@@ -10,7 +10,9 @@ import pytest
 from stockagent.backtest.tw_execution import (
     TaiwanFeeSchedule,
     TaiwanMarginShortSchedule,
+    commission_rebate_rate_vector,
     effective_fee_rate_vectors,
+    gross_fee_rate_vectors,
     lot_size_vector,
     normalize_execution_mode,
     official_tw_short_initial_margin_rates,
@@ -48,7 +50,8 @@ def test_fee_schedule_defaults_are_exact_and_broker_discount_is_separate() -> No
     schedule = TaiwanFeeSchedule()
 
     assert schedule.commission_rate == 0.001425
-    assert schedule.commission_discount == 0.6
+    assert schedule.commission_discount == 0.2
+    assert schedule.commission_rebate_timing == "monthly_15th"
     assert schedule.stock_sell_tax == 0.003
     assert schedule.etf_sell_tax == 0.001
     assert schedule.day_trade_stock_sell_tax == 0.0015
@@ -59,10 +62,41 @@ def test_fee_schedule_defaults_are_exact_and_broker_discount_is_separate() -> No
     assert schedule.settlement_lag_sessions == 2
     assert schedule.cash_lot_size == 1
     assert schedule.day_trade_default_lot_size == 1000
-    assert math.isclose(schedule.effective_commission_rate, 0.000855)
+    assert math.isclose(schedule.effective_commission_rate, 0.000285)
+    assert math.isclose(schedule.commission_rebate_rate, 0.00114)
 
     with pytest.raises(FrozenInstanceError):
         schedule.commission_discount = 1.0  # type: ignore[misc]
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("monthly_15th", "monthly_15th"),
+        (" monthly-15th ", "monthly_15th"),
+        ("MONTHLY", "monthly_15th"),
+        ("月退", "monthly_15th"),
+        ("daily_close", "daily_close"),
+        (" daily-close ", "daily_close"),
+        ("DAILY", "daily_close"),
+        ("日退", "daily_close"),
+    ],
+)
+def test_fee_schedule_normalizes_commission_rebate_timing(
+    raw: str,
+    expected: str,
+) -> None:
+    schedule = TaiwanFeeSchedule(commission_rebate_timing=raw)
+
+    assert schedule.commission_rebate_timing == expected
+
+
+@pytest.mark.parametrize("bad_value", [None, "", "immediate", "weekly", 1, True])
+def test_fee_schedule_rejects_unknown_commission_rebate_timing(
+    bad_value: object,
+) -> None:
+    with pytest.raises(ValueError, match="commission_rebate_timing"):
+        TaiwanFeeSchedule(commission_rebate_timing=bad_value)  # type: ignore[arg-type]
 
 
 def test_margin_short_schedule_defaults_are_checkpoint_safe_and_broker_neutral() -> None:
@@ -261,7 +295,7 @@ def test_fee_schedule_rejects_non_positive_or_non_integer_schedule_values(
 
 def test_tw_cash_fee_vectors_distinguish_stock_and_etf_tax() -> None:
     buy, sell = effective_fee_rate_vectors(["2330", "0050", "00631L"], "tw_cash")
-    commission = 0.001425 * 0.6
+    commission = 0.001425 * 0.2
 
     assert buy.dtype == np.float64
     assert sell.dtype == np.float64
@@ -276,7 +310,7 @@ def test_tw_cash_fee_vectors_distinguish_stock_and_etf_tax() -> None:
 
 def test_tw_day_trade_fee_vectors_use_reduced_stock_tax_and_etf_tax() -> None:
     buy, sell = effective_fee_rate_vectors(["2330", "0050"], "tw_day_trade")
-    commission = 0.001425 * 0.6
+    commission = 0.001425 * 0.2
 
     np.testing.assert_allclose(buy, [commission, commission], rtol=0.0, atol=0.0)
     np.testing.assert_allclose(
@@ -297,10 +331,20 @@ def test_naive_fee_vectors_broadcast_legacy_scalars_without_tw_classification() 
 
     np.testing.assert_array_equal(buy, np.asarray([0.01, 0.01], dtype=np.float64))
     np.testing.assert_array_equal(sell, np.asarray([0.02, 0.02], dtype=np.float64))
+    gross_buy, gross_sell = gross_fee_rate_vectors(
+        ["AAPL", "03001P"],
+        "naive",
+        naive_buy_fee_rate=0.01,
+        naive_sell_fee_rate=0.02,
+    )
+    rebate = commission_rebate_rate_vector(["AAPL", "03001P"], "naive")
+    np.testing.assert_array_equal(gross_buy, buy)
+    np.testing.assert_array_equal(gross_sell, sell)
+    np.testing.assert_array_equal(rebate, np.zeros(2, dtype=np.float64))
 
 
 def test_security_type_override_supports_explicit_stock_or_etf_only() -> None:
-    commission = 0.001425 * 0.6
+    commission = 0.001425 * 0.2
     _, sell = effective_fee_rate_vectors(
         ["FUND_X", "2330"],
         "tw_cash",
@@ -338,6 +382,54 @@ def test_custom_fee_schedule_is_applied_without_discounting_tax() -> None:
 
     np.testing.assert_allclose(buy, [0.001, 0.001], rtol=0.0, atol=0.0)
     np.testing.assert_allclose(sell, [0.005, 0.003], rtol=0.0, atol=0.0)
+
+
+def test_gross_fee_and_rebate_vectors_separate_cash_timing_from_tax() -> None:
+    schedule = TaiwanFeeSchedule(
+        commission_rate=0.002,
+        commission_discount=0.2,
+        stock_sell_tax=0.004,
+        etf_sell_tax=0.002,
+    )
+
+    effective_buy, effective_sell = effective_fee_rate_vectors(
+        ["2330", "0050"],
+        "tw_cash",
+        fee_schedule=schedule,
+    )
+    gross_buy, gross_sell = gross_fee_rate_vectors(
+        ["2330", "0050"],
+        "tw_cash",
+        fee_schedule=schedule,
+    )
+    rebate = commission_rebate_rate_vector(
+        ["2330", "0050"],
+        "tw_cash",
+        fee_schedule=schedule,
+    )
+
+    np.testing.assert_allclose(gross_buy, [0.002, 0.002], rtol=0.0, atol=0.0)
+    np.testing.assert_allclose(
+        gross_sell,
+        [0.002 + 0.004, 0.002 + 0.002],
+        rtol=0.0,
+        atol=0.0,
+    )
+    np.testing.assert_allclose(rebate, [0.0016, 0.0016], rtol=0.0, atol=0.0)
+    # Only commission is rebated: product-specific sell tax is identical in
+    # the gross and ultimate economic schedules.
+    np.testing.assert_allclose(
+        gross_buy - rebate,
+        effective_buy,
+        rtol=1e-15,
+        atol=0.0,
+    )
+    np.testing.assert_allclose(
+        gross_sell - rebate,
+        effective_sell,
+        rtol=1e-15,
+        atol=0.0,
+    )
 
 
 def test_lot_size_vectors_cover_cash_day_trade_and_override() -> None:

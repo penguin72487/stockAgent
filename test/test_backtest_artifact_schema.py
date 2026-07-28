@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -97,6 +98,55 @@ def _continuous_result() -> BacktestResult:
         final_alive=np.asarray(True, dtype=np.bool_),
         final_equity_scale=np.asarray(np.exp(0.01), dtype=np.float32),
     )
+
+
+_COMMISSION_REBATE_HISTORY_FIELDS = (
+    "commission_rebate_accrued_history",
+    "commission_rebate_paid_history",
+    "commission_rebate_current_history",
+    "commission_rebate_due_history",
+)
+_COMMISSION_REBATE_TERMINAL_FIELDS = (
+    "final_commission_rebate_current",
+    "final_commission_rebate_due",
+    "final_commission_rebate_month_id",
+)
+_INTEGER_COMMISSION_REBATE_FIELDS = (
+    "integer_state_commission_rebate_current",
+    "integer_state_commission_rebate_due",
+    "integer_state_commission_rebate_month_id",
+)
+
+
+def _with_commission_rebate_audit(result: BacktestResult) -> BacktestResult:
+    dtype = np.asarray(result.strategy_returns).dtype
+    accrued = np.asarray([0.125, 0.250], dtype=dtype)
+    paid = np.asarray([0.000, 0.125], dtype=dtype)
+    current = np.asarray([0.125, 0.250], dtype=dtype)
+    due = np.asarray([0.750, 0.500], dtype=dtype)
+    assert accrued.shape == np.asarray(result.strategy_returns).shape
+
+    result.commission_rebate_accrued_history = accrued
+    result.commission_rebate_paid_history = paid
+    result.commission_rebate_current_history = current
+    result.commission_rebate_due_history = due
+    result.final_commission_rebate_current = np.asarray(
+        current[-1], dtype=dtype
+    )
+    result.final_commission_rebate_due = np.asarray(due[-1], dtype=dtype)
+    result.final_commission_rebate_month_id = np.asarray(
+        202601, dtype=np.int64
+    )
+
+    state = result.final_integer_state
+    if state is not None:
+        result.final_integer_state = replace(
+            state,
+            commission_rebate_current=float(current[-1]),
+            commission_rebate_due=float(due[-1]),
+            commission_rebate_month_id=202601,
+        )
+    return result
 
 
 _PHASE_AUDIT_FIELDS = (
@@ -482,6 +532,178 @@ def test_integer_backtest_npz_round_trip_preserves_precision_units_and_terminal_
         np.testing.assert_array_equal(
             archive["integer_state_last_weights"], result.final_weights
         )
+
+
+def test_schema_six_continuous_commission_rebate_round_trip(
+    tmp_path: Path,
+) -> None:
+    result = _with_commission_rebate_audit(_continuous_result())
+    dates = np.asarray(["2026-01-02", "2026-01-05"], dtype="datetime64[D]")
+    path = tmp_path / "continuous-rebate.npz"
+
+    _save_backtest_artifact(path, result, dates)
+    loaded, loaded_dates = _load_backtest_artifact(path)
+
+    np.testing.assert_array_equal(loaded_dates, dates)
+    for field in (
+        *_COMMISSION_REBATE_HISTORY_FIELDS,
+        *_COMMISSION_REBATE_TERMINAL_FIELDS,
+    ):
+        expected = getattr(result, field)
+        actual = getattr(loaded, field)
+        assert expected is not None
+        assert actual is not None
+        np.testing.assert_array_equal(actual, expected)
+    assert loaded.final_integer_state is None
+    with np.load(path, allow_pickle=False) as archive:
+        assert int(archive["artifact_schema_version"].item()) == 6
+        for field in (
+            *_COMMISSION_REBATE_HISTORY_FIELDS,
+            *_COMMISSION_REBATE_TERMINAL_FIELDS,
+        ):
+            np.testing.assert_array_equal(archive[field], getattr(result, field))
+
+
+def test_schema_six_integer_commission_rebate_round_trip_preserves_terminal_state(
+    tmp_path: Path,
+) -> None:
+    result = _with_commission_rebate_audit(_integer_result())
+    dates = np.asarray(["2026-01-02", "2026-01-05"], dtype="datetime64[D]")
+    path = tmp_path / "integer-rebate.npz"
+
+    _save_backtest_artifact(path, result, dates)
+    loaded, loaded_dates = _load_backtest_artifact(path)
+
+    np.testing.assert_array_equal(loaded_dates, dates)
+    for field in (
+        *_COMMISSION_REBATE_HISTORY_FIELDS,
+        *_COMMISSION_REBATE_TERMINAL_FIELDS,
+    ):
+        expected = getattr(result, field)
+        actual = getattr(loaded, field)
+        assert expected is not None
+        assert actual is not None
+        np.testing.assert_array_equal(actual, expected)
+    state = loaded.final_integer_state
+    assert state is not None
+    assert state.commission_rebate_current == pytest.approx(0.250)
+    assert state.commission_rebate_due == pytest.approx(0.500)
+    assert state.commission_rebate_month_id == 202601
+    with np.load(path, allow_pickle=False) as archive:
+        assert int(archive["artifact_schema_version"].item()) == 6
+        np.testing.assert_array_equal(
+            archive["integer_state_commission_rebate_current"],
+            result.final_commission_rebate_current,
+        )
+        np.testing.assert_array_equal(
+            archive["integer_state_commission_rebate_due"],
+            result.final_commission_rebate_due,
+        )
+        np.testing.assert_array_equal(
+            archive["integer_state_commission_rebate_month_id"],
+            result.final_commission_rebate_month_id,
+        )
+
+
+@pytest.mark.parametrize("missing_field", _COMMISSION_REBATE_HISTORY_FIELDS)
+def test_schema_six_save_rejects_incomplete_commission_rebate_histories(
+    tmp_path: Path,
+    missing_field: str,
+) -> None:
+    result = _with_commission_rebate_audit(_continuous_result())
+    setattr(result, missing_field, None)
+
+    with pytest.raises(
+        ValueError,
+        match="commission rebate histories must be complete or omitted",
+    ):
+        _save_backtest_artifact(
+            tmp_path / f"save-missing-{missing_field}.npz",
+            result,
+            np.asarray(["2026-01-02", "2026-01-05"], dtype="datetime64[D]"),
+        )
+
+
+@pytest.mark.parametrize("missing_field", _COMMISSION_REBATE_TERMINAL_FIELDS)
+def test_schema_six_save_rejects_incomplete_commission_rebate_terminal_state(
+    tmp_path: Path,
+    missing_field: str,
+) -> None:
+    result = _with_commission_rebate_audit(_continuous_result())
+    setattr(result, missing_field, None)
+
+    with pytest.raises(
+        ValueError,
+        match="final commission rebate state must be complete or omitted",
+    ):
+        _save_backtest_artifact(
+            tmp_path / f"save-missing-{missing_field}.npz",
+            result,
+            np.asarray(["2026-01-02", "2026-01-05"], dtype="datetime64[D]"),
+        )
+
+
+@pytest.mark.parametrize("missing_field", _COMMISSION_REBATE_HISTORY_FIELDS)
+def test_schema_six_load_rejects_any_missing_commission_rebate_history(
+    tmp_path: Path,
+    missing_field: str,
+) -> None:
+    dates = np.asarray(["2026-01-02", "2026-01-05"], dtype="datetime64[D]")
+    valid_path = tmp_path / f"valid-{missing_field}.npz"
+    broken_path = tmp_path / f"load-missing-{missing_field}.npz"
+    _save_backtest_artifact(
+        valid_path,
+        _with_commission_rebate_audit(_continuous_result()),
+        dates,
+    )
+    _rewrite_npz_without(valid_path, broken_path, missing_field)
+
+    with pytest.raises(
+        ValueError,
+        match="schema-6 backtest artifact is missing commission rebate histories",
+    ):
+        _load_backtest_artifact(broken_path)
+
+
+@pytest.mark.parametrize("missing_field", _COMMISSION_REBATE_TERMINAL_FIELDS)
+def test_schema_six_load_rejects_incomplete_commission_rebate_terminal_state(
+    tmp_path: Path,
+    missing_field: str,
+) -> None:
+    dates = np.asarray(["2026-01-02", "2026-01-05"], dtype="datetime64[D]")
+    valid_path = tmp_path / f"valid-{missing_field}.npz"
+    broken_path = tmp_path / f"load-missing-{missing_field}.npz"
+    _save_backtest_artifact(
+        valid_path,
+        _with_commission_rebate_audit(_continuous_result()),
+        dates,
+    )
+    _rewrite_npz_without(valid_path, broken_path, missing_field)
+
+    with pytest.raises(
+        ValueError,
+        match="final commission rebate state is incomplete",
+    ):
+        _load_backtest_artifact(broken_path)
+
+
+@pytest.mark.parametrize("missing_field", _INTEGER_COMMISSION_REBATE_FIELDS)
+def test_schema_six_integer_load_rejects_any_missing_commission_rebate_state(
+    tmp_path: Path,
+    missing_field: str,
+) -> None:
+    dates = np.asarray(["2026-01-02", "2026-01-05"], dtype="datetime64[D]")
+    valid_path = tmp_path / f"valid-{missing_field}.npz"
+    broken_path = tmp_path / f"load-missing-{missing_field}.npz"
+    _save_backtest_artifact(
+        valid_path,
+        _with_commission_rebate_audit(_integer_result()),
+        dates,
+    )
+    _rewrite_npz_without(valid_path, broken_path, missing_field)
+
+    with pytest.raises(ValueError, match="integer commission rebate state"):
+        _load_backtest_artifact(broken_path)
 
 
 def test_schema_four_round_trip_preserves_longer_dividend_receivable_queue(
@@ -900,6 +1122,61 @@ def test_slice_copies_short_collateral_and_only_keeps_true_terminal_state() -> N
         terminal.final_integer_state.short_margin_collateral,
         result.final_integer_state.short_margin_collateral,  # type: ignore[union-attr]
     )
+
+
+def test_schema_six_prefix_and_slice_preserve_rebate_audit_without_fabricating_state(
+) -> None:
+    result = _with_commission_rebate_audit(_integer_result())
+
+    prefix = _prefix_backtest_result(result, 1)
+    sliced = _slice_backtest_rows(
+        result,
+        0,
+        1,
+        preserve_terminal_state=True,
+    )
+    for partial in (prefix, sliced):
+        for field in _COMMISSION_REBATE_HISTORY_FIELDS:
+            expected = getattr(result, field)
+            actual = getattr(partial, field)
+            assert expected is not None
+            assert actual is not None
+            np.testing.assert_array_equal(actual, expected[:1])
+            assert not np.shares_memory(actual, expected)
+        for field in _COMMISSION_REBATE_TERMINAL_FIELDS:
+            assert getattr(partial, field) is None
+        assert partial.final_integer_state is None
+
+    full_prefix = _prefix_backtest_result(result, 2)
+    terminal_slice = _slice_backtest_rows(
+        result,
+        1,
+        2,
+        preserve_terminal_state=True,
+    )
+    for preserved, row_slice in (
+        (full_prefix, slice(None)),
+        (terminal_slice, slice(1, 2)),
+    ):
+        for field in _COMMISSION_REBATE_HISTORY_FIELDS:
+            expected = getattr(result, field)
+            actual = getattr(preserved, field)
+            assert expected is not None
+            assert actual is not None
+            np.testing.assert_array_equal(actual, expected[row_slice])
+            assert not np.shares_memory(actual, expected)
+        for field in _COMMISSION_REBATE_TERMINAL_FIELDS:
+            expected = getattr(result, field)
+            actual = getattr(preserved, field)
+            assert expected is not None
+            assert actual is not None
+            np.testing.assert_array_equal(actual, expected)
+            assert not np.shares_memory(actual, expected)
+        state = preserved.final_integer_state
+        assert state is not None
+        assert state.commission_rebate_current == pytest.approx(0.250)
+        assert state.commission_rebate_due == pytest.approx(0.500)
+        assert state.commission_rebate_month_id == 202601
 
 
 def test_fold_output_uses_integer_oracle_as_canonical_taiwan_artifact(

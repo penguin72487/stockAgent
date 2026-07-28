@@ -213,3 +213,4 @@ codex/*
 data_openBB/*
 data_tw_microstructure/*
 .env.trade.example
+data_tw_minute/*

@@ -2249,9 +2249,9 @@ def test_compiled_loss_probe_reproduces_ddp_gathered_inputs(monkeypatch) -> None
     )
 
     assert ok, error
-    # The real-settlement graph also gathers the per-row session clock so the
-    # compile probe exactly matches the first DDP loss invocation.
-    assert gather_calls == {"autograd": 1, "no_grad": 14}
+    # The real-settlement graph also gathers the per-row session clock plus
+    # rebate month/payment calendar so the probe matches the first DDP loss.
+    assert gather_calls == {"autograd": 1, "no_grad": 16}
     assert captured["weights"].shape == (4, panel.num_symbols)
     assert captured["returns"].shape == captured["weights"].shape
     assert captured["tradable"].shape == captured["weights"].shape

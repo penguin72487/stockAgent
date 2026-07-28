@@ -35,6 +35,8 @@ class WindowedSplitTensors:
     symbol_indices: torch.Tensor | None = None
     execution_mode: str = "naive"
     session_advance_mask: torch.Tensor | None = None
+    session_month_ids: torch.Tensor | None = None
+    commission_rebate_payment_eligible_mask: torch.Tensor | None = None
     day_trade_eligible_mask: torch.Tensor | None = None
     day_trade_can_buy_open_mask: torch.Tensor | None = None
     day_trade_can_sell_open_mask: torch.Tensor | None = None
@@ -177,6 +179,38 @@ class WindowedSplitTensors:
             raise ValueError(
                 "session_advance_mask must have shape [T] matching features: "
                 f"{tuple(self.session_advance_mask.shape)} != ({int(self.features.size(0))},)"
+            )
+        row_count = int(self.features.size(0))
+        if self.session_month_ids is None:
+            self.session_month_ids = torch.zeros(
+                row_count,
+                dtype=torch.int64,
+                device=self.features.device,
+            )
+        else:
+            self.session_month_ids = self.session_month_ids.to(dtype=torch.int64)
+        if tuple(self.session_month_ids.shape) != (row_count,):
+            raise ValueError(
+                "session_month_ids must have shape [T] matching features: "
+                f"{tuple(self.session_month_ids.shape)} != ({row_count},)"
+            )
+        if self.commission_rebate_payment_eligible_mask is None:
+            self.commission_rebate_payment_eligible_mask = torch.zeros(
+                row_count,
+                dtype=torch.bool,
+                device=self.features.device,
+            )
+        else:
+            self.commission_rebate_payment_eligible_mask = (
+                self.commission_rebate_payment_eligible_mask.to(dtype=torch.bool)
+            )
+        if tuple(self.commission_rebate_payment_eligible_mask.shape) != (
+            row_count,
+        ):
+            raise ValueError(
+                "commission_rebate_payment_eligible_mask must have shape [T] "
+                f"matching features: {tuple(self.commission_rebate_payment_eligible_mask.shape)} "
+                f"!= ({row_count},)"
             )
         if self.day_trade_eligible_mask is not None:
             self.day_trade_eligible_mask = self.day_trade_eligible_mask.to(dtype=torch.bool)
@@ -382,6 +416,8 @@ class WindowedSplitTensors:
         sample_mask: torch.Tensor,
     ) -> tuple[
         torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
         torch.Tensor | None,
         torch.Tensor | None,
         torch.Tensor | None,
@@ -392,6 +428,15 @@ class WindowedSplitTensors:
         session_advance = self.session_advance_mask[date_indices]
         sample_gate = sample_mask.to(device=session_advance.device, dtype=torch.bool)
         session_advance = session_advance & sample_gate
+        session_month_ids = torch.where(
+            sample_gate,
+            self.session_month_ids[date_indices],
+            torch.zeros_like(self.session_month_ids[date_indices]),
+        )
+        rebate_payment_eligible = (
+            self.commission_rebate_payment_eligible_mask[date_indices]
+            & sample_gate
+        )
         eligibility = (
             None
             if self.day_trade_eligible_mask is None
@@ -432,6 +477,8 @@ class WindowedSplitTensors:
         )
         return (
             session_advance,
+            session_month_ids,
+            rebate_payment_eligible,
             eligibility,
             can_buy_open,
             can_sell_open,
@@ -447,6 +494,8 @@ class WindowedSplitTensors:
         sample_mask: torch.Tensor,
     ) -> tuple[
         torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
         torch.Tensor | None,
         torch.Tensor | None,
         torch.Tensor | None,
@@ -457,6 +506,19 @@ class WindowedSplitTensors:
         session_advance = self.session_advance_mask.narrow(0, int(date_start), int(rows))
         sample_gate = sample_mask.to(device=session_advance.device, dtype=torch.bool)
         session_advance = session_advance & sample_gate
+        session_month_ids = torch.where(
+            sample_gate,
+            self.session_month_ids.narrow(0, int(date_start), int(rows)),
+            torch.zeros_like(
+                self.session_month_ids.narrow(0, int(date_start), int(rows))
+            ),
+        )
+        rebate_payment_eligible = (
+            self.commission_rebate_payment_eligible_mask.narrow(
+                0, int(date_start), int(rows)
+            )
+            & sample_gate
+        )
         eligibility = (
             None
             if self.day_trade_eligible_mask is None
@@ -506,6 +568,8 @@ class WindowedSplitTensors:
         )
         return (
             session_advance,
+            session_month_ids,
+            rebate_payment_eligible,
             eligibility,
             can_buy_open,
             can_sell_open,
@@ -677,6 +741,14 @@ class WindowedSplitTensors:
             ),
             execution_mode=self.execution_mode,
             session_advance_mask=self.session_advance_mask.to(device=device, non_blocking=non_blocking),
+            session_month_ids=self.session_month_ids.to(
+                device=device, non_blocking=non_blocking
+            ),
+            commission_rebate_payment_eligible_mask=(
+                self.commission_rebate_payment_eligible_mask.to(
+                    device=device, non_blocking=non_blocking
+                )
+            ),
             day_trade_eligible_mask=(
                 None
                 if self.day_trade_eligible_mask is None
@@ -750,6 +822,10 @@ class WindowedSplitTensors:
             symbol_indices=None if self.symbol_indices is None else _pin(self.symbol_indices),
             execution_mode=self.execution_mode,
             session_advance_mask=_pin(self.session_advance_mask),
+            session_month_ids=_pin(self.session_month_ids),
+            commission_rebate_payment_eligible_mask=_pin(
+                self.commission_rebate_payment_eligible_mask
+            ),
             day_trade_eligible_mask=(
                 None if self.day_trade_eligible_mask is None else _pin(self.day_trade_eligible_mask)
             ),
@@ -829,6 +905,10 @@ class WindowedSplitTensors:
             symbol_indices=original_indices,
             execution_mode=self.execution_mode,
             session_advance_mask=self.session_advance_mask,
+            session_month_ids=self.session_month_ids,
+            commission_rebate_payment_eligible_mask=(
+                self.commission_rebate_payment_eligible_mask
+            ),
             day_trade_eligible_mask=(
                 None
                 if self.day_trade_eligible_mask is None
@@ -930,6 +1010,10 @@ class WindowedSplitTensors:
             symbol_indices=padded_symbol_indices,
             execution_mode=self.execution_mode,
             session_advance_mask=self.session_advance_mask,
+            session_month_ids=self.session_month_ids,
+            commission_rebate_payment_eligible_mask=(
+                self.commission_rebate_payment_eligible_mask
+            ),
             day_trade_eligible_mask=(
                 None
                 if self.day_trade_eligible_mask is None
@@ -995,6 +1079,10 @@ class WindowedSplitTensors:
             symbol_indices=clamped_indices,
             execution_mode=self.execution_mode,
             session_advance_mask=self.session_advance_mask,
+            session_month_ids=self.session_month_ids,
+            commission_rebate_payment_eligible_mask=(
+                self.commission_rebate_payment_eligible_mask
+            ),
             day_trade_eligible_mask=self.day_trade_eligible_mask,
             day_trade_can_buy_open_mask=self.day_trade_can_buy_open_mask,
             day_trade_can_sell_open_mask=self.day_trade_can_sell_open_mask,
@@ -1066,6 +1154,8 @@ class WindowedSplitTensors:
         sample_mask = self._default_sample_mask[row_indices] if self.sample_mask is None else self.sample_mask[row_indices]
         (
             session_advance_mask,
+            session_month_ids,
+            commission_rebate_payment_eligible_mask,
             day_trade_eligible_mask,
             day_trade_can_buy_open_mask,
             day_trade_can_sell_open_mask,
@@ -1140,6 +1230,15 @@ class WindowedSplitTensors:
             "session_advance_mask": self._to_device(
                 session_advance_mask, device, non_blocking, prepare_timing
             ),
+            "session_month_ids": self._to_device(
+                session_month_ids, device, non_blocking, prepare_timing
+            ),
+            "commission_rebate_payment_eligible_mask": self._to_device(
+                commission_rebate_payment_eligible_mask,
+                device,
+                non_blocking,
+                prepare_timing,
+            ),
             **(
                 {}
                 if day_trade_eligible_mask is None
@@ -1197,6 +1296,8 @@ class WindowedSplitTensors:
         sample_mask = self._default_sample_mask[row_indices] if self.sample_mask is None else self.sample_mask[row_indices]
         (
             session_advance_mask,
+            session_month_ids,
+            commission_rebate_payment_eligible_mask,
             day_trade_eligible_mask,
             day_trade_can_buy_open_mask,
             day_trade_can_sell_open_mask,
@@ -1270,6 +1371,15 @@ class WindowedSplitTensors:
             "benchmark": self._to_device(benchmark, device, non_blocking, prepare_timing),
             "session_advance_mask": self._to_device(
                 session_advance_mask, device, non_blocking, prepare_timing
+            ),
+            "session_month_ids": self._to_device(
+                session_month_ids, device, non_blocking, prepare_timing
+            ),
+            "commission_rebate_payment_eligible_mask": self._to_device(
+                commission_rebate_payment_eligible_mask,
+                device,
+                non_blocking,
+                prepare_timing,
             ),
             **(
                 {}
@@ -1324,6 +1434,8 @@ class WindowedSplitTensors:
         sample_mask = self._sample_mask_slice(int(start), rows)
         (
             session_advance_mask,
+            session_month_ids,
+            commission_rebate_payment_eligible_mask,
             day_trade_eligible_mask,
             day_trade_can_buy_open_mask,
             day_trade_can_sell_open_mask,
@@ -1398,6 +1510,15 @@ class WindowedSplitTensors:
             "session_advance_mask": self._to_device(
                 session_advance_mask, device, non_blocking, prepare_timing
             ),
+            "session_month_ids": self._to_device(
+                session_month_ids, device, non_blocking, prepare_timing
+            ),
+            "commission_rebate_payment_eligible_mask": self._to_device(
+                commission_rebate_payment_eligible_mask,
+                device,
+                non_blocking,
+                prepare_timing,
+            ),
             **(
                 {}
                 if day_trade_eligible_mask is None
@@ -1448,6 +1569,8 @@ class WindowedSplitTensors:
         timer = self._prepare_timer_start()
         (
             session_advance_mask,
+            session_month_ids,
+            commission_rebate_payment_eligible_mask,
             day_trade_eligible_mask,
             day_trade_can_buy_open_mask,
             day_trade_can_sell_open_mask,
@@ -1526,6 +1649,15 @@ class WindowedSplitTensors:
             "session_advance_mask": self._to_device(
                 session_advance_mask, device, non_blocking, prepare_timing
             ),
+            "session_month_ids": self._to_device(
+                session_month_ids, device, non_blocking, prepare_timing
+            ),
+            "commission_rebate_payment_eligible_mask": self._to_device(
+                commission_rebate_payment_eligible_mask,
+                device,
+                non_blocking,
+                prepare_timing,
+            ),
             **(
                 {}
                 if day_trade_eligible_mask is None
@@ -1582,6 +1714,8 @@ class WindowedSplitTensors:
         timer = self._prepare_timer_start()
         (
             session_advance_mask,
+            session_month_ids,
+            commission_rebate_payment_eligible_mask,
             day_trade_eligible_mask,
             day_trade_can_buy_open_mask,
             day_trade_can_sell_open_mask,
@@ -1662,6 +1796,15 @@ class WindowedSplitTensors:
             "session_advance_mask": self._to_device(
                 session_advance_mask, device, non_blocking, prepare_timing
             ),
+            "session_month_ids": self._to_device(
+                session_month_ids, device, non_blocking, prepare_timing
+            ),
+            "commission_rebate_payment_eligible_mask": self._to_device(
+                commission_rebate_payment_eligible_mask,
+                device,
+                non_blocking,
+                prepare_timing,
+            ),
             **(
                 {}
                 if day_trade_eligible_mask is None
@@ -1719,6 +1862,8 @@ class WindowedSplitTensors:
         timer = self._prepare_timer_start()
         (
             session_advance_mask,
+            session_month_ids,
+            commission_rebate_payment_eligible_mask,
             day_trade_eligible_mask,
             day_trade_can_buy_open_mask,
             day_trade_can_sell_open_mask,
@@ -1796,6 +1941,15 @@ class WindowedSplitTensors:
             "benchmark": self._to_device(benchmark, device, non_blocking, prepare_timing),
             "session_advance_mask": self._to_device(
                 session_advance_mask, device, non_blocking, prepare_timing
+            ),
+            "session_month_ids": self._to_device(
+                session_month_ids, device, non_blocking, prepare_timing
+            ),
+            "commission_rebate_payment_eligible_mask": self._to_device(
+                commission_rebate_payment_eligible_mask,
+                device,
+                non_blocking,
+                prepare_timing,
             ),
             **(
                 {}
@@ -2056,6 +2210,10 @@ def dataset_to_windowed_tensors(dataset: CrossSectionalDataset) -> WindowedSplit
         force_exit_mask=dataset.force_exit_mask_t,
         execution_mode=dataset.execution_mode,
         session_advance_mask=dataset.session_advance_mask_t,
+        session_month_ids=dataset.session_month_ids_t,
+        commission_rebate_payment_eligible_mask=(
+            dataset.commission_rebate_payment_eligible_mask_t
+        ),
         day_trade_eligible_mask=dataset.day_trade_eligible_mask_t,
         day_trade_can_buy_open_mask=dataset.day_trade_can_buy_open_mask_t,
         day_trade_can_sell_open_mask=dataset.day_trade_can_sell_open_mask_t,

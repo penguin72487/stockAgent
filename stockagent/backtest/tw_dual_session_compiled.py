@@ -19,6 +19,10 @@ from typing import Callable
 
 import torch
 
+from stockagent.backtest.tw_commission_rebate import (
+    prepare_commission_rebate_calendar_tensors,
+    prepare_commission_rebate_state,
+)
 from stockagent.backtest.tw_continuous import (
     _prepare_cash_short_state,
     _prepare_equity_scale,
@@ -61,6 +65,10 @@ class _PreparedInputs:
     can_sell_mask: torch.Tensor
     buy_fee_rates: torch.Tensor
     sell_fee_rates: torch.Tensor
+    commission_rebate_rates: torch.Tensor
+    commission_rebate_timing: str
+    session_month_ids: torch.Tensor
+    commission_rebate_payment_eligible_mask: torch.Tensor
     can_short_open_mask: torch.Tensor
     force_short_cover_mask: torch.Tensor
     short_margin_rate: torch.Tensor
@@ -76,6 +84,9 @@ class _PreparedInputs:
     initial_cash: torch.Tensor
     initial_payables: torch.Tensor
     initial_receivables: torch.Tensor
+    initial_commission_rebate_current: torch.Tensor
+    initial_commission_rebate_due: torch.Tensor
+    initial_commission_rebate_month_id: torch.Tensor
     initial_short_sale_collateral: torch.Tensor
     initial_short_margin_collateral: torch.Tensor
     initial_alive: torch.Tensor
@@ -221,6 +232,10 @@ def _prepare_inputs(
     can_sell_mask: torch.Tensor,
     buy_fee_rates: torch.Tensor | float,
     sell_fee_rates: torch.Tensor | float,
+    commission_rebate_rates: torch.Tensor | float,
+    commission_rebate_timing: str,
+    session_month_ids: torch.Tensor | None,
+    commission_rebate_payment_eligible_mask: torch.Tensor | None,
     can_short_open_mask: torch.Tensor | None,
     force_short_cover_mask: torch.Tensor | None,
     short_margin_rate: torch.Tensor | float | None,
@@ -242,6 +257,9 @@ def _prepare_inputs(
     initial_cash: torch.Tensor | None,
     initial_payables: torch.Tensor | None,
     initial_receivables: torch.Tensor | None,
+    initial_commission_rebate_current: torch.Tensor | None,
+    initial_commission_rebate_due: torch.Tensor | None,
+    initial_commission_rebate_month_id: torch.Tensor | None,
     initial_alive: torch.Tensor | None,
     initial_equity_scale: torch.Tensor | None,
     initial_short_sale_collateral: torch.Tensor | None,
@@ -321,8 +339,32 @@ def _prepare_inputs(
         reference=phase_reference,
         name="sell_fee_rates",
     ).contiguous()
+    rebate_rates = _as_phase_rate(
+        commission_rebate_rates,
+        reference=phase_reference,
+        name="commission_rebate_rates",
+    ).contiguous()
     if bool((sell_fees >= 1.0).any().item()):
         raise ValueError("sell_fee_rates must be less than 1")
+    if bool(
+        ((rebate_rates > buy_fees) | (rebate_rates > sell_fees)).any().item()
+    ):
+        raise ValueError(
+            "commission_rebate_rates cannot exceed gross buy or sell fee rates"
+        )
+    (
+        rebate_timing,
+        rebate_month_ids,
+        rebate_payment_eligible,
+    ) = prepare_commission_rebate_calendar_tensors(
+        reference=daily_reference,
+        timing=commission_rebate_timing,
+        session_month_ids=session_month_ids,
+        payment_eligible_mask=commission_rebate_payment_eligible_mask,
+        state_advance_mask=state_advance_mask,
+    )
+    rebate_month_ids = rebate_month_ids.contiguous()
+    rebate_payment_eligible = rebate_payment_eligible.contiguous()
 
     has_short_open_mask = can_short_open_mask is not None
     has_force_short_cover_mask = force_short_cover_mask is not None
@@ -415,6 +457,12 @@ def _prepare_inputs(
         if tuple(advance.shape) != (rows,):
             raise ValueError("state_advance_mask must have shape [T]")
         advance = advance.contiguous()
+    if rebate_timing == "monthly_15th":
+        active_month_ids = rebate_month_ids[advance]
+        if int(active_month_ids.numel()) > 1 and bool(
+            (active_month_ids[1:] < active_month_ids[:-1]).any().item()
+        ):
+            raise ValueError("active session_month_ids must be non-decreasing")
 
     if mode == "tw_overnight":
         exit_fraction = action_values[:, 0]
@@ -436,6 +484,55 @@ def _prepare_inputs(
                 "reverse the same symbol within one session"
             )
 
+    if initial_alive is None:
+        rebate_alive = torch.ones(
+            (),
+            device=action_values.device,
+            dtype=torch.bool,
+        )
+    else:
+        if initial_alive.dim() != 0:
+            raise ValueError("initial_alive must be a scalar tensor")
+        rebate_alive = initial_alive.detach().clone(
+            memory_format=torch.contiguous_format
+        ).to(device=action_values.device, dtype=torch.bool)
+    (
+        rebate_current,
+        rebate_due,
+        rebate_month_id,
+    ) = prepare_commission_rebate_state(
+        reference=daily_reference,
+        initial_current=initial_commission_rebate_current,
+        initial_due=initial_commission_rebate_due,
+        initial_month_id=initial_commission_rebate_month_id,
+        alive=rebate_alive,
+        detach=True,
+    )
+    if (
+        rebate_timing == "monthly_15th"
+        and int(active_month_ids.numel()) > 0
+        and bool(
+            (
+                (rebate_month_id > 0)
+                & (rebate_month_id > active_month_ids[0])
+            ).item()
+        )
+    ):
+        raise ValueError(
+            "initial_commission_rebate_month_id cannot be later than the "
+            "first active session month"
+        )
+    if rebate_timing == "daily_close":
+        has_carried_rebate = (
+            (rebate_current > 0.0)
+            | (rebate_due > 0.0)
+            | (rebate_month_id != 0)
+        )
+        if bool(has_carried_rebate.item()):
+            raise ValueError(
+                "daily_close commission rebates cannot carry an initial "
+                "monthly rebate state"
+            )
     (
         risky,
         cash,
@@ -456,6 +553,8 @@ def _prepare_inputs(
         initial_alive=initial_alive,
         initial_short_sale_collateral=initial_short_sale_collateral,
         initial_short_margin_collateral=initial_short_margin_collateral,
+        commission_rebate_current=rebate_current,
+        commission_rebate_due=rebate_due,
         state_advance_mask=advance,
         detach_initial_state=True,
     )
@@ -471,15 +570,26 @@ def _prepare_inputs(
         intraday,
         buy_fees,
         sell_fees,
+        rebate_rates,
         margin_rates,
         short_cap,
         handling_rates,
         dividend_yields,
         volume_cap,
     )
+    initial_rebate_requires_grad = any(
+        isinstance(value, torch.Tensor) and value.requires_grad
+        for value in (
+            initial_commission_rebate_current,
+            initial_commission_rebate_due,
+        )
+    )
     requires_state_grad = bool(
         torch.is_grad_enabled()
-        and any(value.requires_grad for value in floating_inputs)
+        and (
+            any(value.requires_grad for value in floating_inputs)
+            or initial_rebate_requires_grad
+        )
     )
     if requires_state_grad:
         risky = risky.detach().clone().requires_grad_(True)
@@ -493,6 +603,8 @@ def _prepare_inputs(
             short_margin_collateral.detach().clone().requires_grad_(True)
         )
         equity_scale = equity_scale.detach().clone().requires_grad_(True)
+        rebate_current = rebate_current.detach().clone().requires_grad_(True)
+        rebate_due = rebate_due.detach().clone().requires_grad_(True)
 
     return _PreparedInputs(
         mode=mode,
@@ -504,6 +616,10 @@ def _prepare_inputs(
         can_sell_mask=sell_mask,
         buy_fee_rates=buy_fees,
         sell_fee_rates=sell_fees,
+        commission_rebate_rates=rebate_rates,
+        commission_rebate_timing=rebate_timing,
+        session_month_ids=rebate_month_ids,
+        commission_rebate_payment_eligible_mask=rebate_payment_eligible,
         can_short_open_mask=short_open,
         force_short_cover_mask=forced_cover,
         short_margin_rate=margin_rates,
@@ -519,6 +635,9 @@ def _prepare_inputs(
         initial_cash=cash,
         initial_payables=payables,
         initial_receivables=receivables,
+        initial_commission_rebate_current=rebate_current,
+        initial_commission_rebate_due=rebate_due,
+        initial_commission_rebate_month_id=rebate_month_id,
         initial_short_sale_collateral=short_sale_collateral,
         initial_short_margin_collateral=short_margin_collateral,
         initial_alive=alive,
@@ -555,6 +674,7 @@ def _compile_key(prepared: _PreparedInputs) -> tuple[object, ...]:
             prepared.intraday_log_returns,
             prepared.buy_fee_rates,
             prepared.sell_fee_rates,
+            prepared.commission_rebate_rates,
             prepared.short_margin_rate,
             prepared.short_capacity_weights,
             prepared.short_handling_fee_rate,
@@ -564,6 +684,8 @@ def _compile_key(prepared: _PreparedInputs) -> tuple[object, ...]:
             prepared.initial_cash,
             prepared.initial_payables,
             prepared.initial_receivables,
+            prepared.initial_commission_rebate_current,
+            prepared.initial_commission_rebate_due,
             prepared.initial_short_sale_collateral,
             prepared.initial_short_margin_collateral,
             prepared.initial_equity_scale,
@@ -580,6 +702,7 @@ def _compile_key(prepared: _PreparedInputs) -> tuple[object, ...]:
         prepared.gross_budget,
         prepared.max_turnover_ratio,
         prepared.short_maintenance_ratio,
+        prepared.commission_rebate_timing,
         prepared.return_weights_history,
         prepared.has_short_contract,
         prepared.has_short_open_mask,
@@ -615,6 +738,7 @@ def _compiled_day_runner(
     gross_budget = prepared.gross_budget
     max_turnover = prepared.max_turnover_ratio
     maintenance = prepared.short_maintenance_ratio
+    rebate_timing = prepared.commission_rebate_timing
 
     def run_day(
         day_actions: torch.Tensor,
@@ -625,6 +749,9 @@ def _compiled_day_runner(
         day_can_sell_mask: torch.Tensor,
         day_buy_fee_rates: torch.Tensor,
         day_sell_fee_rates: torch.Tensor,
+        day_commission_rebate_rates: torch.Tensor,
+        day_session_month_ids: torch.Tensor,
+        day_commission_rebate_payment_eligible_mask: torch.Tensor,
         day_can_short_open_mask: torch.Tensor,
         day_force_short_cover_mask: torch.Tensor,
         day_short_margin_rate: torch.Tensor,
@@ -644,6 +771,9 @@ def _compiled_day_runner(
         initial_short_margin_collateral: torch.Tensor,
         initial_alive: torch.Tensor,
         initial_equity_scale: torch.Tensor,
+        initial_commission_rebate_current: torch.Tensor,
+        initial_commission_rebate_due: torch.Tensor,
+        initial_commission_rebate_month_id: torch.Tensor,
     ) -> tuple[torch.Tensor, ...]:
         result = _run_dual_session(
             mode=mode,
@@ -655,6 +785,12 @@ def _compiled_day_runner(
             can_sell_mask=day_can_sell_mask,
             buy_fee_rates=day_buy_fee_rates,
             sell_fee_rates=day_sell_fee_rates,
+            commission_rebate_rates=day_commission_rebate_rates,
+            commission_rebate_timing=rebate_timing,
+            session_month_ids=day_session_month_ids,
+            commission_rebate_payment_eligible_mask=(
+                day_commission_rebate_payment_eligible_mask
+            ),
             can_short_open_mask=(
                 day_can_short_open_mask if has_short_open_mask else None
             ),
@@ -690,6 +826,13 @@ def _compiled_day_runner(
             initial_cash=initial_cash,
             initial_payables=initial_payables,
             initial_receivables=initial_receivables,
+            initial_commission_rebate_current=(
+                initial_commission_rebate_current
+            ),
+            initial_commission_rebate_due=initial_commission_rebate_due,
+            initial_commission_rebate_month_id=(
+                initial_commission_rebate_month_id
+            ),
             initial_alive=initial_alive,
             initial_equity_scale=initial_equity_scale,
             initial_short_sale_collateral=initial_short_sale_collateral,
@@ -748,6 +891,14 @@ def _compiled_day_runner(
             result.final_short_margin_collateral,
             result.final_alive,
             result.final_equity_scale,
+            result.commission_rebate_accrued_history[0],
+            result.commission_rebate_paid_history[0],
+            result.event_commission_rebate_accrued[0],
+            result.commission_rebate_current_history[0],
+            result.commission_rebate_due_history[0],
+            result.final_commission_rebate_current,
+            result.final_commission_rebate_due,
+            result.final_commission_rebate_month_id,
         )
 
     compiled = torch.compile(
@@ -775,6 +926,9 @@ def _day_inputs(
         prepared.can_sell_mask[sl],
         prepared.buy_fee_rates[sl],
         prepared.sell_fee_rates[sl],
+        prepared.commission_rebate_rates[sl],
+        prepared.session_month_ids[sl],
+        prepared.commission_rebate_payment_eligible_mask[sl],
         prepared.can_short_open_mask[sl],
         prepared.force_short_cover_mask[sl],
         prepared.short_margin_rate[sl],
@@ -799,6 +953,9 @@ def _state_tuple(prepared: _PreparedInputs) -> tuple[torch.Tensor, ...]:
         prepared.initial_short_margin_collateral,
         prepared.initial_alive,
         prepared.initial_equity_scale,
+        prepared.initial_commission_rebate_current,
+        prepared.initial_commission_rebate_due,
+        prepared.initial_commission_rebate_month_id,
     )
 
 
@@ -812,6 +969,9 @@ def _next_state(values: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
         values[19],
         values[20],
         values[21],
+        values[27],
+        values[28],
+        values[29],
     )
 
 
@@ -873,6 +1033,19 @@ def _prefix_result(
         short_sale_collateral_history=torch.stack([row[18] for row in rows]),
         short_margin_collateral_history=torch.stack([row[19] for row in rows]),
         equity_scale_history=torch.stack([row[21] for row in rows]),
+        commission_rebate_accrued_history=torch.stack(
+            [row[22] for row in rows]
+        ),
+        commission_rebate_paid_history=torch.stack([row[23] for row in rows]),
+        event_commission_rebate_accrued=torch.stack(
+            [row[24] for row in rows]
+        ),
+        commission_rebate_current_history=torch.stack(
+            [row[25] for row in rows]
+        ),
+        commission_rebate_due_history=torch.stack(
+            [row[26] for row in rows]
+        ),
         final_weights=final[14],
         final_cash=final[15],
         final_payables=final[16],
@@ -881,6 +1054,9 @@ def _prefix_result(
         final_short_margin_collateral=final[19],
         final_alive=final[20],
         final_equity_scale=final[21],
+        final_commission_rebate_current=final[27],
+        final_commission_rebate_due=final[28],
+        final_commission_rebate_month_id=final[29],
         final_due_weights=(final[14] if prepared.mode == "tw_overnight" else None),
     )
 
@@ -932,6 +1108,19 @@ def _concat_results(
         equity_scale_history=cat("equity_scale_history"),
         short_sale_collateral_history=cat("short_sale_collateral_history"),
         short_margin_collateral_history=cat("short_margin_collateral_history"),
+        commission_rebate_accrued_history=cat(
+            "commission_rebate_accrued_history"
+        ),
+        commission_rebate_paid_history=cat("commission_rebate_paid_history"),
+        commission_rebate_current_history=cat(
+            "commission_rebate_current_history"
+        ),
+        commission_rebate_due_history=cat(
+            "commission_rebate_due_history"
+        ),
+        event_commission_rebate_accrued=cat(
+            "event_commission_rebate_accrued"
+        ),
         final_weights=final.final_weights,
         final_cash=final.final_cash,
         final_payables=final.final_payables,
@@ -940,6 +1129,13 @@ def _concat_results(
         final_equity_scale=final.final_equity_scale,
         final_short_sale_collateral=final.final_short_sale_collateral,
         final_short_margin_collateral=final.final_short_margin_collateral,
+        final_commission_rebate_current=(
+            final.final_commission_rebate_current
+        ),
+        final_commission_rebate_due=final.final_commission_rebate_due,
+        final_commission_rebate_month_id=(
+            final.final_commission_rebate_month_id
+        ),
         due_weights_history=(
             torch.cat(
                 [
@@ -973,6 +1169,12 @@ def _eager_tail(
         can_sell_mask=prepared.can_sell_mask[sl],
         buy_fee_rates=prepared.buy_fee_rates[sl],
         sell_fee_rates=prepared.sell_fee_rates[sl],
+        commission_rebate_rates=prepared.commission_rebate_rates[sl],
+        commission_rebate_timing=prepared.commission_rebate_timing,
+        session_month_ids=prepared.session_month_ids[sl],
+        commission_rebate_payment_eligible_mask=(
+            prepared.commission_rebate_payment_eligible_mask[sl]
+        ),
         can_short_open_mask=(
             prepared.can_short_open_mask[sl] if prepared.has_short_open_mask else None
         ),
@@ -1020,6 +1222,9 @@ def _eager_tail(
         initial_short_margin_collateral=state[5],
         initial_alive=state[6],
         initial_equity_scale=state[7],
+        initial_commission_rebate_current=state[8],
+        initial_commission_rebate_due=state[9],
+        initial_commission_rebate_month_id=state[10],
         detach_initial_state=False,
     )
 
@@ -1117,6 +1322,10 @@ def _run_compiled_public(
     can_sell_mask: torch.Tensor,
     buy_fee_rates: torch.Tensor | float,
     sell_fee_rates: torch.Tensor | float,
+    commission_rebate_rates: torch.Tensor | float,
+    commission_rebate_timing: str,
+    session_month_ids: torch.Tensor | None,
+    commission_rebate_payment_eligible_mask: torch.Tensor | None,
     can_short_open_mask: torch.Tensor | None,
     force_short_cover_mask: torch.Tensor | None,
     short_margin_rate: torch.Tensor | float | None,
@@ -1138,6 +1347,9 @@ def _run_compiled_public(
     initial_cash: torch.Tensor | None,
     initial_payables: torch.Tensor | None,
     initial_receivables: torch.Tensor | None,
+    initial_commission_rebate_current: torch.Tensor | None,
+    initial_commission_rebate_due: torch.Tensor | None,
+    initial_commission_rebate_month_id: torch.Tensor | None,
     initial_alive: torch.Tensor | None,
     initial_equity_scale: torch.Tensor | None,
     initial_short_sale_collateral: torch.Tensor | None,
@@ -1154,6 +1366,12 @@ def _run_compiled_public(
         can_sell_mask=can_sell_mask,
         buy_fee_rates=buy_fee_rates,
         sell_fee_rates=sell_fee_rates,
+        commission_rebate_rates=commission_rebate_rates,
+        commission_rebate_timing=commission_rebate_timing,
+        session_month_ids=session_month_ids,
+        commission_rebate_payment_eligible_mask=(
+            commission_rebate_payment_eligible_mask
+        ),
         can_short_open_mask=can_short_open_mask,
         force_short_cover_mask=force_short_cover_mask,
         short_margin_rate=short_margin_rate,
@@ -1175,6 +1393,9 @@ def _run_compiled_public(
         initial_cash=initial_cash,
         initial_payables=initial_payables,
         initial_receivables=initial_receivables,
+        initial_commission_rebate_current=initial_commission_rebate_current,
+        initial_commission_rebate_due=initial_commission_rebate_due,
+        initial_commission_rebate_month_id=initial_commission_rebate_month_id,
         initial_alive=initial_alive,
         initial_equity_scale=initial_equity_scale,
         initial_short_sale_collateral=initial_short_sale_collateral,
@@ -1196,6 +1417,10 @@ def run_tw_cash_dual_session_compiled(
     buy_fee_rates: torch.Tensor | float,
     sell_fee_rates: torch.Tensor | float,
     *,
+    commission_rebate_rates: torch.Tensor | float = 0.0,
+    commission_rebate_timing: str = "daily_close",
+    session_month_ids: torch.Tensor | None = None,
+    commission_rebate_payment_eligible_mask: torch.Tensor | None = None,
     can_short_open_mask: torch.Tensor | None = None,
     force_short_cover_mask: torch.Tensor | None = None,
     short_margin_rate: torch.Tensor | float | None = None,
@@ -1217,6 +1442,9 @@ def run_tw_cash_dual_session_compiled(
     initial_cash: torch.Tensor | None = None,
     initial_payables: torch.Tensor | None = None,
     initial_receivables: torch.Tensor | None = None,
+    initial_commission_rebate_current: torch.Tensor | None = None,
+    initial_commission_rebate_due: torch.Tensor | None = None,
+    initial_commission_rebate_month_id: torch.Tensor | None = None,
     initial_alive: torch.Tensor | None = None,
     initial_equity_scale: torch.Tensor | None = None,
     initial_short_sale_collateral: torch.Tensor | None = None,
@@ -1233,6 +1461,12 @@ def run_tw_cash_dual_session_compiled(
         can_sell_mask=can_sell_mask,
         buy_fee_rates=buy_fee_rates,
         sell_fee_rates=sell_fee_rates,
+        commission_rebate_rates=commission_rebate_rates,
+        commission_rebate_timing=commission_rebate_timing,
+        session_month_ids=session_month_ids,
+        commission_rebate_payment_eligible_mask=(
+            commission_rebate_payment_eligible_mask
+        ),
         can_short_open_mask=can_short_open_mask,
         force_short_cover_mask=force_short_cover_mask,
         short_margin_rate=short_margin_rate,
@@ -1254,6 +1488,9 @@ def run_tw_cash_dual_session_compiled(
         initial_cash=initial_cash,
         initial_payables=initial_payables,
         initial_receivables=initial_receivables,
+        initial_commission_rebate_current=initial_commission_rebate_current,
+        initial_commission_rebate_due=initial_commission_rebate_due,
+        initial_commission_rebate_month_id=initial_commission_rebate_month_id,
         initial_alive=initial_alive,
         initial_equity_scale=initial_equity_scale,
         initial_short_sale_collateral=initial_short_sale_collateral,
@@ -1272,6 +1509,10 @@ def run_tw_overnight_dual_session_compiled(
     buy_fee_rates: torch.Tensor | float,
     sell_fee_rates: torch.Tensor | float,
     *,
+    commission_rebate_rates: torch.Tensor | float = 0.0,
+    commission_rebate_timing: str = "daily_close",
+    session_month_ids: torch.Tensor | None = None,
+    commission_rebate_payment_eligible_mask: torch.Tensor | None = None,
     can_short_open_mask: torch.Tensor | None = None,
     force_short_cover_mask: torch.Tensor | None = None,
     short_margin_rate: torch.Tensor | float | None = None,
@@ -1293,6 +1534,9 @@ def run_tw_overnight_dual_session_compiled(
     initial_cash: torch.Tensor | None = None,
     initial_payables: torch.Tensor | None = None,
     initial_receivables: torch.Tensor | None = None,
+    initial_commission_rebate_current: torch.Tensor | None = None,
+    initial_commission_rebate_due: torch.Tensor | None = None,
+    initial_commission_rebate_month_id: torch.Tensor | None = None,
     initial_alive: torch.Tensor | None = None,
     initial_equity_scale: torch.Tensor | None = None,
     initial_short_sale_collateral: torch.Tensor | None = None,
@@ -1309,6 +1553,12 @@ def run_tw_overnight_dual_session_compiled(
         can_sell_mask=can_sell_mask,
         buy_fee_rates=buy_fee_rates,
         sell_fee_rates=sell_fee_rates,
+        commission_rebate_rates=commission_rebate_rates,
+        commission_rebate_timing=commission_rebate_timing,
+        session_month_ids=session_month_ids,
+        commission_rebate_payment_eligible_mask=(
+            commission_rebate_payment_eligible_mask
+        ),
         can_short_open_mask=can_short_open_mask,
         force_short_cover_mask=force_short_cover_mask,
         short_margin_rate=short_margin_rate,
@@ -1330,6 +1580,9 @@ def run_tw_overnight_dual_session_compiled(
         initial_cash=initial_cash,
         initial_payables=initial_payables,
         initial_receivables=initial_receivables,
+        initial_commission_rebate_current=initial_commission_rebate_current,
+        initial_commission_rebate_due=initial_commission_rebate_due,
+        initial_commission_rebate_month_id=initial_commission_rebate_month_id,
         initial_alive=initial_alive,
         initial_equity_scale=initial_equity_scale,
         initial_short_sale_collateral=initial_short_sale_collateral,

@@ -62,7 +62,8 @@ from stockagent.backtest.tw_execution import (
     TW_CARRYING_EXECUTION_MODES,
     TaiwanFeeSchedule,
     TaiwanMarginShortSchedule,
-    effective_fee_rate_vectors,
+    commission_rebate_rate_vector,
+    gross_fee_rate_vectors,
     lot_size_vector,
     normalize_execution_mode,
     official_tw_short_initial_margin_rates,
@@ -540,6 +541,8 @@ class _ExecutionRuntime:
     sell_fee_rates: torch.Tensor | None
     lot_sizes: np.ndarray | None
     settlement_lag_sessions: int
+    commission_rebate_rates: torch.Tensor | None = None
+    commission_rebate_timing: str = "daily_close"
     minimum_commission: float = 0.0
     commission_rounding: str = "none"
     tax_rounding: str = "none"
@@ -548,6 +551,7 @@ class _ExecutionRuntime:
     # its compute dtype.
     integer_buy_fee_rates: np.ndarray | None = None
     integer_sell_fee_rates: np.ndarray | None = None
+    integer_commission_rebate_rates: np.ndarray | None = None
     short_lot_sizes: np.ndarray | None = None
     short_initial_margin_rate: float = 0.90
     short_handling_fee_rate: float = 0.0
@@ -571,6 +575,10 @@ def _build_execution_runtime(
             mode=mode,
             buy_fee_rates=None,
             sell_fee_rates=None,
+            commission_rebate_rates=None,
+            commission_rebate_timing=str(
+                config.trading.tw_commission_rebate_timing
+            ),
             lot_sizes=None,
             settlement_lag_sessions=lag,
         )
@@ -664,6 +672,7 @@ def _build_execution_runtime(
     schedule = TaiwanFeeSchedule(
         commission_rate=config.trading.tw_commission_rate,
         commission_discount=config.trading.tw_commission_discount,
+        commission_rebate_timing=config.trading.tw_commission_rebate_timing,
         stock_sell_tax=config.trading.tw_stock_sell_tax,
         etf_sell_tax=config.trading.tw_etf_sell_tax,
         day_trade_stock_sell_tax=config.trading.tw_day_trade_stock_sell_tax,
@@ -675,7 +684,12 @@ def _build_execution_runtime(
         cash_lot_size=config.trading.tw_cash_lot_size,
         day_trade_default_lot_size=config.trading.tw_day_trade_lot_size,
     )
-    buy_rates, sell_rates = effective_fee_rate_vectors(
+    buy_rates, sell_rates = gross_fee_rate_vectors(
+        panel.symbols,
+        mode,
+        fee_schedule=schedule,
+    )
+    rebate_rates = commission_rebate_rate_vector(
         panel.symbols,
         mode,
         fee_schedule=schedule,
@@ -699,6 +713,12 @@ def _build_execution_runtime(
             device=device,
             dtype=torch.float32,
         ),
+        commission_rebate_rates=torch.as_tensor(
+            rebate_rates,
+            device=device,
+            dtype=torch.float32,
+        ),
+        commission_rebate_timing=schedule.commission_rebate_timing,
         lot_sizes=lots,
         settlement_lag_sessions=lag,
         minimum_commission=schedule.minimum_commission,
@@ -706,6 +726,7 @@ def _build_execution_runtime(
         tax_rounding=schedule.tax_rounding,
         integer_buy_fee_rates=buy_rates.copy(),
         integer_sell_fee_rates=sell_rates.copy(),
+        integer_commission_rebate_rates=rebate_rates.copy(),
         short_lot_sizes=np.full(
             len(panel.symbols), short_schedule.lot_size, dtype=np.int64
         ),
@@ -747,11 +768,17 @@ def _integer_execution_runtime_kwargs(
         or runtime.lot_sizes is None
         or runtime.integer_buy_fee_rates is None
         or runtime.integer_sell_fee_rates is None
+        or runtime.integer_commission_rebate_rates is None
     ):
         raise RuntimeError(f"{runtime.mode} integer audit schedule is incomplete")
     kwargs.update(
         buy_fee_rates=np.asarray(runtime.integer_buy_fee_rates, dtype=np.float64),
         sell_fee_rates=np.asarray(runtime.integer_sell_fee_rates, dtype=np.float64),
+        commission_rebate_rates=np.asarray(
+            runtime.integer_commission_rebate_rates,
+            dtype=np.float64,
+        ),
+        commission_rebate_timing=runtime.commission_rebate_timing,
         lot_sizes=np.asarray(runtime.lot_sizes),
         open_prices=open_prices,
         day_trade_eligible_mask=day_trade_eligible_mask,
@@ -1447,6 +1474,9 @@ class _CompiledLossFallback:
                 aux_outputs.pop("_final_cash", None)
                 aux_outputs.pop("_final_payables", None)
                 aux_outputs.pop("_final_receivables", None)
+                aux_outputs.pop("_final_commission_rebate_current", None)
+                aux_outputs.pop("_final_commission_rebate_due", None)
+                aux_outputs.pop("_final_commission_rebate_month_id", None)
                 aux_outputs.pop("_final_equity_scale", None)
             return self._eager_fn(*args, **kwargs)
 
@@ -1904,6 +1934,8 @@ def _evaluated_backtest_loss(
     unresolved_corporate_action_mask: torch.Tensor | None = None,
     cash_dividend_yield: torch.Tensor | None = None,
     cash_dividend_payment_delay_sessions: torch.Tensor | None = None,
+    session_month_ids: torch.Tensor | None = None,
+    commission_rebate_payment_eligible_mask: torch.Tensor | None = None,
     symbol_indices: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if _is_return_series_objective(objective):
@@ -1930,6 +1962,20 @@ def _evaluated_backtest_loss(
         ),
         sell_fee_rates=(
             None if execution_runtime is None else execution_runtime.sell_fee_rates
+        ),
+        commission_rebate_rates=(
+            None
+            if execution_runtime is None
+            else execution_runtime.commission_rebate_rates
+        ),
+        commission_rebate_timing=(
+            config.trading.tw_commission_rebate_timing
+            if execution_runtime is None
+            else execution_runtime.commission_rebate_timing
+        ),
+        session_month_ids=session_month_ids,
+        commission_rebate_payment_eligible_mask=(
+            commission_rebate_payment_eligible_mask
         ),
         settlement_lag_sessions=(
             config.trading.tw_settlement_lag_sessions
@@ -2267,6 +2313,8 @@ def _evaluate_windowed_aux_objective_loss(
     force_cover_chunks: list[torch.Tensor] = []
     force_exit_chunks: list[torch.Tensor] = []
     state_advance_chunks: list[torch.Tensor] = []
+    session_month_id_chunks: list[torch.Tensor] = []
+    commission_rebate_payment_chunks: list[torch.Tensor] = []
     day_trade_eligible_chunks: list[torch.Tensor] = []
     day_trade_buy_open_chunks: list[torch.Tensor] = []
     day_trade_sell_open_chunks: list[torch.Tensor] = []
@@ -2353,6 +2401,10 @@ def _evaluate_windowed_aux_objective_loss(
             force_cover_chunks.append(batch["force_short_cover_mask"])
             force_exit_chunks.append(batch["force_exit_mask"])
             state_advance_chunks.append(batch["session_advance_mask"])
+            session_month_id_chunks.append(batch["session_month_ids"])
+            commission_rebate_payment_chunks.append(
+                batch["commission_rebate_payment_eligible_mask"]
+            )
             if "day_trade_eligible_mask" in batch:
                 day_trade_eligible_chunks.append(batch["day_trade_eligible_mask"])
             if "day_trade_can_buy_open_mask" in batch:
@@ -2424,6 +2476,11 @@ def _evaluate_windowed_aux_objective_loss(
         else None
     )
     execution_mode = "naive" if execution_runtime is None else execution_runtime.mode
+    session_month_ids_all = torch.cat(session_month_id_chunks, dim=0)
+    commission_rebate_payment_all = torch.cat(
+        commission_rebate_payment_chunks,
+        dim=0,
+    )
     if execution_mode != normalize_execution_mode(split.execution_mode):
         raise ValueError(
             "full-objective evaluation execution mode differs from the windowed split: "
@@ -2537,6 +2594,20 @@ def _evaluate_windowed_aux_objective_loss(
         ),
         sell_fee_rates=(
             None if execution_runtime is None else execution_runtime.sell_fee_rates
+        ),
+        commission_rebate_rates=(
+            None
+            if execution_runtime is None
+            else execution_runtime.commission_rebate_rates
+        ),
+        commission_rebate_timing=(
+            "daily_close"
+            if execution_runtime is None
+            else execution_runtime.commission_rebate_timing
+        ),
+        session_month_ids=session_month_ids_all,
+        commission_rebate_payment_eligible_mask=(
+            commission_rebate_payment_all
         ),
         settlement_lag_sessions=(
             2 if execution_runtime is None else execution_runtime.settlement_lag_sessions
@@ -4816,6 +4887,9 @@ def _trading_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
         contract["taiwan_execution"] = {
             "commission_rate": float(trading.tw_commission_rate),
             "commission_discount": float(trading.tw_commission_discount),
+            "commission_rebate_timing": str(
+                trading.tw_commission_rebate_timing
+            ),
             "stock_sell_tax": float(trading.tw_stock_sell_tax),
             "etf_sell_tax": float(trading.tw_etf_sell_tax),
             "day_trade_stock_sell_tax": float(
@@ -6428,6 +6502,19 @@ def _save_backtest_artifact(
     require_row_history("cash_history", result.cash_history, ndim=1)
     require_row_history("payables_history", result.payables_history, ndim=2)
     require_row_history("receivables_history", result.receivables_history, ndim=2)
+    for name, value in (
+        (
+            "commission_rebate_accrued_history",
+            result.commission_rebate_accrued_history,
+        ),
+        ("commission_rebate_paid_history", result.commission_rebate_paid_history),
+        (
+            "commission_rebate_current_history",
+            result.commission_rebate_current_history,
+        ),
+        ("commission_rebate_due_history", result.commission_rebate_due_history),
+    ):
+        require_row_history(name, value, ndim=1)
     require_row_history("settlement_default", result.settlement_default, ndim=1)
     require_row_history("equity_scale_history", result.equity_scale_history, ndim=1)
     require_row_history("shares_history", result.shares_history, ndim=2)
@@ -6507,6 +6594,16 @@ def _save_backtest_artifact(
     for name, value in (
         ("short_sale_collateral_history", short_sale_collateral_history),
         ("short_margin_collateral_history", short_margin_collateral_history),
+        (
+            "commission_rebate_accrued_history",
+            result.commission_rebate_accrued_history,
+        ),
+        ("commission_rebate_paid_history", result.commission_rebate_paid_history),
+        (
+            "commission_rebate_current_history",
+            result.commission_rebate_current_history,
+        ),
+        ("commission_rebate_due_history", result.commission_rebate_due_history),
     ):
         if value is not None:
             array = np.asarray(value)
@@ -6554,6 +6651,15 @@ def _save_backtest_artifact(
         ("final_cash", result.final_cash),
         ("final_equity_scale", result.final_equity_scale),
         ("final_alive", result.final_alive),
+        (
+            "final_commission_rebate_current",
+            result.final_commission_rebate_current,
+        ),
+        ("final_commission_rebate_due", result.final_commission_rebate_due),
+        (
+            "final_commission_rebate_month_id",
+            result.final_commission_rebate_month_id,
+        ),
     ):
         if value is not None and np.asarray(value).shape != ():
             raise ValueError(f"backtest artifact {name} must be scalar")
@@ -6567,6 +6673,39 @@ def _save_backtest_artifact(
             raise ValueError(
                 f"backtest artifact {name} must be a non-empty vector"
             )
+    rebate_histories = (
+        result.commission_rebate_accrued_history,
+        result.commission_rebate_paid_history,
+        result.commission_rebate_current_history,
+        result.commission_rebate_due_history,
+    )
+    rebate_history_count = sum(value is not None for value in rebate_histories)
+    if rebate_history_count not in {0, len(rebate_histories)}:
+        raise ValueError(
+            "backtest artifact commission rebate histories must be complete or omitted"
+        )
+    rebate_terminal_fields = (
+        result.final_commission_rebate_current,
+        result.final_commission_rebate_due,
+        result.final_commission_rebate_month_id,
+    )
+    rebate_terminal_count = sum(
+        value is not None for value in rebate_terminal_fields
+    )
+    if rebate_terminal_count not in {0, len(rebate_terminal_fields)}:
+        raise ValueError(
+            "backtest artifact final commission rebate state must be complete or omitted"
+        )
+    if rebate_terminal_count and not rebate_history_count:
+        raise ValueError(
+            "backtest artifact final commission rebate state requires rebate histories"
+        )
+    if result.final_commission_rebate_month_id is not None and int(
+        np.asarray(result.final_commission_rebate_month_id).item()
+    ) < 0:
+        raise ValueError(
+            "backtest artifact final commission rebate month id must be non-negative"
+        )
     terminal_fields = (
         result.final_weights,
         result.final_cash,
@@ -6700,6 +6839,16 @@ def _save_backtest_artifact(
                 final_short_sale_collateral=final_short_sale_collateral,
                 final_short_margin_collateral=final_short_margin_collateral,
             )
+        if rebate_history_count:
+            required_integer_outputs.update(
+                final_commission_rebate_current=(
+                    result.final_commission_rebate_current
+                ),
+                final_commission_rebate_due=result.final_commission_rebate_due,
+                final_commission_rebate_month_id=(
+                    result.final_commission_rebate_month_id
+                ),
+            )
         missing_integer_outputs = sorted(
             name for name, value in required_integer_outputs.items() if value is None
         )
@@ -6742,6 +6891,18 @@ def _save_backtest_artifact(
         ) or bool(np.asarray(result.final_alive).item()) != bool(integer_state.alive):
             raise ValueError(
                 "integer backtest artifact final cash/alive fields disagree with terminal state"
+            )
+        if rebate_history_count and (
+            float(np.asarray(result.final_commission_rebate_current).item())
+            != float(integer_state.commission_rebate_current)
+            or float(np.asarray(result.final_commission_rebate_due).item())
+            != float(integer_state.commission_rebate_due)
+            or int(np.asarray(result.final_commission_rebate_month_id).item())
+            != int(integer_state.commission_rebate_month_id)
+        ):
+            raise ValueError(
+                "integer backtest artifact final commission rebate state "
+                "disagrees with terminal state"
             )
         integer_short_sale_collateral = integer_state.short_sale_collateral
         integer_short_margin_collateral = integer_state.short_margin_collateral
@@ -6851,7 +7012,10 @@ def _save_backtest_artifact(
                 )
     writer = np.savez_compressed if str(compression).strip().lower() == "compressed" else np.savez
     payload: dict[str, np.ndarray] = {
-        "artifact_schema_version": np.asarray(5, dtype=np.int64),
+        "artifact_schema_version": np.asarray(
+            6 if rebate_history_count else 5,
+            dtype=np.int64,
+        ),
         "execution_mode": np.asarray(mode, dtype="U32"),
         "settlement_ledger_unit": np.asarray(ledger_unit, dtype="U16"),
         "strategy_returns": strategy_returns,
@@ -6894,12 +7058,40 @@ def _save_backtest_artifact(
     add_optional("cash_history", result.cash_history)
     add_optional("payables_history", result.payables_history)
     add_optional("receivables_history", result.receivables_history)
+    add_optional(
+        "commission_rebate_accrued_history",
+        result.commission_rebate_accrued_history,
+    )
+    add_optional(
+        "commission_rebate_paid_history",
+        result.commission_rebate_paid_history,
+    )
+    add_optional(
+        "commission_rebate_current_history",
+        result.commission_rebate_current_history,
+    )
+    add_optional(
+        "commission_rebate_due_history",
+        result.commission_rebate_due_history,
+    )
     add_optional("settlement_default", result.settlement_default)
     add_optional("equity_scale_history", result.equity_scale_history)
     add_optional("final_weights", result.final_weights)
     add_optional("final_cash", result.final_cash)
     add_optional("final_payables", result.final_payables)
     add_optional("final_receivables", result.final_receivables)
+    add_optional(
+        "final_commission_rebate_current",
+        result.final_commission_rebate_current,
+    )
+    add_optional(
+        "final_commission_rebate_due",
+        result.final_commission_rebate_due,
+    )
+    add_optional(
+        "final_commission_rebate_month_id",
+        result.final_commission_rebate_month_id,
+    )
     add_optional("final_alive", result.final_alive)
     add_optional("final_equity_scale", result.final_equity_scale)
     add_optional("shares_history", result.shares_history)
@@ -6934,6 +7126,18 @@ def _save_backtest_artifact(
                 integer_state.last_nav, dtype=np.float64
             ),
             integer_state_alive=np.asarray(integer_state.alive, dtype=np.bool_),
+            integer_state_commission_rebate_current=np.asarray(
+                integer_state.commission_rebate_current,
+                dtype=np.float64,
+            ),
+            integer_state_commission_rebate_due=np.asarray(
+                integer_state.commission_rebate_due,
+                dtype=np.float64,
+            ),
+            integer_state_commission_rebate_month_id=np.asarray(
+                integer_state.commission_rebate_month_id,
+                dtype=np.int64,
+            ),
             integer_state_last_weights=np.asarray(
                 integer_last_weights, dtype=np.float64
             ),
@@ -7108,6 +7312,18 @@ def _save_best_val_backtest_snapshot(
         receivables_history=sliced_optional_float32(
             val_backtest.receivables_history
         ),
+        commission_rebate_accrued_history=sliced_optional_float32(
+            val_backtest.commission_rebate_accrued_history
+        ),
+        commission_rebate_paid_history=sliced_optional_float32(
+            val_backtest.commission_rebate_paid_history
+        ),
+        commission_rebate_current_history=sliced_optional_float32(
+            val_backtest.commission_rebate_current_history
+        ),
+        commission_rebate_due_history=sliced_optional_float32(
+            val_backtest.commission_rebate_due_history
+        ),
         settlement_default=sliced_optional_bool(val_backtest.settlement_default),
         equity_scale_history=sliced_optional_float32(
             val_backtest.equity_scale_history
@@ -7126,6 +7342,20 @@ def _save_best_val_backtest_snapshot(
         final_payables=terminal_optional_float32(val_backtest.final_payables),
         final_receivables=terminal_optional_float32(
             val_backtest.final_receivables
+        ),
+        final_commission_rebate_current=terminal_optional_float32(
+            val_backtest.final_commission_rebate_current
+        ),
+        final_commission_rebate_due=terminal_optional_float32(
+            val_backtest.final_commission_rebate_due
+        ),
+        final_commission_rebate_month_id=(
+            None
+            if not preserves_terminal_state
+            or val_backtest.final_commission_rebate_month_id is None
+            else val_backtest.final_commission_rebate_month_id.detach()
+            .to(device="cpu", dtype=torch.int64)
+            .numpy()
         ),
         final_alive=terminal_optional_bool(val_backtest.final_alive),
         final_equity_scale=terminal_optional_float32(
@@ -7835,6 +8065,47 @@ def _save_settlement_audit_artifacts(
         "receivables_total": receivables.sum(axis=1),
         "settlement_default": defaults,
     }
+    rebate_values = (
+        result.commission_rebate_accrued_history,
+        result.commission_rebate_paid_history,
+        result.commission_rebate_current_history,
+        result.commission_rebate_due_history,
+    )
+    if any(value is not None for value in rebate_values):
+        if any(value is None for value in rebate_values):
+            raise RuntimeError(
+                "settlement audit has incomplete commission rebate histories"
+            )
+        (
+            rebate_accrued,
+            rebate_paid,
+            rebate_current,
+            rebate_due,
+        ) = (
+            np.asarray(value, dtype=np.float64).reshape(-1)
+            for value in rebate_values
+        )
+        if any(
+            value.shape != (rows,)
+            or not np.all(np.isfinite(value))
+            or np.any(value < 0.0)
+            for value in (
+                rebate_accrued,
+                rebate_paid,
+                rebate_current,
+                rebate_due,
+            )
+        ):
+            raise ValueError(
+                "settlement commission rebate histories must be finite, "
+                "non-negative, and row-aligned"
+            )
+        data.update(
+            commission_rebate_accrued=rebate_accrued,
+            commission_rebate_paid=rebate_paid,
+            commission_rebate_current_receivable=rebate_current,
+            commission_rebate_due_receivable=rebate_due,
+        )
     if execution_mode in TW_CARRYING_EXECUTION_MODES:
         if (
             result.short_sale_collateral_history is None
@@ -7918,6 +8189,43 @@ def _save_settlement_audit_artifacts(
             None
             if result.final_receivables is None
             else np.asarray(result.final_receivables, dtype=np.float64).tolist()
+        ),
+        "commission_rebate_accrued_total": (
+            None
+            if result.commission_rebate_accrued_history is None
+            else float(
+                np.asarray(
+                    result.commission_rebate_accrued_history,
+                    dtype=np.float64,
+                ).sum()
+            )
+        ),
+        "commission_rebate_paid_total": (
+            None
+            if result.commission_rebate_paid_history is None
+            else float(
+                np.asarray(
+                    result.commission_rebate_paid_history,
+                    dtype=np.float64,
+                ).sum()
+            )
+        ),
+        "final_commission_rebate_current": (
+            None
+            if result.final_commission_rebate_current is None
+            else float(
+                np.asarray(result.final_commission_rebate_current).item()
+            )
+        ),
+        "final_commission_rebate_due": (
+            None
+            if result.final_commission_rebate_due is None
+            else float(np.asarray(result.final_commission_rebate_due).item())
+        ),
+        "final_commission_rebate_month_id": (
+            None
+            if result.final_commission_rebate_month_id is None
+            else int(np.asarray(result.final_commission_rebate_month_id).item())
         ),
         "final_alive": (
             None if result.final_alive is None else bool(np.asarray(result.final_alive).item())
@@ -8101,7 +8409,7 @@ def _load_backtest_artifact(output_path: Path) -> tuple[BacktestResult, np.ndarr
             if "artifact_schema_version" in keys
             else 1
         )
-        if schema_version < 1 or schema_version > 5:
+        if schema_version < 1 or schema_version > 6:
             raise ValueError(
                 f"unsupported backtest artifact schema version {schema_version}"
             )
@@ -8171,6 +8479,11 @@ def _load_backtest_artifact(output_path: Path) -> tuple[BacktestResult, np.ndarr
             "integer_state_short_sale_collateral",
             "integer_state_short_margin_collateral",
         }
+        integer_rebate_keys = {
+            "integer_state_commission_rebate_current",
+            "integer_state_commission_rebate_due",
+            "integer_state_commission_rebate_month_id",
+        }
         present_integer_keys = integer_keys & keys
         if present_integer_keys and present_integer_keys != integer_keys:
             missing_integer = sorted(integer_keys - present_integer_keys)
@@ -8184,6 +8497,29 @@ def _load_backtest_artifact(output_path: Path) -> tuple[BacktestResult, np.ndarr
                 "a complete integer terminal state"
             )
         present_integer_collateral_keys = integer_collateral_keys & keys
+        present_integer_rebate_keys = integer_rebate_keys & keys
+        if present_integer_rebate_keys and not integer_keys.issubset(keys):
+            raise ValueError(
+                "backtest artifact contains integer commission rebate state "
+                "without a complete integer terminal state"
+            )
+        if present_integer_rebate_keys and (
+            present_integer_rebate_keys != integer_rebate_keys
+        ):
+            missing_rebate = sorted(integer_rebate_keys - present_integer_rebate_keys)
+            raise ValueError(
+                "backtest artifact contains incomplete integer commission "
+                "rebate state; missing: "
+                + ", ".join(missing_rebate)
+            )
+        if (
+            schema_version >= 6
+            and integer_keys.issubset(keys)
+            and present_integer_rebate_keys != integer_rebate_keys
+        ):
+            raise ValueError(
+                "schema-6 integer backtest artifact is missing commission rebate state"
+            )
         if present_integer_collateral_keys and not integer_keys.issubset(keys):
             raise ValueError(
                 "backtest artifact contains integer short collateral without "
@@ -8242,6 +8578,33 @@ def _load_backtest_artifact(output_path: Path) -> tuple[BacktestResult, np.ndarr
                 ).copy(),
                 last_nav=float(np.asarray(data["integer_state_last_nav"]).item()),
                 alive=bool(np.asarray(data["integer_state_alive"]).item()),
+                commission_rebate_current=(
+                    float(
+                        np.asarray(
+                            data["integer_state_commission_rebate_current"]
+                        ).item()
+                    )
+                    if "integer_state_commission_rebate_current" in keys
+                    else 0.0
+                ),
+                commission_rebate_due=(
+                    float(
+                        np.asarray(
+                            data["integer_state_commission_rebate_due"]
+                        ).item()
+                    )
+                    if "integer_state_commission_rebate_due" in keys
+                    else 0.0
+                ),
+                commission_rebate_month_id=(
+                    int(
+                        np.asarray(
+                            data["integer_state_commission_rebate_month_id"]
+                        ).item()
+                    )
+                    if "integer_state_commission_rebate_month_id" in keys
+                    else 0
+                ),
                 last_weights=integer_last_weights,
                 short_sale_collateral=(
                     np.asarray(
@@ -8303,12 +8666,34 @@ def _load_backtest_artifact(output_path: Path) -> tuple[BacktestResult, np.ndarr
             cash_history=optional("cash_history"),
             payables_history=optional("payables_history"),
             receivables_history=optional("receivables_history"),
+            commission_rebate_accrued_history=optional(
+                "commission_rebate_accrued_history"
+            ),
+            commission_rebate_paid_history=optional(
+                "commission_rebate_paid_history"
+            ),
+            commission_rebate_current_history=optional(
+                "commission_rebate_current_history"
+            ),
+            commission_rebate_due_history=optional(
+                "commission_rebate_due_history"
+            ),
             settlement_default=optional("settlement_default", np.bool_),
             equity_scale_history=optional("equity_scale_history"),
             final_weights=optional("final_weights"),
             final_cash=optional("final_cash"),
             final_payables=optional("final_payables"),
             final_receivables=optional("final_receivables"),
+            final_commission_rebate_current=optional(
+                "final_commission_rebate_current"
+            ),
+            final_commission_rebate_due=optional(
+                "final_commission_rebate_due"
+            ),
+            final_commission_rebate_month_id=optional(
+                "final_commission_rebate_month_id",
+                np.int64,
+            ),
             final_alive=optional("final_alive", np.bool_),
             final_equity_scale=optional("final_equity_scale"),
             shares_history=optional("shares_history", np.int64),
@@ -8350,6 +8735,26 @@ def _load_backtest_artifact(output_path: Path) -> tuple[BacktestResult, np.ndarr
         ("cash_history", result.cash_history, 1),
         ("payables_history", result.payables_history, 2),
         ("receivables_history", result.receivables_history, 2),
+        (
+            "commission_rebate_accrued_history",
+            result.commission_rebate_accrued_history,
+            1,
+        ),
+        (
+            "commission_rebate_paid_history",
+            result.commission_rebate_paid_history,
+            1,
+        ),
+        (
+            "commission_rebate_current_history",
+            result.commission_rebate_current_history,
+            1,
+        ),
+        (
+            "commission_rebate_due_history",
+            result.commission_rebate_due_history,
+            1,
+        ),
         ("settlement_default", result.settlement_default, 1),
         ("equity_scale_history", result.equity_scale_history, 1),
         ("shares_history", result.shares_history, 2),
@@ -8454,6 +8859,16 @@ def _load_backtest_artifact(output_path: Path) -> tuple[BacktestResult, np.ndarr
     for name, value in (
         ("short_sale_collateral_history", result.short_sale_collateral_history),
         ("short_margin_collateral_history", result.short_margin_collateral_history),
+        (
+            "commission_rebate_accrued_history",
+            result.commission_rebate_accrued_history,
+        ),
+        ("commission_rebate_paid_history", result.commission_rebate_paid_history),
+        (
+            "commission_rebate_current_history",
+            result.commission_rebate_current_history,
+        ),
+        ("commission_rebate_due_history", result.commission_rebate_due_history),
     ):
         if value is not None:
             array = np.asarray(value)
@@ -8571,9 +8986,55 @@ def _load_backtest_artifact(output_path: Path) -> tuple[BacktestResult, np.ndarr
         ("final_cash", result.final_cash),
         ("final_equity_scale", result.final_equity_scale),
         ("final_alive", result.final_alive),
+        (
+            "final_commission_rebate_current",
+            result.final_commission_rebate_current,
+        ),
+        ("final_commission_rebate_due", result.final_commission_rebate_due),
+        (
+            "final_commission_rebate_month_id",
+            result.final_commission_rebate_month_id,
+        ),
     ):
         if value is not None and np.asarray(value).shape != ():
             raise ValueError(f"backtest artifact {name} must be scalar")
+    rebate_histories = (
+        result.commission_rebate_accrued_history,
+        result.commission_rebate_paid_history,
+        result.commission_rebate_current_history,
+        result.commission_rebate_due_history,
+    )
+    rebate_history_count = sum(value is not None for value in rebate_histories)
+    if schema_version >= 6 and rebate_history_count != len(rebate_histories):
+        raise ValueError(
+            "schema-6 backtest artifact is missing commission rebate histories"
+        )
+    if rebate_history_count not in {0, len(rebate_histories)}:
+        raise ValueError(
+            "backtest artifact commission rebate histories are incomplete"
+        )
+    rebate_terminal_fields = (
+        result.final_commission_rebate_current,
+        result.final_commission_rebate_due,
+        result.final_commission_rebate_month_id,
+    )
+    rebate_terminal_count = sum(
+        value is not None for value in rebate_terminal_fields
+    )
+    if rebate_terminal_count not in {0, len(rebate_terminal_fields)}:
+        raise ValueError(
+            "backtest artifact final commission rebate state is incomplete"
+        )
+    if rebate_terminal_count and not rebate_history_count:
+        raise ValueError(
+            "backtest artifact final commission rebate state lacks histories"
+        )
+    if result.final_commission_rebate_month_id is not None and int(
+        np.asarray(result.final_commission_rebate_month_id).item()
+    ) < 0:
+        raise ValueError(
+            "backtest artifact final commission rebate month id is negative"
+        )
     if (result.final_payables is None) != (result.final_receivables is None):
         raise ValueError("backtest artifact has only one final claim queue")
     if result.final_payables is not None:
@@ -8733,6 +9194,20 @@ def _load_backtest_artifact(output_path: Path) -> tuple[BacktestResult, np.ndarr
                 "backtest artifact integer state last_weights are invalid"
             )
         if (
+            not np.isfinite(float(state.commission_rebate_current))
+            or float(state.commission_rebate_current) < 0.0
+            or not np.isfinite(float(state.commission_rebate_due))
+            or float(state.commission_rebate_due) < 0.0
+            or int(state.commission_rebate_month_id) < 0
+            or (
+                float(state.commission_rebate_current) > 0.0
+                and int(state.commission_rebate_month_id) == 0
+            )
+        ):
+            raise ValueError(
+                "backtest artifact integer commission rebate state is invalid"
+            )
+        if (
             state.last_weights is not None
             and result.final_weights is not None
             and not np.array_equal(
@@ -8771,6 +9246,14 @@ def _load_backtest_artifact(output_path: Path) -> tuple[BacktestResult, np.ndarr
             result.final_receivables,
             result.final_alive,
         ]
+        if rebate_history_count:
+            required_public_integer_fields.extend(
+                [
+                    result.final_commission_rebate_current,
+                    result.final_commission_rebate_due,
+                    result.final_commission_rebate_month_id,
+                ]
+            )
         if schema_version >= 3 and execution_mode == "tw_cash":
             required_public_integer_fields.extend(
                 [
@@ -8797,6 +9280,18 @@ def _load_backtest_artifact(output_path: Path) -> tuple[BacktestResult, np.ndarr
         ) or bool(np.asarray(result.final_alive).item()) != bool(state.alive):
             raise ValueError(
                 "backtest artifact integer cash/alive fields disagree with terminal state"
+            )
+        if rebate_history_count and (
+            float(np.asarray(result.final_commission_rebate_current).item())
+            != float(state.commission_rebate_current)
+            or float(np.asarray(result.final_commission_rebate_due).item())
+            != float(state.commission_rebate_due)
+            or int(np.asarray(result.final_commission_rebate_month_id).item())
+            != int(state.commission_rebate_month_id)
+        ):
+            raise ValueError(
+                "backtest artifact integer commission rebate state disagrees "
+                "with public terminal state"
             )
         if (state.short_sale_collateral is None) != (
             state.short_margin_collateral is None
@@ -8921,14 +9416,24 @@ def _dataset_short_contract_to_tensors(
 
 def _dataset_execution_masks_to_tensors(
     dataset: CrossSectionalDataset,
-) -> tuple[torch.Tensor, torch.Tensor | None]:
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor | None,
+    torch.Tensor,
+    torch.Tensor,
+]:
     valid_indices = torch.as_tensor(dataset.valid_indices, dtype=torch.long)
     eligibility = (
         None
         if dataset.day_trade_eligible_mask_t is None
         else dataset.day_trade_eligible_mask_t[valid_indices]
     )
-    return dataset.session_advance_mask_t[valid_indices], eligibility
+    return (
+        dataset.session_advance_mask_t[valid_indices],
+        eligibility,
+        dataset.session_month_ids_t[valid_indices],
+        dataset.commission_rebate_payment_eligible_mask_t[valid_indices],
+    )
 
 
 def _dataset_day_trade_open_masks_to_tensors(
@@ -9183,6 +9688,13 @@ def _prefix_backtest_result(result: BacktestResult, rows: int) -> BacktestResult
             ).copy(),
             last_nav=float(integer_state.last_nav),
             alive=bool(integer_state.alive),
+            commission_rebate_current=float(
+                integer_state.commission_rebate_current
+            ),
+            commission_rebate_due=float(integer_state.commission_rebate_due),
+            commission_rebate_month_id=int(
+                integer_state.commission_rebate_month_id
+            ),
             last_weights=(
                 None
                 if integer_state.last_weights is None
@@ -9222,6 +9734,30 @@ def _prefix_backtest_result(result: BacktestResult, rows: int) -> BacktestResult
             None
             if result.receivables_history is None
             else np.asarray(result.receivables_history[:rows]).copy()
+        ),
+        commission_rebate_accrued_history=(
+            None
+            if result.commission_rebate_accrued_history is None
+            else np.asarray(
+                result.commission_rebate_accrued_history[:rows]
+            ).copy()
+        ),
+        commission_rebate_paid_history=(
+            None
+            if result.commission_rebate_paid_history is None
+            else np.asarray(result.commission_rebate_paid_history[:rows]).copy()
+        ),
+        commission_rebate_current_history=(
+            None
+            if result.commission_rebate_current_history is None
+            else np.asarray(
+                result.commission_rebate_current_history[:rows]
+            ).copy()
+        ),
+        commission_rebate_due_history=(
+            None
+            if result.commission_rebate_due_history is None
+            else np.asarray(result.commission_rebate_due_history[:rows]).copy()
         ),
         settlement_default=(
             None
@@ -9327,6 +9863,24 @@ def _prefix_backtest_result(result: BacktestResult, rows: int) -> BacktestResult
             None
             if not preserves_terminal_state or result.final_receivables is None
             else np.asarray(result.final_receivables).copy()
+        ),
+        final_commission_rebate_current=(
+            None
+            if not preserves_terminal_state
+            or result.final_commission_rebate_current is None
+            else np.asarray(result.final_commission_rebate_current).copy()
+        ),
+        final_commission_rebate_due=(
+            None
+            if not preserves_terminal_state
+            or result.final_commission_rebate_due is None
+            else np.asarray(result.final_commission_rebate_due).copy()
+        ),
+        final_commission_rebate_month_id=(
+            None
+            if not preserves_terminal_state
+            or result.final_commission_rebate_month_id is None
+            else np.asarray(result.final_commission_rebate_month_id).copy()
         ),
         final_alive=(
             None
@@ -9676,6 +10230,10 @@ def _combine_datasets_to_windowed(
         symbol_indices=first.symbol_indices,
         execution_mode=first.execution_mode,
         session_advance_mask=first.session_advance_mask,
+        session_month_ids=first.session_month_ids,
+        commission_rebate_payment_eligible_mask=(
+            first.commission_rebate_payment_eligible_mask
+        ),
         day_trade_eligible_mask=first.day_trade_eligible_mask,
         day_trade_can_buy_open_mask=first.day_trade_can_buy_open_mask,
         day_trade_can_sell_open_mask=first.day_trade_can_sell_open_mask,
@@ -9714,6 +10272,10 @@ def _pad_windowed_training_split(split: WindowedSplitTensors, batch_size: int) -
             symbol_indices=split.symbol_indices,
             execution_mode=split.execution_mode,
             session_advance_mask=split.session_advance_mask,
+            session_month_ids=split.session_month_ids,
+            commission_rebate_payment_eligible_mask=(
+                split.commission_rebate_payment_eligible_mask
+            ),
             day_trade_eligible_mask=split.day_trade_eligible_mask,
             day_trade_can_buy_open_mask=split.day_trade_can_buy_open_mask,
             day_trade_can_sell_open_mask=split.day_trade_can_sell_open_mask,
@@ -9765,6 +10327,10 @@ def _pad_windowed_training_split(split: WindowedSplitTensors, batch_size: int) -
         symbol_indices=split.symbol_indices,
         execution_mode=split.execution_mode,
         session_advance_mask=split.session_advance_mask,
+        session_month_ids=split.session_month_ids,
+        commission_rebate_payment_eligible_mask=(
+            split.commission_rebate_payment_eligible_mask
+        ),
         day_trade_eligible_mask=split.day_trade_eligible_mask,
         day_trade_can_buy_open_mask=split.day_trade_can_buy_open_mask,
         day_trade_can_sell_open_mask=split.day_trade_can_sell_open_mask,
@@ -9855,6 +10421,10 @@ def _densify_windowed_training_split_for_panel_slab(
         symbol_indices=split.symbol_indices,
         execution_mode=split.execution_mode,
         session_advance_mask=split.session_advance_mask,
+        session_month_ids=split.session_month_ids,
+        commission_rebate_payment_eligible_mask=(
+            split.commission_rebate_payment_eligible_mask
+        ),
         day_trade_eligible_mask=split.day_trade_eligible_mask,
         day_trade_can_buy_open_mask=split.day_trade_can_buy_open_mask,
         day_trade_can_sell_open_mask=split.day_trade_can_sell_open_mask,
@@ -10137,6 +10707,10 @@ def _prepare_windowed_split(
             symbol_indices=shared_base.symbol_indices,
             execution_mode=split.execution_mode,
             session_advance_mask=shared_base.session_advance_mask,
+            session_month_ids=shared_base.session_month_ids,
+            commission_rebate_payment_eligible_mask=(
+                shared_base.commission_rebate_payment_eligible_mask
+            ),
             day_trade_eligible_mask=shared_base.day_trade_eligible_mask,
             day_trade_can_buy_open_mask=shared_base.day_trade_can_buy_open_mask,
             day_trade_can_sell_open_mask=shared_base.day_trade_can_sell_open_mask,
@@ -10191,6 +10765,11 @@ def _prepare_windowed_split(
         symbol_indices=None if split.symbol_indices is None else _prepare_host_tensor(split.symbol_indices, pin_memory),
         execution_mode=split.execution_mode,
         session_advance_mask=_prepare_host_tensor(split.session_advance_mask, pin_memory),
+        session_month_ids=_prepare_host_tensor(split.session_month_ids, pin_memory),
+        commission_rebate_payment_eligible_mask=_prepare_host_tensor(
+            split.commission_rebate_payment_eligible_mask,
+            pin_memory,
+        ),
         day_trade_eligible_mask=(
             None
             if split.day_trade_eligible_mask is None
@@ -10258,6 +10837,8 @@ def _windowed_base_tensors(split: WindowedSplitTensors) -> tuple[torch.Tensor | 
         split.short_margin_rate,
         split.short_capacity_notional,
         split.overnight_log_returns,
+        split.session_month_ids,
+        split.commission_rebate_payment_eligible_mask,
     )
 
 
@@ -10271,7 +10852,15 @@ def _with_windowed_base(
     split: WindowedSplitTensors,
     base_tensors: tuple[torch.Tensor | None, ...],
 ) -> WindowedSplitTensors:
-    if any(tensor is None for tensor in (*base_tensors[:10], base_tensors[11])):
+    if any(
+        tensor is None
+        for tensor in (
+            *base_tensors[:10],
+            base_tensors[11],
+            base_tensors[22],
+            base_tensors[23],
+        )
+    ):
         raise ValueError("required windowed base tensor is missing")
     return WindowedSplitTensors(
         features=base_tensors[0],
@@ -10292,6 +10881,8 @@ def _with_windowed_base(
         symbol_indices=split.symbol_indices,
         execution_mode=split.execution_mode,
         session_advance_mask=base_tensors[11],
+        session_month_ids=base_tensors[22],
+        commission_rebate_payment_eligible_mask=base_tensors[23],
         day_trade_eligible_mask=base_tensors[12],
         day_trade_can_buy_open_mask=base_tensors[13],
         day_trade_can_sell_open_mask=base_tensors[14],
@@ -10327,6 +10918,10 @@ def _with_windowed_metadata(
         symbol_indices=split.symbol_indices,
         execution_mode=split.execution_mode,
         session_advance_mask=split.session_advance_mask,
+        session_month_ids=split.session_month_ids,
+        commission_rebate_payment_eligible_mask=(
+            split.commission_rebate_payment_eligible_mask
+        ),
         day_trade_eligible_mask=split.day_trade_eligible_mask,
         day_trade_can_buy_open_mask=split.day_trade_can_buy_open_mask,
         day_trade_can_sell_open_mask=split.day_trade_can_sell_open_mask,
@@ -10512,6 +11107,10 @@ def _maybe_share_windowed_base_from_cached(
         symbol_indices=cached_base.symbol_indices,
         execution_mode=split.execution_mode,
         session_advance_mask=cached_base.session_advance_mask,
+        session_month_ids=cached_base.session_month_ids,
+        commission_rebate_payment_eligible_mask=(
+            cached_base.commission_rebate_payment_eligible_mask
+        ),
         day_trade_eligible_mask=cached_base.day_trade_eligible_mask,
         day_trade_can_buy_open_mask=cached_base.day_trade_can_buy_open_mask,
         day_trade_can_sell_open_mask=cached_base.day_trade_can_sell_open_mask,
@@ -10781,6 +11380,8 @@ def _run_eval_backtest_from_weight_buffers(
     unresolved_corporate_action_mask_all: torch.Tensor | None = None,
     cash_dividend_yield_all: torch.Tensor | None = None,
     cash_dividend_payment_delay_sessions_all: torch.Tensor | None = None,
+    session_month_ids_all: torch.Tensor | None = None,
+    commission_rebate_payment_eligible_mask_all: torch.Tensor | None = None,
     symbol_indices: torch.Tensor | None = None,
 ) -> tuple[BacktestResultTensor, dict[str, float]]:
     total_rows = int(weights_all.size(0))
@@ -10834,6 +11435,10 @@ def _run_eval_backtest_from_weight_buffers(
     executed_short_open_weights_out: torch.Tensor | None = None
     executed_short_cover_weights_out: torch.Tensor | None = None
     due_weights_history_out: torch.Tensor | None = None
+    commission_rebate_accrued_history_out: torch.Tensor | None = None
+    commission_rebate_paid_history_out: torch.Tensor | None = None
+    commission_rebate_current_history_out: torch.Tensor | None = None
+    commission_rebate_due_history_out: torch.Tensor | None = None
     if execution_mode != "naive":
         lag = int(execution_runtime.settlement_lag_sessions) if execution_runtime is not None else 2
         cash_history_out = torch.empty((total_rows,), device=device, dtype=output_dtype)
@@ -10850,6 +11455,18 @@ def _run_eval_backtest_from_weight_buffers(
         settlement_default_out = torch.empty((total_rows,), device=device, dtype=torch.bool)
         equity_scale_history_out = torch.empty(
             (total_rows,), device=device, dtype=output_dtype
+        )
+        commission_rebate_accrued_history_out = torch.empty(
+            (total_rows,), device=device, dtype=output_dtype
+        )
+        commission_rebate_paid_history_out = torch.empty_like(
+            commission_rebate_accrued_history_out
+        )
+        commission_rebate_current_history_out = torch.empty_like(
+            commission_rebate_accrued_history_out
+        )
+        commission_rebate_due_history_out = torch.empty_like(
+            commission_rebate_accrued_history_out
         )
         if execution_mode in TW_CARRYING_EXECUTION_MODES:
             short_sale_collateral_history_out = torch.empty(
@@ -10900,6 +11517,9 @@ def _run_eval_backtest_from_weight_buffers(
     prev_cash: torch.Tensor | None = None
     prev_payables: torch.Tensor | None = None
     prev_receivables: torch.Tensor | None = None
+    prev_commission_rebate_current: torch.Tensor | None = None
+    prev_commission_rebate_due: torch.Tensor | None = None
+    prev_commission_rebate_month_id: torch.Tensor | None = None
     prev_equity_scale: torch.Tensor | None = None
     prev_short_sale_collateral: torch.Tensor | None = None
     prev_short_margin_collateral: torch.Tensor | None = None
@@ -10910,6 +11530,9 @@ def _run_eval_backtest_from_weight_buffers(
             prev_cash = None
             prev_payables = None
             prev_receivables = None
+            prev_commission_rebate_current = None
+            prev_commission_rebate_due = None
+            prev_commission_rebate_month_id = None
             prev_equity_scale = None
             prev_short_sale_collateral = None
             prev_short_margin_collateral = None
@@ -10968,6 +11591,24 @@ def _run_eval_backtest_from_weight_buffers(
             torch.ones((end - start,), device=device, dtype=torch.bool)
             if state_advance_mask_all is None
             else state_advance_mask_all[start:end].to(
+                device=device,
+                dtype=torch.bool,
+                non_blocking=non_blocking,
+            )
+        )
+        session_month_ids_chunk = (
+            None
+            if session_month_ids_all is None
+            else session_month_ids_all[start:end].to(
+                device=device,
+                dtype=torch.int64,
+                non_blocking=non_blocking,
+            )
+        )
+        commission_rebate_payment_chunk = (
+            None
+            if commission_rebate_payment_eligible_mask_all is None
+            else commission_rebate_payment_eligible_mask_all[start:end].to(
                 device=device,
                 dtype=torch.bool,
                 non_blocking=non_blocking,
@@ -11076,6 +11717,18 @@ def _run_eval_backtest_from_weight_buffers(
             int(weights_chunk.size(0)),
             fill_value=False,
         )
+        if session_month_ids_chunk is not None:
+            session_month_ids_chunk = _pad_rows(
+                session_month_ids_chunk,
+                int(weights_chunk.size(0)),
+                fill_value=0,
+            )
+        if commission_rebate_payment_chunk is not None:
+            commission_rebate_payment_chunk = _pad_rows(
+                commission_rebate_payment_chunk,
+                int(weights_chunk.size(0)),
+                fill_value=False,
+            )
         if day_trade_eligible_chunk is not None:
             day_trade_eligible_chunk = _pad_rows(
                 day_trade_eligible_chunk,
@@ -11226,6 +11879,20 @@ def _run_eval_backtest_from_weight_buffers(
                     sell_fee_rates=(
                         None if execution_runtime is None else execution_runtime.sell_fee_rates
                     ),
+                    commission_rebate_rates=(
+                        None
+                        if execution_runtime is None
+                        else execution_runtime.commission_rebate_rates
+                    ),
+                    commission_rebate_timing=(
+                        "daily_close"
+                        if execution_runtime is None
+                        else execution_runtime.commission_rebate_timing
+                    ),
+                    session_month_ids=session_month_ids_chunk,
+                    commission_rebate_payment_eligible_mask=(
+                        commission_rebate_payment_chunk
+                    ),
                     settlement_lag_sessions=(
                         2 if execution_runtime is None else execution_runtime.settlement_lag_sessions
                     ),
@@ -11244,6 +11911,13 @@ def _run_eval_backtest_from_weight_buffers(
                     initial_cash=prev_cash,
                     initial_payables=prev_payables,
                     initial_receivables=prev_receivables,
+                    initial_commission_rebate_current=(
+                        prev_commission_rebate_current
+                    ),
+                    initial_commission_rebate_due=prev_commission_rebate_due,
+                    initial_commission_rebate_month_id=(
+                        prev_commission_rebate_month_id
+                    ),
                     initial_equity_scale=prev_equity_scale,
                     initial_short_sale_collateral=prev_short_sale_collateral,
                     initial_short_margin_collateral=prev_short_margin_collateral,
@@ -11262,6 +11936,15 @@ def _run_eval_backtest_from_weight_buffers(
         prev_cash = _detach_portfolio_state(backtest_chunk.final_cash)
         prev_payables = _detach_portfolio_state(backtest_chunk.final_payables)
         prev_receivables = _detach_portfolio_state(backtest_chunk.final_receivables)
+        prev_commission_rebate_current = _detach_portfolio_state(
+            backtest_chunk.final_commission_rebate_current
+        )
+        prev_commission_rebate_due = _detach_portfolio_state(
+            backtest_chunk.final_commission_rebate_due
+        )
+        prev_commission_rebate_month_id = _detach_portfolio_state(
+            backtest_chunk.final_commission_rebate_month_id
+        )
         prev_equity_scale = _detach_portfolio_state(
             backtest_chunk.final_equity_scale
         )
@@ -11348,6 +12031,28 @@ def _run_eval_backtest_from_weight_buffers(
             equity_scale_history_out[start:end].copy_(
                 backtest_chunk.equity_scale_history[:valid_rows]
             )
+            rebate_histories = (
+                backtest_chunk.commission_rebate_accrued_history,
+                backtest_chunk.commission_rebate_paid_history,
+                backtest_chunk.commission_rebate_current_history,
+                backtest_chunk.commission_rebate_due_history,
+            )
+            if any(value is None for value in rebate_histories):
+                raise RuntimeError(
+                    f"{execution_mode} backtest omitted commission rebate audits"
+                )
+            commission_rebate_accrued_history_out[start:end].copy_(
+                backtest_chunk.commission_rebate_accrued_history[:valid_rows]
+            )
+            commission_rebate_paid_history_out[start:end].copy_(
+                backtest_chunk.commission_rebate_paid_history[:valid_rows]
+            )
+            commission_rebate_current_history_out[start:end].copy_(
+                backtest_chunk.commission_rebate_current_history[:valid_rows]
+            )
+            commission_rebate_due_history_out[start:end].copy_(
+                backtest_chunk.commission_rebate_due_history[:valid_rows]
+            )
             if execution_mode in TW_CARRYING_EXECUTION_MODES:
                 if (
                     short_sale_collateral_history_out is None
@@ -11401,6 +12106,17 @@ def _run_eval_backtest_from_weight_buffers(
         final_cash=prev_cash,
         final_payables=prev_payables,
         final_receivables=prev_receivables,
+        commission_rebate_accrued_history=(
+            commission_rebate_accrued_history_out
+        ),
+        commission_rebate_paid_history=commission_rebate_paid_history_out,
+        commission_rebate_current_history=(
+            commission_rebate_current_history_out
+        ),
+        commission_rebate_due_history=commission_rebate_due_history_out,
+        final_commission_rebate_current=prev_commission_rebate_current,
+        final_commission_rebate_due=prev_commission_rebate_due,
+        final_commission_rebate_month_id=prev_commission_rebate_month_id,
         final_equity_scale=prev_equity_scale,
         short_sale_collateral_history=short_sale_collateral_history_out,
         short_margin_collateral_history=short_margin_collateral_history_out,
@@ -11464,6 +12180,8 @@ def _evaluate_tensor_batch_decoupled(
     unresolved_corporate_action_mask: torch.Tensor | None = None,
     cash_dividend_yield: torch.Tensor | None = None,
     cash_dividend_payment_delay_sessions: torch.Tensor | None = None,
+    session_month_ids: torch.Tensor | None = None,
+    commission_rebate_payment_eligible_mask: torch.Tensor | None = None,
     symbol_indices: torch.Tensor | None = None,
 ) -> tuple[BacktestResultTensor, dict[str, float], dict[str, float]]:
     execution_mode = "naive" if execution_runtime is None else execution_runtime.mode
@@ -11623,6 +12341,20 @@ def _evaluate_tensor_batch_decoupled(
             device=device, dtype=torch.int64, non_blocking=non_blocking
         )
     )
+    session_month_ids_all = (
+        None
+        if session_month_ids is None
+        else session_month_ids.to(
+            device=device, dtype=torch.int64, non_blocking=non_blocking
+        )
+    )
+    commission_rebate_payment_all = (
+        None
+        if commission_rebate_payment_eligible_mask is None
+        else commission_rebate_payment_eligible_mask.to(
+            device=device, dtype=torch.bool, non_blocking=non_blocking
+        )
+    )
     _maybe_sync_cuda(device, profile_timing)
     timing.transfer_s += time.perf_counter() - static_start
 
@@ -11722,6 +12454,10 @@ def _evaluate_tensor_batch_decoupled(
             unresolved_corporate_action_mask_all=unresolved_corporate_action_all,
             cash_dividend_yield_all=cash_dividend_yield_all,
             cash_dividend_payment_delay_sessions_all=cash_dividend_delay_all,
+            session_month_ids_all=session_month_ids_all,
+            commission_rebate_payment_eligible_mask_all=(
+                commission_rebate_payment_all
+            ),
             symbol_indices=symbol_indices,
         )
 
@@ -11789,6 +12525,8 @@ def _evaluate_tensor_batch(
     unresolved_corporate_action_mask: torch.Tensor | None = None,
     cash_dividend_yield: torch.Tensor | None = None,
     cash_dividend_payment_delay_sessions: torch.Tensor | None = None,
+    session_month_ids: torch.Tensor | None = None,
+    commission_rebate_payment_eligible_mask: torch.Tensor | None = None,
     symbol_indices: torch.Tensor | None = None,
 ) -> tuple[BacktestResultTensor, dict[str, float], dict[str, float]]:
     """Evaluate materialized inputs through the same decoupled canonical backtest."""
@@ -11842,6 +12580,10 @@ def _evaluate_tensor_batch(
         cash_dividend_yield=cash_dividend_yield,
         cash_dividend_payment_delay_sessions=(
             cash_dividend_payment_delay_sessions
+        ),
+        session_month_ids=session_month_ids,
+        commission_rebate_payment_eligible_mask=(
+            commission_rebate_payment_eligible_mask
         ),
         symbol_indices=symbol_indices,
     )
@@ -11932,6 +12674,8 @@ def _evaluate_windowed_tensor_batch_decoupled(
     unresolved_corporate_action_all: torch.Tensor | None = None
     cash_dividend_yield_all: torch.Tensor | None = None
     cash_dividend_delay_all: torch.Tensor | None = None
+    session_month_ids_all: torch.Tensor | None = None
+    commission_rebate_payment_all: torch.Tensor | None = None
     panel_forward_model = _panel_forward_module(model)
 
     with torch.inference_mode():
@@ -12003,6 +12747,10 @@ def _evaluate_windowed_tensor_batch_decoupled(
             )
             short_margin_rate_chunk = batch.get("short_margin_rate")
             state_advance_chunk = batch["session_advance_mask"]
+            session_month_ids_chunk = batch["session_month_ids"]
+            commission_rebate_payment_chunk = batch[
+                "commission_rebate_payment_eligible_mask"
+            ]
             day_trade_eligible_chunk = batch.get("day_trade_eligible_mask")
             day_trade_buy_open_chunk = batch.get(
                 "day_trade_can_buy_open_mask"
@@ -12138,6 +12886,12 @@ def _evaluate_windowed_tensor_batch_decoupled(
                 state_advance_all = torch.empty(
                     (total_rows,), device=device, dtype=torch.bool
                 )
+                session_month_ids_all = torch.empty(
+                    (total_rows,), device=device, dtype=torch.int64
+                )
+                commission_rebate_payment_all = torch.empty(
+                    (total_rows,), device=device, dtype=torch.bool
+                )
                 if day_trade_eligible_chunk is not None:
                     day_trade_eligible_all = torch.empty(
                         (total_rows, split.num_symbols),
@@ -12211,6 +12965,12 @@ def _evaluate_windowed_tensor_batch_decoupled(
             force_exit_mask_all[start:end].copy_(force_exit_mask_chunk[:valid_rows])
             benchmark_all[start:end].copy_(bench_chunk_padded[:valid_rows])
             state_advance_all[start:end].copy_(state_advance_chunk[:valid_rows])
+            session_month_ids_all[start:end].copy_(
+                session_month_ids_chunk[:valid_rows]
+            )
+            commission_rebate_payment_all[start:end].copy_(
+                commission_rebate_payment_chunk[:valid_rows]
+            )
             if day_trade_eligible_all is not None and day_trade_eligible_chunk is not None:
                 day_trade_eligible_all[start:end].copy_(day_trade_eligible_chunk[:valid_rows])
             if day_trade_buy_open_all is not None and day_trade_buy_open_chunk is not None:
@@ -12264,6 +13024,8 @@ def _evaluate_windowed_tensor_batch_decoupled(
             or force_exit_mask_all is None
             or benchmark_all is None
             or state_advance_all is None
+            or session_month_ids_all is None
+            or commission_rebate_payment_all is None
         ):
             raise RuntimeError("windowed eval produced no buffers")
 
@@ -12308,6 +13070,10 @@ def _evaluate_windowed_tensor_batch_decoupled(
             unresolved_corporate_action_mask_all=unresolved_corporate_action_all,
             cash_dividend_yield_all=cash_dividend_yield_all,
             cash_dividend_payment_delay_sessions_all=cash_dividend_delay_all,
+            session_month_ids_all=session_month_ids_all,
+            commission_rebate_payment_eligible_mask_all=(
+                commission_rebate_payment_all
+            ),
             symbol_indices=split.symbol_indices,
         )
 
@@ -12520,6 +13286,13 @@ def _slice_backtest_rows(
             ).copy(),
             last_nav=float(integer_state.last_nav),
             alive=bool(integer_state.alive),
+            commission_rebate_current=float(
+                integer_state.commission_rebate_current
+            ),
+            commission_rebate_due=float(integer_state.commission_rebate_due),
+            commission_rebate_month_id=int(
+                integer_state.commission_rebate_month_id
+            ),
             last_weights=(
                 None
                 if integer_state.last_weights is None
@@ -12565,6 +13338,18 @@ def _slice_backtest_rows(
         cash_history=rows(result.cash_history),
         payables_history=rows(result.payables_history),
         receivables_history=rows(result.receivables_history),
+        commission_rebate_accrued_history=rows(
+            result.commission_rebate_accrued_history
+        ),
+        commission_rebate_paid_history=rows(
+            result.commission_rebate_paid_history
+        ),
+        commission_rebate_current_history=rows(
+            result.commission_rebate_current_history
+        ),
+        commission_rebate_due_history=rows(
+            result.commission_rebate_due_history
+        ),
         settlement_default=rows(result.settlement_default),
         equity_scale_history=rows(result.equity_scale_history),
         shares_history=rows(result.shares_history),
@@ -12579,6 +13364,15 @@ def _slice_backtest_rows(
         final_cash=terminal(result.final_cash),
         final_payables=terminal(result.final_payables),
         final_receivables=terminal(result.final_receivables),
+        final_commission_rebate_current=terminal(
+            result.final_commission_rebate_current
+        ),
+        final_commission_rebate_due=terminal(
+            result.final_commission_rebate_due
+        ),
+        final_commission_rebate_month_id=terminal(
+            result.final_commission_rebate_month_id
+        ),
         final_alive=terminal(result.final_alive),
         final_equity_scale=terminal(result.final_equity_scale),
         final_short_sale_collateral=terminal(
@@ -12732,6 +13526,7 @@ def _replay_taiwan_stitched_deployment(
         execution_mode=mode,
         short_capacity_limit_enabled=config.trading.tw_short_capacity_limit_enabled,
         tw_corporate_action_mode=config.trading.tw_corporate_action_mode,
+        tw_commission_rebate_timing=config.trading.tw_commission_rebate_timing,
     )
 
     def selected(tensor: torch.Tensor) -> np.ndarray:
@@ -13619,6 +14414,12 @@ def _probe_compiled_loss_forward_backward(
             state_advance_mask = _all_gather_no_grad(
                 batch["session_advance_mask"].contiguous()
             )
+            session_month_ids = _all_gather_no_grad(
+                batch["session_month_ids"].contiguous()
+            )
+            commission_rebate_payment_eligible_mask = _all_gather_no_grad(
+                batch["commission_rebate_payment_eligible_mask"].contiguous()
+            )
             day_trade_eligible_mask = (
                 _all_gather_no_grad(batch["day_trade_eligible_mask"].contiguous())
                 if "day_trade_eligible_mask" in batch
@@ -13694,6 +14495,10 @@ def _probe_compiled_loss_forward_backward(
             force_exit_mask = batch["force_exit_mask"]
             sample_mask = batch["sample_mask"]
             state_advance_mask = batch["session_advance_mask"]
+            session_month_ids = batch["session_month_ids"]
+            commission_rebate_payment_eligible_mask = batch[
+                "commission_rebate_payment_eligible_mask"
+            ]
             day_trade_eligible_mask = batch.get("day_trade_eligible_mask")
             day_trade_can_buy_open_mask = batch.get(
                 "day_trade_can_buy_open_mask"
@@ -13763,6 +14568,15 @@ def _probe_compiled_loss_forward_backward(
                 device=device,
                 dtype=torch.float32,
             )
+            aux_outputs["initial_commission_rebate_current"] = torch.zeros(
+                (), device=device, dtype=torch.float32
+            )
+            aux_outputs["initial_commission_rebate_due"] = torch.zeros(
+                (), device=device, dtype=torch.float32
+            )
+            aux_outputs["initial_commission_rebate_month_id"] = torch.zeros(
+                (), device=device, dtype=torch.int64
+            )
             aux_outputs["initial_equity_scale"] = torch.ones(
                 (), device=device, dtype=torch.float32
             )
@@ -13788,6 +14602,10 @@ def _probe_compiled_loss_forward_backward(
                 force_exit_mask=force_exit_mask,
                 sample_mask=sample_mask,
                 state_advance_mask=state_advance_mask,
+                session_month_ids=session_month_ids,
+                commission_rebate_payment_eligible_mask=(
+                    commission_rebate_payment_eligible_mask
+                ),
                 day_trade_eligible_mask=day_trade_eligible_mask,
                 day_trade_can_buy_open_mask=day_trade_can_buy_open_mask,
                 day_trade_can_sell_open_mask=day_trade_can_sell_open_mask,
@@ -14534,6 +15352,15 @@ def _train_epoch_windowed_tensor(
         device=device,
         dtype=torch.float32,
     )
+    portfolio_prev_commission_rebate_current = torch.zeros(
+        (), device=device, dtype=torch.float32
+    )
+    portfolio_prev_commission_rebate_due = torch.zeros(
+        (), device=device, dtype=torch.float32
+    )
+    portfolio_prev_commission_rebate_month_id = torch.zeros(
+        (), device=device, dtype=torch.int64
+    )
     portfolio_prev_short_sale_collateral = torch.zeros_like(
         portfolio_prev_weights
     )
@@ -14762,6 +15589,15 @@ def _train_epoch_windowed_tensor(
                     aux_outputs["initial_cash"] = portfolio_prev_cash
                     aux_outputs["initial_payables"] = portfolio_prev_payables
                     aux_outputs["initial_receivables"] = portfolio_prev_receivables
+                    aux_outputs["initial_commission_rebate_current"] = (
+                        portfolio_prev_commission_rebate_current
+                    )
+                    aux_outputs["initial_commission_rebate_due"] = (
+                        portfolio_prev_commission_rebate_due
+                    )
+                    aux_outputs["initial_commission_rebate_month_id"] = (
+                        portfolio_prev_commission_rebate_month_id
+                    )
                     aux_outputs["initial_equity_scale"] = (
                         portfolio_prev_equity_scale
                     )
@@ -14793,6 +15629,10 @@ def _train_epoch_windowed_tensor(
                         force_exit_mask=batch["force_exit_mask"],
                         sample_mask=batch_sample_mask,
                         state_advance_mask=batch.get("session_advance_mask"),
+                        session_month_ids=batch.get("session_month_ids"),
+                        commission_rebate_payment_eligible_mask=batch.get(
+                            "commission_rebate_payment_eligible_mask"
+                        ),
                         day_trade_eligible_mask=batch.get("day_trade_eligible_mask"),
                         day_trade_can_buy_open_mask=batch.get(
                             "day_trade_can_buy_open_mask"
@@ -14873,6 +15713,15 @@ def _train_epoch_windowed_tensor(
             next_cash = aux_outputs.get("_final_cash")
             next_payables = aux_outputs.get("_final_payables")
             next_receivables = aux_outputs.get("_final_receivables")
+            next_commission_rebate_current = aux_outputs.get(
+                "_final_commission_rebate_current"
+            )
+            next_commission_rebate_due = aux_outputs.get(
+                "_final_commission_rebate_due"
+            )
+            next_commission_rebate_month_id = aux_outputs.get(
+                "_final_commission_rebate_month_id"
+            )
             next_equity_scale = aux_outputs.get("_final_equity_scale")
             next_short_sale_collateral = aux_outputs.get(
                 "_final_short_sale_collateral"
@@ -14886,6 +15735,9 @@ def _train_epoch_windowed_tensor(
             next_cash = None
             next_payables = None
             next_receivables = None
+            next_commission_rebate_current = None
+            next_commission_rebate_due = None
+            next_commission_rebate_month_id = None
             next_equity_scale = None
             next_short_sale_collateral = None
             next_short_margin_collateral = None
@@ -14900,6 +15752,18 @@ def _train_epoch_windowed_tensor(
                 portfolio_prev_payables = _detach_portfolio_state(next_payables)
             if next_receivables is not None:
                 portfolio_prev_receivables = _detach_portfolio_state(next_receivables)
+            if next_commission_rebate_current is not None:
+                portfolio_prev_commission_rebate_current = (
+                    _detach_portfolio_state(next_commission_rebate_current)
+                )
+            if next_commission_rebate_due is not None:
+                portfolio_prev_commission_rebate_due = _detach_portfolio_state(
+                    next_commission_rebate_due
+                )
+            if next_commission_rebate_month_id is not None:
+                portfolio_prev_commission_rebate_month_id = (
+                    _detach_portfolio_state(next_commission_rebate_month_id)
+                )
             if next_equity_scale is not None:
                 portfolio_prev_equity_scale = _detach_portfolio_state(
                     next_equity_scale
@@ -15127,6 +15991,15 @@ def _train_epoch_windowed_tensor_ddp(
         device=device,
         dtype=torch.float32,
     )
+    portfolio_prev_commission_rebate_current = torch.zeros(
+        (), device=device, dtype=torch.float32
+    )
+    portfolio_prev_commission_rebate_due = torch.zeros(
+        (), device=device, dtype=torch.float32
+    )
+    portfolio_prev_commission_rebate_month_id = torch.zeros(
+        (), device=device, dtype=torch.int64
+    )
     portfolio_prev_short_sale_collateral = torch.zeros_like(
         portfolio_prev_weights
     )
@@ -15256,6 +16129,12 @@ def _train_epoch_windowed_tensor_ddp(
             state_advance_mask = _all_gather_no_grad(
                 batch["session_advance_mask"].contiguous()
             )
+            session_month_ids = _all_gather_no_grad(
+                batch["session_month_ids"].contiguous()
+            )
+            commission_rebate_payment_eligible_mask = _all_gather_no_grad(
+                batch["commission_rebate_payment_eligible_mask"].contiguous()
+            )
             day_trade_eligible_mask = (
                 _all_gather_no_grad(batch["day_trade_eligible_mask"].contiguous())
                 if "day_trade_eligible_mask" in batch
@@ -15353,6 +16232,15 @@ def _train_epoch_windowed_tensor_ddp(
                     aux_outputs["initial_cash"] = portfolio_prev_cash
                     aux_outputs["initial_payables"] = portfolio_prev_payables
                     aux_outputs["initial_receivables"] = portfolio_prev_receivables
+                    aux_outputs["initial_commission_rebate_current"] = (
+                        portfolio_prev_commission_rebate_current
+                    )
+                    aux_outputs["initial_commission_rebate_due"] = (
+                        portfolio_prev_commission_rebate_due
+                    )
+                    aux_outputs["initial_commission_rebate_month_id"] = (
+                        portfolio_prev_commission_rebate_month_id
+                    )
                     aux_outputs["initial_equity_scale"] = (
                         portfolio_prev_equity_scale
                     )
@@ -15376,6 +16264,10 @@ def _train_epoch_windowed_tensor_ddp(
                     force_exit_mask=force_exit_mask,
                     sample_mask=sample_mask,
                     state_advance_mask=state_advance_mask,
+                    session_month_ids=session_month_ids,
+                    commission_rebate_payment_eligible_mask=(
+                        commission_rebate_payment_eligible_mask
+                    ),
                     day_trade_eligible_mask=day_trade_eligible_mask,
                     day_trade_can_buy_open_mask=day_trade_can_buy_open_mask,
                     day_trade_can_sell_open_mask=day_trade_can_sell_open_mask,
@@ -15443,6 +16335,15 @@ def _train_epoch_windowed_tensor_ddp(
         next_cash = (aux_outputs or {}).get("_final_cash")
         next_payables = (aux_outputs or {}).get("_final_payables")
         next_receivables = (aux_outputs or {}).get("_final_receivables")
+        next_commission_rebate_current = (aux_outputs or {}).get(
+            "_final_commission_rebate_current"
+        )
+        next_commission_rebate_due = (aux_outputs or {}).get(
+            "_final_commission_rebate_due"
+        )
+        next_commission_rebate_month_id = (aux_outputs or {}).get(
+            "_final_commission_rebate_month_id"
+        )
         next_equity_scale = (aux_outputs or {}).get("_final_equity_scale")
         next_short_sale_collateral = (aux_outputs or {}).get(
             "_final_short_sale_collateral"
@@ -15461,6 +16362,18 @@ def _train_epoch_windowed_tensor_ddp(
                 portfolio_prev_payables = _detach_portfolio_state(next_payables)
             if next_receivables is not None:
                 portfolio_prev_receivables = _detach_portfolio_state(next_receivables)
+            if next_commission_rebate_current is not None:
+                portfolio_prev_commission_rebate_current = (
+                    _detach_portfolio_state(next_commission_rebate_current)
+                )
+            if next_commission_rebate_due is not None:
+                portfolio_prev_commission_rebate_due = _detach_portfolio_state(
+                    next_commission_rebate_due
+                )
+            if next_commission_rebate_month_id is not None:
+                portfolio_prev_commission_rebate_month_id = (
+                    _detach_portfolio_state(next_commission_rebate_month_id)
+                )
             if next_equity_scale is not None:
                 portfolio_prev_equity_scale = _detach_portfolio_state(
                     next_equity_scale
@@ -15739,6 +16652,7 @@ def _run_training_tree_models(
             lookback_context=config.walk_forward.lookback_context,
             short_capacity_limit_enabled=config.trading.tw_short_capacity_limit_enabled,
             tw_corporate_action_mode=config.trading.tw_corporate_action_mode,
+            tw_commission_rebate_timing=config.trading.tw_commission_rebate_timing,
         )
         train_x, train_returns, train_masks, _, _, _ = _dataset_to_tensors(train_ds)
 
@@ -15765,6 +16679,7 @@ def _run_training_tree_models(
                 lookback_context=config.walk_forward.lookback_context,
                 short_capacity_limit_enabled=config.trading.tw_short_capacity_limit_enabled,
                 tw_corporate_action_mode=config.trading.tw_corporate_action_mode,
+                tw_commission_rebate_timing=config.trading.tw_commission_rebate_timing,
             )
             test_ds = CrossSectionalDataset(
                 panel,
@@ -15775,6 +16690,7 @@ def _run_training_tree_models(
                 lookback_context=config.walk_forward.lookback_context,
                 short_capacity_limit_enabled=config.trading.tw_short_capacity_limit_enabled,
                 tw_corporate_action_mode=config.trading.tw_corporate_action_mode,
+                tw_commission_rebate_timing=config.trading.tw_commission_rebate_timing,
             )
             if len(test_ds) == 0:
                 print(f"[Fold {fold.fold_id}] skip: empty full test split after lookback filtering")
@@ -15799,7 +16715,12 @@ def _run_training_tree_models(
             val_short_capacity_notional, val_short_margin_rate = (
                 _dataset_short_contract_to_tensors(val_ds)
             )
-            val_state_advance, val_day_trade_eligible = _dataset_execution_masks_to_tensors(val_ds)
+            (
+                val_state_advance,
+                val_day_trade_eligible,
+                val_session_month_ids,
+                val_commission_rebate_payment_eligible,
+            ) = _dataset_execution_masks_to_tensors(val_ds)
             val_day_trade_buy_open, val_day_trade_sell_open = (
                 _dataset_day_trade_open_masks_to_tensors(val_ds)
             )
@@ -15839,6 +16760,10 @@ def _run_training_tree_models(
                 volume_participation_equity=config.trading.volume_participation_equity,
                 execution_runtime=execution_runtime,
                 state_advance_mask=val_state_advance,
+                session_month_ids=val_session_month_ids,
+                commission_rebate_payment_eligible_mask=(
+                    val_commission_rebate_payment_eligible
+                ),
                 day_trade_eligible_mask=val_day_trade_eligible,
                 day_trade_can_buy_open_mask=val_day_trade_buy_open,
                 day_trade_can_sell_open_mask=val_day_trade_sell_open,
@@ -15865,6 +16790,10 @@ def _run_training_tree_models(
                     short_capacity_notional=val_short_capacity_notional,
                     short_margin_rate=val_short_margin_rate,
                     state_advance_mask=val_state_advance,
+                    session_month_ids=val_session_month_ids,
+                    commission_rebate_payment_eligible_mask=(
+                        val_commission_rebate_payment_eligible
+                    ),
                     day_trade_eligible_mask=val_day_trade_eligible,
                     day_trade_can_buy_open_mask=val_day_trade_buy_open,
                     day_trade_can_sell_open_mask=val_day_trade_sell_open,
@@ -15886,7 +16815,12 @@ def _run_training_tree_models(
             test_short_capacity_notional, test_short_margin_rate = (
                 _dataset_short_contract_to_tensors(test_ds)
             )
-            test_state_advance, test_day_trade_eligible = _dataset_execution_masks_to_tensors(test_ds)
+            (
+                test_state_advance,
+                test_day_trade_eligible,
+                test_session_month_ids,
+                test_commission_rebate_payment_eligible,
+            ) = _dataset_execution_masks_to_tensors(test_ds)
             test_day_trade_buy_open, test_day_trade_sell_open = (
                 _dataset_day_trade_open_masks_to_tensors(test_ds)
             )
@@ -15926,6 +16860,10 @@ def _run_training_tree_models(
                 volume_participation_equity=config.trading.volume_participation_equity,
                 execution_runtime=execution_runtime,
                 state_advance_mask=test_state_advance,
+                session_month_ids=test_session_month_ids,
+                commission_rebate_payment_eligible_mask=(
+                    test_commission_rebate_payment_eligible
+                ),
                 day_trade_eligible_mask=test_day_trade_eligible,
                 day_trade_can_buy_open_mask=test_day_trade_buy_open,
                 day_trade_can_sell_open_mask=test_day_trade_sell_open,
@@ -16207,6 +17145,7 @@ def _run_inference_tree_models(
             lookback_context=config.walk_forward.lookback_context,
             short_capacity_limit_enabled=config.trading.tw_short_capacity_limit_enabled,
             tw_corporate_action_mode=config.trading.tw_corporate_action_mode,
+            tw_commission_rebate_timing=config.trading.tw_commission_rebate_timing,
         )
         test_ds = CrossSectionalDataset(
             panel,
@@ -16217,6 +17156,7 @@ def _run_inference_tree_models(
             lookback_context=config.walk_forward.lookback_context,
             short_capacity_limit_enabled=config.trading.tw_short_capacity_limit_enabled,
             tw_corporate_action_mode=config.trading.tw_corporate_action_mode,
+            tw_commission_rebate_timing=config.trading.tw_commission_rebate_timing,
         )
         if len(test_ds) == 0:
             print(f"[Fold {fold.fold_id}] skip: empty full test split after lookback filtering")
@@ -16238,7 +17178,12 @@ def _run_inference_tree_models(
         val_short_capacity_notional, val_short_margin_rate = (
             _dataset_short_contract_to_tensors(val_ds)
         )
-        val_state_advance, val_day_trade_eligible = _dataset_execution_masks_to_tensors(val_ds)
+        (
+            val_state_advance,
+            val_day_trade_eligible,
+            val_session_month_ids,
+            val_commission_rebate_payment_eligible,
+        ) = _dataset_execution_masks_to_tensors(val_ds)
         val_day_trade_buy_open, val_day_trade_sell_open = (
             _dataset_day_trade_open_masks_to_tensors(val_ds)
         )
@@ -16279,6 +17224,10 @@ def _run_inference_tree_models(
             volume_participation_equity=config.trading.volume_participation_equity,
             execution_runtime=execution_runtime,
             state_advance_mask=val_state_advance,
+            session_month_ids=val_session_month_ids,
+            commission_rebate_payment_eligible_mask=(
+                val_commission_rebate_payment_eligible
+            ),
             day_trade_eligible_mask=val_day_trade_eligible,
             day_trade_can_buy_open_mask=val_day_trade_buy_open,
             day_trade_can_sell_open_mask=val_day_trade_sell_open,
@@ -16305,6 +17254,10 @@ def _run_inference_tree_models(
                 short_capacity_notional=val_short_capacity_notional,
                 short_margin_rate=val_short_margin_rate,
                 state_advance_mask=val_state_advance,
+                session_month_ids=val_session_month_ids,
+                commission_rebate_payment_eligible_mask=(
+                    val_commission_rebate_payment_eligible
+                ),
                 day_trade_eligible_mask=val_day_trade_eligible,
                 day_trade_can_buy_open_mask=val_day_trade_buy_open,
                 day_trade_can_sell_open_mask=val_day_trade_sell_open,
@@ -16326,7 +17279,12 @@ def _run_inference_tree_models(
         test_short_capacity_notional, test_short_margin_rate = (
             _dataset_short_contract_to_tensors(test_ds)
         )
-        test_state_advance, test_day_trade_eligible = _dataset_execution_masks_to_tensors(test_ds)
+        (
+            test_state_advance,
+            test_day_trade_eligible,
+            test_session_month_ids,
+            test_commission_rebate_payment_eligible,
+        ) = _dataset_execution_masks_to_tensors(test_ds)
         test_day_trade_buy_open, test_day_trade_sell_open = (
             _dataset_day_trade_open_masks_to_tensors(test_ds)
         )
@@ -16367,6 +17325,10 @@ def _run_inference_tree_models(
             volume_participation_equity=config.trading.volume_participation_equity,
             execution_runtime=execution_runtime,
             state_advance_mask=test_state_advance,
+            session_month_ids=test_session_month_ids,
+            commission_rebate_payment_eligible_mask=(
+                test_commission_rebate_payment_eligible
+            ),
             day_trade_eligible_mask=test_day_trade_eligible,
             day_trade_can_buy_open_mask=test_day_trade_buy_open,
             day_trade_can_sell_open_mask=test_day_trade_sell_open,
@@ -16670,6 +17632,7 @@ def _run_inference_neural_models(
             lookback_context=config.walk_forward.lookback_context,
             short_capacity_limit_enabled=config.trading.tw_short_capacity_limit_enabled,
             tw_corporate_action_mode=config.trading.tw_corporate_action_mode,
+            tw_commission_rebate_timing=config.trading.tw_commission_rebate_timing,
         )
         test_ds = CrossSectionalDataset(
             fold_panel,
@@ -16681,6 +17644,7 @@ def _run_inference_neural_models(
             lookback_context=config.walk_forward.lookback_context,
             short_capacity_limit_enabled=config.trading.tw_short_capacity_limit_enabled,
             tw_corporate_action_mode=config.trading.tw_corporate_action_mode,
+            tw_commission_rebate_timing=config.trading.tw_commission_rebate_timing,
         )
         if len(test_ds) == 0:
             print(f"[Fold {fold.fold_id}] skip: empty full test split after lookback filtering")
@@ -16778,6 +17742,12 @@ def _run_inference_neural_models(
                     loss_objective,
                     execution_runtime=fold_execution_runtime,
                     state_advance_mask=val_windowed.session_advance_mask[val_rule_idx],
+                    session_month_ids=val_windowed.session_month_ids[val_rule_idx],
+                    commission_rebate_payment_eligible_mask=(
+                        val_windowed.commission_rebate_payment_eligible_mask[
+                            val_rule_idx
+                        ]
+                    ),
                     day_trade_eligible_mask=(
                         None
                         if val_windowed.day_trade_eligible_mask is None
@@ -17354,6 +18324,10 @@ def run_training(
             "execution_mode": execution_runtime.mode,
             "buy_fee_rates": execution_runtime.buy_fee_rates,
             "sell_fee_rates": execution_runtime.sell_fee_rates,
+            "commission_rebate_rates": execution_runtime.commission_rebate_rates,
+            "commission_rebate_timing": (
+                execution_runtime.commission_rebate_timing
+            ),
             "settlement_lag_sessions": execution_runtime.settlement_lag_sessions,
             "short_margin_rate": execution_runtime.short_initial_margin_rate,
             "short_maintenance_ratio": execution_runtime.short_maintenance_ratio,
@@ -17594,6 +18568,7 @@ def run_training(
             lookback_context=config.walk_forward.lookback_context,
             short_capacity_limit_enabled=config.trading.tw_short_capacity_limit_enabled,
             tw_corporate_action_mode=config.trading.tw_corporate_action_mode,
+            tw_commission_rebate_timing=config.trading.tw_commission_rebate_timing,
         )
         min_batch_size = max(1, config.training.min_batch_size)
         train_batch_used_bytes = 0
@@ -17724,6 +18699,7 @@ def run_training(
                 lookback_context=config.walk_forward.lookback_context,
                 short_capacity_limit_enabled=config.trading.tw_short_capacity_limit_enabled,
                 tw_corporate_action_mode=config.trading.tw_corporate_action_mode,
+                tw_commission_rebate_timing=config.trading.tw_commission_rebate_timing,
             )
             test_ds = CrossSectionalDataset(
                 panel,
@@ -17735,6 +18711,7 @@ def run_training(
                 lookback_context=config.walk_forward.lookback_context,
                 short_capacity_limit_enabled=config.trading.tw_short_capacity_limit_enabled,
                 tw_corporate_action_mode=config.trading.tw_corporate_action_mode,
+                tw_commission_rebate_timing=config.trading.tw_commission_rebate_timing,
             )
 
             if len(test_ds) == 0:
@@ -17839,6 +18816,7 @@ def run_training(
             lookback_context=config.walk_forward.lookback_context,
             short_capacity_limit_enabled=config.trading.tw_short_capacity_limit_enabled,
             tw_corporate_action_mode=config.trading.tw_corporate_action_mode,
+            tw_commission_rebate_timing=config.trading.tw_commission_rebate_timing,
         )
         if len(curve_test_ds) == 0 and curve_test_indices.size != curve_test_fold_context.fold.test_indices.size:
             curve_test_indices = curve_test_fold_context.fold.test_indices
