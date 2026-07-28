@@ -268,9 +268,13 @@ trading:
   buy_fee_rate: 0.000855
   sell_fee_rate: 0.003855
   # Taiwan modes use product-specific vectors instead of the two legacy scalar
-  # rates above. Commission is 0.1425% at a configurable broker discount.
+  # rates above. Taiwan executors charge the gross 0.1425% commission first;
+  # the default broker profile ultimately costs 20% after the earned rebate.
   tw_commission_rate: 0.001425
-  tw_commission_discount: 0.6
+  tw_commission_discount: 0.2
+  # monthly_15th: next month 15th (or next exchange session) CLOSE;
+  # daily_close: the same session's CLOSE. Pending rebates are not buying power.
+  tw_commission_rebate_timing: monthly_15th
   tw_stock_sell_tax: 0.003
   tw_etf_sell_tax: 0.001
   tw_day_trade_stock_sell_tax: 0.0015

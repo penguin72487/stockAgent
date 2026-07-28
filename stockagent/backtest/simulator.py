@@ -17,6 +17,10 @@ from stockagent.backtest.tw_continuous import (
     run_tw_cash_continuous,
     run_tw_day_trade_continuous,
 )
+from stockagent.backtest.tw_commission_rebate import (
+    commission_rebate_calendar,
+    normalize_commission_rebate_timing,
+)
 from stockagent.backtest.tw_dual_session import (
     run_tw_cash_dual_session,
     run_tw_overnight_dual_session,
@@ -58,11 +62,11 @@ except Exception:  # pragma: no cover - Numba is an acceleration dependency
 INT64_MIN_FLOAT_SAFE = np.nextafter(float(np.iinfo(np.int64).min), 0.0)
 INT64_MAX_FLOAT_SAFE = np.nextafter(float(np.iinfo(np.int64).max + 1), 0.0)
 SCAN_CHUNK_CANDIDATES = (64, 128, 256, 512)
-# v9 adds the causal open/close action ABI for Taiwan T+2 cash execution and
-# the one-session cohort ledger for ``tw_overnight``.  The event order, gross
-# phase fees, recurrent state, and daily return alignment all change, so an
-# older optimizer trajectory must not resume under this contract.
-CANONICAL_BACKTEST_CONTRACT_VERSION = 9
+# v10 separates gross Taiwan commission collection from the economically
+# earned broker rebate, including daily-close / next-month-15th cash timing and
+# recurrent pending-rebate state.  Cash availability and NAV therefore differ
+# from every older optimizer/backtest contract.
+CANONICAL_BACKTEST_CONTRACT_VERSION = 10
 
 _SCAN_CHUNK_CACHE: dict[tuple, int] = {}
 _SCAN_COMPILED_CACHE: dict[
@@ -1202,6 +1206,13 @@ class BacktestResult:
     final_cash: np.ndarray | None = None
     final_payables: np.ndarray | None = None
     final_receivables: np.ndarray | None = None
+    commission_rebate_accrued_history: np.ndarray | None = None
+    commission_rebate_paid_history: np.ndarray | None = None
+    commission_rebate_current_history: np.ndarray | None = None
+    commission_rebate_due_history: np.ndarray | None = None
+    final_commission_rebate_current: np.ndarray | None = None
+    final_commission_rebate_due: np.ndarray | None = None
+    final_commission_rebate_month_id: np.ndarray | None = None
     final_equity_scale: np.ndarray | None = None
     short_sale_collateral_history: np.ndarray | None = None
     short_margin_collateral_history: np.ndarray | None = None
@@ -1249,6 +1260,13 @@ class BacktestResultTensor:
     final_cash: torch.Tensor | None = None
     final_payables: torch.Tensor | None = None
     final_receivables: torch.Tensor | None = None
+    commission_rebate_accrued_history: torch.Tensor | None = None
+    commission_rebate_paid_history: torch.Tensor | None = None
+    commission_rebate_current_history: torch.Tensor | None = None
+    commission_rebate_due_history: torch.Tensor | None = None
+    final_commission_rebate_current: torch.Tensor | None = None
+    final_commission_rebate_due: torch.Tensor | None = None
+    final_commission_rebate_month_id: torch.Tensor | None = None
     final_equity_scale: torch.Tensor | None = None
     short_sale_collateral_history: torch.Tensor | None = None
     short_margin_collateral_history: torch.Tensor | None = None
@@ -1316,6 +1334,31 @@ class BacktestResultTensor:
             final_cash=optional_float32(self.final_cash),
             final_payables=optional_float32(self.final_payables),
             final_receivables=optional_float32(self.final_receivables),
+            commission_rebate_accrued_history=optional_float32(
+                self.commission_rebate_accrued_history
+            ),
+            commission_rebate_paid_history=optional_float32(
+                self.commission_rebate_paid_history
+            ),
+            commission_rebate_current_history=optional_float32(
+                self.commission_rebate_current_history
+            ),
+            commission_rebate_due_history=optional_float32(
+                self.commission_rebate_due_history
+            ),
+            final_commission_rebate_current=optional_float32(
+                self.final_commission_rebate_current
+            ),
+            final_commission_rebate_due=optional_float32(
+                self.final_commission_rebate_due
+            ),
+            final_commission_rebate_month_id=(
+                None
+                if self.final_commission_rebate_month_id is None
+                else self.final_commission_rebate_month_id.detach()
+                .to(device="cpu", dtype=torch.int64)
+                .numpy()
+            ),
             final_equity_scale=optional_float32(self.final_equity_scale),
             short_sale_collateral_history=optional_float32(
                 self.short_sale_collateral_history
@@ -2600,6 +2643,10 @@ def run_backtest(
     execution_mode: str = "naive",
     buy_fee_rates: np.ndarray | None = None,
     sell_fee_rates: np.ndarray | None = None,
+    commission_rebate_rates: np.ndarray | None = None,
+    commission_rebate_timing: str = "daily_close",
+    session_month_ids: np.ndarray | None = None,
+    commission_rebate_payment_eligible_mask: np.ndarray | None = None,
     settlement_lag_sessions: int = 2,
     state_advance_mask: np.ndarray | None = None,
     day_trade_eligible_mask: np.ndarray | None = None,
@@ -2613,6 +2660,9 @@ def run_backtest(
     initial_cash: np.ndarray | float | None = None,
     initial_payables: np.ndarray | None = None,
     initial_receivables: np.ndarray | None = None,
+    initial_commission_rebate_current: np.ndarray | float | None = None,
+    initial_commission_rebate_due: np.ndarray | float | None = None,
+    initial_commission_rebate_month_id: np.ndarray | int | None = None,
     initial_alive: np.ndarray | bool | None = None,
     symbol_indices: np.ndarray | None = None,
     initial_equity_scale: np.ndarray | float | None = None,
@@ -2654,6 +2704,12 @@ def run_backtest(
             execution_mode=mode,
             buy_fee_rates=tensor(buy_fee_rates),
             sell_fee_rates=tensor(sell_fee_rates),
+            commission_rebate_rates=tensor(commission_rebate_rates),
+            commission_rebate_timing=commission_rebate_timing,
+            session_month_ids=tensor(session_month_ids),
+            commission_rebate_payment_eligible_mask=tensor(
+                commission_rebate_payment_eligible_mask
+            ),
             settlement_lag_sessions=settlement_lag_sessions,
             state_advance_mask=tensor(state_advance_mask),
             day_trade_eligible_mask=tensor(day_trade_eligible_mask),
@@ -2671,6 +2727,13 @@ def run_backtest(
             initial_cash=tensor(initial_cash),
             initial_payables=tensor(initial_payables),
             initial_receivables=tensor(initial_receivables),
+            initial_commission_rebate_current=tensor(
+                initial_commission_rebate_current
+            ),
+            initial_commission_rebate_due=tensor(initial_commission_rebate_due),
+            initial_commission_rebate_month_id=tensor(
+                initial_commission_rebate_month_id
+            ),
             initial_alive=tensor(initial_alive),
             initial_equity_scale=tensor(initial_equity_scale),
             initial_short_sale_collateral=tensor(initial_short_sale_collateral),
@@ -2735,6 +2798,10 @@ def run_backtest_torch(
     execution_mode: str = "naive",
     buy_fee_rates: torch.Tensor | None = None,
     sell_fee_rates: torch.Tensor | None = None,
+    commission_rebate_rates: torch.Tensor | None = None,
+    commission_rebate_timing: str = "daily_close",
+    session_month_ids: torch.Tensor | None = None,
+    commission_rebate_payment_eligible_mask: torch.Tensor | None = None,
     settlement_lag_sessions: int = 2,
     state_advance_mask: torch.Tensor | None = None,
     day_trade_eligible_mask: torch.Tensor | None = None,
@@ -2743,6 +2810,9 @@ def run_backtest_torch(
     initial_cash: torch.Tensor | None = None,
     initial_payables: torch.Tensor | None = None,
     initial_receivables: torch.Tensor | None = None,
+    initial_commission_rebate_current: torch.Tensor | None = None,
+    initial_commission_rebate_due: torch.Tensor | None = None,
+    initial_commission_rebate_month_id: torch.Tensor | None = None,
     symbol_indices: torch.Tensor | None = None,
     unresolved_corporate_action_mask: torch.Tensor | None = None,
     cash_dividend_yield: torch.Tensor | None = None,
@@ -2762,6 +2832,8 @@ def run_backtest_torch(
             raise ValueError(
                 f"{mode} requires explicit per-symbol buy_fee_rates and sell_fee_rates"
             )
+        if commission_rebate_rates is None:
+            commission_rebate_rates = torch.zeros_like(buy_fee_rates)
         if symbol_indices is not None:
             active_symbol_indices = symbol_indices.to(
                 device=buy_fee_rates.device,
@@ -2775,6 +2847,14 @@ def run_backtest_torch(
                 dtype=torch.long,
             )
             sell_fee_rates = sell_fee_rates.index_select(0, active_symbol_indices_sell)
+            active_symbol_indices_rebate = symbol_indices.to(
+                device=commission_rebate_rates.device,
+                dtype=torch.long,
+            )
+            commission_rebate_rates = commission_rebate_rates.index_select(
+                0,
+                active_symbol_indices_rebate,
+            )
         elif int(buy_fee_rates.numel()) != n_symbols:
             raise ValueError(
                 "buy_fee_rates length differs from the active symbol dimension; "
@@ -2784,6 +2864,11 @@ def run_backtest_torch(
             raise ValueError(
                 "sell_fee_rates length differs from the active symbol dimension; "
                 "symbol_indices is required for compact symbol batches"
+            )
+        elif int(commission_rebate_rates.numel()) != n_symbols:
+            raise ValueError(
+                "commission_rebate_rates length differs from the active symbol "
+                "dimension; symbol_indices is required for compact symbol batches"
             )
         if mode in TW_CARRYING_EXECUTION_MODES and not long_only:
             missing_short_contract = [
@@ -2952,6 +3037,12 @@ def run_backtest_torch(
                 phase_sell,
                 buy_fee_rates,
                 sell_fee_rates,
+                commission_rebate_rates=commission_rebate_rates,
+                commission_rebate_timing=commission_rebate_timing,
+                session_month_ids=session_month_ids,
+                commission_rebate_payment_eligible_mask=(
+                    commission_rebate_payment_eligible_mask
+                ),
                 can_short_open_mask=phase_short_open,
                 force_short_cover_mask=repeated_phase_mask(
                     None if long_only else force_short_cover_mask
@@ -2979,6 +3070,13 @@ def run_backtest_torch(
                 initial_cash=initial_cash,
                 initial_payables=initial_payables,
                 initial_receivables=initial_receivables,
+                initial_commission_rebate_current=(
+                    initial_commission_rebate_current
+                ),
+                initial_commission_rebate_due=initial_commission_rebate_due,
+                initial_commission_rebate_month_id=(
+                    initial_commission_rebate_month_id
+                ),
                 initial_alive=initial_alive,
                 initial_equity_scale=initial_equity_scale,
                 initial_short_sale_collateral=initial_short_sale_collateral,
@@ -3025,6 +3123,12 @@ def run_backtest_torch(
                 prepped_sell,
                 buy_fee_rates,
                 sell_fee_rates,
+                commission_rebate_rates=commission_rebate_rates,
+                commission_rebate_timing=commission_rebate_timing,
+                session_month_ids=session_month_ids,
+                commission_rebate_payment_eligible_mask=(
+                    commission_rebate_payment_eligible_mask
+                ),
                 can_short_open_mask=(
                     prepped_short_open if not long_only else None
                 ),
@@ -3064,6 +3168,13 @@ def run_backtest_torch(
                 initial_cash=initial_cash,
                 initial_payables=initial_payables,
                 initial_receivables=initial_receivables,
+                initial_commission_rebate_current=(
+                    initial_commission_rebate_current
+                ),
+                initial_commission_rebate_due=initial_commission_rebate_due,
+                initial_commission_rebate_month_id=(
+                    initial_commission_rebate_month_id
+                ),
                 initial_alive=initial_alive,
                 initial_equity_scale=initial_equity_scale,
                 initial_short_sale_collateral=initial_short_sale_collateral,
@@ -3109,6 +3220,12 @@ def run_backtest_torch(
                 ),
                 buy_fee_rates,
                 sell_fee_rates,
+                commission_rebate_rates=commission_rebate_rates,
+                commission_rebate_timing=commission_rebate_timing,
+                session_month_ids=session_month_ids,
+                commission_rebate_payment_eligible_mask=(
+                    commission_rebate_payment_eligible_mask
+                ),
                 day_trade_can_buy_open_mask=prepped_buy_open,
                 day_trade_can_sell_open_mask=prepped_sell_open,
                 settlement_lag_sessions=settlement_lag_sessions,
@@ -3121,6 +3238,13 @@ def run_backtest_torch(
                 initial_cash=initial_cash,
                 initial_payables=initial_payables,
                 initial_receivables=initial_receivables,
+                initial_commission_rebate_current=(
+                    initial_commission_rebate_current
+                ),
+                initial_commission_rebate_due=initial_commission_rebate_due,
+                initial_commission_rebate_month_id=(
+                    initial_commission_rebate_month_id
+                ),
                 initial_alive=initial_alive,
                 initial_equity_scale=initial_equity_scale,
             )
@@ -3197,6 +3321,41 @@ def run_backtest_torch(
             final_cash=tw_result.final_cash,
             final_payables=tw_result.final_payables,
             final_receivables=tw_result.final_receivables,
+            commission_rebate_accrued_history=getattr(
+                tw_result,
+                "commission_rebate_accrued_history",
+                None,
+            ),
+            commission_rebate_paid_history=getattr(
+                tw_result,
+                "commission_rebate_paid_history",
+                None,
+            ),
+            commission_rebate_current_history=getattr(
+                tw_result,
+                "commission_rebate_current_history",
+                None,
+            ),
+            commission_rebate_due_history=getattr(
+                tw_result,
+                "commission_rebate_due_history",
+                None,
+            ),
+            final_commission_rebate_current=getattr(
+                tw_result,
+                "final_commission_rebate_current",
+                None,
+            ),
+            final_commission_rebate_due=getattr(
+                tw_result,
+                "final_commission_rebate_due",
+                None,
+            ),
+            final_commission_rebate_month_id=getattr(
+                tw_result,
+                "final_commission_rebate_month_id",
+                None,
+            ),
             final_equity_scale=tw_result.final_equity_scale,
             short_sale_collateral_history=tw_result.short_sale_collateral_history,
             short_margin_collateral_history=tw_result.short_margin_collateral_history,
@@ -3331,6 +3490,38 @@ def _tw_integer_public_result(
         final_cash=np.asarray(state.settled_cash, dtype=np.float64),
         final_payables=state.payable_queue.copy(),
         final_receivables=state.receivable_queue.copy(),
+        commission_rebate_accrued_history=getattr(
+            result,
+            "commission_rebate_accrued_history",
+            None,
+        ),
+        commission_rebate_paid_history=getattr(
+            result,
+            "commission_rebate_paid_history",
+            None,
+        ),
+        commission_rebate_current_history=getattr(
+            result,
+            "commission_rebate_current_history",
+            None,
+        ),
+        commission_rebate_due_history=getattr(
+            result,
+            "commission_rebate_due_history",
+            None,
+        ),
+        final_commission_rebate_current=np.asarray(
+            state.commission_rebate_current,
+            dtype=np.float64,
+        ),
+        final_commission_rebate_due=np.asarray(
+            state.commission_rebate_due,
+            dtype=np.float64,
+        ),
+        final_commission_rebate_month_id=np.asarray(
+            state.commission_rebate_month_id,
+            dtype=np.int64,
+        ),
         short_sale_collateral_history=getattr(
             result, "short_sale_collateral_history", None
         ),
@@ -3659,6 +3850,10 @@ def run_backtest_integer_shares(
     execution_mode: str = "naive",
     buy_fee_rates: np.ndarray | None = None,
     sell_fee_rates: np.ndarray | None = None,
+    commission_rebate_rates: np.ndarray | float = 0.0,
+    commission_rebate_timing: str = "daily_close",
+    session_month_ids: np.ndarray | None = None,
+    commission_rebate_payment_eligible_mask: np.ndarray | None = None,
     minimum_commission: float = 0.0,
     commission_rounding: str = "none",
     tax_rounding: str = "none",
@@ -3707,7 +3902,10 @@ def run_backtest_integer_shares(
     the canonical close-to-next-session ``future_returns`` for mark-to-market;
     day-trade PnL is derived exactly from the supplied open/close prices.
     Broker minimum commission and whole-TWD rounding are exact-ledger-only
-    controls, charged once per nonzero symbol-side aggregate order.
+    controls, charged once per nonzero symbol-side aggregate order.  Gross
+    commission is posted first; the commission-only discount difference is an
+    NAV receivable until ``daily_close`` or the next-month-15th payment event,
+    and cannot fund trades before payment.
 
     ``symbols`` is normally already aligned to the active weight columns.  Set
     ``symbols_are_full_universe=True`` when it instead needs the same explicit
@@ -3778,6 +3976,37 @@ def run_backtest_integer_shares(
             n_symbols=n_symbols_real,
             symbol_indices=symbol_indices,
         )
+        selected_commission_rebate_rates = _select_integer_time_symbol_parameter(
+            "commission_rebate_rates",
+            commission_rebate_rates,
+            n_rows=t_len_real,
+            n_symbols=n_symbols_real,
+            symbol_indices=symbol_indices,
+        )
+        rebate_timing = normalize_commission_rebate_timing(
+            commission_rebate_timing
+        )
+        rebate_month_ids = session_month_ids
+        rebate_payment_eligible = commission_rebate_payment_eligible_mask
+        if (
+            rebate_timing == "monthly_15th"
+            and (
+                rebate_month_ids is None
+                or rebate_payment_eligible is None
+            )
+        ):
+            if dates is None:
+                raise ValueError(
+                    "monthly_15th integer commission rebates require dates or "
+                    "explicit session-month/payment calendar arrays"
+                )
+            derived_month_ids, derived_payment_eligible = (
+                commission_rebate_calendar(dates)
+            )
+            if rebate_month_ids is None:
+                rebate_month_ids = derived_month_ids
+            if rebate_payment_eligible is None:
+                rebate_payment_eligible = derived_payment_eligible
         selected_lots = (
             None
             if lot_sizes is None
@@ -4179,6 +4408,12 @@ def run_backtest_integer_shares(
                 phase_sell,
                 selected_buy_fees,
                 selected_sell_fees,
+                commission_rebate_rates=selected_commission_rebate_rates,
+                commission_rebate_timing=rebate_timing,
+                session_month_ids=rebate_month_ids,
+                commission_rebate_payment_eligible_mask=(
+                    rebate_payment_eligible
+                ),
                 can_short_open_mask=phase_short_open,
                 force_short_cover_mask=phase_force_cover,
                 short_margin_rate=selected_short_margin_rate,
@@ -4257,6 +4492,12 @@ def run_backtest_integer_shares(
                 claim_queue_sessions=claim_queue_sessions,
                 buy_fee_rates=selected_buy_fees,
                 sell_fee_rates=selected_sell_fees,
+                commission_rebate_rates=selected_commission_rebate_rates,
+                commission_rebate_timing=rebate_timing,
+                session_month_ids=rebate_month_ids,
+                commission_rebate_payment_eligible_mask=(
+                    rebate_payment_eligible
+                ),
                 minimum_commission=minimum_commission,
                 commission_rounding=commission_rounding,
                 tax_rounding=tax_rounding,
@@ -4330,6 +4571,12 @@ def run_backtest_integer_shares(
                 close_real,
                 buy_fee_rates=selected_buy_fees,
                 sell_fee_rates=selected_sell_fees,
+                commission_rebate_rates=selected_commission_rebate_rates,
+                commission_rebate_timing=rebate_timing,
+                session_month_ids=rebate_month_ids,
+                commission_rebate_payment_eligible_mask=(
+                    rebate_payment_eligible
+                ),
                 minimum_commission=minimum_commission,
                 commission_rounding=commission_rounding,
                 tax_rounding=tax_rounding,

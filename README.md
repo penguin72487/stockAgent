@@ -224,6 +224,18 @@ run_fintech_python scripts/manage_gpu_jobs.py status \
 - Use `run_fintech_python downloader/download_yahoo_ohlcv.py --asset crypto` to download only the expanded crypto universe.
 - Use `run_fintech_python downloader/download_yahoo_ohlcv.py --asset crypto --mode incremental` to refresh only missing/stale Yahoo crypto 15-minute bars.
 - Yahoo crypto uses 15-minute bars; existing crypto parquet files that look like old daily data are rebuilt from the 15-minute source instead of being merged.
+
+### Taiwan full-market one-minute Kbar research
+
+The Shioaji minute-research pipeline covers every stock and ETF in the Taiwan
+public universe while remaining separate from the Tick/BidAsk HFT capture.
+It uses resumable `api.kbars()` chunks, causal next-bar execution labels,
+Taiwan day-trade costs, and chronological validation. The default research mode
+recomputes a stateful target after every completed one-minute Kbar, executes only
+the target-position delta at the next minute open, carries positions between
+minutes, and forces the portfolio flat before the session ends. See
+[`docs/tw_minute_kbar_research.md`](docs/tw_minute_kbar_research.md) for the
+full data contract, backfill service, audit, and strategy commands.
 - Use `run_fintech_python downloader/download_yahoo_ohlcv.py --asset forex` to download only the expanded FX universe.
 - Use `run_fintech_python downloader/download_forex_pepperstone.py` to download the Pepperstone-style FX universe.
 - Use `run_fintech_python downloader/download_forex_pepperstone.py --mode repair` to repair stale/missing Pepperstone forex files.

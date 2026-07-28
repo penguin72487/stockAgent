@@ -525,7 +525,11 @@ class TradingConfig:
     # ``naive`` preserves the historical continuous-weight, immediate-fee path.
     execution_mode: str = "naive"
     tw_commission_rate: float = 0.001425
-    tw_commission_discount: float = 0.6
+    # Ultimate commission price after the broker rebate.  The executor still
+    # charges the gross rate first and releases the earned rebate only at the
+    # configured cash-payment event.
+    tw_commission_discount: float = 0.2
+    tw_commission_rebate_timing: str = "monthly_15th"
     tw_stock_sell_tax: float = 0.003
     tw_etf_sell_tax: float = 0.001
     tw_day_trade_stock_sell_tax: float = 0.0015
@@ -1889,6 +1893,7 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     taiwan_fee_schedule = TaiwanFeeSchedule(
         commission_rate=trading["tw_commission_rate"],
         commission_discount=trading["tw_commission_discount"],
+        commission_rebate_timing=trading["tw_commission_rebate_timing"],
         stock_sell_tax=trading["tw_stock_sell_tax"],
         etf_sell_tax=trading["tw_etf_sell_tax"],
         day_trade_stock_sell_tax=trading["tw_day_trade_stock_sell_tax"],
@@ -1904,6 +1909,9 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     # validated execution schedule consumed by the backtest executor.
     trading["tw_commission_rate"] = taiwan_fee_schedule.commission_rate
     trading["tw_commission_discount"] = taiwan_fee_schedule.commission_discount
+    trading["tw_commission_rebate_timing"] = (
+        taiwan_fee_schedule.commission_rebate_timing
+    )
     trading["tw_stock_sell_tax"] = taiwan_fee_schedule.stock_sell_tax
     trading["tw_etf_sell_tax"] = taiwan_fee_schedule.etf_sell_tax
     trading["tw_day_trade_stock_sell_tax"] = (
