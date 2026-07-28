@@ -710,16 +710,16 @@ def test_checkpoint_manifest_records_complete_configuration_fingerprint() -> Non
     assert changed_manifest["fingerprints"] == manifest["fingerprints"]
 
 
-def test_schema7_prior_backtest_contract_cannot_resume_but_can_infer(
+def test_schema9_prior_backtest_contract_cannot_resume_but_can_infer(
     tmp_path: Path,
 ) -> None:
     expected = _checkpoint_manifest(_panel(), _config())
     assert (
         expected["contracts"]["trading"]["canonical_backtest_contract_version"]
-        == 9
+        == 10
     )
     prior_contract = copy.deepcopy(expected)
-    prior_contract["contracts"]["trading"]["canonical_backtest_contract_version"] = 7
+    prior_contract["contracts"]["trading"]["canonical_backtest_contract_version"] = 9
     prior_contract["fingerprints"]["trading"] = trainer_module._stable_fingerprint(
         prior_contract["contracts"]["trading"]
     )
@@ -729,7 +729,7 @@ def test_schema7_prior_backtest_contract_cannot_resume_but_can_infer(
         _validate_checkpoint_manifest(
             checkpoint,
             expected,
-            checkpoint_path=tmp_path / "prior_backtest_schema7.pt",
+            checkpoint_path=tmp_path / "prior_backtest_schema9.pt",
             scope="resume",
         )
 
@@ -738,7 +738,7 @@ def test_schema7_prior_backtest_contract_cannot_resume_but_can_infer(
     _validate_checkpoint_manifest(
         checkpoint,
         expected,
-        checkpoint_path=tmp_path / "prior_backtest_schema7.pt",
+        checkpoint_path=tmp_path / "prior_backtest_schema9.pt",
         scope="inference",
     )
 
@@ -809,6 +809,31 @@ def test_taiwan_short_execution_settings_are_checkpoint_semantics() -> None:
     assert (
         longer_queue_manifest["fingerprints"]["trading"]
         != exact_manifest["fingerprints"]["trading"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("config_name", "replacement"),
+    [
+        ("tw_commission_discount", 0.35),
+        ("tw_commission_rebate_timing", "daily_close"),
+    ],
+)
+def test_taiwan_commission_rebate_settings_are_checkpoint_semantics(
+    config_name: str,
+    replacement: object,
+) -> None:
+    config = _config()
+    config.trading.execution_mode = "tw_cash"
+    baseline = _checkpoint_manifest(_panel(), config)
+
+    changed = copy.deepcopy(config)
+    setattr(changed.trading, config_name, replacement)
+    changed_manifest = _checkpoint_manifest(_panel(), changed)
+
+    assert (
+        changed_manifest["fingerprints"]["trading"]
+        != baseline["fingerprints"]["trading"]
     )
 
 

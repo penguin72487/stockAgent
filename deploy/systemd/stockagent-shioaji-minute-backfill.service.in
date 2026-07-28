@@ -1,0 +1,22 @@
+[Unit]
+Description=StockAgent full-market Shioaji one-minute Kbar backfill
+Wants=network-online.target time-sync.target
+After=network-online.target time-sync.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=@SERVICE_USER@
+Group=@SERVICE_GROUP@
+WorkingDirectory=@REPO_ROOT@
+Environment="HOME=@SERVICE_HOME@"
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=/usr/bin/bash "@REPO_ROOT@/scripts/run_shioaji_minute_full_backfill.sh"
+Restart=on-failure
+RestartSec=60s
+TimeoutStopSec=120s
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target

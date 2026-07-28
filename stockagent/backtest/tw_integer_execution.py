@@ -26,6 +26,9 @@ from typing import Literal
 
 import numpy as np
 
+from stockagent.backtest.tw_commission_rebate import (
+    normalize_commission_rebate_timing,
+)
 from stockagent.backtest.tw_execution import normalize_fee_rounding
 
 
@@ -65,6 +68,11 @@ class TaiwanIntegerState:
     # preserve construction compatibility with pre-margin-short states.
     short_sale_collateral: np.ndarray | None = None
     short_margin_collateral: np.ndarray | None = None
+    # Earned broker commission rebates are owned assets but remain outside
+    # settled buying power until their configured CLOSE payment event.
+    commission_rebate_current: float = 0.0
+    commission_rebate_due: float = 0.0
+    commission_rebate_month_id: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,6 +103,10 @@ class TaiwanIntegerBacktestResult:
     nav_history: np.ndarray
     settlement_net_history: np.ndarray
     fee_history: np.ndarray
+    commission_rebate_accrued_history: np.ndarray
+    commission_rebate_paid_history: np.ndarray
+    commission_rebate_current_history: np.ndarray
+    commission_rebate_due_history: np.ndarray
     default_mask: np.ndarray
     # Per-symbol restricted assets carried by Taiwan margin shorts.  These are
     # zero for cash-long-only and day-trade executions.
@@ -104,6 +116,18 @@ class TaiwanIntegerBacktestResult:
     # ``weights`` above remains the execution-time audit history.
     final_weights: np.ndarray
     final_state: TaiwanIntegerState
+
+    @property
+    def final_commission_rebate_current(self) -> float:
+        return float(self.final_state.commission_rebate_current)
+
+    @property
+    def final_commission_rebate_due(self) -> float:
+        return float(self.final_state.commission_rebate_due)
+
+    @property
+    def final_commission_rebate_month_id(self) -> int:
+        return int(self.final_state.commission_rebate_month_id)
 
 
 def _as_matrix(name: str, value: object) -> np.ndarray:
@@ -247,6 +271,173 @@ def _as_time_symbol_rate(
     return result
 
 
+def _as_commission_rebate_rates(
+    value: object,
+    *,
+    shape: tuple[int, ...],
+    gross_commission_rates: np.ndarray,
+) -> np.ndarray:
+    """Broadcast and validate commission-only rebate rates."""
+
+    result = np.asarray(value, dtype=np.float64)
+    if result.ndim == 0:
+        result = np.broadcast_to(result, shape)
+    elif result.shape == (shape[-1],):
+        result = np.broadcast_to(
+            result.reshape((1,) * (len(shape) - 1) + (shape[-1],)),
+            shape,
+        )
+    elif len(shape) == 2 and result.shape != shape:
+        raise ValueError(
+            "commission_rebate_rates must be scalar, [S], or [T,S]"
+        )
+    elif len(shape) == 3:
+        time, phases, symbols = shape
+        if result.shape == (phases, symbols):
+            result = np.broadcast_to(result.reshape(1, phases, symbols), shape)
+        elif result.shape == (time, symbols):
+            result = np.broadcast_to(result[:, None, :], shape)
+        elif result.shape != shape:
+            raise ValueError(
+                "commission_rebate_rates must be scalar, [S], [2,S], "
+                "[T,S], or [T,2,S]"
+            )
+    if result.shape != shape:
+        raise ValueError(
+            f"commission_rebate_rates must broadcast to shape {shape}"
+        )
+    if not np.all(np.isfinite(result)) or np.any(result < 0.0):
+        raise ValueError(
+            "commission_rebate_rates must contain finite non-negative rates"
+        )
+    gross = np.asarray(gross_commission_rates, dtype=np.float64)
+    tolerance = np.maximum(1.0, np.abs(gross)) * 1e-15
+    if np.any(result > gross + tolerance):
+        raise ValueError(
+            "commission_rebate_rates cannot exceed gross commission rates"
+        )
+    return np.minimum(result, gross)
+
+
+def _as_commission_rebate_calendar(
+    *,
+    time: int,
+    timing: object,
+    session_month_ids: object | None,
+    payment_eligible_mask: object | None,
+    state_advance_mask: np.ndarray,
+) -> tuple[str, np.ndarray, np.ndarray]:
+    """Validate executor-only monthly payment metadata."""
+
+    canonical = normalize_commission_rebate_timing(timing)
+    if canonical == "daily_close":
+        return (
+            canonical,
+            np.zeros(time, dtype=np.int64),
+            np.zeros(time, dtype=np.bool_),
+        )
+    if session_month_ids is None or payment_eligible_mask is None:
+        raise ValueError(
+            "monthly_15th commission rebates require session_month_ids and "
+            "commission_rebate_payment_eligible_mask"
+        )
+    raw_month_ids = np.asarray(session_month_ids)
+    if raw_month_ids.shape != (time,):
+        raise ValueError(f"session_month_ids must have shape [{time}]")
+    if raw_month_ids.dtype == np.bool_:
+        raise ValueError("session_month_ids must contain integers")
+    if not np.issubdtype(raw_month_ids.dtype, np.integer):
+        numeric = np.asarray(raw_month_ids, dtype=np.float64)
+        if not np.all(np.isfinite(numeric)) or not np.all(
+            numeric == np.floor(numeric)
+        ):
+            raise ValueError("session_month_ids must contain integers")
+        raw_month_ids = numeric.astype(np.int64)
+    month_ids = raw_month_ids.astype(np.int64, copy=False)
+    if np.any(month_ids[state_advance_mask] <= 0):
+        raise ValueError(
+            "active session_month_ids must contain positive integers"
+        )
+    if np.any(month_ids[~state_advance_mask] < 0):
+        raise ValueError(
+            "inactive session_month_ids must contain non-negative integers"
+        )
+    payment = np.asarray(payment_eligible_mask)
+    if payment.shape != (time,):
+        raise ValueError(
+            "commission_rebate_payment_eligible_mask must have "
+            f"shape [{time}]"
+        )
+    if payment.dtype != np.bool_:
+        raise ValueError(
+            "commission_rebate_payment_eligible_mask must contain booleans"
+        )
+    return canonical, month_ids, payment.astype(np.bool_, copy=False)
+
+
+def _as_initial_rebate_amount(name: str, value: object | None) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, Real):
+        raise ValueError(f"{name} must be finite and non-negative")
+    result = float(value)
+    if not np.isfinite(result) or result < 0.0:
+        raise ValueError(f"{name} must be finite and non-negative")
+    return result
+
+
+def _as_initial_rebate_month_id(value: object | None) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, (bool, np.bool_)) or not isinstance(
+        value,
+        (int, np.integer),
+    ):
+        raise ValueError(
+            "initial_commission_rebate_month_id must be a non-negative integer"
+        )
+    result = int(value)
+    if result < 0:
+        raise ValueError(
+            "initial_commission_rebate_month_id must be a non-negative integer"
+        )
+    return result
+
+
+def _apply_commission_rebate_at_close(
+    *,
+    earned: float,
+    cash: float,
+    current: float,
+    due: float,
+    accrual_month_id: int,
+    session_month_id: int,
+    payment_eligible: bool,
+    timing: str,
+) -> tuple[float, float, float, int, float]:
+    """Accrue exact integer-order rebates and pay only after CLOSE."""
+
+    earned_value = max(float(earned), 0.0)
+    if timing == "daily_close":
+        return cash + earned_value, 0.0, 0.0, 0, earned_value
+    if timing != "monthly_15th":
+        raise RuntimeError(f"unsupported commission rebate timing: {timing}")
+
+    month_changed = (
+        accrual_month_id > 0 and int(session_month_id) != accrual_month_id
+    )
+    rolled_due = due + current if month_changed else due
+    rolled_current = 0.0 if month_changed else current
+    paid = rolled_due if bool(payment_eligible) else 0.0
+    return (
+        cash + paid,
+        rolled_current + earned_value,
+        rolled_due - paid,
+        int(session_month_id),
+        paid,
+    )
+
+
 def _as_minimum_commission(value: object) -> float:
     if isinstance(value, (bool, np.bool_)) or not isinstance(value, Real):
         raise ValueError("minimum_commission must be finite and non-negative")
@@ -289,11 +480,30 @@ def _round_currency_fees(values: np.ndarray, rule: str) -> np.ndarray:
 
     if rule == "none":
         return values
+    raw = np.asarray(values, dtype=np.float64)
     if rule == "floor":
-        return np.floor(values)
+        boundary = np.rint(raw)
+        tolerance = (
+            8.0
+            * np.finfo(np.float64).eps
+            * np.maximum(1.0, np.abs(raw))
+        )
+        stable = np.where(np.abs(raw - boundary) <= tolerance, boundary, raw)
+        return np.floor(stable)
     if rule == "half_up":
         # Fee amounts are non-negative, so floor(x + 0.5) is decimal half-up.
-        return np.floor(values + 0.5)
+        half_boundary = np.rint(raw * 2.0) * 0.5
+        tolerance = (
+            8.0
+            * np.finfo(np.float64).eps
+            * np.maximum(1.0, np.abs(raw))
+        )
+        stable = np.where(
+            np.abs(raw - half_boundary) <= tolerance,
+            half_boundary,
+            raw,
+        )
+        return np.floor(stable + 0.5)
     raise RuntimeError(f"unreachable fee rounding rule: {rule!r}")
 
 
@@ -343,6 +553,45 @@ def _commission_fees_by_symbol(
         np.maximum(proportional, minimum_commission),
         0.0,
     )
+
+
+def _commission_rebates_by_symbol(
+    notionals: np.ndarray,
+    gross_commission_rates: np.ndarray,
+    commission_rebate_rates: np.ndarray,
+    *,
+    minimum_commission: float,
+    rounding: str,
+    gross_commissions: np.ndarray | None = None,
+) -> np.ndarray:
+    """Return exact earned rebate after independent gross/net fee rules.
+
+    Broker minimums and whole-TWD rounding apply independently to the gross
+    posted commission and to the discounted economic commission.  The earned
+    cash rebate is their non-negative difference; tax and short handling fees
+    never enter this calculation.
+    """
+
+    gross_rates = np.asarray(gross_commission_rates, dtype=np.float64)
+    rebate_rates = np.asarray(commission_rebate_rates, dtype=np.float64)
+    net_rates = np.maximum(gross_rates - rebate_rates, 0.0)
+    gross = (
+        _commission_fees_by_symbol(
+            notionals,
+            gross_rates,
+            minimum_commission=minimum_commission,
+            rounding=rounding,
+        )
+        if gross_commissions is None
+        else np.asarray(gross_commissions, dtype=np.float64)
+    )
+    net = _commission_fees_by_symbol(
+        notionals,
+        net_rates,
+        minimum_commission=minimum_commission,
+        rounding=rounding,
+    )
+    return np.maximum(gross - net, 0.0)
 
 
 def _tax_fees_by_symbol(
@@ -760,9 +1009,13 @@ def _copy_validate_state(
     settlement_lag_sessions: int,
     claim_queue_sessions: int,
     initial_cash: float,
+    initial_commission_rebate_current: object | None = None,
+    initial_commission_rebate_due: object | None = None,
+    initial_commission_rebate_month_id: object | None = None,
 ) -> TaiwanIntegerState:
+    state_was_supplied = state is not None
     if state is None:
-        return _new_state(
+        state = _new_state(
             mode,
             symbols,
             settlement_lag_sessions,
@@ -856,6 +1109,83 @@ def _copy_validate_state(
     ):
         raise ValueError("an absorbing dead initial_state must have a cleared zero ledger")
 
+    state_rebate_current = _as_initial_rebate_amount(
+        "initial_state.commission_rebate_current",
+        getattr(state, "commission_rebate_current", 0.0),
+    )
+    state_rebate_due = _as_initial_rebate_amount(
+        "initial_state.commission_rebate_due",
+        getattr(state, "commission_rebate_due", 0.0),
+    )
+    state_rebate_month_id = _as_initial_rebate_month_id(
+        getattr(state, "commission_rebate_month_id", 0),
+    )
+    assert state_rebate_current is not None
+    assert state_rebate_due is not None
+    assert state_rebate_month_id is not None
+    explicit_rebate_current = _as_initial_rebate_amount(
+        "initial_commission_rebate_current",
+        initial_commission_rebate_current,
+    )
+    explicit_rebate_due = _as_initial_rebate_amount(
+        "initial_commission_rebate_due",
+        initial_commission_rebate_due,
+    )
+    explicit_rebate_month_id = _as_initial_rebate_month_id(
+        initial_commission_rebate_month_id,
+    )
+    for name, explicit, carried in (
+        (
+            "initial_commission_rebate_current",
+            explicit_rebate_current,
+            state_rebate_current,
+        ),
+        (
+            "initial_commission_rebate_due",
+            explicit_rebate_due,
+            state_rebate_due,
+        ),
+        (
+            "initial_commission_rebate_month_id",
+            explicit_rebate_month_id,
+            state_rebate_month_id,
+        ),
+    ):
+        if state_was_supplied and explicit is not None and explicit != carried:
+            raise ValueError(
+                f"{name} disagrees with initial_state commission rebate state"
+            )
+    rebate_current = (
+        state_rebate_current
+        if explicit_rebate_current is None
+        else explicit_rebate_current
+    )
+    rebate_due = (
+        state_rebate_due
+        if explicit_rebate_due is None
+        else explicit_rebate_due
+    )
+    rebate_month_id = (
+        state_rebate_month_id
+        if explicit_rebate_month_id is None
+        else explicit_rebate_month_id
+    )
+    if rebate_current > 0.0 and rebate_month_id == 0:
+        raise ValueError(
+            "a non-zero current commission rebate requires its month id"
+        )
+    if not state.alive and (
+        rebate_current != 0.0
+        or rebate_due != 0.0
+        or rebate_month_id != 0
+    ):
+        raise ValueError(
+            "an absorbing dead initial_state cannot retain commission rebates"
+        )
+    resolved_last_nav = float(state.last_nav)
+    if not state_was_supplied:
+        resolved_last_nav += rebate_current + rebate_due
+
     last_weights: np.ndarray | None
     if state.last_weights is None:
         last_weights = None
@@ -889,11 +1219,14 @@ def _copy_validate_state(
         holdings=holdings,
         payable_queue=payable.copy(),
         receivable_queue=receivable.copy(),
-        last_nav=float(state.last_nav),
+        last_nav=resolved_last_nav,
         alive=bool(state.alive),
         last_weights=last_weights,
         short_sale_collateral=short_sale_collateral,
         short_margin_collateral=short_margin_collateral,
+        commission_rebate_current=rebate_current,
+        commission_rebate_due=rebate_due,
+        commission_rebate_month_id=rebate_month_id,
     )
 
 
@@ -948,6 +1281,22 @@ def _empty_result_arrays(
         "nav_history": np.zeros(time, dtype=np.float64),
         "settlement_net_history": np.zeros(time, dtype=np.float64),
         "fee_history": np.zeros(time, dtype=np.float64),
+        "commission_rebate_accrued_history": np.zeros(
+            time,
+            dtype=np.float64,
+        ),
+        "commission_rebate_paid_history": np.zeros(
+            time,
+            dtype=np.float64,
+        ),
+        "commission_rebate_current_history": np.zeros(
+            time,
+            dtype=np.float64,
+        ),
+        "commission_rebate_due_history": np.zeros(
+            time,
+            dtype=np.float64,
+        ),
         "default_mask": np.zeros(time, dtype=np.bool_),
         "short_sale_collateral_history": np.zeros(
             (time, symbols), dtype=np.float64
@@ -973,6 +1322,8 @@ def _record_state(
     execution_receivable: float | None = None,
     short_sale_collateral: np.ndarray | None = None,
     short_margin_collateral: np.ndarray | None = None,
+    commission_rebate_current: float = 0.0,
+    commission_rebate_due: float = 0.0,
 ) -> None:
     arrays["positions"][index] = holdings
     arrays["weights"][index] = weights
@@ -995,6 +1346,10 @@ def _record_state(
         float(nav) if execution_nav is None else float(execution_nav)
     )
     arrays["nav_history"][index] = nav
+    arrays["commission_rebate_current_history"][index] = (
+        commission_rebate_current
+    )
+    arrays["commission_rebate_due_history"][index] = commission_rebate_due
     if short_sale_collateral is not None:
         arrays["short_sale_collateral_history"][index] = short_sale_collateral
     if short_margin_collateral is not None:
@@ -1125,6 +1480,9 @@ def _build_result(
     final_weights: np.ndarray,
     short_sale_collateral: np.ndarray | None = None,
     short_margin_collateral: np.ndarray | None = None,
+    commission_rebate_current: float = 0.0,
+    commission_rebate_due: float = 0.0,
+    commission_rebate_month_id: int = 0,
 ) -> TaiwanIntegerBacktestResult:
     sale_collateral = (
         np.zeros(holdings.shape, dtype=np.float64)
@@ -1147,6 +1505,9 @@ def _build_result(
         last_weights=np.asarray(final_weights, dtype=np.float64).copy(),
         short_sale_collateral=sale_collateral.copy(),
         short_margin_collateral=margin_collateral.copy(),
+        commission_rebate_current=float(commission_rebate_current),
+        commission_rebate_due=float(commission_rebate_due),
+        commission_rebate_month_id=int(commission_rebate_month_id),
     )
     return TaiwanIntegerBacktestResult(
         final_state=state,
@@ -1166,6 +1527,10 @@ def _run_tw_cash_integer_long_only(
     claim_queue_sessions: int | None = None,
     buy_fee_rates: object,
     sell_fee_rates: object,
+    commission_rebate_rates: object = 0.0,
+    commission_rebate_timing: str = "daily_close",
+    session_month_ids: object | None = None,
+    commission_rebate_payment_eligible_mask: object | None = None,
     minimum_commission: float = 0.0,
     commission_rounding: str = "none",
     tax_rounding: str = "none",
@@ -1182,6 +1547,9 @@ def _run_tw_cash_integer_long_only(
     settlement_lag_sessions: int = 2,
     initial_cash: float = 1_000_000.0,
     initial_state: TaiwanIntegerState | None = None,
+    initial_commission_rebate_current: object | None = None,
+    initial_commission_rebate_due: object | None = None,
+    initial_commission_rebate_month_id: object | None = None,
 ) -> TaiwanIntegerBacktestResult:
     """Execute long-only Taiwan cash-stock targets in integer shares.
 
@@ -1245,6 +1613,14 @@ def _run_tw_cash_integer_long_only(
         sell_fee_rates,
         symbols,
     )
+    rebate_rates = _as_commission_rebate_rates(
+        commission_rebate_rates,
+        shape=targets.shape,
+        gross_commission_rates=np.broadcast_to(
+            commission_rates,
+            targets.shape,
+        ),
+    )
     min_commission = _as_minimum_commission(minimum_commission)
     commission_rounding_rule = normalize_fee_rounding(
         commission_rounding,
@@ -1278,6 +1654,17 @@ def _run_tw_cash_integer_long_only(
             "daily_volumes is required when max_volume_participation is positive"
         )
     advance = _as_advance_mask(state_advance_mask, time)
+    rebate_timing, rebate_month_ids, rebate_payment_eligible = (
+        _as_commission_rebate_calendar(
+            time=time,
+            timing=commission_rebate_timing,
+            session_month_ids=session_month_ids,
+            payment_eligible_mask=(
+                commission_rebate_payment_eligible_mask
+            ),
+            state_advance_mask=advance,
+        )
+    )
     state = _copy_validate_state(
         initial_state,
         mode="tw_cash",
@@ -1285,12 +1672,31 @@ def _run_tw_cash_integer_long_only(
         settlement_lag_sessions=lag,
         claim_queue_sessions=claim_queue,
         initial_cash=initial_cash,
+        initial_commission_rebate_current=(
+            initial_commission_rebate_current
+        ),
+        initial_commission_rebate_due=initial_commission_rebate_due,
+        initial_commission_rebate_month_id=(
+            initial_commission_rebate_month_id
+        ),
     )
 
     cash = state.settled_cash
     holdings = state.holdings.copy()
     payable = state.payable_queue.copy()
     receivable = state.receivable_queue.copy()
+    rebate_current = float(state.commission_rebate_current)
+    rebate_due = float(state.commission_rebate_due)
+    rebate_month_id = int(state.commission_rebate_month_id)
+    if rebate_timing == "daily_close" and (
+        rebate_current != 0.0
+        or rebate_due != 0.0
+        or rebate_month_id != 0
+    ):
+        raise ValueError(
+            "daily_close commission rebates cannot start with monthly pending "
+            "rebate state"
+        )
     last_nav = state.last_nav
     alive = state.alive
     final_weights = (
@@ -1337,6 +1743,8 @@ def _run_tw_cash_integer_long_only(
                 payable=payable,
                 receivable=receivable,
                 nav=last_nav,
+                commission_rebate_current=rebate_current,
+                commission_rebate_due=rebate_due,
             )
             continue
 
@@ -1350,6 +1758,9 @@ def _run_tw_cash_integer_long_only(
             cash = 0.0
             last_nav = 0.0
             final_weights.fill(0.0)
+            rebate_current = 0.0
+            rebate_due = 0.0
+            rebate_month_id = 0
             _record_ruin(arrays, t, payable=payable, receivable=receivable)
             continue
 
@@ -1403,6 +1814,8 @@ def _run_tw_cash_integer_long_only(
             cash
             + float(np.dot(holdings, valuation_price_row))
             + float(np.sum(receivable))
+            + rebate_current
+            + rebate_due
             - float(np.sum(payable))
         )
         if nav_before_trade <= 0.0:
@@ -1411,6 +1824,9 @@ def _run_tw_cash_integer_long_only(
             cash = 0.0
             last_nav = 0.0
             final_weights.fill(0.0)
+            rebate_current = 0.0
+            rebate_due = 0.0
+            rebate_month_id = 0
             _record_ruin(arrays, t, payable=payable, receivable=receivable)
             continue
 
@@ -1504,6 +1920,14 @@ def _run_tw_cash_integer_long_only(
             rounding=tax_rounding_rule,
         )
         sell_fees_by_symbol = sell_commissions_by_symbol + sell_taxes_by_symbol
+        sell_rebate_by_symbol = _commission_rebates_by_symbol(
+            sell_notional_by_symbol,
+            commission_rates,
+            rebate_rates[t],
+            minimum_commission=min_commission,
+            rounding=commission_rounding_rule,
+            gross_commissions=sell_commissions_by_symbol,
+        )
         sell_net = float(np.sum(sell_notional_by_symbol - sell_fees_by_symbol))
         _, _, desired_buy_cost_by_symbol = _buy_costs_by_symbol(
             desired_buys,
@@ -1557,6 +1981,18 @@ def _run_tw_cash_integer_long_only(
             commission_rounding=commission_rounding_rule,
         )
         buy_cost = float(np.sum(buy_cost_by_symbol))
+        buy_rebate_by_symbol = _commission_rebates_by_symbol(
+            buy_notional_by_symbol,
+            commission_rates,
+            rebate_rates[t],
+            minimum_commission=min_commission,
+            rounding=commission_rounding_rule,
+            gross_commissions=buy_fees_by_symbol,
+        )
+        rebate_accrued = float(
+            np.sum(sell_rebate_by_symbol)
+            + np.sum(buy_rebate_by_symbol)
+        )
         sell_notional = float(np.sum(sell_notional_by_symbol))
         fees = float(np.sum(sell_fees_by_symbol) + np.sum(buy_fees_by_symbol))
         settlement_net = sell_net - buy_cost
@@ -1591,6 +2027,8 @@ def _run_tw_cash_integer_long_only(
             cash
             + float(np.dot(holdings, valuation_price_row))
             + float(np.sum(receivable))
+            + rebate_current
+            + rebate_due
             - float(np.sum(payable))
         )
         execution_payable = float(np.sum(payable))
@@ -1603,6 +2041,39 @@ def _run_tw_cash_integer_long_only(
             atol=1e-7,
         ):
             raise RuntimeError("cash ledger asset-liability identity violated")
+        (
+            cash,
+            rebate_current,
+            rebate_due,
+            rebate_month_id,
+            rebate_paid,
+        ) = _apply_commission_rebate_at_close(
+            earned=rebate_accrued,
+            cash=cash,
+            current=rebate_current,
+            due=rebate_due,
+            accrual_month_id=rebate_month_id,
+            session_month_id=rebate_month_ids[t],
+            payment_eligible=rebate_payment_eligible[t],
+            timing=rebate_timing,
+        )
+        arrays["commission_rebate_accrued_history"][t] = rebate_accrued
+        arrays["commission_rebate_paid_history"][t] = rebate_paid
+        nav_after_rebate = (
+            cash
+            + float(np.dot(holdings, valuation_price_row))
+            + float(np.sum(receivable))
+            + rebate_current
+            + rebate_due
+            - float(np.sum(payable))
+        )
+        if not np.isclose(
+            nav_after_rebate,
+            nav_at_execution + rebate_accrued,
+            rtol=2e-12,
+            atol=1e-7,
+        ):
+            raise RuntimeError("commission rebate ledger identity violated")
         # The canonical sample at row t executes at close[t] and realizes the
         # supplied close-to-next-session total return before producing row t's
         # strategy return.  Using close[t] for both execution and valuation
@@ -1634,7 +2105,7 @@ def _run_tw_cash_integer_long_only(
                 np.sum(dividend_claim_by_symbol[due])
             )
         dividend_claim = float(np.sum(dividend_claim_by_symbol))
-        nav = nav_at_execution + dividend_claim + float(
+        nav = nav_after_rebate + dividend_claim + float(
             np.dot(holdings, next_valuation_prices - valuation_price_row)
         )
         if nav <= 0.0:
@@ -1643,6 +2114,9 @@ def _run_tw_cash_integer_long_only(
             cash = 0.0
             last_nav = 0.0
             final_weights.fill(0.0)
+            rebate_current = 0.0
+            rebate_due = 0.0
+            rebate_month_id = 0
             _record_ruin(arrays, t, payable=payable, receivable=receivable)
             continue
 
@@ -1654,6 +2128,8 @@ def _run_tw_cash_integer_long_only(
         ) / nav_before_trade
         arrays["settlement_net_history"][t] = settlement_net
         arrays["fee_history"][t] = fees
+        arrays["commission_rebate_accrued_history"][t] = rebate_accrued
+        arrays["commission_rebate_paid_history"][t] = rebate_paid
         weights = holdings * valuation_price_row / nav_at_execution
         final_weights = holdings * next_valuation_prices / nav
         final_weights_known = True
@@ -1669,6 +2145,8 @@ def _run_tw_cash_integer_long_only(
             execution_nav=nav_at_execution,
             execution_payable=execution_payable,
             execution_receivable=execution_receivable,
+            commission_rebate_current=rebate_current,
+            commission_rebate_due=rebate_due,
         )
         last_nav = nav
 
@@ -1682,6 +2160,9 @@ def _run_tw_cash_integer_long_only(
         last_nav=last_nav,
         alive=alive,
         final_weights=final_weights,
+        commission_rebate_current=rebate_current,
+        commission_rebate_due=rebate_due,
+        commission_rebate_month_id=rebate_month_id,
     )
 
 
@@ -1696,6 +2177,10 @@ def _run_tw_cash_integer_signed(
     claim_queue_sessions: int | None,
     buy_fee_rates: object,
     sell_fee_rates: object,
+    commission_rebate_rates: object,
+    commission_rebate_timing: str,
+    session_month_ids: object | None,
+    commission_rebate_payment_eligible_mask: object | None,
     minimum_commission: float,
     commission_rounding: str,
     tax_rounding: str,
@@ -1719,6 +2204,9 @@ def _run_tw_cash_integer_signed(
     settlement_lag_sessions: int,
     initial_cash: float,
     initial_state: TaiwanIntegerState | None,
+    initial_commission_rebate_current: object | None,
+    initial_commission_rebate_due: object | None,
+    initial_commission_rebate_month_id: object | None,
 ) -> TaiwanIntegerBacktestResult:
     """Signed Taiwan cash ledger with fully collateralized margin shorts."""
 
@@ -1762,6 +2250,14 @@ def _run_tw_cash_integer_signed(
         buy_fee_rates,
         sell_fee_rates,
         symbols,
+    )
+    rebate_rates = _as_commission_rebate_rates(
+        commission_rebate_rates,
+        shape=targets.shape,
+        gross_commission_rates=np.broadcast_to(
+            commission_rates,
+            targets.shape,
+        ),
     )
     margin_rates = _as_time_symbol_rate(
         "short_margin_rate", short_margin_rate, targets.shape
@@ -1821,6 +2317,17 @@ def _run_tw_cash_integer_signed(
             "daily_volumes is required when max_volume_participation is positive"
         )
     advance = _as_advance_mask(state_advance_mask, time)
+    rebate_timing, rebate_month_ids, rebate_payment_eligible = (
+        _as_commission_rebate_calendar(
+            time=time,
+            timing=commission_rebate_timing,
+            session_month_ids=session_month_ids,
+            payment_eligible_mask=(
+                commission_rebate_payment_eligible_mask
+            ),
+            state_advance_mask=advance,
+        )
+    )
     state = _copy_validate_state(
         initial_state,
         mode="tw_cash",
@@ -1828,6 +2335,13 @@ def _run_tw_cash_integer_signed(
         settlement_lag_sessions=lag,
         claim_queue_sessions=claim_queue,
         initial_cash=initial_cash,
+        initial_commission_rebate_current=(
+            initial_commission_rebate_current
+        ),
+        initial_commission_rebate_due=initial_commission_rebate_due,
+        initial_commission_rebate_month_id=(
+            initial_commission_rebate_month_id
+        ),
     )
     if can_short_open_mask is None and np.any(targets < 0.0):
         raise ValueError("negative tw_cash targets require can_short_open_mask")
@@ -1836,6 +2350,18 @@ def _run_tw_cash_integer_signed(
     holdings = state.holdings.copy()
     payable = state.payable_queue.copy()
     receivable = state.receivable_queue.copy()
+    rebate_current = float(state.commission_rebate_current)
+    rebate_due = float(state.commission_rebate_due)
+    rebate_month_id = int(state.commission_rebate_month_id)
+    if rebate_timing == "daily_close" and (
+        rebate_current != 0.0
+        or rebate_due != 0.0
+        or rebate_month_id != 0
+    ):
+        raise ValueError(
+            "daily_close commission rebates cannot start with monthly pending "
+            "rebate state"
+        )
     short_sale_collateral = np.asarray(
         state.short_sale_collateral, dtype=np.float64
     ).copy()
@@ -1892,6 +2418,8 @@ def _run_tw_cash_integer_signed(
                 nav=last_nav,
                 short_sale_collateral=short_sale_collateral,
                 short_margin_collateral=short_margin_collateral,
+                commission_rebate_current=rebate_current,
+                commission_rebate_due=rebate_due,
             )
             continue
 
@@ -1904,6 +2432,9 @@ def _run_tw_cash_integer_signed(
             cash = 0.0
             last_nav = 0.0
             final_weights.fill(0.0)
+            rebate_current = 0.0
+            rebate_due = 0.0
+            rebate_month_id = 0
             _record_ruin(
                 arrays,
                 t,
@@ -1972,6 +2503,8 @@ def _run_tw_cash_integer_signed(
             + float(np.dot(holdings, valuation_price_row))
             + short_collateral_before_trade
             + float(np.sum(receivable))
+            + rebate_current
+            + rebate_due
             - float(np.sum(payable))
         )
         if nav_before_trade <= 0.0:
@@ -1982,6 +2515,9 @@ def _run_tw_cash_integer_signed(
             cash = 0.0
             last_nav = 0.0
             final_weights.fill(0.0)
+            rebate_current = 0.0
+            rebate_due = 0.0
+            rebate_month_id = 0
             _record_ruin(
                 arrays,
                 t,
@@ -2133,6 +2669,14 @@ def _run_tw_cash_integer_signed(
                 rounding=tax_rounding_rule,
             )
             sell_fees = sell_commission + sell_tax
+            sell_rebate = _commission_rebates_by_symbol(
+                sell_notional,
+                commission_rates,
+                rebate_rates[t],
+                minimum_commission=min_commission,
+                rounding=commission_rounding_rule,
+                gross_commissions=sell_commission,
+            )
             short_sell_fraction = np.divide(
                 short_open,
                 sells,
@@ -2166,6 +2710,14 @@ def _run_tw_cash_integer_signed(
                 commission_rates,
                 minimum_commission=min_commission,
                 rounding=commission_rounding_rule,
+            )
+            buy_rebate = _commission_rebates_by_symbol(
+                buy_notional,
+                commission_rates,
+                rebate_rates[t],
+                minimum_commission=min_commission,
+                rounding=commission_rounding_rule,
+                gross_commissions=buy_fees,
             )
             cover_fraction_of_buy = np.divide(
                 cover,
@@ -2312,6 +2864,9 @@ def _run_tw_cash_integer_signed(
                     + np.sum(sell_fees)
                     + np.sum(short_handling_fees)
                 ),
+                "commission_rebate": float(
+                    np.sum(buy_rebate) + np.sum(sell_rebate)
+                ),
                 "settlement_net": settlement_net,
                 "sale_collateral": sale_collateral_after,
                 "margin_collateral": margin_collateral_after,
@@ -2375,6 +2930,7 @@ def _run_tw_cash_integer_signed(
         short_margin_collateral[np.abs(short_margin_collateral) <= 1e-12] = 0.0
         settlement_net = float(details["settlement_net"])
         fees = float(details["fees"])
+        rebate_accrued = float(details["commission_rebate"])
         residual_action = (holdings != 0) & action_avoidance
         if np.any(residual_action):
             raise RuntimeError(
@@ -2398,6 +2954,8 @@ def _run_tw_cash_integer_signed(
             + float(np.sum(short_sale_collateral))
             + float(np.sum(short_margin_collateral))
             + float(np.sum(receivable))
+            + rebate_current
+            + rebate_due
             - float(np.sum(payable))
         )
         execution_payable = float(np.sum(payable))
@@ -2410,6 +2968,41 @@ def _run_tw_cash_integer_signed(
             atol=1e-7,
         ):
             raise RuntimeError("cash margin-short ledger identity violated")
+        (
+            cash,
+            rebate_current,
+            rebate_due,
+            rebate_month_id,
+            rebate_paid,
+        ) = _apply_commission_rebate_at_close(
+            earned=rebate_accrued,
+            cash=cash,
+            current=rebate_current,
+            due=rebate_due,
+            accrual_month_id=rebate_month_id,
+            session_month_id=rebate_month_ids[t],
+            payment_eligible=rebate_payment_eligible[t],
+            timing=rebate_timing,
+        )
+        arrays["commission_rebate_accrued_history"][t] = rebate_accrued
+        arrays["commission_rebate_paid_history"][t] = rebate_paid
+        nav_after_rebate = (
+            cash
+            + float(np.dot(holdings, valuation_price_row))
+            + float(np.sum(short_sale_collateral))
+            + float(np.sum(short_margin_collateral))
+            + float(np.sum(receivable))
+            + rebate_current
+            + rebate_due
+            - float(np.sum(payable))
+        )
+        if not np.isclose(
+            nav_after_rebate,
+            nav_at_execution + rebate_accrued,
+            rtol=2e-12,
+            atol=1e-7,
+        ):
+            raise RuntimeError("commission rebate ledger identity violated")
 
         active_return = holdings != 0
         with np.errstate(over="ignore", invalid="ignore"):
@@ -2437,7 +3030,7 @@ def _run_tw_cash_integer_signed(
                 np.sum(dividend_claim_by_symbol[due])
             )
         dividend_claim = float(np.sum(dividend_claim_by_symbol))
-        nav = nav_at_execution + dividend_claim + float(
+        nav = nav_after_rebate + dividend_claim + float(
             np.dot(holdings, next_valuation_prices - valuation_price_row)
         )
         if nav <= 0.0:
@@ -2448,6 +3041,9 @@ def _run_tw_cash_integer_signed(
             cash = 0.0
             last_nav = 0.0
             final_weights.fill(0.0)
+            rebate_current = 0.0
+            rebate_due = 0.0
+            rebate_month_id = 0
             _record_ruin(arrays, t, payable=payable, receivable=receivable)
             continue
 
@@ -2460,6 +3056,8 @@ def _run_tw_cash_integer_signed(
         ) / nav_before_trade
         arrays["settlement_net_history"][t] = settlement_net
         arrays["fee_history"][t] = fees
+        arrays["commission_rebate_accrued_history"][t] = rebate_accrued
+        arrays["commission_rebate_paid_history"][t] = rebate_paid
         weights = holdings * valuation_price_row / nav_at_execution
         final_weights = holdings * next_valuation_prices / nav
         final_weights_known = True
@@ -2477,6 +3075,8 @@ def _run_tw_cash_integer_signed(
             execution_receivable=execution_receivable,
             short_sale_collateral=short_sale_collateral,
             short_margin_collateral=short_margin_collateral,
+            commission_rebate_current=rebate_current,
+            commission_rebate_due=rebate_due,
         )
         last_nav = nav
 
@@ -2492,6 +3092,9 @@ def _run_tw_cash_integer_signed(
         final_weights=final_weights,
         short_sale_collateral=short_sale_collateral,
         short_margin_collateral=short_margin_collateral,
+        commission_rebate_current=rebate_current,
+        commission_rebate_due=rebate_due,
+        commission_rebate_month_id=rebate_month_id,
     )
 
 
@@ -2506,6 +3109,10 @@ def run_tw_cash_integer(
     claim_queue_sessions: int | None = None,
     buy_fee_rates: object,
     sell_fee_rates: object,
+    commission_rebate_rates: object = 0.0,
+    commission_rebate_timing: str = "daily_close",
+    session_month_ids: object | None = None,
+    commission_rebate_payment_eligible_mask: object | None = None,
     minimum_commission: float = 0.0,
     commission_rounding: str = "none",
     tax_rounding: str = "none",
@@ -2530,6 +3137,9 @@ def run_tw_cash_integer(
     settlement_lag_sessions: int = 2,
     initial_cash: float = 1_000_000.0,
     initial_state: TaiwanIntegerState | None = None,
+    initial_commission_rebate_current: object | None = None,
+    initial_commission_rebate_due: object | None = None,
+    initial_commission_rebate_month_id: object | None = None,
 ) -> TaiwanIntegerBacktestResult:
     """Execute signed Taiwan cash targets; negatives are margin shorts.
 
@@ -2575,6 +3185,12 @@ def run_tw_cash_integer(
             claim_queue_sessions=claim_queue_sessions,
             buy_fee_rates=buy_fee_rates,
             sell_fee_rates=sell_fee_rates,
+            commission_rebate_rates=commission_rebate_rates,
+            commission_rebate_timing=commission_rebate_timing,
+            session_month_ids=session_month_ids,
+            commission_rebate_payment_eligible_mask=(
+                commission_rebate_payment_eligible_mask
+            ),
             minimum_commission=minimum_commission,
             commission_rounding=commission_rounding,
             tax_rounding=tax_rounding,
@@ -2591,6 +3207,13 @@ def run_tw_cash_integer(
             settlement_lag_sessions=settlement_lag_sessions,
             initial_cash=initial_cash,
             initial_state=initial_state,
+            initial_commission_rebate_current=(
+                initial_commission_rebate_current
+            ),
+            initial_commission_rebate_due=initial_commission_rebate_due,
+            initial_commission_rebate_month_id=(
+                initial_commission_rebate_month_id
+            ),
         )
 
     if short_margin_rate is None:
@@ -2628,6 +3251,12 @@ def run_tw_cash_integer(
         claim_queue_sessions=claim_queue_sessions,
         buy_fee_rates=buy_fee_rates,
         sell_fee_rates=sell_fee_rates,
+        commission_rebate_rates=commission_rebate_rates,
+        commission_rebate_timing=commission_rebate_timing,
+        session_month_ids=session_month_ids,
+        commission_rebate_payment_eligible_mask=(
+            commission_rebate_payment_eligible_mask
+        ),
         minimum_commission=minimum_commission,
         commission_rounding=commission_rounding,
         tax_rounding=tax_rounding,
@@ -2651,6 +3280,13 @@ def run_tw_cash_integer(
         settlement_lag_sessions=settlement_lag_sessions,
         initial_cash=initial_cash,
         initial_state=initial_state,
+        initial_commission_rebate_current=(
+            initial_commission_rebate_current
+        ),
+        initial_commission_rebate_due=initial_commission_rebate_due,
+        initial_commission_rebate_month_id=(
+            initial_commission_rebate_month_id
+        ),
     )
 
 
@@ -2662,6 +3298,10 @@ def run_tw_day_trade_integer(
     buy_fee_rates: object,
     sell_fee_rates: object,
     eligibility_mask: object,
+    commission_rebate_rates: object = 0.0,
+    commission_rebate_timing: str = "daily_close",
+    session_month_ids: object | None = None,
+    commission_rebate_payment_eligible_mask: object | None = None,
     minimum_commission: float = 0.0,
     commission_rounding: str = "none",
     tax_rounding: str = "none",
@@ -2681,6 +3321,9 @@ def run_tw_day_trade_integer(
     settlement_lag_sessions: int = 2,
     initial_cash: float = 1_000_000.0,
     initial_state: TaiwanIntegerState | None = None,
+    initial_commission_rebate_current: object | None = None,
+    initial_commission_rebate_due: object | None = None,
+    initial_commission_rebate_month_id: object | None = None,
 ) -> TaiwanIntegerBacktestResult:
     """Execute paired buy/sell day trades and finish every session flat.
 
@@ -2711,6 +3354,14 @@ def run_tw_day_trade_integer(
         buy_fee_rates,
         sell_fee_rates,
         symbols,
+    )
+    rebate_rates = _as_commission_rebate_rates(
+        commission_rebate_rates,
+        shape=targets.shape,
+        gross_commission_rates=np.broadcast_to(
+            commission_rates,
+            targets.shape,
+        ),
     )
     min_commission = _as_minimum_commission(minimum_commission)
     commission_rounding_rule = normalize_fee_rounding(
@@ -2775,6 +3426,17 @@ def run_tw_day_trade_integer(
             "daily_volumes is required when max_volume_participation is positive"
         )
     advance = _as_advance_mask(state_advance_mask, time)
+    rebate_timing, rebate_month_ids, rebate_payment_eligible = (
+        _as_commission_rebate_calendar(
+            time=time,
+            timing=commission_rebate_timing,
+            session_month_ids=session_month_ids,
+            payment_eligible_mask=(
+                commission_rebate_payment_eligible_mask
+            ),
+            state_advance_mask=advance,
+        )
+    )
     state = _copy_validate_state(
         initial_state,
         mode="tw_day_trade",
@@ -2782,12 +3444,31 @@ def run_tw_day_trade_integer(
         settlement_lag_sessions=lag,
         claim_queue_sessions=lag,
         initial_cash=initial_cash,
+        initial_commission_rebate_current=(
+            initial_commission_rebate_current
+        ),
+        initial_commission_rebate_due=initial_commission_rebate_due,
+        initial_commission_rebate_month_id=(
+            initial_commission_rebate_month_id
+        ),
     )
 
     cash = state.settled_cash
     holdings = state.holdings.copy()  # validated flat; retained for common state shape
     payable = state.payable_queue.copy()
     receivable = state.receivable_queue.copy()
+    rebate_current = float(state.commission_rebate_current)
+    rebate_due = float(state.commission_rebate_due)
+    rebate_month_id = int(state.commission_rebate_month_id)
+    if rebate_timing == "daily_close" and (
+        rebate_current != 0.0
+        or rebate_due != 0.0
+        or rebate_month_id != 0
+    ):
+        raise ValueError(
+            "daily_close commission rebates cannot start with monthly pending "
+            "rebate state"
+        )
     last_nav = state.last_nav
     alive = state.alive
     final_weights = np.zeros(symbols, dtype=np.float64)
@@ -2807,7 +3488,13 @@ def run_tw_day_trade_integer(
             )
             continue
         if not advance[t]:
-            nav = cash + float(np.sum(receivable)) - float(np.sum(payable))
+            nav = (
+                cash
+                + float(np.sum(receivable))
+                + rebate_current
+                + rebate_due
+                - float(np.sum(payable))
+            )
             _record_state(
                 arrays,
                 t,
@@ -2817,6 +3504,8 @@ def run_tw_day_trade_integer(
                 payable=payable,
                 receivable=receivable,
                 nav=nav,
+                commission_rebate_current=rebate_current,
+                commission_rebate_due=rebate_due,
             )
             continue
 
@@ -2825,14 +3514,26 @@ def run_tw_day_trade_integer(
             alive = False
             cash = 0.0
             last_nav = 0.0
+            rebate_current = 0.0
+            rebate_due = 0.0
+            rebate_month_id = 0
             _record_ruin(arrays, t, payable=payable, receivable=receivable)
             continue
 
-        nav_before_trade = cash + float(np.sum(receivable)) - float(np.sum(payable))
+        nav_before_trade = (
+            cash
+            + float(np.sum(receivable))
+            + rebate_current
+            + rebate_due
+            - float(np.sum(payable))
+        )
         if nav_before_trade <= 0.0:
             alive = False
             cash = 0.0
             last_nav = 0.0
+            rebate_current = 0.0
+            rebate_due = 0.0
+            rebate_month_id = 0
             _record_ruin(arrays, t, payable=payable, receivable=receivable)
             continue
 
@@ -2940,15 +3641,36 @@ def run_tw_day_trade_integer(
             minimum_commission=min_commission,
             rounding=commission_rounding_rule,
         )
-        sell_fees_by_symbol = _commission_fees_by_symbol(
+        sell_commissions_by_symbol = _commission_fees_by_symbol(
             sell_notional_by_symbol,
             commission_rates,
             minimum_commission=min_commission,
             rounding=commission_rounding_rule,
-        ) + _tax_fees_by_symbol(
+        )
+        sell_fees_by_symbol = sell_commissions_by_symbol + _tax_fees_by_symbol(
             sell_notional_by_symbol,
             sell_tax_rates,
             rounding=tax_rounding_rule,
+        )
+        buy_rebate_by_symbol = _commission_rebates_by_symbol(
+            buy_notional_by_symbol,
+            commission_rates,
+            rebate_rates[t],
+            minimum_commission=min_commission,
+            rounding=commission_rounding_rule,
+            gross_commissions=buy_fees_by_symbol,
+        )
+        sell_rebate_by_symbol = _commission_rebates_by_symbol(
+            sell_notional_by_symbol,
+            commission_rates,
+            rebate_rates[t],
+            minimum_commission=min_commission,
+            rounding=commission_rounding_rule,
+            gross_commissions=sell_commissions_by_symbol,
+        )
+        rebate_accrued = float(
+            np.sum(buy_rebate_by_symbol)
+            + np.sum(sell_rebate_by_symbol)
         )
         buy_cost = float(np.sum(buy_notional_by_symbol + buy_fees_by_symbol))
         sell_net = float(np.sum(sell_notional_by_symbol - sell_fees_by_symbol))
@@ -2956,14 +3678,60 @@ def run_tw_day_trade_integer(
         fees = float(np.sum(buy_fees_by_symbol) + np.sum(sell_fees_by_symbol))
         _enqueue_net_claim(settlement_net, payable, receivable)
 
-        nav = cash + float(np.sum(receivable)) - float(np.sum(payable))
+        nav_before_rebate = (
+            cash
+            + float(np.sum(receivable))
+            + rebate_current
+            + rebate_due
+            - float(np.sum(payable))
+        )
         expected_nav = nav_before_trade + settlement_net
-        if not np.isclose(nav, expected_nav, rtol=2e-12, atol=1e-7):
+        if not np.isclose(
+            nav_before_rebate,
+            expected_nav,
+            rtol=2e-12,
+            atol=1e-7,
+        ):
             raise RuntimeError("day-trade ledger asset-liability identity violated")
+        (
+            cash,
+            rebate_current,
+            rebate_due,
+            rebate_month_id,
+            rebate_paid,
+        ) = _apply_commission_rebate_at_close(
+            earned=rebate_accrued,
+            cash=cash,
+            current=rebate_current,
+            due=rebate_due,
+            accrual_month_id=rebate_month_id,
+            session_month_id=rebate_month_ids[t],
+            payment_eligible=rebate_payment_eligible[t],
+            timing=rebate_timing,
+        )
+        arrays["commission_rebate_accrued_history"][t] = rebate_accrued
+        arrays["commission_rebate_paid_history"][t] = rebate_paid
+        nav = (
+            cash
+            + float(np.sum(receivable))
+            + rebate_current
+            + rebate_due
+            - float(np.sum(payable))
+        )
+        if not np.isclose(
+            nav,
+            nav_before_rebate + rebate_accrued,
+            rtol=2e-12,
+            atol=1e-7,
+        ):
+            raise RuntimeError("commission rebate ledger identity violated")
         if nav <= 0.0:
             alive = False
             cash = 0.0
             last_nav = 0.0
+            rebate_current = 0.0
+            rebate_due = 0.0
+            rebate_month_id = 0
             _record_ruin(arrays, t, payable=payable, receivable=receivable)
             continue
 
@@ -2978,6 +3746,8 @@ def run_tw_day_trade_integer(
         arrays["weights"][t] = signed_positions * open_row / nav_before_trade
         arrays["settlement_net_history"][t] = settlement_net
         arrays["fee_history"][t] = fees
+        arrays["commission_rebate_accrued_history"][t] = rebate_accrued
+        arrays["commission_rebate_paid_history"][t] = rebate_paid
         arrays["settled_cash_history"][t] = cash
         arrays["payable_history"][t] = float(np.sum(payable))
         arrays["receivable_history"][t] = float(np.sum(receivable))
@@ -2985,6 +3755,8 @@ def run_tw_day_trade_integer(
         arrays["receivable_queue_history"][t] = receivable
         arrays["execution_nav_history"][t] = nav_before_trade
         arrays["nav_history"][t] = nav
+        arrays["commission_rebate_current_history"][t] = rebate_current
+        arrays["commission_rebate_due_history"][t] = rebate_due
         # End-of-session holdings remain zero by construction.
         last_nav = nav
 
@@ -2998,4 +3770,7 @@ def run_tw_day_trade_integer(
         last_nav=last_nav,
         alive=alive,
         final_weights=final_weights,
+        commission_rebate_current=rebate_current,
+        commission_rebate_due=rebate_due,
+        commission_rebate_month_id=rebate_month_id,
     )
