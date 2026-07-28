@@ -1777,7 +1777,7 @@ def _volume_limit_weights_from_notional(
     return torch.where(
         torch.isfinite(cap) & (cap >= 0.0),
         cap,
-        torch.full_like(cap, float("inf")),
+        torch.zeros_like(cap),
     )
 
 
@@ -11124,7 +11124,14 @@ def _run_eval_backtest_from_weight_buffers(
             buy_mask_chunk[valid_rows:] = False
             sell_mask_chunk[valid_rows:] = False
         if volume_notional_chunk is not None and int(volume_notional_chunk.size(0)) < int(weights_chunk.size(0)):
-            volume_notional_chunk = _pad_rows(volume_notional_chunk, int(weights_chunk.size(0)), fill_value=float("nan"))
+            # Fixed-shape padding is a recurrent no-op. A zero volume ceiling
+            # cannot fabricate executable capacity and satisfies the T+2
+            # executor's finite/non-negative input contract.
+            volume_notional_chunk = _pad_rows(
+                volume_notional_chunk,
+                int(weights_chunk.size(0)),
+                fill_value=0.0,
+            )
         if short_capacity_notional_chunk is not None:
             short_capacity_notional_chunk = _pad_rows(
                 short_capacity_notional_chunk,

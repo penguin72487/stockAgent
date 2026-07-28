@@ -3585,6 +3585,28 @@ def test_eval_backtest_compile_never_builds_one_shot_history_graph(
     )
 
 
+def test_volume_limit_weights_fail_closed_for_invalid_notional() -> None:
+    notional = torch.tensor(
+        [[1_000_000.0, float("nan"), float("inf"), -1.0]],
+        dtype=torch.float32,
+    )
+
+    cap = trainer_module._volume_limit_weights_from_notional(
+        notional,
+        max_volume_participation=0.5,
+        volume_participation_equity=1_000_000.0,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+
+    assert cap is not None
+    torch.testing.assert_close(
+        cap,
+        torch.tensor([[0.5, 0.0, 0.0, 0.0]], dtype=torch.float32),
+    )
+    assert torch.isfinite(cap).all()
+
+
 def test_compiled_panel_slab_eval_uses_separate_eager_wrapper() -> None:
     source = inspect.getsource(trainer_module.run_training)
     assert "eval_panel_slab_model = _PanelSlabForwardWrapper(model)" in source
