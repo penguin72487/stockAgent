@@ -35,15 +35,20 @@ from stockagent.backtest.tw_execution import normalize_fee_rounding
 from stockagent.backtest.tw_integer_execution import (
     TaiwanIntegerState,
     _as_advance_mask,
+    _as_commission_rebate_calendar,
+    _as_commission_rebate_rates,
     _as_execution_price_matrix,
     _as_lot_vector,
     _as_minimum_commission,
     _as_nonnegative_matrix,
     _as_nonnegative_ratio,
     _as_short_maintenance_ratio,
+    _apply_commission_rebate_at_close,
     _cash_dividend_inputs,
     _commission_fees_by_symbol,
+    _commission_rebates_by_symbol,
     _copy_validate_state,
+    _capacity_for_new_payable,
     _empty_result_arrays,
     _enqueue_net_claim,
     _limit_signed_transition_by_quantity,
@@ -57,7 +62,6 @@ from stockagent.backtest.tw_integer_execution import (
     _separate_reductions_and_openings,
     _settle_start_of_session,
     _tax_fees_by_symbol,
-    _capacity_for_new_payable,
 )
 
 
@@ -120,6 +124,11 @@ class TaiwanDualSessionIntegerBacktestResult:
     settlement_net_history: np.ndarray
     fee_history: np.ndarray
     event_fee_history: np.ndarray
+    commission_rebate_accrued_history: np.ndarray
+    commission_rebate_paid_history: np.ndarray
+    commission_rebate_current_history: np.ndarray
+    commission_rebate_due_history: np.ndarray
+    event_commission_rebate_accrued: np.ndarray
     default_mask: np.ndarray
     executed_buy_shares: np.ndarray
     executed_sell_shares: np.ndarray
@@ -148,6 +157,18 @@ class TaiwanDualSessionIntegerBacktestResult:
     def close_weights(self) -> np.ndarray:
         return self.weights
 
+    @property
+    def final_commission_rebate_current(self) -> float:
+        return float(self.final_state.commission_rebate_current)
+
+    @property
+    def final_commission_rebate_due(self) -> float:
+        return float(self.final_state.commission_rebate_due)
+
+    @property
+    def final_commission_rebate_month_id(self) -> int:
+        return int(self.final_state.commission_rebate_month_id)
+
 
 @dataclass(frozen=True, slots=True)
 class _IntegerEventResult:
@@ -156,6 +177,7 @@ class _IntegerEventResult:
     short_margin_collateral: np.ndarray
     settlement_net: float
     fee: float
+    commission_rebate: float
     turnover_notional: float
     remaining_volume: np.ndarray | None
     remaining_turnover: float | None
@@ -334,6 +356,8 @@ def _ledger_nav(
     short_sale_collateral: np.ndarray,
     short_margin_collateral: np.ndarray,
     pending_net_claim: float = 0.0,
+    commission_rebate_current: float = 0.0,
+    commission_rebate_due: float = 0.0,
 ) -> float:
     return float(
         cash
@@ -341,6 +365,8 @@ def _ledger_nav(
         + np.sum(short_sale_collateral)
         + np.sum(short_margin_collateral)
         + np.sum(receivable)
+        + commission_rebate_current
+        + commission_rebate_due
         - np.sum(payable)
         + pending_net_claim
     )
@@ -419,6 +445,7 @@ def _empty_event(
         short_margin_collateral=short_margin_collateral.copy(),
         settlement_net=0.0,
         fee=0.0,
+        commission_rebate=0.0,
         turnover_notional=0.0,
         remaining_volume=(
             None if remaining_volume is None else remaining_volume.copy()
@@ -471,9 +498,29 @@ def _execute_signed_integer_event(
     remaining_short_capacity: np.ndarray | None,
     event_nav: float,
     gross_budget: float,
+    commission_rebate_rates: np.ndarray | None = None,
 ) -> _IntegerEventResult:
     """Execute one exact signed event without aging or enqueueing settlement."""
 
+    rebate_rates = (
+        np.zeros_like(commission_rates, dtype=np.float64)
+        if commission_rebate_rates is None
+        else np.asarray(commission_rebate_rates, dtype=np.float64)
+    )
+    if rebate_rates.shape != commission_rates.shape:
+        raise ValueError(
+            "commission_rebate_rates must match event commission_rates"
+        )
+    if not np.all(np.isfinite(rebate_rates)) or np.any(rebate_rates < 0.0):
+        raise ValueError(
+            "commission_rebate_rates must contain finite non-negative rates"
+        )
+    gross_rates = np.asarray(commission_rates, dtype=np.float64)
+    tolerance = np.maximum(1.0, np.abs(gross_rates)) * 1e-15
+    if np.any(rebate_rates > gross_rates + tolerance):
+        raise ValueError(
+            "commission_rebate_rates cannot exceed gross commission rates"
+        )
     current_long = np.maximum(holdings, 0)
     current_short = np.maximum(-holdings, 0)
     mandatory_sell = np.minimum(
@@ -630,6 +677,14 @@ def _execute_signed_integer_event(
             rounding=tax_rounding,
         )
         sell_fees = sell_commission + sell_tax
+        sell_rebate = _commission_rebates_by_symbol(
+            sell_notional,
+            commission_rates,
+            rebate_rates,
+            minimum_commission=minimum_commission,
+            rounding=commission_rounding,
+            gross_commissions=sell_commission,
+        )
         short_sell_fraction = np.divide(
             short_open,
             sells,
@@ -659,6 +714,14 @@ def _execute_signed_integer_event(
             commission_rates,
             minimum_commission=minimum_commission,
             rounding=commission_rounding,
+        )
+        buy_rebate = _commission_rebates_by_symbol(
+            buy_notional,
+            commission_rates,
+            rebate_rates,
+            minimum_commission=minimum_commission,
+            rounding=commission_rounding,
+            gross_commissions=buy_fees,
         )
         cover_fraction_of_buy = np.divide(
             cover,
@@ -818,6 +881,9 @@ def _execute_signed_integer_event(
                 np.sum(buy_fees)
                 + np.sum(sell_fees)
                 + np.sum(short_handling_fees)
+            ),
+            "commission_rebate": float(
+                np.sum(buy_rebate) + np.sum(sell_rebate)
             ),
             "settlement_net": settlement_net,
             "sale_collateral": sale_collateral_after,
@@ -1296,6 +1362,7 @@ def _execute_signed_integer_event(
         short_margin_collateral=margin_collateral_after,
         settlement_net=float(details["settlement_net"]),
         fee=float(details["fees"]),
+        commission_rebate=float(details["commission_rebate"]),
         turnover_notional=float(
             np.sum(details["buy_notional"])
             + np.sum(details["sell_notional"])
@@ -1321,6 +1388,10 @@ def _run_dual_session_integer(
     can_sell_mask: object,
     buy_fee_rates: object,
     sell_fee_rates: object,
+    commission_rebate_rates: object,
+    commission_rebate_timing: str,
+    session_month_ids: object | None,
+    commission_rebate_payment_eligible_mask: object | None,
     can_short_open_mask: object | None,
     force_short_cover_mask: object | None,
     short_margin_rate: object | None,
@@ -1345,6 +1416,9 @@ def _run_dual_session_integer(
     settlement_lag_sessions: int,
     initial_cash: float,
     initial_state: TaiwanIntegerState | None,
+    initial_commission_rebate_current: object | None,
+    initial_commission_rebate_due: object | None,
+    initial_commission_rebate_month_id: object | None,
 ) -> TaiwanDualSessionIntegerBacktestResult:
     action_values = _as_actions(actions, mode=mode)
     time, _, symbols = action_values.shape
@@ -1412,6 +1486,11 @@ def _run_dual_session_integer(
         buy_fee_rates,
         sell_fee_rates,
         phase_shape,
+    )
+    rebate_rates = _as_commission_rebate_rates(
+        commission_rebate_rates,
+        shape=phase_shape,
+        gross_commission_rates=commission_rates,
     )
     min_commission = _as_minimum_commission(minimum_commission)
     commission_rounding_rule = normalize_fee_rounding(
@@ -1509,6 +1588,17 @@ def _run_dual_session_integer(
         claim_queue_sessions=claim_queue_sessions,
     )
     advance = _as_advance_mask(state_advance_mask, time)
+    rebate_timing, rebate_month_ids, rebate_payment_eligible = (
+        _as_commission_rebate_calendar(
+            time=time,
+            timing=commission_rebate_timing,
+            session_month_ids=session_month_ids,
+            payment_eligible_mask=(
+                commission_rebate_payment_eligible_mask
+            ),
+            state_advance_mask=advance,
+        )
+    )
     state = _copy_validate_state(
         initial_state,
         mode=mode,
@@ -1516,6 +1606,13 @@ def _run_dual_session_integer(
         settlement_lag_sessions=lag,
         claim_queue_sessions=claim_queue,
         initial_cash=initial_cash,
+        initial_commission_rebate_current=(
+            initial_commission_rebate_current
+        ),
+        initial_commission_rebate_due=initial_commission_rebate_due,
+        initial_commission_rebate_month_id=(
+            initial_commission_rebate_month_id
+        ),
     )
     holdings = state.holdings.copy()
     positive = holdings > 0
@@ -1541,6 +1638,18 @@ def _run_dual_session_integer(
     cash = float(state.settled_cash)
     payable = state.payable_queue.copy()
     receivable = state.receivable_queue.copy()
+    rebate_current = float(state.commission_rebate_current)
+    rebate_due = float(state.commission_rebate_due)
+    rebate_month_id = int(state.commission_rebate_month_id)
+    if rebate_timing == "daily_close" and (
+        rebate_current != 0.0
+        or rebate_due != 0.0
+        or rebate_month_id != 0
+    ):
+        raise ValueError(
+            "daily_close commission rebates cannot start with monthly pending "
+            "rebate state"
+        )
     short_sale_collateral = np.asarray(
         state.short_sale_collateral,
         dtype=np.float64,
@@ -1566,6 +1675,10 @@ def _run_dual_session_integer(
         open_positions=np.zeros((time, symbols), dtype=np.int64),
         open_weights=np.zeros((time, symbols), dtype=np.float64),
         event_fee_history=np.zeros((time, 2), dtype=np.float64),
+        event_commission_rebate_accrued=np.zeros(
+            (time, 2),
+            dtype=np.float64,
+        ),
         executed_long_buy_shares=np.zeros(
             (time, 2, symbols),
             dtype=np.int64,
@@ -1592,6 +1705,7 @@ def _run_dual_session_integer(
 
     def record_default(index: int) -> None:
         nonlocal cash, holdings, last_nav, alive, final_weights
+        nonlocal rebate_current, rebate_due, rebate_month_id
         alive = False
         cash = 0.0
         last_nav = 0.0
@@ -1599,6 +1713,9 @@ def _run_dual_session_integer(
         final_weights.fill(0.0)
         short_sale_collateral.fill(0.0)
         short_margin_collateral.fill(0.0)
+        rebate_current = 0.0
+        rebate_due = 0.0
+        rebate_month_id = 0
         if current_turnover_anchor > 0.0:
             arrays["event_turnovers"][index] = (
                 arrays["event_turnover_notionals"][index]
@@ -1609,6 +1726,9 @@ def _run_dual_session_integer(
             ) / current_turnover_anchor
         arrays["fee_history"][index] = float(
             np.sum(arrays["event_fee_history"][index])
+        )
+        arrays["commission_rebate_accrued_history"][index] = float(
+            np.sum(arrays["event_commission_rebate_accrued"][index])
         )
         arrays["settlement_net_history"][index] = current_pending_claim
         _record_ruin(
@@ -1630,6 +1750,10 @@ def _run_dual_session_integer(
             phase,
         ] += result.turnover_notional
         arrays["event_fee_history"][index, phase] += result.fee
+        arrays["event_commission_rebate_accrued"][
+            index,
+            phase,
+        ] += result.commission_rebate
         arrays["executed_long_buy_shares"][index, phase] += result.long_buy
         arrays["executed_long_sell_shares"][index, phase] += result.long_sell
         arrays["executed_short_open_shares"][index, phase] += result.short_open
@@ -1668,6 +1792,8 @@ def _run_dual_session_integer(
                 nav=last_nav,
                 short_sale_collateral=short_sale_collateral,
                 short_margin_collateral=short_margin_collateral,
+                commission_rebate_current=rebate_current,
+                commission_rebate_due=rebate_due,
             )
             continue
 
@@ -1688,6 +1814,8 @@ def _run_dual_session_integer(
             receivable=receivable,
             short_sale_collateral=short_sale_collateral,
             short_margin_collateral=short_margin_collateral,
+            commission_rebate_current=rebate_current,
+            commission_rebate_due=rebate_due,
         )
         if nav_start <= 0.0 or not np.isfinite(nav_start):
             record_default(t)
@@ -1708,6 +1836,8 @@ def _run_dual_session_integer(
             receivable=receivable,
             short_sale_collateral=short_sale_collateral,
             short_margin_collateral=short_margin_collateral,
+            commission_rebate_current=rebate_current,
+            commission_rebate_due=rebate_due,
         )
         if nav_open <= 0.0 or not np.isfinite(nav_open):
             record_default(t)
@@ -1806,6 +1936,8 @@ def _run_dual_session_integer(
             short_sale_collateral=short_sale_collateral,
             short_margin_collateral=short_margin_collateral,
             pending_net_claim=pending_net_claim,
+            commission_rebate_current=rebate_current,
+            commission_rebate_due=rebate_due,
         )
         open_event = _execute_signed_integer_event(
             holdings=holdings,
@@ -1840,6 +1972,7 @@ def _run_dual_session_integer(
             remaining_short_capacity=remaining_short_capacity,
             event_nav=nav_open,
             gross_budget=gross_ratio,
+            commission_rebate_rates=rebate_rates[t, OPEN],
         )
         apply_event_audit(t, OPEN, open_event)
         if open_event.default_now:
@@ -1862,6 +1995,8 @@ def _run_dual_session_integer(
             short_sale_collateral=short_sale_collateral,
             short_margin_collateral=short_margin_collateral,
             pending_net_claim=pending_net_claim,
+            commission_rebate_current=rebate_current,
+            commission_rebate_due=rebate_due,
         )
         if not np.isclose(
             nav_after_event,
@@ -1908,6 +2043,8 @@ def _run_dual_session_integer(
                 short_sale_collateral=short_sale_collateral,
                 short_margin_collateral=short_margin_collateral,
                 pending_net_claim=pending_net_claim,
+                commission_rebate_current=rebate_current,
+                commission_rebate_due=rebate_due,
             )
             entry_event = _execute_signed_integer_event(
                 holdings=holdings,
@@ -1942,6 +2079,7 @@ def _run_dual_session_integer(
                 remaining_short_capacity=remaining_short_capacity,
                 event_nav=nav_open,
                 gross_budget=gross_ratio,
+                commission_rebate_rates=rebate_rates[t, OPEN],
             )
             apply_event_audit(t, OPEN, entry_event)
             if entry_event.default_now:
@@ -1965,6 +2103,8 @@ def _run_dual_session_integer(
                 short_sale_collateral=short_sale_collateral,
                 short_margin_collateral=short_margin_collateral,
                 pending_net_claim=pending_net_claim,
+                commission_rebate_current=rebate_current,
+                commission_rebate_due=rebate_due,
             )
             if not np.isclose(
                 nav_after_event,
@@ -1985,6 +2125,8 @@ def _run_dual_session_integer(
             short_sale_collateral=short_sale_collateral,
             short_margin_collateral=short_margin_collateral,
             pending_net_claim=pending_net_claim,
+            commission_rebate_current=rebate_current,
+            commission_rebate_due=rebate_due,
         )
         if nav_after_open <= 0.0 or not np.isfinite(nav_after_open):
             record_default(t)
@@ -2010,6 +2152,8 @@ def _run_dual_session_integer(
             short_sale_collateral=short_sale_collateral,
             short_margin_collateral=short_margin_collateral,
             pending_net_claim=pending_net_claim,
+            commission_rebate_current=rebate_current,
+            commission_rebate_due=rebate_due,
         )
         if nav_close <= 0.0 or not np.isfinite(nav_close):
             record_default(t)
@@ -2093,6 +2237,8 @@ def _run_dual_session_integer(
             short_sale_collateral=short_sale_collateral,
             short_margin_collateral=short_margin_collateral,
             pending_net_claim=pending_net_claim,
+            commission_rebate_current=rebate_current,
+            commission_rebate_due=rebate_due,
         )
         close_event = _execute_signed_integer_event(
             holdings=holdings,
@@ -2127,6 +2273,7 @@ def _run_dual_session_integer(
             remaining_short_capacity=remaining_short_capacity,
             event_nav=nav_close,
             gross_budget=gross_ratio,
+            commission_rebate_rates=rebate_rates[t, CLOSE],
         )
         apply_event_audit(t, CLOSE, close_event)
         if close_event.default_now:
@@ -2146,6 +2293,8 @@ def _run_dual_session_integer(
             short_sale_collateral=short_sale_collateral,
             short_margin_collateral=short_margin_collateral,
             pending_net_claim=pending_net_claim,
+            commission_rebate_current=rebate_current,
+            commission_rebate_due=rebate_due,
         )
         if not np.isclose(
             nav_after_close_event,
@@ -2169,6 +2318,45 @@ def _run_dual_session_integer(
         execution_nav = nav_after_close_event
         execution_payable = float(np.sum(payable))
         execution_receivable = float(np.sum(receivable))
+        rebate_accrued = float(
+            np.sum(arrays["event_commission_rebate_accrued"][t])
+        )
+        (
+            cash,
+            rebate_current,
+            rebate_due,
+            rebate_month_id,
+            rebate_paid,
+        ) = _apply_commission_rebate_at_close(
+            earned=rebate_accrued,
+            cash=cash,
+            current=rebate_current,
+            due=rebate_due,
+            accrual_month_id=rebate_month_id,
+            session_month_id=rebate_month_ids[t],
+            payment_eligible=rebate_payment_eligible[t],
+            timing=rebate_timing,
+        )
+        arrays["commission_rebate_accrued_history"][t] = rebate_accrued
+        arrays["commission_rebate_paid_history"][t] = rebate_paid
+        nav_after_rebate = _ledger_nav(
+            cash=cash,
+            holdings=holdings,
+            prices=close_marks,
+            payable=payable,
+            receivable=receivable,
+            short_sale_collateral=short_sale_collateral,
+            short_margin_collateral=short_margin_collateral,
+            commission_rebate_current=rebate_current,
+            commission_rebate_due=rebate_due,
+        )
+        if not np.isclose(
+            nav_after_rebate,
+            execution_nav + rebate_accrued,
+            rtol=2e-12,
+            atol=1e-7,
+        ):
+            raise RuntimeError("commission rebate ledger identity violated")
         dividend_claim_by_symbol = (
             np.maximum(holdings, 0).astype(np.float64)
             * close_marks
@@ -2181,7 +2369,7 @@ def _run_dual_session_integer(
             receivable[int(delay) - 1] += float(
                 np.sum(dividend_claim_by_symbol[due_mask])
             )
-        nav = execution_nav + float(np.sum(dividend_claim_by_symbol))
+        nav = nav_after_rebate + float(np.sum(dividend_claim_by_symbol))
         if nav <= 0.0 or not np.isfinite(nav):
             record_default(t)
             continue
@@ -2198,6 +2386,8 @@ def _run_dual_session_integer(
         arrays["fee_history"][t] = float(
             np.sum(arrays["event_fee_history"][t])
         )
+        arrays["commission_rebate_accrued_history"][t] = rebate_accrued
+        arrays["commission_rebate_paid_history"][t] = rebate_paid
         close_weights = (
             holdings.astype(np.float64) * close_marks / execution_nav
         )
@@ -2216,6 +2406,8 @@ def _run_dual_session_integer(
             execution_receivable=execution_receivable,
             short_sale_collateral=short_sale_collateral,
             short_margin_collateral=short_margin_collateral,
+            commission_rebate_current=rebate_current,
+            commission_rebate_due=rebate_due,
         )
         if mode == "tw_overnight":
             arrays["due_positions_history"][t] = holdings
@@ -2239,6 +2431,9 @@ def _run_dual_session_integer(
             np.float64,
             copy=True,
         ),
+        commission_rebate_current=float(rebate_current),
+        commission_rebate_due=float(rebate_due),
+        commission_rebate_month_id=int(rebate_month_id),
     )
     long_buy = arrays["executed_long_buy_shares"]
     long_sell = arrays["executed_long_sell_shares"]
@@ -2300,6 +2495,21 @@ def _run_dual_session_integer(
         settlement_net_history=arrays["settlement_net_history"],
         fee_history=arrays["fee_history"],
         event_fee_history=arrays["event_fee_history"],
+        commission_rebate_accrued_history=arrays[
+            "commission_rebate_accrued_history"
+        ],
+        commission_rebate_paid_history=arrays[
+            "commission_rebate_paid_history"
+        ],
+        commission_rebate_current_history=arrays[
+            "commission_rebate_current_history"
+        ],
+        commission_rebate_due_history=arrays[
+            "commission_rebate_due_history"
+        ],
+        event_commission_rebate_accrued=arrays[
+            "event_commission_rebate_accrued"
+        ],
         default_mask=arrays["default_mask"],
         executed_buy_shares=long_buy + short_cover_history,
         executed_sell_shares=long_sell + short_open_history,
@@ -2344,6 +2554,10 @@ def run_tw_cash_dual_session_integer(
     buy_fee_rates: object,
     sell_fee_rates: object,
     *,
+    commission_rebate_rates: object = 0.0,
+    commission_rebate_timing: str = "daily_close",
+    session_month_ids: object | None = None,
+    commission_rebate_payment_eligible_mask: object | None = None,
     can_short_open_mask: object | None = None,
     force_short_cover_mask: object | None = None,
     short_margin_rate: object | None = None,
@@ -2368,6 +2582,9 @@ def run_tw_cash_dual_session_integer(
     settlement_lag_sessions: int = 2,
     initial_cash: float = 1_000_000.0,
     initial_state: TaiwanIntegerState | None = None,
+    initial_commission_rebate_current: object | None = None,
+    initial_commission_rebate_due: object | None = None,
+    initial_commission_rebate_month_id: object | None = None,
 ) -> TaiwanDualSessionIntegerBacktestResult:
     """Execute signed OPEN/CLOSE target weights with one daily T+2 event."""
 
@@ -2381,6 +2598,12 @@ def run_tw_cash_dual_session_integer(
         can_sell_mask=can_sell_mask,
         buy_fee_rates=buy_fee_rates,
         sell_fee_rates=sell_fee_rates,
+        commission_rebate_rates=commission_rebate_rates,
+        commission_rebate_timing=commission_rebate_timing,
+        session_month_ids=session_month_ids,
+        commission_rebate_payment_eligible_mask=(
+            commission_rebate_payment_eligible_mask
+        ),
         can_short_open_mask=can_short_open_mask,
         force_short_cover_mask=force_short_cover_mask,
         short_margin_rate=short_margin_rate,
@@ -2407,6 +2630,13 @@ def run_tw_cash_dual_session_integer(
         settlement_lag_sessions=settlement_lag_sessions,
         initial_cash=initial_cash,
         initial_state=initial_state,
+        initial_commission_rebate_current=(
+            initial_commission_rebate_current
+        ),
+        initial_commission_rebate_due=initial_commission_rebate_due,
+        initial_commission_rebate_month_id=(
+            initial_commission_rebate_month_id
+        ),
     )
 
 
@@ -2420,6 +2650,10 @@ def run_tw_overnight_dual_session_integer(
     buy_fee_rates: object,
     sell_fee_rates: object,
     *,
+    commission_rebate_rates: object = 0.0,
+    commission_rebate_timing: str = "daily_close",
+    session_month_ids: object | None = None,
+    commission_rebate_payment_eligible_mask: object | None = None,
     can_short_open_mask: object | None = None,
     force_short_cover_mask: object | None = None,
     short_margin_rate: object | None = None,
@@ -2444,6 +2678,9 @@ def run_tw_overnight_dual_session_integer(
     settlement_lag_sessions: int = 2,
     initial_cash: float = 1_000_000.0,
     initial_state: TaiwanIntegerState | None = None,
+    initial_commission_rebate_current: object | None = None,
+    initial_commission_rebate_due: object | None = None,
+    initial_commission_rebate_month_id: object | None = None,
 ) -> TaiwanDualSessionIntegerBacktestResult:
     """Execute strict one-session cohorts with exact OPEN/CLOSE prices."""
 
@@ -2457,6 +2694,12 @@ def run_tw_overnight_dual_session_integer(
         can_sell_mask=can_sell_mask,
         buy_fee_rates=buy_fee_rates,
         sell_fee_rates=sell_fee_rates,
+        commission_rebate_rates=commission_rebate_rates,
+        commission_rebate_timing=commission_rebate_timing,
+        session_month_ids=session_month_ids,
+        commission_rebate_payment_eligible_mask=(
+            commission_rebate_payment_eligible_mask
+        ),
         can_short_open_mask=can_short_open_mask,
         force_short_cover_mask=force_short_cover_mask,
         short_margin_rate=short_margin_rate,
@@ -2483,4 +2726,11 @@ def run_tw_overnight_dual_session_integer(
         settlement_lag_sessions=settlement_lag_sessions,
         initial_cash=initial_cash,
         initial_state=initial_state,
+        initial_commission_rebate_current=(
+            initial_commission_rebate_current
+        ),
+        initial_commission_rebate_due=initial_commission_rebate_due,
+        initial_commission_rebate_month_id=(
+            initial_commission_rebate_month_id
+        ),
     )

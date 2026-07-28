@@ -4,6 +4,10 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from stockagent.backtest.tw_commission_rebate import (
+    commission_rebate_calendar,
+    normalize_commission_rebate_timing,
+)
 from stockagent.backtest.tw_execution import (
     TW_CARRYING_EXECUTION_MODES,
     normalize_execution_mode,
@@ -120,6 +124,7 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
         lookback_context: str = "split_only",
         short_capacity_limit_enabled: bool = True,
         tw_corporate_action_mode: str = "avoid",
+        tw_commission_rebate_timing: str = "monthly_15th",
     ) -> None:
         self.lookback = int(lookback)
         if self.lookback <= 0:
@@ -128,6 +133,9 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
         carrying_execution = self.execution_mode in TW_CARRYING_EXECUTION_MODES
         self.lookback_context = normalize_lookback_context(lookback_context)
         self.short_capacity_limit_enabled = bool(short_capacity_limit_enabled)
+        self.tw_commission_rebate_timing = normalize_commission_rebate_timing(
+            tw_commission_rebate_timing
+        )
         self.tw_corporate_action_mode = str(tw_corporate_action_mode).strip().lower()
         if self.tw_corporate_action_mode not in {"avoid", "exact"}:
             raise ValueError("tw_corporate_action_mode must be 'avoid' or 'exact'")
@@ -753,6 +761,13 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
         self.force_exit_mask_t = torch.from_numpy(force_exit)
         self.benchmark_t = torch.from_numpy(benchmark_values)
         self.session_advance_mask_t = torch.ones(panel.num_dates, dtype=torch.bool)
+        rebate_month_ids, rebate_payment_eligible = commission_rebate_calendar(
+            panel.dates
+        )
+        self.session_month_ids_t = torch.from_numpy(rebate_month_ids)
+        self.commission_rebate_payment_eligible_mask_t = torch.from_numpy(
+            rebate_payment_eligible
+        )
         self.day_trade_eligible_mask_t = (
             None
             if day_trade_eligible is None
@@ -809,6 +824,10 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
             "force_exit_mask": self.force_exit_mask_t[date_idx],
             "benchmark": self.benchmark_t[date_idx],
             "session_advance_mask": self.session_advance_mask_t[date_idx],
+            "session_month_ids": self.session_month_ids_t[date_idx],
+            "commission_rebate_payment_eligible_mask": (
+                self.commission_rebate_payment_eligible_mask_t[date_idx]
+            ),
         }
         if self.volume_notional_t is not None:
             sample["volume_notional"] = self.volume_notional_t[date_idx]
@@ -862,6 +881,15 @@ def collate_batch(
             "benchmark": torch.stack([s["benchmark"] for s in samples]),
             "session_advance_mask": torch.stack(
                 [s["session_advance_mask"] for s in samples]
+            ),
+            "session_month_ids": torch.stack(
+                [s["session_month_ids"] for s in samples]
+            ),
+            "commission_rebate_payment_eligible_mask": torch.stack(
+                [
+                    s["commission_rebate_payment_eligible_mask"]
+                    for s in samples
+                ]
             ),
             "sample_mask": torch.ones(len(samples), dtype=torch.bool),
         }
@@ -924,6 +952,10 @@ def collate_batch(
         "force_exit_mask": _pad_tensor_list("force_exit_mask"),
         "benchmark": _pad_tensor_list("benchmark"),
         "session_advance_mask": _pad_tensor_list("session_advance_mask"),
+        "session_month_ids": _pad_tensor_list("session_month_ids"),
+        "commission_rebate_payment_eligible_mask": _pad_tensor_list(
+            "commission_rebate_payment_eligible_mask"
+        ),
         "sample_mask": torch.tensor([True] * len(samples) + [False] * pad_count, dtype=torch.bool),
     }
     if "volume_notional" in template:

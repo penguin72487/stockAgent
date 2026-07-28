@@ -73,8 +73,10 @@ def test_integer_runtime_capacity_switch_makes_zero_inventory_nonbinding() -> No
         sell_fee_rates=torch.zeros(1),
         lot_sizes=np.ones(1, dtype=np.int64),
         settlement_lag_sessions=2,
+        commission_rebate_rates=torch.zeros(1),
         integer_buy_fee_rates=np.zeros(1),
         integer_sell_fee_rates=np.zeros(1),
+        integer_commission_rebate_rates=np.zeros(1),
         short_lot_sizes=np.full(1, 1000, dtype=np.int64),
         short_capacity_limit_enabled=False,
     )

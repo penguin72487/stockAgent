@@ -30,6 +30,13 @@ from typing import Literal
 
 import torch
 
+from stockagent.backtest.tw_commission_rebate import (
+    apply_commission_rebate_at_close,
+    mask_commission_rebate_state,
+    normalize_commission_rebate_state,
+    prepare_commission_rebate_calendar_tensors,
+    prepare_commission_rebate_state,
+)
 from stockagent.backtest.tw_continuous import (
     _MIN_WEALTH_FACTOR,
     _advance_equity_scale,
@@ -87,6 +94,14 @@ class TaiwanDualSessionResult:
     final_equity_scale: torch.Tensor
     final_short_sale_collateral: torch.Tensor
     final_short_margin_collateral: torch.Tensor
+    commission_rebate_accrued_history: torch.Tensor
+    commission_rebate_paid_history: torch.Tensor
+    commission_rebate_current_history: torch.Tensor
+    commission_rebate_due_history: torch.Tensor
+    event_commission_rebate_accrued: torch.Tensor
+    final_commission_rebate_current: torch.Tensor
+    final_commission_rebate_due: torch.Tensor
+    final_commission_rebate_month_id: torch.Tensor
     due_weights_history: torch.Tensor | None = None
     final_due_weights: torch.Tensor | None = None
 
@@ -1075,12 +1090,13 @@ def _execute_signed_event(
 def _event_weight(
     risky: torch.Tensor, nav: torch.Tensor, alive: torch.Tensor
 ) -> torch.Tensor:
+    valid = alive & torch.isfinite(nav) & (nav > _MIN_WEALTH_FACTOR)
     safe_nav = torch.where(
-        alive & (nav > _MIN_WEALTH_FACTOR),
+        valid,
         nav,
         torch.ones_like(nav),
     )
-    return torch.where(alive, risky / safe_nav, torch.zeros_like(risky))
+    return torch.where(valid, risky / safe_nav, torch.zeros_like(risky))
 
 
 def _convert_reference_cap_to_ledger(
@@ -1197,6 +1213,10 @@ def _run_dual_session(
     can_sell_mask: torch.Tensor,
     buy_fee_rates: torch.Tensor | float,
     sell_fee_rates: torch.Tensor | float,
+    commission_rebate_rates: torch.Tensor | float,
+    commission_rebate_timing: str,
+    session_month_ids: torch.Tensor | None,
+    commission_rebate_payment_eligible_mask: torch.Tensor | None,
     can_short_open_mask: torch.Tensor | None,
     force_short_cover_mask: torch.Tensor | None,
     short_margin_rate: torch.Tensor | float | None,
@@ -1218,6 +1238,9 @@ def _run_dual_session(
     initial_cash: torch.Tensor | None,
     initial_payables: torch.Tensor | None,
     initial_receivables: torch.Tensor | None,
+    initial_commission_rebate_current: torch.Tensor | None,
+    initial_commission_rebate_due: torch.Tensor | None,
+    initial_commission_rebate_month_id: torch.Tensor | None,
     initial_alive: torch.Tensor | None,
     initial_equity_scale: torch.Tensor | None,
     initial_short_sale_collateral: torch.Tensor | None,
@@ -1319,8 +1342,49 @@ def _run_dual_session(
         reference=phase_reference,
         name="sell_fee_rates",
     )
+    rebate_rates = _as_phase_rate(
+        commission_rebate_rates,
+        reference=phase_reference,
+        name="commission_rebate_rates",
+    )
     if not torch.compiler.is_compiling() and bool((sell_fees >= 1.0).any().item()):
         raise ValueError("sell_fee_rates must be less than 1")
+    if not torch.compiler.is_compiling() and bool(
+        ((rebate_rates > buy_fees) | (rebate_rates > sell_fees)).any().item()
+    ):
+        raise ValueError(
+            "commission_rebate_rates cannot exceed gross buy or sell fee rates"
+        )
+    (
+        rebate_timing,
+        rebate_month_ids,
+        rebate_payment_eligible,
+    ) = prepare_commission_rebate_calendar_tensors(
+        reference=daily_reference,
+        timing=commission_rebate_timing,
+        session_month_ids=session_month_ids,
+        payment_eligible_mask=commission_rebate_payment_eligible_mask,
+        state_advance_mask=state_advance_mask,
+    )
+    if rebate_timing == "monthly_15th" and not torch.compiler.is_compiling():
+        rebate_active_rows = (
+            torch.ones(
+                (t_len,),
+                device=action_values.device,
+                dtype=torch.bool,
+            )
+            if state_advance_mask is None
+            else torch.as_tensor(
+                state_advance_mask,
+                device=action_values.device,
+                dtype=torch.bool,
+            )
+        )
+        active_month_ids = rebate_month_ids[rebate_active_rows]
+        if int(active_month_ids.numel()) > 1 and bool(
+            (active_month_ids[1:] < active_month_ids[:-1]).any().item()
+        ):
+            raise ValueError("active session_month_ids must be non-decreasing")
     if can_short_open_mask is not None:
         if short_margin_rate is None:
             raise ValueError(
@@ -1446,6 +1510,59 @@ def _run_dual_session(
             dtype=torch.int64,
         )
 
+    if initial_alive is None:
+        rebate_alive = torch.ones(
+            (),
+            device=action_values.device,
+            dtype=torch.bool,
+        )
+    else:
+        rebate_alive_source = (
+            initial_alive.detach() if detach_initial_state else initial_alive
+        )
+        if rebate_alive_source.dim() != 0:
+            raise ValueError("initial_alive must be a scalar tensor")
+        rebate_alive = rebate_alive_source.clone(
+            memory_format=torch.contiguous_format
+        ).to(device=action_values.device, dtype=torch.bool)
+    (
+        commission_rebate_current,
+        commission_rebate_due,
+        commission_rebate_month_id,
+    ) = prepare_commission_rebate_state(
+        reference=daily_reference,
+        initial_current=initial_commission_rebate_current,
+        initial_due=initial_commission_rebate_due,
+        initial_month_id=initial_commission_rebate_month_id,
+        alive=rebate_alive,
+        detach=detach_initial_state,
+    )
+    if (
+        rebate_timing == "monthly_15th"
+        and not torch.compiler.is_compiling()
+        and int(active_month_ids.numel()) > 0
+        and bool(
+            (
+                (commission_rebate_month_id > 0)
+                & (commission_rebate_month_id > active_month_ids[0])
+            ).item()
+        )
+    ):
+        raise ValueError(
+            "initial_commission_rebate_month_id cannot be later than the "
+            "first active session month"
+        )
+    if rebate_timing == "daily_close" and not torch.compiler.is_compiling():
+        has_carried_rebate = (
+            (commission_rebate_current > 0.0)
+            | (commission_rebate_due > 0.0)
+            | (commission_rebate_month_id != 0)
+        )
+        if bool(has_carried_rebate.item()):
+            raise ValueError(
+                "daily_close commission rebates cannot carry an initial "
+                "monthly rebate state"
+            )
     (
         risky,
         cash,
@@ -1466,8 +1583,20 @@ def _run_dual_session(
         initial_alive=initial_alive,
         initial_short_sale_collateral=initial_short_sale_collateral,
         initial_short_margin_collateral=initial_short_margin_collateral,
+        commission_rebate_current=commission_rebate_current,
+        commission_rebate_due=commission_rebate_due,
         state_advance_mask=state_advance_mask,
         detach_initial_state=detach_initial_state,
+    )
+    (
+        commission_rebate_current,
+        commission_rebate_due,
+        commission_rebate_month_id,
+    ) = mask_commission_rebate_state(
+        commission_rebate_current,
+        commission_rebate_due,
+        commission_rebate_month_id,
+        alive,
     )
     equity_scale = _prepare_equity_scale(
         daily_reference,
@@ -1493,6 +1622,11 @@ def _run_dual_session(
     equity_scale_rows: list[torch.Tensor] = []
     short_sale_rows: list[torch.Tensor] = []
     short_margin_rows: list[torch.Tensor] = []
+    rebate_accrued_rows: list[torch.Tensor] = []
+    rebate_paid_rows: list[torch.Tensor] = []
+    rebate_current_rows: list[torch.Tensor] = []
+    rebate_due_rows: list[torch.Tensor] = []
+    event_rebate_accrued_rows: list[torch.Tensor] = []
     due_rows: list[torch.Tensor] = []
 
     for idx in range(int(t_len)):
@@ -1528,7 +1662,17 @@ def _run_dual_session(
             short_margin_collateral,
             torch.zeros_like(short_margin_collateral),
         )
-        nav_start = _cash_margin_nav(
+        (
+            commission_rebate_current,
+            commission_rebate_due,
+            commission_rebate_month_id,
+        ) = mask_commission_rebate_state(
+            commission_rebate_current,
+            commission_rebate_due,
+            commission_rebate_month_id,
+            alive_after_settlement,
+        )
+        base_nav_start = _cash_margin_nav(
             cash=cash,
             risky=risky,
             payables=payables,
@@ -1536,6 +1680,11 @@ def _run_dual_session(
             short_sale_collateral=short_sale_collateral,
             short_margin_collateral=short_margin_collateral,
             pending_net_claim=pending_net_claim,
+        )
+        nav_start = (
+            base_nav_start
+            + commission_rebate_current
+            + commission_rebate_due
         )
 
         # All carried overnight positions are the due cohort in tw_overnight.
@@ -1566,6 +1715,16 @@ def _run_dual_session(
             short_margin_collateral=short_margin_collateral,
             pending_net_claim=pending_net_claim,
         )
+        (
+            commission_rebate_current,
+            commission_rebate_due,
+            commission_rebate_month_id,
+        ) = mask_commission_rebate_state(
+            commission_rebate_current,
+            commission_rebate_due,
+            commission_rebate_month_id,
+            alive_after_gap,
+        )
         effective_gap = torch.where(
             advance & alive_after_gap,
             overnight_returns[idx],
@@ -1577,7 +1736,7 @@ def _run_dual_session(
             due * (1.0 + effective_gap),
             torch.zeros_like(due),
         )
-        nav_open = _cash_margin_nav(
+        base_nav_open = _cash_margin_nav(
             cash=cash,
             risky=risky,
             payables=payables,
@@ -1585,6 +1744,11 @@ def _run_dual_session(
             short_sale_collateral=short_sale_collateral,
             short_margin_collateral=short_margin_collateral,
             pending_net_claim=pending_net_claim,
+        )
+        nav_open = (
+            base_nav_open
+            + commission_rebate_current
+            + commission_rebate_due
         )
         open_nav_default = (
             advance
@@ -1612,6 +1776,16 @@ def _run_dual_session(
             short_margin_collateral=short_margin_collateral,
             pending_net_claim=pending_net_claim,
         )
+        (
+            commission_rebate_current,
+            commission_rebate_due,
+            commission_rebate_month_id,
+        ) = mask_commission_rebate_state(
+            commission_rebate_current,
+            commission_rebate_due,
+            commission_rebate_month_id,
+            alive_phase,
+        )
         due = torch.where(alive_phase, due, torch.zeros_like(due))
         # ``nav_open`` remains the raw accounting mark used to classify
         # default and compute the day's return.  Once that mark has defaulted,
@@ -1623,10 +1797,10 @@ def _run_dual_session(
         open_event_nav = torch.where(
             advance
             & alive_phase
-            & torch.isfinite(nav_open)
-            & (nav_open > _MIN_WEALTH_FACTOR),
-            nav_open,
-            torch.zeros_like(nav_open),
+            & torch.isfinite(base_nav_open)
+            & (base_nav_open > _MIN_WEALTH_FACTOR),
+            base_nav_open,
+            torch.zeros_like(base_nav_open),
         )
 
         remaining_volume_reference = _convert_reference_cap_to_ledger(
@@ -1776,6 +1950,16 @@ def _run_dual_session(
             short_margin_collateral=short_margin_collateral,
             pending_net_claim=pending_net_claim,
         )
+        (
+            commission_rebate_current,
+            commission_rebate_due,
+            commission_rebate_month_id,
+        ) = mask_commission_rebate_state(
+            commission_rebate_current,
+            commission_rebate_due,
+            commission_rebate_month_id,
+            alive_phase,
+        )
         if mode == "tw_overnight":
             # No new cohort existed before this transition, so the residual is
             # exactly the due cohort.
@@ -1862,6 +2046,16 @@ def _run_dual_session(
                 short_margin_collateral=short_margin_collateral,
                 pending_net_claim=pending_net_claim,
             )
+            (
+                commission_rebate_current,
+                commission_rebate_due,
+                commission_rebate_month_id,
+            ) = mask_commission_rebate_state(
+                commission_rebate_current,
+                commission_rebate_due,
+                commission_rebate_month_id,
+                alive_phase,
+            )
             due = torch.where(alive_phase, due, torch.zeros_like(due))
             new_cohort = torch.where(
                 alive_phase,
@@ -1919,6 +2113,16 @@ def _run_dual_session(
             short_margin_collateral=short_margin_collateral,
             pending_net_claim=pending_net_claim,
         )
+        (
+            commission_rebate_current,
+            commission_rebate_due,
+            commission_rebate_month_id,
+        ) = mask_commission_rebate_state(
+            commission_rebate_current,
+            commission_rebate_due,
+            commission_rebate_month_id,
+            alive_phase,
+        )
         effective_intraday = torch.where(
             advance & alive_phase,
             intraday_returns[idx],
@@ -1935,7 +2139,7 @@ def _run_dual_session(
                 torch.zeros_like(new_cohort),
             )
 
-        nav_close = _cash_margin_nav(
+        base_nav_close = _cash_margin_nav(
             cash=cash,
             risky=risky,
             payables=payables,
@@ -1943,6 +2147,11 @@ def _run_dual_session(
             short_sale_collateral=short_sale_collateral,
             short_margin_collateral=short_margin_collateral,
             pending_net_claim=pending_net_claim,
+        )
+        nav_close = (
+            base_nav_close
+            + commission_rebate_current
+            + commission_rebate_due
         )
         close_nav_default = (
             advance
@@ -1970,6 +2179,16 @@ def _run_dual_session(
             short_margin_collateral=short_margin_collateral,
             pending_net_claim=pending_net_claim,
         )
+        (
+            commission_rebate_current,
+            commission_rebate_due,
+            commission_rebate_month_id,
+        ) = mask_commission_rebate_state(
+            commission_rebate_current,
+            commission_rebate_due,
+            commission_rebate_month_id,
+            alive_phase,
+        )
         if mode == "tw_overnight":
             due = torch.where(alive_phase, due, torch.zeros_like(due))
             new_cohort = torch.where(
@@ -1983,10 +2202,10 @@ def _run_dual_session(
         close_event_nav = torch.where(
             advance
             & alive_phase
-            & torch.isfinite(nav_close)
-            & (nav_close > _MIN_WEALTH_FACTOR),
-            nav_close,
-            torch.zeros_like(nav_close),
+            & torch.isfinite(base_nav_close)
+            & (base_nav_close > _MIN_WEALTH_FACTOR),
+            base_nav_close,
+            torch.zeros_like(base_nav_close),
         )
 
         close_mandatory_exit = unresolved_action[idx, CLOSE] | terminal[idx, CLOSE]
@@ -2114,6 +2333,16 @@ def _run_dual_session(
             short_margin_collateral=short_margin_collateral,
             pending_net_claim=pending_net_claim,
         )
+        (
+            commission_rebate_current,
+            commission_rebate_due,
+            commission_rebate_month_id,
+        ) = mask_commission_rebate_state(
+            commission_rebate_current,
+            commission_rebate_due,
+            commission_rebate_month_id,
+            alive_phase,
+        )
 
         if mode == "tw_overnight":
             # The due amounts were mandatory inputs to the close event.  The
@@ -2148,6 +2377,39 @@ def _run_dual_session(
             short_margin_collateral=short_margin_collateral,
             pending_net_claim=pending_net_claim,
         )
+        event_commission_rebate_accrued = torch.stack(
+            [
+                (
+                    (
+                        event_long_buy[phase]
+                        + event_long_sell[phase]
+                        + event_short_open[phase]
+                        + event_short_cover[phase]
+                    )
+                    * rebate_rates[idx, phase]
+                ).sum()
+                for phase in (OPEN, CLOSE)
+            ]
+        )
+        commission_rebate_accrued = event_commission_rebate_accrued.sum()
+        (
+            cash,
+            commission_rebate_current,
+            commission_rebate_due,
+            commission_rebate_month_id,
+            commission_rebate_paid,
+        ) = apply_commission_rebate_at_close(
+            earned=commission_rebate_accrued,
+            cash=cash,
+            current=commission_rebate_current,
+            due=commission_rebate_due,
+            accrual_month_id=commission_rebate_month_id,
+            session_month_id=rebate_month_ids[idx],
+            payment_eligible=rebate_payment_eligible[idx],
+            timing=rebate_timing,
+            advance=advance,
+            alive=alive_phase,
+        )
         dividend_claims = (
             risky.clamp_min(0.0)
             * dividend_yields[idx]
@@ -2163,7 +2425,13 @@ def _run_dual_session(
             dividend_claims,
         )
         receivables = receivables + scheduled_dividends
-        nav_end = close_execution_nav + scheduled_dividends.sum()
+        nav_end = (
+            close_execution_nav
+            + commission_rebate_paid
+            + commission_rebate_current
+            + commission_rebate_due
+            + scheduled_dividends.sum()
+        )
         if return_weights_history:
             # Phase histories are execution-boundary audits.  The just-created
             # same-close entitlement therefore cannot retroactively change the
@@ -2196,6 +2464,18 @@ def _run_dual_session(
             advance=advance,
             default_now=default_now,
         )
+        (
+            commission_rebate_current,
+            commission_rebate_due,
+            commission_rebate_month_id,
+        ) = normalize_commission_rebate_state(
+            current=commission_rebate_current,
+            due=commission_rebate_due,
+            month_id=commission_rebate_month_id,
+            nav_end=nav_end,
+            advance=advance,
+            alive=alive,
+        )
         equity_scale = _advance_equity_scale(
             equity_scale,
             simple_return,
@@ -2215,13 +2495,14 @@ def _run_dual_session(
             )
         # Internal event quantities stay in ledger-notional units so fees,
         # cash, shared turnover capacity, and settlement remain exact. Public
-        # turnover and executed-weight audits use the common start-of-day
-        # ``nav_open`` denominator, matching the integer oracle even after an
-        # overnight gap changes account equity.
+        # turnover and executed-weight audits use the common liquid
+        # start-of-day ``base_nav_open`` denominator.  Pending monthly rebates
+        # are owned NAV but cannot fund or size either auction before payment.
         safe_turnover_nav = torch.where(
-            torch.isfinite(nav_open) & (nav_open > _MIN_WEALTH_FACTOR),
-            nav_open,
-            torch.ones_like(nav_open),
+            torch.isfinite(base_nav_open)
+            & (base_nav_open > _MIN_WEALTH_FACTOR),
+            base_nav_open,
+            torch.ones_like(base_nav_open),
         )
         normalized_event_turnovers = torch.stack(event_turnovers) / safe_turnover_nav
         daily_turnover = normalized_event_turnovers.sum()
@@ -2259,6 +2540,11 @@ def _run_dual_session(
         equity_scale_rows.append(equity_scale)
         short_sale_rows.append(short_sale_collateral)
         short_margin_rows.append(short_margin_collateral)
+        rebate_accrued_rows.append(commission_rebate_accrued)
+        rebate_paid_rows.append(commission_rebate_paid)
+        rebate_current_rows.append(commission_rebate_current)
+        rebate_due_rows.append(commission_rebate_due)
+        event_rebate_accrued_rows.append(event_commission_rebate_accrued)
         if mode == "tw_overnight" and return_weights_history:
             # Today's close cohort is tomorrow's due portfolio.  Store it in
             # execution-weight units, matching the field name and artifacts.
@@ -2333,6 +2619,16 @@ def _run_dual_session(
         final_equity_scale=equity_scale,
         final_short_sale_collateral=short_sale_collateral,
         final_short_margin_collateral=short_margin_collateral,
+        commission_rebate_accrued_history=torch.stack(rebate_accrued_rows),
+        commission_rebate_paid_history=torch.stack(rebate_paid_rows),
+        commission_rebate_current_history=torch.stack(rebate_current_rows),
+        commission_rebate_due_history=torch.stack(rebate_due_rows),
+        event_commission_rebate_accrued=torch.stack(
+            event_rebate_accrued_rows
+        ),
+        final_commission_rebate_current=commission_rebate_current,
+        final_commission_rebate_due=commission_rebate_due,
+        final_commission_rebate_month_id=commission_rebate_month_id,
         due_weights_history=due_history,
         final_due_weights=(risky if mode == "tw_overnight" else None),
     )
@@ -2348,6 +2644,10 @@ def run_tw_cash_dual_session(
     buy_fee_rates: torch.Tensor | float,
     sell_fee_rates: torch.Tensor | float,
     *,
+    commission_rebate_rates: torch.Tensor | float = 0.0,
+    commission_rebate_timing: str = "daily_close",
+    session_month_ids: torch.Tensor | None = None,
+    commission_rebate_payment_eligible_mask: torch.Tensor | None = None,
     can_short_open_mask: torch.Tensor | None = None,
     force_short_cover_mask: torch.Tensor | None = None,
     short_margin_rate: torch.Tensor | float | None = None,
@@ -2369,6 +2669,9 @@ def run_tw_cash_dual_session(
     initial_cash: torch.Tensor | None = None,
     initial_payables: torch.Tensor | None = None,
     initial_receivables: torch.Tensor | None = None,
+    initial_commission_rebate_current: torch.Tensor | None = None,
+    initial_commission_rebate_due: torch.Tensor | None = None,
+    initial_commission_rebate_month_id: torch.Tensor | None = None,
     initial_alive: torch.Tensor | None = None,
     initial_equity_scale: torch.Tensor | None = None,
     initial_short_sale_collateral: torch.Tensor | None = None,
@@ -2387,6 +2690,12 @@ def run_tw_cash_dual_session(
         can_sell_mask=can_sell_mask,
         buy_fee_rates=buy_fee_rates,
         sell_fee_rates=sell_fee_rates,
+        commission_rebate_rates=commission_rebate_rates,
+        commission_rebate_timing=commission_rebate_timing,
+        session_month_ids=session_month_ids,
+        commission_rebate_payment_eligible_mask=(
+            commission_rebate_payment_eligible_mask
+        ),
         can_short_open_mask=can_short_open_mask,
         force_short_cover_mask=force_short_cover_mask,
         short_margin_rate=short_margin_rate,
@@ -2408,6 +2717,9 @@ def run_tw_cash_dual_session(
         initial_cash=initial_cash,
         initial_payables=initial_payables,
         initial_receivables=initial_receivables,
+        initial_commission_rebate_current=initial_commission_rebate_current,
+        initial_commission_rebate_due=initial_commission_rebate_due,
+        initial_commission_rebate_month_id=initial_commission_rebate_month_id,
         initial_alive=initial_alive,
         initial_equity_scale=initial_equity_scale,
         initial_short_sale_collateral=initial_short_sale_collateral,
@@ -2426,6 +2738,10 @@ def run_tw_overnight_dual_session(
     buy_fee_rates: torch.Tensor | float,
     sell_fee_rates: torch.Tensor | float,
     *,
+    commission_rebate_rates: torch.Tensor | float = 0.0,
+    commission_rebate_timing: str = "daily_close",
+    session_month_ids: torch.Tensor | None = None,
+    commission_rebate_payment_eligible_mask: torch.Tensor | None = None,
     can_short_open_mask: torch.Tensor | None = None,
     force_short_cover_mask: torch.Tensor | None = None,
     short_margin_rate: torch.Tensor | float | None = None,
@@ -2447,6 +2763,9 @@ def run_tw_overnight_dual_session(
     initial_cash: torch.Tensor | None = None,
     initial_payables: torch.Tensor | None = None,
     initial_receivables: torch.Tensor | None = None,
+    initial_commission_rebate_current: torch.Tensor | None = None,
+    initial_commission_rebate_due: torch.Tensor | None = None,
+    initial_commission_rebate_month_id: torch.Tensor | None = None,
     initial_alive: torch.Tensor | None = None,
     initial_equity_scale: torch.Tensor | None = None,
     initial_short_sale_collateral: torch.Tensor | None = None,
@@ -2470,6 +2789,12 @@ def run_tw_overnight_dual_session(
         can_sell_mask=can_sell_mask,
         buy_fee_rates=buy_fee_rates,
         sell_fee_rates=sell_fee_rates,
+        commission_rebate_rates=commission_rebate_rates,
+        commission_rebate_timing=commission_rebate_timing,
+        session_month_ids=session_month_ids,
+        commission_rebate_payment_eligible_mask=(
+            commission_rebate_payment_eligible_mask
+        ),
         can_short_open_mask=can_short_open_mask,
         force_short_cover_mask=force_short_cover_mask,
         short_margin_rate=short_margin_rate,
@@ -2491,6 +2816,9 @@ def run_tw_overnight_dual_session(
         initial_cash=initial_cash,
         initial_payables=initial_payables,
         initial_receivables=initial_receivables,
+        initial_commission_rebate_current=initial_commission_rebate_current,
+        initial_commission_rebate_due=initial_commission_rebate_due,
+        initial_commission_rebate_month_id=initial_commission_rebate_month_id,
         initial_alive=initial_alive,
         initial_equity_scale=initial_equity_scale,
         initial_short_sale_collateral=initial_short_sale_collateral,

@@ -12,6 +12,7 @@ from dataclasses import fields
 from pathlib import Path
 from typing import Callable
 
+import numpy as np
 import torch
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -29,6 +30,9 @@ from stockagent.backtest.tw_dual_session_compiled import (  # noqa: E402
     run_tw_cash_dual_session_compiled,
     run_tw_overnight_dual_session_compiled,
 )
+from stockagent.backtest.tw_commission_rebate import (  # noqa: E402
+    commission_rebate_calendar,
+)
 
 
 Runner = Callable[..., TaiwanDualSessionResult]
@@ -45,6 +49,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--symbols", type=int, default=2735)
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument("--commission-rate", type=float, default=0.001425)
+    parser.add_argument("--commission-discount", type=float, default=0.2)
+    parser.add_argument(
+        "--commission-rebate-timing",
+        choices=("monthly_15th", "daily_close"),
+        default="monthly_15th",
+    )
     parser.add_argument(
         "--backward",
         action="store_true",
@@ -61,6 +72,10 @@ def _parse_args() -> argparse.Namespace:
 def _make_case(args: argparse.Namespace) -> dict[str, object]:
     if args.rows <= 0 or args.symbols <= 0 or args.repeats <= 0:
         raise ValueError("rows, symbols, and repeats must be positive")
+    if args.commission_rate < 0.0:
+        raise ValueError("commission-rate must be non-negative")
+    if not 0.0 <= args.commission_discount <= 1.0:
+        raise ValueError("commission-discount must be between 0 and 1")
     device = torch.device("cuda")
     generator = torch.Generator(device=device).manual_seed(args.seed)
     base = torch.linspace(-1.0, 1.0, args.symbols, device=device)
@@ -82,7 +97,7 @@ def _make_case(args: argparse.Namespace) -> dict[str, object]:
         device=device,
         dtype=torch.bool,
     )
-    return {
+    case: dict[str, object] = {
         "actions": actions,
         "overnight_log_returns": (
             torch.randn(
@@ -103,8 +118,12 @@ def _make_case(args: argparse.Namespace) -> dict[str, object]:
         "tradable_mask": phase_mask,
         "can_buy_mask": phase_mask,
         "can_sell_mask": phase_mask,
-        "buy_fee_rates": 0.001425,
-        "sell_fee_rates": 0.004425,
+        "buy_fee_rates": args.commission_rate,
+        "sell_fee_rates": args.commission_rate + 0.003,
+        "commission_rebate_rates": (
+            args.commission_rate * (1.0 - args.commission_discount)
+        ),
+        "commission_rebate_timing": args.commission_rebate_timing,
         "can_short_open_mask": phase_mask,
         "short_margin_rate": 0.90,
         "short_capacity_weights": torch.ones(
@@ -114,6 +133,27 @@ def _make_case(args: argparse.Namespace) -> dict[str, object]:
         "short_handling_fee_rate": 0.0008,
         "return_weights_history": args.history,
     }
+    if args.commission_rebate_timing == "monthly_15th":
+        # Business-day sessions are sufficient for the timing benchmark: the
+        # executor consumes the same precomputed calendar tensors as training,
+        # while exchange-holiday accuracy remains a dataset concern.
+        dates = np.busday_offset(
+            np.datetime64("2026-01-02", "D"),
+            np.arange(args.rows),
+            roll="forward",
+        )
+        month_ids, payment_eligible = commission_rebate_calendar(dates)
+        case["session_month_ids"] = torch.as_tensor(
+            month_ids,
+            device=device,
+            dtype=torch.int64,
+        )
+        case["commission_rebate_payment_eligible_mask"] = torch.as_tensor(
+            payment_eligible,
+            device=device,
+            dtype=torch.bool,
+        )
+    return case
 
 
 def _objective(result: TaiwanDualSessionResult) -> torch.Tensor:
@@ -246,6 +286,9 @@ def main() -> None:
                 "symbols": args.symbols,
                 "backward": args.backward,
                 "history": args.history,
+                "commission_rate": args.commission_rate,
+                "commission_discount": args.commission_discount,
+                "commission_rebate_timing": args.commission_rebate_timing,
                 "device": torch.cuda.get_device_name(),
                 "dtype": str(case["actions"].dtype),
                 "cold_seconds": cold_time,

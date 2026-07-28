@@ -197,6 +197,31 @@ def test_fixed_block_and_eager_tail_match_and_preserve_gradient(
             **kwargs,
         )
 
+    def add_monthly_rebate(kwargs: dict[str, object]) -> None:
+        actions = torch.as_tensor(kwargs["actions"])
+        device = actions.device
+        kwargs["commission_rebate_rates"] = 0.00114
+        kwargs["commission_rebate_timing"] = "monthly_15th"
+        kwargs["session_month_ids"] = torch.cat(
+            (
+                torch.full(
+                    (16,),
+                    2026 * 12 + 1,
+                    device=device,
+                    dtype=torch.int64,
+                ),
+                torch.full(
+                    (19,),
+                    2026 * 12 + 2,
+                    device=device,
+                    dtype=torch.int64,
+                ),
+            )
+        )
+        payment_eligible = torch.zeros(35, device=device, dtype=torch.bool)
+        payment_eligible[30:] = True
+        kwargs["commission_rebate_payment_eligible_mask"] = payment_eligible
+
     eager_kwargs = _case(
         mode="tw_cash",
         rows=35,
@@ -204,6 +229,7 @@ def test_fixed_block_and_eager_tail_match_and_preserve_gradient(
         device="cuda",
         requires_grad=True,
     )
+    add_monthly_rebate(eager_kwargs)
     eager = run_tw_cash_dual_session(
         **eager_kwargs,
         return_weights_history=False,
@@ -223,6 +249,7 @@ def test_fixed_block_and_eager_tail_match_and_preserve_gradient(
         device="cuda",
         requires_grad=True,
     )
+    add_monthly_rebate(compiled_kwargs)
     torch._dynamo.reset()
     clear_tw_dual_session_compile_cache()
     get_tw_dual_session_compile_stats(reset=True)
