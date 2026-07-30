@@ -7211,6 +7211,60 @@ def _realized_leverage_backtest(
     )
 
 
+def _write_reporting_leverage_artifacts(
+    result: BacktestResult,
+    future_returns: np.ndarray | torch.Tensor,
+    dates: np.ndarray,
+    fold_dir: Path,
+    config: ExperimentConfig,
+) -> BacktestResult | None:
+    """Write leverage plots without letting inference overwrite them with 1x data."""
+
+    multiplier = float(getattr(config.trading, "reporting_leverage", 1.0))
+    execution_mode = normalize_execution_mode(result.execution_mode)
+    output_names = (
+        "leverage_equity_curve.png",
+        "leverage_equity_curve_log.png",
+        "leverage_annual_performance.png",
+        "leverage_annual_report.txt",
+    )
+    if execution_mode != "naive":
+        if not math.isclose(multiplier, 1.0, rel_tol=0.0, abs_tol=1.0e-12):
+            for name in output_names:
+                (fold_dir / name).unlink(missing_ok=True)
+            return None
+        leverage_result = result
+    else:
+        leverage_result = _realized_leverage_backtest(
+            result,
+            future_returns,
+            leverage_multiplier=multiplier,
+            buy_fee_rate=config.trading.buy_fee_rate,
+            sell_fee_rate=config.trading.sell_fee_rate,
+        )
+
+    plot_equity_curve(
+        leverage_result,
+        dates,
+        fold_dir / "leverage_equity_curve.png",
+    )
+    plot_equity_curve_log(
+        leverage_result,
+        dates,
+        fold_dir / "leverage_equity_curve_log.png",
+    )
+    plot_annual_performance(
+        leverage_result,
+        dates,
+        fold_dir / "leverage_annual_performance.png",
+    )
+    (fold_dir / "leverage_annual_report.txt").write_text(
+        generate_annual_report(leverage_result, dates),
+        encoding="utf-8",
+    )
+    return leverage_result
+
+
 def _save_best_val_backtest_snapshot(
     *,
     fold_dir: Path,
@@ -7914,9 +7968,26 @@ def _align_panel_to_state_dict_universe(
     fold_dir: Path,
     state_dict: Mapping[str, Any],
     *,
+    checkpoint_symbols: Sequence[str] | None = None,
     context: str = "inference",
     allow_missing_masked: bool = False,
 ) -> PanelData:
+    if checkpoint_symbols is not None:
+        trained_symbols = [str(symbol) for symbol in checkpoint_symbols]
+        if len(trained_symbols) != len(set(trained_symbols)):
+            raise ValueError("checkpoint manifest symbol universe contains duplicates")
+        if trained_symbols == list(panel.symbols):
+            return panel
+        print(
+            f"[{context}] aligning panel to checkpoint manifest universe: "
+            f"current={panel.num_symbols}, checkpoint={len(trained_symbols)}"
+        )
+        return _subset_panel_symbols(
+            panel,
+            trained_symbols,
+            allow_missing_masked=allow_missing_masked,
+        )
+
     expected_symbols = _state_dict_symbol_count(state_dict)
     if expected_symbols is None:
         return panel
@@ -17068,9 +17139,13 @@ def _run_training_tree_models(
             plot_equity_curve(canonical_test_bt, test_dates, fold_dir / "equity_curve.png")
             plot_equity_curve_log(canonical_test_bt, test_dates, fold_dir / "equity_curve_log.png")
             plot_annual_performance(canonical_test_bt, test_dates, fold_dir / "annual_performance.png")
-            plot_equity_curve(canonical_test_bt, test_dates, fold_dir / "leverage_equity_curve.png")
-            plot_equity_curve_log(canonical_test_bt, test_dates, fold_dir / "leverage_equity_curve_log.png")
-            plot_annual_performance(canonical_test_bt, test_dates, fold_dir / "leverage_annual_performance.png")
+            _write_reporting_leverage_artifacts(
+                canonical_test_bt,
+                test_returns,
+                test_dates,
+                fold_dir,
+                config,
+            )
             _save_integer_share_audit_artifacts(
                 fold_dir,
                 test_integer_bt,
@@ -17508,9 +17583,13 @@ def _run_inference_tree_models(
         plot_equity_curve(canonical_test_bt, test_dates, fold_dir / "equity_curve.png")
         plot_equity_curve_log(canonical_test_bt, test_dates, fold_dir / "equity_curve_log.png")
         plot_annual_performance(canonical_test_bt, test_dates, fold_dir / "annual_performance.png")
-        plot_equity_curve(canonical_test_bt, test_dates, fold_dir / "leverage_equity_curve.png")
-        plot_equity_curve_log(canonical_test_bt, test_dates, fold_dir / "leverage_equity_curve_log.png")
-        plot_annual_performance(canonical_test_bt, test_dates, fold_dir / "leverage_annual_performance.png")
+        _write_reporting_leverage_artifacts(
+            canonical_test_bt,
+            test_returns,
+            test_dates,
+            fold_dir,
+            config,
+        )
         _save_integer_share_audit_artifacts(
             fold_dir,
             test_integer_bt,
@@ -17578,6 +17657,7 @@ def _run_inference_neural_models(
 
         model_state_dict: dict | None = None
         best_val_loss = float("inf")
+        checkpoint_symbols: Sequence[str] | None = None
 
         if best_checkpoint_file.exists():
             checkpoint = _load_checkpoint(best_checkpoint_file)
@@ -17590,6 +17670,26 @@ def _run_inference_neural_models(
             )
             model_state_dict = checkpoint.get("model_state_dict")
             best_val_loss = float(checkpoint.get("best_val_loss", float("inf")))
+            manifest = checkpoint.get("experiment_manifest")
+            if isinstance(manifest, Mapping):
+                contracts = manifest.get("contracts")
+                model_contract = (
+                    contracts.get("model")
+                    if isinstance(contracts, Mapping)
+                    else None
+                )
+                manifest_symbols = (
+                    model_contract.get("symbols")
+                    if isinstance(model_contract, Mapping)
+                    else None
+                )
+                if isinstance(manifest_symbols, Sequence) and not isinstance(
+                    manifest_symbols,
+                    (str, bytes),
+                ):
+                    checkpoint_symbols = [
+                        str(symbol) for symbol in manifest_symbols
+                    ]
         elif model_file.exists():
             print(
                 f"[Fold {fold.fold_id}] legacy model artifact has no semantic fingerprint: {model_file}"
@@ -17607,6 +17707,7 @@ def _run_inference_neural_models(
             panel,
             fold_dir,
             model_state_dict,
+            checkpoint_symbols=checkpoint_symbols,
             context=f"inference fold {fold.fold_id}",
             # Keep the checkpoint's symbol axis and positional embeddings
             # stable when a newer official universe no longer contains old
@@ -18038,9 +18139,13 @@ def _run_inference_neural_models(
         plot_equity_curve(canonical_test_bt, test_dates, fold_dir / "equity_curve.png")
         plot_equity_curve_log(canonical_test_bt, test_dates, fold_dir / "equity_curve_log.png")
         plot_annual_performance(canonical_test_bt, test_dates, fold_dir / "annual_performance.png")
-        plot_equity_curve(canonical_test_bt, test_dates, fold_dir / "leverage_equity_curve.png")
-        plot_equity_curve_log(canonical_test_bt, test_dates, fold_dir / "leverage_equity_curve_log.png")
-        plot_annual_performance(canonical_test_bt, test_dates, fold_dir / "leverage_annual_performance.png")
+        _write_reporting_leverage_artifacts(
+            canonical_test_bt,
+            test_returns,
+            test_dates,
+            fold_dir,
+            config,
+        )
         _save_integer_share_audit_artifacts(
             fold_dir,
             test_integer_bt,
@@ -18470,6 +18575,12 @@ def run_training(
     # This is executor state only; the canonical loss and checkpoint contract
     # are unchanged.
     shared_dynamic_compiled_loss_fn: Callable[..., torch.Tensor] | None = None
+    train_symbol_bucket_size = _normalize_train_symbol_compaction_bucket_size(
+        getattr(config.training, "train_symbol_compaction_bucket_size", 0)
+    )
+    compile_loss_dynamic_symbols_for_run = bool(
+        getattr(config.training, "compile_loss_dynamic_symbols", False)
+    ) and train_symbol_bucket_size <= 0
     dynamic_loss_symbol_max = max(
         1,
         _train_symbol_compaction_upper_bound(panel, grouped_folds, config),
@@ -18486,7 +18597,7 @@ def run_training(
     # TW executor graph.
     os.environ["STOCKAGENT_TW_COMPILE_SYMBOL_MIN"] = str(
         2
-        if bool(getattr(config.training, "compile_loss_dynamic_symbols", False))
+        if compile_loss_dynamic_symbols_for_run
         else dynamic_loss_symbol_max
     )
     os.environ["STOCKAGENT_TW_COMPILE_SYMBOL_MAX"] = str(dynamic_loss_symbol_max)
@@ -19252,9 +19363,12 @@ def run_training(
             and execution_runtime.mode not in TW_CARRYING_EXECUTION_MODES
             and execution_runtime.mode != "tw_day_trade"
         )
-        compile_loss_dynamic_symbols = bool(
-            getattr(config.training, "compile_loss_dynamic_symbols", False)
-        )
+        # Bucketed compaction already bounds expanding groups to a small set of
+        # fixed widths. Compile one loss graph per bucket instead of reusing the
+        # unbucketed dynamic-loss cache: an AOTAutograd cache entry can retain
+        # the prior active-universe upper guard and reject a later bucket cap
+        # before Dynamo gets a chance to recompile it.
+        compile_loss_dynamic_symbols = compile_loss_dynamic_symbols_for_run
         compile_model_dynamic_symbols_requested = bool(
             getattr(config.training, "compile_model_dynamic_symbols", False)
         )
