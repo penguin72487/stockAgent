@@ -55,6 +55,24 @@ def test_checkpoint_alignment_treats_weight_table_as_authoritative_universe(tmp_
     assert aligned is panel
 
 
+def test_checkpoint_manifest_universe_overrides_symbol_position_capacity(
+    tmp_path: Path,
+) -> None:
+    panel = _panel()
+    fold_dir = tmp_path / "fold_00"
+    fold_dir.mkdir()
+    state_dict = {"symbol_position": torch.zeros((1, 1, 2, 8))}
+
+    aligned = _align_panel_to_state_dict_universe(
+        panel,
+        fold_dir,
+        state_dict,
+        checkpoint_symbols=["1101", "2330", "0050"],
+    )
+
+    assert aligned is panel
+
+
 def test_live_alignment_restores_missing_checkpoint_symbols_as_masked_slots(
     tmp_path: Path,
 ) -> None:

@@ -796,6 +796,18 @@ def test_panel_slab_symbolic_stock_axis_reuses_one_graph_and_matches_eager() -> 
         torch._dynamo.reset()
 
 
+def test_symbol_indices_length_and_range_checks_remain_strict_in_eager_mode() -> None:
+    model = _make_model(allow_dynamic_symbols=False).cpu()
+
+    with pytest.raises(ValueError, match="Expected symbol_indices length"):
+        model._check_symbol_indices(torch.tensor([0, 1]), n_symbols=3)
+    with pytest.raises(ValueError, match="symbol_indices must be in"):
+        model._check_symbol_indices(
+            torch.tensor([0, model.num_symbols]),
+            n_symbols=2,
+        )
+
+
 def test_panel_slab_dynamic_bounds_do_not_cross_sdpa_loop_count() -> None:
     model = _make_model(sdpa_batch_limit=65_535).cpu()
 

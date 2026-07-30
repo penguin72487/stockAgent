@@ -1043,13 +1043,18 @@ class TransformerBasePortfolioModel(nn.Module):
             return
         if symbol_indices.dim() != 1:
             raise ValueError(f"Expected symbol_indices shape [S], got ndim={symbol_indices.dim()}")
+        # The compiled panel-slab graph already guards the shared symbol axis
+        # through feature_slab, mask, and symbol_indices tensor shapes. Calling
+        # int(numel()) here forces Dynamo to specialize a symbolic S during a
+        # later DDP trace even when the pre-DDP compile probe was static.
+        # Preserve all value/range diagnostics in eager mode only.
+        if _torch_is_compiling():
+            return
         if int(symbol_indices.numel()) != int(n_symbols):
             raise ValueError(
                 f"Expected symbol_indices length {int(n_symbols)}, got {int(symbol_indices.numel())}"
             )
         if int(symbol_indices.numel()) == 0:
-            return
-        if _torch_is_compiling():
             return
         idx_cpu = symbol_indices.detach().to(device="cpu", dtype=torch.long)
         min_idx = int(idx_cpu.min().item())
