@@ -134,6 +134,32 @@ def test_signed_action_sparsemax_can_return_sparse_actions() -> None:
     assert int((zero_actions <= 1e-7).sum().item()) >= 1
 
 
+def test_long_only_signed_softmax_keeps_gradient_when_every_stock_logit_is_negative() -> None:
+    logits = torch.tensor(
+        [[-8.0, -7.0, -6.0, -5.0]],
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    mask = torch.ones_like(logits, dtype=torch.bool)
+
+    weights, parts = masked_signed_action_weights(
+        logits,
+        mask,
+        transform="softmax",
+        long_only=True,
+        return_parts=True,
+    )
+    objective = (weights * torch.tensor([[0.1, -0.2, 0.3, -0.4]])).sum()
+    objective.backward()
+
+    assert torch.all(weights >= 0.0)
+    assert torch.all(weights.sum(dim=1) < 1.0)
+    assert torch.all(parts["action_cash_alloc"] > 0.0)
+    assert logits.grad is not None
+    assert torch.isfinite(logits.grad).all()
+    assert torch.count_nonzero(logits.grad).item() == logits.numel()
+
+
 def test_l1_projection_preserves_cash_inside_ball_and_sparsifies_outside_ball() -> None:
     inside = torch.tensor([[0.2, -0.3, 0.1]], dtype=torch.float32)
     outside = torch.tensor([[3.0, 1.0, -0.5, 0.1]], dtype=torch.float32)

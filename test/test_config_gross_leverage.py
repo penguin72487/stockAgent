@@ -768,6 +768,21 @@ def test_tw_public_candles_select_preserves_open_aware_day_trade_contract() -> N
     assert config.environment.torch_compile_threads == 16
 
 
+def test_open_aware_long_only_day_trade_uses_non_dead_action_head() -> None:
+    config = load_config(
+        "configs/markets/tw_public_lanten_market_candles_open_aware.yaml"
+    )
+
+    model = config.training.financial_transformer
+    assert config.trading.execution_mode == "tw_day_trade"
+    assert config.trading.long_only is True
+    assert model.portfolio_mode == "long_only"
+    assert model.portfolio_output_mode == "signed_softmax"
+    assert config.training.loss_portfolio_activation == "pre_normalized"
+    assert config.trading.portfolio_activation == "pre_normalized"
+    assert config.trading.tw_commission_rebate_timing == "monthly_15th"
+
+
 def test_tw_public_candles_all_folds_uses_long_history_tw_cash_contract() -> None:
     config = load_config("configs/markets/tw_public_lanten_market_candles.yaml")
 
