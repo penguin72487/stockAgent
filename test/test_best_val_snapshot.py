@@ -17,6 +17,7 @@ from stockagent.training.trainer import (
     _realized_leverage_backtest,
     _save_best_val_backtest_snapshot,
     _save_fold_output_artifacts,
+    _write_reporting_leverage_artifacts,
 )
 
 
@@ -454,3 +455,54 @@ def test_realized_leverage_backtest_multiplies_realized_positions_before_returns
     expected_strategy_returns = np.log1p(np.clip(expected_simple - expected_fees, -0.999999, None))
     np.testing.assert_allclose(leveraged.strategy_returns, expected_strategy_returns.astype(np.float32), atol=1e-7)
     np.testing.assert_allclose(leveraged.benchmark_returns, base.benchmark_returns, atol=1e-7)
+
+
+def test_reporting_leverage_artifacts_use_replayed_leverage_not_canonical(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    base = BacktestResult(
+        strategy_returns=np.zeros(2, dtype=np.float32),
+        benchmark_returns=np.zeros(2, dtype=np.float32),
+        turnovers=np.zeros(2, dtype=np.float32),
+        weights_history=np.array([[0.4, -0.2], [0.1, -0.3]], dtype=np.float32),
+        execution_mode="naive",
+    )
+    future_returns = np.array([[0.02, -0.01], [-0.03, 0.04]], dtype=np.float32)
+    dates = np.arange("2026-01-01", "2026-01-03", dtype="datetime64[D]")
+    config = SimpleNamespace(
+        trading=SimpleNamespace(
+            reporting_leverage=2.5,
+            buy_fee_rate=0.001,
+            sell_fee_rate=0.002,
+        )
+    )
+    plotted: list[BacktestResult] = []
+
+    def capture(result, *_args, **_kwargs):
+        plotted.append(result)
+
+    monkeypatch.setattr(trainer_module, "plot_equity_curve", capture)
+    monkeypatch.setattr(trainer_module, "plot_equity_curve_log", capture)
+    monkeypatch.setattr(trainer_module, "plot_annual_performance", capture)
+    monkeypatch.setattr(trainer_module, "generate_annual_report", lambda *_args: "leveraged report")
+
+    leveraged = _write_reporting_leverage_artifacts(
+        base,
+        future_returns,
+        dates,
+        tmp_path,
+        config,  # type: ignore[arg-type]
+    )
+
+    assert leveraged is not None
+    assert plotted == [leveraged, leveraged, leveraged]
+    assert leveraged is not base
+    np.testing.assert_allclose(
+        leveraged.weights_history,
+        base.weights_history * 2.5,
+        atol=1e-7,
+    )
+    assert (tmp_path / "leverage_annual_report.txt").read_text(
+        encoding="utf-8"
+    ) == "leveraged report"
