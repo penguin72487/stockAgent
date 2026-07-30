@@ -146,3 +146,39 @@ def test_crypto_downloader_overlap_replaces_existing_tail() -> None:
     assert changed
     assert merged.height == 2
     assert merged.filter(okx.pl.col("date") == "2026-06-22 00:15:00").select("Trading_Volume").item() == 20.0
+
+
+def test_crypto_downloader_overlap_preserves_historical_feature_columns() -> None:
+    existing = okx.pl.DataFrame(
+        {
+            "date": ["2026-06-22 00:00:00", "2026-06-22 00:15:00"],
+            "open": [100.0, 110.0],
+            "max": [101.0, 111.0],
+            "min": [99.0, 109.0],
+            "close": [100.5, 110.5],
+            "adjclose": [100.5, 110.5],
+            "Trading_Volume": [10.0, 1.0],
+            "okx_open_interest_usd": [1000.0, 1100.0],
+        }
+    )
+    fresh = existing.select(
+        [
+            "date",
+            "open",
+            "max",
+            "min",
+            "close",
+            "adjclose",
+            "Trading_Volume",
+        ]
+    ).with_columns(okx.pl.lit(20.0).alias("Trading_Volume"))
+
+    merged, changed = okx._merge_existing_with_fresh(
+        existing,
+        fresh,
+        okx._date_to_ms("2026-06-22", end_of_day=False),
+    )
+
+    assert changed
+    assert merged["okx_open_interest_usd"].to_list() == [1000.0, 1100.0]
+    assert merged["Trading_Volume"].to_list() == [20.0, 20.0]
