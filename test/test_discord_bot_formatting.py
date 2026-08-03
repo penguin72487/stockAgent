@@ -11,6 +11,7 @@ import polars as pl
 from services.discord_bot.bot import (
     _add_user_watch_symbol,
     _auto_signal_price_source,
+    _artifact_backfill_is_current,
     _artifact_backfill_key,
     _can_reuse_latest_signal_now,
     _ConsoleProgress,
@@ -42,6 +43,7 @@ from services.discord_bot.bot import (
     _resolve_pre_signal_command,
     _remove_user_subscription,
     _replace_user_watch_symbol,
+    _recent_performance_from_returns,
     _run_artifact_backfill_sync,
     _run_day_trade_settlement_backfill,
     _risk_message,
@@ -139,6 +141,15 @@ def test_replace_user_watch_symbol_updates_or_adds(monkeypatch, tmp_path) -> Non
 
 def test_artifact_backfill_key_uses_backfill_time_and_skips_interval_markets(monkeypatch) -> None:
     monkeypatch.setattr("services.discord_bot.bot._market_state", lambda market: {})
+    monkeypatch.setattr(
+        "services.discord_bot.bot._runtime_status_for_display",
+        lambda cfg: SimpleNamespace(
+            data=SimpleNamespace(
+                expected_latest_date="2026-07-06",
+                last_data_date="2026-07-06",
+            )
+        ),
+    )
     daily_cfg = SimpleNamespace(
         market="tw",
         data_ready_time="18:00",
@@ -156,12 +167,50 @@ def test_artifact_backfill_key_uses_backfill_time_and_skips_interval_markets(mon
         schedule_interval_minutes=15,
         schedule_delay_seconds=45,
     )
-    now = datetime(2026, 7, 6, 13, 30, tzinfo=ZoneInfo("Asia/Taipei"))
+    now = datetime(2026, 7, 6, 18, 0, tzinfo=ZoneInfo("Asia/Taipei"))
 
-    assert _market_artifact_backfill_time(daily_cfg) == "13:30"
+    assert _market_artifact_backfill_time(daily_cfg) == "18:00"
     assert _artifact_backfill_key(daily_cfg, now) == "2026-07-06:tw:artifact_backfill"
-    assert _artifact_backfill_key(daily_cfg, now.replace(hour=13, minute=29)) is None
+    assert _artifact_backfill_key(daily_cfg, now.replace(hour=23, minute=59)) == (
+        "2026-07-06:tw:artifact_backfill"
+    )
+    assert _artifact_backfill_key(daily_cfg, now.replace(hour=17, minute=59)) is None
     assert _artifact_backfill_key(interval_cfg, now) is None
+
+
+def test_artifact_backfill_key_catches_up_previous_session_after_midnight(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr("services.discord_bot.bot._market_state", lambda market: {})
+    monkeypatch.setattr(
+        "services.discord_bot.bot._runtime_status_for_display",
+        lambda cfg: SimpleNamespace(
+            data=SimpleNamespace(
+                expected_latest_date="2026-07-27",
+                last_data_date="2026-07-27",
+            )
+        ),
+    )
+    cfg = SimpleNamespace(
+        market="tw_day_trade",
+        data_ready_time="13:40",
+        close_time="13:30",
+        summary_time="14:00",
+        schedule_time=None,
+        schedule_interval_minutes=None,
+    )
+    after_midnight = datetime(
+        2026,
+        7,
+        28,
+        0,
+        5,
+        tzinfo=ZoneInfo("Asia/Taipei"),
+    )
+
+    assert _artifact_backfill_key(cfg, after_midnight) == (
+        "2026-07-27:tw_day_trade:artifact_backfill"
+    )
 
 
 def test_formal_history_latest_date_reads_settled_returns(monkeypatch, tmp_path) -> None:
@@ -237,6 +286,44 @@ def test_day_trade_settlement_backfill_runs_formal_fold_inference(monkeypatch, t
     assert kwargs["timeout"] == 123
 
 
+def test_formal_history_backfill_discovers_fold_from_checkpoint(monkeypatch, tmp_path) -> None:
+    cfg = SimpleNamespace(
+        market="forex",
+        fold_id=None,
+        config_path=tmp_path / "forex.yaml",
+        output_dir=tmp_path / "artifacts",
+        pre_signal_timeout_seconds=123,
+    )
+    status = SimpleNamespace(
+        data=SimpleNamespace(
+            expected_latest_date="2026-07-27",
+            last_data_date="2026-07-27",
+            panel_date=None,
+        )
+    )
+    checkpoint = tmp_path / "artifacts" / "fold_07" / "checkpoint_best.pt"
+    dates = iter(["2026-07-24", "2026-07-27"])
+    calls = []
+    monkeypatch.setattr(
+        "services.discord_bot.bot._formal_history_latest_date",
+        lambda cfg: next(dates),
+    )
+    monkeypatch.setattr(
+        "services.discord_bot.bot._market_model_checkpoint",
+        lambda cfg: checkpoint,
+    )
+    monkeypatch.setattr(
+        "services.discord_bot.bot.subprocess.run",
+        lambda command, **kwargs: (
+            calls.append((command, kwargs)) or SimpleNamespace(returncode=0)
+        ),
+    )
+
+    assert _run_day_trade_settlement_backfill(cfg, status)
+    command, _ = calls[0]
+    assert command[command.index("--start-fold") + 1] == "7"
+
+
 def test_naive_artifact_backfill_runs_formal_history_inference(monkeypatch) -> None:
     cfg = SimpleNamespace(
         market="tw",
@@ -284,12 +371,45 @@ def test_naive_artifact_backfill_runs_formal_history_inference(monkeypatch) -> N
 
     assert _run_artifact_backfill_sync(cfg) is not None
     assert calls == [
-        "download",
         "fresh",
         "infer",
         ("signal", "panel"),
         "sync",
     ]
+
+
+def test_naive_artifact_current_requires_contiguous_formal_history_and_close_signal(
+    monkeypatch,
+) -> None:
+    cfg = SimpleNamespace(market="tw")
+    status = SimpleNamespace(
+        data=SimpleNamespace(
+            fresh=True,
+            expected_latest_date="2026-07-27",
+            last_data_date="2026-07-27",
+            panel_date="2026-07-27",
+        )
+    )
+    monkeypatch.setattr(
+        "services.discord_bot.bot._previous_source_session_date",
+        lambda cfg, target: "2026-07-24",
+    )
+    monkeypatch.setattr(
+        "services.discord_bot.bot._market_has_panel_close_signal_for_date",
+        lambda cfg, target: True,
+    )
+    monkeypatch.setattr(
+        "services.discord_bot.bot._formal_history_latest_date",
+        lambda cfg: "2026-07-23",
+    )
+
+    assert not _artifact_backfill_is_current(cfg, status, "naive")
+
+    monkeypatch.setattr(
+        "services.discord_bot.bot._formal_history_latest_date",
+        lambda cfg: "2026-07-24",
+    )
+    assert _artifact_backfill_is_current(cfg, status, "naive")
 
 
 def test_market_has_live_signal_for_date_uses_summary_data_fields(monkeypatch) -> None:
@@ -1147,6 +1267,63 @@ def test_summary_recent_performance_uses_live_portfolio_history(monkeypatch) -> 
     assert np.isclose(recent["excess_return"], 0.07)
 
 
+def test_recent_performance_uses_settled_history_then_contiguous_live_signal(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    fold_dir = tmp_path / "fold_25"
+    fold_dir.mkdir()
+    pl.DataFrame(
+        {
+            "date": ["2026-07-28", "2026-07-29"],
+            "portfolio_return": [0.01, 0.02],
+            "benchmark_return": [0.001, 0.002],
+        }
+    ).write_parquet(fold_dir / "integer_share_daily_portfolio_returns.parquet")
+    stale_path = tmp_path / "stale.json"
+    latest_path = tmp_path / "latest.json"
+    stale_path.write_text("{}", encoding="utf-8")
+    latest_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(
+        "services.discord_bot.bot._market_fold_dir",
+        lambda cfg: fold_dir,
+    )
+    monkeypatch.setattr(
+        "services.discord_bot.bot._recent_market_signal_metrics",
+        lambda cfg, max_summaries: [
+            (
+                stale_path,
+                {
+                    "panel_data_date": "2026-07-29 13:30:00",
+                    "previous_weights_data_date": "2026-07-28",
+                    "portfolio_simple_return": 0.9,
+                    "benchmark_simple_return": 0.9,
+                },
+            ),
+            (
+                latest_path,
+                {
+                    "panel_data_date": "2026-07-30 00:00:00",
+                    "previous_weights_data_date": "2026-07-29 00:00:00",
+                    "portfolio_simple_return": 0.03,
+                    "benchmark_simple_return": 0.003,
+                },
+            ),
+        ],
+    )
+
+    result = _recent_performance_from_returns(
+        SimpleNamespace(market="tw"),
+        3,
+    )
+
+    assert result is not None
+    assert result["start_date"] == "2026-07-28"
+    assert result["end_date"] == "2026-07-30"
+    assert np.isclose(result["strategy_return"], 1.01 * 1.02 * 1.03 - 1.0)
+    assert np.isclose(result["benchmark_return"], 1.001 * 1.002 * 1.003 - 1.0)
+
+
 def test_user_watchlist_state_add_remove_and_filter(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr("services.discord_bot.bot.STATE_PATH", tmp_path / "state.json")
 
@@ -1327,6 +1504,58 @@ def test_portfolio_history_can_prepend_latest_signal_day(tmp_path) -> None:
     assert result.rows[0]["changes"][0]["portfolio_contribution"] == 0.0
     assert "shares" not in result.rows[0]["changes"][0]
     assert summary_path in result.source_paths
+
+
+def test_portfolio_history_uses_complete_weights_when_rebalance_is_empty(tmp_path) -> None:
+    weights_path = tmp_path / "target_weights.parquet"
+    rebalance_path = tmp_path / "rebalance.parquet"
+    pl.DataFrame(
+        {
+            "symbol": ["AAA", "BBB", "CCC"],
+            "name": ["Alpha", "Beta", "Gamma"],
+            "action": ["SELL", "EXIT", "BUY"],
+            "current_weight": [0.0001, 0.0004, 0.0],
+            "target_weight": [-0.0004, 0.0, 0.00001],
+            "delta_weight": [-0.0005, -0.0004, 0.00001],
+            "abs_delta_weight": [0.0005, 0.0004, 0.00001],
+            "current_price": [10.0, 20.0, 30.0],
+        }
+    ).write_parquet(weights_path)
+    pl.DataFrame().write_parquet(rebalance_path)
+    summary_path = tmp_path / "summary.json"
+    summary_path.write_text("{}", encoding="utf-8")
+    result = SimpleNamespace(
+        rows=[{"date": "2026-07-28", "portfolio_return": 0.0, "benchmark_return": 0.0, "profit_value": 0.0}],
+        source_paths=(),
+        days=1,
+        top_changes=5,
+        min_abs_change=0.0001,
+        start_date="2026-07-28",
+        end_date="2026-07-28",
+        period_return=0.0,
+        benchmark_return=0.0,
+        profit_value=0.0,
+        capital=SimpleNamespace(capital=1_000.0),
+    )
+    summary = {
+        "weights_date": "2026-07-29 13:30:00",
+        "panel_date": "2026-07-29 13:30:00",
+        "portfolio_simple_return": 0.01,
+        "weights_path": str(weights_path),
+        "rebalance_path": str(rebalance_path),
+    }
+
+    inserted = _prepend_latest_signal_row_to_portfolio_history(
+        result,
+        summary_path=summary_path,
+        summary=summary,
+        max_rows=2,
+    )
+
+    assert inserted is True
+    assert result.rows[0]["change_count"] == 2
+    assert result.rows[0]["change_counts"] == {"SELL": 1, "EXIT": 1}
+    assert [row["symbol"] for row in result.rows[0]["changes"]] == ["AAA", "BBB"]
 
 
 def test_portfolio_history_prepend_uses_weights_date_before_panel_date(tmp_path) -> None:
@@ -1693,6 +1922,41 @@ def test_portfolio_history_block_wraps_change_rows_for_readability() -> None:
     assert "1. `6669` 緯穎 **EXIT**" in block
     assert "\n       `Δhold=+90.21%`" in block
     assert max(len(line) for line in block.splitlines()) < 120
+
+
+def test_day_trade_portfolio_history_block_labels_open_execution_separately() -> None:
+    block = _portfolio_history_block(
+        {
+            "date": "2026-07-28",
+            "execution_mode": "tw_day_trade",
+            "portfolio_return": 0.0,
+            "benchmark_return": -0.03,
+            "profit_value": 0.0,
+            "cumulative_return": 0.02,
+            "turnover": 0.0,
+            "nav": 1_200_000.0,
+            "gross_ratio": 0.0,
+            "net_ratio": 0.0,
+            "cash_ratio": 1.0,
+            "requested_gross_ratio": 1.0,
+            "execution_fill_ratio": 0.0,
+            "requested_position_count": 100,
+            "position_count": 0,
+            "long_count": 0,
+            "short_count": 0,
+            "change_count": 0,
+            "change_counts": {},
+            "changes": [],
+        }
+    )
+
+    assert "`nav=1,200,000`" in block
+    assert "`open_gross=0.00%`" in block
+    assert "`model_gross=100.00%`" in block
+    assert "`open_executed=0.00%`" in block
+    assert "`fill=0.00%`" in block
+    assert "未成交: 開盤目標受到前一交易日成交量" in block
+    assert "`gross=" not in block
 
 
 def test_history_headers_hide_internal_details_until_debug(tmp_path) -> None:

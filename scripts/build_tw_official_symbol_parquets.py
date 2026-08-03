@@ -33,6 +33,7 @@ from stockagent.data.tw_security import (
     TW_STOCK_SYMBOL_PATTERN,
     classify_tw_stock_or_etf,
 )
+from downloader.tw_public_contract import DAILY_CLOSE_OPTIONAL_DATASETS
 
 
 OFFICIAL_SOURCE_NAME = "twse_tpex_official"
@@ -229,7 +230,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help=(
             "Accept a certified daily-close receipt whose only missing current-day "
-            "datasets are the late TWSE/TPEx margin-balance reports."
+            "datasets are non-OHLCV close-optional reports."
         ),
     )
     return parser.parse_args()
@@ -256,7 +257,7 @@ def _validate_download_receipts(
             and public_summary.get("daily_close_ready") is True
             and int(public_summary.get("blocking_failed_count", -1)) == 0
             and set(public_summary.get("publication_lag_datasets") or ())
-            <= {"twse_margin_balance", "tpex_margin_balance"}
+            <= DAILY_CLOSE_OPTIONAL_DATASETS
         )
         allowed_failed_datasets = set(
             public_summary.get("allowed_failed_datasets") or ()

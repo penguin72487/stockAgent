@@ -7,6 +7,7 @@ import os
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -21,6 +22,8 @@ from stockagent.live.market_config import LiveMarketConfig
 
 
 FEATURE_SUFFIX = "_features.parquet"
+TW_HOLIDAY_SCHEDULE_NAME = "twse_api_holidayschedule_holidayschedule.parquet"
+TW_TRADING_DAY_MARKERS = ("開始交易", "最後交易")
 
 
 @dataclass(slots=True)
@@ -334,13 +337,94 @@ def _us_market_holidays(year: int) -> set[date]:
     return {day for day in holidays if day.year == year}
 
 
-def is_trading_day(market_type: str, day: date, holidays: tuple[str, ...] = ()) -> bool:
+def _tw_holiday_schedule_path(parquet_root: Path | None) -> Path | None:
+    if parquet_root is None:
+        return None
+    candidates = (
+        parquet_root / TW_HOLIDAY_SCHEDULE_NAME,
+        parquet_root.parent / TW_HOLIDAY_SCHEDULE_NAME,
+    )
+    return next((path for path in candidates if path.is_file()), None)
+
+
+def _parse_roc_calendar_date(value: object) -> date | None:
+    text = str(value or "").strip()
+    if not text.isdigit() or len(text) not in {7, 8}:
+        return None
+    try:
+        roc_year = int(text[:-4])
+        return date(roc_year + 1911, int(text[-4:-2]), int(text[-2:]))
+    except ValueError:
+        return None
+
+
+@lru_cache(maxsize=16)
+def _tw_exchange_holidays_cached(
+    path_text: str,
+    size_bytes: int,
+    mtime_ns: int,
+    year: int,
+) -> frozenset[date]:
+    del size_bytes, mtime_ns
+    path = Path(path_text)
+    rows: list[tuple[object, object]] = []
+    if pq is not None:
+        try:
+            table = pq.read_table(path, columns=["Name", "Date"])
+            rows = list(zip(table["Name"].to_pylist(), table["Date"].to_pylist()))
+        except Exception:
+            rows = []
+    if not rows:
+        try:
+            import polars as pl
+
+            frame = pl.read_parquet(path, columns=["Name", "Date"])
+            rows = list(zip(frame["Name"].to_list(), frame["Date"].to_list()))
+        except Exception:
+            return frozenset()
+
+    holidays: set[date] = set()
+    for raw_name, raw_date in rows:
+        day = _parse_roc_calendar_date(raw_date)
+        if day is None or day.year != int(year):
+            continue
+        name = str(raw_name or "")
+        if any(marker in name for marker in TW_TRADING_DAY_MARKERS):
+            continue
+        holidays.add(day)
+    return frozenset(holidays)
+
+
+def _tw_exchange_holidays(parquet_root: Path | None, year: int) -> set[date]:
+    path = _tw_holiday_schedule_path(parquet_root)
+    if path is None:
+        return set()
+    stat = path.stat()
+    return set(
+        _tw_exchange_holidays_cached(
+            str(path.resolve()),
+            int(stat.st_size),
+            int(stat.st_mtime_ns),
+            int(year),
+        )
+    )
+
+
+def is_trading_day(
+    market_type: str,
+    day: date,
+    holidays: tuple[str, ...] = (),
+    *,
+    parquet_root: Path | None = None,
+) -> bool:
     kind = market_type.lower()
     if kind == "crypto":
         return True
     if day.weekday() >= 5:
         return False
     if day.isoformat() in set(holidays):
+        return False
+    if kind in {"tw", "taiwan"} and day in _tw_exchange_holidays(parquet_root, day.year):
         return False
     if kind == "us" and day in _us_market_holidays(day.year):
         return False
@@ -352,6 +436,7 @@ def expected_latest_data_date(
     *,
     market_type: str,
     now: datetime | None = None,
+    parquet_root: Path | None = None,
 ) -> str | None:
     kind = market_type.lower()
     if kind == "crypto":
@@ -362,7 +447,12 @@ def expected_latest_data_date(
     candidate = local_now.date()
     if local_now.time() < ready:
         candidate -= timedelta(days=1)
-    while not is_trading_day(kind, candidate, cfg.holidays):
+    while not is_trading_day(
+        kind,
+        candidate,
+        cfg.holidays,
+        parquet_root=parquet_root,
+    ):
         candidate -= timedelta(days=1)
     return candidate.isoformat()
 
@@ -372,13 +462,19 @@ def market_is_open(
     *,
     market_type: str,
     now: datetime | None = None,
+    parquet_root: Path | None = None,
 ) -> tuple[bool, str | None]:
     kind = market_type.lower()
     if kind == "crypto":
         return True, None
     tz = ZoneInfo(cfg.timezone or "Asia/Taipei")
     local_now = now.astimezone(tz) if now is not None else datetime.now(tz)
-    if not is_trading_day(kind, local_now.date(), cfg.holidays):
+    if not is_trading_day(
+        kind,
+        local_now.date(),
+        cfg.holidays,
+        parquet_root=parquet_root,
+    ):
         return False, f"{local_now.date().isoformat()} is not a trading day"
     if kind == "forex":
         return True, None
@@ -413,17 +509,27 @@ def data_freshness(
     feature_files = list(parquet_root.glob(f"*{FEATURE_SUFFIX}"))
     total_files = len(feature_files)
     benchmark_path = _feature_path(parquet_root, benchmark_name)
-    selected = list(feature_files)
-    sampled = False
-    limit = max(0, int(cfg.freshness_scan_limit))
-    if limit > 0 and len(selected) > limit:
-        sampled = True
-        newest = sorted(selected, key=lambda path: path.stat().st_mtime, reverse=True)[:limit]
-        selected = newest
+    # Daily canonical pipelines certify the whole data layer before promotion.
+    # Runtime freshness therefore follows the configured benchmark/session
+    # anchor instead of stat/read-scanning thousands of symbol files on every
+    # Discord command. Intraday feeds still scan their configured sample because
+    # they do not have one daily close anchor.
+    if not crypto_intraday and benchmark_path is not None:
+        selected = [benchmark_path]
+        sampled = total_files > 1
+    else:
+        selected = list(feature_files)
+        sampled = False
+        limit = max(0, int(cfg.freshness_scan_limit))
+        if limit > 0 and len(selected) > limit:
+            sampled = True
+            selected = sorted(
+                selected,
+                key=lambda path: path.stat().st_mtime,
+                reverse=True,
+            )[:limit]
         if benchmark_path is not None and benchmark_path not in selected:
             selected.append(benchmark_path)
-    elif benchmark_path is not None and benchmark_path not in selected:
-        selected.append(benchmark_path)
 
     date_only = not crypto_intraday
     if len(selected) > 1:
@@ -446,7 +552,12 @@ def data_freshness(
         else None
     )
     panel_date = last_data_date
-    expected = expected_latest_data_date(cfg, market_type=market_type, now=now)
+    expected = expected_latest_data_date(
+        cfg,
+        market_type=market_type,
+        now=now,
+        parquet_root=parquet_root,
+    )
 
     fresh = False
     reason: str | None = None
@@ -507,7 +618,12 @@ def runtime_status(
     market_type = infer_market_type(cfg, freshness.parquet_root)
     checkpoint = checkpoint_info(cfg, root=root, output_dir=output_dir)
     enabled = bool(cfg.enabled if enabled_override is None else enabled_override)
-    is_open, open_reason = market_is_open(cfg, market_type=market_type, now=now)
+    is_open, open_reason = market_is_open(
+        cfg,
+        market_type=market_type,
+        now=now,
+        parquet_root=freshness.parquet_root,
+    )
     if not enabled:
         status = "disabled"
     elif checkpoint is None:

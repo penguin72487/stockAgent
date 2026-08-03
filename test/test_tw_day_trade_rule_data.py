@@ -390,6 +390,30 @@ def test_day_trade_feature_builder_rejects_incomplete_session_coverage(tmp_path)
         _build_day_trade_rule_features(tmp_path)
 
 
+def test_day_trade_feature_builder_can_fail_closed_on_missing_latest_receipt(
+    tmp_path,
+) -> None:
+    _write_day_trade_inputs(tmp_path)
+    twse = pl.read_parquet(tmp_path / "twse_day_trade_eligibility.parquet")
+    twse.filter(pl.col("date") == date(2014, 1, 6)).write_parquet(
+        tmp_path / "twse_day_trade_eligibility.parquet"
+    )
+
+    rules = _build_day_trade_rule_features(
+        tmp_path,
+        allow_missing_latest_session=True,
+    )
+
+    assert rules.filter(
+        (pl.col("date") == date(2014, 6, 30))
+        & pl.col("symbol").is_in(["2330", "2317"])
+    ).is_empty()
+    assert rules.filter(
+        (pl.col("date") == date(2014, 6, 30))
+        & pl.col("symbol").is_in(["6488", "8069"])
+    ).height == 2
+
+
 def test_day_trade_feature_builder_requires_both_exchange_histories(tmp_path) -> None:
     _write_day_trade_inputs(tmp_path)
     (tmp_path / "tpex_day_trade_eligibility.parquet").unlink()

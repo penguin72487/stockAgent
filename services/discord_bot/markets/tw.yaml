@@ -7,7 +7,7 @@ open_time: "09:00"
 close_time: "13:30"
 schedule_time: "13:15"
 summary_time: "14:00"
-data_ready_time: "13:30"
+data_ready_time: "13:40"
 freshness_max_lag_days: 3
 freshness_scan_limit: 0
 holidays: []
@@ -53,7 +53,7 @@ prices_csv:
 yahoo_chunk_size: 200
 
 top_n: 2400
-min_abs_delta: 0.001
+min_abs_delta: 0.0001
 benchmark_window_days: 32
 max_turnover_warning: 1.5
 max_top_weight_warning: 0.1
