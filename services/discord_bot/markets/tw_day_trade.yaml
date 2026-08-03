@@ -6,7 +6,7 @@ timezone: Asia/Taipei
 open_time: "09:00"
 close_time: "13:30"
 summary_time: "14:00"
-data_ready_time: "13:30"
+data_ready_time: "13:40"
 freshness_max_lag_days: 3
 freshness_scan_limit: 0
 holidays: []

@@ -780,29 +780,34 @@ def test_day_trade_stock_history_uses_same_session_open_to_close(tmp_path) -> No
     price_root = tmp_path / "prices"
     fold_dir.mkdir()
     price_root.mkdir()
-    pl.DataFrame({"date": ["2026-01-02"], "AAA": [-0.50]}).write_parquet(
+    pl.DataFrame({"date": ["2026-01-02", "2026-01-05"], "AAA": [-0.50, -0.30]}).write_parquet(
         fold_dir / "daily_weights.parquet"
     )
-    pl.DataFrame({"date": ["2026-01-02"], "AAA": [-0.50]}).write_parquet(
+    pl.DataFrame({"date": ["2026-01-02", "2026-01-05"], "AAA": [-0.50, -0.30]}).write_parquet(
         fold_dir / "integer_share_daily_weights.parquet"
     )
     pl.DataFrame(
         {
-            "date": ["2026-01-02", "2026-01-02"],
-            "symbol": ["CASH", "AAA"],
-            "shares": [1500, -5],
-            "price": [1.0, 100.0],
-            "market_value": [1500.0, -500.0],
-            "holding_ratio": [1.5, -0.5],
-            "is_cash": [True, False],
+            "date": ["2026-01-02", "2026-01-02", "2026-01-05", "2026-01-05"],
+            "symbol": ["CASH", "AAA", "CASH", "AAA"],
+            "shares": [1500, -5, 1300, -3],
+            "price": [1.0, 100.0, 1.0, 100.0],
+            "market_value": [1500.0, -500.0, 1300.0, -300.0],
+            "holding_ratio": [1.5, -0.5, 1.3, -0.3],
+            "is_cash": [True, False, True, False],
         }
     ).write_parquet(fold_dir / "holdings.parquet")
     pl.DataFrame(
-        {"date": ["2026-01-02"], "portfolio_return": [0.05], "benchmark_return": [0.01], "turnover": [1.0]}
+        {
+            "date": ["2026-01-02", "2026-01-05"],
+            "portfolio_return": [0.05, -0.03],
+            "benchmark_return": [0.01, 0.02],
+            "turnover": [1.0, 0.6],
+        }
     ).write_parquet(fold_dir / "integer_share_daily_portfolio_returns.parquet")
-    pl.DataFrame({"date": ["2026-01-02"], "open": [100.0], "close": [90.0]}).write_parquet(
-        price_root / "AAA_features.parquet"
-    )
+    pl.DataFrame(
+        {"date": ["2026-01-02", "2026-01-05"], "open": [100.0, 100.0], "close": [90.0, 110.0]}
+    ).write_parquet(price_root / "AAA_features.parquet")
 
     result = load_stock_history(
         fold_dir,
@@ -813,13 +818,24 @@ def test_day_trade_stock_history_uses_same_session_open_to_close(tmp_path) -> No
         execution_mode="tw_day_trade",
     )
 
-    row = result.rows[0]
-    assert np.isclose(row["price"], 100.0)
-    assert np.isclose(row["entry_price"], 100.0)
-    assert np.isclose(row["exit_price"], 90.0)
-    assert np.isclose(row["price_return"], -0.10)
-    assert np.isclose(row["stock_return"], 0.10)
-    assert np.isclose(row["portfolio_contribution"], 0.05)
+    latest, first = result.rows
+    assert latest["action"] == "OPEN_SHORT"
+    assert latest["prev_shares"] == 0
+    assert latest["share_delta"] == -3
+    assert np.isclose(latest["entry_price"], 100.0)
+    assert np.isclose(latest["exit_price"], 110.0)
+    assert np.isclose(latest["price_return"], 0.10)
+    assert np.isclose(latest["stock_return"], -0.10)
+    assert np.isclose(latest["portfolio_contribution"], -0.03)
+    assert first["action"] == "OPEN_SHORT"
+    assert first["prev_shares"] == 0
+    assert first["share_delta"] == -5
+    assert np.isclose(first["price"], 100.0)
+    assert np.isclose(first["entry_price"], 100.0)
+    assert np.isclose(first["exit_price"], 90.0)
+    assert np.isclose(first["price_return"], -0.10)
+    assert np.isclose(first["stock_return"], 0.10)
+    assert np.isclose(first["portfolio_contribution"], 0.05)
 
 
 def test_load_stock_history_collapses_intraday_snapshots_to_daily(tmp_path) -> None:
@@ -1070,12 +1086,76 @@ def test_day_trade_portfolio_history_changes_use_open_snapshot_and_close_pnl(tmp
 
     row = result.rows[0]["changes"][0]
     assert result.execution_mode == "tw_day_trade"
+    assert row["action"] == "OPEN_LONG"
+    assert row["prev_shares"] == 0
+    assert row["share_delta"] == 20
+    assert np.isclose(row["prev_holding_ratio"], 0.0)
+    assert np.isclose(row["holding_ratio_delta"], 0.2)
     assert np.isclose(row["price"], 10.0)
     assert np.isclose(row["entry_price"], 10.0)
     assert np.isclose(row["exit_price"], 9.0)
     assert np.isclose(row["price_return"], -0.10)
     assert np.isclose(row["stock_return"], -0.10)
     assert np.isclose(row["portfolio_contribution"], -0.02)
+
+
+def test_day_trade_portfolio_history_uses_close_ledger_nav_and_requested_exposure(tmp_path) -> None:
+    fold_dir = tmp_path / "fold_11"
+    fold_dir.mkdir()
+    pl.DataFrame(
+        {
+            "date": ["2026-01-02", "2026-01-02", "2026-01-05"],
+            "symbol": ["CASH", "AAA", "CASH"],
+            "shares": [900, 10, 1000],
+            "price": [1.0, 10.0, 1.0],
+            "market_value": [900.0, 100.0, 1000.0],
+            "holding_ratio": [0.9, 0.1, 1.0],
+            "is_cash": [True, False, True],
+        }
+    ).write_parquet(fold_dir / "holdings.parquet")
+    pl.DataFrame(
+        {
+            "date": ["2026-01-02", "2026-01-05"],
+            "portfolio_return": [0.10, -0.05],
+            "benchmark_return": [0.0, 0.0],
+            "turnover": [0.2, 0.0],
+        }
+    ).write_parquet(fold_dir / "integer_share_daily_portfolio_returns.parquet")
+    pl.DataFrame(
+        {
+            "date": ["2026-01-02", "2026-01-05"],
+            "settled_cash": [1050.0, 1045.0],
+            "payables_total": [0.0, 0.0],
+            "receivables_total": [50.0, 0.0],
+        }
+    ).write_parquet(fold_dir / "integer_share_settlement_audit.parquet")
+    np.savez(
+        fold_dir / "test_integer_share_backtest.npz",
+        dates=np.array(["2026-01-02", "2026-01-05"], dtype="datetime64[D]"),
+        requested_weights_history=np.array([[0.5, -0.5], [0.25, -0.75]], dtype=np.float64),
+    )
+
+    result = load_portfolio_history(
+        fold_dir,
+        days=2,
+        top_changes=1,
+        execution_mode="tw_day_trade",
+    )
+
+    latest, first = result.rows
+    assert np.isclose(first["open_nav"], 1000.0)
+    assert np.isclose(first["nav"], 1100.0)
+    assert np.isclose(first["profit_value"], 100.0)
+    assert np.isclose(first["requested_gross_ratio"], 1.0)
+    assert first["requested_position_count"] == 2
+    assert np.isclose(first["execution_fill_ratio"], 0.1)
+    assert np.isclose(latest["open_nav"], 1000.0)
+    assert np.isclose(latest["nav"], 1045.0)
+    assert np.isclose(latest["profit_value"], -55.0)
+    assert np.isclose(latest["requested_gross_ratio"], 1.0)
+    assert np.isclose(latest["execution_fill_ratio"], 0.0)
+    assert latest["changes"] == []
+    assert np.isclose(result.profit_value, 45.0)
 
 
 def test_load_portfolio_history_scales_values_from_current_capital(tmp_path) -> None:

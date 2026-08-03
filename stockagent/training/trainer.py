@@ -7458,11 +7458,13 @@ def _align_panel_to_state_dict_universe(
 
     trained_set = set(trained_symbols)
     extras = [str(symbol) for symbol in panel.symbols if str(symbol) not in trained_set]
-    if int(panel.num_symbols) != int(expected_symbols) or extras:
+    authoritative_symbols = len(trained_symbols)
+    if int(panel.num_symbols) != authoritative_symbols or extras:
         preview = ", ".join(extras[:10])
         print(
             f"[{context}] aligning panel symbols to checkpoint universe from {weights_path}: "
-            f"current={panel.num_symbols}, checkpoint={expected_symbols}, removed={len(extras)}"
+            f"current={panel.num_symbols}, checkpoint={authoritative_symbols}, "
+            f"removed={len(extras)}, positional_capacity={expected_symbols}"
             + (f" ({preview})" if preview else "")
         )
     else:
@@ -15694,7 +15696,6 @@ def _run_inference_neural_models(
     deployment_folds: Iterable[WalkForwardFold] | None = None,
 ) -> list[FoldResult]:
     _configure_backtest_runtime_from_config(config)
-    experiment_manifest = _checkpoint_manifest(panel, config)
     if getattr(config.training, "inference_backtest_autotune", None) is not None:
         os.environ["STOCKAGENT_BACKTEST_AUTOTUNE"] = (
             "1" if bool(config.training.inference_backtest_autotune) else "0"
@@ -15730,16 +15731,10 @@ def _run_inference_neural_models(
 
         model_state_dict: dict | None = None
         best_val_loss = float("inf")
+        checkpoint: dict[str, Any] | None = None
 
         if best_checkpoint_file.exists():
             checkpoint = _load_checkpoint(best_checkpoint_file)
-            _validate_checkpoint_manifest(
-                checkpoint,
-                experiment_manifest,
-                checkpoint_path=best_checkpoint_file,
-                scope="inference",
-                expected_fold=fold,
-            )
             model_state_dict = checkpoint.get("model_state_dict")
             best_val_loss = float(checkpoint.get("best_val_loss", float("inf")))
         elif model_file.exists():
@@ -15766,6 +15761,17 @@ def _run_inference_neural_models(
             # non-tradable, matching the live-signal inference contract.
             allow_missing_masked=True,
         )
+        if checkpoint is not None:
+            # Universe changes are expected in forward deployment. Validate
+            # against the checkpoint-aligned panel rather than rejecting new
+            # listings before the alignment code gets a chance to remove them.
+            _validate_checkpoint_manifest(
+                checkpoint,
+                _checkpoint_manifest(fold_panel, config),
+                checkpoint_path=best_checkpoint_file,
+                scope="inference",
+                expected_fold=fold,
+            )
         fold_execution_runtime = _build_execution_runtime(fold_panel, config, device)
         model = build_model(
             config=config,
