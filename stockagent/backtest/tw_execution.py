@@ -16,10 +16,22 @@ from typing import Final
 
 import numpy as np
 
+from stockagent.backtest.tw_commission_rebate import (
+    normalize_commission_rebate_timing,
+)
 from stockagent.data.tw_security import classify_tw_stock_or_etf
 
 
-EXECUTION_MODES: Final[tuple[str, ...]] = ("naive", "tw_cash", "tw_day_trade")
+EXECUTION_MODES: Final[tuple[str, ...]] = (
+    "naive",
+    "tw_cash",
+    "tw_day_trade",
+    "tw_overnight",
+)
+TW_CARRYING_EXECUTION_MODES: Final[tuple[str, ...]] = (
+    "tw_cash",
+    "tw_overnight",
+)
 FEE_ROUNDING_MODES: Final[tuple[str, ...]] = ("none", "floor", "half_up")
 
 # These are market-wide statutory floors, not per-security margin schedules.
@@ -50,6 +62,17 @@ _EXECUTION_MODE_ALIASES: Final[dict[str, str]] = {
     "tw_spot": "tw_cash",
     "現股": "tw_cash",
     "台股現股": "tw_cash",
+    # Taiwan next-session round-trip execution.  Every cohort opened on
+    # session t must be closed no later than session t+1 close.
+    "tw_overnight": "tw_overnight",
+    "tw_overnight_trade": "tw_overnight",
+    "taiwan_overnight": "tw_overnight",
+    "overnight": "tw_overnight",
+    "overnight_trade": "tw_overnight",
+    "next_day_trade": "tw_overnight",
+    "next_session_trade": "tw_overnight",
+    "隔日沖": "tw_overnight",
+    "台股隔日沖": "tw_overnight",
     # Taiwan same-day round-trip execution.
     "tw_day_trade": "tw_day_trade",
     "tw_daytrade": "tw_day_trade",
@@ -72,13 +95,15 @@ def normalize_execution_mode(mode: object) -> str:
 
     if not isinstance(mode, str):
         raise ValueError(
-            "execution_mode must be one of 'naive', 'tw_cash', or 'tw_day_trade'"
+            "execution_mode must be one of "
+            "'naive', 'tw_cash', 'tw_day_trade', or 'tw_overnight'"
         )
     normalized = "_".join(mode.strip().casefold().replace("-", "_").split())
     canonical = _EXECUTION_MODE_ALIASES.get(normalized)
     if canonical is None:
         raise ValueError(
-            "execution_mode must be one of 'naive', 'tw_cash', or 'tw_day_trade'"
+            "execution_mode must be one of "
+            "'naive', 'tw_cash', 'tw_day_trade', or 'tw_overnight'"
         )
     return canonical
 
@@ -266,13 +291,17 @@ DEFAULT_TAIWAN_MARGIN_SHORT_SCHEDULE: Final[TaiwanMarginShortSchedule] = (
 class TaiwanFeeSchedule:
     """Taiwan fee and lot-size profile used to build per-security schedules.
 
-    ``commission_discount=0.6`` is a configurable broker-price profile (六折),
-    not a statutory exchange rate.  Statutory/product tax rates remain separate
-    fields so callers cannot accidentally discount tax along with commission.
+    ``commission_discount=0.2`` is the ultimate broker-price profile (二折),
+    not the commission charged at execution and not a statutory exchange rate.
+    The gross commission is charged first; the difference is an earned rebate
+    paid according to ``commission_rebate_timing``.  Statutory/product tax
+    rates remain separate fields so callers cannot accidentally rebate tax
+    along with commission.
     """
 
     commission_rate: float = 0.001425
-    commission_discount: float = 0.6
+    commission_discount: float = 0.2
+    commission_rebate_timing: str = "monthly_15th"
     stock_sell_tax: float = 0.003
     etf_sell_tax: float = 0.001
     day_trade_stock_sell_tax: float = 0.0015
@@ -305,6 +334,13 @@ class TaiwanFeeSchedule:
 
         object.__setattr__(
             self,
+            "commission_rebate_timing",
+            normalize_commission_rebate_timing(
+                self.commission_rebate_timing,
+            ),
+        )
+        object.__setattr__(
+            self,
             "commission_rounding",
             normalize_fee_rounding(
                 self.commission_rounding,
@@ -326,9 +362,15 @@ class TaiwanFeeSchedule:
 
     @property
     def effective_commission_rate(self) -> float:
-        """Commission charged on each side after the broker discount."""
+        """Ultimate economic commission rate after the broker rebate."""
 
         return self.commission_rate * self.commission_discount
+
+    @property
+    def commission_rebate_rate(self) -> float:
+        """Commission-only rate earned back after the gross charge."""
+
+        return self.commission_rate * (1.0 - self.commission_discount)
 
 
 DEFAULT_TAIWAN_FEE_SCHEDULE: Final[TaiwanFeeSchedule] = TaiwanFeeSchedule()
@@ -455,16 +497,109 @@ def effective_fee_rate_vectors(
     buy_fees = np.full(num_symbols, commission, dtype=np.float64)
     sell_fees = np.empty(num_symbols, dtype=np.float64)
 
-    if mode == "tw_cash":
+    if mode in TW_CARRYING_EXECUTION_MODES:
         stock_tax = schedule.stock_sell_tax
         etf_tax = schedule.etf_sell_tax
-    else:
+    elif mode == "tw_day_trade":
         stock_tax = schedule.day_trade_stock_sell_tax
         etf_tax = schedule.day_trade_etf_sell_tax
+    else:  # normalize_execution_mode above makes this an internal contract check.
+        raise AssertionError(f"unhandled Taiwan execution mode: {mode}")
 
     for index, security_type in enumerate(resolved_types):
         sell_fees[index] = commission + (stock_tax if security_type == "stock" else etf_tax)
     return buy_fees, sell_fees
+
+
+def gross_fee_rate_vectors(
+    symbols: Sequence[object],
+    execution_mode: object,
+    *,
+    fee_schedule: TaiwanFeeSchedule | None = None,
+    security_types: Mapping[object, object] | Sequence[object] | None = None,
+    naive_buy_fee_rate: float = 0.0,
+    naive_sell_fee_rate: float = 0.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build fee vectors charged at execution before any broker rebate.
+
+    Taiwan modes charge the undiscounted commission on both sides and add the
+    applicable statutory/product tax only on sells.  The rebate is intentionally
+    absent from these vectors so settlement and cash availability cannot use it
+    before the configured payment event.  ``naive`` has no deferred-rebate
+    contract and therefore preserves its caller-supplied scalar fees.
+    """
+
+    mode = normalize_execution_mode(execution_mode)
+    schedule = _coerce_fee_schedule(fee_schedule)
+    normalized_symbols = _normalized_symbols(symbols)
+    num_symbols = len(normalized_symbols)
+
+    if mode == "naive":
+        if security_types is not None:
+            _security_type_overrides(normalized_symbols, security_types)
+        buy_rate = _finite_nonnegative_rate(
+            "naive_buy_fee_rate",
+            naive_buy_fee_rate,
+        )
+        sell_rate = _finite_nonnegative_rate(
+            "naive_sell_fee_rate",
+            naive_sell_fee_rate,
+        )
+        return (
+            np.full(num_symbols, buy_rate, dtype=np.float64),
+            np.full(num_symbols, sell_rate, dtype=np.float64),
+        )
+
+    resolved_types = _resolve_security_types(normalized_symbols, security_types)
+    commission = schedule.commission_rate
+    buy_fees = np.full(num_symbols, commission, dtype=np.float64)
+    sell_fees = np.empty(num_symbols, dtype=np.float64)
+
+    if mode in TW_CARRYING_EXECUTION_MODES:
+        stock_tax = schedule.stock_sell_tax
+        etf_tax = schedule.etf_sell_tax
+    elif mode == "tw_day_trade":
+        stock_tax = schedule.day_trade_stock_sell_tax
+        etf_tax = schedule.day_trade_etf_sell_tax
+    else:  # normalize_execution_mode above makes this an internal contract check.
+        raise AssertionError(f"unhandled Taiwan execution mode: {mode}")
+
+    for index, security_type in enumerate(resolved_types):
+        sell_fees[index] = commission + (
+            stock_tax if security_type == "stock" else etf_tax
+        )
+    return buy_fees, sell_fees
+
+
+def commission_rebate_rate_vector(
+    symbols: Sequence[object],
+    execution_mode: object,
+    *,
+    fee_schedule: TaiwanFeeSchedule | None = None,
+    security_types: Mapping[object, object] | Sequence[object] | None = None,
+) -> np.ndarray:
+    """Build the commission-only earned-rebate rate in symbol order.
+
+    The commission rate is identical on buy and sell legs, so one vector is the
+    canonical representation.  Taiwan security classification is still
+    validated to fail closed on unsupported products.  Legacy ``naive`` mode
+    has no deferred-rebate contract and returns zeros.
+    """
+
+    mode = normalize_execution_mode(execution_mode)
+    schedule = _coerce_fee_schedule(fee_schedule)
+    normalized_symbols = _normalized_symbols(symbols)
+    if mode == "naive":
+        if security_types is not None:
+            _security_type_overrides(normalized_symbols, security_types)
+        return np.zeros(len(normalized_symbols), dtype=np.float64)
+
+    _resolve_security_types(normalized_symbols, security_types)
+    return np.full(
+        len(normalized_symbols),
+        schedule.commission_rebate_rate,
+        dtype=np.float64,
+    )
 
 
 def lot_size_vector(
@@ -497,10 +632,15 @@ def lot_size_vector(
     # Fail closed for warrants, ETNs, rights, and any other unsupported product.
     _resolve_security_types(normalized_symbols, security_types)
 
-    if mode == "tw_cash":
+    if mode in TW_CARRYING_EXECUTION_MODES:
         if per_symbol_lot_sizes is not None:
-            raise ValueError("per_symbol_lot_sizes is supported only for tw_day_trade")
+            raise ValueError(
+                "per_symbol_lot_sizes is supported only for tw_day_trade"
+            )
         return np.full(len(normalized_symbols), schedule.cash_lot_size, dtype=np.int64)
+
+    if mode != "tw_day_trade":
+        raise AssertionError(f"unhandled Taiwan execution mode: {mode}")
 
     lot_sizes = np.full(
         len(normalized_symbols),
@@ -553,6 +693,8 @@ def settlement_session_indices(num_sessions: int, lag: int = 2) -> np.ndarray:
 
 # Readable integration aliases.  Keep one implementation for each primitive.
 build_effective_fee_vectors = effective_fee_rate_vectors
+build_gross_fee_vectors = gross_fee_rate_vectors
+build_commission_rebate_rate_vector = commission_rebate_rate_vector
 build_lot_size_vector = lot_size_vector
 
 
@@ -560,12 +702,17 @@ __all__ = [
     "DEFAULT_TAIWAN_FEE_SCHEDULE",
     "DEFAULT_TAIWAN_MARGIN_SHORT_SCHEDULE",
     "EXECUTION_MODES",
+    "TW_CARRYING_EXECUTION_MODES",
     "FEE_ROUNDING_MODES",
     "TaiwanFeeSchedule",
     "TaiwanMarginShortSchedule",
+    "build_commission_rebate_rate_vector",
     "build_effective_fee_vectors",
+    "build_gross_fee_vectors",
     "build_lot_size_vector",
+    "commission_rebate_rate_vector",
     "effective_fee_rate_vectors",
+    "gross_fee_rate_vectors",
     "lot_size_vector",
     "normalize_execution_mode",
     "normalize_fee_rounding",

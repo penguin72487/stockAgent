@@ -6,7 +6,10 @@ from typing import Any
 
 import torch
 
-from stockagent.backtest.tw_execution import normalize_execution_mode
+from stockagent.backtest.tw_execution import (
+    TW_CARRYING_EXECUTION_MODES,
+    normalize_execution_mode,
+)
 from stockagent.training.dataset import CrossSectionalDataset, execution_feature_lag
 
 
@@ -20,14 +23,20 @@ class WindowedSplitTensors:
     can_sell_mask: torch.Tensor
     benchmark: torch.Tensor
     lookback: int
+    # Prior close -> current open valuation return.  It is zero for execution
+    # modes without a distinct opening phase.
+    overnight_log_returns: torch.Tensor | None = None
     volume_notional: torch.Tensor | None = None
     can_short_open_mask: torch.Tensor | None = None
+    can_short_open_open_mask: torch.Tensor | None = None
     force_short_cover_mask: torch.Tensor | None = None
     force_exit_mask: torch.Tensor | None = None
     sample_mask: torch.Tensor | None = None
     symbol_indices: torch.Tensor | None = None
     execution_mode: str = "naive"
     session_advance_mask: torch.Tensor | None = None
+    session_month_ids: torch.Tensor | None = None
+    commission_rebate_payment_eligible_mask: torch.Tensor | None = None
     day_trade_eligible_mask: torch.Tensor | None = None
     day_trade_can_buy_open_mask: torch.Tensor | None = None
     day_trade_can_sell_open_mask: torch.Tensor | None = None
@@ -62,6 +71,16 @@ class WindowedSplitTensors:
                 f"{tuple(self.volume_notional.shape)} != {tuple(self.future_log_returns.shape)}"
             )
         expected_symbol_shape = tuple(self.future_log_returns.shape)
+        if self.overnight_log_returns is None:
+            self.overnight_log_returns = torch.zeros_like(
+                self.future_log_returns
+            )
+        elif tuple(self.overnight_log_returns.shape) != expected_symbol_shape:
+            raise ValueError(
+                "overnight_log_returns must have shape [T,S] matching "
+                f"future_log_returns: {tuple(self.overnight_log_returns.shape)} "
+                f"!= {expected_symbol_shape}"
+            )
         if self.short_capacity_shares is None:
             self.short_capacity_shares = torch.zeros(
                 (),
@@ -161,6 +180,38 @@ class WindowedSplitTensors:
                 "session_advance_mask must have shape [T] matching features: "
                 f"{tuple(self.session_advance_mask.shape)} != ({int(self.features.size(0))},)"
             )
+        row_count = int(self.features.size(0))
+        if self.session_month_ids is None:
+            self.session_month_ids = torch.zeros(
+                row_count,
+                dtype=torch.int64,
+                device=self.features.device,
+            )
+        else:
+            self.session_month_ids = self.session_month_ids.to(dtype=torch.int64)
+        if tuple(self.session_month_ids.shape) != (row_count,):
+            raise ValueError(
+                "session_month_ids must have shape [T] matching features: "
+                f"{tuple(self.session_month_ids.shape)} != ({row_count},)"
+            )
+        if self.commission_rebate_payment_eligible_mask is None:
+            self.commission_rebate_payment_eligible_mask = torch.zeros(
+                row_count,
+                dtype=torch.bool,
+                device=self.features.device,
+            )
+        else:
+            self.commission_rebate_payment_eligible_mask = (
+                self.commission_rebate_payment_eligible_mask.to(dtype=torch.bool)
+            )
+        if tuple(self.commission_rebate_payment_eligible_mask.shape) != (
+            row_count,
+        ):
+            raise ValueError(
+                "commission_rebate_payment_eligible_mask must have shape [T] "
+                f"matching features: {tuple(self.commission_rebate_payment_eligible_mask.shape)} "
+                f"!= ({row_count},)"
+            )
         if self.day_trade_eligible_mask is not None:
             self.day_trade_eligible_mask = self.day_trade_eligible_mask.to(dtype=torch.bool)
             expected_eligibility_shape = (
@@ -217,13 +268,14 @@ class WindowedSplitTensors:
                     f"!= {expected_shape}"
                 )
         if (
-            self.execution_mode == "tw_cash"
+            self.execution_mode in TW_CARRYING_EXECUTION_MODES
             and self.unresolved_corporate_action_mask is None
         ):
             raise ValueError(
-                "tw_cash requires unresolved_corporate_action_mask; raw-price "
-                "holdings cannot safely consume adjusted total returns without a "
-                "verified corporate-action ledger"
+                f"{self.execution_mode} requires "
+                "unresolved_corporate_action_mask; raw-price holdings cannot "
+                "safely consume adjusted total returns without a verified "
+                "corporate-action ledger"
             )
         if (self.cash_dividend_yield is None) != (
             self.cash_dividend_payment_delay_sessions is None
@@ -253,7 +305,7 @@ class WindowedSplitTensors:
         if self.can_short_open_mask is None:
             self.can_short_open_mask = (
                 torch.zeros_like(self.can_sell_mask, dtype=torch.bool)
-                if self.execution_mode == "tw_cash"
+                if self.execution_mode in TW_CARRYING_EXECUTION_MODES
                 else self.can_sell_mask.clone()
             )
         else:
@@ -264,21 +316,33 @@ class WindowedSplitTensors:
                 f"future_log_returns: {tuple(self.can_short_open_mask.shape)} "
                 f"!= {expected_symbol_shape}"
             )
-        if self.execution_mode == "tw_cash":
+        if self.can_short_open_open_mask is None:
+            # An old panel/cache has no causal opening-auction short mask.
+            # Never infer it from the close mask; fail closed instead.
+            self.can_short_open_open_mask = torch.zeros_like(
+                self.can_sell_mask,
+                dtype=torch.bool,
+            )
+        else:
+            self.can_short_open_open_mask = (
+                self.can_short_open_open_mask.to(dtype=torch.bool)
+            )
+        if tuple(self.can_short_open_open_mask.shape) != expected_symbol_shape:
+            raise ValueError(
+                "can_short_open_open_mask must have shape [T,S] matching "
+                "future_log_returns: "
+                f"{tuple(self.can_short_open_open_mask.shape)} "
+                f"!= {expected_symbol_shape}"
+            )
+        if self.execution_mode in TW_CARRYING_EXECUTION_MODES:
+            capacity_available = self.short_capacity_shares > 0
             self.can_short_open_mask = (
                 self.can_short_open_mask
                 & self.can_sell_mask.to(dtype=torch.bool)
-                & (self.short_capacity_shares > 0)
+                & capacity_available
             )
-            self.short_capacity_shares = torch.where(
-                self.can_short_open_mask,
-                self.short_capacity_shares,
-                torch.zeros_like(self.short_capacity_shares),
-            )
-            self.short_capacity_notional = torch.where(
-                self.can_short_open_mask,
-                self.short_capacity_notional,
-                torch.zeros_like(self.short_capacity_notional),
+            self.can_short_open_open_mask = (
+                self.can_short_open_open_mask & capacity_available
             )
         if self.force_short_cover_mask is None:
             self.force_short_cover_mask = torch.zeros_like(self.tradable_mask, dtype=torch.bool)
@@ -352,6 +416,8 @@ class WindowedSplitTensors:
         sample_mask: torch.Tensor,
     ) -> tuple[
         torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
         torch.Tensor | None,
         torch.Tensor | None,
         torch.Tensor | None,
@@ -362,6 +428,15 @@ class WindowedSplitTensors:
         session_advance = self.session_advance_mask[date_indices]
         sample_gate = sample_mask.to(device=session_advance.device, dtype=torch.bool)
         session_advance = session_advance & sample_gate
+        session_month_ids = torch.where(
+            sample_gate,
+            self.session_month_ids[date_indices],
+            torch.zeros_like(self.session_month_ids[date_indices]),
+        )
+        rebate_payment_eligible = (
+            self.commission_rebate_payment_eligible_mask[date_indices]
+            & sample_gate
+        )
         eligibility = (
             None
             if self.day_trade_eligible_mask is None
@@ -402,6 +477,8 @@ class WindowedSplitTensors:
         )
         return (
             session_advance,
+            session_month_ids,
+            rebate_payment_eligible,
             eligibility,
             can_buy_open,
             can_sell_open,
@@ -417,6 +494,8 @@ class WindowedSplitTensors:
         sample_mask: torch.Tensor,
     ) -> tuple[
         torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
         torch.Tensor | None,
         torch.Tensor | None,
         torch.Tensor | None,
@@ -427,6 +506,19 @@ class WindowedSplitTensors:
         session_advance = self.session_advance_mask.narrow(0, int(date_start), int(rows))
         sample_gate = sample_mask.to(device=session_advance.device, dtype=torch.bool)
         session_advance = session_advance & sample_gate
+        session_month_ids = torch.where(
+            sample_gate,
+            self.session_month_ids.narrow(0, int(date_start), int(rows)),
+            torch.zeros_like(
+                self.session_month_ids.narrow(0, int(date_start), int(rows))
+            ),
+        )
+        rebate_payment_eligible = (
+            self.commission_rebate_payment_eligible_mask.narrow(
+                0, int(date_start), int(rows)
+            )
+            & sample_gate
+        )
         eligibility = (
             None
             if self.day_trade_eligible_mask is None
@@ -476,6 +568,8 @@ class WindowedSplitTensors:
         )
         return (
             session_advance,
+            session_month_ids,
+            rebate_payment_eligible,
             eligibility,
             can_buy_open,
             can_sell_open,
@@ -609,6 +703,10 @@ class WindowedSplitTensors:
             features=self.features.to(device=device, non_blocking=non_blocking),
             valid_indices=self.valid_indices.to(device=device, non_blocking=non_blocking),
             future_log_returns=self.future_log_returns.to(device=device, non_blocking=non_blocking),
+            overnight_log_returns=self.overnight_log_returns.to(
+                device=device,
+                non_blocking=non_blocking,
+            ),
             tradable_mask=self.tradable_mask.to(device=device, non_blocking=non_blocking),
             can_buy_mask=self.can_buy_mask.to(device=device, non_blocking=non_blocking),
             can_sell_mask=self.can_sell_mask.to(device=device, non_blocking=non_blocking),
@@ -620,6 +718,10 @@ class WindowedSplitTensors:
                 else self.volume_notional.to(device=device, non_blocking=non_blocking)
             ),
             can_short_open_mask=self.can_short_open_mask.to(device=device, non_blocking=non_blocking),
+            can_short_open_open_mask=self.can_short_open_open_mask.to(
+                device=device,
+                non_blocking=non_blocking,
+            ),
             short_capacity_shares=self.short_capacity_shares.to(
                 device=device, non_blocking=non_blocking
             ),
@@ -639,6 +741,14 @@ class WindowedSplitTensors:
             ),
             execution_mode=self.execution_mode,
             session_advance_mask=self.session_advance_mask.to(device=device, non_blocking=non_blocking),
+            session_month_ids=self.session_month_ids.to(
+                device=device, non_blocking=non_blocking
+            ),
+            commission_rebate_payment_eligible_mask=(
+                self.commission_rebate_payment_eligible_mask.to(
+                    device=device, non_blocking=non_blocking
+                )
+            ),
             day_trade_eligible_mask=(
                 None
                 if self.day_trade_eligible_mask is None
@@ -692,6 +802,7 @@ class WindowedSplitTensors:
             features=_pin(self.features),
             valid_indices=_pin(self.valid_indices),
             future_log_returns=_pin(self.future_log_returns),
+            overnight_log_returns=_pin(self.overnight_log_returns),
             tradable_mask=_pin(self.tradable_mask),
             can_buy_mask=_pin(self.can_buy_mask),
             can_sell_mask=_pin(self.can_sell_mask),
@@ -699,6 +810,9 @@ class WindowedSplitTensors:
             lookback=self.lookback,
             volume_notional=None if self.volume_notional is None else _pin(self.volume_notional),
             can_short_open_mask=_pin(self.can_short_open_mask),
+            can_short_open_open_mask=_pin(
+                self.can_short_open_open_mask
+            ),
             short_capacity_shares=_pin(self.short_capacity_shares),
             short_margin_rate=_pin(self.short_margin_rate),
             short_capacity_notional=_pin(self.short_capacity_notional),
@@ -708,6 +822,10 @@ class WindowedSplitTensors:
             symbol_indices=None if self.symbol_indices is None else _pin(self.symbol_indices),
             execution_mode=self.execution_mode,
             session_advance_mask=_pin(self.session_advance_mask),
+            session_month_ids=_pin(self.session_month_ids),
+            commission_rebate_payment_eligible_mask=_pin(
+                self.commission_rebate_payment_eligible_mask
+            ),
             day_trade_eligible_mask=(
                 None if self.day_trade_eligible_mask is None else _pin(self.day_trade_eligible_mask)
             ),
@@ -753,6 +871,10 @@ class WindowedSplitTensors:
             features=self.features.index_select(1, local_indices),
             valid_indices=self.valid_indices,
             future_log_returns=self.future_log_returns.index_select(1, local_indices),
+            overnight_log_returns=self.overnight_log_returns.index_select(
+                1,
+                local_indices,
+            ),
             tradable_mask=self.tradable_mask.index_select(1, local_indices),
             can_buy_mask=self.can_buy_mask.index_select(1, local_indices),
             can_sell_mask=self.can_sell_mask.index_select(1, local_indices),
@@ -764,6 +886,12 @@ class WindowedSplitTensors:
                 else self.volume_notional.index_select(1, local_indices)
             ),
             can_short_open_mask=self.can_short_open_mask.index_select(1, local_indices),
+            can_short_open_open_mask=(
+                self.can_short_open_open_mask.index_select(
+                    1,
+                    local_indices,
+                )
+            ),
             short_capacity_shares=self.short_capacity_shares.index_select(
                 1, local_indices
             ),
@@ -777,6 +905,10 @@ class WindowedSplitTensors:
             symbol_indices=original_indices,
             execution_mode=self.execution_mode,
             session_advance_mask=self.session_advance_mask,
+            session_month_ids=self.session_month_ids,
+            commission_rebate_payment_eligible_mask=(
+                self.commission_rebate_payment_eligible_mask
+            ),
             day_trade_eligible_mask=(
                 None
                 if self.day_trade_eligible_mask is None
@@ -848,6 +980,10 @@ class WindowedSplitTensors:
             features=_pad_symbol_dim(self.features, 0.0),
             valid_indices=self.valid_indices,
             future_log_returns=_pad_symbol_dim(self.future_log_returns, 0.0),
+            overnight_log_returns=_pad_symbol_dim(
+                self.overnight_log_returns,
+                0.0,
+            ),
             tradable_mask=_pad_symbol_dim(self.tradable_mask, False),
             can_buy_mask=_pad_symbol_dim(self.can_buy_mask, False),
             can_sell_mask=_pad_symbol_dim(self.can_sell_mask, False),
@@ -855,6 +991,10 @@ class WindowedSplitTensors:
             lookback=self.lookback,
             volume_notional=None if self.volume_notional is None else _pad_symbol_dim(self.volume_notional, 0.0),
             can_short_open_mask=_pad_symbol_dim(self.can_short_open_mask, False),
+            can_short_open_open_mask=_pad_symbol_dim(
+                self.can_short_open_open_mask,
+                False,
+            ),
             short_capacity_shares=_pad_symbol_dim(
                 self.short_capacity_shares, 0
             ),
@@ -870,6 +1010,10 @@ class WindowedSplitTensors:
             symbol_indices=padded_symbol_indices,
             execution_mode=self.execution_mode,
             session_advance_mask=self.session_advance_mask,
+            session_month_ids=self.session_month_ids,
+            commission_rebate_payment_eligible_mask=(
+                self.commission_rebate_payment_eligible_mask
+            ),
             day_trade_eligible_mask=(
                 None
                 if self.day_trade_eligible_mask is None
@@ -917,6 +1061,7 @@ class WindowedSplitTensors:
             features=self.features,
             valid_indices=self.valid_indices,
             future_log_returns=self.future_log_returns,
+            overnight_log_returns=self.overnight_log_returns,
             tradable_mask=self.tradable_mask,
             can_buy_mask=self.can_buy_mask,
             can_sell_mask=self.can_sell_mask,
@@ -924,6 +1069,7 @@ class WindowedSplitTensors:
             lookback=self.lookback,
             volume_notional=self.volume_notional,
             can_short_open_mask=self.can_short_open_mask,
+            can_short_open_open_mask=self.can_short_open_open_mask,
             short_capacity_shares=self.short_capacity_shares,
             short_margin_rate=self.short_margin_rate,
             short_capacity_notional=self.short_capacity_notional,
@@ -933,6 +1079,10 @@ class WindowedSplitTensors:
             symbol_indices=clamped_indices,
             execution_mode=self.execution_mode,
             session_advance_mask=self.session_advance_mask,
+            session_month_ids=self.session_month_ids,
+            commission_rebate_payment_eligible_mask=(
+                self.commission_rebate_payment_eligible_mask
+            ),
             day_trade_eligible_mask=self.day_trade_eligible_mask,
             day_trade_can_buy_open_mask=self.day_trade_can_buy_open_mask,
             day_trade_can_sell_open_mask=self.day_trade_can_sell_open_mask,
@@ -1004,6 +1154,8 @@ class WindowedSplitTensors:
         sample_mask = self._default_sample_mask[row_indices] if self.sample_mask is None else self.sample_mask[row_indices]
         (
             session_advance_mask,
+            session_month_ids,
+            commission_rebate_payment_eligible_mask,
             day_trade_eligible_mask,
             day_trade_can_buy_open_mask,
             day_trade_can_sell_open_mask,
@@ -1014,6 +1166,7 @@ class WindowedSplitTensors:
         self._prepare_timer_stop(prepare_timing, "mask_build", timer)
         timer = self._prepare_timer_start()
         future_log_returns = self.future_log_returns[date_idx]
+        overnight_log_returns = self.overnight_log_returns[date_idx]
         benchmark = self.benchmark[date_idx]
         volume_notional = None if self.volume_notional is None else self.volume_notional[date_idx]
         self._prepare_timer_stop(prepare_timing, "target_gather", timer)
@@ -1022,6 +1175,7 @@ class WindowedSplitTensors:
         can_buy_mask = self.can_buy_mask[date_idx]
         can_sell_mask = self.can_sell_mask[date_idx]
         can_short_open_mask = self.can_short_open_mask[date_idx]
+        can_short_open_open_mask = self.can_short_open_open_mask[date_idx]
         (
             short_capacity_shares,
             short_margin_rate,
@@ -1040,6 +1194,9 @@ class WindowedSplitTensors:
                 else {"symbol_indices": self._to_device(self.symbol_indices, device, non_blocking, prepare_timing)}
             ),
             "future_log_returns": self._to_device(future_log_returns, device, non_blocking, prepare_timing),
+            "overnight_log_returns": self._to_device(
+                overnight_log_returns, device, non_blocking, prepare_timing
+            ),
             **(
                 {}
                 if volume_notional is None
@@ -1049,6 +1206,12 @@ class WindowedSplitTensors:
             "can_buy_mask": self._to_device(can_buy_mask, device, non_blocking, prepare_timing),
             "can_sell_mask": self._to_device(can_sell_mask, device, non_blocking, prepare_timing),
             "can_short_open_mask": self._to_device(can_short_open_mask, device, non_blocking, prepare_timing),
+            "can_short_open_open_mask": self._to_device(
+                can_short_open_open_mask,
+                device,
+                non_blocking,
+                prepare_timing,
+            ),
             "short_capacity_shares": self._to_device(
                 short_capacity_shares, device, non_blocking, prepare_timing
             ),
@@ -1066,6 +1229,15 @@ class WindowedSplitTensors:
             "benchmark": self._to_device(benchmark, device, non_blocking, prepare_timing),
             "session_advance_mask": self._to_device(
                 session_advance_mask, device, non_blocking, prepare_timing
+            ),
+            "session_month_ids": self._to_device(
+                session_month_ids, device, non_blocking, prepare_timing
+            ),
+            "commission_rebate_payment_eligible_mask": self._to_device(
+                commission_rebate_payment_eligible_mask,
+                device,
+                non_blocking,
+                prepare_timing,
             ),
             **(
                 {}
@@ -1124,6 +1296,8 @@ class WindowedSplitTensors:
         sample_mask = self._default_sample_mask[row_indices] if self.sample_mask is None else self.sample_mask[row_indices]
         (
             session_advance_mask,
+            session_month_ids,
+            commission_rebate_payment_eligible_mask,
             day_trade_eligible_mask,
             day_trade_can_buy_open_mask,
             day_trade_can_sell_open_mask,
@@ -1135,6 +1309,7 @@ class WindowedSplitTensors:
         can_buy_mask = self.can_buy_mask[date_idx]
         can_sell_mask = self.can_sell_mask[date_idx]
         can_short_open_mask = self.can_short_open_mask[date_idx]
+        can_short_open_open_mask = self.can_short_open_open_mask[date_idx]
         (
             short_capacity_shares,
             short_margin_rate,
@@ -1147,6 +1322,7 @@ class WindowedSplitTensors:
         self._prepare_timer_stop(prepare_timing, "mask_build", timer)
         timer = self._prepare_timer_start()
         future_log_returns = self.future_log_returns[date_idx]
+        overnight_log_returns = self.overnight_log_returns[date_idx]
         benchmark = self.benchmark[date_idx]
         volume_notional = None if self.volume_notional is None else self.volume_notional[date_idx]
         self._prepare_timer_stop(prepare_timing, "target_gather", timer)
@@ -1160,6 +1336,9 @@ class WindowedSplitTensors:
                 else {"symbol_indices": self._to_device(self.symbol_indices, device, non_blocking, prepare_timing)}
             ),
             "future_log_returns": self._to_device(future_log_returns, device, non_blocking, prepare_timing),
+            "overnight_log_returns": self._to_device(
+                overnight_log_returns, device, non_blocking, prepare_timing
+            ),
             **(
                 {}
                 if volume_notional is None
@@ -1169,6 +1348,12 @@ class WindowedSplitTensors:
             "can_buy_mask": self._to_device(can_buy_mask, device, non_blocking, prepare_timing),
             "can_sell_mask": self._to_device(can_sell_mask, device, non_blocking, prepare_timing),
             "can_short_open_mask": self._to_device(can_short_open_mask, device, non_blocking, prepare_timing),
+            "can_short_open_open_mask": self._to_device(
+                can_short_open_open_mask,
+                device,
+                non_blocking,
+                prepare_timing,
+            ),
             "short_capacity_shares": self._to_device(
                 short_capacity_shares, device, non_blocking, prepare_timing
             ),
@@ -1186,6 +1371,15 @@ class WindowedSplitTensors:
             "benchmark": self._to_device(benchmark, device, non_blocking, prepare_timing),
             "session_advance_mask": self._to_device(
                 session_advance_mask, device, non_blocking, prepare_timing
+            ),
+            "session_month_ids": self._to_device(
+                session_month_ids, device, non_blocking, prepare_timing
+            ),
+            "commission_rebate_payment_eligible_mask": self._to_device(
+                commission_rebate_payment_eligible_mask,
+                device,
+                non_blocking,
+                prepare_timing,
             ),
             **(
                 {}
@@ -1240,6 +1434,8 @@ class WindowedSplitTensors:
         sample_mask = self._sample_mask_slice(int(start), rows)
         (
             session_advance_mask,
+            session_month_ids,
+            commission_rebate_payment_eligible_mask,
             day_trade_eligible_mask,
             day_trade_can_buy_open_mask,
             day_trade_can_sell_open_mask,
@@ -1251,6 +1447,7 @@ class WindowedSplitTensors:
         can_buy_mask = self.can_buy_mask[date_idx]
         can_sell_mask = self.can_sell_mask[date_idx]
         can_short_open_mask = self.can_short_open_mask[date_idx]
+        can_short_open_open_mask = self.can_short_open_open_mask[date_idx]
         (
             short_capacity_shares,
             short_margin_rate,
@@ -1263,6 +1460,7 @@ class WindowedSplitTensors:
         self._prepare_timer_stop(prepare_timing, "mask_build", timer)
         timer = self._prepare_timer_start()
         future_log_returns = self.future_log_returns[date_idx]
+        overnight_log_returns = self.overnight_log_returns[date_idx]
         benchmark = self.benchmark[date_idx]
         volume_notional = None if self.volume_notional is None else self.volume_notional[date_idx]
         self._prepare_timer_stop(prepare_timing, "target_gather", timer)
@@ -1276,6 +1474,9 @@ class WindowedSplitTensors:
                 else {"symbol_indices": self._to_device(self.symbol_indices, device, non_blocking, prepare_timing)}
             ),
             "future_log_returns": self._to_device(future_log_returns, device, non_blocking, prepare_timing),
+            "overnight_log_returns": self._to_device(
+                overnight_log_returns, device, non_blocking, prepare_timing
+            ),
             **(
                 {}
                 if volume_notional is None
@@ -1285,6 +1486,12 @@ class WindowedSplitTensors:
             "can_buy_mask": self._to_device(can_buy_mask, device, non_blocking, prepare_timing),
             "can_sell_mask": self._to_device(can_sell_mask, device, non_blocking, prepare_timing),
             "can_short_open_mask": self._to_device(can_short_open_mask, device, non_blocking, prepare_timing),
+            "can_short_open_open_mask": self._to_device(
+                can_short_open_open_mask,
+                device,
+                non_blocking,
+                prepare_timing,
+            ),
             "short_capacity_shares": self._to_device(
                 short_capacity_shares, device, non_blocking, prepare_timing
             ),
@@ -1302,6 +1509,15 @@ class WindowedSplitTensors:
             "benchmark": self._to_device(benchmark, device, non_blocking, prepare_timing),
             "session_advance_mask": self._to_device(
                 session_advance_mask, device, non_blocking, prepare_timing
+            ),
+            "session_month_ids": self._to_device(
+                session_month_ids, device, non_blocking, prepare_timing
+            ),
+            "commission_rebate_payment_eligible_mask": self._to_device(
+                commission_rebate_payment_eligible_mask,
+                device,
+                non_blocking,
+                prepare_timing,
             ),
             **(
                 {}
@@ -1353,6 +1569,8 @@ class WindowedSplitTensors:
         timer = self._prepare_timer_start()
         (
             session_advance_mask,
+            session_month_ids,
+            commission_rebate_payment_eligible_mask,
             day_trade_eligible_mask,
             day_trade_can_buy_open_mask,
             day_trade_can_sell_open_mask,
@@ -1361,6 +1579,9 @@ class WindowedSplitTensors:
             cash_dividend_payment_delay_sessions,
         ) = self._execution_masks_for_date_range(date_start, rows, sample_mask)
         future_log_returns = self.future_log_returns.narrow(0, date_start, rows)
+        overnight_log_returns = self.overnight_log_returns.narrow(
+            0, date_start, rows
+        )
         benchmark = self.benchmark.narrow(0, date_start, rows)
         volume_notional = None if self.volume_notional is None else self.volume_notional.narrow(0, date_start, rows)
         self._prepare_timer_stop(prepare_timing, "target_gather", timer)
@@ -1369,6 +1590,11 @@ class WindowedSplitTensors:
         can_buy_mask = self.can_buy_mask.narrow(0, date_start, rows)
         can_sell_mask = self.can_sell_mask.narrow(0, date_start, rows)
         can_short_open_mask = self.can_short_open_mask.narrow(0, date_start, rows)
+        can_short_open_open_mask = self.can_short_open_open_mask.narrow(
+            0,
+            date_start,
+            rows,
+        )
         (
             short_capacity_shares,
             short_margin_rate,
@@ -1387,6 +1613,9 @@ class WindowedSplitTensors:
                 else {"symbol_indices": self._to_device(self.symbol_indices, device, non_blocking, prepare_timing)}
             ),
             "future_log_returns": self._to_device(future_log_returns, device, non_blocking, prepare_timing),
+            "overnight_log_returns": self._to_device(
+                overnight_log_returns, device, non_blocking, prepare_timing
+            ),
             **(
                 {}
                 if volume_notional is None
@@ -1396,6 +1625,12 @@ class WindowedSplitTensors:
             "can_buy_mask": self._to_device(can_buy_mask, device, non_blocking, prepare_timing),
             "can_sell_mask": self._to_device(can_sell_mask, device, non_blocking, prepare_timing),
             "can_short_open_mask": self._to_device(can_short_open_mask, device, non_blocking, prepare_timing),
+            "can_short_open_open_mask": self._to_device(
+                can_short_open_open_mask,
+                device,
+                non_blocking,
+                prepare_timing,
+            ),
             "short_capacity_shares": self._to_device(
                 short_capacity_shares, device, non_blocking, prepare_timing
             ),
@@ -1413,6 +1648,15 @@ class WindowedSplitTensors:
             "benchmark": self._to_device(benchmark, device, non_blocking, prepare_timing),
             "session_advance_mask": self._to_device(
                 session_advance_mask, device, non_blocking, prepare_timing
+            ),
+            "session_month_ids": self._to_device(
+                session_month_ids, device, non_blocking, prepare_timing
+            ),
+            "commission_rebate_payment_eligible_mask": self._to_device(
+                commission_rebate_payment_eligible_mask,
+                device,
+                non_blocking,
+                prepare_timing,
             ),
             **(
                 {}
@@ -1470,6 +1714,8 @@ class WindowedSplitTensors:
         timer = self._prepare_timer_start()
         (
             session_advance_mask,
+            session_month_ids,
+            commission_rebate_payment_eligible_mask,
             day_trade_eligible_mask,
             day_trade_can_buy_open_mask,
             day_trade_can_sell_open_mask,
@@ -1478,6 +1724,9 @@ class WindowedSplitTensors:
             cash_dividend_payment_delay_sessions,
         ) = self._execution_masks_for_date_range(date_start, rows, sample_mask)
         future_log_returns = self.future_log_returns.narrow(0, date_start, rows)
+        overnight_log_returns = self.overnight_log_returns.narrow(
+            0, date_start, rows
+        )
         benchmark = self.benchmark.narrow(0, date_start, rows)
         volume_notional = None if self.volume_notional is None else self.volume_notional.narrow(0, date_start, rows)
         self._prepare_timer_stop(prepare_timing, "target_gather", timer)
@@ -1486,6 +1735,11 @@ class WindowedSplitTensors:
         can_buy_mask = self.can_buy_mask.narrow(0, date_start, rows)
         can_sell_mask = self.can_sell_mask.narrow(0, date_start, rows)
         can_short_open_mask = self.can_short_open_mask.narrow(0, date_start, rows)
+        can_short_open_open_mask = self.can_short_open_open_mask.narrow(
+            0,
+            date_start,
+            rows,
+        )
         (
             short_capacity_shares,
             short_margin_rate,
@@ -1506,6 +1760,9 @@ class WindowedSplitTensors:
                 else {"symbol_indices": self._to_device(self.symbol_indices, device, non_blocking, prepare_timing)}
             ),
             "future_log_returns": self._to_device(future_log_returns, device, non_blocking, prepare_timing),
+            "overnight_log_returns": self._to_device(
+                overnight_log_returns, device, non_blocking, prepare_timing
+            ),
             **(
                 {}
                 if volume_notional is None
@@ -1515,6 +1772,12 @@ class WindowedSplitTensors:
             "can_buy_mask": self._to_device(can_buy_mask, device, non_blocking, prepare_timing),
             "can_sell_mask": self._to_device(can_sell_mask, device, non_blocking, prepare_timing),
             "can_short_open_mask": self._to_device(can_short_open_mask, device, non_blocking, prepare_timing),
+            "can_short_open_open_mask": self._to_device(
+                can_short_open_open_mask,
+                device,
+                non_blocking,
+                prepare_timing,
+            ),
             "short_capacity_shares": self._to_device(
                 short_capacity_shares, device, non_blocking, prepare_timing
             ),
@@ -1532,6 +1795,15 @@ class WindowedSplitTensors:
             "benchmark": self._to_device(benchmark, device, non_blocking, prepare_timing),
             "session_advance_mask": self._to_device(
                 session_advance_mask, device, non_blocking, prepare_timing
+            ),
+            "session_month_ids": self._to_device(
+                session_month_ids, device, non_blocking, prepare_timing
+            ),
+            "commission_rebate_payment_eligible_mask": self._to_device(
+                commission_rebate_payment_eligible_mask,
+                device,
+                non_blocking,
+                prepare_timing,
             ),
             **(
                 {}
@@ -1590,6 +1862,8 @@ class WindowedSplitTensors:
         timer = self._prepare_timer_start()
         (
             session_advance_mask,
+            session_month_ids,
+            commission_rebate_payment_eligible_mask,
             day_trade_eligible_mask,
             day_trade_can_buy_open_mask,
             day_trade_can_sell_open_mask,
@@ -1598,6 +1872,9 @@ class WindowedSplitTensors:
             cash_dividend_payment_delay_sessions,
         ) = self._execution_masks_for_date_range(date_start, rows, sample_mask)
         future_log_returns = self.future_log_returns.narrow(0, date_start, rows)
+        overnight_log_returns = self.overnight_log_returns.narrow(
+            0, date_start, rows
+        )
         benchmark = self.benchmark.narrow(0, date_start, rows)
         volume_notional = None if self.volume_notional is None else self.volume_notional.narrow(0, date_start, rows)
         self._prepare_timer_stop(prepare_timing, "target_gather", timer)
@@ -1606,6 +1883,11 @@ class WindowedSplitTensors:
         can_buy_mask = self.can_buy_mask.narrow(0, date_start, rows)
         can_sell_mask = self.can_sell_mask.narrow(0, date_start, rows)
         can_short_open_mask = self.can_short_open_mask.narrow(0, date_start, rows)
+        can_short_open_open_mask = self.can_short_open_open_mask.narrow(
+            0,
+            date_start,
+            rows,
+        )
         (
             short_capacity_shares,
             short_margin_rate,
@@ -1624,6 +1906,9 @@ class WindowedSplitTensors:
                 else {"symbol_indices": self._to_device(self.symbol_indices, device, non_blocking, prepare_timing)}
             ),
             "future_log_returns": self._to_device(future_log_returns, device, non_blocking, prepare_timing),
+            "overnight_log_returns": self._to_device(
+                overnight_log_returns, device, non_blocking, prepare_timing
+            ),
             **(
                 {}
                 if volume_notional is None
@@ -1633,6 +1918,12 @@ class WindowedSplitTensors:
             "can_buy_mask": self._to_device(can_buy_mask, device, non_blocking, prepare_timing),
             "can_sell_mask": self._to_device(can_sell_mask, device, non_blocking, prepare_timing),
             "can_short_open_mask": self._to_device(can_short_open_mask, device, non_blocking, prepare_timing),
+            "can_short_open_open_mask": self._to_device(
+                can_short_open_open_mask,
+                device,
+                non_blocking,
+                prepare_timing,
+            ),
             "short_capacity_shares": self._to_device(
                 short_capacity_shares, device, non_blocking, prepare_timing
             ),
@@ -1650,6 +1941,15 @@ class WindowedSplitTensors:
             "benchmark": self._to_device(benchmark, device, non_blocking, prepare_timing),
             "session_advance_mask": self._to_device(
                 session_advance_mask, device, non_blocking, prepare_timing
+            ),
+            "session_month_ids": self._to_device(
+                session_month_ids, device, non_blocking, prepare_timing
+            ),
+            "commission_rebate_payment_eligible_mask": self._to_device(
+                commission_rebate_payment_eligible_mask,
+                device,
+                non_blocking,
+                prepare_timing,
             ),
             **(
                 {}
@@ -1894,6 +2194,7 @@ def dataset_to_windowed_tensors(dataset: CrossSectionalDataset) -> WindowedSplit
         features=dataset.features_t,
         valid_indices=torch.as_tensor(dataset.valid_indices, dtype=torch.long),
         future_log_returns=dataset.future_log_returns_t,
+        overnight_log_returns=dataset.overnight_log_returns_t,
         tradable_mask=dataset.tradable_mask_t,
         can_buy_mask=dataset.can_buy_mask_t,
         can_sell_mask=dataset.can_sell_mask_t,
@@ -1901,6 +2202,7 @@ def dataset_to_windowed_tensors(dataset: CrossSectionalDataset) -> WindowedSplit
         lookback=dataset.lookback,
         volume_notional=dataset.volume_notional_t,
         can_short_open_mask=dataset.can_short_open_mask_t,
+        can_short_open_open_mask=dataset.can_short_open_open_mask_t,
         short_capacity_shares=dataset.short_capacity_shares_t,
         short_margin_rate=dataset.short_margin_rate_t,
         short_capacity_notional=dataset.short_capacity_notional_t,
@@ -1908,6 +2210,10 @@ def dataset_to_windowed_tensors(dataset: CrossSectionalDataset) -> WindowedSplit
         force_exit_mask=dataset.force_exit_mask_t,
         execution_mode=dataset.execution_mode,
         session_advance_mask=dataset.session_advance_mask_t,
+        session_month_ids=dataset.session_month_ids_t,
+        commission_rebate_payment_eligible_mask=(
+            dataset.commission_rebate_payment_eligible_mask_t
+        ),
         day_trade_eligible_mask=dataset.day_trade_eligible_mask_t,
         day_trade_can_buy_open_mask=dataset.day_trade_can_buy_open_mask_t,
         day_trade_can_sell_open_mask=dataset.day_trade_can_sell_open_mask_t,

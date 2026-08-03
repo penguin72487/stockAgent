@@ -152,7 +152,9 @@ trading:
   portfolio_activation: pre_normalized
   execution_mode: tw_day_trade
   tw_commission_rate: 0.001425
-  tw_commission_discount: 0.6
+  tw_commission_discount: 0.2
+  # monthly_15th or daily_close; only commission is rebated, never tax.
+  tw_commission_rebate_timing: monthly_15th
   tw_stock_sell_tax: 0.003
   tw_etf_sell_tax: 0.001
   tw_day_trade_stock_sell_tax: 0.0015

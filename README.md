@@ -16,12 +16,125 @@ Multi-asset Taiwan stock trading research workspace.
 3. Run yearly expanding-window walk-forward validation.
 4. Train GPU-enabled reference models first, then portfolio and RL policies.
 
+## Dataset snapshot sync (desync + Syncthing)
+
+Git synchronizes the code repository. Syncthing synchronizes only the immutable
+desync store at `/srv/stockagent-sync`; do not use Syncthing to synchronize the
+Git working tree or a live dataset directory.
+
+Install the pinned desync release and initialize each machine once. Every
+machine must use a different permanent node ID:
+
+```bash
+cd /path/to/stockAgent
+./scripts/install_desync.sh
+
+# Machine A
+./scripts/run_desync_snapshot.sh init \
+  --sync-root /srv/stockagent-sync \
+  --node-id trainer-a
+
+# Machine B uses trainer-b instead.
+```
+
+Check which complete `tw-public` snapshot currently wins:
+
+```bash
+./scripts/run_desync_snapshot.sh status tw-public \
+  --sync-root /srv/stockagent-sync
+```
+
+Fetch the latest complete snapshot into a read-only training location and save
+an exact pin:
+
+```bash
+./scripts/run_desync_snapshot.sh fetch tw-public \
+  --sync-root /srv/stockagent-sync \
+  --materialized-root /srv/stockagent-snapshots \
+  --pin /srv/stockagent-snapshots/tw-public.pin.json
+```
+
+The command prints the materialized directory. It has the form:
+
+```text
+/srv/stockagent-snapshots/tw-public/<SNAPSHOT_ID>
+```
+
+Inspect the saved pin and verify the materialized tree:
+
+```bash
+jq . /srv/stockagent-snapshots/tw-public.pin.json
+
+snapshot_id="$(
+  jq -r '.manifest.snapshot_id' \
+    /srv/stockagent-snapshots/tw-public.pin.json
+)"
+
+snapshot_path="$(
+  printf '/srv/stockagent-snapshots/tw-public/%s\n' \
+    "$snapshot_id"
+)"
+
+./scripts/run_desync_snapshot.sh verify tw-public \
+  --sync-root /srv/stockagent-sync \
+  --materialized "$snapshot_path"
+```
+
+For resume or reproduction, fetch the pinned snapshot ID explicitly instead of
+resolving `latest` again:
+
+```bash
+snapshot_id="$(
+  jq -r '.manifest.snapshot_id' \
+    /srv/stockagent-snapshots/tw-public.pin.json
+)"
+
+./scripts/run_desync_snapshot.sh fetch tw-public \
+  --snapshot-id "$snapshot_id" \
+  --sync-root /srv/stockagent-sync \
+  --materialized-root /srv/stockagent-snapshots
+```
+
+Publish only from a frozen source directory while downloaders, repair jobs, and
+other writers are stopped:
+
+```bash
+./scripts/run_desync_snapshot.sh publish tw-public \
+  data_tw_public \
+  --sync-root /srv/stockagent-sync \
+  --metadata storage_frequency=daily \
+  --metadata audit=strict
+```
+
+Before training, require the dedicated Syncthing folder
+`stockagent-desync` to be `Up to Date` with zero pending items and zero errors.
+Training and resume jobs must read the pinned materialized path, never the live
+source tree or an implicitly re-resolved latest snapshot. See
+`docs/desync_multiwriter_sync.md` for the consistency and recovery contract.
+
 ## Training
 
 - Install dependencies from `requirements.txt` inside the `fintech` environment.
 - Source `scripts/runtime_env.sh` once per shell, then run Python entrypoints with `run_fintech_python`; it discovers the local `fintech` environment without assuming an absolute installation path.
 - Run Taiwan training with `run_fintech_python train.py --config configs/markets/tw.yaml`; outputs go to that market config's `runner.output_dir`.
 - Run the independent Taiwan public-data experiment with `run_fintech_python train.py --config configs/markets/tw_public.yaml`; outputs go to `artifacts/markets/tw_public_official_2005_v1`.
+- Taiwan carrying execution has two explicit phase-action contracts. `tw_cash`
+  emits signed opening- and closing-auction targets while retaining the T+2
+  account ledger. `tw_overnight` emits a next-session exit fraction plus signed
+  open/close entry allocations; every cohort must be closed by the next
+  session's close. Its model head shares one per-symbol entry direction and
+  learns the open/close timing split, preventing an implicit same-day reversal.
+  Both heads use completed daily features through `t-1` plus the dedicated
+  `open[t]/close[t-1]` gap channel. They never see session-`t` high/low/close
+  or full-day volume; phase fill masks and the closing price remain
+  executor-only. Training, tensor backtests, and exact integer-share audit are
+  supported; the existing single-target live preview and portfolio
+  explainability paths reject phase outputs until they have phase-labelled
+  account-state contracts.
+- Run the one-session carrying template with
+  `run_fintech_python train.py --config configs/markets/tw_public_lanten_market_candles_overnight.yaml`.
+- Reproduce the fixed-shape eager/compiled settlement benchmark with
+  `run_fintech_python scripts/benchmark_tw_dual_session_compile.py --symbols 2735 --rows 32 --repeats 7`.
 - `data.use_tw_public_rules` applies official TW execution masks independently from
   model inputs. TW configs enable it by default and fail fast if the configured
   public parquet is missing. `configs/markets/tw_public.yaml` additionally enables
@@ -111,6 +224,18 @@ run_fintech_python scripts/manage_gpu_jobs.py status \
 - Use `run_fintech_python downloader/download_yahoo_ohlcv.py --asset crypto` to download only the expanded crypto universe.
 - Use `run_fintech_python downloader/download_yahoo_ohlcv.py --asset crypto --mode incremental` to refresh only missing/stale Yahoo crypto 15-minute bars.
 - Yahoo crypto uses 15-minute bars; existing crypto parquet files that look like old daily data are rebuilt from the 15-minute source instead of being merged.
+
+### Taiwan full-market one-minute Kbar research
+
+The Shioaji minute-research pipeline covers every stock and ETF in the Taiwan
+public universe while remaining separate from the Tick/BidAsk HFT capture.
+It uses resumable `api.kbars()` chunks, causal next-bar execution labels,
+Taiwan day-trade costs, and chronological validation. The default research mode
+recomputes a stateful target after every completed one-minute Kbar, executes only
+the target-position delta at the next minute open, carries positions between
+minutes, and forces the portfolio flat before the session ends. See
+[`docs/tw_minute_kbar_research.md`](docs/tw_minute_kbar_research.md) for the
+full data contract, backfill service, audit, and strategy commands.
 - Use `run_fintech_python downloader/download_yahoo_ohlcv.py --asset forex` to download only the expanded FX universe.
 - Use `run_fintech_python downloader/download_forex_pepperstone.py` to download the Pepperstone-style FX universe.
 - Use `run_fintech_python downloader/download_forex_pepperstone.py --mode repair` to repair stale/missing Pepperstone forex files.
@@ -290,6 +415,13 @@ sudo apt update && sudo apt full-upgrade -y && sudo apt autoremove -y && sudo sn
 cd /root/stockAgent
 mamba activate fintech
 mamba update --all
+
+
+
+mamba activate fintech
+scripts/run_openbb_archive_until_complete.sh
+
+
 # train
 
 cd /root/stockAgent

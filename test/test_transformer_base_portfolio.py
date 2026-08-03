@@ -796,6 +796,18 @@ def test_panel_slab_symbolic_stock_axis_reuses_one_graph_and_matches_eager() -> 
         torch._dynamo.reset()
 
 
+def test_symbol_indices_length_and_range_checks_remain_strict_in_eager_mode() -> None:
+    model = _make_model(allow_dynamic_symbols=False).cpu()
+
+    with pytest.raises(ValueError, match="Expected symbol_indices length"):
+        model._check_symbol_indices(torch.tensor([0, 1]), n_symbols=3)
+    with pytest.raises(ValueError, match="symbol_indices must be in"):
+        model._check_symbol_indices(
+            torch.tensor([0, model.num_symbols]),
+            n_symbols=2,
+        )
+
+
 def test_panel_slab_dynamic_bounds_do_not_cross_sdpa_loop_count() -> None:
     model = _make_model(sdpa_batch_limit=65_535).cpu()
 
@@ -942,6 +954,66 @@ def test_dynamic_symbol_upper_bound_uses_train_groups_not_future_panel_symbols()
     # from the previous shape or hard-coded to a historical market size.
     tradable[7, 5] = True
     assert _train_symbol_compaction_upper_bound(panel, grouped_folds, config) == 6
+
+
+def test_dynamic_symbol_upper_bound_matches_panel_history_compaction() -> None:
+    dates = 10
+    symbols = 5
+    alive = np.zeros((dates, symbols), dtype=bool)
+    alive[4:7, :3] = True
+    alive[7, 0] = True
+    prior_alive = np.zeros_like(alive)
+    prior_alive[1:] = alive[:-1]
+    panel = SimpleNamespace(
+        num_symbols=symbols,
+        tradable_mask=alive.copy(),
+        returns_1d=np.zeros((dates, symbols), dtype=np.float32),
+        alive_mask=alive,
+        day_trade_eligible_mask=None,
+    )
+    train_indices = np.arange(5, 9, dtype=np.int64)
+    grouped_folds = {
+        (2001,): [SimpleNamespace(train_indices=train_indices)],
+    }
+    config = SimpleNamespace(
+        trading=SimpleNamespace(execution_mode="tw_overnight"),
+        training=SimpleNamespace(
+            lookback=3,
+            train_symbol_compaction="train_union",
+            train_symbol_compaction_bucket_size=0,
+        ),
+        walk_forward=SimpleNamespace(lookback_context="panel_history"),
+    )
+    split = WindowedSplitTensors(
+        features=torch.zeros((dates, symbols, 1)),
+        valid_indices=torch.as_tensor(train_indices),
+        future_log_returns=torch.zeros((dates, symbols)),
+        tradable_mask=torch.from_numpy(prior_alive),
+        can_buy_mask=torch.from_numpy(prior_alive.copy()),
+        can_sell_mask=torch.from_numpy(prior_alive.copy()),
+        benchmark=torch.zeros(dates),
+        lookback=3,
+        execution_mode="tw_overnight",
+        unresolved_corporate_action_mask=torch.zeros(
+            (dates, symbols),
+            dtype=torch.bool,
+        ),
+    )
+
+    compacted = _maybe_compact_train_windowed_symbols(
+        split,
+        config,
+        label="panel-history-upper-bound-test",
+    )
+    upper_bound = _train_symbol_compaction_upper_bound(
+        panel,
+        grouped_folds,
+        config,
+    )
+
+    assert compacted.num_symbols == 3
+    assert upper_bound == 3
+    assert upper_bound >= compacted.num_symbols
 
 
 def test_train_union_bucket_padding_preserves_output_loss_grad_and_state(

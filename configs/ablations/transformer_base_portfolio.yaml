@@ -1,0 +1,235 @@
+# Central ablation matrix for the active TW public Transformer experiment.
+#
+# The runner expands this file one factor at a time (OFAT). The unmodified
+# base_config is always the control. Each enabled discrete value creates one
+# isolated run; disabled dimensions remain documented without consuming GPU.
+#
+# Run:
+#   source scripts/runtime_env.sh
+#   run_fintech_python scripts/run_ablation_experiments.py
+base_config: configs/markets/tw_public.yaml
+output_root: artifacts/ablations/transformer_base_portfolio
+
+matrix:
+  mode: one_factor_at_a_time
+  include_baseline: true
+  # Applied after every variant. No experiment may replace the investment
+  # objective with rank-only, Sortino, or another loss.
+  fixed_overrides:
+    training:
+      loss_type: log_utility
+
+  # Global control used by the baseline and every OFAT variant. Window length
+  # and train batch size are a coupled memory/throughput choice.
+  base_overrides:
+    training:
+      lookback: 32
+      batch_size_train: 128
+      transformer_base_portfolio:
+        attention_mode: market_token
+        use_latent_factors: true
+        use_market_tokens: true
+
+  dimensions:
+    - name: lookback_batch
+      enabled: true
+      paths: [training.lookback, training.batch_size_train]
+      baseline: [32, 128]
+      description: Coupled lookback and training batch-size schedule.
+      values:
+        - {name: lookback256_batch32, experiment_name: lookback256_batch32, value: [256, 32]}
+
+    # Keep attention_mode=market_token and explicitly test the complete 2x2
+    # design. The [true, true] control comes from matrix.base_overrides.
+    - name: information_bottleneck
+      enabled: true
+      baseline: [true, true]
+      description: Isolate cross-stock information carried by latent factors and market tokens.
+      variants:
+        - name: latent_only
+          experiment_name: latent_only
+          overrides:
+            training:
+              transformer_base_portfolio:
+                attention_mode: market_token
+                use_latent_factors: true
+                use_market_tokens: false
+        - name: market_only
+          experiment_name: market_only
+          overrides:
+            training:
+              transformer_base_portfolio:
+                attention_mode: market_token
+                use_latent_factors: false
+                use_market_tokens: true
+        - name: temporal_only
+          experiment_name: temporal_only
+          overrides:
+            training:
+              transformer_base_portfolio:
+                attention_mode: market_token
+                use_latent_factors: false
+                use_market_tokens: false
+
+    - name: temporal_rope
+      enabled: true
+      path: training.transformer_base_portfolio.rope_temporal
+      baseline: true
+      values:
+        - name: disabled
+          experiment_name: no_rope_temporal
+          value: false
+
+    - name: learned_time_position
+      enabled: true
+      path: training.transformer_base_portfolio.use_time_pos
+      baseline: true
+      values:
+        - name: disabled
+          experiment_name: no_time_position
+          value: false
+
+    - name: learned_symbol_position
+      enabled: true
+      path: training.transformer_base_portfolio.use_symbol_pos
+      baseline: false
+      values:
+        - name: enabled
+          experiment_name: with_symbol_position
+          value: true
+
+    - name: qk_normalization
+      enabled: true
+      path: training.transformer_base_portfolio.qk_norm
+      baseline: true
+      values:
+        - name: disabled
+          experiment_name: no_qk_norm
+          value: false
+
+    - name: temporal_pooling
+      enabled: true
+      baseline: last
+      variants:
+        - name: mean
+          experiment_name: mean_pooling
+          overrides:
+            training:
+              transformer_base_portfolio:
+                temporal_pooling: mean
+                temporal_query_mode: full_then_last
+        - name: attention
+          experiment_name: attention_pooling
+          overrides:
+            training:
+              transformer_base_portfolio:
+                temporal_pooling: attention
+                temporal_query_mode: full_then_last
+
+    - name: temporal_layers
+      enabled: false
+      path: training.transformer_base_portfolio.temporal_layers
+      baseline: 2
+      values:
+        - {name: one, experiment_name: temporal_layers_1, value: 1}
+        - {name: three, experiment_name: temporal_layers_3, value: 3}
+
+    - name: normalization
+      enabled: true
+      path: training.transformer_base_portfolio.norm_type
+      baseline: rmsnorm
+      values:
+        - {name: layernorm, experiment_name: layernorm, value: layernorm}
+
+    - name: feed_forward
+      enabled: true
+      path: training.transformer_base_portfolio.ffn_type
+      baseline: swiglu
+      values:
+        - {name: gelu, experiment_name: gelu_ffn, value: gelu}
+
+    - name: model_dropout
+      enabled: false
+      path: training.transformer_base_portfolio.dropout
+      baseline: 0.0
+      values:
+        - {name: "0_1", experiment_name: dropout_01, value: 0.1}
+        - {name: "0_2", experiment_name: dropout_02, value: 0.2}
+
+    - name: input_dropout
+      enabled: false
+      path: training.transformer_base_portfolio.input_dropout
+      baseline: 0.0
+      values:
+        - {name: "0_1", experiment_name: input_dropout_01, value: 0.1}
+
+    - name: rank_ic_auxiliary
+      enabled: false
+      path: training.multitask_loss.rank_ic_weight
+      baseline: 1.0
+      values:
+        - {name: disabled, experiment_name: no_rank_ic_aux, value: 0.0}
+
+    - name: center_long_short_logits
+      enabled: false
+      path: training.transformer_base_portfolio.center_long_short_logits
+      baseline: false
+      values:
+        - {name: disabled, experiment_name: no_center_logits, value: false}
+
+    # Capacity/sensitivity axes are documented but off by default. Enable them
+    # after the structural OFAT pass identifies useful components.
+    - name: model_width
+      enabled: false
+      path: training.transformer_base_portfolio.d_model
+      baseline: 32
+      values:
+        - {name: "16", experiment_name: dmodel_16, value: 16}
+        - {name: "64", experiment_name: dmodel_64, value: 64}
+
+    - name: latent_factor_count
+      enabled: false
+      path: training.transformer_base_portfolio.num_latent_factors
+      baseline: 16
+      values:
+        - {name: "4", experiment_name: latent_factors_4, value: 4}
+        - {name: "8", experiment_name: latent_factors_8, value: 8}
+        - {name: "32", experiment_name: latent_factors_32, value: 32}
+
+    - name: market_token_count
+      enabled: false
+      path: training.transformer_base_portfolio.num_market_tokens
+      baseline: 16
+      values:
+        - {name: "4", experiment_name: market_tokens_4, value: 4}
+        - {name: "8", experiment_name: market_tokens_8, value: 8}
+        - {name: "32", experiment_name: market_tokens_32, value: 32}
+
+    - name: portfolio_direction
+      enabled: false
+      baseline: long_short
+      variants:
+        - name: long_only
+          experiment_name: long_only
+          overrides:
+            trading:
+              long_only: true
+            training:
+              transformer_base_portfolio:
+                portfolio_mode: long_only
+
+    # Engineering parity switches are intentionally disabled: they benchmark
+    # implementation speed/numerics rather than investment-signal contribution.
+    - name: torch_compile
+      enabled: false
+      path: training.enable_torch_compile
+      baseline: true
+      values:
+        - {name: disabled, experiment_name: eager_model, value: false}
+
+    - name: compiled_loss
+      enabled: false
+      path: training.compile_loss
+      baseline: true
+      values:
+        - {name: disabled, experiment_name: eager_loss, value: false}

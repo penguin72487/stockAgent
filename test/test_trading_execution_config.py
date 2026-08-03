@@ -43,6 +43,17 @@ def _write_config(tmp_path: Path, trading_overrides: dict[str, object] | None = 
                 "training": {
                     "non_blocking_transfer": True,
                     "model_name": "transformer_base_portfolio",
+                    "loss_type": "log_utility",
+                    # Keep this generic config helper valid for phase-aware
+                    # execution without applying an already-resolved action
+                    # transform twice.
+                    "transformer_base_portfolio": {
+                        "portfolio_output_mode": "logits",
+                    },
+                    "multitask_loss": {
+                        "return_rank_ic_weight": 0.0,
+                        "direction_weight": 0.0,
+                    },
                 },
                 "evaluation": {},
             }
@@ -60,7 +71,8 @@ def test_execution_config_defaults_preserve_naive_mode_and_legacy_fees(tmp_path:
     assert trading.buy_fee_rate == 0.0007
     assert trading.sell_fee_rate == 0.0037
     assert trading.tw_commission_rate == 0.001425
-    assert trading.tw_commission_discount == 0.6
+    assert trading.tw_commission_discount == 0.2
+    assert trading.tw_commission_rebate_timing == "monthly_15th"
     assert trading.tw_stock_sell_tax == 0.003
     assert trading.tw_etf_sell_tax == 0.001
     assert trading.tw_day_trade_stock_sell_tax == 0.0015
@@ -123,6 +135,7 @@ def test_custom_taiwan_execution_schedule_is_retained_after_validation(tmp_path:
                 "long_only": True,
                 "tw_commission_rate": 0.002,
                 "tw_commission_discount": 0.5,
+                "tw_commission_rebate_timing": "daily",
                 "tw_stock_sell_tax": 0.004,
                 "tw_etf_sell_tax": 0.002,
                 "tw_day_trade_stock_sell_tax": 0.0025,
@@ -146,6 +159,7 @@ def test_custom_taiwan_execution_schedule_is_retained_after_validation(tmp_path:
     assert trading.execution_mode == "tw_cash"
     assert trading.tw_commission_rate == 0.002
     assert trading.tw_commission_discount == 0.5
+    assert trading.tw_commission_rebate_timing == "daily_close"
     assert trading.tw_stock_sell_tax == 0.004
     assert trading.tw_etf_sell_tax == 0.002
     assert trading.tw_day_trade_stock_sell_tax == 0.0025
@@ -221,6 +235,7 @@ def test_disabled_short_capacity_limit_allows_missing_capacity_but_not_eligibili
         can_buy_mask=mask.copy(),
         can_sell_mask=mask.copy(),
         can_short_open_mask=mask.copy(),
+        can_short_open_open_mask=mask.copy(),
         unresolved_corporate_action_mask=np.zeros(shape, dtype=np.bool_),
         short_capacity_shares=None,
     )
@@ -355,6 +370,23 @@ def test_execution_config_rejects_invalid_rates(
 ) -> None:
     with pytest.raises(ValueError):
         load_config(_write_config(tmp_path, {field_name: bad_value}))
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    ["", "immediate", "weekly", 1, True, None],
+)
+def test_execution_config_rejects_invalid_commission_rebate_timing(
+    tmp_path: Path,
+    bad_value: object,
+) -> None:
+    with pytest.raises(ValueError, match="commission_rebate_timing"):
+        load_config(
+            _write_config(
+                tmp_path,
+                {"tw_commission_rebate_timing": bad_value},
+            )
+        )
 
 
 @pytest.mark.parametrize(

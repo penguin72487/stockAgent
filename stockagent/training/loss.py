@@ -12,7 +12,10 @@ from stockagent.backtest.simulator import (
     _resolve_exposure_budget,
     run_backtest_torch,
 )
-from stockagent.backtest.tw_execution import normalize_execution_mode
+from stockagent.backtest.tw_execution import (
+    TW_CARRYING_EXECUTION_MODES,
+    normalize_execution_mode,
+)
 from stockagent.models.normalization import DEFAULT_PORTFOLIO_ACTIVATION
 
 
@@ -334,6 +337,10 @@ def factor_generalization_loss(
     execution_mode: str = "naive",
     buy_fee_rates: Tensor | None = None,
     sell_fee_rates: Tensor | None = None,
+    commission_rebate_rates: Tensor | None = None,
+    commission_rebate_timing: str = "daily_close",
+    session_month_ids: Tensor | None = None,
+    commission_rebate_payment_eligible_mask: Tensor | None = None,
     settlement_lag_sessions: int = 2,
     day_trade_eligible_mask: Tensor | None = None,
     day_trade_can_buy_open_mask: Tensor | None = None,
@@ -361,6 +368,7 @@ def factor_generalization_loss(
     worst_fraction: float = 0.25,
     regime_up_threshold: float = 0.002,
     regime_down_threshold: float = -0.002,
+    can_short_open_open_mask: Tensor | None = None,
 ) -> Tensor:
     """Train scores as a stable, tradable cross-sectional characteristic factor."""
     weights = torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
@@ -420,6 +428,19 @@ def factor_generalization_loss(
     initial_cash = aux_outputs.get("initial_cash") if aux_outputs else None
     initial_payables = aux_outputs.get("initial_payables") if aux_outputs else None
     initial_receivables = aux_outputs.get("initial_receivables") if aux_outputs else None
+    initial_commission_rebate_current = (
+        aux_outputs.get("initial_commission_rebate_current")
+        if aux_outputs
+        else None
+    )
+    initial_commission_rebate_due = (
+        aux_outputs.get("initial_commission_rebate_due") if aux_outputs else None
+    )
+    initial_commission_rebate_month_id = (
+        aux_outputs.get("initial_commission_rebate_month_id")
+        if aux_outputs
+        else None
+    )
     initial_equity_scale = (
         aux_outputs.get("initial_equity_scale") if aux_outputs else None
     )
@@ -453,6 +474,11 @@ def factor_generalization_loss(
             if can_short_open_mask is not None
             else None
         ),
+        can_short_open_open_mask=(
+            can_short_open_open_mask.to(dtype=torch.bool, device=weights.device)
+            if can_short_open_open_mask is not None
+            else None
+        ),
         force_short_cover_mask=(
             force_short_cover_mask.to(dtype=torch.bool, device=weights.device)
             if force_short_cover_mask is not None
@@ -469,6 +495,12 @@ def factor_generalization_loss(
         execution_mode=execution_mode,
         buy_fee_rates=buy_fee_rates,
         sell_fee_rates=sell_fee_rates,
+        commission_rebate_rates=commission_rebate_rates,
+        commission_rebate_timing=commission_rebate_timing,
+        session_month_ids=session_month_ids,
+        commission_rebate_payment_eligible_mask=(
+            commission_rebate_payment_eligible_mask
+        ),
         settlement_lag_sessions=settlement_lag_sessions,
         day_trade_eligible_mask=day_trade_eligible_mask,
         day_trade_can_buy_open_mask=day_trade_can_buy_open_mask,
@@ -483,6 +515,9 @@ def factor_generalization_loss(
         initial_cash=initial_cash,
         initial_payables=initial_payables,
         initial_receivables=initial_receivables,
+        initial_commission_rebate_current=initial_commission_rebate_current,
+        initial_commission_rebate_due=initial_commission_rebate_due,
+        initial_commission_rebate_month_id=initial_commission_rebate_month_id,
         initial_equity_scale=initial_equity_scale,
         initial_short_sale_collateral=initial_short_sale_collateral,
         initial_short_margin_collateral=initial_short_margin_collateral,
@@ -503,6 +538,21 @@ def factor_generalization_loss(
             ("cash", "_final_cash", factor_backtest.final_cash),
             ("payables", "_final_payables", factor_backtest.final_payables),
             ("receivables", "_final_receivables", factor_backtest.final_receivables),
+            (
+                "commission_rebate_current",
+                "_final_commission_rebate_current",
+                factor_backtest.final_commission_rebate_current,
+            ),
+            (
+                "commission_rebate_due",
+                "_final_commission_rebate_due",
+                factor_backtest.final_commission_rebate_due,
+            ),
+            (
+                "commission_rebate_month_id",
+                "_final_commission_rebate_month_id",
+                factor_backtest.final_commission_rebate_month_id,
+            ),
             (
                 "equity_scale",
                 "_final_equity_scale",
@@ -610,6 +660,10 @@ def portfolio_autoencoder_loss(
     execution_mode: str = "naive",
     buy_fee_rates: Tensor | None = None,
     sell_fee_rates: Tensor | None = None,
+    commission_rebate_rates: Tensor | None = None,
+    commission_rebate_timing: str = "daily_close",
+    session_month_ids: Tensor | None = None,
+    commission_rebate_payment_eligible_mask: Tensor | None = None,
     settlement_lag_sessions: int = 2,
     day_trade_eligible_mask: Tensor | None = None,
     day_trade_can_buy_open_mask: Tensor | None = None,
@@ -624,6 +678,7 @@ def portfolio_autoencoder_loss(
     autoencoder_lambda_turnover: float = 0.1,
     autoencoder_lambda_concentration: float = 0.01,
     autoencoder_lambda_latent: float = 0.001,
+    can_short_open_open_mask: Tensor | None = None,
 ) -> Tensor:
     """Portfolio-level objective evaluated by the canonical execution simulator."""
 
@@ -655,6 +710,19 @@ def portfolio_autoencoder_loss(
     initial_cash = aux_outputs.get("initial_cash") if aux_outputs else None
     initial_payables = aux_outputs.get("initial_payables") if aux_outputs else None
     initial_receivables = aux_outputs.get("initial_receivables") if aux_outputs else None
+    initial_commission_rebate_current = (
+        aux_outputs.get("initial_commission_rebate_current")
+        if aux_outputs
+        else None
+    )
+    initial_commission_rebate_due = (
+        aux_outputs.get("initial_commission_rebate_due") if aux_outputs else None
+    )
+    initial_commission_rebate_month_id = (
+        aux_outputs.get("initial_commission_rebate_month_id")
+        if aux_outputs
+        else None
+    )
     initial_equity_scale = (
         aux_outputs.get("initial_equity_scale") if aux_outputs else None
     )
@@ -696,6 +764,11 @@ def portfolio_autoencoder_loss(
             if can_short_open_mask is not None
             else None
         ),
+        can_short_open_open_mask=(
+            can_short_open_open_mask.to(device=weights.device, dtype=torch.bool)
+            if can_short_open_open_mask is not None
+            else None
+        ),
         force_short_cover_mask=(
             force_short_cover_mask.to(device=weights.device, dtype=torch.bool)
             if force_short_cover_mask is not None
@@ -711,6 +784,12 @@ def portfolio_autoencoder_loss(
         execution_mode=execution_mode,
         buy_fee_rates=buy_fee_rates,
         sell_fee_rates=sell_fee_rates,
+        commission_rebate_rates=commission_rebate_rates,
+        commission_rebate_timing=commission_rebate_timing,
+        session_month_ids=session_month_ids,
+        commission_rebate_payment_eligible_mask=(
+            commission_rebate_payment_eligible_mask
+        ),
         settlement_lag_sessions=settlement_lag_sessions,
         day_trade_eligible_mask=day_trade_eligible_mask,
         day_trade_can_buy_open_mask=day_trade_can_buy_open_mask,
@@ -725,6 +804,9 @@ def portfolio_autoencoder_loss(
         initial_cash=initial_cash,
         initial_payables=initial_payables,
         initial_receivables=initial_receivables,
+        initial_commission_rebate_current=initial_commission_rebate_current,
+        initial_commission_rebate_due=initial_commission_rebate_due,
+        initial_commission_rebate_month_id=initial_commission_rebate_month_id,
         initial_equity_scale=initial_equity_scale,
         initial_short_sale_collateral=initial_short_sale_collateral,
         initial_short_margin_collateral=initial_short_margin_collateral,
@@ -746,6 +828,21 @@ def portfolio_autoencoder_loss(
             ("cash", "_final_cash", backtest.final_cash),
             ("payables", "_final_payables", backtest.final_payables),
             ("receivables", "_final_receivables", backtest.final_receivables),
+            (
+                "commission_rebate_current",
+                "_final_commission_rebate_current",
+                backtest.final_commission_rebate_current,
+            ),
+            (
+                "commission_rebate_due",
+                "_final_commission_rebate_due",
+                backtest.final_commission_rebate_due,
+            ),
+            (
+                "commission_rebate_month_id",
+                "_final_commission_rebate_month_id",
+                backtest.final_commission_rebate_month_id,
+            ),
             ("equity_scale", "_final_equity_scale", backtest.final_equity_scale),
             (
                 "short_sale_collateral",
@@ -1045,6 +1142,10 @@ def risk_aware_loss(
     execution_mode: str = "naive",
     buy_fee_rates: Tensor | None = None,
     sell_fee_rates: Tensor | None = None,
+    commission_rebate_rates: Tensor | None = None,
+    commission_rebate_timing: str = "daily_close",
+    session_month_ids: Tensor | None = None,
+    commission_rebate_payment_eligible_mask: Tensor | None = None,
     settlement_lag_sessions: int = 2,
     day_trade_eligible_mask: Tensor | None = None,
     day_trade_can_buy_open_mask: Tensor | None = None,
@@ -1097,6 +1198,8 @@ def risk_aware_loss(
     autoencoder_lambda_turnover: float = 0.1,
     autoencoder_lambda_concentration: float = 0.01,
     autoencoder_lambda_latent: float = 0.001,
+    overnight_log_returns: Tensor | None = None,
+    can_short_open_open_mask: Tensor | None = None,
 ) -> Tensor:
     """Risk-aware loss with configurable objective, including excess-CVaR-drawdown."""
     normalize_start = _loss_timer_start()
@@ -1104,13 +1207,44 @@ def risk_aware_loss(
     _loss_timer_stop("normalize_weights", normalize_start)
 
     prepare_start = _loss_timer_start()
+    mode = normalize_execution_mode(execution_mode)
     execution_returns, returns = _execution_and_safe_returns(
         future_log_returns,
         reference=weights,
-        execution_mode=execution_mode,
+        execution_mode=mode,
     )
     tradable = tradable_mask.to(dtype=torch.bool, device=weights.device)
     objective_norm = objective.strip().lower()
+    if mode in TW_CARRYING_EXECUTION_MODES:
+        phase_actions = mode == "tw_overnight" or weights.dim() == 3
+        expected_channels = 2 if mode == "tw_cash" else 3
+        if phase_actions and (
+            weights.dim() != 3 or int(weights.size(1)) != expected_channels
+        ):
+            raise ValueError(
+                f"{mode} requires model actions with shape "
+                f"[T,{expected_channels},S], got {tuple(weights.shape)}"
+            )
+        if not phase_actions and (mode != "tw_cash" or weights.dim() != 2):
+            raise ValueError(
+                f"{mode} received an unsupported action shape {tuple(weights.shape)}"
+            )
+        if phase_actions and objective_norm not in {
+            "log_utility",
+            "log_util",
+            "kelly",
+            "growth",
+            "mean_log_return",
+        }:
+            raise ValueError(
+                f"{mode} currently supports only canonical log-utility "
+                "objectives; phase logits do not have a single unbiased "
+                "cross-sectional rank label"
+            )
+        if phase_actions and overnight_log_returns is None:
+            raise ValueError(
+                f"{mode} requires prior-close-to-open overnight_log_returns"
+            )
     _loss_timer_stop("prepare_inputs", prepare_start)
 
     if objective_norm in {"portfolio_autoencoder", "bottleneck_portfolio_autoencoder", "autoencoder_portfolio"}:
@@ -1122,6 +1256,7 @@ def risk_aware_loss(
             can_buy_mask=can_buy_mask,
             can_sell_mask=can_sell_mask,
             can_short_open_mask=can_short_open_mask,
+            can_short_open_open_mask=can_short_open_open_mask,
             force_short_cover_mask=force_short_cover_mask,
             force_exit_mask=force_exit_mask,
             sample_mask=sample_mask,
@@ -1140,6 +1275,12 @@ def risk_aware_loss(
             execution_mode=execution_mode,
             buy_fee_rates=buy_fee_rates,
             sell_fee_rates=sell_fee_rates,
+            commission_rebate_rates=commission_rebate_rates,
+            commission_rebate_timing=commission_rebate_timing,
+            session_month_ids=session_month_ids,
+            commission_rebate_payment_eligible_mask=(
+                commission_rebate_payment_eligible_mask
+            ),
             settlement_lag_sessions=settlement_lag_sessions,
             day_trade_eligible_mask=day_trade_eligible_mask,
             day_trade_can_buy_open_mask=day_trade_can_buy_open_mask,
@@ -1167,6 +1308,7 @@ def risk_aware_loss(
             can_buy_mask=can_buy_mask,
             can_sell_mask=can_sell_mask,
             can_short_open_mask=can_short_open_mask,
+            can_short_open_open_mask=can_short_open_open_mask,
             force_short_cover_mask=force_short_cover_mask,
             force_exit_mask=force_exit_mask,
             sample_mask=sample_mask,
@@ -1185,6 +1327,12 @@ def risk_aware_loss(
             execution_mode=execution_mode,
             buy_fee_rates=buy_fee_rates,
             sell_fee_rates=sell_fee_rates,
+            commission_rebate_rates=commission_rebate_rates,
+            commission_rebate_timing=commission_rebate_timing,
+            session_month_ids=session_month_ids,
+            commission_rebate_payment_eligible_mask=(
+                commission_rebate_payment_eligible_mask
+            ),
             settlement_lag_sessions=settlement_lag_sessions,
             day_trade_eligible_mask=day_trade_eligible_mask,
             day_trade_can_buy_open_mask=day_trade_can_buy_open_mask,
@@ -1295,6 +1443,9 @@ def risk_aware_loss(
     initial_cash = None
     initial_payables = None
     initial_receivables = None
+    initial_commission_rebate_current = None
+    initial_commission_rebate_due = None
+    initial_commission_rebate_month_id = None
     initial_equity_scale = None
     initial_short_sale_collateral = None
     initial_short_margin_collateral = None
@@ -1330,6 +1481,32 @@ def risk_aware_loss(
             initial_receivables = _clone_portfolio_state_for_loss(
                 initial_receivables,
                 stat_prefix="initial_receivables_clone",
+            )
+        initial_commission_rebate_current = aux_outputs.get(
+            "initial_commission_rebate_current"
+        )
+        if isinstance(initial_commission_rebate_current, torch.Tensor):
+            initial_commission_rebate_current = _clone_portfolio_state_for_loss(
+                initial_commission_rebate_current,
+                stat_prefix="initial_commission_rebate_current_clone",
+            )
+        initial_commission_rebate_due = aux_outputs.get(
+            "initial_commission_rebate_due"
+        )
+        if isinstance(initial_commission_rebate_due, torch.Tensor):
+            initial_commission_rebate_due = _clone_portfolio_state_for_loss(
+                initial_commission_rebate_due,
+                stat_prefix="initial_commission_rebate_due_clone",
+            )
+        initial_commission_rebate_month_id = aux_outputs.get(
+            "initial_commission_rebate_month_id"
+        )
+        if isinstance(initial_commission_rebate_month_id, torch.Tensor):
+            initial_commission_rebate_month_id = (
+                _clone_portfolio_state_for_loss(
+                    initial_commission_rebate_month_id,
+                    stat_prefix="initial_commission_rebate_month_id_clone",
+                )
             )
         initial_equity_scale = aux_outputs.get("initial_equity_scale")
         if isinstance(initial_equity_scale, torch.Tensor):
@@ -1380,6 +1557,11 @@ def risk_aware_loss(
             if can_short_open_mask is not None
             else None
         ),
+        can_short_open_open_mask=(
+            can_short_open_open_mask.to(dtype=torch.bool, device=weights.device)
+            if can_short_open_open_mask is not None
+            else None
+        ),
         force_short_cover_mask=(
             force_short_cover_mask.to(dtype=torch.bool, device=weights.device)
             if force_short_cover_mask is not None
@@ -1396,6 +1578,12 @@ def risk_aware_loss(
         execution_mode=execution_mode,
         buy_fee_rates=buy_fee_rates,
         sell_fee_rates=sell_fee_rates,
+        commission_rebate_rates=commission_rebate_rates,
+        commission_rebate_timing=commission_rebate_timing,
+        session_month_ids=session_month_ids,
+        commission_rebate_payment_eligible_mask=(
+            commission_rebate_payment_eligible_mask
+        ),
         settlement_lag_sessions=settlement_lag_sessions,
         day_trade_eligible_mask=day_trade_eligible_mask,
         day_trade_can_buy_open_mask=day_trade_can_buy_open_mask,
@@ -1410,10 +1598,14 @@ def risk_aware_loss(
         initial_cash=initial_cash,
         initial_payables=initial_payables,
         initial_receivables=initial_receivables,
+        initial_commission_rebate_current=initial_commission_rebate_current,
+        initial_commission_rebate_due=initial_commission_rebate_due,
+        initial_commission_rebate_month_id=initial_commission_rebate_month_id,
         initial_equity_scale=initial_equity_scale,
         initial_short_sale_collateral=initial_short_sale_collateral,
         initial_short_margin_collateral=initial_short_margin_collateral,
         symbol_indices=symbol_indices,
+        overnight_returns=overnight_log_returns,
     )
     _loss_timer_stop("backtest", backtest_start)
 
@@ -1433,6 +1625,21 @@ def risk_aware_loss(
             ("cash", "_final_cash", backtest.final_cash),
             ("payables", "_final_payables", backtest.final_payables),
             ("receivables", "_final_receivables", backtest.final_receivables),
+            (
+                "commission_rebate_current",
+                "_final_commission_rebate_current",
+                backtest.final_commission_rebate_current,
+            ),
+            (
+                "commission_rebate_due",
+                "_final_commission_rebate_due",
+                backtest.final_commission_rebate_due,
+            ),
+            (
+                "commission_rebate_month_id",
+                "_final_commission_rebate_month_id",
+                backtest.final_commission_rebate_month_id,
+            ),
             ("equity_scale", "_final_equity_scale", backtest.final_equity_scale),
             (
                 "short_sale_collateral",

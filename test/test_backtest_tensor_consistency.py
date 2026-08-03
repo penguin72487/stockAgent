@@ -2100,9 +2100,14 @@ def test_tw_cash_loss_probe_supplies_unlimited_capacity_and_margin_contract() ->
     panel = _make_panel(rows=9, symbols=4, features=3)
     shape = panel.tradable_mask.shape
     panel.can_short_open_mask = np.ones(shape, dtype=np.bool_)
+    panel.can_short_open_open_mask = np.ones(shape, dtype=np.bool_)
     panel.short_capacity_shares = np.zeros(shape, dtype=np.int64)
     panel.short_margin_rate = np.full(shape, 0.9, dtype=np.float32)
     panel.raw_close_returns_1d = np.asarray(panel.returns_1d, dtype=np.float32)
+    panel.open_prices = np.asarray(panel.close_prices, dtype=np.float32).copy()
+    panel.intraday_returns = np.zeros(shape, dtype=np.float32)
+    panel.day_trade_can_buy_open_mask = np.ones(shape, dtype=np.bool_)
+    panel.day_trade_can_sell_open_mask = np.ones(shape, dtype=np.bool_)
     panel.unresolved_corporate_action_mask = np.zeros(shape, dtype=np.bool_)
     dataset = CrossSectionalDataset(
         panel,
@@ -2131,7 +2136,10 @@ def test_tw_cash_loss_probe_supplies_unlimited_capacity_and_margin_contract() ->
     ) -> torch.Tensor:
         del tradable
         captured.update(kwargs)
-        return (weights.square() + weights * returns).mean()
+        return (
+            weights.square()
+            + weights * returns.unsqueeze(1)
+        ).mean()
 
     ok, error = _probe_compiled_loss_forward_backward(
         loss_fn,
@@ -2151,17 +2159,48 @@ def test_tw_cash_loss_probe_supplies_unlimited_capacity_and_margin_contract() ->
     margin = captured["short_margin_rate"]
     assert isinstance(capacity, torch.Tensor)
     assert capacity.shape == (4, panel.num_symbols)
-    assert torch.isfinite(capacity).all()
-    assert torch.equal(
-        capacity,
-        torch.ones_like(capacity),
-    )
+    assert torch.isposinf(capacity).all()
     assert isinstance(margin, torch.Tensor)
     assert torch.equal(margin, torch.full_like(margin, 0.9))
     aux = captured["aux_outputs"]
     assert isinstance(aux, dict)
     assert aux["initial_short_sale_collateral"].shape == (panel.num_symbols,)
     assert aux["initial_short_margin_collateral"].shape == (panel.num_symbols,)
+
+
+def test_compiled_loss_probe_rejects_nonfinite_action_gradients() -> None:
+    panel = _make_panel(rows=9, symbols=4, features=3)
+    dataset = CrossSectionalDataset(panel, np.arange(panel.num_dates), lookback=3)
+    split = _pad_windowed_training_split(
+        dataset_to_windowed_tensors(dataset),
+        batch_size=4,
+    )
+
+    def loss_fn(
+        weights: torch.Tensor,
+        _returns: torch.Tensor,
+        _tradable: torch.Tensor,
+        **_kwargs,
+    ) -> torch.Tensor:
+        # Forward is exactly finite at the all-zero probe input, while the
+        # derivative of sqrt at zero is positive infinity.
+        return torch.sqrt(weights).sum()
+
+    ok, error = _probe_compiled_loss_forward_backward(
+        loss_fn,
+        split,
+        batch_size=4,
+        device=torch.device("cpu"),
+        amp_dtype=None,
+        non_blocking=False,
+        loss_kwargs={},
+        max_volume_participation=0.0,
+        volume_participation_equity=1_000_000.0,
+    )
+
+    assert not ok
+    assert error is not None
+    assert "non-finite model-action gradients" in error
 
 
 def test_compiled_loss_probe_reproduces_ddp_gathered_inputs(monkeypatch) -> None:
@@ -2210,9 +2249,9 @@ def test_compiled_loss_probe_reproduces_ddp_gathered_inputs(monkeypatch) -> None
     )
 
     assert ok, error
-    # The real-settlement graph also gathers the per-row session clock so the
-    # compile probe exactly matches the first DDP loss invocation.
-    assert gather_calls == {"autograd": 1, "no_grad": 12}
+    # The real-settlement graph also gathers the per-row session clock plus
+    # rebate month/payment calendar so the probe matches the first DDP loss.
+    assert gather_calls == {"autograd": 1, "no_grad": 16}
     assert captured["weights"].shape == (4, panel.num_symbols)
     assert captured["returns"].shape == captured["weights"].shape
     assert captured["tradable"].shape == captured["weights"].shape
@@ -2678,6 +2717,11 @@ def test_panel_history_hands_new_year_first_target_to_new_model() -> None:
         alive_mask=mask.copy(),
         benchmark_returns=np.zeros((rows,), dtype=np.float32),
         close_prices=np.ones((rows, 2), dtype=np.float32),
+        open_prices=np.ones((rows, 2), dtype=np.float32),
+        intraday_returns=np.ones((rows, 2), dtype=np.float32) * 0.001,
+        day_trade_can_buy_open_mask=mask.copy(),
+        day_trade_can_sell_open_mask=mask.copy(),
+        can_short_open_open_mask=mask.copy(),
         unresolved_corporate_action_mask=np.zeros((rows, 2), dtype=bool),
     )
     folds = build_expanding_year_folds(
@@ -3541,6 +3585,28 @@ def test_eval_backtest_compile_never_builds_one_shot_history_graph(
     )
 
 
+def test_volume_limit_weights_fail_closed_for_invalid_notional() -> None:
+    notional = torch.tensor(
+        [[1_000_000.0, float("nan"), float("inf"), -1.0]],
+        dtype=torch.float32,
+    )
+
+    cap = trainer_module._volume_limit_weights_from_notional(
+        notional,
+        max_volume_participation=0.5,
+        volume_participation_equity=1_000_000.0,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+
+    assert cap is not None
+    torch.testing.assert_close(
+        cap,
+        torch.tensor([[0.5, 0.0, 0.0, 0.0]], dtype=torch.float32),
+    )
+    assert torch.isfinite(cap).all()
+
+
 def test_compiled_panel_slab_eval_uses_separate_eager_wrapper() -> None:
     source = inspect.getsource(trainer_module.run_training)
     assert "eval_panel_slab_model = _PanelSlabForwardWrapper(model)" in source
@@ -3705,6 +3771,9 @@ def test_eval_padding_rows_copy_last_valid_mask_for_no_fallback_attention() -> N
 
 def test_windowed_shared_base_cache_preserves_batches_without_copying_base() -> None:
     panel = _make_panel(rows=12, symbols=4, features=3)
+    panel.can_short_open_open_mask = (
+        np.indices((panel.num_dates, panel.num_symbols)).sum(axis=0) % 3 == 0
+    )
     first_ds = CrossSectionalDataset(panel, torch.arange(0, 8).numpy(), lookback=3)
     second_ds = CrossSectionalDataset(panel, torch.arange(4, 12).numpy(), lookback=3)
     first = dataset_to_windowed_tensors(first_ds)
@@ -3722,6 +3791,10 @@ def test_windowed_shared_base_cache_preserves_batches_without_copying_base() -> 
     assert shared is not None
     assert shared.features.data_ptr() == first.features.data_ptr()
     assert shared.future_log_returns.data_ptr() == first.future_log_returns.data_ptr()
+    assert (
+        shared.can_short_open_open_mask.data_ptr()
+        == first.can_short_open_open_mask.data_ptr()
+    )
     assert shared.valid_indices.data_ptr() != first.valid_indices.data_ptr()
 
     expected = second.batch_by_rows(0, len(second), torch.device("cpu"), non_blocking=False)
