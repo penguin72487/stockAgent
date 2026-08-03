@@ -1,0 +1,46 @@
+base_config: tw_public_lanten_market.yaml
+
+# Research-only close-price approximation with 256 completed panel sessions.
+# The naive executor is intentionally distinct from the point-in-time P2/P3
+# Taiwan ledgers and therefore owns a separate checkpoint/artifact contract.
+experiment_name: tw-transformer-market-public-naive-lookback256
+
+runner:
+  # Fold 8-20 are retrained from scratch under one bucket512 compile contract.
+  # Keep the earlier mixed-fingerprint artifacts intact for audit/recovery.
+  output_dir: artifacts/markets/tw_public_lanten_market_naive_lookback256
+  resume: true
+  start_fold: 1
+
+data:
+  # Keep 2005 as feature context. Target-owning folds begin in 2006 so their
+  # first target can read 256 already-observed sessions without projecting the
+  # later universe or any future feature backward.
+  panel_start_date: "2005-01-01"
+
+walk_forward:
+  expected_first_year: 2005
+  split_start_year: 2006
+  lookback_context: panel_history
+
+trading:
+  # Explicitly select the research approximation: target weights execute with
+  # the legacy close-to-close tensor return/fee contract, without T+2 cash,
+  # lot-size, auction, eligibility, or settlement-state accounting.
+  execution_mode: naive
+
+training:
+  lookback: 256
+  # Expanding train_union otherwise creates one static compiled model graph per
+  # yearly symbol width and exhausts Dynamo's eight-graph recompile limit.
+  # Bucket only the tensor width; padded symbols stay fully masked and therefore
+  # cannot affect attention, positions, loss, fees, or checkpoint symbol maps.
+  train_symbol_compaction_bucket_size: 512
+  # Lookback 256 has roughly eight times the temporal activation footprint of
+  # lookback 32. These global sizes become local 16/8 under two-rank DDP and are
+  # a conservative 32 GiB-per-GPU starting point; tune only after measuring
+  # epoch 2+ VRAM and complete-workflow throughput.
+  batch_size_train: 32
+  batch_size_eval: 16
+  eval_model_chunk_rows: 16
+  eval_auto_chunk_rows_cap: 16

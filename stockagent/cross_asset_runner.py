@@ -324,14 +324,55 @@ def _fold_row_weights(
     panel: PanelData,
     *,
     lookback: int,
+    execution_mode: str = "naive",
+    lookback_context: str = "split_only",
+    short_capacity_limit_enabled: bool = True,
+    tw_corporate_action_mode: str = "avoid",
 ) -> dict[int, int]:
+    resolved_lookback = int(lookback)
+    if resolved_lookback <= 0:
+        raise ValueError(f"lookback must be positive, got {lookback!r}")
+    if not hasattr(panel, "tradable_mask"):
+        # Preserve the lightweight dates-only scheduling contract used by
+        # callers that do not own a materialized PanelData instance. Real
+        # runs use the dataset-backed estimator below so execution masks and
+        # panel-history target ownership remain exact.
+        phase_feature_lag = (
+            0 if str(execution_mode).strip().lower() == "naive" else 1
+        )
+        panel_dates = np.asarray(panel.dates, dtype="datetime64[D]")
+        weights: dict[int, int] = {}
+        for fold_id in fold_ids:
+            fold = folds_by_id[int(fold_id)]
+            indices = np.asarray(fold.test_indices, dtype=np.int64)
+            if indices.size == 0:
+                weights[int(fold_id)] = 0
+                continue
+            years = panel_dates[indices].astype("datetime64[Y]")
+            first_year_indices = indices[years == years.min()]
+            history_origin = (
+                0
+                if str(lookback_context).strip().lower() == "panel_history"
+                else int(first_year_indices[0])
+            )
+            min_valid_index = (
+                history_origin + resolved_lookback - 1 + phase_feature_lag
+            )
+            weights[int(fold_id)] = int(
+                np.count_nonzero(first_year_indices >= min_valid_index)
+            )
+        return weights
     return {
         int(fold_id): int(
             _estimated_first_test_year_explain_rows(
                 folds_by_id[int(fold_id)],
                 panel,
-                lookback=int(lookback),
+                lookback=resolved_lookback,
                 max_rows=0,
+                execution_mode=execution_mode,
+                lookback_context=lookback_context,
+                short_capacity_limit_enabled=short_capacity_limit_enabled,
+                tw_corporate_action_mode=tw_corporate_action_mode,
             )
         )
         for fold_id in fold_ids
@@ -448,14 +489,34 @@ def _run_fold(
         device,
         strict=bool(args.strict),
     )
+    dataset_kwargs: dict[str, Any] = {}
+    trading_config = getattr(config, "trading", None)
+    if trading_config is not None:
+        dataset_kwargs.update(
+            execution_mode=getattr(trading_config, "execution_mode", "naive"),
+            short_capacity_limit_enabled=getattr(
+                trading_config,
+                "tw_short_capacity_limit_enabled",
+                True,
+            ),
+            tw_corporate_action_mode=getattr(
+                trading_config,
+                "tw_corporate_action_mode",
+                "avoid",
+            ),
+        )
+    walk_forward_config = getattr(config, "walk_forward", None)
+    if walk_forward_config is not None:
+        dataset_kwargs["lookback_context"] = getattr(
+            walk_forward_config,
+            "lookback_context",
+            "split_only",
+        )
     dataset = _first_test_year_dataset(
         fold_panel,
         fold,
         config.training.lookback,
-        execution_mode=config.trading.execution_mode,
-        lookback_context=config.walk_forward.lookback_context,
-        short_capacity_limit_enabled=config.trading.tw_short_capacity_limit_enabled,
-        tw_corporate_action_mode=config.trading.tw_corporate_action_mode,
+        **dataset_kwargs,
     )
     split_rows = len(dataset)
     batch_source = _sample_dataset_source(
@@ -600,6 +661,10 @@ def _run(args: argparse.Namespace) -> None:
         folds_by_id,
         panel,
         lookback=config.training.lookback,
+        execution_mode=config.trading.execution_mode,
+        lookback_context=config.walk_forward.lookback_context,
+        short_capacity_limit_enabled=config.trading.tw_short_capacity_limit_enabled,
+        tw_corporate_action_mode=config.trading.tw_corporate_action_mode,
     )
     assignments, estimated_loads = _lpt_fold_assignments(
         selected_fold_ids,

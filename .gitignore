@@ -212,4 +212,6 @@ data_tw_public/*
 codex/*
 data_openBB/*
 data_tw_microstructure/*
+data_tw_index_futures/*
 .env.trade.example
+data_tw_minute/*

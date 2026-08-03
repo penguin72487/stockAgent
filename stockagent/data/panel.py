@@ -122,7 +122,9 @@ BASE_PANEL_FEATURE_COLUMNS = [
 # termination date itself has no executable quote.
 # v50 resolves that terminal liquidation only after every buy/sell side rule is
 # known, and stores immutable logical-array fingerprints in the panel cache.
-PANEL_CACHE_VERSION = 50
+# v51 separates opening- and closing-auction short-open masks and keeps the
+# official inventory headroom independent of later close-side execution facts.
+PANEL_CACHE_VERSION = 51
 # v2 distinguishes the cumulative corporate-action archive coverage from the
 # latest incremental downloader request.  Keep this in the backend contract so
 # panels built with the old requested_start_year interpretation are never
@@ -279,7 +281,15 @@ class PanelData:
     daily_volumes: np.ndarray | None = None
     can_buy_mask: np.ndarray | None = None
     can_sell_mask: np.ndarray | None = None
+    # New/increased short eligibility at the closing auction.  This may use
+    # session-t close execution facts such as the realized limit-down state.
     can_short_open_mask: np.ndarray | None = None
+    # New/increased short eligibility at the opening auction.  This is a
+    # distinct point-in-time contract: it may use open[t] but must never be
+    # reconstructed from can_short_open_mask/can_sell_mask, both of which can
+    # contain information first known at close[t].  None means unavailable;
+    # carrying-mode consumers must fail closed.
+    can_short_open_open_mask: np.ndarray | None = None
     force_short_cover_mask: np.ndarray | None = None
     force_exit_mask: np.ndarray | None = None
     open_prices: np.ndarray | None = None
@@ -371,6 +381,7 @@ def _slice_panel_start(panel: PanelData, panel_start_date: np.datetime64 | None)
         can_buy_mask=sliced(panel.can_buy_mask),
         can_sell_mask=sliced(panel.can_sell_mask),
         can_short_open_mask=sliced(panel.can_short_open_mask),
+        can_short_open_open_mask=sliced(panel.can_short_open_open_mask),
         force_short_cover_mask=sliced(panel.force_short_cover_mask),
         force_exit_mask=sliced(panel.force_exit_mask),
         short_capacity_shares=sliced(panel.short_capacity_shares),
@@ -3095,6 +3106,14 @@ def _apply_corporate_action_avoidance_transitions(
                 else can_sell,
                 dtype=bool,
             ).copy()
+            can_short_open_open = (
+                None
+                if panel.can_short_open_open_mask is None
+                else np.asarray(
+                    panel.can_short_open_open_mask,
+                    dtype=bool,
+                ).copy()
+            )
             legal_cover_events = 0
             conservative_cover_events = 0
             known_short_events: dict[str, set[int]] = {}
@@ -3124,6 +3143,14 @@ def _apply_corporate_action_avoidance_transitions(
                 can_short_open[
                     cover_row : min(int(ban_end), int(panel_dates.size)), sym_idx
                 ] = False
+                if can_short_open_open is not None:
+                    can_short_open_open[
+                        cover_row : min(
+                            int(ban_end),
+                            int(panel_dates.size),
+                        ),
+                        sym_idx,
+                    ] = False
                 return True
 
             for symbol, (event_dates, stop_transfer_dates) in short_terms.items():
@@ -3194,6 +3221,7 @@ def _apply_corporate_action_avoidance_transitions(
 
             panel.force_short_cover_mask = force_short_cover
             panel.can_short_open_mask = can_short_open
+            panel.can_short_open_open_mask = can_short_open_open
             print(
                 "[panel] applied corporate-action margin-short rules "
                 f"mops_article76={legal_cover_events} "
@@ -3634,6 +3662,11 @@ def _apply_external_rule_masks(panel: PanelData, external_features: _ExternalFea
         panel.can_short_open_mask if panel.can_short_open_mask is not None else can_sell,
         dtype=bool,
     ).copy()
+    can_short_open_open = (
+        np.asarray(panel.can_short_open_open_mask, dtype=bool).copy()
+        if panel.can_short_open_open_mask is not None
+        else np.zeros_like(panel.tradable_mask, dtype=bool)
+    )
     margin_short_rules_available = (
         margin_short_evidence_idx is not None and short_capacity_idx is not None
     )
@@ -3642,6 +3675,7 @@ def _apply_external_rule_masks(panel: PanelData, external_features: _ExternalFea
         # evidence.  An all-null or partially generated rule schema is still a
         # declared margin contract, so every symbol/date remains false/zero.
         can_short_open = np.zeros_like(panel.tradable_mask, dtype=bool)
+        can_short_open_open = np.zeros_like(panel.tradable_mask, dtype=bool)
         short_capacity_shares: np.ndarray | None = np.zeros(
             panel.tradable_mask.shape,
             dtype=np.int64,
@@ -3734,6 +3768,7 @@ def _apply_external_rule_masks(panel: PanelData, external_features: _ExternalFea
             # eligible security; the capacity tensor blocks it only when the
             # account configuration enables the inventory ceiling.
             can_short_open[:, sym_idx] = next_session_valid
+            can_short_open_open[:, sym_idx] = next_session_valid
             short_capacity_shares[:, sym_idx] = next_session_capacity
         if day_trade_eligible_idx is not None and day_trade_eligible is not None:
             eligibility_values = aligned_rules[:, day_trade_eligible_idx]
@@ -3760,10 +3795,12 @@ def _apply_external_rule_masks(panel: PanelData, external_features: _ExternalFea
                 day_trade_can_buy_open[halted, sym_idx] = False
                 day_trade_can_sell_open[halted, sym_idx] = False
                 can_short_open[halted, sym_idx] = False
+                can_short_open_open[halted, sym_idx] = False
                 panel.returns_1d[halted, sym_idx] = 0.0
         if short_ban_idx is not None:
             short_banned = np.isfinite(aligned_rules[:, short_ban_idx]) & (aligned_rules[:, short_ban_idx] > 0.0)
             can_short_open[short_banned, sym_idx] = False
+            can_short_open_open[short_banned, sym_idx] = False
             if day_trade_short_open is not None:
                 day_trade_short_open[short_banned, sym_idx] = False
         delisted_rows = np.empty((0,), dtype=np.int64)
@@ -3848,6 +3885,7 @@ def _apply_external_rule_masks(panel: PanelData, external_features: _ExternalFea
                     day_trade_can_buy_open[suspended, sym_idx] = False
                     day_trade_can_sell_open[suspended, sym_idx] = False
                     can_short_open[suspended, sym_idx] = False
+                    can_short_open_open[suspended, sym_idx] = False
                     panel.returns_1d[suspended, sym_idx] = 0.0
         if delisted_rows.size:
             panel.tradable_mask[delisted_blocked, sym_idx] = False
@@ -3856,6 +3894,7 @@ def _apply_external_rule_masks(panel: PanelData, external_features: _ExternalFea
             day_trade_can_buy_open[delisted_blocked, sym_idx] = False
             day_trade_can_sell_open[delisted_blocked, sym_idx] = False
             can_short_open[delisted_blocked, sym_idx] = False
+            can_short_open_open[delisted_blocked, sym_idx] = False
         close_ret = _safe_log_ratio_array(close_prices[:, sym_idx], _shift_array(close_prices[:, sym_idx], 1))
         open_ret = _safe_log_ratio_array(
             np.asarray(panel.open_prices[:, sym_idx], dtype=np.float64),
@@ -4002,6 +4041,7 @@ def _apply_external_rule_masks(panel: PanelData, external_features: _ExternalFea
                 can_buy[block_start:block_end, sym_idx] = False
                 can_sell[block_start:block_end, sym_idx] = False
                 can_short_open[block_start:block_end, sym_idx] = False
+                can_short_open_open[block_start:block_end, sym_idx] = False
                 day_trade_can_buy_open[block_start:block_end, sym_idx] = False
                 day_trade_can_sell_open[block_start:block_end, sym_idx] = False
 
@@ -4010,10 +4050,16 @@ def _apply_external_rule_masks(panel: PanelData, external_features: _ExternalFea
             "[panel] external TW public limit rules updated masks "
             f"(blocked_buy={changed_buy}, blocked_sell={changed_sell})"
         )
+    # The close and open auctions have different observable execution facts.
+    # Keep the common official eligibility/capacity oracle phase-neutral, then
+    # gate each phase with only the quote state known by that auction.
     effective_short_open = can_short_open & can_sell
+    effective_short_open_at_open = (
+        can_short_open_open & day_trade_can_sell_open
+    )
     if short_capacity_shares is not None:
         short_capacity_shares = np.where(
-            effective_short_open,
+            can_short_open | can_short_open_open,
             short_capacity_shares,
             0,
         ).astype(np.int64, copy=False)
@@ -4027,6 +4073,7 @@ def _apply_external_rule_masks(panel: PanelData, external_features: _ExternalFea
         can_buy_mask=can_buy,
         can_sell_mask=can_sell,
         can_short_open_mask=effective_short_open,
+        can_short_open_open_mask=effective_short_open_at_open,
         force_short_cover_mask=force_short_cover,
         force_exit_mask=force_exit,
         short_capacity_shares=short_capacity_shares,
@@ -4156,6 +4203,11 @@ def _load_panel_cache(cache_path: Path) -> PanelData:
     can_buy_mask = cached["can_buy_mask"] if "can_buy_mask" in cached_keys else tradable_mask
     can_sell_mask = cached["can_sell_mask"] if "can_sell_mask" in cached_keys else tradable_mask
     can_short_open_mask = cached["can_short_open_mask"] if "can_short_open_mask" in cached_keys else can_sell_mask
+    can_short_open_open_mask = (
+        cached["can_short_open_open_mask"]
+        if "can_short_open_open_mask" in cached_keys
+        else None
+    )
     force_short_cover_mask = (
         cached["force_short_cover_mask"]
         if "force_short_cover_mask" in cached_keys
@@ -4226,6 +4278,7 @@ def _load_panel_cache(cache_path: Path) -> PanelData:
         can_buy_mask=can_buy_mask,
         can_sell_mask=can_sell_mask,
         can_short_open_mask=can_short_open_mask,
+        can_short_open_open_mask=can_short_open_open_mask,
         force_short_cover_mask=force_short_cover_mask,
         force_exit_mask=force_exit_mask,
         short_capacity_shares=short_capacity_shares,
@@ -4265,6 +4318,7 @@ def _panel_from_cache_payload(payload: dict) -> PanelData:
     can_buy_mask = payload.get("can_buy_mask", tradable_mask)
     can_sell_mask = payload.get("can_sell_mask", tradable_mask)
     can_short_open_mask = payload.get("can_short_open_mask", can_sell_mask)
+    can_short_open_open_mask = payload.get("can_short_open_open_mask")
     force_short_cover_mask = payload.get("force_short_cover_mask", np.zeros_like(tradable_mask, dtype=bool))
     force_exit_mask = payload.get(
         "force_exit_mask", np.zeros_like(tradable_mask, dtype=bool)
@@ -4281,6 +4335,7 @@ def _panel_from_cache_payload(payload: dict) -> PanelData:
         can_buy_mask=can_buy_mask,
         can_sell_mask=can_sell_mask,
         can_short_open_mask=can_short_open_mask,
+        can_short_open_open_mask=can_short_open_open_mask,
         force_short_cover_mask=force_short_cover_mask,
         force_exit_mask=force_exit_mask,
         short_capacity_shares=payload.get("short_capacity_shares"),
@@ -4451,6 +4506,7 @@ def _filter_panel_features(
         can_buy_mask=panel.can_buy_mask,
         can_sell_mask=panel.can_sell_mask,
         can_short_open_mask=panel.can_short_open_mask,
+        can_short_open_open_mask=panel.can_short_open_open_mask,
         force_short_cover_mask=panel.force_short_cover_mask,
         force_exit_mask=panel.force_exit_mask,
         short_capacity_shares=panel.short_capacity_shares,

@@ -1,0 +1,31 @@
+base_config: tw_public_lanten_market_candles_day_trade_2006plus.yaml
+
+# Shared contract for the classic-model comparison.  Model-specific files only
+# override capacity/lookback; targets, point-in-time masks, fees and settlement
+# remain inherited from the causal open-aware tw_day_trade experiment.
+runner:
+  resume: true
+  # Training already evaluates the saved best checkpoint and writes the full
+  # fold/walk-forward plot set. Avoid a duplicate inference pass per model.
+  post_train_infer: false
+
+training:
+  multi_gpu_strategy: none
+  epochs: 30
+  early_stopping_no_improve_ratio: 0.2
+  batch_size_train: 16
+  batch_size_eval: 16
+  enable_torch_compile: true
+  compile_eval_model: true
+  cache_train_tensors_on_gpu: true
+  cache_eval_tensors_on_gpu: true
+  curve_plot_async: false
+  defer_epoch_curve_plot_until_end: true
+  explain_after_each_fold: false
+  save_best_val_artifacts: true
+  learning_rate: 0.0003
+  enable_lr_scheduler: true
+  lr_scheduler: plateau
+  lr_scheduler_patience: 3
+  lr_scheduler_gamma: 0.5
+  weight_decay: 0.01

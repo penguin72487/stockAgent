@@ -1,0 +1,50 @@
+# Stock cross-section -> one signed TAIEX exposure -> TX/MTX/TMF integer basket.
+#
+# Timing contract:
+# - At 08:45 on futures session t, the model may read stock data only through
+#   the completed stock session t-1.
+# - The basket enters at the day-session open and is fully flattened at the
+#   day-session close. It carries no night-session exposure.
+# - TX/MTX/TMF are sizing instruments for one underlying direction; they are
+#   not three independent alpha heads.
+base_experiment_config: tw_public_lanten_market.yaml
+futures_data_path: ../../data_tw_index_futures/day_session_front_month.parquet
+output_dir: ../../artifacts/markets/tw_index_futures_day
+
+reference_product: TX
+initial_capital: 1000000.0
+max_abs_exposure: 1.0
+
+# Differentiable training proxy. At TWD 1m, 0.00009 approximates the official
+# round-trip futures tax plus two MTX exchange/clearing fees. Negotiated broker
+# commission remains account-specific and is applied only by the exact integer
+# evaluator below.
+continuous_round_trip_cost_rate: 0.00009
+
+# Official TAIFEX exchange + clearing charges, in TX/MTX/TMF order, per side.
+exchange_and_clearing_fee_per_side_twd: [20.0, 12.5, 8.0]
+# Replace these zeros with the account's actual negotiated per-side commission
+# before treating any backtest result as execution-ready.
+broker_fee_per_side_twd: [0.0, 0.0, 0.0]
+slippage_points_per_side: [0.0, 0.0, 0.0]
+basket_fee_penalty: 1.0
+
+epochs: 50
+batch_size: 32
+eval_batch_size: 64
+learning_rate: 0.0003
+weight_decay: 0.0001
+start_fold: 1
+max_folds: null
+seed: 42
+enable_torch_compile: true
+
+model_overrides:
+  attention_mode: market_token
+  use_latent_factors: false
+  use_market_tokens: true
+  temporal_pooling: attention
+  temporal_query_mode: full_then_last
+  portfolio_output_mode: logits
+  return_aux: false
+  return_aux_details: false

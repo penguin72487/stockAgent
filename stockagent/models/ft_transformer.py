@@ -7,18 +7,25 @@ from stockagent.models.normalization import dual_branch_softmax, masked_softmax,
 
 
 class _FeatureTokenizer(nn.Module):
-    """Tokenize continuous tabular features into per-feature embeddings."""
+    """Tokenize each feature's complete causal history into one embedding."""
 
-    def __init__(self, num_input_features: int, d_token: int) -> None:
+    def __init__(self, lookback: int, num_features: int, d_token: int) -> None:
         super().__init__()
-        self.weight = nn.Parameter(torch.empty(num_input_features, d_token))
-        self.bias = nn.Parameter(torch.empty(num_input_features, d_token))
+        self.lookback = int(lookback)
+        self.num_features = int(num_features)
+        self.weight = nn.Parameter(torch.empty(num_features, lookback, d_token))
+        self.bias = nn.Parameter(torch.empty(num_features, d_token))
         nn.init.xavier_uniform_(self.weight)
         nn.init.zeros_(self.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [N, D] -> tokens: [N, D, d_token]
-        return x.unsqueeze(-1) * self.weight.unsqueeze(0) + self.bias.unsqueeze(0)
+        # x: [N, lookback, features] -> tokens: [N, features, d_token]
+        if x.ndim != 3 or int(x.size(1)) != self.lookback or int(x.size(2)) != self.num_features:
+            raise ValueError(
+                "Feature tokenizer shape mismatch: expected "
+                f"[N,{self.lookback},{self.num_features}], got {tuple(x.shape)}"
+            )
+        return torch.einsum("nlf,fld->nfd", x, self.weight) + self.bias.unsqueeze(0)
 
 
 class CrossSectionalFTTransformer(nn.Module):
@@ -37,7 +44,7 @@ class CrossSectionalFTTransformer(nn.Module):
         long_only: bool = True,
         portfolio_activation: str = "identity",
         use_cls_token: bool = True,
-        max_encoder_batch_rows: int = 60000,
+        max_encoder_batch_rows: int = 8192,
     ) -> None:
         super().__init__()
         input_dim = int(lookback) * int(num_features)
@@ -54,7 +61,12 @@ class CrossSectionalFTTransformer(nn.Module):
         self.portfolio_activation = normalize_portfolio_activation(portfolio_activation)
         self.use_cls_token = bool(use_cls_token)
         self.max_encoder_batch_rows = max(1, int(max_encoder_batch_rows))
-        self.tokenizer = _FeatureTokenizer(num_input_features=input_dim, d_token=d_token)
+        self.num_features = int(num_features)
+        self.tokenizer = _FeatureTokenizer(
+            lookback=self.lookback,
+            num_features=self.num_features,
+            d_token=d_token,
+        )
 
         if self.use_cls_token:
             self.cls_token = nn.Parameter(torch.zeros(1, 1, d_token))
@@ -81,17 +93,20 @@ class CrossSectionalFTTransformer(nn.Module):
             nn.Linear(d_token, 1),
         )
 
-    def _encode_tokens_chunked(self, tokens: torch.Tensor) -> torch.Tensor:
-        """Run transformer encoder in chunks to avoid CUDA SDP batch-index limits."""
+    def _score_tokens_chunked(self, tokens: torch.Tensor) -> torch.Tensor:
+        """Encode and score row chunks without retaining a giant encoded tensor."""
         row_count = int(tokens.size(0))
-        if row_count <= self.max_encoder_batch_rows:
-            return self.encoder(tokens)
-
-        encoded_chunks: list[torch.Tensor] = []
+        score_chunks: list[torch.Tensor] = []
         for start in range(0, row_count, self.max_encoder_batch_rows):
             end = min(start + self.max_encoder_batch_rows, row_count)
-            encoded_chunks.append(self.encoder(tokens[start:end]))
-        return torch.cat(encoded_chunks, dim=0)
+            chunk = tokens[start:end]
+            encoded = self.encoder(chunk)
+            if self.use_cls_token:
+                symbol_repr = encoded[:, 0, :]
+            else:
+                symbol_repr = encoded.mean(dim=1)
+            score_chunks.append(self.head(symbol_repr).squeeze(-1))
+        return torch.cat(score_chunks, dim=0)
 
     def forward(self, x: torch.Tensor, tradable_mask: torch.Tensor | None = None) -> torch.Tensor:
         # x: [B, lookback, S, F]
@@ -101,21 +116,17 @@ class CrossSectionalFTTransformer(nn.Module):
         if num_symbols != self.num_symbols:
             raise ValueError(f"Expected num_symbols={self.num_symbols}, got {num_symbols}")
 
-        # Flatten temporal-feature axis per symbol, then run FT-Transformer independently per symbol.
-        x_flat = x.permute(0, 2, 1, 3).reshape(bsz * num_symbols, lookback * num_features)
-        tokens = self.tokenizer(x_flat)
+        # One token per feature, with its full causal lookback projected into
+        # the token embedding. This retains all observations while changing
+        # attention complexity from O((L*F)^2) to O(F^2).
+        x_history = x.permute(0, 2, 1, 3).reshape(bsz * num_symbols, lookback, num_features)
+        tokens = self.tokenizer(x_history)
 
         if self.use_cls_token and self.cls_token is not None:
             cls = self.cls_token.expand(tokens.size(0), -1, -1)
             tokens = torch.cat((cls, tokens), dim=1)
 
-        encoded = self._encode_tokens_chunked(tokens)
-        if self.use_cls_token:
-            symbol_repr = encoded[:, 0, :]
-        else:
-            symbol_repr = encoded.mean(dim=1)
-
-        logits = self.head(symbol_repr).reshape(bsz, num_symbols)
+        logits = self._score_tokens_chunked(tokens).reshape(bsz, num_symbols)
 
         if self.long_only:
             return masked_softmax(logits, tradable_mask, activation=self.portfolio_activation)

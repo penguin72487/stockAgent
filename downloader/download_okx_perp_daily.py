@@ -21,7 +21,17 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from common import describe_rate_limit, resolve_end_date, resolve_request_interval, run_parallel_tasks
+from common import (  # noqa: E402
+    describe_rate_limit,
+    resolve_end_date,
+    resolve_request_interval,
+    run_parallel_tasks,
+)
+from okx_historical_features import (  # noqa: E402
+    feature_catalog_payload,
+    result_rows as historical_feature_result_rows,
+    run_historical_feature_downloads,
+)
 
 
 BASE_URL = "https://www.okx.com"
@@ -66,6 +76,8 @@ class SymbolRecord:
     quote_ccy: str | None
     settle_ccy: str | None
     ct_type: str | None
+    inst_family: str | None
+    uly: str | None
     state: str | None
     list_time: str | None
 
@@ -114,6 +126,28 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-retries", type=int, default=8, help="Max retries per HTTP request")
     parser.add_argument("--retry-base", type=float, default=0.6, help="Base seconds for exponential backoff")
+    parser.add_argument(
+        "--skip-historical-features",
+        action="store_true",
+        help=(
+            "Download only canonical 15m candles. By default, point-in-time "
+            "reconstructable OKX historical features are also updated."
+        ),
+    )
+    parser.add_argument(
+        "--skip-funding-archive",
+        action="store_true",
+        help=(
+            "Skip OKX monthly historical funding ZIP files and use only the "
+            "three-month REST funding history."
+        ),
+    )
+    parser.add_argument(
+        "--feature-workers",
+        type=int,
+        default=None,
+        help="Parallel workers for historical features; defaults to --workers.",
+    )
     return parser.parse_args()
 
 
@@ -221,6 +255,38 @@ class OkxClient:
             raise last_error
         raise RuntimeError("OKX request failed without explicit error")
 
+    def get_bytes(self, url: str) -> bytes:
+        last_error: Exception | None = None
+        for attempt in range(self.max_retries + 1):
+            self._wait_for_slot()
+            req = Request(
+                url,
+                headers={
+                    "User-Agent": "Mozilla/5.0",
+                    "Accept": "application/zip,application/octet-stream,*/*",
+                },
+            )
+            try:
+                with urlopen(req, timeout=60) as response:
+                    return response.read()
+            except HTTPError as exc:
+                last_error = exc
+                if exc.code in {429, 500, 502, 503, 504} and attempt < self.max_retries:
+                    backoff = self.retry_base * (2**attempt)
+                    time.sleep(min(backoff, 30.0))
+                    continue
+                raise
+            except URLError as exc:
+                last_error = exc
+                if attempt < self.max_retries:
+                    backoff = self.retry_base * (2**attempt)
+                    time.sleep(min(backoff, 30.0))
+                    continue
+                raise
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("OKX binary request failed without explicit error")
+
 
 def _ms_to_date_string(ms: int) -> str:
     return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -242,13 +308,42 @@ def _frames_equal(left: pl.DataFrame, right: pl.DataFrame) -> bool:
 def _merge_existing_with_fresh(existing_df: pl.DataFrame, fresh_df: pl.DataFrame, effective_start_ms: int) -> tuple[pl.DataFrame, bool]:
     existing = _normalize_date_frame(existing_df)
     cutoff = _ms_to_date_string(effective_start_ms)
-    kept_existing = existing.filter(pl.col("date") < cutoff) if "date" in existing.columns else existing
-    combined = (
-        pl.concat([kept_existing, fresh_df], how="diagonal_relaxed")
-        .sort("date")
-        .unique(subset=["date"], keep="last", maintain_order=True)
+    kept_existing = (
+        existing.filter(pl.col("date") < cutoff)
+        if "date" in existing.columns
+        else existing
+    )
+    overlap_existing = (
+        existing.filter(pl.col("date") >= cutoff)
+        if "date" in existing.columns
+        else pl.DataFrame()
+    )
+    overlap = pl.concat(
+        [
+            overlap_existing.with_columns(pl.lit(0).alias("__source_priority")),
+            fresh_df.with_columns(pl.lit(1).alias("__source_priority")),
+        ],
+        how="diagonal_relaxed",
+    ).sort(["date", "__source_priority"])
+    value_columns = [
+        column
+        for column in overlap.columns
+        if column not in {"date", "__source_priority"}
+    ]
+    merged_overlap = (
+        overlap.group_by("date", maintain_order=True)
+        .agg(
+            [
+                pl.col(column).drop_nulls().last().alias(column)
+                for column in value_columns
+            ]
+        )
         .sort("date")
     )
+    combined = pl.concat(
+        [kept_existing, merged_overlap],
+        how="diagonal_relaxed",
+    ).sort("date")
     return combined, not _frames_equal(existing, combined)
 
 
@@ -338,6 +433,8 @@ def _fetch_swap_symbols(client: OkxClient, limit: int | None = None) -> list[Sym
                 quote_ccy=item.get("quoteCcy"),
                 settle_ccy=item.get("settleCcy"),
                 ct_type=item.get("ctType"),
+                inst_family=item.get("instFamily"),
+                uly=item.get("uly"),
                 state=item.get("state"),
                 list_time=_ms_to_date_string(int(item["listTime"])) if item.get("listTime") else None,
             )
@@ -578,10 +675,71 @@ def main() -> None:
         on_error=_on_error,
     )
 
+    feature_catalog_path = output_dir / "okx_historical_feature_catalog.json"
+    feature_catalog_path.write_text(
+        json.dumps(feature_catalog_payload(), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    historical_feature_results = []
+    if not args.skip_historical_features:
+        historical_feature_results = run_historical_feature_downloads(
+            client,
+            symbols,
+            output_dir,
+            start_ms=start_ms,
+            end_ms=end_ms,
+            workers=args.feature_workers or args.workers,
+            include_funding_archive=not args.skip_funding_archive,
+        )
+
+    historical_feature_report_path = output_dir / "historical_feature_report.csv"
+    feature_rows = historical_feature_result_rows(historical_feature_results)
+    (
+        pl.DataFrame(feature_rows, infer_schema_length=None)
+        if feature_rows
+        else pl.DataFrame(
+            schema={
+                "code": pl.String,
+                "okx_symbol": pl.String,
+                "status": pl.String,
+                "rows": pl.Int64,
+                "output_path": pl.String,
+                "changed": pl.Boolean,
+                "stage_status_json": pl.String,
+                "coverage_json": pl.String,
+                "errors_json": pl.String,
+            }
+        )
+    ).write_csv(historical_feature_report_path)
+
     report_path = output_dir / "download_report.csv"
     summary_path = output_dir / "download_summary.json"
 
-    result_rows = [asdict(r) for r in results]
+    historical_by_code = {
+        result.code: result for result in historical_feature_results
+    }
+    result_rows = []
+    for result in results:
+        row = asdict(result)
+        historical = historical_by_code.get(result.code)
+        row.update(
+            {
+                "historical_feature_status": (
+                    historical.status if historical is not None else "disabled_or_missing"
+                ),
+                "historical_feature_changed": (
+                    historical.changed if historical is not None else False
+                ),
+                "historical_feature_coverage_json": (
+                    historical.coverage_json if historical is not None else "{}"
+                ),
+                "historical_feature_errors_json": (
+                    historical.errors_json if historical is not None else "{}"
+                ),
+            }
+        )
+        result_rows.append(row)
     result_df = (
         pl.DataFrame(result_rows, infer_schema_length=None).sort(["status", "okx_symbol"])
         if result_rows
@@ -593,6 +751,11 @@ def main() -> None:
     for result in results:
         status_counts[result.status] = status_counts.get(result.status, 0) + 1
         row_count += int(result.rows)
+    historical_status_counts: dict[str, int] = {}
+    for result in historical_feature_results:
+        historical_status_counts[result.status] = (
+            historical_status_counts.get(result.status, 0) + 1
+        )
 
     summary = {
         "asset_class": "crypto_okx_perp",
@@ -600,6 +763,13 @@ def main() -> None:
         "symbol_count": len(symbols),
         "row_count": row_count,
         "status_counts": status_counts,
+        "historical_features_enabled": not args.skip_historical_features,
+        "funding_archive_enabled": (
+            not args.skip_historical_features and not args.skip_funding_archive
+        ),
+        "historical_feature_status_counts": historical_status_counts,
+        "historical_feature_report": str(historical_feature_report_path),
+        "historical_feature_catalog": str(feature_catalog_path),
         "start_date": start_date,
         "end_date": end_date,
     }
@@ -608,6 +778,8 @@ def main() -> None:
     print(f"[okx] symbols.csv -> {symbols_path}")
     print(f"[okx] download_report.csv -> {report_path}")
     print(f"[okx] download_summary.json -> {summary_path}")
+    print(f"[okx] historical_feature_report.csv -> {historical_feature_report_path}")
+    print(f"[okx] okx_historical_feature_catalog.json -> {feature_catalog_path}")
     print(f"[okx] done: {json.dumps(summary, ensure_ascii=False)}")
 
 

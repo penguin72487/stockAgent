@@ -71,6 +71,7 @@ def _day_trade_panel(
         can_buy_mask=mask.copy(),
         can_sell_mask=mask.copy(),
         can_short_open_mask=mask.copy(),
+        can_short_open_open_mask=mask.copy(),
         alive_mask=mask.copy(),
         benchmark_returns=np.zeros(rows, dtype=np.float32),
         close_prices=closes,

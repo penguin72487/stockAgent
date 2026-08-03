@@ -1948,6 +1948,8 @@ def test_tw_cash_compiled_tuple_carries_margin_state_and_separates_cache_contrac
     zero_rows = torch.zeros_like(target)
     zero_state = torch.zeros(2, dtype=torch.float64)
     initial_cash = torch.ones((), dtype=torch.float64)
+    zero_scalar = torch.zeros((), dtype=torch.float64)
+    zero_month_id = torch.zeros((), dtype=torch.int64)
     initial_alive = torch.tensor(True)
     initial_scale = torch.ones((), dtype=torch.float64)
 
@@ -1983,16 +1985,22 @@ def test_tw_cash_compiled_tuple_carries_margin_state_and_separates_cache_contrac
         zero_rows,
         fees,
         fees,
+        fees,
         zero_rows,
         no_force,
         no_force,
         torch.ones(2, dtype=torch.bool),
+        torch.zeros(2, dtype=torch.int64),
+        torch.zeros(2, dtype=torch.bool),
         zero_state,
         initial_cash,
         zero_state,
         zero_state,
         zero_state,
         zero_state,
+        zero_scalar,
+        zero_scalar,
+        zero_month_id,
         initial_alive,
         initial_scale,
     )

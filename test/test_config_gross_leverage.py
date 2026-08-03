@@ -156,13 +156,13 @@ def test_load_config_rejects_permanently_disabled_snapshot_features(
         load_config(config_path)
 
 
-def test_open_aware_feature_requires_day_trade_execution(tmp_path: Path) -> None:
+def test_open_aware_feature_requires_phase_aware_execution(tmp_path: Path) -> None:
     config_path = _write_minimal_config(tmp_path)
     payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     payload["data"]["day_trade_open_feature"] = True
     config_path.write_text(yaml.safe_dump(payload), encoding="utf-8")
 
-    with pytest.raises(ValueError, match="only with trading.execution_mode='tw_day_trade'"):
+    with pytest.raises(ValueError, match="only with a phase-aware Taiwan execution mode"):
         load_config(config_path)
 
 
@@ -762,10 +762,25 @@ def test_tw_public_candles_select_preserves_open_aware_day_trade_contract() -> N
     assert config.training.loss_portfolio_activation == "pre_normalized"
     assert config.trading.portfolio_activation == "pre_normalized"
     assert config.training.multi_gpu_strategy == "auto"
-    assert config.training.batch_size_train == 128
-    assert config.training.batch_size_eval == 128
+    assert config.training.batch_size_train == 64
+    assert config.training.batch_size_eval == 64
     assert config.environment.cpu_threads == 128
     assert config.environment.torch_compile_threads == 16
+
+
+def test_open_aware_long_only_day_trade_uses_non_dead_action_head() -> None:
+    config = load_config(
+        "configs/markets/tw_public_lanten_market_candles_open_aware.yaml"
+    )
+
+    model = config.training.financial_transformer
+    assert config.trading.execution_mode == "tw_day_trade"
+    assert config.trading.long_only is True
+    assert model.portfolio_mode == "long_only"
+    assert model.portfolio_output_mode == "signed_softmax"
+    assert config.training.loss_portfolio_activation == "pre_normalized"
+    assert config.trading.portfolio_activation == "pre_normalized"
+    assert config.trading.tw_commission_rebate_timing == "monthly_15th"
 
 
 def test_tw_public_candles_all_folds_uses_long_history_tw_cash_contract() -> None:
@@ -782,8 +797,8 @@ def test_tw_public_candles_all_folds_uses_long_history_tw_cash_contract() -> Non
     assert config.trading.tw_short_capacity_limit_enabled is False
     assert config.training.financial_transformer.portfolio_output_mode == "l1"
     assert config.training.multi_gpu_strategy == "auto"
-    assert config.training.batch_size_train == 128
-    assert config.training.batch_size_eval == 128
+    assert config.training.batch_size_train == 64
+    assert config.training.batch_size_eval == 64
     assert config.environment.cpu_threads == 128
     assert config.environment.torch_compile_threads == 16
     assert config.runner.resume is True

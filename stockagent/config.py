@@ -10,6 +10,7 @@ from typing import Any, get_args, get_type_hints
 import yaml
 
 from stockagent.backtest.tw_execution import (
+    TW_CARRYING_EXECUTION_MODES,
     TaiwanFeeSchedule,
     TaiwanMarginShortSchedule,
     normalize_execution_mode,
@@ -38,6 +39,173 @@ FORBIDDEN_SNAPSHOT_ONLY_FEATURE_PATTERNS = (
     "twpub_company_*",
 )
 DAY_TRADE_OPEN_GAP_FEATURE = "next_session_open_gap_logret"
+
+# The first multi-action execution contract is deliberately narrow.  These are
+# the two model families whose final stock scorer has an explicit action-channel
+# axis; every other model still emits one scalar target per symbol.
+_TW_PHASE_HEAD_MODEL_NAMES = frozenset(
+    {
+        "transformer_base_portfolio",
+        "transformer_base_portfolio_model",
+        "flash_transformer_portfolio",
+        "scalable_transformer_portfolio",
+        "multi_axis_transformer_portfolio",
+        "tbp",
+        "financial_transformer",
+        "financial_transformer_model",
+        "financial_token_transformer",
+        "financial_tokenized_transformer",
+    }
+)
+_TW_FINANCIAL_PHASE_HEAD_MODEL_NAMES = frozenset(
+    {
+        "financial_transformer",
+        "financial_transformer_model",
+        "financial_token_transformer",
+        "financial_tokenized_transformer",
+    }
+)
+
+# Keep this synchronized with the canonical phase-action boundary in
+# stockagent.training.loss.risk_aware_loss.  Rank/factor/autoencoder objectives
+# need a different label and attribution contract for [T,P,S] actions and must
+# not silently flatten or select one phase.
+_TW_PHASE_RETURN_OBJECTIVES = frozenset(
+    {
+        "log_utility",
+        "log_util",
+        "kelly",
+        "growth",
+        "mean_log_return",
+    }
+)
+
+
+def _normalized_contract_name(value: object) -> str:
+    return str(value).strip().lower().replace("-", "_")
+
+
+def _validate_tw_phase_mode_contract(
+    *,
+    execution_mode: str,
+    model_name: object,
+    loss_type: object,
+    model_portfolio_output_mode: object,
+    trading_portfolio_activation: object,
+    loss_portfolio_activation: object,
+    return_rank_ic_weight: object,
+    direction_weight: object,
+    explain_after_each_fold: object,
+) -> None:
+    """Fail closed before a phase action is interpreted as a scalar target."""
+
+    if execution_mode not in TW_CARRYING_EXECUTION_MODES:
+        return
+
+    normalized_model = _normalized_contract_name(model_name)
+    if normalized_model not in _TW_PHASE_HEAD_MODEL_NAMES:
+        raise ValueError(
+            f"trading.execution_mode={execution_mode!r} requires a model with "
+            "an explicit phase-action head; supported training.model_name "
+            "families are 'transformer_base_portfolio' and "
+            f"'financial_transformer', got {model_name!r}"
+        )
+
+    normalized_objective = _normalized_contract_name(loss_type)
+    if normalized_objective not in _TW_PHASE_RETURN_OBJECTIVES:
+        raise ValueError(
+            f"trading.execution_mode={execution_mode!r} currently supports only "
+            "canonical path-dependent log-utility objectives "
+            f"{sorted(_TW_PHASE_RETURN_OBJECTIVES)}; rank, factor, "
+            "autoencoder, and other scalar-target objectives are not defined "
+            f"for phase actions, got training.loss_type={loss_type!r}"
+        )
+
+    unsupported_auxiliary_losses = {
+        "training.multitask_loss.return_rank_ic_weight": float(
+            return_rank_ic_weight
+        ),
+        "training.multitask_loss.direction_weight": float(direction_weight),
+    }
+    enabled_unsupported_auxiliary_losses = [
+        name
+        for name, weight in unsupported_auxiliary_losses.items()
+        if weight > 0.0
+    ]
+    if enabled_unsupported_auxiliary_losses:
+        raise ValueError(
+            f"trading.execution_mode={execution_mode!r} does not define a "
+            "single daily cross-sectional rank or direction target for "
+            "multi-phase [T,P,S] actions; "
+            + ", ".join(enabled_unsupported_auxiliary_losses)
+            + " must be 0"
+        )
+    if bool(explain_after_each_fold):
+        raise ValueError(
+            f"trading.execution_mode={execution_mode!r} does not yet support "
+            "training.explain_after_each_fold: phase actions [B,P,S] need "
+            "phase-labelled attribution, and the tw_overnight due-exit "
+            "fraction is not a signed portfolio exposure"
+        )
+
+    output_mode = normalize_portfolio_output_mode(
+        str(model_portfolio_output_mode)
+    )
+    trading_activation = normalize_portfolio_activation(
+        str(trading_portfolio_activation)
+    )
+    raw_loss_activation = _normalized_contract_name(
+        loss_portfolio_activation
+    )
+    loss_activation = (
+        trading_activation
+        if raw_loss_activation
+        in {"", "auto", "trading", "same", "same_as_trading"}
+        else normalize_portfolio_activation(raw_loss_activation)
+    )
+    processed_output = output_mode != "logits"
+    activations = {
+        "trading.portfolio_activation": trading_activation,
+        "training.loss_portfolio_activation": loss_activation,
+    }
+    if output_mode == "activation_l1":
+        raise ValueError(
+            f"trading.execution_mode={execution_mode!r} does not support "
+            "portfolio_output_mode='activation_l1': the current phase model "
+            "and resolved-action consumer share one portfolio_activation "
+            "field, so pre_normalized consumption would silently replace the "
+            "model activation with identity. Use portfolio_output_mode='l1' "
+            "or 'logits' until those activation settings are separated."
+        )
+    if processed_output:
+        mismatched = [
+            name
+            for name, activation in activations.items()
+            if activation != "pre_normalized"
+        ]
+        if mismatched:
+            raise ValueError(
+                f"trading.execution_mode={execution_mode!r} with model "
+                f"portfolio_output_mode={output_mode!r} already emits resolved "
+                "phase actions; "
+                + ", ".join(mismatched)
+                + " must be 'pre_normalized' to prevent a second "
+                "sigmoid/activation/L1 transform"
+            )
+    else:
+        mismatched = [
+            name
+            for name, activation in activations.items()
+            if activation == "pre_normalized"
+        ]
+        if mismatched:
+            raise ValueError(
+                f"trading.execution_mode={execution_mode!r} with model "
+                "portfolio_output_mode='logits' emits unresolved raw phase "
+                "logits; "
+                + ", ".join(mismatched)
+                + " cannot be 'pre_normalized'"
+            )
 
 
 class _UniqueKeySafeLoader(yaml.SafeLoader):
@@ -357,7 +525,11 @@ class TradingConfig:
     # ``naive`` preserves the historical continuous-weight, immediate-fee path.
     execution_mode: str = "naive"
     tw_commission_rate: float = 0.001425
-    tw_commission_discount: float = 0.6
+    # Ultimate commission price after the broker rebate.  The executor still
+    # charges the gross rate first and releases the earned rebate only at the
+    # configured cash-payment event.
+    tw_commission_discount: float = 0.2
+    tw_commission_rebate_timing: str = "monthly_15th"
     tw_stock_sell_tax: float = 0.003
     tw_etf_sell_tax: float = 0.001
     tw_day_trade_stock_sell_tax: float = 0.0015
@@ -1687,18 +1859,41 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
             )
     _set_dataclass_defaults(trading, TradingConfig)
     trading["execution_mode"] = normalize_execution_mode(trading["execution_mode"])
+    normalized_phase_model = _normalized_contract_name(training["model_name"])
+    phase_model_config = (
+        training["financial_transformer"]
+        if normalized_phase_model in _TW_FINANCIAL_PHASE_HEAD_MODEL_NAMES
+        else training["transformer_base_portfolio"]
+    )
+    _validate_tw_phase_mode_contract(
+        execution_mode=trading["execution_mode"],
+        model_name=training["model_name"],
+        loss_type=training["loss_type"],
+        model_portfolio_output_mode=phase_model_config[
+            "portfolio_output_mode"
+        ],
+        trading_portfolio_activation=trading["portfolio_activation"],
+        loss_portfolio_activation=training["loss_portfolio_activation"],
+        return_rank_ic_weight=training["multitask_loss"][
+            "return_rank_ic_weight"
+        ],
+        direction_weight=training["multitask_loss"]["direction_weight"],
+        explain_after_each_fold=training["explain_after_each_fold"],
+    )
     if (
         DAY_TRADE_OPEN_GAP_FEATURE in data["feature_include"]
         and trading["execution_mode"] != "tw_day_trade"
+        and trading["execution_mode"] not in TW_CARRYING_EXECUTION_MODES
     ):
         raise ValueError(
             f"data.feature_include={DAY_TRADE_OPEN_GAP_FEATURE!r} is available "
-            "only with trading.execution_mode='tw_day_trade'; its row t value "
+            "only with a phase-aware Taiwan execution mode; its row t value "
             "contains the next session's opening quote"
         )
     taiwan_fee_schedule = TaiwanFeeSchedule(
         commission_rate=trading["tw_commission_rate"],
         commission_discount=trading["tw_commission_discount"],
+        commission_rebate_timing=trading["tw_commission_rebate_timing"],
         stock_sell_tax=trading["tw_stock_sell_tax"],
         etf_sell_tax=trading["tw_etf_sell_tax"],
         day_trade_stock_sell_tax=trading["tw_day_trade_stock_sell_tax"],
@@ -1714,6 +1909,9 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     # validated execution schedule consumed by the backtest executor.
     trading["tw_commission_rate"] = taiwan_fee_schedule.commission_rate
     trading["tw_commission_discount"] = taiwan_fee_schedule.commission_discount
+    trading["tw_commission_rebate_timing"] = (
+        taiwan_fee_schedule.commission_rebate_timing
+    )
     trading["tw_stock_sell_tax"] = taiwan_fee_schedule.stock_sell_tax
     trading["tw_etf_sell_tax"] = taiwan_fee_schedule.etf_sell_tax
     trading["tw_day_trade_stock_sell_tax"] = (
