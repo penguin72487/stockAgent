@@ -42,7 +42,7 @@ SOURCE_NAME = "TWSE"
 SOURCE_PRODUCT = "indicesReport/MI_5MINS_HIST"
 OFFICIAL_START_DATE = date(1999, 1, 5)
 ENDPOINT_TEMPLATE = (
-    "https://www.twse.com.tw/indicesReport/MI_5MINS_HIST"
+    "https://wwwc.twse.com.tw/indicesReport/MI_5MINS_HIST"
     "?date={date}&response=json"
 )
 PARSER_CONTRACT_VERSION = 1
@@ -271,7 +271,7 @@ def _request_once(url: str, args: argparse.Namespace) -> requests.Response:
         "User-Agent": USER_AGENT,
         "Accept": "application/json,text/plain,*/*;q=0.8",
         "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
-        "Referer": "https://www.twse.com.tw/zh/indices/taiex/mi-5min-hist.html",
+        "Referer": "https://wwwc.twse.com.tw/zh/indices/taiex/mi-5min-hist.html",
         "X-Requested-With": "XMLHttpRequest",
     }
     _global_rate_limiter().wait()

@@ -19,7 +19,7 @@ pre_signal_command:
   - --mode
   - daily
   - --config
-  - configs/markets/tw_public.yaml
+  - configs/deployments/tw_day_trade.yaml
   - --public-dir
   - data_tw_public
   - --stock-root
@@ -31,7 +31,7 @@ pre_signal_command:
   - --workers
   - "8"
   - --ohlcv-fallback
-  - yahoo
+  - none
   - --fallback-start-date
   - "2000-01-01"
   - --skip-raw

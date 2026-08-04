@@ -676,6 +676,23 @@ def _production_paths(args: argparse.Namespace, config) -> tuple[Path, Path, Pat
     return production_stocks, production_public, production_public_feature
 
 
+def _daily_baseline_ready(
+    *,
+    stock_root: Path,
+    public_dir: Path,
+    public_feature_path: Path,
+    benchmark_name: str,
+) -> bool:
+    return all(
+        path.is_file()
+        for path in (
+            stock_root / f"{benchmark_name}_features.parquet",
+            public_dir / "twse_taiex_ohlc.parquet",
+            public_feature_path,
+        )
+    )
+
+
 def _data_paths(args: argparse.Namespace, config) -> tuple[Path, Path, Path]:
     production_stocks, production_public, production_public_feature = _production_paths(
         args, config
@@ -991,6 +1008,24 @@ def main() -> None:
         raise ValueError("--yahoo-request-interval must be >= 0")
 
     config = load_config(args.config)
+    production_stocks, production_public, production_public_feature = _production_paths(
+        args, config
+    )
+    if args.operation == "daily" and not _daily_baseline_ready(
+        stock_root=production_stocks,
+        public_dir=production_public,
+        public_feature_path=production_public_feature,
+        benchmark_name=str(config.data.benchmark_name),
+    ):
+        args.mode = "rebuild"
+        args.operation = "from-zero"
+        args.promote = True
+        print(
+            "[tw-data-rebuild] daily baseline is missing or incomplete; "
+            f"bootstrapping a staged replacement for {production_public}",
+            flush=True,
+        )
+
     expected_first_year = config.walk_forward.expected_first_year
     if (
         args.operation == "from-zero"
@@ -1005,9 +1040,6 @@ def main() -> None:
             "provenance-backed TWSE/TPEx archive with --legacy-official-ohlcv and "
             "--legacy-source-name; fold IDs must not be renumbered."
         )
-    production_stocks, production_public, production_public_feature = _production_paths(
-        args, config
-    )
     stock_root, public_dir, public_feature_path = _data_paths(args, config)
     yahoo_fallback_dir = (
         Path(args.yahoo_fallback_dir)

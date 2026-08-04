@@ -391,7 +391,7 @@ def test_v7_rebuild_refetches_only_retitled_stale_mi_index_raw_receipt(
         description="bounded market-index contract test",
         tags=("twse", "index"),
         url_template=(
-            "https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX"
+            "https://wwwc.twse.com.tw/rwd/zh/afterTrading/MI_INDEX"
             "?date={date}&type=IND&response=json"
         ),
         date_format="%Y%m%d",
@@ -1193,11 +1193,12 @@ def test_twse_market_index_retitled_stale_response_resets_session_and_uses_fallb
         FakeResponse(payload("20150130", "9,361.91")),
     ]
     requested_urls: list[str] = []
+    retry_security_blocks: list[bool] = []
     discarded_sessions: list[bool] = []
 
     def fake_get(url: str, **kwargs):
         requested_urls.append(url)
-        assert kwargs["retry_security_blocks"] is False
+        retry_security_blocks.append(kwargs["retry_security_blocks"])
         return responses.pop(0)
 
     monkeypatch.setattr(twpub, "_http_get", fake_get)
@@ -1225,6 +1226,7 @@ def test_twse_market_index_retitled_stale_response_resets_session_and_uses_fallb
     assert result.url == requested_urls[2]
     assert result.response_attempts == 3
     assert discarded_sessions == [True, True]
+    assert retry_security_blocks == [False, True, True]
     assert responses == []
 
 
@@ -1539,10 +1541,11 @@ def test_twse_cross_checked_empty_retries_cache_busted_and_keeps_failure_receipt
         FakeResponse(final_content),
     ]
     requested_urls: list[str] = []
+    retry_security_blocks: list[bool] = []
 
     def fake_get(url: str, **kwargs):
         requested_urls.append(url)
-        assert kwargs["retry_security_blocks"] is False
+        retry_security_blocks.append(kwargs["retry_security_blocks"])
         return responses.pop(0)
 
     class FakeLimiter:
@@ -1587,6 +1590,7 @@ def test_twse_cross_checked_empty_retries_cache_busted_and_keeps_failure_receipt
     assert limiter.deferrals == [0.25]
     assert sleeps == [0.25]
     assert responses == []
+    assert retry_security_blocks == [False, True, True]
     assert result.raw_path is not None
     receipt = Path(result.raw_path)
     assert receipt.parent == tmp_path / "raw_failures" / spec.name
@@ -1725,10 +1729,11 @@ def test_twse_semantic_fallback_retry_uses_unique_cache_key(
         FakeResponse(correct_day),
     ]
     requested_urls: list[str] = []
+    retry_security_blocks: list[bool] = []
 
     def fake_get(url: str, **kwargs):
         requested_urls.append(url)
-        assert kwargs["retry_security_blocks"] is False
+        retry_security_blocks.append(kwargs["retry_security_blocks"])
         return responses.pop(0)
 
     monkeypatch.setattr(twpub, "_http_get", fake_get)
@@ -1748,6 +1753,7 @@ def test_twse_semantic_fallback_retry_uses_unique_cache_key(
 
     assert result.error is None
     assert result.frame.height == 1
+    assert retry_security_blocks == [False, True, True]
     assert "/rwd/zh/afterTrading/BWIBBU_d" in requested_urls[0]
     assert "/exchangeReport/BWIBBU_d" in requested_urls[1]
     assert requested_urls[2] == f"{requested_urls[1]}&_=123456789"
@@ -2230,7 +2236,7 @@ def test_waf_cooldown_honors_retry_after_when_it_is_longer():
     assert twpub._retry_delay_seconds(response, 0, 1.0) == 75.0
 
 
-def test_http_security_block_can_switch_to_semantic_fallback_without_same_url_retry(
+def test_http_security_block_can_switch_to_semantic_fallback_without_cooldown(
     monkeypatch,
 ):
     class FakeLimiter:
@@ -2279,11 +2285,11 @@ def test_http_security_block_can_switch_to_semantic_fallback_without_same_url_re
     assert response.status_code == 307
     assert session.calls == 1
     assert limiter.waits == 1
-    assert limiter.deferrals == [twpub.TW_PUBLIC_WAF_COOLDOWN_SECONDS]
-    assert sleeps == [twpub.TW_PUBLIC_WAF_COOLDOWN_SECONDS]
+    assert limiter.deferrals == []
+    assert sleeps == []
 
 
-def test_historical_waf_switches_to_official_fallback_with_one_global_cooldown(
+def test_historical_waf_switches_to_official_fallback_without_primary_cooldown(
     tmp_path: Path,
     monkeypatch,
 ):
@@ -2359,8 +2365,8 @@ def test_historical_waf_switches_to_official_fallback_with_one_global_cooldown(
     assert result.frame.height == 1
     assert result.response_attempts == 2
     assert limiter.waits == 2
-    assert limiter.deferrals == [twpub.TW_PUBLIC_WAF_COOLDOWN_SECONDS]
-    assert sleeps == [twpub.TW_PUBLIC_WAF_COOLDOWN_SECONDS]
+    assert limiter.deferrals == []
+    assert sleeps == []
     assert discarded_sessions == [True]
     assert session.responses == []
 

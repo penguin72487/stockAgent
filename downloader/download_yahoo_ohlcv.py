@@ -66,8 +66,8 @@ US_SYMBOL_SOURCES = (
     "https://www.nasdaqtrader.com/dynamic/symdir/otherlisted.txt",
 )
 TWSE_DELISTED_SOURCES = (
-    "https://www.twse.com.tw/en/listed/suspend-listing.html",
-    "https://www.twse.com.tw/en/listed/delisted-company.html",
+    "https://wwwc.twse.com.tw/en/listed/suspend-listing.html",
+    "https://wwwc.twse.com.tw/en/listed/delisted-company.html",
 )
 TPEX_DELISTED_SOURCES = (
     "https://www.tpex.org.tw/en-us/mainboard/termination.html",
