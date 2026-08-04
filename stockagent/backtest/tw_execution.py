@@ -27,6 +27,12 @@ EXECUTION_MODES: Final[tuple[str, ...]] = (
     "tw_cash",
     "tw_day_trade",
     "tw_overnight",
+    "tw_index_futures_day",
+)
+TW_STOCK_EXECUTION_MODES: Final[tuple[str, ...]] = (
+    "tw_cash",
+    "tw_day_trade",
+    "tw_overnight",
 )
 TW_CARRYING_EXECUTION_MODES: Final[tuple[str, ...]] = (
     "tw_cash",
@@ -83,6 +89,12 @@ _EXECUTION_MODE_ALIASES: Final[dict[str, str]] = {
     "tw_intraday": "tw_day_trade",
     "當沖": "tw_day_trade",
     "台股當沖": "tw_day_trade",
+    # One signed TAIEX exposure, executed with a same-day TX/MTX/TMF basket.
+    "tw_index_futures_day": "tw_index_futures_day",
+    "tw_index_future_day": "tw_index_futures_day",
+    "tw_futures_day": "tw_index_futures_day",
+    "taiex_futures_day": "tw_index_futures_day",
+    "台指期日盤": "tw_index_futures_day",
 }
 
 
@@ -96,14 +108,16 @@ def normalize_execution_mode(mode: object) -> str:
     if not isinstance(mode, str):
         raise ValueError(
             "execution_mode must be one of "
-            "'naive', 'tw_cash', 'tw_day_trade', or 'tw_overnight'"
+            "'naive', 'tw_cash', 'tw_day_trade', 'tw_overnight', or "
+            "'tw_index_futures_day'"
         )
     normalized = "_".join(mode.strip().casefold().replace("-", "_").split())
     canonical = _EXECUTION_MODE_ALIASES.get(normalized)
     if canonical is None:
         raise ValueError(
             "execution_mode must be one of "
-            "'naive', 'tw_cash', 'tw_day_trade', or 'tw_overnight'"
+            "'naive', 'tw_cash', 'tw_day_trade', 'tw_overnight', or "
+            "'tw_index_futures_day'"
         )
     return canonical
 

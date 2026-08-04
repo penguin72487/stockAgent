@@ -15,6 +15,14 @@
 模型不讀取交易日 `t` 的股票開盤、最高、最低、收盤或成交量。期貨日盤的
 開盤價、可交易狀態與實際到期月份也只屬於執行器，不是模型特徵。
 
+策略設定直接繼承 `tw_public_lanten_market_candles.yaml` 的股票資料、歷史
+特徵、walk-forward、lookback、optimizer 與
+`training.transformer_base_portfolio` 參數。唯一的資料特徵例外是
+`next_session_open_gap_logret`：原 candles 策略可在股票開盤後使用它，但
+台指期 08:45 決策時股票尚未開盤，因此子設定以
+`data.day_trade_open_feature: false` 阻止它進入 feature schema。期貨專用模型
+仍由原本 model factory 建立，再把個股投組輸出頭換成單一 `[-1, 1]` 指數曝險頭。
+
 ## 資料
 
 下載器只接受臺灣期貨交易所官方 `futDataDown` 收據，保留原始 ZIP/CSV、
@@ -37,15 +45,44 @@ run_fintech_python scripts/download_tw_index_futures_day_session.py \
 ```bash
 source scripts/runtime_env.sh
 run_fintech_python scripts/check_environment.py --require-cuda --strict
-run_fintech_python scripts/train_tw_index_futures_day.py \
+run_fintech_python train.py \
   --config configs/markets/tw_index_futures_day.yaml
 ```
 
+canonical 訓練預設寫入 `artifacts/markets/tw_index_futures_day_canonical`。
+舊的 `artifacts/markets/tw_index_futures_day` 是已退役獨立 trainer 的 checkpoint，
+因為缺少 canonical manifest，不會拿來接續 optimizer，也不會被自動刪除。
+
+若要先驗證最新 walk-forward fold，而不修改正式 YAML：
+
+```bash
+run_fintech_python train.py \
+  --config configs/markets/tw_index_futures_day.yaml \
+  --epochs 2 \
+  --start-fold 12 \
+  --max-folds 1 \
+  --no-resume \
+  --no-post-train-infer \
+  --output-dir artifacts_smoke/tw_index_futures_day
+```
+
+這不是另一套 trainer。面板快取、walk-forward、lazy window、torch.compile、
+optimizer、checkpoint/resume、`epoch_curve.jsonl`、early stopping、推論與
+fold artifacts 全部沿用 `train.py` 的 canonical 路徑。正式策略使用基準設定
+繼承而來的 `temporal_pooling: last` 與 `temporal_query_mode: last_only`；
+train/eval batch size、epoch、learning rate、weight decay、seed 與
+torch.compile 也全部繼承，不再維護另一組訓練超參數。唯一的 CUDA 執行
+穩定性覆寫是 `sdpa_batch_limit: 16384`：它只切分 `batch * symbols` 的 SDPA
+工作，不改變模型參數、token 或注意力計算語意。
+
 訓練目標使用連續曝險的費後 log utility；測試輸出則使用 TX/MTX/TMF 實際
 乘數、整數口數、期交稅、交易/結算費與設定中的券商手續費、滑價重算。
-`broker_fee_per_side_twd` 與 `slippage_points_per_side` 的預設值為零，只是因為
-它們屬於帳戶條件；正式解讀前必須改成實際值。
+目前交易人實付的總手續費按每口、每邊設定為 TX 60 元、MTX 24 元、TMF
+16 元。這些優惠價視為已包含期交所交易／結算費；載入器只在內部拆出剩餘
+券商部分，避免重複收費。canonical artifact 會另外保留連續訓練代理與整數
+期貨執行結果；整數 holdings 表以 TX/MTX/TMF 記錄每日進出場口數。選擇權
+22 元不屬於本策略商品集合，因此不進入
+回測。滑價仍為零，正式解讀績效前應另做非零滑價敏感度測試。
 
 這條路徑目前只建立研究、訓練與整數執行預覽，不會送出 Shioaji 正式委託。
 未來接實盤時，商品月份必須由 Contract V2 查詢具體契約，不得自行拼接代碼。
-
