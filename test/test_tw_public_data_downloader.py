@@ -14,6 +14,10 @@ import polars as pl
 import pytest
 
 from downloader import download_tw_public_data as twpub
+from downloader.tw_public_contract import (
+    DAILY_CLOSE_CORE_DATASETS,
+    DAILY_CLOSE_OPTIONAL_DATASETS,
+)
 
 
 def _historical_args(
@@ -2460,6 +2464,23 @@ def test_select_specs_accepts_tags_and_names():
     assert "dgbas_unemployment_rate" in names
 
 
+def test_daily_close_contract_separates_core_ohlcv_from_late_publications():
+    assert DAILY_CLOSE_CORE_DATASETS == {
+        "twse_daily_ohlcv",
+        "tpex_daily_ohlcv",
+    }
+    assert DAILY_CLOSE_CORE_DATASETS.isdisjoint(DAILY_CLOSE_OPTIONAL_DATASETS)
+    assert {
+        "twse_daily_valuation",
+        "tpex_daily_valuation",
+        "twse_institutional_trades",
+        "tpex_institutional_trades",
+        "twse_margin_balance",
+        "tpex_margin_balance",
+        "twse_day_trade_eligibility",
+    } <= DAILY_CLOSE_OPTIONAL_DATASETS
+
+
 def test_model_useful_group_is_curated_and_has_unique_dataset_names():
     specs = twpub._select_specs(["model_useful"])
     names = [spec.name for spec in specs]
@@ -4235,3 +4256,100 @@ def test_tpex_dependency_scheduler_runs_calendar_phase_first(
         ["twse_daily_ohlcv", "tpex_daily_ohlcv"],
         ["tpex_margin_balance"],
     ]
+
+
+def test_daily_close_publication_gate_rejects_stale_exchange_ohlcv(
+    tmp_path: Path,
+):
+    requested = date(2026, 7, 27)
+    _write_validated_taiex_calendar(
+        tmp_path,
+        [requested],
+        coverage_start=requested,
+        coverage_end=requested,
+    )
+    for name in ("twse_daily_ohlcv", "tpex_daily_ohlcv"):
+        pl.DataFrame({"date": [date(2026, 7, 24)]}).write_parquet(
+            tmp_path / f"{name}.parquet"
+        )
+    specs = [
+        twpub.DEFAULT_DATASETS["twse_daily_ohlcv"],
+        twpub.DEFAULT_DATASETS["tpex_daily_ohlcv"],
+    ]
+    results = [
+        twpub.DownloadResult(name, "ok", 1, None, coverage_complete=True)
+        for name in ("twse_daily_ohlcv", "tpex_daily_ohlcv")
+    ]
+    args = SimpleNamespace(
+        mode="daily",
+        end_date=requested.isoformat(),
+        require_daily_close_publication=True,
+    )
+
+    with pytest.raises(RuntimeError, match="daily close publication pending"):
+        twpub._require_daily_close_publication(
+            specs,
+            args,
+            tmp_path,
+            results,
+        )
+
+
+def test_daily_close_publication_gate_accepts_current_exchange_ohlcv(
+    tmp_path: Path,
+):
+    requested = date(2026, 7, 27)
+    _write_validated_taiex_calendar(
+        tmp_path,
+        [requested],
+        coverage_start=requested,
+        coverage_end=requested,
+    )
+    for name in ("twse_daily_ohlcv", "tpex_daily_ohlcv"):
+        pl.DataFrame({"date": [requested]}).write_parquet(
+            tmp_path / f"{name}.parquet"
+        )
+    specs = [
+        twpub.DEFAULT_DATASETS["twse_daily_ohlcv"],
+        twpub.DEFAULT_DATASETS["tpex_daily_ohlcv"],
+    ]
+    results = [
+        twpub.DownloadResult(name, "ok", 1, None, coverage_complete=True)
+        for name in ("twse_daily_ohlcv", "tpex_daily_ohlcv")
+    ]
+    args = SimpleNamespace(
+        mode="daily",
+        end_date=requested.isoformat(),
+        require_daily_close_publication=True,
+    )
+
+    twpub._require_daily_close_publication(
+        specs,
+        args,
+        tmp_path,
+        results,
+    )
+
+
+def test_daily_download_skips_superseded_tdcc_endpoint(monkeypatch, tmp_path: Path):
+    direct = twpub.DEFAULT_DATASETS["tdcc_shareholding_distribution"]
+    mirror = twpub.DEFAULT_DATASETS["data_gov_tdcc_shareholding_distribution"]
+    requested: list[str] = []
+    args = SimpleNamespace(mode="daily", workers=2)
+
+    monkeypatch.setattr(
+        twpub,
+        "download_dataset",
+        lambda spec, args, output_dir: (
+            requested.append(spec.name)
+            or twpub.DownloadResult(spec.name, "ok", 1, str(output_dir / f"{spec.name}.parquet"))
+        ),
+    )
+
+    results = twpub._run_selected_downloads([direct, mirror], args, tmp_path)
+
+    assert requested == ["data_gov_tdcc_shareholding_distribution"]
+    assert {row.dataset: row.status for row in results} == {
+        "tdcc_shareholding_distribution": "up_to_date",
+        "data_gov_tdcc_shareholding_distribution": "ok",
+    }

@@ -54,6 +54,7 @@ from downloader.download_tw_public_data import (
     _validated_source_unavailable_receipt_dates,
     _validated_taiex_session_dates,
 )
+from downloader.tw_public_contract import DAILY_CLOSE_OPTIONAL_DATASETS
 
 
 BASE_FEATURES = {
@@ -2070,6 +2071,57 @@ def _source_dates(path: Path) -> np.ndarray:
     return np.asarray(frame.get_column("date").to_numpy(), dtype="datetime64[D]")
 
 
+def _validated_daily_publication_lag_datasets(
+    public_dir: Path,
+    receipt: dict[str, Any] | None,
+) -> set[str]:
+    if (
+        receipt is None
+        or str(receipt.get("mode", "")) != "daily"
+        or receipt.get("daily_close_ready") is not True
+        or int(receipt.get("blocking_failed_count", -1)) != 0
+    ):
+        return set()
+    datasets = receipt.get("publication_lag_datasets")
+    try:
+        count = int(receipt.get("publication_lag_count", -1))
+    except (TypeError, ValueError):
+        return set()
+    if (
+        not isinstance(datasets, list)
+        or count <= 0
+        or count != len(datasets)
+    ):
+        return set()
+    names = set(map(str, datasets))
+    if not names <= DAILY_CLOSE_OPTIONAL_DATASETS:
+        return set()
+
+    report_path = public_dir / "download_report.csv"
+    if not report_path.exists():
+        return set()
+    try:
+        report = pl.read_csv(report_path)
+        lag_rows = report.filter(
+            pl.col("dataset").cast(pl.String).is_in(sorted(names))
+        )
+        end_date = str(receipt.get("end_date", ""))
+        valid = (
+            lag_rows.height == count
+            and set(lag_rows["dataset"].cast(pl.String).to_list()) == names
+            and all(
+                str(row["status"]) in {"failed", "incomplete", "unsupported"}
+                and int(row["failed_dates"]) == 1
+                and int(row["missing_dates_after"]) == 1
+                and end_date in str(row["message"])
+                for row in lag_rows.iter_rows(named=True)
+            )
+        )
+    except (OSError, pl.exceptions.PolarsError, TypeError, ValueError):
+        return set()
+    return names if valid else set()
+
+
 def _authoritative_source_unavailable_dates(
     public_dir: Path,
     dataset: str,
@@ -2090,14 +2142,34 @@ def _authoritative_source_unavailable_dates(
     state = _read_json_object(public_dir / "state" / f"{dataset}.json")
     if state is None:
         return np.asarray([], dtype="datetime64[D]")
+    publication_lag_receipt = _read_json_object(
+        public_dir / "download_summary.json"
+    )
+    publication_lag_datasets = _validated_daily_publication_lag_datasets(
+        public_dir,
+        publication_lag_receipt,
+    )
+    latest_session = str(expected_sessions[-1])
+    failed_dates = state.get("failed_dates")
+    latest_publication_lag = (
+        dataset in publication_lag_datasets
+        and isinstance(failed_dates, dict)
+        and set(map(str, failed_dates)) == {latest_session}
+        and int(state.get("missing_dates_after", -1)) == 1
+    )
     calendar_kind = str(state.get("coverage_calendar_kind", "") or "").lower()
     required_checks = (
         state.get("dataset") == dataset,
         state.get("baseline_established") is True,
-        state.get("coverage_complete") is True,
         state.get("replacement_promoted") is True,
-        not bool(state.get("failed_dates")),
-        int(state.get("missing_dates_after", -1)) == 0,
+        (
+            (
+                state.get("coverage_complete") is True
+                and not bool(failed_dates)
+                and int(state.get("missing_dates_after", -1)) == 0
+            )
+            or latest_publication_lag
+        ),
         "official" in calendar_kind and "session" in calendar_kind,
     )
     if not all(required_checks):
@@ -2854,6 +2926,15 @@ def audit_source_receipts(
         "public_download_coverage_complete": (
             public_receipt.get("coverage_complete") if public_receipt else None
         ),
+        "public_download_daily_close_ready": (
+            public_receipt.get("daily_close_ready") if public_receipt else None
+        ),
+        "public_download_publication_lag_count": (
+            public_receipt.get("publication_lag_count") if public_receipt else None
+        ),
+        "public_download_publication_lag_datasets": (
+            public_receipt.get("publication_lag_datasets") if public_receipt else None
+        ),
     }
     if public_receipt is None:
         findings.append(
@@ -2877,6 +2958,36 @@ def audit_source_receipts(
         configured_allowed_failed_datasets = public_receipt.get(
             "configured_allowed_failed_datasets"
         )
+        publication_lag_count = int(
+            public_receipt.get("publication_lag_count", -1)
+        )
+        publication_lag_datasets = public_receipt.get(
+            "publication_lag_datasets"
+        )
+        validated_publication_lag_datasets = (
+            _validated_daily_publication_lag_datasets(
+                public_dir,
+                public_receipt,
+            )
+        )
+        publication_lag_report_valid = (
+            isinstance(publication_lag_datasets, list)
+            and set(map(str, publication_lag_datasets))
+            == validated_publication_lag_datasets
+        )
+        daily_publication_lag_valid = (
+            str(public_receipt.get("mode", "")) == "daily"
+            and public_receipt.get("daily_close_ready") is True
+            and blocking_failed_count == 0
+            and failed_count >= 0
+            and allowed_failed_count >= 0
+            and publication_lag_count >= 0
+            and failed_count == allowed_failed_count + publication_lag_count
+            and isinstance(publication_lag_datasets, list)
+            and set(map(str, publication_lag_datasets))
+            <= DAILY_CLOSE_OPTIONAL_DATASETS
+            and publication_lag_report_valid
+        )
         declared_nonblocking_failures = (
             public_receipt.get("coverage_complete") is True
             and failed_count >= 0
@@ -2888,8 +2999,22 @@ def audit_source_receipts(
             and set(map(str, allowed_failed_datasets))
             <= set(map(str, configured_allowed_failed_datasets))
         )
+        if daily_publication_lag_valid and allowed_failed_count:
+            daily_publication_lag_valid = (
+                isinstance(allowed_failed_datasets, list)
+                and isinstance(configured_allowed_failed_datasets, list)
+                and len(allowed_failed_datasets) == allowed_failed_count
+                and set(map(str, allowed_failed_datasets))
+                <= set(map(str, configured_allowed_failed_datasets))
+            )
+        declared_nonblocking_failures = (
+            declared_nonblocking_failures or daily_publication_lag_valid
+        )
         receipt_summary["public_download_nonblocking_failures_valid"] = (
             declared_nonblocking_failures
+        )
+        receipt_summary["public_download_daily_publication_lag_valid"] = (
+            daily_publication_lag_valid
         )
         if failed_count != 0 and not declared_nonblocking_failures:
             findings.append(
@@ -2911,7 +3036,11 @@ def audit_source_receipts(
             "coverage_complete" not in public_receipt
             and str(public_receipt.get("mode", "")) == "full"
         )
-        if public_receipt.get("coverage_complete") is not True and not legacy_full_receipt:
+        if (
+            public_receipt.get("coverage_complete") is not True
+            and not legacy_full_receipt
+            and not daily_publication_lag_valid
+        ):
             findings.append(
                 Finding(
                     "critical",

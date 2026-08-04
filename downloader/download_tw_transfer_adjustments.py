@@ -29,6 +29,7 @@ from downloader.download_tw_public_data import (
     _configure_tw_public_rate_limiter,
     _http_get,
 )
+from downloader.tw_public_contract import DAILY_CLOSE_OPTIONAL_DATASETS
 
 
 DATASET_NAME = "tw_transfer_adjustment_reference"
@@ -452,7 +453,7 @@ def _validate_official_inputs(
         and public_summary.get("daily_close_ready") is True
         and int(public_summary.get("blocking_failed_count", -1)) == 0
         and set(public_summary.get("publication_lag_datasets") or ())
-        <= {"twse_margin_balance", "tpex_margin_balance"}
+        <= DAILY_CLOSE_OPTIONAL_DATASETS
     )
     if (
         (
