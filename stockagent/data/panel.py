@@ -325,6 +325,10 @@ class PanelData:
     # generation. Synthetic or caller-mutated panels leave this unset and are
     # hashed directly by checkpoint construction.
     content_fingerprints: dict[str, dict[str, Any]] | None = None
+    # Optional executor-only TAIFEX arrays. They are attached by train.py after
+    # the stock panel has been built/cached and are never model input features.
+    index_futures_day_session: Any | None = None
+    index_futures_reference_product: str | None = None
 
     @property
     def num_dates(self) -> int:

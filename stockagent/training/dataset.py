@@ -131,6 +131,7 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
             raise ValueError(f"lookback must be positive, got {lookback!r}")
         self.execution_mode = normalize_execution_mode(execution_mode)
         carrying_execution = self.execution_mode in TW_CARRYING_EXECUTION_MODES
+        futures_execution = self.execution_mode == "tw_index_futures_day"
         self.lookback_context = normalize_lookback_context(lookback_context)
         self.short_capacity_limit_enabled = bool(short_capacity_limit_enabled)
         self.tw_commission_rebate_timing = normalize_commission_rebate_timing(
@@ -223,7 +224,33 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
             panel.tradable_mask.shape,
             dtype=np.float32,
         )
-        if self.execution_mode == "tw_day_trade":
+        if futures_execution:
+            market = getattr(panel, "index_futures_day_session", None)
+            reference_product = getattr(
+                panel, "index_futures_reference_product", None
+            )
+            if market is None or not reference_product:
+                raise ValueError(
+                    "tw_index_futures_day requires train.py to attach aligned "
+                    "TAIFEX day-session data to PanelData"
+                )
+            if not np.array_equal(
+                np.asarray(panel.dates, dtype="datetime64[D]"),
+                np.asarray(market.dates, dtype="datetime64[D]"),
+            ):
+                raise ValueError("stock panel and futures market dates must align")
+            reference_returns = np.asarray(
+                market.reference_log_returns(reference_product),
+                dtype=np.float32,
+            )
+            reference_valid = np.asarray(
+                market.reference_tradable_mask(reference_product),
+                dtype=bool,
+            )
+            target_returns = np.broadcast_to(
+                reference_returns[:, None], panel.tradable_mask.shape
+            ).copy()
+        elif self.execution_mode == "tw_day_trade":
             if panel.intraday_returns is None:
                 raise ValueError(
                     "tw_day_trade requires PanelData.intraday_returns; refusing to "
@@ -310,7 +337,15 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
 
         finite_target = np.isfinite(target_returns)
         close_tradable = panel.tradable_mask & finite_target
-        if day_trade_eligible is not None:
+        if futures_execution:
+            prior_alive = np.zeros_like(panel.alive_mask, dtype=bool)
+            prior_alive[1:] = np.asarray(panel.alive_mask[:-1], dtype=bool)
+            tradable = prior_alive
+            close_tradable = (
+                prior_alive
+                & np.asarray(reference_valid, dtype=bool)[:, None]
+            )
+        elif day_trade_eligible is not None:
             close_tradable = close_tradable & day_trade_eligible
             # The model target is committed before the opening auction.  Even
             # today's realized open price/limit state is therefore execution
@@ -336,7 +371,14 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
             close_tradable = np.asarray(panel.tradable_mask, dtype=bool)
         else:
             tradable = close_tradable
-        if self.execution_mode == "tw_day_trade" or carrying_execution:
+        if futures_execution:
+            benchmark_values = np.nan_to_num(
+                np.asarray(reference_returns, dtype=np.float32),
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            )
+        elif self.execution_mode == "tw_day_trade" or carrying_execution:
             # A session-t day trade is held from open[t] to close[t].  Its
             # buy-and-hold comparator must cover the same wall-clock session:
             # adjusted close[t-1] to adjusted close[t].  Panel benchmark labels
@@ -360,6 +402,8 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
             if panel.force_exit_mask is not None
             else np.zeros_like(tradable, dtype=bool)
         )
+        if futures_execution:
+            force_exit = np.zeros_like(tradable, dtype=bool)
         if self.date_indices.size == 0:
             valid_indices = self.date_indices
             if not allow_empty:
@@ -379,7 +423,13 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
                 fold_start_idx = int(self.date_indices[0])
                 min_valid_idx = fold_start_idx + self.lookback - 1 + feature_lag
             valid_indices = self.date_indices[self.date_indices >= min_valid_idx]
-            if valid_indices.size > 0 and self.execution_mode == "naive":
+            if valid_indices.size > 0 and futures_execution:
+                executable = (
+                    tradable[valid_indices].any(axis=1)
+                    & np.asarray(reference_valid, dtype=bool)[valid_indices]
+                )
+                valid_indices = valid_indices[executable]
+            elif valid_indices.size > 0 and self.execution_mode == "naive":
                 executable_or_terminal = (
                     tradable[valid_indices].any(axis=1)
                     | force_exit[valid_indices].any(axis=1)
@@ -415,6 +465,11 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
             )
         can_buy = np.asarray(panel.can_buy_mask, dtype=bool) & close_tradable
         can_sell = np.asarray(panel.can_sell_mask, dtype=bool) & close_tradable
+        if futures_execution:
+            # These are executor gates for the single futures exposure. Stock
+            # limit masks are model features only and never gate TX/MTX/TMF.
+            can_buy = close_tradable.copy()
+            can_sell = close_tradable.copy()
         raw_short_capacity = getattr(panel, "short_capacity_shares", None)
         if raw_short_capacity is None:
             short_capacity_shares: np.ndarray | None = None
@@ -652,6 +707,8 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
             if panel.force_short_cover_mask is not None
             else np.zeros_like(tradable, dtype=bool)
         )
+        if futures_execution:
+            force_short_cover = np.zeros_like(tradable, dtype=bool)
         # build_panel sanitizes feature NaN/inf values before caching.  Re-running
         # torch.nan_to_num here would duplicate the full panel for every split.
         features = panel.features.astype(np.float32, copy=False)
