@@ -26,6 +26,9 @@ data:
   live_tail_panel_rows: 64
   trading_volume_policy: required
   tradable_mode: tw_limit_guard
+  # Close-time contract: the Naive deployment uses only same-session official
+  # OHLCV base features. Public valuation, institutional, and margin features
+  # that publish after 13:30 are excluded from model input.
   use_tw_public_features: false
   use_tw_public_rules: true
   tw_public_feature_path: data_tw_public/features/tw_public_stock_daily.parquet

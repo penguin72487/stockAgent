@@ -571,12 +571,20 @@ def _public_command(args: argparse.Namespace, public_dir: Path) -> list[str]:
         "--resume" if args.resume else "--no-resume",
     )
     if args.mode == "daily":
-        command.append("--allow-daily-publication-lag")
+        command.extend(
+            [
+                "--allow-daily-publication-lag",
+                "--require-daily-close-publication",
+            ]
+        )
     if args.request_interval is not None:
         command.extend(["--request-interval", str(args.request_interval)])
-    if args.allow_failed_public_datasets:
+    allow_failed = tuple(
+        getattr(args, "allow_failed_public_datasets", ()) or ()
+    )
+    if allow_failed:
         command.extend(
-            ["--allow-failed-datasets", *args.allow_failed_public_datasets]
+            ["--allow-failed-datasets", *allow_failed]
         )
     if args.skip_raw:
         command.append("--skip-raw")
@@ -668,6 +676,23 @@ def _production_paths(args: argparse.Namespace, config) -> tuple[Path, Path, Pat
     return production_stocks, production_public, production_public_feature
 
 
+def _daily_baseline_ready(
+    *,
+    stock_root: Path,
+    public_dir: Path,
+    public_feature_path: Path,
+    benchmark_name: str,
+) -> bool:
+    return all(
+        path.is_file()
+        for path in (
+            stock_root / f"{benchmark_name}_features.parquet",
+            public_dir / "twse_taiex_ohlc.parquet",
+            public_feature_path,
+        )
+    )
+
+
 def _data_paths(args: argparse.Namespace, config) -> tuple[Path, Path, Path]:
     production_stocks, production_public, production_public_feature = _production_paths(
         args, config
@@ -685,6 +710,50 @@ def _data_paths(args: argparse.Namespace, config) -> tuple[Path, Path, Path]:
             "TW official stock and feature outputs must be inside the public-data tree for atomic promotion"
         ) from exc
     return public / stock_relative_path, public, public / feature_relative_path
+
+
+def _parquet_max_date(path: Path) -> date | None:
+    if not path.is_file():
+        return None
+    try:
+        table = pq.read_table(path, columns=["date"])
+        value = pc.max(table["date"]).as_py()
+    except Exception:
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    try:
+        return date.fromisoformat(str(value)[:10])
+    except ValueError:
+        return None
+
+
+def _validate_daily_canonical_close(
+    *,
+    stock_root: Path,
+    public_dir: Path,
+    benchmark_name: str,
+    requested_end: date,
+) -> None:
+    calendar_latest = _parquet_max_date(public_dir / "twse_taiex_ohlc.parquet")
+    if calendar_latest is None:
+        raise RuntimeError("daily canonical validation has no official TAIEX session")
+    expected_session = min(calendar_latest, requested_end)
+    benchmark_path = stock_root / f"{benchmark_name}_features.parquet"
+    benchmark_latest = _parquet_max_date(benchmark_path)
+    if benchmark_latest is None or benchmark_latest < expected_session:
+        raise RuntimeError(
+            "daily canonical stock data is stale after symbol build: "
+            f"benchmark={benchmark_name} latest={benchmark_latest or 'missing'} "
+            f"expected={expected_session}"
+        )
+    print(
+        f"[tw-data-rebuild] canonical close ready benchmark={benchmark_name} "
+        f"date={benchmark_latest}",
+        flush=True,
+    )
 
 
 def _preflight(
@@ -939,6 +1008,24 @@ def main() -> None:
         raise ValueError("--yahoo-request-interval must be >= 0")
 
     config = load_config(args.config)
+    production_stocks, production_public, production_public_feature = _production_paths(
+        args, config
+    )
+    if args.operation == "daily" and not _daily_baseline_ready(
+        stock_root=production_stocks,
+        public_dir=production_public,
+        public_feature_path=production_public_feature,
+        benchmark_name=str(config.data.benchmark_name),
+    ):
+        args.mode = "rebuild"
+        args.operation = "from-zero"
+        args.promote = True
+        print(
+            "[tw-data-rebuild] daily baseline is missing or incomplete; "
+            f"bootstrapping a staged replacement for {production_public}",
+            flush=True,
+        )
+
     expected_first_year = config.walk_forward.expected_first_year
     if (
         args.operation == "from-zero"
@@ -953,9 +1040,6 @@ def main() -> None:
             "provenance-backed TWSE/TPEx archive with --legacy-official-ohlcv and "
             "--legacy-source-name; fold IDs must not be renumbered."
         )
-    production_stocks, production_public, production_public_feature = _production_paths(
-        args, config
-    )
     stock_root, public_dir, public_feature_path = _data_paths(args, config)
     yahoo_fallback_dir = (
         Path(args.yahoo_fallback_dir)
@@ -1246,6 +1330,13 @@ def main() -> None:
                 stock_root / "official_symbol_build_summary.json"
             ),
         )
+        if args.mode == "daily" and not args.dry_run:
+            _validate_daily_canonical_close(
+                stock_root=stock_root,
+                public_dir=public_dir,
+                benchmark_name=str(config.data.benchmark_name),
+                requested_end=requested_end,
+            )
 
     if not args.skip_corporate_actions:
         entitlement_output = (
@@ -1320,21 +1411,24 @@ def main() -> None:
         )
 
     if not args.skip_feature_build:
+        feature_build_command = _python_command(
+            "scripts/build_tw_public_training_features.py",
+            "--input-dir",
+            str(public_dir),
+            "--output-path",
+            str(public_feature_path),
+            "--symbols-root",
+            str(stock_root),
+            "--market-symbol",
+            str(config.data.tw_public_market_symbol),
+            "--end-date",
+            args.end_date,
+        )
+        if args.mode == "daily":
+            feature_build_command.append("--allow-daily-publication-lag")
         runner.run(
             "build_public_features",
-            _python_command(
-                "scripts/build_tw_public_training_features.py",
-                "--input-dir",
-                str(public_dir),
-                "--output-path",
-                str(public_feature_path),
-                "--symbols-root",
-                str(stock_root),
-                "--market-symbol",
-                str(config.data.tw_public_market_symbol),
-                "--end-date",
-                args.end_date,
-            ),
+            feature_build_command,
             outputs=[public_feature_path, public_feature_path.with_suffix(".summary.json")],
         )
 
@@ -1406,10 +1500,18 @@ def main() -> None:
         )
     else:
         runner.update_metadata(promoted=False)
-        print(
-            f"[tw-data-rebuild] validated staged data at {args.stage_root}; promotion not requested",
-            flush=True,
-        )
+        if args.operation == "from-zero":
+            print(
+                f"[tw-data-rebuild] validated staged data at {args.stage_root}; "
+                "promotion not requested",
+                flush=True,
+            )
+        else:
+            print(
+                f"[tw-data-rebuild] updated and validated production data "
+                f"mode={args.mode} public_dir={public_dir} stock_root={stock_root}",
+                flush=True,
+            )
 
 
 if __name__ == "__main__":

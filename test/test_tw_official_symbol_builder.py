@@ -239,7 +239,7 @@ def _write_verified_taiex_calendar(
             "_source_product": ["indicesReport/MI_5MINS_HIST"] * len(dates),
             "_request_month": [value.strftime("%Y-%m") for value in dates],
             "_downloaded_at_utc": ["2026-07-12T00:00:00+00:00"] * len(dates),
-            "_url": ["https://www.twse.com.tw/indicesReport/MI_5MINS_HIST"]
+            "_url": ["https://wwwc.twse.com.tw/indicesReport/MI_5MINS_HIST"]
             * len(dates),
         }
     ).write_parquet(path)
@@ -2135,7 +2135,7 @@ def test_official_ohlcv_can_use_yahoo_factor_only_when_official_factor_is_missin
         "yahoo_fallback",
     ]
     assert math.isclose(output["adjclose"][1] / output["adjclose"][0], 1.05)
-def test_daily_close_receipt_allows_only_certified_margin_publication_lag(
+def test_daily_close_receipt_allows_only_certified_optional_publication_lag(
     tmp_path: Path,
 ) -> None:
     corporate_path = tmp_path / "tw_corporate_action_reference.parquet"
@@ -2159,7 +2159,10 @@ def test_daily_close_receipt_allows_only_certified_margin_publication_lag(
         "blocking_failed_count": 0,
         "daily_close_ready": True,
         "publication_lag_datasets": [
+            "tpex_daily_valuation",
             "tpex_margin_balance",
+            "twse_day_trade_eligibility",
+            "twse_institutional_trades",
             "twse_margin_balance",
         ],
     }

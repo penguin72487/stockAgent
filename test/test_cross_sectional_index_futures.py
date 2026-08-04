@@ -41,12 +41,14 @@ def test_cross_sectional_head_emits_one_bounded_exposure() -> None:
     end_indices = torch.tensor([2, 3, 4])
     mask = torch.ones(3, 5, dtype=torch.bool)
     mask[-1] = False
-    exposure = model.forward_from_panel(features, end_indices, mask)
+    pseudo_weights = model.forward_from_panel(features, end_indices, mask)
+    exposure = pseudo_weights.sum(dim=-1)
 
+    assert pseudo_weights.shape == (3, 5)
     assert exposure.shape == (3,)
     assert torch.all(exposure.abs() <= 0.75 + 1e-6)
+    assert torch.all(pseudo_weights[-1] == 0.0)
     assert exposure[-1].item() == 0.0
     exposure[:2].sum().backward()
     assert features.grad is not None
     assert torch.isfinite(features.grad).all()
-

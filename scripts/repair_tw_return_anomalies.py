@@ -23,7 +23,7 @@ PRICE_COLUMNS = ("open", "max", "min", "close", "adjclose")
 OHLC_COLUMNS = ("open", "max", "min", "close")
 VOLUME_COLUMN = "Trading_Volume"
 FINMIND_URL = "https://api.finmindtrade.com/api/v4/data"
-TWSE_STOCK_DAY_URL = "https://www.twse.com.tw/rwd/zh/afterTrading/STOCK_DAY"
+TWSE_STOCK_DAY_URL = "https://wwwc.twse.com.tw/rwd/zh/afterTrading/STOCK_DAY"
 TPEX_DAILY_QUOTES_URL = "https://www.tpex.org.tw/www/zh-tw/afterTrading/dailyQuotes"
 HTTP_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; stockAgent-data-audit/1.0)"}
 

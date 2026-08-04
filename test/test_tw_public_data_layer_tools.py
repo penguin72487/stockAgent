@@ -34,12 +34,14 @@ from scripts.audit_tw_public_data_layer import (
 from scripts.rebuild_tw_public_data_layer import (
     RebuildRunner,
     _daily_yahoo_refresh_symbols,
+    _daily_baseline_ready,
     _default_tw_end_date,
     _file_receipt as _runner_file_receipt,
     _promote_one,
     _retained_daily_yahoo_symbols,
     _rollback_promoted_tree,
     _validate_corporate_action_entitlements,
+    _validate_daily_canonical_close,
     _validate_official_symbol_build_summary,
 )
 from scripts.build_tw_official_symbol_parquets import (
@@ -78,6 +80,38 @@ def test_daily_yahoo_refresh_symbols_extracts_only_actionable_gaps(tmp_path: Pat
     )
 
     assert _daily_yahoo_refresh_symbols(summary) == ["4526", "8926"]
+
+
+def test_daily_canonical_close_requires_benchmark_through_latest_session(
+    tmp_path: Path,
+) -> None:
+    public_dir = tmp_path / "data_tw_public"
+    stock_root = public_dir / "stocks"
+    stock_root.mkdir(parents=True)
+    pl.DataFrame(
+        {"date": [date(2026, 7, 24), date(2026, 7, 27)]}
+    ).write_parquet(public_dir / "twse_taiex_ohlc.parquet")
+    pl.DataFrame(
+        {"date": [date(2026, 7, 24)]}
+    ).write_parquet(stock_root / "2330_features.parquet")
+
+    with pytest.raises(RuntimeError, match="canonical stock data is stale"):
+        _validate_daily_canonical_close(
+            stock_root=stock_root,
+            public_dir=public_dir,
+            benchmark_name="2330",
+            requested_end=date(2026, 7, 27),
+        )
+
+    pl.DataFrame(
+        {"date": [date(2026, 7, 24), date(2026, 7, 27)]}
+    ).write_parquet(stock_root / "2330_features.parquet")
+    _validate_daily_canonical_close(
+        stock_root=stock_root,
+        public_dir=public_dir,
+        benchmark_name="2330",
+        requested_end=date(2026, 7, 27),
+    )
 
 
 def test_daily_yahoo_refresh_symbols_rejects_non_yahoo_failures(tmp_path: Path) -> None:
@@ -214,7 +248,7 @@ def _write_verified_taiex_calendar(
             "_source_product": ["indicesReport/MI_5MINS_HIST"] * len(dates),
             "_request_month": [value.strftime("%Y-%m") for value in dates],
             "_downloaded_at_utc": ["2026-07-12T00:00:00+00:00"] * len(dates),
-            "_url": ["https://www.twse.com.tw/indicesReport/MI_5MINS_HIST"]
+            "_url": ["https://wwwc.twse.com.tw/indicesReport/MI_5MINS_HIST"]
             * len(dates),
         }
     ).write_parquet(path)
@@ -423,6 +457,97 @@ def test_undeclared_public_download_failure_remains_critical(
     assert any(item.code == "public_download_failures" for item in findings)
 
 
+def test_daily_close_publication_lag_receipt_is_accepted(
+    tmp_path: Path,
+) -> None:
+    config = load_config("configs/markets/tw_public.yaml")
+    lag_datasets = [
+        "twse_daily_valuation",
+        "twse_day_trade_eligibility",
+    ]
+    (tmp_path / "download_summary.json").write_text(
+        json.dumps(
+            {
+                "mode": "daily",
+                "end_date": "2026-07-30",
+                "daily_close_ready": True,
+                "coverage_complete": False,
+                "failed_count": len(lag_datasets),
+                "allowed_failed_count": 0,
+                "blocking_failed_count": 0,
+                "allowed_failed_datasets": [],
+                "configured_allowed_failed_datasets": [],
+                "publication_lag_count": len(lag_datasets),
+                "publication_lag_datasets": lag_datasets,
+            }
+        ),
+        encoding="utf-8",
+    )
+    pl.DataFrame(
+        {
+            "dataset": lag_datasets,
+            "status": ["failed", "failed"],
+            "failed_dates": [1, 1],
+            "missing_dates_after": [1, 1],
+            "message": [
+                "1 date request(s) failed: 2026-07-30",
+                "1 date request(s) failed: 2026-07-30",
+            ],
+        }
+    ).write_csv(tmp_path / "download_report.csv")
+
+    summary, findings = audit_source_receipts(tmp_path, config)
+
+    assert summary["public_download_daily_publication_lag_valid"] is True
+    assert summary["public_download_nonblocking_failures_valid"] is True
+    assert not any(
+        item.code
+        in {"public_download_failures", "incomplete_public_download_coverage"}
+        for item in findings
+    )
+
+
+def test_daily_close_historical_gap_remains_critical(
+    tmp_path: Path,
+) -> None:
+    config = load_config("configs/markets/tw_public.yaml")
+    (tmp_path / "download_summary.json").write_text(
+        json.dumps(
+            {
+                "mode": "daily",
+                "end_date": "2026-07-30",
+                "daily_close_ready": True,
+                "coverage_complete": False,
+                "failed_count": 1,
+                "allowed_failed_count": 0,
+                "blocking_failed_count": 0,
+                "allowed_failed_datasets": [],
+                "configured_allowed_failed_datasets": [],
+                "publication_lag_count": 1,
+                "publication_lag_datasets": ["twse_daily_valuation"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    pl.DataFrame(
+        {
+            "dataset": ["twse_daily_valuation"],
+            "status": ["failed"],
+            "failed_dates": [2],
+            "missing_dates_after": [2],
+            "message": ["2 date request(s) failed: 2026-07-29, 2026-07-30"],
+        }
+    ).write_csv(tmp_path / "download_report.csv")
+
+    summary, findings = audit_source_receipts(tmp_path, config)
+
+    assert summary["public_download_daily_publication_lag_valid"] is False
+    assert any(item.code == "public_download_failures" for item in findings)
+    assert any(
+        item.code == "incomplete_public_download_coverage" for item in findings
+    )
+
+
 def test_rule_receipt_is_required_and_machine_checked(tmp_path: Path) -> None:
     config = load_config("configs/markets/tw_public.yaml")
     (tmp_path / "download_summary.json").write_text(
@@ -463,7 +588,7 @@ def test_rule_receipt_is_required_and_machine_checked(tmp_path: Path) -> None:
             "_source_product": ["indicesReport/MI_5MINS_HIST"],
             "_request_month": ["1999-01"],
             "_downloaded_at_utc": ["2026-07-11T00:00:00+00:00"],
-            "_url": ["https://www.twse.com.tw/indicesReport/MI_5MINS_HIST"],
+            "_url": ["https://wwwc.twse.com.tw/indicesReport/MI_5MINS_HIST"],
         }
     ).write_parquet(taiex_path)
     taiex_receipt = _file_content_receipt(taiex_path)
@@ -729,6 +854,39 @@ def test_historical_source_audit_separates_observed_and_receipt_resolved_session
         and item.item == "tpex_margin_balance"
         for item in findings
     )
+
+    state["coverage_complete"] = False
+    state["failed_dates"] = {
+        "2007-06-05": "official TPEx report returned no rows on a validated open session"
+    }
+    state["missing_dates_after"] = 1
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    (tmp_path / "download_summary.json").write_text(
+        json.dumps(
+            {
+                "mode": "daily",
+                "end_date": "2007-06-05",
+                "daily_close_ready": True,
+                "blocking_failed_count": 0,
+                "publication_lag_count": 1,
+                "publication_lag_datasets": ["tpex_margin_balance"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    pl.DataFrame(
+        {
+            "dataset": ["tpex_margin_balance"],
+            "status": ["failed"],
+            "failed_dates": [1],
+            "missing_dates_after": [1],
+            "message": ["1 date request(s) failed: 2007-06-05"],
+        }
+    ).write_csv(tmp_path / "download_report.csv")
+    profiles, findings = audit_historical_sources(tmp_path, expected, config)
+    profile = next(item for item in profiles if item.source == "tpex_margin_balance")
+    assert profile.source_unavailable_sessions == 1
+    assert profile.resolved_session_coverage == 1.0
 
     raw_path.write_bytes(raw_content + b" ")
     profiles, findings = audit_historical_sources(tmp_path, expected, config)
@@ -1650,6 +1808,34 @@ def test_single_promotion_restores_old_data_when_new_move_fails(
     assert (production / "marker").read_text(encoding="utf-8") == "old"
     assert (staged / "marker").read_text(encoding="utf-8") == "new"
     assert not backup.exists()
+
+
+def test_daily_baseline_requires_all_canonical_outputs(tmp_path: Path) -> None:
+    public_dir = tmp_path / "data_tw_public"
+    stock_root = public_dir / "stocks"
+    feature_path = public_dir / "features" / "tw_public_stock_daily.parquet"
+
+    assert not _daily_baseline_ready(
+        stock_root=stock_root,
+        public_dir=public_dir,
+        public_feature_path=feature_path,
+        benchmark_name="2330",
+    )
+
+    for path in (
+        stock_root / "2330_features.parquet",
+        public_dir / "twse_taiex_ohlc.parquet",
+        feature_path,
+    ):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+
+    assert _daily_baseline_ready(
+        stock_root=stock_root,
+        public_dir=public_dir,
+        public_feature_path=feature_path,
+        benchmark_name="2330",
+    )
 
 
 def test_single_public_tree_promotion_can_roll_back(tmp_path: Path) -> None:

@@ -14,6 +14,10 @@ import polars as pl
 import pytest
 
 from downloader import download_tw_public_data as twpub
+from downloader.tw_public_contract import (
+    DAILY_CLOSE_CORE_DATASETS,
+    DAILY_CLOSE_OPTIONAL_DATASETS,
+)
 
 
 def _historical_args(
@@ -387,7 +391,7 @@ def test_v7_rebuild_refetches_only_retitled_stale_mi_index_raw_receipt(
         description="bounded market-index contract test",
         tags=("twse", "index"),
         url_template=(
-            "https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX"
+            "https://wwwc.twse.com.tw/rwd/zh/afterTrading/MI_INDEX"
             "?date={date}&type=IND&response=json"
         ),
         date_format="%Y%m%d",
@@ -1189,11 +1193,12 @@ def test_twse_market_index_retitled_stale_response_resets_session_and_uses_fallb
         FakeResponse(payload("20150130", "9,361.91")),
     ]
     requested_urls: list[str] = []
+    retry_security_blocks: list[bool] = []
     discarded_sessions: list[bool] = []
 
     def fake_get(url: str, **kwargs):
         requested_urls.append(url)
-        assert kwargs["retry_security_blocks"] is False
+        retry_security_blocks.append(kwargs["retry_security_blocks"])
         return responses.pop(0)
 
     monkeypatch.setattr(twpub, "_http_get", fake_get)
@@ -1221,6 +1226,7 @@ def test_twse_market_index_retitled_stale_response_resets_session_and_uses_fallb
     assert result.url == requested_urls[2]
     assert result.response_attempts == 3
     assert discarded_sessions == [True, True]
+    assert retry_security_blocks == [False, True, True]
     assert responses == []
 
 
@@ -1535,10 +1541,11 @@ def test_twse_cross_checked_empty_retries_cache_busted_and_keeps_failure_receipt
         FakeResponse(final_content),
     ]
     requested_urls: list[str] = []
+    retry_security_blocks: list[bool] = []
 
     def fake_get(url: str, **kwargs):
         requested_urls.append(url)
-        assert kwargs["retry_security_blocks"] is False
+        retry_security_blocks.append(kwargs["retry_security_blocks"])
         return responses.pop(0)
 
     class FakeLimiter:
@@ -1583,6 +1590,7 @@ def test_twse_cross_checked_empty_retries_cache_busted_and_keeps_failure_receipt
     assert limiter.deferrals == [0.25]
     assert sleeps == [0.25]
     assert responses == []
+    assert retry_security_blocks == [False, True, True]
     assert result.raw_path is not None
     receipt = Path(result.raw_path)
     assert receipt.parent == tmp_path / "raw_failures" / spec.name
@@ -1721,10 +1729,11 @@ def test_twse_semantic_fallback_retry_uses_unique_cache_key(
         FakeResponse(correct_day),
     ]
     requested_urls: list[str] = []
+    retry_security_blocks: list[bool] = []
 
     def fake_get(url: str, **kwargs):
         requested_urls.append(url)
-        assert kwargs["retry_security_blocks"] is False
+        retry_security_blocks.append(kwargs["retry_security_blocks"])
         return responses.pop(0)
 
     monkeypatch.setattr(twpub, "_http_get", fake_get)
@@ -1744,6 +1753,7 @@ def test_twse_semantic_fallback_retry_uses_unique_cache_key(
 
     assert result.error is None
     assert result.frame.height == 1
+    assert retry_security_blocks == [False, True, True]
     assert "/rwd/zh/afterTrading/BWIBBU_d" in requested_urls[0]
     assert "/exchangeReport/BWIBBU_d" in requested_urls[1]
     assert requested_urls[2] == f"{requested_urls[1]}&_=123456789"
@@ -2226,7 +2236,7 @@ def test_waf_cooldown_honors_retry_after_when_it_is_longer():
     assert twpub._retry_delay_seconds(response, 0, 1.0) == 75.0
 
 
-def test_http_security_block_can_switch_to_semantic_fallback_without_same_url_retry(
+def test_http_security_block_can_switch_to_semantic_fallback_without_cooldown(
     monkeypatch,
 ):
     class FakeLimiter:
@@ -2275,11 +2285,11 @@ def test_http_security_block_can_switch_to_semantic_fallback_without_same_url_re
     assert response.status_code == 307
     assert session.calls == 1
     assert limiter.waits == 1
-    assert limiter.deferrals == [twpub.TW_PUBLIC_WAF_COOLDOWN_SECONDS]
-    assert sleeps == [twpub.TW_PUBLIC_WAF_COOLDOWN_SECONDS]
+    assert limiter.deferrals == []
+    assert sleeps == []
 
 
-def test_historical_waf_switches_to_official_fallback_with_one_global_cooldown(
+def test_historical_waf_switches_to_official_fallback_without_primary_cooldown(
     tmp_path: Path,
     monkeypatch,
 ):
@@ -2355,8 +2365,8 @@ def test_historical_waf_switches_to_official_fallback_with_one_global_cooldown(
     assert result.frame.height == 1
     assert result.response_attempts == 2
     assert limiter.waits == 2
-    assert limiter.deferrals == [twpub.TW_PUBLIC_WAF_COOLDOWN_SECONDS]
-    assert sleeps == [twpub.TW_PUBLIC_WAF_COOLDOWN_SECONDS]
+    assert limiter.deferrals == []
+    assert sleeps == []
     assert discarded_sessions == [True]
     assert session.responses == []
 
@@ -2458,6 +2468,23 @@ def test_select_specs_accepts_tags_and_names():
     assert "twse_daily_ohlcv" in names
     assert "cbc_overnight_rate" in names
     assert "dgbas_unemployment_rate" in names
+
+
+def test_daily_close_contract_separates_core_ohlcv_from_late_publications():
+    assert DAILY_CLOSE_CORE_DATASETS == {
+        "twse_daily_ohlcv",
+        "tpex_daily_ohlcv",
+    }
+    assert DAILY_CLOSE_CORE_DATASETS.isdisjoint(DAILY_CLOSE_OPTIONAL_DATASETS)
+    assert {
+        "twse_daily_valuation",
+        "tpex_daily_valuation",
+        "twse_institutional_trades",
+        "tpex_institutional_trades",
+        "twse_margin_balance",
+        "tpex_margin_balance",
+        "twse_day_trade_eligibility",
+    } <= DAILY_CLOSE_OPTIONAL_DATASETS
 
 
 def test_model_useful_group_is_curated_and_has_unique_dataset_names():
@@ -4235,3 +4262,100 @@ def test_tpex_dependency_scheduler_runs_calendar_phase_first(
         ["twse_daily_ohlcv", "tpex_daily_ohlcv"],
         ["tpex_margin_balance"],
     ]
+
+
+def test_daily_close_publication_gate_rejects_stale_exchange_ohlcv(
+    tmp_path: Path,
+):
+    requested = date(2026, 7, 27)
+    _write_validated_taiex_calendar(
+        tmp_path,
+        [requested],
+        coverage_start=requested,
+        coverage_end=requested,
+    )
+    for name in ("twse_daily_ohlcv", "tpex_daily_ohlcv"):
+        pl.DataFrame({"date": [date(2026, 7, 24)]}).write_parquet(
+            tmp_path / f"{name}.parquet"
+        )
+    specs = [
+        twpub.DEFAULT_DATASETS["twse_daily_ohlcv"],
+        twpub.DEFAULT_DATASETS["tpex_daily_ohlcv"],
+    ]
+    results = [
+        twpub.DownloadResult(name, "ok", 1, None, coverage_complete=True)
+        for name in ("twse_daily_ohlcv", "tpex_daily_ohlcv")
+    ]
+    args = SimpleNamespace(
+        mode="daily",
+        end_date=requested.isoformat(),
+        require_daily_close_publication=True,
+    )
+
+    with pytest.raises(RuntimeError, match="daily close publication pending"):
+        twpub._require_daily_close_publication(
+            specs,
+            args,
+            tmp_path,
+            results,
+        )
+
+
+def test_daily_close_publication_gate_accepts_current_exchange_ohlcv(
+    tmp_path: Path,
+):
+    requested = date(2026, 7, 27)
+    _write_validated_taiex_calendar(
+        tmp_path,
+        [requested],
+        coverage_start=requested,
+        coverage_end=requested,
+    )
+    for name in ("twse_daily_ohlcv", "tpex_daily_ohlcv"):
+        pl.DataFrame({"date": [requested]}).write_parquet(
+            tmp_path / f"{name}.parquet"
+        )
+    specs = [
+        twpub.DEFAULT_DATASETS["twse_daily_ohlcv"],
+        twpub.DEFAULT_DATASETS["tpex_daily_ohlcv"],
+    ]
+    results = [
+        twpub.DownloadResult(name, "ok", 1, None, coverage_complete=True)
+        for name in ("twse_daily_ohlcv", "tpex_daily_ohlcv")
+    ]
+    args = SimpleNamespace(
+        mode="daily",
+        end_date=requested.isoformat(),
+        require_daily_close_publication=True,
+    )
+
+    twpub._require_daily_close_publication(
+        specs,
+        args,
+        tmp_path,
+        results,
+    )
+
+
+def test_daily_download_skips_superseded_tdcc_endpoint(monkeypatch, tmp_path: Path):
+    direct = twpub.DEFAULT_DATASETS["tdcc_shareholding_distribution"]
+    mirror = twpub.DEFAULT_DATASETS["data_gov_tdcc_shareholding_distribution"]
+    requested: list[str] = []
+    args = SimpleNamespace(mode="daily", workers=2)
+
+    monkeypatch.setattr(
+        twpub,
+        "download_dataset",
+        lambda spec, args, output_dir: (
+            requested.append(spec.name)
+            or twpub.DownloadResult(spec.name, "ok", 1, str(output_dir / f"{spec.name}.parquet"))
+        ),
+    )
+
+    results = twpub._run_selected_downloads([direct, mirror], args, tmp_path)
+
+    assert requested == ["data_gov_tdcc_shareholding_distribution"]
+    assert {row.dataset: row.status for row in results} == {
+        "tdcc_shareholding_distribution": "up_to_date",
+        "data_gov_tdcc_shareholding_distribution": "ok",
+    }
