@@ -22,7 +22,7 @@ def test_day_trade_history_specs_use_official_daily_endpoints() -> None:
     assert tpex.start_date == "2014-01-06"
     assert "tpex_day_trade_eligibility" in downloader.TPEX_SESSION_DEPENDENT_DATASETS
     assert downloader._historical_request_info(twse, date(2024, 7, 15))[0] == (
-        "https://www.twse.com.tw/rwd/zh/dayTrading/TWTB4U"
+        "https://wwwc.twse.com.tw/rwd/zh/dayTrading/TWTB4U"
         "?date=20240715&selectType=All&response=json"
     )
     assert downloader._historical_request_info(tpex, date(2024, 7, 15))[0] == (

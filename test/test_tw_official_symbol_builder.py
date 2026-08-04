@@ -239,7 +239,7 @@ def _write_verified_taiex_calendar(
             "_source_product": ["indicesReport/MI_5MINS_HIST"] * len(dates),
             "_request_month": [value.strftime("%Y-%m") for value in dates],
             "_downloaded_at_utc": ["2026-07-12T00:00:00+00:00"] * len(dates),
-            "_url": ["https://www.twse.com.tw/indicesReport/MI_5MINS_HIST"]
+            "_url": ["https://wwwc.twse.com.tw/indicesReport/MI_5MINS_HIST"]
             * len(dates),
         }
     ).write_parquet(path)

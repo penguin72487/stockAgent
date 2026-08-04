@@ -195,8 +195,8 @@ def test_split_reconstruction_uses_ratio_squared_and_drops_off_calendar_rows(
             "market": ["twse", "twse"],
             "previous_close": [19.5, 31.0],
             "source_url": [
-                "https://www.twse.com.tw/rwd/zh/exRight/TWT49U",
-                "https://www.twse.com.tw/rwd/zh/exRight/TWT49U",
+                "https://wwwc.twse.com.tw/rwd/zh/exRight/TWT49U",
+                "https://wwwc.twse.com.tw/rwd/zh/exRight/TWT49U",
             ],
         }
     )

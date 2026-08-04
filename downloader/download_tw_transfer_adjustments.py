@@ -38,7 +38,7 @@ RULE_URL = (
     "https://twse-regulation.twse.com.tw/TW/law/DAT06.aspx"
     "?FLCODE=FL007304&FLDATE=20020730&LSER=001"
 )
-FMSRFK_URL = "https://www.twse.com.tw/rwd/zh/afterTrading/FMSRFK"
+FMSRFK_URL = "https://wwwc.twse.com.tw/rwd/zh/afterTrading/FMSRFK"
 YAHOO_METADATA_KEYS = {
     "source": b"stockagent.source",
     "asset_class": b"stockagent.asset_class",

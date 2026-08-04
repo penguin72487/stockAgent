@@ -43,6 +43,17 @@ def test_discord_tw_market_uses_canonical_official_data_layer() -> None:
     assert "audit_ohlcv_data.py" not in command
 
 
+def test_discord_tw_day_trade_uses_its_point_in_time_data_contract() -> None:
+    cfg = load_market_config("services/discord_bot/markets/tw_day_trade.yaml")
+    command = " ".join(cfg.pre_signal_command)
+
+    assert "downloader/download_tw_official_data.py" in command
+    assert "--config configs/deployments/tw_day_trade.yaml" in command
+    assert "--public-dir data_tw_public" in command
+    assert "--stock-root data_tw_public/stocks" in command
+    assert "--ohlcv-fallback none" in command
+
+
 def test_daily_downloader_keeps_tw_out_of_legacy_yahoo_tree() -> None:
     script = Path("downloader/run_daily_all_markets.sh").read_text(encoding="utf-8")
 

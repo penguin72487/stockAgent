@@ -407,7 +407,7 @@ HISTORICAL_DAILY_DATASETS: tuple[DatasetSpec, ...] = (
         description="TWSE listed daily OHLCV from official historical MI_INDEX JSON.",
         tags=("twse", "price", "liquidity", "daily", "historical"),
         url_template=(
-            "https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX"
+            "https://wwwc.twse.com.tw/rwd/zh/afterTrading/MI_INDEX"
             "?date={date}&type=ALLBUT0999&response=json"
         ),
         date_format="%Y%m%d",
@@ -421,7 +421,7 @@ HISTORICAL_DAILY_DATASETS: tuple[DatasetSpec, ...] = (
         description="TWSE market index tables from official historical MI_INDEX JSON.",
         tags=("twse", "index", "market", "daily", "historical"),
         url_template=(
-            "https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX"
+            "https://wwwc.twse.com.tw/rwd/zh/afterTrading/MI_INDEX"
             "?date={date}&type=IND&response=json"
         ),
         date_format="%Y%m%d",
@@ -435,7 +435,7 @@ HISTORICAL_DAILY_DATASETS: tuple[DatasetSpec, ...] = (
         description="TWSE margin and short balance from official historical MI_MARGN JSON.",
         tags=("twse", "chip", "margin", "daily", "historical"),
         url_template=(
-            "https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN"
+            "https://wwwc.twse.com.tw/rwd/zh/marginTrading/MI_MARGN"
             "?date={date}&selectType=ALL&response=json"
         ),
         date_format="%Y%m%d",
@@ -449,7 +449,7 @@ HISTORICAL_DAILY_DATASETS: tuple[DatasetSpec, ...] = (
         description="TWSE three major institutional investors by stock from official T86 JSON.",
         tags=("twse", "chip", "institutional", "daily", "historical"),
         url_template=(
-            "https://www.twse.com.tw/rwd/zh/fund/T86"
+            "https://wwwc.twse.com.tw/rwd/zh/fund/T86"
             "?date={date}&selectType=ALLBUT0999&response=json"
         ),
         date_format="%Y%m%d",
@@ -462,7 +462,7 @@ HISTORICAL_DAILY_DATASETS: tuple[DatasetSpec, ...] = (
         description="TWSE daily dividend yield, PE, and PB by stock.",
         tags=("twse", "fundamental", "valuation", "daily", "historical"),
         url_template=(
-            "https://www.twse.com.tw/rwd/zh/afterTrading/BWIBBU_d"
+            "https://wwwc.twse.com.tw/rwd/zh/afterTrading/BWIBBU_d"
             "?date={date}&selectType=ALL&response=json"
         ),
         date_format="%Y%m%d",
@@ -478,7 +478,7 @@ HISTORICAL_DAILY_DATASETS: tuple[DatasetSpec, ...] = (
         ),
         tags=("twse", "execution", "day-trade", "daily", "historical"),
         url_template=(
-            "https://www.twse.com.tw/rwd/zh/dayTrading/TWTB4U"
+            "https://wwwc.twse.com.tw/rwd/zh/dayTrading/TWTB4U"
             "?date={date}&selectType=All&response=json"
         ),
         date_format="%Y%m%d",
@@ -2603,7 +2603,7 @@ def _http_get(
         "User-Agent": USER_AGENT,
         "Accept": "application/json,text/csv,text/plain,text/javascript,application/xml,text/xml,*/*;q=0.8",
         "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
-        "Referer": "https://www.twse.com.tw/",
+        "Referer": "https://wwwc.twse.com.tw/",
         "X-Requested-With": "XMLHttpRequest",
     }
     retry_count = max(0, int(retries))
@@ -2672,10 +2672,12 @@ def _http_get(
                 response = request_once(session, verify=False)
             security_block = _response_is_tw_public_security_block(response)
             if security_block:
+                if not retry_security_blocks:
+                    return annotate_attempts(response)
                 delay = _retry_delay_seconds(response, attempt, retry_backoff)
                 limiter.defer(delay)
                 time.sleep(delay)
-                if not retry_security_blocks or attempt >= retry_count:
+                if attempt >= retry_count:
                     return annotate_attempts(response)
                 close_response(response)
                 continue
@@ -5130,7 +5132,7 @@ def _download_historical_date(
                     verify_ssl=bool(args.verify_ssl),
                     retries=int(args.retries),
                     retry_backoff=float(args.retry_backoff),
-                    retry_security_blocks=False,
+                    retry_security_blocks=request_url_index == len(request_urls) - 1,
                 )
                 total_response_attempts += max(
                     1,

@@ -34,6 +34,7 @@ from scripts.audit_tw_public_data_layer import (
 from scripts.rebuild_tw_public_data_layer import (
     RebuildRunner,
     _daily_yahoo_refresh_symbols,
+    _daily_baseline_ready,
     _default_tw_end_date,
     _file_receipt as _runner_file_receipt,
     _promote_one,
@@ -247,7 +248,7 @@ def _write_verified_taiex_calendar(
             "_source_product": ["indicesReport/MI_5MINS_HIST"] * len(dates),
             "_request_month": [value.strftime("%Y-%m") for value in dates],
             "_downloaded_at_utc": ["2026-07-12T00:00:00+00:00"] * len(dates),
-            "_url": ["https://www.twse.com.tw/indicesReport/MI_5MINS_HIST"]
+            "_url": ["https://wwwc.twse.com.tw/indicesReport/MI_5MINS_HIST"]
             * len(dates),
         }
     ).write_parquet(path)
@@ -587,7 +588,7 @@ def test_rule_receipt_is_required_and_machine_checked(tmp_path: Path) -> None:
             "_source_product": ["indicesReport/MI_5MINS_HIST"],
             "_request_month": ["1999-01"],
             "_downloaded_at_utc": ["2026-07-11T00:00:00+00:00"],
-            "_url": ["https://www.twse.com.tw/indicesReport/MI_5MINS_HIST"],
+            "_url": ["https://wwwc.twse.com.tw/indicesReport/MI_5MINS_HIST"],
         }
     ).write_parquet(taiex_path)
     taiex_receipt = _file_content_receipt(taiex_path)
@@ -1807,6 +1808,34 @@ def test_single_promotion_restores_old_data_when_new_move_fails(
     assert (production / "marker").read_text(encoding="utf-8") == "old"
     assert (staged / "marker").read_text(encoding="utf-8") == "new"
     assert not backup.exists()
+
+
+def test_daily_baseline_requires_all_canonical_outputs(tmp_path: Path) -> None:
+    public_dir = tmp_path / "data_tw_public"
+    stock_root = public_dir / "stocks"
+    feature_path = public_dir / "features" / "tw_public_stock_daily.parquet"
+
+    assert not _daily_baseline_ready(
+        stock_root=stock_root,
+        public_dir=public_dir,
+        public_feature_path=feature_path,
+        benchmark_name="2330",
+    )
+
+    for path in (
+        stock_root / "2330_features.parquet",
+        public_dir / "twse_taiex_ohlc.parquet",
+        feature_path,
+    ):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+
+    assert _daily_baseline_ready(
+        stock_root=stock_root,
+        public_dir=public_dir,
+        public_feature_path=feature_path,
+        benchmark_name="2330",
+    )
 
 
 def test_single_public_tree_promotion_can_roll_back(tmp_path: Path) -> None:
