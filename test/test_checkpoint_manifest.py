@@ -1193,6 +1193,25 @@ def test_checkpoint_validation_rejects_wrong_fold_year_contract(tmp_path: Path) 
         )
 
 
+def test_checkpoint_loader_safely_allows_local_posix_paths(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "checkpoint_best.pt"
+    _atomic_torch_save(
+        {
+            "model_state_dict": {"weight": torch.ones(1)},
+            "artifact_root": tmp_path,
+        },
+        checkpoint_path,
+    )
+
+    checkpoint = _load_checkpoint(checkpoint_path)
+
+    assert checkpoint["artifact_root"] == tmp_path
+    torch.testing.assert_close(
+        checkpoint["model_state_dict"]["weight"],
+        torch.ones(1),
+    )
+
+
 def test_explainability_rejects_checkpoint_feature_schema_mismatch(tmp_path: Path) -> None:
     panel = _panel()
     config = _config()

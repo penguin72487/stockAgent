@@ -17,7 +17,10 @@ class CrossSectionalIndexFuturesModel(TransformerBasePortfolioModel):
     TX, MTX, and TMF share the same underlying index.  Product selection and
     integer sizing therefore belong to execution, not to three independent
     model heads.  This head attention-pools the final stock embeddings and
-    returns one bounded scalar per decision row.
+    owns one bounded scalar per decision row. For compatibility with the
+    canonical trainer ABI it returns that scalar distributed across the valid
+    stock slots; the futures executor collapses the vector by summation before
+    trading. No component of this vector is a stock position.
     """
 
     def __init__(
@@ -112,9 +115,11 @@ class CrossSectionalIndexFuturesModel(TransformerBasePortfolioModel):
             torch.tanh(exposure_logit) * float(self.max_abs_exposure)
         )
         exposure = torch.where(has_stocks, exposure, torch.zeros_like(exposure))
+        pseudo_weights = pool_weights * exposure.unsqueeze(-1)
+        pseudo_scores = pool_weights * exposure_logit.unsqueeze(-1)
 
         if return_scores:
-            return exposure, exposure_logit
+            return pseudo_weights, pseudo_scores
         include_aux = bool(return_aux is True or (return_aux is None and self.return_aux))
         if include_aux:
             output_aux = dict(aux)
@@ -128,16 +133,16 @@ class CrossSectionalIndexFuturesModel(TransformerBasePortfolioModel):
                 }
             )
             if return_aux is True:
-                return exposure, exposure_logit, output_aux
+                return pseudo_weights, pseudo_scores, output_aux
             return {
-                "weights": exposure,
-                "scores": exposure_logit,
+                "weights": pseudo_weights,
+                "scores": pseudo_scores,
                 "futures_exposure": exposure,
                 "futures_exposure_logit": exposure_logit,
                 "aux": output_aux,
                 **output_aux,
             }
-        return exposure
+        return pseudo_weights
 
 
 __all__ = ["CrossSectionalIndexFuturesModel"]

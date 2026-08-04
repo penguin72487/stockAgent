@@ -18,7 +18,7 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass, field
 from datetime import timedelta
 from functools import partial, wraps
-from pathlib import Path
+from pathlib import Path, PosixPath
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 import numpy as np
@@ -60,6 +60,7 @@ from stockagent.backtest.simulator import (
 )
 from stockagent.backtest.tw_execution import (
     TW_CARRYING_EXECUTION_MODES,
+    TW_STOCK_EXECUTION_MODES,
     TaiwanFeeSchedule,
     TaiwanMarginShortSchedule,
     commission_rebate_rate_vector,
@@ -67,6 +68,10 @@ from stockagent.backtest.tw_execution import (
     lot_size_vector,
     normalize_execution_mode,
     official_tw_short_initial_margin_rates,
+)
+from stockagent.backtest.tw_index_futures import (
+    FuturesCostSchedule,
+    TW_INDEX_FUTURES_DAY_BACKTEST_CONTRACT_VERSION,
 )
 from stockagent.backtest.tw_continuous import get_tw_continuous_compile_stats
 from stockagent.backtest.tw_dual_session_compiled import (
@@ -80,6 +85,7 @@ from stockagent.backtest.tw_integer_execution import (
 )
 from stockagent.config import ExperimentConfig
 from stockagent.data.panel import PanelData
+from stockagent.data.tw_index_futures import TaiwanIndexFuturesDaySession
 from stockagent.data.panel_cache import array_content_fingerprint
 from stockagent.data.walkforward import WalkForwardFold, normalize_lookback_context
 from stockagent.evaluation.metrics import compute_ic_series_torch, ic_summary
@@ -559,6 +565,10 @@ class _ExecutionRuntime:
     short_capacity_limit_enabled: bool = True
     corporate_action_mode: str = "avoid"
     claim_queue_sessions: int = 2
+    futures_market: TaiwanIndexFuturesDaySession | None = None
+    futures_cost_schedule: FuturesCostSchedule | None = None
+    futures_initial_capital: float = 1_000_000.0
+    futures_max_abs_exposure: float = 1.0
 
 
 def _build_execution_runtime(
@@ -581,6 +591,50 @@ def _build_execution_runtime(
             ),
             lot_sizes=None,
             settlement_lag_sessions=lag,
+        )
+    if mode == "tw_index_futures_day":
+        market = getattr(panel, "index_futures_day_session", None)
+        if market is None:
+            raise ValueError(
+                "tw_index_futures_day requires aligned TAIFEX data attached by train.py"
+            )
+        exchange_fees = tuple(
+            float(value)
+            for value in config.trading.tw_index_futures_exchange_and_clearing_fee_per_side_twd
+        )
+        total_fees = tuple(
+            float(value)
+            for value in config.trading.tw_index_futures_total_fee_per_side_twd
+        )
+        broker_fees = tuple(
+            total - exchange
+            for total, exchange in zip(total_fees, exchange_fees, strict=True)
+        )
+        schedule = FuturesCostSchedule(
+            exchange_and_clearing_fee_per_side_twd=exchange_fees,
+            broker_fee_per_side_twd=broker_fees,
+            slippage_points_per_side=tuple(
+                float(value)
+                for value in config.trading.tw_index_futures_slippage_points_per_side
+            ),
+            basket_fee_penalty=float(
+                config.trading.tw_index_futures_basket_fee_penalty
+            ),
+        )
+        return _ExecutionRuntime(
+            mode=mode,
+            buy_fee_rates=None,
+            sell_fee_rates=None,
+            lot_sizes=None,
+            settlement_lag_sessions=0,
+            futures_market=market,
+            futures_cost_schedule=schedule,
+            futures_initial_capital=float(
+                config.trading.tw_index_futures_initial_capital
+            ),
+            futures_max_abs_exposure=float(
+                config.trading.tw_index_futures_max_abs_exposure
+            ),
         )
     if mode in TW_CARRYING_EXECUTION_MODES and not bool(config.trading.long_only):
         if (
@@ -762,6 +816,15 @@ def _integer_execution_runtime_kwargs(
     kwargs: dict[str, Any] = {"execution_mode": runtime.mode}
     if runtime.mode == "naive":
         return kwargs
+    if runtime.mode == "tw_index_futures_day":
+        if runtime.futures_market is None or runtime.futures_cost_schedule is None:
+            raise RuntimeError("futures integer audit runtime is incomplete")
+        kwargs.update(
+            futures_market=runtime.futures_market,
+            futures_cost_schedule=runtime.futures_cost_schedule,
+            futures_max_abs_exposure=runtime.futures_max_abs_exposure,
+        )
+        return kwargs
     if (
         runtime.buy_fee_rates is None
         or runtime.sell_fee_rates is None
@@ -860,6 +923,8 @@ def _integer_audit_initial_capital(
 
     if runtime.mode == "naive":
         return 1_000_000.0
+    if runtime.mode == "tw_index_futures_day":
+        return float(runtime.futures_initial_capital)
     capital = float(config.trading.volume_participation_equity)
     if not math.isfinite(capital) or capital <= 0.0:
         raise ValueError(
@@ -4387,6 +4452,16 @@ def _panel_array_content_fingerprint(
 
 def _active_model_config(config: ExperimentConfig) -> dict[str, Any]:
     normalized = _normalized_model_name(config.training.model_name)
+    if normalized in {
+        "cross_sectional_index_futures",
+        "cross_sectional_index_futures_model",
+        "tw_index_futures",
+    }:
+        return {
+            "config_name": "transformer_base_portfolio",
+            "contract_name": "cross_sectional_index_futures",
+            "values": asdict(config.training.transformer_base_portfolio),
+        }
     aliases = {
         "cross_sectional_mlp": "mlp",
         "ft": "ft_transformer",
@@ -4883,7 +4958,35 @@ def _trading_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
             trading.portfolio_activation
         ),
     }
-    if execution_mode != "naive":
+    if execution_mode == "tw_index_futures_day":
+        contract["taiwan_index_futures_day"] = {
+            "backtest_contract_version": int(
+                TW_INDEX_FUTURES_DAY_BACKTEST_CONTRACT_VERSION
+            ),
+            "data_path": str(trading.tw_index_futures_data_path),
+            "reference_product": str(
+                trading.tw_index_futures_reference_product
+            ),
+            "initial_capital": float(
+                trading.tw_index_futures_initial_capital
+            ),
+            "max_abs_exposure": float(
+                trading.tw_index_futures_max_abs_exposure
+            ),
+            "exchange_and_clearing_fee_per_side_twd": list(
+                trading.tw_index_futures_exchange_and_clearing_fee_per_side_twd
+            ),
+            "total_fee_per_side_twd": list(
+                trading.tw_index_futures_total_fee_per_side_twd
+            ),
+            "slippage_points_per_side": list(
+                trading.tw_index_futures_slippage_points_per_side
+            ),
+            "basket_fee_penalty": float(
+                trading.tw_index_futures_basket_fee_penalty
+            ),
+        }
+    if execution_mode in TW_STOCK_EXECUTION_MODES:
         contract["taiwan_execution"] = {
             "commission_rate": float(trading.tw_commission_rate),
             "commission_discount": float(trading.tw_commission_discount),
@@ -5275,6 +5378,37 @@ def _checkpoint_manifest(
                     ),
                 }
             )
+        if execution_mode == "tw_index_futures_day":
+            futures_market = panel.index_futures_day_session
+            if futures_market is None:
+                raise ValueError(
+                    "tw_index_futures_day checkpoint manifest requires futures data"
+                )
+            panel_arrays.update(
+                {
+                    "index_futures_dates": _array_content_fingerprint(
+                        futures_market.dates
+                    ),
+                    "index_futures_contract_months": _array_content_fingerprint(
+                        futures_market.contract_months
+                    ),
+                    "index_futures_open_prices": _array_content_fingerprint(
+                        futures_market.open_prices
+                    ),
+                    "index_futures_close_prices": _array_content_fingerprint(
+                        futures_market.close_prices
+                    ),
+                    "index_futures_volumes": _array_content_fingerprint(
+                        futures_market.volumes
+                    ),
+                    "index_futures_log_returns": _array_content_fingerprint(
+                        futures_market.log_returns
+                    ),
+                    "index_futures_tradable_mask": _array_content_fingerprint(
+                        futures_market.tradable_mask
+                    ),
+                }
+            )
         if execution_mode in TW_CARRYING_EXECUTION_MODES:
             uses_full_avoidance = (
                 config.trading.tw_corporate_action_mode == "avoid"
@@ -5384,7 +5518,7 @@ def _checkpoint_manifest(
     symbols = [str(symbol) for symbol in panel.symbols]
     feature_names = [str(name) for name in panel.feature_names]
     model_contract = {
-        "model_name": active_model["config_name"],
+        "model_name": active_model.get("contract_name", active_model["config_name"]),
         "model": _checkpoint_model_values(config, active_model, feature_names),
         "lookback": int(config.training.lookback),
         "num_symbols": int(panel.num_symbols),
@@ -5393,7 +5527,7 @@ def _checkpoint_manifest(
         "feature_names": feature_names,
     }
     schema_3_model_contract = {
-        "model_name": active_model["config_name"],
+        "model_name": active_model.get("contract_name", active_model["config_name"]),
         "model": _schema_3_checkpoint_model_values(active_model),
         "lookback": int(config.training.lookback),
         "num_symbols": int(panel.num_symbols),
@@ -6216,7 +6350,26 @@ def _save_tree_checkpoint_metadata(
 
 
 def _load_checkpoint(checkpoint_path: Path) -> dict:
-    return torch.load(checkpoint_path, map_location="cpu")
+    """Load tensor checkpoints without enabling arbitrary pickle globals.
+
+    Project manifests may contain local ``Path`` values. PyTorch 2.6 changed
+    ``torch.load`` to ``weights_only=True`` by default, so explicitly allow the
+    concrete Linux path type while keeping every other non-tensor global
+    blocked.
+    """
+
+    with torch.serialization.safe_globals([PosixPath]):
+        checkpoint = torch.load(
+            checkpoint_path,
+            map_location="cpu",
+            weights_only=True,
+        )
+    if not isinstance(checkpoint, dict):
+        raise TypeError(
+            f"Checkpoint must contain a mapping, got {type(checkpoint).__name__}: "
+            f"{checkpoint_path}"
+        )
+    return checkpoint
 
 
 def _validate_checkpoint_effective_train_batch_size(
@@ -6714,7 +6867,10 @@ def _save_backtest_artifact(
         result.final_alive,
     )
     terminal_field_count = sum(value is not None for value in terminal_fields)
-    if mode != "naive" and terminal_field_count not in {0, len(terminal_fields)}:
+    if mode in TW_STOCK_EXECUTION_MODES and terminal_field_count not in {
+        0,
+        len(terminal_fields),
+    }:
         raise ValueError(
             "backtest artifact terminal fields must be either complete or all omitted"
         )
@@ -6774,14 +6930,18 @@ def _save_backtest_artifact(
         result.receivables_history,
         result.settlement_default,
     )
-    if mode != "naive" and any(value is None for value in ledger_fields):
+    if mode in TW_STOCK_EXECUTION_MODES and any(
+        value is None for value in ledger_fields
+    ):
         raise ValueError(
             f"{mode} backtest artifact requires complete settlement histories"
         )
     ledger_unit = result.settlement_ledger_unit
-    if mode == "naive":
+    if mode not in TW_STOCK_EXECUTION_MODES:
         if ledger_unit not in {None, "none"}:
-            raise ValueError("naive backtest artifact cannot declare settlement ledger units")
+            raise ValueError(
+                f"{mode} backtest artifact cannot declare settlement ledger units"
+            )
         ledger_unit = "none"
     elif ledger_unit not in {"currency", "nav_ratio"}:
         raise ValueError(
@@ -7960,6 +8120,8 @@ def _subset_panel_symbols(
         short_capacity_shares=aligned_2d(panel.short_capacity_shares, 0),
         short_margin_rate=aligned_2d(panel.short_margin_rate, np.nan),
         content_fingerprints=None,
+        index_futures_day_session=panel.index_futures_day_session,
+        index_futures_reference_product=panel.index_futures_reference_product,
     )
 
 
@@ -8087,7 +8249,7 @@ def _save_settlement_audit_artifacts(
     """Persist a row-auditable settlement ledger for Taiwan execution modes."""
 
     execution_mode = normalize_execution_mode(result.execution_mode)
-    if execution_mode == "naive":
+    if execution_mode not in TW_STOCK_EXECUTION_MODES:
         _unlink_table_variants(base_path)
         base_path.with_name(base_path.name + "_summary").with_suffix(".json").unlink(
             missing_ok=True
@@ -8513,7 +8675,7 @@ def _load_backtest_artifact(output_path: Path) -> tuple[BacktestResult, np.ndarr
             ledger_unit = None
         stored_payable_queue_sessions: int | None = None
         stored_receivable_queue_sessions: int | None = None
-        if schema_version >= 4 and execution_mode != "naive":
+        if schema_version >= 4 and execution_mode in TW_STOCK_EXECUTION_MODES:
             queue_metadata = {
                 "payable_queue_sessions",
                 "receivable_queue_sessions",
@@ -8702,7 +8864,7 @@ def _load_backtest_artifact(output_path: Path) -> tuple[BacktestResult, np.ndarr
                 # unambiguous, so it is safe to recover rather than reject.
                 ledger_unit = "currency"
         elif (
-            execution_mode != "naive"
+            execution_mode in TW_STOCK_EXECUTION_MODES
             and ledger_unit is None
             and schema_version == 1
         ):
@@ -8965,7 +9127,7 @@ def _load_backtest_artifact(output_path: Path) -> tuple[BacktestResult, np.ndarr
         raise ValueError(
             "legacy backtest artifact payable and receivable queue histories differ"
         )
-    if schema_version >= 4 and execution_mode != "naive":
+    if schema_version >= 4 and execution_mode in TW_STOCK_EXECUTION_MODES:
         if (
             result.payables_history is None
             or int(np.asarray(result.payables_history).shape[1])
@@ -9078,7 +9240,11 @@ def _load_backtest_artifact(output_path: Path) -> tuple[BacktestResult, np.ndarr
         result.commission_rebate_due_history,
     )
     rebate_history_count = sum(value is not None for value in rebate_histories)
-    if schema_version >= 6 and rebate_history_count != len(rebate_histories):
+    if (
+        schema_version >= 6
+        and execution_mode in TW_STOCK_EXECUTION_MODES
+        and rebate_history_count != len(rebate_histories)
+    ):
         raise ValueError(
             "schema-6 backtest artifact is missing commission rebate histories"
         )
@@ -9140,7 +9306,7 @@ def _load_backtest_artifact(output_path: Path) -> tuple[BacktestResult, np.ndarr
         result.final_alive,
     )
     terminal_field_count = sum(value is not None for value in terminal_fields)
-    if execution_mode != "naive" and terminal_field_count not in {
+    if execution_mode in TW_STOCK_EXECUTION_MODES and terminal_field_count not in {
         0,
         len(terminal_fields),
     }:
@@ -9216,7 +9382,7 @@ def _load_backtest_artifact(output_path: Path) -> tuple[BacktestResult, np.ndarr
                 raise ValueError(
                     f"{execution_mode} backtest artifact contains nonzero {name}"
                 )
-    if execution_mode != "naive" and any(
+    if execution_mode in TW_STOCK_EXECUTION_MODES and any(
         value is None
         for value in (
             result.cash_history,
@@ -9228,9 +9394,19 @@ def _load_backtest_artifact(output_path: Path) -> tuple[BacktestResult, np.ndarr
         raise ValueError(
             f"{execution_mode} backtest artifact has incomplete settlement histories"
         )
-    if execution_mode != "naive" and ledger_unit not in {"currency", "nav_ratio"}:
+    if execution_mode in TW_STOCK_EXECUTION_MODES and ledger_unit not in {
+        "currency",
+        "nav_ratio",
+    }:
         raise ValueError(
             f"{execution_mode} backtest artifact has invalid settlement ledger units"
+        )
+    if execution_mode not in TW_STOCK_EXECUTION_MODES and ledger_unit not in {
+        None,
+        "none",
+    }:
+        raise ValueError(
+            f"{execution_mode} backtest artifact cannot contain a settlement ledger"
         )
     if ledger_unit == "nav_ratio":
         has_scale_history = result.equity_scale_history is not None
@@ -11512,7 +11688,7 @@ def _run_eval_backtest_from_weight_buffers(
     commission_rebate_paid_history_out: torch.Tensor | None = None
     commission_rebate_current_history_out: torch.Tensor | None = None
     commission_rebate_due_history_out: torch.Tensor | None = None
-    if execution_mode != "naive":
+    if execution_mode in TW_STOCK_EXECUTION_MODES:
         lag = int(execution_runtime.settlement_lag_sessions) if execution_runtime is not None else 2
         cash_history_out = torch.empty((total_rows,), device=device, dtype=output_dtype)
         payables_history_out = torch.empty((total_rows, lag), device=device, dtype=output_dtype)
@@ -12176,7 +12352,7 @@ def _run_eval_backtest_from_weight_buffers(
         final_alive=prev_alive,
         execution_mode=execution_mode,
         settlement_ledger_unit=(
-            "nav_ratio" if execution_mode != "naive" else None
+            "nav_ratio" if execution_mode in TW_STOCK_EXECUTION_MODES else None
         ),
         cash_history=cash_history_out,
         payables_history=payables_history_out,
@@ -12542,7 +12718,11 @@ def _evaluate_tensor_batch_decoupled(
         )
 
         ic_start = time.perf_counter()
-        if compute_ic and execution_mode not in TW_CARRYING_EXECUTION_MODES:
+        if (
+            compute_ic
+            and execution_mode not in TW_CARRYING_EXECUTION_MODES
+            and execution_mode != "tw_index_futures_day"
+        ):
             ic_series = compute_ic_series_torch(weights_all, future_returns_all, tradable_mask_all)
             _maybe_sync_cuda(device, profile_timing)
             ic = _finalize_ic_summary_from_series(ic_series, device=device, profile_timing=profile_timing, timing=timing)
@@ -13161,6 +13341,7 @@ def _evaluate_windowed_tensor_batch_decoupled(
         if (
             compute_ic
             and split.execution_mode not in TW_CARRYING_EXECUTION_MODES
+            and split.execution_mode != "tw_index_futures_day"
         ):
             ic_series = compute_ic_series_torch(weights_all, returns_all, mask_all)
             _maybe_sync_cuda(device, profile_timing)
@@ -13588,7 +13769,11 @@ def _replay_taiwan_stitched_deployment(
         panel_dates[panel_rows], stitched_dates
     ):
         raise RuntimeError("stitched deployment contains dates absent from the panel")
-    if panel_rows.size > 1 and np.any(np.diff(panel_rows) != 1):
+    if (
+        mode in TW_STOCK_EXECUTION_MODES
+        and panel_rows.size > 1
+        and np.any(np.diff(panel_rows) != 1)
+    ):
         missing = np.flatnonzero(np.diff(panel_rows) != 1)
         raise RuntimeError(
             "stitched Taiwan deployment must contain every exchange session so "
@@ -14630,7 +14815,7 @@ def _probe_compiled_loss_forward_backward(
             ),
             "initial_alive": torch.ones((), device=device, dtype=torch.bool),
         }
-        if split.execution_mode != "naive":
+        if split.execution_mode in TW_STOCK_EXECUTION_MODES:
             aux_outputs["initial_cash"] = torch.ones(
                 (), device=device, dtype=torch.float32
             )
@@ -15665,7 +15850,7 @@ def _train_epoch_windowed_tensor(
                 aux_outputs = dict(aux_outputs or {})
                 aux_outputs["initial_weights"] = portfolio_prev_weights
                 aux_outputs["initial_alive"] = portfolio_prev_alive
-                if split.execution_mode != "naive":
+                if split.execution_mode in TW_STOCK_EXECUTION_MODES:
                     aux_outputs["initial_cash"] = portfolio_prev_cash
                     aux_outputs["initial_payables"] = portfolio_prev_payables
                     aux_outputs["initial_receivables"] = portfolio_prev_receivables
@@ -16308,7 +16493,7 @@ def _train_epoch_windowed_tensor_ddp(
                     "initial_weights": portfolio_prev_weights,
                     "initial_alive": portfolio_prev_alive,
                 }
-                if split.execution_mode != "naive":
+                if split.execution_mode in TW_STOCK_EXECUTION_MODES:
                     aux_outputs["initial_cash"] = portfolio_prev_cash
                     aux_outputs["initial_payables"] = portfolio_prev_payables
                     aux_outputs["initial_receivables"] = portfolio_prev_receivables
@@ -17689,7 +17874,7 @@ def _run_inference_neural_models(
             print(
                 f"[Fold {fold.fold_id}] legacy model artifact has no semantic fingerprint: {model_file}"
             )
-            model_state_dict = torch.load(model_file, map_location="cpu")
+            model_state_dict = _load_checkpoint(model_file)
         else:
             print(f"[Fold {fold.fold_id}] skip: missing {model_file.name} and {best_checkpoint_file.name}")
             continue

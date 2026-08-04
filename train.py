@@ -6,6 +6,7 @@ import json
 import os
 import random
 import signal
+import subprocess
 import sys
 import time
 from dataclasses import asdict
@@ -568,6 +569,98 @@ def _set_rank_local_seed(base_seed: int, active_strategy: str) -> int:
     return resolved
 
 
+_FOLD_ISOLATION_CHILD_ENV = "STOCKAGENT_FOLD_ISOLATION_CHILD"
+
+
+def _isolated_fold_command(
+    argv: Sequence[str],
+    *,
+    fold_id: int,
+) -> list[str]:
+    """Build one canonical train.py invocation restricted to one fold."""
+
+    return [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        *argv,
+        "--start-fold",
+        str(int(fold_id)),
+        "--max-folds",
+        "1",
+        "--no-post-train-infer",
+        "--no-isolate-train-folds",
+    ]
+
+
+def _isolated_inference_command(argv: Sequence[str]) -> list[str]:
+    """Build a fresh-process post-training inference invocation."""
+
+    return [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        *argv,
+        "--mode",
+        "infer",
+        "--no-post-train-infer",
+        "--no-isolate-train-folds",
+    ]
+
+
+def _isolated_child_environment() -> dict[str, str]:
+    child_env = os.environ.copy()
+    child_env[_FOLD_ISOLATION_CHILD_ENV] = "1"
+    return child_env
+
+
+def _run_isolated_train_fold_processes(
+    folds: Sequence[object],
+    *,
+    argv: Sequence[str],
+) -> None:
+    """Run selected folds sequentially with a fresh CUDA process per fold."""
+
+    child_env = _isolated_child_environment()
+    total = len(folds)
+    for index, fold in enumerate(folds, start=1):
+        fold_id = int(getattr(fold, "fold_id"))
+        print(
+            f"[runner] isolated train fold {index}/{total}: fold={fold_id}",
+            flush=True,
+        )
+        completed = subprocess.run(
+            _isolated_fold_command(argv, fold_id=fold_id),
+            env=child_env,
+            check=False,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError(
+                "isolated train.py child failed: "
+                f"fold={fold_id} returncode={completed.returncode}"
+            )
+        print(
+            f"[runner] isolated train fold complete: fold={fold_id}",
+            flush=True,
+        )
+
+
+def _run_isolated_post_train_inference(*, argv: Sequence[str]) -> None:
+    print(
+        "[post-train] running inference+plot pass in a fresh process after "
+        "all isolated folds completed...",
+        flush=True,
+    )
+    completed = subprocess.run(
+        _isolated_inference_command(argv),
+        env=_isolated_child_environment(),
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(
+            "isolated train.py inference child failed: "
+            f"returncode={completed.returncode}"
+        )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train the stockAgent baseline model")
     parser.add_argument("--config", default="configs/markets/tw.yaml", help="Path to experiment config")
@@ -595,6 +688,15 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=None,
         help="Override config.runner.post_train_infer after training",
+    )
+    parser.add_argument(
+        "--isolate-train-folds",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Run each selected fold in a fresh train.py process while retaining "
+            "the canonical trainer and shared checkpoint/output directory."
+        ),
     )
     parser.add_argument(
         "--profile-timing",
@@ -846,7 +948,12 @@ def main() -> None:
         build_expanding_year_folds,
         validate_walk_forward_year_contract,
     )
-    from stockagent.training.trainer import run_inference, run_training
+    from stockagent.training.trainer import (
+        _load_checkpoint,
+        _load_completed_fold_result,
+        run_inference,
+        run_training,
+    )
 
     startup_timing.checkpoint(
         "arguments_config_and_runtime_imports",
@@ -971,6 +1078,11 @@ def main() -> None:
     if args.retrain_completed_folds is not None:
         os.environ["STOCKAGENT_RETRAIN_COMPLETED_FOLDS"] = "1" if bool(args.retrain_completed_folds) else "0"
     post_train_infer = args.post_train_infer if args.post_train_infer is not None else config.runner.post_train_infer
+    isolate_train_folds = (
+        args.isolate_train_folds
+        if args.isolate_train_folds is not None
+        else config.runner.isolate_train_folds
+    )
     start_fold = args.start_fold if args.start_fold is not None else config.runner.start_fold
 
     if config.runner.require_cuda and not torch.cuda.is_available():
@@ -989,6 +1101,26 @@ def main() -> None:
         print("[runner] CUDA unavailable; falling back to CPU because runner.require_cuda=false")
 
     panel = _build_panel_rank_coordinated(build_panel, config, active_strategy)
+    if str(config.trading.execution_mode) == "tw_index_futures_day":
+        from stockagent.data.tw_index_futures import (
+            load_taifex_index_futures_day_session,
+        )
+
+        panel.index_futures_day_session = load_taifex_index_futures_day_session(
+            config.trading.tw_index_futures_data_path,
+            panel_dates=panel.dates,
+        )
+        panel.index_futures_reference_product = (
+            config.trading.tw_index_futures_reference_product
+        )
+        reference_valid = panel.index_futures_day_session.reference_tradable_mask(
+            panel.index_futures_reference_product
+        )
+        print(
+            "[runner] attached TAIFEX TX/MTX/TMF day-session executor data: "
+            f"valid_reference_rows={int(reference_valid.sum())}/{panel.num_dates}",
+            flush=True,
+        )
     startup_timing.checkpoint(
         "panel_build_or_cache_load",
         rows=int(panel.num_dates),
@@ -1014,11 +1146,7 @@ def main() -> None:
             / "checkpoint_best.pt"
         )
         if checkpoint_path.exists():
-            checkpoint = torch.load(
-                checkpoint_path,
-                map_location="cpu",
-                weights_only=False,
-            )
+            checkpoint = _load_checkpoint(checkpoint_path)
             checkpoint_fold = build_checkpoint_inference_fold(
                 panel.dates,
                 checkpoint,
@@ -1073,6 +1201,18 @@ def main() -> None:
         mode=str(mode),
         resume=bool(resume),
     )
+    isolate_this_run = (
+        mode == "train"
+        and bool(isolate_train_folds)
+        and len(folds) > 1
+        and os.environ.get(_FOLD_ISOLATION_CHILD_ENV) != "1"
+    )
+    if isolate_this_run and active_strategy != "none":
+        raise RuntimeError(
+            "runner.isolate_train_folds currently requires one visible GPU "
+            "(training.multi_gpu_strategy must resolve to 'none')"
+        )
+
     if mode == "infer":
         results = run_inference(
             panel,
@@ -1081,6 +1221,27 @@ def main() -> None:
             output_dir,
             deployment_folds=all_folds,
         )
+    elif isolate_this_run:
+        print(
+            "[runner] fold process isolation enabled: each selected fold will "
+            "use the same train.py/run_training path in a fresh CUDA process",
+            flush=True,
+        )
+        _run_isolated_train_fold_processes(folds, argv=sys.argv[1:])
+        if post_train_infer:
+            _run_isolated_post_train_inference(argv=sys.argv[1:])
+        results = []
+        for fold in folds:
+            completed = _load_completed_fold_result(
+                Path(output_dir),
+                int(fold.fold_id),
+            )
+            if completed is None:
+                raise RuntimeError(
+                    "isolated fold child exited successfully without complete "
+                    f"artifacts: fold={int(fold.fold_id)}"
+                )
+            results.append(completed)
     else:
         results = run_training(
             panel,
