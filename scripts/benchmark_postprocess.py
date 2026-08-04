@@ -7,6 +7,9 @@ import json
 import os
 import sys
 import time
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from contextlib import nullcontext
+from multiprocessing import get_context
 from pathlib import Path
 from typing import Any
 
@@ -447,50 +450,204 @@ def _auto_sweep_batch_size(
         return max(1, min(candidate_count, 8))
 
 
+def _resolve_sweep_devices(primary: torch.device, requested: str) -> list[torch.device]:
+    if primary.type != "cuda" or not torch.cuda.is_available():
+        return [primary]
+    raw = str(requested).strip().lower()
+    available = max(1, int(torch.cuda.device_count()))
+    count = available if raw in {"", "auto", "all", "0"} else int(raw)
+    count = max(1, min(count, available))
+    primary_index = (
+        int(torch.cuda.current_device())
+        if primary.index is None
+        else int(primary.index)
+    )
+    indices = [primary_index] + [index for index in range(available) if index != primary_index]
+    return [torch.device("cuda", index) for index in indices[:count]]
+
+
+def _evaluate_backtest_candidate_rows(
+    *,
+    buffers: dict[str, torch.Tensor],
+    config: Any,
+    candidates: list[dict[str, Any]],
+    scan_chunk_size: int | None,
+) -> list[dict[str, Any]]:
+    if not candidates:
+        return []
+
+    rows: list[dict[str, Any]] = []
+    device = buffers["scores"].device
+    device_context = torch.cuda.device(device) if device.type == "cuda" else nullcontext()
+    with device_context:
+        for row in candidates:
+            candidate_started = time.perf_counter()
+            backtest = _run_single_backtest(
+                buffers=buffers,
+                config=config,
+                activation=str(row["activation"]),
+                threshold=float(row["min_trade_weight"]),
+                scan_chunk_size=scan_chunk_size,
+                return_weights_history=True,
+            )
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            candidate_elapsed_s = time.perf_counter() - candidate_started
+            metrics = _compute_metrics_from_tensors(
+                backtest.strategy_returns,
+                backtest.benchmark_returns,
+                backtest.turnovers,
+            )
+            rows.append(
+                {
+                    **row,
+                    "elapsed_s": float(candidate_elapsed_s),
+                    **metrics,
+                    **_weight_diagnostics(backtest.weights_history),
+                }
+            )
+    return rows
+
+
+def _evaluate_candidate_partition_in_process(
+    buffers_cpu: dict[str, torch.Tensor],
+    config: Any,
+    candidates: list[dict[str, Any]],
+    scan_chunk_size: int | None,
+    device_name: str,
+) -> list[dict[str, Any]]:
+    """Spawn-safe worker: stage shared CPU buffers onto one isolated GPU."""
+    device = torch.device(device_name)
+    torch.cuda.set_device(device)
+    buffers = {
+        name: value.to(device=device, non_blocking=False).contiguous()
+        for name, value in buffers_cpu.items()
+    }
+    torch.cuda.synchronize(device)
+    return _evaluate_backtest_candidate_rows(
+        buffers=buffers,
+        config=config,
+        candidates=candidates,
+        scan_chunk_size=scan_chunk_size,
+    )
+
+
 def _batched_backtest_candidates(
     *,
     buffers: dict[str, torch.Tensor],
     config: Any,
     candidates: list[dict[str, Any]],
     scan_chunk_size: int | None,
+    replica_buffers: list[dict[str, torch.Tensor]] | None = None,
+    replica_devices: list[torch.device] | None = None,
 ) -> tuple[list[dict[str, Any]], float]:
-    """Evaluate a presentation batch by repeatedly calling the canonical backtest."""
+    """Run canonical candidate backtests concurrently on independent devices."""
     if not candidates:
         return [], 0.0
 
+    process_devices = list(replica_devices or []) if len(candidates) >= 16 else []
+    active_buffers = [buffers, *(replica_buffers or [])]
+    worker_count = min(
+        1 + len(process_devices) if process_devices else len(active_buffers),
+        len(candidates),
+    )
+    active_buffers = active_buffers[:worker_count]
     started = time.perf_counter()
-    rows: list[dict[str, Any]] = []
-    for row in candidates:
-        candidate_started = time.perf_counter()
-        backtest = _run_single_backtest(
+    if worker_count <= 1:
+        rows = _evaluate_backtest_candidate_rows(
             buffers=buffers,
             config=config,
-            activation=str(row["activation"]),
-            threshold=float(row["min_trade_weight"]),
+            candidates=candidates,
             scan_chunk_size=scan_chunk_size,
-            return_weights_history=True,
         )
-        if buffers["scores"].device.type == "cuda":
-            torch.cuda.synchronize(buffers["scores"].device)
-        candidate_elapsed_s = time.perf_counter() - candidate_started
-        metrics = _compute_metrics_from_tensors(
-            backtest.strategy_returns,
-            backtest.benchmark_returns,
-            backtest.turnovers,
-        )
-        rows.append(
-            {
-                **row,
-                "elapsed_s": float(candidate_elapsed_s),
-                "sweep_batch_size": int(len(candidates)),
-                **metrics,
-                **_weight_diagnostics(backtest.weights_history),
-            }
-        )
+    elif process_devices:
+        indexed_partitions: list[list[tuple[int, dict[str, Any]]]] = [
+            [] for _ in range(worker_count)
+        ]
+        for index, row in enumerate(candidates):
+            indexed_partitions[index % worker_count].append((index, row))
+        buffers_cpu = {
+            name: value.detach().to(device="cpu", non_blocking=False).contiguous()
+            for name, value in buffers.items()
+        }
+        indexed_results: list[tuple[int, dict[str, Any]]] = []
+        context = get_context("spawn")
+        with ProcessPoolExecutor(
+            max_workers=worker_count - 1,
+            mp_context=context,
+        ) as executor:
+            futures = []
+            for worker_index in range(1, worker_count):
+                indexed_rows = indexed_partitions[worker_index]
+                futures.append(
+                    (
+                        indexed_rows,
+                        executor.submit(
+                            _evaluate_candidate_partition_in_process,
+                            buffers_cpu,
+                            config,
+                            [row for _, row in indexed_rows],
+                            scan_chunk_size,
+                            str(process_devices[worker_index - 1]),
+                        ),
+                    )
+                )
+            parent_rows = indexed_partitions[0]
+            parent_evaluated = _evaluate_backtest_candidate_rows(
+                buffers=buffers,
+                config=config,
+                candidates=[row for _, row in parent_rows],
+                scan_chunk_size=scan_chunk_size,
+            )
+            indexed_results.extend(
+                (source_index, evaluated_row)
+                for (source_index, _), evaluated_row in zip(
+                    parent_rows, parent_evaluated, strict=True
+                )
+            )
+            for indexed_rows, future in futures:
+                evaluated = future.result()
+                indexed_results.extend(
+                    (source_index, evaluated_row)
+                    for (source_index, _), evaluated_row in zip(
+                        indexed_rows, evaluated, strict=True
+                    )
+                )
+        rows = [row for _, row in sorted(indexed_results, key=lambda item: item[0])]
+    else:
+        indexed_partitions: list[list[tuple[int, dict[str, Any]]]] = [
+            [] for _ in range(worker_count)
+        ]
+        for index, row in enumerate(candidates):
+            indexed_partitions[index % worker_count].append((index, row))
+
+        def run_partition(worker_index: int) -> list[tuple[int, dict[str, Any]]]:
+            indexed_rows = indexed_partitions[worker_index]
+            evaluated = _evaluate_backtest_candidate_rows(
+                buffers=active_buffers[worker_index],
+                config=config,
+                candidates=[row for _, row in indexed_rows],
+                scan_chunk_size=scan_chunk_size,
+            )
+            return [
+                (source_index, evaluated_row)
+                for (source_index, _), evaluated_row in zip(
+                    indexed_rows, evaluated, strict=True
+                )
+            ]
+
+        indexed_results: list[tuple[int, dict[str, Any]]] = []
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = [executor.submit(run_partition, index) for index in range(worker_count)]
+            for future in futures:
+                indexed_results.extend(future.result())
+        rows = [row for _, row in sorted(indexed_results, key=lambda item: item[0])]
 
     elapsed_s = time.perf_counter() - started
     for row in rows:
         row["batch_elapsed_s"] = float(elapsed_s)
+        row["sweep_batch_size"] = int(len(candidates))
+        row["sweep_device_count"] = int(worker_count)
     return rows, elapsed_s
 
 
@@ -741,6 +898,8 @@ def _run_sweep(
     config: Any,
     scan_chunk_size: int | None,
     sweep_batch_size: int | None = None,
+    replica_buffers: list[dict[str, torch.Tensor]] | None = None,
+    replica_devices: list[torch.device] | None = None,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     candidates: list[dict[str, Any]] = []
@@ -776,6 +935,8 @@ def _run_sweep(
             config=config,
             candidates=batch,
             scan_chunk_size=scan_chunk_size,
+            replica_buffers=replica_buffers,
+            replica_devices=replica_devices,
         )
         rows.extend(batch_rows)
         best_batch = _best_by_metric(batch_rows, "sharpe")
@@ -965,6 +1126,11 @@ def main() -> None:
             "Use 0 for GPU-memory-aware auto sizing."
         ),
     )
+    parser.add_argument(
+        "--sweep-devices",
+        default="1",
+        help="CUDA devices used concurrently for the candidate sweep: integer, auto, or all.",
+    )
     parser.add_argument("--plots", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--plot-top-n", type=int, default=20)
     parser.add_argument(
@@ -1120,6 +1286,7 @@ def main() -> None:
                 "trained_activation": trained_activation,
                 "plot_metrics": plot_metrics,
                 "sweep_batch_size": int(args.sweep_batch_size),
+                "sweep_devices": str(args.sweep_devices),
             },
             sort_keys=True,
         ),
@@ -1145,6 +1312,11 @@ def main() -> None:
         "trained_output": trained_buffers,
         "raw_logits": raw_buffers,
     }
+    sweep_devices = _resolve_sweep_devices(device, str(args.sweep_devices))
+    print(
+        "sweep_devices=" + ",".join(str(item) for item in sweep_devices),
+        flush=True,
+    )
     trained_rows = _run_sweep(
         buffers=trained_buffers,
         mode="trained_output",
@@ -1154,6 +1326,7 @@ def main() -> None:
         config=config,
         scan_chunk_size=scan_chunk_size,
         sweep_batch_size=int(args.sweep_batch_size),
+        replica_devices=sweep_devices[1:],
     )
     raw_rows = _run_sweep(
         buffers=raw_buffers,
@@ -1164,6 +1337,7 @@ def main() -> None:
         config=config,
         scan_chunk_size=scan_chunk_size,
         sweep_batch_size=int(args.sweep_batch_size),
+        replica_devices=sweep_devices[1:],
     )
     rows = trained_rows + raw_rows
     best_by = {
@@ -1205,6 +1379,7 @@ def main() -> None:
         "trained_output_mode": original_output_mode,
         "trained_activation": trained_activation,
         "sweep_batch_size": int(args.sweep_batch_size),
+        "sweep_devices": [str(item) for item in sweep_devices],
         "rank_metric": rank_metric,
         "plot_metrics": plot_metrics,
         "inference_elapsed_s": float(trained_inference_elapsed_s + raw_inference_elapsed_s),

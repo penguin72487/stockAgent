@@ -1,0 +1,136 @@
+# OFAT ablation matrix for the corrected TW naive long/short baseline.
+base_config: configs/markets/tw_public_lanten_market_candles.yaml
+output_root: artifacts/ablations/financial_transformer_naive_long_short_lb256_bs32
+expected_fold_count: 12
+
+runtime:
+  cpu_threads: 112
+  torch_compile_threads: 16
+
+matrix:
+  mode: one_factor_at_a_time
+  include_baseline: true
+  fixed_overrides:
+    data:
+      # Naive row-t decisions cannot observe open[t+1]. The candles baseline's
+      # phase-only open-gap channel must be removed to preserve causality.
+      day_trade_open_feature: false
+    trading:
+      execution_mode: naive
+      long_only: false
+    training:
+      loss_type: log_utility
+
+  base_overrides:
+    runner:
+      post_train_infer: false
+    training:
+      # Correct naive control: 256 completed sessions with the measured-safe
+      # 32/16 train/eval batch schedule on dual 32 GiB GPUs.
+      lookback: 256
+      batch_size_train: 32
+      batch_size_eval: 16
+      eval_model_chunk_rows: 16
+      eval_auto_chunk_rows_cap: 16
+
+  dimensions:
+    - name: lookback_batch
+      enabled: true
+      paths: [training.lookback, training.batch_size_train]
+      baseline: [256, 32]
+      values:
+        - name: lookback32_batch128
+          experiment_name: lookback32_batch128
+          value: [32, 128]
+          overrides:
+            training:
+              batch_size_eval: 128
+              eval_model_chunk_rows: 32
+              eval_auto_chunk_rows_cap: 32
+
+    - name: information_bottleneck
+      enabled: true
+      baseline: [true, true]
+      variants:
+        - name: latent_only
+          experiment_name: latent_only
+          overrides:
+            training:
+              financial_transformer:
+                use_latent_factors: true
+                use_market_tokens: false
+        - name: market_only
+          experiment_name: market_only
+          overrides:
+            training:
+              financial_transformer:
+                use_latent_factors: false
+                use_market_tokens: true
+        - name: temporal_only
+          experiment_name: temporal_only
+          overrides:
+            training:
+              financial_transformer:
+                use_latent_factors: false
+                use_market_tokens: false
+
+    - name: temporal_rope
+      enabled: true
+      path: training.financial_transformer.rope_temporal
+      baseline: true
+      values:
+        - {name: disabled, experiment_name: no_rope_temporal, value: false}
+
+    - name: learned_time_position
+      enabled: true
+      path: training.financial_transformer.use_time_pos
+      baseline: true
+      values:
+        - {name: disabled, experiment_name: no_time_position, value: false}
+
+    - name: learned_symbol_position
+      enabled: true
+      path: training.financial_transformer.use_symbol_pos
+      baseline: false
+      values:
+        - {name: enabled, experiment_name: with_symbol_position, value: true}
+
+    - name: qk_normalization
+      enabled: true
+      path: training.financial_transformer.qk_norm
+      baseline: true
+      values:
+        - {name: disabled, experiment_name: no_qk_norm, value: false}
+
+    - name: temporal_pooling
+      enabled: true
+      baseline: last
+      variants:
+        - name: mean
+          experiment_name: mean_pooling
+          overrides:
+            training:
+              financial_transformer:
+                temporal_pooling: mean
+                temporal_query_mode: full_then_last
+        - name: attention
+          experiment_name: attention_pooling
+          overrides:
+            training:
+              financial_transformer:
+                temporal_pooling: attention
+                temporal_query_mode: full_then_last
+
+    - name: normalization
+      enabled: true
+      path: training.financial_transformer.norm_type
+      baseline: rmsnorm
+      values:
+        - {name: layernorm, experiment_name: layernorm, value: layernorm}
+
+    - name: feed_forward
+      enabled: true
+      path: training.financial_transformer.ffn_type
+      baseline: swiglu
+      values:
+        - {name: gelu, experiment_name: gelu_ffn, value: gelu}

@@ -8,7 +8,24 @@
 #   source scripts/runtime_env.sh
 #   run_fintech_python scripts/run_ablation_experiments.py
 base_config: configs/markets/tw_public.yaml
-output_root: artifacts/ablations/transformer_base_portfolio
+# Older roots contain either 2005-owned folds or a static-S compile run that
+# exhausted Dynamo's eight-graph recompile budget after four completed folds.
+# Keep them immutable for audit. This root uses the causal 2006+ fold contract
+# and a bounded symbolic stock axis from its first checkpoint onward.
+output_root: artifacts/ablations/transformer_base_portfolio_2006plus_dynamic_s
+# The current causal 2006+ walk-forward contract owns fold_01..fold_20. This
+# runner-only bound lets a matrix restart skip fully completed experiments
+# without launching train.py merely to rediscover that all folds exist. Update
+# it whenever the panel/test-year range is extended.
+expected_fold_count: 20
+
+# Host-wide runtime budgets for this 112-core / 224-thread machine. train.py
+# divides them across the two local DDP ranks, yielding 56 runtime threads and
+# 8 Inductor workers per rank. These launcher-only controls do not alter the
+# generated experiment config or checkpoint semantic fingerprint.
+runtime:
+  cpu_threads: 112
+  torch_compile_threads: 16
 
 matrix:
   mode: one_factor_at_a_time
@@ -20,11 +37,33 @@ matrix:
       loss_type: log_utility
 
   # Global control used by the baseline and every OFAT variant. Window length
-  # and train batch size are a coupled memory/throughput choice.
+  # and train batch size are a coupled memory/throughput choice. A 256-session
+  # variant cannot own targets in the first (2005) panel year because that year
+  # has fewer than 256 causal feature dates. Apply the same panel-history
+  # contract and 2006 split start to every run so the comparison stays OFAT.
   base_overrides:
+    runner:
+      # run_training already reloads checkpoint_best and writes the complete
+      # fold metrics/backtests/tables/plots plus stitched walk-forward report.
+      # Re-running every saved model once more in train.py is duplicate work.
+      post_train_infer: false
+    data:
+      panel_start_date: "2005-01-01"
+    walk_forward:
+      expected_first_year: 2005
+      split_start_year: 2006
+      lookback_context: panel_history
     training:
       lookback: 32
       batch_size_train: 128
+      # Expanding train_union folds have a genuinely variable stock axis.
+      # Compile only S symbolically; batch/lookback/features remain static and
+      # the runtime derives a causal upper bound from train-owning folds. This
+      # reuses one graph within each SDPA loop-count interval without padding
+      # assets, raising Dynamo's recompile limit, or falling back to eager.
+      compile_model_dynamic_symbols: true
+      compile_loss_dynamic_symbols: true
+      train_symbol_compaction_bucket_size: 0
       transformer_base_portfolio:
         attention_mode: market_token
         use_latent_factors: true
@@ -37,7 +76,18 @@ matrix:
       baseline: [32, 128]
       description: Coupled lookback and training batch-size schedule.
       values:
-        - {name: lookback256_batch32, experiment_name: lookback256_batch32, value: [256, 32]}
+        - name: lookback256_batch32
+          experiment_name: lookback256_batch32
+          value: [256, 32]
+          # Evaluation materializes the same 256-session temporal graph over
+          # the full validation universe. The lookback-32 control's 64-row
+          # chunk needs an extra ~5.35 GiB per rank here and OOMs on 32 GiB
+          # GPUs, so the 256-day memory schedule also owns its eval chunk.
+          overrides:
+            training:
+              batch_size_eval: 16
+              eval_model_chunk_rows: 16
+              eval_auto_chunk_rows_cap: 16
 
     # Keep attention_mode=market_token and explicitly test the complete 2x2
     # design. The [true, true] control comes from matrix.base_overrides.
@@ -115,6 +165,14 @@ matrix:
           experiment_name: mean_pooling
           overrides:
             training:
+              # Inductor specializes the stock axis while lowering the mean
+              # reduction, which is incompatible with a forced mark_dynamic
+              # contract. Use four exact masked bucket ABIs instead of 20 raw
+              # expanding-universe widths. Padded assets remain untradable and
+              # have zero output, loss, state, fees, and gradients.
+              compile_model_dynamic_symbols: false
+              compile_loss_dynamic_symbols: false
+              train_symbol_compaction_bucket_size: 512
               transformer_base_portfolio:
                 temporal_pooling: mean
                 temporal_query_mode: full_then_last
@@ -122,6 +180,12 @@ matrix:
           experiment_name: attention_pooling
           overrides:
             training:
+              # Full-step attention pooling has the same Inductor symbolic-S
+              # specialization boundary as mean pooling. Reuse the validated
+              # four-width masked ABI schedule rather than failing fold 1.
+              compile_model_dynamic_symbols: false
+              compile_loss_dynamic_symbols: false
+              train_symbol_compaction_bucket_size: 512
               transformer_base_portfolio:
                 temporal_pooling: attention
                 temporal_query_mode: full_then_last

@@ -93,6 +93,44 @@ def test_batched_postprocess_sweep_matches_single_backtests(long_only: bool) -> 
             assert float(row[key]) == pytest.approx(float(expected), abs=1e-6, rel=1e-6)
 
 
+def test_multi_device_scheduler_preserves_candidate_order_and_results() -> None:
+    config = _config(long_only=False)
+    buffers = _buffers()
+    candidates = [
+        {
+            "mode": "raw_logits",
+            "model_output_mode": "logits",
+            "candidate": f"raw:{activation}",
+            "activation": activation,
+            "min_trade_weight": threshold,
+        }
+        for activation in ("identity", "tanh")
+        for threshold in (0.0, 0.05)
+    ]
+    serial, _ = bp._batched_backtest_candidates(
+        buffers=buffers,
+        config=config,
+        candidates=candidates,
+        scan_chunk_size=4,
+    )
+    parallel, _ = bp._batched_backtest_candidates(
+        buffers=buffers,
+        replica_buffers=[{name: value.clone() for name, value in buffers.items()}],
+        config=config,
+        candidates=candidates,
+        scan_chunk_size=4,
+    )
+
+    assert [row["candidate"] for row in parallel] == [row["candidate"] for row in serial]
+    assert [row["min_trade_weight"] for row in parallel] == [
+        row["min_trade_weight"] for row in serial
+    ]
+    for actual, expected in zip(parallel, serial, strict=True):
+        assert actual["sweep_device_count"] == 2
+        for key in ("sharpe", "sortino", "cumulative_return", "turnover", "avg_gross"):
+            assert float(actual[key]) == pytest.approx(float(expected[key]), abs=1e-6, rel=1e-6)
+
+
 def test_raw_logits_from_aux_matches_direct_logits_mode() -> None:
     torch.manual_seed(11)
     model = TransformerBasePortfolioModel(

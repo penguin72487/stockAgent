@@ -1,0 +1,79 @@
+# Output-contract-only OFAT matrix for open-aware TW day-trade long/short.
+# The projection_l1 control and five other new modes train in this root. The
+# l1 variant is semantically identical to the completed architecture suite's
+# baseline and is linked into this root after exact effective-config validation.
+base_config: configs/markets/tw_public_lanten_market_candles.yaml
+output_root: artifacts/ablations/financial_transformer_tw_day_trade_output_modes_projection_l1
+expected_fold_count: 12
+
+runtime:
+  cpu_threads: 112
+  torch_compile_threads: 16
+
+matrix:
+  mode: one_factor_at_a_time
+  include_baseline: true
+  fixed_overrides:
+    trading:
+      execution_mode: tw_day_trade
+      long_only: false
+    training:
+      loss_type: log_utility
+
+  base_overrides:
+    runner:
+      post_train_infer: false
+    trading:
+      portfolio_activation: pre_normalized
+    training:
+      loss_portfolio_activation: pre_normalized
+      financial_transformer:
+        portfolio_output_mode: projection_l1
+
+  dimensions:
+    - name: portfolio_output_mode
+      enabled: true
+      baseline: projection_l1
+      variants:
+        - name: activation_l1
+          experiment_name: output_activation_l1
+          overrides:
+            trading:
+              portfolio_activation: identity
+            training:
+              loss_portfolio_activation: identity
+              financial_transformer:
+                portfolio_output_mode: activation_l1
+        - name: l1
+          experiment_name: output_l1
+          overrides:
+            training:
+              financial_transformer:
+                portfolio_output_mode: l1
+        - name: logits
+          experiment_name: output_logits
+          overrides:
+            trading:
+              portfolio_activation: identity
+            training:
+              loss_portfolio_activation: identity
+              financial_transformer:
+                portfolio_output_mode: logits
+        - name: signed_softmax
+          experiment_name: output_signed_softmax
+          overrides:
+            training:
+              financial_transformer:
+                portfolio_output_mode: signed_softmax
+        - name: signed_entmax15
+          experiment_name: output_signed_entmax15
+          overrides:
+            training:
+              financial_transformer:
+                portfolio_output_mode: signed_entmax15
+        - name: signed_sparsemax
+          experiment_name: output_signed_sparsemax
+          overrides:
+            training:
+              financial_transformer:
+                portfolio_output_mode: signed_sparsemax
