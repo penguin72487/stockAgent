@@ -29,6 +29,7 @@ from downloader.download_tw_public_data import (
     _configure_tw_public_rate_limiter,
     _http_get,
 )
+from downloader.tw_public_contract import DAILY_CLOSE_OPTIONAL_DATASETS
 
 
 DATASET_NAME = "tw_transfer_adjustment_reference"
@@ -37,7 +38,7 @@ RULE_URL = (
     "https://twse-regulation.twse.com.tw/TW/law/DAT06.aspx"
     "?FLCODE=FL007304&FLDATE=20020730&LSER=001"
 )
-FMSRFK_URL = "https://www.twse.com.tw/rwd/zh/afterTrading/FMSRFK"
+FMSRFK_URL = "https://wwwc.twse.com.tw/rwd/zh/afterTrading/FMSRFK"
 YAHOO_METADATA_KEYS = {
     "source": b"stockagent.source",
     "asset_class": b"stockagent.asset_class",
@@ -452,7 +453,7 @@ def _validate_official_inputs(
         and public_summary.get("daily_close_ready") is True
         and int(public_summary.get("blocking_failed_count", -1)) == 0
         and set(public_summary.get("publication_lag_datasets") or ())
-        <= {"twse_margin_balance", "tpex_margin_balance"}
+        <= DAILY_CLOSE_OPTIONAL_DATASETS
     )
     if (
         (

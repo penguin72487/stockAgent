@@ -265,6 +265,7 @@ def build_tw_public_training_features(
     market_symbol: str = DEFAULT_MARKET_SYMBOL,
     summary_path: str | Path | None = None,
     end_date: date | None = None,
+    allow_daily_publication_lag: bool = False,
 ) -> TwPublicFeatureBuildResult:
     input_dir = Path(input_dir)
     output_path = Path(output_path)
@@ -287,7 +288,11 @@ def build_tw_public_training_features(
         _build_model_useful_ownership_features(input_dir),
         _build_model_useful_shorting_features(input_dir),
         _build_model_useful_rule_features(input_dir),
-        _build_day_trade_rule_features(input_dir, symbols=symbols),
+        _build_day_trade_rule_features(
+            input_dir,
+            symbols=symbols,
+            allow_missing_latest_session=allow_daily_publication_lag,
+        ),
     ]
     stock_features = _merge_feature_frames(stock_frames)
     if symbols is not None and not stock_features.is_empty():
@@ -1149,11 +1154,17 @@ def _require_day_trade_date_coverage(
     market: str,
     universe: pl.DataFrame,
     eligible: pl.DataFrame,
-) -> None:
+    allow_missing_latest_session: bool = False,
+) -> pl.DataFrame:
     universe_dates = universe.select("date").unique()
     eligible_dates = eligible.select("date").unique()
     missing = universe_dates.join(eligible_dates, on="date", how="anti").sort("date")
     extra = eligible_dates.join(universe_dates, on="date", how="anti").sort("date")
+    if allow_missing_latest_session and extra.is_empty() and missing.height == 1:
+        missing_date = missing.item()
+        latest_universe_date = universe_dates.select(pl.col("date").max()).item()
+        if missing_date == latest_universe_date:
+            return universe.filter(pl.col("date") != pl.lit(missing_date))
     if not missing.is_empty() or not extra.is_empty():
         raise ValueError(
             f"{market} day-trade eligibility coverage does not match official "
@@ -1161,12 +1172,14 @@ def _require_day_trade_date_coverage(
             f"missing={missing.head(5).to_series().to_list()} "
             f"extra={extra.head(5).to_series().to_list()}"
         )
+    return universe
 
 
 def _build_day_trade_rule_features(
     input_dir: Path,
     *,
     symbols: set[str] | None = None,
+    allow_missing_latest_session: bool = False,
 ) -> pl.DataFrame:
     """Build exact-session TWSE/TPEx day-trade masks with explicit negatives.
 
@@ -1214,10 +1227,11 @@ def _build_day_trade_rule_features(
         ("TWSE", twse_universe, twse_eligible),
         ("TPEx", tpex_universe, tpex_eligible),
     ):
-        _require_day_trade_date_coverage(
+        universe = _require_day_trade_date_coverage(
             market=market,
             universe=universe,
             eligible=eligible,
+            allow_missing_latest_session=allow_missing_latest_session,
         )
         if symbols is not None:
             symbol_filter = sorted(symbols)

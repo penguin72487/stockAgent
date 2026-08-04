@@ -495,6 +495,24 @@ def _coalesce_stock_history_columns(frame, *, execution_mode: str = "naive"):
     has_actual = pl.col("actual_weight").is_not_null()
     has_model = pl.col("model_weight").is_not_null()
     signal_target = pl.lit(naive) & ~has_holdings & ~has_actual & has_model
+    day_trade = str(execution_mode).strip().lower() == "tw_day_trade"
+    previous_columns = (
+        [
+            pl.lit(0, dtype=pl.Int64).alias("prev_shares"),
+            pl.lit(None, dtype=pl.Float64).alias("prev_price"),
+            pl.lit(0.0).alias("prev_holding_ratio"),
+            pl.lit(0.0).alias("prev_actual_weight"),
+            pl.lit(0.0).alias("prev_model_weight"),
+        ]
+        if day_trade
+        else [
+            pl.col("shares").shift(1).fill_null(0).alias("prev_shares"),
+            pl.col("price").shift(1).alias("prev_price"),
+            pl.col("holding_ratio").shift(1).fill_null(0.0).alias("prev_holding_ratio"),
+            pl.col("actual_weight").shift(1).fill_null(0.0).alias("prev_actual_weight"),
+            pl.col("model_weight").shift(1).fill_null(0.0).alias("prev_model_weight"),
+        ]
+    )
     prepared = (
         frame.with_columns(
             [
@@ -532,15 +550,7 @@ def _coalesce_stock_history_columns(frame, *, execution_mode: str = "naive"):
             ]
         )
         .sort("date")
-        .with_columns(
-            [
-                pl.col("shares").shift(1).fill_null(0).alias("prev_shares"),
-                pl.col("price").shift(1).alias("prev_price"),
-                pl.col("holding_ratio").shift(1).fill_null(0.0).alias("prev_holding_ratio"),
-                pl.col("actual_weight").shift(1).fill_null(0.0).alias("prev_actual_weight"),
-                pl.col("model_weight").shift(1).fill_null(0.0).alias("prev_model_weight"),
-            ]
-        )
+        .with_columns(previous_columns)
         .with_columns(
             pl.when(pl.col("position_source") == "signal_target")
             .then(pl.col("prev_shares"))
@@ -556,7 +566,7 @@ def _coalesce_stock_history_columns(frame, *, execution_mode: str = "naive"):
             ]
         )
     )
-    if str(execution_mode).strip().lower() == "tw_day_trade":
+    if day_trade:
         return prepared.with_columns(
             [
                 pl.col("price").alias("entry_price"),
@@ -722,12 +732,20 @@ def load_stock_history(
     capital = resolve_fold_capital_scale(root, initial_capital=initial_capital, current_capital=current_capital)
     if capital.scale != 1.0:
         frame = frame.with_columns((pl.col("market_value") * capital.scale).alias("market_value"))
-    frame = frame.with_columns(
-        [
-            pl.col("market_value").shift(1).fill_null(0.0).alias("prev_market_value"),
-            (pl.col("market_value") - pl.col("market_value").shift(1).fill_null(0.0)).alias("market_value_delta"),
-        ]
-    )
+    if day_trade:
+        frame = frame.with_columns(
+            [
+                pl.lit(0.0).alias("prev_market_value"),
+                pl.col("market_value").fill_null(0.0).alias("market_value_delta"),
+            ]
+        )
+    else:
+        frame = frame.with_columns(
+            [
+                pl.col("market_value").shift(1).fill_null(0.0).alias("prev_market_value"),
+                (pl.col("market_value") - pl.col("market_value").shift(1).fill_null(0.0)).alias("market_value_delta"),
+            ]
+        )
     rows = frame.to_dicts()
     for row in rows:
         row["execution_mode"] = str(execution_mode)

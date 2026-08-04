@@ -8792,10 +8792,11 @@ def load_model_from_checkpoint(
     # module lazily for post-fold reports as well.
     from stockagent.training.trainer import (
         _checkpoint_manifest,
+        _load_checkpoint,
         _validate_checkpoint_manifest,
     )
 
-    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    checkpoint = _load_checkpoint(checkpoint_path)
     _validate_checkpoint_manifest(
         checkpoint,
         _checkpoint_manifest(panel, config, include_data_content=False),
@@ -8864,7 +8865,9 @@ def _available_checkpoint_folds(folds: list[WalkForwardFold], output_dir: Path) 
 
 
 def _checkpoint_symbol_count(checkpoint_path: Path) -> int | None:
-    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    from stockagent.training.trainer import _load_checkpoint
+
+    checkpoint = _load_checkpoint(checkpoint_path)
     state_dict = checkpoint.get("model_state_dict", checkpoint) if isinstance(checkpoint, dict) else checkpoint
     if not isinstance(state_dict, dict):
         return None

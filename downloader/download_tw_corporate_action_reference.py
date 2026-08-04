@@ -31,7 +31,7 @@ from downloader.download_tw_public_data import (
 )
 
 
-TWSE_URL = "https://www.twse.com.tw/rwd/zh/exRight/TWT49U"
+TWSE_URL = "https://wwwc.twse.com.tw/rwd/zh/exRight/TWT49U"
 TPEX_CURRENT_URL = "https://www.tpex.org.tw/www/zh-tw/bulletin/exDailyQ"
 TPEX_HISTORICAL_URL = "https://www.tpex.org.tw/www/zh-tw/bulletin/exDailyQHis"
 TPEX_MONTHLY_REPORT_URL = "https://www.tpex.org.tw/www/zh-tw/statistics/monthlyRptMkt"

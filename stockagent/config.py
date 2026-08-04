@@ -4,6 +4,7 @@ from copy import deepcopy
 from dataclasses import MISSING, asdict, dataclass, field, fields, is_dataclass
 from datetime import date
 import fnmatch
+import math
 from pathlib import Path
 from typing import Any, get_args, get_type_hints
 
@@ -14,6 +15,10 @@ from stockagent.backtest.tw_execution import (
     TaiwanFeeSchedule,
     TaiwanMarginShortSchedule,
     normalize_execution_mode,
+)
+from stockagent.backtest.tw_index_futures import FuturesCostSchedule
+from stockagent.data.tw_index_futures import (
+    normalize_taifex_index_futures_product,
 )
 from stockagent.data.walkforward import normalize_lookback_context
 from stockagent.portfolio_contract import (
@@ -79,6 +84,13 @@ _TW_PHASE_RETURN_OBJECTIVES = frozenset(
         "mean_log_return",
     }
 )
+_TW_INDEX_FUTURES_MODEL_NAMES = frozenset(
+    {
+        "cross_sectional_index_futures",
+        "cross_sectional_index_futures_model",
+        "tw_index_futures",
+    }
+)
 
 
 def _normalized_contract_name(value: object) -> str:
@@ -110,7 +122,6 @@ def _validate_tw_phase_mode_contract(
             "families are 'transformer_base_portfolio' and "
             f"'financial_transformer', got {model_name!r}"
         )
-
     normalized_objective = _normalized_contract_name(loss_type)
     if normalized_objective not in _TW_PHASE_RETURN_OBJECTIVES:
         raise ValueError(
@@ -206,6 +217,46 @@ def _validate_tw_phase_mode_contract(
                 + ", ".join(mismatched)
                 + " cannot be 'pre_normalized'"
             )
+
+
+def _validate_tw_index_futures_mode_contract(
+    *,
+    execution_mode: str,
+    model_name: object,
+    loss_type: object,
+    return_rank_ic_weight: object,
+    direction_weight: object,
+    volatility_regime_weight: object,
+    concentration_weight: object,
+) -> None:
+    """Reject scalar-stock objectives that have no futures exposure meaning."""
+
+    if execution_mode != "tw_index_futures_day":
+        return
+    normalized_model = _normalized_contract_name(model_name)
+    if normalized_model not in _TW_INDEX_FUTURES_MODEL_NAMES:
+        raise ValueError(
+            "trading.execution_mode='tw_index_futures_day' requires "
+            "training.model_name='cross_sectional_index_futures'"
+        )
+    normalized_objective = _normalized_contract_name(loss_type)
+    if normalized_objective not in _TW_PHASE_RETURN_OBJECTIVES:
+        raise ValueError(
+            "tw_index_futures_day currently supports only canonical "
+            f"log-utility objectives {sorted(_TW_PHASE_RETURN_OBJECTIVES)}"
+        )
+    unsupported = {
+        "return_rank_ic_weight": float(return_rank_ic_weight),
+        "direction_weight": float(direction_weight),
+        "volatility_regime_weight": float(volatility_regime_weight),
+        "concentration_weight": float(concentration_weight),
+    }
+    enabled = [name for name, value in unsupported.items() if value != 0.0]
+    if enabled:
+        raise ValueError(
+            "tw_index_futures_day has one scalar TAIEX target and requires "
+            "stock-level auxiliary loss weights to be zero: " + ", ".join(enabled)
+        )
 
 
 class _UniqueKeySafeLoader(yaml.SafeLoader):
@@ -445,6 +496,10 @@ class RunnerConfig:
     resume: bool = True
     post_train_infer: bool = True
     start_fold: int | None = None
+    # Run each selected walk-forward fold through a fresh train.py process.
+    # This is an execution-isolation switch only; every child still uses the
+    # canonical run_training implementation and the same output/checkpoints.
+    isolate_train_folds: bool = False
 
 
 @dataclass(slots=True)
@@ -560,6 +615,22 @@ class TradingConfig:
     # explicit counterfactual account contract that leaves eligible shorts
     # uncapped while preserving every other short-sale rule.
     tw_short_capacity_limit_enabled: bool = True
+    # Daily TX/MTX/TMF execution. The three products are integer-sizing
+    # instruments for one signed TAIEX exposure, not independent alpha heads.
+    tw_index_futures_data_path: str = "data_tw_index_futures/day_session_front_month.parquet"
+    tw_index_futures_reference_product: str = "TX"
+    tw_index_futures_initial_capital: float = 1_000_000.0
+    tw_index_futures_max_abs_exposure: float = 1.0
+    tw_index_futures_exchange_and_clearing_fee_per_side_twd: list[float] = field(
+        default_factory=lambda: [20.0, 12.5, 8.0]
+    )
+    tw_index_futures_total_fee_per_side_twd: list[float] = field(
+        default_factory=lambda: [60.0, 24.0, 16.0]
+    )
+    tw_index_futures_slippage_points_per_side: list[float] = field(
+        default_factory=lambda: [0.0, 0.0, 0.0]
+    )
+    tw_index_futures_basket_fee_penalty: float = 1.0
 
 
 @dataclass(slots=True)
@@ -1880,6 +1951,21 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         direction_weight=training["multitask_loss"]["direction_weight"],
         explain_after_each_fold=training["explain_after_each_fold"],
     )
+    _validate_tw_index_futures_mode_contract(
+        execution_mode=trading["execution_mode"],
+        model_name=training["model_name"],
+        loss_type=training["loss_type"],
+        return_rank_ic_weight=training["multitask_loss"][
+            "return_rank_ic_weight"
+        ],
+        direction_weight=training["multitask_loss"]["direction_weight"],
+        volatility_regime_weight=training["multitask_loss"][
+            "volatility_regime_weight"
+        ],
+        concentration_weight=training["multitask_loss"][
+            "concentration_weight"
+        ],
+    )
     if (
         DAY_TRADE_OPEN_GAP_FEATURE in data["feature_include"]
         and trading["execution_mode"] != "tw_day_trade"
@@ -1956,6 +2042,82 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
             "trading.tw_corporate_action_claim_queue_sessions must be at least "
             "tw_settlement_lag_sessions"
         )
+    futures_data_path = str(trading["tw_index_futures_data_path"]).strip()
+    if not futures_data_path:
+        raise ValueError("trading.tw_index_futures_data_path must not be empty")
+    trading["tw_index_futures_data_path"] = futures_data_path
+    trading["tw_index_futures_reference_product"] = (
+        normalize_taifex_index_futures_product(
+            trading["tw_index_futures_reference_product"]
+        )
+    )
+    futures_initial_capital = float(
+        trading["tw_index_futures_initial_capital"]
+    )
+    futures_max_abs_exposure = float(
+        trading["tw_index_futures_max_abs_exposure"]
+    )
+    futures_basket_fee_penalty = float(
+        trading["tw_index_futures_basket_fee_penalty"]
+    )
+    if not math.isfinite(futures_initial_capital) or futures_initial_capital <= 0.0:
+        raise ValueError("tw_index_futures_initial_capital must be positive and finite")
+    if (
+        not math.isfinite(futures_max_abs_exposure)
+        or not 0.0 < futures_max_abs_exposure <= 1.0
+    ):
+        raise ValueError("tw_index_futures_max_abs_exposure must be in (0, 1]")
+    if not math.isfinite(futures_basket_fee_penalty) or futures_basket_fee_penalty < 0.0:
+        raise ValueError("tw_index_futures_basket_fee_penalty must be finite and non-negative")
+
+    def futures_triple(name: str) -> tuple[float, float, float]:
+        raw_values = trading[name]
+        if isinstance(raw_values, (str, bytes)):
+            raise ValueError(f"trading.{name} must contain TX, MTX, and TMF values")
+        values = tuple(float(value) for value in raw_values)
+        if len(values) != 3 or any(
+            not math.isfinite(value) or value < 0.0 for value in values
+        ):
+            raise ValueError(
+                f"trading.{name} must contain three finite non-negative values"
+            )
+        trading[name] = list(values)
+        return values
+
+    futures_exchange_fees = futures_triple(
+        "tw_index_futures_exchange_and_clearing_fee_per_side_twd"
+    )
+    futures_total_fees = futures_triple(
+        "tw_index_futures_total_fee_per_side_twd"
+    )
+    futures_slippage = futures_triple(
+        "tw_index_futures_slippage_points_per_side"
+    )
+    if any(
+        total + 1e-12 < exchange
+        for total, exchange in zip(
+            futures_total_fees, futures_exchange_fees, strict=True
+        )
+    ):
+        raise ValueError(
+            "tw_index_futures_total_fee_per_side_twd cannot be smaller than "
+            "the exchange and clearing charge"
+        )
+    futures_broker_fees = tuple(
+        total - exchange
+        for total, exchange in zip(
+            futures_total_fees, futures_exchange_fees, strict=True
+        )
+    )
+    _ = FuturesCostSchedule(
+        exchange_and_clearing_fee_per_side_twd=futures_exchange_fees,
+        broker_fee_per_side_twd=futures_broker_fees,
+        slippage_points_per_side=futures_slippage,
+        basket_fee_penalty=futures_basket_fee_penalty,
+    )
+    trading["tw_index_futures_initial_capital"] = futures_initial_capital
+    trading["tw_index_futures_max_abs_exposure"] = futures_max_abs_exposure
+    trading["tw_index_futures_basket_fee_penalty"] = futures_basket_fee_penalty
     # Report/post-processing leverage only. Canonical model/loss/backtest exposure stays unlevered.
     trading["max_turnover_ratio"] = max(0.0, float(trading["max_turnover_ratio"]))
     trading["max_volume_participation"] = max(0.0, float(trading["max_volume_participation"]))

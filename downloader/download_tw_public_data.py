@@ -43,6 +43,7 @@ try:
         resolve_request_interval,
         run_parallel_tasks,
     )
+    from downloader.tw_public_contract import DAILY_CLOSE_OPTIONAL_DATASETS
 except ImportError:  # pragma: no cover - direct script execution from downloader/
     from common import (
         SharedRateLimiter,
@@ -52,6 +53,7 @@ except ImportError:  # pragma: no cover - direct script execution from downloade
         resolve_request_interval,
         run_parallel_tasks,
     )
+    from tw_public_contract import DAILY_CLOSE_OPTIONAL_DATASETS
 
 
 DATA_GOV_DATASET_API = "https://data.gov.tw/api/v2/rest/dataset/{dataset_id}"
@@ -260,6 +262,14 @@ OHLCV_SYMBOL_COLUMNS = {
     "tpex_daily_ohlcv": "代號",
 }
 TPEX_OFFICIAL_CALENDAR_DATASET = "tpex_daily_ohlcv"
+DAILY_SUPERSEDED_DATASETS = {
+    # Both endpoints publish the same TDCC tier-distribution dataset. The
+    # openapi-t host is materially less reliable and can consume minutes of
+    # retries, while data.gov.tw resolves the maintained canonical resource.
+    # Keep both for rebuild/repair cross-checks, but use the maintained mirror
+    # for latency-sensitive daily refreshes.
+    "tdcc_shareholding_distribution": "data_gov_tdcc_shareholding_distribution",
+}
 TAIEX_SESSION_CALENDAR_DATASET = "twse_taiex_ohlc"
 TAIEX_SESSION_CALENDAR_SUMMARY_SCHEMA_VERSION = 1
 TAIEX_SESSION_CALENDAR_REQUIRED_COLUMNS = (
@@ -397,7 +407,7 @@ HISTORICAL_DAILY_DATASETS: tuple[DatasetSpec, ...] = (
         description="TWSE listed daily OHLCV from official historical MI_INDEX JSON.",
         tags=("twse", "price", "liquidity", "daily", "historical"),
         url_template=(
-            "https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX"
+            "https://wwwc.twse.com.tw/rwd/zh/afterTrading/MI_INDEX"
             "?date={date}&type=ALLBUT0999&response=json"
         ),
         date_format="%Y%m%d",
@@ -411,7 +421,7 @@ HISTORICAL_DAILY_DATASETS: tuple[DatasetSpec, ...] = (
         description="TWSE market index tables from official historical MI_INDEX JSON.",
         tags=("twse", "index", "market", "daily", "historical"),
         url_template=(
-            "https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX"
+            "https://wwwc.twse.com.tw/rwd/zh/afterTrading/MI_INDEX"
             "?date={date}&type=IND&response=json"
         ),
         date_format="%Y%m%d",
@@ -425,7 +435,7 @@ HISTORICAL_DAILY_DATASETS: tuple[DatasetSpec, ...] = (
         description="TWSE margin and short balance from official historical MI_MARGN JSON.",
         tags=("twse", "chip", "margin", "daily", "historical"),
         url_template=(
-            "https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN"
+            "https://wwwc.twse.com.tw/rwd/zh/marginTrading/MI_MARGN"
             "?date={date}&selectType=ALL&response=json"
         ),
         date_format="%Y%m%d",
@@ -439,7 +449,7 @@ HISTORICAL_DAILY_DATASETS: tuple[DatasetSpec, ...] = (
         description="TWSE three major institutional investors by stock from official T86 JSON.",
         tags=("twse", "chip", "institutional", "daily", "historical"),
         url_template=(
-            "https://www.twse.com.tw/rwd/zh/fund/T86"
+            "https://wwwc.twse.com.tw/rwd/zh/fund/T86"
             "?date={date}&selectType=ALLBUT0999&response=json"
         ),
         date_format="%Y%m%d",
@@ -452,7 +462,7 @@ HISTORICAL_DAILY_DATASETS: tuple[DatasetSpec, ...] = (
         description="TWSE daily dividend yield, PE, and PB by stock.",
         tags=("twse", "fundamental", "valuation", "daily", "historical"),
         url_template=(
-            "https://www.twse.com.tw/rwd/zh/afterTrading/BWIBBU_d"
+            "https://wwwc.twse.com.tw/rwd/zh/afterTrading/BWIBBU_d"
             "?date={date}&selectType=ALL&response=json"
         ),
         date_format="%Y%m%d",
@@ -468,7 +478,7 @@ HISTORICAL_DAILY_DATASETS: tuple[DatasetSpec, ...] = (
         ),
         tags=("twse", "execution", "day-trade", "daily", "historical"),
         url_template=(
-            "https://www.twse.com.tw/rwd/zh/dayTrading/TWTB4U"
+            "https://wwwc.twse.com.tw/rwd/zh/dayTrading/TWTB4U"
             "?date={date}&selectType=All&response=json"
         ),
         date_format="%Y%m%d",
@@ -956,8 +966,18 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help=(
             "In daily mode only, do not fail the close-price pipeline when the "
-            "current session's TWSE/TPEx margin-balance reports have not been "
-            "published yet. All other dataset failures remain fatal."
+            "current session's non-OHLCV close-optional reports have not been "
+            "published yet. Historical gaps and core OHLCV failures remain fatal."
+        ),
+    )
+    parser.add_argument(
+        "--require-daily-close-publication",
+        action="store_true",
+        help=(
+            "In daily mode, stop after the independent historical-source phase "
+            "unless the requested TAIEX session and both TWSE/TPEx OHLCV files "
+            "contain the requested close. This prevents expensive dependent "
+            "downloads and derived rebuilds before the exchange has published."
         ),
     )
     parser.add_argument(
@@ -2583,7 +2603,7 @@ def _http_get(
         "User-Agent": USER_AGENT,
         "Accept": "application/json,text/csv,text/plain,text/javascript,application/xml,text/xml,*/*;q=0.8",
         "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
-        "Referer": "https://www.twse.com.tw/",
+        "Referer": "https://wwwc.twse.com.tw/",
         "X-Requested-With": "XMLHttpRequest",
     }
     retry_count = max(0, int(retries))
@@ -2652,10 +2672,12 @@ def _http_get(
                 response = request_once(session, verify=False)
             security_block = _response_is_tw_public_security_block(response)
             if security_block:
+                if not retry_security_blocks:
+                    return annotate_attempts(response)
                 delay = _retry_delay_seconds(response, attempt, retry_backoff)
                 limiter.defer(delay)
                 time.sleep(delay)
-                if not retry_security_blocks or attempt >= retry_count:
+                if attempt >= retry_count:
                     return annotate_attempts(response)
                 close_response(response)
                 continue
@@ -5110,7 +5132,7 @@ def _download_historical_date(
                     verify_ssl=bool(args.verify_ssl),
                     retries=int(args.retries),
                     retry_backoff=float(args.retry_backoff),
-                    retry_security_blocks=False,
+                    retry_security_blocks=request_url_index == len(request_urls) - 1,
                 )
                 total_response_attempts += max(
                     1,
@@ -5907,11 +5929,104 @@ def _print_dataset_list(specs: list[DatasetSpec]) -> None:
         print(f"{spec.name}\t{spec.kind}\t{spec.source}\t{labels}\t{origin}")
 
 
+def _require_daily_close_publication(
+    specs: list[DatasetSpec],
+    args: argparse.Namespace,
+    output_dir: Path,
+    phase_one_results: list[DownloadResult],
+) -> None:
+    if not bool(getattr(args, "require_daily_close_publication", False)):
+        return
+    if args.mode != "daily":
+        raise ValueError("--require-daily-close-publication is valid only in daily mode")
+
+    required_names = {"twse_daily_ohlcv", "tpex_daily_ohlcv"}
+    selected_names = {spec.name for spec in specs}
+    missing_specs = sorted(required_names - selected_names)
+    if missing_specs:
+        raise ValueError(
+            "--require-daily-close-publication requires datasets: "
+            + ", ".join(missing_specs)
+        )
+
+    requested = _parse_date(resolve_end_date(args.end_date))
+    try:
+        sessions, _ = _validated_taiex_session_dates(
+            output_dir,
+            requested,
+            requested,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"daily close publication pending for {requested}: "
+            f"TAIEX session calendar is not published through the requested date"
+        ) from exc
+    if requested not in sessions:
+        print(
+            f"[tw-public] requested date {requested} is not an official TAIEX "
+            "session; no same-day close publication is required",
+            flush=True,
+        )
+        return
+
+    results_by_name = {row.dataset: row for row in phase_one_results}
+    pending: list[str] = []
+    for name in sorted(required_names):
+        result = results_by_name.get(name)
+        latest = _latest_existing_date(output_dir / f"{name}.parquet")
+        if (
+            result is None
+            or result.status in {"failed", "incomplete", "unsupported"}
+            or latest is None
+            or latest < requested
+        ):
+            pending.append(f"{name}={latest or 'missing'}")
+    if pending:
+        raise RuntimeError(
+            f"daily close publication pending for {requested}: "
+            + ", ".join(pending)
+        )
+    print(
+        f"[tw-public] daily close publication ready date={requested} "
+        "sources=twse_daily_ohlcv,tpex_daily_ohlcv",
+        flush=True,
+    )
+
+
 def _run_selected_downloads(
     specs: list[DatasetSpec],
     args: argparse.Namespace,
     output_dir: Path,
 ) -> list[DownloadResult]:
+    superseded_results: list[DownloadResult] = []
+    if getattr(args, "mode", None) == "daily":
+        selected_names = {spec.name for spec in specs}
+        active_specs: list[DatasetSpec] = []
+        for spec in specs:
+            replacement = DAILY_SUPERSEDED_DATASETS.get(spec.name)
+            if replacement and replacement in selected_names:
+                path = output_dir / f"{spec.name}.parquet"
+                superseded_results.append(
+                    DownloadResult(
+                        dataset=spec.name,
+                        status="up_to_date",
+                        rows=_read_existing_row_count(path),
+                        output_path=str(path) if path.is_file() else None,
+                        message=(
+                            f"daily refresh uses maintained equivalent dataset "
+                            f"{replacement}"
+                        ),
+                    )
+                )
+                print(
+                    f"[tw-public] daily skip superseded dataset={spec.name} "
+                    f"replacement={replacement}",
+                    flush=True,
+                )
+                continue
+            active_specs.append(spec)
+        specs = active_specs
+
     dependent = [
         spec for spec in specs if spec.name in TPEX_SESSION_DEPENDENT_DATASETS
     ]
@@ -5935,7 +6050,7 @@ def _run_selected_downloads(
         )
 
     if not dependent:
-        return run_batch(specs, "download:tw_public")
+        return superseded_results + run_batch(specs, "download:tw_public")
 
     # The three TPEx feature histories use validated official OHLCV sessions as
     # their calendar. Complete every independent historical source first so a
@@ -5953,7 +6068,14 @@ def _run_selected_downloads(
         for spec in specs
         if spec.name not in phase_one_names
     ]
-    return run_batch(phase_one, "download:tw_public:calendar") + run_batch(
+    phase_one_results = run_batch(phase_one, "download:tw_public:calendar")
+    _require_daily_close_publication(
+        specs,
+        args,
+        output_dir,
+        phase_one_results,
+    )
+    return superseded_results + phase_one_results + run_batch(
         phase_two,
         "download:tw_public:dependent",
     )
@@ -6016,7 +6138,6 @@ def main() -> None:
         for row in historical_results
         if row.dataset in TPEX_KNOWN_SOURCE_UNAVAILABLE_RANGES
     }
-    publication_lag_candidates = {"twse_margin_balance", "tpex_margin_balance"}
     resolved_end_date = resolve_end_date(args.end_date)
     publication_lag_results = [
         row
@@ -6024,7 +6145,7 @@ def main() -> None:
         if (
             bool(args.allow_daily_publication_lag)
             and args.mode == "daily"
-            and row.dataset in publication_lag_candidates
+            and row.dataset in DAILY_CLOSE_OPTIONAL_DATASETS
             and row.status in failed_statuses
             and int(row.failed_dates) == 1
             and int(row.missing_dates_after) == 1

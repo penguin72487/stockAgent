@@ -36,6 +36,7 @@ class PortfolioHistoryResult:
     capital: CapitalScale
     frequency: str
     execution_mode: str = "naive"
+    min_abs_change: float = 0.0
 
 
 def _latest_holdings_by_date_symbol(holdings):
@@ -123,6 +124,78 @@ def _join_daily_returns(daily, returns):
         if name not in daily.columns:
             daily = daily.with_columns(pl.lit(None, dtype=pl.Float64).alias(name))
     return daily.sort("date")
+
+
+def _read_day_trade_close_nav(root: Path):
+    import polars as pl
+
+    path = _artifact_path(root, "integer_share_settlement_audit")
+    if path is None:
+        path = _artifact_path(root, "settlement_audit")
+    if path is None:
+        return None, None
+    frame = _read_table(path)
+    required = {"date", "settled_cash", "payables_total", "receivables_total"}
+    if not required.issubset(frame.columns):
+        return None, path
+    close_nav = (
+        frame.select(
+            [
+                _date_string_expr("daily"),
+                (
+                    pl.col("settled_cash").cast(pl.Float64, strict=False).fill_null(0.0)
+                    + pl.col("receivables_total").cast(pl.Float64, strict=False).fill_null(0.0)
+                    - pl.col("payables_total").cast(pl.Float64, strict=False).fill_null(0.0)
+                ).alias("close_nav"),
+            ]
+        )
+        .group_by("date", maintain_order=True)
+        .agg(pl.col("close_nav").last())
+    )
+    return close_nav, path
+
+
+def _with_day_trade_close_nav(daily, close_nav):
+    import polars as pl
+
+    if close_nav is None:
+        return daily.with_columns(pl.col("nav").alias("open_nav"))
+    return (
+        daily.rename({"nav": "open_nav"})
+        .join(close_nav, on="date", how="left")
+        .with_columns(pl.coalesce([pl.col("close_nav"), pl.col("open_nav")]).alias("nav"))
+        .drop("close_nav")
+    )
+
+
+def _read_requested_weight_summaries(root: Path) -> tuple[dict[str, dict[str, float | int]], Path | None]:
+    import numpy as np
+
+    for name in ("test_integer_share_backtest.npz", "test_backtest.npz"):
+        path = root / name
+        if not path.exists():
+            continue
+        try:
+            with np.load(path, allow_pickle=False) as archive:
+                if "dates" not in archive or "requested_weights_history" not in archive:
+                    continue
+                dates = np.asarray(archive["dates"])
+                requested = np.asarray(archive["requested_weights_history"], dtype=np.float64)
+                if requested.ndim != 2:
+                    continue
+                row_count = min(int(dates.shape[0]), int(requested.shape[0]))
+                summaries: dict[str, dict[str, float | int]] = {}
+                for idx in range(row_count):
+                    values = np.nan_to_num(requested[idx], nan=0.0, posinf=0.0, neginf=0.0)
+                    date = np.datetime_as_string(dates[idx].astype("datetime64[D]"), unit="D")
+                    summaries[str(date)] = {
+                        "requested_gross_ratio": float(np.abs(values).sum()),
+                        "requested_position_count": int(np.count_nonzero(np.abs(values) > 1e-9)),
+                    }
+                return summaries, path
+        except (OSError, ValueError, TypeError, KeyError):
+            continue
+    return {}, None
 
 
 def _with_profit_estimates(daily):
@@ -334,7 +407,8 @@ def _daily_changes(
     execution_mode: str = "naive",
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     current = holdings_by_date.get(date, {})
-    previous = holdings_by_date.get(previous_date or "", {})
+    day_trade = str(execution_mode).strip().lower() == "tw_day_trade"
+    previous = {} if day_trade else holdings_by_date.get(previous_date or "", {})
     symbols = set(current) | set(previous)
     changes: list[dict[str, Any]] = []
     counts: dict[str, int] = {}
@@ -425,6 +499,7 @@ def load_portfolio_history(
         frequency=history_frequency,
         execution_mode=execution_mode,
     )
+    day_trade = str(execution_mode).strip().lower() == "tw_day_trade"
     returns, returns_path = _read_returns(root, frequency=history_frequency)
     holdings = holdings.with_row_index(_ROW_INDEX_COL).select(
         [
@@ -442,7 +517,15 @@ def load_portfolio_history(
         holdings = _bar_holdings_by_timestamp(holdings, returns)
     else:
         holdings = _latest_holdings_by_date_symbol(holdings)
-    daily = _with_profit_estimates(_join_daily_returns(_daily_holdings_summary(holdings), returns))
+    daily = _join_daily_returns(_daily_holdings_summary(holdings), returns)
+    close_nav_path = None
+    requested_summaries: dict[str, dict[str, float | int]] = {}
+    requested_path = None
+    if day_trade and not is_bar_frequency(history_frequency):
+        close_nav, close_nav_path = _read_day_trade_close_nav(root)
+        daily = _with_day_trade_close_nav(daily, close_nav)
+        requested_summaries, requested_path = _read_requested_weight_summaries(root)
+    daily = _with_profit_estimates(daily)
     capital = resolve_capital_scale_from_nav(
         daily.select(["date", "nav"]).to_dicts(),
         initial_capital=initial_capital,
@@ -457,6 +540,7 @@ def load_portfolio_history(
         "long_exposure",
         "short_exposure",
         "profit_value",
+        "open_nav",
     ]
     if capital.scale != 1.0:
         daily = daily.with_columns([(pl.col(name) * capital.scale).alias(name) for name in money_columns if name in daily.columns])
@@ -509,6 +593,15 @@ def load_portfolio_history(
         else:
             changes, change_counts = [], {}
         row = dict(row)
+        row["execution_mode"] = str(execution_mode)
+        requested = requested_summaries.get(date)
+        if requested is not None:
+            row.update(requested)
+            requested_gross = float(requested.get("requested_gross_ratio") or 0.0)
+            executed_gross = float(row.get("gross_ratio") or 0.0)
+            row["execution_fill_ratio"] = (
+                executed_gross / requested_gross if requested_gross > 1e-12 else None
+            )
         row["cumulative_return"] = cumulative_values.get(date)
         row["changes"] = changes
         row["change_counts"] = change_counts
@@ -518,6 +611,9 @@ def load_portfolio_history(
     source_paths = [holdings_path]
     if returns_path is not None:
         source_paths.append(returns_path)
+    for path in (close_nav_path, requested_path):
+        if path is not None and path not in source_paths:
+            source_paths.append(path)
     source_paths.extend(price_lookup.paths)
     return PortfolioHistoryResult(
         fold_dir=root,
@@ -533,4 +629,5 @@ def load_portfolio_history(
         capital=capital,
         frequency=history_frequency,
         execution_mode=str(execution_mode),
+        min_abs_change=float(min_abs_change),
     )
