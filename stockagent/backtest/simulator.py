@@ -44,6 +44,12 @@ from stockagent.backtest.tw_integer_execution import (
     run_tw_cash_integer,
     run_tw_day_trade_integer,
 )
+from stockagent.backtest.tw_index_futures import (
+    FuturesCostSchedule,
+    run_tw_index_futures_day_continuous,
+    run_tw_index_futures_day_integer,
+)
+from stockagent.data.tw_index_futures import TaiwanIndexFuturesDaySession
 from stockagent.models.normalization import (
     DEFAULT_PORTFOLIO_ACTIVATION,
     PORTFOLIO_L1_EPS,
@@ -2826,6 +2832,129 @@ def run_backtest_torch(
 ) -> BacktestResultTensor:
     """Simulate daily portfolio execution from model weights in torch."""
     mode = normalize_execution_mode(execution_mode)
+    if mode == "tw_index_futures_day":
+        if weights.dim() != 2:
+            raise ValueError(
+                "tw_index_futures_day expects canonical pseudo weights [T,S]"
+            )
+        if future_returns.shape != weights.shape:
+            raise ValueError("future_returns must match futures pseudo weights [T,S]")
+        if tradable_mask.shape != weights.shape:
+            raise ValueError("tradable_mask must match futures pseudo weights [T,S]")
+        selection_mask = tradable_mask.to(device=weights.device, dtype=torch.bool)
+        clean_weights = torch.nan_to_num(
+            weights, nan=0.0, posinf=0.0, neginf=0.0
+        )
+        clean_weights = torch.where(
+            selection_mask, clean_weights, torch.zeros_like(clean_weights)
+        )
+        requested_exposure = clean_weights.sum(dim=-1)
+        if long_only:
+            requested_exposure = requested_exposure.clamp_min(0.0)
+        if float(min_trade_weight) > 0.0:
+            requested_exposure = torch.where(
+                requested_exposure.abs() >= float(min_trade_weight),
+                requested_exposure,
+                torch.zeros_like(requested_exposure),
+            )
+
+        raw_returns = future_returns.to(
+            device=weights.device, dtype=torch.float32
+        )
+        valid_cells = selection_mask & torch.isfinite(raw_returns)
+        valid_count = valid_cells.sum(dim=-1)
+        reference_returns = torch.where(
+            valid_count > 0,
+            torch.where(valid_cells, raw_returns, torch.zeros_like(raw_returns))
+            .sum(dim=-1)
+            / valid_count.clamp_min(1).to(dtype=raw_returns.dtype),
+            torch.zeros_like(requested_exposure, dtype=torch.float32),
+        )
+        futures_tradable = valid_count > 0
+        if state_advance_mask is not None:
+            futures_tradable = futures_tradable & state_advance_mask.to(
+                device=weights.device, dtype=torch.bool
+            )
+        if initial_alive is not None:
+            futures_tradable = futures_tradable & initial_alive.to(
+                device=weights.device, dtype=torch.bool
+            )
+        exposure_limit = _resolve_exposure_budget(gross_leverage)
+        continuous = run_tw_index_futures_day_continuous(
+            requested_exposure,
+            reference_returns,
+            futures_tradable,
+            round_trip_cost_rate=float(buy_fee_rate) + float(sell_fee_rate),
+            max_abs_exposure=exposure_limit,
+        )
+        initial_alive_tensor = (
+            torch.ones((), device=weights.device, dtype=torch.bool)
+            if initial_alive is None
+            else initial_alive.to(device=weights.device, dtype=torch.bool)
+        )
+        if int(weights.size(0)) > 0:
+            survived_prior_rows = torch.cat(
+                (
+                    torch.ones((1,), device=weights.device, dtype=torch.bool),
+                    torch.cumprod(
+                        (continuous.strategy_returns[:-1] > -1.0).to(
+                            dtype=torch.int64
+                        ),
+                        dim=0,
+                    ).to(dtype=torch.bool),
+                ),
+                dim=0,
+            )
+            alive_before_row = initial_alive_tensor & survived_prior_rows
+            continuous = run_tw_index_futures_day_continuous(
+                requested_exposure,
+                reference_returns,
+                futures_tradable & alive_before_row,
+                round_trip_cost_rate=float(buy_fee_rate) + float(sell_fee_rate),
+                max_abs_exposure=exposure_limit,
+            )
+        strategy_log_returns = _portfolio_simple_returns_to_log_torch(
+            continuous.strategy_returns
+        )
+        # Avoid 0/0 without perturbing small but valid scalar exposures.
+        scale = torch.where(
+            continuous.requested_exposure != 0.0,
+            continuous.executed_exposure
+            / torch.where(
+                continuous.requested_exposure != 0.0,
+                continuous.requested_exposure,
+                torch.ones_like(continuous.requested_exposure),
+            ),
+            torch.zeros_like(continuous.executed_exposure),
+        )
+        executed_pseudo_weights = clean_weights.to(dtype=torch.float32) * scale.unsqueeze(-1)
+        empty_or_history = (
+            executed_pseudo_weights
+            if return_weights_history
+            else executed_pseudo_weights.new_empty((0, int(weights.size(-1))))
+        )
+        requested_history = (
+            weights.to(dtype=torch.float32)
+            if return_weights_history
+            else None
+        )
+        survived = initial_alive_tensor & torch.all(
+            continuous.strategy_returns > -1.0
+        )
+        return BacktestResultTensor(
+            strategy_returns=strategy_log_returns,
+            benchmark_returns=benchmark_returns.to(
+                device=weights.device, dtype=torch.float32
+            ),
+            turnovers=continuous.turnovers,
+            weights_history=empty_or_history,
+            requested_weights_history=requested_history,
+            final_weights=torch.zeros(
+                int(weights.size(-1)), device=weights.device, dtype=torch.float32
+            ),
+            final_alive=survived,
+            execution_mode=mode,
+        )
     if mode != "naive":
         n_symbols = int(weights.size(-1))
         if buy_fee_rates is None or sell_fee_rates is None:
@@ -3877,6 +4006,9 @@ def run_backtest_integer_shares(
     initial_integer_state: TaiwanIntegerState | None = None,
     symbol_indices: np.ndarray | None = None,
     symbols_are_full_universe: bool = False,
+    futures_market: TaiwanIndexFuturesDaySession | None = None,
+    futures_cost_schedule: FuturesCostSchedule | None = None,
+    futures_max_abs_exposure: float | None = None,
 ) -> tuple[BacktestResult, list[HoldingsRecord]]:
     """Integer-share audit backtest for naive or Taiwan settlement execution.
 
@@ -3914,6 +4046,136 @@ def run_backtest_integer_shares(
     to equal the active symbol count but their orders differ.
     """
     mode = normalize_execution_mode(execution_mode)
+    if mode == "tw_index_futures_day":
+        raw_weights = np.asarray(weights, dtype=np.float64)
+        raw_returns = np.asarray(future_returns)
+        raw_tradable = np.asarray(tradable_mask)
+        raw_benchmark = np.asarray(benchmark_returns, dtype=np.float32)
+        if raw_weights.ndim != 2 or raw_weights.shape[0] <= 0:
+            raise ValueError("tw_index_futures_day weights must have shape [T,S]")
+        rows, symbols_count = raw_weights.shape
+        if raw_returns.shape != raw_weights.shape:
+            raise ValueError("future_returns must match futures weights [T,S]")
+        if raw_tradable.shape != raw_weights.shape or raw_tradable.dtype != np.bool_:
+            raise ValueError("tradable_mask must be boolean and match weights [T,S]")
+        if raw_benchmark.shape != (rows,):
+            raise ValueError("benchmark_returns must have shape [T]")
+        if futures_market is None:
+            raise ValueError("tw_index_futures_day requires futures_market")
+
+        market_dates = np.asarray(futures_market.dates, dtype="datetime64[D]")
+        requested_dates = (
+            market_dates
+            if dates is None
+            else np.asarray(dates, dtype="datetime64[D]")
+        )
+        if requested_dates.shape != (rows,):
+            raise ValueError("dates must contain one row per futures decision")
+        row_indices = np.searchsorted(market_dates, requested_dates)
+        if bool(
+            np.any(row_indices >= market_dates.size)
+            or np.any(market_dates[row_indices] != requested_dates)
+        ):
+            raise ValueError("futures_market does not cover every requested date")
+        selected_market = TaiwanIndexFuturesDaySession(
+            dates=market_dates[row_indices],
+            products=futures_market.products,
+            contract_months=futures_market.contract_months[row_indices],
+            open_prices=futures_market.open_prices[row_indices],
+            high_prices=futures_market.high_prices[row_indices],
+            low_prices=futures_market.low_prices[row_indices],
+            close_prices=futures_market.close_prices[row_indices],
+            volumes=futures_market.volumes[row_indices],
+            log_returns=futures_market.log_returns[row_indices],
+            tradable_mask=futures_market.tradable_mask[row_indices],
+            multipliers=futures_market.multipliers,
+        )
+        clean_weights = np.nan_to_num(
+            raw_weights, nan=0.0, posinf=0.0, neginf=0.0
+        )
+        clean_weights = np.where(raw_tradable, clean_weights, 0.0)
+        requested_exposure = clean_weights.sum(axis=-1)
+        if long_only:
+            requested_exposure = np.maximum(requested_exposure, 0.0)
+        if float(min_trade_weight) > 0.0:
+            requested_exposure = np.where(
+                np.abs(requested_exposure) >= float(min_trade_weight),
+                requested_exposure,
+                0.0,
+            )
+        integer = run_tw_index_futures_day_integer(
+            requested_exposure,
+            selected_market,
+            initial_capital=initial_capital,
+            max_abs_exposure=min(
+                _resolve_exposure_budget(gross_leverage),
+                (
+                    _resolve_exposure_budget(futures_max_abs_exposure)
+                    if futures_max_abs_exposure is not None
+                    else 1.0
+                ),
+            ),
+            cost_schedule=futures_cost_schedule,
+        )
+        denominator = np.where(
+            requested_exposure != 0.0, requested_exposure, 1.0
+        )
+        scale = np.where(
+            requested_exposure != 0.0,
+            integer.executed_exposure / denominator,
+            0.0,
+        )
+        executed_pseudo_weights = (
+            clean_weights * scale[:, None]
+        ).astype(np.float32, copy=False)
+        result = BacktestResult(
+            strategy_returns=_portfolio_simple_returns_to_log_numpy(
+                integer.strategy_returns
+            ),
+            benchmark_returns=raw_benchmark,
+            turnovers=integer.turnovers.astype(np.float32, copy=False),
+            weights_history=executed_pseudo_weights,
+            requested_weights_history=raw_weights.astype(np.float32, copy=False),
+            final_weights=np.zeros(symbols_count, dtype=np.float32),
+            final_alive=np.asarray(
+                integer.alive[-1] if integer.alive.size else True,
+                dtype=bool,
+            ),
+            execution_mode=mode,
+        )
+        records: list[HoldingsRecord] = []
+        if collect_holdings:
+            multipliers = selected_market.multipliers.astype(np.float64)
+            prior_equity = float(initial_capital)
+            for row in range(rows):
+                equity_denominator = max(prior_equity, 1e-12)
+                for product_idx, product in enumerate(selected_market.products):
+                    quantity = int(integer.contract_quantities[row, product_idx])
+                    if quantity == 0:
+                        continue
+                    for record_type, price in (
+                        ("entry", selected_market.open_prices[row, product_idx]),
+                        ("exit", selected_market.close_prices[row, product_idx]),
+                    ):
+                        signed_quantity = quantity if record_type == "entry" else -quantity
+                        market_value = (
+                            signed_quantity * multipliers[product_idx] * float(price)
+                        )
+                        records.append(
+                            HoldingsRecord(
+                                date=str(requested_dates[row]),
+                                symbol=str(product),
+                                shares=signed_quantity,
+                                price=float(price),
+                                market_value=float(market_value),
+                                holding_ratio=float(market_value / equity_denominator),
+                                is_cash=False,
+                                record_type=record_type,
+                                side="buy" if signed_quantity > 0 else "sell",
+                            )
+                        )
+                prior_equity = float(integer.equity[row])
+        return result, records
     if mode != "naive":
         raw_weights = np.asarray(weights, dtype=np.float64)
         phase_execution = (

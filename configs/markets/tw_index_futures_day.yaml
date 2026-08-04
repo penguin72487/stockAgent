@@ -1,50 +1,83 @@
-# Stock cross-section -> one signed TAIEX exposure -> TX/MTX/TMF integer basket.
+# Canonical train.py experiment: completed stock cross-section -> one signed
+# TAIEX exposure -> exact same-day TX/MTX/TMF basket.
 #
-# Timing contract:
-# - At 08:45 on futures session t, the model may read stock data only through
-#   the completed stock session t-1.
-# - The basket enters at the day-session open and is fully flattened at the
-#   day-session close. It carries no night-session exposure.
-# - TX/MTX/TMF are sizing instruments for one underlying direction; they are
-#   not three independent alpha heads.
-base_experiment_config: tw_public_lanten_market.yaml
-futures_data_path: ../../data_tw_index_futures/day_session_front_month.parquet
-output_dir: ../../artifacts/markets/tw_index_futures_day
+# Causal clock:
+# - At the futures day-session open on date t, features end at stock session t-1.
+# - No stock open/high/low/close/volume from t is visible to the model.
+# - The selected TX/MTX/TMF basket opens and fully closes in the day session;
+#   there is no night-session or overnight position.
+base_config: tw_public_lanten_market_candles.yaml
 
-reference_product: TX
-initial_capital: 1000000.0
-max_abs_exposure: 1.0
+experiment_name: tw-stock-cross-section-index-futures-day-last-only-v1
 
-# Differentiable training proxy. At TWD 1m, 0.00009 approximates the official
-# round-trip futures tax plus two MTX exchange/clearing fees. Negotiated broker
-# commission remains account-specific and is applied only by the exact integer
-# evaluator below.
-continuous_round_trip_cost_rate: 0.00009
+runner:
+  # Preserve checkpoints produced by the retired standalone trainer. They do
+  # not have the canonical train.py manifest and cannot safely resume.
+  output_dir: artifacts/markets/tw_index_futures_day_canonical
+  mode: train
+  resume: true
+  post_train_infer: true
+  start_fold: 1
+  # The current WDDM/CUDA driver can become device-not-ready when expanding
+  # folds compile sequentially in one long-lived context. Keep train.py as the
+  # supervisor while giving every fold a clean CUDA process.
+  isolate_train_folds: true
 
-# Official TAIFEX exchange + clearing charges, in TX/MTX/TMF order, per side.
-exchange_and_clearing_fee_per_side_twd: [20.0, 12.5, 8.0]
-# Replace these zeros with the account's actual negotiated per-side commission
-# before treating any backtest result as execution-ready.
-broker_fee_per_side_twd: [0.0, 0.0, 0.0]
-slippage_points_per_side: [0.0, 0.0, 0.0]
-basket_fee_penalty: 1.0
+data:
+  # The inherited candles config adds open[t]/close[t-1] only when this switch
+  # is true. Futures trade at 08:45, before the 09:00 stock open, so disable it.
+  day_trade_open_feature: false
 
-epochs: 50
-batch_size: 32
-eval_batch_size: 64
-learning_rate: 0.0003
-weight_decay: 0.0001
-start_fold: 1
-max_folds: null
-seed: 42
-enable_torch_compile: true
+trading:
+  execution_mode: tw_index_futures_day
+  frequency: daily
+  long_only: false
+  max_turnover_ratio: 0.0
+  max_volume_participation: 0.0
+  min_trade_weight: 0.0
+  portfolio_activation: pre_normalized
 
-model_overrides:
-  attention_mode: market_token
-  use_latent_factors: false
-  use_market_tokens: true
-  temporal_pooling: attention
-  temporal_query_mode: full_then_last
-  portfolio_output_mode: logits
-  return_aux: false
-  return_aux_details: false
+  # Differentiable round-trip proxy: 0.45 bps per side, 0.90 bps per day total.
+  # Exact evaluation below recomputes integer contract counts, fixed fees,
+  # futures transaction tax, and optional slippage for every product/day.
+  buy_fee_rate: 0.000045
+  sell_fee_rate: 0.000045
+
+  tw_index_futures_data_path: data_tw_index_futures/day_session_front_month.parquet
+  tw_index_futures_reference_product: TX
+  tw_index_futures_initial_capital: 1000000.0
+  tw_index_futures_max_abs_exposure: 1.0
+
+  # Per contract, per side, ordered TX / MTX / TMF. The online prices supplied
+  # by the user are all-in trader fees, so they are not added a second time to
+  # the official exchange + clearing component.
+  tw_index_futures_exchange_and_clearing_fee_per_side_twd: [20.0, 12.5, 8.0]
+  tw_index_futures_total_fee_per_side_twd: [60.0, 24.0, 16.0]
+  tw_index_futures_slippage_points_per_side: [0.0, 0.0, 0.0]
+  tw_index_futures_basket_fee_penalty: 1.0
+
+training:
+  model_name: cross_sectional_index_futures
+  loss_type: log_utility
+  loss_portfolio_activation: pre_normalized
+  explain_after_each_fold: false
+  postprocess_benchmark_after_fold: false
+  postprocess_benchmark_after_best_val: false
+
+  # Keep the inherited Transformer explicitly pinned to the requested
+  # last/last_only behavior. The dedicated head pools the current stock
+  # cross-section into one bounded futures exposure.
+  transformer_base_portfolio:
+    temporal_pooling: last
+    temporal_query_mode: last_only
+    # WDDM stability guard only: chunk the flattened batch*symbol temporal
+    # attention axis without changing weights, tokens, or attention results.
+    sdpa_batch_limit: 16384
+    return_aux: false
+    return_aux_details: false
+
+  multitask_loss:
+    return_rank_ic_weight: 0.0
+    direction_weight: 0.0
+    volatility_regime_weight: 0.0
+    concentration_weight: 0.0

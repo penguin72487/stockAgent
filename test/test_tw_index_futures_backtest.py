@@ -10,6 +10,10 @@ from stockagent.backtest.tw_index_futures import (
     run_tw_index_futures_day_integer,
     select_tw_index_futures_contract_basket,
 )
+from stockagent.backtest.simulator import (
+    run_backtest_integer_shares,
+    run_backtest_torch,
+)
 from stockagent.data.tw_index_futures import TaiwanIndexFuturesDaySession
 
 
@@ -86,3 +90,80 @@ def test_integer_backtest_applies_direction_tax_and_both_side_fees() -> None:
     assert result.equity[-1] > 1_000_000.0
     assert result.alive.all()
 
+
+def test_canonical_tensor_adapter_collapses_only_to_one_futures_exposure() -> None:
+    pseudo_weights = torch.tensor([[0.2, 0.3], [-0.4, -0.1]], requires_grad=True)
+    repeated_returns = torch.log(
+        torch.tensor([[1.01, 1.01], [0.99, 0.99]])
+    )
+    mask = torch.ones_like(pseudo_weights, dtype=torch.bool)
+    result = run_backtest_torch(
+        pseudo_weights,
+        repeated_returns,
+        mask,
+        repeated_returns[:, 0],
+        0.0005,
+        0.0005,
+        long_only=False,
+        portfolio_activation="pre_normalized",
+        execution_mode="tw_index_futures_day",
+    )
+
+    expected_simple = torch.tensor([0.5 * 0.01 - 0.0005, 0.5 * 0.01 - 0.0005])
+    torch.testing.assert_close(torch.expm1(result.strategy_returns), expected_simple)
+    torch.testing.assert_close(result.turnovers, torch.ones(2))
+    (-result.strategy_returns.mean()).backward()
+    assert pseudo_weights.grad is not None
+    assert torch.isfinite(pseudo_weights.grad).all()
+
+
+def test_canonical_tensor_adapter_keeps_ruin_absorbing_within_chunk() -> None:
+    pseudo_weights = torch.ones((2, 1))
+    repeated_returns = torch.log(torch.tensor([[0.01], [2.0]]))
+    mask = torch.ones_like(pseudo_weights, dtype=torch.bool)
+    result = run_backtest_torch(
+        pseudo_weights,
+        repeated_returns,
+        mask,
+        repeated_returns[:, 0],
+        0.05,
+        0.05,
+        long_only=False,
+        portfolio_activation="pre_normalized",
+        execution_mode="tw_index_futures_day",
+    )
+
+    assert result.strategy_returns[0] < 0.0
+    assert result.strategy_returns[1].item() == 0.0
+    torch.testing.assert_close(result.turnovers, torch.tensor([2.0, 0.0]))
+    assert not bool(result.final_alive)
+
+
+def test_canonical_integer_adapter_uses_all_in_user_fees() -> None:
+    pseudo_weights = np.asarray([[0.5, 0.5], [-0.5, -0.5]])
+    returns = np.repeat(_market().log_returns[:, :1], 2, axis=1)
+    mask = np.ones_like(pseudo_weights, dtype=bool)
+    schedule = FuturesCostSchedule(
+        tax_rate=0.0,
+        exchange_and_clearing_fee_per_side_twd=(20.0, 12.5, 8.0),
+        broker_fee_per_side_twd=(40.0, 11.5, 8.0),
+    )
+    result, records = run_backtest_integer_shares(
+        pseudo_weights,
+        returns,
+        mask,
+        np.asarray(_market().log_returns[:, 0], dtype=np.float32),
+        initial_capital=1_000_000.0,
+        long_only=False,
+        portfolio_activation="pre_normalized",
+        dates=_market().dates,
+        execution_mode="tw_index_futures_day",
+        futures_market=_market(),
+        futures_cost_schedule=schedule,
+    )
+
+    # TWD 1m exposure is two MTX; two sides * two contracts * TWD 24.
+    assert len(records) == 4
+    assert result.execution_mode == "tw_index_futures_day"
+    first_day_net = np.expm1(result.strategy_returns[0]) * 1_000_000.0
+    assert first_day_net == pytest.approx(10_000.0 - 96.0, rel=1e-5)

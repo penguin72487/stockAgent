@@ -8,6 +8,9 @@ from torch import nn
 from stockagent.config import ExperimentConfig
 from stockagent.models.bottleneck_portfolio_autoencoder import BottleneckPortfolioAutoencoder
 from stockagent.models.cross_sectional_temporal_portfolio_model import CrossSectionalTemporalPortfolioModel
+from stockagent.models.cross_sectional_index_futures import (
+    CrossSectionalIndexFuturesModel,
+)
 from stockagent.models.efficient_tcn_tabular_set_portfolio import EfficientTCNTabularSetPortfolioModel
 from stockagent.models.ft_transformer import CrossSectionalFTTransformer
 from stockagent.models.financial_transformer import FinancialTransformerModel
@@ -91,6 +94,12 @@ _TRANSFORMER_BASE_PORTFOLIO_NAMES = {
     "tbp",
 }
 
+_CROSS_SECTIONAL_INDEX_FUTURES_NAMES = {
+    "cross_sectional_index_futures",
+    "cross_sectional_index_futures_model",
+    "tw_index_futures",
+}
+
 _FINANCIAL_TRANSFORMER_NAMES = {
     "financial_transformer",
     "financial_transformer_model",
@@ -125,7 +134,10 @@ def model_hidden_dim_hint(config: ExperimentConfig) -> int:
         return int(config.training.latent_factor_market_token_portfolio.stock_embedding_dim)
     if model_name in _LOW_RANK_MARKET_TRANSFORMER_NAMES:
         return int(config.training.low_rank_market_transformer_portfolio.stock_embedding_dim)
-    if model_name in _TRANSFORMER_BASE_PORTFOLIO_NAMES:
+    if model_name in (
+        _TRANSFORMER_BASE_PORTFOLIO_NAMES
+        | _CROSS_SECTIONAL_INDEX_FUTURES_NAMES
+    ):
         return int(config.training.transformer_base_portfolio.d_model)
     if model_name in _FINANCIAL_TRANSFORMER_NAMES:
         return int(config.training.financial_transformer.d_model)
@@ -330,12 +342,29 @@ def build_model(
             allow_dynamic_symbols=config.training.allow_dynamic_symbols,
         )
 
-    if model_name in _TRANSFORMER_BASE_PORTFOLIO_NAMES:
+    if model_name in (
+        _TRANSFORMER_BASE_PORTFOLIO_NAMES
+        | _CROSS_SECTIONAL_INDEX_FUTURES_NAMES
+    ):
         tbp_cfg = config.training.transformer_base_portfolio
         portfolio_mode = str(tbp_cfg.portfolio_mode).strip().lower().replace("-", "_")
         if portfolio_mode in {"", "auto"}:
             portfolio_mode = "long_only" if config.trading.long_only else "long_short"
-        return TransformerBasePortfolioModel(
+        model_class = (
+            CrossSectionalIndexFuturesModel
+            if model_name in _CROSS_SECTIONAL_INDEX_FUTURES_NAMES
+            else TransformerBasePortfolioModel
+        )
+        futures_kwargs = (
+            {
+                "max_abs_exposure": (
+                    config.trading.tw_index_futures_max_abs_exposure
+                )
+            }
+            if model_name in _CROSS_SECTIONAL_INDEX_FUTURES_NAMES
+            else {}
+        )
+        return model_class(
             lookback=lookback,
             num_features=num_features,
             num_symbols=num_symbols,
@@ -394,6 +423,7 @@ def build_model(
             categorical_embedding_dim=tbp_cfg.categorical_embedding_dim,
             categorical_embedding_cardinality=tbp_cfg.categorical_embedding_cardinality,
             execution_mode=getattr(config.trading, "execution_mode", "naive"),
+            **futures_kwargs,
         )
 
     if model_name in _FINANCIAL_TRANSFORMER_NAMES:
