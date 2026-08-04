@@ -10,6 +10,7 @@ import pytest
 import torch
 
 import stockagent.models.transformer_base_portfolio as transformer_module
+import stockagent.training.trainer as trainer_module
 from stockagent.config import load_config
 from stockagent.models.factory import build_model, model_hidden_dim_hint
 from stockagent.models.transformer_base_portfolio import (
@@ -34,6 +35,7 @@ from stockagent.training.trainer import (
     _maybe_compact_train_windowed_symbols,
     _PanelSlabForwardWrapper,
     _panel_slab_dynamic_symbol_bounds,
+    _train_symbol_compaction_bounds,
     _train_symbol_compaction_upper_bound,
 )
 from stockagent.training.windowed import WindowedSplitTensors
@@ -41,6 +43,27 @@ from stockagent.training.windowed import WindowedSplitTensors
 
 def _device() -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+@pytest.mark.parametrize(
+    ("rank0", "isatty", "expected"),
+    [
+        (True, True, True),
+        (True, False, False),
+        (False, True, False),
+    ],
+)
+def test_interactive_progress_requires_rank0_real_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+    rank0: bool,
+    isatty: bool,
+    expected: bool,
+) -> None:
+    stream = SimpleNamespace(isatty=lambda: isatty)
+    monkeypatch.setattr(trainer_module, "_distributed_is_rank0", lambda: rank0)
+    monkeypatch.setattr(trainer_module.sys, "stderr", stream)
+
+    assert trainer_module._interactive_progress_enabled() is expected
 
 
 def _make_model(**overrides) -> TransformerBasePortfolioModel:
@@ -823,6 +846,16 @@ def test_panel_slab_dynamic_bounds_do_not_cross_sdpa_loop_count() -> None:
         max_symbols=2_735,
         local_batch_rows=128,
     ) == (2_560, 2_735)
+    # Lookback-256 uses only 16 local rows under two-rank DDP, so every real
+    # train width fits one SDPA interval. Preserve the causal run minimum
+    # instead of widening the symbolic domain to impossible tiny universes.
+    assert _panel_slab_dynamic_symbol_bounds(
+        model,
+        observed_symbols=1_244,
+        min_symbols=1_244,
+        max_symbols=2_598,
+        local_batch_rows=16,
+    ) == (1_244, 2_598)
 
 
 def test_symbol_indices_preserve_full_universe_symbol_positions() -> None:
@@ -948,11 +981,13 @@ def test_dynamic_symbol_upper_bound_uses_train_groups_not_future_panel_symbols()
         ),
     )
 
+    assert _train_symbol_compaction_bounds(panel, grouped_folds, config) == (2, 5)
     assert _train_symbol_compaction_upper_bound(panel, grouped_folds, config) == 5
 
     # Universe changes are re-derived from the current run's data, not retained
     # from the previous shape or hard-coded to a historical market size.
     tradable[7, 5] = True
+    assert _train_symbol_compaction_bounds(panel, grouped_folds, config) == (2, 6)
     assert _train_symbol_compaction_upper_bound(panel, grouped_folds, config) == 6
 
 

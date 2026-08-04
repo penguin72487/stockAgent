@@ -1,0 +1,129 @@
+# OFAT ablation matrix for the open-aware TW day-trade long/short model.
+base_config: configs/markets/tw_public_lanten_market_candles.yaml
+output_root: artifacts/ablations/financial_transformer_tw_day_trade_long_short_candles_baseline
+expected_fold_count: 12
+
+runtime:
+  cpu_threads: 112
+  torch_compile_threads: 16
+
+matrix:
+  mode: one_factor_at_a_time
+  include_baseline: true
+  fixed_overrides:
+    trading:
+      execution_mode: tw_day_trade
+      # Buy/open-long -> sell-at-close and sell-first -> cover-at-close are
+      # both active, subject to the point-in-time day-trade eligibility masks.
+      long_only: false
+    training:
+      # Keep the candles baseline objective fixed across every OFAT variant.
+      loss_type: log_utility
+
+  base_overrides:
+    runner:
+      # train.py already reloads the best checkpoint and writes complete fold
+      # metrics/artifacts; a second post-train inference pass is redundant.
+      post_train_infer: false
+
+  dimensions:
+    - name: lookback_batch
+      enabled: true
+      paths: [training.lookback, training.batch_size_train]
+      baseline: [32, 128]
+      values:
+        - name: lookback64_batch64
+          experiment_name: lookback64_batch64
+          value: [64, 64]
+          overrides:
+            training:
+              batch_size_eval: 64
+              eval_model_chunk_rows: 16
+              eval_auto_chunk_rows_cap: 16
+
+    - name: information_bottleneck
+      enabled: true
+      baseline: [true, true]
+      variants:
+        - name: latent_only
+          experiment_name: latent_only
+          overrides:
+            training:
+              financial_transformer:
+                use_latent_factors: true
+                use_market_tokens: false
+        - name: market_only
+          experiment_name: market_only
+          overrides:
+            training:
+              financial_transformer:
+                use_latent_factors: false
+                use_market_tokens: true
+        - name: temporal_only
+          experiment_name: temporal_only
+          overrides:
+            training:
+              financial_transformer:
+                use_latent_factors: false
+                use_market_tokens: false
+
+    - name: temporal_rope
+      enabled: true
+      path: training.financial_transformer.rope_temporal
+      baseline: true
+      values:
+        - {name: disabled, experiment_name: no_rope_temporal, value: false}
+
+    - name: learned_time_position
+      enabled: true
+      path: training.financial_transformer.use_time_pos
+      baseline: true
+      values:
+        - {name: disabled, experiment_name: no_time_position, value: false}
+
+    - name: learned_symbol_position
+      enabled: true
+      path: training.financial_transformer.use_symbol_pos
+      baseline: false
+      values:
+        - {name: enabled, experiment_name: with_symbol_position, value: true}
+
+    - name: qk_normalization
+      enabled: true
+      path: training.financial_transformer.qk_norm
+      baseline: true
+      values:
+        - {name: disabled, experiment_name: no_qk_norm, value: false}
+
+    - name: temporal_pooling
+      enabled: true
+      baseline: last
+      variants:
+        - name: mean
+          experiment_name: mean_pooling
+          overrides:
+            training:
+              financial_transformer:
+                temporal_pooling: mean
+                temporal_query_mode: full_then_last
+        - name: attention
+          experiment_name: attention_pooling
+          overrides:
+            training:
+              financial_transformer:
+                temporal_pooling: attention
+                temporal_query_mode: full_then_last
+
+    - name: normalization
+      enabled: true
+      path: training.financial_transformer.norm_type
+      baseline: rmsnorm
+      values:
+        - {name: layernorm, experiment_name: layernorm, value: layernorm}
+
+    - name: feed_forward
+      enabled: true
+      path: training.financial_transformer.ffn_type
+      baseline: swiglu
+      values:
+        - {name: gelu, experiment_name: gelu_ffn, value: gelu}
