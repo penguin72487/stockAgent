@@ -37,6 +37,14 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Inclusive completed-session cutoff (YYYY-MM-DD).",
     )
+    parser.add_argument(
+        "--allow-daily-publication-lag",
+        action="store_true",
+        help=(
+            "Permit only a missing latest-session day-trade eligibility receipt. "
+            "No eligibility row is fabricated, so day-trade execution fails closed."
+        ),
+    )
     parser.add_argument("--summary-path", default=None, help="Optional JSON summary path.")
     return parser.parse_args()
 
@@ -50,6 +58,7 @@ def main() -> None:
         market_symbol=str(args.market_symbol),
         summary_path=Path(args.summary_path) if args.summary_path else None,
         end_date=date.fromisoformat(args.end_date) if args.end_date else None,
+        allow_daily_publication_lag=bool(args.allow_daily_publication_lag),
     )
     print(
         "[tw-public-features] "

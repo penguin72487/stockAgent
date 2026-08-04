@@ -83,6 +83,8 @@ ERROR_LOG_PATH = ROOT / "artifacts" / "discord_bot" / "errors.log"
 AUDIT_LOG_PATH = ROOT / "artifacts" / "discord_bot" / "audit_events.jsonl"
 PYTHON_EXECUTABLE_SENTINEL = "{python}"
 _MODEL_INFERENCE_LOCK = threading.Lock()
+_PRE_SIGNAL_SUCCESS_LOCK = threading.Lock()
+_PRE_SIGNAL_SUCCESS_AT: dict[tuple[str, ...], float] = {}
 
 
 class BotUserError(RuntimeError):
@@ -432,8 +434,8 @@ def _market_artifact_backfill_time(cfg: LiveMarketConfig) -> str | None:
     value = (
         entry.get("artifact_backfill_time")
         or entry.get("backfill_time")
-        or cfg.close_time
         or cfg.data_ready_time
+        or cfg.close_time
         or cfg.summary_time
         or cfg.schedule_time
     )
@@ -781,9 +783,27 @@ def _artifact_backfill_key(cfg: LiveMarketConfig, now: datetime) -> str | None:
     if _market_schedule_interval_minutes(cfg) is not None:
         return None
     backfill_time = _market_artifact_backfill_time(cfg)
-    if not backfill_time or now.strftime("%H:%M") != backfill_time:
+    if not backfill_time:
         return None
-    return f"{now.strftime('%Y-%m-%d')}:{cfg.market}:artifact_backfill"
+    target_date = now.date().isoformat()
+    try:
+        status = _runtime_status_for_display(cfg)
+        target_date = (
+            _date_key(status.data.expected_latest_date)
+            or _date_key(status.data.last_data_date)
+            or target_date
+        )
+    except Exception:
+        # A status error must not disable the scheduler. Keep the wall-date
+        # fallback so the task can surface and retry the underlying failure.
+        pass
+    ready_minutes = _hhmm_minutes(backfill_time)
+    now_minutes = now.hour * 60 + now.minute
+    if ready_minutes is None:
+        return None
+    if target_date >= now.date().isoformat() and now_minutes < ready_minutes:
+        return None
+    return f"{target_date}:{cfg.market}:artifact_backfill"
 
 
 def _scheduled_retry_delay_seconds() -> int:
@@ -807,6 +827,35 @@ def _resolve_pre_signal_command(command: tuple[str, ...] | list[str]) -> list[st
     if resolved and resolved[0] == PYTHON_EXECUTABLE_SENTINEL:
         resolved[0] = sys.executable
     return resolved
+
+
+def _pre_signal_success_ttl_seconds() -> float:
+    return max(0.0, _env_float("STOCKAGENT_PRE_SIGNAL_SUCCESS_TTL_SECONDS", 30.0))
+
+
+def _recent_pre_signal_success(command: list[str]) -> bool:
+    ttl = _pre_signal_success_ttl_seconds()
+    if ttl <= 0:
+        return False
+    key = tuple(command)
+    now = time.monotonic()
+    with _PRE_SIGNAL_SUCCESS_LOCK:
+        completed_at = _PRE_SIGNAL_SUCCESS_AT.get(key)
+        if completed_at is None or now - completed_at > ttl:
+            _PRE_SIGNAL_SUCCESS_AT.pop(key, None)
+            return False
+        return True
+
+
+def _remember_pre_signal_success(command: list[str]) -> None:
+    key = tuple(command)
+    now = time.monotonic()
+    with _PRE_SIGNAL_SUCCESS_LOCK:
+        _PRE_SIGNAL_SUCCESS_AT[key] = now
+        stale_before = now - max(60.0, _pre_signal_success_ttl_seconds() * 4.0)
+        for cached_key, completed_at in list(_PRE_SIGNAL_SUCCESS_AT.items()):
+            if completed_at < stale_before:
+                _PRE_SIGNAL_SUCCESS_AT.pop(cached_key, None)
 
 
 def _tw_data_layer_lock_path(command: list[str]) -> Path | None:
@@ -860,7 +909,18 @@ def _run_pre_signal_command(cfg: LiveMarketConfig) -> None:
     command = _resolve_pre_signal_command(cfg.pre_signal_command)
     started = datetime.now().astimezone().isoformat(timespec="seconds")
     timeout_seconds = max(1, int(cfg.pre_signal_timeout_seconds))
+    if _recent_pre_signal_success(command):
+        print(
+            f"[pre-signal:{cfg.market}] reuse recent shared data update "
+            f"ttl={_pre_signal_success_ttl_seconds():.0f}s",
+            flush=True,
+        )
+        return
     if _wait_for_existing_tw_data_update(command, timeout_seconds=timeout_seconds):
+        log_path = ROOT / "artifacts" / "discord_bot" / "pre_signal_commands.log"
+        _validate_pre_signal_download_artifacts(cfg, command, log_path)
+        _remember_pre_signal_success(command)
+        clear_live_panel_memory_cache()
         return
     env = os.environ.copy()
     env.setdefault("PYTHONUNBUFFERED", "1")
@@ -930,6 +990,7 @@ def _run_pre_signal_command(cfg: LiveMarketConfig) -> None:
             f"{detail} log=`{_display_path(log_path)}`"
         )
     _validate_pre_signal_download_artifacts(cfg, command, log_path)
+    _remember_pre_signal_success(command)
     clear_live_panel_memory_cache()
 
 
@@ -1585,7 +1646,12 @@ def _refresh_summary_recent_performance_from_history(
 
 
 def _returns_artifact_path(fold_dir: Path) -> Path | None:
-    for name in ("daily_portfolio_returns.parquet", "daily_portfolio_returns.csv"):
+    for name in (
+        "integer_share_daily_portfolio_returns.parquet",
+        "integer_share_daily_portfolio_returns.csv",
+        "daily_portfolio_returns.parquet",
+        "daily_portfolio_returns.csv",
+    ):
         path = fold_dir / name
         if path.exists():
             return path
@@ -1632,9 +1698,12 @@ def _recent_performance_from_returns(
         else:
             frame = pl.read_csv(path, columns=columns, infer_schema_length=10000).tail(limit * 2)
         for row in frame.select(columns).to_dicts():
+            date_key = _date_key(row.get("date"))
+            if not date_key:
+                continue
             rows.append(
                 {
-                    "date": str(row.get("date")),
+                    "date": date_key,
                     "portfolio_return": _float_or_none(row.get("portfolio_return")),
                     "benchmark_return": _float_or_none(row.get("benchmark_return")),
                     "source": "returns_artifact",
@@ -1645,43 +1714,44 @@ def _recent_performance_from_returns(
     for summary_path, summary in _recent_market_signal_metrics(cfg, max_summaries=max(limit * 4, 64)):
         if bool(summary.get("execution_preview_only")):
             continue
-        date_key = str(
+        date_key = _date_key(
             summary.get("panel_data_date")
             or summary.get("weights_date")
             or summary.get("panel_date")
             or summary.get("asof_date")
-            or ""
-        ).strip()
+        )
         if not date_key:
             continue
         current = live_by_date.get(date_key)
         if current is None or summary_path.stat().st_mtime >= current[0].stat().st_mtime:
             live_by_date[date_key] = (summary_path, summary)
-    for summary_path, summary in live_by_date.values():
-        source_paths.append(summary_path)
-        rows.append(
-            {
-                "date": str(
-                    summary.get("panel_data_date")
-                    or summary.get("weights_date")
-                    or summary.get("panel_date")
-                    or summary.get("asof_date")
-                ),
-                "portfolio_return": _float_or_none(summary.get("portfolio_simple_return")),
-                "benchmark_return": _float_or_none(summary.get("benchmark_simple_return")),
-                "source": "live_signal_summary",
-            }
-        )
 
-    latest_by_date: dict[str, dict[str, Any]] = {}
-    for row in rows:
-        key = str(row.get("date") or "").strip()
-        if not key:
+    settled_by_date = {str(row["date"]): row for row in rows}
+    cursor = max(settled_by_date, default=None)
+    for date_key, (summary_path, summary) in sorted(live_by_date.items()):
+        if date_key in settled_by_date:
             continue
-        current = latest_by_date.get(key)
-        if current is None or str(row.get("source")) == "live_signal_summary":
-            latest_by_date[key] = row
-    selected = sorted(latest_by_date.values(), key=lambda row: _history_sort_dt(row.get("date")))[-limit:]
+        previous_key = _date_key(
+            summary.get("previous_weights_data_date")
+            or summary.get("previous_weights_date")
+            or summary.get("drift_base_data_date")
+            or summary.get("drift_base_date")
+        )
+        if cursor is not None and previous_key != cursor:
+            continue
+        source_paths.append(summary_path)
+        settled_by_date[date_key] = {
+            "date": date_key,
+            "portfolio_return": _float_or_none(summary.get("portfolio_simple_return")),
+            "benchmark_return": _float_or_none(summary.get("benchmark_simple_return")),
+            "source": "live_signal_summary",
+        }
+        cursor = date_key
+
+    selected = sorted(
+        settled_by_date.values(),
+        key=lambda row: _history_sort_dt(row.get("date")),
+    )[-limit:]
     if not selected:
         return None
     strategy = _compound_return_values([_float_or_none(row.get("portfolio_return")) for row in selected])
@@ -2525,6 +2595,10 @@ def _read_summary_metric_fields(path: Path) -> dict[str, Any]:
         "weights_date",
         "panel_date",
         "asof_date",
+        "previous_weights_data_date",
+        "previous_weights_date",
+        "drift_base_data_date",
+        "drift_base_date",
         "portfolio_simple_return",
         "benchmark_simple_return",
         "execution_preview_only",
@@ -2626,6 +2700,74 @@ def _formal_history_latest_date(cfg: LiveMarketConfig) -> str | None:
     return parsed.date().isoformat() if parsed is not None else None
 
 
+def _previous_source_session_date(
+    cfg: LiveMarketConfig,
+    target_date: str | None,
+) -> str | None:
+    target_key = _date_key(target_date)
+    if not target_key:
+        return None
+    try:
+        train_config = load_config(_resolve_repo_path(cfg.config_path) or cfg.config_path)
+        parquet_root = _resolve_repo_path(train_config.data.parquet_root)
+        benchmark = str(train_config.data.benchmark_name or "").strip()
+        if parquet_root is None or not benchmark:
+            return None
+        path = parquet_root / f"{benchmark}_features.parquet"
+        if not path.is_file():
+            return None
+
+        import polars as pl
+
+        dates = (
+            pl.scan_parquet(path)
+            .select(pl.col("date").cast(pl.Date, strict=False).alias("date"))
+            .filter(pl.col("date") < pl.lit(target_key).str.to_date())
+            .select(pl.col("date").max())
+            .collect()
+            .item()
+        )
+    except Exception:
+        return None
+    parsed = _history_datetime(dates)
+    return parsed.date().isoformat() if parsed is not None else None
+
+
+def _artifact_backfill_is_current(
+    cfg: LiveMarketConfig,
+    status: MarketRuntimeStatus,
+    execution_mode: str,
+) -> bool:
+    if not bool(getattr(status.data, "fresh", False)):
+        return False
+    target_date = (
+        status.data.expected_latest_date
+        or status.data.last_data_date
+        or status.data.panel_date
+    )
+    target_key = _date_key(target_date)
+    if not target_key:
+        return False
+    if execution_mode == "naive":
+        required_formal = _previous_source_session_date(cfg, target_key)
+        if not required_formal:
+            return False
+        formal_latest = _formal_history_latest_date(cfg)
+        formal_ready = bool(
+            required_formal
+            and formal_latest
+            and formal_latest >= required_formal
+        )
+        return formal_ready and _market_has_panel_close_signal_for_date(
+            cfg,
+            target_key,
+        )
+    if execution_mode == "tw_day_trade":
+        formal_latest = _formal_history_latest_date(cfg)
+        return bool(formal_latest and formal_latest >= target_key)
+    return _market_has_live_signal_for_date(cfg, target_key)
+
+
 def _run_formal_history_backfill(cfg: LiveMarketConfig, status: MarketRuntimeStatus) -> bool:
     target_date = (
         getattr(status.data, "expected_latest_date", None)
@@ -2636,8 +2778,18 @@ def _run_formal_history_backfill(cfg: LiveMarketConfig, status: MarketRuntimeSta
     latest_key = _formal_history_latest_date(cfg)
     if target_key and latest_key and latest_key >= target_key:
         return False
-    if cfg.fold_id is None:
-        raise BotUserError(f"`{cfg.market}` formal history backfill requires an explicit fold_id")
+    fold_id = cfg.fold_id
+    if fold_id is None:
+        checkpoint = _market_model_checkpoint(cfg)
+        if checkpoint is not None:
+            match = re.fullmatch(r"fold_(\d+)", checkpoint.parent.name)
+            if match:
+                fold_id = int(match.group(1))
+    if fold_id is None:
+        raise BotUserError(
+            f"`{cfg.market}` formal history backfill cannot resolve fold_id "
+            "from config or checkpoint path"
+        )
 
     config_path = _resolve_repo_path(cfg.config_path) or Path(cfg.config_path)
     output_dir = _resolve_repo_path(cfg.output_dir) if cfg.output_dir else None
@@ -2649,7 +2801,7 @@ def _run_formal_history_backfill(cfg: LiveMarketConfig, status: MarketRuntimeSta
         "--mode",
         "infer",
         "--start-fold",
-        str(int(cfg.fold_id)),
+        str(int(fold_id)),
         "--max-folds",
         "1",
         "--multi-gpu-strategy",
@@ -2710,32 +2862,36 @@ def _run_artifact_backfill_sync(cfg: LiveMarketConfig) -> LiveSignalResult | Non
     cfg = _effective_market_config(cfg)
     status = _ensure_signal_ready(cfg)
     execution_mode = _market_execution_mode(cfg)
+    if _artifact_backfill_is_current(cfg, status, execution_mode):
+        _sync_latest_live_weights_to_market_artifact(cfg)
+        return None
     if execution_mode in {"naive", "tw_day_trade"}:
-        try:
-            _run_pre_signal_command(cfg)
-        except BotUserError:
-            # Some auxiliary official datasets may be temporarily unavailable
-            # even after the canonical stock OHLCV has already advanced.
+        if not status.data.fresh:
+            try:
+                _run_pre_signal_command(cfg)
+            except BotUserError:
+                # Some auxiliary official datasets may be temporarily unavailable
+                # even after the canonical stock OHLCV has already advanced.
+                _clear_runtime_status_cache()
+                refreshed_status = _runtime_status(cfg)
+                if not refreshed_status.data.fresh:
+                    raise
             _clear_runtime_status_cache()
-            refreshed_status = _runtime_status(cfg)
-            if not refreshed_status.data.fresh:
-                raise
-        _clear_runtime_status_cache()
-        status = _runtime_status(cfg)
+            status = _runtime_status(cfg)
         _require_fresh_data_for_artifact_generation(cfg, status)
         target_date = (
             status.data.expected_latest_date
             or status.data.last_data_date
             or status.data.panel_date
         )
-        if (
-            execution_mode == "naive"
-            and _market_has_panel_close_signal_for_date(cfg, target_date)
-        ):
+        if _artifact_backfill_is_current(cfg, status, execution_mode):
             _sync_latest_live_weights_to_market_artifact(cfg)
             return None
         _run_formal_history_backfill(cfg, status)
         if execution_mode == "naive":
+            if _artifact_backfill_is_current(cfg, status, execution_mode):
+                _sync_latest_live_weights_to_market_artifact(cfg)
+                return None
             progress_label = f"backfill:{cfg.market}:panel-close"
             progress_callback = (
                 _ConsoleProgress(prefix=progress_label)
@@ -2772,8 +2928,10 @@ def _run_artifact_backfill_sync(cfg: LiveMarketConfig) -> LiveSignalResult | Non
         _sync_latest_live_weights_to_market_artifact(cfg)
         return result
 
-    _run_pre_signal_command(cfg)
-    status = _runtime_status(cfg)
+    if not status.data.fresh:
+        _run_pre_signal_command(cfg)
+        _clear_runtime_status_cache()
+        status = _runtime_status(cfg)
     _require_fresh_data_for_artifact_generation(cfg, status)
     target_date = status.data.expected_latest_date or status.data.last_data_date or status.data.panel_date
     if _market_has_live_signal_for_date(cfg, target_date):
@@ -3599,11 +3757,28 @@ def _prepend_latest_signal_row_to_portfolio_history(
     if weights_path is not None and weights_path.exists():
         weight_rows = _read_parquet_rows(weights_path)
 
+    min_abs_change = _float_or_none(getattr(result, "min_abs_change", None))
+    if min_abs_change is None:
+        min_abs_change = MIN_DISPLAY_ABS_WEIGHT
+    min_abs_change = max(0.0, min_abs_change)
+    complete_weight_rows = any(
+        {"action", "current_weight", "target_weight"}.issubset(raw)
+        and ("delta_weight" in raw or "abs_delta_weight" in raw)
+        for raw in weight_rows
+    )
+    change_source_rows = weight_rows if complete_weight_rows else rebalance_rows
     change_counts: dict[str, int] = {}
     changes_all: list[dict[str, Any]] = []
-    for raw in rebalance_rows:
+    for raw in change_source_rows:
         action = str(raw.get("action") or "HOLD").upper()
         if action == "HOLD":
+            continue
+        delta_weight = _float_or_none(raw.get("delta_weight"))
+        if delta_weight is None:
+            current_weight = _float_or_none(raw.get("current_weight")) or 0.0
+            target_weight = _float_or_none(raw.get("target_weight")) or 0.0
+            delta_weight = target_weight - current_weight
+        if abs(delta_weight) + 1e-12 < min_abs_change:
             continue
         change_counts[action] = change_counts.get(action, 0) + 1
         changes_all.append(_live_signal_change_row(raw, capital=capital))
@@ -3648,6 +3823,7 @@ def _prepend_latest_signal_row_to_portfolio_history(
         "change_counts": change_counts,
         "change_count": sum(change_counts.values()),
         "source": "latest_live_signal",
+        "execution_mode": str(getattr(result, "execution_mode", "naive")),
     }
 
     rows = [row, *result.rows]
@@ -3871,7 +4047,9 @@ def _portfolio_history_header_lines(
         "說明: stock_ret=個股方向報酬；pnl_contrib=對整體組合報酬貢獻。",
     ]
     if str(getattr(result, "execution_mode", "naive")) == "tw_day_trade":
-        header.append("當沖契約: 部位與調整為開盤快照；ret 為同日收盤平倉後結果，不保留隔夜部位。")
+        header.append(
+            "當沖契約: 每日從空倉開始；部位/調整為開盤實際成交，nav/ret/pnl 為同日收盤平倉後結果。"
+        )
     if debug:
         source_text = _shorten(", ".join(_display_path(path) for path in result.source_paths), 700)
         header.extend(
@@ -4071,6 +4249,7 @@ def _portfolio_change_block(row: dict[str, Any], index: int) -> str:
 def _portfolio_history_block(row: dict[str, Any]) -> str:
     changes = row.get("changes")
     change_rows = changes if isinstance(changes, list) else []
+    day_trade = str(row.get("execution_mode") or "").strip().lower() == "tw_day_trade"
     lines = [
         f"`{row.get('display_date', row.get('date', 'n/a'))}`",
         _kv_line(
@@ -4084,9 +4263,9 @@ def _portfolio_history_block(row: dict[str, Any]) -> str:
             ("nav", _money(row.get("nav"))),
         ),
         _kv_line(
-            ("gross", _pct(row.get("gross_ratio"))),
-            ("net", _signed_pct(row.get("net_ratio"))),
-            ("cash", _pct(row.get("cash_ratio"))),
+            ("open_gross" if day_trade else "gross", _pct(row.get("gross_ratio"))),
+            ("open_net" if day_trade else "net", _signed_pct(row.get("net_ratio"))),
+            ("open_cash" if day_trade else "cash", _pct(row.get("cash_ratio"))),
         ),
         _kv_line(
             ("pos", row.get("position_count", "n/a")),
@@ -4096,6 +4275,23 @@ def _portfolio_history_block(row: dict[str, Any]) -> str:
         ),
         f"  change_mix: `{_portfolio_change_counts(row)}`",
     ]
+    requested_gross = _float_or_none(row.get("requested_gross_ratio"))
+    if requested_gross is not None:
+        executed_gross = _float_or_none(row.get("gross_ratio")) or 0.0
+        lines.insert(
+            4,
+            _kv_line(
+                ("model_gross", _pct(requested_gross)),
+                ("open_executed", _pct(executed_gross)),
+                ("fill", _pct(row.get("execution_fill_ratio"))),
+                ("model_pos", row.get("requested_position_count", "n/a")),
+            ),
+        )
+        if day_trade and requested_gross > 1e-12 and executed_gross <= 1e-12:
+            lines.insert(
+                5,
+                "  未成交: 開盤目標受到前一交易日成交量、整張股數、交易遮罩與可用資金限制。",
+            )
     if change_rows:
         lines.append("  top changes:")
         for index, item in enumerate(change_rows[:8], start=1):
@@ -5298,7 +5494,7 @@ async def portfolio_history_command(
     days: int = 32,
     top_changes: int = 5,
     page_size: int = 1,
-    min_abs_change: float = 0.0,
+    min_abs_change: float = MIN_DISPLAY_ABS_WEIGHT,
     initial_capital: float = 0.0,
     current_capital: float = 0.0,
     debug: bool = False,
@@ -5596,6 +5792,8 @@ async def artifact_backfill() -> None:
         now = datetime.now(ZoneInfo(cfg.timezone or bot.tz.key))
         key = _artifact_backfill_key(cfg, now)
         if key is None:
+            continue
+        if not _market_has_model(cfg):
             continue
         if key in bot._last_artifact_backfill_keys:
             continue
