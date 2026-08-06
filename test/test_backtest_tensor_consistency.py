@@ -58,6 +58,7 @@ from stockagent.training.trainer import (
     _should_check_finite,
     _train_epoch_windowed_tensor,
     _train_epoch_windowed_tensor_ddp,
+    _timing_curve_payload,
     _write_loss_contract_metadata,
     run_inference,
     run_training,
@@ -1287,6 +1288,7 @@ def test_compiled_loss_dynamic_symbols_reuses_one_graph_across_symbol_counts() -
         loss_fn,
         label="dynamic-symbol-graph-test",
         dynamic_symbol_axis=True,
+        dynamic_symbol_min=7,
         dynamic_symbol_max=2304,
     )
 
@@ -1304,6 +1306,21 @@ def test_compiled_loss_dynamic_symbols_reuses_one_graph_across_symbol_counts() -
         )
 
     assert compile_calls == 1
+
+
+def test_compiled_loss_dynamic_symbols_rejects_width_outside_train_domain() -> None:
+    wrapped = _CompiledLossFallback(
+        lambda weights, *_args, **_kwargs: weights.sum(),
+        lambda weights, *_args, **_kwargs: weights.sum(),
+        label="dynamic-symbol-domain-test",
+        dynamic_symbol_axis=True,
+        dynamic_symbol_min=7,
+        dynamic_symbol_max=19,
+    )
+    weights = torch.ones((8, 6))
+
+    with pytest.raises(ValueError, match="outside its causal train domain"):
+        wrapped(weights, torch.ones_like(weights), torch.ones_like(weights, dtype=torch.bool))
 
 
 def test_eval_chunk_estimate_uses_full_eval_rows_not_probe_rows() -> None:
@@ -4073,6 +4090,19 @@ def test_windowed_eval_timing_breaks_out_batch_prepare_and_h2d() -> None:
     assert timing.window_materialize_s > 0.0
     assert timing.h2d_transfer_s >= 0.0
     assert timing.transfer_s + 1e-9 >= timing.batch_prepare_s + timing.h2d_transfer_s
+
+
+def test_epoch_timing_subtracts_parallel_validation_test_overlap() -> None:
+    payload = _timing_curve_payload(
+        train_timing=TimingBreakdown(total_s=1.0, batches=1),
+        val_eval_s=2.0,
+        val_loss_s=0.1,
+        test_curve_s=3.0,
+        parallel_eval_overlap_s=2.1,
+    )
+
+    assert payload["epoch_parallel_eval_overlap_s"] == pytest.approx(2.1)
+    assert payload["epoch_total_s"] == pytest.approx(4.0)
 
 
 def test_evaluate_windowed_tensor_batch_decoupled_matches_old_chunking() -> None:
