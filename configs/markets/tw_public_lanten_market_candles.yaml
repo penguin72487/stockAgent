@@ -619,7 +619,7 @@ training:
     # - signed_sparsemax: hardest sparse long/short/cash simplex; largest local gradients, more support-jump risk.
     # - projection_l1: raw holdings projected to L1 ball; legal cash, sparse only when raw gross exceeds 1.
     # For signed_* and projection_l1, keep portfolio_activation/loss_portfolio_activation=pre_normalized.
-    portfolio_output_mode: l1
+    portfolio_output_mode: projection_l1
     max_full_tokens: 16384
     checkpoint_blocks: false
     return_aux: false
