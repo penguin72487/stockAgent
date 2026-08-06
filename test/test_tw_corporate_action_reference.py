@@ -4,6 +4,7 @@ from datetime import date
 from io import BytesIO
 from zipfile import ZIP_DEFLATED, ZipFile
 
+import polars as pl
 import pytest
 
 from downloader.download_tw_corporate_action_reference import (
@@ -12,6 +13,7 @@ from downloader.download_tw_corporate_action_reference import (
     _parse_tpex_monthly_ods,
     _payload_rows,
     _resolve_tpex_monthly_rows,
+    _tpex_event_candidates,
     _write_immutable_raw,
 )
 
@@ -148,6 +150,37 @@ def test_parse_tpex_monthly_dividend_uses_pre_and_post_reference_columns() -> No
     assert rows[0]["reference_price"] == 13.03
 
 
+@pytest.mark.parametrize(
+    ("year", "month", "title"),
+    [
+        (2011, 1, "100年1月除權交易股票一覽表"),
+        (2012, 4, "101年04月除權交易股票一覽表"),
+    ],
+)
+def test_parse_tpex_monthly_accepts_exact_roc_year_title(
+    year: int,
+    month: int,
+    title: str,
+) -> None:
+    rows = _parse_tpex_monthly_ods(
+        _ods_bytes(
+            [
+                [title],
+                ["股票名稱", "日期", "除權前參考價", "除權後參考價"],
+                ["測試公司", "4", "24.90", "24.42"],
+            ]
+        ),
+        year=year,
+        month=month,
+        report_type=6,
+        document_id="1013",
+        source_url="https://official.test/doc=1013",
+    )
+
+    assert rows[0]["date"] == date(year, month, 4)
+    assert rows[0]["reference_price"] == 24.42
+
+
 def test_parse_tpex_monthly_rejects_wrong_linked_workbook() -> None:
     content = _ods_bytes(
         [
@@ -230,6 +263,46 @@ def test_resolve_tpex_monthly_accepts_consistent_type6_type7_and_accounts_direct
     assert stats["previous_daily_next_reference_keys"] == 1
     assert stats["duplicate_consistent_monthly_keys"] == 1
     assert stats["unresolved_keys"] == 0
+    assert stats["unresolved_months"] == []
+
+
+def test_resolve_tpex_monthly_reports_every_unresolved_month() -> None:
+    rows, stats = _resolve_tpex_monthly_rows(
+        [
+            _candidate(date(2012, 4, 26), "3303", 14.3),
+            _candidate(date(2011, 1, 4), "8111", 24.9),
+        ],
+        [],
+        [],
+    )
+
+    assert rows == []
+    assert stats["unresolved_keys"] == 2
+    assert stats["unresolved_months"] == ["2011-01", "2012-04"]
+
+
+def test_tpex_event_candidates_can_skip_unmatchable_prior_close() -> None:
+    frame = pl.DataFrame(
+        {
+            "date": ["2011-01-04", "2012-04-25", "2012-04-26"],
+            "代號": ["8111", "3303", "3303"],
+            "名稱": ["立碁", "岱稜", "岱稜"],
+            "收盤": ["25.00", "14.30", "13.75"],
+            "漲跌": ["除權", "+ 0.25", "除權"],
+            "次日參考價": [None, None, None],
+        }
+    )
+
+    candidates = _tpex_event_candidates(
+        frame,
+        start=date(2011, 1, 1),
+        end=date(2012, 12, 31),
+        require_complete_previous_close=False,
+    )
+
+    assert [(row["date"], row["symbol"]) for row in candidates] == [
+        (date(2012, 4, 26), "3303")
+    ]
 
 
 def test_resolve_tpex_monthly_rejects_type6_type7_reference_conflict() -> None:

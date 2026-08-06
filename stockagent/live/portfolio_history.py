@@ -138,6 +138,14 @@ def _read_day_trade_close_nav(root: Path):
     required = {"date", "settled_cash", "payables_total", "receivables_total"}
     if not required.issubset(frame.columns):
         return None, path
+    rebate_receivables = [
+        pl.col(name).cast(pl.Float64, strict=False).fill_null(0.0)
+        for name in (
+            "commission_rebate_current_receivable",
+            "commission_rebate_due_receivable",
+        )
+        if name in frame.columns
+    ]
     close_nav = (
         frame.select(
             [
@@ -146,6 +154,7 @@ def _read_day_trade_close_nav(root: Path):
                     pl.col("settled_cash").cast(pl.Float64, strict=False).fill_null(0.0)
                     + pl.col("receivables_total").cast(pl.Float64, strict=False).fill_null(0.0)
                     - pl.col("payables_total").cast(pl.Float64, strict=False).fill_null(0.0)
+                    + sum(rebate_receivables, start=pl.lit(0.0))
                 ).alias("close_nav"),
             ]
         )
@@ -158,13 +167,28 @@ def _read_day_trade_close_nav(root: Path):
 def _with_day_trade_close_nav(daily, close_nav):
     import polars as pl
 
+    prepared = daily.rename({"nav": "open_nav"})
     if close_nav is None:
-        return daily.with_columns(pl.col("nav").alias("open_nav"))
-    return (
-        daily.rename({"nav": "open_nav"})
-        .join(close_nav, on="date", how="left")
-        .with_columns(pl.coalesce([pl.col("close_nav"), pl.col("open_nav")]).alias("nav"))
-        .drop("close_nav")
+        prepared = prepared.with_columns(
+            pl.lit(None, dtype=pl.Float64).alias("ledger_close_nav")
+        )
+    else:
+        prepared = prepared.join(
+            close_nav.rename({"close_nav": "ledger_close_nav"}),
+            on="date",
+            how="left",
+        )
+    return prepared.with_columns(
+        pl.when(
+            pl.col("open_nav").is_not_null()
+            & pl.col("portfolio_return").is_not_null()
+        )
+        .then(pl.col("open_nav") * (1.0 + pl.col("portfolio_return")))
+        .otherwise(pl.coalesce([pl.col("ledger_close_nav"), pl.col("open_nav")]))
+        .alias("close_nav"),
+        # A day-trade history row records the account and positions at the
+        # opening auction.  The same row's return/PnL then settles at close.
+        pl.col("open_nav").alias("nav"),
     )
 
 
@@ -201,15 +225,25 @@ def _read_requested_weight_summaries(root: Path) -> tuple[dict[str, dict[str, fl
 def _with_profit_estimates(daily):
     import polars as pl
 
-    return daily.with_columns(pl.col("nav").shift(1).alias("prev_nav")).with_columns(
-        [
+    prepared = daily.with_columns(pl.col("nav").shift(1).alias("prev_nav"))
+    if "open_nav" in daily.columns:
+        return prepared.with_columns(
             pl.when(pl.col("portfolio_return").is_null())
             .then(None)
-            .when(pl.col("prev_nav").is_not_null())
-            .then(pl.col("prev_nav") * pl.col("portfolio_return"))
-            .otherwise(pl.col("nav") * pl.col("portfolio_return") / (1.0 + pl.col("portfolio_return")))
+            .otherwise(pl.col("open_nav") * pl.col("portfolio_return"))
             .alias("profit_value")
-        ]
+        )
+    return prepared.with_columns(
+        pl.when(pl.col("portfolio_return").is_null())
+        .then(None)
+        .when(pl.col("prev_nav").is_not_null())
+        .then(pl.col("prev_nav") * pl.col("portfolio_return"))
+        .otherwise(
+            pl.col("nav")
+            * pl.col("portfolio_return")
+            / (1.0 + pl.col("portfolio_return"))
+        )
+        .alias("profit_value")
     )
 
 
@@ -290,15 +324,17 @@ def _change_row(
     prev_holding_ratio = float((previous or {}).get("holding_ratio") or 0.0)
     market_value = float((current or {}).get("market_value") or 0.0)
     prev_market_value = float((previous or {}).get("market_value") or 0.0)
+    day_trade = str(execution_mode).strip().lower() == "tw_day_trade"
     price = _float_or_none((current or {}).get("price"))
-    if resolve_missing_prices and price is None and price_lookup is not None:
+    if day_trade and price_lookup is not None:
+        price = price_lookup.get(symbol, date) or price
+    elif resolve_missing_prices and price is None and price_lookup is not None:
         price = price_lookup.get(symbol, date)
     if resolve_missing_prices and price is None:
         price = _float_or_none((previous or {}).get("price"))
     prev_price = _float_or_none((previous or {}).get("price"))
     if resolve_missing_prices and prev_price is None and price_lookup is not None:
         prev_price = price_lookup.get(symbol, previous_date)
-    day_trade = str(execution_mode).strip().lower() == "tw_day_trade"
     exit_price = price_lookup.get_close(symbol, date) if day_trade and price_lookup is not None else None
     if day_trade:
         price_return = exit_price / price - 1.0 if price is not None and exit_price is not None and price > 0.0 else None
@@ -349,10 +385,13 @@ def _enrich_change_row_prices(
     if price_lookup is None:
         return row
     symbol = str(row.get("symbol") or "")
+    day_trade = str(execution_mode).strip().lower() == "tw_day_trade"
     price = _float_or_none(row.get("price"))
     prev_price = _float_or_none(row.get("prev_price"))
     action_text = str(row.get("action") or "").upper()
-    if action_text.startswith("EXIT"):
+    if day_trade:
+        price = price_lookup.get(symbol, date) or price
+    elif action_text.startswith("EXIT"):
         price = price_lookup.get(symbol, date) or price
     if price is None:
         price = price_lookup.get(symbol, date)
@@ -360,7 +399,6 @@ def _enrich_change_row_prices(
         prev_price = price_lookup.get(symbol, previous_date)
     if price is None:
         price = prev_price
-    day_trade = str(execution_mode).strip().lower() == "tw_day_trade"
     exit_price = price_lookup.get_close(symbol, date) if day_trade else None
     if day_trade:
         price_return = exit_price / price - 1.0 if price is not None and exit_price is not None and price > 0.0 else None
@@ -541,6 +579,8 @@ def load_portfolio_history(
         "short_exposure",
         "profit_value",
         "open_nav",
+        "close_nav",
+        "ledger_close_nav",
     ]
     if capital.scale != 1.0:
         daily = daily.with_columns([(pl.col(name) * capital.scale).alias(name) for name in money_columns if name in daily.columns])
