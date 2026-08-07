@@ -100,6 +100,26 @@ def test_financial_transformer_last_pooling_panel_slab_forward() -> None:
     assert weights[2, 6].item() == 0.0
 
 
+def test_checkpointed_mean_pooling_compiles_fullgraph_without_capture_side_effect() -> None:
+    device = _device()
+    model = _make_model(
+        checkpoint_blocks=True,
+        temporal_pooling="mean",
+        temporal_query_mode="full_then_last",
+        return_aux=False,
+        return_aux_details=False,
+    ).train()
+    compiled = torch.compile(model, backend="eager", fullgraph=True)
+    x = torch.randn(2, 5, 7, 10, device=device, requires_grad=True)
+    mask = torch.ones(2, 7, dtype=torch.bool, device=device)
+
+    weights = compiled(x, mask)
+    weights.square().sum().backward()
+
+    assert x.grad is not None
+    assert torch.isfinite(x.grad).all()
+
+
 def test_candle_encoder_directly_replaces_feature_projection() -> None:
     device = _device()
     model = _make_model().eval()

@@ -1,0 +1,7 @@
+base_config: tw_public_lanten_market_candles.yaml
+
+# Reproducible data pin: immutable provenance lives under stockagent-snapshots;
+# panel_cache_v2 is written only to this separate mutable training copy.
+data:
+  parquet_root: /srv/stockagent-training-data/tw-public/tw-public-20260804T083108590889195Z-l0-lab203-7e95d25803d82230/stocks
+  tw_public_feature_path: /srv/stockagent-snapshots/tw-public/tw-public-20260804T083108590889195Z-l0-lab203-7e95d25803d82230/features/tw_public_stock_daily.parquet
