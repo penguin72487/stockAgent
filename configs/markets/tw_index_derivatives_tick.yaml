@@ -1,0 +1,92 @@
+# Completed-second TAIFEX TXO-chain features -> one signed TX exposure.
+#
+# The official transaction source has whole-second timestamps and no trade ID.
+# A row is therefore decided only after that second is complete and executes at
+# the first trade in a strictly later second. This base mode executes TX; the
+# two option configs inherit the same causal dataset and execute a fixed ATM
+# Call/Put pair through captured five-level Shioaji books. Missing/stale books
+# are non-executable; there is no fallback to the public matched-trade price.
+base_config: tw_public_lanten_market_candles.yaml
+
+experiment_name: tw-index-derivatives-completed-second-v1
+
+runner:
+  output_dir: artifacts/markets/tw_index_derivatives_tick
+  mode: train
+  resume: true
+  post_train_infer: false
+  start_fold: 0
+  isolate_train_folds: false
+
+data:
+  day_trade_open_feature: false
+  index_derivatives_tick_raw_root: data_tw_index_derivatives_ticks
+  index_derivatives_tick_dataset_root: data_tw_index_derivatives_ticks/strategy_dataset_bidask
+  index_derivatives_tick_execution_price_source: shioaji_bidask
+  index_derivatives_tick_bidask_capture_root: data_tw_index_derivatives_ticks/shioaji_fop_captures
+  # A completed public second is observable at t+1s. The executor then waits a
+  # further 250ms and accepts only the first valid book within the next second.
+  index_derivatives_tick_execution_latency_ms: 250.0
+  index_derivatives_tick_execution_max_wait_ms: 1000.0
+  index_derivatives_tick_max_transport_delay_ms: 2000.0
+  index_derivatives_tick_verify_partition_sha256: true
+  index_derivatives_tick_session: day
+  index_derivatives_tick_decision_interval_seconds: 5
+  index_derivatives_tick_rolling_window_seconds: 60
+  index_derivatives_tick_warmup_seconds: 300
+  index_derivatives_tick_atm_moneyness_fraction: 0.01
+
+  # The TAIFEX public page currently exposes 30 rolling trading days.
+  index_derivatives_tick_min_train_days: 20
+  index_derivatives_tick_val_days: 5
+  index_derivatives_tick_test_days: 5
+
+trading:
+  execution_mode: tw_index_derivatives_tick
+  frequency: tick
+  long_only: false
+  portfolio_activation: pre_normalized
+  min_trade_weight: 0.0
+  max_turnover_ratio: 0.0
+  max_volume_participation: 0.0
+
+  # The five-level depth walk already pays spread and price impact. Extra
+  # slippage stays zero unless a separate latency/hidden-liquidity stress is run.
+  buy_fee_rate: 0.000045
+  sell_fee_rate: 0.000045
+  tw_index_futures_max_abs_exposure: 1.0
+  tw_index_derivatives_tick_fee_rate_per_side: 0.000045
+  tw_index_derivatives_tick_slippage_points_per_side: 0.0
+  tw_index_derivatives_tick_initial_equity: 1000000.0
+  tw_index_derivatives_tick_contract_multiplier: 200.0
+  tw_index_options_tick_slippage_points_per_side: 0.0
+
+training:
+  model_name: cross_sectional_index_futures
+  multi_gpu_strategy: none
+  loss_type: log_utility
+  loss_portfolio_activation: pre_normalized
+  lookback: 32
+  batch_size_train: 256
+  batch_size_eval: 256
+  epochs: 30
+  enable_torch_compile: true
+  explain_after_each_fold: false
+  postprocess_benchmark_after_fold: false
+  postprocess_benchmark_after_best_val: false
+
+  transformer_base_portfolio:
+    attention_mode: temporal_only
+    use_latent_factors: false
+    use_market_tokens: false
+    temporal_pooling: last
+    temporal_query_mode: last_only
+    portfolio_output_mode: logits
+    return_aux: false
+    return_aux_details: false
+
+  multitask_loss:
+    return_rank_ic_weight: 0.0
+    direction_weight: 0.0
+    volatility_regime_weight: 0.0
+    concentration_weight: 0.0

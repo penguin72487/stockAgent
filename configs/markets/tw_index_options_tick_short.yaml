@@ -1,0 +1,16 @@
+# Same data/model/trainer as buyer-only mode; this policy additionally permits
+# naked short Call and short Put subject to the configured initial-margin cap.
+base_config: tw_index_options_tick_long.yaml
+
+experiment_name: tw-index-options-completed-second-short-v1
+
+runner:
+  output_dir: artifacts/markets/tw_index_options_tick_short
+
+trading:
+  execution_mode: tw_index_options_tick_short
+  long_only: false
+
+training:
+  transformer_base_portfolio:
+    portfolio_mode: long_short

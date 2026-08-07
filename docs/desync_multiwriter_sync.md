@@ -78,12 +78,16 @@ export STOCKAGENT_SYNC_ROOT=/srv/stockagent-sync
 export STOCKAGENT_MATERIALIZED_ROOT=/srv/stockagent-snapshots
 ./scripts/run_desync_snapshot.sh init \
   --sync-root "$STOCKAGENT_SYNC_ROOT" \
-  --node-id trainer-a
+  --node-id penguin
 ```
 
 Use a different stable `--node-id` on every machine. Do not use a cloud image
 with a pre-populated `.local-state/node-id`. Changing an initialized identity
 requires the explicit `init --replace-node-id` flag.
+
+The current machine names are `penguin`, `vastai1T`, and `lab203`. Use these
+names consistently for the snapshot node ID and the Syncthing device label;
+the Syncthing cryptographic Device ID remains unchanged when a label changes.
 
 Initialize the directory before adding it to Syncthing so `.stignore` exists
 before the first scan. The tracked reference is
@@ -148,7 +152,7 @@ For resume or reproduction, pass the pinned `snapshot_id` explicitly:
 
 ```bash
 ./scripts/run_desync_snapshot.sh fetch tw-public \
-  --snapshot-id tw-public-YYYYMMDDTHHMMSSnnnnnnnnnZ-l0-trainer-a-0123456789abcdef \
+  --snapshot-id tw-public-YYYYMMDDTHHMMSSnnnnnnnnnZ-l0-penguin-0123456789abcdef \
   --sync-root "$STOCKAGENT_SYNC_ROOT" \
   --materialized-root "$STOCKAGENT_MATERIALIZED_ROOT"
 ```

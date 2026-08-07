@@ -1,20 +1,21 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SERVICE_NAME="stockagent-shioaji-top200.service"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-TEMPLATE="$REPO_ROOT/deploy/systemd/$SERVICE_NAME.in"
-UNIT_PATH="/etc/systemd/system/$SERVICE_NAME"
+SERVICE_NAME="stockagent-shioaji-top200.service"
 START_NOW=true
 
 usage() {
-  echo "Usage: sudo bash scripts/install_shioaji_top200_service.sh [--no-start]" >&2
+  echo "Usage: sudo bash scripts/install_shioaji_top200_service.sh [--taifex-bidask] [--no-start]" >&2
 }
 
 for argument in "$@"; do
   case "$argument" in
     --no-start)
       START_NOW=false
+      ;;
+    --taifex-bidask)
+      SERVICE_NAME="stockagent-shioaji-taifex-bidask.service"
       ;;
     -h|--help)
       usage
@@ -26,6 +27,9 @@ for argument in "$@"; do
       ;;
   esac
 done
+
+TEMPLATE="$REPO_ROOT/deploy/systemd/$SERVICE_NAME.in"
+UNIT_PATH="/etc/systemd/system/$SERVICE_NAME"
 
 if (( EUID != 0 )); then
   echo "[shioaji-service] root privileges are required; run with sudo." >&2

@@ -3625,7 +3625,7 @@ def test_volume_limit_weights_fail_closed_for_invalid_notional() -> None:
 
 
 def test_compiled_panel_slab_eval_uses_separate_eager_wrapper() -> None:
-    source = inspect.getsource(trainer_module.run_training)
+    source = inspect.getsource(trainer_module._run_training_impl)
     assert "eval_panel_slab_model = _PanelSlabForwardWrapper(model)" in source
     assert "eager_panel_slab_separate_from_compiled_train" in source
     assert "eval_model,\n                    panel_slab_model," not in source
@@ -3705,7 +3705,7 @@ def test_rank0_final_artifact_failure_is_raised_on_waiting_worker(monkeypatch) -
 
 
 def test_final_group_checkpoint_collective_precedes_rank0_best_model_artifacts() -> None:
-    source = inspect.getsource(trainer_module.run_training)
+    source = inspect.getsource(trainer_module._run_training_impl)
     rank0_artifact_split = source.split(
         "if ddp_enabled and not _distributed_should_write():",
         maxsplit=1,
@@ -3724,7 +3724,7 @@ def test_final_group_checkpoint_collective_precedes_rank0_best_model_artifacts()
 
 
 def test_final_fold_validation_is_recomputed_after_each_best_checkpoint_load() -> None:
-    source = inspect.getsource(trainer_module.run_training)
+    source = inspect.getsource(trainer_module._run_training_impl)
     artifact_source = source.split(
         "if ddp_enabled and not _distributed_should_write():",
         maxsplit=1,

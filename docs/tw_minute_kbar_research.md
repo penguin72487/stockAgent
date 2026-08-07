@@ -7,15 +7,9 @@
 ## 研究範圍
 
 Universe 取自 `data_tw_public/stocks/symbols.csv`，只保留 `stock` 與
-`etf`。2026-07-27 的固定輸入快照為：
-
-| 類別 | 檔數 |
-|---|---:|
-| 股票 | 2,322 |
-| ETF | 416 |
-| 合計 | 2,738 |
-| TWSE | 1,513 |
-| TPEx | 1,225 |
+`etf`。2026-07-27 的最新封存目標共有 2,744 檔；其中永豐歷史 KBar
+可用來源 2,620 檔，Contract V2 明確不存在 124 檔。不存在的合約仍保留在
+全市場母體統計，但交易 mask 永遠為 false，不會補造價格。
 
 「全市場」代表每天所有可用股票與 ETF 都是橫斷面候選標的，不代表策略必須
 同時持有 2,738 檔。基線會從全市場依已完成 K 棒的分數選出前 `top_n` 檔，
@@ -95,10 +89,13 @@ data_tw_minute/shioaji_1m/
 已完成資料。最後建研究資料集時會再驗證每個輸入檔 SHA-256。
 
 Contract V2 登入後只載入 `region=TW, security_type=STK` 的 Base contract map，
-不跨類型掃描指數、期貨、選擇權與權證。Shioaji 的舊資料偶爾含有 OHLCV 與
-Amount 全為 0 的佔位 K 棒；分鐘下載器只移除「所有欄位同時為 0」的列，並在
-receipt 記錄 `zero_placeholder_rows_dropped`。部分為 0 或其他不一致仍會
-fail-closed。
+不跨類型掃描指數、期貨、選擇權與權證。下載器會依公開 point-in-time
+正成交量交易日排除生命週期外資料，並稽核移除全零占位列、任一負 Volume／
+Amount 的歷史修正列及盤外批次列；各類數量都寫入 receipt。其餘價格不一致、
+重複 timestamp 或無法解釋的資料仍 fail-closed，絕不任選重複列或補值。
+
+全市場下載使用 5 個獨立登入程序，但共用帳號級滑動視窗 limiter；需求起始率
+上限固定為永豐文件的 50 requests / 5 seconds，也就是 10 req/s。
 
 完整 2020-03-02 至 2026-07-27 快照共有 221,778 個 receipt 分塊。公開
 point-in-time panel 顯示其中 54,348 塊沒有任何正成交量交易日，會寫入有
@@ -138,6 +135,8 @@ source scripts/runtime_env.sh
 run_fintech_python scripts/build_shioaji_tw_minute_dataset.py
 run_fintech_python scripts/audit_shioaji_tw_minute_dataset.py \
   --trade-date YYYY-MM-DD
+run_fintech_python scripts/audit_shioaji_tw_minute_dataset.py \
+  --all-partitions
 ```
 
 輸出依交易日分區：
@@ -152,6 +151,30 @@ data_tw_minute/research_dataset/
 模型欄位只有已完成 K 棒能知道的報酬、缺口、振幅、收盤位置、相對量、實現
 波動與日內時間特徵。稽核會拒絕重複 key、盤外時間、日期錯置、跨缺口的一分鐘
 標籤、executor-only 欄位外漏，以及無效標籤仍帶未來價格的資料列。
+
+schema-2 manifest 只有在 2,744 檔全部被歸類成 available-source 或
+`contract_unavailable`，且 failed／partial 都為 0 時才會標成
+`research_ready`。已重試仍由永豐缺資料的日期保留為 source-gap mask；允許研究
+使用可取得來源，不代表宣稱永豐對每一檔每一天都有完整歷史。
+
+## 神經網路 walk-forward 訓練
+
+一分鐘模式沿用 `train.py`、年度 expanding walk-forward、BF16 AMP、
+Transformer model factory、AdamW、scheduler、early stopping、resume、
+`checkpoint_best.pt`、`epoch_curve.jsonl` 與 validation/test artifacts：
+
+```bash
+source scripts/runtime_env.sh
+run_fintech_python train.py \
+  --config configs/markets/tw_minute.yaml \
+  --start-fold 1
+```
+
+`execution_mode: tw_minute` 會在 daily panel 建置前分流到專用逐日 streaming
+loader；它不會借用 `tw_day_trade` 的每日 open-to-close 標籤。每個交易日展開成
+固定 270 分鐘的稀疏全市場 panel，模型每根完成 K 棒輸出一次目標，executor
+只交易目標差額。正規化平均與變異數由該 fold 的 train 年份分區統計聚合，
+validation/test 不參與。13:29 只能減倉，13:30 強制歸零。
 
 ## 透明策略與時間序列驗證
 
@@ -188,5 +211,5 @@ pilot 有 70,654 個原始列，每個策略產生 35,245 次分鐘決策；五�
 - 日終平倉超過觀察成交量容量或使用過時最後價格的金額會獨立報告，不會隱藏。
 - Shioaji 現有 contracts 可能不包含歷史下市標的；缺少合約會被明確記成
   `contract_unavailable`，因此研究仍需揭露可能的存活者偏誤。
-- 目前 pilot 只有 0050、2330，足以驗證資料、成本與因果契約，不足以評估
-  全市場 alpha；完整回補結束前不得把 pilot 報酬解讀為投資結論。
+- `contract_unavailable` 與已稽核 source gap 仍造成歷史覆蓋差異；報告必須保留
+  這些數量，不能把 available-source 回測寫成無缺口的全市場真值。
