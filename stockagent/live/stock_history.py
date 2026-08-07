@@ -496,6 +496,11 @@ def _coalesce_stock_history_columns(frame, *, execution_mode: str = "naive"):
     has_model = pl.col("model_weight").is_not_null()
     signal_target = pl.lit(naive) & ~has_holdings & ~has_actual & has_model
     day_trade = str(execution_mode).strip().lower() == "tw_day_trade"
+    record_price = (
+        pl.coalesce([pl.col("price_from_data"), pl.col("price")])
+        if day_trade
+        else pl.coalesce([pl.col("price"), pl.col("price_from_data")])
+    )
     previous_columns = (
         [
             pl.lit(0, dtype=pl.Int64).alias("prev_shares"),
@@ -517,7 +522,7 @@ def _coalesce_stock_history_columns(frame, *, execution_mode: str = "naive"):
         frame.with_columns(
             [
                 pl.coalesce([pl.col("shares"), pl.lit(0)]).cast(pl.Int64).alias("shares"),
-                pl.coalesce([pl.col("price"), pl.col("price_from_data")]).cast(pl.Float64).alias("price"),
+                record_price.cast(pl.Float64).alias("price"),
                 pl.when(signal_target)
                 .then(None)
                 .otherwise(pl.coalesce([pl.col("market_value"), pl.lit(0.0)]))

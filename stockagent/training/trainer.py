@@ -150,6 +150,22 @@ def _distributed_should_write() -> bool:
     return _distributed_world_size() <= 1 or _distributed_is_rank0()
 
 
+def _interactive_progress_enabled() -> bool:
+    """Show carriage-return progress bars only on rank 0 of a real terminal.
+
+    coda_runner merges stderr into ``tee`` for durable logs. In that piped
+    mode tqdm's carriage returns are commonly rendered as a new line for every
+    refresh, so structured logs are preferable to a corrupted progress bar.
+    """
+
+    isatty = getattr(sys.stderr, "isatty", None)
+    return bool(
+        _distributed_is_rank0()
+        and callable(isatty)
+        and isatty()
+    )
+
+
 def _distributed_barrier() -> None:
     if _distributed_is_initialized() and _distributed_world_size() > 1:
         if torch.cuda.is_available():
@@ -1256,6 +1272,59 @@ class TimingBreakdown:
     )
 
 
+def _broadcast_epoch_eval_tensor(
+    value: torch.Tensor | None,
+    *,
+    count: int,
+    src: int,
+    device: torch.device,
+) -> torch.Tensor | None:
+    """Broadcast a small rank-owned eval result without copying market tensors."""
+    count = max(0, int(count))
+    if count == 0:
+        return None
+    if not _distributed_is_initialized() or _distributed_world_size() <= 1:
+        if value is None or int(value.numel()) != count:
+            raise RuntimeError(f"epoch eval expected {count} scalar(s)")
+        return value
+    if _distributed_rank() == int(src):
+        if value is None or int(value.numel()) != count:
+            raise RuntimeError(
+                f"epoch eval source rank {src} expected {count} scalar(s)"
+            )
+        payload = value.detach().to(device=device, dtype=torch.float32).reshape(count).contiguous()
+    else:
+        payload = torch.empty((count,), device=device, dtype=torch.float32)
+    dist.broadcast(payload, src=int(src))
+    return payload
+
+
+def _broadcast_epoch_eval_timing(
+    timing: TimingBreakdown,
+    *,
+    elapsed_s: float,
+    loss_s: float,
+    src: int,
+    device: torch.device,
+) -> tuple[TimingBreakdown, float, float]:
+    """Move timing metadata from an eval worker rank to the reporting rank."""
+    if not _distributed_is_initialized() or _distributed_world_size() <= 1:
+        return timing, float(elapsed_s), float(loss_s)
+    names = [name for name in TimingBreakdown.__dataclass_fields__ if name != "cuda_events"]
+    if _distributed_rank() == int(src):
+        values = [float(getattr(timing, name)) for name in names]
+        values.extend((float(elapsed_s), float(loss_s)))
+        payload = torch.tensor(values, device=device, dtype=torch.float64)
+    else:
+        payload = torch.empty((len(names) + 2,), device=device, dtype=torch.float64)
+    dist.broadcast(payload, src=int(src))
+    values = payload.detach().cpu().tolist()
+    resolved = TimingBreakdown()
+    for name, raw in zip(names, values[:-2], strict=True):
+        setattr(resolved, name, int(raw) if name == "batches" else float(raw))
+    return resolved, float(values[-2]), float(values[-1])
+
+
 def _log_timing(label: str, timing: TimingBreakdown) -> None:
     parts = [f"[profile] {label}: total={timing.total_s:.3f}s"]
     if timing.batches:
@@ -1501,6 +1570,7 @@ class _CompiledLossFallback:
         label: str,
         strict_no_fallback: bool | None = None,
         dynamic_symbol_axis: bool = False,
+        dynamic_symbol_min: int | None = None,
         dynamic_symbol_max: int | None = None,
     ) -> None:
         self._compiled_fn = compiled_fn
@@ -1508,9 +1578,20 @@ class _CompiledLossFallback:
         self._label = label
         self._strict_no_fallback = _strict_no_fallback_enabled() if strict_no_fallback is None else bool(strict_no_fallback)
         self._dynamic_symbol_axis = bool(dynamic_symbol_axis)
+        self._dynamic_symbol_min = (
+            None if dynamic_symbol_min is None else max(1, int(dynamic_symbol_min))
+        )
         self._dynamic_symbol_max = (
             None if dynamic_symbol_max is None else max(1, int(dynamic_symbol_max))
         )
+        if (
+            self._dynamic_symbol_min is not None
+            and self._dynamic_symbol_max is not None
+            and self._dynamic_symbol_min > self._dynamic_symbol_max
+        ):
+            raise ValueError(
+                "compiled loss dynamic symbol minimum cannot exceed maximum"
+            )
         self._disabled = False
         self._warned = False
 
@@ -1521,6 +1602,7 @@ class _CompiledLossFallback:
             _mark_compiled_loss_dynamic_symbol_axis(
                 args,
                 kwargs,
+                min_symbols=self._dynamic_symbol_min,
                 max_symbols=self._dynamic_symbol_max,
             )
         try:
@@ -1562,6 +1644,7 @@ def _mark_compiled_loss_dynamic_symbol_axis(
     args: Sequence[Any],
     kwargs: Mapping[str, Any],
     *,
+    min_symbols: int | None = None,
     max_symbols: int | None = None,
 ) -> None:
     """Mark only canonical-loss symbol dimensions dynamic before tracing."""
@@ -1578,7 +1661,13 @@ def _mark_compiled_loss_dynamic_symbol_axis(
 
     rows = int(weights.size(0))
     symbols = int(weights.size(1))
-    symbol_upper_bound = max(symbols, int(max_symbols or 65_536))
+    symbol_lower_bound = max(1, int(min_symbols or 1))
+    symbol_upper_bound = int(max_symbols or 65_536)
+    if symbols < symbol_lower_bound or symbols > symbol_upper_bound:
+        raise ValueError(
+            "compiled loss observed S outside its causal train domain "
+            f"[{symbol_lower_bound}, {symbol_upper_bound}]: {symbols}"
+        )
     seen: set[int] = set()
 
     def visit(value: Any, *, aux_value: bool = False) -> None:
@@ -1596,9 +1685,19 @@ def _mark_compiled_loss_dynamic_symbol_axis(
                 # supplies the largest width in the current walk-forward train
                 # domain, covering every compacted group without including
                 # validation/test-only symbols or an arbitrary huge range.
-                mark_dynamic(value, 1, min=1, max=symbol_upper_bound)
+                mark_dynamic(
+                    value,
+                    1,
+                    min=symbol_lower_bound,
+                    max=symbol_upper_bound,
+                )
             elif aux_value and value.dim() == 1 and int(value.size(0)) == symbols:
-                mark_dynamic(value, 0, min=1, max=symbol_upper_bound)
+                mark_dynamic(
+                    value,
+                    0,
+                    min=symbol_lower_bound,
+                    max=symbol_upper_bound,
+                )
             return
         if isinstance(value, Mapping):
             for nested in value.values():
@@ -1652,7 +1751,7 @@ def _progress_bar(
         total=total,
         leave=leave,
         dynamic_ncols=True,
-        disable=not _distributed_is_rank0(),
+        disable=not _interactive_progress_enabled(),
     )
 
 
@@ -3393,6 +3492,7 @@ def _timing_curve_payload(
     scalar_sync_s: float = 0.0,
     cuda_sync_s: float = 0.0,
     gc_s: float = 0.0,
+    parallel_eval_overlap_s: float = 0.0,
     epoch_wall_s: float | None = None,
     timing_synchronized: bool = False,
     backtest_compile_stats: dict[str, int] | None = None,
@@ -3471,6 +3571,7 @@ def _timing_curve_payload(
         + float(scalar_sync_s)
         + float(cuda_sync_s)
         + float(gc_s)
+        - max(0.0, float(parallel_eval_overlap_s))
     )
     epoch_total_s = float(epoch_wall_s) if epoch_wall_s is not None else measured_total_s
     unattributed_s = max(0.0, epoch_total_s - measured_total_s)
@@ -3725,6 +3826,7 @@ def _timing_curve_payload(
         "gc_s": float(gc_s),
         "epoch_wall_s": epoch_total_s,
         "epoch_unattributed_s": unattributed_s,
+        "epoch_parallel_eval_overlap_s": max(0.0, float(parallel_eval_overlap_s)),
         "epoch_total_s": epoch_total_s,
         "epoch_step_train_loss_total_time_s": float(train_timing.loss_s),
         "epoch_step_train_loss_percent": _epoch_percent(train_timing.loss_s),
@@ -4021,6 +4123,7 @@ def _panel_slab_dynamic_symbol_bounds(
     model: nn.Module,
     *,
     observed_symbols: int,
+    min_symbols: int = 1,
     max_symbols: int,
     local_batch_rows: int,
 ) -> tuple[int, int]:
@@ -4033,18 +4136,24 @@ def _panel_slab_dynamic_symbol_bounds(
     padding assets or making the batch/time axes symbolic.
     """
     observed = max(1, int(observed_symbols))
-    panel_max = max(observed, int(max_symbols))
+    panel_min = max(1, int(min_symbols))
+    panel_max = max(panel_min, int(max_symbols))
+    if observed < panel_min or observed > panel_max:
+        raise ValueError(
+            "observed panel-slab S is outside its causal train domain "
+            f"[{panel_min}, {panel_max}]: {observed}"
+        )
     batch_rows = max(1, int(local_batch_rows))
     unwrapped = _unwrap_model(model)
     sdpa_batch_limit = max(0, int(getattr(unwrapped, "sdpa_batch_limit", 0)))
     if sdpa_batch_limit <= 0:
-        return 1, panel_max
+        return panel_min, panel_max
 
     flattened_rows = batch_rows * observed
     chunk_count = max(1, math.ceil(flattened_rows / sdpa_batch_limit))
     lower = ((chunk_count - 1) * sdpa_batch_limit) // batch_rows + 1
     upper = (chunk_count * sdpa_batch_limit) // batch_rows
-    lower = max(1, min(observed, lower))
+    lower = max(panel_min, min(observed, lower))
     upper = max(observed, min(panel_max, upper))
     return lower, upper
 
@@ -10925,12 +11034,12 @@ def _bucketed_symbol_count(active_count: int, total_symbols: int, bucket_size: i
     return min(total_symbols, max(active_count, bucketed))
 
 
-def _train_symbol_compaction_upper_bound(
+def _train_symbol_compaction_group_widths(
     panel: PanelData,
     grouped_folds: Mapping[tuple[int, ...], Sequence[WalkForwardFold]],
     config: ExperimentConfig,
-) -> int:
-    """Return the largest symbol width that a compact training group can use.
+) -> tuple[int, ...]:
+    """Return every reachable compact-training symbol width.
 
     The compiled train graph never consumes validation/test-only symbols.  Its
     symbolic ``S`` domain must therefore be derived from the walk-forward train
@@ -10945,7 +11054,7 @@ def _train_symbol_compaction_upper_bound(
         getattr(config.training, "train_symbol_compaction", "none")
     )
     if mode == "none" or total_symbols <= 0:
-        return total_symbols
+        return (total_symbols,)
 
     execution_mode = normalize_execution_mode(config.trading.execution_mode)
     if execution_mode in TW_CARRYING_EXECUTION_MODES:
@@ -10971,7 +11080,7 @@ def _train_symbol_compaction_upper_bound(
     lookback_context = normalize_lookback_context(
         getattr(walk_forward, "lookback_context", "split_only")
     )
-    upper_bound = 0
+    group_widths: list[int] = []
     for group_folds in grouped_folds.values():
         if not group_folds:
             continue
@@ -11002,11 +11111,30 @@ def _train_symbol_compaction_upper_bound(
                 bucket_size,
             )
         )
-        upper_bound = max(upper_bound, int(group_symbols))
+        group_widths.append(int(group_symbols))
 
     # No trainable group will reach compilation, but retain a valid conservative
-    # bound so the caller can report the eventual dataset error normally.
-    return total_symbols if upper_bound <= 0 else upper_bound
+    # domain so the caller can report the eventual dataset error normally.
+    return tuple(group_widths) if group_widths else (total_symbols,)
+
+
+def _train_symbol_compaction_bounds(
+    panel: PanelData,
+    grouped_folds: Mapping[tuple[int, ...], Sequence[WalkForwardFold]],
+    config: ExperimentConfig,
+) -> tuple[int, int]:
+    """Return the exact reachable ``S`` envelope for compiled train graphs."""
+    widths = _train_symbol_compaction_group_widths(panel, grouped_folds, config)
+    return min(widths), max(widths)
+
+
+def _train_symbol_compaction_upper_bound(
+    panel: PanelData,
+    grouped_folds: Mapping[tuple[int, ...], Sequence[WalkForwardFold]],
+    config: ExperimentConfig,
+) -> int:
+    """Compatibility helper returning the reachable compiled-train maximum."""
+    return _train_symbol_compaction_bounds(panel, grouped_folds, config)[1]
 
 
 def _maybe_compact_train_windowed_symbols(
@@ -15346,6 +15474,11 @@ def _run_postprocess_benchmark_after_fold(
         ",".join(plot_metrics),
         "--plot-top-n",
         str(int(getattr(config.training, "postprocess_benchmark_plot_top_n", 20))),
+        # DDP's non-writer ranks release their CUDA allocations before this
+        # subprocess starts.  Use every GPU assigned to the job to evaluate
+        # independent canonical postprocess candidates concurrently.
+        "--sweep-devices",
+        "auto",
         "--output-root",
         str(output_path),
     ]
@@ -19029,13 +19162,18 @@ def _run_training_impl(
     compile_loss_dynamic_symbols_for_run = bool(
         getattr(config.training, "compile_loss_dynamic_symbols", False)
     ) and train_symbol_bucket_size <= 0
+    dynamic_loss_symbol_min, dynamic_loss_symbol_max = (
+        _train_symbol_compaction_bounds(panel, grouped_folds, config)
+    )
+    dynamic_loss_symbol_min = max(1, int(dynamic_loss_symbol_min))
     dynamic_loss_symbol_max = max(
-        1,
-        _train_symbol_compaction_upper_bound(panel, grouped_folds, config),
+        dynamic_loss_symbol_min,
+        int(dynamic_loss_symbol_max),
     )
     if _distributed_should_write():
         print(
-            f"[dynamic symbols] train graph domain S<={dynamic_loss_symbol_max} "
+            f"[dynamic symbols] train graph domain "
+            f"{dynamic_loss_symbol_min}<=S<={dynamic_loss_symbol_max} "
             f"(full_panel={len(panel.symbols)}, "
             f"compaction={_normalize_train_symbol_compaction(config.training.train_symbol_compaction)})"
         )
@@ -19044,7 +19182,7 @@ def _run_training_impl(
     # expanding compact train groups intentionally share one bounded-dynamic
     # TW executor graph.
     os.environ["STOCKAGENT_TW_COMPILE_SYMBOL_MIN"] = str(
-        2
+        dynamic_loss_symbol_min
         if compile_loss_dynamic_symbols_for_run
         else dynamic_loss_symbol_max
     )
@@ -19848,6 +19986,7 @@ def _run_training_impl(
             dynamic_model_symbol_bounds = _panel_slab_dynamic_symbol_bounds(
                 model,
                 observed_symbols=int(train_windowed.features.shape[1]),
+                min_symbols=dynamic_loss_symbol_min,
                 max_symbols=dynamic_loss_symbol_max,
                 local_batch_rows=local_model_rows,
             )
@@ -20020,6 +20159,11 @@ def _run_training_impl(
                                 eager_loss_fn,
                                 label=f"Train {train_years}",
                                 dynamic_symbol_axis=compile_loss_dynamic_symbols,
+                                dynamic_symbol_min=(
+                                    dynamic_loss_symbol_min
+                                    if compile_loss_dynamic_symbols
+                                    else None
+                                ),
                                 dynamic_symbol_max=(
                                     dynamic_loss_symbol_max
                                     if compile_loss_dynamic_symbols
@@ -20511,6 +20655,9 @@ def _run_training_impl(
             ),
             dynamic_symbols=bool(compile_loss_dynamic_symbols),
             shared_across_train_groups=bool(compile_loss_dynamic_symbols),
+            dynamic_symbol_min=(
+                dynamic_loss_symbol_min if compile_loss_dynamic_symbols else None
+            ),
             dynamic_symbol_max=(
                 dynamic_loss_symbol_max if compile_loss_dynamic_symbols else None
             ),
@@ -20614,12 +20761,32 @@ def _run_training_impl(
         # temporary allocator blocks before considering eval caches.
         _release_cuda_memory(device)
 
+        val_return_weights_history_config = bool(
+            getattr(config.training, "save_best_val_artifacts", False)
+        )
+        parallel_ddp_epoch_eval = bool(
+            ddp_enabled
+            and _distributed_is_initialized()
+            and _distributed_world_size() >= 2
+            and not full_objective_eval_required
+            and not val_return_weights_history_config
+        )
+        eval_rank = _distributed_rank()
+        cache_val_on_rank = not parallel_ddp_epoch_eval or eval_rank == 0
+        cache_test_on_rank = not parallel_ddp_epoch_eval or eval_rank == 1
+        if parallel_ddp_epoch_eval:
+            print(
+                f"[Train {train_years}] epoch eval sharding rank={eval_rank}: "
+                f"validation={'on' if eval_rank == 0 else 'off'} "
+                f"sampled_test={'on' if eval_rank == 1 else 'off'}"
+            )
+
         combined_val_windowed_shared = _maybe_share_windowed_base_from_cached(
             name=f"validation windowed tensors {train_years}",
             split=combined_val_windowed,
             device=device,
             non_blocking=non_blocking,
-            enabled=bool(config.training.cache_eval_tensors_on_gpu),
+            enabled=bool(config.training.cache_eval_tensors_on_gpu and cache_val_on_rank),
             cached_base=train_windowed,
         )
         if combined_val_windowed_shared is not None:
@@ -20629,7 +20796,7 @@ def _run_training_impl(
                 name=f"validation windowed tensors {train_years}",
                 split=combined_val_windowed,
                 device=device,
-                enabled=bool(config.training.cache_eval_tensors_on_gpu),
+                enabled=bool(config.training.cache_eval_tensors_on_gpu and cache_val_on_rank),
                 target_fraction=float(config.training.target_vram_fraction),
                 safety_margin_gb=float(config.training.vram_safety_margin_gb),
             )
@@ -20639,7 +20806,7 @@ def _run_training_impl(
             split=combined_test_windowed,
             device=device,
             non_blocking=non_blocking,
-            enabled=bool(config.training.cache_eval_tensors_on_gpu),
+            enabled=bool(config.training.cache_eval_tensors_on_gpu and cache_test_on_rank),
             cached_base=combined_val_windowed,
         )
         if combined_test_windowed_shared is not None:
@@ -20649,7 +20816,7 @@ def _run_training_impl(
                 name=f"test windowed tensors {train_years}",
                 split=combined_test_windowed,
                 device=device,
-                enabled=bool(config.training.cache_eval_tensors_on_gpu),
+                enabled=bool(config.training.cache_eval_tensors_on_gpu and cache_test_on_rank),
                 target_fraction=float(config.training.target_vram_fraction),
                 safety_margin_gb=float(config.training.vram_safety_margin_gb),
             )
@@ -21233,7 +21400,7 @@ def _run_training_impl(
             deferred_val_loss_contexts: list[FoldRuntimeContext] = []
             deferred_val_loss_tensors: torch.Tensor | None = None
             deferred_test_loss_tensors: torch.Tensor | None = None
-            val_return_weights_history = bool(getattr(config.training, "save_best_val_artifacts", False))
+            val_return_weights_history = val_return_weights_history_config
             if full_objective_eval_required:
                 val_eval_start = time.perf_counter()
                 eval_model.eval()
@@ -21324,7 +21491,7 @@ def _run_training_impl(
                             fold_ckpt_total += time.perf_counter() - fold_ckpt_start
                 val_eval_total = max(0.0, time.perf_counter() - val_eval_start - fold_ckpt_total)
                 val_loss_total = 0.0
-            else:
+            elif not parallel_ddp_epoch_eval or eval_rank == 0:
                 val_eval_start = time.perf_counter()
                 val_backtest_epoch, _, _ = _evaluate_windowed_tensor_batch(
                     eval_model,
@@ -21382,6 +21549,13 @@ def _run_training_impl(
                     log_utility_log_shift=config.evaluation.eval_log_utility_log_shift,
                 )
                 val_loss_total = time.perf_counter() - val_loss_start
+            else:
+                # Rank 0 owns validation and broadcasts only the per-segment
+                # scalar losses. Rank 1 can evaluate the independent sampled
+                # test segment at the same time on the other GPU.
+                deferred_val_loss_contexts = list(fold_contexts.values())
+                val_eval_total = 0.0
+                val_loss_total = 0.0
 
             curve_test_interval = max(1, int(getattr(config.training, "curve_test_interval", 1)))
             should_compute_test_mean = (
@@ -21396,7 +21570,9 @@ def _run_training_impl(
             curve_test_total = 0.0
             test_loss_total = 0.0
             test_losses_epoch: list[float] = []
-            if should_compute_test_mean:
+            if should_compute_test_mean and (
+                not parallel_ddp_epoch_eval or eval_rank == 1
+            ):
                 curve_test_start = time.perf_counter()
                 if full_objective_eval_required:
                     eval_model.eval()
@@ -21502,6 +21678,44 @@ def _run_training_impl(
                     )
                     test_loss_total = time.perf_counter() - test_loss_start
                 curve_test_total = time.perf_counter() - curve_test_start
+
+            parallel_eval_overlap_s = 0.0
+            if parallel_ddp_epoch_eval:
+                deferred_val_loss_tensors = _broadcast_epoch_eval_tensor(
+                    deferred_val_loss_tensors,
+                    count=len(fold_contexts),
+                    src=0,
+                    device=device,
+                )
+                val_timing, val_eval_total, val_loss_total = _broadcast_epoch_eval_timing(
+                    val_timing,
+                    elapsed_s=val_eval_total,
+                    loss_s=val_loss_total,
+                    src=0,
+                    device=device,
+                )
+                if should_compute_test_mean:
+                    deferred_test_loss_tensors = _broadcast_epoch_eval_tensor(
+                        deferred_test_loss_tensors,
+                        count=max(0, len(curve_test_offsets) - 1),
+                        src=1,
+                        device=device,
+                    )
+                    (
+                        test_curve_timing,
+                        curve_test_total,
+                        test_loss_total,
+                    ) = _broadcast_epoch_eval_timing(
+                        test_curve_timing,
+                        elapsed_s=curve_test_total,
+                        loss_s=test_loss_total,
+                        src=1,
+                        device=device,
+                    )
+                    parallel_eval_overlap_s = min(
+                        val_eval_total + val_loss_total,
+                        curve_test_total,
+                    )
 
             scalar_sync_start = time.perf_counter()
             scalar_parts = [train_loss_t.detach().float().reshape(1)]
@@ -21753,6 +21967,7 @@ def _run_training_impl(
                             cuda_sync_s=cuda_sync_total,
                             scalar_sync_s=scalar_sync_total,
                             gc_s=gc_total,
+                            parallel_eval_overlap_s=parallel_eval_overlap_s,
                             epoch_wall_s=time.perf_counter() - epoch_start,
                             timing_synchronized=(
                                 device.type != "cuda"
@@ -22138,14 +22353,31 @@ def _run_training_impl(
                 )
                 plot_total = float(plot_timing.get("total_s", 0.0))
 
-                refresh_start = time.perf_counter()
-                _refresh_walkforward_artifacts(
-                    output_path,
-                    list(results_by_fold.values()),
-                    panel=panel,
-                    config=config,
+                # Fold-local artifacts are durable before this point. Rebuilding
+                # every global walk-forward plot after folds 1, 1..2, ...,
+                # 1..N is O(N^2) presentation work and the intermediate files
+                # are immediately overwritten. Refresh once when every selected
+                # fold is complete. A resumed fully-complete run also refreshes
+                # these artifacts in the completed-fold scan above.
+                selected_folds_complete = all(
+                    selected.fold_id in results_by_fold for selected in fold_list
                 )
-                plot_timing["walkforward_refresh_s"] = float(time.perf_counter() - refresh_start)
+                if selected_folds_complete:
+                    refresh_start = time.perf_counter()
+                    _refresh_walkforward_artifacts(
+                        output_path,
+                        list(results_by_fold.values()),
+                        panel=panel,
+                        config=config,
+                    )
+                    plot_timing["walkforward_refresh_s"] = float(
+                        time.perf_counter() - refresh_start
+                    )
+                else:
+                    plot_timing["walkforward_refresh_s"] = 0.0
+                    plot_timing["walkforward_refresh_status"] = (
+                        "deferred_until_all_selected_folds_complete"
+                    )
                 explain_start = time.perf_counter()
                 explain_path = _run_fold_explainability(
                     model=model,

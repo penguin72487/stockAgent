@@ -791,7 +791,9 @@ def test_day_trade_stock_history_uses_same_session_open_to_close(tmp_path) -> No
             "date": ["2026-01-02", "2026-01-02", "2026-01-05", "2026-01-05"],
             "symbol": ["CASH", "AAA", "CASH", "AAA"],
             "shares": [1500, -5, 1300, -3],
-            "price": [1.0, 100.0, 1.0, 100.0],
+            # The holdings snapshot price is deliberately different.  Daily
+            # day-trade history must use the official session open instead.
+            "price": [1.0, 95.0, 1.0, 96.0],
             "market_value": [1500.0, -500.0, 1300.0, -300.0],
             "holding_ratio": [1.5, -0.5, 1.3, -0.3],
             "is_cash": [True, False, True, False],
@@ -1058,7 +1060,9 @@ def test_day_trade_portfolio_history_changes_use_open_snapshot_and_close_pnl(tmp
             "date": ["2026-01-02", "2026-01-02", "2026-01-05", "2026-01-05"],
             "symbol": ["CASH", "AAA", "CASH", "AAA"],
             "shares": [900, 10, 800, 20],
-            "price": [1.0, 10.0, 1.0, 10.0],
+            # History must not mistake this stored snapshot for the official
+            # opening execution price supplied by the daily price source.
+            "price": [1.0, 9.5, 1.0, 9.6],
             "market_value": [900.0, 100.0, 800.0, 200.0],
             "holding_ratio": [0.9, 0.1, 0.8, 0.2],
             "is_cash": [True, False, True, False],
@@ -1099,7 +1103,7 @@ def test_day_trade_portfolio_history_changes_use_open_snapshot_and_close_pnl(tmp
     assert np.isclose(row["portfolio_contribution"], -0.02)
 
 
-def test_day_trade_portfolio_history_uses_close_ledger_nav_and_requested_exposure(tmp_path) -> None:
+def test_day_trade_portfolio_history_records_open_nav_and_same_session_pnl(tmp_path) -> None:
     fold_dir = tmp_path / "fold_11"
     fold_dir.mkdir()
     pl.DataFrame(
@@ -1124,9 +1128,11 @@ def test_day_trade_portfolio_history_uses_close_ledger_nav_and_requested_exposur
     pl.DataFrame(
         {
             "date": ["2026-01-02", "2026-01-05"],
-            "settled_cash": [1050.0, 1045.0],
+            "settled_cash": [1050.0, 945.0],
             "payables_total": [0.0, 0.0],
             "receivables_total": [50.0, 0.0],
+            "commission_rebate_current_receivable": [0.0, 5.0],
+            "commission_rebate_due_receivable": [0.0, 0.0],
         }
     ).write_parquet(fold_dir / "integer_share_settlement_audit.parquet")
     np.savez(
@@ -1144,18 +1150,22 @@ def test_day_trade_portfolio_history_uses_close_ledger_nav_and_requested_exposur
 
     latest, first = result.rows
     assert np.isclose(first["open_nav"], 1000.0)
-    assert np.isclose(first["nav"], 1100.0)
+    assert np.isclose(first["nav"], 1000.0)
+    assert np.isclose(first["close_nav"], 1100.0)
+    assert np.isclose(first["ledger_close_nav"], 1100.0)
     assert np.isclose(first["profit_value"], 100.0)
     assert np.isclose(first["requested_gross_ratio"], 1.0)
     assert first["requested_position_count"] == 2
     assert np.isclose(first["execution_fill_ratio"], 0.1)
     assert np.isclose(latest["open_nav"], 1000.0)
-    assert np.isclose(latest["nav"], 1045.0)
-    assert np.isclose(latest["profit_value"], -55.0)
+    assert np.isclose(latest["nav"], 1000.0)
+    assert np.isclose(latest["close_nav"], 950.0)
+    assert np.isclose(latest["ledger_close_nav"], 950.0)
+    assert np.isclose(latest["profit_value"], -50.0)
     assert np.isclose(latest["requested_gross_ratio"], 1.0)
     assert np.isclose(latest["execution_fill_ratio"], 0.0)
     assert latest["changes"] == []
-    assert np.isclose(result.profit_value, 45.0)
+    assert np.isclose(result.profit_value, 50.0)
 
 
 def test_load_portfolio_history_scales_values_from_current_capital(tmp_path) -> None:

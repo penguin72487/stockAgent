@@ -3584,11 +3584,28 @@ def _symbol_name_map_cached(parquet_root: str) -> dict[str, str]:
 
 
 def _annotate_history_rows_with_display_time(cfg: LiveMarketConfig, rows: list[dict[str, Any]]) -> None:
+    execution_mode = _market_execution_mode(cfg)
+    frequency = str(getattr(cfg, "history_frequency", "daily") or "daily").strip().lower()
+    day_trade_open_records = execution_mode == "tw_day_trade" and frequency not in {
+        "bar",
+        "intraday",
+        "15m",
+        "15min",
+        "interval",
+    }
+    open_time = str(getattr(cfg, "open_time", None) or "09:00").strip()
+    if re.fullmatch(r"\d{1,2}:\d{2}", open_time):
+        open_time += ":00"
     for row in rows:
         if isinstance(row, dict):
             if row.get("display_date"):
                 continue
-            row["display_date"] = _display_cfg_time(cfg, row.get("date", "n/a"))
+            value = row.get("date", "n/a")
+            if day_trade_open_records:
+                day = _date_key(value)
+                if day:
+                    value = f"{day} {open_time}"
+            row["display_date"] = _display_cfg_time(cfg, value)
 
 
 def _load_stock_history_for_market(
@@ -4048,7 +4065,7 @@ def _portfolio_history_header_lines(
     ]
     if str(getattr(result, "execution_mode", "naive")) == "tw_day_trade":
         header.append(
-            "當沖契約: 每日從空倉開始；部位/調整為開盤實際成交，nav/ret/pnl 為同日收盤平倉後結果。"
+            "當沖契約: 每列記錄當日開盤成交；ret/pnl 依同日 open->close（含費用）結算。"
         )
     if debug:
         source_text = _shorten(", ".join(_display_path(path) for path in result.source_paths), 700)
@@ -4061,7 +4078,13 @@ def _portfolio_history_header_lines(
                     ("ref", _display_cfg_time(cfg, result.capital.reference_date or "n/a")),
                 ),
                 f"sources: `{source_text}`",
-                "欄位: pnl≈前一期 NAV x 本期報酬估算；cum=本查詢期間累積報酬；top=本期絕對持倉比例變動最大的標的。",
+                (
+                    "欄位: pnl=當日開盤 NAV x 同日 open->close 報酬；"
+                    "cum=本查詢期間累積報酬；top=開盤部位變動最大的標的。"
+                    if str(getattr(result, "execution_mode", "naive")) == "tw_day_trade"
+                    else "欄位: pnl≈前一期 NAV x 本期報酬估算；cum=本查詢期間累積報酬；"
+                    "top=本期絕對持倉比例變動最大的標的。"
+                ),
             ]
         )
     return header
@@ -4257,10 +4280,19 @@ def _portfolio_history_block(row: dict[str, Any]) -> str:
             ("bench", _signed_pct(row.get("benchmark_return"))),
             ("pnl", _signed_money(row.get("profit_value"))),
         ),
-        _kv_line(
-            ("cum", _signed_pct(row.get("cumulative_return"))),
-            ("turnover", _pct(row.get("turnover"))),
-            ("nav", _money(row.get("nav"))),
+        (
+            _kv_line(
+                ("cum", _signed_pct(row.get("cumulative_return"))),
+                ("turnover", _pct(row.get("turnover"))),
+                ("open_nav", _money(row.get("open_nav", row.get("nav")))),
+                ("close_nav", _money(row.get("close_nav"))),
+            )
+            if day_trade
+            else _kv_line(
+                ("cum", _signed_pct(row.get("cumulative_return"))),
+                ("turnover", _pct(row.get("turnover"))),
+                ("nav", _money(row.get("nav"))),
+            )
         ),
         _kv_line(
             ("open_gross" if day_trade else "gross", _pct(row.get("gross_ratio"))),
