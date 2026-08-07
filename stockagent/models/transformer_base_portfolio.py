@@ -26,6 +26,9 @@ from stockagent.profiling import PROFILE_RANGES_ENABLED, _torch_is_compiling, pr
 _ACTION_CHANNEL_NAMES_BY_EXECUTION_MODE: dict[str, tuple[str, ...]] = {
     "naive": ("target",),
     "tw_day_trade": ("target",),
+    "tw_minute": ("target",),
+    "tw_index_options_tick_long": ("target",),
+    "tw_index_options_tick_short": ("target",),
     "tw_cash": ("open_target", "close_target"),
     "tw_overnight": (
         "due_exit_fraction",
@@ -37,6 +40,9 @@ _ACTION_CHANNEL_NAMES_BY_EXECUTION_MODE: dict[str, tuple[str, ...]] = {
 _ACTION_SCHEMA_BY_EXECUTION_MODE: dict[str, str] = {
     "naive": "single_target_v1",
     "tw_day_trade": "single_target_v1",
+    "tw_minute": "single_minute_target_v1",
+    "tw_index_options_tick_long": "single_option_pair_target_v1",
+    "tw_index_options_tick_short": "single_option_pair_target_v1",
     "tw_cash": "open_close_targets_v1",
     "tw_overnight": "due_exit_open_close_entries_v2_shared_direction",
 }
@@ -1135,6 +1141,49 @@ class TransformerBasePortfolioModel(nn.Module):
         if mask is not None and tuple(mask.shape) != (batch_rows, int(feature_slab.size(1))):
             raise ValueError(f"Expected mask shape {(batch_rows, int(feature_slab.size(1)))}, got {tuple(mask.shape)}")
 
+    def _check_batched_panel_slab_shapes(
+        self,
+        feature_slabs: torch.Tensor,
+        mask: torch.Tensor | None,
+        symbol_indices: torch.Tensor | None = None,
+    ) -> None:
+        if feature_slabs.dim() != 4:
+            raise ValueError(
+                "Expected feature_slabs shape [D,U,S,F], "
+                f"got ndim={feature_slabs.dim()}"
+            )
+        if int(feature_slabs.size(1)) < self.lookback:
+            raise ValueError(
+                f"Expected slab rows >= lookback={self.lookback}, "
+                f"got {int(feature_slabs.size(1))}"
+            )
+        if (
+            not self.allow_dynamic_symbols
+            and symbol_indices is None
+            and int(feature_slabs.size(2)) != self.num_symbols
+        ):
+            raise ValueError(
+                f"Expected num_symbols={self.num_symbols}, "
+                f"got {int(feature_slabs.size(2))}"
+            )
+        self._check_symbol_indices(symbol_indices, int(feature_slabs.size(2)))
+        if int(feature_slabs.size(3)) != self.num_features:
+            raise ValueError(
+                f"Expected num_features={self.num_features}, "
+                f"got {int(feature_slabs.size(3))}"
+            )
+        decision_rows = int(feature_slabs.size(1)) - self.lookback + 1
+        expected_mask = (
+            int(feature_slabs.size(0)),
+            decision_rows,
+            int(feature_slabs.size(2)),
+        )
+        if mask is not None and tuple(mask.shape) != expected_mask:
+            raise ValueError(
+                f"Expected batched slab mask shape {expected_mask}, "
+                f"got {tuple(mask.shape)}"
+            )
+
     def configure_attention_capture(
         self,
         enabled: bool,
@@ -1450,6 +1499,25 @@ class TransformerBasePortfolioModel(nn.Module):
         projected = self._project_features(feature_slab)
         h = projected.unfold(0, self.lookback, 1).permute(0, 3, 1, 2).contiguous()
         return self._add_window_positions(h, int(feature_slab.size(1)), symbol_indices)
+
+    def _embed_windowed_from_batched_panel_slabs(
+        self,
+        feature_slabs: torch.Tensor,
+        symbol_indices: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Project overlapping windows once per unique row and independent slab.
+
+        ``D`` is an independence axis (for example, separate trading days), not
+        a time axis.  The returned batch is flattened in ``[D,C]`` order while
+        every window retains the canonical ``[L,S,F]`` chronology.
+        """
+        projected = self._project_features(feature_slabs)
+        windows = projected.unfold(1, self.lookback, 1)
+        # unfold appends the rolling dimension: [D,C,S,H,L] -> [D,C,L,S,H].
+        h = windows.permute(0, 1, 4, 2, 3).contiguous()
+        days, decision_rows, lookback, symbols, width = h.shape
+        h = h.reshape(days * decision_rows, lookback, symbols, width)
+        return self._add_window_positions(h, int(feature_slabs.size(2)), symbol_indices)
 
     def _embed_windowed_from_panel(
         self,
@@ -2562,6 +2630,39 @@ class TransformerBasePortfolioModel(nn.Module):
             mask_bool = torch.ones(h.size(0), h.size(2), dtype=torch.bool, device=h.device)
         else:
             mask_bool = mask.to(device=h.device, dtype=torch.bool)
+        return self._forward_embedded(
+            h,
+            mask_bool,
+            temperature=temperature,
+            return_aux=return_aux,
+        )
+
+    def forward_from_batched_panel_slabs(
+        self,
+        feature_slabs: torch.Tensor,
+        mask: torch.Tensor | None = None,
+        temperature: float | torch.Tensor | None = None,
+        return_aux: bool | None = None,
+        symbol_indices: torch.Tensor | None = None,
+    ):
+        """Forward independent contiguous panel slabs without repeated projection.
+
+        Inputs use ``[D,U,S,F]`` and masks use ``[D,C,S]``, where
+        ``C = U - lookback + 1``.  Outputs follow the ordinary flattened model
+        batch order ``[D*C,S]``.
+        """
+        self._check_batched_panel_slab_shapes(feature_slabs, mask, symbol_indices)
+        h = self._embed_windowed_from_batched_panel_slabs(
+            feature_slabs, symbol_indices
+        )
+        if mask is None:
+            mask_bool = torch.ones(
+                h.size(0), h.size(2), dtype=torch.bool, device=h.device
+            )
+        else:
+            mask_bool = mask.to(device=h.device, dtype=torch.bool).reshape(
+                h.size(0), h.size(2)
+            )
         return self._forward_embedded(
             h,
             mask_bool,

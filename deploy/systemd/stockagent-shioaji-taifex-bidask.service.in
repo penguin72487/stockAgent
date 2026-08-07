@@ -1,0 +1,22 @@
+[Unit]
+Description=StockAgent Shioaji TAIFEX Tick and five-level BidAsk capture
+Wants=network-online.target time-sync.target
+After=network-online.target time-sync.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=@SERVICE_USER@
+Group=@SERVICE_GROUP@
+WorkingDirectory=@REPO_ROOT@
+Environment="HOME=@SERVICE_HOME@"
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=/usr/bin/bash "@REPO_ROOT@/scripts/run_shioaji_taifex_bidask_stream.sh"
+Restart=on-failure
+RestartSec=30s
+TimeoutStopSec=90s
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target
