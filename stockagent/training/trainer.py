@@ -60,6 +60,8 @@ from stockagent.backtest.simulator import (
 )
 from stockagent.backtest.tw_execution import (
     TW_CARRYING_EXECUTION_MODES,
+    TW_DERIVATIVES_TICK_EXECUTION_MODES,
+    TW_MINUTE_EXECUTION_MODES,
     TW_STOCK_EXECUTION_MODES,
     TaiwanFeeSchedule,
     TaiwanMarginShortSchedule,
@@ -115,6 +117,12 @@ from stockagent.training.execution_coverage import (
     validate_training_execution_coverage,
 )
 from stockagent.training.loss import _resolve_rank_scores, get_loss_runtime_stats, risk_aware_loss
+from stockagent.training.lifecycle import (
+    TrainingArtifactLayout,
+    TrainingRunLifecycle,
+    canonical_mode_artifact_contract,
+    normalize_epoch_curve_record,
+)
 from stockagent.training.windowed import WindowedSplitTensors, dataset_to_windowed_tensors
 
 
@@ -1721,6 +1729,32 @@ def _progress(message: str) -> None:
     print(message, flush=True)
 
 
+def _progress_bar(
+    iterable: Iterable[Any] | None = None,
+    *,
+    desc: str,
+    unit: str,
+    total: int | None = None,
+    leave: bool = True,
+) -> Any:
+    """Create the canonical rank-aware training progress bar.
+
+    Product-specific runners supply only the real work unit (for example,
+    independent sessions or epochs).  Terminal behavior, sizing, and rank
+    ownership stay identical across daily, minute, and tick training modes.
+    """
+
+    return tqdm(
+        iterable,
+        desc=desc,
+        unit=unit,
+        total=total,
+        leave=leave,
+        dynamic_ncols=True,
+        disable=not _interactive_progress_enabled(),
+    )
+
+
 def _extract_weights_and_aux(
     model_output: torch.Tensor | dict[str, torch.Tensor] | tuple[Any, ...],
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor] | None]:
@@ -2945,7 +2979,7 @@ def _is_tree_model_name(model_name: str) -> bool:
 
 
 def _fold_dir(output_path: Path, fold_id: int) -> Path:
-    return output_path / f"fold_{fold_id:02d}"
+    return TrainingArtifactLayout(output_path).fold_dir(fold_id)
 
 
 def _best_checkpoint_path(fold_dir: Path) -> Path:
@@ -2997,15 +3031,16 @@ def _group_key(train_years: list[int]) -> tuple[int, ...]:
 
 
 def _group_id(train_years: list[int]) -> str:
-    return "train_" + "-".join(str(year) for year in train_years)
+    return TrainingArtifactLayout.year_group_name(train_years)
 
 
 def _group_dir(output_path: Path, train_years: list[int]) -> Path:
-    return output_path / _group_id(train_years)
+    return TrainingArtifactLayout(output_path).year_group_dir(train_years)
 
 
 def _group_checkpoint_path(output_path: Path, train_years: list[int]) -> Path:
-    return _group_dir(output_path, train_years) / "checkpoint_last.pt"
+    layout = TrainingArtifactLayout(output_path)
+    return layout.group_checkpoint_path(layout.year_group_name(train_years))
 
 
 def _parse_group_years_from_dir_name(name: str) -> list[int] | None:
@@ -3044,7 +3079,8 @@ def _latest_group_checkpoint(output_path: Path) -> tuple[Path, list[int]] | None
 
 
 def _group_curve_path(output_path: Path, train_years: list[int]) -> Path:
-    return _group_dir(output_path, train_years) / "epoch_curve.jsonl"
+    layout = TrainingArtifactLayout(output_path)
+    return layout.group_curve_path(layout.year_group_name(train_years))
 
 
 def _write_loss_contract_metadata(
@@ -3370,6 +3406,71 @@ class _AsyncEpochCurvePlotter:
         if self._pending:
             self._pending = False
             self._launch()
+
+
+class _EpochCurveLifecycle:
+    """Canonical epoch-curve recording and plotting lifecycle.
+
+    Specialized neural runners should reuse this coordinator instead of
+    reimplementing resume trimming, async request coalescing, deferred plots,
+    or final flushing around the shared JSONL curve.
+    """
+
+    def __init__(
+        self,
+        curve_path: Path,
+        *,
+        enabled: bool,
+        interval: int,
+        async_enabled: bool,
+        defer_until_end: bool,
+        writer_enabled: bool = True,
+    ) -> None:
+        self.curve_path = curve_path
+        self.enabled = bool(enabled)
+        self.interval = max(1, int(interval))
+        self.defer_until_end = bool(defer_until_end)
+        self.writer_enabled = bool(writer_enabled)
+        self._plotter = (
+            _AsyncEpochCurvePlotter(
+                curve_path,
+                interval=self.interval,
+                async_enabled=bool(async_enabled),
+            )
+            if self.enabled and self.writer_enabled
+            else None
+        )
+
+    def prepare_resume(self, start_epoch: int) -> None:
+        if self.enabled and self.writer_enabled:
+            _trim_group_curve(self.curve_path, int(start_epoch))
+
+    def record(
+        self,
+        payload: dict[str, float | int | None],
+        *,
+        request_plot: bool,
+    ) -> None:
+        if not self.enabled:
+            return
+        _append_group_curve(
+            self.curve_path,
+            normalize_epoch_curve_record(payload),
+        )
+        if (
+            request_plot
+            and not self.defer_until_end
+            and self._plotter is not None
+        ):
+            self._plotter.request()
+
+    def flush(self) -> dict[str, float | int | str]:
+        if self._plotter is None:
+            return {}
+        if self.defer_until_end:
+            return _run_epoch_curve_plot_once(self.curve_path, self.interval)
+        self._plotter.flush()
+        return {}
 
 
 def _timing_curve_payload(
@@ -6112,6 +6213,7 @@ def _save_fold_checkpoint(
     optimizer: torch.optim.Optimizer,
     scaler: GradScaler,
     experiment_manifest: Mapping[str, Any] | None = None,
+    extra_payload: Mapping[str, Any] | None = None,
     include_optimizer: bool = False,
     check_finite: bool = True,
 ) -> None:
@@ -6134,6 +6236,14 @@ def _save_fold_checkpoint(
     if include_optimizer:
         payload["optimizer_state_dict"] = optimizer.state_dict()
         payload["scaler_state_dict"] = scaler.state_dict()
+    if extra_payload:
+        overlap = set(payload).intersection(extra_payload)
+        if overlap:
+            raise ValueError(
+                "fold checkpoint extra_payload cannot replace canonical fields: "
+                f"{sorted(overlap)}"
+            )
+        payload.update(dict(extra_payload))
     _atomic_torch_save(payload, checkpoint_path)
 
 
@@ -6526,6 +6636,7 @@ def _save_group_checkpoint(
     experiment_manifest: Mapping[str, Any],
     effective_train_batch_size: int,
     scheduler: torch.optim.lr_scheduler.LRScheduler | torch.optim.lr_scheduler.ReduceLROnPlateau | None = None,
+    extra_payload: Mapping[str, Any] | None = None,
     no_improve_epochs: int = 0,
     early_stop_patience: int = 0,
     early_stopping_no_improve_ratio: float = 0.0,
@@ -6540,23 +6651,60 @@ def _save_group_checkpoint(
         return
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     scheduler_state = scheduler.state_dict() if scheduler is not None else None
-    _atomic_torch_save(
-        {
-            "train_years": train_years,
-            "epoch": epoch,
-            "model_state_dict": _state_dict_for_save(model),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "scaler_state_dict": scaler.state_dict(),
-            "rng_state": rng_state,
-            "experiment_manifest": dict(experiment_manifest),
-            "effective_train_batch_size": int(effective_train_batch_size),
-            "scheduler_state_dict": scheduler_state,
-            "no_improve_epochs": int(max(0, no_improve_epochs)),
-            "early_stop_patience": int(max(0, early_stop_patience)),
-            "early_stopping_no_improve_ratio": float(max(0.0, early_stopping_no_improve_ratio)),
-            "early_stop_val_interval_epochs": int(max(1, early_stop_val_interval_epochs)),
-        },
-        checkpoint_path,
+    payload: dict[str, Any] = {
+        "train_years": train_years,
+        "epoch": epoch,
+        "model_state_dict": _state_dict_for_save(model),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scaler_state_dict": scaler.state_dict(),
+        "rng_state": rng_state,
+        "experiment_manifest": dict(experiment_manifest),
+        "effective_train_batch_size": int(effective_train_batch_size),
+        "scheduler_state_dict": scheduler_state,
+        "no_improve_epochs": int(max(0, no_improve_epochs)),
+        "early_stop_patience": int(max(0, early_stop_patience)),
+        "early_stopping_no_improve_ratio": float(
+            max(0.0, early_stopping_no_improve_ratio)
+        ),
+        "early_stop_val_interval_epochs": int(max(1, early_stop_val_interval_epochs)),
+    }
+    if extra_payload:
+        overlap = set(payload).intersection(extra_payload)
+        if overlap:
+            raise ValueError(
+                "group checkpoint extra_payload cannot replace canonical fields: "
+                f"{sorted(overlap)}"
+            )
+        payload.update(dict(extra_payload))
+    _atomic_torch_save(payload, checkpoint_path)
+
+
+def _create_adamw_optimizer(
+    model: nn.Module,
+    config: ExperimentConfig,
+    device: torch.device,
+    *,
+    label: str,
+) -> torch.optim.AdamW:
+    """Create the canonical neural-training optimizer for every executor."""
+    if device.type == "cuda":
+        try:
+            optimizer = torch.optim.AdamW(
+                model.parameters(),
+                lr=config.training.learning_rate,
+                weight_decay=config.training.weight_decay,
+                fused=True,
+            )
+            print(f"[{label}] optimizer=AdamW(fused=True)")
+            return optimizer
+        except TypeError:
+            print(
+                f"[{label}] optimizer=AdamW(fused=False, unsupported by this torch build)"
+            )
+    return torch.optim.AdamW(
+        model.parameters(),
+        lr=config.training.learning_rate,
+        weight_decay=config.training.weight_decay,
     )
 
 
@@ -7830,7 +7978,21 @@ def _save_fold_output_artifacts(
     requested_mode = normalize_execution_mode(
         getattr(trading_config, "execution_mode", "naive")
     )
-    if requested_mode != "naive":
+    if requested_mode in {
+        *TW_MINUTE_EXECUTION_MODES,
+        *TW_DERIVATIVES_TICK_EXECUTION_MODES,
+    }:
+        if normalize_execution_mode(test_backtest.execution_mode) != requested_mode:
+            raise RuntimeError(
+                "specialized intraday artifact execution mode differs from "
+                "configured mode"
+            )
+        if test_integer_backtest is not None:
+            raise RuntimeError(
+                "specialized intraday artifacts come from their native event "
+                "ledger and must not attach a daily integer-share oracle"
+            )
+    elif requested_mode != "naive":
         if test_integer_backtest is None:
             raise RuntimeError(
                 f"{requested_mode} final artifacts require the exact integer-share oracle"
@@ -8078,6 +8240,15 @@ def _save_fold_output_artifacts(
     (fold_dir / "plot_timing.json").write_text(
         json.dumps(plot_timing, indent=2, ensure_ascii=False),
         encoding="utf-8",
+    )
+    # Every product publishes the same reporting-semantics filename.  Intraday
+    # adapters may immediately replace this base contract with a stricter
+    # dataset/executor fingerprint, but daily modes must no longer omit it.
+    from stockagent.training.mode_adapter import write_training_json
+
+    write_training_json(
+        fold_dir / "mode_artifact_contract.json",
+        canonical_mode_artifact_contract(requested_mode),
     )
     if mark_complete:
         _write_fold_complete_marker(fold_dir, fold_result, source="fold_output_artifacts")
@@ -17025,11 +17196,10 @@ def _run_training_tree_models(
     loss_objective = _normalize_risk_objective(config.training.loss_type)
     execution_runtime = _build_execution_runtime(panel, config, device)
 
-    for train_years_key, group_folds in tqdm(
+    for train_years_key, group_folds in _progress_bar(
         grouped_folds.items(),
         desc="Train groups",
         unit="group",
-        disable=not _interactive_progress_enabled(),
     ):
         train_years = list(train_years_key)
         pending_folds = [fold for fold in group_folds if fold.fold_id not in results_by_fold]
@@ -17488,6 +17658,77 @@ def _run_training_tree_models(
     return [results_by_fold[fold.fold_id] for fold in fold_list if fold.fold_id in results_by_fold]
 
 
+def run_training(
+    panel: PanelData,
+    folds: Iterable[WalkForwardFold],
+    config: ExperimentConfig,
+    output_dir: str | Path,
+    resume: bool = True,
+    profile_timing: bool = False,
+    deployment_folds: Iterable[WalkForwardFold] | None = None,
+) -> list[FoldResult]:
+    """Run the canonical trainer inside the cross-mode lifecycle contract."""
+
+    fold_list = list(folds)
+    deployment_fold_list = (
+        fold_list if deployment_folds is None else list(deployment_folds)
+    )
+    configuration = asdict(config)
+    dataset_identity = {
+        "dates": int(panel.num_dates),
+        "first_date": (
+            None if panel.num_dates == 0 else str(np.asarray(panel.dates[0]))
+        ),
+        "last_date": (
+            None if panel.num_dates == 0 else str(np.asarray(panel.dates[-1]))
+        ),
+        "symbols": int(panel.num_symbols),
+        "features": int(len(panel.feature_names)),
+        "symbol_names": [str(symbol) for symbol in panel.symbols],
+        "feature_names": [str(name) for name in panel.feature_names],
+    }
+    lifecycle = TrainingRunLifecycle(
+        output_dir,
+        execution_mode=config.trading.execution_mode,
+        run_mode="train",
+        strategy=str(
+            getattr(config.training, "multi_gpu_strategy", "none") or "none"
+        ),
+        model_name=config.training.model_name,
+        writer_enabled=_distributed_should_write(),
+    )
+    lifecycle.start(
+        fold_ids=[fold.fold_id for fold in fold_list],
+        dataset_fingerprint=_stable_fingerprint(dataset_identity),
+        configuration_fingerprint=_stable_fingerprint(configuration),
+        contract_versions={
+            "canonical_backtest": int(CANONICAL_BACKTEST_CONTRACT_VERSION),
+        },
+        data_summary=dataset_identity,
+        configuration=configuration,
+        mode_details={"benchmark_name": str(config.data.benchmark_name)},
+    )
+    try:
+        results = _run_training_impl(
+            panel,
+            fold_list,
+            config,
+            output_dir,
+            resume=resume,
+            profile_timing=profile_timing,
+            deployment_folds=deployment_fold_list,
+            lifecycle=lifecycle,
+        )
+    except BaseException as exc:
+        lifecycle.fail(exc)
+        raise
+    lifecycle.complete(
+        fold_ids=[result.fold_id for result in results],
+        message=f"completed {len(results)} fold(s)",
+    )
+    return results
+
+
 def _run_inference_tree_models(
     panel: PanelData,
     folds: Iterable[WalkForwardFold],
@@ -17513,12 +17754,7 @@ def _run_inference_tree_models(
     execution_runtime = _build_execution_runtime(panel, config, device)
 
     print(f"[inference] tree model={config.training.model_name} folds={len(fold_list)}")
-    for fold in tqdm(
-        fold_list,
-        desc="Inference folds",
-        unit="fold",
-        disable=not _interactive_progress_enabled(),
-    ):
+    for fold in _progress_bar(fold_list, desc="Inference folds", unit="fold"):
         fold_dir = _fold_dir(output_path, fold.fold_id)
         model_path = _model_path(fold_dir)
         if not model_path.exists():
@@ -17974,12 +18210,7 @@ def _run_inference_neural_models(
     next_fold_by_id = _next_fold_by_id(deployment_fold_list)
 
     print(f"[inference] model={config.training.model_name} folds={len(fold_list)} device={device}")
-    for fold in tqdm(
-        fold_list,
-        desc="Inference folds",
-        unit="fold",
-        disable=not _interactive_progress_enabled(),
-    ):
+    for fold in _progress_bar(fold_list, desc="Inference folds", unit="fold"):
         fold_dir = _fold_dir(output_path, fold.fold_id)
         model_file = _model_path(fold_dir)
         best_checkpoint_file = _best_checkpoint_path(fold_dir)
@@ -18529,7 +18760,7 @@ def run_inference(
 
 
 @_isolate_backtest_runtime_environment
-def run_training(
+def _run_training_impl(
     panel: PanelData,
     folds: Iterable[WalkForwardFold],
     config: ExperimentConfig,
@@ -18537,6 +18768,7 @@ def run_training(
     resume: bool = True,
     profile_timing: bool = False,
     deployment_folds: Iterable[WalkForwardFold] | None = None,
+    lifecycle: TrainingRunLifecycle | None = None,
 ) -> list[FoldResult]:
     fold_list_for_run = list(folds)
     deployment_fold_list_for_run = (
@@ -18835,6 +19067,21 @@ def run_training(
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
     experiment_manifest = _checkpoint_manifest(panel, config)
+    if lifecycle is not None:
+        lifecycle.update_manifest(
+            dataset_fingerprint=str(
+                experiment_manifest.get("fingerprints", {}).get("data", "")
+            ),
+            configuration_fingerprint=str(
+                experiment_manifest.get("configuration_fingerprint", "")
+            ),
+            contract_versions={
+                "checkpoint_manifest_schema": int(
+                    experiment_manifest.get("schema_version", 0)
+                ),
+                "canonical_backtest": int(CANONICAL_BACKTEST_CONTRACT_VERSION),
+            },
+        )
 
     results_by_fold: dict[int, FoldResult] = {}
     fold_list = list(folds)
@@ -18941,13 +19188,21 @@ def run_training(
     )
     os.environ["STOCKAGENT_TW_COMPILE_SYMBOL_MAX"] = str(dynamic_loss_symbol_max)
 
-    for train_years_key, group_folds in tqdm(
-        grouped_folds.items(),
-        desc="Train groups",
-        unit="group",
-        disable=not _interactive_progress_enabled(),
+    grouped_fold_items = list(grouped_folds.items())
+    for group_index, (train_years_key, group_folds) in enumerate(
+        _progress_bar(grouped_fold_items, desc="Train groups", unit="group"),
+        start=1,
     ):
         train_years = list(train_years_key)
+        if lifecycle is not None:
+            lifecycle.start_group(
+                group_name=_group_id(train_years),
+                group_index=group_index,
+                group_total=len(grouped_fold_items),
+                fold_ids=[fold.fold_id for fold in group_folds],
+                epoch_total=int(config.training.epochs),
+                message=f"Train {train_years}",
+            )
         group_checkpoint_path = _group_checkpoint_path(output_path, train_years)
         group_curve_path = _group_curve_path(output_path, train_years)
         pending_folds = [fold for fold in group_folds if fold.fold_id not in results_by_fold]
@@ -18980,6 +19235,9 @@ def run_training(
                 f"completed_group_{_group_id(train_years)}_postprocess",
                 completed_postprocess_error,
             )
+            if lifecycle is not None:
+                for fold in group_folds:
+                    lifecycle.finish_fold(fold.fold_id)
             continue
 
         loss_contract_error: BaseException | None = None
@@ -19416,28 +19674,12 @@ def run_training(
                 )
         compiled_loss_fn: Callable[..., torch.Tensor] = partial(risk_aware_loss, **risk_loss_kwargs)
 
-        if device.type == "cuda":
-            try:
-                optimizer = torch.optim.AdamW(
-                    model.parameters(),
-                    lr=config.training.learning_rate,
-                    weight_decay=config.training.weight_decay,
-                    fused=True,
-                )
-                print(f"[Train {train_years}] optimizer=AdamW(fused=True)")
-            except TypeError:
-                optimizer = torch.optim.AdamW(
-                    model.parameters(),
-                    lr=config.training.learning_rate,
-                    weight_decay=config.training.weight_decay,
-                )
-                print(f"[Train {train_years}] optimizer=AdamW(fused=False, unsupported by this torch build)")
-        else:
-            optimizer = torch.optim.AdamW(
-                model.parameters(),
-                lr=config.training.learning_rate,
-                weight_decay=config.training.weight_decay,
-            )
+        optimizer = _create_adamw_optimizer(
+            model,
+            config,
+            device,
+            label=f"Train {train_years}",
+        )
         scaler = GradScaler(enabled=device.type == "cuda" and amp_dtype == torch.float16)
         train_steps_per_epoch = _estimate_train_steps_per_epoch(
             train_windowed=train_windowed,
@@ -19513,33 +19755,30 @@ def run_training(
             print(f"[Train {train_years}] checkpoint already reached epoch {config.training.epochs}; evaluating only")
 
         record_epoch_curve = bool(getattr(config.training, "record_epoch_curve", True))
+        curve_lifecycle = _EpochCurveLifecycle(
+            group_curve_path,
+            enabled=record_epoch_curve,
+            interval=int(config.training.curve_plot_interval),
+            async_enabled=bool(config.training.curve_plot_async),
+            defer_until_end=bool(
+                getattr(config.training, "defer_epoch_curve_plot_until_end", True)
+            ),
+            writer_enabled=_distributed_should_write(),
+        )
         if record_epoch_curve:
             curve_trim_error: BaseException | None = None
             try:
-                if _distributed_should_write():
-                    _trim_group_curve(group_curve_path, start_epoch)
+                curve_lifecycle.prepare_resume(start_epoch)
             except BaseException as exc:
                 curve_trim_error = exc
             _raise_if_distributed_phase_failed(
                 "resume_epoch_curve_trim",
                 curve_trim_error,
             )
-            curve_plotter: _AsyncEpochCurvePlotter | None = (
-                _AsyncEpochCurvePlotter(
-                    group_curve_path,
-                    interval=int(config.training.curve_plot_interval),
-                    async_enabled=bool(config.training.curve_plot_async),
-                )
-                if _distributed_should_write()
-                else None
-            )
         else:
-            curve_plotter = None
             print(f"[Train {train_years}] epoch curve recording disabled")
         run_epoch_test_curve = bool(getattr(config.training, "epoch_test_curve", True))
-        defer_epoch_curve_plot_until_end = bool(
-            getattr(config.training, "defer_epoch_curve_plot_until_end", True)
-        )
+        defer_epoch_curve_plot_until_end = curve_lifecycle.defer_until_end
         if not run_epoch_test_curve:
             print(f"[Train {train_years}] epoch-level test curve disabled; final test runs after training")
         if defer_epoch_curve_plot_until_end:
@@ -19557,9 +19796,7 @@ def run_training(
             start_t = time.perf_counter()
             curve_error: BaseException | None = None
             try:
-                _append_group_curve(group_curve_path, payload)
-                if request_plot and not defer_epoch_curve_plot_until_end and curve_plotter is not None:
-                    curve_plotter.request()
+                curve_lifecycle.record(payload, request_plot=request_plot)
             except BaseException as exc:
                 curve_error = exc
             _raise_if_distributed_phase_failed(
@@ -20610,12 +20847,11 @@ def run_training(
             "pre_epoch_total",
             next_epoch=int(start_epoch),
         )
-        epoch_pbar = tqdm(
+        epoch_pbar = _progress_bar(
             range(start_epoch, config.training.epochs + 1),
             desc=" Epochs",
+            unit="epoch",
             leave=True,
-            dynamic_ncols=True,
-            disable=not _interactive_progress_enabled(),
         )
         val_backtest: BacktestResultTensor | None = None
         test_mean_best_by_val: float | None = None
@@ -20977,6 +21213,20 @@ def run_training(
             epoch_start = time.perf_counter()
             epoch_compile_before = _dynamo_compile_counter_snapshot()
             last_epoch = epoch
+            if lifecycle is not None:
+                lifecycle.set_phase(
+                    "training",
+                    fold_id=(
+                        pending_folds[0].fold_id
+                        if len(pending_folds) == 1
+                        else None
+                    ),
+                    epoch=int(epoch),
+                    epoch_total=int(config.training.epochs),
+                    work_total=int(len(train_ds)),
+                    work_unit="window",
+                    message=f"Train {train_years} epoch {epoch}",
+                )
             get_backtest_compile_stats(reset=True)
             get_backtest_prep_compile_stats(reset=True)
             get_backtest_runtime_stats(reset=True)
@@ -21106,9 +21356,35 @@ def run_training(
                         f"Train {train_years} epoch {epoch} curve_record",
                         TimingBreakdown(plot_s=curve_record_total, total_s=curve_record_total),
                     )
+                if lifecycle is not None:
+                    lifecycle.finish_epoch(
+                        epoch=int(epoch),
+                        epoch_total=int(config.training.epochs),
+                        metrics={
+                            "train_loss": train_loss,
+                            "val_mean": None,
+                            "test_mean": test_mean_best_by_val,
+                            "best_val_loss": min(
+                                context.best_val_loss
+                                for context in fold_contexts.values()
+                            ),
+                            "no_improve": no_improve_epochs,
+                            "lr": optimizer.param_groups[0]["lr"],
+                            "epoch_total_s": time.perf_counter() - epoch_start,
+                        },
+                    )
                 continue
 
             val_losses: list[float] = []
+            if lifecycle is not None:
+                lifecycle.set_phase(
+                    "validation",
+                    epoch=int(epoch),
+                    epoch_total=int(config.training.epochs),
+                    work_total=int(len(fold_contexts)),
+                    work_unit="fold",
+                    message=f"Validate {train_years} epoch {epoch}",
+                )
             val_ics: list[float] = []
             any_fold_improved = False
             fold_ckpt_total = 0.0
@@ -21712,6 +21988,23 @@ def run_training(
                         f"Train {train_years} epoch {epoch} curve_record",
                         TimingBreakdown(plot_s=curve_record_total, total_s=curve_record_total),
                     )
+                if lifecycle is not None:
+                    lifecycle.finish_epoch(
+                        epoch=int(epoch),
+                        epoch_total=int(config.training.epochs),
+                        metrics={
+                            "train_loss": train_loss,
+                            "val_mean": val_mean_loss,
+                            "test_mean": test_mean_best_by_val,
+                            "best_val_loss": min(
+                                context.best_val_loss
+                                for context in fold_contexts.values()
+                            ),
+                            "no_improve": no_improve_epochs,
+                            "lr": optimizer.param_groups[0]["lr"],
+                            "epoch_total_s": time.perf_counter() - epoch_start,
+                        },
+                    )
 
                 if early_stop_patience > 0 and no_improve_epochs >= early_stop_patience:
                     print(
@@ -21751,12 +22044,7 @@ def run_training(
         curve_flush_error: BaseException | None = None
         try:
             curve_flush_start = time.perf_counter()
-            curve_plot_timing: dict[str, float | int | str] = {}
-            if curve_plotter is not None:
-                if defer_epoch_curve_plot_until_end:
-                    curve_plot_timing = _run_epoch_curve_plot_once(group_curve_path, curve_plot_request_interval)
-                else:
-                    curve_plotter.flush()
+            curve_plot_timing = curve_lifecycle.flush()
             curve_flush_total = time.perf_counter() - curve_flush_start
             if profile_timing and curve_flush_total > 0.0:
                 _log_timing(
@@ -22122,6 +22410,10 @@ def run_training(
         except BaseException as exc:
             final_artifact_error = exc
         final_artifact_sync.finish(final_artifact_error)
+        if lifecycle is not None and _distributed_should_write():
+            for fold in group_folds:
+                if fold.fold_id in results_by_fold:
+                    lifecycle.finish_fold(fold.fold_id)
 
         if config.training.warm_start_from_previous_fold:
             warm_start_checkpoint_path = group_checkpoint_path

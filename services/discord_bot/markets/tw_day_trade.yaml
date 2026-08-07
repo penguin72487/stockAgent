@@ -10,6 +10,7 @@ data_ready_time: "13:40"
 freshness_max_lag_days: 3
 freshness_scan_limit: 0
 holidays: []
+initial_capital: 10000000.0
 
 # Data is shared with the other TW modes. There is no independent automatic
 # broadcast schedule; users opt in through /watch or request /signal_now.

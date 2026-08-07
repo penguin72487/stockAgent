@@ -432,6 +432,19 @@ Rules:
   DataLoader or single-process multi-GPU executor.
 - The loss path is canonical `risk_aware_loss` plus `run_backtest_torch`; compile it
   when useful, but do not add an alternate return formula.
+- Keep `tw_minute` and TX/TXO tick training sessions in strict chronological
+  order; do not shuffle the day axis. The canonical progress UI reports
+  processed sessions and optimizer batches, while `batch_date` is only an audit
+  field. A sample-order change alters the optimizer trajectory and must
+  invalidate resume.
+- Every neural product/frequency runner must use
+  `stockagent.training.lifecycle`: one `TrainingArtifactLayout`, root
+  `run_manifest.json`, fixed-envelope `progress.json`, normalized flat
+  `epoch_curve.jsonl`, and canonical fold `mode_artifact_contract.json`.
+  Compatibility manifest filenames may mirror the canonical manifest but must
+  not evolve a second schema. A completed mode smoke test must pass
+  `validate_completed_training_artifacts`; mode-specific details belong in
+  namespaced checkpoint state and prefixed metrics, not new outer files.
 - Market configs default to `training.multi_gpu_strategy: auto`: use the
   canonical single-device executor with one visible GPU and automatically
   relaunch torchrun/DDP with two or more visible GPUs. GPU visibility and

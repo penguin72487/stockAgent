@@ -310,11 +310,19 @@ def _parse_tpex_monthly_ods(
     rows = _ods_cell_rows(content)
     nonempty = [row for row in rows if row and any(_compact_cell(value) for value in row)]
     expected_event = TPEX_MONTHLY_REPORT_TYPES[report_type]
-    expected_title = f"{month}月{'除權' if report_type == 6 else '除息'}交易股票一覽表"
-    if not nonempty or _compact_cell(nonempty[0][0]) != expected_title:
-        actual = _compact_cell(nonempty[0][0]) if nonempty else ""
+    title_suffix = f"{'除權' if report_type == 6 else '除息'}交易股票一覽表"
+    roc_year = year - 1911
+    expected_titles = {
+        f"{month}月{title_suffix}",
+        f"{month:02d}月{title_suffix}",
+        f"{roc_year}年{month}月{title_suffix}",
+        f"{roc_year}年{month:02d}月{title_suffix}",
+    }
+    actual_title = _compact_cell(nonempty[0][0]) if nonempty else ""
+    if actual_title not in expected_titles:
         raise MonthlyDocumentIdentityError(
-            f"TPEx monthly doc={document_id} expected title {expected_title!r}, got {actual!r}"
+            f"TPEx monthly doc={document_id} expected title in "
+            f"{sorted(expected_titles)!r}, got {actual_title!r}"
         )
 
     expected_header = (
@@ -675,6 +683,7 @@ def _tpex_event_candidates(
     *,
     start: date = TPEX_HISTORICAL_GAP_START,
     end: date = TPEX_HISTORICAL_GAP_END,
+    require_complete_previous_close: bool = True,
 ) -> list[dict[str, Any]]:
     required = {"date", "代號", "名稱", "收盤", "漲跌"}
     missing = sorted(required - set(frame.columns))
@@ -750,10 +759,16 @@ def _tpex_event_candidates(
         | ~pl.col("previous_close").is_finite()
         | (pl.col("previous_close") <= 0)
     )
-    if invalid.height:
+    if invalid.height and require_complete_previous_close:
         raise ValueError(
             "TPEx monthly fallback event keys lack a positive prior official close: "
             f"{invalid.select('date', 'symbol').head(20)}"
+        )
+    if invalid.height:
+        events = events.join(
+            invalid.select("date", "symbol"),
+            on=["date", "symbol"],
+            how="anti",
         )
     return events.to_dicts()
 
@@ -967,6 +982,7 @@ def _resolve_tpex_monthly_rows(
         ),
         "normalized_name_alias_keys": len(normalized_name_alias_keys),
         "unresolved_keys": len(unresolved_keys),
+        "unresolved_months": sorted({label[:7] for label in unresolved_keys}),
         "annual_archive_examples": archive_keys[:20],
         "previous_daily_next_reference_examples": direct_keys[:20],
         "monthly_report_examples": monthly_keys[:20],
@@ -1010,6 +1026,23 @@ def main() -> None:
         )
     else:
         request_start_year = int(args.start_year)
+    coverage_start_year = (
+        min(
+            int(previous_summary.get("coverage_start_year", request_start_year)),
+            request_start_year,
+        )
+        if args.mode != "rebuild" and previous_summary
+        else request_start_year
+    )
+    preserved_existing: pl.DataFrame | None = None
+    if args.mode != "rebuild" and output_path.exists():
+        preserved_existing = pl.read_parquet(output_path)
+        if not preserved_existing.is_empty():
+            requested_start = date(request_start_year, 1, 1)
+            existing_date = pl.col("date").cast(pl.Date, strict=False)
+            preserved_existing = preserved_existing.filter(
+                (existing_date < requested_start) | (existing_date > end_date)
+            )
     tasks: list[tuple[str, int]] = []
     for market, first_year in (("twse", 2003), ("tpex", 2000)):
         tasks.extend(
@@ -1040,6 +1073,7 @@ def main() -> None:
         "unrecoverable_daily_name_exception_keys": 0,
         "normalized_name_alias_keys": 0,
         "unresolved_keys": 0,
+        "unresolved_months": [],
         "annual_archive_examples": [],
         "previous_daily_next_reference_examples": [],
         "monthly_report_examples": [],
@@ -1049,28 +1083,76 @@ def main() -> None:
         "unresolved_examples": [],
     }
     tpex_daily_receipt: dict[str, Any] | None = None
-    requested_start_date = date(request_start_year, 1, 1)
-    monthly_start = max(requested_start_date, TPEX_HISTORICAL_GAP_START)
-    monthly_end = min(end_date, TPEX_HISTORICAL_GAP_END)
-    if monthly_start <= monthly_end:
+    requested_start_date = date(coverage_start_year, 1, 1)
+    monthly_requested_months: list[str] = []
+    monthly_start: date | None = None
+    monthly_end: date | None = None
+    if requested_start_date <= end_date:
+        tpex_daily_path = args.output_dir / "tpex_daily_ohlcv.parquet"
+        if not tpex_daily_path.is_file():
+            raise FileNotFoundError(
+                "TPEx monthly corporate-action fallback requires "
+                f"the official daily parquet: {tpex_daily_path}"
+            )
+        tpex_daily_receipt = _file_receipt(tpex_daily_path)
+        candidates = _tpex_event_candidates(
+            pl.read_parquet(tpex_daily_path),
+            start=requested_start_date,
+            end=end_date,
+            require_complete_previous_close=False,
+        )
+        resolution_rows = list(rows)
+        if preserved_existing is not None and not preserved_existing.is_empty():
+            resolution_rows.extend(preserved_existing.to_dicts())
+        resolved_tpex_keys = {
+            (row.get("date"), str(row.get("symbol", "")))
+            for row in resolution_rows
+            if str(row.get("market", "")).lower() == "tpex"
+            and _price_key(row.get("reference_price")) is not None
+        }
+        unresolved_candidates = [
+            candidate
+            for candidate in candidates
+            if (candidate.get("date"), str(candidate.get("symbol", "")))
+            not in resolved_tpex_keys
+        ]
+        _, unresolved_stats = _resolve_tpex_monthly_rows(
+            unresolved_candidates,
+            [],
+            [],
+        )
+        monthly_requested_months = list(unresolved_stats["unresolved_months"])
+        if monthly_requested_months:
+            first_year, first_month = map(int, monthly_requested_months[0].split("-"))
+            last_year, last_month = map(int, monthly_requested_months[-1].split("-"))
+            monthly_start = date(first_year, first_month, 1)
+            monthly_end = date(
+                last_year,
+                last_month,
+                monthrange(last_year, last_month)[1],
+            )
         monthly_tasks = [
             (year, month, report_type)
-            for year, month in _iter_months(monthly_start, monthly_end)
+            for requested_month in monthly_requested_months
+            for year, month in [
+                (int(requested_month[:4]), int(requested_month[5:7]))
+            ]
             for report_type in sorted(TPEX_MONTHLY_REPORT_TYPES)
         ]
-        with ThreadPoolExecutor(max_workers=max(1, int(args.workers))) as executor:
-            futures = {
-                executor.submit(
-                    _fetch_tpex_monthly_document,
-                    year,
-                    month,
-                    report_type,
-                    args,
-                ): (year, month, report_type)
-                for year, month, report_type in monthly_tasks
-            }
-            for future in as_completed(futures):
-                monthly_results.append(future.result())
+        if monthly_tasks:
+            with ThreadPoolExecutor(max_workers=max(1, int(args.workers))) as executor:
+                futures = {
+                    executor.submit(
+                        _fetch_tpex_monthly_document,
+                        year,
+                        month,
+                        report_type,
+                        args,
+                    ): (year, month, report_type)
+                    for year, month, report_type in monthly_tasks
+                }
+                for future in as_completed(futures):
+                    monthly_results.append(future.result())
         monthly_results.sort(key=lambda result: (result.year, result.month, result.report_type))
         monthly_failures = [result for result in monthly_results if result.status == "failed"]
         if monthly_failures:
@@ -1086,23 +1168,11 @@ def main() -> None:
                 for result in monthly_failures
             ]
             raise RuntimeError(f"TPEx monthly corporate-action requests failed: {report[:10]}")
-        tpex_daily_path = args.output_dir / "tpex_daily_ohlcv.parquet"
-        if not tpex_daily_path.is_file():
-            raise FileNotFoundError(
-                "TPEx monthly corporate-action fallback requires "
-                f"the official daily parquet: {tpex_daily_path}"
-            )
-        tpex_daily_receipt = _file_receipt(tpex_daily_path)
-        candidates = _tpex_event_candidates(
-            pl.read_parquet(tpex_daily_path),
-            start=monthly_start,
-            end=monthly_end,
-        )
         monthly_rows = [row for result in monthly_results for row in result.rows]
         fallback_rows, monthly_stats = _resolve_tpex_monthly_rows(
-            candidates,
+            unresolved_candidates,
             monthly_rows,
-            rows,
+            [],
         )
         if int(monthly_stats["unresolved_keys"]) != 0:
             raise RuntimeError(
@@ -1136,23 +1206,17 @@ def main() -> None:
             .unique(["date", "symbol"], keep="first", maintain_order=True)
             .drop("_has_reference")
         )
-    if args.mode != "rebuild" and output_path.exists():
-        existing = pl.read_parquet(output_path)
-        if not existing.is_empty():
-            requested_start = date(request_start_year, 1, 1)
-            existing_date = pl.col("date").cast(pl.Date, strict=False)
-            existing = existing.filter(
-                (existing_date < requested_start) | (existing_date > end_date)
+    if preserved_existing is not None and not preserved_existing.is_empty():
+        existing = preserved_existing
+        frame = (
+            existing
+            if frame.is_empty()
+            else pl.concat([existing, frame], how="diagonal_relaxed")
+        )
+        if not frame.is_empty():
+            frame = frame.sort(["date", "symbol"]).unique(
+                ["date", "symbol"], keep="last", maintain_order=True
             )
-            frame = (
-                existing
-                if frame.is_empty()
-                else pl.concat([existing, frame], how="diagonal_relaxed")
-            )
-            if not frame.is_empty():
-                frame = frame.sort(["date", "symbol"]).unique(
-                    ["date", "symbol"], keep="last", maintain_order=True
-                )
     handle = tempfile.NamedTemporaryFile(
         prefix=f".{output_path.name}.", suffix=".tmp", dir=output_path.parent, delete=False
     )
@@ -1191,15 +1255,11 @@ def main() -> None:
         for receipt in result.raw_receipts
     ]
     summary = {
-        "schema_version": 3,
+        "schema_version": 4,
         "generated_at_utc": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
         "mode": args.mode,
         "requested_start_year": request_start_year,
-        "coverage_start_year": (
-            min(int(previous_summary.get("coverage_start_year", request_start_year)), request_start_year)
-            if args.mode != "rebuild" and previous_summary
-            else request_start_year
-        ),
+        "coverage_start_year": coverage_start_year,
         "baseline_established": baseline_established,
         "coverage_complete": baseline_established
         and int(monthly_stats["unresolved_keys"]) == 0,
@@ -1227,8 +1287,13 @@ def main() -> None:
                     "only official_receipt_name_bytes_unrecoverable may use a unique "
                     "date/price/receipt match; type=6/7 duplicates must agree"
                 ),
-                "requested_start": str(monthly_start) if monthly_start <= monthly_end else None,
-                "requested_end": str(monthly_end) if monthly_start <= monthly_end else None,
+                "selection_contract": (
+                    "query only event months unresolved by the annual official archive "
+                    "and prior-session official next-reference field"
+                ),
+                "requested_months": monthly_requested_months,
+                "requested_start": str(monthly_start) if monthly_start is not None else None,
+                "requested_end": str(monthly_end) if monthly_end is not None else None,
                 "documents": monthly_documents,
                 "parsed_document_count": sum(
                     result.status == "parsed" for result in monthly_results

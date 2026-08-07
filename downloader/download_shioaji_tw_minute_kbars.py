@@ -4,11 +4,13 @@ import argparse
 from dataclasses import asdict
 from datetime import date, datetime, timedelta, timezone
 import math
+import multiprocessing as mp
 import os
 from pathlib import Path
+from queue import Empty
 import sys
 import time
-from typing import Any
+from typing import Any, Callable
 
 import polars as pl
 
@@ -31,7 +33,6 @@ from downloader.download_shioaji_tw_kbars import (  # noqa: E402
     _read_json,
     _sha256,
     _taiwan_market_hours_now,
-    _usage_values,
     iter_date_chunks,
     normalize_kbars,
 )
@@ -41,10 +42,220 @@ STORAGE_FREQUENCY = "minute"
 RECEIPT_SCHEMA_VERSION = 1
 MANIFEST_SCHEMA_VERSION = 1
 DEFAULT_CHUNK_DAYS = 29
+MINUTE_SESSION_START = 9 * 60 + 1
+MINUTE_SESSION_END = 13 * 60 + 30
+SHIOAJI_QUOTE_LIMIT_REQUESTS = 50
+SHIOAJI_QUOTE_LIMIT_WINDOW_SECONDS = 5.0
+SHIOAJI_MAX_CONNECTIONS = 5
+DEFAULT_WORKERS = SHIOAJI_MAX_CONNECTIONS
+DEFAULT_REQUESTS_PER_SECOND = (
+    SHIOAJI_QUOTE_LIMIT_REQUESTS / SHIOAJI_QUOTE_LIMIT_WINDOW_SECONDS
+)
 
 
 class MarketHoursReached(RuntimeError):
     """Pause a long historical run before it competes with live quote capture."""
+
+
+class DownloadStopRequested(RuntimeError):
+    """Another parallel worker reached a global stop condition."""
+
+
+class SharedRequestRateLimiter:
+    """Process-shared paced limiter with a strict sliding-window ceiling.
+
+    The documented Shioaji quote-query guard is account-wide, so every worker,
+    retry, and single-day fallback must acquire from this one limiter. Pacing
+    avoids a 50-request burst while the ring buffer also guarantees that no
+    sliding five-second window contains more than 50 request starts.
+    """
+
+    def __init__(
+        self,
+        context: Any,
+        *,
+        requests_per_second: float,
+        max_requests: int = SHIOAJI_QUOTE_LIMIT_REQUESTS,
+        window_seconds: float = SHIOAJI_QUOTE_LIMIT_WINDOW_SECONDS,
+    ) -> None:
+        rate = float(requests_per_second)
+        maximum = int(max_requests)
+        window = float(window_seconds)
+        if rate <= 0.0:
+            raise ValueError("requests_per_second must be positive")
+        if maximum <= 0 or window <= 0.0:
+            raise ValueError("rate-limit window must be positive")
+        if rate > maximum / window + 1e-12:
+            raise ValueError(
+                "requests_per_second exceeds the sliding-window ceiling: "
+                f"rate={rate} ceiling={maximum / window}"
+            )
+        self.requests_per_second = rate
+        self.max_requests = maximum
+        self.window_seconds = window
+        self._interval_seconds = 1.0 / rate
+        self._lock = context.Lock()
+        self._timestamps = context.Array("d", maximum, lock=False)
+        self._head = context.Value("i", 0, lock=False)
+        self._count = context.Value("i", 0, lock=False)
+        self._next_start = context.Value("d", 0.0, lock=False)
+        self._total = context.Value("q", 0, lock=False)
+        self._first_start = context.Value("d", 0.0, lock=False)
+        self._last_start = context.Value("d", 0.0, lock=False)
+
+    def _prune_locked(self, now: float) -> None:
+        while self._count.value > 0:
+            oldest = self._timestamps[self._head.value]
+            if now - oldest < self.window_seconds:
+                break
+            self._head.value = (self._head.value + 1) % self.max_requests
+            self._count.value -= 1
+
+    def acquire(self, stop_event: Any | None = None) -> float:
+        with self._lock:
+            if stop_event is not None and stop_event.is_set():
+                raise DownloadStopRequested("parallel stop requested")
+            now = time.monotonic()
+            self._prune_locked(now)
+            target = max(now, self._next_start.value)
+            if self._count.value >= self.max_requests:
+                oldest = self._timestamps[self._head.value]
+                target = max(target, oldest + self.window_seconds)
+            delay = max(0.0, target - now)
+            if delay > 0.0:
+                if stop_event is not None:
+                    if stop_event.wait(delay):
+                        raise DownloadStopRequested("parallel stop requested")
+                else:
+                    time.sleep(delay)
+            started = time.monotonic()
+            self._prune_locked(started)
+            if self._count.value >= self.max_requests:
+                # Monotonic-clock rounding can leave the oldest timestamp a few
+                # nanoseconds inside the window. Wait it out rather than exceed
+                # the documented account-wide boundary.
+                oldest = self._timestamps[self._head.value]
+                residual = max(0.0, oldest + self.window_seconds - started)
+                if residual > 0.0:
+                    if stop_event is not None:
+                        if stop_event.wait(residual):
+                            raise DownloadStopRequested("parallel stop requested")
+                    else:
+                        time.sleep(residual)
+                    started = time.monotonic()
+                    self._prune_locked(started)
+            slot = (self._head.value + self._count.value) % self.max_requests
+            self._timestamps[slot] = started
+            self._count.value += 1
+            self._next_start.value = started + self._interval_seconds
+            self._total.value += 1
+            if self._first_start.value <= 0.0:
+                self._first_start.value = started
+            self._last_start.value = started
+            return started
+
+    def snapshot(self) -> dict[str, float | int]:
+        with self._lock:
+            now = time.monotonic()
+            self._prune_locked(now)
+            total = int(self._total.value)
+            first = float(self._first_start.value)
+            last = float(self._last_start.value)
+            elapsed = max(0.0, last - first)
+            return {
+                "total_requests": total,
+                "requests_in_window": int(self._count.value),
+                "window_seconds": self.window_seconds,
+                "window_rps": float(self._count.value) / self.window_seconds,
+                "overall_rps": (
+                    float(total - 1) / elapsed if total > 1 and elapsed > 0.0 else 0.0
+                ),
+            }
+
+
+class SharedDownloadCounters:
+    def __init__(self, context: Any) -> None:
+        self._lock = context.Lock()
+        self.processed_chunks = context.Value("q", 0, lock=False)
+        self.queried_chunks = context.Value("q", 0, lock=False)
+        self.skipped_empty_chunks = context.Value("q", 0, lock=False)
+
+    def record_chunk(self, *, query_performed: bool) -> dict[str, int]:
+        with self._lock:
+            self.processed_chunks.value += 1
+            if query_performed:
+                self.queried_chunks.value += 1
+            else:
+                self.skipped_empty_chunks.value += 1
+            return self.snapshot_locked()
+
+    def snapshot_locked(self) -> dict[str, int]:
+        return {
+            "processed_chunks": int(self.processed_chunks.value),
+            "queried_chunks": int(self.queried_chunks.value),
+            "skipped_empty_chunks": int(self.skipped_empty_chunks.value),
+        }
+
+    def snapshot(self) -> dict[str, int]:
+        with self._lock:
+            return self.snapshot_locked()
+
+
+class SharedTrafficBudgetGuard:
+    """Serialize and cache the account-wide traffic check across workers."""
+
+    def __init__(
+        self,
+        context: Any,
+        *,
+        max_fraction: float,
+        reserve_bytes: int,
+        check_interval_seconds: float,
+    ) -> None:
+        self.max_fraction = float(max_fraction)
+        self.reserve_bytes = int(reserve_bytes)
+        self.check_interval_seconds = float(check_interval_seconds)
+        self._lock = context.Lock()
+        self._last_check = context.Value("d", 0.0, lock=False)
+        self._used = context.Value("q", -1, lock=False)
+        self._limit = context.Value("q", -1, lock=False)
+
+    def check(self, api: Any) -> tuple[int, int] | None:
+        with self._lock:
+            now = time.monotonic()
+            if (
+                self._last_check.value > 0.0
+                and now - self._last_check.value < self.check_interval_seconds
+            ):
+                return self.last_usage_locked()
+            used, limit = _check_traffic_budget(
+                api,
+                max_fraction=self.max_fraction,
+                reserve_bytes=self.reserve_bytes,
+            )
+            self._used.value = used
+            self._limit.value = limit
+            self._last_check.value = now
+            return used, limit
+
+    def last_usage_locked(self) -> tuple[int, int] | None:
+        if self._used.value < 0 or self._limit.value <= 0:
+            return None
+        return int(self._used.value), int(self._limit.value)
+
+    def last_usage(self) -> tuple[int, int] | None:
+        with self._lock:
+            return self.last_usage_locked()
+
+
+def _emit_worker_log(message: str) -> None:
+    """Write one worker line atomically when stdout is a systemd/tee pipe."""
+
+    payload = (str(message).rstrip("\n") + "\n").encode("utf-8", errors="replace")
+    try:
+        os.write(sys.stdout.fileno(), payload)
+    except (AttributeError, OSError, ValueError):
+        print(message, flush=True)
 
 
 def query_minute_chunk(
@@ -59,60 +270,148 @@ def query_minute_chunk(
     retries: int,
     retry_backoff: float,
     expected_dates: set[date],
-) -> tuple[pl.DataFrame, int]:
-    """Query one chunk and remove only Shioaji's all-zero placeholder bars."""
+    request_started: Callable[[], None] | None = None,
+) -> tuple[pl.DataFrame, dict[str, Any]]:
+    """Query one chunk and retain only causal regular-session minute bars.
+
+    Shioaji can include rows outside the public point-in-time lifecycle,
+    after-hours 15:00 batches, and negative volume/amount correction rows in a
+    historical KBar response. None is executable regular-session liquidity.
+    They are removed with explicit receipt counters; every other malformed row
+    still fails closed in ``normalize_kbars``.
+    """
+
+    def clean_payload(payload: Any) -> tuple[pl.DataFrame, dict[str, int]]:
+        values = _payload_dict(payload)
+        required = ("ts", "Open", "High", "Low", "Close", "Volume", "Amount")
+        missing = [name for name in required if name not in values]
+        if missing:
+            raise ValueError(f"Shioaji Kbars payload is missing fields: {missing}")
+        lengths = {name: len(values[name]) for name in required}
+        if len(set(lengths.values())) != 1:
+            raise ValueError(f"Shioaji Kbars fields have different lengths: {lengths}")
+        if not lengths["ts"]:
+            return normalize_kbars(
+                values,
+                symbol=row.symbol,
+                market=row.market,
+                contract_unit=contract_unit,
+            ), {
+                "zero_placeholder_rows_dropped": 0,
+                "negative_correction_rows_dropped": 0,
+                "out_of_session_rows_dropped": 0,
+                "outside_reference_date_rows_dropped": 0,
+            }
+
+        raw = pl.DataFrame({name: values[name] for name in required}).with_columns(
+            pl.col("ts").cast(pl.Datetime("ns"), strict=False),
+            *[
+                pl.col(name).cast(pl.Float64, strict=False).fill_nan(None).alias(name)
+                for name in ("Open", "High", "Low", "Close", "Volume", "Amount")
+            ],
+        )
+        reference_dates = sorted(expected_dates)
+        outside_reference_date = (
+            pl.col("ts").is_not_null()
+            & ~pl.col("ts").cast(pl.Date).is_in(reference_dates)
+        ).fill_null(True)
+        all_zero_placeholder = pl.all_horizontal(
+            *[(pl.col(name) == 0.0) for name in required[1:]]
+        ).fill_null(False)
+        # A negative trade quantity or amount cannot be executable liquidity.
+        # Historical correction rows are not uniform: some have zero/partial
+        # prices, and some negate only one of Volume/Amount. Requiring a valid
+        # price plus two negative fields leaves those corrections in the alpha
+        # dataset and causes an otherwise repairable symbol to fail closed.
+        negative_correction = (
+            (pl.col("Volume") < 0.0) | (pl.col("Amount") < 0.0)
+        ).fill_null(False)
+        minute_of_day = pl.col("ts").dt.hour().cast(pl.Int16) * 60 + pl.col(
+            "ts"
+        ).dt.minute().cast(pl.Int16)
+        out_of_session = (
+            pl.col("ts").is_not_null()
+            & (
+                (minute_of_day < MINUTE_SESSION_START)
+                | (minute_of_day > MINUTE_SESSION_END)
+            )
+        ).fill_null(False)
+        stats = {
+            "outside_reference_date_rows_dropped": raw.filter(
+                outside_reference_date
+            ).height,
+            "zero_placeholder_rows_dropped": raw.filter(
+                ~outside_reference_date & all_zero_placeholder
+            ).height,
+            "negative_correction_rows_dropped": raw.filter(
+                ~outside_reference_date
+                & ~all_zero_placeholder
+                & negative_correction
+            ).height,
+            "out_of_session_rows_dropped": raw.filter(
+                ~outside_reference_date
+                & ~all_zero_placeholder
+                & ~negative_correction
+                & out_of_session
+            ).height,
+        }
+        cleaned = raw.filter(
+            ~outside_reference_date
+            & ~all_zero_placeholder
+            & ~negative_correction
+            & ~out_of_session
+        )
+        frame = normalize_kbars(
+            cleaned.to_dict(as_series=False),
+            symbol=row.symbol,
+            market=row.market,
+            contract_unit=contract_unit,
+        )
+        return frame, stats
 
     last_error: Exception | None = None
     for attempt in range(max(0, retries) + 1):
         try:
+            if request_started is not None:
+                request_started()
             payload = api.kbars(
                 contract=contract,
                 start=start.isoformat(),
                 end=end.isoformat(),
                 timeout=int(timeout_ms),
             )
-            values = _payload_dict(payload)
-            required = ("ts", "Open", "High", "Low", "Close", "Volume", "Amount")
-            missing = [name for name in required if name not in values]
-            if missing:
-                raise ValueError(f"Shioaji Kbars payload is missing fields: {missing}")
-            raw = pl.DataFrame({name: values[name] for name in required})
-            placeholder_rows = 0
-            cleaned_payload: Any = values
-            if raw.height:
-                all_zero_placeholder = pl.all_horizontal(
-                    *[
-                        pl.col(name).cast(pl.Float64, strict=False).fill_nan(None)
-                        == 0.0
-                        for name in (
-                            "Open",
-                            "High",
-                            "Low",
-                            "Close",
-                            "Volume",
-                            "Amount",
-                        )
-                    ]
-                ).fill_null(False)
-                placeholder_rows = raw.filter(all_zero_placeholder).height
-                if placeholder_rows:
-                    cleaned_payload = raw.filter(~all_zero_placeholder).to_dict(
-                        as_series=False
-                    )
-            frame = normalize_kbars(
-                cleaned_payload,
-                symbol=row.symbol,
-                market=row.market,
-                contract_unit=contract_unit,
-            )
+            frame, stats = clean_payload(payload)
             returned_dates = set(frame["date"].to_list()) if frame.height else set()
             missing_dates = sorted(expected_dates - returned_dates)
             if missing_dates:
-                raise RuntimeError(
-                    f"Shioaji Kbars omitted {len(missing_dates)} public "
-                    f"positive-volume sessions for {row.symbol}: {missing_dates[:10]}"
-                )
-            return frame, placeholder_rows
+                fallback_frames: list[pl.DataFrame] = []
+                for missing_date in missing_dates:
+                    if request_started is not None:
+                        request_started()
+                    fallback_payload = api.kbars(
+                        contract=contract,
+                        start=missing_date.isoformat(),
+                        end=missing_date.isoformat(),
+                        timeout=int(timeout_ms),
+                    )
+                    fallback, fallback_stats = clean_payload(fallback_payload)
+                    for key, value in fallback_stats.items():
+                        stats[key] += value
+                    if fallback.height:
+                        fallback_frames.append(fallback)
+                stats["single_day_fallback_queries"] = len(missing_dates)
+                if fallback_frames:
+                    frame = pl.concat(
+                        [frame, *fallback_frames], how="vertical_relaxed"
+                    ).sort("ts")
+                    returned_dates = set(frame["date"].to_list())
+            unresolved_dates = sorted(expected_dates - returned_dates)
+            stats["source_gap_dates"] = [
+                value.isoformat() for value in unresolved_dates
+            ]
+            return frame, stats
+        except DownloadStopRequested:
+            raise
         except Exception as exc:
             last_error = exc
             if attempt >= max(0, retries):
@@ -159,7 +458,33 @@ def parse_args() -> argparse.Namespace:
         help="Explicitly request the entire public stock/ETF universe.",
     )
     parser.add_argument("--max-symbols", type=int, default=0)
-    parser.add_argument("--request-interval", type=float, default=0.25)
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=DEFAULT_WORKERS,
+        help="Independent logged-in worker processes (maximum 5 per person ID).",
+    )
+    parser.add_argument(
+        "--requests-per-second",
+        type=float,
+        default=DEFAULT_REQUESTS_PER_SECOND,
+        help="Account-wide KBar request starts per second (maximum 10).",
+    )
+    parser.add_argument(
+        "--request-interval",
+        type=float,
+        default=0.0,
+        help=(
+            "Legacy extra per-worker delay after a primary chunk. Keep 0 when "
+            "using the account-wide limiter."
+        ),
+    )
+    parser.add_argument(
+        "--traffic-check-interval",
+        type=float,
+        default=5.0,
+        help="Seconds to cache the account-wide traffic-usage check.",
+    )
     parser.add_argument("--timeout-ms", type=int, default=30_000)
     parser.add_argument("--retries", type=int, default=3)
     parser.add_argument("--retry-backoff", type=float, default=3.0)
@@ -272,12 +597,16 @@ def minute_receipt_valid(
         and payload.get("symbol") == symbol
         and payload.get("start_date") == start.isoformat()
         and payload.get("end_date") == end.isoformat()
-        and payload.get("status") in {"ok", "empty"}
+        and payload.get("status") in {"ok", "empty", "source_gap"}
         and (simulation is None or payload.get("simulation") is bool(simulation))
     ):
         return False
     if payload["status"] == "empty":
         return int(payload.get("rows", -1)) == 0
+    if payload["status"] == "source_gap" and not payload.get("source_gap_dates"):
+        return False
+    if int(payload.get("rows", -1)) == 0:
+        return payload["status"] == "source_gap"
     output = payload.get("output_receipt")
     if not isinstance(output, dict):
         return False
@@ -400,6 +729,7 @@ def _write_symbol_manifest(
     entries: list[dict[str, Any]] = []
     total_rows = 0
     dates: set[date] = set()
+    source_gap_dates: set[date] = set()
     for chunk_start, chunk_end in chunks:
         data_path, receipt_path = minute_chunk_paths(
             output_dir, row.symbol, chunk_start, chunk_end
@@ -422,17 +752,26 @@ def _write_symbol_manifest(
                 "status": receipt["status"],
                 "rows": int(receipt.get("rows", 0)),
                 "sessions": int(receipt.get("sessions", 0)),
-                "data_path": str(data_path) if receipt["status"] == "ok" else None,
+                "data_path": (
+                    str(data_path)
+                    if receipt["status"] in {"ok", "source_gap"}
+                    and int(receipt.get("rows", 0)) > 0
+                    else None
+                ),
                 "data_sha256": (
                     receipt["output_receipt"]["sha256"]
-                    if receipt["status"] == "ok"
+                    if receipt["status"] in {"ok", "source_gap"}
+                    and int(receipt.get("rows", 0)) > 0
                     else None
                 ),
                 "receipt_path": str(receipt_path),
+                "source_gap_dates": list(receipt.get("source_gap_dates", [])),
             }
         )
         for raw in receipt.get("returned_dates", []):
             dates.add(date.fromisoformat(str(raw)))
+        for raw in receipt.get("source_gap_dates", []):
+            source_gap_dates.add(date.fromisoformat(str(raw)))
     manifest_path = output_dir / "symbols" / f"{row.symbol}.manifest.json"
     _atomic_write_json(
         manifest_path,
@@ -450,6 +789,10 @@ def _write_symbol_manifest(
             "chunks": entries,
             "minute_rows": total_rows,
             "sessions": len(dates),
+            "source_gap_sessions": len(source_gap_dates),
+            "source_gap_dates": [
+                value.isoformat() for value in sorted(source_gap_dates)
+            ],
             "first_date": min(dates).isoformat() if dates else None,
             "last_date": max(dates).isoformat() if dates else None,
             "written_at_utc": datetime.now(timezone.utc)
@@ -459,7 +802,7 @@ def _write_symbol_manifest(
     )
     return SymbolResult(
         symbol=row.symbol,
-        status="complete",
+        status=("complete_with_source_gaps" if source_gap_dates else "complete"),
         chunks_total=len(chunks),
         chunks_complete=len(chunks),
         source_minute_rows=total_rows,
@@ -467,6 +810,9 @@ def _write_symbol_manifest(
         first_date=min(dates).isoformat() if dates else None,
         last_date=max(dates).isoformat() if dates else None,
         output_path=str(manifest_path),
+        message=(
+            f"source_gap_sessions={len(source_gap_dates)}" if source_gap_dates else ""
+        ),
     )
 
 
@@ -506,13 +852,13 @@ def completed_symbol_manifest_result(
         if not isinstance(entry, dict) or not (
             entry.get("start_date") == chunk_start.isoformat()
             and entry.get("end_date") == chunk_end.isoformat()
-            and entry.get("status") in {"ok", "empty"}
+            and entry.get("status") in {"ok", "empty", "source_gap"}
         ):
             return None
         receipt_path = Path(str(entry.get("receipt_path", "")))
         if not receipt_path.is_file():
             return None
-        if entry["status"] == "ok":
+        if entry["status"] in {"ok", "source_gap"} and int(entry.get("rows", 0)) > 0:
             data_path = Path(str(entry.get("data_path", "")))
             if not (
                 data_path.is_file()
@@ -522,7 +868,11 @@ def completed_symbol_manifest_result(
                 return None
     return SymbolResult(
         symbol=row.symbol,
-        status="complete",
+        status=(
+            "complete_with_source_gaps"
+            if int(payload.get("source_gap_sessions", 0)) > 0
+            else "complete"
+        ),
         chunks_total=len(chunks),
         chunks_complete=len(chunks),
         source_minute_rows=int(payload.get("minute_rows", 0)),
@@ -530,7 +880,14 @@ def completed_symbol_manifest_result(
         first_date=payload.get("first_date"),
         last_date=payload.get("last_date"),
         output_path=str(manifest_path),
-        message="resumed_from_sealed_manifest",
+        message=(
+            "resumed_from_sealed_manifest"
+            + (
+                f";source_gap_sessions={int(payload.get('source_gap_sessions', 0))}"
+                if int(payload.get("source_gap_sessions", 0)) > 0
+                else ""
+            )
+        ),
     )
 
 
@@ -543,6 +900,9 @@ def _write_run_summary(
     traffic: tuple[int, int] | None,
     stopped_for_traffic: bool,
     stopped_for_market_hours: bool,
+    counters: dict[str, int],
+    rate: dict[str, float | int],
+    fatal_error: str,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     report_path = output_dir / "download_report.csv"
@@ -554,8 +914,12 @@ def _write_run_summary(
         pl.DataFrame(
             schema={name: pl.String for name in SymbolResult.__dataclass_fields__}
         ).write_csv(report_path)
-    complete = len(results) == len(selected) and all(
-        item.status in {"complete", "contract_unavailable"} for item in results
+    strict_complete = len(results) == len(selected) and all(
+        item.status == "complete" for item in results
+    )
+    collection_complete = len(results) == len(selected) and all(
+        item.status in {"complete", "complete_with_source_gaps", "contract_unavailable"}
+        for item in results
     )
     _atomic_write_json(
         output_dir / "download_summary.json",
@@ -567,17 +931,33 @@ def _write_run_summary(
             "end_date": str(args.end_date),
             "chunk_days": int(args.chunk_days),
             "simulation": bool(args.simulation),
+            "workers": int(args.workers),
+            "requests_per_second_limit": float(args.requests_per_second),
+            "quote_limit_requests": SHIOAJI_QUOTE_LIMIT_REQUESTS,
+            "quote_limit_window_seconds": SHIOAJI_QUOTE_LIMIT_WINDOW_SECONDS,
+            "api_requests_started_this_run": int(rate["total_requests"]),
+            "observed_request_start_rps": float(rate["overall_rps"]),
+            "processed_chunks_this_run": int(counters["processed_chunks"]),
+            "queried_chunks_this_run": int(counters["queried_chunks"]),
+            "skipped_empty_chunks_this_run": int(
+                counters["skipped_empty_chunks"]
+            ),
             "selected_symbols": len(selected),
             "reported_symbols": len(results),
             "complete_symbols": sum(x.status == "complete" for x in results),
+            "complete_with_source_gap_symbols": sum(
+                x.status == "complete_with_source_gaps" for x in results
+            ),
             "contract_unavailable_symbols": sum(
                 x.status == "contract_unavailable" for x in results
             ),
             "failed_symbols": sum(x.status == "failed" for x in results),
             "partial_symbols": sum(x.status == "partial" for x in results),
-            "selected_coverage_complete": complete,
+            "selected_coverage_complete": strict_complete,
+            "resumable_collection_complete": collection_complete,
             "stopped_for_traffic": stopped_for_traffic,
             "stopped_for_market_hours": stopped_for_market_hours,
+            "fatal_error": fatal_error or None,
             "traffic_used_bytes": traffic[0] if traffic else None,
             "traffic_limit_bytes": traffic[1] if traffic else None,
             "report_path": str(report_path),
@@ -586,6 +966,383 @@ def _write_run_summary(
             .isoformat(),
         },
     )
+
+
+def _partial_symbol_result(
+    row: UniverseRow,
+    chunks: list[tuple[date, date]],
+    *,
+    completed: int,
+    message: str,
+) -> SymbolResult:
+    return SymbolResult(
+        symbol=row.symbol,
+        status="partial",
+        chunks_total=len(chunks),
+        chunks_complete=completed,
+        source_minute_rows=0,
+        daily_rows=0,
+        first_date=None,
+        last_date=None,
+        output_path="",
+        message=message,
+    )
+
+
+def _download_symbol(
+    api: Any,
+    contracts_by_code: dict[str, Any],
+    row: UniverseRow,
+    *,
+    symbol_index: int,
+    selected_count: int,
+    worker_index: int,
+    args: argparse.Namespace,
+    start: date,
+    end: date,
+    chunks: list[tuple[date, date]],
+    limiter: SharedRequestRateLimiter,
+    counters: SharedDownloadCounters,
+    traffic_guard: SharedTrafficBudgetGuard,
+    stop_event: Any,
+    stopped_for_traffic: Any,
+    stopped_for_market_hours: Any,
+) -> SymbolResult:
+    completed = 0
+    try:
+        sealed_result = completed_symbol_manifest_result(
+            args.output_dir,
+            row,
+            chunks,
+            requested_start=start,
+            requested_end=end,
+            simulation=bool(args.simulation),
+        )
+        if sealed_result is not None:
+            return sealed_result
+        completed = sum(
+            minute_receipt_valid(
+                minute_chunk_paths(args.output_dir, row.symbol, a, b)[1],
+                symbol=row.symbol,
+                start=a,
+                end=b,
+                simulation=bool(args.simulation),
+            )
+            for a, b in chunks
+        )
+        if completed == len(chunks):
+            return _write_symbol_manifest(
+                args.output_dir,
+                row,
+                chunks,
+                requested_start=start,
+                requested_end=end,
+                simulation=bool(args.simulation),
+            )
+        expected_all = _positive_volume_dates(row.base_path, start, end)
+        contract: Any | None = None
+        unit = 0.0
+        contract_message = ""
+        if expected_all:
+            contract, unit, contract_message = contract_for_stock_symbol(
+                api, row, contracts_by_code
+            )
+        if expected_all and contract is None:
+            _emit_worker_log(
+                f"[shioaji-minute] worker={worker_index} symbol={row.symbol} "
+                f"symbol_index={symbol_index}/{selected_count} "
+                f"status=contract_unavailable reason={contract_message}"
+            )
+            return SymbolResult(
+                symbol=row.symbol,
+                status="contract_unavailable",
+                chunks_total=len(chunks),
+                chunks_complete=completed,
+                source_minute_rows=0,
+                daily_rows=0,
+                first_date=None,
+                last_date=None,
+                output_path="",
+                message=contract_message,
+            )
+
+        for chunk_index, (chunk_start, chunk_end) in enumerate(chunks, start=1):
+            data_path, receipt_path = minute_chunk_paths(
+                args.output_dir, row.symbol, chunk_start, chunk_end
+            )
+            if minute_receipt_valid(
+                receipt_path,
+                symbol=row.symbol,
+                start=chunk_start,
+                end=chunk_end,
+                simulation=bool(args.simulation),
+            ):
+                continue
+            if stop_event.is_set():
+                raise DownloadStopRequested("another worker requested a global stop")
+            if _taiwan_market_hours_now() and not args.allow_market_hours:
+                raise MarketHoursReached(
+                    "Taiwan market-hours safety window reached; "
+                    "resume after 14:30 Asia/Taipei"
+                )
+            expected_dates = {
+                value for value in expected_all if chunk_start <= value <= chunk_end
+            }
+            query_performed = bool(expected_dates)
+            if query_performed:
+                traffic_guard.check(api)
+                assert contract is not None
+                frame, query_audit = query_minute_chunk(
+                    api,
+                    contract,
+                    row,
+                    contract_unit=unit,
+                    start=chunk_start,
+                    end=chunk_end,
+                    timeout_ms=int(args.timeout_ms),
+                    retries=int(args.retries),
+                    retry_backoff=float(args.retry_backoff),
+                    expected_dates=expected_dates,
+                    request_started=lambda: limiter.acquire(stop_event),
+                )
+            else:
+                # The public point-in-time panel is the universe and coverage
+                # reference. With no positive-volume session, this chunk cannot
+                # contribute a tradable minute bar.
+                frame = pl.DataFrame()
+                query_audit = {
+                    "zero_placeholder_rows_dropped": 0,
+                    "negative_correction_rows_dropped": 0,
+                    "out_of_session_rows_dropped": 0,
+                    "outside_reference_date_rows_dropped": 0,
+                    "single_day_fallback_queries": 0,
+                    "source_gap_dates": [],
+                }
+            audit = validate_minute_kbars(
+                frame,
+                symbol=row.symbol,
+                start=chunk_start,
+                end=chunk_end,
+            )
+            returned_dates = sorted(
+                value.isoformat()
+                for value in (
+                    set(frame["date"].to_list()) if frame.height else set()
+                )
+            )
+            output_receipt = (
+                _write_minute_parquet(frame, data_path) if frame.height else None
+            )
+            source_gap_dates = list(query_audit["source_gap_dates"])
+            receipt_status = (
+                "source_gap"
+                if source_gap_dates
+                else ("ok" if frame.height else "empty")
+            )
+            _atomic_write_json(
+                receipt_path,
+                {
+                    "schema_version": RECEIPT_SCHEMA_VERSION,
+                    "source": SOURCE_NAME,
+                    "storage_frequency": STORAGE_FREQUENCY,
+                    "simulation": bool(args.simulation),
+                    "symbol": row.symbol,
+                    "name": row.name,
+                    "market": row.market,
+                    "security_type": row.security_type,
+                    "contract_unit": unit,
+                    "start_date": chunk_start.isoformat(),
+                    "end_date": chunk_end.isoformat(),
+                    "status": receipt_status,
+                    "rows": frame.height,
+                    "sessions": audit["sessions"],
+                    "first_ts": audit["first_ts"],
+                    "last_ts": audit["last_ts"],
+                    "expected_positive_volume_sessions": len(expected_dates),
+                    "returned_dates": returned_dates,
+                    "query_performed": query_performed,
+                    "query_skipped_reason": (
+                        None
+                        if query_performed
+                        else "no_public_positive_volume_session"
+                    ),
+                    "zero_placeholder_rows_dropped": int(
+                        query_audit["zero_placeholder_rows_dropped"]
+                    ),
+                    "negative_correction_rows_dropped": int(
+                        query_audit["negative_correction_rows_dropped"]
+                    ),
+                    "out_of_session_rows_dropped": int(
+                        query_audit["out_of_session_rows_dropped"]
+                    ),
+                    "outside_reference_date_rows_dropped": int(
+                        query_audit["outside_reference_date_rows_dropped"]
+                    ),
+                    "single_day_fallback_queries": int(
+                        query_audit.get("single_day_fallback_queries", 0)
+                    ),
+                    "source_gap_dates": source_gap_dates,
+                    "audit": audit,
+                    "output_receipt": output_receipt,
+                    "downloaded_at_utc": datetime.now(timezone.utc)
+                    .replace(microsecond=0)
+                    .isoformat(),
+                },
+            )
+            completed += 1
+            chunk_counts = counters.record_chunk(query_performed=query_performed)
+            rate = limiter.snapshot()
+            _emit_worker_log(
+                f"[shioaji-minute] worker={worker_index} symbol={row.symbol} "
+                f"symbol_index={symbol_index}/{selected_count} "
+                f"chunk={chunk_index}/{len(chunks)} rows={frame.height} "
+                f"api_queried={str(query_performed).lower()} "
+                f"source_gaps={len(source_gap_dates)} "
+                f"queried={chunk_counts['queried_chunks']} "
+                f"skipped_empty={chunk_counts['skipped_empty_chunks']} "
+                f"api_requests={rate['total_requests']} "
+                f"request_rps={float(rate['overall_rps']):.3f} "
+                f"window_rps={float(rate['window_rps']):.3f}"
+            )
+            if query_performed and float(args.request_interval) > 0.0:
+                time.sleep(float(args.request_interval))
+        return _write_symbol_manifest(
+            args.output_dir,
+            row,
+            chunks,
+            requested_start=start,
+            requested_end=end,
+            simulation=bool(args.simulation),
+        )
+    except TrafficBudgetReached as exc:
+        stopped_for_traffic.value = 1
+        stop_event.set()
+        _emit_worker_log(
+            f"[shioaji-minute] worker={worker_index} symbol={row.symbol} "
+            f"symbol_index={symbol_index}/{selected_count} "
+            f"status=stopped_for_traffic reason={exc}"
+        )
+        return _partial_symbol_result(
+            row, chunks, completed=completed, message=str(exc)
+        )
+    except MarketHoursReached as exc:
+        stopped_for_market_hours.value = 1
+        stop_event.set()
+        _emit_worker_log(
+            f"[shioaji-minute] worker={worker_index} symbol={row.symbol} "
+            f"symbol_index={symbol_index}/{selected_count} "
+            f"status=stopped_for_market_hours reason={exc}"
+        )
+        return _partial_symbol_result(
+            row, chunks, completed=completed, message=str(exc)
+        )
+    except DownloadStopRequested as exc:
+        return _partial_symbol_result(
+            row, chunks, completed=completed, message=str(exc)
+        )
+    except Exception as exc:
+        _emit_worker_log(
+            f"[shioaji-minute] worker={worker_index} symbol={row.symbol} "
+            f"symbol_index={symbol_index}/{selected_count} "
+            f"status=failed error={type(exc).__name__}: {exc}"
+        )
+        return SymbolResult(
+            symbol=row.symbol,
+            status="failed",
+            chunks_total=len(chunks),
+            chunks_complete=completed,
+            source_minute_rows=0,
+            daily_rows=0,
+            first_date=None,
+            last_date=None,
+            output_path="",
+            message=f"{type(exc).__name__}: {exc}",
+        )
+
+
+def _parallel_download_worker(
+    worker_index: int,
+    args: argparse.Namespace,
+    start: date,
+    end: date,
+    chunks: list[tuple[date, date]],
+    selected_count: int,
+    task_queue: Any,
+    result_queue: Any,
+    error_queue: Any,
+    ready_barrier: Any,
+    start_event: Any,
+    stop_event: Any,
+    init_failures: Any,
+    runtime_failures: Any,
+    stopped_for_traffic: Any,
+    stopped_for_market_hours: Any,
+    limiter: SharedRequestRateLimiter,
+    counters: SharedDownloadCounters,
+    traffic_guard: SharedTrafficBudgetGuard,
+) -> None:
+    api: Any | None = None
+    contracts_by_code: dict[str, Any] = {}
+    init_error = ""
+    try:
+        import shioaji as sj
+
+        api_key = os.environ.get("SHIOAJI_API_KEY", "").strip()
+        secret_key = os.environ.get("SHIOAJI_SECRET_KEY", "").strip()
+        api = sj.Shioaji(simulation=bool(args.simulation))
+        api.set_event_callback(lambda _code, _event_code, _info, _event: None)
+        api.login(api_key=api_key, secret_key=secret_key, subscribe_trade=False)
+        contracts_by_code = stock_contract_map(api)
+        _emit_worker_log(
+            f"[shioaji-minute] worker={worker_index} login=ok "
+            f"stock_contracts={len(contracts_by_code)}"
+        )
+    except Exception as exc:
+        init_error = f"worker={worker_index} {type(exc).__name__}: {exc}"
+        with init_failures.get_lock():
+            init_failures.value += 1
+        error_queue.put(("init", init_error))
+    try:
+        ready_barrier.wait(timeout=120.0)
+        start_event.wait()
+        if init_error or stop_event.is_set():
+            return
+        while not stop_event.is_set():
+            task = task_queue.get()
+            if task is None:
+                break
+            symbol_index, row = task
+            result = _download_symbol(
+                api,
+                contracts_by_code,
+                row,
+                symbol_index=int(symbol_index),
+                selected_count=selected_count,
+                worker_index=worker_index,
+                args=args,
+                start=start,
+                end=end,
+                chunks=chunks,
+                limiter=limiter,
+                counters=counters,
+                traffic_guard=traffic_guard,
+                stop_event=stop_event,
+                stopped_for_traffic=stopped_for_traffic,
+                stopped_for_market_hours=stopped_for_market_hours,
+            )
+            result_queue.put((int(symbol_index), result))
+    except Exception as exc:
+        message = f"worker={worker_index} {type(exc).__name__}: {exc}"
+        with runtime_failures.get_lock():
+            runtime_failures.value += 1
+        error_queue.put(("runtime", message))
+        stop_event.set()
+    finally:
+        if api is not None:
+            try:
+                api.logout()
+            except Exception:
+                pass
 
 
 def main() -> None:
@@ -600,8 +1357,19 @@ def main() -> None:
         raise ValueError("--start-date must not be after --end-date")
     if not 1 <= int(args.chunk_days) <= MAX_KBAR_QUERY_DAYS:
         raise ValueError("--chunk-days must be between 1 and 30")
-    if float(args.request_interval) < 0:
+    if not 1 <= int(args.workers) <= SHIOAJI_MAX_CONNECTIONS:
+        raise ValueError(
+            f"--workers must be between 1 and {SHIOAJI_MAX_CONNECTIONS}"
+        )
+    if not 0.0 < float(args.requests_per_second) <= DEFAULT_REQUESTS_PER_SECOND:
+        raise ValueError(
+            "--requests-per-second must be positive and no greater than "
+            f"{DEFAULT_REQUESTS_PER_SECOND:g}"
+        )
+    if float(args.request_interval) < 0.0:
         raise ValueError("--request-interval must be nonnegative")
+    if float(args.traffic_check_interval) <= 0.0:
+        raise ValueError("--traffic-check-interval must be positive")
     if not 0 < float(args.max_traffic_fraction) < 1:
         raise ValueError("--max-traffic-fraction must be between 0 and 1")
 
@@ -629,6 +1397,8 @@ def main() -> None:
             f"[shioaji-minute] dry_run symbols={len(selected)} "
             f"receipt_chunks={len(selected) * len(chunks)} "
             f"api_query_chunks={api_query_chunks} range={start}..{end} "
+            f"workers={int(args.workers)} "
+            f"requests_per_second={float(args.requests_per_second):g} "
             f"output={args.output_dir}",
             flush=True,
         )
@@ -645,336 +1415,206 @@ def main() -> None:
             "Set SHIOAJI_API_KEY and SHIOAJI_SECRET_KEY locally; credentials "
             "are intentionally not accepted as command-line arguments."
         )
-    try:
-        import shioaji as sj
-    except ImportError as exc:
-        raise RuntimeError("Shioaji is unavailable in the selected runtime") from exc
 
-    api = sj.Shioaji(simulation=bool(args.simulation))
-    api.set_event_callback(lambda _code, _event_code, _info, _event: None)
-    api.login(api_key=api_key, secret_key=secret_key, subscribe_trade=False)
-    contracts_by_code = stock_contract_map(api)
-    print(
-        f"[shioaji-minute] stock_contracts={len(contracts_by_code)} "
-        "region=TW security_type=STK",
-        flush=True,
+    context = mp.get_context("spawn")
+    workers = int(args.workers)
+    task_queue = context.Queue()
+    result_queue = context.Queue()
+    error_queue = context.Queue()
+    for symbol_index, row in enumerate(selected, start=1):
+        task_queue.put((symbol_index, row))
+    for _ in range(workers):
+        task_queue.put(None)
+
+    ready_barrier = context.Barrier(workers + 1)
+    start_event = context.Event()
+    stop_event = context.Event()
+    init_failures = context.Value("i", 0)
+    runtime_failures = context.Value("i", 0)
+    stopped_for_traffic = context.Value("b", 0)
+    stopped_for_market_hours = context.Value("b", 0)
+    limiter = SharedRequestRateLimiter(
+        context,
+        requests_per_second=float(args.requests_per_second),
     )
-    results: list[SymbolResult] = []
-    traffic: tuple[int, int] | None = None
-    stopped_for_traffic = False
-    stopped_for_market_hours = False
-    processed_chunks = 0
-    queried_chunks = 0
-    skipped_empty_chunks = 0
-    started = time.monotonic()
+    counters = SharedDownloadCounters(context)
     reserve_bytes = int(float(args.traffic_reserve_mb) * 1024 * 1024)
-    try:
-        for symbol_index, row in enumerate(selected, start=1):
-            sealed_result = completed_symbol_manifest_result(
-                args.output_dir,
-                row,
+    traffic_guard = SharedTrafficBudgetGuard(
+        context,
+        max_fraction=float(args.max_traffic_fraction),
+        reserve_bytes=reserve_bytes,
+        check_interval_seconds=float(args.traffic_check_interval),
+    )
+    processes = [
+        context.Process(
+            target=_parallel_download_worker,
+            name=f"shioaji-minute-{worker_index}",
+            args=(
+                worker_index,
+                args,
+                start,
+                end,
                 chunks,
-                requested_start=start,
-                requested_end=end,
-                simulation=bool(args.simulation),
+                len(selected),
+                task_queue,
+                result_queue,
+                error_queue,
+                ready_barrier,
+                start_event,
+                stop_event,
+                init_failures,
+                runtime_failures,
+                stopped_for_traffic,
+                stopped_for_market_hours,
+                limiter,
+                counters,
+                traffic_guard,
+            ),
+        )
+        for worker_index in range(1, workers + 1)
+    ]
+
+    started = time.monotonic()
+    result_items: list[tuple[int, SymbolResult]] = []
+    error_items: list[tuple[str, str]] = []
+    fatal_error = ""
+    try:
+        for process in processes:
+            process.start()
+        try:
+            ready_barrier.wait(timeout=180.0)
+        except Exception as exc:
+            fatal_error = f"worker readiness failed: {type(exc).__name__}: {exc}"
+            stop_event.set()
+        if init_failures.value:
+            fatal_error = (
+                f"{int(init_failures.value)}/{workers} Shioaji workers "
+                "failed login or contract initialization"
             )
-            if sealed_result is not None:
-                results.append(sealed_result)
-                continue
-            completed = sum(
-                minute_receipt_valid(
-                    minute_chunk_paths(args.output_dir, row.symbol, a, b)[1],
-                    symbol=row.symbol,
-                    start=a,
-                    end=b,
-                    simulation=bool(args.simulation),
-                )
-                for a, b in chunks
-            )
-            if completed == len(chunks):
-                results.append(
-                    _write_symbol_manifest(
-                        args.output_dir,
-                        row,
-                        chunks,
-                        requested_start=start,
-                        requested_end=end,
-                        simulation=bool(args.simulation),
-                    )
-                )
-                continue
-            contract, unit, contract_message = contract_for_stock_symbol(
-                api, row, contracts_by_code
-            )
-            if contract is None:
-                print(
-                    f"[shioaji-minute] symbol={row.symbol} "
-                    f"symbol_index={symbol_index}/{len(selected)} "
-                    f"status=contract_unavailable reason={contract_message}",
-                    flush=True,
-                )
-                results.append(
-                    SymbolResult(
-                        symbol=row.symbol,
-                        status="contract_unavailable",
-                        chunks_total=len(chunks),
-                        chunks_complete=completed,
-                        source_minute_rows=0,
-                        daily_rows=0,
-                        first_date=None,
-                        last_date=None,
-                        output_path="",
-                        message=contract_message,
-                    )
-                )
-                continue
-            expected_all = _positive_volume_dates(row.base_path, start, end)
+            stop_event.set()
+        print(
+            f"[shioaji-minute] parallel_workers={workers} "
+            f"requests_per_second={float(args.requests_per_second):g} "
+            f"sliding_window={SHIOAJI_QUOTE_LIMIT_REQUESTS}/"
+            f"{SHIOAJI_QUOTE_LIMIT_WINDOW_SECONDS:g}s "
+            f"start_allowed={str(not stop_event.is_set()).lower()}",
+            flush=True,
+        )
+        start_event.set()
+
+        while any(process.is_alive() for process in processes):
             try:
-                for chunk_index, (chunk_start, chunk_end) in enumerate(chunks, start=1):
-                    data_path, receipt_path = minute_chunk_paths(
-                        args.output_dir, row.symbol, chunk_start, chunk_end
-                    )
-                    if minute_receipt_valid(
-                        receipt_path,
-                        symbol=row.symbol,
-                        start=chunk_start,
-                        end=chunk_end,
-                        simulation=bool(args.simulation),
-                    ):
-                        continue
-                    if _taiwan_market_hours_now() and not args.allow_market_hours:
-                        raise MarketHoursReached(
-                            "Taiwan market-hours safety window reached; "
-                            "resume after 14:30 Asia/Taipei"
-                        )
-                    expected_dates = {
-                        value
-                        for value in expected_all
-                        if chunk_start <= value <= chunk_end
-                    }
-                    query_performed = bool(expected_dates)
-                    if query_performed:
-                        traffic = _check_traffic_budget(
-                            api,
-                            max_fraction=float(args.max_traffic_fraction),
-                            reserve_bytes=reserve_bytes,
-                        )
-                        frame, zero_placeholder_rows_dropped = query_minute_chunk(
-                            api,
-                            contract,
-                            row,
-                            contract_unit=unit,
-                            start=chunk_start,
-                            end=chunk_end,
-                            timeout_ms=int(args.timeout_ms),
-                            retries=int(args.retries),
-                            retry_backoff=float(args.retry_backoff),
-                            expected_dates=expected_dates,
-                        )
-                        queried_chunks += 1
-                    else:
-                        # The public point-in-time panel is the universe and
-                        # coverage reference. With no positive-volume session,
-                        # this chunk cannot contribute a tradable minute bar.
-                        frame = pl.DataFrame()
-                        zero_placeholder_rows_dropped = 0
-                        skipped_empty_chunks += 1
-                    processed_chunks += 1
-                    audit = validate_minute_kbars(
-                        frame,
-                        symbol=row.symbol,
-                        start=chunk_start,
-                        end=chunk_end,
-                    )
-                    returned_dates = sorted(
-                        value.isoformat()
-                        for value in (
-                            set(frame["date"].to_list()) if frame.height else set()
-                        )
-                    )
-                    output_receipt = (
-                        _write_minute_parquet(frame, data_path)
-                        if frame.height
-                        else None
-                    )
-                    _atomic_write_json(
-                        receipt_path,
-                        {
-                            "schema_version": RECEIPT_SCHEMA_VERSION,
-                            "source": SOURCE_NAME,
-                            "storage_frequency": STORAGE_FREQUENCY,
-                            "simulation": bool(args.simulation),
-                            "symbol": row.symbol,
-                            "name": row.name,
-                            "market": row.market,
-                            "security_type": row.security_type,
-                            "contract_unit": unit,
-                            "start_date": chunk_start.isoformat(),
-                            "end_date": chunk_end.isoformat(),
-                            "status": "ok" if frame.height else "empty",
-                            "rows": frame.height,
-                            "sessions": audit["sessions"],
-                            "first_ts": audit["first_ts"],
-                            "last_ts": audit["last_ts"],
-                            "expected_positive_volume_sessions": len(expected_dates),
-                            "returned_dates": returned_dates,
-                            "query_performed": query_performed,
-                            "query_skipped_reason": (
-                                None
-                                if query_performed
-                                else "no_public_positive_volume_session"
-                            ),
-                            "zero_placeholder_rows_dropped": (
-                                zero_placeholder_rows_dropped
-                            ),
-                            "audit": audit,
-                            "output_receipt": output_receipt,
-                            "downloaded_at_utc": datetime.now(timezone.utc)
-                            .replace(microsecond=0)
-                            .isoformat(),
-                        },
-                    )
-                    completed += 1
-                    print(
-                        f"[shioaji-minute] symbol={row.symbol} "
-                        f"symbol_index={symbol_index}/{len(selected)} "
-                        f"chunk={chunk_index}/{len(chunks)} rows={frame.height} "
-                        f"api_queried={str(query_performed).lower()} "
-                        f"queried={queried_chunks} "
-                        f"skipped_empty={skipped_empty_chunks}",
-                        flush=True,
-                    )
-                    if query_performed and float(args.request_interval):
-                        time.sleep(float(args.request_interval))
-                results.append(
-                    _write_symbol_manifest(
-                        args.output_dir,
-                        row,
-                        chunks,
-                        requested_start=start,
-                        requested_end=end,
-                        simulation=bool(args.simulation),
-                    )
-                )
-            except TrafficBudgetReached as exc:
-                stopped_for_traffic = True
-                print(
-                    f"[shioaji-minute] symbol={row.symbol} "
-                    f"symbol_index={symbol_index}/{len(selected)} "
-                    f"status=stopped_for_traffic reason={exc}",
-                    flush=True,
-                )
-                results.append(
-                    SymbolResult(
-                        symbol=row.symbol,
-                        status="partial",
-                        chunks_total=len(chunks),
-                        chunks_complete=completed,
-                        source_minute_rows=0,
-                        daily_rows=0,
-                        first_date=None,
-                        last_date=None,
-                        output_path="",
-                        message=str(exc),
-                    )
-                )
+                result_items.append(result_queue.get(timeout=0.5))
+            except Empty:
+                pass
+        for process in processes:
+            process.join(timeout=5.0)
+        while True:
+            try:
+                result_items.append(result_queue.get_nowait())
+            except Empty:
                 break
-            except MarketHoursReached as exc:
-                stopped_for_market_hours = True
-                print(
-                    f"[shioaji-minute] symbol={row.symbol} "
-                    f"symbol_index={symbol_index}/{len(selected)} "
-                    f"status=stopped_for_market_hours reason={exc}",
-                    flush=True,
-                )
-                results.append(
-                    SymbolResult(
-                        symbol=row.symbol,
-                        status="partial",
-                        chunks_total=len(chunks),
-                        chunks_complete=completed,
-                        source_minute_rows=0,
-                        daily_rows=0,
-                        first_date=None,
-                        last_date=None,
-                        output_path="",
-                        message=str(exc),
-                    )
-                )
+        while True:
+            try:
+                error_items.append(error_queue.get_nowait())
+            except Empty:
                 break
-            except Exception as exc:
-                print(
-                    f"[shioaji-minute] symbol={row.symbol} "
-                    f"symbol_index={symbol_index}/{len(selected)} "
-                    f"status=failed error={type(exc).__name__}: {exc}",
-                    flush=True,
-                )
-                results.append(
-                    SymbolResult(
-                        symbol=row.symbol,
-                        status="failed",
-                        chunks_total=len(chunks),
-                        chunks_complete=completed,
-                        source_minute_rows=0,
-                        daily_rows=0,
-                        first_date=None,
-                        last_date=None,
-                        output_path="",
-                        message=f"{type(exc).__name__}: {exc}",
-                    )
-                )
-        try:
-            traffic = _usage_values(api)
-        except Exception:
-            pass
+        bad_exits = [
+            f"{process.name}={process.exitcode}"
+            for process in processes
+            if process.exitcode not in {0, None}
+        ]
+        if bad_exits and not fatal_error:
+            fatal_error = "worker exits: " + ",".join(bad_exits)
+        if runtime_failures.value and not fatal_error:
+            fatal_error = (
+                f"{int(runtime_failures.value)} parallel worker runtime failure(s)"
+            )
+        if error_items:
+            detail = "; ".join(message for _, message in error_items)
+            fatal_error = f"{fatal_error}; {detail}".strip("; ")
     finally:
-        try:
-            api.logout()
-        except Exception:
-            pass
-        _write_run_summary(
-            args.output_dir,
-            args=args,
-            selected=selected,
-            results=results,
-            traffic=traffic,
-            stopped_for_traffic=stopped_for_traffic,
-            stopped_for_market_hours=stopped_for_market_hours,
+        stop_event.set()
+        start_event.set()
+        for process in processes:
+            if process.is_alive():
+                process.join(timeout=10.0)
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5.0)
+
+    deduplicated = {
+        int(symbol_index): result for symbol_index, result in result_items
+    }
+    results = [deduplicated[index] for index in sorted(deduplicated)]
+    traffic = traffic_guard.last_usage()
+    counter_snapshot = counters.snapshot()
+    rate_snapshot = limiter.snapshot()
+    elapsed_seconds = round(time.monotonic() - started, 3)
+    _write_run_summary(
+        args.output_dir,
+        args=args,
+        selected=selected,
+        results=results,
+        traffic=traffic,
+        stopped_for_traffic=bool(stopped_for_traffic.value),
+        stopped_for_market_hours=bool(stopped_for_market_hours.value),
+        counters=counter_snapshot,
+        rate=rate_snapshot,
+        fatal_error=fatal_error,
+    )
+    state = (
+        "failed"
+        if fatal_error
+        else (
+            "stopped_for_traffic"
+            if stopped_for_traffic.value
+            else (
+                "stopped_for_market_hours"
+                if stopped_for_market_hours.value
+                else "finished"
+            )
         )
-        _atomic_write_json(
-            args.output_dir / "progress.json",
-            {
-                "schema_version": 1,
-                "state": (
-                    "stopped_for_traffic"
-                    if stopped_for_traffic
-                    else (
-                        "stopped_for_market_hours"
-                        if stopped_for_market_hours
-                        else "finished"
-                    )
-                ),
-                "selected_symbols": len(selected),
-                "reported_symbols": len(results),
-                "processed_chunks_this_run": processed_chunks,
-                "queried_chunks_this_run": queried_chunks,
-                "skipped_empty_chunks_this_run": skipped_empty_chunks,
-                "elapsed_seconds": round(time.monotonic() - started, 3),
-                "traffic_used_bytes": traffic[0] if traffic else None,
-                "traffic_limit_bytes": traffic[1] if traffic else None,
-                "updated_at_utc": datetime.now(timezone.utc)
-                .replace(microsecond=0)
-                .isoformat(),
-            },
-        )
+    )
+    _atomic_write_json(
+        args.output_dir / "progress.json",
+        {
+            "schema_version": 2,
+            "state": state,
+            "parallel_workers": workers,
+            "requests_per_second_limit": float(args.requests_per_second),
+            "selected_symbols": len(selected),
+            "reported_symbols": len(results),
+            "processed_chunks_this_run": counter_snapshot["processed_chunks"],
+            "queried_chunks_this_run": counter_snapshot["queried_chunks"],
+            "skipped_empty_chunks_this_run": counter_snapshot[
+                "skipped_empty_chunks"
+            ],
+            "api_requests_started_this_run": int(rate_snapshot["total_requests"]),
+            "observed_request_start_rps": float(rate_snapshot["overall_rps"]),
+            "request_window_rps": float(rate_snapshot["window_rps"]),
+            "elapsed_seconds": elapsed_seconds,
+            "traffic_used_bytes": traffic[0] if traffic else None,
+            "traffic_limit_bytes": traffic[1] if traffic else None,
+            "fatal_error": fatal_error or None,
+            "updated_at_utc": datetime.now(timezone.utc)
+            .replace(microsecond=0)
+            .isoformat(),
+        },
+    )
     print(
         f"[shioaji-minute] complete={sum(x.status == 'complete' for x in results)} "
+        f"complete_with_gaps="
+        f"{sum(x.status == 'complete_with_source_gaps' for x in results)} "
         f"failed={sum(x.status == 'failed' for x in results)} "
         f"partial={sum(x.status == 'partial' for x in results)} "
+        f"api_requests={int(rate_snapshot['total_requests'])} "
+        f"request_rps={float(rate_snapshot['overall_rps']):.3f} "
         f"summary={args.output_dir / 'download_summary.json'}",
         flush=True,
     )
-
+    if fatal_error:
+        raise RuntimeError(fatal_error)
 
 if __name__ == "__main__":
     main()

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta
 import json
+import multiprocessing as mp
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -10,6 +11,7 @@ import pytest
 
 from downloader.download_shioaji_tw_kbars import UniverseRow
 from downloader.download_shioaji_tw_minute_kbars import (
+    SharedRequestRateLimiter,
     completed_symbol_manifest_result,
     contract_for_stock_symbol,
     minute_chunk_paths,
@@ -21,6 +23,7 @@ from downloader.download_shioaji_tw_minute_kbars import (
 from scripts.audit_shioaji_tw_minute_dataset import audit_frame
 from scripts.build_shioaji_tw_minute_dataset import (
     MODEL_FEATURE_COLUMNS,
+    _validate_collection_gate,
     build_research_frame,
 )
 from stockagent.research.tw_minute_kbars import (
@@ -32,6 +35,15 @@ from stockagent.research.tw_minute_kbars import (
 
 
 TRADE_DATE = date(2026, 7, 24)
+
+
+def _acquire_rate_limit_slots(
+    limiter: SharedRequestRateLimiter,
+    count: int,
+    output: object,
+) -> None:
+    for _ in range(count):
+        output.put(limiter.acquire())
 
 
 def _raw_minute_frame(
@@ -163,6 +175,77 @@ def test_minute_chunk_paths_are_separate_from_daily_storage() -> None:
     )
     assert receipt_path.name.endswith(".receipt.json")
     assert "daily_chunks" not in str(data_path)
+
+
+def test_research_gate_allows_audited_source_gaps_but_rejects_failures(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "download_summary.json"
+    base = {
+        "schema_version": 1,
+        "source": "shioaji_kbars_1m",
+        "storage_frequency": "minute",
+        "simulation": True,
+        "fatal_error": None,
+        "selected_symbols": 2,
+        "reported_symbols": 2,
+        "complete_symbols": 0,
+        "complete_with_source_gap_symbols": 1,
+        "contract_unavailable_symbols": 1,
+        "failed_symbols": 0,
+        "partial_symbols": 0,
+        "resumable_collection_complete": True,
+    }
+    path.write_text(json.dumps(base), encoding="utf-8")
+
+    result = _validate_collection_gate(
+        path, selected_symbols=["0050"], subset_requested=False
+    )
+    assert result["complete_with_source_gap_symbols"] == 1
+
+    base.update(
+        complete_with_source_gap_symbols=0,
+        failed_symbols=1,
+        resumable_collection_complete=False,
+    )
+    path.write_text(json.dumps(base), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="not research-ready"):
+        _validate_collection_gate(
+            path, selected_symbols=[], subset_requested=False
+        )
+
+
+def test_account_wide_rate_limiter_is_shared_across_processes() -> None:
+    context = mp.get_context("spawn")
+    output = context.Queue()
+    # Scale the official 50/5s boundary down to a fast 50/0.05s test while
+    # preserving its 50-request sliding-window shape.
+    limiter = SharedRequestRateLimiter(
+        context,
+        requests_per_second=1_000.0,
+        max_requests=50,
+        window_seconds=0.05,
+    )
+    processes = [
+        context.Process(
+            target=_acquire_rate_limit_slots,
+            args=(limiter, 25, output),
+        )
+        for _ in range(4)
+    ]
+
+    for process in processes:
+        process.start()
+    starts = sorted(output.get(timeout=10.0) for _ in range(100))
+    for process in processes:
+        process.join(timeout=10.0)
+
+    assert all(process.exitcode == 0 for process in processes)
+    assert limiter.snapshot()["total_requests"] == 100
+    assert all(
+        later - earlier >= 0.05 - 1e-4
+        for earlier, later in zip(starts[:50], starts[50:], strict=True)
+    )
 
 
 def test_full_market_universe_requires_explicit_scope() -> None:
@@ -331,7 +414,7 @@ def test_query_drops_only_fully_zero_shioaji_placeholders() -> None:
     row = UniverseRow(
         "0051", "元大中型100", "twse", "etf", Path("0051_features.parquet")
     )
-    frame, dropped = query_minute_chunk(
+    frame, query_audit = query_minute_chunk(
         FakeAPI(),
         object(),
         row,
@@ -344,7 +427,11 @@ def test_query_drops_only_fully_zero_shioaji_placeholders() -> None:
         expected_dates={TRADE_DATE},
     )
 
-    assert dropped == 1
+    assert query_audit["zero_placeholder_rows_dropped"] == 1
+    assert query_audit["negative_correction_rows_dropped"] == 0
+    assert query_audit["out_of_session_rows_dropped"] == 0
+    assert query_audit["outside_reference_date_rows_dropped"] == 0
+    assert query_audit["source_gap_dates"] == []
     assert frame.height == 1
     assert frame["ts"][0] == datetime(2026, 7, 24, 9, 1)
 
@@ -373,6 +460,154 @@ def test_query_drops_only_fully_zero_shioaji_placeholders() -> None:
             retry_backoff=0.0,
             expected_dates={TRADE_DATE},
         )
+
+
+def test_query_audits_non_executable_shioaji_rows() -> None:
+    class FakeAPI:
+        def kbars(self, **_: object) -> dict[str, list[object]]:
+            return {
+                "ts": [
+                    datetime(2026, 7, 24, 9, 1),
+                    datetime(2026, 7, 24, 9, 2),
+                    datetime(2026, 7, 24, 15, 0),
+                    datetime(2026, 7, 24, 15, 0),
+                ],
+                "Open": [100.0, 101.0, 102.0, 102.0],
+                "High": [101.0, 101.0, 102.0, 102.0],
+                "Low": [99.0, 101.0, 102.0, 102.0],
+                "Close": [100.5, 101.0, 102.0, 102.0],
+                "Volume": [10, -2, 1, 1],
+                "Amount": [1_000_000.0, -202_000.0, 102_000.0, 102_000.0],
+            }
+
+    row = UniverseRow(
+        "0051", "元大中型100", "twse", "etf", Path("0051_features.parquet")
+    )
+    frame, query_audit = query_minute_chunk(
+        FakeAPI(),
+        object(),
+        row,
+        contract_unit=1_000.0,
+        start=TRADE_DATE,
+        end=TRADE_DATE,
+        timeout_ms=30_000,
+        retries=0,
+        retry_backoff=0.0,
+        expected_dates={TRADE_DATE},
+    )
+
+    assert frame["ts"].to_list() == [datetime(2026, 7, 24, 9, 1)]
+    assert query_audit["negative_correction_rows_dropped"] == 1
+    assert query_audit["out_of_session_rows_dropped"] == 2
+    assert query_audit["outside_reference_date_rows_dropped"] == 0
+    assert query_audit["source_gap_dates"] == []
+
+
+def test_query_drops_one_sided_corrections_and_pre_lifecycle_rows() -> None:
+    pre_lifecycle = TRADE_DATE - timedelta(days=1)
+
+    class FakeAPI:
+        def kbars(self, **_: object) -> dict[str, list[object]]:
+            return {
+                "ts": [
+                    datetime.combine(pre_lifecycle, datetime.min.time()).replace(
+                        hour=9, minute=1
+                    ),
+                    datetime.combine(pre_lifecycle, datetime.min.time()).replace(
+                        hour=9, minute=1
+                    ),
+                    datetime(2026, 7, 24, 9, 1),
+                    datetime(2026, 7, 24, 9, 2),
+                    datetime(2026, 7, 24, 9, 3),
+                ],
+                "Open": [18.54, 18.10, 100.0, 0.0, 101.0],
+                "High": [18.54, 18.10, 100.0, 0.0, 101.0],
+                "Low": [18.54, 18.10, 100.0, 0.0, 101.0],
+                "Close": [18.54, 18.10, 100.0, 0.0, 101.0],
+                "Volume": [2_000, 1_000, 0, -107, 10],
+                "Amount": [37_080_000.0, 18_100_000.0, -10.0, 0.0, 1_010_000.0],
+            }
+
+    row = UniverseRow(
+        "3597", "映興", "tpex", "stock", Path("3597_features.parquet")
+    )
+    frame, query_audit = query_minute_chunk(
+        FakeAPI(),
+        object(),
+        row,
+        contract_unit=1_000.0,
+        start=pre_lifecycle,
+        end=TRADE_DATE,
+        timeout_ms=30_000,
+        retries=0,
+        retry_backoff=0.0,
+        expected_dates={TRADE_DATE},
+    )
+
+    assert frame["ts"].to_list() == [datetime(2026, 7, 24, 9, 3)]
+    assert query_audit["outside_reference_date_rows_dropped"] == 2
+    assert query_audit["negative_correction_rows_dropped"] == 2
+    assert query_audit["source_gap_dates"] == []
+
+
+def test_query_single_day_fallback_records_persistent_source_gap() -> None:
+    missing_date = TRADE_DATE - timedelta(days=1)
+
+    class FakeAPI:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str]] = []
+
+        def kbars(self, **kwargs: object) -> dict[str, list[object]]:
+            start = str(kwargs["start"])
+            end = str(kwargs["end"])
+            self.calls.append((start, end))
+            if start == end == missing_date.isoformat():
+                return {
+                    "ts": [],
+                    "Open": [],
+                    "High": [],
+                    "Low": [],
+                    "Close": [],
+                    "Volume": [],
+                    "Amount": [],
+                }
+            return {
+                "ts": [datetime(2026, 7, 24, 9, 1)],
+                "Open": [100.0],
+                "High": [101.0],
+                "Low": [99.0],
+                "Close": [100.5],
+                "Volume": [10],
+                "Amount": [1_000_000.0],
+            }
+
+    api = FakeAPI()
+    request_starts: list[int] = []
+    row = UniverseRow(
+        "0051", "元大中型100", "twse", "etf", Path("0051_features.parquet")
+    )
+    frame, query_audit = query_minute_chunk(
+        api,
+        object(),
+        row,
+        contract_unit=1_000.0,
+        start=missing_date,
+        end=TRADE_DATE,
+        timeout_ms=30_000,
+        retries=0,
+        retry_backoff=0.0,
+        expected_dates={missing_date, TRADE_DATE},
+        request_started=lambda: request_starts.append(len(request_starts) + 1),
+    )
+
+    assert frame.height == 1
+    assert api.calls == [
+        (missing_date.isoformat(), TRADE_DATE.isoformat()),
+        (missing_date.isoformat(), missing_date.isoformat()),
+    ]
+    assert query_audit["single_day_fallback_queries"] == 1
+    assert query_audit["source_gap_dates"] == [missing_date.isoformat()]
+    assert request_starts == [1, 2]
 
 
 def test_completed_bar_features_do_not_read_next_bar() -> None:
@@ -525,5 +760,7 @@ def test_flat_price_round_trip_is_negative_after_fees_and_slippage() -> None:
 
     assert result.summary["trades"] == 1
     assert result.trades["gross_return"][0] == pytest.approx(0.0)
-    assert result.trades["net_return"][0] < -0.003
+    assert result.trades["net_return"][0] < 0.0
+    assert result.summary["total_explicit_fees"] > 0.0
+    assert result.summary["total_slippage_cost"] > 0.0
     assert result.summary["total_return"] < 0.0

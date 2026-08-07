@@ -91,6 +91,80 @@ _TW_INDEX_FUTURES_MODEL_NAMES = frozenset(
         "tw_index_futures",
     }
 )
+_TW_OPTION_TICK_EXECUTION_MODES = frozenset(
+    {"tw_index_options_tick_long", "tw_index_options_tick_short"}
+)
+_TW_OPTION_TICK_MODEL_NAMES = frozenset(
+    {
+        "transformer_base_portfolio",
+        "transformer_base_portfolio_model",
+        "flash_transformer_portfolio",
+        "scalable_transformer_portfolio",
+        "multi_axis_transformer_portfolio",
+        "tbp",
+    }
+)
+
+
+def _validate_tw_minute_mode_contract(
+    *,
+    execution_mode: str,
+    frequency: object,
+    model_name: object,
+    loss_type: object,
+    long_only: object,
+    portfolio_output_mode: object,
+    first_decision_minute: object,
+    last_entry_minute: object,
+    last_decision_minute: object,
+    force_session_close: object,
+) -> None:
+    """Fail closed before daily semantics can leak into one-minute training."""
+
+    if execution_mode != "tw_minute":
+        return
+    if _normalized_contract_name(frequency) not in {"minute", "1m", "1_minute"}:
+        raise ValueError(
+            "trading.execution_mode='tw_minute' requires trading.frequency='minute'"
+        )
+    if (
+        _normalized_contract_name(model_name)
+        not in _TW_PHASE_HEAD_MODEL_NAMES - _TW_FINANCIAL_PHASE_HEAD_MODEL_NAMES
+    ):
+        raise ValueError(
+            "tw_minute currently supports training.model_name="
+            "'transformer_base_portfolio'; the minute runner requires one scalar "
+            "score per symbol and does not flatten a phase head"
+        )
+    if _normalized_contract_name(loss_type) not in _TW_PHASE_RETURN_OBJECTIVES:
+        raise ValueError(
+            "tw_minute currently supports only the canonical path-dependent "
+            "log-utility objective"
+        )
+    if not bool(long_only):
+        raise ValueError(
+            "tw_minute v1 is long-only because historical point-in-time sell-first "
+            "eligibility is not yet joined; do not project today's eligibility backward"
+        )
+    if normalize_portfolio_output_mode(str(portfolio_output_mode)) != "logits":
+        raise ValueError(
+            "tw_minute requires transformer_base_portfolio.portfolio_output_mode='logits' "
+            "so the minute executor owns tradability masking and exposure limits"
+        )
+    first = int(first_decision_minute)
+    last_entry = int(last_entry_minute)
+    last = int(last_decision_minute)
+    if not 1 <= first <= last_entry < last <= 269:
+        raise ValueError(
+            "tw_minute decision contract requires "
+            "1 <= first_decision_minute <= last_entry_minute < "
+            "last_decision_minute <= 269"
+        )
+    if not bool(force_session_close):
+        raise ValueError(
+            "tw_minute must force_session_close=true; overnight inventory is outside "
+            "the one-minute day-trade contract"
+        )
 
 
 def _normalized_contract_name(value: object) -> str:
@@ -133,15 +207,11 @@ def _validate_tw_phase_mode_contract(
         )
 
     unsupported_auxiliary_losses = {
-        "training.multitask_loss.return_rank_ic_weight": float(
-            return_rank_ic_weight
-        ),
+        "training.multitask_loss.return_rank_ic_weight": float(return_rank_ic_weight),
         "training.multitask_loss.direction_weight": float(direction_weight),
     }
     enabled_unsupported_auxiliary_losses = [
-        name
-        for name, weight in unsupported_auxiliary_losses.items()
-        if weight > 0.0
+        name for name, weight in unsupported_auxiliary_losses.items() if weight > 0.0
     ]
     if enabled_unsupported_auxiliary_losses:
         raise ValueError(
@@ -159,19 +229,14 @@ def _validate_tw_phase_mode_contract(
             "fraction is not a signed portfolio exposure"
         )
 
-    output_mode = normalize_portfolio_output_mode(
-        str(model_portfolio_output_mode)
-    )
+    output_mode = normalize_portfolio_output_mode(str(model_portfolio_output_mode))
     trading_activation = normalize_portfolio_activation(
         str(trading_portfolio_activation)
     )
-    raw_loss_activation = _normalized_contract_name(
-        loss_portfolio_activation
-    )
+    raw_loss_activation = _normalized_contract_name(loss_portfolio_activation)
     loss_activation = (
         trading_activation
-        if raw_loss_activation
-        in {"", "auto", "trading", "same", "same_as_trading"}
+        if raw_loss_activation in {"", "auto", "trading", "same", "same_as_trading"}
         else normalize_portfolio_activation(raw_loss_activation)
     )
     processed_output = output_mode != "logits"
@@ -213,9 +278,7 @@ def _validate_tw_phase_mode_contract(
             raise ValueError(
                 f"trading.execution_mode={execution_mode!r} with model "
                 "portfolio_output_mode='logits' emits unresolved raw phase "
-                "logits; "
-                + ", ".join(mismatched)
-                + " cannot be 'pre_normalized'"
+                "logits; " + ", ".join(mismatched) + " cannot be 'pre_normalized'"
             )
 
 
@@ -259,6 +322,82 @@ def _validate_tw_index_futures_mode_contract(
         )
 
 
+def _validate_tw_index_derivatives_tick_mode_contract(
+    *,
+    execution_mode: str,
+    frequency: object,
+    model_name: object,
+    loss_type: object,
+    long_only: object,
+    session: object,
+    execution_price_source: object,
+    return_rank_ic_weight: object,
+    direction_weight: object,
+    volatility_regime_weight: object,
+    concentration_weight: object,
+) -> None:
+    """Fail closed before daily or direct-option semantics enter tick training."""
+
+    tick_modes = {"tw_index_derivatives_tick", *_TW_OPTION_TICK_EXECUTION_MODES}
+    if execution_mode not in tick_modes:
+        return
+    if _normalized_contract_name(frequency) not in {"tick", "ticks", "transaction"}:
+        raise ValueError(
+            "trading.execution_mode='tw_index_derivatives_tick' requires "
+            "trading.frequency='tick'"
+        )
+    normalized_model = _normalized_contract_name(model_name)
+    if execution_mode == "tw_index_derivatives_tick":
+        if normalized_model not in _TW_INDEX_FUTURES_MODEL_NAMES:
+            raise ValueError(
+                "tw_index_derivatives_tick requires "
+                "training.model_name='cross_sectional_index_futures'"
+            )
+        if bool(long_only):
+            raise ValueError(
+                "tw_index_derivatives_tick models one signed TX exposure and "
+                "requires trading.long_only=false"
+            )
+    else:
+        if normalized_model not in _TW_OPTION_TICK_MODEL_NAMES:
+            raise ValueError(
+                f"{execution_mode} requires "
+                "training.model_name='transformer_base_portfolio'"
+            )
+        expected_long_only = execution_mode == "tw_index_options_tick_long"
+        if bool(long_only) != expected_long_only:
+            raise ValueError(
+                f"{execution_mode} requires trading.long_only="
+                f"{str(expected_long_only).lower()}"
+            )
+    if _normalized_contract_name(loss_type) not in _TW_PHASE_RETURN_OBJECTIVES:
+        raise ValueError(
+            "tw_index_derivatives_tick supports only the canonical path-dependent "
+            "log-utility objective"
+        )
+    if _normalized_contract_name(session) != "day":
+        raise ValueError(
+            "tw_index_derivatives_tick v1 supports only the TAIFEX day session"
+        )
+    if _normalized_contract_name(execution_price_source) != "shioaji_bidask":
+        raise ValueError(
+            f"{execution_mode} requires captured Shioaji BidAsk execution; "
+            "trade-price fallback is not permitted"
+        )
+    unsupported = {
+        "return_rank_ic_weight": float(return_rank_ic_weight),
+        "direction_weight": float(direction_weight),
+        "volatility_regime_weight": float(volatility_regime_weight),
+        "concentration_weight": float(concentration_weight),
+    }
+    enabled = [name for name, value in unsupported.items() if value != 0.0]
+    if enabled:
+        raise ValueError(
+            f"{execution_mode} requires "
+            "stock-level auxiliary loss weights to be zero: " + ", ".join(enabled)
+        )
+
+
 class _UniqueKeySafeLoader(yaml.SafeLoader):
     """Safe YAML loader that rejects ambiguous duplicate mapping keys."""
 
@@ -279,9 +418,7 @@ def _construct_unique_mapping(
                 f"Unhashable YAML mapping key at {key_node.start_mark}"
             ) from exc
         if duplicate:
-            raise ValueError(
-                f"Duplicate YAML key {key!r} at {key_node.start_mark}"
-            )
+            raise ValueError(f"Duplicate YAML key {key!r} at {key_node.start_mark}")
         mapping[key] = loader.construct_object(value_node, deep=deep)
     return mapping
 
@@ -344,7 +481,11 @@ def _validate_config_bool_values(
     hints = get_type_hints(dataclass_type)
     invalid: list[str] = []
     for key, annotation in hints.items():
-        if key not in payload or payload[key] is None or not _is_strict_bool_annotation(annotation):
+        if (
+            key not in payload
+            or payload[key] is None
+            or not _is_strict_bool_annotation(annotation)
+        ):
             continue
         value = payload[key]
         if type(value) is not bool:
@@ -401,7 +542,9 @@ def _set_dataclass_defaults(
             payload.setdefault(key, value)
 
 
-def _set_legacy_alias_defaults(payload: dict[str, Any], aliases: dict[str, Any]) -> None:
+def _set_legacy_alias_defaults(
+    payload: dict[str, Any], aliases: dict[str, Any]
+) -> None:
     """Apply only explicitly supplied legacy values before canonical defaults."""
     for key, value in aliases.items():
         if value is not MISSING:
@@ -412,7 +555,9 @@ def _deep_merge_config(base: Any, override: Any) -> Any:
     if isinstance(base, dict) and isinstance(override, dict):
         merged = dict(base)
         for key, value in override.items():
-            merged[key] = _deep_merge_config(merged[key], value) if key in merged else value
+            merged[key] = (
+                _deep_merge_config(merged[key], value) if key in merged else value
+            )
         return merged
     return override
 
@@ -465,7 +610,9 @@ def _normalize_string_list(value: Any, *, field_name: str) -> list[str]:
     elif isinstance(value, (list, tuple, set)):
         raw_items = value
     else:
-        raise ValueError(f"{field_name} must be a list or comma-separated string, got {type(value).__name__}")
+        raise ValueError(
+            f"{field_name} must be a list or comma-separated string, got {type(value).__name__}"
+        )
 
     items: list[str] = []
     for item in raw_items:
@@ -529,7 +676,9 @@ class DataConfig:
     live_tail_panel_rows: int = 0
     use_tw_public_features: bool = False
     use_tw_public_rules: bool = False
-    tw_public_feature_path: str = "data_tw_public/features/tw_public_stock_daily.parquet"
+    tw_public_feature_path: str = (
+        "data_tw_public/features/tw_public_stock_daily.parquet"
+    )
     tw_public_market_symbol: str = "__MARKET__"
     feature_include: list[str] = field(default_factory=list)
     feature_exclude: list[str] = field(default_factory=list)
@@ -544,6 +693,35 @@ class DataConfig:
     # Explicit research-only opt-in for using final session-t aggregates in a
     # model that approximates execution at that same close.
     allow_same_close_feature_approximation: bool = False
+    # Receipt-backed, date-partitioned right-labelled one-minute research data.
+    # This path is consumed only by execution_mode=tw_minute and never by the
+    # daily panel builder.
+    minute_parquet_root: str = "data_tw_minute/research_dataset"
+    minute_require_research_ready: bool = True
+    minute_verify_partition_sha256: bool = True
+    # Receipt-backed completed-second TX/TXO transactions.  The derived
+    # dataset uses TXO chain activity as features and the first later TX trade
+    # as the executable price; it never enters the daily panel builder.
+    index_derivatives_tick_raw_root: str = "data_tw_index_derivatives_ticks"
+    index_derivatives_tick_dataset_root: str = (
+        "data_tw_index_derivatives_ticks/strategy_dataset_bidask"
+    )
+    index_derivatives_tick_execution_price_source: str = "shioaji_bidask"
+    index_derivatives_tick_bidask_capture_root: str = (
+        "data_tw_index_derivatives_ticks/shioaji_fop_captures"
+    )
+    index_derivatives_tick_execution_latency_ms: float = 250.0
+    index_derivatives_tick_execution_max_wait_ms: float = 1_000.0
+    index_derivatives_tick_max_transport_delay_ms: float = 2_000.0
+    index_derivatives_tick_verify_partition_sha256: bool = True
+    index_derivatives_tick_session: str = "day"
+    index_derivatives_tick_decision_interval_seconds: int = 5
+    index_derivatives_tick_rolling_window_seconds: int = 60
+    index_derivatives_tick_warmup_seconds: int = 300
+    index_derivatives_tick_atm_moneyness_fraction: float = 0.01
+    index_derivatives_tick_min_train_days: int = 20
+    index_derivatives_tick_val_days: int = 5
+    index_derivatives_tick_test_days: int = 5
 
 
 @dataclass(slots=True)
@@ -603,6 +781,19 @@ class TradingConfig:
     tw_corporate_action_claim_queue_sessions: int = 256
     tw_cash_lot_size: int = 1
     tw_day_trade_lot_size: int = 1000
+    # Continuous research executor for right-labelled 1m Kbars. Decisions are
+    # made after a completed bar and target deltas execute at the next bar's
+    # open proxy. A later Tick/BidAsk phase can replace that price model without
+    # changing the decision clock.
+    tw_minute_initial_equity: float = 10_000_000.0
+    tw_minute_gross_exposure: float = 0.90
+    tw_minute_max_name_weight: float = 0.05
+    tw_minute_max_order_notional: float = 1_000_000.0
+    tw_minute_slippage_bps_per_side: float = 2.0
+    tw_minute_first_decision_minute: int = 1
+    tw_minute_last_entry_minute: int = 268
+    tw_minute_last_decision_minute: int = 269
+    tw_minute_force_session_close: bool = True
     # A negative tw_cash position is a separate margin-short liability, never
     # a negative cash-share holding.  These fields are serialized as part of
     # TradingConfig and therefore participate in checkpoint compatibility.
@@ -617,7 +808,9 @@ class TradingConfig:
     tw_short_capacity_limit_enabled: bool = True
     # Daily TX/MTX/TMF execution. The three products are integer-sizing
     # instruments for one signed TAIEX exposure, not independent alpha heads.
-    tw_index_futures_data_path: str = "data_tw_index_futures/day_session_front_month.parquet"
+    tw_index_futures_data_path: str = (
+        "data_tw_index_futures/day_session_front_month.parquet"
+    )
     tw_index_futures_reference_product: str = "TX"
     tw_index_futures_initial_capital: float = 1_000_000.0
     tw_index_futures_max_abs_exposure: float = 1.0
@@ -631,6 +824,22 @@ class TradingConfig:
         default_factory=lambda: [0.0, 0.0, 0.0]
     )
     tw_index_futures_basket_fee_penalty: float = 1.0
+    # Completed-second TX/TXO strategies. The futures mode charges costs on a
+    # signed TX exposure; both direct-option policies share the fields below.
+    tw_index_derivatives_tick_fee_rate_per_side: float = 0.000045
+    tw_index_derivatives_tick_slippage_points_per_side: float = 0.0
+    tw_index_derivatives_tick_initial_equity: float = 1_000_000.0
+    tw_index_derivatives_tick_contract_multiplier: float = 200.0
+    tw_index_options_tick_initial_equity: float = 1_000_000.0
+    tw_index_options_tick_maximum_capital_fraction: float = 0.80
+    tw_index_options_tick_contract_multiplier: float = 50.0
+    # Current original-margin A/B inputs are explicit because TAIFEX may revise
+    # them. Historical experiments must pin the values applicable to the data.
+    tw_index_options_tick_risk_margin_a_twd: float = 169_000.0
+    tw_index_options_tick_risk_margin_b_twd: float = 85_000.0
+    tw_index_options_tick_fixed_fee_per_contract_per_side_twd: float = 20.0
+    tw_index_options_tick_transaction_tax_rate: float = 0.001
+    tw_index_options_tick_slippage_points_per_side: float = 0.5
 
 
 @dataclass(slots=True)
@@ -1021,6 +1230,13 @@ class TrainingConfig:
     lookback: int = 1
     batch_size_train: int = 32
     batch_size_eval: int = 32
+    # tw_minute interprets batch_size_train/eval as independent trading days.
+    # Decisions remain sequential inside each day and are vectorized in fixed
+    # chunks so overlapping lookback rows are projected only once.
+    minute_decision_chunk_rows: int = 8
+    minute_cache_days_on_cpu: bool = True
+    minute_cpu_cache_gb: float = 64.0
+    minute_data_workers: int = 4
     min_batch_size: int = 1
     auto_batch_size: bool = False
     vram_budget_gb: float = 8.0
@@ -1075,7 +1291,14 @@ class TrainingConfig:
     explain_cross_asset_max_repeated_rows: int = 48
     explain_cross_asset_perturb_scale: float = 1.0
     explain_cross_asset_shocks: list[str] = field(
-        default_factory=lambda: ["zero", "momentum", "gap", "volume", "volatility", "liquidity"]
+        default_factory=lambda: [
+            "zero",
+            "momentum",
+            "gap",
+            "volume",
+            "volatility",
+            "liquidity",
+        ]
     )
     explain_cross_asset_attention_flow: bool = True
     explain_cross_asset_attention_capture_rows: int = 1
@@ -1098,7 +1321,9 @@ class TrainingConfig:
     postprocess_benchmark_after_best_val: bool = False
     postprocess_benchmark_split: str = "test"
     postprocess_benchmark_activations: str = "identity,softsign,tanh,isru,erf,atan,gd"
-    postprocess_benchmark_thresholds: str = "0,0.0001,0.00025,0.0005,0.001,0.0025,0.005,0.01,0.02"
+    postprocess_benchmark_thresholds: str = (
+        "0,0.0001,0.00025,0.0005,0.001,0.0025,0.005,0.01,0.02"
+    )
     postprocess_benchmark_rank_metric: str = "sharpe"
     postprocess_benchmark_plot_metrics: str = "sharpe,sortino,cumulative_return"
     postprocess_benchmark_plot_top_n: int = 20
@@ -1122,13 +1347,21 @@ class TrainingConfig:
     grad_clip_norm: float = 1.0
     finite_check_interval_steps: int = 0
     checkpoint_finite_check: bool = True
-    loss_type: str = "mse"  # "mse", "pure_rank", "rank_ic", "sharpe", "sortino", "log_utility", etc.
+    loss_type: str = (
+        "mse"  # "mse", "pure_rank", "rank_ic", "sharpe", "sortino", "log_utility", etc.
+    )
     mlp: MLPModelConfig = field(default_factory=MLPModelConfig)
-    ft_transformer: FTTransformerModelConfig = field(default_factory=FTTransformerModelConfig)
-    tabular_resnet: TabularResNetModelConfig = field(default_factory=TabularResNetModelConfig)
-    multi_stock_tcn: MultiStockTCNModelConfig = field(default_factory=MultiStockTCNModelConfig)
-    efficient_tcn_tabular_set_portfolio: EfficientTCNTabularSetPortfolioModelConfig = field(
-        default_factory=EfficientTCNTabularSetPortfolioModelConfig
+    ft_transformer: FTTransformerModelConfig = field(
+        default_factory=FTTransformerModelConfig
+    )
+    tabular_resnet: TabularResNetModelConfig = field(
+        default_factory=TabularResNetModelConfig
+    )
+    multi_stock_tcn: MultiStockTCNModelConfig = field(
+        default_factory=MultiStockTCNModelConfig
+    )
+    efficient_tcn_tabular_set_portfolio: EfficientTCNTabularSetPortfolioModelConfig = (
+        field(default_factory=EfficientTCNTabularSetPortfolioModelConfig)
     )
     latent_factor_market_token_portfolio: LatentFactorMarketTokenPortfolioModelConfig = field(
         default_factory=LatentFactorMarketTokenPortfolioModelConfig
@@ -1145,13 +1378,25 @@ class TrainingConfig:
     gradient_boosted_portfolio_transformer: GradientBoostedPortfolioTransformerConfig = field(
         default_factory=GradientBoostedPortfolioTransformerConfig
     )
-    bottleneck_portfolio_autoencoder: BottleneckPortfolioAutoencoderConfig = field(default_factory=BottleneckPortfolioAutoencoderConfig)
-    tcn_hybrid_tabular_resnet: TCNHybridTabularResNetModelConfig = field(default_factory=TCNHybridTabularResNetModelConfig)
-    temporal_tabular_resnet: TemporalTabularResNetModelConfig = field(default_factory=TemporalTabularResNetModelConfig)
-    cross_sectional_temporal_portfolio_model: CrossSectionalTemporalPortfolioModelConfig = field(default_factory=CrossSectionalTemporalPortfolioModelConfig)
+    bottleneck_portfolio_autoencoder: BottleneckPortfolioAutoencoderConfig = field(
+        default_factory=BottleneckPortfolioAutoencoderConfig
+    )
+    tcn_hybrid_tabular_resnet: TCNHybridTabularResNetModelConfig = field(
+        default_factory=TCNHybridTabularResNetModelConfig
+    )
+    temporal_tabular_resnet: TemporalTabularResNetModelConfig = field(
+        default_factory=TemporalTabularResNetModelConfig
+    )
+    cross_sectional_temporal_portfolio_model: CrossSectionalTemporalPortfolioModelConfig = field(
+        default_factory=CrossSectionalTemporalPortfolioModelConfig
+    )
     multitask_loss: MultitaskLossConfig = field(default_factory=MultitaskLossConfig)
-    factor_generalization_loss: FactorGeneralizationLossConfig = field(default_factory=FactorGeneralizationLossConfig)
-    portfolio_autoencoder_loss: PortfolioAutoencoderLossConfig = field(default_factory=PortfolioAutoencoderLossConfig)
+    factor_generalization_loss: FactorGeneralizationLossConfig = field(
+        default_factory=FactorGeneralizationLossConfig
+    )
+    portfolio_autoencoder_loss: PortfolioAutoencoderLossConfig = field(
+        default_factory=PortfolioAutoencoderLossConfig
+    )
     lightgbm: LightGBMModelConfig = field(default_factory=LightGBMModelConfig)
     xgboost: XGBoostModelConfig = field(default_factory=XGBoostModelConfig)
 
@@ -1240,8 +1485,12 @@ def _validate_raw_config_bool_types(raw: dict[str, Any]) -> None:
         if payload is None:
             continue
         if not isinstance(payload, dict):
-            raise ValueError(f"Config section 'training.{section_name}' must be a YAML mapping")
-        _validate_config_bool_values(payload, schema, section=f"training.{section_name}")
+            raise ValueError(
+                f"Config section 'training.{section_name}' must be a YAML mapping"
+            )
+        _validate_config_bool_values(
+            payload, schema, section=f"training.{section_name}"
+        )
 
 
 def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
@@ -1321,17 +1570,28 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
 
     # Preserve the historical master-switch shorthand before dataclass defaults
     # make it impossible to distinguish an omitted child flag from explicit false.
-    if "save_best_val_artifacts" not in training and "save_best_val_fold_artifacts" in training:
+    if (
+        "save_best_val_artifacts" not in training
+        and "save_best_val_fold_artifacts" in training
+    ):
         training["save_best_val_artifacts"] = training["save_best_val_fold_artifacts"]
-    if "save_best_val_fold_artifacts" not in training and "save_best_val_artifacts" in training:
+    if (
+        "save_best_val_fold_artifacts" not in training
+        and "save_best_val_artifacts" in training
+    ):
         training["save_best_val_fold_artifacts"] = training["save_best_val_artifacts"]
-    if "save_best_val_fold_plots" not in training and "save_best_val_fold_artifacts" in training:
+    if (
+        "save_best_val_fold_plots" not in training
+        and "save_best_val_fold_artifacts" in training
+    ):
         training["save_best_val_fold_plots"] = training["save_best_val_fold_artifacts"]
 
     nested_training_keys = set(_nested_training_schemas())
     _set_dataclass_defaults(training, TrainingConfig, exclude=nested_training_keys)
 
-    multi_gpu_strategy = str(training["multi_gpu_strategy"]).strip().lower().replace("-", "_")
+    multi_gpu_strategy = (
+        str(training["multi_gpu_strategy"]).strip().lower().replace("-", "_")
+    )
     multi_gpu_aliases = {
         "": "none",
         "0": "none",
@@ -1346,14 +1606,21 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         "distributed_data_parallel": "distributed_data_parallel",
         "torch_ddp": "distributed_data_parallel",
     }
-    if multi_gpu_strategy in {"dp", "dataparallel", "data_parallel", "torch_data_parallel"}:
+    if multi_gpu_strategy in {
+        "dp",
+        "dataparallel",
+        "data_parallel",
+        "torch_data_parallel",
+    }:
         raise ValueError(
             "training.multi_gpu_strategy='data_parallel' has been removed; "
             "use 'distributed_data_parallel' with torchrun"
         )
     multi_gpu_strategy = multi_gpu_aliases.get(multi_gpu_strategy, multi_gpu_strategy)
     if multi_gpu_strategy not in {"auto", "none", "distributed_data_parallel"}:
-        raise ValueError("training.multi_gpu_strategy must be one of: auto, none, distributed_data_parallel")
+        raise ValueError(
+            "training.multi_gpu_strategy must be one of: auto, none, distributed_data_parallel"
+        )
     training["multi_gpu_strategy"] = multi_gpu_strategy
     training["ddp_bucket_cap_mb"] = int(training["ddp_bucket_cap_mb"])
     training["tw_continuous_compile_chunk_rows"] = max(
@@ -1364,6 +1631,11 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         0,
         int(training["tw_continuous_gradient_horizon_rows"]),
     )
+    training["minute_decision_chunk_rows"] = max(
+        1, int(training["minute_decision_chunk_rows"])
+    )
+    training["minute_cpu_cache_gb"] = max(0.0, float(training["minute_cpu_cache_gb"]))
+    training["minute_data_workers"] = max(1, int(training["minute_data_workers"]))
     tw_compile_rows = training["tw_continuous_compile_chunk_rows"]
     tw_gradient_rows = training["tw_continuous_gradient_horizon_rows"]
     if (
@@ -1375,20 +1647,27 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
             "training.tw_continuous_gradient_horizon_rows must be zero or "
             "an exact multiple of tw_continuous_compile_chunk_rows"
         )
-    training["best_checkpoint_max_epoch"] = max(0, int(training["best_checkpoint_max_epoch"]))
+    training["best_checkpoint_max_epoch"] = max(
+        0, int(training["best_checkpoint_max_epoch"])
+    )
     save_best_val_artifacts = bool(training["save_best_val_artifacts"])
     training["save_best_val_artifacts"] = save_best_val_artifacts
     training["save_best_val_fold_artifacts"] = (
         bool(training["save_best_val_fold_artifacts"]) and save_best_val_artifacts
     )
     training["save_best_val_fold_plots"] = (
-        bool(training["save_best_val_fold_plots"]) and training["save_best_val_fold_artifacts"]
+        bool(training["save_best_val_fold_plots"])
+        and training["save_best_val_fold_artifacts"]
     )
     postprocess_split = str(training["postprocess_benchmark_split"]).strip().lower()
     if postprocess_split not in {"train", "val", "test"}:
-        raise ValueError("training.postprocess_benchmark_split must be one of: train, val, test")
+        raise ValueError(
+            "training.postprocess_benchmark_split must be one of: train, val, test"
+        )
     training["postprocess_benchmark_split"] = postprocess_split
-    postprocess_metric = str(training["postprocess_benchmark_rank_metric"]).strip().lower()
+    postprocess_metric = (
+        str(training["postprocess_benchmark_rank_metric"]).strip().lower()
+    )
     metric_aliases = {
         "sharp": "sharpe",
         "cum_return": "cumulative_return",
@@ -1418,7 +1697,10 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     training["postprocess_benchmark_rank_metric"] = postprocess_metric
     plot_metrics: list[str] = []
     for raw_metric in str(training["postprocess_benchmark_plot_metrics"]).split(","):
-        metric = metric_aliases.get(raw_metric.strip().lower().replace("-", "_"), raw_metric.strip().lower().replace("-", "_"))
+        metric = metric_aliases.get(
+            raw_metric.strip().lower().replace("-", "_"),
+            raw_metric.strip().lower().replace("-", "_"),
+        )
         if not metric:
             continue
         if metric not in valid_postprocess_metrics:
@@ -1445,7 +1727,9 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     legacy_transformer_layers = training.get("transformer_layers", MISSING)
     legacy_transformer_heads = training.get("transformer_heads", MISSING)
     legacy_transformer_ffn_dim = training.get("transformer_ffn_dim", MISSING)
-    legacy_transformer_use_cls_token = training.get("transformer_use_cls_token", MISSING)
+    legacy_transformer_use_cls_token = training.get(
+        "transformer_use_cls_token", MISSING
+    )
     legacy_dropout = training.get("dropout", MISSING)
 
     mlp = training.setdefault("mlp", {})
@@ -1479,9 +1763,13 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         tabular_resnet,
         {
             "embedding_dim": (
-                max(64, int(legacy_embedding_dim)) if legacy_embedding_dim is not MISSING else MISSING
+                max(64, int(legacy_embedding_dim))
+                if legacy_embedding_dim is not MISSING
+                else MISSING
             ),
-            "hidden_dim": max(128, int(legacy_hidden_dim)) if legacy_hidden_dim is not MISSING else MISSING,
+            "hidden_dim": max(128, int(legacy_hidden_dim))
+            if legacy_hidden_dim is not MISSING
+            else MISSING,
             "dropout": legacy_dropout,
         },
     )
@@ -1492,20 +1780,28 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         multi_stock_tcn,
         {
             "hidden_channels": (
-                max(32, int(legacy_embedding_dim)) if legacy_embedding_dim is not MISSING else MISSING
+                max(32, int(legacy_embedding_dim))
+                if legacy_embedding_dim is not MISSING
+                else MISSING
             ),
             "embedding_dim": (
-                max(32, int(legacy_embedding_dim)) if legacy_embedding_dim is not MISSING else MISSING
+                max(32, int(legacy_embedding_dim))
+                if legacy_embedding_dim is not MISSING
+                else MISSING
             ),
             "head_hidden_dim": (
-                max(64, int(legacy_embedding_dim)) if legacy_embedding_dim is not MISSING else MISSING
+                max(64, int(legacy_embedding_dim))
+                if legacy_embedding_dim is not MISSING
+                else MISSING
             ),
             "dropout": legacy_dropout,
         },
     )
     _set_dataclass_defaults(multi_stock_tcn, MultiStockTCNModelConfig)
 
-    efficient_tcn_tabular_set_portfolio = training.setdefault("efficient_tcn_tabular_set_portfolio", {})
+    efficient_tcn_tabular_set_portfolio = training.setdefault(
+        "efficient_tcn_tabular_set_portfolio", {}
+    )
     _set_legacy_alias_defaults(
         efficient_tcn_tabular_set_portfolio,
         {"dropout": legacy_dropout},
@@ -1515,7 +1811,9 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         EfficientTCNTabularSetPortfolioModelConfig,
     )
 
-    latent_factor_market_token_portfolio = training.setdefault("latent_factor_market_token_portfolio", {})
+    latent_factor_market_token_portfolio = training.setdefault(
+        "latent_factor_market_token_portfolio", {}
+    )
     _set_legacy_alias_defaults(
         latent_factor_market_token_portfolio,
         {"dropout": legacy_dropout},
@@ -1525,7 +1823,9 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         LatentFactorMarketTokenPortfolioModelConfig,
     )
 
-    low_rank_market_transformer_portfolio = training.setdefault("low_rank_market_transformer_portfolio", {})
+    low_rank_market_transformer_portfolio = training.setdefault(
+        "low_rank_market_transformer_portfolio", {}
+    )
     _set_legacy_alias_defaults(
         low_rank_market_transformer_portfolio,
         {"temporal_dropout": legacy_dropout, "dropout": legacy_dropout},
@@ -1535,13 +1835,19 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         LowRankMarketTransformerPortfolioModelConfig,
     )
 
-    financial_transformer_overrides = deepcopy(training.get("financial_transformer", {}))
+    financial_transformer_overrides = deepcopy(
+        training.get("financial_transformer", {})
+    )
 
     transformer_base_portfolio = training.setdefault("transformer_base_portfolio", {})
     _set_legacy_alias_defaults(transformer_base_portfolio, {"dropout": legacy_dropout})
-    _set_dataclass_defaults(transformer_base_portfolio, TransformerBasePortfolioModelConfig)
-    transformer_base_portfolio["portfolio_output_mode"] = normalize_portfolio_output_mode(
-        transformer_base_portfolio.get("portfolio_output_mode")
+    _set_dataclass_defaults(
+        transformer_base_portfolio, TransformerBasePortfolioModelConfig
+    )
+    transformer_base_portfolio["portfolio_output_mode"] = (
+        normalize_portfolio_output_mode(
+            transformer_base_portfolio.get("portfolio_output_mode")
+        )
     )
     transformer_base_portfolio["categorical_feature_names"] = _normalize_string_list(
         transformer_base_portfolio.get("categorical_feature_names"),
@@ -1577,8 +1883,12 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         2, int(financial_transformer["categorical_embedding_cardinality"])
     )
 
-    gradient_boosted_portfolio_transformer = training.setdefault("gradient_boosted_portfolio_transformer", {})
-    gradient_defaults = _dataclass_default_values(GradientBoostedPortfolioTransformerConfig)
+    gradient_boosted_portfolio_transformer = training.setdefault(
+        "gradient_boosted_portfolio_transformer", {}
+    )
+    gradient_defaults = _dataclass_default_values(
+        GradientBoostedPortfolioTransformerConfig
+    )
     _set_legacy_alias_defaults(
         gradient_boosted_portfolio_transformer,
         {"dropout": legacy_dropout},
@@ -1589,15 +1899,25 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     )
     raw_stage_eta = gradient_boosted_portfolio_transformer["stage_eta"]
     if isinstance(raw_stage_eta, str):
-        stage_eta = [float(item.strip()) for item in raw_stage_eta.split(",") if item.strip()]
+        stage_eta = [
+            float(item.strip()) for item in raw_stage_eta.split(",") if item.strip()
+        ]
     else:
-        stage_eta = [float(item) for item in (raw_stage_eta or gradient_defaults["stage_eta"])]
-    gradient_boosted_portfolio_transformer["stage_eta"] = stage_eta or deepcopy(gradient_defaults["stage_eta"])
-    gradient_boosted_portfolio_transformer["portfolio_output_mode"] = normalize_portfolio_output_mode(
-        gradient_boosted_portfolio_transformer.get("portfolio_output_mode")
+        stage_eta = [
+            float(item) for item in (raw_stage_eta or gradient_defaults["stage_eta"])
+        ]
+    gradient_boosted_portfolio_transformer["stage_eta"] = stage_eta or deepcopy(
+        gradient_defaults["stage_eta"]
+    )
+    gradient_boosted_portfolio_transformer["portfolio_output_mode"] = (
+        normalize_portfolio_output_mode(
+            gradient_boosted_portfolio_transformer.get("portfolio_output_mode")
+        )
     )
 
-    bottleneck_portfolio_autoencoder = training.setdefault("bottleneck_portfolio_autoencoder", {})
+    bottleneck_portfolio_autoencoder = training.setdefault(
+        "bottleneck_portfolio_autoencoder", {}
+    )
     _set_legacy_alias_defaults(
         bottleneck_portfolio_autoencoder,
         {"dropout": legacy_dropout},
@@ -1612,34 +1932,48 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         tcn_hybrid_tabular_resnet,
         {
             "embedding_dim": (
-                max(64, int(legacy_embedding_dim)) if legacy_embedding_dim is not MISSING else MISSING
+                max(64, int(legacy_embedding_dim))
+                if legacy_embedding_dim is not MISSING
+                else MISSING
             ),
             "encoder_hidden_dim": (
-                max(128, int(legacy_hidden_dim)) if legacy_hidden_dim is not MISSING else MISSING
+                max(128, int(legacy_hidden_dim))
+                if legacy_hidden_dim is not MISSING
+                else MISSING
             ),
             "dropout": legacy_dropout,
         },
     )
-    _set_dataclass_defaults(tcn_hybrid_tabular_resnet, TCNHybridTabularResNetModelConfig)
+    _set_dataclass_defaults(
+        tcn_hybrid_tabular_resnet, TCNHybridTabularResNetModelConfig
+    )
 
     temporal_tabular_resnet = training.setdefault("temporal_tabular_resnet", {})
     _set_legacy_alias_defaults(
         temporal_tabular_resnet,
         {
             "temporal_hidden_dim": (
-                max(64, int(legacy_embedding_dim)) if legacy_embedding_dim is not MISSING else MISSING
+                max(64, int(legacy_embedding_dim))
+                if legacy_embedding_dim is not MISSING
+                else MISSING
             ),
             "temporal_dropout": legacy_dropout,
             "embedding_dim": (
-                max(64, int(legacy_embedding_dim)) if legacy_embedding_dim is not MISSING else MISSING
+                max(64, int(legacy_embedding_dim))
+                if legacy_embedding_dim is not MISSING
+                else MISSING
             ),
-            "hidden_dim": max(128, int(legacy_hidden_dim)) if legacy_hidden_dim is not MISSING else MISSING,
+            "hidden_dim": max(128, int(legacy_hidden_dim))
+            if legacy_hidden_dim is not MISSING
+            else MISSING,
             "dropout": legacy_dropout,
         },
     )
     _set_dataclass_defaults(temporal_tabular_resnet, TemporalTabularResNetModelConfig)
 
-    cross_sectional_temporal_portfolio_model = training.setdefault("cross_sectional_temporal_portfolio_model", {})
+    cross_sectional_temporal_portfolio_model = training.setdefault(
+        "cross_sectional_temporal_portfolio_model", {}
+    )
     _set_legacy_alias_defaults(
         cross_sectional_temporal_portfolio_model,
         {"dropout": legacy_dropout},
@@ -1736,7 +2070,13 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         )
     data["security_filter"] = security_filter
     panel_backend = str(data["panel_backend"]).strip().lower()
-    valid_panel_backends = {"auto", "polars", "polars_lazy", "polars_streaming", "pyarrow"}
+    valid_panel_backends = {
+        "auto",
+        "polars",
+        "polars_lazy",
+        "polars_streaming",
+        "pyarrow",
+    }
     if panel_backend not in valid_panel_backends:
         raise ValueError(
             f"data.panel_backend must be one of {sorted(valid_panel_backends)}, got {data['panel_backend']!r}"
@@ -1779,12 +2119,16 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     data["use_tw_public_features"] = bool(data["use_tw_public_features"])
     data["use_tw_public_rules"] = bool(data["use_tw_public_rules"])
     data["tw_public_feature_path"] = str(data["tw_public_feature_path"] or "").strip()
-    tw_public_market_symbol_default = _dataclass_default_values(DataConfig)["tw_public_market_symbol"]
+    tw_public_market_symbol_default = _dataclass_default_values(DataConfig)[
+        "tw_public_market_symbol"
+    ]
     data["tw_public_market_symbol"] = (
         str(data["tw_public_market_symbol"] or tw_public_market_symbol_default).strip()
         or tw_public_market_symbol_default
     )
-    data["feature_include"] = _normalize_string_list(data["feature_include"], field_name="data.feature_include")
+    data["feature_include"] = _normalize_string_list(
+        data["feature_include"], field_name="data.feature_include"
+    )
     data["day_trade_open_feature"] = bool(data["day_trade_open_feature"])
     if (
         data["day_trade_open_feature"]
@@ -1804,7 +2148,9 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
             "data.feature_include contains permanently disabled snapshot-only "
             f"features: {forbidden_snapshot_features}"
         )
-    data["feature_exclude"] = _normalize_string_list(data["feature_exclude"], field_name="data.feature_exclude")
+    data["feature_exclude"] = _normalize_string_list(
+        data["feature_exclude"], field_name="data.feature_exclude"
+    )
     data["feature_zero_fill"] = _normalize_string_list(
         data["feature_zero_fill"], field_name="data.feature_zero_fill"
     )
@@ -1822,56 +2168,102 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
             f"training.plot_backend must be one of {sorted(valid_plot_backends)}, got {training['plot_backend']!r}"
         )
     training["plot_backend"] = plot_backend
-    if bool(training["strict_no_fallback"]) and bool(training["explain_write_plots"]) and plot_backend == "auto":
+    if (
+        bool(training["strict_no_fallback"])
+        and bool(training["explain_write_plots"])
+        and plot_backend == "auto"
+    ):
         raise ValueError(
             "training.plot_backend cannot be 'auto' when strict_no_fallback=true and explain_write_plots=true; "
             "choose 'rapids_datashader' or 'matplotlib' explicitly."
         )
     report_style = str(training["explain_report_style"]).strip().lower()
     if report_style not in {"paper", "standard", "none"}:
-        raise ValueError("training.explain_report_style must be one of: paper, standard, none")
+        raise ValueError(
+            "training.explain_report_style must be one of: paper, standard, none"
+        )
     training["explain_report_style"] = report_style
     plot_theme = str(training["explain_plot_theme"]).strip().lower()
     if plot_theme not in {"paper", "standard"}:
         raise ValueError("training.explain_plot_theme must be one of: paper, standard")
     training["explain_plot_theme"] = plot_theme
     shap_mode = str(training["explain_shap_mode"]).strip().lower()
-    valid_shap_modes = {"score_head_surrogate", "surrogate", "score_head", "off", "none"}
+    valid_shap_modes = {
+        "score_head_surrogate",
+        "surrogate",
+        "score_head",
+        "off",
+        "none",
+    }
     if shap_mode not in valid_shap_modes:
-        raise ValueError(f"training.explain_shap_mode must be one of {sorted(valid_shap_modes)}")
+        raise ValueError(
+            f"training.explain_shap_mode must be one of {sorted(valid_shap_modes)}"
+        )
     training["explain_shap_mode"] = shap_mode
-    j_lens_intervention_fraction = float(training["explain_j_lens_intervention_fraction"])
+    j_lens_intervention_fraction = float(
+        training["explain_j_lens_intervention_fraction"]
+    )
     if not 0.0 <= j_lens_intervention_fraction <= 1.0:
-        raise ValueError("training.explain_j_lens_intervention_fraction must be between 0 and 1")
+        raise ValueError(
+            "training.explain_j_lens_intervention_fraction must be between 0 and 1"
+        )
     training["explain_j_lens_intervention_fraction"] = j_lens_intervention_fraction
-    training["explain_case_study_top_k"] = max(1, int(training["explain_case_study_top_k"]))
+    training["explain_case_study_top_k"] = max(
+        1, int(training["explain_case_study_top_k"])
+    )
     training["explain_ig_batch_size"] = max(0, int(training["explain_ig_batch_size"]))
-    training["explain_perturb_batch_size"] = max(0, int(training["explain_perturb_batch_size"]))
+    training["explain_perturb_batch_size"] = max(
+        0, int(training["explain_perturb_batch_size"])
+    )
     training["explain_perturb_max_auto_batch_size"] = max(
         1, int(training["explain_perturb_max_auto_batch_size"])
     )
     training["explain_perturb_max_input_elements"] = max(
         1, int(training["explain_perturb_max_input_elements"])
     )
-    training["explain_umap_max_points"] = max(0, int(training["explain_umap_max_points"]))
-    training["explain_umap_max_projections"] = max(0, int(training["explain_umap_max_projections"]))
-    training["explain_umap_n_neighbors"] = max(2, int(training["explain_umap_n_neighbors"]))
-    training["explain_umap_min_dist"] = max(0.0, float(training["explain_umap_min_dist"]))
-    training["explain_cross_asset_max_sources"] = max(1, int(training["explain_cross_asset_max_sources"]))
-    training["explain_cross_asset_max_targets"] = max(1, int(training["explain_cross_asset_max_targets"]))
-    training["explain_cross_asset_top_edges"] = max(1, int(training["explain_cross_asset_top_edges"]))
+    training["explain_umap_max_points"] = max(
+        0, int(training["explain_umap_max_points"])
+    )
+    training["explain_umap_max_projections"] = max(
+        0, int(training["explain_umap_max_projections"])
+    )
+    training["explain_umap_n_neighbors"] = max(
+        2, int(training["explain_umap_n_neighbors"])
+    )
+    training["explain_umap_min_dist"] = max(
+        0.0, float(training["explain_umap_min_dist"])
+    )
+    training["explain_cross_asset_max_sources"] = max(
+        1, int(training["explain_cross_asset_max_sources"])
+    )
+    training["explain_cross_asset_max_targets"] = max(
+        1, int(training["explain_cross_asset_max_targets"])
+    )
+    training["explain_cross_asset_top_edges"] = max(
+        1, int(training["explain_cross_asset_top_edges"])
+    )
     training["explain_cross_asset_source_chunk_size"] = max(
         1, int(training["explain_cross_asset_source_chunk_size"])
     )
     training["explain_cross_asset_max_repeated_rows"] = max(
         1, int(training["explain_cross_asset_max_repeated_rows"])
     )
-    training["explain_cross_asset_perturb_scale"] = float(training["explain_cross_asset_perturb_scale"])
+    training["explain_cross_asset_perturb_scale"] = float(
+        training["explain_cross_asset_perturb_scale"]
+    )
     raw_cross_shocks = training["explain_cross_asset_shocks"]
     if isinstance(raw_cross_shocks, str):
-        cross_shocks = [value.strip().lower() for value in raw_cross_shocks.split(",") if value.strip()]
+        cross_shocks = [
+            value.strip().lower()
+            for value in raw_cross_shocks.split(",")
+            if value.strip()
+        ]
     else:
-        cross_shocks = [str(value).strip().lower() for value in raw_cross_shocks if str(value).strip()]
+        cross_shocks = [
+            str(value).strip().lower()
+            for value in raw_cross_shocks
+            if str(value).strip()
+        ]
     training["explain_cross_asset_shocks"] = cross_shocks or [
         "zero",
         "momentum",
@@ -1885,7 +2277,9 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     )
     graph_backend = str(training["explain_cross_asset_graph_backend"]).strip().lower()
     if graph_backend not in {"auto", "polars", "cugraph"}:
-        raise ValueError("training.explain_cross_asset_graph_backend must be one of: auto, polars, cugraph")
+        raise ValueError(
+            "training.explain_cross_asset_graph_backend must be one of: auto, polars, cugraph"
+        )
     training["explain_cross_asset_graph_backend"] = graph_backend
     training["explain_cross_asset_graph_benchmark_min_edges"] = max(
         0, int(training["explain_cross_asset_graph_benchmark_min_edges"])
@@ -1899,9 +2293,13 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     training["explain_cross_asset_graph_plot_max_nodes"] = max(
         5, int(training["explain_cross_asset_graph_plot_max_nodes"])
     )
-    backtest_artifact_compression = str(training["backtest_artifact_compression"]).strip().lower()
+    backtest_artifact_compression = (
+        str(training["backtest_artifact_compression"]).strip().lower()
+    )
     if backtest_artifact_compression not in {"none", "compressed"}:
-        raise ValueError("training.backtest_artifact_compression must be one of: none, compressed")
+        raise ValueError(
+            "training.backtest_artifact_compression must be one of: none, compressed"
+        )
     training["backtest_artifact_compression"] = backtest_artifact_compression
     legacy_gross_leverage = trading.pop("gross_leverage", None)
     legacy_leverage = trading.pop("leverage", None)
@@ -1940,31 +2338,48 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         execution_mode=trading["execution_mode"],
         model_name=training["model_name"],
         loss_type=training["loss_type"],
-        model_portfolio_output_mode=phase_model_config[
-            "portfolio_output_mode"
-        ],
+        model_portfolio_output_mode=phase_model_config["portfolio_output_mode"],
         trading_portfolio_activation=trading["portfolio_activation"],
         loss_portfolio_activation=training["loss_portfolio_activation"],
-        return_rank_ic_weight=training["multitask_loss"][
-            "return_rank_ic_weight"
-        ],
+        return_rank_ic_weight=training["multitask_loss"]["return_rank_ic_weight"],
         direction_weight=training["multitask_loss"]["direction_weight"],
         explain_after_each_fold=training["explain_after_each_fold"],
+    )
+    _validate_tw_minute_mode_contract(
+        execution_mode=trading["execution_mode"],
+        frequency=trading["frequency"],
+        model_name=training["model_name"],
+        loss_type=training["loss_type"],
+        long_only=trading["long_only"],
+        portfolio_output_mode=training["transformer_base_portfolio"][
+            "portfolio_output_mode"
+        ],
+        first_decision_minute=trading["tw_minute_first_decision_minute"],
+        last_entry_minute=trading["tw_minute_last_entry_minute"],
+        last_decision_minute=trading["tw_minute_last_decision_minute"],
+        force_session_close=trading["tw_minute_force_session_close"],
     )
     _validate_tw_index_futures_mode_contract(
         execution_mode=trading["execution_mode"],
         model_name=training["model_name"],
         loss_type=training["loss_type"],
-        return_rank_ic_weight=training["multitask_loss"][
-            "return_rank_ic_weight"
-        ],
+        return_rank_ic_weight=training["multitask_loss"]["return_rank_ic_weight"],
         direction_weight=training["multitask_loss"]["direction_weight"],
-        volatility_regime_weight=training["multitask_loss"][
-            "volatility_regime_weight"
-        ],
-        concentration_weight=training["multitask_loss"][
-            "concentration_weight"
-        ],
+        volatility_regime_weight=training["multitask_loss"]["volatility_regime_weight"],
+        concentration_weight=training["multitask_loss"]["concentration_weight"],
+    )
+    _validate_tw_index_derivatives_tick_mode_contract(
+        execution_mode=trading["execution_mode"],
+        frequency=trading["frequency"],
+        model_name=training["model_name"],
+        loss_type=training["loss_type"],
+        long_only=trading["long_only"],
+        session=data["index_derivatives_tick_session"],
+        execution_price_source=data["index_derivatives_tick_execution_price_source"],
+        return_rank_ic_weight=training["multitask_loss"]["return_rank_ic_weight"],
+        direction_weight=training["multitask_loss"]["direction_weight"],
+        volatility_regime_weight=training["multitask_loss"]["volatility_regime_weight"],
+        concentration_weight=training["multitask_loss"]["concentration_weight"],
     )
     if (
         DAY_TRADE_OPEN_GAP_FEATURE in data["feature_include"]
@@ -2021,16 +2436,10 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     trading["tw_short_lot_size"] = taiwan_short_schedule.lot_size
     trading["tw_short_handling_fee_rate"] = taiwan_short_schedule.handling_fee_rate
     if not isinstance(trading["tw_short_capacity_limit_enabled"], bool):
-        raise ValueError(
-            "trading.tw_short_capacity_limit_enabled must be a boolean"
-        )
-    corporate_action_mode = str(
-        trading["tw_corporate_action_mode"]
-    ).strip().lower()
+        raise ValueError("trading.tw_short_capacity_limit_enabled must be a boolean")
+    corporate_action_mode = str(trading["tw_corporate_action_mode"]).strip().lower()
     if corporate_action_mode not in {"avoid", "exact"}:
-        raise ValueError(
-            "trading.tw_corporate_action_mode must be 'avoid' or 'exact'"
-        )
+        raise ValueError("trading.tw_corporate_action_mode must be 'avoid' or 'exact'")
     trading["tw_corporate_action_mode"] = corporate_action_mode
     claim_queue = trading["tw_corporate_action_claim_queue_sessions"]
     if isinstance(claim_queue, bool) or not isinstance(claim_queue, int):
@@ -2051,15 +2460,9 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
             trading["tw_index_futures_reference_product"]
         )
     )
-    futures_initial_capital = float(
-        trading["tw_index_futures_initial_capital"]
-    )
-    futures_max_abs_exposure = float(
-        trading["tw_index_futures_max_abs_exposure"]
-    )
-    futures_basket_fee_penalty = float(
-        trading["tw_index_futures_basket_fee_penalty"]
-    )
+    futures_initial_capital = float(trading["tw_index_futures_initial_capital"])
+    futures_max_abs_exposure = float(trading["tw_index_futures_max_abs_exposure"])
+    futures_basket_fee_penalty = float(trading["tw_index_futures_basket_fee_penalty"])
     if not math.isfinite(futures_initial_capital) or futures_initial_capital <= 0.0:
         raise ValueError("tw_index_futures_initial_capital must be positive and finite")
     if (
@@ -2067,8 +2470,13 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         or not 0.0 < futures_max_abs_exposure <= 1.0
     ):
         raise ValueError("tw_index_futures_max_abs_exposure must be in (0, 1]")
-    if not math.isfinite(futures_basket_fee_penalty) or futures_basket_fee_penalty < 0.0:
-        raise ValueError("tw_index_futures_basket_fee_penalty must be finite and non-negative")
+    if (
+        not math.isfinite(futures_basket_fee_penalty)
+        or futures_basket_fee_penalty < 0.0
+    ):
+        raise ValueError(
+            "tw_index_futures_basket_fee_penalty must be finite and non-negative"
+        )
 
     def futures_triple(name: str) -> tuple[float, float, float]:
         raw_values = trading[name]
@@ -2087,12 +2495,8 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     futures_exchange_fees = futures_triple(
         "tw_index_futures_exchange_and_clearing_fee_per_side_twd"
     )
-    futures_total_fees = futures_triple(
-        "tw_index_futures_total_fee_per_side_twd"
-    )
-    futures_slippage = futures_triple(
-        "tw_index_futures_slippage_points_per_side"
-    )
+    futures_total_fees = futures_triple("tw_index_futures_total_fee_per_side_twd")
+    futures_slippage = futures_triple("tw_index_futures_slippage_points_per_side")
     if any(
         total + 1e-12 < exchange
         for total, exchange in zip(
@@ -2118,19 +2522,136 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     trading["tw_index_futures_initial_capital"] = futures_initial_capital
     trading["tw_index_futures_max_abs_exposure"] = futures_max_abs_exposure
     trading["tw_index_futures_basket_fee_penalty"] = futures_basket_fee_penalty
+    for key in (
+        "index_derivatives_tick_raw_root",
+        "index_derivatives_tick_dataset_root",
+        "index_derivatives_tick_bidask_capture_root",
+    ):
+        normalized_path = str(data[key]).strip()
+        if not normalized_path:
+            raise ValueError(f"data.{key} must not be empty")
+        data[key] = normalized_path
+    tick_session = _normalized_contract_name(data["index_derivatives_tick_session"])
+    if tick_session != "day":
+        raise ValueError(
+            "data.index_derivatives_tick_session currently supports only 'day'"
+        )
+    data["index_derivatives_tick_session"] = tick_session
+    tick_execution_source = _normalized_contract_name(
+        data["index_derivatives_tick_execution_price_source"]
+    )
+    if tick_execution_source not in {
+        "shioaji_bidask",
+        "taifex_next_trade_proxy",
+    }:
+        raise ValueError(
+            "data.index_derivatives_tick_execution_price_source is unsupported"
+        )
+    data["index_derivatives_tick_execution_price_source"] = tick_execution_source
+    for key in (
+        "index_derivatives_tick_execution_latency_ms",
+        "index_derivatives_tick_execution_max_wait_ms",
+        "index_derivatives_tick_max_transport_delay_ms",
+    ):
+        normalized_value = float(data[key])
+        if not math.isfinite(normalized_value) or normalized_value < 0.0:
+            raise ValueError(f"data.{key} must be finite and non-negative")
+        if (
+            key != "index_derivatives_tick_execution_latency_ms"
+            and normalized_value <= 0.0
+        ):
+            raise ValueError(f"data.{key} must be positive")
+        data[key] = normalized_value
+    for key in (
+        "index_derivatives_tick_decision_interval_seconds",
+        "index_derivatives_tick_rolling_window_seconds",
+        "index_derivatives_tick_warmup_seconds",
+        "index_derivatives_tick_min_train_days",
+        "index_derivatives_tick_val_days",
+        "index_derivatives_tick_test_days",
+    ):
+        raw_value = data[key]
+        if isinstance(raw_value, bool) or int(raw_value) != raw_value:
+            raise ValueError(f"data.{key} must be an integer")
+        normalized_value = int(raw_value)
+        if normalized_value < 1:
+            raise ValueError(f"data.{key} must be positive")
+        data[key] = normalized_value
+    if (
+        data["index_derivatives_tick_warmup_seconds"]
+        < data["index_derivatives_tick_rolling_window_seconds"]
+    ):
+        raise ValueError(
+            "data.index_derivatives_tick_warmup_seconds must cover the rolling window"
+        )
+    tick_atm_fraction = float(data["index_derivatives_tick_atm_moneyness_fraction"])
+    if not math.isfinite(tick_atm_fraction) or not 0.0 < tick_atm_fraction <= 0.25:
+        raise ValueError(
+            "data.index_derivatives_tick_atm_moneyness_fraction must be in (0, 0.25]"
+        )
+    data["index_derivatives_tick_atm_moneyness_fraction"] = tick_atm_fraction
+    for key in (
+        "tw_index_derivatives_tick_fee_rate_per_side",
+        "tw_index_derivatives_tick_slippage_points_per_side",
+        "tw_index_options_tick_fixed_fee_per_contract_per_side_twd",
+        "tw_index_options_tick_transaction_tax_rate",
+        "tw_index_options_tick_slippage_points_per_side",
+    ):
+        normalized_value = float(trading[key])
+        if not math.isfinite(normalized_value) or normalized_value < 0.0:
+            raise ValueError(f"trading.{key} must be finite and non-negative")
+        trading[key] = normalized_value
+    for key in (
+        "tw_index_options_tick_initial_equity",
+        "tw_index_options_tick_contract_multiplier",
+        "tw_index_options_tick_risk_margin_a_twd",
+        "tw_index_options_tick_risk_margin_b_twd",
+        "tw_index_derivatives_tick_initial_equity",
+        "tw_index_derivatives_tick_contract_multiplier",
+    ):
+        normalized_value = float(trading[key])
+        if not math.isfinite(normalized_value) or normalized_value <= 0.0:
+            raise ValueError(f"trading.{key} must be finite and positive")
+        trading[key] = normalized_value
+    option_capital_fraction = float(
+        trading["tw_index_options_tick_maximum_capital_fraction"]
+    )
+    if (
+        not math.isfinite(option_capital_fraction)
+        or not 0.0 < option_capital_fraction <= 1.0
+    ):
+        raise ValueError(
+            "trading.tw_index_options_tick_maximum_capital_fraction must be in (0,1]"
+        )
+    trading["tw_index_options_tick_maximum_capital_fraction"] = option_capital_fraction
+    if (
+        trading["tw_index_options_tick_risk_margin_b_twd"]
+        > trading["tw_index_options_tick_risk_margin_a_twd"]
+    ):
+        raise ValueError("tw_index_options_tick_risk_margin_b_twd must not exceed A")
     # Report/post-processing leverage only. Canonical model/loss/backtest exposure stays unlevered.
     trading["max_turnover_ratio"] = max(0.0, float(trading["max_turnover_ratio"]))
-    trading["max_volume_participation"] = max(0.0, float(trading["max_volume_participation"]))
-    trading["volume_participation_equity"] = max(1e-12, float(trading["volume_participation_equity"]))
+    trading["max_volume_participation"] = max(
+        0.0, float(trading["max_volume_participation"])
+    )
+    trading["volume_participation_equity"] = max(
+        1e-12, float(trading["volume_participation_equity"])
+    )
     trading["reporting_leverage"] = max(0.0, float(trading["reporting_leverage"]))
     trading["min_trade_weight"] = max(0.0, float(trading["min_trade_weight"]))
-    trading["portfolio_activation"] = normalize_portfolio_activation(trading["portfolio_activation"])
+    trading["portfolio_activation"] = normalize_portfolio_activation(
+        trading["portfolio_activation"]
+    )
     evaluation = raw.setdefault("evaluation", {})
-    loss_activation = str(training["loss_portfolio_activation"]).strip().lower().replace("-", "_")
+    loss_activation = (
+        str(training["loss_portfolio_activation"]).strip().lower().replace("-", "_")
+    )
     if loss_activation in {"", "auto", "trading", "same", "same_as_trading"}:
         training["loss_portfolio_activation"] = "auto"
     else:
-        training["loss_portfolio_activation"] = normalize_portfolio_activation(loss_activation)
+        training["loss_portfolio_activation"] = normalize_portfolio_activation(
+            loss_activation
+        )
     loss_min_trade_weight = training["loss_min_trade_weight"]
     if loss_min_trade_weight is None or str(loss_min_trade_weight).strip().lower() in {
         "",
@@ -2151,8 +2672,12 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         trading["buy_fee_rate"] = fee
         trading["sell_fee_rate"] = fee
     else:
-        trading["buy_fee_rate"] = float(buy_fee_raw if buy_fee_raw is not None else fee_per_side_raw or 0.0)
-        trading["sell_fee_rate"] = float(sell_fee_raw if sell_fee_raw is not None else fee_per_side_raw or 0.0)
+        trading["buy_fee_rate"] = float(
+            buy_fee_raw if buy_fee_raw is not None else fee_per_side_raw or 0.0
+        )
+        trading["sell_fee_rate"] = float(
+            sell_fee_raw if sell_fee_raw is not None else fee_per_side_raw or 0.0
+        )
 
     # Legacy key is accepted as input but removed from the normalized config payload.
     trading.pop("fee_per_side", None)
@@ -2168,7 +2693,9 @@ def load_config(path: str | Path) -> ExperimentConfig:
     _validate_config_keys(raw["runner"], RunnerConfig, section="runner")
     _validate_config_keys(raw["environment"], EnvironmentConfig, section="environment")
     _validate_config_keys(raw["data"], DataConfig, section="data")
-    _validate_config_keys(raw["walk_forward"], WalkForwardConfig, section="walk_forward")
+    _validate_config_keys(
+        raw["walk_forward"], WalkForwardConfig, section="walk_forward"
+    )
     _validate_config_keys(raw["trading"], TradingConfig, section="trading")
     _validate_config_keys(training_raw, TrainingConfig, section="training")
     _validate_config_keys(raw["evaluation"], EvaluationConfig, section="evaluation")
@@ -2212,7 +2739,9 @@ def load_config(path: str | Path) -> ExperimentConfig:
             eval_backtest_compile=training_raw["eval_backtest_compile"],
             eval_auto_chunk_rows_cap=training_raw["eval_auto_chunk_rows_cap"],
             train_symbol_compaction=training_raw["train_symbol_compaction"],
-            train_symbol_compaction_bucket_size=int(training_raw["train_symbol_compaction_bucket_size"]),
+            train_symbol_compaction_bucket_size=int(
+                training_raw["train_symbol_compaction_bucket_size"]
+            ),
             backtest_autotune=training_raw["backtest_autotune"],
             backtest_compile=training_raw["backtest_compile"],
             backtest_compile_stateful=training_raw["backtest_compile_stateful"],
@@ -2227,19 +2756,27 @@ def load_config(path: str | Path) -> ExperimentConfig:
             inference_backtest_compile=training_raw["inference_backtest_compile"],
             backtest_verbose=training_raw["backtest_verbose"],
             strict_no_fallback=training_raw["strict_no_fallback"],
-            backtest_checkpoint_chunk_rows=training_raw["backtest_checkpoint_chunk_rows"],
+            backtest_checkpoint_chunk_rows=training_raw[
+                "backtest_checkpoint_chunk_rows"
+            ],
             runtime_shape_check=training_raw["runtime_shape_check"],
             allow_dynamic_symbols=training_raw["allow_dynamic_symbols"],
             lookback=training_raw["lookback"],
             batch_size_train=training_raw["batch_size_train"],
             batch_size_eval=training_raw["batch_size_eval"],
+            minute_decision_chunk_rows=training_raw["minute_decision_chunk_rows"],
+            minute_cache_days_on_cpu=training_raw["minute_cache_days_on_cpu"],
+            minute_cpu_cache_gb=training_raw["minute_cpu_cache_gb"],
+            minute_data_workers=training_raw["minute_data_workers"],
             min_batch_size=training_raw["min_batch_size"],
             auto_batch_size=training_raw["auto_batch_size"],
             vram_budget_gb=training_raw["vram_budget_gb"],
             vram_safety_margin_gb=training_raw["vram_safety_margin_gb"],
             target_vram_fraction=training_raw["target_vram_fraction"],
             epochs=training_raw["epochs"],
-            early_stopping_no_improve_ratio=training_raw["early_stopping_no_improve_ratio"],
+            early_stopping_no_improve_ratio=training_raw[
+                "early_stopping_no_improve_ratio"
+            ],
             early_stopping_min_delta=training_raw["early_stopping_min_delta"],
             best_checkpoint_max_epoch=training_raw["best_checkpoint_max_epoch"],
             val_interval_epochs=training_raw["val_interval_epochs"],
@@ -2249,7 +2786,9 @@ def load_config(path: str | Path) -> ExperimentConfig:
             curve_plot_async=training_raw["curve_plot_async"],
             plot_backend=training_raw["plot_backend"],
             epoch_test_curve=training_raw["epoch_test_curve"],
-            defer_epoch_curve_plot_until_end=training_raw["defer_epoch_curve_plot_until_end"],
+            defer_epoch_curve_plot_until_end=training_raw[
+                "defer_epoch_curve_plot_until_end"
+            ],
             debug_timing_sync=training_raw["debug_timing_sync"],
             explain_after_each_fold=training_raw["explain_after_each_fold"],
             explain_top_k=training_raw["explain_top_k"],
@@ -2259,9 +2798,15 @@ def load_config(path: str | Path) -> ExperimentConfig:
             explain_sample_method=training_raw["explain_sample_method"],
             explain_perturb=training_raw["explain_perturb"],
             explain_perturb_batch_size=training_raw["explain_perturb_batch_size"],
-            explain_perturb_max_auto_batch_size=training_raw["explain_perturb_max_auto_batch_size"],
-            explain_perturb_max_input_elements=training_raw["explain_perturb_max_input_elements"],
-            explain_counterfactual_compile=training_raw["explain_counterfactual_compile"],
+            explain_perturb_max_auto_batch_size=training_raw[
+                "explain_perturb_max_auto_batch_size"
+            ],
+            explain_perturb_max_input_elements=training_raw[
+                "explain_perturb_max_input_elements"
+            ],
+            explain_counterfactual_compile=training_raw[
+                "explain_counterfactual_compile"
+            ],
             explain_write_plots=training_raw["explain_write_plots"],
             explain_report_style=training_raw["explain_report_style"],
             explain_plot_theme=training_raw["explain_plot_theme"],
@@ -2270,7 +2815,9 @@ def load_config(path: str | Path) -> ExperimentConfig:
             explain_shap_enabled=training_raw["explain_shap_enabled"],
             explain_shap_mode=training_raw["explain_shap_mode"],
             explain_j_lens_enabled=training_raw["explain_j_lens_enabled"],
-            explain_j_lens_intervention_fraction=training_raw["explain_j_lens_intervention_fraction"],
+            explain_j_lens_intervention_fraction=training_raw[
+                "explain_j_lens_intervention_fraction"
+            ],
             explain_case_study_top_k=training_raw["explain_case_study_top_k"],
             explain_regime_analysis=training_raw["explain_regime_analysis"],
             explain_fold_stability=training_raw["explain_fold_stability"],
@@ -2280,48 +2827,96 @@ def load_config(path: str | Path) -> ExperimentConfig:
             explain_umap_n_neighbors=training_raw["explain_umap_n_neighbors"],
             explain_umap_min_dist=training_raw["explain_umap_min_dist"],
             explain_cross_asset_enabled=training_raw["explain_cross_asset_enabled"],
-            explain_cross_asset_max_sources=training_raw["explain_cross_asset_max_sources"],
-            explain_cross_asset_max_targets=training_raw["explain_cross_asset_max_targets"],
+            explain_cross_asset_max_sources=training_raw[
+                "explain_cross_asset_max_sources"
+            ],
+            explain_cross_asset_max_targets=training_raw[
+                "explain_cross_asset_max_targets"
+            ],
             explain_cross_asset_top_edges=training_raw["explain_cross_asset_top_edges"],
-            explain_cross_asset_source_chunk_size=training_raw["explain_cross_asset_source_chunk_size"],
-            explain_cross_asset_max_repeated_rows=training_raw["explain_cross_asset_max_repeated_rows"],
-            explain_cross_asset_perturb_scale=training_raw["explain_cross_asset_perturb_scale"],
+            explain_cross_asset_source_chunk_size=training_raw[
+                "explain_cross_asset_source_chunk_size"
+            ],
+            explain_cross_asset_max_repeated_rows=training_raw[
+                "explain_cross_asset_max_repeated_rows"
+            ],
+            explain_cross_asset_perturb_scale=training_raw[
+                "explain_cross_asset_perturb_scale"
+            ],
             explain_cross_asset_shocks=training_raw["explain_cross_asset_shocks"],
-            explain_cross_asset_attention_flow=training_raw["explain_cross_asset_attention_flow"],
-            explain_cross_asset_attention_capture_rows=training_raw["explain_cross_asset_attention_capture_rows"],
-            explain_cross_asset_validated_transmission=training_raw["explain_cross_asset_validated_transmission"],
-            explain_cross_asset_role_embedding=training_raw["explain_cross_asset_role_embedding"],
-            explain_cross_asset_graph_backend=training_raw["explain_cross_asset_graph_backend"],
+            explain_cross_asset_attention_flow=training_raw[
+                "explain_cross_asset_attention_flow"
+            ],
+            explain_cross_asset_attention_capture_rows=training_raw[
+                "explain_cross_asset_attention_capture_rows"
+            ],
+            explain_cross_asset_validated_transmission=training_raw[
+                "explain_cross_asset_validated_transmission"
+            ],
+            explain_cross_asset_role_embedding=training_raw[
+                "explain_cross_asset_role_embedding"
+            ],
+            explain_cross_asset_graph_backend=training_raw[
+                "explain_cross_asset_graph_backend"
+            ],
             explain_cross_asset_graph_benchmark_min_edges=training_raw[
                 "explain_cross_asset_graph_benchmark_min_edges"
             ],
-            explain_cross_asset_graph_explainability=training_raw["explain_cross_asset_graph_explainability"],
+            explain_cross_asset_graph_explainability=training_raw[
+                "explain_cross_asset_graph_explainability"
+            ],
             explain_cross_asset_graph_betweenness_max_vertices=training_raw[
                 "explain_cross_asset_graph_betweenness_max_vertices"
             ],
-            explain_cross_asset_graph_plot_max_nodes=training_raw["explain_cross_asset_graph_plot_max_nodes"],
+            explain_cross_asset_graph_plot_max_nodes=training_raw[
+                "explain_cross_asset_graph_plot_max_nodes"
+            ],
             table_output_format=training_raw["table_output_format"],
             save_daily_weights_table=training_raw["save_daily_weights_table"],
-            save_integer_share_daily_weights_table=training_raw["save_integer_share_daily_weights_table"],
-            save_integer_share_holdings_table=training_raw["save_integer_share_holdings_table"],
+            save_integer_share_daily_weights_table=training_raw[
+                "save_integer_share_daily_weights_table"
+            ],
+            save_integer_share_holdings_table=training_raw[
+                "save_integer_share_holdings_table"
+            ],
             backtest_artifact_compression=training_raw["backtest_artifact_compression"],
             save_best_val_artifacts=training_raw["save_best_val_artifacts"],
             save_best_val_fold_artifacts=training_raw["save_best_val_fold_artifacts"],
             save_best_val_fold_plots=training_raw["save_best_val_fold_plots"],
-            postprocess_benchmark_after_fold=training_raw["postprocess_benchmark_after_fold"],
-            postprocess_benchmark_after_best_val=training_raw["postprocess_benchmark_after_best_val"],
+            postprocess_benchmark_after_fold=training_raw[
+                "postprocess_benchmark_after_fold"
+            ],
+            postprocess_benchmark_after_best_val=training_raw[
+                "postprocess_benchmark_after_best_val"
+            ],
             postprocess_benchmark_split=training_raw["postprocess_benchmark_split"],
-            postprocess_benchmark_activations=training_raw["postprocess_benchmark_activations"],
-            postprocess_benchmark_thresholds=training_raw["postprocess_benchmark_thresholds"],
-            postprocess_benchmark_rank_metric=training_raw["postprocess_benchmark_rank_metric"],
-            postprocess_benchmark_plot_metrics=training_raw["postprocess_benchmark_plot_metrics"],
-            postprocess_benchmark_plot_top_n=training_raw["postprocess_benchmark_plot_top_n"],
-            postprocess_benchmark_backtest_compile=training_raw["postprocess_benchmark_backtest_compile"],
-            postprocess_benchmark_max_rows=training_raw["postprocess_benchmark_max_rows"],
+            postprocess_benchmark_activations=training_raw[
+                "postprocess_benchmark_activations"
+            ],
+            postprocess_benchmark_thresholds=training_raw[
+                "postprocess_benchmark_thresholds"
+            ],
+            postprocess_benchmark_rank_metric=training_raw[
+                "postprocess_benchmark_rank_metric"
+            ],
+            postprocess_benchmark_plot_metrics=training_raw[
+                "postprocess_benchmark_plot_metrics"
+            ],
+            postprocess_benchmark_plot_top_n=training_raw[
+                "postprocess_benchmark_plot_top_n"
+            ],
+            postprocess_benchmark_backtest_compile=training_raw[
+                "postprocess_benchmark_backtest_compile"
+            ],
+            postprocess_benchmark_max_rows=training_raw[
+                "postprocess_benchmark_max_rows"
+            ],
             postprocess_benchmark_strict=training_raw["postprocess_benchmark_strict"],
             cache_train_tensors_on_gpu=training_raw["cache_train_tensors_on_gpu"],
             cache_eval_tensors_on_gpu=training_raw["cache_eval_tensors_on_gpu"],
-            cache_train_features_in_amp_dtype=training_raw["cache_train_features_in_amp_dtype"],
+            cache_train_features_in_amp_dtype=training_raw[
+                "cache_train_features_in_amp_dtype"
+            ],
             learning_rate=training_raw["learning_rate"],
             enable_lr_scheduler=training_raw["enable_lr_scheduler"],
             lr_scheduler=training_raw["lr_scheduler"],
@@ -2362,12 +2957,22 @@ def load_config(path: str | Path) -> ExperimentConfig:
             bottleneck_portfolio_autoencoder=BottleneckPortfolioAutoencoderConfig(
                 **training_raw["bottleneck_portfolio_autoencoder"]
             ),
-            tcn_hybrid_tabular_resnet=TCNHybridTabularResNetModelConfig(**training_raw["tcn_hybrid_tabular_resnet"]),
-            temporal_tabular_resnet=TemporalTabularResNetModelConfig(**training_raw["temporal_tabular_resnet"]),
-            cross_sectional_temporal_portfolio_model=CrossSectionalTemporalPortfolioModelConfig(**training_raw["cross_sectional_temporal_portfolio_model"]),
+            tcn_hybrid_tabular_resnet=TCNHybridTabularResNetModelConfig(
+                **training_raw["tcn_hybrid_tabular_resnet"]
+            ),
+            temporal_tabular_resnet=TemporalTabularResNetModelConfig(
+                **training_raw["temporal_tabular_resnet"]
+            ),
+            cross_sectional_temporal_portfolio_model=CrossSectionalTemporalPortfolioModelConfig(
+                **training_raw["cross_sectional_temporal_portfolio_model"]
+            ),
             multitask_loss=MultitaskLossConfig(**training_raw["multitask_loss"]),
-            factor_generalization_loss=FactorGeneralizationLossConfig(**training_raw["factor_generalization_loss"]),
-            portfolio_autoencoder_loss=PortfolioAutoencoderLossConfig(**training_raw["portfolio_autoencoder_loss"]),
+            factor_generalization_loss=FactorGeneralizationLossConfig(
+                **training_raw["factor_generalization_loss"]
+            ),
+            portfolio_autoencoder_loss=PortfolioAutoencoderLossConfig(
+                **training_raw["portfolio_autoencoder_loss"]
+            ),
             lightgbm=LightGBMModelConfig(**training_raw["lightgbm"]),
             xgboost=XGBoostModelConfig(**training_raw["xgboost"]),
         ),
