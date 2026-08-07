@@ -1,6 +1,6 @@
-# OFAT ablation matrix for the corrected TW naive long/short baseline.
+# OFAT ablation matrix for the corrected TW naive long/short projection-L1 baseline.
 base_config: configs/markets/tw_public_lanten_market_candles.yaml
-output_root: artifacts/ablations/financial_transformer_naive_long_short_lb256_bs32
+output_root: artifacts/ablations/financial_transformer_naive_long_short_lb256_bs32_projection_l1
 expected_fold_count: 12
 
 runtime:
@@ -18,8 +18,15 @@ matrix:
     trading:
       execution_mode: naive
       long_only: false
+      portfolio_activation: pre_normalized
     training:
       loss_type: log_utility
+      loss_portfolio_activation: pre_normalized
+      financial_transformer:
+        # Architecture ablations use the same projection-L1 control as the
+        # dedicated output-mode matrix. Output transforms are not an implicit
+        # architecture variable.
+        portfolio_output_mode: projection_l1
 
   base_overrides:
     runner:
@@ -111,6 +118,10 @@ matrix:
           overrides:
             training:
               financial_transformer:
+                # lookback=256 keeps every temporal token alive for pooling;
+                # recompute transformer blocks during backward so the global
+                # batch remains 32 without exceeding 32 GiB per DDP rank.
+                checkpoint_blocks: true
                 temporal_pooling: mean
                 temporal_query_mode: full_then_last
         - name: attention
@@ -118,6 +129,7 @@ matrix:
           overrides:
             training:
               financial_transformer:
+                checkpoint_blocks: true
                 temporal_pooling: attention
                 temporal_query_mode: full_then_last
 

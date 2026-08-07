@@ -1,25 +1,26 @@
-base_config: tw_public_lanten_market_candles_open_aware.yaml
+base_config: tw_public_lanten_market_candles_day_trade_snapshot_20260804.yaml
 
-# Feature-selected continuation of the trained 99-feature open-aware day-trade
-# experiment.  Inheriting the source config keeps the causal open-at-entry,
-# 2014+ walk-forward, fee, settlement, and model contracts unchanged.
-experiment_name: tw-financial-transformer-candles-open-aware-select72-gross-tw-day-trade
+# Feature-selected continuation of the pinned-snapshot 99-feature day-trade
+# experiment. Inheriting the source config keeps its long/short direction,
+# causal open-at-entry, walk-forward, fee, and execution contracts unchanged.
+experiment_name: tw-financial-transformer-candles-open-aware-select65-fold11-gross-tw-day-trade
 
 runner:
-  # A 72-feature model is checkpoint-incompatible with the source 99-feature
+  # A 65-feature model is checkpoint-incompatible with the source 99-feature
   # model, so training must start in a fresh artifact root.
-  output_dir: artifacts/markets/tw_public_candles_tw_day_trade_select
+  output_dir: artifacts/markets/tw_public_candles_tw_day_trade_select65_fold11
   resume: false
 
 data:
-  # Feature-screening contract (2026-07-20 UTC): all 12/12 checkpoints, only
-  # the first calendar year of each fold's test split, all 2,310 valid dates
-  # after lookback. Keep when Gradient x Input OR Integrated Gradients is
-  # non-zero in at least one fold; disable only exact zero in BOTH methods in
-  # every fold. Result: keep 72/99 and disable 27/99.
-  # Evidence:
-  # artifacts/markets/tw_public_candles_tw_day_trade/
-  # feature_screening_first_test_year/feature_importance_12folds.csv
+  # Feature-screening contract (2026-08-05 UTC): folds 1-11 only, first calendar
+  # year of each fold's test split, with complete Gradient x Input, Integrated
+  # Gradients, perturbation, and surrogate-SHAP artifacts. The user-selected
+  # cutoff is twpub_dividend_total_cash_log. Disable it and every currently
+  # active feature whose 11-fold mean of the four normalized attribution shares
+  # is lower. Result: keep 65/99 and disable 34/99.
+  # Evidence: per-fold global_feature_attribution.csv under
+  # artifacts/markets/tw_public_candles_tw_day_trade_lookback32/explainability/
+  # fold_01_test through fold_11_test (fold_12 deliberately excluded).
   feature_include:
     # Base price log returns
     - open_logret_1d
@@ -94,12 +95,12 @@ data:
     # - twpub_company_has_preferred_stock  # permanently disabled: snapshot-only
 
     # Dividend announcements and ex-dividend information
-    - twpub_dividend_cash_per_share
-    - twpub_dividend_stock_per_share
-    - twpub_dividend_total_cash_log
-    - twpub_dividend_total_stock_log
-    - twpub_dividend_confirmed
-    - twpub_dividend_board_approved
+    # - twpub_dividend_cash_per_share  # disabled: 11-fold four-method mean share 0.01793%, below cutoff
+    # - twpub_dividend_stock_per_share  # disabled: 11-fold four-method mean share 0.00468%, below cutoff
+    # - twpub_dividend_total_cash_log  # disabled: user-selected cutoff; 11-fold four-method mean share 0.02413%
+    # - twpub_dividend_total_stock_log  # disabled: 11-fold four-method mean share 0.00897%, below cutoff
+    # - twpub_dividend_confirmed  # disabled: 11-fold four-method mean share 0.00377%, below cutoff
+    # - twpub_dividend_board_approved  # disabled: 11-fold four-method mean share 0.01413%, below cutoff
     # - twpub_exdiv_known  # disabled: exact zero in both methods across all 12 folds
     # - twpub_exdiv_cash_dividend  # disabled: exact zero in both methods across all 12 folds
     # - twpub_exdiv_stock_dividend_ratio  # disabled: exact zero in both methods across all 12 folds
@@ -187,7 +188,7 @@ data:
     # - twpub_taifex_tx_top5_long_ratio  # disabled: exact zero in both methods across all 12 folds
     # - twpub_taifex_tx_top10_long_ratio  # disabled: exact zero in both methods across all 12 folds
     # - twpub_taifex_tx_large_oi_log  # disabled: exact zero in both methods across all 12 folds
-    - twpub_taifex_tx_final_settlement_logret
+    # - twpub_taifex_tx_final_settlement_logret  # disabled: 11-fold four-method mean share 0.00036%, below cutoff
 
   feature_exclude: []
   feature_zero_fill: []
