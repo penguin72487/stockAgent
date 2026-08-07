@@ -23,18 +23,19 @@ desync store at `/srv/stockagent-sync`; do not use Syncthing to synchronize the
 Git working tree or a live dataset directory.
 
 Install the pinned desync release and initialize each machine once. Every
-machine must use a different permanent node ID:
+machine must use a different permanent node ID. Use its stable hostname rather
+than an abstract A/B/C label:
 
 ```bash
 cd /path/to/stockAgent
 ./scripts/install_desync.sh
 
-# Machine A
+# This machine is penguin
 ./scripts/run_desync_snapshot.sh init \
   --sync-root /srv/stockagent-sync \
-  --node-id trainer-a
+  --node-id penguin
 
-# Machine B uses trainer-b instead.
+# The other current machines use vastai1T and lab203 respectively.
 ```
 
 Check which complete `tw-public` snapshot currently wins:
@@ -142,6 +143,10 @@ source tree or an implicitly re-resolved latest snapshot. See
 - Use `data.feature_include` and `data.feature_exclude` to manually switch panel features by exact name or glob pattern, for example `twpub_*` or `*_logret_1d`; leave both empty to keep all features.
 - Or use the project runner: `./coda_runner.sh`.
 - Runner defaults live in each experiment YAML's `runner` section; runtime discovery is centralized in `scripts/runtime_env.sh`.
+- Daily, one-minute, and TX/TXO tick neural modes share the same lifecycle,
+  progress schema, group/fold paths, checkpoints, curves, and report filenames.
+  See [`docs/training_mode_adapter_architecture.md`](docs/training_mode_adapter_architecture.md)
+  for the adapter boundary and completed-artifact contract.
 
 ### Multi-GPU market job manager
 
@@ -236,6 +241,15 @@ the target-position delta at the next minute open, carries positions between
 minutes, and forces the portfolio flat before the session ends. See
 [`docs/tw_minute_kbar_research.md`](docs/tw_minute_kbar_research.md) for the
 full data contract, backfill service, audit, and strategy commands.
+
+The neural walk-forward path uses the same top-level entry point as daily
+experiments, but dispatches to a separate causal minute executor:
+
+```bash
+source scripts/runtime_env.sh
+run_fintech_python train.py --config configs/markets/tw_minute.yaml
+```
+
 - Use `run_fintech_python downloader/download_yahoo_ohlcv.py --asset forex` to download only the expanded FX universe.
 - Use `run_fintech_python downloader/download_forex_pepperstone.py` to download the Pepperstone-style FX universe.
 - Use `run_fintech_python downloader/download_forex_pepperstone.py --mode repair` to repair stale/missing Pepperstone forex files.

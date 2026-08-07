@@ -2,9 +2,11 @@ import json
 from pathlib import Path
 
 from stockagent.training.trainer import (
+    _EpochCurveLifecycle,
     _infer_no_improve_epochs_from_curve,
     _resume_no_improve_epochs_from_checkpoint,
 )
+from stockagent.training import trainer
 
 
 def _write_curve_rows(path: Path, rows: list[dict[str, object]]) -> None:
@@ -83,3 +85,108 @@ def test_infer_no_improve_prefers_explicit_curve_state(tmp_path: Path) -> None:
     )
 
     assert _infer_no_improve_epochs_from_curve(curve_path) == 10
+
+
+def test_epoch_curve_lifecycle_reuses_resume_record_and_deferred_plot(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    curve_path = tmp_path / "train_2020" / "epoch_curve.jsonl"
+    calls: list[tuple[str, object]] = []
+    monkeypatch.setattr(
+        trainer,
+        "_trim_group_curve",
+        lambda path, epoch: calls.append(("trim", (path, epoch))),
+    )
+    monkeypatch.setattr(
+        trainer,
+        "_append_group_curve",
+        lambda path, payload: calls.append(("append", (path, payload))),
+    )
+    monkeypatch.setattr(
+        trainer,
+        "_run_epoch_curve_plot_once",
+        lambda path, interval, **_kwargs: calls.append(
+            ("plot", (path, interval))
+        )
+        or {"total_s": 0.1},
+    )
+    lifecycle = _EpochCurveLifecycle(
+        curve_path,
+        enabled=True,
+        interval=3,
+        async_enabled=True,
+        defer_until_end=True,
+    )
+
+    lifecycle.prepare_resume(4)
+    lifecycle.record({"epoch": 4, "train_loss": 1.0}, request_plot=True)
+    timing = lifecycle.flush()
+
+    assert [name for name, _ in calls] == ["trim", "append", "plot"]
+    assert timing == {"total_s": 0.1}
+
+
+def test_epoch_curve_lifecycle_honors_synchronous_incremental_plot(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    curve_path = tmp_path / "epoch_curve.jsonl"
+    curve_path.write_text("{}\n", encoding="utf-8")
+    calls: list[tuple[Path, int, bool]] = []
+    monkeypatch.setattr(
+        trainer,
+        "_run_epoch_curve_plot_once",
+        lambda path, interval, *, write_parquet_cache=True: calls.append(
+            (path, interval, write_parquet_cache)
+        )
+        or {},
+    )
+    lifecycle = _EpochCurveLifecycle(
+        curve_path,
+        enabled=True,
+        interval=2,
+        async_enabled=False,
+        defer_until_end=False,
+    )
+
+    lifecycle.record({"epoch": 2, "train_loss": 1.0}, request_plot=True)
+    lifecycle.flush()
+
+    assert calls == [(curve_path, 2, False)]
+
+
+def test_progress_bar_is_one_rank_aware_canonical_implementation(
+    monkeypatch,
+) -> None:
+    calls: list[dict[str, object]] = []
+    sentinel = object()
+
+    def fake_tqdm(iterable=None, **kwargs):
+        calls.append({"iterable": iterable, **kwargs})
+        return sentinel
+
+    monkeypatch.setattr(trainer, "tqdm", fake_tqdm)
+    monkeypatch.setattr(trainer, "_distributed_is_rank0", lambda: False)
+
+    result = trainer._progress_bar(
+        [1, 2], desc=" Epochs", unit="epoch", leave=False
+    )
+
+    assert result is sentinel
+    assert calls == [
+        {
+            "iterable": [1, 2],
+            "desc": " Epochs",
+            "unit": "epoch",
+            "total": None,
+            "leave": False,
+            "dynamic_ncols": True,
+            "disable": True,
+        }
+    ]
+
+    from stockagent.training import index_derivatives_tick, minute
+
+    assert minute._progress_bar is trainer._progress_bar
+    assert index_derivatives_tick._progress_bar is trainer._progress_bar

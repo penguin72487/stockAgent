@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import date
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -30,13 +31,26 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=Path("data_tw_minute/research_dataset"),
     )
-    parser.add_argument("--trade-date", required=True)
+    parser.add_argument("--trade-date")
+    parser.add_argument(
+        "--all-partitions",
+        action="store_true",
+        help="Audit every partition and its manifest fingerprint.",
+    )
     parser.add_argument(
         "--output",
         type=Path,
         default=Path("data_tw_minute/audits/latest.json"),
     )
     return parser.parse_args()
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def audit_frame(frame: pl.DataFrame, *, trade_date: date) -> dict[str, Any]:
@@ -140,6 +154,96 @@ def audit_frame(frame: pl.DataFrame, *, trade_date: date) -> dict[str, Any]:
 
 def main() -> None:
     args = parse_args()
+    if bool(args.all_partitions):
+        manifest_path = args.dataset_root / "manifest.json"
+        if not manifest_path.is_file():
+            raise RuntimeError(f"minute dataset manifest is missing: {manifest_path}")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if not (
+            manifest.get("schema_version") == 2
+            and manifest.get("research_ready") is True
+            and manifest.get("status") == "research_ready"
+        ):
+            raise RuntimeError(
+                "minute full audit requires a schema-2 research_ready manifest"
+            )
+        partitions = manifest.get("partitions", [])
+        if not partitions or len(partitions) != len(manifest.get("dates", [])):
+            raise RuntimeError("minute manifest partition accounting is incomplete")
+        totals = {
+            "rows": 0,
+            "feature_valid_rows": 0,
+            "label_valid_rows": 0,
+        }
+        seen_dates: set[str] = set()
+        maximum_symbols = 0
+        for position, summary in enumerate(partitions, start=1):
+            date_text = str(summary["trade_date"])
+            if date_text in seen_dates:
+                raise RuntimeError(f"duplicate minute partition date: {date_text}")
+            seen_dates.add(date_text)
+            path = Path(str(summary["output"]))
+            if not path.is_absolute():
+                working_path = (Path.cwd() / path).resolve()
+                portable_path = (
+                    args.dataset_root / f"trade_date={date_text}" / "data.parquet"
+                ).resolve()
+                path = working_path if working_path.is_file() else portable_path
+            if not path.is_file():
+                raise RuntimeError(f"minute partition is missing: {path}")
+            actual_sha256 = _sha256(path)
+            if actual_sha256 != str(summary.get("output_sha256", "")):
+                raise RuntimeError(f"minute partition fingerprint mismatch: {path}")
+            result = audit_frame(
+                pl.read_parquet(path), trade_date=date.fromisoformat(date_text)
+            )
+            if int(result["rows"]) != int(summary["rows"]):
+                raise RuntimeError(f"minute partition row count changed: {path}")
+            for name in totals:
+                totals[name] += int(result[name])
+            maximum_symbols = max(maximum_symbols, int(result["symbols"]))
+            if position == 1 or position % 100 == 0 or position == len(partitions):
+                print(
+                    f"[tw-minute-audit] partitions={position}/{len(partitions)} "
+                    f"date={date_text} rows={totals['rows']}",
+                    flush=True,
+                )
+        result = {
+            "schema_version": 2,
+            "status": "research_ready",
+            "source": "shioaji_kbars_1m",
+            "partitions": len(partitions),
+            "first_date": min(seen_dates),
+            "last_date": max(seen_dates),
+            "available_source_symbols": int(
+                manifest.get("available_source_symbols", 0)
+            ),
+            "source_gap_symbols": int(manifest.get("source_gap_symbols", 0)),
+            "contract_unavailable_symbols": int(
+                manifest.get("contract_unavailable_symbols", 0)
+            ),
+            "maximum_symbols_per_day": maximum_symbols,
+            **totals,
+            "failures": {},
+        }
+        output = args.output
+        if output == Path("data_tw_minute/audits/latest.json"):
+            output = Path("data_tw_minute/audits/full_latest.json")
+        output.parent.mkdir(parents=True, exist_ok=True)
+        temporary = output.with_suffix(output.suffix + ".tmp")
+        temporary.write_text(
+            json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, output)
+        print(
+            f"[tw-minute-audit] status=research_ready "
+            f"partitions={len(partitions)} rows={totals['rows']} output={output}",
+            flush=True,
+        )
+        return
+    if not args.trade_date:
+        raise ValueError("--trade-date is required unless --all-partitions is used")
     trade_date = date.fromisoformat(args.trade_date)
     path = args.dataset_root / f"trade_date={trade_date}" / "data.parquet"
     if not path.is_file():

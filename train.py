@@ -1100,6 +1100,23 @@ def main() -> None:
         config.environment.device = "cpu"
         print("[runner] CUDA unavailable; falling back to CPU because runner.require_cuda=false")
 
+    from stockagent.training.mode_adapter import (
+        dispatch_specialized_training_mode,
+    )
+
+    if dispatch_specialized_training_mode(
+        config,
+        output_dir=output_dir,
+        mode=mode,
+        resume=bool(resume),
+        start_fold=start_fold,
+        max_folds=args.max_folds,
+        active_strategy=str(active_strategy),
+        isolate_train_folds=bool(isolate_train_folds),
+        startup_checkpoint=startup_timing.checkpoint,
+    ):
+        return
+
     panel = _build_panel_rank_coordinated(build_panel, config, active_strategy)
     if str(config.trading.execution_mode) == "tw_index_futures_day":
         from stockagent.data.tw_index_futures import (

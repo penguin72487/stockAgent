@@ -26,8 +26,12 @@ EXECUTION_MODES: Final[tuple[str, ...]] = (
     "naive",
     "tw_cash",
     "tw_day_trade",
+    "tw_minute",
     "tw_overnight",
     "tw_index_futures_day",
+    "tw_index_derivatives_tick",
+    "tw_index_options_tick_long",
+    "tw_index_options_tick_short",
 )
 TW_STOCK_EXECUTION_MODES: Final[tuple[str, ...]] = (
     "tw_cash",
@@ -37,6 +41,12 @@ TW_STOCK_EXECUTION_MODES: Final[tuple[str, ...]] = (
 TW_CARRYING_EXECUTION_MODES: Final[tuple[str, ...]] = (
     "tw_cash",
     "tw_overnight",
+)
+TW_MINUTE_EXECUTION_MODES: Final[tuple[str, ...]] = ("tw_minute",)
+TW_DERIVATIVES_TICK_EXECUTION_MODES: Final[tuple[str, ...]] = (
+    "tw_index_derivatives_tick",
+    "tw_index_options_tick_long",
+    "tw_index_options_tick_short",
 )
 FEE_ROUNDING_MODES: Final[tuple[str, ...]] = ("none", "floor", "half_up")
 
@@ -89,12 +99,38 @@ _EXECUTION_MODE_ALIASES: Final[dict[str, str]] = {
     "tw_intraday": "tw_day_trade",
     "當沖": "tw_day_trade",
     "台股當沖": "tw_day_trade",
+    # Right-labelled one-minute KBar decisions with next-minute execution.
+    # This is intentionally not an alias of the daily open-to-close contract.
+    "tw_minute": "tw_minute",
+    "tw_minute_day_trade": "tw_minute",
+    "taiwan_minute": "tw_minute",
+    "minute_day_trade": "tw_minute",
+    "一分鐘當沖": "tw_minute",
+    "分鐘當沖": "tw_minute",
     # One signed TAIEX exposure, executed with a same-day TX/MTX/TMF basket.
     "tw_index_futures_day": "tw_index_futures_day",
     "tw_index_future_day": "tw_index_futures_day",
     "tw_futures_day": "tw_index_futures_day",
     "taiex_futures_day": "tw_index_futures_day",
     "台指期日盤": "tw_index_futures_day",
+    # Completed-second TX/TXO trade events with next-TX-trade execution.  The
+    # official public source has no sub-second ordering, so "tick" here means
+    # the finest defensible event clock exposed by that source.
+    "tw_index_derivatives_tick": "tw_index_derivatives_tick",
+    "tw_index_derivative_tick": "tw_index_derivatives_tick",
+    "tw_futures_options_tick": "tw_index_derivatives_tick",
+    "taiex_derivatives_tick": "tw_index_derivatives_tick",
+    "台指期選逐筆": "tw_index_derivatives_tick",
+    # Fixed causal ATM Call/Put pair. The two policies share data, features,
+    # model, trainer, and accounting; only naked-short permission differs.
+    "tw_index_options_tick_long": "tw_index_options_tick_long",
+    "tw_index_option_tick_long": "tw_index_options_tick_long",
+    "txo_tick_long": "tw_index_options_tick_long",
+    "台指選逐筆買方": "tw_index_options_tick_long",
+    "tw_index_options_tick_short": "tw_index_options_tick_short",
+    "tw_index_option_tick_short": "tw_index_options_tick_short",
+    "txo_tick_short": "tw_index_options_tick_short",
+    "台指選逐筆可空賣": "tw_index_options_tick_short",
 }
 
 
@@ -108,16 +144,18 @@ def normalize_execution_mode(mode: object) -> str:
     if not isinstance(mode, str):
         raise ValueError(
             "execution_mode must be one of "
-            "'naive', 'tw_cash', 'tw_day_trade', 'tw_overnight', or "
-            "'tw_index_futures_day'"
+            "'naive', 'tw_cash', 'tw_day_trade', 'tw_minute', 'tw_overnight', or "
+            "'tw_index_futures_day', 'tw_index_derivatives_tick', "
+            "'tw_index_options_tick_long', or 'tw_index_options_tick_short'"
         )
     normalized = "_".join(mode.strip().casefold().replace("-", "_").split())
     canonical = _EXECUTION_MODE_ALIASES.get(normalized)
     if canonical is None:
         raise ValueError(
             "execution_mode must be one of "
-            "'naive', 'tw_cash', 'tw_day_trade', 'tw_overnight', or "
-            "'tw_index_futures_day'"
+            "'naive', 'tw_cash', 'tw_day_trade', 'tw_minute', 'tw_overnight', or "
+            "'tw_index_futures_day', 'tw_index_derivatives_tick', "
+            "'tw_index_options_tick_long', or 'tw_index_options_tick_short'"
         )
     return canonical
 
@@ -717,6 +755,8 @@ __all__ = [
     "DEFAULT_TAIWAN_MARGIN_SHORT_SCHEDULE",
     "EXECUTION_MODES",
     "TW_CARRYING_EXECUTION_MODES",
+    "TW_DERIVATIVES_TICK_EXECUTION_MODES",
+    "TW_MINUTE_EXECUTION_MODES",
     "FEE_ROUNDING_MODES",
     "TaiwanFeeSchedule",
     "TaiwanMarginShortSchedule",
