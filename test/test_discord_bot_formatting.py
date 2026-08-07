@@ -10,6 +10,7 @@ import polars as pl
 
 from services.discord_bot.bot import (
     _add_user_watch_symbol,
+    _annotate_history_rows_with_display_time,
     _auto_signal_price_source,
     _artifact_backfill_is_current,
     _artifact_backfill_key,
@@ -1935,6 +1936,8 @@ def test_day_trade_portfolio_history_block_labels_open_execution_separately() ->
             "cumulative_return": 0.02,
             "turnover": 0.0,
             "nav": 1_200_000.0,
+            "open_nav": 1_200_000.0,
+            "close_nav": 1_188_000.0,
             "gross_ratio": 0.0,
             "net_ratio": 0.0,
             "cash_ratio": 1.0,
@@ -1950,13 +1953,32 @@ def test_day_trade_portfolio_history_block_labels_open_execution_separately() ->
         }
     )
 
-    assert "`nav=1,200,000`" in block
+    assert "`open_nav=1,200,000`" in block
+    assert "`close_nav=1,188,000`" in block
     assert "`open_gross=0.00%`" in block
     assert "`model_gross=100.00%`" in block
     assert "`open_executed=0.00%`" in block
     assert "`fill=0.00%`" in block
     assert "未成交: 開盤目標受到前一交易日成交量" in block
     assert "`gross=" not in block
+
+
+def test_day_trade_history_rows_are_recorded_at_market_open(monkeypatch) -> None:
+    cfg = SimpleNamespace(
+        history_frequency="daily",
+        open_time="09:00",
+        timezone="Asia/Taipei",
+        display_timezone="Asia/Taipei",
+    )
+    monkeypatch.setattr(
+        "services.discord_bot.bot._market_execution_mode",
+        lambda _cfg: "tw_day_trade",
+    )
+    rows = [{"date": "2026-08-05"}]
+
+    _annotate_history_rows_with_display_time(cfg, rows)
+
+    assert rows[0]["display_date"] == "2026-08-05 09:00:00"
 
 
 def test_history_headers_hide_internal_details_until_debug(tmp_path) -> None:

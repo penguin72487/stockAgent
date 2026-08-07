@@ -207,17 +207,40 @@ def _build_configs(
     return rows
 
 
-def _fold_status(output_dir: Path, start_fold: int | None, max_folds: int | None) -> tuple[int, int]:
-    if start_fold is not None and max_folds is not None:
+def _fold_status(
+    output_dir: Path,
+    start_fold: int | None,
+    max_folds: int | None,
+    expected_fold_count: int | None = None,
+) -> tuple[int, int | None]:
+    first_fold = 1 if start_fold is None else int(start_fold)
+    if max_folds is not None:
         requested = max(0, int(max_folds))
-        folds = range(int(start_fold), int(start_fold) + requested)
+        folds = range(first_fold, first_fold + requested)
+        complete = sum(
+            (output_dir / f"fold_{fold:02d}" / "fold_complete.json").is_file()
+            for fold in folds
+        )
+        return int(complete), requested
+    if expected_fold_count is not None:
+        last_fold = int(expected_fold_count)
+        requested = max(0, last_fold - first_fold + 1)
+        folds = range(first_fold, last_fold + 1)
         complete = sum(
             (output_dir / f"fold_{fold:02d}" / "fold_complete.json").is_file()
             for fold in folds
         )
         return int(complete), requested
     markers = list(output_dir.glob("fold_*/fold_complete.json"))
-    return len(markers), len(markers)
+    # Without an explicit bounded range, marker count does not tell us how many
+    # folds the effective panel will generate. Treating N existing markers as
+    # N/N complete incorrectly skips interrupted experiments. Let the canonical
+    # trainer inspect and resume those folds instead.
+    return len(markers), None
+
+
+def _format_fold_status(complete: int, requested: int | None) -> str:
+    return f"{complete}/{requested if requested is not None else '?'}"
 
 
 def _metric(metrics: dict[str, Any], split: str, key: str) -> float | None:
@@ -292,6 +315,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--multi-gpu-strategy", default=None)
+    parser.add_argument(
+        "--cpu-threads",
+        type=int,
+        default=None,
+        help="Host-wide runtime thread budget; defaults to spec.runtime.cpu_threads.",
+    )
+    parser.add_argument(
+        "--torch-compile-threads",
+        type=int,
+        default=None,
+        help="Host-wide Inductor worker budget; defaults to spec.runtime.torch_compile_threads.",
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--collect-only", action="store_true")
     parser.add_argument("--force", action="store_true", help="Run even when all requested fold markers exist.")
@@ -318,6 +353,21 @@ def main() -> None:
     )
     output_root.mkdir(parents=True, exist_ok=True)
     runs = _build_configs(spec_path, spec, experiments, output_root)
+    runtime = spec.get("runtime", {})
+    if not isinstance(runtime, dict):
+        raise ValueError("ablation spec runtime must be a mapping")
+    cpu_threads = args.cpu_threads if args.cpu_threads is not None else runtime.get("cpu_threads")
+    compile_threads = (
+        args.torch_compile_threads
+        if args.torch_compile_threads is not None
+        else runtime.get("torch_compile_threads")
+    )
+    expected_fold_count_raw = spec.get("expected_fold_count")
+    expected_fold_count = (
+        None if expected_fold_count_raw is None else int(expected_fold_count_raw)
+    )
+    if expected_fold_count is not None and expected_fold_count <= 0:
+        raise ValueError("ablation spec expected_fold_count must be positive")
 
     summary_rows: list[dict[str, Any]] = []
     total_runs = len(runs)
@@ -331,14 +381,23 @@ def main() -> None:
             ("--epochs", args.epochs),
             ("--seed", args.seed),
             ("--multi-gpu-strategy", args.multi_gpu_strategy),
+            ("--cpu-threads", cpu_threads),
+            ("--torch-compile-threads", compile_threads),
         ):
             if value is not None:
                 command.extend([flag, str(value)])
 
         complete_before, requested = _fold_status(
-            run["output_dir"], args.start_fold, args.max_folds
+            run["output_dir"],
+            args.start_fold,
+            args.max_folds,
+            expected_fold_count,
         )
-        already_complete = requested > 0 and complete_before == requested
+        already_complete = (
+            requested is not None
+            and requested > 0
+            and complete_before == requested
+        )
         returncode: int | None = None
         elapsed_s = 0.0
         status = "complete" if already_complete else "pending"
@@ -365,7 +424,10 @@ def main() -> None:
             status = "succeeded" if returncode == 0 else "failed"
 
         complete_after, requested_after = _fold_status(
-            run["output_dir"], args.start_fold, args.max_folds
+            run["output_dir"],
+            args.start_fold,
+            args.max_folds,
+            expected_fold_count,
         )
         row = {
             "name": run["name"],
@@ -384,7 +446,8 @@ def main() -> None:
         _write_summary(output_root, summary_rows)
         _print_progress(run_index, total_runs, f"{run['name']}: {status}")
         print(
-            f"[{run['name']}] {status} folds={complete_after}/{requested_after} "
+            f"[{run['name']}] {status} "
+            f"folds={_format_fold_status(complete_after, requested_after)} "
             f"elapsed={elapsed_s:.1f}s",
             flush=True,
         )
