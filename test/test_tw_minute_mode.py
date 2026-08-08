@@ -549,7 +549,7 @@ def test_minute_partition_loads_sparse_full_market_rows_into_dense_day(
     (root / "manifest.json").write_text(
         json.dumps(
             {
-                "schema_version": 2,
+                "schema_version": 3,
                 "status": "research_ready",
                 "research_ready": True,
                 "source": "shioaji_kbars_1m",
@@ -646,7 +646,7 @@ def test_minute_training_reuses_canonical_group_artifacts(
     (root / "manifest.json").write_text(
         json.dumps(
             {
-                "schema_version": 2,
+                "schema_version": 3,
                 "status": "research_ready",
                 "research_ready": True,
                 "source": "shioaji_kbars_1m",

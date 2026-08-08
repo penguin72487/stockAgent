@@ -152,7 +152,13 @@ data_tw_minute/research_dataset/
 波動與日內時間特徵。稽核會拒絕重複 key、盤外時間、日期錯置、跨缺口的一分鐘
 標籤、executor-only 欄位外漏，以及無效標籤仍帶未來價格的資料列。
 
-schema-2 manifest 只有在 2,744 檔全部被歸類成 available-source 或
+Shioaji 歷史股票 KBar 的 `Volume` 並非全期間固定單位：多數列以交易單位回傳，
+部分新上市期間直接回傳股數，特殊 ETF 也可能使用 100 股或個別 1,000 股倍率。
+schema-3 會以同列 `Amount` 是否落在 OHLC 可成交金額範圍內，從
+`1/10/100/1000/contract_unit` 唯一判定 `source_volume_multiplier`，再產生
+`volume_shares`。無法可信判定的列保留價格但成交容量 fail-closed，不會放大成交。
+
+schema-3 manifest 只有在 2,744 檔全部被歸類成 available-source 或
 `contract_unavailable`，且 failed／partial 都為 0 時才會標成
 `research_ready`。已重試仍由永豐缺資料的日期保留為 source-gap mask；允許研究
 使用可取得來源，不代表宣稱永豐對每一檔每一天都有完整歷史。

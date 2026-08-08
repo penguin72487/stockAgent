@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta
+import hashlib
 import json
 import multiprocessing as mp
 from pathlib import Path
@@ -16,6 +17,7 @@ from downloader.download_shioaji_tw_minute_kbars import (
     contract_for_stock_symbol,
     minute_chunk_paths,
     query_minute_chunk,
+    restore_extended_tail_from_archived_manifest,
     select_universe,
     stock_contract_map,
     validate_minute_kbars,
@@ -58,17 +60,22 @@ def _raw_minute_frame(
     timestamps.append(datetime(2026, 7, 24, 13, 30))
     closes = [101.0, 102.0, 103.0, 104.0, 105.0, 106.0, next_close, session_close]
     opens = [100.0, 101.0, 102.0, 103.0, 104.0, 105.0, next_open, 109.0]
+    highs = [max(a, b) + 1.0 for a, b in zip(opens, closes, strict=True)]
+    lows = [min(a, b) - 1.0 for a, b in zip(opens, closes, strict=True)]
     return pl.DataFrame(
         {
             "ts": timestamps,
             "date": [TRADE_DATE] * len(timestamps),
             "symbol": ["2330"] * len(timestamps),
             "Open": opens,
-            "High": [max(a, b) + 1.0 for a, b in zip(opens, closes, strict=True)],
-            "Low": [min(a, b) - 1.0 for a, b in zip(opens, closes, strict=True)],
+            "High": highs,
+            "Low": lows,
             "Close": closes,
             "Volume": [100.0] * len(timestamps),
-            "Amount": [100_000.0] * len(timestamps),
+            "Amount": [
+                100.0 * 1_000.0 * ((high + low) / 2.0)
+                for high, low in zip(highs, lows, strict=True)
+            ],
             "contract_unit": [1_000.0] * len(timestamps),
         }
     )
@@ -610,6 +617,72 @@ def test_query_single_day_fallback_records_persistent_source_gap() -> None:
     assert request_starts == [1, 2]
 
 
+def test_delisted_contract_extension_repacks_covered_archived_tail(
+    tmp_path: Path,
+) -> None:
+    row = UniverseRow(
+        "4130", "健亞", "tpex", "stock", Path("4130_features.parquet")
+    )
+    root = tmp_path / "minute"
+    old_start = date(2026, 7, 9)
+    old_end = date(2026, 7, 27)
+    new_end = date(2026, 8, 4)
+    old_path = root / "minute_chunks" / row.symbol / "archived.parquet"
+    old_path.parent.mkdir(parents=True)
+    frame = _raw_minute_frame().with_columns(pl.lit(row.symbol).alias("symbol"))
+    frame.write_parquet(old_path)
+    manifest_path = root / "symbols" / f"{row.symbol}.manifest.json"
+    manifest_path.parent.mkdir(parents=True)
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "source": "shioaji_kbars_1m",
+                "storage_frequency": "minute",
+                "simulation": True,
+                "symbol": row.symbol,
+                "requested_start": old_start.isoformat(),
+                "requested_end": old_end.isoformat(),
+                "chunks": [
+                    {
+                        "start_date": old_start.isoformat(),
+                        "end_date": old_end.isoformat(),
+                        "status": "ok",
+                        "data_path": str(old_path),
+                        "data_sha256": hashlib.sha256(old_path.read_bytes()).hexdigest(),
+                        "source_gap_dates": [],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    restored = restore_extended_tail_from_archived_manifest(
+        root,
+        row,
+        [(old_start, new_end)],
+        requested_start=old_start,
+        requested_end=new_end,
+        simulation=True,
+        expected_dates={TRADE_DATE},
+    )
+
+    assert restored
+    receipt = json.loads(
+        (
+            root
+            / "minute_chunks"
+            / row.symbol
+            / f"{old_start.isoformat()}_{new_end.isoformat()}.receipt.json"
+        ).read_text()
+    )
+    assert receipt["status"] == "ok"
+    assert receipt["query_performed"] is False
+    assert receipt["query_skipped_reason"] == "archived_delisted_contract_tail_repacked"
+    assert receipt["rows"] == frame.height
+
+
 def test_completed_bar_features_do_not_read_next_bar() -> None:
     baseline = _research_frame(next_open=106.0, next_close=107.0)
     changed_future = _research_frame(next_open=160.0, next_close=170.0)
@@ -628,6 +701,29 @@ def test_completed_bar_features_do_not_read_next_bar() -> None:
     )
 
 
+def test_research_frame_infers_mixed_shioaji_volume_units_from_amount() -> None:
+    raw = _raw_minute_frame().with_columns(
+        pl.when(pl.int_range(pl.len()) == 1)
+        .then(pl.col("Volume") * pl.col("contract_unit"))
+        .otherwise(pl.col("Volume"))
+        .alias("Volume")
+    )
+    result = build_research_frame(raw.lazy()).collect()
+
+    assert result["source_volume_unit_valid"].to_list() == [True] * result.height
+    assert result["source_volume_multiplier"].to_list() == [
+        1_000.0,
+        1.0,
+        1_000.0,
+        1_000.0,
+        1_000.0,
+        1_000.0,
+        1_000.0,
+        1_000.0,
+    ]
+    assert result["volume_shares"].to_list() == [100_000.0] * result.height
+
+
 def test_dataset_audit_accepts_causal_synthetic_partition() -> None:
     result = audit_frame(_research_frame(), trade_date=TRADE_DATE)
 
@@ -637,6 +733,10 @@ def test_dataset_audit_accepts_causal_synthetic_partition() -> None:
         "duplicate_keys": 0,
         "out_of_session_rows": 0,
         "wrong_date_rows": 0,
+        "raw_invalid_rows": 0,
+        "invalid_volume_unit_rows": 0,
+        "invalid_volume_notional_rows": 0,
+        "invalid_volume_shares_rows": 0,
         "invalid_rows_with_labels": 0,
         "invalid_session_rows_with_labels": 0,
         "bad_label_alignment_rows": 0,

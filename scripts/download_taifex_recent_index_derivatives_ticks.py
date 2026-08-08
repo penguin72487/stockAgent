@@ -427,7 +427,15 @@ def _parse_futures_rows(
     trading_date: date,
     source_file: str,
     source_sha256: str,
+    products: tuple[str, ...] = ("TX",),
+    outright_contracts_only: bool = False,
 ) -> pl.DataFrame:
+    normalized_products = tuple(str(value).strip().upper() for value in products)
+    if not normalized_products or any(not value for value in normalized_products):
+        raise ValueError("futures products must contain non-empty product codes")
+    if len(set(normalized_products)) != len(normalized_products):
+        raise ValueError("futures products must not contain duplicates")
+    product_set = frozenset(normalized_products)
     raw: dict[str, list[object]] = {
         "event_date_raw": [],
         "event_time": [],
@@ -444,7 +452,9 @@ def _parse_futures_rows(
     }
     for row_number, row in enumerate(csv.reader(text), start=1):
         cells = [cell.strip() for cell in row]
-        if len(cells) < 9 or not cells[0].isdigit() or cells[1] != "TX":
+        if len(cells) < 9 or not cells[0].isdigit() or cells[1] not in product_set:
+            continue
+        if outright_contracts_only and "/" in cells[2]:
             continue
         if len(cells) > 9 and any(cells[9:]):
             raise ValueError(f"row {row_number}: unexpected nonempty futures columns")
@@ -466,7 +476,7 @@ def _parse_futures_rows(
         raw["event_date_raw"].append(cells[0])
         raw["event_time"].append(cells[3])
         raw["session"].append(_session_for_time(event_time, row_number=row_number))
-        raw["product"].append("TX")
+        raw["product"].append(cells[1])
         raw["delivery_month_week"].append(cells[2])
         raw["price"].append(
             _parse_float(cells[4], row_number=row_number, field="price")
@@ -497,6 +507,8 @@ def _parse_zip(
     kind: str,
     trading_date: date,
     source_sha256: str,
+    futures_products: tuple[str, ...] = ("TX",),
+    futures_outright_contracts_only: bool = False,
 ) -> pl.DataFrame:
     expected_member = (
         f"OptionsDaily_{trading_date.strftime('%Y_%m_%d')}.csv"
@@ -517,6 +529,8 @@ def _parse_zip(
                 trading_date=trading_date,
                 source_file=str(path),
                 source_sha256=source_sha256,
+                products=futures_products,
+                outright_contracts_only=futures_outright_contracts_only,
             )
 
 
