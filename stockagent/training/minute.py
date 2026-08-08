@@ -45,6 +45,7 @@ from stockagent.data.walkforward import (
     validate_walk_forward_year_contract,
 )
 from stockagent.models.factory import build_model
+from stockagent.portfolio_contract import normalize_portfolio_output_mode
 from stockagent.evaluation.metrics import ic_summary
 from stockagent.training.trainer import (
     FoldResult,
@@ -94,11 +95,11 @@ from stockagent.training.lifecycle import (
 )
 
 
-MINUTE_EXECUTION_CONTRACT_VERSION = 4
+MINUTE_EXECUTION_CONTRACT_VERSION = 6
 # Per-epoch validation/test reporting is audit-only: it does not alter model
 # inputs, optimizer state, scheduler state, sample order, or loss/backtest
-# semantics. Keep v6 checkpoints resumable when reporting fields evolve.
-MINUTE_TRAINING_CONTRACT_VERSION = 6
+# semantics. Allocation-order changes require a fresh training contract.
+MINUTE_TRAINING_CONTRACT_VERSION = 8
 
 
 class _MinuteSlabForwardAdapter(nn.Module):
@@ -121,6 +122,9 @@ class _MinuteSlabForwardAdapter(nn.Module):
         )
         self.outside_cash_logit = config.outside_cash_logit
         self.config_long_only = bool(config.long_only)
+        self.portfolio_output_mode = normalize_portfolio_output_mode(
+            str(getattr(model, "portfolio_output_mode", "logits"))
+        )
 
     def forward(
         self,
@@ -128,22 +132,33 @@ class _MinuteSlabForwardAdapter(nn.Module):
         mask: torch.Tensor,
         shortable_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        logits = self.model.forward_from_batched_panel_slabs(
+        model_output = self.model.forward_from_batched_panel_slabs(
             feature_slabs,
             mask,
             return_aux=False,
         )
-        if isinstance(logits, dict):
-            logits = logits.get("score_logits", logits.get("weights"))
-        if isinstance(logits, tuple):
-            logits = logits[0]
-        if not isinstance(logits, torch.Tensor):
-            raise RuntimeError("tw_minute model did not return score logits")
+        if isinstance(model_output, dict):
+            model_output = model_output.get(
+                "score_logits", model_output.get("weights")
+            )
+        if isinstance(model_output, tuple):
+            model_output = model_output[0]
+        if not isinstance(model_output, torch.Tensor):
+            raise RuntimeError("tw_minute model did not return portfolio outputs")
         flat_mask = mask.reshape(-1, mask.size(-1))
+        if self.portfolio_output_mode in {"l1", "projection_l1"}:
+            # Match the canonical daily tw_day_trade ordering exactly: the
+            # model first resolves its L1 allocation using only its causal
+            # feature/tradability mask.  Projection-L1 may deliberately leave
+            # part of the gross-one budget as cash. Directional eligibility,
+            # close availability, and volume capacity are executor facts
+            # applied afterwards; blocked requests also remain cash instead of
+            # being redistributed across the surviving symbols.
+            return model_output.float().masked_fill(~flat_mask, 0.0)
         if shortable_mask is None:
             shortable_mask = mask
         return minute_target_weights_from_logits(
-            logits,
+            model_output,
             flat_mask,
             gross_exposure=self.gross_exposure,
             maximum_name_weight=self.maximum_name_weight,
@@ -1086,7 +1101,13 @@ def _run_day_batch(
     benchmark_closes = cpu_fields["session_close"]
     benchmark_exit_mask = cpu_fields["session_exit_mask"]
     for day_index, trade_date in enumerate(trade_dates):
-        final_equity = float(metrics[0, day_index])
+        ledger_equity_scale = float(metrics[0, day_index])
+        log_return = float(metrics[1, day_index])
+        # The differentiable objective accumulates small direct P&L returns in
+        # normalized units. Convert to currency once in host Float64 so the
+        # report cannot reintroduce NT$10m FP32 cancellation.
+        net_return = float(math.expm1(log_return))
+        final_equity = float(execution_config.initial_equity) * (1.0 + net_return)
         benchmark_open = float(
             benchmark_opens[
                 day_index, first_execution_index, benchmark_symbol_index
@@ -1115,8 +1136,10 @@ def _run_day_batch(
                 "date": str(trade_date.astype("datetime64[D]")),
                 "initial_equity": execution_config.initial_equity,
                 "final_equity": final_equity,
-                "net_return": final_equity / execution_config.initial_equity - 1.0,
-                "log_return": float(metrics[1, day_index]),
+                "net_return": net_return,
+                "log_return": log_return,
+                "ledger_equity_scale": ledger_equity_scale,
+                "ledger_equity_gap": ledger_equity_scale - (1.0 + net_return),
                 "benchmark_log_return": benchmark_log_return,
                 "benchmark_available": float(math.isfinite(benchmark_log_return)),
                 "turnover_notional": float(metrics[2, day_index]),

@@ -185,18 +185,19 @@ bash scripts/run_tw_minute_dual_5090.sh \
 ```
 
 launcher 會把 rank 0/1 分別綁到 GPU 0/1 鄰近的 NUMA CPU，輸出獨立寫到
-`artifacts/markets/tw_minute_dual_5090_daytrade_rules_v3`。這份設定以
+`artifacts/markets/tw_minute_dual_5090_daytrade_frequency_only_v4`。這份設定以
 `tw_public_lanten_market_candles.yaml` 為母設定，保留其 FinancialTransformer、
 BF16、optimizer、1000 epochs、early stopping 與 scanner 設定，只覆寫分鐘資料／
 executor 契約及雙卡容量。每個全域 batch 仍保持日期順序，交易日
 才在 rank 間切分；各 rank 會跑完自己交易日內的 270 分鐘狀態帳本，再以 DDP
 同步梯度。因此這不是「一張 GPU 跑一個 fold」。
 
-交易規則直接沿用一般台股當沖基準，只把決策頻率改成一分鐘：raw signed score
-不去均值、L1 gross exposure 為 1、每根 KBar 最多參與 50% 成交量、使用正常
-手續費與當沖稅，且不加額外滑價、現金 gate、單筆金額上限或單一標的權重上限。
-逐日精確放空資格與前一資料 session 的官方放空容量仍會 fail closed；這是可執行
-性契約，不是壓力測試。
+交易規則直接沿用一般台股當沖基準，只把決策頻率改成一分鐘：初始本金 1,000 萬、
+同一個 `projection_l1` 投資組合頭（`sum(abs(w)) <= 1`，未使用曝險即為 cash）、
+每根 KBar 最多參與 50% 成交量、使用正常手續費與當沖稅，且不加額外滑價、單筆
+金額上限或單一標的權重上限。模型先分配股票與 cash，再套逐日精確放空資格、
+前一資料 session 的官方放空容量及成交限制；被擋掉或未成交的部位保留為 cash，
+不會重新分配到其他股票。這些遮罩是可執行性契約，不是壓力測試。
 
 雙 RTX 5090 的完整 epoch-2 吞吐掃描採 2 的冪次容量。原始 fold 1 有 456 個
 train sessions，所以 nominal batch 64 被均分成八批、實際每批只有 57 天；它沒有

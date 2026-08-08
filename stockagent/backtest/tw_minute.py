@@ -56,6 +56,15 @@ class MinuteExecutionConfig:
 
 @dataclass(slots=True)
 class MinuteExecutionState:
+    """Differentiable minute ledger in initial-equity-normalized units.
+
+    ``cash`` and ``equity`` are NAV ratios whose initial value is one.
+    ``shares`` stores actual shares divided by ``config.initial_equity`` so
+    price times shares is also a NAV ratio. Public turnover, fee, and slippage
+    results remain denominated in TWD. This keeps the CUDA hot path in FP32
+    without subtracting two approximately NT$10m values to recover a tiny P&L.
+    """
+
     cash: torch.Tensor
     shares: torch.Tensor
     last_prices: torch.Tensor
@@ -108,7 +117,7 @@ def initialize_minute_execution_state(
     batch_shape = () if batch_size is None else (int(batch_size),)
     cash = torch.full(
         batch_shape,
-        float(config.initial_equity),
+        1.0,
         device=device,
         dtype=dtype,
     )
@@ -290,7 +299,10 @@ def execute_minute_target(
         & (volumes > 0.0)
     )
     valuation_open = torch.where(valid, opens, state.last_prices)
-    equity_open = state.cash + torch.sum(state.shares * valuation_open, dim=-1)
+    mark_to_open_pnl = torch.sum(
+        state.shares * (valuation_open - state.last_prices), dim=-1
+    )
+    equity_open = state.equity + mark_to_open_pnl
     # Avoid a device synchronization on every minute. CPU oracle/tests still
     # fail at the exact event; CUDA training is guarded by the finite log-loss
     # check before every backward pass.
@@ -305,6 +317,8 @@ def execute_minute_target(
         torch.nan_to_num(target_weights.float(), nan=0.0, posinf=0.0, neginf=0.0),
         torch.zeros_like(target_weights, dtype=torch.float32),
     )
+    # State shares are normalized by initial equity. Target weights therefore
+    # map directly from normalized NAV to normalized shares.
     target_shares = (
         clean_target
         * equity_open.unsqueeze(-1)
@@ -330,7 +344,7 @@ def execute_minute_target(
                 nan=0.0,
                 posinf=0.0,
                 neginf=0.0,
-            ).clamp_min(0.0)
+            ).clamp_min(0.0) / float(config.initial_equity)
         target_shares = torch.where(
             shortable,
             torch.maximum(target_shares, -short_capacity),
@@ -364,14 +378,19 @@ def execute_minute_target(
     delta = target_shares - state.shares
     volume_capacity = torch.where(
         valid,
-        volumes * float(config.maximum_volume_participation),
+        volumes
+        * (float(config.maximum_volume_participation) / float(config.initial_equity)),
         torch.zeros_like(volumes),
     )
     capacity = volume_capacity
     if config.maximum_order_notional is not None:
         notional_capacity = torch.where(
             valid,
-            float(config.maximum_order_notional) / torch.clamp_min(opens, 1e-12),
+            (
+                float(config.maximum_order_notional)
+                / float(config.initial_equity)
+            )
+            / torch.clamp_min(opens, 1e-12),
             torch.zeros_like(opens),
         )
         capacity = torch.minimum(capacity, notional_capacity)
@@ -405,10 +424,22 @@ def execute_minute_target(
     )
     shares = shares_after_sell + buy_quantity
     last_prices = torch.where(valid, closes, state.last_prices)
-    equity = cash + torch.sum(shares * last_prices, dim=-1)
-    net_return = equity / torch.clamp_min(state.equity, 1e-12) - 1.0
-    turnover = torch.sum((sell_quantity + buy_quantity) * opens, dim=-1)
-    fees = torch.sum(sell_fees + buy_fees, dim=-1)
+    normalized_pnl = torch.sum(
+        state.shares * (last_prices - state.last_prices)
+        + sell_quantity * (sell_execution - last_prices)
+        + buy_quantity * (last_prices - buy_execution)
+        - sell_fees
+        - buy_fees,
+        dim=-1,
+    )
+    equity = state.equity + normalized_pnl
+    net_return = normalized_pnl / torch.clamp_min(state.equity, 1e-12)
+    currency_scale = float(config.initial_equity)
+    turnover = (
+        torch.sum((sell_quantity + buy_quantity) * opens, dim=-1)
+        * currency_scale
+    )
+    fees = torch.sum(sell_fees + buy_fees, dim=-1) * currency_scale
     slippage_cost = turnover * slippage
     return MinuteStepResult(
         state=MinuteExecutionState(
@@ -477,17 +508,33 @@ def force_close_minute_session(
     buy_fees = short_quantity * buy_execution * buy_rates
     proceeds = long_quantity * sell_execution - sell_fees
     cover_cost = short_quantity * buy_execution + buy_fees
-    cash = state.cash + torch.sum(proceeds - cover_cost, dim=-1)
-    turnover = torch.sum(quantity * reference, dim=-1)
+    normalized_cash = state.cash + torch.sum(proceeds - cover_cost, dim=-1)
+    normalized_pnl = torch.sum(
+        long_quantity * (sell_execution - state.last_prices)
+        + short_quantity * (state.last_prices - buy_execution)
+        - sell_fees
+        - buy_fees,
+        dim=-1,
+    )
+    equity = state.equity + normalized_pnl
+    # The forced close leaves no inventory, so cash and equity must be the
+    # same canonical normalized value. The independently updated cash is kept
+    # only as a finite guard against implementation mistakes on CPU.
+    if state.shares.device.type == "cpu" and not bool(
+        torch.all(torch.isfinite(normalized_cash)).item()
+    ):
+        raise RuntimeError("minute session close produced non-finite cash")
+    cash = equity
+    currency_scale = float(config.initial_equity)
+    turnover = torch.sum(quantity * reference, dim=-1) * currency_scale
     capacity = (
         last_minute_volume_shares.float().to(state.shares.device)
-        * float(config.maximum_volume_participation)
+        * (float(config.maximum_volume_participation) / currency_scale)
     )
     over_capacity = torch.sum(
         torch.clamp_min(quantity - capacity, 0.0) * reference, dim=-1
-    )
-    equity = cash
-    net_return = equity / torch.clamp_min(state.equity, 1e-12) - 1.0
+    ) * currency_scale
+    net_return = normalized_pnl / torch.clamp_min(state.equity, 1e-12)
     return MinuteCloseResult(
         state=MinuteExecutionState(
             cash=cash,
@@ -497,7 +544,9 @@ def force_close_minute_session(
         ),
         net_return=net_return,
         turnover_notional=turnover,
-        explicit_fees=torch.sum(sell_fees + buy_fees, dim=-1),
+        explicit_fees=(
+            torch.sum(sell_fees + buy_fees, dim=-1) * currency_scale
+        ),
         slippage_cost=turnover * slippage,
         forced_exit_over_capacity_notional=over_capacity,
     )

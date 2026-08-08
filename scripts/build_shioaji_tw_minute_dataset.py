@@ -14,7 +14,8 @@ import polars as pl
 
 
 NS_PER_MINUTE = 60_000_000_000
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
+FEATURE_STATISTICS_CONTRACT = "float64_sums_v1"
 VOLUME_NOTIONAL_TOLERANCE = 0.05
 
 MODEL_FEATURE_COLUMNS = (
@@ -424,10 +425,21 @@ def _feature_statistics(day_frame: pl.DataFrame) -> dict[str, Any]:
         sum_squares = {name: 0.0 for name in MODEL_FEATURE_COLUMNS}
     else:
         row = valid.select(
-            *[pl.col(name).count().alias(f"{name}__count") for name in MODEL_FEATURE_COLUMNS],
-            *[pl.col(name).sum().alias(f"{name}__sum") for name in MODEL_FEATURE_COLUMNS],
             *[
-                (pl.col(name) * pl.col(name)).sum().alias(f"{name}__sum_square")
+                pl.col(name).count().alias(f"{name}__count")
+                for name in MODEL_FEATURE_COLUMNS
+            ],
+            *[
+                pl.col(name).cast(pl.Float64).sum().alias(f"{name}__sum")
+                for name in MODEL_FEATURE_COLUMNS
+            ],
+            *[
+                (
+                    pl.col(name).cast(pl.Float64)
+                    * pl.col(name).cast(pl.Float64)
+                )
+                .sum()
+                .alias(f"{name}__sum_square")
                 for name in MODEL_FEATURE_COLUMNS
             ],
         ).row(0, named=True)
@@ -491,6 +503,7 @@ def main() -> None:
             os.replace(temporary, output)
             summary = {
                 "schema_version": SCHEMA_VERSION,
+                "feature_statistics_contract": FEATURE_STATISTICS_CONTRACT,
                 "status": "ok",
                 "source": "shioaji_kbars_1m",
                 "trade_date": date_text,
@@ -518,6 +531,7 @@ def main() -> None:
         args.output_root / "manifest.json",
         {
             "schema_version": SCHEMA_VERSION,
+            "feature_statistics_contract": FEATURE_STATISTICS_CONTRACT,
             "status": "research_ready" if not requested else "research_subset",
             "research_ready": not requested,
             "source": "shioaji_kbars_1m",
