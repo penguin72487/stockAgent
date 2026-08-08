@@ -53,6 +53,7 @@ def _raw_minute_frame(
     next_open: float = 106.0,
     next_close: float = 107.0,
     session_close: float = 110.0,
+    source_volume_multiplier: float = 10.0,
 ) -> pl.DataFrame:
     timestamps = [
         datetime(2026, 7, 24, 9, 1) + timedelta(minutes=index) for index in range(7)
@@ -72,8 +73,10 @@ def _raw_minute_frame(
             "Low": lows,
             "Close": closes,
             "Volume": [100.0] * len(timestamps),
+            # The default multiplier makes 100 raw units represent 1,000 shares;
+            # keep notional inside every bar's causal low/high range.
             "Amount": [
-                100.0 * 1_000.0 * ((high + low) / 2.0)
+                100.0 * source_volume_multiplier * ((high + low) / 2.0)
                 for high, low in zip(highs, lows, strict=True)
             ],
             "contract_unit": [1_000.0] * len(timestamps),
@@ -702,7 +705,7 @@ def test_completed_bar_features_do_not_read_next_bar() -> None:
 
 
 def test_research_frame_infers_mixed_shioaji_volume_units_from_amount() -> None:
-    raw = _raw_minute_frame().with_columns(
+    raw = _raw_minute_frame(source_volume_multiplier=1_000.0).with_columns(
         pl.when(pl.int_range(pl.len()) == 1)
         .then(pl.col("Volume") * pl.col("contract_unit"))
         .otherwise(pl.col("Volume"))

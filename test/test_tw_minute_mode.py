@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -23,11 +24,17 @@ from stockagent.data.tw_minute import (
     MINUTE_FEATURE_COLUMNS,
     MinuteDayPanel,
     MinuteFeatureNormalizer,
+    _load_minute_short_rules,
     load_minute_dataset_index,
 )
 from stockagent.training.minute import (
+    _MinuteSlabForwardAdapter,
     _build_windows,
     _execute_minute_chunk,
+    _first_calendar_year_indices,
+    _global_session_batches,
+    _minute_benchmark_log_return,
+    _minute_chunk_training_loss,
     run_minute_training,
 )
 from stockagent.training.lifecycle import validate_completed_training_artifacts
@@ -49,6 +56,42 @@ def _config() -> MinuteExecutionConfig:
     )
 
 
+def test_first_calendar_year_indices_selects_only_first_test_year() -> None:
+    dates = np.asarray(
+        [
+            "2022-12-30",
+            "2023-01-03",
+            "2023-12-29",
+            "2024-01-02",
+            "2025-01-02",
+        ],
+        dtype="datetime64[D]",
+    )
+
+    year, indices = _first_calendar_year_indices(dates, [1, 2, 3, 4])
+
+    assert year == 2023
+    assert indices.tolist() == [1, 2]
+
+
+def test_minute_group_runtime_release_resets_compiler_on_cpu(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+    monkeypatch.setattr(torch.compiler, "reset", lambda: calls.append("reset"))
+    monkeypatch.setattr(minute_training.gc, "collect", lambda: calls.append("gc"))
+
+    released = minute_training._release_minute_group_runtime(torch.device("cpu"))
+
+    assert calls == ["reset", "gc"]
+    assert released == {
+        "allocated_before": 0,
+        "allocated_after": 0,
+        "reserved_before": 0,
+        "reserved_after": 0,
+    }
+
+
 def _step(state, target: torch.Tensor, *, allow_new_entries: bool = True):
     return execute_minute_target(
         state,
@@ -68,6 +111,7 @@ def test_minute_split_is_chronological_and_progress_counts_sessions(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     seen_batches: list[list[int]] = []
+    seen_chunk_rows: list[int] = []
     progress_instances: list[object] = []
 
     class FakeCache:
@@ -102,9 +146,10 @@ def test_minute_split_is_chronological_and_progress_counts_sessions(
         progress_instances.append(progress)
         return progress
 
-    def fake_run_day_batch(*, days, **_kwargs):
+    def fake_run_day_batch(*, days, **kwargs):
         indices = [int(value) for value in days]
         seen_batches.append(indices)
+        seen_chunk_rows.append(int(kwargs["decision_chunk_rows"]))
         rows = [
             {
                 "date": str(np.datetime64("2020-01-01") + np.timedelta64(index, "D")),
@@ -129,6 +174,7 @@ def test_minute_split_is_chronological_and_progress_counts_sessions(
             batch_size_train=2,
             batch_size_eval=3,
             minute_decision_chunk_rows=10,
+            minute_eval_decision_chunk_rows=4,
             grad_clip_norm=1.0,
         )
     )
@@ -136,7 +182,13 @@ def test_minute_split_is_chronological_and_progress_counts_sessions(
     _summary, rows, _weights, timing = minute_training._run_split(
         name="chronological-train",
         indices=np.asarray([0, 1, 2, 3, 4], dtype=np.int64),
-        dataset=object(),
+        dataset=SimpleNamespace(
+            dates=np.arange(
+                np.datetime64("2020-01-01"),
+                np.datetime64("2020-01-06"),
+                dtype="datetime64[D]",
+            )
+        ),
         normalizer=object(),
         model=torch.nn.Identity(),
         model_forward=lambda *_args: None,
@@ -165,6 +217,109 @@ def test_minute_split_is_chronological_and_progress_counts_sessions(
     assert progress.total == 5
     assert progress.updated == 5
     assert timing.batches == 3
+    assert seen_chunk_rows == [10, 10, 10]
+
+    seen_batches.clear()
+    seen_chunk_rows.clear()
+    minute_training._run_split(
+        name="chronological-eval",
+        indices=np.asarray([0, 1, 2, 3, 4], dtype=np.int64),
+        dataset=SimpleNamespace(
+            dates=np.arange(
+                np.datetime64("2020-01-01"),
+                np.datetime64("2020-01-06"),
+                dtype="datetime64[D]",
+            )
+        ),
+        normalizer=object(),
+        model=torch.nn.Identity(),
+        model_forward=lambda *_args: None,
+        execution_forward=lambda *_args: (),
+        day_cache=FakeCache(),
+        config=config,
+        execution_config=_config(),
+        buy_fee_rates=torch.zeros(1),
+        sell_fee_rates=torch.zeros(1),
+        device=torch.device("cpu"),
+        amp_dtype=None,
+        optimizer=None,
+        benchmark_symbol_index=0,
+    )
+    assert seen_batches == [[0, 1, 2], [3, 4]]
+    assert seen_chunk_rows == [4, 4]
+
+
+def test_minute_ddp_global_batches_preserve_every_chronological_session() -> None:
+    batches = _global_session_batches(
+        range(19),
+        global_batch_size=8,
+        world_size=2,
+    )
+
+    assert [index for batch in batches for index in batch] == list(range(19))
+    assert all(len(batch[0::2]) >= 1 for batch in batches)
+    assert all(len(batch[1::2]) >= 1 for batch in batches)
+    assert [len(batch) for batch in batches] == [7, 6, 6]
+    with pytest.raises(ValueError, match="global batch size"):
+        _global_session_batches(range(8), global_batch_size=1, world_size=2)
+
+
+def test_minute_ddp_ragged_loss_matches_global_batch_gradient() -> None:
+    parameter = torch.tensor(2.0, requires_grad=True)
+    rank0_utility = parameter * torch.tensor([1.0, 2.0])
+    rank1_utility = parameter * torch.tensor([3.0])
+    rank0_loss = _minute_chunk_training_loss(
+        rank0_utility,
+        real_days=2,
+        global_real_days=3,
+        decisions_per_day=5,
+        gradient_world_size=2,
+    )
+    rank1_loss = _minute_chunk_training_loss(
+        rank1_utility,
+        real_days=1,
+        global_real_days=3,
+        decisions_per_day=5,
+        gradient_world_size=2,
+    )
+    ddp_averaged_loss = (rank0_loss + rank1_loss) / 2.0
+    expected_loss = -(parameter * torch.tensor([1.0, 2.0, 3.0])).sum() / 15.0
+
+    torch.testing.assert_close(ddp_averaged_loss, expected_loss)
+    actual_gradient = torch.autograd.grad(ddp_averaged_loss, parameter)[0]
+    expected_gradient = torch.autograd.grad(expected_loss, parameter)[0]
+    torch.testing.assert_close(actual_gradient, expected_gradient)
+
+
+def test_minute_empty_source_partition_preserves_missing_benchmark() -> None:
+    day = MinuteDayPanel(
+        trade_date=np.datetime64("2020-09-27"),
+        features=np.zeros((270, 2, len(MINUTE_FEATURE_COLUMNS)), dtype=np.float32),
+        feature_mask=np.zeros((270, 2), dtype=bool),
+        execution_mask=np.zeros((270, 2), dtype=bool),
+        execution_open=np.zeros((270, 2), dtype=np.float32),
+        exit_close=np.zeros((270, 2), dtype=np.float32),
+        future_volume_shares=np.zeros((270, 2), dtype=np.float32),
+        session_close=np.zeros(2, dtype=np.float32),
+        session_exit_mask=np.zeros(2, dtype=bool),
+    )
+
+    assert math.isnan(
+        _minute_benchmark_log_return(
+            day,
+            first_execution_index=31,
+            benchmark_symbol_index=0,
+        )
+    )
+
+    day.feature_mask[31, 1] = True
+    assert math.isnan(
+        _minute_benchmark_log_return(
+            day,
+            first_execution_index=31,
+            benchmark_symbol_index=0,
+        )
+    )
 
 
 def test_minute_logits_are_masked_capped_and_leave_cash() -> None:
@@ -178,6 +333,238 @@ def test_minute_logits_are_masked_capped_and_leave_cash() -> None:
     assert weights[0, 0] == pytest.approx(0.4)
     assert weights[0, 2] == 0.0
     assert float(weights.sum()) < 0.9
+
+
+def test_minute_long_short_targets_are_bias_invariant_and_fail_closed() -> None:
+    logits = torch.tensor([[2.0, 1.0, -1.0, -2.0]], requires_grad=True)
+    tradable = torch.ones_like(logits, dtype=torch.bool)
+    shortable = torch.tensor([[True, True, False, True]])
+
+    actual = minute_target_weights_from_logits(
+        logits,
+        tradable,
+        gross_exposure=1.0,
+        maximum_name_weight=1.0,
+        long_only=False,
+        shortable_mask=shortable,
+    )
+    shifted = minute_target_weights_from_logits(
+        logits + 32.0,
+        tradable,
+        gross_exposure=1.0,
+        maximum_name_weight=1.0,
+        long_only=False,
+        shortable_mask=shortable,
+    )
+
+    torch.testing.assert_close(actual, torch.tensor([[0.4, 0.2, 0.0, -0.4]]))
+    torch.testing.assert_close(actual, shifted)
+    assert float(actual.detach().abs().sum()) == pytest.approx(1.0)
+    actual.sum().backward()
+    assert logits.grad is not None
+    assert bool(torch.isfinite(logits.grad).all())
+
+
+def test_minute_long_short_executor_enforces_capacity_and_covers_at_close() -> None:
+    config = MinuteExecutionConfig(
+        initial_equity=1_000_000.0,
+        gross_exposure=1.0,
+        maximum_name_weight=1.0,
+        maximum_volume_participation=1.0,
+        maximum_order_notional=1_000_000.0,
+        slippage_bps_per_side=0.0,
+        long_only=False,
+    )
+    state = initialize_minute_execution_state(
+        num_symbols=2,
+        config=config,
+        device=torch.device("cpu"),
+    )
+    opened = execute_minute_target(
+        state,
+        target_weights=torch.tensor([-0.5, 0.5]),
+        execution_mask=torch.tensor([True, True]),
+        execution_open=torch.tensor([100.0, 100.0]),
+        exit_close=torch.tensor([100.0, 100.0]),
+        future_volume_shares=torch.tensor([1_000_000.0, 1_000_000.0]),
+        buy_fee_rates=torch.tensor([0.001, 0.001]),
+        sell_fee_rates=torch.tensor([0.002, 0.002]),
+        config=config,
+        allow_new_entries=True,
+        short_open_mask=torch.tensor([True, False]),
+        short_capacity_shares=torch.tensor([2_000.0, 0.0]),
+    )
+
+    assert float(opened.state.shares[0]) == pytest.approx(-2_000.0)
+    assert float(opened.state.shares[1]) > 0.0
+    closed = force_close_minute_session(
+        opened.state,
+        session_close=torch.tensor([100.0, 100.0]),
+        session_exit_mask=torch.tensor([True, True]),
+        last_minute_volume_shares=torch.tensor([1_000_000.0, 1_000_000.0]),
+        sell_fee_rates=torch.tensor([0.002, 0.002]),
+        buy_fee_rates=torch.tensor([0.001, 0.001]),
+        config=config,
+    )
+    torch.testing.assert_close(closed.state.shares, torch.zeros(2))
+    # Short cover uses the buy fee while the long liquidation uses sell fees.
+    expected_close_fees = 2_000.0 * 100.0 * 0.001 + float(
+        opened.state.shares[1]
+    ) * 100.0 * 0.002
+    assert float(closed.explicit_fees) == pytest.approx(expected_close_fees)
+
+
+def test_minute_short_rule_sidecar_uses_exact_day_and_one_session_shift(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "tw_public.parquet"
+    dates = np.asarray(
+        ["2026-01-02", "2026-01-05", "2026-01-06"],
+        dtype="datetime64[D]",
+    )
+    pl.DataFrame(
+        {
+            "date": [
+                datetime(2026, 1, 2).date(),
+                datetime(2026, 1, 2).date(),
+                datetime(2026, 1, 5).date(),
+                datetime(2026, 1, 5).date(),
+                datetime(2026, 1, 6).date(),
+                datetime(2026, 1, 6).date(),
+            ],
+            "symbol": ["0050", "2330"] * 3,
+            "_twpub_day_trade_eligible": [1.0] * 6,
+            # Exact-session direction blocks 0050 on the middle session.
+            "_twpub_day_trade_short_open": [1.0, 1.0, 0.0, 1.0, 1.0, 1.0],
+            # The missing middle-session evidence must not forward-fill.
+            "_twpub_margin_short_evidence_next_session": [
+                1.0,
+                1.0,
+                None,
+                1.0,
+                1.0,
+                1.0,
+            ],
+            "_twpub_short_capacity_shares_next_session": [
+                1_000.0,
+                2_000.0,
+                None,
+                3_000.0,
+                4_000.0,
+                5_000.0,
+            ],
+        }
+    ).write_parquet(path)
+
+    shortable, capacity, fingerprint = _load_minute_short_rules(
+        path,
+        symbols=("0050", "2330"),
+        dates=dates,
+    )
+
+    assert shortable.tolist() == [
+        [False, False],
+        [False, True],
+        [False, True],
+    ]
+    assert capacity.tolist() == [[0, 0], [0, 2_000], [0, 3_000]]
+    assert len(fingerprint) == 64
+
+
+def test_minute_cash_outside_option_is_universe_invariant_and_learnable() -> None:
+    learnable_logits = torch.zeros(1, 8, requires_grad=True)
+    small = minute_target_weights_from_logits(
+        torch.zeros(1, 2),
+        torch.ones(1, 2, dtype=torch.bool),
+        gross_exposure=0.9,
+        maximum_name_weight=1.0,
+        outside_cash_logit=4.0,
+    )
+    large = minute_target_weights_from_logits(
+        learnable_logits,
+        torch.ones(1, 8, dtype=torch.bool),
+        gross_exposure=0.9,
+        maximum_name_weight=1.0,
+        outside_cash_logit=4.0,
+    )
+    shifted = minute_target_weights_from_logits(
+        torch.full((1, 8), 4.0),
+        torch.ones(1, 8, dtype=torch.bool),
+        gross_exposure=0.9,
+        maximum_name_weight=1.0,
+        outside_cash_logit=4.0,
+    )
+
+    torch.testing.assert_close(small.sum(), large.sum())
+    torch.testing.assert_close(
+        small.sum(),
+        torch.tensor(0.9 * torch.sigmoid(torch.tensor(-4.0)).item()),
+    )
+    torch.testing.assert_close(shifted.sum(), torch.tensor(0.45))
+    large.sum().backward()
+    assert learnable_logits.grad is not None
+    assert bool(torch.all(learnable_logits.grad > 0.0))
+
+    reference_logits = torch.tensor([[1.0, -2.0, 0.5, 3.0]])
+    reference_mask = torch.tensor([[True, False, True, True]])
+    actual = minute_target_weights_from_logits(
+        reference_logits,
+        reference_mask,
+        gross_exposure=0.5,
+        maximum_name_weight=1.0,
+        outside_cash_logit=4.0,
+    )
+    safe = reference_logits.masked_fill(
+        ~reference_mask, torch.finfo(torch.float32).min
+    )
+    conditional = torch.softmax(safe, dim=1).masked_fill(~reference_mask, 0.0)
+    log_mean_exp = torch.logsumexp(safe, dim=1, keepdim=True) - math.log(3.0)
+    expected = conditional * 0.5 * torch.sigmoid(log_mean_exp - 4.0)
+    torch.testing.assert_close(actual, expected)
+
+
+def test_minute_slab_adapter_fuses_identical_target_construction() -> None:
+    class FakeSlabModel(torch.nn.Module):
+        def forward_from_batched_panel_slabs(
+            self,
+            feature_slabs: torch.Tensor,
+            mask: torch.Tensor,
+            *,
+            return_aux: bool,
+        ) -> torch.Tensor:
+            del feature_slabs, return_aux
+            return torch.arange(mask.numel(), dtype=torch.float32).reshape(
+                -1, mask.size(-1)
+            ) / 8.0
+
+    config = MinuteExecutionConfig(
+        initial_equity=1_000_000.0,
+        gross_exposure=0.5,
+        maximum_name_weight=0.25,
+        maximum_volume_participation=0.1,
+        maximum_order_notional=100_000.0,
+        slippage_bps_per_side=1.0,
+        outside_cash_logit=4.0,
+    )
+    mask = torch.tensor(
+        [
+            [[True, True, False], [True, False, True]],
+            [[False, True, True], [True, True, True]],
+        ]
+    )
+    features = torch.zeros(2, 3, 3, 1)
+    adapter = _MinuteSlabForwardAdapter(FakeSlabModel(), config)
+    actual = adapter(features, mask)
+    logits = torch.arange(mask.numel(), dtype=torch.float32).reshape(-1, 3) / 8.0
+    expected = minute_target_weights_from_logits(
+        logits,
+        mask.reshape(-1, 3),
+        gross_exposure=0.5,
+        maximum_name_weight=0.25,
+        outside_cash_logit=4.0,
+    )
+
+    torch.testing.assert_close(actual, expected)
 
 
 def test_minute_executor_trades_only_target_delta_and_forces_flat() -> None:
@@ -478,6 +865,47 @@ def test_official_tw_minute_config_uses_a_separate_training_contract() -> None:
     assert action_channels_for_execution_mode("tw_minute") == ("target",)
 
 
+def test_dual_5090_minute_config_is_within_fold_ddp() -> None:
+    config_path = (
+        Path(__file__).parents[1]
+        / "configs/markets/tw_minute_dual_5090.yaml"
+    )
+    config = load_config(config_path)
+
+    assert config.training.multi_gpu_strategy == "distributed_data_parallel"
+    assert config.training.model_name == "financial_transformer"
+    assert config.training.batch_size_train == 64
+    assert config.training.batch_size_eval == 16
+    assert config.training.minute_decision_chunk_rows == 16
+    assert config.training.minute_eval_decision_chunk_rows == 16
+    assert config.training.enable_lr_scheduler is False
+    assert config.training.epochs == 1000
+    assert config.training.finite_check_interval_steps == 0
+    assert config.training.checkpoint_finite_check is False
+    assert config.training.financial_transformer.d_model == 32
+    assert config.training.financial_transformer.amp_native_position_add is True
+    assert config.training.financial_transformer.checkpoint_blocks is True
+    assert config.training.transformer_base_portfolio.amp_native_position_add is True
+    assert config.training.transformer_base_portfolio.checkpoint_blocks is True
+    assert config.training.transformer_base_portfolio.portfolio_output_mode == "logits"
+    assert config.training.financial_transformer.temporal_pooling == "last"
+    assert config.training.financial_transformer.temporal_query_mode == "last_only"
+    assert config.training.financial_transformer.portfolio_mode == "long_short"
+    assert config.training.financial_transformer.portfolio_output_mode == "logits"
+    assert config.trading.long_only is False
+    assert config.data.use_tw_public_rules is True
+    assert config.trading.tw_minute_outside_cash_logit == 4.0
+    assert config.training.curve_plot_interval == 1
+    assert config.training.epoch_test_curve is True
+    assert config.training.curve_test_interval == 1
+    assert config.training.curve_plot_async is True
+    assert config.training.defer_epoch_curve_plot_until_end is False
+    assert (
+        config.runner.output_dir
+        == "artifacts/markets/tw_minute_dual_5090_long_short_algo_v2"
+    )
+
+
 def test_model_mask_does_not_consume_next_bar_or_session_exit_availability() -> None:
     features = np.ones((270, 2, len(MINUTE_FEATURE_COLUMNS)), dtype=np.float32)
     feature_mask = np.ones((270, 2), dtype=bool)
@@ -582,7 +1010,6 @@ def test_minute_partition_loads_sparse_full_market_rows_into_dense_day(
 
 def test_minute_training_reuses_canonical_group_artifacts(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     root = tmp_path / "minute"
     symbols = ["0050", "2330"]
@@ -690,11 +1117,6 @@ def test_minute_training_reuses_canonical_group_artifacts(
     config.trading.tw_minute_first_decision_minute = 2
     config.trading.tw_minute_last_entry_minute = 2
     config.trading.tw_minute_last_decision_minute = 2
-    monkeypatch.setattr(
-        "stockagent.training.trainer._run_epoch_curve_plot_once",
-        lambda *_args, **_kwargs: {},
-    )
-
     output_dir = tmp_path / "artifacts"
     results = run_minute_training(
         config,
@@ -750,12 +1172,20 @@ def test_minute_training_reuses_canonical_group_artifacts(
     assert len(curve_rows) == 1
     assert curve_rows[0]["train_loss"] is not None
     assert curve_rows[0]["val_mean"] is not None
+    assert curve_rows[0]["test_mean"] is not None
+    assert curve_rows[0]["test_mean_scope"] == "first_calendar_year_of_fold_test"
+    assert curve_rows[0]["test_sample_year"] == 2023
+    assert curve_rows[0]["test_sample_rows"] == 1
     assert curve_rows[0]["epoch_total_s"] > 0.0
     assert curve_rows[0]["minute_days_per_train_batch"] == 2
     assert curve_rows[0]["minute_decision_chunk_rows"] == 10
+    assert curve_rows[0]["minute_eval_decision_chunk_rows"] == 10
     assert curve_rows[0]["minute_optimizer_steps_per_epoch"] == 1
     assert curve_rows[0]["minute_train_cache_misses"] == 2
     assert curve_rows[0]["minute_val_cache_misses"] == 1
+    assert curve_rows[0]["minute_test_cache_misses"] == 1
+    assert (group_dir / "epoch_curve_every1.png").is_file()
+    assert (group_dir / "epoch_timing_every1.png").is_file()
     conformance = validate_completed_training_artifacts(
         output_dir,
         fold_ids=[1],

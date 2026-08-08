@@ -106,8 +106,22 @@ def main() -> None:
                "--spec", str(spec_path), "--output-root", str(root), "--dry-run",
                "--multi-gpu-strategy", args.multi_gpu_strategy]
     _run_checked(dry_run)
-    configs = sorted((root / "generated_configs").glob("*.yaml"))
-    names = [path.stem for path in configs]
+    # Derive the run set from the current spec, not from every historical file
+    # left under generated_configs. This keeps removed/renamed experiments out
+    # of the progress denominator without deleting their audit artifacts.
+    if str(REPO_ROOT) not in sys.path:
+        sys.path.insert(0, str(REPO_ROOT))
+    from scripts.run_ablation_experiments import _experiment_rows
+
+    _, experiment_rows = _experiment_rows(spec_path)
+    names = [str(row["name"]) for row in experiment_rows]
+    configs = [root / "generated_configs" / f"{name}.yaml" for name in names]
+    missing_configs = [str(path) for path in configs if not path.is_file()]
+    if missing_configs:
+        raise SystemExit(
+            "dry-run did not generate every configured ablation: "
+            + ", ".join(missing_configs)
+        )
     if not names:
         raise SystemExit("no generated ablation configs")
     epochs = max(int(yaml.safe_load(path.read_text())["training"]["epochs"]) for path in configs)

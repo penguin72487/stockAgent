@@ -84,6 +84,8 @@ class MinuteDayPanel:
     future_volume_shares: np.ndarray
     session_close: np.ndarray
     session_exit_mask: np.ndarray
+    short_open_mask: np.ndarray | None = None
+    short_capacity_shares: np.ndarray | None = None
 
 
 @dataclass(slots=True)
@@ -93,6 +95,9 @@ class MinuteDatasetIndex:
     symbols: tuple[str, ...]
     dates: np.ndarray
     partitions: dict[str, dict[str, Any]]
+    short_open_mask: np.ndarray | None = None
+    short_capacity_shares: np.ndarray | None = None
+    short_rules_fingerprint: str | None = None
 
     @property
     def num_symbols(self) -> int:
@@ -259,7 +264,139 @@ class MinuteDatasetIndex:
             future_volume_shares=future_volume,
             session_close=session_close,
             session_exit_mask=session_exit_mask,
+            short_open_mask=(
+                None
+                if self.short_open_mask is None
+                else self.short_open_mask[int(index)]
+            ),
+            short_capacity_shares=(
+                None
+                if self.short_capacity_shares is None
+                else self.short_capacity_shares[int(index)]
+            ),
         )
+
+
+def _load_minute_short_rules(
+    path: str | Path,
+    *,
+    symbols: tuple[str, ...],
+    dates: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, str]:
+    """Load exact-session sell-first rules into compact day-level arrays.
+
+    The minute parquet intentionally does not repeat a daily rule on every one
+    of its roughly 270 rows.  Eligibility is read for the exact session.  The
+    official margin-short evidence and capacity are post-close observations,
+    so row ``t`` becomes usable only on the next observed minute session.
+    Missing observations fail closed and are never forward-filled.
+    """
+
+    resolved = Path(path).resolve()
+    if not resolved.is_file():
+        raise RuntimeError(f"tw_minute short-rule parquet is missing: {resolved}")
+    required = (
+        "date",
+        "symbol",
+        "_twpub_day_trade_eligible",
+        "_twpub_day_trade_short_open",
+        "_twpub_margin_short_evidence_next_session",
+        "_twpub_short_capacity_shares_next_session",
+    )
+    frame = (
+        pl.scan_parquet(resolved)
+        .select(required)
+        .filter(
+            pl.col("date").is_between(
+                pl.lit(dates[0].astype("datetime64[D]").astype(object)),
+                pl.lit(dates[-1].astype("datetime64[D]").astype(object)),
+                closed="both",
+            )
+            & pl.col("symbol").is_in(pl.Series(symbols).implode())
+        )
+        .collect()
+    )
+    if frame.is_empty():
+        raise RuntimeError("tw_minute short-rule parquet has no overlapping rows")
+
+    date_values = frame["date"].to_numpy().astype("datetime64[D]")
+    symbol_values = frame["symbol"].cast(pl.String).to_numpy()
+    symbol_array = np.asarray(symbols, dtype=object)
+    date_indices = np.searchsorted(dates, date_values)
+    symbol_indices = np.searchsorted(symbol_array, symbol_values)
+    aligned = (
+        (date_indices >= 0)
+        & (date_indices < dates.size)
+        & (symbol_indices >= 0)
+        & (symbol_indices < symbol_array.size)
+    )
+    aligned &= dates[np.clip(date_indices, 0, dates.size - 1)] == date_values
+    aligned &= (
+        symbol_array[np.clip(symbol_indices, 0, symbol_array.size - 1)]
+        == symbol_values
+    )
+    date_indices = date_indices[aligned]
+    symbol_indices = symbol_indices[aligned]
+    flat = date_indices * symbol_array.size + symbol_indices
+    if np.unique(flat).size != flat.size:
+        raise RuntimeError("tw_minute short-rule parquet has duplicate date-symbol rows")
+
+    shape = (int(dates.size), int(symbol_array.size))
+    eligible = np.zeros(shape, dtype=np.bool_)
+    sell_first = np.zeros(shape, dtype=np.bool_)
+    evidence = np.zeros(shape, dtype=np.bool_)
+    source_capacity = np.zeros(shape, dtype=np.int64)
+
+    def numeric(name: str) -> np.ndarray:
+        return (
+            frame[name]
+            .cast(pl.Float64)
+            .fill_null(float("nan"))
+            .to_numpy()[aligned]
+        )
+
+    eligible_values = numeric("_twpub_day_trade_eligible")
+    direction_values = numeric("_twpub_day_trade_short_open")
+    evidence_values = numeric("_twpub_margin_short_evidence_next_session")
+    capacity_values = numeric("_twpub_short_capacity_shares_next_session")
+    eligible[date_indices, symbol_indices] = (
+        np.isfinite(eligible_values) & (eligible_values > 0.0)
+    )
+    sell_first[date_indices, symbol_indices] = (
+        np.isfinite(direction_values) & (direction_values > 0.0)
+    )
+    valid_capacity = (
+        np.isfinite(evidence_values)
+        & (evidence_values > 0.0)
+        & np.isfinite(capacity_values)
+        & (capacity_values > 0.0)
+        & (capacity_values == np.floor(capacity_values))
+        & (capacity_values <= float(np.iinfo(np.int64).max))
+    )
+    evidence[date_indices, symbol_indices] = valid_capacity
+    source_capacity[date_indices[valid_capacity], symbol_indices[valid_capacity]] = (
+        capacity_values[valid_capacity].astype(np.int64, copy=False)
+    )
+
+    next_session_evidence = np.zeros_like(evidence)
+    next_session_capacity = np.zeros_like(source_capacity)
+    if dates.size > 1:
+        next_session_evidence[1:] = evidence[:-1]
+        next_session_capacity[1:] = source_capacity[:-1]
+    short_open = eligible & sell_first & next_session_evidence
+    short_capacity = np.where(
+        short_open,
+        next_session_capacity,
+        np.zeros_like(next_session_capacity),
+    )
+    if not bool(short_open.any()):
+        raise RuntimeError(
+            "tw_minute short rules contain no point-in-time eligible capacity"
+        )
+    digest = hashlib.sha256()
+    digest.update(np.ascontiguousarray(short_open).view(np.uint8))
+    digest.update(np.ascontiguousarray(short_capacity).view(np.uint8))
+    return short_open, short_capacity, digest.hexdigest()
 
 
 def load_minute_dataset_index(
@@ -268,6 +405,8 @@ def load_minute_dataset_index(
     require_research_ready: bool = True,
     verify_partition_sha256: bool = True,
     progress: Callable[[str], None] | None = None,
+    short_rule_path: str | Path | None = None,
+    require_short_rules: bool = False,
 ) -> MinuteDatasetIndex:
     resolved_root = Path(root).resolve()
     manifest_path = resolved_root / "manifest.json"
@@ -336,12 +475,32 @@ def load_minute_dataset_index(
     if set(partitions) != set(date_strings):
         raise RuntimeError("minute manifest date list and partition list disagree")
     dates = np.asarray(date_strings, dtype="datetime64[D]")
+    short_open_mask: np.ndarray | None = None
+    short_capacity_shares: np.ndarray | None = None
+    short_rules_fingerprint: str | None = None
+    if short_rule_path is not None:
+        (
+            short_open_mask,
+            short_capacity_shares,
+            short_rules_fingerprint,
+        ) = _load_minute_short_rules(
+            short_rule_path,
+            symbols=symbols,
+            dates=dates,
+        )
+    elif require_short_rules:
+        raise RuntimeError(
+            "tw_minute long/short requires a point-in-time short-rule parquet"
+        )
     return MinuteDatasetIndex(
         root=resolved_root,
         manifest=manifest,
         symbols=symbols,
         dates=dates,
         partitions=partitions,
+        short_open_mask=short_open_mask,
+        short_capacity_shares=short_capacity_shares,
+        short_rules_fingerprint=short_rules_fingerprint,
     )
 
 
