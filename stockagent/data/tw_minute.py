@@ -274,7 +274,7 @@ def load_minute_dataset_index(
     if not manifest_path.is_file():
         raise RuntimeError(f"minute dataset manifest is missing: {manifest_path}")
     manifest = _read_json(manifest_path)
-    if manifest.get("schema_version") != 2:
+    if manifest.get("schema_version") != 3:
         raise RuntimeError(
             "minute dataset schema is stale; rebuild with "
             "scripts/build_shioaji_tw_minute_dataset.py"

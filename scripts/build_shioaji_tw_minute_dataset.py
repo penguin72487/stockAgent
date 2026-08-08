@@ -14,7 +14,8 @@ import polars as pl
 
 
 NS_PER_MINUTE = 60_000_000_000
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+VOLUME_NOTIONAL_TOLERANCE = 0.05
 
 MODEL_FEATURE_COLUMNS = (
     "log_close_return_1m",
@@ -108,6 +109,40 @@ def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
 def build_research_frame(frame: pl.LazyFrame) -> pl.LazyFrame:
     """Create completed-bar features and strictly next-bar execution labels."""
 
+    positive_volume = (pl.col("Volume") > 0.0) & (pl.col("Amount") > 0.0)
+
+    def volume_multiplier_matches(multiplier: pl.Expr | float) -> pl.Expr:
+        candidate = (
+            multiplier if isinstance(multiplier, pl.Expr) else pl.lit(multiplier)
+        )
+        notional = pl.col("Volume") * candidate
+        tolerance = VOLUME_NOTIONAL_TOLERANCE
+        return (
+            positive_volume
+            & (pl.col("Amount") >= notional * pl.col("Low") * (1.0 - tolerance))
+            & (pl.col("Amount") <= notional * pl.col("High") * (1.0 + tolerance))
+        )
+
+    # Historical Shioaji stock Kbars mix round-lot and direct-share Volume
+    # encodings. Amount and the bar's OHLC range identify the source multiplier
+    # without manufacturing a price or an executable quantity. Unknown positive
+    # volume rows deliberately produce null capacity.
+    multiplier_candidates: tuple[pl.Expr | float, ...] = (
+        pl.col("contract_unit"),
+        1_000.0,
+        100.0,
+        10.0,
+        1.0,
+    )
+    source_volume_multiplier = pl.coalesce(
+        *[
+            pl.when(volume_multiplier_matches(candidate))
+            .then(candidate)
+            .otherwise(None)
+            for candidate in multiplier_candidates
+        ]
+    )
+
     ordered = (
         frame.with_columns(
             pl.col("ts").cast(pl.Datetime("ns")),
@@ -136,6 +171,11 @@ def build_research_frame(frame: pl.LazyFrame) -> pl.LazyFrame:
             .alias("minutes_from_open"),
             pl.col("ts").shift(1).over(["symbol", "date"]).alias("previous_ts"),
             pl.col("Close").shift(1).over(["symbol", "date"]).alias("previous_close"),
+            pl.when((pl.col("Volume") == 0.0) & (pl.col("Amount") == 0.0))
+            .then(pl.col("contract_unit"))
+            .otherwise(source_volume_multiplier)
+            .cast(pl.Float64)
+            .alias("source_volume_multiplier"),
         )
         .with_columns(
             (
@@ -151,6 +191,9 @@ def build_research_frame(frame: pl.LazyFrame) -> pl.LazyFrame:
             )
             .fill_null(False)
             .alias("has_exact_next_minute"),
+            pl.col("source_volume_multiplier")
+            .is_not_null()
+            .alias("source_volume_unit_valid"),
         )
         .with_columns(
             pl.when(
@@ -171,7 +214,10 @@ def build_research_frame(frame: pl.LazyFrame) -> pl.LazyFrame:
             .then((pl.col("Close") - pl.col("Low")) / (pl.col("High") - pl.col("Low")))
             .otherwise(0.5)
             .alias("close_location"),
-            (pl.col("Volume") * pl.col("contract_unit")).alias("volume_shares"),
+            pl.when(pl.col("source_volume_unit_valid"))
+            .then(pl.col("Volume") * pl.col("source_volume_multiplier"))
+            .otherwise(None)
+            .alias("volume_shares"),
         )
         .with_columns(
             pl.col("volume_shares")

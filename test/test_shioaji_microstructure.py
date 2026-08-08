@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import subprocess
+import sys
 from datetime import date, datetime, time
 from decimal import Decimal
 from pathlib import Path
@@ -17,6 +19,24 @@ from downloader.stream_shioaji_tw_microstructure import (
     normalize_tick,
 )
 from downloader.stream_shioaji_taifex_bidask import select_option_strip
+
+
+def test_taifex_capture_module_cli_imports_from_repo_root() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "downloader.stream_shioaji_taifex_bidask",
+            "--help",
+        ],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "Capture TX front-month" in completed.stdout
 
 
 class Payload:

@@ -14,6 +14,12 @@ source "$ENV_FILE"
 set +a
 source scripts/runtime_env.sh
 
+# Fail at service startup if the package entry point cannot be imported.  Running
+# the collector with ``-m`` keeps the repository root on sys.path; executing the
+# file path directly sets sys.path[0] to downloader/ and breaks its package
+# imports before any capture manifest can be written.
+run_fintech_python -c 'import downloader.stream_shioaji_taifex_bidask'
+
 RUN_ROOT="${SHIOAJI_TAIFEX_RUN_ROOT:-artifacts/data_capture/shioaji_taifex_bidask}"
 CAPTURE_ROOT="${SHIOAJI_TAIFEX_CAPTURE_ROOT:-data_tw_index_derivatives_ticks/shioaji_fop_captures}"
 LOG_FILE="$RUN_ROOT/run.log"
@@ -72,7 +78,7 @@ while true; do
   capture_id="$(run_fintech_python -c 'import uuid; print(uuid.uuid4().hex)')"
   echo "[shioaji-taifex] capture_start=$(TZ=Asia/Taipei date --iso-8601=seconds) capture_id=$capture_id"
   set +e
-  run_fintech_python downloader/stream_shioaji_taifex_bidask.py \
+  run_fintech_python -m downloader.stream_shioaji_taifex_bidask \
     --simulation \
     --capture-id "$capture_id" \
     --output-dir "$CAPTURE_ROOT"
