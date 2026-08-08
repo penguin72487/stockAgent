@@ -56,6 +56,38 @@ def test_training_cli_has_no_cross_asset_execution_entrypoint(
         train_entry.parse_args()
 
 
+def test_training_cli_accepts_minute_chunk_capacity_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "train.py",
+            "--minute-decision-chunk-rows",
+            "16",
+            "--minute-eval-decision-chunk-rows",
+            "32",
+            "--torch-compile-mode",
+            "max-autotune-no-cudagraphs",
+            "--transformer-temporal-pooling",
+            "last",
+            "--transformer-d-model",
+            "16",
+            "--transformer-temporal-query-mode",
+            "last_only",
+        ],
+    )
+
+    args = train_entry.parse_args()
+    assert args.minute_decision_chunk_rows == 16
+    assert args.minute_eval_decision_chunk_rows == 32
+    assert args.torch_compile_mode == "max-autotune-no-cudagraphs"
+    assert args.transformer_temporal_pooling == "last"
+    assert args.transformer_d_model == 16
+    assert args.transformer_temporal_query_mode == "last_only"
+
+
 def test_process_thread_budget_prefers_config_then_inherited_then_affinity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -86,6 +118,8 @@ def test_process_thread_budget_prefers_config_then_inherited_then_affinity(
         environ={},
         fallback=3,
     ) == 3
+    assert train_entry._clamp_thread_count_to_affinity(56) == 20
+    assert train_entry._clamp_thread_count_to_affinity(8) == 8
 
 
 def test_termination_handlers_use_python_exit_for_atexit_cleanup(monkeypatch) -> None:
@@ -161,6 +195,40 @@ def test_local_world_size_uses_local_not_global_rank_count(
     monkeypatch.setenv("LOCAL_WORLD_SIZE", "4")
     assert train_entry._local_world_size("distributed_data_parallel") == 4
     assert train_entry._local_world_size("none") == 1
+
+
+def test_ddp_cpu_affinity_binds_each_local_rank_to_its_requested_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LOCAL_RANK", "1")
+    monkeypatch.setenv("LOCAL_WORLD_SIZE", "2")
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    monkeypatch.setenv("STOCKAGENT_DDP_CPU_AFFINITY", "0-2,8;4-6,10")
+    monkeypatch.setattr(train_entry.os, "sched_getaffinity", lambda _pid: set(range(16)))
+    captured: list[set[int]] = []
+    monkeypatch.setattr(
+        train_entry.os,
+        "sched_setaffinity",
+        lambda _pid, cpus: captured.append(set(cpus)),
+    )
+
+    train_entry._configure_local_rank_cpu_affinity("distributed_data_parallel")
+
+    assert captured == [{4, 5, 6, 10}]
+
+
+def test_ddp_cpu_affinity_rejects_missing_rank_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    monkeypatch.setenv("LOCAL_WORLD_SIZE", "2")
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    monkeypatch.setenv("STOCKAGENT_DDP_CPU_AFFINITY", "0-3")
+
+    with pytest.raises(ValueError, match="one CPU set per local rank"):
+        train_entry._configure_local_rank_cpu_affinity(
+            "distributed_data_parallel"
+        )
 
 
 def test_rank_local_seed_is_reproducible_and_decorrelated(

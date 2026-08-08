@@ -113,6 +113,8 @@ def _validate_tw_minute_mode_contract(
     model_name: object,
     loss_type: object,
     long_only: object,
+    use_tw_public_rules: object,
+    tw_public_feature_path: object,
     portfolio_output_mode: object,
     first_decision_minute: object,
     last_entry_minute: object,
@@ -129,22 +131,26 @@ def _validate_tw_minute_mode_contract(
         )
     if (
         _normalized_contract_name(model_name)
-        not in _TW_PHASE_HEAD_MODEL_NAMES - _TW_FINANCIAL_PHASE_HEAD_MODEL_NAMES
+        not in _TW_PHASE_HEAD_MODEL_NAMES
     ):
         raise ValueError(
-            "tw_minute currently supports training.model_name="
-            "'transformer_base_portfolio'; the minute runner requires one scalar "
-            "score per symbol and does not flatten a phase head"
+            "tw_minute requires transformer_base_portfolio or financial_transformer; "
+            "the minute runner consumes one scalar score per symbol and does not "
+            "flatten a carrying-mode phase head"
         )
     if _normalized_contract_name(loss_type) not in _TW_PHASE_RETURN_OBJECTIVES:
         raise ValueError(
             "tw_minute currently supports only the canonical path-dependent "
             "log-utility objective"
         )
-    if not bool(long_only):
+    if not bool(long_only) and (
+        not bool(use_tw_public_rules)
+        or not str(tw_public_feature_path or "").strip()
+    ):
         raise ValueError(
-            "tw_minute v1 is long-only because historical point-in-time sell-first "
-            "eligibility is not yet joined; do not project today's eligibility backward"
+            "tw_minute long/short requires data.use_tw_public_rules=true and a "
+            "point-in-time data.tw_public_feature_path; do not project today's "
+            "sell-first eligibility backward"
         )
     if normalize_portfolio_output_mode(str(portfolio_output_mode)) != "logits":
         raise ValueError(
@@ -788,6 +794,10 @@ class TradingConfig:
     tw_minute_initial_equity: float = 10_000_000.0
     tw_minute_gross_exposure: float = 0.90
     tw_minute_max_name_weight: float = 0.05
+    # Optional universe-size-invariant cash outside option. The risky sleeve
+    # uses sigmoid(logmeanexp(stock_logits) - outside_cash_logit), so the model
+    # can learn zero exposure instead of being forced fully invested each bar.
+    tw_minute_outside_cash_logit: float | None = None
     tw_minute_max_order_notional: float = 1_000_000.0
     tw_minute_slippage_bps_per_side: float = 2.0
     tw_minute_first_decision_minute: int = 1
@@ -1234,6 +1244,9 @@ class TrainingConfig:
     # Decisions remain sequential inside each day and are vectorized in fixed
     # chunks so overlapping lookback rows are projected only once.
     minute_decision_chunk_rows: int = 8
+    # Evaluation has no autograd workspace, so its capacity optimum can differ
+    # from training. None preserves the historical shared-chunk behavior.
+    minute_eval_decision_chunk_rows: int | None = None
     minute_cache_days_on_cpu: bool = True
     minute_cpu_cache_gb: float = 64.0
     minute_data_workers: int = 4
@@ -1634,6 +1647,10 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     training["minute_decision_chunk_rows"] = max(
         1, int(training["minute_decision_chunk_rows"])
     )
+    if training["minute_eval_decision_chunk_rows"] is not None:
+        training["minute_eval_decision_chunk_rows"] = max(
+            1, int(training["minute_eval_decision_chunk_rows"])
+        )
     training["minute_cpu_cache_gb"] = max(0.0, float(training["minute_cpu_cache_gb"]))
     training["minute_data_workers"] = max(1, int(training["minute_data_workers"]))
     tw_compile_rows = training["tw_continuous_compile_chunk_rows"]
@@ -2351,9 +2368,9 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         model_name=training["model_name"],
         loss_type=training["loss_type"],
         long_only=trading["long_only"],
-        portfolio_output_mode=training["transformer_base_portfolio"][
-            "portfolio_output_mode"
-        ],
+        use_tw_public_rules=data["use_tw_public_rules"],
+        tw_public_feature_path=data["tw_public_feature_path"],
+        portfolio_output_mode=phase_model_config["portfolio_output_mode"],
         first_decision_minute=trading["tw_minute_first_decision_minute"],
         last_entry_minute=trading["tw_minute_last_entry_minute"],
         last_decision_minute=trading["tw_minute_last_decision_minute"],
@@ -2765,6 +2782,9 @@ def load_config(path: str | Path) -> ExperimentConfig:
             batch_size_train=training_raw["batch_size_train"],
             batch_size_eval=training_raw["batch_size_eval"],
             minute_decision_chunk_rows=training_raw["minute_decision_chunk_rows"],
+            minute_eval_decision_chunk_rows=training_raw[
+                "minute_eval_decision_chunk_rows"
+            ],
             minute_cache_days_on_cpu=training_raw["minute_cache_days_on_cpu"],
             minute_cpu_cache_gb=training_raw["minute_cpu_cache_gb"],
             minute_data_workers=training_raw["minute_data_workers"],

@@ -250,6 +250,16 @@ source scripts/runtime_env.sh
 run_fintech_python train.py --config configs/markets/tw_minute.yaml
 ```
 
+On the dual-RTX-5090 host, train one fold cooperatively with both GPUs using
+`bash scripts/run_tw_minute_dual_5090.sh --start-fold 1`. This is within-fold
+DDP, not fold-parallel execution. The config inherits the FinancialTransformer
+architecture and general training policy from
+`configs/markets/tw_public_lanten_market_candles.yaml`; only the minute data and
+execution contract plus the measured dual-GPU capacity settings are overridden.
+It is a long/short contract: sell-first allocation is restricted by exact-day
+official eligibility and the preceding session's official short-capacity
+evidence, with missing evidence failing closed.
+
 - Use `run_fintech_python downloader/download_yahoo_ohlcv.py --asset forex` to download only the expanded FX universe.
 - Use `run_fintech_python downloader/download_forex_pepperstone.py` to download the Pepperstone-style FX universe.
 - Use `run_fintech_python downloader/download_forex_pepperstone.py --mode repair` to repair stale/missing Pepperstone forex files.

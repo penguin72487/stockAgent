@@ -1,0 +1,129 @@
+base_config: tw_public_lanten_market_candles.yaml
+
+experiment_name: tw-full-market-minute-long-short-algorithmic-dual-5090-v2
+
+runner:
+  # The minute execution/cash contract and capacity shapes are intentionally
+  # checkpoint-incompatible with both daily candles and the old minute run.
+  output_dir: artifacts/markets/tw_minute_dual_5090_long_short_algo_v2
+  mode: train
+  resume: true
+  post_train_infer: false
+  start_fold: 1
+
+environment:
+  device: cuda
+  use_tensor_cores: true
+  amp_dtype: bf16
+  # Keep the candle baseline's dual-EPYC host budget. The NUMA launcher further
+  # limits each rank to CPUs local to its assigned RTX 5090.
+  cpu_threads: 112
+  torch_compile_threads: 16
+
+data:
+  # These are the only data overrides: daily-panel fields inherited from the
+  # candle config are inert because tw_minute dispatches before panel build.
+  panel_start_date: "2020-01-01"
+  minute_parquet_root: data_tw_minute/research_dataset
+  minute_require_research_ready: true
+  minute_verify_partition_sha256: true
+  benchmark_name: "2330"
+  day_trade_open_feature: false
+  # Exact-session eligibility/direction plus prior-session official short
+  # capacity are loaded once into a compact [day,symbol] sidecar.
+  use_tw_public_rules: true
+  tw_public_feature_path: data_tw_public/features/tw_public_stock_daily.parquet
+
+walk_forward:
+  # Minute partitions begin in 2020. Keep every session strictly chronological
+  # and require a complete lookback within its owned split.
+  min_train_years: 2
+  val_years: 1
+  expected_first_year: 2020
+  split_start_year: null
+  lookback_context: split_only
+  require_contiguous_years: true
+  require_future_test_year: false
+
+trading:
+  # Daily/tw_day_trade execution fields must not leak into the minute ledger.
+  frequency: minute
+  execution_mode: tw_minute
+  long_only: false
+  portfolio_activation: identity
+  min_trade_weight: 0.0
+  reporting_leverage: 1.0
+  max_volume_participation: 0.01
+  tw_minute_initial_equity: 10000000.0
+  tw_minute_gross_exposure: 0.90
+  tw_minute_max_name_weight: 0.05
+  # 2^2 universe-size-invariant cash outside option. Signed exposure responds
+  # to cross-sectional score dispersion; a common score bias cannot fake risk.
+  tw_minute_outside_cash_logit: 4.0
+  tw_minute_max_order_notional: 1000000.0
+  tw_minute_slippage_bps_per_side: 2.0
+  tw_minute_first_decision_minute: 1
+  tw_minute_last_entry_minute: 268
+  tw_minute_last_decision_minute: 269
+  tw_minute_force_session_close: true
+
+training:
+  # Everything below that is not minute/DDP capacity-specific is inherited
+  # from tw_public_lanten_market_candles.yaml, including 1000 epochs, no LR
+  # scheduler, scanner-free hot path, BF16 compile settings, and optimizer.
+  model_name: financial_transformer
+  multi_gpu_strategy: distributed_data_parallel
+  lookback: 32
+  # Dual-5090 fold-1 throughput sweep (epoch 2, complete train + validation):
+  # global batch 8/16/32/64 -> 30.53/28.60/28.15/27.02 seconds. Batch 128
+  # with chunk 8 tied at 27.02 seconds but consumed 31.5/32.6 GiB per GPU.
+  # Fold 1 has 456 train sessions, so its nominal batch 64 was balanced into
+  # eight actual 57-session batches and never tested the full capacity. Fold 2
+  # is the first group that forms 64 sessions: per rank 32 days * chunk 16 =
+  # 512 compiled rows, which measured 30.46 GiB allocated and OOMed on the next
+  # 226 MiB buffer. Keep chunk 16 and prevent the much larger BF16 candle
+  # residual from being promoted back to FP32 when positional tensors are
+  # added; this preserves the optimizer/chunk schedule and creates real VRAM
+  # headroom instead of merely squeezing below the allocator limit.
+  # After stacked host-batch caching, scanner-free chunk math, and one DDP
+  # reduction per optimizer step, the signed long/short path measured 24.061s.
+  batch_size_train: 64
+  batch_size_eval: 16
+  minute_decision_chunk_rows: 16
+  minute_eval_decision_chunk_rows: 16
+  minute_cache_days_on_cpu: true
+  minute_cpu_cache_gb: 64.0
+  minute_data_workers: 8
+  loss_type: log_utility
+  loss_portfolio_activation: identity
+  strict_no_fallback: true
+  allow_dynamic_symbols: false
+  # Keep the shared Transformer-family contract aligned even though this run
+  # selects financial_transformer as its active model.
+  transformer_base_portfolio:
+    amp_native_position_add: true
+    checkpoint_blocks: true
+    portfolio_output_mode: logits
+  financial_transformer:
+    # Preserve the candle model exactly except for the minute head contract.
+    # Under BF16 autocast, cast the small position tensors to the activation
+    # dtype instead of promoting the full [B,L,S,D] residual back to FP32.
+    amp_native_position_add: true
+    # Recompute Transformer-block internals during backward so a true 64-day
+    # batch has headroom for both the fixed graph and Triton autotune buffers.
+    # A complete fold-2 one-epoch compiled smoke retained about 1.11 GiB per
+    # GPU at steady training and completed final validation/test artifact QA.
+    # This keeps the batch/chunk/optimizer schedule unchanged.
+    checkpoint_blocks: true
+    portfolio_mode: long_short
+    portfolio_output_mode: logits
+    return_aux: false
+    return_aux_details: false
+  # Rank 0 refreshes both live curves after every complete epoch.
+  # Test loss is audit-only and uses the first calendar year in this fold's
+  # test interval (fold 1: 2023), never the later test years.
+  epoch_test_curve: true
+  curve_test_interval: 1
+  curve_plot_interval: 1
+  curve_plot_async: true
+  defer_epoch_curve_plot_until_end: false
