@@ -94,7 +94,7 @@ from stockagent.training.lifecycle import (
 )
 
 
-MINUTE_EXECUTION_CONTRACT_VERSION = 3
+MINUTE_EXECUTION_CONTRACT_VERSION = 4
 # Per-epoch validation/test reporting is audit-only: it does not alter model
 # inputs, optimizer state, scheduler state, sample order, or loss/backtest
 # semantics. Keep v6 checkpoints resumable when reporting fields evolve.
@@ -114,7 +114,11 @@ class _MinuteSlabForwardAdapter(nn.Module):
         super().__init__()
         self.model = model
         self.gross_exposure = float(config.gross_exposure)
-        self.maximum_name_weight = float(config.maximum_name_weight)
+        self.maximum_name_weight = (
+            None
+            if config.maximum_name_weight is None
+            else float(config.maximum_name_weight)
+        )
         self.outside_cash_logit = config.outside_cash_logit
         self.config_long_only = bool(config.long_only)
 
@@ -305,14 +309,22 @@ def _execution_config(config: ExperimentConfig) -> MinuteExecutionConfig:
     return MinuteExecutionConfig(
         initial_equity=float(trading.tw_minute_initial_equity),
         gross_exposure=float(trading.tw_minute_gross_exposure),
-        maximum_name_weight=float(trading.tw_minute_max_name_weight),
+        maximum_name_weight=(
+            None
+            if trading.tw_minute_max_name_weight is None
+            else float(trading.tw_minute_max_name_weight)
+        ),
         outside_cash_logit=(
             None
             if trading.tw_minute_outside_cash_logit is None
             else float(trading.tw_minute_outside_cash_logit)
         ),
         maximum_volume_participation=participation,
-        maximum_order_notional=float(trading.tw_minute_max_order_notional),
+        maximum_order_notional=(
+            None
+            if trading.tw_minute_max_order_notional is None
+            else float(trading.tw_minute_max_order_notional)
+        ),
         slippage_bps_per_side=float(trading.tw_minute_slippage_bps_per_side),
         long_only=bool(trading.long_only),
     )

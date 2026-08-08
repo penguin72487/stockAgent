@@ -1,11 +1,11 @@
 base_config: tw_public_lanten_market_candles.yaml
 
-experiment_name: tw-full-market-minute-long-short-algorithmic-dual-5090-v2
+experiment_name: tw-full-market-minute-long-short-daytrade-rules-dual-5090-v3
 
 runner:
-  # The minute execution/cash contract and capacity shapes are intentionally
-  # checkpoint-incompatible with both daily candles and the old minute run.
-  output_dir: artifacts/markets/tw_minute_dual_5090_long_short_algo_v2
+  # Preserve prior capped/cash-gated runs. Execution-contract v4 copies the
+  # daily day-trade rules and changes only the decision frequency to one minute.
+  output_dir: artifacts/markets/tw_minute_dual_5090_daytrade_rules_v3
   mode: train
   resume: true
   post_train_infer: false
@@ -53,15 +53,16 @@ trading:
   portfolio_activation: identity
   min_trade_weight: 0.0
   reporting_leverage: 1.0
-  max_volume_participation: 0.01
-  tw_minute_initial_equity: 10000000.0
-  tw_minute_gross_exposure: 0.90
-  tw_minute_max_name_weight: 0.05
-  # 2^2 universe-size-invariant cash outside option. Signed exposure responds
-  # to cross-sectional score dispersion; a common score bias cannot fake risk.
-  tw_minute_outside_cash_logit: 4.0
-  tw_minute_max_order_notional: 1000000.0
-  tw_minute_slippage_bps_per_side: 2.0
+  # Match tw_public_lanten_market_candles.yaml's day-trade contract: raw signed
+  # score + L1 gross exposure 1, 50% volume participation, normal fees/tax, and
+  # no de-meaning, extra slippage, cash gate, per-order, or per-name ceiling.
+  max_volume_participation: 0.50
+  tw_minute_initial_equity: 1000000.0
+  tw_minute_gross_exposure: 1.0
+  tw_minute_max_name_weight: null
+  tw_minute_outside_cash_logit: null
+  tw_minute_max_order_notional: null
+  tw_minute_slippage_bps_per_side: 0.0
   tw_minute_first_decision_minute: 1
   tw_minute_last_entry_minute: 268
   tw_minute_last_decision_minute: 269

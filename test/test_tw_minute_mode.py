@@ -335,7 +335,7 @@ def test_minute_logits_are_masked_capped_and_leave_cash() -> None:
     assert float(weights.sum()) < 0.9
 
 
-def test_minute_long_short_targets_are_bias_invariant_and_fail_closed() -> None:
+def test_minute_long_short_targets_use_raw_l1_and_fail_closed() -> None:
     logits = torch.tensor([[2.0, 1.0, -1.0, -2.0]], requires_grad=True)
     tradable = torch.ones_like(logits, dtype=torch.bool)
     shortable = torch.tensor([[True, True, False, True]])
@@ -348,17 +348,7 @@ def test_minute_long_short_targets_are_bias_invariant_and_fail_closed() -> None:
         long_only=False,
         shortable_mask=shortable,
     )
-    shifted = minute_target_weights_from_logits(
-        logits + 32.0,
-        tradable,
-        gross_exposure=1.0,
-        maximum_name_weight=1.0,
-        long_only=False,
-        shortable_mask=shortable,
-    )
-
     torch.testing.assert_close(actual, torch.tensor([[0.4, 0.2, 0.0, -0.4]]))
-    torch.testing.assert_close(actual, shifted)
     assert float(actual.detach().abs().sum()) == pytest.approx(1.0)
     actual.sum().backward()
     assert logits.grad is not None
@@ -521,6 +511,49 @@ def test_minute_cash_outside_option_is_universe_invariant_and_learnable() -> Non
     log_mean_exp = torch.logsumexp(safe, dim=1, keepdim=True) - math.log(3.0)
     expected = conditional * 0.5 * torch.sigmoid(log_mean_exp - 4.0)
     torch.testing.assert_close(actual, expected)
+
+
+def test_minute_uncapped_daytrade_rules_keep_only_volume_capacity() -> None:
+    weights = minute_target_weights_from_logits(
+        torch.tensor([[8.0, 0.0]]),
+        torch.ones(1, 2, dtype=torch.bool),
+        gross_exposure=1.0,
+        maximum_name_weight=None,
+        outside_cash_logit=None,
+        long_only=True,
+    )
+    assert float(weights[0, 0]) > 0.99
+
+    config = MinuteExecutionConfig(
+        initial_equity=1_000_000.0,
+        gross_exposure=1.0,
+        maximum_name_weight=None,
+        maximum_volume_participation=0.5,
+        maximum_order_notional=None,
+        slippage_bps_per_side=0.0,
+    )
+    state = initialize_minute_execution_state(
+        num_symbols=1,
+        config=config,
+        device=torch.device("cpu"),
+    )
+    result = execute_minute_target(
+        state,
+        target_weights=torch.tensor([1.0]),
+        execution_mask=torch.tensor([True]),
+        execution_open=torch.tensor([100.0]),
+        exit_close=torch.tensor([100.0]),
+        future_volume_shares=torch.tensor([10_000.0]),
+        buy_fee_rates=torch.tensor([0.0]),
+        sell_fee_rates=torch.tensor([0.0]),
+        config=config,
+        allow_new_entries=True,
+    )
+
+    # The request is 10,000 shares; with no notional ceiling, only 50% of the
+    # 10,000-share next KBar volume limits the fill.
+    torch.testing.assert_close(result.state.shares, torch.tensor([5_000.0]))
+    torch.testing.assert_close(result.slippage_cost, torch.tensor(0.0))
 
 
 def test_minute_slab_adapter_fuses_identical_target_construction() -> None:
@@ -894,7 +927,13 @@ def test_dual_5090_minute_config_is_within_fold_ddp() -> None:
     assert config.training.financial_transformer.portfolio_output_mode == "logits"
     assert config.trading.long_only is False
     assert config.data.use_tw_public_rules is True
-    assert config.trading.tw_minute_outside_cash_logit == 4.0
+    assert config.trading.max_volume_participation == 0.5
+    assert config.trading.tw_minute_initial_equity == 1_000_000.0
+    assert config.trading.tw_minute_gross_exposure == 1.0
+    assert config.trading.tw_minute_max_name_weight is None
+    assert config.trading.tw_minute_outside_cash_logit is None
+    assert config.trading.tw_minute_max_order_notional is None
+    assert config.trading.tw_minute_slippage_bps_per_side == 0.0
     assert config.training.curve_plot_interval == 1
     assert config.training.epoch_test_curve is True
     assert config.training.curve_test_interval == 1
@@ -902,7 +941,7 @@ def test_dual_5090_minute_config_is_within_fold_ddp() -> None:
     assert config.training.defer_epoch_curve_plot_until_end is False
     assert (
         config.runner.output_dir
-        == "artifacts/markets/tw_minute_dual_5090_long_short_algo_v2"
+        == "artifacts/markets/tw_minute_dual_5090_daytrade_rules_v3"
     )
 
 
@@ -1113,7 +1152,13 @@ def test_minute_training_reuses_canonical_group_artifacts(
     config.training.transformer_base_portfolio.joint_heads = 1
     config.training.transformer_base_portfolio.joint_ffn_mult = 1
     config.training.transformer_base_portfolio.head_hidden_dim = 8
-    config.trading.tw_minute_max_name_weight = 0.5
+    config.trading.max_volume_participation = 0.5
+    config.trading.tw_minute_initial_equity = 1_000_000.0
+    config.trading.tw_minute_gross_exposure = 1.0
+    config.trading.tw_minute_max_name_weight = None
+    config.trading.tw_minute_outside_cash_logit = None
+    config.trading.tw_minute_max_order_notional = None
+    config.trading.tw_minute_slippage_bps_per_side = 0.0
     config.trading.tw_minute_first_decision_minute = 2
     config.trading.tw_minute_last_entry_minute = 2
     config.trading.tw_minute_last_decision_minute = 2
