@@ -424,9 +424,13 @@ class FlashSDPAAttention(nn.Module):
             key_mask = key_mask.to(device=query.device, dtype=torch.bool)
             attn_mask = key_mask[:, None, None, :]
 
-        self.captured_attention = None
-        self.captured_attention_shape = None
         if bool(self.capture_attention):
+            # Attention capture is an explainability-only opt-in.  Do not
+            # mutate module state on the normal training path: activation
+            # checkpointing is a Dynamo higher-order operator and rejects
+            # side effects on modules outside the checkpoint scope.
+            self.captured_attention = None
+            self.captured_attention_shape = None
             cap_rows = max(1, min(int(self.capture_max_rows), int(q.size(0))))
             capture_elements = cap_rows * int(query_steps) * int(key_steps)
             if capture_elements <= max(1, int(self.capture_max_elements)):

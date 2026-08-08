@@ -7,6 +7,7 @@ import argparse
 import csv
 import json
 import math
+import warnings
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -14,7 +15,7 @@ import numpy as np
 
 
 LABELS = {
-    "baseline": "Baseline",
+    "baseline": "Baseline (capital TWD 1M)",
     "lookback256_batch32": "Lookback 256 / batch 32",
     "lookback64_batch64": "Lookback 64 / batch 64",
     "lookback32_batch128": "Lookback 32 / batch 128",
@@ -29,6 +30,8 @@ LABELS = {
     "attention_pooling": "Attention pooling",
     "layernorm": "LayerNorm",
     "gelu_ffn": "GELU FFN",
+    "initial_capital_10m": "Capital TWD 10M",
+    "initial_capital_100m": "Capital TWD 100M",
     "output_activation_l1": "Output: activation L1",
     "output_l1": "Output: raw L1",
     "output_logits": "Output: logits",
@@ -38,17 +41,98 @@ LABELS = {
 }
 
 
-def load(root: Path) -> dict[str, list[dict]]:
+def _years(value: str) -> list[int]:
+    return [int(year) for year in value.split("-") if year]
+
+
+def _load_baseline_snapshot(root: Path, split: str) -> list[dict]:
+    """Recover the exact baseline fold values exported by a prior successful plot.
+
+    Some consolidated ablation roots keep ``baseline`` as a symlink to a preserved
+    run.  If that source is temporarily unavailable, the fold-level CSV beside the
+    charts is still a lossless source for every baseline metric used here.
+    """
+
+    path = root / f"{split}_baseline_fold_metrics.csv"
+    if not path.is_file():
+        return []
+    rows: list[dict] = []
+    with path.open(newline="") as fh:
+        for row in csv.DictReader(fh):
+            rows.append(
+                {
+                    "fold_id": int(row["fold_id"]),
+                    "train_years": _years(row["train_years"]),
+                    "val_years": _years(row["val_years"]),
+                    "test_years": _years(row["test_years"]),
+                    f"{split}_metrics": {
+                        name: float(row[name])
+                        for name in (
+                            "cagr",
+                            "sharpe",
+                            "sortino",
+                            "max_drawdown",
+                            "turnover",
+                            "daily_hit_rate",
+                        )
+                    },
+                }
+            )
+    return rows
+
+
+def display_label(name: str) -> str:
+    """Return a readable label without excluding newly added experiments."""
+
+    return LABELS.get(name, name.replace("_", " ").title())
+
+
+def ordered_variant_names(runs: dict[str, list[dict]]) -> list[str]:
+    """Keep curated order for known runs and include every unknown complete run."""
+
+    rank = {name: index for index, name in enumerate(LABELS)}
+    names = (name for name in runs if name != "baseline")
+    return sorted(names, key=lambda name: (rank.get(name, len(rank)), name))
+
+
+def load(root: Path, split: str) -> dict[str, list[dict]]:
     runs: dict[str, list[dict]] = {}
     for path in sorted(root.glob("*/summary.json")):
         rows = json.loads(path.read_text())
         if isinstance(rows, list) and rows:
-            runs[path.parent.name] = rows
+            runs[path.parent.name] = sorted(rows, key=lambda row: int(row["fold_id"]))
     if "baseline" not in runs:
-        raise RuntimeError("A baseline summary was not found")
+        baseline_rows = _load_baseline_snapshot(root, split)
+        if not baseline_rows:
+            raise RuntimeError(
+                "A baseline summary was not found and no baseline fold-metrics "
+                f"snapshot exists for split={split!r}"
+            )
+        warnings.warn(
+            f"baseline/summary.json is unavailable; using {split} baseline "
+            "fold-metrics snapshot",
+            stacklevel=2,
+        )
+        runs["baseline"] = sorted(
+            baseline_rows, key=lambda row: int(row["fold_id"])
+        )
     fold_count = len(runs["baseline"])
-    runs = {name: rows for name, rows in runs.items() if len(rows) == fold_count}
-    return runs
+    baseline_folds = tuple(int(row["fold_id"]) for row in runs["baseline"])
+    compatible: dict[str, list[dict]] = {}
+    rejected: list[str] = []
+    for name, rows in runs.items():
+        folds = tuple(int(row["fold_id"]) for row in rows)
+        if len(rows) == fold_count and folds == baseline_folds:
+            compatible[name] = rows
+        else:
+            rejected.append(name)
+    if rejected:
+        warnings.warn(
+            "excluding runs without the same completed fold IDs as baseline: "
+            + ", ".join(sorted(rejected)),
+            stacklevel=2,
+        )
+    return compatible
 
 
 def metric(rows: list[dict], split: str, name: str) -> np.ndarray:
@@ -67,13 +151,13 @@ def main() -> None:
     parser.add_argument("--split", choices=("val", "test"), default="val")
     parser.add_argument("--prefix", default=None)
     args = parser.parse_args()
-    runs = load(args.root)
+    runs = load(args.root, args.split)
     fold_count = len(runs["baseline"])
     prefix = args.prefix or args.split
     split_label = "validation" if args.split == "val" else "test"
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    names = [n for n in LABELS if n in runs and n != "baseline"]
+    names = ordered_variant_names(runs)
     base = metric(runs["baseline"], args.split, "sharpe")
     rng = np.random.default_rng(20260802)
     stats = []
@@ -130,7 +214,7 @@ def main() -> None:
     ax.errorbar(means, y, xerr=[means - low, high - means], fmt="none", ecolor=ink, capsize=3, lw=1.2)
     ax.scatter(means, y, c=colors, s=58, edgecolor=ink, linewidth=.6, zorder=3)
     ax.axvline(0, color=ink, lw=1)
-    ax.set_yticks(y, [LABELS[s[0]] for s in effect_stats])
+    ax.set_yticks(y, [display_label(s[0]) for s in effect_stats])
     ax.set_xlabel(f"Mean paired difference in {split_label} Sharpe vs baseline")
     fig.suptitle(f"Transformer ablations: paired change in {split_label} Sharpe", y=.985, fontweight="bold")
     fig.text(.5, .95, f"{fold_count} walk-forward folds; whiskers are fold-bootstrap 95% CIs; positive favors variant",
@@ -152,7 +236,7 @@ def main() -> None:
     colors = [ink if row[0] == "baseline" else blue for row in absolute_display]
     ax.errorbar(means, y, xerr=[means - low, high - means], fmt="none", ecolor=ink, capsize=3, lw=1.2)
     ax.scatter(means, y, c=colors, s=58, edgecolor=ink, linewidth=.6, zorder=3)
-    ax.set_yticks(y, [LABELS[row[0]] for row in absolute_display])
+    ax.set_yticks(y, [display_label(row[0]) for row in absolute_display])
     ax.set_xlabel(f"Mean absolute {split_label} Sharpe")
     fig.suptitle(f"Absolute {split_label} Sharpe across ablations", y=.985, fontweight="bold")
     fig.text(.5, .95, f"{fold_count} walk-forward folds; whiskers are fold-bootstrap 95% CIs; baseline is black",
@@ -172,7 +256,7 @@ def main() -> None:
     limit = max(1.0, float(np.nanquantile(np.abs(matrix), .95)))
     fig, ax = plt.subplots(figsize=(14, 7.5))
     image = ax.imshow(matrix, aspect="auto", cmap="RdBu", vmin=-limit, vmax=limit)
-    ax.set_yticks(np.arange(len(order)), [LABELS[n] for n in order])
+    ax.set_yticks(np.arange(len(order)), [display_label(n) for n in order])
     ax.set_xticks(np.arange(fold_count), [str(i) for i in range(1, fold_count + 1)])
     ax.set_xlabel("Walk-forward fold")
     fig.suptitle(f"Paired {split_label}-Sharpe difference by fold", y=.985, fontweight="bold")
@@ -197,7 +281,7 @@ def main() -> None:
         yv = np.median(metric(runs[name], args.split, "cagr"))
         color = ink if name == "baseline" else blue
         ax.scatter(x, yv, s=80 if name == "baseline" else 48, color=color, edgecolor="white", linewidth=.7)
-        ax.annotate(LABELS[name], (x, yv), xytext=label_offsets.get(name, (5, 4)),
+        ax.annotate(display_label(name), (x, yv), xytext=label_offsets.get(name, (5, 4)),
                     textcoords="offset points", fontsize=8)
     ax.axhline(0, color=grid, lw=.9)
     ax.set_xlabel(f"Median {split_label} max drawdown (less negative is better)")

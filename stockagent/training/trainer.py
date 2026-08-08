@@ -3451,7 +3451,7 @@ class _EpochCurveLifecycle:
         *,
         request_plot: bool,
     ) -> None:
-        if not self.enabled:
+        if not self.enabled or not self.writer_enabled:
             return
         _append_group_curve(
             self.curve_path,
@@ -14436,6 +14436,7 @@ def _wrap_distributed_data_parallel_model(
     *,
     config: ExperimentConfig,
     device: torch.device,
+    static_graph: bool = True,
 ) -> DistributedDataParallel:
     ddp_kwargs: dict[str, Any] = {
         "device_ids": [device.index] if device.type == "cuda" else None,
@@ -14450,7 +14451,11 @@ def _wrap_distributed_data_parallel_model(
     except (TypeError, ValueError):
         pass
     try:
-        return DistributedDataParallel(module, static_graph=True, **ddp_kwargs)
+        return DistributedDataParallel(
+            module,
+            static_graph=bool(static_graph),
+            **ddp_kwargs,
+        )
     except TypeError:
         return DistributedDataParallel(module, **ddp_kwargs)
 

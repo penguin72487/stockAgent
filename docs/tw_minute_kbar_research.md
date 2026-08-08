@@ -176,6 +176,61 @@ run_fintech_python train.py \
   --start-fold 1
 ```
 
+這台雙 RTX 5090 主機使用單 fold 內 DDP；`batch_size_train/eval` 是兩張卡合計的
+全域交易日數，並非每張卡各自的數量：
+
+```bash
+bash scripts/run_tw_minute_dual_5090.sh \
+  --start-fold 1
+```
+
+launcher 會把 rank 0/1 分別綁到 GPU 0/1 鄰近的 NUMA CPU，輸出獨立寫到
+`artifacts/markets/tw_minute_dual_5090_long_short_algo_v2`。這份設定以
+`tw_public_lanten_market_candles.yaml` 為母設定，保留其 FinancialTransformer、
+BF16、optimizer、1000 epochs、early stopping 與 scanner 設定，只覆寫分鐘資料／
+executor 契約及雙卡容量。每個全域 batch 仍保持日期順序，交易日
+才在 rank 間切分；各 rank 會跑完自己交易日內的 270 分鐘狀態帳本，再以 DDP
+同步梯度。因此這不是「一張 GPU 跑一個 fold」。
+
+雙 RTX 5090 的完整 epoch-2 吞吐掃描採 2 的冪次容量。原始 fold 1 有 456 個
+train sessions，所以 nominal batch 64 被均分成八批、實際每批只有 57 天；它沒有
+測到 64 天的完整容量。fold 2 首次形成完整 batch 時，每 rank 的
+`32 days * chunk 16 = 512` compiled rows 會在 30.46 GiB 後再要求 226 MiB 而 OOM。
+目前保留全域 `batch_size_train: 64`、`batch_size_eval: 16` 與 train/eval chunk
+`16`。BF16 模型改用 `amp_native_position_add: true`，將小型 position tensor 轉成
+activation dtype，避免把完整 `[B,L,S,D]` candle residual 升回 FP32；因此不必增加
+日內 chunks 或改變 optimizer-step schedule。另啟用已通過 fullgraph 測試的
+`checkpoint_blocks: true`，在 backward 重算 Transformer block 內部活化，替固定圖
+與 Triton autotune workspace 保留顯存。fold 2 的完整單 epoch compiled smoke 已跑完
+train、validation、first-test-year audit 與最終 validation/test；steady training 約用
+31.0 GiB/卡並保留約 1.11 GiB，group 結束後 reserved 由 29.47 GiB 降至 0.07 GiB。
+`batch=128/chunk=8` 沒有更快且把每卡顯存推到約 31.5/32.6 GiB，故不採用。
+
+這份執行器是真正的 signed long/short 帳本，不會把負權重截成零。空方權限不從
+當代名單或普通 `tradable_mask` 猜測：啟動時從
+`data_tw_public/features/tw_public_stock_daily.parquet` 一次讀取當日精確的可當沖／
+可先賣旗標，再把官方收盤後融券證據與容量嚴格位移到下一個資料集交易日；缺列、
+缺日、零容量都 fail closed。結果只保存緊湊的 `[day,symbol]` bool/int64 sidecar，
+不把同一個日規則複製到 270 根分鐘列。
+
+熱路徑不再每個 epoch 對每批重做多次 `np.stack`，而是依確定性的 chronological
+batch plan 快取最終 host tensors；每個 optimizer batch 的多個 recurrent chunks
+也只在最後一次 backward 做一次 DDP all-reduce。關閉的 `symbol_position` 會從
+分鐘 optimizer/DDP bookkeeping 凍結，但仍保留在 state dict。scanner-free CUDA
+模式不會在每個 chunk 為 scalar finite check 強制同步，成交數學本身則維持有限與
+有界。
+
+同機 fold 1 的完整 epoch 2（456 train sessions＋246 validation sessions）實測由
+舊版 27.260 秒降為 24.061 秒，約快 11.7%；其中 train 20.798 秒、validation
+3.262 秒。這是舊 FP32 position-add 在 fold 1 未滿 batch 下的 steady-state 參考，
+不是 v2 的跨 fold 容量證據；第一個 epoch的 compile／autotune 冷啟動也不納入
+預設選擇。
+
+每個 epoch 完成後，rank 0 會在背景更新
+`train_YYYY-YYYY/epoch_curve_every1.png` 與
+`train_YYYY-YYYY/epoch_timing_every1.png`；直接開著圖片即可一邊訓練一邊查看，
+不會等全部 epochs 結束才繪圖。
+
 `execution_mode: tw_minute` 會在 daily panel 建置前分流到專用逐日 streaming
 loader；它不會借用 `tw_day_trade` 的每日 open-to-close 標籤。每個交易日展開成
 固定 270 分鐘的稀疏全市場 panel，模型每根完成 K 棒輸出一次目標，executor
