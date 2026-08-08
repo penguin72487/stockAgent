@@ -68,7 +68,9 @@ def _raw_minute_frame(
             "Low": [min(a, b) - 1.0 for a, b in zip(opens, closes, strict=True)],
             "Close": closes,
             "Volume": [100.0] * len(timestamps),
-            "Amount": [100_000.0] * len(timestamps),
+            # Ten raw Shioaji volume units represent 1,000 shares here; keep
+            # notional inside every bar's causal low/high range.
+            "Amount": [close * 1_000.0 for close in closes],
             "contract_unit": [1_000.0] * len(timestamps),
         }
     )
@@ -637,6 +639,10 @@ def test_dataset_audit_accepts_causal_synthetic_partition() -> None:
         "duplicate_keys": 0,
         "out_of_session_rows": 0,
         "wrong_date_rows": 0,
+        "raw_invalid_rows": 0,
+        "invalid_volume_unit_rows": 0,
+        "invalid_volume_notional_rows": 0,
+        "invalid_volume_shares_rows": 0,
         "invalid_rows_with_labels": 0,
         "invalid_session_rows_with_labels": 0,
         "bad_label_alignment_rows": 0,

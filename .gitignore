@@ -216,3 +216,4 @@ data_tw_index_futures/*
 .env.trade.example
 data_tw_minute/*
 data_tw_index_derivatives_ticks/*
+artifacts_benchmark/*

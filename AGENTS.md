@@ -457,6 +457,26 @@ The user cares about total epoch wall time, not only train step time.
 
 Rules:
 
+- For the dual-RTX-5090 `tw_minute` FinancialTransformer config that inherits
+  `tw_public_lanten_market_candles.yaml`, the measured throughput-only capacity
+  is global `batch_size_train: 64`, `batch_size_eval: 16`, and train/eval
+  decision chunks of 16. Complete fold-1 epoch-2 times for train batches
+  8/16/32/64 at chunk 16 were 30.53/28.60/28.15/27.02 seconds. Batch 128 with
+  chunk 8 tied at 27.02 seconds but reserved about 31.5 of 32.6 GiB per GPU;
+  keep 64/16 for the same throughput with more headroom. Compare finite-loss
+  runs by throughput only when that is the user's explicit priority.
+- The long/short minute execution-contract v3 and training-contract v6 add a
+  compact point-in-time short-rule sidecar, signed target/ledger execution,
+  deterministic stacked host-batch caching, and one DDP gradient reduction per
+  optimizer batch via non-static DDP `no_sync` chunks. Freeze disabled
+  positional tables before optimizer creation instead of enabling per-forward
+  unused-parameter discovery. On fold 1, the complete steady epoch 2 measured
+  `24.061s = 20.798s train + 3.262s validation`, versus the preceding exact
+  production rerun at `27.260s` (11.7% faster) despite adding short execution.
+  The official eligibility/direction remains exact-session, official
+  post-close capacity shifts by exactly one observed dataset session, and all
+  missing evidence fails closed without forward fill.
+
 - Use `epoch_curve.jsonl` when optimizing epoch-level speed.
 - Break down "other" time before optimizing blindly.
 - For long-year runs, re-check the latest artifact before optimizing. The run under
@@ -476,7 +496,7 @@ Rules:
   bound makes Inductor constraint analysis and cold compilation much more
   expensive and can violate flattened-index guards.
 - Do not hide expensive work behind `val_interval_epochs > 1` or skip curve/test/plot work unless the user explicitly asks.
-- Recent preference: sampled test loss only needs one fold per epoch to reduce epoch-level overhead.
+- Recent preference: sampled test loss only needs one fold per epoch to reduce epoch-level overhead. For `tw_minute`, compute that audit-only loss over the first calendar year of the current fold's test interval, record its year/row scope in `epoch_curve.jsonl`, and never use it for checkpoint selection, early stopping, or the scheduler.
 - Keep curve plotting async where possible.
 - When comparing throughput after compile, chunking, or cache changes, use the second epoch or later steady-state numbers. Do not choose defaults from the first epoch, because compile/autotune/warmup can dominate it.
 - For the high-throughput TW cash candles configuration, keep

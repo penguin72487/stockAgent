@@ -19,6 +19,8 @@ from scripts.build_shioaji_tw_minute_dataset import (  # noqa: E402
     EXECUTOR_ONLY_COLUMNS,
     MODEL_FEATURE_COLUMNS,
     NS_PER_MINUTE,
+    SCHEMA_VERSION,
+    VOLUME_NOTIONAL_TOLERANCE,
 )
 
 
@@ -59,6 +61,9 @@ def audit_frame(frame: pl.DataFrame, *, trade_date: date) -> dict[str, Any]:
         "ts",
         "symbol",
         "feature_valid",
+        "source_volume_multiplier",
+        "source_volume_unit_valid",
+        "volume_shares",
         "label_valid_1m",
         "execution_open_next_1m",
         "exit_close_next_1m",
@@ -78,6 +83,56 @@ def audit_frame(frame: pl.DataFrame, *, trade_date: date) -> dict[str, Any]:
         | (pl.col("ts").dt.second() != 0)
     ).height
     wrong_date = frame.filter(pl.col("date") != pl.lit(trade_date)).height
+    raw_invalid = frame.filter(
+        ~pl.all_horizontal(
+            *[
+                pl.col(name).is_not_null() & pl.col(name).is_finite()
+                for name in (
+                    "Open",
+                    "High",
+                    "Low",
+                    "Close",
+                    "Volume",
+                    "Amount",
+                    "contract_unit",
+                )
+            ]
+        )
+        | pl.any_horizontal(
+            *[(pl.col(name) <= 0.0) for name in ("Open", "High", "Low", "Close")]
+        )
+        | (pl.col("Volume") < 0.0)
+        | (pl.col("Amount") < 0.0)
+        | (pl.col("contract_unit") <= 0.0)
+        | (pl.col("High") < pl.max_horizontal("Open", "Low", "Close"))
+        | (pl.col("Low") > pl.min_horizontal("Open", "High", "Close"))
+    ).height
+    invalid_volume_unit = frame.filter(~pl.col("source_volume_unit_valid")).height
+    tolerance = VOLUME_NOTIONAL_TOLERANCE
+    invalid_volume_notional = frame.filter(
+        (pl.col("Volume") > 0.0)
+        & pl.col("source_volume_unit_valid")
+        & (
+            (
+                pl.col("Amount")
+                < pl.col("volume_shares") * pl.col("Low") * (1.0 - tolerance)
+            )
+            | (
+                pl.col("Amount")
+                > pl.col("volume_shares") * pl.col("High") * (1.0 + tolerance)
+            )
+        )
+    ).height
+    invalid_volume_shares = frame.filter(
+        pl.col("source_volume_unit_valid")
+        & (
+            (
+                pl.col("volume_shares")
+                - pl.col("Volume") * pl.col("source_volume_multiplier")
+            ).abs()
+            > 1e-8
+        )
+    ).height
     invalid_rows_with_labels = frame.filter(
         ~pl.col("label_valid_1m")
         & pl.any_horizontal(
@@ -130,6 +185,10 @@ def audit_frame(frame: pl.DataFrame, *, trade_date: date) -> dict[str, Any]:
         "duplicate_keys": int(duplicates),
         "out_of_session_rows": int(out_of_session),
         "wrong_date_rows": int(wrong_date),
+        "raw_invalid_rows": int(raw_invalid),
+        "invalid_volume_unit_rows": int(invalid_volume_unit),
+        "invalid_volume_notional_rows": int(invalid_volume_notional),
+        "invalid_volume_shares_rows": int(invalid_volume_shares),
         "invalid_rows_with_labels": int(invalid_rows_with_labels),
         "invalid_session_rows_with_labels": int(invalid_session_rows_with_labels),
         "bad_label_alignment_rows": int(bad_label_alignment),
@@ -137,8 +196,36 @@ def audit_frame(frame: pl.DataFrame, *, trade_date: date) -> dict[str, Any]:
     }
     if any(failures.values()):
         raise RuntimeError(f"minute dataset audit failed: {failures}")
+    positive_volume = pl.col("Volume") > 0.0
+    volume_stats = frame.select(
+        positive_volume.sum().alias("positive_volume_rows"),
+        (positive_volume & (pl.col("source_volume_multiplier") == 1.0))
+        .sum()
+        .alias("volume_multiplier_1_rows"),
+        (positive_volume & (pl.col("source_volume_multiplier") == 10.0))
+        .sum()
+        .alias("volume_multiplier_10_rows"),
+        (positive_volume & (pl.col("source_volume_multiplier") == 100.0))
+        .sum()
+        .alias("volume_multiplier_100_rows"),
+        (positive_volume & (pl.col("source_volume_multiplier") == 1_000.0))
+        .sum()
+        .alias("volume_multiplier_1000_rows"),
+        (
+            positive_volume
+            & (pl.col("source_volume_multiplier") == pl.col("contract_unit"))
+        )
+        .sum()
+        .alias("volume_rows_using_contract_unit"),
+        (
+            positive_volume
+            & (pl.col("source_volume_multiplier") != pl.col("contract_unit"))
+        )
+        .sum()
+        .alias("volume_rows_using_non_contract_unit"),
+    ).row(0, named=True)
     return {
-        "schema_version": 1,
+        "schema_version": SCHEMA_VERSION,
         "status": "ok",
         "trade_date": trade_date.isoformat(),
         "rows": frame.height,
@@ -146,6 +233,7 @@ def audit_frame(frame: pl.DataFrame, *, trade_date: date) -> dict[str, Any]:
         "bars": frame["ts"].n_unique(),
         "feature_valid_rows": int(frame["feature_valid"].sum()),
         "label_valid_rows": int(frame["label_valid_1m"].sum()),
+        **{name: int(value or 0) for name, value in volume_stats.items()},
         "model_feature_columns": list(MODEL_FEATURE_COLUMNS),
         "executor_only_columns": list(EXECUTOR_ONLY_COLUMNS),
         "failures": failures,
@@ -160,12 +248,12 @@ def main() -> None:
             raise RuntimeError(f"minute dataset manifest is missing: {manifest_path}")
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         if not (
-            manifest.get("schema_version") == 2
+            manifest.get("schema_version") == SCHEMA_VERSION
             and manifest.get("research_ready") is True
             and manifest.get("status") == "research_ready"
         ):
             raise RuntimeError(
-                "minute full audit requires a schema-2 research_ready manifest"
+                "minute full audit requires a schema-3 research_ready manifest"
             )
         partitions = manifest.get("partitions", [])
         if not partitions or len(partitions) != len(manifest.get("dates", [])):
@@ -174,6 +262,13 @@ def main() -> None:
             "rows": 0,
             "feature_valid_rows": 0,
             "label_valid_rows": 0,
+            "positive_volume_rows": 0,
+            "volume_multiplier_1_rows": 0,
+            "volume_multiplier_10_rows": 0,
+            "volume_multiplier_100_rows": 0,
+            "volume_multiplier_1000_rows": 0,
+            "volume_rows_using_contract_unit": 0,
+            "volume_rows_using_non_contract_unit": 0,
         }
         seen_dates: set[str] = set()
         maximum_symbols = 0
@@ -209,7 +304,7 @@ def main() -> None:
                     flush=True,
                 )
         result = {
-            "schema_version": 2,
+            "schema_version": SCHEMA_VERSION,
             "status": "research_ready",
             "source": "shioaji_kbars_1m",
             "partitions": len(partitions),

@@ -891,6 +891,136 @@ def completed_symbol_manifest_result(
     )
 
 
+def restore_extended_tail_from_archived_manifest(
+    output_dir: Path,
+    row: UniverseRow,
+    chunks: list[tuple[date, date]],
+    *,
+    requested_start: date,
+    requested_end: date,
+    simulation: bool,
+    expected_dates: set[date],
+) -> bool:
+    """Repack a covered archived tail when a delisted contract disappears.
+
+    Contract V2 is a current contract directory, so a delisted symbol can
+    disappear even though its already archived history remains valid. When an
+    end-date extension only changes the final chunk boundary and all expected
+    public trading dates are covered by the previous sealed tail (or its
+    explicit source-gap dates), repack that immutable tail into the new chunk
+    instead of relabeling the entire historical symbol as unavailable.
+    """
+
+    manifest_path = output_dir / "symbols" / f"{row.symbol}.manifest.json"
+    archived = _read_json(manifest_path)
+    if archived is None or not (
+        archived.get("schema_version") == MANIFEST_SCHEMA_VERSION
+        and archived.get("source") == SOURCE_NAME
+        and archived.get("storage_frequency") == STORAGE_FREQUENCY
+        and archived.get("simulation") is simulation
+        and archived.get("symbol") == row.symbol
+        and archived.get("requested_start") == requested_start.isoformat()
+    ):
+        return False
+    old_chunks = archived.get("chunks", [])
+    if not old_chunks or not chunks:
+        return False
+    missing = [
+        (start, end)
+        for start, end in chunks
+        if not minute_receipt_valid(
+            minute_chunk_paths(output_dir, row.symbol, start, end)[1],
+            symbol=row.symbol,
+            start=start,
+            end=end,
+            simulation=simulation,
+        )
+    ]
+    if len(missing) != 1 or missing[0] != chunks[-1]:
+        return False
+    new_start, new_end = missing[0]
+    old_tail = old_chunks[-1]
+    if not (
+        old_tail.get("start_date") == new_start.isoformat()
+        and date.fromisoformat(str(old_tail.get("end_date"))) < new_end
+        and old_tail.get("status") in {"ok", "source_gap"}
+        and old_tail.get("data_path")
+    ):
+        return False
+    old_path = Path(str(old_tail["data_path"]))
+    if not old_path.is_file() or _sha256(old_path) != str(
+        old_tail.get("data_sha256", "")
+    ):
+        return False
+    frame = pl.read_parquet(old_path).filter(
+        (pl.col("date") >= pl.lit(new_start)) & (pl.col("date") <= pl.lit(new_end))
+    )
+    returned = set(frame["date"].to_list()) if frame.height else set()
+    source_gaps = {
+        date.fromisoformat(str(value))
+        for value in old_tail.get("source_gap_dates", [])
+    }
+    expected_tail = {
+        value for value in expected_dates if new_start <= value <= new_end
+    }
+    if not expected_tail.issubset(returned | source_gaps):
+        return False
+    units = frame["contract_unit"].unique().to_list() if frame.height else []
+    if len(units) != 1 or not math.isfinite(float(units[0])) or float(units[0]) <= 0:
+        return False
+    unit = float(units[0])
+    audit = validate_minute_kbars(
+        frame,
+        symbol=row.symbol,
+        start=new_start,
+        end=new_end,
+    )
+    data_path, receipt_path = minute_chunk_paths(
+        output_dir, row.symbol, new_start, new_end
+    )
+    output_receipt = _write_minute_parquet(frame, data_path) if frame.height else None
+    gap_dates = [value.isoformat() for value in sorted(source_gaps & expected_tail)]
+    receipt_status = "source_gap" if gap_dates else ("ok" if frame.height else "empty")
+    _atomic_write_json(
+        receipt_path,
+        {
+            "schema_version": RECEIPT_SCHEMA_VERSION,
+            "source": SOURCE_NAME,
+            "storage_frequency": STORAGE_FREQUENCY,
+            "simulation": simulation,
+            "symbol": row.symbol,
+            "name": row.name,
+            "market": row.market,
+            "security_type": row.security_type,
+            "contract_unit": unit,
+            "start_date": new_start.isoformat(),
+            "end_date": new_end.isoformat(),
+            "status": receipt_status,
+            "rows": frame.height,
+            "sessions": audit["sessions"],
+            "first_ts": audit["first_ts"],
+            "last_ts": audit["last_ts"],
+            "expected_positive_volume_sessions": len(expected_tail),
+            "returned_dates": [value.isoformat() for value in sorted(returned)],
+            "query_performed": False,
+            "query_skipped_reason": "archived_delisted_contract_tail_repacked",
+            "restored_from": str(old_path),
+            "zero_placeholder_rows_dropped": 0,
+            "negative_correction_rows_dropped": 0,
+            "out_of_session_rows_dropped": 0,
+            "outside_reference_date_rows_dropped": 0,
+            "single_day_fallback_queries": 0,
+            "source_gap_dates": gap_dates,
+            "audit": audit,
+            "output_receipt": output_receipt,
+            "downloaded_at_utc": datetime.now(timezone.utc)
+            .replace(microsecond=0)
+            .isoformat(),
+        },
+    )
+    return True
+
+
 def _write_run_summary(
     output_dir: Path,
     *,
@@ -1048,6 +1178,29 @@ def _download_symbol(
                 api, row, contracts_by_code
             )
         if expected_all and contract is None:
+            restored = restore_extended_tail_from_archived_manifest(
+                args.output_dir,
+                row,
+                chunks,
+                requested_start=start,
+                requested_end=end,
+                simulation=bool(args.simulation),
+                expected_dates=expected_all,
+            )
+            if restored:
+                _emit_worker_log(
+                    f"[shioaji-minute] worker={worker_index} symbol={row.symbol} "
+                    f"symbol_index={symbol_index}/{selected_count} "
+                    "status=archived_delisted_tail_repacked"
+                )
+                return _write_symbol_manifest(
+                    args.output_dir,
+                    row,
+                    chunks,
+                    requested_start=start,
+                    requested_end=end,
+                    simulation=bool(args.simulation),
+                )
             _emit_worker_log(
                 f"[shioaji-minute] worker={worker_index} symbol={row.symbol} "
                 f"symbol_index={symbol_index}/{selected_count} "
