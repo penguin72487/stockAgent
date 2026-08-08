@@ -10,29 +10,39 @@ import torch
 class MinuteExecutionConfig:
     initial_equity: float
     gross_exposure: float
-    maximum_name_weight: float
+    maximum_name_weight: float | None
     maximum_volume_participation: float
-    maximum_order_notional: float
+    maximum_order_notional: float | None
     slippage_bps_per_side: float
     outside_cash_logit: float | None = None
     long_only: bool = True
 
     def __post_init__(self) -> None:
-        positive = {
-            "initial_equity": self.initial_equity,
-            "maximum_order_notional": self.maximum_order_notional,
-        }
+        positive = {"initial_equity": self.initial_equity}
         for name, value in positive.items():
             if not math.isfinite(float(value)) or float(value) <= 0.0:
                 raise ValueError(f"{name} must be positive and finite")
+        if self.maximum_order_notional is not None and (
+            not math.isfinite(float(self.maximum_order_notional))
+            or float(self.maximum_order_notional) <= 0.0
+        ):
+            raise ValueError(
+                "maximum_order_notional must be positive and finite when enabled"
+            )
         fractions = {
             "gross_exposure": self.gross_exposure,
-            "maximum_name_weight": self.maximum_name_weight,
             "maximum_volume_participation": self.maximum_volume_participation,
         }
         for name, value in fractions.items():
             if not math.isfinite(float(value)) or not 0.0 < float(value) <= 1.0:
                 raise ValueError(f"{name} must be in (0, 1]")
+        if self.maximum_name_weight is not None and (
+            not math.isfinite(float(self.maximum_name_weight))
+            or not 0.0 < float(self.maximum_name_weight) <= 1.0
+        ):
+            raise ValueError(
+                "maximum_name_weight must be in (0, 1] when enabled"
+            )
         if (
             not math.isfinite(float(self.slippage_bps_per_side))
             or float(self.slippage_bps_per_side) < 0.0
@@ -119,7 +129,7 @@ def minute_target_weights_from_logits(
     tradable_mask: torch.Tensor,
     *,
     gross_exposure: float,
-    maximum_name_weight: float,
+    maximum_name_weight: float | None,
     outside_cash_logit: float | None = None,
     long_only: bool = True,
     shortable_mask: torch.Tensor | None = None,
@@ -137,18 +147,16 @@ def minute_target_weights_from_logits(
     any_valid = valid_count_int > 0
     if not bool(long_only):
         valid_count = valid_count_int.clamp_min(1).float()
-        centered = torch.where(mask, float_logits, torch.zeros_like(float_logits))
-        centered = centered - centered.sum(dim=1, keepdim=True) / valid_count
-        centered = centered.masked_fill(~mask, 0.0)
+        raw_scores = torch.where(mask, float_logits, torch.zeros_like(float_logits))
         shortable = (
             mask
             if shortable_mask is None
             else shortable_mask.to(device=logits.device, dtype=torch.bool) & mask
         )
         signed_scores = torch.where(
-            (centered >= 0.0) | shortable,
-            centered,
-            torch.zeros_like(centered),
+            (raw_scores >= 0.0) | shortable,
+            raw_scores,
+            torch.zeros_like(raw_scores),
         )
         l1 = signed_scores.abs().sum(dim=1, keepdim=True)
         weights = torch.where(
@@ -163,9 +171,8 @@ def minute_target_weights_from_logits(
                 dtype=torch.float32,
             )
         else:
-            # Cross-sectional dispersion, not a shared score bias, is the
-            # evidence for taking signed risk.  The log-mean-exp statistic is
-            # invariant to universe width and remains smooth at zero.
+            # Optional legacy cash gate. The active day-trade-equivalent
+            # minute contract disables it and uses raw signed-score L1.
             magnitude = signed_scores.abs()
             row_max = magnitude.max(dim=1, keepdim=True).values
             magnitude_exp = torch.exp(magnitude - row_max).masked_fill(~mask, 0.0)
@@ -183,11 +190,12 @@ def minute_target_weights_from_logits(
             risky_exposure,
             torch.zeros_like(risky_exposure),
         )
-        weights = torch.clamp(
-            weights,
-            min=-float(maximum_name_weight),
-            max=float(maximum_name_weight),
-        )
+        if maximum_name_weight is not None:
+            weights = torch.clamp(
+                weights,
+                min=-float(maximum_name_weight),
+                max=float(maximum_name_weight),
+            )
         return torch.where(any_valid, weights, torch.zeros_like(weights))
     safe_logits = float_logits.masked_fill(~mask, torch.finfo(torch.float32).min)
     safe_logits = torch.where(any_valid, safe_logits, torch.zeros_like(safe_logits))
@@ -224,7 +232,8 @@ def minute_target_weights_from_logits(
     weights = weights * risky_exposure
     # Clamping leaves unused exposure as cash. Renormalizing here would violate
     # the configured per-name ceiling for a concentrated cross-section.
-    weights = torch.clamp(weights, min=0.0, max=float(maximum_name_weight))
+    if maximum_name_weight is not None:
+        weights = torch.clamp(weights, min=0.0, max=float(maximum_name_weight))
     return torch.where(any_valid, weights, torch.zeros_like(weights))
 
 
@@ -358,12 +367,14 @@ def execute_minute_target(
         volumes * float(config.maximum_volume_participation),
         torch.zeros_like(volumes),
     )
-    notional_capacity = torch.where(
-        valid,
-        float(config.maximum_order_notional) / torch.clamp_min(opens, 1e-12),
-        torch.zeros_like(opens),
-    )
-    capacity = torch.minimum(volume_capacity, notional_capacity)
+    capacity = volume_capacity
+    if config.maximum_order_notional is not None:
+        notional_capacity = torch.where(
+            valid,
+            float(config.maximum_order_notional) / torch.clamp_min(opens, 1e-12),
+            torch.zeros_like(opens),
+        )
+        capacity = torch.minimum(capacity, notional_capacity)
     slippage = float(config.slippage_bps_per_side) / 10_000.0
     buy_rates = buy_fee_rates.float().to(state.shares.device)
     sell_rates = sell_fee_rates.float().to(state.shares.device)

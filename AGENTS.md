@@ -271,6 +271,14 @@ aligned.
 
 Guidelines:
 
+- The active dual-RTX-5090 `tw_minute` long/short contract copies the ordinary
+  TW day-trade trading rules and changes only decision frequency: L1 gross
+  exposure `1.0` directly from raw signed scores (no de-meaning),
+  `max_volume_participation: 0.5`, normal fees/tax, zero extra slippage, and no
+  outside-cash, per-order-notional, or per-name ceiling.
+  Exact-session short eligibility and prior-session official short capacity
+  remain correctness constraints, not stress-test overlays.
+
 - Current active low-rank baseline preference: `portfolio_mode: long_short`.
 - Keep `trading.long_only: false` when the model is intended to do long/short.
 - Portfolio direction and sizing should default to raw score direction followed by L1 normalization for gross exposure control:

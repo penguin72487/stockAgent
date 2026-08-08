@@ -793,12 +793,16 @@ class TradingConfig:
     # changing the decision clock.
     tw_minute_initial_equity: float = 10_000_000.0
     tw_minute_gross_exposure: float = 0.90
-    tw_minute_max_name_weight: float = 0.05
+    # ``None`` disables the per-name ceiling; gross exposure still bounds the
+    # portfolio-wide L1 norm.
+    tw_minute_max_name_weight: float | None = 0.05
     # Optional universe-size-invariant cash outside option. The risky sleeve
     # uses sigmoid(logmeanexp(stock_logits) - outside_cash_logit), so the model
     # can learn zero exposure instead of being forced fully invested each bar.
     tw_minute_outside_cash_logit: float | None = None
-    tw_minute_max_order_notional: float = 1_000_000.0
+    # ``None`` disables the per-order notional ceiling. KBar volume capacity
+    # and available cash/short inventory remain enforceable constraints.
+    tw_minute_max_order_notional: float | None = 1_000_000.0
     tw_minute_slippage_bps_per_side: float = 2.0
     tw_minute_first_decision_minute: int = 1
     tw_minute_last_entry_minute: int = 268

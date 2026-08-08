@@ -259,6 +259,10 @@ execution contract plus the measured dual-GPU capacity settings are overridden.
 It is a long/short contract: sell-first allocation is restricted by exact-day
 official eligibility and the preceding session's official short-capacity
 evidence, with missing evidence failing closed.
+Its trading rules otherwise match the ordinary day-trade baseline: raw signed
+scores without de-meaning, 50% KBar volume participation, L1 gross exposure 1,
+normal fees/tax, zero extra slippage, and no cash gate, per-order ceiling, or
+per-name ceiling.
 
 - Use `run_fintech_python downloader/download_yahoo_ohlcv.py --asset forex` to download only the expanded FX universe.
 - Use `run_fintech_python downloader/download_forex_pepperstone.py` to download the Pepperstone-style FX universe.

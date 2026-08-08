@@ -257,7 +257,7 @@ trading:
   sell_fee_rate: 0.003291
   max_turnover_ratio: 0.0
   max_volume_participation: 0.5
-  volume_participation_equity: 1000000.0
+  volume_participation_equity: 10000000.0
   reporting_leverage: 1.0
   min_trade_weight: 0.0
   portfolio_activation: pre_normalized
