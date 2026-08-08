@@ -116,6 +116,9 @@ def _validate_tw_minute_mode_contract(
     use_tw_public_rules: object,
     tw_public_feature_path: object,
     portfolio_output_mode: object,
+    gross_exposure: object,
+    maximum_name_weight: object,
+    outside_cash_logit: object,
     first_decision_minute: object,
     last_entry_minute: object,
     last_decision_minute: object,
@@ -152,11 +155,25 @@ def _validate_tw_minute_mode_contract(
             "point-in-time data.tw_public_feature_path; do not project today's "
             "sell-first eligibility backward"
         )
-    if normalize_portfolio_output_mode(str(portfolio_output_mode)) != "logits":
+    output_mode = normalize_portfolio_output_mode(str(portfolio_output_mode))
+    if output_mode not in {"logits", "l1", "projection_l1"}:
         raise ValueError(
-            "tw_minute requires transformer_base_portfolio.portfolio_output_mode='logits' "
-            "so the minute executor owns tradability masking and exposure limits"
+            "tw_minute requires the active model portfolio_output_mode to be "
+            "'logits', 'l1', or 'projection_l1'"
         )
+    if output_mode in {"l1", "projection_l1"}:
+        if float(gross_exposure) != 1.0:
+            raise ValueError(
+                "tw_minute pre-normalized portfolio output already emits the "
+                "daily day-trade allocation and requires "
+                "trading.tw_minute_gross_exposure=1.0"
+            )
+        if maximum_name_weight is not None or outside_cash_logit is not None:
+            raise ValueError(
+                "tw_minute pre-normalized portfolio output must preserve the "
+                "daily day-trade allocation before execution masks; disable the "
+                "minute per-name cap and outside-cash logits gate"
+            )
     first = int(first_decision_minute)
     last_entry = int(last_entry_minute)
     last = int(last_decision_minute)
@@ -2375,6 +2392,9 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         use_tw_public_rules=data["use_tw_public_rules"],
         tw_public_feature_path=data["tw_public_feature_path"],
         portfolio_output_mode=phase_model_config["portfolio_output_mode"],
+        gross_exposure=trading["tw_minute_gross_exposure"],
+        maximum_name_weight=trading["tw_minute_max_name_weight"],
+        outside_cash_logit=trading["tw_minute_outside_cash_logit"],
         first_decision_minute=trading["tw_minute_first_decision_minute"],
         last_entry_minute=trading["tw_minute_last_entry_minute"],
         last_decision_minute=trading["tw_minute_last_decision_minute"],

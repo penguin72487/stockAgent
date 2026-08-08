@@ -25,6 +25,7 @@ from downloader.download_shioaji_tw_minute_kbars import (
 from scripts.audit_shioaji_tw_minute_dataset import audit_frame
 from scripts.build_shioaji_tw_minute_dataset import (
     MODEL_FEATURE_COLUMNS,
+    _feature_statistics,
     _validate_collection_gate,
     build_research_frame,
 )
@@ -86,6 +87,27 @@ def _raw_minute_frame(
 
 def _research_frame(**kwargs: float) -> pl.DataFrame:
     return build_research_frame(_raw_minute_frame(**kwargs).lazy()).collect()
+
+
+def test_feature_statistics_square_integer_features_in_float64() -> None:
+    frame = pl.DataFrame(
+        {
+            **{
+                name: (
+                    pl.Series([6, 132, 265], dtype=pl.Int16)
+                    if name == "minutes_from_open"
+                    else pl.Series([1.0, 2.0, 3.0], dtype=pl.Float64)
+                )
+                for name in MODEL_FEATURE_COLUMNS
+            },
+            "feature_valid": [True, True, True],
+        }
+    )
+
+    statistics = _feature_statistics(frame)
+
+    assert statistics["feature_sums"]["minutes_from_open"] == 403.0
+    assert statistics["feature_sum_squares"]["minutes_from_open"] == 87_685.0
 
 
 def _backtest_rows(

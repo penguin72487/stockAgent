@@ -1,13 +1,14 @@
 base_config: tw_public_lanten_market_candles.yaml
 
-experiment_name: tw-full-market-minute-long-short-daytrade-rules-dual-5090-v3
+experiment_name: tw-full-market-minute-long-short-precision-balanced-dual-5090-v5
 
 runner:
-  # Preserve prior capped/cash-gated runs. Execution-contract v4 copies the
-  # daily day-trade rules and changes only the decision frequency to one minute.
-  output_dir: artifacts/markets/tw_minute_dual_5090_daytrade_rules_v3
+  # Preserve every prior checkpoint. Execution-contract v6 uses a normalized
+  # FP32 NAV ledger; training-contract v8 consumes Float64-built statistics and
+  # restores the historical profitable day-trade checkpoint's L1 output.
+  output_dir: artifacts/markets/tw_minute_dual_5090_precision_balanced_v5
   mode: train
-  resume: true
+  resume: false
   post_train_infer: false
   start_fold: 1
 
@@ -24,7 +25,7 @@ data:
   # These are the only data overrides: daily-panel fields inherited from the
   # candle config are inert because tw_minute dispatches before panel build.
   panel_start_date: "2020-01-01"
-  minute_parquet_root: data_tw_minute/research_dataset
+  minute_parquet_root: data_tw_minute/research_dataset_stats_v4
   minute_require_research_ready: true
   minute_verify_partition_sha256: true
   benchmark_name: "2330"
@@ -50,14 +51,14 @@ trading:
   frequency: minute
   execution_mode: tw_minute
   long_only: false
-  portfolio_activation: identity
+  portfolio_activation: pre_normalized
   min_trade_weight: 0.0
   reporting_leverage: 1.0
-  # Match tw_public_lanten_market_candles.yaml's day-trade contract: raw signed
-  # score + L1 gross exposure 1, 50% volume participation, normal fees/tax, and
-  # no de-meaning, extra slippage, cash gate, per-order, or per-name ceiling.
+  # Match the resolved historical profitable day-trade checkpoint: every
+  # nonzero model row uses gross L1 exposure one before executor eligibility
+  # and capacity masks. Blocked or unfilled orders still remain cash.
   max_volume_participation: 0.50
-  tw_minute_initial_equity: 1000000.0
+  tw_minute_initial_equity: 10000000.0
   tw_minute_gross_exposure: 1.0
   tw_minute_max_name_weight: null
   tw_minute_outside_cash_logit: null
@@ -96,7 +97,7 @@ training:
   minute_cpu_cache_gb: 64.0
   minute_data_workers: 8
   loss_type: log_utility
-  loss_portfolio_activation: identity
+  loss_portfolio_activation: pre_normalized
   strict_no_fallback: true
   allow_dynamic_symbols: false
   # Keep the shared Transformer-family contract aligned even though this run
@@ -104,9 +105,10 @@ training:
   transformer_base_portfolio:
     amp_native_position_add: true
     checkpoint_blocks: true
-    portfolio_output_mode: logits
+    portfolio_output_mode: l1
   financial_transformer:
-    # Preserve the candle model exactly except for the minute head contract.
+    # Restore the resolved historical profitable day-trade checkpoint's L1
+    # portfolio head. Execution masks run afterwards, as in tw_day_trade.
     # Under BF16 autocast, cast the small position tensors to the activation
     # dtype instead of promoting the full [B,L,S,D] residual back to FP32.
     amp_native_position_add: true
@@ -117,7 +119,7 @@ training:
     # This keeps the batch/chunk/optimizer schedule unchanged.
     checkpoint_blocks: true
     portfolio_mode: long_short
-    portfolio_output_mode: logits
+    portfolio_output_mode: l1
     return_aux: false
     return_aux_details: false
   # Rank 0 refreshes both live curves after every complete epoch.

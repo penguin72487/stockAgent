@@ -11,6 +11,8 @@ import polars as pl
 
 
 MINUTE_SESSION_BARS = 270
+MINUTE_DATASET_SCHEMA_VERSION = 4
+MINUTE_FEATURE_STATISTICS_CONTRACT = "float64_sums_v1"
 MINUTE_FEATURE_COLUMNS = (
     "log_close_return_1m",
     "gap_log_return",
@@ -127,8 +129,33 @@ class MinuteDatasetIndex:
             raise RuntimeError(
                 f"minute training split has insufficient feature statistics: {missing}"
             )
+        if not (
+            np.isfinite(counts).all()
+            and np.isfinite(sums).all()
+            and np.isfinite(sum_squares).all()
+        ):
+            raise RuntimeError("minute feature statistics contain non-finite values")
         mean = sums / counts
-        variance = np.maximum(sum_squares / counts - mean * mean, 1e-12)
+        second_moment = sum_squares / counts
+        raw_variance = second_moment - mean * mean
+        cancellation_tolerance = (
+            64.0
+            * np.finfo(np.float64).eps
+            * np.maximum.reduce(
+                [np.abs(second_moment), np.square(mean), np.ones_like(mean)]
+            )
+        )
+        corrupted = raw_variance < -cancellation_tolerance
+        if np.any(corrupted):
+            details = {
+                MINUTE_FEATURE_COLUMNS[index]: float(raw_variance[index])
+                for index in np.flatnonzero(corrupted)
+            }
+            raise RuntimeError(
+                "minute feature statistics imply negative variance; rebuild the "
+                f"dataset with Float64 accumulation: {details}"
+            )
+        variance = np.maximum(raw_variance, 1e-12)
         return MinuteFeatureNormalizer(
             mean=mean.astype(np.float32),
             scale=np.sqrt(variance).astype(np.float32),
@@ -413,10 +440,18 @@ def load_minute_dataset_index(
     if not manifest_path.is_file():
         raise RuntimeError(f"minute dataset manifest is missing: {manifest_path}")
     manifest = _read_json(manifest_path)
-    if manifest.get("schema_version") != 3:
+    if manifest.get("schema_version") != MINUTE_DATASET_SCHEMA_VERSION:
         raise RuntimeError(
             "minute dataset schema is stale; rebuild with "
             "scripts/build_shioaji_tw_minute_dataset.py"
+        )
+    if (
+        manifest.get("feature_statistics_contract")
+        != MINUTE_FEATURE_STATISTICS_CONTRACT
+    ):
+        raise RuntimeError(
+            "minute dataset feature statistics are stale; rebuild with "
+            "Float64 accumulation"
         )
     if manifest.get("source") != "shioaji_kbars_1m":
         raise RuntimeError("minute dataset source is not Shioaji Kbars")

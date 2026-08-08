@@ -22,6 +22,7 @@ from stockagent.backtest.tw_minute import (
 from stockagent.config import load_config
 from stockagent.data.tw_minute import (
     MINUTE_FEATURE_COLUMNS,
+    MinuteDatasetIndex,
     MinuteDayPanel,
     MinuteFeatureNormalizer,
     _load_minute_short_rules,
@@ -72,6 +73,28 @@ def test_first_calendar_year_indices_selects_only_first_test_year() -> None:
 
     assert year == 2023
     assert indices.tolist() == [1, 2]
+
+
+def test_minute_normalizer_rejects_negative_variance_statistics(
+    tmp_path: Path,
+) -> None:
+    valid = {
+        "feature_counts": {name: 2 for name in MINUTE_FEATURE_COLUMNS},
+        "feature_sums": {name: 0.0 for name in MINUTE_FEATURE_COLUMNS},
+        "feature_sum_squares": {name: 2.0 for name in MINUTE_FEATURE_COLUMNS},
+    }
+    valid["feature_sums"]["minutes_from_open"] = 200.0
+    valid["feature_sum_squares"]["minutes_from_open"] = 1.0
+    dataset = MinuteDatasetIndex(
+        root=tmp_path,
+        manifest={},
+        symbols=("2330",),
+        dates=np.asarray(["2026-01-02"], dtype="datetime64[D]"),
+        partitions={"2026-01-02": valid},
+    )
+
+    with pytest.raises(RuntimeError, match="negative variance"):
+        dataset.fit_normalizer([0])
 
 
 def test_minute_group_runtime_release_resets_compiler_on_cpu(
@@ -385,7 +408,9 @@ def test_minute_long_short_executor_enforces_capacity_and_covers_at_close() -> N
         short_capacity_shares=torch.tensor([2_000.0, 0.0]),
     )
 
-    assert float(opened.state.shares[0]) == pytest.approx(-2_000.0)
+    assert float(opened.state.shares[0]) * config.initial_equity == pytest.approx(
+        -2_000.0
+    )
     assert float(opened.state.shares[1]) > 0.0
     closed = force_close_minute_session(
         opened.state,
@@ -400,7 +425,7 @@ def test_minute_long_short_executor_enforces_capacity_and_covers_at_close() -> N
     # Short cover uses the buy fee while the long liquidation uses sell fees.
     expected_close_fees = 2_000.0 * 100.0 * 0.001 + float(
         opened.state.shares[1]
-    ) * 100.0 * 0.002
+    ) * config.initial_equity * 100.0 * 0.002
     assert float(closed.explicit_fees) == pytest.approx(expected_close_fees)
 
 
@@ -552,7 +577,10 @@ def test_minute_uncapped_daytrade_rules_keep_only_volume_capacity() -> None:
 
     # The request is 10,000 shares; with no notional ceiling, only 50% of the
     # 10,000-share next KBar volume limits the fill.
-    torch.testing.assert_close(result.state.shares, torch.tensor([5_000.0]))
+    torch.testing.assert_close(
+        result.state.shares * config.initial_equity,
+        torch.tensor([5_000.0]),
+    )
     torch.testing.assert_close(result.slippage_cost, torch.tensor(0.0))
 
 
@@ -600,6 +628,50 @@ def test_minute_slab_adapter_fuses_identical_target_construction() -> None:
     torch.testing.assert_close(actual, expected)
 
 
+def test_minute_daily_projection_adapter_preserves_implicit_and_blocked_cash() -> None:
+    class FakeDailyProjectionModel(torch.nn.Module):
+        portfolio_output_mode = "projection_l1"
+
+        def forward_from_batched_panel_slabs(
+            self,
+            feature_slabs: torch.Tensor,
+            mask: torch.Tensor,
+            *,
+            return_aux: bool,
+        ) -> torch.Tensor:
+            del feature_slabs, mask, return_aux
+            # This is the already-resolved daily L1-ball request with 25% cash.
+            # The first symbol's short is an executor rejection, not permission
+            # to renormalize the two remaining longs back to gross one.
+            return torch.tensor([[-0.25, 0.25, 0.25]])
+
+    config = MinuteExecutionConfig(
+        initial_equity=10_000_000.0,
+        gross_exposure=1.0,
+        maximum_name_weight=None,
+        maximum_volume_participation=0.5,
+        maximum_order_notional=None,
+        slippage_bps_per_side=0.0,
+        outside_cash_logit=None,
+        long_only=False,
+    )
+    adapter = _MinuteSlabForwardAdapter(FakeDailyProjectionModel(), config)
+    actual = adapter(
+        torch.zeros(1, 1, 3, 1),
+        torch.ones(1, 1, 3, dtype=torch.bool),
+        torch.tensor([[[False, True, True]]]),
+    )
+
+    torch.testing.assert_close(actual, torch.tensor([[-0.25, 0.25, 0.25]]))
+    executable = torch.where(
+        (actual < 0.0) & torch.tensor([[True, False, False]]),
+        torch.zeros_like(actual),
+        actual,
+    )
+    assert float(executable.abs().sum()) == pytest.approx(0.5)
+    assert 1.0 - float(executable.abs().sum()) == pytest.approx(0.5)
+
+
 def test_minute_executor_trades_only_target_delta_and_forces_flat() -> None:
     state = initialize_minute_execution_state(
         num_symbols=2,
@@ -620,7 +692,51 @@ def test_minute_executor_trades_only_target_delta_and_forces_flat() -> None:
         config=_config(),
     )
     assert torch.count_nonzero(closed.state.shares) == 0
-    assert float(closed.state.equity) < _config().initial_equity
+    assert 0.0 < float(closed.state.equity) < 1.0
+
+
+def test_normalized_minute_ledger_resolves_sub_twd_fees_at_ten_million_nav() -> None:
+    config = MinuteExecutionConfig(
+        initial_equity=10_000_000.0,
+        gross_exposure=1.0,
+        maximum_name_weight=None,
+        maximum_volume_participation=0.5,
+        maximum_order_notional=None,
+        slippage_bps_per_side=0.0,
+    )
+    state = initialize_minute_execution_state(
+        num_symbols=1,
+        config=config,
+        device=torch.device("cpu"),
+    )
+    opened = execute_minute_target(
+        state,
+        target_weights=torch.tensor([1e-6]),
+        execution_mask=torch.tensor([True]),
+        execution_open=torch.tensor([100.0]),
+        exit_close=torch.tensor([100.0]),
+        future_volume_shares=torch.tensor([1_000_000.0]),
+        buy_fee_rates=torch.tensor([0.001]),
+        sell_fee_rates=torch.tensor([0.002]),
+        config=config,
+        allow_new_entries=True,
+    )
+    closed = force_close_minute_session(
+        opened.state,
+        session_close=torch.tensor([100.0]),
+        session_exit_mask=torch.tensor([True]),
+        last_minute_volume_shares=torch.tensor([1_000_000.0]),
+        sell_fee_rates=torch.tensor([0.002]),
+        config=config,
+    )
+
+    # NT$10 notional pays NT$0.01 on entry and NT$0.02 on exit. Currency-FP32
+    # accounting at NT$10m rounds both away; normalized FP32 retains them in
+    # the direct return path without requiring slow GPU FP64.
+    assert float(opened.explicit_fees) == pytest.approx(0.01, abs=1e-6)
+    assert float(closed.explicit_fees) == pytest.approx(0.02, abs=1e-6)
+    assert float(opened.net_return) == pytest.approx(-1e-9, rel=1e-5)
+    assert float(closed.net_return) == pytest.approx(-2e-9, rel=1e-5)
 
 
 def test_last_decision_cannot_open_new_inventory() -> None:
@@ -920,15 +1036,21 @@ def test_dual_5090_minute_config_is_within_fold_ddp() -> None:
     assert config.training.financial_transformer.checkpoint_blocks is True
     assert config.training.transformer_base_portfolio.amp_native_position_add is True
     assert config.training.transformer_base_portfolio.checkpoint_blocks is True
-    assert config.training.transformer_base_portfolio.portfolio_output_mode == "logits"
+    assert (
+        config.training.transformer_base_portfolio.portfolio_output_mode
+        == "l1"
+    )
     assert config.training.financial_transformer.temporal_pooling == "last"
     assert config.training.financial_transformer.temporal_query_mode == "last_only"
     assert config.training.financial_transformer.portfolio_mode == "long_short"
-    assert config.training.financial_transformer.portfolio_output_mode == "logits"
+    assert (
+        config.training.financial_transformer.portfolio_output_mode
+        == "l1"
+    )
     assert config.trading.long_only is False
     assert config.data.use_tw_public_rules is True
     assert config.trading.max_volume_participation == 0.5
-    assert config.trading.tw_minute_initial_equity == 1_000_000.0
+    assert config.trading.tw_minute_initial_equity == 10_000_000.0
     assert config.trading.tw_minute_gross_exposure == 1.0
     assert config.trading.tw_minute_max_name_weight is None
     assert config.trading.tw_minute_outside_cash_logit is None
@@ -941,7 +1063,46 @@ def test_dual_5090_minute_config_is_within_fold_ddp() -> None:
     assert config.training.defer_epoch_curve_plot_until_end is False
     assert (
         config.runner.output_dir
-        == "artifacts/markets/tw_minute_dual_5090_daytrade_rules_v3"
+        == "artifacts/markets/tw_minute_dual_5090_precision_balanced_v5"
+    )
+
+
+def test_dual_5090_minute_trading_contract_matches_daily_day_trade() -> None:
+    root = Path(__file__).parents[1]
+    daily = load_config(root / "configs/markets/tw_public_lanten_market_candles.yaml")
+    minute = load_config(root / "configs/markets/tw_minute_dual_5090.yaml")
+
+    assert minute.trading.tw_minute_initial_equity == 10_000_000.0
+    assert (
+        minute.trading.tw_minute_initial_equity
+        == daily.trading.volume_participation_equity
+    )
+    for field in (
+        "buy_fee_rate",
+        "sell_fee_rate",
+        "max_volume_participation",
+        "volume_participation_equity",
+        "long_only",
+        "portfolio_activation",
+        "min_trade_weight",
+        "tw_commission_rate",
+        "tw_commission_discount",
+        "tw_commission_rebate_timing",
+        "tw_day_trade_stock_sell_tax",
+        "tw_day_trade_etf_sell_tax",
+        "tw_minimum_commission",
+        "tw_commission_rounding",
+        "tw_tax_rounding",
+    ):
+        assert getattr(minute.trading, field) == getattr(daily.trading, field)
+    assert (
+        minute.training.financial_transformer.portfolio_output_mode
+        == "l1"
+    )
+    assert (
+        minute.training.loss_portfolio_activation
+        == daily.training.loss_portfolio_activation
+        == "pre_normalized"
     )
 
 
@@ -1016,7 +1177,8 @@ def test_minute_partition_loads_sparse_full_market_rows_into_dense_day(
     (root / "manifest.json").write_text(
         json.dumps(
             {
-                "schema_version": 3,
+                "schema_version": 4,
+                "feature_statistics_contract": "float64_sums_v1",
                 "status": "research_ready",
                 "research_ready": True,
                 "source": "shioaji_kbars_1m",
@@ -1112,7 +1274,8 @@ def test_minute_training_reuses_canonical_group_artifacts(
     (root / "manifest.json").write_text(
         json.dumps(
             {
-                "schema_version": 3,
+                "schema_version": 4,
+                "feature_statistics_contract": "float64_sums_v1",
                 "status": "research_ready",
                 "research_ready": True,
                 "source": "shioaji_kbars_1m",
