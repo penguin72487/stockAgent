@@ -16,6 +16,7 @@ import polars as pl
 import torch
 from torch import nn
 from torch.amp import GradScaler
+from torch.utils.checkpoint import checkpoint as activation_checkpoint
 
 from stockagent.backtest.tw_execution import (
     TaiwanFeeSchedule,
@@ -33,11 +34,15 @@ from stockagent.backtest.report import compute_metrics
 from stockagent.backtest.simulator import BacktestResult
 from stockagent.config import ExperimentConfig
 from stockagent.data.tw_minute import (
+    MINUTE_DAILY_CONTEXT_CONTRACT,
+    MINUTE_DEVELOPING_CANDLE_FEATURE_COLUMNS,
     MINUTE_FEATURE_COLUMNS,
+    MINUTE_MICROSTRUCTURE_FEATURE_COLUMNS,
     MinuteDatasetIndex,
     MinuteDayPanel,
     MinuteFeatureNormalizer,
     load_minute_dataset_index,
+    minute_static_daily_context_feature_names,
 )
 from stockagent.data.walkforward import (
     WalkForwardFold,
@@ -45,6 +50,7 @@ from stockagent.data.walkforward import (
     validate_walk_forward_year_contract,
 )
 from stockagent.models.factory import build_model
+from stockagent.portfolio_contract import normalize_portfolio_output_mode
 from stockagent.evaluation.metrics import ic_summary
 from stockagent.training.trainer import (
     FoldResult,
@@ -96,11 +102,11 @@ from stockagent.training.lifecycle import (
 )
 
 
-MINUTE_EXECUTION_CONTRACT_VERSION = 4
+MINUTE_EXECUTION_CONTRACT_VERSION = 6
 # Per-epoch validation/test reporting is audit-only: it does not alter model
 # inputs, optimizer state, scheduler state, sample order, or loss/backtest
-# semantics. Keep v6 checkpoints resumable when reporting fields evolve.
-MINUTE_TRAINING_CONTRACT_VERSION = 6
+# semantics. Allocation-order changes require a fresh training contract.
+MINUTE_TRAINING_CONTRACT_VERSION = 11
 
 
 class _MinuteSlabForwardAdapter(nn.Module):
@@ -112,9 +118,16 @@ class _MinuteSlabForwardAdapter(nn.Module):
     target weights also removes the eager model-to-allocation CUDA boundary.
     """
 
-    def __init__(self, model: nn.Module, config: MinuteExecutionConfig) -> None:
+    def __init__(
+        self,
+        model: nn.Module,
+        config: MinuteExecutionConfig,
+        *,
+        daily_context_is_encoded: bool = False,
+    ) -> None:
         super().__init__()
         self.model = model
+        self.daily_context_is_encoded = bool(daily_context_is_encoded)
         self.gross_exposure = float(config.gross_exposure)
         self.maximum_name_weight = (
             None
@@ -123,29 +136,67 @@ class _MinuteSlabForwardAdapter(nn.Module):
         )
         self.outside_cash_logit = config.outside_cash_logit
         self.config_long_only = bool(config.long_only)
+        self.portfolio_output_mode = normalize_portfolio_output_mode(
+            str(getattr(model, "portfolio_output_mode", "logits"))
+        )
+        self.daily_context_num_features = int(
+            getattr(model, "daily_context_num_features", 0)
+        )
 
     def forward(
         self,
         feature_slabs: torch.Tensor,
         mask: torch.Tensor,
         shortable_mask: torch.Tensor | None = None,
+        daily_context_features: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        logits = self.model.forward_from_batched_panel_slabs(
-            feature_slabs,
-            mask,
-            return_aux=False,
-        )
-        if isinstance(logits, dict):
-            logits = logits.get("score_logits", logits.get("weights"))
-        if isinstance(logits, tuple):
-            logits = logits[0]
-        if not isinstance(logits, torch.Tensor):
-            raise RuntimeError("tw_minute model did not return score logits")
+        if self.daily_context_num_features > 0:
+            if daily_context_features is None:
+                raise RuntimeError("tw_minute daily context tensor is missing")
+            if self.daily_context_is_encoded:
+                model_output = self.model.forward_from_batched_panel_slabs_with_encoded_daily_context(
+                    feature_slabs,
+                    daily_context_features,
+                    mask,
+                    return_aux=False,
+                )
+            else:
+                model_output = (
+                    self.model.forward_from_batched_panel_slabs_with_daily_context(
+                        feature_slabs,
+                        daily_context_features,
+                        mask,
+                        return_aux=False,
+                    )
+                )
+        else:
+            model_output = self.model.forward_from_batched_panel_slabs(
+                feature_slabs,
+                mask,
+                return_aux=False,
+            )
+        if isinstance(model_output, dict):
+            model_output = model_output.get(
+                "score_logits", model_output.get("weights")
+            )
+        if isinstance(model_output, tuple):
+            model_output = model_output[0]
+        if not isinstance(model_output, torch.Tensor):
+            raise RuntimeError("tw_minute model did not return portfolio outputs")
         flat_mask = mask.reshape(-1, mask.size(-1))
+        if self.portfolio_output_mode in {"l1", "projection_l1"}:
+            # Match the canonical daily tw_day_trade ordering exactly: the
+            # model first resolves its L1 allocation using only its causal
+            # feature/tradability mask.  Projection-L1 may deliberately leave
+            # part of the gross-one budget as cash. Directional eligibility,
+            # close availability, and volume capacity are executor facts
+            # applied afterwards; blocked requests also remain cash instead of
+            # being redistributed across the surviving symbols.
+            return model_output.float().masked_fill(~flat_mask, 0.0)
         if shortable_mask is None:
             shortable_mask = mask
         return minute_target_weights_from_logits(
-            logits,
+            model_output,
             flat_mask,
             gross_exposure=self.gross_exposure,
             maximum_name_weight=self.maximum_name_weight,
@@ -232,12 +283,23 @@ def _minute_dataset_fingerprint(dataset: MinuteDatasetIndex) -> str:
                 for value in dataset.dates.astype("datetime64[D]")
             ],
             "short_rules_fingerprint": dataset.short_rules_fingerprint,
+            "daily_context_fingerprint": (
+                None
+                if dataset.daily_feature_context is None
+                else dataset.daily_feature_context.fingerprint
+            ),
+            "daily_context_lookback": int(dataset.daily_context_lookback),
         }
     )
 
 
 def _minute_configuration_fingerprint(config: ExperimentConfig) -> str:
     active_model_config = _active_model_config(config)["values"]
+    daily_context_feature_names = (
+        minute_static_daily_context_feature_names(config.data.feature_include)
+        if config.data.minute_daily_context_panel_meta is not None
+        else ()
+    )
     return _stable_fingerprint(
         {
             "training_contract_version": MINUTE_TRAINING_CONTRACT_VERSION,
@@ -248,7 +310,23 @@ def _minute_configuration_fingerprint(config: ExperimentConfig) -> str:
             "loss_type": config.training.loss_type,
             "batch_size_train": config.training.batch_size_train,
             "minute_decision_chunk_rows": config.training.minute_decision_chunk_rows,
+            "minute_full_day_credit_assignment": (
+                config.training.minute_full_day_credit_assignment
+            ),
+            "minute_full_day_activation_checkpoint": (
+                config.training.minute_full_day_activation_checkpoint
+            ),
+            "minute_stateful_proximal_allocator": (
+                config.training.minute_stateful_proximal_allocator
+            ),
+            "minute_proximal_cost_multiplier": (
+                config.training.minute_proximal_cost_multiplier
+            ),
             "amp_dtype": config.environment.amp_dtype,
+            "daily_context_panel_meta": (
+                config.data.minute_daily_context_panel_meta
+            ),
+            "daily_context_feature_names": list(daily_context_feature_names),
             "active_model_config": active_model_config,
         }
     )
@@ -332,6 +410,7 @@ def _freeze_inactive_minute_parameters(model: nn.Module) -> tuple[str, ...]:
     frozen: list[str] = []
     for enabled_name, parameter_name in (
         ("use_time_pos", "time_position"),
+        ("use_time_pos", "daily_context_time_position"),
         ("use_symbol_pos", "symbol_position"),
     ):
         if bool(getattr(model, enabled_name, True)):
@@ -367,12 +446,20 @@ def _build_windows(
 
 
 def _batched_slab_targets(
-    model_forward: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], Any],
+    model_forward: Callable[
+        [torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], Any
+    ],
     feature_slabs: torch.Tensor,
     mask: torch.Tensor,
     shortable_mask: torch.Tensor,
+    daily_context_features: torch.Tensor,
 ) -> torch.Tensor:
-    output = model_forward(feature_slabs, mask, shortable_mask)
+    output = model_forward(
+        feature_slabs,
+        mask,
+        shortable_mask,
+        daily_context_features,
+    )
     if isinstance(output, dict):
         output = output.get("score_logits", output.get("weights"))
     if isinstance(output, tuple):
@@ -387,6 +474,76 @@ def _batched_slab_targets(
             "tw_minute batched panel-slab model must return [D*C,S] targets"
         )
     return output
+
+
+def _stateful_proximal_target_weights(
+    requested_weights: torch.Tensor,
+    previous_executed_weights: torch.Tensor,
+    *,
+    buy_fee_rates: torch.Tensor,
+    sell_fee_rates: torch.Tensor,
+    cost_multiplier: float,
+    long_only: bool,
+) -> torch.Tensor:
+    """Cost-aware target update around the actual pre-trade portfolio.
+
+    This is the proximal map for a quadratic pull toward the model proposal and
+    an asymmetric L1 switching cost.  The threshold uses the exact applicable
+    one-way fee: buys (including short covers) pay ``buy_fee_rates`` and sells
+    (including short opens) pay ``sell_fee_rates``.  If every proposed change
+    lies inside the no-trade region, the previous portfolio is returned exactly.
+    """
+
+    if requested_weights.shape != previous_executed_weights.shape:
+        raise ValueError("requested and previous minute weights must have one shape")
+    if requested_weights.dim() != 2:
+        raise ValueError("stateful minute allocator expects [B,S] weights")
+    if buy_fee_rates.shape != (requested_weights.size(1),) or sell_fee_rates.shape != (
+        requested_weights.size(1),
+    ):
+        raise ValueError("stateful minute allocator fee vectors must have shape [S]")
+    multiplier = float(cost_multiplier)
+    if not math.isfinite(multiplier) or multiplier < 0.0:
+        raise ValueError("minute proximal cost multiplier must be finite and nonnegative")
+
+    requested = requested_weights.float()
+    previous = previous_executed_weights.float()
+    if long_only:
+        requested = requested.clamp_min(0.0)
+        previous = previous.clamp_min(0.0)
+    delta = requested - previous
+    fee_threshold = torch.where(
+        delta >= 0.0,
+        buy_fee_rates.float().view(1, -1),
+        sell_fee_rates.float().view(1, -1),
+    ) * multiplier
+    shrunk_delta = torch.sign(delta) * torch.relu(delta.abs() - fee_threshold)
+    changed = shrunk_delta.abs().sum(dim=-1, keepdim=True) > 0.0
+    candidate = previous + shrunk_delta
+    if long_only:
+        candidate = candidate.clamp_min(0.0)
+
+    requested_gross = requested.abs().sum(dim=-1, keepdim=True)
+    previous_gross = previous.abs().sum(dim=-1, keepdim=True)
+    candidate_gross = candidate.abs().sum(dim=-1, keepdim=True)
+    desired_gross = torch.where(
+        requested_gross > 1e-12,
+        requested_gross,
+        previous_gross,
+    )
+    normalized_candidate = torch.where(
+        candidate_gross > 1e-12,
+        candidate * desired_gross / torch.clamp_min(candidate_gross, 1e-12),
+        previous,
+    )
+    # The first allocation has no previous inventory to preserve; charge its
+    # real entry fee in the ledger without sparsifying the gross-one proposal.
+    initial_entry = previous_gross <= 1e-12
+    return torch.where(
+        initial_entry,
+        requested,
+        torch.where(changed, normalized_candidate, previous),
+    )
 
 
 def _execute_minute_chunk(
@@ -406,6 +563,8 @@ def _execute_minute_chunk(
     buy_fee_rates: torch.Tensor,
     sell_fee_rates: torch.Tensor,
     config: MinuteExecutionConfig,
+    stateful_proximal_allocator: bool = False,
+    proximal_cost_multiplier: float = 1.0,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -433,9 +592,37 @@ def _execute_minute_chunk(
     fees = torch.zeros_like(equity)
     slippage = torch.zeros_like(equity)
     for local in range(int(targets.size(1))):
+        target_weights = targets[:, local]
+        if stateful_proximal_allocator:
+            mark_prices = torch.where(
+                execution_masks[:, local]
+                & torch.isfinite(execution_opens[:, local])
+                & (execution_opens[:, local] > 0.0),
+                execution_opens[:, local],
+                state.last_prices,
+            )
+            marked_nav = state.cash + torch.sum(
+                state.shares * mark_prices,
+                dim=-1,
+            )
+            previous_weights = torch.where(
+                marked_nav.unsqueeze(-1) > 1e-12,
+                state.shares
+                * mark_prices
+                / torch.clamp_min(marked_nav.unsqueeze(-1), 1e-12),
+                torch.zeros_like(state.shares),
+            )
+            target_weights = _stateful_proximal_target_weights(
+                target_weights,
+                previous_weights,
+                buy_fee_rates=buy_fee_rates,
+                sell_fee_rates=sell_fee_rates,
+                cost_multiplier=proximal_cost_multiplier,
+                long_only=bool(config.long_only),
+            )
         step = execute_minute_target(
             state,
-            target_weights=targets[:, local],
+            target_weights=target_weights,
             execution_mask=execution_masks[:, local],
             execution_open=execution_opens[:, local],
             exit_close=exit_closes[:, local],
@@ -496,6 +683,75 @@ def _minute_chunk_training_loss(
     )
 
 
+def _all_reduce_full_day_gradients(
+    model: nn.Module,
+    *,
+    bucket_cap_mb: int,
+) -> None:
+    """Synchronize one full-day backward accumulated under DDP ``no_sync``.
+
+    A full minute session deliberately performs several policy forwards before
+    its single backward so future fees can reach earlier decisions. DDP's
+    reducer models every forward as an iteration and therefore cannot own that
+    multi-forward graph directly. We keep all forwards and the backward under
+    ``no_sync`` and reproduce DDP's averaged-gradient contract here, using
+    bounded flat buckets instead of one collective per parameter.
+    """
+
+    if not _distributed_is_initialized() or _distributed_world_size() <= 1:
+        return
+    parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    device = next((parameter.device for parameter in parameters), torch.device("cpu"))
+    present = torch.tensor(
+        [parameter.grad is not None for parameter in parameters],
+        device=device,
+        dtype=torch.int32,
+    )
+    torch.distributed.all_reduce(present, op=torch.distributed.ReduceOp.SUM)
+    world_size = _distributed_world_size()
+    inconsistent = (present != 0) & (present != world_size)
+    if bool(torch.any(inconsistent).item()):
+        indices = torch.nonzero(inconsistent, as_tuple=False).flatten().tolist()
+        raise RuntimeError(
+            "tw_minute full-day DDP ranks used different parameters: "
+            f"indices={indices[:16]}"
+        )
+    gradients = [
+        parameter.grad
+        for parameter, count in zip(parameters, present.tolist())
+        if count == world_size and parameter.grad is not None
+    ]
+    if any(gradient.is_sparse for gradient in gradients):
+        raise RuntimeError("tw_minute full-day DDP does not support sparse gradients")
+    cap_bytes = max(1, int(bucket_cap_mb)) * 1024 * 1024
+    buckets: list[list[torch.Tensor]] = []
+    current: list[torch.Tensor] = []
+    current_bytes = 0
+    current_key: tuple[torch.device, torch.dtype] | None = None
+    for gradient in gradients:
+        key = (gradient.device, gradient.dtype)
+        gradient_bytes = int(gradient.numel() * gradient.element_size())
+        if current and (key != current_key or current_bytes + gradient_bytes > cap_bytes):
+            buckets.append(current)
+            current = []
+            current_bytes = 0
+        current.append(gradient)
+        current_bytes += gradient_bytes
+        current_key = key
+    if current:
+        buckets.append(current)
+    inverse_world_size = 1.0 / float(world_size)
+    for bucket in buckets:
+        flat = torch.cat([gradient.reshape(-1) for gradient in bucket])
+        torch.distributed.all_reduce(flat, op=torch.distributed.ReduceOp.SUM)
+        flat.mul_(inverse_world_size)
+        offset = 0
+        for gradient in bucket:
+            count = int(gradient.numel())
+            gradient.copy_(flat[offset : offset + count].view_as(gradient))
+            offset += count
+
+
 def _decision_indices(config: ExperimentConfig) -> np.ndarray:
     first = max(
         int(config.trading.tw_minute_first_decision_minute),
@@ -546,6 +802,11 @@ def _day_panel_nbytes(day: MinuteDayPanel) -> int:
                 day.future_volume_shares,
                 day.session_close,
                 day.session_exit_mask,
+                *(
+                    ()
+                    if day.daily_context_features is None
+                    else (day.daily_context_features,)
+                ),
                 *(
                     ()
                     if day.short_open_mask is None
@@ -664,6 +925,7 @@ class _MinuteDayCache:
             "session_exit_mask",
             "short_open_mask",
             "short_capacity_shares",
+            "daily_context_features",
         )
         fields = {
             name: _stack_day_field(days, name, padded_days=int(padded_days))
@@ -705,6 +967,8 @@ def _stack_day_field(
                 value = np.zeros(day.features.shape[1], dtype=np.bool_)
             elif name == "short_capacity_shares":
                 value = np.zeros(day.features.shape[1], dtype=np.int64)
+            elif name == "daily_context_features":
+                value = np.zeros((day.features.shape[1], 0), dtype=np.float32)
             else:
                 raise RuntimeError(f"minute host field {name!r} is missing")
         values.append(value)
@@ -717,7 +981,10 @@ def _stack_day_field(
 def _run_day_batch(
     *,
     model: nn.Module,
-    model_forward: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], Any],
+    model_forward: Callable[
+        [torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], Any
+    ],
+    daily_context_forward: Callable[[torch.Tensor], torch.Tensor] | None = None,
     execution_forward: Callable[..., tuple[torch.Tensor, ...]],
     days: list[MinuteDayPanel] | None,
     host_batch: _MinuteHostBatch | None = None,
@@ -775,6 +1042,7 @@ def _run_day_batch(
                 "session_exit_mask",
                 "short_open_mask",
                 "short_capacity_shares",
+                "daily_context_features",
             )
         }
     )
@@ -822,10 +1090,52 @@ def _run_day_batch(
     day_short_capacity = cpu_fields["short_capacity_shares"].to(
         device=device, dtype=torch.float32, non_blocking=non_blocking
     )
+    daily_context_features = cpu_fields["daily_context_features"].to(
+        device=device, dtype=torch.float32, non_blocking=non_blocking
+    )
     timing.transfer_s += time.perf_counter() - transfer_started
     chunks = list(range(0, len(decisions), decision_chunk_rows))
+    full_day_credit_assignment = bool(
+        training and config.training.minute_full_day_credit_assignment
+    )
+    full_day_activation_checkpoint = bool(
+        full_day_credit_assignment
+        and config.training.minute_full_day_activation_checkpoint
+    )
+    full_day_log_utility = torch.zeros(
+        day_batch_size, device=device, dtype=torch.float32
+    )
     if training:
         optimizer.zero_grad(set_to_none=True)
+    deferred_ddp_sync = bool(
+        full_day_credit_assignment
+        and _distributed_is_initialized()
+        and _distributed_world_size() > 1
+        and hasattr(model, "no_sync")
+    )
+    full_day_sync_context = model.no_sync() if deferred_ddp_sync else nullcontext()
+    full_day_sync_context.__enter__()
+    policy_daily_context = daily_context_features
+    if daily_context_forward is not None:
+        daily_started = time.perf_counter()
+
+        def _encode_daily_context(features: torch.Tensor) -> torch.Tensor:
+            with _autocast_context(device, amp_dtype):
+                return daily_context_forward(features)
+
+        with torch.set_grad_enabled(training):
+            if full_day_activation_checkpoint:
+                policy_daily_context = activation_checkpoint(
+                    _encode_daily_context,
+                    daily_context_features,
+                    use_reentrant=False,
+                    preserve_rng_state=True,
+                )
+            else:
+                policy_daily_context = _encode_daily_context(
+                    daily_context_features
+                )
+        timing.forward_s += time.perf_counter() - daily_started
     for chunk_number, start in enumerate(chunks):
         is_last_chunk = chunk_number == len(chunks) - 1
         # A minute optimizer batch contains many recurrent ledger chunks. DDP
@@ -835,7 +1145,12 @@ def _run_day_batch(
         # flag to be restored between consecutive no-sync chunks.
         sync_context = (
             model.no_sync()
-            if training and not is_last_chunk and hasattr(model, "no_sync")
+            if (
+                training
+                and not full_day_credit_assignment
+                and not is_last_chunk
+                and hasattr(model, "no_sync")
+            )
             else nullcontext()
         )
         sync_context.__enter__()
@@ -880,14 +1195,46 @@ def _run_day_batch(
             & day_short_open_mask.unsqueeze(1)
             & session_exit_mask.unsqueeze(1)
         )
+        def _policy_targets(
+            slabs: torch.Tensor,
+            masks: torch.Tensor,
+            short_masks: torch.Tensor,
+            daily_features: torch.Tensor,
+        ) -> torch.Tensor:
+            with _autocast_context(device, amp_dtype):
+                return _batched_slab_targets(
+                    model_forward,
+                    slabs,
+                    masks,
+                    short_masks,
+                    daily_features,
+                ).reshape(day_batch_size, decision_chunk_rows, -1)
+
         forward_started = time.perf_counter()
-        with torch.set_grad_enabled(training), _autocast_context(device, amp_dtype):
-            targets = _batched_slab_targets(
-                model_forward,
-                feature_slabs,
-                model_masks,
-                shortable_rows,
-            ).reshape(day_batch_size, decision_chunk_rows, -1)
+        with torch.set_grad_enabled(training):
+            if full_day_activation_checkpoint:
+                # Exact full-session credit assignment otherwise retains all
+                # 15 Transformer chunk activations until forced-close
+                # backward. Non-reentrant checkpointing retains the recurrent
+                # ledger graph and RNG semantics, but recomputes policy
+                # activations chunk-by-chunk during backward. This changes the
+                # memory/time tradeoff, not the objective or its gradients.
+                targets = activation_checkpoint(
+                    _policy_targets,
+                    feature_slabs,
+                    model_masks,
+                    shortable_rows,
+                    policy_daily_context,
+                    use_reentrant=False,
+                    preserve_rng_state=True,
+                )
+            else:
+                targets = _policy_targets(
+                    feature_slabs,
+                    model_masks,
+                    shortable_rows,
+                    policy_daily_context,
+                )
         timing.forward_s += time.perf_counter() - forward_started
         chunk_log_utility = torch.zeros(
             day_batch_size, device=device, dtype=torch.float32
@@ -1012,8 +1359,10 @@ def _run_day_batch(
             total_fees = total_fees + close.explicit_fees.detach()
             total_slippage = total_slippage + close.slippage_cost.detach()
         timing.backtest_s += time.perf_counter() - execution_started
+        if full_day_credit_assignment:
+            full_day_log_utility = full_day_log_utility + chunk_log_utility
 
-        if training:
+        if training and not full_day_credit_assignment:
             if scaler is None:
                 raise RuntimeError("tw_minute training requires the canonical GradScaler")
             loss = _minute_chunk_training_loss(
@@ -1038,12 +1387,50 @@ def _run_day_batch(
             backward_started = time.perf_counter()
             scaler.scale(loss).backward()
             timing.backward_s += time.perf_counter() - backward_started
-        # Every ledger update is functional, so a detached storage view is
-        # sufficient within one optimizer batch. Cloning four state tensors at
-        # each chunk boundary only adds memory traffic; cross-batch state still
-        # uses the conservative clone-by-default API.
-        state = state.detached(clone=False)
+        # Evaluation and the legacy truncated-gradient path can release the
+        # recurrent graph at every compile chunk.  Full-day credit assignment
+        # deliberately keeps cash, shares, prices, and NAV connected until the
+        # forced-close loss has been added and one backward pass is issued.
+        if not full_day_credit_assignment:
+            state = state.detached(clone=False)
         sync_context.__exit__(None, None, None)
+
+    if full_day_credit_assignment:
+        if scaler is None:
+            raise RuntimeError("tw_minute training requires the canonical GradScaler")
+        loss = _minute_chunk_training_loss(
+            full_day_log_utility,
+            real_days=real_days,
+            global_real_days=(
+                real_days if global_real_days is None else global_real_days
+            ),
+            decisions_per_day=len(decisions),
+            gradient_world_size=gradient_world_size,
+        )
+        check_finite_loss = (
+            device.type != "cuda"
+            or int(config.training.finite_check_interval_steps) > 0
+        )
+        if check_finite_loss and not torch.isfinite(loss):
+            raise RuntimeError(f"non-finite tw_minute full-day loss: {loss}")
+        backward_started = time.perf_counter()
+        scaler.scale(loss).backward()
+        timing.backward_s += time.perf_counter() - backward_started
+
+    full_day_sync_context.__exit__(None, None, None)
+    if deferred_ddp_sync:
+        # ``no_sync`` intentionally bypassed the reducer for all policy
+        # forwards participating in this one full-session graph. Restore the
+        # next-forward buffer contract and perform exactly one bucketized
+        # averaged-gradient synchronization before clipping/stepping.
+        if hasattr(model, "require_forward_param_sync"):
+            model.require_forward_param_sync = True
+        reduce_started = time.perf_counter()
+        _all_reduce_full_day_gradients(
+            model,
+            bucket_cap_mb=int(config.training.ddp_bucket_cap_mb),
+        )
+        timing.backward_s += time.perf_counter() - reduce_started
 
     if training:
         step_started = time.perf_counter()
@@ -1075,7 +1462,13 @@ def _run_day_batch(
     benchmark_closes = cpu_fields["session_close"]
     benchmark_exit_mask = cpu_fields["session_exit_mask"]
     for day_index, trade_date in enumerate(trade_dates):
-        final_equity = float(metrics[0, day_index])
+        ledger_equity_scale = float(metrics[0, day_index])
+        log_return = float(metrics[1, day_index])
+        # The differentiable objective accumulates small direct P&L returns in
+        # normalized units. Convert to currency once in host Float64 so the
+        # report cannot reintroduce NT$10m FP32 cancellation.
+        net_return = float(math.expm1(log_return))
+        final_equity = float(execution_config.initial_equity) * (1.0 + net_return)
         benchmark_open = float(
             benchmark_opens[
                 day_index, first_execution_index, benchmark_symbol_index
@@ -1104,8 +1497,10 @@ def _run_day_batch(
                 "date": str(trade_date.astype("datetime64[D]")),
                 "initial_equity": execution_config.initial_equity,
                 "final_equity": final_equity,
-                "net_return": final_equity / execution_config.initial_equity - 1.0,
-                "log_return": float(metrics[1, day_index]),
+                "net_return": net_return,
+                "log_return": log_return,
+                "ledger_equity_scale": ledger_equity_scale,
+                "ledger_equity_gap": ledger_equity_scale - (1.0 + net_return),
                 "benchmark_log_return": benchmark_log_return,
                 "benchmark_available": float(math.isfinite(benchmark_log_return)),
                 "turnover_notional": float(metrics[2, day_index]),
@@ -1328,7 +1723,10 @@ def _run_split(
     dataset: MinuteDatasetIndex,
     normalizer: MinuteFeatureNormalizer,
     model: nn.Module,
-    model_forward: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], Any],
+    model_forward: Callable[
+        [torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], Any
+    ],
+    daily_context_forward: Callable[[torch.Tensor], torch.Tensor] | None = None,
     execution_forward: Callable[..., tuple[torch.Tensor, ...]],
     day_cache: _MinuteDayCache,
     config: ExperimentConfig,
@@ -1409,6 +1807,7 @@ def _run_split(
             batch_rows, batch_close_weights, batch_timing = _run_day_batch(
                 model=model,
                 model_forward=model_forward,
+                daily_context_forward=daily_context_forward,
                 execution_forward=execution_forward,
                 days=days,
                 host_batch=host_batch,
@@ -1655,6 +2054,11 @@ def _run_minute_training_impl(
     short_rule_path = (
         config.data.tw_public_feature_path if require_short_rules else None
     )
+    daily_context_feature_names = (
+        minute_static_daily_context_feature_names(config.data.feature_include)
+        if config.data.minute_daily_context_panel_meta is not None
+        else ()
+    )
     rank0_verifies = distributed_requested and _distributed_world_size() > 1
     if not rank0_verifies or _distributed_is_rank0():
         try:
@@ -1667,6 +2071,15 @@ def _run_minute_training_impl(
                 progress=_progress,
                 short_rule_path=short_rule_path,
                 require_short_rules=require_short_rules,
+                daily_context_panel_meta=(
+                    config.data.minute_daily_context_panel_meta
+                ),
+                daily_context_feature_names=(
+                    daily_context_feature_names
+                ),
+                daily_context_lookback=int(
+                    config.training.financial_transformer.daily_context_lookback
+                ),
             )
         except BaseException as exc:
             dataset_error = exc
@@ -1680,6 +2093,15 @@ def _run_minute_training_impl(
                 progress=None,
                 short_rule_path=short_rule_path,
                 require_short_rules=require_short_rules,
+                daily_context_panel_meta=(
+                    config.data.minute_daily_context_panel_meta
+                ),
+                daily_context_feature_names=(
+                    daily_context_feature_names
+                ),
+                daily_context_lookback=int(
+                    config.training.financial_transformer.daily_context_lookback
+                ),
             )
         except BaseException as exc:
             dataset_error = exc
@@ -1798,12 +2220,43 @@ def _run_minute_training_impl(
             "contract_unavailable_symbols": dataset.manifest.get(
                 "contract_unavailable_symbols", 0
             ),
+            "minute_feature_count": len(MINUTE_FEATURE_COLUMNS),
+            "minute_microstructure_feature_count": len(
+                MINUTE_MICROSTRUCTURE_FEATURE_COLUMNS
+            ),
+            "minute_developing_candle_feature_count": len(
+                MINUTE_DEVELOPING_CANDLE_FEATURE_COLUMNS
+            ),
+            "daily_context_feature_count": (
+                0
+                if dataset.daily_feature_context is None
+                else dataset.daily_feature_context.num_features
+            ),
+            "daily_context_lookback": int(dataset.daily_context_lookback),
         },
         configuration=asdict(config),
         mode_details={
             "dataset_decision_clock": dataset.manifest["decision_clock"],
             "dataset_execution_clock": dataset.manifest["execution_clock"],
             "benchmark_name": benchmark_name,
+            "minute_feature_names": list(MINUTE_FEATURE_COLUMNS),
+            "minute_microstructure_feature_names": list(
+                MINUTE_MICROSTRUCTURE_FEATURE_COLUMNS
+            ),
+            "minute_developing_candle_feature_names": list(
+                MINUTE_DEVELOPING_CANDLE_FEATURE_COLUMNS
+            ),
+            "daily_context_contract": (
+                None
+                if dataset.daily_feature_context is None
+                else MINUTE_DAILY_CONTEXT_CONTRACT
+            ),
+            "daily_context_feature_names": (
+                []
+                if dataset.daily_feature_context is None
+                else list(dataset.daily_feature_context.feature_names)
+            ),
+            "daily_context_lookback": int(dataset.daily_context_lookback),
         },
         compatibility_manifest_paths=[root / "minute_run_manifest.json"],
     )
@@ -1883,6 +2336,11 @@ def _run_minute_training_impl(
             num_features=len(MINUTE_FEATURE_COLUMNS),
             num_symbols=dataset.num_symbols,
             feature_names=MINUTE_FEATURE_COLUMNS,
+            daily_context_feature_names=(
+                None
+                if dataset.daily_feature_context is None
+                else dataset.daily_feature_context.feature_names
+            ),
         ).to(device)
         frozen_inactive_parameters = _freeze_inactive_minute_parameters(model)
         if frozen_inactive_parameters:
@@ -1965,10 +2423,36 @@ def _run_minute_training_impl(
             raise RuntimeError(
                 "tw_minute requires a model with forward_from_batched_panel_slabs"
             )
+        if dataset.daily_feature_context is not None and not hasattr(
+            model, "forward_from_batched_panel_slabs_with_daily_context"
+        ):
+            raise RuntimeError(
+                "tw_minute daily context requires a model with separate "
+                "daily-context projection"
+            )
+        preencode_daily_context = bool(
+            dataset.daily_feature_context is not None
+            and config.training.minute_full_day_credit_assignment
+        )
         slab_forward_module: nn.Module = _MinuteSlabForwardAdapter(
             model,
             execution_config,
+            daily_context_is_encoded=preencode_daily_context,
         ).to(device)
+
+        class _DailyContextForwardAdapter(nn.Module):
+            def __init__(self, inner_model: nn.Module) -> None:
+                super().__init__()
+                self.inner_model = inner_model
+
+            def forward(self, features: torch.Tensor) -> torch.Tensor:
+                return self.inner_model.encode_daily_context_history(features)
+
+        daily_context_forward_module: nn.Module | None = (
+            _DailyContextForwardAdapter(model).to(device)
+            if preencode_daily_context
+            else None
+        )
 
         def eager_execution_forward(
             cash: torch.Tensor,
@@ -2000,6 +2484,12 @@ def _run_minute_training_impl(
                 buy_fee_rates=buy_rates,
                 sell_fee_rates=sell_rates,
                 config=execution_config,
+                stateful_proximal_allocator=bool(
+                    config.training.minute_stateful_proximal_allocator
+                ),
+                proximal_cost_multiplier=float(
+                    config.training.minute_proximal_cost_multiplier
+                ),
             )
 
         execution_forward: Callable[..., tuple[torch.Tensor, ...]] = (
@@ -2030,6 +2520,16 @@ def _run_minute_training_impl(
                             cudagraphs=False,
                         ),
                     )
+                    if daily_context_forward_module is not None:
+                        daily_context_forward_module = torch.compile(
+                            daily_context_forward_module,
+                            fullgraph=True,
+                            dynamic=False,
+                            options=_torch_compile_options(
+                                compile_mode,
+                                cudagraphs=False,
+                            ),
+                        )
                     execution_forward = torch.compile(
                         eager_execution_forward,
                         fullgraph=True,
@@ -2040,7 +2540,7 @@ def _run_minute_training_impl(
                         ),
                     )
                     model_compile_status = (
-                        "enabled:fullgraph:fixed_shape:model+minute_ledger"
+                        "enabled:fullgraph:fixed_shape:model+daily_context+minute_ledger"
                     )
                     _progress(
                         f"[Train {train_years}] torch.compile enabled "
@@ -2071,12 +2571,11 @@ def _run_minute_training_impl(
             )
             model_compile_status += ":ddp"
 
-        def model_forward(
-            feature_slabs: torch.Tensor,
-            mask: torch.Tensor,
-            shortable_mask: torch.Tensor,
-        ) -> Any:
-            return slab_forward_module(feature_slabs, mask, shortable_mask)
+        model_forward: Callable[..., Any] = slab_forward_module
+        def daily_context_forward(features: torch.Tensor) -> torch.Tensor:
+            if daily_context_forward_module is None:
+                raise RuntimeError("tw_minute daily-context encoder is unavailable")
+            return daily_context_forward_module(features)
 
         runtime_model = slab_forward_module
         pre_epoch_timing.checkpoint(
@@ -2187,6 +2686,11 @@ def _run_minute_training_impl(
                     normalizer=normalizer,
                     model=runtime_model,
                     model_forward=model_forward,
+                    daily_context_forward=(
+                        daily_context_forward
+                        if daily_context_forward_module is not None
+                        else None
+                    ),
                     execution_forward=execution_forward,
                     day_cache=day_cache,
                     config=config,
@@ -2236,6 +2740,11 @@ def _run_minute_training_impl(
                         normalizer=normalizer,
                         model=runtime_model,
                         model_forward=model_forward,
+                        daily_context_forward=(
+                            daily_context_forward
+                            if daily_context_forward_module is not None
+                            else None
+                        ),
                         execution_forward=execution_forward,
                         day_cache=day_cache,
                         config=config,
@@ -2297,6 +2806,11 @@ def _run_minute_training_impl(
                         normalizer=normalizer,
                         model=runtime_model,
                         model_forward=model_forward,
+                        daily_context_forward=(
+                            daily_context_forward
+                            if daily_context_forward_module is not None
+                            else None
+                        ),
                         execution_forward=execution_forward,
                         day_cache=day_cache,
                         config=config,
@@ -2527,6 +3041,11 @@ def _run_minute_training_impl(
             normalizer=checkpoint_normalizer,
             model=runtime_model,
             model_forward=model_forward,
+            daily_context_forward=(
+                daily_context_forward
+                if daily_context_forward_module is not None
+                else None
+            ),
             execution_forward=execution_forward,
             day_cache=day_cache,
             config=config,
@@ -2552,6 +3071,11 @@ def _run_minute_training_impl(
             normalizer=checkpoint_normalizer,
             model=runtime_model,
             model_forward=model_forward,
+            daily_context_forward=(
+                daily_context_forward
+                if daily_context_forward_module is not None
+                else None
+            ),
             execution_forward=execution_forward,
             day_cache=day_cache,
             config=config,

@@ -166,6 +166,7 @@ def build_model(
     num_features: int,
     num_symbols: int,
     feature_names: Sequence[str] | None = None,
+    daily_context_feature_names: Sequence[str] | None = None,
 ) -> nn.Module:
     model_name = _normalized_model_name(config.training.model_name)
 
@@ -498,6 +499,16 @@ def build_model(
             categorical_embedding_dim=fin_cfg.categorical_embedding_dim,
             categorical_embedding_cardinality=fin_cfg.categorical_embedding_cardinality,
             candle_dropout=fin_cfg.candle_dropout,
+            daily_context_num_features=len(daily_context_feature_names or ()),
+            daily_context_categorical_feature_indices=(
+                _feature_indices_from_patterns(
+                    daily_context_feature_names,
+                    fin_cfg.categorical_feature_names,
+                )
+            ),
+            daily_context_lookback=fin_cfg.daily_context_lookback,
+            daily_context_layers=fin_cfg.daily_context_layers,
+            daily_context_pooling=fin_cfg.daily_context_pooling,
             execution_mode=getattr(config.trading, "execution_mode", "naive"),
         )
 

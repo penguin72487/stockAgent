@@ -8139,8 +8139,6 @@ def _save_fold_output_artifacts(
     stage_start = time.perf_counter()
     report = generate_annual_report(test_backtest, test_dates)
     save_timing["annual_report_compute_s"] = float(time.perf_counter() - stage_start)
-    if print_report:
-        print("\n" + report)
     stage_start = time.perf_counter()
     with (fold_dir / "annual_report.txt").open("w", encoding="utf-8") as f:
         f.write(report)
@@ -8298,6 +8296,14 @@ def _save_fold_output_artifacts(
     )
     if mark_complete:
         _write_fold_complete_marker(fold_dir, fold_result, source="fold_output_artifacts")
+    if print_report:
+        # Console output is optional and must not invalidate completed model,
+        # backtest, plot, or lifecycle artifacts when a detached terminal or
+        # orchestration pipe disappears during long-running training.
+        try:
+            print("\n" + report)
+        except BrokenPipeError:
+            pass
     return save_timing, plot_timing
 
 
