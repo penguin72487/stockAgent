@@ -14,7 +14,8 @@ def test_guide_lists_all_three_tw_execution_modes() -> None:
 
     assert "`tw` 舊版 Naive" in guide
     assert "`tw_cash` 現股/T+2" in guide
-    assert "`tw_day_trade` 現股當沖" in guide
+    assert "`tw_day_trade` 現股當沖（初始 1,000 萬）" in guide
+    assert "`tw_day_trade_100m` 現股當沖（初始 1 億）" in guide
 
 
 def test_discord_page_size_and_top_n_floor_to_ten() -> None:
