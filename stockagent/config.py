@@ -1018,6 +1018,10 @@ class TransformerBasePortfolioModelConfig:
     temporal_ffn_mult: int = 2
     temporal_pooling: str = "attention"
     temporal_query_mode: str = "full_then_last"
+    temporal_basis_families: list[str] = field(default_factory=list)
+    temporal_basis_components: int = 8
+    temporal_basis_dropout: float = 0.0
+    temporal_basis_gate_init: float = -2.0
     cross_layers: int = 1
     cross_heads: int = 4
     cross_ffn_mult: int = 2
@@ -1874,6 +1878,13 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         transformer_base_portfolio.get("categorical_feature_names"),
         field_name="training.transformer_base_portfolio.categorical_feature_names",
     )
+    transformer_base_portfolio["temporal_basis_families"] = _normalize_string_list(
+        transformer_base_portfolio.get("temporal_basis_families"),
+        field_name="training.transformer_base_portfolio.temporal_basis_families",
+    )
+    transformer_base_portfolio["temporal_basis_components"] = max(
+        1, int(transformer_base_portfolio["temporal_basis_components"])
+    )
     transformer_base_portfolio["categorical_embedding_dim"] = max(
         1, int(transformer_base_portfolio["categorical_embedding_dim"])
     )
@@ -1896,6 +1907,13 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     financial_transformer["categorical_feature_names"] = _normalize_string_list(
         financial_transformer.get("categorical_feature_names"),
         field_name="training.financial_transformer.categorical_feature_names",
+    )
+    financial_transformer["temporal_basis_families"] = _normalize_string_list(
+        financial_transformer.get("temporal_basis_families"),
+        field_name="training.financial_transformer.temporal_basis_families",
+    )
+    financial_transformer["temporal_basis_components"] = max(
+        1, int(financial_transformer["temporal_basis_components"])
     )
     financial_transformer["categorical_embedding_dim"] = max(
         1, int(financial_transformer["categorical_embedding_dim"])

@@ -55,6 +55,7 @@ from stockagent.training.trainer import (
     FoldResult,
     _EpochCurveLifecycle,
     _PreEpochTimingRecorder,
+    _configuration_fingerprint_snapshot,
     _autocast_context,
     _can_enable_torch_compile,
     _create_adamw_optimizer,
@@ -103,7 +104,7 @@ def _execution_contract_version(config: ExperimentConfig) -> int:
 
 
 def _tick_configuration_fingerprint(config: ExperimentConfig) -> str:
-    return _stable_fingerprint(asdict(config))
+    return _stable_fingerprint(_configuration_fingerprint_snapshot(config))
 
 
 def _tick_artifact_contract(
