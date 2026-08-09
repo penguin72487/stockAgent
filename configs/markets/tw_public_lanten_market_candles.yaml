@@ -3,7 +3,7 @@ experiment_name: tw-financial-transformer-candles-snapshot-safe99-open-aware-gro
 runner:
   # The causal current-open channel creates a 99-slot schema and therefore a
   # fresh checkpoint root, incompatible with the earlier 98-slot model.
-  output_dir: artifacts/markets/tw_public_candles_tw_cash_lookback32
+  output_dir: artifacts/markets/tw_public_candles_tw_day_trade_lookback32
   mode: train
   # Keep all older artifacts for audit, but never resume their optimizer state
   # into this fresh root. Later interruptions within this 99-slot run remain
@@ -249,7 +249,7 @@ trading:
   # The receipt-verified MOPS entitlement archive is incomplete, and avoid-mode
   # mandatory covers are not executable on every historical action date. Use
   # the research-only executor instead of fabricating exact cash entitlements.
-  execution_mode: tw_cash
+  execution_mode: tw_day_trade
   tw_corporate_action_mode: avoid
   tw_short_capacity_limit_enabled: false
   tw_corporate_action_claim_queue_sessions: 256
@@ -257,7 +257,7 @@ trading:
   sell_fee_rate: 0.003291
   max_turnover_ratio: 0.0
   max_volume_participation: 0.5
-  volume_participation_equity: 1000000.0
+  volume_participation_equity: 10000000.0
   reporting_leverage: 1.0
   min_trade_weight: 0.0
   portfolio_activation: pre_normalized
@@ -276,7 +276,7 @@ training:
     # single 32-dimensional candle vector.
     d_model: 32
     candle_dropout: 0.0
-    # sum(abs(long and short weights)) = 1 for every nonzero portfolio row.
+    # Project onto sum(abs(long and short weights)) <= 1; unused gross is cash.
     portfolio_output_mode: l1
   non_blocking_transfer: true
   model_name: financial_transformer
@@ -342,8 +342,8 @@ training:
   # 99-feature schema changes.
   batch_size_train: 128
   batch_size_eval: 128
-  epochs: 1000
-  early_stopping_no_improve_ratio: 0.1
+  epochs: 100
+  early_stopping_no_improve_ratio: 1
   val_interval_epochs: 1
   curve_test_interval: 1
   record_epoch_curve: true

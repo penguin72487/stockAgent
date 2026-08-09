@@ -1,6 +1,8 @@
-# OFAT ablation matrix for the open-aware TW day-trade long/short model.
+# Unified OFAT ablation matrix for the open-aware TW day-trade long/short
+# model. Architecture variants hold projection-L1 fixed; the final dimension
+# deliberately varies the portfolio output contract.
 base_config: configs/markets/tw_public_lanten_market_candles.yaml
-output_root: artifacts/ablations/financial_transformer_tw_day_trade_long_short_candles_baseline
+output_root: artifacts/ablations/financial_transformer_tw_day_trade_long_short_candles_projection_l1
 expected_fold_count: 12
 
 runtime:
@@ -25,6 +27,16 @@ matrix:
       # train.py already reloads the best checkpoint and writes complete fold
       # metrics/artifacts; a second post-train inference pass is redundant.
       post_train_infer: false
+    trading:
+      # Baseline post-processing for model outputs that already satisfy the
+      # signed gross-exposure contract.
+      portfolio_activation: pre_normalized
+    training:
+      loss_portfolio_activation: pre_normalized
+      financial_transformer:
+        # Every architecture/sequence variant inherits projection-L1. Only
+        # the explicit portfolio_output_mode dimension below overrides it.
+        portfolio_output_mode: projection_l1
 
   dimensions:
     - name: lookback_batch
@@ -32,12 +44,12 @@ matrix:
       paths: [training.lookback, training.batch_size_train]
       baseline: [32, 128]
       values:
-        - name: lookback64_batch64
-          experiment_name: lookback64_batch64
-          value: [64, 64]
+        - name: lookback256_batch32
+          experiment_name: lookback256_batch32
+          value: [256, 32]
           overrides:
             training:
-              batch_size_eval: 64
+              batch_size_eval: 16
               eval_model_chunk_rows: 16
               eval_auto_chunk_rows_cap: 16
 
@@ -127,3 +139,65 @@ matrix:
       baseline: swiglu
       values:
         - {name: gelu, experiment_name: gelu_ffn, value: gelu}
+
+    - name: initial_capital
+      enabled: true
+      # This is the absolute-equity anchor used by the Taiwan integer audit
+      # and by the causal volume-participation weight cap. It is distinct from
+      # tw_short_initial_margin_rate, which remains the official margin ratio.
+      path: trading.volume_participation_equity
+      baseline: 1000000.0
+      values:
+        - name: 10m
+          experiment_name: initial_capital_10m
+          value: 10000000.0
+        - name: 100m
+          experiment_name: initial_capital_100m
+          value: 100000000.0
+
+    - name: portfolio_output_mode
+      enabled: true
+      baseline: projection_l1
+      variants:
+        - name: activation_l1
+          experiment_name: output_activation_l1
+          overrides:
+            trading:
+              portfolio_activation: identity
+            training:
+              loss_portfolio_activation: identity
+              financial_transformer:
+                portfolio_output_mode: activation_l1
+        - name: l1
+          experiment_name: output_l1
+          overrides:
+            training:
+              financial_transformer:
+                portfolio_output_mode: l1
+        - name: logits
+          experiment_name: output_logits
+          overrides:
+            trading:
+              portfolio_activation: identity
+            training:
+              loss_portfolio_activation: identity
+              financial_transformer:
+                portfolio_output_mode: logits
+        - name: signed_softmax
+          experiment_name: output_signed_softmax
+          overrides:
+            training:
+              financial_transformer:
+                portfolio_output_mode: signed_softmax
+        - name: signed_entmax15
+          experiment_name: output_signed_entmax15
+          overrides:
+            training:
+              financial_transformer:
+                portfolio_output_mode: signed_entmax15
+        - name: signed_sparsemax
+          experiment_name: output_signed_sparsemax
+          overrides:
+            training:
+              financial_transformer:
+                portfolio_output_mode: signed_sparsemax

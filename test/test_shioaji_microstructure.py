@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import subprocess
+import sys
 from datetime import date, datetime, time
 from decimal import Decimal
 from pathlib import Path
@@ -12,8 +14,29 @@ from downloader.stream_shioaji_tw_microstructure import (
     BOOK_SCHEMA,
     PartWriter,
     normalize_book,
+    normalize_fop_book,
+    normalize_fop_tick,
     normalize_tick,
 )
+from downloader.stream_shioaji_taifex_bidask import select_option_strip
+
+
+def test_taifex_capture_module_cli_imports_from_repo_root() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "downloader.stream_shioaji_taifex_bidask",
+            "--help",
+        ],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "Capture TX front-month" in completed.stdout
 
 
 class Payload:
@@ -125,6 +148,84 @@ def test_tick_and_book_normalization_preserve_event_and_receive_time() -> None:
     assert book["bid_price_1"] == 1001.0
     assert book["ask_volume_2"] == 4
     assert book["bid_price_5"] is None
+
+
+def test_fop_normalization_derives_trade_date_and_preserves_five_levels() -> None:
+    event_dt = datetime(2026, 8, 7, 8, 45, 1, 123456)
+    tick = normalize_fop_tick(
+        Payload(
+            {
+                "code": "TXFH6",
+                "datetime": event_dt,
+                "open": Decimal("20000"),
+                "close": Decimal("20001"),
+                "high": Decimal("20002"),
+                "low": Decimal("19999"),
+                "volume": 2,
+                "total_volume": 10,
+                "underlying_price": Decimal("20001"),
+            }
+        ),
+        event_seq=1,
+        worker_index=0,
+        receive_ts_ns=100,
+        receive_monotonic_ns=200,
+    )
+    book = normalize_fop_book(
+        Payload(
+            {
+                "code": "TX1H6",
+                "datetime": event_dt,
+                "bid_price": [100, 99, 98, 97, 96],
+                "bid_volume": [1, 2, 3, 4, 5],
+                "ask_price": [101, 102, 103, 104, 105],
+                "ask_volume": [6, 7, 8, 9, 10],
+            }
+        ),
+        event_seq=2,
+        worker_index=0,
+        receive_ts_ns=101,
+        receive_monotonic_ns=201,
+    )
+    assert tick["trade_date"] == date(2026, 8, 7)
+    assert tick["close"] == 20001.0
+    assert book["trade_date"] == date(2026, 8, 7)
+    assert book["bid_price_1"] == 100.0
+    assert book["ask_volume_5"] == 10
+
+
+def test_option_strip_is_paired_bounded_and_nearest_atm() -> None:
+    class Base:
+        def __init__(self, code: str) -> None:
+            self.code = code
+
+    class Info:
+        def __init__(self, expiry: date, strike: float, right: str) -> None:
+            self.delivery_date = expiry
+            self.last_trading_date = expiry
+            self.strike_price = strike
+            self.option_right = right
+            self.base = Base(f"{expiry:%m%d}-{strike:.0f}-{right}")
+
+    infos = [
+        Info(expiry, strike, right)
+        for expiry in (date(2026, 8, 7), date(2026, 8, 12), date(2026, 8, 19))
+        for strike in (19_900.0, 20_000.0, 20_100.0)
+        for right in ("C", "P")
+    ]
+    selected = select_option_strip(
+        infos,
+        trade_date=date(2026, 8, 6),
+        underlying_reference=20_030.0,
+        expiry_count=2,
+        strikes_per_expiry=2,
+    )
+    assert len(selected) == 8
+    assert {item.delivery_date for item in selected} == {
+        date(2026, 8, 7),
+        date(2026, 8, 12),
+    }
+    assert {item.strike_price for item in selected} == {20_000.0, 20_100.0}
 
 
 def test_part_writer_uses_atomic_partitioned_parquet(tmp_path: Path) -> None:

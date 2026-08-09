@@ -1,0 +1,18 @@
+# Call/Put buyer-only policy. Everything except execution policy and model
+# family is inherited from the shared completed-second derivative config.
+base_config: tw_index_derivatives_tick.yaml
+
+experiment_name: tw-index-options-completed-second-long-v1
+
+runner:
+  output_dir: artifacts/markets/tw_index_options_tick_long
+
+trading:
+  execution_mode: tw_index_options_tick_long
+  long_only: true
+
+training:
+  model_name: transformer_base_portfolio
+  lookback: 16
+  transformer_base_portfolio:
+    portfolio_mode: long_only

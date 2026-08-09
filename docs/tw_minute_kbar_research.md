@@ -7,15 +7,9 @@
 ## 研究範圍
 
 Universe 取自 `data_tw_public/stocks/symbols.csv`，只保留 `stock` 與
-`etf`。2026-07-27 的固定輸入快照為：
-
-| 類別 | 檔數 |
-|---|---:|
-| 股票 | 2,322 |
-| ETF | 416 |
-| 合計 | 2,738 |
-| TWSE | 1,513 |
-| TPEx | 1,225 |
+`etf`。2026-07-27 的最新封存目標共有 2,744 檔；其中永豐歷史 KBar
+可用來源 2,620 檔，Contract V2 明確不存在 124 檔。不存在的合約仍保留在
+全市場母體統計，但交易 mask 永遠為 false，不會補造價格。
 
 「全市場」代表每天所有可用股票與 ETF 都是橫斷面候選標的，不代表策略必須
 同時持有 2,738 檔。基線會從全市場依已完成 K 棒的分數選出前 `top_n` 檔，
@@ -95,10 +89,13 @@ data_tw_minute/shioaji_1m/
 已完成資料。最後建研究資料集時會再驗證每個輸入檔 SHA-256。
 
 Contract V2 登入後只載入 `region=TW, security_type=STK` 的 Base contract map，
-不跨類型掃描指數、期貨、選擇權與權證。Shioaji 的舊資料偶爾含有 OHLCV 與
-Amount 全為 0 的佔位 K 棒；分鐘下載器只移除「所有欄位同時為 0」的列，並在
-receipt 記錄 `zero_placeholder_rows_dropped`。部分為 0 或其他不一致仍會
-fail-closed。
+不跨類型掃描指數、期貨、選擇權與權證。下載器會依公開 point-in-time
+正成交量交易日排除生命週期外資料，並稽核移除全零占位列、任一負 Volume／
+Amount 的歷史修正列及盤外批次列；各類數量都寫入 receipt。其餘價格不一致、
+重複 timestamp 或無法解釋的資料仍 fail-closed，絕不任選重複列或補值。
+
+全市場下載使用 5 個獨立登入程序，但共用帳號級滑動視窗 limiter；需求起始率
+上限固定為永豐文件的 50 requests / 5 seconds，也就是 10 req/s。
 
 完整 2020-03-02 至 2026-07-27 快照共有 221,778 個 receipt 分塊。公開
 point-in-time panel 顯示其中 54,348 塊沒有任何正成交量交易日，會寫入有
@@ -138,6 +135,8 @@ source scripts/runtime_env.sh
 run_fintech_python scripts/build_shioaji_tw_minute_dataset.py
 run_fintech_python scripts/audit_shioaji_tw_minute_dataset.py \
   --trade-date YYYY-MM-DD
+run_fintech_python scripts/audit_shioaji_tw_minute_dataset.py \
+  --all-partitions
 ```
 
 輸出依交易日分區：
@@ -152,6 +151,103 @@ data_tw_minute/research_dataset/
 模型欄位只有已完成 K 棒能知道的報酬、缺口、振幅、收盤位置、相對量、實現
 波動與日內時間特徵。稽核會拒絕重複 key、盤外時間、日期錯置、跨缺口的一分鐘
 標籤、executor-only 欄位外漏，以及無效標籤仍帶未來價格的資料列。
+
+Shioaji 歷史股票 KBar 的 `Volume` 並非全期間固定單位：多數列以交易單位回傳，
+部分新上市期間直接回傳股數，特殊 ETF 也可能使用 100 股或個別 1,000 股倍率。
+schema-3 會以同列 `Amount` 是否落在 OHLC 可成交金額範圍內，從
+`1/10/100/1000/contract_unit` 唯一判定 `source_volume_multiplier`，再產生
+`volume_shares`。無法可信判定的列保留價格但成交容量 fail-closed，不會放大成交。
+
+schema-3 manifest 只有在 2,744 檔全部被歸類成 available-source 或
+`contract_unavailable`，且 failed／partial 都為 0 時才會標成
+`research_ready`。已重試仍由永豐缺資料的日期保留為 source-gap mask；允許研究
+使用可取得來源，不代表宣稱永豐對每一檔每一天都有完整歷史。
+
+## 神經網路 walk-forward 訓練
+
+一分鐘模式沿用 `train.py`、年度 expanding walk-forward、BF16 AMP、
+Transformer model factory、AdamW、scheduler、early stopping、resume、
+`checkpoint_best.pt`、`epoch_curve.jsonl` 與 validation/test artifacts：
+
+```bash
+source scripts/runtime_env.sh
+run_fintech_python train.py \
+  --config configs/markets/tw_minute.yaml \
+  --start-fold 1
+```
+
+這台雙 RTX 5090 主機使用單 fold 內 DDP；`batch_size_train/eval` 是兩張卡合計的
+全域交易日數，並非每張卡各自的數量：
+
+```bash
+bash scripts/run_tw_minute_dual_5090.sh \
+  --start-fold 1
+```
+
+launcher 會把 rank 0/1 分別綁到 GPU 0/1 鄰近的 NUMA CPU，輸出獨立寫到
+`artifacts/markets/tw_minute_dual_5090_developing99_raw_v7`。這份設定以
+`tw_public_lanten_market_candles.yaml` 為母設定，保留其 FinancialTransformer、
+BF16、optimizer、1000 epochs、early stopping 與 scanner 設定，只覆寫分鐘資料／
+executor 契約及雙卡容量。每個全域 batch 仍保持日期順序，交易日
+才在 rank 間切分；各 rank 會跑完自己交易日內的 270 分鐘狀態帳本，再以 DDP
+同步梯度。因此這不是「一張 GPU 跑一個 fold」。
+
+交易規則直接沿用一般台股當沖基準，只把決策頻率改成一分鐘：初始本金 1,000 萬、
+raw signed score 經 gross-L1 1.0 正規化且不做 de-mean、
+每根 KBar 最多參與 50% 成交量、使用正常手續費與當沖稅，且不加額外滑價、單筆
+金額上限、單一標的權重上限或 outside-cash logit。再套逐日精確放空資格、
+前一資料 session 的官方放空容量及成交限制；被擋掉或未成交的部位保留為 cash，
+不會重新分配到其他股票。這些遮罩是可執行性契約，不是壓力測試。
+
+模型每個 completed minute 都會看到 25 個動態欄位：10 個一分鐘微結構欄位，加上
+15 個由「截至當下」session open、累積 high/low/volume 與最新 close 重算的純 K 線
+欄位。其餘 84 個 point-in-time 日級欄位只投影一次，但會融合到每個分鐘 token；
+因此完整保留母設定的 99 個 feature，且任何分鐘都不會讀到當日未發生的收盤或總量。
+
+雙 RTX 5090 的完整 epoch-2 吞吐掃描採 2 的冪次容量。原始 fold 1 有 456 個
+train sessions，所以 nominal batch 64 被均分成八批、實際每批只有 57 天；它沒有
+測到 64 天的完整容量。fold 2 首次形成完整 batch 時，每 rank 的
+`32 days * chunk 16 = 512` compiled rows 會在 30.46 GiB 後再要求 226 MiB 而 OOM。
+目前保留全域 `batch_size_train: 64`、`batch_size_eval: 16` 與 train/eval chunk
+`16`。BF16 模型改用 `amp_native_position_add: true`，將小型 position tensor 轉成
+activation dtype，避免把完整 `[B,L,S,D]` candle residual 升回 FP32；因此不必增加
+日內 chunks 或改變 optimizer-step schedule。另啟用已通過 fullgraph 測試的
+`checkpoint_blocks: true`，在 backward 重算 Transformer block 內部活化，替固定圖
+與 Triton autotune workspace 保留顯存。fold 2 的完整單 epoch compiled smoke 已跑完
+train、validation、first-test-year audit 與最終 validation/test；steady training 約用
+31.0 GiB/卡並保留約 1.11 GiB，group 結束後 reserved 由 29.47 GiB 降至 0.07 GiB。
+`batch=128/chunk=8` 沒有更快且把每卡顯存推到約 31.5/32.6 GiB，故不採用。
+
+這份執行器是真正的 signed long/short 帳本，不會把負權重截成零。空方權限不從
+當代名單或普通 `tradable_mask` 猜測：啟動時從
+`data_tw_public/features/tw_public_stock_daily.parquet` 一次讀取當日精確的可當沖／
+可先賣旗標，再把官方收盤後融券證據與容量嚴格位移到下一個資料集交易日；缺列、
+缺日、零容量都 fail closed。結果只保存緊湊的 `[day,symbol]` bool/int64 sidecar，
+不把同一個日規則複製到 270 根分鐘列。
+
+熱路徑不再每個 epoch 對每批重做多次 `np.stack`，而是依確定性的 chronological
+batch plan 快取最終 host tensors；每個 optimizer batch 的多個 recurrent chunks
+也只在最後一次 backward 做一次 DDP all-reduce。關閉的 `symbol_position` 會從
+分鐘 optimizer/DDP bookkeeping 凍結，但仍保留在 state dict。scanner-free CUDA
+模式不會在每個 chunk 為 scalar finite check 強制同步，成交數學本身則維持有限與
+有界。
+
+同機 fold 1 的完整 epoch 2（456 train sessions＋246 validation sessions）實測由
+舊版 27.260 秒降為 24.061 秒，約快 11.7%；其中 train 20.798 秒、validation
+3.262 秒。這是舊 FP32 position-add 在 fold 1 未滿 batch 下的 steady-state 參考，
+不是 v2 的跨 fold 容量證據；第一個 epoch的 compile／autotune 冷啟動也不納入
+預設選擇。
+
+每個 epoch 完成後，rank 0 會在背景更新
+`train_YYYY-YYYY/epoch_curve_every1.png` 與
+`train_YYYY-YYYY/epoch_timing_every1.png`；直接開著圖片即可一邊訓練一邊查看，
+不會等全部 epochs 結束才繪圖。
+
+`execution_mode: tw_minute` 會在 daily panel 建置前分流到專用逐日 streaming
+loader；它不會借用 `tw_day_trade` 的每日 open-to-close 標籤。每個交易日展開成
+固定 270 分鐘的稀疏全市場 panel，模型每根完成 K 棒輸出一次目標，executor
+只交易目標差額。正規化平均與變異數由該 fold 的 train 年份分區統計聚合，
+validation/test 不參與。13:29 只能減倉，13:30 強制歸零。
 
 ## 透明策略與時間序列驗證
 
@@ -188,5 +284,5 @@ pilot 有 70,654 個原始列，每個策略產生 35,245 次分鐘決策；五�
 - 日終平倉超過觀察成交量容量或使用過時最後價格的金額會獨立報告，不會隱藏。
 - Shioaji 現有 contracts 可能不包含歷史下市標的；缺少合約會被明確記成
   `contract_unavailable`，因此研究仍需揭露可能的存活者偏誤。
-- 目前 pilot 只有 0050、2330，足以驗證資料、成本與因果契約，不足以評估
-  全市場 alpha；完整回補結束前不得把 pilot 報酬解讀為投資結論。
+- `contract_unavailable` 與已稽核 source gap 仍造成歷史覆蓋差異；報告必須保留
+  這些數量，不能把 available-source 回測寫成無缺口的全市場真值。

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
-from datetime import date, datetime, time as datetime_time, timezone
+from datetime import datetime, time as datetime_time, timezone
 import hashlib
 import itertools
 import json
@@ -260,6 +260,96 @@ def normalize_book(
     return row
 
 
+def normalize_fop_tick(
+    tick: Any,
+    *,
+    event_seq: int,
+    worker_index: int,
+    receive_ts_ns: int,
+    receive_monotonic_ns: int,
+) -> dict[str, Any]:
+    """Normalize a futures/options tick into the shared immutable event schema."""
+
+    values = tick.to_dict()
+    event_datetime = values.get("datetime")
+    exchange_ts_ns = _exchange_ts_ns(event_datetime)
+    localized = (
+        event_datetime.replace(tzinfo=TAIPEI)
+        if event_datetime.tzinfo is None
+        else event_datetime.astimezone(TAIPEI)
+    )
+    row: dict[str, Any] = {
+        "event_seq": event_seq,
+        "worker_index": worker_index,
+        "exchange": "TAIFEX",
+        "code": str(values["code"]),
+        "trade_date": localized.date(),
+        "exchange_ts_ns": exchange_ts_ns,
+        "receive_ts_ns": receive_ts_ns,
+        "receive_monotonic_ns": receive_monotonic_ns,
+    }
+    for name in TICK_SCHEMA:
+        row.setdefault(name, None)
+    for name in ("open", "close", "high", "low"):
+        row[name] = _float(values.get(name))
+    for name in (
+        "volume",
+        "total_volume",
+        "bid_side_total_vol",
+        "ask_side_total_vol",
+    ):
+        row[name] = _int(values.get(name))
+    row["simtrade"] = bool(values.get("simtrade", False))
+    row["suspend"] = False
+    row["intraday_odd"] = False
+    return row
+
+
+def normalize_fop_book(
+    book: Any,
+    *,
+    event_seq: int,
+    worker_index: int,
+    receive_ts_ns: int,
+    receive_monotonic_ns: int,
+) -> dict[str, Any]:
+    """Normalize a TAIFEX five-level book while retaining receive time."""
+
+    values = book.to_dict()
+    event_datetime = values.get("datetime")
+    exchange_ts_ns = _exchange_ts_ns(event_datetime)
+    localized = (
+        event_datetime.replace(tzinfo=TAIPEI)
+        if event_datetime.tzinfo is None
+        else event_datetime.astimezone(TAIPEI)
+    )
+    row: dict[str, Any] = {
+        "event_seq": event_seq,
+        "worker_index": worker_index,
+        "exchange": "TAIFEX",
+        "code": str(values["code"]),
+        "trade_date": localized.date(),
+        "exchange_ts_ns": exchange_ts_ns,
+        "receive_ts_ns": receive_ts_ns,
+        "receive_monotonic_ns": receive_monotonic_ns,
+        "suspend": False,
+        "simtrade": bool(values.get("simtrade", False)),
+        "intraday_odd": False,
+    }
+    fields = {
+        "bid_price": _levels(values.get("bid_price"), numeric="float"),
+        "bid_volume": _levels(values.get("bid_volume"), numeric="int"),
+        "diff_bid_vol": [None] * 5,
+        "ask_price": _levels(values.get("ask_price"), numeric="float"),
+        "ask_volume": _levels(values.get("ask_volume"), numeric="int"),
+        "diff_ask_vol": [None] * 5,
+    }
+    for field, levels in fields.items():
+        for level, value in enumerate(levels, start=1):
+            row[f"{field}_{level}"] = value
+    return row
+
+
 class PartWriter:
     def __init__(
         self,
@@ -291,8 +381,10 @@ class PartWriter:
     def maybe_flush(self, *, force: bool = False) -> None:
         if not self.rows:
             return
-        if not force and len(self.rows) < self.flush_rows and (
-            time.monotonic() - self.last_flush < self.flush_seconds
+        if (
+            not force
+            and len(self.rows) < self.flush_rows
+            and (time.monotonic() - self.last_flush < self.flush_seconds)
         ):
             return
         by_partition: dict[tuple[str, str], list[dict[str, Any]]] = {}
@@ -303,7 +395,9 @@ class PartWriter:
             by_partition.setdefault(key, []).append(row)
         self.rows = []
         for (trade_date, hour), rows in sorted(by_partition.items()):
-            partition = self.root / self.kind / f"trade_date={trade_date}" / f"hour={hour}"
+            partition = (
+                self.root / self.kind / f"trade_date={trade_date}" / f"hour={hour}"
+            )
             partition.mkdir(parents=True, exist_ok=True)
             self.part_sequence += 1
             stamp = time.time_ns()
@@ -369,7 +463,9 @@ class EventSink:
         self.snapshot_writer = PartWriter(
             output_dir, "book_1s", BOOK_1S_SCHEMA, **options
         )
-        self.thread = threading.Thread(target=self._run, name="event-writer", daemon=False)
+        self.thread = threading.Thread(
+            target=self._run, name="event-writer", daemon=False
+        )
 
     def start(self) -> None:
         self.thread.start()
@@ -430,7 +526,9 @@ class EventSink:
             now_second = time.time_ns() // 1_000_000_000
             if now_second > current_second:
                 if now_second > current_second + 1:
-                    self.stats.missed_snapshot_seconds += now_second - current_second - 1
+                    self.stats.missed_snapshot_seconds += (
+                        now_second - current_second - 1
+                    )
                 current_second = now_second
                 self._emit_snapshots(current_second)
             if kind == "tick":
@@ -479,18 +577,24 @@ def main() -> None:
         raise ValueError(
             "capture-id may contain only ASCII letters, digits, dot, underscore, or dash"
         )
-    universe = pl.read_csv(
-        args.universe,
-        schema_overrides={"symbol": pl.String},
-        infer_schema_length=0,
-    ).with_columns(
-        pl.col("market_cap_rank").cast(pl.Int32, strict=True),
-        pl.col("symbol").cast(pl.String, strict=True),
-    ).sort("market_cap_rank")
+    universe = (
+        pl.read_csv(
+            args.universe,
+            schema_overrides={"symbol": pl.String},
+            infer_schema_length=0,
+        )
+        .with_columns(
+            pl.col("market_cap_rank").cast(pl.Int32, strict=True),
+            pl.col("symbol").cast(pl.String, strict=True),
+        )
+        .sort("market_cap_rank")
+    )
     universe_sha256 = hashlib.sha256(args.universe.read_bytes()).hexdigest()
     required = {"market_cap_rank", "symbol", "market"}
     if not required <= set(universe.columns):
-        raise ValueError(f"universe lacks columns: {sorted(required-set(universe.columns))}")
+        raise ValueError(
+            f"universe lacks columns: {sorted(required - set(universe.columns))}"
+        )
     selected = universe.filter(
         ((pl.col("market_cap_rank") - 1) % args.workers) == args.worker_index
     )
@@ -578,7 +682,9 @@ def main() -> None:
             contracts.append(contract)
     if missing:
         api.logout()
-        raise RuntimeError(f"top-market-cap symbols missing Shioaji contracts: {missing}")
+        raise RuntimeError(
+            f"top-market-cap symbols missing Shioaji contracts: {missing}"
+        )
     sink.start()
     subscribed = 0
     status = "running"

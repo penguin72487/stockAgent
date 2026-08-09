@@ -271,6 +271,14 @@ aligned.
 
 Guidelines:
 
+- The active dual-RTX-5090 `tw_minute` long/short contract copies the ordinary
+  TW day-trade trading rules and changes only decision frequency: L1 gross
+  exposure `1.0` directly from raw signed scores (no de-meaning),
+  `max_volume_participation: 0.5`, normal fees/tax, zero extra slippage, and no
+  outside-cash, per-order-notional, or per-name ceiling.
+  Exact-session short eligibility and prior-session official short capacity
+  remain correctness constraints, not stress-test overlays.
+
 - Current active low-rank baseline preference: `portfolio_mode: long_short`.
 - Keep `trading.long_only: false` when the model is intended to do long/short.
 - Portfolio direction and sizing should default to raw score direction followed by L1 normalization for gross exposure control:
@@ -432,6 +440,19 @@ Rules:
   DataLoader or single-process multi-GPU executor.
 - The loss path is canonical `risk_aware_loss` plus `run_backtest_torch`; compile it
   when useful, but do not add an alternate return formula.
+- Keep `tw_minute` and TX/TXO tick training sessions in strict chronological
+  order; do not shuffle the day axis. The canonical progress UI reports
+  processed sessions and optimizer batches, while `batch_date` is only an audit
+  field. A sample-order change alters the optimizer trajectory and must
+  invalidate resume.
+- Every neural product/frequency runner must use
+  `stockagent.training.lifecycle`: one `TrainingArtifactLayout`, root
+  `run_manifest.json`, fixed-envelope `progress.json`, normalized flat
+  `epoch_curve.jsonl`, and canonical fold `mode_artifact_contract.json`.
+  Compatibility manifest filenames may mirror the canonical manifest but must
+  not evolve a second schema. A completed mode smoke test must pass
+  `validate_completed_training_artifacts`; mode-specific details belong in
+  namespaced checkpoint state and prefixed metrics, not new outer files.
 - Market configs default to `training.multi_gpu_strategy: auto`: use the
   canonical single-device executor with one visible GPU and automatically
   relaunch torchrun/DDP with two or more visible GPUs. GPU visibility and
@@ -443,6 +464,26 @@ Rules:
 The user cares about total epoch wall time, not only train step time.
 
 Rules:
+
+- For the dual-RTX-5090 `tw_minute` FinancialTransformer config that inherits
+  `tw_public_lanten_market_candles.yaml`, the measured throughput-only capacity
+  is global `batch_size_train: 64`, `batch_size_eval: 16`, and train/eval
+  decision chunks of 16. Complete fold-1 epoch-2 times for train batches
+  8/16/32/64 at chunk 16 were 30.53/28.60/28.15/27.02 seconds. Batch 128 with
+  chunk 8 tied at 27.02 seconds but reserved about 31.5 of 32.6 GiB per GPU;
+  keep 64/16 for the same throughput with more headroom. Compare finite-loss
+  runs by throughput only when that is the user's explicit priority.
+- The long/short minute execution-contract v3 and training-contract v6 add a
+  compact point-in-time short-rule sidecar, signed target/ledger execution,
+  deterministic stacked host-batch caching, and one DDP gradient reduction per
+  optimizer batch via non-static DDP `no_sync` chunks. Freeze disabled
+  positional tables before optimizer creation instead of enabling per-forward
+  unused-parameter discovery. On fold 1, the complete steady epoch 2 measured
+  `24.061s = 20.798s train + 3.262s validation`, versus the preceding exact
+  production rerun at `27.260s` (11.7% faster) despite adding short execution.
+  The official eligibility/direction remains exact-session, official
+  post-close capacity shifts by exactly one observed dataset session, and all
+  missing evidence fails closed without forward fill.
 
 - Use `epoch_curve.jsonl` when optimizing epoch-level speed.
 - Break down "other" time before optimizing blindly.
@@ -463,7 +504,7 @@ Rules:
   bound makes Inductor constraint analysis and cold compilation much more
   expensive and can violate flattened-index guards.
 - Do not hide expensive work behind `val_interval_epochs > 1` or skip curve/test/plot work unless the user explicitly asks.
-- Recent preference: sampled test loss only needs one fold per epoch to reduce epoch-level overhead.
+- Recent preference: sampled test loss only needs one fold per epoch to reduce epoch-level overhead. For `tw_minute`, compute that audit-only loss over the first calendar year of the current fold's test interval, record its year/row scope in `epoch_curve.jsonl`, and never use it for checkpoint selection, early stopping, or the scheduler.
 - Keep curve plotting async where possible.
 - When comparing throughput after compile, chunking, or cache changes, use the second epoch or later steady-state numbers. Do not choose defaults from the first epoch, because compile/autotune/warmup can dominate it.
 - For the high-throughput TW cash candles configuration, keep

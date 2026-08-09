@@ -46,6 +46,7 @@ _MONTHLY_CONTRACT_RE = re.compile(r"^[0-9]{6}$")
 _DAY_SESSION_ALIASES: Final[frozenset[str]] = frozenset(
     {"一般", "一般交易時段", "day", "day_session", "regular"}
 )
+TAIFEX_DAY_SESSION_ALIASES: Final[frozenset[str]] = _DAY_SESSION_ALIASES
 _REQUIRED_SOURCE_COLUMNS: Final[tuple[str, ...]] = (
     "交易日期",
     "契約",
@@ -551,14 +552,39 @@ def load_taifex_index_futures_day_session(
     )
 
 
+def iter_taifex_daily_csv_streams(
+    source_path: str | Path,
+) -> Iterator[tuple[TextIO, str, str]]:
+    """Expose the shared CP950 CSV/ZIP reader for other TAIFEX daily datasets."""
+
+    yield from _decoded_csv_stream(Path(source_path).expanduser().resolve())
+
+
+def parse_taifex_daily_price(value: object) -> float:
+    return _parse_price(value)
+
+
+def parse_taifex_daily_volume(value: object) -> int:
+    return _parse_volume(value)
+
+
+def parse_taifex_trading_date(value: object) -> np.datetime64 | None:
+    return _parse_trading_date(value)
+
+
 __all__ = [
     "SHIOAJI_FUTURES_ROOTS",
     "TAIFEX_DAY_SESSION_LABEL",
+    "TAIFEX_DAY_SESSION_ALIASES",
     "TAIFEX_FUTURES_DATA_CONTRACT_VERSION",
     "TAIFEX_INDEX_FUTURES_MULTIPLIERS",
     "TAIFEX_INDEX_FUTURES_PRODUCTS",
     "TaiwanIndexFuturesDaySession",
     "build_taifex_index_futures_day_session",
+    "iter_taifex_daily_csv_streams",
     "load_taifex_index_futures_day_session",
     "normalize_taifex_index_futures_product",
+    "parse_taifex_daily_price",
+    "parse_taifex_daily_volume",
+    "parse_taifex_trading_date",
 ]

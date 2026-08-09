@@ -1,7 +1,7 @@
 [Unit]
 Description=StockAgent full-market Shioaji one-minute Kbar backfill
-Wants=network-online.target time-sync.target
-After=network-online.target time-sync.target
+Wants=network-online.target time-sync.target stockagent-shioaji-top200.service
+After=network-online.target time-sync.target stockagent-shioaji-top200.service
 StartLimitIntervalSec=300
 StartLimitBurst=5
 
