@@ -26,6 +26,9 @@ from stockagent.profiling import PROFILE_RANGES_ENABLED, _torch_is_compiling, pr
 _ACTION_CHANNEL_NAMES_BY_EXECUTION_MODE: dict[str, tuple[str, ...]] = {
     "naive": ("target",),
     "tw_day_trade": ("target",),
+    "tw_minute": ("target",),
+    "tw_index_options_tick_long": ("target",),
+    "tw_index_options_tick_short": ("target",),
     "tw_cash": ("open_target", "close_target"),
     "tw_overnight": (
         "due_exit_fraction",
@@ -37,9 +40,70 @@ _ACTION_CHANNEL_NAMES_BY_EXECUTION_MODE: dict[str, tuple[str, ...]] = {
 _ACTION_SCHEMA_BY_EXECUTION_MODE: dict[str, str] = {
     "naive": "single_target_v1",
     "tw_day_trade": "single_target_v1",
+    "tw_minute": "single_minute_target_v1",
+    "tw_index_options_tick_long": "single_option_pair_target_v1",
+    "tw_index_options_tick_short": "single_option_pair_target_v1",
     "tw_cash": "open_close_targets_v1",
     "tw_overnight": "due_exit_open_close_entries_v2_shared_direction",
 }
+
+_TEMPORAL_BASIS_ALIASES: dict[str, str] = {
+    "wavelet": "haar",
+    "haar_wavelet": "haar",
+    "walsh_hadamard": "walsh",
+    "hadamard": "walsh",
+    "fft": "fourier",
+    "real_fourier": "fourier",
+    "cosine": "dct",
+    "dct_ii": "dct",
+    "slepian": "dpss",
+    "multitaper": "dpss",
+    "ema": "exponential",
+    "ewma": "exponential",
+    "decay": "exponential",
+    "derivative": "difference",
+    "trend_filter": "difference",
+    "ar": "ar_innovation",
+    "innovation": "ar_innovation",
+    "burg": "ar_innovation",
+    "spline": "bspline",
+    "cubic_spline": "bspline",
+    "gabor": "local_cosine",
+    "mdct": "local_cosine",
+    "local_fourier": "local_cosine",
+    "morlet_wavelet": "morlet",
+    "db2": "swt_db2",
+    "stationary_wavelet_db2": "swt_db2",
+    "sym4": "swt_sym4",
+    "stationary_wavelet_sym4": "swt_sym4",
+    "wavelet_packet_db2": "wavelet_packet",
+    "shapelet": "learned",
+    "dictionary": "learned",
+    "learned_shapelet": "learned",
+    "polynomial": "legendre",
+    "taylor": "legendre",
+}
+ONLINE_SAFE_TEMPORAL_BASIS_FAMILIES: tuple[str, ...] = (
+    "haar",
+    "swt_db2",
+    "swt_sym4",
+    "wavelet_packet",
+    "walsh",
+    "fourier",
+    "dct",
+    "dpss",
+    "local_cosine",
+    "morlet",
+    "exponential",
+    "laguerre",
+    "difference",
+    "ar_innovation",
+    "bspline",
+    "legendre",
+    "chebyshev",
+    "learned",
+)
+_TEMPORAL_BASIS_FAMILIES = frozenset(ONLINE_SAFE_TEMPORAL_BASIS_FAMILIES)
 
 
 def action_channels_for_execution_mode(execution_mode: str) -> tuple[str, ...]:
@@ -154,6 +218,692 @@ class GatedProjection(nn.Module):
         else:
             projected = F.gelu(projected)
         return self.dropout(projected)
+
+
+def _normalize_temporal_basis_families(
+    families: Sequence[str] | str | None,
+) -> tuple[str, ...]:
+    """Normalize the fixed temporal bases without silently accepting no-ops."""
+
+    if families is None:
+        return ()
+    raw_families = families.split(",") if isinstance(families, str) else families
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for family in raw_families:
+        name = str(family).strip().lower().replace("-", "_")
+        if not name:
+            continue
+        name = _TEMPORAL_BASIS_ALIASES.get(name, name)
+        if name not in _TEMPORAL_BASIS_FAMILIES:
+            supported = ", ".join(sorted(_TEMPORAL_BASIS_FAMILIES))
+            raise ValueError(
+                f"Unsupported temporal basis family {family!r}; supported: {supported}"
+            )
+        if name not in seen:
+            normalized.append(name)
+            seen.add(name)
+    return tuple(normalized)
+
+
+def _haar_basis(steps: int) -> list[torch.Tensor]:
+    if steps < 2 or steps & (steps - 1):
+        raise ValueError(
+            "Haar temporal basis requires lookback to be a power of two and >= 2"
+        )
+    rows: list[torch.Tensor] = []
+    support = steps
+    while support >= 2:
+        scale = 1.0 / math.sqrt(float(support))
+        half = support // 2
+        for start in range(0, steps, support):
+            row = torch.zeros(steps, dtype=torch.float64)
+            row[start : start + half] = scale
+            row[start + half : start + support] = -scale
+            rows.append(row)
+        support //= 2
+    return rows
+
+
+def _walsh_basis(steps: int) -> list[torch.Tensor]:
+    if steps < 2 or steps & (steps - 1):
+        raise ValueError(
+            "Walsh temporal basis requires lookback to be a power of two and >= 2"
+        )
+    matrix = torch.ones((1, 1), dtype=torch.float64)
+    while int(matrix.size(0)) < steps:
+        matrix = torch.cat(
+            (
+                torch.cat((matrix, matrix), dim=1),
+                torch.cat((matrix, -matrix), dim=1),
+            ),
+            dim=0,
+        )
+    rows = [row / math.sqrt(float(steps)) for row in matrix[1:]]
+    return sorted(
+        rows,
+        key=lambda row: int((row[1:] != row[:-1]).sum().item()),
+    )
+
+
+def _fourier_basis(steps: int) -> list[torch.Tensor]:
+    positions = torch.arange(steps, dtype=torch.float64)
+    rows: list[torch.Tensor] = []
+    for frequency in range(1, steps // 2 + 1):
+        angle = 2.0 * math.pi * float(frequency) * positions / float(steps)
+        cosine = torch.cos(angle)
+        rows.append(cosine / cosine.norm().clamp_min(1e-12))
+        sine = torch.sin(angle)
+        if float(sine.norm().item()) > 1e-10:
+            rows.append(sine / sine.norm())
+    return rows
+
+
+def _dct_basis(steps: int) -> list[torch.Tensor]:
+    positions = torch.arange(steps, dtype=torch.float64) + 0.5
+    scale = math.sqrt(2.0 / float(steps))
+    return [
+        torch.cos(math.pi * float(degree) * positions / float(steps)) * scale
+        for degree in range(1, steps)
+    ]
+
+
+def _orthonormal_polynomial_basis(steps: int, family: str) -> list[torch.Tensor]:
+    positions = torch.linspace(-1.0, 1.0, steps, dtype=torch.float64)
+    raw_rows = [torch.ones_like(positions), positions]
+    for degree in range(2, steps):
+        if family == "legendre":
+            row = (
+                (2 * degree - 1) * positions * raw_rows[-1]
+                - (degree - 1) * raw_rows[-2]
+            ) / float(degree)
+        else:
+            row = 2.0 * positions * raw_rows[-1] - raw_rows[-2]
+        raw_rows.append(row)
+
+    constant = raw_rows[0] / raw_rows[0].norm()
+    orthonormal: list[torch.Tensor] = []
+    for raw in raw_rows[1:]:
+        row = raw - torch.dot(raw, constant) * constant
+        for previous in orthonormal:
+            row = row - torch.dot(row, previous) * previous
+        norm = row.norm()
+        if float(norm.item()) <= 1e-10:
+            continue
+        row = row / norm
+        if float(torch.dot(row, raw).item()) < 0.0:
+            row = -row
+        orthonormal.append(row)
+    return orthonormal
+
+
+def _orthonormalize_non_dc_rows(
+    raw_rows: Sequence[torch.Tensor],
+    *,
+    steps: int,
+) -> list[torch.Tensor]:
+    """Return a stable ordered orthonormal bank orthogonal to the DC vector."""
+
+    constant = torch.ones(steps, dtype=torch.float64)
+    constant = constant / constant.norm()
+    orthonormal: list[torch.Tensor] = []
+    for raw in raw_rows:
+        raw64 = raw.to(dtype=torch.float64).reshape(-1)
+        if int(raw64.numel()) != steps or not bool(torch.isfinite(raw64).all()):
+            raise ValueError("Temporal basis rows must be finite and match lookback")
+        row = raw64 - torch.dot(raw64, constant) * constant
+        # Two modified Gram-Schmidt passes keep float32-exported banks stable
+        # enough for the fixed-bank orthogonality contract.
+        for _ in range(2):
+            for previous in orthonormal:
+                row = row - torch.dot(row, previous) * previous
+        norm = row.norm()
+        if float(norm.item()) <= 1e-10:
+            continue
+        row = row / norm
+        # Eigensolvers may choose either sign for the same DPSS vector. Fix the
+        # orientation by the largest-magnitude entry so reconstruction after a
+        # checkpoint load is deterministic across BLAS implementations.
+        pivot = int(row.abs().argmax().item())
+        if float(row[pivot].item()) < 0.0:
+            row = -row
+        orthonormal.append(row)
+        if len(orthonormal) >= steps - 1:
+            break
+    return orthonormal
+
+
+def _dpss_basis(steps: int) -> list[torch.Tensor]:
+    """Slepian sequences ordered by finite-window spectral concentration."""
+
+    time = torch.arange(steps, dtype=torch.float64)
+    offsets = time[:, None] - time[None, :]
+    time_bandwidth = min(2.5, max(0.75, float(steps) / 4.0 - 1e-6))
+    half_bandwidth = time_bandwidth / float(steps)
+    concentration = torch.where(
+        offsets == 0,
+        torch.full_like(offsets, 2.0 * half_bandwidth),
+        torch.sin(2.0 * math.pi * half_bandwidth * offsets)
+        / (math.pi * offsets),
+    )
+    _eigenvalues, eigenvectors = torch.linalg.eigh(concentration)
+    return [row for row in eigenvectors.transpose(0, 1).flip(0)]
+
+
+def _exponential_basis(steps: int, components: int) -> list[torch.Tensor]:
+    lags = torch.arange(steps - 1, -1, -1, dtype=torch.float64)
+    count = min(steps, max(components * 3, 12))
+    half_lives = torch.logspace(
+        math.log10(0.5),
+        math.log10(max(2.0, float(steps) * 2.0)),
+        count,
+        dtype=torch.float64,
+    )
+    return [torch.exp(-math.log(2.0) * lags / half_life) for half_life in half_lives]
+
+
+def _laguerre_basis(steps: int, components: int) -> list[torch.Tensor]:
+    lags = torch.arange(steps - 1, -1, -1, dtype=torch.float64)
+    x = lags / max(1.0, float(steps) / 6.0)
+    polynomial_rows = [torch.ones_like(x)]
+    if steps > 1:
+        polynomial_rows.append(1.0 - x)
+    for degree in range(2, min(steps, max(components * 2 + 2, 12))):
+        polynomial_rows.append(
+            (
+                (2.0 * degree - 1.0 - x) * polynomial_rows[-1]
+                - (degree - 1.0) * polynomial_rows[-2]
+            )
+            / float(degree)
+        )
+    envelope = torch.exp(-0.5 * x)
+    return [envelope * polynomial for polynomial in polynomial_rows]
+
+
+def _log_spaced_horizons(steps: int, count: int) -> list[int]:
+    if steps <= 1:
+        return []
+    count = min(max(1, int(count)), steps - 1)
+    raw = torch.logspace(
+        0.0,
+        math.log10(float(steps - 1)),
+        count,
+        dtype=torch.float64,
+    ).round().to(torch.long)
+    horizons: list[int] = []
+    for value in raw.tolist() + list(range(1, steps)):
+        horizon = min(steps - 1, max(1, int(value)))
+        if horizon not in horizons:
+            horizons.append(horizon)
+        if len(horizons) >= count:
+            break
+    return horizons
+
+
+def _difference_basis(steps: int, components: int) -> list[torch.Tensor]:
+    horizons = _log_spaced_horizons(steps, max(components * 2, 12))
+    first_order: list[torch.Tensor] = []
+    second_order: list[torch.Tensor] = []
+    for horizon in horizons:
+        first = torch.zeros(steps, dtype=torch.float64)
+        first[-1] = 1.0
+        first[-1 - horizon] = -1.0
+        first_order.append(first)
+        if 2 * horizon < steps:
+            second = torch.zeros(steps, dtype=torch.float64)
+            second[-1] = 1.0
+            second[-1 - horizon] = -2.0
+            second[-1 - 2 * horizon] = 1.0
+            second_order.append(second)
+    return first_order + second_order
+
+
+def _ar_innovation_basis(steps: int, components: int) -> list[torch.Tensor]:
+    if steps < 2:
+        return []
+    past_lags = torch.arange(steps - 1, 0, -1, dtype=torch.float64)
+    count = min(steps - 1, max(components * 3, 12))
+    half_lives = torch.logspace(
+        math.log10(0.5),
+        math.log10(max(2.0, float(steps))),
+        count,
+        dtype=torch.float64,
+    )
+    rows: list[torch.Tensor] = []
+    for half_life in half_lives:
+        past_weights = torch.exp(-math.log(2.0) * past_lags / half_life)
+        past_weights = past_weights / past_weights.sum().clamp_min(1e-12)
+        row = torch.zeros(steps, dtype=torch.float64)
+        row[:-1] = -past_weights
+        row[-1] = 1.0
+        rows.append(row)
+    return rows
+
+
+def _bspline_basis(steps: int, components: int) -> list[torch.Tensor]:
+    positions = torch.linspace(0.0, 1.0, steps, dtype=torch.float64)
+    count = min(steps, max(components * 3, 12))
+    centers = torch.linspace(-0.1, 1.1, count, dtype=torch.float64)
+    width = max(2.0 / float(steps - 1), 1.2 / float(max(2, count - 1)))
+    rows: list[torch.Tensor] = []
+    for center in centers:
+        distance = ((positions - center) / width).abs()
+        row = torch.where(
+            distance < 1.0,
+            (4.0 - 6.0 * distance.square() + 3.0 * distance.pow(3)) / 6.0,
+            torch.where(
+                distance < 2.0,
+                (2.0 - distance).pow(3) / 6.0,
+                torch.zeros_like(distance),
+            ),
+        )
+        rows.append(row)
+    return rows
+
+
+def _local_cosine_basis(steps: int, components: int) -> list[torch.Tensor]:
+    positions = torch.linspace(0.0, 1.0, steps, dtype=torch.float64)
+    rows: list[torch.Tensor] = []
+    center_count = min(5, max(3, components // 2 + 1))
+    centers = torch.linspace(0.1, 0.9, center_count, dtype=torch.float64)
+    for frequency in range(1, max(4, components + 1)):
+        for center in centers:
+            scale = 0.18 if frequency <= 2 else 0.12
+            window = torch.exp(-0.5 * ((positions - center) / scale).square())
+            phase = 2.0 * math.pi * float(frequency) * (positions - center)
+            rows.append(window * torch.cos(phase))
+            rows.append(window * torch.sin(phase))
+    return rows
+
+
+def _morlet_basis(steps: int, components: int) -> list[torch.Tensor]:
+    positions = torch.linspace(-1.0, 1.0, steps, dtype=torch.float64)
+    rows: list[torch.Tensor] = []
+    scales = (0.18, 0.32, 0.55)
+    centers = torch.linspace(-0.65, 0.65, 5, dtype=torch.float64)
+    for scale in scales:
+        for center in centers:
+            localized = (positions - center) / scale
+            envelope = torch.exp(-0.5 * localized.square())
+            rows.append(envelope * torch.cos(5.0 * localized))
+            rows.append(envelope * torch.sin(5.0 * localized))
+            if len(rows) >= max(components * 3, 12):
+                return rows
+    return rows
+
+
+def _qmf_high_pass(low_pass: torch.Tensor) -> torch.Tensor:
+    signs = torch.where(
+        torch.arange(low_pass.numel()) % 2 == 0,
+        torch.ones(low_pass.numel(), dtype=torch.float64),
+        -torch.ones(low_pass.numel(), dtype=torch.float64),
+    )
+    return low_pass.flip(0) * signs
+
+
+def _place_filter_at_end(
+    filter_values: torch.Tensor,
+    *,
+    steps: int,
+    dilation: int = 1,
+    end: int | None = None,
+) -> torch.Tensor | None:
+    end = steps - 1 if end is None else int(end)
+    indices = end - torch.arange(filter_values.numel(), dtype=torch.long) * int(dilation)
+    if int(indices.min().item()) < 0 or end >= steps:
+        return None
+    row = torch.zeros(steps, dtype=torch.float64)
+    row[indices] = filter_values
+    return row
+
+
+def _stationary_wavelet_basis(
+    steps: int,
+    low_pass: Sequence[float],
+) -> list[torch.Tensor]:
+    low = torch.tensor(tuple(low_pass), dtype=torch.float64)
+    high = _qmf_high_pass(low)
+    levels: list[tuple[int, tuple[int, int]]] = []
+    dilation = 1
+    while (int(low.numel()) - 1) * dilation + 1 <= steps:
+        effective_width = (int(low.numel()) - 1) * dilation + 1
+        levels.append(
+            (
+                dilation,
+                (steps - 1, steps - 1 - max(1, effective_width // 2)),
+            )
+        )
+        dilation *= 2
+
+    rows: list[torch.Tensor] = []
+    # Round-robin by scale before adding shifted/low-pass atoms. A compact
+    # four-component bank must still see all feasible wavelet scales.
+    for filter_values, end_index in (
+        (high, 0),
+        (low, 0),
+        (high, 1),
+        (low, 1),
+    ):
+        for dilation, ends in levels:
+            end = ends[end_index]
+            row = _place_filter_at_end(
+                filter_values,
+                steps=steps,
+                dilation=dilation,
+                end=end,
+            )
+            if row is not None:
+                rows.append(row)
+    return rows
+
+
+def _full_convolve(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
+    result = torch.zeros(
+        int(left.numel()) + int(right.numel()) - 1,
+        dtype=torch.float64,
+    )
+    for index in range(int(left.numel())):
+        result[index : index + int(right.numel())] += left[index] * right
+    return result
+
+
+def _wavelet_packet_basis(steps: int, components: int) -> list[torch.Tensor]:
+    low = torch.tensor(
+        (
+            -0.12940952255126034,
+            0.2241438680420134,
+            0.8365163037378079,
+            0.48296291314453416,
+        ),
+        dtype=torch.float64,
+    )
+    high = _qmf_high_pass(low)
+    paths = [torch.ones(1, dtype=torch.float64)]
+    depth_rows: list[list[torch.Tensor]] = []
+    for depth in range(1, 5):
+        dilation = 2 ** (depth - 1)
+        next_paths: list[torch.Tensor] = []
+        rows: list[torch.Tensor] = []
+        for path in paths:
+            for filter_values in (low, high):
+                dilated = torch.zeros(
+                    (int(filter_values.numel()) - 1) * dilation + 1,
+                    dtype=torch.float64,
+                )
+                dilated[::dilation] = filter_values
+                effective = _full_convolve(path, dilated)
+                if int(effective.numel()) <= steps:
+                    next_paths.append(effective)
+                    row = _place_filter_at_end(effective, steps=steps)
+                    if row is not None:
+                        rows.append(row)
+        if not next_paths:
+            break
+        depth_rows.append(rows)
+        paths = next_paths
+    if not depth_rows:
+        return []
+    eligible = [rows for rows in depth_rows if len(rows) <= components]
+    primary = max(eligible, key=len) if eligible else depth_rows[0]
+    return primary + [
+        row
+        for rows in reversed(depth_rows)
+        if rows is not primary
+        for row in rows
+    ]
+
+
+_DB2_LOW_PASS = (
+    -0.12940952255126034,
+    0.2241438680420134,
+    0.8365163037378079,
+    0.48296291314453416,
+)
+_SYM4_LOW_PASS = (
+    -0.07576571478927333,
+    -0.02963552764599851,
+    0.49761866763201545,
+    0.8037387518059161,
+    0.29785779560527736,
+    -0.09921954357684722,
+    -0.012603967262037833,
+    0.0322231006040427,
+)
+
+
+def _temporal_basis_matrix(
+    family: str,
+    *,
+    steps: int,
+    components: int,
+) -> torch.Tensor:
+    """Build a deterministic non-DC analysis bank for one causal window."""
+
+    normalized = _normalize_temporal_basis_families((family,))
+    if len(normalized) != 1:
+        raise ValueError("Exactly one temporal basis family is required")
+    family = normalized[0]
+    steps = int(steps)
+    components = int(components)
+    if steps < 2:
+        raise ValueError("Temporal basis decomposition requires lookback >= 2")
+    if components < 1:
+        raise ValueError("temporal_basis_components must be positive")
+
+    if family == "haar":
+        rows = _haar_basis(steps)
+    elif family == "walsh":
+        rows = _walsh_basis(steps)
+    elif family == "fourier":
+        rows = _fourier_basis(steps)
+    elif family == "dct":
+        rows = _dct_basis(steps)
+    elif family == "dpss":
+        rows = _dpss_basis(steps)
+    elif family == "exponential":
+        rows = _exponential_basis(steps, components)
+    elif family == "laguerre":
+        rows = _laguerre_basis(steps, components)
+    elif family == "difference":
+        rows = _difference_basis(steps, components)
+    elif family == "ar_innovation":
+        rows = _ar_innovation_basis(steps, components)
+    elif family == "bspline":
+        rows = _bspline_basis(steps, components)
+    elif family == "local_cosine":
+        rows = _local_cosine_basis(steps, components)
+    elif family == "morlet":
+        rows = _morlet_basis(steps, components)
+    elif family == "swt_db2":
+        rows = _stationary_wavelet_basis(steps, _DB2_LOW_PASS)
+    elif family == "swt_sym4":
+        rows = _stationary_wavelet_basis(steps, _SYM4_LOW_PASS)
+    elif family == "wavelet_packet":
+        rows = _wavelet_packet_basis(steps, components)
+    elif family in {"legendre", "chebyshev"}:
+        rows = _orthonormal_polynomial_basis(steps, family)
+    else:
+        # The learned dictionary starts from a stable non-DC DCT bank and is
+        # registered as a parameter by TemporalMultiBasisEncoder.
+        rows = _dct_basis(steps)
+    rows = _orthonormalize_non_dc_rows(rows, steps=steps)
+    if not rows:
+        raise ValueError(
+            f"Temporal basis family {family!r} has no non-constant components "
+            f"for lookback={steps}"
+        )
+
+    keep = min(components, len(rows))
+    if family == "haar" and keep < len(rows):
+        # Haar rows are ordered coarse-to-fine.  Even spacing retains both
+        # long-horizon and local changes when the configured bank is compact.
+        indices = torch.linspace(0, len(rows) - 1, keep).round().to(torch.long)
+        selected = [rows[int(index)] for index in indices]
+    else:
+        selected = rows[:keep]
+    return torch.stack(selected, dim=0).to(dtype=torch.float32)
+
+
+class TemporalMultiBasisEncoder(nn.Module):
+    """Fuse fixed and learned temporal coefficients into a gated representation.
+
+    The raw/learned temporal Transformer remains the main path.  This branch
+    analyzes its pre-temporal embeddings with non-DC bases and contributes
+    signed phase plus per-channel energy through a gated residual.
+    """
+
+    def __init__(
+        self,
+        *,
+        lookback: int,
+        dim: int,
+        families: Sequence[str] | str,
+        components: int,
+        dropout: float,
+        gate_init: float,
+        norm_type: str,
+        ffn_type: str,
+    ) -> None:
+        super().__init__()
+        self.lookback = int(lookback)
+        self.dim = int(dim)
+        self.family_names = _normalize_temporal_basis_families(families)
+        if not self.family_names:
+            raise ValueError("TemporalMultiBasisEncoder requires at least one family")
+        if not math.isfinite(float(gate_init)):
+            raise ValueError("temporal_basis_gate_init must be finite")
+
+        self.family_projections = nn.ModuleDict()
+        self.signed_mix_logits = nn.ParameterDict()
+        self.energy_mix_logits = nn.ParameterDict()
+        for family in self.family_names:
+            matrix = _temporal_basis_matrix(
+                family,
+                steps=self.lookback,
+                components=int(components),
+            )
+            if family == "learned":
+                self.register_parameter(
+                    f"{family}_basis",
+                    nn.Parameter(matrix),
+                )
+            else:
+                self.register_buffer(f"{family}_basis", matrix, persistent=False)
+            coefficient_count = int(matrix.size(0))
+            signed_init = math.atanh(min(0.95, 1.0 / math.sqrt(coefficient_count)))
+            self.signed_mix_logits[family] = nn.Parameter(
+                torch.full((coefficient_count,), signed_init)
+            )
+            self.energy_mix_logits[family] = nn.Parameter(
+                torch.zeros(coefficient_count)
+            )
+            self.family_projections[family] = nn.Sequential(
+                _make_norm(self.dim * 2, norm_type),
+                GatedProjection(
+                    self.dim * 2,
+                    self.dim,
+                    float(dropout),
+                    ffn_type,
+                ),
+            )
+
+        self.fusion = GatedProjection(
+            self.dim * len(self.family_names),
+            self.dim,
+            float(dropout),
+            ffn_type,
+        )
+        self.delta_norm = _make_norm(self.dim, norm_type)
+        self.gate_norm = _make_norm(self.dim * 2, norm_type)
+        self.gate = nn.Linear(self.dim * 2, 1)
+        nn.init.zeros_(self.gate.weight)
+        nn.init.constant_(self.gate.bias, float(gate_init))
+
+    def forward(
+        self,
+        temporal_embeddings: torch.Tensor,
+        z_base: torch.Tensor,
+        mask: torch.Tensor,
+        *,
+        collect_aux: bool,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        if temporal_embeddings.ndim != 4:
+            raise ValueError("temporal_embeddings must have shape [B,L,S,D]")
+        if int(temporal_embeddings.size(1)) != self.lookback:
+            raise ValueError(
+                f"Expected temporal lookback={self.lookback}, "
+                f"got {int(temporal_embeddings.size(1))}"
+            )
+        if not _torch_is_compiling() and tuple(z_base.shape) != (
+            int(temporal_embeddings.size(0)),
+            int(temporal_embeddings.size(2)),
+            self.dim,
+        ):
+            raise ValueError("z_base must have shape [B,S,D]")
+
+        temporal_mean = temporal_embeddings.float().mean(dim=1, keepdim=True)
+        centered = temporal_embeddings - temporal_mean.to(
+            dtype=temporal_embeddings.dtype
+        )
+        summaries: list[torch.Tensor] = []
+        aux: dict[str, torch.Tensor] = {}
+        for family in self.family_names:
+            basis_source = getattr(self, f"{family}_basis")
+            if family == "learned":
+                basis_source = basis_source - basis_source.mean(dim=-1, keepdim=True)
+                basis_source = F.normalize(
+                    basis_source.float(),
+                    dim=-1,
+                    eps=1e-6,
+                ).to(dtype=basis_source.dtype)
+            basis = basis_source.to(
+                device=centered.device,
+                dtype=centered.dtype,
+            )
+            coefficients = torch.einsum("kl,blsd->bksd", basis, centered)
+            signed_weights = torch.tanh(self.signed_mix_logits[family]).to(
+                device=coefficients.device,
+                dtype=coefficients.dtype,
+            )
+            signed = (
+                coefficients
+                * signed_weights.reshape(1, -1, 1, 1)
+            ).sum(dim=1)
+            energy_weights = torch.softmax(
+                self.energy_mix_logits[family], dim=0
+            ).to(device=coefficients.device, dtype=coefficients.dtype)
+            energy = torch.sqrt(
+                (
+                    coefficients.square()
+                    * energy_weights.reshape(1, -1, 1, 1)
+                ).sum(dim=1).float()
+                + 1e-6
+            ).to(dtype=coefficients.dtype)
+            summary = self.family_projections[family](
+                torch.cat((signed, energy), dim=-1)
+            )
+            summaries.append(summary)
+            if collect_aux:
+                aux[f"temporal_basis_{family}_summary"] = summary
+                aux[f"temporal_basis_{family}_signed"] = signed
+                aux[f"temporal_basis_{family}_energy"] = energy
+
+        delta = self.delta_norm(self.fusion(torch.cat(summaries, dim=-1)))
+        gate = torch.sigmoid(
+            self.gate(self.gate_norm(torch.cat((z_base, delta), dim=-1)))
+        )
+        mask_bool = mask.to(device=z_base.device, dtype=torch.bool)
+        augmented = (z_base + gate * delta).masked_fill(
+            ~mask_bool.unsqueeze(-1), 0.0
+        )
+        if collect_aux:
+            aux["temporal_basis_delta"] = delta.masked_fill(
+                ~mask_bool.unsqueeze(-1), 0.0
+            )
+            aux["temporal_basis_gate"] = gate.masked_fill(
+                ~mask_bool.unsqueeze(-1), 0.0
+            )
+        return augmented, aux
 
 
 def _masked_market_summary_parts(z_stock: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -418,9 +1168,13 @@ class FlashSDPAAttention(nn.Module):
             key_mask = key_mask.to(device=query.device, dtype=torch.bool)
             attn_mask = key_mask[:, None, None, :]
 
-        self.captured_attention = None
-        self.captured_attention_shape = None
         if bool(self.capture_attention):
+            # Attention capture is an explainability-only opt-in.  Do not
+            # mutate module state on the normal training path: activation
+            # checkpointing is a Dynamo higher-order operator and rejects
+            # side effects on modules outside the checkpoint scope.
+            self.captured_attention = None
+            self.captured_attention_shape = None
             cap_rows = max(1, min(int(self.capture_max_rows), int(q.size(0))))
             capture_elements = cap_rows * int(query_steps) * int(key_steps)
             if capture_elements <= max(1, int(self.capture_max_elements)):
@@ -633,6 +1387,10 @@ class TransformerBasePortfolioModel(nn.Module):
         temporal_ffn_mult: int = 2,
         temporal_pooling: str = "attention",
         temporal_query_mode: str = "full_then_last",
+        temporal_basis_families: Sequence[str] | str | None = None,
+        temporal_basis_components: int = 8,
+        temporal_basis_dropout: float = 0.0,
+        temporal_basis_gate_init: float = -2.0,
         cross_layers: int = 1,
         cross_heads: int = 4,
         cross_ffn_mult: int = 2,
@@ -691,6 +1449,10 @@ class TransformerBasePortfolioModel(nn.Module):
         self.use_market_tokens = self.attention_mode in {"latent", "market_token"}
         self.temporal_pooling = self._normalize_pooling(temporal_pooling)
         self.temporal_query_mode = self._normalize_temporal_query_mode(temporal_query_mode)
+        self.temporal_basis_families = _normalize_temporal_basis_families(
+            temporal_basis_families
+        )
+        self.temporal_basis_components = int(temporal_basis_components)
         self.default_temperature = float(default_temperature)
         self.portfolio_mode = normalize_portfolio_mode(portfolio_mode)
         self.portfolio_activation = normalize_portfolio_activation(portfolio_activation)
@@ -856,6 +1618,20 @@ class TransformerBasePortfolioModel(nn.Module):
         )
 
         self.temporal_pool_score = nn.Linear(self.d_model, 1) if self.temporal_pooling == "attention" else None
+        self.temporal_basis_encoder = (
+            TemporalMultiBasisEncoder(
+                lookback=self.lookback,
+                dim=self.d_model,
+                families=self.temporal_basis_families,
+                components=self.temporal_basis_components,
+                dropout=float(temporal_basis_dropout),
+                gate_init=float(temporal_basis_gate_init),
+                norm_type=self.norm_type,
+                ffn_type=self.ffn_type,
+            )
+            if self.temporal_basis_families
+            else None
+        )
         self.output_norm = _make_norm(self.d_model, self.norm_type)
         self.stock_market_gate = nn.Sequential(
             GatedProjection(self.d_model * 2, self.d_model, float(dropout), self.ffn_type),
@@ -1135,6 +1911,49 @@ class TransformerBasePortfolioModel(nn.Module):
         if mask is not None and tuple(mask.shape) != (batch_rows, int(feature_slab.size(1))):
             raise ValueError(f"Expected mask shape {(batch_rows, int(feature_slab.size(1)))}, got {tuple(mask.shape)}")
 
+    def _check_batched_panel_slab_shapes(
+        self,
+        feature_slabs: torch.Tensor,
+        mask: torch.Tensor | None,
+        symbol_indices: torch.Tensor | None = None,
+    ) -> None:
+        if feature_slabs.dim() != 4:
+            raise ValueError(
+                "Expected feature_slabs shape [D,U,S,F], "
+                f"got ndim={feature_slabs.dim()}"
+            )
+        if int(feature_slabs.size(1)) < self.lookback:
+            raise ValueError(
+                f"Expected slab rows >= lookback={self.lookback}, "
+                f"got {int(feature_slabs.size(1))}"
+            )
+        if (
+            not self.allow_dynamic_symbols
+            and symbol_indices is None
+            and int(feature_slabs.size(2)) != self.num_symbols
+        ):
+            raise ValueError(
+                f"Expected num_symbols={self.num_symbols}, "
+                f"got {int(feature_slabs.size(2))}"
+            )
+        self._check_symbol_indices(symbol_indices, int(feature_slabs.size(2)))
+        if int(feature_slabs.size(3)) != self.num_features:
+            raise ValueError(
+                f"Expected num_features={self.num_features}, "
+                f"got {int(feature_slabs.size(3))}"
+            )
+        decision_rows = int(feature_slabs.size(1)) - self.lookback + 1
+        expected_mask = (
+            int(feature_slabs.size(0)),
+            decision_rows,
+            int(feature_slabs.size(2)),
+        )
+        if mask is not None and tuple(mask.shape) != expected_mask:
+            raise ValueError(
+                f"Expected batched slab mask shape {expected_mask}, "
+                f"got {tuple(mask.shape)}"
+            )
+
     def configure_attention_capture(
         self,
         enabled: bool,
@@ -1330,7 +2149,14 @@ class TransformerBasePortfolioModel(nn.Module):
             raise ValueError("embedded explainability mask must have shape [B,S]")
         safe_mask = _safe_attention_mask(mask_bool)
         temporal = self._apply_temporal_blocks(embedded, keep_all_steps=False)
-        return self._pool_temporal(temporal, safe_mask)
+        pooled = self._pool_temporal(temporal, safe_mask)
+        pooled, _ = self._apply_temporal_basis(
+            pooled,
+            embedded,
+            safe_mask,
+            collect_aux=False,
+        )
+        return pooled
 
     def forward_from_stock_embeddings_explainability(
         self,
@@ -1451,6 +2277,25 @@ class TransformerBasePortfolioModel(nn.Module):
         h = projected.unfold(0, self.lookback, 1).permute(0, 3, 1, 2).contiguous()
         return self._add_window_positions(h, int(feature_slab.size(1)), symbol_indices)
 
+    def _embed_windowed_from_batched_panel_slabs(
+        self,
+        feature_slabs: torch.Tensor,
+        symbol_indices: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Project overlapping windows once per unique row and independent slab.
+
+        ``D`` is an independence axis (for example, separate trading days), not
+        a time axis.  The returned batch is flattened in ``[D,C]`` order while
+        every window retains the canonical ``[L,S,F]`` chronology.
+        """
+        projected = self._project_features(feature_slabs)
+        windows = projected.unfold(1, self.lookback, 1)
+        # unfold appends the rolling dimension: [D,C,S,H,L] -> [D,C,L,S,H].
+        h = windows.permute(0, 1, 4, 2, 3).contiguous()
+        days, decision_rows, lookback, symbols, width = h.shape
+        h = h.reshape(days * decision_rows, lookback, symbols, width)
+        return self._add_window_positions(h, int(feature_slabs.size(2)), symbol_indices)
+
     def _embed_windowed_from_panel(
         self,
         features: torch.Tensor,
@@ -1564,6 +2409,23 @@ class TransformerBasePortfolioModel(nn.Module):
             pooled = (h.permute(0, 2, 1, 3) * weights.unsqueeze(-1)).sum(dim=2)
         return self.output_norm(pooled).masked_fill(~mask_bool.unsqueeze(-1), 0.0)
 
+    def _apply_temporal_basis(
+        self,
+        z_base: torch.Tensor,
+        temporal_source: torch.Tensor,
+        safe_mask: torch.Tensor,
+        *,
+        collect_aux: bool,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        if self.temporal_basis_encoder is None:
+            return z_base, {}
+        return self.temporal_basis_encoder(
+            temporal_source,
+            z_base,
+            safe_mask,
+            collect_aux=collect_aux,
+        )
+
     def _apply_stock_market_gate(
         self,
         z_base: torch.Tensor,
@@ -1584,6 +2446,7 @@ class TransformerBasePortfolioModel(nn.Module):
         *,
         collect_aux: bool,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        basis_source = h
         bsz, steps, n_symbols, dim = h.shape
         token_count = steps * n_symbols
         if self.max_full_tokens > 0 and token_count > self.max_full_tokens:
@@ -1597,7 +2460,16 @@ class TransformerBasePortfolioModel(nn.Module):
             tokens = self._run_block(block, tokens, None, key_mask)
         h_full = tokens.reshape(bsz, steps, n_symbols, dim)
         aux = {"token_embedding": h_full} if collect_aux else {}
-        return self._pool_temporal(h_full, safe_mask), aux
+        z_base = self._pool_temporal(h_full, safe_mask)
+        z_base, basis_aux = self._apply_temporal_basis(
+            z_base,
+            basis_source,
+            safe_mask,
+            collect_aux=collect_aux,
+        )
+        if collect_aux:
+            aux.update(basis_aux)
+        return z_base, aux
 
     def _forward_axial(
         self,
@@ -1606,13 +2478,23 @@ class TransformerBasePortfolioModel(nn.Module):
         *,
         collect_aux: bool,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        basis_source = h
         h = self._apply_temporal_blocks(
             h,
             keep_all_steps=(collect_aux and self.temporal_query_mode != "last_only"),
         )
         h = self._apply_cross_blocks(h, safe_mask)
         aux = {"token_embedding": h} if collect_aux else {}
-        return self._pool_temporal(h, safe_mask), aux
+        z_base = self._pool_temporal(h, safe_mask)
+        z_base, basis_aux = self._apply_temporal_basis(
+            z_base,
+            basis_source,
+            safe_mask,
+            collect_aux=collect_aux,
+        )
+        if collect_aux:
+            aux.update(basis_aux)
+        return z_base, aux
 
     def _forward_temporal_only(
         self,
@@ -1621,12 +2503,22 @@ class TransformerBasePortfolioModel(nn.Module):
         *,
         collect_aux: bool,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        basis_source = h
         h = self._apply_temporal_blocks(
             h,
             keep_all_steps=(collect_aux and self.temporal_query_mode != "last_only"),
         )
         aux = {"token_embedding": h} if collect_aux else {}
-        return self._pool_temporal(h, safe_mask), aux
+        z_base = self._pool_temporal(h, safe_mask)
+        z_base, basis_aux = self._apply_temporal_basis(
+            z_base,
+            basis_source,
+            safe_mask,
+            collect_aux=collect_aux,
+        )
+        if collect_aux:
+            aux.update(basis_aux)
+        return z_base, aux
 
     def _forward_latent_or_market(
         self,
@@ -1637,12 +2529,19 @@ class TransformerBasePortfolioModel(nn.Module):
         collect_aux: bool,
         use_market: bool = True,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        basis_source = h
         h = self._apply_temporal_blocks(
             h,
             keep_all_steps=(collect_aux and self.temporal_query_mode != "last_only"),
         )
         z_base = self._pool_temporal(h, safe_mask)
-        return self._forward_latent_or_market_from_stock_embeddings(
+        z_base, basis_aux = self._apply_temporal_basis(
+            z_base,
+            basis_source,
+            safe_mask,
+            collect_aux=collect_aux,
+        )
+        z_stock, aux = self._forward_latent_or_market_from_stock_embeddings(
             z_base,
             safe_mask,
             use_latent=use_latent,
@@ -1650,6 +2549,9 @@ class TransformerBasePortfolioModel(nn.Module):
             use_market=use_market,
             token_embedding=h,
         )
+        if collect_aux:
+            aux.update(basis_aux)
+        return z_stock, aux
 
     def _forward_latent_or_market_from_stock_embeddings(
         self,
@@ -1756,17 +2658,27 @@ class TransformerBasePortfolioModel(nn.Module):
         *,
         collect_aux: bool,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        basis_source = h
         h = self._apply_temporal_blocks(
             h,
             keep_all_steps=(collect_aux and self.temporal_query_mode != "last_only"),
         )
         z_base = self._pool_temporal(h, safe_mask)
-        return self._forward_market_token_from_stock_embeddings(
+        z_base, basis_aux = self._apply_temporal_basis(
+            z_base,
+            basis_source,
+            safe_mask,
+            collect_aux=collect_aux,
+        )
+        z_stock, aux = self._forward_market_token_from_stock_embeddings(
             z_base,
             safe_mask,
             collect_aux=collect_aux,
             token_embedding=h,
         )
+        if collect_aux:
+            aux.update(basis_aux)
+        return z_stock, aux
 
     def _forward_market_token_from_stock_embeddings(
         self,
@@ -2562,6 +3474,39 @@ class TransformerBasePortfolioModel(nn.Module):
             mask_bool = torch.ones(h.size(0), h.size(2), dtype=torch.bool, device=h.device)
         else:
             mask_bool = mask.to(device=h.device, dtype=torch.bool)
+        return self._forward_embedded(
+            h,
+            mask_bool,
+            temperature=temperature,
+            return_aux=return_aux,
+        )
+
+    def forward_from_batched_panel_slabs(
+        self,
+        feature_slabs: torch.Tensor,
+        mask: torch.Tensor | None = None,
+        temperature: float | torch.Tensor | None = None,
+        return_aux: bool | None = None,
+        symbol_indices: torch.Tensor | None = None,
+    ):
+        """Forward independent contiguous panel slabs without repeated projection.
+
+        Inputs use ``[D,U,S,F]`` and masks use ``[D,C,S]``, where
+        ``C = U - lookback + 1``.  Outputs follow the ordinary flattened model
+        batch order ``[D*C,S]``.
+        """
+        self._check_batched_panel_slab_shapes(feature_slabs, mask, symbol_indices)
+        h = self._embed_windowed_from_batched_panel_slabs(
+            feature_slabs, symbol_indices
+        )
+        if mask is None:
+            mask_bool = torch.ones(
+                h.size(0), h.size(2), dtype=torch.bool, device=h.device
+            )
+        else:
+            mask_bool = mask.to(device=h.device, dtype=torch.bool).reshape(
+                h.size(0), h.size(2)
+            )
         return self._forward_embedded(
             h,
             mask_bool,

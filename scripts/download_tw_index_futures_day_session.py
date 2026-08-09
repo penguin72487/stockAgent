@@ -11,16 +11,11 @@ from __future__ import annotations
 
 import argparse
 from datetime import date, timedelta
-import hashlib
 import json
-import os
 from pathlib import Path
 import sys
-import tempfile
 import time
 from typing import Final
-from urllib import parse, request
-import zipfile
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -29,6 +24,13 @@ if str(REPO_ROOT) not in sys.path:
 from stockagent.data.tw_index_futures import (  # noqa: E402
     TAIFEX_INDEX_FUTURES_PRODUCTS,
     build_taifex_index_futures_day_session,
+)
+from scripts.taifex_daily_download_common import (  # noqa: E402
+    download_taifex_attachment,
+    month_ranges,
+    parse_iso_date,
+    sha256_path,
+    validate_taifex_receipt,
 )
 
 
@@ -39,7 +41,7 @@ TAIFEX_DOWNLOAD_URL: Final[str] = (
 
 def _parse_date(value: str) -> date:
     try:
-        return date.fromisoformat(value)
+        return parse_iso_date(value)
     except ValueError as exc:
         raise argparse.ArgumentTypeError(
             f"expected ISO date YYYY-MM-DD, got {value!r}"
@@ -47,14 +49,7 @@ def _parse_date(value: str) -> date:
 
 
 def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        while True:
-            chunk = handle.read(1024 * 1024)
-            if not chunk:
-                break
-            digest.update(chunk)
-    return digest.hexdigest()
+    return sha256_path(path)
 
 
 def _download(
@@ -64,82 +59,22 @@ def _download(
     attempts: int,
     request_interval: float,
 ) -> Path:
-    if target.is_file() and target.stat().st_size > 0:
-        return target
-    target.parent.mkdir(parents=True, exist_ok=True)
-    encoded = parse.urlencode(payload).encode("ascii")
-    last_error: Exception | None = None
-    for attempt in range(1, attempts + 1):
-        try:
-            http_request = request.Request(
-                TAIFEX_DOWNLOAD_URL,
-                data=encoded,
-                headers={
-                    "User-Agent": "stockAgent/taifex-day-session-research",
-                    "Content-Type": "application/x-www-form-urlencoded",
-                },
-                method="POST",
-            )
-            with request.urlopen(http_request, timeout=120) as response:
-                body = response.read()
-                disposition = str(response.headers.get("Content-Disposition") or "")
-            if len(body) < 100 or "attachment" not in disposition.casefold():
-                raise RuntimeError(
-                    "TAIFEX response was not a downloadable attachment"
-                )
-            with tempfile.NamedTemporaryFile(
-                dir=target.parent,
-                prefix=target.name + ".",
-                suffix=".tmp",
-                delete=False,
-            ) as handle:
-                temporary = Path(handle.name)
-                handle.write(body)
-                handle.flush()
-                os.fsync(handle.fileno())
-            temporary.replace(target)
-            return target
-        except Exception as exc:
-            last_error = exc
-            if attempt >= attempts:
-                break
-            time.sleep(max(request_interval, float(attempt)))
-    raise RuntimeError(
-        f"failed to download {target.name} after {attempts} attempts"
-    ) from last_error
+    return download_taifex_attachment(
+        TAIFEX_DOWNLOAD_URL,
+        payload,
+        target,
+        attempts=attempts,
+        request_interval=request_interval,
+        user_agent="stockAgent/taifex-day-session-research",
+    )
 
 
 def _month_ranges(start: date, end: date):
-    current = start.replace(day=1)
-    while current <= end:
-        next_month = (
-            date(current.year + 1, 1, 1)
-            if current.month == 12
-            else date(current.year, current.month + 1, 1)
-        )
-        range_start = max(start, current)
-        range_end = min(end, next_month - timedelta(days=1))
-        yield range_start, range_end
-        current = next_month
+    yield from month_ranges(start, end)
 
 
 def _validate_receipt(path: Path) -> None:
-    if path.suffix.lower() == ".zip":
-        if not zipfile.is_zipfile(path):
-            raise ValueError(f"downloaded annual file is not a ZIP: {path}")
-        with zipfile.ZipFile(path) as archive:
-            csv_members = [
-                name for name in archive.namelist() if name.lower().endswith(".csv")
-            ]
-            if not csv_members:
-                raise ValueError(f"annual ZIP contains no CSV: {path}")
-    elif path.suffix.lower() == ".csv":
-        with path.open("rb") as handle:
-            header = handle.readline()
-        if b"," not in header or len(header) < 40:
-            raise ValueError(f"downloaded range file has no CSV header: {path}")
-    else:
-        raise ValueError(f"unsupported receipt: {path}")
+    validate_taifex_receipt(path)
 
 
 def main() -> int:

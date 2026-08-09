@@ -47,6 +47,37 @@ Outputs:
 - `data_tw_microstructure/hft_dataset/manifest.json`
 - `data_tw_microstructure/audits/hft_YYYY-MM-DD.json`
 
+## Compact raw captures for transfer
+
+The live recorder intentionally writes immutable parts so an interrupted market
+session cannot corrupt a large Parquet file.  After the corresponding HFT dates
+have passed both audits, compact the selected `capture_id` parts into an
+immutable transfer snapshot with exactly one Parquet file per symbol:
+
+```bash
+source scripts/runtime_env.sh
+POLARS_MAX_THREADS=32 run_fintech_python \
+  scripts/compact_shioaji_microstructure_by_symbol.py \
+  --through-date 2026-08-06 \
+  --output-root data_tw_microstructure/symbol_dataset_20260806
+```
+
+The compactor checks the HFT summary, audit receipt, worker manifests, stream
+row totals, symbol membership, and output hashes before atomically publishing
+the output.  It excludes dates after `--through-date`, so the current live
+capture is not read while it is being written.  Output files are
+`symbols/symbol=CODE/data.parquet`; Tick, BidAsk events, and one-second books
+share a union schema and are identified by `source_stream`.  The bounded-memory
+writer reads one completed date and stream at a time and appends large row
+groups directly to each symbol file; it does not create a second partitioned
+dataset as an intermediate result.
+
+This symbol layout is for raw-event archival and machine transfer.  Keep the
+causal HFT training dataset partitioned by trading date, because training reads
+the market cross-section for each time interval.  Parquet is not appendable, so
+publish each compacted history as a new immutable snapshot instead of mutating
+an older symbol file in place.
+
 ## Feature and label contract
 
 - Session rows are restricted to `[09:00:00, 13:30:00)` Asia/Taipei.

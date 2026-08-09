@@ -260,6 +260,71 @@ def _local_world_size(active_strategy: str | None = None) -> int:
         return 1
 
 
+def _parse_cpu_affinity(value: str) -> set[int]:
+    cpus: set[int] = set()
+    for token in str(value).split(","):
+        part = token.strip()
+        if not part:
+            continue
+        if "-" in part:
+            first_text, last_text = part.split("-", 1)
+            first, last = int(first_text), int(last_text)
+            if first < 0 or last < first:
+                raise ValueError(f"invalid CPU affinity range: {part!r}")
+            cpus.update(range(first, last + 1))
+        else:
+            cpu = int(part)
+            if cpu < 0:
+                raise ValueError(f"invalid CPU affinity index: {part!r}")
+            cpus.add(cpu)
+    if not cpus:
+        raise ValueError("CPU affinity set must not be empty")
+    return cpus
+
+
+def _configure_local_rank_cpu_affinity(active_strategy: str) -> None:
+    """Optionally bind each local DDP rank to its GPU-adjacent CPU set.
+
+    The semicolon-separated environment contract keeps topology-specific CPU
+    numbers out of portable market configs.  Example for two local ranks:
+    ``STOCKAGENT_DDP_CPU_AFFINITY='0-15;16-31'``.
+    """
+
+    raw = os.environ.get("STOCKAGENT_DDP_CPU_AFFINITY", "").strip()
+    if not raw or active_strategy != "distributed_data_parallel":
+        return
+    local_rank_text = os.environ.get("LOCAL_RANK")
+    if local_rank_text is None:
+        return
+    local_rank = int(local_rank_text)
+    rank_specs = [part.strip() for part in raw.split(";")]
+    local_world_size = _local_world_size(active_strategy)
+    if len(rank_specs) != local_world_size:
+        raise ValueError(
+            "STOCKAGENT_DDP_CPU_AFFINITY must contain one CPU set per local rank: "
+            f"sets={len(rank_specs)} local_world_size={local_world_size}"
+        )
+    if local_rank < 0 or local_rank >= len(rank_specs):
+        raise ValueError(
+            f"LOCAL_RANK={local_rank} has no configured CPU affinity set"
+        )
+    requested = _parse_cpu_affinity(rank_specs[local_rank])
+    available = set(os.sched_getaffinity(0))
+    unavailable = sorted(requested - available)
+    if unavailable:
+        raise ValueError(
+            "DDP CPU affinity requests unavailable CPUs: "
+            + ",".join(str(cpu) for cpu in unavailable)
+        )
+    os.sched_setaffinity(0, requested)
+    print(
+        "[runtime] ddp_cpu_affinity "
+        f"local_rank={local_rank} cpus={rank_specs[local_rank]} "
+        f"count={len(requested)}",
+        flush=True,
+    )
+
+
 def _resolve_process_thread_count(
     configured_total: int | None,
     *,
@@ -293,6 +358,11 @@ def _resolve_process_thread_count(
     return max(1, _available_cpu_count() // ranks)
 
 
+def _clamp_thread_count_to_affinity(threads: int) -> int:
+    """Never oversubscribe a rank after topology-specific affinity binding."""
+    return max(1, min(int(threads), _available_cpu_count()))
+
+
 def _configure_cpu_parallelism(
     *,
     cpu_threads: int | None,
@@ -304,6 +374,7 @@ def _configure_cpu_parallelism(
         inherited_names=("STOCKAGENT_CPU_THREADS", "OMP_NUM_THREADS"),
         local_world_size=local_world_size,
     )
+    resolved_cpu_threads = _clamp_thread_count_to_affinity(resolved_cpu_threads)
     os.environ["STOCKAGENT_CPU_THREADS"] = str(resolved_cpu_threads)
 
     for env_name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
@@ -738,6 +809,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--torch-compile-mode",
+        type=str,
+        default=None,
+        help=(
+            "Override training.torch_compile_mode, for example "
+            "reduce-overhead or max-autotune-no-cudagraphs."
+        ),
+    )
+    parser.add_argument(
         "--cudnn-benchmark",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -751,6 +831,26 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--batch-size-train", type=int, default=None, help="Override training.batch_size_train.")
     parser.add_argument("--batch-size-eval", type=int, default=None, help="Override training.batch_size_eval.")
+    parser.add_argument(
+        "--transformer-temporal-pooling",
+        choices=("attention", "last", "mean"),
+        default=None,
+        help="Override transformer_base_portfolio.temporal_pooling for an A/B run.",
+    )
+    parser.add_argument(
+        "--transformer-d-model",
+        type=int,
+        default=None,
+        help="Override transformer_base_portfolio.d_model for a capacity A/B run.",
+    )
+    parser.add_argument(
+        "--transformer-temporal-query-mode",
+        choices=("full_then_last", "last_only"),
+        default=None,
+        help=(
+            "Override transformer_base_portfolio.temporal_query_mode for an A/B run."
+        ),
+    )
     parser.add_argument(
         "--cache-train-tensors-on-gpu",
         action=argparse.BooleanOptionalAction,
@@ -864,6 +964,24 @@ def parse_args() -> argparse.Namespace:
         help="Override training.defer_epoch_curve_plot_until_end.",
     )
     parser.add_argument(
+        "--minute-decision-chunk-rows",
+        type=int,
+        default=None,
+        help=(
+            "Override training.minute_decision_chunk_rows for tw_minute "
+            "capacity and throughput measurements."
+        ),
+    )
+    parser.add_argument(
+        "--minute-eval-decision-chunk-rows",
+        type=int,
+        default=None,
+        help=(
+            "Override training.minute_eval_decision_chunk_rows for tw_minute "
+            "evaluation capacity measurements."
+        ),
+    )
+    parser.add_argument(
         "--postprocess-benchmark-after-fold",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -930,6 +1048,7 @@ def main() -> None:
     config_strategy = _resolve_multi_gpu_strategy(getattr(config.training, "multi_gpu_strategy", "auto"))
     cli_strategy = _resolve_multi_gpu_strategy(args.multi_gpu_strategy) if args.multi_gpu_strategy is not None else None
     active_strategy = cli_strategy or config_strategy
+    _configure_local_rank_cpu_affinity(active_strategy)
     configured_cpu_threads = args.cpu_threads if args.cpu_threads is not None else config.environment.cpu_threads
     compile_threads = (
         args.torch_compile_threads
@@ -970,6 +1089,8 @@ def main() -> None:
         config.training.multi_gpu_strategy = active_strategy
     if args.cudnn_benchmark is not None:
         config.environment.cudnn_benchmark = bool(args.cudnn_benchmark)
+    if args.torch_compile_mode is not None:
+        config.training.torch_compile_mode = str(args.torch_compile_mode)
     if args.batch_size_train is not None:
         if args.batch_size_train < 1:
             raise ValueError(f"--batch-size-train must be >= 1, got {args.batch_size_train}")
@@ -978,6 +1099,22 @@ def main() -> None:
         if args.batch_size_eval < 1:
             raise ValueError(f"--batch-size-eval must be >= 1, got {args.batch_size_eval}")
         config.training.batch_size_eval = int(args.batch_size_eval)
+    if args.transformer_temporal_pooling is not None:
+        config.training.transformer_base_portfolio.temporal_pooling = str(
+            args.transformer_temporal_pooling
+        )
+    if args.transformer_d_model is not None:
+        if args.transformer_d_model < 1:
+            raise ValueError(
+                f"--transformer-d-model must be >= 1, got {args.transformer_d_model}"
+            )
+        config.training.transformer_base_portfolio.d_model = int(
+            args.transformer_d_model
+        )
+    if args.transformer_temporal_query_mode is not None:
+        config.training.transformer_base_portfolio.temporal_query_mode = str(
+            args.transformer_temporal_query_mode
+        )
     if args.cache_train_tensors_on_gpu is not None:
         config.training.cache_train_tensors_on_gpu = bool(args.cache_train_tensors_on_gpu)
     if args.cache_eval_tensors_on_gpu is not None:
@@ -1030,6 +1167,24 @@ def main() -> None:
         config.training.backtest_artifact_compression = str(args.backtest_artifact_compression)
     if args.defer_epoch_curve_plot_until_end is not None:
         config.training.defer_epoch_curve_plot_until_end = bool(args.defer_epoch_curve_plot_until_end)
+    if args.minute_decision_chunk_rows is not None:
+        if args.minute_decision_chunk_rows < 1:
+            raise ValueError(
+                "--minute-decision-chunk-rows must be >= 1, got "
+                f"{args.minute_decision_chunk_rows}"
+            )
+        config.training.minute_decision_chunk_rows = int(
+            args.minute_decision_chunk_rows
+        )
+    if args.minute_eval_decision_chunk_rows is not None:
+        if args.minute_eval_decision_chunk_rows < 1:
+            raise ValueError(
+                "--minute-eval-decision-chunk-rows must be >= 1, got "
+                f"{args.minute_eval_decision_chunk_rows}"
+            )
+        config.training.minute_eval_decision_chunk_rows = int(
+            args.minute_eval_decision_chunk_rows
+        )
     if args.postprocess_benchmark_after_fold is not None:
         config.training.postprocess_benchmark_after_fold = bool(args.postprocess_benchmark_after_fold)
     if args.postprocess_benchmark_after_best_val is not None:
@@ -1099,6 +1254,23 @@ def main() -> None:
             )
         config.environment.device = "cpu"
         print("[runner] CUDA unavailable; falling back to CPU because runner.require_cuda=false")
+
+    from stockagent.training.mode_adapter import (
+        dispatch_specialized_training_mode,
+    )
+
+    if dispatch_specialized_training_mode(
+        config,
+        output_dir=output_dir,
+        mode=mode,
+        resume=bool(resume),
+        start_fold=start_fold,
+        max_folds=args.max_folds,
+        active_strategy=str(active_strategy),
+        isolate_train_folds=bool(isolate_train_folds),
+        startup_checkpoint=startup_timing.checkpoint,
+    ):
+        return
 
     panel = _build_panel_rank_coordinated(build_panel, config, active_strategy)
     if str(config.trading.execution_mode) == "tw_index_futures_day":

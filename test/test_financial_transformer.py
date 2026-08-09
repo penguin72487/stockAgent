@@ -10,6 +10,9 @@ import yaml
 from stockagent.config import TransformerBasePortfolioModelConfig, load_config
 from stockagent.models.factory import build_model, model_hidden_dim_hint
 from stockagent.models.financial_transformer import FinancialTransformerModel
+from stockagent.models.transformer_base_portfolio import (
+    ONLINE_SAFE_TEMPORAL_BASIS_FAMILIES,
+)
 
 
 def _device() -> torch.device:
@@ -100,6 +103,26 @@ def test_financial_transformer_last_pooling_panel_slab_forward() -> None:
     assert weights[2, 6].item() == 0.0
 
 
+def test_checkpointed_mean_pooling_compiles_fullgraph_without_capture_side_effect() -> None:
+    device = _device()
+    model = _make_model(
+        checkpoint_blocks=True,
+        temporal_pooling="mean",
+        temporal_query_mode="full_then_last",
+        return_aux=False,
+        return_aux_details=False,
+    ).train()
+    compiled = torch.compile(model, backend="eager", fullgraph=True)
+    x = torch.randn(2, 5, 7, 10, device=device, requires_grad=True)
+    mask = torch.ones(2, 7, dtype=torch.bool, device=device)
+
+    weights = compiled(x, mask)
+    weights.square().sum().backward()
+
+    assert x.grad is not None
+    assert torch.isfinite(x.grad).all()
+
+
 def test_candle_encoder_directly_replaces_feature_projection() -> None:
     device = _device()
     model = _make_model().eval()
@@ -169,6 +192,34 @@ def test_factory_builds_financial_transformer_model() -> None:
     assert isinstance(model, FinancialTransformerModel)
     assert model_hidden_dim_hint(cfg) == 24
     assert model.candle_encoder.d_model == 24
+
+
+def test_multi_basis_experiment_config_is_fresh_and_propagates_to_financial_model() -> None:
+    config = load_config("configs/markets/tw_public_multi_basis.yaml")
+
+    assert config.runner.resume is False
+    assert config.training.lookback == 32
+    assert config.training.model_name == "financial_transformer"
+    expected = ["haar", "fourier", "dct"]
+    assert config.training.transformer_base_portfolio.temporal_basis_families == expected
+    assert config.training.financial_transformer.temporal_basis_families == expected
+    assert config.training.financial_transformer.temporal_basis_components == 8
+    assert config.training.financial_transformer.temporal_basis_gate_init == -2.0
+
+
+def test_online_complete_multi_basis_config_propagates_every_supported_family() -> None:
+    config = load_config(
+        "configs/markets/tw_public_multi_basis_online_complete.yaml"
+    )
+
+    expected = list(ONLINE_SAFE_TEMPORAL_BASIS_FAMILIES)
+    assert config.runner.resume is False
+    assert config.training.lookback == 32
+    assert config.training.model_name == "financial_transformer"
+    assert config.training.transformer_base_portfolio.temporal_basis_families == expected
+    assert config.training.financial_transformer.temporal_basis_families == expected
+    assert config.training.financial_transformer.temporal_basis_components == 4
+    assert "online_complete_lookback32_v2" in config.runner.output_dir
 
 
 def test_candle_encoder_uses_every_feature_jointly() -> None:

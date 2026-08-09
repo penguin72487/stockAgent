@@ -1,0 +1,98 @@
+base_config: tw.yaml
+
+experiment_name: tw-full-market-minute-day-trade
+
+runner:
+  output_dir: artifacts/markets/tw_minute
+  mode: train
+  resume: true
+  post_train_infer: false
+  start_fold: null
+  isolate_train_folds: false
+
+data:
+  panel_start_date: "2020-01-01"
+  minute_parquet_root: data_tw_minute/research_dataset
+  minute_require_research_ready: true
+  minute_verify_partition_sha256: true
+
+walk_forward:
+  min_train_years: 2
+  val_years: 1
+  expected_first_year: 2020
+  require_contiguous_years: true
+  require_future_test_year: false
+  lookback_context: split_only
+  split_start_year: null
+
+trading:
+  frequency: minute
+  execution_mode: tw_minute
+  long_only: true
+  reporting_leverage: 1.0
+  portfolio_activation: identity
+  min_trade_weight: 0.0
+  # Every completed 1m KBar emits a new target. Only the target delta trades.
+  max_volume_participation: 0.01
+  tw_minute_initial_equity: 10000000.0
+  tw_minute_gross_exposure: 0.90
+  tw_minute_max_name_weight: 0.05
+  tw_minute_max_order_notional: 1000000.0
+  tw_minute_slippage_bps_per_side: 2.0
+  tw_minute_first_decision_minute: 1
+  # A 13:29 decision may only reduce inventory; no last-minute round trip.
+  tw_minute_last_entry_minute: 268
+  tw_minute_last_decision_minute: 269
+  tw_minute_force_session_close: true
+
+training:
+  model_name: transformer_base_portfolio
+  multi_gpu_strategy: none
+  lookback: 32
+  # Batch axes are independent trading days. Ten sequential decisions are
+  # evaluated together inside each day, so train forward rows are 3*10=30.
+  batch_size_train: 3
+  batch_size_eval: 6
+  minute_decision_chunk_rows: 10
+  minute_cache_days_on_cpu: true
+  minute_cpu_cache_gb: 64.0
+  minute_data_workers: 4
+  epochs: 100
+  learning_rate: 0.0003
+  weight_decay: 0.01
+  grad_clip_norm: 1.0
+  loss_type: log_utility
+  loss_portfolio_activation: identity
+  enable_torch_compile: true
+  compile_loss: false
+  strict_no_fallback: true
+  allow_dynamic_symbols: false
+  explain_after_each_fold: false
+  transformer_base_portfolio:
+    attention_mode: market_token
+    use_latent_factors: false
+    use_market_tokens: true
+    temporal_pooling: attention
+    temporal_query_mode: full_then_last
+    portfolio_mode: long_only
+    portfolio_output_mode: logits
+    return_aux: false
+    return_aux_details: false
+  # Keep the shared Transformer contract aligned even though this runner uses
+  # transformer_base_portfolio; config-wide compatibility tests rely on it.
+  financial_transformer:
+    attention_mode: market_token
+    use_latent_factors: false
+    use_market_tokens: true
+    temporal_pooling: attention
+    temporal_query_mode: full_then_last
+    portfolio_mode: long_only
+    portfolio_output_mode: logits
+    return_aux: false
+    return_aux_details: false
+  multitask_loss:
+    rank_ic_weight: 0.0
+    return_rank_ic_weight: 0.0
+    direction_weight: 0.0
+    volatility_regime_weight: 0.0
+    concentration_weight: 0.0

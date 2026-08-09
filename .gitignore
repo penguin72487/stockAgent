@@ -213,5 +213,8 @@ codex/*
 data_openBB/*
 data_tw_microstructure/*
 data_tw_index_futures/*
+data_tw_index_options_daily/*
 .env.trade.example
 data_tw_minute/*
+data_tw_index_derivatives_ticks/*
+artifacts_benchmark/*

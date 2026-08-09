@@ -14,7 +14,9 @@ import polars as pl
 
 
 NS_PER_MINUTE = 60_000_000_000
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 4
+FEATURE_STATISTICS_CONTRACT = "float64_sums_v1"
+VOLUME_NOTIONAL_TOLERANCE = 0.05
 
 MODEL_FEATURE_COLUMNS = (
     "log_close_return_1m",
@@ -68,6 +70,15 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Optional comma-separated completed symbols. Default: all manifests.",
     )
+    parser.add_argument(
+        "--download-summary",
+        type=Path,
+        default=None,
+        help=(
+            "Receipt-backed full-market download summary. Defaults to "
+            "<input-root>/download_summary.json."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -99,6 +110,40 @@ def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
 def build_research_frame(frame: pl.LazyFrame) -> pl.LazyFrame:
     """Create completed-bar features and strictly next-bar execution labels."""
 
+    positive_volume = (pl.col("Volume") > 0.0) & (pl.col("Amount") > 0.0)
+
+    def volume_multiplier_matches(multiplier: pl.Expr | float) -> pl.Expr:
+        candidate = (
+            multiplier if isinstance(multiplier, pl.Expr) else pl.lit(multiplier)
+        )
+        notional = pl.col("Volume") * candidate
+        tolerance = VOLUME_NOTIONAL_TOLERANCE
+        return (
+            positive_volume
+            & (pl.col("Amount") >= notional * pl.col("Low") * (1.0 - tolerance))
+            & (pl.col("Amount") <= notional * pl.col("High") * (1.0 + tolerance))
+        )
+
+    # Historical Shioaji stock Kbars mix round-lot and direct-share Volume
+    # encodings. Amount and the bar's OHLC range identify the source multiplier
+    # without manufacturing a price or an executable quantity. Unknown positive
+    # volume rows deliberately produce null capacity.
+    multiplier_candidates: tuple[pl.Expr | float, ...] = (
+        pl.col("contract_unit"),
+        1_000.0,
+        100.0,
+        10.0,
+        1.0,
+    )
+    source_volume_multiplier = pl.coalesce(
+        *[
+            pl.when(volume_multiplier_matches(candidate))
+            .then(candidate)
+            .otherwise(None)
+            for candidate in multiplier_candidates
+        ]
+    )
+
     ordered = (
         frame.with_columns(
             pl.col("ts").cast(pl.Datetime("ns")),
@@ -127,6 +172,11 @@ def build_research_frame(frame: pl.LazyFrame) -> pl.LazyFrame:
             .alias("minutes_from_open"),
             pl.col("ts").shift(1).over(["symbol", "date"]).alias("previous_ts"),
             pl.col("Close").shift(1).over(["symbol", "date"]).alias("previous_close"),
+            pl.when((pl.col("Volume") == 0.0) & (pl.col("Amount") == 0.0))
+            .then(pl.col("contract_unit"))
+            .otherwise(source_volume_multiplier)
+            .cast(pl.Float64)
+            .alias("source_volume_multiplier"),
         )
         .with_columns(
             (
@@ -142,6 +192,9 @@ def build_research_frame(frame: pl.LazyFrame) -> pl.LazyFrame:
             )
             .fill_null(False)
             .alias("has_exact_next_minute"),
+            pl.col("source_volume_multiplier")
+            .is_not_null()
+            .alias("source_volume_unit_valid"),
         )
         .with_columns(
             pl.when(
@@ -162,7 +215,10 @@ def build_research_frame(frame: pl.LazyFrame) -> pl.LazyFrame:
             .then((pl.col("Close") - pl.col("Low")) / (pl.col("High") - pl.col("Low")))
             .otherwise(0.5)
             .alias("close_location"),
-            (pl.col("Volume") * pl.col("contract_unit")).alias("volume_shares"),
+            pl.when(pl.col("source_volume_unit_valid"))
+            .then(pl.col("Volume") * pl.col("source_volume_multiplier"))
+            .otherwise(None)
+            .alias("volume_shares"),
         )
         .with_columns(
             pl.col("volume_shares")
@@ -236,8 +292,7 @@ def build_research_frame(frame: pl.LazyFrame) -> pl.LazyFrame:
             .otherwise(None)
             .alias("short_gross_return_next_1m"),
             (
-                pl.col("label_valid_1m")
-                & (
+                (
                     pl.col("session_last_ts").dt.hour().cast(pl.Int16) * 60
                     + pl.col("session_last_ts").dt.minute().cast(pl.Int16)
                     == 13 * 60 + 30
@@ -248,11 +303,11 @@ def build_research_frame(frame: pl.LazyFrame) -> pl.LazyFrame:
             .alias("session_exit_valid"),
         )
         .with_columns(
-            pl.when(pl.col("session_exit_valid"))
+            pl.when(pl.col("session_exit_valid") & pl.col("label_valid_1m"))
             .then(pl.col("session_close") / pl.col("execution_open_next_1m") - 1.0)
             .otherwise(None)
             .alias("long_gross_return_to_session_close"),
-            pl.when(pl.col("session_exit_valid"))
+            pl.when(pl.col("session_exit_valid") & pl.col("label_valid_1m"))
             .then(pl.col("execution_open_next_1m") / pl.col("session_close") - 1.0)
             .otherwise(None)
             .alias("short_gross_return_to_session_close"),
@@ -287,9 +342,12 @@ def discover_chunk_groups(
             raise RuntimeError(f"invalid minute symbol manifest: {manifest_path}")
         selected_symbols.append(symbol)
         for chunk in payload.get("chunks", []):
-            if chunk.get("status") != "ok":
+            if chunk.get("status") not in {"ok", "source_gap"}:
                 continue
-            path = Path(str(chunk.get("data_path", "")))
+            raw_path = chunk.get("data_path")
+            if not raw_path:
+                continue
+            path = Path(str(raw_path))
             if not path.is_file():
                 raise RuntimeError(f"minute chunk is missing: {path}")
             expected = str(chunk.get("data_sha256", ""))
@@ -306,6 +364,102 @@ def discover_chunk_groups(
     return dict(sorted(groups.items())), sorted(selected_symbols)
 
 
+def _validate_collection_gate(
+    path: Path,
+    *,
+    selected_symbols: list[str],
+    subset_requested: bool,
+) -> dict[str, Any]:
+    if not path.is_file():
+        raise RuntimeError(f"minute download summary is missing: {path}")
+    payload = _read_json(path)
+    required_identity = (
+        payload.get("schema_version") == 1
+        and payload.get("source") == "shioaji_kbars_1m"
+        and payload.get("storage_frequency") == "minute"
+        and bool(payload.get("simulation"))
+    )
+    if not required_identity:
+        raise RuntimeError(f"invalid minute download summary identity: {path}")
+    if payload.get("fatal_error"):
+        raise RuntimeError(
+            "minute collection has a fatal error: " + str(payload["fatal_error"])
+        )
+    selected = int(payload.get("selected_symbols", 0))
+    reported = int(payload.get("reported_symbols", 0))
+    failed = int(payload.get("failed_symbols", 0))
+    partial = int(payload.get("partial_symbols", 0))
+    available = int(payload.get("complete_symbols", 0)) + int(
+        payload.get("complete_with_source_gap_symbols", 0)
+    )
+    unavailable = int(payload.get("contract_unavailable_symbols", 0))
+    accounted = available + unavailable + failed + partial
+    if not bool(payload.get("resumable_collection_complete")):
+        raise RuntimeError(
+            "minute collection is not research-ready: "
+            f"selected={selected} reported={reported} available={available} "
+            f"unavailable={unavailable} failed={failed} partial={partial}"
+        )
+    if selected <= 0 or reported != selected or accounted != selected:
+        raise RuntimeError(
+            "minute collection accounting is inconsistent: "
+            f"selected={selected} reported={reported} accounted={accounted}"
+        )
+    if failed or partial:
+        raise RuntimeError(
+            f"minute collection still has failed={failed} partial={partial}"
+        )
+    if not subset_requested and len(selected_symbols) != available:
+        raise RuntimeError(
+            "completed minute manifests do not match available-source count: "
+            f"manifests={len(selected_symbols)} available={available}"
+        )
+    return payload
+
+
+def _feature_statistics(day_frame: pl.DataFrame) -> dict[str, Any]:
+    valid = day_frame.filter(pl.col("feature_valid"))
+    if valid.is_empty():
+        counts = {name: 0 for name in MODEL_FEATURE_COLUMNS}
+        sums = {name: 0.0 for name in MODEL_FEATURE_COLUMNS}
+        sum_squares = {name: 0.0 for name in MODEL_FEATURE_COLUMNS}
+    else:
+        row = valid.select(
+            *[
+                pl.col(name).count().alias(f"{name}__count")
+                for name in MODEL_FEATURE_COLUMNS
+            ],
+            *[
+                pl.col(name).cast(pl.Float64).sum().alias(f"{name}__sum")
+                for name in MODEL_FEATURE_COLUMNS
+            ],
+            *[
+                (
+                    pl.col(name).cast(pl.Float64)
+                    * pl.col(name).cast(pl.Float64)
+                )
+                .sum()
+                .alias(f"{name}__sum_square")
+                for name in MODEL_FEATURE_COLUMNS
+            ],
+        ).row(0, named=True)
+        counts = {
+            name: int(row[f"{name}__count"] or 0) for name in MODEL_FEATURE_COLUMNS
+        }
+        sums = {
+            name: float(row[f"{name}__sum"] or 0.0) for name in MODEL_FEATURE_COLUMNS
+        }
+        sum_squares = {
+            name: float(row[f"{name}__sum_square"] or 0.0)
+            for name in MODEL_FEATURE_COLUMNS
+        }
+    return {
+        "feature_counts": counts,
+        "feature_sums": sums,
+        "feature_sum_squares": sum_squares,
+    }
+
+
 def main() -> None:
     args = parse_args()
     requested = {
@@ -314,6 +468,16 @@ def main() -> None:
     groups, symbols = discover_chunk_groups(
         args.input_root,
         requested if requested else None,
+    )
+    download_summary_path = (
+        args.download_summary
+        if args.download_summary is not None
+        else args.input_root / "download_summary.json"
+    )
+    collection = _validate_collection_gate(
+        download_summary_path,
+        selected_symbols=symbols,
+        subset_requested=bool(requested),
     )
     date_summaries: dict[str, dict[str, Any]] = {}
     for (chunk_start, chunk_end), paths in groups.items():
@@ -339,6 +503,7 @@ def main() -> None:
             os.replace(temporary, output)
             summary = {
                 "schema_version": SCHEMA_VERSION,
+                "feature_statistics_contract": FEATURE_STATISTICS_CONTRACT,
                 "status": "ok",
                 "source": "shioaji_kbars_1m",
                 "trade_date": date_text,
@@ -351,8 +516,9 @@ def main() -> None:
                 "label_valid_rows": int(day_frame["label_valid_1m"].sum()),
                 "model_feature_columns": list(MODEL_FEATURE_COLUMNS),
                 "executor_only_columns": list(EXECUTOR_ONLY_COLUMNS),
-                "output": str(output),
+                "output": str(output.relative_to(args.output_root)),
                 "output_sha256": _sha256(output),
+                **_feature_statistics(day_frame),
             }
             _atomic_json(partition / "summary.json", summary)
             date_summaries[date_text] = summary
@@ -365,8 +531,29 @@ def main() -> None:
         args.output_root / "manifest.json",
         {
             "schema_version": SCHEMA_VERSION,
-            "status": "ok",
+            "feature_statistics_contract": FEATURE_STATISTICS_CONTRACT,
+            "status": "research_ready" if not requested else "research_subset",
+            "research_ready": not requested,
             "source": "shioaji_kbars_1m",
+            "decision_clock": "completed_right_labelled_1m_bar",
+            "execution_clock": "next_1m_bar_open_proxy",
+            "timezone": "Asia/Taipei",
+            "download_summary": str(download_summary_path),
+            "download_start_date": collection.get("start_date"),
+            "download_end_date": collection.get("end_date"),
+            "full_market_selected_symbols": int(
+                collection.get("selected_symbols", 0)
+            ),
+            "available_source_symbols": int(collection.get("complete_symbols", 0))
+            + int(collection.get("complete_with_source_gap_symbols", 0)),
+            "source_gap_symbols": int(
+                collection.get("complete_with_source_gap_symbols", 0)
+            ),
+            "contract_unavailable_symbols": int(
+                collection.get("contract_unavailable_symbols", 0)
+            ),
+            "failed_symbols": int(collection.get("failed_symbols", 0)),
+            "partial_symbols": int(collection.get("partial_symbols", 0)),
             "symbols": symbols,
             "dates": sorted(date_summaries),
             "partitions": [date_summaries[key] for key in sorted(date_summaries)],

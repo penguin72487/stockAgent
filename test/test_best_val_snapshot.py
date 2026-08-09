@@ -240,6 +240,60 @@ def test_save_fold_output_artifacts_writes_standard_files_with_compressed_backte
     assert completion["deployment_date_end"] == "2025-01-02"
 
 
+def test_save_fold_output_artifacts_survives_broken_report_pipe(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    model = nn.Linear(2, 1)
+    backtest = BacktestResult(
+        strategy_returns=np.array([0.01], dtype=np.float32),
+        benchmark_returns=np.array([0.0], dtype=np.float32),
+        turnovers=np.array([0.1], dtype=np.float32),
+        weights_history=np.array([[0.6, -0.4]], dtype=np.float32),
+    )
+    fold_result = FoldResult(
+        fold_id=1,
+        train_years=[2023],
+        val_years=[2024],
+        test_years=[2025],
+        best_val_loss=0.0,
+        val_ic={},
+        val_metrics={},
+        test_ic={},
+        test_metrics={},
+    )
+    config = SimpleNamespace(
+        training=SimpleNamespace(
+            table_output_format="csv",
+            save_daily_weights_table=False,
+            save_integer_share_daily_weights_table=False,
+            save_integer_share_holdings_table=False,
+            backtest_artifact_compression="none",
+        )
+    )
+
+    def broken_print(*_args, **_kwargs) -> None:
+        raise BrokenPipeError("detached output pipe")
+
+    monkeypatch.setattr("builtins.print", broken_print)
+    _save_fold_output_artifacts(
+        fold_dir=tmp_path,
+        fold_result=fold_result,
+        model=model,
+        test_backtest=backtest,
+        test_dates=np.array(["2025-01-02"], dtype="datetime64[D]"),
+        symbols=["A", "B"],
+        config=config,  # type: ignore[arg-type]
+        print_report=True,
+        write_plots=False,
+        mark_complete=True,
+    )
+
+    assert (tmp_path / "annual_report.txt").is_file()
+    assert (tmp_path / "mode_artifact_contract.json").is_file()
+    assert (tmp_path / "fold_complete.json").is_file()
+
+
 def test_walkforward_refresh_prefers_deployment_artifact_with_legacy_fallback(
     tmp_path: Path,
     monkeypatch,

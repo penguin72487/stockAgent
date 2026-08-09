@@ -177,3 +177,91 @@ def test_active_ablation_matrix_uses_bounded_dynamic_stock_axis(
     assert attention_training["compile_loss_dynamic_symbols"] is False
     assert attention_training["train_symbol_compaction_bucket_size"] == 512
     assert attention_training["transformer_base_portfolio"]["temporal_pooling"] == "attention"
+
+
+def test_tw_day_trade_unified_matrix_keeps_projection_control_except_output_modes(
+    tmp_path: Path,
+) -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    spec_path = (
+        repo_root / "configs/ablations/financial_transformer_tw_day_trade.yaml"
+    )
+    spec, experiments = _experiment_rows(spec_path)
+    expected_names = [
+        "baseline",
+        "lookback256_batch32",
+        "latent_only",
+        "market_only",
+        "temporal_only",
+        "no_rope_temporal",
+        "no_time_position",
+        "with_symbol_position",
+        "no_qk_norm",
+        "mean_pooling",
+        "attention_pooling",
+        "layernorm",
+        "gelu_ffn",
+        "initial_capital_10m",
+        "initial_capital_100m",
+        "output_activation_l1",
+        "output_l1",
+        "output_logits",
+        "output_signed_softmax",
+        "output_signed_entmax15",
+        "output_signed_sparsemax",
+    ]
+    assert [row["name"] for row in experiments] == expected_names
+
+    runs = _build_configs(spec_path, spec, experiments, tmp_path)
+    effective = {
+        run["name"]: yaml.safe_load(run["config_path"].read_text(encoding="utf-8"))
+        for run in runs
+    }
+    for raw in effective.values():
+        assert raw["trading"]["execution_mode"] == "tw_day_trade"
+        assert raw["trading"]["long_only"] is False
+        assert raw["training"]["loss_type"] == "log_utility"
+
+    output_modes = {
+        "output_activation_l1": "activation_l1",
+        "output_l1": "l1",
+        "output_logits": "logits",
+        "output_signed_softmax": "signed_softmax",
+        "output_signed_entmax15": "signed_entmax15",
+        "output_signed_sparsemax": "signed_sparsemax",
+    }
+    architecture_names = set(expected_names) - set(output_modes)
+    for name in architecture_names:
+        raw = effective[name]
+        assert (
+            raw["training"]["financial_transformer"]["portfolio_output_mode"]
+            == "projection_l1"
+        )
+        assert raw["trading"]["portfolio_activation"] == "pre_normalized"
+        assert raw["training"]["loss_portfolio_activation"] == "pre_normalized"
+
+    for name, output_mode in output_modes.items():
+        assert (
+            effective[name]["training"]["financial_transformer"][
+                "portfolio_output_mode"
+            ]
+            == output_mode
+        )
+
+    assert effective["baseline"]["training"]["lookback"] == 32
+    assert effective["baseline"]["training"]["batch_size_train"] == 128
+    assert effective["lookback256_batch32"]["training"]["lookback"] == 256
+    assert (
+        effective["lookback256_batch32"]["training"]["batch_size_train"] == 32
+    )
+    assert effective["baseline"]["trading"]["volume_participation_equity"] == 1_000_000.0
+    assert (
+        effective["initial_capital_10m"]["trading"]["volume_participation_equity"]
+        == 10_000_000.0
+    )
+    assert (
+        effective["initial_capital_100m"]["trading"]["volume_participation_equity"]
+        == 100_000_000.0
+    )
+    assert effective["initial_capital_10m"]["trading"]["tw_short_initial_margin_rate"] == 0.9
+    assert effective["initial_capital_100m"]["trading"]["tw_short_initial_margin_rate"] == 0.9

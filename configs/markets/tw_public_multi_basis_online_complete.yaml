@@ -1,0 +1,37 @@
+base_config: tw_public_multi_basis.yaml
+
+experiment_name: tw-public-financial-transformer-multi-basis-online-complete-lookback32-v2
+
+runner:
+  # This model owns a trainable temporal dictionary and a wider fusion layer;
+  # it is intentionally checkpoint-incompatible with both raw-only and v1.
+  output_dir: artifacts/markets/tw_public_candles_multi_basis_online_complete_lookback32_v2
+  resume: false
+
+training:
+  transformer_base_portfolio:
+    # All families consume only the observed trailing window and have static
+    # shapes. Four coefficients per family bound live inference and training
+    # cost while retaining complementary mechanisms rather than synonyms.
+    temporal_basis_families:
+      - haar
+      - swt_db2
+      - swt_sym4
+      - wavelet_packet
+      - walsh
+      - fourier
+      - dct
+      - dpss
+      - local_cosine
+      - morlet
+      - exponential
+      - laguerre
+      - difference
+      - ar_innovation
+      - bspline
+      - legendre
+      - chebyshev
+      - learned
+    temporal_basis_components: 4
+    temporal_basis_dropout: 0.0
+    temporal_basis_gate_init: -2.0

@@ -166,6 +166,7 @@ def build_model(
     num_features: int,
     num_symbols: int,
     feature_names: Sequence[str] | None = None,
+    daily_context_feature_names: Sequence[str] | None = None,
 ) -> nn.Module:
     model_name = _normalized_model_name(config.training.model_name)
 
@@ -392,6 +393,10 @@ def build_model(
             temporal_ffn_mult=tbp_cfg.temporal_ffn_mult,
             temporal_pooling=tbp_cfg.temporal_pooling,
             temporal_query_mode=tbp_cfg.temporal_query_mode,
+            temporal_basis_families=tbp_cfg.temporal_basis_families,
+            temporal_basis_components=tbp_cfg.temporal_basis_components,
+            temporal_basis_dropout=tbp_cfg.temporal_basis_dropout,
+            temporal_basis_gate_init=tbp_cfg.temporal_basis_gate_init,
             cross_layers=tbp_cfg.cross_layers,
             cross_heads=tbp_cfg.cross_heads,
             cross_ffn_mult=tbp_cfg.cross_ffn_mult,
@@ -459,6 +464,10 @@ def build_model(
             temporal_ffn_mult=fin_cfg.temporal_ffn_mult,
             temporal_pooling=fin_cfg.temporal_pooling,
             temporal_query_mode=fin_cfg.temporal_query_mode,
+            temporal_basis_families=fin_cfg.temporal_basis_families,
+            temporal_basis_components=fin_cfg.temporal_basis_components,
+            temporal_basis_dropout=fin_cfg.temporal_basis_dropout,
+            temporal_basis_gate_init=fin_cfg.temporal_basis_gate_init,
             cross_layers=fin_cfg.cross_layers,
             cross_heads=fin_cfg.cross_heads,
             cross_ffn_mult=fin_cfg.cross_ffn_mult,
@@ -490,6 +499,16 @@ def build_model(
             categorical_embedding_dim=fin_cfg.categorical_embedding_dim,
             categorical_embedding_cardinality=fin_cfg.categorical_embedding_cardinality,
             candle_dropout=fin_cfg.candle_dropout,
+            daily_context_num_features=len(daily_context_feature_names or ()),
+            daily_context_categorical_feature_indices=(
+                _feature_indices_from_patterns(
+                    daily_context_feature_names,
+                    fin_cfg.categorical_feature_names,
+                )
+            ),
+            daily_context_lookback=fin_cfg.daily_context_lookback,
+            daily_context_layers=fin_cfg.daily_context_layers,
+            daily_context_pooling=fin_cfg.daily_context_pooling,
             execution_mode=getattr(config.trading, "execution_mode", "naive"),
         )
 
