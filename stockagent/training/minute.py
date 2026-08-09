@@ -51,6 +51,7 @@ from stockagent.training.trainer import (
     TimingBreakdown,
     _EpochCurveLifecycle,
     _PreEpochTimingRecorder,
+    _active_model_config,
     _autocast_context,
     _can_enable_torch_compile,
     _create_adamw_optimizer,
@@ -77,6 +78,7 @@ from stockagent.training.trainer import (
     _save_fold_checkpoint,
     _save_group_checkpoint,
     _stable_fingerprint,
+    _configuration_fingerprint_snapshot,
     _step_batch_lr_scheduler,
     _timing_curve_payload,
     _torch_compile_options,
@@ -235,20 +237,7 @@ def _minute_dataset_fingerprint(dataset: MinuteDatasetIndex) -> str:
 
 
 def _minute_configuration_fingerprint(config: ExperimentConfig) -> str:
-    normalized_model_name = str(config.training.model_name).strip().lower().replace(
-        "-", "_"
-    )
-    active_model_config = (
-        config.training.financial_transformer
-        if normalized_model_name
-        in {
-            "financial_transformer",
-            "financial_transformer_model",
-            "financial_token_transformer",
-            "financial_tokenized_transformer",
-        }
-        else config.training.transformer_base_portfolio
-    )
+    active_model_config = _active_model_config(config)["values"]
     return _stable_fingerprint(
         {
             "training_contract_version": MINUTE_TRAINING_CONTRACT_VERSION,
@@ -260,7 +249,7 @@ def _minute_configuration_fingerprint(config: ExperimentConfig) -> str:
             "batch_size_train": config.training.batch_size_train,
             "minute_decision_chunk_rows": config.training.minute_decision_chunk_rows,
             "amp_dtype": config.environment.amp_dtype,
-            "active_model_config": asdict(active_model_config),
+            "active_model_config": active_model_config,
         }
     )
 
@@ -2711,7 +2700,9 @@ def run_minute_training(
     configuration = asdict(config)
     lifecycle.start(
         fold_ids=[],
-        configuration_fingerprint=_stable_fingerprint(configuration),
+        configuration_fingerprint=_stable_fingerprint(
+            _configuration_fingerprint_snapshot(config)
+        ),
         contract_versions={
             "execution": MINUTE_EXECUTION_CONTRACT_VERSION,
             "training": MINUTE_TRAINING_CONTRACT_VERSION,

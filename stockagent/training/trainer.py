@@ -4660,6 +4660,42 @@ def _panel_array_content_fingerprint(
     return _array_content_fingerprint(value)
 
 
+_TEMPORAL_BASIS_MODEL_CONFIG_FIELDS = (
+    "temporal_basis_families",
+    "temporal_basis_components",
+    "temporal_basis_dropout",
+    "temporal_basis_gate_init",
+)
+
+
+def _project_temporal_basis_model_config(
+    values: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Keep disabled basis defaults compatible with pre-feature checkpoints."""
+
+    projected = dict(values)
+    if not projected.get("temporal_basis_families"):
+        for field_name in _TEMPORAL_BASIS_MODEL_CONFIG_FIELDS:
+            projected.pop(field_name, None)
+    return projected
+
+
+def _configuration_fingerprint_snapshot(config: ExperimentConfig) -> dict[str, Any]:
+    """Return a semantic config snapshot while omitting disabled new branches."""
+
+    snapshot = asdict(config)
+    training = snapshot.get("training")
+    if isinstance(training, dict):
+        for config_name in (
+            "transformer_base_portfolio",
+            "financial_transformer",
+        ):
+            values = training.get(config_name)
+            if isinstance(values, Mapping):
+                training[config_name] = _project_temporal_basis_model_config(values)
+    return snapshot
+
+
 def _active_model_config(config: ExperimentConfig) -> dict[str, Any]:
     normalized = _normalized_model_name(config.training.model_name)
     if normalized in {
@@ -4670,7 +4706,9 @@ def _active_model_config(config: ExperimentConfig) -> dict[str, Any]:
         return {
             "config_name": "transformer_base_portfolio",
             "contract_name": "cross_sectional_index_futures",
-            "values": asdict(config.training.transformer_base_portfolio),
+            "values": _project_temporal_basis_model_config(
+                asdict(config.training.transformer_base_portfolio)
+            ),
         }
     aliases = {
         "cross_sectional_mlp": "mlp",
@@ -4720,7 +4758,9 @@ def _active_model_config(config: ExperimentConfig) -> dict[str, Any]:
         if model_config is not None:
             return {
                 "config_name": candidate,
-                "values": asdict(model_config),
+                "values": _project_temporal_basis_model_config(
+                    asdict(model_config)
+                ),
             }
     raise ValueError(
         f"Cannot resolve active model config for training.model_name={config.training.model_name!r}"
@@ -5003,6 +5043,12 @@ def _training_checkpoint_contract_schema_3(
 ) -> dict[str, Any]:
     """Exact training contract written by schema 3 before semantic layering."""
     contract = asdict(config.training)
+    for config_name in ("transformer_base_portfolio", "financial_transformer"):
+        model_values = contract.get(config_name)
+        if isinstance(model_values, Mapping):
+            contract[config_name] = _project_temporal_basis_model_config(
+                model_values
+            )
     transformer_values = contract.get("transformer_base_portfolio")
     if isinstance(transformer_values, Mapping):
         projected_transformer_values = dict(transformer_values)
@@ -5800,7 +5846,7 @@ def _checkpoint_manifest(
         for interval in legacy_intervals
     }
     legacy_setting_contract = legacy_setting_contracts["epoch"]
-    configuration_snapshot = asdict(config)
+    configuration_snapshot = _configuration_fingerprint_snapshot(config)
 
     schema_3_contracts = {
         "data": data_contract,
@@ -17705,7 +17751,9 @@ def run_training(
     lifecycle.start(
         fold_ids=[fold.fold_id for fold in fold_list],
         dataset_fingerprint=_stable_fingerprint(dataset_identity),
-        configuration_fingerprint=_stable_fingerprint(configuration),
+        configuration_fingerprint=_stable_fingerprint(
+            _configuration_fingerprint_snapshot(config)
+        ),
         contract_versions={
             "canonical_backtest": int(CANONICAL_BACKTEST_CONTRACT_VERSION),
         },
