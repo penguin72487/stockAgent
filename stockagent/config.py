@@ -116,6 +116,9 @@ def _validate_tw_minute_mode_contract(
     use_tw_public_rules: object,
     tw_public_feature_path: object,
     portfolio_output_mode: object,
+    gross_exposure: object,
+    maximum_name_weight: object,
+    outside_cash_logit: object,
     first_decision_minute: object,
     last_entry_minute: object,
     last_decision_minute: object,
@@ -152,11 +155,25 @@ def _validate_tw_minute_mode_contract(
             "point-in-time data.tw_public_feature_path; do not project today's "
             "sell-first eligibility backward"
         )
-    if normalize_portfolio_output_mode(str(portfolio_output_mode)) != "logits":
+    output_mode = normalize_portfolio_output_mode(str(portfolio_output_mode))
+    if output_mode not in {"logits", "l1", "projection_l1"}:
         raise ValueError(
-            "tw_minute requires transformer_base_portfolio.portfolio_output_mode='logits' "
-            "so the minute executor owns tradability masking and exposure limits"
+            "tw_minute requires the active model portfolio_output_mode to be "
+            "'logits', 'l1', or 'projection_l1'"
         )
+    if output_mode in {"l1", "projection_l1"}:
+        if float(gross_exposure) != 1.0:
+            raise ValueError(
+                "tw_minute pre-normalized portfolio output already emits the "
+                "daily day-trade allocation and requires "
+                "trading.tw_minute_gross_exposure=1.0"
+            )
+        if maximum_name_weight is not None or outside_cash_logit is not None:
+            raise ValueError(
+                "tw_minute pre-normalized portfolio output must preserve the "
+                "daily day-trade allocation before execution masks; disable the "
+                "minute per-name cap and outside-cash logits gate"
+            )
     first = int(first_decision_minute)
     last_entry = int(last_entry_minute)
     last = int(last_decision_minute)
@@ -705,6 +722,13 @@ class DataConfig:
     minute_parquet_root: str = "data_tw_minute/research_dataset"
     minute_require_research_ready: bool = True
     minute_verify_partition_sha256: bool = True
+    # Optional immutable daily-panel cache metadata used as causal context by
+    # the minute model.  A minute session D reads the ordinary day-trade
+    # feature row D-1; the dedicated opening-gap channel additionally reads
+    # open[D], which is already observable before the first minute decision.
+    # Keeping this as [day,symbol,feature] side input avoids repeating a wide
+    # daily vector on every one of the 270 minute bars.
+    minute_daily_context_panel_meta: str | None = None
     # Receipt-backed completed-second TX/TXO transactions.  The derived
     # dataset uses TXO chain activity as features and the first later TX trade
     # as the executable price; it never enters the daily panel builder.
@@ -1057,6 +1081,12 @@ class TransformerBasePortfolioModelConfig:
 @dataclass(slots=True)
 class FinancialTransformerModelConfig(TransformerBasePortfolioModelConfig):
     candle_dropout: float = 0.0
+    # The minute path may fuse a separately encoded causal history of completed
+    # daily features.  A value of one preserves the historical broadcast-only
+    # checkpoint schema; values greater than one create a new model contract.
+    daily_context_lookback: int = 1
+    daily_context_layers: int = 0
+    daily_context_pooling: str = "last"
 
 
 @dataclass(slots=True)
@@ -1255,6 +1285,18 @@ class TrainingConfig:
     # Evaluation has no autograd workspace, so its capacity optimum can differ
     # from training. None preserves the historical shared-chunk behavior.
     minute_eval_decision_chunk_rows: int | None = None
+    # Preserve the recurrent computation graph across every decision chunk so
+    # later turnover and forced-close costs reach the actions that caused them.
+    minute_full_day_credit_assignment: bool = False
+    # Recompute each minute policy chunk during the full-day backward pass.
+    # This preserves exact cross-chunk gradients without retaining a complete
+    # session of Transformer activations in VRAM.
+    minute_full_day_activation_checkpoint: bool = False
+    # Apply an exact-fee-scaled proximal update against executed holdings inside
+    # the sequential ledger.  The multiplier is dimensionless; 1.0 uses the
+    # applicable one-way fee as the soft-threshold strength.
+    minute_stateful_proximal_allocator: bool = False
+    minute_proximal_cost_multiplier: float = 1.0
     minute_cache_days_on_cpu: bool = True
     minute_cpu_cache_gb: float = 64.0
     minute_data_workers: int = 4
@@ -1659,6 +1701,34 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         training["minute_eval_decision_chunk_rows"] = max(
             1, int(training["minute_eval_decision_chunk_rows"])
         )
+    training["minute_full_day_credit_assignment"] = bool(
+        training["minute_full_day_credit_assignment"]
+    )
+    training["minute_full_day_activation_checkpoint"] = bool(
+        training["minute_full_day_activation_checkpoint"]
+    )
+    if (
+        training["minute_full_day_activation_checkpoint"]
+        and not training["minute_full_day_credit_assignment"]
+    ):
+        raise ValueError(
+            "training.minute_full_day_activation_checkpoint requires "
+            "training.minute_full_day_credit_assignment"
+        )
+    training["minute_stateful_proximal_allocator"] = bool(
+        training["minute_stateful_proximal_allocator"]
+    )
+    training["minute_proximal_cost_multiplier"] = float(
+        training["minute_proximal_cost_multiplier"]
+    )
+    if (
+        not math.isfinite(training["minute_proximal_cost_multiplier"])
+        or training["minute_proximal_cost_multiplier"] < 0.0
+    ):
+        raise ValueError(
+            "training.minute_proximal_cost_multiplier must be finite and "
+            "nonnegative"
+        )
     training["minute_cpu_cache_gb"] = max(0.0, float(training["minute_cpu_cache_gb"]))
     training["minute_data_workers"] = max(1, int(training["minute_data_workers"]))
     tw_compile_rows = training["tw_continuous_compile_chunk_rows"]
@@ -1921,6 +1991,24 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     financial_transformer["categorical_embedding_cardinality"] = max(
         2, int(financial_transformer["categorical_embedding_cardinality"])
     )
+    financial_transformer["daily_context_lookback"] = max(
+        1, int(financial_transformer["daily_context_lookback"])
+    )
+    financial_transformer["daily_context_layers"] = max(
+        0, int(financial_transformer["daily_context_layers"])
+    )
+    daily_context_pooling = (
+        str(financial_transformer["daily_context_pooling"])
+        .strip()
+        .lower()
+        .replace("-", "_")
+    )
+    if daily_context_pooling not in {"last", "mean", "attention"}:
+        raise ValueError(
+            "training.financial_transformer.daily_context_pooling must be "
+            "one of: last, mean, attention"
+        )
+    financial_transformer["daily_context_pooling"] = daily_context_pooling
 
     gradient_boosted_portfolio_transformer = training.setdefault(
         "gradient_boosted_portfolio_transformer", {}
@@ -2393,6 +2481,9 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         use_tw_public_rules=data["use_tw_public_rules"],
         tw_public_feature_path=data["tw_public_feature_path"],
         portfolio_output_mode=phase_model_config["portfolio_output_mode"],
+        gross_exposure=trading["tw_minute_gross_exposure"],
+        maximum_name_weight=trading["tw_minute_max_name_weight"],
+        outside_cash_logit=trading["tw_minute_outside_cash_logit"],
         first_decision_minute=trading["tw_minute_first_decision_minute"],
         last_entry_minute=trading["tw_minute_last_entry_minute"],
         last_decision_minute=trading["tw_minute_last_decision_minute"],
@@ -2423,12 +2514,30 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     if (
         DAY_TRADE_OPEN_GAP_FEATURE in data["feature_include"]
         and trading["execution_mode"] != "tw_day_trade"
+        and trading["execution_mode"] != "tw_minute"
         and trading["execution_mode"] not in TW_CARRYING_EXECUTION_MODES
     ):
         raise ValueError(
             f"data.feature_include={DAY_TRADE_OPEN_GAP_FEATURE!r} is available "
             "only with a phase-aware Taiwan execution mode; its row t value "
             "contains the next session's opening quote"
+        )
+    raw_minute_context_meta = data.get("minute_daily_context_panel_meta")
+    data["minute_daily_context_panel_meta"] = (
+        None
+        if raw_minute_context_meta is None
+        or not str(raw_minute_context_meta).strip()
+        else str(raw_minute_context_meta).strip()
+    )
+    if (
+        trading["execution_mode"] == "tw_minute"
+        and data["minute_daily_context_panel_meta"] is not None
+        and normalized_phase_model not in _TW_FINANCIAL_PHASE_HEAD_MODEL_NAMES
+    ):
+        raise ValueError(
+            "tw_minute daily feature context currently requires "
+            "training.model_name='financial_transformer' so minute and daily "
+            "features can use separate encoders without repeating daily data"
         )
     taiwan_fee_schedule = TaiwanFeeSchedule(
         commission_rate=trading["tw_commission_rate"],
@@ -2806,6 +2915,18 @@ def load_config(path: str | Path) -> ExperimentConfig:
             minute_decision_chunk_rows=training_raw["minute_decision_chunk_rows"],
             minute_eval_decision_chunk_rows=training_raw[
                 "minute_eval_decision_chunk_rows"
+            ],
+            minute_full_day_credit_assignment=training_raw[
+                "minute_full_day_credit_assignment"
+            ],
+            minute_full_day_activation_checkpoint=training_raw[
+                "minute_full_day_activation_checkpoint"
+            ],
+            minute_stateful_proximal_allocator=training_raw[
+                "minute_stateful_proximal_allocator"
+            ],
+            minute_proximal_cost_multiplier=training_raw[
+                "minute_proximal_cost_multiplier"
             ],
             minute_cache_days_on_cpu=training_raw["minute_cache_days_on_cpu"],
             minute_cpu_cache_gb=training_raw["minute_cpu_cache_gb"],

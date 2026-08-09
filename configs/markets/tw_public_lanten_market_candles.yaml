@@ -276,7 +276,7 @@ training:
     # single 32-dimensional candle vector.
     d_model: 32
     candle_dropout: 0.0
-    # sum(abs(long and short weights)) = 1 for every nonzero portfolio row.
+    # Project onto sum(abs(long and short weights)) <= 1; unused gross is cash.
     portfolio_output_mode: l1
   non_blocking_transfer: true
   model_name: financial_transformer
@@ -342,8 +342,8 @@ training:
   # 99-feature schema changes.
   batch_size_train: 128
   batch_size_eval: 128
-  epochs: 1000
-  early_stopping_no_improve_ratio: 0.1
+  epochs: 100
+  early_stopping_no_improve_ratio: 1
   val_interval_epochs: 1
   curve_test_interval: 1
   record_epoch_curve: true

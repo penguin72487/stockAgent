@@ -260,9 +260,17 @@ It is a long/short contract: sell-first allocation is restricted by exact-day
 official eligibility and the preceding session's official short-capacity
 evidence, with missing evidence failing closed.
 Its trading rules otherwise match the ordinary day-trade baseline: raw signed
-scores without de-meaning, 50% KBar volume participation, L1 gross exposure 1,
-normal fees/tax, zero extra slippage, and no cash gate, per-order ceiling, or
-per-name ceiling.
+scores with gross L1 exposure 1.0 and no de-meaning, NT$10 million initial
+capital, 50% KBar volume participation, normal fees/tax, zero extra slippage,
+and no outside-cash, per-order-notional, or per-name ceiling. The model sees
+ten one-minute microstructure fields plus fifteen pure OHLCV/candlestick fields
+rebuilt from the developing session candle after every completed minute. The
+remaining 84 point-in-time daily fields are projected once and fused into every
+minute token, preserving the complete inherited 99-feature contract without
+repeating wide daily tensors across all 270 bars.
+Executor eligibility and capacity masks
+run after the model allocation, so blocked or unfilled exposure also stays cash
+instead of being redistributed.
 
 - Use `run_fintech_python downloader/download_yahoo_ohlcv.py --asset forex` to download only the expanded FX universe.
 - Use `run_fintech_python downloader/download_forex_pepperstone.py` to download the Pepperstone-style FX universe.
