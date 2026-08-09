@@ -261,7 +261,13 @@ def execute_minute_target(
     short_open_mask: torch.Tensor | None = None,
     short_capacity_shares: torch.Tensor | None = None,
 ) -> MinuteStepResult:
-    """Execute one completed-bar decision at the next bar's open proxy."""
+    """Rebalance only the target delta at the next bar's open proxy.
+
+    ``exit_close`` is the next completed KBar's mark-to-market price; it does
+    not liquidate inventory.  Executed shares remain in ``state`` across
+    minute calls until a later target changes them or the session-close
+    routine explicitly flattens the account.
+    """
 
     if state.shares.ndim < 1:
         raise ValueError("minute executor shares must end in a symbol axis")

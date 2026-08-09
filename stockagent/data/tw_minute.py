@@ -11,9 +11,12 @@ import polars as pl
 
 
 MINUTE_SESSION_BARS = 270
-MINUTE_DATASET_SCHEMA_VERSION = 4
-MINUTE_FEATURE_STATISTICS_CONTRACT = "float64_sums_v1"
-MINUTE_FEATURE_COLUMNS = (
+MINUTE_DATASET_SCHEMA_VERSION = 5
+MINUTE_FEATURE_STATISTICS_CONTRACT = "float64_sums_developing_candle_v2"
+MINUTE_DEVELOPING_CANDLE_CONTRACT = (
+    "completed_minute_session_to_date_previous_completed_symbol_session_v2"
+)
+MINUTE_MICROSTRUCTURE_FEATURE_COLUMNS = (
     "log_close_return_1m",
     "gap_log_return",
     "intrabar_log_return",
@@ -25,6 +28,397 @@ MINUTE_FEATURE_COLUMNS = (
     "time_sin",
     "time_cos",
 )
+MINUTE_DEVELOPING_CANDLE_FEATURE_COLUMNS = (
+    "open_logret_1d",
+    "max_logret_1d",
+    "min_logret_1d",
+    "close_logret_1d",
+    "trading_volume_logret_1d",
+    "signed_vol",
+    "body_ratio",
+    "signed_body_ratio",
+    "delta_body_ratio",
+    "clv",
+    "clv_centered",
+    "delta_clv",
+    "upper_shadow",
+    "lower_shadow",
+    "shadow_imbalance",
+)
+MINUTE_FEATURE_COLUMNS = (
+    *MINUTE_MICROSTRUCTURE_FEATURE_COLUMNS,
+    *MINUTE_DEVELOPING_CANDLE_FEATURE_COLUMNS,
+)
+MINUTE_DAILY_OPEN_GAP_FEATURE = "next_session_open_gap_logret"
+MINUTE_DAILY_CONTEXT_CONTRACT = (
+    "causal_completed_daily_history_plus_observed_open_v3"
+)
+_TW_MAX_ABS_DAILY_PRICE_LOG_RETURN = float(np.log(2.0))
+
+
+def minute_static_daily_context_feature_names(
+    feature_names: Sequence[str],
+) -> tuple[str, ...]:
+    """Split the ordinary daily feature list without losing information.
+
+    Pure OHLCV/candlestick fields are rebuilt causally from the developing
+    current-session candle on every completed minute.  Only the remaining
+    point-in-time fields are broadcast once per session as daily context.
+    """
+
+    requested = tuple(str(name) for name in feature_names)
+    missing = [
+        name
+        for name in MINUTE_DEVELOPING_CANDLE_FEATURE_COLUMNS
+        if name not in requested
+    ]
+    if missing:
+        raise RuntimeError(
+            "tw_minute complete daily-feature contract lacks developing "
+            f"candlestick fields: {missing}"
+        )
+    return tuple(
+        name
+        for name in requested
+        if name not in MINUTE_DEVELOPING_CANDLE_FEATURE_COLUMNS
+    )
+
+
+def _finite(expr: pl.Expr) -> pl.Expr:
+    return expr.is_not_null() & expr.is_finite().fill_null(False)
+
+
+def _positive_finite(expr: pl.Expr) -> pl.Expr:
+    return _finite(expr) & (expr > 0.0)
+
+
+def _bounded_candle_ratio(
+    numerator: pl.Expr,
+    spread: pl.Expr,
+    valid_envelope: pl.Expr,
+    *,
+    flat_value: float,
+    lower: float,
+    upper: float,
+) -> pl.Expr:
+    return (
+        pl.when(valid_envelope & (spread > 1e-12))
+        .then((numerator / spread).clip(lower, upper))
+        .when(valid_envelope)
+        .then(pl.lit(flat_value, dtype=pl.Float64))
+        .otherwise(None)
+    )
+
+
+def _developing_price_log_return(
+    numerator: pl.Expr,
+    denominator: pl.Expr,
+) -> pl.Expr:
+    value = (numerator / denominator).log()
+    valid = (
+        _positive_finite(numerator)
+        & _positive_finite(denominator)
+        & _finite(value)
+        & (value.abs() <= _TW_MAX_ABS_DAILY_PRICE_LOG_RETURN)
+    )
+    return pl.when(valid).then(value).otherwise(None)
+
+
+def _developing_safe_log_return(
+    numerator: pl.Expr,
+    denominator: pl.Expr,
+) -> pl.Expr:
+    value = (numerator / denominator).log()
+    valid = (
+        _positive_finite(numerator)
+        & _positive_finite(denominator)
+        & _finite(value)
+    )
+    return pl.when(valid).then(value).otherwise(None)
+
+
+def add_developing_daily_candle_features(
+    frame: pl.DataFrame,
+    previous_sessions: pl.DataFrame,
+) -> pl.DataFrame:
+    """Add causal session-to-date daily-candle features to minute bars.
+
+    Each output row uses only bars at or before that row.  The comparison
+    baseline is the immediately preceding completed minute-data session.  The
+    joined baseline must use the ``previous_*`` schema produced by
+    :func:`summarize_minute_sessions_for_next_day`.
+    """
+
+    required = {
+        "ts",
+        "symbol",
+        "Open",
+        "High",
+        "Low",
+        "Close",
+        "volume_shares",
+        "source_volume_unit_valid",
+        "feature_valid",
+    }
+    missing = sorted(required - set(frame.columns))
+    if missing:
+        raise RuntimeError(
+            f"minute frame lacks developing-candle inputs: {missing}"
+        )
+    prior_required = {
+        "symbol",
+        "previous_open",
+        "previous_high",
+        "previous_low",
+        "previous_close",
+        "previous_volume",
+        "previous_body_ratio",
+        "previous_clv",
+        "previous_session_valid",
+    }
+    prior_missing = sorted(prior_required - set(previous_sessions.columns))
+    if prior_missing:
+        raise RuntimeError(
+            f"previous minute sessions lack baseline fields: {prior_missing}"
+        )
+    daily_baseline_names = {
+        name: f"_daily_{name}"
+        for name in prior_required
+        if name != "symbol"
+    }
+    daily_baseline = previous_sessions.select(sorted(prior_required)).rename(
+        daily_baseline_names
+    )
+
+    output = (
+        frame.sort(["symbol", "ts"])
+        .join(daily_baseline, on="symbol", how="left")
+        .with_columns(
+            pl.col("Open").cast(pl.Float64).first().over("symbol").alias("_developing_open"),
+            pl.col("High").cast(pl.Float64).cum_max().over("symbol").alias("_developing_high"),
+            pl.col("Low").cast(pl.Float64).cum_min().over("symbol").alias("_developing_low"),
+            pl.col("Close").cast(pl.Float64).alias("_developing_close"),
+            pl.col("volume_shares")
+            .cast(pl.Float64)
+            .cum_sum()
+            .over("symbol")
+            .alias("_developing_volume"),
+            (
+                _positive_finite(pl.col("Open"))
+                & _positive_finite(pl.col("High"))
+                & _positive_finite(pl.col("Low"))
+                & _positive_finite(pl.col("Close"))
+                & (pl.col("High") >= pl.max_horizontal("Open", "Close"))
+                & (pl.col("Low") <= pl.min_horizontal("Open", "Close"))
+            )
+            .cast(pl.Int8)
+            .cum_min()
+            .over("symbol")
+            .cast(pl.Boolean)
+            .alias("_developing_price_prefix_valid"),
+            (
+                pl.col("source_volume_unit_valid")
+                .fill_null(False)
+                .cast(pl.Int8)
+                .cum_min()
+                .over("symbol")
+                .cast(pl.Boolean)
+                & _finite(pl.col("volume_shares"))
+                & (pl.col("volume_shares") >= 0.0)
+            ).alias("_developing_volume_prefix_valid"),
+        )
+    )
+    open_px = pl.col("_developing_open")
+    high_px = pl.col("_developing_high")
+    low_px = pl.col("_developing_low")
+    close_px = pl.col("_developing_close")
+    spread = high_px - low_px
+    valid_envelope = (
+        _positive_finite(open_px)
+        & _positive_finite(high_px)
+        & _positive_finite(low_px)
+        & _positive_finite(close_px)
+        & (high_px >= pl.max_horizontal(open_px, close_px))
+        & (low_px <= pl.min_horizontal(open_px, close_px))
+    )
+    output = output.with_columns(
+        _bounded_candle_ratio(
+            (close_px - open_px).abs(),
+            spread,
+            valid_envelope,
+            flat_value=0.0,
+            lower=0.0,
+            upper=1.0,
+        ).alias("body_ratio"),
+        _bounded_candle_ratio(
+            close_px - open_px,
+            spread,
+            valid_envelope,
+            flat_value=0.0,
+            lower=-1.0,
+            upper=1.0,
+        ).alias("signed_body_ratio"),
+        _bounded_candle_ratio(
+            close_px - low_px,
+            spread,
+            valid_envelope,
+            flat_value=0.5,
+            lower=0.0,
+            upper=1.0,
+        ).alias("clv"),
+        _bounded_candle_ratio(
+            high_px - pl.max_horizontal(open_px, close_px),
+            spread,
+            valid_envelope,
+            flat_value=0.0,
+            lower=0.0,
+            upper=1.0,
+        ).alias("upper_shadow"),
+        _bounded_candle_ratio(
+            pl.min_horizontal(open_px, close_px) - low_px,
+            spread,
+            valid_envelope,
+            flat_value=0.0,
+            lower=0.0,
+            upper=1.0,
+        ).alias("lower_shadow"),
+        _developing_price_log_return(open_px, pl.col("_daily_previous_open")).alias(
+            "open_logret_1d"
+        ),
+        _developing_price_log_return(high_px, pl.col("_daily_previous_high")).alias(
+            "max_logret_1d"
+        ),
+        _developing_price_log_return(low_px, pl.col("_daily_previous_low")).alias(
+            "min_logret_1d"
+        ),
+        _developing_price_log_return(close_px, pl.col("_daily_previous_close")).alias(
+            "close_logret_1d"
+        ),
+        _developing_safe_log_return(
+            pl.col("_developing_volume"), pl.col("_daily_previous_volume")
+        ).alias("trading_volume_logret_1d"),
+    ).with_columns(
+        (
+            pl.col("body_ratio") - pl.col("_daily_previous_body_ratio")
+        ).alias("delta_body_ratio"),
+        (pl.col("clv") - 0.5).alias("clv_centered"),
+        (pl.col("clv") - pl.col("_daily_previous_clv")).alias("delta_clv"),
+        (pl.col("upper_shadow") - pl.col("lower_shadow")).alias(
+            "shadow_imbalance"
+        ),
+        (
+            (close_px - open_px).sign()
+            * pl.col("trading_volume_logret_1d")
+        ).alias("signed_vol"),
+    )
+    all_developing_finite = pl.all_horizontal(
+        *[
+            _finite(pl.col(name))
+            for name in MINUTE_DEVELOPING_CANDLE_FEATURE_COLUMNS
+        ]
+    )
+    return output.with_columns(
+        (
+            pl.col("feature_valid").fill_null(False)
+            & pl.col("_daily_previous_session_valid").fill_null(False)
+            & pl.col("_developing_price_prefix_valid").fill_null(False)
+            & pl.col("_developing_volume_prefix_valid").fill_null(False)
+            & all_developing_finite
+        ).alias("feature_valid")
+    ).drop(
+        *daily_baseline_names.values(),
+        "_developing_open",
+        "_developing_high",
+        "_developing_low",
+        "_developing_close",
+        "_developing_volume",
+        "_developing_price_prefix_valid",
+        "_developing_volume_prefix_valid",
+    )
+
+
+def summarize_minute_sessions_for_next_day(frame: pl.DataFrame) -> pl.DataFrame:
+    """Create the completed-session baseline used by the next partition."""
+
+    required = {
+        "ts",
+        "symbol",
+        "Open",
+        "High",
+        "Low",
+        "Close",
+        "volume_shares",
+        "source_volume_unit_valid",
+        "session_exit_valid",
+    }
+    missing = sorted(required - set(frame.columns))
+    if missing:
+        raise RuntimeError(f"minute frame lacks session-summary inputs: {missing}")
+    summary = (
+        frame.sort(["symbol", "ts"])
+        .group_by("symbol", maintain_order=True)
+        .agg(
+            pl.col("Open").cast(pl.Float64).first().alias("previous_open"),
+            pl.col("High").cast(pl.Float64).max().alias("previous_high"),
+            pl.col("Low").cast(pl.Float64).min().alias("previous_low"),
+            pl.col("Close").cast(pl.Float64).last().alias("previous_close"),
+            pl.col("volume_shares").cast(pl.Float64).sum().alias("previous_volume"),
+            pl.col("source_volume_unit_valid").fill_null(False).all().alias(
+                "_volume_valid"
+            ),
+            pl.col("session_exit_valid").fill_null(False).any().alias(
+                "_exit_valid"
+            ),
+            (
+                _positive_finite(pl.col("Open"))
+                & _positive_finite(pl.col("High"))
+                & _positive_finite(pl.col("Low"))
+                & _positive_finite(pl.col("Close"))
+                & (pl.col("High") >= pl.max_horizontal("Open", "Close"))
+                & (pl.col("Low") <= pl.min_horizontal("Open", "Close"))
+            )
+            .all()
+            .alias("_prices_valid"),
+        )
+    )
+    open_px = pl.col("previous_open")
+    high_px = pl.col("previous_high")
+    low_px = pl.col("previous_low")
+    close_px = pl.col("previous_close")
+    spread = high_px - low_px
+    valid_envelope = (
+        _positive_finite(open_px)
+        & _positive_finite(high_px)
+        & _positive_finite(low_px)
+        & _positive_finite(close_px)
+        & (high_px >= pl.max_horizontal(open_px, close_px))
+        & (low_px <= pl.min_horizontal(open_px, close_px))
+    )
+    return summary.with_columns(
+        _bounded_candle_ratio(
+            (close_px - open_px).abs(),
+            spread,
+            valid_envelope,
+            flat_value=0.0,
+            lower=0.0,
+            upper=1.0,
+        ).alias("previous_body_ratio"),
+        _bounded_candle_ratio(
+            close_px - low_px,
+            spread,
+            valid_envelope,
+            flat_value=0.5,
+            lower=0.0,
+            upper=1.0,
+        ).alias("previous_clv"),
+        (
+            pl.col("_volume_valid")
+            & pl.col("_exit_valid")
+            & pl.col("_prices_valid")
+            & _positive_finite(pl.col("previous_volume"))
+            & valid_envelope
+        ).alias("previous_session_valid"),
+    ).drop("_volume_valid", "_exit_valid", "_prices_valid")
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -88,6 +482,101 @@ class MinuteDayPanel:
     session_exit_mask: np.ndarray
     short_open_mask: np.ndarray | None = None
     short_capacity_shares: np.ndarray | None = None
+    daily_context_features: np.ndarray | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class MinuteDailyFeatureContext:
+    """Memory-mapped ordinary day-trade features aligned to minute sessions.
+
+    For minute session ``D``, every close-complete daily feature comes from the
+    immediately preceding panel session.  The optional opening-gap feature is
+    the daily contract's row ``D-1`` value ``log(open[D] / close[D-1])``.  It
+    is known before any configured minute decision and never exposes D's
+    high/low/close/full-session volume.
+    """
+
+    feature_names: tuple[str, ...]
+    panel_features: np.ndarray
+    panel_open_prices: np.ndarray
+    panel_close_prices: np.ndarray
+    panel_symbol_indices: np.ndarray
+    selected_feature_indices: np.ndarray
+    selected_output_indices: np.ndarray
+    previous_session_indices: np.ndarray
+    current_session_indices: np.ndarray
+    opening_gap_output_index: int | None
+    fingerprint: str
+
+    @property
+    def num_features(self) -> int:
+        return len(self.feature_names)
+
+    def for_minute_day(self, index: int, *, lookback: int = 1) -> np.ndarray:
+        day_index = int(index)
+        previous = int(self.previous_session_indices[day_index])
+        history = int(lookback)
+        if history < 1:
+            raise ValueError("minute daily-context lookback must be positive")
+        first = previous - history + 1
+        if first < 0:
+            raise RuntimeError(
+                "tw_minute daily-context panel lacks a complete causal "
+                f"lookback={history} before minute day index={day_index}"
+            )
+        panel_rows = np.asarray(
+            self.panel_features[first : previous + 1], dtype=np.float32
+        )
+        selected = panel_rows[:, self.panel_symbol_indices][
+            :, :, self.selected_feature_indices
+        ]
+        output = np.zeros(
+            (history, int(self.panel_symbol_indices.size), self.num_features),
+            dtype=np.float32,
+        )
+        output[:, :, self.selected_output_indices] = selected
+
+        gap_index = self.opening_gap_output_index
+        current = int(self.current_session_indices[day_index])
+        if gap_index is not None:
+            completed_rows = np.arange(first, previous + 1, dtype=np.int64)
+            opening_rows = completed_rows + 1
+            # Every historical gap is already observed.  The final row may use
+            # only the exact current session's opening quote; if the public
+            # panel lacks that session it fails closed instead of reading the
+            # next future row returned by searchsorted.
+            opening_rows[-1] = current
+            valid_rows = (opening_rows >= 0) & (
+                opening_rows < int(self.panel_open_prices.shape[0])
+            )
+            safe_opening_rows = np.clip(
+                opening_rows, 0, int(self.panel_open_prices.shape[0]) - 1
+            )
+            opens = np.asarray(
+                self.panel_open_prices[safe_opening_rows], dtype=np.float64
+            )[:, self.panel_symbol_indices]
+            closes = np.asarray(
+                self.panel_close_prices[completed_rows], dtype=np.float64
+            )[:, self.panel_symbol_indices]
+            valid = (
+                valid_rows[:, None]
+                & np.isfinite(opens)
+                & np.isfinite(closes)
+                & (opens > 0.0)
+                & (closes > 0.0)
+            )
+            gap = np.zeros(opens.shape, dtype=np.float64)
+            np.log(
+                np.divide(opens, closes, out=np.ones_like(opens), where=valid),
+                out=gap,
+                where=valid,
+            )
+            # Match the daily panel's fail-closed 2x price-jump quarantine.
+            valid &= np.isfinite(gap) & (np.abs(gap) <= float(np.log(2.0)))
+            output[:, :, gap_index] = np.where(valid, gap, 0.0).astype(
+                np.float32, copy=False
+            )
+        return output[0] if history == 1 else output
 
 
 @dataclass(slots=True)
@@ -100,6 +589,8 @@ class MinuteDatasetIndex:
     short_open_mask: np.ndarray | None = None
     short_capacity_shares: np.ndarray | None = None
     short_rules_fingerprint: str | None = None
+    daily_feature_context: MinuteDailyFeatureContext | None = None
+    daily_context_lookback: int = 1
 
     @property
     def num_symbols(self) -> int:
@@ -301,7 +792,207 @@ class MinuteDatasetIndex:
                 if self.short_capacity_shares is None
                 else self.short_capacity_shares[int(index)]
             ),
+            daily_context_features=(
+                None
+                if self.daily_feature_context is None
+                else self.daily_feature_context.for_minute_day(
+                    int(index), lookback=int(self.daily_context_lookback)
+                )
+            ),
         )
+
+
+def _resolve_panel_cache_array_root(
+    meta_path: Path,
+    metadata: dict[str, Any],
+) -> Path:
+    dates_entry = metadata.get("arrays", {}).get("dates", {})
+    relative = Path(str(dates_entry.get("file", "")))
+    for candidate in (meta_path.parent, *meta_path.parents):
+        if relative.parts and (candidate / relative).is_file():
+            return candidate
+    raise RuntimeError(
+        f"minute daily-context metadata references a missing dates array: {meta_path}"
+    )
+
+
+def _load_minute_daily_feature_context(
+    meta_path: str | Path,
+    *,
+    minute_symbols: tuple[str, ...],
+    minute_dates: np.ndarray,
+    requested_feature_names: Sequence[str],
+) -> MinuteDailyFeatureContext:
+    resolved_meta = Path(meta_path).resolve()
+    if not resolved_meta.is_file():
+        raise RuntimeError(
+            f"tw_minute daily-context panel metadata is missing: {resolved_meta}"
+        )
+    metadata = _read_json(resolved_meta)
+    if int(metadata.get("version", 0)) < 2:
+        raise RuntimeError("tw_minute daily context requires panel cache v2 metadata")
+    cache_root = _resolve_panel_cache_array_root(resolved_meta, metadata)
+
+    def array_path(name: str) -> Path:
+        entry = metadata.get("arrays", {}).get(name)
+        if not isinstance(entry, dict) or not str(entry.get("file", "")):
+            raise RuntimeError(
+                f"tw_minute daily-context metadata lacks array {name!r}"
+            )
+        path = (cache_root / str(entry["file"])).resolve()
+        if not path.is_file():
+            raise RuntimeError(
+                f"tw_minute daily-context array {name!r} is missing: {path}"
+            )
+        return path
+
+    symbols_path = (cache_root / str(metadata.get("symbols_file", ""))).resolve()
+    feature_names_path = (
+        cache_root / str(metadata.get("feature_names_file", ""))
+    ).resolve()
+    if not symbols_path.is_file() or not feature_names_path.is_file():
+        raise RuntimeError("tw_minute daily-context symbol/feature metadata is missing")
+    panel_symbols_payload = json.loads(symbols_path.read_text(encoding="utf-8"))
+    cached_feature_payload = json.loads(
+        feature_names_path.read_text(encoding="utf-8")
+    )
+    if not isinstance(panel_symbols_payload, list) or not isinstance(
+        cached_feature_payload, list
+    ):
+        raise RuntimeError("tw_minute daily-context metadata lists are malformed")
+    panel_symbols = np.asarray(
+        [str(value) for value in panel_symbols_payload], dtype=object
+    )
+    if panel_symbols.size == 0:
+        raise RuntimeError("tw_minute daily-context panel has no symbols")
+    panel_symbol_lookup = {
+        symbol: index for index, symbol in enumerate(panel_symbols.tolist())
+    }
+    if len(panel_symbol_lookup) != int(panel_symbols.size):
+        raise RuntimeError("tw_minute daily-context panel symbols are not unique")
+    minute_symbol_values = np.asarray(minute_symbols, dtype=object)
+    missing = [
+        str(symbol)
+        for symbol in minute_symbol_values.tolist()
+        if str(symbol) not in panel_symbol_lookup
+    ]
+    if missing:
+        raise RuntimeError(
+            "tw_minute daily-context panel lacks minute symbols: "
+            f"{missing[:20]}"
+        )
+    panel_symbol_indices = np.asarray(
+        [panel_symbol_lookup[str(symbol)] for symbol in minute_symbol_values],
+        dtype=np.int64,
+    )
+
+    cached_feature_names = tuple(str(value) for value in cached_feature_payload)
+    cached_feature_lookup = {
+        name: index for index, name in enumerate(cached_feature_names)
+    }
+    requested = tuple(str(value) for value in requested_feature_names)
+    if not requested:
+        raise RuntimeError("tw_minute daily context requires at least one feature")
+    if len(set(requested)) != len(requested):
+        raise RuntimeError("tw_minute daily-context feature list contains duplicates")
+    unsupported = [
+        name
+        for name in requested
+        if name != MINUTE_DAILY_OPEN_GAP_FEATURE and name not in cached_feature_lookup
+    ]
+    if unsupported:
+        raise RuntimeError(
+            "tw_minute daily-context panel lacks configured day-trade features: "
+            f"{unsupported}"
+        )
+    selected_output_indices = np.asarray(
+        [
+            index
+            for index, name in enumerate(requested)
+            if name != MINUTE_DAILY_OPEN_GAP_FEATURE
+        ],
+        dtype=np.int64,
+    )
+    selected_feature_indices = np.asarray(
+        [
+            cached_feature_lookup[name]
+            for name in requested
+            if name != MINUTE_DAILY_OPEN_GAP_FEATURE
+        ],
+        dtype=np.int64,
+    )
+    opening_gap_output_index = (
+        requested.index(MINUTE_DAILY_OPEN_GAP_FEATURE)
+        if MINUTE_DAILY_OPEN_GAP_FEATURE in requested
+        else None
+    )
+
+    panel_dates = np.load(array_path("dates"), mmap_mode="r").astype("datetime64[D]")
+    if panel_dates.ndim != 1 or panel_dates.size < 2:
+        raise RuntimeError("tw_minute daily-context panel dates are malformed")
+    if not bool(np.all(panel_dates[1:] > panel_dates[:-1])):
+        raise RuntimeError("tw_minute daily-context panel dates are not sorted/unique")
+    minute_day_values = np.asarray(minute_dates, dtype="datetime64[D]")
+    insertion = np.searchsorted(panel_dates, minute_day_values)
+    previous_session_indices = insertion - 1
+    if np.any(previous_session_indices < 0):
+        raise RuntimeError(
+            "tw_minute daily-context panel lacks a prior completed session"
+        )
+    current_session_indices = np.full(minute_day_values.shape, -1, dtype=np.int64)
+    exact = insertion < panel_dates.size
+    exact &= (
+        panel_dates[np.clip(insertion, 0, panel_dates.size - 1)]
+        == minute_day_values
+    )
+    current_session_indices[exact] = insertion[exact]
+
+    arrays = metadata.get("arrays", {})
+    digest_payload = {
+        "contract": MINUTE_DAILY_CONTEXT_CONTRACT,
+        "metadata_sha256": _sha256(resolved_meta),
+        "features_sha256": arrays.get("features", {}).get(
+            "content_fingerprint", {}
+        ).get("sha256"),
+        "open_prices_sha256": arrays.get("open_prices", {}).get(
+            "content_fingerprint", {}
+        ).get("sha256"),
+        "close_prices_sha256": arrays.get("close_prices", {}).get(
+            "content_fingerprint", {}
+        ).get("sha256"),
+        "feature_names": list(requested),
+        "minute_symbols": list(minute_symbols),
+        "minute_dates": [str(value) for value in minute_day_values],
+    }
+    if not all(
+        isinstance(digest_payload[name], str) and digest_payload[name]
+        for name in (
+            "features_sha256",
+            "open_prices_sha256",
+            "close_prices_sha256",
+        )
+    ):
+        raise RuntimeError(
+            "tw_minute daily-context cache lacks immutable content fingerprints"
+        )
+    fingerprint = hashlib.sha256(
+        json.dumps(digest_payload, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+    return MinuteDailyFeatureContext(
+        feature_names=requested,
+        panel_features=np.load(array_path("features"), mmap_mode="r"),
+        panel_open_prices=np.load(array_path("open_prices"), mmap_mode="r"),
+        panel_close_prices=np.load(array_path("close_prices"), mmap_mode="r"),
+        panel_symbol_indices=panel_symbol_indices.astype(np.int64, copy=False),
+        selected_feature_indices=selected_feature_indices,
+        selected_output_indices=selected_output_indices,
+        previous_session_indices=previous_session_indices.astype(np.int64, copy=False),
+        current_session_indices=current_session_indices,
+        opening_gap_output_index=opening_gap_output_index,
+        fingerprint=fingerprint,
+    )
 
 
 def _load_minute_short_rules(
@@ -434,6 +1125,9 @@ def load_minute_dataset_index(
     progress: Callable[[str], None] | None = None,
     short_rule_path: str | Path | None = None,
     require_short_rules: bool = False,
+    daily_context_panel_meta: str | Path | None = None,
+    daily_context_feature_names: Sequence[str] = (),
+    daily_context_lookback: int = 1,
 ) -> MinuteDatasetIndex:
     resolved_root = Path(root).resolve()
     manifest_path = resolved_root / "manifest.json"
@@ -442,8 +1136,8 @@ def load_minute_dataset_index(
     manifest = _read_json(manifest_path)
     if manifest.get("schema_version") != MINUTE_DATASET_SCHEMA_VERSION:
         raise RuntimeError(
-            "minute dataset schema is stale; rebuild with "
-            "scripts/build_shioaji_tw_minute_dataset.py"
+            "minute dataset schema is stale; upgrade the schema-4 receipts with "
+            "scripts/upgrade_tw_minute_developing_candles.py"
         )
     if (
         manifest.get("feature_statistics_contract")
@@ -452,6 +1146,13 @@ def load_minute_dataset_index(
         raise RuntimeError(
             "minute dataset feature statistics are stale; rebuild with "
             "Float64 accumulation"
+        )
+    if (
+        manifest.get("developing_candle_contract")
+        != MINUTE_DEVELOPING_CANDLE_CONTRACT
+    ):
+        raise RuntimeError(
+            "minute dataset developing-candle contract is incompatible"
         )
     if manifest.get("source") != "shioaji_kbars_1m":
         raise RuntimeError("minute dataset source is not Shioaji Kbars")
@@ -527,6 +1228,22 @@ def load_minute_dataset_index(
         raise RuntimeError(
             "tw_minute long/short requires a point-in-time short-rule parquet"
         )
+    resolved_daily_context_lookback = int(daily_context_lookback)
+    if resolved_daily_context_lookback < 1:
+        raise ValueError("tw_minute daily-context lookback must be positive")
+    daily_feature_context = None
+    if daily_context_panel_meta is not None:
+        daily_feature_context = _load_minute_daily_feature_context(
+            daily_context_panel_meta,
+            minute_symbols=symbols,
+            minute_dates=dates,
+            requested_feature_names=daily_context_feature_names,
+        )
+    elif daily_context_feature_names:
+        raise RuntimeError(
+            "tw_minute daily-context features require "
+            "data.minute_daily_context_panel_meta"
+        )
     return MinuteDatasetIndex(
         root=resolved_root,
         manifest=manifest,
@@ -536,14 +1253,25 @@ def load_minute_dataset_index(
         short_open_mask=short_open_mask,
         short_capacity_shares=short_capacity_shares,
         short_rules_fingerprint=short_rules_fingerprint,
+        daily_feature_context=daily_feature_context,
+        daily_context_lookback=resolved_daily_context_lookback,
     )
 
 
 __all__ = [
     "MINUTE_FEATURE_COLUMNS",
+    "MINUTE_MICROSTRUCTURE_FEATURE_COLUMNS",
+    "MINUTE_DEVELOPING_CANDLE_FEATURE_COLUMNS",
+    "MINUTE_DEVELOPING_CANDLE_CONTRACT",
+    "MINUTE_DAILY_CONTEXT_CONTRACT",
+    "MINUTE_DAILY_OPEN_GAP_FEATURE",
     "MINUTE_SESSION_BARS",
+    "MinuteDailyFeatureContext",
     "MinuteDatasetIndex",
     "MinuteDayPanel",
     "MinuteFeatureNormalizer",
+    "add_developing_daily_candle_features",
     "load_minute_dataset_index",
+    "minute_static_daily_context_feature_names",
+    "summarize_minute_sessions_for_next_day",
 ]
