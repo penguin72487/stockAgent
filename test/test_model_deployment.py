@@ -141,7 +141,7 @@ def test_repo_tw_modes_have_independent_market_and_artifact_routes() -> None:
     root = Path(__file__).resolve().parents[1]
     configs = load_market_configs(root / "services/discord_bot/markets")
 
-    assert {"tw", "tw_cash", "tw_day_trade"}.issubset(configs)
+    assert {"tw", "tw_cash", "tw_day_trade", "tw_day_trade_100m"}.issubset(configs)
     naive = configs["tw"]
     assert naive.market_type == "tw"
     assert naive.fold_id == 25
@@ -151,9 +151,18 @@ def test_repo_tw_modes_have_independent_market_and_artifact_routes() -> None:
     assert configs["tw_cash"].output_dir != configs["tw"].output_dir
     day_trade = configs["tw_day_trade"]
     assert day_trade.fold_id == 11
-    assert day_trade.config_path == "configs/deployments/tw_day_trade.yaml"
-    assert day_trade.output_dir == "artifacts/markets/tw_public_candles_tw_day_trade_select"
+    assert day_trade.initial_capital == 10_000_000.0
+    assert day_trade.config_path == "configs/markets/tw_day_trade_10m.yaml"
+    assert day_trade.output_dir == "artifacts/markets/tw_day_trade_10m"
     assert day_trade.checkpoint_path == (
-        "artifacts/markets/tw_public_candles_tw_day_trade_select/"
-        "fold_11/checkpoint_best.pt"
+        "artifacts/markets/tw_day_trade_10m/fold_11/checkpoint_best.pt"
     )
+    day_trade_100m = configs["tw_day_trade_100m"]
+    assert day_trade_100m.fold_id == 11
+    assert day_trade_100m.initial_capital == 100_000_000.0
+    assert day_trade_100m.config_path == "configs/markets/tw_day_trade_100m.yaml"
+    assert day_trade_100m.output_dir == "artifacts/markets/tw_day_trade_100m"
+    assert day_trade_100m.checkpoint_path == (
+        "artifacts/markets/tw_day_trade_100m/fold_11/checkpoint_best.pt"
+    )
+    assert day_trade.live_output_dir == day_trade_100m.live_output_dir == "artifacts/live_signals"

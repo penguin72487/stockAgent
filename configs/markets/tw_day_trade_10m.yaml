@@ -1,0 +1,55 @@
+base_config: ../deployments/tw_day_trade.yaml
+
+# 台股現股當沖：以新台幣 1,000 萬作為精確整股回測與成交量上限的
+# 絕對資金基準。訓練損失仍依專案契約使用標準化淨值計算。
+experiment_name: tw-day-trade-initial-capital-10m
+
+runner:
+  output_dir: artifacts/markets/tw_day_trade_10m
+  mode: train
+  # 單卡完整 walk-forward 會跑較久；中斷後沿用相容 checkpoint。
+  resume: true
+
+environment:
+  # 單張 RTX 4070 Ti SUPER 16GB；避免繼承雙 RTX 5090 主機的執行緒預算。
+  cpu_threads: 14
+  torch_compile_threads: 8
+
+data:
+  # 配合本機 14 個實體核心，避免 64 workers 在 WSL2 過度競爭。
+  panel_load_workers: 14
+
+trading:
+  execution_mode: tw_day_trade
+  volume_participation_equity: 10000000.0
+
+training:
+  # 固定使用專案的單裝置 executor，不啟動 torchrun/DDP。
+  multi_gpu_strategy: none
+
+  # RTX 4070 Ti SUPER 16GB、台股完整市場、lookback 32 的實測安全起點。
+  # batch 32 在這個市場寬度會增加 VRAM 並降低吞吐，因此採用 16。
+  batch_size_train: 16
+  batch_size_eval: 16
+  auto_batch_size: false
+
+  # 當沖的 bounded settlement kernel 固定以 32 rows 編譯，無法在 16-row
+  # train batch 中執行。這張 4070 Ti SUPER 的既有實測也是 compiled model
+  # 搭配 eager loss 較快，因此明確關閉訓練 backtest/loss compile；這不是
+  # fallback，canonical risk_aware_loss 與結算語意完全不變。
+  compile_loss: false
+  backtest_compile: false
+  backtest_compile_stateful: false
+  eval_backtest_compile: false
+
+  # Ragged eval tail 可能走較高記憶體的 materialized fallback；限制為 16。
+  eval_model_chunk_rows: 16
+  eval_auto_chunk_rows_cap: 16
+
+  # 保留 BF16 與 model compile；GPU panel 快取仍會先做 VRAM 安全檢查，
+  # 空間不足時由 trainer 自動略過。
+  vram_budget_gb: 16
+  vram_safety_margin_gb: 1.5
+  target_vram_fraction: 0.85
+  cache_train_tensors_on_gpu: true
+  cache_eval_tensors_on_gpu: true

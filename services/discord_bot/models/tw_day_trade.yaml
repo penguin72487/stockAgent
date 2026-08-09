@@ -1,14 +1,14 @@
-# Immutable manual deployment for the TW intraday model.
+# Immutable manual deployment for the TWD 10 million TW intraday model.
 mode: manual
-config_path: configs/deployments/tw_day_trade.yaml
-output_dir: artifacts/markets/tw_public_candles_tw_day_trade_select
+config_path: configs/markets/tw_day_trade_10m.yaml
+output_dir: artifacts/markets/tw_day_trade_10m
 fold_id: 11
-checkpoint_path: artifacts/markets/tw_public_candles_tw_day_trade_select/fold_11/checkpoint_best.pt
-weights_path: artifacts/markets/tw_public_candles_tw_day_trade_select/fold_11/daily_weights.parquet
+checkpoint_path: artifacts/markets/tw_day_trade_10m/fold_11/checkpoint_best.pt
+weights_path: artifacts/markets/tw_day_trade_10m/fold_11/daily_weights.parquet
 model_scoped_live_output: true
 model_candidate_output_dirs:
-  - artifacts/markets/tw_public_candles_tw_day_trade_select
+  - artifacts/markets/tw_day_trade_10m
 model_candidate_config_paths:
-  - configs/deployments/tw_day_trade.yaml
+  - configs/markets/tw_day_trade_10m.yaml
 model_deployment_manifest: artifacts/discord_bot/deployments/tw_day_trade.json
 model_auto_deploy_interval_seconds: 60

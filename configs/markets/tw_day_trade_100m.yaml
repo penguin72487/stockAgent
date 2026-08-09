@@ -1,0 +1,11 @@
+base_config: tw_day_trade_10m.yaml
+
+# 台股現股當沖：以新台幣 1 億元作為精確整股回測與成交量上限的
+# 絕對資金基準。單卡 RTX 4070 Ti SUPER 參數沿用已驗證的 1,000 萬設定。
+experiment_name: tw-day-trade-initial-capital-100m
+
+runner:
+  output_dir: artifacts/markets/tw_day_trade_100m
+
+trading:
+  volume_participation_equity: 100000000.0
