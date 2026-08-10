@@ -348,7 +348,17 @@ def _embedded_explainability_api(model: nn.Module) -> nn.Module | None:
         "forward_from_embedded_explainability",
     )
     for candidate in candidates:
-        if candidate is not None and all(callable(getattr(candidate, name, None)) for name in required):
+        support_check = getattr(
+            candidate,
+            "supports_embedded_explainability_reuse",
+            None,
+        )
+        supported = not callable(support_check) or bool(support_check())
+        if (
+            candidate is not None
+            and supported
+            and all(callable(getattr(candidate, name, None)) for name in required)
+        ):
             return candidate
     return None
 
@@ -360,7 +370,17 @@ def _stock_embedding_explainability_api(model: nn.Module) -> nn.Module | None:
         "forward_from_stock_embeddings_explainability",
     )
     for candidate in candidates:
-        if candidate is not None and all(callable(getattr(candidate, name, None)) for name in required):
+        support_check = getattr(
+            candidate,
+            "supports_embedded_explainability_reuse",
+            None,
+        )
+        supported = not callable(support_check) or bool(support_check())
+        if (
+            candidate is not None
+            and supported
+            and all(callable(getattr(candidate, name, None)) for name in required)
+        ):
             return candidate
     return None
 

@@ -290,6 +290,45 @@ def test_temporal_basis_coefficients_are_plain_input_features() -> None:
     assert not hasattr(encoder, "energy_mix_logits")
 
 
+def test_raw_feature_basis_fused_projection_matches_explicit_coefficients() -> None:
+    torch.manual_seed(57)
+    encoder = TemporalBasisFeatureEncoder(
+        lookback=8,
+        dim=3,
+        source_dim=5,
+        families=("haar", "dct", "learned"),
+        components=2,
+        fuse_projection=True,
+    )
+    temporal = torch.randn(2, 8, 4, 5, requires_grad=True)
+    z_base = torch.randn(2, 4, 3, requires_grad=True)
+    mask = torch.ones(2, 4, dtype=torch.bool)
+    mask[1, -1] = False
+
+    with_aux, aux = encoder(temporal, z_base, mask, collect_aux=True)
+    fused, _ = encoder(temporal, z_base, mask, collect_aux=False)
+
+    explicit = encoder.feature_projection(aux["temporal_basis_input_features"])
+    explicit = explicit.masked_fill(~mask.unsqueeze(-1), 0.0)
+    torch.testing.assert_close(fused, with_aux, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(fused, explicit, rtol=1e-5, atol=1e-6)
+    assert aux["temporal_basis_input_features"].shape == (2, 4, 33)
+    assert aux["temporal_basis_original_path"].shape == (2, 4, 3)
+    for family in ("haar", "dct", "learned"):
+        assert aux[f"temporal_basis_{family}_coefficients"].shape == (
+            2,
+            2,
+            4,
+            5,
+        )
+
+    fused.square().mean().backward()
+    assert temporal.grad is not None
+    assert torch.isfinite(temporal.grad).all()
+    assert encoder.learned_basis.grad is not None
+    assert torch.isfinite(encoder.learned_basis.grad).all()
+
+
 def test_online_complete_temporal_basis_forward_and_learned_dictionary_grad() -> None:
     device = _device()
     model = _make_model(
@@ -343,6 +382,11 @@ def test_disabled_temporal_basis_keeps_legacy_model_fingerprint_projection() -> 
     enabled = _active_model_config(config)["values"]
     assert enabled["temporal_basis_families"] == ["dct"]
     assert enabled["temporal_basis_components"] == 8
+    assert "temporal_basis_input" not in enabled
+
+    config.training.transformer_base_portfolio.temporal_basis_input = "raw_features"
+    raw_enabled = _active_model_config(config)["values"]
+    assert raw_enabled["temporal_basis_input"] == "raw_features"
 
 
 @pytest.mark.parametrize("feature_idx", [1, 2])
