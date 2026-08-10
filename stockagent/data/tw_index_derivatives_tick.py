@@ -23,7 +23,7 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import polars as pl
 
-from downloader.shioaji_capture_parts import select_capture_part_paths
+from stockagent.data.shioaji_capture_parts import select_capture_part_paths
 
 
 TICK_DATASET_SCHEMA_VERSION: Final[int] = 5

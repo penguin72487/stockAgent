@@ -1,4 +1,4 @@
-experiment_name: tw-financial-transformer-candles-snapshot-safe99-open-aware-gross-tw-cash-lookback32-panel-history-v1-dual5090
+experiment_name: tw-financial-transformer-candles-snapshot-safe99-open-aware-gross-tw-day-trade-lookback32-panel-history-v1-dual5090
 
 runner:
   # The causal current-open channel creates a 99-slot schema and therefore a
@@ -37,8 +37,8 @@ data:
   # high/low/close/full-day-volume field.
   day_trade_open_feature: true
   # Reporting comparator: 2330 adjusted-close buy-and-hold on the panel's
-  # close-to-close clock. This is only the benchmark clock: tw_cash strategy
-  # actions may execute independently at the opening and closing auctions.
+  # close-to-close clock. This is only the benchmark clock: tw_day_trade
+  # actions execute from the observed opening print to the same-session close.
   benchmark_name: "2330"
   usd_only_trading_pairs: false
   panel_backend: auto
@@ -277,7 +277,7 @@ training:
     d_model: 32
     candle_dropout: 0.0
     # Project onto sum(abs(long and short weights)) <= 1; unused gross is cash.
-    portfolio_output_mode: l1
+    portfolio_output_mode: projection_l1
   non_blocking_transfer: true
   model_name: financial_transformer
   multi_gpu_strategy: auto
@@ -332,8 +332,8 @@ training:
   backtest_checkpoint_chunk_rows: 0
   runtime_shape_check: false
   allow_dynamic_symbols: false
-  # tw_cash consumes close-complete rows through t-1, with only the dedicated
-  # final-row opening-gap channel augmented by open[t]. It reads exactly the
+  # tw_day_trade consumes close-complete rows through t-1, with only the
+  # dedicated final-row opening-gap channel augmented by open[t]. It reads the
   # 32 prior panel sessions, including prior years, without importing their
   # returns or settlement state into the owned split.
   lookback: 32
