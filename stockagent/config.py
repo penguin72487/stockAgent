@@ -194,6 +194,23 @@ def _normalized_contract_name(value: object) -> str:
     return str(value).strip().lower().replace("-", "_")
 
 
+def _normalize_temporal_basis_input(value: object) -> str:
+    normalized = _normalized_contract_name(value or "embedded")
+    normalized = {
+        "embedding": "embedded",
+        "embeddings": "embedded",
+        "latent": "embedded",
+        "raw": "raw_features",
+        "raw_feature": "raw_features",
+        "features": "raw_features",
+    }.get(normalized, normalized)
+    if normalized not in {"embedded", "raw_features"}:
+        raise ValueError(
+            "temporal_basis_input must be 'embedded' or 'raw_features'"
+        )
+    return normalized
+
+
 def _validate_tw_phase_mode_contract(
     *,
     execution_mode: str,
@@ -1044,6 +1061,7 @@ class TransformerBasePortfolioModelConfig:
     temporal_query_mode: str = "full_then_last"
     temporal_basis_families: list[str] = field(default_factory=list)
     temporal_basis_components: int = 8
+    temporal_basis_input: str = "embedded"
     cross_layers: int = 1
     cross_heads: int = 4
     cross_ffn_mult: int = 2
@@ -1953,6 +1971,11 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     transformer_base_portfolio["temporal_basis_components"] = max(
         1, int(transformer_base_portfolio["temporal_basis_components"])
     )
+    transformer_base_portfolio["temporal_basis_input"] = (
+        _normalize_temporal_basis_input(
+            transformer_base_portfolio["temporal_basis_input"]
+        )
+    )
     transformer_base_portfolio["categorical_embedding_dim"] = max(
         1, int(transformer_base_portfolio["categorical_embedding_dim"])
     )
@@ -1982,6 +2005,11 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     )
     financial_transformer["temporal_basis_components"] = max(
         1, int(financial_transformer["temporal_basis_components"])
+    )
+    financial_transformer["temporal_basis_input"] = (
+        _normalize_temporal_basis_input(
+            financial_transformer["temporal_basis_input"]
+        )
     )
     financial_transformer["categorical_embedding_dim"] = max(
         1, int(financial_transformer["categorical_embedding_dim"])
