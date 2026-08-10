@@ -19,6 +19,7 @@ from stockagent.models.transformer_base_portfolio import (
     ONLINE_SAFE_TEMPORAL_BASIS_FAMILIES,
     PortfolioRMSNorm,
     SwiGLUFeedForward,
+    TemporalBasisFeatureEncoder,
     TransformerBasePortfolioModel,
     _compiled_cross_attention_requires_blackwell_workaround,
     _sanitize_scores_to_dtype,
@@ -234,17 +235,59 @@ def test_temporal_multi_basis_forward_aux_mask_and_gradients() -> None:
     assert model.temporal_basis_families == ("haar", "fourier", "dct")
     assert weights.shape == (2, 13)
     assert weights[1, -2:].abs().max().item() == 0.0
-    assert aux["temporal_basis_gate"].shape == (2, 13, 1)
-    assert aux["temporal_basis_delta"].shape == (2, 13, 24)
+    assert aux["temporal_basis_input_features"].shape == (2, 13, 312)
+    assert aux["temporal_basis_output"].shape == (2, 13, 24)
     for family in model.temporal_basis_families:
-        assert aux[f"temporal_basis_{family}_summary"].shape == (2, 13, 24)
-        assert aux[f"temporal_basis_{family}_signed"].shape == (2, 13, 24)
-        assert aux[f"temporal_basis_{family}_energy"].shape == (2, 13, 24)
+        assert aux[f"temporal_basis_{family}_coefficients"].shape == (
+            2,
+            4,
+            13,
+            24,
+        )
     assert x.grad is not None
     assert torch.isfinite(x.grad).all()
-    assert model.temporal_basis_encoder is not None
-    assert model.temporal_basis_encoder.gate.weight.grad is not None
-    assert torch.isfinite(model.temporal_basis_encoder.gate.weight.grad).all()
+    assert model.temporal_basis_feature_encoder is not None
+    encoder = model.temporal_basis_feature_encoder
+    assert set(dict(encoder.named_parameters())) == {
+        "feature_projection.weight",
+        "feature_projection.bias",
+    }
+    projection_grad = encoder.feature_projection.weight.grad
+    assert projection_grad is not None
+    assert torch.isfinite(projection_grad).all()
+
+
+def test_temporal_basis_coefficients_are_plain_input_features() -> None:
+    torch.manual_seed(41)
+    encoder = TemporalBasisFeatureEncoder(
+        lookback=8,
+        dim=3,
+        families=("dct",),
+        components=2,
+    )
+    temporal = torch.randn(2, 8, 4, 3)
+    z_base = torch.randn(2, 4, 3)
+    mask = torch.ones(2, 4, dtype=torch.bool)
+
+    output, aux = encoder(temporal, z_base, mask, collect_aux=True)
+    basis = encoder.dct_basis
+    coefficients = torch.einsum("kl,blsd->bksd", basis, temporal)
+    expected_features = torch.cat(
+        (z_base, coefficients.permute(0, 2, 1, 3).flatten(start_dim=2)),
+        dim=-1,
+    )
+
+    torch.testing.assert_close(
+        aux["temporal_basis_input_features"],
+        expected_features,
+    )
+    torch.testing.assert_close(
+        output,
+        encoder.feature_projection(expected_features),
+    )
+    assert not hasattr(encoder, "gate")
+    assert not hasattr(encoder, "fusion")
+    assert not hasattr(encoder, "energy_mix_logits")
 
 
 def test_online_complete_temporal_basis_forward_and_learned_dictionary_grad() -> None:
@@ -265,12 +308,17 @@ def test_online_complete_temporal_basis_forward_and_learned_dictionary_grad() ->
     _weights, _scores, aux = model(x, mask, return_aux=True)
     aux["score_logits"].square().mean().backward()
 
-    encoder = model.temporal_basis_encoder
+    encoder = model.temporal_basis_feature_encoder
     assert encoder is not None
     assert isinstance(encoder.learned_basis, torch.nn.Parameter)
+    assert set(dict(encoder.named_parameters())) == {
+        "learned_basis",
+        "feature_projection.weight",
+        "feature_projection.bias",
+    }
     assert encoder.learned_basis.grad is not None
     assert torch.isfinite(encoder.learned_basis.grad).all()
-    assert "temporal_basis_learned_summary" in aux
+    assert "temporal_basis_learned_coefficients" in aux
     assert "learned_basis" in encoder.state_dict()
     assert "haar_basis" not in encoder.state_dict()
 
@@ -859,8 +907,8 @@ def test_temporal_multi_basis_panel_paths_and_embedding_reuse_match() -> None:
         torch.testing.assert_close(actual[0], expected[0], rtol=1e-5, atol=1e-6)
         torch.testing.assert_close(actual[1], expected[1], rtol=1e-5, atol=1e-6)
         torch.testing.assert_close(
-            actual[2]["temporal_basis_delta"],
-            expected[2]["temporal_basis_delta"],
+            actual[2]["temporal_basis_output"],
+            expected[2]["temporal_basis_output"],
             rtol=1e-5,
             atol=1e-6,
         )

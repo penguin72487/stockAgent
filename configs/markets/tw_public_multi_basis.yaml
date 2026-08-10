@@ -1,12 +1,12 @@
 base_config: tw_public_lanten_market_candles.yaml
 
-experiment_name: tw-public-financial-transformer-multi-basis-lookback32-v1
+experiment_name: tw-public-financial-transformer-multi-basis-feature-input-lookback32-v2
 
 runner:
-  # The multi-basis branch changes model parameters and optimizer semantics.
-  # Keep it in a fresh artifact root instead of resuming the raw-only baseline.
-  output_dir: artifacts/markets/tw_public_candles_multi_basis_lookback32_v1
-  resume: true
+  # The basis coefficients are now plain input features. Keep them in a fresh
+  # artifact root instead of resuming either raw-only or gated-basis weights.
+  output_dir: artifacts/markets/tw_public_candles_multi_basis_feature_input_lookback32_v2
+  resume: false
 
 training:
   model_name: financial_transformer
@@ -18,7 +18,3 @@ training:
     # within-stock temporal inductive biases.
     temporal_basis_families: [haar, fourier, dct]
     temporal_basis_components: 8
-    temporal_basis_dropout: 0.0
-    # sigmoid(-2) ~= 0.119: start as a conservative residual, then let the
-    # optimizer decide per stock/window how much basis information to admit.
-    temporal_basis_gate_init: -2.0
