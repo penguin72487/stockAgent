@@ -40,6 +40,7 @@ from stockagent.models.factory import build_model
 from stockagent.training.inference_contract import (
     align_panel_to_checkpoint_universe,
     build_checkpoint_manifest,
+    checkpoint_manifest_symbols,
     configure_inference_runtime,
     validate_checkpoint_manifest,
 )
@@ -1640,6 +1641,7 @@ def generate_live_signal(
         panel,
         resolved_output_dir / f"fold_{resolved_fold_id:02d}",
         state_dict,
+        checkpoint_symbols=checkpoint_manifest_symbols(checkpoint_payload),
         context=f"live signal {market_id or resolved_fold_id}",
         allow_missing_masked=True,
     )
