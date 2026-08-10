@@ -208,7 +208,7 @@ data_bybit/*
 data_yahoo_tw_ohlcv/*
 data/*
 /data_tw_public
-.codex/*
+.codex/
 codex/*
 data_openBB/*
 data_tw_microstructure/*
@@ -218,3 +218,4 @@ data_tw_index_options_daily/*
 data_tw_minute/*
 data_tw_index_derivatives_ticks/*
 artifacts_benchmark/*
+.build/

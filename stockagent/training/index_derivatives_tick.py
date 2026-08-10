@@ -51,11 +51,14 @@ from stockagent.training.lifecycle import (
     TrainingRunLifecycle,
     canonical_mode_artifact_contract,
 )
+from stockagent.training.checkpoint_contract import (
+    _configuration_fingerprint_snapshot,
+    _stable_fingerprint,
+)
 from stockagent.training.trainer import (
     FoldResult,
     _EpochCurveLifecycle,
     _PreEpochTimingRecorder,
-    _configuration_fingerprint_snapshot,
     _autocast_context,
     _can_enable_torch_compile,
     _create_adamw_optimizer,
@@ -72,7 +75,6 @@ from stockagent.training.trainer import (
     _save_fold_checkpoint,
     _save_fold_output_artifacts,
     _save_group_checkpoint,
-    _stable_fingerprint,
     _step_batch_lr_scheduler,
     _torch_compile_options,
     _validate_checkpoint_effective_train_batch_size,
