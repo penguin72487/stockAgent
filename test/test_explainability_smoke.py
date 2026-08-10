@@ -23,8 +23,10 @@ from stockagent.explainability import (
     _perturbation_importance,
     _portfolio_j_lens,
     _combine_j_lens_frames_from_chunks,
+    _cross_fold_figure_spec,
     _plot_all_explanation_figures,
     _representation_aux_summary,
+    _read_cross_fold_source_table,
     _save_matplotlib_figure,
     _score_head_surrogate_shap,
     _score_head_surrogate_shap_chunked,
@@ -770,10 +772,34 @@ def test_paper_fold_stability_outputs(tmp_path: Path) -> None:
     assert (root / "plot_validation_all_folds.json").exists()
     report = (root / "comprehensive_all_folds_report.md").read_text(encoding="utf-8")
     assert "不是將各 Fold 報告或圖片串接" in report
+    assert "完整 2 特徵" in report
+    assert "Fold 1–2 漂移" in report
+    assert "Fold 1–21" not in report
+    assert "21 folds" not in report
     assert "fold_01_test/plots/" not in report
     assert report.count("comprehensive_explainability_report.md") == 2
     assert (root / "tables_cross_fold" / "cross_fold_portfolio_and_shap.csv").exists()
     assert (root / "plots_cross_fold" / "cross_fold_portfolio_diagnostics.png").exists()
+
+
+def test_cross_fold_source_keeps_mixed_symbol_codes_as_strings(tmp_path: Path) -> None:
+    source_path = tmp_path / "j_lens_stock_readout.csv"
+    pl.DataFrame(
+        {
+            "layer": ["stock"] * 102,
+            "symbol": [f"{index:06d}" for index in range(101)] + ["00637L"],
+            "mean_abs": [0.1] * 102,
+            "signed_mean": [0.05] * 102,
+        }
+    ).write_csv(source_path)
+
+    spec = _cross_fold_figure_spec("plots/j_lens_layer_stock_score_heatmap.png")
+    assert spec is not None
+    frame = _read_cross_fold_source_table(source_path, spec)
+
+    assert frame.schema["symbol"] == pl.String
+    assert frame.get_column("symbol").head(1).item() == "000000"
+    assert frame.get_column("symbol").tail(1).item() == "00637L"
 
 
 def test_method_agreement_active_union_avoids_shared_zero_tie_inflation() -> None:
