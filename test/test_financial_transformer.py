@@ -204,7 +204,6 @@ def test_multi_basis_experiment_config_is_fresh_and_propagates_to_financial_mode
     assert config.training.transformer_base_portfolio.temporal_basis_families == expected
     assert config.training.financial_transformer.temporal_basis_families == expected
     assert config.training.financial_transformer.temporal_basis_components == 8
-    assert config.training.financial_transformer.temporal_basis_gate_init == -2.0
 
 
 def test_online_complete_multi_basis_config_propagates_every_supported_family() -> None:
@@ -223,7 +222,7 @@ def test_online_complete_multi_basis_config_propagates_every_supported_family() 
     assert config.training.cache_train_tensors_on_gpu is False
     assert config.training.cache_eval_tensors_on_gpu is False
     assert config.training.vram_budget_gb == 16
-    assert "online_complete_lookback32_v2" in config.runner.output_dir
+    assert "online_complete_feature_input_lookback32_v3" in config.runner.output_dir
 
 
 def test_candle_encoder_uses_every_feature_jointly() -> None:

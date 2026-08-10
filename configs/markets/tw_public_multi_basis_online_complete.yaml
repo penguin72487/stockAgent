@@ -1,12 +1,12 @@
 base_config: tw_public_multi_basis.yaml
 
-experiment_name: tw-public-financial-transformer-multi-basis-online-complete-lookback32-v2
+experiment_name: tw-public-financial-transformer-multi-basis-online-complete-feature-input-lookback32-v3
 
 runner:
-  # This model owns a trainable temporal dictionary and a wider fusion layer;
-  # it is intentionally checkpoint-incompatible with both raw-only and v1.
-  output_dir: artifacts/markets/tw_public_candles_multi_basis_online_complete_lookback32_v2
-  resume: true
+  # This model owns a trainable temporal dictionary and a wider input projection;
+  # it is intentionally incompatible with raw-only and gated-basis checkpoints.
+  output_dir: artifacts/markets/tw_public_candles_multi_basis_online_complete_feature_input_lookback32_v3
+  resume: false
 
 training:
   # The inherited candles baseline was measured on two 32 GiB RTX 5090s:
@@ -45,5 +45,3 @@ training:
       - chebyshev
       - learned
     temporal_basis_components: 4
-    temporal_basis_dropout: 0.0
-    temporal_basis_gate_init: -2.0
