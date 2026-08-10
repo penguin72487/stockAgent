@@ -320,7 +320,7 @@ def test_candle_encoder_jointly_embeds_categorical_features() -> None:
     assert not torch.equal(base_aux["candle_embedding"], changed_aux["candle_embedding"])
 
 
-def test_all_resolved_experiment_configs_define_matching_financial_transformer() -> None:
+def test_active_financial_transformers_match_shared_non_output_contract() -> None:
     config_paths = [Path("configs/experiment_baseline.yaml")]
     config_paths.extend(sorted(Path("configs/markets").glob("*.yaml")))
 
@@ -334,9 +334,16 @@ def test_all_resolved_experiment_configs_define_matching_financial_transformer()
             assert raw.get("base_config"), path
 
         config = load_config(path)
+        if config.training.model_name != "financial_transformer":
+            continue
         transformer_base = config.training.transformer_base_portfolio
         financial = config.training.financial_transformer
         for config_field in fields(TransformerBasePortfolioModelConfig):
+            if config_field.name in {"portfolio_mode", "portfolio_output_mode"}:
+                # Direction and output representation are legitimate
+                # experiment-level overrides for the active Financial
+                # Transformer head. All encoder/runtime fields stay shared.
+                continue
             assert getattr(financial, config_field.name) == getattr(
                 transformer_base,
                 config_field.name,

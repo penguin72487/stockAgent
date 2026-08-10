@@ -757,14 +757,17 @@ def test_tw_public_candles_select_preserves_open_aware_day_trade_contract() -> N
     assert config.trading.tw_corporate_action_mode == "avoid"
     assert config.trading.tw_short_capacity_limit_enabled is False
     assert config.trading.long_only is False
-    assert model.portfolio_output_mode == "l1"
-    assert config.training.transformer_base_portfolio.portfolio_output_mode == "l1"
+    assert model.portfolio_output_mode == "projection_l1"
+    assert (
+        config.training.transformer_base_portfolio.portfolio_output_mode
+        == "projection_l1"
+    )
     assert config.training.loss_portfolio_activation == "pre_normalized"
     assert config.trading.portfolio_activation == "pre_normalized"
     assert config.training.multi_gpu_strategy == "auto"
-    assert config.training.batch_size_train == 64
-    assert config.training.batch_size_eval == 64
-    assert config.environment.cpu_threads == 128
+    assert config.training.batch_size_train == 128
+    assert config.training.batch_size_eval == 128
+    assert config.environment.cpu_threads == 112
     assert config.environment.torch_compile_threads == 16
 
 
@@ -783,23 +786,29 @@ def test_open_aware_long_only_day_trade_uses_non_dead_action_head() -> None:
     assert config.trading.tw_commission_rebate_timing == "monthly_15th"
 
 
-def test_tw_public_candles_all_folds_uses_long_history_tw_cash_contract() -> None:
+def test_tw_public_candles_all_folds_uses_fixed_abi_day_trade_contract() -> None:
     config = load_config("configs/markets/tw_public_lanten_market_candles.yaml")
 
-    assert config.trading.execution_mode == "tw_cash"
+    assert config.trading.execution_mode == "tw_day_trade"
     assert config.data.panel_start_date == "2012-01-01"
     assert config.data.benchmark_name == "2330"
     assert config.walk_forward.expected_first_year == 2012
     assert config.walk_forward.split_start_year == 2014
     assert config.walk_forward.lookback_context == "panel_history"
-    assert config.training.lookback == 256
+    assert config.training.lookback == 32
     assert config.trading.tw_corporate_action_mode == "avoid"
     assert config.trading.tw_short_capacity_limit_enabled is False
-    assert config.training.financial_transformer.portfolio_output_mode == "l1"
+    assert (
+        config.training.financial_transformer.portfolio_output_mode
+        == "projection_l1"
+    )
     assert config.training.multi_gpu_strategy == "auto"
-    assert config.training.batch_size_train == 64
-    assert config.training.batch_size_eval == 64
-    assert config.environment.cpu_threads == 128
+    assert config.training.batch_size_train == 128
+    assert config.training.batch_size_eval == 128
+    assert config.training.train_symbol_compaction == "none"
+    assert config.training.compile_model_dynamic_symbols is False
+    assert config.training.compile_loss_dynamic_symbols is False
+    assert config.environment.cpu_threads == 112
     assert config.environment.torch_compile_threads == 16
     assert config.runner.resume is True
 
