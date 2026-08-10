@@ -28,6 +28,9 @@ matrix:
       # metrics/artifacts; a second post-train inference pass is redundant.
       post_train_infer: false
     trading:
+      # Keep the declared OFAT baseline independent of the current production
+      # capital anchor inherited from the source market config.
+      volume_participation_equity: 1000000.0
       # Baseline post-processing for model outputs that already satisfy the
       # signed gross-exposure contract.
       portfolio_activation: pre_normalized

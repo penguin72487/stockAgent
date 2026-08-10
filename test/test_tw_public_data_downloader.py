@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import date
 import hashlib
 import json
@@ -153,7 +153,13 @@ def test_twse_mi_index_semantic_bumps_quarantine_only_affected_partials():
     twse_margin = twpub.DEFAULT_DATASETS["twse_margin_balance"]
     tpex = twpub.DEFAULT_DATASETS["tpex_daily_ohlcv"]
 
-    assert key_at_version(twse, 5) == "74ab358560b05834"
+    legacy_twse = replace(
+        twse,
+        url_template=twse.url_template.replace("https://wwwc.twse.com.tw/", "https://www.twse.com.tw/"),
+    )
+    assert key_at_version(legacy_twse, 5) == "74ab358560b05834"
+    assert key_at_version(twse, 5) == "e4ab06eeb2dff19a"
+    assert key_at_version(twse, 5) != key_at_version(legacy_twse, 5)
     assert twpub._historical_resume_cache_key(twse) == key_at_version(twse, 7)
     assert twpub._historical_resume_cache_key(twse) != key_at_version(twse, 6)
     assert twpub._historical_resume_cache_key(twse_index) == key_at_version(

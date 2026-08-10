@@ -131,6 +131,6 @@ if __name__ == "__main__":
     print(f"Device: {_device()}")
     test_long_only_forward_shape_mask_and_normalization()
     test_long_short_forward_shape_mask_and_normalization()
-    test_tcn_temporal_option_rejects_empty_mask_row()
+    test_tcn_temporal_option_empty_mask_row_is_finite_and_zero()
     test_portfolio_autoencoder_loss_backward()
     print("SUCCESS")
