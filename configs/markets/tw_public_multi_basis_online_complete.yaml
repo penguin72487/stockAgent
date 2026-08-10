@@ -1,11 +1,11 @@
 base_config: tw_public_multi_basis.yaml
 
-experiment_name: tw-public-financial-transformer-multi-basis-online-complete-feature-input-lookback32-v3
+experiment_name: tw-public-financial-transformer-multi-basis-online-complete-raw-feature-input-lookback32-v4
 
 runner:
-  # This model owns a trainable temporal dictionary and a wider input projection;
-  # it is intentionally incompatible with raw-only and gated-basis checkpoints.
-  output_dir: artifacts/markets/tw_public_candles_multi_basis_online_complete_feature_input_lookback32_v3
+  # The completed v4 artifact decomposed the 32-D latent representation.  This
+  # new root decomposes all 99 raw features and is checkpoint-incompatible.
+  output_dir: artifacts/markets/tw_public_candles_multi_basis_online_complete_raw_feature_input_lookback32_v5
   resume: false
 
 training:
@@ -22,9 +22,10 @@ training:
   vram_budget_gb: 16
 
   transformer_base_portfolio:
-    # All families consume only the observed trailing window and have static
-    # shapes. Four coefficients per family bound live inference and training
-    # cost while retaining complementary mechanisms rather than synonyms.
+    # Every family consumes each named raw feature over the observed trailing
+    # window.  The untouched CandleEncoder + temporal Transformer is retained
+    # as the time-domain path and fused with all basis coefficients afterward.
+    temporal_basis_input: raw_features
     temporal_basis_families:
       - haar
       - swt_db2

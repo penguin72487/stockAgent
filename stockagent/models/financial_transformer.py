@@ -410,11 +410,13 @@ class FinancialTransformerModel(TransformerBasePortfolioModel):
             return_token_aux=collect_token_aux,
         )
         h = self._add_window_positions(h, int(x.size(2)), symbol_indices)
+        raw_basis_source = self._prepare_raw_temporal_basis_source(x)
         output = self._forward_embedded(
             h,
             mask_bool,
             temperature=temperature,
             return_aux=return_aux,
+            temporal_basis_source=raw_basis_source,
         )
         return self._attach_candle_aux(output, token_aux, return_aux)
 
@@ -521,9 +523,15 @@ class FinancialTransformerModel(TransformerBasePortfolioModel):
             mask_bool = mask.to(device=h.device, dtype=torch.bool).reshape(
                 h.size(0), h.size(2)
             )
+        raw_basis_source = (
+            self._raw_temporal_basis_windows_from_batched_panel_slabs(
+                feature_slabs
+            )
+        )
         return self._forward_embedded(
             h,
             mask_bool,
             temperature=temperature,
             return_aux=return_aux,
+            temporal_basis_source=raw_basis_source,
         )
