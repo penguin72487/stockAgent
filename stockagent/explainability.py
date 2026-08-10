@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import atexit
-import csv
 import gc
 import inspect
 import json
@@ -15,7 +14,7 @@ from dataclasses import dataclass, replace
 from datetime import timedelta
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 import numpy as np
 import polars as pl
@@ -35,6 +34,20 @@ from stockagent.data.panel import PanelData, build_panel
 from stockagent.data.walkforward import WalkForwardFold, build_expanding_year_folds
 from stockagent.models.factory import build_model
 from stockagent.training.dataset import CrossSectionalDataset, collate_batch
+from stockagent.training.checkpoint_contract import (
+    align_panel_to_checkpoint_universe,
+    build_checkpoint_manifest,
+    checkpoint_manifest_symbols,
+    subset_panel_symbols,
+    validate_checkpoint_manifest,
+    weight_table_path,
+    weight_table_symbols,
+)
+from stockagent.training.runtime import load_checkpoint
+
+_subset_panel_symbols = subset_panel_symbols
+_daily_weight_symbols = weight_table_symbols
+_daily_weight_table_path = weight_table_path
 
 
 def _clear_explainability_runtime_cache() -> None:
@@ -8816,19 +8829,10 @@ def load_model_from_checkpoint(
     *,
     strict: bool = False,
 ) -> tuple[nn.Module, dict[str, Any]]:
-    # Keep explainability under the same schema/model compatibility contract as
-    # inference and live signals.  Import lazily because trainer imports this
-    # module lazily for post-fold reports as well.
-    from stockagent.training.trainer import (
-        _checkpoint_manifest,
-        _load_checkpoint,
-        _validate_checkpoint_manifest,
-    )
-
-    checkpoint = _load_checkpoint(checkpoint_path)
-    _validate_checkpoint_manifest(
+    checkpoint = load_checkpoint(checkpoint_path)
+    validate_checkpoint_manifest(
         checkpoint,
-        _checkpoint_manifest(panel, config, include_data_content=False),
+        build_checkpoint_manifest(panel, config, include_data_content=False),
         checkpoint_path=checkpoint_path,
         scope="model",
     )
@@ -8856,6 +8860,25 @@ def load_model_from_checkpoint(
 
 def _fold_dir(output_dir: Path, fold_id: int) -> Path:
     return output_dir / f"fold_{int(fold_id):02d}"
+
+
+def _align_panel_to_checkpoint_universe(
+    panel: PanelData,
+    output_dir: Path,
+    fold_id: int,
+    checkpoint_path: Path,
+) -> PanelData:
+    checkpoint = load_checkpoint(checkpoint_path)
+    state_dict = checkpoint.get("model_state_dict", checkpoint)
+    if not isinstance(state_dict, Mapping):
+        return panel
+    return align_panel_to_checkpoint_universe(
+        panel,
+        _fold_dir(output_dir, fold_id),
+        state_dict,
+        checkpoint_symbols=checkpoint_manifest_symbols(checkpoint),
+        context="explain",
+    )
 
 
 def _select_fold_and_checkpoint(
@@ -8891,186 +8914,6 @@ def _available_checkpoint_folds(folds: list[WalkForwardFold], output_dir: Path) 
         if ckpt.exists():
             available.append(int(fold.fold_id))
     return sorted(available)
-
-
-def _checkpoint_symbol_count(checkpoint_path: Path) -> int | None:
-    from stockagent.training.trainer import _load_checkpoint
-
-    checkpoint = _load_checkpoint(checkpoint_path)
-    state_dict = checkpoint.get("model_state_dict", checkpoint) if isinstance(checkpoint, dict) else checkpoint
-    if not isinstance(state_dict, dict):
-        return None
-    for key, value in state_dict.items():
-        if str(key).endswith("symbol_position") and torch.is_tensor(value) and value.ndim == 4:
-            return int(value.size(2))
-    return None
-
-
-def _daily_weight_symbols(path: Path) -> list[str]:
-    if path.suffix.lower() == ".parquet":
-        import pyarrow.parquet as pq
-
-        return [str(column) for column in pq.read_schema(path).names if str(column) != "date"]
-    if path.suffix.lower() == ".parquet":
-        columns = pl.read_parquet_schema(path).names()
-        return [str(column) for column in columns if str(column) != "date"]
-    with path.open("r", encoding="utf-8", newline="") as handle:
-        header = next(csv.reader(handle))
-    return [str(column) for column in header if str(column) != "date"]
-
-
-def _daily_weight_table_path(fold_dir: Path) -> Path | None:
-    for candidate in (fold_dir / "daily_weights.parquet", fold_dir / "daily_weights.csv"):
-        if candidate.is_file():
-            return candidate
-    return None
-
-
-def _subset_panel_symbols(panel: PanelData, symbols: list[str]) -> PanelData:
-    index_by_symbol = {str(symbol): idx for idx, symbol in enumerate(panel.symbols)}
-    missing = [symbol for symbol in symbols if symbol not in index_by_symbol]
-    if missing:
-        preview = ", ".join(missing[:10])
-        raise ValueError(
-            f"Cannot align panel to checkpoint universe; {len(missing)} symbols from the daily_weights table "
-            f"are missing in the current panel: {preview}"
-        )
-    indices = np.asarray([index_by_symbol[symbol] for symbol in symbols], dtype=np.int64)
-    return PanelData(
-        dates=panel.dates,
-        symbols=list(symbols),
-        feature_names=list(panel.feature_names),
-        features=panel.features[:, indices, :],
-        returns_1d=panel.returns_1d[:, indices],
-        tradable_mask=panel.tradable_mask[:, indices],
-        alive_mask=panel.alive_mask[:, indices],
-        benchmark_returns=panel.benchmark_returns,
-        close_prices=panel.close_prices[:, indices],
-        can_buy_mask=panel.can_buy_mask[:, indices] if panel.can_buy_mask is not None else None,
-        can_sell_mask=panel.can_sell_mask[:, indices] if panel.can_sell_mask is not None else None,
-        can_short_open_mask=(
-            panel.can_short_open_mask[:, indices] if panel.can_short_open_mask is not None else None
-        ),
-        can_short_open_open_mask=(
-            panel.can_short_open_open_mask[:, indices]
-            if panel.can_short_open_open_mask is not None
-            else None
-        ),
-        force_short_cover_mask=(
-            panel.force_short_cover_mask[:, indices] if panel.force_short_cover_mask is not None else None
-        ),
-        force_exit_mask=(
-            panel.force_exit_mask[:, indices]
-            if panel.force_exit_mask is not None
-            else None
-        ),
-        daily_volumes=(
-            panel.daily_volumes[:, indices] if panel.daily_volumes is not None else None
-        ),
-        open_prices=(
-            panel.open_prices[:, indices] if panel.open_prices is not None else None
-        ),
-        intraday_returns=(
-            panel.intraday_returns[:, indices]
-            if panel.intraday_returns is not None
-            else None
-        ),
-        day_trade_eligible_mask=(
-            panel.day_trade_eligible_mask[:, indices]
-            if panel.day_trade_eligible_mask is not None
-            else None
-        ),
-        day_trade_can_short_open_mask=(
-            panel.day_trade_can_short_open_mask[:, indices]
-            if panel.day_trade_can_short_open_mask is not None
-            else None
-        ),
-        day_trade_can_buy_open_mask=(
-            panel.day_trade_can_buy_open_mask[:, indices]
-            if panel.day_trade_can_buy_open_mask is not None
-            else None
-        ),
-        day_trade_can_sell_open_mask=(
-            panel.day_trade_can_sell_open_mask[:, indices]
-            if panel.day_trade_can_sell_open_mask is not None
-            else None
-        ),
-        raw_close_returns_1d=(
-            panel.raw_close_returns_1d[:, indices]
-            if panel.raw_close_returns_1d is not None
-            else None
-        ),
-        unresolved_corporate_action_mask=(
-            panel.unresolved_corporate_action_mask[:, indices]
-            if panel.unresolved_corporate_action_mask is not None
-            else None
-        ),
-        cash_dividend_yield=(
-            panel.cash_dividend_yield[:, indices]
-            if panel.cash_dividend_yield is not None
-            else None
-        ),
-        cash_dividend_payment_delay_sessions=(
-            panel.cash_dividend_payment_delay_sessions[:, indices]
-            if panel.cash_dividend_payment_delay_sessions is not None
-            else None
-        ),
-        short_capacity_shares=(
-            panel.short_capacity_shares[:, indices]
-            if panel.short_capacity_shares is not None
-            else None
-        ),
-        short_margin_rate=(
-            panel.short_margin_rate[:, indices]
-            if panel.short_margin_rate is not None
-            else None
-        ),
-    )
-
-
-def _align_panel_to_checkpoint_universe(panel: PanelData, output_dir: Path, fold_id: int, checkpoint_path: Path) -> PanelData:
-    expected_symbols = _checkpoint_symbol_count(checkpoint_path)
-    if expected_symbols is None:
-        return panel
-    fold_dir = _fold_dir(output_dir, fold_id)
-    weights_path = _daily_weight_table_path(fold_dir)
-    if weights_path is None:
-        if int(panel.num_symbols) != int(expected_symbols):
-            raise ValueError(
-                f"Checkpoint expects {expected_symbols} symbols but current panel has {panel.num_symbols}; "
-                f"cannot align because daily_weights.parquet/csv is missing in {fold_dir}."
-            )
-        return panel
-
-    trained_symbols = _daily_weight_symbols(weights_path)
-    # symbol_position can be the compact train-union capacity while the saved
-    # daily weight table is the authoritative full evaluation universe.  This
-    # mirrors inference alignment: never reject a valid ordered weight schema
-    # merely because its width differs from the positional tensor checkpoint.
-    if trained_symbols == list(panel.symbols):
-        return panel
-
-    current_symbols = set(panel.symbols)
-    trained_set = set(trained_symbols)
-    if not trained_set.issubset(current_symbols):
-        missing = sorted(trained_set - current_symbols)
-        preview = ", ".join(missing[:10])
-        raise ValueError(
-            f"Cannot align panel to checkpoint universe; {len(missing)} trained symbols are missing "
-            f"from the current panel: {preview}"
-        )
-
-    extras = [symbol for symbol in panel.symbols if symbol not in trained_set]
-    if int(panel.num_symbols) != int(expected_symbols) or extras:
-        preview = ", ".join(extras[:10])
-        print(
-            "[explain] aligning panel symbols to checkpoint universe from "
-            f"{weights_path}: current={panel.num_symbols}, checkpoint={expected_symbols}, "
-            f"removed={len(extras)}" + (f" ({preview})" if preview else "")
-        )
-    else:
-        print(f"[explain] reordering panel symbols to match checkpoint universe from {weights_path}")
-    return _subset_panel_symbols(panel, trained_symbols)
 
 
 def _first_year_indices(panel: PanelData, indices: np.ndarray) -> np.ndarray:

@@ -52,12 +52,16 @@ from stockagent.data.walkforward import (
 from stockagent.models.factory import build_model
 from stockagent.portfolio_contract import normalize_portfolio_output_mode
 from stockagent.evaluation.metrics import ic_summary
+from stockagent.training.checkpoint_contract import (
+    _active_model_config,
+    _configuration_fingerprint_snapshot,
+    _stable_fingerprint,
+)
 from stockagent.training.trainer import (
     FoldResult,
     TimingBreakdown,
     _EpochCurveLifecycle,
     _PreEpochTimingRecorder,
-    _active_model_config,
     _autocast_context,
     _can_enable_torch_compile,
     _create_adamw_optimizer,
@@ -83,8 +87,6 @@ from stockagent.training.trainer import (
     _save_fold_output_artifacts,
     _save_fold_checkpoint,
     _save_group_checkpoint,
-    _stable_fingerprint,
-    _configuration_fingerprint_snapshot,
     _step_batch_lr_scheduler,
     _timing_curve_payload,
     _torch_compile_options,

@@ -428,6 +428,13 @@ Rules:
 
 ## Trainer Executor Boundaries
 
+- Checkpoint schema 1--4 construction/validation and ordered universe alignment
+  are owned by `stockagent.training.checkpoint_contract`. Training may retain
+  private compatibility aliases, but live/explainability code must not import
+  trainer orchestration for these semantics. When present, the manifest's
+  ordered symbols are authoritative; `symbol_position` is only a capacity hint
+  and `daily_weights` is a legacy fallback. A model/data symbol-contract
+  disagreement must fail closed.
 - Neural training has one lazy `WindowedSplitTensors` executor per process. The
   single-device and torchrun DDP variants share the same canonical model, loss,
   side masks, fees, and stateful backtest semantics.

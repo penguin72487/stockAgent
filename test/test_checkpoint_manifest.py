@@ -14,6 +14,7 @@ from stockagent.config import load_config
 from stockagent.data.panel import PanelData
 from stockagent.data.walkforward import WalkForwardFold
 from stockagent.explainability import load_model_from_checkpoint
+from stockagent.training.checkpoint_contract import checkpoint_manifest_symbols
 from stockagent.training.trainer import (
     _align_panel_to_state_dict_universe,
     _checkpoint_manifest,
@@ -71,6 +72,50 @@ def test_checkpoint_manifest_universe_overrides_symbol_position_capacity(
     )
 
     assert aligned is panel
+
+
+def test_checkpoint_manifest_symbols_drive_order_without_weight_table(
+    tmp_path: Path,
+) -> None:
+    panel = _panel()
+    fold_dir = tmp_path / "fold_00"
+    fold_dir.mkdir()
+    state_dict = {"symbol_position": torch.zeros((1, 1, 8, 8))}
+    checkpoint = {
+        "experiment_manifest": {
+            "contracts": {
+                "model": {"symbols": ["2330", "1101"]},
+                "data": {"symbols": ["2330", "1101"]},
+            }
+        }
+    }
+
+    symbols = checkpoint_manifest_symbols(checkpoint)
+    aligned = _align_panel_to_state_dict_universe(
+        panel,
+        fold_dir,
+        state_dict,
+        checkpoint_symbols=symbols,
+    )
+
+    assert symbols == ["2330", "1101"]
+    assert aligned.symbols == ["2330", "1101"]
+    assert np.array_equal(aligned.features[:, 0], panel.features[:, 1])
+    assert np.array_equal(aligned.features[:, 1], panel.features[:, 0])
+
+
+def test_checkpoint_manifest_symbol_contract_disagreement_fails_closed() -> None:
+    checkpoint = {
+        "experiment_manifest": {
+            "contracts": {
+                "model": {"symbols": ["1101", "2330"]},
+                "data": {"symbols": ["2330", "1101"]},
+            }
+        }
+    }
+
+    with pytest.raises(ValueError, match="ordered symbol universes disagree"):
+        checkpoint_manifest_symbols(checkpoint)
 
 
 def test_live_alignment_restores_missing_checkpoint_symbols_as_masked_slots(
