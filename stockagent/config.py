@@ -1044,8 +1044,6 @@ class TransformerBasePortfolioModelConfig:
     temporal_query_mode: str = "full_then_last"
     temporal_basis_families: list[str] = field(default_factory=list)
     temporal_basis_components: int = 8
-    temporal_basis_dropout: float = 0.0
-    temporal_basis_gate_init: float = -2.0
     cross_layers: int = 1
     cross_heads: int = 4
     cross_ffn_mult: int = 2
