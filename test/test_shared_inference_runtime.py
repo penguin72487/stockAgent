@@ -8,6 +8,19 @@ import pytest
 import torch
 from torch import nn
 
+from stockagent.training.checkpoint_contract import (
+    align_panel_to_checkpoint_universe as canonical_align_panel,
+    build_checkpoint_manifest as canonical_build_manifest,
+    checkpoint_manifest_symbols as canonical_checkpoint_symbols,
+    validate_checkpoint_manifest as canonical_validate_manifest,
+)
+from stockagent.training.inference_contract import (
+    align_panel_to_checkpoint_universe,
+    build_checkpoint_manifest,
+    checkpoint_manifest_symbols,
+    configure_inference_runtime,
+    validate_checkpoint_manifest,
+)
 from stockagent.training.runtime import (
     autocast_context,
     call_model,
@@ -17,6 +30,9 @@ from stockagent.training.runtime import (
     resolve_amp_dtype,
     resolve_device,
     unwrap_model,
+)
+from stockagent.training.runtime_configuration import (
+    configure_inference_runtime as canonical_configure_runtime,
 )
 
 
@@ -113,6 +129,34 @@ def test_live_module_import_does_not_eagerly_load_trainer() -> None:
             "-c",
             (
                 "import sys; import stockagent.live.signal_engine; "
+                "print('stockagent.training.trainer' in sys.modules)"
+            ),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.stdout.strip() == "False"
+
+
+def test_inference_contract_is_a_direct_trainer_free_boundary() -> None:
+    assert align_panel_to_checkpoint_universe is canonical_align_panel
+    assert build_checkpoint_manifest is canonical_build_manifest
+    assert checkpoint_manifest_symbols is canonical_checkpoint_symbols
+    assert configure_inference_runtime is canonical_configure_runtime
+    assert validate_checkpoint_manifest is canonical_validate_manifest
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; "
+                "from stockagent.config import load_config; "
+                "from stockagent.training.inference_contract import "
+                "configure_inference_runtime; "
+                "configure_inference_runtime(load_config('configs/experiment_baseline.yaml')); "
                 "print('stockagent.training.trainer' in sys.modules)"
             ),
         ],

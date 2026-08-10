@@ -17,14 +17,14 @@ or any strategy is investable.
 | Information | point-in-time masks, public-data feature timing, immutable snapshot and receipt workflows | Strong design; completeness must still be checked per run |
 | Causality | explicit fold ownership, split-local/panel-history lookbacks, execution-specific clocks | Strong contract; the active candle YAML is now consistently named as day-trade |
 | Mechanism | canonical tensor simulator, fees/taxes, Taiwan settlement and phase executors | Strong but high-complexity implementation |
-| Latency/deployability | lazy slabs, compile/DDP paths, live signal path | Capable; pure inference runtime no longer requires eager trainer import, while manifest construction remains trainer-owned behind a narrow API |
+| Latency/deployability | lazy slabs, compile/DDP paths, live signal path | Capable; importing and calling the shared inference contract no longer loads trainer orchestration |
 | Reproducibility | checkpoint manifests, RNG/fold fingerprints, lifecycle artifacts | Strong run artifacts; environment runtime and repository-local metadata boundaries are now verified |
 
 ## Measured inventory
 
 - 487 tracked-or-patch files; 126 test modules and 2,100 test functions.
 - About 294,358 tracked-or-patch Python lines.
-- Largest production modules: `stockagent/training/trainer.py` (22,326 lines),
+- Largest production modules: `stockagent/training/trainer.py` (20,292 lines),
   `downloader/download_openbb_archive.py` (18,732), and
   `stockagent/explainability.py` (10,110).
 - The worktree was clean at the start of the review.
@@ -38,10 +38,11 @@ compileall: passed
 Ruff correctness checks: passed
 focused correction tests: 35 passed
 shared runtime/live/checkpoint focused tests: 143 passed
+manifest/runtime extraction focused tests: 261 passed
 real CUDA NVFP4 forward/backward: 1 passed
 strict CUDA environment check: passed
-formal suite: 2725 passed, 1 skipped, 1 xfailed, 32 warnings
-formal suite elapsed: 266.27 seconds
+formal suite: 2731 passed, 1 skipped, 1 xfailed, 32 warnings
+formal suite elapsed: 273.50 seconds
 ```
 
 The focused set covered active trading/output configuration, inherited ablation
@@ -76,7 +77,7 @@ runtime imports and package metadata observed by Python are correct, but this is
 an environment-hygiene issue to clean during a controlled rebuild rather than by
 manually deleting package records.
 
-### Partially resolved P1 — Extract shared runtime contracts
+### Resolved P1 — Extract shared inference contracts
 
 Device resolution, BF16/FP16 autocast, model calling, model-output extraction,
 wrapper unwrapping, safe checkpoint loading, and state-dict compatibility now
@@ -87,16 +88,28 @@ live signal module no longer imports the trainer.
 
 One measured cold import changed from 7.68s / 818,268 KiB RSS / 2,866 modules to
 4.54s / 804,060 KiB RSS / 2,680 modules. This is import-boundary evidence, not a
-claim that complete signal generation is 41% faster: checkpoint manifest
-construction and panel-universe alignment still delegate lazily to their single
-trainer implementation through `stockagent/training/inference_contract.py`.
+claim that complete signal generation is 41% faster. Checkpoint schema 1--4
+construction/validation, ordered universe alignment, and compile/backtest
+runtime configuration now live in orchestration-free modules. A subprocess
+regression test calls the public runtime configuration and proves that trainer
+is still absent from `sys.modules`.
+
+After the full extraction, a fresh cold-import sample measured 4.22s,
+804,360 KiB RSS, and 2,682 modules with trainer absent. This remains a
+cold-import boundary measurement, not an end-to-end live-signal latency claim.
+
+The checkpoint manifest's ordered symbol list is now authoritative during live
+and explainability alignment. The positional tensor is only a capacity hint,
+and `daily_weights` remains a legacy fallback. If model and data contracts name
+different ordered universes, loading fails closed instead of silently permuting
+positions.
 
 The former `stockagent/data` dependency on `downloader/` was repaired in this
 review: reusable capture-part selection now lives in
 `stockagent/data/shioaji_capture_parts.py`, while the downloader path is a thin
-compatibility re-export. The remaining runtime-boundary priority is to move the
-manifest/alignment implementations behind the public inference API, eliminating
-its lazy delegates into trainer internals without duplicating schema logic.
+compatibility re-export. Explainability's second panel-symbol slicing
+implementation was also removed; training, live, and explainability now project
+every symbol-indexed panel array through the same implementation.
 
 ### Partially resolved P1 — Repair repository boundaries
 
@@ -160,6 +173,13 @@ for optional stacks instead of assuming package metadata implies importability.
   the optional NVFP4 CUDA path.
 - Extracted the shared model/precision/checkpoint-I/O runtime from the trainer,
   preserved existing trainer aliases, and moved live inference to public APIs.
+- Extracted checkpoint manifest construction/validation, ordered panel-universe
+  alignment, and runtime environment configuration from the trainer without
+  changing schema 1--4 compatibility behavior.
+- Made checkpoint manifest symbols authoritative for live/explainability and
+  fail closed when saved model/data universe order disagrees.
+- Removed explainability's duplicate panel-symbol projection and weight-table
+  schema reader; both now reuse the canonical checkpoint contract.
 - Added regression coverage for empty attention rows, nested wrapper state,
   safe checkpoint payloads, canonical alias reuse, precision, and lazy live
   imports.
@@ -171,13 +191,10 @@ not changed.
 
 ## Recommended next sequence
 
-1. Extract checkpoint manifest construction/validation and panel-universe
-   alignment from the trainer after characterizing all schema-1--4 compatibility
-   paths; remove the lazy delegates only in that same patch.
-2. Turn the now-green formal suite and strict environment check into CI gates.
-3. Back up and schedule explicit Git object maintenance; do not combine history
+1. Turn the now-green formal suite and strict environment check into CI gates.
+2. Back up and schedule explicit Git object maintenance; do not combine history
    rewriting or garbage collection with feature work.
-4. Rebuild the fintech environment from a lock to eliminate duplicate package
+3. Rebuild the fintech environment from a lock to eliminate duplicate package
    metadata and verify optional precision capabilities from a clean prefix.
-5. Continue decomposing the largest modules only behind characterized semantic
+4. Continue decomposing the largest modules only behind characterized semantic
    contracts.
