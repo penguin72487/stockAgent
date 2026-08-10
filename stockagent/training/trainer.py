@@ -18,7 +18,7 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass, field
 from datetime import timedelta
 from functools import partial, wraps
-from pathlib import Path, PosixPath
+from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 import numpy as np
@@ -30,7 +30,7 @@ try:
 except Exception:  # pragma: no cover - older torch fallback
     dist_fc = None
 from torch import nn
-from torch.amp import GradScaler, autocast
+from torch.amp import GradScaler
 from torch.nn.parallel import DistributedDataParallel as DistributedDataParallel
 from tqdm import tqdm
 
@@ -122,6 +122,17 @@ from stockagent.training.lifecycle import (
     TrainingRunLifecycle,
     canonical_mode_artifact_contract,
     normalize_epoch_curve_record,
+)
+from stockagent.training.runtime import (
+    autocast_context as _autocast_context,
+    call_model as _call_model,
+    extract_weights_and_aux as _extract_weights_and_aux,
+    load_checkpoint as _load_checkpoint,
+    load_model_state_dict,
+    model_attention_mask as _model_attention_mask,
+    resolve_amp_dtype as _resolve_amp_dtype,
+    resolve_device as _resolve_device,
+    unwrap_model as _unwrap_model,
 )
 from stockagent.training.windowed import WindowedSplitTensors, dataset_to_windowed_tensors
 
@@ -1753,68 +1764,6 @@ def _progress_bar(
         dynamic_ncols=True,
         disable=not _interactive_progress_enabled(),
     )
-
-
-def _extract_weights_and_aux(
-    model_output: torch.Tensor | dict[str, torch.Tensor] | tuple[Any, ...],
-) -> tuple[torch.Tensor, dict[str, torch.Tensor] | None]:
-    if isinstance(model_output, dict):
-        if "weights" not in model_output:
-            raise ValueError("Model output dict must include 'weights'")
-        weights = model_output["weights"]
-        return weights, model_output
-    if isinstance(model_output, tuple):
-        weights = model_output[0]
-        aux = model_output[2] if len(model_output) >= 3 and isinstance(model_output[2], dict) else None
-        return weights, aux
-    return model_output, None
-
-
-def _model_accepts_return_aux(model: nn.Module) -> bool:
-    target = _unwrap_model(model)
-    cached = getattr(target, "_stockagent_accepts_return_aux", None)
-    if cached is not None:
-        return bool(cached)
-    try:
-        accepts = "return_aux" in inspect.signature(target.forward).parameters
-    except (TypeError, ValueError):
-        accepts = hasattr(target, "return_aux")
-    try:
-        setattr(target, "_stockagent_accepts_return_aux", bool(accepts))
-    except Exception:
-        pass
-    return bool(accepts)
-
-
-def _call_model(
-    model: nn.Module,
-    x: torch.Tensor,
-    mask: torch.Tensor,
-    *,
-    return_aux: bool | None = None,
-    symbol_indices: torch.Tensor | None = None,
-):
-    mask = _model_attention_mask(mask)
-    if symbol_indices is not None:
-        if return_aux is None or not _model_accepts_return_aux(model):
-            return model(x, mask, symbol_indices=symbol_indices)
-        return model(x, mask, return_aux=return_aux, symbol_indices=symbol_indices)
-    if return_aux is None or not _model_accepts_return_aux(model):
-        return model(x, mask)
-    return model(x, mask, return_aux=return_aux)
-
-
-def _model_attention_mask(mask: torch.Tensor) -> torch.Tensor:
-    """Ensure every model row has a visible attention token.
-
-    Dataset rows containing only a forced exit legitimately have no tradable
-    symbols.  The model still needs one visible token to keep attention kernels
-    well-defined, while callers retain the original mask for every loss and
-    backtest calculation.
-    """
-    mask_bool = mask.to(dtype=torch.bool)
-    empty_rows = ~mask_bool.any(dim=-1, keepdim=True)
-    return torch.cat((mask_bool[..., :1] | empty_rows, mask_bool[..., 1:]), dim=-1)
 
 
 def _loss_from_backtest_series(
@@ -3985,27 +3934,6 @@ def _write_summary(results: list[FoldResult], output_path: Path) -> None:
         json.dump([asdict(result) for result in results], handle, indent=2)
 
 
-def _unwrap_model(model: nn.Module) -> nn.Module:
-    target = model
-    seen: set[int] = set()
-    while True:
-        if id(target) in seen:
-            return target
-        seen.add(id(target))
-        next_target = getattr(target, "_orig_mod", None)
-        if next_target is None and isinstance(target, _PanelSlabForwardWrapper):
-            next_target = getattr(target, "model", None)
-        if next_target is None and bool(
-            getattr(target, "_stockagent_dynamic_symbol_panel_slab_wrapper", False)
-        ):
-            next_target = getattr(target, "model", None)
-        if next_target is None and isinstance(target, DistributedDataParallel):
-            next_target = getattr(target, "module", None)
-        if next_target is None or next_target is target:
-            return target
-        target = next_target
-
-
 def _unwrap_distributed_data_parallel(model: nn.Module) -> nn.Module:
     if isinstance(model, DistributedDataParallel):
         return getattr(model, "module", model)
@@ -4087,6 +4015,8 @@ def _callable_accepts_parameter(fn: Callable[..., Any], parameter: str) -> bool:
 
 
 class _PanelSlabForwardWrapper(nn.Module):
+    _stockagent_panel_slab_forward_wrapper = True
+
     def __init__(self, model: nn.Module) -> None:
         super().__init__()
         slab_model = _panel_slab_forward_module(model)
@@ -4549,80 +4479,12 @@ def _tensor_is_finite(value: torch.Tensor) -> bool:
 
 
 def _load_state_dict(model: nn.Module, state_dict: dict) -> None:
-    def _strip_wrapper_prefixes(key: str) -> str:
-        cleaned = str(key)
-        while True:
-            previous = cleaned
-            for prefix in ("module.", "_orig_mod."):
-                if cleaned.startswith(prefix):
-                    cleaned = cleaned[len(prefix) :]
-                    break
-            if cleaned == previous:
-                return cleaned
-
-    cleaned_state_dict = {
-        _strip_wrapper_prefixes(key): value for key, value in state_dict.items()
-    }
-    target = _unwrap_model(model)
-    legacy_dynamic_keys = any(
-        key.startswith(("dynamic_latent_generator.", "dynamic_market_generator."))
-        for key in cleaned_state_dict
+    load_model_state_dict(
+        model,
+        state_dict,
+        strict_no_fallback=_strict_no_fallback_enabled(),
+        progress=_progress,
     )
-    if legacy_dynamic_keys:
-        compatibility_loader = getattr(
-            target,
-            "enable_legacy_dynamic_token_checkpoint_compatibility",
-            None,
-        )
-        if compatibility_loader is None:
-            raise RuntimeError(
-                "Checkpoint contains legacy dynamic-token weights, but the target model "
-                "does not support their strict inference reconstruction."
-            )
-        compatibility_loader(cleaned_state_dict)
-    try:
-        target.load_state_dict(cleaned_state_dict)
-        return
-    except RuntimeError as exc:
-        message = str(exc)
-        if not (hasattr(target, "forward_from_panel") and "Unexpected key(s)" in message):
-            raise
-        if _strict_no_fallback_enabled():
-            raise RuntimeError(
-                "Checkpoint state_dict is not strictly compatible with the model; "
-                "strict_no_fallback=true so strict=False checkpoint loading is disabled."
-            ) from exc
-
-    incompatible = target.load_state_dict(cleaned_state_dict, strict=False)
-    allowed_prefixes = (
-        "cross_blocks.",
-        "joint_blocks.",
-        "latent_queries",
-        "market_queries",
-        "temporal_pool_score.",
-        "latent_blocks.",
-        "market_blocks.",
-        "stock_read_latent_blocks.",
-        "stock_read_market_blocks.",
-    )
-    unexpected = list(getattr(incompatible, "unexpected_keys", []))
-    missing = list(getattr(incompatible, "missing_keys", []))
-    disallowed_unexpected = [
-        key for key in unexpected if not any(key.startswith(prefix) for prefix in allowed_prefixes)
-    ]
-    if missing or disallowed_unexpected:
-        details = []
-        if missing:
-            details.append(f"missing={missing[:8]}")
-        if disallowed_unexpected:
-            details.append(f"unexpected={disallowed_unexpected[:8]}")
-        raise RuntimeError("Checkpoint is incompatible with model state_dict: " + ", ".join(details))
-    if unexpected:
-        _progress(
-            "Loaded checkpoint with strict=False; ignored unused TransformerBasePortfolioModel keys: "
-            + ", ".join(unexpected[:8])
-            + (" ..." if len(unexpected) > 8 else "")
-        )
 
 
 def _stable_fingerprint(payload: Mapping[str, Any]) -> str:
@@ -6618,29 +6480,6 @@ def _save_tree_checkpoint_metadata(
         },
         checkpoint_path,
     )
-
-
-def _load_checkpoint(checkpoint_path: Path) -> dict:
-    """Load tensor checkpoints without enabling arbitrary pickle globals.
-
-    Project manifests may contain local ``Path`` values. PyTorch 2.6 changed
-    ``torch.load`` to ``weights_only=True`` by default, so explicitly allow the
-    concrete Linux path type while keeping every other non-tensor global
-    blocked.
-    """
-
-    with torch.serialization.safe_globals([PosixPath]):
-        checkpoint = torch.load(
-            checkpoint_path,
-            map_location="cpu",
-            weights_only=True,
-        )
-    if not isinstance(checkpoint, dict):
-        raise TypeError(
-            f"Checkpoint must contain a mapping, got {type(checkpoint).__name__}: "
-            f"{checkpoint_path}"
-        )
-    return checkpoint
 
 
 def _validate_checkpoint_effective_train_batch_size(
@@ -14454,17 +14293,6 @@ def _load_completed_fold_result(
 
 
 
-def _resolve_device(config: ExperimentConfig) -> torch.device:
-    requested = config.environment.device
-    if requested == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError(
-            "CUDA was requested in config (environment.device=cuda), "
-            "but torch.cuda.is_available() is False. "
-            "Training is aborted to avoid silently falling back to CPU."
-        )
-    return torch.device(requested)
-
-
 def _resolve_distributed_data_parallel(config: ExperimentConfig, device: torch.device) -> bool:
     strategy = str(getattr(config.training, "multi_gpu_strategy", "none") or "none").strip().lower().replace("-", "_")
     if strategy not in {"distributed_data_parallel", "ddp", "distributed", "torch_ddp"}:
@@ -14516,22 +14344,6 @@ def _wrap_distributed_data_parallel_model(
         )
     except TypeError:
         return DistributedDataParallel(module, **ddp_kwargs)
-
-
-def _resolve_amp_dtype(amp_dtype: str) -> torch.dtype | None:
-    if amp_dtype == "bf16":
-        return torch.bfloat16
-    if amp_dtype == "fp16":
-        return torch.float16
-    if amp_dtype == "tf32":
-        return None
-    raise ValueError(f"Unsupported amp dtype: {amp_dtype}")
-
-
-def _autocast_context(device: torch.device, amp_dtype: torch.dtype | None):
-    if device.type != "cuda" or amp_dtype is None:
-        return nullcontext()
-    return autocast(device_type="cuda", enabled=True, dtype=amp_dtype)
 
 
 def _resolve_host_compilers() -> tuple[str | None, str | None]:

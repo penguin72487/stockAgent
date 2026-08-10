@@ -37,18 +37,20 @@ from stockagent.live.report_formatter import format_signal_message, is_display_p
 from stockagent.live.market_status import cumulative_recent_returns, short_file_fingerprint
 from stockagent.live.time_display import DEFAULT_DISPLAY_TIMEZONE, display_timezone_label
 from stockagent.models.factory import build_model
-from stockagent.training.trainer import (
-    _autocast_context,
-    _call_model,
-    _checkpoint_manifest,
-    _extract_weights_and_aux,
-    _align_panel_to_state_dict_universe,
-    _configure_backtest_runtime_from_config,
-    _load_checkpoint,
-    _load_state_dict,
-    _resolve_amp_dtype,
-    _resolve_device,
-    _validate_checkpoint_manifest,
+from stockagent.training.inference_contract import (
+    align_panel_to_checkpoint_universe,
+    build_checkpoint_manifest,
+    configure_inference_runtime,
+    validate_checkpoint_manifest,
+)
+from stockagent.training.runtime import (
+    autocast_context,
+    call_model,
+    extract_weights_and_aux,
+    load_checkpoint,
+    load_model_state_dict,
+    resolve_amp_dtype,
+    resolve_device,
 )
 
 
@@ -1596,7 +1598,7 @@ def generate_live_signal(
     if device is not None:
         config.environment.device = str(device)
     os.environ["STOCKAGENT_STRICT_NO_FALLBACK"] = "1" if config.training.strict_no_fallback else "0"
-    _configure_backtest_runtime_from_config(config)
+    configure_inference_runtime(config)
     if getattr(config.training, "inference_backtest_autotune", None) is not None:
         os.environ["STOCKAGENT_BACKTEST_AUTOTUNE"] = (
             "1" if bool(config.training.inference_backtest_autotune) else "0"
@@ -1618,11 +1620,11 @@ def generate_live_signal(
     trading_frequency = str(getattr(config.trading, "frequency", "") or "")
     intraday_frequency = _is_intraday_frequency(trading_frequency)
 
-    runtime_device = _resolve_device(config)
-    amp_dtype = _resolve_amp_dtype(config.environment.amp_dtype)
+    runtime_device = resolve_device(config)
+    amp_dtype = resolve_amp_dtype(config.environment.amp_dtype)
     non_blocking = bool(config.training.non_blocking_transfer and runtime_device.type == "cuda")
 
-    checkpoint_payload = _load_checkpoint(checkpoint)
+    checkpoint_payload = load_checkpoint(checkpoint)
     _emit_progress(progress_callback, label=progress_name, step=3, total=progress_total, message="checkpoint loaded")
     state_dict = checkpoint_payload.get("model_state_dict")
     if not isinstance(state_dict, dict):
@@ -1634,7 +1636,7 @@ def generate_live_signal(
         else _build_panel(config, live_tail=True)
     )
     _emit_progress(progress_callback, label=progress_name, step=4, total=progress_total, message="panel ready")
-    panel = _align_panel_to_state_dict_universe(
+    panel = align_panel_to_checkpoint_universe(
         panel,
         resolved_output_dir / f"fold_{resolved_fold_id:02d}",
         state_dict,
@@ -1646,9 +1648,9 @@ def generate_live_signal(
         raise RuntimeError(
             f"checkpoint fold mismatch: path requests {resolved_fold_id}, payload contains {saved_fold_id}"
         )
-    _validate_checkpoint_manifest(
+    validate_checkpoint_manifest(
         checkpoint_payload,
-        _checkpoint_manifest(panel, config, include_data_content=False),
+        build_checkpoint_manifest(panel, config, include_data_content=False),
         checkpoint_path=checkpoint,
         scope="model",
     )
@@ -1850,7 +1852,11 @@ def generate_live_signal(
         num_symbols=panel.num_symbols,
         feature_names=panel.feature_names,
     ).to(runtime_device)
-    _load_state_dict(model, state_dict)
+    load_model_state_dict(
+        model,
+        state_dict,
+        strict_no_fallback=bool(config.training.strict_no_fallback),
+    )
     model.eval()
     _emit_progress(progress_callback, label=progress_name, step=11, total=progress_total, message="model ready")
 
@@ -1916,9 +1922,9 @@ def generate_live_signal(
     with torch.inference_mode():
         x = torch.from_numpy(x_np).unsqueeze(0).to(device=runtime_device, non_blocking=non_blocking)
         mask = torch.from_numpy(mask_np).unsqueeze(0).to(device=runtime_device, non_blocking=non_blocking)
-        with _autocast_context(runtime_device, amp_dtype):
-            model_output = _call_model(model, x, mask, return_aux=True)
-            model_weights_t, aux = _extract_weights_and_aux(model_output)
+        with autocast_context(runtime_device, amp_dtype):
+            model_output = call_model(model, x, mask, return_aux=True)
+            model_weights_t, aux = extract_weights_and_aux(model_output)
             model_weights_t = _require_single_target_live_weights(
                 model_weights_t,
                 execution_mode=execution_mode,
@@ -1928,13 +1934,13 @@ def generate_live_signal(
                 # This second pass deliberately exposes every checkpoint symbol to
                 # the model.  Its score logits are for inspection only and never
                 # feed the executable target/backtest path below.
-                unconstrained_output = _call_model(
+                unconstrained_output = call_model(
                     model,
                     x,
                     torch.ones_like(mask, dtype=torch.bool),
                     return_aux=True,
                 )
-                _, unconstrained_aux = _extract_weights_and_aux(unconstrained_output)
+                _, unconstrained_aux = extract_weights_and_aux(unconstrained_output)
                 (
                     unconstrained_raw_score_tensor,
                     unconstrained_raw_score_source,
