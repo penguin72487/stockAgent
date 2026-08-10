@@ -4663,6 +4663,7 @@ def _panel_array_content_fingerprint(
 _TEMPORAL_BASIS_MODEL_CONFIG_FIELDS = (
     "temporal_basis_families",
     "temporal_basis_components",
+    "temporal_basis_input",
 )
 
 
@@ -4675,6 +4676,10 @@ def _project_temporal_basis_model_config(
     if not projected.get("temporal_basis_families"):
         for field_name in _TEMPORAL_BASIS_MODEL_CONFIG_FIELDS:
             projected.pop(field_name, None)
+    elif str(projected.get("temporal_basis_input", "embedded")) == "embedded":
+        # Preserve pre-option basis checkpoint fingerprints.  Embedded is the
+        # historical behavior and does not alter parameters or the forward path.
+        projected.pop("temporal_basis_input", None)
     if int(projected.get("daily_context_layers", 0) or 0) == 0:
         # These controls have no parameters or forward-path effect until the
         # daily-context branch has at least one layer.  Omitting them preserves

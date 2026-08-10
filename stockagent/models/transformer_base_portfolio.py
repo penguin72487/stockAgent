@@ -246,6 +246,26 @@ def _normalize_temporal_basis_families(
     return tuple(normalized)
 
 
+def _normalize_temporal_basis_input(value: str | None) -> str:
+    """Resolve which representation is decomposed along the time axis."""
+
+    normalized = str(value or "embedded").strip().lower().replace("-", "_")
+    aliases = {
+        "embedding": "embedded",
+        "embeddings": "embedded",
+        "latent": "embedded",
+        "raw": "raw_features",
+        "raw_feature": "raw_features",
+        "features": "raw_features",
+    }
+    normalized = aliases.get(normalized, normalized)
+    if normalized not in {"embedded", "raw_features"}:
+        raise ValueError(
+            "temporal_basis_input must be 'embedded' or 'raw_features'"
+        )
+    return normalized
+
+
 def _haar_basis(steps: int) -> list[torch.Tensor]:
     if steps < 2 or steps & (steps - 1):
         raise ValueError(
@@ -745,19 +765,38 @@ def _temporal_basis_matrix(
 
 
 class TemporalBasisFeatureEncoder(nn.Module):
-    """Append temporal-basis coefficients to the ordinary model feature vector."""
+    """Fuse a time-domain model path with per-input temporal coefficients.
+
+    ``source_dim`` may differ from ``dim``.  That is the important distinction
+    for raw-feature decomposition: the ordinary temporal Transformer still
+    produces ``z_base [B,S,D]``, while every original feature independently
+    produces one coefficient per basis component.
+
+    The no-aux hot path contracts the basis and the final linear projection
+    before applying them to the input.  It is exactly the same linear map as
+    materializing ``[B,S,K*F]`` coefficients, but avoids retaining that very
+    large tensor for full-universe training.
+    """
 
     def __init__(
         self,
         *,
         lookback: int,
         dim: int,
+        source_dim: int | None = None,
         families: Sequence[str] | str,
         components: int,
+        sanitize_inputs: bool = True,
+        fuse_projection: bool = False,
     ) -> None:
         super().__init__()
         self.lookback = int(lookback)
         self.dim = int(dim)
+        self.source_dim = self.dim if source_dim is None else int(source_dim)
+        if self.source_dim <= 0:
+            raise ValueError("TemporalBasisFeatureEncoder source_dim must be positive")
+        self.sanitize_inputs = bool(sanitize_inputs)
+        self.fuse_projection = bool(fuse_projection)
         self.family_names = _normalize_temporal_basis_families(families)
         if not self.family_names:
             raise ValueError("TemporalBasisFeatureEncoder requires at least one family")
@@ -779,11 +818,83 @@ class TemporalBasisFeatureEncoder(nn.Module):
             self.family_component_counts[family] = int(matrix.size(0))
 
         self.total_basis_components = sum(self.family_component_counts.values())
-        self.input_feature_dim = self.dim * (1 + self.total_basis_components)
+        self.input_feature_dim = self.dim + (
+            self.source_dim * self.total_basis_components
+        )
         self.feature_projection = nn.Linear(
             self.input_feature_dim,
             self.dim,
         )
+
+    def prepare_source(self, source: torch.Tensor) -> torch.Tensor:
+        """Move and sanitize raw source rows once before rolling-window views."""
+
+        weight = self.feature_projection.weight
+        prepared = source.to(device=weight.device, dtype=weight.dtype)
+        if self.sanitize_inputs:
+            prepared = torch.nan_to_num(
+                prepared,
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            )
+        return prepared
+
+    def _basis(self, family: str, source: torch.Tensor) -> torch.Tensor:
+        basis_source = getattr(self, f"{family}_basis")
+        if family == "learned":
+            basis_source = basis_source - basis_source.mean(dim=-1, keepdim=True)
+            basis_source = F.normalize(
+                basis_source.float(),
+                dim=-1,
+                eps=1e-6,
+            ).to(dtype=basis_source.dtype)
+        return basis_source.to(device=source.device, dtype=source.dtype)
+
+    def _fused_projection(
+        self,
+        temporal_source: torch.Tensor,
+        z_base: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply the concatenated coefficient projection without materializing it."""
+
+        weight = self.feature_projection.weight
+        output = F.linear(
+            z_base,
+            weight[:, : self.dim],
+            self.feature_projection.bias,
+        )
+        offset = self.dim
+        effective_kernel: torch.Tensor | None = None
+        for family in self.family_names:
+            component_count = self.family_component_counts[family]
+            width = component_count * self.source_dim
+            family_weight = weight[:, offset : offset + width].reshape(
+                self.dim,
+                component_count,
+                self.source_dim,
+            )
+            basis = self._basis(family, temporal_source)
+            # W[o,k,f] B[k,l] becomes one compact time-feature kernel.  This
+            # contraction is algebraically identical to W @ basis_coefficients.
+            family_kernel = torch.einsum(
+                "okf,kl->olf",
+                family_weight,
+                basis,
+            )
+            effective_kernel = (
+                family_kernel
+                if effective_kernel is None
+                else effective_kernel + family_kernel
+            )
+            offset += width
+        if effective_kernel is not None:
+            output = output + torch.einsum(
+                "olf,blsf->bso",
+                effective_kernel,
+                temporal_source,
+            )
+        return output
 
     def forward(
         self,
@@ -792,13 +903,19 @@ class TemporalBasisFeatureEncoder(nn.Module):
         mask: torch.Tensor,
         *,
         collect_aux: bool,
+        source_is_prepared: bool = False,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         if temporal_embeddings.ndim != 4:
-            raise ValueError("temporal_embeddings must have shape [B,L,S,D]")
+            raise ValueError("temporal_embeddings must have shape [B,L,S,F]")
         if int(temporal_embeddings.size(1)) != self.lookback:
             raise ValueError(
                 f"Expected temporal lookback={self.lookback}, "
                 f"got {int(temporal_embeddings.size(1))}"
+            )
+        if int(temporal_embeddings.size(-1)) != self.source_dim:
+            raise ValueError(
+                f"Expected temporal source_dim={self.source_dim}, "
+                f"got {int(temporal_embeddings.size(-1))}"
             )
         if not _torch_is_compiling() and tuple(z_base.shape) != (
             int(temporal_embeddings.size(0)),
@@ -807,40 +924,43 @@ class TemporalBasisFeatureEncoder(nn.Module):
         ):
             raise ValueError("z_base must have shape [B,S,D]")
 
-        feature_parts = [z_base]
+        # Embedded is the historical path and is already sanitized/projected.
+        # Keep its native AMP dtype and exact coefficient calculation.  Raw
+        # sources are prepared explicitly before rolling-window views.
+        if not source_is_prepared and self.fuse_projection:
+            temporal_embeddings = self.prepare_source(temporal_embeddings)
         aux: dict[str, torch.Tensor] = {}
-        for family in self.family_names:
-            basis_source = getattr(self, f"{family}_basis")
-            if family == "learned":
-                basis_source = basis_source - basis_source.mean(dim=-1, keepdim=True)
-                basis_source = F.normalize(
-                    basis_source.float(),
-                    dim=-1,
-                    eps=1e-6,
-                ).to(dtype=basis_source.dtype)
-            basis = basis_source.to(
-                device=temporal_embeddings.device,
-                dtype=temporal_embeddings.dtype,
-            )
-            coefficients = torch.einsum(
-                "kl,blsd->bksd",
-                basis,
-                temporal_embeddings,
-            )
-            feature_parts.append(
-                coefficients.permute(0, 2, 1, 3).flatten(start_dim=2)
-            )
-            if collect_aux:
-                aux[f"temporal_basis_{family}_coefficients"] = coefficients
-
-        input_features = torch.cat(feature_parts, dim=-1)
-        augmented = self.feature_projection(input_features)
+        input_features: torch.Tensor | None = None
+        if collect_aux or not self.fuse_projection:
+            feature_parts = [z_base]
+            for family in self.family_names:
+                basis = self._basis(family, temporal_embeddings)
+                coefficients = torch.einsum(
+                    "kl,blsf->bksf",
+                    basis,
+                    temporal_embeddings,
+                )
+                feature_parts.append(
+                    coefficients.permute(0, 2, 1, 3).flatten(start_dim=2)
+                )
+                if collect_aux:
+                    aux[f"temporal_basis_{family}_coefficients"] = coefficients
+            input_features = torch.cat(feature_parts, dim=-1)
+        if self.fuse_projection:
+            augmented = self._fused_projection(temporal_embeddings, z_base)
+        else:
+            assert input_features is not None
+            augmented = self.feature_projection(input_features)
         mask_bool = mask.to(device=z_base.device, dtype=torch.bool)
         augmented = augmented.masked_fill(
             ~mask_bool.unsqueeze(-1), 0.0
         )
         if collect_aux:
+            assert input_features is not None
             aux["temporal_basis_input_features"] = input_features.masked_fill(
+                ~mask_bool.unsqueeze(-1), 0.0
+            )
+            aux["temporal_basis_original_path"] = z_base.masked_fill(
                 ~mask_bool.unsqueeze(-1), 0.0
             )
             aux["temporal_basis_output"] = augmented
@@ -1330,6 +1450,7 @@ class TransformerBasePortfolioModel(nn.Module):
         temporal_query_mode: str = "full_then_last",
         temporal_basis_families: Sequence[str] | str | None = None,
         temporal_basis_components: int = 8,
+        temporal_basis_input: str = "embedded",
         cross_layers: int = 1,
         cross_heads: int = 4,
         cross_ffn_mult: int = 2,
@@ -1392,6 +1513,9 @@ class TransformerBasePortfolioModel(nn.Module):
             temporal_basis_families
         )
         self.temporal_basis_components = int(temporal_basis_components)
+        self.temporal_basis_input = _normalize_temporal_basis_input(
+            temporal_basis_input
+        )
         self.default_temperature = float(default_temperature)
         self.portfolio_mode = normalize_portfolio_mode(portfolio_mode)
         self.portfolio_activation = normalize_portfolio_activation(portfolio_activation)
@@ -1561,8 +1685,15 @@ class TransformerBasePortfolioModel(nn.Module):
             TemporalBasisFeatureEncoder(
                 lookback=self.lookback,
                 dim=self.d_model,
+                source_dim=(
+                    self.num_features
+                    if self.temporal_basis_input == "raw_features"
+                    else self.d_model
+                ),
                 families=self.temporal_basis_families,
                 components=self.temporal_basis_components,
+                sanitize_inputs=self.sanitize_inputs,
+                fuse_projection=(self.temporal_basis_input == "raw_features"),
             )
             if self.temporal_basis_families
             else None
@@ -2011,6 +2142,11 @@ class TransformerBasePortfolioModel(nn.Module):
         """
         return self._project_features(x)
 
+    def supports_embedded_explainability_reuse(self) -> bool:
+        """Whether projected embeddings contain every active model input path."""
+
+        return not self._raw_temporal_basis_enabled()
+
     def embed_projected_for_explainability(
         self,
         projected: torch.Tensor,
@@ -2070,6 +2206,12 @@ class TransformerBasePortfolioModel(nn.Module):
         reused exactly.
         """
         self._require_compact_explainability_mode()
+        if self.temporal_basis_input == "raw_features" and self.temporal_basis_families:
+            raise RuntimeError(
+                "embedded-only explainability reuse is unavailable when "
+                "temporal_basis_input='raw_features'; use the ordinary raw-input "
+                "model forward so the basis branch remains exact"
+            )
         if embedded.ndim != 4 or int(embedded.size(-1)) != self.d_model:
             raise ValueError("embedded explainability inputs must have shape [B,L,S,d_model]")
         if self.training:
@@ -2272,6 +2414,113 @@ class TransformerBasePortfolioModel(nn.Module):
 
         return self._add_window_positions(h, int(features.size(1)), symbol_indices)
 
+    def _raw_temporal_basis_enabled(self) -> bool:
+        return bool(
+            self.temporal_basis_feature_encoder is not None
+            and self.temporal_basis_input == "raw_features"
+        )
+
+    def _prepare_raw_temporal_basis_source(
+        self,
+        source: torch.Tensor,
+    ) -> torch.Tensor | None:
+        if not self._raw_temporal_basis_enabled():
+            return None
+        encoder = self.temporal_basis_feature_encoder
+        if encoder is None:
+            raise RuntimeError("raw temporal basis encoder is unexpectedly missing")
+        return encoder.prepare_source(source)
+
+    def _raw_temporal_basis_windows_from_panel_slab(
+        self,
+        feature_slab: torch.Tensor,
+    ) -> torch.Tensor | None:
+        prepared = self._prepare_raw_temporal_basis_source(feature_slab)
+        if prepared is None:
+            return None
+        # Move/sanitize the unique slab first, then create a rolling view.  Doing
+        # this in the opposite order would materialize B*L repeated raw rows.
+        return prepared.unfold(0, self.lookback, 1).permute(0, 3, 1, 2)
+
+    def _raw_temporal_basis_windows_from_batched_panel_slabs(
+        self,
+        feature_slabs: torch.Tensor,
+    ) -> torch.Tensor | None:
+        prepared = self._prepare_raw_temporal_basis_source(feature_slabs)
+        if prepared is None:
+            return None
+        windows = prepared.unfold(1, self.lookback, 1).permute(0, 1, 4, 2, 3)
+        days, decision_rows, lookback, symbols, features = windows.shape
+        return windows.reshape(
+            days * decision_rows,
+            lookback,
+            symbols,
+            features,
+        )
+
+    def _raw_temporal_basis_windows_from_panel(
+        self,
+        features: torch.Tensor,
+        date_indices: torch.Tensor,
+    ) -> torch.Tensor | None:
+        if not self._raw_temporal_basis_enabled():
+            return None
+        date_indices_source = date_indices.to(
+            device=features.device,
+            dtype=torch.long,
+        )
+        batch_rows = int(date_indices_source.numel())
+        if batch_rows <= 0:
+            encoder = self.temporal_basis_feature_encoder
+            if encoder is None:
+                raise RuntimeError("raw temporal basis encoder is unexpectedly missing")
+            return encoder.feature_projection.weight.new_empty(
+                (0, self.lookback, int(features.size(1)), self.num_features)
+            )
+
+        is_contiguous = True
+        if batch_rows > 1:
+            diffs = date_indices_source[1:] - date_indices_source[:-1]
+            is_contiguous = bool(torch.all(diffs == 1).detach().cpu().item())
+        if is_contiguous:
+            start = (
+                int(date_indices_source[0].detach().cpu().item())
+                - self.lookback
+                + 1
+            )
+            end = int(date_indices_source[-1].detach().cpu().item()) + 1
+            return self._raw_temporal_basis_windows_from_panel_slab(
+                features.narrow(0, start, end - start)
+            )
+
+        offsets = torch.arange(
+            self.lookback - 1,
+            -1,
+            -1,
+            device=features.device,
+            dtype=torch.long,
+        )
+        window_idx = date_indices_source[:, None] - offsets[None, :]
+        unique_idx, inverse = torch.unique(
+            window_idx.reshape(-1),
+            sorted=True,
+            return_inverse=True,
+        )
+        selected = features.index_select(0, unique_idx)
+        prepared = self._prepare_raw_temporal_basis_source(selected)
+        if prepared is None:
+            return None
+        gathered = prepared.index_select(
+            0,
+            inverse.to(device=prepared.device, dtype=torch.long),
+        )
+        return gathered.reshape(
+            batch_rows,
+            self.lookback,
+            int(features.size(1)),
+            self.num_features,
+        )
+
     def _apply_temporal_blocks(self, h: torch.Tensor, *, keep_all_steps: bool = False) -> torch.Tensor:
         bsz, steps, n_symbols, dim = h.shape
         seq = h.permute(0, 2, 1, 3).contiguous().reshape(bsz * n_symbols, steps, dim)
@@ -2351,6 +2600,7 @@ class TransformerBasePortfolioModel(nn.Module):
         safe_mask: torch.Tensor,
         *,
         collect_aux: bool,
+        source_is_prepared: bool = False,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         if self.temporal_basis_feature_encoder is None:
             return z_base, {}
@@ -2359,7 +2609,24 @@ class TransformerBasePortfolioModel(nn.Module):
             z_base,
             safe_mask,
             collect_aux=collect_aux,
+            source_is_prepared=source_is_prepared,
         )
+
+    def _temporal_basis_source(
+        self,
+        embedded_source: torch.Tensor,
+        raw_source: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if self.temporal_basis_feature_encoder is None:
+            return embedded_source
+        if self.temporal_basis_input == "embedded":
+            return embedded_source
+        if raw_source is None:
+            raise RuntimeError(
+                "temporal_basis_input='raw_features' requires the canonical "
+                "raw [B,L,S,F] window"
+            )
+        return raw_source
 
     def _apply_stock_market_gate(
         self,
@@ -2380,8 +2647,9 @@ class TransformerBasePortfolioModel(nn.Module):
         safe_mask: torch.Tensor,
         *,
         collect_aux: bool,
+        temporal_basis_source: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        basis_source = h
+        basis_source = self._temporal_basis_source(h, temporal_basis_source)
         bsz, steps, n_symbols, dim = h.shape
         token_count = steps * n_symbols
         if self.max_full_tokens > 0 and token_count > self.max_full_tokens:
@@ -2401,6 +2669,7 @@ class TransformerBasePortfolioModel(nn.Module):
             basis_source,
             safe_mask,
             collect_aux=collect_aux,
+            source_is_prepared=(self.temporal_basis_input == "raw_features"),
         )
         if collect_aux:
             aux.update(basis_aux)
@@ -2412,8 +2681,9 @@ class TransformerBasePortfolioModel(nn.Module):
         safe_mask: torch.Tensor,
         *,
         collect_aux: bool,
+        temporal_basis_source: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        basis_source = h
+        basis_source = self._temporal_basis_source(h, temporal_basis_source)
         h = self._apply_temporal_blocks(
             h,
             keep_all_steps=(collect_aux and self.temporal_query_mode != "last_only"),
@@ -2426,6 +2696,7 @@ class TransformerBasePortfolioModel(nn.Module):
             basis_source,
             safe_mask,
             collect_aux=collect_aux,
+            source_is_prepared=(self.temporal_basis_input == "raw_features"),
         )
         if collect_aux:
             aux.update(basis_aux)
@@ -2437,8 +2708,9 @@ class TransformerBasePortfolioModel(nn.Module):
         safe_mask: torch.Tensor,
         *,
         collect_aux: bool,
+        temporal_basis_source: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        basis_source = h
+        basis_source = self._temporal_basis_source(h, temporal_basis_source)
         h = self._apply_temporal_blocks(
             h,
             keep_all_steps=(collect_aux and self.temporal_query_mode != "last_only"),
@@ -2450,6 +2722,7 @@ class TransformerBasePortfolioModel(nn.Module):
             basis_source,
             safe_mask,
             collect_aux=collect_aux,
+            source_is_prepared=(self.temporal_basis_input == "raw_features"),
         )
         if collect_aux:
             aux.update(basis_aux)
@@ -2463,8 +2736,9 @@ class TransformerBasePortfolioModel(nn.Module):
         use_latent: bool,
         collect_aux: bool,
         use_market: bool = True,
+        temporal_basis_source: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        basis_source = h
+        basis_source = self._temporal_basis_source(h, temporal_basis_source)
         h = self._apply_temporal_blocks(
             h,
             keep_all_steps=(collect_aux and self.temporal_query_mode != "last_only"),
@@ -2475,6 +2749,7 @@ class TransformerBasePortfolioModel(nn.Module):
             basis_source,
             safe_mask,
             collect_aux=collect_aux,
+            source_is_prepared=(self.temporal_basis_input == "raw_features"),
         )
         z_stock, aux = self._forward_latent_or_market_from_stock_embeddings(
             z_base,
@@ -2592,8 +2867,9 @@ class TransformerBasePortfolioModel(nn.Module):
         safe_mask: torch.Tensor,
         *,
         collect_aux: bool,
+        temporal_basis_source: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        basis_source = h
+        basis_source = self._temporal_basis_source(h, temporal_basis_source)
         h = self._apply_temporal_blocks(
             h,
             keep_all_steps=(collect_aux and self.temporal_query_mode != "last_only"),
@@ -2604,6 +2880,7 @@ class TransformerBasePortfolioModel(nn.Module):
             basis_source,
             safe_mask,
             collect_aux=collect_aux,
+            source_is_prepared=(self.temporal_basis_input == "raw_features"),
         )
         z_stock, aux = self._forward_market_token_from_stock_embeddings(
             z_base,
@@ -2719,14 +2996,25 @@ class TransformerBasePortfolioModel(nn.Module):
         temperature: float | torch.Tensor | None = None,
         return_aux: bool | None = None,
         return_scores: bool = False,
+        temporal_basis_source: torch.Tensor | None = None,
     ):
         safe_mask = _safe_attention_mask(mask_bool)
         collect_aux = bool(return_aux is True or (return_aux is None and self.return_aux and self.return_aux_details))
 
         if self.attention_mode == "full":
-            z_stock, aux = self._forward_full(h, safe_mask, collect_aux=collect_aux)
+            z_stock, aux = self._forward_full(
+                h,
+                safe_mask,
+                collect_aux=collect_aux,
+                temporal_basis_source=temporal_basis_source,
+            )
         elif self.attention_mode == "axial":
-            z_stock, aux = self._forward_axial(h, safe_mask, collect_aux=collect_aux)
+            z_stock, aux = self._forward_axial(
+                h,
+                safe_mask,
+                collect_aux=collect_aux,
+                temporal_basis_source=temporal_basis_source,
+            )
         elif self.attention_mode == "latent":
             z_stock, aux = self._forward_latent_or_market(
                 h,
@@ -2734,6 +3022,7 @@ class TransformerBasePortfolioModel(nn.Module):
                 use_latent=True,
                 use_market=True,
                 collect_aux=collect_aux,
+                temporal_basis_source=temporal_basis_source,
             )
         elif self.attention_mode == "latent_only":
             z_stock, aux = self._forward_latent_or_market(
@@ -2742,11 +3031,22 @@ class TransformerBasePortfolioModel(nn.Module):
                 use_latent=True,
                 use_market=False,
                 collect_aux=collect_aux,
+                temporal_basis_source=temporal_basis_source,
             )
         elif self.attention_mode == "market_token":
-            z_stock, aux = self._forward_market_token_fast(h, safe_mask, collect_aux=collect_aux)
+            z_stock, aux = self._forward_market_token_fast(
+                h,
+                safe_mask,
+                collect_aux=collect_aux,
+                temporal_basis_source=temporal_basis_source,
+            )
         else:
-            z_stock, aux = self._forward_temporal_only(h, safe_mask, collect_aux=collect_aux)
+            z_stock, aux = self._forward_temporal_only(
+                h,
+                safe_mask,
+                collect_aux=collect_aux,
+                temporal_basis_source=temporal_basis_source,
+            )
 
         return self._portfolio_outputs_from_stock_embeddings(
             z_stock,
@@ -3366,11 +3666,13 @@ class TransformerBasePortfolioModel(nn.Module):
         else:
             mask_bool = mask.to(device=x.device, dtype=torch.bool)
         h = self._embed_inputs(x, symbol_indices)
+        raw_basis_source = self._prepare_raw_temporal_basis_source(x)
         return self._forward_embedded(
             h,
             mask_bool,
             temperature=temperature,
             return_aux=return_aux,
+            temporal_basis_source=raw_basis_source,
         )
 
     def forward_from_panel(
@@ -3388,11 +3690,16 @@ class TransformerBasePortfolioModel(nn.Module):
             mask_bool = torch.ones(h.size(0), h.size(2), dtype=torch.bool, device=h.device)
         else:
             mask_bool = mask.to(device=h.device, dtype=torch.bool)
+        raw_basis_source = self._raw_temporal_basis_windows_from_panel(
+            features,
+            date_indices,
+        )
         return self._forward_embedded(
             h,
             mask_bool,
             temperature=temperature,
             return_aux=return_aux,
+            temporal_basis_source=raw_basis_source,
         )
 
     def forward_from_panel_slab(
@@ -3409,11 +3716,15 @@ class TransformerBasePortfolioModel(nn.Module):
             mask_bool = torch.ones(h.size(0), h.size(2), dtype=torch.bool, device=h.device)
         else:
             mask_bool = mask.to(device=h.device, dtype=torch.bool)
+        raw_basis_source = self._raw_temporal_basis_windows_from_panel_slab(
+            feature_slab
+        )
         return self._forward_embedded(
             h,
             mask_bool,
             temperature=temperature,
             return_aux=return_aux,
+            temporal_basis_source=raw_basis_source,
         )
 
     def forward_from_batched_panel_slabs(
@@ -3442,9 +3753,15 @@ class TransformerBasePortfolioModel(nn.Module):
             mask_bool = mask.to(device=h.device, dtype=torch.bool).reshape(
                 h.size(0), h.size(2)
             )
+        raw_basis_source = (
+            self._raw_temporal_basis_windows_from_batched_panel_slabs(
+                feature_slabs
+            )
+        )
         return self._forward_embedded(
             h,
             mask_bool,
             temperature=temperature,
             return_aux=return_aux,
+            temporal_basis_source=raw_basis_source,
         )
