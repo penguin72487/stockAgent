@@ -1091,6 +1091,30 @@ def test_inference_manifest_skips_expensive_content_hash_but_preserves_model_sch
     assert inference["fingerprints"]["model"] == full["fingerprints"]["model"]
 
 
+def test_disabled_daily_context_is_backward_compatible_but_enabled_branch_is_not() -> None:
+    panel = _panel()
+    config = load_config("configs/deployments/tw_day_trade.yaml")
+    financial = config.training.financial_transformer
+    assert financial.daily_context_layers == 0
+
+    baseline = _checkpoint_manifest(panel, config)
+    model_values = baseline["contracts"]["model"]["model"]
+    assert "daily_context_layers" not in model_values
+    assert "daily_context_lookback" not in model_values
+    assert "daily_context_pooling" not in model_values
+
+    disabled_changed = copy.deepcopy(config)
+    disabled_changed.training.financial_transformer.daily_context_lookback = 17
+    disabled_changed.training.financial_transformer.daily_context_pooling = "mean"
+    disabled_manifest = _checkpoint_manifest(panel, disabled_changed)
+    assert disabled_manifest["fingerprints"]["model"] == baseline["fingerprints"]["model"]
+
+    enabled = copy.deepcopy(config)
+    enabled.training.financial_transformer.daily_context_layers = 1
+    enabled_manifest = _checkpoint_manifest(panel, enabled)
+    assert enabled_manifest["fingerprints"]["model"] != baseline["fingerprints"]["model"]
+
+
 def test_checkpoint_validation_scopes_resume_and_future_inference_data(tmp_path: Path) -> None:
     panel = _panel()
     config = _config()

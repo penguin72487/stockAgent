@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -81,23 +82,78 @@ def load_prices_csv(path: str | Path, symbols: list[str], fallback_prices: np.nd
     columns = {name.lower(): name for name in frame.columns}
     symbol_col = columns.get("symbol") or columns.get("code") or columns.get("ticker")
     price_col = columns.get("price") or columns.get("close") or columns.get("last") or columns.get("current_price")
+    open_col = columns.get("open_price") or columns.get("open")
+    high_col = columns.get("high_price") or columns.get("high")
+    low_col = columns.get("low_price") or columns.get("low")
+    volume_col = columns.get("volume") or columns.get("trading_volume")
+    upper_col = columns.get("upper_limit_price") or columns.get("upper_limit")
+    lower_col = columns.get("lower_limit_price") or columns.get("lower_limit")
     if symbol_col is None or price_col is None:
         raise ValueError("prices CSV must contain symbol/code/ticker and price/close/last/current_price columns")
 
+    value_columns = [
+        column
+        for column in (
+            symbol_col,
+            price_col,
+            open_col,
+            high_col,
+            low_col,
+            volume_col,
+            upper_col,
+            lower_col,
+        )
+        if column is not None
+    ]
     lookup = {
-        str(row[symbol_col]).strip(): float(row[price_col])
-        for row in frame.select([symbol_col, price_col]).iter_rows(named=True)
+        str(row[symbol_col]).strip(): row
+        for row in frame.select(value_columns).iter_rows(named=True)
         if str(row[symbol_col]).strip()
     }
     prices = np.asarray(fallback_prices, dtype=np.float64).copy()
+    available = np.zeros((len(symbols),), dtype=bool)
+    open_prices = np.full((len(symbols),), np.nan, dtype=np.float64)
+    high_prices = np.full((len(symbols),), np.nan, dtype=np.float64)
+    low_prices = np.full((len(symbols),), np.nan, dtype=np.float64)
+    volumes = np.full((len(symbols),), np.nan, dtype=np.float64)
+    upper_limit_prices = np.full((len(symbols),), np.nan, dtype=np.float64)
+    lower_limit_prices = np.full((len(symbols),), np.nan, dtype=np.float64)
     count = 0
     for idx, symbol in enumerate(symbols):
-        value = lookup.get(str(symbol))
-        if value is None or not np.isfinite(value) or value <= 0.0:
+        row = lookup.get(str(symbol))
+        if row is None:
+            continue
+        value = _float_or_none(row.get(price_col))
+        if value is None:
             continue
         prices[idx] = value
+        available[idx] = True
         count += 1
-    return PriceSnapshot(prices=prices, source=f"csv:{Path(path)}", available_count=count)
+        for column, target in (
+            (open_col, open_prices),
+            (high_col, high_prices),
+            (low_col, low_prices),
+            (volume_col, volumes),
+            (upper_col, upper_limit_prices),
+            (lower_col, lower_limit_prices),
+        ):
+            if column is None:
+                continue
+            observed = _float_or_none(row.get(column))
+            if observed is not None:
+                target[idx] = observed
+    return PriceSnapshot(
+        prices=prices,
+        source=f"csv:{Path(path)}",
+        available_count=count,
+        available_mask=available,
+        open_prices=open_prices,
+        high_prices=high_prices,
+        low_prices=low_prices,
+        volumes=volumes,
+        upper_limit_prices=upper_limit_prices,
+        lower_limit_prices=lower_limit_prices,
+    )
 
 
 def _float_or_none(value: object) -> float | None:
@@ -181,8 +237,16 @@ def fetch_tw_mis_last_prices(
     # stable endpoint batch used by the full-universe fetcher.
     chunk_len = max(1, min(int(chunk_size), 80))
     chunks = [ex_channels[start : start + chunk_len] for start in range(0, len(ex_channels), chunk_len)]
-    max_parallel = int(os.getenv("STOCKAGENT_TW_MIS_PARALLEL_REQUESTS", "8") or "8")
+    max_parallel = int(os.getenv("STOCKAGENT_TW_MIS_PARALLEL_REQUESTS", "4") or "4")
     workers = max(1, min(len(chunks) or 1, max_parallel))
+    retry_attempts = max(
+        0,
+        int(os.getenv("STOCKAGENT_TW_MIS_RETRY_ATTEMPTS", "3") or "3"),
+    )
+    retry_delay_seconds = max(
+        0.0,
+        float(os.getenv("STOCKAGENT_TW_MIS_RETRY_DELAY_SECONDS", "0.35") or "0.35"),
+    )
     session_local = threading.local()
 
     def session() -> requests.Session:
@@ -257,24 +321,60 @@ def fetch_tw_mis_last_prices(
                 )
         return rows
 
+    chunk_results: list[
+        list[
+            tuple[
+                int,
+                float,
+                int | None,
+                float | None,
+                float | None,
+                float | None,
+                float | None,
+                float | None,
+                float | None,
+            ]
+        ]
+    ] = [[] for _ in chunks]
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="tw-mis-quote") as executor:
-        futures = [executor.submit(fetch_chunk, chunk) for chunk in chunks]
+        futures = {
+            executor.submit(fetch_chunk, chunk): chunk_index
+            for chunk_index, chunk in enumerate(chunks)
+        }
         for future in as_completed(futures):
-            for idx, value, timestamp_ms, open_px, high_px, low_px, volume, upper_px, lower_px in future.result():
-                prices[idx] = value
-                filled[idx] = True
-                for target, observed in (
-                    (open_prices, open_px),
-                    (high_prices, high_px),
-                    (low_prices, low_px),
-                    (volumes, volume),
-                    (upper_limit_prices, upper_px),
-                    (lower_limit_prices, lower_px),
-                ):
-                    if observed is not None:
-                        target[idx] = observed
-                if timestamp_ms is not None and (last_timestamp_ms is None or timestamp_ms > last_timestamp_ms):
-                    last_timestamp_ms = timestamp_ms
+            chunk_results[futures[future]] = future.result()
+
+    # MIS intermittently closes full-universe connections. Empty chunks are not
+    # usable evidence that no symbol traded, so retry only those chunks in a
+    # paced single-thread pass. Never substitute the intraday last price for a
+    # missing opening price; callers receive NaN in open_prices and fail closed.
+    for chunk_index, rows in enumerate(chunk_results):
+        if rows or retry_attempts <= 0:
+            continue
+        for attempt in range(retry_attempts):
+            if retry_delay_seconds > 0.0:
+                time.sleep(retry_delay_seconds * (attempt + 1))
+            rows = fetch_chunk(chunks[chunk_index])
+            if rows:
+                chunk_results[chunk_index] = rows
+                break
+
+    for rows in chunk_results:
+        for idx, value, timestamp_ms, open_px, high_px, low_px, volume, upper_px, lower_px in rows:
+            prices[idx] = value
+            filled[idx] = True
+            for target, observed in (
+                (open_prices, open_px),
+                (high_prices, high_px),
+                (low_prices, low_px),
+                (volumes, volume),
+                (upper_limit_prices, upper_px),
+                (lower_limit_prices, lower_px),
+            ):
+                if observed is not None:
+                    target[idx] = observed
+            if timestamp_ms is not None and (last_timestamp_ms is None or timestamp_ms > last_timestamp_ms):
+                last_timestamp_ms = timestamp_ms
 
     timestamp = None
     if last_timestamp_ms is not None:

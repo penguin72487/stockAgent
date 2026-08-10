@@ -4671,12 +4671,20 @@ _TEMPORAL_BASIS_MODEL_CONFIG_FIELDS = (
 def _project_temporal_basis_model_config(
     values: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Keep disabled basis defaults compatible with pre-feature checkpoints."""
+    """Keep disabled model branches compatible with pre-feature checkpoints."""
 
     projected = dict(values)
     if not projected.get("temporal_basis_families"):
         for field_name in _TEMPORAL_BASIS_MODEL_CONFIG_FIELDS:
             projected.pop(field_name, None)
+    if int(projected.get("daily_context_layers", 0) or 0) == 0:
+        # These controls have no parameters or forward-path effect until the
+        # daily-context branch has at least one layer.  Omitting them preserves
+        # model fingerprints written before the disabled branch was added,
+        # while an enabled branch remains part of the strict model contract.
+        projected.pop("daily_context_layers", None)
+        projected.pop("daily_context_lookback", None)
+        projected.pop("daily_context_pooling", None)
     return projected
 
 

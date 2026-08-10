@@ -6,7 +6,7 @@ runner:
   # The multi-basis branch changes model parameters and optimizer semantics.
   # Keep it in a fresh artifact root instead of resuming the raw-only baseline.
   output_dir: artifacts/markets/tw_public_candles_multi_basis_lookback32_v1
-  resume: false
+  resume: true
 
 training:
   model_name: financial_transformer

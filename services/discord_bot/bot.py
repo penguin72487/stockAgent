@@ -1144,6 +1144,7 @@ def _signal_kwargs(
     scheduled: bool = False,
     progress_callback: Any | None = None,
     progress_label: str | None = None,
+    include_unconstrained_raw_scores: bool = False,
 ) -> dict:
     cfg = _effective_market_config(_resolve_market(market))
     status = _ensure_signal_ready(cfg, scheduled=scheduled)
@@ -1162,6 +1163,7 @@ def _signal_kwargs(
         "previous_signal_backfill_limit": backfill_limit,
         "progress_callback": progress_callback,
         "progress_label": progress_label,
+        "include_unconstrained_raw_scores": bool(include_unconstrained_raw_scores),
     }
     return cfg.signal_kwargs(**overrides)
 
@@ -1435,6 +1437,20 @@ def _limit_rows(rows: list[dict[str, Any]], limit: int | None) -> list[dict[str,
 def _row_abs(row: dict[str, Any], key: str) -> float:
     number = _float_or_none(row.get(key))
     return abs(number) if number is not None else 0.0
+
+
+def _row_raw_score(row: dict[str, Any]) -> Any:
+    raw_score = _float_or_none(row.get("raw_score"))
+    return raw_score if raw_score is not None else row.get("score")
+
+
+def _normalize_signal_now_mode(value: str | None) -> str:
+    normalized = str(value or "signal").strip().lower().replace("-", "_")
+    if normalized in {"signal", "trade", "trading", "交易訊號"}:
+        return "signal"
+    if normalized in {"raw", "raw_score", "raw_scores", "original", "原始分數"}:
+        return "raw_scores"
+    raise BotUserError("mode 必須是 signal 或 raw_scores。")
 
 
 def _row_position_weight(row: dict[str, Any], keys: tuple[str, ...]) -> float | None:
@@ -1859,6 +1875,10 @@ def _config_trading_limits(cfg: LiveMarketConfig) -> tuple[float | None, float |
     # must not weaken live exposure sanity checks.
     gross = 1.0
     turnover = _float_or_none(getattr(market_cfg.trading, "max_turnover_ratio", None))
+    # Canonical execution uses zero as the sentinel for "turnover cap disabled".
+    # Do not reinterpret that sentinel as a literal 0% live-sanity ceiling.
+    if turnover is not None and turnover <= 0.0:
+        turnover = None
     return gross, turnover
 
 
@@ -2082,22 +2102,27 @@ def _line_pages(
     return pages
 
 
+def _discord_page_kwargs(page: str) -> dict[str, Any]:
+    """Use an embed for a single logical page that exceeds message content limits."""
+
+    content = str(page or "(empty)")
+    if len(content) <= 1900:
+        return {"content": content, "embed": None}
+    if len(content) <= 4000:
+        return {"content": None, "embed": discord.Embed(description=content)}
+    raise RuntimeError(f"Discord page exceeds embed limit ({len(content)}>4000)")
+
+
 async def _send_paginated_response(interaction: discord.Interaction, pages: list[str]) -> None:
     clean_pages = [page if page else "(empty)" for page in pages] or ["(empty)"]
     view = PagedTextView(clean_pages) if len(clean_pages) > 1 else None
-    if view is None:
-        await interaction.followup.send(clean_pages[0])
-    else:
-        await interaction.followup.send(clean_pages[0], view=view)
+    await interaction.followup.send(**_discord_page_kwargs(clean_pages[0]), view=view)
 
 
 async def _send_channel_pages(channel: Any, pages: list[str], *, timeout: float | None = 24 * 60 * 60) -> None:
     clean_pages = [page if page else "(empty)" for page in pages] or ["(empty)"]
     view = PagedTextView(clean_pages, timeout=timeout) if len(clean_pages) > 1 else None
-    if view is None:
-        await channel.send(clean_pages[0])
-    else:
-        await channel.send(clean_pages[0], view=view)
+    await channel.send(**_discord_page_kwargs(clean_pages[0]), view=view)
 
 
 def _active_position_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -2125,6 +2150,7 @@ def _scheduled_detail_page_groups(
     *,
     title_prefix: str = "scheduled",
     include_decisions: bool = False,
+    max_rows: int | None = None,
     debug: bool = False,
 ) -> list[list[str]]:
     capital = _resolve_current_capital(cfg)
@@ -2143,6 +2169,7 @@ def _scheduled_detail_page_groups(
     common_header = [
         _kv_line(*header_pairs),
         f"capital: `{_capital_context_text(capital=capital)}`",
+        "欄位: `raw_score`=模型未置中原始分數；`score`=置中後排序分數。",
     ]
     if debug:
         common_header.extend(
@@ -2165,6 +2192,9 @@ def _scheduled_detail_page_groups(
         ),
         "delta",
     )
+    position_rows = _limit_rows(position_rows, max_rows)
+    rebalance_rows = _limit_rows(rebalance_rows, max_rows)
+    decision_rows = _limit_rows(decision_rows, max_rows)
 
     position_header = [
         *common_header,
@@ -2218,6 +2248,95 @@ def _scheduled_detail_page_groups(
             )
         )
     return groups
+
+
+def _raw_score_line(row: dict[str, Any]) -> str:
+    return "\n".join(
+        [
+            _symbol_label(row),
+            _kv_line(
+                ("raw_score", _num(_row_raw_score(row), 6)),
+                ("abs_rank", row.get("abs_raw_score_rank", "n/a")),
+                ("px", _price(row.get("current_price"))),
+            ),
+            _kv_line(
+                ("alive", row.get("alive", "n/a")),
+                ("tradable", row.get("tradable", "n/a")),
+                ("can_buy", row.get("can_buy", "n/a")),
+                ("can_sell", row.get("can_sell", "n/a")),
+            ),
+        ]
+    )
+
+
+def _raw_score_pages(
+    cfg: LiveMarketConfig,
+    result: Any,
+    *,
+    title_prefix: str = "signal_now",
+    debug: bool = False,
+) -> list[str]:
+    summary = result.summary
+    source_rows = [dict(row) for row in list(getattr(result, "weights_rows", []))]
+    rows = sorted(
+        source_rows,
+        key=lambda row: (
+            _row_abs(row, "raw_score"),
+            str(row.get("symbol") or ""),
+        ),
+        reverse=True,
+    )
+    for index, row in enumerate(rows, start=1):
+        row["abs_raw_score_rank"] = index
+    contract = summary.get("score_contract") if isinstance(summary.get("score_contract"), dict) else {}
+    header = [
+        _kv_line(
+            ("market", summary.get("market", cfg.market)),
+            ("signal", summary.get("signal_id", "n/a")),
+            ("asof", _display_summary_time(summary, summary.get("asof_date", "n/a"))),
+            ("panel", _display_summary_time(summary, summary.get("panel_date", "n/a"))),
+        ),
+        _kv_line(
+            ("rows", len(rows)),
+            ("scope", contract.get("raw_score_scope", "n/a")),
+            ("filter", "none"),
+            ("sort", "abs(raw_score)"),
+        ),
+        "此模式對完整 checkpoint 股票 universe 使用全 True 模型 mask；交易資格、漲跌停與買賣限制只標示，不過濾也不改寫 raw_score。",
+    ]
+    if debug:
+        header.append(
+            f"full: `{summary.get('positions_markdown_path', summary.get('weights_path', 'n/a'))}`"
+        )
+    return _line_pages(
+        title=f"{title_prefix} unconstrained raw scores",
+        rows=rows,
+        formatter=_raw_score_line,
+        page_size=12,
+        header_lines=header,
+        min_page_size=1,
+        default_page_size=12,
+    )
+
+
+def _signal_now_detail_page_groups(
+    cfg: LiveMarketConfig,
+    result: Any,
+    *,
+    mode: str,
+    top_n: int | None = None,
+    debug: bool = False,
+) -> list[list[str]]:
+    if _normalize_signal_now_mode(mode) == "raw_scores":
+        return [_raw_score_pages(cfg, result, title_prefix="raw_score_now", debug=debug)]
+    return _scheduled_detail_page_groups(
+        cfg,
+        result,
+        title_prefix="signal_now",
+        include_decisions=True,
+        max_rows=top_n,
+        debug=debug,
+    )
 
 
 def _status_line(key: str, cfg: LiveMarketConfig, status: MarketRuntimeStatus) -> str:
@@ -2507,12 +2626,18 @@ def _signal_now_cached_result(
     *,
     requested_price_source: str,
     top_n: int,
+    require_unconstrained_raw_scores: bool = False,
     debug: bool = False,
 ):
     latest = _latest_market_signal(cfg)
     if latest is None:
         return None
     summary_path, summary = latest
+    if not _summary_has_raw_score_contract(
+        summary,
+        require_unconstrained=require_unconstrained_raw_scores,
+    ):
+        return None
     reusable, reason = _can_reuse_latest_signal_now(
         cfg,
         status,
@@ -2524,6 +2649,29 @@ def _signal_now_cached_result(
     result = _latest_signal_result_from_artifacts(cfg, summary_path, summary, top_n=top_n, debug=debug)
     result.summary["signal_now_cache"] = reason
     return summary_path, result, reason
+
+
+def _summary_has_raw_score_contract(
+    summary: dict[str, Any],
+    *,
+    require_unconstrained: bool = False,
+) -> bool:
+    contract = summary.get("score_contract")
+    if not isinstance(contract, dict):
+        return False
+    try:
+        valid = int(contract.get("schema_version", 0)) >= 1
+    except (TypeError, ValueError):
+        return False
+    if not valid:
+        return False
+    if require_unconstrained:
+        return (
+            int(contract.get("schema_version", 0)) >= 2
+            and str(contract.get("raw_score_scope") or "")
+            == "all_checkpoint_symbols_unmasked"
+        )
+    return True
 
 
 def _signal_now_should_refresh_data(status: MarketRuntimeStatus, *, refresh_data: bool) -> bool:
@@ -3266,6 +3414,7 @@ def _guide_message() -> str:
         "**台股模式**",
         "`tw` 舊版 Naive 權重模式。",
         "`tw_cash` 現股/T+2 模式；需有相符 checkpoint 才能推論。",
+        "`tw_day_trade_1m` 現股當沖（初始 100 萬）；使用獨立 fold 11 模型與資金基準。",
         "`tw_day_trade` 現股當沖（初始 1,000 萬）；訊號是當日模型目標，不是隔夜持倉。",
         "`tw_day_trade_100m` 現股當沖（初始 1 億）；使用獨立模型與資金基準。",
         "",
@@ -3289,6 +3438,7 @@ def _guide_message() -> str:
         "",
         "**管理/重算**",
         "`/signal_now market:<市場>` 立即更新資料並重新推論。",
+        "`/raw_score_now market:<市場>` 顯示 checkpoint 全股票 raw_score；交易限制只標示、不過濾。",
         "`/set_capital`、`/set_schedule`、`/set_market_enabled` 需要 trader/admin 權限。",
     ]
     return "\n".join(lines)
@@ -3379,9 +3529,11 @@ def _signal_now_background_key(
     top_n: int,
     min_abs_delta: float,
     debug: bool,
+    mode: str = "signal",
 ) -> str:
     source = str(requested_price_source or "auto").strip().lower() or "auto"
-    return f"{cfg.market}:{source}:{int(top_n)}:{float(min_abs_delta):.8g}:{int(bool(debug))}"
+    normalized_mode = _normalize_signal_now_mode(mode)
+    return f"{cfg.market}:{source}:{int(top_n)}:{float(min_abs_delta):.8g}:{int(bool(debug))}:{normalized_mode}"
 
 
 async def _send_signal_now_background_failure(user_ids: set[int], cfg: LiveMarketConfig, exc: Exception) -> None:
@@ -3406,8 +3558,12 @@ async def _run_signal_now_background_refresh(
     top_n: int,
     min_abs_delta: float,
     debug: bool,
+    mode: str = "signal",
 ) -> None:
     cfg = _resolve_market(market)
+    normalized_mode = _normalize_signal_now_mode(mode)
+    include_raw_universe = normalized_mode == "raw_scores"
+    command_name = "raw_score_now" if include_raw_universe else "signal_now"
     try:
         initial_status = await asyncio.to_thread(_ensure_signal_ready_cached, cfg)
         if not bool(getattr(initial_status.data, "fresh", False)):
@@ -3422,7 +3578,8 @@ async def _run_signal_now_background_refresh(
                     price_source=preview_price_source,
                     top_n=top_n,
                     min_abs_delta=min_abs_delta,
-                    progress_label=f"signal_now:preview:{cfg.market}",
+                    progress_label=f"{command_name}:preview:{cfg.market}",
+                    include_unconstrained_raw_scores=include_raw_universe,
                 )
                 preview = _enrich_signal_performance_for_discord(cfg, preview, max_rows=0, debug=debug)
                 preview_issues = _signal_sanity_issues(cfg, preview.summary)
@@ -3430,7 +3587,7 @@ async def _run_signal_now_background_refresh(
                     preview.message = _prepend_sanity_notice(preview.message, cfg, preview.summary)
                 preview_waiters = set(bot._signal_now_background_waiters.get(key, set()))
                 preview_header = (
-                    f"`{cfg.market}` 快速訊號已完成；資料仍在背景更新，完成後會再傳正式結果。\n"
+                    f"`{cfg.market}` 快速 {command_name} 已完成；資料仍在背景更新，完成後會再傳正式結果。\n"
                     f"panel=`{preview.summary.get('panel_date') or 'n/a'}` "
                     f"price_time=`{preview.summary.get('price_timestamp') or 'n/a'}`"
                 )
@@ -3462,7 +3619,8 @@ async def _run_signal_now_background_refresh(
             price_source=resolved_price_source,
             top_n=top_n,
             min_abs_delta=min_abs_delta,
-            progress_label=f"signal_now:bg:{cfg.market}",
+            progress_label=f"{command_name}:bg:{cfg.market}",
+            include_unconstrained_raw_scores=include_raw_universe,
         )
         result = _enrich_signal_performance_for_discord(cfg, result, max_rows=0, debug=debug)
         sanity_issues = _signal_sanity_issues(cfg, result.summary)
@@ -3472,7 +3630,7 @@ async def _run_signal_now_background_refresh(
         if not waiters:
             return
         header = (
-            f"`{cfg.market}` 背景更新完成，以下是最新 signal_now。\n"
+            f"`{cfg.market}` 背景更新完成，以下是最新 {command_name}。\n"
             f"auto_refreshed=`{bool(auto_refreshed)}` price_source=`{resolved_price_source or 'config'}`"
         )
         for user_id in sorted(waiters):
@@ -3486,11 +3644,11 @@ async def _run_signal_now_background_refresh(
                         market=str(result.summary.get("market") or cfg.market),
                     ),
                 )
-                for pages in _scheduled_detail_page_groups(
+                for pages in _signal_now_detail_page_groups(
                     cfg,
                     result,
-                    title_prefix="signal_now",
-                    include_decisions=True,
+                    mode=normalized_mode,
+                    top_n=top_n,
                     debug=debug,
                 ):
                     await _send_channel_pages(user, pages, timeout=24 * 60 * 60)
@@ -3512,6 +3670,7 @@ def _enqueue_signal_now_background_refresh(
     top_n: int,
     min_abs_delta: float,
     debug: bool,
+    mode: str = "signal",
 ) -> tuple[str, bool]:
     key = _signal_now_background_key(
         cfg,
@@ -3519,6 +3678,7 @@ def _enqueue_signal_now_background_refresh(
         top_n=top_n,
         min_abs_delta=min_abs_delta,
         debug=debug,
+        mode=mode,
     )
     bot._signal_now_background_waiters.setdefault(key, set()).add(int(user_id))
     task = bot._signal_now_background_tasks.get(key)
@@ -3532,6 +3692,7 @@ def _enqueue_signal_now_background_refresh(
             top_n=top_n,
             min_abs_delta=min_abs_delta,
             debug=debug,
+            mode=mode,
         )
     )
     return key, True
@@ -3689,7 +3850,13 @@ def _refresh_portfolio_history_window(result: PortfolioHistoryResult) -> None:
     result.profit_value = sum(float(row.get("profit_value") or 0.0) for row in rows)
 
 
-def _live_signal_change_row(row: dict[str, Any], *, capital: float | None) -> dict[str, Any]:
+def _live_signal_change_row(
+    row: dict[str, Any],
+    *,
+    capital: float | None,
+    signal_target: bool = False,
+    execution_mode: str = "naive",
+) -> dict[str, Any]:
     current_weight = _float_or_none(row.get("current_weight")) or 0.0
     target_weight = _float_or_none(row.get("target_weight")) or 0.0
     delta_weight = _float_or_none(row.get("delta_weight"))
@@ -3698,7 +3865,7 @@ def _live_signal_change_row(row: dict[str, Any], *, capital: float | None) -> di
     current_value = current_weight * capital if capital is not None else None
     target_value = target_weight * capital if capital is not None else None
     delta_value = delta_weight * capital if capital is not None else None
-    raw_price_return = _float_or_none(row.get("price_return"))
+    raw_price_return = None if signal_target else _float_or_none(row.get("price_return"))
     stock_return = _float_or_none(row.get("stock_return"))
     if stock_return is None:
         stock_return = _position_adjusted_return(
@@ -3711,11 +3878,26 @@ def _live_signal_change_row(row: dict[str, Any], *, capital: float | None) -> di
             {"current_weight": current_weight, "price_return": raw_price_return},
             ("current_weight",),
         )
+    session_open_price = bool(
+        signal_target or str(execution_mode).strip().lower() == "tw_day_trade"
+    )
+    price = (
+        row.get("open_price")
+        if session_open_price
+        else row.get("trade_price", row.get("current_price"))
+    )
+    if signal_target:
+        stock_return = None
+        portfolio_contribution = None
     return {
         "symbol": str(row.get("symbol") or ""),
         "name": str(row.get("name") or ""),
         "action": str(row.get("action") or "HOLD"),
-        "price": row.get("trade_price", row.get("current_price")),
+        "price": price,
+        "entry_price": price if session_open_price else row.get("entry_price"),
+        "entry_price_source": "saved_session_open" if session_open_price else None,
+        "price_contract": "session_open_target" if session_open_price else "mark_to_mark",
+        "intraday_price_included": False if session_open_price else None,
         "price_return": raw_price_return,
         "stock_return": stock_return,
         "portfolio_contribution": portfolio_contribution,
@@ -3728,7 +3910,26 @@ def _live_signal_change_row(row: dict[str, Any], *, capital: float | None) -> di
         "prev_holding_ratio": current_weight,
         "holding_ratio_delta": delta_weight,
         "is_live_signal": True,
+        "position_source": "signal_target" if signal_target else "executed_history",
+        "execution_mode": execution_mode,
     }
+
+
+def _portfolio_history_accepts_live_signal(summary: dict[str, Any]) -> bool:
+    execution_mode = str(summary.get("execution_mode") or "").strip().lower()
+    contract = summary.get("signal_price_contract")
+    if execution_mode == "tw_day_trade":
+        # This applies to every historical/live day-trade artifact, not only
+        # preview rows. Old artifacts without an explicit opening-auction
+        # contract must never enter portfolio history.
+        return (
+            bool(summary.get("live_session_open_feature_applied"))
+            and isinstance(contract, dict)
+            and str(contract.get("model_observation") or "") == "session_open"
+            and str(contract.get("history_effective_price") or "") == "session_open"
+            and contract.get("intraday_prices_allowed_in_portfolio_history") is False
+        )
+    return not bool(summary.get("execution_preview_only"))
 
 
 def _prepend_latest_signal_row_to_portfolio_history(
@@ -3738,10 +3939,13 @@ def _prepend_latest_signal_row_to_portfolio_history(
     summary: dict[str, Any],
     max_rows: int,
 ) -> bool:
-    if bool(summary.get("execution_preview_only")):
+    if not _portfolio_history_accepts_live_signal(summary):
         return False
+    signal_target = bool(summary.get("execution_preview_only"))
+    day_trade_signal = str(summary.get("execution_mode") or "").strip().lower() == "tw_day_trade"
     signal_date = str(
-        summary.get("weights_date")
+        summary.get("portfolio_history_effective_date")
+        or summary.get("weights_date")
         or summary.get("panel_data_date")
         or summary.get("panel_date")
         or summary.get("asof_date")
@@ -3761,7 +3965,11 @@ def _prepend_latest_signal_row_to_portfolio_history(
     if capital is None and result_capital is not None:
         capital = _float_or_none(getattr(result_capital, "capital", None))
     portfolio_return = _float_or_none(summary.get("portfolio_simple_return"))
-    benchmark_return = _float_or_none(summary.get("benchmark_simple_return"))
+    benchmark_return = (
+        None
+        if signal_target
+        else _float_or_none(summary.get("benchmark_simple_return"))
+    )
     profit_value = _float_or_none(summary.get("portfolio_pnl_value"))
     if profit_value is None and capital is not None and portfolio_return is not None:
         profit_value = capital * portfolio_return
@@ -3799,7 +4007,14 @@ def _prepend_latest_signal_row_to_portfolio_history(
         if abs(delta_weight) + 1e-12 < min_abs_change:
             continue
         change_counts[action] = change_counts.get(action, 0) + 1
-        changes_all.append(_live_signal_change_row(raw, capital=capital))
+        changes_all.append(
+            _live_signal_change_row(
+                raw,
+                capital=capital,
+                signal_target=signal_target,
+                execution_mode=str(summary.get("execution_mode") or "naive"),
+            )
+        )
     changes_all.sort(key=lambda row: abs(float(row.get("holding_ratio_delta") or 0.0)), reverse=True)
 
     eps = 1e-9
@@ -3823,12 +4038,20 @@ def _prepend_latest_signal_row_to_portfolio_history(
     net = _float_or_none(target_risk.get("net"))
     row = {
         "date": signal_date,
-        "display_date": _display_summary_time(summary, summary.get("panel_date") or summary.get("asof_date") or signal_date),
+        "display_date": _display_summary_time(
+            summary,
+            summary.get("portfolio_history_effective_date")
+            or summary.get("panel_date")
+            or summary.get("asof_date")
+            or signal_date,
+        ),
         "portfolio_return": portfolio_return,
         "benchmark_return": benchmark_return,
         "turnover": _float_or_none(summary.get("turnover")),
         "profit_value": profit_value,
         "nav": capital,
+        "open_nav": capital if signal_target else None,
+        "close_nav": None,
         "gross_ratio": gross,
         "net_ratio": net,
         "cash_ratio": max(0.0, 1.0 - gross) if gross is not None else None,
@@ -3840,8 +4063,16 @@ def _prepend_latest_signal_row_to_portfolio_history(
         "changes": changes_all[: max(0, int(result.top_changes))],
         "change_counts": change_counts,
         "change_count": sum(change_counts.values()),
-        "source": "latest_live_signal",
+        "source": "live_signal_open_target" if signal_target else "latest_live_signal",
+        "position_source": "signal_target" if signal_target else "executed_history",
+        "execution_constraints_complete": summary.get("execution_constraints_complete"),
+        "execution_constraints_notice": summary.get("execution_constraints_notice"),
+        "price_source": summary.get("price_source"),
+        "price_timestamp": summary.get("price_timestamp"),
+        "signal_generated_at": summary.get("asof_date"),
         "execution_mode": str(getattr(result, "execution_mode", "naive")),
+        "price_contract": "session_open_target" if day_trade_signal else "mark_to_mark",
+        "intraday_price_included": False if day_trade_signal else None,
     }
 
     rows = [row, *result.rows]
@@ -3895,6 +4126,26 @@ def _include_live_signals_in_portfolio_history(
         dt = _history_datetime(signal_date_key(summary))
         return dt or datetime.min, str(path)
 
+    def should_replace_selected(
+        current: tuple[Path, dict[str, Any]],
+        candidate: tuple[Path, dict[str, Any]],
+    ) -> bool:
+        current_path, current_summary = current
+        candidate_path, candidate_summary = candidate
+        current_preview = bool(current_summary.get("execution_preview_only"))
+        candidate_preview = bool(candidate_summary.get("execution_preview_only"))
+        if current_preview != candidate_preview:
+            return not candidate_preview
+        if not candidate_preview:
+            return candidate_path.stat().st_mtime >= current_path.stat().st_mtime
+        current_coverage = int(current_summary.get("opening_price_available_count") or 0)
+        candidate_coverage = int(candidate_summary.get("opening_price_available_count") or 0)
+        if candidate_coverage != current_coverage:
+            return candidate_coverage > current_coverage
+        current_time = _history_datetime(current_summary.get("asof_date")) or datetime.max
+        candidate_time = _history_datetime(candidate_summary.get("asof_date")) or datetime.max
+        return candidate_time < current_time
+
     latest_by_date: dict[str, tuple[Path, dict[str, Any]]] = {}
     history_ceiling: str | None = None
     try:
@@ -3917,7 +4168,7 @@ def _include_live_signals_in_portfolio_history(
         recent_signals = _market_signals(cfg)
     def collect(signals: list[tuple[Path, dict[str, Any]]]) -> None:
         for summary_path, summary in signals:
-            if bool(summary.get("execution_preview_only")):
+            if not _portfolio_history_accepts_live_signal(summary):
                 continue
             key = signal_day_key(summary)
             if not key:
@@ -3928,7 +4179,8 @@ def _include_live_signals_in_portfolio_history(
             ):
                 continue
             current = latest_by_date.get(key)
-            if current is None or summary_path.stat().st_mtime >= current[0].stat().st_mtime:
+            candidate = (summary_path, summary)
+            if current is None or should_replace_selected(current, candidate):
                 latest_by_date[key] = (summary_path, summary)
 
     collect(recent_signals)
@@ -3940,10 +4192,18 @@ def _include_live_signals_in_portfolio_history(
         signal_day = signal_day_key(summary)
         if cursor is not None and previous_day_key(summary) != cursor:
             continue
+        history_summary = dict(summary)
+        if bool(summary.get("execution_preview_only")):
+            open_time = str(getattr(cfg, "open_time", None) or "09:00").strip()
+            if len(open_time.split(":")) == 2:
+                open_time += ":00"
+            history_summary["portfolio_history_effective_date"] = (
+                f"{signal_day} {open_time}" if signal_day else signal_date_key(summary)
+            )
         inserted = _prepend_latest_signal_row_to_portfolio_history(
             result,
             summary_path=summary_path,
-            summary=summary,
+            summary=history_summary,
             max_rows=max_rows,
         )
         if inserted:
@@ -3986,7 +4246,98 @@ def _load_portfolio_history_for_market(
     )
     _include_latest_signal_in_portfolio_history(cfg, result, max_rows=days)
     _annotate_history_rows_with_display_time(cfg, result.rows)
+    _validate_day_trade_portfolio_history_result(cfg, result)
     return result
+
+
+def _validate_day_trade_portfolio_history_result(
+    cfg: LiveMarketConfig,
+    result: PortfolioHistoryResult,
+) -> None:
+    """Fail closed before Discord renders an incorrect day-trade history page."""
+
+    if _market_execution_mode(cfg) != "tw_day_trade":
+        return
+    open_time = str(getattr(cfg, "open_time", None) or "09:00").strip()
+    if re.fullmatch(r"\d{1,2}:\d{2}", open_time):
+        open_time += ":00"
+    seen_days: set[str] = set()
+    for row in result.rows:
+        day = _date_key(row.get("date"))
+        if not day:
+            raise RuntimeError("day-trade portfolio history contains a row without a date")
+        if day in seen_days:
+            raise RuntimeError(f"day-trade portfolio history contains duplicate day {day}")
+        seen_days.add(day)
+        display_date = str(row.get("display_date") or "")
+        if not display_date.startswith(day) or not display_date.endswith(open_time):
+            raise RuntimeError(
+                f"day-trade portfolio history {day} must render at session open {open_time}; "
+                f"got {display_date!r}"
+            )
+
+        signal_target = row.get("position_source") == "signal_target"
+        expected_contract = "session_open_target" if signal_target else "session_open_to_close"
+        if row.get("price_contract") != expected_contract:
+            raise RuntimeError(
+                f"day-trade portfolio history {day} has invalid price contract "
+                f"{row.get('price_contract')!r}"
+            )
+        if row.get("intraday_price_included") is not False:
+            raise RuntimeError(f"day-trade portfolio history {day} includes an intraday price")
+        if signal_target:
+            if any(row.get(key) is not None for key in ("portfolio_return", "benchmark_return", "profit_value")):
+                raise RuntimeError(
+                    f"pending day-trade opening target {day} must not contain return/benchmark/PnL"
+                )
+        else:
+            if row.get("source") != "integer_share_backtest":
+                raise RuntimeError(
+                    f"executed day-trade history {day} must use integer_share_backtest, "
+                    f"got {row.get('source')!r}"
+                )
+            open_nav = _float_or_none(row.get("open_nav"))
+            close_nav = _float_or_none(row.get("close_nav"))
+            portfolio_return = _float_or_none(row.get("portfolio_return"))
+            profit_value = _float_or_none(row.get("profit_value"))
+            if open_nav is None or open_nav <= 0.0 or close_nav is None:
+                raise RuntimeError(f"executed day-trade history {day} has invalid open/close NAV")
+            if portfolio_return is not None:
+                expected_close = open_nav * (1.0 + portfolio_return)
+                expected_profit = open_nav * portfolio_return
+                if not math.isclose(close_nav, expected_close, rel_tol=1e-10, abs_tol=0.02):
+                    raise RuntimeError(f"executed day-trade history {day} close NAV does not match return")
+                if profit_value is None or not math.isclose(
+                    profit_value,
+                    expected_profit,
+                    rel_tol=1e-10,
+                    abs_tol=0.02,
+                ):
+                    raise RuntimeError(f"executed day-trade history {day} PnL does not match return")
+
+        changes = row.get("changes") if isinstance(row.get("changes"), list) else []
+        for change in changes:
+            if not isinstance(change, dict):
+                raise RuntimeError(f"day-trade portfolio history {day} contains an invalid change row")
+            if change.get("price_contract") != expected_contract:
+                raise RuntimeError(
+                    f"day-trade portfolio history {day} change {change.get('symbol')} has invalid price contract"
+                )
+            if change.get("intraday_price_included") is not False:
+                raise RuntimeError(
+                    f"day-trade portfolio history {day} change {change.get('symbol')} includes an intraday price"
+                )
+            entry_price = _float_or_none(change.get("entry_price", change.get("price")))
+            if entry_price is None or entry_price <= 0.0:
+                raise RuntimeError(
+                    f"day-trade portfolio history {day} change {change.get('symbol')} has no opening price"
+                )
+            if not signal_target:
+                exit_price = _float_or_none(change.get("exit_price"))
+                if exit_price is None or exit_price <= 0.0:
+                    raise RuntimeError(
+                        f"executed day-trade history {day} change {change.get('symbol')} has no closing price"
+                    )
 
 
 def _stock_history_header_lines(cfg: LiveMarketConfig, result: StockHistoryResult, *, debug: bool = False) -> list[str]:
@@ -4068,6 +4419,10 @@ def _portfolio_history_header_lines(
         header.append(
             "當沖契約: 每列記錄當日開盤成交；ret/pnl 依同日 open->close（含費用）結算。"
         )
+    if any(row.get("position_source") == "signal_target" for row in result.rows):
+        header.append(
+            "今日 `source=signal_target` 是已觀察開盤價後的模型目標；尚未有整數成交與收盤損益，不計入期間報酬。"
+        )
     if debug:
         source_text = _shorten(", ".join(_display_path(path) for path in result.source_paths), 700)
         header.extend(
@@ -4115,7 +4470,7 @@ def _position_line(row: dict[str, Any]) -> str:
     lines.append(
         _kv_line(
             ("px", _price(row.get("current_price"))),
-            ("score", _num(row.get("score"), 3)),
+            ("raw_score", _num(_row_raw_score(row), 4)),
         )
     )
     status = _position_status_label(row)
@@ -4137,6 +4492,7 @@ def _rebalance_line(row: dict[str, Any]) -> str:
         _kv_line(
             ("now", _pct(row.get("current_weight"))),
             ("target", _pct(row.get("target_weight"))),
+            ("raw_score", _num(_row_raw_score(row), 4)),
         ),
         _return_pnl_line(row, ("current_weight", "holding_ratio", "target_weight")),
     ]
@@ -4243,25 +4599,37 @@ def _portfolio_change_block(row: dict[str, Any], index: int) -> str:
         if row.get("is_live_signal")
         else ("prev_holding_ratio", "holding_ratio", "current_weight", "target_weight")
     )
-    lines = [
-        f"    {index}. {label} **{action}**",
-        "       "
-        + _kv_inline(
-            ("Δhold", _signed_pct(row.get("holding_ratio_delta"))),
+    day_trade = str(row.get("execution_mode") or "").lower() == "tw_day_trade"
+    position_pairs: list[tuple[str, Any]] = []
+    # A day-trade history row always starts flat. Its holding, value, and shares
+    # therefore already equal their respective deltas; displaying both copies
+    # wastes most of a one-day Discord page without adding information.
+    if not day_trade:
+        position_pairs.append(("Δhold", _signed_pct(row.get("holding_ratio_delta"))))
+    position_pairs.extend(
+        [
             ("hold", _pct(row.get("holding_ratio"))),
             ("stock_ret", _signed_pct_zero_plain(_position_adjusted_return(row, pnl_weight_keys))),
             ("pnl_contrib", _signed_pct_zero_plain(_portfolio_return_contribution(row, pnl_weight_keys))),
-        ),
-    ]
+        ]
+    )
+    if day_trade:
+        lines = [f"    {index}. {label} **{action}**  " + _kv_inline(*position_pairs)]
+    else:
+        lines = [
+            f"    {index}. {label} **{action}**",
+            "       " + _kv_inline(*position_pairs),
+        ]
     value_pairs: list[tuple[str, Any]] = []
     if _float_or_none(row.get("market_value")) is not None:
         value_pairs.append(("value", _money(row.get("market_value"))))
-    if _float_or_none(row.get("market_value_delta")) is not None:
+    if not day_trade and _float_or_none(row.get("market_value_delta")) is not None:
         value_pairs.append(("Δvalue", _signed_money(row.get("market_value_delta"))))
     if row.get("shares") is not None or row.get("share_delta") is not None:
         value_pairs.append(("shares", int(_float_or_none(row.get("shares")) or 0)))
-        value_pairs.append(("Δsh", f"{int(_float_or_none(row.get('share_delta')) or 0):+d}"))
-    if str(row.get("execution_mode") or "").lower() == "tw_day_trade":
+        if not day_trade:
+            value_pairs.append(("Δsh", f"{int(_float_or_none(row.get('share_delta')) or 0):+d}"))
+    if day_trade:
         value_pairs.append(("open", _price(row.get("entry_price", row.get("price")))))
         value_pairs.append(("close", _price(row.get("exit_price"))))
     else:
@@ -4274,6 +4642,14 @@ def _portfolio_history_block(row: dict[str, Any]) -> str:
     changes = row.get("changes")
     change_rows = changes if isinstance(changes, list) else []
     day_trade = str(row.get("execution_mode") or "").strip().lower() == "tw_day_trade"
+    signal_target = row.get("position_source") == "signal_target"
+    position_pairs: list[tuple[str, Any]] = [
+        ("pos", row.get("position_count", "n/a")),
+        ("long", row.get("long_count", "n/a")),
+        ("short", row.get("short_count", "n/a")),
+    ]
+    if not day_trade:
+        position_pairs.append(("changes", row.get("change_count", 0)))
     lines = [
         f"`{row.get('display_date', row.get('date', 'n/a'))}`",
         _kv_line(
@@ -4284,7 +4660,7 @@ def _portfolio_history_block(row: dict[str, Any]) -> str:
         (
             _kv_line(
                 ("cum", _signed_pct(row.get("cumulative_return"))),
-                ("turnover", _pct(row.get("turnover"))),
+                ("target_turnover" if signal_target else "turnover", _pct(row.get("turnover"))),
                 ("open_nav", _money(row.get("open_nav", row.get("nav")))),
                 ("close_nav", _money(row.get("close_nav"))),
             )
@@ -4296,18 +4672,30 @@ def _portfolio_history_block(row: dict[str, Any]) -> str:
             )
         ),
         _kv_line(
-            ("open_gross" if day_trade else "gross", _pct(row.get("gross_ratio"))),
-            ("open_net" if day_trade else "net", _signed_pct(row.get("net_ratio"))),
-            ("open_cash" if day_trade else "cash", _pct(row.get("cash_ratio"))),
+            (
+                "target_gross" if signal_target else "open_gross" if day_trade else "gross",
+                _pct(row.get("gross_ratio")),
+            ),
+            (
+                "target_net" if signal_target else "open_net" if day_trade else "net",
+                _signed_pct(row.get("net_ratio")),
+            ),
+            (
+                "target_cash" if signal_target else "open_cash" if day_trade else "cash",
+                _pct(row.get("cash_ratio")),
+            ),
         ),
-        _kv_line(
-            ("pos", row.get("position_count", "n/a")),
-            ("long", row.get("long_count", "n/a")),
-            ("short", row.get("short_count", "n/a")),
-            ("changes", row.get("change_count", 0)),
-        ),
+        _kv_line(*position_pairs),
         f"  change_mix: `{_portfolio_change_counts(row)}`",
     ]
+    if signal_target:
+        lines.insert(
+            1,
+            "`source=signal_target` 已觀察當日開盤價的模型目標；尚未有同日整數成交或收盤損益。",
+        )
+        if row.get("execution_constraints_complete") is False:
+            notice = _shorten(row.get("execution_constraints_notice"), 260)
+            lines.insert(2, f"  限制: `{notice or '同日官方當沖資格尚未完整套用'}`")
     requested_gross = _float_or_none(row.get("requested_gross_ratio"))
     if requested_gross is not None:
         executed_gross = _float_or_none(row.get("gross_ratio")) or 0.0
@@ -4325,14 +4713,67 @@ def _portfolio_history_block(row: dict[str, Any]) -> str:
                 5,
                 "  未成交: 開盤目標受到前一交易日成交量、整張股數、交易遮罩與可用資金限制。",
             )
-    if change_rows:
-        lines.append("  top changes:")
-        for index, item in enumerate(change_rows[:8], start=1):
+    displayed_changes = change_rows
+    if displayed_changes:
+        total_changes = int(row.get("change_count") or len(displayed_changes))
+        lines.append(f"  top changes: `{len(displayed_changes)}/{total_changes}`")
+        for index, item in enumerate(displayed_changes, start=1):
             if isinstance(item, dict):
                 lines.append(_portfolio_change_block(item, index))
     else:
         lines.append("  top changes: none")
     return "\n".join(lines)
+
+
+def _portfolio_history_pages(
+    cfg: LiveMarketConfig,
+    result: PortfolioHistoryResult,
+    *,
+    debug: bool = False,
+) -> list[str]:
+    """Render exactly one history period per Discord page without splitting it."""
+
+    rows = list(result.rows)
+    if not rows:
+        return [f"**portfolio history**\n(no rows)\n\n{INVESTMENT_WARNING}"]
+    _validate_day_trade_portfolio_history_result(cfg, result)
+    max_chars = 4000
+    page_count = len(rows)
+    pages: list[str] = []
+    for page_index, source_row in enumerate(rows, start=1):
+        source_changes = (
+            [dict(item) for item in source_row.get("changes", []) if isinstance(item, dict)]
+            if isinstance(source_row.get("changes"), list)
+            else []
+        )
+
+        row = dict(source_row)
+        row["changes"] = source_changes
+        lines = [
+            f"**portfolio history · {cfg.market}**  `page={page_index}/{page_count}`",
+            "",
+            _portfolio_history_block(row),
+        ]
+        if debug:
+            lines.append(
+                _kv_line(
+                    ("fold", _display_path(result.fold_dir)),
+                    ("sources", len(result.source_paths)),
+                    ("display_tz", _display_tz_text(cfg)),
+                )
+            )
+        _append_investment_warning(lines)
+        page = "\n".join(lines)
+        if len(page) > max_chars:
+            day = source_row.get("display_date", source_row.get("date", "n/a"))
+            raise RuntimeError(
+                f"portfolio history day {day} cannot fit all {len(source_changes)} top changes "
+                f"in one Discord page ({len(page)}>{max_chars})"
+            )
+        pages.append(page)
+    if len(pages) != len(rows):
+        raise RuntimeError("portfolio history pagination must produce exactly one page per period")
+    return pages
 
 
 def _decision_line(row: dict[str, Any]) -> str:
@@ -4369,6 +4810,7 @@ def _decision_block(row: dict[str, Any]) -> str:
             ),
             _kv_line(
                 ("px", _price(row.get("trade_price", row.get("current_price")))),
+                ("raw_score", _num(_row_raw_score(row), 4)),
                 ("score", _num(row.get("score"), 4)),
                 ("rank", row.get("abs_score_rank", "n/a")),
             ),
@@ -4654,7 +5096,10 @@ class PagedTextView(discord.ui.View):
     async def _show(self, interaction: discord.Interaction) -> None:
         self._sync_buttons()
         try:
-            await interaction.response.edit_message(content=self.pages[self.index], view=self)
+            await interaction.response.edit_message(
+                **_discord_page_kwargs(self.pages[self.index]),
+                view=self,
+            )
         except discord.NotFound:
             return
         except discord.HTTPException as exc:
@@ -5020,6 +5465,139 @@ async def watchlist_command(
     )
 
 
+async def _handle_signal_now_command(
+    interaction: discord.Interaction,
+    *,
+    market: str,
+    mode: str,
+    price_source: str,
+    top_n: int,
+    min_abs_delta: float,
+    refresh_data: bool,
+    debug: bool,
+) -> None:
+    normalized_mode = _normalize_signal_now_mode(mode)
+    include_raw_universe = normalized_mode == "raw_scores"
+    command_name = "raw_score_now" if include_raw_universe else "signal_now"
+    await interaction.response.defer(thinking=True)
+    try:
+        shown_rows = _top_n(top_n)
+        cfg = _resolve_market(market)
+        status = await asyncio.to_thread(_ensure_signal_ready_cached, cfg)
+        cached = None
+        if not refresh_data:
+            cached = await asyncio.to_thread(
+                _signal_now_cached_result,
+                cfg,
+                status,
+                requested_price_source=price_source,
+                top_n=shown_rows,
+                require_unconstrained_raw_scores=include_raw_universe,
+                debug=debug,
+            )
+        if cached is not None:
+            summary_path, result, cache_reason = cached
+            _record_audit_event(
+                str(result.summary.get("signal_id")),
+                "cached",
+                interaction,
+                market=str(result.summary.get("market") or market or _default_market()),
+                output_dir=result.output_dir,
+                market_open=bool(status.market_open),
+                auto_refreshed=False,
+                requested_price_source=price_source,
+                resolved_price_source=str(result.summary.get("price_source") or "artifact"),
+                cache=cache_reason,
+                mode=normalized_mode,
+                summary=str(summary_path),
+                sanity=_signal_sanity_level(_signal_sanity_issues(cfg, result.summary)),
+            )
+            await _send_signal_response(
+                interaction,
+                result.message,
+                str(result.summary.get("signal_id")),
+                str(result.summary.get("market") or market or _default_market()),
+            )
+            for pages in _signal_now_detail_page_groups(
+                cfg,
+                result,
+                mode=normalized_mode,
+                top_n=shown_rows,
+                debug=debug,
+            ):
+                await _send_paginated_response(interaction, pages)
+            return
+        should_refresh_data = _signal_now_should_refresh_data(status, refresh_data=refresh_data)
+        if should_refresh_data:
+            user_id = int(getattr(interaction.user, "id", 0) or 0)
+            key, started = _enqueue_signal_now_background_refresh(
+                user_id=user_id,
+                cfg=cfg,
+                requested_price_source=price_source,
+                top_n=shown_rows,
+                min_abs_delta=min_abs_delta,
+                debug=debug,
+                mode=normalized_mode,
+            )
+            verb = "已開始" if started else "已加入既有"
+            reason = "refresh_data=true" if refresh_data else "資料落後"
+            await interaction.followup.send(
+                f"`{cfg.market}` {reason}，{verb}背景更新與推論；完成後會 DM 結果。\n"
+                f"command=`/{command_name}` job=`{key}`"
+            )
+            return
+        resolved_price_source, status, auto_refreshed = await asyncio.to_thread(
+            _prepare_realtime_signal_sync,
+            cfg,
+            requested_price_source=price_source,
+            force_refresh=should_refresh_data,
+        )
+        await asyncio.to_thread(_sync_latest_live_weights_to_market_artifact, cfg)
+        result = await _run_market_signal(
+            market=market,
+            price_source=resolved_price_source,
+            top_n=shown_rows,
+            min_abs_delta=min_abs_delta,
+            progress_label=f"{command_name}:{cfg.market}",
+            include_unconstrained_raw_scores=include_raw_universe,
+        )
+        result = _enrich_signal_performance_for_discord(cfg, result, max_rows=0, debug=debug)
+    except Exception as exc:
+        error_prefix = "raw score" if include_raw_universe else "live signal"
+        await _send_command_error(interaction, error_prefix, exc)
+        return
+    sanity_issues = _signal_sanity_issues(cfg, result.summary)
+    if sanity_issues:
+        result.message = _prepend_sanity_notice(result.message, cfg, result.summary)
+    _record_audit_event(
+        str(result.summary.get("signal_id")),
+        "generated",
+        interaction,
+        market=str(result.summary.get("market") or market or _default_market()),
+        output_dir=result.output_dir,
+        market_open=bool(status.market_open),
+        auto_refreshed=bool(auto_refreshed),
+        requested_price_source=price_source,
+        resolved_price_source=resolved_price_source or "config",
+        mode=normalized_mode,
+        sanity=_signal_sanity_level(sanity_issues),
+    )
+    await _send_signal_response(
+        interaction,
+        result.message,
+        str(result.summary.get("signal_id")),
+        str(result.summary.get("market") or market or _default_market()),
+    )
+    for pages in _signal_now_detail_page_groups(
+        cfg,
+        result,
+        mode=normalized_mode,
+        top_n=shown_rows,
+        debug=debug,
+    ):
+        await _send_paginated_response(interaction, pages)
+
+
 @bot.tree.command(name="signal_now", description="Run stockAgent live signal now.")
 @app_commands.describe(
     market="Market id",
@@ -5039,117 +5617,46 @@ async def signal_now(
     refresh_data: bool = False,
     debug: bool = False,
 ) -> None:
-    await interaction.response.defer(thinking=True)
-    try:
-        shown_rows = _top_n(top_n)
-        cfg = _resolve_market(market)
-        status = await asyncio.to_thread(_ensure_signal_ready_cached, cfg)
-        cached = None
-        if not refresh_data:
-            cached = await asyncio.to_thread(
-                _signal_now_cached_result,
-                cfg,
-                status,
-                requested_price_source=price_source,
-                top_n=shown_rows,
-                debug=debug,
-            )
-        if cached is not None:
-            summary_path, result, cache_reason = cached
-            _record_audit_event(
-                str(result.summary.get("signal_id")),
-                "cached",
-                interaction,
-                market=str(result.summary.get("market") or market or _default_market()),
-                output_dir=result.output_dir,
-                market_open=bool(status.market_open),
-                auto_refreshed=False,
-                requested_price_source=price_source,
-                resolved_price_source=str(result.summary.get("price_source") or "artifact"),
-                cache=cache_reason,
-                summary=str(summary_path),
-                sanity=_signal_sanity_level(_signal_sanity_issues(cfg, result.summary)),
-            )
-            await _send_signal_response(
-                interaction,
-                result.message,
-                str(result.summary.get("signal_id")),
-                str(result.summary.get("market") or market or _default_market()),
-            )
-            for pages in _scheduled_detail_page_groups(
-                cfg,
-                result,
-                title_prefix="signal_now",
-                include_decisions=True,
-                debug=debug,
-            ):
-                await _send_paginated_response(interaction, pages)
-            return
-        should_refresh_data = _signal_now_should_refresh_data(status, refresh_data=refresh_data)
-        if should_refresh_data:
-            user_id = int(getattr(interaction.user, "id", 0) or 0)
-            key, started = _enqueue_signal_now_background_refresh(
-                user_id=user_id,
-                cfg=cfg,
-                requested_price_source=price_source,
-                top_n=shown_rows,
-                min_abs_delta=min_abs_delta,
-                debug=debug,
-            )
-            verb = "已開始" if started else "已加入既有"
-            reason = "refresh_data=true" if refresh_data else "資料落後"
-            await interaction.followup.send(
-                f"`{cfg.market}` {reason}，{verb}背景更新與推論；完成後會 DM 結果。\n"
-                f"job=`{key}`"
-            )
-            return
-        resolved_price_source, status, auto_refreshed = await asyncio.to_thread(
-            _prepare_realtime_signal_sync,
-            cfg,
-            requested_price_source=price_source,
-            force_refresh=should_refresh_data,
-        )
-        await asyncio.to_thread(_sync_latest_live_weights_to_market_artifact, cfg)
-        result = await _run_market_signal(
-            market=market,
-            price_source=resolved_price_source,
-            top_n=shown_rows,
-            min_abs_delta=min_abs_delta,
-            progress_label=f"signal_now:{cfg.market}",
-        )
-        result = _enrich_signal_performance_for_discord(cfg, result, max_rows=0, debug=debug)
-    except Exception as exc:
-        await _send_command_error(interaction, "live signal", exc)
-        return
-    sanity_issues = _signal_sanity_issues(cfg, result.summary)
-    if sanity_issues:
-        result.message = _prepend_sanity_notice(result.message, cfg, result.summary)
-    _record_audit_event(
-        str(result.summary.get("signal_id")),
-        "generated",
+    await _handle_signal_now_command(
         interaction,
-        market=str(result.summary.get("market") or market or _default_market()),
-        output_dir=result.output_dir,
-        market_open=bool(status.market_open),
-        auto_refreshed=bool(auto_refreshed),
-        requested_price_source=price_source,
-        resolved_price_source=resolved_price_source or "config",
-        sanity=_signal_sanity_level(sanity_issues),
-    )
-    await _send_signal_response(
-        interaction,
-        result.message,
-        str(result.summary.get("signal_id")),
-        str(result.summary.get("market") or market or _default_market()),
-    )
-    for pages in _scheduled_detail_page_groups(
-        cfg,
-        result,
-        title_prefix="signal_now",
-        include_decisions=True,
+        market=market,
+        mode="signal",
+        price_source=price_source,
+        top_n=top_n,
+        min_abs_delta=min_abs_delta,
+        refresh_data=refresh_data,
         debug=debug,
-    ):
-        await _send_paginated_response(interaction, pages)
+    )
+
+
+@bot.tree.command(
+    name="raw_score_now",
+    description="Show unfiltered model raw scores for the complete checkpoint universe.",
+)
+@app_commands.describe(
+    market="Market id",
+    price_source="auto/panel/csv/yahoo/tw",
+    refresh_data="Run the market pre-signal data updater first. Default false for fast query.",
+    debug="Show signal ids, fingerprints, output folders, and artifact paths.",
+)
+@app_commands.autocomplete(market=market_autocomplete)
+async def raw_score_now(
+    interaction: discord.Interaction,
+    market: str = "",
+    price_source: str = "auto",
+    refresh_data: bool = False,
+    debug: bool = False,
+) -> None:
+    await _handle_signal_now_command(
+        interaction,
+        market=market,
+        mode="raw_scores",
+        price_source=price_source,
+        top_n=20,
+        min_abs_delta=0.001,
+        refresh_data=refresh_data,
+        debug=debug,
+    )
 
 
 @bot.tree.command(name="positions", description="Show target position weights.")
@@ -5513,8 +6020,7 @@ async def stock_history_command(
 @app_commands.describe(
     market="Market id.",
     days="Periods to show. Daily markets use days; crypto can use 15m bars. Default 32. 0 means all.",
-    top_changes="Top holding changes per period.",
-    page_size="Periods per page. Default 1 means one day/bar per page.",
+    top_changes="Top holding changes per period (0-20; all requested rows are shown).",
     min_abs_change="Hide weight-only changes below this absolute ratio.",
     initial_capital="Scale fold values from the first fold NAV.",
     current_capital="Scale fold values from the latest fold NAV. Overrides initial_capital.",
@@ -5525,8 +6031,7 @@ async def portfolio_history_command(
     interaction: discord.Interaction,
     market: str = "",
     days: int = 32,
-    top_changes: int = 5,
-    page_size: int = 1,
+    top_changes: app_commands.Range[int, 0, 20] = 5,
     min_abs_change: float = MIN_DISPLAY_ABS_WEIGHT,
     initial_capital: float = 0.0,
     current_capital: float = 0.0,
@@ -5548,16 +6053,11 @@ async def portfolio_history_command(
         await _send_command_error(interaction, "portfolio_history", exc)
         return
 
-    pages = _line_pages(
-        title="portfolio history",
-        rows=result.rows,
-        formatter=_portfolio_history_block,
-        page_size=page_size,
-        header_lines=_portfolio_history_header_lines(cfg, result, debug=debug),
-        min_page_size=1,
-        default_page_size=1,
-    )
-    await _send_paginated_response(interaction, pages)
+    try:
+        pages = _portfolio_history_pages(cfg, result, debug=debug)
+        await _send_paginated_response(interaction, pages)
+    except Exception as exc:
+        await _send_command_error(interaction, "portfolio_history", exc)
 
 
 @bot.tree.command(name="set_market_enabled", description="Enable or disable a market in the Discord bot.")

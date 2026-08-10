@@ -6603,6 +6603,16 @@ def _umap_fold_statistics(frame: pl.DataFrame) -> dict[str, float]:
     }
 
 
+def _read_cross_fold_source_table(source_path: Path, spec: _CrossFoldFigureSpec) -> pl.DataFrame:
+    """Read a drift source without coercing mixed-format security identifiers."""
+    schema_overrides = {"symbol": pl.String} if "symbol" in spec.key_cols else None
+    return pl.read_csv(
+        source_path,
+        infer_schema_length=None,
+        schema_overrides=schema_overrides,
+    )
+
+
 def _write_cross_fold_figure_drift(
     root: Path,
     fold_dirs: list[Path],
@@ -6633,7 +6643,7 @@ def _write_cross_fold_figure_drift(
                 source_path = fold_dir / spec.source
                 if not source_path.exists():
                     continue
-                frame = pl.read_csv(source_path)
+                frame = _read_cross_fold_source_table(source_path, spec)
                 vector = _umap_fold_statistics(frame) if spec.mode == "umap" else _fold_vector_from_table(frame, spec)
                 if not vector:
                     continue
@@ -7010,6 +7020,15 @@ def _write_all_folds_comprehensive_report(root: Path, fold_dirs: list[Path], sta
     complete_stability = stability
     if not stability.is_empty() and "folds_present" in stability.columns:
         complete_stability = stability.filter(pl.col("folds_present") == len(fold_dirs))
+    fold_ids = sorted(int(path.name.removeprefix("fold_").removesuffix("_test")) for path in fold_dirs)
+    fold_scope = "Fold"
+    if fold_ids:
+        fold_scope = (
+            f"Fold {fold_ids[0]}–{fold_ids[-1]}"
+            if fold_ids == list(range(fold_ids[0], fold_ids[-1] + 1))
+            else "Folds " + ", ".join(str(value) for value in fold_ids)
+        )
+    complete_feature_count = complete_stability.height
 
     def count_at_least(column: str, threshold: float) -> int:
         if metrics.is_empty() or column not in metrics.columns:
@@ -7044,7 +7063,7 @@ def _write_all_folds_comprehensive_report(root: Path, fold_dirs: list[Path], sta
         f"- 代理 SHAP 平均 R2：**{mean_shap:.3f}**；低於 0.8：**{count_at_most('shap_surrogate_r2', 0.799999)}/{len(fold_dirs)} folds**。",
         f"- 跨 Fold 聚合圖表 QA：**{sum(item.get('status') == 'ok' for item in plot_validation)}/{len(plot_validation)}**。",
         (
-            "- **21 個 Fold 的既有 perturbation artifact 尚未使用 batch-matched baseline；"
+            f"- **{len(fold_dirs)} 個 Fold 的既有 perturbation artifact 尚未使用 batch-matched baseline；"
             "weight perturbation 的跨 Fold 漂移目前只可視為 provisional，必須重算後才能做特徵重要性結論。**"
             if not perturb_artifacts_verified
             else "- Perturbation artifact 已全部使用同 batch、同執行路徑基準。"
@@ -7085,7 +7104,7 @@ def _write_all_folds_comprehensive_report(root: Path, fold_dirs: list[Path], sta
             "",
             "## 4. 不同解釋方法是否彼此支持",
             "",
-            "箱型圖使用每個 Fold 中任一方法非零的完整 active feature union 計算 Spearman 相關，不做 Top-K；完整 131 特徵（含零值 ties）的結果仍保存在 CSV。低相關不是自動判錯，但表示 Gradient、IG、權重 Perturbation 與代理 SHAP 不能互相替代。",
+            f"箱型圖使用每個 Fold 中任一方法非零的完整 active feature union 計算 Spearman 相關，不做 Top-K；完整 {complete_feature_count} 特徵（含零值 ties）的結果仍保存在 CSV。低相關不是自動判錯，但表示 Gradient、IG、權重 Perturbation 與代理 SHAP 不能互相替代。",
             "",
             "[![跨 Fold 方法一致性](plots_cross_fold/cross_fold_method_agreement.png)](plots_cross_fold/cross_fold_method_agreement.png)",
             "",
@@ -7116,9 +7135,9 @@ def _write_all_folds_comprehensive_report(root: Path, fold_dirs: list[Path], sta
         ]
     )
     cross_figure_lines = [
-        "## 6. 每一種圖表的 Fold 1–21 漂移",
+        f"## 6. 每一種圖表的 {fold_scope} 漂移",
         "",
-        "以下每一節都從該圖的完整來源表重新對齊 Fold 1–21；L1 分布漂移 0 代表形狀相同、1 代表最大差異，cosine 與 rank correlation 越接近 1 越穩定，absolute scale 則檢查整體訊號強度是否改變。所有 cells 都參與計算，不做 Top-K／Top-N。",
+        f"以下每一節都從該圖的完整來源表重新對齊 {fold_scope}；L1 分布漂移 0 代表形狀相同、1 代表最大差異，cosine 與 rank correlation 越接近 1 越穩定，absolute scale 則檢查整體訊號強度是否改變。所有 cells 都參與計算，不做 Top-K／Top-N。",
         "",
     ]
     if cross_figure_manifest.is_empty():
@@ -7154,7 +7173,7 @@ def _write_all_folds_comprehensive_report(root: Path, fold_dirs: list[Path], sta
             elif item.get("status") == "all_zero_omitted":
                 cross_figure_lines.extend(
                     [
-                        "此指標在 21 folds 全部為零，因此沒有可誠實呈現的漂移曲線；這是量測解析度限制，不應解讀成所有特徵都不重要。",
+                        f"此指標在 {len(fold_dirs)} folds 全部為零，因此沒有可誠實呈現的漂移曲線；這是量測解析度限制，不應解讀成所有特徵都不重要。",
                         "",
                     ]
                 )

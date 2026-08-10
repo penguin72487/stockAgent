@@ -6,9 +6,21 @@ runner:
   # This model owns a trainable temporal dictionary and a wider fusion layer;
   # it is intentionally checkpoint-incompatible with both raw-only and v1.
   output_dir: artifacts/markets/tw_public_candles_multi_basis_online_complete_lookback32_v2
-  resume: false
+  resume: true
 
 training:
+  # The inherited candles baseline was measured on two 32 GiB RTX 5090s:
+  # global batch 128 becomes local batch 64 and the full panel can stay on
+  # each GPU.  This complete 18-family basis experiment is also run on the
+  # single 16 GiB RTX 4070 Ti SUPER workstation.  There, local batch 128 fails
+  # the compiled forward/backward probe even without the panel cache, while
+  # local batch 64 with host-resident shared tensors completes model/loss
+  # probes and the full train/validation/test epoch workflow.
+  batch_size_train: 64
+  cache_train_tensors_on_gpu: false
+  cache_eval_tensors_on_gpu: false
+  vram_budget_gb: 16
+
   transformer_base_portfolio:
     # All families consume only the observed trailing window and have static
     # shapes. Four coefficients per family bound live inference and training
