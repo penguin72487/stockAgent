@@ -4663,8 +4663,6 @@ def _panel_array_content_fingerprint(
 _TEMPORAL_BASIS_MODEL_CONFIG_FIELDS = (
     "temporal_basis_families",
     "temporal_basis_components",
-    "temporal_basis_dropout",
-    "temporal_basis_gate_init",
 )
 
 

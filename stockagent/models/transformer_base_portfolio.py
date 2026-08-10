@@ -724,7 +724,7 @@ def _temporal_basis_matrix(
         rows = _orthonormal_polynomial_basis(steps, family)
     else:
         # The learned dictionary starts from a stable non-DC DCT bank and is
-        # registered as a parameter by TemporalMultiBasisEncoder.
+        # registered as a parameter by TemporalBasisFeatureEncoder.
         rows = _dct_basis(steps)
     rows = _orthonormalize_non_dc_rows(rows, steps=steps)
     if not rows:
@@ -744,13 +744,8 @@ def _temporal_basis_matrix(
     return torch.stack(selected, dim=0).to(dtype=torch.float32)
 
 
-class TemporalMultiBasisEncoder(nn.Module):
-    """Fuse fixed and learned temporal coefficients into a gated representation.
-
-    The raw/learned temporal Transformer remains the main path.  This branch
-    analyzes its pre-temporal embeddings with non-DC bases and contributes
-    signed phase plus per-channel energy through a gated residual.
-    """
+class TemporalBasisFeatureEncoder(nn.Module):
+    """Append temporal-basis coefficients to the ordinary model feature vector."""
 
     def __init__(
         self,
@@ -759,23 +754,15 @@ class TemporalMultiBasisEncoder(nn.Module):
         dim: int,
         families: Sequence[str] | str,
         components: int,
-        dropout: float,
-        gate_init: float,
-        norm_type: str,
-        ffn_type: str,
     ) -> None:
         super().__init__()
         self.lookback = int(lookback)
         self.dim = int(dim)
         self.family_names = _normalize_temporal_basis_families(families)
         if not self.family_names:
-            raise ValueError("TemporalMultiBasisEncoder requires at least one family")
-        if not math.isfinite(float(gate_init)):
-            raise ValueError("temporal_basis_gate_init must be finite")
+            raise ValueError("TemporalBasisFeatureEncoder requires at least one family")
 
-        self.family_projections = nn.ModuleDict()
-        self.signed_mix_logits = nn.ParameterDict()
-        self.energy_mix_logits = nn.ParameterDict()
+        self.family_component_counts: dict[str, int] = {}
         for family in self.family_names:
             matrix = _temporal_basis_matrix(
                 family,
@@ -789,35 +776,14 @@ class TemporalMultiBasisEncoder(nn.Module):
                 )
             else:
                 self.register_buffer(f"{family}_basis", matrix, persistent=False)
-            coefficient_count = int(matrix.size(0))
-            signed_init = math.atanh(min(0.95, 1.0 / math.sqrt(coefficient_count)))
-            self.signed_mix_logits[family] = nn.Parameter(
-                torch.full((coefficient_count,), signed_init)
-            )
-            self.energy_mix_logits[family] = nn.Parameter(
-                torch.zeros(coefficient_count)
-            )
-            self.family_projections[family] = nn.Sequential(
-                _make_norm(self.dim * 2, norm_type),
-                GatedProjection(
-                    self.dim * 2,
-                    self.dim,
-                    float(dropout),
-                    ffn_type,
-                ),
-            )
+            self.family_component_counts[family] = int(matrix.size(0))
 
-        self.fusion = GatedProjection(
-            self.dim * len(self.family_names),
+        self.total_basis_components = sum(self.family_component_counts.values())
+        self.input_feature_dim = self.dim * (1 + self.total_basis_components)
+        self.feature_projection = nn.Linear(
+            self.input_feature_dim,
             self.dim,
-            float(dropout),
-            ffn_type,
         )
-        self.delta_norm = _make_norm(self.dim, norm_type)
-        self.gate_norm = _make_norm(self.dim * 2, norm_type)
-        self.gate = nn.Linear(self.dim * 2, 1)
-        nn.init.zeros_(self.gate.weight)
-        nn.init.constant_(self.gate.bias, float(gate_init))
 
     def forward(
         self,
@@ -841,11 +807,7 @@ class TemporalMultiBasisEncoder(nn.Module):
         ):
             raise ValueError("z_base must have shape [B,S,D]")
 
-        temporal_mean = temporal_embeddings.float().mean(dim=1, keepdim=True)
-        centered = temporal_embeddings - temporal_mean.to(
-            dtype=temporal_embeddings.dtype
-        )
-        summaries: list[torch.Tensor] = []
+        feature_parts = [z_base]
         aux: dict[str, torch.Tensor] = {}
         for family in self.family_names:
             basis_source = getattr(self, f"{family}_basis")
@@ -857,52 +819,31 @@ class TemporalMultiBasisEncoder(nn.Module):
                     eps=1e-6,
                 ).to(dtype=basis_source.dtype)
             basis = basis_source.to(
-                device=centered.device,
-                dtype=centered.dtype,
+                device=temporal_embeddings.device,
+                dtype=temporal_embeddings.dtype,
             )
-            coefficients = torch.einsum("kl,blsd->bksd", basis, centered)
-            signed_weights = torch.tanh(self.signed_mix_logits[family]).to(
-                device=coefficients.device,
-                dtype=coefficients.dtype,
+            coefficients = torch.einsum(
+                "kl,blsd->bksd",
+                basis,
+                temporal_embeddings,
             )
-            signed = (
-                coefficients
-                * signed_weights.reshape(1, -1, 1, 1)
-            ).sum(dim=1)
-            energy_weights = torch.softmax(
-                self.energy_mix_logits[family], dim=0
-            ).to(device=coefficients.device, dtype=coefficients.dtype)
-            energy = torch.sqrt(
-                (
-                    coefficients.square()
-                    * energy_weights.reshape(1, -1, 1, 1)
-                ).sum(dim=1).float()
-                + 1e-6
-            ).to(dtype=coefficients.dtype)
-            summary = self.family_projections[family](
-                torch.cat((signed, energy), dim=-1)
+            feature_parts.append(
+                coefficients.permute(0, 2, 1, 3).flatten(start_dim=2)
             )
-            summaries.append(summary)
             if collect_aux:
-                aux[f"temporal_basis_{family}_summary"] = summary
-                aux[f"temporal_basis_{family}_signed"] = signed
-                aux[f"temporal_basis_{family}_energy"] = energy
+                aux[f"temporal_basis_{family}_coefficients"] = coefficients
 
-        delta = self.delta_norm(self.fusion(torch.cat(summaries, dim=-1)))
-        gate = torch.sigmoid(
-            self.gate(self.gate_norm(torch.cat((z_base, delta), dim=-1)))
-        )
+        input_features = torch.cat(feature_parts, dim=-1)
+        augmented = self.feature_projection(input_features)
         mask_bool = mask.to(device=z_base.device, dtype=torch.bool)
-        augmented = (z_base + gate * delta).masked_fill(
+        augmented = augmented.masked_fill(
             ~mask_bool.unsqueeze(-1), 0.0
         )
         if collect_aux:
-            aux["temporal_basis_delta"] = delta.masked_fill(
+            aux["temporal_basis_input_features"] = input_features.masked_fill(
                 ~mask_bool.unsqueeze(-1), 0.0
             )
-            aux["temporal_basis_gate"] = gate.masked_fill(
-                ~mask_bool.unsqueeze(-1), 0.0
-            )
+            aux["temporal_basis_output"] = augmented
         return augmented, aux
 
 
@@ -1389,8 +1330,6 @@ class TransformerBasePortfolioModel(nn.Module):
         temporal_query_mode: str = "full_then_last",
         temporal_basis_families: Sequence[str] | str | None = None,
         temporal_basis_components: int = 8,
-        temporal_basis_dropout: float = 0.0,
-        temporal_basis_gate_init: float = -2.0,
         cross_layers: int = 1,
         cross_heads: int = 4,
         cross_ffn_mult: int = 2,
@@ -1618,16 +1557,12 @@ class TransformerBasePortfolioModel(nn.Module):
         )
 
         self.temporal_pool_score = nn.Linear(self.d_model, 1) if self.temporal_pooling == "attention" else None
-        self.temporal_basis_encoder = (
-            TemporalMultiBasisEncoder(
+        self.temporal_basis_feature_encoder = (
+            TemporalBasisFeatureEncoder(
                 lookback=self.lookback,
                 dim=self.d_model,
                 families=self.temporal_basis_families,
                 components=self.temporal_basis_components,
-                dropout=float(temporal_basis_dropout),
-                gate_init=float(temporal_basis_gate_init),
-                norm_type=self.norm_type,
-                ffn_type=self.ffn_type,
             )
             if self.temporal_basis_families
             else None
@@ -2417,9 +2352,9 @@ class TransformerBasePortfolioModel(nn.Module):
         *,
         collect_aux: bool,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        if self.temporal_basis_encoder is None:
+        if self.temporal_basis_feature_encoder is None:
             return z_base, {}
-        return self.temporal_basis_encoder(
+        return self.temporal_basis_feature_encoder(
             temporal_source,
             z_base,
             safe_mask,
