@@ -32,15 +32,26 @@ def main() -> int:
     parser.add_argument("--output", type=Path, default=None)
     args = parser.parse_args()
     manifests = read_capture_manifests(args.capture_root, args.trade_date.isoformat())
-    if len(manifests) != 1:
-        raise RuntimeError(f"expected one FOP worker manifest, got {len(manifests)}")
-    manifest = manifests[0]
-    if manifest.get("source") != "shioaji_taifex_tick_bidask_v1":
-        raise RuntimeError("unexpected capture source")
-    if manifest.get("status") != "complete":
-        raise RuntimeError(f"capture status is not complete: {manifest.get('status')}")
-    if int(manifest.get("dropped_events", -1)) != 0:
-        raise RuntimeError("capture lost callback events")
+    if not manifests:
+        raise RuntimeError("no FOP worker manifests found")
+    expected_workers = {int(item.get("workers", 1)) for item in manifests}
+    if len(expected_workers) != 1 or len(manifests) != next(iter(expected_workers)):
+        raise RuntimeError(
+            f"incomplete FOP worker manifests: got={len(manifests)} "
+            f"declared={sorted(expected_workers)}"
+        )
+    capture_ids = {str(item.get("capture_id", "")) for item in manifests}
+    if len(capture_ids) != 1 or "" in capture_ids:
+        raise RuntimeError(f"FOP workers do not share one capture: {capture_ids}")
+    for manifest in manifests:
+        if manifest.get("source") != "shioaji_taifex_tick_bidask_v1":
+            raise RuntimeError("unexpected capture source")
+        if manifest.get("status") != "complete":
+            raise RuntimeError(
+                f"capture status is not complete: {manifest.get('status')}"
+            )
+        if int(manifest.get("dropped_events", -1)) != 0:
+            raise RuntimeError("capture lost callback events")
     paths = select_capture_part_paths(
         capture_root=args.capture_root,
         kind="book_events",
@@ -55,7 +66,11 @@ def main() -> int:
         & (pl.col("bid_volume_1") > 0)
         & (pl.col("ask_volume_1") > 0)
     )
-    metadata = manifest.get("contract_metadata", [])
+    metadata = [
+        row
+        for manifest in manifests
+        for row in manifest.get("contract_metadata", [])
+    ]
     expected_codes = sorted(
         {
             str(row["code"])
@@ -76,8 +91,11 @@ def main() -> int:
         "schema_version": 1,
         "status": "ok",
         "trade_date": args.trade_date.isoformat(),
-        "capture_id": manifest["capture_id"],
-        "simulation_account_environment": bool(manifest.get("simulation")),
+        "capture_id": next(iter(capture_ids)),
+        "simulation_account_environment": all(
+            bool(manifest.get("simulation")) for manifest in manifests
+        ),
+        "workers": len(manifests),
         "contracts": len(expected_codes),
         "book_rows": books.height,
         "valid_book_rows": valid.height,
@@ -86,8 +104,10 @@ def main() -> int:
         "transport_delay_ms_p99": float(transport_ms.quantile(0.99, "nearest")),
         "receive_ts_min_ns": int(valid["receive_ts_ns"].min()),
         "receive_ts_max_ns": int(valid["receive_ts_ns"].max()),
-        "dropped_events": int(manifest["dropped_events"]),
-        "queue_high_watermark": int(manifest["queue_high_watermark"]),
+        "dropped_events": sum(int(item["dropped_events"]) for item in manifests),
+        "queue_high_watermark": max(
+            int(item["queue_high_watermark"]) for item in manifests
+        ),
     }
     output = args.output or (
         args.capture_root / "audits" / f"{args.trade_date.isoformat()}.json"
