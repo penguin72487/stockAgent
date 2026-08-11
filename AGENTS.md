@@ -460,6 +460,14 @@ Rules:
   not evolve a second schema. A completed mode smoke test must pass
   `validate_completed_training_artifacts`; mode-specific details belong in
   namespaced checkpoint state and prefixed metrics, not new outer files.
+- A lifecycle may publish `state=complete` only when its completed fold IDs
+  exactly match the selected manifest IDs and the shared artifact gate passes.
+  The gate must fail closed on empty required files, inconsistent
+  manifest/progress/summary/fold identities, malformed or incomplete epoch
+  rows, missing canonical backtest ZIP members, and invalid plot signatures.
+  Keep this completion check structural and lightweight: do not import models,
+  execute checkpoint payloads, or decompress full-universe backtest arrays.
+  On failure, persist the same progress envelope with `state=failed`.
 - Market configs default to `training.multi_gpu_strategy: auto`: use the
   canonical single-device executor with one visible GPU and automatically
   relaunch torchrun/DDP with two or more visible GPUs. GPU visibility and

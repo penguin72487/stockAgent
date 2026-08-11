@@ -18,7 +18,10 @@ from downloader.stream_shioaji_tw_microstructure import (
     normalize_fop_tick,
     normalize_tick,
 )
-from downloader.stream_shioaji_taifex_bidask import select_option_strip
+from downloader.stream_shioaji_taifex_bidask import (
+    select_balanced_option_strips,
+    select_option_strip,
+)
 
 
 def test_taifex_capture_module_cli_imports_from_repo_root() -> None:
@@ -226,6 +229,54 @@ def test_option_strip_is_paired_bounded_and_nearest_atm() -> None:
         date(2026, 8, 12),
     }
     assert {item.strike_price for item in selected} == {20_000.0, 20_100.0}
+
+
+def test_balanced_option_strips_keep_only_nearest_monthly_and_weekly() -> None:
+    class Base:
+        def __init__(self, code: str) -> None:
+            self.code = code
+
+    class Info:
+        def __init__(
+            self, root: str, expiry: date, strike: float, right: str
+        ) -> None:
+            self.root = root
+            self.delivery_date = expiry
+            self.last_trading_date = expiry
+            self.strike_price = strike
+            self.option_right = right
+            self.base = Base(f"{root}-{expiry:%m%d}-{strike:.0f}-{right}")
+
+    infos = [
+        Info(root, expiry, strike, right)
+        for root, expiry in (
+            ("TX2", date(2026, 8, 12)),
+            ("TXV", date(2026, 8, 14)),
+            ("TXO", date(2026, 8, 19)),
+            ("TXO", date(2026, 9, 16)),
+        )
+        for strike in (19_900.0, 20_000.0, 20_100.0)
+        for right in ("C", "P")
+    ]
+    selected = select_balanced_option_strips(
+        infos,
+        trade_date=date(2026, 8, 11),
+        underlying_reference=20_030.0,
+        monthly_expiry_count=1,
+        weekly_expiry_count=1,
+        strikes_per_expiry=3,
+        max_pairs=5,
+    )
+    assert len(selected) == 10
+    selected_series = {(item.root, item.delivery_date) for item in selected}
+    assert selected_series == {
+        ("TX2", date(2026, 8, 12)),
+        ("TXO", date(2026, 8, 19)),
+    }
+    assert all(
+        item.strike_price in {19_900.0, 20_000.0, 20_100.0}
+        for item in selected
+    )
 
 
 def test_part_writer_uses_atomic_partitioned_parquet(tmp_path: Path) -> None:

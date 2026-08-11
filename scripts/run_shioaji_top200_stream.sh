@@ -18,6 +18,8 @@ RUN_ROOT="${SHIOAJI_MICRO_RUN_ROOT:-artifacts/data_capture/shioaji_top200}"
 CAPTURE_ROOT="${SHIOAJI_MICRO_CAPTURE_ROOT:-data_tw_microstructure/captures}"
 UNIVERSE="${SHIOAJI_MICRO_UNIVERSE:-data_tw_microstructure/universe/top_200.csv}"
 HFT_DATASET_ROOT="${SHIOAJI_HFT_DATASET_ROOT:-data_tw_microstructure/hft_dataset}"
+TAIFEX_PRIORITY_GATE="${SHIOAJI_TAIFEX_PRIORITY_GATE:-true}"
+TAIFEX_WORKERS="${SHIOAJI_TAIFEX_WORKERS:-3}"
 LOG_FILE="$RUN_ROOT/run.log"
 LOCK_FILE="$RUN_ROOT/runner.lock"
 mkdir -p "$RUN_ROOT"
@@ -63,6 +65,30 @@ print(max(1, int((target - now).total_seconds())))
 PY
 }
 
+wait_for_taifex_priority() {
+  if [[ "$TAIFEX_PRIORITY_GATE" != true ]]; then
+    echo "[shioaji-top200] priority_gate=disabled"
+    return 0
+  fi
+  local last_log=0
+  while true; do
+    local taifex_processes
+    taifex_processes="$(pgrep -fc '[p]ython .*downloader\.stream_shioaji_taifex_bidask' || true)"
+    if systemctl is-active --quiet stockagent-shioaji-taifex-bidask.service \
+      && (( taifex_processes >= TAIFEX_WORKERS )); then
+      echo "[shioaji-top200] priority_gate=taifex_collectors_running count=$taifex_processes"
+      return 0
+    fi
+    local now_epoch
+    now_epoch="$(date +%s)"
+    if (( now_epoch - last_log >= 60 )); then
+      echo "[shioaji-top200] waiting_seconds=5 reason=taifex_priority_gate"
+      last_log="$now_epoch"
+    fi
+    sleep 5
+  done
+}
+
 echo "[shioaji-top200] runner_started=$(TZ=Asia/Taipei date --iso-8601=seconds)"
 while true; do
   delay="$(seconds_until_capture_window)"
@@ -70,6 +96,8 @@ while true; do
     echo "[shioaji-top200] waiting_seconds=$delay reason=next_capture_window"
     sleep "$delay"
   fi
+
+  wait_for_taifex_priority
 
   trade_date="$(TZ=Asia/Taipei date +%F)"
   echo "[shioaji-top200] universe_refresh date=$trade_date"

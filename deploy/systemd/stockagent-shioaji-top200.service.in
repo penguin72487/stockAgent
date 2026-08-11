@@ -1,7 +1,8 @@
 [Unit]
 Description=StockAgent Shioaji Top-200 microstructure capture
 Wants=network-online.target time-sync.target
-After=network-online.target time-sync.target
+Requires=stockagent-shioaji-taifex-bidask.service
+After=network-online.target time-sync.target stockagent-shioaji-taifex-bidask.service
 StartLimitIntervalSec=300
 StartLimitBurst=5
 
@@ -13,6 +14,9 @@ WorkingDirectory=@REPO_ROOT@
 Environment="HOME=@SERVICE_HOME@"
 Environment="PYTHONUNBUFFERED=1"
 ExecStart=/usr/bin/bash "@REPO_ROOT@/scripts/run_shioaji_top200_stream.sh"
+Nice=5
+CPUWeight=50
+IOWeight=50
 Restart=on-failure
 RestartSec=30s
 TimeoutStopSec=90s

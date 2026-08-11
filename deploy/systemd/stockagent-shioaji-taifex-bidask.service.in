@@ -2,6 +2,7 @@
 Description=StockAgent Shioaji TAIFEX Tick and five-level BidAsk capture
 Wants=network-online.target time-sync.target
 After=network-online.target time-sync.target
+Before=stockagent-shioaji-top200.service
 StartLimitIntervalSec=300
 StartLimitBurst=5
 
@@ -13,6 +14,9 @@ WorkingDirectory=@REPO_ROOT@
 Environment="HOME=@SERVICE_HOME@"
 Environment="PYTHONUNBUFFERED=1"
 ExecStart=/usr/bin/bash "@REPO_ROOT@/scripts/run_shioaji_taifex_bidask_stream.sh"
+Nice=-5
+CPUWeight=200
+IOWeight=200
 Restart=on-failure
 RestartSec=30s
 TimeoutStopSec=90s

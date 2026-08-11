@@ -18,7 +18,7 @@ or any strategy is investable.
 | Causality | explicit fold ownership, split-local/panel-history lookbacks, execution-specific clocks | Strong contract; the active candle YAML is now consistently named as day-trade |
 | Mechanism | canonical tensor simulator, fees/taxes, Taiwan settlement and phase executors | Strong but high-complexity implementation |
 | Latency/deployability | lazy slabs, compile/DDP paths, live signal path | Capable; importing and calling the shared inference contract no longer loads trainer orchestration |
-| Reproducibility | checkpoint manifests, RNG/fold fingerprints, lifecycle artifacts | Strong run artifacts; environment runtime and repository-local metadata boundaries are now verified |
+| Reproducibility | checkpoint manifests, RNG/fold fingerprints, lifecycle artifacts | Strong run artifacts; completion now fails closed on partial fold coverage and malformed durable outputs |
 
 ## Measured inventory
 
@@ -41,8 +41,8 @@ shared runtime/live/checkpoint focused tests: 143 passed
 manifest/runtime extraction focused tests: 261 passed
 real CUDA NVFP4 forward/backward: 1 passed
 strict CUDA environment check: passed
-formal suite: 2731 passed, 1 skipped, 1 xfailed, 32 warnings
-formal suite elapsed: 273.50 seconds
+formal suite: 2733 passed, 1 skipped, 1 xfailed, 32 warnings
+formal suite elapsed: 266.13 seconds
 ```
 
 The focused set covered active trading/output configuration, inherited ablation
@@ -131,6 +131,27 @@ review adds a minimal `pyproject.toml`: default pytest discovery is `test/`, and
 default Ruff checks only execution-affecting errors. Full style cleanup remains
 separate because the legacy tree currently has about 190 broad Ruff findings.
 
+### Resolved P1 — Make training completion fail closed
+
+The former completed-artifact validator was only called explicitly by a smoke
+test and treated zero-byte checkpoints, models, backtests, and plots as valid.
+It inspected only the first epoch-curve row, so a later truncated row also
+produced a false green handoff.
+
+`TrainingRunLifecycle.complete()` now requires exact selected/completed fold
+coverage and automatically runs the shared conformance gate for real train
+groups. The gate checks non-empty artifacts, cross-file fold/mode identity,
+every curve row, the canonical NPZ member inventory, and PNG signatures. A
+failure returns `progress.json` to `state=failed` and raises instead of leaving
+a false completed run. The check reads only JSON, ZIP directories, and small
+file headers; it does not execute checkpoints or decompress large backtests.
+
+A real one-epoch `tw_minute` smoke and its second `resume=True` pass both
+completed under the new gate. Checkpoint/resume, minute, derivative-tick, mode
+adapter, and completion-marker focused tests passed (172 tests), followed by
+the full formal suite above. No return, fee, settlement, point-in-time mask, or
+checkpoint schema semantics changed.
+
 ### P2 — Decompose monoliths behind contracts
 
 The trainer, downloader, explainability module, and several tests are too large
@@ -183,6 +204,9 @@ for optional stacks instead of assuming package metadata implies importability.
 - Added regression coverage for empty attention rows, nested wrapper state,
   safe checkpoint payloads, canonical alias reuse, precision, and lazy live
   imports.
+- Made lifecycle completion validate exact fold coverage and durable artifact
+  structure automatically; added corrupt/partial-output and completed-resume
+  regression coverage.
 - Removed the invalid xFormers gitlink and machine-local Codex settings from Git
   tracking without deleting their local files; made VS Code task paths portable.
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Capture TX front-month and a bounded near-ATM TXO Tick/BidAsk strip."""
+"""Capture TX front-month and nearest monthly/weekly TXO Tick/BidAsk strips."""
 
 from __future__ import annotations
 
@@ -26,6 +26,7 @@ from downloader.stream_shioaji_tw_microstructure import (
 
 
 SOURCE_NAME = "shioaji_taifex_tick_bidask_v1"
+DEFAULT_OPTION_ROOTS = "TXO,TX1,TX2,TX4,TX5,TXU,TXV,TXX,TXY,TXZ"
 
 
 def parse_args() -> argparse.Namespace:
@@ -36,9 +37,20 @@ def parse_args() -> argparse.Namespace:
         default=Path("data_tw_index_derivatives_ticks/shioaji_fop_captures"),
     )
     parser.add_argument("--future-code", default="TXFR1")
-    parser.add_argument("--option-root", default="TXO")
-    parser.add_argument("--option-expiries", type=int, default=2)
-    parser.add_argument("--strikes-per-expiry", type=int, default=16)
+    parser.add_argument("--option-roots", default=DEFAULT_OPTION_ROOTS)
+    parser.add_argument(
+        "--option-expiries",
+        type=int,
+        default=1,
+        help="Number of nearest monthly TXO expiries to keep.",
+    )
+    parser.add_argument(
+        "--weekly-expiries",
+        type=int,
+        default=1,
+        help="Number of nearest weekly TXO expiries across all weekly roots to keep.",
+    )
+    parser.add_argument("--strikes-per-expiry", type=int, default=100)
     parser.add_argument("--underlying-reference", type=float, default=None)
     parser.add_argument("--stop-time", default="13:45:05")
     parser.add_argument("--queue-size", type=int, default=250_000)
@@ -48,6 +60,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--subscribe-interval", type=float, default=0.04)
     parser.add_argument("--simulation", action="store_true")
     parser.add_argument("--capture-id", default="")
+    parser.add_argument("--worker-index", type=int, default=0)
+    parser.add_argument("--workers", type=int, default=1)
     return parser.parse_args()
 
 
@@ -125,6 +139,93 @@ def select_option_strip(
     return selected
 
 
+def select_balanced_option_strips(
+    option_infos: Iterable[Any],
+    *,
+    trade_date: date,
+    underlying_reference: float,
+    monthly_expiry_count: int,
+    weekly_expiry_count: int,
+    strikes_per_expiry: int,
+    max_pairs: int,
+) -> list[Any]:
+    """Round-robin paired strikes across only the nearest monthly/weeklies."""
+
+    if not math.isfinite(underlying_reference) or underlying_reference <= 0.0:
+        raise ValueError("underlying_reference must be finite and positive")
+    if (
+        monthly_expiry_count < 1
+        or weekly_expiry_count < 1
+        or strikes_per_expiry < 1
+        or max_pairs < 1
+    ):
+        raise ValueError("expiry, strike, and pair limits must be positive")
+    grouped: dict[tuple[str, date], dict[float, dict[str, Any]]] = defaultdict(
+        lambda: defaultdict(dict)
+    )
+    for info in option_infos:
+        root = str(getattr(info, "root", "")).strip().upper()
+        delivery_date = getattr(info, "delivery_date", None)
+        last_trading_date = getattr(info, "last_trading_date", delivery_date)
+        if not root or not isinstance(delivery_date, date) or delivery_date < trade_date:
+            continue
+        if isinstance(last_trading_date, date) and last_trading_date < trade_date:
+            continue
+        try:
+            right = _option_right(getattr(info, "option_right", None))
+            strike = float(getattr(info, "strike_price"))
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(strike) and strike > 0.0:
+            grouped[(root, delivery_date)][strike][right] = info
+
+    paired_keys = {
+        key
+        for key, strikes in grouped.items()
+        if any({"C", "P"} <= set(rights) for rights in strikes.values())
+    }
+    monthly_keys = sorted(key for key in paired_keys if key[0] == "TXO")[
+        :monthly_expiry_count
+    ]
+    weekly_keys = sorted(
+        (key for key in paired_keys if key[0] != "TXO"),
+        key=lambda item: (item[1], item[0]),
+    )[:weekly_expiry_count]
+    if not monthly_keys:
+        raise RuntimeError("no unexpired paired monthly TXO series were available")
+    if not weekly_keys:
+        raise RuntimeError("no unexpired paired weekly TXO series were available")
+
+    series: list[tuple[tuple[str, date], list[float]]] = []
+    for key in sorted([*monthly_keys, *weekly_keys], key=lambda item: (item[1], item[0])):
+        strikes = [
+            strike
+            for strike, rights in grouped[key].items()
+            if {"C", "P"} <= set(rights)
+        ]
+        strikes.sort(key=lambda strike: (abs(strike - underlying_reference), strike))
+        if strikes:
+            series.append((key, strikes[:strikes_per_expiry]))
+    if not series:
+        raise RuntimeError("no unexpired paired TXO contracts were available")
+    if not any(key[0] != "TXO" for key, _strikes in series):
+        raise RuntimeError("no unexpired paired weekly TXO contracts were available")
+
+    selected_pairs: list[tuple[tuple[str, date], float]] = []
+    for offset in range(strikes_per_expiry):
+        for key, strikes in series:
+            if offset < len(strikes):
+                selected_pairs.append((key, strikes[offset]))
+                if len(selected_pairs) >= max_pairs:
+                    break
+        if len(selected_pairs) >= max_pairs:
+            break
+    selected: list[Any] = []
+    for key, strike in selected_pairs:
+        selected.extend([grouped[key][strike]["C"], grouped[key][strike]["P"]])
+    return selected
+
+
 def _metadata(info: Any, *, logical_code: str | None = None) -> dict[str, Any]:
     base = _base(info)
     security_type = str(_scalar(getattr(base, "security_type", "")))
@@ -163,6 +264,8 @@ def _stop_datetime(value: str) -> datetime:
 
 def main() -> int:
     args = parse_args()
+    if args.workers < 1 or not 0 <= args.worker_index < args.workers:
+        raise ValueError("worker-index must satisfy 0 <= worker-index < workers")
     capture_id = str(args.capture_id).strip() or f"single-{time.time_ns()}"
     if re.fullmatch(r"[A-Za-z0-9_.-]+", capture_id) is None:
         raise ValueError("capture-id contains unsupported characters")
@@ -181,7 +284,7 @@ def main() -> int:
     event_sequence = itertools.count(1)
     sink = EventSink(
         args.output_dir,
-        worker_index=0,
+        worker_index=int(args.worker_index),
         capture_id=capture_id,
         queue_size=int(args.queue_size),
         flush_rows=int(args.flush_rows),
@@ -216,15 +319,39 @@ def main() -> int:
         if args.underlying_reference is not None
         else float(getattr(future_info, "reference", 0.0) or 0.0)
     )
-    option_infos = api.contracts.options(str(args.option_root))
-    selected_option_infos = select_option_strip(
+    option_roots = tuple(
+        dict.fromkeys(
+            root.strip().upper()
+            for root in str(args.option_roots).split(",")
+            if root.strip()
+        )
+    )
+    if "TXO" not in option_roots:
+        api.logout()
+        raise ValueError("option-roots must include monthly root TXO")
+    option_infos: list[Any] = []
+    unavailable_roots: dict[str, str] = {}
+    for root in option_roots:
+        try:
+            option_infos.extend(api.contracts.options(root))
+        except Exception as exc:
+            unavailable_roots[root] = f"{type(exc).__name__}: {exc}"
+    max_contracts = int(args.workers) * 100
+    selected_option_infos = select_balanced_option_strips(
         option_infos,
         trade_date=datetime.now(TAIPEI).date(),
         underlying_reference=reference,
-        expiry_count=int(args.option_expiries),
+        monthly_expiry_count=int(args.option_expiries),
+        weekly_expiry_count=int(args.weekly_expiries),
         strikes_per_expiry=int(args.strikes_per_expiry),
+        max_pairs=(max_contracts - 1) // 2,
     )
-    selected_infos = [future_info, *selected_option_infos]
+    all_selected_infos = [future_info, *selected_option_infos]
+    selected_infos = [
+        info
+        for index, info in enumerate(all_selected_infos)
+        if index % int(args.workers) == int(args.worker_index)
+    ]
     contracts = [_base(info) for info in selected_infos]
     subscriptions_requested = len(contracts) * 2
     if subscriptions_requested > 200:
@@ -236,9 +363,11 @@ def main() -> int:
     contract_metadata = [
         _metadata(
             info,
-            logical_code=(str(args.future_code) if index == 0 else None),
+            logical_code=(
+                str(args.future_code) if info is future_info else None
+            ),
         )
-        for index, info in enumerate(selected_infos)
+        for info in selected_infos
     ]
 
     @api.on_tick_fop_v1()
@@ -251,7 +380,7 @@ def main() -> int:
                 normalize_fop_tick(
                     tick,
                     event_seq=next(event_sequence),
-                    worker_index=0,
+                    worker_index=int(args.worker_index),
                     receive_ts_ns=receive_ts_ns,
                     receive_monotonic_ns=receive_monotonic_ns,
                 ),
@@ -269,7 +398,7 @@ def main() -> int:
                 normalize_fop_book(
                     book,
                     event_seq=next(event_sequence),
-                    worker_index=0,
+                    worker_index=int(args.worker_index),
                     receive_ts_ns=receive_ts_ns,
                     receive_monotonic_ns=receive_monotonic_ns,
                 ),
@@ -299,7 +428,8 @@ def main() -> int:
             if args.subscribe_interval:
                 time.sleep(float(args.subscribe_interval))
         print(
-            f"[shioaji-taifex] contracts={len(contracts)} "
+            f"[shioaji-taifex] worker={args.worker_index}/{args.workers} "
+            f"contracts={len(contracts)} "
             f"subscriptions={subscribed} reference={reference} stop_at={stop_at}",
             flush=True,
         )
@@ -328,16 +458,20 @@ def main() -> int:
             "status": status,
             "capture_id": capture_id,
             "simulation": bool(args.simulation),
-            "worker_index": 0,
-            "workers": 1,
+            "worker_index": int(args.worker_index),
+            "workers": int(args.workers),
             "trade_date": datetime.now(TAIPEI).date().isoformat(),
             "selection": {
                 "future_code": str(args.future_code),
                 "resolved_future_code": str(getattr(future_base, "code")),
-                "option_root": str(args.option_root),
-                "option_expiries": int(args.option_expiries),
+                "option_roots": list(option_roots),
+                "unavailable_option_roots": unavailable_roots,
+                "selection_policy": "nearest_monthly_and_nearest_weekly_atm_outward",
+                "monthly_option_expiries": int(args.option_expiries),
+                "weekly_option_expiries": int(args.weekly_expiries),
                 "strikes_per_expiry": int(args.strikes_per_expiry),
                 "underlying_reference": reference,
+                "selected_contracts_all_workers": len(all_selected_infos),
             },
             "contract_metadata": contract_metadata,
             "contract_count": len(contracts),
@@ -361,7 +495,7 @@ def main() -> int:
             args.output_dir
             / "manifests"
             / f"trade_date={datetime.now(TAIPEI).date()}"
-            / "worker=00.json"
+            / f"worker={int(args.worker_index):02d}.json"
         )
         _atomic_json(manifest_path, manifest)
         print(

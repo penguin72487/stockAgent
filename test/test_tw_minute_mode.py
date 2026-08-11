@@ -1898,3 +1898,15 @@ def test_minute_training_reuses_canonical_group_artifacts(
     )
     conformance.require()
     assert results[0]["status"] == "complete"
+
+    resumed = run_minute_training(
+        config,
+        output_dir=output_dir,
+        mode="train",
+        resume=True,
+        start_fold=None,
+        max_folds=1,
+        active_strategy="none",
+    )
+    assert resumed[0]["status"] == "complete"
+    assert resumed[0]["fold_id"] == 1

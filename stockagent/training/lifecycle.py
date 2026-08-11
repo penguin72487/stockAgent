@@ -16,6 +16,7 @@ import math
 from pathlib import Path
 import time
 from typing import Any, Iterable, Mapping, Sequence
+import zipfile
 
 from stockagent.training.mode_adapter import (
     TrainingModeSpec,
@@ -193,7 +194,14 @@ def validate_completed_training_artifacts(
     require_plots: bool = True,
     require_epoch_curve: bool = True,
 ) -> ArtifactConformance:
-    """Check files whose names and locations must not vary by training mode."""
+    """Fail closed on incomplete or internally inconsistent run artifacts.
+
+    This validator deliberately stays model-free: it verifies the durable
+    lifecycle envelope and container structure without importing PyTorch or
+    executing checkpoint payloads.  Tensor/checkpoint semantics remain owned
+    by the checkpoint loaders, while this gate prevents empty, truncated, or
+    cross-run files from being advertised as a completed training run.
+    """
 
     layout = TrainingArtifactLayout(Path(root))
     fold_id_values = [int(fold_id) for fold_id in fold_ids]
@@ -215,6 +223,21 @@ def validate_completed_training_artifacts(
     missing = tuple(path for path in checked if not path.is_file())
     invalid: list[str] = []
 
+    def has_content(path: Path) -> bool:
+        try:
+            return path.is_file() and path.stat().st_size > 0
+        except OSError:
+            return False
+
+    for path in checked:
+        if not path.is_file():
+            continue
+        try:
+            if path.stat().st_size <= 0:
+                invalid.append(f"{path}: required artifact is empty")
+        except OSError as exc:
+            invalid.append(f"{path}: cannot stat artifact ({type(exc).__name__})")
+
     def read_json(path: Path) -> Any | None:
         if not path.is_file():
             return None
@@ -225,11 +248,34 @@ def validate_completed_training_artifacts(
             return None
 
     manifest = read_json(layout.run_manifest_path)
+    manifest_execution_mode: str | None = None
     if isinstance(manifest, dict):
-        if manifest.get("lifecycle_schema_version") != TRAINING_LIFECYCLE_SCHEMA_VERSION:
+        if manifest.get("schema_version") != TRAINING_LIFECYCLE_SCHEMA_VERSION:
+            invalid.append(f"{layout.run_manifest_path}: manifest schema mismatch")
+        if (
+            manifest.get("lifecycle_schema_version")
+            != TRAINING_LIFECYCLE_SCHEMA_VERSION
+        ):
             invalid.append(f"{layout.run_manifest_path}: lifecycle schema mismatch")
         if manifest.get("artifact_layout_version") != TRAINING_ARTIFACT_LAYOUT_VERSION:
             invalid.append(f"{layout.run_manifest_path}: artifact layout mismatch")
+        manifest_execution_mode = str(manifest.get("execution_mode", "")).strip()
+        if not manifest_execution_mode:
+            invalid.append(f"{layout.run_manifest_path}: execution mode is missing")
+        try:
+            selected_fold_ids = sorted(
+                int(value) for value in manifest.get("selected_fold_ids", [])
+            )
+        except (TypeError, ValueError):
+            selected_fold_ids = []
+            invalid.append(
+                f"{layout.run_manifest_path}: selected_fold_ids must be integers"
+            )
+        if selected_fold_ids != sorted(set(fold_id_values)):
+            invalid.append(
+                f"{layout.run_manifest_path}: selected fold ids do not match "
+                f"requested folds {sorted(set(fold_id_values))}"
+            )
     elif manifest is not None:
         invalid.append(f"{layout.run_manifest_path}: expected a JSON object")
 
@@ -239,19 +285,101 @@ def validate_completed_training_artifacts(
             invalid.append(f"{layout.progress_path}: progress schema mismatch")
         if progress.get("state") != "complete" or progress.get("phase") != "complete":
             invalid.append(f"{layout.progress_path}: lifecycle is not complete")
+        try:
+            completed_fold_ids = sorted(
+                int(value)
+                for value in progress.get("fold", {}).get("completed_ids", [])
+            )
+        except (AttributeError, TypeError, ValueError):
+            completed_fold_ids = []
+            invalid.append(
+                f"{layout.progress_path}: completed fold ids must be integers"
+            )
+        if completed_fold_ids != sorted(set(fold_id_values)):
+            invalid.append(
+                f"{layout.progress_path}: completed fold ids do not match "
+                f"requested folds {sorted(set(fold_id_values))}"
+            )
     elif progress is not None:
         invalid.append(f"{layout.progress_path}: expected a JSON object")
 
     summary = read_json(layout.summary_path)
-    if summary is not None and not isinstance(summary, list):
+    if isinstance(summary, list):
+        try:
+            summary_fold_ids = sorted(
+                int(row["fold_id"]) for row in summary if isinstance(row, dict)
+            )
+        except (KeyError, TypeError, ValueError):
+            summary_fold_ids = []
+            invalid.append(
+                f"{layout.summary_path}: every summary row requires an integer fold_id"
+            )
+        if len(summary_fold_ids) != len(summary):
+            invalid.append(f"{layout.summary_path}: summary rows must be JSON objects")
+        if len(summary_fold_ids) != len(set(summary_fold_ids)):
+            invalid.append(f"{layout.summary_path}: summary fold ids are duplicated")
+        missing_summary_fold_ids = sorted(set(fold_id_values) - set(summary_fold_ids))
+        if missing_summary_fold_ids:
+            invalid.append(
+                f"{layout.summary_path}: summary is missing requested folds "
+                f"{missing_summary_fold_ids}"
+            )
+    elif summary is not None:
         invalid.append(f"{layout.summary_path}: expected a JSON array")
+
+    required_backtest_entries = {
+        "artifact_schema_version.npy",
+        "execution_mode.npy",
+        "strategy_returns.npy",
+        "benchmark_returns.npy",
+        "turnovers.npy",
+        "weights_history.npy",
+        "dates.npy",
+    }
+
+    def validate_backtest_container(path: Path) -> None:
+        if not has_content(path):
+            return
+        try:
+            with zipfile.ZipFile(path) as archive:
+                names = set(archive.namelist())
+        except (OSError, zipfile.BadZipFile) as exc:
+            invalid.append(f"{path}: invalid backtest container ({type(exc).__name__})")
+            return
+        missing_entries = sorted(required_backtest_entries - names)
+        if missing_entries:
+            invalid.append(f"{path}: missing backtest entries {missing_entries}")
+
+    def validate_png(path: Path) -> None:
+        if not has_content(path):
+            return
+        try:
+            with path.open("rb") as handle:
+                signature = handle.read(8)
+        except OSError as exc:
+            invalid.append(f"{path}: cannot read PNG ({type(exc).__name__})")
+            return
+        if signature != b"\x89PNG\r\n\x1a\n":
+            invalid.append(f"{path}: invalid PNG signature")
 
     for fold_id in fold_id_values:
         contract_path = layout.fold_dir(fold_id) / "mode_artifact_contract.json"
         contract = read_json(contract_path)
         if isinstance(contract, dict):
-            if contract.get("artifact_layout_version") != TRAINING_ARTIFACT_LAYOUT_VERSION:
+            if contract.get("schema_version") != TRAINING_LIFECYCLE_SCHEMA_VERSION:
+                invalid.append(f"{contract_path}: lifecycle schema mismatch")
+            if (
+                contract.get("artifact_layout_version")
+                != TRAINING_ARTIFACT_LAYOUT_VERSION
+            ):
                 invalid.append(f"{contract_path}: artifact layout mismatch")
+            if (
+                manifest_execution_mode is not None
+                and contract.get("execution_mode") != manifest_execution_mode
+            ):
+                invalid.append(
+                    f"{contract_path}: execution mode disagrees with run manifest"
+                )
         elif contract is not None:
             invalid.append(f"{contract_path}: expected a JSON object")
         complete_path = layout.fold_complete_path(fold_id)
@@ -259,23 +387,133 @@ def validate_completed_training_artifacts(
         if isinstance(complete, dict):
             if complete.get("status") != "complete":
                 invalid.append(f"{complete_path}: fold is not complete")
+            try:
+                marker_fold_id = int(complete.get("fold_id"))
+            except (TypeError, ValueError):
+                marker_fold_id = -1
+            if marker_fold_id != fold_id:
+                invalid.append(f"{complete_path}: fold id mismatch")
+            try:
+                artifact_scope_version = int(complete.get("artifact_scope_version", 0))
+            except (TypeError, ValueError):
+                artifact_scope_version = 0
+            if artifact_scope_version < 2:
+                invalid.append(f"{complete_path}: artifact scope is obsolete")
+            if complete.get("test_scope") != "full_horizon":
+                invalid.append(f"{complete_path}: test scope is not full_horizon")
+            if complete.get("deployment_scope") != "stitched_deployment":
+                invalid.append(
+                    f"{complete_path}: deployment scope is not stitched_deployment"
+                )
         elif complete is not None:
             invalid.append(f"{complete_path}: expected a JSON object")
 
+        metrics_path = layout.fold_dir(fold_id) / "metrics.json"
+        metrics = read_json(metrics_path)
+        if isinstance(metrics, dict):
+            try:
+                metrics_fold_id = int(metrics.get("fold_id"))
+            except (TypeError, ValueError):
+                metrics_fold_id = -1
+            if metrics_fold_id != fold_id:
+                invalid.append(f"{metrics_path}: fold id mismatch")
+        elif metrics is not None:
+            invalid.append(f"{metrics_path}: expected a JSON object")
+
+        plot_timing_path = layout.fold_dir(fold_id) / "plot_timing.json"
+        plot_timing = read_json(plot_timing_path)
+        if plot_timing is not None and not isinstance(plot_timing, dict):
+            invalid.append(f"{plot_timing_path}: expected a JSON object")
+
+        validate_backtest_container(layout.fold_dir(fold_id) / "test_backtest.npz")
+        validate_backtest_container(
+            layout.fold_dir(fold_id) / "deployment_test_backtest.npz"
+        )
+        if require_plots:
+            for name in (
+                "equity_curve.png",
+                "equity_curve_log.png",
+                "annual_performance.png",
+            ):
+                validate_png(layout.fold_dir(fold_id) / name)
+
     for group_name in group_name_values:
+        timing_path = layout.group_pre_epoch_timing_path(group_name)
+        if has_content(timing_path):
+            try:
+                timing_rows = [
+                    json.loads(line)
+                    for line in timing_path.read_text(encoding="utf-8").splitlines()
+                    if line.strip()
+                ]
+                if not timing_rows or not all(
+                    isinstance(row, dict) for row in timing_rows
+                ):
+                    invalid.append(
+                        f"{timing_path}: pre-epoch timing must contain JSON objects"
+                    )
+            except (OSError, json.JSONDecodeError) as exc:
+                invalid.append(
+                    f"{timing_path}: invalid pre-epoch timing ({type(exc).__name__})"
+                )
+
         curve_path = layout.group_curve_path(group_name)
         if require_epoch_curve and curve_path.is_file():
             try:
-                first_line = next(
-                    line.strip()
+                curve_rows = [
+                    json.loads(line)
                     for line in curve_path.read_text(encoding="utf-8").splitlines()
                     if line.strip()
+                ]
+                required_curve_fields = {
+                    "schema_version",
+                    "epoch",
+                    "train_loss",
+                    "val_mean",
+                    "test_mean",
+                    "lr",
+                    "no_improve",
+                    "best_val_loss",
+                    "improved",
+                    "epoch_total_s",
+                }
+                epochs: list[int] = []
+                if not curve_rows:
+                    invalid.append(f"{curve_path}: epoch curve is empty")
+                for row_index, curve_row in enumerate(curve_rows, start=1):
+                    if not isinstance(curve_row, dict):
+                        invalid.append(
+                            f"{curve_path}: row {row_index} is not a JSON object"
+                        )
+                        continue
+                    if (
+                        curve_row.get("schema_version")
+                        != TRAINING_EPOCH_CURVE_SCHEMA_VERSION
+                    ):
+                        invalid.append(f"{curve_path}: row {row_index} schema mismatch")
+                    missing_fields = sorted(required_curve_fields - set(curve_row))
+                    if missing_fields:
+                        invalid.append(
+                            f"{curve_path}: row {row_index} missing core fields "
+                            f"{missing_fields}"
+                        )
+                    try:
+                        epoch = int(curve_row.get("epoch"))
+                    except (TypeError, ValueError):
+                        epoch = 0
+                    if epoch < 1:
+                        invalid.append(
+                            f"{curve_path}: row {row_index} has invalid epoch"
+                        )
+                    epochs.append(epoch)
+                if epochs != sorted(set(epochs)):
+                    invalid.append(
+                        f"{curve_path}: epochs must be strictly increasing and unique"
+                    )
+            except (OSError, json.JSONDecodeError, AttributeError) as exc:
+                invalid.append(
+                    f"{curve_path}: invalid epoch curve ({type(exc).__name__})"
                 )
-                curve_row = json.loads(first_line)
-                if curve_row.get("schema_version") != TRAINING_EPOCH_CURVE_SCHEMA_VERSION:
-                    invalid.append(f"{curve_path}: epoch curve schema mismatch")
-            except (OSError, json.JSONDecodeError, StopIteration, AttributeError) as exc:
-                invalid.append(f"{curve_path}: invalid epoch curve ({type(exc).__name__})")
 
     return ArtifactConformance(
         checked=tuple(checked),
@@ -367,6 +605,7 @@ class TrainingRunLifecycle:
         self._last_progress_write_monotonic = float("-inf")
         self._progress: dict[str, Any] = self._initial_progress()
         self._manifest: dict[str, Any] | None = None
+        self._group_names: list[str] = []
 
     def _initial_progress(self) -> dict[str, Any]:
         return {
@@ -460,6 +699,7 @@ class TrainingRunLifecycle:
             "started_at": self._started_at,
         }
         self._manifest = manifest
+        self._group_names = []
         self._progress["fold"]["selected_ids"] = selected_fold_ids
         self._progress["fold"]["total"] = len(selected_fold_ids)
         if self.writer_enabled:
@@ -481,6 +721,8 @@ class TrainingRunLifecycle:
         message: str | None = None,
     ) -> None:
         self.layout.group_dir(group_name)  # validate the component before writing it
+        if group_name not in self._group_names:
+            self._group_names.append(group_name)
         fold_ids = [int(fold_id) for fold_id in fold_ids]
         self._progress.update(
             {
@@ -628,8 +870,36 @@ class TrainingRunLifecycle:
             message=f"fold {fold_id} artifacts complete",
         )
 
-    def complete(self, *, fold_ids: Iterable[int], message: str | None = None) -> None:
+    def complete(
+        self,
+        *,
+        fold_ids: Iterable[int],
+        message: str | None = None,
+    ) -> None:
         completed = sorted({int(fold_id) for fold_id in fold_ids})
+        expected = sorted(
+            {
+                int(fold_id)
+                for fold_id in (
+                    []
+                    if self._manifest is None
+                    else self._manifest.get("selected_fold_ids", [])
+                )
+            }
+        )
+        if self._manifest is None:
+            error = RuntimeError(
+                "training lifecycle cannot complete before its manifest starts"
+            )
+            self.fail(error)
+            raise error
+        if completed != expected:
+            error = RuntimeError(
+                "training lifecycle cannot complete with partial fold coverage: "
+                f"expected={expected} completed={completed}"
+            )
+            self.fail(error)
+            raise error
         self._progress["fold"]["completed_ids"] = completed
         self._progress["fold"]["id"] = completed[-1] if completed else None
         self.set_phase(
@@ -639,6 +909,20 @@ class TrainingRunLifecycle:
             work_unit="fold",
             message=message or "training lifecycle complete",
         )
+        if not self.writer_enabled or not self._group_names:
+            return
+        conformance = validate_completed_training_artifacts(
+            self.layout.root,
+            fold_ids=completed,
+            group_names=self._group_names,
+        )
+        if conformance.ok:
+            return
+        try:
+            conformance.require()
+        except RuntimeError as error:
+            self.fail(error)
+            raise
 
     def fail(self, error: BaseException) -> None:
         self._progress["failure"] = {

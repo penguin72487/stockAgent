@@ -93,6 +93,17 @@ updates), so monitoring does not become a training bottleneck.
 may append prefixed flat fields such as `minute_cache_gib`; it cannot replace
 the core with a nested or differently named record.
 
+Completion is a checked state transition, not a final log message.
+`TrainingRunLifecycle.complete()` requires the completed fold set to equal the
+manifest's selected fold set, writes the candidate complete envelope, and then
+runs the shared artifact conformance gate.  The gate verifies non-empty
+required files, run/progress/summary/fold identity, every epoch-curve row,
+canonical backtest ZIP members, and PNG signatures.  If any check fails,
+`progress.json` is atomically returned to the same envelope with
+`state=failed`; a partial run is never left advertised as complete.  This is a
+lightweight structural check: it does not import a model, execute a checkpoint,
+or decompress large backtest arrays.
+
 ## Shared outer lifecycle
 
 The canonical numerical implementation remains in
@@ -194,8 +205,9 @@ turnover or concentration.  Equal field names do not imply equal units.
    benchmark change does not silently reuse stale plots or unnecessarily resume
    an optimizer under a changed execution contract.
 7. Add causality, accounting, gradient, permission, checkpoint, registry, and
-   old-mode regression tests.  Run
-   `validate_completed_training_artifacts(...)` in the end-to-end smoke test.
+   old-mode regression tests.  The runner's final lifecycle transition invokes
+   `validate_completed_training_artifacts(...)`; also assert it directly in the
+   end-to-end smoke test so the artifact contract is visible in test failures.
 
 Adding `minute_progress.json`, `checkpoint_latest.pt`, a new nested curve
 format, or another terminal progress renderer is a failed abstraction: the
