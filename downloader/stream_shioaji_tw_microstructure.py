@@ -18,6 +18,8 @@ from zoneinfo import ZoneInfo
 
 import polars as pl
 
+from stockagent.data.taifex_sessions import taifex_trading_date
+
 
 TAIPEI = ZoneInfo("Asia/Taipei")
 SOURCE_NAME = "shioaji_streaming_v1"
@@ -283,7 +285,7 @@ def normalize_fop_tick(
         "worker_index": worker_index,
         "exchange": "TAIFEX",
         "code": str(values["code"]),
-        "trade_date": localized.date(),
+        "trade_date": taifex_trading_date(localized),
         "exchange_ts_ns": exchange_ts_ns,
         "receive_ts_ns": receive_ts_ns,
         "receive_monotonic_ns": receive_monotonic_ns,
@@ -328,7 +330,7 @@ def normalize_fop_book(
         "worker_index": worker_index,
         "exchange": "TAIFEX",
         "code": str(values["code"]),
-        "trade_date": localized.date(),
+        "trade_date": taifex_trading_date(localized),
         "exchange_ts_ns": exchange_ts_ns,
         "receive_ts_ns": receive_ts_ns,
         "receive_monotonic_ns": receive_monotonic_ns,
@@ -489,8 +491,13 @@ class EventSink:
 
     def _emit_snapshots(self, second: int) -> None:
         snapshot_ns = second * 1_000_000_000
-        snapshot_date = datetime.fromtimestamp(snapshot_ns / 1e9, tz=TAIPEI).date()
+        snapshot_datetime = datetime.fromtimestamp(snapshot_ns / 1e9, tz=TAIPEI)
         for book in self.latest_books.values():
+            snapshot_date = (
+                taifex_trading_date(snapshot_datetime)
+                if book["exchange"] == "TAIFEX"
+                else snapshot_datetime.date()
+            )
             if book["trade_date"] != snapshot_date:
                 continue
             age_ms = max(0.0, (snapshot_ns - int(book["receive_ts_ns"])) / 1e6)

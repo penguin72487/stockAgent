@@ -371,6 +371,25 @@ def test_all_active_tw_features_have_machine_checked_availability() -> None:
     assert summary["unexpected_panel_shifts"] == []
 
 
+def test_day_trade_features_fail_closed_without_double_availability_lag() -> None:
+    config = load_config("configs/markets/tw_day_trade_10m.yaml")
+
+    summary, findings = audit_feature_availability_contract(config)
+
+    assert findings == []
+    assert summary["selected_features"] == 24
+    assert summary["active_features"] == 24
+    assert summary["pre_close_active_features"] == [
+        "next_session_open_gap_logret",
+        "open_logret_1d",
+    ]
+    assert summary["post_close_active_features"] == []
+    assert summary["post_close_selected_features"] == []
+    assert summary["zero_filled_features"] == []
+    assert summary["unclassified_active_features"] == []
+    assert audit_feature_lineage_registry(config) == []
+
+
 def test_availability_audit_rejects_missing_or_unjustified_panel_shift() -> None:
     config = load_config("configs/markets/tw_public.yaml")
     config.data.allow_same_close_feature_approximation = False

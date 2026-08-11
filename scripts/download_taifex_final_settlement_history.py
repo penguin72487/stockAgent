@@ -28,15 +28,19 @@ from scripts.taifex_daily_download_common import (  # noqa: E402
 )
 
 
-TAIFEX_FINAL_SETTLEMENT_PAGE: Final[str] = (
-    "https://www.taifex.com.tw/cht/5/optIndxFSP"
-)
+TAIFEX_FINAL_SETTLEMENT_PAGE: Final[str] = "https://www.taifex.com.tw/cht/5/optIndxFSP"
 TAIFEX_TXO_COMMODITY_ID: Final[str] = "2"
 OUTPUT_SCHEMA_VERSION: Final[int] = 1
 
 
-def _download_html(url: str, target: Path, *, attempts: int = 3) -> Path:
-    if target.is_file() and target.stat().st_size > 1_000:
+def _download_html(
+    url: str,
+    target: Path,
+    *,
+    attempts: int = 3,
+    refresh: bool = False,
+) -> Path:
+    if not refresh and target.is_file() and target.stat().st_size > 1_000:
         return target
     target.parent.mkdir(parents=True, exist_ok=True)
     last_error: Exception | None = None
@@ -46,9 +50,7 @@ def _download_html(url: str, target: Path, *, attempts: int = 3) -> Path:
         try:
             http_request = request.Request(
                 url,
-                headers={
-                    "User-Agent": "stockAgent/taifex-final-settlement-research"
-                },
+                headers={"User-Agent": "stockAgent/taifex-final-settlement-research"},
             )
             with request.urlopen(http_request, timeout=120) as response:
                 body = response.read()
@@ -106,9 +108,7 @@ def parse_taifex_txo_final_settlement_html(
     table["settlement_date"] = pd.to_datetime(
         table["settlement_date"], format="%Y/%m/%d", errors="coerce"
     ).dt.date
-    table["option_series"] = (
-        table["option_series"].astype(str).str.strip().str.upper()
-    )
+    table["option_series"] = table["option_series"].astype(str).str.strip().str.upper()
     table["final_settlement_price"] = pd.to_numeric(
         table["final_settlement_price"], errors="coerce"
     )
@@ -118,9 +118,7 @@ def parse_taifex_txo_final_settlement_html(
         & table["final_settlement_price"].gt(0.0)
     ].copy()
     valid = valid.loc[
-        valid["settlement_date"].map(
-            lambda value: start_date <= value <= end_date
-        )
+        valid["settlement_date"].map(lambda value: start_date <= value <= end_date)
     ]
     if valid.empty:
         raise ValueError("official TAIFEX page produced no valid TXO settlements")
@@ -154,6 +152,11 @@ def main() -> int:
     parser.add_argument(
         "--output-dir", type=Path, default=Path("data_tw_index_options_daily")
     )
+    parser.add_argument(
+        "--refresh",
+        action="store_true",
+        help="replace the mutable current-period HTML receipt with a fresh response",
+    )
     args = parser.parse_args()
     if args.end_date < args.start_date:
         parser.error("--end-date precedes --start-date")
@@ -167,10 +170,15 @@ def main() -> int:
     }
     source_url = f"{TAIFEX_FINAL_SETTLEMENT_PAGE}?{parse.urlencode(query)}"
     output_dir = args.output_dir.expanduser().resolve()
-    raw_path = output_dir / "raw" / "final_settlement" / (
-        f"{args.start_date.strftime('%Y-%m')}_{args.end_date.strftime('%Y-%m')}_TXO.html"
+    raw_path = (
+        output_dir
+        / "raw"
+        / "final_settlement"
+        / (
+            f"{args.start_date.strftime('%Y-%m')}_{args.end_date.strftime('%Y-%m')}_TXO.html"
+        )
     )
-    _download_html(source_url, raw_path)
+    _download_html(source_url, raw_path, refresh=bool(args.refresh))
     source_sha256 = sha256_path(raw_path)
     frame = parse_taifex_txo_final_settlement_html(
         raw_path.read_bytes(),

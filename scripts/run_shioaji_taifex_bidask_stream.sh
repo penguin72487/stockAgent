@@ -40,11 +40,15 @@ run_fintech_python -c 'import downloader.stream_shioaji_taifex_bidask'
 RUN_ROOT="${SHIOAJI_TAIFEX_RUN_ROOT:-artifacts/data_capture/shioaji_taifex_bidask}"
 CAPTURE_ROOT="${SHIOAJI_TAIFEX_CAPTURE_ROOT:-data_tw_index_derivatives_ticks/shioaji_fop_captures}"
 FUTURE_CODE="${SHIOAJI_TAIFEX_FUTURE_CODE:-TXFR1}"
+HEDGE_FUTURE_CODE="${SHIOAJI_TAIFEX_HEDGE_FUTURE_CODE:-MXFR1}"
 OPTION_ROOTS="${SHIOAJI_TAIFEX_OPTION_ROOTS:-TXO,TX1,TX2,TX4,TX5,TXU,TXV,TXX,TXY,TXZ}"
 OPTION_EXPIRIES="${SHIOAJI_TAIFEX_OPTION_EXPIRIES:-1}"
 WEEKLY_EXPIRIES="${SHIOAJI_TAIFEX_WEEKLY_EXPIRIES:-1}"
 STRIKES_PER_EXPIRY="${SHIOAJI_TAIFEX_STRIKES_PER_EXPIRY:-100}"
 WORKERS="${SHIOAJI_TAIFEX_WORKERS:-3}"
+EXECUTE_STRATEGIES="${SHIOAJI_TAIFEX_EXECUTE_STRATEGIES:-true}"
+STRATEGY_STATE_DIR="${SHIOAJI_TAIFEX_STRATEGY_STATE_DIR:-artifacts/live/shioaji_taifex_volatility_simulation}"
+FINAL_SETTLEMENT_PATH="${SHIOAJI_TAIFEX_FINAL_SETTLEMENT_PATH:-data_tw_index_options_daily/txo_final_settlement_history.parquet}"
 LOG_FILE="$RUN_ROOT/run.log"
 LOCK_FILE="$RUN_ROOT/runner.lock"
 mkdir -p "$RUN_ROOT"
@@ -95,7 +99,12 @@ if (( WORKERS < 1 || WORKERS > 3 )); then
   exit 2
 fi
 
-echo "[shioaji-taifex] runner_started=$(TZ=Asia/Taipei date --iso-8601=seconds) credential_source=$CREDENTIAL_SOURCE future=$FUTURE_CODE option_roots=$OPTION_ROOTS monthly_expiries=$OPTION_EXPIRIES weekly_expiries=$WEEKLY_EXPIRIES strikes_per_expiry=$STRIKES_PER_EXPIRY workers=$WORKERS"
+if [[ "$EXECUTE_STRATEGIES" != true && "$EXECUTE_STRATEGIES" != false ]]; then
+  echo "[shioaji-taifex] SHIOAJI_TAIFEX_EXECUTE_STRATEGIES must be true or false" >&2
+  exit 2
+fi
+
+echo "[shioaji-taifex] runner_started=$(TZ=Asia/Taipei date --iso-8601=seconds) credential_source=$CREDENTIAL_SOURCE future=$FUTURE_CODE hedge_future=$HEDGE_FUTURE_CODE option_roots=$OPTION_ROOTS monthly_expiries=$OPTION_EXPIRIES weekly_expiries=$WEEKLY_EXPIRIES strikes_per_expiry=$STRIKES_PER_EXPIRY workers=$WORKERS execute_strategies=$EXECUTE_STRATEGIES"
 while true; do
   delay="$(seconds_until_capture_window)"
   if (( delay > 0 )); then
@@ -103,17 +112,37 @@ while true; do
     sleep "$delay"
   fi
   trade_date="$(TZ=Asia/Taipei date +%F)"
+  if [[ "$EXECUTE_STRATEGIES" == true ]]; then
+    settlement_end="$(TZ=Asia/Taipei date -d yesterday +%F)"
+    echo "[shioaji-taifex] final_settlement_refresh_end=$settlement_end"
+    if ! run_fintech_python scripts/download_taifex_final_settlement_history.py \
+      --start-date 2012-11-01 \
+      --end-date "$settlement_end" \
+      --refresh; then
+      echo "[shioaji-taifex] final_settlement_refresh_failed end=$settlement_end strategy_will_fail_closed_if_needed" >&2
+    fi
+  fi
   capture_id="$(run_fintech_python -c 'import uuid; print(uuid.uuid4().hex)')"
   echo "[shioaji-taifex] capture_start=$(TZ=Asia/Taipei date --iso-8601=seconds) capture_id=$capture_id"
   worker_pids=()
   worker_rcs=()
   set +e
   for (( worker_index=0; worker_index<WORKERS; worker_index++ )); do
+    strategy_args=()
+    if [[ "$EXECUTE_STRATEGIES" == true && "$worker_index" -eq 0 ]]; then
+      strategy_args+=(
+        --execute-strategies
+        --strategy-state-dir "$STRATEGY_STATE_DIR"
+        --final-settlement-path "$FINAL_SETTLEMENT_PATH"
+      )
+    fi
     run_fintech_python -m downloader.stream_shioaji_taifex_bidask \
       --simulation \
+      "${strategy_args[@]}" \
       --capture-id "$capture_id" \
       --output-dir "$CAPTURE_ROOT" \
       --future-code "$FUTURE_CODE" \
+      --hedge-future-code "$HEDGE_FUTURE_CODE" \
       --option-roots "$OPTION_ROOTS" \
       --option-expiries "$OPTION_EXPIRIES" \
       --weekly-expiries "$WEEKLY_EXPIRIES" \

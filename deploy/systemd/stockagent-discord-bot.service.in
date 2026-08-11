@@ -1,8 +1,7 @@
 [Unit]
-Description=StockAgent Shioaji TAIFEX BidAsk capture and simulation strategies
+Description=StockAgent Discord bot and private scheduled simulation artifacts
 Wants=network-online.target time-sync.target
 After=network-online.target time-sync.target
-Before=stockagent-shioaji-top200.service
 StartLimitIntervalSec=300
 StartLimitBurst=5
 
@@ -13,13 +12,10 @@ Group=@SERVICE_GROUP@
 WorkingDirectory=@REPO_ROOT@
 Environment="HOME=@SERVICE_HOME@"
 Environment="PYTHONUNBUFFERED=1"
-ExecStart=/usr/bin/bash "@REPO_ROOT@/scripts/run_shioaji_taifex_bidask_stream.sh"
-Nice=-5
-CPUWeight=200
-IOWeight=200
-Restart=on-failure
-RestartSec=30s
-TimeoutStopSec=90s
+ExecStart=/usr/bin/bash "@REPO_ROOT@/scripts/run_discord_bot.sh"
+Restart=always
+RestartSec=10s
+TimeoutStopSec=30s
 KillMode=control-group
 
 [Install]
