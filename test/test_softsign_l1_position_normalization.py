@@ -258,6 +258,7 @@ def test_portfolio_mode_contract_normalizes_shared_aliases() -> None:
     assert normalize_portfolio_mode("long") == "long_only"
     assert normalize_portfolio_mode("long-and-short") == "long_short"
     assert normalize_portfolio_output_mode("raw_scores") == "logits"
+    assert normalize_portfolio_output_mode("explicit_cash_l1") == "cash_l1"
     assert normalize_portfolio_output_mode("differentiable_projection") == "projection_l1"
     assert normalize_portfolio_output_mode("signed_action_entmax15") == "signed_entmax15"
 
