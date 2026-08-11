@@ -27,6 +27,7 @@ from stockagent.models.transformer_base_portfolio import (
 )
 from stockagent.models.normalization import (
     masked_activation_l1_weights,
+    masked_cash_asset_l1_weights,
     masked_l1_projection_weights,
     masked_signed_action_weights,
 )
@@ -1907,6 +1908,82 @@ def test_portfolio_output_mode_l1_uses_identity_l1_weights() -> None:
     expected_gross = torch.ones_like(long_gross)
     assert torch.allclose(weights.abs().sum(dim=1), expected_gross, atol=1e-6, rtol=1e-6)
     assert torch.allclose(long_gross + short_gross, expected_gross, atol=1e-6, rtol=1e-6)
+
+
+def test_cash_l1_jointly_normalizes_stock_and_model_cash_scores() -> None:
+    stock_logits = torch.tensor(
+        [[2.0, -1.0, 9.0], [0.0, 0.0, 0.0]], requires_grad=True
+    )
+    cash_logits = torch.tensor([0.25, -0.5], requires_grad=True)
+    mask = torch.tensor([[True, True, False], [False, False, False]])
+
+    weights, cash_weight, positive_cash_score = masked_cash_asset_l1_weights(
+        stock_logits,
+        cash_logits,
+        mask,
+        long_only=False,
+    )
+
+    assert weights[0, 2].item() == 0.0
+    assert torch.equal(weights[1], torch.zeros_like(weights[1]))
+    torch.testing.assert_close(
+        weights.abs().sum(dim=1) + cash_weight,
+        torch.ones_like(cash_weight),
+    )
+    assert cash_weight[1].item() == pytest.approx(1.0)
+    assert bool(torch.all(positive_cash_score > 0.0))
+    (weights.square().sum() + cash_weight.square().sum()).backward()
+    assert cash_logits.grad is not None
+    assert bool(torch.isfinite(cash_logits.grad).all())
+
+
+def test_transformer_cash_l1_scores_cash_as_contextual_extra_asset() -> None:
+    device = _device()
+    model = _make_model(
+        portfolio_output_mode="cash_l1",
+        center_long_short_logits=False,
+        return_aux=True,
+        return_aux_details=True,
+    ).train()
+    assert model.cash_asset_token is not None
+    assert model.cash_asset_norm is not None
+    assert not hasattr(model, "cash_score_head")
+    x = torch.randn(2, 6, 13, 11, device=device)
+    mask = torch.ones(2, 13, dtype=torch.bool, device=device)
+    mask[0, 10:] = False
+    mask[1] = False
+
+    weights, _, aux = model(x, mask, return_aux=True)
+
+    assert tuple(aux["cash_score_logits"].shape) == (2,)
+    assert tuple(aux["cash_weight"].shape) == (2,)
+    assert tuple(aux["score_logits_with_cash"].shape) == (2, 14)
+    assert tuple(aux["allocation_scores_with_cash"].shape) == (2, 14)
+    assert tuple(aux["weights_with_cash"].shape) == (2, 14)
+    torch.testing.assert_close(aux["weights_with_cash"][:, :-1], weights)
+    torch.testing.assert_close(
+        aux["weights_with_cash"][:, -1], aux["cash_weight"]
+    )
+    expected_weights, expected_cash, _ = masked_cash_asset_l1_weights(
+        aux["centered_score_logits"],
+        aux["cash_target_logits"],
+        mask,
+        long_only=False,
+    )
+    torch.testing.assert_close(weights, expected_weights)
+    torch.testing.assert_close(aux["cash_weight"], expected_cash)
+    assert torch.equal(weights[1], torch.zeros_like(weights[1]))
+    torch.testing.assert_close(
+        weights.abs().sum(dim=1) + aux["cash_weight"],
+        torch.ones(2, device=device),
+        atol=1e-5,
+        rtol=1e-5,
+    )
+    assert aux["cash_weight"][1].item() == pytest.approx(1.0)
+    loss = weights[0].square().sum() + aux["cash_weight"][0].square()
+    loss.backward()
+    assert model.cash_asset_token.grad is not None
+    assert bool(torch.isfinite(model.cash_asset_token.grad).all())
 
 
 def test_portfolio_output_mode_logits_returns_masked_centered_scores() -> None:

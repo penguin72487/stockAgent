@@ -151,6 +151,22 @@ def _maybe_relaunch_for_ddp(config, args: argparse.Namespace) -> None:
         strategy = _resolve_multi_gpu_strategy(args.multi_gpu_strategy)
     if strategy != "distributed_data_parallel":
         return
+    isolate_train_folds = (
+        args.isolate_train_folds
+        if args.isolate_train_folds is not None
+        else bool(getattr(config.runner, "isolate_train_folds", False))
+    )
+    # Keep the orchestration parent outside torchrun.  It launches one fresh
+    # child per fold, and each child receives --no-isolate-train-folds so this
+    # same function relaunches that child under within-fold DDP.  Starting the
+    # outer process under torchrun would make two rank parents race to launch
+    # children while also retaining CUDA contexts across fold boundaries.
+    if (
+        isolate_train_folds
+        and os.environ.get(_FOLD_ISOLATION_CHILD_ENV) != "1"
+        and int(os.environ.get("WORLD_SIZE", "1")) == 1
+    ):
+        return
     if int(os.environ.get("WORLD_SIZE", "1")) > 1 or os.environ.get("STOCKAGENT_DDP_LAUNCHED") == "1":
         return
     if not torch.cuda.is_available():

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+from types import SimpleNamespace
 
 import train
 
@@ -92,3 +93,19 @@ def test_isolated_fold_runner_uses_sequential_children_and_stops_on_failure(
     assert all(
         env[train._FOLD_ISOLATION_CHILD_ENV] == "1" for _, env in calls
     )
+
+
+def test_ddp_relaunch_is_deferred_to_isolated_fold_child() -> None:
+    config = SimpleNamespace(
+        training=SimpleNamespace(multi_gpu_strategy="distributed_data_parallel"),
+        runner=SimpleNamespace(isolate_train_folds=True),
+    )
+    args = SimpleNamespace(
+        multi_gpu_strategy=None,
+        isolate_train_folds=None,
+    )
+
+    # Returning without os.exec proves the outer orchestrator remains a
+    # single process; the authoritative child command disables isolation and
+    # therefore performs the normal torchrun relaunch itself.
+    train._maybe_relaunch_for_ddp(config, args)

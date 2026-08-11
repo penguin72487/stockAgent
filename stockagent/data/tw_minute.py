@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
+import os
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
@@ -436,6 +437,68 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _partition_verification_cache_path(root: Path) -> Path:
+    """Return a machine-local receipt path without mutating the dataset tree."""
+
+    cache_root = Path(
+        os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache"))
+    )
+    root_key = hashlib.sha256(str(root).encode("utf-8")).hexdigest()[:24]
+    return cache_root / "stockagent" / "tw_minute_sha256" / f"{root_key}.json"
+
+
+def _partition_stat_contract(path: Path) -> dict[str, int | str]:
+    stat = path.stat()
+    return {
+        "path": str(path),
+        "size": int(stat.st_size),
+        "mtime_ns": int(stat.st_mtime_ns),
+        "ctime_ns": int(stat.st_ctime_ns),
+        "device": int(stat.st_dev),
+        "inode": int(stat.st_ino),
+    }
+
+
+def _load_partition_verification_receipt(
+    root: Path,
+    *,
+    manifest_sha256: str,
+    contracts: list[dict[str, int | str]],
+) -> bool:
+    path = _partition_verification_cache_path(root)
+    try:
+        payload = _read_json(path)
+    except (OSError, json.JSONDecodeError, RuntimeError):
+        return False
+    return bool(
+        payload.get("schema_version") == 1
+        and payload.get("manifest_sha256") == manifest_sha256
+        and payload.get("partitions") == contracts
+    )
+
+
+def _write_partition_verification_receipt(
+    root: Path,
+    *,
+    manifest_sha256: str,
+    contracts: list[dict[str, int | str]],
+) -> None:
+    path = _partition_verification_cache_path(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema_version": 1,
+        "dataset_root": str(root),
+        "manifest_sha256": manifest_sha256,
+        "partitions": contracts,
+    }
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    os.replace(temporary, path)
+
+
 def _partition_path(root: Path, summary: dict[str, Any]) -> Path:
     raw = Path(str(summary.get("output", "")))
     candidates = (
@@ -483,6 +546,8 @@ class MinuteDayPanel:
     short_open_mask: np.ndarray | None = None
     short_capacity_shares: np.ndarray | None = None
     daily_context_features: np.ndarray | None = None
+    benchmark_log_return: float = float("nan")
+    benchmark_price_available: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -507,6 +572,10 @@ class MinuteDailyFeatureContext:
     current_session_indices: np.ndarray
     opening_gap_output_index: int | None
     fingerprint: str
+    benchmark_name: str
+    benchmark_log_returns: np.ndarray
+    benchmark_price_available: np.ndarray
+    benchmark_fingerprint: str
 
     @property
     def num_features(self) -> int:
@@ -799,6 +868,18 @@ class MinuteDatasetIndex:
                     int(index), lookback=int(self.daily_context_lookback)
                 )
             ),
+            benchmark_log_return=(
+                float("nan")
+                if self.daily_feature_context is None
+                else float(self.daily_feature_context.benchmark_log_returns[int(index)])
+            ),
+            benchmark_price_available=(
+                False
+                if self.daily_feature_context is None
+                else bool(
+                    self.daily_feature_context.benchmark_price_available[int(index)]
+                )
+            ),
         )
 
 
@@ -822,6 +903,7 @@ def _load_minute_daily_feature_context(
     minute_symbols: tuple[str, ...],
     minute_dates: np.ndarray,
     requested_feature_names: Sequence[str],
+    benchmark_name: str | None = None,
 ) -> MinuteDailyFeatureContext:
     resolved_meta = Path(meta_path).resolve()
     if not resolved_meta.is_file():
@@ -885,6 +967,27 @@ def _load_minute_daily_feature_context(
         [panel_symbol_lookup[str(symbol)] for symbol in minute_symbol_values],
         dtype=np.int64,
     )
+    resolved_benchmark_name = str(benchmark_name or "").strip()
+    if not resolved_benchmark_name:
+        raise RuntimeError("tw_minute daily context requires a benchmark symbol")
+    if resolved_benchmark_name not in panel_symbol_lookup:
+        raise RuntimeError(
+            "tw_minute daily-context panel lacks configured benchmark "
+            f"{resolved_benchmark_name!r}"
+        )
+    backend_fields = {
+        field.split("=", 1)[0]: field.split("=", 1)[1]
+        for field in str(metadata.get("backend_key", "")).split("|")
+        if "=" in field
+    }
+    cached_benchmark_name = str(backend_fields.get("benchmark", "")).strip()
+    if cached_benchmark_name != resolved_benchmark_name:
+        raise RuntimeError(
+            "tw_minute daily-context benchmark disagrees with its panel cache: "
+            f"configured={resolved_benchmark_name!r} "
+            f"cached={cached_benchmark_name!r}"
+        )
+    benchmark_symbol_index = int(panel_symbol_lookup[resolved_benchmark_name])
 
     cached_feature_names = tuple(str(value) for value in cached_feature_payload)
     cached_feature_lookup = {
@@ -947,6 +1050,34 @@ def _load_minute_daily_feature_context(
     )
     current_session_indices[exact] = insertion[exact]
 
+    panel_returns = np.load(array_path("returns_1d"), mmap_mode="r")
+    panel_close_prices = np.load(array_path("close_prices"), mmap_mode="r")
+    expected_panel_shape = (int(panel_dates.size), int(panel_symbols.size))
+    if panel_returns.shape != expected_panel_shape:
+        raise RuntimeError("tw_minute daily-context returns_1d shape is malformed")
+    if panel_close_prices.shape != expected_panel_shape:
+        raise RuntimeError("tw_minute daily-context close_prices shape is malformed")
+    benchmark_log_returns = np.full(minute_day_values.shape, np.nan, dtype=np.float32)
+    benchmark_price_available = np.zeros(minute_day_values.shape, dtype=np.bool_)
+    if bool(np.any(exact)):
+        exact_rows = current_session_indices[exact]
+        # ``returns_1d[p]`` is the forward adjusted-close return from panel
+        # row p to p+1.  Place it on the minute session where that move ends so
+        # daily benchmark rows and strategy rows share the same wall-clock
+        # date.  The split runner later zeroes its first row so a standalone
+        # split begins exactly at its first close rather than the prior split.
+        ending_return_rows = previous_session_indices[exact]
+        benchmark_log_returns[exact] = np.asarray(
+            panel_returns[ending_return_rows, benchmark_symbol_index],
+            dtype=np.float32,
+        )
+        benchmark_closes = np.asarray(
+            panel_close_prices[exact_rows, benchmark_symbol_index], dtype=np.float64
+        )
+        benchmark_price_available[exact] = np.isfinite(benchmark_closes) & (
+            benchmark_closes > 0.0
+        )
+
     arrays = metadata.get("arrays", {})
     digest_payload = {
         "contract": MINUTE_DAILY_CONTEXT_CONTRACT,
@@ -980,6 +1111,32 @@ def _load_minute_daily_feature_context(
             "utf-8"
         )
     ).hexdigest()
+    benchmark_digest_payload = {
+        "contract": "configured_symbol_adjusted_close_buy_hold_first_to_last_v1",
+        "benchmark_name": resolved_benchmark_name,
+        "returns_1d_sha256": arrays.get("returns_1d", {}).get(
+            "content_fingerprint", {}
+        ).get("sha256"),
+        "close_prices_sha256": arrays.get("close_prices", {}).get(
+            "content_fingerprint", {}
+        ).get("sha256"),
+        "minute_dates": [str(value) for value in minute_day_values],
+    }
+    if not all(
+        isinstance(benchmark_digest_payload[name], str)
+        and benchmark_digest_payload[name]
+        for name in ("returns_1d_sha256", "close_prices_sha256")
+    ):
+        raise RuntimeError(
+            "tw_minute daily-context cache lacks benchmark content fingerprints"
+        )
+    benchmark_fingerprint = hashlib.sha256(
+        json.dumps(
+            benchmark_digest_payload,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
     return MinuteDailyFeatureContext(
         feature_names=requested,
         panel_features=np.load(array_path("features"), mmap_mode="r"),
@@ -992,6 +1149,10 @@ def _load_minute_daily_feature_context(
         current_session_indices=current_session_indices,
         opening_gap_output_index=opening_gap_output_index,
         fingerprint=fingerprint,
+        benchmark_name=resolved_benchmark_name,
+        benchmark_log_returns=benchmark_log_returns,
+        benchmark_price_available=benchmark_price_available,
+        benchmark_fingerprint=benchmark_fingerprint,
     )
 
 
@@ -1128,6 +1289,7 @@ def load_minute_dataset_index(
     daily_context_panel_meta: str | Path | None = None,
     daily_context_feature_names: Sequence[str] = (),
     daily_context_lookback: int = 1,
+    benchmark_name: str | None = None,
 ) -> MinuteDatasetIndex:
     resolved_root = Path(root).resolve()
     manifest_path = resolved_root / "manifest.json"
@@ -1175,6 +1337,30 @@ def load_minute_dataset_index(
         raise RuntimeError("minute manifest dates are not unique and sorted")
     partitions: dict[str, dict[str, Any]] = {}
     partition_summaries = list(manifest.get("partitions", []))
+    partition_paths: list[Path] = []
+    partition_contracts: list[dict[str, int | str]] = []
+    for summary in partition_summaries:
+        path = _partition_path(resolved_root, summary)
+        if not path.is_file():
+            raise RuntimeError(f"minute partition is missing: {path}")
+        contract = _partition_stat_contract(path)
+        contract["expected_sha256"] = str(summary.get("output_sha256", ""))
+        partition_paths.append(path)
+        partition_contracts.append(contract)
+    manifest_sha256 = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    verification_cached = bool(
+        verify_partition_sha256
+        and _load_partition_verification_receipt(
+            resolved_root,
+            manifest_sha256=manifest_sha256,
+            contracts=partition_contracts,
+        )
+    )
+    if verification_cached and progress is not None:
+        progress(
+            "[tw-minute data] reused SHA256 receipt for "
+            f"{len(partition_summaries)} unchanged partitions"
+        )
     for position, summary in enumerate(partition_summaries, start=1):
         key = str(summary.get("trade_date", ""))
         if key in partitions:
@@ -1187,10 +1373,8 @@ def load_minute_dataset_index(
                 raise RuntimeError(
                     f"minute partition {key} lacks causal normalization statistics"
                 )
-        path = _partition_path(resolved_root, summary)
-        if not path.is_file():
-            raise RuntimeError(f"minute partition is missing: {path}")
-        if verify_partition_sha256:
+        path = partition_paths[position - 1]
+        if verify_partition_sha256 and not verification_cached:
             expected = str(summary.get("output_sha256", ""))
             actual = _sha256(path)
             if not expected or actual != expected:
@@ -1199,7 +1383,7 @@ def load_minute_dataset_index(
                     f"expected={expected} actual={actual}"
                 )
         partitions[key] = summary
-        if progress is not None and (
+        if progress is not None and not verification_cached and (
             position == 1
             or position % 100 == 0
             or position == len(partition_summaries)
@@ -1208,6 +1392,12 @@ def load_minute_dataset_index(
                 "[tw-minute data] verified partitions="
                 f"{position}/{len(partition_summaries)} last_date={key}"
             )
+    if verify_partition_sha256 and not verification_cached:
+        _write_partition_verification_receipt(
+            resolved_root,
+            manifest_sha256=manifest_sha256,
+            contracts=partition_contracts,
+        )
     if set(partitions) != set(date_strings):
         raise RuntimeError("minute manifest date list and partition list disagree")
     dates = np.asarray(date_strings, dtype="datetime64[D]")
@@ -1238,6 +1428,7 @@ def load_minute_dataset_index(
             minute_symbols=symbols,
             minute_dates=dates,
             requested_feature_names=daily_context_feature_names,
+            benchmark_name=benchmark_name,
         )
     elif daily_context_feature_names:
         raise RuntimeError(

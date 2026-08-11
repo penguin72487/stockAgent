@@ -1,16 +1,21 @@
 base_config: tw_public_lanten_market_candles.yaml
 
-experiment_name: tw-full-market-minute-long-short-dual-timescale-stateful-v8
+experiment_name: tw-full-market-minute-long-short-cost-aware-v10
 
 runner:
-  # Training-contract v11 adds a causal 32-day encoder, executed-holding-aware
-  # proximal allocation, and complete intraday cost credit assignment. Preserve
-  # every earlier checkpoint in its own root; none is optimizer-compatible.
-  output_dir: artifacts/markets/tw_minute_dual_5090_dual_timescale_stateful_v8
+  # Training-contract v13 preserves the exact proximal candidate instead of
+  # re-normalizing away its no-trade band. Preserve the still-running v9 job in
+  # its own root; it is not optimizer-compatible with this allocator contract.
+  output_dir: artifacts/markets/tw_minute_dual_5090_cost_aware_v10
   mode: train
   resume: true
   post_train_infer: false
   start_fold: 1
+  # Keep DDP inside each fold, but give every expanding fold a fresh process.
+  # A same-process run completed folds 1/2 and then OOMed while Triton loaded
+  # fold 3's first backward kernel. An isolated fold-3 batch64/chunk16 smoke
+  # completed train+validation+test with the same math and peak shape.
+  isolate_train_folds: true
 
 environment:
   device: cuda
@@ -30,6 +35,9 @@ data:
   minute_parquet_root: data_tw_minute/research_dataset_developing_v5
   minute_require_research_ready: true
   minute_verify_partition_sha256: true
+  # Reporting only: one 2330 adjusted-close (dividend-adjusted) buy-and-hold
+  # path from each split's first close through its final close. It is not a
+  # daily reset open-to-close strategy and never consumes the next split's row.
   benchmark_name: "2330"
   day_trade_open_feature: true
   minute_daily_context_panel_meta: data_tw_public/stocks/panel_cache_v2/variants/5f5050cb6b7b0738f40f926bd8d9c05a487f82658b717067aebe43021d2ecc16.json
@@ -62,9 +70,9 @@ trading:
   # sell 0.1285%, and buy 0.0285% for both.
   buy_fee_rate: 0.000285
   sell_fee_rate: 0.001785
-  # Match the resolved historical profitable day-trade checkpoint: every
-  # nonzero model row uses gross L1 exposure one before executor eligibility
-  # and capacity masks. Blocked or unfilled orders still remain cash.
+  # Cash and every signed stock score share one L1 action budget. This remains
+  # the maximum gross-risk ceiling; the learned cash score decides how much of
+  # it stays in cash before eligibility and capacity masks are applied.
   max_volume_participation: 0.50
   tw_minute_initial_equity: 10000000.0
   tw_minute_gross_exposure: 1.0
@@ -116,6 +124,12 @@ training:
   minute_cache_days_on_cpu: true
   minute_cpu_cache_gb: 64.0
   minute_data_workers: 8
+  # The first model matmul already consumes BF16 under autocast. Store only
+  # immutable model features (minute and daily context) in that same dtype;
+  # prices, volume, fees, positions, NAV, and report reductions remain FP32.
+  # This makes Fold 4 train+validation+test fit in each rank's 64 GiB cache and
+  # halves the dominant host-to-device feature payload.
+  cache_train_features_in_amp_dtype: true
   loss_type: log_utility
   loss_portfolio_activation: pre_normalized
   strict_no_fallback: true
@@ -125,19 +139,18 @@ training:
   transformer_base_portfolio:
     amp_native_position_add: true
     checkpoint_blocks: true
-    portfolio_output_mode: l1
+    portfolio_output_mode: cash_l1
     center_long_short_logits: false
   financial_transformer:
-    # Restore the resolved historical profitable day-trade checkpoint's L1
-    # portfolio head. Execution masks run afterwards, as in tw_day_trade.
+    # Add one contextual cash token to the stock score vector and normalize
+    # [signed stocks, positive cash] jointly. Cash is a model action, not the
+    # residual of failed or capacity-limited orders.
     # Under BF16 autocast, cast the small position tensors to the activation
     # dtype instead of promoting the full [B,L,S,D] residual back to FP32.
     amp_native_position_add: true
-    # Recompute Transformer-block internals during backward so a true 64-day
-    # batch has headroom for both the fixed graph and Triton autotune buffers.
-    # A complete fold-2 one-epoch compiled smoke retained about 1.11 GiB per
-    # GPU at steady training and completed final validation/test artifact QA.
-    # This keeps the batch/chunk/optimizer schedule unchanged.
+    # Fold-4 A/B confirmed this remains necessary even though the executor also
+    # checkpoints complete policy chunks: disabling it reached 30.5 GiB before
+    # Triton requested its final 96-226 MiB autotune buffers and OOMed.
     checkpoint_blocks: true
     # Separate clocks: completed 32-day public/daily history and completed
     # 32-minute developing-candle history are encoded independently, then fused.
@@ -145,7 +158,7 @@ training:
     daily_context_layers: 2
     daily_context_pooling: last
     portfolio_mode: long_short
-    portfolio_output_mode: l1
+    portfolio_output_mode: cash_l1
     # Preserve raw signed score direction. Do not force cross-sectional dollar
     # neutrality by subtracting the market mean before L1 normalization.
     center_long_short_logits: false
