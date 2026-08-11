@@ -83,7 +83,7 @@ def test_specialized_mode_contracts_are_explicit(
     assert spec.product_family == product_family
     assert spec.frequency == frequency
     assert spec.sample_order_contract == "chronological_sessions"
-    assert not spec.supports_isolated_folds
+    assert spec.supports_isolated_folds is (execution_mode == "tw_minute")
 
 
 def test_canonical_mode_is_not_dispatched_to_a_second_runner(tmp_path: Path) -> None:
@@ -155,3 +155,37 @@ def test_specialized_dispatch_rejects_unsupported_fold_isolation(
             active_strategy="none",
             isolate_train_folds=True,
         )
+
+
+def test_tw_minute_dispatch_selects_isolated_runner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, object]] = []
+
+    def fake_isolated_runner(config: object, **kwargs: object) -> None:
+        calls.append({"config": config, **kwargs})
+
+    monkeypatch.setattr(
+        mode_adapter,
+        "import_module",
+        lambda _name: SimpleNamespace(
+            run_minute_training_isolated=fake_isolated_runner
+        ),
+    )
+
+    handled = mode_adapter.dispatch_specialized_training_mode(
+        _config("tw_minute"),
+        output_dir=tmp_path,
+        mode="train",
+        resume=True,
+        start_fold=3,
+        max_folds=2,
+        active_strategy="distributed_data_parallel",
+        isolate_train_folds=True,
+    )
+
+    assert handled is True
+    assert len(calls) == 1
+    assert calls[0]["start_fold"] == 3
+    assert calls[0]["max_folds"] == 2
