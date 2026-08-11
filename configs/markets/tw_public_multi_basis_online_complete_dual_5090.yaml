@@ -1,0 +1,39 @@
+base_config: tw_public_multi_basis_online_complete.yaml
+
+experiment_name: tw-public-financial-transformer-multi-basis-online-complete-input-features-lookback32-v1-dual5090
+
+runner:
+  # The parent config intentionally targets a single 16 GiB workstation.  This
+  # root is also checkpoint-incompatible with the old post-temporal basis
+  # branch; never mix the two model contracts.
+  output_dir: artifacts/markets/tw_public_candles_multi_basis_online_complete_input_features_lookback32_v1_dual5090_1m
+  # The output root is fresh on first launch and safely resumable afterward.
+  resume: true
+  # Training already writes canonical fold and walk-forward artifacts.  Avoid a
+  # second eager inference/plot pass over every saved model at the very end.
+  post_train_infer: false
+
+trading:
+  # Absolute TWD equity anchor used by the TW day-trade executor, volume cap,
+  # and exact integer-share audit.
+  volume_participation_equity: 1000000.0
+
+training:
+  # Global DDP batch 128 gives each RTX 5090 a local power-of-two batch 64,
+  # matching the measured full-universe FinancialTransformer capacity contract.
+  batch_size_train: 128
+  batch_size_eval: 128
+  epochs: 1000
+  early_stopping_no_improve_ratio: 0.1
+  # Keep live epoch curves enabled.  Independently, the canonical trainer
+  # writes equity_curve.png, equity_curve_log.png, and annual_performance.png
+  # immediately after each fold's final test; post_train_infer is not required.
+  curve_plot_interval: 1
+  curve_plot_async: true
+  defer_epoch_curve_plot_until_end: false
+
+  # Both cards have 32 GiB.  Keep the immutable FP32 panel resident per rank so
+  # 1,000 epochs do not repeatedly pay host-to-device transfer cost.
+  cache_train_tensors_on_gpu: true
+  cache_eval_tensors_on_gpu: true
+  vram_budget_gb: 32

@@ -370,6 +370,11 @@ def test_temporal_basis_rejects_unknown_family_and_non_dyadic_haar() -> None:
         _make_model(lookback=6, temporal_basis_families=("haar",))
     with pytest.raises(ValueError, match="power of two"):
         _make_model(lookback=6, temporal_basis_families=("walsh",))
+    with pytest.raises(ValueError, match="requires the Financial Transformer"):
+        _make_model(
+            temporal_basis_families=("dct",),
+            temporal_basis_input="input_features",
+        )
 
 
 def test_disabled_temporal_basis_keeps_legacy_model_fingerprint_projection() -> None:
@@ -388,6 +393,10 @@ def test_disabled_temporal_basis_keeps_legacy_model_fingerprint_projection() -> 
     config.training.transformer_base_portfolio.temporal_basis_input = "raw_features"
     raw_enabled = _active_model_config(config)["values"]
     assert raw_enabled["temporal_basis_input"] == "raw_features"
+
+    config.training.transformer_base_portfolio.temporal_basis_input = "input_features"
+    input_enabled = _active_model_config(config)["values"]
+    assert input_enabled["temporal_basis_input"] == "input_features"
 
 
 @pytest.mark.parametrize("feature_idx", [1, 2])
@@ -548,7 +557,13 @@ def test_compiled_stock_embedding_explainability_returns_weights_and_scores(
     x = torch.randn(2, 6, 13, 11, device=device)
     mask = torch.ones(2, 13, dtype=torch.bool, device=device)
     mask[1, -3:] = False
-    monkeypatch.setattr(torch, "compile", lambda fn, **_kwargs: fn)
+    compile_kwargs: list[dict[str, object]] = []
+
+    def fake_compile(fn, **kwargs):
+        compile_kwargs.append(kwargs)
+        return fn
+
+    monkeypatch.setattr(torch, "compile", fake_compile)
 
     with torch.no_grad():
         embedded = model.embed_projected_for_explainability(
@@ -574,6 +589,13 @@ def test_compiled_stock_embedding_explainability_returns_weights_and_scores(
 
     torch.testing.assert_close(actual_weights, expected_weights, rtol=2e-5, atol=2e-6)
     torch.testing.assert_close(actual_scores, expected_scores, rtol=2e-5, atol=2e-6)
+    assert compile_kwargs == [
+        {
+            "dynamic": False,
+            "fullgraph": False,
+            "options": {"triton.cudagraphs": False},
+        }
+    ]
 
 
 @pytest.mark.parametrize(

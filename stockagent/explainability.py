@@ -9,7 +9,7 @@ import math
 import os
 import time
 import warnings
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, replace
 from datetime import timedelta
 from functools import lru_cache
@@ -49,6 +49,15 @@ _subset_panel_symbols = subset_panel_symbols
 _daily_weight_symbols = weight_table_symbols
 _daily_weight_table_path = weight_table_path
 
+# PyTorch's CUDA autograd engine can keep the C++ leaf accumulator alive after
+# an input VJP even when every Python reference and saved graph has gone away.
+# Reuse one storage per input shape so complete multi-date explainability has a
+# fixed attribution-memory cost instead of retaining a fresh full-universe
+# input allocation for every Gradient x Input / IG call.
+_CUDA_INPUT_ATTRIBUTION_WORKSPACES: dict[
+    tuple[str, torch.dtype, tuple[int, ...]], torch.Tensor
+] = {}
+
 
 def _clear_explainability_runtime_cache() -> None:
     gc.collect()
@@ -58,6 +67,32 @@ def _clear_explainability_runtime_cache() -> None:
             torch.cuda.ipc_collect()
         except Exception:
             pass
+
+
+def _release_explainability_chunk_memory(device: torch.device) -> tuple[float, float]:
+    """Release completed chunk graphs after every result is resident on CPU.
+
+    Full-universe FinancialTransformer explanations create large temporary
+    autograd and auxiliary-output object graphs.  Waiting for generational GC
+    lets those graphs survive across date chunks and makes live CUDA memory
+    grow until even a one-row chunk OOMs.  Chunk outputs have already been
+    detached and copied to CPU at this boundary, so collecting here cannot
+    change attribution values or coverage.
+    """
+
+    gc.collect()
+    if device.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        allocated_gib = float(torch.cuda.memory_allocated(device)) / (1024**3)
+        reserved_gib = float(torch.cuda.memory_reserved(device)) / (1024**3)
+        if os.environ.get("STOCKAGENT_EXPLAIN_MEMORY_DIAGNOSTICS", "0") == "1":
+            print(
+                "[explain-memory] post_chunk "
+                f"allocated_gib={allocated_gib:.3f} reserved_gib={reserved_gib:.3f}",
+                flush=True,
+            )
+        return allocated_gib, reserved_gib
+    return 0.0, 0.0
 
 
 PAPER_TOKENS = {
@@ -1549,6 +1584,55 @@ def _decision_target(
     return (scores * direction.to(dtype=scores.dtype) * target_weight).sum() / denom
 
 
+def _input_attribution_workspace(
+    template: torch.Tensor,
+    shape: tuple[int, ...] | None = None,
+) -> torch.Tensor:
+    resolved_shape = tuple(int(dim) for dim in (shape or tuple(template.shape)))
+    if template.device.type != "cuda":
+        return torch.empty(
+            resolved_shape,
+            device=template.device,
+            dtype=template.dtype,
+            requires_grad=False,
+        )
+    key = (str(template.device), template.dtype, resolved_shape)
+    workspace = _CUDA_INPUT_ATTRIBUTION_WORKSPACES.get(key)
+    if workspace is None:
+        workspace = torch.empty(
+            resolved_shape,
+            device=template.device,
+            dtype=template.dtype,
+            requires_grad=False,
+        )
+        _CUDA_INPUT_ATTRIBUTION_WORKSPACES[key] = workspace
+    return workspace
+
+
+@contextmanager
+def _input_attribution_parameter_freeze(model: nn.Module):
+    """Avoid building parameter-gradient graphs for input-only attribution.
+
+    Gradient x Input and Integrated Gradients differentiate only with respect
+    to their input leaf.  Leaving every model parameter trainable makes
+    autograd construct parameter-gradient edges that are never consumed and,
+    on full-universe CUDA batches, can retain the large input leaves after the
+    VJP has completed.  Preserve and restore the exact flags so this remains a
+    local explainability optimization and cannot alter model training state.
+    """
+
+    parameters = tuple(model.parameters())
+    requires_grad = tuple(parameter.requires_grad for parameter in parameters)
+    try:
+        for parameter in parameters:
+            if parameter.requires_grad:
+                parameter.requires_grad_(False)
+        yield
+    finally:
+        for parameter, enabled in zip(parameters, requires_grad, strict=True):
+            parameter.requires_grad_(enabled)
+
+
 def _gradient_x_input_attribution(
     model: nn.Module,
     x: torch.Tensor,
@@ -1558,11 +1642,22 @@ def _gradient_x_input_attribution(
     gross_weight: torch.Tensor,
 ) -> torch.Tensor:
     model.zero_grad(set_to_none=True)
-    x_grad = x.detach().clone().requires_grad_(True)
-    _, scores, _ = _forward_outputs(model, x_grad, mask, return_aux=False)
-    target = _decision_target(scores, selected, direction, gross_weight)
-    grad = torch.autograd.grad(target, x_grad, retain_graph=False, create_graph=False)[0]
-    return torch.nan_to_num((grad * x_grad).detach(), nan=0.0, posinf=0.0, neginf=0.0)
+    with _input_attribution_parameter_freeze(model):
+        x_grad = _input_attribution_workspace(x)
+        with torch.no_grad():
+            x_grad.copy_(x)
+        x_grad.requires_grad_(True)
+        try:
+            _, scores, _ = _forward_outputs(model, x_grad, mask, return_aux=False)
+            target = _decision_target(scores, selected, direction, gross_weight)
+            grad = torch.autograd.grad(target, x_grad, retain_graph=False, create_graph=False)[0]
+            attribution = torch.nan_to_num(
+                (grad * x_grad).detach(), nan=0.0, posinf=0.0, neginf=0.0
+            )
+        finally:
+            x_grad.detach_()
+        del grad, target, scores, x_grad
+    return attribution
 
 
 def _auto_repeat_chunk_size(
@@ -1665,20 +1760,57 @@ def _integrated_gradients_attribution(
         alpha = torch.arange(start, end + 1, device=x.device, dtype=x.dtype) / float(steps)
         repeats = int(alpha.numel())
         model.zero_grad(set_to_none=True)
-        x_step = (alpha.view(repeats, 1, 1, 1, 1) * x.detach().unsqueeze(0)).reshape(
-            repeats * int(x.size(0)),
-            *tuple(x.shape[1:]),
-        )
-        x_step = x_step.detach().requires_grad_(True)
-        mask_step = _repeat_first_dim(mask, repeats)
-        selected_step = _repeat_first_dim(selected, repeats)
-        direction_step = _repeat_first_dim(direction, repeats)
-        gross_weight_step = _repeat_first_dim(gross_weight, repeats)
-        _, scores, _ = _forward_outputs(model, x_step, mask_step, return_aux=False)
-        target = _decision_target(scores, selected_step, direction_step, gross_weight_step) * float(repeats)
-        grad = torch.autograd.grad(target, x_step, retain_graph=False, create_graph=False)[0]
-        grad = torch.nan_to_num(grad.detach(), nan=0.0, posinf=0.0, neginf=0.0)
-        total_grad = total_grad + grad.reshape(repeats, *tuple(x.shape)).sum(dim=0)
+        with _input_attribution_parameter_freeze(model):
+            x_step_shape = (
+                repeats * int(x.size(0)),
+                *tuple(x.shape[1:]),
+            )
+            x_step = _input_attribution_workspace(x, x_step_shape)
+            with torch.no_grad():
+                x_step_view = x_step.view(repeats, *tuple(x.shape))
+                x_step_view.copy_(x.detach().unsqueeze(0))
+                x_step_view.mul_(alpha.view(repeats, 1, 1, 1, 1))
+            x_step.requires_grad_(True)
+            mask_step = _repeat_first_dim(mask, repeats)
+            selected_step = _repeat_first_dim(selected, repeats)
+            direction_step = _repeat_first_dim(direction, repeats)
+            gross_weight_step = _repeat_first_dim(gross_weight, repeats)
+            try:
+                _, scores, _ = _forward_outputs(model, x_step, mask_step, return_aux=False)
+                target = (
+                    _decision_target(
+                        scores,
+                        selected_step,
+                        direction_step,
+                        gross_weight_step,
+                    )
+                    * float(repeats)
+                )
+                grad = torch.autograd.grad(
+                    target,
+                    x_step,
+                    retain_graph=False,
+                    create_graph=False,
+                )[0]
+                grad = torch.nan_to_num(
+                    grad.detach(), nan=0.0, posinf=0.0, neginf=0.0
+                )
+                total_grad = total_grad + grad.reshape(
+                    repeats, *tuple(x.shape)
+                ).sum(dim=0)
+            finally:
+                x_step.detach_()
+            del (
+                grad,
+                target,
+                scores,
+                x_step,
+                x_step_view,
+                mask_step,
+                selected_step,
+                direction_step,
+                gross_weight_step,
+            )
     return x * (total_grad / float(steps))
 
 
@@ -4641,9 +4773,7 @@ def explain_batch_row_chunked(
                 )
                 chunk_results.append((result, end - start))
                 del chunk, result
-                # Results are already detached to CPU.  Keep CUDA's allocator
-                # cache warm across equal-shaped date chunks; empty_cache/ipc_collect
-                # here forced a device sync and reallocation every microbatch.
+                _release_explainability_chunk_memory(device)
                 row_progress.set_postfix(rows=f"{end}/{n_rows}", refresh=False)
 
             diagnostics = {**diagnostics, "chunk_count": len(chunk_results)}
@@ -4791,11 +4921,7 @@ def explain_batch_source_chunked(
         chunk_results.append((result, end - start))
         del batch, result
         start = end
-        # Keep the CUDA caching allocator and Python generations warm across
-        # equal-shaped chunks. A full gc/empty_cache/ipc_collect cycle here
-        # forces a device synchronization for every date microbatch and turns
-        # allocator reuse into repeated cudaMalloc work. OOM retries and the
-        # fold boundary still perform an explicit cleanup.
+        _release_explainability_chunk_memory(device)
         progress.update(end - progress.n)
         progress.set_postfix(chunk=row_chunk_size, refresh=False)
     progress.close()
@@ -7658,6 +7784,31 @@ def _plot_barh(
     labels = _string_list(data, label_col)
     values = _numeric_numpy(data, value_col)
     import matplotlib.pyplot as plt
+
+    # Flattened raw temporal inputs can contain lookback * feature_count
+    # dimensions (for example 32 * 99 = 3168). Faceting every dimension into
+    # labelled bar panels preserves rows but creates a hundreds-of-inches-tall
+    # PNG that Pillow correctly rejects as a decompression bomb. Preserve every
+    # dimension as a point in a bounded, index-ordered profile instead. Small
+    # representations retain the more readable labelled bar inventory below.
+    if label_col == "dim" and data.height > 144:
+        dense = _with_numeric(data, label_col, value_col).drop_nulls(
+            subset=[label_col, value_col]
+        ).sort(label_col)
+        x = _numeric_numpy(dense, label_col)
+        y = _numeric_numpy(dense, value_col)
+        fig, ax = plt.subplots(figsize=_figsize_17_6(6.2), dpi=150)
+        ax.plot(x, y, color=PAPER_TOKENS["blue_mid"], linewidth=0.8)
+        ax.fill_between(x, 0.0, y, color=PAPER_TOKENS["blue_light"], alpha=0.35)
+        ax.set_title(f"{title} — all {data.height:,} dimensions")
+        ax.set_xlabel("dimension index")
+        ax.set_ylabel(value_col)
+        ax.grid(True, axis="y", alpha=0.25)
+        _safe_matplotlib_tight_layout(fig)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        _save_matplotlib_figure(fig, output_path, pad_to_standard_aspect=False)
+        plt.close(fig)
+        return
 
     # A single 100+ row axis technically contains every feature but is not
     # readable in Markdown or an image viewer.  Facet the complete ordered

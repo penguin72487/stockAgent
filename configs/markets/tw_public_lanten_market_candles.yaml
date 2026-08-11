@@ -3,7 +3,7 @@ experiment_name: tw-financial-transformer-candles-snapshot-safe99-open-aware-gro
 runner:
   # The causal current-open channel creates a 99-slot schema and therefore a
   # fresh checkpoint root, incompatible with the earlier 98-slot model.
-  output_dir: artifacts/markets/tw_public_candles_tw_day_trade_lookback32
+  output_dir: artifacts/markets/tw_public_candles_tw_day_trade_lookback32_1W
   mode: train
   # Keep all older artifacts for audit, but never resume their optimizer state
   # into this fresh root. Later interruptions within this 99-slot run remain
@@ -342,7 +342,7 @@ training:
   # 99-feature schema changes.
   batch_size_train: 128
   batch_size_eval: 128
-  epochs: 1000
+  epochs: 10000
   early_stopping_no_improve_ratio: 0.1
   val_interval_epochs: 1
   curve_test_interval: 1

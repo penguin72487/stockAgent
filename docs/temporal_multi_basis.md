@@ -8,11 +8,13 @@ shape, and periodic structure easier for the optimizer to isolate. Basis
 coefficients are therefore ordinary input features, not a privileged model
 branch.
 
-The implementation runs inside the model on the already-causal `[B,L,S,D]`
-window embeddings. It does not materialize rolling columns in parquet, does not
+The implementation runs inside the model on the already-causal raw
+`[B,L,S,F]` window. It does not materialize rolling columns in parquet, does not
 read beyond the current window endpoint, and preserves the panel-slab fast path.
-Every fixed bank excludes the constant/DC vector, so static symbol/category
-information is not mistaken for a time-varying signal.
+The resulting coefficients are appended to the endpoint candle's ordinary
+feature row before CandleEncoder normalization and projection. Every fixed bank
+excludes the constant/DC vector, so static symbol/category information is not
+mistaken for a time-varying signal.
 
 ## Implemented online-safe families
 
@@ -48,17 +50,22 @@ stored as float32.
 For basis matrices `B_f`, the complete mechanism is:
 
 ```text
-c_f = B_f @ temporal_embeddings
-input_features = concat(raw_stock_embedding, flatten(c_1), ..., flatten(c_F))
-stock_embedding = Linear(input_features)
+c_f = B_f @ raw_feature_window
+endpoint_features = concat(raw_endpoint_features, flatten(c_1), ..., flatten(c_F))
+endpoint_embedding = CandleEncoder(endpoint_features)
+window_embeddings = concat(CandleEncoder(raw_rows_before_endpoint), endpoint_embedding)
+stock_embedding = TemporalTransformer(window_embeddings)
 ```
 
-That is the entire basis integration. There is no family-specific MLP, learned
-coefficient mixer, energy path, fusion network, gate, or residual addition.
-Raw/learned and basis values are columns in one feature vector and the same
-linear feature projection decides their weights. Detailed aux output exposes
-the exact family coefficients, concatenated input features, and projected
-output.
+That is the entire basis integration. There is no post-temporal branch,
+family-specific MLP, learned coefficient mixer, fusion network, gate, or
+residual addition. Raw and basis values are columns in one feature vector and
+the same RMSNorm plus CandleEncoder linear projection decides their weights.
+For 99 raw features, 18 families, and four components, this is exactly
+`99 + 18*4*99 = 7,227` input columns. The hot path algebraically contracts the
+same wide linear map instead of allocating all 7,227 columns for every stock;
+detailed aux output can still expose the exact coefficients and concatenated
+endpoint row.
 
 ## Why these are online-safe
 
@@ -106,28 +113,12 @@ into the final production model. Use coefficient diagnostics, projection
 weights, family ablations, and walk-forward net returns to prune redundant
 families after training.
 
-## Engineering smoke benchmark
+## Engineering validation
 
-On the local RTX 5070 Ti with PyTorch 2.12.1, the latest same-process eager BF16
-comparison measured:
-
-| Branch | Live forward `[1,32,2304,131]` | Train fwd+bwd `[4,32,2304,131]` | Peak train allocation | Parameters |
-| --- | ---: | ---: | ---: | ---: |
-| Raw/learned only | 12.521 ms | 60.100 ms | 1594.1 MiB | 169,509 |
-| Compact feature input, 3 x 8 | 15.524 ms | 60.718 ms | 1630.9 MiB | 195,141 |
-| Complete feature input, 18 x 4 | 16.700 ms | 74.494 ms | 1631.9 MiB | 244,421 |
-
-Values are medians across two order-reversed rounds; each round used 15 steady
-forward repetitions or nine training repetitions after warmup, with aux
-collection disabled. Relative to raw, the complete set adds about 4.18 ms to a
-full-universe live forward and 24.0% to this model-only training step, while
-adding about 37.8 MiB peak allocation. A CUDA BF16
-`torch.compile(mode="reduce-overhead", fullgraph=True)` forward/backward smoke
-also completed with finite output, input gradient, feature-projection gradient,
-and learned-basis gradient. Cold compilation must be warmed and cached before
-live service startup.
-
-These are model-kernel engineering smokes, not compiled full-epoch benchmarks
-and not evidence of strategy lift. Daily live use easily fits this latency; a
-high-frequency runner should benchmark its own batch/symbol shape and normally
-start from the compact family set.
+The ordinary-input-feature contract intentionally invalidates timing and model
+quality results from the former post-temporal branch. Validate it with exact
+expanded-vs-fused projection tests, materialized-vs-panel-slab equivalence,
+finite forward/backward gradients (including the learned basis), and a bounded
+CUDA smoke before starting a fresh artifact root. Throughput measurements are
+engineering evidence only; whether the new columns add fee-adjusted edge still
+requires comparable walk-forward folds.

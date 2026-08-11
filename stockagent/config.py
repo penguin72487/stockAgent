@@ -203,10 +203,14 @@ def _normalize_temporal_basis_input(value: object) -> str:
         "raw": "raw_features",
         "raw_feature": "raw_features",
         "features": "raw_features",
+        "input": "input_features",
+        "input_feature": "input_features",
+        "ordinary_features": "input_features",
     }.get(normalized, normalized)
-    if normalized not in {"embedded", "raw_features"}:
+    if normalized not in {"embedded", "raw_features", "input_features"}:
         raise ValueError(
-            "temporal_basis_input must be 'embedded' or 'raw_features'"
+            "temporal_basis_input must be 'embedded', 'raw_features', or "
+            "'input_features'"
         )
     return normalized
 

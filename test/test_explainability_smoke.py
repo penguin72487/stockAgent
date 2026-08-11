@@ -20,6 +20,7 @@ from stockagent.explainability import (
     _evenly_spaced_sample_indices,
     _method_agreement_table,
     _forward_outputs,
+    _plot_barh,
     _perturbation_importance,
     _portfolio_j_lens,
     _combine_j_lens_frames_from_chunks,
@@ -32,6 +33,7 @@ from stockagent.explainability import (
     _score_head_surrogate_shap_chunked,
     _selection_from_weights,
     _streaming_aux_umap_samples,
+    _validate_explainability_plots,
     _write_decision_inventory_streaming,
     _with_numeric,
     _feature_correlations,
@@ -84,6 +86,34 @@ def test_evenly_spaced_sample_indices_stay_in_bounds_above_float32_exact_range()
     assert bool(torch.all(indices[1:] > indices[:-1]))
     assert int(indices.min()) >= 0
     assert int(indices.max()) < n_points
+
+
+def test_large_aux_dimension_profile_is_bounded_and_passes_strict_plot_qa(
+    tmp_path: Path,
+) -> None:
+    dimension_count = 32 * 99
+    frame = pl.DataFrame(
+        {
+            "dim": np.arange(dimension_count, dtype=np.int64),
+            "mean_abs": np.linspace(0.001, 1.0, dimension_count, dtype=np.float64),
+        }
+    )
+    relative_path = "plots/aux_dims/temporal_basis_input_features.png"
+    output_path = tmp_path / relative_path
+
+    _plot_barh(
+        frame,
+        output_path=output_path,
+        label_col="dim",
+        value_col="mean_abs",
+        title="Complete Aux Dimension Profile: temporal_basis_input_features",
+    )
+
+    validation = _validate_explainability_plots(tmp_path, {relative_path})
+    assert len(validation) == 1
+    assert validation[0]["status"] == "ok"
+    assert validation[0]["width"] <= 6000
+    assert validation[0]["height"] <= 3000
 
 
 def test_phase_actions_fail_closed_before_portfolio_explainability() -> None:
@@ -662,6 +692,8 @@ def test_explainability_chunked_attribution_matches_serial_with_fewer_forwards()
     diagnostics = chunked["summary"]["perturb_diagnostics"]
     assert diagnostics["elapsed_s"] >= 0.0
     assert diagnostics["perturbations_per_s"] > 0.0
+    assert all(parameter.requires_grad for parameter in serial_model.parameters())
+    assert all(parameter.requires_grad for parameter in chunked_model.parameters())
 
 
 def test_paper_explainability_lookback_warning_and_heatmap_readability(tmp_path: Path) -> None:
