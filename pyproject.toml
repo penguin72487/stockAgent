@@ -1,0 +1,19 @@
+[tool.pytest.ini_options]
+testpaths = ["test"]
+python_files = ["test_*.py"]
+
+[tool.ruff]
+target-version = "py312"
+extend-exclude = [
+  ".build",
+  ".codex",
+  "artifacts",
+  "artifacts_*",
+  "data_*",
+]
+
+[tool.ruff.lint]
+# Keep the repository-wide default focused on errors that can change execution.
+# Style cleanup can be enabled directory by directory after the legacy scripts
+# have been normalized.
+select = ["E9", "F63", "F7", "F82"]

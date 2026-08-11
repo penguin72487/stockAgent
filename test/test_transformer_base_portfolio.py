@@ -16,11 +16,14 @@ from stockagent.models.factory import build_model, model_hidden_dim_hint
 from stockagent.models.transformer_base_portfolio import (
     FlashSDPAAttention,
     LegacyDynamicTokenGenerator,
+    ONLINE_SAFE_TEMPORAL_BASIS_FAMILIES,
     PortfolioRMSNorm,
     SwiGLUFeedForward,
+    TemporalBasisFeatureEncoder,
     TransformerBasePortfolioModel,
     _compiled_cross_attention_requires_blackwell_workaround,
     _sanitize_scores_to_dtype,
+    _temporal_basis_matrix,
 )
 from stockagent.models.normalization import (
     masked_activation_l1_weights,
@@ -32,6 +35,7 @@ from stockagent.training.loss import risk_aware_loss
 from stockagent.training.trainer import (
     _DynamicSymbolPanelSlabWrapper,
     _extract_weights_and_aux,
+    _active_model_config,
     _load_state_dict,
     _maybe_compact_train_windowed_symbols,
     _PanelSlabForwardWrapper,
@@ -189,6 +193,201 @@ def test_attention_modes_forward(mode: str) -> None:
     assert torch.all(weights.abs().sum(dim=1) <= 1.0 + 1e-5)
     assert bool((weights > 0).any().item())
     assert bool((weights < 0).any().item())
+
+
+@pytest.mark.parametrize(
+    "family",
+    ONLINE_SAFE_TEMPORAL_BASIS_FAMILIES,
+)
+def test_temporal_basis_banks_are_orthonormal_and_non_dc(family: str) -> None:
+    basis = _temporal_basis_matrix(family, steps=32, components=8).double()
+
+    torch.testing.assert_close(
+        basis @ basis.transpose(0, 1),
+        torch.eye(8, dtype=torch.float64),
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    torch.testing.assert_close(
+        basis.sum(dim=1),
+        torch.zeros(8, dtype=torch.float64),
+        rtol=0.0,
+        atol=1e-6,
+    )
+
+
+def test_temporal_multi_basis_forward_aux_mask_and_gradients() -> None:
+    device = _device()
+    model = _make_model(
+        lookback=8,
+        attention_mode="market_token",
+        temporal_basis_families=("wavelet", "fourier", "dct"),
+        temporal_basis_components=4,
+        return_aux=True,
+        return_aux_details=True,
+    ).train()
+    x = torch.randn(2, 8, 13, 11, device=device, requires_grad=True)
+    mask = torch.ones(2, 13, dtype=torch.bool, device=device)
+    mask[1, -2:] = False
+
+    weights, _scores, aux = model(x, mask, return_aux=True)
+    aux["score_logits"].square().mean().backward()
+
+    assert model.temporal_basis_families == ("haar", "fourier", "dct")
+    assert weights.shape == (2, 13)
+    assert weights[1, -2:].abs().max().item() == 0.0
+    assert aux["temporal_basis_input_features"].shape == (2, 13, 312)
+    assert aux["temporal_basis_output"].shape == (2, 13, 24)
+    for family in model.temporal_basis_families:
+        assert aux[f"temporal_basis_{family}_coefficients"].shape == (
+            2,
+            4,
+            13,
+            24,
+        )
+    assert x.grad is not None
+    assert torch.isfinite(x.grad).all()
+    assert model.temporal_basis_feature_encoder is not None
+    encoder = model.temporal_basis_feature_encoder
+    assert set(dict(encoder.named_parameters())) == {
+        "feature_projection.weight",
+        "feature_projection.bias",
+    }
+    projection_grad = encoder.feature_projection.weight.grad
+    assert projection_grad is not None
+    assert torch.isfinite(projection_grad).all()
+
+
+def test_temporal_basis_coefficients_are_plain_input_features() -> None:
+    torch.manual_seed(41)
+    encoder = TemporalBasisFeatureEncoder(
+        lookback=8,
+        dim=3,
+        families=("dct",),
+        components=2,
+    )
+    temporal = torch.randn(2, 8, 4, 3)
+    z_base = torch.randn(2, 4, 3)
+    mask = torch.ones(2, 4, dtype=torch.bool)
+
+    output, aux = encoder(temporal, z_base, mask, collect_aux=True)
+    basis = encoder.dct_basis
+    coefficients = torch.einsum("kl,blsd->bksd", basis, temporal)
+    expected_features = torch.cat(
+        (z_base, coefficients.permute(0, 2, 1, 3).flatten(start_dim=2)),
+        dim=-1,
+    )
+
+    torch.testing.assert_close(
+        aux["temporal_basis_input_features"],
+        expected_features,
+    )
+    torch.testing.assert_close(
+        output,
+        encoder.feature_projection(expected_features),
+    )
+    assert not hasattr(encoder, "gate")
+    assert not hasattr(encoder, "fusion")
+    assert not hasattr(encoder, "energy_mix_logits")
+
+
+def test_raw_feature_basis_fused_projection_matches_explicit_coefficients() -> None:
+    torch.manual_seed(57)
+    encoder = TemporalBasisFeatureEncoder(
+        lookback=8,
+        dim=3,
+        source_dim=5,
+        families=("haar", "dct", "learned"),
+        components=2,
+        fuse_projection=True,
+    )
+    temporal = torch.randn(2, 8, 4, 5, requires_grad=True)
+    z_base = torch.randn(2, 4, 3, requires_grad=True)
+    mask = torch.ones(2, 4, dtype=torch.bool)
+    mask[1, -1] = False
+
+    with_aux, aux = encoder(temporal, z_base, mask, collect_aux=True)
+    fused, _ = encoder(temporal, z_base, mask, collect_aux=False)
+
+    explicit = encoder.feature_projection(aux["temporal_basis_input_features"])
+    explicit = explicit.masked_fill(~mask.unsqueeze(-1), 0.0)
+    torch.testing.assert_close(fused, with_aux, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(fused, explicit, rtol=1e-5, atol=1e-6)
+    assert aux["temporal_basis_input_features"].shape == (2, 4, 33)
+    assert aux["temporal_basis_original_path"].shape == (2, 4, 3)
+    for family in ("haar", "dct", "learned"):
+        assert aux[f"temporal_basis_{family}_coefficients"].shape == (
+            2,
+            2,
+            4,
+            5,
+        )
+
+    fused.square().mean().backward()
+    assert temporal.grad is not None
+    assert torch.isfinite(temporal.grad).all()
+    assert encoder.learned_basis.grad is not None
+    assert torch.isfinite(encoder.learned_basis.grad).all()
+
+
+def test_online_complete_temporal_basis_forward_and_learned_dictionary_grad() -> None:
+    device = _device()
+    model = _make_model(
+        lookback=32,
+        attention_mode="temporal_only",
+        temporal_pooling="last",
+        temporal_query_mode="last_only",
+        temporal_basis_families=ONLINE_SAFE_TEMPORAL_BASIS_FAMILIES,
+        temporal_basis_components=4,
+        return_aux=True,
+        return_aux_details=True,
+    ).train()
+    x = torch.randn(1, 32, 5, 11, device=device, requires_grad=True)
+    mask = torch.ones(1, 5, dtype=torch.bool, device=device)
+
+    _weights, _scores, aux = model(x, mask, return_aux=True)
+    aux["score_logits"].square().mean().backward()
+
+    encoder = model.temporal_basis_feature_encoder
+    assert encoder is not None
+    assert isinstance(encoder.learned_basis, torch.nn.Parameter)
+    assert set(dict(encoder.named_parameters())) == {
+        "learned_basis",
+        "feature_projection.weight",
+        "feature_projection.bias",
+    }
+    assert encoder.learned_basis.grad is not None
+    assert torch.isfinite(encoder.learned_basis.grad).all()
+    assert "temporal_basis_learned_coefficients" in aux
+    assert "learned_basis" in encoder.state_dict()
+    assert "haar_basis" not in encoder.state_dict()
+
+
+def test_temporal_basis_rejects_unknown_family_and_non_dyadic_haar() -> None:
+    with pytest.raises(ValueError, match="Unsupported temporal basis family"):
+        _make_model(temporal_basis_families=("emd",))
+    with pytest.raises(ValueError, match="power of two"):
+        _make_model(lookback=6, temporal_basis_families=("haar",))
+    with pytest.raises(ValueError, match="power of two"):
+        _make_model(lookback=6, temporal_basis_families=("walsh",))
+
+
+def test_disabled_temporal_basis_keeps_legacy_model_fingerprint_projection() -> None:
+    config = load_config("configs/experiment_baseline.yaml")
+    config.training.model_name = "transformer_base_portfolio"
+
+    disabled = _active_model_config(config)["values"]
+    assert not any(name.startswith("temporal_basis_") for name in disabled)
+
+    config.training.transformer_base_portfolio.temporal_basis_families = ["dct"]
+    enabled = _active_model_config(config)["values"]
+    assert enabled["temporal_basis_families"] == ["dct"]
+    assert enabled["temporal_basis_components"] == 8
+    assert "temporal_basis_input" not in enabled
+
+    config.training.transformer_base_portfolio.temporal_basis_input = "raw_features"
+    raw_enabled = _active_model_config(config)["values"]
+    assert raw_enabled["temporal_basis_input"] == "raw_features"
 
 
 @pytest.mark.parametrize("feature_idx", [1, 2])
@@ -709,6 +908,61 @@ def test_forward_from_panel_slab_equivalence_for_contiguous_rows() -> None:
     assert torch.allclose(weights_x, weights_slab, atol=1e-5, rtol=1e-5)
     assert torch.allclose(scores_x, scores_slab, atol=1e-5, rtol=1e-5)
     assert torch.allclose(aux_x["score_logits"], aux_slab["score_logits"], atol=1e-5, rtol=1e-5)
+
+
+def test_temporal_multi_basis_panel_paths_and_embedding_reuse_match() -> None:
+    device = _device()
+    model = _make_model(
+        lookback=8,
+        attention_mode="market_token",
+        temporal_pooling="last",
+        temporal_query_mode="last_only",
+        temporal_basis_families=("haar", "fourier", "dct"),
+        temporal_basis_components=4,
+        return_aux=True,
+        return_aux_details=True,
+    ).eval()
+    feature_slab = torch.randn(11, 13, 11, device=device)
+    date_indices = torch.arange(7, 11, dtype=torch.long, device=device)
+    windows = feature_slab.unfold(0, 8, 1).permute(0, 3, 1, 2).contiguous()
+    mask = torch.ones(4, 13, dtype=torch.bool, device=device)
+    mask[-1, -2:] = False
+
+    with torch.no_grad():
+        materialized = model(windows, mask, return_aux=True)
+        panel = model.forward_from_panel(
+            feature_slab,
+            date_indices,
+            mask,
+            return_aux=True,
+        )
+        slab = model.forward_from_panel_slab(
+            feature_slab,
+            mask,
+            return_aux=True,
+        )
+        projected = model.project_features_for_explainability(windows)
+        embedded = model.embed_projected_for_explainability(projected)
+        temporal_embeddings = model.temporal_stock_embeddings_for_explainability(
+            embedded,
+            mask,
+        )
+
+    for expected, actual in ((materialized, panel), (materialized, slab)):
+        torch.testing.assert_close(actual[0], expected[0], rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(actual[1], expected[1], rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(
+            actual[2]["temporal_basis_output"],
+            expected[2]["temporal_basis_output"],
+            rtol=1e-5,
+            atol=1e-6,
+        )
+    torch.testing.assert_close(
+        temporal_embeddings,
+        materialized[2]["stock_embedding"],
+        rtol=1e-5,
+        atol=1e-6,
+    )
 
 
 def test_panel_slab_compiles_fullgraph_on_cpu_with_compact_symbols_and_backward() -> None:

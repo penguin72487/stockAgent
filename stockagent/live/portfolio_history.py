@@ -135,6 +135,23 @@ def _read_day_trade_close_nav(root: Path):
     if path is None:
         return None, None
     frame = _read_table(path)
+    if "execution_mode" in frame.columns:
+        invalid_modes = (
+            frame.select(
+                pl.col("execution_mode")
+                .cast(pl.Utf8, strict=False)
+                .str.to_lowercase()
+                .filter(pl.col("execution_mode").is_not_null())
+                .unique()
+            )
+            .to_series()
+            .to_list()
+        )
+        invalid_modes = [mode for mode in invalid_modes if mode != "tw_day_trade"]
+        if invalid_modes:
+            raise ValueError(
+                f"{path} contains non-day-trade execution modes: {sorted(invalid_modes)}"
+            )
     required = {"date", "settled_cash", "payables_total", "receivables_total"}
     if not required.issubset(frame.columns):
         return None, path
@@ -255,6 +272,31 @@ def _float_or_none(value: Any) -> float | None:
     return number
 
 
+def _validate_day_trade_holdings_contract(holdings, path: Path) -> None:
+    """Fail closed when saved non-cash records are not opening-auction positions."""
+
+    if "record_type" not in holdings.columns:
+        return
+    import polars as pl
+
+    invalid = holdings.filter(
+        (~pl.col("is_cash").cast(pl.Boolean).fill_null(False))
+        & (
+            pl.col("record_type")
+            .cast(pl.Utf8, strict=False)
+            .fill_null("")
+            .str.to_lowercase()
+            != "day_trade_open"
+        )
+    )
+    if invalid.height:
+        sample = invalid.select([name for name in ("date", "symbol", "record_type") if name in invalid.columns]).head(5)
+        raise ValueError(
+            f"{path} contains {invalid.height} non-opening day-trade holding records; "
+            f"sample={sample.to_dicts()}"
+        )
+
+
 class _PriceLookup:
     def __init__(
         self,
@@ -326,8 +368,12 @@ def _change_row(
     prev_market_value = float((previous or {}).get("market_value") or 0.0)
     day_trade = str(execution_mode).strip().lower() == "tw_day_trade"
     price = _float_or_none((current or {}).get("price"))
+    entry_price_source = "holdings_day_trade_open" if day_trade and price is not None else None
     if day_trade and price_lookup is not None:
-        price = price_lookup.get(symbol, date) or price
+        official_open = price_lookup.get(symbol, date)
+        if official_open is not None:
+            price = official_open
+            entry_price_source = "official_ohlc_open"
     elif resolve_missing_prices and price is None and price_lookup is not None:
         price = price_lookup.get(symbol, date)
     if resolve_missing_prices and price is None:
@@ -360,6 +406,10 @@ def _change_row(
         "price": price,
         "entry_price": price if day_trade else None,
         "exit_price": exit_price,
+        "entry_price_source": entry_price_source,
+        "exit_price_source": "official_ohlc_close" if day_trade and exit_price is not None else None,
+        "price_contract": "session_open_to_close" if day_trade else "mark_to_mark",
+        "intraday_price_included": False if day_trade else None,
         "prev_price": prev_price,
         "price_return": price_return,
         "stock_return": stock_return,
@@ -389,8 +439,14 @@ def _enrich_change_row_prices(
     price = _float_or_none(row.get("price"))
     prev_price = _float_or_none(row.get("prev_price"))
     action_text = str(row.get("action") or "").upper()
+    entry_price_source = row.get("entry_price_source")
     if day_trade:
-        price = price_lookup.get(symbol, date) or price
+        official_open = price_lookup.get(symbol, date)
+        if official_open is not None:
+            price = official_open
+            entry_price_source = "official_ohlc_open"
+        elif price is not None:
+            entry_price_source = entry_price_source or "holdings_day_trade_open"
     elif action_text.startswith("EXIT"):
         price = price_lookup.get(symbol, date) or price
     if price is None:
@@ -410,6 +466,10 @@ def _enrich_change_row_prices(
     enriched["price"] = price
     enriched["entry_price"] = price if day_trade else None
     enriched["exit_price"] = exit_price
+    enriched["entry_price_source"] = entry_price_source
+    enriched["exit_price_source"] = "official_ohlc_close" if day_trade and exit_price is not None else None
+    enriched["price_contract"] = "session_open_to_close" if day_trade else "mark_to_mark"
+    enriched["intraday_price_included"] = False if day_trade else None
     enriched["prev_price"] = prev_price
     enriched["price_return"] = price_return
     enriched["stock_return"] = position_adjusted_stock_return(return_weight, price_return)
@@ -538,6 +598,8 @@ def load_portfolio_history(
         execution_mode=execution_mode,
     )
     day_trade = str(execution_mode).strip().lower() == "tw_day_trade"
+    if day_trade and not is_bar_frequency(history_frequency):
+        _validate_day_trade_holdings_contract(holdings, holdings_path)
     returns, returns_path = _read_returns(root, frequency=history_frequency)
     holdings = holdings.with_row_index(_ROW_INDEX_COL).select(
         [
@@ -634,6 +696,15 @@ def load_portfolio_history(
             changes, change_counts = [], {}
         row = dict(row)
         row["execution_mode"] = str(execution_mode)
+        row["position_source"] = "executed_history"
+        row["source"] = (
+            "integer_share_backtest"
+            if returns_path is not None
+            and returns_path.name.startswith("integer_share_")
+            else "backtest"
+        )
+        row["price_contract"] = "session_open_to_close" if day_trade else "mark_to_mark"
+        row["intraday_price_included"] = False if day_trade else None
         requested = requested_summaries.get(date)
         if requested is not None:
             row.update(requested)

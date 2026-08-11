@@ -4,17 +4,24 @@ Multi-asset Taiwan stock trading research workspace.
 
 ## Current status
 
-- Raw research data lives under `data_parquet/`.
-- Each parquet file represents one stock symbol, for example `2330_features.parquet`.
-- The current training and validation specification is documented in `docs/training_spec.md`.
-- Market-specific experiment templates live under `configs/markets/`, for example `configs/markets/tw.yaml`. The legacy `configs/experiment_baseline.yaml` is kept for compatibility.
+- Start with the [documentation index](docs/README.md) and the
+  [current training contract](docs/training_spec.md).
+- The 2026-08-10 whole-project engineering review is recorded in
+  [docs/PROJECT_REVIEW_2026-08-10.md](docs/PROJECT_REVIEW_2026-08-10.md).
+- Raw research data is kept outside Git under the configured data roots. Do not
+  assume every market uses `data_parquet/`; the resolved market YAML is the
+  authority for a run.
+- Market-specific experiment templates live under `configs/markets/`, for
+  example `configs/markets/tw.yaml`. The legacy
+  `configs/experiment_baseline.yaml` is kept for compatibility.
 
-## Planned workflow
+## System workflow
 
 1. Normalize all symbol parquet files into a shared date x symbol panel.
 2. Build benchmark returns from each market config's `data.benchmark_name`; use `universe_average_return` only when an explicit universe-average benchmark is desired.
 3. Run yearly expanding-window walk-forward validation.
-4. Train GPU-enabled reference models first, then portfolio and RL policies.
+4. Train the configured model through the canonical loss/backtest path, then
+   publish checkpointed, reproducible artifacts for evaluation or deployment.
 
 ## Dataset snapshot sync (desync + Syncthing)
 
@@ -423,6 +430,10 @@ run_fintech_python train.py --config configs/experiment_baseline.yaml
 The environment checker prints the selected Python/CUDA roots, inherited values
 before normalization, tool paths, package versions, and GPU inventory. Add
 `--strict` when warnings (including a non-`fintech` prefix) should fail CI.
+
+The commands below this point are operator notes from specific machines. Treat
+them as examples, not as a reproducible environment lock or a safe unattended
+upgrade procedure. Prefer the scripts and checked-in market configs above.
 
 To recreate or update the environment:
 

@@ -9,15 +9,18 @@ import numpy as np
 import polars as pl
 
 from services.discord_bot.bot import (
+    bot as stockagent_bot,
     _add_user_watch_symbol,
     _annotate_history_rows_with_display_time,
     _auto_signal_price_source,
     _artifact_backfill_is_current,
     _artifact_backfill_key,
     _can_reuse_latest_signal_now,
+    _config_trading_limits,
     _ConsoleProgress,
     _decision_overview_page,
     _daily_summary_message,
+    _discord_page_kwargs,
     _ensure_signal_ready,
     _filter_watchlist_rows,
     _formal_history_latest_date,
@@ -35,10 +38,13 @@ from services.discord_bot.bot import (
     _portfolio_change_line,
     _portfolio_history_header_lines,
     _portfolio_history_block,
+    _portfolio_history_pages,
+    _validate_day_trade_portfolio_history_result,
     _prepare_realtime_signal_sync,
     _include_live_signals_in_portfolio_history,
     _prepend_latest_signal_row_to_portfolio_history,
     _public_broadcasts_enabled,
+    _raw_score_pages,
     _rebalance_line,
     _remove_user_watch_symbol,
     _resolve_pre_signal_command,
@@ -55,7 +61,9 @@ from services.discord_bot.bot import (
     _clear_scheduled_retry,
     _set_user_subscription,
     _signal_now_should_refresh_data,
+    _normalize_signal_now_mode,
     _summary_age_seconds,
+    _summary_has_raw_score_contract,
     _signal_kwargs,
     _signal_sanity_issues,
     _signal_sanity_level,
@@ -71,6 +79,107 @@ from services.discord_bot.bot import (
     _watch_poll_seconds,
     _wait_for_existing_tw_data_update,
 )
+
+
+def test_portfolio_history_command_has_no_multi_period_page_size_option() -> None:
+    command = stockagent_bot.tree.get_command("portfolio_history")
+    assert command is not None
+    parameters = {parameter.name: parameter for parameter in command.parameters}
+    assert "page_size" not in parameters
+    assert parameters["top_changes"].min_value == 0
+    assert parameters["top_changes"].max_value == 20
+
+
+def test_portfolio_history_renders_exactly_one_day_per_page(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(
+        "services.discord_bot.bot._market_execution_mode",
+        lambda cfg: "tw_day_trade",
+    )
+    cfg = SimpleNamespace(
+        market="tw_day_trade",
+        open_time="09:00",
+        display_timezone="Asia/Taipei",
+    )
+    changes = [
+        {
+            "symbol": f"LONG_SYMBOL_{index}",
+            "name": "很長的測試股票名稱",
+            "action": "BUY",
+            "holding_ratio_delta": 0.01,
+            "holding_ratio": 0.01,
+            "market_value": 10_000.0,
+            "market_value_delta": 10_000.0,
+            "shares": 1000,
+            "share_delta": 1000,
+            "entry_price": 10.0,
+            "exit_price": 10.2,
+            "price_contract": "session_open_to_close",
+            "intraday_price_included": False,
+            "execution_mode": "tw_day_trade",
+        }
+        for index in range(20)
+    ]
+    rows = []
+    for day, daily_return in (("2026-08-07", 0.01), ("2026-08-06", -0.02)):
+        open_nav = 1_000_000.0
+        rows.append(
+            {
+                "date": day,
+                "display_date": f"{day} 09:00:00",
+                "position_source": "executed_history",
+                "source": "integer_share_backtest",
+                "price_contract": "session_open_to_close",
+                "intraday_price_included": False,
+                "portfolio_return": daily_return,
+                "benchmark_return": 0.0,
+                "profit_value": open_nav * daily_return,
+                "open_nav": open_nav,
+                "close_nav": open_nav * (1.0 + daily_return),
+                "turnover": 0.5,
+                "gross_ratio": 0.25,
+                "net_ratio": 0.05,
+                "cash_ratio": 0.95,
+                "position_count": 20,
+                "long_count": 20,
+                "short_count": 0,
+                "change_count": 100,
+                "change_counts": {"OPEN_LONG": 100},
+                "changes": changes,
+                "execution_mode": "tw_day_trade",
+            }
+        )
+    result = SimpleNamespace(
+        rows=rows,
+        frequency="daily",
+        fold_dir=tmp_path / "fold_11",
+        source_paths=(),
+    )
+
+    _validate_day_trade_portfolio_history_result(cfg, result)
+    pages = _portfolio_history_pages(cfg, result)
+
+    assert len(pages) == len(rows) == 2
+    assert all(1850 < len(page) <= 4000 for page in pages)
+    assert "2026-08-07 09:00:00" in pages[0]
+    assert "2026-08-06 09:00:00" not in pages[0]
+    assert "2026-08-06 09:00:00" in pages[1]
+    assert "2026-08-07 09:00:00" not in pages[1]
+    assert "page=1/2" in pages[0]
+    assert "page=2/2" in pages[1]
+    assert "top changes: `20/100`" in pages[0]
+    assert all(f"LONG_SYMBOL_{index}" in pages[0] for index in range(20))
+    assert "`Δhold=" not in pages[0]
+    assert "`Δvalue=" not in pages[0]
+    assert "`Δsh=" not in pages[0]
+    assert "`hold=" in pages[0]
+    assert "`value=" in pages[0]
+    assert "`shares=" in pages[0]
+    assert "`open=" in pages[0]
+    assert "`close=" in pages[0]
+
+    payload = _discord_page_kwargs(pages[0])
+    assert payload["content"] is None
+    assert payload["embed"].description == pages[0]
 
 
 def test_pre_signal_python_sentinel_uses_running_interpreter() -> None:
@@ -556,6 +665,60 @@ def test_can_reuse_latest_signal_now_for_closed_fresh_panel_close() -> None:
     assert reason == "cached_latest_close"
 
 
+def test_signal_now_cache_requires_raw_score_contract() -> None:
+    assert not _summary_has_raw_score_contract({})
+    assert not _summary_has_raw_score_contract({"score_contract": {"schema_version": 0}})
+    assert _summary_has_raw_score_contract(
+        {
+            "score_contract": {
+                "schema_version": 1,
+                "raw_score": "score_logits",
+                "score": "centered_score_logits",
+            }
+        }
+    )
+    assert not _summary_has_raw_score_contract(
+        {
+            "score_contract": {
+                "schema_version": 1,
+                "raw_score": "score_logits",
+            }
+        },
+        require_unconstrained=True,
+    )
+    assert _summary_has_raw_score_contract(
+        {
+            "score_contract": {
+                "schema_version": 2,
+                "raw_score": "score_logits",
+                "raw_score_scope": "all_checkpoint_symbols_unmasked",
+            }
+        },
+        require_unconstrained=True,
+    )
+
+
+def test_signal_now_mode_normalization() -> None:
+    assert _normalize_signal_now_mode("signal") == "signal"
+    assert _normalize_signal_now_mode("raw_scores") == "raw_scores"
+    assert _normalize_signal_now_mode("原始分數") == "raw_scores"
+
+
+def test_raw_score_now_is_a_separate_slash_command() -> None:
+    signal_command = stockagent_bot.tree.get_command("signal_now")
+    raw_command = stockagent_bot.tree.get_command("raw_score_now")
+
+    assert signal_command is not None
+    assert raw_command is not None
+    assert "mode" not in {parameter.name for parameter in signal_command.parameters}
+    assert {parameter.name for parameter in raw_command.parameters} == {
+        "market",
+        "price_source",
+        "refresh_data",
+        "debug",
+    }
+
+
 def test_can_reuse_latest_signal_now_rejects_stale_closed_panel() -> None:
     cfg = SimpleNamespace(market="tw")
     status = SimpleNamespace(
@@ -849,6 +1012,7 @@ def test_scheduled_detail_pages_include_positions_and_rebalances() -> None:
                 "target_weight": 0.05,
                 "delta_weight": 0.04,
                 "score": 1.2,
+                "raw_score": 2.5,
                 "current_price": 10.0,
                 "price_return": 0.02,
             },
@@ -883,6 +1047,7 @@ def test_scheduled_detail_pages_include_positions_and_rebalances() -> None:
                 "current_weight": 0.01,
                 "target_weight": 0.05,
                 "delta_weight": 0.04,
+                "raw_score": 2.5,
                 "trade_price": 10.0,
                 "price_return": 0.02,
             },
@@ -900,6 +1065,11 @@ def test_scheduled_detail_pages_include_positions_and_rebalances() -> None:
     )
 
     position_pages, rebalance_pages = _scheduled_detail_page_groups(cfg, result)
+    limited_position_pages, limited_rebalance_pages = _scheduled_detail_page_groups(
+        cfg,
+        result,
+        max_rows=1,
+    )
     debug_position_pages, debug_rebalance_pages = _scheduled_detail_page_groups(cfg, result, debug=True)
 
     assert len(position_pages) == 1
@@ -912,6 +1082,12 @@ def test_scheduled_detail_pages_include_positions_and_rebalances() -> None:
     assert "`now=1.00%`" in position_pages[0]
     assert "`target=5.00%`" in position_pages[0]
     assert "`delta_value=+40,000`" in rebalance_pages[0]
+    assert "`raw_score=2.5000`" in position_pages[0]
+    assert "`raw_score=2.5000`" in rebalance_pages[0]
+    assert "`rows=1`" in limited_position_pages[0]
+    assert "`rows=1`" in limited_rebalance_pages[0]
+    assert "`CCC`" not in limited_position_pages[0]
+    assert "`CCC`" not in limited_rebalance_pages[0]
     assert "display_tz=" not in position_pages[0]
     assert "output:" not in position_pages[0]
     assert "full:" not in position_pages[0]
@@ -949,6 +1125,7 @@ def test_signal_now_detail_pages_include_actionable_decisions() -> None:
                 "target_weight": 0.05,
                 "delta_weight": 0.04,
                 "score": 1.2,
+                "raw_score": 2.5,
                 "current_price": 10.0,
                 "price_return": 0.02,
             },
@@ -961,6 +1138,7 @@ def test_signal_now_detail_pages_include_actionable_decisions() -> None:
                 "current_weight": 0.01,
                 "target_weight": 0.05,
                 "delta_weight": 0.04,
+                "raw_score": 2.5,
                 "trade_price": 10.0,
                 "price_return": 0.02,
             },
@@ -977,6 +1155,7 @@ def test_signal_now_detail_pages_include_actionable_decisions() -> None:
                 "trade_price": 10.0,
                 "price_return": 0.02,
                 "score": 1.2,
+                "raw_score": 2.5,
                 "abs_score_rank": 1,
                 "abs_target_rank": 1,
                 "tradable": True,
@@ -1015,11 +1194,73 @@ def test_signal_now_detail_pages_include_actionable_decisions() -> None:
     assert "signal_now current / target positions" in position_pages[0]
     assert "signal_now rebalance" in rebalance_pages[0]
     assert "signal_now decision explanations" in decision_pages[0]
+    assert "`raw_score`=模型未置中原始分數" in decision_pages[0]
     assert "`rows=1`" in decision_pages[0]
     assert "`AAA` Alpha **BUY**" in decision_pages[0]
+    assert "`raw_score=2.5000`" in position_pages[0]
+    assert "`raw_score=2.5000`" in rebalance_pages[0]
+    assert "`raw_score=2.5000`" in decision_pages[0]
     assert "`BBB`" not in decision_pages[0]
     assert "full:" not in decision_pages[0]
     assert "full:" in debug_pages[2][0]
+
+
+def test_raw_score_pages_show_complete_universe_without_trade_filtering() -> None:
+    cfg = SimpleNamespace(market="unit")
+    result = SimpleNamespace(
+        summary={
+            "market": "unit",
+            "signal_id": "sig-raw",
+            "asof_date": "2026-08-10",
+            "panel_date": "2026-08-08",
+            "score_contract": {
+                "schema_version": 2,
+                "raw_score": "score_logits",
+                "raw_score_scope": "all_checkpoint_symbols_unmasked",
+            },
+        },
+        weights_rows=[
+            {
+                "symbol": "BLOCKED",
+                "raw_score": -3.0,
+                "current_price": 12.0,
+                "alive": True,
+                "tradable": False,
+                "can_buy": False,
+                "can_sell": False,
+            },
+            {
+                "symbol": "OPEN",
+                "raw_score": 1.0,
+                "current_price": 20.0,
+                "alive": True,
+                "tradable": True,
+                "can_buy": True,
+                "can_sell": True,
+            },
+            {
+                "symbol": "DEAD",
+                "raw_score": 0.5,
+                "alive": False,
+                "tradable": False,
+                "can_buy": False,
+                "can_sell": False,
+            },
+        ],
+    )
+
+    pages = _raw_score_pages(cfg, result)
+
+    content = "\n".join(pages)
+    assert "rows=3" in content
+    assert "scope=all_checkpoint_symbols_unmasked" in content
+    assert "filter=none" in content
+    assert "`BLOCKED`" in content
+    assert "`OPEN`" in content
+    assert "`DEAD`" in content
+    assert "raw_score=-3.000000" in content
+    assert "tradable=False" in content
+    assert "abs_rank=1" in content
 
 
 def test_signal_sanity_blocks_implausible_latest_return() -> None:
@@ -1040,6 +1281,27 @@ def test_signal_sanity_blocks_implausible_latest_return() -> None:
 
     assert _signal_sanity_level(issues) == "BLOCK"
     assert any("portfolio return" in text for _, text in issues)
+
+
+def test_zero_turnover_cap_is_disabled_in_signal_sanity() -> None:
+    cfg = SimpleNamespace(
+        market="tw_day_trade_1m",
+        label="台股當沖 1m",
+        config_path="configs/markets/tw_day_trade_1m.yaml",
+    )
+    gross_limit, turnover_limit = _config_trading_limits(cfg)
+    summary = {
+        "asof_date": "2026-08-10 10:30:00",
+        "panel_date": "2026-08-07 13:30:00",
+        "turnover": 0.2712,
+        "target_risk": {"gross": 0.2712, "top_abs_weight": 0.0025},
+    }
+
+    issues = _signal_sanity_issues(cfg, summary)
+
+    assert gross_limit == 1.0
+    assert turnover_limit is None
+    assert not any("turnover" in text for _, text in issues)
 
 
 def test_stale_data_still_allows_signal_with_notice(monkeypatch) -> None:
@@ -1601,7 +1863,7 @@ def test_portfolio_history_prepend_uses_weights_date_before_panel_date(tmp_path)
     ]
 
 
-def test_portfolio_history_never_persists_day_trade_signal_preview(tmp_path) -> None:
+def test_portfolio_history_excludes_day_trade_preview_without_observed_open(tmp_path) -> None:
     result = SimpleNamespace(rows=[{"date": "2026-07-17"}], end_date="2026-07-17")
     summary = {
         "asof_date": "2026-07-22 10:30:00",
@@ -1619,6 +1881,210 @@ def test_portfolio_history_never_persists_day_trade_signal_preview(tmp_path) -> 
 
     assert inserted is False
     assert result.rows == [{"date": "2026-07-17"}]
+
+
+def test_portfolio_history_excludes_old_nonpreview_day_trade_without_open_contract(tmp_path) -> None:
+    result = SimpleNamespace(rows=[{"date": "2026-07-17"}], end_date="2026-07-17")
+    summary = {
+        "asof_date": "2026-07-22 10:30:00",
+        "panel_data_date": "2026-07-22",
+        "execution_mode": "tw_day_trade",
+        "execution_preview_only": False,
+        "portfolio_simple_return": 0.50,
+    }
+
+    inserted = _prepend_latest_signal_row_to_portfolio_history(
+        result,
+        summary_path=tmp_path / "summary.json",
+        summary=summary,
+        max_rows=32,
+    )
+
+    assert inserted is False
+    assert result.rows == [{"date": "2026-07-17"}]
+
+
+def test_portfolio_history_includes_observed_open_day_trade_target(tmp_path) -> None:
+    weights_path = tmp_path / "target_weights.parquet"
+    pl.DataFrame(
+        {
+            "symbol": ["AAA", "BBB"],
+            "name": ["Alpha", "Beta"],
+            "action": ["BUY", "SELL"],
+            "current_weight": [0.0, 0.0],
+            "target_weight": [0.4, -0.6],
+            "delta_weight": [0.4, -0.6],
+            "abs_delta_weight": [0.4, 0.6],
+            "current_price": [10.0, 20.0],
+            "open_price": [9.5, 19.0],
+        }
+    ).write_parquet(weights_path)
+    summary_path = tmp_path / "summary.json"
+    summary_path.write_text("{}", encoding="utf-8")
+    result = SimpleNamespace(
+        rows=[
+            {
+                "date": "2026-08-07",
+                "portfolio_return": 0.01,
+                "benchmark_return": 0.01,
+                "profit_value": 10.0,
+            }
+        ],
+        source_paths=(),
+        days=2,
+        top_changes=2,
+        min_abs_change=0.001,
+        start_date="2026-08-07",
+        end_date="2026-08-07",
+        period_return=0.01,
+        benchmark_return=0.01,
+        profit_value=10.0,
+        capital=SimpleNamespace(capital=1_000.0),
+        execution_mode="tw_day_trade",
+    )
+    summary = {
+        "weights_date": "2026-08-10 09:57:07",
+        "panel_date": "2026-08-10 09:57:08",
+        "execution_mode": "tw_day_trade",
+        "execution_preview_only": True,
+        "live_session_open_feature_applied": True,
+        "opening_price_available_count": 2,
+        "signal_price_contract": {
+            "schema_version": 1,
+            "model_observation": "session_open",
+            "history_effective_price": "session_open",
+            "intraday_prices_allowed_in_portfolio_history": False,
+        },
+        "execution_constraints_complete": False,
+        "execution_constraints_notice": "同日官方當沖資格尚未完整套用",
+        "portfolio_simple_return": None,
+        "benchmark_simple_return": 0.012,
+        "turnover": 1.0,
+        "target_risk": {
+            "gross": 1.0,
+            "net": -0.2,
+            "long_gross": 0.4,
+            "short_gross": 0.6,
+        },
+        "weights_path": str(weights_path),
+        "price_source": "twse_tpex:mis",
+        "price_timestamp": "2026-08-10T01:57:08+00:00",
+    }
+
+    inserted = _prepend_latest_signal_row_to_portfolio_history(
+        result,
+        summary_path=summary_path,
+        summary=summary,
+        max_rows=2,
+    )
+
+    assert inserted is True
+    assert result.rows[0]["date"] == "2026-08-10 09:57:07"
+    assert result.rows[0]["position_source"] == "signal_target"
+    assert result.rows[0]["source"] == "live_signal_open_target"
+    assert result.rows[0]["price_contract"] == "session_open_target"
+    assert result.rows[0]["intraday_price_included"] is False
+    assert result.rows[0]["portfolio_return"] is None
+    assert result.rows[0]["change_count"] == 2
+    assert result.rows[0]["changes"][0]["symbol"] == "BBB"
+    assert result.rows[0]["changes"][0]["price"] == 19.0
+    assert result.rows[0]["changes"][0]["entry_price_source"] == "saved_session_open"
+    assert result.rows[0]["changes"][0]["price_contract"] == "session_open_target"
+    assert result.rows[0]["changes"][0]["intraday_price_included"] is False
+    assert result.rows[0]["changes"][0]["price_return"] is None
+    block = _portfolio_history_block(result.rows[0])
+    assert "source=signal_target" in block
+    assert "target_gross=100.00%" in block
+    assert "open=19.00" in block
+    assert "同日官方當沖資格尚未完整套用" in block
+
+
+def test_portfolio_history_keeps_one_open_price_signal_not_later_intraday_snapshot(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    result = SimpleNamespace(
+        rows=[{"date": "2026-08-07", "portfolio_return": 0.01, "profit_value": 10.0}],
+        source_paths=(),
+        days=2,
+        top_changes=1,
+        min_abs_change=0.001,
+        start_date="2026-08-07",
+        end_date="2026-08-07",
+        period_return=0.01,
+        benchmark_return=0.01,
+        profit_value=10.0,
+        capital=SimpleNamespace(capital=1_000.0),
+        execution_mode="tw_day_trade",
+    )
+    contract = {
+        "schema_version": 1,
+        "model_observation": "session_open",
+        "history_effective_price": "session_open",
+        "intraday_prices_allowed_in_portfolio_history": False,
+    }
+    signals = []
+    for label, asof, target, current_price in (
+        ("open", "2026-08-10 09:05:00", 0.1, 12.0),
+        ("intraday", "2026-08-10 11:30:00", 0.9, 18.0),
+    ):
+        signal_dir = tmp_path / label
+        signal_dir.mkdir()
+        weights_path = signal_dir / "target_weights.parquet"
+        pl.DataFrame(
+            {
+                "symbol": ["AAA"],
+                "action": ["BUY"],
+                "current_weight": [0.0],
+                "target_weight": [target],
+                "delta_weight": [target],
+                "abs_delta_weight": [target],
+                "open_price": [10.0],
+                "current_price": [current_price],
+            }
+        ).write_parquet(weights_path)
+        summary_path = signal_dir / "summary.json"
+        summary_path.write_text("{}", encoding="utf-8")
+        signals.append(
+            (
+                summary_path,
+                {
+                    "asof_date": asof,
+                    "weights_date": asof,
+                    "previous_weights_data_date": "2026-08-07",
+                    "execution_mode": "tw_day_trade",
+                    "execution_preview_only": True,
+                    "live_session_open_feature_applied": True,
+                    "opening_price_available_count": 100,
+                    "signal_price_contract": contract,
+                    "weights_path": str(weights_path),
+                    "turnover": target,
+                    "target_risk": {
+                        "gross": target,
+                        "net": target,
+                        "long_gross": target,
+                        "short_gross": 0.0,
+                    },
+                },
+            )
+        )
+    monkeypatch.setattr(
+        "services.discord_bot.bot._recent_market_signals",
+        lambda cfg, max_summaries: signals,
+    )
+    monkeypatch.setattr(
+        "services.discord_bot.bot._market_fold_dir",
+        lambda cfg: tmp_path / "fold",
+    )
+    cfg = SimpleNamespace(market="tw_day_trade", open_time="09:00")
+
+    _include_live_signals_in_portfolio_history(cfg, result, max_rows=2)
+
+    assert result.rows[0]["date"] == "2026-08-10 09:00:00"
+    assert result.rows[0]["gross_ratio"] == 0.1
+    assert result.rows[0]["changes"][0]["price"] == 10.0
+    assert signals[0][0] in result.source_paths
+    assert signals[1][0] not in result.source_paths
 
 
 def test_portfolio_history_prepend_keeps_panel_display_time(tmp_path) -> None:

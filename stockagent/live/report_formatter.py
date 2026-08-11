@@ -69,6 +69,11 @@ def _float_or_none(value: Any) -> float | None:
     return number
 
 
+def _raw_score(row: dict[str, Any]) -> Any:
+    value = row.get("raw_score")
+    return value if _float_or_none(value) is not None else row.get("score")
+
+
 def _fmt_money(value: Any) -> str:
     number = _float_or_none(value)
     if number is None:
@@ -283,7 +288,7 @@ def format_signal_message(summary: dict[str, Any], *, max_rows: int = 12, debug:
         if score_drivers:
             lines.append("score drivers:")
             lines.extend(
-                f"  {index}. {str(row.get('symbol'))}: score={_fmt_float(row.get('score'), 3)}"
+                f"  {index}. {str(row.get('symbol'))}: raw_score={_fmt_float(_raw_score(row), 3)}"
                 for index, row in enumerate(score_drivers, start=1)
             )
         if feature_drivers:

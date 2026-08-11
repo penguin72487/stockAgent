@@ -37,18 +37,21 @@ from stockagent.live.report_formatter import format_signal_message, is_display_p
 from stockagent.live.market_status import cumulative_recent_returns, short_file_fingerprint
 from stockagent.live.time_display import DEFAULT_DISPLAY_TIMEZONE, display_timezone_label
 from stockagent.models.factory import build_model
-from stockagent.training.trainer import (
-    _autocast_context,
-    _call_model,
-    _checkpoint_manifest,
-    _extract_weights_and_aux,
-    _align_panel_to_state_dict_universe,
-    _configure_backtest_runtime_from_config,
-    _load_checkpoint,
-    _load_state_dict,
-    _resolve_amp_dtype,
-    _resolve_device,
-    _validate_checkpoint_manifest,
+from stockagent.training.inference_contract import (
+    align_panel_to_checkpoint_universe,
+    build_checkpoint_manifest,
+    checkpoint_manifest_symbols,
+    configure_inference_runtime,
+    validate_checkpoint_manifest,
+)
+from stockagent.training.runtime import (
+    autocast_context,
+    call_model,
+    extract_weights_and_aux,
+    load_checkpoint,
+    load_model_state_dict,
+    resolve_amp_dtype,
+    resolve_device,
 )
 
 
@@ -1084,12 +1087,17 @@ def _build_decision_rows(
     can_buy_mask: np.ndarray,
     can_sell_mask: np.ndarray,
     aux: dict[str, torch.Tensor] | None,
+    raw_scores: np.ndarray | None = None,
 ) -> list[dict[str, Any]]:
     symbol_count = len(symbols)
     score_arr = None
     if scores is not None:
         score_arr = np.asarray(scores, dtype=np.float64)
+    raw_score_arr = None
+    if raw_scores is not None:
+        raw_score_arr = np.asarray(raw_scores, dtype=np.float64)
     score_ranks = _abs_rank(score_arr, symbol_count)
+    raw_score_ranks = _abs_rank(raw_score_arr, symbol_count)
     target_ranks = _abs_rank(target_weights, symbol_count)
     gate = _aux_scalar_by_symbol(aux, "stock_market_gate", symbol_count, reduction="mean")
     market_delta_norm = _aux_scalar_by_symbol(aux, "z_market_delta", symbol_count, reduction="norm")
@@ -1101,6 +1109,11 @@ def _build_decision_rows(
         delta_weight = float(target_weight - current_weight)
         action = classify_rebalance_action(current_weight, target_weight, delta_weight=delta_weight)
         score = _finite_float_or_none(score_arr[idx]) if score_arr is not None else None
+        raw_score = (
+            _finite_float_or_none(raw_score_arr[idx])
+            if raw_score_arr is not None
+            else score
+        )
         raw_price_return = _finite_float_or_none(price_returns[idx])
         constraint = _constraint_note(
             tradable=bool(tradable_mask[idx]),
@@ -1119,7 +1132,9 @@ def _build_decision_rows(
                 "decision_reason": _decision_reason(action, score, float(model_weights[idx]), constraint),
                 "constraint": constraint,
                 "score": score,
+                "raw_score": raw_score,
                 "abs_score_rank": int(score_ranks[idx]),
+                "abs_raw_score_rank": int(raw_score_ranks[idx]),
                 "model_weight": float(model_weights[idx]),
                 "current_weight": current_weight,
                 "target_weight": target_weight,
@@ -1184,7 +1199,11 @@ def _top_position_rows_from_weights(rows: list[dict[str, Any]], top_n: int) -> l
                 "target_weight": weight,
                 "delta_weight": float(row.get("delta_weight") or 0.0),
                 "current_price": row.get("current_price"),
+                "open_price": row.get("open_price"),
                 "model_weight": float(row.get("model_weight") or 0.0),
+                "score": row.get("score"),
+                "raw_score": row.get("raw_score", row.get("score")),
+                "abs_raw_score_rank": row.get("abs_raw_score_rank"),
                 "tradable": bool(row.get("tradable", True)),
                 "can_buy": bool(row.get("can_buy", True)),
                 "can_sell": bool(row.get("can_sell", True)),
@@ -1249,6 +1268,7 @@ def _compact_decision_bullets(rows: list[dict[str, Any]], limit: int = 15) -> li
             f"{label}: {row.get('action', 'HOLD')} "
             f"delta={_fmt_md_value(row.get('delta_weight'), pct=True, digits=2)} "
             f"target={_fmt_md_value(row.get('target_weight'), pct=True, digits=2)} "
+            f"raw_score={_fmt_md_value(row.get('raw_score', row.get('score')), digits=4)} "
             f"score={_fmt_md_value(row.get('score'), digits=4)} "
             f"rank={row.get('abs_score_rank', '')} "
             f"px={_fmt_md_value(row.get('trade_price'), digits=2)} "
@@ -1303,7 +1323,7 @@ def _decision_report_markdown(summary: dict[str, Any], decision_rows: list[dict[
             if name:
                 label += f" {name}"
             lines.append(
-                f"- {label}: score={_fmt_md_value(row.get('score'), digits=6)} "
+                f"- {label}: raw_score={_fmt_md_value(row.get('raw_score', row.get('score')), digits=6)} "
                 f"target={_fmt_md_value(row.get('target_weight'), pct=True, digits=2)} "
                 f"px={_fmt_md_value(row.get('current_price'), digits=2)}"
             )
@@ -1320,6 +1340,7 @@ def _decision_report_markdown(summary: dict[str, Any], decision_rows: list[dict[
             "",
             "## Field Guide",
             "",
+            "- raw_score: original uncentered model score/logit from score_logits (rank_logits fallback).",
             "- score: model score/logit used for cross-sectional ranking. Positive usually supports long exposure; negative usually supports short or sell pressure.",
             "- model_weight: raw model portfolio weight before the trading simulator applies turnover, fee, leverage, and buy/sell constraints.",
             "- current_weight: drifted current holding before today's rebalance.",
@@ -1362,8 +1383,10 @@ def _write_text_artifacts(result: LiveSignalResult, output_dir: Path) -> None:
                 ("current", "current_weight", "pct"),
                 ("delta", "delta_weight", "pct"),
                 ("px", "current_price", "price"),
+                ("open_px", "open_price", "price"),
                 ("stock_ret", "stock_return", "pct"),
                 ("pnl_contrib", "portfolio_contribution", "pct"),
+                ("raw_score", "raw_score", "float"),
                 ("score", "score", "float"),
                 ("action", "action", "text"),
                 ("status", "position_status", "text"),
@@ -1383,8 +1406,10 @@ def _write_text_artifacts(result: LiveSignalResult, output_dir: Path) -> None:
                 ("now", "current_weight", "pct"),
                 ("target", "target_weight", "pct"),
                 ("px", "trade_price", "price"),
+                ("open_px", "open_price", "price"),
                 ("stock_ret", "stock_return", "pct"),
                 ("pnl_contrib", "portfolio_contribution", "pct"),
+                ("raw_score", "raw_score", "float"),
                 ("status", "position_status", "text"),
             ],
         ),
@@ -1399,12 +1424,14 @@ def _write_text_artifacts(result: LiveSignalResult, output_dir: Path) -> None:
                 ("name", "name", "text"),
                 ("action", "action", "text"),
                 ("reason", "decision_reason", "text"),
+                ("raw_score", "raw_score", "float"),
                 ("score", "score", "float"),
                 ("score_rank", "abs_score_rank", "text"),
                 ("target", "target_weight", "pct"),
                 ("current", "current_weight", "pct"),
                 ("delta", "delta_weight", "pct"),
                 ("px", "trade_price", "price"),
+                ("open_px", "open_price", "price"),
                 ("stock_ret", "stock_return", "pct"),
                 ("pnl_contrib", "portfolio_contribution", "pct"),
                 ("constraint", "constraint", "text"),
@@ -1447,11 +1474,35 @@ def _top_score_drivers(
                 "symbol": str(symbols[int(idx)]),
                 "name": str((symbol_names or {}).get(str(symbols[int(idx)]), "")),
                 "score": float(score_arr[int(idx)]),
+                "raw_score": float(score_arr[int(idx)]),
                 "target_weight": float(weights[int(idx)]),
                 "current_price": float(prices[int(idx)]) if np.isfinite(prices[int(idx)]) else None,
             }
         )
     return rows
+
+
+def _raw_score_tensor_from_model_output(
+    model_output: Any,
+    aux: dict[str, torch.Tensor] | None,
+) -> tuple[torch.Tensor | None, str | None]:
+    containers: list[dict[str, Any]] = []
+    if isinstance(aux, dict):
+        containers.append(aux)
+    if isinstance(model_output, dict) and model_output is not aux:
+        containers.append(model_output)
+    for container in containers:
+        for key in ("score_logits", "rank_logits"):
+            value = container.get(key)
+            if isinstance(value, torch.Tensor):
+                return value, key
+    if (
+        isinstance(model_output, tuple)
+        and len(model_output) >= 2
+        and isinstance(model_output[1], torch.Tensor)
+    ):
+        return model_output[1], "scores"
+    return None, None
 
 
 def _feature_driver_summary(
@@ -1536,6 +1587,7 @@ def generate_live_signal(
     previous_signal_backfill_limit: int = 8,
     progress_callback: ProgressCallback | None = None,
     progress_label: str | None = None,
+    include_unconstrained_raw_scores: bool = False,
     _panel_override: PanelData | None = None,
 ) -> LiveSignalResult:
     progress_total = 17
@@ -1547,7 +1599,7 @@ def generate_live_signal(
     if device is not None:
         config.environment.device = str(device)
     os.environ["STOCKAGENT_STRICT_NO_FALLBACK"] = "1" if config.training.strict_no_fallback else "0"
-    _configure_backtest_runtime_from_config(config)
+    configure_inference_runtime(config)
     if getattr(config.training, "inference_backtest_autotune", None) is not None:
         os.environ["STOCKAGENT_BACKTEST_AUTOTUNE"] = (
             "1" if bool(config.training.inference_backtest_autotune) else "0"
@@ -1569,11 +1621,11 @@ def generate_live_signal(
     trading_frequency = str(getattr(config.trading, "frequency", "") or "")
     intraday_frequency = _is_intraday_frequency(trading_frequency)
 
-    runtime_device = _resolve_device(config)
-    amp_dtype = _resolve_amp_dtype(config.environment.amp_dtype)
+    runtime_device = resolve_device(config)
+    amp_dtype = resolve_amp_dtype(config.environment.amp_dtype)
     non_blocking = bool(config.training.non_blocking_transfer and runtime_device.type == "cuda")
 
-    checkpoint_payload = _load_checkpoint(checkpoint)
+    checkpoint_payload = load_checkpoint(checkpoint)
     _emit_progress(progress_callback, label=progress_name, step=3, total=progress_total, message="checkpoint loaded")
     state_dict = checkpoint_payload.get("model_state_dict")
     if not isinstance(state_dict, dict):
@@ -1585,10 +1637,11 @@ def generate_live_signal(
         else _build_panel(config, live_tail=True)
     )
     _emit_progress(progress_callback, label=progress_name, step=4, total=progress_total, message="panel ready")
-    panel = _align_panel_to_state_dict_universe(
+    panel = align_panel_to_checkpoint_universe(
         panel,
         resolved_output_dir / f"fold_{resolved_fold_id:02d}",
         state_dict,
+        checkpoint_symbols=checkpoint_manifest_symbols(checkpoint_payload),
         context=f"live signal {market_id or resolved_fold_id}",
         allow_missing_masked=True,
     )
@@ -1597,9 +1650,9 @@ def generate_live_signal(
         raise RuntimeError(
             f"checkpoint fold mismatch: path requests {resolved_fold_id}, payload contains {saved_fold_id}"
         )
-    _validate_checkpoint_manifest(
+    validate_checkpoint_manifest(
         checkpoint_payload,
-        _checkpoint_manifest(panel, config, include_data_content=False),
+        build_checkpoint_manifest(panel, config, include_data_content=False),
         checkpoint_path=checkpoint,
         scope="model",
     )
@@ -1801,7 +1854,11 @@ def generate_live_signal(
         num_symbols=panel.num_symbols,
         feature_names=panel.feature_names,
     ).to(runtime_device)
-    _load_state_dict(model, state_dict)
+    load_model_state_dict(
+        model,
+        state_dict,
+        strict_no_fallback=bool(config.training.strict_no_fallback),
+    )
     model.eval()
     _emit_progress(progress_callback, label=progress_name, step=11, total=progress_total, message="model ready")
 
@@ -1861,17 +1918,38 @@ def generate_live_signal(
         # prior day's intraday exposure is not an overnight holding.
         current_weights = np.zeros_like(current_weights)
 
+    unconstrained_aux: dict[str, torch.Tensor] | None = None
+    unconstrained_raw_score_tensor: torch.Tensor | None = None
+    unconstrained_raw_score_source: str | None = None
     with torch.inference_mode():
         x = torch.from_numpy(x_np).unsqueeze(0).to(device=runtime_device, non_blocking=non_blocking)
         mask = torch.from_numpy(mask_np).unsqueeze(0).to(device=runtime_device, non_blocking=non_blocking)
-        with _autocast_context(runtime_device, amp_dtype):
-            model_output = _call_model(model, x, mask, return_aux=True)
-            model_weights_t, aux = _extract_weights_and_aux(model_output)
+        with autocast_context(runtime_device, amp_dtype):
+            model_output = call_model(model, x, mask, return_aux=True)
+            model_weights_t, aux = extract_weights_and_aux(model_output)
             model_weights_t = _require_single_target_live_weights(
                 model_weights_t,
                 execution_mode=execution_mode,
                 expected_symbols=panel.num_symbols,
             )
+            if include_unconstrained_raw_scores:
+                # This second pass deliberately exposes every checkpoint symbol to
+                # the model.  Its score logits are for inspection only and never
+                # feed the executable target/backtest path below.
+                unconstrained_output = call_model(
+                    model,
+                    x,
+                    torch.ones_like(mask, dtype=torch.bool),
+                    return_aux=True,
+                )
+                _, unconstrained_aux = extract_weights_and_aux(unconstrained_output)
+                (
+                    unconstrained_raw_score_tensor,
+                    unconstrained_raw_score_source,
+                ) = _raw_score_tensor_from_model_output(
+                    unconstrained_output,
+                    unconstrained_aux,
+                )
         _emit_progress(progress_callback, label=progress_name, step=12, total=progress_total, message="model inference done")
         model_weights = model_weights_t[0].detach().float().cpu().numpy().astype(np.float64)
         if execution_preview_only:
@@ -1879,10 +1957,20 @@ def generate_live_signal(
             if execution_mode == "tw_day_trade":
                 if day_trade_live_session or panel.day_trade_eligible_mask is None:
                     execution_constraints_complete = False
+                    has_limit_snapshot = bool(
+                        price_snapshot.upper_limit_prices is not None
+                        and price_snapshot.lower_limit_prices is not None
+                        and (
+                            np.any(np.isfinite(price_snapshot.upper_limit_prices))
+                            or np.any(np.isfinite(price_snapshot.lower_limit_prices))
+                        )
+                    )
+                    applied_limits = "與已取得的漲跌停限制" if has_limit_snapshot else ""
+                    missing_limits = "、完整漲跌停快照" if not has_limit_snapshot else ""
                     execution_constraints_notice = (
-                        "盤中決策列尚未取得同日官方現股當沖資格快照；以下已套用即時開盤"
-                        "報價與漲跌停限制，但保留未套用同日資格限制的模型目標，僅供研究，"
-                        "不能視為可執行委託。"
+                        f"盤中決策列尚未取得同日官方現股當沖資格{missing_limits}；"
+                        f"以下已套用開盤報價{applied_limits}，但保留未套用完整同日限制的模型目標，"
+                        "僅供研究，不能視為可執行委託。"
                     )
                 else:
                     eligible = np.asarray(
@@ -1965,14 +2053,38 @@ def generate_live_signal(
         )
 
     score_values: np.ndarray | None = None
+    raw_score_values: np.ndarray | None = None
+    raw_score_source: str | None = None
+    if include_unconstrained_raw_scores:
+        raw_score_tensor = unconstrained_raw_score_tensor
+        raw_score_source = unconstrained_raw_score_source
+    else:
+        raw_score_tensor, raw_score_source = _raw_score_tensor_from_model_output(
+            model_output,
+            aux,
+        )
+    if raw_score_tensor is not None:
+        raw_score_values = (
+            raw_score_tensor[0].detach().float().cpu().numpy().astype(np.float64)
+        )
     if aux is not None:
+        masked_raw_score_tensor = aux.get("score_logits")
+        if masked_raw_score_tensor is None:
+            masked_raw_score_tensor = aux.get("rank_logits")
         score_tensor = aux.get("centered_score_logits")
         if score_tensor is None:
-            score_tensor = aux.get("score_logits")
+            score_tensor = masked_raw_score_tensor
         if score_tensor is None:
             score_tensor = aux.get("rank_logits")
         if score_tensor is not None:
             score_values = score_tensor[0].detach().float().cpu().numpy().astype(np.float64)
+        if (
+            raw_score_values is None
+            and score_values is not None
+            and not include_unconstrained_raw_scores
+        ):
+            raw_score_values = score_values.copy()
+            raw_score_source = "centered_score_logits"
 
     benchmark_simple = estimate_benchmark_return(
         panel.symbols,
@@ -2003,7 +2115,7 @@ def generate_live_signal(
     )
     score_drivers = _top_score_drivers(
         panel.symbols,
-        score_values,
+        raw_score_values,
         target_weights,
         current_prices,
         symbol_names=symbol_names,
@@ -2023,6 +2135,20 @@ def generate_live_signal(
     _emit_progress(progress_callback, label=progress_name, step=14, total=progress_total, message="risk and explanations ready")
 
     weights_rows: list[dict[str, Any]] = []
+    raw_score_ranks = _abs_rank(raw_score_values, panel.num_symbols)
+    opening_prices = (
+        np.asarray(price_snapshot.open_prices, dtype=np.float64)
+        if price_snapshot.open_prices is not None
+        else np.full((panel.num_symbols,), np.nan, dtype=np.float64)
+    )
+    opening_price_available_count = int(
+        np.count_nonzero(np.isfinite(opening_prices) & (opening_prices > 0.0))
+    )
+    session_open_signal = bool(
+        execution_mode == "tw_day_trade"
+        and day_trade_live_session
+        and opening_price_available_count > 0
+    )
     price_return = np.divide(
         current_prices,
         drift_base_prices,
@@ -2042,6 +2168,12 @@ def generate_live_signal(
                 "name": str(symbol_names.get(str(symbol), "")),
                 "action": action,
                 "score": _finite_float_or_none(score_values[idx]) if score_values is not None else None,
+                "raw_score": (
+                    _finite_float_or_none(raw_score_values[idx])
+                    if raw_score_values is not None
+                    else None
+                ),
+                "abs_raw_score_rank": int(raw_score_ranks[idx]),
                 "model_weight": float(model_weights[idx]),
                 "current_weight": current_weight,
                 "target_weight": float(target_weights[idx]),
@@ -2050,12 +2182,14 @@ def generate_live_signal(
                 "base_price": float(drift_base_prices[idx]) if np.isfinite(drift_base_prices[idx]) else None,
                 "panel_price": float(panel_prices[idx]) if np.isfinite(panel_prices[idx]) else None,
                 "current_price": float(current_prices[idx]) if np.isfinite(current_prices[idx]) else None,
+                "open_price": float(opening_prices[idx]) if np.isfinite(opening_prices[idx]) else None,
                 "price_return": raw_price_return,
                 "stock_return": _position_stock_return(current_weight, raw_price_return),
                 "portfolio_contribution": _position_portfolio_contribution(current_weight, raw_price_return),
                 "tradable": bool(mask_np[idx]),
                 "can_buy": bool(can_buy_np[idx]),
                 "can_sell": bool(can_sell_np[idx]),
+                "alive": bool(panel.alive_mask[panel_idx, idx]),
                 "position_status": _position_status(
                     tradable=bool(mask_np[idx]),
                     current_weight=current_weight,
@@ -2071,7 +2205,10 @@ def generate_live_signal(
         if not meta:
             continue
         row["score"] = meta.get("score")
+        row["raw_score"] = meta.get("raw_score", meta.get("score"))
+        row["abs_raw_score_rank"] = meta.get("abs_raw_score_rank")
         row["model_weight"] = meta.get("model_weight")
+        row["open_price"] = meta.get("open_price")
         row["tradable"] = meta.get("tradable")
         row["can_buy"] = meta.get("can_buy")
         row["can_sell"] = meta.get("can_sell")
@@ -2086,6 +2223,7 @@ def generate_live_signal(
         current_weights=current_weights,
         target_weights=target_weights,
         scores=score_values,
+        raw_scores=raw_score_values,
         current_prices=current_prices,
         base_prices=drift_base_prices,
         price_returns=price_return,
@@ -2094,6 +2232,10 @@ def generate_live_signal(
         can_sell_mask=can_sell_np,
         aux=aux,
     )
+    for row in decision_rows:
+        meta = weight_meta_by_symbol.get(str(row.get("symbol") or ""))
+        if meta:
+            row["open_price"] = meta.get("open_price")
     actionable_decisions = [row for row in decision_rows if str(row.get("action") or "") != "HOLD"]
     decision_action_counts = _action_counts(decision_rows)
     _emit_progress(progress_callback, label=progress_name, step=15, total=progress_total, message="rows formatted")
@@ -2158,6 +2300,13 @@ def generate_live_signal(
         "price_timestamp": price_timestamp,
         "price_data_date": price_timestamp,
         "price_available_count": int(price_snapshot.available_count),
+        "opening_price_available_count": opening_price_available_count,
+        "signal_price_contract": {
+            "schema_version": 1,
+            "model_observation": "session_open" if session_open_signal else "completed_panel",
+            "history_effective_price": "session_open" if session_open_signal else "current_price",
+            "intraday_prices_allowed_in_portfolio_history": False,
+        },
         "symbol_count": int(panel.num_symbols),
         "valid_price_count": int(drift.valid_price_count),
         "portfolio_simple_return": None if execution_preview_only else float(drift.simple_return),
@@ -2170,6 +2319,23 @@ def generate_live_signal(
         "current_risk": current_risk,
         "target_risk": target_risk,
         "risk_warnings": risk_warnings,
+        "score_contract": {
+            "schema_version": 2,
+            "raw_score": raw_score_source or "unavailable",
+            "raw_score_scope": (
+                "all_checkpoint_symbols_unmasked"
+                if include_unconstrained_raw_scores and raw_score_values is not None
+                else "trade_attention_mask"
+                if raw_score_values is not None
+                else "unavailable"
+            ),
+            "raw_score_filters_applied": False,
+            "score": (
+                "centered_score_logits"
+                if isinstance(aux, dict) and aux.get("centered_score_logits") is not None
+                else raw_score_source or "unavailable"
+            ),
+        },
         "market_notice": str(market_notice) if market_notice else None,
         "recent_performance": recent_performance,
         "model_explanation": {

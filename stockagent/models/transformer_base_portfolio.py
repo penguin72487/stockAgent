@@ -48,6 +48,64 @@ _ACTION_SCHEMA_BY_EXECUTION_MODE: dict[str, str] = {
     "tw_overnight": "due_exit_open_close_entries_v2_shared_direction",
 }
 
+_TEMPORAL_BASIS_ALIASES: dict[str, str] = {
+    "wavelet": "haar",
+    "haar_wavelet": "haar",
+    "walsh_hadamard": "walsh",
+    "hadamard": "walsh",
+    "fft": "fourier",
+    "real_fourier": "fourier",
+    "cosine": "dct",
+    "dct_ii": "dct",
+    "slepian": "dpss",
+    "multitaper": "dpss",
+    "ema": "exponential",
+    "ewma": "exponential",
+    "decay": "exponential",
+    "derivative": "difference",
+    "trend_filter": "difference",
+    "ar": "ar_innovation",
+    "innovation": "ar_innovation",
+    "burg": "ar_innovation",
+    "spline": "bspline",
+    "cubic_spline": "bspline",
+    "gabor": "local_cosine",
+    "mdct": "local_cosine",
+    "local_fourier": "local_cosine",
+    "morlet_wavelet": "morlet",
+    "db2": "swt_db2",
+    "stationary_wavelet_db2": "swt_db2",
+    "sym4": "swt_sym4",
+    "stationary_wavelet_sym4": "swt_sym4",
+    "wavelet_packet_db2": "wavelet_packet",
+    "shapelet": "learned",
+    "dictionary": "learned",
+    "learned_shapelet": "learned",
+    "polynomial": "legendre",
+    "taylor": "legendre",
+}
+ONLINE_SAFE_TEMPORAL_BASIS_FAMILIES: tuple[str, ...] = (
+    "haar",
+    "swt_db2",
+    "swt_sym4",
+    "wavelet_packet",
+    "walsh",
+    "fourier",
+    "dct",
+    "dpss",
+    "local_cosine",
+    "morlet",
+    "exponential",
+    "laguerre",
+    "difference",
+    "ar_innovation",
+    "bspline",
+    "legendre",
+    "chebyshev",
+    "learned",
+)
+_TEMPORAL_BASIS_FAMILIES = frozenset(ONLINE_SAFE_TEMPORAL_BASIS_FAMILIES)
+
 
 def action_channels_for_execution_mode(execution_mode: str) -> tuple[str, ...]:
     """Return the fixed model-output channels for one canonical execution mode."""
@@ -161,6 +219,753 @@ class GatedProjection(nn.Module):
         else:
             projected = F.gelu(projected)
         return self.dropout(projected)
+
+
+def _normalize_temporal_basis_families(
+    families: Sequence[str] | str | None,
+) -> tuple[str, ...]:
+    """Normalize the fixed temporal bases without silently accepting no-ops."""
+
+    if families is None:
+        return ()
+    raw_families = families.split(",") if isinstance(families, str) else families
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for family in raw_families:
+        name = str(family).strip().lower().replace("-", "_")
+        if not name:
+            continue
+        name = _TEMPORAL_BASIS_ALIASES.get(name, name)
+        if name not in _TEMPORAL_BASIS_FAMILIES:
+            supported = ", ".join(sorted(_TEMPORAL_BASIS_FAMILIES))
+            raise ValueError(
+                f"Unsupported temporal basis family {family!r}; supported: {supported}"
+            )
+        if name not in seen:
+            normalized.append(name)
+            seen.add(name)
+    return tuple(normalized)
+
+
+def _normalize_temporal_basis_input(value: str | None) -> str:
+    """Resolve which representation is decomposed along the time axis."""
+
+    normalized = str(value or "embedded").strip().lower().replace("-", "_")
+    aliases = {
+        "embedding": "embedded",
+        "embeddings": "embedded",
+        "latent": "embedded",
+        "raw": "raw_features",
+        "raw_feature": "raw_features",
+        "features": "raw_features",
+    }
+    normalized = aliases.get(normalized, normalized)
+    if normalized not in {"embedded", "raw_features"}:
+        raise ValueError(
+            "temporal_basis_input must be 'embedded' or 'raw_features'"
+        )
+    return normalized
+
+
+def _haar_basis(steps: int) -> list[torch.Tensor]:
+    if steps < 2 or steps & (steps - 1):
+        raise ValueError(
+            "Haar temporal basis requires lookback to be a power of two and >= 2"
+        )
+    rows: list[torch.Tensor] = []
+    support = steps
+    while support >= 2:
+        scale = 1.0 / math.sqrt(float(support))
+        half = support // 2
+        for start in range(0, steps, support):
+            row = torch.zeros(steps, dtype=torch.float64)
+            row[start : start + half] = scale
+            row[start + half : start + support] = -scale
+            rows.append(row)
+        support //= 2
+    return rows
+
+
+def _walsh_basis(steps: int) -> list[torch.Tensor]:
+    if steps < 2 or steps & (steps - 1):
+        raise ValueError(
+            "Walsh temporal basis requires lookback to be a power of two and >= 2"
+        )
+    matrix = torch.ones((1, 1), dtype=torch.float64)
+    while int(matrix.size(0)) < steps:
+        matrix = torch.cat(
+            (
+                torch.cat((matrix, matrix), dim=1),
+                torch.cat((matrix, -matrix), dim=1),
+            ),
+            dim=0,
+        )
+    rows = [row / math.sqrt(float(steps)) for row in matrix[1:]]
+    return sorted(
+        rows,
+        key=lambda row: int((row[1:] != row[:-1]).sum().item()),
+    )
+
+
+def _fourier_basis(steps: int) -> list[torch.Tensor]:
+    positions = torch.arange(steps, dtype=torch.float64)
+    rows: list[torch.Tensor] = []
+    for frequency in range(1, steps // 2 + 1):
+        angle = 2.0 * math.pi * float(frequency) * positions / float(steps)
+        cosine = torch.cos(angle)
+        rows.append(cosine / cosine.norm().clamp_min(1e-12))
+        sine = torch.sin(angle)
+        if float(sine.norm().item()) > 1e-10:
+            rows.append(sine / sine.norm())
+    return rows
+
+
+def _dct_basis(steps: int) -> list[torch.Tensor]:
+    positions = torch.arange(steps, dtype=torch.float64) + 0.5
+    scale = math.sqrt(2.0 / float(steps))
+    return [
+        torch.cos(math.pi * float(degree) * positions / float(steps)) * scale
+        for degree in range(1, steps)
+    ]
+
+
+def _orthonormal_polynomial_basis(steps: int, family: str) -> list[torch.Tensor]:
+    positions = torch.linspace(-1.0, 1.0, steps, dtype=torch.float64)
+    raw_rows = [torch.ones_like(positions), positions]
+    for degree in range(2, steps):
+        if family == "legendre":
+            row = (
+                (2 * degree - 1) * positions * raw_rows[-1]
+                - (degree - 1) * raw_rows[-2]
+            ) / float(degree)
+        else:
+            row = 2.0 * positions * raw_rows[-1] - raw_rows[-2]
+        raw_rows.append(row)
+
+    constant = raw_rows[0] / raw_rows[0].norm()
+    orthonormal: list[torch.Tensor] = []
+    for raw in raw_rows[1:]:
+        row = raw - torch.dot(raw, constant) * constant
+        for previous in orthonormal:
+            row = row - torch.dot(row, previous) * previous
+        norm = row.norm()
+        if float(norm.item()) <= 1e-10:
+            continue
+        row = row / norm
+        if float(torch.dot(row, raw).item()) < 0.0:
+            row = -row
+        orthonormal.append(row)
+    return orthonormal
+
+
+def _orthonormalize_non_dc_rows(
+    raw_rows: Sequence[torch.Tensor],
+    *,
+    steps: int,
+) -> list[torch.Tensor]:
+    """Return a stable ordered orthonormal bank orthogonal to the DC vector."""
+
+    constant = torch.ones(steps, dtype=torch.float64)
+    constant = constant / constant.norm()
+    orthonormal: list[torch.Tensor] = []
+    for raw in raw_rows:
+        raw64 = raw.to(dtype=torch.float64).reshape(-1)
+        if int(raw64.numel()) != steps or not bool(torch.isfinite(raw64).all()):
+            raise ValueError("Temporal basis rows must be finite and match lookback")
+        row = raw64 - torch.dot(raw64, constant) * constant
+        # Two modified Gram-Schmidt passes keep float32-exported banks stable
+        # enough for the fixed-bank orthogonality contract.
+        for _ in range(2):
+            for previous in orthonormal:
+                row = row - torch.dot(row, previous) * previous
+        norm = row.norm()
+        if float(norm.item()) <= 1e-10:
+            continue
+        row = row / norm
+        # Eigensolvers may choose either sign for the same DPSS vector. Fix the
+        # orientation by the largest-magnitude entry so reconstruction after a
+        # checkpoint load is deterministic across BLAS implementations.
+        pivot = int(row.abs().argmax().item())
+        if float(row[pivot].item()) < 0.0:
+            row = -row
+        orthonormal.append(row)
+        if len(orthonormal) >= steps - 1:
+            break
+    return orthonormal
+
+
+def _dpss_basis(steps: int) -> list[torch.Tensor]:
+    """Slepian sequences ordered by finite-window spectral concentration."""
+
+    time = torch.arange(steps, dtype=torch.float64)
+    offsets = time[:, None] - time[None, :]
+    time_bandwidth = min(2.5, max(0.75, float(steps) / 4.0 - 1e-6))
+    half_bandwidth = time_bandwidth / float(steps)
+    concentration = torch.where(
+        offsets == 0,
+        torch.full_like(offsets, 2.0 * half_bandwidth),
+        torch.sin(2.0 * math.pi * half_bandwidth * offsets)
+        / (math.pi * offsets),
+    )
+    _eigenvalues, eigenvectors = torch.linalg.eigh(concentration)
+    return [row for row in eigenvectors.transpose(0, 1).flip(0)]
+
+
+def _exponential_basis(steps: int, components: int) -> list[torch.Tensor]:
+    lags = torch.arange(steps - 1, -1, -1, dtype=torch.float64)
+    count = min(steps, max(components * 3, 12))
+    half_lives = torch.logspace(
+        math.log10(0.5),
+        math.log10(max(2.0, float(steps) * 2.0)),
+        count,
+        dtype=torch.float64,
+    )
+    return [torch.exp(-math.log(2.0) * lags / half_life) for half_life in half_lives]
+
+
+def _laguerre_basis(steps: int, components: int) -> list[torch.Tensor]:
+    lags = torch.arange(steps - 1, -1, -1, dtype=torch.float64)
+    x = lags / max(1.0, float(steps) / 6.0)
+    polynomial_rows = [torch.ones_like(x)]
+    if steps > 1:
+        polynomial_rows.append(1.0 - x)
+    for degree in range(2, min(steps, max(components * 2 + 2, 12))):
+        polynomial_rows.append(
+            (
+                (2.0 * degree - 1.0 - x) * polynomial_rows[-1]
+                - (degree - 1.0) * polynomial_rows[-2]
+            )
+            / float(degree)
+        )
+    envelope = torch.exp(-0.5 * x)
+    return [envelope * polynomial for polynomial in polynomial_rows]
+
+
+def _log_spaced_horizons(steps: int, count: int) -> list[int]:
+    if steps <= 1:
+        return []
+    count = min(max(1, int(count)), steps - 1)
+    raw = torch.logspace(
+        0.0,
+        math.log10(float(steps - 1)),
+        count,
+        dtype=torch.float64,
+    ).round().to(torch.long)
+    horizons: list[int] = []
+    for value in raw.tolist() + list(range(1, steps)):
+        horizon = min(steps - 1, max(1, int(value)))
+        if horizon not in horizons:
+            horizons.append(horizon)
+        if len(horizons) >= count:
+            break
+    return horizons
+
+
+def _difference_basis(steps: int, components: int) -> list[torch.Tensor]:
+    horizons = _log_spaced_horizons(steps, max(components * 2, 12))
+    first_order: list[torch.Tensor] = []
+    second_order: list[torch.Tensor] = []
+    for horizon in horizons:
+        first = torch.zeros(steps, dtype=torch.float64)
+        first[-1] = 1.0
+        first[-1 - horizon] = -1.0
+        first_order.append(first)
+        if 2 * horizon < steps:
+            second = torch.zeros(steps, dtype=torch.float64)
+            second[-1] = 1.0
+            second[-1 - horizon] = -2.0
+            second[-1 - 2 * horizon] = 1.0
+            second_order.append(second)
+    return first_order + second_order
+
+
+def _ar_innovation_basis(steps: int, components: int) -> list[torch.Tensor]:
+    if steps < 2:
+        return []
+    past_lags = torch.arange(steps - 1, 0, -1, dtype=torch.float64)
+    count = min(steps - 1, max(components * 3, 12))
+    half_lives = torch.logspace(
+        math.log10(0.5),
+        math.log10(max(2.0, float(steps))),
+        count,
+        dtype=torch.float64,
+    )
+    rows: list[torch.Tensor] = []
+    for half_life in half_lives:
+        past_weights = torch.exp(-math.log(2.0) * past_lags / half_life)
+        past_weights = past_weights / past_weights.sum().clamp_min(1e-12)
+        row = torch.zeros(steps, dtype=torch.float64)
+        row[:-1] = -past_weights
+        row[-1] = 1.0
+        rows.append(row)
+    return rows
+
+
+def _bspline_basis(steps: int, components: int) -> list[torch.Tensor]:
+    positions = torch.linspace(0.0, 1.0, steps, dtype=torch.float64)
+    count = min(steps, max(components * 3, 12))
+    centers = torch.linspace(-0.1, 1.1, count, dtype=torch.float64)
+    width = max(2.0 / float(steps - 1), 1.2 / float(max(2, count - 1)))
+    rows: list[torch.Tensor] = []
+    for center in centers:
+        distance = ((positions - center) / width).abs()
+        row = torch.where(
+            distance < 1.0,
+            (4.0 - 6.0 * distance.square() + 3.0 * distance.pow(3)) / 6.0,
+            torch.where(
+                distance < 2.0,
+                (2.0 - distance).pow(3) / 6.0,
+                torch.zeros_like(distance),
+            ),
+        )
+        rows.append(row)
+    return rows
+
+
+def _local_cosine_basis(steps: int, components: int) -> list[torch.Tensor]:
+    positions = torch.linspace(0.0, 1.0, steps, dtype=torch.float64)
+    rows: list[torch.Tensor] = []
+    center_count = min(5, max(3, components // 2 + 1))
+    centers = torch.linspace(0.1, 0.9, center_count, dtype=torch.float64)
+    for frequency in range(1, max(4, components + 1)):
+        for center in centers:
+            scale = 0.18 if frequency <= 2 else 0.12
+            window = torch.exp(-0.5 * ((positions - center) / scale).square())
+            phase = 2.0 * math.pi * float(frequency) * (positions - center)
+            rows.append(window * torch.cos(phase))
+            rows.append(window * torch.sin(phase))
+    return rows
+
+
+def _morlet_basis(steps: int, components: int) -> list[torch.Tensor]:
+    positions = torch.linspace(-1.0, 1.0, steps, dtype=torch.float64)
+    rows: list[torch.Tensor] = []
+    scales = (0.18, 0.32, 0.55)
+    centers = torch.linspace(-0.65, 0.65, 5, dtype=torch.float64)
+    for scale in scales:
+        for center in centers:
+            localized = (positions - center) / scale
+            envelope = torch.exp(-0.5 * localized.square())
+            rows.append(envelope * torch.cos(5.0 * localized))
+            rows.append(envelope * torch.sin(5.0 * localized))
+            if len(rows) >= max(components * 3, 12):
+                return rows
+    return rows
+
+
+def _qmf_high_pass(low_pass: torch.Tensor) -> torch.Tensor:
+    signs = torch.where(
+        torch.arange(low_pass.numel()) % 2 == 0,
+        torch.ones(low_pass.numel(), dtype=torch.float64),
+        -torch.ones(low_pass.numel(), dtype=torch.float64),
+    )
+    return low_pass.flip(0) * signs
+
+
+def _place_filter_at_end(
+    filter_values: torch.Tensor,
+    *,
+    steps: int,
+    dilation: int = 1,
+    end: int | None = None,
+) -> torch.Tensor | None:
+    end = steps - 1 if end is None else int(end)
+    indices = end - torch.arange(filter_values.numel(), dtype=torch.long) * int(dilation)
+    if int(indices.min().item()) < 0 or end >= steps:
+        return None
+    row = torch.zeros(steps, dtype=torch.float64)
+    row[indices] = filter_values
+    return row
+
+
+def _stationary_wavelet_basis(
+    steps: int,
+    low_pass: Sequence[float],
+) -> list[torch.Tensor]:
+    low = torch.tensor(tuple(low_pass), dtype=torch.float64)
+    high = _qmf_high_pass(low)
+    levels: list[tuple[int, tuple[int, int]]] = []
+    dilation = 1
+    while (int(low.numel()) - 1) * dilation + 1 <= steps:
+        effective_width = (int(low.numel()) - 1) * dilation + 1
+        levels.append(
+            (
+                dilation,
+                (steps - 1, steps - 1 - max(1, effective_width // 2)),
+            )
+        )
+        dilation *= 2
+
+    rows: list[torch.Tensor] = []
+    # Round-robin by scale before adding shifted/low-pass atoms. A compact
+    # four-component bank must still see all feasible wavelet scales.
+    for filter_values, end_index in (
+        (high, 0),
+        (low, 0),
+        (high, 1),
+        (low, 1),
+    ):
+        for dilation, ends in levels:
+            end = ends[end_index]
+            row = _place_filter_at_end(
+                filter_values,
+                steps=steps,
+                dilation=dilation,
+                end=end,
+            )
+            if row is not None:
+                rows.append(row)
+    return rows
+
+
+def _full_convolve(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
+    result = torch.zeros(
+        int(left.numel()) + int(right.numel()) - 1,
+        dtype=torch.float64,
+    )
+    for index in range(int(left.numel())):
+        result[index : index + int(right.numel())] += left[index] * right
+    return result
+
+
+def _wavelet_packet_basis(steps: int, components: int) -> list[torch.Tensor]:
+    low = torch.tensor(
+        (
+            -0.12940952255126034,
+            0.2241438680420134,
+            0.8365163037378079,
+            0.48296291314453416,
+        ),
+        dtype=torch.float64,
+    )
+    high = _qmf_high_pass(low)
+    paths = [torch.ones(1, dtype=torch.float64)]
+    depth_rows: list[list[torch.Tensor]] = []
+    for depth in range(1, 5):
+        dilation = 2 ** (depth - 1)
+        next_paths: list[torch.Tensor] = []
+        rows: list[torch.Tensor] = []
+        for path in paths:
+            for filter_values in (low, high):
+                dilated = torch.zeros(
+                    (int(filter_values.numel()) - 1) * dilation + 1,
+                    dtype=torch.float64,
+                )
+                dilated[::dilation] = filter_values
+                effective = _full_convolve(path, dilated)
+                if int(effective.numel()) <= steps:
+                    next_paths.append(effective)
+                    row = _place_filter_at_end(effective, steps=steps)
+                    if row is not None:
+                        rows.append(row)
+        if not next_paths:
+            break
+        depth_rows.append(rows)
+        paths = next_paths
+    if not depth_rows:
+        return []
+    eligible = [rows for rows in depth_rows if len(rows) <= components]
+    primary = max(eligible, key=len) if eligible else depth_rows[0]
+    return primary + [
+        row
+        for rows in reversed(depth_rows)
+        if rows is not primary
+        for row in rows
+    ]
+
+
+_DB2_LOW_PASS = (
+    -0.12940952255126034,
+    0.2241438680420134,
+    0.8365163037378079,
+    0.48296291314453416,
+)
+_SYM4_LOW_PASS = (
+    -0.07576571478927333,
+    -0.02963552764599851,
+    0.49761866763201545,
+    0.8037387518059161,
+    0.29785779560527736,
+    -0.09921954357684722,
+    -0.012603967262037833,
+    0.0322231006040427,
+)
+
+
+def _temporal_basis_matrix(
+    family: str,
+    *,
+    steps: int,
+    components: int,
+) -> torch.Tensor:
+    """Build a deterministic non-DC analysis bank for one causal window."""
+
+    normalized = _normalize_temporal_basis_families((family,))
+    if len(normalized) != 1:
+        raise ValueError("Exactly one temporal basis family is required")
+    family = normalized[0]
+    steps = int(steps)
+    components = int(components)
+    if steps < 2:
+        raise ValueError("Temporal basis decomposition requires lookback >= 2")
+    if components < 1:
+        raise ValueError("temporal_basis_components must be positive")
+
+    if family == "haar":
+        rows = _haar_basis(steps)
+    elif family == "walsh":
+        rows = _walsh_basis(steps)
+    elif family == "fourier":
+        rows = _fourier_basis(steps)
+    elif family == "dct":
+        rows = _dct_basis(steps)
+    elif family == "dpss":
+        rows = _dpss_basis(steps)
+    elif family == "exponential":
+        rows = _exponential_basis(steps, components)
+    elif family == "laguerre":
+        rows = _laguerre_basis(steps, components)
+    elif family == "difference":
+        rows = _difference_basis(steps, components)
+    elif family == "ar_innovation":
+        rows = _ar_innovation_basis(steps, components)
+    elif family == "bspline":
+        rows = _bspline_basis(steps, components)
+    elif family == "local_cosine":
+        rows = _local_cosine_basis(steps, components)
+    elif family == "morlet":
+        rows = _morlet_basis(steps, components)
+    elif family == "swt_db2":
+        rows = _stationary_wavelet_basis(steps, _DB2_LOW_PASS)
+    elif family == "swt_sym4":
+        rows = _stationary_wavelet_basis(steps, _SYM4_LOW_PASS)
+    elif family == "wavelet_packet":
+        rows = _wavelet_packet_basis(steps, components)
+    elif family in {"legendre", "chebyshev"}:
+        rows = _orthonormal_polynomial_basis(steps, family)
+    else:
+        # The learned dictionary starts from a stable non-DC DCT bank and is
+        # registered as a parameter by TemporalBasisFeatureEncoder.
+        rows = _dct_basis(steps)
+    rows = _orthonormalize_non_dc_rows(rows, steps=steps)
+    if not rows:
+        raise ValueError(
+            f"Temporal basis family {family!r} has no non-constant components "
+            f"for lookback={steps}"
+        )
+
+    keep = min(components, len(rows))
+    if family == "haar" and keep < len(rows):
+        # Haar rows are ordered coarse-to-fine.  Even spacing retains both
+        # long-horizon and local changes when the configured bank is compact.
+        indices = torch.linspace(0, len(rows) - 1, keep).round().to(torch.long)
+        selected = [rows[int(index)] for index in indices]
+    else:
+        selected = rows[:keep]
+    return torch.stack(selected, dim=0).to(dtype=torch.float32)
+
+
+class TemporalBasisFeatureEncoder(nn.Module):
+    """Fuse a time-domain model path with per-input temporal coefficients.
+
+    ``source_dim`` may differ from ``dim``.  That is the important distinction
+    for raw-feature decomposition: the ordinary temporal Transformer still
+    produces ``z_base [B,S,D]``, while every original feature independently
+    produces one coefficient per basis component.
+
+    The no-aux hot path contracts the basis and the final linear projection
+    before applying them to the input.  It is exactly the same linear map as
+    materializing ``[B,S,K*F]`` coefficients, but avoids retaining that very
+    large tensor for full-universe training.
+    """
+
+    def __init__(
+        self,
+        *,
+        lookback: int,
+        dim: int,
+        source_dim: int | None = None,
+        families: Sequence[str] | str,
+        components: int,
+        sanitize_inputs: bool = True,
+        fuse_projection: bool = False,
+    ) -> None:
+        super().__init__()
+        self.lookback = int(lookback)
+        self.dim = int(dim)
+        self.source_dim = self.dim if source_dim is None else int(source_dim)
+        if self.source_dim <= 0:
+            raise ValueError("TemporalBasisFeatureEncoder source_dim must be positive")
+        self.sanitize_inputs = bool(sanitize_inputs)
+        self.fuse_projection = bool(fuse_projection)
+        self.family_names = _normalize_temporal_basis_families(families)
+        if not self.family_names:
+            raise ValueError("TemporalBasisFeatureEncoder requires at least one family")
+
+        self.family_component_counts: dict[str, int] = {}
+        for family in self.family_names:
+            matrix = _temporal_basis_matrix(
+                family,
+                steps=self.lookback,
+                components=int(components),
+            )
+            if family == "learned":
+                self.register_parameter(
+                    f"{family}_basis",
+                    nn.Parameter(matrix),
+                )
+            else:
+                self.register_buffer(f"{family}_basis", matrix, persistent=False)
+            self.family_component_counts[family] = int(matrix.size(0))
+
+        self.total_basis_components = sum(self.family_component_counts.values())
+        self.input_feature_dim = self.dim + (
+            self.source_dim * self.total_basis_components
+        )
+        self.feature_projection = nn.Linear(
+            self.input_feature_dim,
+            self.dim,
+        )
+
+    def prepare_source(self, source: torch.Tensor) -> torch.Tensor:
+        """Move and sanitize raw source rows once before rolling-window views."""
+
+        weight = self.feature_projection.weight
+        prepared = source.to(device=weight.device, dtype=weight.dtype)
+        if self.sanitize_inputs:
+            prepared = torch.nan_to_num(
+                prepared,
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            )
+        return prepared
+
+    def _basis(self, family: str, source: torch.Tensor) -> torch.Tensor:
+        basis_source = getattr(self, f"{family}_basis")
+        if family == "learned":
+            basis_source = basis_source - basis_source.mean(dim=-1, keepdim=True)
+            basis_source = F.normalize(
+                basis_source.float(),
+                dim=-1,
+                eps=1e-6,
+            ).to(dtype=basis_source.dtype)
+        return basis_source.to(device=source.device, dtype=source.dtype)
+
+    def _fused_projection(
+        self,
+        temporal_source: torch.Tensor,
+        z_base: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply the concatenated coefficient projection without materializing it."""
+
+        weight = self.feature_projection.weight
+        output = F.linear(
+            z_base,
+            weight[:, : self.dim],
+            self.feature_projection.bias,
+        )
+        offset = self.dim
+        effective_kernel: torch.Tensor | None = None
+        for family in self.family_names:
+            component_count = self.family_component_counts[family]
+            width = component_count * self.source_dim
+            family_weight = weight[:, offset : offset + width].reshape(
+                self.dim,
+                component_count,
+                self.source_dim,
+            )
+            basis = self._basis(family, temporal_source)
+            # W[o,k,f] B[k,l] becomes one compact time-feature kernel.  This
+            # contraction is algebraically identical to W @ basis_coefficients.
+            family_kernel = torch.einsum(
+                "okf,kl->olf",
+                family_weight,
+                basis,
+            )
+            effective_kernel = (
+                family_kernel
+                if effective_kernel is None
+                else effective_kernel + family_kernel
+            )
+            offset += width
+        if effective_kernel is not None:
+            output = output + torch.einsum(
+                "olf,blsf->bso",
+                effective_kernel,
+                temporal_source,
+            )
+        return output
+
+    def forward(
+        self,
+        temporal_embeddings: torch.Tensor,
+        z_base: torch.Tensor,
+        mask: torch.Tensor,
+        *,
+        collect_aux: bool,
+        source_is_prepared: bool = False,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        if temporal_embeddings.ndim != 4:
+            raise ValueError("temporal_embeddings must have shape [B,L,S,F]")
+        if int(temporal_embeddings.size(1)) != self.lookback:
+            raise ValueError(
+                f"Expected temporal lookback={self.lookback}, "
+                f"got {int(temporal_embeddings.size(1))}"
+            )
+        if int(temporal_embeddings.size(-1)) != self.source_dim:
+            raise ValueError(
+                f"Expected temporal source_dim={self.source_dim}, "
+                f"got {int(temporal_embeddings.size(-1))}"
+            )
+        if not _torch_is_compiling() and tuple(z_base.shape) != (
+            int(temporal_embeddings.size(0)),
+            int(temporal_embeddings.size(2)),
+            self.dim,
+        ):
+            raise ValueError("z_base must have shape [B,S,D]")
+
+        # Embedded is the historical path and is already sanitized/projected.
+        # Keep its native AMP dtype and exact coefficient calculation.  Raw
+        # sources are prepared explicitly before rolling-window views.
+        if not source_is_prepared and self.fuse_projection:
+            temporal_embeddings = self.prepare_source(temporal_embeddings)
+        aux: dict[str, torch.Tensor] = {}
+        input_features: torch.Tensor | None = None
+        if collect_aux or not self.fuse_projection:
+            feature_parts = [z_base]
+            for family in self.family_names:
+                basis = self._basis(family, temporal_embeddings)
+                coefficients = torch.einsum(
+                    "kl,blsf->bksf",
+                    basis,
+                    temporal_embeddings,
+                )
+                feature_parts.append(
+                    coefficients.permute(0, 2, 1, 3).flatten(start_dim=2)
+                )
+                if collect_aux:
+                    aux[f"temporal_basis_{family}_coefficients"] = coefficients
+            input_features = torch.cat(feature_parts, dim=-1)
+        if self.fuse_projection:
+            augmented = self._fused_projection(temporal_embeddings, z_base)
+        else:
+            assert input_features is not None
+            augmented = self.feature_projection(input_features)
+        mask_bool = mask.to(device=z_base.device, dtype=torch.bool)
+        augmented = augmented.masked_fill(
+            ~mask_bool.unsqueeze(-1), 0.0
+        )
+        if collect_aux:
+            assert input_features is not None
+            aux["temporal_basis_input_features"] = input_features.masked_fill(
+                ~mask_bool.unsqueeze(-1), 0.0
+            )
+            aux["temporal_basis_original_path"] = z_base.masked_fill(
+                ~mask_bool.unsqueeze(-1), 0.0
+            )
+            aux["temporal_basis_output"] = augmented
+        return augmented, aux
 
 
 def _masked_market_summary_parts(z_stock: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -644,6 +1449,9 @@ class TransformerBasePortfolioModel(nn.Module):
         temporal_ffn_mult: int = 2,
         temporal_pooling: str = "attention",
         temporal_query_mode: str = "full_then_last",
+        temporal_basis_families: Sequence[str] | str | None = None,
+        temporal_basis_components: int = 8,
+        temporal_basis_input: str = "embedded",
         cross_layers: int = 1,
         cross_heads: int = 4,
         cross_ffn_mult: int = 2,
@@ -702,6 +1510,13 @@ class TransformerBasePortfolioModel(nn.Module):
         self.use_market_tokens = self.attention_mode in {"latent", "market_token"}
         self.temporal_pooling = self._normalize_pooling(temporal_pooling)
         self.temporal_query_mode = self._normalize_temporal_query_mode(temporal_query_mode)
+        self.temporal_basis_families = _normalize_temporal_basis_families(
+            temporal_basis_families
+        )
+        self.temporal_basis_components = int(temporal_basis_components)
+        self.temporal_basis_input = _normalize_temporal_basis_input(
+            temporal_basis_input
+        )
         self.default_temperature = float(default_temperature)
         self.portfolio_mode = normalize_portfolio_mode(portfolio_mode)
         self.portfolio_activation = normalize_portfolio_activation(portfolio_activation)
@@ -872,6 +1687,23 @@ class TransformerBasePortfolioModel(nn.Module):
         )
 
         self.temporal_pool_score = nn.Linear(self.d_model, 1) if self.temporal_pooling == "attention" else None
+        self.temporal_basis_feature_encoder = (
+            TemporalBasisFeatureEncoder(
+                lookback=self.lookback,
+                dim=self.d_model,
+                source_dim=(
+                    self.num_features
+                    if self.temporal_basis_input == "raw_features"
+                    else self.d_model
+                ),
+                families=self.temporal_basis_families,
+                components=self.temporal_basis_components,
+                sanitize_inputs=self.sanitize_inputs,
+                fuse_projection=(self.temporal_basis_input == "raw_features"),
+            )
+            if self.temporal_basis_families
+            else None
+        )
         self.output_norm = _make_norm(self.d_model, self.norm_type)
         self.stock_market_gate = nn.Sequential(
             GatedProjection(self.d_model * 2, self.d_model, float(dropout), self.ffn_type),
@@ -1330,6 +2162,11 @@ class TransformerBasePortfolioModel(nn.Module):
         """
         return self._project_features(x)
 
+    def supports_embedded_explainability_reuse(self) -> bool:
+        """Whether projected embeddings contain every active model input path."""
+
+        return not self._raw_temporal_basis_enabled()
+
     def embed_projected_for_explainability(
         self,
         projected: torch.Tensor,
@@ -1389,6 +2226,12 @@ class TransformerBasePortfolioModel(nn.Module):
         reused exactly.
         """
         self._require_compact_explainability_mode()
+        if self.temporal_basis_input == "raw_features" and self.temporal_basis_families:
+            raise RuntimeError(
+                "embedded-only explainability reuse is unavailable when "
+                "temporal_basis_input='raw_features'; use the ordinary raw-input "
+                "model forward so the basis branch remains exact"
+            )
         if embedded.ndim != 4 or int(embedded.size(-1)) != self.d_model:
             raise ValueError("embedded explainability inputs must have shape [B,L,S,d_model]")
         if self.training:
@@ -1403,7 +2246,14 @@ class TransformerBasePortfolioModel(nn.Module):
             raise ValueError("embedded explainability mask must have shape [B,S]")
         safe_mask = _safe_attention_mask(mask_bool)
         temporal = self._apply_temporal_blocks(embedded, keep_all_steps=False)
-        return self._pool_temporal(temporal, safe_mask)
+        pooled = self._pool_temporal(temporal, safe_mask)
+        pooled, _ = self._apply_temporal_basis(
+            pooled,
+            embedded,
+            safe_mask,
+            collect_aux=False,
+        )
+        return pooled
 
     def forward_from_stock_embeddings_explainability(
         self,
@@ -1584,6 +2434,113 @@ class TransformerBasePortfolioModel(nn.Module):
 
         return self._add_window_positions(h, int(features.size(1)), symbol_indices)
 
+    def _raw_temporal_basis_enabled(self) -> bool:
+        return bool(
+            self.temporal_basis_feature_encoder is not None
+            and self.temporal_basis_input == "raw_features"
+        )
+
+    def _prepare_raw_temporal_basis_source(
+        self,
+        source: torch.Tensor,
+    ) -> torch.Tensor | None:
+        if not self._raw_temporal_basis_enabled():
+            return None
+        encoder = self.temporal_basis_feature_encoder
+        if encoder is None:
+            raise RuntimeError("raw temporal basis encoder is unexpectedly missing")
+        return encoder.prepare_source(source)
+
+    def _raw_temporal_basis_windows_from_panel_slab(
+        self,
+        feature_slab: torch.Tensor,
+    ) -> torch.Tensor | None:
+        prepared = self._prepare_raw_temporal_basis_source(feature_slab)
+        if prepared is None:
+            return None
+        # Move/sanitize the unique slab first, then create a rolling view.  Doing
+        # this in the opposite order would materialize B*L repeated raw rows.
+        return prepared.unfold(0, self.lookback, 1).permute(0, 3, 1, 2)
+
+    def _raw_temporal_basis_windows_from_batched_panel_slabs(
+        self,
+        feature_slabs: torch.Tensor,
+    ) -> torch.Tensor | None:
+        prepared = self._prepare_raw_temporal_basis_source(feature_slabs)
+        if prepared is None:
+            return None
+        windows = prepared.unfold(1, self.lookback, 1).permute(0, 1, 4, 2, 3)
+        days, decision_rows, lookback, symbols, features = windows.shape
+        return windows.reshape(
+            days * decision_rows,
+            lookback,
+            symbols,
+            features,
+        )
+
+    def _raw_temporal_basis_windows_from_panel(
+        self,
+        features: torch.Tensor,
+        date_indices: torch.Tensor,
+    ) -> torch.Tensor | None:
+        if not self._raw_temporal_basis_enabled():
+            return None
+        date_indices_source = date_indices.to(
+            device=features.device,
+            dtype=torch.long,
+        )
+        batch_rows = int(date_indices_source.numel())
+        if batch_rows <= 0:
+            encoder = self.temporal_basis_feature_encoder
+            if encoder is None:
+                raise RuntimeError("raw temporal basis encoder is unexpectedly missing")
+            return encoder.feature_projection.weight.new_empty(
+                (0, self.lookback, int(features.size(1)), self.num_features)
+            )
+
+        is_contiguous = True
+        if batch_rows > 1:
+            diffs = date_indices_source[1:] - date_indices_source[:-1]
+            is_contiguous = bool(torch.all(diffs == 1).detach().cpu().item())
+        if is_contiguous:
+            start = (
+                int(date_indices_source[0].detach().cpu().item())
+                - self.lookback
+                + 1
+            )
+            end = int(date_indices_source[-1].detach().cpu().item()) + 1
+            return self._raw_temporal_basis_windows_from_panel_slab(
+                features.narrow(0, start, end - start)
+            )
+
+        offsets = torch.arange(
+            self.lookback - 1,
+            -1,
+            -1,
+            device=features.device,
+            dtype=torch.long,
+        )
+        window_idx = date_indices_source[:, None] - offsets[None, :]
+        unique_idx, inverse = torch.unique(
+            window_idx.reshape(-1),
+            sorted=True,
+            return_inverse=True,
+        )
+        selected = features.index_select(0, unique_idx)
+        prepared = self._prepare_raw_temporal_basis_source(selected)
+        if prepared is None:
+            return None
+        gathered = prepared.index_select(
+            0,
+            inverse.to(device=prepared.device, dtype=torch.long),
+        )
+        return gathered.reshape(
+            batch_rows,
+            self.lookback,
+            int(features.size(1)),
+            self.num_features,
+        )
+
     def _apply_temporal_blocks(self, h: torch.Tensor, *, keep_all_steps: bool = False) -> torch.Tensor:
         bsz, steps, n_symbols, dim = h.shape
         seq = h.permute(0, 2, 1, 3).contiguous().reshape(bsz * n_symbols, steps, dim)
@@ -1656,6 +2613,41 @@ class TransformerBasePortfolioModel(nn.Module):
             pooled = (h.permute(0, 2, 1, 3) * weights.unsqueeze(-1)).sum(dim=2)
         return self.output_norm(pooled).masked_fill(~mask_bool.unsqueeze(-1), 0.0)
 
+    def _apply_temporal_basis(
+        self,
+        z_base: torch.Tensor,
+        temporal_source: torch.Tensor,
+        safe_mask: torch.Tensor,
+        *,
+        collect_aux: bool,
+        source_is_prepared: bool = False,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        if self.temporal_basis_feature_encoder is None:
+            return z_base, {}
+        return self.temporal_basis_feature_encoder(
+            temporal_source,
+            z_base,
+            safe_mask,
+            collect_aux=collect_aux,
+            source_is_prepared=source_is_prepared,
+        )
+
+    def _temporal_basis_source(
+        self,
+        embedded_source: torch.Tensor,
+        raw_source: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if self.temporal_basis_feature_encoder is None:
+            return embedded_source
+        if self.temporal_basis_input == "embedded":
+            return embedded_source
+        if raw_source is None:
+            raise RuntimeError(
+                "temporal_basis_input='raw_features' requires the canonical "
+                "raw [B,L,S,F] window"
+            )
+        return raw_source
+
     def _apply_stock_market_gate(
         self,
         z_base: torch.Tensor,
@@ -1675,7 +2667,9 @@ class TransformerBasePortfolioModel(nn.Module):
         safe_mask: torch.Tensor,
         *,
         collect_aux: bool,
+        temporal_basis_source: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        basis_source = self._temporal_basis_source(h, temporal_basis_source)
         bsz, steps, n_symbols, dim = h.shape
         token_count = steps * n_symbols
         if self.max_full_tokens > 0 and token_count > self.max_full_tokens:
@@ -1689,7 +2683,17 @@ class TransformerBasePortfolioModel(nn.Module):
             tokens = self._run_block(block, tokens, None, key_mask)
         h_full = tokens.reshape(bsz, steps, n_symbols, dim)
         aux = {"token_embedding": h_full} if collect_aux else {}
-        return self._pool_temporal(h_full, safe_mask), aux
+        z_base = self._pool_temporal(h_full, safe_mask)
+        z_base, basis_aux = self._apply_temporal_basis(
+            z_base,
+            basis_source,
+            safe_mask,
+            collect_aux=collect_aux,
+            source_is_prepared=(self.temporal_basis_input == "raw_features"),
+        )
+        if collect_aux:
+            aux.update(basis_aux)
+        return z_base, aux
 
     def _forward_axial(
         self,
@@ -1697,14 +2701,26 @@ class TransformerBasePortfolioModel(nn.Module):
         safe_mask: torch.Tensor,
         *,
         collect_aux: bool,
+        temporal_basis_source: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        basis_source = self._temporal_basis_source(h, temporal_basis_source)
         h = self._apply_temporal_blocks(
             h,
             keep_all_steps=(collect_aux and self.temporal_query_mode != "last_only"),
         )
         h = self._apply_cross_blocks(h, safe_mask)
         aux = {"token_embedding": h} if collect_aux else {}
-        return self._pool_temporal(h, safe_mask), aux
+        z_base = self._pool_temporal(h, safe_mask)
+        z_base, basis_aux = self._apply_temporal_basis(
+            z_base,
+            basis_source,
+            safe_mask,
+            collect_aux=collect_aux,
+            source_is_prepared=(self.temporal_basis_input == "raw_features"),
+        )
+        if collect_aux:
+            aux.update(basis_aux)
+        return z_base, aux
 
     def _forward_temporal_only(
         self,
@@ -1712,13 +2728,25 @@ class TransformerBasePortfolioModel(nn.Module):
         safe_mask: torch.Tensor,
         *,
         collect_aux: bool,
+        temporal_basis_source: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        basis_source = self._temporal_basis_source(h, temporal_basis_source)
         h = self._apply_temporal_blocks(
             h,
             keep_all_steps=(collect_aux and self.temporal_query_mode != "last_only"),
         )
         aux = {"token_embedding": h} if collect_aux else {}
-        return self._pool_temporal(h, safe_mask), aux
+        z_base = self._pool_temporal(h, safe_mask)
+        z_base, basis_aux = self._apply_temporal_basis(
+            z_base,
+            basis_source,
+            safe_mask,
+            collect_aux=collect_aux,
+            source_is_prepared=(self.temporal_basis_input == "raw_features"),
+        )
+        if collect_aux:
+            aux.update(basis_aux)
+        return z_base, aux
 
     def _forward_latent_or_market(
         self,
@@ -1728,13 +2756,22 @@ class TransformerBasePortfolioModel(nn.Module):
         use_latent: bool,
         collect_aux: bool,
         use_market: bool = True,
+        temporal_basis_source: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        basis_source = self._temporal_basis_source(h, temporal_basis_source)
         h = self._apply_temporal_blocks(
             h,
             keep_all_steps=(collect_aux and self.temporal_query_mode != "last_only"),
         )
         z_base = self._pool_temporal(h, safe_mask)
-        return self._forward_latent_or_market_from_stock_embeddings(
+        z_base, basis_aux = self._apply_temporal_basis(
+            z_base,
+            basis_source,
+            safe_mask,
+            collect_aux=collect_aux,
+            source_is_prepared=(self.temporal_basis_input == "raw_features"),
+        )
+        z_stock, aux = self._forward_latent_or_market_from_stock_embeddings(
             z_base,
             safe_mask,
             use_latent=use_latent,
@@ -1742,6 +2779,9 @@ class TransformerBasePortfolioModel(nn.Module):
             use_market=use_market,
             token_embedding=h,
         )
+        if collect_aux:
+            aux.update(basis_aux)
+        return z_stock, aux
 
     def _forward_latent_or_market_from_stock_embeddings(
         self,
@@ -1847,18 +2887,30 @@ class TransformerBasePortfolioModel(nn.Module):
         safe_mask: torch.Tensor,
         *,
         collect_aux: bool,
+        temporal_basis_source: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        basis_source = self._temporal_basis_source(h, temporal_basis_source)
         h = self._apply_temporal_blocks(
             h,
             keep_all_steps=(collect_aux and self.temporal_query_mode != "last_only"),
         )
         z_base = self._pool_temporal(h, safe_mask)
-        return self._forward_market_token_from_stock_embeddings(
+        z_base, basis_aux = self._apply_temporal_basis(
+            z_base,
+            basis_source,
+            safe_mask,
+            collect_aux=collect_aux,
+            source_is_prepared=(self.temporal_basis_input == "raw_features"),
+        )
+        z_stock, aux = self._forward_market_token_from_stock_embeddings(
             z_base,
             safe_mask,
             collect_aux=collect_aux,
             token_embedding=h,
         )
+        if collect_aux:
+            aux.update(basis_aux)
+        return z_stock, aux
 
     def _forward_market_token_from_stock_embeddings(
         self,
@@ -1964,14 +3016,25 @@ class TransformerBasePortfolioModel(nn.Module):
         temperature: float | torch.Tensor | None = None,
         return_aux: bool | None = None,
         return_scores: bool = False,
+        temporal_basis_source: torch.Tensor | None = None,
     ):
         safe_mask = _safe_attention_mask(mask_bool)
         collect_aux = bool(return_aux is True or (return_aux is None and self.return_aux and self.return_aux_details))
 
         if self.attention_mode == "full":
-            z_stock, aux = self._forward_full(h, safe_mask, collect_aux=collect_aux)
+            z_stock, aux = self._forward_full(
+                h,
+                safe_mask,
+                collect_aux=collect_aux,
+                temporal_basis_source=temporal_basis_source,
+            )
         elif self.attention_mode == "axial":
-            z_stock, aux = self._forward_axial(h, safe_mask, collect_aux=collect_aux)
+            z_stock, aux = self._forward_axial(
+                h,
+                safe_mask,
+                collect_aux=collect_aux,
+                temporal_basis_source=temporal_basis_source,
+            )
         elif self.attention_mode == "latent":
             z_stock, aux = self._forward_latent_or_market(
                 h,
@@ -1979,6 +3042,7 @@ class TransformerBasePortfolioModel(nn.Module):
                 use_latent=True,
                 use_market=True,
                 collect_aux=collect_aux,
+                temporal_basis_source=temporal_basis_source,
             )
         elif self.attention_mode == "latent_only":
             z_stock, aux = self._forward_latent_or_market(
@@ -1987,11 +3051,22 @@ class TransformerBasePortfolioModel(nn.Module):
                 use_latent=True,
                 use_market=False,
                 collect_aux=collect_aux,
+                temporal_basis_source=temporal_basis_source,
             )
         elif self.attention_mode == "market_token":
-            z_stock, aux = self._forward_market_token_fast(h, safe_mask, collect_aux=collect_aux)
+            z_stock, aux = self._forward_market_token_fast(
+                h,
+                safe_mask,
+                collect_aux=collect_aux,
+                temporal_basis_source=temporal_basis_source,
+            )
         else:
-            z_stock, aux = self._forward_temporal_only(h, safe_mask, collect_aux=collect_aux)
+            z_stock, aux = self._forward_temporal_only(
+                h,
+                safe_mask,
+                collect_aux=collect_aux,
+                temporal_basis_source=temporal_basis_source,
+            )
 
         return self._portfolio_outputs_from_stock_embeddings(
             z_stock,
@@ -2703,11 +3778,13 @@ class TransformerBasePortfolioModel(nn.Module):
         else:
             mask_bool = mask.to(device=x.device, dtype=torch.bool)
         h = self._embed_inputs(x, symbol_indices)
+        raw_basis_source = self._prepare_raw_temporal_basis_source(x)
         return self._forward_embedded(
             h,
             mask_bool,
             temperature=temperature,
             return_aux=return_aux,
+            temporal_basis_source=raw_basis_source,
         )
 
     def forward_from_panel(
@@ -2725,11 +3802,16 @@ class TransformerBasePortfolioModel(nn.Module):
             mask_bool = torch.ones(h.size(0), h.size(2), dtype=torch.bool, device=h.device)
         else:
             mask_bool = mask.to(device=h.device, dtype=torch.bool)
+        raw_basis_source = self._raw_temporal_basis_windows_from_panel(
+            features,
+            date_indices,
+        )
         return self._forward_embedded(
             h,
             mask_bool,
             temperature=temperature,
             return_aux=return_aux,
+            temporal_basis_source=raw_basis_source,
         )
 
     def forward_from_panel_slab(
@@ -2746,11 +3828,15 @@ class TransformerBasePortfolioModel(nn.Module):
             mask_bool = torch.ones(h.size(0), h.size(2), dtype=torch.bool, device=h.device)
         else:
             mask_bool = mask.to(device=h.device, dtype=torch.bool)
+        raw_basis_source = self._raw_temporal_basis_windows_from_panel_slab(
+            feature_slab
+        )
         return self._forward_embedded(
             h,
             mask_bool,
             temperature=temperature,
             return_aux=return_aux,
+            temporal_basis_source=raw_basis_source,
         )
 
     def forward_from_batched_panel_slabs(
@@ -2779,9 +3865,15 @@ class TransformerBasePortfolioModel(nn.Module):
             mask_bool = mask.to(device=h.device, dtype=torch.bool).reshape(
                 h.size(0), h.size(2)
             )
+        raw_basis_source = (
+            self._raw_temporal_basis_windows_from_batched_panel_slabs(
+                feature_slabs
+            )
+        )
         return self._forward_embedded(
             h,
             mask_bool,
             temperature=temperature,
             return_aux=return_aux,
+            temporal_basis_source=raw_basis_source,
         )

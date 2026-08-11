@@ -6,7 +6,11 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 import numpy as np
 
-from stockagent.live.quote_provider import fetch_yahoo_last_prices
+from stockagent.live.quote_provider import (
+    fetch_tw_mis_last_prices,
+    fetch_yahoo_last_prices,
+    load_prices_csv,
+)
 
 
 class _FakeResponse:
@@ -63,6 +67,80 @@ class _FakeChartResponse:
                 ]
             }
         }
+
+
+class _FakeMisResponse:
+    def __init__(self, rows: list[dict]) -> None:
+        self.rows = rows
+
+    def raise_for_status(self) -> None:
+        return None
+
+    def json(self) -> dict:
+        return {"msgArray": self.rows}
+
+
+def test_fetch_tw_mis_retries_empty_chunks_without_using_last_as_open(monkeypatch, tmp_path) -> None:
+    attempts: dict[str, int] = {}
+
+    class FakeSession:
+        def __init__(self) -> None:
+            self.headers: dict[str, str] = {}
+
+        def get(self, url: str, *, timeout: int, params=None, **kwargs):
+            if params is None:
+                return _FakeMisResponse([])
+            ex_ch = str(params["ex_ch"])
+            attempts[ex_ch] = attempts.get(ex_ch, 0) + 1
+            if attempts[ex_ch] == 1:
+                raise RuntimeError("temporary MIS disconnect")
+            code = ex_ch.split("_", 1)[1].split(".", 1)[0]
+            return _FakeMisResponse(
+                [
+                    {
+                        "c": code,
+                        "z": "105.0",
+                        "o": "101.0",
+                        "h": "106.0",
+                        "l": "100.0",
+                        "v": "1234",
+                        "tlong": "1800000000000",
+                    }
+                ]
+            )
+
+    monkeypatch.setenv("STOCKAGENT_TW_MIS_PARALLEL_REQUESTS", "1")
+    monkeypatch.setenv("STOCKAGENT_TW_MIS_RETRY_ATTEMPTS", "1")
+    monkeypatch.setenv("STOCKAGENT_TW_MIS_RETRY_DELAY_SECONDS", "0")
+    monkeypatch.setattr("stockagent.live.quote_provider.requests.Session", FakeSession)
+
+    snapshot = fetch_tw_mis_last_prices(
+        ["2330", "2317"],
+        np.array([90.0, 80.0]),
+        parquet_root=tmp_path,
+        chunk_size=2,
+    )
+
+    assert snapshot.available_count == 2
+    np.testing.assert_allclose(snapshot.prices, [105.0, 105.0])
+    np.testing.assert_allclose(snapshot.open_prices, [101.0, 101.0])
+    assert all(count == 2 for count in attempts.values())
+
+
+def test_load_prices_csv_preserves_explicit_open_snapshot(tmp_path) -> None:
+    path = tmp_path / "session_open.csv"
+    path.write_text(
+        "symbol,price,open_price\n2330,101.0,101.0\n2317,205.0,205.0\n",
+        encoding="utf-8",
+    )
+
+    snapshot = load_prices_csv(path, ["2330", "2317", "MISSING"], np.array([90.0, 190.0, 30.0]))
+
+    np.testing.assert_allclose(snapshot.prices, [101.0, 205.0, 30.0])
+    np.testing.assert_allclose(snapshot.open_prices[:2], [101.0, 205.0])
+    assert np.isnan(snapshot.open_prices[2])
+    assert snapshot.available_mask.tolist() == [True, True, False]
+    assert snapshot.available_count == 2
 
 
 def test_fetch_yahoo_last_prices_runs_requests_in_parallel(monkeypatch, tmp_path) -> None:

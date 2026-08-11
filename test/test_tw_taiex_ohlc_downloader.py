@@ -498,7 +498,7 @@ def test_jsonl_loader_tolerates_only_torn_final_record(tmp_path: Path) -> None:
         taiex._load_journal_latest(path)
 
 
-def test_daily_requires_complete_baseline(tmp_path: Path) -> None:
+def test_daily_requires_established_baseline(tmp_path: Path) -> None:
     args = _args(
         tmp_path,
         mode="daily",
@@ -507,7 +507,7 @@ def test_daily_requires_complete_baseline(tmp_path: Path) -> None:
     )
     assert taiex._run(args) == 1
     summary = json.loads(taiex._summary_path(tmp_path).read_text(encoding="utf-8"))
-    assert "requires a coverage-complete" in summary["fatal_error"]
+    assert "requires an established rebuild/repair" in summary["fatal_error"]
 
 
 def test_taiex_outer_command_and_partial_cleanup_are_source_scoped(tmp_path: Path) -> None:

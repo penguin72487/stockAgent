@@ -1,5 +1,5 @@
-market: tw_day_trade
-label: 台股・當沖（初始 1,000 萬）
+market: tw_day_trade_100m
+label: 台股・當沖（初始 1 億）
 enabled: true
 market_type: tw
 timezone: Asia/Taipei
@@ -10,7 +10,7 @@ data_ready_time: "13:40"
 freshness_max_lag_days: 3
 freshness_scan_limit: 0
 holidays: []
-initial_capital: 10000000.0
+initial_capital: 100000000.0
 
 # Data is shared with the other TW modes. There is no independent automatic
 # broadcast schedule; users opt in through /watch or request /signal_now.
@@ -20,7 +20,7 @@ pre_signal_command:
   - --mode
   - daily
   - --config
-  - configs/markets/tw_day_trade_10m.yaml
+  - configs/markets/tw_day_trade_100m.yaml
   - --public-dir
   - data_tw_public
   - --stock-root
@@ -39,13 +39,13 @@ pre_signal_command:
 pre_signal_timeout_seconds: 1800
 previous_signal_backfill_limit: 512
 
-model_selection_path: ../models/tw_day_trade.yaml
-config_path: configs/markets/tw_day_trade_10m.yaml
-output_dir: artifacts/markets/tw_day_trade_10m
+model_selection_path: ../models/tw_day_trade_100m.yaml
+config_path: configs/markets/tw_day_trade_100m.yaml
+output_dir: artifacts/markets/tw_day_trade_100m
 live_output_dir: artifacts/live_signals
 fold_id: 11
-checkpoint_path: artifacts/markets/tw_day_trade_10m/fold_11/checkpoint_best.pt
-weights_path: artifacts/markets/tw_day_trade_10m/fold_11/daily_weights.parquet
+checkpoint_path: artifacts/markets/tw_day_trade_100m/fold_11/checkpoint_best.pt
+weights_path: artifacts/markets/tw_day_trade_100m/fold_11/daily_weights.parquet
 
 panel_date: latest
 device: cuda
@@ -57,4 +57,4 @@ benchmark_window_days: 32
 max_turnover_warning: 1.5
 max_top_weight_warning: 0.1
 max_gross_warning: 1.05
-unsupported_message: "**台股・當沖（初始 1,000 萬）** 模型尚未準備完成。"
+unsupported_message: "**台股・當沖（初始 1 億）** 模型尚未準備完成。"
