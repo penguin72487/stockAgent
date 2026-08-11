@@ -217,6 +217,119 @@ def test_raw_feature_basis_panel_paths_match_materialized_windows() -> None:
     torch.testing.assert_close(slab, materialized, rtol=1e-5, atol=1e-6)
 
 
+def test_basis_coefficients_are_ordinary_candle_input_features() -> None:
+    device = _device()
+    model = _make_model(
+        lookback=8,
+        temporal_pooling="last",
+        temporal_query_mode="last_only",
+        temporal_basis_families=("haar", "learned"),
+        temporal_basis_components=2,
+        temporal_basis_input="input_features",
+        return_aux=False,
+        return_aux_details=False,
+    ).eval()
+    raw_window = torch.randn(2, 8, 7, 10, device=device)
+    encoder = model.temporal_basis_input_feature_builder
+    candle = model.candle_encoder
+    assert encoder is not None
+    assert model.temporal_basis_feature_encoder is None
+    assert candle.base_joint_input_dim == 10
+    assert candle.joint_input_dim == 10 + 2 * 2 * 10
+    assert candle.joint_projection.proj.in_features == candle.joint_input_dim
+    assert model.supports_embedded_explainability_reuse() is False
+
+    with torch.no_grad():
+        fused, aux = encoder(raw_window, candle, collect_aux=True)
+        source = encoder._prepare_source(raw_window, candle)
+        base = candle._base_joint_features(source[:, -1])
+        parts = [base]
+        for family in encoder.family_names:
+            coefficients = torch.einsum(
+                "kl,blsf->bksf",
+                encoder._basis(family, source),
+                source,
+            )
+            parts.append(coefficients.permute(0, 2, 1, 3).flatten(start_dim=2))
+        explicit_features = torch.cat(parts, dim=-1)
+        explicit = candle._finish_embedding(
+            candle.joint_projection(candle.input_norm(explicit_features))
+        )
+
+    torch.testing.assert_close(fused, explicit, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(
+        aux["temporal_basis_input_features"],
+        explicit_features,
+        rtol=0.0,
+        atol=0.0,
+    )
+    assert aux["temporal_basis_input_features"].shape == (2, 7, 50)
+    assert aux["temporal_basis_output"].shape == (2, 7, 24)
+
+
+def test_ordinary_basis_input_features_backpropagate_through_shared_projection() -> None:
+    device = _device()
+    model = _make_model(
+        lookback=8,
+        temporal_basis_families=("haar", "learned"),
+        temporal_basis_components=2,
+        temporal_basis_input="input_features",
+        return_aux=False,
+        return_aux_details=False,
+    ).train()
+    raw_window = torch.randn(
+        2,
+        8,
+        7,
+        10,
+        device=device,
+        requires_grad=True,
+    )
+    encoder = model.temporal_basis_input_feature_builder
+    assert encoder is not None
+    endpoint, _ = encoder(
+        raw_window,
+        model.candle_encoder,
+        collect_aux=False,
+    )
+    endpoint.square().mean().backward()
+
+    projection_grad = model.candle_encoder.joint_projection.proj.weight.grad
+    learned_grad = encoder.learned_basis.grad
+    assert raw_window.grad is not None and torch.isfinite(raw_window.grad).all()
+    assert projection_grad is not None and torch.isfinite(projection_grad).all()
+    assert projection_grad[:, 10:].abs().sum().item() > 0.0
+    assert learned_grad is not None and torch.isfinite(learned_grad).all()
+    assert learned_grad.abs().sum().item() > 0.0
+
+
+def test_ordinary_basis_input_panel_paths_match_materialized_windows() -> None:
+    device = _device()
+    model = _make_model(
+        lookback=8,
+        temporal_pooling="last",
+        temporal_query_mode="last_only",
+        temporal_basis_families=("haar", "dct"),
+        temporal_basis_components=2,
+        temporal_basis_input="input_features",
+        return_aux=False,
+        return_aux_details=False,
+    ).eval()
+    feature_slab = torch.randn(11, 7, 10, device=device)
+    date_indices = torch.arange(7, 11, dtype=torch.long, device=device)
+    windows = feature_slab.unfold(0, 8, 1).permute(0, 3, 1, 2).contiguous()
+    mask = torch.ones(4, 7, dtype=torch.bool, device=device)
+    mask[-1, -1] = False
+
+    with torch.no_grad():
+        materialized = model(windows, mask)
+        panel = model.forward_from_panel(feature_slab, date_indices, mask)
+        slab = model.forward_from_panel_slab(feature_slab, mask)
+
+    torch.testing.assert_close(panel, materialized, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(slab, materialized, rtol=1e-5, atol=1e-6)
+
+
 def test_factory_builds_financial_transformer_model() -> None:
     cfg = load_config(Path("configs/experiment_baseline.yaml"))
     cfg.training.model_name = "financial_transformer"
@@ -276,13 +389,38 @@ def test_online_complete_multi_basis_config_propagates_every_supported_family() 
     assert config.training.transformer_base_portfolio.temporal_basis_families == expected
     assert config.training.financial_transformer.temporal_basis_families == expected
     assert config.training.financial_transformer.temporal_basis_components == 4
-    assert config.training.transformer_base_portfolio.temporal_basis_input == "raw_features"
-    assert config.training.financial_transformer.temporal_basis_input == "raw_features"
+    assert config.training.transformer_base_portfolio.temporal_basis_input == "input_features"
+    assert config.training.financial_transformer.temporal_basis_input == "input_features"
     assert config.training.batch_size_train == 64
     assert config.training.cache_train_tensors_on_gpu is False
     assert config.training.cache_eval_tensors_on_gpu is False
     assert config.training.vram_budget_gb == 16
-    assert "online_complete_raw_feature_input_lookback32_v5" in config.runner.output_dir
+    assert "online_complete_input_features_lookback32_v1" in config.runner.output_dir
+
+
+def test_online_complete_multi_basis_dual_5090_config_restores_host_capacity() -> None:
+    config = load_config(
+        "configs/markets/tw_public_multi_basis_online_complete_dual_5090.yaml"
+    )
+
+    assert config.training.model_name == "financial_transformer"
+    assert config.training.multi_gpu_strategy == "auto"
+    assert config.training.batch_size_train == 128
+    assert config.training.batch_size_eval == 128
+    assert config.training.cache_train_tensors_on_gpu is True
+    assert config.training.cache_eval_tensors_on_gpu is True
+    assert config.training.vram_budget_gb == 32
+    assert config.environment.amp_dtype == "bf16"
+    assert config.training.enable_torch_compile is True
+    assert config.training.compile_loss is True
+    assert config.training.curve_plot_interval == 1
+    assert config.training.curve_plot_async is True
+    assert config.training.defer_epoch_curve_plot_until_end is False
+    assert config.runner.resume is True
+    assert config.runner.post_train_infer is False
+    assert str(config.runner.output_dir).endswith(
+        "_input_features_lookback32_v1_dual5090_1m"
+    )
 
 
 def test_candle_encoder_uses_every_feature_jointly() -> None:

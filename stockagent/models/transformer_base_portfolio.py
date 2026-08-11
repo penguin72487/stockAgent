@@ -258,11 +258,15 @@ def _normalize_temporal_basis_input(value: str | None) -> str:
         "raw": "raw_features",
         "raw_feature": "raw_features",
         "features": "raw_features",
+        "input": "input_features",
+        "input_feature": "input_features",
+        "ordinary_features": "input_features",
     }
     normalized = aliases.get(normalized, normalized)
-    if normalized not in {"embedded", "raw_features"}:
+    if normalized not in {"embedded", "raw_features", "input_features"}:
         raise ValueError(
-            "temporal_basis_input must be 'embedded' or 'raw_features'"
+            "temporal_basis_input must be 'embedded', 'raw_features', or "
+            "'input_features'"
         )
     return normalized
 
@@ -1422,6 +1426,8 @@ class TransformerBasePortfolioModel(nn.Module):
     preset semantics so existing configs and checkpoints remain compatible.
     """
 
+    _supports_temporal_basis_input_features = False
+
     def __init__(
         self,
         lookback: int,
@@ -1517,6 +1523,16 @@ class TransformerBasePortfolioModel(nn.Module):
         self.temporal_basis_input = _normalize_temporal_basis_input(
             temporal_basis_input
         )
+        if (
+            self.temporal_basis_families
+            and self.temporal_basis_input == "input_features"
+            and not self._supports_temporal_basis_input_features
+        ):
+            raise ValueError(
+                "temporal_basis_input='input_features' requires the Financial "
+                "Transformer CandleEncoder; transformer_base_portfolio has no "
+                "shared raw-feature input projection"
+            )
         self.default_temperature = float(default_temperature)
         self.portfolio_mode = normalize_portfolio_mode(portfolio_mode)
         self.portfolio_activation = normalize_portfolio_activation(portfolio_activation)
@@ -1701,7 +1717,10 @@ class TransformerBasePortfolioModel(nn.Module):
                 sanitize_inputs=self.sanitize_inputs,
                 fuse_projection=(self.temporal_basis_input == "raw_features"),
             )
-            if self.temporal_basis_families
+            if (
+                self.temporal_basis_families
+                and self.temporal_basis_input != "input_features"
+            )
             else None
         )
         self.output_norm = _make_norm(self.d_model, self.norm_type)
@@ -2165,7 +2184,10 @@ class TransformerBasePortfolioModel(nn.Module):
     def supports_embedded_explainability_reuse(self) -> bool:
         """Whether projected embeddings contain every active model input path."""
 
-        return not self._raw_temporal_basis_enabled()
+        return not (
+            self.temporal_basis_families
+            and self.temporal_basis_input in {"raw_features", "input_features"}
+        )
 
     def embed_projected_for_explainability(
         self,
@@ -2226,11 +2248,14 @@ class TransformerBasePortfolioModel(nn.Module):
         reused exactly.
         """
         self._require_compact_explainability_mode()
-        if self.temporal_basis_input == "raw_features" and self.temporal_basis_families:
+        if (
+            self.temporal_basis_families
+            and self.temporal_basis_input in {"raw_features", "input_features"}
+        ):
             raise RuntimeError(
                 "embedded-only explainability reuse is unavailable when "
-                "temporal_basis_input='raw_features'; use the ordinary raw-input "
-                "model forward so the basis branch remains exact"
+                f"temporal_basis_input={self.temporal_basis_input!r}; use the "
+                "ordinary raw-input model forward so every basis feature remains exact"
             )
         if embedded.ndim != 4 or int(embedded.size(-1)) != self.d_model:
             raise ValueError("embedded explainability inputs must have shape [B,L,S,d_model]")
@@ -2307,9 +2332,15 @@ class TransformerBasePortfolioModel(nn.Module):
 
             compiled = torch.compile(
                 forward_fn,
-                mode="reduce-overhead",
                 dynamic=False,
                 fullgraph=False,
+                # Explainability keeps compiled outputs only long enough to
+                # reduce them to CPU tables, but CUDA Graph Trees can still
+                # retain a fresh private pool for each outer date chunk.  On
+                # the full TW universe that grows by several GiB per chunk
+                # and eventually OOMs even though the tensor shape is fixed.
+                # Inductor kernels remain compiled with CUDA graphs disabled.
+                options={"triton.cudagraphs": False},
             )
             # Avoid registering a self-referential OptimizedModule as a child.
             object.__setattr__(self, "_compiled_explainability_forward", compiled)
@@ -2334,9 +2365,9 @@ class TransformerBasePortfolioModel(nn.Module):
 
             compiled = torch.compile(
                 forward_fn,
-                mode="reduce-overhead",
                 dynamic=False,
                 fullgraph=False,
+                options={"triton.cudagraphs": False},
             )
             # Avoid registering a self-referential OptimizedModule as a child.
             object.__setattr__(self, "_compiled_stock_explainability_forward", compiled)

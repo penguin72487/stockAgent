@@ -1,11 +1,11 @@
 base_config: tw_public_multi_basis.yaml
 
-experiment_name: tw-public-financial-transformer-multi-basis-online-complete-raw-feature-input-lookback32-v4
+experiment_name: tw-public-financial-transformer-multi-basis-online-complete-ordinary-input-features-lookback32-v1
 
 runner:
-  # The completed v4 artifact decomposed the 32-D latent representation.  This
-  # new root decomposes all 99 raw features and is checkpoint-incompatible.
-  output_dir: artifacts/markets/tw_public_candles_multi_basis_online_complete_raw_feature_input_lookback32_v5
+  # This root is checkpoint-incompatible with the old post-temporal basis
+  # branch. Basis coefficients now occupy ordinary CandleEncoder input columns.
+  output_dir: artifacts/markets/tw_public_candles_multi_basis_online_complete_input_features_lookback32_v1
   resume: false
 
 training:
@@ -23,9 +23,10 @@ training:
 
   transformer_base_portfolio:
     # Every family consumes each named raw feature over the observed trailing
-    # window.  The untouched CandleEncoder + temporal Transformer is retained
-    # as the time-domain path and fused with all basis coefficients afterward.
-    temporal_basis_input: raw_features
+    # window. The endpoint row is [ordinary features, basis coefficients]; all
+    # 7,227 columns share one RMSNorm and one CandleEncoder projection. There
+    # is no post-temporal basis branch, gate, or separate feature encoder.
+    temporal_basis_input: input_features
     temporal_basis_families:
       - haar
       - swt_db2
