@@ -37,6 +37,7 @@ def parse_args() -> argparse.Namespace:
         default=Path("data_tw_index_derivatives_ticks/shioaji_fop_captures"),
     )
     parser.add_argument("--future-code", default="TXFR1")
+    parser.add_argument("--hedge-future-code", default="MXFR1")
     parser.add_argument("--option-roots", default=DEFAULT_OPTION_ROOTS)
     parser.add_argument(
         "--option-expiries",
@@ -59,6 +60,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stale-ms", type=float, default=2_000.0)
     parser.add_argument("--subscribe-interval", type=float, default=0.04)
     parser.add_argument("--simulation", action="store_true")
+    parser.add_argument(
+        "--execute-strategies",
+        action="store_true",
+        help=(
+            "run the seven-strategy Shioaji simulation engine on worker 0; "
+            "requires --simulation"
+        ),
+    )
+    parser.add_argument(
+        "--strategy-state-dir",
+        type=Path,
+        default=Path("artifacts/live/shioaji_taifex_volatility_simulation"),
+    )
+    parser.add_argument(
+        "--final-settlement-path",
+        type=Path,
+        default=Path(
+            "data_tw_index_options_daily/txo_final_settlement_history.parquet"
+        ),
+    )
+    parser.add_argument("--strategy-calibration-time", default="13:29:00")
+    parser.add_argument("--strategy-bootstrap-after", default="")
     parser.add_argument("--capture-id", default="")
     parser.add_argument("--worker-index", type=int, default=0)
     parser.add_argument("--workers", type=int, default=1)
@@ -167,7 +190,11 @@ def select_balanced_option_strips(
         root = str(getattr(info, "root", "")).strip().upper()
         delivery_date = getattr(info, "delivery_date", None)
         last_trading_date = getattr(info, "last_trading_date", delivery_date)
-        if not root or not isinstance(delivery_date, date) or delivery_date < trade_date:
+        if (
+            not root
+            or not isinstance(delivery_date, date)
+            or delivery_date < trade_date
+        ):
             continue
         if isinstance(last_trading_date, date) and last_trading_date < trade_date:
             continue
@@ -197,7 +224,9 @@ def select_balanced_option_strips(
         raise RuntimeError("no unexpired paired weekly TXO series were available")
 
     series: list[tuple[tuple[str, date], list[float]]] = []
-    for key in sorted([*monthly_keys, *weekly_keys], key=lambda item: (item[1], item[0])):
+    for key in sorted(
+        [*monthly_keys, *weekly_keys], key=lambda item: (item[1], item[0])
+    ):
         strikes = [
             strike
             for strike, rights in grouped[key].items()
@@ -223,6 +252,44 @@ def select_balanced_option_strips(
     selected: list[Any] = []
     for key, strike in selected_pairs:
         selected.extend([grouped[key][strike]["C"], grouped[key][strike]["P"]])
+    return selected
+
+
+def partition_contract_infos(
+    *,
+    futures_infos: list[Any],
+    option_infos: list[Any],
+    worker_index: int,
+    workers: int,
+    contracts_per_worker: int = 100,
+) -> list[Any]:
+    """Keep Call/Put pairs together and reserve worker 0 for strategy data."""
+
+    if workers < 1 or not 0 <= worker_index < workers:
+        raise ValueError("worker index is outside the configured worker count")
+    if contracts_per_worker < 2 or len(futures_infos) > contracts_per_worker:
+        raise ValueError("invalid per-worker contract capacity")
+    if len(option_infos) % 2:
+        raise ValueError("option selection must contain complete Call/Put pairs")
+    pairs = [
+        option_infos[index : index + 2] for index in range(0, len(option_infos), 2)
+    ]
+    pair_capacities = [
+        (contracts_per_worker - len(futures_infos)) // 2,
+        *([contracts_per_worker // 2] * (workers - 1)),
+    ]
+    if len(pairs) > sum(pair_capacities):
+        raise ValueError("selected option pairs exceed worker capacity")
+    offset = 0
+    selected_pairs: list[list[Any]] = []
+    for capacity in pair_capacities:
+        selected_pairs.append(pairs[offset : offset + capacity])
+        offset += capacity
+    selected = [item for pair in selected_pairs[worker_index] for item in pair]
+    if worker_index == 0:
+        selected = [*futures_infos, *selected]
+    if len(selected) > contracts_per_worker:
+        raise AssertionError("worker contract partition exceeds its hard cap")
     return selected
 
 
@@ -266,6 +333,10 @@ def main() -> int:
     args = parse_args()
     if args.workers < 1 or not 0 <= args.worker_index < args.workers:
         raise ValueError("worker-index must satisfy 0 <= worker-index < workers")
+    if args.execute_strategies and not args.simulation:
+        raise RuntimeError("strategy execution requires the literal --simulation mode")
+    if args.execute_strategies and int(args.worker_index) != 0:
+        raise RuntimeError("strategy execution is owned only by worker 0")
     capture_id = str(args.capture_id).strip() or f"single-{time.time_ns()}"
     if re.fullmatch(r"[A-Za-z0-9_.-]+", capture_id) is None:
         raise ValueError("capture-id contains unsupported characters")
@@ -299,7 +370,11 @@ def main() -> int:
     signal.signal(signal.SIGTERM, request_shutdown)
     api = sj.Shioaji(simulation=bool(args.simulation))
     api.set_event_callback(lambda *_args: None)
-    api.login(api_key=api_key, secret_key=secret_key, subscribe_trade=False)
+    api.login(
+        api_key=api_key,
+        secret_key=secret_key,
+        subscribe_trade=bool(args.execute_strategies),
+    )
 
     logical_future = api.contracts.get(str(args.future_code))
     if logical_future is None:
@@ -319,6 +394,25 @@ def main() -> int:
         if args.underlying_reference is not None
         else float(getattr(future_info, "reference", 0.0) or 0.0)
     )
+    logical_hedge = api.contracts.get(str(args.hedge_future_code))
+    if logical_hedge is None:
+        api.logout()
+        raise LookupError(f"hedge future contract not found: {args.hedge_future_code}")
+    hedge_target_code = getattr(logical_hedge, "target_code", None)
+    hedge_base = (
+        api.contracts.get(str(hedge_target_code))
+        if hedge_target_code
+        else logical_hedge
+    )
+    if hedge_base is None:
+        api.logout()
+        raise LookupError(f"resolved hedge future not found: {hedge_target_code}")
+    hedge_info = api.contracts.info(hedge_base)
+    if hedge_info is None:
+        api.logout()
+        raise LookupError(
+            f"hedge future info not found: {getattr(hedge_base, 'code', '')}"
+        )
     option_roots = tuple(
         dict.fromkeys(
             root.strip().upper()
@@ -336,6 +430,7 @@ def main() -> int:
             option_infos.extend(api.contracts.options(root))
         except Exception as exc:
             unavailable_roots[root] = f"{type(exc).__name__}: {exc}"
+    futures_infos = [future_info, hedge_info]
     max_contracts = int(args.workers) * 100
     selected_option_infos = select_balanced_option_strips(
         option_infos,
@@ -344,14 +439,15 @@ def main() -> int:
         monthly_expiry_count=int(args.option_expiries),
         weekly_expiry_count=int(args.weekly_expiries),
         strikes_per_expiry=int(args.strikes_per_expiry),
-        max_pairs=(max_contracts - 1) // 2,
+        max_pairs=(max_contracts - len(futures_infos)) // 2,
     )
-    all_selected_infos = [future_info, *selected_option_infos]
-    selected_infos = [
-        info
-        for index, info in enumerate(all_selected_infos)
-        if index % int(args.workers) == int(args.worker_index)
-    ]
+    all_selected_infos = [*futures_infos, *selected_option_infos]
+    selected_infos = partition_contract_infos(
+        futures_infos=futures_infos,
+        option_infos=selected_option_infos,
+        worker_index=int(args.worker_index),
+        workers=int(args.workers),
+    )
     contracts = [_base(info) for info in selected_infos]
     subscriptions_requested = len(contracts) * 2
     if subscriptions_requested > 200:
@@ -364,27 +460,70 @@ def main() -> int:
         _metadata(
             info,
             logical_code=(
-                str(args.future_code) if info is future_info else None
+                str(args.future_code)
+                if info is future_info
+                else str(args.hedge_future_code)
+                if info is hedge_info
+                else None
             ),
         )
         for info in selected_infos
     ]
+
+    strategy_engine = None
+    if args.execute_strategies:
+        from stockagent.live.taifex_volatility_simulation import (
+            FuturesInstrument,
+            TaifexVolatilitySimulation,
+        )
+
+        bootstrap_after = (
+            date.fromisoformat(str(args.strategy_bootstrap_after))
+            if str(args.strategy_bootstrap_after).strip()
+            else None
+        )
+        calibration_time = datetime_time.fromisoformat(
+            str(args.strategy_calibration_time)
+        )
+        strategy_engine = TaifexVolatilitySimulation(
+            api=api,
+            shioaji_module=sj,
+            state_dir=Path(args.strategy_state_dir),
+            option_infos=selected_option_infos[: (100 - len(futures_infos))],
+            underlying=FuturesInstrument(
+                logical_code=str(args.future_code),
+                code=str(getattr(future_base, "code")),
+                contract=future_base,
+                last_trading_date=getattr(future_info, "last_trading_date", None),
+            ),
+            hedge=FuturesInstrument(
+                logical_code=str(args.hedge_future_code),
+                code=str(getattr(hedge_base, "code")),
+                contract=hedge_base,
+                last_trading_date=getattr(hedge_info, "last_trading_date", None),
+            ),
+            final_settlement_path=Path(args.final_settlement_path),
+            calibration_time=calibration_time,
+            bootstrap_after=bootstrap_after,
+            broker_orders_enabled=True,
+        )
+        api.set_order_callback(strategy_engine.on_order_event)
 
     @api.on_tick_fop_v1()
     def on_tick(tick: Any) -> None:
         receive_ts_ns = time.time_ns()
         receive_monotonic_ns = time.monotonic_ns()
         try:
-            sink.enqueue(
-                "tick",
-                normalize_fop_tick(
-                    tick,
-                    event_seq=next(event_sequence),
-                    worker_index=int(args.worker_index),
-                    receive_ts_ns=receive_ts_ns,
-                    receive_monotonic_ns=receive_monotonic_ns,
-                ),
+            row = normalize_fop_tick(
+                tick,
+                event_seq=next(event_sequence),
+                worker_index=int(args.worker_index),
+                receive_ts_ns=receive_ts_ns,
+                receive_monotonic_ns=receive_monotonic_ns,
             )
+            sink.enqueue("tick", row)
+            if strategy_engine is not None:
+                strategy_engine.on_tick(row)
         except Exception:
             sink.fatal_event.set()
 
@@ -393,16 +532,16 @@ def main() -> int:
         receive_ts_ns = time.time_ns()
         receive_monotonic_ns = time.monotonic_ns()
         try:
-            sink.enqueue(
-                "book",
-                normalize_fop_book(
-                    book,
-                    event_seq=next(event_sequence),
-                    worker_index=int(args.worker_index),
-                    receive_ts_ns=receive_ts_ns,
-                    receive_monotonic_ns=receive_monotonic_ns,
-                ),
+            row = normalize_fop_book(
+                book,
+                event_seq=next(event_sequence),
+                worker_index=int(args.worker_index),
+                receive_ts_ns=receive_ts_ns,
+                receive_monotonic_ns=receive_monotonic_ns,
             )
+            sink.enqueue("book", row)
+            if strategy_engine is not None:
+                strategy_engine.on_book(row)
         except Exception:
             sink.fatal_event.set()
 
@@ -437,6 +576,8 @@ def main() -> int:
             if sink.fatal_event.is_set():
                 status = "failed_event_loss_or_normalization"
                 break
+            if strategy_engine is not None:
+                strategy_engine.step()
         if shutdown.is_set():
             status = "stopped_by_signal"
         elif status == "running":
@@ -445,6 +586,8 @@ def main() -> int:
             status = "failed_no_bidask_events"
     finally:
         sink.stop()
+        if strategy_engine is not None:
+            strategy_engine.close()
         try:
             api.logout()
         except Exception:
@@ -464,6 +607,8 @@ def main() -> int:
             "selection": {
                 "future_code": str(args.future_code),
                 "resolved_future_code": str(getattr(future_base, "code")),
+                "hedge_future_code": str(args.hedge_future_code),
+                "resolved_hedge_future_code": str(getattr(hedge_base, "code")),
                 "option_roots": list(option_roots),
                 "unavailable_option_roots": unavailable_roots,
                 "selection_policy": "nearest_monthly_and_nearest_weekly_atm_outward",
@@ -490,6 +635,12 @@ def main() -> int:
             "book_1s_parts": sink.snapshot_writer.total_parts,
             "started_at_utc": started_at.replace(microsecond=0).isoformat(),
             "finished_at_utc": finished_at.replace(microsecond=0).isoformat(),
+            "strategy_simulation": {
+                "enabled": bool(args.execute_strategies),
+                "simulation_only": True,
+                "state_dir": str(args.strategy_state_dir),
+                "status_path": str(Path(args.strategy_state_dir) / "status.json"),
+            },
         }
         manifest_path = (
             args.output_dir

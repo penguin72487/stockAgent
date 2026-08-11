@@ -128,7 +128,40 @@ data:
   - twpub_taifex_tx_large_oi_log
   - twpub_taifex_tx_final_settlement_logret
   - next_session_open_gap_logret
-  feature_exclude: []
+  # Fail closed for inputs whose historical point-in-time lineage is not yet
+  # sufficient for the day-trade executor.  They are excluded (rather than
+  # merely zero-filled) because live deployment requires every selected input
+  # to contain real, causally available data.
+  feature_exclude:
+    # Valuation coverage is not yet stable across the historical universe.
+    - twpub_pe_log
+    - twpub_pb_log
+    - twpub_dividend_yield
+
+    # These session-t chip values are already shifted to the next verified
+    # exchange session by the feature builder.  The tw_day_trade executor also
+    # consumes a completed prior-session window, so enabling them here would
+    # apply the availability lag twice.
+    - twpub_margin_*
+    - twpub_short_*
+    - twpub_foreign_net_buy_flow
+    - twpub_investment_trust_net_buy_flow
+    - twpub_dealer_net_buy_flow
+    - twpub_institutional_net_buy_flow
+
+    # Current snapshots, single-vintage macro archives, or feature families
+    # without a complete machine-checked historical availability registry.
+    - twpub_dividend_*
+    - twpub_exdiv_*
+    - twpub_material_*
+    - twpub_attention_*
+    - twpub_disposal_*
+    - twpub_twse_taiex_*
+    - twpub_usdtwd_*
+    - twpub_cbc_*
+    - twpub_dgbas_*
+    - twpub_mof_*
+    - twpub_taifex_*
   feature_zero_fill: []
   day_trade_open_feature: true
   feature_shift_next_session: []

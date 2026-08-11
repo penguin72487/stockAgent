@@ -1,0 +1,217 @@
+{
+  "schema_version": 1,
+  "datasets": [
+    {
+      "dataset": "tw-public",
+      "source": "data_tw_public",
+      "role": "training-and-audit",
+      "publish": true,
+      "pack_buckets": 64,
+      "loose_threshold_mib": 8,
+      "active_process_substrings": [
+        "download_tw_public_data.py",
+        "rebuild_tw_public_data_layer.py",
+        "build_tw_public_training_features.py"
+      ],
+      "note": "Immutable public TW training tree plus official raw receipts."
+    },
+    {
+      "dataset": "tw-minute-train",
+      "source": "data_tw_minute/research_dataset",
+      "role": "training",
+      "publish": true,
+      "pack_buckets": 64,
+      "loose_threshold_mib": 8,
+      "active_process_substrings": [
+        "build_shioaji_tw_minute_dataset.py"
+      ],
+      "note": "Canonical audited one-minute partitions; excludes the known schema2 volume-bug quarantine tree."
+    },
+    {
+      "dataset": "tw-minute-source-cold",
+      "source": "data_tw_minute/shioaji_1m",
+      "role": "cold-audit",
+      "publish": true,
+      "pack_buckets": 128,
+      "loose_threshold_mib": 8,
+      "active_process_substrings": [
+        "download_shioaji_tw_minute_kbars.py"
+      ],
+      "note": "Resumable source chunks and receipts; pack only after downloader exit."
+    },
+    {
+      "dataset": "tw-microstructure-train",
+      "source": "data_tw_microstructure/hft_dataset",
+      "role": "training",
+      "publish": true,
+      "pack_buckets": 64,
+      "loose_threshold_mib": 8,
+      "active_process_substrings": [
+        "build_shioaji_hft_dataset.py"
+      ],
+      "note": "Audited HFT partitions selected from completed captures."
+    },
+    {
+      "dataset": "tw-microstructure-captures-cold",
+      "source": "data_tw_microstructure/captures",
+      "role": "cold-audit",
+      "publish": true,
+      "pack_buckets": 128,
+      "loose_threshold_mib": 8,
+      "active_process_substrings": [
+        "stream_shioaji_tw_microstructure.py",
+        "stream_shioaji_taifex_bidask.py"
+      ],
+      "note": "Raw immutable capture parts; prefer the one-file-per-symbol compactor for analytical reads."
+    },
+    {
+      "dataset": "openbb-compact",
+      "source": "data_openBB/compact",
+      "role": "analytics",
+      "publish": true,
+      "pack_buckets": 32,
+      "loose_threshold_mib": 16,
+      "active_process_substrings": [
+        "download_openbb_archive.py",
+        "process_openbb_archive.py"
+      ],
+      "note": "Only validated endpoint-level archive.parquet outputs are publishable; millions of task shards stay local until compaction is complete."
+    },
+    {
+      "dataset": "yahoo-market",
+      "source": "data_yahoo",
+      "role": "training",
+      "publish": true,
+      "pack_buckets": 128,
+      "loose_threshold_mib": 8,
+      "active_process_substrings": [
+        "download_yahoo_ohlcv.py",
+        "build_tw_yahoo_fallback_archive.py"
+      ],
+      "note": "Per-symbol Parquet is the query-aligned canonical grain; transport packs hide it from Syncthing indexing."
+    },
+    {
+      "dataset": "okx",
+      "source": "data_okx",
+      "role": "training",
+      "publish": true,
+      "pack_buckets": 16,
+      "loose_threshold_mib": 8,
+      "active_process_substrings": [
+        "download_okx_perp_15m.py",
+        "download_okx_perp_daily.py",
+        "okx_historical_features.py"
+      ],
+      "note": "OKX public market and point-in-time feature data."
+    },
+    {
+      "dataset": "bybit",
+      "source": "data_bybit",
+      "role": "training",
+      "publish": true,
+      "pack_buckets": 16,
+      "loose_threshold_mib": 8,
+      "active_process_substrings": [
+        "download_bybit_perp_15m.py",
+        "download_bybit_perp_daily.py"
+      ],
+      "note": "Bybit public perpetual market data."
+    },
+    {
+      "dataset": "tw-index-futures",
+      "source": "data_tw_index_futures",
+      "role": "training",
+      "publish": true,
+      "pack_buckets": 16,
+      "loose_threshold_mib": 8,
+      "active_process_substrings": [
+        "download_tw_index_futures_day_session.py"
+      ],
+      "note": "TAIFEX index-futures daily/session data."
+    },
+    {
+      "dataset": "tw-index-derivatives-ticks",
+      "source": "data_tw_index_derivatives_ticks",
+      "role": "training-and-audit",
+      "publish": true,
+      "pack_buckets": 32,
+      "loose_threshold_mib": 8,
+      "active_process_substrings": [
+        "download_taifex_recent_index_derivatives_ticks.py",
+        "build_taifex_index_derivatives_tick_dataset.py"
+      ],
+      "note": "Official raw tick downloads, normalized outputs, receipts and manifests."
+    },
+    {
+      "dataset": "tw-index-options-daily",
+      "source": "data_tw_index_options_daily",
+      "role": "training-and-audit",
+      "publish": true,
+      "pack_buckets": 16,
+      "loose_threshold_mib": 8,
+      "active_process_substrings": [
+        "download_taifex_option_daily_history.py"
+      ],
+      "note": "TAIFEX option daily history and receipts."
+    },
+    {
+      "dataset": "tw-futures",
+      "source": "data_tw_futures",
+      "role": "training",
+      "publish": true,
+      "pack_buckets": 16,
+      "loose_threshold_mib": 8,
+      "active_process_substrings": [
+        "download_shioaji_tx_futures_ticks.py"
+      ],
+      "note": "Shioaji/TAIFEX futures data."
+    },
+    {
+      "dataset": "forex-frankfurter",
+      "source": "data_forex_frankfurter",
+      "role": "training",
+      "publish": true,
+      "pack_buckets": 8,
+      "loose_threshold_mib": 8,
+      "active_process_substrings": [
+        "download_forex_frankfurter.py"
+      ],
+      "note": "Frankfurter FX data."
+    },
+    {
+      "dataset": "forex-pepperstone",
+      "source": "data_peperstone",
+      "role": "training",
+      "publish": true,
+      "pack_buckets": 16,
+      "loose_threshold_mib": 8,
+      "active_process_substrings": [
+        "download_pepperstone.py",
+        "download_forex_pepperstone.py"
+      ],
+      "note": "Pepperstone FX data; preserves the current historical directory spelling."
+    },
+    {
+      "dataset": "legacy-parquet",
+      "source": "data_parquet",
+      "role": "legacy",
+      "publish": true,
+      "pack_buckets": 32,
+      "loose_threshold_mib": 8,
+      "active_process_substrings": [],
+      "note": "Legacy Parquet root; keep separate until every consumer has an explicit owner."
+    },
+    {
+      "dataset": "openbb-task-shards-local",
+      "source": "data_openBB/data",
+      "role": "local-work-only",
+      "publish": false,
+      "pack_buckets": 0,
+      "loose_threshold_mib": 0,
+      "active_process_substrings": [
+        "download_openbb_archive.py"
+      ],
+      "note": "Never sync the millions of resumable task shards; compact and verify endpoint archives first."
+    }
+  ]
+}

@@ -183,7 +183,7 @@ def test_repo_tw_modes_have_independent_market_and_artifact_routes() -> None:
     multi_basis = configs["tw_day_trade_multi_basis"]
     multi_basis_root = (
         "artifacts/markets/"
-        "tw_public_candles_multi_basis_online_complete_raw_feature_input_lookback32_v5"
+        "tw_public_candles_multi_basis_online_complete_input_features_lookback32_v1"
     )
     assert multi_basis.fold_id == 11
     assert multi_basis.initial_capital == 10_000_000.0
@@ -201,3 +201,13 @@ def test_repo_tw_modes_have_independent_market_and_artifact_routes() -> None:
         == day_trade_100m.live_output_dir
         == "artifacts/live_signals"
     )
+    shared_refresh = (
+        "{python}",
+        "scripts/refresh_tw_public_live_snapshot.py",
+        "--config",
+        "configs/markets/tw_day_trade_10m.yaml",
+    )
+    assert day_trade_1m.pre_signal_command == shared_refresh
+    assert day_trade.pre_signal_command == shared_refresh
+    assert multi_basis.pre_signal_command == shared_refresh
+    assert day_trade_100m.pre_signal_command == shared_refresh

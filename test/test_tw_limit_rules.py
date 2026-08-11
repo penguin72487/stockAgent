@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import math
 import sys
+from datetime import date
 from pathlib import Path
 
 import numpy as np
@@ -13,10 +14,12 @@ import polars as pl
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from stockagent.backtest.simulator import run_backtest_integer_shares
+from stockagent.data import panel_numba
 from stockagent.data.panel import (
     _compute_tw_limit_masks,
     _tw_limit_price,
     _tw_open_limit_masks_from_arrays,
+    _tw_tick_size,
 )
 
 
@@ -45,6 +48,68 @@ def test_limit_price_examples() -> None:
         _assert_close(float(actual), float(expected))
     for actual, expected in zip(down.tolist(), expected_down):
         _assert_close(float(actual), float(expected))
+
+
+def test_historical_tick_buckets_change_on_2005_03_01() -> None:
+    prices = np.asarray([7.0, 20.0, 100.0, 200.0], dtype=np.float64)
+    old_dates = np.full(prices.shape, np.datetime64("2005-02-28", "D"))
+    new_dates = np.full(prices.shape, np.datetime64("2005-03-01", "D"))
+
+    np.testing.assert_allclose(
+        _tw_tick_size(prices, old_dates),
+        np.asarray([0.05, 0.10, 0.50, 1.00]),
+    )
+    np.testing.assert_allclose(
+        _tw_tick_size(prices, new_dates),
+        np.asarray([0.01, 0.05, 0.50, 0.50]),
+    )
+
+
+def test_historical_daily_limit_changes_on_2015_06_01() -> None:
+    reference = np.asarray([100.0, 100.0], dtype=np.float64)
+    dates = np.asarray(["2015-05-29", "2015-06-01"], dtype="datetime64[D]")
+
+    np.testing.assert_allclose(_tw_limit_price(reference, 1.10, dates), [107.0, 110.0])
+    np.testing.assert_allclose(_tw_limit_price(reference, 0.90, dates), [93.0, 90.0])
+
+
+def test_historical_numba_and_numpy_price_rules_match() -> None:
+    prices = np.asarray([4.99, 7.0, 20.0, 100.0, 200.0, 1000.0], dtype=np.float64)
+    dates = np.asarray(
+        [
+            "2005-02-28",
+            "2005-02-28",
+            "2005-03-01",
+            "2015-05-29",
+            "2015-06-01",
+            "2026-08-12",
+        ],
+        dtype="datetime64[D]",
+    )
+    from stockagent.data.tw_price_rules import limit_price_numpy, tick_size_numpy
+
+    np.testing.assert_array_equal(
+        panel_numba.tw_tick_size(prices, dates),
+        tick_size_numpy(prices, dates),
+    )
+    np.testing.assert_array_equal(
+        panel_numba.tw_limit_price(prices, 1.10, dates),
+        limit_price_numpy(prices, 1.10, dates),
+    )
+
+
+def test_historical_limit_mask_uses_session_date() -> None:
+    frame = pl.DataFrame(
+        {
+            "date": [date(2015, 5, 28), date(2015, 5, 29)],
+            "tradable": [True, True],
+            "close_raw": [100.0, 107.0],
+        }
+    )
+
+    can_buy, can_sell = _compute_tw_limit_masks(frame)
+    assert bool(can_buy[1]) is False
+    assert bool(can_sell[1]) is True
 
 
 def test_limit_down_rounds_up_to_tick_for_ching_yun_case() -> None:

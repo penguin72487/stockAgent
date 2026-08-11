@@ -7,6 +7,34 @@ source scripts/runtime_env.sh
 run_fintech_python services/discord_bot/bot.py
 ```
 
+For this host, install the persistent service with:
+
+```bash
+bash scripts/install_discord_bot_service.sh
+systemctl status stockagent-discord-bot.service
+```
+
+The service reads `services/discord_bot/.env`; keep that file mode `0600`.
+Use `STOCKAGENT_SCHEDULED_MARKETS` to list only markets whose credentials and
+model artifacts are ready. A market remains available to interactive Discord
+commands when enabled even if it is not in that automatic schedule.
+
+All Taiwan daily and day-trade market configs share
+`scripts/refresh_tw_public_live_snapshot.py`. The updater writes only to the
+mutable `/srv/stockagent-live/data_tw_public` tree, runs the strict causal-data
+audit, publishes to the Syncthing/desync store, verifies a separately
+materialized snapshot, then atomically switches the repository symlink. Check
+the four day-trade modes with:
+
+```bash
+source scripts/runtime_env.sh
+run_fintech_python scripts/audit_tw_day_trade_live_readiness.py
+```
+
+The durable report is written to
+`artifacts/live/tw_day_trade_readiness/readiness.md`. Data readiness does not
+substitute for a missing checkpoint or an unsupported execution contract.
+
 The entrypoint runs with a built-in reload supervisor by default. It watches
 Discord bot code/config, `stockagent/live`, `configs/markets`, and
 `scripts/live_signal.py`; watched file updates restart the child bot process
