@@ -1,0 +1,14 @@
+# Immutable manual deployment for the TWD 10 million Multi-Basis day-trade model.
+mode: manual
+config_path: configs/markets/tw_public_multi_basis_online_complete.yaml
+output_dir: artifacts/markets/tw_public_candles_multi_basis_online_complete_raw_feature_input_lookback32_v5
+fold_id: 11
+checkpoint_path: artifacts/markets/tw_public_candles_multi_basis_online_complete_raw_feature_input_lookback32_v5/fold_11/checkpoint_best.pt
+weights_path: artifacts/markets/tw_public_candles_multi_basis_online_complete_raw_feature_input_lookback32_v5/fold_11/daily_weights.parquet
+model_scoped_live_output: true
+model_candidate_output_dirs:
+  - artifacts/markets/tw_public_candles_multi_basis_online_complete_raw_feature_input_lookback32_v5
+model_candidate_config_paths:
+  - configs/markets/tw_public_multi_basis_online_complete.yaml
+model_deployment_manifest: artifacts/discord_bot/deployments/tw_day_trade_multi_basis.json
+model_auto_deploy_interval_seconds: 60

@@ -28,6 +28,20 @@ Required environment:
 - `STOCKAGENT_MARKETS_DIR` defaults to `services/discord_bot/markets`
 - `STOCKAGENT_DEFAULT_MARKET` defaults to `tw`
 
+User Install:
+
+- Requires `discord.py>=2.4,<3`. The command tree is synced globally once from
+  `setup_hook()` and supports both Guild Install and User Install.
+- Install Otto Suwen to a personal account with
+  <https://discord.com/oauth2/authorize?client_id=1518140996930637877> and
+  choose **Add to my apps**. No `bot`, `gdm.join`, or administrator scope is
+  required for personal installation.
+- User-facing slash commands are available in guild channels, Bot DMs, direct
+  messages, and group DMs. Non-ephemeral responses are visible to everyone in
+  the current conversation.
+- `/set_market_enabled`, `/set_schedule`, and `/set_capital` remain Guild-only
+  because they mutate shared Bot state and require administrator/trader access.
+
 Market configs:
 
 - One market per YAML file.
@@ -59,6 +73,8 @@ Market configs:
 
 Useful commands:
 
+- `/ask question:...` verifies that Otto Suwen can be invoked from a personal
+  installation, including direct messages and private group conversations.
 - `/signal_now market:tw` answers from a reusable live artifact when it already
   matches the current market context. With `price_source:auto`, open stock
   markets use current Yahoo quotes when a new inference is needed; closed

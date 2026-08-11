@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from stockagent.live.report_formatter import INVESTMENT_WARNING
@@ -9,14 +11,21 @@ discord = pytest.importorskip("discord")
 from services.discord_bot import bot as discord_bot  # noqa: E402
 
 
-def test_guide_lists_all_three_tw_execution_modes() -> None:
+def test_guide_lists_all_tw_execution_modes() -> None:
     guide = discord_bot._guide_message()
 
     assert "`tw` 舊版 Naive" in guide
     assert "`tw_cash` 現股/T+2" in guide
     assert "`tw_day_trade_1m` 現股當沖（初始 100 萬）" in guide
     assert "`tw_day_trade` 現股當沖（初始 1,000 萬）" in guide
+    assert "`tw_day_trade_multi_basis` Multi-Basis 現股當沖（初始 1,000 萬）" in guide
     assert "`tw_day_trade_100m` 現股當沖（初始 1 億）" in guide
+
+
+def test_multi_basis_day_trade_is_available_in_market_autocomplete() -> None:
+    choices = asyncio.run(discord_bot.market_autocomplete(None, "multi_basis"))
+
+    assert any(choice.value == "tw_day_trade_multi_basis" for choice in choices)
 
 
 def test_discord_page_size_and_top_n_floor_to_ten() -> None:
@@ -68,3 +77,46 @@ def test_discord_empty_trade_page_still_has_warning() -> None:
     pages = discord_bot._line_pages(title="empty", rows=[], formatter=str, page_size=5)
 
     assert pages == [f"**empty**\n(no rows)\n\n{INVESTMENT_WARNING}"]
+
+
+def test_user_facing_commands_support_user_install_and_private_contexts() -> None:
+    shared_state_commands = {"set_market_enabled", "set_schedule", "set_capital"}
+
+    for command in discord_bot.bot.tree.get_commands():
+        payload = command.to_dict(discord_bot.bot.tree)
+        if command.name in shared_state_commands:
+            assert payload["integration_types"] == [0]
+            assert payload["contexts"] == [0]
+        else:
+            assert payload["integration_types"] == [0, 1]
+            assert payload["contexts"] == [0, 1, 2]
+
+    ask_command = discord_bot.bot.tree.get_command("ask")
+    assert ask_command is not None
+    assert [parameter.name for parameter in ask_command.parameters] == ["question"]
+
+
+def test_setup_hook_syncs_only_global_commands(monkeypatch: pytest.MonkeyPatch) -> None:
+    sync_guilds: list[object | None] = []
+    started_loops: list[str] = []
+
+    async def fake_sync(_tree, *, guild=None):
+        sync_guilds.append(guild)
+        return []
+
+    def fake_start(loop, *args, **kwargs):
+        del args, kwargs
+        started_loops.append(loop.coro.__name__)
+
+    monkeypatch.setattr(discord_bot.app_commands.CommandTree, "sync", fake_sync)
+    monkeypatch.setattr(discord_bot.tasks.Loop, "start", fake_start)
+
+    asyncio.run(discord_bot.bot.setup_hook())
+
+    assert sync_guilds == [None]
+    assert set(started_loops) == {
+        "scheduled_signal",
+        "daily_summary",
+        "artifact_backfill",
+        "model_auto_deployment",
+    }
