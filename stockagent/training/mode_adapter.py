@@ -137,13 +137,15 @@ _MODE_SPECS: Final[tuple[TrainingModeSpec, ...]] = (
         terminal_policy="mandatory_session_close_flatten",
         split_ownership="year_expanding_walk_forward",
         sample_order_contract="chronological_sessions",
-        benchmark_contract="configured_symbol_first_execution_to_session_close",
+        benchmark_contract=(
+            "configured_symbol_adjusted_close_buy_hold_first_to_last_v1"
+        ),
         weight_snapshot_contract="realised_weights_before_mandatory_close_flatten",
         turnover_contract="gross_traded_notional_over_daily_initial_equity",
         runner_module="stockagent.training.minute",
         runner_name="run_minute_training",
         dataset_root_config_path="data.minute_parquet_root",
-        supports_isolated_folds=False,
+        supports_isolated_folds=True,
     ),
     TrainingModeSpec(
         execution_mode="tw_index_derivatives_tick",
@@ -282,7 +284,13 @@ def dispatch_specialized_training_mode(
             "use its canonical in-process group checkpoint resume"
         )
     assert spec.runner_module is not None and spec.runner_name is not None
-    runner = getattr(import_module(spec.runner_module), spec.runner_name)
+    runner_module = import_module(spec.runner_module)
+    runner_name = (
+        f"{spec.runner_name}_isolated"
+        if isolate_train_folds
+        else spec.runner_name
+    )
+    runner = getattr(runner_module, runner_name)
     if startup_checkpoint is not None:
         startup_checkpoint(
             f"{spec.execution_mode}_runner_dispatch",

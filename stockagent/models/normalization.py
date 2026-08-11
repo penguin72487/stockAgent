@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 
 import torch
+import torch.nn.functional as F
 
 from stockagent.portfolio_contract import (
     DEFAULT_PORTFOLIO_ACTIVATION,
@@ -98,6 +99,51 @@ def masked_activation_l1_weights(
         with profile_range("portfolio.normalize_l1"):
             denom = weights.abs().sum(dim=1, keepdim=True)
             return torch.where(denom > 0.0, weights / denom.clamp_min(float(eps)), torch.zeros_like(weights))
+
+
+def masked_cash_asset_l1_weights(
+    stock_logits: torch.Tensor,
+    cash_logit: torch.Tensor,
+    mask: torch.Tensor | None,
+    *,
+    long_only: bool = False,
+    activation: str | None = "identity",
+    eps: float = PORTFOLIO_L1_EPS,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Jointly allocate one explicit cash action and signed stock actions.
+
+    The cash action is a model score, not residual buying power.  Its positive
+    score competes in the same L1 denominator as every stock score, so every
+    row satisfies ``sum(abs(stock_weights)) + cash_weight == 1`` (up to
+    floating-point rounding).  Cash cannot be short, hence the smooth
+    ``softplus`` mapping from its unconstrained model logit.
+    """
+
+    if stock_logits.ndim != 2:
+        raise ValueError("cash-L1 stock logits must have shape [B,S]")
+    if cash_logit.ndim == 1:
+        cash_logit = cash_logit.unsqueeze(1)
+    if tuple(cash_logit.shape) != (int(stock_logits.size(0)), 1):
+        raise ValueError("cash-L1 cash logit must have shape [B] or [B,1]")
+
+    stock_scores = apply_portfolio_activation(stock_logits, activation).float()
+    if long_only:
+        stock_scores = stock_scores.clamp_min(0.0)
+    if mask is not None:
+        mask_bool = mask.to(device=stock_logits.device, dtype=torch.bool)
+        if tuple(mask_bool.shape) != tuple(stock_logits.shape):
+            raise ValueError("cash-L1 mask must match stock logits")
+        stock_scores = stock_scores.masked_fill(~mask_bool, 0.0)
+
+    clean_cash_logit = torch.nan_to_num(
+        cash_logit.float(), nan=0.0, posinf=0.0, neginf=0.0
+    )
+    positive_cash_score = F.softplus(clean_cash_logit)
+    denominator = stock_scores.abs().sum(dim=1, keepdim=True) + positive_cash_score
+    denominator = denominator.clamp_min(float(eps))
+    stock_weights = stock_scores / denominator
+    cash_weight = positive_cash_score / denominator
+    return stock_weights, cash_weight.squeeze(1), positive_cash_score.squeeze(1)
 
 
 def _masked_distribution(

@@ -13,6 +13,7 @@ from stockagent.models.latent_factor_market_token_portfolio import _safe_attenti
 from stockagent.models.normalization import (
     dual_branch_softmax,
     finite_mask_fill_value,
+    masked_cash_asset_l1_weights,
     masked_l1_projection_weights,
     masked_cross_sectional_mean_finite,
     masked_signed_action_weights,
@@ -705,6 +706,11 @@ class TransformerBasePortfolioModel(nn.Module):
         self.portfolio_mode = normalize_portfolio_mode(portfolio_mode)
         self.portfolio_activation = normalize_portfolio_activation(portfolio_activation)
         self.portfolio_output_mode = normalize_portfolio_output_mode(portfolio_output_mode)
+        if self.portfolio_output_mode == "cash_l1" and self.num_action_channels != 1:
+            raise ValueError(
+                "portfolio_output_mode='cash_l1' supports only a single target "
+                "channel; carrying-mode phase heads require a separate cash contract"
+            )
         self.center_long_short_logits = bool(center_long_short_logits)
         self.max_full_tokens = int(max_full_tokens)
         self.checkpoint_blocks = bool(checkpoint_blocks)
@@ -891,6 +897,20 @@ class TransformerBasePortfolioModel(nn.Module):
         # parameter shapes so old strict checkpoints remain byte-for-byte
         # schema compatible.  Multi-action modes widen only the final head.
         self.score_head = make_score_head(self.num_action_channels)
+        # Cash-L1 treats cash as one additional model-scored asset.  Its token
+        # receives the current masked market context and then passes through
+        # the exact same score head as stocks.  Disabled modes create no new
+        # parameters, preserving their historical checkpoint schema.
+        self.cash_asset_token = (
+            nn.Parameter(torch.randn(1, self.d_model) * 0.02)
+            if self.portfolio_output_mode == "cash_l1"
+            else None
+        )
+        self.cash_asset_norm = (
+            _make_norm(self.d_model, self.norm_type)
+            if self.portfolio_output_mode == "cash_l1"
+            else None
+        )
 
     def enable_legacy_dynamic_token_checkpoint_compatibility(
         self,
@@ -1998,6 +2018,11 @@ class TransformerBasePortfolioModel(nn.Module):
             # This helper is the explicit logits -> executable-target boundary.
             # Callers that want raw logits do not call it.
             resolved_mode = "activation_l1"
+        if resolved_mode == "cash_l1":
+            raise ValueError(
+                "cash_l1 requires the contextual cash token and is resolved "
+                "inside model forward; raw stock logits alone are insufficient"
+            )
 
         output_aux: dict[str, torch.Tensor] = {}
         long_only = self.portfolio_mode == "long_only"
@@ -2367,6 +2392,26 @@ class TransformerBasePortfolioModel(nn.Module):
             return output
         return actions
 
+    def _cash_asset_score_logit(
+        self,
+        z_stock: torch.Tensor,
+        mask_bool: torch.Tensor,
+    ) -> torch.Tensor:
+        """Score one contextual cash token with the shared stock score head."""
+
+        if self.cash_asset_token is None or self.cash_asset_norm is None:
+            raise RuntimeError("cash asset score requested while cash_l1 is disabled")
+        mask_f = mask_bool.unsqueeze(-1).to(dtype=z_stock.dtype)
+        valid_count = mask_f.sum(dim=1).clamp_min(1.0)
+        market_context = (z_stock * mask_f).sum(dim=1) / valid_count
+        cash_embedding = self.cash_asset_norm(
+            market_context + self.cash_asset_token.to(dtype=market_context.dtype)
+        )
+        cash_score = self.score_head(cash_embedding)
+        if tuple(cash_score.shape) != (int(z_stock.size(0)), 1):
+            raise RuntimeError("cash-L1 shared score head must emit one cash score")
+        return _sanitize_scores_to_dtype(cash_score.squeeze(-1))
+
     def _portfolio_outputs_from_stock_embeddings(
         self,
         z_stock: torch.Tensor,
@@ -2412,6 +2457,11 @@ class TransformerBasePortfolioModel(nn.Module):
 
         output_aux: dict[str, torch.Tensor] = {}
         include_action_aux = bool(return_aux is True or (return_aux is None and self.return_aux and self.return_aux_details))
+        cash_score_logits: torch.Tensor | None = None
+        cash_target_logits: torch.Tensor | None = None
+        if self.portfolio_output_mode == "cash_l1":
+            cash_score_logits = self._cash_asset_score_logit(z_stock, mask_bool)
+            cash_target_logits = cash_score_logits / temp
 
         if self.portfolio_mode == "long_only":
             centered_scores = scores
@@ -2422,6 +2472,25 @@ class TransformerBasePortfolioModel(nn.Module):
                 target_logits = (scores / temp).masked_fill(~mask_bool, 0.0)
             if self.portfolio_output_mode == "logits":
                 weights = target_logits
+            elif self.portfolio_output_mode == "cash_l1":
+                if cash_target_logits is None or cash_score_logits is None:
+                    raise AssertionError("cash-L1 logits were not prepared")
+                weights, cash_weight, positive_cash_score = (
+                    masked_cash_asset_l1_weights(
+                        target_logits,
+                        cash_target_logits,
+                        mask_bool,
+                        long_only=True,
+                        activation="identity",
+                    )
+                )
+                output_aux = {
+                    "cash_score_logits": cash_score_logits,
+                    "cash_target_logits": cash_target_logits,
+                    "positive_cash_score": positive_cash_score,
+                    "cash_weight": cash_weight,
+                    "risky_gross_weight": weights.abs().sum(dim=1),
+                }
             elif self.portfolio_output_mode == "signed_softmax":
                 action_output = masked_signed_action_weights(
                     target_logits,
@@ -2487,6 +2556,25 @@ class TransformerBasePortfolioModel(nn.Module):
                 target_logits = (centered_scores / temp).masked_fill(~mask_bool, 0.0)
             if self.portfolio_output_mode == "logits":
                 weights = target_logits
+            elif self.portfolio_output_mode == "cash_l1":
+                if cash_target_logits is None or cash_score_logits is None:
+                    raise AssertionError("cash-L1 logits were not prepared")
+                weights, cash_weight, positive_cash_score = (
+                    masked_cash_asset_l1_weights(
+                        target_logits,
+                        cash_target_logits,
+                        mask_bool,
+                        long_only=False,
+                        activation="identity",
+                    )
+                )
+                output_aux = {
+                    "cash_score_logits": cash_score_logits,
+                    "cash_target_logits": cash_target_logits,
+                    "positive_cash_score": positive_cash_score,
+                    "cash_weight": cash_weight,
+                    "risky_gross_weight": weights.abs().sum(dim=1),
+                }
             elif self.portfolio_output_mode == "signed_softmax":
                 action_output = masked_signed_action_weights(
                     target_logits,
@@ -2539,6 +2627,29 @@ class TransformerBasePortfolioModel(nn.Module):
         else:
             weights = weights.masked_fill(~mask_bool, 0.0)
 
+        if self.portfolio_output_mode == "cash_l1":
+            cash_weight = output_aux["cash_weight"]
+            positive_cash_score = output_aux["positive_cash_score"]
+            if cash_score_logits is None:
+                raise AssertionError("cash-L1 score logits were not prepared")
+            output_aux.update(
+                {
+                    # Cash is the final asset column in all three auditable
+                    # vectors. The allocation vector applies softplus only to
+                    # cash because negative cash/borrowing is not permitted.
+                    "score_logits_with_cash": torch.cat(
+                        (scores, cash_score_logits.unsqueeze(1)), dim=1
+                    ),
+                    "allocation_scores_with_cash": torch.cat(
+                        (target_logits.float(), positive_cash_score.unsqueeze(1)),
+                        dim=1,
+                    ),
+                    "weights_with_cash": torch.cat(
+                        (weights, cash_weight.unsqueeze(1)), dim=1
+                    ),
+                }
+            )
+
         if return_scores:
             return weights, masked_scores
         if return_aux is True:
@@ -2561,6 +2672,7 @@ class TransformerBasePortfolioModel(nn.Module):
                 "rank_logits": scores,
                 "centered_score_logits": centered_scores,
             }
+            output.update(output_aux)
             if self.return_aux_details:
                 aux = dict(aux)
                 aux.update(

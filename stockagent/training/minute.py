@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 import gc
 import json
 import math
+import os
 from pathlib import Path
+import subprocess
+import sys
 import time
 from typing import Any, Callable, Iterable
 
@@ -31,6 +34,7 @@ from stockagent.backtest.tw_minute import (
     minute_target_weights_from_logits,
 )
 from stockagent.backtest.report import compute_metrics
+from stockagent.backtest.holdings import save_realized_holdings_artifacts
 from stockagent.backtest.simulator import BacktestResult
 from stockagent.config import ExperimentConfig
 from stockagent.data.tw_minute import (
@@ -101,10 +105,13 @@ from stockagent.training.lifecycle import (
 
 
 MINUTE_EXECUTION_CONTRACT_VERSION = 6
+MINUTE_BENCHMARK_CONTRACT = (
+    "configured_symbol_adjusted_close_buy_hold_first_to_last_v1"
+)
 # Per-epoch validation/test reporting is audit-only: it does not alter model
 # inputs, optimizer state, scheduler state, sample order, or loss/backtest
 # semantics. Allocation-order changes require a fresh training contract.
-MINUTE_TRAINING_CONTRACT_VERSION = 11
+MINUTE_TRAINING_CONTRACT_VERSION = 13
 
 
 class _MinuteSlabForwardAdapter(nn.Module):
@@ -182,14 +189,14 @@ class _MinuteSlabForwardAdapter(nn.Module):
         if not isinstance(model_output, torch.Tensor):
             raise RuntimeError("tw_minute model did not return portfolio outputs")
         flat_mask = mask.reshape(-1, mask.size(-1))
-        if self.portfolio_output_mode in {"l1", "projection_l1"}:
+        if self.portfolio_output_mode in {"l1", "cash_l1", "projection_l1"}:
             # Match the canonical daily tw_day_trade ordering exactly: the
             # model first resolves its L1 allocation using only its causal
-            # feature/tradability mask.  Projection-L1 may deliberately leave
-            # part of the gross-one budget as cash. Directional eligibility,
-            # close availability, and volume capacity are executor facts
-            # applied afterwards; blocked requests also remain cash instead of
-            # being redistributed across the surviving symbols.
+            # feature/tradability mask. Cash-L1 includes one model-scored cash
+            # asset in that same normalization; projection-L1 may also leave
+            # part of the budget unused. Directional eligibility, close
+            # availability, and volume capacity are executor facts applied
+            # afterwards; blocked requests are never redistributed.
             return model_output.float().masked_fill(~flat_mask, 0.0)
         if shortable_mask is None:
             shortable_mask = mask
@@ -347,6 +354,23 @@ def _minute_artifact_contract(
     dataset: MinuteDatasetIndex,
     config: ExperimentConfig,
 ) -> dict[str, Any]:
+    normalized_model_name = str(config.training.model_name).strip().lower().replace(
+        "-", "_"
+    )
+    active_model_config = (
+        config.training.financial_transformer
+        if normalized_model_name
+        in {
+            "financial_transformer",
+            "financial_transformer_model",
+            "financial_token_transformer",
+            "financial_tokenized_transformer",
+        }
+        else config.training.transformer_base_portfolio
+    )
+    output_mode = normalize_portfolio_output_mode(
+        active_model_config.portfolio_output_mode
+    )
     return {
         **canonical_mode_artifact_contract(config.trading.execution_mode),
         "execution_contract_version": MINUTE_EXECUTION_CONTRACT_VERSION,
@@ -354,6 +378,18 @@ def _minute_artifact_contract(
         "dataset_fingerprint": _minute_dataset_fingerprint(dataset),
         "configuration_fingerprint": _minute_configuration_fingerprint(config),
         "benchmark_name": str(config.data.benchmark_name),
+        "benchmark_contract": MINUTE_BENCHMARK_CONTRACT,
+        "benchmark_fingerprint": (
+            None
+            if dataset.daily_feature_context is None
+            else dataset.daily_feature_context.benchmark_fingerprint
+        ),
+        "portfolio_output_mode": output_mode,
+        "cash_allocation_contract": (
+            "contextual_cash_asset_joint_signed_l1_v1"
+            if output_mode == "cash_l1"
+            else None
+        ),
     }
 
 
@@ -534,26 +570,19 @@ def _stateful_proximal_target_weights(
     if long_only:
         candidate = candidate.clamp_min(0.0)
 
-    requested_gross = requested.abs().sum(dim=-1, keepdim=True)
     previous_gross = previous.abs().sum(dim=-1, keepdim=True)
-    candidate_gross = candidate.abs().sum(dim=-1, keepdim=True)
-    desired_gross = torch.where(
-        requested_gross > 1e-12,
-        requested_gross,
-        previous_gross,
-    )
-    normalized_candidate = torch.where(
-        candidate_gross > 1e-12,
-        candidate * desired_gross / torch.clamp_min(candidate_gross, 1e-12),
-        previous,
-    )
+    # Do not L1-normalize this candidate.  Every coordinate lies between the
+    # previous and requested endpoint, so the convexity of the L1 ball already
+    # guarantees feasibility.  Normalizing to either endpoint gross would
+    # re-introduce the turnover removed by the proximal threshold and would
+    # prevent a deliberate reduction of risky gross in favour of cash.
     # The first allocation has no previous inventory to preserve; charge its
-    # real entry fee in the ledger without sparsifying the gross-one proposal.
+    # real entry fee in the ledger without sparsifying the model proposal.
     initial_entry = previous_gross <= 1e-12
     return torch.where(
         initial_entry,
         requested,
-        torch.where(changed, normalized_candidate, previous),
+        torch.where(changed, candidate, previous),
     )
 
 
@@ -775,28 +804,17 @@ def _decision_indices(config: ExperimentConfig) -> np.ndarray:
 
 def _minute_benchmark_log_return(
     day: MinuteDayPanel,
-    *,
-    first_execution_index: int,
-    benchmark_symbol_index: int,
 ) -> float:
-    benchmark_open = float(
-        day.execution_open[first_execution_index, benchmark_symbol_index]
-    )
-    benchmark_close = float(day.session_close[benchmark_symbol_index])
-    benchmark_valid = bool(
-        day.execution_mask[first_execution_index, benchmark_symbol_index]
-        and day.session_exit_mask[benchmark_symbol_index]
-        and math.isfinite(benchmark_open)
-        and math.isfinite(benchmark_close)
-        and benchmark_open > 0.0
-        and benchmark_close > 0.0
-    )
-    if benchmark_valid:
-        return float(math.log(benchmark_close / benchmark_open))
-    # Benchmark coverage is report-only and must not invalidate otherwise
-    # executable strategy training.  Preserve the gap as NaN in daily parquet;
-    # the canonical report adapter treats it as a flat benchmark day while the
-    # explicit coverage metric keeps the missing observation auditable.
+    """Return the configured symbol's session-ending adjusted-close log return.
+
+    This deliberately ignores the minute executor's first tradable open and
+    close masks.  A benchmark is one buy-and-hold path, not a sequence of
+    independently reset intraday round trips.
+    """
+
+    value = float(day.benchmark_log_return)
+    if bool(day.benchmark_price_available) and math.isfinite(value):
+        return value
     return float("nan")
 
 
@@ -813,6 +831,8 @@ def _day_panel_nbytes(day: MinuteDayPanel) -> int:
                 day.future_volume_shares,
                 day.session_close,
                 day.session_exit_mask,
+                np.asarray(day.benchmark_log_return, dtype=np.float32),
+                np.asarray(day.benchmark_price_available, dtype=np.bool_),
                 *(
                     ()
                     if day.daily_context_features is None
@@ -852,10 +872,16 @@ class _MinuteDayCache:
         *,
         maximum_bytes: int,
         workers: int,
+        feature_storage_dtype: torch.dtype | None = None,
     ) -> None:
         self.dataset = dataset
         self.normalizer = normalizer
         self.maximum_bytes = max(0, int(maximum_bytes))
+        if feature_storage_dtype not in {None, torch.float16, torch.bfloat16}:
+            raise ValueError(
+                "minute host feature storage dtype must be FP16, BF16, or disabled"
+            )
+        self.feature_storage_dtype = feature_storage_dtype
         self._cache: OrderedDict[int, MinuteDayPanel] = OrderedDict()
         self._cache_bytes = 0
         self._batch_cache: OrderedDict[tuple[tuple[int, ...], int], _MinuteHostBatch] = (
@@ -866,6 +892,13 @@ class _MinuteDayCache:
             max_workers=max(1, int(workers)),
             thread_name_prefix="tw-minute-parquet",
         )
+        # Coordinate one complete future batch outside the parquet worker pool.
+        # The training thread can then execute the current GPU batch while the
+        # otherwise-idle CPU workers read and stack the next chronological one.
+        self._prefetch_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="tw-minute-prefetch",
+        )
         self.hits = 0
         self.misses = 0
 
@@ -874,6 +907,9 @@ class _MinuteDayCache:
         return self._cache_bytes + self._batch_cache_bytes
 
     def close(self) -> None:
+        # The coordinator may be waiting on parquet workers, so always drain it
+        # before shutting down the worker pool it depends on.
+        self._prefetch_executor.shutdown(wait=True, cancel_futures=False)
         self._executor.shutdown(wait=True, cancel_futures=False)
 
     def _load_one(self, index: int) -> tuple[int, MinuteDayPanel]:
@@ -937,11 +973,18 @@ class _MinuteDayCache:
             "short_open_mask",
             "short_capacity_shares",
             "daily_context_features",
+            "benchmark_log_return",
+            "benchmark_price_available",
         )
-        fields = {
-            name: _stack_day_field(days, name, padded_days=int(padded_days))
-            for name in field_names
-        }
+        fields: dict[str, torch.Tensor] = {}
+        for name in field_names:
+            value = _stack_day_field(days, name, padded_days=int(padded_days))
+            if (
+                self.feature_storage_dtype is not None
+                and name in {"features", "daily_context_features"}
+            ):
+                value = value.to(dtype=self.feature_storage_dtype)
+            fields[name] = value
         size = int(
             sum(value.numel() * value.element_size() for value in fields.values())
         )
@@ -963,6 +1006,20 @@ class _MinuteDayCache:
             self._batch_cache_bytes += size
         return batch
 
+    def prefetch_many_stacked(
+        self,
+        indices: list[int],
+        *,
+        padded_days: int,
+    ) -> Future[_MinuteHostBatch]:
+        """Schedule one chronological host batch for CPU/GPU overlap."""
+
+        return self._prefetch_executor.submit(
+            self.get_many_stacked,
+            indices,
+            padded_days=int(padded_days),
+        )
+
 
 def _stack_day_field(
     days: list[MinuteDayPanel],
@@ -980,6 +1037,10 @@ def _stack_day_field(
                 value = np.zeros(day.features.shape[1], dtype=np.int64)
             elif name == "daily_context_features":
                 value = np.zeros((day.features.shape[1], 0), dtype=np.float32)
+            elif name == "benchmark_log_return":
+                value = np.asarray(float("nan"), dtype=np.float32)
+            elif name == "benchmark_price_available":
+                value = np.asarray(False, dtype=np.bool_)
             else:
                 raise RuntimeError(f"minute host field {name!r} is missing")
         values.append(value)
@@ -1013,12 +1074,33 @@ def _run_day_batch(
     | torch.optim.lr_scheduler.ReduceLROnPlateau
     | None,
     gradient_clip_norm: float,
-    benchmark_symbol_index: int,
     global_real_days: int | None = None,
     gradient_world_size: int = 1,
 ) -> tuple[list[dict[str, float]], np.ndarray, TimingBreakdown]:
     training = optimizer is not None
     model.train(training)
+    normalized_model_name = (
+        str(config.training.model_name).strip().lower().replace("-", "_")
+    )
+    active_model_config = (
+        config.training.financial_transformer
+        if normalized_model_name
+        in {
+            "financial_transformer",
+            "financial_transformer_model",
+            "financial_token_transformer",
+            "financial_tokenized_transformer",
+        }
+        else config.training.transformer_base_portfolio
+    )
+    record_model_cash = (
+        not training
+        and normalize_portfolio_output_mode(
+            active_model_config.portfolio_output_mode
+        )
+        == "cash_l1"
+    )
+    model_requested_cash_parts: list[torch.Tensor] = []
     if host_batch is None:
         if not days or len(days) > int(day_batch_size):
             raise ValueError("tw_minute day batch must contain 1..day_batch_size days")
@@ -1054,6 +1136,8 @@ def _run_day_batch(
                 "short_open_mask",
                 "short_capacity_shares",
                 "daily_context_features",
+                "benchmark_log_return",
+                "benchmark_price_available",
             )
         }
     )
@@ -1070,8 +1154,15 @@ def _run_day_batch(
     total_log_return = torch.zeros(day_batch_size, device=device, dtype=torch.float32)
     session_close_weights = torch.zeros_like(state.shares)
     transfer_started = time.perf_counter()
+    feature_device_dtype = (
+        amp_dtype
+        if bool(config.training.cache_train_features_in_amp_dtype)
+        and device.type == "cuda"
+        and amp_dtype in {torch.float16, torch.bfloat16}
+        else torch.float32
+    )
     day_features = cpu_fields["features"].to(
-        device=device, dtype=torch.float32, non_blocking=non_blocking
+        device=device, dtype=feature_device_dtype, non_blocking=non_blocking
     )
     day_feature_mask = cpu_fields["feature_mask"].to(
         device=device, dtype=torch.bool, non_blocking=non_blocking
@@ -1102,7 +1193,7 @@ def _run_day_batch(
         device=device, dtype=torch.float32, non_blocking=non_blocking
     )
     daily_context_features = cpu_fields["daily_context_features"].to(
-        device=device, dtype=torch.float32, non_blocking=non_blocking
+        device=device, dtype=feature_device_dtype, non_blocking=non_blocking
     )
     timing.transfer_s += time.perf_counter() - transfer_started
     chunks = list(range(0, len(decisions), decision_chunk_rows))
@@ -1247,6 +1338,11 @@ def _run_day_batch(
                     policy_daily_context,
                 )
         timing.forward_s += time.perf_counter() - forward_started
+        if record_model_cash:
+            requested_gross = targets[:, :real_rows].abs().sum(dim=-1)
+            model_requested_cash_parts.append(
+                (1.0 - requested_gross).clamp(0.0, 1.0).detach()
+            )
         chunk_log_utility = torch.zeros(
             day_batch_size, device=device, dtype=torch.float32
         )
@@ -1466,12 +1562,14 @@ def _run_day_batch(
     if bool(torch.any(state.shares != 0.0).item()):
         raise RuntimeError("tw_minute day batch ended with nonzero inventory")
     close_weights = session_close_weights[:real_days].cpu().numpy()
+    model_requested_cash = (
+        torch.cat(model_requested_cash_parts, dim=1)[:real_days].cpu().numpy()
+        if model_requested_cash_parts
+        else None
+    )
     rows: list[dict[str, float]] = []
-    first_execution_index = int(decisions[0])
-    benchmark_opens = cpu_fields["execution_open"]
-    benchmark_execution_mask = cpu_fields["execution_mask"]
-    benchmark_closes = cpu_fields["session_close"]
-    benchmark_exit_mask = cpu_fields["session_exit_mask"]
+    benchmark_log_returns = cpu_fields["benchmark_log_return"]
+    benchmark_price_available = cpu_fields["benchmark_price_available"]
     for day_index, trade_date in enumerate(trade_dates):
         ledger_equity_scale = float(metrics[0, day_index])
         log_return = float(metrics[1, day_index])
@@ -1480,29 +1578,13 @@ def _run_day_batch(
         # report cannot reintroduce NT$10m FP32 cancellation.
         net_return = float(math.expm1(log_return))
         final_equity = float(execution_config.initial_equity) * (1.0 + net_return)
-        benchmark_open = float(
-            benchmark_opens[
-                day_index, first_execution_index, benchmark_symbol_index
-            ]
-        )
-        benchmark_close = float(
-            benchmark_closes[day_index, benchmark_symbol_index]
-        )
+        benchmark_log_return = float(benchmark_log_returns[day_index])
         benchmark_valid = bool(
-            benchmark_execution_mask[
-                day_index, first_execution_index, benchmark_symbol_index
-            ]
-            and benchmark_exit_mask[day_index, benchmark_symbol_index]
-            and math.isfinite(benchmark_open)
-            and math.isfinite(benchmark_close)
-            and benchmark_open > 0.0
-            and benchmark_close > 0.0
+            benchmark_price_available[day_index]
+            and math.isfinite(benchmark_log_return)
         )
-        benchmark_log_return = (
-            float(math.log(benchmark_close / benchmark_open))
-            if benchmark_valid
-            else float("nan")
-        )
+        if not benchmark_valid:
+            benchmark_log_return = float("nan")
         rows.append(
             {
                 "date": str(trade_date.astype("datetime64[D]")),
@@ -1520,6 +1602,19 @@ def _run_day_batch(
                 "decisions": float(len(decisions)),
             }
         )
+        if model_requested_cash is not None:
+            day_cash = model_requested_cash[day_index]
+            rows[-1].update(
+                {
+                    "mean_model_requested_cash_weight": float(np.mean(day_cash)),
+                    "min_model_requested_cash_weight": float(np.min(day_cash)),
+                    "max_model_requested_cash_weight": float(np.max(day_cash)),
+                    "last_model_requested_cash_weight": float(day_cash[-1]),
+                    "mean_model_requested_risky_gross_weight": float(
+                        np.mean(1.0 - day_cash)
+                    ),
+                }
+            )
     return rows, close_weights, timing
 
 
@@ -1749,7 +1844,6 @@ def _run_split(
     optimizer: torch.optim.Optimizer | None = None,
     scaler: GradScaler | None = None,
     scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
-    benchmark_symbol_index: int,
     progress_lifecycle: TrainingRunLifecycle | _NullTrainingRunLifecycle | None = None,
     gather_close_weights: bool = True,
 ) -> tuple[dict[str, float], list[dict[str, float]], np.ndarray, TimingBreakdown]:
@@ -1795,6 +1889,13 @@ def _run_split(
         total=len(selected),
         leave=False,
     )
+    prefetched_host_batch: Future[_MinuteHostBatch] | None = None
+    if global_batches and hasattr(day_cache, "prefetch_many_stacked"):
+        first_batch_indices = global_batches[0][rank::world_size]
+        prefetched_host_batch = day_cache.prefetch_many_stacked(
+            first_batch_indices,
+            padded_days=local_day_batch_size,
+        )
     try:
         processed_sessions = 0
         for batch_number, global_batch_indices in enumerate(global_batches, start=1):
@@ -1803,7 +1904,18 @@ def _run_split(
                 dataset.dates[int(global_batch_indices[-1])].astype("datetime64[D]")
             )
             fetch_started = time.perf_counter()
-            if hasattr(day_cache, "get_many_stacked"):
+            if prefetched_host_batch is not None:
+                host_batch = prefetched_host_batch.result()
+                days = None
+                if batch_number < len(global_batches):
+                    next_batch_indices = global_batches[batch_number][rank::world_size]
+                    prefetched_host_batch = day_cache.prefetch_many_stacked(
+                        next_batch_indices,
+                        padded_days=local_day_batch_size,
+                    )
+                else:
+                    prefetched_host_batch = None
+            elif hasattr(day_cache, "get_many_stacked"):
                 host_batch = day_cache.get_many_stacked(
                     batch_indices,
                     padded_days=local_day_batch_size,
@@ -1834,7 +1946,6 @@ def _run_split(
                 scaler=scaler,
                 scheduler=scheduler,
                 gradient_clip_norm=float(config.training.grad_clip_norm),
-                benchmark_symbol_index=benchmark_symbol_index,
                 global_real_days=len(global_batch_indices),
                 gradient_world_size=world_size,
             )
@@ -1895,6 +2006,20 @@ def _run_split(
         close_weights,
         gather_close_weights=bool(gather_close_weights),
     )
+    # The aligned daily value on session t is close[t-1] -> close[t].  A
+    # standalone split starts at its first close, so exclude the preceding
+    # split's final close by setting only this split's first row to zero.
+    if rows:
+        first_index = int(selected[0])
+        daily_feature_context = getattr(dataset, "daily_feature_context", None)
+        first_price_available = bool(
+            daily_feature_context is not None
+            and daily_feature_context.benchmark_price_available[first_index]
+        )
+        rows[0]["benchmark_log_return"] = (
+            0.0 if first_price_available else float("nan")
+        )
+        rows[0]["benchmark_available"] = float(first_price_available)
     summary = _summarize_days(rows)
     timing.total_s = time.monotonic() - started
     summary["elapsed_seconds"] = timing.total_s
@@ -2091,6 +2216,7 @@ def _run_minute_training_impl(
                 daily_context_lookback=int(
                     config.training.financial_transformer.daily_context_lookback
                 ),
+                benchmark_name=str(config.data.benchmark_name),
             )
         except BaseException as exc:
             dataset_error = exc
@@ -2113,6 +2239,7 @@ def _run_minute_training_impl(
                 daily_context_lookback=int(
                     config.training.financial_transformer.daily_context_lookback
                 ),
+                benchmark_name=str(config.data.benchmark_name),
             )
         except BaseException as exc:
             dataset_error = exc
@@ -2137,12 +2264,17 @@ def _run_minute_training_impl(
                 f"registered mode contract {expected!r}"
             )
     benchmark_name = str(config.data.benchmark_name)
-    try:
-        benchmark_symbol_index = dataset.symbols.index(benchmark_name)
-    except ValueError as exc:
+    if benchmark_name not in dataset.symbols:
         raise RuntimeError(
             f"tw_minute benchmark {benchmark_name!r} is absent from the dataset"
-        ) from exc
+        )
+    if (
+        dataset.daily_feature_context is not None
+        and dataset.daily_feature_context.benchmark_name != benchmark_name
+    ):
+        raise RuntimeError(
+            "tw_minute daily-context benchmark does not match configuration"
+        )
     setup_timing.checkpoint(
         "dataset_index_and_partition_verification",
         dates=int(len(dataset.dates)),
@@ -2225,6 +2357,12 @@ def _run_minute_training_impl(
         },
         data_summary={
             "benchmark_name": benchmark_name,
+            "benchmark_contract": MINUTE_BENCHMARK_CONTRACT,
+            "benchmark_fingerprint": (
+                None
+                if dataset.daily_feature_context is None
+                else dataset.daily_feature_context.benchmark_fingerprint
+            ),
             "symbols": dataset.num_symbols,
             "dates": len(dataset.dates),
             "source_gap_symbols": dataset.manifest.get("source_gap_symbols", 0),
@@ -2250,6 +2388,7 @@ def _run_minute_training_impl(
             "dataset_decision_clock": dataset.manifest["decision_clock"],
             "dataset_execution_clock": dataset.manifest["execution_clock"],
             "benchmark_name": benchmark_name,
+            "benchmark_contract": MINUTE_BENCHMARK_CONTRACT,
             "minute_feature_names": list(MINUTE_FEATURE_COLUMNS),
             "minute_microstructure_feature_names": list(
                 MINUTE_MICROSTRUCTURE_FEATURE_COLUMNS
@@ -2617,6 +2756,13 @@ def _run_minute_training_impl(
             normalizer,
             maximum_bytes=cache_limit_bytes,
             workers=int(config.training.minute_data_workers),
+            feature_storage_dtype=(
+                amp_dtype
+                if bool(config.training.cache_train_features_in_amp_dtype)
+                and device.type == "cuda"
+                and amp_dtype in {torch.float16, torch.bfloat16}
+                else None
+            ),
         )
         rank_count = max(1, int(_distributed_world_size()))
         per_rank_train_batch_capacity = math.ceil(
@@ -2725,7 +2871,6 @@ def _run_minute_training_impl(
                     optimizer=optimizer,
                     scaler=scaler,
                     scheduler=(scheduler if scheduler_interval == "step" else None),
-                    benchmark_symbol_index=benchmark_symbol_index,
                     progress_lifecycle=lifecycle,
                     gather_close_weights=False,
                 )
@@ -2776,7 +2921,6 @@ def _run_minute_training_impl(
                         sell_fee_rates=sell_rates,
                         device=device,
                         amp_dtype=amp_dtype,
-                        benchmark_symbol_index=benchmark_symbol_index,
                         progress_lifecycle=lifecycle,
                         gather_close_weights=False,
                     )
@@ -2842,7 +2986,6 @@ def _run_minute_training_impl(
                         sell_fee_rates=sell_rates,
                         device=device,
                         amp_dtype=amp_dtype,
-                        benchmark_symbol_index=benchmark_symbol_index,
                         progress_lifecycle=lifecycle,
                         gather_close_weights=False,
                     )
@@ -3077,7 +3220,6 @@ def _run_minute_training_impl(
             sell_fee_rates=sell_rates,
             device=device,
             amp_dtype=amp_dtype,
-            benchmark_symbol_index=benchmark_symbol_index,
             progress_lifecycle=lifecycle,
         )
         lifecycle.set_phase(
@@ -3107,7 +3249,6 @@ def _run_minute_training_impl(
             sell_fee_rates=sell_rates,
             device=device,
             amp_dtype=amp_dtype,
-            benchmark_symbol_index=benchmark_symbol_index,
             progress_lifecycle=lifecycle,
         )
         if _distributed_should_write():
@@ -3171,6 +3312,17 @@ def _run_minute_training_impl(
             write_plots=True,
             mark_complete=True,
         )
+        if _distributed_should_write():
+            save_realized_holdings_artifacts(
+                fold_dir,
+                test_dates,
+                list(dataset.symbols),
+                test_backtest.weights_history,
+                initial_capital=float(config.trading.tw_minute_initial_equity),
+                daily_performance=pl.DataFrame(test_rows),
+                write_plots=True,
+                source_artifact="test_backtest.npz",
+            )
         if _distributed_should_write():
             write_training_json(
                 fold_dir / "mode_artifact_contract.json",
@@ -3275,4 +3427,175 @@ def run_minute_training(
     return results
 
 
-__all__ = ["run_minute_training"]
+_FOLD_ISOLATION_CHILD_ENV = "STOCKAGENT_FOLD_ISOLATION_CHILD"
+
+
+def _minute_isolated_fold_command(
+    argv: list[str],
+    *,
+    output_dir: str | Path,
+    fold_id: int,
+    resume: bool,
+) -> list[str]:
+    """Build one authoritative fresh-process minute-fold invocation."""
+
+    return [
+        sys.executable,
+        str(Path(__file__).resolve().parents[2] / "train.py"),
+        *argv,
+        "--output-dir",
+        str(output_dir),
+        "--mode",
+        "train",
+        "--resume" if resume else "--no-resume",
+        "--start-fold",
+        str(int(fold_id)),
+        "--max-folds",
+        "1",
+        "--no-post-train-infer",
+        "--no-isolate-train-folds",
+    ]
+
+
+def _minute_isolated_fold_plan(
+    config: ExperimentConfig,
+    *,
+    start_fold: int | None,
+    max_folds: int | None,
+) -> list[WalkForwardFold]:
+    manifest_path = Path(config.data.minute_parquet_root).resolve() / "manifest.json"
+    if not manifest_path.is_file():
+        raise RuntimeError(f"minute dataset manifest is missing: {manifest_path}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    dates = np.asarray(manifest.get("dates", []), dtype="datetime64[D]")
+    validate_walk_forward_year_contract(
+        dates,
+        expected_first_year=config.walk_forward.expected_first_year,
+        require_contiguous_years=config.walk_forward.require_contiguous_years,
+    )
+    folds = build_expanding_year_folds(
+        dates=dates,
+        min_train_years=config.walk_forward.min_train_years,
+        val_years=config.walk_forward.val_years,
+        require_future_test_year=config.walk_forward.require_future_test_year,
+        split_start_year=config.walk_forward.split_start_year,
+    )
+    return _folds_for_run(
+        folds,
+        start_fold=start_fold,
+        max_folds=max_folds,
+    )
+
+
+def _load_isolated_minute_fold_result(
+    output_dir: Path,
+    fold: WalkForwardFold,
+) -> FoldResult:
+    metrics_path = output_dir / f"fold_{fold.fold_id:02d}" / "metrics.json"
+    complete_path = output_dir / f"fold_{fold.fold_id:02d}" / "fold_complete.json"
+    if not metrics_path.is_file() or not complete_path.is_file():
+        raise RuntimeError(
+            f"isolated tw_minute fold {fold.fold_id} did not produce completed artifacts"
+        )
+    complete = json.loads(complete_path.read_text(encoding="utf-8"))
+    if complete.get("status") != "complete":
+        raise RuntimeError(f"isolated tw_minute fold {fold.fold_id} is not complete")
+    payload = json.loads(metrics_path.read_text(encoding="utf-8"))
+    if int(payload.get("fold_id", -1)) != int(fold.fold_id):
+        raise RuntimeError("isolated tw_minute metrics fold id is inconsistent")
+    return FoldResult(**payload)
+
+
+def run_minute_training_isolated(
+    config: ExperimentConfig,
+    *,
+    output_dir: str | Path,
+    mode: str,
+    resume: bool,
+    start_fold: int | None,
+    max_folds: int | None,
+    active_strategy: str,
+) -> list[dict[str, Any]]:
+    """Run each minute fold in a fresh process while retaining within-fold DDP."""
+
+    if mode != "train":
+        raise ValueError("tw_minute fold isolation is available only in train mode")
+    if _distributed_is_initialized():
+        raise RuntimeError(
+            "tw_minute isolation parent must start outside torchrun; "
+            "each child owns its within-fold DDP process group"
+        )
+    folds = _minute_isolated_fold_plan(
+        config,
+        start_fold=start_fold,
+        max_folds=max_folds,
+    )
+    root = Path(output_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    child_env = os.environ.copy()
+    child_env[_FOLD_ISOLATION_CHILD_ENV] = "1"
+    for position, fold in enumerate(folds, start=1):
+        command = _minute_isolated_fold_command(
+            list(sys.argv[1:]),
+            output_dir=root,
+            fold_id=fold.fold_id,
+            resume=resume,
+        )
+        _progress(
+            "[tw-minute isolate] fresh process "
+            f"fold={fold.fold_id} position={position}/{len(folds)}; "
+            "child will relaunch under within-fold DDP"
+        )
+        completed = subprocess.run(
+            command,
+            env=child_env,
+            check=False,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError(
+                "isolated tw_minute child failed: "
+                f"fold={fold.fold_id} returncode={completed.returncode}"
+            )
+
+    fold_results = [
+        _load_isolated_minute_fold_result(root, fold)
+        for fold in folds
+    ]
+    _refresh_walkforward_artifacts(root, fold_results)
+
+    # The last child owns a complete, verified manifest. Restore its semantic
+    # fields while widening selected/completed ids to the full parent plan.
+    child_manifest_path = root / "run_manifest.json"
+    child_manifest = json.loads(child_manifest_path.read_text(encoding="utf-8"))
+    lifecycle = TrainingRunLifecycle(
+        root,
+        execution_mode=config.trading.execution_mode,
+        run_mode=mode,
+        strategy=active_strategy,
+        model_name=config.training.model_name,
+    )
+    lifecycle.start(
+        fold_ids=[fold.fold_id for fold in folds],
+        dataset_fingerprint=child_manifest.get("dataset_fingerprint"),
+        configuration_fingerprint=child_manifest.get("configuration_fingerprint"),
+        contract_versions=child_manifest.get("contract_versions"),
+        data_summary=child_manifest.get("data_summary"),
+        configuration=asdict(config),
+        mode_details=child_manifest.get("mode_details"),
+        compatibility_manifest_paths=[root / "minute_run_manifest.json"],
+    )
+    lifecycle.complete(
+        fold_ids=[fold.fold_id for fold in folds],
+        message=f"completed {len(folds)} isolated fold(s) with within-fold DDP",
+    )
+    return [
+        {
+            "status": "complete",
+            "execution_mode": "tw_minute",
+            **asdict(result),
+        }
+        for result in fold_results
+    ]
+
+
+__all__ = ["run_minute_training", "run_minute_training_isolated"]

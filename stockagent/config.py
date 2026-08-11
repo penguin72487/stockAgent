@@ -156,12 +156,12 @@ def _validate_tw_minute_mode_contract(
             "sell-first eligibility backward"
         )
     output_mode = normalize_portfolio_output_mode(str(portfolio_output_mode))
-    if output_mode not in {"logits", "l1", "projection_l1"}:
+    if output_mode not in {"logits", "l1", "cash_l1", "projection_l1"}:
         raise ValueError(
             "tw_minute requires the active model portfolio_output_mode to be "
-            "'logits', 'l1', or 'projection_l1'"
+            "'logits', 'l1', 'cash_l1', or 'projection_l1'"
         )
-    if output_mode in {"l1", "projection_l1"}:
+    if output_mode in {"l1", "cash_l1", "projection_l1"}:
         if float(gross_exposure) != 1.0:
             raise ValueError(
                 "tw_minute pre-normalized portfolio output already emits the "
@@ -170,9 +170,9 @@ def _validate_tw_minute_mode_contract(
             )
         if maximum_name_weight is not None or outside_cash_logit is not None:
             raise ValueError(
-                "tw_minute pre-normalized portfolio output must preserve the "
-                "daily day-trade allocation before execution masks; disable the "
-                "minute per-name cap and outside-cash logits gate"
+                "tw_minute pre-normalized portfolio output must preserve its "
+                "model allocation before execution masks; disable the minute "
+                "per-name cap and legacy outside-cash logits gate"
             )
     first = int(first_decision_minute)
     last_entry = int(last_entry_minute)
