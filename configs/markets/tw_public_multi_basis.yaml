@@ -1,0 +1,20 @@
+base_config: tw_public_lanten_market_candles.yaml
+
+experiment_name: tw-public-financial-transformer-multi-basis-feature-input-lookback32-v2
+
+runner:
+  # The basis coefficients are now plain input features. Keep them in a fresh
+  # artifact root instead of resuming either raw-only or gated-basis weights.
+  output_dir: artifacts/markets/tw_public_candles_multi_basis_feature_input_lookback32_v2
+  resume: false
+
+training:
+  model_name: financial_transformer
+  lookback: 32
+  transformer_base_portfolio:
+    # Raw time-domain and the learned temporal Transformer remain enabled by
+    # construction. The existing latent/market-token path owns cross-stock
+    # learned eigenfactors. These fixed non-DC banks add only complementary
+    # within-stock temporal inductive biases.
+    temporal_basis_families: [haar, fourier, dct]
+    temporal_basis_components: 8

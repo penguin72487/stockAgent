@@ -10,6 +10,9 @@ import yaml
 from stockagent.config import TransformerBasePortfolioModelConfig, load_config
 from stockagent.models.factory import build_model, model_hidden_dim_hint
 from stockagent.models.financial_transformer import FinancialTransformerModel
+from stockagent.models.transformer_base_portfolio import (
+    ONLINE_SAFE_TEMPORAL_BASIS_FAMILIES,
+)
 
 
 def _device() -> torch.device:
@@ -156,6 +159,64 @@ def test_financial_transformer_panel_paths_match_materialized_windows() -> None:
     torch.testing.assert_close(slab, materialized, rtol=1e-5, atol=1e-6)
 
 
+def test_financial_transformer_decomposes_each_raw_feature_before_positions() -> None:
+    device = _device()
+    model = _make_model(
+        lookback=8,
+        temporal_pooling="last",
+        temporal_query_mode="last_only",
+        temporal_basis_families=("haar", "dct"),
+        temporal_basis_components=2,
+        temporal_basis_input="raw_features",
+    ).eval()
+    x = torch.zeros(2, 8, 7, 10, device=device)
+    mask = torch.ones(2, 7, dtype=torch.bool, device=device)
+
+    with torch.no_grad():
+        _weights, _scores, aux = model(x, mask, return_aux=True)
+
+    encoder = model.temporal_basis_feature_encoder
+    assert encoder is not None
+    assert encoder.source_dim == 10
+    assert encoder.input_feature_dim == 24 + 2 * 2 * 10
+    assert model.supports_embedded_explainability_reuse() is False
+    assert aux["temporal_basis_input_features"].shape == (2, 7, 64)
+    # Raw zeros remain zero even though CandleEncoder queries and learned time
+    # positions make the untouched time-domain path non-zero.
+    assert aux["temporal_basis_original_path"].abs().sum().item() > 0.0
+    for family in ("haar", "dct"):
+        coefficients = aux[f"temporal_basis_{family}_coefficients"]
+        assert coefficients.shape == (2, 2, 7, 10)
+        assert coefficients.abs().max().item() == 0.0
+
+
+def test_raw_feature_basis_panel_paths_match_materialized_windows() -> None:
+    device = _device()
+    model = _make_model(
+        lookback=8,
+        temporal_pooling="last",
+        temporal_query_mode="last_only",
+        temporal_basis_families=("haar", "dct"),
+        temporal_basis_components=2,
+        temporal_basis_input="raw_features",
+        return_aux=False,
+        return_aux_details=False,
+    ).eval()
+    feature_slab = torch.randn(11, 7, 10, device=device)
+    date_indices = torch.arange(7, 11, dtype=torch.long, device=device)
+    windows = feature_slab.unfold(0, 8, 1).permute(0, 3, 1, 2).contiguous()
+    mask = torch.ones(4, 7, dtype=torch.bool, device=device)
+    mask[-1, -1] = False
+
+    with torch.no_grad():
+        materialized = model(windows, mask)
+        panel = model.forward_from_panel(feature_slab, date_indices, mask)
+        slab = model.forward_from_panel_slab(feature_slab, mask)
+
+    torch.testing.assert_close(panel, materialized, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(slab, materialized, rtol=1e-5, atol=1e-6)
+
+
 def test_factory_builds_financial_transformer_model() -> None:
     cfg = load_config(Path("configs/experiment_baseline.yaml"))
     cfg.training.model_name = "financial_transformer"
@@ -189,6 +250,39 @@ def test_factory_builds_financial_transformer_model() -> None:
     assert isinstance(model, FinancialTransformerModel)
     assert model_hidden_dim_hint(cfg) == 24
     assert model.candle_encoder.d_model == 24
+
+
+def test_multi_basis_experiment_config_is_fresh_and_propagates_to_financial_model() -> None:
+    config = load_config("configs/markets/tw_public_multi_basis.yaml")
+
+    assert config.runner.resume is False
+    assert config.training.lookback == 32
+    assert config.training.model_name == "financial_transformer"
+    expected = ["haar", "fourier", "dct"]
+    assert config.training.transformer_base_portfolio.temporal_basis_families == expected
+    assert config.training.financial_transformer.temporal_basis_families == expected
+    assert config.training.financial_transformer.temporal_basis_components == 8
+
+
+def test_online_complete_multi_basis_config_propagates_every_supported_family() -> None:
+    config = load_config(
+        "configs/markets/tw_public_multi_basis_online_complete.yaml"
+    )
+
+    expected = list(ONLINE_SAFE_TEMPORAL_BASIS_FAMILIES)
+    assert config.runner.resume is False
+    assert config.training.lookback == 32
+    assert config.training.model_name == "financial_transformer"
+    assert config.training.transformer_base_portfolio.temporal_basis_families == expected
+    assert config.training.financial_transformer.temporal_basis_families == expected
+    assert config.training.financial_transformer.temporal_basis_components == 4
+    assert config.training.transformer_base_portfolio.temporal_basis_input == "raw_features"
+    assert config.training.financial_transformer.temporal_basis_input == "raw_features"
+    assert config.training.batch_size_train == 64
+    assert config.training.cache_train_tensors_on_gpu is False
+    assert config.training.cache_eval_tensors_on_gpu is False
+    assert config.training.vram_budget_gb == 16
+    assert "online_complete_raw_feature_input_lookback32_v5" in config.runner.output_dir
 
 
 def test_candle_encoder_uses_every_feature_jointly() -> None:
@@ -226,7 +320,7 @@ def test_candle_encoder_jointly_embeds_categorical_features() -> None:
     assert not torch.equal(base_aux["candle_embedding"], changed_aux["candle_embedding"])
 
 
-def test_all_resolved_experiment_configs_define_matching_financial_transformer() -> None:
+def test_active_financial_transformers_match_shared_non_output_contract() -> None:
     config_paths = [Path("configs/experiment_baseline.yaml")]
     config_paths.extend(sorted(Path("configs/markets").glob("*.yaml")))
 
@@ -240,9 +334,16 @@ def test_all_resolved_experiment_configs_define_matching_financial_transformer()
             assert raw.get("base_config"), path
 
         config = load_config(path)
+        if config.training.model_name != "financial_transformer":
+            continue
         transformer_base = config.training.transformer_base_portfolio
         financial = config.training.financial_transformer
         for config_field in fields(TransformerBasePortfolioModelConfig):
+            if config_field.name in {"portfolio_mode", "portfolio_output_mode"}:
+                # Direction and output representation are legitimate
+                # experiment-level overrides for the active Financial
+                # Transformer head. All encoder/runtime fields stay shared.
+                continue
             assert getattr(financial, config_field.name) == getattr(
                 transformer_base,
                 config_field.name,

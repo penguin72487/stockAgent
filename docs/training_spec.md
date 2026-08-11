@@ -1,155 +1,131 @@
-# Training Specification
+# Training And Evaluation Contract
 
-## Objective
+This document describes the stable system contract. A resolved market config is
+an experiment snapshot; its model, dates, batch sizes, and execution mode are not
+global defaults. When sources disagree, use this order of authority:
 
-Train a Taiwan equity multi-asset trading system that can trade the full daily stock universe, evaluate against the same-day average return of the full stock universe, and scale training on CUDA with Tensor Core acceleration.
+1. point-in-time and accounting contracts in `AGENTS.md`;
+2. the resolved YAML configuration and its checkpoint fingerprint;
+3. the canonical implementation and contract-version constants;
+4. this overview and mode-specific documentation.
 
-## Dataset assumptions
+## First-principles model
 
-- Input source: `data_parquet/*.parquet`
-- Each file is one symbol with daily features.
-- Representative schema currently includes:
-  - `date`
-  - `open`, `max`, `min`, `close`
-  - `Trading_Volume`
-  - `PER`, `ROE`, `Debt_Ratio`
-  - `PER_Z_Score`, `Debt_Ratio_Scaled`
-- The trading universe is the full daily stock pool, not a fixed subset.
-- A per-date tradability mask must be constructed because symbols appear and disappear over time.
+A trading result is meaningful only if these questions have explicit answers:
 
-## Baseline
+1. **Information:** what values were observable before each decision?
+2. **Causality:** which target row owns a lookback window, and can that window
+   read any future or unannounced value?
+3. **Mechanism:** how do actions become fills, fees, taxes, borrow, settlement,
+   and recurrent portfolio state?
+4. **Latency and deployability:** can the same feature and model path run by the
+   required deadline, using data actually available then?
+5. **Reproducibility:** can a checkpoint be tied to its config, data universe,
+   fold, random state, and artifact schema?
 
-- Primary benchmark: the same-day cross-sectional average return of all tradable stocks.
-- Benchmark construction rule: on each trading day, compute the arithmetic mean of all tradable stock returns in the active universe.
-- No external benchmark file is required for the primary baseline because it is derived from the daily stock panel.
+Model architecture and headline return come after these gates.
 
-## Walk-forward validation
+## Data and time
 
-Use yearly expanding-window validation.
+The canonical panel represents observations as dense tensors plus point-in-time
+masks. Typical shapes are:
 
-Definition:
+- base features `[date, symbol, feature]`;
+- model windows `[batch, lookback, symbol, feature]`;
+- ordinary actions `[batch, symbol]`;
+- phase actions `[batch, phase, symbol]` for multi-auction modes.
 
-- Fold 1: train year 1, validate year 2, test years 3 to end
-- Fold 2: train years 1 to 2, validate year 3, test years 4 to end
-- Fold 3: train years 1 to 3, validate year 4, test years 5 to end
-- Continue until the final validation year still leaves at least one test year
+Panel construction owns schema normalization, symbol/date alignment, labels,
+feature availability, and execution masks. Missing permission evidence must not
+be forward-filled into permission. Data snapshots, official-download receipts,
+and coverage audits remain part of the input contract, not incidental caches.
 
-Operational rules:
+## Walk-forward ownership
 
-- Hyperparameter selection is based on validation results only.
-- Test results are reported out of sample for each fold.
-- Aggregate performance should include per-fold metrics and a stitched equity curve from non-overlapping selected test windows if a final production score is needed.
+`stockagent.data.walkforward.build_expanding_year_folds` constructs expanding
+training folds. Validation selects checkpoints; test data does not select them.
+Every target belongs to exactly the split specified by the fold.
 
-## Trading assumptions
+The default split-local lookback drops the first `lookback - 1` targets of each
+split. The explicit `lookback_context: panel_history` mode may read earlier panel
+rows for context while keeping only the already-owned target indices. It does
+not import earlier returns, portfolio state, or future information.
 
-- Frequency: daily
-- Trading universe: all tradable stocks on each trading day
-- Transaction fee: `0.001` per side
-- If transaction tax, slippage, or limit-up and limit-down constraints are needed, they should be modeled explicitly in the simulator instead of being folded into the fee field.
-- Symbols that are not tradable on a given day must be masked from action generation and portfolio construction.
+If `require_future_test_year: false`, the final fold may intentionally reuse its
+validation window as its test window. Such output must be labelled latest-period
+experimentation, not unbiased model selection.
 
-## Recommended modeling roadmap
+## Execution modes
 
-### Stage 1: panel builder and simulator
+Execution mode is a semantic boundary, not a reporting label. The registry in
+`stockagent/training/mode_adapter.py` determines the supported modes and whether
+they use the generic or specialized runner. Important families include:
 
-Build a shared panel with these core tensors:
+- ordinary close-to-close portfolios (`naive`);
+- Taiwan OPEN/CLOSE carrying modes (`tw_cash`, `tw_overnight`);
+- open-to-close day trade (`tw_day_trade`);
+- intraday minute decisions (`tw_minute`);
+- Taiwan index futures and TAIFEX tick/options modes.
 
-- `features[t, s, f]`
-- `returns_1d[t, s]`
-- `returns_5d[t, s]`
-- `tradable_mask[t, s]`
-- `alive_mask[t, s]`
+Each mode must define its decision clock, executable price clock, permissions,
+fees/taxes, volume and borrow limits, settlement, and recurrent state. Never
+flatten a phase action into an ordinary signed exposure merely to reuse an API.
 
-This stage is required before any model training.
+## Model, loss, and backtest alignment
 
-### Stage 2: supervised cross-sectional baseline
+`stockagent.models.factory.build_model` is the model construction boundary.
+Neural models should emit raw scores or the explicitly configured portfolio
+representation. Tradability is applied before allocation.
 
-Train a GPU model that scores all symbols each day.
+`stockagent.training.loss.risk_aware_loss` and
+`stockagent.backtest.simulator.run_backtest_torch` are the canonical return path
+for training and evaluation. Model output mode, loss activation, long/short
+intent, and inference post-processing must agree. A compatibility alias is not
+evidence that two economic contracts are equivalent.
 
-Recommended first target:
+Fees and recurrent state are part of the objective. Cross-batch state carries
+the previous executed, mark-to-market portfolio and absorbing alive/default
+state; it is detached from the prior optimization graph. Do not fork separate
+train, validation, test, and live return formulas.
 
-- Predict next-day or next-5-day return ranking
+## Precision and performance
 
-Recommended first model families:
+CUDA runs use the configured autocast type. The recommended baseline is BF16
+autocast with FP32 parameters and numerically sensitive reductions. `GradScaler`
+is enabled only for FP16. Fixed-shape panel slabs, `torch.compile`, DDP, caching,
+and chunking are performance representations; they must remain numerically and
+semantically equivalent to the eager canonical path.
 
-- MLP on per-symbol features
-- Temporal model with short rolling window if sequence structure is needed later
+Measure whole steady-state epochs, including validation, sampled test, plots,
+checkpointing, and artifact work. A fast kernel is not a fast or deployable
+experiment by itself.
 
-Portfolio rule for baseline evaluation:
+## Checkpoints and artifacts
 
-- Rank all tradable stocks each day
-- Hold top-k names or convert scores to long-only weights
-- Compare against the same-day universe average return baseline and against a simple equal-weight version
+Every neural runner uses `stockagent.training.lifecycle` for the outer artifact
+contract:
 
-### Stage 3: portfolio policy layer
+- root `run_manifest.json`;
+- fixed-envelope `progress.json`;
+- flat `epoch_curve.jsonl`;
+- fold `mode_artifact_contract.json`;
+- canonical `checkpoint_last.pt`, `checkpoint_best.pt`, and completion marker.
 
-Before RL, add a policy layer that converts alpha scores into weights under constraints.
+Checkpoint manifests bind semantic configuration, data/fold identity, universe,
+RNG state, and the canonical backtest contract version. Incompatible accounting
+or sample-order changes may load weights for explicit inference, but must not
+silently resume optimizer state.
 
-Suggested constraints:
+## Verification gates
 
-- long-only
-- cash allowed
-- single-name cap
-- turnover penalty
-- optional sector cap
+Use progressively stronger evidence:
 
-### Stage 4: RL policy
+1. syntax and correctness lint;
+2. focused unit tests for the touched contract;
+3. checkpoint/resume and artifact validation;
+4. eager/compiled and single-device/DDP parity where applicable;
+5. a complete epoch or mode smoke test using real panel shapes;
+6. the full formal test suite before declaring the repository green.
 
-Use RL only after the supervised baseline and simulator are stable.
-
-Recommended RL action space:
-
-- target portfolio weights for all tradable symbols
-
-Recommended reward:
-
-- daily pnl
-- minus transaction fee
-- minus turnover penalty
-- minus concentration penalty
-
-## CUDA and Tensor Core plan
-
-Use PyTorch as the main training backend.
-
-Recommended settings:
-
-- device: `cuda`
-- mixed precision: `bf16` if supported, otherwise `fp16`
-- enable Tensor Core friendly matrix dimensions when batching
-- use `torch.autocast` and `GradScaler` when needed
-- set DataLoader `pin_memory=True`
-- use non-blocking host-to-device copies
-- keep tensors in contiguous dense layout for batched daily cross-sectional training
-
-Recommended tensor layout for fast training:
-
-- batch over time windows
-- process all symbols in parallel within a batch
-- keep features as dense tensors plus masks instead of Python loops over files
-
-Example shapes:
-
-- `x`: `[batch, lookback, symbols, features]`
-- `mask`: `[batch, symbols]` or `[batch, lookback, symbols]`
-- `y`: `[batch, symbols]`
-
-## Metrics
-
-Minimum metrics to report per fold:
-
-- cumulative return
-- annualized return
-- Sharpe ratio
-- max drawdown
-- turnover
-- daily hit rate
-- excess return versus universe average
-
-## Open implementation requirements
-
-- define the exact tradable-mask rule used to compute the universe-average benchmark
-- define whether transaction tax is included separately from fee
-- define slippage model
-- define top-k versus continuous weight portfolio output
-- define whether the first release is long-only or supports shorting
+Feature validation, live deployability, and investment merit are separate
+conclusions. Passing one does not establish the others.

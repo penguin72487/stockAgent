@@ -56,6 +56,11 @@ from stockagent.data.walkforward import (
 from stockagent.models.factory import build_model
 from stockagent.portfolio_contract import normalize_portfolio_output_mode
 from stockagent.evaluation.metrics import ic_summary
+from stockagent.training.checkpoint_contract import (
+    _active_model_config,
+    _configuration_fingerprint_snapshot,
+    _stable_fingerprint,
+)
 from stockagent.training.trainer import (
     FoldResult,
     TimingBreakdown,
@@ -86,7 +91,6 @@ from stockagent.training.trainer import (
     _save_fold_output_artifacts,
     _save_fold_checkpoint,
     _save_group_checkpoint,
-    _stable_fingerprint,
     _step_batch_lr_scheduler,
     _timing_curve_payload,
     _torch_compile_options,
@@ -299,20 +303,7 @@ def _minute_dataset_fingerprint(dataset: MinuteDatasetIndex) -> str:
 
 
 def _minute_configuration_fingerprint(config: ExperimentConfig) -> str:
-    normalized_model_name = str(config.training.model_name).strip().lower().replace(
-        "-", "_"
-    )
-    active_model_config = (
-        config.training.financial_transformer
-        if normalized_model_name
-        in {
-            "financial_transformer",
-            "financial_transformer_model",
-            "financial_token_transformer",
-            "financial_tokenized_transformer",
-        }
-        else config.training.transformer_base_portfolio
-    )
+    active_model_config = _active_model_config(config)["values"]
     daily_context_feature_names = (
         minute_static_daily_context_feature_names(config.data.feature_include)
         if config.data.minute_daily_context_panel_meta is not None
@@ -345,7 +336,7 @@ def _minute_configuration_fingerprint(config: ExperimentConfig) -> str:
                 config.data.minute_daily_context_panel_meta
             ),
             "daily_context_feature_names": list(daily_context_feature_names),
-            "active_model_config": asdict(active_model_config),
+            "active_model_config": active_model_config,
         }
     )
 
@@ -2721,19 +2712,7 @@ def _run_minute_training_impl(
             )
             model_compile_status += ":ddp"
 
-        def model_forward(
-            feature_slabs: torch.Tensor,
-            mask: torch.Tensor,
-            shortable_mask: torch.Tensor,
-            daily_context_features: torch.Tensor,
-        ) -> Any:
-            return slab_forward_module(
-                feature_slabs,
-                mask,
-                shortable_mask,
-                daily_context_features,
-            )
-
+        model_forward: Callable[..., Any] = slab_forward_module
         def daily_context_forward(features: torch.Tensor) -> torch.Tensor:
             if daily_context_forward_module is None:
                 raise RuntimeError("tw_minute daily-context encoder is unavailable")
@@ -3399,7 +3378,9 @@ def run_minute_training(
     configuration = asdict(config)
     lifecycle.start(
         fold_ids=[],
-        configuration_fingerprint=_stable_fingerprint(configuration),
+        configuration_fingerprint=_stable_fingerprint(
+            _configuration_fingerprint_snapshot(config)
+        ),
         contract_versions={
             "execution": MINUTE_EXECUTION_CONTRACT_VERSION,
             "training": MINUTE_TRAINING_CONTRACT_VERSION,

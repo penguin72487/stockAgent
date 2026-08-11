@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 import polars as pl
+import pytest
 
 from stockagent.backtest.simulator import HoldingsRecord, holding_record_abs_sort_key
 from stockagent.data.panel import PanelData
@@ -84,7 +85,12 @@ def test_day_trade_live_window_uses_current_open_without_incomplete_daily_bar() 
 
 def test_top_positions_hide_weights_below_one_basis_point() -> None:
     rows = [
-        {"symbol": "VISIBLE", "target_weight": 0.0001},
+        {
+            "symbol": "VISIBLE",
+            "target_weight": 0.0001,
+            "score": -0.2,
+            "raw_score": 1.25,
+        },
         {"symbol": "TINY", "target_weight": -0.000099},
         {"symbol": "CHANGED", "target_weight": 0.0, "delta_weight": -0.0002},
         {"symbol": "ZERO", "target_weight": 0.0},
@@ -93,6 +99,8 @@ def test_top_positions_hide_weights_below_one_basis_point() -> None:
     result = _top_position_rows_from_weights(rows, top_n=10)
 
     assert [row["symbol"] for row in result] == ["VISIBLE", "CHANGED"]
+    assert result[0]["score"] == -0.2
+    assert result[0]["raw_score"] == 1.25
     assert _top_position_rows_from_weights(rows, top_n=0) == []
 
 
@@ -101,7 +109,13 @@ def test_signal_message_hides_weights_below_one_basis_point() -> None:
         "asof_date": "2026-07-17",
         "panel_date": "2026-07-16",
         "top_positions": [
-            {"symbol": "VISIBLE", "weight": 0.0001, "current_price": 10.0},
+            {
+                "symbol": "VISIBLE",
+                "weight": 0.0001,
+                "current_price": 10.0,
+                "score": -0.2,
+                "raw_score": 1.25,
+            },
             {"symbol": "TINY", "weight": 0.000099, "current_price": 20.0},
             {
                 "symbol": "CHANGED",
@@ -238,6 +252,7 @@ def test_build_decision_rows_records_scores_constraints_and_reasons() -> None:
         current_weights=np.array([0.1, 0.0, -0.1]),
         target_weights=np.array([0.2, -0.3, 0.0]),
         scores=np.array([0.5, -1.2, 0.0]),
+        raw_scores=np.array([0.8, -2.4, 0.1]),
         current_prices=np.array([10.0, 20.0, 30.0]),
         base_prices=np.array([10.0, 10.0, 30.0]),
         price_returns=np.array([0.0, 1.0, 0.0]),
@@ -251,6 +266,9 @@ def test_build_decision_rows_records_scores_constraints_and_reasons() -> None:
     assert rows[0]["name"] == "Bravo"
     assert rows[0]["action"] == "SELL"
     assert rows[0]["abs_score_rank"] == 1
+    assert rows[0]["abs_raw_score_rank"] == 1
+    assert rows[0]["score"] == -1.2
+    assert rows[0]["raw_score"] == -2.4
     assert rows[0]["trade_price"] == 20.0
     assert "negative_score" in rows[0]["decision_reason"]
     assert rows[-1]["constraint"] == "not_tradable"
@@ -1101,6 +1119,47 @@ def test_day_trade_portfolio_history_changes_use_open_snapshot_and_close_pnl(tmp
     assert np.isclose(row["price_return"], -0.10)
     assert np.isclose(row["stock_return"], -0.10)
     assert np.isclose(row["portfolio_contribution"], -0.02)
+    assert result.rows[0]["position_source"] == "executed_history"
+    assert result.rows[0]["source"] == "integer_share_backtest"
+    assert result.rows[0]["price_contract"] == "session_open_to_close"
+    assert result.rows[0]["intraday_price_included"] is False
+    assert row["entry_price_source"] == "official_ohlc_open"
+    assert row["exit_price_source"] == "official_ohlc_close"
+    assert row["price_contract"] == "session_open_to_close"
+    assert row["intraday_price_included"] is False
+
+
+def test_day_trade_portfolio_history_rejects_non_open_holding_records(tmp_path) -> None:
+    fold_dir = tmp_path / "fold_11"
+    fold_dir.mkdir()
+    pl.DataFrame(
+        {
+            "date": ["2026-01-02", "2026-01-02"],
+            "symbol": ["CASH", "AAA"],
+            "shares": [900, 10],
+            "price": [1.0, 10.0],
+            "market_value": [900.0, 100.0],
+            "holding_ratio": [0.9, 0.1],
+            "is_cash": [True, False],
+            "record_type": ["cash", "intraday_snapshot"],
+        }
+    ).write_parquet(fold_dir / "holdings.parquet")
+    pl.DataFrame(
+        {
+            "date": ["2026-01-02"],
+            "portfolio_return": [0.01],
+            "benchmark_return": [0.0],
+            "turnover": [0.2],
+        }
+    ).write_parquet(fold_dir / "integer_share_daily_portfolio_returns.parquet")
+
+    with pytest.raises(ValueError, match="non-opening day-trade holding records"):
+        load_portfolio_history(
+            fold_dir,
+            days=0,
+            top_changes=0,
+            execution_mode="tw_day_trade",
+        )
 
 
 def test_day_trade_portfolio_history_records_open_nav_and_same_session_pnl(tmp_path) -> None:

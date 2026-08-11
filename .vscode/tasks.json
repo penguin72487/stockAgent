@@ -4,7 +4,7 @@
     {
       "label": "Local Codex: Run Prompt",
       "type": "shell",
-      "command": "/home/user/.codex/skills/local-llamacpp-codex/scripts/local-codex",
+      "command": "${env:HOME}/.codex/skills/local-llamacpp-codex/scripts/local-codex",
       "args": [
         "-C",
         "${workspaceFolder}",
@@ -24,7 +24,7 @@
     {
       "label": "Local Codex: Explainability Artifact",
       "type": "shell",
-      "command": "/home/user/.codex/skills/local-llamacpp-codex/scripts/local-codex",
+      "command": "${env:HOME}/.codex/skills/local-llamacpp-codex/scripts/local-codex",
       "args": [
         "-C",
         "${workspaceFolder}",
@@ -52,7 +52,7 @@
     {
       "label": "Local Codex: Git Status Diff",
       "type": "shell",
-      "command": "/home/user/.codex/skills/local-llamacpp-codex/scripts/local-codex",
+      "command": "${env:HOME}/.codex/skills/local-llamacpp-codex/scripts/local-codex",
       "args": [
         "-C",
         "${workspaceFolder}",
