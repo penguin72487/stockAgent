@@ -342,7 +342,7 @@ training:
   # 99-feature schema changes.
   batch_size_train: 128
   batch_size_eval: 128
-  epochs: 10000
+  epochs: 1000
   early_stopping_no_improve_ratio: 0.1
   val_interval_epochs: 1
   curve_test_interval: 1
