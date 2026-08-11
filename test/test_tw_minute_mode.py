@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,6 +19,10 @@ from stockagent.backtest.tw_minute import (
     force_close_minute_session,
     initialize_minute_execution_state,
     minute_target_weights_from_logits,
+)
+from stockagent.backtest.holdings import (
+    build_realized_holdings_frames,
+    save_realized_holdings_artifacts,
 )
 from stockagent.backtest.tw_execution import effective_fee_rate_vectors
 from stockagent.config import load_config
@@ -38,7 +43,9 @@ from stockagent.data.tw_minute import (
     minute_static_daily_context_feature_names,
     summarize_minute_sessions_for_next_day,
 )
+from stockagent.data import tw_minute as minute_data
 from stockagent.training.minute import (
+    _MinuteDayCache,
     _MinuteSlabForwardAdapter,
     _build_windows,
     _execute_minute_chunk,
@@ -243,6 +250,10 @@ def test_minute_daily_context_uses_prior_complete_session_and_current_open(
             [[100.0, 50.0], [110.0, 55.0], [121.0, 60.0]],
             dtype=np.float32,
         ),
+        "returns_1d": np.asarray(
+            [[0.10, 0.01], [0.20, 0.02], [np.nan, np.nan]],
+            dtype=np.float32,
+        ),
     }
     array_meta: dict[str, dict[str, object]] = {}
     for name, values in arrays.items():
@@ -257,6 +268,7 @@ def test_minute_daily_context_uses_prior_complete_session_and_current_open(
         json.dumps(
             {
                 "version": 2,
+                "backend_key": "test|benchmark=2330|other=value",
                 "symbols_file": "generations/g1/symbols.json",
                 "feature_names_file": "generations/g1/feature_names.json",
                 "arrays": array_meta,
@@ -274,6 +286,7 @@ def test_minute_daily_context_uses_prior_complete_session_and_current_open(
             MINUTE_DAILY_OPEN_GAP_FEATURE,
             "daily_a",
         ),
+        benchmark_name="2330",
     )
     first = context.for_minute_day(0)
     history = context.for_minute_day(1, lookback=2)
@@ -295,6 +308,22 @@ def test_minute_daily_context_uses_prior_complete_session_and_current_open(
         ],
     )
     assert len(context.fingerprint) == 64
+    assert context.benchmark_name == "2330"
+    # Benchmark rows are assigned to the session where each adjusted-close
+    # move ends: Jan-02 -> Jan-05, then Jan-05 -> Jan-06.
+    np.testing.assert_allclose(context.benchmark_log_returns, [0.10, 0.20])
+    assert context.benchmark_price_available.tolist() == [True, True]
+    assert len(context.benchmark_fingerprint) == 64
+    with pytest.raises(RuntimeError, match="benchmark disagrees"):
+        _load_minute_daily_feature_context(
+            meta,
+            minute_symbols=("0050", "2330"),
+            minute_dates=np.asarray(
+                ["2026-01-05", "2026-01-06"], dtype="datetime64[D]"
+            ),
+            requested_feature_names=("daily_a",),
+            benchmark_name="0050",
+        )
 
 
 def test_minute_group_runtime_release_resets_compiler_on_cpu(
@@ -378,6 +407,8 @@ def test_minute_split_is_chronological_and_progress_counts_sessions(
                 "date": str(np.datetime64("2020-01-01") + np.timedelta64(index, "D")),
                 "net_return": 0.0,
                 "log_return": 0.0,
+                "benchmark_log_return": 0.01 * (index + 1),
+                "benchmark_available": 1.0,
                 "turnover_notional": 0.0,
                 "explicit_fees": 0.0,
                 "slippage_cost": 0.0,
@@ -410,7 +441,10 @@ def test_minute_split_is_chronological_and_progress_counts_sessions(
                 np.datetime64("2020-01-01"),
                 np.datetime64("2020-01-06"),
                 dtype="datetime64[D]",
-            )
+            ),
+            daily_feature_context=SimpleNamespace(
+                benchmark_price_available=np.ones(5, dtype=np.bool_)
+            ),
         ),
         normalizer=object(),
         model=torch.nn.Identity(),
@@ -424,7 +458,6 @@ def test_minute_split_is_chronological_and_progress_counts_sessions(
         device=torch.device("cpu"),
         amp_dtype=None,
         optimizer=object(),
-        benchmark_symbol_index=0,
     )
 
     assert seen_batches == [[0, 1], [2, 3], [4]]
@@ -435,6 +468,13 @@ def test_minute_split_is_chronological_and_progress_counts_sessions(
         "2020-01-04",
         "2020-01-05",
     ]
+    np.testing.assert_allclose(
+        [row["benchmark_log_return"] for row in rows],
+        [0.0, 0.02, 0.03, 0.04, 0.05],
+    )
+    assert math.expm1(sum(row["benchmark_log_return"] for row in rows)) == pytest.approx(
+        math.expm1(0.14)
+    )
     progress = progress_instances[0]
     assert isinstance(progress, FakeProgress)
     assert progress.total == 5
@@ -452,7 +492,10 @@ def test_minute_split_is_chronological_and_progress_counts_sessions(
                 np.datetime64("2020-01-01"),
                 np.datetime64("2020-01-06"),
                 dtype="datetime64[D]",
-            )
+            ),
+            daily_feature_context=SimpleNamespace(
+                benchmark_price_available=np.ones(5, dtype=np.bool_)
+            ),
         ),
         normalizer=object(),
         model=torch.nn.Identity(),
@@ -466,7 +509,6 @@ def test_minute_split_is_chronological_and_progress_counts_sessions(
         device=torch.device("cpu"),
         amp_dtype=None,
         optimizer=None,
-        benchmark_symbol_index=0,
     )
     assert seen_batches == [[0, 1, 2], [3, 4]]
     assert seen_chunk_rows == [4, 4]
@@ -527,20 +569,33 @@ def test_minute_empty_source_partition_preserves_missing_benchmark() -> None:
         session_exit_mask=np.zeros(2, dtype=bool),
     )
 
-    assert math.isnan(
-        _minute_benchmark_log_return(
-            day,
-            first_execution_index=31,
-            benchmark_symbol_index=0,
-        )
-    )
+    assert math.isnan(_minute_benchmark_log_return(day))
 
     day.feature_mask[31, 1] = True
+    assert math.isnan(_minute_benchmark_log_return(day))
+
+
+def test_minute_benchmark_uses_aligned_adjusted_close_return_only() -> None:
+    day = MinuteDayPanel(
+        trade_date=np.datetime64("2026-01-05"),
+        features=np.zeros((270, 1, len(MINUTE_FEATURE_COLUMNS)), dtype=np.float32),
+        feature_mask=np.ones((270, 1), dtype=bool),
+        execution_mask=np.ones((270, 1), dtype=bool),
+        execution_open=np.full((270, 1), 100.0, dtype=np.float32),
+        exit_close=np.full((270, 1), 200.0, dtype=np.float32),
+        future_volume_shares=np.ones((270, 1), dtype=np.float32),
+        session_close=np.asarray([200.0], dtype=np.float32),
+        session_exit_mask=np.ones(1, dtype=bool),
+        benchmark_log_return=0.125,
+        benchmark_price_available=True,
+    )
+
+    # Executor prices imply a very different intraday return; reporting must
+    # consume only the independently aligned adjusted-close benchmark value.
+    assert _minute_benchmark_log_return(day) == pytest.approx(0.125)
     assert math.isnan(
         _minute_benchmark_log_return(
-            day,
-            first_execution_index=31,
-            benchmark_symbol_index=0,
+            replace(day, benchmark_price_available=False)
         )
     )
 
@@ -1016,6 +1071,119 @@ def test_stateful_proximal_allocator_preserves_exact_no_trade_region() -> None:
     torch.testing.assert_close(initial, requested.detach())
 
 
+def test_stateful_proximal_allocator_does_not_renormalize_removed_turnover() -> None:
+    """The proximal step may deliberately move gross exposure into cash.
+
+    Re-normalizing the candidate back to the requested gross would undo the
+    soft-thresholded no-trade band and can create more turnover than the model
+    requested.  A coordinate-wise point between two L1-feasible portfolios is
+    already L1-feasible, so the exact candidate must be preserved.
+    """
+
+    previous = torch.tensor([[0.50, 0.30]])
+    requested = torch.tensor([[0.20, 0.10]])
+    actual = _stateful_proximal_target_weights(
+        requested,
+        previous,
+        buy_fee_rates=torch.tensor([0.05, 0.05]),
+        sell_fee_rates=torch.tensor([0.05, 0.05]),
+        cost_multiplier=1.0,
+        long_only=False,
+    )
+
+    expected = torch.tensor([[0.25, 0.15]])
+    torch.testing.assert_close(actual, expected)
+    assert float(actual.abs().sum()) == pytest.approx(0.40)
+    assert float((actual - previous).abs().sum()) == pytest.approx(0.40)
+    assert float((actual - previous).abs().sum()) < float(
+        (requested - previous).abs().sum()
+    )
+
+
+def test_minute_batch_cache_stores_only_model_features_in_bf16() -> None:
+    features = np.ones((270, 2, len(MINUTE_FEATURE_COLUMNS)), dtype=np.float32)
+    day = MinuteDayPanel(
+        trade_date=np.datetime64("2026-01-02"),
+        features=features,
+        feature_mask=np.ones((270, 2), dtype=bool),
+        execution_mask=np.ones((270, 2), dtype=bool),
+        execution_open=np.ones((270, 2), dtype=np.float32),
+        exit_close=np.ones((270, 2), dtype=np.float32),
+        future_volume_shares=np.ones((270, 2), dtype=np.float32),
+        session_close=np.ones(2, dtype=np.float32),
+        session_exit_mask=np.ones(2, dtype=bool),
+        short_open_mask=np.ones(2, dtype=bool),
+        short_capacity_shares=np.ones(2, dtype=np.int64),
+        daily_context_features=np.ones((2, 3), dtype=np.float32),
+    )
+    dataset = SimpleNamespace(
+        load_day=lambda _index, *, normalizer: day,
+    )
+    normalizer = MinuteFeatureNormalizer(
+        mean=np.zeros(len(MINUTE_FEATURE_COLUMNS), dtype=np.float32),
+        scale=np.ones(len(MINUTE_FEATURE_COLUMNS), dtype=np.float32),
+        counts=np.full(len(MINUTE_FEATURE_COLUMNS), 2, dtype=np.int64),
+    )
+    cache = _MinuteDayCache(
+        dataset,
+        normalizer,
+        maximum_bytes=1 << 30,
+        workers=1,
+        feature_storage_dtype=torch.bfloat16,
+    )
+    try:
+        batch = cache.prefetch_many_stacked([0], padded_days=1).result(timeout=5.0)
+        cached_batch = cache.get_many_stacked([0], padded_days=1)
+    finally:
+        cache.close()
+
+    assert cached_batch is batch
+    assert cache.hits == 1
+    assert cache.misses == 1
+    assert batch.fields["features"].dtype == torch.bfloat16
+    assert batch.fields["daily_context_features"].dtype == torch.bfloat16
+    assert batch.fields["execution_open"].dtype == torch.float32
+    assert batch.fields["future_volume_shares"].dtype == torch.float32
+    assert batch.fields["short_capacity_shares"].dtype == torch.int64
+    assert batch.nbytes == sum(
+        value.numel() * value.element_size() for value in batch.fields.values()
+    )
+
+
+def test_realized_minute_holdings_are_long_form_and_ranked(tmp_path: Path) -> None:
+    dates = np.asarray(["2025-01-02", "2025-01-03"], dtype="datetime64[D]")
+    symbols = ["2330", "2317", "0050"]
+    weights = np.asarray(
+        [[0.6, -0.3, 0.1], [0.0, 0.0, 0.0]], dtype=np.float64
+    )
+    holdings, summary = build_realized_holdings_frames(
+        dates,
+        symbols,
+        weights,
+        initial_capital=10_000_000.0,
+    )
+    assert holdings.shape == (3, 8)
+    assert holdings["symbol"].to_list() == ["2330", "2317", "0050"]
+    assert holdings["side"].to_list() == ["long", "short", "long"]
+    assert holdings["gross_rank"].to_list() == [1, 2, 3]
+    assert summary["gross_weight"].to_list() == pytest.approx([1.0, 0.0])
+    assert summary["net_weight"].to_list() == pytest.approx([0.4, 0.0])
+    assert summary["effective_names"][1] == 0.0
+    contract = save_realized_holdings_artifacts(
+        tmp_path,
+        dates,
+        symbols,
+        weights,
+        initial_capital=10_000_000.0,
+        write_plots=False,
+    )
+    assert contract["nonzero_holding_rows"] == 3
+    assert (tmp_path / "pre_close_holdings.parquet").is_file()
+    assert (tmp_path / "holdings_summary.parquet").is_file()
+    assert (tmp_path / "holdings_summary.md").is_file()
+    assert (tmp_path / "holdings_contract.json").is_file()
+
+
 def test_recurrent_minute_chunks_keep_future_cost_gradient_to_earlier_target() -> None:
     config = MinuteExecutionConfig(
         initial_equity=1_000_000.0,
@@ -1183,7 +1351,6 @@ def test_run_day_batch_full_day_credit_changes_earlier_chunk_gradient() -> None:
             scaler=torch.amp.GradScaler("cuda", enabled=False),
             scheduler=None,
             gradient_clip_norm=0.0,
-            benchmark_symbol_index=0,
         )
         assert policy.first_logit.grad is not None
         return policy.first_logit.grad.detach().clone()
@@ -1194,6 +1361,112 @@ def test_run_day_batch_full_day_credit_changes_earlier_chunk_gradient() -> None:
     assert bool(torch.isfinite(full_gradient).all())
     torch.testing.assert_close(checkpointed_full_gradient, full_gradient)
     assert not torch.allclose(full_gradient, truncated_gradient, atol=1e-9, rtol=1e-6)
+
+
+def test_eval_day_reports_cash_l1_model_allocation_separately_from_fills() -> None:
+    config = load_config(Path("configs/markets/tw_minute_dual_5090.yaml"))
+    config.training.lookback = 1
+    config.training.non_blocking_transfer = False
+    config.trading.tw_minute_first_decision_minute = 1
+    config.trading.tw_minute_last_entry_minute = 2
+    config.trading.tw_minute_last_decision_minute = 2
+    features = np.zeros((270, 2, len(MINUTE_FEATURE_COLUMNS)), dtype=np.float32)
+    features[0, :, 0] = 1.0
+    features[1, :, 0] = 2.0
+    execution_mask = np.zeros((270, 2), dtype=bool)
+    execution_mask[:2] = True
+    prices = np.zeros((270, 2), dtype=np.float32)
+    prices[:2] = 100.0
+    volumes = np.zeros((270, 2), dtype=np.float32)
+    volumes[:2] = 1_000_000.0
+    day = MinuteDayPanel(
+        trade_date=np.datetime64("2026-01-02"),
+        features=features,
+        feature_mask=np.ones((270, 2), dtype=bool),
+        execution_mask=execution_mask,
+        execution_open=prices,
+        exit_close=prices,
+        future_volume_shares=volumes,
+        session_close=np.asarray([100.0, 100.0], dtype=np.float32),
+        session_exit_mask=np.asarray([True, True]),
+    )
+    execution_config = MinuteExecutionConfig(
+        initial_equity=1_000_000.0,
+        gross_exposure=1.0,
+        maximum_name_weight=None,
+        maximum_volume_participation=1.0,
+        maximum_order_notional=None,
+        slippage_bps_per_side=0.0,
+        long_only=True,
+    )
+    policy = torch.nn.Identity()
+    buy_rates = torch.zeros(2)
+    sell_rates = torch.zeros(2)
+
+    def model_forward(feature_slabs, _mask, _shortable, _daily):
+        minute_code = feature_slabs[:, -1, 0, 0]
+        return torch.where(
+            (minute_code < 1.5).unsqueeze(1),
+            torch.tensor([0.2, 0.1]),
+            torch.tensor([0.4, 0.0]),
+        )
+
+    def execution_forward(
+        cash,
+        shares,
+        last_prices,
+        equity,
+        targets,
+        masks,
+        opens,
+        closes,
+        future_volumes,
+        allow_entries,
+        short_masks,
+        short_capacity,
+    ):
+        return _execute_minute_chunk(
+            cash,
+            shares,
+            last_prices,
+            equity,
+            targets,
+            masks,
+            opens,
+            closes,
+            future_volumes,
+            allow_entries,
+            short_masks,
+            short_capacity,
+            buy_fee_rates=buy_rates,
+            sell_fee_rates=sell_rates,
+            config=execution_config,
+        )
+
+    rows, _, _ = _run_day_batch(
+        model=policy,
+        model_forward=model_forward,
+        execution_forward=execution_forward,
+        days=[day],
+        config=config,
+        execution_config=execution_config,
+        buy_fee_rates=buy_rates,
+        sell_fee_rates=sell_rates,
+        device=torch.device("cpu"),
+        amp_dtype=None,
+        day_batch_size=1,
+        decision_chunk_rows=1,
+        optimizer=None,
+        scaler=None,
+        scheduler=None,
+        gradient_clip_norm=0.0,
+    )
+
+    assert rows[0]["mean_model_requested_cash_weight"] == pytest.approx(0.65)
+    assert rows[0]["min_model_requested_cash_weight"] == pytest.approx(0.6)
+    assert rows[0]["max_model_requested_cash_weight"] == pytest.approx(0.7)
+    assert rows[0]["last_model_requested_cash_weight"] == pytest.approx(0.6)
+    assert rows[0]["mean_model_requested_risky_gross_weight"] == pytest.approx(0.35)
 
 
 def test_batched_minute_executor_matches_independent_day_oracle_and_gradients() -> None:
@@ -1504,7 +1777,7 @@ def test_dual_5090_minute_config_is_within_fold_ddp() -> None:
     assert config.training.minute_stateful_proximal_allocator is True
     assert config.training.minute_proximal_cost_multiplier == 1.0
     assert config.training.enable_lr_scheduler is False
-    assert config.training.epochs == 100
+    assert config.training.epochs == 1000
     assert config.training.finite_check_interval_steps == 0
     assert config.training.checkpoint_finite_check is False
     assert config.training.financial_transformer.d_model == 32
@@ -1515,16 +1788,17 @@ def test_dual_5090_minute_config_is_within_fold_ddp() -> None:
     assert config.training.financial_transformer.daily_context_pooling == "last"
     assert config.training.transformer_base_portfolio.amp_native_position_add is True
     assert config.training.transformer_base_portfolio.checkpoint_blocks is True
+    assert config.training.cache_train_features_in_amp_dtype is True
     assert (
         config.training.transformer_base_portfolio.portfolio_output_mode
-        == "l1"
+        == "cash_l1"
     )
     assert config.training.financial_transformer.temporal_pooling == "last"
     assert config.training.financial_transformer.temporal_query_mode == "last_only"
     assert config.training.financial_transformer.portfolio_mode == "long_short"
     assert (
         config.training.financial_transformer.portfolio_output_mode
-        == "l1"
+        == "cash_l1"
     )
     assert config.training.financial_transformer.center_long_short_logits is False
     assert config.training.transformer_base_portfolio.center_long_short_logits is False
@@ -1547,7 +1821,7 @@ def test_dual_5090_minute_config_is_within_fold_ddp() -> None:
     assert config.training.defer_epoch_curve_plot_until_end is False
     assert (
         config.runner.output_dir
-        == "artifacts/markets/tw_minute_dual_5090_dual_timescale_stateful_v8"
+        == "artifacts/markets/tw_minute_dual_5090_cost_aware_v10"
     )
     assert (
         config.data.minute_parquet_root
@@ -1590,10 +1864,9 @@ def test_dual_5090_minute_trading_contract_matches_daily_day_trade() -> None:
     )
     np.testing.assert_allclose(buy_rates, [0.000285, 0.000285])
     np.testing.assert_allclose(sell_rates, [0.001785, 0.001285])
-    assert (
-        minute.training.financial_transformer.portfolio_output_mode
-        == "l1"
-    )
+    # The latest explicit user override changes only portfolio construction:
+    # cash is one contextual model-scored asset in the signed L1 action vector.
+    assert minute.training.financial_transformer.portfolio_output_mode == "cash_l1"
     assert (
         minute.training.loss_portfolio_activation
         == daily.training.loss_portfolio_activation
@@ -1625,7 +1898,9 @@ def test_model_mask_does_not_consume_next_bar_or_session_exit_availability() -> 
 
 def test_minute_partition_loads_sparse_full_market_rows_into_dense_day(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
     root = tmp_path / "minute"
     partition = root / "trade_date=2026-01-02"
     partition.mkdir(parents=True)
@@ -1688,7 +1963,25 @@ def test_minute_partition_loads_sparse_full_market_rows_into_dense_day(
         ),
         encoding="utf-8",
     )
+    sha_calls: list[Path] = []
+    real_sha256 = minute_data._sha256
+
+    def counting_sha256(path: Path) -> str:
+        sha_calls.append(path)
+        return real_sha256(path)
+
+    monkeypatch.setattr(minute_data, "_sha256", counting_sha256)
     dataset = load_minute_dataset_index(root)
+    assert sha_calls == [output.resolve()]
+    load_minute_dataset_index(root)
+    assert sha_calls == [output.resolve()]
+
+    original_bytes = output.read_bytes()
+    output.write_bytes(original_bytes + b"changed")
+    with pytest.raises(RuntimeError, match="fingerprint mismatch"):
+        load_minute_dataset_index(root)
+    assert sha_calls == [output.resolve(), output.resolve()]
+    output.write_bytes(original_bytes)
     normalizer = MinuteFeatureNormalizer(
         mean=np.zeros(len(MINUTE_FEATURE_COLUMNS), dtype=np.float32),
         scale=np.ones(len(MINUTE_FEATURE_COLUMNS), dtype=np.float32),

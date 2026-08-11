@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
+from copy import deepcopy
 
 import torch
 import torch.nn.functional as F
@@ -13,6 +14,7 @@ from stockagent.models.latent_factor_market_token_portfolio import _safe_attenti
 from stockagent.models.normalization import (
     dual_branch_softmax,
     finite_mask_fill_value,
+    masked_cash_asset_l1_weights,
     masked_l1_projection_weights,
     masked_cross_sectional_mean_finite,
     masked_signed_action_weights,
@@ -896,6 +898,151 @@ class TemporalBasisFeatureEncoder(nn.Module):
             )
         return output
 
+    def explainability_decomposition(
+        self,
+        temporal_source: torch.Tensor,
+        z_base: torch.Tensor,
+        mask: torch.Tensor,
+        *,
+        source_is_prepared: bool = False,
+    ) -> dict[str, object]:
+        """Return faithful fusion-path counterfactuals and analytical audits.
+
+        This method is deliberately outside the training hot path.  It keeps
+        the ordinary temporal representation, bias, and every basis family as
+        separate ``[B,S,D]`` tensors so explainability can intervene on one
+        path at a time without changing checkpoint parameters or model
+        semantics.  Each reported family contribution is the finite-precision
+        marginal ``full_fusion - fusion_without_family`` evaluated with the
+        same compact-kernel path as inference.  The separately accumulated
+        additive reconstruction remains available only as a BF16 roundoff
+        audit.  Family kernels are the exact analytical contraction of the
+        learned projection weights with each temporal analysis bank.
+        """
+
+        if not self.fuse_projection:
+            raise RuntimeError(
+                "Exact temporal-basis path decomposition requires "
+                "fuse_projection=True (raw-feature basis input)."
+            )
+        if temporal_source.ndim != 4:
+            raise ValueError("temporal_source must have shape [B,L,S,F]")
+        if int(temporal_source.size(1)) != self.lookback:
+            raise ValueError(
+                f"Expected temporal lookback={self.lookback}, "
+                f"got {int(temporal_source.size(1))}"
+            )
+        if int(temporal_source.size(-1)) != self.source_dim:
+            raise ValueError(
+                f"Expected temporal source_dim={self.source_dim}, "
+                f"got {int(temporal_source.size(-1))}"
+            )
+        if not source_is_prepared:
+            temporal_source = self.prepare_source(temporal_source)
+
+        mask_bool = mask.to(device=z_base.device, dtype=torch.bool)
+        output_mask = mask_bool.unsqueeze(-1)
+        weight = self.feature_projection.weight
+        original_signal = F.linear(z_base, weight[:, : self.dim], None).masked_fill(
+            ~output_mask, 0.0
+        )
+        if self.feature_projection.bias is None:
+            bias = z_base.new_zeros(self.dim)
+        else:
+            bias = self.feature_projection.bias.to(
+                device=z_base.device,
+                dtype=z_base.dtype,
+            )
+        bias_contribution = bias.view(1, 1, self.dim).expand_as(original_signal).masked_fill(
+            ~output_mask, 0.0
+        )
+
+        family_contributions: dict[str, torch.Tensor] = {}
+        family_ablated: dict[str, torch.Tensor] = {}
+        family_kernels: dict[str, torch.Tensor] = {}
+        family_projection_weights: dict[str, torch.Tensor] = {}
+        additive_reconstructed = original_signal + bias_contribution
+        total_kernel: torch.Tensor | None = None
+        offset = self.dim
+        for family in self.family_names:
+            component_count = self.family_component_counts[family]
+            width = component_count * self.source_dim
+            family_weight = weight[:, offset : offset + width].reshape(
+                self.dim,
+                component_count,
+                self.source_dim,
+            )
+            basis = self._basis(family, temporal_source)
+            family_kernel = torch.einsum(
+                "okf,kl->olf",
+                family_weight,
+                basis,
+            )
+            analytical_contribution = torch.einsum(
+                "olf,blsf->bso",
+                family_kernel,
+                temporal_source,
+            ).masked_fill(~output_mask, 0.0)
+            family_kernels[family] = family_kernel
+            family_projection_weights[family] = family_weight
+            additive_reconstructed = additive_reconstructed + analytical_contribution
+            total_kernel = (
+                family_kernel
+                if total_kernel is None
+                else total_kernel + family_kernel
+            )
+            offset += width
+
+        fused = self._fused_projection(temporal_source, z_base).masked_fill(
+            ~output_mask, 0.0
+        )
+        if total_kernel is None:
+            raise RuntimeError("Temporal-basis decomposition has no family kernel")
+        base_with_bias = F.linear(
+            z_base,
+            weight[:, : self.dim],
+            self.feature_projection.bias,
+        ).masked_fill(~output_mask, 0.0)
+        basis_only = torch.einsum(
+            "olf,blsf->bso",
+            total_kernel,
+            temporal_source,
+        ).masked_fill(~output_mask, 0.0)
+        original_ablated = (bias_contribution + basis_only).masked_fill(
+            ~output_mask, 0.0
+        )
+        original_contribution = fused - original_ablated
+        for family in self.family_names:
+            alternative = (
+                base_with_bias
+                + torch.einsum(
+                    "olf,blsf->bso",
+                    total_kernel - family_kernels[family],
+                    temporal_source,
+                )
+            ).masked_fill(~output_mask, 0.0)
+            family_ablated[family] = alternative
+            # This is the faithful finite-precision marginal used by the
+            # actual hot path, not a separately evaluated algebraic term.
+            family_contributions[family] = fused - alternative
+        return {
+            "temporal_source": temporal_source,
+            "z_base": z_base.masked_fill(~output_mask, 0.0),
+            "original_contribution": original_contribution,
+            "bias_contribution": bias_contribution,
+            "family_contributions": family_contributions,
+            "family_ablated": family_ablated,
+            "family_kernels": family_kernels,
+            "family_projection_weights": family_projection_weights,
+            "original_ablated": original_ablated,
+            "all_basis_ablated": base_with_bias,
+            "additive_reconstructed": additive_reconstructed.masked_fill(
+                ~output_mask, 0.0
+            ),
+            "reconstructed": fused,
+            "fused": fused,
+        }
+
     def forward(
         self,
         temporal_embeddings: torch.Tensor,
@@ -1520,6 +1667,11 @@ class TransformerBasePortfolioModel(nn.Module):
         self.portfolio_mode = normalize_portfolio_mode(portfolio_mode)
         self.portfolio_activation = normalize_portfolio_activation(portfolio_activation)
         self.portfolio_output_mode = normalize_portfolio_output_mode(portfolio_output_mode)
+        if self.portfolio_output_mode == "cash_l1" and self.num_action_channels != 1:
+            raise ValueError(
+                "portfolio_output_mode='cash_l1' supports only a single target "
+                "channel; carrying-mode phase heads require a separate cash contract"
+            )
         self.center_long_short_logits = bool(center_long_short_logits)
         self.max_full_tokens = int(max_full_tokens)
         self.checkpoint_blocks = bool(checkpoint_blocks)
@@ -1723,6 +1875,20 @@ class TransformerBasePortfolioModel(nn.Module):
         # parameter shapes so old strict checkpoints remain byte-for-byte
         # schema compatible.  Multi-action modes widen only the final head.
         self.score_head = make_score_head(self.num_action_channels)
+        # Cash-L1 treats cash as one additional model-scored asset.  Its token
+        # receives the current masked market context and then passes through
+        # the exact same score head as stocks.  Disabled modes create no new
+        # parameters, preserving their historical checkpoint schema.
+        self.cash_asset_token = (
+            nn.Parameter(torch.randn(1, self.d_model) * 0.02)
+            if self.portfolio_output_mode == "cash_l1"
+            else None
+        )
+        self.cash_asset_norm = (
+            _make_norm(self.d_model, self.norm_type)
+            if self.portfolio_output_mode == "cash_l1"
+            else None
+        )
 
     def enable_legacy_dynamic_token_checkpoint_compatibility(
         self,
@@ -2235,12 +2401,58 @@ class TransformerBasePortfolioModel(nn.Module):
         )
         return pooled
 
+    def temporal_basis_decomposition_for_explainability(
+        self,
+        x: torch.Tensor,
+        mask: torch.Tensor | None = None,
+        symbol_indices: torch.Tensor | None = None,
+    ) -> dict[str, object]:
+        """Expose the exact raw-feature basis fusion paths for interventions.
+
+        Only compact modes are eligible because their cross-stock stage starts
+        after the additive temporal-basis fusion.  This lets explainability
+        remove one family and rerun the unchanged market-token/latent/head
+        stack, while the production ``forward`` signature remains untouched.
+        """
+
+        self._require_compact_explainability_mode()
+        if not self._raw_temporal_basis_enabled():
+            raise RuntimeError(
+                "Raw temporal-basis decomposition requires "
+                "temporal_basis_input='raw_features'."
+            )
+        if self.training:
+            raise RuntimeError("temporal-basis explainability requires model.eval()")
+        self._check_shapes(x, mask, symbol_indices)
+        if mask is None:
+            mask_bool = torch.ones(
+                x.size(0), x.size(2), dtype=torch.bool, device=x.device
+            )
+        else:
+            mask_bool = mask.to(device=x.device, dtype=torch.bool)
+        safe_mask = _safe_attention_mask(mask_bool)
+        embedded = self._embed_inputs(x, symbol_indices)
+        temporal = self._apply_temporal_blocks(embedded, keep_all_steps=False)
+        z_base = self._pool_temporal(temporal, safe_mask)
+        raw_source = self._prepare_raw_temporal_basis_source(x)
+        if raw_source is None or self.temporal_basis_feature_encoder is None:
+            raise RuntimeError("Raw temporal-basis source was not prepared")
+        decomposition = self.temporal_basis_feature_encoder.explainability_decomposition(
+            raw_source,
+            z_base,
+            safe_mask,
+            source_is_prepared=True,
+        )
+        decomposition["safe_mask"] = safe_mask
+        return decomposition
+
     def forward_from_stock_embeddings_explainability(
         self,
         stock_embeddings: torch.Tensor,
         mask: torch.Tensor | None = None,
         temperature: float | torch.Tensor | None = None,
         return_aux: bool | None = None,
+        return_scores: bool = False,
     ):
         """Run the compact cross-stock bottleneck/head from cached ``[B,S,D]`` inputs."""
         self._require_compact_explainability_mode()
@@ -2267,6 +2479,7 @@ class TransformerBasePortfolioModel(nn.Module):
             mask_bool,
             temperature=temperature,
             return_aux=return_aux,
+            return_scores=return_scores,
         )
 
     def forward_from_embedded_explainability_compiled(
@@ -2287,9 +2500,9 @@ class TransformerBasePortfolioModel(nn.Module):
 
             compiled = torch.compile(
                 forward_fn,
-                mode="reduce-overhead",
                 dynamic=False,
                 fullgraph=False,
+                options={"triton.cudagraphs": False},
             )
             # Avoid registering a self-referential OptimizedModule as a child.
             object.__setattr__(self, "_compiled_explainability_forward", compiled)
@@ -2321,6 +2534,52 @@ class TransformerBasePortfolioModel(nn.Module):
             # Avoid registering a self-referential OptimizedModule as a child.
             object.__setattr__(self, "_compiled_stock_explainability_forward", compiled)
         return compiled(stock_embeddings, mask)
+
+    def forward_explainability_compiled(
+        self,
+        x: torch.Tensor,
+        mask: torch.Tensor,
+    ):
+        """Compile the fixed-shape raw-input counterfactual forward.
+
+        Raw-feature temporal bases cannot reuse a cached embedded window:
+        perturbing one raw feature changes both the CandleEncoder projection
+        and the temporal-basis fusion path.  This method preserves that full
+        dependency while avoiding thousands of eager Python-dispatched model
+        forwards during feature-by-lag intervention.
+        """
+
+        compiled = self.__dict__.get("_compiled_raw_explainability_forward")
+        if compiled is None:
+            # J-Lens temporarily registers forward hooks on the live model for
+            # every date chunk.  Dynamo guards on hook registries, so compiling
+            # the live module would invalidate/recompile this hot path after
+            # each J-Lens pass and eventually fall back to eager execution.
+            # A checkpoint-identical eval snapshot isolates the counterfactual
+            # graph while leaving all reported interventions semantically
+            # unchanged.
+            frozen_model = deepcopy(self)
+            frozen_model.eval()
+            frozen_model.requires_grad_(False)
+            object.__setattr__(self, "_raw_explainability_model", frozen_model)
+
+            def forward_fn(raw_x: torch.Tensor, raw_mask: torch.Tensor):
+                return frozen_model.forward(
+                    raw_x,
+                    raw_mask.to(device=raw_x.device, dtype=torch.bool),
+                    return_aux=False,
+                    return_scores=True,
+                )
+
+            compiled = torch.compile(
+                forward_fn,
+                dynamic=False,
+                fullgraph=False,
+                options={"triton.cudagraphs": False},
+            )
+            # Avoid registering a self-referential OptimizedModule as a child.
+            object.__setattr__(self, "_compiled_raw_explainability_forward", compiled)
+        return compiled(x, mask)
 
     def _add_window_positions(
         self,
@@ -3073,6 +3332,11 @@ class TransformerBasePortfolioModel(nn.Module):
             # This helper is the explicit logits -> executable-target boundary.
             # Callers that want raw logits do not call it.
             resolved_mode = "activation_l1"
+        if resolved_mode == "cash_l1":
+            raise ValueError(
+                "cash_l1 requires the contextual cash token and is resolved "
+                "inside model forward; raw stock logits alone are insufficient"
+            )
 
         output_aux: dict[str, torch.Tensor] = {}
         long_only = self.portfolio_mode == "long_only"
@@ -3442,6 +3706,26 @@ class TransformerBasePortfolioModel(nn.Module):
             return output
         return actions
 
+    def _cash_asset_score_logit(
+        self,
+        z_stock: torch.Tensor,
+        mask_bool: torch.Tensor,
+    ) -> torch.Tensor:
+        """Score one contextual cash token with the shared stock score head."""
+
+        if self.cash_asset_token is None or self.cash_asset_norm is None:
+            raise RuntimeError("cash asset score requested while cash_l1 is disabled")
+        mask_f = mask_bool.unsqueeze(-1).to(dtype=z_stock.dtype)
+        valid_count = mask_f.sum(dim=1).clamp_min(1.0)
+        market_context = (z_stock * mask_f).sum(dim=1) / valid_count
+        cash_embedding = self.cash_asset_norm(
+            market_context + self.cash_asset_token.to(dtype=market_context.dtype)
+        )
+        cash_score = self.score_head(cash_embedding)
+        if tuple(cash_score.shape) != (int(z_stock.size(0)), 1):
+            raise RuntimeError("cash-L1 shared score head must emit one cash score")
+        return _sanitize_scores_to_dtype(cash_score.squeeze(-1))
+
     def _portfolio_outputs_from_stock_embeddings(
         self,
         z_stock: torch.Tensor,
@@ -3487,6 +3771,11 @@ class TransformerBasePortfolioModel(nn.Module):
 
         output_aux: dict[str, torch.Tensor] = {}
         include_action_aux = bool(return_aux is True or (return_aux is None and self.return_aux and self.return_aux_details))
+        cash_score_logits: torch.Tensor | None = None
+        cash_target_logits: torch.Tensor | None = None
+        if self.portfolio_output_mode == "cash_l1":
+            cash_score_logits = self._cash_asset_score_logit(z_stock, mask_bool)
+            cash_target_logits = cash_score_logits / temp
 
         if self.portfolio_mode == "long_only":
             centered_scores = scores
@@ -3497,6 +3786,25 @@ class TransformerBasePortfolioModel(nn.Module):
                 target_logits = (scores / temp).masked_fill(~mask_bool, 0.0)
             if self.portfolio_output_mode == "logits":
                 weights = target_logits
+            elif self.portfolio_output_mode == "cash_l1":
+                if cash_target_logits is None or cash_score_logits is None:
+                    raise AssertionError("cash-L1 logits were not prepared")
+                weights, cash_weight, positive_cash_score = (
+                    masked_cash_asset_l1_weights(
+                        target_logits,
+                        cash_target_logits,
+                        mask_bool,
+                        long_only=True,
+                        activation="identity",
+                    )
+                )
+                output_aux = {
+                    "cash_score_logits": cash_score_logits,
+                    "cash_target_logits": cash_target_logits,
+                    "positive_cash_score": positive_cash_score,
+                    "cash_weight": cash_weight,
+                    "risky_gross_weight": weights.abs().sum(dim=1),
+                }
             elif self.portfolio_output_mode == "signed_softmax":
                 action_output = masked_signed_action_weights(
                     target_logits,
@@ -3562,6 +3870,25 @@ class TransformerBasePortfolioModel(nn.Module):
                 target_logits = (centered_scores / temp).masked_fill(~mask_bool, 0.0)
             if self.portfolio_output_mode == "logits":
                 weights = target_logits
+            elif self.portfolio_output_mode == "cash_l1":
+                if cash_target_logits is None or cash_score_logits is None:
+                    raise AssertionError("cash-L1 logits were not prepared")
+                weights, cash_weight, positive_cash_score = (
+                    masked_cash_asset_l1_weights(
+                        target_logits,
+                        cash_target_logits,
+                        mask_bool,
+                        long_only=False,
+                        activation="identity",
+                    )
+                )
+                output_aux = {
+                    "cash_score_logits": cash_score_logits,
+                    "cash_target_logits": cash_target_logits,
+                    "positive_cash_score": positive_cash_score,
+                    "cash_weight": cash_weight,
+                    "risky_gross_weight": weights.abs().sum(dim=1),
+                }
             elif self.portfolio_output_mode == "signed_softmax":
                 action_output = masked_signed_action_weights(
                     target_logits,
@@ -3614,6 +3941,29 @@ class TransformerBasePortfolioModel(nn.Module):
         else:
             weights = weights.masked_fill(~mask_bool, 0.0)
 
+        if self.portfolio_output_mode == "cash_l1":
+            cash_weight = output_aux["cash_weight"]
+            positive_cash_score = output_aux["positive_cash_score"]
+            if cash_score_logits is None:
+                raise AssertionError("cash-L1 score logits were not prepared")
+            output_aux.update(
+                {
+                    # Cash is the final asset column in all three auditable
+                    # vectors. The allocation vector applies softplus only to
+                    # cash because negative cash/borrowing is not permitted.
+                    "score_logits_with_cash": torch.cat(
+                        (scores, cash_score_logits.unsqueeze(1)), dim=1
+                    ),
+                    "allocation_scores_with_cash": torch.cat(
+                        (target_logits.float(), positive_cash_score.unsqueeze(1)),
+                        dim=1,
+                    ),
+                    "weights_with_cash": torch.cat(
+                        (weights, cash_weight.unsqueeze(1)), dim=1
+                    ),
+                }
+            )
+
         if return_scores:
             return weights, masked_scores
         if return_aux is True:
@@ -3636,6 +3986,7 @@ class TransformerBasePortfolioModel(nn.Module):
                 "rank_logits": scores,
                 "centered_score_logits": centered_scores,
             }
+            output.update(output_aux)
             if self.return_aux_details:
                 aux = dict(aux)
                 aux.update(
@@ -3659,6 +4010,7 @@ class TransformerBasePortfolioModel(nn.Module):
         temperature: float | torch.Tensor | None = None,
         return_aux: bool | None = None,
         symbol_indices: torch.Tensor | None = None,
+        return_scores: bool = False,
     ):
         self._check_shapes(x, mask, symbol_indices)
         if mask is None:
@@ -3672,6 +4024,7 @@ class TransformerBasePortfolioModel(nn.Module):
             mask_bool,
             temperature=temperature,
             return_aux=return_aux,
+            return_scores=return_scores,
             temporal_basis_source=raw_basis_source,
         )
 

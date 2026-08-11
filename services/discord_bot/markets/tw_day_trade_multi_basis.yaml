@@ -1,0 +1,61 @@
+market: tw_day_trade_multi_basis
+label: 台股・Multi-Basis 當沖（初始 1,000 萬）
+enabled: true
+market_type: tw
+timezone: Asia/Taipei
+open_time: "09:00"
+close_time: "13:30"
+summary_time: "14:00"
+data_ready_time: "13:40"
+freshness_max_lag_days: 3
+freshness_scan_limit: 0
+holidays: []
+initial_capital: 10000000.0
+
+# This model shares the canonical TW public data layer with the other TW
+# day-trade modes. Users opt in through commands/subscriptions; it has no
+# independent automatic broadcast schedule.
+pre_signal_command:
+  - "{python}"
+  - downloader/download_tw_official_data.py
+  - --mode
+  - daily
+  - --config
+  - configs/markets/tw_public_multi_basis_online_complete.yaml
+  - --public-dir
+  - data_tw_public
+  - --stock-root
+  - data_tw_public/stocks
+  - --public-workers
+  - "2"
+  - --date-workers
+  - "4"
+  - --workers
+  - "8"
+  - --ohlcv-fallback
+  - none
+  - --fallback-start-date
+  - "2000-01-01"
+  - --skip-raw
+pre_signal_timeout_seconds: 1800
+previous_signal_backfill_limit: 512
+
+model_selection_path: ../models/tw_day_trade_multi_basis.yaml
+config_path: configs/markets/tw_public_multi_basis_online_complete.yaml
+output_dir: artifacts/markets/tw_public_candles_multi_basis_online_complete_raw_feature_input_lookback32_v5
+live_output_dir: artifacts/live_signals
+fold_id: 11
+checkpoint_path: artifacts/markets/tw_public_candles_multi_basis_online_complete_raw_feature_input_lookback32_v5/fold_11/checkpoint_best.pt
+weights_path: artifacts/markets/tw_public_candles_multi_basis_online_complete_raw_feature_input_lookback32_v5/fold_11/daily_weights.parquet
+
+panel_date: latest
+device: cuda
+price_source: panel
+yahoo_chunk_size: 200
+top_n: 2400
+min_abs_delta: 0.001
+benchmark_window_days: 32
+max_turnover_warning: 1.5
+max_top_weight_warning: 0.1
+max_gross_warning: 1.05
+unsupported_message: "**台股・Multi-Basis 當沖（初始 1,000 萬）** 模型尚未準備完成。"

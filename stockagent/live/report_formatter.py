@@ -155,7 +155,17 @@ def format_signal_message(summary: dict[str, Any], *, max_rows: int = 12, debug:
     baseline_return = _float_or_none(summary.get("benchmark_simple_return"))
     period_excess = None if portfolio_return is None or baseline_return is None else portfolio_return - baseline_return
     execution_mode = str(summary.get("execution_mode") or "naive").strip().lower()
-    execution_preview_only = bool(summary.get("execution_preview_only"))
+    market_id = str(summary.get("market") or "").strip().lower()
+    is_day_trade = execution_mode == "tw_day_trade" or market_id.startswith("tw_day_trade")
+    if is_day_trade:
+        execution_mode = "tw_day_trade"
+    execution_preview_only = is_day_trade or bool(summary.get("execution_preview_only"))
+    if is_day_trade:
+        # /signal_now owns the actionable position table.  Keep the leading
+        # day-trade summary compact instead of repeating the same positions and
+        # rebalance rows before that table.
+        rebalance = []
+        top_positions = []
 
     market_label = str(summary.get("market_label") or summary.get("market") or "").strip()
     title = "**stockAgent live signal**"
@@ -248,6 +258,24 @@ def format_signal_message(summary: dict[str, Any], *, max_rows: int = 12, debug:
                     ("excess_pnl", _fmt_money(recent.get("excess_pnl_value"))),
                 )
             )
+        if any(
+            _float_or_none(recent.get(key)) is not None
+            for key in ("sharpe", "sortino", "max_drawdown", "calmar")
+        ):
+            lines.append(
+                _kv_line(
+                    ("Sharpe", _fmt_float(recent.get("sharpe"), 2)),
+                    ("Sortino", _fmt_float(recent.get("sortino"), 2)),
+                    ("MDD", _fmt_signed_pct(recent.get("max_drawdown"))),
+                    ("Calmar", _fmt_float(recent.get("calmar"), 2)),
+                )
+            )
+            lines.append(
+                _kv_line(
+                    ("risk_basis", f"net_daily/ann{int(recent.get('risk_annualization_periods') or 252)}"),
+                    ("n", int(recent.get("risk_observations") or recent.get("window_days") or 0)),
+                )
+            )
 
     notice = str(summary.get("market_notice") or "").strip()
     if notice:
@@ -279,24 +307,38 @@ def format_signal_message(summary: dict[str, Any], *, max_rows: int = 12, debug:
                 )
             )
 
-    score_drivers = list(explanation.get("top_score_drivers", []))[:3]
-    feature_drivers = list(explanation.get("top_feature_drivers", []))[:3]
+    driver_limit = 5 if is_day_trade else 3
+    score_drivers = list(explanation.get("top_score_drivers", []))[:driver_limit]
+    feature_drivers = list(explanation.get("top_feature_drivers", []))[:driver_limit]
     if score_drivers or feature_drivers:
         lines.append("")
-        lines.append("**模型摘要**")
-        lines.append(_kv_line(("confidence_proxy", _fmt_float(explanation.get("confidence_proxy_score_std"), 3))))
+        if not is_day_trade:
+            lines.append("**模型摘要**")
+            lines.append(_kv_line(("confidence_proxy", _fmt_float(explanation.get("confidence_proxy_score_std"), 3))))
         if score_drivers:
             lines.append("score drivers:")
-            lines.extend(
-                f"  {index}. {str(row.get('symbol'))}: raw_score={_fmt_float(_raw_score(row), 3)}"
-                for index, row in enumerate(score_drivers, start=1)
-            )
+            if is_day_trade:
+                lines.extend(
+                    f"  {str(row.get('symbol'))}: raw_score={_fmt_float(_raw_score(row), 3)}"
+                    for row in score_drivers
+                )
+            else:
+                lines.extend(
+                    f"  {index}. {str(row.get('symbol'))}: raw_score={_fmt_float(_raw_score(row), 3)}"
+                    for index, row in enumerate(score_drivers, start=1)
+                )
         if feature_drivers:
             lines.append("feature drivers:")
-            lines.extend(
-                f"  {index}. {str(row.get('feature'))}: value={_fmt_float(row.get('weighted_abs_value'), 3)}"
-                for index, row in enumerate(feature_drivers, start=1)
-            )
+            if is_day_trade:
+                lines.extend(
+                    f"  {str(row.get('feature'))}: value={_fmt_float(row.get('weighted_abs_value'), 3)}"
+                    for row in feature_drivers
+                )
+            else:
+                lines.extend(
+                    f"  {index}. {str(row.get('feature'))}: value={_fmt_float(row.get('weighted_abs_value'), 3)}"
+                    for index, row in enumerate(feature_drivers, start=1)
+                )
 
     artifact = _fmt_path(summary.get("summary_path") or summary.get("output_dir"))
     weights_path = _fmt_path(summary.get("weights_path"))

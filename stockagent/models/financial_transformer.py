@@ -396,6 +396,7 @@ class FinancialTransformerModel(TransformerBasePortfolioModel):
         temperature: float | torch.Tensor | None = None,
         return_aux: bool | None = None,
         symbol_indices: torch.Tensor | None = None,
+        return_scores: bool = False,
     ):
         self._check_shapes(x, mask, symbol_indices)
         if mask is None:
@@ -416,6 +417,7 @@ class FinancialTransformerModel(TransformerBasePortfolioModel):
             mask_bool,
             temperature=temperature,
             return_aux=return_aux,
+            return_scores=return_scores,
             temporal_basis_source=raw_basis_source,
         )
         return self._attach_candle_aux(output, token_aux, return_aux)

@@ -973,6 +973,692 @@ def _forward_outputs(
     )
 
 
+_TEMPORAL_BASIS_INTERPRETATION: dict[str, tuple[str, str]] = {
+    "haar": ("piecewise level changes across coarse and local intervals", "multi-scale discontinuities"),
+    "swt_db2": ("shift-stable db2 wavelet detail patterns", "local smooth changes without decimation"),
+    "swt_sym4": ("shift-stable symmetric wavelet detail patterns", "local changes with lower phase distortion"),
+    "wavelet_packet": ("localized low/high frequency packet bands", "multi-resolution frequency bursts"),
+    "walsh": ("binary sign-switching temporal patterns", "abrupt regime and alternating blocks"),
+    "fourier": ("global sine/cosine oscillations", "periodic cycles across the full window"),
+    "dct": ("global cosine shapes ordered from slow to fast", "smooth trend and oscillation"),
+    "dpss": ("energy-concentrated band-limited sequences", "stable narrow-band variation"),
+    "local_cosine": ("cosine oscillations localized to sub-windows", "time-local cycles"),
+    "morlet": ("localized oscillatory wavelets", "transient cycles and bursts"),
+    "exponential": ("recent-history exponential decay profiles", "short-memory recency effects"),
+    "laguerre": ("orthogonal decaying-memory profiles", "multiple recency time scales"),
+    "difference": ("finite-difference filters", "slope, acceleration, and local change"),
+    "ar_innovation": ("autoregressive innovation-like filters", "unexpected moves after persistence"),
+    "bspline": ("smooth localized spline shapes", "local nonlinear trend"),
+    "legendre": ("global orthogonal polynomial shapes", "level-free trend and curvature"),
+    "chebyshev": ("edge-sensitive orthogonal polynomial shapes", "global curvature with endpoint emphasis"),
+    "learned": ("a trainable non-DC temporal dictionary", "data-adaptive residual patterns"),
+}
+
+
+def _basis_subject_model(model: nn.Module) -> nn.Module:
+    """Unwrap compile/DDP wrappers for eager-only basis diagnostics."""
+
+    return _unwrap_j_lens_model(model)
+
+
+def _basis_action_mask(mask: torch.Tensor, values: torch.Tensor) -> torch.Tensor:
+    if values.ndim == 2:
+        return mask
+    if values.ndim == 3:
+        return mask.unsqueeze(1).expand_as(values)
+    raise ValueError(
+        "Temporal-basis intervention outputs must have shape [B,S] or [B,P,S]"
+    )
+
+
+def _basis_spearman_sufficient_stats(
+    baseline: torch.Tensor,
+    alternative: torch.Tensor,
+    mask: torch.Tensor,
+) -> tuple[float, int]:
+    """Return the sum/count of per-decision Spearman correlations."""
+
+    if baseline.ndim == 2:
+        baseline_rows = baseline.unsqueeze(1)
+        alternative_rows = alternative.unsqueeze(1)
+    elif baseline.ndim == 3:
+        baseline_rows = baseline
+        alternative_rows = alternative
+    else:
+        return 0.0, 0
+    total = 0.0
+    count = 0
+    for row in range(int(baseline_rows.size(0))):
+        active = mask[row]
+        active_count = int(active.sum().item())
+        if active_count < 2:
+            continue
+        for channel in range(int(baseline_rows.size(1))):
+            left = baseline_rows[row, channel][active].float()
+            right = alternative_rows[row, channel][active].float()
+            left_order = torch.argsort(left, stable=True)
+            right_order = torch.argsort(right, stable=True)
+            left_rank = torch.empty_like(left_order, dtype=torch.float32)
+            right_rank = torch.empty_like(right_order, dtype=torch.float32)
+            rank_values = torch.arange(
+                active_count,
+                device=left.device,
+                dtype=torch.float32,
+            )
+            left_rank[left_order] = rank_values
+            right_rank[right_order] = rank_values
+            left_rank = left_rank - left_rank.mean()
+            right_rank = right_rank - right_rank.mean()
+            denom = left_rank.square().sum().sqrt() * right_rank.square().sum().sqrt()
+            if float(denom.item()) <= 0.0:
+                continue
+            total += float(((left_rank * right_rank).sum() / denom).item())
+            count += 1
+    return total, count
+
+
+def _basis_path_sufficient_stats(
+    contribution: torch.Tensor,
+    fused: torch.Tensor,
+    mask: torch.Tensor,
+) -> dict[str, float | int]:
+    active = mask.unsqueeze(-1).expand_as(contribution)
+    values = contribution[active].float()
+    count = int(values.numel())
+    if count == 0:
+        return {
+            "contribution_abs_sum": 0.0,
+            "contribution_sq_sum": 0.0,
+            "contribution_element_count": 0,
+            "alignment_cosine_sum": 0.0,
+            "alignment_cosine_count": 0,
+        }
+    path_vectors = contribution[mask].float()
+    fused_vectors = fused[mask].float()
+    dot = (path_vectors * fused_vectors).sum(dim=-1)
+    denom = path_vectors.square().sum(dim=-1).sqrt() * fused_vectors.square().sum(dim=-1).sqrt()
+    valid_cosine = denom > 1e-12
+    cosine = torch.where(valid_cosine, dot / denom.clamp_min(1e-12), torch.zeros_like(dot))
+    return {
+        "contribution_abs_sum": float(values.abs().sum().item()),
+        "contribution_sq_sum": float(values.square().sum().item()),
+        "contribution_element_count": count,
+        "alignment_cosine_sum": float(cosine[valid_cosine].sum().item()),
+        "alignment_cosine_count": int(valid_cosine.sum().item()),
+    }
+
+
+def _basis_intervention_sufficient_stats(
+    baseline_actions: torch.Tensor,
+    baseline_scores: torch.Tensor,
+    alternative_actions: torch.Tensor,
+    alternative_scores: torch.Tensor,
+    mask: torch.Tensor,
+) -> dict[str, float | int]:
+    action_mask = _basis_action_mask(mask, baseline_actions)
+    score_mask = _basis_action_mask(mask, baseline_scores)
+    action_left = baseline_actions[action_mask].float()
+    action_right = alternative_actions[action_mask].float()
+    score_left = baseline_scores[score_mask].float()
+    score_right = alternative_scores[score_mask].float()
+    action_delta = action_right - action_left
+    score_delta = score_right - score_left
+    spearman_sum, spearman_count = _basis_spearman_sufficient_stats(
+        baseline_scores,
+        alternative_scores,
+        mask,
+    )
+    return {
+        "baseline_action_abs_sum": float(action_left.abs().sum().item()),
+        "action_abs_delta_sum": float(action_delta.abs().sum().item()),
+        "action_sq_delta_sum": float(action_delta.square().sum().item()),
+        "action_delta_count": int(action_delta.numel()),
+        "action_sign_flip_sum": int(((action_left * action_right) < 0.0).sum().item()),
+        "baseline_score_abs_sum": float(score_left.abs().sum().item()),
+        "score_abs_delta_sum": float(score_delta.abs().sum().item()),
+        "score_sq_delta_sum": float(score_delta.square().sum().item()),
+        "score_delta_count": int(score_delta.numel()),
+        "score_sign_flip_sum": int(((score_left * score_right) < 0.0).sum().item()),
+        "score_spearman_sum": float(spearman_sum),
+        "score_spearman_count": int(spearman_count),
+    }
+
+
+def _finalize_temporal_basis_family_frame(frame: pl.DataFrame) -> pl.DataFrame:
+    if _is_empty_frame(frame):
+        return frame
+    frame = frame.with_columns(
+        [
+            (
+                _numeric_expr("contribution_abs_sum")
+                / _numeric_expr("contribution_element_count").clip(lower_bound=1.0)
+            ).alias("contribution_mean_abs"),
+            (
+                _numeric_expr("contribution_sq_sum")
+                / _numeric_expr("contribution_element_count").clip(lower_bound=1.0)
+            ).sqrt().alias("contribution_rms"),
+            (
+                _numeric_expr("alignment_cosine_sum")
+                / _numeric_expr("alignment_cosine_count").clip(lower_bound=1.0)
+            ).alias("alignment_cosine_mean"),
+            (
+                _numeric_expr("action_abs_delta_sum")
+                / _numeric_expr("action_delta_count").clip(lower_bound=1.0)
+            ).alias("ablation_action_mean_abs_delta"),
+            (
+                _numeric_expr("action_sq_delta_sum")
+                / _numeric_expr("action_delta_count").clip(lower_bound=1.0)
+            ).sqrt().alias("ablation_action_rms_delta"),
+            (
+                _numeric_expr("action_sign_flip_sum")
+                / _numeric_expr("action_delta_count").clip(lower_bound=1.0)
+            ).alias("ablation_action_sign_flip_fraction"),
+            (
+                _numeric_expr("action_abs_delta_sum")
+                / _numeric_expr("baseline_action_abs_sum").clip(lower_bound=1e-12)
+            ).alias("ablation_action_relative_abs_delta"),
+            (
+                _numeric_expr("score_abs_delta_sum")
+                / _numeric_expr("score_delta_count").clip(lower_bound=1.0)
+            ).alias("ablation_score_mean_abs_delta"),
+            (
+                _numeric_expr("score_sq_delta_sum")
+                / _numeric_expr("score_delta_count").clip(lower_bound=1.0)
+            ).sqrt().alias("ablation_score_rms_delta"),
+            (
+                _numeric_expr("score_sign_flip_sum")
+                / _numeric_expr("score_delta_count").clip(lower_bound=1.0)
+            ).alias("ablation_score_sign_flip_fraction"),
+            (
+                _numeric_expr("score_abs_delta_sum")
+                / _numeric_expr("baseline_score_abs_sum").clip(lower_bound=1e-12)
+            ).alias("ablation_score_relative_abs_delta"),
+            (
+                _numeric_expr("score_spearman_sum")
+                / _numeric_expr("score_spearman_count").clip(lower_bound=1.0)
+            ).alias("ablation_score_spearman"),
+            (
+                1.0
+                - (
+                    _numeric_expr("score_spearman_sum")
+                    / _numeric_expr("score_spearman_count").clip(lower_bound=1.0)
+                )
+            ).alias("ablation_score_rank_disruption"),
+        ]
+    )
+    share_denominator = float(
+        frame.filter(pl.col("path_type").is_in(["original_path", "basis_family"]))
+        .select(_numeric_expr("contribution_abs_sum").sum())
+        .item()
+        or 0.0
+    )
+    return frame.with_columns(
+        (
+            _numeric_expr("contribution_abs_sum") / max(share_denominator, 1e-12)
+        ).alias("fusion_marginal_abs_share")
+    ).sort(["path_order", "family"])
+
+
+def _finalize_temporal_basis_component_frame(frame: pl.DataFrame) -> pl.DataFrame:
+    if _is_empty_frame(frame):
+        return frame
+    return frame.with_columns(
+        [
+            (
+                _numeric_expr("coefficient_abs_sum")
+                / _numeric_expr("coefficient_count").clip(lower_bound=1.0)
+            ).alias("coefficient_mean_abs"),
+            (
+                _numeric_expr("coefficient_sq_sum")
+                / _numeric_expr("coefficient_count").clip(lower_bound=1.0)
+            ).sqrt().alias("coefficient_rms"),
+        ]
+    ).with_columns(
+        (
+            _numeric_expr("coefficient_rms")
+            * _numeric_expr("projection_weight_l2")
+        ).alias("activation_projection_scale_proxy")
+    ).sort(["family_order", "component", "feature_index"])
+
+
+def _temporal_basis_warnings(frames: Mapping[str, pl.DataFrame]) -> list[str]:
+    warnings_out: list[str] = []
+    completeness = frames.get("temporal_basis_completeness", pl.DataFrame())
+    if not _is_empty_frame(completeness):
+        row = _first_row(completeness)
+        max_error = max(
+            float(row.get("embedding_reconstruction_max_abs_error", 0.0) or 0.0),
+            float(row.get("full_forward_action_max_abs_error", 0.0) or 0.0),
+            float(row.get("full_forward_score_max_abs_error", 0.0) or 0.0),
+        )
+        if not bool(row.get("all_values_finite", False)):
+            warnings_out.append(
+                "Temporal-basis diagnostics contain non-finite values; family conclusions are invalid."
+            )
+        if max_error > 1e-3:
+            warnings_out.append(
+                "Temporal-basis reconstructed fusion does not match the full model within 1e-3; family conclusions are invalid."
+            )
+    overlap = frames.get("temporal_basis_subspace_overlap", pl.DataFrame())
+    if not _is_empty_frame(overlap) and {
+        "left_family",
+        "right_family",
+        "subspace_affinity",
+    }.issubset(overlap.columns):
+        redundant = overlap.filter(
+            (pl.col("left_family") != pl.col("right_family"))
+            & (_numeric_expr("subspace_affinity") >= 0.95)
+        )
+        if not redundant.is_empty():
+            pair_count = int(redundant.height // 2)
+            warnings_out.append(
+                f"Temporal-basis bank has {pair_count} highly overlapping family pairs (subspace affinity >= 0.95); ablation effects may be redundant."
+            )
+    family = frames.get("temporal_basis_family_diagnostics", pl.DataFrame())
+    if not _is_empty_frame(family) and {
+        "family",
+        "ablation_action_relative_abs_delta",
+        "ablation_score_spearman",
+        "score_spearman_count",
+    }.issubset(family.columns):
+        all_basis = family.filter(pl.col("family") == "all_basis_paths")
+        if not all_basis.is_empty():
+            row = _first_row(all_basis)
+            if (
+                int(row.get("score_spearman_count", 0) or 0) > 0
+                and float(row.get("ablation_action_relative_abs_delta", 0.0) or 0.0) < 1e-3
+                and float(row.get("ablation_score_spearman", 0.0) or 0.0) > 0.999
+            ):
+                warnings_out.append(
+                    "Removing all temporal-basis paths barely changes actions or score ranks in the explained window; the added basis branch appears decision-inactive."
+                )
+    return warnings_out
+
+
+def _raw_temporal_basis_diagnostics(
+    model: nn.Module,
+    x: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    feature_names: list[str],
+    full_actions: torch.Tensor,
+    full_scores: torch.Tensor,
+    progress_enabled: bool,
+) -> tuple[dict[str, pl.DataFrame], dict[str, Any], dict[str, torch.Tensor]] | None:
+    """Explain raw-feature basis paths with exact fusion and downstream ablations."""
+
+    subject = _basis_subject_model(model)
+    decompose = getattr(subject, "temporal_basis_decomposition_for_explainability", None)
+    post_forward = getattr(subject, "forward_from_stock_embeddings_explainability", None)
+    encoder = getattr(subject, "temporal_basis_feature_encoder", None)
+    if not callable(decompose) or not callable(post_forward) or encoder is None:
+        return None
+    if str(getattr(subject, "temporal_basis_input", "embedded")) != "raw_features":
+        return None
+    families = tuple(str(name) for name in getattr(encoder, "family_names", ()))
+    if not families:
+        return None
+
+    decomposition = decompose(x, mask)
+    temporal_source = decomposition["temporal_source"]
+    original = decomposition["original_contribution"]
+    bias = decomposition["bias_contribution"]
+    family_contributions = decomposition["family_contributions"]
+    family_ablated = decomposition["family_ablated"]
+    family_kernels = decomposition["family_kernels"]
+    family_projection_weights = decomposition["family_projection_weights"]
+    original_ablated = decomposition["original_ablated"]
+    all_basis_ablated = decomposition["all_basis_ablated"]
+    additive_reconstructed = decomposition["additive_reconstructed"]
+    reconstructed = decomposition["reconstructed"]
+    fused = decomposition["fused"]
+    if not all(
+        torch.is_tensor(value)
+        for value in (
+            temporal_source,
+            original,
+            bias,
+            original_ablated,
+            all_basis_ablated,
+            additive_reconstructed,
+            reconstructed,
+            fused,
+        )
+    ):
+        raise RuntimeError("Temporal-basis decomposition returned non-tensor core values")
+    if not all(
+        isinstance(value, dict)
+        for value in (
+            family_contributions,
+            family_ablated,
+            family_kernels,
+            family_projection_weights,
+        )
+    ):
+        raise RuntimeError("Temporal-basis decomposition returned invalid family maps")
+
+    baseline_output = post_forward(reconstructed, mask, return_aux=True)
+    baseline_actions, baseline_scores, downstream_aux = _normalize_model_output(baseline_output)
+    baseline_actions = torch.nan_to_num(baseline_actions, nan=0.0, posinf=0.0, neginf=0.0)
+    baseline_scores = torch.nan_to_num(baseline_scores, nan=0.0, posinf=0.0, neginf=0.0)
+
+    actual_action_mask = _basis_action_mask(mask, full_actions)
+    actual_score_mask = _basis_action_mask(mask, full_scores)
+    action_residual = (baseline_actions - full_actions)[actual_action_mask].float()
+    score_residual = (baseline_scores - full_scores)[actual_score_mask].float()
+    embedding_residual = (reconstructed - fused)[mask.unsqueeze(-1).expand_as(fused)].float()
+    additive_residual = (additive_reconstructed - fused)[
+        mask.unsqueeze(-1).expand_as(fused)
+    ].float()
+
+    projection_weight = encoder.feature_projection.weight
+    original_weight_l2 = float(projection_weight[:, : encoder.dim].float().norm().item())
+    family_rows: list[dict[str, Any]] = []
+
+    def add_path_row(
+        *,
+        family: str,
+        path_type: str,
+        path_order: int,
+        contribution: torch.Tensor,
+        projection_l2: float,
+        kernel_l2: float,
+        alternative: torch.Tensor,
+        components: int,
+    ) -> None:
+        alternative_output = post_forward(
+            alternative,
+            mask,
+            return_aux=False,
+            return_scores=True,
+        )
+        alternative_actions, alternative_scores, _ = _normalize_model_output(alternative_output)
+        meaning, scale = _TEMPORAL_BASIS_INTERPRETATION.get(
+            family,
+            ("ordinary temporal Transformer representation", "nonlinear time-domain path"),
+        )
+        family_rows.append(
+            {
+                "family": family,
+                "path_type": path_type,
+                "path_order": int(path_order),
+                "components": int(components),
+                "decomposes": meaning,
+                "timescale_bias": scale,
+                "projection_weight_l2": float(projection_l2),
+                "effective_kernel_l2": float(kernel_l2),
+                **_basis_path_sufficient_stats(contribution, fused, mask),
+                **_basis_intervention_sufficient_stats(
+                    baseline_actions,
+                    baseline_scores,
+                    alternative_actions,
+                    alternative_scores,
+                    mask,
+                ),
+            }
+        )
+
+    diagnostics_progress = tqdm(
+        total=len(families) + 2,
+        desc="Raw basis diagnostics",
+        unit="path",
+        leave=False,
+        disable=not progress_enabled,
+    )
+    add_path_row(
+        family="original_path",
+        path_type="original_path",
+        path_order=0,
+        contribution=original,
+        projection_l2=original_weight_l2,
+        kernel_l2=0.0,
+        alternative=original_ablated,
+        components=int(getattr(subject, "d_model", int(original.size(-1)))),
+    )
+    diagnostics_progress.update(1)
+
+    component_frames: list[pl.DataFrame] = []
+    kernel_frames: list[pl.DataFrame] = []
+    basis_vector_frames: list[pl.DataFrame] = []
+    total_kernel: torch.Tensor | None = None
+    actual_feature_names = (
+        list(feature_names)
+        if len(feature_names) == int(encoder.source_dim)
+        else [f"feature_{index}" for index in range(int(encoder.source_dim))]
+    )
+    feature_labels = [_feature_label(name) for name in actual_feature_names]
+    feature_groups = [_feature_group(name) for name in actual_feature_names]
+    active_coeff_mask = mask[:, None, :, None]
+
+    for family_order, family in enumerate(families, start=1):
+        contribution = family_contributions[family]
+        kernel = family_kernels[family]
+        family_weight = family_projection_weights[family]
+        if not all(torch.is_tensor(value) for value in (contribution, kernel, family_weight)):
+            raise RuntimeError(f"Temporal-basis family {family!r} returned invalid tensors")
+        total_kernel = kernel if total_kernel is None else total_kernel + kernel
+        add_path_row(
+            family=family,
+            path_type="basis_family",
+            path_order=family_order,
+            contribution=contribution,
+            projection_l2=float(family_weight.float().norm().item()),
+            kernel_l2=float(kernel.float().norm().item()),
+            alternative=family_ablated[family],
+            components=int(family_weight.size(1)),
+        )
+
+        basis = encoder._basis(family, temporal_source)
+        basis_rows = int(basis.size(0))
+        basis_steps = int(basis.size(1))
+        basis_vector_frames.append(
+            pl.DataFrame(
+                {
+                    "family": np.repeat(family, basis_rows * basis_steps),
+                    "family_order": np.repeat(family_order, basis_rows * basis_steps),
+                    "component": np.repeat(np.arange(basis_rows, dtype=np.int64), basis_steps),
+                    "lookback_index": np.tile(np.arange(basis_steps, dtype=np.int64), basis_rows),
+                    "lookback_from_end": np.tile(np.arange(basis_steps - 1, -1, -1, dtype=np.int64), basis_rows),
+                    "basis_value": basis.detach().float().cpu().numpy().reshape(-1),
+                }
+            )
+        )
+        coefficients = torch.einsum("kl,blsf->bksf", basis, temporal_source)
+        coefficient_values = coefficients.masked_fill(~active_coeff_mask, 0.0).float()
+        coefficient_abs = coefficient_values.abs().sum(dim=(0, 2))
+        coefficient_sq = coefficient_values.square().sum(dim=(0, 2))
+        coefficient_count = int(mask.sum().item())
+        component_count = int(coefficients.size(1))
+        projection_l2 = family_weight.float().square().sum(dim=0).sqrt()
+        component_frames.append(
+            pl.DataFrame(
+                {
+                    "family": np.repeat(family, component_count * len(actual_feature_names)),
+                    "family_order": np.repeat(family_order, component_count * len(actual_feature_names)),
+                    "component": np.repeat(np.arange(component_count, dtype=np.int64), len(actual_feature_names)),
+                    "feature_index": np.tile(np.arange(len(actual_feature_names), dtype=np.int64), component_count),
+                    "feature": np.tile(np.asarray(actual_feature_names, dtype=object), component_count),
+                    "feature_label": np.tile(np.asarray(feature_labels, dtype=object), component_count),
+                    "feature_group": np.tile(np.asarray(feature_groups, dtype=object), component_count),
+                    "coefficient_abs_sum": coefficient_abs.detach().cpu().numpy().reshape(-1),
+                    "coefficient_sq_sum": coefficient_sq.detach().cpu().numpy().reshape(-1),
+                    "coefficient_count": np.full(component_count * len(actual_feature_names), coefficient_count, dtype=np.int64),
+                    "projection_weight_l2": projection_l2.detach().cpu().numpy().reshape(-1),
+                }
+            )
+        )
+        del coefficients, coefficient_values, coefficient_abs, coefficient_sq
+
+        kernel_float = kernel.detach().float()
+        kernel_l2 = kernel_float.square().sum(dim=0).sqrt()
+        kernel_mean_abs = kernel_float.abs().mean(dim=0)
+        lookback = int(kernel.size(1))
+        kernel_frames.append(
+            pl.DataFrame(
+                {
+                    "family": np.repeat(family, lookback * len(actual_feature_names)),
+                    "family_order": np.repeat(family_order, lookback * len(actual_feature_names)),
+                    "lookback_index": np.repeat(np.arange(lookback, dtype=np.int64), len(actual_feature_names)),
+                    "lookback_from_end": np.repeat(np.arange(lookback - 1, -1, -1, dtype=np.int64), len(actual_feature_names)),
+                    "feature_index": np.tile(np.arange(len(actual_feature_names), dtype=np.int64), lookback),
+                    "feature": np.tile(np.asarray(actual_feature_names, dtype=object), lookback),
+                    "feature_label": np.tile(np.asarray(feature_labels, dtype=object), lookback),
+                    "feature_group": np.tile(np.asarray(feature_groups, dtype=object), lookback),
+                    "effective_kernel_l2": kernel_l2.cpu().numpy().reshape(-1),
+                    "effective_kernel_mean_abs": kernel_mean_abs.cpu().numpy().reshape(-1),
+                }
+            )
+        )
+        diagnostics_progress.update(1)
+        diagnostics_progress.set_postfix(family=family, refresh=False)
+
+    assert total_kernel is not None
+    total_kernel_float = total_kernel.detach().float()
+    total_kernel_l2 = total_kernel_float.square().sum(dim=0).sqrt()
+    total_kernel_mean_abs = total_kernel_float.abs().mean(dim=0)
+    lookback = int(total_kernel.size(1))
+    kernel_frames.append(
+        pl.DataFrame(
+            {
+                "family": np.repeat("all_basis_paths", lookback * len(actual_feature_names)),
+                "family_order": np.repeat(len(families) + 1, lookback * len(actual_feature_names)),
+                "lookback_index": np.repeat(np.arange(lookback, dtype=np.int64), len(actual_feature_names)),
+                "lookback_from_end": np.repeat(np.arange(lookback - 1, -1, -1, dtype=np.int64), len(actual_feature_names)),
+                "feature_index": np.tile(np.arange(len(actual_feature_names), dtype=np.int64), lookback),
+                "feature": np.tile(np.asarray(actual_feature_names, dtype=object), lookback),
+                "feature_label": np.tile(np.asarray(feature_labels, dtype=object), lookback),
+                "feature_group": np.tile(np.asarray(feature_groups, dtype=object), lookback),
+                "effective_kernel_l2": total_kernel_l2.cpu().numpy().reshape(-1),
+                "effective_kernel_mean_abs": total_kernel_mean_abs.cpu().numpy().reshape(-1),
+            }
+        )
+    )
+    all_basis_projection_l2 = math.sqrt(
+        sum(float(family_projection_weights[family].float().square().sum().item()) for family in families)
+    )
+    all_basis = fused - all_basis_ablated
+    add_path_row(
+        family="all_basis_paths",
+        path_type="basis_group",
+        path_order=len(families) + 1,
+        contribution=all_basis,
+        projection_l2=all_basis_projection_l2,
+        kernel_l2=float(total_kernel_float.norm().item()),
+        alternative=all_basis_ablated,
+        components=sum(int(encoder.family_component_counts[family]) for family in families),
+    )
+    diagnostics_progress.update(1)
+    diagnostics_progress.close()
+
+    overlap_rows: list[dict[str, Any]] = []
+    basis_cpu = {
+        family: encoder._basis(family, temporal_source).detach().float().cpu()
+        for family in families
+    }
+    for left_order, left_family in enumerate(families, start=1):
+        left = basis_cpu[left_family]
+        for right_order, right_family in enumerate(families, start=1):
+            right = basis_cpu[right_family]
+            cross = left @ right.transpose(0, 1)
+            singular = torch.linalg.svdvals(cross)
+            affinity = float(cross.square().sum().item()) / max(1, min(int(left.size(0)), int(right.size(0))))
+            overlap_rows.append(
+                {
+                    "left_family": left_family,
+                    "left_family_order": left_order,
+                    "right_family": right_family,
+                    "right_family_order": right_order,
+                    "subspace_affinity": affinity,
+                    "max_canonical_correlation": float(singular.max().item()) if singular.numel() else 0.0,
+                    "mean_canonical_correlation": float(singular.mean().item()) if singular.numel() else 0.0,
+                }
+            )
+
+    family_frame = _finalize_temporal_basis_family_frame(pl.DataFrame(family_rows))
+    component_frame = _finalize_temporal_basis_component_frame(_concat_frames(component_frames))
+    kernel_frame = _concat_frames(kernel_frames).sort(
+        ["family_order", "lookback_index", "feature_index"]
+    )
+    expected_component_feature_cells = sum(
+        int(encoder.family_component_counts[family]) * int(encoder.source_dim)
+        for family in families
+    )
+    basis_vector_frame = _concat_frames(basis_vector_frames).sort(
+        ["family_order", "component", "lookback_index"]
+    )
+    expected_basis_vector_cells = sum(
+        int(encoder.family_component_counts[family]) * int(encoder.lookback)
+        for family in families
+    )
+    expected_kernel_cells = (len(families) + 1) * int(encoder.lookback) * int(encoder.source_dim)
+    completeness = pl.DataFrame(
+        [
+            {
+                "basis_input": "raw_features",
+                "raw_feature_count": int(encoder.source_dim),
+                "lookback": int(encoder.lookback),
+                "expected_families": len(families),
+                "observed_families": len(families),
+                "expected_component_feature_cells": expected_component_feature_cells,
+                "observed_component_feature_cells": len(component_frame),
+                "expected_basis_vector_cells": expected_basis_vector_cells,
+                "observed_basis_vector_cells": len(basis_vector_frame),
+                "expected_effective_kernel_cells": expected_kernel_cells,
+                "observed_effective_kernel_cells": len(kernel_frame),
+                "embedding_residual_abs_sum": float(embedding_residual.abs().sum().item()),
+                "embedding_residual_sq_sum": float(embedding_residual.square().sum().item()),
+                "embedding_residual_count": int(embedding_residual.numel()),
+                "embedding_reconstruction_max_abs_error": float(embedding_residual.abs().max().item()) if embedding_residual.numel() else 0.0,
+                "additive_roundoff_residual_abs_sum": float(additive_residual.abs().sum().item()),
+                "additive_roundoff_residual_sq_sum": float(additive_residual.square().sum().item()),
+                "additive_roundoff_residual_count": int(additive_residual.numel()),
+                "additive_roundoff_max_abs_error": float(additive_residual.abs().max().item()) if additive_residual.numel() else 0.0,
+                "action_residual_abs_sum": float(action_residual.abs().sum().item()),
+                "action_residual_sq_sum": float(action_residual.square().sum().item()),
+                "action_residual_count": int(action_residual.numel()),
+                "full_forward_action_max_abs_error": float(action_residual.abs().max().item()) if action_residual.numel() else 0.0,
+                "score_residual_abs_sum": float(score_residual.abs().sum().item()),
+                "score_residual_sq_sum": float(score_residual.square().sum().item()),
+                "score_residual_count": int(score_residual.numel()),
+                "full_forward_score_max_abs_error": float(score_residual.abs().max().item()) if score_residual.numel() else 0.0,
+                "all_values_finite": bool(
+                    torch.isfinite(reconstructed).all().item()
+                    and torch.isfinite(baseline_actions).all().item()
+                    and torch.isfinite(baseline_scores).all().item()
+                ),
+            }
+        ]
+    )
+    summary = {
+        "enabled": True,
+        "input": "raw_features",
+        "families": list(families),
+        "family_count": len(families),
+        "components_total": sum(int(encoder.family_component_counts[family]) for family in families),
+        "raw_feature_count": int(encoder.source_dim),
+        "lookback": int(encoder.lookback),
+        "component_feature_cells": len(component_frame),
+        "basis_vector_cells": len(basis_vector_frame),
+        "effective_kernel_cells": len(kernel_frame),
+        "interpretation": {
+            "structural": "projection/kernel magnitude is a parameter-scale diagnostic, not causal importance",
+            "activation": "fusion marginal is full finite-precision fusion minus fusion without one path; analytical additivity is retained only as a BF16 roundoff audit",
+            "intervention": "ablation reruns the unchanged downstream stack after removing one fusion path; overlapping families make effects non-additive",
+        },
+    }
+    frames = {
+        "temporal_basis_family_diagnostics": family_frame,
+        "temporal_basis_component_feature_diagnostics": component_frame,
+        "temporal_basis_vectors": basis_vector_frame,
+        "temporal_basis_effective_kernel": kernel_frame,
+        "temporal_basis_subspace_overlap": pl.DataFrame(overlap_rows).sort(
+            ["left_family_order", "right_family_order"]
+        ),
+        "temporal_basis_completeness": completeness,
+    }
+    return frames, summary, downstream_aux
+
+
 _J_LENS_BLOCK_GROUPS = (
     "temporal_blocks",
     "cross_blocks",
@@ -1812,6 +2498,7 @@ def _perturbation_importance(
         "original_vs_matched_baseline_weight_abs_delta": 0.0,
         "original_vs_matched_baseline_score_abs_delta": 0.0,
         "embedded_fast_path": False,
+        "raw_compiled_fast_path": False,
         "compiled_forward": False,
     }
     if not all_perturbations:
@@ -1854,6 +2541,22 @@ def _perturbation_importance(
     base_weights = base_weights.detach()
     base_scores = base_scores.detach()
     embedded_api = _embedded_explainability_api(model)
+    raw_compiled_api = None
+    if embedded_api is None and compile_forward:
+        subject = _basis_subject_model(model)
+        candidate = getattr(subject, "forward_explainability_compiled", None)
+        if callable(candidate):
+            raw_compiled_api = candidate
+            diagnostics["raw_compiled_fast_path"] = True
+            diagnostics["compiled_forward"] = True
+    if raw_compiled_api is not None and x.device.type == "cuda":
+        # J-Lens and IG run immediately before perturbation and leave sizeable
+        # now-dead workspaces in the caching allocator.  Releasing only those
+        # unused blocks keeps the fixed-shape compiled raw counterfactual at a
+        # stable kernel/workspace choice across date chunks; live tensors and
+        # numerical state are untouched.
+        torch.cuda.empty_cache()
+        diagnostics["cuda_cache_cleared_before_raw_compile"] = True
     base_projected: torch.Tensor | None = None
     base_embedded: torch.Tensor | None = None
     matched_baseline_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
@@ -1918,12 +2621,16 @@ def _perturbation_importance(
                     for local_idx, (time_idx, feat_idx, _) in enumerate(work_chunk):
                         x_perturbed[local_idx, :, time_idx, :, feat_idx] = 0.0
                     x_perturbed = x_perturbed.reshape(work_repeats * int(x.size(0)), *tuple(x.shape[1:]))
-                    weights_p, scores_p, _ = _forward_outputs(
-                        model,
-                        x_perturbed,
-                        mask_perturbed,
-                        return_aux=False,
-                    )
+                    if raw_compiled_api is not None:
+                        raw_output = raw_compiled_api(x_perturbed, mask_perturbed)
+                        weights_p, scores_p, _ = _normalize_model_output(raw_output)
+                    else:
+                        weights_p, scores_p, _ = _forward_outputs(
+                            model,
+                            x_perturbed,
+                            mask_perturbed,
+                            return_aux=False,
+                        )
                 weights_p = weights_p.reshape(work_repeats, *tuple(base_weights.shape))[:repeats]
                 scores_p = scores_p.reshape(work_repeats, *tuple(base_scores.shape))[:repeats]
                 matched_baseline = matched_baseline_cache.get(work_repeats)
@@ -1942,12 +2649,24 @@ def _perturbation_importance(
                         x_base = x.detach().unsqueeze(0).expand(
                             (work_repeats,) + tuple(x.shape)
                         ).reshape(work_repeats * int(x.size(0)), *tuple(x.shape[1:]))
-                        base_weights_repeated, base_scores_repeated, _ = _forward_outputs(
-                            model,
-                            x_base,
-                            mask_perturbed,
-                            return_aux=False,
-                        )
+                        if raw_compiled_api is not None:
+                            base_output = raw_compiled_api(x_base, mask_perturbed)
+                            (
+                                base_weights_repeated,
+                                base_scores_repeated,
+                                _,
+                            ) = _normalize_model_output(base_output)
+                        else:
+                            (
+                                base_weights_repeated,
+                                base_scores_repeated,
+                                _,
+                            ) = _forward_outputs(
+                                model,
+                                x_base,
+                                mask_perturbed,
+                                return_aux=False,
+                            )
                     base_weights_repeated = base_weights_repeated.reshape(
                         work_repeats, *tuple(base_weights.shape)
                     )
@@ -3559,8 +4278,61 @@ def explain_batch(
     complete_stage("base_forward", "prepare_batch_s")
 
     stage_start = time.perf_counter()
+    temporal_basis_frames: dict[str, pl.DataFrame] = {}
+    temporal_basis_summary: dict[str, Any] = {"enabled": False}
     with torch.no_grad():
-        weights, scores, aux = _forward_outputs(model, x, mask, return_aux=True)
+        subject = _basis_subject_model(model)
+        raw_basis_enabled = bool(
+            str(getattr(subject, "temporal_basis_input", "embedded"))
+            == "raw_features"
+            and getattr(subject, "temporal_basis_feature_encoder", None) is not None
+            and callable(
+                getattr(
+                    subject,
+                    "temporal_basis_decomposition_for_explainability",
+                    None,
+                )
+            )
+        )
+        if raw_basis_enabled:
+            # Avoid materializing all 18 [B,K,S,F] coefficient tensors at
+            # once.  The dedicated path streams family summaries and obtains
+            # market-token aux tensors from the exact reconstructed fusion.
+            # Request the raw score head explicitly without ``return_aux`` so
+            # the model does not retain every [B,K,S,F] basis coefficient.
+            # Falling back to a weights-only call would compare centered
+            # long/short actions with uncentered raw scores and falsely report
+            # a constant-offset reconstruction error.
+            raw_output = subject(
+                x,
+                mask,
+                return_aux=False,
+                return_scores=True,
+            )
+            weights, scores, _ = _normalize_model_output(raw_output)
+            weights = torch.nan_to_num(
+                weights, nan=0.0, posinf=0.0, neginf=0.0
+            )
+            scores = torch.nan_to_num(
+                scores, nan=0.0, posinf=0.0, neginf=0.0
+            )
+            temporal_basis_result = _raw_temporal_basis_diagnostics(
+                model,
+                x,
+                mask,
+                feature_names=feature_names,
+                full_actions=weights,
+                full_scores=scores,
+                progress_enabled=bool(settings.progress_enabled),
+            )
+            if temporal_basis_result is None:
+                raise RuntimeError(
+                    "Raw-feature temporal bases are enabled but their strict "
+                    "explainability decomposition is unavailable."
+                )
+            temporal_basis_frames, temporal_basis_summary, aux = temporal_basis_result
+        else:
+            weights, scores, aux = _forward_outputs(model, x, mask, return_aux=True)
     selected, direction, attribution_gross_weight = _selection_from_weights(
         weights.detach(),
         mask,
@@ -3731,6 +4503,7 @@ def explain_batch(
     warnings.extend(aux_projection_warnings)
     warnings.extend(shap_warnings)
     warnings.extend(j_lens_warnings)
+    warnings.extend(_temporal_basis_warnings(temporal_basis_frames))
     trust_checks = _trust_check_frame(portfolio, grad_feature, grad_time, corr, aux_frame)
     attribution_lookback = 0
     if not _is_empty_frame(grad_ft) and "lookback_from_end" in grad_ft.columns:
@@ -3804,6 +4577,7 @@ def explain_batch(
             "umap_method": "cuml_umap",
             "aux_projection_summary": aux_projection_summary,
             "aux_projection_timing": aux_projection_timing,
+            "temporal_basis": temporal_basis_summary,
             "timing": timing,
             "warnings": warnings,
         },
@@ -3830,6 +4604,7 @@ def explain_batch(
             "trust_checks": trust_checks,
             "stock_contributions": stock_contrib,
             "aux_summary": aux_frame,
+            **temporal_basis_frames,
             **j_lens_frames,
         },
         "aux_dim_frames": aux_dim_frames,
@@ -4283,6 +5058,188 @@ def _combine_j_lens_frames_from_chunks(
     return frames, first
 
 
+def _combine_temporal_basis_frames_from_chunks(
+    chunk_results: list[tuple[dict[str, Any], int]],
+) -> tuple[dict[str, pl.DataFrame], dict[str, Any]]:
+    valid = [
+        result
+        for result, _rows in chunk_results
+        if bool(result.get("summary", {}).get("temporal_basis", {}).get("enabled", False))
+    ]
+    if not valid:
+        return {}, {"enabled": False}
+
+    family_pieces = [
+        result.get("frames", {}).get("temporal_basis_family_diagnostics", pl.DataFrame())
+        for result in valid
+    ]
+    family_pieces = [frame for frame in family_pieces if not _is_empty_frame(frame)]
+    family_frame = pl.DataFrame()
+    if family_pieces:
+        combined = _concat_frames(family_pieces)
+        sum_columns = (
+            "contribution_abs_sum",
+            "contribution_sq_sum",
+            "contribution_element_count",
+            "alignment_cosine_sum",
+            "alignment_cosine_count",
+            "baseline_action_abs_sum",
+            "action_abs_delta_sum",
+            "action_sq_delta_sum",
+            "action_delta_count",
+            "action_sign_flip_sum",
+            "baseline_score_abs_sum",
+            "score_abs_delta_sum",
+            "score_sq_delta_sum",
+            "score_delta_count",
+            "score_sign_flip_sum",
+            "score_spearman_sum",
+            "score_spearman_count",
+        )
+        structural_columns = (
+            "path_order",
+            "components",
+            "decomposes",
+            "timescale_bias",
+            "projection_weight_l2",
+            "effective_kernel_l2",
+        )
+        family_frame = combined.group_by(["family", "path_type"]).agg(
+            [
+                _numeric_expr(column).sum().alias(column)
+                for column in sum_columns
+            ]
+            + [pl.col(column).first().alias(column) for column in structural_columns]
+        )
+        family_frame = _finalize_temporal_basis_family_frame(family_frame)
+
+    component_pieces = [
+        result.get("frames", {}).get(
+            "temporal_basis_component_feature_diagnostics",
+            pl.DataFrame(),
+        )
+        for result in valid
+    ]
+    component_pieces = [frame for frame in component_pieces if not _is_empty_frame(frame)]
+    component_frame = pl.DataFrame()
+    if component_pieces:
+        combined = _concat_frames(component_pieces)
+        component_frame = combined.group_by(
+            [
+                "family",
+                "family_order",
+                "component",
+                "feature_index",
+                "feature",
+                "feature_label",
+                "feature_group",
+            ]
+        ).agg(
+            [
+                _numeric_expr("coefficient_abs_sum").sum().alias("coefficient_abs_sum"),
+                _numeric_expr("coefficient_sq_sum").sum().alias("coefficient_sq_sum"),
+                _numeric_expr("coefficient_count").sum().alias("coefficient_count"),
+                _numeric_expr("projection_weight_l2").first().alias("projection_weight_l2"),
+            ]
+        )
+        component_frame = _finalize_temporal_basis_component_frame(component_frame)
+
+    # Kernels and basis geometry are checkpoint parameters and therefore
+    # identical for every date microbatch.  Keep one complete copy rather than
+    # summing duplicate structural values.
+    first_frames = valid[0].get("frames", {})
+    basis_vector_frame = first_frames.get("temporal_basis_vectors", pl.DataFrame())
+    kernel_frame = first_frames.get("temporal_basis_effective_kernel", pl.DataFrame())
+    overlap_frame = first_frames.get("temporal_basis_subspace_overlap", pl.DataFrame())
+
+    completeness_pieces = [
+        result.get("frames", {}).get("temporal_basis_completeness", pl.DataFrame())
+        for result in valid
+    ]
+    completeness_pieces = [frame for frame in completeness_pieces if not _is_empty_frame(frame)]
+    completeness = pl.DataFrame()
+    if completeness_pieces:
+        rows = [_first_row(frame) for frame in completeness_pieces]
+        first = rows[0]
+        embedding_count = sum(int(row.get("embedding_residual_count", 0) or 0) for row in rows)
+        additive_roundoff_count = sum(
+            int(row.get("additive_roundoff_residual_count", 0) or 0)
+            for row in rows
+        )
+        action_count = sum(int(row.get("action_residual_count", 0) or 0) for row in rows)
+        score_count = sum(int(row.get("score_residual_count", 0) or 0) for row in rows)
+        completeness = pl.DataFrame(
+            [
+                {
+                    **{
+                        key: first.get(key)
+                        for key in (
+                            "basis_input",
+                            "raw_feature_count",
+                            "lookback",
+                            "expected_families",
+                            "observed_families",
+                            "expected_component_feature_cells",
+                            "observed_component_feature_cells",
+                            "expected_basis_vector_cells",
+                            "observed_basis_vector_cells",
+                            "expected_effective_kernel_cells",
+                            "observed_effective_kernel_cells",
+                        )
+                    },
+                    "embedding_residual_abs_sum": sum(float(row.get("embedding_residual_abs_sum", 0.0) or 0.0) for row in rows),
+                    "embedding_residual_sq_sum": sum(float(row.get("embedding_residual_sq_sum", 0.0) or 0.0) for row in rows),
+                    "embedding_residual_count": embedding_count,
+                    "embedding_reconstruction_max_abs_error": max(float(row.get("embedding_reconstruction_max_abs_error", 0.0) or 0.0) for row in rows),
+                    "additive_roundoff_residual_abs_sum": sum(float(row.get("additive_roundoff_residual_abs_sum", 0.0) or 0.0) for row in rows),
+                    "additive_roundoff_residual_sq_sum": sum(float(row.get("additive_roundoff_residual_sq_sum", 0.0) or 0.0) for row in rows),
+                    "additive_roundoff_residual_count": additive_roundoff_count,
+                    "additive_roundoff_max_abs_error": max(float(row.get("additive_roundoff_max_abs_error", 0.0) or 0.0) for row in rows),
+                    "action_residual_abs_sum": sum(float(row.get("action_residual_abs_sum", 0.0) or 0.0) for row in rows),
+                    "action_residual_sq_sum": sum(float(row.get("action_residual_sq_sum", 0.0) or 0.0) for row in rows),
+                    "action_residual_count": action_count,
+                    "full_forward_action_max_abs_error": max(float(row.get("full_forward_action_max_abs_error", 0.0) or 0.0) for row in rows),
+                    "score_residual_abs_sum": sum(float(row.get("score_residual_abs_sum", 0.0) or 0.0) for row in rows),
+                    "score_residual_sq_sum": sum(float(row.get("score_residual_sq_sum", 0.0) or 0.0) for row in rows),
+                    "score_residual_count": score_count,
+                    "full_forward_score_max_abs_error": max(float(row.get("full_forward_score_max_abs_error", 0.0) or 0.0) for row in rows),
+                    "all_values_finite": all(bool(row.get("all_values_finite", False)) for row in rows),
+                    "chunks_aggregated": len(rows),
+                }
+            ]
+        ).with_columns(
+            [
+                (
+                    _numeric_expr("embedding_residual_sq_sum")
+                    / _numeric_expr("embedding_residual_count").clip(lower_bound=1.0)
+                ).sqrt().alias("embedding_reconstruction_rmse"),
+                (
+                    _numeric_expr("additive_roundoff_residual_sq_sum")
+                    / _numeric_expr("additive_roundoff_residual_count").clip(lower_bound=1.0)
+                ).sqrt().alias("additive_roundoff_rmse"),
+                (
+                    _numeric_expr("action_residual_sq_sum")
+                    / _numeric_expr("action_residual_count").clip(lower_bound=1.0)
+                ).sqrt().alias("full_forward_action_rmse"),
+                (
+                    _numeric_expr("score_residual_sq_sum")
+                    / _numeric_expr("score_residual_count").clip(lower_bound=1.0)
+                ).sqrt().alias("full_forward_score_rmse"),
+            ]
+        )
+
+    summary = dict(valid[0].get("summary", {}).get("temporal_basis", {}))
+    summary["chunks_aggregated"] = len(valid)
+    return {
+        "temporal_basis_family_diagnostics": family_frame,
+        "temporal_basis_component_feature_diagnostics": component_frame,
+        "temporal_basis_vectors": basis_vector_frame,
+        "temporal_basis_effective_kernel": kernel_frame,
+        "temporal_basis_subspace_overlap": overlap_frame,
+        "temporal_basis_completeness": completeness,
+    }, summary
+
+
 def _combine_chunked_explainability_results(
     chunk_results: list[tuple[dict[str, Any], int]],
     *,
@@ -4451,6 +5408,9 @@ def _combine_chunked_explainability_results(
             aliases=aux_aliases,
         )
     )
+    temporal_basis_frames, temporal_basis_summary = (
+        _combine_temporal_basis_frames_from_chunks(chunk_results)
+    )
 
     warnings = _make_warnings(portfolio, grad_feature, grad_time, corr, aux_frame)
     warnings.append(
@@ -4458,6 +5418,7 @@ def _combine_chunked_explainability_results(
     )
     warnings.extend(shap_warnings)
     warnings.extend(aux_projection_warnings)
+    warnings.extend(_temporal_basis_warnings(temporal_basis_frames))
     for result, _ in chunk_results:
         for item in result.get("summary", {}).get("warnings", []):
             warning = str(item)
@@ -4520,6 +5481,7 @@ def _combine_chunked_explainability_results(
             "umap_method": "cuml_umap",
             "aux_projection_summary": aux_projection_summary,
             "aux_projection_timing": aux_projection_timing,
+            "temporal_basis": temporal_basis_summary,
             "row_chunking": row_chunk_diagnostics,
             "timing": timing,
             "warnings": warnings,
@@ -4547,6 +5509,7 @@ def _combine_chunked_explainability_results(
             "trust_checks": trust_checks,
             "stock_contributions": stock_contrib,
             "aux_summary": aux_frame,
+            **temporal_basis_frames,
             **j_lens_frames,
         },
         "aux_dim_frames": aux_dim_frames,
@@ -4688,6 +5651,12 @@ def _compact_explain_chunk_result(result: dict[str, Any]) -> None:
         "feature_time_integrated_gradients",
         "feature_time_perturbation",
         "aux_summary",
+        "temporal_basis_family_diagnostics",
+        "temporal_basis_component_feature_diagnostics",
+        "temporal_basis_vectors",
+        "temporal_basis_effective_kernel",
+        "temporal_basis_subspace_overlap",
+        "temporal_basis_completeness",
         "j_lens_transport",
         "j_lens_layer_summary",
         "j_lens_dimension_readout",
@@ -4851,6 +5820,7 @@ def _write_markdown_report(
             "- 歸因目標：所有可交易非零部位，依總曝險加權；不做基於排名的截斷。",
             "- 特徵與 lookback 日歸因：Gradient × Input 與 Integrated Gradients。",
             "- Perturbation 敏感度：每個特徵–日期切片歸零後的分數／權重變化。",
+            "- Raw-feature 時間基底：18 家族的完整 basis vectors、99 特徵 × 家族係數／投影尺度、精確有效 kernel、子空間重疊與逐家族下游消融。",
             "- 輔助表示：branch／latent 張量 norm 與崩塌檢查。",
             "- cuML UMAP 投影：stock embeddings、latent factors、market tokens 等 Transformer aux 張量的二維圖。",
             "- 合理性警告：集中度、曝險、換手代理、單一特徵主導與簡單特徵相關。",
@@ -4869,6 +5839,7 @@ def _write_markdown_report(
             "- `aux_projections`：高維 Transformer state 的 cuML UMAP；縮成一團、單 token 孤島或只按日期分帶都要人工檢查。",
             "- `explainability_completeness`：確認部位／總曝險覆蓋率為 100%、inventory 列數一致，且啟用方法包含 lookback × feature 格。",
             "- `exposure_coverage_curve`：使用全部標的；曲線越陡代表策略越集中。",
+            "- `temporal_basis_family_diagnostics`：projection/kernel 是結構代理量；fusion marginal 是同一有限精度融合路徑減去單一路徑後的差；ablation 會再通過下游非線性堆疊，衡量決策影響。因家族可能重疊，各效果不可直接相加。",
         ]
     )
     lines.append("")
@@ -4914,6 +5885,8 @@ def _write_markdown_report(
         "feature_correlations",
         "stock_contributions",
         "aux_summary",
+        "temporal_basis_family_diagnostics",
+        "temporal_basis_completeness",
     ):
         frame = frames.get(name)
         if _is_empty_frame(frame):
@@ -5250,6 +6223,12 @@ def _write_paper_tables(
         "feature_importance_shap",
         "shap_components",
         "aux_summary",
+        "temporal_basis_family_diagnostics",
+        "temporal_basis_component_feature_diagnostics",
+        "temporal_basis_vectors",
+        "temporal_basis_effective_kernel",
+        "temporal_basis_subspace_overlap",
+        "temporal_basis_completeness",
     ):
         tables[name] = frames.get(name, pl.DataFrame())
     completeness = tables.get("explainability_completeness", pl.DataFrame())
@@ -5663,6 +6642,260 @@ def _plot_paper_coverage_curve(
     plt.close(fig)
 
 
+def _plot_paper_temporal_basis_family_diagnostics(
+    frame: pl.DataFrame,
+    *,
+    output_path: Path,
+    subtitle: str,
+) -> None:
+    required = {
+        "family",
+        "projection_weight_l2",
+        "contribution_mean_abs",
+        "ablation_action_relative_abs_delta",
+        "ablation_score_spearman",
+    }
+    if _is_empty_frame(frame) or not required.issubset(frame.columns):
+        return
+    data = _with_numeric(
+        frame.sort("path_order"),
+        "projection_weight_l2",
+        "contribution_mean_abs",
+        "ablation_action_relative_abs_delta",
+        "ablation_score_spearman",
+    )
+    labels = _string_list(data, "family")
+    metrics = (
+        ("projection_weight_l2", "Projection L2 (structural proxy)", PAPER_TOKENS["neutral_mid"]),
+        ("contribution_mean_abs", "Mean |finite-precision fusion marginal|", PAPER_TOKENS["blue_mid"]),
+        ("ablation_action_relative_abs_delta", "Relative |action change| after path ablation", PAPER_TOKENS["orange_mid"]),
+        ("ablation_score_spearman", "Score-rank preservation after ablation", PAPER_TOKENS["olive_mid"]),
+    )
+    plt, _ = _setup_paper_plotting()
+    fig, axes = plt.subplots(2, 2, figsize=(22.0, max(12.0, 0.43 * len(labels) + 5.0)), dpi=165)
+    y = np.arange(len(labels))
+    for ax, (column, title, color) in zip(axes.flat, metrics, strict=True):
+        values = _numeric_numpy(data, column)
+        ax.barh(y, values, color=color)
+        ax.set_yticks(y)
+        ax.set_yticklabels(labels, fontsize=8)
+        ax.invert_yaxis()
+        ax.set_xlabel(column)
+        ax.set_title(title, fontsize=11)
+        ax.grid(True, axis="x", color=PAPER_TOKENS["grid"], linewidth=0.8)
+        _finish_paper_axes(ax)
+    axes[1, 1].set_xlim(-0.02, 1.02)
+    fig.suptitle(
+        "Raw-feature temporal bases: structure, realized contribution, and marginal intervention",
+        fontsize=16,
+        y=0.995,
+    )
+    fig.text(
+        0.5,
+        0.975,
+        subtitle,
+        ha="center",
+        va="top",
+        fontsize=9,
+        color=PAPER_TOKENS["muted"],
+    )
+    _safe_matplotlib_tight_layout(fig)
+    _save_matplotlib_figure(fig, output_path, pad_to_standard_aspect=False)
+    plt.close(fig)
+
+
+def _plot_paper_temporal_basis_vectors(
+    frame: pl.DataFrame,
+    *,
+    output_path: Path,
+    subtitle: str,
+) -> None:
+    required = {"family", "family_order", "component", "lookback_index", "basis_value"}
+    if _is_empty_frame(frame) or not required.issubset(frame.columns):
+        return
+    families = (
+        frame.select(["family_order", "family"])
+        .unique()
+        .sort("family_order")
+        .get_column("family")
+        .cast(pl.String)
+        .to_list()
+    )
+    if not families:
+        return
+    columns = 3
+    rows = math.ceil(len(families) / columns)
+    plt, _ = _setup_paper_plotting()
+    fig, axes = plt.subplots(
+        rows,
+        columns,
+        figsize=(22.0, max(7.0, 4.1 * rows)),
+        dpi=160,
+        squeeze=False,
+        sharex=True,
+    )
+    colors = (
+        PAPER_TOKENS["blue_dark"],
+        PAPER_TOKENS["gold_mid"],
+        PAPER_TOKENS["orange_mid"],
+        PAPER_TOKENS["olive_mid"],
+        PAPER_TOKENS["pink_mid"],
+    )
+    for ax, family in zip(axes.flat, families, strict=False):
+        family_data = frame.filter(pl.col("family") == family).sort(
+            ["component", "lookback_index"]
+        )
+        for component_data in family_data.partition_by("component", as_dict=False):
+            component = int(component_data.get_column("component").head(1).item())
+            ax.plot(
+                _numeric_numpy(component_data, "lookback_index"),
+                _numeric_numpy(component_data, "basis_value"),
+                linewidth=1.5,
+                color=colors[component % len(colors)],
+                label=f"c{component}",
+            )
+        ax.axhline(0.0, color=PAPER_TOKENS["axis"], linewidth=0.8)
+        ax.set_title(str(family), fontsize=11)
+        ax.set_xlabel("Window position (oldest to latest)")
+        ax.set_ylabel("Basis value")
+        ax.grid(True, color=PAPER_TOKENS["grid"], linewidth=0.6)
+        ax.legend(loc="best", fontsize=7, frameon=False, ncol=2)
+        _finish_paper_axes(ax)
+    for ax in list(axes.flat)[len(families) :]:
+        ax.set_visible(False)
+    fig.suptitle("Complete temporal analysis banks used on every raw feature", fontsize=16, y=0.997)
+    fig.text(0.5, 0.982, subtitle, ha="center", va="top", fontsize=9, color=PAPER_TOKENS["muted"])
+    _safe_matplotlib_tight_layout(fig)
+    _save_matplotlib_figure(fig, output_path, pad_to_standard_aspect=False)
+    plt.close(fig)
+
+
+def _plot_paper_temporal_basis_feature_scale(
+    frame: pl.DataFrame,
+    *,
+    output_path: Path,
+    subtitle: str,
+) -> None:
+    required = {
+        "family",
+        "family_order",
+        "feature",
+        "feature_label",
+        "activation_projection_scale_proxy",
+    }
+    if _is_empty_frame(frame) or not required.issubset(frame.columns):
+        return
+    data = frame.group_by(
+        ["family", "family_order", "feature", "feature_label"]
+    ).agg(
+        _numeric_expr("activation_projection_scale_proxy")
+        .pow(2)
+        .sum()
+        .sqrt()
+        .alias("family_feature_scale_proxy")
+    )
+    families = (
+        data.select(["family_order", "family"])
+        .unique()
+        .sort("family_order")
+        .get_column("family")
+        .cast(pl.String)
+        .to_list()
+    )
+    features = (
+        data.group_by(["feature", "feature_label"])
+        .agg(_numeric_expr("family_feature_scale_proxy").sum().alias("total"))
+        .sort("total", descending=True)
+        .get_column("feature_label")
+        .cast(pl.String)
+        .to_list()
+    )
+    labels, columns, matrix = _pivot_sum_matrix(
+        data,
+        index_col="feature_label",
+        column_col="family",
+        value_col="family_feature_scale_proxy",
+        index_order=features,
+        column_order=families,
+    )
+    if matrix.size == 0:
+        return
+    plt, _ = _setup_paper_plotting()
+    from matplotlib.colors import PowerNorm
+
+    fig, ax = plt.subplots(figsize=(22.0, max(12.0, 0.26 * len(labels) + 3.5)), dpi=170)
+    vmax = max(float(np.nanmax(matrix)), 1e-12)
+    image = ax.imshow(
+        matrix,
+        aspect="auto",
+        interpolation="nearest",
+        cmap="magma",
+        norm=PowerNorm(gamma=0.5, vmin=0.0, vmax=vmax),
+    )
+    ax.set_xticks(np.arange(len(columns)))
+    ax.set_xticklabels(columns, rotation=45, ha="right", fontsize=8)
+    ax.set_yticks(np.arange(len(labels)))
+    ax.set_yticklabels(labels, fontsize=7)
+    ax.set_xlabel("Temporal basis family")
+    ax.set_ylabel("All raw features")
+    fig.colorbar(image, ax=ax, fraction=0.018, pad=0.012, label="Coefficient RMS × projection L2 proxy")
+    fig.suptitle("Complete 99-feature × basis-family activation/parameter scale map", fontsize=16, y=0.997)
+    fig.text(0.5, 0.982, subtitle, ha="center", va="top", fontsize=9, color=PAPER_TOKENS["muted"])
+    _safe_matplotlib_tight_layout(fig)
+    _save_matplotlib_figure(fig, output_path, pad_to_standard_aspect=False)
+    plt.close(fig)
+
+
+def _plot_paper_temporal_basis_overlap(
+    frame: pl.DataFrame,
+    *,
+    output_path: Path,
+    subtitle: str,
+) -> None:
+    required = {
+        "left_family",
+        "left_family_order",
+        "right_family",
+        "right_family_order",
+        "subspace_affinity",
+    }
+    if _is_empty_frame(frame) or not required.issubset(frame.columns):
+        return
+    families = (
+        frame.select(["left_family_order", "left_family"])
+        .unique()
+        .sort("left_family_order")
+        .get_column("left_family")
+        .cast(pl.String)
+        .to_list()
+    )
+    labels, columns, matrix = _pivot_sum_matrix(
+        frame,
+        index_col="left_family",
+        column_col="right_family",
+        value_col="subspace_affinity",
+        index_order=families,
+        column_order=families,
+    )
+    if matrix.size == 0:
+        return
+    plt, _ = _setup_paper_plotting()
+    fig, ax = plt.subplots(figsize=(17.0, 15.0), dpi=170)
+    image = ax.imshow(matrix, aspect="equal", interpolation="nearest", cmap="viridis", vmin=0.0, vmax=1.0)
+    ax.set_xticks(np.arange(len(columns)))
+    ax.set_xticklabels(columns, rotation=45, ha="right", fontsize=8)
+    ax.set_yticks(np.arange(len(labels)))
+    ax.set_yticklabels(labels, fontsize=8)
+    ax.set_xlabel("Basis family")
+    ax.set_ylabel("Basis family")
+    fig.colorbar(image, ax=ax, fraction=0.035, pad=0.025, label="Subspace affinity (0 distinct, 1 redundant)")
+    fig.suptitle("Temporal-basis redundancy and overlap", fontsize=16, y=0.995)
+    fig.text(0.5, 0.975, subtitle, ha="center", va="top", fontsize=9, color=PAPER_TOKENS["muted"])
+    _safe_matplotlib_tight_layout(fig)
+    _save_matplotlib_figure(fig, output_path, pad_to_standard_aspect=False)
+    plt.close(fig)
+
+
 def _plot_all_paper_figures(
     output_dir: Path,
     *,
@@ -5678,7 +6911,7 @@ def _plot_all_paper_figures(
     generated: list[Path] = []
     scope = _paper_scope(metadata, summary)
     paper_progress = tqdm(
-        total=12,
+        total=17,
         desc="Paper plots",
         unit="plot",
         leave=False,
@@ -5804,6 +7037,68 @@ def _plot_all_paper_figures(
         lambda: _plot_paper_aux_summary(frames.get("aux_summary", pl.DataFrame()), output_path=out, subtitle=scope),
         out,
     )
+    out = plot_dir / "temporal_basis_family_diagnostics.png"
+    _time_plot(
+        "temporal_basis_family_diagnostics_s",
+        lambda: _plot_paper_temporal_basis_family_diagnostics(
+            frames.get("temporal_basis_family_diagnostics", pl.DataFrame()),
+            output_path=out,
+            subtitle=(
+                "Projection magnitude is structural; the fusion marginal is a faithful finite-precision path-removal difference; "
+                f"ablation is the decision-proximate marginal diagnostic. {scope}"
+            ),
+        ),
+        out,
+    )
+    out = plot_dir / "temporal_basis_vectors.png"
+    _time_plot(
+        "temporal_basis_vectors_s",
+        lambda: _plot_paper_temporal_basis_vectors(
+            frames.get("temporal_basis_vectors", pl.DataFrame()),
+            output_path=out,
+            subtitle=f"Every component and family is shown; learned is the checkpoint dictionary. {scope}",
+        ),
+        out,
+    )
+    out = plot_dir / "temporal_basis_feature_scale_heatmap.png"
+    _time_plot(
+        "temporal_basis_feature_scale_heatmap_s",
+        lambda: _plot_paper_temporal_basis_feature_scale(
+            frames.get("temporal_basis_component_feature_diagnostics", pl.DataFrame()),
+            output_path=out,
+            subtitle=(
+                "This coefficient-RMS × projection-L2 map is a complete scale proxy, not a causal ranking; "
+                f"confirm with family ablation and raw feature perturbation. {scope}"
+            ),
+        ),
+        out,
+    )
+    out = plot_dir / "temporal_basis_total_effective_kernel_heatmap.png"
+    _time_plot(
+        "temporal_basis_total_effective_kernel_heatmap_s",
+        lambda: _plot_paper_feature_time_heatmap(
+            frames.get("temporal_basis_effective_kernel", pl.DataFrame()).filter(
+                pl.col("family") == "all_basis_paths"
+            )
+            if not _is_empty_frame(frames.get("temporal_basis_effective_kernel", pl.DataFrame()))
+            else pl.DataFrame(),
+            output_path=out,
+            value_col="effective_kernel_l2",
+            title="Exact effective linear kernel from all temporal bases before nonlinear fusion",
+            subtitle=f"All 99 raw features × 32 lags; output dimensions reduced by L2 norm. {scope}",
+        ),
+        out,
+    )
+    out = plot_dir / "temporal_basis_subspace_overlap.png"
+    _time_plot(
+        "temporal_basis_subspace_overlap_s",
+        lambda: _plot_paper_temporal_basis_overlap(
+            frames.get("temporal_basis_subspace_overlap", pl.DataFrame()),
+            output_path=out,
+            subtitle=f"High off-diagonal affinity means two 4-component banks span similar temporal directions. {scope}",
+        ),
+        out,
+    )
     paper_progress.close()
     return [str(path.relative_to(output_dir)) for path in generated]
 
@@ -5868,6 +7163,31 @@ PAPER_FIGURE_GUIDE: dict[str, tuple[str, str, str]] = {
         "Checks activation magnitude for latent factors, market tokens, and transformer auxiliary tensors.",
         "Non-zero, non-dominant representations suggest tokens are being used rather than collapsed.",
         "Near-zero or single-dimension dominance suggests latent/market tokens are not absorbing meaningful market regime information.",
+    ),
+    "temporal_basis_family_diagnostics.png": (
+        "Separates parameter scale, finite-precision fusion path-removal marginals, and downstream family-ablation effects for every temporal basis path.",
+        "Use ablation action change and score-rank preservation to judge marginal use; projection norms alone are only structural proxies.",
+        "Large projection/contribution with negligible ablation suggests redundancy, while a large ablation effect that is unstable across folds suggests fragility.",
+    ),
+    "temporal_basis_vectors.png": (
+        "Draws every configured component of all temporal analysis banks, including the learned checkpoint dictionary.",
+        "Read each line as the signed weighting applied from the oldest to latest observation of every raw feature.",
+        "Nearly duplicated banks or a learned bank collapsing onto another family indicate wasted basis capacity.",
+    ),
+    "temporal_basis_feature_scale_heatmap.png": (
+        "Maps all raw features to all basis families using coefficient RMS times projection-weight L2.",
+        "Bright cells identify feature-family channels with both realized activation and a large projection scale, then require ablation/perturbation confirmation.",
+        "This proxy is not causal; isolated extreme cells may reflect feature scaling rather than useful predictive information.",
+    ),
+    "temporal_basis_total_effective_kernel_heatmap.png": (
+        "Shows the exact linear time-feature kernel obtained after contracting every basis bank with the learned fusion projection.",
+        "Rows are all raw features and columns are all lags; brightness is L2 magnitude across fusion output dimensions.",
+        "A single feature-lag cell dominating can be a shortcut, while an all-zero region means that channel is structurally unused.",
+    ),
+    "temporal_basis_subspace_overlap.png": (
+        "Measures pairwise overlap between complete temporal-basis subspaces.",
+        "Off-diagonal values near one mean two basis families span nearly the same temporal directions at the configured component count.",
+        "High overlap plus similar ablation behavior indicates redundancy and motivates a controlled retraining ablation, not immediate deletion.",
     ),
 }
 
@@ -6031,6 +7351,31 @@ FIGURE_GUIDE_ZH: dict[str, tuple[str, str, str]] = {
         "檢查 latent factors、market tokens 與其他 Transformer 輔助張量的激活幅度。",
         "多個非零且不被單一維度壟斷的表示，較像是 token 確實被模型使用。",
         "接近零或單一維度完全主導，可能表示 latent／market token 已崩塌。",
+    ),
+    "temporal_basis_family_diagnostics.png": (
+        "把每個時間基底家族的參數尺度、融合前精確貢獻與移除後的決策變化分開呈現。",
+        "判斷『有沒有用』應優先看消融後 action 變化與分數排序保留率；projection norm 只能說明結構尺度。",
+        "參數／貢獻很大但消融幾乎沒影響，通常代表與其他基底冗餘；消融很大但跨 Fold 不穩則可能脆弱。",
+    ),
+    "temporal_basis_vectors.png": (
+        "畫出 18 個時間基底家族的全部分量，包括 checkpoint 中實際學到的 learned dictionary。",
+        "每條線就是同一個原始特徵在最舊到最新 32 天被加權的形狀，可直接看它分解趨勢、週期或局部變化。",
+        "多個家族形狀幾乎重複，或 learned 完全塌到既有家族，表示基底容量可能重複。",
+    ),
+    "temporal_basis_feature_scale_heatmap.png": (
+        "以 coefficient RMS × projection L2 顯示完整 99 特徵 × 18 基底家族的激活／參數尺度。",
+        "亮格表示該特徵在該基底既常被激活又有較大投影尺度，仍需用家族消融與原始特徵 perturbation 確認。",
+        "這是尺度代理量，不是因果重要性；單一極亮格也可能只是特徵尺度異常。",
+    ),
+    "temporal_basis_total_effective_kernel_heatmap.png": (
+        "呈現所有基底與融合投影收縮後的精確線性 99 特徵 × 32 lag kernel。",
+        "列是原始特徵、欄是時間 lag，顏色為跨融合輸出維度的 L2 大小；可看模型結構上允許哪些時間形狀進入後段。",
+        "單一特徵–lag 壓倒全部可能是捷徑；大片全零代表該區域在結構上沒有被使用。",
+    ),
+    "temporal_basis_subspace_overlap.png": (
+        "衡量各基底家族 4 個分量所張成時間子空間的兩兩重疊程度。",
+        "非對角值接近 1 代表兩個家族在目前 4 分量設定下幾乎描述相同的時間方向。",
+        "高重疊且消融效果也相近表示冗餘，但仍應用重新訓練的受控 ablation 才能決定刪除。",
     ),
     "decision_inventory_exposure_by_side.png": (
         "呈現所有日期與股票的多單、空單、零部位與 masked 曝險分布。",
@@ -6209,6 +7554,11 @@ def _expected_explainability_plot_paths(
             ("regime_analysis", "regime_analysis.png", ("regime",)),
             ("decision_case_studies", "decision_case_studies.png", ("date",)),
             ("aux_summary", "aux_token_diagnostics.png", ("name", "mean_abs")),
+            ("temporal_basis_family_diagnostics", "temporal_basis_family_diagnostics.png", ("family", "ablation_action_relative_abs_delta")),
+            ("temporal_basis_vectors", "temporal_basis_vectors.png", ("family", "component", "lookback_index", "basis_value")),
+            ("temporal_basis_component_feature_diagnostics", "temporal_basis_feature_scale_heatmap.png", ("family", "feature", "activation_projection_scale_proxy")),
+            ("temporal_basis_effective_kernel", "temporal_basis_total_effective_kernel_heatmap.png", ("family", "feature", "lookback_from_end", "effective_kernel_l2")),
+            ("temporal_basis_subspace_overlap", "temporal_basis_subspace_overlap.png", ("left_family", "right_family", "subspace_affinity")),
         )
         for frame_name, filename, required in paper_specs:
             add_if(frame_name, f"plots_paper/{filename}", required)
@@ -6302,6 +7652,7 @@ def _write_comprehensive_explainability_report(
     method_agreement = _method_agreement_table(global_attribution)
     risk_diagnostic = _diagnostic_risk_table(frames.get("daily_portfolio", pl.DataFrame()))
     j_lens_completeness = frames.get("j_lens_completeness", pl.DataFrame())
+    temporal_basis_completeness = frames.get("temporal_basis_completeness", pl.DataFrame())
     omitted_visuals = _omitted_uninformative_visuals(frames)
     perturb_legacy_baseline = (
         not _is_empty_frame(frames.get("feature_time_perturbation", pl.DataFrame()))
@@ -6323,6 +7674,14 @@ def _write_comprehensive_explainability_report(
             f"- Portfolio J-Lens：狀態 `{j_lens_info.get('status', 'unknown')}`，"
             f"完整層數 `{j_lens_info.get('layers', 0)}`，hidden width `{j_lens_info.get('d_model', 'unknown')}`，"
             f"VJP passes `{j_lens_info.get('vjp_passes', 0)}`；不做 Top-K。"
+        )
+    temporal_basis_info = summary.get("temporal_basis", {})
+    if bool(temporal_basis_info.get("enabled", False)):
+        lines.append(
+            f"- Raw-feature temporal basis：`{temporal_basis_info.get('family_count', 0)}` 家族、"
+            f"`{temporal_basis_info.get('components_total', 0)}` 分量、"
+            f"`{temporal_basis_info.get('raw_feature_count', 0)}` 原始特徵、"
+            f"`{temporal_basis_info.get('lookback', 0)}` 天；完整逐家族消融，不做 Top-K。"
         )
     if failed:
         lines.append(
@@ -6405,6 +7764,12 @@ def _write_comprehensive_explainability_report(
             "",
             _render_frame_markdown(completeness, limit=None),
             "",
+            "### Raw-feature temporal-basis completeness",
+            "",
+            "下表核對每個 basis component × raw feature、basis vector 與 family × lag × feature effective-kernel cell，並驗證加總重建與完整前向一致。",
+            "",
+            _render_frame_markdown(temporal_basis_completeness, limit=None),
+            "",
             "### Portfolio J-Lens completeness",
             "",
             "下表核對完整 layer × hidden-dimension transport cells，以及日期、股票、lookback、token 與 intervention 覆蓋；不做 Top-K。",
@@ -6447,6 +7812,9 @@ def _write_comprehensive_explainability_report(
             "- 若 `score_abs_delta` 全為 0，代表目前 BF16 執行沒有可辨識的 raw-score 差，不解讀空白 score 圖。`weight_abs_delta` 只有在 `batch_matched_baseline=true` 時才可採用。",
             "- 代理 SHAP 解釋的是擬合後的 score-head surrogate，不是端到端 Transformer 的精確 Shapley 分解。",
             "- Portfolio J-Lens 使用 corpus-averaged Jacobian，把每個已執行 residual-width layer transport 到最終 `z_stock`，再投影到共享 score head；它衡量局部機制傳遞，不是輸入特徵重要性。",
+            "- 時間基底的 `projection_weight_l2`、`effective_kernel_l2` 與 coefficient-scale heatmap 都是結構／尺度診斷，不等於有預測用。",
+            "- `contribution_mean_abs` 是同一有限精度融合輸出減去單一路徑後的差；它忠實反映 BF16 實際 hot path，但不同路徑會重疊或抵銷，絕對占比不是 Shapley value。",
+            "- `ablation_action_mean_abs_delta` 與 `ablation_score_spearman` 會移除一條融合路徑後重跑完全相同的下游堆疊，是較接近『這家族有沒有被決策使用』的邊際證據；家族重疊使各消融不可相加，真正的績效增益仍需重新訓練 ablation。",
             "- J-Lens 的因果敘事必須由 `j_lens_linearization_faithfulness` 的真實 layer intervention 支持；若 cosine 低或 relative L2 error 高，只能視為局部敏感度。",
             "- 此模型的輸出 head 是共享單一純量方向，所以 J-Lens 的可讀語意是增加／降低股票 score，不等同 LLM vocabulary concept。",
             "- Aux 維度圖檢查激活使用情況；UMAP 只近似保留局部鄰域，不提供具語意的座標軸。",
@@ -6523,6 +7891,36 @@ def _cross_fold_figure_spec(relative_path: str) -> _CrossFoldFigureSpec | None:
         "portfolio_exposure_coverage_curve.png": _CrossFoldFigureSpec("paper_tables/exposure_coverage_curve.csv", ("fraction_of_tradable_names",), ("mean_cumulative_gross_exposure",), "curve"),
         "regime_analysis.png": _CrossFoldFigureSpec("regime_analysis.csv", ("dimension", "regime"), ("mean_strategy_log_return", "mean_turnover_proxy", "mean_gross_exposure", "mean_net_exposure", "hit_rate")),
         "trust_checks.png": _CrossFoldFigureSpec("trust_checks.csv", ("check",), ("value",)),
+        "temporal_basis_family_diagnostics.png": _CrossFoldFigureSpec(
+            "temporal_basis_family_diagnostics.csv",
+            ("path_type", "family"),
+            (
+                "projection_weight_l2",
+                "contribution_mean_abs",
+                "ablation_action_relative_abs_delta",
+                "ablation_score_spearman",
+            ),
+        ),
+        "temporal_basis_vectors.png": _CrossFoldFigureSpec(
+            "temporal_basis_vectors.csv",
+            ("family", "component", "lookback_from_end"),
+            ("basis_value",),
+        ),
+        "temporal_basis_feature_scale_heatmap.png": _CrossFoldFigureSpec(
+            "temporal_basis_component_feature_diagnostics.csv",
+            ("family", "component", "feature"),
+            ("activation_projection_scale_proxy",),
+        ),
+        "temporal_basis_total_effective_kernel_heatmap.png": _CrossFoldFigureSpec(
+            "temporal_basis_effective_kernel.csv",
+            ("family", "feature", "lookback_from_end"),
+            ("effective_kernel_l2",),
+        ),
+        "temporal_basis_subspace_overlap.png": _CrossFoldFigureSpec(
+            "temporal_basis_subspace_overlap.csv",
+            ("left_family", "right_family"),
+            ("subspace_affinity", "max_canonical_correlation"),
+        ),
         "j_lens_layer_transport_strength.png": _CrossFoldFigureSpec("j_lens_layer_summary.csv", ("layer",), ("frobenius_norm", "effective_rank", "score_direction_l2")),
         "j_lens_transport_matrix_heatmap.png": _CrossFoldFigureSpec("j_lens_transport.csv", ("layer", "output_dim", "input_dim"), ("jacobian",)),
         "j_lens_layer_stock_score_heatmap.png": _CrossFoldFigureSpec("j_lens_stock_readout.csv", ("layer", "symbol"), ("mean_abs", "signed_mean")),
@@ -6793,6 +8191,9 @@ def _write_all_folds_comprehensive_report(root: Path, fold_dirs: list[Path], sta
         "high_abs_net": "Long/short 絕對淨曝險偏高",
         "high_turnover": "換手率代理偏高",
         "row_microbatch": "使用 row microbatch（資訊）",
+        "basis_reconstruction": "時間基底重建／有限值失敗",
+        "basis_redundancy": "時間基底家族高度重疊",
+        "basis_inactive": "全部時間基底對決策近乎無影響",
         "no_rule_anomaly": "未觸發經驗規則異常（資訊）",
         "other": "其他警告",
     }
@@ -6804,6 +8205,9 @@ def _write_all_folds_comprehensive_report(root: Path, fold_dirs: list[Path], sta
         "high_abs_net": "High absolute net exposure",
         "high_turnover": "High turnover proxy",
         "row_microbatch": "Row microbatching (info)",
+        "basis_reconstruction": "Basis reconstruction invalid",
+        "basis_redundancy": "Highly overlapping basis families",
+        "basis_inactive": "All-basis branch decision-inactive",
         "no_rule_anomaly": "No heuristic anomaly (info)",
         "other": "Other warning",
     }
@@ -6814,6 +8218,14 @@ def _write_all_folds_comprehensive_report(root: Path, fold_dirs: list[Path], sta
             return "strong_simple_correlation"
         if text.startswith("Score-head surrogate SHAP has low R2"):
             return "low_shap_r2"
+        if text.startswith("Temporal-basis diagnostics contain non-finite") or text.startswith(
+            "Temporal-basis reconstructed fusion"
+        ):
+            return "basis_reconstruction"
+        if text.startswith("Temporal-basis bank has "):
+            return "basis_redundancy"
+        if text.startswith("Removing all temporal-basis paths barely changes"):
+            return "basis_inactive"
         if text.startswith("Some auxiliary representations are near-zero/collapsed:"):
             return "aux_collapse"
         exact = {
@@ -7226,6 +8638,9 @@ def _report_warning_zh(value: Any) -> str:
         "Explainability used row microbatching to fit the full stock universe in GPU memory; all row chunks were aggregated before global SHAP and aux UMAP output.": "為讓完整股票 universe 放入 GPU，解釋流程使用 row microbatch；所有 row chunks 都已在全域 SHAP 與 aux UMAP 輸出前完整彙總。",
         "No rule-of-thumb anomaly was triggered; inspect tables before trusting the strategy.": "沒有觸發經驗規則異常；信任策略前仍須檢查完整表格。",
         "Turnover proxy is high; strategy may be relying on unstable daily flips.": "換手代理偏高；策略可能依賴不穩定的每日方向翻轉。",
+        "Temporal-basis diagnostics contain non-finite values; family conclusions are invalid.": "時間基底診斷含非有限值；逐家族結論無效。",
+        "Temporal-basis reconstructed fusion does not match the full model within 1e-3; family conclusions are invalid.": "時間基底重建融合與完整模型誤差超過 1e-3；逐家族結論無效。",
+        "Removing all temporal-basis paths barely changes actions or score ranks in the explained window; the added basis branch appears decision-inactive.": "在解釋視窗中移除全部時間基底後，action 與分數排序幾乎不變；新增基底分支看起來未實際參與決策。",
     }
     if text in exact:
         return exact[text]
@@ -7242,6 +8657,14 @@ def _report_warning_zh(value: Any) -> str:
     if text.startswith("Some auxiliary representations are near-zero/collapsed: "):
         return "部分輔助表示接近零或已崩塌：" + text.removeprefix(
             "Some auxiliary representations are near-zero/collapsed: "
+        )
+    if text.startswith("Temporal-basis bank has "):
+        return text.replace(
+            "Temporal-basis bank has ",
+            "時間基底庫有 ",
+        ).replace(
+            " highly overlapping family pairs (subspace affinity >= 0.95); ablation effects may be redundant.",
+            " 組高度重疊家族（subspace affinity >= 0.95）；消融效果可能彼此冗餘。",
         )
     return text
 
@@ -7343,6 +8766,22 @@ def _write_paper_report(
     lines.append("")
     lines.append(_render_frame_markdown(frames.get("explainability_completeness", pl.DataFrame()), limit=30))
     lines.append("")
+    if bool(summary.get("temporal_basis", {}).get("enabled", False)):
+        lines.append("## Raw-feature 時間基底：哪些有用")
+        lines.append("")
+        lines.append(
+            "判斷順序固定為：先確認完整 forward 一致，再看逐家族下游消融；fusion marginal 用來解釋融合層的路徑尺度，projection/kernel 只用來描述結構。"
+            "基底彼此重疊，所以單一家族移除效果不可相加，也不能取代重新訓練的績效 ablation。"
+        )
+        lines.append("")
+        lines.append(_render_frame_markdown(frames.get("temporal_basis_family_diagnostics", pl.DataFrame()), limit=None))
+        lines.append("")
+        lines.append("### 基底完整性")
+        lines.append("")
+        lines.append(_render_frame_markdown(frames.get("temporal_basis_completeness", pl.DataFrame()), limit=None))
+        lines.append("")
+        lines.append("完整 component × feature、basis vectors、effective kernels 與 overlap 表保存在 `paper_tables/temporal_basis_*.csv`。")
+        lines.append("")
     lines.append("## 方法一致性")
     lines.append("")
     lines.append("以下同時保存完整特徵與 active union 的 Spearman 相關；主要解讀 active union，避免共同零值 ties 人為拉高一致性，且不是 Top-K 比較。")
@@ -7395,6 +8834,7 @@ def _write_paper_summary(
         "paper_plots": paper_plots,
         "attribution_lookback": summary.get("attribution_lookback"),
         "shap_info": summary.get("shap_info", {}),
+        "temporal_basis": summary.get("temporal_basis", {"enabled": False}),
         "warnings": summary.get("warnings", []),
     }
     path.write_text(json.dumps(_to_builtin(payload), indent=2, ensure_ascii=False), encoding="utf-8")
@@ -7480,6 +8920,69 @@ def write_fold_stability_outputs(
     plot_dir.mkdir(parents=True, exist_ok=True)
     _write_csv(combined, table_dir / "fold_feature_attribution_long.csv")
     _write_csv(summary, table_dir / "fold_feature_stability.csv")
+    basis_rows: list[pl.DataFrame] = []
+    for fold_dir in fold_dirs:
+        basis_path = fold_dir / "temporal_basis_family_diagnostics.csv"
+        if not basis_path.exists():
+            continue
+        basis_table = pl.read_csv(basis_path, infer_schema_length=None)
+        if basis_table.is_empty() or not {"family", "path_type"}.issubset(
+            basis_table.columns
+        ):
+            continue
+        fold_id = int(fold_dir.name.removeprefix("fold_").removesuffix("_test"))
+        basis_rows.append(basis_table.with_columns(pl.lit(fold_id).alias("fold_id")))
+    basis_combined = _concat_frames(basis_rows)
+    basis_stability = pl.DataFrame()
+    if not basis_combined.is_empty():
+        basis_metrics = [
+            column
+            for column in (
+                "projection_weight_l2",
+                "effective_kernel_l2",
+                "contribution_mean_abs",
+                "fusion_marginal_abs_share",
+                "ablation_action_mean_abs_delta",
+                "ablation_action_relative_abs_delta",
+                "ablation_action_sign_flip_fraction",
+                "ablation_score_mean_abs_delta",
+                "ablation_score_relative_abs_delta",
+                "ablation_score_sign_flip_fraction",
+                "ablation_score_spearman",
+            )
+            if column in basis_combined.columns
+        ]
+        basis_stability = basis_combined.group_by(
+            ["path_order", "path_type", "family"]
+        ).agg(
+            [pl.col("fold_id").n_unique().alias("folds_present")]
+            + [
+                _numeric_expr(column).mean().alias(f"mean_{column}")
+                for column in basis_metrics
+            ]
+            + [
+                _numeric_expr(column).std().alias(f"std_{column}")
+                for column in basis_metrics
+            ]
+        ).sort(["path_order", "family"])
+        _write_csv(
+            basis_combined.sort(["fold_id", "path_order", "family"]),
+            table_dir / "fold_temporal_basis_diagnostics_long.csv",
+        )
+        _write_csv(
+            basis_stability,
+            table_dir / "fold_temporal_basis_stability.csv",
+        )
+        _plot_barh(
+            basis_stability,
+            output_path=plot_dir / "fold_stability_temporal_basis_ablation.png",
+            label_col="family",
+            value_col="mean_ablation_action_relative_abs_delta",
+            title=(
+                "Complete temporal-basis marginal action effect across "
+                f"{int(basis_combined.select(pl.col('fold_id').n_unique()).item())} folds"
+            ),
+        )
     data = summary
     if not data.is_empty():
         fold_count = int(combined.select(pl.col("fold_id").n_unique()).item())
@@ -7501,6 +9004,17 @@ def write_fold_stability_outputs(
         _render_frame_markdown(summary, limit=None),
         "",
     ]
+    if not basis_stability.is_empty():
+        report.extend(
+            [
+                "## Raw-feature 時間基底跨 Fold 穩定性",
+                "",
+                "以下保留 original path、每一個 basis family 與 all-basis group；主要看平均消融 action 變化及其 Fold 間標準差，參數尺度不當作有用性的證明。",
+                "",
+                _render_frame_markdown(basis_stability, limit=None),
+                "",
+            ]
+        )
     (output_dir / "paper_fold_stability_report.md").write_text("\n".join(report), encoding="utf-8")
     _write_all_folds_comprehensive_report(root, fold_dirs, output_dir)
     return output_dir
@@ -7516,6 +9030,9 @@ _SAVED_EXPLAINABILITY_FRAME_NAMES = (
     "exposure_coverage_curve", "position_distribution", "daily_portfolio",
     "regime_analysis", "decision_case_studies", "trust_checks",
     "aux_summary", "j_lens_transport", "j_lens_layer_summary",
+    "temporal_basis_family_diagnostics", "temporal_basis_component_feature_diagnostics",
+    "temporal_basis_vectors", "temporal_basis_effective_kernel",
+    "temporal_basis_subspace_overlap", "temporal_basis_completeness",
     "j_lens_dimension_readout", "j_lens_date_readout", "j_lens_stock_readout",
     "j_lens_lookback_readout", "j_lens_token_readout", "j_lens_faithfulness",
     "j_lens_completeness",
