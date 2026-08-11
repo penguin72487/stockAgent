@@ -23,7 +23,11 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import polars as pl
 
-from stockagent.data.shioaji_capture_parts import select_capture_part_paths
+from stockagent.data.shioaji_capture_parts import (
+    read_capture_manifests,
+    select_capture_part_paths,
+    shared_capture_id,
+)
 
 
 TICK_DATASET_SCHEMA_VERSION: Final[int] = 5
@@ -1003,34 +1007,48 @@ def _load_bidask_capture_day(
     capture_root: Path,
     trading_date: date,
 ) -> tuple[pl.DataFrame, list[dict[str, Any]], dict[str, Any]]:
-    manifest_path = (
-        capture_root
-        / "manifests"
-        / f"trade_date={trading_date.isoformat()}"
-        / "worker=00.json"
+    manifests = read_capture_manifests(capture_root, trading_date.isoformat())
+    if not manifests:
+        raise ValueError(f"FOP capture manifests are missing for {trading_date}")
+    manifest_dir = (
+        capture_root / "manifests" / f"trade_date={trading_date.isoformat()}"
     )
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if manifest.get("source") != "shioaji_taifex_tick_bidask_v1":
-        raise ValueError(f"unexpected FOP capture source: {manifest_path}")
-    if manifest.get("status") != "complete":
-        raise ValueError(f"FOP capture is not complete: {manifest_path}")
-    if int(manifest.get("dropped_events", -1)) != 0:
-        raise ValueError(f"FOP capture recorded dropped events: {manifest_path}")
-    metadata = manifest.get("contract_metadata")
-    if not isinstance(metadata, list) or not metadata:
-        raise ValueError(f"FOP capture has no contract metadata: {manifest_path}")
+    for manifest in manifests:
+        if manifest.get("source") != "shioaji_taifex_tick_bidask_v1":
+            raise ValueError(f"unexpected FOP capture source: {manifest_dir}")
+        if manifest.get("status") != "complete":
+            raise ValueError(f"FOP capture is not complete: {manifest_dir}")
+        if int(manifest.get("dropped_events", -1)) != 0:
+            raise ValueError(f"FOP capture recorded dropped events: {manifest_dir}")
+    metadata = [
+        row
+        for manifest in manifests
+        for row in manifest.get("contract_metadata", [])
+        if isinstance(row, dict)
+    ]
+    if not metadata:
+        raise ValueError(f"FOP capture has no contract metadata: {manifest_dir}")
     paths = select_capture_part_paths(
         capture_root=capture_root,
         kind="book_events",
         trade_date=trading_date.isoformat(),
-        manifests=[manifest],
+        manifests=manifests,
     )
     part_hashes = {str(path): _sha256_path(path) for path in paths}
     books = pl.concat([pl.read_parquet(path) for path in paths], how="vertical_relaxed")
+    manifest_paths = sorted(manifest_dir.glob("worker=*.json"))
     evidence = {
-        "manifest_path": str(manifest_path),
-        "manifest_sha256": _sha256_path(manifest_path),
-        "capture_id": str(manifest["capture_id"]),
+        "manifest_path": str(manifest_paths[0]),
+        "manifest_sha256": _sha256_path(manifest_paths[0]),
+        "manifest_paths": [
+            str(manifest_dir / f"worker={int(item['worker_index']):02d}.json")
+            for item in manifests
+        ],
+        "manifest_sha256_by_path": {
+            str(path): _sha256_path(path)
+            for path in manifest_paths
+        },
+        "capture_id": str(shared_capture_id(manifests)),
         "book_part_sha256": part_hashes,
         "book_rows": books.height,
     }
