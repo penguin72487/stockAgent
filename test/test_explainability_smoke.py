@@ -37,10 +37,12 @@ from stockagent.explainability import (
     _feature_correlations,
     _feature_correlations_chunked,
     explain_batch,
+    explain_batch_row_chunked,
     run_loaded_model_explanation,
     write_fold_stability_outputs,
     write_explanation_outputs,
 )
+from stockagent.models.transformer_base_portfolio import TransformerBasePortfolioModel
 
 
 class _TinyResidualBlock(torch.nn.Module):
@@ -490,6 +492,120 @@ def test_explainability_smoke(tmp_path: Path) -> None:
     assert "解讀方式" in comprehensive_report
     assert "可疑訊號" in comprehensive_report
     assert "![" in comprehensive_report
+
+
+def test_raw_temporal_basis_explainability_has_complete_family_feature_and_kernel_tables(
+    tmp_path: Path,
+) -> None:
+    torch.manual_seed(17)
+    rows, lookback, symbols, features = 2, 4, 3, 3
+    model = TransformerBasePortfolioModel(
+        lookback=lookback,
+        num_features=features,
+        num_symbols=symbols,
+        d_model=8,
+        attention_mode="market_token",
+        temporal_layers=1,
+        temporal_heads=2,
+        temporal_ffn_mult=1,
+        cross_heads=2,
+        cross_ffn_mult=1,
+        num_market_tokens=2,
+        market_layers=1,
+        head_hidden_dim=8,
+        head_layers=1,
+        dropout=0.0,
+        input_dropout=0.0,
+        temporal_basis_families=("haar", "dct"),
+        temporal_basis_components=2,
+        temporal_basis_input="raw_features",
+        portfolio_output_mode="logits",
+        return_aux=False,
+        return_aux_details=False,
+    ).eval()
+    batch = {
+        "x": torch.randn(rows, lookback, symbols, features),
+        "future_log_returns": torch.randn(rows, symbols) * 0.01,
+        "tradable_mask": torch.tensor(
+            [[True, True, True], [True, True, False]],
+            dtype=torch.bool,
+        ),
+    }
+    settings = ExplainabilitySettings(
+        progress_enabled=False,
+        row_chunk_size=1,
+        ig_steps=0,
+        perturb=False,
+        shap_enabled=False,
+        j_lens_enabled=False,
+        regime_analysis=False,
+        umap_enabled=False,
+    )
+    output = explain_batch(
+        model,
+        batch,
+        feature_names=[f"f{index}" for index in range(features)],
+        symbols=[f"S{index}" for index in range(symbols)],
+        dates=["2026-04-01", "2026-04-02"],
+        settings=settings,
+        device=torch.device("cpu"),
+    )
+
+    assert output["summary"]["temporal_basis"]["enabled"] is True
+    family = output["frames"]["temporal_basis_family_diagnostics"]
+    component = output["frames"]["temporal_basis_component_feature_diagnostics"]
+    basis_vectors = output["frames"]["temporal_basis_vectors"]
+    kernel = output["frames"]["temporal_basis_effective_kernel"]
+    overlap = output["frames"]["temporal_basis_subspace_overlap"]
+    completeness = output["frames"]["temporal_basis_completeness"].row(0, named=True)
+    assert family.get_column("family").to_list() == [
+        "original_path",
+        "haar",
+        "dct",
+        "all_basis_paths",
+    ]
+    assert len(component) == 2 * 2 * features
+    assert len(basis_vectors) == 2 * 2 * lookback
+    assert len(kernel) == (2 + 1) * lookback * features
+    assert len(overlap) == 2 * 2
+    assert completeness["observed_component_feature_cells"] == 2 * 2 * features
+    assert completeness["observed_basis_vector_cells"] == 2 * 2 * lookback
+    assert completeness["observed_effective_kernel_cells"] == (2 + 1) * lookback * features
+    assert completeness["embedding_reconstruction_max_abs_error"] < 1e-5
+    assert completeness["full_forward_action_max_abs_error"] < 1e-5
+
+    chunked = explain_batch_row_chunked(
+        model,
+        batch,
+        feature_names=[f"f{index}" for index in range(features)],
+        symbols=[f"S{index}" for index in range(symbols)],
+        dates=["2026-04-01", "2026-04-02"],
+        settings=settings,
+        device=torch.device("cpu"),
+    )
+    assert chunked["summary"]["temporal_basis"]["chunks_aggregated"] == rows
+    assert len(chunked["frames"]["temporal_basis_family_diagnostics"]) == 4
+    assert len(chunked["frames"]["temporal_basis_component_feature_diagnostics"]) == 12
+
+    output_dir = tmp_path / "raw_basis_explainability"
+    write_explanation_outputs(
+        chunked,
+        output_dir,
+        metadata={"model_name": "transformer_base_portfolio", "config_lookback": lookback},
+        plot_backend="matplotlib",
+    )
+    for filename in (
+        "temporal_basis_family_diagnostics.png",
+        "temporal_basis_vectors.png",
+        "temporal_basis_feature_scale_heatmap.png",
+        "temporal_basis_total_effective_kernel_heatmap.png",
+        "temporal_basis_subspace_overlap.png",
+    ):
+        assert (output_dir / "plots_paper" / filename).exists()
+    assert (output_dir / "paper_tables" / "temporal_basis_family_diagnostics.csv").exists()
+    assert (output_dir / "paper_tables" / "temporal_basis_completeness.csv").exists()
+    summary_json = json.loads((output_dir / "summary.json").read_text(encoding="utf-8"))
+    assert summary_json["plot_validation"]["failed"] == 0
 
 
 def test_feature_correlations_zero_variance_without_runtime_warning() -> None:

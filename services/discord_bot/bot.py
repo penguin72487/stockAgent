@@ -21,6 +21,8 @@ from types import SimpleNamespace
 from typing import Any
 from zoneinfo import ZoneInfo
 
+import numpy as np
+
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -48,6 +50,11 @@ try:
     from discord.ext import tasks
 except ImportError as exc:  # pragma: no cover - runtime dependency guard
     raise SystemExit("discord.py is required. Install with: pip install discord.py>=2.4") from exc
+
+if (discord.version_info.major, discord.version_info.minor) < (2, 4):
+    raise SystemExit(
+        f"discord.py>=2.4 is required for User Install commands; found {discord.__version__}"
+    )
 
 from downloader.status import command_asset, command_option, first_download_failure
 from stockagent.live.market_config import LiveMarketConfig, load_market_configs
@@ -1189,7 +1196,15 @@ class StockAgentBot(discord.Client):
     def __init__(self) -> None:
         intents = discord.Intents.default()
         super().__init__(intents=intents)
-        self.tree = app_commands.CommandTree(self)
+        self.tree = app_commands.CommandTree(
+            self,
+            allowed_installs=app_commands.AppInstallationType(guild=True, user=True),
+            allowed_contexts=app_commands.AppCommandContext(
+                guild=True,
+                dm_channel=True,
+                private_channel=True,
+            ),
+        )
         self.tz = ZoneInfo(_env("STOCKAGENT_TZ", "Asia/Taipei") or "Asia/Taipei")
         self.signal_time = _env("STOCKAGENT_SIGNAL_TIME", "13:15") or "13:15"
         self.channel_id = _env_int("DISCORD_CHANNEL_ID")
@@ -1202,10 +1217,14 @@ class StockAgentBot(discord.Client):
         self._model_deployment_last_check: dict[str, float] = {}
         self._signal_now_background_tasks: dict[str, asyncio.Task[None]] = {}
         self._signal_now_background_waiters: dict[str, set[int]] = {}
-        self._synced_guild_id: int | None = None
 
     async def setup_hook(self) -> None:
-        await self.tree.sync()
+        synced = await self.tree.sync()
+        print(
+            f"synced {len(synced)} global app commands "
+            "installs=guild,user contexts=guild,dm,private_channel",
+            flush=True,
+        )
         scheduled_signal.start()
         daily_summary.start()
         artifact_backfill.start()
@@ -1213,16 +1232,6 @@ class StockAgentBot(discord.Client):
 
     async def on_ready(self) -> None:
         print(f"logged in as {self.user} signal_time={self.signal_time} channel_id={self.channel_id}", flush=True)
-        if self.channel_id is None or self._synced_guild_id is not None:
-            return
-        channel = bot.get_channel(self.channel_id) or await bot.fetch_channel(self.channel_id)
-        guild = getattr(channel, "guild", None)
-        if guild is None:
-            return
-        self.tree.copy_global_to(guild=guild)
-        synced = await self.tree.sync(guild=guild)
-        self._synced_guild_id = int(guild.id)
-        print(f"synced {len(synced)} app commands to guild={guild.id}", flush=True)
 
 
 bot = StockAgentBot()
@@ -1647,6 +1656,15 @@ def _refresh_summary_recent_performance_from_history(
             "start_date": history.start_date,
             "end_date": history.end_date,
         }
+        history_rows = sorted(
+            list(getattr(history, "rows", []) or []),
+            key=lambda row: _history_sort_dt(row.get("date")),
+        )
+        recent_fast.update(
+            _risk_adjusted_metrics_from_simple_returns(
+                [_float_or_none(row.get("portfolio_return")) for row in history_rows]
+            )
+        )
         if capital is not None:
             for source_key, target_key in (
                 ("strategy_return", "strategy_pnl_value"),
@@ -1688,6 +1706,46 @@ def _compound_return_values(values: list[float | None]) -> float | None:
         total *= 1.0 + number
         seen = True
     return total - 1.0 if seen else None
+
+
+def _risk_adjusted_metrics_from_simple_returns(
+    values: list[float | None],
+    *,
+    annualization_periods: int = 252,
+) -> dict[str, Any]:
+    """Match the project's canonical log-return risk metric definitions."""
+    simple = np.asarray(
+        [number for value in values if (number := _float_or_none(value)) is not None],
+        dtype=np.float64,
+    )
+    periods = max(1, int(annualization_periods))
+    if simple.size == 0:
+        return {}
+    log_returns = np.log1p(np.clip(simple, -0.999999, None))
+    average = float(log_returns.mean())
+    volatility = float(log_returns.std(ddof=0))
+    downside = np.minimum(log_returns, 0.0)
+    downside_deviation = float(np.sqrt(np.mean(np.square(downside))))
+    cumulative_log = np.cumsum(log_returns)
+    cumulative_with_initial = np.concatenate((np.zeros(1, dtype=np.float64), cumulative_log))
+    running_peak = np.maximum.accumulate(cumulative_with_initial)[1:]
+    drawdowns = np.expm1(np.clip(cumulative_log - running_peak, -745.0, 0.0))
+    max_drawdown = float(drawdowns.min(initial=0.0))
+    annualized_return = float(np.expm1(np.clip(average * periods, -745.0, 709.0)))
+    return {
+        "sharpe": float(average / volatility * math.sqrt(periods)) if volatility > 0.0 else 0.0,
+        "sortino": (
+            float(average / downside_deviation * math.sqrt(periods))
+            if downside_deviation > 0.0
+            else 0.0
+        ),
+        "max_drawdown": max_drawdown,
+        "calmar": annualized_return / abs(max_drawdown) if max_drawdown < 0.0 else 0.0,
+        "annualized_return": annualized_return,
+        "risk_observations": int(simple.size),
+        "risk_annualization_periods": periods,
+        "risk_return_basis": "net_log_return",
+    }
 
 
 def _recent_performance_from_returns(
@@ -1782,6 +1840,11 @@ def _recent_performance_from_returns(
         "start_date": str(selected[0].get("date")),
         "end_date": str(selected[-1].get("date")),
     }
+    out.update(
+        _risk_adjusted_metrics_from_simple_returns(
+            [_float_or_none(row.get("portfolio_return")) for row in selected]
+        )
+    )
     if source_paths:
         out["source_path"] = str(source_paths[0])
     if capital is not None:
@@ -2116,13 +2179,19 @@ def _discord_page_kwargs(page: str) -> dict[str, Any]:
 async def _send_paginated_response(interaction: discord.Interaction, pages: list[str]) -> None:
     clean_pages = [page if page else "(empty)" for page in pages] or ["(empty)"]
     view = PagedTextView(clean_pages) if len(clean_pages) > 1 else None
-    await interaction.followup.send(**_discord_page_kwargs(clean_pages[0]), view=view)
+    kwargs = _discord_page_kwargs(clean_pages[0])
+    if view is not None:
+        kwargs["view"] = view
+    await interaction.followup.send(**kwargs)
 
 
 async def _send_channel_pages(channel: Any, pages: list[str], *, timeout: float | None = 24 * 60 * 60) -> None:
     clean_pages = [page if page else "(empty)" for page in pages] or ["(empty)"]
     view = PagedTextView(clean_pages, timeout=timeout) if len(clean_pages) > 1 else None
-    await channel.send(**_discord_page_kwargs(clean_pages[0]), view=view)
+    kwargs = _discord_page_kwargs(clean_pages[0])
+    if view is not None:
+        kwargs["view"] = view
+    await channel.send(**kwargs)
 
 
 def _active_position_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -2150,6 +2219,7 @@ def _scheduled_detail_page_groups(
     *,
     title_prefix: str = "scheduled",
     include_decisions: bool = False,
+    positions_only: bool = False,
     max_rows: int | None = None,
     debug: bool = False,
 ) -> list[list[str]]:
@@ -2192,7 +2262,10 @@ def _scheduled_detail_page_groups(
         ),
         "delta",
     )
-    position_rows = _limit_rows(position_rows, max_rows)
+    # /signal_now day-trade positions are the complete actionable portfolio.
+    # Keep every active row and let PagedTextView expose later pages; top_n is
+    # still respected by the non-day-trade/scheduled detail templates.
+    position_rows = _limit_rows(position_rows, None if positions_only else max_rows)
     rebalance_rows = _limit_rows(rebalance_rows, max_rows)
     decision_rows = _limit_rows(decision_rows, max_rows)
 
@@ -2228,16 +2301,19 @@ def _scheduled_detail_page_groups(
             formatter=_position_line,
             page_size=20,
             header_lines=position_header,
-        ),
-        _line_pages(
-            title=f"{title_prefix} rebalance",
-            rows=rebalance_rows,
-            formatter=_rebalance_line,
-            page_size=20,
-            header_lines=rebalance_header,
-        ),
+        )
     ]
-    if include_decisions:
+    if not positions_only:
+        groups.append(
+            _line_pages(
+                title=f"{title_prefix} rebalance",
+                rows=rebalance_rows,
+                formatter=_rebalance_line,
+                page_size=20,
+                header_lines=rebalance_header,
+            )
+        )
+    if include_decisions and not positions_only:
         groups.append(
             _line_pages(
                 title=f"{title_prefix} decision explanations",
@@ -2329,11 +2405,15 @@ def _signal_now_detail_page_groups(
 ) -> list[list[str]]:
     if _normalize_signal_now_mode(mode) == "raw_scores":
         return [_raw_score_pages(cfg, result, title_prefix="raw_score_now", debug=debug)]
+    execution_mode = str(result.summary.get("execution_mode") or "").strip().lower()
+    market_id = str(result.summary.get("market") or cfg.market or "").strip().lower()
+    is_day_trade = execution_mode == "tw_day_trade" or market_id.startswith("tw_day_trade")
     return _scheduled_detail_page_groups(
         cfg,
         result,
         title_prefix="signal_now",
-        include_decisions=True,
+        include_decisions=not is_day_trade,
+        positions_only=is_day_trade,
         max_rows=top_n,
         debug=debug,
     )
@@ -3416,6 +3496,7 @@ def _guide_message() -> str:
         "`tw_cash` 現股/T+2 模式；需有相符 checkpoint 才能推論。",
         "`tw_day_trade_1m` 現股當沖（初始 100 萬）；使用獨立 fold 11 模型與資金基準。",
         "`tw_day_trade` 現股當沖（初始 1,000 萬）；訊號是當日模型目標，不是隔夜持倉。",
+        "`tw_day_trade_multi_basis` Multi-Basis 現股當沖（初始 1,000 萬）；使用 raw-feature lookback-32 fold 11。",
         "`tw_day_trade_100m` 現股當沖（初始 1 億）；使用獨立模型與資金基準。",
         "",
         "**日常看盤**",
@@ -5165,6 +5246,14 @@ class SignalReviewView(discord.ui.View):
         await self._handle(interaction, "mark_reviewed")
 
 
+@bot.tree.command(name="ask", description="詢問 Otto Suwen")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.describe(question="你的問題")
+async def ask(interaction: discord.Interaction, question: str) -> None:
+    await interaction.response.send_message(f"你的問題：{question}")
+
+
 @bot.tree.command(name="guide", description="Show the investor-friendly stockAgent command guide.")
 async def guide(interaction: discord.Interaction) -> None:
     await interaction.response.defer(thinking=True, ephemeral=True)
@@ -5602,7 +5691,7 @@ async def _handle_signal_now_command(
 @app_commands.describe(
     market="Market id",
     price_source="auto/panel/csv/yahoo/tw",
-    top_n="Rows to show, minimum 10",
+    top_n="Summary driver rows, minimum 10; day-trade positions show every active row with paging",
     min_abs_delta="Minimum absolute weight delta",
     refresh_data="Run the market pre-signal data updater before generating. Default false for fast query.",
     debug="Show signal ids, fingerprints, output folders, and artifact paths.",
@@ -6061,6 +6150,8 @@ async def portfolio_history_command(
 
 
 @bot.tree.command(name="set_market_enabled", description="Enable or disable a market in the Discord bot.")
+@app_commands.allowed_installs(guilds=True, users=False)
+@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
 @app_commands.describe(market="Market id", enabled="true/false")
 @app_commands.autocomplete(market=market_autocomplete)
 async def set_market_enabled(interaction: discord.Interaction, market: str, enabled: bool) -> None:
@@ -6076,6 +6167,8 @@ async def set_market_enabled(interaction: discord.Interaction, market: str, enab
 
 
 @bot.tree.command(name="set_schedule", description="Set a market scheduled signal time.")
+@app_commands.allowed_installs(guilds=True, users=False)
+@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
 @app_commands.describe(market="Market id", schedule_time="HH:MM in the market timezone")
 @app_commands.autocomplete(market=market_autocomplete)
 async def set_schedule(interaction: discord.Interaction, market: str, schedule_time: str) -> None:
@@ -6092,6 +6185,8 @@ async def set_schedule(interaction: discord.Interaction, market: str, schedule_t
 
 
 @bot.tree.command(name="set_capital", description="Set default capital for market amount estimates.")
+@app_commands.allowed_installs(guilds=True, users=False)
+@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
 @app_commands.describe(
     market="Market id",
     initial_capital="Fold initial capital. Use 0 to clear.",

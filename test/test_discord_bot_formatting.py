@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import sys
 from types import SimpleNamespace
 from datetime import datetime
@@ -7,6 +8,7 @@ from zoneinfo import ZoneInfo
 
 import numpy as np
 import polars as pl
+import discord
 
 from services.discord_bot.bot import (
     bot as stockagent_bot,
@@ -21,6 +23,8 @@ from services.discord_bot.bot import (
     _decision_overview_page,
     _daily_summary_message,
     _discord_page_kwargs,
+    _send_channel_pages,
+    _send_paginated_response,
     _ensure_signal_ready,
     _filter_watchlist_rows,
     _formal_history_latest_date,
@@ -51,6 +55,7 @@ from services.discord_bot.bot import (
     _remove_user_subscription,
     _replace_user_watch_symbol,
     _recent_performance_from_returns,
+    _risk_adjusted_metrics_from_simple_returns,
     _run_artifact_backfill_sync,
     _run_day_trade_settlement_backfill,
     _risk_message,
@@ -65,6 +70,7 @@ from services.discord_bot.bot import (
     _summary_age_seconds,
     _summary_has_raw_score_contract,
     _signal_kwargs,
+    _signal_now_detail_page_groups,
     _signal_sanity_issues,
     _signal_sanity_level,
     _subscription_alert_pages,
@@ -88,6 +94,49 @@ def test_portfolio_history_command_has_no_multi_period_page_size_option() -> Non
     assert "page_size" not in parameters
     assert parameters["top_changes"].min_value == 0
     assert parameters["top_changes"].max_value == 20
+
+
+def test_paginated_senders_omit_none_view_for_single_page() -> None:
+    class Recorder:
+        def __init__(self) -> None:
+            self.calls = []
+
+        async def send(self, **kwargs) -> None:
+            self.calls.append(kwargs)
+
+    async def exercise() -> tuple[Recorder, Recorder]:
+        followup = Recorder()
+        channel = Recorder()
+        interaction = SimpleNamespace(followup=followup)
+        await _send_paginated_response(interaction, ["single interaction page"])
+        await _send_channel_pages(channel, ["single channel page"])
+        return followup, channel
+
+    followup, channel = asyncio.run(exercise())
+
+    assert followup.calls == [{"content": "single interaction page", "embed": None}]
+    assert channel.calls == [{"content": "single channel page", "embed": None}]
+
+
+def test_paginated_senders_attach_view_for_multiple_pages() -> None:
+    class Recorder:
+        def __init__(self) -> None:
+            self.calls = []
+
+        async def send(self, **kwargs) -> None:
+            self.calls.append(kwargs)
+
+    async def exercise() -> Recorder:
+        followup = Recorder()
+        interaction = SimpleNamespace(followup=followup)
+        await _send_paginated_response(interaction, ["first", "second"])
+        return followup
+
+    followup = asyncio.run(exercise())
+
+    assert followup.calls[0]["content"] == "first"
+    assert followup.calls[0]["embed"] is None
+    assert isinstance(followup.calls[0]["view"], discord.ui.View)
 
 
 def test_portfolio_history_renders_exactly_one_day_per_page(monkeypatch, tmp_path) -> None:
@@ -1205,6 +1254,102 @@ def test_signal_now_detail_pages_include_actionable_decisions() -> None:
     assert "full:" in debug_pages[2][0]
 
 
+def test_signal_now_day_trade_only_includes_current_target_positions() -> None:
+    cfg = SimpleNamespace(
+        market="tw_day_trade_multi_basis",
+        min_abs_delta=0.001,
+        current_capital=10_000_000.0,
+        initial_capital=None,
+    )
+    row = {
+        "symbol": "AAA",
+        "name": "Alpha",
+        "action": "BUY",
+        "current_weight": 0.0,
+        "model_weight": 0.05,
+        "target_weight": 0.05,
+        "delta_weight": 0.05,
+        "score": 1.2,
+        "raw_score": 2.5,
+        "current_price": 10.0,
+        "trade_price": 10.0,
+        "price_return": 0.0,
+        "decision_reason": "positive_score, target_increase",
+    }
+    result = SimpleNamespace(
+        summary={
+            "market": cfg.market,
+            "execution_mode": "tw_day_trade",
+            "signal_id": "sig-test",
+            "panel_date": "2026-08-11 13:30:00",
+            "price_source": "panel_close",
+        },
+        output_dir=None,
+        weights_rows=[row],
+        rebalance_rows=[row],
+        decision_rows=[row],
+    )
+
+    groups = _signal_now_detail_page_groups(cfg, result, mode="signal", top_n=10)
+
+    assert len(groups) == 1
+    rendered = "\n".join(groups[0])
+    assert "signal_now current / target positions" in rendered
+    assert "signal_now rebalance" not in rendered
+    assert "signal_now decision explanations" not in rendered
+    assert "`AAA` Alpha **BUY**" in rendered
+
+
+def test_signal_now_day_trade_positions_keep_all_rows_and_paginate() -> None:
+    cfg = SimpleNamespace(
+        market="tw_day_trade",
+        min_abs_delta=0.001,
+        current_capital=10_000_000.0,
+        initial_capital=None,
+    )
+    rows = [
+        {
+            "symbol": f"S{index:02d}",
+            "name": f"Stock {index:02d}",
+            "action": "BUY",
+            "current_weight": 0.0,
+            "target_weight": 0.001 + index / 100_000,
+            "delta_weight": 0.001 + index / 100_000,
+            "score": float(index),
+            "raw_score": float(index),
+            "current_price": 10.0 + index,
+            "price_return": 0.0,
+        }
+        for index in range(25)
+    ]
+    result = SimpleNamespace(
+        summary={
+            "market": cfg.market,
+            "execution_mode": "tw_day_trade",
+            "signal_id": "sig-paged",
+            "panel_date": "2026-08-11 13:30:00",
+            "price_source": "panel_close",
+        },
+        output_dir=None,
+        weights_rows=rows,
+        rebalance_rows=rows,
+        decision_rows=rows,
+    )
+
+    groups = _signal_now_detail_page_groups(cfg, result, mode="signal", top_n=10)
+
+    assert len(groups) == 1
+    pages = groups[0]
+    assert len(pages) > 1
+    rendered = "\n".join(pages)
+    assert "rows 1-" in pages[0]
+    assert "/25`" in pages[0]
+    assert "`S00` Stock 00 **BUY**" in rendered
+    assert "`S24` Stock 24 **BUY**" in rendered
+    assert "signal_now rebalance" not in rendered
+    assert "signal_now decision explanations" not in rendered
+
+
 def test_raw_score_pages_show_complete_universe_without_trade_filtering() -> None:
     cfg = SimpleNamespace(market="unit")
     result = SimpleNamespace(
@@ -1585,6 +1730,19 @@ def test_recent_performance_uses_settled_history_then_contiguous_live_signal(
     assert result["end_date"] == "2026-07-30"
     assert np.isclose(result["strategy_return"], 1.01 * 1.02 * 1.03 - 1.0)
     assert np.isclose(result["benchmark_return"], 1.001 * 1.002 * 1.003 - 1.0)
+    expected = _risk_adjusted_metrics_from_simple_returns([0.01, 0.02, 0.03])
+    for key in ("sharpe", "sortino", "max_drawdown", "calmar", "annualized_return"):
+        assert np.isclose(result[key], expected[key])
+    assert result["risk_observations"] == 3
+    assert result["risk_annualization_periods"] == 252
+
+
+def test_risk_adjusted_metrics_include_initial_nav_in_drawdown() -> None:
+    metrics = _risk_adjusted_metrics_from_simple_returns([-0.10, 0.05])
+
+    assert np.isclose(metrics["max_drawdown"], -0.10)
+    assert metrics["risk_observations"] == 2
+    assert metrics["risk_return_basis"] == "net_log_return"
 
 
 def test_user_watchlist_state_add_remove_and_filter(monkeypatch, tmp_path) -> None:
