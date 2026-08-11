@@ -24,8 +24,15 @@ from services.discord_bot.bot import (
 )
 
 
-DEFAULT_MARKETS = ("tw_day_trade_1m", "tw_day_trade", "tw_day_trade_100m")
+DEFAULT_MARKETS = (
+    "tw_day_trade_1m",
+    "tw_day_trade",
+    "tw_day_trade_multi_basis",
+    "tw_day_trade_100m",
+)
 OPEN_PRICE_TOLERANCE = 1e-4
+TOP_CHANGES_AUDIT_COUNT = 20
+DISCORD_PAGE_MAX_CHARS = 4000
 
 
 def _parse_args() -> argparse.Namespace:
@@ -155,7 +162,7 @@ def audit_market(market: str) -> dict[str, Any]:
     history = _load_portfolio_history_for_market(
         cfg,
         0,
-        8,
+        TOP_CHANGES_AUDIT_COUNT,
         0.0,
         None,
         None,
@@ -206,7 +213,7 @@ def audit_market(market: str) -> dict[str, Any]:
         and one_period_per_page
         and bad_page_dates == 0
         and missing_displayed_top_changes == 0
-        and max_page_chars <= 1850
+        and max_page_chars <= DISCORD_PAGE_MAX_CHARS
         and parity.get("status") == "pass"
     )
     return {
@@ -228,10 +235,12 @@ def audit_market(market: str) -> dict[str, Any]:
         "bad_executed_history_contracts": bad_history_contracts,
         "bad_pending_open_rows": bad_pending_rows,
         "discord_pages": len(pages),
+        "top_changes_audited": TOP_CHANGES_AUDIT_COUNT,
         "one_period_per_page": one_period_per_page,
         "bad_page_dates": bad_page_dates,
         "missing_displayed_top_changes": missing_displayed_top_changes,
         "max_page_chars": max_page_chars,
+        "discord_page_max_chars": DISCORD_PAGE_MAX_CHARS,
         "return_artifact_parity": parity,
         "fold_dir": str(fold_dir),
         "holdings_path": str(holdings_path),

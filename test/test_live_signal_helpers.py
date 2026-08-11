@@ -165,10 +165,58 @@ def test_live_signal_execution_preview_is_not_presented_as_executed_holdings() -
     message = format_signal_message(summary, max_rows=10)
 
     assert "output=model_target_preview" in message
-    assert "模型目標配置 Top" in message
-    assert "模型進場方向 Top" in message
+    assert "模型目標配置 Top" not in message
+    assert "模型進場方向 Top" not in message
     assert "目標持倉 Top" not in message
     assert "上個交易日到現在" not in message
+
+
+def test_live_signal_day_trade_uses_compact_driver_template() -> None:
+    summary = {
+        "market_label": "台股・Multi-Basis 當沖（初始 1,000 萬）",
+        "market": "tw_day_trade_multi_basis",
+        "asof_date": "2026-08-11 16:40:37",
+        "panel_date": "2026-08-11 13:30:00",
+        # Day-trade market IDs are target previews even when an older artifact
+        # did not persist the execution-mode convenience fields.
+        "execution_preview_only": False,
+        "turnover": 0.2131,
+        "target_risk": {
+            "gross": 0.2131,
+            "long_gross": 0.0506,
+            "short_gross": 0.1626,
+            "top_abs_weight": 0.0646,
+            "hhi": 0.226,
+        },
+        "top_positions": [{"symbol": "TOP_REPEAT", "weight": 0.0646, "current_price": 10.0}],
+        "rebalance": [{"symbol": "REBALANCE_REPEAT", "delta_weight": 0.0646}],
+        "model_explanation": {
+            "confidence_proxy_score_std": 0.037,
+            "top_score_drivers": [
+                {"symbol": f"S{index}", "raw_score": -index / 10}
+                for index in range(1, 7)
+            ],
+            "top_feature_drivers": [
+                {"feature": f"feature_{index}", "weighted_abs_value": float(index)}
+                for index in range(1, 7)
+            ],
+        },
+    }
+
+    message = format_signal_message(summary, max_rows=10)
+
+    assert "output=model_target_preview" in message
+    assert "模型摘要" not in message
+    assert "confidence_proxy" not in message
+    assert "TOP_REPEAT" not in message
+    assert "REBALANCE_REPEAT" not in message
+    assert "  S1: raw_score=-0.100" in message
+    assert "  S5: raw_score=-0.500" in message
+    assert "S6" not in message
+    assert "  feature_1: value=1.000" in message
+    assert "  feature_5: value=5.000" in message
+    assert "feature_6" not in message
+    assert INVESTMENT_WARNING in message
 
 
 def test_live_signal_execution_preview_displays_missing_constraint_notice() -> None:
@@ -1422,6 +1470,12 @@ def test_format_signal_message_shows_period_and_recent_baseline_pnl() -> None:
             "strategy_pnl_value": 8_000.0,
             "benchmark_pnl_value": 3_000.0,
             "excess_pnl_value": 5_000.0,
+            "sharpe": 1.234,
+            "sortino": 1.567,
+            "max_drawdown": -0.0456,
+            "calmar": 2.345,
+            "risk_observations": 32,
+            "risk_annualization_periods": 252,
         },
     }
 
@@ -1439,6 +1493,12 @@ def test_format_signal_message_shows_period_and_recent_baseline_pnl() -> None:
     assert "`strategy=+8.00%`" in message
     assert "`baseline=+3.00%`" in message
     assert "`excess_pnl=+5,000`" in message
+    assert "`Sharpe=1.23`" in message
+    assert "`Sortino=1.57`" in message
+    assert "`MDD=-4.56%`" in message
+    assert "`Calmar=2.35`" in message
+    assert "`risk_basis=net_daily/ann252`" in message
+    assert "`n=32`" in message
 
 
 def test_format_signal_message_shows_day_trade_feature_cutoff() -> None:
