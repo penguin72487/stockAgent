@@ -146,6 +146,7 @@ def test_repo_tw_modes_have_independent_market_and_artifact_routes() -> None:
         "tw_cash",
         "tw_day_trade_1m",
         "tw_day_trade",
+        "tw_day_trade_multi_basis",
         "tw_day_trade_100m",
     }.issubset(configs)
     naive = configs["tw"]
@@ -179,9 +180,24 @@ def test_repo_tw_modes_have_independent_market_and_artifact_routes() -> None:
     assert day_trade_100m.checkpoint_path == (
         "artifacts/markets/tw_day_trade_100m/fold_11/checkpoint_best.pt"
     )
+    multi_basis = configs["tw_day_trade_multi_basis"]
+    multi_basis_root = (
+        "artifacts/markets/"
+        "tw_public_candles_multi_basis_online_complete_raw_feature_input_lookback32_v5"
+    )
+    assert multi_basis.fold_id == 11
+    assert multi_basis.initial_capital == 10_000_000.0
+    assert multi_basis.config_path == (
+        "configs/markets/tw_public_multi_basis_online_complete.yaml"
+    )
+    assert multi_basis.output_dir == multi_basis_root
+    assert multi_basis.checkpoint_path == (
+        f"{multi_basis_root}/fold_11/checkpoint_best.pt"
+    )
     assert (
         day_trade_1m.live_output_dir
         == day_trade.live_output_dir
+        == multi_basis.live_output_dir
         == day_trade_100m.live_output_dir
         == "artifacts/live_signals"
     )

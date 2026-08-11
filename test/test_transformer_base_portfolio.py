@@ -330,6 +330,56 @@ def test_raw_feature_basis_fused_projection_matches_explicit_coefficients() -> N
     assert torch.isfinite(encoder.learned_basis.grad).all()
 
 
+def test_raw_feature_basis_explainability_decomposition_is_exact() -> None:
+    device = _device()
+    model = _make_model(
+        lookback=8,
+        attention_mode="market_token",
+        temporal_basis_families=("haar", "dct", "learned"),
+        temporal_basis_components=2,
+        temporal_basis_input="raw_features",
+        portfolio_output_mode="logits",
+        return_aux=False,
+        return_aux_details=False,
+    ).eval()
+    x = torch.randn(2, 8, 7, 11, device=device)
+    mask = torch.ones(2, 7, dtype=torch.bool, device=device)
+    mask[1, -2:] = False
+
+    with torch.no_grad():
+        decomposition = model.temporal_basis_decomposition_for_explainability(
+            x,
+            mask,
+        )
+        reconstructed = decomposition["reconstructed"]
+        fused = decomposition["fused"]
+        assert torch.is_tensor(reconstructed)
+        assert torch.is_tensor(fused)
+        torch.testing.assert_close(reconstructed, fused, rtol=1e-5, atol=2e-6)
+
+        original = decomposition["original_contribution"]
+        bias = decomposition["bias_contribution"]
+        family_contributions = decomposition["family_contributions"]
+        assert torch.is_tensor(original)
+        assert torch.is_tensor(bias)
+        assert isinstance(family_contributions, dict)
+        explicit = original + bias
+        for contribution in family_contributions.values():
+            explicit = explicit + contribution
+        torch.testing.assert_close(explicit, fused, rtol=1e-5, atol=2e-6)
+
+        reused_weights, reused_scores = model.forward_from_stock_embeddings_explainability(
+            reconstructed,
+            mask,
+            return_aux=False,
+            return_scores=True,
+        )
+        direct_weights, direct_scores, _aux = model(x, mask, return_aux=True)
+        torch.testing.assert_close(reused_weights, direct_weights, rtol=1e-5, atol=2e-6)
+        torch.testing.assert_close(reused_scores, direct_scores, rtol=1e-5, atol=2e-6)
+        assert reused_weights[1, -2:].abs().max().item() == 0.0
+
+
 def test_online_complete_temporal_basis_forward_and_learned_dictionary_grad() -> None:
     device = _device()
     model = _make_model(
