@@ -43,6 +43,7 @@ from services.discord_bot.bot import (
     _portfolio_history_header_lines,
     _portfolio_history_block,
     _portfolio_history_pages,
+    _preopen_prepare_key,
     _validate_day_trade_portfolio_history_result,
     _prepare_realtime_signal_sync,
     _include_live_signals_in_portfolio_history,
@@ -52,6 +53,9 @@ from services.discord_bot.bot import (
     _rebalance_line,
     _remove_user_watch_symbol,
     _resolve_pre_signal_command,
+    _recent_pre_signal_failure,
+    _remember_pre_signal_failure,
+    _remember_pre_signal_success,
     _remove_user_subscription,
     _replace_user_watch_symbol,
     _recent_performance_from_returns,
@@ -84,6 +88,7 @@ from services.discord_bot.bot import (
     _watch_delay_seconds,
     _watch_poll_seconds,
     _wait_for_existing_tw_data_update,
+    _tw_data_layer_lock_path,
 )
 
 
@@ -335,6 +340,30 @@ def test_artifact_backfill_key_uses_backfill_time_and_skips_interval_markets(mon
     )
     assert _artifact_backfill_key(daily_cfg, now.replace(hour=17, minute=59)) is None
     assert _artifact_backfill_key(interval_cfg, now) is None
+
+
+def test_preopen_prepare_key_requires_explicit_window() -> None:
+    now = datetime(2026, 7, 6, 8, 30, tzinfo=ZoneInfo("Asia/Taipei"))
+    configured = SimpleNamespace(
+        market="tw_day_trade",
+        preopen_prepare_time="08:30",
+        open_time="09:00",
+        schedule_interval_minutes=None,
+        holidays=(),
+    )
+    generic = SimpleNamespace(
+        market="tw",
+        preopen_prepare_time=None,
+        open_time="09:00",
+        schedule_interval_minutes=None,
+        holidays=(),
+    )
+
+    assert _preopen_prepare_key(configured, now) == (
+        "2026-07-06:tw_day_trade:preopen"
+    )
+    assert _preopen_prepare_key(configured, now.replace(hour=9)) is None
+    assert _preopen_prepare_key(generic, now) is None
 
 
 def test_artifact_backfill_key_catches_up_previous_session_after_midnight(
@@ -651,7 +680,7 @@ def test_prepare_realtime_signal_does_not_run_daily_updater_just_because_market_
 
     source, resolved_status, refreshed = _prepare_realtime_signal_sync(cfg, requested_price_source="auto", force_refresh=False)
 
-    assert source == "tw"
+    assert source == "shioaji"
     assert resolved_status is status
     assert not refreshed
     assert calls == []
@@ -698,6 +727,42 @@ def test_tw_pre_signal_waits_for_existing_data_update(monkeypatch, tmp_path) -> 
     finally:
         holder.close()
     assert sleeps == [1.0]
+
+
+def test_tw_snapshot_refresh_uses_the_outer_shared_lock(tmp_path) -> None:
+    live_root = tmp_path / "live" / "data_tw_public"
+    command = [
+        "python",
+        "scripts/refresh_tw_public_live_snapshot.py",
+        "--live-root",
+        str(live_root),
+    ]
+
+    assert _tw_data_layer_lock_path(command) == (
+        live_root.parent / ".locks" / "tw-public-refresh.lock"
+    )
+
+
+def test_pre_signal_failure_cache_is_shared_and_success_clears_it(monkeypatch) -> None:
+    from services.discord_bot import bot as discord_bot
+
+    clock = {"now": 100.0}
+    command = ["python", "scripts/refresh_tw_public_live_snapshot.py"]
+    monkeypatch.setattr(discord_bot.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setenv("STOCKAGENT_PRE_SIGNAL_FAILURE_TTL_SECONDS", "900")
+    discord_bot._PRE_SIGNAL_FAILURE_AT.clear()
+    discord_bot._PRE_SIGNAL_SUCCESS_AT.clear()
+
+    _remember_pre_signal_failure(command, "shared publication lag")
+    assert _recent_pre_signal_failure(command) == "shared publication lag"
+
+    clock["now"] = 1001.0
+    assert _recent_pre_signal_failure(command) is None
+
+    clock["now"] = 1100.0
+    _remember_pre_signal_failure(command, "stale failure")
+    _remember_pre_signal_success(command)
+    assert _recent_pre_signal_failure(command) is None
 
 
 def test_can_reuse_latest_signal_now_for_closed_fresh_panel_close() -> None:
@@ -821,19 +886,19 @@ def test_can_reuse_latest_signal_now_rejects_closed_tw_panel_when_today_panel_mi
     reusable, _ = _can_reuse_latest_signal_now(cfg, status, panel_summary, requested_price_source="auto")
     assert not reusable
 
-    mis_summary = {
+    shioaji_summary = {
         "asof_date": "2026-07-09 14:35:00",
         "panel_date": "2000-01-01",
-        "price_source": "twse_tpex:mis",
+        "price_source": "shioaji:stock_snapshot",
         "price_available_count": 2000,
     }
     monkeypatch.setattr("services.discord_bot.bot._summary_age_seconds", lambda summary, cfg: 30.0)
     monkeypatch.setenv("STOCKAGENT_SIGNAL_NOW_OPEN_CACHE_SECONDS", "60")
 
-    reusable, reason = _can_reuse_latest_signal_now(cfg, status, mis_summary, requested_price_source="auto")
+    reusable, reason = _can_reuse_latest_signal_now(cfg, status, shioaji_summary, requested_price_source="auto")
 
     assert reusable
-    assert reason == "cached_tw_after_close_age=30s"
+    assert reason == "cached_shioaji_after_close_age=30s"
 
 
 def test_can_reuse_latest_signal_now_for_recent_open_panel_market(monkeypatch) -> None:
@@ -955,12 +1020,12 @@ def test_signal_now_refreshes_automatically_when_data_is_stale() -> None:
     assert _signal_now_should_refresh_data(stale, refresh_data=False)
 
 
-def test_auto_signal_price_source_uses_tw_mis_for_open_taiwan_market() -> None:
+def test_auto_signal_price_source_uses_shioaji_for_open_taiwan_market() -> None:
     status = SimpleNamespace(market_open=True)
     cfg = SimpleNamespace(market_type="tw", history_frequency="daily", pre_signal_command=["download"])
 
-    assert _auto_signal_price_source(cfg, status, "auto") == "tw"
-    assert _auto_signal_price_source(cfg, status, None) == "tw"
+    assert _auto_signal_price_source(cfg, status, "auto") == "shioaji"
+    assert _auto_signal_price_source(cfg, status, None) == "shioaji"
 
 
 def test_auto_signal_price_source_uses_yahoo_for_other_open_stock_markets() -> None:
@@ -999,7 +1064,7 @@ def test_auto_signal_price_source_respects_explicit_and_closed_market_defaults()
     assert _auto_signal_price_source(cfg, open_status, "panel") == "panel"
     assert _auto_signal_price_source(cfg, open_status, "yahoo") == "yahoo"
     assert _auto_signal_price_source(cfg, closed_fresh_status, "auto") is None
-    assert _auto_signal_price_source(cfg, closed_lagging_after_open_status, "auto") == "tw"
+    assert _auto_signal_price_source(cfg, closed_lagging_after_open_status, "auto") == "shioaji"
 
 
 def test_console_progress_prints_backend_progress_bar(capsys) -> None:

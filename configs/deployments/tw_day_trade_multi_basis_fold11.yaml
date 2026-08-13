@@ -1,0 +1,15 @@
+base_config: ../markets/tw_public_multi_basis_online_complete.yaml
+
+# Immutable inference contract for the completed fold-11 artifact.  The active
+# market experiment now uses temporal_basis_input=input_features in a separate
+# output root, while this checkpoint was trained with the post-temporal
+# raw-feature basis branch and must keep that exact semantic fingerprint.
+experiment_name: tw-public-financial-transformer-multi-basis-online-complete-raw-feature-input-lookback32-v5-deployment
+
+runner:
+  output_dir: artifacts/markets/tw_public_candles_multi_basis_online_complete_raw_feature_input_lookback32_v5
+  resume: false
+
+training:
+  transformer_base_portfolio:
+    temporal_basis_input: raw_features

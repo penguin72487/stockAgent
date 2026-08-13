@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+from datetime import date
 from pathlib import Path
 import zipfile
 
@@ -14,6 +15,7 @@ from stockagent.data.tw_index_futures import (
 from stockagent.data.tw_index_options_daily import (
     build_taifex_monthly_atm_straddles,
     build_taifex_weekly_atm_straddles,
+    iter_taifex_option_daily_rows,
     load_taifex_monthly_atm_straddles,
     load_taifex_weekly_atm_straddles,
 )
@@ -345,3 +347,28 @@ def test_weekly_selects_friday_before_later_wednesday(tmp_path: Path) -> None:
     selected = frame.loc[frame["date"].astype(str) == "2025-01-02"].iloc[0]
     assert selected["option_series"] == "202501F1"
     assert selected["strike"] == 20200
+
+
+def test_surface_iterator_reads_monthly_and_weekly_in_one_parser_pass(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "surface.csv"
+    rows = [
+        _option_row("2025/01/02", "202501", 20200, "買權", 100, 110),
+        _option_row("2025/01/02", "202501", 20200, "賣權", 90, 80),
+        _option_row("2025/01/02", "202501W1", 20200, "買權", 50, 60),
+        _option_row("2025/01/02", "202501W1", 20200, "賣權", 40, 30),
+        _option_row("2025/01/03", "202501W1", 20300, "買權", 45, 55),
+    ]
+    _write(source, _OPTION_HEADER, rows)
+
+    selected = list(
+        iter_taifex_option_daily_rows(
+            [source],
+            trading_dates={date(2025, 1, 2)},
+        )
+    )
+
+    assert len(selected) == 4
+    assert {row["series_scope"] for row in selected} == {"monthly", "weekly"}
+    assert {row["option_series"] for row in selected} == {"202501", "202501W1"}

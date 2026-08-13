@@ -32,59 +32,40 @@ def test_discord_crypto_market_uses_15m_incremental_updater() -> None:
 
 def test_discord_tw_market_uses_canonical_official_data_layer() -> None:
     cfg = load_market_config("services/discord_bot/markets/tw.yaml")
-    command = " ".join(cfg.pre_signal_command)
-
-    assert "downloader/download_tw_official_data.py" in command
-    assert "--mode daily" in command
-    assert "--public-dir data_tw_public" in command
-    assert "--stock-root data_tw_public/stocks" in command
-    assert "--ohlcv-fallback yahoo" in command
-    assert "--fallback-start-date 2000-01-01" in command
-    assert "audit_ohlcv_data.py" not in command
+    assert cfg.pre_signal_command == (
+        "{python}",
+        "scripts/refresh_tw_public_live_snapshot.py",
+        "--config",
+        "configs/markets/tw_day_trade_10m.yaml",
+    )
 
 
 def test_discord_tw_day_trade_uses_its_point_in_time_data_contract() -> None:
     cfg = load_market_config("services/discord_bot/markets/tw_day_trade.yaml")
-    command = " ".join(cfg.pre_signal_command)
-
-    assert "downloader/download_tw_official_data.py" in command
-    assert "--config configs/markets/tw_day_trade_10m.yaml" in command
-    assert "--public-dir data_tw_public" in command
-    assert "--stock-root data_tw_public/stocks" in command
-    assert "--ohlcv-fallback none" in command
+    assert cfg.pre_signal_command == load_market_config(
+        "services/discord_bot/markets/tw.yaml"
+    ).pre_signal_command
 
 
 def test_discord_tw_day_trade_1m_uses_its_point_in_time_data_contract() -> None:
     cfg = load_market_config("services/discord_bot/markets/tw_day_trade_1m.yaml")
-    command = " ".join(cfg.pre_signal_command)
-
-    assert "downloader/download_tw_official_data.py" in command
-    assert "--config configs/markets/tw_day_trade_1m.yaml" in command
-    assert "--public-dir data_tw_public" in command
-    assert "--stock-root data_tw_public/stocks" in command
-    assert "--ohlcv-fallback none" in command
+    assert cfg.pre_signal_command == load_market_config(
+        "services/discord_bot/markets/tw.yaml"
+    ).pre_signal_command
 
 
 def test_discord_tw_day_trade_100m_uses_its_point_in_time_data_contract() -> None:
     cfg = load_market_config("services/discord_bot/markets/tw_day_trade_100m.yaml")
-    command = " ".join(cfg.pre_signal_command)
-
-    assert "downloader/download_tw_official_data.py" in command
-    assert "--config configs/markets/tw_day_trade_100m.yaml" in command
-    assert "--public-dir data_tw_public" in command
-    assert "--stock-root data_tw_public/stocks" in command
-    assert "--ohlcv-fallback none" in command
+    assert cfg.pre_signal_command == load_market_config(
+        "services/discord_bot/markets/tw.yaml"
+    ).pre_signal_command
 
 
 def test_discord_tw_day_trade_multi_basis_uses_its_point_in_time_data_contract() -> None:
     cfg = load_market_config("services/discord_bot/markets/tw_day_trade_multi_basis.yaml")
-    command = " ".join(cfg.pre_signal_command)
-
-    assert "downloader/download_tw_official_data.py" in command
-    assert "--config configs/markets/tw_public_multi_basis_online_complete.yaml" in command
-    assert "--public-dir data_tw_public" in command
-    assert "--stock-root data_tw_public/stocks" in command
-    assert "--ohlcv-fallback none" in command
+    assert cfg.pre_signal_command == load_market_config(
+        "services/discord_bot/markets/tw.yaml"
+    ).pre_signal_command
 
 
 def test_daily_downloader_keeps_tw_out_of_legacy_yahoo_tree() -> None:

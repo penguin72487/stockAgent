@@ -1,0 +1,27 @@
+[Unit]
+Description=StockAgent read-only TAIFEX simulation status dashboard
+Wants=stockagent-shioaji-taifex-bidask.service
+After=stockagent-shioaji-taifex-bidask.service
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=@SERVICE_USER@
+Group=@SERVICE_GROUP@
+WorkingDirectory=@REPO_ROOT@
+Environment="HOME=@SERVICE_HOME@"
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=/usr/bin/bash "@REPO_ROOT@/scripts/run_shioaji_taifex_dashboard.sh"
+Nice=5
+CPUWeight=25
+IOWeight=25
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=15s
+KillMode=control-group
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

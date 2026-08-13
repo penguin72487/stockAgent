@@ -1,0 +1,553 @@
+#!/usr/bin/env python3
+"""Serve sanitized, cached public views of both localhost dashboards."""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass
+import gzip
+import hashlib
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import ipaddress
+import json
+from pathlib import Path
+import sys
+import threading
+import time
+from typing import Any, Callable, Final, Mapping
+from urllib.error import HTTPError, URLError
+from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.request import ProxyHandler, build_opener
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from stockagent.live.public_dashboards import (  # noqa: E402
+    TokenBucketRateLimiter,
+    UnsafePublicDashboardPayload,
+    sanitize_taifex_history,
+    sanitize_taifex_status,
+    sanitize_tw_signals,
+    sanitize_tw_status,
+)
+
+
+MAX_UPSTREAM_BYTES: Final[int] = 8 * 1024 * 1024
+MAX_REQUEST_TARGET_BYTES: Final[int] = 2_048
+PUBLIC_SIGNAL_LIMIT: Final[int] = 250
+API_CONCURRENCY: Final[int] = 32
+_OPENER = build_opener(ProxyHandler({}))
+
+
+@dataclass(frozen=True)
+class PreparedResponse:
+    body: bytes
+    gzip_body: bytes
+    content_type: str
+    etag: str
+    cache_control: str
+
+
+@dataclass
+class CacheEntry:
+    expires_at: float
+    response: PreparedResponse
+
+
+def _prepared(
+    body: bytes,
+    *,
+    content_type: str,
+    cache_control: str,
+) -> PreparedResponse:
+    digest = hashlib.sha256(body).hexdigest()
+    compressed = gzip.compress(body, compresslevel=5) if len(body) >= 1_024 else body
+    return PreparedResponse(
+        body=body,
+        gzip_body=compressed,
+        content_type=content_type,
+        etag=f'"sha256-{digest}"',
+        cache_control=cache_control,
+    )
+
+
+class PublicDashboardServer(ThreadingHTTPServer):
+    daemon_threads = True
+    request_queue_size = 64
+    allow_reuse_address = True
+
+    def __init__(
+        self,
+        address: tuple[str, int],
+        *,
+        public_static_root: Path,
+        taifex_static_root: Path,
+        tw_static_root: Path,
+        taifex_upstream: str,
+        tw_upstream: str,
+    ) -> None:
+        super().__init__(address, PublicDashboardHandler)
+        self.public_static_root = Path(public_static_root)
+        self.taifex_static_root = Path(taifex_static_root)
+        self.tw_static_root = Path(tw_static_root)
+        self.taifex_upstream = str(taifex_upstream).rstrip("/")
+        self.tw_upstream = str(tw_upstream).rstrip("/")
+        self.rate_limiter = TokenBucketRateLimiter()
+        self.api_slots = threading.BoundedSemaphore(API_CONCURRENCY)
+        self._cache: dict[str, CacheEntry] = {}
+        self._cache_lock = threading.Lock()
+
+    def cached_json(
+        self,
+        *,
+        cache_key: str,
+        upstream_url: str,
+        ttl_seconds: float,
+        cache_control: str,
+        sanitizer: Callable[[Mapping[str, Any]], dict[str, Any]],
+    ) -> PreparedResponse:
+        observed = time.monotonic()
+        cached = self._cache.get(cache_key)
+        if cached is not None and cached.expires_at > observed:
+            return cached.response
+        with self._cache_lock:
+            observed = time.monotonic()
+            cached = self._cache.get(cache_key)
+            if cached is not None and cached.expires_at > observed:
+                return cached.response
+            request = _OPENER.open(upstream_url, timeout=15.0)
+            try:
+                raw = request.read(MAX_UPSTREAM_BYTES + 1)
+            finally:
+                request.close()
+            if len(raw) > MAX_UPSTREAM_BYTES:
+                raise ValueError("upstream payload exceeds public size limit")
+            payload = json.loads(raw)
+            if not isinstance(payload, Mapping):
+                raise ValueError("upstream JSON root is not an object")
+            public_payload = sanitizer(payload)
+            encoded = (
+                json.dumps(
+                    public_payload,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                )
+                + "\n"
+            ).encode("utf-8")
+            response = _prepared(
+                encoded,
+                content_type="application/json; charset=utf-8",
+                cache_control=cache_control,
+            )
+            self._cache[cache_key] = CacheEntry(
+                expires_at=time.monotonic() + float(ttl_seconds),
+                response=response,
+            )
+            return response
+
+
+class PublicDashboardHandler(BaseHTTPRequestHandler):
+    server: PublicDashboardServer
+    server_version = "StockAgentPublicGateway"
+    sys_version = ""
+    protocol_version = "HTTP/1.1"
+
+    def _security_headers(self) -> None:
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Cross-Origin-Opener-Policy", "same-origin")
+        self.send_header("Cross-Origin-Resource-Policy", "same-origin")
+        self.send_header(
+            "Permissions-Policy",
+            "camera=(), microphone=(), geolocation=(), payment=(), usb=()",
+        )
+        self.send_header("X-Robots-Tag", "noindex, nofollow, noarchive")
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'self'; script-src 'self'; style-src 'self'; "
+            "img-src 'self' data:; connect-src 'self'; object-src 'none'; "
+            "base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+        )
+
+    def _client_key(self) -> str:
+        peer = str(self.client_address[0])
+        try:
+            peer_address = ipaddress.ip_address(peer)
+        except ValueError:
+            return peer
+        if not peer_address.is_loopback:
+            return peer
+        forwarded = str(self.headers.get("X-Forwarded-For") or "").split(",", 1)[0]
+        try:
+            return str(ipaddress.ip_address(forwarded.strip()))
+        except ValueError:
+            return peer
+
+    def _send_prepared(
+        self,
+        status: HTTPStatus,
+        response: PreparedResponse,
+        *,
+        head_only: bool,
+    ) -> None:
+        if self.headers.get("If-None-Match") == response.etag:
+            self.send_response(HTTPStatus.NOT_MODIFIED)
+            self.send_header("ETag", response.etag)
+            self.send_header("Cache-Control", response.cache_control)
+            self.send_header("Content-Length", "0")
+            self._security_headers()
+            self.end_headers()
+            return
+        accepts_gzip = "gzip" in str(self.headers.get("Accept-Encoding") or "").lower()
+        use_gzip = accepts_gzip and response.gzip_body is not response.body
+        body = response.gzip_body if use_gzip else response.body
+        self.send_response(status)
+        self.send_header("Content-Type", response.content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", response.cache_control)
+        self.send_header("ETag", response.etag)
+        if use_gzip:
+            self.send_header("Content-Encoding", "gzip")
+            self.send_header("Vary", "Accept-Encoding")
+        self._security_headers()
+        self.end_headers()
+        if not head_only:
+            self.wfile.write(body)
+
+    def _send_json(
+        self,
+        status: HTTPStatus,
+        payload: Mapping[str, Any],
+        *,
+        head_only: bool,
+        cache_control: str = "no-store",
+    ) -> None:
+        body = (
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+        ).encode("utf-8")
+        self._send_prepared(
+            status,
+            _prepared(
+                body,
+                content_type="application/json; charset=utf-8",
+                cache_control=cache_control,
+            ),
+            head_only=head_only,
+        )
+
+    def _redirect(self, location: str, *, head_only: bool) -> None:
+        body = b"redirecting\n"
+        self.send_response(HTTPStatus.PERMANENT_REDIRECT)
+        self.send_header("Location", location)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "public, max-age=300")
+        self._security_headers()
+        self.end_headers()
+        if not head_only:
+            self.wfile.write(body)
+
+    def _static_response(self, path: str) -> PreparedResponse | None:
+        routes: dict[str, tuple[Path, str, str]] = {
+            "/": (
+                self.server.public_static_root / "index.html",
+                "text/html; charset=utf-8",
+                "public, max-age=60",
+            ),
+            "/public.css": (
+                self.server.public_static_root / "public.css",
+                "text/css; charset=utf-8",
+                "public, max-age=300",
+            ),
+            "/robots.txt": (
+                self.server.public_static_root / "robots.txt",
+                "text/plain; charset=utf-8",
+                "public, max-age=3600",
+            ),
+        }
+        for prefix, root in (
+            ("/taifex/", self.server.taifex_static_root),
+            ("/tw-day-trade/", self.server.tw_static_root),
+        ):
+            suffix = path.removeprefix(prefix) if path.startswith(prefix) else None
+            if suffix in {"", "index.html"}:
+                routes[path] = (
+                    root / "index.html",
+                    "text/html; charset=utf-8",
+                    "public, max-age=60",
+                )
+            elif suffix == "app.js":
+                routes[path] = (
+                    root / "app.js",
+                    "text/javascript; charset=utf-8",
+                    "public, max-age=300",
+                )
+            elif suffix == "styles.css":
+                routes[path] = (
+                    root / "styles.css",
+                    "text/css; charset=utf-8",
+                    "public, max-age=300",
+                )
+        selected = routes.get(path)
+        if selected is None:
+            return None
+        target, content_type, cache_control = selected
+        return _prepared(
+            target.read_bytes(),
+            content_type=content_type,
+            cache_control=cache_control,
+        )
+
+    @staticmethod
+    def _signal_query(raw_query: str) -> str:
+        query = parse_qs(
+            raw_query,
+            keep_blank_values=True,
+            strict_parsing=False,
+            max_num_fields=5,
+        )
+        allowed = {"mode", "symbol", "status", "offset", "limit"}
+        if set(query) - allowed or any(len(values) != 1 for values in query.values()):
+            raise ValueError("unsupported or repeated query field")
+        mode = str(query.get("mode", [""])[0])[:64]
+        symbol = str(query.get("symbol", [""])[0])[:32]
+        status = str(query.get("status", ["all"])[0])[:32]
+        offset = int(query.get("offset", ["0"])[0])
+        limit = int(query.get("limit", [str(PUBLIC_SIGNAL_LIMIT)])[0])
+        if offset < 0 or offset > 100_000:
+            raise ValueError("offset is outside the public range")
+        if limit < 1:
+            raise ValueError("limit must be positive")
+        limit = min(limit, PUBLIC_SIGNAL_LIMIT)
+        return urlencode(
+            {
+                "mode": mode,
+                "symbol": symbol,
+                "status": status,
+                "offset": offset,
+                "limit": limit,
+            }
+        )
+
+    def _api_response(self, path: str, raw_query: str) -> PreparedResponse:
+        if path == "/taifex/api/status":
+            return self.server.cached_json(
+                cache_key="taifex-status",
+                upstream_url=f"{self.server.taifex_upstream}/api/status",
+                ttl_seconds=2.0,
+                cache_control="public, max-age=2, stale-while-revalidate=3",
+                sanitizer=sanitize_taifex_status,
+            )
+        if path == "/taifex/api/history":
+            return self.server.cached_json(
+                cache_key="taifex-history",
+                upstream_url=f"{self.server.taifex_upstream}/api/history",
+                ttl_seconds=55.0,
+                cache_control="public, max-age=30, stale-while-revalidate=30",
+                sanitizer=sanitize_taifex_history,
+            )
+        if path == "/tw-day-trade/api/status":
+            return self.server.cached_json(
+                cache_key="tw-status",
+                upstream_url=f"{self.server.tw_upstream}/api/status",
+                ttl_seconds=2.0,
+                cache_control="public, max-age=2, stale-while-revalidate=3",
+                sanitizer=sanitize_tw_status,
+            )
+        if path == "/tw-day-trade/api/signals":
+            normalized = self._signal_query(raw_query)
+            return self.server.cached_json(
+                cache_key=f"tw-signals:{normalized}",
+                upstream_url=f"{self.server.tw_upstream}/api/signals?{normalized}",
+                ttl_seconds=2.0,
+                cache_control="public, max-age=2, stale-while-revalidate=3",
+                sanitizer=sanitize_tw_signals,
+            )
+        raise KeyError(path)
+
+    def _handle(self, *, head_only: bool) -> None:
+        if len(self.path.encode("utf-8", errors="ignore")) > MAX_REQUEST_TARGET_BYTES:
+            self._send_json(
+                HTTPStatus.REQUEST_URI_TOO_LONG,
+                {"error": "request_target_too_long"},
+                head_only=head_only,
+            )
+            return
+        parsed = urlparse(self.path)
+        path = parsed.path
+        if path in {"/taifex", "/tw-day-trade"}:
+            self._redirect(f"{path}/", head_only=head_only)
+            return
+        if path == "/healthz":
+            self._send_json(
+                HTTPStatus.OK,
+                {"health": "ok"},
+                head_only=head_only,
+                cache_control="no-store",
+            )
+            return
+        if path == "/favicon.ico":
+            self.send_response(HTTPStatus.NO_CONTENT)
+            self.send_header("Content-Length", "0")
+            self.send_header("Cache-Control", "public, max-age=86400")
+            self._security_headers()
+            self.end_headers()
+            return
+
+        is_api = "/api/" in path
+        if not self.server.rate_limiter.allow(
+            self._client_key(), cost=5.0 if path.endswith("/api/history") else 1.0
+        ):
+            self.send_response(HTTPStatus.TOO_MANY_REQUESTS)
+            self.send_header("Retry-After", "5")
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            body = b'{"error":"rate_limited"}\n'
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self._security_headers()
+            self.end_headers()
+            if not head_only:
+                self.wfile.write(body)
+            return
+
+        if is_api:
+            if not self.server.api_slots.acquire(blocking=False):
+                self._send_json(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    {"error": "busy"},
+                    head_only=head_only,
+                )
+                return
+            try:
+                response = self._api_response(path, parsed.query)
+            except KeyError:
+                self._send_json(
+                    HTTPStatus.NOT_FOUND,
+                    {"error": "not_found"},
+                    head_only=head_only,
+                )
+                return
+            except ValueError:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": "invalid_request"},
+                    head_only=head_only,
+                )
+                return
+            except (
+                HTTPError,
+                URLError,
+                OSError,
+                json.JSONDecodeError,
+                UnsafePublicDashboardPayload,
+            ):
+                self._send_json(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    {"health": "unavailable", "error": "temporarily_unavailable"},
+                    head_only=head_only,
+                )
+                return
+            finally:
+                self.server.api_slots.release()
+            self._send_prepared(HTTPStatus.OK, response, head_only=head_only)
+            return
+
+        try:
+            response = self._static_response(path)
+        except OSError:
+            response = None
+        if response is None:
+            self._send_json(
+                HTTPStatus.NOT_FOUND,
+                {"error": "not_found"},
+                head_only=head_only,
+            )
+            return
+        self._send_prepared(HTTPStatus.OK, response, head_only=head_only)
+
+    def do_GET(self) -> None:  # noqa: N802
+        self._handle(head_only=False)
+
+    def do_HEAD(self) -> None:  # noqa: N802
+        self._handle(head_only=True)
+
+    def _method_not_allowed(self) -> None:
+        body = b'{"error":"method_not_allowed"}\n'
+        self.send_response(HTTPStatus.METHOD_NOT_ALLOWED)
+        self.send_header("Allow", "GET, HEAD")
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self._security_headers()
+        self.end_headers()
+        self.wfile.write(body)
+
+    do_POST = _method_not_allowed
+    do_PUT = _method_not_allowed
+    do_PATCH = _method_not_allowed
+    do_DELETE = _method_not_allowed
+    do_OPTIONS = _method_not_allowed
+    do_TRACE = _method_not_allowed
+
+    def log_message(self, format: str, *args: object) -> None:
+        path = urlparse(self.path).path
+        sys.stderr.write(
+            f"public-dashboard peer={self._client_key()} path={path} "
+            f"message={format % args}\n"
+        )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8770)
+    parser.add_argument(
+        "--public-static-root",
+        type=Path,
+        default=Path("services/public_dashboards"),
+    )
+    parser.add_argument(
+        "--taifex-static-root", type=Path, default=Path("services/taifex_dashboard")
+    )
+    parser.add_argument(
+        "--tw-static-root",
+        type=Path,
+        default=Path("services/tw_day_trade_dashboard"),
+    )
+    parser.add_argument("--taifex-upstream", default="http://127.0.0.1:8765")
+    parser.add_argument("--tw-upstream", default="http://127.0.0.1:8766")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    if not 1 <= int(args.port) <= 65_535:
+        raise ValueError("port must be between 1 and 65535")
+    server = PublicDashboardServer(
+        (str(args.host), int(args.port)),
+        public_static_root=Path(args.public_static_root),
+        taifex_static_root=Path(args.taifex_static_root),
+        tw_static_root=Path(args.tw_static_root),
+        taifex_upstream=str(args.taifex_upstream),
+        tw_upstream=str(args.tw_upstream),
+    )
+    print(
+        f"[public-dashboards] listening=http://{args.host}:{args.port} "
+        "upstreams=localhost-only",
+        flush=True,
+    )
+    try:
+        server.serve_forever(poll_interval=0.5)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

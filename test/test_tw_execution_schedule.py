@@ -16,6 +16,7 @@ from stockagent.backtest.tw_execution import (
     lot_size_vector,
     normalize_execution_mode,
     official_tw_short_initial_margin_rates,
+    preserve_directional_lot_mix,
     settlement_session_indices,
 )
 
@@ -486,3 +487,73 @@ def test_settlement_indices_validate_integer_session_arguments(
 ) -> None:
     with pytest.raises(ValueError):
         settlement_session_indices(num_sessions, lag=lag)  # type: ignore[arg-type]
+
+
+def test_directional_lot_mix_never_leaves_a_two_sided_target_one_sided() -> None:
+    adjusted, audit = preserve_directional_lot_mix(
+        np.asarray([0.50, -0.50]),
+        np.asarray([0, 4_000]),
+        np.asarray([100.0, 100.0]),
+        np.asarray([1_000, 1_000]),
+        capital=1_000_000.0,
+    )
+
+    np.testing.assert_array_equal(adjusted, [0, 0])
+    assert audit.pre_balance_long_gross == 0.0
+    assert audit.pre_balance_short_gross == 0.4
+    assert audit.post_balance_long_gross == 0.0
+    assert audit.post_balance_short_gross == 0.0
+    assert audit.collapsed_to_flat is True
+
+
+def test_directional_lot_mix_marks_an_all_unexecutable_two_sided_target_flat() -> None:
+    adjusted, audit = preserve_directional_lot_mix(
+        np.asarray([0.50, -0.50]),
+        np.asarray([0, 0]),
+        np.asarray([np.nan, np.nan]),
+        np.asarray([1_000, 1_000]),
+        capital=1_000_000.0,
+    )
+
+    np.testing.assert_array_equal(adjusted, [0, 0])
+    assert audit.common_fill_rate == 0.0
+    assert audit.collapsed_to_flat is True
+
+
+def test_directional_lot_mix_prunes_low_conviction_lots_without_adding_exposure() -> None:
+    adjusted, audit = preserve_directional_lot_mix(
+        # The first long reaches 10% gross.  Shorts reach 14%, so their common
+        # 10% fill rate is restored by removing the lower-conviction short and
+        # one lot from the higher-conviction short.
+        np.asarray([0.50, -0.10, -0.40]),
+        np.asarray([1_000, 1_000, 4_000]),
+        np.asarray([100.0, 20.0, 30.0]),
+        np.asarray([1_000, 1_000, 1_000]),
+        capital=1_000_000.0,
+    )
+
+    np.testing.assert_array_equal(adjusted, [1_000, 0, 3_000])
+    assert audit.target_long_gross == 0.5
+    assert audit.target_short_gross == 0.5
+    assert audit.pre_balance_long_gross == 0.1
+    assert audit.pre_balance_short_gross == 0.14
+    assert audit.post_balance_long_gross == 0.1
+    assert audit.post_balance_short_gross == 0.09
+    assert audit.common_fill_rate == pytest.approx(0.2)
+    assert audit.adjusted is True
+    assert audit.collapsed_to_flat is False
+
+
+def test_directional_lot_mix_leaves_a_directional_model_target_unchanged() -> None:
+    adjusted, audit = preserve_directional_lot_mix(
+        np.asarray([0.0, -0.75, -0.25]),
+        np.asarray([0, 3_000, 1_000]),
+        np.asarray([np.nan, 100.0, 100.0]),
+        np.asarray([1_000, 1_000, 1_000]),
+        capital=1_000_000.0,
+    )
+
+    np.testing.assert_array_equal(adjusted, [0, 3_000, 1_000])
+    assert audit.target_long_gross == 0.0
+    assert audit.target_short_gross == 1.0
+    assert audit.adjusted is False

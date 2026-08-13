@@ -84,3 +84,32 @@ def test_first_download_failure_uses_asset_output_summary_not_other_root_summary
     path, reason = failure
     assert path == tw_dir / "download_summary.json"
     assert reason == "2307 failed, 0 productive"
+
+
+def test_tw_public_refresh_summary_fails_closed_on_publication_gap(tmp_path) -> None:
+    live_root = tmp_path / "data_tw_public"
+    live_root.mkdir(parents=True)
+    summary = live_root / "download_summary.json"
+    summary.write_text(
+        "{"
+        '"daily_close_ready":true,'
+        '"coverage_complete":false,'
+        '"blocking_failed_count":0,'
+        '"missing_dates_after":3'
+        "}",
+        encoding="utf-8",
+    )
+    command = [
+        "python",
+        "scripts/refresh_tw_public_live_snapshot.py",
+        "--live-root",
+        str(live_root),
+    ]
+
+    assert command_summary_paths(command) == [summary]
+    failure = first_download_failure(command=command, market="tw", market_type="tw")
+
+    assert failure is not None
+    path, reason = failure
+    assert path == summary
+    assert reason == "coverage_complete is not true; missing_dates_after=3"

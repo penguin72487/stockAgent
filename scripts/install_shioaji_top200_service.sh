@@ -6,8 +6,10 @@ SERVICE_NAME="stockagent-shioaji-top200.service"
 START_NOW=true
 
 usage() {
-  echo "Usage: sudo bash scripts/install_shioaji_top200_service.sh [--taifex-bidask] [--no-start]" >&2
+  echo "Usage: sudo bash scripts/install_shioaji_top200_service.sh [--taifex-bidask|--taifex-dashboard] [--no-start]" >&2
 }
+
+REQUIRE_SHIOAJI_ENV=true
 
 for argument in "$@"; do
   case "$argument" in
@@ -16,6 +18,10 @@ for argument in "$@"; do
       ;;
     --taifex-bidask)
       SERVICE_NAME="stockagent-shioaji-taifex-bidask.service"
+      ;;
+    --taifex-dashboard)
+      SERVICE_NAME="stockagent-shioaji-taifex-dashboard.service"
+      REQUIRE_SHIOAJI_ENV=false
       ;;
     -h|--help)
       usage
@@ -39,7 +45,7 @@ if [[ ! -f "$TEMPLATE" ]]; then
   echo "[shioaji-service] missing unit template: $TEMPLATE" >&2
   exit 2
 fi
-if [[ ! -f "$REPO_ROOT/.env" ]]; then
+if [[ "$REQUIRE_SHIOAJI_ENV" == true && ! -f "$REPO_ROOT/.env" ]]; then
   echo "[shioaji-service] missing Shioaji environment file: $REPO_ROOT/.env" >&2
   exit 2
 fi
@@ -55,7 +61,8 @@ if [[ -z "$SERVICE_HOME" ]]; then
   echo "[shioaji-service] cannot resolve home for service user: $SERVICE_USER" >&2
   exit 2
 fi
-if ! runuser -u "$SERVICE_USER" -- test -r "$REPO_ROOT/.env"; then
+if [[ "$REQUIRE_SHIOAJI_ENV" == true ]] \
+  && ! runuser -u "$SERVICE_USER" -- test -r "$REPO_ROOT/.env"; then
   echo "[shioaji-service] $SERVICE_USER cannot read $REPO_ROOT/.env" >&2
   exit 2
 fi
@@ -79,7 +86,9 @@ sed \
 
 systemd-analyze verify "$rendered_unit"
 install -m 0644 "$rendered_unit" "$UNIT_PATH"
-chmod go-rwx "$REPO_ROOT/.env"
+if [[ "$REQUIRE_SHIOAJI_ENV" == true ]]; then
+  chmod go-rwx "$REPO_ROOT/.env"
+fi
 systemctl daemon-reload
 systemctl enable "$SERVICE_NAME"
 if [[ "$START_NOW" == true ]]; then

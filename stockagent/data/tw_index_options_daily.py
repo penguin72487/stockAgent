@@ -16,7 +16,7 @@ import csv
 import math
 from pathlib import Path
 import re
-from typing import Final, Iterable, Literal, Mapping
+from typing import Final, Iterable, Iterator, Literal, Mapping, Sequence
 
 import numpy as np
 
@@ -493,6 +493,14 @@ def _series_matches(series: str, scope: TaifexOptionSeriesScope) -> bool:
     return pattern.fullmatch(series) is not None
 
 
+def _series_scope(series: str) -> TaifexOptionSeriesScope | None:
+    if _MONTHLY_SERIES_RE.fullmatch(series) is not None:
+        return "monthly"
+    if _WEEKLY_SERIES_RE.fullmatch(series) is not None:
+        return "weekly"
+    return None
+
+
 def _series_sort_key(
     series: str,
     scope: TaifexOptionSeriesScope,
@@ -510,7 +518,7 @@ def _series_sort_key(
 def _read_txo_rows(
     source_path: Path,
     *,
-    series_scope: TaifexOptionSeriesScope,
+    series_scope: TaifexOptionSeriesScope | None,
 ) -> tuple[
     dict[date, dict[tuple[str, float, str], _OptionDailyRow]],
     set[date],
@@ -543,7 +551,10 @@ def _read_txo_rows(
             trading_date = date.fromisoformat(str(parsed_date))
             all_txo_dates.add(trading_date)
             series = str(raw.get("到期月份(週別)") or "").strip()
-            if not _series_matches(series, series_scope):
+            actual_scope = _series_scope(series)
+            if actual_scope is None or (
+                series_scope is not None and actual_scope != series_scope
+            ):
                 continue
             right = _parse_right(raw.get("買賣權"))
             if right is None:
@@ -575,6 +586,66 @@ def _read_txo_rows(
                 )
             by_date[trading_date][key] = row
     return by_date, all_txo_dates
+
+
+def iter_taifex_option_daily_rows(
+    option_source_paths: Iterable[str | Path],
+    *,
+    trading_dates: Iterable[date] | None = None,
+    series_scopes: Sequence[TaifexOptionSeriesScope] = ("monthly", "weekly"),
+) -> Iterator[dict[str, object]]:
+    """Yield normalized official TXO day-session rows without a second parser.
+
+    The iterator reads one receipt at a time, so callers can build a filtered
+    surface cache without materializing the complete multi-year option chain.
+    It intentionally preserves each contract's own first/last trade and final
+    quote fields; none of those fields are treated as synchronized quotes.
+    """
+
+    normalized_scopes = tuple(
+        _normalize_series_scope(scope) for scope in series_scopes
+    )
+    if not normalized_scopes:
+        raise ValueError("series_scopes must not be empty")
+    if len(set(normalized_scopes)) != len(normalized_scopes):
+        raise ValueError(f"series_scopes contains duplicates: {normalized_scopes}")
+    requested_dates = None if trading_dates is None else set(trading_dates)
+    for raw_path in option_source_paths:
+        source_path = Path(raw_path).expanduser().resolve()
+        if not source_path.is_file():
+            raise FileNotFoundError(f"TAIFEX option source does not exist: {source_path}")
+        rows_by_date, _all_txo_dates = _read_txo_rows(
+            source_path,
+            series_scope=None,
+        )
+        for trading_date in sorted(rows_by_date):
+            if requested_dates is not None and trading_date not in requested_dates:
+                continue
+            for row in rows_by_date[trading_date].values():
+                scope = _series_scope(row.series)
+                if scope not in normalized_scopes:
+                    continue
+                yield {
+                    "date": row.trading_date,
+                    "option_series": row.series,
+                    "series_scope": scope,
+                    "strike": row.strike,
+                    "option_right": row.right,
+                    "open": row.open if math.isfinite(row.open) else None,
+                    "close": row.close if math.isfinite(row.close) else None,
+                    "settlement": (
+                        row.settlement if math.isfinite(row.settlement) else None
+                    ),
+                    "volume": row.volume,
+                    "last_bid": (
+                        row.last_bid if math.isfinite(row.last_bid) else None
+                    ),
+                    "last_ask": (
+                        row.last_ask if math.isfinite(row.last_ask) else None
+                    ),
+                    "source_file": row.source_file,
+                    "source_sha256": row.source_sha256,
+                }
 
 
 def _none_row(
@@ -1397,6 +1468,7 @@ __all__ = [
     "build_taifex_opening_atm_straddles",
     "build_taifex_weekly_atm_straddles",
     "combine_taifex_option_chains",
+    "iter_taifex_option_daily_rows",
     "load_taifex_monthly_atm_straddles",
     "load_taifex_option_daily_contract_rows",
     "load_taifex_option_full_chain",

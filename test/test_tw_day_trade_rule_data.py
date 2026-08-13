@@ -47,7 +47,7 @@ def test_twse_day_trade_history_selects_rule_table_and_binds_both_dates() -> Non
                 "fields": [
                     "證券代號",
                     "證券名稱",
-                    "暫停現股賣出後現款買進當沖註記",
+                    "暫停現股賣出後\n現款買進當沖註記",
                 ],
                 "data": [["2330", "台積電", "Y"], ["2317", "鴻海", ""]],
             },
@@ -74,6 +74,37 @@ def test_twse_day_trade_history_selects_rule_table_and_binds_both_dates() -> Non
             _payload_bytes(stale),
             "json",
         )
+
+
+def test_twse_day_trade_history_accepts_official_preopen_rule_table() -> None:
+    spec = downloader.DEFAULT_DATASETS["twse_day_trade_eligibility"]
+    payload = {
+        "stat": "OK",
+        "date": "20260813",
+        "tables": [
+            {},
+            {
+                "title": "115年08月13日 當日沖銷交易標的",
+                "fields": [
+                    "證券代號",
+                    "證券名稱",
+                    "暫停現股賣出後現款買進當沖註記",
+                ],
+                "data": [["2330", "台積電", ""]],
+            },
+        ],
+    }
+
+    frame, _suffix = downloader._parse_historical_response_content(
+        spec,
+        date(2026, 8, 13),
+        _payload_bytes(payload),
+        "json",
+    )
+
+    assert frame.select("date", "證券代號").to_dicts() == [
+        {"date": "2026-08-13", "證券代號": "2330"}
+    ]
 
 
 def test_tpex_day_trade_history_requires_post_launch_direction_marker() -> None:

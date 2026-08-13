@@ -26,9 +26,21 @@ _PART_COUNT_KEYS = {
 
 
 def read_capture_manifests(
-    capture_root: Path, trade_date: str
+    capture_root: Path,
+    trade_date: str,
+    *,
+    session: str | None = None,
 ) -> list[dict[str, Any]]:
     manifest_dir = capture_root / "manifests" / f"trade_date={trade_date}"
+    if session is not None:
+        normalized = str(session).strip().lower()
+        if normalized not in {"day", "night"}:
+            raise ValueError(f"unsupported TAIFEX capture session: {session!r}")
+        session_dir = manifest_dir / f"session={normalized}"
+        if session_dir.is_dir():
+            manifest_dir = session_dir
+        elif normalized == "night":
+            return []
     paths = sorted(manifest_dir.glob("worker=*.json"))
     manifests: list[dict[str, Any]] = []
     for path in paths:
@@ -37,6 +49,33 @@ def read_capture_manifests(
             raise RuntimeError(f"JSON root is not an object: {path}")
         manifests.append(payload)
     return manifests
+
+
+def read_capture_manifest_groups(
+    capture_root: Path, trade_date: str
+) -> list[tuple[str | None, list[dict[str, Any]]]]:
+    """Read immutable capture groups without mixing distinct capture IDs.
+
+    New TAIFEX captures use session-scoped manifests.  A mirrored top-level day
+    manifest remains for older consumers, so it is ignored whenever any
+    session-scoped group exists.
+    """
+
+    manifest_dir = capture_root / "manifests" / f"trade_date={trade_date}"
+    session_groups: list[tuple[str | None, list[dict[str, Any]]]] = []
+    for session in ("night", "day"):
+        session_dir = manifest_dir / f"session={session}"
+        if not session_dir.is_dir():
+            continue
+        manifests = read_capture_manifests(
+            capture_root, trade_date, session=session
+        )
+        if manifests:
+            session_groups.append((session, manifests))
+    if session_groups:
+        return session_groups
+    manifests = read_capture_manifests(capture_root, trade_date)
+    return [(None, manifests)] if manifests else []
 
 
 def shared_capture_id(manifests: Iterable[dict[str, Any]]) -> str | None:
@@ -135,6 +174,7 @@ def select_capture_part_paths(
 
 
 __all__ = [
+    "read_capture_manifest_groups",
     "read_capture_manifests",
     "select_capture_part_paths",
     "shared_capture_id",

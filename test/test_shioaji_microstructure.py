@@ -4,12 +4,16 @@ import subprocess
 import sys
 from datetime import date, datetime, time
 from decimal import Decimal
+import json
 from pathlib import Path
 
 import polars as pl
 
 from downloader.build_tw_top_market_cap_universe import build_universe
-from downloader.shioaji_capture_parts import select_capture_part_paths
+from downloader.shioaji_capture_parts import (
+    read_capture_manifest_groups,
+    select_capture_part_paths,
+)
 from downloader.stream_shioaji_tw_microstructure import (
     BOOK_SCHEMA,
     PartWriter,
@@ -19,6 +23,7 @@ from downloader.stream_shioaji_tw_microstructure import (
     normalize_tick,
 )
 from downloader.stream_shioaji_taifex_bidask import (
+    partition_contract_infos,
     select_balanced_option_strips,
     select_option_strip,
 )
@@ -197,6 +202,40 @@ def test_fop_normalization_derives_trade_date_and_preserves_five_levels() -> Non
     assert book["ask_volume_5"] == 10
 
 
+def test_fop_night_session_is_assigned_to_following_trading_date() -> None:
+    monday_night = datetime(2026, 8, 10, 15, 0, 1)
+    saturday_early = datetime(2026, 8, 15, 2, 0, 1)
+    for event_dt, expected in (
+        (monday_night, date(2026, 8, 11)),
+        (saturday_early, date(2026, 8, 17)),
+    ):
+        tick = normalize_fop_tick(
+            Payload({"code": "TXFH6", "datetime": event_dt, "close": 20_000}),
+            event_seq=1,
+            worker_index=0,
+            receive_ts_ns=100,
+            receive_monotonic_ns=200,
+        )
+        book = normalize_fop_book(
+            Payload(
+                {
+                    "code": "TXFH6",
+                    "datetime": event_dt,
+                    "bid_price": [19_999],
+                    "bid_volume": [1],
+                    "ask_price": [20_001],
+                    "ask_volume": [1],
+                }
+            ),
+            event_seq=2,
+            worker_index=0,
+            receive_ts_ns=101,
+            receive_monotonic_ns=201,
+        )
+        assert tick["trade_date"] == expected
+        assert book["trade_date"] == expected
+
+
 def test_option_strip_is_paired_bounded_and_nearest_atm() -> None:
     class Base:
         def __init__(self, code: str) -> None:
@@ -237,9 +276,7 @@ def test_balanced_option_strips_keep_only_nearest_monthly_and_weekly() -> None:
             self.code = code
 
     class Info:
-        def __init__(
-            self, root: str, expiry: date, strike: float, right: str
-        ) -> None:
+        def __init__(self, root: str, expiry: date, strike: float, right: str) -> None:
             self.root = root
             self.delivery_date = expiry
             self.last_trading_date = expiry
@@ -273,10 +310,37 @@ def test_balanced_option_strips_keep_only_nearest_monthly_and_weekly() -> None:
         ("TX2", date(2026, 8, 12)),
         ("TXO", date(2026, 8, 19)),
     }
-    assert all(
-        item.strike_price in {19_900.0, 20_000.0, 20_100.0}
-        for item in selected
-    )
+    assert all(item.strike_price in {19_900.0, 20_000.0, 20_100.0} for item in selected)
+
+
+def test_contract_partition_keeps_pairs_and_reserves_two_futures_on_worker_zero() -> (
+    None
+):
+    futures = ["TX", "MTX"]
+    options = [f"pair-{pair}-{right}" for pair in range(149) for right in ("C", "P")]
+    partitions = [
+        partition_contract_infos(
+            futures_infos=futures,
+            option_infos=options,
+            worker_index=worker,
+            workers=3,
+        )
+        for worker in range(3)
+    ]
+    assert [len(items) for items in partitions] == [100, 100, 100]
+    assert partitions[0][:2] == futures
+    assert not ({"TX", "MTX"} & set(partitions[1] + partitions[2]))
+    observed_options = [
+        item for items in partitions for item in items if item not in futures
+    ]
+    assert observed_options == options
+    for items in partitions:
+        option_items = [item for item in items if item not in futures]
+        assert all(
+            option_items[index].rsplit("-", 1)[0]
+            == option_items[index + 1].rsplit("-", 1)[0]
+            for index in range(0, len(option_items), 2)
+        )
 
 
 def test_part_writer_uses_atomic_partitioned_parquet(tmp_path: Path) -> None:
@@ -348,6 +412,35 @@ def test_capture_part_selection_excludes_same_day_previous_run(tmp_path: Path) -
     )
 
     assert selected == [current]
+
+
+def test_capture_manifest_groups_prefer_session_receipts_over_day_mirror(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "manifests" / "trade_date=2026-08-12"
+    for session, capture_id in (("day", "day_capture"), ("night", "night_capture")):
+        target = root / f"session={session}"
+        target.mkdir(parents=True)
+        (target / "worker=00.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 3,
+                    "capture_id": capture_id,
+                    "worker_index": 0,
+                }
+            )
+        )
+    (root / "worker=00.json").write_text(
+        (root / "session=day" / "worker=00.json").read_text()
+    )
+
+    groups = read_capture_manifest_groups(tmp_path, "2026-08-12")
+
+    assert [session for session, _manifests in groups] == ["night", "day"]
+    assert [manifests[0]["capture_id"] for _session, manifests in groups] == [
+        "night_capture",
+        "day_capture",
+    ]
 
 
 def test_legacy_capture_part_selection_uses_manifest_write_window(

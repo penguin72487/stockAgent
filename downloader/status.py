@@ -36,6 +36,13 @@ SUMMARY_NAME_BY_MODE = {
 }
 
 
+def _is_tw_public_refresh_command(command: list[str]) -> bool:
+    return any(
+        Path(str(item)).name == "refresh_tw_public_live_snapshot.py"
+        for item in command
+    )
+
+
 def download_counts_failure_reason(counts: dict[str, Any]) -> str | None:
     failed = int(counts.get("failed", 0) or 0)
     if failed <= 0:
@@ -79,6 +86,10 @@ def command_summary_paths(command: list[str], *, resolve_path=None) -> list[Path
     summary_name = SUMMARY_NAME_BY_MODE.get(mode, "download_summary.json")
 
     paths: list[Path] = []
+    if _is_tw_public_refresh_command(command):
+        live_root_raw = command_option(command, "--live-root")
+        live_root = resolve(live_root_raw or "/srv/stockagent-live/data_tw_public")
+        paths.append(live_root / "download_summary.json")
     output_dir = resolve(output_dir_raw) if output_dir_raw else None
     output_root = resolve(output_root_raw) if output_root_raw else None
     if output_dir is not None:
@@ -137,7 +148,26 @@ def first_download_failure(
     resolve_path=None,
 ) -> tuple[Path, str] | None:
     asset_keys = market_asset_keys(market=market, market_type=market_type, command=command)
-    for path, payload in read_summary_payloads(command_summary_paths(command, resolve_path=resolve_path)):
+    summary_paths = command_summary_paths(command, resolve_path=resolve_path)
+    summaries = read_summary_payloads(summary_paths)
+    if _is_tw_public_refresh_command(command):
+        if not summaries:
+            return summary_paths[0], "TW public refresh summary is missing"
+        path, payload = summaries[0]
+        failures: list[str] = []
+        if payload.get("daily_close_ready") is not True:
+            failures.append("daily_close_ready is not true")
+        if payload.get("coverage_complete") is not True:
+            failures.append("coverage_complete is not true")
+        blocking = int(payload.get("blocking_failed_count") or 0)
+        if blocking != 0:
+            failures.append(f"blocking_failed_count={blocking}")
+        missing = int(payload.get("missing_dates_after") or 0)
+        if missing != 0:
+            failures.append(f"missing_dates_after={missing}")
+        if failures:
+            return path, "; ".join(failures)
+    for path, payload in summaries:
         counts = extract_counts_for_asset(payload, asset_keys)
         if not isinstance(counts, dict):
             continue

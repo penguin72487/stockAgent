@@ -28,6 +28,25 @@ def test_multi_basis_day_trade_is_available_in_market_autocomplete() -> None:
     assert any(choice.value == "tw_day_trade_multi_basis" for choice in choices)
 
 
+def test_all_four_day_trade_modes_share_the_0900_paper_execution_contract() -> None:
+    configs = discord_bot._market_configs()
+    markets = (
+        "tw_day_trade_1m",
+        "tw_day_trade",
+        "tw_day_trade_multi_basis",
+        "tw_day_trade_100m",
+    )
+
+    for market in markets:
+        config = configs[market]
+        assert config.schedule_time == "09:00"
+        assert config.day_trade_simulation_enabled is True
+        assert config.day_trade_quote_interval_seconds == 60
+        assert config.day_trade_simulation_state_dir == (
+            "artifacts/live/tw_day_trade_simulation"
+        )
+
+
 def test_discord_page_size_and_top_n_floor_to_ten() -> None:
     assert discord_bot._page_size(1) == 10
     assert discord_bot._page_size(5) == 10
@@ -116,6 +135,7 @@ def test_setup_hook_syncs_only_global_commands(monkeypatch: pytest.MonkeyPatch) 
     assert sync_guilds == [None]
     assert set(started_loops) == {
         "scheduled_signal",
+        "preopen_prepare",
         "daily_summary",
         "artifact_backfill",
         "model_auto_deployment",

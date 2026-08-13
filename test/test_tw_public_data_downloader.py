@@ -105,6 +105,7 @@ def test_download_modes_have_stable_legacy_aliases():
         ("tpex_margin_balance", 8),
         ("tpex_institutional_trades", 6),
         ("tpex_daily_valuation", 7),
+        ("twse_day_trade_eligibility", 4),
     ],
 )
 def test_historical_parser_contract_is_versioned_per_dataset(
@@ -3839,6 +3840,18 @@ def test_direct_cli_does_not_require_taiex_calendar_by_default(monkeypatch):
     args = twpub.parse_args()
 
     assert args.require_taiex_session_calendar is False
+    assert args.write_run_metadata is True
+
+
+def test_targeted_cli_can_preserve_parent_run_metadata(monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        ["download_tw_public_data.py", "--no-write-run-metadata"],
+    )
+
+    args = twpub.parse_args()
+
+    assert args.write_run_metadata is False
 
 
 def test_strict_plan_uses_receipt_verified_taiex_sessions_for_twse(tmp_path: Path):

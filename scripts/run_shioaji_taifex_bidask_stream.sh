@@ -40,11 +40,25 @@ run_fintech_python -c 'import downloader.stream_shioaji_taifex_bidask'
 RUN_ROOT="${SHIOAJI_TAIFEX_RUN_ROOT:-artifacts/data_capture/shioaji_taifex_bidask}"
 CAPTURE_ROOT="${SHIOAJI_TAIFEX_CAPTURE_ROOT:-data_tw_index_derivatives_ticks/shioaji_fop_captures}"
 FUTURE_CODE="${SHIOAJI_TAIFEX_FUTURE_CODE:-TXFR1}"
+HEDGE_FUTURE_CODE="${SHIOAJI_TAIFEX_HEDGE_FUTURE_CODE:-TMFR1}"
 OPTION_ROOTS="${SHIOAJI_TAIFEX_OPTION_ROOTS:-TXO,TX1,TX2,TX4,TX5,TXU,TXV,TXX,TXY,TXZ}"
 OPTION_EXPIRIES="${SHIOAJI_TAIFEX_OPTION_EXPIRIES:-1}"
-WEEKLY_EXPIRIES="${SHIOAJI_TAIFEX_WEEKLY_EXPIRIES:-1}"
+WEEKLY_EXPIRIES="${SHIOAJI_TAIFEX_WEEKLY_EXPIRIES:-2}"
 STRIKES_PER_EXPIRY="${SHIOAJI_TAIFEX_STRIKES_PER_EXPIRY:-100}"
 WORKERS="${SHIOAJI_TAIFEX_WORKERS:-3}"
+EXECUTE_STRATEGIES="${SHIOAJI_TAIFEX_EXECUTE_STRATEGIES:-true}"
+STRATEGY_STATE_DIR="${SHIOAJI_TAIFEX_STRATEGY_STATE_DIR:-artifacts/live/shioaji_taifex_volatility_simulation}"
+FINAL_SETTLEMENT_PATH="${SHIOAJI_TAIFEX_FINAL_SETTLEMENT_PATH:-data_tw_index_options_daily/txo_final_settlement_history.parquet}"
+STRATEGY_MODE="${SHIOAJI_TAIFEX_STRATEGY_MODE:-intraday_futures}"
+STRATEGY_INTRADAY_INTERVAL_SECONDS="${SHIOAJI_TAIFEX_STRATEGY_INTRADAY_INTERVAL_SECONDS:-60}"
+STRATEGY_INTRADAY_ENTRY_CUTOFF="${SHIOAJI_TAIFEX_STRATEGY_INTRADAY_ENTRY_CUTOFF:-13:20:00}"
+STRATEGY_INTRADAY_FLATTEN_TIME="${SHIOAJI_TAIFEX_STRATEGY_INTRADAY_FLATTEN_TIME:-13:35:00}"
+STRATEGY_NIGHT_ENTRY_CUTOFF="${SHIOAJI_TAIFEX_STRATEGY_NIGHT_ENTRY_CUTOFF:-04:40:00}"
+STRATEGY_NIGHT_FLATTEN_TIME="${SHIOAJI_TAIFEX_STRATEGY_NIGHT_FLATTEN_TIME:-04:55:00}"
+STRATEGY_OPTION_RISK_MARGIN_A_TWD="${SHIOAJI_TAIFEX_STRATEGY_OPTION_RISK_MARGIN_A_TWD:-169000}"
+STRATEGY_OPTION_RISK_MARGIN_B_TWD="${SHIOAJI_TAIFEX_STRATEGY_OPTION_RISK_MARGIN_B_TWD:-85000}"
+STRATEGY_CAPITAL_BUFFER_MULTIPLE="${SHIOAJI_TAIFEX_STRATEGY_CAPITAL_BUFFER_MULTIPLE:-2.0}"
+STRATEGY_CATALOG_EXPANSION_ENTRY_POLICY="${SHIOAJI_TAIFEX_STRATEGY_CATALOG_EXPANSION_ENTRY_POLICY:-immediate_live}"
 LOG_FILE="$RUN_ROOT/run.log"
 LOCK_FILE="$RUN_ROOT/runner.lock"
 mkdir -p "$RUN_ROOT"
@@ -55,38 +69,24 @@ if ! flock -n 9; then
 fi
 exec > >(tee -a "$LOG_FILE") 2>&1
 
-seconds_until_capture_window() {
+next_capture_spec() {
   run_fintech_python - <<'PY'
-from datetime import datetime, time, timedelta
-from zoneinfo import ZoneInfo
+from datetime import datetime
 
-tz = ZoneInfo("Asia/Taipei")
-now = datetime.now(tz)
-if now.weekday() < 5 and time(8, 44, 30) <= now.time() < time(13, 30):
-    print(0)
-else:
-    target_date = now.date()
-    if now.weekday() >= 5 or now.time() >= time(13, 30):
-        target_date += timedelta(days=1)
-    while target_date.weekday() >= 5:
-        target_date += timedelta(days=1)
-    target = datetime.combine(target_date, time(8, 44, 30), tzinfo=tz)
-    print(max(1, int((target - now).total_seconds())))
-PY
-}
+from stockagent.data.taifex_sessions import TAIPEI, next_taifex_capture_window
 
-seconds_until_next_capture_day() {
-  run_fintech_python - <<'PY'
-from datetime import datetime, time, timedelta
-from zoneinfo import ZoneInfo
-
-tz = ZoneInfo("Asia/Taipei")
-now = datetime.now(tz)
-target_date = now.date() + timedelta(days=1)
-while target_date.weekday() >= 5:
-    target_date += timedelta(days=1)
-target = datetime.combine(target_date, time(8, 44, 30), tzinfo=tz)
-print(max(1, int((target - now).total_seconds())))
+now = datetime.now(TAIPEI)
+window = next_taifex_capture_window(now)
+print(
+    "\t".join(
+        (
+            str(window.delay_seconds(now)),
+            window.session,
+            window.trading_date.isoformat(),
+            window.stops_at.isoformat(),
+        )
+    )
+)
 PY
 }
 
@@ -95,25 +95,62 @@ if (( WORKERS < 1 || WORKERS > 3 )); then
   exit 2
 fi
 
-echo "[shioaji-taifex] runner_started=$(TZ=Asia/Taipei date --iso-8601=seconds) credential_source=$CREDENTIAL_SOURCE future=$FUTURE_CODE option_roots=$OPTION_ROOTS monthly_expiries=$OPTION_EXPIRIES weekly_expiries=$WEEKLY_EXPIRIES strikes_per_expiry=$STRIKES_PER_EXPIRY workers=$WORKERS"
+if [[ "$EXECUTE_STRATEGIES" != true && "$EXECUTE_STRATEGIES" != false ]]; then
+  echo "[shioaji-taifex] SHIOAJI_TAIFEX_EXECUTE_STRATEGIES must be true or false" >&2
+  exit 2
+fi
+
+echo "[shioaji-taifex] runner_started=$(TZ=Asia/Taipei date --iso-8601=seconds) credential_source=$CREDENTIAL_SOURCE future=$FUTURE_CODE hedge_future=$HEDGE_FUTURE_CODE option_roots=$OPTION_ROOTS monthly_expiries=$OPTION_EXPIRIES weekly_expiries=$WEEKLY_EXPIRIES strikes_per_expiry=$STRIKES_PER_EXPIRY workers=$WORKERS execute_strategies=$EXECUTE_STRATEGIES strategy_mode=$STRATEGY_MODE intraday_interval_seconds=$STRATEGY_INTRADAY_INTERVAL_SECONDS intraday_entry_cutoff=$STRATEGY_INTRADAY_ENTRY_CUTOFF intraday_flatten_time=$STRATEGY_INTRADAY_FLATTEN_TIME night_entry_cutoff=$STRATEGY_NIGHT_ENTRY_CUTOFF night_flatten_time=$STRATEGY_NIGHT_FLATTEN_TIME"
 while true; do
-  delay="$(seconds_until_capture_window)"
+  IFS=$'\t' read -r delay capture_session trade_date stop_at < <(next_capture_spec)
   if (( delay > 0 )); then
-    echo "[shioaji-taifex] waiting_seconds=$delay reason=next_capture_window"
+    echo "[shioaji-taifex] waiting_seconds=$delay reason=next_capture_window session=$capture_session trade_date=$trade_date stop_at=$stop_at"
     sleep "$delay"
   fi
-  trade_date="$(TZ=Asia/Taipei date +%F)"
+  if [[ "$EXECUTE_STRATEGIES" == true && "$capture_session" == day ]]; then
+    settlement_end="$(TZ=Asia/Taipei date -d yesterday +%F)"
+    echo "[shioaji-taifex] final_settlement_refresh_end=$settlement_end"
+    if ! run_fintech_python scripts/download_taifex_final_settlement_history.py \
+      --start-date 2012-11-01 \
+      --end-date "$settlement_end" \
+      --refresh; then
+      echo "[shioaji-taifex] final_settlement_refresh_failed end=$settlement_end strategy_will_fail_closed_if_needed" >&2
+    fi
+  fi
   capture_id="$(run_fintech_python -c 'import uuid; print(uuid.uuid4().hex)')"
-  echo "[shioaji-taifex] capture_start=$(TZ=Asia/Taipei date --iso-8601=seconds) capture_id=$capture_id"
+  echo "[shioaji-taifex] capture_start=$(TZ=Asia/Taipei date --iso-8601=seconds) capture_id=$capture_id session=$capture_session trade_date=$trade_date stop_at=$stop_at"
   worker_pids=()
   worker_rcs=()
   set +e
   for (( worker_index=0; worker_index<WORKERS; worker_index++ )); do
+    strategy_args=()
+    if [[ "$EXECUTE_STRATEGIES" == true && "$worker_index" -eq 0 ]]; then
+      strategy_args+=(
+        --execute-strategies
+        --strategy-state-dir "$STRATEGY_STATE_DIR"
+        --final-settlement-path "$FINAL_SETTLEMENT_PATH"
+        --strategy-mode "$STRATEGY_MODE"
+        --strategy-intraday-interval-seconds "$STRATEGY_INTRADAY_INTERVAL_SECONDS"
+        --strategy-intraday-entry-cutoff "$STRATEGY_INTRADAY_ENTRY_CUTOFF"
+        --strategy-intraday-flatten-time "$STRATEGY_INTRADAY_FLATTEN_TIME"
+        --strategy-night-entry-cutoff "$STRATEGY_NIGHT_ENTRY_CUTOFF"
+        --strategy-night-flatten-time "$STRATEGY_NIGHT_FLATTEN_TIME"
+        --strategy-option-risk-margin-a-twd "$STRATEGY_OPTION_RISK_MARGIN_A_TWD"
+        --strategy-option-risk-margin-b-twd "$STRATEGY_OPTION_RISK_MARGIN_B_TWD"
+        --strategy-capital-buffer-multiple "$STRATEGY_CAPITAL_BUFFER_MULTIPLE"
+        --strategy-catalog-expansion-entry-policy "$STRATEGY_CATALOG_EXPANSION_ENTRY_POLICY"
+      )
+    fi
     run_fintech_python -m downloader.stream_shioaji_taifex_bidask \
       --simulation \
+      "${strategy_args[@]}" \
       --capture-id "$capture_id" \
+      --capture-session "$capture_session" \
+      --trade-date "$trade_date" \
+      --stop-at "$stop_at" \
       --output-dir "$CAPTURE_ROOT" \
       --future-code "$FUTURE_CODE" \
+      --hedge-future-code "$HEDGE_FUTURE_CODE" \
       --option-roots "$OPTION_ROOTS" \
       --option-expiries "$OPTION_EXPIRIES" \
       --weekly-expiries "$WEEKLY_EXPIRIES" \
@@ -140,16 +177,14 @@ while true; do
   done
   trap - TERM INT
   set -e
-  echo "[shioaji-taifex] capture_exit=$capture_rc worker_rcs=${worker_rcs[*]} date=$trade_date"
+  echo "[shioaji-taifex] capture_exit=$capture_rc worker_rcs=${worker_rcs[*]} date=$trade_date session=$capture_session"
   if (( capture_rc != 0 )); then
-    echo "[shioaji-taifex] retry_seconds=30 reason=capture_failed date=$trade_date" >&2
+    echo "[shioaji-taifex] retry_seconds=30 reason=capture_failed date=$trade_date session=$capture_session" >&2
     sleep 30
     continue
   fi
   run_fintech_python scripts/audit_shioaji_taifex_bidask_capture.py \
     --trade-date "$trade_date" \
+    --session "$capture_session" \
     --capture-root "$CAPTURE_ROOT"
-  next_delay="$(seconds_until_next_capture_day)"
-  echo "[shioaji-taifex] waiting_seconds=$next_delay reason=next_capture_day"
-  sleep "$next_delay"
 done

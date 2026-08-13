@@ -279,6 +279,15 @@ Guidelines:
   Exact-session short eligibility and prior-session official short capacity
   remain correctness constraints, not stress-test overlays.
 
+- After eligibility, volume, turnover, demonstrated depth, and whole-lot
+  constraints, a genuinely two-sided day-trade target must retain its requested
+  long/short gross mix by reducing only the better-filled side.  Never add lots
+  or exposure to repair the mix.  If either requested side has no executable
+  lot, fail the complete portfolio closed to flat instead of silently turning a
+  long/short signal into a one-sided directional bet.  The exact integer oracle
+  removes the lowest-absolute-weight lots first; continuous training/backtest
+  and live paper execution must enforce the same portfolio-level principle.
+
 - Current active low-rank baseline preference: `portfolio_mode: long_short`.
 - Keep `trading.long_only: false` when the model is intended to do long/short.
 - Portfolio direction and sizing should default to raw score direction followed by L1 normalization for gross exposure control:
