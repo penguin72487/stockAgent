@@ -160,7 +160,7 @@ def test_repo_tw_modes_have_independent_market_and_artifact_routes() -> None:
     day_trade_1m = configs["tw_day_trade_1m"]
     assert day_trade_1m.fold_id == 11
     assert day_trade_1m.initial_capital == 1_000_000.0
-    assert day_trade_1m.config_path == "configs/markets/tw_day_trade_1m.yaml"
+    assert day_trade_1m.config_path == "configs/deployments/tw_day_trade_1m_fold11.yaml"
     assert day_trade_1m.output_dir == "artifacts/markets/tw_day_trade_1m"
     assert day_trade_1m.checkpoint_path == (
         "artifacts/markets/tw_day_trade_1m/fold_11/checkpoint_best.pt"
@@ -168,7 +168,7 @@ def test_repo_tw_modes_have_independent_market_and_artifact_routes() -> None:
     day_trade = configs["tw_day_trade"]
     assert day_trade.fold_id == 11
     assert day_trade.initial_capital == 10_000_000.0
-    assert day_trade.config_path == "configs/markets/tw_day_trade_10m.yaml"
+    assert day_trade.config_path == "configs/deployments/tw_day_trade_10m_fold11.yaml"
     assert day_trade.output_dir == "artifacts/markets/tw_day_trade_10m"
     assert day_trade.checkpoint_path == (
         "artifacts/markets/tw_day_trade_10m/fold_11/checkpoint_best.pt"
@@ -176,7 +176,7 @@ def test_repo_tw_modes_have_independent_market_and_artifact_routes() -> None:
     day_trade_100m = configs["tw_day_trade_100m"]
     assert day_trade_100m.fold_id == 11
     assert day_trade_100m.initial_capital == 100_000_000.0
-    assert day_trade_100m.config_path == "configs/markets/tw_day_trade_100m.yaml"
+    assert day_trade_100m.config_path == "configs/deployments/tw_day_trade_100m_fold11.yaml"
     assert day_trade_100m.output_dir == "artifacts/markets/tw_day_trade_100m"
     assert day_trade_100m.checkpoint_path == (
         "artifacts/markets/tw_day_trade_100m/fold_11/checkpoint_best.pt"
