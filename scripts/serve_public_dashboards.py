@@ -32,6 +32,9 @@ from stockagent.live.public_dashboards import (  # noqa: E402
     sanitize_tw_signals,
     sanitize_tw_status,
 )
+from stockagent.live.shioaji_api_dashboard import (  # noqa: E402
+    build_shioaji_public_status,
+)
 
 
 MAX_UPSTREAM_BYTES: Final[int] = 8 * 1024 * 1024
@@ -85,6 +88,8 @@ class PublicDashboardServer(ThreadingHTTPServer):
         public_static_root: Path,
         taifex_static_root: Path,
         tw_static_root: Path,
+        shioaji_static_root: Path,
+        repo_root: Path,
         taifex_upstream: str,
         tw_upstream: str,
     ) -> None:
@@ -92,12 +97,53 @@ class PublicDashboardServer(ThreadingHTTPServer):
         self.public_static_root = Path(public_static_root)
         self.taifex_static_root = Path(taifex_static_root)
         self.tw_static_root = Path(tw_static_root)
+        self.shioaji_static_root = Path(shioaji_static_root)
+        self.repo_root = Path(repo_root)
         self.taifex_upstream = str(taifex_upstream).rstrip("/")
         self.tw_upstream = str(tw_upstream).rstrip("/")
         self.rate_limiter = TokenBucketRateLimiter()
         self.api_slots = threading.BoundedSemaphore(API_CONCURRENCY)
         self._cache: dict[str, CacheEntry] = {}
         self._cache_lock = threading.Lock()
+
+    def cached_local_json(
+        self,
+        *,
+        cache_key: str,
+        ttl_seconds: float,
+        cache_control: str,
+        builder: Callable[[], Mapping[str, Any]],
+    ) -> PreparedResponse:
+        """Build and cache a local allowlisted status payload."""
+
+        observed = time.monotonic()
+        cached = self._cache.get(cache_key)
+        if cached is not None and cached.expires_at > observed:
+            return cached.response
+        with self._cache_lock:
+            observed = time.monotonic()
+            cached = self._cache.get(cache_key)
+            if cached is not None and cached.expires_at > observed:
+                return cached.response
+            encoded = (
+                json.dumps(
+                    dict(builder()),
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                )
+                + "\n"
+            ).encode("utf-8")
+            response = _prepared(
+                encoded,
+                content_type="application/json; charset=utf-8",
+                cache_control=cache_control,
+            )
+            self._cache[cache_key] = CacheEntry(
+                expires_at=time.monotonic() + float(ttl_seconds),
+                response=response,
+            )
+            return response
 
     def cached_json(
         self,
@@ -263,6 +309,11 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                 "text/css; charset=utf-8",
                 "public, max-age=300",
             ),
+            "/public.js": (
+                self.server.public_static_root / "public.js",
+                "text/javascript; charset=utf-8",
+                "public, max-age=300",
+            ),
             "/robots.txt": (
                 self.server.public_static_root / "robots.txt",
                 "text/plain; charset=utf-8",
@@ -272,6 +323,7 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
         for prefix, root in (
             ("/taifex/", self.server.taifex_static_root),
             ("/tw-day-trade/", self.server.tw_static_root),
+            ("/shioaji/", self.server.shioaji_static_root),
         ):
             suffix = path.removeprefix(prefix) if path.startswith(prefix) else None
             if suffix in {"", "index.html"}:
@@ -367,6 +419,13 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                 cache_control="public, max-age=2, stale-while-revalidate=3",
                 sanitizer=sanitize_tw_signals,
             )
+        if path == "/shioaji/api/status":
+            return self.server.cached_local_json(
+                cache_key="shioaji-status",
+                ttl_seconds=8.0,
+                cache_control="public, max-age=5, stale-while-revalidate=5",
+                builder=lambda: build_shioaji_public_status(self.server.repo_root),
+            )
         raise KeyError(path)
 
     def _handle(self, *, head_only: bool) -> None:
@@ -379,7 +438,7 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
             return
         parsed = urlparse(self.path)
         path = parsed.path
-        if path in {"/taifex", "/tw-day-trade"}:
+        if path in {"/taifex", "/tw-day-trade", "/shioaji"}:
             self._redirect(f"{path}/", head_only=head_only)
             return
         if path == "/healthz":
@@ -518,6 +577,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path("services/tw_day_trade_dashboard"),
     )
+    parser.add_argument(
+        "--shioaji-static-root",
+        type=Path,
+        default=Path("services/shioaji_api_dashboard"),
+    )
+    parser.add_argument("--repo-root", type=Path, default=REPO_ROOT)
     parser.add_argument("--taifex-upstream", default="http://127.0.0.1:8765")
     parser.add_argument("--tw-upstream", default="http://127.0.0.1:8766")
     return parser
@@ -532,6 +597,8 @@ def main(argv: list[str] | None = None) -> int:
         public_static_root=Path(args.public_static_root),
         taifex_static_root=Path(args.taifex_static_root),
         tw_static_root=Path(args.tw_static_root),
+        shioaji_static_root=Path(args.shioaji_static_root),
+        repo_root=Path(args.repo_root),
         taifex_upstream=str(args.taifex_upstream),
         tw_upstream=str(args.tw_upstream),
     )

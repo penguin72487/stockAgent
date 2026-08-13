@@ -8,30 +8,116 @@
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
+  <a class="skip-link" href="#main-content">跳到主要內容</a>
+  <header class="public-nav">
+    <a class="public-brand" href="../">STOCKAGENT</a>
+    <nav aria-label="公開面板導覽">
+      <a href="../">總覽</a>
+      <a href="../taifex/">TAIFEX</a>
+      <a class="active" href="./" aria-current="page">台股當沖</a>
+      <a href="../shioaji/">永豐 API</a>
+    </nav>
+  </header>
+
   <header class="topbar">
     <div>
-      <p class="eyebrow">STOCKAGENT · PAPER EXECUTION</p>
+      <p class="eyebrow">TW STOCKS · PUBLIC READ-ONLY SIMULATION</p>
       <h1>台股四模式當沖模擬</h1>
-      <p class="subtitle">09:00 開盤後訊號 · 市價可成交價 · 13:20 限價 · 13:24 市價平倉</p>
+      <p class="subtitle">先看四模式結果與風險，再下鑽到訊號、成交和執行進度。</p>
     </div>
-    <div class="healthbox">
+    <div id="connection-status" class="healthbox" role="status" aria-live="polite">
+      <small>資料狀態</small>
       <span id="health" class="pill">載入中</span>
       <small id="freshness">—</small>
       <strong>僅模擬，絕不送正式單</strong>
     </div>
   </header>
 
-  <main>
-    <section id="alert" class="alert hidden"></section>
+  <nav class="jump-nav" aria-label="本頁快速導覽">
+    <a href="#overview">今日總覽</a>
+    <a href="#performance">四模式績效</a>
+    <a href="#details">持倉與訊號</a>
+    <a href="#operations">執行進度</a>
+    <a href="#audit">資料稽核</a>
+  </nav>
 
-    <section class="controls panel">
+  <main id="main-content">
+    <section id="alert" class="alert hidden" role="alert" aria-live="assertive"></section>
+
+    <div id="overview" class="section-intro">
+      <div><span>01</span><h2>今日是否可解讀</h2></div>
+      <p>資料狀態、完成模式、持倉與損益先於技術流程。</p>
+    </div>
+    <section id="overview-kpis" class="overview-kpis" aria-label="今日核心摘要" aria-busy="true">
+      <div class="overview-kpi loading"><span>模式狀態</span><strong>讀取中</strong><small>—</small></div>
+      <div class="overview-kpi loading"><span>今日持倉</span><strong>—</strong><small>—</small></div>
+      <div class="overview-kpi loading"><span>四模式淨損益</span><strong>—</strong><small>—</small></div>
+      <div class="overview-kpi loading"><span>報酬範圍</span><strong>—</strong><small>—</small></div>
+    </section>
+
+    <div id="performance" class="section-intro">
+      <div><span>02</span><h2>四模式績效</h2></div>
+      <p>每個模式用自己的資金基準；不能直接把資金規模當成策略優劣。</p>
+    </div>
+    <section id="mode-cards" class="mode-grid" aria-label="四模式績效卡片"></section>
+
+    <div id="details" class="section-intro">
+      <div><span>03</span><h2>持倉與訊號下鑽</h2></div>
+      <p>篩選只影響比較圖與下方明細，不會改變原始帳本。</p>
+    </div>
+    <section class="controls panel" aria-label="明細篩選">
+      <div class="controls-title"><strong>明細篩選</strong><span>模式、股票與狀態</span></div>
       <label>交易日<select id="date-filter"></select></label>
       <label>模式<select id="mode-filter"><option value="all">全部模式</option></select></label>
-      <label>股票<input id="symbol-filter" type="search" placeholder="代號或名稱"></label>
+      <label>股票<input id="symbol-filter" type="search" placeholder="輸入代號或名稱" autocomplete="off"></label>
       <label>狀態<select id="status-filter"><option value="all">全部狀態</option><option value="open">持倉中</option><option value="closed">已平倉</option><option value="blocked">未執行</option></select></label>
+      <button id="reset-filters" class="secondary" type="button">清除篩選</button>
       <div class="clock"><span>系統時間</span><strong id="clock">—</strong></div>
     </section>
 
+    <section class="grid-two">
+      <article class="panel chart-panel">
+        <div class="panel-head"><div><h2>每分鐘累積報酬率比較（%）</h2><p>每條線都除以自己的資金基準；策略含成本，基準以可成交 ask 進場、bid 清算</p></div><div id="chart-legend" class="legend"></div></div>
+        <div id="chart-empty" class="empty hidden">目前尚無分鐘報酬率資料</div>
+        <svg id="equity-chart" viewBox="0 0 960 360" role="img" aria-label="每分鐘累積報酬率百分比曲線"></svg>
+      </article>
+      <article class="panel timeline-panel">
+        <div class="panel-head"><div><h2>執行時鐘與資料契約</h2><p>畫面直接讀取同一份 append-only 模擬帳本</p></div></div>
+        <ol class="timeline">
+          <li><time>09:00</time><div><strong>開盤後訊號閘門</strong><span>必須先看到有效 opening quote；模型完成後再等較晚報價。</span></div></li>
+	          <li><time>進場</time><div><strong>市價可成交價</strong><span>買入取 best ask、賣空取 best bid，且只成交最優一檔可見量；不足即部分成交。</span></div></li>
+          <li><time>盤中</time><div><strong>四模式 TP/SL 皆內縮一 Tick</strong><span>四個策略都從漲跌停價向內縮一個日期有效的合法 Tick。TP 是限價，SL 是本地觸價後市價；內縮只能提高成交機率，不能保證有對手量。</span></div></li>
+          <li><time>13:20</time><div><strong>被動限價退出</strong><span>多單掛 ask、空單掛 bid；保留成交與未成交狀態。</span></div></li>
+	          <li><time>13:24</time><div><strong>撤單後市價強平</strong><span>多單賣 bid、空單補 ask；缺價或一檔量不足會標紅，持倉不會憑空消失。</span></div></li>
+        </ol>
+        <dl class="source-list">
+          <div><dt>訊號</dt><dd id="source-signal">—</dd></div>
+          <div><dt>成交</dt><dd id="source-fill">—</dd></div>
+          <div><dt>成本</dt><dd id="source-fees">—</dd></div>
+          <div><dt>百分比比較</dt><dd id="source-comparison">—</dd></div>
+          <div><dt>資格</dt><dd id="source-eligibility">—</dd></div>
+          <div><dt>深度限制</dt><dd id="source-depth">—</dd></div>
+        </dl>
+      </article>
+    </section>
+
+    <section class="panel table-panel">
+	      <div class="panel-head"><div><h2>持倉與完整生命週期</h2><p>依 |訊號權重| 由大到小；買多少、何時買、停利停損、13:20/13:24 狀態與賣出原因</p></div><div class="table-actions"><span id="position-count" class="count"></span><button id="load-more-positions" class="secondary hidden" type="button">載入更多</button></div></div>
+	      <div class="scroll-hint" aria-hidden="true">表格可左右滑動查看完整生命週期 →</div>
+	      <div class="table-scroll" tabindex="0" role="region" aria-label="持倉生命週期，可左右捲動"><table><thead><tr><th>模式／股票</th><th>方向</th><th>訊號權重</th><th>成交／剩餘</th><th>進場</th><th>即時清算</th><th>停利／停損</th><th>13:20</th><th>出場</th><th>淨損益</th><th>估值</th></tr></thead><tbody id="position-body"></tbody></table></div>
+    </section>
+
+    <section class="panel table-panel">
+	      <div class="panel-head"><div><h2>所有訊號</h2><p>伺服器分頁，依 |目標權重| 由大到小；排序會先顯示少數高權重尾端，方向摘要只計每個模式目前的 signal_id</p></div><div class="table-actions"><span id="signal-count" class="count"></span><button id="load-more-signals" class="secondary hidden" type="button">載入更多</button></div></div>
+	      <div id="signal-direction-summary" class="direction-summary"></div>
+	      <div class="scroll-hint" aria-hidden="true">表格可左右滑動查看訊號細節 →</div>
+	      <div class="table-scroll" tabindex="0" role="region" aria-label="所有訊號，可左右捲動"><table><thead><tr><th>時間</th><th>模式</th><th>股票</th><th>方向</th><th>分數</th><th>目標權重</th><th>成交／預計</th><th>bid / ask</th><th>資格</th><th>結果</th></tr></thead><tbody id="signal-body"></tbody></table></div>
+    </section>
+
+    <div id="operations" class="section-intro">
+      <div><span>04</span><h2>執行進度</h2></div>
+      <p>這裡回答「流程走到哪裡」，不是績效結論。</p>
+    </div>
     <section class="panel operations-panel">
       <div class="panel-head">
         <div><h2>啟動、預熱與執行進度</h2><p>只顯示狀態檔中的實際完成步驟；速度以本次實測耗時或帳本更新計算</p></div>
@@ -50,45 +136,10 @@
       </div>
     </section>
 
-    <section id="mode-cards" class="mode-grid"></section>
-
-    <section class="grid-two">
-      <article class="panel chart-panel">
-        <div class="panel-head"><div><h2>每分鐘累積報酬率比較（%）</h2><p>每條線都除以自己的資金基準；策略含成本，基準以可成交 ask 進場、bid 清算</p></div><div id="chart-legend" class="legend"></div></div>
-        <div id="chart-empty" class="empty hidden">目前尚無分鐘報酬率資料</div>
-        <svg id="equity-chart" viewBox="0 0 960 360" role="img" aria-label="每分鐘累積報酬率百分比曲線"></svg>
-      </article>
-      <article class="panel timeline-panel">
-        <div class="panel-head"><div><h2>執行時鐘與資料契約</h2><p>畫面直接讀取同一份 append-only 模擬帳本</p></div></div>
-        <ol class="timeline">
-          <li><time>09:00</time><div><strong>開盤後訊號閘門</strong><span>必須先看到有效 opening quote；模型完成後再等較晚報價。</span></div></li>
-	          <li><time>進場</time><div><strong>市價可成交價</strong><span>買入取 best ask、賣空取 best bid，且只成交最優一檔可見量；不足即部分成交。</span></div></li>
-          <li><time>盤中</time><div><strong>完整漲跌停 TP/SL</strong><span>TP 是限價；SL 是本地觸價後市價，不會把跌停限價錯當停損。</span></div></li>
-          <li><time>13:20</time><div><strong>被動限價退出</strong><span>多單掛 ask、空單掛 bid；保留成交與未成交狀態。</span></div></li>
-	          <li><time>13:24</time><div><strong>撤單後市價強平</strong><span>多單賣 bid、空單補 ask；缺價或一檔量不足會標紅，持倉不會憑空消失。</span></div></li>
-        </ol>
-        <dl class="source-list">
-          <div><dt>訊號</dt><dd id="source-signal">—</dd></div>
-          <div><dt>成交</dt><dd id="source-fill">—</dd></div>
-          <div><dt>成本</dt><dd id="source-fees">—</dd></div>
-          <div><dt>百分比比較</dt><dd id="source-comparison">—</dd></div>
-          <div><dt>資格</dt><dd id="source-eligibility">—</dd></div>
-          <div><dt>深度限制</dt><dd id="source-depth">—</dd></div>
-        </dl>
-      </article>
-    </section>
-
-    <section class="panel table-panel">
-	      <div class="panel-head"><div><h2>持倉與完整生命週期</h2><p>依 |訊號權重| 由大到小；買多少、何時買、停利停損、13:20/13:24 狀態與賣出原因</p></div><div class="table-actions"><span id="position-count" class="count"></span><button id="load-more-positions" class="secondary hidden" type="button">載入更多</button></div></div>
-	      <div class="table-scroll"><table><thead><tr><th>模式／股票</th><th>方向</th><th>訊號權重</th><th>成交／剩餘</th><th>進場</th><th>即時清算</th><th>停利／停損</th><th>13:20</th><th>出場</th><th>淨損益</th><th>估值</th></tr></thead><tbody id="position-body"></tbody></table></div>
-    </section>
-
-    <section class="panel table-panel">
-	      <div class="panel-head"><div><h2>所有訊號</h2><p>伺服器分頁，依 |目標權重| 由大到小；排序會先顯示少數高權重尾端，方向摘要只計每個模式目前的 signal_id</p></div><div class="table-actions"><span id="signal-count" class="count"></span><button id="load-more-signals" class="secondary hidden" type="button">載入更多</button></div></div>
-	      <div id="signal-direction-summary" class="direction-summary"></div>
-	      <div class="table-scroll"><table><thead><tr><th>時間</th><th>模式</th><th>股票</th><th>方向</th><th>分數</th><th>目標權重</th><th>成交／預計</th><th>bid / ask</th><th>資格</th><th>結果</th></tr></thead><tbody id="signal-body"></tbody></table></div>
-    </section>
-
+    <div id="audit" class="section-intro">
+      <div><span>05</span><h2>委託事件與資料稽核</h2></div>
+      <p>最後才看技術證據，避免把健康檢查誤當成投資結果。</p>
+    </div>
     <section class="grid-two compact">
       <article class="panel table-panel">
         <div class="panel-head"><div><h2>委託與成交事件</h2><p>模擬委託、成交、撤單替換與 OCO 原因</p></div></div>

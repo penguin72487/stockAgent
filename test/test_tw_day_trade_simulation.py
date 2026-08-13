@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import date, datetime
 import json
 from pathlib import Path
@@ -83,6 +84,28 @@ def _row(weight: float = 0.1) -> dict[str, object]:
         "score": 1.0,
         "raw_score": 1.1,
     }
+
+
+def test_runner_offsets_all_four_existing_modes_without_adding_a_fifth() -> None:
+    from scripts.run_tw_day_trade_simulation import _mode_specs
+
+    repo_root = Path(__file__).resolve().parents[1]
+    specs, live_configs, errors = _mode_specs(
+        repo_root / "services/discord_bot/markets"
+    )
+    by_market = {spec.market: spec for spec in specs}
+    expected = {
+        "tw_day_trade_1m",
+        "tw_day_trade",
+        "tw_day_trade_multi_basis",
+        "tw_day_trade_100m",
+    }
+
+    assert errors == {}
+    assert set(by_market) == expected
+    assert set(live_configs) == expected
+    assert all(spec.signal_market is None for spec in specs)
+    assert all(spec.price_limit_offset_ticks == 1 for spec in specs)
 
 
 def _eligibility() -> dict[str, LiveEligibility]:
@@ -261,6 +284,76 @@ def test_schema2_open_position_migrates_fail_closed(tmp_path: Path) -> None:
     assert mode["engine_status"] == (
         "critical_legacy_position_requires_reconciliation"
     )
+
+
+def test_inside_limit_mode_offsets_long_bracket_one_legal_tick(
+    tmp_path: Path,
+) -> None:
+    spec = replace(
+        _spec(tmp_path),
+        label="inside one tick",
+        price_limit_offset_ticks=1,
+    )
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+
+    engine.register_signal(
+        spec=spec,
+        summary=_summary(),
+        signal_rows=[_row(0.1)],
+        quotes={"2330": _quote()},
+        eligibility=_eligibility(),
+        eligibility_coverage={},
+        now=_now(9, 1, 7),
+    )
+
+    mode = engine.state["modes"][spec.market]
+    position = next(iter(mode["positions"].values()))
+    assert mode["signal_market"] == spec.market
+    assert mode["price_limit_offset_ticks"] == 1
+    assert mode["fill_guaranteed"] is False
+    assert position["take_profit_price"] == 1_095.0
+    assert position["stop_trigger_price"] == 901.0
+
+    engine.process_quotes(
+        quotes={"2330": _quote(bid=1_095.0, ask=1_100.0, last=1_095.0)},
+        now=_now(9, 10),
+    )
+
+    assert position["signed_shares"] == 0
+    assert position["exit_reason"] == "take_profit_inside_daily_limit_1_tick"
+
+
+def test_inside_limit_mode_offsets_short_bracket_and_uses_market_stop(
+    tmp_path: Path,
+) -> None:
+    spec = replace(
+        _spec(tmp_path),
+        price_limit_offset_ticks=1,
+    )
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+
+    engine.register_signal(
+        spec=spec,
+        summary=_summary(),
+        signal_rows=[_row(-0.1)],
+        quotes={"2330": _quote()},
+        eligibility=_eligibility(),
+        eligibility_coverage={},
+        now=_now(9, 1, 7),
+    )
+
+    position = next(iter(engine.state["modes"][spec.market]["positions"].values()))
+    assert position["take_profit_price"] == 901.0
+    assert position["stop_trigger_price"] == 1_095.0
+
+    engine.process_quotes(
+        quotes={"2330": _quote(bid=1_095.0, ask=1_096.0, last=1_095.0)},
+        now=_now(9, 10),
+    )
+
+    assert position["signed_shares"] == 0
+    assert position["exit_price"] == 1_096.0
+    assert position["exit_reason"] == "stop_loss_inside_daily_limit_1_tick_trigger"
 
 
 def test_entry_only_fills_displayed_level_one_volume(tmp_path: Path) -> None:
@@ -549,6 +642,27 @@ def test_rearm_flat_session_refuses_any_position_history(tmp_path: Path) -> None
         )
 
 
+def test_retire_flat_mode_removes_only_state_and_keeps_audit_log(
+    tmp_path: Path,
+) -> None:
+    spec = _spec(tmp_path)
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+    engine.update_readiness([spec], now=_now(8, 30))
+
+    assert (
+        engine.retire_flat_mode(
+            spec.market,
+            now=_now(8, 31),
+            reason="mistaken extra strategy",
+        )
+        == "retired"
+    )
+    assert spec.market not in engine.state["modes"]
+    events = [json.loads(line) for line in engine.events_path.read_text().splitlines()]
+    assert events[-1]["event"] == "simulation_mode_retired"
+    assert events[-1]["market"] == spec.market
+
+
 def test_lower_limit_is_local_stop_not_immediate_sell_limit(tmp_path: Path) -> None:
     spec = _spec(tmp_path)
     engine = TwDayTradeSimulationEngine(tmp_path / "state")
@@ -679,6 +793,12 @@ def test_1324_market_then_1325_limit_rod_and_1330_auction_fill(tmp_path: Path) -
     assert position["signed_shares"] == 2_000
     assert position["status"] == "force_exit_partially_filled"
     assert engine.state["modes"][spec.market]["force_exit_failures"] == 1
+
+    engine.update_readiness([spec], now=_now(14, 0))
+    assert (
+        engine.state["modes"][spec.market]["engine_status"]
+        == "critical_unflattened_after_13_24"
+    )
 
     engine.process_quotes(
         quotes={"2330": _quote(bid=1003.0, ask=1005.0, bid_volume=2.0)},
@@ -1070,10 +1190,16 @@ def test_dashboard_html_is_local_and_refreshes_api() -> None:
     assert 'id="load-more-signals"' in html
     assert 'id="load-more-positions"' in html
     assert 'id="signal-direction-summary"' in html
+    assert 'class="skip-link"' in html
+    assert 'aria-label="公開面板導覽"' in html
+    assert 'id="overview-kpis"' in html
+    assert 'id="reset-filters"' in html
+    assert "function renderOverview(data)" in javascript
+    assert "13:24 強平後仍有未平部位" in javascript
     assert "目前訊號目標" in javascript
     assert "方向平衡後" in javascript
-    assert "目前今日當沖資格仍未覆蓋" in javascript
-    assert "不會用較晚資料回填假成交" in javascript
+    assert "今日當沖資格未完整覆蓋" in javascript
+    assert "較晚補齊的資料不會回填成假成交" in javascript
     assert "依 |目標權重| 由大到小" in html
     assert "window.setInterval(refresh, REFRESH_MS)" in javascript
 

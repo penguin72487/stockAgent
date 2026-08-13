@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Consume four Discord live signals and maintain one-minute paper ledgers."""
+"""Consume Discord live signals and maintain one-minute paper ledgers."""
 
 from __future__ import annotations
 
@@ -104,6 +104,7 @@ def _mode_specs(
                     live_output_dir=_repo_path(resolved_live_output_dir(live)),
                     fee_schedule=_fee_schedule(experiment),
                     lot_size=int(experiment.trading.tw_day_trade_lot_size),
+                    price_limit_offset_ticks=1,
                 )
             )
         except Exception as exc:
@@ -123,7 +124,8 @@ def _latest_signal(
             summary = json.loads(path.read_text(encoding="utf-8"))
             if (
                 not isinstance(summary, dict)
-                or str(summary.get("market")) != spec.market
+                or str(summary.get("market"))
+                != str(spec.signal_market or spec.market)
             ):
                 continue
             generated = datetime.fromisoformat(str(summary.get("generated_at")))

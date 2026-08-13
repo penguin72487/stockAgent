@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 
 import polars as pl
+import pytest
 
 from downloader.build_tw_top_market_cap_universe import build_universe
 from downloader.shioaji_capture_parts import (
@@ -24,9 +25,11 @@ from downloader.stream_shioaji_tw_microstructure import (
 )
 from downloader.stream_shioaji_taifex_bidask import (
     partition_contract_infos,
+    prioritize_required_option_pairs,
     select_balanced_option_strips,
     select_option_strip,
 )
+from stockagent.live.taifex_strategy_state import load_held_option_codes
 
 
 def test_taifex_capture_module_cli_imports_from_repo_root() -> None:
@@ -340,6 +343,88 @@ def test_contract_partition_keeps_pairs_and_reserves_two_futures_on_worker_zero(
             option_items[index].rsplit("-", 1)[0]
             == option_items[index + 1].rsplit("-", 1)[0]
             for index in range(0, len(option_items), 2)
+        )
+
+
+def test_held_option_pair_is_pinned_to_strategy_worker_without_growing_selection(
+    tmp_path: Path,
+) -> None:
+    class Base:
+        def __init__(self, code: str) -> None:
+            self.code = code
+
+    class Info:
+        def __init__(self, strike: float, right: str) -> None:
+            self.root = "TXV"
+            self.delivery_date = date(2026, 8, 14)
+            self.last_trading_date = self.delivery_date
+            self.strike_price = strike
+            self.option_right = right
+            self.base = Base(f"TXV-{strike:.0f}-{right}")
+
+    infos = [
+        Info(strike, right)
+        for strike in (44_900.0, 45_000.0, 45_100.0)
+        for right in ("C", "P")
+    ]
+    selected = infos[2:]
+    prioritized = prioritize_required_option_pairs(
+        infos,
+        selected,
+        trade_date=date(2026, 8, 13),
+        required_codes=("TXV-44900-C",),
+        priority_pair_capacity=1,
+    )
+
+    assert len(prioritized) == len(selected) == 4
+    assert [item.base.code for item in prioritized[:2]] == [
+        "TXV-44900-C",
+        "TXV-44900-P",
+    ]
+    worker_zero = partition_contract_infos(
+        futures_infos=["TX", "TMF"],
+        option_infos=prioritized,
+        worker_index=0,
+        workers=2,
+        contracts_per_worker=4,
+    )
+    assert [item.base.code for item in worker_zero[2:]] == [
+        "TXV-44900-C",
+        "TXV-44900-P",
+    ]
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    (state_dir / "state.json").write_text(
+        json.dumps(
+            {
+                "strategies": {
+                    "long": {
+                        "option_positions": {
+                            "TXV-44900-C": 1,
+                            "ignored-flat": 0,
+                        }
+                    },
+                    "short": {"option_positions": {"TXV-44900-P": -2}},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert load_held_option_codes(state_dir) == (
+        "TXV-44900-C",
+        "TXV-44900-P",
+    )
+
+
+def test_missing_held_option_contract_fails_selection_closed() -> None:
+    with pytest.raises(RuntimeError, match="held option contracts are unavailable"):
+        prioritize_required_option_pairs(
+            [],
+            [],
+            trade_date=date(2026, 8, 13),
+            required_codes=("TXV-MISSING",),
+            priority_pair_capacity=49,
         )
 
 
