@@ -123,6 +123,8 @@ def _validate_tw_minute_mode_contract(
     long_only: object,
     use_tw_public_rules: object,
     tw_public_feature_path: object,
+    daily_context_panel_meta: object,
+    daily_guidance_path: object,
     portfolio_output_mode: object,
     gross_exposure: object,
     maximum_name_weight: object,
@@ -140,10 +142,7 @@ def _validate_tw_minute_mode_contract(
         raise ValueError(
             "trading.execution_mode='tw_minute' requires trading.frequency='minute'"
         )
-    if (
-        _normalized_contract_name(model_name)
-        not in _TW_PHASE_HEAD_MODEL_NAMES
-    ):
+    if _normalized_contract_name(model_name) not in _TW_PHASE_HEAD_MODEL_NAMES:
         raise ValueError(
             "tw_minute requires transformer_base_portfolio or financial_transformer; "
             "the minute runner consumes one scalar score per symbol and does not "
@@ -155,8 +154,7 @@ def _validate_tw_minute_mode_contract(
             "log-utility objective"
         )
     if not bool(long_only) and (
-        not bool(use_tw_public_rules)
-        or not str(tw_public_feature_path or "").strip()
+        not bool(use_tw_public_rules) or not str(tw_public_feature_path or "").strip()
     ):
         raise ValueError(
             "tw_minute long/short requires data.use_tw_public_rules=true and a "
@@ -169,6 +167,31 @@ def _validate_tw_minute_mode_contract(
             "tw_minute requires the active model portfolio_output_mode to be "
             "'logits', 'l1', 'cash_l1', or 'projection_l1'"
         )
+    guided = bool(str(daily_guidance_path or "").strip())
+    if guided:
+        if not str(daily_context_panel_meta or "").strip():
+            raise ValueError(
+                "tw_minute daily-model guidance requires "
+                "data.minute_daily_context_panel_meta so the minute policy can "
+                "condition on the guide without repeating it on every minute bar"
+            )
+        if output_mode != "logits":
+            raise ValueError(
+                "tw_minute daily-model guidance requires the active model "
+                "portfolio_output_mode='logits'; logits parameterize a [0,1] "
+                "exposure gate while the daily model owns direction and sizing"
+            )
+        if float(gross_exposure) != 1.0:
+            raise ValueError(
+                "tw_minute daily-model guidance requires "
+                "trading.tw_minute_gross_exposure=1.0; the signed daily guide "
+                "already owns the portfolio-wide L1 risk budget"
+            )
+        if maximum_name_weight is not None or outside_cash_logit is not None:
+            raise ValueError(
+                "tw_minute daily-model guidance must preserve the daily target "
+                "weights; disable the minute per-name cap and outside-cash logit"
+            )
     if output_mode in {"l1", "cash_l1", "projection_l1"}:
         if float(gross_exposure) != 1.0:
             raise ValueError(
@@ -389,7 +412,10 @@ def _validate_tw_index_derivatives_day_mode_contract(
 ) -> None:
     if execution_mode != "tw_index_derivatives_day":
         return
-    if _normalized_contract_name(model_name) not in _TW_INDEX_DERIVATIVES_DAY_MODEL_NAMES:
+    if (
+        _normalized_contract_name(model_name)
+        not in _TW_INDEX_DERIVATIVES_DAY_MODEL_NAMES
+    ):
         raise ValueError(
             "tw_index_derivatives_day requires "
             "training.model_name='cross_sectional_index_derivatives_day'"
@@ -811,6 +837,12 @@ class DataConfig:
     # Keeping this as [day,symbol,feature] side input avoids repeating a wide
     # daily vector on every one of the 270 minute bars.
     minute_daily_context_panel_meta: str | None = None
+    # Optional walk-forward out-of-fold daily-model target weights.  When set,
+    # the minute policy controls only a [0,1] exposure gate for each signed
+    # daily target; direction and maximum per-name size remain owned by the
+    # causal daily guide.  The adjacent manifest is mandatory and fingerprints
+    # every source fold/checkpoint used to build the guide.
+    minute_daily_guidance_path: str | None = None
     # Receipt-backed completed-second TX/TXO transactions.  The derived
     # dataset uses TXO chain activity as features and the first later TX trade
     # as the executable price; it never enters the daily panel builder.
@@ -1835,8 +1867,7 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         or training["minute_proximal_cost_multiplier"] < 0.0
     ):
         raise ValueError(
-            "training.minute_proximal_cost_multiplier must be finite and "
-            "nonnegative"
+            "training.minute_proximal_cost_multiplier must be finite and nonnegative"
         )
     training["minute_cpu_cache_gb"] = max(0.0, float(training["minute_cpu_cache_gb"]))
     training["minute_data_workers"] = max(1, int(training["minute_data_workers"]))
@@ -2099,10 +2130,8 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     financial_transformer["temporal_basis_components"] = max(
         1, int(financial_transformer["temporal_basis_components"])
     )
-    financial_transformer["temporal_basis_input"] = (
-        _normalize_temporal_basis_input(
-            financial_transformer["temporal_basis_input"]
-        )
+    financial_transformer["temporal_basis_input"] = _normalize_temporal_basis_input(
+        financial_transformer["temporal_basis_input"]
     )
     financial_transformer["categorical_embedding_dim"] = max(
         1, int(financial_transformer["categorical_embedding_dim"])
@@ -2599,6 +2628,8 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         long_only=trading["long_only"],
         use_tw_public_rules=data["use_tw_public_rules"],
         tw_public_feature_path=data["tw_public_feature_path"],
+        daily_context_panel_meta=data["minute_daily_context_panel_meta"],
+        daily_guidance_path=data["minute_daily_guidance_path"],
         portfolio_output_mode=phase_model_config["portfolio_output_mode"],
         gross_exposure=trading["tw_minute_gross_exposure"],
         maximum_name_weight=trading["tw_minute_max_name_weight"],
@@ -2656,9 +2687,14 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     raw_minute_context_meta = data.get("minute_daily_context_panel_meta")
     data["minute_daily_context_panel_meta"] = (
         None
-        if raw_minute_context_meta is None
-        or not str(raw_minute_context_meta).strip()
+        if raw_minute_context_meta is None or not str(raw_minute_context_meta).strip()
         else str(raw_minute_context_meta).strip()
+    )
+    raw_minute_guidance_path = data.get("minute_daily_guidance_path")
+    data["minute_daily_guidance_path"] = (
+        None
+        if raw_minute_guidance_path is None or not str(raw_minute_guidance_path).strip()
+        else str(raw_minute_guidance_path).strip()
     )
     if (
         trading["execution_mode"] == "tw_minute"
@@ -2776,9 +2812,7 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     )
     futures_total_fees = futures_triple("tw_index_futures_total_fee_per_side_twd")
     futures_slippage = futures_triple("tw_index_futures_slippage_points_per_side")
-    futures_sell_tax_rate = float(
-        trading["tw_index_futures_sell_transaction_tax_rate"]
-    )
+    futures_sell_tax_rate = float(trading["tw_index_futures_sell_transaction_tax_rate"])
     if not math.isfinite(futures_sell_tax_rate) or futures_sell_tax_rate < 0.0:
         raise ValueError(
             "tw_index_futures_sell_transaction_tax_rate must be finite and non-negative"
@@ -2876,9 +2910,9 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(
             "tw_index_derivatives_day_option_margin_schedule_as_of must not be empty"
         )
-    margin_offsets = str(
-        trading["tw_index_derivatives_day_option_margin_offsets"]
-    ).strip().lower()
+    margin_offsets = (
+        str(trading["tw_index_derivatives_day_option_margin_offsets"]).strip().lower()
+    )
     underlying_index_path = str(
         trading["tw_index_derivatives_day_underlying_index_path"]
     ).strip()

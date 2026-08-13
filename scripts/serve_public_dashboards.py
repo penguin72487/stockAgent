@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+from datetime import UTC, datetime
 import gzip
 import hashlib
 from http import HTTPStatus
@@ -41,6 +42,7 @@ MAX_UPSTREAM_BYTES: Final[int] = 8 * 1024 * 1024
 MAX_REQUEST_TARGET_BYTES: Final[int] = 2_048
 PUBLIC_SIGNAL_LIMIT: Final[int] = 250
 API_CONCURRENCY: Final[int] = 32
+MAX_CACHE_ENTRIES: Final[int] = 512
 _OPENER = build_opener(ProxyHandler({}))
 
 
@@ -56,7 +58,9 @@ class PreparedResponse:
 @dataclass
 class CacheEntry:
     expires_at: float
+    stale_until: float
     response: PreparedResponse
+    last_accessed_at: float
 
 
 def _prepared(
@@ -74,6 +78,129 @@ def _prepared(
         etag=f'"sha256-{digest}"',
         cache_control=cache_control,
     )
+
+
+def _response_json(response: PreparedResponse) -> dict[str, Any]:
+    payload = json.loads(response.body)
+    if not isinstance(payload, dict):
+        raise ValueError("cached JSON root is not an object")
+    return payload
+
+
+def _open_position_summary(payload: Mapping[str, Any]) -> tuple[int, int]:
+    open_count = 0
+    stale_count = 0
+    positions = payload.get("positions")
+    if not isinstance(positions, list):
+        return open_count, stale_count
+    for row in positions:
+        if not isinstance(row, Mapping) or not row.get("signed_shares"):
+            continue
+        open_count += 1
+        if row.get("valuation_stale"):
+            stale_count += 1
+    return open_count, stale_count
+
+
+def summarize_tw_status(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Project the frequently polled TW fields without its large ledgers."""
+
+    open_count, stale_count = _open_position_summary(payload)
+    allowed = (
+        "dashboard_schema_version",
+        "generated_at_utc",
+        "health",
+        "source_age_seconds",
+        "source_updated_at",
+        "session_date",
+        "simulation_only",
+        "production_order_possible",
+        "current_market_phase",
+        "modes",
+        "benchmarks",
+        "record_counts",
+        "session_progress",
+        "preopen",
+    )
+    summary = {key: payload[key] for key in allowed if key in payload}
+    summary["open_position_count"] = open_count
+    summary["stale_position_count"] = stale_count
+    return summary
+
+
+def build_public_overview(
+    taifex: Mapping[str, Any],
+    tw: Mapping[str, Any],
+    shioaji: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return only the fields required by the public landing cards."""
+
+    tw_open, _ = _open_position_summary(tw)
+    taifex_strategies = taifex.get("strategies")
+    tw_modes = tw.get("modes")
+    traffic = shioaji.get("traffic")
+    backfill = shioaji.get("backfill")
+    pipeline_summary = shioaji.get("pipeline_summary")
+    market = taifex.get("market")
+    strategy_counts = taifex.get("strategy_counts")
+    return {
+        "schema_version": 1,
+        "generated_at_utc": datetime.now(UTC).isoformat(),
+        "taifex": {
+            "health": taifex.get("health"),
+            "source_age_seconds": taifex.get("source_age_seconds"),
+            "live_strategies": (
+                strategy_counts.get("live_ideal")
+                if isinstance(strategy_counts, Mapping)
+                else len(taifex_strategies)
+                if isinstance(taifex_strategies, list)
+                else 0
+            ),
+            "book_coverage_ratio": (
+                market.get("book_coverage_ratio")
+                if isinstance(market, Mapping)
+                else None
+            ),
+        },
+        "tw": {
+            "health": tw.get("health"),
+            "source_age_seconds": tw.get("source_age_seconds"),
+            "modes": len(tw_modes) if isinstance(tw_modes, list) else 0,
+            "open_positions": tw_open,
+        },
+        "shioaji": {
+            "health": shioaji.get("health"),
+            "source_age_seconds": shioaji.get("source_age_seconds"),
+            "traffic_used_ratio": (
+                traffic.get("used_ratio") if isinstance(traffic, Mapping) else None
+            ),
+            "safe_remaining_bytes": (
+                traffic.get("safe_remaining_bytes")
+                if isinstance(traffic, Mapping)
+                else None
+            ),
+            "completed_contracts": (
+                backfill.get("completed_contracts")
+                if isinstance(backfill, Mapping)
+                else 0
+            ),
+            "inventory_contracts": (
+                backfill.get("inventory_contracts")
+                if isinstance(backfill, Mapping)
+                else 0
+            ),
+            "progress_ratio": (
+                backfill.get("progress_ratio")
+                if isinstance(backfill, Mapping)
+                else None
+            ),
+            "pipeline_total": (
+                pipeline_summary.get("total")
+                if isinstance(pipeline_summary, Mapping)
+                else 0
+            ),
+        },
+    }
 
 
 class PublicDashboardServer(ThreadingHTTPServer):
@@ -105,6 +232,126 @@ class PublicDashboardServer(ThreadingHTTPServer):
         self.api_slots = threading.BoundedSemaphore(API_CONCURRENCY)
         self._cache: dict[str, CacheEntry] = {}
         self._cache_lock = threading.Lock()
+        self._cache_key_locks: dict[str, threading.Lock] = {}
+        self._refreshing: set[str] = set()
+
+    def _store_cached_response(
+        self,
+        cache_key: str,
+        response: PreparedResponse,
+        ttl_seconds: float,
+    ) -> None:
+        observed = time.monotonic()
+        stale_grace_seconds = max(15.0, float(ttl_seconds) * 3.0)
+        with self._cache_lock:
+            self._cache[cache_key] = CacheEntry(
+                expires_at=observed + float(ttl_seconds),
+                stale_until=observed + float(ttl_seconds) + stale_grace_seconds,
+                response=response,
+                last_accessed_at=observed,
+            )
+            if len(self._cache) <= MAX_CACHE_ENTRIES:
+                return
+            removable = sorted(
+                (
+                    (entry.last_accessed_at, key)
+                    for key, entry in self._cache.items()
+                    if key != cache_key
+                    and key not in self._refreshing
+                    and not self._cache_key_locks.get(key, threading.Lock()).locked()
+                )
+            )
+            for _, key in removable[: len(self._cache) - MAX_CACHE_ENTRIES]:
+                self._cache.pop(key, None)
+                self._cache_key_locks.pop(key, None)
+
+    def _background_refresh(
+        self,
+        *,
+        cache_key: str,
+        ttl_seconds: float,
+        builder: Callable[[], PreparedResponse],
+        key_lock: threading.Lock,
+    ) -> None:
+        try:
+            with key_lock:
+                response = builder()
+                self._store_cached_response(cache_key, response, ttl_seconds)
+        except Exception as error:  # keep the last verified response on refresh errors
+            with self._cache_lock:
+                cached = self._cache.get(cache_key)
+                if cached is not None:
+                    cached.expires_at = min(
+                        cached.stale_until,
+                        time.monotonic()
+                        + min(2.0, max(0.5, float(ttl_seconds))),
+                    )
+            sys.stderr.write(
+                f"public-dashboard background_refresh_failed key={cache_key} "
+                f"error={type(error).__name__}\n"
+            )
+        finally:
+            with self._cache_lock:
+                self._refreshing.discard(cache_key)
+
+    def _cached_response(
+        self,
+        *,
+        cache_key: str,
+        ttl_seconds: float,
+        builder: Callable[[], PreparedResponse],
+    ) -> PreparedResponse:
+        """Per-key single-flight cache with stale-while-refresh behavior."""
+
+        start_background = False
+        with self._cache_lock:
+            observed = time.monotonic()
+            cached = self._cache.get(cache_key)
+            if cached is not None:
+                cached.last_accessed_at = observed
+                if cached.expires_at > observed:
+                    return cached.response
+                key_lock = self._cache_key_locks.setdefault(
+                    cache_key, threading.Lock()
+                )
+                if cached.stale_until > observed:
+                    if cache_key not in self._refreshing:
+                        self._refreshing.add(cache_key)
+                        start_background = True
+                    stale_response = cached.response
+                else:
+                    stale_response = None
+            else:
+                key_lock = self._cache_key_locks.setdefault(
+                    cache_key, threading.Lock()
+                )
+                stale_response = None
+
+        if stale_response is not None:
+            if start_background:
+                threading.Thread(
+                    target=self._background_refresh,
+                    kwargs={
+                        "cache_key": cache_key,
+                        "ttl_seconds": ttl_seconds,
+                        "builder": builder,
+                        "key_lock": key_lock,
+                    },
+                    name=f"public-cache-{cache_key[:48]}",
+                    daemon=True,
+                ).start()
+            return stale_response
+
+        with key_lock:
+            with self._cache_lock:
+                observed = time.monotonic()
+                cached = self._cache.get(cache_key)
+                if cached is not None and cached.expires_at > observed:
+                    cached.last_accessed_at = observed
+                    return cached.response
+            response = builder()
+            self._store_cached_response(cache_key, response, ttl_seconds)
+            return response
 
     def cached_local_json(
         self,
@@ -116,15 +363,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
     ) -> PreparedResponse:
         """Build and cache a local allowlisted status payload."""
 
-        observed = time.monotonic()
-        cached = self._cache.get(cache_key)
-        if cached is not None and cached.expires_at > observed:
-            return cached.response
-        with self._cache_lock:
-            observed = time.monotonic()
-            cached = self._cache.get(cache_key)
-            if cached is not None and cached.expires_at > observed:
-                return cached.response
+        def build() -> PreparedResponse:
             encoded = (
                 json.dumps(
                     dict(builder()),
@@ -139,11 +378,13 @@ class PublicDashboardServer(ThreadingHTTPServer):
                 content_type="application/json; charset=utf-8",
                 cache_control=cache_control,
             )
-            self._cache[cache_key] = CacheEntry(
-                expires_at=time.monotonic() + float(ttl_seconds),
-                response=response,
-            )
             return response
+
+        return self._cached_response(
+            cache_key=cache_key,
+            ttl_seconds=ttl_seconds,
+            builder=build,
+        )
 
     def cached_json(
         self,
@@ -154,15 +395,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
         cache_control: str,
         sanitizer: Callable[[Mapping[str, Any]], dict[str, Any]],
     ) -> PreparedResponse:
-        observed = time.monotonic()
-        cached = self._cache.get(cache_key)
-        if cached is not None and cached.expires_at > observed:
-            return cached.response
-        with self._cache_lock:
-            observed = time.monotonic()
-            cached = self._cache.get(cache_key)
-            if cached is not None and cached.expires_at > observed:
-                return cached.response
+        def build() -> PreparedResponse:
             request = _OPENER.open(upstream_url, timeout=15.0)
             try:
                 raw = request.read(MAX_UPSTREAM_BYTES + 1)
@@ -188,11 +421,43 @@ class PublicDashboardServer(ThreadingHTTPServer):
                 content_type="application/json; charset=utf-8",
                 cache_control=cache_control,
             )
-            self._cache[cache_key] = CacheEntry(
-                expires_at=time.monotonic() + float(ttl_seconds),
-                response=response,
-            )
             return response
+
+        return self._cached_response(
+            cache_key=cache_key,
+            ttl_seconds=ttl_seconds,
+            builder=build,
+        )
+
+    def tw_status(self) -> PreparedResponse:
+        return self.cached_json(
+            cache_key="tw-status",
+            upstream_url=f"{self.tw_upstream}/api/status",
+            ttl_seconds=2.0,
+            cache_control="public, max-age=2, stale-while-revalidate=8",
+            sanitizer=sanitize_tw_status,
+        )
+
+    def public_overview(self) -> Mapping[str, Any]:
+        taifex = _response_json(
+            self.cached_json(
+                cache_key="taifex-status",
+                upstream_url=f"{self.taifex_upstream}/api/status",
+                ttl_seconds=2.0,
+                cache_control="public, max-age=2, stale-while-revalidate=8",
+                sanitizer=sanitize_taifex_status,
+            )
+        )
+        tw = _response_json(self.tw_status())
+        shioaji = _response_json(
+            self.cached_local_json(
+                cache_key="shioaji-status",
+                ttl_seconds=8.0,
+                cache_control="public, max-age=5, stale-while-revalidate=15",
+                builder=lambda: build_shioaji_public_status(self.repo_root),
+            )
+        )
+        return build_public_overview(taifex, tw, shioaji)
 
 
 class PublicDashboardHandler(BaseHTTPRequestHandler):
@@ -314,6 +579,11 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                 "text/javascript; charset=utf-8",
                 "public, max-age=300",
             ),
+            "/dashboard-core.css": (
+                self.server.public_static_root / "dashboard-core.css",
+                "text/css; charset=utf-8",
+                "public, max-age=300",
+            ),
             "/robots.txt": (
                 self.server.public_static_root / "robots.txt",
                 "text/plain; charset=utf-8",
@@ -386,12 +656,19 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
         )
 
     def _api_response(self, path: str, raw_query: str) -> PreparedResponse:
+        if path == "/api/overview":
+            return self.server.cached_local_json(
+                cache_key="public-overview",
+                ttl_seconds=2.0,
+                cache_control="public, max-age=2, stale-while-revalidate=8",
+                builder=self.server.public_overview,
+            )
         if path == "/taifex/api/status":
             return self.server.cached_json(
                 cache_key="taifex-status",
                 upstream_url=f"{self.server.taifex_upstream}/api/status",
                 ttl_seconds=2.0,
-                cache_control="public, max-age=2, stale-while-revalidate=3",
+                cache_control="public, max-age=2, stale-while-revalidate=8",
                 sanitizer=sanitize_taifex_status,
             )
         if path == "/taifex/api/history":
@@ -403,12 +680,15 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                 sanitizer=sanitize_taifex_history,
             )
         if path == "/tw-day-trade/api/status":
-            return self.server.cached_json(
-                cache_key="tw-status",
-                upstream_url=f"{self.server.tw_upstream}/api/status",
+            return self.server.tw_status()
+        if path == "/tw-day-trade/api/summary":
+            return self.server.cached_local_json(
+                cache_key="tw-summary",
                 ttl_seconds=2.0,
-                cache_control="public, max-age=2, stale-while-revalidate=3",
-                sanitizer=sanitize_tw_status,
+                cache_control="public, max-age=2, stale-while-revalidate=8",
+                builder=lambda: summarize_tw_status(
+                    _response_json(self.server.tw_status())
+                ),
             )
         if path == "/tw-day-trade/api/signals":
             normalized = self._signal_query(raw_query)
@@ -416,14 +696,14 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                 cache_key=f"tw-signals:{normalized}",
                 upstream_url=f"{self.server.tw_upstream}/api/signals?{normalized}",
                 ttl_seconds=2.0,
-                cache_control="public, max-age=2, stale-while-revalidate=3",
+                cache_control="public, max-age=2, stale-while-revalidate=8",
                 sanitizer=sanitize_tw_signals,
             )
         if path == "/shioaji/api/status":
             return self.server.cached_local_json(
                 cache_key="shioaji-status",
                 ttl_seconds=8.0,
-                cache_control="public, max-age=5, stale-while-revalidate=5",
+                cache_control="public, max-age=5, stale-while-revalidate=15",
                 builder=lambda: build_shioaji_public_status(self.server.repo_root),
             )
         raise KeyError(path)
@@ -458,7 +738,7 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
             return
 
         is_api = "/api/" in path
-        if not self.server.rate_limiter.allow(
+        if is_api and not self.server.rate_limiter.allow(
             self._client_key(), cost=5.0 if path.endswith("/api/history") else 1.0
         ):
             self.send_response(HTTPStatus.TOO_MANY_REQUESTS)

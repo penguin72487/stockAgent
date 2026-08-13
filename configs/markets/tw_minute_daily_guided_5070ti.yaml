@@ -1,0 +1,30 @@
+base_config: tw_minute_daily_guided_dual_5090.yaml
+
+experiment_name: tw-minute-daily-guided-day-trade-10m-5070ti-v1
+
+runner:
+  output_dir: artifacts/markets/tw_minute_daily_guided_day_trade_10m_5070ti_v1
+  post_train_infer: false
+  isolate_train_folds: false
+  resume: true
+
+data:
+  # The runtime excludes the two receipt-backed partitions that contain no
+  # causal feature rows; they remain in the immutable source for audit.
+  minute_parquet_root: data_tw_minute/research_dataset_developing_v5
+  minute_daily_guidance_path: data_tw_minute/daily_guidance/oof_day_trade_10m_v4_requested_weights.parquet
+  # Pinned, immutable tw-public snapshot. This exact cache covers 2012-01-02
+  # through 2026-08-12 and contains the 98-field daily feature contract.
+  minute_daily_context_panel_meta: /srv/stockagent-snapshots/tw-public/tw-public-20260812T130538477887822Z-l0-penguin-96275d4017e0aabe/stocks/panel_cache_v2/variants/a3494447df9377a4a06033b46407dc8dc950e89a2667722011cac0df7c38f931.json
+
+training:
+  # One RTX 5070 Ti has 16 GiB. Start from a conservative 64 compiled policy
+  # rows (8 sessions x 8 decisions); complete-epoch measurements, not this
+  # comment, determine the final capacity setting.
+  multi_gpu_strategy: none
+  batch_size_train: 8
+  batch_size_eval: 4
+  minute_decision_chunk_rows: 8
+  minute_eval_decision_chunk_rows: 8
+  minute_data_workers: 4
+  minute_cpu_cache_gb: 64.0

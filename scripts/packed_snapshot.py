@@ -21,6 +21,7 @@ from stockagent.data_sync.packed_snapshots import (  # noqa: E402
     DEFAULT_LOOSE_FILE_THRESHOLD_BYTES,
     DEFAULT_PACK_BUCKETS,
     fetch_packed_snapshot,
+    fetch_packed_subtree,
     initialize_packed_layout,
     publish_packed_snapshot,
     referenced_packed_objects,
@@ -34,9 +35,7 @@ from stockagent.data_sync.packed_snapshots import (  # noqa: E402
 def _sync_root(value: str | None) -> Path:
     selected = value or os.environ.get("STOCKAGENT_PACKED_SYNC_ROOT")
     if not selected:
-        raise SnapshotError(
-            "provide --sync-root or STOCKAGENT_PACKED_SYNC_ROOT"
-        )
+        raise SnapshotError("provide --sync-root or STOCKAGENT_PACKED_SYNC_ROOT")
     return Path(selected).expanduser()
 
 
@@ -100,7 +99,9 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--replace-ignore", action="store_true")
     init.add_argument("--replace-node-id", action="store_true")
 
-    publish = subparsers.add_parser("publish", help="publish an immutable packed snapshot")
+    publish = subparsers.add_parser(
+        "publish", help="publish an immutable packed snapshot"
+    )
     publish.add_argument("dataset")
     publish.add_argument("source", type=Path)
     publish.add_argument("--sync-root")
@@ -136,6 +137,14 @@ def build_parser() -> argparse.ArgumentParser:
     _add_resolution_arguments(fetch)
     fetch.add_argument("--materialized-root")
     fetch.add_argument("--pin", type=Path)
+
+    fetch_subtree = subparsers.add_parser(
+        "fetch-subtree", help="atomically materialize one snapshot directory"
+    )
+    _add_resolution_arguments(fetch_subtree)
+    fetch_subtree.add_argument("subtree")
+    fetch_subtree.add_argument("--materialized-root")
+    fetch_subtree.add_argument("--pin", type=Path)
 
     objects = subparsers.add_parser(
         "objects", help="count stored and manifest-referenced objects; never deletes"
@@ -228,6 +237,26 @@ def main(argv: list[str] | None = None) -> int:
                 }
             )
             return 0
+        if args.command == "fetch-subtree":
+            root = _sync_root(args.sync_root)
+            resolved = _resolved(args)
+            target = fetch_packed_subtree(
+                root,
+                _materialized_root(args.materialized_root),
+                resolved,
+                args.subtree,
+            )
+            if args.pin:
+                write_packed_pin(args.pin, resolved)
+            _print(
+                {
+                    "snapshot_id": resolved.manifest["snapshot_id"],
+                    "materialized_path": str(target),
+                    "subtree": args.subtree,
+                    "manifest_sha256": resolved.manifest_sha256,
+                }
+            )
+            return 0
         if args.command == "objects":
             root = _sync_root(args.sync_root).resolve()
             stored = {
@@ -256,4 +285,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

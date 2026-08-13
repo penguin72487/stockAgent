@@ -1135,6 +1135,23 @@ Walk-forward summary visualization rules:
 - First-test-year summary visuals should use only each fold's first test year, even when the fold's test split contains all future years.
 - Keep fold-level first-test-year return/risk, turnover, and concentration views visible so strategy behavior can be judged before later test years dominate the picture.
 
+## TAIFEX Live Strategy Dashboard Contract
+
+- The Shioaji TAIFEX strategy engine runs only on market-data worker 0. At the
+  start of every multi-worker capture, read the persisted non-zero option
+  positions exactly once, pass the same code snapshot to every worker, and pin
+  each required complete Call/Put pair ahead of the ordinary ATM selection so
+  it remains within worker 0's 100-contract cap. Missing, expired, incomplete,
+  or over-capacity held pairs must fail startup closed.
+- Construct the engine from the option contracts actually assigned to worker 0,
+  then assert that every persisted held option code is subscribed before
+  reconciliation or strategy steps. Generic fleet coverage on another worker is
+  not strategy valuation coverage.
+- Keep dashboard feed coverage, held-leg subscription/book coverage, fresh
+  executable strategy valuation, recent explicitly labelled `CARRIED`
+  valuation, and unavailable valuation as separate metrics. Never show generic
+  `100/100` callbacks as proof that all strategy curves are currently valued.
+
 ## Testing And Verification
 
 Use focused tests after small changes, then broader tests when training/model/loss code changes.

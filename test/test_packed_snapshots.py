@@ -8,6 +8,7 @@ import pytest
 from stockagent.data_sync.desync_snapshots import SnapshotError, scan_tree
 from stockagent.data_sync.packed_snapshots import (
     fetch_packed_snapshot,
+    fetch_packed_subtree,
     initialize_packed_layout,
     publish_packed_snapshot,
     resolve_latest_packed,
@@ -52,18 +53,67 @@ def test_packed_snapshot_round_trip_and_content_dedup(tmp_path: Path) -> None:
     assert verification["objects"] == archive["object_count"]
 
     target = fetch_packed_snapshot(sync_root, tmp_path / "materialized", resolved)
-    assert scan_tree(target)["portable_fingerprint_sha256"] == scan_tree(source)[
-        "portable_fingerprint_sha256"
-    ]
-    assert (target / "large-a.bin").read_bytes() == (source / "large-a.bin").read_bytes()
+    assert (
+        scan_tree(target)["portable_fingerprint_sha256"]
+        == scan_tree(source)["portable_fingerprint_sha256"]
+    )
+    assert (target / "large-a.bin").read_bytes() == (
+        source / "large-a.bin"
+    ).read_bytes()
     assert (target / "text" / "first.json").read_text(encoding="utf-8") == (
         source / "text" / "first.json"
     ).read_text(encoding="utf-8")
     assert (target / "current").is_symlink()
     assert os.readlink(target / "current") == "text/first.json"
-    assert verify_packed_snapshot(
-        sync_root, resolved, materialized_path=target
-    )["materialized_verified"]
+    assert verify_packed_snapshot(sync_root, resolved, materialized_path=target)[
+        "materialized_verified"
+    ]
+
+
+def test_packed_snapshot_fetch_subtree_is_atomic_and_verified(tmp_path: Path) -> None:
+    source = _source_tree(tmp_path)
+    sync_root = tmp_path / "sync"
+    initialize_packed_layout(sync_root, node_id="node-a")
+    resolved = publish_packed_snapshot(
+        sync_root,
+        "prices",
+        source,
+        loose_file_threshold_bytes=1024,
+        pack_buckets=4,
+    )
+
+    target = fetch_packed_subtree(
+        sync_root, tmp_path / "materialized-subtree", resolved, "text"
+    )
+
+    assert target.name == "text"
+    assert (target / "first.json").read_bytes() == (
+        source / "text" / "first.json"
+    ).read_bytes()
+    assert (target / "second.csv").read_bytes() == (
+        source / "text" / "second.csv"
+    ).read_bytes()
+    assert not (target / "large-a.bin").exists()
+    assert (
+        fetch_packed_subtree(
+            sync_root, tmp_path / "materialized-subtree", resolved, "text"
+        )
+        == target
+    )
+
+
+def test_packed_snapshot_fetch_subtree_rejects_missing_directory(
+    tmp_path: Path,
+) -> None:
+    source = _source_tree(tmp_path)
+    sync_root = tmp_path / "sync"
+    initialize_packed_layout(sync_root, node_id="node-a")
+    resolved = publish_packed_snapshot(sync_root, "prices", source)
+
+    with pytest.raises(SnapshotError, match="subtree is missing"):
+        fetch_packed_subtree(
+            sync_root, tmp_path / "materialized-subtree", resolved, "missing"
+        )
 
 
 def test_unchanged_publish_reuses_identical_content_objects(tmp_path: Path) -> None:
@@ -85,12 +135,11 @@ def test_unchanged_publish_reuses_identical_content_objects(tmp_path: Path) -> N
         pack_buckets=4,
     )
 
-    assert first.manifest["archive"]["inventory"]["sha256"] == second.manifest[
-        "archive"
-    ]["inventory"]["sha256"]
-    assert first.manifest["archive"]["objects"] == second.manifest["archive"][
-        "objects"
-    ]
+    assert (
+        first.manifest["archive"]["inventory"]["sha256"]
+        == second.manifest["archive"]["inventory"]["sha256"]
+    )
+    assert first.manifest["archive"]["objects"] == second.manifest["archive"]["objects"]
     assert first.manifest["snapshot_id"] != second.manifest["snapshot_id"]
 
 
@@ -124,7 +173,9 @@ def test_corrupt_object_is_rejected(tmp_path: Path) -> None:
         pack_buckets=2,
     )
     pack = next(
-        item for item in resolved.manifest["archive"]["objects"] if item["kind"] == "pack"
+        item
+        for item in resolved.manifest["archive"]["objects"]
+        if item["kind"] == "pack"
     )
     pack_path = sync_root.joinpath(*Path(pack["relpath"]).parts)
     with pack_path.open("r+b") as stream:
@@ -146,4 +197,3 @@ def test_symlink_that_escapes_source_is_rejected(tmp_path: Path) -> None:
 
     with pytest.raises(SnapshotError, match="escapes the snapshot root"):
         publish_packed_snapshot(sync_root, "prices", source)
-
