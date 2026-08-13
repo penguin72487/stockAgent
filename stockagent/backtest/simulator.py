@@ -68,11 +68,11 @@ except Exception:  # pragma: no cover - Numba is an acceleration dependency
 INT64_MIN_FLOAT_SAFE = np.nextafter(float(np.iinfo(np.int64).min), 0.0)
 INT64_MAX_FLOAT_SAFE = np.nextafter(float(np.iinfo(np.int64).max + 1), 0.0)
 SCAN_CHUNK_CANDIDATES = (64, 128, 256, 512)
-# v10 separates gross Taiwan commission collection from the economically
-# earned broker rebate, including daily-close / next-month-15th cash timing and
-# recurrent pending-rebate state.  Cash availability and NAV therefore differ
-# from every older optimizer/backtest contract.
-CANONICAL_BACKTEST_CONTRACT_VERSION = 10
+# v11 prevents point-in-time side masks, liquidity caps, and whole-lot rounding
+# from silently turning a two-sided Taiwan day-trade target into a one-sided
+# bet.  v10 separated gross commission collection from the economically earned
+# broker rebate and added recurrent pending-rebate state.
+CANONICAL_BACKTEST_CONTRACT_VERSION = 11
 
 _SCAN_CHUNK_CACHE: dict[tuple, int] = {}
 _SCAN_COMPILED_CACHE: dict[

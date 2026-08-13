@@ -1,0 +1,352 @@
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+import json
+from pathlib import Path
+
+import pytest
+
+from stockagent.live.taifex_volatility_dashboard import (
+    _performance_metrics,
+    build_dashboard_snapshot,
+)
+
+
+def _write_json(path: Path, payload: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+
+
+def _fixture(tmp_path: Path, *, age_seconds: float = 2.0) -> tuple[Path, Path]:
+    state_dir = tmp_path / "state"
+    receipts = tmp_path / "receipts"
+    now = datetime(2026, 8, 12, 1, 30, tzinfo=timezone.utc)
+    strategy_ids = ["classic_opening_straddle", "daily_vol_model_gamma__black_scholes"]
+    marks = {
+        strategy_id: {
+            "strategy_id": strategy_id,
+            "net_equity_twd": 125.0,
+            "cumulative_pnl_twd": 125.0,
+            "initial_capital_twd": 1_000.0,
+            "total_equity_twd": 1_125.0,
+            "gross_cash_twd": -10_000.0,
+            "open_liquidation_value_twd": 10_200.0,
+            "fixed_fees_twd": 44.0,
+            "transaction_tax_twd": 31.0,
+            "futures_position": 0,
+            "option_positions": {"TXO-C": 2, "TXO-P": -1},
+            "option_books_valid": True,
+            "future_book_valid": True,
+        }
+        for strategy_id in strategy_ids
+    }
+    _write_json(
+        state_dir / "status.json",
+        {
+            "updated_at_utc": (now - timedelta(seconds=age_seconds)).isoformat(),
+            "engine_status": "cycle_open",
+            "blocked_reason": None,
+            "simulation_only": True,
+            "production_order_possible": False,
+            "current_session": "night",
+            "current_trading_date": "2026-08-13",
+            "intraday_entry_cutoff": "13:20:00",
+            "intraday_flatten_time": "13:35:00",
+            "night_entry_cutoff": "04:40:00",
+            "night_flatten_time": "04:55:00",
+            "bootstrap_after_date": "2026-08-11",
+            "broker_orders_enabled": True,
+            "broker_order_failures": 0,
+            "inflight_order_count": 0,
+            "underlying_contract": "TXFH6",
+            "hedge_contract": "MXFH6",
+            "option_contract_count": 98,
+            "latest_book_count": 100,
+            "active_cycle": {
+                "cycle_id": "safe-cycle",
+                "expiry_date": "2026-08-14",
+                "strike": 45_000,
+                "account_id": "must-not-leak",
+            },
+            "pending_targets": {},
+            "strategies": marks,
+        },
+    )
+    _write_json(
+        state_dir / "state.json",
+        {
+            "schema_version": 1,
+            "strategy_ids": strategy_ids,
+            "strategies": {
+                strategy_id: {"initial_capital_twd": 1_000.0}
+                for strategy_id in strategy_ids
+            },
+            "account_id": "secret",
+        },
+    )
+    mark_rows = []
+    for minute in range(12):
+        for strategy_id in strategy_ids:
+            mark_rows.append(
+                {
+                    "recorded_at_utc": now.isoformat(),
+                    "decision_ts_ns": int(
+                        (now - timedelta(minutes=11 - minute)).timestamp() * 1e9
+                    ),
+                    "strategy_id": strategy_id,
+                    "net_equity_twd": float(minute),
+                    "gross_cash_twd": 0.0,
+                    "open_liquidation_value_twd": float(minute),
+                    "fixed_fees_twd": 0.0,
+                    "transaction_tax_twd": 0.0,
+                    "futures_position": 0,
+                    "option_books_valid": True,
+                    "future_book_valid": True,
+                }
+            )
+    (state_dir / "marks.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in mark_rows), encoding="utf-8"
+    )
+    (state_dir / "events.jsonl").write_text("{}\n", encoding="utf-8")
+    _write_json(
+        receipts / "20260812-futures-simulation-lifecycle.json",
+        {
+            "account": {"account_id": "must-not-leak"},
+            "result": "ok",
+            "simulation": True,
+            "production_order_possible": False,
+            "logical_contract": "TXFR1",
+            "resolved_contract": "TXFH6",
+            "baseline_position": 0,
+            "final_position": 0,
+            "finished_at_utc": now.isoformat(),
+            "steps": [{"order_id": "must-not-leak"}],
+        },
+    )
+    return state_dir, receipts
+
+
+def test_dashboard_snapshot_is_bounded_fresh_and_account_safe(tmp_path: Path) -> None:
+    state_dir, receipts = _fixture(tmp_path)
+    now = datetime(2026, 8, 12, 1, 30, tzinfo=timezone.utc)
+    payload = build_dashboard_snapshot(
+        state_dir=state_dir,
+        api_receipt_dir=receipts,
+        now=now,
+        mark_limit_per_strategy=8,
+    )
+    assert payload["health"] == "active"
+    assert payload["dashboard_schema_version"] == 6
+    assert payload["source_age_seconds"] == 2.0
+    assert payload["market"]["book_coverage_ratio"] == 1.0
+    assert len(payload["strategies"]) == 2
+    assert payload["strategy_counts"]["live_ideal"] == 53
+    assert payload["strategy_counts"]["blocked_contract"] >= 1
+    assert (
+        len(payload["strategy_catalog"]) == payload["strategy_counts"]["catalog_total"]
+    )
+    assert any(
+        row["strategy_id"] == "short_atm_straddle"
+        and row["availability"] == "live_ideal"
+        and row["directional_exposure"] == "neutral"
+        and row["volatility_exposure"] == "short_volatility"
+        and row["design_option_short_ratio"] == 1.0
+        for row in payload["strategy_catalog"]
+    )
+    assert any(
+        row["strategy_id"] == "conversion"
+        and row["directional_exposure"] == "hedged_neutral"
+        and row["volatility_exposure"] == "volatility_neutral"
+        and row["hedge_type"] == "parity_locked"
+        and row["design_option_long_ratio"] == 0.5
+        for row in payload["strategy_catalog"]
+    )
+    assert len(payload["history"]) == 16
+    assert payload["record_counts"]["marks"] == 24
+    assert payload["api_round_trip"]["result"] == "ok"
+    assert payload["current_session"] == "night"
+    assert payload["current_market_phase"] == "day_continuous"
+    assert payload["runner_mode"] == "always_on_scheduled_capture"
+    assert len(payload["trading_schedule"]) == 6
+    assert payload["trading_schedule"][0]["ideal_fill_allowed"] is False
+    assert payload["trading_schedule"][1]["ideal_fill_allowed"] is True
+    assert payload["catalog_expansion_entry_policy"] is None
+    assert payload["current_trading_date"] == "2026-08-13"
+    assert payload["night_flatten_time"] == "04:55:00"
+    first = payload["strategies"][0]
+    assert first["reserved_capital_twd"] == 1_000.0
+    assert first["one_unit_net_pnl_twd"] == 125.0
+    assert first["one_unit_net_pnl_abs_twd"] == 125.0
+    assert first["fixed_capital_return"] == 0.125
+    assert first["explicit_cost_twd"] == 75.0
+    assert first["net_pnl_to_explicit_cost_ratio"] == pytest.approx(5 / 3)
+    assert first["observed_trading_day_count"] == 2
+    assert first["compounded_return_to_live_mark"] == pytest.approx(0.126254)
+    assert first["directional_exposure"] == "neutral"
+    assert first["volatility_exposure"] == "long_volatility"
+    assert first["design_option_ratio_label"] == "多 100% / 空 0% (2:0 口)"
+    assert first["live_option_long_ratio"] == pytest.approx(2 / 3)
+    assert first["live_option_short_ratio"] == pytest.approx(1 / 3)
+    assert first["live_option_ratio_label"] == "多 67% / 空 33% (2:1 口)"
+    assert payload["exposure_summary"]["ratio_basis"]
+    assert payload["exposure_summary"]["live"]["directional_exposure"]
+    assert payload["exposure_taxonomy"]["hedge_type"]["dynamic_delta"]["label"]
+    summary = payload["portfolio_summary"]
+    assert summary["independent_strategy_reserved_capital_twd"] == 2_000.0
+    assert summary["independent_strategy_explicit_cost_twd"] == 150.0
+    assert summary["median_fixed_capital_return"] == 0.125
+    assert payload["metric_definitions"]["fixed_capital_return"]
+    assert "account" not in json.dumps(payload).casefold()
+    assert "order_id" not in json.dumps(payload).casefold()
+
+
+def test_dashboard_snapshot_fails_visible_when_source_is_stale(tmp_path: Path) -> None:
+    state_dir, receipts = _fixture(tmp_path, age_seconds=20.0)
+    payload = build_dashboard_snapshot(
+        state_dir=state_dir,
+        api_receipt_dir=receipts,
+        now=datetime(2026, 8, 12, 1, 30, tzinfo=timezone.utc),
+    )
+    assert payload["health"] == "stale"
+
+
+def test_dashboard_expected_closed_gap_is_waiting_not_stale(tmp_path: Path) -> None:
+    state_dir, receipts = _fixture(tmp_path, age_seconds=300.0)
+    payload = build_dashboard_snapshot(
+        state_dir=state_dir,
+        api_receipt_dir=receipts,
+        now=datetime(2026, 8, 12, 6, 0, tzinfo=timezone.utc),
+    )
+    assert payload["current_market_phase"] == "day_close_to_night_preopen"
+    assert payload["source_fresh_expected"] is False
+    assert payload["health"] == "waiting"
+
+
+def test_dashboard_append_only_counts_and_tail_follow_new_rows(tmp_path: Path) -> None:
+    state_dir, receipts = _fixture(tmp_path)
+    now = datetime(2026, 8, 12, 1, 30, tzinfo=timezone.utc)
+    first = build_dashboard_snapshot(
+        state_dir=state_dir,
+        api_receipt_dir=receipts,
+        now=now,
+        mark_limit_per_strategy=2,
+    )
+    new_row = {
+        "recorded_at_utc": now.isoformat(),
+        "decision_ts_ns": int(now.timestamp() * 1e9),
+        "strategy_id": "classic_opening_straddle",
+        "net_equity_twd": 99.0,
+        "open_liquidation_value_twd": 99.0,
+        "option_books_valid": True,
+        "future_book_valid": True,
+    }
+    with (state_dir / "marks.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(new_row) + "\n")
+
+    second = build_dashboard_snapshot(
+        state_dir=state_dir,
+        api_receipt_dir=receipts,
+        now=now,
+        mark_limit_per_strategy=2,
+    )
+    assert first["record_counts"]["marks"] == 24
+    assert second["record_counts"]["marks"] == 25
+    classic = [
+        row
+        for row in second["history"]
+        if row["strategy_id"] == "classic_opening_straddle"
+    ]
+    assert len(classic) == 2
+    assert classic[-1]["net_equity_twd"] == 99.0
+    assert classic[-1]["total_equity_twd"] == 1_099.0
+
+
+def test_dashboard_carries_previous_complete_mark_instead_of_partial_jump(
+    tmp_path: Path,
+) -> None:
+    state_dir, receipts = _fixture(tmp_path)
+    now = datetime(2026, 8, 12, 1, 30, tzinfo=timezone.utc)
+    invalid = {
+        "recorded_at_utc": now.isoformat(),
+        "decision_ts_ns": int(now.timestamp() * 1e9),
+        "strategy_id": "classic_opening_straddle",
+        "active_cycle_id": None,
+        "net_equity_twd": 450_000.0,
+        "gross_cash_twd": 0.0,
+        "open_liquidation_value_twd": 450_000.0,
+        "fixed_fees_twd": 0.0,
+        "transaction_tax_twd": 0.0,
+        "futures_position": 0,
+        "option_books_valid": False,
+        "future_book_valid": True,
+    }
+    with (state_dir / "marks.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(invalid) + "\n")
+
+    payload = build_dashboard_snapshot(
+        state_dir=state_dir,
+        api_receipt_dir=receipts,
+        now=now,
+    )
+    classic = [
+        row
+        for row in payload["history"]
+        if row["strategy_id"] == "classic_opening_straddle"
+    ]
+    assert classic[-1]["valuation_carried_forward"] is True
+    assert classic[-1]["cumulative_pnl_twd"] == classic[-2]["cumulative_pnl_twd"]
+    assert classic[-1]["total_equity_twd"] == classic[-2]["total_equity_twd"]
+    assert classic[-1]["total_equity_twd"] != 451_000.0
+
+
+def test_dashboard_compounds_daily_pnl_changes_not_minute_marks() -> None:
+    metrics = _performance_metrics(
+        daily_endpoints={
+            "2026-08-12": (1, 100.0),
+            "2026-08-13": (2, 210.0),
+        },
+        current_trading_date="2026-08-13",
+        current_ts_ns=2,
+        current_pnl_twd=210.0,
+        reserved_capital_twd=1_000.0,
+        explicit_cost_twd=25.0,
+        margin_required_twd=400.0,
+    )
+    assert metrics["fixed_capital_return"] == 0.21
+    assert metrics["compounded_return_to_live_mark"] == pytest.approx(0.221)
+    assert metrics["margin_utilization"] == 0.4
+    assert metrics["observed_trading_day_count"] == 2
+    assert metrics["compound_includes_partial_trading_day"] is True
+
+
+def test_dashboard_html_is_local_and_refreshes_the_read_only_api() -> None:
+    root = Path(__file__).resolve().parents[1] / "services" / "taifex_dashboard"
+    html = (root / "index.html").read_text(encoding="utf-8")
+    javascript = (root / "app.js").read_text(encoding="utf-8")
+    assert "http://" not in html and "https://" not in html
+    assert 'fetch("api/status"' in javascript
+    assert 'fetch("api/history"' in javascript
+    assert "window.setInterval(refresh, REFRESH_MS)" in javascript
+    assert "window.setInterval(refreshHistory, 60000)" in javascript
+    assert "row.total_equity_twd" in javascript
+    assert "row.total_equity_twd != null" in javascript
+    assert "CARRIED" in javascript
+    assert 'id="night-session-times"' in html
+    assert 'id="strategy-guide-grid"' in html
+    assert 'id="curve-wall-grid"' in html
+    assert 'id="strategy-sort"' in html
+    assert 'id="exposure-direction-filter"' in html
+    assert 'id="exposure-volatility-filter"' in html
+    assert 'id="exposure-hedge-filter"' in html
+    assert 'id="exposure-summary"' in html
+    assert 'id="performance-reserve"' in html
+    assert 'id="runner-mode"' in html
+    assert 'id="night-official-session"' in html
+    assert "所有策略怎麼做" in html
+    assert 'setText("current-session"' in javascript
+    assert "renderStrategyGuide" in javascript
+    assert "renderCurveWall" in javascript
+    assert "renderExposureSummary" in javascript
+    assert "matchesExposureFilters" in javascript
+    assert "row.design_option_ratio_label" in javascript
+    assert "compounded_return_to_live_mark" in javascript

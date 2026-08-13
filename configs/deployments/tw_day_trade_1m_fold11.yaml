@@ -1,0 +1,14 @@
+base_config: ../markets/tw_day_trade_1m.yaml
+
+# Immutable inference contract for the restored TWD 1 million fold-11
+# checkpoint.  The checkpoint was trained with the complete 99-feature TW
+# public schema; the active research config may deliberately exclude slower
+# official datasets, but live inference must retain the saved schema.
+experiment_name: tw-day-trade-initial-capital-1m-fold11-deployment
+
+runner:
+  output_dir: artifacts/markets/tw_day_trade_1m
+  resume: false
+
+data:
+  feature_exclude: []

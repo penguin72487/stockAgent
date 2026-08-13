@@ -5,15 +5,21 @@ market_type: tw
 timezone: Asia/Taipei
 open_time: "09:00"
 close_time: "13:30"
+schedule_time: "09:00"
+preopen_prepare_time: "08:30"
 summary_time: "14:00"
 data_ready_time: "13:40"
 freshness_max_lag_days: 3
 freshness_scan_limit: 0
 holidays: []
 initial_capital: 100000000.0
+day_trade_simulation_enabled: true
+day_trade_simulation_state_dir: artifacts/live/tw_day_trade_simulation
+day_trade_rule_data_dir: /srv/stockagent-live/data_tw_public
+day_trade_quote_interval_seconds: 60
 
-# Data is shared with the other TW modes. There is no independent automatic
-# broadcast schedule; users opt in through /watch or request /signal_now.
+# 09:00 is a gate: inference starts only after a real opening quote exists;
+# paper entry then uses a causally later executable best quote.
 pre_signal_command:
   - "{python}"
   - scripts/refresh_tw_public_live_snapshot.py
@@ -23,7 +29,7 @@ pre_signal_timeout_seconds: 14400
 previous_signal_backfill_limit: 512
 
 model_selection_path: ../models/tw_day_trade_100m.yaml
-config_path: configs/markets/tw_day_trade_100m.yaml
+config_path: configs/deployments/tw_day_trade_100m_fold11.yaml
 output_dir: artifacts/markets/tw_day_trade_100m
 live_output_dir: artifacts/live_signals
 fold_id: 11

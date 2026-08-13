@@ -35,6 +35,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--contract", default="TXFR1")
     parser.add_argument("--quantity", type=int, default=1)
     parser.add_argument(
+        "--restore-position",
+        type=int,
+        default=None,
+        help=(
+            "simulation-only recovery mode: skip the round trip and restore the "
+            "resolved contract to this signed net position"
+        ),
+    )
+    parser.add_argument(
+        "--max-restore-quantity",
+        type=int,
+        default=2,
+        help="explicit simulation recovery size guard (default: 2)",
+    )
+    parser.add_argument(
         "--execute-simulation",
         action="store_true",
         help="required acknowledgement; production mode is not implemented",
@@ -132,7 +147,7 @@ def _poll_terminal(
     trade: Any,
     *,
     sleeper: Callable[[float], None] = time.sleep,
-    attempts: int = 20,
+    attempts: int = 60,
 ) -> dict[str, Any]:
     latest = _status_summary(trade)
     for _ in range(attempts):
@@ -142,6 +157,60 @@ def _poll_terminal(
         api.update_status(trade=trade)
         latest = _status_summary(trade)
     return latest
+
+
+def _current_net_position(api: Any, account: Any, code: str) -> int:
+    api.update_status(account)
+    return _net_position(list(api.list_positions(account=account)), code)
+
+
+def _restore_net_position(
+    *,
+    api: Any,
+    sj: Any,
+    account: Any,
+    contract: Any,
+    code: str,
+    target: int,
+    maximum_quantity: int,
+    sleeper: Callable[[float], None],
+) -> tuple[int, dict[str, Any] | None]:
+    """Restore one simulation contract from broker truth without blind retries."""
+
+    current = _current_net_position(api, account, code)
+    delta = int(target) - current
+    if delta == 0:
+        return current, None
+    if abs(delta) > int(maximum_quantity):
+        raise RuntimeError(
+            "refusing simulation recovery beyond the explicit size guard: "
+            f"{current} -> {target}, max={maximum_quantity}"
+        )
+    _snapshot_book(api, contract)
+    order = sj.FuturesOrder(
+        action=sj.Action.Buy if delta > 0 else sj.Action.Sell,
+        price=0,
+        quantity=abs(delta),
+        price_type=sj.FuturesPriceType.MKT,
+        order_type=sj.OrderType.IOC,
+        octype=sj.FuturesOCType.Auto,
+        custom_field="FAPIRC",
+        account=account,
+    )
+    trade = api.place_order(contract, order)
+    status = _poll_terminal(api, trade, sleeper=sleeper)
+    observed = current
+    for _ in range(60):
+        observed = _current_net_position(api, account, code)
+        if observed == int(target):
+            break
+        sleeper(0.5)
+    if observed != int(target):
+        raise RuntimeError(
+            "simulation recovery did not reach target position: "
+            f"{current} -> {observed}, target={target}, order={status}"
+        )
+    return observed, status
 
 
 def _snapshot_book(api: Any, contract: Any) -> dict[str, float]:
@@ -210,6 +279,10 @@ def run_futures_simulation_lifecycle(
         raise RuntimeError("refusing to run without --execute-simulation")
     if int(args.quantity) != 1:
         raise RuntimeError("this one-lot safety test requires --quantity 1")
+    restore_position = getattr(args, "restore_position", None)
+    maximum_restore_quantity = int(getattr(args, "max_restore_quantity", 2))
+    if not 1 <= maximum_restore_quantity <= 20:
+        raise RuntimeError("max-restore-quantity safety bound is 1..20")
     if enforce_session and not _session_open():
         raise RuntimeError("TAIFEX day/night continuous session is not open")
     api_key = _required_credential("SHIOAJI_API_KEY", "SHIOAJI_TRADE_API_KEY")
@@ -228,6 +301,9 @@ def run_futures_simulation_lifecycle(
         "session": taifex_session_kind(observed_at_taipei),
         "trading_date": taifex_trading_date(observed_at_taipei).isoformat(),
         "logical_contract": str(args.contract),
+        "operation": (
+            "position_restore" if restore_position is not None else "round_trip"
+        ),
         "quantity": 1,
         "steps": [],
         "callback_events": [],
@@ -240,6 +316,8 @@ def run_futures_simulation_lifecycle(
     concrete_contract: Any | None = None
     account: Any | None = None
     baseline_position = 0
+    receipt: Path | None = None
+    closing_trade: Any | None = None
     try:
         if hasattr(api, "set_event_callback"):
             api.set_event_callback(lambda *_args: None)
@@ -293,6 +371,35 @@ def run_futures_simulation_lifecycle(
         before_positions = list(api.list_positions(account=account))
         baseline_position = _net_position(before_positions, concrete_code)
         summary["baseline_position"] = baseline_position
+        if restore_position is not None:
+            final_position, recovery_status = _restore_net_position(
+                api=api,
+                sj=sj,
+                account=account,
+                contract=concrete_contract,
+                code=concrete_code,
+                target=int(restore_position),
+                maximum_quantity=maximum_restore_quantity,
+                sleeper=sleeper,
+            )
+            summary["final_position"] = final_position
+            summary["steps"].append(
+                {
+                    "step": "restore_simulation_position",
+                    "status": "ok",
+                    "baseline_position": baseline_position,
+                    "target_position": int(restore_position),
+                    "final_position": final_position,
+                    "order": recovery_status,
+                }
+            )
+            summary["result"] = "ok"
+            summary["finished_at_utc"] = datetime.now(timezone.utc).isoformat()
+            summary["callback_event_count"] = len(summary["callback_events"])
+            api.logout()
+            logged_in = False
+            receipt = _write_receipt(Path(args.receipt_dir), summary)
+            return summary, receipt
         opening_book = _snapshot_book(api, concrete_contract)
         summary["opening_book"] = opening_book
         buy_order = sj.FuturesOrder(
@@ -327,6 +434,7 @@ def run_futures_simulation_lifecycle(
             account=account,
         )
         sell_trade = api.place_order(concrete_contract, sell_order)
+        closing_trade = sell_trade
         sell_status = _poll_terminal(api, sell_trade, sleeper=sleeper)
         summary["steps"].append({"step": "market_sell_ioc", **sell_status})
         if int(sell_status["deal_quantity"]) != opened_quantity:
@@ -359,27 +467,47 @@ def run_futures_simulation_lifecycle(
         summary["result"] = "ok"
     except Exception as exc:
         summary["error"] = f"{type(exc).__name__}: {exc}"
-        # If the opening leg filled but the normal close path failed, make one
-        # best-effort simulation-only IOC close before returning a failed test.
+        # Recover from broker position truth.  Never submit a second blind close:
+        # delayed simulation fills can otherwise turn a flat account short.
         if opened_quantity and concrete_contract is not None and account is not None:
             try:
-                book = _snapshot_book(api, concrete_contract)
-                emergency = sj.FuturesOrder(
-                    action=sj.Action.Sell,
-                    price=0,
-                    quantity=opened_quantity,
-                    price_type=sj.FuturesPriceType.MKT,
-                    order_type=sj.OrderType.IOC,
-                    octype=sj.FuturesOCType.Auto,
-                    custom_field="FAPIFL",
+                if (
+                    closing_trade is not None
+                    and _status_value(closing_trade) not in TERMINAL_STATUSES
+                ):
+                    cancelled = api.cancel_order(closing_trade)
+                    if cancelled is not None:
+                        closing_trade = cancelled
+                    cancel_status = _poll_terminal(
+                        api, closing_trade, sleeper=sleeper
+                    )
+                    summary["steps"].append(
+                        {"step": "cancel_unresolved_close", **cancel_status}
+                    )
+                    if cancel_status["status"] not in TERMINAL_STATUSES:
+                        raise RuntimeError(
+                            "cannot restore while the original close remains nonterminal"
+                        )
+                recovered, emergency_status = _restore_net_position(
+                    api=api,
+                    sj=sj,
                     account=account,
+                    contract=concrete_contract,
+                    code=str(getattr(concrete_contract, "code", "")),
+                    target=baseline_position,
+                    maximum_quantity=maximum_restore_quantity,
+                    sleeper=sleeper,
                 )
-                emergency_trade = api.place_order(concrete_contract, emergency)
-                emergency_status = _poll_terminal(api, emergency_trade, sleeper=sleeper)
                 summary["steps"].append(
-                    {"step": "emergency_simulation_close", **emergency_status}
+                    {
+                        "step": "restore_simulation_baseline",
+                        "status": "ok",
+                        "target_position": baseline_position,
+                        "final_position": recovered,
+                        "order": emergency_status,
+                    }
                 )
-                if int(emergency_status["deal_quantity"]) == opened_quantity:
+                if recovered == baseline_position:
                     opened_quantity = 0
             except Exception as close_exc:
                 summary["emergency_close_error"] = (
@@ -393,7 +521,9 @@ def run_futures_simulation_lifecycle(
                 api.logout()
             except Exception as exc:
                 summary["logout_error"] = f"{type(exc).__name__}: {exc}"
-        receipt = _write_receipt(Path(args.receipt_dir), summary)
+        if receipt is None:
+            receipt = _write_receipt(Path(args.receipt_dir), summary)
+    assert receipt is not None
     return summary, receipt
 
 

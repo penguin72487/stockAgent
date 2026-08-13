@@ -1,6 +1,6 @@
 # Immutable manual deployment for the TWD 1 million TW intraday model.
 mode: manual
-config_path: configs/markets/tw_day_trade_1m.yaml
+config_path: configs/deployments/tw_day_trade_1m_fold11.yaml
 output_dir: artifacts/markets/tw_day_trade_1m
 fold_id: 11
 checkpoint_path: artifacts/markets/tw_day_trade_1m/fold_11/checkpoint_best.pt
@@ -9,6 +9,6 @@ model_scoped_live_output: true
 model_candidate_output_dirs:
   - artifacts/markets/tw_day_trade_1m
 model_candidate_config_paths:
-  - configs/markets/tw_day_trade_1m.yaml
+  - configs/deployments/tw_day_trade_1m_fold11.yaml
 model_deployment_manifest: artifacts/discord_bot/deployments/tw_day_trade_1m.json
 model_auto_deploy_interval_seconds: 60

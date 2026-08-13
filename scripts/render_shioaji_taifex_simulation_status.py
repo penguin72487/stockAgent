@@ -11,7 +11,6 @@ from pathlib import Path
 import subprocess
 from typing import Any
 
-
 DEFAULT_STATE_DIR = Path("artifacts/live/shioaji_taifex_volatility_simulation")
 DEFAULT_API_RECEIPTS = Path("artifacts/orders/shioaji_futures_simulation")
 
@@ -101,8 +100,9 @@ def render(*, state_dir: Path, api_receipt_dir: Path, output: Path) -> Path:
             f"{receipt.get('resolved_contract')}；baseline/final position "
             f"{receipt.get('baseline_position')} / {receipt.get('final_position')}"
         )
+    strategy_count = len(status.get("strategies") or state.get("strategy_ids") or ())
     lines = [
-        "# 永豐 TAIFEX 七策略模擬交易即時狀態",
+        f"# 永豐 TAIFEX {strategy_count} 策略模擬交易即時狀態",
         "",
         f"- 產生時間：{datetime.now().astimezone().isoformat(timespec='seconds')}",
         f"- systemd：`{service_text}`，enabled=`{service.get('UnitFileState', 'unknown')}`，PID=`{service.get('MainPID', 'unknown')}`，restarts=`{service.get('NRestarts', 'unknown')}`",
@@ -113,20 +113,20 @@ def render(*, state_dir: Path, api_receipt_dir: Path, output: Path) -> Path:
         f"- Active cycle：`{cycle if cycle is not None else 'flat'}`；pending targets={len(pending)}",
         f"- 永豐期貨 API round-trip：{api_text}",
         "",
-        "## 七個獨立理想可成交價帳本",
+        f"## {strategy_count} 個獨立理想可成交價帳本",
         "",
         "| 策略 | 即時淨值 TWD | MTX 部位 | 累計手續費 | 累計稅 | Book 有效 |",
         "|---|---:|---:|---:|---:|:---:|",
         *rows,
         "",
-        "理想帳使用收到當下的一口對手價：買進用 best ask、賣出用 best bid。永豐模擬帳戶會把七策略委託淨額合併，因此 broker callback 只做下單／成交／對帳證據，不拿來拆分各策略 P&L。",
+        "理想帳依收到當下的五檔深度成交：買進掃 ask、賣出掃 bid。永豐模擬帳戶只鏡射參考部位與指定模型避險，因此 broker callback 只做下單／成交／對帳證據，不拿來拆分各策略 P&L。",
         "",
         "## 紀錄檔",
         "",
         f"- `status.json`：即時快照（每 5 秒更新）",
         f"- `state.json`：可重啟狀態與 inflight order gate",
         f"- `ideal_ledger.jsonl`：{_line_count(state_dir / 'ideal_ledger.jsonl'):,} 筆理想 Bid/Ask 成交帳",
-        f"- `marks.jsonl`：{_line_count(state_dir / 'marks.jsonl'):,} 筆每分鐘七策略 mark",
+        f"- `marks.jsonl`：{_line_count(state_dir / 'marks.jsonl'):,} 筆每分鐘全策略 mark",
         f"- `calibrations.jsonl`：{_line_count(state_dir / 'calibrations.jsonl'):,} 筆模型校準與下一日 MTX target",
         f"- `events.jsonl`：{_line_count(state_dir / 'events.jsonl'):,} 筆決策、委託、成交與錯誤事件",
         f"- 期貨 API receipt：`{receipt_path if receipt_path else 'missing'}`",

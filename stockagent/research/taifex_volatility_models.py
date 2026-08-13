@@ -27,41 +27,17 @@ from scipy.optimize import least_squares
 
 from stockagent.data.tw_index_derivatives_tick import TAIPEI
 from stockagent.data.tw_index_options_daily import taifex_option_expiry
-
-
-MODEL_BLACK_SCHOLES: Final[str] = "black_scholes"
-MODEL_HESTON_SVI: Final[str] = "heston_svi_proxy"
-MODEL_SABR: Final[str] = "sabr_hagan_beta1"
-MODEL_LOCAL_VOL: Final[str] = "local_vol_surface_proxy"
-MODEL_SLV: Final[str] = "slv_blend_proxy"
-MODEL_ROUGH_VOL: Final[str] = "rough_vol_power_law_proxy"
-
-VOLATILITY_MODEL_IDS: Final[tuple[str, ...]] = (
+from stockagent.research.taifex_volatility_metadata import (
     MODEL_BLACK_SCHOLES,
     MODEL_HESTON_SVI,
-    MODEL_SABR,
     MODEL_LOCAL_VOL,
-    MODEL_SLV,
     MODEL_ROUGH_VOL,
+    MODEL_SABR,
+    MODEL_SLV,
+    VOLATILITY_MODEL_IDS,
+    VOLATILITY_MODEL_IMPLEMENTATION,
+    VOLATILITY_MODEL_LABELS,
 )
-
-VOLATILITY_MODEL_LABELS: Final[dict[str, str]] = {
-    MODEL_BLACK_SCHOLES: "Black-Scholes (flat IV)",
-    MODEL_HESTON_SVI: "Heston (raw-SVI surface proxy)",
-    MODEL_SABR: "SABR (Hagan beta=1)",
-    MODEL_LOCAL_VOL: "Local Vol (smooth-surface delta proxy)",
-    MODEL_SLV: "SLV (local/Heston surface blend proxy)",
-    MODEL_ROUGH_VOL: "Rough Vol (power-law term-skew proxy)",
-}
-
-VOLATILITY_MODEL_IMPLEMENTATION: Final[dict[str, str]] = {
-    MODEL_BLACK_SCHOLES: "direct_formula",
-    MODEL_HESTON_SVI: "surface_proxy_not_heston_characteristic_function",
-    MODEL_SABR: "direct_hagan_asymptotic_formula_beta_1",
-    MODEL_LOCAL_VOL: "surface_delta_proxy_not_dupire_pde",
-    MODEL_SLV: "surface_blend_proxy_not_particle_calibrated_slv",
-    MODEL_ROUGH_VOL: "power_law_surface_proxy_not_rough_bergomi_monte_carlo",
-}
 
 SECONDS_PER_YEAR: Final[float] = 365.0 * 24.0 * 60.0 * 60.0
 OBSERVABILITY_DELAY_NS: Final[int] = 1_000_000_000

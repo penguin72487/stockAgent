@@ -40,6 +40,7 @@ class LiveMarketConfig:
     open_time: str | None = None
     close_time: str | None = None
     schedule_time: str | None = None
+    preopen_prepare_time: str | None = None
     schedule_interval_minutes: int | None = None
     schedule_delay_seconds: int = 0
     summary_time: str | None = None
@@ -58,6 +59,10 @@ class LiveMarketConfig:
     max_gross_warning: float | None = None
     initial_capital: float | None = None
     current_capital: float | None = None
+    day_trade_simulation_enabled: bool = False
+    day_trade_simulation_state_dir: str | None = None
+    day_trade_rule_data_dir: str | None = None
+    day_trade_quote_interval_seconds: int = 60
     trader_role_ids: tuple[int, ...] = ()
     trader_role_names: tuple[str, ...] = ()
 
@@ -279,6 +284,7 @@ def load_market_config(path: str | Path) -> LiveMarketConfig:
         open_time=_optional_str(raw.get("open_time")),
         close_time=_optional_str(raw.get("close_time")),
         schedule_time=_optional_str(raw.get("schedule_time")),
+        preopen_prepare_time=_optional_str(raw.get("preopen_prepare_time")),
         schedule_interval_minutes=_optional_int(raw.get("schedule_interval_minutes")),
         schedule_delay_seconds=int(raw.get("schedule_delay_seconds") or 0),
         summary_time=_optional_str(raw.get("summary_time")),
@@ -299,6 +305,16 @@ def load_market_config(path: str | Path) -> LiveMarketConfig:
         max_gross_warning=_optional_float(raw.get("max_gross_warning")),
         initial_capital=_optional_float(raw.get("initial_capital")),
         current_capital=_optional_float(raw.get("current_capital")),
+        day_trade_simulation_enabled=_bool_value(
+            raw.get("day_trade_simulation_enabled"), False
+        ),
+        day_trade_simulation_state_dir=_optional_str(
+            raw.get("day_trade_simulation_state_dir")
+        ),
+        day_trade_rule_data_dir=_optional_str(raw.get("day_trade_rule_data_dir")),
+        day_trade_quote_interval_seconds=max(
+            1, int(raw.get("day_trade_quote_interval_seconds") or 60)
+        ),
         trader_role_ids=_int_tuple(raw.get("trader_role_ids")),
         trader_role_names=_str_tuple(raw.get("trader_role_names")),
     )
@@ -313,3 +329,20 @@ def load_market_configs(directory: str | Path) -> dict[str, LiveMarketConfig]:
         cfg = load_market_config(path)
         configs[cfg.market] = cfg
     return configs
+
+
+def resolved_live_output_dir(config: LiveMarketConfig) -> Path:
+    """Return the same model-scoped signal root used by every live consumer."""
+
+    base = Path(
+        config.live_output_dir or f"artifacts/live_signals/{config.market}"
+    )
+    if not config.model_scoped_live_output:
+        return base
+    output_name = Path(str(config.output_dir or "")).name
+    if not output_name or config.fold_id is None:
+        return base
+    scope = Path(output_name) / f"fold_{int(config.fold_id):02d}"
+    if tuple(base.parts[-len(scope.parts) :]) != scope.parts:
+        base /= scope
+    return base

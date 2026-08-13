@@ -252,6 +252,40 @@ def _split_signed(value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return negative, positive
 
 
+def _preserve_directional_gross_mix(
+    requested: torch.Tensor,
+    executable: torch.Tensor,
+) -> torch.Tensor:
+    """Scale down the better-filled side of a two-sided portfolio request.
+
+    Eligibility, volume, and close-leg evidence are execution constraints, not
+    permission to reinterpret a requested long/short portfolio as a one-sided
+    directional bet.  This continuous counterpart of
+    ``preserve_directional_lot_mix`` never increases executable exposure.
+    """
+
+    eps = requested.new_tensor(1.0e-12)
+    requested_long = requested.clamp_min(0.0).sum()
+    requested_short = (-requested.clamp_max(0.0)).sum()
+    executable_long = executable.clamp_min(0.0).sum()
+    executable_short = (-executable.clamp_max(0.0)).sum()
+    has_both = (requested_long > eps) & (requested_short > eps)
+    long_fill_rate = executable_long / requested_long.clamp_min(eps)
+    short_fill_rate = executable_short / requested_short.clamp_min(eps)
+    common_fill_rate = torch.minimum(long_fill_rate, short_fill_rate)
+    long_scale = torch.minimum(
+        torch.ones_like(common_fill_rate),
+        common_fill_rate / long_fill_rate.clamp_min(eps),
+    )
+    short_scale = torch.minimum(
+        torch.ones_like(common_fill_rate),
+        common_fill_rate / short_fill_rate.clamp_min(eps),
+    )
+    negative, positive = _split_signed(executable)
+    balanced = positive * long_scale + negative * short_scale
+    return torch.where(has_both, balanced, executable)
+
+
 def _as_fee_vector(
     value: torch.Tensor,
     *,
@@ -3587,6 +3621,11 @@ def _run_tw_day_trade_continuous_impl(
         # A day-trade account begins and ends flat.  A terminal exit therefore
         # means no new round trip may be opened, while a mandatory short-cover
         # event blocks only a new sell-first trade and still permits buy-first.
+        requested_target = torch.where(
+            advance & alive_after_settlement,
+            target_weights[idx],
+            torch.zeros_like(target_weights[idx]),
+        )
         entry_eligible = eligible[idx] & ~force_exit[idx]
         direction_open = torch.where(
             target_weights[idx] < 0.0,
@@ -3645,6 +3684,10 @@ def _run_tw_day_trade_continuous_impl(
             executable_round_trip,
             signed_target,
             torch.zeros_like(signed_target),
+        )
+        signed_target = _preserve_directional_gross_mix(
+            requested_target,
+            signed_target,
         )
 
         short_signed, long_entry = _split_signed(signed_target)

@@ -217,8 +217,13 @@ HISTORICAL_PARSER_CONTRACT_VERSION_BY_DATASET = {
     # markers instead of guessing their meaning. v2 additionally rejects
     # truncated rows and a declared table total that differs from the payload,
     # so a missing sell-first marker or partial member list cannot become an
-    # implicit permission/denial downstream.
-    "twse_day_trade_eligibility": 2,
+    # implicit permission/denial downstream. v3 accepts the official pre-open
+    # table title "當日沖銷交易標的" as well as the longer post-close title;
+    # the selected-table title and top-level payload date remain independently
+    # bound to the requested session. v4 canonicalizes whitespace inside the
+    # official sell-first header because the pre-open payload inserts a newline
+    # in that field name without changing its meaning.
+    "twse_day_trade_eligibility": 4,
     # v6 treated two real TPEx OHLCV HTML generations as the same layout and
     # silently shifted their price/volume columns. v7 separated the layouts,
     # but missed three corporate-action rows whose split direction cell is
@@ -483,7 +488,7 @@ HISTORICAL_DAILY_DATASETS: tuple[DatasetSpec, ...] = (
         ),
         date_format="%Y%m%d",
         start_date="2014-01-06",
-        table_mode="title_contains:當日沖銷交易標的及成交量值",
+        table_mode="title_contains:當日沖銷交易標的",
     ),
     DatasetSpec(
         name="tpex_daily_ohlcv",
@@ -962,6 +967,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--start-date", default="earliest", help="Historical start date or 'earliest'.")
     parser.add_argument("--end-date", default="today", help="Historical end date, today, or now.")
     parser.add_argument(
+        "--same-session-rule-date",
+        default=None,
+        help=(
+            "Explicit current-session date for the two day-trade eligibility "
+            "feeds. This allows the pre-open official rule tables to extend "
+            "beyond the prior close-based session calendar."
+        ),
+    )
+    parser.add_argument(
         "--allow-daily-publication-lag",
         action="store_true",
         help=(
@@ -990,6 +1004,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--output-dir", default="data_tw_public", help="Output directory.")
+    parser.add_argument(
+        "--write-run-metadata",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Write dataset_manifest.json, download_report.csv, and "
+            "download_summary.json. Disable only for a targeted in-place "
+            "refresh whose parent workflow owns the directory-level metadata."
+        ),
+    )
     parser.add_argument("--workers", type=int, default=4, help="Concurrent historical dataset workers.")
     parser.add_argument(
         "--date-workers",
@@ -2218,26 +2242,67 @@ def _plan_historical_download(
 ) -> HistoricalDownloadPlan:
     mode = _canonical_mode(args.mode)
     start, end = _historical_bounds(spec, args)
+    same_session_text = str(
+        getattr(args, "same_session_rule_date", None) or ""
+    ).strip()
+    same_session_day: date | None = None
+    if same_session_text and spec.name in {
+        "twse_day_trade_eligibility",
+        "tpex_day_trade_eligibility",
+    }:
+        same_session_day = _parse_date(same_session_text)
+        if not start <= same_session_day <= end:
+            raise ValueError(
+                "--same-session-rule-date must be inside the requested range"
+            )
     taiex_calendar_receipt: str | None = None
     if spec.name in TPEX_SESSION_DEPENDENT_DATASETS:
+        calendar_end = (
+            min(end, same_session_day - timedelta(days=1))
+            if same_session_day is not None
+            else end
+        )
         expected_taiex_sessions: set[date] | None = None
         if _requires_strict_session_calendar(spec, args):
-            expected_taiex_sessions, taiex_calendar_receipt = (
-                _validated_taiex_session_dates(output_dir, start, end)
+            if calendar_end >= start:
+                expected_taiex_sessions, taiex_calendar_receipt = (
+                    _validated_taiex_session_dates(
+                        output_dir,
+                        start,
+                        calendar_end,
+                    )
+                )
+            else:
+                expected_taiex_sessions = set()
+        all_weekdays = (
+            _validated_tpex_session_dates(
+                output_dir,
+                start,
+                calendar_end,
+                expected_taiex_sessions=expected_taiex_sessions,
+                expected_taiex_receipt=taiex_calendar_receipt,
             )
-        all_weekdays = _validated_tpex_session_dates(
-            output_dir,
-            start,
-            end,
-            expected_taiex_sessions=expected_taiex_sessions,
-            expected_taiex_receipt=taiex_calendar_receipt,
+            if calendar_end >= start
+            else set()
         )
+        if same_session_day is not None:
+            all_weekdays.add(same_session_day)
     elif _uses_taiex_session_calendar(spec, args):
-        all_weekdays, taiex_calendar_receipt = _validated_taiex_session_dates(
-            output_dir,
-            start,
-            end,
+        calendar_end = (
+            min(end, same_session_day - timedelta(days=1))
+            if same_session_day is not None
+            else end
         )
+        if calendar_end >= start:
+            all_weekdays, taiex_calendar_receipt = _validated_taiex_session_dates(
+                output_dir,
+                start,
+                calendar_end,
+            )
+        else:
+            all_weekdays = set()
+        if same_session_day is not None:
+            all_weekdays.add(same_session_day)
     else:
         all_weekdays = set(
             _iter_dates(
@@ -2253,9 +2318,20 @@ def _plan_historical_download(
         state["coverage_calendar_source"] = TAIEX_SESSION_CALENDAR_DATASET
         state["coverage_calendar_kind"] = "receipt_verified_official_open_sessions"
         state["coverage_calendar_sha256"] = taiex_calendar_receipt
+        if same_session_day is not None:
+            state["coverage_calendar_kind"] = (
+                "receipt_verified_official_open_sessions_plus_same_session_rule"
+            )
+            state["same_session_rule_date"] = same_session_day.isoformat()
     elif spec.name in TPEX_SESSION_DEPENDENT_DATASETS:
         state["coverage_calendar_source"] = TPEX_OFFICIAL_CALENDAR_DATASET
-        state["coverage_calendar_kind"] = "validated_official_open_sessions"
+        state["coverage_calendar_kind"] = (
+            "validated_official_open_sessions_plus_same_session_rule"
+            if same_session_day is not None
+            else "validated_official_open_sessions"
+        )
+        if same_session_day is not None:
+            state["same_session_rule_date"] = same_session_day.isoformat()
         if taiex_calendar_receipt is not None:
             state["root_coverage_calendar_source"] = TAIEX_SESSION_CALENDAR_DATASET
             state["root_coverage_calendar_sha256"] = taiex_calendar_receipt
@@ -2904,6 +2980,11 @@ def _normalize_historical_json_fields(
     spec: DatasetSpec,
     fields: list[Any],
 ) -> list[Any]:
+    if spec.name in DAY_TRADE_ELIGIBILITY_DATASETS:
+        return [
+            re.sub(r"\s+", "", _strip_html(field))
+            for field in fields
+        ]
     stripped = tuple(_strip_html(field) for field in fields)
     if (
         spec.name == "tpex_institutional_trades"
@@ -6093,6 +6174,17 @@ def main() -> None:
     print(f"[tw-public] {describe_rate_limit('tw_public', request_interval)}", flush=True)
     specs = _select_specs(args.datasets)
     selected_names = {spec.name for spec in specs}
+    if args.same_session_rule_date:
+        allowed_same_session = {
+            "twse_day_trade_eligibility",
+            "tpex_day_trade_eligibility",
+        }
+        if args.mode != "daily":
+            raise ValueError("--same-session-rule-date requires --mode daily")
+        if not selected_names or not selected_names <= allowed_same_session:
+            raise ValueError(
+                "--same-session-rule-date may select only day-trade eligibility datasets"
+            )
     allowed_failure_names = {
         str(name).strip().lower()
         for name in args.allow_failed_datasets
@@ -6110,11 +6202,16 @@ def main() -> None:
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    _write_json(output_dir / "dataset_manifest.json", [asdict(spec) for spec in specs])
+    if args.write_run_metadata:
+        _write_json(
+            output_dir / "dataset_manifest.json",
+            [asdict(spec) for spec in specs],
+        )
 
     results = _run_selected_downloads(specs, args, output_dir)
     results.sort(key=lambda row: row.dataset)
-    _write_csv_report(output_dir / "download_report.csv", results)
+    if args.write_run_metadata:
+        _write_csv_report(output_dir / "download_report.csv", results)
 
     failed_statuses = {"failed", "incomplete", "unsupported"}
     historical_names = {
@@ -6212,9 +6309,21 @@ def main() -> None:
         "missing_dates_after": sum(row.missing_dates_after for row in results),
         "rows_total": sum(row.rows for row in results),
     }
-    _write_json(output_dir / "download_summary.json", summary)
-    print(f"[tw-public] download_report.csv -> {output_dir / 'download_report.csv'}")
-    print(f"[tw-public] download_summary.json -> {output_dir / 'download_summary.json'}")
+    if args.write_run_metadata:
+        _write_json(output_dir / "download_summary.json", summary)
+        print(
+            f"[tw-public] download_report.csv -> "
+            f"{output_dir / 'download_report.csv'}"
+        )
+        print(
+            f"[tw-public] download_summary.json -> "
+            f"{output_dir / 'download_summary.json'}"
+        )
+    else:
+        print(
+            "[tw-public] directory-level run metadata preserved by parent workflow",
+            flush=True,
+        )
     print(
         f"[tw-public] mode={args.mode} ok={summary['ok_count']} "
         f"up_to_date={summary['up_to_date_count']} failed={summary['failed_count']} "
