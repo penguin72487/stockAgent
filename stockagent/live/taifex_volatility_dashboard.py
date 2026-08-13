@@ -595,6 +595,40 @@ def build_dashboard_snapshot(
             }
         )
 
+    strategy_count = len(strategy_rows)
+    valuation_available_count = sum(
+        bool(row["valuation_available"]) for row in strategy_rows
+    )
+    fresh_valuation_count = sum(
+        bool(row["valuation_available"]) and not bool(row["valuation_stale"])
+        for row in strategy_rows
+    )
+    carried_valuation_count = sum(
+        bool(row["valuation_carried_forward"]) for row in strategy_rows
+    )
+    timely_valuation_count = sum(
+        bool(row["valuation_available"])
+        and (
+            not bool(row["valuation_stale"])
+            or (
+                row["valuation_age_seconds"] is not None
+                and float(row["valuation_age_seconds"])
+                <= float(max_source_age_seconds)
+            )
+        )
+        for row in strategy_rows
+    )
+    recent_carried_valuation_count = max(
+        0, timely_valuation_count - fresh_valuation_count
+    )
+    if (
+        health in {"active", "ready"}
+        and source_fresh_expected
+        and strategy_count > 0
+        and timely_valuation_count < strategy_count
+    ):
+        health = "degraded"
+
     current_trading_date = (
         str(status.get("current_trading_date"))
         if status.get("current_trading_date")
@@ -729,6 +763,13 @@ def build_dashboard_snapshot(
     option_contract_count = int(status.get("option_contract_count") or 0)
     latest_book_count = int(status.get("latest_book_count") or 0)
     expected_book_count = option_contract_count + 2
+    held_option_contract_count = int(
+        status.get("held_option_contract_count") or 0
+    )
+    held_option_subscribed_count = int(
+        status.get("held_option_subscribed_count") or 0
+    )
+    held_option_book_count = int(status.get("held_option_book_count") or 0)
     pending_targets = status.get("pending_targets") or {}
     pending_rows = []
     if isinstance(pending_targets, Mapping):
@@ -831,6 +872,19 @@ def build_dashboard_snapshot(
             "hedge_fee_per_side_twd": status.get("hedge_fee_per_side_twd"),
             "option_risk_margin_a_twd": status.get("option_risk_margin_a_twd"),
             "option_risk_margin_b_twd": status.get("option_risk_margin_b_twd"),
+            "option_risk_margin_c_twd": status.get("option_risk_margin_c_twd"),
+            "option_risk_margin_effective_trading_date": status.get(
+                "option_risk_margin_effective_trading_date"
+            ),
+            "option_risk_margin_source_url": status.get(
+                "option_risk_margin_source_url"
+            ),
+            "option_margin_policy": status.get("option_margin_policy"),
+            "margin_requirement_basis": status.get("margin_requirement_basis"),
+            "official_margin_schedule": status.get("official_margin_schedule"),
+            "futures_initial_margin_per_contract_twd": status.get(
+                "futures_initial_margin_per_contract_twd"
+            ),
             "strategy_capital_buffer_multiple": status.get(
                 "strategy_capital_buffer_multiple"
             ),
@@ -840,6 +894,40 @@ def build_dashboard_snapshot(
             "book_coverage_ratio": (
                 latest_book_count / expected_book_count
                 if expected_book_count > 0
+                else 0.0
+            ),
+            "held_option_contract_count": held_option_contract_count,
+            "held_option_subscribed_count": held_option_subscribed_count,
+            "held_option_book_count": held_option_book_count,
+            "held_option_subscription_coverage_ratio": (
+                held_option_subscribed_count / held_option_contract_count
+                if held_option_contract_count > 0
+                else 1.0
+            ),
+            "missing_held_option_subscription_codes": list(
+                status.get("missing_held_option_subscription_codes") or ()
+            ),
+            "strategy_count": strategy_count,
+            "strategy_valuation_available_count": valuation_available_count,
+            "strategy_fresh_valuation_count": fresh_valuation_count,
+            "strategy_carried_valuation_count": carried_valuation_count,
+            "strategy_timely_valuation_count": timely_valuation_count,
+            "strategy_recent_carried_valuation_count": (
+                recent_carried_valuation_count
+            ),
+            "strategy_valuation_coverage_ratio": (
+                valuation_available_count / strategy_count
+                if strategy_count > 0
+                else 0.0
+            ),
+            "strategy_fresh_valuation_coverage_ratio": (
+                fresh_valuation_count / strategy_count
+                if strategy_count > 0
+                else 0.0
+            ),
+            "strategy_timely_valuation_coverage_ratio": (
+                timely_valuation_count / strategy_count
+                if strategy_count > 0
                 else 0.0
             ),
         },
@@ -876,6 +964,21 @@ def build_dashboard_snapshot(
                 "payoff or target. They are not a live Greek measurement."
             ),
             "option_long_short_ratio": EXPOSURE_RATIO_BASIS,
+            "strategy_fresh_valuation_coverage_ratio": (
+                "Strategies with a complete current executable Bid/Ask liquidation "
+                "mark divided by all live ideal strategy ledgers. CARRIED marks do "
+                "not count as fresh."
+            ),
+            "strategy_timely_valuation_coverage_ratio": (
+                "Strategies with either a fresh executable mark or an explicitly "
+                "labelled CARRIED last-complete mark no older than the dashboard "
+                "source-age threshold, divided by all live ideal ledgers."
+            ),
+            "book_coverage_ratio": (
+                "Contracts with any latest callback divided by the worker-0 "
+                "subscription set; this is a generic feed metric, not proof that "
+                "every held leg can be valued."
+            ),
         },
         "exposure_taxonomy": EXPOSURE_TAXONOMY,
         "exposure_summary": _exposure_summary(strategy_rows, catalog_rows),

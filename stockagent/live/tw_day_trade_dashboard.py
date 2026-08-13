@@ -183,7 +183,9 @@ def _preopen_progress(
     rows: list[dict[str, Any]] = []
     for mode in modes:
         market = str(mode.get("market") or "")
-        raw = raw_markets.get(market)
+        signal_market = str(mode.get("signal_market") or market)
+        reuses_signal = signal_market != market
+        raw = raw_markets.get(signal_market)
         item = dict(raw) if isinstance(raw, Mapping) else {}
         status = str(item.get("status") or "pending")
         step = max(0, int(item.get("step") or 0))
@@ -228,11 +230,17 @@ def _preopen_progress(
             {
                 "market": market,
                 "label": mode.get("label") or market,
+                "signal_market": signal_market,
+                "reuses_signal": reuses_signal,
                 "status": status,
                 "progress_ratio": round(progress_ratio, 6),
                 "step": step or None,
                 "total": total or None,
-                "message": item.get("message"),
+                "message": (
+                    f"重用 {signal_market} 已準備的訊號與模型，不重複推論"
+                    if reuses_signal and status == "ready"
+                    else item.get("message")
+                ),
                 "started_at": item.get("started_at"),
                 "completed_at": item.get("completed_at"),
                 "elapsed_seconds": (
@@ -418,6 +426,7 @@ def _safe_position(position: Mapping[str, Any]) -> dict[str, Any]:
     allowed = (
         "position_id",
         "market",
+        "signal_market",
         "session_date",
         "signal_id",
         "symbol",
@@ -440,6 +449,9 @@ def _safe_position(position: Mapping[str, Any]) -> dict[str, Any]:
         "lower_limit",
         "take_profit_price",
         "stop_trigger_price",
+        "price_limit_offset_ticks",
+        "bracket_price_policy",
+        "fill_guaranteed",
         "take_profit_order_status",
         "stop_order_status",
         "eod_limit_price",
@@ -509,6 +521,10 @@ def build_dashboard_snapshot(
             {
                 "market": market,
                 "label": mode.get("label"),
+                "signal_market": mode.get("signal_market") or market,
+                "price_limit_offset_ticks": mode.get("price_limit_offset_ticks", 0),
+                "bracket_price_policy": mode.get("bracket_price_policy"),
+                "fill_guaranteed": bool(mode.get("fill_guaranteed", False)),
                 "engine_status": mode.get("engine_status"),
                 "checkpoint_ready": mode.get("checkpoint_ready"),
                 "readiness_error": mode.get("readiness_error"),
@@ -677,6 +693,7 @@ def build_dashboard_snapshot(
             "comparison": "all strategies and benchmarks are compared as cumulative net return divided by their own capital basis; TX uses one-contract official initial margin, while 0050/2330 use one-board-lot entry notional",
             "benchmarks": "0050/2330 price-return ledgers enter at best ask and liquidate at best bid after tw_cash costs; future cash distributions are not credited. TXFR1 holds one TX across sessions, rolls only when old bid and new ask coexist, and includes TWD 60 per side plus statutory futures tax",
             "depth_limit": "each mode is an independent counterfactual; only displayed level-one MIS volume is fillable (lots x 1,000 shares), while queue and deeper book are unknown",
+            "bracket_fill": "all four modes move TP and the local SL trigger one legal dated TW tick inward; this improves fill probability but does not guarantee a fill without a trigger and executable counterparty volume",
         },
     }
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
+import re
 
 import pytest
 
@@ -62,6 +63,10 @@ def _fixture(tmp_path: Path, *, age_seconds: float = 2.0) -> tuple[Path, Path]:
             "hedge_contract": "MXFH6",
             "option_contract_count": 98,
             "latest_book_count": 100,
+            "held_option_contract_count": 2,
+            "held_option_subscribed_count": 2,
+            "held_option_book_count": 2,
+            "missing_held_option_subscription_codes": [],
             "active_cycle": {
                 "cycle_id": "safe-cycle",
                 "expiry_date": "2026-08-14",
@@ -139,6 +144,10 @@ def test_dashboard_snapshot_is_bounded_fresh_and_account_safe(tmp_path: Path) ->
     assert payload["dashboard_schema_version"] == 6
     assert payload["source_age_seconds"] == 2.0
     assert payload["market"]["book_coverage_ratio"] == 1.0
+    assert payload["market"]["strategy_fresh_valuation_coverage_ratio"] == 1.0
+    assert payload["market"]["strategy_timely_valuation_coverage_ratio"] == 1.0
+    assert payload["market"]["strategy_fresh_valuation_count"] == 2
+    assert payload["market"]["held_option_subscription_coverage_ratio"] == 1.0
     assert len(payload["strategies"]) == 2
     assert payload["strategy_counts"]["live_ideal"] == 53
     assert payload["strategy_counts"]["blocked_contract"] >= 1
@@ -208,6 +217,69 @@ def test_dashboard_snapshot_fails_visible_when_source_is_stale(tmp_path: Path) -
         now=datetime(2026, 8, 12, 1, 30, tzinfo=timezone.utc),
     )
     assert payload["health"] == "stale"
+
+
+def test_dashboard_marks_fresh_but_incomplete_strategy_valuation_as_degraded(
+    tmp_path: Path,
+) -> None:
+    state_dir, receipts = _fixture(tmp_path)
+    status_path = state_dir / "status.json"
+    status = json.loads(status_path.read_text(encoding="utf-8"))
+    broken = status["strategies"]["classic_opening_straddle"]
+    broken["valuation_available"] = False
+    broken["option_books_valid"] = False
+    broken["cumulative_pnl_twd"] = None
+    broken["net_equity_twd"] = None
+    broken["total_equity_twd"] = None
+    _write_json(status_path, status)
+
+    payload = build_dashboard_snapshot(
+        state_dir=state_dir,
+        api_receipt_dir=receipts,
+        now=datetime(2026, 8, 12, 1, 30, tzinfo=timezone.utc),
+    )
+
+    assert payload["health"] == "degraded"
+    assert payload["market"]["strategy_fresh_valuation_count"] == 1
+    assert payload["market"]["strategy_fresh_valuation_coverage_ratio"] == 0.5
+    assert payload["market"]["strategy_timely_valuation_coverage_ratio"] == 0.5
+
+
+def test_dashboard_accepts_only_recent_explicit_carried_valuation_for_health(
+    tmp_path: Path,
+) -> None:
+    state_dir, receipts = _fixture(tmp_path)
+    status_path = state_dir / "status.json"
+    status = json.loads(status_path.read_text(encoding="utf-8"))
+    carried = status["strategies"]["classic_opening_straddle"]
+    carried["valuation_available"] = True
+    carried["valuation_stale"] = True
+    carried["valuation_carried_forward"] = True
+    carried["valuation_age_seconds"] = 5.0
+    carried["option_books_valid"] = False
+    _write_json(status_path, status)
+
+    recent = build_dashboard_snapshot(
+        state_dir=state_dir,
+        api_receipt_dir=receipts,
+        now=datetime(2026, 8, 12, 1, 30, tzinfo=timezone.utc),
+    )
+    assert recent["health"] == "active"
+    assert recent["market"]["strategy_fresh_valuation_count"] == 1
+    assert recent["market"]["strategy_recent_carried_valuation_count"] == 1
+    assert recent["market"]["strategy_timely_valuation_count"] == 2
+
+    status["strategies"]["classic_opening_straddle"][
+        "valuation_age_seconds"
+    ] = 20.0
+    _write_json(status_path, status)
+    old = build_dashboard_snapshot(
+        state_dir=state_dir,
+        api_receipt_dir=receipts,
+        now=datetime(2026, 8, 12, 1, 30, tzinfo=timezone.utc),
+    )
+    assert old["health"] == "degraded"
+    assert old["market"]["strategy_timely_valuation_count"] == 1
 
 
 def test_dashboard_expected_closed_gap_is_waiting_not_stale(tmp_path: Path) -> None:
@@ -323,7 +395,11 @@ def test_dashboard_html_is_local_and_refreshes_the_read_only_api() -> None:
     root = Path(__file__).resolve().parents[1] / "services" / "taifex_dashboard"
     html = (root / "index.html").read_text(encoding="utf-8")
     javascript = (root / "app.js").read_text(encoding="utf-8")
-    assert "http://" not in html and "https://" not in html
+    assert "http://" not in html
+    external_links = re.findall(r'href="(https://[^"]+)"', html)
+    assert external_links == [
+        "https://www.taifex.com.tw/cht/11/newsDetail?idx=17259&amp;newsType=1"
+    ]
     assert 'fetch("api/status"' in javascript
     assert 'fetch("api/history"' in javascript
     assert "window.setInterval(refresh, REFRESH_MS)" in javascript
@@ -340,6 +416,11 @@ def test_dashboard_html_is_local_and_refreshes_the_read_only_api() -> None:
     assert 'id="exposure-hedge-filter"' in html
     assert 'id="exposure-summary"' in html
     assert 'id="performance-reserve"' in html
+    assert 'class="skip-link"' in html
+    assert 'aria-label="公開面板導覽"' in html
+    assert 'id="curve-load-more"' in html
+    assert 'id="strategy-search"' in html
+    assert 'id="guide-load-more"' in html
     assert 'id="runner-mode"' in html
     assert 'id="night-official-session"' in html
     assert "所有策略怎麼做" in html
@@ -350,3 +431,10 @@ def test_dashboard_html_is_local_and_refreshes_the_read_only_api() -> None:
     assert "matchesExposureFilters" in javascript
     assert "row.design_option_ratio_label" in javascript
     assert "compounded_return_to_live_mark" in javascript
+    assert 'return {label: "資料逾時", state: "blocked"}' in javascript
+    assert "if (document.hidden) return" in javascript
+    assert "curveVisibleCount" in javascript
+    assert "guideVisibleCount" in javascript
+    assert 'snapshot.health === "degraded"' in javascript
+    assert 'href="styles.css?v=8"' in html
+    assert 'src="app.js?v=8"' in html

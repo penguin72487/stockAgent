@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from scripts.serve_public_dashboards import PublicDashboardHandler
@@ -123,6 +125,22 @@ def test_public_signal_query_accepts_dashboard_five_field_contract() -> None:
         "mode=all&symbol=&status=all&offset=0&limit=250"
     )
     assert normalized == "mode=all&symbol=&status=all&offset=0&limit=250"
+
+
+def test_public_landing_exposes_live_safe_status_without_remote_assets() -> None:
+    root = Path(__file__).resolve().parents[1] / "services" / "public_dashboards"
+    html = (root / "index.html").read_text(encoding="utf-8")
+    javascript = (root / "public.js").read_text(encoding="utf-8")
+    assert 'src="public.js"' in html
+    assert 'id="taifex-health"' in html
+    assert 'id="tw-health"' in html
+    assert 'id="shioaji-health"' in html
+    assert "http://" not in html and "https://" not in html
+    assert 'fetchJson("taifex/api/status")' in javascript
+    assert 'fetchJson("tw-day-trade/api/status")' in javascript
+    assert 'fetchJson("shioaji/api/status")' in javascript
+    assert '"流量保護"' in javascript
+    assert "textContent" in javascript
 
 
 def test_token_bucket_rate_limiter_refills_and_caps_client_table() -> None:

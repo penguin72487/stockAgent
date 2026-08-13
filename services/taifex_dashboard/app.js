@@ -4,6 +4,7 @@ const REFRESH_MS = 5000;
 const money = new Intl.NumberFormat("zh-TW", { maximumFractionDigits: 0 });
 const percent = new Intl.NumberFormat("zh-TW", { style: "percent", minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const ratio = new Intl.NumberFormat("zh-TW", { maximumFractionDigits: 2 });
+const compactMoney = new Intl.NumberFormat("zh-TW", { notation: "compact", maximumFractionDigits: 2 });
 let selectedStrategy = "";
 let selectedCategory = "";
 let selectedDirectionalExposure = "";
@@ -13,12 +14,22 @@ let selectedSort = "fixed_capital_return";
 let sortDescending = true;
 let lastSnapshot = null;
 let cachedHistory = [];
+let curveVisibleCount = 12;
+let guideVisibleCount = 12;
+let strategySearch = "";
+let lastStrategyCatalog = [];
+let lastStrategyCounts = null;
+let lastHeavyRevision = "";
 
 function byId(id) { return document.getElementById(id); }
 function setText(id, value) { byId(id).textContent = value ?? "—"; }
 function formatTwd(value) {
   if (value == null || !Number.isFinite(Number(value))) return "—";
   return `${money.format(Number(value))} TWD`;
+}
+function formatCompactTwd(value) {
+  if (value == null || !Number.isFinite(Number(value))) return "—";
+  return `${compactMoney.format(Number(value))} TWD`;
 }
 function formatPercent(value) {
   if (value == null || !Number.isFinite(Number(value))) return "—";
@@ -36,9 +47,44 @@ function localTime(value) {
   }).format(new Date(value));
 }
 
+function formatAge(value) {
+  const seconds = Number(value);
+  if (!Number.isFinite(seconds)) return "—";
+  if (seconds < 60) return `${Math.max(0, seconds).toFixed(1)} 秒`;
+  if (seconds < 3600) return `${ratio.format(seconds / 60)} 分鐘`;
+  return `${ratio.format(seconds / 3600)} 小時`;
+}
+
+function engineLabel(value) {
+  const labels = {
+    intraday_active: "日內策略運作中",
+    intraday_flat_for_day_close: "日盤已平倉",
+    waiting_for_bootstrap: "等待新完整週期",
+    waiting: "等待合法交易時段",
+    active: "策略運作中",
+  };
+  return labels[value] || String(value || "未知狀態").replaceAll("_", " ");
+}
+
+function healthPresentation(snapshot) {
+  if (["active", "ready"].includes(snapshot.health)) return {label: "資料正常", state: "active"};
+  if (snapshot.health === "degraded") return {label: "估值不完整", state: "degraded"};
+  if (snapshot.health === "waiting" && !snapshot.source_fresh_expected) {
+    return {label: "休市監控", state: "waiting"};
+  }
+  if (snapshot.health === "waiting") return {label: "等待資料", state: "waiting"};
+  if (snapshot.health === "stale") return {label: "資料逾時", state: "blocked"};
+  if (snapshot.health === "blocked") return {label: "策略阻擋", state: "blocked"};
+  return {label: "狀態未知", state: "waiting"};
+}
+
 function healthMessage(snapshot) {
   if (snapshot.health === "blocked") return `引擎已阻擋：${snapshot.blocked_reason || "原因未記錄"}`;
-  if (snapshot.health === "stale") return `狀態已過期：最後更新距今 ${snapshot.source_age_seconds.toFixed(1)} 秒`;
+  if (snapshot.health === "degraded") {
+    const market = snapshot.market || {};
+    return `行情仍在更新，但只有 ${market.strategy_timely_valuation_count || 0} / ${market.strategy_count || 0} 條策略具備 15 秒內的新鮮或明確 CARRIED 可成交估值；其餘曲線暫停在最後可信點。`;
+  }
+  if (snapshot.health === "stale") return `資料來源已逾時：最後一筆狀態距今 ${formatAge(snapshot.source_age_seconds)}。畫面仍可供歷史查閱，但不能當成現在行情。`;
   if (snapshot.health === "waiting" && !snapshot.source_fresh_expected) {
     return `排程監控中：${snapshot.current_market_phase} 為交易所休市空窗；下一個合法收單／撮合時段會自動恢復行情與策略。`;
   }
@@ -46,21 +92,23 @@ function healthMessage(snapshot) {
     return `正常等待：安全規則禁止補建已開始的週期，需等 ${snapshot.bootstrap_after_date} 結算後的新完整週期。`;
   }
   if (snapshot.health === "active") return "週期已開啟；策略、行情與理想帳持續更新。";
-  return `引擎正常：${snapshot.engine_status}`;
+  return `引擎狀態正常：${engineLabel(snapshot.engine_status)}。`;
 }
 
 function renderHeader(snapshot) {
   const dot = byId("live-dot");
   dot.className = "live-dot";
-  const unhealthy = ["blocked", "stale"].includes(snapshot.health);
-  dot.classList.add(unhealthy ? "blocked" : "active");
-  setText("live-label", unhealthy ? snapshot.health.toUpperCase() : "LIVE");
-  setText("last-refresh", `更新 ${localTime(snapshot.source_updated_at_utc)}`);
+  const presentation = healthPresentation(snapshot);
+  const unhealthy = ["blocked", "degraded"].includes(presentation.state);
+  dot.classList.add(presentation.state);
+  byId("connection-status").dataset.state = presentation.state;
+  setText("live-label", presentation.label);
+  setText("last-refresh", `來源更新 ${localTime(snapshot.source_updated_at_utc)}`);
   const liveCount = snapshot.strategy_counts?.live_ideal ?? snapshot.strategies.length;
   setText("dashboard-title", `TAIFEX ${liveCount} 策略模擬交易即時面板`);
   setText("strategy-table-title", `${liveCount} 個獨立策略帳本`);
   const alert = byId("alert");
-  alert.className = `alert ${unhealthy ? "blocked" : "ready"}`;
+  alert.className = `alert ${presentation.state === "blocked" ? "blocked" : presentation.state === "degraded" ? "degraded" : "ready"}`;
   alert.textContent = healthMessage(snapshot);
 }
 
@@ -68,25 +116,33 @@ function renderMetrics(snapshot) {
   const market = snapshot.market;
   const cycle = snapshot.active_cycle;
   const broker = snapshot.broker;
-  setText("engine-status", snapshot.engine_status);
-  setText("blocked-reason", `blocked: ${snapshot.blocked_reason || "none"}`);
-  setText("book-coverage", percent.format(market.book_coverage_ratio || 0));
-  setText("book-count", `${market.latest_book_count} / ${market.expected_book_count} contracts`);
-  setText("cycle-status", cycle ? "OPEN" : "FLAT");
-  setText("cycle-expiry", cycle ? `expiry ${cycle.expiry_date || "—"}` : "目前無持倉週期");
-  setText("broker-status", broker.order_failures === 0 ? "0 failures" : `${broker.order_failures} failures`);
-  setText("broker-detail", `${broker.inflight_order_count} inflight · enabled=${broker.orders_enabled}`);
-  setText("source-age", `${Number(snapshot.source_age_seconds).toFixed(1)} 秒`);
+  setText("engine-status", engineLabel(snapshot.engine_status));
+  byId("engine-status").title = snapshot.engine_status || "";
+  setText("blocked-reason", snapshot.blocked_reason ? `阻擋原因：${snapshot.blocked_reason}` : "目前沒有阻擋");
+  setText("book-coverage", percent.format(market.strategy_timely_valuation_coverage_ratio || 0));
+  setText("book-count", `近期可用 ${market.strategy_timely_valuation_count || 0}/${market.strategy_count || 0} · fresh ${market.strategy_fresh_valuation_count || 0} + CARRIED≤15秒 ${market.strategy_recent_carried_valuation_count || 0} · 持倉腿 ${market.held_option_book_count || 0}/${market.held_option_contract_count || 0} · 一般訂閱 ${market.latest_book_count || 0}/${market.expected_book_count || 0}`);
+  setText("cycle-status", cycle ? "週期進行中" : "目前空手");
+  setText("cycle-expiry", cycle ? `到期 ${cycle.expiry_date || "—"}` : "目前無持倉週期");
+  setText("broker-status", broker.order_failures === 0 ? "無失敗" : `${broker.order_failures} 次失敗`);
+  setText("broker-detail", `${broker.inflight_order_count} 筆處理中 · 正式單=${broker.orders_enabled ? "啟用" : "停用"}`);
+  setText("source-age", formatAge(snapshot.source_age_seconds));
   const safe = snapshot.simulation_only && !snapshot.production_order_possible;
-  setText("safety-state", safe ? "SIM ONLY" : "UNSAFE");
+  setText("safety-state", safe ? "只讀模擬" : "安全契約失敗");
 }
 
 function renderCycle(snapshot) {
   const market = snapshot.market;
   const cycle = snapshot.active_cycle || {};
+  const marginSchedule = market.official_margin_schedule || {};
+  const maintenance = marginSchedule.maintenance || {};
+  const clearing = marginSchedule.clearing || {};
+  const maintenanceTxo = maintenance.txo_risk_margin_twd || {};
+  const clearingTxo = clearing.txo_risk_margin_twd || {};
   setText("underlying-contract", market.underlying_contract);
   setText("hedge-contract", `${market.hedge_product || "—"} · ${market.hedge_contract || "—"} · ×${market.hedge_multiplier_twd_per_point || "—"}`);
-  setText("option-risk-margins", `${formatTwd(market.option_risk_margin_a_twd)} / ${formatTwd(market.option_risk_margin_b_twd)}`);
+  setText("option-risk-margins", `${formatTwd(market.option_risk_margin_a_twd)} / ${formatTwd(market.option_risk_margin_b_twd)} / ${formatTwd(market.option_risk_margin_c_twd)} · ${market.option_risk_margin_effective_trading_date || "—"} 起 · C 僅作組合式參考，本帳逐腿裸賣計提`);
+  setText("futures-initial-margin", `${market.hedge_product || "—"} 每口 ${formatTwd(market.futures_initial_margin_per_contract_twd)}`);
+  setText("maintenance-clearing-margin", `${market.hedge_product || "—"} 維持 ${formatTwd(maintenance.futures_twd)}／結算 ${formatTwd(clearing.futures_twd)}；TXO 維持 A/B/C ${formatTwd(maintenanceTxo.A)} / ${formatTwd(maintenanceTxo.B)} / ${formatTwd(maintenanceTxo.C)}；結算 ${formatTwd(clearingTxo.A)} / ${formatTwd(clearingTxo.B)} / ${formatTwd(clearingTxo.C)}`);
   setText("capital-buffer-multiple", market.strategy_capital_buffer_multiple == null ? "—" : `×${market.strategy_capital_buffer_multiple}`);
   setText("cycle-series", cycle.series || "flat");
   setText("strategy-mode", snapshot.strategy_mode || "—");
@@ -216,7 +272,7 @@ function renderExposureSummary(summary) {
 function renderPerformanceSummary(summary) {
   summary = summary || {};
   setText("performance-count", `${summary.valid_return_count ?? 0} / ${summary.strategy_count ?? 0}`);
-  setText("performance-reserve", formatTwd(summary.independent_strategy_reserved_capital_twd));
+  setText("performance-reserve", formatCompactTwd(summary.independent_strategy_reserved_capital_twd));
   setText("performance-median", formatPercent(summary.median_fixed_capital_return));
   const best = summary.best_strategy;
   const worst = summary.worst_strategy;
@@ -224,7 +280,7 @@ function renderPerformanceSummary(summary) {
   setText("performance-best-name", best?.label || "—");
   setText("performance-worst", worst ? formatPercent(worst.fixed_capital_return) : "—");
   setText("performance-worst-name", worst?.label || "—");
-  setText("performance-cost", formatTwd(summary.independent_strategy_explicit_cost_twd));
+  setText("performance-cost", formatCompactTwd(summary.independent_strategy_explicit_cost_twd));
 }
 
 function renderTable(strategies) {
@@ -336,13 +392,20 @@ function renderStrategyGuide(catalog, counts) {
     }
   }
   filter.value = selectedCategory;
+  const normalizedSearch = strategySearch.trim().toLocaleLowerCase("zh-Hant");
   const rows = catalog.filter((row) => (
     (!selectedCategory || row.category === selectedCategory)
     && matchesExposureFilters(row)
+    && (!normalizedSearch || [
+      row.label, row.category, row.family, row.summary, row.entry_rule,
+      row.exit_rule, row.risk_note, row.directional_exposure_label,
+      row.volatility_exposure_label, row.hedge_type_label,
+    ].some((value) => String(value || "").toLocaleLowerCase("zh-Hant").includes(normalizedSearch)))
   ));
+  const visibleRows = rows.slice(0, guideVisibleCount);
   const grid = byId("strategy-guide-grid");
   grid.replaceChildren();
-  for (const row of rows) {
+  for (const row of visibleRows) {
     const card = document.createElement("article");
     card.className = "strategy-card";
     const head = document.createElement("div");
@@ -386,9 +449,18 @@ function renderStrategyGuide(catalog, counts) {
     if (row.blocker) appendGuideField(card, "尚缺契約", row.blocker);
     grid.appendChild(card);
   }
+  if (!visibleRows.length) {
+    const empty = document.createElement("p");
+    empty.className = "empty-state";
+    empty.textContent = "沒有符合搜尋與曝險條件的策略。";
+    grid.appendChild(empty);
+  }
+  const loadMore = byId("guide-load-more");
+  loadMore.hidden = visibleRows.length >= rows.length;
+  setText("guide-visible-count", `顯示 ${visibleRows.length} / ${rows.length}`);
   setText(
     "strategy-guide-summary",
-    `目前顯示 ${rows.length} / ${counts.catalog_total}；${counts.live_ideal} 個實際理想帳曲線 · ${counts.blocked_contract} 個契約缺口 fail-closed`
+    `符合條件 ${rows.length} / ${counts.catalog_total}；${counts.live_ideal} 個實際理想帳曲線 · ${counts.blocked_contract} 個契約缺口 fail-closed`
   );
 }
 
@@ -402,8 +474,9 @@ function svgNode(name, attrs = {}, text = "") {
 function renderCurveWall(strategies, history) {
   const grid = byId("curve-wall-grid");
   grid.replaceChildren();
-  const visible = filteredStrategies(strategies);
-  const byStrategy = new Map(visible.map((row) => [row.strategy_id, []]));
+  const filtered = sortedStrategies(filteredStrategies(strategies));
+  const visible = filtered.slice(0, curveVisibleCount);
+  const byStrategy = new Map(filtered.map((row) => [row.strategy_id, []]));
   for (const point of history) {
     const value = Number(point.fixed_capital_return);
     if (byStrategy.has(point.strategy_id) && Number.isFinite(value)) {
@@ -420,7 +493,7 @@ function renderCurveWall(strategies, history) {
   maxY += range * 0.06;
   const width = 240, height = 76, inset = 6;
   const y = (value) => inset + (maxY - value) * (height - inset * 2) / (maxY - minY);
-  for (const row of sortedStrategies(visible)) {
+  for (const row of visible) {
     const values = byStrategy.get(row.strategy_id) || [];
     const card = document.createElement("button");
     card.type = "button";
@@ -430,7 +503,8 @@ function renderCurveWall(strategies, history) {
       selectedStrategy = row.strategy_id;
       byId("strategy-select").value = selectedStrategy;
       if (lastSnapshot) renderChart(lastSnapshot.history);
-      byId("equity-chart").scrollIntoView({ behavior: "smooth", block: "center" });
+      const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+      byId("equity-chart").scrollIntoView({ behavior: reducedMotion ? "auto" : "smooth", block: "center" });
     });
     const head = document.createElement("span");
     head.className = "curve-card-head";
@@ -457,9 +531,12 @@ function renderCurveWall(strategies, history) {
     card.append(head, meta, svg);
     grid.appendChild(card);
   }
+  const loadMore = byId("curve-load-more");
+  loadMore.hidden = visible.length >= filtered.length;
+  setText("curve-visible-count", `顯示 ${visible.length} / ${filtered.length}`);
   setText(
     "curve-wall-note",
-    `顯示 ${visible.length} / ${strategies.length} 條曲線；共用 Y 軸（${formatPercent(minY)} ～ ${formatPercent(maxY)}），以固定預留資金正規化；排序與下表一致。`
+    `符合條件 ${filtered.length} / ${strategies.length} 條曲線；共用 Y 軸（${formatPercent(minY)} ～ ${formatPercent(maxY)}），以固定預留資金正規化；排序與下表一致。`
   );
 }
 
@@ -513,7 +590,7 @@ function renderCounts(counts) {
   setText("count-events", money.format(counts.events));
 }
 
-function render(snapshot) {
+function render(snapshot, {forceHeavy = false} = {}) {
   snapshot.history = cachedHistory;
   lastSnapshot = snapshot;
   renderHeader(snapshot); renderMetrics(snapshot); renderCycle(snapshot);
@@ -537,6 +614,26 @@ function render(snapshot) {
     design_option_ratio_label: row.design_option_ratio_label || "尚未載入",
     availability: "live_ideal"
   }));
+  const compatibilityCounts = snapshot.strategy_counts || {
+    live_ideal: snapshot.strategies.length,
+    blocked_contract: 0,
+    catalog_total: compatibilityCatalog.length
+  };
+  lastStrategyCatalog = compatibilityCatalog;
+  lastStrategyCounts = compatibilityCounts;
+  const revision = JSON.stringify([
+    snapshot.record_counts,
+    snapshot.portfolio_summary,
+    snapshot.exposure_summary,
+    snapshot.strategies.map((row) => [
+      row.strategy_id, row.total_equity_twd, row.fixed_capital_return,
+      row.compounded_return_to_live_mark, row.margin_excess_twd,
+      row.valuation_status, row.valuation_age_seconds,
+    ]),
+    compatibilityCatalog.length,
+  ]);
+  if (!forceHeavy && revision === lastHeavyRevision) return;
+  lastHeavyRevision = revision;
   renderExposureControls(compatibilityCatalog);
   renderExposureSummary(snapshot.exposure_summary);
   renderStrategySelector(snapshot.strategies);
@@ -544,15 +641,11 @@ function render(snapshot) {
   renderCurveWall(snapshot.strategies, snapshot.history);
   renderTable(snapshot.strategies);
   renderCounts(snapshot.record_counts);
-  const compatibilityCounts = snapshot.strategy_counts || {
-    live_ideal: snapshot.strategies.length,
-    blocked_contract: 0,
-    catalog_total: compatibilityCatalog.length
-  };
   renderStrategyGuide(compatibilityCatalog, compatibilityCounts);
 }
 
 async function refresh() {
+  if (document.hidden) return;
   try {
     const response = await fetch("api/status", { cache: "no-cache" });
     const payload = await response.json();
@@ -568,6 +661,7 @@ async function refresh() {
 }
 
 async function refreshHistory() {
+  if (document.hidden) return;
   try {
     const response = await fetch("api/history", { cache: "no-cache" });
     const payload = await response.json();
@@ -590,25 +684,39 @@ byId("strategy-select").addEventListener("change", (event) => {
 });
 byId("strategy-category-filter").addEventListener("change", (event) => {
   selectedCategory = event.target.value;
-  if (lastSnapshot) render(lastSnapshot);
+  guideVisibleCount = 12;
+  if (lastSnapshot) render(lastSnapshot, {forceHeavy: true});
+});
+byId("strategy-search").addEventListener("input", (event) => {
+  strategySearch = event.target.value;
+  guideVisibleCount = 12;
+  if (lastSnapshot) renderStrategyGuide(lastStrategyCatalog, lastStrategyCounts);
 });
 byId("exposure-direction-filter").addEventListener("change", (event) => {
   selectedDirectionalExposure = event.target.value;
-  if (lastSnapshot) render(lastSnapshot);
+  curveVisibleCount = 12;
+  guideVisibleCount = 12;
+  if (lastSnapshot) render(lastSnapshot, {forceHeavy: true});
 });
 byId("exposure-volatility-filter").addEventListener("change", (event) => {
   selectedVolatilityExposure = event.target.value;
-  if (lastSnapshot) render(lastSnapshot);
+  curveVisibleCount = 12;
+  guideVisibleCount = 12;
+  if (lastSnapshot) render(lastSnapshot, {forceHeavy: true});
 });
 byId("exposure-hedge-filter").addEventListener("change", (event) => {
   selectedHedgeType = event.target.value;
-  if (lastSnapshot) render(lastSnapshot);
+  curveVisibleCount = 12;
+  guideVisibleCount = 12;
+  if (lastSnapshot) render(lastSnapshot, {forceHeavy: true});
 });
 byId("exposure-filter-reset").addEventListener("click", () => {
   selectedDirectionalExposure = "";
   selectedVolatilityExposure = "";
   selectedHedgeType = "";
-  if (lastSnapshot) render(lastSnapshot);
+  curveVisibleCount = 12;
+  guideVisibleCount = 12;
+  if (lastSnapshot) render(lastSnapshot, {forceHeavy: true});
 });
 byId("strategy-sort").addEventListener("change", (event) => {
   selectedSort = event.target.value;
@@ -623,6 +731,20 @@ byId("sort-direction").addEventListener("click", () => {
   if (lastSnapshot) {
     renderCurveWall(lastSnapshot.strategies, lastSnapshot.history);
     renderTable(lastSnapshot.strategies);
+  }
+});
+byId("curve-load-more").addEventListener("click", () => {
+  curveVisibleCount += 12;
+  if (lastSnapshot) renderCurveWall(lastSnapshot.strategies, lastSnapshot.history);
+});
+byId("guide-load-more").addEventListener("click", () => {
+  guideVisibleCount += 12;
+  if (lastSnapshot) renderStrategyGuide(lastStrategyCatalog, lastStrategyCounts);
+});
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) {
+    refresh();
+    refreshHistory();
   }
 });
 refresh();

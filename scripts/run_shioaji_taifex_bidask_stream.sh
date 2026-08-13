@@ -55,8 +55,9 @@ STRATEGY_INTRADAY_ENTRY_CUTOFF="${SHIOAJI_TAIFEX_STRATEGY_INTRADAY_ENTRY_CUTOFF:
 STRATEGY_INTRADAY_FLATTEN_TIME="${SHIOAJI_TAIFEX_STRATEGY_INTRADAY_FLATTEN_TIME:-13:35:00}"
 STRATEGY_NIGHT_ENTRY_CUTOFF="${SHIOAJI_TAIFEX_STRATEGY_NIGHT_ENTRY_CUTOFF:-04:40:00}"
 STRATEGY_NIGHT_FLATTEN_TIME="${SHIOAJI_TAIFEX_STRATEGY_NIGHT_FLATTEN_TIME:-04:55:00}"
-STRATEGY_OPTION_RISK_MARGIN_A_TWD="${SHIOAJI_TAIFEX_STRATEGY_OPTION_RISK_MARGIN_A_TWD:-169000}"
-STRATEGY_OPTION_RISK_MARGIN_B_TWD="${SHIOAJI_TAIFEX_STRATEGY_OPTION_RISK_MARGIN_B_TWD:-85000}"
+STRATEGY_OPTION_RISK_MARGIN_A_TWD="${SHIOAJI_TAIFEX_STRATEGY_OPTION_RISK_MARGIN_A_TWD:-187000}"
+STRATEGY_OPTION_RISK_MARGIN_B_TWD="${SHIOAJI_TAIFEX_STRATEGY_OPTION_RISK_MARGIN_B_TWD:-94000}"
+STRATEGY_OPTION_RISK_MARGIN_C_TWD="${SHIOAJI_TAIFEX_STRATEGY_OPTION_RISK_MARGIN_C_TWD:-18800}"
 STRATEGY_CAPITAL_BUFFER_MULTIPLE="${SHIOAJI_TAIFEX_STRATEGY_CAPITAL_BUFFER_MULTIPLE:-2.0}"
 STRATEGY_CATALOG_EXPANSION_ENTRY_POLICY="${SHIOAJI_TAIFEX_STRATEGY_CATALOG_EXPANSION_ENTRY_POLICY:-immediate_live}"
 LOG_FILE="$RUN_ROOT/run.log"
@@ -118,6 +119,10 @@ while true; do
     fi
   fi
   capture_id="$(run_fintech_python -c 'import uuid; print(uuid.uuid4().hex)')"
+  required_option_codes=""
+  if [[ "$EXECUTE_STRATEGIES" == true ]]; then
+    required_option_codes="$(run_fintech_python -c 'from pathlib import Path; import sys; from stockagent.live.taifex_strategy_state import load_held_option_codes; print(",".join(load_held_option_codes(Path(sys.argv[1]))))' "$STRATEGY_STATE_DIR")"
+  fi
   echo "[shioaji-taifex] capture_start=$(TZ=Asia/Taipei date --iso-8601=seconds) capture_id=$capture_id session=$capture_session trade_date=$trade_date stop_at=$stop_at"
   worker_pids=()
   worker_rcs=()
@@ -127,7 +132,6 @@ while true; do
     if [[ "$EXECUTE_STRATEGIES" == true && "$worker_index" -eq 0 ]]; then
       strategy_args+=(
         --execute-strategies
-        --strategy-state-dir "$STRATEGY_STATE_DIR"
         --final-settlement-path "$FINAL_SETTLEMENT_PATH"
         --strategy-mode "$STRATEGY_MODE"
         --strategy-intraday-interval-seconds "$STRATEGY_INTRADAY_INTERVAL_SECONDS"
@@ -137,6 +141,7 @@ while true; do
         --strategy-night-flatten-time "$STRATEGY_NIGHT_FLATTEN_TIME"
         --strategy-option-risk-margin-a-twd "$STRATEGY_OPTION_RISK_MARGIN_A_TWD"
         --strategy-option-risk-margin-b-twd "$STRATEGY_OPTION_RISK_MARGIN_B_TWD"
+        --strategy-option-risk-margin-c-twd "$STRATEGY_OPTION_RISK_MARGIN_C_TWD"
         --strategy-capital-buffer-multiple "$STRATEGY_CAPITAL_BUFFER_MULTIPLE"
         --strategy-catalog-expansion-entry-policy "$STRATEGY_CATALOG_EXPANSION_ENTRY_POLICY"
       )
@@ -155,6 +160,8 @@ while true; do
       --option-expiries "$OPTION_EXPIRIES" \
       --weekly-expiries "$WEEKLY_EXPIRIES" \
       --strikes-per-expiry "$STRIKES_PER_EXPIRY" \
+      --strategy-state-dir "$STRATEGY_STATE_DIR" \
+      --strategy-required-option-codes "$required_option_codes" \
       --worker-index "$worker_index" \
       --workers "$WORKERS" \
       > >(tee -a "$RUN_ROOT/worker_${worker_index}.log") 2>&1 &

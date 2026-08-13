@@ -894,8 +894,8 @@ class TradingConfig:
     tw_index_options_tick_contract_multiplier: float = 50.0
     # Current original-margin A/B inputs are explicit because TAIFEX may revise
     # them. Historical experiments must pin the values applicable to the data.
-    tw_index_options_tick_risk_margin_a_twd: float = 169_000.0
-    tw_index_options_tick_risk_margin_b_twd: float = 85_000.0
+    tw_index_options_tick_risk_margin_a_twd: float = 187_000.0
+    tw_index_options_tick_risk_margin_b_twd: float = 94_000.0
     tw_index_options_tick_fixed_fee_per_contract_per_side_twd: float = 20.0
     tw_index_options_tick_transaction_tax_rate: float = 0.001
     tw_index_options_tick_slippage_points_per_side: float = 0.5
