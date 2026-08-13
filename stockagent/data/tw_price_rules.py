@@ -81,6 +81,37 @@ def tick_size_numpy(price: np.ndarray, dates: Any | None = None) -> np.ndarray:
     return out
 
 
+def move_price_ticks_numpy(
+    price: np.ndarray,
+    ticks: int,
+    dates: Any | None = None,
+) -> np.ndarray:
+    """Move legal regular-stock prices by an integer number of dated ticks.
+
+    Downward moves probe immediately below the current price before resolving
+    the tick size.  This matters at bucket boundaries: the legal price one
+    tick below 1,000 is 999, not 995.  Repeated movement is deliberate so a
+    caller crossing a historical or current tick bucket remains legal.
+    """
+
+    if isinstance(ticks, bool) or int(ticks) != ticks:
+        raise ValueError("TW price tick movement must be an integer")
+    steps = int(ticks)
+    out = np.asarray(price, dtype=np.float64).copy()
+    if steps == 0:
+        return out
+
+    direction = 1.0 if steps > 0 else -1.0
+    for _ in range(abs(steps)):
+        probe = out if direction > 0.0 else np.nextafter(out, -np.inf)
+        tick = tick_size_numpy(probe, dates)
+        valid = np.isfinite(out) & (out > 0.0) & np.isfinite(tick) & (tick > 0.0)
+        shifted = out + direction * tick
+        shifted = np.floor(shifted * 100.0 + 0.5) / 100.0
+        out = np.where(valid & (shifted > 0.0), shifted, np.nan)
+    return out
+
+
 def dated_limit_ratio(ratio: float, dates: Any | None, shape: tuple[int, ...]) -> np.ndarray:
     """Map an up/down direction to the 7% or 10% rule active on each date."""
 

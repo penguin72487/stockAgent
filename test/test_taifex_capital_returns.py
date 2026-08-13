@@ -10,8 +10,14 @@ from stockagent.data.tw_index_derivatives_tick import TAIPEI
 from scripts.render_taifex_option_capital_report import curve_group_for_variant
 from stockagent.research.taifex_capital_returns import (
     TAIFEX_INITIAL_MARGIN_TWD,
+    TAIFEX_INITIAL_MARGIN_TWD_2026_08_13,
+    TXO_RISK_MARGIN_TWD,
+    TXO_RISK_MARGIN_TWD_2026_08_13,
     build_capital_normalized_returns,
     compute_daily_required_capital,
+    taifex_futures_margin_twd,
+    taifex_initial_margin_twd,
+    taifex_txo_risk_margin_twd,
 )
 
 
@@ -204,6 +210,73 @@ def test_futures_capital_uses_official_initial_margin_not_notional() -> None:
     )
     assert capital.item(0, "peak_futures_initial_margin_twd") == pytest.approx(
         318_000.0
+    )
+
+
+def test_margin_schedule_switches_on_2026_08_13_trading_date() -> None:
+    assert taifex_initial_margin_twd("TX", date(2026, 8, 12)) == pytest.approx(
+        TAIFEX_INITIAL_MARGIN_TWD["TX"]
+    )
+    assert taifex_initial_margin_twd("TX", date(2026, 8, 13)) == pytest.approx(
+        TAIFEX_INITIAL_MARGIN_TWD_2026_08_13["TX"]
+    )
+    assert taifex_txo_risk_margin_twd(date(2026, 8, 12)) == TXO_RISK_MARGIN_TWD
+    assert (
+        taifex_txo_risk_margin_twd(date(2026, 8, 13))
+        == TXO_RISK_MARGIN_TWD_2026_08_13
+    )
+    assert taifex_futures_margin_twd(
+        "TMF", date(2026, 8, 13), level="maintenance"
+    ) == pytest.approx(26_900.0)
+    assert taifex_futures_margin_twd(
+        "TMF", date(2026, 8, 13), level="clearing"
+    ) == pytest.approx(25_950.0)
+    assert taifex_txo_risk_margin_twd(
+        date(2026, 8, 13), level="maintenance"
+    ) == {"A": 143_000.0, "B": 72_000.0, "C": 14_400.0}
+    assert taifex_txo_risk_margin_twd(
+        date(2026, 8, 13), level="clearing"
+    ) == {"A": 138_000.0, "B": 69_000.0, "C": 13_800.0}
+
+
+def test_futures_capital_uses_new_margin_from_2026_08_13() -> None:
+    trading_date = date(2026, 8, 13)
+    rows = [
+        _trade(
+            trading_date=trading_date,
+            variant_id="tmf_new_margin",
+            hour=8,
+            minute=46,
+            instrument_type="future",
+            product="TMF",
+            delta_contracts=1,
+            gross_cash_flow_twd=0.0,
+            fixed_fee_twd=16.0,
+            series="TMF_front_month",
+            strike=None,
+            option_right=None,
+        ),
+        _trade(
+            trading_date=trading_date,
+            variant_id="tmf_new_margin",
+            hour=13,
+            minute=44,
+            instrument_type="future",
+            product="TMF",
+            delta_contracts=-1,
+            gross_cash_flow_twd=0.0,
+            fixed_fee_twd=16.0,
+            series="TMF_front_month",
+            strike=None,
+            option_right=None,
+        ),
+    ]
+    capital = compute_daily_required_capital(pl.DataFrame(rows))
+    assert capital.item(0, "peak_futures_initial_margin_twd") == pytest.approx(
+        35_050.0
+    )
+    assert capital.item(0, "daily_peak_required_capital_twd") == pytest.approx(
+        35_066.0
     )
 
 

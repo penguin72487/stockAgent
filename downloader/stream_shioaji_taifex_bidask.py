@@ -33,6 +33,7 @@ from stockagent.data.taifex_sessions import (
     taifex_session_kind,
     taifex_trading_date,
 )
+from stockagent.live.taifex_strategy_state import load_held_option_codes
 
 
 SOURCE_NAME = "shioaji_taifex_tick_bidask_v1"
@@ -91,6 +92,14 @@ def parse_args() -> argparse.Namespace:
         default=Path("artifacts/live/shioaji_taifex_volatility_simulation"),
     )
     parser.add_argument(
+        "--strategy-required-option-codes",
+        default=None,
+        help=(
+            "Comma-separated held option codes captured once by the multi-worker "
+            "runner. If omitted, read strategy-state-dir directly."
+        ),
+    )
+    parser.add_argument(
         "--final-settlement-path",
         type=Path,
         default=Path(
@@ -118,6 +127,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--strategy-option-risk-margin-b-twd", type=float, default=94_000.0
+    )
+    parser.add_argument(
+        "--strategy-option-risk-margin-c-twd", type=float, default=18_800.0
     )
     parser.add_argument(
         "--strategy-capital-buffer-multiple", type=float, default=2.0
@@ -302,6 +314,114 @@ def select_balanced_option_strips(
     for key, strike in selected_pairs:
         selected.extend([grouped[key][strike]["C"], grouped[key][strike]["P"]])
     return selected
+
+
+def prioritize_required_option_pairs(
+    all_option_infos: Iterable[Any],
+    selected_option_infos: list[Any],
+    *,
+    trade_date: date,
+    required_codes: Iterable[str],
+    priority_pair_capacity: int,
+) -> list[Any]:
+    """Pin persisted held pairs to worker 0 without changing total selection size."""
+
+    if priority_pair_capacity < 1:
+        raise ValueError("priority pair capacity must be positive")
+
+    eligible_pairs: dict[tuple[str, date, float], dict[str, Any]] = defaultdict(dict)
+    eligible_by_code: dict[str, tuple[str, date, float]] = {}
+    for info in all_option_infos:
+        root = str(getattr(info, "root", "")).strip().upper()
+        delivery_date = getattr(info, "delivery_date", None)
+        last_trading_date = getattr(info, "last_trading_date", delivery_date)
+        if (
+            not root
+            or not isinstance(delivery_date, date)
+            or delivery_date < trade_date
+            or (
+                isinstance(last_trading_date, date)
+                and last_trading_date < trade_date
+            )
+        ):
+            continue
+        try:
+            right = _option_right(getattr(info, "option_right", None))
+            strike = float(getattr(info, "strike_price"))
+            code = str(getattr(_base(info), "code")).strip()
+        except (TypeError, ValueError):
+            continue
+        if not code or not math.isfinite(strike) or strike <= 0.0:
+            continue
+        key = (root, delivery_date, strike)
+        if code in eligible_by_code and eligible_by_code[code] != key:
+            raise RuntimeError(f"duplicate option code maps to multiple pairs: {code}")
+        eligible_by_code[code] = key
+        eligible_pairs[key][right] = info
+
+    normalized_required_codes = tuple(
+        sorted({str(code).strip() for code in required_codes if str(code).strip()})
+    )
+    missing_codes = sorted(set(normalized_required_codes) - set(eligible_by_code))
+    if missing_codes:
+        raise RuntimeError(
+            "held option contracts are unavailable for this trading date: "
+            + ",".join(missing_codes)
+        )
+    required_keys = {eligible_by_code[code] for code in normalized_required_codes}
+    incomplete_required = sorted(
+        key for key in required_keys if set(eligible_pairs[key]) != {"C", "P"}
+    )
+    if incomplete_required:
+        raise RuntimeError(
+            "held option contract pairs are incomplete: "
+            + ",".join(
+                f"{root}/{expiry.isoformat()}/{strike:g}"
+                for root, expiry, strike in incomplete_required
+            )
+        )
+    if len(required_keys) > priority_pair_capacity:
+        raise RuntimeError(
+            "held option pairs exceed worker-0 capacity: "
+            f"required={len(required_keys)} capacity={priority_pair_capacity}"
+        )
+    if len(selected_option_infos) % 2:
+        raise ValueError("option selection must contain complete Call/Put pairs")
+
+    selected_keys: list[tuple[str, date, float]] = []
+    for index in range(0, len(selected_option_infos), 2):
+        pair = selected_option_infos[index : index + 2]
+        pair_keys: set[tuple[str, date, float]] = set()
+        rights: set[str] = set()
+        for info in pair:
+            root = str(getattr(info, "root", "")).strip().upper()
+            delivery_date = getattr(info, "delivery_date", None)
+            strike = float(getattr(info, "strike_price"))
+            if not root or not isinstance(delivery_date, date):
+                raise ValueError("selected option pair has invalid contract metadata")
+            pair_keys.add((root, delivery_date, strike))
+            rights.add(_option_right(getattr(info, "option_right", None)))
+        if len(pair_keys) != 1 or rights != {"C", "P"}:
+            raise ValueError("selected options are not adjacent complete Call/Put pairs")
+        selected_keys.append(next(iter(pair_keys)))
+
+    target_pair_count = len(selected_keys)
+    if len(required_keys) > target_pair_count:
+        raise RuntimeError(
+            "held option pairs exceed the total selected pair count: "
+            f"required={len(required_keys)} selected={target_pair_count}"
+        )
+    ordered_keys = [
+        *sorted(required_keys, key=lambda item: (item[1], item[0], item[2])),
+        *(key for key in selected_keys if key not in required_keys),
+    ][:target_pair_count]
+    output: list[Any] = []
+    for key in ordered_keys:
+        rights = eligible_pairs.get(key)
+        if rights is None or set(rights) != {"C", "P"}:
+            raise RuntimeError(f"selected option pair became unavailable: {key!r}")
+        output.extend([rights["C"], rights["P"]])
+    return output
 
 
 def partition_contract_infos(
@@ -507,6 +627,25 @@ def main() -> int:
         strikes_per_expiry=int(args.strikes_per_expiry),
         max_pairs=(max_contracts - len(futures_infos)) // 2,
     )
+    if args.strategy_required_option_codes is None:
+        required_option_codes = load_held_option_codes(args.strategy_state_dir)
+    else:
+        required_option_codes = tuple(
+            sorted(
+                {
+                    code.strip()
+                    for code in str(args.strategy_required_option_codes).split(",")
+                    if code.strip()
+                }
+            )
+        )
+    selected_option_infos = prioritize_required_option_pairs(
+        option_infos,
+        selected_option_infos,
+        trade_date=capture_trade_date,
+        required_codes=required_option_codes,
+        priority_pair_capacity=(100 - len(futures_infos)) // 2,
+    )
     all_selected_infos = [*futures_infos, *selected_option_infos]
     selected_infos = partition_contract_infos(
         futures_infos=futures_infos,
@@ -567,7 +706,7 @@ def main() -> int:
             api=api,
             shioaji_module=sj,
             state_dir=Path(args.strategy_state_dir),
-            option_infos=selected_option_infos[: (100 - len(futures_infos))],
+            option_infos=selected_infos[len(futures_infos) :],
             underlying=FuturesInstrument(
                 logical_code=str(args.future_code),
                 code=str(getattr(future_base, "code")),
@@ -597,6 +736,9 @@ def main() -> int:
             ),
             option_risk_margin_b_twd=float(
                 args.strategy_option_risk_margin_b_twd
+            ),
+            option_risk_margin_c_twd=float(
+                args.strategy_option_risk_margin_c_twd
             ),
             strategy_capital_buffer_multiple=float(
                 args.strategy_capital_buffer_multiple
@@ -716,6 +858,21 @@ def main() -> int:
                 "strikes_per_expiry": int(args.strikes_per_expiry),
                 "underlying_reference": reference,
                 "selected_contracts_all_workers": len(all_selected_infos),
+                "held_option_codes_pinned_to_worker_0": list(required_option_codes),
+                "held_option_pair_count_pinned_to_worker_0": len(
+                    {
+                        (
+                            str(getattr(info, "root", "")).strip().upper(),
+                            getattr(info, "delivery_date", None),
+                            float(getattr(info, "strike_price")),
+                        )
+                        for info in selected_option_infos[
+                            : 2 * ((100 - len(futures_infos)) // 2)
+                        ]
+                        if str(getattr(_base(info), "code"))
+                        in set(required_option_codes)
+                    }
+                ),
             },
             "contract_metadata": contract_metadata,
             "contract_count": len(contracts),

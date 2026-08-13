@@ -24,7 +24,7 @@ All Taiwan daily and day-trade market configs share
 mutable `/srv/stockagent-live/data_tw_public` tree, runs the strict causal-data
 audit, publishes to the Syncthing/desync store, verifies a separately
 materialized snapshot, then atomically switches the repository symlink. Check
-the four day-trade modes with:
+the four independently inferred day-trade modes with:
 
 ```bash
 source scripts/runtime_env.sh

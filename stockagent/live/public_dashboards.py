@@ -1,4 +1,4 @@
-"""Public-safe projections for the two read-only live dashboards.
+"""Public-safe projections for the read-only live dashboards.
 
 The private dashboards intentionally retain operational identifiers and local
 artifact paths for audit work.  Public viewers do not need those fields.  This
