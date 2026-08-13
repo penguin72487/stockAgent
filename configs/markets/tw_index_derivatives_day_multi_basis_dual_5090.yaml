@@ -1,0 +1,25 @@
+# Hardware-only dual-RTX-5090 overlay. Strategy and accounting are inherited.
+base_config: tw_index_derivatives_day_multi_basis.yaml
+
+experiment_name: tw-stock-cross-section-index-derivatives-day-multi-basis-dual5090-100m-relative-tenor-v5
+
+runner:
+  output_dir: artifacts/markets/tw_index_derivatives_day_multi_basis_100m_relative_tenor_v5_dual5090
+  resume: true
+  isolate_train_folds: true
+
+training:
+  multi_gpu_strategy: distributed_data_parallel
+  # Same measured complete multi-basis footprint: local batch 64 per 5090.
+  batch_size_train: 128
+  batch_size_eval: 128
+  epochs: 1000
+  cache_train_tensors_on_gpu: true
+  # Rank 1 evaluates a different sampled-test base. Caching it beside the
+  # 4.49 GiB train base consumes the local-batch-64 activation headroom;
+  # streamed eval chunks are small, so reserve VRAM for the compiled train graph.
+  cache_eval_tensors_on_gpu: false
+  vram_budget_gb: 32
+  curve_plot_interval: 1
+  curve_plot_async: true
+  defer_epoch_curve_plot_until_end: false

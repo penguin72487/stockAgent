@@ -116,6 +116,13 @@ def test_build_filters_session_weekly_and_selects_front_month(
     )
     market = load_taifex_index_futures_day_session(output)
 
+    import pyarrow.parquet as pq
+
+    normalized = pq.read_table(output)
+    # The v2 parquet retains the deferred month required to compute a real roll.
+    assert normalized.num_rows == 7
+    assert int(sum(normalized["is_front_month"].to_pylist())) == 6
+
     assert market.products == ("TX", "MTX", "TMF")
     assert market.contract_months[0].tolist() == [
         "202501",
@@ -129,6 +136,43 @@ def test_build_filters_session_weekly_and_selects_front_month(
     )
     assert market.tradable_mask.all()
     np.testing.assert_array_equal(market.multipliers, [200, 50, 10])
+
+
+def test_rolling_buy_hold_uses_new_contract_prior_close_on_roll(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "roll.csv"
+    _write_csv(
+        source,
+        [
+            _row("2025/01/02", "TX", "202501", 100, 100),
+            _row("2025/01/02", "TX", "202502", 110, 110),
+            _row("2025/01/03", "TX", "202501", 100, 101),
+            _row("2025/01/03", "TX", "202502", 110, 111),
+            # The January contract is no longer listed. February becomes front.
+            _row("2025/01/06", "TX", "202502", 111, 112),
+        ],
+    )
+    output = build_taifex_index_futures_day_session(
+        [source],
+        tmp_path / "contracts.parquet",
+        products=("TX",),
+    )
+    market = load_taifex_index_futures_day_session(output, products=("TX",))
+
+    np.testing.assert_array_equal(
+        market.contract_months[:, 0],
+        ["202501", "202501", "202502"],
+    )
+    rolling = market.reference_rolling_buy_hold_log_returns("TX")
+    assert np.isnan(rolling[0])
+    assert rolling[1] == pytest.approx(np.log(101 / 100))
+    # Crucial: no artificial 112/101 old/new-contract price jump.
+    assert rolling[2] == pytest.approx(np.log(112 / 111))
+    np.testing.assert_array_equal(
+        market.reference_front_month_roll_mask("TX"),
+        [False, False, True],
+    )
 
 
 def test_build_reads_cp950_csv_inside_zip(tmp_path: Path) -> None:

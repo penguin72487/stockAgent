@@ -3,8 +3,8 @@
 
 Annual ZIP files are used for completed years.  The current year is downloaded
 in calendar-month chunks because TAIFEX limits the daily CSV endpoint to one
-month per request.  Raw receipts remain immutable inputs to the normalized
-front-month parquet.
+month per request. Raw receipts remain immutable inputs to the normalized
+all-contract parquet.
 """
 
 from __future__ import annotations
@@ -22,6 +22,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from stockagent.data.tw_index_futures import (  # noqa: E402
+    TAIFEX_FUTURES_DATA_CONTRACT_VERSION,
     TAIFEX_INDEX_FUTURES_PRODUCTS,
     build_taifex_index_futures_day_session,
 )
@@ -93,6 +94,14 @@ def main() -> int:
     )
     parser.add_argument("--request-interval", type=float, default=1.0)
     parser.add_argument("--attempts", type=int, default=3)
+    parser.add_argument(
+        "--rebuild-normalized-only",
+        action="store_true",
+        help=(
+            "Do not access the network; validate every existing raw ZIP/CSV "
+            "receipt and rebuild the normalized v2 contract parquet."
+        ),
+    )
     args = parser.parse_args()
 
     if args.start_year < 1998:
@@ -107,51 +116,69 @@ def main() -> int:
     output_dir = Path(args.output_dir).expanduser().resolve()
     raw_dir = output_dir / "raw"
     receipts: list[Path] = []
-    for year in range(args.start_year, args.end_date.year):
-        target = raw_dir / "annual" / f"{year}_fut.zip"
-        receipts.append(
-            _download(
-                {"down_type": "2", "his_year": str(year)},
-                target,
-                attempts=args.attempts,
-                request_interval=args.request_interval,
+    if args.rebuild_normalized_only:
+        receipts = sorted(
+            [*raw_dir.rglob("*.zip"), *raw_dir.rglob("*.csv")],
+            key=lambda path: str(path),
+        )
+        if not receipts:
+            parser.error(
+                "--rebuild-normalized-only found no raw ZIP/CSV receipts under "
+                f"{raw_dir}"
             )
-        )
-        _validate_receipt(receipts[-1])
-        time.sleep(args.request_interval)
-
-    current_start = date(args.end_date.year, 1, 1)
-    for range_start, range_end in _month_ranges(current_start, args.end_date):
-        target = raw_dir / "ranges" / (
-            f"{range_start.isoformat()}_{range_end.isoformat()}_all.csv"
-        )
-        receipts.append(
-            _download(
-                {
-                    "down_type": "1",
-                    "queryStartDate": range_start.strftime("%Y/%m/%d"),
-                    "queryEndDate": range_end.strftime("%Y/%m/%d"),
-                    "commodity_id": "all",
-                    "commodity_id2": "",
-                },
-                target,
-                attempts=args.attempts,
-                request_interval=args.request_interval,
+        for receipt in receipts:
+            _validate_receipt(receipt)
+    else:
+        for year in range(args.start_year, args.end_date.year):
+            target = raw_dir / "annual" / f"{year}_fut.zip"
+            receipts.append(
+                _download(
+                    {"down_type": "2", "his_year": str(year)},
+                    target,
+                    attempts=args.attempts,
+                    request_interval=args.request_interval,
+                )
             )
-        )
-        _validate_receipt(receipts[-1])
-        time.sleep(args.request_interval)
+            _validate_receipt(receipts[-1])
+            time.sleep(args.request_interval)
 
-    normalized = output_dir / "day_session_front_month.parquet"
+        current_start = date(args.end_date.year, 1, 1)
+        for range_start, range_end in _month_ranges(current_start, args.end_date):
+            target = raw_dir / "ranges" / (
+                f"{range_start.isoformat()}_{range_end.isoformat()}_all.csv"
+            )
+            receipts.append(
+                _download(
+                    {
+                        "down_type": "1",
+                        "queryStartDate": range_start.strftime("%Y/%m/%d"),
+                        "queryEndDate": range_end.strftime("%Y/%m/%d"),
+                        "commodity_id": "all",
+                        "commodity_id2": "",
+                    },
+                    target,
+                    attempts=args.attempts,
+                    request_interval=args.request_interval,
+                )
+            )
+            _validate_receipt(receipts[-1])
+            time.sleep(args.request_interval)
+
+    normalized = output_dir / "day_session_contracts.parquet"
     build_taifex_index_futures_day_session(
         receipts,
         normalized,
         products=TAIFEX_INDEX_FUTURES_PRODUCTS,
     )
     manifest = {
-        "dataset": "tw_index_futures_day_session_front_month",
+        "dataset": "tw_index_futures_day_session_contracts",
+        "contract_version": TAIFEX_FUTURES_DATA_CONTRACT_VERSION,
         "products": list(TAIFEX_INDEX_FUTURES_PRODUCTS),
         "session": "一般",
+        "front_month_policy": "nearest_unexpired_monthly",
+        "rolling_benchmark": "1x_long_front_month_gross",
+        "roll_timing": "preceding_session_close",
+        "roll_gap_treatment": "same_contract_close_to_close",
         "start_year": int(args.start_year),
         "end_date": args.end_date.isoformat(),
         "normalized_path": str(normalized),

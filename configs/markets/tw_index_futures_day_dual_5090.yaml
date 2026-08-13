@@ -1,0 +1,22 @@
+# Throughput-tuned dual-RTX-5090 variant of the canonical TX/MTX/TMF day
+# strategy.  It changes hardware execution capacity only; the causal feature
+# clock, model, loss, fees, integer audit, walk-forward folds, and reporting
+# contract are inherited unchanged.
+base_config: tw_index_futures_day.yaml
+
+experiment_name: tw-stock-cross-section-index-futures-day-dual-5090-100m-rolling-v2-exact-v4
+
+runner:
+  # Batch shape differs from the canonical experiment, so keep checkpoints in
+  # a fresh root rather than resuming a different optimizer trajectory.
+  output_dir: artifacts/markets/tw_index_futures_day_dual_5090_100m_rolling_v2_exact_v4
+  isolate_train_folds: true
+
+training:
+  multi_gpu_strategy: distributed_data_parallel
+  # Measured on 2x RTX 5090, S=2744, F=98, lookback=32, fold 12:
+  # global 128: 5276 rows/s; 256: 5209; 512: 6064; 640: 5706.
+  # Global 768 passed compile probing but OOMed in the real train hotpath at
+  # 31.33/31.36 GiB on rank 1.  Keep 512 as the fastest completed shape with
+  # material VRAM headroom (local batch 256 per rank).
+  batch_size_train: 512

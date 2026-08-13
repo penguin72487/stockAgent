@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import subprocess
 from types import SimpleNamespace
 
@@ -109,3 +110,40 @@ def test_ddp_relaunch_is_deferred_to_isolated_fold_child() -> None:
     # single process; the authoritative child command disables isolation and
     # therefore performs the normal torchrun relaunch itself.
     train._maybe_relaunch_for_ddp(config, args)
+
+
+def test_single_selected_fold_still_uses_fresh_process_boundary(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv(train._FOLD_ISOLATION_CHILD_ENV, raising=False)
+
+    assert train._should_isolate_selected_folds(
+        mode="train",
+        isolate_train_folds=True,
+        folds=[_Fold(12)],
+    )
+
+    monkeypatch.setenv(train._FOLD_ISOLATION_CHILD_ENV, "1")
+    assert not train._should_isolate_selected_folds(
+        mode="train",
+        isolate_train_folds=True,
+        folds=[_Fold(12)],
+    )
+
+
+def test_isolated_parent_rebuilds_complete_walkforward_with_panel_and_config() -> None:
+    tree = ast.parse(train.Path(train.__file__).read_text(encoding="utf-8"))
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_refresh_walkforward_artifacts"
+    ]
+
+    assert len(calls) == 1
+    call = calls[0]
+    assert isinstance(call.args[0], ast.Call)
+    assert isinstance(call.args[1], ast.Name) and call.args[1].id == "results"
+    keyword_names = {keyword.arg for keyword in call.keywords}
+    assert keyword_names == {"panel", "config"}
