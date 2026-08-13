@@ -24,8 +24,13 @@ from stockagent.data.tw_index_futures import (
 )
 
 
-TW_INDEX_FUTURES_DAY_BACKTEST_CONTRACT_VERSION: Final[int] = 1
-TW_INDEX_FUTURES_TAX_RATE: Final[float] = 0.00002
+# v4 charges the configured transaction tax on the sale leg only.  A long
+# round trip sells at the close; a short round trip sells at the open.  v3 and
+# earlier incorrectly charged both the buy and sell legs.
+TW_INDEX_FUTURES_DAY_BACKTEST_CONTRACT_VERSION: Final[int] = 4
+TW_INDEX_FUTURES_SELL_TAX_RATE: Final[float] = 0.0002
+# Compatibility export.  The value is a sell-side rate, not a two-sided rate.
+TW_INDEX_FUTURES_TAX_RATE: Final[float] = TW_INDEX_FUTURES_SELL_TAX_RATE
 # Current TAIFEX exchange + clearing charges per contract per side.  A broker's
 # negotiated commission is separate and defaults to zero below.
 TAIFEX_FIXED_FEES_PER_SIDE_TWD: Final[dict[str, float]] = {
@@ -37,7 +42,9 @@ TAIFEX_FIXED_FEES_PER_SIDE_TWD: Final[dict[str, float]] = {
 
 @dataclass(frozen=True, slots=True)
 class FuturesCostSchedule:
-    tax_rate: float = TW_INDEX_FUTURES_TAX_RATE
+    # Tax applies only when a contract is sold.  Fixed fees and slippage remain
+    # per side and are therefore incurred twice for a daily-flat round trip.
+    tax_rate: float = TW_INDEX_FUTURES_SELL_TAX_RATE
     exchange_and_clearing_fee_per_side_twd: tuple[float, ...] = (20.0, 12.5, 8.0)
     broker_fee_per_side_twd: tuple[float, ...] = (0.0, 0.0, 0.0)
     slippage_points_per_side: tuple[float, ...] = (0.0, 0.0, 0.0)
@@ -309,7 +316,11 @@ def select_tw_index_futures_contract_basket(
             tracking_error=target,
             estimated_round_trip_cost=0.0,
         )
-    safe_notionals = np.where(valid, notionals, np.inf)
+    # Invalid products are already excluded by ``valid`` in the enumerator.
+    # Give them a finite zero placeholder rather than infinity: the unavailable
+    # branch has an exact count of zero, and ``0 * inf`` would otherwise emit a
+    # warning/NaN before that candidate is rejected.
+    safe_notionals = np.where(valid, notionals, 0.0)
     fixed = schedule.fixed_fee_per_side_twd
     slippage = np.asarray(
         schedule.slippage_points_per_side,
@@ -328,12 +339,14 @@ def select_tw_index_futures_contract_basket(
         if actual > maximum + 1e-9:
             continue
         fixed_round_trip = float(np.dot(counts, fixed * 2.0))
+        # Direction and closing prices are not known while choosing the basket
+        # at the open.  Use one opening sale-notional tax as the symmetric
+        # sizing estimate; the ledger below recomputes the exact long/short
+        # sale price.
         tax_round_trip = float(
             np.dot(
                 counts,
-                np.where(valid, notionals, 0.0)
-                * float(schedule.tax_rate)
-                * 2.0,
+                np.where(valid, notionals, 0.0) * float(schedule.tax_rate),
             )
         )
         slippage_round_trip = float(np.dot(counts, slippage * multipliers * 2.0))
@@ -448,24 +461,61 @@ def run_tw_index_futures_day_integer(
 
         opens = market.open_prices[row]
         closes = market.close_prices[row]
+        # A product with zero selected contracts has no cash flow. Restrict
+        # every price-dependent calculation to active legs so unavailable
+        # products cannot leak NaN through IEEE ``0 * NaN`` arithmetic. An
+        # active leg with a broken price is instead a hard data-contract error;
+        # silently converting it to zero PnL would fabricate an executable
+        # round trip.
+        active = signed_counts != 0
+        active_prices_valid = (
+            np.isfinite(opens[active])
+            & np.isfinite(closes[active])
+            & (opens[active] > 0.0)
+            & (closes[active] > 0.0)
+        )
+        if not bool(active_prices_valid.all()):
+            invalid_products = [
+                market.products[index]
+                for index in np.flatnonzero(active)
+                if not (
+                    math.isfinite(float(opens[index]))
+                    and math.isfinite(float(closes[index]))
+                    and float(opens[index]) > 0.0
+                    and float(closes[index]) > 0.0
+                )
+            ]
+            raise ValueError(
+                "selected futures contracts require finite positive open/close "
+                f"prices on {market.dates[row]}: {', '.join(invalid_products)}"
+            )
+        active_counts = signed_counts[active].astype(np.float64)
+        active_absolute_counts = np.abs(active_counts)
+        active_multipliers = multipliers[active]
+        active_opens = opens[active]
+        active_closes = closes[active]
         gross = float(
             np.dot(
-                signed_counts.astype(np.float64) * multipliers,
-                closes - opens,
+                active_counts * active_multipliers,
+                active_closes - active_opens,
             )
         )
-        absolute_counts = np.abs(signed_counts).astype(np.float64)
-        fees = float(np.dot(absolute_counts, fixed_per_side * 2.0))
+        fees = float(
+            np.dot(active_absolute_counts, fixed_per_side[active] * 2.0)
+        )
+        # Long: buy open, sell close. Short: sell open, buy close. Transaction
+        # tax is charged exactly once, on the actual sale leg.
+        sale_prices = np.where(active_counts > 0.0, active_closes, active_opens)
         tax = float(
             np.dot(
-                absolute_counts * multipliers,
-                (opens + closes) * float(schedule.tax_rate),
+                active_absolute_counts * active_multipliers,
+                sale_prices * float(schedule.tax_rate),
             )
         )
         slip = float(
             np.dot(
-                absolute_counts,
-                slip_points * multipliers * 2.0,
+                active_absolute_counts,
+                slip_points[active] * active_multipliers * 2.0,
             )
         )
         net = gross - fees - tax - slip
@@ -512,6 +562,7 @@ __all__ = [
     "FuturesIntegerBacktest",
     "TAIFEX_FIXED_FEES_PER_SIDE_TWD",
     "TW_INDEX_FUTURES_DAY_BACKTEST_CONTRACT_VERSION",
+    "TW_INDEX_FUTURES_SELL_TAX_RATE",
     "TW_INDEX_FUTURES_TAX_RATE",
     "run_tw_index_futures_day_continuous",
     "run_tw_index_futures_day_integer",

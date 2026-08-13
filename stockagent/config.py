@@ -17,6 +17,7 @@ from stockagent.backtest.tw_execution import (
     normalize_execution_mode,
 )
 from stockagent.backtest.tw_index_futures import FuturesCostSchedule
+from stockagent.backtest.tw_index_derivatives_day import OptionDayCostSchedule
 from stockagent.data.tw_index_futures import (
     normalize_taifex_index_futures_product,
 )
@@ -89,6 +90,13 @@ _TW_INDEX_FUTURES_MODEL_NAMES = frozenset(
         "cross_sectional_index_futures",
         "cross_sectional_index_futures_model",
         "tw_index_futures",
+    }
+)
+_TW_INDEX_DERIVATIVES_DAY_MODEL_NAMES = frozenset(
+    {
+        "cross_sectional_index_derivatives_day",
+        "cross_sectional_index_derivatives_day_model",
+        "tw_index_derivatives_day",
     }
 )
 _TW_OPTION_TICK_EXECUTION_MODES = frozenset(
@@ -363,6 +371,59 @@ def _validate_tw_index_futures_mode_contract(
         raise ValueError(
             "tw_index_futures_day has one scalar TAIEX target and requires "
             "stock-level auxiliary loss weights to be zero: " + ", ".join(enabled)
+        )
+
+
+def _validate_tw_index_derivatives_day_mode_contract(
+    *,
+    execution_mode: str,
+    model_name: object,
+    loss_type: object,
+    long_only: object,
+    train_symbol_compaction: object,
+    return_rank_ic_weight: object,
+    direction_weight: object,
+    volatility_regime_weight: object,
+    concentration_weight: object,
+    explain_after_each_fold: object,
+) -> None:
+    if execution_mode != "tw_index_derivatives_day":
+        return
+    if _normalized_contract_name(model_name) not in _TW_INDEX_DERIVATIVES_DAY_MODEL_NAMES:
+        raise ValueError(
+            "tw_index_derivatives_day requires "
+            "training.model_name='cross_sectional_index_derivatives_day'"
+        )
+    if _normalized_contract_name(loss_type) not in _TW_PHASE_RETURN_OBJECTIVES:
+        raise ValueError(
+            "tw_index_derivatives_day supports only canonical log-utility objectives"
+        )
+    if bool(long_only):
+        raise ValueError(
+            "tw_index_derivatives_day requires trading.long_only=false: futures "
+            "are signed while all option sleeves remain structurally long-only"
+        )
+    if _normalized_contract_name(train_symbol_compaction) != "none":
+        raise ValueError(
+            "tw_index_derivatives_day requires train_symbol_compaction='none' "
+            "so the all-stock signal encoder retains its fixed universe"
+        )
+    unsupported = {
+        "return_rank_ic_weight": float(return_rank_ic_weight),
+        "direction_weight": float(direction_weight),
+        "volatility_regime_weight": float(volatility_regime_weight),
+        "concentration_weight": float(concentration_weight),
+    }
+    enabled = [name for name, value in unsupported.items() if value != 0.0]
+    if enabled:
+        raise ValueError(
+            "tw_index_derivatives_day has no unbiased stock-level target; set "
+            "auxiliary stock losses to zero: " + ", ".join(enabled)
+        )
+    if bool(explain_after_each_fold):
+        raise ValueError(
+            "tw_index_derivatives_day does not yet publish full-chain-labelled "
+            "per-fold explainability; set explain_after_each_fold=false"
         )
 
 
@@ -868,10 +929,10 @@ class TradingConfig:
     # Daily TX/MTX/TMF execution. The three products are integer-sizing
     # instruments for one signed TAIEX exposure, not independent alpha heads.
     tw_index_futures_data_path: str = (
-        "data_tw_index_futures/day_session_front_month.parquet"
+        "data_tw_index_futures/day_session_contracts.parquet"
     )
     tw_index_futures_reference_product: str = "TX"
-    tw_index_futures_initial_capital: float = 1_000_000.0
+    tw_index_futures_initial_capital: float = 100_000_000.0
     tw_index_futures_max_abs_exposure: float = 1.0
     tw_index_futures_exchange_and_clearing_fee_per_side_twd: list[float] = field(
         default_factory=lambda: [20.0, 12.5, 8.0]
@@ -879,10 +940,29 @@ class TradingConfig:
     tw_index_futures_total_fee_per_side_twd: list[float] = field(
         default_factory=lambda: [60.0, 24.0, 16.0]
     )
+    tw_index_futures_sell_transaction_tax_rate: float = 0.0002
     tw_index_futures_slippage_points_per_side: list[float] = field(
         default_factory=lambda: [0.0, 0.0, 0.0]
     )
     tw_index_futures_basket_fee_penalty: float = 1.0
+    tw_index_options_monthly_data_path: str = (
+        "data_tw_index_options_daily/monthly_full_chain.parquet"
+    )
+    tw_index_options_weekly_data_path: str = (
+        "data_tw_index_options_daily/weekly_full_chain.parquet"
+    )
+    tw_index_derivatives_day_maximum_capital_fraction: float = 0.98
+    # The L1 projection chooses direction and relative derivative weights.  An
+    # optional learned scalar gate may then leave capital in cash instead of
+    # forcing every non-zero score vector to the projection boundary.  The
+    # option cap is a separate absolute NAV risk budget; unused option budget
+    # is cash and is never reallocated to futures.
+    tw_index_derivatives_day_use_exposure_gate: bool = False
+    tw_index_derivatives_day_exposure_gate_init_logit: float = -2.0
+    tw_index_derivatives_day_option_maximum_capital_fraction: float = 0.98
+    tw_index_derivatives_day_option_fixed_fee_per_contract_per_side_twd: float = 22.0
+    tw_index_derivatives_day_option_transaction_tax_rate: float = 0.0002
+    tw_index_derivatives_day_option_slippage_points_per_side: float = 0.5
     # Completed-second TX/TXO strategies. The futures mode charges costs on a
     # signed TX exposure; both direct-option policies share the fields below.
     tw_index_derivatives_tick_fee_rate_per_side: float = 0.000045
@@ -2528,6 +2608,18 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         volatility_regime_weight=training["multitask_loss"]["volatility_regime_weight"],
         concentration_weight=training["multitask_loss"]["concentration_weight"],
     )
+    _validate_tw_index_derivatives_day_mode_contract(
+        execution_mode=trading["execution_mode"],
+        model_name=training["model_name"],
+        loss_type=training["loss_type"],
+        long_only=trading["long_only"],
+        train_symbol_compaction=training["train_symbol_compaction"],
+        return_rank_ic_weight=training["multitask_loss"]["return_rank_ic_weight"],
+        direction_weight=training["multitask_loss"]["direction_weight"],
+        volatility_regime_weight=training["multitask_loss"]["volatility_regime_weight"],
+        concentration_weight=training["multitask_loss"]["concentration_weight"],
+        explain_after_each_fold=training["explain_after_each_fold"],
+    )
     _validate_tw_index_derivatives_tick_mode_contract(
         execution_mode=trading["execution_mode"],
         frequency=trading["frequency"],
@@ -2675,6 +2767,14 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     )
     futures_total_fees = futures_triple("tw_index_futures_total_fee_per_side_twd")
     futures_slippage = futures_triple("tw_index_futures_slippage_points_per_side")
+    futures_sell_tax_rate = float(
+        trading["tw_index_futures_sell_transaction_tax_rate"]
+    )
+    if not math.isfinite(futures_sell_tax_rate) or futures_sell_tax_rate < 0.0:
+        raise ValueError(
+            "tw_index_futures_sell_transaction_tax_rate must be finite and non-negative"
+        )
+    trading["tw_index_futures_sell_transaction_tax_rate"] = futures_sell_tax_rate
     if any(
         total + 1e-12 < exchange
         for total, exchange in zip(
@@ -2692,6 +2792,7 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         )
     )
     _ = FuturesCostSchedule(
+        tax_rate=futures_sell_tax_rate,
         exchange_and_clearing_fee_per_side_twd=futures_exchange_fees,
         broker_fee_per_side_twd=futures_broker_fees,
         slippage_points_per_side=futures_slippage,
@@ -2700,6 +2801,55 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     trading["tw_index_futures_initial_capital"] = futures_initial_capital
     trading["tw_index_futures_max_abs_exposure"] = futures_max_abs_exposure
     trading["tw_index_futures_basket_fee_penalty"] = futures_basket_fee_penalty
+    for key in (
+        "tw_index_options_monthly_data_path",
+        "tw_index_options_weekly_data_path",
+    ):
+        normalized = str(trading[key]).strip()
+        if not normalized:
+            raise ValueError(f"trading.{key} must not be empty")
+        trading[key] = normalized
+    derivatives_fraction = float(
+        trading["tw_index_derivatives_day_maximum_capital_fraction"]
+    )
+    if not math.isfinite(derivatives_fraction) or not 0.0 < derivatives_fraction <= 1.0:
+        raise ValueError(
+            "tw_index_derivatives_day_maximum_capital_fraction must be in (0, 1]"
+        )
+    trading["tw_index_derivatives_day_maximum_capital_fraction"] = derivatives_fraction
+    option_derivatives_fraction = float(
+        trading["tw_index_derivatives_day_option_maximum_capital_fraction"]
+    )
+    if (
+        not math.isfinite(option_derivatives_fraction)
+        or not 0.0 <= option_derivatives_fraction <= derivatives_fraction
+    ):
+        raise ValueError(
+            "tw_index_derivatives_day_option_maximum_capital_fraction must be "
+            "in [0, tw_index_derivatives_day_maximum_capital_fraction]"
+        )
+    exposure_gate_init = float(
+        trading["tw_index_derivatives_day_exposure_gate_init_logit"]
+    )
+    if not math.isfinite(exposure_gate_init):
+        raise ValueError(
+            "tw_index_derivatives_day_exposure_gate_init_logit must be finite"
+        )
+    trading["tw_index_derivatives_day_option_maximum_capital_fraction"] = (
+        option_derivatives_fraction
+    )
+    trading["tw_index_derivatives_day_exposure_gate_init_logit"] = exposure_gate_init
+    _ = OptionDayCostSchedule(
+        fixed_fee_per_contract_per_side_twd=trading[
+            "tw_index_derivatives_day_option_fixed_fee_per_contract_per_side_twd"
+        ],
+        transaction_tax_rate=trading[
+            "tw_index_derivatives_day_option_transaction_tax_rate"
+        ],
+        slippage_points_per_side=trading[
+            "tw_index_derivatives_day_option_slippage_points_per_side"
+        ],
+    )
     for key in (
         "index_derivatives_tick_raw_root",
         "index_derivatives_tick_dataset_root",

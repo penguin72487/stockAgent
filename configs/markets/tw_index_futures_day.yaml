@@ -8,12 +8,14 @@
 #   there is no night-session or overnight position.
 base_config: tw_public_lanten_market_candles.yaml
 
-experiment_name: tw-stock-cross-section-index-futures-day-last-only-v1
+experiment_name: tw-stock-cross-section-index-futures-day-100m-rolling-v2-exact-v4
 
 runner:
   # Preserve checkpoints produced by the retired standalone trainer. They do
   # not have the canonical train.py manifest and cannot safely resume.
-  output_dir: artifacts/markets/tw_index_futures_day_canonical
+  # Exact integer execution contract v4 taxes only the sale leg. Keep older
+  # checkpoints as inference-only evidence.
+  output_dir: artifacts/markets/tw_index_futures_day_canonical_100m_rolling_v2_exact_v4
   mode: train
   resume: true
   post_train_infer: true
@@ -37,15 +39,17 @@ trading:
   min_trade_weight: 0.0
   portfolio_activation: pre_normalized
 
-  # Differentiable round-trip proxy: 0.45 bps per side, 0.90 bps per day total.
-  # Exact evaluation below recomputes integer contract counts, fixed fees,
-  # futures transaction tax, and optional slippage for every product/day.
+  # Differentiable proxy: 0.45 bps fixed-cost approximation per side, plus the
+  # configured 2 bps sale tax in the sell-side rate. Exact evaluation below
+  # recomputes integer counts and TWD costs for every product/day.
   buy_fee_rate: 0.000045
-  sell_fee_rate: 0.000045
+  sell_fee_rate: 0.000245
 
-  tw_index_futures_data_path: data_tw_index_futures/day_session_front_month.parquet
+  tw_index_futures_data_path: data_tw_index_futures/day_session_contracts.parquet
   tw_index_futures_reference_product: TX
-  tw_index_futures_initial_capital: 1000000.0
+  # The executable ledger is intentionally capitalized at TWD 100m so the
+  # smallest TMF contract is about 0.3%-0.5% rather than a 29%-49% position.
+  tw_index_futures_initial_capital: 100000000.0
   tw_index_futures_max_abs_exposure: 1.0
 
   # Per contract, per side, ordered TX / MTX / TMF. The online prices supplied
@@ -53,6 +57,8 @@ trading:
   # the official exchange + clearing component.
   tw_index_futures_exchange_and_clearing_fee_per_side_twd: [20.0, 12.5, 8.0]
   tw_index_futures_total_fee_per_side_twd: [60.0, 24.0, 16.0]
+  # Charged once on the sale leg: close for a long, open for a short.
+  tw_index_futures_sell_transaction_tax_rate: 0.0002
   tw_index_futures_slippage_points_per_side: [0.0, 0.0, 0.0]
   tw_index_futures_basket_fee_penalty: 1.0
 

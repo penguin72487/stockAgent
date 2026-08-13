@@ -128,6 +128,22 @@ def _model_accepts_return_aux(model: nn.Module) -> bool:
     return bool(accepts)
 
 
+def _model_accepts_portfolio_context(model: nn.Module) -> bool:
+    target = unwrap_model(model)
+    cached = getattr(target, "_stockagent_accepts_portfolio_context", None)
+    if cached is not None:
+        return bool(cached)
+    try:
+        accepts = "portfolio_context" in inspect.signature(target.forward).parameters
+    except (TypeError, ValueError):
+        accepts = False
+    try:
+        setattr(target, "_stockagent_accepts_portfolio_context", bool(accepts))
+    except Exception:
+        pass
+    return bool(accepts)
+
+
 def call_model(
     model: nn.Module,
     x: torch.Tensor,
@@ -135,21 +151,22 @@ def call_model(
     *,
     return_aux: bool | None = None,
     symbol_indices: torch.Tensor | None = None,
+    portfolio_context: dict[str, torch.Tensor] | None = None,
 ) -> Any:
     """Call a StockAgent model through the canonical mask/aux ABI."""
     model_mask = model_attention_mask(mask)
+    kwargs: dict[str, Any] = {}
     if symbol_indices is not None:
-        if return_aux is None or not _model_accepts_return_aux(model):
-            return model(x, model_mask, symbol_indices=symbol_indices)
-        return model(
-            x,
-            model_mask,
-            return_aux=return_aux,
-            symbol_indices=symbol_indices,
-        )
-    if return_aux is None or not _model_accepts_return_aux(model):
-        return model(x, model_mask)
-    return model(x, model_mask, return_aux=return_aux)
+        kwargs["symbol_indices"] = symbol_indices
+    if return_aux is not None and _model_accepts_return_aux(model):
+        kwargs["return_aux"] = return_aux
+    if portfolio_context is not None:
+        if not _model_accepts_portfolio_context(model):
+            raise ValueError(
+                "model does not accept required derivative portfolio_context"
+            )
+        kwargs["portfolio_context"] = portfolio_context
+    return model(x, model_mask, **kwargs)
 
 
 def load_checkpoint(checkpoint_path: Path) -> dict[str, Any]:

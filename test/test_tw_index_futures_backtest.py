@@ -24,6 +24,7 @@ def _market() -> TaiwanIndexFuturesDaySession:
     closes = np.asarray(
         [[10100.0, 10100.0, 10100.0], [9900.0, 9900.0, 9900.0]]
     )
+    rolling = np.log(closes / opens)
     return TaiwanIndexFuturesDaySession(
         dates=np.asarray(["2025-01-02", "2025-01-03"], dtype="datetime64[D]"),
         products=("TX", "MTX", "TMF"),
@@ -33,9 +34,12 @@ def _market() -> TaiwanIndexFuturesDaySession:
         low_prices=np.minimum(opens, closes),
         close_prices=closes,
         volumes=np.full((2, 3), 1000, dtype=np.int64),
-        log_returns=np.log(closes / opens),
+        log_returns=rolling,
         tradable_mask=np.ones((2, 3), dtype=bool),
         multipliers=np.asarray([200, 50, 10], dtype=np.int64),
+        rolling_buy_hold_log_returns=rolling,
+        rolling_buy_hold_tradable_mask=np.ones((2, 3), dtype=bool),
+        front_month_roll_mask=np.zeros((2, 3), dtype=bool),
     )
 
 
@@ -66,11 +70,11 @@ def test_basket_uses_same_underlying_products_for_integer_sizing() -> None:
     assert basket.actual_notional == pytest.approx(1_000_000.0)
 
 
-def test_integer_backtest_applies_direction_tax_and_both_side_fees() -> None:
+def test_integer_backtest_applies_sell_only_tax_and_both_side_fees() -> None:
     schedule = FuturesCostSchedule(
-        tax_rate=0.00002,
+        tax_rate=0.0002,
         exchange_and_clearing_fee_per_side_twd=(20.0, 12.5, 8.0),
-        broker_fee_per_side_twd=(0.0, 0.0, 0.0),
+        broker_fee_per_side_twd=(40.0, 11.5, 8.0),
         slippage_points_per_side=(0.0, 0.0, 0.0),
     )
     result = run_tw_index_futures_day_integer(
@@ -82,13 +86,86 @@ def test_integer_backtest_applies_direction_tax_and_both_side_fees() -> None:
 
     np.testing.assert_array_equal(result.contract_quantities[0], [0, 2, 0])
     assert result.gross_pnl_twd[0] == pytest.approx(10_000.0)
-    assert result.fees_twd[0] == pytest.approx(50.0)
-    assert result.tax_twd[0] == pytest.approx(40.2)
-    assert result.net_pnl_twd[0] == pytest.approx(9_909.8)
+    # Two MTX, TWD 24 per contract per side, two sides.
+    assert result.fees_twd[0] == pytest.approx(96.0)
+    # Long opens with a buy and closes with a sale: only close is taxed.
+    assert result.tax_twd[0] == pytest.approx(2 * 50 * 10_100 * 0.0002)
+    assert result.net_pnl_twd[0] == pytest.approx(10_000.0 - 96.0 - 202.0)
     # Day two is short and therefore also profits when the index falls.
     assert result.gross_pnl_twd[1] > 0.0
+    # Short opens with a sale and closes with a buy: only open is taxed.
+    assert result.tax_twd[1] == pytest.approx(2 * 50 * 10_000 * 0.0002)
     assert result.equity[-1] > 1_000_000.0
     assert result.alive.all()
+
+
+def test_basket_estimate_charges_one_sale_tax_and_two_fixed_fees() -> None:
+    schedule = FuturesCostSchedule(
+        tax_rate=0.0002,
+        exchange_and_clearing_fee_per_side_twd=(20.0, 12.5, 8.0),
+        broker_fee_per_side_twd=(40.0, 11.5, 8.0),
+    )
+    basket = select_tw_index_futures_contract_basket(
+        1_000_000.0,
+        np.asarray([10_000.0, 10_000.0, 10_000.0]),
+        np.ones(3, dtype=bool),
+        cost_schedule=schedule,
+        max_notional=1_000_000.0,
+    )
+    np.testing.assert_array_equal(basket.quantities, [0, 2, 0])
+    # 2 contracts * 2 sides * TWD 24 + one TWD 1m sale * 0.0002.
+    assert basket.estimated_round_trip_cost == pytest.approx(96.0 + 200.0)
+
+
+def test_one_hundred_million_capital_executes_small_model_exposure() -> None:
+    result = run_tw_index_futures_day_integer(
+        np.asarray([0.03, 0.03]),
+        _market(),
+        initial_capital=100_000_000.0,
+        cost_schedule=FuturesCostSchedule(tax_rate=0.0),
+    )
+
+    assert np.all(np.abs(result.contract_quantities).sum(axis=1) > 0)
+    assert np.all(result.executed_exposure > 0.0)
+    assert np.any(result.strategy_returns != 0.0)
+
+
+def test_missing_unused_product_does_not_ruin_integer_account() -> None:
+    market = _market()
+    market.open_prices[:, 2] = np.nan
+    market.high_prices[:, 2] = np.nan
+    market.low_prices[:, 2] = np.nan
+    market.close_prices[:, 2] = np.nan
+    market.log_returns[:, 2] = np.nan
+    market.tradable_mask[:, 2] = False
+
+    result = run_tw_index_futures_day_integer(
+        np.asarray([1.0, -1.0]),
+        market,
+        initial_capital=1_000_000.0,
+        cost_schedule=FuturesCostSchedule(tax_rate=0.0),
+    )
+
+    np.testing.assert_array_equal(result.contract_quantities[:, 2], 0)
+    assert np.isfinite(result.strategy_returns).all()
+    assert np.any(result.strategy_returns != 0.0)
+    assert result.alive.all()
+
+
+def test_nonfinite_price_on_selected_product_fails_closed() -> None:
+    market = _market()
+    market.close_prices[0, 1] = np.nan
+
+    with pytest.raises(
+        ValueError,
+        match="selected futures contracts require finite positive open/close prices",
+    ):
+        run_tw_index_futures_day_integer(
+            np.asarray([1.0, -1.0]),
+            market,
+            initial_capital=1_000_000.0,
+            cost_schedule=FuturesCostSchedule(tax_rate=0.0),
+        )
 
 
 def test_canonical_tensor_adapter_collapses_only_to_one_futures_exposure() -> None:

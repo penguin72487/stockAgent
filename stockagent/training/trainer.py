@@ -74,6 +74,7 @@ from stockagent.backtest.tw_execution import (
 from stockagent.backtest.tw_index_futures import (
     FuturesCostSchedule,
 )
+from stockagent.backtest.tw_index_derivatives_day import OptionDayCostSchedule
 from stockagent.backtest.tw_continuous import get_tw_continuous_compile_stats
 from stockagent.backtest.tw_dual_session_compiled import (
     COMPILED_BLOCK_ROWS as TW_DUAL_SESSION_COMPILED_BLOCK_ROWS,
@@ -84,7 +85,17 @@ from stockagent.backtest.tw_integer_execution import (
 )
 from stockagent.config import ExperimentConfig
 from stockagent.data.panel import PanelData
-from stockagent.data.tw_index_futures import TaiwanIndexFuturesDaySession
+from stockagent.data.tw_index_futures import (
+    TaiwanIndexFuturesDaySession,
+    load_taifex_index_futures_day_session,
+)
+from stockagent.data.tw_index_derivatives_day import (
+    TAIFEX_INDEX_DERIVATIVE_ACTION_COUNT_V4,
+    TaiwanIndexDerivativeDayCandidates,
+)
+from stockagent.data.tw_index_options_daily import (
+    TaiwanIndexOptionChainDaySession,
+)
 from stockagent.data.walkforward import WalkForwardFold, normalize_lookback_context
 from stockagent.evaluation.metrics import compute_ic_series_torch, ic_summary
 from stockagent.models.factory import (
@@ -609,8 +620,12 @@ class _ExecutionRuntime:
     claim_queue_sessions: int = 2
     futures_market: TaiwanIndexFuturesDaySession | None = None
     futures_cost_schedule: FuturesCostSchedule | None = None
-    futures_initial_capital: float = 1_000_000.0
+    futures_initial_capital: float = 100_000_000.0
     futures_max_abs_exposure: float = 1.0
+    options_chain_market: TaiwanIndexOptionChainDaySession | None = None
+    derivatives_day_candidates: TaiwanIndexDerivativeDayCandidates | None = None
+    option_day_cost_schedule: OptionDayCostSchedule | None = None
+    derivatives_maximum_capital_fraction: float = 0.98
 
 
 def _build_execution_runtime(
@@ -634,11 +649,11 @@ def _build_execution_runtime(
             lot_sizes=None,
             settlement_lag_sessions=lag,
         )
-    if mode == "tw_index_futures_day":
+    if mode in {"tw_index_futures_day", "tw_index_derivatives_day"}:
         market = getattr(panel, "index_futures_day_session", None)
         if market is None:
             raise ValueError(
-                "tw_index_futures_day requires aligned TAIFEX data attached by train.py"
+                f"{mode} requires aligned TAIFEX data attached by train.py"
             )
         exchange_fees = tuple(
             float(value)
@@ -653,6 +668,9 @@ def _build_execution_runtime(
             for total, exchange in zip(total_fees, exchange_fees, strict=True)
         )
         schedule = FuturesCostSchedule(
+            tax_rate=float(
+                config.trading.tw_index_futures_sell_transaction_tax_rate
+            ),
             exchange_and_clearing_fee_per_side_twd=exchange_fees,
             broker_fee_per_side_twd=broker_fees,
             slippage_points_per_side=tuple(
@@ -662,6 +680,29 @@ def _build_execution_runtime(
             basket_fee_penalty=float(
                 config.trading.tw_index_futures_basket_fee_penalty
             ),
+        )
+        option_chain = getattr(panel, "index_options_chain_day_session", None)
+        derivative_candidates = getattr(panel, "index_derivatives_day_candidates", None)
+        if mode == "tw_index_derivatives_day" and (
+            option_chain is None or derivative_candidates is None
+        ):
+            raise ValueError(
+                "tw_index_derivatives_day requires the TXO chain and causal candidates"
+            )
+        option_schedule = (
+            OptionDayCostSchedule(
+                fixed_fee_per_contract_per_side_twd=float(
+                    config.trading.tw_index_derivatives_day_option_fixed_fee_per_contract_per_side_twd
+                ),
+                transaction_tax_rate=float(
+                    config.trading.tw_index_derivatives_day_option_transaction_tax_rate
+                ),
+                slippage_points_per_side=float(
+                    config.trading.tw_index_derivatives_day_option_slippage_points_per_side
+                ),
+            )
+            if mode == "tw_index_derivatives_day"
+            else None
         )
         return _ExecutionRuntime(
             mode=mode,
@@ -676,6 +717,12 @@ def _build_execution_runtime(
             ),
             futures_max_abs_exposure=float(
                 config.trading.tw_index_futures_max_abs_exposure
+            ),
+            options_chain_market=option_chain,
+            derivatives_day_candidates=derivative_candidates,
+            option_day_cost_schedule=option_schedule,
+            derivatives_maximum_capital_fraction=float(
+                config.trading.tw_index_derivatives_day_maximum_capital_fraction
             ),
         )
     if mode in TW_CARRYING_EXECUTION_MODES and not bool(config.trading.long_only):
@@ -858,7 +905,7 @@ def _integer_execution_runtime_kwargs(
     kwargs: dict[str, Any] = {"execution_mode": runtime.mode}
     if runtime.mode == "naive":
         return kwargs
-    if runtime.mode == "tw_index_futures_day":
+    if runtime.mode in {"tw_index_futures_day", "tw_index_derivatives_day"}:
         if runtime.futures_market is None or runtime.futures_cost_schedule is None:
             raise RuntimeError("futures integer audit runtime is incomplete")
         kwargs.update(
@@ -866,6 +913,21 @@ def _integer_execution_runtime_kwargs(
             futures_cost_schedule=runtime.futures_cost_schedule,
             futures_max_abs_exposure=runtime.futures_max_abs_exposure,
         )
+        if runtime.mode == "tw_index_derivatives_day":
+            if (
+                runtime.options_chain_market is None
+                or runtime.derivatives_day_candidates is None
+                or runtime.option_day_cost_schedule is None
+            ):
+                raise RuntimeError("derivatives integer audit runtime is incomplete")
+            kwargs.update(
+                options_chain_market=runtime.options_chain_market,
+                derivatives_day_candidates=runtime.derivatives_day_candidates,
+                option_day_cost_schedule=runtime.option_day_cost_schedule,
+                derivatives_maximum_capital_fraction=(
+                    runtime.derivatives_maximum_capital_fraction
+                ),
+            )
         return kwargs
     if (
         runtime.buy_fee_rates is None
@@ -965,7 +1027,7 @@ def _integer_audit_initial_capital(
 
     if runtime.mode == "naive":
         return 1_000_000.0
-    if runtime.mode == "tw_index_futures_day":
+    if runtime.mode in {"tw_index_futures_day", "tw_index_derivatives_day"}:
         return float(runtime.futures_initial_capital)
     capital = float(config.trading.volume_participation_equity)
     if not math.isfinite(capital) or capital <= 0.0:
@@ -993,6 +1055,15 @@ def _integer_audit_requested_weights(
         )
     requested_array = np.asarray(requested)
     realised_shape = tuple(np.asarray(result.weights_history).shape)
+    if runtime.mode == "tw_index_derivatives_day":
+        if requested_array.ndim != 2 or int(requested_array.shape[0]) != int(
+            realised_shape[0]
+        ):
+            raise RuntimeError(
+                "tw_index_derivatives_day integer audit requires direct "
+                f"[T,D_derivatives] actions, got {requested_array.shape}"
+            )
+        return requested_array
     if (
         requested_array.ndim not in {2, 3}
         or int(requested_array.shape[0]) != int(realised_shape[0])
@@ -1002,7 +1073,13 @@ def _integer_audit_requested_weights(
             "requested and realised weight histories must share row and symbol "
             f"dimensions for integer audit: {requested_array.shape} vs {realised_shape}"
         )
-    expected_phases = 2 if runtime.mode == "tw_cash" else 3 if runtime.mode == "tw_overnight" else 1
+    expected_phases = (
+        2
+        if runtime.mode == "tw_cash"
+        else 3
+        if runtime.mode == "tw_overnight"
+        else 1
+    )
     if requested_array.ndim == 3 and int(requested_array.shape[1]) != expected_phases:
         raise RuntimeError(
             f"{runtime.mode} integer audit expected {expected_phases} action phases, "
@@ -2471,6 +2548,7 @@ def _evaluate_windowed_aux_objective_loss(
                         mask_chunk,
                         return_aux=model_return_aux,
                         symbol_indices=batch.get("symbol_indices"),
+                        portfolio_context=_derivative_portfolio_context(batch),
                     )
                 weights_chunk, aux_outputs = _extract_weights_and_aux(model_output)
                 _require_training_aux_outputs(
@@ -3972,6 +4050,8 @@ class _PanelSlabForwardWrapper(nn.Module):
         feature_slab: torch.Tensor,
         mask: torch.Tensor,
         symbol_indices: torch.Tensor | None = None,
+        derivative_candidate_features: torch.Tensor | None = None,
+        derivative_candidate_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # A fixed slab can contain sample-masked dates that were absent from
         # CrossSectionalDataset because every symbol was non-tradable.  The
@@ -3985,6 +4065,13 @@ class _PanelSlabForwardWrapper(nn.Module):
             if not self._accepts_symbol_indices:
                 raise ValueError("compact symbol batches require forward_from_panel_slab(..., symbol_indices=...)")
             kwargs["symbol_indices"] = symbol_indices
+        if derivative_candidate_features is not None or derivative_candidate_mask is not None:
+            if derivative_candidate_features is None or derivative_candidate_mask is None:
+                raise ValueError("derivative candidate context must be present as a pair")
+            kwargs["portfolio_context"] = {
+                "candidate_features": derivative_candidate_features,
+                "candidate_mask": derivative_candidate_mask,
+            }
         return self.model.forward_from_panel_slab(feature_slab, mask, **kwargs)
 
 
@@ -4049,6 +4136,8 @@ class _DynamicSymbolPanelSlabWrapper(nn.Module):
         feature_slab: torch.Tensor,
         mask: torch.Tensor,
         symbol_indices: torch.Tensor | None = None,
+        derivative_candidate_features: torch.Tensor | None = None,
+        derivative_candidate_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if feature_slab.dim() != 3:
             raise ValueError(
@@ -4114,6 +4203,8 @@ class _DynamicSymbolPanelSlabWrapper(nn.Module):
             feature_slab_for_compile,
             mask_for_compile,
             symbol_indices_for_compile,
+            derivative_candidate_features,
+            derivative_candidate_mask,
         )
 
 
@@ -4188,6 +4279,18 @@ def _move_windowed_batch_to_device(
     return moved
 
 
+def _derivative_portfolio_context(
+    batch: Mapping[str, torch.Tensor],
+) -> dict[str, torch.Tensor] | None:
+    features = batch.get("derivative_candidate_features")
+    mask = batch.get("derivative_candidate_mask")
+    if features is None and mask is None:
+        return None
+    if features is None or mask is None:
+        raise ValueError("derivative candidate features and mask must be paired")
+    return {"candidate_features": features, "candidate_mask": mask}
+
+
 def _call_panel_forward_for_batch(
     *,
     panel_forward_model: nn.Module,
@@ -4211,13 +4314,28 @@ def _call_panel_forward_for_batch(
             rows=rows,
         )
         if feature_slab is not None:
-            return panel_slab_model(feature_slab, model_mask, batch.get("symbol_indices"))
+            return panel_slab_model(
+                feature_slab,
+                model_mask,
+                batch.get("symbol_indices"),
+                batch.get("derivative_candidate_features"),
+                batch.get("derivative_candidate_mask"),
+            )
     kwargs: dict[str, Any] = {"return_aux": return_aux}
     symbol_indices = batch.get("symbol_indices")
     if symbol_indices is not None:
         if not _callable_accepts_parameter(panel_forward_model.forward_from_panel, "symbol_indices"):
             raise ValueError("compact symbol batches require forward_from_panel(..., symbol_indices=...)")
         kwargs["symbol_indices"] = symbol_indices
+    portfolio_context = _derivative_portfolio_context(batch)
+    if portfolio_context is not None:
+        if not _callable_accepts_parameter(
+            panel_forward_model.forward_from_panel, "portfolio_context"
+        ):
+            raise ValueError(
+                "derivative model requires forward_from_panel(..., portfolio_context=...)"
+            )
+        kwargs["portfolio_context"] = portfolio_context
     model_date_indices = batch["date_indices"] - execution_feature_lag(
         split.execution_mode
     )
@@ -5086,7 +5204,16 @@ def _save_backtest_artifact(
     requested_weights_history = result.requested_weights_history
     if requested_weights_history is not None:
         requested_array = np.asarray(requested_weights_history)
-        if (
+        if mode == "tw_index_derivatives_day":
+            if requested_array.shape != (
+                rows,
+                TAIFEX_INDEX_DERIVATIVE_ACTION_COUNT_V4,
+            ):
+                raise ValueError(
+                    "tw_index_derivatives_day requested_weights_history must "
+                    "have direct shape [rows,D_derivatives]"
+                )
+        elif (
             requested_array.ndim not in {2, 3}
             or int(requested_array.shape[0]) != rows
             or int(requested_array.shape[-1]) != symbol_count
@@ -5597,6 +5724,7 @@ def _save_backtest_artifact(
     has_phase_requests = (
         requested_weights_history is not None
         and np.asarray(requested_weights_history).ndim == 3
+        and mode != "tw_index_derivatives_day"
     )
     has_phase_audit = phase_audit_count == len(phase_audit_fields)
     if has_phase_requests and not has_phase_audit:
@@ -6151,6 +6279,82 @@ def _save_deployment_test_artifacts(
     return timing
 
 
+def _save_tw_index_futures_benchmark_audit(
+    output_path: Path,
+    *,
+    dates: np.ndarray,
+    benchmark_returns: np.ndarray,
+    config: ExperimentConfig,
+) -> None:
+    """Persist and validate the exact front-month roll path used by reports."""
+
+    date_values = np.asarray(dates, dtype="datetime64[D]")
+    market = load_taifex_index_futures_day_session(
+        config.trading.tw_index_futures_data_path,
+        panel_dates=date_values,
+    )
+    product = str(config.trading.tw_index_futures_reference_product)
+    product_index = market.product_index(product)
+    rolling = np.asarray(
+        market.reference_rolling_buy_hold_log_returns(product),
+        dtype=np.float64,
+    )
+    reported = np.asarray(benchmark_returns, dtype=np.float64)
+    if rolling.shape != reported.shape or not np.allclose(
+        rolling,
+        reported,
+        rtol=1e-6,
+        atol=1e-8,
+        equal_nan=False,
+    ):
+        max_difference = (
+            float(np.max(np.abs(rolling - reported)))
+            if rolling.shape == reported.shape and rolling.size
+            else float("inf")
+        )
+        raise ValueError(
+            "reported futures benchmark differs from the v2 rolling "
+            f"buy-and-hold contract; max_abs_difference={max_difference}"
+        )
+    valid = np.asarray(
+        market.reference_rolling_buy_hold_tradable_mask(product),
+        dtype=bool,
+    )
+    if not bool(valid.all()):
+        missing_dates = date_values[~valid]
+        raise ValueError(
+            "futures benchmark audit contains non-executable rows: "
+            + ", ".join(str(value) for value in missing_dates[:5])
+        )
+    closes = np.asarray(market.close_prices[:, product_index], dtype=np.float64)
+    prior_same_contract_closes = closes / np.exp(rolling)
+    np.savez_compressed(
+        output_path,
+        artifact_schema_version=np.asarray(1, dtype=np.int64),
+        benchmark_name=np.asarray(
+            f"{product} rolling buy-and-hold",
+            dtype="U64",
+        ),
+        benchmark_contract=np.asarray(
+            "1x_long_front_month_gross_roll_at_preceding_close_v2",
+            dtype="U96",
+        ),
+        roll_gap_treatment=np.asarray(
+            "same_contract_close_to_close",
+            dtype="U64",
+        ),
+        cost_treatment=np.asarray("gross_no_fees", dtype="U32"),
+        reference_product=np.asarray(product, dtype="U8"),
+        dates=date_values,
+        contract_months=market.contract_months[:, product_index],
+        front_month_roll_mask=market.reference_front_month_roll_mask(product),
+        front_month_close=closes,
+        prior_same_contract_close=prior_same_contract_closes,
+        benchmark_log_returns=rolling,
+        benchmark_simple_returns=np.expm1(rolling),
+    )
+
+
 def _save_fold_output_artifacts(
     *,
     fold_dir: Path,
@@ -6242,6 +6446,17 @@ def _save_fold_output_artifacts(
     )
     save_timing["backtest_npz_s"] = float(time.perf_counter() - stage_start)
     save_timing["backtest_artifact_compression"] = compression
+    if requested_mode in {"tw_index_futures_day", "tw_index_derivatives_day"}:
+        benchmark_audit_start = time.perf_counter()
+        _save_tw_index_futures_benchmark_audit(
+            fold_dir / "futures_benchmark_audit.npz",
+            dates=test_dates,
+            benchmark_returns=test_backtest.benchmark_returns,
+            config=config,
+        )
+        save_timing["futures_benchmark_audit_s"] = float(
+            time.perf_counter() - benchmark_audit_start
+        )
     if continuous_surrogate_backtest is not None:
         surrogate_start = time.perf_counter()
         _save_backtest_artifact(
@@ -7336,7 +7551,15 @@ def _load_backtest_artifact(output_path: Path) -> tuple[BacktestResult, np.ndarr
             )
     if result.requested_weights_history is not None:
         requested = np.asarray(result.requested_weights_history)
-        if (
+        if execution_mode == "tw_index_derivatives_day":
+            if requested.shape != (
+                rows,
+                TAIFEX_INDEX_DERIVATIVE_ACTION_COUNT_V4,
+            ):
+                raise ValueError(
+                    "backtest derivative request history has invalid direct-axis shape"
+                )
+        elif (
             requested.ndim not in {2, 3}
             or int(requested.shape[0]) != rows
             or int(requested.shape[-1]) != symbol_count
@@ -8769,6 +8992,8 @@ def _combine_datasets_to_windowed(
         valid_indices=torch.cat(valid_indices, dim=0),
         future_log_returns=first.future_log_returns,
         overnight_log_returns=first.overnight_log_returns,
+        derivative_candidate_features=first.derivative_candidate_features,
+        derivative_candidate_mask=first.derivative_candidate_mask,
         tradable_mask=first.tradable_mask,
         can_buy_mask=first.can_buy_mask,
         can_sell_mask=first.can_sell_mask,
@@ -8810,6 +9035,8 @@ def _pad_windowed_training_split(split: WindowedSplitTensors, batch_size: int) -
             valid_indices=split.valid_indices,
             future_log_returns=split.future_log_returns,
             overnight_log_returns=split.overnight_log_returns,
+            derivative_candidate_features=split.derivative_candidate_features,
+            derivative_candidate_mask=split.derivative_candidate_mask,
             tradable_mask=split.tradable_mask,
             can_buy_mask=split.can_buy_mask,
             can_sell_mask=split.can_sell_mask,
@@ -8865,6 +9092,8 @@ def _pad_windowed_training_split(split: WindowedSplitTensors, batch_size: int) -
         valid_indices=valid_indices,
         future_log_returns=split.future_log_returns,
         overnight_log_returns=split.overnight_log_returns,
+        derivative_candidate_features=split.derivative_candidate_features,
+        derivative_candidate_mask=split.derivative_candidate_mask,
         tradable_mask=split.tradable_mask,
         can_buy_mask=split.can_buy_mask,
         can_sell_mask=split.can_sell_mask,
@@ -8959,6 +9188,8 @@ def _densify_windowed_training_split_for_panel_slab(
         valid_indices=dense_indices,
         future_log_returns=split.future_log_returns,
         overnight_log_returns=split.overnight_log_returns,
+        derivative_candidate_features=split.derivative_candidate_features,
+        derivative_candidate_mask=split.derivative_candidate_mask,
         tradable_mask=split.tradable_mask,
         can_buy_mask=split.can_buy_mask,
         can_sell_mask=split.can_sell_mask,
@@ -9246,6 +9477,8 @@ def _prepare_windowed_split(
             valid_indices=valid_indices,
             future_log_returns=shared_base.future_log_returns,
             overnight_log_returns=shared_base.overnight_log_returns,
+            derivative_candidate_features=shared_base.derivative_candidate_features,
+            derivative_candidate_mask=shared_base.derivative_candidate_mask,
             tradable_mask=shared_base.tradable_mask,
             can_buy_mask=shared_base.can_buy_mask,
             can_sell_mask=shared_base.can_sell_mask,
@@ -9295,6 +9528,16 @@ def _prepare_windowed_split(
         overnight_log_returns=_prepare_host_tensor(
             split.overnight_log_returns,
             pin_memory,
+        ),
+        derivative_candidate_features=(
+            None
+            if split.derivative_candidate_features is None
+            else _prepare_host_tensor(split.derivative_candidate_features, pin_memory)
+        ),
+        derivative_candidate_mask=(
+            None
+            if split.derivative_candidate_mask is None
+            else _prepare_host_tensor(split.derivative_candidate_mask, pin_memory)
         ),
         tradable_mask=_prepare_host_tensor(split.tradable_mask, pin_memory),
         can_buy_mask=_prepare_host_tensor(split.can_buy_mask, pin_memory),
@@ -9395,6 +9638,8 @@ def _windowed_base_tensors(split: WindowedSplitTensors) -> tuple[torch.Tensor | 
         split.overnight_log_returns,
         split.session_month_ids,
         split.commission_rebate_payment_eligible_mask,
+        split.derivative_candidate_features,
+        split.derivative_candidate_mask,
     )
 
 
@@ -9439,6 +9684,8 @@ def _with_windowed_base(
         session_advance_mask=base_tensors[11],
         session_month_ids=base_tensors[22],
         commission_rebate_payment_eligible_mask=base_tensors[23],
+        derivative_candidate_features=base_tensors[24],
+        derivative_candidate_mask=base_tensors[25],
         day_trade_eligible_mask=base_tensors[12],
         day_trade_can_buy_open_mask=base_tensors[13],
         day_trade_can_sell_open_mask=base_tensors[14],
@@ -9460,6 +9707,8 @@ def _with_windowed_metadata(
         valid_indices=metadata_tensors[0],
         future_log_returns=split.future_log_returns,
         overnight_log_returns=split.overnight_log_returns,
+        derivative_candidate_features=split.derivative_candidate_features,
+        derivative_candidate_mask=split.derivative_candidate_mask,
         tradable_mask=split.tradable_mask,
         can_buy_mask=split.can_buy_mask,
         can_sell_mask=split.can_sell_mask,
@@ -9591,6 +9840,8 @@ def _windowed_base_compatible(a: WindowedSplitTensors, b: WindowedSplitTensors) 
         "short_capacity_shares",
         "short_margin_rate",
         "short_capacity_notional",
+        "derivative_candidate_features",
+        "derivative_candidate_mask",
     )
     if a.execution_mode != b.execution_mode:
         return False
@@ -9649,6 +9900,8 @@ def _maybe_share_windowed_base_from_cached(
         valid_indices=valid_indices,
         future_log_returns=cached_base.future_log_returns,
         overnight_log_returns=cached_base.overnight_log_returns,
+        derivative_candidate_features=cached_base.derivative_candidate_features,
+        derivative_candidate_mask=cached_base.derivative_candidate_mask,
         tradable_mask=cached_base.tradable_mask,
         can_buy_mask=cached_base.can_buy_mask,
         can_sell_mask=cached_base.can_sell_mask,
@@ -9705,6 +9958,107 @@ def _pad_eval_chunk_first_dim(
     benchmark_pad = benchmark.new_zeros((pad_rows,) + tuple(benchmark.shape[1:]))
     return (
         torch.cat((x, x_pad), dim=0),
+        torch.cat((returns, returns_pad), dim=0),
+        torch.cat((tradable_mask, tradable_pad), dim=0),
+        torch.cat((can_buy_mask, buy_pad), dim=0),
+        torch.cat((can_sell_mask, sell_pad), dim=0),
+        torch.cat((benchmark, benchmark_pad), dim=0),
+        valid_rows,
+    )
+
+
+def _pad_derivative_candidate_context_first_dim(
+    batch: Mapping[str, torch.Tensor],
+    *,
+    target_rows: int,
+) -> dict[str, torch.Tensor]:
+    """Pad derivative context with invisible cash-only rows for fixed eval graphs."""
+
+    features = batch.get("derivative_candidate_features")
+    mask = batch.get("derivative_candidate_mask")
+    if features is None and mask is None:
+        return dict(batch)
+    if features is None or mask is None:
+        raise ValueError("derivative candidate features and mask must be paired")
+    rows = int(features.size(0))
+    if int(mask.size(0)) != rows:
+        raise ValueError("derivative candidate feature/mask row counts must match")
+    target = int(target_rows)
+    if rows >= target:
+        return dict(batch)
+    pad_rows = target - rows
+    padded = dict(batch)
+    padded["derivative_candidate_features"] = torch.cat(
+        (
+            features,
+            features.new_zeros((pad_rows, *tuple(features.shape[1:]))),
+        ),
+        dim=0,
+    )
+    padded["derivative_candidate_mask"] = torch.cat(
+        (
+            mask,
+            mask.new_zeros((pad_rows, *tuple(mask.shape[1:]))),
+        ),
+        dim=0,
+    )
+    return padded
+
+
+def _pad_eval_panel_slab_first_dim(
+    feature_slab: torch.Tensor,
+    returns: torch.Tensor,
+    tradable_mask: torch.Tensor,
+    can_buy_mask: torch.Tensor,
+    can_sell_mask: torch.Tensor,
+    benchmark: torch.Tensor,
+    *,
+    target_rows: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    """Pad a contiguous eval slab without changing any real output window.
+
+    ``feature_slab`` contains ``valid_rows + lookback - 1`` dates. Appending
+    copies of its final date creates only synthetic trailing windows, so the
+    first ``valid_rows`` input windows remain unchanged while a compiled
+    fixed-shape panel-slab wrapper can handle the final short chunk.
+    """
+
+    valid_rows = int(returns.size(0))
+    target_rows = int(target_rows)
+    if valid_rows <= 0 or valid_rows >= target_rows:
+        return (
+            feature_slab,
+            returns,
+            tradable_mask,
+            can_buy_mask,
+            can_sell_mask,
+            benchmark,
+            valid_rows,
+        )
+    if int(feature_slab.size(0)) < valid_rows:
+        raise ValueError(
+            "eval panel slab must contain at least one feature row per output row"
+        )
+
+    pad_rows = target_rows - valid_rows
+    feature_pad = feature_slab[-1:].expand(
+        (pad_rows,) + tuple(feature_slab.shape[1:])
+    )
+    returns_pad = returns.new_zeros((pad_rows,) + tuple(returns.shape[1:]))
+    tradable_pad = tradable_mask[-1:].expand(
+        (pad_rows,) + tuple(tradable_mask.shape[1:])
+    )
+    buy_pad = can_buy_mask[-1:].expand(
+        (pad_rows,) + tuple(can_buy_mask.shape[1:])
+    )
+    sell_pad = can_sell_mask[-1:].expand(
+        (pad_rows,) + tuple(can_sell_mask.shape[1:])
+    )
+    benchmark_pad = benchmark.new_zeros(
+        (pad_rows,) + tuple(benchmark.shape[1:])
+    )
+    return (
+        torch.cat((feature_slab, feature_pad), dim=0),
         torch.cat((returns, returns_pad), dim=0),
         torch.cat((tradable_mask, tradable_pad), dim=0),
         torch.cat((can_buy_mask, buy_pad), dim=0),
@@ -9941,8 +10295,12 @@ def _run_eval_backtest_from_weight_buffers(
     symbol_indices: torch.Tensor | None = None,
 ) -> tuple[BacktestResultTensor, dict[str, float]]:
     total_rows = int(weights_all.size(0))
-    num_symbols = int(weights_all.size(-1))
     execution_mode = "naive" if execution_runtime is None else execution_runtime.mode
+    num_symbols = int(
+        future_log_returns_all.size(-1)
+        if execution_mode == "tw_index_derivatives_day"
+        else weights_all.size(-1)
+    )
     if total_rows <= 0:
         empty_returns = torch.empty((0,), device=device, dtype=torch.float32)
         empty_weights = torch.empty((0, num_symbols), device=device, dtype=torch.float32)
@@ -11028,7 +11386,10 @@ def _evaluate_tensor_batch_decoupled(
         if (
             compute_ic
             and execution_mode not in TW_CARRYING_EXECUTION_MODES
-            and execution_mode != "tw_index_futures_day"
+            and execution_mode not in {
+                "tw_index_futures_day",
+                "tw_index_derivatives_day",
+            }
         ):
             ic_series = compute_ic_series_torch(weights_all, future_returns_all, tradable_mask_all)
             _maybe_sync_cuda(device, profile_timing)
@@ -11256,7 +11617,7 @@ def _evaluate_windowed_tensor_batch_decoupled(
             direct_panel_slab = False
             if panel_forward_model is not None:
                 batch = None
-                if panel_slab_model is not None and int(end - start) == int(model_chunk_rows):
+                if panel_slab_model is not None:
                     batch = split.panel_slab_batch_by_rows(
                         start,
                         end,
@@ -11337,13 +11698,26 @@ def _evaluate_windowed_tensor_batch_decoupled(
             timing.h2d_transfer_s += h2d_elapsed
 
             pad_start = time.perf_counter()
+            batch_for_forward = dict(batch)
             if panel_forward_model is not None and direct_panel_slab:
-                returns_chunk_padded = returns_chunk
-                mask_chunk_padded = mask_chunk
-                buy_mask_chunk_padded = buy_mask_chunk
-                sell_mask_chunk_padded = sell_mask_chunk
-                bench_chunk_padded = bench_chunk
-                valid_rows = int(end - start)
+                (
+                    feature_slab_padded,
+                    returns_chunk_padded,
+                    mask_chunk_padded,
+                    buy_mask_chunk_padded,
+                    sell_mask_chunk_padded,
+                    bench_chunk_padded,
+                    valid_rows,
+                ) = _pad_eval_panel_slab_first_dim(
+                    batch_for_forward["feature_slab"],
+                    returns_chunk,
+                    mask_chunk,
+                    buy_mask_chunk,
+                    sell_mask_chunk,
+                    bench_chunk,
+                    target_rows=model_chunk_rows,
+                )
+                batch_for_forward["feature_slab"] = feature_slab_padded
             elif panel_forward_model is not None:
                 (
                     date_indices_chunk,
@@ -11362,8 +11736,7 @@ def _evaluate_windowed_tensor_batch_decoupled(
                     bench_chunk,
                     target_rows=model_chunk_rows,
                 )
-                panel_batch_for_forward = dict(batch)
-                panel_batch_for_forward["date_indices"] = date_indices_chunk
+                batch_for_forward["date_indices"] = date_indices_chunk
             else:
                 (
                     x_chunk,
@@ -11382,6 +11755,10 @@ def _evaluate_windowed_tensor_batch_decoupled(
                     bench_chunk,
                     target_rows=model_chunk_rows,
                 )
+            batch_for_forward = _pad_derivative_candidate_context_first_dim(
+                batch_for_forward,
+                target_rows=int(mask_chunk_padded.size(0)),
+            )
             _maybe_sync_cuda(device, profile_timing)
             pad_elapsed = time.perf_counter() - pad_start
             timing.batch_prepare_s += pad_elapsed
@@ -11394,16 +11771,18 @@ def _evaluate_windowed_tensor_batch_decoupled(
                         if panel_slab_model is None:
                             raise RuntimeError("panel slab model unexpectedly unavailable")
                         model_output_chunk = panel_slab_model(
-                            batch["feature_slab"],
+                            batch_for_forward["feature_slab"],
                             mask_chunk_padded,
-                            batch.get("symbol_indices"),
+                            batch_for_forward.get("symbol_indices"),
+                            batch_for_forward.get("derivative_candidate_features"),
+                            batch_for_forward.get("derivative_candidate_mask"),
                         )
                     else:
                         model_output_chunk = _call_panel_forward_for_batch(
                             panel_forward_model=panel_forward_model,
                             panel_slab_model=panel_slab_model,
                             split=split,
-                            batch=batch if int(valid_rows) == int(model_chunk_rows) else panel_batch_for_forward,
+                            batch=batch_for_forward,
                             mask=mask_chunk_padded,
                             device=device,
                             non_blocking=non_blocking,
@@ -11412,7 +11791,13 @@ def _evaluate_windowed_tensor_batch_decoupled(
                             rows=int(valid_rows),
                         )
                 else:
-                    model_output_chunk = _call_model(model, x_chunk, mask_chunk_padded, return_aux=False)
+                    model_output_chunk = _call_model(
+                        model,
+                        x_chunk,
+                        mask_chunk_padded,
+                        return_aux=False,
+                        portfolio_context=_derivative_portfolio_context(batch_for_forward),
+                    )
                 weights_chunk, _ = _extract_weights_and_aux(model_output_chunk)
             _maybe_sync_cuda(device, profile_timing)
             forward_elapsed = time.perf_counter() - forward_start
@@ -11427,7 +11812,7 @@ def _evaluate_windowed_tensor_batch_decoupled(
                 )
                 returns_all = torch.empty((total_rows, split.num_symbols), device=device, dtype=returns_chunk.dtype)
                 overnight_returns_all = torch.empty(
-                    (total_rows, split.num_symbols),
+                    (total_rows, int(overnight_returns_chunk.size(1))),
                     device=device,
                     dtype=overnight_returns_chunk.dtype,
                 )
@@ -11648,7 +12033,10 @@ def _evaluate_windowed_tensor_batch_decoupled(
         if (
             compute_ic
             and split.execution_mode not in TW_CARRYING_EXECUTION_MODES
-            and split.execution_mode != "tw_index_futures_day"
+            and split.execution_mode not in {
+                "tw_index_futures_day",
+                "tw_index_derivatives_day",
+            }
         ):
             ic_series = compute_ic_series_torch(weights_all, returns_all, mask_all)
             _maybe_sync_cuda(device, profile_timing)
@@ -12034,6 +12422,20 @@ def _replay_taiwan_stitched_deployment(
         requests_array = np.asarray(requests, dtype=np.float64)
         if requests_array.ndim not in {2, 3} or requests_array.shape[0] != rows:
             raise RuntimeError("deployment requested-weight history has invalid shape")
+        if mode == "tw_index_derivatives_day":
+            if requests_array.shape != (
+                rows,
+                TAIFEX_INDEX_DERIVATIVE_ACTION_COUNT_V4,
+            ):
+                raise RuntimeError(
+                    "derivative deployment requests must use the direct "
+                    "[T,D_derivatives] axis"
+                )
+            request_parts.append(requests_array)
+            date_parts.append(fold_dates)
+            fold_segments.append((fold_dir, cursor, cursor + rows))
+            cursor += rows
+            continue
         local_symbols = _load_deployment_symbols(
             fold_dir,
             int(requests_array.shape[-1]),
@@ -12300,7 +12702,23 @@ def _refresh_walkforward_artifacts(
             all_first_year_strategy_log.append(np.nan_to_num(fold_backtest.strategy_returns[mask], nan=0.0).astype(np.float64))
             all_first_year_baseline_log.append(np.nan_to_num(fold_backtest.benchmark_returns[mask], nan=0.0).astype(np.float64))
             all_first_year_turnovers.append(np.nan_to_num(fold_backtest.turnovers[mask], nan=0.0).astype(np.float64))
-            all_first_year_weights.append(np.nan_to_num(fold_backtest.weights_history[mask], nan=0.0).astype(np.float64))
+            concentration_weights = fold_backtest.weights_history
+            if (
+                normalize_execution_mode(fold_backtest.execution_mode)
+                == "tw_index_derivatives_day"
+                and fold_backtest.requested_weights_history is not None
+            ):
+                # Derivative strategies finish each day flat, so their carried
+                # stock-axis weights_history is intentionally all zeros.  The
+                # economically meaningful concentration lives on the direct
+                # futures/options request axis.
+                concentration_weights = fold_backtest.requested_weights_history
+            all_first_year_weights.append(
+                np.nan_to_num(
+                    np.asarray(concentration_weights)[mask],
+                    nan=0.0,
+                ).astype(np.float64)
+            )
 
     if not all_dates:
         return
@@ -12705,6 +13123,8 @@ def _probe_compiled_train_forward(
                         batch["feature_slab"],
                         batch["tradable_mask"],
                         batch.get("symbol_indices"),
+                        batch.get("derivative_candidate_features"),
+                        batch.get("derivative_candidate_mask"),
                     )
                 else:
                     output = _call_model(
@@ -12713,6 +13133,7 @@ def _probe_compiled_train_forward(
                         batch["tradable_mask"],
                         return_aux=return_aux,
                         symbol_indices=batch.get("symbol_indices"),
+                        portfolio_context=_derivative_portfolio_context(batch),
                     )
                 weights, aux_outputs = _extract_weights_and_aux(output)
                 if observed_output_dtypes is not None:
@@ -12829,7 +13250,12 @@ def _probe_compiled_loss_forward_backward(
             else 1
         )
         action_shape = tuple(batch["future_log_returns"].shape)
-        if action_channels > 1:
+        if split.execution_mode == "tw_index_derivatives_day":
+            action_shape = (
+                int(action_shape[0]),
+                TAIFEX_INDEX_DERIVATIVE_ACTION_COUNT_V4,
+            )
+        elif action_channels > 1:
             action_shape = (
                 int(action_shape[0]),
                 action_channels,
@@ -13883,6 +14309,8 @@ def _train_epoch_windowed_tensor(
                                     batch["feature_slab"],
                                     batch_mask,
                                     batch.get("symbol_indices"),
+                                    batch.get("derivative_candidate_features"),
+                                    batch.get("derivative_candidate_mask"),
                                 )
                             else:
                                 model_output = _call_panel_forward_for_batch(
@@ -13904,6 +14332,7 @@ def _train_epoch_windowed_tensor(
                                 batch_mask,
                                 return_aux=model_return_aux,
                                 symbol_indices=batch.get("symbol_indices"),
+                                portfolio_context=_derivative_portfolio_context(batch),
                             )
                 elif use_panel_forward:
                     if panel_forward_model is None:
@@ -13915,6 +14344,8 @@ def _train_epoch_windowed_tensor(
                             batch["feature_slab"],
                             batch_mask,
                             batch.get("symbol_indices"),
+                            batch.get("derivative_candidate_features"),
+                            batch.get("derivative_candidate_mask"),
                         )
                     else:
                         model_output = _call_panel_forward_for_batch(
@@ -13936,6 +14367,7 @@ def _train_epoch_windowed_tensor(
                         batch_mask,
                         return_aux=model_return_aux,
                         symbol_indices=batch.get("symbol_indices"),
+                        portfolio_context=_derivative_portfolio_context(batch),
                     )
                 weights, aux_outputs = _extract_weights_and_aux(model_output)
             batch_volume_limit_weights = _volume_limit_weights_from_notional(
@@ -14501,6 +14933,8 @@ def _train_epoch_windowed_tensor_ddp(
                         batch["feature_slab"],
                         batch_mask,
                         batch.get("symbol_indices"),
+                        batch.get("derivative_candidate_features"),
+                        batch.get("derivative_candidate_mask"),
                     )
                 else:
                     if batch_x is None:
@@ -14511,6 +14945,7 @@ def _train_epoch_windowed_tensor_ddp(
                         batch_mask,
                         return_aux=False,
                         symbol_indices=batch.get("symbol_indices"),
+                        portfolio_context=_derivative_portfolio_context(batch),
                     )
                 local_weights, _ = _extract_weights_and_aux(model_output)
             _maybe_sync_cuda(device, profile_timing)
@@ -14987,6 +15422,49 @@ def _format_ic_summary_for_console(summary: Mapping[str, Any]) -> str:
     return f"IC={ic_mean:+.4f}  IC_IR={ic_ir:+.4f}"
 
 
+def _format_fold_evaluation_lines(
+    *,
+    execution_mode: str,
+    loss_objective: str,
+    val_ic: Mapping[str, Any],
+    val_metrics: Mapping[str, float],
+    test_ic: Mapping[str, Any],
+    test_metrics: Mapping[str, float],
+    test_integer_metrics: Mapping[str, float] | None,
+) -> tuple[str, ...]:
+    """Label continuous and exact metrics without presenting one as the other."""
+
+    objective_key = _objective_metric_key(loss_objective)
+
+    def line(
+        label: str,
+        ic: Mapping[str, Any],
+        metrics: Mapping[str, float],
+    ) -> str:
+        objective_value = float(metrics.get(objective_key, float("nan")))
+        return (
+            f"  [{label}]  {_format_ic_summary_for_console(ic)}  "
+            f"{objective_key}={objective_value:+.4f}  "
+            f"cum_ret={float(metrics['cumulative_return']):+.4f}  "
+            f"excess={float(metrics['excess_return_vs_benchmark']):+.4f}"
+        )
+
+    if normalize_execution_mode(execution_mode) == "naive":
+        return (
+            line("val", val_ic, val_metrics),
+            line("test", test_ic, test_metrics),
+        )
+    if test_integer_metrics is None:
+        raise ValueError(
+            f"{execution_mode} console reporting requires exact integer metrics"
+        )
+    return (
+        line("val surrogate", val_ic, val_metrics),
+        line("test exact", test_ic, test_integer_metrics),
+        line("test surrogate", test_ic, test_metrics),
+    )
+
+
 def _run_training_tree_models(
     panel: PanelData,
     folds: Iterable[WalkForwardFold],
@@ -15379,20 +15857,19 @@ def _run_training_tree_models(
                 deployment_test_rows,
             )
 
-            objective_key = _objective_metric_key(loss_objective)
-            val_objective_metric = float(val_met.get(objective_key, float("nan")))
-            test_objective_metric = float(test_met.get(objective_key, float("nan")))
             print(
-                f"\n  [val]   {_format_ic_summary_for_console(val_ic)}  "
-                f"{loss_objective}={val_objective_metric:+.4f}  "
-                f"cum_ret={val_met['cumulative_return']:+.4f}  "
-                f"excess={val_met['excess_return_vs_benchmark']:+.4f}"
-            )
-            print(
-                f"  [test]  {_format_ic_summary_for_console(test_ic)}  "
-                f"{loss_objective}={test_objective_metric:+.4f}  "
-                f"cum_ret={test_met['cumulative_return']:+.4f}  "
-                f"excess={test_met['excess_return_vs_benchmark']:+.4f}"
+                "\n"
+                + "\n".join(
+                    _format_fold_evaluation_lines(
+                        execution_mode=execution_runtime.mode,
+                        loss_objective=loss_objective,
+                        val_ic=val_ic,
+                        val_metrics=val_met,
+                        test_ic=test_ic,
+                        test_metrics=test_met,
+                        test_integer_metrics=test_integer_met,
+                    )
+                )
             )
 
             fold_result = FoldResult(
@@ -15565,9 +16042,22 @@ def run_training(
     except BaseException as exc:
         lifecycle.fail(exc)
         raise
-    lifecycle.complete(
-        fold_ids=[result.fold_id for result in results],
-        message=f"completed {len(results)} fold(s)",
+    completed_fold_ids = [result.fold_id for result in results]
+
+    def complete_lifecycle_on_rank0() -> None:
+        lifecycle.complete(
+            fold_ids=completed_fold_ids,
+            message=f"completed {len(results)} fold(s)",
+        )
+
+    # DDP workers intentionally return no FoldResult objects because rank 0
+    # alone owns reporting and artifact writes.  Run the structural artifact
+    # gate on that writer and propagate its outcome to every rank; asking each
+    # worker to validate its empty local result list falsely reports partial
+    # fold coverage after otherwise successful training.
+    _run_rank0_store_synchronized_phase(
+        "training_lifecycle_completion",
+        complete_lifecycle_on_rank0,
     )
     return results
 
@@ -20137,20 +20627,19 @@ def _run_training_impl(
                 test_integer_met = compute_metrics(test_integer_bt)
                 test_report_total = time.perf_counter() - test_report_start
 
-                objective_key = _objective_metric_key(loss_objective)
-                val_objective_metric = float(val_met.get(objective_key, float("nan")))
-                test_objective_metric = float(test_met.get(objective_key, float("nan")))
                 print(
-                    f"\n  [val]   {_format_ic_summary_for_console(val_ic)}  "
-                    f"{loss_objective}={val_objective_metric:+.4f}  "
-                    f"cum_ret={val_met['cumulative_return']:+.4f}  "
-                    f"excess={val_met['excess_return_vs_benchmark']:+.4f}"
-                )
-                print(
-                    f"  [test]  {_format_ic_summary_for_console(test_ic)}  "
-                    f"{loss_objective}={test_objective_metric:+.4f}  "
-                    f"cum_ret={test_met['cumulative_return']:+.4f}  "
-                    f"excess={test_met['excess_return_vs_benchmark']:+.4f}"
+                    "\n"
+                    + "\n".join(
+                        _format_fold_evaluation_lines(
+                            execution_mode=execution_runtime.mode,
+                            loss_objective=loss_objective,
+                            val_ic=val_ic,
+                            val_metrics=val_met,
+                            test_ic=test_ic,
+                            test_metrics=test_met,
+                            test_integer_metrics=test_integer_met,
+                        )
+                    )
                 )
                 if profile_timing:
                     _log_timing(

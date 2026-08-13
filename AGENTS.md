@@ -397,6 +397,24 @@ Rules:
 
 ## Intentional Walk-Forward Semantics
 
+- The `tw_index_futures_day` market comparator is not the strategy's daily
+  open-to-close TX target. It is a gross, fully collateralized 1x long TX
+  front-month buy-and-hold series. Preserve every monthly contract in futures
+  data contract v2. When the front month changes, roll at the preceding session
+  close and compute the new row from that new contract's own preceding close;
+  never book the old/new calendar-spread price gap as return. Persist the fold
+  roll path in `futures_benchmark_audit.npz`.
+- The active exact TX/MTX/TMF integer audit capital is TWD 100,000,000. Keep it
+  in the mode-specific checkpoint contract and use a fresh artifact root when
+  changing it. Do not force a minimum one-contract trade to hide granularity;
+  that would violate the model's requested risk exposure.
+- The exact integer executor must apply price-dependent PnL, tax, and slippage
+  arithmetic only to products with nonzero selected contract quantities.
+  Missing prices on an unavailable zero-quantity product are inert; an active
+  product with a non-finite open/close is a hard data error. Keep exact and
+  continuous-surrogate test metrics explicitly labeled in console output so
+  the surrogate cannot be mistaken for the canonical annual report.
+
 - TW day-trade point-in-time eligibility is absent before 2014 in the verified
   public data and first becomes executable on 2014-01-06 (sell-first coverage
   begins 2014-06-30). A `tw_day_trade` experiment must not start its training
