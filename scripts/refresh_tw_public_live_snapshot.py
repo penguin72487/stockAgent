@@ -33,6 +33,9 @@ from stockagent.data_sync.desync_snapshots import (  # noqa: E402
 )
 from stockagent.live.market_config import LiveMarketConfig  # noqa: E402
 from stockagent.live.market_status import expected_latest_data_date  # noqa: E402
+from stockagent.live.tw_day_trade_simulation import (  # noqa: E402
+    require_exact_session_eligibility,
+)
 
 
 TAIPEI = ZoneInfo("Asia/Taipei")
@@ -227,6 +230,64 @@ def _downloader_command(
     ]
 
 
+def _same_session_rule_command(
+    *,
+    python: str,
+    live_root: Path,
+    trading_date: str,
+) -> list[str]:
+    return [
+        python,
+        str(REPO_ROOT / "downloader" / "download_tw_public_data.py"),
+        "--mode",
+        "daily",
+        "--datasets",
+        "twse_day_trade_eligibility",
+        "tpex_day_trade_eligibility",
+        "--end-date",
+        trading_date,
+        "--same-session-rule-date",
+        trading_date,
+        "--output-dir",
+        str(live_root),
+        "--workers",
+        "2",
+        "--date-workers",
+        "2",
+        "--daily-overlap-days",
+        "1",
+        "--require-taiex-session-calendar",
+        "--no-progress",
+        "--no-write-run-metadata",
+    ]
+
+
+def _refresh_same_session_rules(
+    live_root: Path,
+    *,
+    observed: datetime,
+) -> dict[str, object]:
+    trading_date = observed.astimezone(TAIPEI).date()
+    subprocess.run(
+        _same_session_rule_command(
+            python=sys.executable,
+            live_root=live_root,
+            trading_date=trading_date.isoformat(),
+        ),
+        cwd=REPO_ROOT,
+        check=True,
+    )
+    coverage = require_exact_session_eligibility(
+        rule_data_dir=live_root,
+        parquet_root=live_root / "stocks",
+        trading_date=trading_date,
+    )
+    return {
+        "trading_date": trading_date.isoformat(),
+        "venues": coverage,
+    }
+
+
 def _audit_command(
     *,
     python: str,
@@ -272,9 +333,16 @@ def main() -> int:
 
     with lock_path.open("a+", encoding="utf-8") as lock_handle:
         fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        observed = datetime.now(TAIPEI)
         expected_latest = _expected_latest(
             live_root if live_root.exists() else (REPO_ROOT / "data_tw_public")
         )
+        active_source = (REPO_ROOT / "data_tw_public").resolve(strict=True)
+        if live_root == active_source:
+            raise RuntimeError(
+                "mutable live root resolves to the active inference snapshot"
+            )
+        _bootstrap_live_tree(live_root, active_source)
         if not args.force:
             reused = _can_reuse_today(
                 receipt_path,
@@ -282,15 +350,18 @@ def main() -> int:
                 active_link=REPO_ROOT / "data_tw_public",
             )
             if reused is not None:
-                print(json.dumps({**reused, "reused": True}, ensure_ascii=False))
+                same_session = _refresh_same_session_rules(
+                    live_root,
+                    observed=observed,
+                )
+                reused_payload = {
+                    **reused,
+                    "same_session_eligibility": same_session,
+                    "reused": True,
+                }
+                _atomic_json(receipt_path, reused_payload)
+                print(json.dumps(reused_payload, ensure_ascii=False))
                 return 0
-
-        active_source = (REPO_ROOT / "data_tw_public").resolve(strict=True)
-        if live_root == active_source:
-            raise RuntimeError(
-                "mutable live root resolves to the active inference snapshot"
-            )
-        _bootstrap_live_tree(live_root, active_source)
 
         summary_path = live_root / "download_summary.json"
         if args.reuse_live_download:
@@ -326,6 +397,10 @@ def main() -> int:
 
         summary = _json(summary_path)
         _validate_download_summary(summary, expected_latest=expected_latest)
+        same_session = _refresh_same_session_rules(
+            live_root,
+            observed=observed,
+        )
         resolved = publish_snapshot(
             sync_root,
             "tw-public",
@@ -356,6 +431,7 @@ def main() -> int:
             "materialized_path": str(target),
             "pin_path": str(pin_path),
             "config_path": str(config_path),
+            "same_session_eligibility": same_session,
             "reused_live_download": bool(args.reuse_live_download),
             "reused": False,
         }

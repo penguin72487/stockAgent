@@ -43,6 +43,41 @@ TAIFEX_MARGIN_CSV_SHA256: Final[str] = (
     "67c48684e1df9df834ef8a57379916d38e522da123ef9bd24755d2e1113e91af"
 )
 
+# Effective after the 2026-08-12 regular session, hence from the 2026-08-13
+# TAIFEX trading date (including the preceding night session).  Keep this as a
+# date-versioned step instead of overwriting ``TAIFEX_INITIAL_MARGIN_TWD``;
+# research ledgers spanning the change need the value that applied on each day.
+TAIFEX_INITIAL_MARGIN_TWD_2026_08_13: Final[dict[str, float]] = {
+    "TX": 701_000.0,
+    "MTX": 175_250.0,
+    "TMF": 35_050.0,
+}
+TAIFEX_MARGIN_2026_08_13_EFFECTIVE_DATE: Final[date] = date(2026, 8, 13)
+TAIFEX_MARGIN_2026_08_13_ANNOUNCEMENT_URL: Final[str] = (
+    "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/"
+    "%E6%96%B0%E8%81%9E%E7%A8%BF_20260811.pdf"
+)
+TAIFEX_MARGIN_2026_08_13_PDF_SHA256: Final[str] = (
+    "43c5985b1fc2722f9f5d340945b9addca4a83a4035c3474e4a6428993d0f073f"
+)
+
+
+def taifex_initial_margin_twd(product: object, trading_date: date) -> float:
+    """Return the official initial margin for a supported live date step."""
+
+    if not isinstance(trading_date, date):
+        raise TypeError("trading_date must be a datetime.date")
+    normalized = str(product or "").strip().upper()
+    schedule = (
+        TAIFEX_INITIAL_MARGIN_TWD_2026_08_13
+        if trading_date >= TAIFEX_MARGIN_2026_08_13_EFFECTIVE_DATE
+        else TAIFEX_INITIAL_MARGIN_TWD
+    )
+    try:
+        return float(schedule[normalized])
+    except KeyError as exc:
+        raise ValueError(f"unsupported TAIFEX margin product: {normalized!r}") from exc
+
 
 def _require_columns(frame: pl.DataFrame, required: set[str], *, label: str) -> None:
     missing = sorted(required.difference(frame.columns))
@@ -117,7 +152,10 @@ def compute_daily_required_capital(
         str(product).strip().upper(): float(value)
         for product, value in futures_initial_margin_twd.items()
     }
-    if any(not math.isfinite(value) or value <= 0.0 for value in normalized_margins.values()):
+    if any(
+        not math.isfinite(value) or value <= 0.0
+        for value in normalized_margins.values()
+    ):
         raise ValueError("futures initial margins must be finite and positive")
 
     ordered = trades.with_row_index("_ledger_order").sort(
@@ -170,15 +208,15 @@ def compute_daily_required_capital(
                             f"non-finite option cash flow: date={trading_date}, "
                             f"variant={variant_id}"
                         )
-                    option_cash_balance += (
-                        gross_cash_flow - fixed_fee - transaction_tax
-                    )
+                    option_cash_balance += gross_cash_flow - fixed_fee - transaction_tax
                     key = (
                         str(row["series"]),
                         float(row["strike"]),
                         str(row["option_right"]),
                     )
-                    option_positions[key] = option_positions.get(key, 0) + delta_contracts
+                    option_positions[key] = (
+                        option_positions.get(key, 0) + delta_contracts
+                    )
                 elif instrument_type == "future":
                     product = str(row["product"]).strip().upper()
                     if product not in normalized_margins:
@@ -231,7 +269,9 @@ def compute_daily_required_capital(
             key: quantity for key, quantity in option_positions.items() if quantity != 0
         }
         open_futures = {
-            key: quantity for key, quantity in futures_positions.items() if quantity != 0
+            key: quantity
+            for key, quantity in futures_positions.items()
+            if quantity != 0
         }
         if open_options or open_futures:
             raise ValueError(
@@ -300,9 +340,12 @@ def build_capital_normalized_returns(
         "variant_id",
         pl.col(pnl_column).alias("normalized_pnl_twd"),
     )
-    if selected_daily.height != selected_daily.select(
-        pl.struct(["trading_date", "variant_id"]).n_unique()
-    ).item():
+    if (
+        selected_daily.height
+        != selected_daily.select(
+            pl.struct(["trading_date", "variant_id"]).n_unique()
+        ).item()
+    ):
         raise ValueError("daily benchmark results contain duplicate variant/day rows")
     if carry_across_sessions:
         # Reuse the canonical ledger replay by collapsing only the grouping

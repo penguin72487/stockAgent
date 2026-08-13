@@ -1,0 +1,78 @@
+{
+	default_bind 192.168.50.211 [::]
+	admin 127.0.0.1:2019
+	grace_period 10s
+	log default {
+		output file {$STOCKAGENT_PUBLIC_RUNTIME_LOG} {
+			roll_size 10MiB
+			roll_keep 5
+			roll_keep_for 168h
+		}
+		format json
+		level INFO
+	}
+	servers {
+		protocols h1 h2
+		max_header_size 16KB
+		timeouts {
+			read_body 10s
+			read_header 5s
+			write 30s
+			idle 2m
+		}
+	}
+}
+
+http://penguin72487.ddnsgeek.com {
+	bind 192.168.50.211 [::]
+	header -Server
+	redir https://penguin72487.ddnsgeek.com{uri} permanent
+}
+
+penguin72487.ddnsgeek.com {
+	bind 192.168.50.211 [::]
+	encode zstd gzip
+
+	header {
+		-Server
+		-Via
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+		X-Frame-Options "DENY"
+		Cross-Origin-Opener-Policy "same-origin"
+		Cross-Origin-Resource-Policy "same-origin"
+		Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=(), usb=()"
+		X-Robots-Tag "noindex, nofollow, noarchive"
+		Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+	}
+
+	@write_methods not method GET HEAD
+	respond @write_methods 405
+
+	reverse_proxy 127.0.0.1:8770 {
+		health_uri /healthz
+		health_interval 30s
+		health_timeout 2s
+		health_passes 1
+		health_fails 3
+		fail_duration 10s
+		max_fails 3
+		unhealthy_status 500 502 503 504
+		transport http {
+			dial_timeout 2s
+			response_header_timeout 20s
+			keepalive 30s
+			max_conns_per_host 32
+		}
+	}
+
+	log {
+		output file {$STOCKAGENT_PUBLIC_LOG} {
+			roll_size 10MiB
+			roll_keep 5
+			roll_keep_for 168h
+		}
+		format json
+	}
+}

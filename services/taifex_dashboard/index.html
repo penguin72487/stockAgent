@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TAIFEX 全策略模擬交易即時面板</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <main class="shell">
+    <header class="hero">
+      <div>
+        <p class="eyebrow">SHIOAJI · SIMULATION ONLY</p>
+        <h1 id="dashboard-title">TAIFEX 全策略模擬交易即時面板</h1>
+        <p class="subtitle">Bid/Ask 可成交價理想帳、日內期貨避險與永豐模擬委託監控</p>
+      </div>
+      <div class="live-block">
+        <span id="live-dot" class="live-dot" aria-hidden="true"></span>
+        <span id="live-label">連線中</span>
+        <span id="last-refresh" class="mono">—</span>
+      </div>
+    </header>
+
+    <section id="alert" class="alert" role="status" aria-live="polite">
+      正在載入已落盤的模擬狀態。
+    </section>
+
+    <section class="metrics" aria-label="核心狀態">
+      <article class="metric"><span>引擎</span><strong id="engine-status">—</strong><small id="blocked-reason">blocked: —</small></article>
+      <article class="metric"><span>行情覆蓋</span><strong id="book-coverage">—</strong><small id="book-count">—</small></article>
+      <article class="metric"><span>目前週期</span><strong id="cycle-status">—</strong><small id="cycle-expiry">—</small></article>
+      <article class="metric"><span>模擬委託</span><strong id="broker-status">—</strong><small id="broker-detail">—</small></article>
+      <article class="metric"><span>狀態延遲</span><strong id="source-age">—</strong><small>超過 15 秒即標示 stale</small></article>
+      <article class="metric"><span>安全邊界</span><strong id="safety-state">—</strong><small>正式下單必須永遠不可用</small></article>
+    </section>
+
+    <section class="metrics performance-metrics" aria-label="全策略績效摘要">
+      <article class="metric"><span>有效曲線</span><strong id="performance-count">—</strong><small>有固定資金分母的策略</small></article>
+      <article class="metric"><span>預留資金合計</span><strong id="performance-reserve">—</strong><small>各最小策略單位獨立預留後加總</small></article>
+      <article class="metric"><span>中位固定資金報酬</span><strong id="performance-median">—</strong><small>一單位淨損益 ÷ 固定預留資金</small></article>
+      <article class="metric"><span>目前最佳</span><strong id="performance-best">—</strong><small id="performance-best-name">—</small></article>
+      <article class="metric"><span>目前最差</span><strong id="performance-worst">—</strong><small id="performance-worst-name">—</small></article>
+      <article class="metric"><span>顯性成本合計</span><strong id="performance-cost">—</strong><small>手續費 + 交易稅；不含預留保證金</small></article>
+    </section>
+
+    <section class="grid-two">
+      <article class="panel chart-panel">
+        <div class="panel-head">
+          <div>
+            <h2>策略總權益</h2>
+            <p>每分鐘 mark；起始資金加累積 P&amp;L，單位 TWD</p>
+          </div>
+          <label>策略
+            <select id="strategy-select" aria-label="選擇策略"></select>
+          </label>
+        </div>
+        <svg id="equity-chart" viewBox="0 0 900 300" role="img" aria-label="選擇策略的總權益曲線"></svg>
+        <p id="chart-note" class="chart-note"></p>
+      </article>
+
+      <article class="panel cycle-panel">
+        <div class="panel-head"><div><h2>週期與合約</h2><p>目前執行狀態</p></div></div>
+        <dl class="detail-list">
+          <div><dt>TX</dt><dd id="underlying-contract">—</dd></div>
+          <div><dt>避險期貨</dt><dd id="hedge-contract">—</dd></div>
+          <div><dt>裸賣保證金 A/B</dt><dd id="option-risk-margins">—</dd></div>
+          <div><dt>策略資金緩衝</dt><dd id="capital-buffer-multiple">—</dd></div>
+          <div><dt>週選序列</dt><dd id="cycle-series">—</dd></div>
+          <div><dt>策略模式</dt><dd id="strategy-mode">—</dd></div>
+          <div><dt>新增策略進場</dt><dd id="catalog-entry-policy">—</dd></div>
+          <div><dt>目前盤別</dt><dd id="current-session">—</dd></div>
+          <div><dt>執行模式</dt><dd id="runner-mode">—</dd></div>
+          <div><dt>日盤官方時段</dt><dd id="day-official-session">—</dd></div>
+          <div><dt>日／夜盤空窗</dt><dd id="intersession-gap">—</dd></div>
+          <div><dt>盤後／夜盤時段</dt><dd id="night-official-session">—</dd></div>
+          <div><dt>TAIFEX 交易日</dt><dd id="current-trading-date">—</dd></div>
+          <div><dt>決策頻率</dt><dd id="decision-interval">—</dd></div>
+          <div><dt>日盤停止／平倉</dt><dd id="day-session-times">—</dd></div>
+          <div><dt>夜盤停止／平倉</dt><dd id="night-session-times">—</dd></div>
+          <div><dt>履約價</dt><dd id="cycle-strike">—</dd></div>
+          <div><dt>到期日</dt><dd id="detail-expiry">—</dd></div>
+          <div><dt>待執行 target</dt><dd id="pending-targets">—</dd></div>
+          <div><dt>Bootstrap gate</dt><dd id="bootstrap-date">—</dd></div>
+          <div><dt>API round-trip</dt><dd id="api-round-trip">—</dd></div>
+        </dl>
+      </article>
+    </section>
+
+    <section class="panel curve-wall" aria-labelledby="curve-wall-title">
+      <div class="panel-head">
+        <div>
+          <h2 id="curve-wall-title">所有策略曲線一覽</h2>
+          <p>每條線是一個最小策略單位的累積淨損益 ÷ 固定預留資金；點卡片可切換上方大圖</p>
+        </div>
+        <div class="exposure-controls" aria-label="曝險分類篩選">
+          <label>方向
+            <select id="exposure-direction-filter" aria-label="篩選方向曝險">
+              <option value="">全部方向曝險</option>
+            </select>
+          </label>
+          <label>波動
+            <select id="exposure-volatility-filter" aria-label="篩選波動曝險">
+              <option value="">全部波動曝險</option>
+            </select>
+          </label>
+          <label>避險
+            <select id="exposure-hedge-filter" aria-label="篩選避險型態">
+              <option value="">全部避險型態</option>
+            </select>
+          </label>
+          <button id="exposure-filter-reset" type="button">清除曝險篩選</button>
+        </div>
+      </div>
+      <div id="exposure-summary" class="exposure-summary" aria-label="即時策略曝險分類統計"></div>
+      <div id="curve-wall-grid" class="curve-wall-grid"></div>
+      <p id="curve-wall-note" class="chart-note"></p>
+    </section>
+
+    <section class="panel table-panel">
+      <div class="panel-head">
+        <div><h2 id="strategy-table-title">獨立策略帳本</h2><p>所有腿依五檔深度清算；裸賣逐腿保守保證金，權益不足強制平倉</p></div>
+        <div class="sort-controls">
+          <label>排序
+            <select id="strategy-sort" aria-label="策略排序指標">
+              <option value="fixed_capital_return">固定資金報酬</option>
+              <option value="compounded_return_to_live_mark">逐交易日複利</option>
+              <option value="one_unit_net_pnl_twd">一單位淨損益</option>
+              <option value="one_unit_net_pnl_abs_twd">損益絕對值</option>
+              <option value="reserved_capital_twd">預留資金</option>
+              <option value="explicit_cost_twd">顯性成本</option>
+              <option value="net_pnl_to_explicit_cost_ratio">損益／顯性成本</option>
+              <option value="margin_required_twd">保證金</option>
+              <option value="margin_utilization">資金占用率</option>
+              <option value="directional_exposure_label">方向曝險</option>
+              <option value="volatility_exposure_label">波動曝險</option>
+              <option value="hedge_type_label">避險型態</option>
+              <option value="design_option_long_ratio">設計多方口數占比</option>
+              <option value="live_option_long_ratio">實際多方口數占比</option>
+              <option value="category">分類</option>
+              <option value="label">名稱</option>
+            </select>
+          </label>
+          <button id="sort-direction" type="button">由高到低 ↓</button>
+        </div>
+      </div>
+      <div class="table-scroll">
+        <table>
+          <thead><tr><th>策略</th><th>分類</th><th>方向曝險</th><th>波動曝險</th><th>避險型態</th><th>選擇權多:空口數比</th><th>預留資金</th><th>一單位淨損益</th><th>損益絕對值</th><th>固定資金報酬</th><th>逐日複利*</th><th>顯性成本</th><th>損益／成本</th><th>保證金</th><th>資金占用</th><th>總權益</th><th>餘裕</th><th>清算價值</th><th>選擇權腿</th><th>期貨</th><th>狀態</th></tr></thead>
+          <tbody id="strategy-body"></tbody>
+        </table>
+      </div>
+      <p class="table-footnote">* 逐 TAIFEX 交易日以固定預留資金計算日報酬後連乘；包含目前尚未結束的夜盤／交易日 mark。多空比例是選擇權絕對口數占比，不是 Delta、Vega、名目本金、權利金或保證金占比。</p>
+    </section>
+
+    <section class="grid-two compact">
+      <article class="panel">
+        <div class="panel-head"><div><h2>稽核筆數</h2><p>由 append-only 帳本直接統計</p></div></div>
+        <dl class="detail-list two-col">
+          <div><dt>理想成交 legs</dt><dd id="count-trades">—</dd></div>
+          <div><dt>每分鐘 marks</dt><dd id="count-marks">—</dd></div>
+          <div><dt>模型校準</dt><dd id="count-calibrations">—</dd></div>
+          <div><dt>引擎事件</dt><dd id="count-events">—</dd></div>
+        </dl>
+      </article>
+      <article class="panel methodology">
+        <div class="panel-head"><div><h2>資料與限制</h2><p>面板為唯讀，不參與交易決策</p></div></div>
+        <ul>
+          <li><code>status.json</code>：5 秒粒度。</li>
+          <li>TX／TMF／TXO 日盤 08:30 起接收盤前試撮、08:45–13:45 連續交易；夜盤 14:50 起接收盤前試撮、15:00–05:00 連續交易。</li>
+          <li>盤前試撮五檔會保存，但 <code>simtrade=true</code> 不可當作成交；理想帳只在連續交易取得非試撮、未過期且數量足夠的五檔時成交。</li>
+          <li>13:45–14:50 與 05:00–08:30 為休市監控空窗；supervisor 保持在線，但不會偽造委託或成交。</li>
+          <li><code>marks.jsonl</code>：1 分鐘粒度，圖表最多顯示最近 360 點。</li>
+          <li>「最小一單位」是可執行策略配方，不一定只有一腿；例如 Strap 的一單位含 2 Call + 1 Put。</li>
+          <li>方向／波動／避險型態是策略 payoff 與目標分類；「中性對沖目標」不代表目前實測 Delta 恰為零。</li>
+          <li>「設計多空比」由最小策略配方計算；「實際多空比」由目前理想帳持倉計算，兩者都只按選擇權口數。</li>
+          <li>預留資金是每個策略帳本固定的 <code>initial_capital_twd</code>；固定資金報酬 = 累積淨損益 ÷ 預留資金。</li>
+          <li>複利只在 TAIFEX 交易日之間發生：∏(1 + 當日損益增量 ÷ 固定預留資金) − 1；目前交易日是未結算即時值。</li>
+          <li>預留資金合計假設 53 個策略各自獨立部署，不宣稱可共用擔保品或享有價差／SPAN 折抵。</li>
+          <li>進場買 Ask／賣 Bid；清算多單賣 Bid、空單買 Ask，數量需由五檔顯示量完整承接。</li>
+          <li>裸賣逐腿使用 TXO 單一部位保證金，不假設尚未驗證的價差或 SPAN 折抵。</li>
+          <li>任一持倉腿缺報價時，只延用完全相同持倉指紋的上一筆完整清算值，並標示 CARRIED。</li>
+          <li>永豐模擬帳戶只鏡射共用參考 Straddle 與既有六模型期貨；其他策略為可歸屬的 Bid/Ask 理想帳。</li>
+        </ul>
+      </article>
+    </section>
+
+    <section class="panel strategy-guide" aria-labelledby="strategy-guide-title">
+      <div class="panel-head">
+        <div>
+          <h2 id="strategy-guide-title">所有策略怎麼做</h2>
+          <p id="strategy-guide-summary">依分類載入策略規則、進出場、風險與目前可執行層級</p>
+        </div>
+        <label>分類
+          <select id="strategy-category-filter" aria-label="篩選策略分類">
+            <option value="">全部分類</option>
+          </select>
+        </label>
+      </div>
+      <div id="strategy-guide-grid" class="strategy-guide-grid"></div>
+    </section>
+  </main>
+  <script src="app.js" defer></script>
+</body>
+</html>

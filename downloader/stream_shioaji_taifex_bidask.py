@@ -23,6 +23,16 @@ from downloader.stream_shioaji_tw_microstructure import (
     normalize_fop_book,
     normalize_fop_tick,
 )
+from stockagent.research.taifex_volatility_metadata import (
+    CATALOG_EXPANSION_ENTRY_NEXT_CYCLE,
+    CATALOG_EXPANSION_ENTRY_POLICIES,
+    STRATEGY_MODE_DAILY,
+    STRATEGY_MODES,
+)
+from stockagent.data.taifex_sessions import (
+    taifex_session_kind,
+    taifex_trading_date,
+)
 
 
 SOURCE_NAME = "shioaji_taifex_tick_bidask_v1"
@@ -54,6 +64,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--strikes-per-expiry", type=int, default=100)
     parser.add_argument("--underlying-reference", type=float, default=None)
     parser.add_argument("--stop-time", default="13:45:05")
+    parser.add_argument(
+        "--stop-at",
+        default="",
+        help="Explicit timezone-aware ISO stop timestamp; supports night capture.",
+    )
+    parser.add_argument("--trade-date", type=date.fromisoformat, default=None)
+    parser.add_argument("--capture-session", choices=("day", "night"), default=None)
     parser.add_argument("--queue-size", type=int, default=250_000)
     parser.add_argument("--flush-rows", type=int, default=50_000)
     parser.add_argument("--flush-seconds", type=float, default=10.0)
@@ -64,7 +81,7 @@ def parse_args() -> argparse.Namespace:
         "--execute-strategies",
         action="store_true",
         help=(
-            "run the seven-strategy Shioaji simulation engine on worker 0; "
+            "run the catalogued-strategy Shioaji simulation engine on worker 0; "
             "requires --simulation"
         ),
     )
@@ -82,6 +99,38 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--strategy-calibration-time", default="13:29:00")
     parser.add_argument("--strategy-bootstrap-after", default="")
+    parser.add_argument(
+        "--strategy-mode",
+        choices=STRATEGY_MODES,
+        default=STRATEGY_MODE_DAILY,
+    )
+    parser.add_argument("--strategy-intraday-interval-seconds", type=int, default=60)
+    parser.add_argument("--strategy-intraday-entry-cutoff", default="13:20:00")
+    parser.add_argument("--strategy-intraday-flatten-time", default="13:35:00")
+    parser.add_argument(
+        "--strategy-night-entry-cutoff", default="04:40:00"
+    )
+    parser.add_argument(
+        "--strategy-night-flatten-time", default="04:55:00"
+    )
+    parser.add_argument(
+        "--strategy-option-risk-margin-a-twd", type=float, default=169_000.0
+    )
+    parser.add_argument(
+        "--strategy-option-risk-margin-b-twd", type=float, default=85_000.0
+    )
+    parser.add_argument(
+        "--strategy-capital-buffer-multiple", type=float, default=2.0
+    )
+    parser.add_argument(
+        "--strategy-catalog-expansion-entry-policy",
+        choices=CATALOG_EXPANSION_ENTRY_POLICIES,
+        default=CATALOG_EXPANSION_ENTRY_NEXT_CYCLE,
+        help=(
+            "whether newly added catalogue strategies wait for the next weekly "
+            "cycle or enter from the first complete fresh live book"
+        ),
+    )
     parser.add_argument("--capture-id", default="")
     parser.add_argument("--worker-index", type=int, default=0)
     parser.add_argument("--workers", type=int, default=1)
@@ -323,10 +372,15 @@ def _metadata(info: Any, *, logical_code: str | None = None) -> dict[str, Any]:
     return row
 
 
-def _stop_datetime(value: str) -> datetime:
-    parsed = datetime_time.fromisoformat(value)
+def _stop_datetime(*, stop_time: str, stop_at: str) -> datetime:
+    if str(stop_at).strip():
+        parsed_at = datetime.fromisoformat(str(stop_at).strip())
+        if parsed_at.tzinfo is None:
+            raise ValueError("--stop-at must include an explicit timezone offset")
+        return parsed_at.astimezone(TAIPEI)
+    parsed_time = datetime_time.fromisoformat(stop_time)
     now = datetime.now(TAIPEI)
-    return datetime.combine(now.date(), parsed, tzinfo=TAIPEI)
+    return datetime.combine(now.date(), parsed_time, tzinfo=TAIPEI)
 
 
 def main() -> int:
@@ -348,9 +402,21 @@ def main() -> int:
     import shioaji as sj
 
     started_at = datetime.now(timezone.utc)
-    stop_at = _stop_datetime(args.stop_time)
+    observed_start = datetime.now(TAIPEI)
+    stop_at = _stop_datetime(stop_time=args.stop_time, stop_at=args.stop_at)
     if stop_at <= datetime.now(TAIPEI):
-        raise RuntimeError(f"stop time has already passed for today: {stop_at}")
+        raise RuntimeError(f"capture stop timestamp has already passed: {stop_at}")
+    capture_session = (
+        str(args.capture_session)
+        if args.capture_session is not None
+        else taifex_session_kind(observed_start, include_preopen=True)
+    )
+    if capture_session not in {"day", "night"}:
+        raise RuntimeError(
+            "capture starts outside a TAIFEX session; pass --capture-session "
+            "only from a scheduled pre-open window"
+        )
+    capture_trade_date = args.trade_date or taifex_trading_date(observed_start)
     shutdown = threading.Event()
     event_sequence = itertools.count(1)
     sink = EventSink(
@@ -434,7 +500,7 @@ def main() -> int:
     max_contracts = int(args.workers) * 100
     selected_option_infos = select_balanced_option_strips(
         option_infos,
-        trade_date=datetime.now(TAIPEI).date(),
+        trade_date=capture_trade_date,
         underlying_reference=reference,
         monthly_expiry_count=int(args.option_expiries),
         weekly_expiry_count=int(args.weekly_expiries),
@@ -485,6 +551,18 @@ def main() -> int:
         calibration_time = datetime_time.fromisoformat(
             str(args.strategy_calibration_time)
         )
+        intraday_entry_cutoff = datetime_time.fromisoformat(
+            str(args.strategy_intraday_entry_cutoff)
+        )
+        intraday_flatten_time = datetime_time.fromisoformat(
+            str(args.strategy_intraday_flatten_time)
+        )
+        night_entry_cutoff = datetime_time.fromisoformat(
+            str(args.strategy_night_entry_cutoff)
+        )
+        night_flatten_time = datetime_time.fromisoformat(
+            str(args.strategy_night_flatten_time)
+        )
         strategy_engine = TaifexVolatilitySimulation(
             api=api,
             shioaji_module=sj,
@@ -506,6 +584,26 @@ def main() -> int:
             calibration_time=calibration_time,
             bootstrap_after=bootstrap_after,
             broker_orders_enabled=True,
+            strategy_mode=str(args.strategy_mode),
+            intraday_decision_interval_seconds=int(
+                args.strategy_intraday_interval_seconds
+            ),
+            intraday_entry_cutoff=intraday_entry_cutoff,
+            intraday_flatten_time=intraday_flatten_time,
+            night_entry_cutoff=night_entry_cutoff,
+            night_flatten_time=night_flatten_time,
+            option_risk_margin_a_twd=float(
+                args.strategy_option_risk_margin_a_twd
+            ),
+            option_risk_margin_b_twd=float(
+                args.strategy_option_risk_margin_b_twd
+            ),
+            strategy_capital_buffer_multiple=float(
+                args.strategy_capital_buffer_multiple
+            ),
+            catalog_expansion_entry_policy=str(
+                args.strategy_catalog_expansion_entry_policy
+            ),
         )
         api.set_order_callback(strategy_engine.on_order_event)
 
@@ -603,7 +701,8 @@ def main() -> int:
             "simulation": bool(args.simulation),
             "worker_index": int(args.worker_index),
             "workers": int(args.workers),
-            "trade_date": datetime.now(TAIPEI).date().isoformat(),
+            "trade_date": capture_trade_date.isoformat(),
+            "capture_session": capture_session,
             "selection": {
                 "future_code": str(args.future_code),
                 "resolved_future_code": str(getattr(future_base, "code")),
@@ -638,17 +737,40 @@ def main() -> int:
             "strategy_simulation": {
                 "enabled": bool(args.execute_strategies),
                 "simulation_only": True,
+                "strategy_mode": str(args.strategy_mode),
+                "catalog_expansion_entry_policy": str(
+                    args.strategy_catalog_expansion_entry_policy
+                ),
+                "strategy_capital_buffer_multiple": float(
+                    args.strategy_capital_buffer_multiple
+                ),
+                "intraday_decision_interval_seconds": int(
+                    args.strategy_intraday_interval_seconds
+                ),
+                "night_entry_cutoff": str(args.strategy_night_entry_cutoff),
+                "night_flatten_time": str(args.strategy_night_flatten_time),
                 "state_dir": str(args.strategy_state_dir),
                 "status_path": str(Path(args.strategy_state_dir) / "status.json"),
             },
         }
-        manifest_path = (
+        manifest_root = (
             args.output_dir
             / "manifests"
-            / f"trade_date={datetime.now(TAIPEI).date()}"
+            / f"trade_date={capture_trade_date.isoformat()}"
+        )
+        manifest_path = (
+            manifest_root
+            / f"session={capture_session}"
             / f"worker={int(args.worker_index):02d}.json"
         )
         _atomic_json(manifest_path, manifest)
+        # Preserve the historical day-only manifest path for consumers that
+        # have not yet opted into grouped day/night loading.
+        if capture_session == "day":
+            _atomic_json(
+                manifest_root / f"worker={int(args.worker_index):02d}.json",
+                manifest,
+            )
         print(
             f"[shioaji-taifex] status={status} ticks={stats.tick_events} "
             f"books={stats.book_events} dropped={stats.dropped_events} "

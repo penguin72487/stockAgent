@@ -4,12 +4,16 @@ import subprocess
 import sys
 from datetime import date, datetime, time
 from decimal import Decimal
+import json
 from pathlib import Path
 
 import polars as pl
 
 from downloader.build_tw_top_market_cap_universe import build_universe
-from downloader.shioaji_capture_parts import select_capture_part_paths
+from downloader.shioaji_capture_parts import (
+    read_capture_manifest_groups,
+    select_capture_part_paths,
+)
 from downloader.stream_shioaji_tw_microstructure import (
     BOOK_SCHEMA,
     PartWriter,
@@ -408,6 +412,35 @@ def test_capture_part_selection_excludes_same_day_previous_run(tmp_path: Path) -
     )
 
     assert selected == [current]
+
+
+def test_capture_manifest_groups_prefer_session_receipts_over_day_mirror(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "manifests" / "trade_date=2026-08-12"
+    for session, capture_id in (("day", "day_capture"), ("night", "night_capture")):
+        target = root / f"session={session}"
+        target.mkdir(parents=True)
+        (target / "worker=00.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 3,
+                    "capture_id": capture_id,
+                    "worker_index": 0,
+                }
+            )
+        )
+    (root / "worker=00.json").write_text(
+        (root / "session=day" / "worker=00.json").read_text()
+    )
+
+    groups = read_capture_manifest_groups(tmp_path, "2026-08-12")
+
+    assert [session for session, _manifests in groups] == ["night", "day"]
+    assert [manifests[0]["capture_id"] for _session, manifests in groups] == [
+        "night_capture",
+        "day_capture",
+    ]
 
 
 def test_legacy_capture_part_selection_uses_manifest_write_window(

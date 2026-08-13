@@ -14,4 +14,4 @@ source "$FUTURES_ENV_FILE"
 set +a
 
 source scripts/runtime_env.sh
-run_fintech_python scripts/test_shioaji_futures_simulation_lifecycle.py "$@"
+run_fintech_python -m scripts.test_shioaji_futures_simulation_lifecycle "$@"

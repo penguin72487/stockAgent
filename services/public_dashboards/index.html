@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>StockAgent 即時模擬面板</title>
+  <link rel="stylesheet" href="public.css">
+</head>
+<body>
+  <main>
+    <p class="eyebrow">STOCKAGENT · PUBLIC READ-ONLY</p>
+    <h1>即時模擬面板</h1>
+    <p class="lead">以下內容來自唯讀模擬帳本，不是實際成交、投資建議或可操作的交易介面。</p>
+    <section class="cards" aria-label="即時面板">
+      <a href="taifex/">
+        <span>TAIFEX</span>
+        <strong>期貨選擇權全策略模擬</strong>
+        <small>Bid/Ask 理想帳、53 條即時策略曲線與風險說明</small>
+      </a>
+      <a href="tw-day-trade/">
+        <span>TW STOCKS</span>
+        <strong>台股四模式當沖模擬</strong>
+        <small>訊號、模擬成交、持倉生命週期與分鐘權益</small>
+      </a>
+    </section>
+    <aside>
+      <strong>公開安全邊界</strong>
+      <p>正式下單永遠不可用；內部檔案路徑、broker 委託識別碼與執行識別碼不會出現在公開 API。資料延遲或缺少可成交報價時，面板會明確顯示 stale、blocked 或 carried。</p>
+    </aside>
+  </main>
+</body>
+</html>

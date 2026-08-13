@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import threading
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
@@ -28,6 +29,7 @@ from stockagent.live.portfolio_state import (
 )
 from stockagent.live.quote_provider import (
     PriceSnapshot,
+    fetch_shioaji_stock_snapshots,
     fetch_tw_mis_last_prices,
     fetch_yahoo_last_prices,
     load_prices_csv,
@@ -70,11 +72,103 @@ ProgressCallback = Callable[[dict[str, Any]], None]
 _LIVE_PANEL_CACHE_MAX_ENTRIES = 3
 _LIVE_PANEL_CACHE: OrderedDict[str, PanelData] = OrderedDict()
 _LIVE_PANEL_CACHE_LOCK = threading.Lock()
+_LIVE_CHECKPOINT_CACHE_MAX_ENTRIES = 8
+_LIVE_CHECKPOINT_CACHE: OrderedDict[str, dict[str, Any]] = OrderedDict()
+_LIVE_CHECKPOINT_CACHE_LOCK = threading.Lock()
+_LIVE_MODEL_CACHE_MAX_ENTRIES = 8
+_LIVE_MODEL_CACHE: OrderedDict[str, torch.nn.Module] = OrderedDict()
+_LIVE_MODEL_CACHE_LOCK = threading.Lock()
 
 
 def clear_live_panel_memory_cache() -> None:
     with _LIVE_PANEL_CACHE_LOCK:
         _LIVE_PANEL_CACHE.clear()
+
+
+def clear_live_inference_memory_cache() -> None:
+    """Clear panel, checkpoint, and GPU-model caches after a deployment change."""
+
+    clear_live_panel_memory_cache()
+    with _LIVE_CHECKPOINT_CACHE_LOCK:
+        _LIVE_CHECKPOINT_CACHE.clear()
+    with _LIVE_MODEL_CACHE_LOCK:
+        _LIVE_MODEL_CACHE.clear()
+
+
+def _checkpoint_cache_key(path: Path) -> str:
+    stat = path.stat()
+    return f"{path.resolve()}:{stat.st_size}:{stat.st_mtime_ns}:{stat.st_ctime_ns}"
+
+
+def _cached_checkpoint(path: Path) -> tuple[dict[str, Any], str, bool]:
+    key = _checkpoint_cache_key(path)
+    with _LIVE_CHECKPOINT_CACHE_LOCK:
+        payload = _LIVE_CHECKPOINT_CACHE.get(key)
+        if payload is not None:
+            _LIVE_CHECKPOINT_CACHE.move_to_end(key)
+            return payload, key, True
+    payload = load_checkpoint(path)
+    with _LIVE_CHECKPOINT_CACHE_LOCK:
+        _LIVE_CHECKPOINT_CACHE[key] = payload
+        _LIVE_CHECKPOINT_CACHE.move_to_end(key)
+        while len(_LIVE_CHECKPOINT_CACHE) > _LIVE_CHECKPOINT_CACHE_MAX_ENTRIES:
+            _LIVE_CHECKPOINT_CACHE.popitem(last=False)
+    return payload, key, False
+
+
+def _model_cache_key(
+    *,
+    checkpoint_key: str,
+    runtime_device: torch.device,
+    panel: PanelData,
+    lookback: int,
+) -> str:
+    digest = hashlib.sha256()
+    digest.update(checkpoint_key.encode("utf-8"))
+    digest.update(str(runtime_device).encode("utf-8"))
+    digest.update(str(int(lookback)).encode("ascii"))
+    digest.update("\0".join(panel.feature_names).encode("utf-8"))
+    digest.update("\0".join(panel.symbols).encode("utf-8"))
+    return digest.hexdigest()
+
+
+def _cached_live_model(
+    *,
+    config: ExperimentConfig,
+    checkpoint_key: str,
+    state_dict: dict[str, Any],
+    panel: PanelData,
+    runtime_device: torch.device,
+) -> tuple[torch.nn.Module, bool]:
+    key = _model_cache_key(
+        checkpoint_key=checkpoint_key,
+        runtime_device=runtime_device,
+        panel=panel,
+        lookback=config.training.lookback,
+    )
+    with _LIVE_MODEL_CACHE_LOCK:
+        cached = _LIVE_MODEL_CACHE.get(key)
+        if cached is not None:
+            _LIVE_MODEL_CACHE.move_to_end(key)
+            return cached, True
+        model = build_model(
+            config=config,
+            lookback=config.training.lookback,
+            num_features=len(panel.feature_names),
+            num_symbols=panel.num_symbols,
+            feature_names=panel.feature_names,
+        ).to(runtime_device)
+        load_model_state_dict(
+            model,
+            state_dict,
+            strict_no_fallback=bool(config.training.strict_no_fallback),
+        )
+        model.eval()
+        _LIVE_MODEL_CACHE[key] = model
+        _LIVE_MODEL_CACHE.move_to_end(key)
+        while len(_LIVE_MODEL_CACHE) > _LIVE_MODEL_CACHE_MAX_ENTRIES:
+            _LIVE_MODEL_CACHE.popitem(last=False)
+        return model, False
 
 
 def _live_panel_cache_key(
@@ -693,6 +787,21 @@ def _price_snapshot(
             parquet_root=parquet_root,
             chunk_size=yahoo_chunk_size,
         )
+    if source_norm in {"shioaji", "sj", "sinopac", "永豐"}:
+        return fetch_shioaji_stock_snapshots(
+            symbols,
+            fallback_prices,
+            cache_ttl_seconds=max(
+                0.0,
+                float(
+                    os.getenv(
+                        "STOCKAGENT_SHIOAJI_SIGNAL_CACHE_SECONDS",
+                        "15",
+                    )
+                    or "15"
+                ),
+            ),
+        )
     if source_norm in {"tw", "twse", "tpex", "mis", "tw_mis"}:
         snapshot = fetch_tw_mis_last_prices(
             symbols,
@@ -708,7 +817,9 @@ def _price_snapshot(
                 available_mask=np.zeros((len(symbols),), dtype=bool),
             )
         return snapshot
-    raise ValueError(f"price_source must be one of panel/csv/yahoo/tw, got {source!r}")
+    raise ValueError(
+        f"price_source must be one of panel/csv/yahoo/tw/shioaji, got {source!r}"
+    )
 
 
 def _write_outputs(result: LiveSignalResult, output_root: str | Path, asof_date: str) -> str:
@@ -1590,6 +1701,9 @@ def generate_live_signal(
     include_unconstrained_raw_scores: bool = False,
     _panel_override: PanelData | None = None,
 ) -> LiveSignalResult:
+    signal_started = time.perf_counter()
+    quote_latency_ms = 0.0
+    inference_latency_ms = 0.0
     progress_total = 17
     progress_name = str(progress_label or f"live-signal:{market or 'default'}").strip()
     _emit_progress(progress_callback, label=progress_name, step=1, total=progress_total, message="load config")
@@ -1625,8 +1739,14 @@ def generate_live_signal(
     amp_dtype = resolve_amp_dtype(config.environment.amp_dtype)
     non_blocking = bool(config.training.non_blocking_transfer and runtime_device.type == "cuda")
 
-    checkpoint_payload = load_checkpoint(checkpoint)
-    _emit_progress(progress_callback, label=progress_name, step=3, total=progress_total, message="checkpoint loaded")
+    checkpoint_payload, checkpoint_cache_key, checkpoint_cache_hit = _cached_checkpoint(checkpoint)
+    _emit_progress(
+        progress_callback,
+        label=progress_name,
+        step=3,
+        total=progress_total,
+        message=f"checkpoint loaded cache_hit={checkpoint_cache_hit}",
+    )
     state_dict = checkpoint_payload.get("model_state_dict")
     if not isinstance(state_dict, dict):
         raise ValueError(f"Checkpoint does not contain model_state_dict: {checkpoint}")
@@ -1677,6 +1797,7 @@ def generate_live_signal(
     )
 
     panel_prices = np.asarray(panel.close_prices[panel_idx], dtype=np.float64)
+    quote_started = time.perf_counter()
     price_snapshot = _price_snapshot(
         source=price_source,
         symbols=panel.symbols,
@@ -1685,6 +1806,7 @@ def generate_live_signal(
         prices_csv=prices_csv,
         yahoo_chunk_size=yahoo_chunk_size,
     )
+    quote_latency_ms = (time.perf_counter() - quote_started) * 1000.0
     if str(price_snapshot.source).startswith("panel_close:fallback_tw_mis_unavailable"):
         quote_notice = (
             "TWSE/TPEx MIS 本次未回傳任何盤中報價；本訊號明確改用最後完整收盤價，"
@@ -1702,6 +1824,19 @@ def generate_live_signal(
         quote_notice = (
             f"TWSE/TPEx MIS 即時報價覆蓋 {price_snapshot.available_count}/{panel.num_symbols}；"
             "未取得報價的標的沿用最後完整收盤價。"
+        )
+        market_notice = (
+            f"{str(market_notice).strip()} {quote_notice}".strip()
+            if market_notice
+            else quote_notice
+        )
+    elif (
+        str(price_snapshot.source).startswith("shioaji:")
+        and int(price_snapshot.available_count) < int(panel.num_symbols)
+    ):
+        quote_notice = (
+            f"永豐 Shioaji snapshot 覆蓋 {price_snapshot.available_count}/{panel.num_symbols}；"
+            "未取得 snapshot 的標的沿用最後完整收盤價，且沒有開盤價者不進入本次模型可交易遮罩。"
         )
         market_notice = (
             f"{str(market_notice).strip()} {quote_notice}".strip()
@@ -1847,20 +1982,20 @@ def generate_live_signal(
     drift = estimate_drifted_weights(previous_weights, drift_base_prices, current_prices)
     _emit_progress(progress_callback, label=progress_name, step=10, total=progress_total, message="mark previous holdings")
 
-    model = build_model(
+    model, model_cache_hit = _cached_live_model(
         config=config,
-        lookback=config.training.lookback,
-        num_features=len(panel.feature_names),
-        num_symbols=panel.num_symbols,
-        feature_names=panel.feature_names,
-    ).to(runtime_device)
-    load_model_state_dict(
-        model,
-        state_dict,
-        strict_no_fallback=bool(config.training.strict_no_fallback),
+        checkpoint_key=checkpoint_cache_key,
+        state_dict=state_dict,
+        panel=panel,
+        runtime_device=runtime_device,
     )
-    model.eval()
-    _emit_progress(progress_callback, label=progress_name, step=11, total=progress_total, message="model ready")
+    _emit_progress(
+        progress_callback,
+        label=progress_name,
+        step=11,
+        total=progress_total,
+        message=f"model ready cache_hit={model_cache_hit}",
+    )
 
     start = panel_idx - int(config.training.lookback) + 1
     raw_model_window = (
@@ -1921,6 +2056,7 @@ def generate_live_signal(
     unconstrained_aux: dict[str, torch.Tensor] | None = None
     unconstrained_raw_score_tensor: torch.Tensor | None = None
     unconstrained_raw_score_source: str | None = None
+    inference_started = time.perf_counter()
     with torch.inference_mode():
         x = torch.from_numpy(x_np).unsqueeze(0).to(device=runtime_device, non_blocking=non_blocking)
         mask = torch.from_numpy(mask_np).unsqueeze(0).to(device=runtime_device, non_blocking=non_blocking)
@@ -2037,6 +2173,9 @@ def generate_live_signal(
             target_weights = backtest.final_weights.detach().float().cpu().numpy().astype(np.float64)
             turnover = float(backtest.turnovers[0].detach().float().cpu().item())
             estimated_trade_cost = -float(backtest.strategy_returns[0].detach().float().cpu().item())
+    if runtime_device.type == "cuda":
+        torch.cuda.synchronize(runtime_device)
+    inference_latency_ms = (time.perf_counter() - inference_started) * 1000.0
     _emit_progress(progress_callback, label=progress_name, step=13, total=progress_total, message="trading constraints applied")
 
     if execution_preview_only:
@@ -2301,6 +2440,16 @@ def generate_live_signal(
         "price_data_date": price_timestamp,
         "price_available_count": int(price_snapshot.available_count),
         "opening_price_available_count": opening_price_available_count,
+        "live_latency": {
+            "schema_version": 1,
+            "checkpoint_cache_hit": bool(checkpoint_cache_hit),
+            "model_cache_hit": bool(model_cache_hit),
+            "quote_fetch_ms": round(float(quote_latency_ms), 3),
+            "model_inference_ms": round(float(inference_latency_ms), 3),
+            "compute_before_publish_ms": round(
+                float((time.perf_counter() - signal_started) * 1000.0), 3
+            ),
+        },
         "signal_price_contract": {
             "schema_version": 1,
             "model_observation": "session_open" if session_open_signal else "completed_panel",

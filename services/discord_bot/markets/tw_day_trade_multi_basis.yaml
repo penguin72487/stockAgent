@@ -5,16 +5,21 @@ market_type: tw
 timezone: Asia/Taipei
 open_time: "09:00"
 close_time: "13:30"
+schedule_time: "09:00"
+preopen_prepare_time: "08:30"
 summary_time: "14:00"
 data_ready_time: "13:40"
 freshness_max_lag_days: 3
 freshness_scan_limit: 0
 holidays: []
 initial_capital: 10000000.0
+day_trade_simulation_enabled: true
+day_trade_simulation_state_dir: artifacts/live/tw_day_trade_simulation
+day_trade_rule_data_dir: /srv/stockagent-live/data_tw_public
+day_trade_quote_interval_seconds: 60
 
-# This model shares the canonical TW public data layer with the other TW
-# day-trade modes. Users opt in through commands/subscriptions; it has no
-# independent automatic broadcast schedule.
+# This model shares the canonical TW public data layer with the other modes.
+# 09:00 is a gate; entry uses a causally later executable best quote.
 pre_signal_command:
   - "{python}"
   - scripts/refresh_tw_public_live_snapshot.py

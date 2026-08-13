@@ -24,7 +24,7 @@ import numpy as np
 import polars as pl
 
 from stockagent.data.shioaji_capture_parts import (
-    read_capture_manifests,
+    read_capture_manifest_groups,
     select_capture_part_paths,
     shared_capture_id,
 )
@@ -1007,48 +1007,66 @@ def _load_bidask_capture_day(
     capture_root: Path,
     trading_date: date,
 ) -> tuple[pl.DataFrame, list[dict[str, Any]], dict[str, Any]]:
-    manifests = read_capture_manifests(capture_root, trading_date.isoformat())
-    if not manifests:
+    groups = read_capture_manifest_groups(capture_root, trading_date.isoformat())
+    if not groups:
         raise ValueError(f"FOP capture manifests are missing for {trading_date}")
-    manifest_dir = (
+    base_manifest_dir = (
         capture_root / "manifests" / f"trade_date={trading_date.isoformat()}"
     )
-    for manifest in manifests:
-        if manifest.get("source") != "shioaji_taifex_tick_bidask_v1":
-            raise ValueError(f"unexpected FOP capture source: {manifest_dir}")
-        if manifest.get("status") != "complete":
-            raise ValueError(f"FOP capture is not complete: {manifest_dir}")
-        if int(manifest.get("dropped_events", -1)) != 0:
-            raise ValueError(f"FOP capture recorded dropped events: {manifest_dir}")
-    metadata = [
-        row
-        for manifest in manifests
-        for row in manifest.get("contract_metadata", [])
-        if isinstance(row, dict)
-    ]
+    metadata_by_code: dict[str, dict[str, Any]] = {}
+    all_paths: list[Path] = []
+    manifest_paths: list[Path] = []
+    capture_ids: list[str] = []
+    sessions: list[str] = []
+    for session, manifests in groups:
+        manifest_dir = (
+            base_manifest_dir / f"session={session}"
+            if session is not None
+            else base_manifest_dir
+        )
+        for manifest in manifests:
+            if manifest.get("source") != "shioaji_taifex_tick_bidask_v1":
+                raise ValueError(f"unexpected FOP capture source: {manifest_dir}")
+            if manifest.get("status") != "complete":
+                raise ValueError(f"FOP capture is not complete: {manifest_dir}")
+            if int(manifest.get("dropped_events", -1)) != 0:
+                raise ValueError(
+                    f"FOP capture recorded dropped events: {manifest_dir}"
+                )
+            for row in manifest.get("contract_metadata", []):
+                if isinstance(row, dict) and row.get("code"):
+                    metadata_by_code[str(row["code"])] = row
+        all_paths.extend(
+            select_capture_part_paths(
+                capture_root=capture_root,
+                kind="book_events",
+                trade_date=trading_date.isoformat(),
+                manifests=manifests,
+            )
+        )
+        manifest_paths.extend(sorted(manifest_dir.glob("worker=*.json")))
+        capture_id = shared_capture_id(manifests)
+        if capture_id is not None:
+            capture_ids.append(capture_id)
+        sessions.append(session or "legacy")
+    metadata = list(metadata_by_code.values())
     if not metadata:
-        raise ValueError(f"FOP capture has no contract metadata: {manifest_dir}")
-    paths = select_capture_part_paths(
-        capture_root=capture_root,
-        kind="book_events",
-        trade_date=trading_date.isoformat(),
-        manifests=manifests,
+        raise ValueError(f"FOP capture has no contract metadata: {base_manifest_dir}")
+    part_hashes = {str(path): _sha256_path(path) for path in all_paths}
+    books = pl.concat(
+        [pl.read_parquet(path) for path in all_paths], how="vertical_relaxed"
     )
-    part_hashes = {str(path): _sha256_path(path) for path in paths}
-    books = pl.concat([pl.read_parquet(path) for path in paths], how="vertical_relaxed")
-    manifest_paths = sorted(manifest_dir.glob("worker=*.json"))
     evidence = {
         "manifest_path": str(manifest_paths[0]),
         "manifest_sha256": _sha256_path(manifest_paths[0]),
-        "manifest_paths": [
-            str(manifest_dir / f"worker={int(item['worker_index']):02d}.json")
-            for item in manifests
-        ],
+        "manifest_paths": [str(path) for path in manifest_paths],
         "manifest_sha256_by_path": {
             str(path): _sha256_path(path)
             for path in manifest_paths
         },
-        "capture_id": str(shared_capture_id(manifests)),
+        "capture_id": capture_ids[0] if len(capture_ids) == 1 else None,
+        "capture_ids": capture_ids,
+        "capture_sessions": sessions,
         "book_part_sha256": part_hashes,
         "book_rows": books.height,
     }

@@ -61,6 +61,27 @@ def test_downloader_command_keeps_every_mutable_output_in_live_tree(
     )
 
 
+def test_same_session_rule_command_targets_today_without_overwriting_parent_metadata(
+    tmp_path: Path,
+) -> None:
+    live_root = tmp_path / "live" / "data_tw_public"
+    command = refresh._same_session_rule_command(
+        python="python",
+        live_root=live_root,
+        trading_date="2026-08-13",
+    )
+
+    assert command[command.index("--datasets") + 1 : command.index("--end-date")] == [
+        "twse_day_trade_eligibility",
+        "tpex_day_trade_eligibility",
+    ]
+    assert command[command.index("--end-date") + 1] == "2026-08-13"
+    assert command[command.index("--same-session-rule-date") + 1] == "2026-08-13"
+    assert Path(command[command.index("--output-dir") + 1]) == live_root
+    assert "--require-taiex-session-calendar" in command
+    assert "--no-write-run-metadata" in command
+
+
 def test_audit_command_reads_only_the_mutable_live_tree(tmp_path: Path) -> None:
     live_root = tmp_path / "live" / "data_tw_public"
     output_dir = tmp_path / "audit"

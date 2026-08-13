@@ -29,7 +29,10 @@ import numpy as np
 from stockagent.backtest.tw_commission_rebate import (
     normalize_commission_rebate_timing,
 )
-from stockagent.backtest.tw_execution import normalize_fee_rounding
+from stockagent.backtest.tw_execution import (
+    normalize_fee_rounding,
+    preserve_directional_lot_mix,
+)
 
 
 ExecutionMode = Literal["tw_cash", "tw_day_trade"]
@@ -3615,6 +3618,17 @@ def run_tw_day_trade_integer(
                     * (turnover_budget / opening_round_trip_notional),
                     lots,
                 )
+        # Whole-lot rounding and point-in-time side masks may otherwise turn a
+        # two-sided model target into a materially different one-sided trade.
+        # Preserve the model's requested long/short mix by reducing only the
+        # better-filled side; never manufacture a missing lot on the weak side.
+        quantities, _directional_mix_audit = preserve_directional_lot_mix(
+            targets[t],
+            quantities,
+            open_row,
+            lots,
+            capital=nav_before_trade,
+        )
         signed_positions = np.sign(targets[t]).astype(np.int64) * quantities
 
         long_mask = signed_positions > 0
