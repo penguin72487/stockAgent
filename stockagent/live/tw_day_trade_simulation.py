@@ -1,4 +1,4 @@
-"""Durable four-mode Taiwan stock day-trade paper execution.
+"""Durable multi-mode Taiwan stock day-trade paper execution.
 
 The signal producer and this executor deliberately remain separate.  A signal
 artifact is an immutable model decision; this module observes a causally later
@@ -39,7 +39,7 @@ from stockagent.data.tw_index_futures import (
     TAIFEX_INDEX_FUTURES_FEE_PER_SIDE_TWD,
     TAIFEX_INDEX_FUTURES_MULTIPLIERS,
 )
-from stockagent.data.tw_price_rules import limit_price_numpy
+from stockagent.data.tw_price_rules import limit_price_numpy, move_price_ticks_numpy
 from stockagent.live.quote_provider import PriceSnapshot
 from stockagent.research.taifex_capital_returns import taifex_initial_margin_twd
 from stockagent.research.taifex_transaction_tax import (
@@ -244,6 +244,16 @@ class ModeSpec:
     live_output_dir: Path
     fee_schedule: TaiwanFeeSchedule
     lot_size: int = 1_000
+    signal_market: str | None = None
+    price_limit_offset_ticks: int = 0
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.price_limit_offset_ticks, bool)
+            or int(self.price_limit_offset_ticks) != self.price_limit_offset_ticks
+            or int(self.price_limit_offset_ticks) < 0
+        ):
+            raise ValueError("price_limit_offset_ticks must be a non-negative integer")
 
 
 @dataclass(frozen=True, slots=True)
@@ -477,7 +487,7 @@ def quote_map_from_snapshot(
 
 
 class TwDayTradeSimulationEngine:
-    """One durable simulation ledger shared by all four day-trade modes."""
+    """One durable simulation ledger shared by all stock day-trade modes."""
 
     def __init__(self, state_dir: Path) -> None:
         self.state_dir = Path(state_dir)
@@ -863,8 +873,8 @@ class TwDayTradeSimulationEngine:
 
     def _mode(self, spec: ModeSpec) -> dict[str, Any]:
         mode = self.state.setdefault("modes", {}).setdefault(spec.market, {})
-        mode.setdefault("market", spec.market)
-        mode.setdefault("label", spec.label)
+        mode["market"] = spec.market
+        mode["label"] = spec.label
         mode.setdefault("initial_capital_twd", float(spec.initial_capital_twd))
         mode.setdefault("cumulative_realized_net_pnl_twd", 0.0)
         mode.setdefault("cumulative_commission_rebate_accrued_twd", 0.0)
@@ -878,6 +888,14 @@ class TwDayTradeSimulationEngine:
         mode["config_path"] = spec.config_path
         mode["checkpoint_path"] = spec.checkpoint_path
         mode["live_output_dir"] = str(spec.live_output_dir)
+        mode["signal_market"] = spec.signal_market or spec.market
+        mode["price_limit_offset_ticks"] = int(spec.price_limit_offset_ticks)
+        mode["bracket_price_policy"] = (
+            "inside_daily_limits_by_ticks"
+            if int(spec.price_limit_offset_ticks) > 0
+            else "full_daily_limits"
+        )
+        mode["fill_guaranteed"] = False
         return mode
 
     def update_readiness(
@@ -899,11 +917,16 @@ class TwDayTradeSimulationEngine:
                 mode["current_eligibility_coverage"] = dict(
                     current_eligibility_coverage.get(spec.market) or {}
                 )
-            if mode.get("positions") and any(
+            has_open_position = bool(mode.get("positions")) and any(
                 int(item.get("signed_shares") or 0) != 0
                 for item in mode["positions"].values()
-            ):
-                mode["engine_status"] = "active"
+            )
+            if has_open_position:
+                mode["engine_status"] = (
+                    "critical_unflattened_after_13_24"
+                    if observed.timetz().replace(tzinfo=None) >= FORCE_EXIT_TIME
+                    else "active"
+                )
             elif not checkpoint_ready:
                 mode["engine_status"] = "blocked_missing_checkpoint"
             elif str(
@@ -989,6 +1012,41 @@ class TwDayTradeSimulationEngine:
         )
         self._persist(observed)
         return "rearmed"
+
+    def retire_flat_mode(
+        self,
+        market: str,
+        *,
+        now: datetime | None = None,
+        reason: str,
+    ) -> str:
+        """Remove a mistakenly configured flat mode while preserving its logs."""
+
+        observed = _now_taipei(now)
+        normalized_market = str(market or "").strip()
+        normalized_reason = str(reason or "").strip()
+        if not normalized_market or not normalized_reason:
+            raise ValueError("retiring a simulation mode requires market and reason")
+        modes = self.state.get("modes") or {}
+        mode = modes.get(normalized_market)
+        if not isinstance(mode, dict):
+            return "absent"
+        if any(
+            int(position.get("signed_shares") or 0) != 0
+            for position in (mode.get("positions") or {}).values()
+        ):
+            raise RuntimeError(f"{normalized_market} has an open position")
+        session_date = str(mode.get("session_date") or observed.date().isoformat())
+        if self._session_has_fill(normalized_market, session_date):
+            raise RuntimeError(f"{normalized_market} has fills and cannot be retired")
+        modes.pop(normalized_market)
+        self._event(
+            "simulation_mode_retired",
+            market=normalized_market,
+            reason=normalized_reason,
+        )
+        self._persist(observed)
+        return "retired"
 
     def _session_has_fill(self, market: str, session_date: str) -> bool:
         if not self.fills_path.is_file():
@@ -1203,6 +1261,7 @@ class TwDayTradeSimulationEngine:
             requested_shares = int(plan["requested_shares"])
             filled_shares = int(plan["filled_shares"])
             top_book_capacity_shares = int(plan["top_book_capacity_shares"])
+            offset_ticks = int(spec.price_limit_offset_ticks)
             filled_weight = (
                 (1.0 if side == "long" else -1.0)
                 * filled_shares
@@ -1225,6 +1284,8 @@ class TwDayTradeSimulationEngine:
                 "recorded_at": observed.isoformat(timespec="seconds"),
                 "session_date": observed.date().isoformat(),
                 "market": spec.market,
+                "signal_market": spec.signal_market or spec.market,
+                "price_limit_offset_ticks": offset_ticks,
                 "signal_id": signal_id,
                 "signal_at": signal_at.isoformat(timespec="seconds"),
                 "symbol": symbol,
@@ -1269,6 +1330,21 @@ class TwDayTradeSimulationEngine:
             ):
                 continue
 
+            upper_bracket = float(
+                move_price_ticks_numpy(
+                    np.asarray([upper], dtype=np.float64),
+                    -offset_ticks,
+                    np.asarray([observed.date()]),
+                )[0]
+            )
+            lower_bracket = float(
+                move_price_ticks_numpy(
+                    np.asarray([lower], dtype=np.float64),
+                    offset_ticks,
+                    np.asarray([observed.date()]),
+                )[0]
+            )
+
             signed_shares = filled_shares if side == "long" else -filled_shares
             buy_rate, sell_rate, rebate_rate = fee_rates[symbol]
             entry_rate = buy_rate if side == "long" else sell_rate
@@ -1280,6 +1356,7 @@ class TwDayTradeSimulationEngine:
             position = {
                 "position_id": position_id,
                 "market": spec.market,
+                "signal_market": spec.signal_market or spec.market,
                 "session_date": observed.date().isoformat(),
                 "signal_id": signal_id,
                 "symbol": symbol,
@@ -1304,8 +1381,15 @@ class TwDayTradeSimulationEngine:
                 "commission_rebate_rate": rebate_rate,
                 "upper_limit": upper,
                 "lower_limit": lower,
-                "take_profit_price": upper if side == "long" else lower,
-                "stop_trigger_price": lower if side == "long" else upper,
+                "take_profit_price": upper_bracket if side == "long" else lower_bracket,
+                "stop_trigger_price": lower_bracket if side == "long" else upper_bracket,
+                "price_limit_offset_ticks": offset_ticks,
+                "bracket_price_policy": (
+                    "inside_daily_limits_by_ticks"
+                    if offset_ticks > 0
+                    else "full_daily_limits"
+                ),
+                "fill_guaranteed": False,
                 "take_profit_order_status": "working",
                 "stop_order_status": "armed_local_trigger",
                 "eod_limit_order_status": None,
@@ -1326,6 +1410,8 @@ class TwDayTradeSimulationEngine:
                 "recorded_at": observed.isoformat(timespec="seconds"),
                 "session_date": observed.date().isoformat(),
                 "market": spec.market,
+                "signal_market": spec.signal_market or spec.market,
+                "price_limit_offset_ticks": offset_ticks,
                 "position_id": position_id,
                 "symbol": symbol,
                 "quantity": requested_shares,
@@ -1494,7 +1580,12 @@ class TwDayTradeSimulationEngine:
                 price=take_profit,
                 quote=quote,
                 now=now,
-                reason="take_profit_full_price_limit",
+                reason=(
+                    "take_profit_inside_daily_limit_"
+                    f"{int(position.get('price_limit_offset_ticks') or 0)}_tick"
+                    if int(position.get("price_limit_offset_ticks") or 0) > 0
+                    else "take_profit_full_price_limit"
+                ),
                 order_type="LMT",
                 quantity=capacity,
             )
@@ -1524,7 +1615,12 @@ class TwDayTradeSimulationEngine:
             price=executable,
             quote=quote,
             now=now,
-            reason="stop_loss_full_price_limit_trigger",
+            reason=(
+                "stop_loss_inside_daily_limit_"
+                f"{int(position.get('price_limit_offset_ticks') or 0)}_tick_trigger"
+                if int(position.get("price_limit_offset_ticks") or 0) > 0
+                else "stop_loss_full_price_limit_trigger"
+            ),
             order_type="MKT",
             quantity=capacity,
         )
@@ -1964,8 +2060,10 @@ class TwDayTradeSimulationEngine:
                 "schedule": {
                     "signal_gate": "09:00",
                     "entry": "causally later best ask/bid, capped by displayed level-one volume",
-                    "take_profit": "full favorable daily price limit",
-                    "stop_loss": "local trigger at full adverse daily price limit then market",
+                    "take_profit": "mode-specific daily-limit LMT: full limit or configured ticks inside",
+                    "stop_loss": "mode-specific local trigger: full limit or configured ticks inside, then market",
+                    "fill_guarantee": False,
+                    "fill_caveat": "inside-limit prices improve fill probability but cannot guarantee a fill without executable counterparty volume",
                     "exit_limit": "13:20 passive top-of-book limit",
                     "force_exit": "13:24 cancel/replace market",
                     "decision_and_mark_interval_seconds": 60,
@@ -1977,6 +2075,10 @@ class TwDayTradeSimulationEngine:
                         for key in (
                             "market",
                             "label",
+                            "signal_market",
+                            "price_limit_offset_ticks",
+                            "bracket_price_policy",
+                            "fill_guaranteed",
                             "engine_status",
                             "checkpoint_ready",
                             "readiness_error",

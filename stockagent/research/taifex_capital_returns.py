@@ -26,8 +26,19 @@ TAIFEX_INITIAL_MARGIN_TWD: Final[dict[str, float]] = {
     "MTX": 159_000.0,
     "TMF": 31_800.0,
 }
+TAIFEX_MAINTENANCE_MARGIN_TWD: Final[dict[str, float]] = {
+    "TX": 488_000.0,
+    "MTX": 122_000.0,
+    "TMF": 24_400.0,
+}
+TAIFEX_CLEARING_MARGIN_TWD: Final[dict[str, float]] = {
+    "TX": 471_000.0,
+    "MTX": 117_750.0,
+    "TMF": 23_550.0,
+}
 TAIFEX_MARGIN_FIRST_TRADING_DATE: Final[date] = date(2026, 6, 19)
-TAIFEX_MARGIN_VERIFIED_THROUGH: Final[date] = date(2026, 8, 6)
+# The 2026-08-13 night session belongs to TAIFEX trading date 2026-08-14.
+TAIFEX_MARGIN_VERIFIED_THROUGH: Final[date] = date(2026, 8, 14)
 TAIFEX_MARGIN_ANNOUNCEMENT_URL: Final[str] = (
     "https://www.taifex.com.tw/cht/11/newsDetail?idx=16991&newsType=1"
 )
@@ -52,31 +63,135 @@ TAIFEX_INITIAL_MARGIN_TWD_2026_08_13: Final[dict[str, float]] = {
     "MTX": 175_250.0,
     "TMF": 35_050.0,
 }
+TAIFEX_MAINTENANCE_MARGIN_TWD_2026_08_13: Final[dict[str, float]] = {
+    "TX": 538_000.0,
+    "MTX": 134_500.0,
+    "TMF": 26_900.0,
+}
+TAIFEX_CLEARING_MARGIN_TWD_2026_08_13: Final[dict[str, float]] = {
+    "TX": 519_000.0,
+    "MTX": 129_750.0,
+    "TMF": 25_950.0,
+}
 TAIFEX_MARGIN_2026_08_13_EFFECTIVE_DATE: Final[date] = date(2026, 8, 13)
 TAIFEX_MARGIN_2026_08_13_ANNOUNCEMENT_URL: Final[str] = (
+    "https://www.taifex.com.tw/cht/11/newsDetail?idx=17259&newsType=1"
+)
+TAIFEX_MARGIN_2026_08_13_PDF_URL: Final[str] = (
     "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/"
-    "%E6%96%B0%E8%81%9E%E7%A8%BF_20260811.pdf"
+    "%E5%85%AC%E5%91%8A20260811.pdf"
 )
 TAIFEX_MARGIN_2026_08_13_PDF_SHA256: Final[str] = (
-    "43c5985b1fc2722f9f5d340945b9addca4a83a4035c3474e4a6428993d0f073f"
+    "1116e01e9dbebfdb11a3009e61da60276357677fc1f925d6c31f9c96372a792a"
+)
+TAIFEX_MARGIN_2026_08_13_CSV_URL: Final[str] = (
+    "https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/"
+    "%E4%BF%9D%E8%AD%89%E9%87%91%E8%AA%BF%E6%95%B4%E5%88%97%E8%A1%A820260811.csv"
+)
+TAIFEX_MARGIN_2026_08_13_CSV_SHA256: Final[str] = (
+    "955a04536b7ea7c99bac043f497187d64d6edf215241a2df306411ecd05bc021"
 )
 
+# TXO short-option risk-margin parameters.  C is published for spread/combined
+# position formulas; the live ideal ledger deliberately values each short leg
+# with the single-leg naked formula (premium + max(A - OTM, B)), so C is audit
+# metadata until an exact TAIFEX combination-matching executor is implemented.
+TXO_RISK_MARGIN_TWD: Final[dict[str, float]] = {
+    "A": 169_000.0,
+    "B": 85_000.0,
+    "C": 17_000.0,
+}
+TXO_RISK_MARGIN_TWD_2026_08_13: Final[dict[str, float]] = {
+    "A": 187_000.0,
+    "B": 94_000.0,
+    "C": 18_800.0,
+}
+TXO_RISK_MAINTENANCE_MARGIN_TWD: Final[dict[str, float]] = {
+    "A": 130_000.0,
+    "B": 65_000.0,
+    "C": 13_000.0,
+}
+TXO_RISK_MAINTENANCE_MARGIN_TWD_2026_08_13: Final[dict[str, float]] = {
+    "A": 143_000.0,
+    "B": 72_000.0,
+    "C": 14_400.0,
+}
+TXO_RISK_CLEARING_MARGIN_TWD: Final[dict[str, float]] = {
+    "A": 125_000.0,
+    "B": 63_000.0,
+    "C": 12_600.0,
+}
+TXO_RISK_CLEARING_MARGIN_TWD_2026_08_13: Final[dict[str, float]] = {
+    "A": 138_000.0,
+    "B": 69_000.0,
+    "C": 13_800.0,
+}
 
-def taifex_initial_margin_twd(product: object, trading_date: date) -> float:
-    """Return the official initial margin for a supported live date step."""
+
+def taifex_txo_risk_margin_twd(
+    trading_date: date, *, level: str = "initial"
+) -> dict[str, float]:
+    """Return official TXO A/B/C parameters for an account margin level."""
+
+    if not isinstance(trading_date, date):
+        raise TypeError("trading_date must be a datetime.date")
+    normalized_level = str(level).strip().lower()
+    before = {
+        "initial": TXO_RISK_MARGIN_TWD,
+        "maintenance": TXO_RISK_MAINTENANCE_MARGIN_TWD,
+        "clearing": TXO_RISK_CLEARING_MARGIN_TWD,
+    }
+    after = {
+        "initial": TXO_RISK_MARGIN_TWD_2026_08_13,
+        "maintenance": TXO_RISK_MAINTENANCE_MARGIN_TWD_2026_08_13,
+        "clearing": TXO_RISK_CLEARING_MARGIN_TWD_2026_08_13,
+    }
+    if normalized_level not in before:
+        raise ValueError(f"unsupported TAIFEX margin level: {level!r}")
+    schedule = (
+        after[normalized_level]
+        if trading_date >= TAIFEX_MARGIN_2026_08_13_EFFECTIVE_DATE
+        else before[normalized_level]
+    )
+    return dict(schedule)
+
+
+def taifex_futures_margin_twd(
+    product: object, trading_date: date, *, level: str = "initial"
+) -> float:
+    """Return official futures margin for a supported date step and level."""
 
     if not isinstance(trading_date, date):
         raise TypeError("trading_date must be a datetime.date")
     normalized = str(product or "").strip().upper()
+    normalized_level = str(level).strip().lower()
+    before = {
+        "initial": TAIFEX_INITIAL_MARGIN_TWD,
+        "maintenance": TAIFEX_MAINTENANCE_MARGIN_TWD,
+        "clearing": TAIFEX_CLEARING_MARGIN_TWD,
+    }
+    after = {
+        "initial": TAIFEX_INITIAL_MARGIN_TWD_2026_08_13,
+        "maintenance": TAIFEX_MAINTENANCE_MARGIN_TWD_2026_08_13,
+        "clearing": TAIFEX_CLEARING_MARGIN_TWD_2026_08_13,
+    }
+    if normalized_level not in before:
+        raise ValueError(f"unsupported TAIFEX margin level: {level!r}")
     schedule = (
-        TAIFEX_INITIAL_MARGIN_TWD_2026_08_13
+        after[normalized_level]
         if trading_date >= TAIFEX_MARGIN_2026_08_13_EFFECTIVE_DATE
-        else TAIFEX_INITIAL_MARGIN_TWD
+        else before[normalized_level]
     )
     try:
         return float(schedule[normalized])
     except KeyError as exc:
         raise ValueError(f"unsupported TAIFEX margin product: {normalized!r}") from exc
+
+
+def taifex_initial_margin_twd(product: object, trading_date: date) -> float:
+    """Return the official initial margin for a supported live date step."""
+
+    return taifex_futures_margin_twd(product, trading_date, level="initial")
 
 
 def _require_columns(frame: pl.DataFrame, required: set[str], *, label: str) -> None:
@@ -88,7 +203,7 @@ def _require_columns(frame: pl.DataFrame, required: set[str], *, label: str) -> 
 def compute_daily_required_capital(
     trades: pl.DataFrame,
     *,
-    futures_initial_margin_twd: Mapping[str, float] = TAIFEX_INITIAL_MARGIN_TWD,
+    futures_initial_margin_twd: Mapping[str, float] | None = None,
     margin_first_trading_date: date = TAIFEX_MARGIN_FIRST_TRADING_DATE,
     margin_verified_through: date = TAIFEX_MARGIN_VERIFIED_THROUGH,
 ) -> pl.DataFrame:
@@ -148,10 +263,14 @@ def compute_daily_required_capital(
             f"verified={margin_first_trading_date}..{margin_verified_through}"
         )
 
-    normalized_margins = {
-        str(product).strip().upper(): float(value)
-        for product, value in futures_initial_margin_twd.items()
-    }
+    normalized_margins = (
+        {
+            str(product).strip().upper(): float(value)
+            for product, value in futures_initial_margin_twd.items()
+        }
+        if futures_initial_margin_twd is not None
+        else {}
+    )
     if any(
         not math.isfinite(value) or value <= 0.0
         for value in normalized_margins.values()
@@ -219,7 +338,7 @@ def compute_daily_required_capital(
                     )
                 elif instrument_type == "future":
                     product = str(row["product"]).strip().upper()
-                    if product not in normalized_margins:
+                    if futures_initial_margin_twd is not None and product not in normalized_margins:
                         raise ValueError(
                             f"missing initial margin for futures product={product}"
                         )
@@ -248,7 +367,12 @@ def compute_daily_required_capital(
 
             option_cash_requirement = max(-option_cash_balance, 0.0)
             futures_margin = sum(
-                abs(quantity) * normalized_margins[product]
+                abs(quantity)
+                * (
+                    normalized_margins[product]
+                    if futures_initial_margin_twd is not None
+                    else taifex_initial_margin_twd(product, trading_date)
+                )
                 for product, quantity in futures_positions.items()
             )
             total_required = (
@@ -311,7 +435,7 @@ def build_capital_normalized_returns(
     daily: pl.DataFrame,
     trades: pl.DataFrame,
     *,
-    futures_initial_margin_twd: Mapping[str, float] = TAIFEX_INITIAL_MARGIN_TWD,
+    futures_initial_margin_twd: Mapping[str, float] | None = None,
     margin_first_trading_date: date = TAIFEX_MARGIN_FIRST_TRADING_DATE,
     margin_verified_through: date = TAIFEX_MARGIN_VERIFIED_THROUGH,
     periods_per_year: float = TRADING_DAYS_PER_YEAR,

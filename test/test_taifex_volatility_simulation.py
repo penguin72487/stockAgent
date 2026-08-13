@@ -283,7 +283,7 @@ def test_short_straddle_uses_bid_entry_ask_liquidation_and_absorbing_ruin(
     ledger = engine.state["strategies"][strategy_id]
     assert sorted(ledger["option_positions"].values()) == [-1, -1]
     assert ledger["gross_cash_twd"] > 0.0
-    assert ledger["initial_capital_twd"] > 2 * 85_000.0
+    assert ledger["initial_capital_twd"] > 2 * 94_000.0
     entry_rows = [
         json.loads(line)
         for line in (tmp_path / "ideal_ledger.jsonl").read_text().splitlines()
@@ -354,8 +354,19 @@ def test_complete_books_start_all_live_catalog_curves_without_margin_failure(
         == 0
     )
     engine._write_marks(receive_ns + 1_000_000_000)
+    engine._write_status(force=True, decision_ns=receive_ns + 1_000_000_000)
     mark_rows = (tmp_path / "marks.jsonl").read_text().splitlines()
     assert len(mark_rows) >= len(STRATEGY_IDS)
+    status = json.loads((tmp_path / "status.json").read_text(encoding="utf-8"))
+    assert status["strategy_count"] == len(STRATEGY_IDS)
+    assert status["strategy_fresh_valuation_count"] == len(STRATEGY_IDS)
+    assert status["strategy_valuation_available_count"] == len(STRATEGY_IDS)
+    assert status["held_option_contract_count"] > 0
+    assert (
+        status["held_option_subscribed_count"]
+        == status["held_option_contract_count"]
+    )
+    assert status["missing_held_option_subscription_codes"] == []
     engine.close()
 
 
@@ -413,6 +424,73 @@ def test_restart_rejects_option_risk_margin_contract_change(tmp_path: Path) -> N
         match="strategy option risk-margin/capital contract mismatch",
     ):
         _engine(tmp_path, bootstrap_after=date(2026, 8, 12))
+
+
+def test_restart_rejects_persisted_held_option_without_worker_subscription(
+    tmp_path: Path,
+) -> None:
+    engine = _engine(tmp_path, bootstrap_after=date(2026, 8, 12))
+    engine.state["strategies"][CLASSIC_VARIANT_ID]["option_positions"] = {
+        "TXV-NOT-SUBSCRIBED": 1
+    }
+    engine.close()
+
+    with pytest.raises(
+        RuntimeError,
+        match="persisted held option contracts are not subscribed on strategy worker 0",
+    ):
+        _engine(tmp_path, bootstrap_after=date(2026, 8, 12))
+
+
+def test_restart_migrates_exact_official_2026_08_13_margin_step(
+    tmp_path: Path,
+) -> None:
+    engine = _engine(tmp_path, bootstrap_after=date(2026, 8, 12))
+    engine.state["strategies"][CLASSIC_VARIANT_ID]["gross_cash_twd"] = 12_345.0
+    engine.close()
+    state_path = tmp_path / "state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["execution_contract_version"] = 6
+    state["option_risk_margin_a_twd"] = 169_000.0
+    state["option_risk_margin_b_twd"] = 85_000.0
+    state.pop("option_risk_margin_c_twd", None)
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    migrated = _engine(tmp_path, bootstrap_after=date(2026, 8, 12))
+
+    assert migrated.state["execution_contract_version"] == EXECUTION_CONTRACT_VERSION
+    assert migrated.state["option_risk_margin_a_twd"] == 187_000.0
+    assert migrated.state["option_risk_margin_b_twd"] == 94_000.0
+    assert migrated.state["option_risk_margin_c_twd"] == 18_800.0
+    assert (
+        migrated.state["strategies"][CLASSIC_VARIANT_ID]["gross_cash_twd"]
+        == 12_345.0
+    )
+    migration = json.loads(
+        (tmp_path / "events.jsonl").read_text(encoding="utf-8").splitlines()[-1]
+    )
+    assert migration["event"] == "execution_contract_migrated"
+    assert migration["margin_schedule"]["positions_and_pnl_preserved"] is True
+    migrated.close()
+
+
+def test_restart_recovers_partial_hot_reload_margin_step(tmp_path: Path) -> None:
+    engine = _engine(tmp_path, bootstrap_after=date(2026, 8, 12))
+    engine.close()
+    state_path = tmp_path / "state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["execution_contract_version"] = EXECUTION_CONTRACT_VERSION
+    state["option_risk_margin_a_twd"] = 169_000.0
+    state["option_risk_margin_b_twd"] = 85_000.0
+    state["option_risk_margin_c_twd"] = 18_800.0
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    migrated = _engine(tmp_path, bootstrap_after=date(2026, 8, 12))
+
+    assert migrated.state["option_risk_margin_a_twd"] == 187_000.0
+    assert migrated.state["option_risk_margin_b_twd"] == 94_000.0
+    assert migrated.state["option_risk_margin_c_twd"] == 18_800.0
+    migrated.close()
 
 
 @pytest.mark.parametrize(

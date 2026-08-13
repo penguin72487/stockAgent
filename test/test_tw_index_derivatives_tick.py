@@ -511,7 +511,7 @@ def test_option_naked_call_and_put_margin_uses_official_single_leg_formula() -> 
         underlying_price=20_000.0,
         strike_price=20_100.0,
     )
-    torch.testing.assert_close(margin, torch.tensor([169_000.0, 175_000.0]))
+    torch.testing.assert_close(margin, torch.tensor([187_000.0, 193_000.0]))
 
 
 def test_option_executor_enforces_permission_tax_margin_and_forced_flat() -> None:

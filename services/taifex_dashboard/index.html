@@ -4,36 +4,63 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>TAIFEX 全策略模擬交易即時面板</title>
-  <link rel="stylesheet" href="styles.css">
+  <link rel="stylesheet" href="styles.css?v=8">
 </head>
 <body>
-  <main class="shell">
+  <a class="skip-link" href="#main-content">跳到主要內容</a>
+  <header class="public-nav">
+    <a class="public-brand" href="../">STOCKAGENT</a>
+    <nav aria-label="公開面板導覽">
+      <a href="../">總覽</a>
+      <a class="active" href="./" aria-current="page">TAIFEX</a>
+      <a href="../tw-day-trade/">台股當沖</a>
+      <a href="../shioaji/">永豐 API</a>
+    </nav>
+  </header>
+
+  <main id="main-content" class="shell">
     <header class="hero">
       <div>
-        <p class="eyebrow">SHIOAJI · SIMULATION ONLY</p>
+        <p class="eyebrow">TAIFEX · PUBLIC READ-ONLY SIMULATION</p>
         <h1 id="dashboard-title">TAIFEX 全策略模擬交易即時面板</h1>
-        <p class="subtitle">Bid/Ask 可成交價理想帳、日內期貨避險與永豐模擬委託監控</p>
+        <p class="subtitle">先看資料狀態與策略績效，再下鑽到合約、帳本和方法。所有損益皆為 Bid/Ask 可成交價模擬。</p>
       </div>
-      <div class="live-block">
+      <div id="connection-status" class="live-block" role="status" aria-live="polite">
         <span id="live-dot" class="live-dot" aria-hidden="true"></span>
-        <span id="live-label">連線中</span>
-        <span id="last-refresh" class="mono">—</span>
+        <span><small>資料狀態</small><strong id="live-label">連線中</strong></span>
+        <span id="last-refresh" class="mono">最後來源更新 —</span>
       </div>
     </header>
+
+    <nav class="jump-nav" aria-label="本頁快速導覽">
+      <a href="#overview">狀態總覽</a>
+      <a href="#performance">績效趨勢</a>
+      <a href="#strategies">策略比較</a>
+      <a href="#audit">資料稽核</a>
+      <a href="#methodology">策略方法</a>
+    </nav>
 
     <section id="alert" class="alert" role="status" aria-live="polite">
       正在載入已落盤的模擬狀態。
     </section>
 
+    <div id="overview" class="section-intro">
+      <div><span>01</span><h2>現在是否可信</h2></div>
+      <p>引擎、行情、週期、委託、延遲和安全邊界必須一起看。</p>
+    </div>
     <section class="metrics" aria-label="核心狀態">
       <article class="metric"><span>引擎</span><strong id="engine-status">—</strong><small id="blocked-reason">blocked: —</small></article>
-      <article class="metric"><span>行情覆蓋</span><strong id="book-coverage">—</strong><small id="book-count">—</small></article>
+      <article class="metric"><span>近期估值覆蓋</span><strong id="book-coverage">—</strong><small id="book-count">—</small></article>
       <article class="metric"><span>目前週期</span><strong id="cycle-status">—</strong><small id="cycle-expiry">—</small></article>
       <article class="metric"><span>模擬委託</span><strong id="broker-status">—</strong><small id="broker-detail">—</small></article>
       <article class="metric"><span>狀態延遲</span><strong id="source-age">—</strong><small>超過 15 秒即標示 stale</small></article>
       <article class="metric"><span>安全邊界</span><strong id="safety-state">—</strong><small>正式下單必須永遠不可用</small></article>
     </section>
 
+    <div id="performance" class="section-intro">
+      <div><span>02</span><h2>績效與資金輪廓</h2></div>
+      <p>每張卡只有一個主要口徑；最佳與最差不等於未來表現。</p>
+    </div>
     <section class="metrics performance-metrics" aria-label="全策略績效摘要">
       <article class="metric"><span>有效曲線</span><strong id="performance-count">—</strong><small>有固定資金分母的策略</small></article>
       <article class="metric"><span>預留資金合計</span><strong id="performance-reserve">—</strong><small>各最小策略單位獨立預留後加總</small></article>
@@ -59,22 +86,29 @@
       </article>
 
       <article class="panel cycle-panel">
-        <div class="panel-head"><div><h2>週期與合約</h2><p>目前執行狀態</p></div></div>
-        <dl class="detail-list">
-          <div><dt>TX</dt><dd id="underlying-contract">—</dd></div>
+        <div class="panel-head"><div><h2>合約執行摘要</h2><p>先看四個會改變解讀的欄位</p></div></div>
+        <dl class="cycle-glance">
+          <div><dt>TX 合約</dt><dd id="underlying-contract">—</dd></div>
+          <div><dt>目前盤別</dt><dd id="current-session">—</dd></div>
+          <div><dt>TAIFEX 交易日</dt><dd id="current-trading-date">—</dd></div>
+          <div><dt>決策頻率</dt><dd id="decision-interval">—</dd></div>
+        </dl>
+        <details class="technical-details">
+          <summary>展開完整合約與排程契約</summary>
+          <dl class="detail-list">
           <div><dt>避險期貨</dt><dd id="hedge-contract">—</dd></div>
-          <div><dt>裸賣保證金 A/B</dt><dd id="option-risk-margins">—</dd></div>
+          <div><dt>TXO 風險保證金 A/B/C</dt><dd id="option-risk-margins">—</dd></div>
+          <div><dt>避險期貨原始保證金</dt><dd id="futures-initial-margin">—</dd></div>
+          <div><dt>維持／結算保證金</dt><dd id="maintenance-clearing-margin">—</dd></div>
+          <div><dt>規則來源</dt><dd><a href="https://www.taifex.com.tw/cht/11/newsDetail?idx=17259&amp;newsType=1" target="_blank" rel="noopener noreferrer">TAIFEX 2026-08-11 公告</a></dd></div>
           <div><dt>策略資金緩衝</dt><dd id="capital-buffer-multiple">—</dd></div>
           <div><dt>週選序列</dt><dd id="cycle-series">—</dd></div>
           <div><dt>策略模式</dt><dd id="strategy-mode">—</dd></div>
           <div><dt>新增策略進場</dt><dd id="catalog-entry-policy">—</dd></div>
-          <div><dt>目前盤別</dt><dd id="current-session">—</dd></div>
           <div><dt>執行模式</dt><dd id="runner-mode">—</dd></div>
           <div><dt>日盤官方時段</dt><dd id="day-official-session">—</dd></div>
           <div><dt>日／夜盤空窗</dt><dd id="intersession-gap">—</dd></div>
           <div><dt>盤後／夜盤時段</dt><dd id="night-official-session">—</dd></div>
-          <div><dt>TAIFEX 交易日</dt><dd id="current-trading-date">—</dd></div>
-          <div><dt>決策頻率</dt><dd id="decision-interval">—</dd></div>
           <div><dt>日盤停止／平倉</dt><dd id="day-session-times">—</dd></div>
           <div><dt>夜盤停止／平倉</dt><dd id="night-session-times">—</dd></div>
           <div><dt>履約價</dt><dd id="cycle-strike">—</dd></div>
@@ -82,10 +116,15 @@
           <div><dt>待執行 target</dt><dd id="pending-targets">—</dd></div>
           <div><dt>Bootstrap gate</dt><dd id="bootstrap-date">—</dd></div>
           <div><dt>API round-trip</dt><dd id="api-round-trip">—</dd></div>
-        </dl>
+          </dl>
+        </details>
       </article>
     </section>
 
+    <div id="strategies" class="section-intro">
+      <div><span>03</span><h2>策略比較與下鑽</h2></div>
+      <p>先用曲線找差異，再用帳本與方法確認差異從哪裡來。</p>
+    </div>
     <section class="panel curve-wall" aria-labelledby="curve-wall-title">
       <div class="panel-head">
         <div>
@@ -113,6 +152,10 @@
       </div>
       <div id="exposure-summary" class="exposure-summary" aria-label="即時策略曝險分類統計"></div>
       <div id="curve-wall-grid" class="curve-wall-grid"></div>
+      <div class="progressive-actions">
+        <span id="curve-visible-count">—</span>
+        <button id="curve-load-more" type="button">顯示更多曲線</button>
+      </div>
       <p id="curve-wall-note" class="chart-note"></p>
     </section>
 
@@ -143,7 +186,8 @@
           <button id="sort-direction" type="button">由高到低 ↓</button>
         </div>
       </div>
-      <div class="table-scroll">
+      <div class="scroll-hint" aria-hidden="true">表格可左右滑動查看完整欄位 →</div>
+      <div class="table-scroll" tabindex="0" role="region" aria-label="53 個策略帳本，可左右捲動">
         <table>
           <thead><tr><th>策略</th><th>分類</th><th>方向曝險</th><th>波動曝險</th><th>避險型態</th><th>選擇權多:空口數比</th><th>預留資金</th><th>一單位淨損益</th><th>損益絕對值</th><th>固定資金報酬</th><th>逐日複利*</th><th>顯性成本</th><th>損益／成本</th><th>保證金</th><th>資金占用</th><th>總權益</th><th>餘裕</th><th>清算價值</th><th>選擇權腿</th><th>期貨</th><th>狀態</th></tr></thead>
           <tbody id="strategy-body"></tbody>
@@ -152,6 +196,10 @@
       <p class="table-footnote">* 逐 TAIFEX 交易日以固定預留資金計算日報酬後連乘；包含目前尚未結束的夜盤／交易日 mark。多空比例是選擇權絕對口數占比，不是 Delta、Vega、名目本金、權利金或保證金占比。</p>
     </section>
 
+    <div id="audit" class="section-intro">
+      <div><span>04</span><h2>資料來源與限制</h2></div>
+      <p>把「數字怎麼來」和「不能推論什麼」放在同一層。</p>
+    </div>
     <section class="grid-two compact">
       <article class="panel">
         <div class="panel-head"><div><h2>稽核筆數</h2><p>由 append-only 帳本直接統計</p></div></div>
@@ -184,21 +232,30 @@
       </article>
     </section>
 
-    <section class="panel strategy-guide" aria-labelledby="strategy-guide-title">
+    <section id="methodology" class="panel strategy-guide" aria-labelledby="strategy-guide-title">
       <div class="panel-head">
         <div>
           <h2 id="strategy-guide-title">所有策略怎麼做</h2>
           <p id="strategy-guide-summary">依分類載入策略規則、進出場、風險與目前可執行層級</p>
         </div>
-        <label>分類
-          <select id="strategy-category-filter" aria-label="篩選策略分類">
-            <option value="">全部分類</option>
-          </select>
-        </label>
+        <div class="guide-controls">
+          <label>搜尋
+            <input id="strategy-search" type="search" placeholder="名稱、做法或風險" autocomplete="off">
+          </label>
+          <label>分類
+            <select id="strategy-category-filter" aria-label="篩選策略分類">
+              <option value="">全部分類</option>
+            </select>
+          </label>
+        </div>
       </div>
       <div id="strategy-guide-grid" class="strategy-guide-grid"></div>
+      <div class="progressive-actions">
+        <span id="guide-visible-count">—</span>
+        <button id="guide-load-more" type="button">顯示更多策略</button>
+      </div>
     </section>
   </main>
-  <script src="app.js" defer></script>
+  <script src="app.js?v=8" defer></script>
 </body>
 </html>

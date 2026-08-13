@@ -98,6 +98,42 @@ def test_historical_numba_and_numpy_price_rules_match() -> None:
     )
 
 
+def test_move_price_ticks_uses_legal_tick_on_each_side_of_bucket_boundary() -> None:
+    from stockagent.data.tw_price_rules import move_price_ticks_numpy
+
+    prices = np.asarray([1_000.0, 1_000.0, 500.0, 500.0])
+    dates = np.asarray(["2026-08-13"] * 4, dtype="datetime64[D]")
+
+    np.testing.assert_array_equal(
+        move_price_ticks_numpy(prices[:2], -1, dates[:2]),
+        [999.0, 999.0],
+    )
+    np.testing.assert_array_equal(
+        move_price_ticks_numpy(prices[2:], -1, dates[2:]),
+        [499.5, 499.5],
+    )
+    np.testing.assert_array_equal(
+        move_price_ticks_numpy(prices, 1, dates),
+        [1_005.0, 1_005.0, 501.0, 501.0],
+    )
+
+
+def test_move_price_ticks_respects_pre_2005_tick_schedule() -> None:
+    from stockagent.data.tw_price_rules import move_price_ticks_numpy
+
+    prices = np.asarray([150.0, 150.0])
+    dates = np.asarray(["2005-02-28", "2005-03-01"], dtype="datetime64[D]")
+
+    np.testing.assert_array_equal(
+        move_price_ticks_numpy(prices, -1, dates),
+        [149.5, 149.5],
+    )
+    np.testing.assert_array_equal(
+        move_price_ticks_numpy(prices, 1, dates),
+        [151.0, 150.5],
+    )
+
+
 def test_historical_limit_mask_uses_session_date() -> None:
     frame = pl.DataFrame(
         {

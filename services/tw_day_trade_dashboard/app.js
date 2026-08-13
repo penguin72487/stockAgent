@@ -42,6 +42,18 @@ const monetaryNumber = (value) => {
   // produce up to eight economically meaningful TWD decimals.
   return resolved.toLocaleString("zh-TW", {maximumFractionDigits: 8});
 };
+const summaryMoney = (value) => value == null || !Number.isFinite(Number(value))
+  ? "—"
+  : `NT$ ${Number(value).toLocaleString("zh-TW", {maximumFractionDigits: 2})}`;
+const compactMoney = (value) => value == null || !Number.isFinite(Number(value))
+  ? "—"
+  : `NT$ ${Number(value).toLocaleString("zh-TW", {notation: "compact", maximumFractionDigits: 2})}`;
+const displayPct = (value) => {
+  if (value == null || !Number.isFinite(Number(value))) return "—";
+  const resolved = Number(value);
+  const digits = Math.abs(resolved) < .0001 && resolved !== 0 ? 6 : 4;
+  return `${resolved.toLocaleString("zh-TW", {maximumFractionDigits: digits})}%`;
+};
 const money = (value) => value == null ? "—" : `NT$ ${monetaryNumber(value)}`;
 const pct = (value) => value == null ? "—" : `${sourceNumber(Number(value) * 100)}%`;
 const shortTime = (value) => value ? String(value).replace("T", " ").slice(5, 19) : "—";
@@ -85,11 +97,82 @@ function compareByAbsoluteWeight(a, b) {
     || String(a.symbol || "").localeCompare(String(b.symbol || ""), "zh-Hant");
 }
 
+function healthPresentation(value) {
+  const health = String(value || "unavailable").toLowerCase();
+  const labels = {
+    active: "資料正常",
+    ready: "資料正常",
+    waiting: "等待資料",
+    stale: "資料逾時",
+    blocked: "策略阻擋",
+    critical: "需要注意",
+    unavailable: "暫時離線",
+  };
+  return {health: health === "ready" ? "active" : health, label: labels[health] || "狀態未知"};
+}
+
+function engineStatusLabel(value) {
+  const labels = {
+    active: "執行正常",
+    ready: "已就緒",
+    waiting: "等待時段",
+    critical_unflattened_after_13_24: "13:24 強平後仍有未平部位",
+    blocked_missing_eligibility: "缺少當日當沖資格資料，已停止執行",
+    blocked_missing_checkpoint: "缺少模型權重，已停止執行",
+  };
+  return labels[value] || String(value || "未知狀態").replaceAll("_", " ");
+}
+
+function engineStatusShortLabel(value) {
+  const labels = {
+    active: "執行正常",
+    ready: "已就緒",
+    critical_unflattened_after_13_24: "13:24 後未平",
+    flat_no_executable_signal: "今日無可執行訊號",
+    session_flat_after_exit: "今日已平倉",
+  };
+  return labels[value] || engineStatusLabel(value);
+}
+
+function renderOverview(data) {
+  const modes = Array.isArray(data.modes) ? data.modes : [];
+  const healthyModes = modes.filter((mode) => (
+    mode.checkpoint_ready
+    && !String(mode.engine_status || "").startsWith("critical")
+    && !String(mode.engine_status || "").startsWith("blocked")
+  )).length;
+  const openPositions = (data.positions || []).filter((row) => Number(row.signed_shares || 0) !== 0);
+  const stalePositions = openPositions.filter((row) => row.valuation_stale).length;
+  const pnlValues = modes.map((mode) => {
+    const initial = Number(mode.initial_capital_twd);
+    const equity = Number(mode.total_equity_twd);
+    return Number.isFinite(initial) && Number.isFinite(equity) ? equity - initial : null;
+  }).filter((value) => value != null);
+  const totalPnl = pnlValues.length ? pnlValues.reduce((sum, value) => sum + value, 0) : null;
+  const returns = modes.map((mode) => Number(mode.return_pct)).filter(Number.isFinite);
+  const best = returns.length ? Math.max(...returns) : null;
+  const worst = returns.length ? Math.min(...returns) : null;
+  const healthKind = healthyModes === modes.length ? "good" : healthyModes ? "warn" : "bad";
+  const pnlKind = pnlClass(totalPnl);
+  const cards = [
+    ["模式狀態", `${healthyModes}/${modes.length} 可解讀`, healthyModes === modes.length ? "所有 checkpoint 與執行狀態正常" : "有模式需要查看上方警示", healthKind],
+    ["今日持倉", `${number(openPositions.length)} 個`, stalePositions ? `${number(stalePositions)} 個估值延用` : "目前估值皆有新鮮報價", stalePositions ? "warn" : "good"],
+    ["四模式淨損益", totalPnl == null ? "—" : `${totalPnl >= 0 ? "+" : ""}${compactMoney(totalPnl)}`, "四個獨立模擬帳本直接加總", pnlKind],
+    ["報酬範圍", best == null ? "—" : `${best >= 0 ? "+" : ""}${displayPct(best)} ～ ${worst >= 0 ? "+" : ""}${displayPct(worst)}`, "各模式以自己的初始資金為分母", best != null && worst < 0 ? "warn" : pnlClass(best)],
+  ];
+  $("overview-kpis").innerHTML = cards.map(([label, value, note, kind]) => `<div class="overview-kpi">
+    <span>${esc(label)}</span><strong class="${esc(kind)}">${esc(value)}</strong><small class="${esc(kind)}">${esc(note)}</small>
+  </div>`).join("");
+  $("overview-kpis").setAttribute("aria-busy", "false");
+}
+
 function renderHeader(data) {
   const health = $("health");
-  health.textContent = String(data.health || "unknown").toUpperCase();
-  health.className = `pill ${data.health || ""}`;
-  $("freshness").textContent = `來源 ${sourceNumber(data.source_age_seconds)} 秒前 · ${shortTime(data.source_updated_at)}`;
+  const presentation = healthPresentation(data.health);
+  health.textContent = presentation.label;
+  health.className = `pill ${presentation.health}`;
+  $("connection-status").dataset.state = presentation.health;
+  $("freshness").textContent = `來源 ${duration(data.source_age_seconds)}前 · ${shortTime(data.source_updated_at)}`;
   const alert = $("alert");
   const blockers = data.modes.filter((mode) => !mode.checkpoint_ready || String(mode.engine_status || "").startsWith("critical"));
   const signalMissingEligibility = new Map();
@@ -105,14 +188,22 @@ function renderHeader(data) {
     }
   }
   if (data.health === "stale" || blockers.length || signalMissingEligibility.size || currentMissingEligibility.size) {
+    const messages = [
+      data.health === "stale" ? "資料來源已逾時；畫面只能當歷史紀錄，不能視為現在行情。" : "",
+      currentMissingEligibility.size ? `今日當沖資格未完整覆蓋，後續訊號已停止執行：${[...currentMissingEligibility.entries()].map(([venue, row]) => `${venue.toUpperCase()} 需要 ${row.target_date || "今日"}，最新僅到 ${row.latest_date || "無資料"}`).join("；")}` : "",
+      !currentMissingEligibility.size && signalMissingEligibility.size ? "09:00 訊號產生時資格資料尚未到齊，因此已 fail-closed；較晚補齊的資料不會回填成假成交。" : "",
+      ...blockers.map((mode) => `${mode.label || mode.market}：${engineStatusLabel(mode.engine_status)}${mode.checkpoint_ready ? "" : "；checkpoint 未就緒"}`),
+    ].filter(Boolean);
+    const signature = messages.join("|");
     alert.classList.remove("hidden");
-    alert.innerHTML = [
-      data.health === "stale" ? "面板來源已過期，請先確認模擬服務。" : "",
-      currentMissingEligibility.size ? `目前今日當沖資格仍未覆蓋，後續訊號會 fail-closed：${[...currentMissingEligibility.entries()].map(([venue, row]) => `${venue.toUpperCase()} 需要 ${row.target_date || "今日"}，目前最新 ${row.latest_date || "無資料"}`).join("；")}` : "",
-      !currentMissingEligibility.size && signalMissingEligibility.size ? "09:00 批次在資格資料到達前已 fail-closed；目前今日資格已補齊，但不會用較晚資料回填假成交。" : "",
-      ...blockers.map((mode) => `${mode.label || mode.market}: ${mode.engine_status || "未就緒"}${mode.checkpoint_ready ? "" : "（checkpoint 不存在）"}`),
-    ].filter(Boolean).map(esc).join("<br>");
-  } else alert.classList.add("hidden");
+    if (alert.dataset.signature !== signature) {
+      alert.innerHTML = `<strong>需要注意</strong>${messages.map((message) => `<span>${esc(message)}</span>`).join("")}`;
+      alert.dataset.signature = signature;
+    }
+  } else {
+    alert.classList.add("hidden");
+    alert.dataset.signature = "";
+  }
 }
 
 function syncFilters(data) {
@@ -133,20 +224,27 @@ function renderModes(data) {
     const status = String(mode.engine_status || "unknown");
     const kind = status === "active" ? "good" : status.startsWith("blocked") || status.startsWith("critical") ? "bad" : "warn";
     const mix = mode.execution_projection || {};
+    const offsetTicks = Number(mode.price_limit_offset_ticks || 0);
+    const bracketPolicy = offsetTicks > 0
+      ? `TP／SL 漲跌停內縮 ${sourceNumber(offsetTicks)} Tick（提高成交機率，非保證）`
+      : "TP／SL 使用完整漲跌停價";
     return `<article class="panel mode-card">
-      <header><h3>${esc(mode.label || mode.market)}</h3>${badge(status, kind)}</header>
-      <div class="equity ${pnlClass(returnPct)}">${returnPct == null ? "尚無估值" : `${returnPct >= 0 ? "+" : ""}${sourceNumber(returnPct)}%`}</div>
-      <div class="delta ${pnlClass(pnl)}">${pnl == null ? "尚無估值" : `總權益 ${money(equity)} · 淨損益 ${pnl >= 0 ? "+" : ""}${money(pnl)}`}</div>
-      <div class="metrics">
-        <div><span>報酬率資金基準</span><strong>${money(initial)}</strong></div>
+      <header><h3>${esc(mode.label || mode.market)}</h3>${badge(engineStatusShortLabel(status), kind)}</header>
+      <div class="equity ${pnlClass(returnPct)}">${returnPct == null ? "尚無估值" : `${returnPct >= 0 ? "+" : ""}${displayPct(returnPct)}`}</div>
+      <div class="delta ${pnlClass(pnl)}">${pnl == null ? "尚無估值" : `總權益 ${summaryMoney(equity)} · 淨損益 ${pnl >= 0 ? "+" : ""}${summaryMoney(pnl)}`}</div>
+      <div class="mode-glance">
         <div><span>持倉／缺價</span><strong>${number(mode.open_position_count)} / ${number(mode.stale_position_count)}</strong></div>
-        <div><span>已實現淨損益</span><strong class="${pnlClass(mode.cumulative_realized_net_pnl_twd)}">${money(mode.cumulative_realized_net_pnl_twd)}</strong></div>
+        <div><span>已實現淨損益</span><strong class="${pnlClass(mode.cumulative_realized_net_pnl_twd)}">${summaryMoney(mode.cumulative_realized_net_pnl_twd)}</strong></div>
+        <div><span>13:24 未平</span><strong class="${Number(mode.force_exit_failures || 0) ? "negative" : ""}">${number(mode.force_exit_failures || 0)}</strong></div>
+      </div>
+      <details><summary>查看資金、訊號與曝險細節</summary><div class="metrics">
+        <div><span>報酬率資金基準</span><strong>${money(initial)}</strong></div>
         <div><span>已賺手續費退佣</span><strong>${money(mode.cumulative_commission_rebate_accrued_twd)}</strong></div>
         <div><span>訊號時間</span><strong>${shortTime(mode.signal_at)}</strong></div>
-        <div><span>13:24 未平</span><strong class="${Number(mode.force_exit_failures || 0) ? "negative" : ""}">${number(mode.force_exit_failures || 0)}</strong></div>
         <div class="wide"><span>方向總曝險：目標</span><strong>多 ${pct(mix.target_long_gross)} / 空 ${pct(mix.target_short_gross)}</strong></div>
         <div class="wide"><span>整張／深度後 → 平衡後</span><strong>多 ${pct(mix.pre_balance_long_gross)} / 空 ${pct(mix.pre_balance_short_gross)} → 多 ${pct(mix.post_balance_long_gross)} / 空 ${pct(mix.post_balance_short_gross)}</strong></div>
-      </div>
+        <div class="wide"><span>停利停損價位</span><strong>${esc(bracketPolicy)}</strong></div>
+      </div></details>
     </article>`;
   }).join("");
 }
@@ -328,15 +426,19 @@ function renderAudit(data) {
   $("source-signal").textContent = contract.signal || "—"; $("source-fill").textContent = contract.entry_fill || "—";
   $("source-fees").textContent = contract.fees || "—";
   $("source-comparison").textContent = `${contract.comparison || "—"}；${contract.benchmarks || "—"}`;
-  $("source-eligibility").textContent = contract.eligibility || "—"; $("source-depth").textContent = contract.depth_limit || "—";
+  $("source-eligibility").textContent = contract.eligibility || "—"; $("source-depth").textContent = `${contract.depth_limit || "—"}；${contract.bracket_fill || "—"}`;
 }
 
 function revisionOf(data) {
   const counts = data.record_counts || {};
   return JSON.stringify([
-    data.source_updated_at,
     counts.orders, counts.fills, counts.marks, counts.benchmark_marks, counts.events,
-    data.modes.map((row) => [row.market, row.total_equity_twd, row.open_position_count, row.engine_status]),
+    data.session_progress,
+    data.preopen?.updated_at,
+    data.modes.map((row) => [
+      row.market, row.total_equity_twd, row.open_position_count,
+      row.stale_position_count, row.force_exit_failures, row.engine_status,
+    ]),
     (data.benchmarks || []).map((row) => [row.benchmark_id, row.return_pct, row.valuation_stale, row.contract_code]),
   ]);
 }
@@ -344,8 +446,9 @@ function revisionOf(data) {
 function render({heavy = true} = {}) {
   if (!snapshot) return;
   renderHeader(snapshot);
-  renderOperations(snapshot);
+  renderOverview(snapshot);
   if (!heavy) return;
+  renderOperations(snapshot);
   renderModes(snapshot);
   renderChart(snapshot);
   renderPositions(snapshot);
@@ -389,6 +492,7 @@ async function loadSignals({append = false} = {}) {
 }
 
 async function refresh() {
+  if (document.hidden) return;
   if (refreshInFlight) return;
   refreshInFlight = true;
   try {
@@ -423,10 +527,17 @@ function filtersChanged({debounceSignals = false} = {}) {
 $("mode-filter").addEventListener("change", () => filtersChanged());
 $("status-filter").addEventListener("change", () => filtersChanged());
 $("symbol-filter").addEventListener("input", () => filtersChanged({debounceSignals: true}));
+$("reset-filters").addEventListener("click", () => {
+  $("mode-filter").value = "all";
+  $("symbol-filter").value = "";
+  $("status-filter").value = "all";
+  filtersChanged();
+});
 $("load-more-signals").addEventListener("click", () => loadSignals({append: true}));
 $("load-more-positions").addEventListener("click", () => {
   positionVisibleRows += POSITION_PAGE_SIZE;
   renderPositions(snapshot);
 });
 setInterval(() => { $("clock").textContent = new Date().toLocaleString("zh-TW", {timeZone:"Asia/Taipei", hour12:false}); }, 1000);
+document.addEventListener("visibilitychange", () => { if (!document.hidden) refresh(); });
 refresh(); window.setInterval(refresh, REFRESH_MS);

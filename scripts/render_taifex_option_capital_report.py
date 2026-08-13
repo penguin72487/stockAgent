@@ -26,6 +26,13 @@ from scripts.backtest_taifex_atm_straddle_rolling import _sha256_path  # noqa: E
 from stockagent.data.tw_index_derivatives_tick import _atomic_json  # noqa: E402
 from stockagent.research.taifex_capital_returns import (  # noqa: E402
     TAIFEX_INITIAL_MARGIN_TWD,
+    TAIFEX_INITIAL_MARGIN_TWD_2026_08_13,
+    TAIFEX_MARGIN_2026_08_13_ANNOUNCEMENT_URL,
+    TAIFEX_MARGIN_2026_08_13_CSV_SHA256,
+    TAIFEX_MARGIN_2026_08_13_CSV_URL,
+    TAIFEX_MARGIN_2026_08_13_EFFECTIVE_DATE,
+    TAIFEX_MARGIN_2026_08_13_PDF_SHA256,
+    TAIFEX_MARGIN_2026_08_13_PDF_URL,
     TAIFEX_MARGIN_ANNOUNCEMENT_URL,
     TAIFEX_MARGIN_CSV_SHA256,
     TAIFEX_MARGIN_CSV_URL,
@@ -738,7 +745,18 @@ def build_report(*, input_dir: Path, output_path: Path) -> dict[str, Any]:
             else "product(1 + daily return) - 1; statistical view only, because actual positions remain one lot"
         ),
         "annualized_sharpe": "mean daily return / sample daily standard deviation * sqrt(252), zero risk-free rate",
-        "futures_initial_margin_twd": TAIFEX_INITIAL_MARGIN_TWD,
+        "futures_initial_margin_schedule_twd": [
+            {
+                "effective_trading_date": TAIFEX_MARGIN_FIRST_TRADING_DATE.isoformat(),
+                "values": TAIFEX_INITIAL_MARGIN_TWD,
+            },
+            {
+                "effective_trading_date": (
+                    TAIFEX_MARGIN_2026_08_13_EFFECTIVE_DATE.isoformat()
+                ),
+                "values": TAIFEX_INITIAL_MARGIN_TWD_2026_08_13,
+            },
+        ],
         "margin_first_trading_date": TAIFEX_MARGIN_FIRST_TRADING_DATE.isoformat(),
         "margin_verified_through": TAIFEX_MARGIN_VERIFIED_THROUGH.isoformat(),
         "official_sources": {
@@ -746,6 +764,13 @@ def build_report(*, input_dir: Path, output_path: Path) -> dict[str, Any]:
             "pdf": TAIFEX_MARGIN_PDF_URL,
             "csv": TAIFEX_MARGIN_CSV_URL,
             "csv_sha256": TAIFEX_MARGIN_CSV_SHA256,
+            "2026_08_13_announcement": (
+                TAIFEX_MARGIN_2026_08_13_ANNOUNCEMENT_URL
+            ),
+            "2026_08_13_pdf": TAIFEX_MARGIN_2026_08_13_PDF_URL,
+            "2026_08_13_pdf_sha256": TAIFEX_MARGIN_2026_08_13_PDF_SHA256,
+            "2026_08_13_csv": TAIFEX_MARGIN_2026_08_13_CSV_URL,
+            "2026_08_13_csv_sha256": TAIFEX_MARGIN_2026_08_13_CSV_SHA256,
         },
     }
     contract_path = input_dir / "capital_normalization_contract.json"
@@ -844,7 +869,7 @@ def build_report(*, input_dir: Path, output_path: Path) -> dict[str, Any]:
 
 - 每個變體使用樣本期間 **最高資金需求** 當固定分母，不因某天保證金較低就放大報酬。
 - 買方選擇權：盤中累積淨權利金現金支出的最高值，包含每口每邊 22 TWD 固定費。
-- 期貨：同時持有口數乘以官方原始保證金，TX `{_twd(TAIFEX_INITIAL_MARGIN_TWD['TX'])}`、MTX `{_twd(TAIFEX_INITIAL_MARGIN_TWD['MTX'])}`、TMF `{_twd(TAIFEX_INITIAL_MARGIN_TWD['TMF'])}` TWD，再加累積固定費。
+- 期貨：同時持有口數乘以各交易日當時有效的官方原始保證金；2026-08-13 起 TX `{_twd(TAIFEX_INITIAL_MARGIN_TWD_2026_08_13['TX'])}`、MTX `{_twd(TAIFEX_INITIAL_MARGIN_TWD_2026_08_13['MTX'])}`、TMF `{_twd(TAIFEX_INITIAL_MARGIN_TWD_2026_08_13['TMF'])}` TWD，再加累積固定費。
 - Gamma：在每個逐筆事件同時計算選擇權現金需求與期貨保證金。
 - 同一整秒的成交視為原子事件；買方策略不得出現裸賣部位，跨日模式只要求官方到期後與樣本結尾歸零。
 - 本輪已逐筆計入選擇權權利金交易稅、指數期貨交易稅與到期現金結算稅；依要求沒有壓力滑價、深度、等待上限或額外保證金 buffer。

@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>永豐 Shioaji API 資料監控｜StockAgent</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <a class="skip-link" href="#main">跳到主要內容</a>
+  <header class="site-header">
+    <a class="brand" href="../">STOCKAGENT</a>
+    <nav aria-label="公開面板">
+      <a href="../">總覽</a>
+      <a href="../taifex/">TAIFEX</a>
+      <a href="../tw-day-trade/">台股當沖</a>
+      <a href="./" aria-current="page">永豐 API</a>
+    </nav>
+  </header>
+
+  <main id="main">
+    <section class="hero" aria-labelledby="page-title">
+      <div>
+        <p class="eyebrow">SHIOAJI · READ-ONLY PIPELINE MONITOR</p>
+        <h1 id="page-title">永豐 API<br>資料管線</h1>
+        <p class="lead">不用登入、不多占連線，也不消耗額外行情流量。直接從既有 receipt、用量紀錄與 capture 證據呈現真實進度。</p>
+      </div>
+      <div class="health-panel">
+        <span>管線狀態</span>
+        <strong id="connection-status" class="status loading" aria-live="polite"><i aria-hidden="true"></i>讀取中</strong>
+        <p id="source-freshness">正在取得最新證據…</p>
+        <small>公開唯讀 · 金鑰與帳號永不傳到瀏覽器</small>
+      </div>
+    </section>
+
+    <nav class="jump-nav" aria-label="頁內導覽">
+      <a href="#traffic">流量額度</a>
+      <a href="#backfill">歷史回補</a>
+      <a href="#capture">即時擷取</a>
+      <a href="#method">口徑說明</a>
+    </nav>
+
+    <section id="pipeline-alert" class="alert" hidden aria-live="polite">
+      <span>目前狀態</span>
+      <strong id="alert-title">—</strong>
+      <p id="alert-copy">—</p>
+    </section>
+
+    <section id="traffic" class="section-block" aria-labelledby="traffic-title">
+      <header class="section-heading">
+        <span>01</span>
+        <div>
+          <h2 id="traffic-title">今日歷史行情流量</h2>
+          <p>帳面剩餘與安全可用額度分開顯示；即時訂閱不計入這個配額。</p>
+        </div>
+      </header>
+      <div class="kpi-grid traffic-kpis">
+        <article class="kpi featured">
+          <span>已使用</span>
+          <strong id="traffic-used">—</strong>
+          <p id="traffic-used-ratio">—</p>
+        </article>
+        <article class="kpi">
+          <span>永豐原始剩餘</span>
+          <strong id="traffic-remaining">—</strong>
+          <p>總額度扣除已使用量</p>
+        </article>
+        <article class="kpi">
+          <span>安全可用</span>
+          <strong id="traffic-safe-remaining">—</strong>
+          <p>套用 90% 與 128 MiB 保留閘門</p>
+        </article>
+        <article class="kpi">
+          <span>重置規則</span>
+          <strong id="traffic-reset">—</strong>
+          <p id="traffic-observed">—</p>
+        </article>
+      </div>
+
+      <figure class="chart-card">
+        <figcaption>
+          <div><strong>近 24 小時用量軌跡</strong><span>每分鐘保留最後一次 api.usage() 觀測</span></div>
+          <div class="legend" aria-hidden="true"><span class="usage-key">已用量</span><span class="guard-key">安全上限</span></div>
+        </figcaption>
+        <svg id="traffic-chart" viewBox="0 0 960 300" role="img" aria-labelledby="traffic-chart-title traffic-chart-desc">
+          <title id="traffic-chart-title">Shioaji 歷史行情流量時間序列</title>
+          <desc id="traffic-chart-desc">顯示已用流量占每日額度比例，並標示百分之九十安全上限。</desc>
+        </svg>
+        <p id="chart-empty" class="empty" hidden>累積兩筆觀測後會畫出趨勢；目前仍會顯示最新用量。</p>
+      </figure>
+
+      <details class="audit-details">
+        <summary>查看最近用量觀測</summary>
+        <div class="table-wrap" tabindex="0" role="region" aria-label="最近用量觀測，可左右捲動">
+          <table>
+            <thead><tr><th>時間</th><th>已用</th><th>剩餘</th><th>使用率</th></tr></thead>
+            <tbody id="traffic-body"><tr><td colspan="4">讀取中</td></tr></tbody>
+          </table>
+        </div>
+      </details>
+    </section>
+
+    <section id="backfill" class="section-block" aria-labelledby="backfill-title">
+      <header class="section-heading">
+        <span>02</span>
+        <div>
+          <h2 id="backfill-title">期貨歷史 Tick 回補</h2>
+          <p>用 receipt 覆蓋率衡量完成度；服務活著不等於資料完成。</p>
+        </div>
+      </header>
+      <div class="progress-card">
+        <div class="progress-copy">
+          <div><span>全合約進度</span><strong id="fleet-progress-label">—</strong></div>
+          <p id="fleet-progress-detail">—</p>
+        </div>
+        <div class="progress-track" role="progressbar" aria-label="全合約歷史回補進度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><i id="fleet-progress-bar"></i></div>
+      </div>
+      <div class="kpi-grid backfill-kpis">
+        <article class="kpi"><span>合約完成</span><strong id="contracts-complete">—</strong><p id="contracts-started">—</p></article>
+        <article class="kpi"><span>目前合約</span><strong id="current-contract">—</strong><p id="current-contract-progress">—</p></article>
+        <article class="kpi"><span>已保存 Tick</span><strong id="backfill-rows">—</strong><p id="backfill-storage">—</p></article>
+        <article class="kpi"><span>下載器</span><strong id="backfill-state">—</strong><p id="backfill-target">—</p></article>
+      </div>
+      <div class="table-card">
+        <header><strong>已開始合約</strong><span>精確 receipt 對帳</span></header>
+        <div class="table-wrap" tabindex="0" role="region" aria-label="合約回補明細，可左右捲動">
+          <table>
+            <thead><tr><th>合約</th><th>狀態</th><th>交易日</th><th>Tick 筆數</th><th>儲存量</th></tr></thead>
+            <tbody id="contracts-body"><tr><td colspan="5">讀取中</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <section id="capture" class="section-block" aria-labelledby="capture-title">
+      <header class="section-heading">
+        <span>03</span>
+        <div>
+          <h2 id="capture-title">即時 Tick / BidAsk 擷取</h2>
+          <p>以最新落盤檔案與目前 worker 訂閱證據判斷，不用歷史流量額度。</p>
+        </div>
+      </header>
+      <div class="capture-card">
+        <div class="capture-primary">
+          <span id="capture-dot" class="pulse" aria-hidden="true"></span>
+          <div><span>擷取狀態</span><strong id="capture-state">—</strong><p id="capture-freshness">—</p></div>
+        </div>
+        <dl>
+          <div><dt>盤別／交易日</dt><dd id="capture-session">—</dd></div>
+          <div><dt>Workers</dt><dd id="capture-workers">—</dd></div>
+          <div><dt>合約／訂閱</dt><dd id="capture-subscriptions">—</dd></div>
+          <div><dt>預定停止</dt><dd id="capture-stop">—</dd></div>
+        </dl>
+      </div>
+    </section>
+
+    <section id="method" class="section-block method" aria-labelledby="method-title">
+      <header class="section-heading">
+        <span>04</span>
+        <div><h2 id="method-title">你看到的數字怎麼來</h2><p>公開面板只呈現必要的聚合證據。</p></div>
+      </header>
+      <div class="method-grid">
+        <article><strong>零額外 API 成本</strong><p>面板不呼叫 login、ticks 或 kbars；只讀既有 manifest、receipt、systemd 狀態與嚴格解析後的 journal 數字。</p></article>
+        <article><strong>流量與串流分離</strong><p>流量圖是歷史行情查詢額度。Shioaji 即時行情是持續推送，不消耗這個歷史查詢配額。</p></article>
+        <article><strong>公開資料最小化</strong><p>不輸出 API Key、Secret、身分、帳號、憑證、本機路徑、capture ID 或 systemd invocation ID。</p></article>
+      </div>
+    </section>
+  </main>
+  <footer>StockAgent · 永豐 Shioaji API 公開唯讀監控 · 每 10 秒更新</footer>
+  <script src="app.js" defer></script>
+</body>
+</html>

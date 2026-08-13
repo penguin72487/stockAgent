@@ -48,13 +48,22 @@ from stockagent.data.taifex_sessions import (
     taifex_session_kind,
     taifex_trading_date,
 )
+from stockagent.live.taifex_strategy_state import held_option_codes
 from stockagent.research.taifex_transaction_tax import (
     option_cash_settlement_transaction_tax_twd,
     option_premium_transaction_tax_twd,
     stock_index_futures_tax_rate,
     taifex_tax_per_contract_twd,
 )
-from stockagent.research.taifex_capital_returns import TAIFEX_INITIAL_MARGIN_TWD
+from stockagent.research.taifex_capital_returns import (
+    TAIFEX_MARGIN_2026_08_13_ANNOUNCEMENT_URL,
+    TAIFEX_MARGIN_2026_08_13_EFFECTIVE_DATE,
+    TXO_RISK_MARGIN_TWD,
+    TXO_RISK_MARGIN_TWD_2026_08_13,
+    taifex_futures_margin_twd,
+    taifex_initial_margin_twd,
+    taifex_txo_risk_margin_twd,
+)
 from stockagent.research.taifex_volatility_models import (
     BidAskSurfaceQuote,
     SECONDS_PER_YEAR,
@@ -81,11 +90,15 @@ from stockagent.research.taifex_volatility_metadata import (
 
 
 SCHEMA_VERSION: Final[int] = 1
-EXECUTION_CONTRACT_VERSION: Final[int] = 6
+EXECUTION_CONTRACT_VERSION: Final[int] = 7
 OPTION_MULTIPLIER: Final[float] = 50.0
 OPTION_FEE_PER_SIDE_TWD: Final[float] = 22.0
-DEFAULT_OPTION_RISK_MARGIN_A_TWD: Final[float] = 169_000.0
-DEFAULT_OPTION_RISK_MARGIN_B_TWD: Final[float] = 85_000.0
+DEFAULT_OPTION_RISK_MARGIN_A_TWD: Final[float] = TXO_RISK_MARGIN_TWD_2026_08_13["A"]
+DEFAULT_OPTION_RISK_MARGIN_B_TWD: Final[float] = TXO_RISK_MARGIN_TWD_2026_08_13["B"]
+DEFAULT_OPTION_RISK_MARGIN_C_TWD: Final[float] = TXO_RISK_MARGIN_TWD_2026_08_13["C"]
+OPTION_MARGIN_POLICY: Final[str] = (
+    "single_leg_naked_a_b_conservative_no_combo_offset_c_reference_only"
+)
 DEFAULT_STRATEGY_CAPITAL_BUFFER_MULTIPLE: Final[float] = 2.0
 FUTURES_FEE_PER_SIDE_TWD: Final[dict[str, float]] = (
     TAIFEX_INDEX_FUTURES_FEE_PER_SIDE_TWD
@@ -410,6 +423,7 @@ class TaifexVolatilitySimulation:
         night_flatten_time: datetime_time = DEFAULT_NIGHT_FLATTEN_TIME,
         option_risk_margin_a_twd: float = DEFAULT_OPTION_RISK_MARGIN_A_TWD,
         option_risk_margin_b_twd: float = DEFAULT_OPTION_RISK_MARGIN_B_TWD,
+        option_risk_margin_c_twd: float = DEFAULT_OPTION_RISK_MARGIN_C_TWD,
         strategy_capital_buffer_multiple: float = (
             DEFAULT_STRATEGY_CAPITAL_BUFFER_MULTIPLE
         ),
@@ -430,6 +444,7 @@ class TaifexVolatilitySimulation:
             )
         margin_a = float(option_risk_margin_a_twd)
         margin_b = float(option_risk_margin_b_twd)
+        margin_c = float(option_risk_margin_c_twd)
         capital_buffer_multiple = float(strategy_capital_buffer_multiple)
         if not math.isfinite(capital_buffer_multiple) or capital_buffer_multiple < 1.0:
             raise ValueError("strategy capital buffer multiple must be finite and >= 1")
@@ -442,11 +457,16 @@ class TaifexVolatilitySimulation:
         if (
             not math.isfinite(margin_a)
             or not math.isfinite(margin_b)
+            or not math.isfinite(margin_c)
             or margin_a <= 0.0
             or margin_b <= 0.0
+            or margin_c <= 0.0
             or margin_b > margin_a
+            or margin_c > margin_b
         ):
-            raise ValueError("option risk margins must satisfy finite A >= B > 0")
+            raise ValueError(
+                "option risk margins must satisfy finite A >= B >= C > 0"
+            )
         self.api = api
         self.sj = shioaji_module
         self.state_dir = Path(state_dir)
@@ -468,6 +488,7 @@ class TaifexVolatilitySimulation:
         self.night_flatten_time = night_flatten_time
         self.option_risk_margin_a_twd = margin_a
         self.option_risk_margin_b_twd = margin_b
+        self.option_risk_margin_c_twd = margin_c
         self.strategy_capital_buffer_multiple = capital_buffer_multiple
         self.catalog_expansion_entry_policy = expansion_policy
         self.underlying = underlying
@@ -501,16 +522,31 @@ class TaifexVolatilitySimulation:
             raise RuntimeError(
                 "another TAIFEX strategy engine holds engine.lock"
             ) from exc
-        self.state = self._load_or_initialize_state(bootstrap_after)
-        # A prior timeout/reconciliation failure is a persistent fail-closed
-        # decision.  A process restart must not silently re-enable broker-side
-        # simulation orders merely because the CLI default is true.
-        self.broker_orders_enabled = self.broker_orders_enabled and bool(
-            self.state.get("broker_orders_enabled", False)
-        )
-        self.state["broker_orders_enabled"] = self.broker_orders_enabled
-        self._reconcile_inflight_orders()
-        self._write_status(force=True)
+        try:
+            self.state = self._load_or_initialize_state(bootstrap_after)
+            missing_held_codes = sorted(
+                set(held_option_codes(self.state)) - set(self.options_by_code)
+            )
+            if missing_held_codes:
+                raise RuntimeError(
+                    "persisted held option contracts are not subscribed on "
+                    "strategy worker 0: " + ",".join(missing_held_codes)
+                )
+            # A prior timeout/reconciliation failure is a persistent fail-closed
+            # decision.  A process restart must not silently re-enable broker-side
+            # simulation orders merely because the CLI default is true.
+            self.broker_orders_enabled = self.broker_orders_enabled and bool(
+                self.state.get("broker_orders_enabled", False)
+            )
+            self.state["broker_orders_enabled"] = self.broker_orders_enabled
+            self._reconcile_inflight_orders()
+            self._write_status(force=True)
+        except Exception:
+            try:
+                fcntl.flock(self.lock_handle.fileno(), fcntl.LOCK_UN)
+            finally:
+                self.lock_handle.close()
+            raise
 
     def _load_or_initialize_state(self, bootstrap_after: date | None) -> dict[str, Any]:
         if self.state_path.is_file():
@@ -572,6 +608,9 @@ class TaifexVolatilitySimulation:
             elif execution_version == 5:
                 payload["execution_contract_version"] = EXECUTION_CONTRACT_VERSION
                 migration_reasons.append("multi_strategy_option_ledger_migration")
+            elif execution_version == 6:
+                payload["execution_contract_version"] = EXECUTION_CONTRACT_VERSION
+                migration_reasons.append("official_margin_schedule_migration")
             elif execution_version != EXECUTION_CONTRACT_VERSION:
                 raise RuntimeError("strategy execution contract mismatch")
 
@@ -642,12 +681,50 @@ class TaifexVolatilitySimulation:
                 self.catalog_expansion_entry_policy
             )
             payload.setdefault("last_intraday_decision_session", None)
-            payload.setdefault(
-                "option_risk_margin_a_twd", self.option_risk_margin_a_twd
+            stored_margin_a = float(
+                payload.get("option_risk_margin_a_twd", TXO_RISK_MARGIN_TWD["A"])
             )
-            payload.setdefault(
-                "option_risk_margin_b_twd", self.option_risk_margin_b_twd
+            stored_margin_b = float(
+                payload.get("option_risk_margin_b_twd", TXO_RISK_MARGIN_TWD["B"])
             )
+            stored_margin_c = float(
+                payload.get("option_risk_margin_c_twd", TXO_RISK_MARGIN_TWD["C"])
+            )
+            official_margin_step = (
+                execution_version <= EXECUTION_CONTRACT_VERSION
+                and stored_margin_a == TXO_RISK_MARGIN_TWD["A"]
+                and stored_margin_b == TXO_RISK_MARGIN_TWD["B"]
+                and stored_margin_c
+                in {TXO_RISK_MARGIN_TWD["C"], TXO_RISK_MARGIN_TWD_2026_08_13["C"]}
+                and self.option_risk_margin_a_twd
+                == TXO_RISK_MARGIN_TWD_2026_08_13["A"]
+                and self.option_risk_margin_b_twd
+                == TXO_RISK_MARGIN_TWD_2026_08_13["B"]
+                and self.option_risk_margin_c_twd
+                == TXO_RISK_MARGIN_TWD_2026_08_13["C"]
+            )
+            if official_margin_step:
+                payload["option_risk_margin_a_twd"] = self.option_risk_margin_a_twd
+                payload["option_risk_margin_b_twd"] = self.option_risk_margin_b_twd
+                payload["option_risk_margin_c_twd"] = self.option_risk_margin_c_twd
+                migration_reasons.append("taifex_2026_08_13_margin_values")
+            else:
+                payload.setdefault(
+                    "option_risk_margin_a_twd", self.option_risk_margin_a_twd
+                )
+                payload.setdefault(
+                    "option_risk_margin_b_twd", self.option_risk_margin_b_twd
+                )
+                payload.setdefault(
+                    "option_risk_margin_c_twd", self.option_risk_margin_c_twd
+                )
+            payload["option_risk_margin_effective_trading_date"] = (
+                TAIFEX_MARGIN_2026_08_13_EFFECTIVE_DATE.isoformat()
+            )
+            payload["option_risk_margin_source_url"] = (
+                TAIFEX_MARGIN_2026_08_13_ANNOUNCEMENT_URL
+            )
+            payload["option_margin_policy"] = OPTION_MARGIN_POLICY
             payload.setdefault(
                 "strategy_capital_buffer_multiple",
                 self.strategy_capital_buffer_multiple,
@@ -658,20 +735,6 @@ class TaifexVolatilitySimulation:
                 f"{legacy_flatten_date}:day" if legacy_flatten_date else None,
             )
             self._ensure_strategy_reporting_state(payload)
-            if migration_reasons:
-                self.state = payload
-                self._persist_state()
-                _append_jsonl(
-                    self.events_path,
-                    {
-                        "event": "execution_contract_migrated",
-                        "at_utc": _now_iso(),
-                        "from_version": execution_version,
-                        "to_version": EXECUTION_CONTRACT_VERSION,
-                        "strategy_mode": self.strategy_mode,
-                        "reason": "+".join(dict.fromkeys(migration_reasons)),
-                    },
-                )
             if str(payload.get("strategy_mode")) != self.strategy_mode:
                 raise RuntimeError(
                     "strategy state mode mismatch: "
@@ -700,6 +763,13 @@ class TaifexVolatilitySimulation:
                 != self.option_risk_margin_b_twd
                 or float(
                     payload.get(
+                        "option_risk_margin_c_twd",
+                        self.option_risk_margin_c_twd,
+                    )
+                )
+                != self.option_risk_margin_c_twd
+                or float(
+                    payload.get(
                         "strategy_capital_buffer_multiple",
                         self.strategy_capital_buffer_multiple,
                     )
@@ -709,6 +779,28 @@ class TaifexVolatilitySimulation:
                 raise RuntimeError(
                     "strategy option risk-margin/capital contract mismatch"
                 )
+            if migration_reasons:
+                self.state = payload
+                self._persist_state()
+                event: dict[str, Any] = {
+                    "event": "execution_contract_migrated",
+                    "at_utc": _now_iso(),
+                    "from_version": execution_version,
+                    "to_version": EXECUTION_CONTRACT_VERSION,
+                    "strategy_mode": self.strategy_mode,
+                    "reason": "+".join(dict.fromkeys(migration_reasons)),
+                }
+                if official_margin_step:
+                    event["margin_schedule"] = {
+                        "effective_trading_date": (
+                            TAIFEX_MARGIN_2026_08_13_EFFECTIVE_DATE.isoformat()
+                        ),
+                        "source_url": TAIFEX_MARGIN_2026_08_13_ANNOUNCEMENT_URL,
+                        "before_twd": dict(TXO_RISK_MARGIN_TWD),
+                        "after_twd": dict(TXO_RISK_MARGIN_TWD_2026_08_13),
+                        "positions_and_pnl_preserved": True,
+                    }
+                _append_jsonl(self.events_path, event)
             return payload
         today = datetime.now(TAIPEI).date()
         weekly_expiries = sorted(
@@ -733,6 +825,14 @@ class TaifexVolatilitySimulation:
             "hedge_fee_per_side_twd": self.hedge_fee_per_side_twd,
             "option_risk_margin_a_twd": self.option_risk_margin_a_twd,
             "option_risk_margin_b_twd": self.option_risk_margin_b_twd,
+            "option_risk_margin_c_twd": self.option_risk_margin_c_twd,
+            "option_risk_margin_effective_trading_date": (
+                TAIFEX_MARGIN_2026_08_13_EFFECTIVE_DATE.isoformat()
+            ),
+            "option_risk_margin_source_url": (
+                TAIFEX_MARGIN_2026_08_13_ANNOUNCEMENT_URL
+            ),
+            "option_margin_policy": OPTION_MARGIN_POLICY,
             "strategy_capital_buffer_multiple": (self.strategy_capital_buffer_multiple),
             "catalog_expansion_entry_policy": (self.catalog_expansion_entry_policy),
             "created_at_utc": _now_iso(),
@@ -807,7 +907,7 @@ class TaifexVolatilitySimulation:
             tax_rate=stock_index_futures_tax_rate(entry_date),
         )
         future_capital = margin_contracts * (
-            TAIFEX_INITIAL_MARGIN_TWD[self.hedge_product]
+            taifex_initial_margin_twd(self.hedge_product, entry_date)
             + self.hedge_fee_per_side_twd
             + hedge_tax
         )
@@ -2182,8 +2282,14 @@ class TaifexVolatilitySimulation:
             fresh_open_value += (
                 future_position * future_sweep[0] * self.hedge_multiplier
             )
-        margin_required = short_margin_required + abs(future_position) * float(
-            TAIFEX_INITIAL_MARGIN_TWD[self.hedge_product]
+        mark_at_taipei = datetime.fromtimestamp(decision_ns / 1e9, tz=TAIPEI)
+        margin_trading_date = taifex_trading_date(mark_at_taipei)
+        futures_margin_per_contract = taifex_initial_margin_twd(
+            self.hedge_product, margin_trading_date
+        )
+        margin_required = (
+            short_margin_required
+            + abs(future_position) * futures_margin_per_contract
         )
 
         live_complete = option_books_valid and future_mark_valid
@@ -2258,6 +2364,10 @@ class TaifexVolatilitySimulation:
             "total_equity_twd": total_equity,
             "margin_required_twd": float(margin_required),
             "margin_excess_twd": margin_excess,
+            "margin_trading_date": margin_trading_date.isoformat(),
+            "futures_initial_margin_per_contract_twd": (
+                futures_margin_per_contract
+            ),
             "alive": bool(ledger.get("alive", True)),
             "margin_call_count": int(ledger.get("margin_call_count") or 0),
             "forced_liquidation_pending": bool(
@@ -2295,6 +2405,45 @@ class TaifexVolatilitySimulation:
             return
         timestamp_ns = int(decision_ns or time.time_ns())
         observed_at_taipei = datetime.now(TAIPEI)
+        current_trading_date = taifex_trading_date(observed_at_taipei)
+        official_margin_schedule = {
+            level: {
+                "futures_twd": taifex_futures_margin_twd(
+                    self.hedge_product,
+                    current_trading_date,
+                    level=level,
+                ),
+                "txo_risk_margin_twd": taifex_txo_risk_margin_twd(
+                    current_trading_date,
+                    level=level,
+                ),
+            }
+            for level in ("initial", "maintenance", "clearing")
+        }
+        strategy_marks = {
+            strategy_id: self._strategy_mark(strategy_id, timestamp_ns)
+            for strategy_id in STRATEGY_IDS
+        }
+        strategy_count = len(strategy_marks)
+        valuation_available_count = sum(
+            bool(mark.get("valuation_available"))
+            for mark in strategy_marks.values()
+        )
+        fresh_valuation_count = sum(
+            mark.get("valuation_source") == "fresh_executable_bidask"
+            for mark in strategy_marks.values()
+        )
+        carried_valuation_count = sum(
+            bool(mark.get("valuation_carried_forward"))
+            for mark in strategy_marks.values()
+        )
+        required_held_codes = held_option_codes(self.state)
+        subscribed_held_codes = tuple(
+            code for code in required_held_codes if code in self.options_by_code
+        )
+        held_codes_with_any_book = tuple(
+            code for code in required_held_codes if code in self.latest_books
+        )
         payload = {
             "schema_version": SCHEMA_VERSION,
             "execution_contract_version": EXECUTION_CONTRACT_VERSION,
@@ -2304,7 +2453,7 @@ class TaifexVolatilitySimulation:
             "strategy_mode": self.strategy_mode,
             "current_session": taifex_session_kind(observed_at_taipei),
             "current_market_phase": taifex_market_phase(observed_at_taipei),
-            "current_trading_date": taifex_trading_date(observed_at_taipei).isoformat(),
+            "current_trading_date": current_trading_date.isoformat(),
             "intraday_decision_interval_seconds": (
                 self.intraday_decision_interval_seconds
                 if self.strategy_mode == STRATEGY_MODE_INTRADAY_FUTURES
@@ -2355,14 +2504,37 @@ class TaifexVolatilitySimulation:
             "hedge_fee_per_side_twd": self.hedge_fee_per_side_twd,
             "option_risk_margin_a_twd": self.option_risk_margin_a_twd,
             "option_risk_margin_b_twd": self.option_risk_margin_b_twd,
+            "option_risk_margin_c_twd": self.option_risk_margin_c_twd,
+            "option_risk_margin_effective_trading_date": (
+                TAIFEX_MARGIN_2026_08_13_EFFECTIVE_DATE.isoformat()
+            ),
+            "option_risk_margin_source_url": (
+                TAIFEX_MARGIN_2026_08_13_ANNOUNCEMENT_URL
+            ),
+            "option_margin_policy": OPTION_MARGIN_POLICY,
+            "margin_requirement_basis": "initial",
+            "official_margin_schedule": official_margin_schedule,
+            "futures_initial_margin_per_contract_twd": (
+                taifex_initial_margin_twd(
+                    self.hedge_product,
+                    current_trading_date,
+                )
+            ),
             "strategy_capital_buffer_multiple": (self.strategy_capital_buffer_multiple),
             "catalog_expansion_entry_policy": (self.catalog_expansion_entry_policy),
             "option_contract_count": len(self.options),
             "latest_book_count": len(self.latest_books),
-            "strategies": {
-                strategy_id: self._strategy_mark(strategy_id, timestamp_ns)
-                for strategy_id in STRATEGY_IDS
-            },
+            "held_option_contract_count": len(required_held_codes),
+            "held_option_subscribed_count": len(subscribed_held_codes),
+            "held_option_book_count": len(held_codes_with_any_book),
+            "missing_held_option_subscription_codes": sorted(
+                set(required_held_codes) - set(subscribed_held_codes)
+            ),
+            "strategy_count": strategy_count,
+            "strategy_valuation_available_count": valuation_available_count,
+            "strategy_fresh_valuation_count": fresh_valuation_count,
+            "strategy_carried_valuation_count": carried_valuation_count,
+            "strategies": strategy_marks,
         }
         _atomic_json(self.status_path, payload)
         self.last_status_monotonic = now_monotonic
