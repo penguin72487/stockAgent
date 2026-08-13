@@ -835,6 +835,7 @@ class FinancialTransformerModel(TransformerBasePortfolioModel):
         return_aux: bool | None = None,
         symbol_indices: torch.Tensor | None = None,
         return_scores: bool = False,
+        portfolio_context: dict[str, torch.Tensor] | None = None,
     ):
         self._check_shapes(x, mask, symbol_indices)
         if mask is None:
@@ -857,6 +858,7 @@ class FinancialTransformerModel(TransformerBasePortfolioModel):
             return_aux=return_aux,
             return_scores=return_scores,
             temporal_basis_source=raw_basis_source,
+            portfolio_context=portfolio_context,
         )
         return self._attach_candle_aux(output, token_aux, return_aux)
 

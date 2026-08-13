@@ -6,7 +6,7 @@ runner:
   # The parent config intentionally targets a single 16 GiB workstation.  This
   # root is also checkpoint-incompatible with the old post-temporal basis
   # branch; never mix the two model contracts.
-  output_dir: artifacts/markets/tw_public_candles_multi_basis_online_complete_input_features_lookback32_v1_dual5090_1m
+  output_dir: artifacts/markets/tw_public_candles_multi_basis_online_complete_input_features_lookback32_v1_dual5090_10m
   # The output root is fresh on first launch and safely resumable afterward.
   resume: true
   # Training already writes canonical fold and walk-forward artifacts.  Avoid a
@@ -16,7 +16,7 @@ runner:
 trading:
   # Absolute TWD equity anchor used by the TW day-trade executor, volume cap,
   # and exact integer-share audit.
-  volume_participation_equity: 1000000.0
+  volume_participation_equity: 10000000.0
 
 training:
   # Global DDP batch 128 gives each RTX 5090 a local power-of-two batch 64,

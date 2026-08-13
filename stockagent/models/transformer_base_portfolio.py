@@ -3238,6 +3238,7 @@ class TransformerBasePortfolioModel(nn.Module):
         temperature: float | torch.Tensor | None = None,
         return_aux: bool | None = None,
         return_scores: bool = False,
+        portfolio_context: dict[str, torch.Tensor] | None = None,
     ):
         self._require_compact_explainability_mode()
         safe_mask = _safe_attention_mask(mask_bool)
@@ -3277,6 +3278,7 @@ class TransformerBasePortfolioModel(nn.Module):
             temperature=temperature,
             return_aux=return_aux,
             return_scores=return_scores,
+            portfolio_context=portfolio_context,
         )
 
     def _forward_embedded(
@@ -3287,6 +3289,7 @@ class TransformerBasePortfolioModel(nn.Module):
         return_aux: bool | None = None,
         return_scores: bool = False,
         temporal_basis_source: torch.Tensor | None = None,
+        portfolio_context: dict[str, torch.Tensor] | None = None,
     ):
         safe_mask = _safe_attention_mask(mask_bool)
         collect_aux = bool(return_aux is True or (return_aux is None and self.return_aux and self.return_aux_details))
@@ -3345,6 +3348,7 @@ class TransformerBasePortfolioModel(nn.Module):
             temperature=temperature,
             return_aux=return_aux,
             return_scores=return_scores,
+            portfolio_context=portfolio_context,
         )
 
     def _postprocess_flat_target_logits(
@@ -3766,7 +3770,9 @@ class TransformerBasePortfolioModel(nn.Module):
         temperature: float | torch.Tensor | None = None,
         return_aux: bool | None = None,
         return_scores: bool = False,
+        portfolio_context: dict[str, torch.Tensor] | None = None,
     ):
+        del portfolio_context
         if self.num_action_channels > 1:
             return self._multi_action_outputs_from_stock_embeddings(
                 z_stock,
@@ -4042,6 +4048,7 @@ class TransformerBasePortfolioModel(nn.Module):
         return_aux: bool | None = None,
         symbol_indices: torch.Tensor | None = None,
         return_scores: bool = False,
+        portfolio_context: dict[str, torch.Tensor] | None = None,
     ):
         self._check_shapes(x, mask, symbol_indices)
         if mask is None:
@@ -4057,6 +4064,7 @@ class TransformerBasePortfolioModel(nn.Module):
             return_aux=return_aux,
             return_scores=return_scores,
             temporal_basis_source=raw_basis_source,
+            portfolio_context=portfolio_context,
         )
 
     def forward_from_panel(
@@ -4067,6 +4075,7 @@ class TransformerBasePortfolioModel(nn.Module):
         temperature: float | torch.Tensor | None = None,
         return_aux: bool | None = None,
         symbol_indices: torch.Tensor | None = None,
+        portfolio_context: dict[str, torch.Tensor] | None = None,
     ):
         self._check_panel_shapes(features, date_indices, mask, symbol_indices)
         h = self._embed_windowed_from_panel(features, date_indices, symbol_indices)
@@ -4084,6 +4093,7 @@ class TransformerBasePortfolioModel(nn.Module):
             temperature=temperature,
             return_aux=return_aux,
             temporal_basis_source=raw_basis_source,
+            portfolio_context=portfolio_context,
         )
 
     def forward_from_panel_slab(
@@ -4093,6 +4103,7 @@ class TransformerBasePortfolioModel(nn.Module):
         temperature: float | torch.Tensor | None = None,
         return_aux: bool | None = None,
         symbol_indices: torch.Tensor | None = None,
+        portfolio_context: dict[str, torch.Tensor] | None = None,
     ):
         self._check_panel_slab_shapes(feature_slab, mask, symbol_indices)
         h = self._embed_windowed_from_panel_slab(feature_slab, symbol_indices)
@@ -4109,6 +4120,7 @@ class TransformerBasePortfolioModel(nn.Module):
             temperature=temperature,
             return_aux=return_aux,
             temporal_basis_source=raw_basis_source,
+            portfolio_context=portfolio_context,
         )
 
     def forward_from_batched_panel_slabs(
@@ -4118,6 +4130,7 @@ class TransformerBasePortfolioModel(nn.Module):
         temperature: float | torch.Tensor | None = None,
         return_aux: bool | None = None,
         symbol_indices: torch.Tensor | None = None,
+        portfolio_context: dict[str, torch.Tensor] | None = None,
     ):
         """Forward independent contiguous panel slabs without repeated projection.
 
@@ -4148,4 +4161,5 @@ class TransformerBasePortfolioModel(nn.Module):
             temperature=temperature,
             return_aux=return_aux,
             temporal_basis_source=raw_basis_source,
+            portfolio_context=portfolio_context,
         )

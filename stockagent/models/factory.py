@@ -11,6 +11,9 @@ from stockagent.models.cross_sectional_temporal_portfolio_model import CrossSect
 from stockagent.models.cross_sectional_index_futures import (
     CrossSectionalIndexFuturesModel,
 )
+from stockagent.models.cross_sectional_index_derivatives_day import (
+    CrossSectionalIndexDerivativesDayModel,
+)
 from stockagent.models.efficient_tcn_tabular_set_portfolio import EfficientTCNTabularSetPortfolioModel
 from stockagent.models.ft_transformer import CrossSectionalFTTransformer
 from stockagent.models.financial_transformer import FinancialTransformerModel
@@ -100,6 +103,12 @@ _CROSS_SECTIONAL_INDEX_FUTURES_NAMES = {
     "tw_index_futures",
 }
 
+_CROSS_SECTIONAL_INDEX_DERIVATIVES_DAY_NAMES = {
+    "cross_sectional_index_derivatives_day",
+    "cross_sectional_index_derivatives_day_model",
+    "tw_index_derivatives_day",
+}
+
 _FINANCIAL_TRANSFORMER_NAMES = {
     "financial_transformer",
     "financial_transformer_model",
@@ -139,7 +148,10 @@ def model_hidden_dim_hint(config: ExperimentConfig) -> int:
         | _CROSS_SECTIONAL_INDEX_FUTURES_NAMES
     ):
         return int(config.training.transformer_base_portfolio.d_model)
-    if model_name in _FINANCIAL_TRANSFORMER_NAMES:
+    if model_name in (
+        _FINANCIAL_TRANSFORMER_NAMES
+        | _CROSS_SECTIONAL_INDEX_DERIVATIVES_DAY_NAMES
+    ):
         return int(config.training.financial_transformer.d_model)
     if model_name in _GRADIENT_BOOSTED_PORTFOLIO_TRANSFORMER_NAMES:
         return int(config.training.gradient_boosted_portfolio_transformer.d_model)
@@ -430,12 +442,47 @@ def build_model(
             **futures_kwargs,
         )
 
-    if model_name in _FINANCIAL_TRANSFORMER_NAMES:
+    if model_name in (
+        _FINANCIAL_TRANSFORMER_NAMES
+        | _CROSS_SECTIONAL_INDEX_DERIVATIVES_DAY_NAMES
+    ):
         fin_cfg = config.training.financial_transformer
         portfolio_mode = str(fin_cfg.portfolio_mode).strip().lower().replace("-", "_")
         if portfolio_mode in {"", "auto"}:
             portfolio_mode = "long_only" if config.trading.long_only else "long_short"
-        return FinancialTransformerModel(
+        model_type = (
+            CrossSectionalIndexDerivativesDayModel
+            if model_name in _CROSS_SECTIONAL_INDEX_DERIVATIVES_DAY_NAMES
+            else FinancialTransformerModel
+        )
+        derivative_kwargs = (
+            {
+                "maximum_capital_fraction": getattr(
+                    config.trading,
+                    "tw_index_derivatives_day_maximum_capital_fraction",
+                    0.98,
+                ),
+                "derivative_head_hidden_dim": fin_cfg.head_hidden_dim,
+                "use_exposure_gate": getattr(
+                    config.trading,
+                    "tw_index_derivatives_day_use_exposure_gate",
+                    False,
+                ),
+                "exposure_gate_init_logit": getattr(
+                    config.trading,
+                    "tw_index_derivatives_day_exposure_gate_init_logit",
+                    -2.0,
+                ),
+                "option_maximum_capital_fraction": getattr(
+                    config.trading,
+                    "tw_index_derivatives_day_option_maximum_capital_fraction",
+                    0.98,
+                ),
+            }
+            if model_name in _CROSS_SECTIONAL_INDEX_DERIVATIVES_DAY_NAMES
+            else {}
+        )
+        return model_type(
             lookback=lookback,
             num_features=num_features,
             num_symbols=num_symbols,
@@ -508,6 +555,7 @@ def build_model(
             daily_context_layers=fin_cfg.daily_context_layers,
             daily_context_pooling=fin_cfg.daily_context_pooling,
             execution_mode=getattr(config.trading, "execution_mode", "naive"),
+            **derivative_kwargs,
         )
 
     if model_name in _GRADIENT_BOOSTED_PORTFOLIO_TRANSFORMER_NAMES:

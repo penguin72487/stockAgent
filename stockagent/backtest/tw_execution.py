@@ -29,6 +29,7 @@ EXECUTION_MODES: Final[tuple[str, ...]] = (
     "tw_minute",
     "tw_overnight",
     "tw_index_futures_day",
+    "tw_index_derivatives_day",
     "tw_index_derivatives_tick",
     "tw_index_options_tick_long",
     "tw_index_options_tick_short",
@@ -114,6 +115,11 @@ _EXECUTION_MODE_ALIASES: Final[dict[str, str]] = {
     "tw_futures_day": "tw_index_futures_day",
     "taiex_futures_day": "tw_index_futures_day",
     "台指期日盤": "tw_index_futures_day",
+    # Daily-flat joint TX/MTX/TMF plus full-chain monthly/weekly TXO.
+    "tw_index_derivatives_day": "tw_index_derivatives_day",
+    "tw_futures_options_day": "tw_index_derivatives_day",
+    "taiex_derivatives_day": "tw_index_derivatives_day",
+    "台指期選日盤": "tw_index_derivatives_day",
     # Completed-second TX/TXO trade events with next-TX-trade execution.  The
     # official public source has no sub-second ordering, so "tick" here means
     # the finest defensible event clock exposed by that source.
@@ -146,7 +152,8 @@ def normalize_execution_mode(mode: object) -> str:
         raise ValueError(
             "execution_mode must be one of "
             "'naive', 'tw_cash', 'tw_day_trade', 'tw_minute', 'tw_overnight', or "
-            "'tw_index_futures_day', 'tw_index_derivatives_tick', "
+            "'tw_index_futures_day', 'tw_index_derivatives_day', "
+            "'tw_index_derivatives_tick', "
             "'tw_index_options_tick_long', or 'tw_index_options_tick_short'"
         )
     normalized = "_".join(mode.strip().casefold().replace("-", "_").split())
@@ -155,7 +162,8 @@ def normalize_execution_mode(mode: object) -> str:
         raise ValueError(
             "execution_mode must be one of "
             "'naive', 'tw_cash', 'tw_day_trade', 'tw_minute', 'tw_overnight', or "
-            "'tw_index_futures_day', 'tw_index_derivatives_tick', "
+            "'tw_index_futures_day', 'tw_index_derivatives_day', "
+            "'tw_index_derivatives_tick', "
             "'tw_index_options_tick_long', or 'tw_index_options_tick_short'"
         )
     return canonical

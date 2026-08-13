@@ -419,7 +419,7 @@ def test_online_complete_multi_basis_dual_5090_config_restores_host_capacity() -
     assert config.runner.resume is True
     assert config.runner.post_train_infer is False
     assert str(config.runner.output_dir).endswith(
-        "_input_features_lookback32_v1_dual5090_1m"
+        "_input_features_lookback32_v1_dual5090_10m"
     )
 
 

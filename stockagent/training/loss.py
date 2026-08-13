@@ -16,6 +16,9 @@ from stockagent.backtest.tw_execution import (
     TW_CARRYING_EXECUTION_MODES,
     normalize_execution_mode,
 )
+from stockagent.data.tw_index_derivatives_day import (
+    TAIFEX_INDEX_DERIVATIVE_ACTION_COUNT_V4,
+)
 from stockagent.models.normalization import DEFAULT_PORTFOLIO_ACTIVATION
 
 
@@ -1215,6 +1218,27 @@ def risk_aware_loss(
     )
     tradable = tradable_mask.to(dtype=torch.bool, device=weights.device)
     objective_norm = objective.strip().lower()
+    if mode == "tw_index_derivatives_day":
+        if weights.dim() != 2 or int(weights.size(1)) != TAIFEX_INDEX_DERIVATIVE_ACTION_COUNT_V4:
+            raise ValueError(
+                "tw_index_derivatives_day requires direct model actions "
+                "[T,D_derivatives], "
+                f"got {tuple(weights.shape)}"
+            )
+        if objective_norm not in {
+            "log_utility",
+            "log_util",
+            "kelly",
+            "growth",
+            "mean_log_return",
+        }:
+            raise ValueError(
+                "tw_index_derivatives_day supports only canonical log utility"
+            )
+        if overnight_log_returns is None:
+            raise ValueError(
+                "tw_index_derivatives_day requires aligned derivative simple returns"
+            )
     if mode in TW_CARRYING_EXECUTION_MODES:
         phase_actions = mode == "tw_overnight" or weights.dim() == 3
         expected_channels = 2 if mode == "tw_cash" else 3

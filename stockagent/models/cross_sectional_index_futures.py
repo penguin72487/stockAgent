@@ -62,7 +62,9 @@ class CrossSectionalIndexFuturesModel(TransformerBasePortfolioModel):
         temperature: float | torch.Tensor | None = None,
         return_aux: bool | None = None,
         return_scores: bool = False,
+        portfolio_context: dict[str, torch.Tensor] | None = None,
     ):
+        del portfolio_context
         if z_stock.ndim != 3:
             raise ValueError(
                 f"z_stock must have shape [B,S,D], got {tuple(z_stock.shape)}"

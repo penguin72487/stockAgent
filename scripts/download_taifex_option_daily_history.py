@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Download official TAIFEX option daily history and build monthly ATM pairs.
+"""Download official TAIFEX daily options and build ATM plus full-chain data.
 
 Completed calendar years use the official annual ZIP archive.  The current
 year uses one-month daily requests because the TAIFEX endpoint limits each
@@ -17,6 +17,8 @@ import sys
 import time
 from typing import Final
 
+import numpy as np
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
@@ -33,6 +35,7 @@ from stockagent.data.tw_index_options_daily import (  # noqa: E402
     TAIFEX_OPTION_SERIES_SCOPES,
     TAIFEX_OPTIONS_DAILY_DATA_CONTRACT_VERSION,
     TAIFEX_OPTIONS_DAILY_PRICE_SOURCE,
+    build_taifex_option_full_chain,
     build_taifex_opening_atm_straddles,
     load_taifex_opening_atm_straddles,
 )
@@ -116,6 +119,30 @@ def _quality_summary(normalized: Path, *, series_scope: str) -> dict[str, object
     }
 
 
+def _full_chain_quality_summary(normalized: Path) -> dict[str, object]:
+    import pyarrow.parquet as pq
+
+    table = pq.read_table(
+        normalized,
+        columns=["date", "option_slot", "executable"],
+    )
+    dates = np.asarray(table.column("date").to_numpy(), dtype="datetime64[D]")
+    slots = np.asarray(table.column("option_slot").to_numpy(), dtype=np.int32)
+    executable = np.asarray(table.column("executable").to_numpy(), dtype=bool)
+    if dates.size:
+        _, daily_counts = np.unique(dates[executable], return_counts=True)
+    else:
+        daily_counts = np.empty(0, dtype=np.int64)
+    return {
+        "rows": int(dates.size),
+        "first_date": str(dates.min()) if dates.size else None,
+        "last_date": str(dates.max()) if dates.size else None,
+        "executable_rows": int(executable.sum()),
+        "distinct_slots": int(np.unique(slots).size),
+        "maximum_executable_legs_per_day": int(daily_counts.max()) if daily_counts.size else 0,
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -125,15 +152,18 @@ def main() -> int:
     )
     parser.add_argument(
         "--futures-path",
-        default="data_tw_index_futures/day_session_front_month.parquet",
+        default="data_tw_index_futures/day_session_contracts.parquet",
         help="Official normalized front-month TX day-session parquet.",
     )
     parser.add_argument("--start-year", type=int, default=2001)
     parser.add_argument(
         "--series-scope",
-        choices=TAIFEX_OPTION_SERIES_SCOPES,
+        choices=(*TAIFEX_OPTION_SERIES_SCOPES, "all"),
         default="monthly",
-        help="Monthly series or nearest-expiry weekly series.",
+        help=(
+            "Monthly series, nearest-expiry weekly series, or both from one "
+            "shared immutable receipt download."
+        ),
     )
     parser.add_argument(
         "--end-date",
@@ -204,60 +234,84 @@ def main() -> int:
         "monthly": "monthly_opening_atm_pairs.parquet",
         "weekly": "weekly_nearest_expiry_opening_atm_pairs.parquet",
     }
+    full_chain_output_names = {
+        "monthly": "monthly_full_chain.parquet",
+        "weekly": "weekly_full_chain.parquet",
+    }
     dataset_names = {
         "monthly": "taifex_monthly_opening_atm_straddles",
         "weekly": "taifex_nearest_expiry_weekly_opening_atm_straddles",
     }
-    normalized = output_dir / output_names[args.series_scope]
-    build_taifex_opening_atm_straddles(
-        receipts,
-        futures_path,
-        normalized,
-        series_scope=args.series_scope,
+    selected_scopes = (
+        TAIFEX_OPTION_SERIES_SCOPES
+        if args.series_scope == "all"
+        else (args.series_scope,)
     )
-    quality = _quality_summary(normalized, series_scope=args.series_scope)
-    manifest = {
-        "dataset": dataset_names[args.series_scope],
-        "contract_version": TAIFEX_OPTIONS_DAILY_DATA_CONTRACT_VERSION,
-        "status": "complete",
-        "official_page": TAIFEX_OPTION_DAILY_PAGE,
-        "official_download_endpoint": TAIFEX_OPTION_DOWNLOAD_URL,
-        "product": "TXO",
-        "session": "一般",
-        "series_scope": (
-            "nearest_unexpired_monthly_only"
-            if args.series_scope == "monthly"
-            else "nearest_expiry_weekly_only"
-        ),
-        "atm_reference": "official_front_month_TX_day_session_open",
-        "price_source": TAIFEX_OPTIONS_DAILY_PRICE_SOURCE,
-        "price_boundary": (
-            "option open/close are each leg's first/last official transaction; "
-            "they are not simultaneous executable bid/ask quotes"
-        ),
-        "start_year": int(args.start_year),
-        "end_date": args.end_date.isoformat(),
-        "futures_path": str(futures_path),
-        "futures_sha256": sha256_path(futures_path),
-        "normalized_path": str(normalized),
-        "normalized_sha256": sha256_path(normalized),
-        "quality": quality,
-        "receipts": [
-            {
-                "path": str(path),
-                "bytes": path.stat().st_size,
-                "sha256": sha256_path(path),
-            }
-            for path in receipts
-        ],
-    }
-    manifest_name = "manifest.json" if args.series_scope == "monthly" else "manifest_weekly.json"
-    atomic_write_json(output_dir / manifest_name, manifest)
-    print(
-        f"built {normalized} from {len(receipts)} official receipt(s); "
-        f"{quality['executable_rows']:,}/{quality['rows']:,} candidate sessions executable",
-        flush=True,
-    )
+    receipt_manifest = [
+        {
+            "path": str(path),
+            "bytes": path.stat().st_size,
+            "sha256": sha256_path(path),
+        }
+        for path in receipts
+    ]
+    for series_scope in selected_scopes:
+        normalized = output_dir / output_names[series_scope]
+        build_taifex_opening_atm_straddles(
+            receipts,
+            futures_path,
+            normalized,
+            series_scope=series_scope,
+        )
+        full_chain = output_dir / full_chain_output_names[series_scope]
+        build_taifex_option_full_chain(
+            receipts,
+            futures_path,
+            full_chain,
+            series_scope=series_scope,
+        )
+        quality = _quality_summary(normalized, series_scope=series_scope)
+        full_chain_quality = _full_chain_quality_summary(full_chain)
+        manifest = {
+            "dataset": dataset_names[series_scope],
+            "contract_version": TAIFEX_OPTIONS_DAILY_DATA_CONTRACT_VERSION,
+            "status": "complete",
+            "official_page": TAIFEX_OPTION_DAILY_PAGE,
+            "official_download_endpoint": TAIFEX_OPTION_DOWNLOAD_URL,
+            "product": "TXO",
+            "session": "一般",
+            "series_scope": (
+                "nearest_unexpired_monthly_only"
+                if series_scope == "monthly"
+                else "nearest_expiry_weekly_only"
+            ),
+            "atm_reference": "official_front_month_TX_day_session_open",
+            "price_source": TAIFEX_OPTIONS_DAILY_PRICE_SOURCE,
+            "price_boundary": (
+                "option open/close are each leg's first/last official transaction; "
+                "they are not simultaneous executable bid/ask quotes"
+            ),
+            "start_year": int(args.start_year),
+            "end_date": args.end_date.isoformat(),
+            "futures_path": str(futures_path),
+            "futures_sha256": sha256_path(futures_path),
+            "normalized_path": str(normalized),
+            "normalized_sha256": sha256_path(normalized),
+            "quality": quality,
+            "full_chain_path": str(full_chain),
+            "full_chain_sha256": sha256_path(full_chain),
+            "full_chain_quality": full_chain_quality,
+            "receipts": receipt_manifest,
+        }
+        manifest_name = (
+            "manifest.json" if series_scope == "monthly" else "manifest_weekly.json"
+        )
+        atomic_write_json(output_dir / manifest_name, manifest)
+        print(
+            f"built {normalized} from {len(receipts)} official receipt(s); "
+            f"{quality['executable_rows']:,}/{quality['rows']:,} candidate sessions executable",
+            flush=True,
+        )
     return 0
 
 
