@@ -26,11 +26,11 @@ trading:
   max_turnover_ratio: 0.0
   max_volume_participation: 0.0
 
-  # Differentiable TX proxy: 0.45 bps fixed-cost approximation per side and
-  # the configured 2 bps sale tax in the sell-side rate. Each TXO candidate's
-  # unbounded simple return independently includes fees, sale tax and slippage.
-  buy_fee_rate: 0.000045
-  sell_fee_rate: 0.000245
+  # Differentiable TX proxy: 0.45 bps fee approximation plus the statutory
+  # 0.20 bps transaction tax on each side.  Each TXO candidate's unbounded
+  # simple return independently includes fees, two premium taxes and slippage.
+  buy_fee_rate: 0.000065
+  sell_fee_rate: 0.000065
   tw_index_futures_initial_capital: 100000000.0
   tw_index_futures_max_abs_exposure: 1.0
 
@@ -39,9 +39,9 @@ trading:
   # Leave 2% uncommitted for integer granularity and execution charges.
   tw_index_derivatives_day_maximum_capital_fraction: 0.98
   tw_index_derivatives_day_option_fixed_fee_per_contract_per_side_twd: 22.0
-  # Long TXO buys at the open and sells at the close; tax applies only to the
-  # closing sale premium.
-  tw_index_derivatives_day_option_transaction_tax_rate: 0.0002
+  # Statutory TXO premium tax per transaction; opening and closing are both
+  # charged by the continuous and exact daily-flat executors.
+  tw_index_derivatives_day_option_transaction_tax_rate: 0.001
   tw_index_derivatives_day_option_slippage_points_per_side: 0.5
 
 training:

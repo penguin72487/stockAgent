@@ -773,16 +773,16 @@ def test_checkpoint_manifest_records_complete_configuration_fingerprint() -> Non
     assert changed_manifest["fingerprints"] == manifest["fingerprints"]
 
 
-def test_schema10_prior_backtest_contract_cannot_resume_but_can_infer(
+def test_schema11_prior_backtest_contract_cannot_resume_but_can_infer(
     tmp_path: Path,
 ) -> None:
     expected = _checkpoint_manifest(_panel(), _config())
     assert (
         expected["contracts"]["trading"]["canonical_backtest_contract_version"]
-        == 11
+        == 12
     )
     prior_contract = copy.deepcopy(expected)
-    prior_contract["contracts"]["trading"]["canonical_backtest_contract_version"] = 10
+    prior_contract["contracts"]["trading"]["canonical_backtest_contract_version"] = 11
     prior_contract["fingerprints"]["trading"] = trainer_module._stable_fingerprint(
         prior_contract["contracts"]["trading"]
     )
@@ -792,7 +792,7 @@ def test_schema10_prior_backtest_contract_cannot_resume_but_can_infer(
         _validate_checkpoint_manifest(
             checkpoint,
             expected,
-            checkpoint_path=tmp_path / "prior_backtest_schema10.pt",
+            checkpoint_path=tmp_path / "prior_backtest_schema11.pt",
             scope="resume",
         )
 
@@ -801,7 +801,7 @@ def test_schema10_prior_backtest_contract_cannot_resume_but_can_infer(
     _validate_checkpoint_manifest(
         checkpoint,
         expected,
-        checkpoint_path=tmp_path / "prior_backtest_schema10.pt",
+        checkpoint_path=tmp_path / "prior_backtest_schema11.pt",
         scope="inference",
     )
 

@@ -88,13 +88,17 @@ def test_integer_backtest_applies_sell_only_tax_and_both_side_fees() -> None:
     assert result.gross_pnl_twd[0] == pytest.approx(10_000.0)
     # Two MTX, TWD 24 per contract per side, two sides.
     assert result.fees_twd[0] == pytest.approx(96.0)
-    # Long opens with a buy and closes with a sale: only close is taxed.
-    assert result.tax_twd[0] == pytest.approx(2 * 50 * 10_100 * 0.0002)
-    assert result.net_pnl_twd[0] == pytest.approx(10_000.0 - 96.0 - 202.0)
+    # Both the opening and closing futures transactions are taxed.
+    assert result.tax_twd[0] == pytest.approx(
+        2 * 50 * (10_000 + 10_100) * 0.0002
+    )
+    assert result.net_pnl_twd[0] == pytest.approx(10_000.0 - 96.0 - 402.0)
     # Day two is short and therefore also profits when the index falls.
     assert result.gross_pnl_twd[1] > 0.0
-    # Short opens with a sale and closes with a buy: only open is taxed.
-    assert result.tax_twd[1] == pytest.approx(2 * 50 * 10_000 * 0.0002)
+    # Direction does not change the per-transaction tax base.
+    assert result.tax_twd[1] == pytest.approx(
+        2 * 50 * (10_000 + 9_900) * 0.0002
+    )
     assert result.equity[-1] > 1_000_000.0
     assert result.alive.all()
 
@@ -113,8 +117,8 @@ def test_basket_estimate_charges_one_sale_tax_and_two_fixed_fees() -> None:
         max_notional=1_000_000.0,
     )
     np.testing.assert_array_equal(basket.quantities, [0, 2, 0])
-    # 2 contracts * 2 sides * TWD 24 + one TWD 1m sale * 0.0002.
-    assert basket.estimated_round_trip_cost == pytest.approx(96.0 + 200.0)
+    # 2 contracts * 2 sides * TWD 24 + two TWD 1m transactions * 0.0002.
+    assert basket.estimated_round_trip_cost == pytest.approx(96.0 + 400.0)
 
 
 def test_one_hundred_million_capital_executes_small_model_exposure() -> None:
