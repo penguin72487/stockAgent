@@ -940,7 +940,8 @@ class TradingConfig:
     tw_index_futures_total_fee_per_side_twd: list[float] = field(
         default_factory=lambda: [60.0, 24.0, 16.0]
     )
-    tw_index_futures_sell_transaction_tax_rate: float = 0.0002
+    # Legacy field name; interpreted as the per-transaction statutory rate.
+    tw_index_futures_sell_transaction_tax_rate: float = 0.00002
     tw_index_futures_slippage_points_per_side: list[float] = field(
         default_factory=lambda: [0.0, 0.0, 0.0]
     )
@@ -970,7 +971,7 @@ class TradingConfig:
         "data_tw_public/twse_taiex_ohlc.parquet"
     )
     tw_index_derivatives_day_option_fixed_fee_per_contract_per_side_twd: float = 22.0
-    tw_index_derivatives_day_option_transaction_tax_rate: float = 0.0002
+    tw_index_derivatives_day_option_transaction_tax_rate: float = 0.001
     tw_index_derivatives_day_option_slippage_points_per_side: float = 0.5
     # Completed-second TX/TXO strategies. The futures mode charges costs on a
     # signed TX exposure; both direct-option policies share the fields below.

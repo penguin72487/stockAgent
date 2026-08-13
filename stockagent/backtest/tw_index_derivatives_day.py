@@ -25,13 +25,15 @@ from stockagent.data.tw_index_futures import (
 )
 
 
-TW_INDEX_DERIVATIVES_DAY_BACKTEST_CONTRACT_VERSION: Final[int] = 5
+TW_INDEX_DERIVATIVES_DAY_BACKTEST_CONTRACT_VERSION: Final[int] = 6
 
 
 @dataclass(frozen=True, slots=True)
 class OptionDayCostSchedule:
     fixed_fee_per_contract_per_side_twd: float = 22.0
-    transaction_tax_rate: float = 0.0002
+    # Statutory TXO premium tax per transaction.  A daily-flat position has an
+    # opening and a closing transaction, regardless of long/short direction.
+    transaction_tax_rate: float = 0.001
     slippage_points_per_side: float = 0.5
 
     def __post_init__(self) -> None:
@@ -344,9 +346,11 @@ def run_tw_index_derivatives_day_integer(
             active_mult = multipliers[active]
             gross_pnl[row] += float(np.dot(signed * active_mult, closes - opens))
             fees[row] += float(np.dot(absolute, future_fixed[active] * 2.0))
-            sale_prices = np.where(signed > 0.0, closes, opens)
             taxes[row] += float(
-                np.dot(absolute * active_mult, sale_prices * future_schedule.tax_rate)
+                np.dot(
+                    absolute * active_mult,
+                    (opens + closes) * future_schedule.tax_rate,
+                )
             )
             slippage[row] += float(
                 np.dot(absolute, future_slip[active] * active_mult * 2.0)
@@ -412,7 +416,7 @@ def run_tw_index_derivatives_day_integer(
             taxes[row] += (
                 absolute_count_f
                 * option_multiplier
-                * (open_price if short_side else close_price)
+                * (open_price + close_price)
                 * option_schedule.transaction_tax_rate
             )
             slippage[row] += (

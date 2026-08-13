@@ -1,0 +1,21 @@
+# Statutory-tax replay/training contract derived from the completed v7 model.
+#
+# This version deliberately changes only transaction-tax semantics and the
+# matching differentiable TX cost proxy.  It does not claim to fix v7's deeper
+# action-risk, liquidity, calibration, or validation-selection problems; those
+# are measured by the accompanying first-principles diagnostic report.
+base_config: tw_index_derivatives_day_multi_basis_cash_entmax_v7.yaml
+
+experiment_name: tw-stock-cross-section-index-derivatives-day-multi-basis-dual5090-cash-entmax-v8-statutory-tax
+
+runner:
+  output_dir: artifacts/markets/tw_index_derivatives_day_multi_basis_100m_relative_tenor_cash_entmax_v8_statutory_tax_dual5090
+  resume: true
+
+trading:
+  # 0.45 bps fee proxy + 0.20 bps statutory futures tax per transaction.
+  buy_fee_rate: 0.000065
+  sell_fee_rate: 0.000065
+  tw_index_futures_sell_transaction_tax_rate: 0.00002
+  # TXO premium tax per transaction; opening and closing are both charged.
+  tw_index_derivatives_day_option_transaction_tax_rate: 0.001

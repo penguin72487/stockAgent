@@ -746,7 +746,7 @@ def _trading_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
             "total_fee_per_side_twd": list(
                 trading.tw_index_futures_total_fee_per_side_twd
             ),
-            "sell_transaction_tax_rate": float(
+            "transaction_tax_rate_per_trade": float(
                 trading.tw_index_futures_sell_transaction_tax_rate
             ),
             "slippage_points_per_side": list(
@@ -780,7 +780,7 @@ def _trading_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
             "option_fixed_fee_per_contract_per_side_twd": float(
                 trading.tw_index_derivatives_day_option_fixed_fee_per_contract_per_side_twd
             ),
-            "option_sell_transaction_tax_rate": float(
+            "option_transaction_tax_rate_per_trade": float(
                 trading.tw_index_derivatives_day_option_transaction_tax_rate
             ),
             "option_slippage_points_per_side": float(

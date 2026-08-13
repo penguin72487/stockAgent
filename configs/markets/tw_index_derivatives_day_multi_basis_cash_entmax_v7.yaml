@@ -15,6 +15,13 @@ runner:
   resume: true
 
 trading:
+  # Reproducibility pins for the already-completed v7 artifact family.  These
+  # are the legacy one-sided rates used by that run, not the corrected
+  # statutory per-transaction contract introduced in v8.
+  buy_fee_rate: 0.000045
+  sell_fee_rate: 0.000245
+  tw_index_futures_sell_transaction_tax_rate: 0.0002
+  tw_index_derivatives_day_option_transaction_tax_rate: 0.0002
   # Both long and short TXO actions compete with futures for relative risk;
   # weak aggregate evidence leaves residual capital in cash automatically.
   # Short sizing uses the dated official naked-margin snapshot below; no
