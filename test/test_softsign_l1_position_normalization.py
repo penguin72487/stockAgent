@@ -7,6 +7,7 @@ from stockagent.models.normalization import (
     apply_portfolio_activation,
     dual_branch_softmax,
     masked_activation_l1_weights,
+    masked_cash_entmax15_weights,
     masked_l1_projection_weights,
     masked_signed_action_weights,
     masked_softmax,
@@ -95,6 +96,94 @@ def test_signed_action_entmax_can_return_sparse_actions() -> None:
     assert torch.allclose(action_sum, torch.ones_like(action_sum), atol=1e-5)
     assert torch.all(weights.abs().sum(dim=1) <= 1.0 + 1e-6)
     assert int((zero_actions <= 1e-7).sum().item()) >= 1
+
+
+def test_signed_action_entmax_short_mask_keeps_long_only_assets_out_of_short_book() -> None:
+    logits = torch.tensor([[-8.0, -9.0]], dtype=torch.float32)
+    mask = torch.ones_like(logits, dtype=torch.bool)
+    short_mask = torch.zeros_like(mask)
+
+    weights, parts = masked_signed_action_weights(
+        logits,
+        mask,
+        transform="entmax15",
+        long_only=False,
+        short_mask=short_mask,
+        return_parts=True,
+    )
+
+    torch.testing.assert_close(weights, torch.zeros_like(weights))
+    torch.testing.assert_close(
+        parts["action_short_alloc"],
+        torch.zeros_like(parts["action_short_alloc"]),
+    )
+    torch.testing.assert_close(
+        parts["action_cash_alloc"],
+        torch.ones_like(parts["action_cash_alloc"]),
+    )
+
+
+def test_cash_entmax_zero_evidence_is_cash_and_candidate_count_is_invariant() -> None:
+    for width in (2, 4_102):
+        zeros = torch.zeros(1, width, dtype=torch.float32, requires_grad=True)
+        mask = torch.ones_like(zeros, dtype=torch.bool)
+        weights, parts = masked_cash_entmax15_weights(
+            zeros,
+            mask,
+            short_mask=mask,
+            radius=0.98,
+            return_parts=True,
+        )
+        torch.testing.assert_close(weights, torch.zeros_like(weights))
+        torch.testing.assert_close(
+            parts["cash_entmax_cash_fraction"],
+            torch.ones_like(parts["cash_entmax_cash_fraction"]),
+        )
+
+    small = torch.tensor([[1.0, -1.0]], dtype=torch.float32)
+    wide = small.repeat(1, 2_051)
+    small_weights, small_parts = masked_cash_entmax15_weights(
+        small,
+        torch.ones_like(small, dtype=torch.bool),
+        radius=0.98,
+        return_parts=True,
+    )
+    wide_weights, wide_parts = masked_cash_entmax15_weights(
+        wide,
+        torch.ones_like(wide, dtype=torch.bool),
+        radius=0.98,
+        return_parts=True,
+    )
+    torch.testing.assert_close(
+        small_parts["cash_entmax_risk_fraction"],
+        wide_parts["cash_entmax_risk_fraction"],
+    )
+    torch.testing.assert_close(
+        small_weights.abs().sum(dim=1),
+        wide_weights.abs().sum(dim=1),
+        atol=1e-5,
+        rtol=1e-5,
+    )
+
+    sparse_small = torch.tensor([[8.0, 0.0]], dtype=torch.float32)
+    sparse_wide = torch.zeros(1, 4_102, dtype=torch.float32)
+    sparse_wide[0, 0] = 8.0
+    sparse_small_weights = masked_cash_entmax15_weights(
+        sparse_small,
+        torch.ones_like(sparse_small, dtype=torch.bool),
+        radius=0.98,
+    )
+    sparse_wide_weights = masked_cash_entmax15_weights(
+        sparse_wide,
+        torch.ones_like(sparse_wide, dtype=torch.bool),
+        radius=0.98,
+    )
+    torch.testing.assert_close(
+        sparse_small_weights.abs().sum(dim=1),
+        sparse_wide_weights.abs().sum(dim=1),
+        atol=1e-5,
+        rtol=1e-5,
+    )
 
 
 def test_signed_action_entmax_amplifies_uniform_large_universe_gradient_vs_softmax() -> None:

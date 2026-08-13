@@ -18,7 +18,11 @@ from stockagent.live.tw_day_trade_dashboard import (
     build_dashboard_snapshot,
 )
 from stockagent.live.tw_day_trade_simulation import (
+    DAY_TRADE_SHORTFALL_BORROW_FEE_RATE,
+    DAY_TRADE_SHORTFALL_HANDLING_FEE_FRACTION,
     LiveEligibility,
+    MARGIN_FINANCING_ANNUAL_RATE,
+    MARGIN_FINANCING_RATIO,
     ModeSpec,
     TwDayTradeSimulationEngine,
     load_live_eligibility,
@@ -97,14 +101,17 @@ def _eligibility() -> dict[str, LiveEligibility]:
 
 def _quote(
     *,
+    open_price: float = 1_000.0,
     bid: float = 998.0,
     ask: float = 1000.0,
     last: float = 999.0,
     bid_volume: float = 20.0,
     ask_volume: float = 20.0,
+    minute_volume_lots: float = 100.0,
 ) -> dict[str, object]:
     return {
         "symbol": "2330",
+        "open": open_price,
         "last": last,
         "bid": bid,
         "ask": ask,
@@ -112,7 +119,8 @@ def _quote(
         "ask_volume": ask_volume,
         "upper_limit": 1_100.0,
         "lower_limit": 900.0,
-        "quote_at": _now(9, 0, 6).isoformat(),
+        "minute_volume_lots": minute_volume_lots,
+        "quote_at": _now(9, 1, 6).isoformat(),
         "source": "fixture",
     }
 
@@ -130,10 +138,28 @@ def test_entry_waits_for_quote_strictly_after_signal(tmp_path: Path) -> None:
         quotes={"2330": quote},
         eligibility=_eligibility(),
         eligibility_coverage={},
-        now=_now(9, 0, 6),
+        now=_now(9, 1, 6),
     )
 
     assert result == "waiting_quote"
+    assert not engine.state["modes"][spec.market]["positions"]
+
+
+def test_entry_waits_until_first_minute_is_complete(tmp_path: Path) -> None:
+    spec = _spec(tmp_path)
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+
+    result = engine.register_signal(
+        spec=spec,
+        summary=_summary(),
+        signal_rows=[_row()],
+        quotes={"2330": _quote()},
+        eligibility=_eligibility(),
+        eligibility_coverage={},
+        now=_now(9, 0, 59),
+    )
+
+    assert result == "waiting_first_minute"
     assert not engine.state["modes"][spec.market]["positions"]
 
 
@@ -148,7 +174,7 @@ def test_market_entry_uses_best_ask_and_records_board_lot(tmp_path: Path) -> Non
         quotes={"2330": _quote()},
         eligibility=_eligibility(),
         eligibility_coverage={},
-        now=_now(9, 0, 7),
+        now=_now(9, 1, 7),
     )
 
     assert result == "registered"
@@ -157,6 +183,84 @@ def test_market_entry_uses_best_ask_and_records_board_lot(tmp_path: Path) -> Non
     assert position["filled_shares"] == 1_000
     assert position["take_profit_price"] == 1_100.0
     assert position["stop_trigger_price"] == 900.0
+
+
+def test_entry_sizes_at_open_and_caps_fill_at_half_minute_kbar(tmp_path: Path) -> None:
+    spec = _spec(tmp_path)
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+
+    engine.register_signal(
+        spec=spec,
+        summary=_summary(),
+        signal_rows=[_row(0.5)],
+        quotes={
+            "2330": _quote(
+                open_price=500.0,
+                ask=1_000.0,
+                ask_volume=20.0,
+                minute_volume_lots=2.0,
+            )
+        },
+        eligibility=_eligibility(),
+        eligibility_coverage={},
+        now=_now(9, 1, 7),
+    )
+
+    position = next(iter(engine.state["modes"][spec.market]["positions"].values()))
+    assert position["requested_shares"] == 10_000
+    assert position["sizing_open_price"] == 500.0
+    assert position["entry_price"] == 1_000.0
+    assert position["filled_shares"] == 1_000
+
+
+def test_cumulative_snapshots_only_create_adjacent_minute_volume(tmp_path: Path) -> None:
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+
+    at_open = engine.prepare_minute_quotes(
+        {"2330": {"cumulative_volume_lots": 3.0}}, now=_now(9, 0)
+    )
+    first = engine.prepare_minute_quotes(
+        {"2330": {"cumulative_volume_lots": 10.0}}, now=_now(9, 1)
+    )
+    second = engine.prepare_minute_quotes(
+        {"2330": {"cumulative_volume_lots": 14.0}}, now=_now(9, 2)
+    )
+    gap = engine.prepare_minute_quotes(
+        {"2330": {"cumulative_volume_lots": 30.0}}, now=_now(9, 4)
+    )
+
+    assert at_open["2330"]["minute_volume_lots"] is None
+    assert first["2330"]["minute_volume_lots"] == 10.0
+    assert second["2330"]["minute_volume_lots"] == 4.0
+    assert gap["2330"]["minute_volume_lots"] is None
+
+
+def test_schema2_open_position_migrates_fail_closed(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    (state_dir / "state.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "modes": {
+                    "tw_day_trade": {
+                        "positions": {"legacy": {"signed_shares": 1_000}}
+                    }
+                },
+                "benchmarks": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    engine = TwDayTradeSimulationEngine(state_dir)
+
+    mode = engine.state["modes"]["tw_day_trade"]
+    assert engine.state["schema_version"] == 3
+    assert mode["legacy_execution_contract"] is True
+    assert mode["engine_status"] == (
+        "critical_legacy_position_requires_reconciliation"
+    )
 
 
 def test_entry_only_fills_displayed_level_one_volume(tmp_path: Path) -> None:
@@ -170,7 +274,7 @@ def test_entry_only_fills_displayed_level_one_volume(tmp_path: Path) -> None:
         quotes={"2330": _quote(ask_volume=1.0)},
         eligibility=_eligibility(),
         eligibility_coverage={},
-        now=_now(9, 0, 7),
+        now=_now(9, 1, 7),
     )
 
     position = next(iter(engine.state["modes"][spec.market]["positions"].values()))
@@ -210,12 +314,16 @@ def test_two_sided_live_signal_reduces_only_the_better_filled_side(
         summary=_summary(),
         signal_rows=[long_row, short_row],
         quotes={
-            "2330": _quote(bid=99.0, ask=100.0, ask_volume=1.0),
-            "2317": _quote(bid=100.0, ask=101.0, bid_volume=20.0),
+            "2330": _quote(
+                open_price=100.0, bid=99.0, ask=100.0, ask_volume=1.0
+            ),
+            "2317": _quote(
+                open_price=100.0, bid=100.0, ask=101.0, bid_volume=20.0
+            ),
         },
         eligibility=eligibility,
         eligibility_coverage={},
-        now=_now(9, 0, 7),
+        now=_now(9, 1, 7),
     )
 
     mode = engine.state["modes"][spec.market]
@@ -259,7 +367,7 @@ def test_two_sided_live_signal_fails_complete_portfolio_flat_when_one_side_has_n
         },
         eligibility=eligibility,
         eligibility_coverage={},
-        now=_now(9, 0, 7),
+        now=_now(9, 1, 7),
     )
 
     mode = engine.state["modes"][spec.market]
@@ -281,12 +389,12 @@ def test_entry_without_displayed_volume_fails_closed(tmp_path: Path) -> None:
         quotes={"2330": quote},
         eligibility=_eligibility(),
         eligibility_coverage={},
-        now=_now(9, 0, 7),
+        now=_now(9, 1, 7),
     )
 
     assert not engine.state["modes"][spec.market]["positions"]
     signal = json.loads(engine.signals_path.read_text().splitlines()[-1])
-    assert signal["reason"] == "top_book_volume_unavailable"
+    assert signal["reason"] == "minute_or_top_book_volume_unavailable"
 
 
 def test_second_signal_cannot_overwrite_an_open_position(tmp_path: Path) -> None:
@@ -299,7 +407,7 @@ def test_second_signal_cannot_overwrite_an_open_position(tmp_path: Path) -> None
         quotes={"2330": _quote()},
         eligibility=_eligibility(),
         eligibility_coverage={},
-        now=_now(9, 0, 7),
+        now=_now(9, 1, 7),
     )
 
     result = engine.register_signal(
@@ -334,7 +442,7 @@ def test_only_one_daily_entry_is_allowed_after_the_first_is_closed(
         quotes={"2330": _quote()},
         eligibility=_eligibility(),
         eligibility_coverage={},
-        now=_now(9, 0, 7),
+        now=_now(9, 1, 7),
     )
     engine.process_quotes(
         quotes={"2330": _quote(bid=899.0, ask=900.0, last=900.0)},
@@ -380,7 +488,7 @@ def test_rearm_flat_session_preserves_audit_and_allows_replacement_signal(
         quotes={"2330": _quote()},
         eligibility={"2330": missing},
         eligibility_coverage={},
-        now=_now(9, 0, 7),
+        now=_now(9, 1, 7),
     )
 
     assert (
@@ -426,7 +534,7 @@ def test_rearm_flat_session_refuses_any_position_history(tmp_path: Path) -> None
         quotes={"2330": _quote()},
         eligibility=_eligibility(),
         eligibility_coverage={},
-        now=_now(9, 0, 7),
+        now=_now(9, 1, 7),
     )
     engine.process_quotes(
         quotes={"2330": _quote(bid=899.0, ask=900.0, last=900.0)},
@@ -451,7 +559,7 @@ def test_lower_limit_is_local_stop_not_immediate_sell_limit(tmp_path: Path) -> N
         quotes={"2330": _quote()},
         eligibility=_eligibility(),
         eligibility_coverage={},
-        now=_now(9, 0, 7),
+        now=_now(9, 1, 7),
     )
 
     engine.process_quotes(
@@ -474,7 +582,7 @@ def test_stop_trigger_is_idempotent_and_uses_executable_bid(tmp_path: Path) -> N
         quotes={"2330": _quote()},
         eligibility=_eligibility(),
         eligibility_coverage={},
-        now=_now(9, 0, 7),
+        now=_now(9, 1, 7),
     )
 
     stop_quote = _quote(bid=899.0, ask=900.0, last=900.0)
@@ -502,7 +610,7 @@ def test_1320_passive_limit_then_1324_market_force_exit(tmp_path: Path) -> None:
         quotes={"2330": _quote()},
         eligibility=_eligibility(),
         eligibility_coverage={},
-        now=_now(9, 0, 7),
+        now=_now(9, 1, 7),
     )
 
     engine.process_quotes(
@@ -532,7 +640,7 @@ def test_1320_missing_quote_places_limit_on_first_later_quote(tmp_path: Path) ->
         quotes={"2330": _quote()},
         eligibility=_eligibility(),
         eligibility_coverage={},
-        now=_now(9, 0, 7),
+        now=_now(9, 1, 7),
     )
     position = next(iter(engine.state["modes"][spec.market]["positions"].values()))
 
@@ -550,7 +658,7 @@ def test_1320_missing_quote_places_limit_on_first_later_quote(tmp_path: Path) ->
     )
 
 
-def test_1324_only_consumes_visible_depth_and_retries_remainder(tmp_path: Path) -> None:
+def test_1324_market_then_1325_limit_rod_and_1330_auction_fill(tmp_path: Path) -> None:
     spec = _spec(tmp_path)
     engine = TwDayTradeSimulationEngine(tmp_path / "state")
     engine.register_signal(
@@ -560,7 +668,7 @@ def test_1324_only_consumes_visible_depth_and_retries_remainder(tmp_path: Path) 
         quotes={"2330": _quote(ask_volume=3.0)},
         eligibility=_eligibility(),
         eligibility_coverage={},
-        now=_now(9, 0, 7),
+        now=_now(9, 1, 7),
     )
     position = next(iter(engine.state["modes"][spec.market]["positions"].values()))
 
@@ -576,6 +684,21 @@ def test_1324_only_consumes_visible_depth_and_retries_remainder(tmp_path: Path) 
         quotes={"2330": _quote(bid=1003.0, ask=1005.0, bid_volume=2.0)},
         now=_now(13, 25),
     )
+    assert position["signed_shares"] == 2_000
+    assert position["closing_auction_order_status"] == "working"
+
+    engine.process_quotes(
+        quotes={
+            "2330": _quote(
+                bid=1003.0,
+                ask=1005.0,
+                last=1004.0,
+                bid_volume=2.0,
+                minute_volume_lots=4.0,
+            )
+        },
+        now=_now(13, 30),
+    )
     assert position["signed_shares"] == 0
     assert position["status"] == "closed"
     exit_fills = [
@@ -583,9 +706,63 @@ def test_1324_only_consumes_visible_depth_and_retries_remainder(tmp_path: Path) 
         for row in (
             json.loads(line) for line in engine.fills_path.read_text().splitlines()
         )
-        if row["purpose"] == "13_24_market_force_exit"
+        if row["purpose"]
+        in {"13_24_market_force_exit", "13_30_closing_auction_fill"}
     ]
     assert [row["quantity"] for row in exit_fills] == [1_000, 2_000]
+
+
+@pytest.mark.parametrize("target_weight", [0.1, -0.1])
+def test_1330_residual_is_reclassified_with_conservative_carry_cost(
+    tmp_path: Path,
+    target_weight: float,
+) -> None:
+    spec = _spec(tmp_path)
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+    engine.register_signal(
+        spec=spec,
+        summary=_summary(),
+        signal_rows=[_row(target_weight)],
+        quotes={"2330": _quote()},
+        eligibility=_eligibility(),
+        eligibility_coverage={},
+        now=_now(9, 1, 7),
+    )
+    position = next(iter(engine.state["modes"][spec.market]["positions"].values()))
+
+    engine.process_quotes(
+        quotes={
+            "2330": _quote(
+                bid_volume=0.0,
+                ask_volume=0.0,
+                minute_volume_lots=0.0,
+                last=1_000.0,
+            )
+        },
+        now=_now(13, 30),
+    )
+
+    assert abs(position["signed_shares"]) == 1_000
+    if target_weight > 0:
+        assert position["carry_type"] == "margin_financing_long"
+        expected_principal = 1_000 * 1_000.0 * MARGIN_FINANCING_RATIO
+        assert position["financing_principal_twd"] == expected_principal
+        assert position["carry_cost_twd"] == pytest.approx(
+            expected_principal * MARGIN_FINANCING_ANNUAL_RATE / 365.0
+        )
+    else:
+        assert position["carry_type"] == "day_trade_securities_shortfall"
+        expected_borrow = (
+            1_000 * 1_000.0 * DAY_TRADE_SHORTFALL_BORROW_FEE_RATE
+        )
+        assert position["shortfall_borrow_fee_twd"] == expected_borrow
+        assert position["shortfall_handling_fee_twd"] == pytest.approx(
+            expected_borrow * DAY_TRADE_SHORTFALL_HANDLING_FEE_FRACTION
+        )
+        assert position["normal_sell_tax_adjustment_twd"] > 0.0
+    assert engine.state["modes"][spec.market]["engine_status"] == (
+        "critical_residual_carried_after_13_30"
+    )
 
 
 def test_missing_mark_carries_same_position_equity_and_flags_stale(
@@ -600,7 +777,7 @@ def test_missing_mark_carries_same_position_equity_and_flags_stale(
         quotes={"2330": _quote()},
         eligibility=_eligibility(),
         eligibility_coverage={},
-        now=_now(9, 0, 7),
+        now=_now(9, 1, 7),
     )
     engine.process_quotes(
         quotes={"2330": _quote(bid=1005.0, ask=1006.0, last=1005.0)},
@@ -658,6 +835,8 @@ def test_quote_snapshot_exposes_bid_ask_and_computes_limits(tmp_path: Path) -> N
     snapshot = PriceSnapshot(
         prices=np.asarray([100.0]),
         source="fixture",
+        open_prices=np.asarray([98.0]),
+        volumes=np.asarray([123.0]),
         bid_prices=np.asarray([99.9]),
         ask_prices=np.asarray([100.0]),
         bid_volumes=np.asarray([5.0]),
@@ -668,6 +847,8 @@ def test_quote_snapshot_exposes_bid_ask_and_computes_limits(tmp_path: Path) -> N
     quotes = quote_map_from_snapshot(["2330"], snapshot, trading_date=date(2026, 8, 13))
     assert quotes["2330"]["bid"] == 99.9
     assert quotes["2330"]["ask"] == 100.0
+    assert quotes["2330"]["open"] == 98.0
+    assert quotes["2330"]["cumulative_volume_lots"] == 123.0
     assert quotes["2330"]["bid_volume"] == 5.0
     assert quotes["2330"]["ask_volume"] == 4.0
     assert quotes["2330"]["upper_limit"] == 110.0

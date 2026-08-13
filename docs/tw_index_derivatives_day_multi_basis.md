@@ -104,7 +104,7 @@ epoch 分別為 29.84 秒與 26.54 秒；修正後為 4.09 秒與 0.62 秒。第
 epoch 仍包含 eval graph warmup，第二個 epoch 是零新 graph 的穩態。完整
 2,578 列 final test 與 lifecycle artifact gate 亦已跑完。
 
-## v5 第一性診斷與 gated v6
+## v5 第一性診斷與 cash-Entmax v7
 
 正式 12-fold v5 的 isolated-child root report 曾被最後一個 fold 覆寫，只剩
 2026 年 140 列。Parent 現在會在所有子程序完成後，以 12 個 fold 的原始
@@ -117,26 +117,42 @@ benchmark `+692.85%`；直接 integer replay 與儲存日報酬最大差 `8.75e-
 在 100% 日期都把 requested gross 推到 `0.98`，平均只留下 1.62 腿，最大腿
 平均占 87.4%。期權雖只在 15 日被選中，但那些日期複利 `-93.86%`。
 
-新設定 `configs/markets/tw_index_derivatives_day_multi_basis_gated_v6.yaml`
-保留使用者指定的 `last + last_only + projection_l1`：
+新設定
+`configs/markets/tw_index_derivatives_day_multi_basis_cash_entmax_v7.yaml`
+保留 `last + last_only`，但把全域 `projection_l1` 換成既有
+`cash_entmax15` 的無額外參數現金保留配置器：
 
-- `projection_l1` 仍決定方向與稀疏選腿；
-- 投影後乘一個由 market embedding 產生的 scalar capital gate，讓模型可以
-  不把 L1 半徑用滿；權重與 bias 分別初始化為 0 與 -2，初始 gate 為 11.92%；
-- 長期權投影後另有 5% NAV 上限；被切掉的 option budget 留在現金，不轉配
-  給期貨；
-- v5 預設 `use_exposure_gate: false` 且 option cap 0.98，模型參數與舊
-  checkpoint 不變；v6 使用 fresh artifact root。
+- Entmax-1.5 先以合法方向的分數絕對值，決定 futures-long／short 與
+  option-long／short 各腿的相對風險配置；
+- 每個被選中腿的投入強度直接使用自身分數的 `|s|/(1+|s|)`；零證據就是
+  100% 現金，單一強訊號不會再被數千個弱候選腿取平均而稀釋；
+- 不建立可學習 capital gate，也沒有獨立 option gross cap；
+- Entmax 可把低證據風險 actions 精確壓成零；輸出再乘原本帳戶層級的
+  0.98 上限，保留至少 2% 給整數張數與費用，其餘未用曝險也是現金；
+- option-long 的 action 是權利金資本比例；option-short 的 action 是原始
+  保證金資本比例。空方逐腿使用
+  `權利金市值 + max(A - 價外值, B)`，2026-08-12 快照為原始保證金
+  `A=187,000`、`B=94,000`、`C=18,800` 元；週契約與月契約相同；
+- 價外值使用收據驗證的官方 TAIEX 同日開盤指數；不以 TX 開盤價代替，因為
+  期現貨基差可能使價外值扣除過大而低估保證金。缺少任何同日指數即 fail closed；
+- 目前採保守逐腿裸賣，不套用同到期價差、跨／勒式、時間價差或 TX/MTX/TMF
+  組合折抵，因此不會低估保證金，但可能低估可交易口數。C 值只被記錄在
+  checkpoint contract，尚未用於折抵；
+- 這組 A/B/C 是「依最新規則重算歷史樣本」的 dated counterfactual，不是假裝
+  2016--2026 每天真的使用 2026-08-12 金額。正式歷史制度回測仍需要補齊
+  每次 TAIFEX 調整的 point-in-time margin schedule；
+- v5 的 `projection_l1` 路徑仍保留供舊 checkpoint 重現；v7 使用 fresh
+  artifact root。舊 `gated_v6` 設定路徑只是 v7 的 compatibility alias。
 
 正式訓練指令：
 
 ```bash
 source scripts/runtime_env.sh
 run_fintech_python train.py \
-  --config configs/markets/tw_index_derivatives_day_multi_basis_gated_v6.yaml
+  --config configs/markets/tw_index_derivatives_day_multi_basis_cash_entmax_v7.yaml
 ```
 
-v6 是風險與可 abstain 契約的修正，不是已證明獲利的結果。下一次正式比較
+v7 是 allocator 與可 abstain 契約的修正，不是已證明獲利的結果。下一次正式比較
 必須用多區塊／nested temporal selection、cash baseline、worst-year guardrail
 及同步 opening ask／closing bid 資料；不得再用單一年 best validation 宣稱
 可部署。
@@ -144,3 +160,8 @@ v6 是風險與可 abstain 契約的修正，不是已證明獲利的結果。�
 另需注意：目前 `0.0002` 且僅賣出時計稅是依先前指定保留的研究設定；TAIFEX
 現行公開費率表列 TXO 權利金交易稅率為 `0.001`。正式可交易性驗證應另開新
 成本契約處理，而不是讓舊 checkpoint 靜默改語意。
+
+官方規則來源：
+
+- [TAIFEX 股票指數類保證金一覽表](https://www.taifex.com.tw/cht/5/indexMarging?menuid1=12)
+- [TAIFEX 股價指數選擇權各種部位組合保證金公式](https://www.taifex.com.tw/cht/5/margingReqIndexOpt?menuid1=12)

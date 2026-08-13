@@ -354,8 +354,12 @@ def main(argv: list[str] | None = None) -> int:
                 )
 
         active_symbols, active_fallback = _active_symbols(engine)
-        quote_due = bool(active_symbols) and last_quote_minute != minute_key
         wall_time = observed.timetz().replace(tzinfo=None)
+        quote_due = (
+            bool(active_symbols)
+            and datetime_time(9, 0) <= wall_time <= datetime_time(13, 30)
+            and last_quote_minute != minute_key
+        )
         benchmark_due = (
             observed.weekday() < 5
             and datetime_time(9, 0) <= wall_time < datetime_time(13, 30)
@@ -390,6 +394,7 @@ def main(argv: list[str] | None = None) -> int:
                     parquet_root=specs[0].parquet_root,
                     trading_date=observed,
                 )
+                quotes = engine.prepare_minute_quotes(quotes, now=observed)
             except Exception as exc:
                 print(
                     f"[tw-day-trade-sim] quote_error={type(exc).__name__}: {exc}",
@@ -432,7 +437,7 @@ def main(argv: list[str] | None = None) -> int:
                     eligibility_coverage=coverage,
                     now=observed,
                 )
-                if result == "waiting_quote":
+                if result in {"waiting_quote", "waiting_first_minute"}:
                     pending_retry_minute[spec.market] = minute_key
                 else:
                     pending_retry_minute.pop(spec.market, None)

@@ -28,6 +28,7 @@ from stockagent.models.transformer_base_portfolio import (
 from stockagent.models.normalization import (
     masked_activation_l1_weights,
     masked_cash_asset_l1_weights,
+    masked_cash_entmax15_weights,
     masked_l1_projection_weights,
     masked_signed_action_weights,
 )
@@ -2212,6 +2213,36 @@ def test_portfolio_output_mode_projection_l1_matches_projection_helper() -> None
     assert torch.all(weights.abs().sum(dim=1) <= 1.0 + 1e-6)
     assert torch.allclose(aux["projection_gross_exposure"], weights.abs().sum(dim=1), atol=1e-6, rtol=1e-6)
     assert weights[1, 10:].abs().max().item() < 1e-6
+
+
+def test_portfolio_output_mode_cash_entmax_matches_cash_helper() -> None:
+    device = _device()
+    model = _make_model(
+        attention_mode="market_token",
+        portfolio_mode="long_short",
+        portfolio_output_mode="cash_entmax15",
+    ).eval()
+    x = torch.randn(2, 6, 13, 11, device=device)
+    mask = torch.ones(2, 13, dtype=torch.bool, device=device)
+    mask[1, 10:] = False
+
+    with torch.no_grad():
+        weights, _, aux = model(x, mask, return_aux=True)
+
+    expected, expected_parts = masked_cash_entmax15_weights(
+        aux["centered_score_logits"],
+        mask,
+        short_mask=mask,
+        return_parts=True,
+    )
+    assert model.portfolio_output_mode == "cash_entmax15"
+    torch.testing.assert_close(weights, expected)
+    torch.testing.assert_close(
+        aux["cash_entmax_risk_fraction"],
+        expected_parts["cash_entmax_risk_fraction"],
+    )
+    assert torch.all(weights.abs().sum(dim=1) < 1.0)
+    assert weights[1, 10:].abs().max().item() == 0.0
 
 
 def test_factory_builds_transformer_base_portfolio_model() -> None:

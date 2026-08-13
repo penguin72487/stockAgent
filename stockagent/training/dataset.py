@@ -289,9 +289,14 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
                     derivative_candidate_mask, dtype=bool
                 )
                 if (
-                    derivative_returns.ndim != 2
+                    derivative_returns.ndim not in {2, 3}
                     or derivative_returns.shape[0] != panel.num_dates
-                    or derivative_candidate_mask.shape != derivative_returns.shape
+                    or derivative_candidate_mask.shape
+                    != derivative_returns.shape[:2]
+                    or (
+                        derivative_returns.ndim == 3
+                        and derivative_returns.shape[2] != 2
+                    )
                     or derivative_candidate_features.shape[:2]
                     != (panel.num_dates, derivative_returns.shape[1] - 6)
                 ):

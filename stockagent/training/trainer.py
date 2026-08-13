@@ -11812,7 +11812,7 @@ def _evaluate_windowed_tensor_batch_decoupled(
                 )
                 returns_all = torch.empty((total_rows, split.num_symbols), device=device, dtype=returns_chunk.dtype)
                 overnight_returns_all = torch.empty(
-                    (total_rows, int(overnight_returns_chunk.size(1))),
+                    (total_rows, *tuple(overnight_returns_chunk.shape[1:])),
                     device=device,
                     dtype=overnight_returns_chunk.dtype,
                 )

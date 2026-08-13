@@ -35,6 +35,14 @@ def normalize_portfolio_output_mode(mode: str | None) -> str:
         "cash_asset_l1",
     }:
         return "cash_l1"
+    if normalized in {
+        "cash_entmax",
+        "cash_entmax15",
+        "cash_entmax_15",
+        "confidence_entmax",
+        "confidence_entmax15",
+    }:
+        return "cash_entmax15"
     if normalized in {"logits", "raw_logits", "scores", "raw_scores", "score_logits"}:
         return "logits"
     if normalized in {"signed_softmax", "signed_action_softmax", "action_softmax"}:
@@ -65,7 +73,8 @@ def normalize_portfolio_output_mode(mode: str | None) -> str:
         return "projection_l1"
     raise ValueError(
         "portfolio_output_mode must be 'activation_l1', 'l1', 'cash_l1', 'logits', "
-        "'signed_softmax', 'signed_sparsemax', 'signed_entmax15', or 'projection_l1'"
+        "'signed_softmax', 'signed_sparsemax', 'signed_entmax15', "
+        "'cash_entmax15', or 'projection_l1'"
     )
 
 

@@ -8,6 +8,7 @@ from torch import nn
 from stockagent.models.normalization import (
     finite_mask_fill_value,
     masked_activation_l1_weights,
+    masked_cash_entmax15_weights,
     masked_cross_sectional_mean,
     masked_l1_projection_weights,
     masked_signed_action_weights,
@@ -594,6 +595,19 @@ class GradientBoostedPortfolioTransformer(nn.Module):
                 weights, output_aux = action_output
             else:
                 weights = action_output
+        elif self.portfolio_output_mode == "cash_entmax15":
+            cash_output = masked_cash_entmax15_weights(
+                target_logits,
+                mask_bool,
+                short_mask=(
+                    torch.zeros_like(mask_bool) if long_only else mask_bool
+                ),
+                return_parts=include_aux,
+            )
+            if include_aux:
+                weights, output_aux = cash_output
+            else:
+                weights = cash_output
         elif self.portfolio_output_mode == "projection_l1":
             weights = masked_l1_projection_weights(target_logits, mask_bool, long_only=long_only)
             if include_aux:

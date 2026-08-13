@@ -1,0 +1,36 @@
+# Cash-preserving relative-tenor derivative allocator.
+#
+# The model keeps the requested last + last_only temporal contract, but replaces
+# the global Euclidean L1 projection with a parameter-free cash-preserving
+# Entmax-1.5 allocator. Entmax chooses relative derivative legs; every selected
+# leg's own bounded score conviction sets deployed risk, so residual is cash.
+# There is no learned capital gate and no option-only gross cap. The inherited
+# 0.98 maximum remains only the account-wide legal/execution reserve.
+base_config: tw_index_derivatives_day_multi_basis_dual_5090.yaml
+
+experiment_name: tw-stock-cross-section-index-derivatives-day-multi-basis-dual5090-cash-entmax-v7
+
+runner:
+  output_dir: artifacts/markets/tw_index_derivatives_day_multi_basis_100m_relative_tenor_cash_entmax_v7_dual5090
+  resume: true
+
+trading:
+  # Both long and short TXO actions compete with futures for relative risk;
+  # weak aggregate evidence leaves residual capital in cash automatically.
+  # Short sizing uses the dated official naked-margin snapshot below; no
+  # portfolio-combination offset is claimed. Applying this current snapshot to
+  # earlier samples is an explicit current-rule counterfactual, not a claim
+  # about historical point-in-time margin amounts.
+  tw_index_derivatives_day_allow_option_short: true
+  tw_index_derivatives_day_option_risk_margin_a_twd: 187000
+  tw_index_derivatives_day_option_risk_margin_b_twd: 94000
+  tw_index_derivatives_day_option_risk_margin_c_twd: 18800
+  tw_index_derivatives_day_option_margin_schedule_as_of: "2026-08-12"
+  tw_index_derivatives_day_option_margin_offsets: conservative_naked
+  # Official cash-index open required by the TAIFEX OTM deduction formula.
+  # Futures open is deliberately not accepted as a substitute.
+  tw_index_derivatives_day_underlying_index_path: data_tw_public/twse_taiex_ohlc.parquet
+
+training:
+  financial_transformer:
+    portfolio_output_mode: cash_entmax15

@@ -1,23 +1,3 @@
-# First-principles risk repair of relative-tenor v5.
-#
-# Direction and sparse selection remain exactly the requested
-# last + last_only + projection_l1 contract.  The new scalar capital gate lets
-# projection leave cash, and a separate 5% NAV cap prevents a rare selected
-# long option from consuming the full 98% derivative budget.  This is a new
-# checkpoint contract and therefore has a fresh artifact root.
-base_config: tw_index_derivatives_day_multi_basis_dual_5090.yaml
-
-experiment_name: tw-stock-cross-section-index-derivatives-day-multi-basis-dual5090-gated-v6
-
-runner:
-  output_dir: artifacts/markets/tw_index_derivatives_day_multi_basis_100m_relative_tenor_gated_v6_dual5090
-  resume: true
-
-trading:
-  tw_index_derivatives_day_use_exposure_gate: true
-  # sigmoid(-2) = 11.92% of the projected gross at initialization. Training
-  # must earn the right to deploy more capital instead of starting full-risk.
-  tw_index_derivatives_day_exposure_gate_init_logit: -2.0
-  # A long option can lose essentially all premium in one day.  Five percent
-  # is an explicit one-session option-risk budget, not a forecast threshold.
-  tw_index_derivatives_day_option_maximum_capital_fraction: 0.05
+# Compatibility alias. The gated experiment was superseded before training by
+# the user's explicit no-gate/no-option-cap cash-Entmax contract.
+base_config: tw_index_derivatives_day_multi_basis_cash_entmax_v7.yaml

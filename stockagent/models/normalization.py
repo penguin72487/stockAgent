@@ -241,6 +241,7 @@ def masked_signed_action_weights(
     *,
     transform: str = "softmax",
     long_only: bool = False,
+    short_mask: torch.Tensor | None = None,
     cash_logit: float = 0.0,
     return_parts: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
@@ -248,15 +249,27 @@ def masked_signed_action_weights(
 
     Long/short mode creates a single action distribution over ``[long_i]``,
     ``[short_i]``, and one cash action.  Net holding is ``long_i - short_i``.
-    This keeps the long/short ratio free and leaves unused gross exposure as
-    implicit cash.  ``sparsemax`` and ``entmax15`` use the same action set but
-    can produce exact zero actions.
+    ``short_mask`` may further restrict which otherwise tradable instruments
+    have a short action; this supports mixed universes such as signed futures
+    plus long-only options without inventing an executable short-option leg.
+    This keeps the permitted long/short ratio free and leaves unused gross
+    exposure as implicit cash.  ``sparsemax`` and ``entmax15`` use the same
+    action set but can produce exact zero actions.
     """
     with profile_range("portfolio.action_head"):
         if mask is None:
             mask_bool = torch.ones_like(logits, dtype=torch.bool)
         else:
             mask_bool = mask.to(device=logits.device, dtype=torch.bool)
+        if short_mask is None:
+            short_mask_bool = mask_bool
+        else:
+            short_mask_bool = short_mask.to(
+                device=logits.device, dtype=torch.bool
+            )
+            if tuple(short_mask_bool.shape) != tuple(logits.shape):
+                raise ValueError("short_mask must match logits")
+            short_mask_bool = short_mask_bool & mask_bool
         clean_logits = torch.nan_to_num(logits, nan=0.0)
         with profile_range("portfolio.action_mask_where"):
             clean_logits = clean_logits.masked_fill(~mask_bool, 0.0)
@@ -279,11 +292,15 @@ def masked_signed_action_weights(
                 weights = long_alloc
             else:
                 action_logits = torch.cat([clean_logits, -clean_logits, cash], dim=1)
-                action_mask = torch.cat([mask_bool, mask_bool, cash_mask], dim=1)
+                action_mask = torch.cat(
+                    [mask_bool, short_mask_bool, cash_mask], dim=1
+                )
                 probs = _masked_distribution(action_logits, action_mask, transform=transform)
                 width = clean_logits.size(1)
                 long_alloc = probs[:, :width].masked_fill(~mask_bool, 0.0)
-                short_alloc = probs[:, width : 2 * width].masked_fill(~mask_bool, 0.0)
+                short_alloc = probs[:, width : 2 * width].masked_fill(
+                    ~short_mask_bool, 0.0
+                )
                 cash_alloc = probs[:, 2 * width]
                 weights = long_alloc - short_alloc
 
@@ -298,6 +315,74 @@ def masked_signed_action_weights(
             "implicit_cash_weight": (1.0 - weights.abs().sum(dim=1)).clamp_min(0.0),
         }
         return weights, parts
+
+
+def masked_cash_entmax15_weights(
+    logits: torch.Tensor,
+    mask: torch.Tensor | None,
+    *,
+    short_mask: torch.Tensor | None = None,
+    radius: float = 1.0,
+    eps: float = PORTFOLIO_L1_EPS,
+    return_parts: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Sparse signed allocation with dimension-invariant residual cash.
+
+    Entmax-1.5 chooses relative legs from legal directional evidence. Each
+    selected leg keeps its own parameter-free conviction
+    ``score / (1 + abs(score))``; unused gross remains cash. Therefore zero
+    evidence is all cash, one strong sparse leg is not averaged over thousands
+    of weak candidates, and gross stays below ``radius`` without normalizing
+    every nonzero row to the boundary.
+    """
+
+    if logits.ndim != 2:
+        raise ValueError("cash-entmax logits must have shape [B,S]")
+    radius_value = float(radius)
+    if not math.isfinite(radius_value) or not 0.0 < radius_value <= 1.0:
+        raise ValueError("cash-entmax radius must be in (0,1]")
+    mask_bool = (
+        torch.ones_like(logits, dtype=torch.bool)
+        if mask is None
+        else mask.to(device=logits.device, dtype=torch.bool)
+    )
+    if tuple(mask_bool.shape) != tuple(logits.shape):
+        raise ValueError("cash-entmax mask must match logits")
+    if short_mask is None:
+        short_mask_bool = mask_bool
+    else:
+        short_mask_bool = short_mask.to(device=logits.device, dtype=torch.bool)
+        if tuple(short_mask_bool.shape) != tuple(logits.shape):
+            raise ValueError("short_mask must match logits")
+        short_mask_bool = short_mask_bool & mask_bool
+
+    clean = torch.nan_to_num(logits.float(), nan=0.0, posinf=0.0, neginf=0.0)
+    legal_evidence = torch.where(
+        short_mask_bool,
+        clean.abs(),
+        clean.clamp_min(0.0),
+    ).masked_fill(~mask_bool, 0.0)
+    direction = torch.where(
+        short_mask_bool,
+        clean.sign(),
+        torch.ones_like(clean),
+    )
+    relative = _masked_entmax15(legal_evidence, mask_bool, eps=eps).float()
+    conviction = legal_evidence / (1.0 + legal_evidence)
+    weights = (
+        relative * direction * conviction * radius_value
+    ).masked_fill(~mask_bool, 0.0)
+    weights = weights.to(dtype=logits.dtype)
+    if not return_parts:
+        return weights
+    gross = weights.float().abs().sum(dim=1)
+    return weights, {
+        "cash_entmax_relative_alloc": relative.to(dtype=logits.dtype),
+        "cash_entmax_conviction": conviction.to(dtype=logits.dtype),
+        "cash_entmax_risk_fraction": (gross / radius_value).clamp(0.0, 1.0),
+        "cash_entmax_cash_fraction": (1.0 - gross).clamp_min(0.0),
+        "implicit_cash_weight": (1.0 - gross).clamp_min(0.0),
+    }
 
 
 def masked_l1_projection_weights(
