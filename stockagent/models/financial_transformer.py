@@ -11,6 +11,7 @@ from stockagent.models.transformer_base_portfolio import (
     GatedProjection,
     PortfolioRMSNorm,
     TransformerBasePortfolioModel,
+    _build_rope_cache,
     _make_norm,
     _normalize_temporal_basis_families,
     _temporal_basis_matrix,
@@ -435,11 +436,9 @@ class FinancialTransformerModel(TransformerBasePortfolioModel):
         self.daily_context_lookback = max(1, int(daily_context_lookback))
         self.daily_context_layers = max(0, int(daily_context_layers))
         self.daily_context_pooling = self._normalize_pooling(daily_context_pooling)
-        if self.daily_context_lookback > self.lookback:
-            raise ValueError(
-                "daily_context_lookback cannot exceed the model lookback; "
-                f"got daily={self.daily_context_lookback} model={self.lookback}"
-            )
+        # The daily branch has its own encoder, temporal blocks, position
+        # table, and shape checks. Its history length is therefore an
+        # independent clock and must not be bounded by the minute lookback.
         if self.daily_context_layers > len(self.temporal_blocks):
             raise ValueError(
                 "daily_context_layers cannot exceed temporal_layers; "
@@ -484,6 +483,18 @@ class FinancialTransformerModel(TransformerBasePortfolioModel):
                         ]
                     ]
                 )
+                # Cloned minute blocks inherit a RoPE cache sized for the
+                # minute lookback. Rebuild only their non-persistent cache for
+                # the independent daily clock; learned weights stay identical.
+                for block in self.daily_context_temporal_blocks:
+                    attention = block.attn
+                    rope_cos, rope_sin = _build_rope_cache(
+                        self.daily_context_lookback,
+                        attention.head_dim,
+                        attention.rope_base,
+                    )
+                    attention.rope_cos_cached = rope_cos
+                    attention.rope_sin_cached = rope_sin
                 self.daily_context_time_position: nn.Parameter | None = (
                     nn.Parameter(
                         torch.randn(

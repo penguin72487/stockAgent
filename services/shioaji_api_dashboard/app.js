@@ -3,6 +3,10 @@
 const REFRESH_MS = 10000;
 const SVG_NS = "http://www.w3.org/2000/svg";
 const $ = (id) => document.getElementById(id);
+let latestPipelines = [];
+let activeFilter = "all";
+let refreshInFlight = false;
+let lastHeavyRevision = "";
 
 function number(value, digits = 0) {
   const parsed = Number(value);
@@ -30,6 +34,7 @@ function percent(value, digits = 1) {
 }
 
 function ageLabel(value) {
+  if (value == null || value === "") return "無更新時間";
   const seconds = Number(value);
   if (!Number.isFinite(seconds)) return "無更新時間";
   if (seconds < 60) return `${Math.max(0, Math.round(seconds))} 秒前`;
@@ -47,8 +52,114 @@ function setText(id, value) { $(id).textContent = value; }
 
 function healthPresentation(health) {
   const key = String(health || "unavailable");
-  const labels = {active: "資料正常", waiting: "流量保護中", stale: "資料待更新", degraded: "部分服務異常", unavailable: "暫時離線"};
+  const labels = {active: "資料正常", waiting: "流量保護中", stale: "資料待更新", degraded: "部分管線需注意", unavailable: "暫時離線"};
   return {key, label: labels[key] || "狀態未知"};
+}
+
+function pipelineStatusLabel(status) {
+  return ({active: "運行中", ready: "可使用", complete: "已完成", waiting: "等待中", partial: "部分完成", failed: "執行失敗", stopped: "已停止", unavailable: "無資料"})[status] || "待確認";
+}
+
+function categoryLabel(category) {
+  return ({historical: "歷史下載", realtime: "即時訂閱", derived: "衍生資料", reference: "合約目錄", on_demand: "隨需行情"})[category] || "其他";
+}
+
+function quotaLabel(quota) {
+  return ({historical: "計入歷史流量", realtime: "不扣歷史流量", none: "不呼叫 API"})[quota] || "配額待確認";
+}
+
+function metricValue(metric) {
+  const value = metric?.value;
+  const format = metric?.format;
+  if (format === "bytes") return bytes(value);
+  if (format === "compact") return compact(value);
+  if (format === "percent") return percent(value, 1);
+  if (format === "datetime") return localTime(value, {month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit"});
+  const rendered = number(value);
+  return metric?.unit && rendered !== "—" ? `${rendered} ${metric.unit}` : rendered;
+}
+
+function node(name, className = "", text = null) {
+  const element = document.createElement(name);
+  if (className) element.className = className;
+  if (text != null) element.textContent = String(text);
+  return element;
+}
+
+function pipelineCard(item) {
+  const article = node("article", `pipeline-card state-${item.status || "unavailable"}`);
+  article.dataset.category = item.category || "other";
+  article.dataset.pipelineId = item.id || "";
+
+  const header = node("header", "pipeline-card-header");
+  const tags = node("div", "pipeline-tags");
+  tags.append(node("span", "category-tag", categoryLabel(item.category)));
+  tags.append(node("span", `pipeline-status ${item.status || "unavailable"}`, item.status_label || pipelineStatusLabel(item.status)));
+  header.append(tags, node("span", "api-surface", item.api_surface || "—"));
+
+  const title = node("h3", "", item.title || "未命名管線");
+  const detail = node("p", "pipeline-detail", item.detail || "—");
+  article.append(header, title, detail);
+
+  if (item.coverage && Number.isFinite(Number(item.coverage.ratio))) {
+    const ratio = Math.max(0, Math.min(1, Number(item.coverage.ratio)));
+    const coverage = node("div", "mini-progress");
+    const copy = node("div", "mini-progress-copy");
+    copy.append(node("span", "", item.coverage.label || "覆蓋率"), node("strong", "", percent(ratio, 2)));
+    const track = node("progress", "mini-progress-track");
+    track.setAttribute("max", "100");
+    track.setAttribute("value", String(ratio * 100));
+    track.setAttribute("aria-label", `${item.coverage.label || "覆蓋率"} ${percent(ratio, 2)}`);
+    coverage.append(copy, track, node("small", "", `${number(item.coverage.current)} / ${number(item.coverage.total)} ${item.coverage.unit || ""}`));
+    article.append(coverage);
+  }
+
+  const metrics = node("dl", "pipeline-metrics");
+  (Array.isArray(item.metrics) ? item.metrics : []).forEach((metric) => {
+    const row = node("div");
+    row.append(node("dt", "", metric.label || "—"), node("dd", "", metricValue(metric)));
+    metrics.append(row);
+  });
+  article.append(metrics);
+
+  const fields = node("div", "field-block");
+  fields.append(node("span", "field-label", "包含資料"));
+  const chips = node("div", "field-chips");
+  (Array.isArray(item.fields) ? item.fields : []).forEach((field) => chips.append(node("span", "", field)));
+  fields.append(chips); article.append(fields);
+
+  const warnings = Array.isArray(item.warnings) ? item.warnings.filter(Boolean) : [];
+  if (warnings.length) {
+    const list = node("ul", "pipeline-warnings");
+    warnings.forEach((warning) => list.append(node("li", "", warning)));
+    article.append(list);
+  }
+
+  const footer = node("footer", "pipeline-footer");
+  footer.append(node("span", `quota-tag quota-${item.quota || "unknown"}`, quotaLabel(item.quota)));
+  const serviceText = item.service ? (item.service.active ? "服務運行" : item.service.state === "manual" ? "手動執行" : item.service.state === "unavailable" ? "無獨立服務" : "服務停止") : "資料產物";
+  footer.append(node("span", "pipeline-age", `${serviceText} · 更新 ${ageLabel(item.latest_age_seconds)}`));
+  article.append(footer);
+  return article;
+}
+
+function renderPipelines(pipelines) {
+  latestPipelines = Array.isArray(pipelines) ? pipelines : [];
+  const visible = activeFilter === "all" ? latestPipelines : latestPipelines.filter((item) => item.category === activeFilter);
+  const grid = $("pipeline-grid");
+  grid.replaceChildren(...visible.map(pipelineCard));
+  $("pipeline-empty").hidden = visible.length > 0;
+}
+
+function updatePipelineAges(pipelines) {
+  const byId = new Map((Array.isArray(pipelines) ? pipelines : []).map((item) => [String(item.id || ""), item]));
+  document.querySelectorAll(".pipeline-card[data-pipeline-id]").forEach((card) => {
+    const item = byId.get(card.dataset.pipelineId || "");
+    const target = card.querySelector(".pipeline-age");
+    if (!item || !target) return;
+    const serviceText = item.service ? (item.service.active ? "服務運行" : item.service.state === "manual" ? "手動執行" : item.service.state === "unavailable" ? "無獨立服務" : "服務停止") : "資料產物";
+    target.textContent = `${serviceText} · 更新 ${ageLabel(item.latest_age_seconds)}`;
+  });
 }
 
 function backfillLabel(state) {
@@ -118,11 +229,12 @@ function renderTrafficTable(history) {
   const rows = Array.isArray(history) ? history.slice(-8).reverse() : [];
   if (!rows.length) {
     const row = document.createElement("tr");
-    const cell = document.createElement("td"); cell.colSpan = 4; cell.textContent = "尚無用量觀測"; row.append(cell); body.append(row); return;
+    const cell = document.createElement("td"); cell.colSpan = 5; cell.textContent = "尚無用量觀測"; row.append(cell); body.append(row); return;
   }
   rows.forEach((item) => {
     const row = document.createElement("tr");
     appendCell(row, localTime(item.observed_at_utc));
+    appendCell(row, item.source_label || "歷史行情查詢");
     appendCell(row, bytes(item.used_bytes));
     appendCell(row, bytes(item.remaining_bytes));
     appendCell(row, percent(item.used_ratio, 2));
@@ -151,7 +263,16 @@ function renderContracts(rows) {
 function renderAlert(data) {
   const alert = $("pipeline-alert");
   const state = data.backfill?.state;
-  if (state === "waiting_quota") {
+  const failed = (Array.isArray(data.pipelines) ? data.pipelines : []).filter((item) => item.status === "failed");
+  if (failed.length && state === "waiting_quota") {
+    alert.hidden = false;
+    setText("alert-title", `${failed.length} 條管線執行失敗，歷史下載也已進入流量保護`);
+    setText("alert-copy", `${failed[0].title}：${failed[0].detail}。安全可用額度剩 ${bytes(data.traffic?.safe_remaining_bytes)}。`);
+  } else if (failed.length) {
+    alert.hidden = false;
+    setText("alert-title", `${failed.length} 條資料管線需要處理`);
+    setText("alert-copy", `${failed[0].title}：${failed[0].detail}。既有資料仍保留，公開面板不會自行重啟服務。`);
+  } else if (state === "waiting_quota") {
     alert.hidden = false;
     setText("alert-title", "歷史下載已在安全閘門前暫停");
     setText("alert-copy", `帳面仍有 ${bytes(data.traffic?.remaining_bytes)}，但安全可用只剩 ${bytes(data.traffic?.safe_remaining_bytes)}；即時行情擷取不受影響。`);
@@ -165,6 +286,17 @@ function renderAlert(data) {
 }
 
 function render(data) {
+  const heavyRevision = JSON.stringify([
+    data.pipeline_summary,
+    (data.pipelines || []).map((item) => [
+      item.id, item.status, item.status_label, item.detail, item.coverage,
+      item.latest_at_utc, item.fields, item.metrics, item.warnings, item.service,
+    ]),
+    data.traffic?.history,
+    data.traffic?.guard_fraction,
+    data.backfill?.contracts,
+  ]);
+  const renderHeavy = heavyRevision !== lastHeavyRevision;
   const health = healthPresentation(data.health);
   const status = $("connection-status");
   status.className = `status ${health.key}`;
@@ -172,23 +304,33 @@ function render(data) {
   setText("source-freshness", `最新來源 ${ageLabel(data.source_age_seconds)} · ${localTime(data.generated_at_utc)}`);
   renderAlert(data);
 
+  const summary = data.pipeline_summary || {};
+  setText("pipeline-total", number(summary.total));
+  setText("pipeline-scope", `${number(summary.historical)} 條歷史 · ${number(summary.realtime)} 條即時`);
+  setText("pipeline-active", number(summary.active));
+  setText("pipeline-ready", number(summary.ready));
+  setText("pipeline-attention", number(summary.attention));
+  if (renderHeavy) renderPipelines(data.pipelines);
+  else updatePipelineAges(data.pipelines);
+
   const traffic = data.traffic || {};
   setText("traffic-used", `${bytes(traffic.used_bytes)} / ${bytes(traffic.limit_bytes)}`);
   setText("traffic-used-ratio", `${percent(traffic.used_ratio, 2)} 已使用`);
   setText("traffic-remaining", bytes(traffic.remaining_bytes));
   setText("traffic-safe-remaining", bytes(traffic.safe_remaining_bytes));
   setText("traffic-reset", traffic.reset_policy || "—");
-  setText("traffic-observed", `用量觀測 ${ageLabel((Date.now() - new Date(traffic.observed_at_utc).getTime()) / 1000)}`);
-  renderTrafficChart(traffic.history, traffic.guard_fraction);
-  renderTrafficTable(traffic.history);
+  const trafficObserved = traffic.observed_at_utc ? (Date.now() - new Date(traffic.observed_at_utc).getTime()) / 1000 : null;
+  setText("traffic-observed", `用量觀測 ${ageLabel(trafficObserved)}`);
+  if (renderHeavy) {
+    renderTrafficChart(traffic.history, traffic.guard_fraction);
+    renderTrafficTable(traffic.history);
+  }
 
   const backfill = data.backfill || {};
   const ratio = Number(backfill.progress_ratio) || 0;
   setText("fleet-progress-label", percent(ratio, 2));
   setText("fleet-progress-detail", `${number(backfill.resolved_contract_dates)} / ${number(backfill.expected_contract_dates)} 個合約交易日已有 receipt`);
-  $("fleet-progress-bar").style.width = `${Math.max(0, Math.min(100, ratio * 100))}%`;
-  const track = $("fleet-progress-bar").parentElement;
-  track.setAttribute("aria-valuenow", String(Math.max(0, Math.min(100, ratio * 100))));
+  $("fleet-progress-bar").value = Math.max(0, Math.min(100, ratio * 100));
   setText("contracts-complete", `${number(backfill.completed_contracts)} / ${number(backfill.inventory_contracts)}`);
   setText("contracts-started", `${number(backfill.started_contracts)} 個合約已開始`);
   setText("current-contract", backfill.current_contract || "—");
@@ -199,7 +341,7 @@ function render(data) {
   setText("backfill-storage", `${bytes(backfill.stored_bytes)} 已落盤`);
   setText("backfill-state", backfillLabel(backfill.state));
   setText("backfill-target", `目標截至 ${backfill.target_end_date || "—"}`);
-  renderContracts(backfill.contracts);
+  if (renderHeavy) renderContracts(backfill.contracts);
 
   const capture = data.capture || {};
   setText("capture-state", captureLabel(capture.state));
@@ -209,12 +351,14 @@ function render(data) {
   setText("capture-subscriptions", `${number(capture.contracts)} 合約 · ${number(capture.subscriptions)} 訂閱`);
   setText("capture-stop", capture.scheduled_stop_at_local ? localTime(capture.scheduled_stop_at_local, {month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit"}) : "—");
   $("capture-dot").className = capture.state === "capturing" ? "pulse active" : "pulse";
+  lastHeavyRevision = heavyRevision;
 }
 
 async function refresh() {
-  if (document.hidden) return;
+  if (document.hidden || refreshInFlight) return;
+  refreshInFlight = true;
   try {
-    const response = await fetch("api/status", {cache: "no-cache"});
+    const response = await fetch("api/status", {cache: "default"});
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     render(await response.json());
   } catch (_error) {
@@ -222,9 +366,22 @@ async function refresh() {
     status.className = "status unavailable";
     status.lastChild.textContent = "暫時離線";
     setText("source-freshness", "無法取得公開監控資料");
+  } finally {
+    refreshInFlight = false;
   }
 }
 
 document.addEventListener("visibilitychange", () => { if (!document.hidden) void refresh(); });
+document.querySelectorAll(".filter").forEach((button) => {
+  button.addEventListener("click", () => {
+    activeFilter = button.dataset.filter || "all";
+    document.querySelectorAll(".filter").forEach((candidate) => {
+      const active = candidate === button;
+      candidate.classList.toggle("active", active);
+      candidate.setAttribute("aria-pressed", String(active));
+    });
+    renderPipelines(latestPipelines);
+  });
+});
 void refresh();
 window.setInterval(() => void refresh(), REFRESH_MS);

@@ -145,7 +145,9 @@ def _ensure_source_stat(path: Path, expected: _SourceEntry) -> None:
 def _validate_symlink_target(path: str, target: str) -> None:
     target_path = PurePosixPath(target)
     if target_path.is_absolute():
-        raise SnapshotError(f"absolute symlink is not snapshot-safe: {path} -> {target}")
+        raise SnapshotError(
+            f"absolute symlink is not snapshot-safe: {path} -> {target}"
+        )
     depth = len(PurePosixPath(path).parent.parts)
     for part in target_path.parts:
         if part in {"", "."}:
@@ -288,9 +290,12 @@ def _write_pack(
             source_path = source.joinpath(*PurePosixPath(entry.path).parts)
             _ensure_source_stat(source_path, entry)
             digest = hashlib.sha256()
-            with source_path.open("rb") as input_stream, archive.open(
-                _zip_info(entry), mode="w", force_zip64=True
-            ) as output_stream:
+            with (
+                source_path.open("rb") as input_stream,
+                archive.open(
+                    _zip_info(entry), mode="w", force_zip64=True
+                ) as output_stream,
+            ):
                 while block := input_stream.read(8 * 1024 * 1024):
                     digest.update(block)
                     output_stream.write(block)
@@ -381,7 +386,9 @@ def _resolve_node_id(sync_root: Path, explicit: str | None = None) -> str:
             node_path.read_text(encoding="utf-8").strip(), "stored node_id"
         )
     except OSError as exc:
-        raise SnapshotError(f"packed sync root is not initialized: {sync_root}") from exc
+        raise SnapshotError(
+            f"packed sync root is not initialized: {sync_root}"
+        ) from exc
     if requested is not None and requested != stored:
         raise SnapshotError(
             f"requested node_id {requested} disagrees with initialized node_id {stored}"
@@ -441,7 +448,9 @@ def _validate_object_presence(sync_root: Path, manifest: Mapping[str, Any]) -> N
         try:
             size = path.stat().st_size
         except OSError as exc:
-            raise SnapshotError(f"snapshot object is not locally complete: {path}") from exc
+            raise SnapshotError(
+                f"snapshot object is not locally complete: {path}"
+            ) from exc
         if size != int(item["bytes"]):
             raise SnapshotError(
                 f"snapshot object size mismatch for {path}: "
@@ -504,7 +513,9 @@ def _head_candidates(
         except (OSError, SnapshotError, TypeError, ValueError) as exc:
             message = f"{head_path.name}: {exc}"
             diagnostics.append(message)
-            if canonical or (head_stamp is None and ".sync-conflict-" not in head_path.name):
+            if canonical or (
+                head_stamp is None and ".sync-conflict-" not in head_path.name
+            ):
                 incomplete.append((head_stamp, message))
     return candidates, diagnostics, incomplete
 
@@ -536,7 +547,11 @@ def resolve_latest_packed(
         ),
     )
     winner_stamp = HLC.from_mapping(winner.manifest["hlc"])
-    blocking = [message for stamp, message in incomplete if stamp is None or stamp >= winner_stamp]
+    blocking = [
+        message
+        for stamp, message in incomplete
+        if stamp is None or stamp >= winner_stamp
+    ]
     if blocking:
         raise SnapshotError(
             "newest canonical packed head is not locally complete; refusing to fall "
@@ -694,13 +709,13 @@ def publish_packed_snapshot(
 
         for entry in entries:
             if entry.kind == "file" and (not entry.sha256 or not entry.storage):
-                raise SnapshotError(f"file was not assigned to a packed object: {entry.path}")
+                raise SnapshotError(
+                    f"file was not assigned to a packed object: {entry.path}"
+                )
 
         inventory_temp = staging_root / f"inventory-{uuid.uuid4().hex}.partial"
         inventory_sha = _write_inventory(inventory_temp, entries)
-        inventory_relpath = _object_relpath(
-            "inventories", inventory_sha, ".jsonl.gz"
-        )
+        inventory_relpath = _object_relpath("inventories", inventory_sha, ".jsonl.gz")
         inventory_path = sync_root.joinpath(*inventory_relpath.parts)
         inventory_bytes = inventory_temp.stat().st_size
         _install_immutable_object(
@@ -708,7 +723,10 @@ def publish_packed_snapshot(
         )
 
         after = scan_tree(source)
-        if before["stability_fingerprint_sha256"] != after["stability_fingerprint_sha256"]:
+        if (
+            before["stability_fingerprint_sha256"]
+            != after["stability_fingerprint_sha256"]
+        ):
             raise SnapshotError(
                 "source tree changed while it was being packed; publish from a frozen "
                 "snapshot or under the downloader's dataset lock"
@@ -726,7 +744,9 @@ def publish_packed_snapshot(
             now_ns=wall_time_ns,
         )
         seconds, nanos = divmod(stamp.physical_ns, 1_000_000_000)
-        timestamp_slug = time.strftime("%Y%m%dT%H%M%S", time.gmtime(seconds)) + f"{nanos:09d}Z"
+        timestamp_slug = (
+            time.strftime("%Y%m%dT%H%M%S", time.gmtime(seconds)) + f"{nanos:09d}Z"
+        )
         snapshot_id = validate_slug(
             f"{dataset[:40]}-{timestamp_slug}-l{stamp.logical}-"
             f"{publisher_node[:40]}-{inventory_sha[:16]}",
@@ -739,10 +759,10 @@ def publish_packed_snapshot(
             if existing is None:
                 unique_objects[digest] = item
                 continue
-            if any(
-                existing[key] != item[key] for key in ("bytes", "kind", "relpath")
-            ):
-                raise SnapshotError(f"inconsistent duplicate object descriptor: {digest}")
+            if any(existing[key] != item[key] for key in ("bytes", "kind", "relpath")):
+                raise SnapshotError(
+                    f"inconsistent duplicate object descriptor: {digest}"
+                )
             existing["file_count"] += int(item["file_count"])
             existing["logical_bytes"] += int(item["logical_bytes"])
         objects = sorted(
@@ -808,7 +828,9 @@ def publish_packed_snapshot(
         )
 
 
-def _load_inventory(sync_root: Path, manifest: Mapping[str, Any]) -> list[dict[str, Any]]:
+def _load_inventory(
+    sync_root: Path, manifest: Mapping[str, Any]
+) -> list[dict[str, Any]]:
     descriptor = manifest["archive"]["inventory"]
     path = _path_under(sync_root, str(descriptor["relpath"]), "inventory relpath")
     expected_sha = _validate_hash(descriptor["sha256"], "inventory SHA-256")
@@ -904,7 +926,9 @@ def verify_packed_snapshot(
     manifest = resolved.manifest
     _validate_manifest(manifest)
     if sha256_file(resolved.manifest_path) != resolved.manifest_sha256:
-        raise SnapshotError(f"manifest changed after resolution: {resolved.manifest_path}")
+        raise SnapshotError(
+            f"manifest changed after resolution: {resolved.manifest_path}"
+        )
     _validate_object_presence(sync_root, manifest)
     entries = _load_inventory(sync_root, manifest)
     inventory_result = _validate_inventory(manifest, entries)
@@ -990,6 +1014,219 @@ def _verify_materialized(
             f"materialized fingerprint mismatch: expected {expected}, "
             f"got {inventory['portable_fingerprint_sha256']}"
         )
+
+
+def _subtree_entries(
+    entries: list[dict[str, Any]], subtree: PurePosixPath
+) -> list[dict[str, Any]]:
+    prefix = subtree.as_posix()
+    selected = [
+        row
+        for row in entries
+        if row["path"] == prefix or row["path"].startswith(f"{prefix}/")
+    ]
+    if not selected:
+        raise SnapshotError(f"packed snapshot subtree is missing: {prefix}")
+    root = selected[0]
+    if root["path"] != prefix or root["kind"] != "directory":
+        raise SnapshotError(f"packed snapshot subtree is not a directory: {prefix}")
+    return selected
+
+
+def _subtree_destination(
+    root: Path, subtree: PurePosixPath, row: Mapping[str, Any]
+) -> Path:
+    relative = PurePosixPath(str(row["path"])).relative_to(subtree)
+    return root.joinpath(*relative.parts)
+
+
+def _verify_materialized_subtree(
+    materialized_path: Path,
+    subtree: PurePosixPath,
+    entries: list[dict[str, Any]],
+) -> dict[str, int]:
+    expected_counts = {"files": 0, "directories": 0, "symlinks": 0, "logical_bytes": 0}
+    for row in entries:
+        path = _subtree_destination(materialized_path, subtree, row)
+        kind = row["kind"]
+        if kind == "directory":
+            if not path.is_dir():
+                raise SnapshotError(
+                    f"materialized subtree directory is missing: {path}"
+                )
+            if row["path"] != subtree.as_posix():
+                expected_counts["directories"] += 1
+        elif kind == "symlink":
+            if not path.is_symlink() or os.readlink(path) != row["target"]:
+                raise SnapshotError(f"materialized subtree symlink differs: {path}")
+            expected_counts["symlinks"] += 1
+        elif kind == "file":
+            if not path.is_file() or path.stat().st_size != int(row["size"]):
+                raise SnapshotError(f"materialized subtree file differs: {path}")
+            if sha256_file(path) != row["sha256"]:
+                raise SnapshotError(
+                    f"materialized subtree file checksum mismatch: {path}"
+                )
+            expected_counts["files"] += 1
+            expected_counts["logical_bytes"] += int(row["size"])
+        else:  # pragma: no cover - full inventory validation owns this guard.
+            raise SnapshotError(f"invalid materialized subtree kind: {kind!r}")
+    actual = scan_tree(materialized_path)
+    for key, expected in expected_counts.items():
+        if int(actual[key]) != expected:
+            raise SnapshotError(
+                f"materialized subtree {key} mismatch: expected {expected}, "
+                f"got {actual[key]}"
+            )
+    return expected_counts
+
+
+def fetch_packed_subtree(
+    sync_root: Path,
+    materialized_root: Path,
+    resolved: ResolvedSnapshot,
+    subtree: str,
+) -> Path:
+    """Atomically materialize one verified directory from a packed snapshot.
+
+    Large migration snapshots can contain many unrelated datasets.  This keeps
+    the same manifest, inventory, object, and per-file checksum authority as a
+    full fetch while avoiding extraction of unrelated bytes.
+    """
+
+    sync_root = sync_root.resolve()
+    materialized_root = materialized_root.resolve()
+    if _paths_overlap(sync_root, materialized_root):
+        raise SnapshotError("materialized root must be outside the packed sync root")
+    relative_subtree = _safe_relative_path(subtree, "subtree")
+    manifest = resolved.manifest
+    _validate_manifest(manifest)
+    if sha256_file(resolved.manifest_path) != resolved.manifest_sha256:
+        raise SnapshotError(
+            f"manifest changed after resolution: {resolved.manifest_path}"
+        )
+    _validate_object_presence(sync_root, manifest)
+    entries = _load_inventory(sync_root, manifest)
+    _validate_inventory(manifest, entries)
+    selected = _subtree_entries(entries, relative_subtree)
+
+    dataset = validate_slug(str(manifest["dataset"]), "dataset")
+    snapshot_id = validate_slug(str(manifest["snapshot_id"]), "snapshot_id")
+    target = materialized_root / dataset / snapshot_id
+    target = target.joinpath(*relative_subtree.parts)
+    ready_name = hashlib.sha256(relative_subtree.as_posix().encode()).hexdigest()[:16]
+    ready_path = target.parent / f".{target.name}.{ready_name}.READY.json"
+    lock_path = (
+        materialized_root
+        / ".locks"
+        / f"fetch-{dataset}-{snapshot_id}-subtree-{ready_name}.lock"
+    )
+    with _exclusive_lock(lock_path):
+        if target.exists():
+            counts = _verify_materialized_subtree(target, relative_subtree, selected)
+            if not ready_path.exists():
+                atomic_write_json(
+                    ready_path,
+                    {
+                        "snapshot_id": snapshot_id,
+                        "manifest_sha256": resolved.manifest_sha256,
+                        "subtree": relative_subtree.as_posix(),
+                        "counts": counts,
+                        "verified_at": _utc_iso_from_ns(time.time_ns()),
+                    },
+                )
+            return target
+
+        target.parent.mkdir(parents=True, exist_ok=True)
+        staging = target.parent / f".{target.name}.partial.{uuid.uuid4().hex}"
+        staging.mkdir()
+        try:
+            object_by_hash = {
+                str(item["sha256"]): item for item in manifest["archive"]["objects"]
+            }
+            selected_object_hashes = {
+                str(row["storage"]["object_sha256"])
+                for row in selected
+                if row["kind"] == "file"
+            }
+            for object_sha in sorted(selected_object_hashes):
+                item = object_by_hash[object_sha]
+                object_path = _path_under(
+                    sync_root, str(item["relpath"]), "object relpath"
+                )
+                if sha256_file(object_path) != object_sha:
+                    raise SnapshotError(
+                        f"packed object checksum mismatch: expected {object_sha}, "
+                        f"got corrupt object {object_path}"
+                    )
+            for row in selected:
+                if row["kind"] == "directory":
+                    path = _subtree_destination(staging, relative_subtree, row)
+                    path.mkdir(parents=True, exist_ok=True)
+                    path.chmod(int(row["mode"]))
+            for row in selected:
+                path = _subtree_destination(staging, relative_subtree, row)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                if row["kind"] == "symlink":
+                    path.symlink_to(str(row["target"]))
+            for row in selected:
+                if row["kind"] != "file" or row["storage"]["kind"] != "blob":
+                    continue
+                storage = row["storage"]
+                object_item = object_by_hash[str(storage["object_sha256"])]
+                object_path = _path_under(
+                    sync_root, str(object_item["relpath"]), "object relpath"
+                )
+                path = _subtree_destination(staging, relative_subtree, row)
+                with object_path.open("rb") as input_stream:
+                    _copy_member_and_verify(
+                        input_stream,
+                        path,
+                        expected_size=int(row["size"]),
+                        expected_sha256=str(row["sha256"]),
+                        mode=int(row["mode"]),
+                    )
+            pack_rows: dict[str, list[dict[str, Any]]] = {}
+            for row in selected:
+                if row["kind"] == "file" and row["storage"]["kind"] == "pack":
+                    object_sha = str(row["storage"]["object_sha256"])
+                    pack_rows.setdefault(object_sha, []).append(row)
+            for object_sha, rows in pack_rows.items():
+                object_item = object_by_hash[object_sha]
+                object_path = _path_under(
+                    sync_root, str(object_item["relpath"]), "object relpath"
+                )
+                with zipfile.ZipFile(object_path, mode="r") as archive:
+                    for row in rows:
+                        path = _subtree_destination(staging, relative_subtree, row)
+                        with archive.open(
+                            str(row["storage"]["member"]), mode="r"
+                        ) as input_stream:
+                            _copy_member_and_verify(
+                                input_stream,
+                                path,
+                                expected_size=int(row["size"]),
+                                expected_sha256=str(row["sha256"]),
+                                mode=int(row["mode"]),
+                            )
+            counts = _verify_materialized_subtree(staging, relative_subtree, selected)
+            os.replace(staging, target)
+            _fsync_directory(target.parent)
+        except Exception:
+            # Keep the partial tree for diagnosis; it is never treated as ready.
+            raise
+        atomic_write_json(
+            ready_path,
+            {
+                "snapshot_id": snapshot_id,
+                "manifest_sha256": resolved.manifest_sha256,
+                "inventory_sha256": manifest["archive"]["inventory"]["sha256"],
+                "subtree": relative_subtree.as_posix(),
+                "counts": counts,
+                "verified_at": _utc_iso_from_ns(time.time_ns()),
+            },
+        )
+        return target
 
 
 def fetch_packed_snapshot(
@@ -1130,5 +1367,7 @@ def referenced_packed_objects(sync_root: Path) -> set[Path]:
             _path_under(sync_root, str(inventory["relpath"]), "inventory relpath")
         )
         for item in manifest["archive"]["objects"]:
-            referenced.add(_path_under(sync_root, str(item["relpath"]), "object relpath"))
+            referenced.add(
+                _path_under(sync_root, str(item["relpath"]), "object relpath")
+            )
     return referenced

@@ -1,10 +1,19 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
+import re
+import threading
+import time
 
 import pytest
 
-from scripts.serve_public_dashboards import PublicDashboardHandler
+from scripts.serve_public_dashboards import (
+    PublicDashboardHandler,
+    PublicDashboardServer,
+    build_public_overview,
+    summarize_tw_status,
+)
 from stockagent.live.public_dashboards import (
     PUBLIC_MAX_EVENT_ROWS,
     TokenBucketRateLimiter,
@@ -131,16 +140,190 @@ def test_public_landing_exposes_live_safe_status_without_remote_assets() -> None
     root = Path(__file__).resolve().parents[1] / "services" / "public_dashboards"
     html = (root / "index.html").read_text(encoding="utf-8")
     javascript = (root / "public.js").read_text(encoding="utf-8")
-    assert 'src="public.js"' in html
+    assert 'src="public.js?v=2"' in html
     assert 'id="taifex-health"' in html
     assert 'id="tw-health"' in html
     assert 'id="shioaji-health"' in html
     assert "http://" not in html and "https://" not in html
-    assert 'fetchJson("taifex/api/status")' in javascript
-    assert 'fetchJson("tw-day-trade/api/status")' in javascript
-    assert 'fetchJson("shioaji/api/status")' in javascript
+    assert 'fetchJson("api/overview")' in javascript
+    assert "taifex/api/status" not in javascript
+    assert "tw-day-trade/api/status" not in javascript
+    assert "shioaji/api/status" not in javascript
     assert '"流量保護"' in javascript
     assert "textContent" in javascript
+
+
+def test_public_overview_and_tw_summary_exclude_large_ledgers() -> None:
+    tw = {
+        "health": "active",
+        "source_age_seconds": 1.5,
+        "session_date": "2026-08-13",
+        "modes": [{"market": "tw"}, {"market": "tw_cash"}],
+        "positions": [
+            {"signed_shares": 1000, "valuation_stale": True},
+            {"signed_shares": 0, "valuation_stale": False},
+        ],
+        "marks": [{"large": "payload"}],
+        "orders": [{"large": "payload"}],
+    }
+    summary = summarize_tw_status(tw)
+    assert summary["open_position_count"] == 1
+    assert summary["stale_position_count"] == 1
+    assert not ({"positions", "marks", "orders"} & set(summary))
+
+    overview = build_public_overview(
+        {
+            "health": "active",
+            "source_age_seconds": 1,
+            "strategy_counts": {"live_ideal": 53},
+            "market": {"book_coverage_ratio": 0.9},
+        },
+        tw,
+        {
+            "health": "waiting",
+            "traffic": {"used_ratio": 0.8, "safe_remaining_bytes": 123},
+            "backfill": {
+                "completed_contracts": 7,
+                "inventory_contracts": 743,
+                "progress_ratio": 0.25,
+            },
+            "pipeline_summary": {"total": 8},
+        },
+    )
+    assert overview["taifex"]["live_strategies"] == 53
+    assert overview["tw"] == {
+        "health": "active",
+        "source_age_seconds": 1.5,
+        "modes": 2,
+        "open_positions": 1,
+    }
+    assert overview["shioaji"]["pipeline_total"] == 8
+    encoded = json.dumps(overview)
+    assert '"marks"' not in encoded
+    assert '"orders"' not in encoded
+    assert '"positions": [' not in encoded
+
+
+def test_public_pages_share_visual_tokens() -> None:
+    root = Path(__file__).resolve().parents[1] / "services"
+    shared = (root / "public_dashboards" / "dashboard-core.css").read_text(
+        encoding="utf-8"
+    )
+    assert "--dashboard-cyan" in shared
+    assert "content-visibility: auto" in shared
+    for relative in (
+        "public_dashboards/index.html",
+        "taifex_dashboard/index.html",
+        "tw_day_trade_dashboard/index.html",
+        "shioaji_api_dashboard/index.html",
+    ):
+        html = (root / relative).read_text(encoding="utf-8")
+        assert "dashboard-core.css?v=2" in html
+        assert '<meta name="theme-color" content="#071019">' in html
+
+    tw_javascript = (root / "tw_day_trade_dashboard" / "app.js").read_text(
+        encoding="utf-8"
+    )
+    assert re.search(r"\bREFRESH_MS\b", tw_javascript) is None
+    assert "signalLoadError" in tw_javascript
+    assert "alert.textContent = `訊號分頁" not in tw_javascript
+    for dashboard in ("tw_day_trade_dashboard", "shioaji_api_dashboard"):
+        javascript = (root / dashboard / "app.js").read_text(encoding="utf-8")
+        assert "style=" not in javascript
+        assert ".style." not in javascript
+
+
+def _test_server() -> PublicDashboardServer:
+    root = Path(__file__).resolve().parents[1]
+    return PublicDashboardServer(
+        ("127.0.0.1", 0),
+        public_static_root=root / "services/public_dashboards",
+        taifex_static_root=root / "services/taifex_dashboard",
+        tw_static_root=root / "services/tw_day_trade_dashboard",
+        shioaji_static_root=root / "services/shioaji_api_dashboard",
+        repo_root=root,
+        taifex_upstream="http://127.0.0.1:1",
+        tw_upstream="http://127.0.0.1:1",
+    )
+
+
+def test_expired_cache_returns_stale_while_refreshing_in_background() -> None:
+    server = _test_server()
+    calls = 0
+    refreshed = threading.Event()
+
+    def builder() -> dict[str, int]:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            refreshed.set()
+        return {"value": calls}
+
+    try:
+        first = server.cached_local_json(
+            cache_key="swr",
+            ttl_seconds=0.05,
+            cache_control="public, max-age=0",
+            builder=builder,
+        )
+        time.sleep(0.06)
+        stale = server.cached_local_json(
+            cache_key="swr",
+            ttl_seconds=0.05,
+            cache_control="public, max-age=0",
+            builder=builder,
+        )
+        assert json.loads(first.body) == {"value": 1}
+        assert stale.body == first.body
+        assert refreshed.wait(1.0)
+        deadline = time.monotonic() + 1.0
+        while json.loads(server._cache["swr"].response.body)["value"] != 2:
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+    finally:
+        server.server_close()
+
+
+def test_unrelated_cache_keys_do_not_block_each_other() -> None:
+    server = _test_server()
+    slow_started = threading.Event()
+    release_slow = threading.Event()
+    fast_done = threading.Event()
+
+    def slow_builder() -> dict[str, bool]:
+        slow_started.set()
+        assert release_slow.wait(1.0)
+        return {"slow": True}
+
+    def call_slow() -> None:
+        server.cached_local_json(
+            cache_key="slow",
+            ttl_seconds=1,
+            cache_control="no-store",
+            builder=slow_builder,
+        )
+
+    def call_fast() -> None:
+        server.cached_local_json(
+            cache_key="fast",
+            ttl_seconds=1,
+            cache_control="no-store",
+            builder=lambda: {"fast": True},
+        )
+        fast_done.set()
+
+    slow_thread = threading.Thread(target=call_slow)
+    fast_thread = threading.Thread(target=call_fast)
+    try:
+        slow_thread.start()
+        assert slow_started.wait(0.5)
+        fast_thread.start()
+        assert fast_done.wait(0.5)
+    finally:
+        release_slow.set()
+        slow_thread.join(timeout=1)
+        fast_thread.join(timeout=1)
+        server.server_close()
 
 
 def test_token_bucket_rate_limiter_refills_and_caps_client_table() -> None:

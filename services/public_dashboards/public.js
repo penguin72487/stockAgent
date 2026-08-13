@@ -1,6 +1,7 @@
 "use strict";
 
 const REFRESH_MS = 15000;
+let refreshInFlight = false;
 
 const $ = (id) => document.getElementById(id);
 
@@ -35,43 +36,27 @@ function setHealth(prefix, value, overrideLabel = null) {
 }
 
 async function fetchJson(path) {
-  const response = await fetch(path, {cache: "no-cache"});
+  const response = await fetch(path, {cache: "default"});
   if (!response.ok) throw new Error(`HTTP ${response.status}`);
   return response.json();
 }
 
-async function refreshTaifex() {
-  try {
-    const data = await fetchJson("taifex/api/status");
+function renderTaifex(data) {
     setHealth("taifex", data.health);
     $("taifex-freshness").textContent = ageLabel(data.source_age_seconds);
-    const live = Number(data.strategy_counts?.live_ideal ?? data.strategies?.length ?? 0);
-    const coverage = Number(data.market?.book_coverage_ratio);
+    const live = Number(data.live_strategies || 0);
+    const coverage = Number(data.book_coverage_ratio);
     $("taifex-summary").textContent = Number.isFinite(coverage)
       ? `${live} 策略 · ${(coverage * 100).toFixed(0)}% 行情`
       : `${live} 個策略`;
-  } catch (_error) {
-    setHealth("taifex", "unavailable");
-    $("taifex-freshness").textContent = "無法取得";
-    $("taifex-summary").textContent = "進入面板查看";
-  }
 }
 
-async function refreshTw() {
-  try {
-    const data = await fetchJson("tw-day-trade/api/status");
+function renderTw(data) {
     setHealth("tw", data.health);
     $("tw-freshness").textContent = ageLabel(data.source_age_seconds);
-    const modes = Array.isArray(data.modes) ? data.modes.length : 0;
-    const positions = Array.isArray(data.positions)
-      ? data.positions.filter((row) => Number(row.signed_shares || 0) !== 0).length
-      : 0;
+    const modes = Number(data.modes || 0);
+    const positions = Number(data.open_positions || 0);
     $("tw-summary").textContent = `${modes} 模式 · ${positions} 個持倉`;
-  } catch (_error) {
-    setHealth("tw", "unavailable");
-    $("tw-freshness").textContent = "無法取得";
-    $("tw-summary").textContent = "進入面板查看";
-  }
 }
 
 function bytes(value) {
@@ -84,26 +69,39 @@ function bytes(value) {
   return `${amount.toFixed(amount >= 100 ? 0 : 1)} ${units[unit]}`;
 }
 
-async function refreshShioaji() {
-  try {
-    const data = await fetchJson("shioaji/api/status");
+function renderShioaji(data) {
     setHealth("shioaji", data.health, data.health === "waiting" ? "流量保護" : null);
-    $("shioaji-traffic").textContent = `${(Number(data.traffic?.used_ratio || 0) * 100).toFixed(1)}% · 安全剩 ${bytes(data.traffic?.safe_remaining_bytes)}`;
-    $("shioaji-progress").textContent = `${Number(data.backfill?.completed_contracts || 0)}/${Number(data.backfill?.inventory_contracts || 0)} 合約 · ${(Number(data.backfill?.progress_ratio || 0) * 100).toFixed(2)}%`;
+    $("shioaji-traffic").textContent = `${(Number(data.traffic_used_ratio || 0) * 100).toFixed(1)}% · 安全剩 ${bytes(data.safe_remaining_bytes)}`;
+    $("shioaji-progress").textContent = `${Number(data.completed_contracts || 0)}/${Number(data.inventory_contracts || 0)} 合約 · ${(Number(data.progress_ratio || 0) * 100).toFixed(2)}%`;
+}
+
+function renderUnavailable() {
+  for (const prefix of ["taifex", "tw", "shioaji"]) setHealth(prefix, "unavailable");
+  $("taifex-freshness").textContent = "無法取得";
+  $("tw-freshness").textContent = "無法取得";
+  $("taifex-summary").textContent = "進入面板查看";
+  $("tw-summary").textContent = "進入面板查看";
+  $("shioaji-traffic").textContent = "無法取得";
+  $("shioaji-progress").textContent = "進入面板查看";
+}
+
+async function refresh() {
+  if (document.hidden || refreshInFlight) return;
+  refreshInFlight = true;
+  try {
+    const data = await fetchJson("api/overview");
+    renderTaifex(data.taifex || {});
+    renderTw(data.tw || {});
+    renderShioaji(data.shioaji || {});
   } catch (_error) {
-    setHealth("shioaji", "unavailable");
-    $("shioaji-traffic").textContent = "無法取得";
-    $("shioaji-progress").textContent = "進入面板查看";
+    renderUnavailable();
+  } finally {
+    refreshInFlight = false;
   }
 }
 
-function refresh() {
-  if (document.hidden) return;
-  void Promise.allSettled([refreshTaifex(), refreshTw(), refreshShioaji()]);
-}
-
 document.addEventListener("visibilitychange", () => {
-  if (!document.hidden) refresh();
+  if (!document.hidden) void refresh();
 });
-refresh();
-window.setInterval(refresh, REFRESH_MS);
+void refresh();
+window.setInterval(() => void refresh(), REFRESH_MS);

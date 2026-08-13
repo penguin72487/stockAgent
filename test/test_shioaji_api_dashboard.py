@@ -170,6 +170,23 @@ def test_shioaji_public_status_reconciles_quota_progress_and_capture(
     assert payload["capture"]["state"] == "capturing"
     assert payload["capture"]["workers"] == 2
     assert payload["capture"]["subscriptions"] == 400
+    assert payload["dashboard_schema_version"] == 2
+    assert {item["id"] for item in payload["pipelines"]} == {
+        "contract_catalog",
+        "fop_stream",
+        "futures_history",
+        "hft_dataset",
+        "on_demand_snapshots",
+        "stock_daily",
+        "stock_minute",
+        "top200_stream",
+    }
+    assert payload["pipeline_summary"]["total"] == 8
+    assert all(
+        item["quota"] in {"historical", "realtime", "none"}
+        for item in payload["pipelines"]
+    )
+    assert all(isinstance(item["fields"], list) for item in payload["pipelines"])
     forbidden = {
         "api_key",
         "secret",
@@ -190,6 +207,11 @@ def test_shioaji_dashboard_is_local_read_only_and_source_backed() -> None:
     assert 'fetch("api/status"' in javascript
     assert "traffic-chart" in html
     assert "fleet-progress-bar" in html
+    assert "pipeline-grid" in html
+    assert 'data-filter="historical"' in html
+    assert 'data-filter="realtime"' in html
+    assert "renderPipelines" in javascript
     assert "API Key、Secret" in html
     assert "http://" not in html and "https://" not in html
     assert "textContent" in javascript
+    assert "innerHTML" not in javascript

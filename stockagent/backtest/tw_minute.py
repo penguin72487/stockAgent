@@ -40,9 +40,7 @@ class MinuteExecutionConfig:
             not math.isfinite(float(self.maximum_name_weight))
             or not 0.0 < float(self.maximum_name_weight) <= 1.0
         ):
-            raise ValueError(
-                "maximum_name_weight must be in (0, 1] when enabled"
-            )
+            raise ValueError("maximum_name_weight must be in (0, 1] when enabled")
         if (
             not math.isfinite(float(self.slippage_bps_per_side))
             or float(self.slippage_bps_per_side) < 0.0
@@ -246,6 +244,38 @@ def minute_target_weights_from_logits(
     return torch.where(any_valid, weights, torch.zeros_like(weights))
 
 
+def daily_guided_minute_target_weights(
+    daily_target_weights: torch.Tensor,
+    tradable_mask: torch.Tensor,
+    *,
+    gate_logits: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Restrict an intraday target to the signed daily-model risk envelope.
+
+    ``gate_logits=None`` is the guide-only baseline: hold every available daily
+    target at full requested exposure. Learned logits map through sigmoid, so
+    the minute policy may reduce, exit, and later re-enter a daily position but
+    can neither reverse its sign nor exceed its daily allocation.
+    """
+
+    if daily_target_weights.ndim != 2:
+        raise ValueError("daily-guided minute targets must have shape [B,S]")
+    if tradable_mask.shape != daily_target_weights.shape:
+        raise ValueError("daily-guided minute mask must match target shape")
+    if gate_logits is not None and gate_logits.shape != daily_target_weights.shape:
+        raise ValueError("daily-guided minute gate logits must match target shape")
+    guide = daily_target_weights.float()
+    gates = (
+        torch.ones_like(guide)
+        if gate_logits is None
+        else torch.sigmoid(gate_logits.float())
+    )
+    return (guide * gates).masked_fill(
+        ~tradable_mask.to(device=guide.device, dtype=torch.bool),
+        0.0,
+    )
+
+
 def execute_minute_target(
     state: MinuteExecutionState,
     *,
@@ -273,7 +303,10 @@ def execute_minute_target(
         raise ValueError("minute executor shares must end in a symbol axis")
     symbols = int(state.shares.size(-1))
     batch_shape = tuple(state.shares.shape[:-1])
-    if tuple(state.cash.shape) != batch_shape or tuple(state.equity.shape) != batch_shape:
+    if (
+        tuple(state.cash.shape) != batch_shape
+        or tuple(state.equity.shape) != batch_shape
+    ):
         raise ValueError("minute executor cash/equity batch axes are inconsistent")
     if tuple(state.last_prices.shape) != tuple(state.shares.shape):
         raise ValueError("minute executor last_prices must match shares")
@@ -285,9 +318,7 @@ def execute_minute_target(
         future_volume_shares,
     )
     if any(tuple(value.shape) != tuple(state.shares.shape) for value in aligned):
-        raise ValueError(
-            "minute executor market inputs must match shares on [...,S]"
-        )
+        raise ValueError("minute executor market inputs must match shares on [...,S]")
     for rates in (buy_fee_rates, sell_fee_rates):
         if tuple(rates.shape) not in {(symbols,), tuple(state.shares.shape)}:
             raise ValueError("minute fee rates must have shape [S] or [...,S]")
@@ -326,9 +357,7 @@ def execute_minute_target(
     # State shares are normalized by initial equity. Target weights therefore
     # map directly from normalized NAV to normalized shares.
     target_shares = (
-        clean_target
-        * equity_open.unsqueeze(-1)
-        / torch.clamp_min(opens, 1e-12)
+        clean_target * equity_open.unsqueeze(-1) / torch.clamp_min(opens, 1e-12)
     )
     if bool(config.long_only):
         target_shares = torch.clamp_min(target_shares, 0.0)
@@ -342,8 +371,7 @@ def execute_minute_target(
             if tuple(short_capacity_shares.shape) != tuple(state.shares.shape):
                 raise ValueError("minute short capacity must match shares")
             shortable = (
-                short_open_mask.to(device=state.shares.device, dtype=torch.bool)
-                & valid
+                short_open_mask.to(device=state.shares.device, dtype=torch.bool) & valid
             )
             short_capacity = torch.nan_to_num(
                 short_capacity_shares.float().to(state.shares.device),
@@ -368,9 +396,7 @@ def execute_minute_target(
                 ),
             )
     else:
-        entry_flag = allow_new_entries.to(
-            device=state.shares.device, dtype=torch.bool
-        )
+        entry_flag = allow_new_entries.to(device=state.shares.device, dtype=torch.bool)
         reduce_only = torch.where(
             state.shares > 0.0,
             torch.minimum(torch.clamp_min(target_shares, 0.0), state.shares),
@@ -380,7 +406,9 @@ def execute_minute_target(
                 torch.zeros_like(target_shares),
             ),
         )
-        target_shares = torch.where(entry_flag.unsqueeze(-1), target_shares, reduce_only)
+        target_shares = torch.where(
+            entry_flag.unsqueeze(-1), target_shares, reduce_only
+        )
     delta = target_shares - state.shares
     volume_capacity = torch.where(
         valid,
@@ -392,10 +420,7 @@ def execute_minute_target(
     if config.maximum_order_notional is not None:
         notional_capacity = torch.where(
             valid,
-            (
-                float(config.maximum_order_notional)
-                / float(config.initial_equity)
-            )
+            (float(config.maximum_order_notional) / float(config.initial_equity))
             / torch.clamp_min(opens, 1e-12),
             torch.zeros_like(opens),
         )
@@ -420,14 +445,14 @@ def execute_minute_target(
     requested_buy_cost = torch.sum(buy_quantity * buy_unit_cost, dim=-1)
     affordable_scale = torch.where(
         requested_buy_cost > 0.0,
-        torch.clamp(cash_after_sell / torch.clamp_min(requested_buy_cost, 1e-12), 0.0, 1.0),
+        torch.clamp(
+            cash_after_sell / torch.clamp_min(requested_buy_cost, 1e-12), 0.0, 1.0
+        ),
         torch.zeros_like(requested_buy_cost),
     )
     buy_quantity = buy_quantity * affordable_scale.unsqueeze(-1)
     buy_fees = buy_quantity * buy_execution * buy_rates
-    cash = cash_after_sell - torch.sum(
-        buy_quantity * buy_execution + buy_fees, dim=-1
-    )
+    cash = cash_after_sell - torch.sum(buy_quantity * buy_execution + buy_fees, dim=-1)
     shares = shares_after_sell + buy_quantity
     last_prices = torch.where(valid, closes, state.last_prices)
     normalized_pnl = torch.sum(
@@ -442,8 +467,7 @@ def execute_minute_target(
     net_return = normalized_pnl / torch.clamp_min(state.equity, 1e-12)
     currency_scale = float(config.initial_equity)
     turnover = (
-        torch.sum((sell_quantity + buy_quantity) * opens, dim=-1)
-        * currency_scale
+        torch.sum((sell_quantity + buy_quantity) * opens, dim=-1) * currency_scale
     )
     fees = torch.sum(sell_fees + buy_fees, dim=-1) * currency_scale
     slippage_cost = turnover * slippage
@@ -479,7 +503,9 @@ def force_close_minute_session(
         tuple(value.shape) != aligned_shape
         for value in (session_close, session_exit_mask, last_minute_volume_shares)
     ):
-        raise ValueError("minute force-close market inputs must match shares on [...,S]")
+        raise ValueError(
+            "minute force-close market inputs must match shares on [...,S]"
+        )
     if tuple(sell_fee_rates.shape) not in {(symbols,), aligned_shape}:
         raise ValueError("minute force-close fee rates must have shape [S] or [...,S]")
     if buy_fee_rates is not None and tuple(buy_fee_rates.shape) not in {
@@ -496,7 +522,9 @@ def force_close_minute_session(
         & (session_close > 0.0)
     )
     if state.shares.device.type == "cpu" and bool(torch.any(held & ~valid_exit).item()):
-        raise RuntimeError("minute session cannot force-close held symbols without a close")
+        raise RuntimeError(
+            "minute session cannot force-close held symbols without a close"
+        )
     reference = session_close.float().to(state.shares.device)
     long_quantity = torch.clamp_min(state.shares, 0.0)
     short_quantity = torch.clamp_min(-state.shares, 0.0)
@@ -533,13 +561,13 @@ def force_close_minute_session(
     cash = equity
     currency_scale = float(config.initial_equity)
     turnover = torch.sum(quantity * reference, dim=-1) * currency_scale
-    capacity = (
-        last_minute_volume_shares.float().to(state.shares.device)
-        * (float(config.maximum_volume_participation) / currency_scale)
+    capacity = last_minute_volume_shares.float().to(state.shares.device) * (
+        float(config.maximum_volume_participation) / currency_scale
     )
-    over_capacity = torch.sum(
-        torch.clamp_min(quantity - capacity, 0.0) * reference, dim=-1
-    ) * currency_scale
+    over_capacity = (
+        torch.sum(torch.clamp_min(quantity - capacity, 0.0) * reference, dim=-1)
+        * currency_scale
+    )
     net_return = normalized_pnl / torch.clamp_min(state.equity, 1e-12)
     return MinuteCloseResult(
         state=MinuteExecutionState(
@@ -550,9 +578,7 @@ def force_close_minute_session(
         ),
         net_return=net_return,
         turnover_notional=turnover,
-        explicit_fees=(
-            torch.sum(sell_fees + buy_fees, dim=-1) * currency_scale
-        ),
+        explicit_fees=(torch.sum(sell_fees + buy_fees, dim=-1) * currency_scale),
         slippage_cost=turnover * slippage,
         forced_exit_over_capacity_notional=over_capacity,
     )
@@ -563,6 +589,7 @@ __all__ = [
     "MinuteExecutionConfig",
     "MinuteExecutionState",
     "MinuteStepResult",
+    "daily_guided_minute_target_weights",
     "execute_minute_target",
     "force_close_minute_session",
     "initialize_minute_execution_state",
