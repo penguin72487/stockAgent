@@ -380,6 +380,45 @@ def validate_completed_training_artifacts(
                 invalid.append(
                     f"{contract_path}: execution mode disagrees with run manifest"
                 )
+            if contract.get("execution_mode") in {
+                "tw_index_futures_day",
+                "tw_index_derivatives_day",
+            }:
+                audit_path = layout.fold_dir(fold_id) / "futures_benchmark_audit.npz"
+                if not has_content(audit_path):
+                    invalid.append(
+                        f"{audit_path}: required rolling futures benchmark audit "
+                        "is missing or empty"
+                    )
+                else:
+                    try:
+                        with zipfile.ZipFile(audit_path) as archive:
+                            audit_names = set(archive.namelist())
+                    except (OSError, zipfile.BadZipFile) as exc:
+                        invalid.append(
+                            f"{audit_path}: invalid futures benchmark audit "
+                            f"container ({type(exc).__name__})"
+                        )
+                    else:
+                        required_audit_entries = {
+                            "artifact_schema_version.npy",
+                            "benchmark_contract.npy",
+                            "roll_gap_treatment.npy",
+                            "dates.npy",
+                            "contract_months.npy",
+                            "front_month_roll_mask.npy",
+                            "front_month_close.npy",
+                            "prior_same_contract_close.npy",
+                            "benchmark_log_returns.npy",
+                        }
+                        missing_audit_entries = sorted(
+                            required_audit_entries - audit_names
+                        )
+                        if missing_audit_entries:
+                            invalid.append(
+                                f"{audit_path}: missing futures benchmark audit "
+                                f"entries {missing_audit_entries}"
+                            )
         elif contract is not None:
             invalid.append(f"{contract_path}: expected a JSON object")
         complete_path = layout.fold_complete_path(fold_id)

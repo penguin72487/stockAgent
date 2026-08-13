@@ -748,6 +748,28 @@ def _run_isolated_post_train_inference(*, argv: Sequence[str]) -> None:
         )
 
 
+def _should_isolate_selected_folds(
+    *,
+    mode: str,
+    isolate_train_folds: bool,
+    folds: Sequence[object],
+) -> bool:
+    """Keep even a single selected fold behind the fresh-process boundary.
+
+    The DDP launcher deliberately stays out of the orchestration parent when
+    fold isolation is enabled.  Therefore a one-fold smoke/profile run must
+    still launch an isolated child; otherwise the parent reaches the DDP
+    trainer without the RANK/WORLD_SIZE environment that torchrun owns.
+    """
+
+    return (
+        str(mode) == "train"
+        and bool(isolate_train_folds)
+        and len(folds) > 0
+        and os.environ.get(_FOLD_ISOLATION_CHILD_ENV) != "1"
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train the stockAgent baseline model")
     parser.add_argument("--config", default="configs/markets/tw.yaml", help="Path to experiment config")
@@ -1086,6 +1108,7 @@ def main() -> None:
     from stockagent.training.trainer import (
         _load_checkpoint,
         _load_completed_fold_result,
+        _refresh_walkforward_artifacts,
         run_inference,
         run_training,
     )
@@ -1289,7 +1312,10 @@ def main() -> None:
         return
 
     panel = _build_panel_rank_coordinated(build_panel, config, active_strategy)
-    if str(config.trading.execution_mode) == "tw_index_futures_day":
+    if str(config.trading.execution_mode) in {
+        "tw_index_futures_day",
+        "tw_index_derivatives_day",
+    }:
         from stockagent.data.tw_index_futures import (
             load_taifex_index_futures_day_session,
         )
@@ -1301,14 +1327,100 @@ def main() -> None:
         panel.index_futures_reference_product = (
             config.trading.tw_index_futures_reference_product
         )
+        if str(config.trading.execution_mode) == "tw_index_derivatives_day":
+            from stockagent.data.tw_index_options_daily import (
+                combine_taifex_option_chains,
+                load_taifex_option_full_chain,
+            )
+            from stockagent.data.tw_index_derivatives_day import (
+                TAIFEX_INDEX_DERIVATIVE_ACTION_COUNT_V4,
+                build_causal_derivative_day_candidates,
+            )
+
+            panel.index_options_monthly_day_session = (
+                load_taifex_option_full_chain(
+                    config.trading.tw_index_options_monthly_data_path,
+                    expected_series_scope="monthly",
+                    panel_dates=panel.dates,
+                )
+            )
+            panel.index_options_weekly_day_session = (
+                load_taifex_option_full_chain(
+                    config.trading.tw_index_options_weekly_data_path,
+                    expected_series_scope="weekly",
+                    panel_dates=panel.dates,
+                )
+            )
+            panel.index_options_chain_day_session = combine_taifex_option_chains(
+                panel.index_options_monthly_day_session,
+                panel.index_options_weekly_day_session,
+            )
+            option_costs = {
+                "fixed_fee_per_contract_per_side_twd": (
+                    config.trading.tw_index_derivatives_day_option_fixed_fee_per_contract_per_side_twd
+                ),
+                "transaction_tax_rate": (
+                    config.trading.tw_index_derivatives_day_option_transaction_tax_rate
+                ),
+                "slippage_points_per_side": (
+                    config.trading.tw_index_derivatives_day_option_slippage_points_per_side
+                ),
+            }
+            panel.index_derivatives_day_candidates = (
+                build_causal_derivative_day_candidates(
+                    panel.index_futures_day_session,
+                    panel.index_options_chain_day_session,
+                    reference_product=(
+                        config.trading.tw_index_futures_reference_product
+                    ),
+                    **option_costs,
+                )
+            )
+            panel.index_derivatives_candidate_features = (
+                panel.index_derivatives_day_candidates.option_candidate_features
+            )
+            panel.index_derivatives_candidate_mask = (
+                panel.index_derivatives_day_candidates.candidate_mask()
+            )
+            panel.index_derivatives_simple_returns = (
+                panel.index_derivatives_day_candidates.simple_returns()
+            )
+            if panel.index_derivatives_simple_returns.shape[1] != (
+                TAIFEX_INDEX_DERIVATIVE_ACTION_COUNT_V4
+            ):
+                raise RuntimeError("relative-tenor derivative action width mismatch")
         reference_valid = panel.index_futures_day_session.reference_tradable_mask(
             panel.index_futures_reference_product
         )
+        benchmark_valid = (
+            panel.index_futures_day_session.reference_rolling_buy_hold_tradable_mask(
+                panel.index_futures_reference_product
+            )
+        )
+        benchmark_rolls = (
+            panel.index_futures_day_session.reference_front_month_roll_mask(
+                panel.index_futures_reference_product
+            )
+        )
         print(
             "[runner] attached TAIFEX TX/MTX/TMF day-session executor data: "
-            f"valid_reference_rows={int(reference_valid.sum())}/{panel.num_dates}",
+            f"valid_intraday_rows={int(reference_valid.sum())}/{panel.num_dates}, "
+            f"valid_rolling_benchmark_rows={int(benchmark_valid.sum())}/"
+            f"{panel.num_dates}, rolls={int(benchmark_rolls.sum())}",
             flush=True,
         )
+        if str(config.trading.execution_mode) == "tw_index_derivatives_day":
+            candidates = panel.index_derivatives_day_candidates
+            option_visible = np.asarray(candidates.option_candidate_mask, dtype=bool)
+            option_valid = np.isfinite(candidates.option_simple_returns)
+            print(
+                "[runner] attached causal relative-tenor derivative panel: "
+                f"futures_tenors=6, option_capacity={option_valid.shape[1]}, "
+                f"option_max_candidates={int(option_visible.sum(axis=1).max())}, "
+                f"option_max_executable={int(option_valid.sum(axis=1).max())}; "
+                "prices are official first/last daily trades, not simultaneous quotes",
+                flush=True,
+            )
     startup_timing.checkpoint(
         "panel_build_or_cache_load",
         rows=int(panel.num_dates),
@@ -1389,18 +1501,11 @@ def main() -> None:
         mode=str(mode),
         resume=bool(resume),
     )
-    isolate_this_run = (
-        mode == "train"
-        and bool(isolate_train_folds)
-        and len(folds) > 1
-        and os.environ.get(_FOLD_ISOLATION_CHILD_ENV) != "1"
+    isolate_this_run = _should_isolate_selected_folds(
+        mode=str(mode),
+        isolate_train_folds=bool(isolate_train_folds),
+        folds=folds,
     )
-    if isolate_this_run and active_strategy != "none":
-        raise RuntimeError(
-            "runner.isolate_train_folds currently requires one visible GPU "
-            "(training.multi_gpu_strategy must resolve to 'none')"
-        )
-
     if mode == "infer":
         results = run_inference(
             panel,
@@ -1430,6 +1535,18 @@ def main() -> None:
                     f"artifacts: fold={int(fold.fold_id)}"
                 )
             results.append(completed)
+        # Each isolated child can only see its own selected fold, so its
+        # root-level walk-forward report is necessarily incomplete and the
+        # last child would otherwise overwrite it.  Rebuild the canonical
+        # stitched deployment once in the parent after every selected fold is
+        # available, preserving one chronological account across model-owner
+        # changes.
+        _refresh_walkforward_artifacts(
+            Path(output_dir),
+            results,
+            panel=panel,
+            config=config,
+        )
     else:
         results = run_training(
             panel,

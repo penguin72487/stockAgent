@@ -3,8 +3,9 @@
 The source files are the CSV/ZIP artifacts returned by TAIFEX's
 ``futDataDown`` endpoint.  They contain both the general (day) and after-hours
 sessions.  This module deliberately keeps only ``一般`` rows and monthly
-contracts, then selects the nearest listed monthly contract for each
-date/product.  Weekly MTX rows and calendar spreads are never mixed into the
+contracts.  It preserves every listed monthly contract so a point-in-time
+front-month series can roll without treating the old/new contract price gap as
+a return.  Weekly MTX rows and calendar spreads are never mixed into the
 continuous series.
 """
 
@@ -26,6 +27,7 @@ import numpy as np
 
 
 TAIFEX_INDEX_FUTURES_PRODUCTS: Final[tuple[str, ...]] = ("TX", "MTX", "TMF")
+TAIFEX_INDEX_FUTURES_TENOR_SLOTS: Final[int] = 6
 TAIFEX_INDEX_FUTURES_MULTIPLIERS: Final[dict[str, int]] = {
     "TX": 200,
     "MTX": 50,
@@ -49,7 +51,7 @@ SHIOAJI_FUTURES_ROOTS: Final[dict[str, str]] = {
 }
 
 TAIFEX_DAY_SESSION_LABEL: Final[str] = "一般"
-TAIFEX_FUTURES_DATA_CONTRACT_VERSION: Final[int] = 1
+TAIFEX_FUTURES_DATA_CONTRACT_VERSION: Final[int] = 2
 _MONTHLY_CONTRACT_RE = re.compile(r"^[0-9]{6}$")
 _DAY_SESSION_ALIASES: Final[frozenset[str]] = frozenset(
     {"一般", "一般交易時段", "day", "day_session", "regular"}
@@ -76,6 +78,9 @@ _NORMALIZED_COLUMNS: Final[tuple[str, ...]] = (
     "volume",
     "log_return",
     "multiplier",
+    "is_front_month",
+    "rolling_buy_hold_log_return",
+    "front_month_roll",
     "source_file",
     "source_sha256",
 )
@@ -83,7 +88,14 @@ _NORMALIZED_COLUMNS: Final[tuple[str, ...]] = (
 
 @dataclass(frozen=True, slots=True)
 class TaiwanIndexFuturesDaySession:
-    """Front-month day-session arrays aligned to a requested date axis."""
+    """Front-month day-session arrays aligned to a requested date axis.
+
+    ``log_returns`` are same-session open-to-close strategy labels.
+    ``rolling_buy_hold_log_returns`` are a distinct, fully collateralized 1x
+    long benchmark. On a front-month change, the benchmark is assumed to roll
+    at the preceding session close and therefore measures the new contract
+    from its own preceding close instead of booking the calendar-spread gap.
+    """
 
     dates: np.ndarray
     products: tuple[str, ...]
@@ -96,6 +108,38 @@ class TaiwanIndexFuturesDaySession:
     log_returns: np.ndarray
     tradable_mask: np.ndarray
     multipliers: np.ndarray
+    rolling_buy_hold_log_returns: np.ndarray | None = None
+    rolling_buy_hold_tradable_mask: np.ndarray | None = None
+    front_month_roll_mask: np.ndarray | None = None
+    # All causally listable monthly expiries, ordered E1..E6 independently on
+    # every date.  Product is the final axis in canonical TX/MTX/TMF order.
+    # The legacy two-dimensional fields above remain the front-month view used
+    # by the rolling benchmark and older futures-only experiments.
+    tenor_contract_months: np.ndarray | None = None
+    tenor_open_prices: np.ndarray | None = None
+    tenor_high_prices: np.ndarray | None = None
+    tenor_low_prices: np.ndarray | None = None
+    tenor_close_prices: np.ndarray | None = None
+    tenor_volumes: np.ndarray | None = None
+    tenor_log_returns: np.ndarray | None = None
+    tenor_tradable_mask: np.ndarray | None = None
+
+    def require_tenor_panel(self) -> tuple[np.ndarray, ...]:
+        values = (
+            self.tenor_contract_months,
+            self.tenor_open_prices,
+            self.tenor_high_prices,
+            self.tenor_low_prices,
+            self.tenor_close_prices,
+            self.tenor_volumes,
+            self.tenor_log_returns,
+            self.tenor_tradable_mask,
+        )
+        if any(value is None for value in values):
+            raise ValueError(
+                "TAIFEX futures data does not contain the E1..E6 tenor panel"
+            )
+        return tuple(np.asarray(value) for value in values)  # type: ignore[arg-type,return-value]
 
     def product_index(self, product: str) -> int:
         normalized = normalize_taifex_index_futures_product(product)
@@ -112,9 +156,44 @@ class TaiwanIndexFuturesDaySession:
     def reference_tradable_mask(self, product: str = "TX") -> np.ndarray:
         return self.tradable_mask[:, self.product_index(product)]
 
+    def reference_rolling_buy_hold_log_returns(
+        self,
+        product: str = "TX",
+    ) -> np.ndarray:
+        if self.rolling_buy_hold_log_returns is None:
+            raise ValueError(
+                "TAIFEX data does not contain the rolling buy-and-hold "
+                "benchmark; rebuild it with futures data contract v2"
+            )
+        return self.rolling_buy_hold_log_returns[:, self.product_index(product)]
+
+    def reference_rolling_buy_hold_tradable_mask(
+        self,
+        product: str = "TX",
+    ) -> np.ndarray:
+        if self.rolling_buy_hold_tradable_mask is None:
+            raise ValueError(
+                "TAIFEX data does not contain rolling benchmark validity; "
+                "rebuild it with futures data contract v2"
+            )
+        return self.rolling_buy_hold_tradable_mask[
+            :, self.product_index(product)
+        ]
+
+    def reference_front_month_roll_mask(
+        self,
+        product: str = "TX",
+    ) -> np.ndarray:
+        if self.front_month_roll_mask is None:
+            raise ValueError(
+                "TAIFEX data does not contain front-month roll events; rebuild "
+                "it with futures data contract v2"
+            )
+        return self.front_month_roll_mask[:, self.product_index(product)]
+
 
 @dataclass(frozen=True, slots=True)
-class _FrontMonthRow:
+class _MonthlyContractRow:
     date: np.datetime64
     product: str
     contract_month: str
@@ -264,7 +343,7 @@ def _iter_monthly_day_rows(
     source_path: Path,
     *,
     products: tuple[str, ...],
-) -> Iterator[_FrontMonthRow]:
+) -> Iterator[_MonthlyContractRow]:
     product_set = set(products)
     for stream, source_name, source_sha256 in _decoded_csv_stream(source_path):
         reader = csv.DictReader(stream)
@@ -303,7 +382,7 @@ def _iter_monthly_day_rows(
                 continue
             if volume <= 0:
                 continue
-            yield _FrontMonthRow(
+            yield _MonthlyContractRow(
                 date=date_value,
                 product=product,
                 contract_month=contract_month,
@@ -317,12 +396,12 @@ def _iter_monthly_day_rows(
             )
 
 
-def _front_month_rows(
+def _monthly_day_rows(
     source_paths: Iterable[str | Path],
     *,
     products: tuple[str, ...],
-) -> list[_FrontMonthRow]:
-    by_contract: dict[tuple[np.datetime64, str, str], _FrontMonthRow] = {}
+) -> list[_MonthlyContractRow]:
+    by_contract: dict[tuple[np.datetime64, str, str], _MonthlyContractRow] = {}
     for raw_path in source_paths:
         path = Path(raw_path).expanduser().resolve()
         if not path.is_file():
@@ -354,18 +433,81 @@ def _front_month_rows(
                     f"{previous.source_file} vs {row.source_file}"
                 )
 
-    grouped: dict[tuple[np.datetime64, str], list[_FrontMonthRow]] = {}
-    for row in by_contract.values():
+    return sorted(
+        by_contract.values(),
+        key=lambda row: (
+            row.date,
+            products.index(row.product),
+            row.contract_month,
+        ),
+    )
+
+
+def _front_month_keys(
+    rows: Sequence[_MonthlyContractRow],
+) -> set[tuple[np.datetime64, str, str]]:
+    grouped: dict[tuple[np.datetime64, str], list[_MonthlyContractRow]] = {}
+    for row in rows:
         grouped.setdefault((row.date, row.product), []).append(row)
 
-    selected: list[_FrontMonthRow] = []
+    selected: set[tuple[np.datetime64, str, str]] = set()
     for key, candidates in grouped.items():
-        date_value, _product = key
+        date_value, product = key
         calendar_month = str(date_value.astype("datetime64[M]")).replace("-", "")
         nonexpired = [row for row in candidates if row.contract_month >= calendar_month]
         pool = nonexpired if nonexpired else candidates
-        selected.append(min(pool, key=lambda row: row.contract_month))
-    return sorted(selected, key=lambda row: (row.date, products.index(row.product)))
+        front = min(pool, key=lambda row: row.contract_month)
+        selected.add((date_value, product, front.contract_month))
+    return selected
+
+
+def _rolling_buy_hold_payload(
+    rows: Sequence[_MonthlyContractRow],
+    front_keys: set[tuple[np.datetime64, str, str]],
+) -> dict[tuple[np.datetime64, str, str], tuple[float, bool]]:
+    """Return front-row benchmark log returns and roll-event flags.
+
+    The contract that is front month on date ``t`` is assumed to have been
+    entered at the preceding futures-session close. Its return is therefore
+    ``log(close[t, current] / close[t-1, current])``. This is identical to a
+    normal close-to-close return away from a roll and removes the artificial
+    old/new-contract level jump on a roll.
+    """
+
+    by_contract = {
+        (row.date, row.product, row.contract_month): row for row in rows
+    }
+    front_by_product: dict[str, list[_MonthlyContractRow]] = {}
+    for row in rows:
+        key = (row.date, row.product, row.contract_month)
+        if key in front_keys:
+            front_by_product.setdefault(row.product, []).append(row)
+
+    payload: dict[tuple[np.datetime64, str, str], tuple[float, bool]] = {}
+    for product_rows in front_by_product.values():
+        ordered = sorted(product_rows, key=lambda row: row.date)
+        for index, current in enumerate(ordered):
+            key = (current.date, current.product, current.contract_month)
+            if index == 0:
+                payload[key] = (float("nan"), False)
+                continue
+            previous_front = ordered[index - 1]
+            prior_same_contract = by_contract.get(
+                (
+                    previous_front.date,
+                    current.product,
+                    current.contract_month,
+                )
+            )
+            rolled = current.contract_month != previous_front.contract_month
+            if prior_same_contract is None:
+                payload[key] = (float("nan"), rolled)
+                continue
+            payload[key] = (
+                float(math.log(current.close / prior_same_contract.close)),
+                rolled,
+            )
+    return payload
 
 
 def build_taifex_index_futures_day_session(
@@ -374,12 +516,14 @@ def build_taifex_index_futures_day_session(
     *,
     products: Sequence[object] | None = None,
 ) -> Path:
-    """Normalize official files into one front-month day-session parquet."""
+    """Normalize official files into an auditable all-contract parquet."""
 
     normalized_products = _normalized_products(products)
-    rows = _front_month_rows(source_paths, products=normalized_products)
+    rows = _monthly_day_rows(source_paths, products=normalized_products)
     if not rows:
-        raise ValueError("no usable front-month TAIFEX day-session rows were found")
+        raise ValueError("no usable monthly TAIFEX day-session rows were found")
+    front_keys = _front_month_keys(rows)
+    rolling_payload = _rolling_buy_hold_payload(rows, front_keys)
 
     import pyarrow as pa
     import pyarrow.parquet as pq
@@ -408,6 +552,33 @@ def build_taifex_index_futures_day_session(
                 [TAIFEX_INDEX_FUTURES_MULTIPLIERS[row.product] for row in rows],
                 dtype=np.int64,
             ),
+            "is_front_month": np.asarray(
+                [
+                    (row.date, row.product, row.contract_month) in front_keys
+                    for row in rows
+                ],
+                dtype=bool,
+            ),
+            "rolling_buy_hold_log_return": np.asarray(
+                [
+                    rolling_payload.get(
+                        (row.date, row.product, row.contract_month),
+                        (float("nan"), False),
+                    )[0]
+                    for row in rows
+                ],
+                dtype=np.float64,
+            ),
+            "front_month_roll": np.asarray(
+                [
+                    rolling_payload.get(
+                        (row.date, row.product, row.contract_month),
+                        (float("nan"), False),
+                    )[1]
+                    for row in rows
+                ],
+                dtype=bool,
+            ),
             "source_file": [row.source_file for row in rows],
             "source_sha256": [row.source_sha256 for row in rows],
         }
@@ -415,12 +586,16 @@ def build_taifex_index_futures_day_session(
     metadata = dict(table.schema.metadata or {})
     metadata.update(
         {
-            b"stockagent.dataset": b"tw_index_futures_day_session_front_month",
+            b"stockagent.dataset": b"tw_index_futures_day_session_contracts",
             b"stockagent.contract_version": str(
                 TAIFEX_FUTURES_DATA_CONTRACT_VERSION
             ).encode("ascii"),
             b"stockagent.session": TAIFEX_DAY_SESSION_LABEL.encode("utf-8"),
             b"stockagent.products": ",".join(normalized_products).encode("ascii"),
+            b"stockagent.front_month_policy": b"nearest_unexpired_monthly",
+            b"stockagent.rolling_benchmark": b"1x_long_front_month_gross",
+            b"stockagent.roll_timing": b"preceding_session_close",
+            b"stockagent.roll_gap_treatment": b"same_contract_close_to_close",
         }
     )
     table = table.replace_schema_metadata(metadata)
@@ -438,7 +613,7 @@ def load_taifex_index_futures_day_session(
     panel_dates: np.ndarray | None = None,
     products: Sequence[object] | None = None,
 ) -> TaiwanIndexFuturesDaySession:
-    """Load and optionally align normalized front-month data to panel dates."""
+    """Load and optionally align v2 front-month and rolling benchmark data."""
 
     import pyarrow.parquet as pq
 
@@ -452,11 +627,27 @@ def load_taifex_index_futures_day_session(
         raise ValueError(f"{source} is missing normalized columns: {missing}")
     metadata = table.schema.metadata or {}
     contract_version = metadata.get(b"stockagent.contract_version")
-    if contract_version is not None and int(contract_version) != (
+    if contract_version is None or int(contract_version) != (
         TAIFEX_FUTURES_DATA_CONTRACT_VERSION
     ):
         raise ValueError(
             f"{source} uses unsupported futures data contract {contract_version!r}"
+        )
+    expected_metadata = {
+        b"stockagent.front_month_policy": b"nearest_unexpired_monthly",
+        b"stockagent.rolling_benchmark": b"1x_long_front_month_gross",
+        b"stockagent.roll_timing": b"preceding_session_close",
+        b"stockagent.roll_gap_treatment": b"same_contract_close_to_close",
+    }
+    mismatched_metadata = {
+        key.decode("ascii"): (metadata.get(key), expected)
+        for key, expected in expected_metadata.items()
+        if metadata.get(key) != expected
+    }
+    if mismatched_metadata:
+        raise ValueError(
+            f"{source} has unsupported rolling benchmark metadata: "
+            f"{mismatched_metadata}"
         )
 
     payload = table.select(
@@ -471,6 +662,9 @@ def load_taifex_index_futures_day_session(
             "volume",
             "log_return",
             "multiplier",
+            "is_front_month",
+            "rolling_buy_hold_log_return",
+            "front_month_roll",
         ]
     ).to_pydict()
     source_dates = np.asarray(payload["date"], dtype="datetime64[D]")
@@ -492,6 +686,10 @@ def load_taifex_index_futures_day_session(
     close_prices = np.full((rows, columns), np.nan, dtype=np.float64)
     volumes = np.zeros((rows, columns), dtype=np.int64)
     log_returns = np.full((rows, columns), np.nan, dtype=np.float64)
+    rolling_buy_hold_log_returns = np.full(
+        (rows, columns), np.nan, dtype=np.float64
+    )
+    front_month_roll_mask = np.zeros((rows, columns), dtype=bool)
     date_to_row = {date_value: idx for idx, date_value in enumerate(dates)}
     product_to_col = {product: idx for idx, product in enumerate(normalized_products)}
     seen: set[tuple[int, int]] = set()
@@ -500,7 +698,11 @@ def load_taifex_index_futures_day_session(
         zip(source_dates, payload["product"], strict=True)
     ):
         product = str(raw_product).strip().upper()
-        if product not in product_to_col or date_value not in date_to_row:
+        if (
+            product not in product_to_col
+            or date_value not in date_to_row
+            or not bool(payload["is_front_month"][source_row])
+        ):
             continue
         row = date_to_row[date_value]
         col = product_to_col[product]
@@ -517,6 +719,12 @@ def load_taifex_index_futures_day_session(
         close_prices[row, col] = float(payload["close"][source_row])
         volumes[row, col] = int(payload["volume"][source_row])
         log_returns[row, col] = float(payload["log_return"][source_row])
+        rolling_buy_hold_log_returns[row, col] = float(
+            payload["rolling_buy_hold_log_return"][source_row]
+        )
+        front_month_roll_mask[row, col] = bool(
+            payload["front_month_roll"][source_row]
+        )
         expected_multiplier = TAIFEX_INDEX_FUTURES_MULTIPLIERS[product]
         if int(payload["multiplier"][source_row]) != expected_multiplier:
             raise ValueError(
@@ -531,6 +739,84 @@ def load_taifex_index_futures_day_session(
         & (close_prices > 0.0)
         & np.isfinite(log_returns)
         & (volumes > 0)
+    )
+    rolling_buy_hold_tradable = tradable & np.isfinite(
+        rolling_buy_hold_log_returns
+    )
+
+    tenor_shape = (rows, TAIFEX_INDEX_FUTURES_TENOR_SLOTS, columns)
+    tenor_contract_months = np.full(
+        (rows, TAIFEX_INDEX_FUTURES_TENOR_SLOTS), "", dtype="U6"
+    )
+    tenor_open_prices = np.full(tenor_shape, np.nan, dtype=np.float64)
+    tenor_high_prices = np.full(tenor_shape, np.nan, dtype=np.float64)
+    tenor_low_prices = np.full(tenor_shape, np.nan, dtype=np.float64)
+    tenor_close_prices = np.full(tenor_shape, np.nan, dtype=np.float64)
+    tenor_volumes = np.zeros(tenor_shape, dtype=np.int64)
+    tenor_log_returns = np.full(tenor_shape, np.nan, dtype=np.float64)
+    source_rows_by_date: dict[np.datetime64, list[int]] = {}
+    for source_row, date_value in enumerate(source_dates):
+        raw_product = str(payload["product"][source_row]).strip().upper()
+        if raw_product in product_to_col and date_value in date_to_row:
+            source_rows_by_date.setdefault(date_value, []).append(source_row)
+    for date_value, source_rows_for_date in source_rows_by_date.items():
+        row = date_to_row[date_value]
+        months = sorted(
+            {
+                str(payload["contract_month"][source_row]).strip()
+                for source_row in source_rows_for_date
+                if _MONTHLY_CONTRACT_RE.fullmatch(
+                    str(payload["contract_month"][source_row]).strip()
+                )
+            }
+        )
+        if len(months) > TAIFEX_INDEX_FUTURES_TENOR_SLOTS:
+            raise ValueError(
+                f"{source} contains {len(months)} monthly expiries on "
+                f"{date_value}, exceeding E1..E{TAIFEX_INDEX_FUTURES_TENOR_SLOTS}"
+            )
+        month_to_tenor = {month: index for index, month in enumerate(months)}
+        tenor_contract_months[row, : len(months)] = months
+        seen_tenor_products: set[tuple[int, int]] = set()
+        for source_row in source_rows_for_date:
+            month = str(payload["contract_month"][source_row]).strip()
+            product = str(payload["product"][source_row]).strip().upper()
+            if month not in month_to_tenor or product not in product_to_col:
+                continue
+            tenor = month_to_tenor[month]
+            product_col = product_to_col[product]
+            key = (tenor, product_col)
+            if key in seen_tenor_products:
+                raise ValueError(
+                    f"{source} contains duplicate tenor row "
+                    f"{date_value}/{month}/{product}"
+                )
+            seen_tenor_products.add(key)
+            tenor_open_prices[row, tenor, product_col] = float(
+                payload["open"][source_row]
+            )
+            tenor_high_prices[row, tenor, product_col] = float(
+                payload["high"][source_row]
+            )
+            tenor_low_prices[row, tenor, product_col] = float(
+                payload["low"][source_row]
+            )
+            tenor_close_prices[row, tenor, product_col] = float(
+                payload["close"][source_row]
+            )
+            tenor_volumes[row, tenor, product_col] = int(
+                payload["volume"][source_row]
+            )
+            tenor_log_returns[row, tenor, product_col] = float(
+                payload["log_return"][source_row]
+            )
+    tenor_tradable = (
+        np.isfinite(tenor_open_prices)
+        & (tenor_open_prices > 0.0)
+        & np.isfinite(tenor_close_prices)
+        & (tenor_close_prices > 0.0)
+        & np.isfinite(tenor_log_returns)
+        & (tenor_volumes > 0)
     )
     return TaiwanIndexFuturesDaySession(
         dates=dates,
@@ -550,6 +836,17 @@ def load_taifex_index_futures_day_session(
             ],
             dtype=np.int64,
         ),
+        rolling_buy_hold_log_returns=rolling_buy_hold_log_returns,
+        rolling_buy_hold_tradable_mask=rolling_buy_hold_tradable,
+        front_month_roll_mask=front_month_roll_mask,
+        tenor_contract_months=tenor_contract_months,
+        tenor_open_prices=tenor_open_prices,
+        tenor_high_prices=tenor_high_prices,
+        tenor_low_prices=tenor_low_prices,
+        tenor_close_prices=tenor_close_prices,
+        tenor_volumes=tenor_volumes,
+        tenor_log_returns=tenor_log_returns,
+        tenor_tradable_mask=tenor_tradable,
     )
 
 
@@ -580,6 +877,7 @@ __all__ = [
     "TAIFEX_FUTURES_DATA_CONTRACT_VERSION",
     "TAIFEX_INDEX_FUTURES_MULTIPLIERS",
     "TAIFEX_INDEX_FUTURES_PRODUCTS",
+    "TAIFEX_INDEX_FUTURES_TENOR_SLOTS",
     "TaiwanIndexFuturesDaySession",
     "build_taifex_index_futures_day_session",
     "iter_taifex_daily_csv_streams",

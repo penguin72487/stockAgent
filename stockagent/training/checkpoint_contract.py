@@ -26,8 +26,15 @@ from stockagent.backtest.tw_execution import (
 from stockagent.backtest.tw_index_futures import (
     TW_INDEX_FUTURES_DAY_BACKTEST_CONTRACT_VERSION,
 )
+from stockagent.backtest.tw_index_derivatives_day import (
+    TW_INDEX_DERIVATIVES_DAY_BACKTEST_CONTRACT_VERSION,
+)
 from stockagent.config import ExperimentConfig
 from stockagent.data.panel import PanelData
+from stockagent.data.tw_index_derivatives_day import (
+    TAIFEX_DERIVATIVE_CANDIDATE_CONTRACT_VERSION,
+    TAIFEX_INDEX_DERIVATIVE_ACTION_COUNT_V4,
+)
 from stockagent.data.panel_cache import array_content_fingerprint
 from stockagent.data.walkforward import WalkForwardFold, normalize_lookback_context
 from stockagent.models.factory import _feature_indices_from_patterns
@@ -192,6 +199,18 @@ def _configuration_fingerprint_snapshot(config: ExperimentConfig) -> dict[str, A
 
 def _active_model_config(config: ExperimentConfig) -> dict[str, Any]:
     normalized = _normalized_model_name(config.training.model_name)
+    if normalized in {
+        "cross_sectional_index_derivatives_day",
+        "cross_sectional_index_derivatives_day_model",
+        "tw_index_derivatives_day",
+    }:
+        return {
+            "config_name": "financial_transformer",
+            "contract_name": "cross_sectional_index_derivatives_day",
+            "values": _project_temporal_basis_model_config(
+                asdict(config.training.financial_transformer)
+            ),
+        }
     if normalized in {
         "cross_sectional_index_futures",
         "cross_sectional_index_futures_model",
@@ -711,7 +730,7 @@ def _trading_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
             trading.portfolio_activation
         ),
     }
-    if execution_mode == "tw_index_futures_day":
+    if execution_mode in {"tw_index_futures_day", "tw_index_derivatives_day"}:
         contract["taiwan_index_futures_day"] = {
             "backtest_contract_version": int(
                 TW_INDEX_FUTURES_DAY_BACKTEST_CONTRACT_VERSION
@@ -726,10 +745,43 @@ def _trading_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
             "total_fee_per_side_twd": list(
                 trading.tw_index_futures_total_fee_per_side_twd
             ),
+            "sell_transaction_tax_rate": float(
+                trading.tw_index_futures_sell_transaction_tax_rate
+            ),
             "slippage_points_per_side": list(
                 trading.tw_index_futures_slippage_points_per_side
             ),
             "basket_fee_penalty": float(trading.tw_index_futures_basket_fee_penalty),
+        }
+    if execution_mode == "tw_index_derivatives_day":
+        contract["taiwan_index_derivatives_day"] = {
+            "backtest_contract_version": int(
+                TW_INDEX_DERIVATIVES_DAY_BACKTEST_CONTRACT_VERSION
+            ),
+            "candidate_contract_version": int(
+                TAIFEX_DERIVATIVE_CANDIDATE_CONTRACT_VERSION
+            ),
+            "action_count": int(TAIFEX_INDEX_DERIVATIVE_ACTION_COUNT_V4),
+            "monthly_options_data_path": str(
+                trading.tw_index_options_monthly_data_path
+            ),
+            "weekly_options_data_path": str(
+                trading.tw_index_options_weekly_data_path
+            ),
+            "maximum_capital_fraction": float(
+                trading.tw_index_derivatives_day_maximum_capital_fraction
+            ),
+            "option_fixed_fee_per_contract_per_side_twd": float(
+                trading.tw_index_derivatives_day_option_fixed_fee_per_contract_per_side_twd
+            ),
+            "option_sell_transaction_tax_rate": float(
+                trading.tw_index_derivatives_day_option_transaction_tax_rate
+            ),
+            "option_slippage_points_per_side": float(
+                trading.tw_index_derivatives_day_option_slippage_points_per_side
+            ),
+            "option_price_source": "taifex_daily_first_last_trade_proxy",
+            "option_shorting": False,
         }
     if execution_mode in TW_STOCK_EXECUTION_MODES:
         contract["taiwan_execution"] = {
@@ -1110,11 +1162,20 @@ def _checkpoint_manifest(
                     ),
                 }
             )
-        if execution_mode == "tw_index_futures_day":
+        if execution_mode in {"tw_index_futures_day", "tw_index_derivatives_day"}:
             futures_market = panel.index_futures_day_session
             if futures_market is None:
                 raise ValueError(
                     "tw_index_futures_day checkpoint manifest requires futures data"
+                )
+            if (
+                futures_market.rolling_buy_hold_log_returns is None
+                or futures_market.rolling_buy_hold_tradable_mask is None
+                or futures_market.front_month_roll_mask is None
+            ):
+                raise ValueError(
+                    "tw_index_futures_day checkpoint manifest requires futures "
+                    "data contract v2 rolling benchmark arrays"
                 )
             panel_arrays.update(
                 {
@@ -1139,8 +1200,77 @@ def _checkpoint_manifest(
                     "index_futures_tradable_mask": _array_content_fingerprint(
                         futures_market.tradable_mask
                     ),
+                    "index_futures_rolling_buy_hold_log_returns": (
+                        _array_content_fingerprint(
+                            futures_market.rolling_buy_hold_log_returns
+                        )
+                    ),
+                    "index_futures_rolling_buy_hold_tradable_mask": (
+                        _array_content_fingerprint(
+                            futures_market.rolling_buy_hold_tradable_mask
+                        )
+                    ),
+                    "index_futures_front_month_roll_mask": (
+                        _array_content_fingerprint(
+                            futures_market.front_month_roll_mask
+                        )
+                    ),
                 }
             )
+            if execution_mode == "tw_index_derivatives_day":
+                option_chain = panel.index_options_chain_day_session
+                candidates = panel.index_derivatives_day_candidates
+                if option_chain is None or candidates is None:
+                    raise ValueError(
+                        "tw_index_derivatives_day checkpoint manifest requires "
+                        "full-chain option data and causal candidates"
+                    )
+                tenor_panel = futures_market.require_tenor_panel()
+                panel_arrays.update(
+                    {
+                        "index_futures_tenor_contract_months": _array_content_fingerprint(
+                            tenor_panel[0]
+                        ),
+                        "index_futures_tenor_open_close": _array_content_fingerprint(
+                            np.stack((tenor_panel[1], tenor_panel[4]), axis=-1)
+                        ),
+                        "index_futures_tenor_tradable_mask": _array_content_fingerprint(
+                            tenor_panel[7]
+                        ),
+                        "index_options_chain_offsets": _array_content_fingerprint(
+                            option_chain.row_offsets
+                        ),
+                        "index_options_chain_slots": _array_content_fingerprint(
+                            option_chain.slot_indices
+                        ),
+                        "index_options_chain_series": _array_content_fingerprint(
+                            option_chain.option_series
+                        ),
+                        "index_options_chain_strikes": _array_content_fingerprint(
+                            option_chain.strikes
+                        ),
+                        "index_options_chain_open_close": _array_content_fingerprint(
+                            np.column_stack(
+                                (option_chain.open_prices, option_chain.close_prices)
+                            )
+                        ),
+                        "index_derivatives_futures_contract_months": _array_content_fingerprint(
+                            candidates.futures_contract_months
+                        ),
+                        "index_derivatives_candidate_mask": _array_content_fingerprint(
+                            candidates.candidate_mask()
+                        ),
+                        "index_derivatives_candidate_features": _array_content_fingerprint(
+                            candidates.option_candidate_features
+                        ),
+                        "index_derivatives_simple_returns": _array_content_fingerprint(
+                            candidates.simple_returns()
+                        ),
+                        "index_derivatives_option_sparse_indices": _array_content_fingerprint(
+                            candidates.option_sparse_indices
+                        ),
+                    }
+                )
         if execution_mode in TW_CARRYING_EXECUTION_MODES:
             uses_full_avoidance = (
                 config.trading.tw_corporate_action_mode == "avoid"
@@ -1866,6 +1996,13 @@ def _subset_panel_symbols(
         content_fingerprints=None,
         index_futures_day_session=panel.index_futures_day_session,
         index_futures_reference_product=panel.index_futures_reference_product,
+        index_options_monthly_day_session=panel.index_options_monthly_day_session,
+        index_options_weekly_day_session=panel.index_options_weekly_day_session,
+        index_options_chain_day_session=panel.index_options_chain_day_session,
+        index_derivatives_day_candidates=panel.index_derivatives_day_candidates,
+        index_derivatives_candidate_features=panel.index_derivatives_candidate_features,
+        index_derivatives_candidate_mask=panel.index_derivatives_candidate_mask,
+        index_derivatives_simple_returns=panel.index_derivatives_simple_returns,
     )
 
 

@@ -329,6 +329,16 @@ class PanelData:
     # the stock panel has been built/cached and are never model input features.
     index_futures_day_session: Any | None = None
     index_futures_reference_product: str | None = None
+    index_options_monthly_day_session: Any | None = None
+    index_options_weekly_day_session: Any | None = None
+    index_options_chain_day_session: Any | None = None
+    # Causal relative-tenor derivative candidates.  Option candidate metadata
+    # is model context, while same-session simple returns and concrete mappings
+    # remain labels/executor facts.
+    index_derivatives_day_candidates: Any | None = None
+    index_derivatives_candidate_features: np.ndarray | None = None
+    index_derivatives_candidate_mask: np.ndarray | None = None
+    index_derivatives_simple_returns: np.ndarray | None = None
 
     @property
     def num_dates(self) -> int:

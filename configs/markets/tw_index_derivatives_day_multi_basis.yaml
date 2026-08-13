@@ -1,0 +1,97 @@
+# Full stock cross-section -> causal relative-tenor daily-flat derivative axis.
+#
+# Information contract:
+# - the decision for TAIFEX session t uses stock features completed through t-1;
+# - the 18x4 temporal-basis coefficients are ordinary CandleEncoder columns;
+# - stocks are signals only and can never become execution instruments;
+# - futures use E1..E6 expiry buckets and exact TX/MTX/TMF integer sizing;
+# - every prior-session-known monthly/Wed-weekly/Fri-weekly ITM/ATM/OTM TXO
+#   leg with data is packed into a date-local candidate axis and is long-only.
+base_config: tw_index_futures_day.yaml
+
+experiment_name: tw-stock-cross-section-index-derivatives-day-multi-basis-100m-relative-tenor-v5
+
+runner:
+  output_dir: artifacts/markets/tw_index_derivatives_day_multi_basis_100m_relative_tenor_v5
+  resume: true
+  post_train_infer: false
+  isolate_train_folds: true
+
+trading:
+  execution_mode: tw_index_derivatives_day
+  frequency: daily
+  long_only: false
+  portfolio_activation: pre_normalized
+  min_trade_weight: 0.0
+  max_turnover_ratio: 0.0
+  max_volume_participation: 0.0
+
+  # Differentiable TX proxy: 0.45 bps fixed-cost approximation per side and
+  # the configured 2 bps sale tax in the sell-side rate. Each TXO candidate's
+  # unbounded simple return independently includes fees, sale tax and slippage.
+  buy_fee_rate: 0.000045
+  sell_fee_rate: 0.000245
+  tw_index_futures_initial_capital: 100000000.0
+  tw_index_futures_max_abs_exposure: 1.0
+
+  tw_index_options_monthly_data_path: data_tw_index_options_daily/monthly_full_chain.parquet
+  tw_index_options_weekly_data_path: data_tw_index_options_daily/weekly_full_chain.parquet
+  # Leave 2% uncommitted for integer granularity and execution charges.
+  tw_index_derivatives_day_maximum_capital_fraction: 0.98
+  tw_index_derivatives_day_option_fixed_fee_per_contract_per_side_twd: 22.0
+  # Long TXO buys at the open and sells at the close; tax applies only to the
+  # closing sale premium.
+  tw_index_derivatives_day_option_transaction_tax_rate: 0.0002
+  tw_index_derivatives_day_option_slippage_points_per_side: 0.5
+
+training:
+  model_name: cross_sectional_index_derivatives_day
+  loss_type: log_utility
+  loss_portfolio_activation: pre_normalized
+  train_symbol_compaction: none
+  # The inherited day-trade value 32 was selected for a lookback-256 path.
+  # This strategy has lookback 32 and a compact last-only temporal graph; use
+  # the full global eval batch to amortize 4,102-axis candidate scoring and
+  # projection kernels on dual 32-GiB RTX 5090 cards.
+  eval_model_chunk_rows: 128
+  explain_after_each_fold: false
+  postprocess_benchmark_after_fold: false
+  postprocess_benchmark_after_best_val: false
+
+  transformer_base_portfolio:
+    temporal_basis_input: input_features
+    temporal_basis_families:
+      - haar
+      - swt_db2
+      - swt_sym4
+      - wavelet_packet
+      - walsh
+      - fourier
+      - dct
+      - dpss
+      - local_cosine
+      - morlet
+      - exponential
+      - laguerre
+      - difference
+      - ar_innovation
+      - bspline
+      - legendre
+      - chebyshev
+      - learned
+    temporal_basis_components: 4
+    norm_type: rmsnorm
+    # Match the canonical day-trade FinancialTransformer temporal contract.
+    temporal_pooling: last
+    temporal_query_mode: last_only
+    # The derivative subclass applies this mode across the mixed signed-futures
+    # and long-only-option action vector. Unused L1 radius remains cash.
+    portfolio_output_mode: projection_l1
+    return_aux: false
+    return_aux_details: false
+
+  multitask_loss:
+    return_rank_ic_weight: 0.0
+    direction_weight: 0.0
+    volatility_regime_weight: 0.0
+    concentration_weight: 0.0

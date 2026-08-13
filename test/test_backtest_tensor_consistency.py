@@ -4064,6 +4064,36 @@ def test_evaluate_windowed_tensor_batch_panel_slab_wrapper_matches_generic_panel
     assert torch.allclose(slab_bt.weights_history.cpu(), generic_bt.weights_history.cpu(), atol=1e-7, rtol=1e-6)
 
 
+def test_evaluate_windowed_tensor_batch_pads_tail_through_panel_slab_wrapper() -> None:
+    panel = _make_panel(rows=14, symbols=5, features=2)
+    dataset = CrossSectionalDataset(
+        panel,
+        torch.arange(panel.num_dates).numpy(),
+        lookback=2,
+    )
+    split = dataset_to_windowed_tensors(dataset)
+    model = _SlabOnlyTrainModel(lookback=2)
+
+    backtest, _, _ = _evaluate_windowed_tensor_batch(
+        model,
+        _PanelSlabForwardWrapper(model),
+        split,
+        torch.device("cpu"),
+        None,
+        False,
+        True,
+        0.001,
+        0.003,
+        0.55,
+        1.0,
+        chunk_rows=3,
+    )
+
+    assert backtest.strategy_returns.shape == (len(split),)
+    assert torch.isfinite(backtest.strategy_returns).all()
+    assert model.generic_panel_calls == 0
+
+
 def test_windowed_eval_timing_breaks_out_batch_prepare_and_h2d() -> None:
     panel = _make_panel(rows=14, symbols=5, features=1)
     dataset = CrossSectionalDataset(panel, torch.arange(panel.num_dates).numpy(), lookback=2)

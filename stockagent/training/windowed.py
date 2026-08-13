@@ -11,6 +11,11 @@ from stockagent.backtest.tw_execution import (
     normalize_execution_mode,
 )
 from stockagent.training.dataset import CrossSectionalDataset, execution_feature_lag
+from stockagent.data.tw_index_derivatives_day import (
+    TAIFEX_INDEX_DERIVATIVE_ACTION_COUNT_V4,
+    TAIFEX_OPTION_CANDIDATE_CAPACITY,
+    TAIFEX_OPTION_CANDIDATE_FEATURE_DIM,
+)
 
 
 @dataclass(slots=True)
@@ -26,6 +31,8 @@ class WindowedSplitTensors:
     # Prior close -> current open valuation return.  It is zero for execution
     # modes without a distinct opening phase.
     overnight_log_returns: torch.Tensor | None = None
+    derivative_candidate_features: torch.Tensor | None = None
+    derivative_candidate_mask: torch.Tensor | None = None
     volume_notional: torch.Tensor | None = None
     can_short_open_mask: torch.Tensor | None = None
     can_short_open_open_mask: torch.Tensor | None = None
@@ -75,11 +82,61 @@ class WindowedSplitTensors:
             self.overnight_log_returns = torch.zeros_like(
                 self.future_log_returns
             )
-        elif tuple(self.overnight_log_returns.shape) != expected_symbol_shape:
+        elif (
+            self.execution_mode == "tw_index_derivatives_day"
+            and (
+                self.overnight_log_returns.dim() != 2
+                or int(self.overnight_log_returns.size(0)) != expected_symbol_shape[0]
+            )
+        ):
+            raise ValueError(
+                "tw_index_derivatives_day overnight_log_returns must have "
+                "shape [T,D_options]"
+            )
+        elif (
+            self.execution_mode != "tw_index_derivatives_day"
+            and tuple(self.overnight_log_returns.shape) != expected_symbol_shape
+        ):
             raise ValueError(
                 "overnight_log_returns must have shape [T,S] matching "
                 f"future_log_returns: {tuple(self.overnight_log_returns.shape)} "
                 f"!= {expected_symbol_shape}"
+            )
+        if self.execution_mode == "tw_index_derivatives_day":
+            expected_rows = int(self.features.size(0))
+            if tuple(self.overnight_log_returns.shape) != (
+                expected_rows,
+                TAIFEX_INDEX_DERIVATIVE_ACTION_COUNT_V4,
+            ):
+                raise ValueError(
+                    "tw_index_derivatives_day derivative simple returns must "
+                    "have shape [T,4102]"
+                )
+            if self.derivative_candidate_features is None or (
+                tuple(self.derivative_candidate_features.shape)
+                != (
+                    expected_rows,
+                    TAIFEX_OPTION_CANDIDATE_CAPACITY,
+                    TAIFEX_OPTION_CANDIDATE_FEATURE_DIM,
+                )
+            ):
+                raise ValueError(
+                    "tw_index_derivatives_day candidate features must have "
+                    "shape [T,4096,9]"
+                )
+            if self.derivative_candidate_mask is None or (
+                tuple(self.derivative_candidate_mask.shape)
+                != (
+                    expected_rows,
+                    TAIFEX_INDEX_DERIVATIVE_ACTION_COUNT_V4,
+                )
+            ):
+                raise ValueError(
+                    "tw_index_derivatives_day candidate mask must have "
+                    "shape [T,4102]"
+                )
+            self.derivative_candidate_mask = self.derivative_candidate_mask.to(
+                dtype=torch.bool
             )
         if self.short_capacity_shares is None:
             self.short_capacity_shares = torch.zeros(
@@ -611,6 +668,29 @@ class WindowedSplitTensors:
             ),
         }
 
+    def _derivative_candidate_items(
+        self,
+        candidate_features: torch.Tensor | None,
+        candidate_mask: torch.Tensor | None,
+        device: torch.device,
+        non_blocking: bool,
+        timing: Any | None,
+    ) -> dict[str, torch.Tensor]:
+        if candidate_features is None and candidate_mask is None:
+            return {}
+        if candidate_features is None or candidate_mask is None:
+            raise RuntimeError(
+                "derivative candidate features and mask must be present as a pair"
+            )
+        return {
+            "derivative_candidate_features": self._to_device(
+                candidate_features, device, non_blocking, timing
+            ),
+            "derivative_candidate_mask": self._to_device(
+                candidate_mask, device, non_blocking, timing
+            ),
+        }
+
     def _corporate_action_mask_items(
         self,
         unresolved_action: torch.Tensor | None,
@@ -706,6 +786,20 @@ class WindowedSplitTensors:
             overnight_log_returns=self.overnight_log_returns.to(
                 device=device,
                 non_blocking=non_blocking,
+            ),
+            derivative_candidate_features=(
+                None
+                if self.derivative_candidate_features is None
+                else self.derivative_candidate_features.to(
+                    device=device, non_blocking=non_blocking
+                )
+            ),
+            derivative_candidate_mask=(
+                None
+                if self.derivative_candidate_mask is None
+                else self.derivative_candidate_mask.to(
+                    device=device, non_blocking=non_blocking
+                )
             ),
             tradable_mask=self.tradable_mask.to(device=device, non_blocking=non_blocking),
             can_buy_mask=self.can_buy_mask.to(device=device, non_blocking=non_blocking),
@@ -803,6 +897,16 @@ class WindowedSplitTensors:
             valid_indices=_pin(self.valid_indices),
             future_log_returns=_pin(self.future_log_returns),
             overnight_log_returns=_pin(self.overnight_log_returns),
+            derivative_candidate_features=(
+                None
+                if self.derivative_candidate_features is None
+                else _pin(self.derivative_candidate_features)
+            ),
+            derivative_candidate_mask=(
+                None
+                if self.derivative_candidate_mask is None
+                else _pin(self.derivative_candidate_mask)
+            ),
             tradable_mask=_pin(self.tradable_mask),
             can_buy_mask=_pin(self.can_buy_mask),
             can_sell_mask=_pin(self.can_sell_mask),
@@ -871,10 +975,13 @@ class WindowedSplitTensors:
             features=self.features.index_select(1, local_indices),
             valid_indices=self.valid_indices,
             future_log_returns=self.future_log_returns.index_select(1, local_indices),
-            overnight_log_returns=self.overnight_log_returns.index_select(
-                1,
-                local_indices,
+            overnight_log_returns=(
+                self.overnight_log_returns
+                if self.execution_mode == "tw_index_derivatives_day"
+                else self.overnight_log_returns.index_select(1, local_indices)
             ),
+            derivative_candidate_features=self.derivative_candidate_features,
+            derivative_candidate_mask=self.derivative_candidate_mask,
             tradable_mask=self.tradable_mask.index_select(1, local_indices),
             can_buy_mask=self.can_buy_mask.index_select(1, local_indices),
             can_sell_mask=self.can_sell_mask.index_select(1, local_indices),
@@ -980,10 +1087,13 @@ class WindowedSplitTensors:
             features=_pad_symbol_dim(self.features, 0.0),
             valid_indices=self.valid_indices,
             future_log_returns=_pad_symbol_dim(self.future_log_returns, 0.0),
-            overnight_log_returns=_pad_symbol_dim(
-                self.overnight_log_returns,
-                0.0,
+            overnight_log_returns=(
+                self.overnight_log_returns
+                if self.execution_mode == "tw_index_derivatives_day"
+                else _pad_symbol_dim(self.overnight_log_returns, 0.0)
             ),
+            derivative_candidate_features=self.derivative_candidate_features,
+            derivative_candidate_mask=self.derivative_candidate_mask,
             tradable_mask=_pad_symbol_dim(self.tradable_mask, False),
             can_buy_mask=_pad_symbol_dim(self.can_buy_mask, False),
             can_sell_mask=_pad_symbol_dim(self.can_sell_mask, False),
@@ -1062,6 +1172,8 @@ class WindowedSplitTensors:
             valid_indices=self.valid_indices,
             future_log_returns=self.future_log_returns,
             overnight_log_returns=self.overnight_log_returns,
+            derivative_candidate_features=self.derivative_candidate_features,
+            derivative_candidate_mask=self.derivative_candidate_mask,
             tradable_mask=self.tradable_mask,
             can_buy_mask=self.can_buy_mask,
             can_sell_mask=self.can_sell_mask,
@@ -1196,6 +1308,17 @@ class WindowedSplitTensors:
             "future_log_returns": self._to_device(future_log_returns, device, non_blocking, prepare_timing),
             "overnight_log_returns": self._to_device(
                 overnight_log_returns, device, non_blocking, prepare_timing
+            ),
+            **self._derivative_candidate_items(
+                None
+                if self.derivative_candidate_features is None
+                else self.derivative_candidate_features[date_idx],
+                None
+                if self.derivative_candidate_mask is None
+                else self.derivative_candidate_mask[date_idx],
+                device,
+                non_blocking,
+                prepare_timing,
             ),
             **(
                 {}
@@ -1339,6 +1462,17 @@ class WindowedSplitTensors:
             "overnight_log_returns": self._to_device(
                 overnight_log_returns, device, non_blocking, prepare_timing
             ),
+            **self._derivative_candidate_items(
+                None
+                if self.derivative_candidate_features is None
+                else self.derivative_candidate_features[date_idx],
+                None
+                if self.derivative_candidate_mask is None
+                else self.derivative_candidate_mask[date_idx],
+                device,
+                non_blocking,
+                prepare_timing,
+            ),
             **(
                 {}
                 if volume_notional is None
@@ -1476,6 +1610,17 @@ class WindowedSplitTensors:
             "future_log_returns": self._to_device(future_log_returns, device, non_blocking, prepare_timing),
             "overnight_log_returns": self._to_device(
                 overnight_log_returns, device, non_blocking, prepare_timing
+            ),
+            **self._derivative_candidate_items(
+                None
+                if self.derivative_candidate_features is None
+                else self.derivative_candidate_features[date_idx],
+                None
+                if self.derivative_candidate_mask is None
+                else self.derivative_candidate_mask[date_idx],
+                device,
+                non_blocking,
+                prepare_timing,
             ),
             **(
                 {}
@@ -1615,6 +1760,17 @@ class WindowedSplitTensors:
             "future_log_returns": self._to_device(future_log_returns, device, non_blocking, prepare_timing),
             "overnight_log_returns": self._to_device(
                 overnight_log_returns, device, non_blocking, prepare_timing
+            ),
+            **self._derivative_candidate_items(
+                None
+                if self.derivative_candidate_features is None
+                else self.derivative_candidate_features.narrow(0, date_start, rows),
+                None
+                if self.derivative_candidate_mask is None
+                else self.derivative_candidate_mask.narrow(0, date_start, rows),
+                device,
+                non_blocking,
+                prepare_timing,
             ),
             **(
                 {}
@@ -1763,6 +1919,17 @@ class WindowedSplitTensors:
             "overnight_log_returns": self._to_device(
                 overnight_log_returns, device, non_blocking, prepare_timing
             ),
+            **self._derivative_candidate_items(
+                None
+                if self.derivative_candidate_features is None
+                else self.derivative_candidate_features.narrow(0, date_start, rows),
+                None
+                if self.derivative_candidate_mask is None
+                else self.derivative_candidate_mask.narrow(0, date_start, rows),
+                device,
+                non_blocking,
+                prepare_timing,
+            ),
             **(
                 {}
                 if volume_notional is None
@@ -1908,6 +2075,17 @@ class WindowedSplitTensors:
             "future_log_returns": self._to_device(future_log_returns, device, non_blocking, prepare_timing),
             "overnight_log_returns": self._to_device(
                 overnight_log_returns, device, non_blocking, prepare_timing
+            ),
+            **self._derivative_candidate_items(
+                None
+                if self.derivative_candidate_features is None
+                else self.derivative_candidate_features.narrow(0, date_start, rows),
+                None
+                if self.derivative_candidate_mask is None
+                else self.derivative_candidate_mask.narrow(0, date_start, rows),
+                device,
+                non_blocking,
+                prepare_timing,
             ),
             **(
                 {}
@@ -2195,6 +2373,8 @@ def dataset_to_windowed_tensors(dataset: CrossSectionalDataset) -> WindowedSplit
         valid_indices=torch.as_tensor(dataset.valid_indices, dtype=torch.long),
         future_log_returns=dataset.future_log_returns_t,
         overnight_log_returns=dataset.overnight_log_returns_t,
+        derivative_candidate_features=dataset.derivative_candidate_features_t,
+        derivative_candidate_mask=dataset.derivative_candidate_mask_t,
         tradable_mask=dataset.tradable_mask_t,
         can_buy_mask=dataset.can_buy_mask_t,
         can_sell_mask=dataset.can_sell_mask_t,

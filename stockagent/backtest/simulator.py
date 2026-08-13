@@ -49,7 +49,23 @@ from stockagent.backtest.tw_index_futures import (
     run_tw_index_futures_day_continuous,
     run_tw_index_futures_day_integer,
 )
-from stockagent.data.tw_index_futures import TaiwanIndexFuturesDaySession
+from stockagent.backtest.tw_index_derivatives_day import (
+    OptionDayCostSchedule,
+    run_tw_index_derivatives_day_continuous,
+    run_tw_index_derivatives_day_integer,
+)
+from stockagent.data.tw_index_futures import (
+    TAIFEX_INDEX_FUTURES_TENOR_SLOTS,
+    TAIFEX_INDEX_FUTURES_PRODUCTS,
+    TaiwanIndexFuturesDaySession,
+)
+from stockagent.data.tw_index_derivatives_day import (
+    TAIFEX_INDEX_DERIVATIVE_ACTION_COUNT_V4,
+    TaiwanIndexDerivativeDayCandidates,
+)
+from stockagent.data.tw_index_options_daily import (
+    TaiwanIndexOptionChainDaySession,
+)
 from stockagent.models.normalization import (
     DEFAULT_PORTFOLIO_ACTIVATION,
     PORTFOLIO_L1_EPS,
@@ -2832,6 +2848,73 @@ def run_backtest_torch(
 ) -> BacktestResultTensor:
     """Simulate daily portfolio execution from model weights in torch."""
     mode = normalize_execution_mode(execution_mode)
+    if mode == "tw_index_derivatives_day":
+        if weights.dim() != 2 or int(weights.size(1)) != TAIFEX_INDEX_DERIVATIVE_ACTION_COUNT_V4:
+            raise ValueError(
+                "tw_index_derivatives_day expects direct actions [T,D_derivatives]"
+            )
+        rows = int(weights.size(0))
+        symbols_count = int(future_returns.size(1))
+        if tuple(future_returns.shape) != (rows, symbols_count):
+            raise ValueError("future_returns must have shape [T,S]")
+        if tuple(tradable_mask.shape) != (rows, symbols_count):
+            raise ValueError("tradable_mask must have shape [T,S]")
+        if overnight_returns is None or tuple(overnight_returns.shape) != (
+            rows,
+            TAIFEX_INDEX_DERIVATIVE_ACTION_COUNT_V4,
+        ):
+            raise ValueError(
+                "tw_index_derivatives_day requires derivative simple returns in "
+                "overnight_returns [T,4102]"
+            )
+        clean = torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
+        derivative_returns = overnight_returns.to(
+            device=weights.device, dtype=torch.float32
+        )
+        if state_advance_mask is not None:
+            advance = state_advance_mask.to(device=weights.device, dtype=torch.bool)
+            derivative_returns = torch.where(
+                advance.unsqueeze(-1),
+                derivative_returns,
+                torch.full_like(derivative_returns, float("nan")),
+            )
+        initial_alive_tensor = (
+            torch.ones((), device=weights.device, dtype=torch.bool)
+            if initial_alive is None
+            else initial_alive.to(device=weights.device, dtype=torch.bool)
+        )
+        actions = torch.where(initial_alive_tensor, clean, torch.zeros_like(clean))
+        continuous = run_tw_index_derivatives_day_continuous(
+            actions,
+            derivative_returns,
+            futures_round_trip_cost_rate=float(buy_fee_rate) + float(sell_fee_rate),
+            maximum_capital_fraction=min(_resolve_exposure_budget(gross_leverage), 1.0),
+        )
+        executed_attribution = torch.zeros(
+            (rows, symbols_count), device=weights.device, dtype=torch.float32
+        )
+        weights_history = (
+            executed_attribution
+            if return_weights_history
+            else executed_attribution.new_empty((0, symbols_count))
+        )
+        return BacktestResultTensor(
+            strategy_returns=_portfolio_simple_returns_to_log_torch(
+                continuous.strategy_returns
+            ),
+            benchmark_returns=benchmark_returns.to(
+                device=weights.device, dtype=torch.float32
+            ),
+            turnovers=continuous.turnovers,
+            weights_history=weights_history,
+            requested_weights_history=(weights.float() if return_weights_history else None),
+            final_weights=torch.zeros(
+                symbols_count, device=weights.device, dtype=torch.float32
+            ),
+            final_alive=initial_alive_tensor
+            & (continuous.alive[-1] if rows else initial_alive_tensor),
+            execution_mode=mode,
+        )
     if mode == "tw_index_futures_day":
         if weights.dim() != 2:
             raise ValueError(
@@ -4009,6 +4092,10 @@ def run_backtest_integer_shares(
     futures_market: TaiwanIndexFuturesDaySession | None = None,
     futures_cost_schedule: FuturesCostSchedule | None = None,
     futures_max_abs_exposure: float | None = None,
+    options_chain_market: TaiwanIndexOptionChainDaySession | None = None,
+    derivatives_day_candidates: TaiwanIndexDerivativeDayCandidates | None = None,
+    option_day_cost_schedule: OptionDayCostSchedule | None = None,
+    derivatives_maximum_capital_fraction: float = 0.98,
 ) -> tuple[BacktestResult, list[HoldingsRecord]]:
     """Integer-share audit backtest for naive or Taiwan settlement execution.
 
@@ -4046,6 +4133,124 @@ def run_backtest_integer_shares(
     to equal the active symbol count but their orders differ.
     """
     mode = normalize_execution_mode(execution_mode)
+    if mode == "tw_index_derivatives_day":
+        raw_weights = np.asarray(weights, dtype=np.float64)
+        raw_returns = np.asarray(future_returns)
+        raw_tradable = np.asarray(tradable_mask)
+        raw_benchmark = np.asarray(benchmark_returns, dtype=np.float32)
+        if raw_weights.ndim != 2 or raw_weights.shape[1] != TAIFEX_INDEX_DERIVATIVE_ACTION_COUNT_V4:
+            raise ValueError(
+                "tw_index_derivatives_day weights must have direct shape [T,D_derivatives]"
+            )
+        rows = int(raw_weights.shape[0])
+        symbols_count = int(raw_returns.shape[1])
+        if raw_returns.shape != (rows, symbols_count):
+            raise ValueError("future_returns must have shape [T,S]")
+        if raw_tradable.shape != (rows, symbols_count) or raw_tradable.dtype != np.bool_:
+            raise ValueError("tradable_mask must be boolean [T,S]")
+        if raw_benchmark.shape != (rows,):
+            raise ValueError("benchmark_returns must have shape [T]")
+        if futures_market is None or derivatives_day_candidates is None:
+            raise ValueError(
+                "tw_index_derivatives_day requires futures and causal derivative candidates"
+            )
+        requested_dates = (
+            np.asarray(futures_market.dates, dtype="datetime64[D]")
+            if dates is None
+            else np.asarray(dates, dtype="datetime64[D]")
+        )
+        if requested_dates.shape != (rows,):
+            raise ValueError("dates must contain one row per derivative decision")
+        market_dates = np.asarray(futures_market.dates, dtype="datetime64[D]")
+        row_indices = np.searchsorted(market_dates, requested_dates)
+        if bool(np.any(row_indices >= market_dates.size)) or not np.array_equal(market_dates[row_indices], requested_dates):
+            raise ValueError("derivative markets do not cover every requested date")
+        selected_market = TaiwanIndexFuturesDaySession(
+            dates=market_dates[row_indices], products=futures_market.products,
+            contract_months=futures_market.contract_months[row_indices],
+            open_prices=futures_market.open_prices[row_indices], high_prices=futures_market.high_prices[row_indices],
+            low_prices=futures_market.low_prices[row_indices], close_prices=futures_market.close_prices[row_indices],
+            volumes=futures_market.volumes[row_indices], log_returns=futures_market.log_returns[row_indices],
+            tradable_mask=futures_market.tradable_mask[row_indices], multipliers=futures_market.multipliers,
+            tenor_contract_months=(None if futures_market.tenor_contract_months is None else futures_market.tenor_contract_months[row_indices]),
+            tenor_open_prices=(None if futures_market.tenor_open_prices is None else futures_market.tenor_open_prices[row_indices]),
+            tenor_high_prices=(None if futures_market.tenor_high_prices is None else futures_market.tenor_high_prices[row_indices]),
+            tenor_low_prices=(None if futures_market.tenor_low_prices is None else futures_market.tenor_low_prices[row_indices]),
+            tenor_close_prices=(None if futures_market.tenor_close_prices is None else futures_market.tenor_close_prices[row_indices]),
+            tenor_volumes=(None if futures_market.tenor_volumes is None else futures_market.tenor_volumes[row_indices]),
+            tenor_log_returns=(None if futures_market.tenor_log_returns is None else futures_market.tenor_log_returns[row_indices]),
+            tenor_tradable_mask=(None if futures_market.tenor_tradable_mask is None else futures_market.tenor_tradable_mask[row_indices]),
+        )
+
+        selected_candidates = derivatives_day_candidates.select_dates(requested_dates)
+        actions = np.nan_to_num(raw_weights, nan=0.0, posinf=0.0, neginf=0.0)
+        integer = run_tw_index_derivatives_day_integer(
+            actions, selected_market, selected_candidates, initial_capital=initial_capital,
+            maximum_capital_fraction=derivatives_maximum_capital_fraction,
+            futures_cost_schedule=futures_cost_schedule,
+            option_cost_schedule=option_day_cost_schedule,
+        )
+        result = BacktestResult(
+            strategy_returns=_portfolio_simple_returns_to_log_numpy(integer.strategy_returns),
+            benchmark_returns=raw_benchmark,
+            turnovers=integer.turnovers.astype(np.float32),
+            weights_history=np.zeros((rows, symbols_count), dtype=np.float32),
+            requested_weights_history=raw_weights.astype(np.float32),
+            final_weights=np.zeros(symbols_count, dtype=np.float32),
+            final_alive=np.asarray(integer.alive[-1] if rows else True, dtype=bool),
+            execution_mode=mode,
+        )
+        records: list[HoldingsRecord] = []
+        if collect_holdings:
+            prior_equity = float(initial_capital)
+            market_tenors = selected_market.require_tenor_panel()
+            selected_options = selected_candidates.source_chain
+            for row in range(rows):
+                denominator = max(prior_equity, 1e-12)
+                month_to_tenor = {
+                    str(month): tenor
+                    for tenor, month in enumerate(market_tenors[0][row])
+                    if str(month)
+                }
+                for tenor_slot in range(TAIFEX_INDEX_FUTURES_TENOR_SLOTS):
+                    month = str(integer.futures_contract_months[row, tenor_slot])
+                    market_tenor = month_to_tenor.get(month)
+                    if market_tenor is None:
+                        continue
+                    for product_index, product in enumerate(TAIFEX_INDEX_FUTURES_PRODUCTS):
+                        quantity = int(
+                            integer.futures_contract_quantities[
+                                row, tenor_slot, product_index
+                            ]
+                        )
+                        for record_type, signed, price in (
+                            ("entry", quantity, market_tenors[1][row, market_tenor, product_index]),
+                            ("exit", -quantity, market_tenors[4][row, market_tenor, product_index]),
+                        ):
+                            if signed:
+                                value = signed * selected_market.multipliers[product_index] * float(price)
+                                records.append(HoldingsRecord(date=str(requested_dates[row]), symbol=f"{product}_{month}", shares=signed, price=float(price), market_value=float(value), holding_ratio=float(value / denominator), is_cash=False, record_type=record_type, side="buy" if signed > 0 else "sell"))
+                for slot_value in np.flatnonzero(
+                    integer.option_contract_quantities[row]
+                ):
+                    slot = int(slot_value)
+                    sparse_index = int(integer.option_sparse_indices[row, slot])
+                    quantity = int(integer.option_contract_quantities[row, slot])
+                    if sparse_index < 0 or quantity == 0:
+                        continue
+                    series = str(selected_options.option_series[sparse_index])
+                    strike = float(selected_options.strikes[sparse_index])
+                    right = str(selected_options.option_rights[sparse_index])
+                    contract_symbol = f"TXO_{series}_{strike:g}_{right}"
+                    for record_type, signed, price in (
+                        ("entry", quantity, selected_options.open_prices[sparse_index]),
+                        ("exit", -quantity, selected_options.close_prices[sparse_index]),
+                    ):
+                        if signed:
+                            value = signed * 50.0 * float(price)
+                            records.append(HoldingsRecord(date=str(requested_dates[row]), symbol=contract_symbol, shares=signed, price=float(price), market_value=float(value), holding_ratio=float(value / denominator), is_cash=False, record_type=record_type, side="buy" if signed > 0 else "sell"))
+                prior_equity = float(integer.equity[row])
+        return result, records
     if mode == "tw_index_futures_day":
         raw_weights = np.asarray(weights, dtype=np.float64)
         raw_returns = np.asarray(future_returns)
@@ -4089,6 +4294,21 @@ def run_backtest_integer_shares(
             log_returns=futures_market.log_returns[row_indices],
             tradable_mask=futures_market.tradable_mask[row_indices],
             multipliers=futures_market.multipliers,
+            rolling_buy_hold_log_returns=(
+                None
+                if futures_market.rolling_buy_hold_log_returns is None
+                else futures_market.rolling_buy_hold_log_returns[row_indices]
+            ),
+            rolling_buy_hold_tradable_mask=(
+                None
+                if futures_market.rolling_buy_hold_tradable_mask is None
+                else futures_market.rolling_buy_hold_tradable_mask[row_indices]
+            ),
+            front_month_roll_mask=(
+                None
+                if futures_market.front_month_roll_mask is None
+                else futures_market.front_month_roll_mask[row_indices]
+            ),
         )
         clean_weights = np.nan_to_num(
             raw_weights, nan=0.0, posinf=0.0, neginf=0.0

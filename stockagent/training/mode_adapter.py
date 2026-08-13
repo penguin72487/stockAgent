@@ -126,6 +126,28 @@ _MODE_SPECS: Final[tuple[TrainingModeSpec, ...]] = (
         recurrent_state_scope="single_session_index_exposure",
         terminal_policy="flat_at_session_terminal",
         split_ownership="year_expanding_walk_forward",
+        benchmark_contract=(
+            "tx_front_month_1x_long_gross_roll_at_preceding_close_"
+            "same_contract_close_to_close_v2"
+        ),
+    ),
+    TrainingModeSpec(
+        execution_mode="tw_index_derivatives_day",
+        product_family="taiwan_index_futures_tx_mtx_tmf_and_txo_long_options",
+        frequency="daily_session",
+        decision_clock="completed_prior_stock_session_features",
+        execution_clock="taifex_day_session_first_last_trade_proxy",
+        recurrent_state_scope="single_session_joint_derivative_budget",
+        terminal_policy="all_futures_and_options_flat_at_session_terminal",
+        split_ownership="year_expanding_walk_forward",
+        benchmark_contract=(
+            "tx_front_month_1x_long_gross_roll_at_preceding_close_"
+            "same_contract_close_to_close_v2"
+        ),
+        weight_snapshot_contract=(
+            "relative_e1_e6_plus_4096_causal_txo_candidates_v4"
+        ),
+        turnover_contract="gross_open_and_close_derivative_notional_over_nav",
     ),
     TrainingModeSpec(
         execution_mode="tw_minute",
