@@ -478,6 +478,11 @@ def build_model(
                     "tw_index_derivatives_day_option_maximum_capital_fraction",
                     0.98,
                 ),
+                "allow_option_short": getattr(
+                    config.trading,
+                    "tw_index_derivatives_day_allow_option_short",
+                    False,
+                ),
             }
             if model_name in _CROSS_SECTIONAL_INDEX_DERIVATIVES_DAY_NAMES
             else {}

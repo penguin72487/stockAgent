@@ -19,6 +19,7 @@ from tqdm.auto import tqdm
 from stockagent.models.normalization import (
     dual_branch_softmax,
     masked_cross_sectional_mean,
+    masked_cash_entmax15_weights,
     masked_l1_projection_weights,
     masked_signed_action_weights,
     masked_softmax,
@@ -444,6 +445,12 @@ def _portfolio_weights_from_scores(model: nn.Module, scores: torch.Tensor, mask:
             return masked_signed_action_weights(target_logits, mask, transform="sparsemax", long_only=True).masked_fill(~mask, 0.0)
         if output_mode == "signed_entmax15":
             return masked_signed_action_weights(target_logits, mask, transform="entmax15", long_only=True).masked_fill(~mask, 0.0)
+        if output_mode == "cash_entmax15":
+            return masked_cash_entmax15_weights(
+                target_logits,
+                mask,
+                short_mask=torch.zeros_like(mask),
+            ).masked_fill(~mask, 0.0)
         if output_mode == "projection_l1":
             return masked_l1_projection_weights(target_logits, mask, long_only=True).masked_fill(~mask, 0.0)
         weight_activation = "identity" if output_mode == "l1" else activation
@@ -458,6 +465,12 @@ def _portfolio_weights_from_scores(model: nn.Module, scores: torch.Tensor, mask:
         return masked_signed_action_weights(target_logits, mask, transform="sparsemax", long_only=False).masked_fill(~mask, 0.0)
     if output_mode == "signed_entmax15":
         return masked_signed_action_weights(target_logits, mask, transform="entmax15", long_only=False).masked_fill(~mask, 0.0)
+    if output_mode == "cash_entmax15":
+        return masked_cash_entmax15_weights(
+            target_logits,
+            mask,
+            short_mask=mask,
+        ).masked_fill(~mask, 0.0)
     if output_mode == "projection_l1":
         return masked_l1_projection_weights(target_logits, mask, long_only=False).masked_fill(~mask, 0.0)
     weight_activation = "identity" if output_mode == "l1" else activation

@@ -85,7 +85,7 @@ class WindowedSplitTensors:
         elif (
             self.execution_mode == "tw_index_derivatives_day"
             and (
-                self.overnight_log_returns.dim() != 2
+                self.overnight_log_returns.dim() not in {2, 3}
                 or int(self.overnight_log_returns.size(0)) != expected_symbol_shape[0]
             )
         ):
@@ -104,13 +104,14 @@ class WindowedSplitTensors:
             )
         if self.execution_mode == "tw_index_derivatives_day":
             expected_rows = int(self.features.size(0))
-            if tuple(self.overnight_log_returns.shape) != (
-                expected_rows,
-                TAIFEX_INDEX_DERIVATIVE_ACTION_COUNT_V4,
-            ):
+            derivative_return_shape = tuple(self.overnight_log_returns.shape)
+            if derivative_return_shape not in {
+                (expected_rows, TAIFEX_INDEX_DERIVATIVE_ACTION_COUNT_V4),
+                (expected_rows, TAIFEX_INDEX_DERIVATIVE_ACTION_COUNT_V4, 2),
+            }:
                 raise ValueError(
                     "tw_index_derivatives_day derivative simple returns must "
-                    "have shape [T,4102]"
+                    "have shape [T,4102] or directional [T,4102,2]"
                 )
             if self.derivative_candidate_features is None or (
                 tuple(self.derivative_candidate_features.shape)

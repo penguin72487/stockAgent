@@ -102,6 +102,28 @@ def test_shioaji_stock_snapshots_fail_closed_without_usable_rows(monkeypatch):
         raise AssertionError("missing Shioaji quotes must fail closed")
 
 
+def test_shioaji_limits_never_derive_from_panel_close_without_official_reference(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("STOCKAGENT_TW_PRICE_LIMIT_ROOT", str(tmp_path))
+    monkeypatch.setattr(quote_provider, "_TW_LIMIT_CACHE_KEY", None)
+    monkeypatch.setattr(quote_provider, "_TW_LIMIT_CACHE", {})
+    contract = SimpleNamespace(code="2330")
+    api = _FakeApi({"2330": contract})
+    monkeypatch.setattr(quote_provider, "_SHIOAJI_STOCK_API", api)
+    monkeypatch.setattr(quote_provider, "_SHIOAJI_STOCK_CONTRACTS", {})
+    monkeypatch.setattr(quote_provider, "_SHIOAJI_STOCK_CACHE", {})
+
+    snapshot = quote_provider.fetch_shioaji_stock_snapshots(
+        ["2330"],
+        np.asarray([100.0], dtype=np.float64),
+    )
+
+    assert np.isnan(snapshot.reference_prices[0])
+    assert np.isnan(snapshot.upper_limit_prices[0])
+    assert np.isnan(snapshot.lower_limit_prices[0])
+
+
 def test_shioaji_futures_snapshot_resolves_target_and_fetches_old_roll_contract(
     monkeypatch,
 ):

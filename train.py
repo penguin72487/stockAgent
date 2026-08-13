@@ -1335,6 +1335,7 @@ def main() -> None:
             from stockagent.data.tw_index_derivatives_day import (
                 TAIFEX_INDEX_DERIVATIVE_ACTION_COUNT_V4,
                 build_causal_derivative_day_candidates,
+                load_taiex_opening_index,
             )
 
             panel.index_options_monthly_day_session = (
@@ -1366,12 +1367,38 @@ def main() -> None:
                     config.trading.tw_index_derivatives_day_option_slippage_points_per_side
                 ),
             }
+            allow_option_short = bool(
+                config.trading.tw_index_derivatives_day_allow_option_short
+            )
+            taiex_opening_index = (
+                load_taiex_opening_index(
+                    config.trading.tw_index_derivatives_day_underlying_index_path,
+                    panel_dates=panel.dates,
+                )
+                if allow_option_short
+                else None
+            )
             panel.index_derivatives_day_candidates = (
                 build_causal_derivative_day_candidates(
                     panel.index_futures_day_session,
                     panel.index_options_chain_day_session,
                     reference_product=(
                         config.trading.tw_index_futures_reference_product
+                    ),
+                    allow_option_short=allow_option_short,
+                    option_risk_margin_a_twd=float(
+                        config.trading.tw_index_derivatives_day_option_risk_margin_a_twd
+                    ),
+                    option_risk_margin_b_twd=float(
+                        config.trading.tw_index_derivatives_day_option_risk_margin_b_twd
+                    ),
+                    option_margin_schedule_as_of=str(
+                        config.trading.tw_index_derivatives_day_option_margin_schedule_as_of
+                    ),
+                    underlying_index_open_prices=taiex_opening_index,
+                    option_margin_underlying_source=(
+                        "official_twse_taiex_opening_index:"
+                        f"{config.trading.tw_index_derivatives_day_underlying_index_path}"
                     ),
                     **option_costs,
                 )

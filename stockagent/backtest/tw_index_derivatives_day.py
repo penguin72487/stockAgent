@@ -1,4 +1,4 @@
-"""Daily-flat E1..E6 futures plus causal long-TXO candidate execution."""
+"""Daily-flat E1..E6 futures plus causal signed-TXO candidate execution."""
 
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ from stockagent.data.tw_index_futures import (
 )
 
 
-TW_INDEX_DERIVATIVES_DAY_BACKTEST_CONTRACT_VERSION: Final[int] = 4
+TW_INDEX_DERIVATIVES_DAY_BACKTEST_CONTRACT_VERSION: Final[int] = 5
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,7 +81,10 @@ class DerivativesDayIntegerBacktest:
 
 
 def _normalize_actions_torch(
-    actions: torch.Tensor, maximum_capital_fraction: float
+    actions: torch.Tensor,
+    maximum_capital_fraction: float,
+    *,
+    allow_option_short: bool,
 ) -> torch.Tensor:
     if (
         actions.ndim != 2
@@ -96,9 +99,11 @@ def _normalize_actions_torch(
         raise ValueError("maximum_capital_fraction must be in (0, 1]")
     clean = torch.nan_to_num(actions, nan=0.0, posinf=maximum, neginf=-maximum)
     futures = clean[:, :TAIFEX_INDEX_FUTURES_TENOR_SLOTS]
-    options = clean[:, TAIFEX_INDEX_FUTURES_TENOR_SLOTS:].clamp_min(0.0)
+    options = clean[:, TAIFEX_INDEX_FUTURES_TENOR_SLOTS:]
+    if not bool(allow_option_short):
+        options = options.clamp_min(0.0)
     clean = torch.cat((futures, options), dim=-1)
-    gross = futures.abs().sum(dim=-1, keepdim=True) + options.sum(
+    gross = futures.abs().sum(dim=-1, keepdim=True) + options.abs().sum(
         dim=-1, keepdim=True
     )
     scale = torch.clamp(
@@ -121,10 +126,19 @@ def run_tw_index_derivatives_day_continuous(
     floored at -100% when the account is ruined.
     """
 
-    requested = _normalize_actions_torch(actions, maximum_capital_fraction)
-    if tuple(derivative_simple_returns.shape) != tuple(requested.shape):
+    directional = derivative_simple_returns.dim() == 3
+    requested = _normalize_actions_torch(
+        actions,
+        maximum_capital_fraction,
+        allow_option_short=directional,
+    )
+    if tuple(derivative_simple_returns.shape) not in {
+        tuple(requested.shape),
+        (*tuple(requested.shape), 2),
+    }:
         raise ValueError(
-            "derivative_simple_returns must match actions [T,4102]"
+            "derivative_simple_returns must have shape [T,4102] or "
+            "directional [T,4102,2]"
         )
     cost = float(futures_round_trip_cost_rate)
     if not math.isfinite(cost) or cost < 0.0:
@@ -133,18 +147,37 @@ def run_tw_index_derivatives_day_continuous(
     raw_returns = derivative_simple_returns.to(
         device=actions.device, dtype=torch.float32
     )
-    valid = torch.isfinite(raw_returns)
-    executed = torch.where(valid, requested, torch.zeros_like(requested))
-    safe_returns = torch.where(valid, raw_returns, torch.zeros_like(raw_returns))
+    if directional:
+        long_returns = raw_returns[..., 0]
+        short_returns = raw_returns[..., 1]
+        valid = torch.where(
+            requested >= 0.0,
+            torch.isfinite(long_returns),
+            torch.isfinite(short_returns),
+        )
+        executed = torch.where(valid, requested, torch.zeros_like(requested))
+        safe_long = torch.where(
+            torch.isfinite(long_returns), long_returns, torch.zeros_like(long_returns)
+        )
+        safe_short = torch.where(
+            torch.isfinite(short_returns),
+            short_returns,
+            torch.zeros_like(short_returns),
+        )
+        capital_returns = (
+            executed.clamp_min(0.0) * safe_long
+            + (-executed).clamp_min(0.0) * safe_short
+        )
+    else:
+        valid = torch.isfinite(raw_returns)
+        executed = torch.where(valid, requested, torch.zeros_like(requested))
+        safe_returns = torch.where(valid, raw_returns, torch.zeros_like(raw_returns))
+        capital_returns = executed * safe_returns
     futures = executed[:, :TAIFEX_INDEX_FUTURES_TENOR_SLOTS].float()
-    options = executed[:, TAIFEX_INDEX_FUTURES_TENOR_SLOTS:].float()
     simple_raw = (
-        (futures * safe_returns[:, :TAIFEX_INDEX_FUTURES_TENOR_SLOTS]).sum(dim=-1)
+        capital_returns[:, :TAIFEX_INDEX_FUTURES_TENOR_SLOTS].sum(dim=-1)
         - futures.abs().sum(dim=-1) * cost
-        + (
-            options
-            * safe_returns[:, TAIFEX_INDEX_FUTURES_TENOR_SLOTS:]
-        ).sum(dim=-1)
+        + capital_returns[:, TAIFEX_INDEX_FUTURES_TENOR_SLOTS:].sum(dim=-1)
     )
     rows = int(requested.size(0))
     if rows:
@@ -166,9 +199,7 @@ def run_tw_index_derivatives_day_continuous(
     else:
         strategy = simple_raw
         alive = torch.empty(0, dtype=torch.bool, device=actions.device)
-    gross_exposure = executed[:, :TAIFEX_INDEX_FUTURES_TENOR_SLOTS].abs().sum(
-        dim=-1
-    ) + executed[:, TAIFEX_INDEX_FUTURES_TENOR_SLOTS:].sum(dim=-1)
+    gross_exposure = executed.abs().sum(dim=-1)
     return DerivativesDayContinuousBacktest(
         strategy_returns=strategy,
         requested_actions=requested,
@@ -209,11 +240,11 @@ def run_tw_index_derivatives_day_integer(
         raise ValueError(
             f"actions must have shape [{rows},{TAIFEX_INDEX_DERIVATIVE_ACTION_COUNT_V4}]"
         )
-    requested[:, TAIFEX_INDEX_FUTURES_TENOR_SLOTS:] = np.maximum(
-        requested[:, TAIFEX_INDEX_FUTURES_TENOR_SLOTS:], 0.0
-    )
-    gross = np.abs(requested[:, :TAIFEX_INDEX_FUTURES_TENOR_SLOTS]).sum(axis=-1)
-    gross += requested[:, TAIFEX_INDEX_FUTURES_TENOR_SLOTS:].sum(axis=-1)
+    if not bool(candidates.allow_option_short):
+        requested[:, TAIFEX_INDEX_FUTURES_TENOR_SLOTS:] = np.maximum(
+            requested[:, TAIFEX_INDEX_FUTURES_TENOR_SLOTS:], 0.0
+        )
+    gross = np.abs(requested).sum(axis=-1)
     scale = np.minimum(1.0, maximum / np.maximum(gross, np.finfo(np.float64).eps))
     requested *= scale[:, None]
     candidate_mask = candidates.candidate_mask()
@@ -262,6 +293,12 @@ def run_tw_index_derivatives_day_integer(
     option_close = np.asarray(chain.close_prices, dtype=np.float64)
     option_executable = np.asarray(chain.executable, dtype=bool)
     option_simple = np.asarray(candidates.option_simple_returns, dtype=np.float64)
+    option_short_simple = np.asarray(
+        candidates.option_short_simple_returns, dtype=np.float64
+    )
+    option_short_margin = np.asarray(
+        candidates.option_short_initial_margins, dtype=np.float64
+    )
 
     for row in range(rows):
         if not still_alive:
@@ -316,8 +353,7 @@ def run_tw_index_derivatives_day_integer(
             )
 
         active_option_slots = np.flatnonzero(
-            (requested[row, TAIFEX_INDEX_FUTURES_TENOR_SLOTS:] > 0.0)
-            & np.isfinite(option_simple[row])
+            (requested[row, TAIFEX_INDEX_FUTURES_TENOR_SLOTS:] != 0.0)
             & (option_sparse_out[row] >= 0)
         )
         for slot_value in active_option_slots:
@@ -326,10 +362,15 @@ def run_tw_index_derivatives_day_integer(
                 requested[row, TAIFEX_INDEX_FUTURES_TENOR_SLOTS + slot]
             )
             sparse_index = int(option_sparse_out[row, slot])
+            short_side = target_weight < 0.0
+            directional_return = (
+                float(option_short_simple[row, slot])
+                if short_side
+                else float(option_simple[row, slot])
+            )
             if (
-                target_weight <= 0.0
-                or sparse_index < 0
-                or not math.isfinite(float(option_simple[row, slot]))
+                sparse_index < 0
+                or not math.isfinite(directional_return)
                 or not bool(option_executable[sparse_index])
             ):
                 continue
@@ -343,28 +384,39 @@ def run_tw_index_derivatives_day_integer(
             ):
                 raise ValueError("executable option candidate has invalid prices")
             premium = open_price * option_multiplier
-            count = int(math.floor(target_weight * current_equity / premium))
-            if count <= 0:
+            capital_per_contract = (
+                float(option_short_margin[row, slot])
+                if short_side
+                else premium
+            )
+            if not math.isfinite(capital_per_contract) or capital_per_contract <= 0.0:
+                raise ValueError("active option leg has invalid capital requirement")
+            absolute_count = int(
+                math.floor(abs(target_weight) * current_equity / capital_per_contract)
+            )
+            if absolute_count <= 0:
                 continue
+            count = -absolute_count if short_side else absolute_count
             option_counts[row, slot] = count
             executed[row, TAIFEX_INDEX_FUTURES_TENOR_SLOTS + slot] = (
-                count * premium / current_equity
+                count * capital_per_contract / current_equity
             )
             count_f = float(count)
+            absolute_count_f = abs(count_f)
             gross_pnl[row] += count_f * option_multiplier * (close_price - open_price)
             fees[row] += (
-                count_f
+                absolute_count_f
                 * option_schedule.fixed_fee_per_contract_per_side_twd
                 * 2.0
             )
             taxes[row] += (
-                count_f
+                absolute_count_f
                 * option_multiplier
-                * close_price
+                * (open_price if short_side else close_price)
                 * option_schedule.transaction_tax_rate
             )
             slippage[row] += (
-                count_f
+                absolute_count_f
                 * option_multiplier
                 * option_schedule.slippage_points_per_side
                 * 2.0
@@ -372,10 +424,7 @@ def run_tw_index_derivatives_day_integer(
 
         net_pnl[row] = gross_pnl[row] - fees[row] - taxes[row] - slippage[row]
         returns[row] = max(net_pnl[row] / current_equity, -1.0)
-        turnovers[row] = 2.0 * (
-            np.abs(executed[row, :TAIFEX_INDEX_FUTURES_TENOR_SLOTS]).sum()
-            + executed[row, TAIFEX_INDEX_FUTURES_TENOR_SLOTS:].sum()
-        )
+        turnovers[row] = 2.0 * np.abs(executed[row]).sum()
         current_equity += net_pnl[row]
         if not math.isfinite(current_equity) or current_equity <= 0.0:
             current_equity = 0.0

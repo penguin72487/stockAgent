@@ -33,6 +33,7 @@ from stockagent.config import ExperimentConfig
 from stockagent.data.panel import PanelData
 from stockagent.data.tw_index_derivatives_day import (
     TAIFEX_DERIVATIVE_CANDIDATE_CONTRACT_VERSION,
+    TAIFEX_DERIVATIVE_SHORT_CANDIDATE_CONTRACT_VERSION,
     TAIFEX_INDEX_DERIVATIVE_ACTION_COUNT_V4,
 )
 from stockagent.data.panel_cache import array_content_fingerprint
@@ -754,12 +755,17 @@ def _trading_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
             "basket_fee_penalty": float(trading.tw_index_futures_basket_fee_penalty),
         }
     if execution_mode == "tw_index_derivatives_day":
+        allow_option_short = bool(
+            trading.tw_index_derivatives_day_allow_option_short
+        )
         contract["taiwan_index_derivatives_day"] = {
             "backtest_contract_version": int(
                 TW_INDEX_DERIVATIVES_DAY_BACKTEST_CONTRACT_VERSION
             ),
             "candidate_contract_version": int(
-                TAIFEX_DERIVATIVE_CANDIDATE_CONTRACT_VERSION
+                TAIFEX_DERIVATIVE_SHORT_CANDIDATE_CONTRACT_VERSION
+                if allow_option_short
+                else TAIFEX_DERIVATIVE_CANDIDATE_CONTRACT_VERSION
             ),
             "action_count": int(TAIFEX_INDEX_DERIVATIVE_ACTION_COUNT_V4),
             "monthly_options_data_path": str(
@@ -781,7 +787,31 @@ def _trading_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
                 trading.tw_index_derivatives_day_option_slippage_points_per_side
             ),
             "option_price_source": "taifex_daily_first_last_trade_proxy",
-            "option_shorting": False,
+            "option_shorting": allow_option_short,
+            "option_short_margin_formula": (
+                "premium_value_plus_max_a_minus_otm_b"
+                if allow_option_short
+                else None
+            ),
+            "option_risk_margin_a_twd": float(
+                trading.tw_index_derivatives_day_option_risk_margin_a_twd
+            ),
+            "option_risk_margin_b_twd": float(
+                trading.tw_index_derivatives_day_option_risk_margin_b_twd
+            ),
+            "option_risk_margin_c_twd": float(
+                trading.tw_index_derivatives_day_option_risk_margin_c_twd
+            ),
+            "option_margin_schedule_as_of": str(
+                trading.tw_index_derivatives_day_option_margin_schedule_as_of
+            ),
+            "option_margin_offsets": str(
+                trading.tw_index_derivatives_day_option_margin_offsets
+            ),
+            "option_margin_underlying_price_source": "official_twse_taiex_opening_index",
+            "option_margin_underlying_index_path": str(
+                trading.tw_index_derivatives_day_underlying_index_path
+            ),
         }
     if execution_mode in TW_STOCK_EXECUTION_MODES:
         contract["taiwan_execution"] = {

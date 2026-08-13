@@ -12,6 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date
 import math
+from pathlib import Path
 import re
 from typing import Final, Iterable
 
@@ -31,6 +32,7 @@ TAIFEX_INDEX_DERIVATIVE_ACTION_COUNT_V4: Final[int] = (
     TAIFEX_INDEX_FUTURES_TENOR_SLOTS + TAIFEX_OPTION_CANDIDATE_CAPACITY
 )
 TAIFEX_DERIVATIVE_CANDIDATE_CONTRACT_VERSION: Final[int] = 1
+TAIFEX_DERIVATIVE_SHORT_CANDIDATE_CONTRACT_VERSION: Final[int] = 2
 TAIFEX_OPTION_EXPIRY_SLOTS_BY_FAMILY: Final[tuple[int, int, int]] = (5, 3, 3)
 
 _MONTHLY_RE: Final[re.Pattern[str]] = re.compile(r"^[0-9]{6}$")
@@ -53,6 +55,68 @@ def _as_python_date(value: np.datetime64) -> date:
     return date.fromisoformat(str(np.datetime64(value, "D")))
 
 
+def load_taiex_opening_index(
+    path: str | Path,
+    *,
+    panel_dates: np.ndarray,
+) -> np.ndarray:
+    """Load the official cash-index open required by the TXO margin formula.
+
+    Futures prices are not a valid substitute: futures basis can change the
+    out-of-the-money deduction and thereby understate required collateral.
+    Short-option training therefore fails closed unless every panel session
+    has one finite positive official TAIEX opening index.
+    """
+
+    source_path = Path(path)
+    if not source_path.is_file():
+        raise FileNotFoundError(
+            f"official TAIEX opening-index parquet not found: {source_path}"
+        )
+    try:
+        import pyarrow.parquet as pq
+
+        table = pq.read_table(source_path, columns=["date", "opening_index"])
+    except Exception as exc:
+        raise ValueError(
+            f"unable to read official TAIEX opening-index parquet {source_path}: {exc}"
+        ) from exc
+    source_dates = np.asarray(table.column("date").to_pylist(), dtype="datetime64[D]")
+    source_open = np.asarray(
+        table.column("opening_index").to_numpy(zero_copy_only=False),
+        dtype=np.float64,
+    )
+    if (
+        source_dates.ndim != 1
+        or source_dates.size == 0
+        or source_open.shape != source_dates.shape
+    ):
+        raise ValueError("official TAIEX opening-index parquet is empty or malformed")
+    order = np.argsort(source_dates, kind="stable")
+    source_dates = source_dates[order]
+    source_open = source_open[order]
+    if bool(np.any(source_dates[1:] <= source_dates[:-1])):
+        raise ValueError("official TAIEX opening-index dates must be unique")
+
+    requested = np.asarray(panel_dates, dtype="datetime64[D]")
+    if requested.ndim != 1 or requested.size == 0:
+        raise ValueError("panel_dates must be a non-empty one-dimensional array")
+    locations = np.searchsorted(source_dates, requested)
+    in_bounds = locations < source_dates.size
+    matched = np.zeros(requested.shape, dtype=bool)
+    matched[in_bounds] = source_dates[locations[in_bounds]] == requested[in_bounds]
+    aligned = np.full(requested.shape, np.nan, dtype=np.float64)
+    aligned[matched] = source_open[locations[matched]]
+    valid = np.isfinite(aligned) & (aligned > 0.0)
+    if not bool(valid.all()):
+        missing = [str(value) for value in requested[~valid][:5]]
+        raise ValueError(
+            "official TAIEX opening index does not cover every panel session; "
+            f"examples={missing}"
+        )
+    return aligned
+
+
 @dataclass(frozen=True, slots=True)
 class TaiwanIndexDerivativeDayCandidates:
     """Fixed-envelope tensors with date-local concrete contract mappings."""
@@ -64,8 +128,13 @@ class TaiwanIndexDerivativeDayCandidates:
     option_candidate_mask: np.ndarray
     option_candidate_features: np.ndarray
     option_simple_returns: np.ndarray
+    option_short_simple_returns: np.ndarray
+    option_short_initial_margins: np.ndarray
     option_sparse_indices: np.ndarray
     source_chain: TaiwanIndexOptionChainDaySession
+    allow_option_short: bool = False
+    option_margin_schedule_as_of: str = ""
+    option_margin_underlying_source: str = ""
 
     def __post_init__(self) -> None:
         dates = np.asarray(self.dates, dtype="datetime64[D]")
@@ -84,6 +153,14 @@ class TaiwanIndexDerivativeDayCandidates:
             raise ValueError("option_candidate_mask must have shape [T,4096]")
         if np.asarray(self.option_simple_returns).shape != expected_options:
             raise ValueError("option_simple_returns must have shape [T,4096]")
+        if np.asarray(self.option_short_simple_returns).shape != expected_options:
+            raise ValueError(
+                "option_short_simple_returns must have shape [T,4096]"
+            )
+        if np.asarray(self.option_short_initial_margins).shape != expected_options:
+            raise ValueError(
+                "option_short_initial_margins must have shape [T,4096]"
+            )
         if np.asarray(self.option_sparse_indices).shape != expected_options:
             raise ValueError("option_sparse_indices must have shape [T,4096]")
         if np.asarray(self.option_candidate_features).shape != (
@@ -104,6 +181,37 @@ class TaiwanIndexDerivativeDayCandidates:
         option_returns = np.asarray(self.option_simple_returns)
         if bool((np.isfinite(option_returns) & ((sparse < 0) | ~option_mask)).any()):
             raise ValueError("finite option returns require a visible mapped contract")
+        short_returns = np.asarray(self.option_short_simple_returns)
+        short_margins = np.asarray(self.option_short_initial_margins)
+        if bool(
+            (
+                np.isfinite(short_returns)
+                & ((sparse < 0) | ~option_mask | ~np.isfinite(short_margins))
+            ).any()
+        ):
+            raise ValueError(
+                "finite short-option returns require a visible contract and margin"
+            )
+        if bool((np.isfinite(short_margins) & (short_margins <= 0.0)).any()):
+            raise ValueError("finite short-option margins must be positive")
+        if not bool(self.allow_option_short) and bool(
+            np.isfinite(short_returns).any() or np.isfinite(short_margins).any()
+        ):
+            raise ValueError(
+                "long-only derivative candidates cannot contain short-option labels"
+            )
+        if bool(self.allow_option_short) and not str(
+            self.option_margin_schedule_as_of
+        ).strip():
+            raise ValueError(
+                "short-option candidates require an explicit margin schedule date"
+            )
+        if bool(self.allow_option_short) and not str(
+            self.option_margin_underlying_source
+        ).strip():
+            raise ValueError(
+                "short-option candidates require an official underlying-index source"
+            )
         object.__setattr__(self, "dates", dates)
 
     @property
@@ -120,13 +228,23 @@ class TaiwanIndexDerivativeDayCandidates:
         )
 
     def simple_returns(self) -> np.ndarray:
-        return np.concatenate(
+        long_returns = np.concatenate(
             (
                 np.asarray(self.futures_simple_returns, dtype=np.float32),
                 np.asarray(self.option_simple_returns, dtype=np.float32),
             ),
             axis=1,
         )
+        if not bool(self.allow_option_short):
+            return long_returns
+        short_returns = np.concatenate(
+            (
+                -np.asarray(self.futures_simple_returns, dtype=np.float32),
+                np.asarray(self.option_short_simple_returns, dtype=np.float32),
+            ),
+            axis=1,
+        )
+        return np.stack((long_returns, short_returns), axis=-1)
 
     def select_dates(
         self, requested_dates: Iterable[object]
@@ -163,8 +281,19 @@ class TaiwanIndexDerivativeDayCandidates:
             option_candidate_mask=np.asarray(self.option_candidate_mask)[indices].copy(),
             option_candidate_features=np.asarray(self.option_candidate_features)[indices].copy(),
             option_simple_returns=np.asarray(self.option_simple_returns)[indices].copy(),
+            option_short_simple_returns=np.asarray(
+                self.option_short_simple_returns
+            )[indices].copy(),
+            option_short_initial_margins=np.asarray(
+                self.option_short_initial_margins
+            )[indices].copy(),
             option_sparse_indices=remapped,
             source_chain=selected_chain,
+            allow_option_short=bool(self.allow_option_short),
+            option_margin_schedule_as_of=str(self.option_margin_schedule_as_of),
+            option_margin_underlying_source=str(
+                self.option_margin_underlying_source
+            ),
         )
 
 
@@ -176,6 +305,12 @@ def build_causal_derivative_day_candidates(
     transaction_tax_rate: float,
     slippage_points_per_side: float,
     reference_product: str = "TX",
+    allow_option_short: bool = False,
+    option_risk_margin_a_twd: float = 187_000.0,
+    option_risk_margin_b_twd: float = 94_000.0,
+    option_margin_schedule_as_of: str = "2026-08-12",
+    underlying_index_open_prices: np.ndarray | None = None,
+    option_margin_underlying_source: str = "",
 ) -> TaiwanIndexDerivativeDayCandidates:
     """Build E1..E6 plus prior-session TXO candidates without future masks."""
 
@@ -186,6 +321,30 @@ def build_causal_derivative_day_candidates(
     slip = float(slippage_points_per_side)
     if any(not math.isfinite(value) or value < 0.0 for value in (fee, tax, slip)):
         raise ValueError("candidate cost inputs must be finite and non-negative")
+    margin_a = float(option_risk_margin_a_twd)
+    margin_b = float(option_risk_margin_b_twd)
+    margin_as_of = str(option_margin_schedule_as_of).strip()
+    underlying_source = str(option_margin_underlying_source).strip()
+    underlying_open = (
+        np.asarray(underlying_index_open_prices, dtype=np.float64)
+        if underlying_index_open_prices is not None
+        else np.empty(0, dtype=np.float64)
+    )
+    if bool(allow_option_short) and (
+        not math.isfinite(margin_a)
+        or not math.isfinite(margin_b)
+        or margin_a <= 0.0
+        or margin_b <= 0.0
+        or margin_b > margin_a
+        or not margin_as_of
+        or not underlying_source
+        or underlying_open.shape != (int(futures.dates.size),)
+        or not bool((np.isfinite(underlying_open) & (underlying_open > 0.0)).all())
+    ):
+        raise ValueError(
+            "short-option candidates require finite A >= B > 0, an explicit "
+            "margin date, and one official positive TAIEX open per session"
+        )
     (
         tenor_months,
         _tenor_open,
@@ -220,6 +379,8 @@ def build_causal_derivative_day_candidates(
     option_returns = np.full(
         (rows, TAIFEX_OPTION_CANDIDATE_CAPACITY), np.nan, dtype=np.float32
     )
+    option_short_returns = np.full_like(option_returns, np.nan)
+    option_short_margins = np.full_like(option_returns, np.nan)
     option_sparse = np.full(
         (rows, TAIFEX_OPTION_CANDIDATE_CAPACITY), -1, dtype=np.int32
     )
@@ -355,6 +516,29 @@ def build_causal_derivative_day_candidates(
                 - tax * ratio
                 - (2.0 * slip) / open_price
             )
+            if bool(allow_option_short):
+                underlying_index_open = float(underlying_open[row])
+                if right == "C":
+                    out_of_money = max(strike - underlying_index_open, 0.0)
+                elif right == "P":
+                    out_of_money = max(underlying_index_open - strike, 0.0)
+                else:
+                    raise ValueError(f"unsupported option right {right!r}")
+                premium_value = open_price * float(options.multiplier)
+                margin = premium_value + max(
+                    margin_a - out_of_money * float(options.multiplier),
+                    margin_b,
+                )
+                option_short_margins[row, slot] = np.float32(margin)
+                option_short_returns[row, slot] = np.float32(
+                    (
+                        (open_price - close_price) * float(options.multiplier)
+                        - 2.0 * fee
+                        - tax * open_price * float(options.multiplier)
+                        - 2.0 * slip * float(options.multiplier)
+                    )
+                    / margin
+                )
 
     return TaiwanIndexDerivativeDayCandidates(
         dates=np.asarray(futures.dates, dtype="datetime64[D]").copy(),
@@ -364,17 +548,26 @@ def build_causal_derivative_day_candidates(
         option_candidate_mask=option_mask,
         option_candidate_features=option_features,
         option_simple_returns=option_returns,
+        option_short_simple_returns=option_short_returns,
+        option_short_initial_margins=option_short_margins,
         option_sparse_indices=option_sparse,
         source_chain=options,
+        allow_option_short=bool(allow_option_short),
+        option_margin_schedule_as_of=margin_as_of if allow_option_short else "",
+        option_margin_underlying_source=(
+            underlying_source if allow_option_short else ""
+        ),
     )
 
 
 __all__ = [
     "TAIFEX_DERIVATIVE_CANDIDATE_CONTRACT_VERSION",
+    "TAIFEX_DERIVATIVE_SHORT_CANDIDATE_CONTRACT_VERSION",
     "TAIFEX_INDEX_DERIVATIVE_ACTION_COUNT_V4",
     "TAIFEX_OPTION_CANDIDATE_CAPACITY",
     "TAIFEX_OPTION_CANDIDATE_FEATURE_DIM",
     "TAIFEX_OPTION_EXPIRY_SLOTS_BY_FAMILY",
     "TaiwanIndexDerivativeDayCandidates",
     "build_causal_derivative_day_candidates",
+    "load_taiex_opening_index",
 ]

@@ -952,14 +952,23 @@ class TradingConfig:
         "data_tw_index_options_daily/weekly_full_chain.parquet"
     )
     tw_index_derivatives_day_maximum_capital_fraction: float = 0.98
-    # The L1 projection chooses direction and relative derivative weights.  An
-    # optional learned scalar gate may then leave capital in cash instead of
-    # forcing every non-zero score vector to the projection boundary.  The
-    # option cap is a separate absolute NAV risk budget; unused option budget
-    # is cash and is never reallocated to futures.
+    # Legacy projection_l1 experiments may add a scalar gate and option-only
+    # budget. The cash_entmax15 path deliberately ignores both fields: its
+    # score evidence leaves residual capital in cash without an extra head.
     tw_index_derivatives_day_use_exposure_gate: bool = False
     tw_index_derivatives_day_exposure_gate_init_logit: float = -2.0
     tw_index_derivatives_day_option_maximum_capital_fraction: float = 0.98
+    # Short TXO uses the official naked single-leg initial-margin formula.
+    # These are a dated current-rule snapshot, not a historical margin series.
+    tw_index_derivatives_day_allow_option_short: bool = False
+    tw_index_derivatives_day_option_risk_margin_a_twd: float = 187_000.0
+    tw_index_derivatives_day_option_risk_margin_b_twd: float = 94_000.0
+    tw_index_derivatives_day_option_risk_margin_c_twd: float = 18_800.0
+    tw_index_derivatives_day_option_margin_schedule_as_of: str = "2026-08-12"
+    tw_index_derivatives_day_option_margin_offsets: str = "conservative_naked"
+    tw_index_derivatives_day_underlying_index_path: str = (
+        "data_tw_public/twse_taiex_ohlc.parquet"
+    )
     tw_index_derivatives_day_option_fixed_fee_per_contract_per_side_twd: float = 22.0
     tw_index_derivatives_day_option_transaction_tax_rate: float = 0.0002
     tw_index_derivatives_day_option_slippage_points_per_side: float = 0.5
@@ -974,8 +983,8 @@ class TradingConfig:
     tw_index_options_tick_contract_multiplier: float = 50.0
     # Current original-margin A/B inputs are explicit because TAIFEX may revise
     # them. Historical experiments must pin the values applicable to the data.
-    tw_index_options_tick_risk_margin_a_twd: float = 169_000.0
-    tw_index_options_tick_risk_margin_b_twd: float = 85_000.0
+    tw_index_options_tick_risk_margin_a_twd: float = 187_000.0
+    tw_index_options_tick_risk_margin_b_twd: float = 94_000.0
     tw_index_options_tick_fixed_fee_per_contract_per_side_twd: float = 20.0
     tw_index_options_tick_transaction_tax_rate: float = 0.001
     tw_index_options_tick_slippage_points_per_side: float = 0.5
@@ -2839,6 +2848,58 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         option_derivatives_fraction
     )
     trading["tw_index_derivatives_day_exposure_gate_init_logit"] = exposure_gate_init
+    option_margin_a = float(
+        trading["tw_index_derivatives_day_option_risk_margin_a_twd"]
+    )
+    option_margin_b = float(
+        trading["tw_index_derivatives_day_option_risk_margin_b_twd"]
+    )
+    option_margin_c = float(
+        trading["tw_index_derivatives_day_option_risk_margin_c_twd"]
+    )
+    if (
+        not math.isfinite(option_margin_a)
+        or not math.isfinite(option_margin_b)
+        or not math.isfinite(option_margin_c)
+        or option_margin_a <= 0.0
+        or option_margin_b <= 0.0
+        or option_margin_c < 0.0
+        or option_margin_b > option_margin_a
+    ):
+        raise ValueError(
+            "TXO margin snapshot must satisfy finite A >= B > 0 and C >= 0"
+        )
+    margin_as_of = str(
+        trading["tw_index_derivatives_day_option_margin_schedule_as_of"]
+    ).strip()
+    if not margin_as_of:
+        raise ValueError(
+            "tw_index_derivatives_day_option_margin_schedule_as_of must not be empty"
+        )
+    margin_offsets = str(
+        trading["tw_index_derivatives_day_option_margin_offsets"]
+    ).strip().lower()
+    underlying_index_path = str(
+        trading["tw_index_derivatives_day_underlying_index_path"]
+    ).strip()
+    if margin_offsets != "conservative_naked":
+        raise ValueError(
+            "tw_index_derivatives_day currently supports only conservative_naked "
+            "short-option margin without unverified portfolio offsets"
+        )
+    if (
+        bool(trading["tw_index_derivatives_day_allow_option_short"])
+        and not underlying_index_path
+    ):
+        raise ValueError(
+            "short TXO requires tw_index_derivatives_day_underlying_index_path"
+        )
+    trading["tw_index_derivatives_day_option_risk_margin_a_twd"] = option_margin_a
+    trading["tw_index_derivatives_day_option_risk_margin_b_twd"] = option_margin_b
+    trading["tw_index_derivatives_day_option_risk_margin_c_twd"] = option_margin_c
+    trading["tw_index_derivatives_day_option_margin_schedule_as_of"] = margin_as_of
+    trading["tw_index_derivatives_day_option_margin_offsets"] = margin_offsets
+    trading["tw_index_derivatives_day_underlying_index_path"] = underlying_index_path
     _ = OptionDayCostSchedule(
         fixed_fee_per_contract_per_side_twd=trading[
             "tw_index_derivatives_day_option_fixed_fee_per_contract_per_side_twd"

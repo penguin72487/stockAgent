@@ -114,10 +114,10 @@ def parse_args() -> argparse.Namespace:
         "--strategy-night-flatten-time", default="04:55:00"
     )
     parser.add_argument(
-        "--strategy-option-risk-margin-a-twd", type=float, default=169_000.0
+        "--strategy-option-risk-margin-a-twd", type=float, default=187_000.0
     )
     parser.add_argument(
-        "--strategy-option-risk-margin-b-twd", type=float, default=85_000.0
+        "--strategy-option-risk-margin-b-twd", type=float, default=94_000.0
     )
     parser.add_argument(
         "--strategy-capital-buffer-multiple", type=float, default=2.0

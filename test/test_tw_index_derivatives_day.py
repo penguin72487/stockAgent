@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import math
+
 import numpy as np
 import pytest
 import torch
+from torch import nn
 
 from stockagent.backtest.simulator import run_backtest_integer_shares, run_backtest_torch
 from stockagent.backtest.tw_index_derivatives_day import (
@@ -17,6 +20,7 @@ from stockagent.data.tw_index_derivatives_day import (
     TAIFEX_OPTION_CANDIDATE_CAPACITY,
     TAIFEX_OPTION_CANDIDATE_FEATURE_DIM,
     build_causal_derivative_day_candidates,
+    load_taiex_opening_index,
 )
 from stockagent.data.tw_index_futures import TaiwanIndexFuturesDaySession
 from stockagent.data.tw_index_options_daily import (
@@ -24,7 +28,13 @@ from stockagent.data.tw_index_options_daily import (
     option_slot_index,
 )
 from stockagent.models.factory import build_model
-from stockagent.models.normalization import masked_l1_projection_weights
+from stockagent.models.normalization import (
+    masked_cash_entmax15_weights,
+    masked_l1_projection_weights,
+)
+from stockagent.training import trainer as trainer_module
+from stockagent.training.trainer import _evaluate_windowed_tensor_batch
+from stockagent.training.windowed import WindowedSplitTensors
 
 
 def _dates() -> np.ndarray:
@@ -133,13 +143,23 @@ def _option_chain(*, cheap_first: bool = False) -> TaiwanIndexOptionChainDaySess
     )
 
 
-def _candidates(*, cheap_first: bool = False):
+def _candidates(*, cheap_first: bool = False, allow_option_short: bool = False):
     return build_causal_derivative_day_candidates(
         _futures_market(),
         _option_chain(cheap_first=cheap_first),
         fixed_fee_per_contract_per_side_twd=22.0,
         transaction_tax_rate=0.0002,
         slippage_points_per_side=0.5,
+        allow_option_short=allow_option_short,
+        option_risk_margin_a_twd=187_000.0,
+        option_risk_margin_b_twd=94_000.0,
+        option_margin_schedule_as_of="2026-08-12",
+        underlying_index_open_prices=(
+            np.full(3, 23_000.0) if allow_option_short else None
+        ),
+        option_margin_underlying_source=(
+            "synthetic_official_taiex_open" if allow_option_short else ""
+        ),
     )
 
 
@@ -233,17 +253,25 @@ def test_derivative_model_masks_invalid_candidates_before_sparse_allocation() ->
     assert all(torch.isfinite(gradient).all() for gradient in gradients)
 
 
-def test_gated_v6_keeps_projection_l1_but_can_hold_cash_and_caps_options() -> None:
+def test_cash_entmax_v7_can_hold_cash_without_gate_or_option_cap() -> None:
     torch.manual_seed(11)
     config = load_config(
-        "configs/markets/tw_index_derivatives_day_multi_basis_gated_v6.yaml"
+        "configs/markets/tw_index_derivatives_day_multi_basis_cash_entmax_v7.yaml"
     )
     assert config.training.financial_transformer.temporal_pooling == "last"
     assert config.training.financial_transformer.temporal_query_mode == "last_only"
-    assert config.training.financial_transformer.portfolio_output_mode == "projection_l1"
-    assert config.trading.tw_index_derivatives_day_use_exposure_gate
-    assert config.trading.tw_index_derivatives_day_option_maximum_capital_fraction == 0.05
-    assert "gated_v6" in str(config.runner.output_dir)
+    assert config.training.financial_transformer.portfolio_output_mode == "cash_entmax15"
+    assert not config.trading.tw_index_derivatives_day_use_exposure_gate
+    assert config.trading.tw_index_derivatives_day_option_maximum_capital_fraction == 0.98
+    assert config.trading.tw_index_derivatives_day_allow_option_short
+    assert config.trading.tw_index_derivatives_day_option_risk_margin_a_twd == 187_000.0
+    assert config.trading.tw_index_derivatives_day_option_risk_margin_b_twd == 94_000.0
+    assert config.trading.tw_index_derivatives_day_option_risk_margin_c_twd == 18_800.0
+    assert config.trading.tw_index_derivatives_day_option_margin_schedule_as_of == "2026-08-12"
+    assert config.trading.tw_index_derivatives_day_underlying_index_path == (
+        "data_tw_public/twse_taiex_ohlc.parquet"
+    )
+    assert "cash_entmax_v7" in str(config.runner.output_dir)
 
     model = build_model(
         config=config,
@@ -262,26 +290,40 @@ def test_gated_v6_keeps_projection_l1_but_can_hold_cash_and_caps_options() -> No
             "candidate_mask": candidate_mask,
         },
     )
-    projected = aux["derivative_projected_actions"]
-    expected_projection = masked_l1_projection_weights(
-        aux["derivative_raw_actions"],
+    short_mask = candidate_mask.clone()
+    expected = masked_cash_entmax15_weights(
+        aux["derivative_allocation_logits"],
         candidate_mask,
-        long_only=False,
+        short_mask=short_mask,
         radius=0.98,
     )
-    torch.testing.assert_close(projected, expected_projection)
-    gate = aux["derivative_capital_gate"]
-    torch.testing.assert_close(
-        gate,
-        torch.full_like(gate, torch.sigmoid(torch.tensor(-2.0))),
-    )
-    option_gross = actions[:, 6:].sum(dim=-1)
+    torch.testing.assert_close(actions, expected)
+    assert "derivative_projected_actions" not in aux
+    assert "derivative_capital_gate" not in aux
+    assert not hasattr(model, "derivative_capital_head")
+    assert model.allow_option_short
+    option_gross = actions[:, 6:].abs().sum(dim=-1)
     total_gross = actions[:, :6].abs().sum(dim=-1) + option_gross
-    assert torch.all(option_gross <= 0.05 + 1e-6)
-    assert torch.all(total_gross < 0.98)
+    assert torch.all(option_gross <= 0.98 + 1e-6)
+    assert torch.all(total_gross <= 0.98 + 1e-6)
+    torch.testing.assert_close(
+        aux["cash_fraction"], (1.0 - total_gross).unsqueeze(-1)
+    )
     actions.square().sum().backward()
-    assert model.derivative_capital_head.weight.grad is not None
-    assert torch.isfinite(model.derivative_capital_head.weight.grad).all()
+    gradients = [parameter.grad for parameter in model.parameters() if parameter.grad is not None]
+    assert gradients
+    assert all(torch.isfinite(gradient).all() for gradient in gradients)
+
+
+def test_gated_v6_path_is_compatibility_alias_for_cash_entmax_v7() -> None:
+    config = load_config(
+        "configs/markets/tw_index_derivatives_day_multi_basis_gated_v6.yaml"
+    )
+    assert config.training.financial_transformer.portfolio_output_mode == "cash_entmax15"
+    assert not config.trading.tw_index_derivatives_day_use_exposure_gate
+    assert config.trading.tw_index_derivatives_day_option_maximum_capital_fraction == 0.98
+    assert config.trading.tw_index_derivatives_day_allow_option_short
+    assert "cash_entmax_v7" in str(config.runner.output_dir)
 
 
 def test_option_simple_return_is_not_clipped_per_leg_below_minus_one() -> None:
@@ -297,6 +339,196 @@ def test_option_simple_return_is_not_clipped_per_leg_below_minus_one() -> None:
         - 1.0 / open_price
     )
     assert candidates.option_simple_returns[1, 0] == pytest.approx(expected)
+
+
+def test_short_option_uses_dated_naked_margin_and_directional_capital_return() -> None:
+    candidates = _candidates(allow_option_short=True)
+    assert candidates.allow_option_short
+    assert candidates.option_margin_schedule_as_of == "2026-08-12"
+    assert candidates.option_margin_underlying_source == (
+        "synthetic_official_taiex_open"
+    )
+    # Row 1 / slot 0 is the prior-known 23,000 Call. At a 23,000 underlying
+    # open its OTM deduction is zero: 100*50 premium + A = 192,000 TWD.
+    assert candidates.option_short_initial_margins[1, 0] == pytest.approx(
+        192_000.0
+    )
+    expected_short_pnl = (
+        (100.0 - 120.0) * 50.0
+        - 2.0 * 22.0
+        - 0.0002 * 100.0 * 50.0
+        - 2.0 * 0.5 * 50.0
+    )
+    assert candidates.option_short_simple_returns[1, 0] == pytest.approx(
+        expected_short_pnl / 192_000.0
+    )
+    directional = candidates.simple_returns()
+    assert directional.shape == (3, 4102, 2)
+
+    actions = np.zeros((3, 4102), dtype=np.float64)
+    actions[1, 6] = -192_000.0 / 100_000_000.0
+    integer = run_tw_index_derivatives_day_integer(
+        actions,
+        _futures_market(),
+        candidates,
+        initial_capital=100_000_000.0,
+        option_cost_schedule=OptionDayCostSchedule(
+            fixed_fee_per_contract_per_side_twd=22.0,
+            transaction_tax_rate=0.0002,
+            slippage_points_per_side=0.5,
+        ),
+    )
+    assert integer.option_contract_quantities[1, 0] == -1
+    assert integer.executed_actions[1, 6] == pytest.approx(actions[1, 6])
+    assert integer.net_pnl_twd[1] == pytest.approx(expected_short_pnl)
+
+    continuous = run_tw_index_derivatives_day_continuous(
+        torch.as_tensor(actions, dtype=torch.float32),
+        torch.as_tensor(directional, dtype=torch.float32),
+        futures_round_trip_cost_rate=0.0,
+    )
+    assert continuous.strategy_returns[1].item() == pytest.approx(
+        expected_short_pnl / 100_000_000.0,
+        abs=1e-9,
+    )
+
+
+def test_chunked_eval_preserves_directional_derivative_return_axis() -> None:
+    rows, symbols = 5, 2
+    derivative_returns = torch.zeros(
+        rows,
+        TAIFEX_INDEX_DERIVATIVE_ACTION_COUNT_V4,
+        2,
+        dtype=torch.float32,
+    )
+    derivative_returns[:, 0, 0] = 0.01
+    derivative_returns[:, 0, 1] = -0.01
+    split = WindowedSplitTensors(
+        features=torch.zeros((rows, symbols, 1), dtype=torch.float32),
+        valid_indices=torch.arange(1, rows),
+        future_log_returns=torch.zeros((rows, symbols), dtype=torch.float32),
+        tradable_mask=torch.ones((rows, symbols), dtype=torch.bool),
+        can_buy_mask=torch.ones((rows, symbols), dtype=torch.bool),
+        can_sell_mask=torch.ones((rows, symbols), dtype=torch.bool),
+        benchmark=torch.zeros(rows, dtype=torch.float32),
+        lookback=1,
+        overnight_log_returns=derivative_returns,
+        derivative_candidate_features=torch.zeros(
+            rows,
+            TAIFEX_OPTION_CANDIDATE_CAPACITY,
+            TAIFEX_OPTION_CANDIDATE_FEATURE_DIM,
+            dtype=torch.float32,
+        ),
+        derivative_candidate_mask=torch.ones(
+            rows,
+            TAIFEX_INDEX_DERIVATIVE_ACTION_COUNT_V4,
+            dtype=torch.bool,
+        ),
+        execution_mode="tw_index_derivatives_day",
+    )
+
+    class _FixedDerivativeModel(nn.Module):
+        def forward(self, x, mask, *, portfolio_context=None):
+            del mask, portfolio_context
+            actions = torch.zeros(
+                int(x.size(0)),
+                TAIFEX_INDEX_DERIVATIVE_ACTION_COUNT_V4,
+                device=x.device,
+                dtype=x.dtype,
+            )
+            actions[:, 0] = 0.5
+            return actions
+
+    runtime = trainer_module._ExecutionRuntime(
+        mode="tw_index_derivatives_day",
+        buy_fee_rates=None,
+        sell_fee_rates=None,
+        lot_sizes=None,
+        settlement_lag_sessions=0,
+    )
+    backtest, _, _ = _evaluate_windowed_tensor_batch(
+        _FixedDerivativeModel(),
+        None,
+        split,
+        torch.device("cpu"),
+        None,
+        False,
+        False,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        chunk_rows=3,
+        backtest_chunk_rows=2,
+        execution_runtime=runtime,
+    )
+
+    assert backtest.strategy_returns.shape == (len(split),)
+    assert backtest.requested_weights_history is not None
+    assert backtest.requested_weights_history.shape == (
+        len(split),
+        TAIFEX_INDEX_DERIVATIVE_ACTION_COUNT_V4,
+    )
+    torch.testing.assert_close(
+        backtest.strategy_returns,
+        torch.full((len(split),), math.log1p(0.005), dtype=torch.float32),
+    )
+
+
+def test_short_option_margin_requires_and_uses_official_taiex_open() -> None:
+    common = {
+        "fixed_fee_per_contract_per_side_twd": 22.0,
+        "transaction_tax_rate": 0.0002,
+        "slippage_points_per_side": 0.5,
+        "allow_option_short": True,
+        "option_risk_margin_a_twd": 187_000.0,
+        "option_risk_margin_b_twd": 94_000.0,
+        "option_margin_schedule_as_of": "2026-08-12",
+    }
+    with pytest.raises(ValueError, match="official positive TAIEX open"):
+        build_causal_derivative_day_candidates(
+            _futures_market(),
+            _option_chain(),
+            **common,
+        )
+
+    candidates = build_causal_derivative_day_candidates(
+        _futures_market(),
+        _option_chain(),
+        underlying_index_open_prices=np.asarray([23_000.0, 22_800.0, 23_000.0]),
+        option_margin_underlying_source="synthetic_official_taiex_open",
+        **common,
+    )
+    # Row 1 slot 0 is a 23,000 Call. With TAIEX open at 22,800, its 200-point
+    # OTM value is 10,000 TWD: 5,000 premium + (187,000 - 10,000).
+    assert candidates.option_short_initial_margins[1, 0] == pytest.approx(
+        182_000.0
+    )
+
+
+def test_official_taiex_open_loader_aligns_dates_and_fails_closed(tmp_path) -> None:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    path = tmp_path / "taiex.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "date": pa.array(
+                    [date.item() for date in _dates()], type=pa.date32()
+                ),
+                "opening_index": [23_000.0, 22_800.0, 23_100.0],
+            }
+        ),
+        path,
+    )
+    loaded = load_taiex_opening_index(path, panel_dates=_dates()[[2, 0]])
+    np.testing.assert_allclose(loaded, [23_100.0, 23_000.0])
+    with pytest.raises(ValueError, match="does not cover every panel session"):
+        load_taiex_opening_index(
+            path,
+            panel_dates=np.asarray(["2025-01-07"], dtype="datetime64[D]"),
+        )
 
 
 def test_integer_costs_and_relative_tenor_mapping_finish_flat() -> None:

@@ -17,6 +17,7 @@ from stockagent.data.tw_index_futures import TAIFEX_INDEX_FUTURES_TENOR_SLOTS
 from stockagent.models.financial_transformer import FinancialTransformerModel
 from stockagent.models.normalization import (
     finite_mask_fill_value,
+    masked_cash_entmax15_weights,
     masked_l1_projection_weights,
 )
 from stockagent.models.transformer_base_portfolio import PortfolioRMSNorm
@@ -25,15 +26,19 @@ from stockagent.models.transformer_base_portfolio import PortfolioRMSNorm
 TW_INDEX_DERIVATIVE_DAY_ACTION_SCHEMA: Final[str] = (
     "futures_e1_e6_plus_prior_session_txo_candidates_v4"
 )
+TW_INDEX_DERIVATIVE_DAY_SHORT_ACTION_SCHEMA: Final[str] = (
+    "signed_futures_e1_e6_plus_signed_prior_session_txo_candidates_v5"
+)
 
 
 class CrossSectionalIndexDerivativesDayModel(FinancialTransformerModel):
     """Encode all stocks, then score only today's causal derivative universe.
 
     Output ``[B,4102]`` contains six signed futures expiry buckets E1..E6 and
-    4,096 non-negative option candidate slots.  Each option is represented by
-    its own prior-session metadata; concrete contract ids never become model
-    parameters and are never carried from one session to the next.
+    4,096 option candidate slots.  Options are non-negative in the legacy
+    contract and signed when the dated short-margin contract is enabled. Each
+    option is represented by its own prior-session metadata; concrete contract
+    ids never become model parameters and are never carried across sessions.
     """
 
     def __init__(
@@ -44,14 +49,19 @@ class CrossSectionalIndexDerivativesDayModel(FinancialTransformerModel):
         use_exposure_gate: bool = False,
         exposure_gate_init_logit: float = -2.0,
         option_maximum_capital_fraction: float = 0.98,
+        allow_option_short: bool = False,
         **kwargs: Any,
     ) -> None:
         kwargs["execution_mode"] = "naive"
         super().__init__(*args, **kwargs)
-        if self.portfolio_output_mode != "projection_l1":
+        if self.portfolio_output_mode not in {
+            "projection_l1",
+            "cash_entmax15",
+        }:
             raise ValueError(
                 "cross_sectional_index_derivatives_day requires "
-                "portfolio_output_mode='projection_l1'"
+                "portfolio_output_mode='projection_l1' or "
+                "'cash_entmax15'"
             )
         fraction = float(maximum_capital_fraction)
         if not 0.0 < fraction <= 1.0:
@@ -73,11 +83,21 @@ class CrossSectionalIndexDerivativesDayModel(FinancialTransformerModel):
         self.maximum_capital_fraction = fraction
         self.option_maximum_capital_fraction = option_fraction
         self.use_exposure_gate = bool(use_exposure_gate)
+        self.allow_option_short = bool(allow_option_short)
+        if self.allow_option_short and self.portfolio_output_mode != "cash_entmax15":
+            raise ValueError(
+                "short TXO actions require portfolio_output_mode="
+                "'cash_entmax15'; the legacy projection path is long-option only"
+            )
         self.execution_mode = "tw_index_derivatives_day"
         self.num_action_channels = 1
         self.num_option_slots = TAIFEX_OPTION_CANDIDATE_CAPACITY
         self.num_derivative_actions = TAIFEX_INDEX_DERIVATIVE_ACTION_COUNT_V4
-        self.action_schema = TW_INDEX_DERIVATIVE_DAY_ACTION_SCHEMA
+        self.action_schema = (
+            TW_INDEX_DERIVATIVE_DAY_SHORT_ACTION_SCHEMA
+            if self.allow_option_short
+            else TW_INDEX_DERIVATIVE_DAY_ACTION_SCHEMA
+        )
         del self.score_head
 
         self.derivative_pool_score = nn.Linear(self.d_model, 1)
@@ -205,43 +225,85 @@ class CrossSectionalIndexDerivativesDayModel(FinancialTransformerModel):
         option_mask = candidate_mask[:, TAIFEX_INDEX_FUTURES_TENOR_SLOTS:]
         option_raw_actions = torch.where(
             option_mask,
-            option_scores.clamp_min(0.0),
+            option_scores
+            if self.allow_option_short
+            else option_scores.clamp_min(0.0),
             torch.zeros_like(option_scores),
         )
         raw_actions = torch.cat((future_raw_actions, option_raw_actions), dim=-1)
-        projected_actions = masked_l1_projection_weights(
-            raw_actions,
-            candidate_mask,
-            long_only=False,
-            radius=self.maximum_capital_fraction,
-        )
-        projected_futures = projected_actions[
-            :, :TAIFEX_INDEX_FUTURES_TENOR_SLOTS
-        ]
-        projected_options = projected_actions[
-            :, TAIFEX_INDEX_FUTURES_TENOR_SLOTS:
-        ]
-        option_gross = projected_options.sum(dim=-1, keepdim=True)
-        option_scale = torch.clamp(
-            projected_options.new_tensor(self.option_maximum_capital_fraction)
-            / option_gross.clamp_min(torch.finfo(projected_options.dtype).eps),
-            max=1.0,
-        )
-        risk_capped_actions = torch.cat(
-            (projected_futures, projected_options * option_scale), dim=-1
-        )
-        if self.use_exposure_gate:
-            capital_gate = torch.sigmoid(
-                self.derivative_capital_head(market).float()
+        allocation_logits = torch.cat((future_scores, option_scores), dim=-1)
+        allocator_aux: dict[str, torch.Tensor]
+        if self.portfolio_output_mode == "projection_l1":
+            projected_actions = masked_l1_projection_weights(
+                raw_actions,
+                candidate_mask,
+                long_only=False,
+                radius=self.maximum_capital_fraction,
             )
-            actions = risk_capped_actions * capital_gate
+            projected_futures = projected_actions[
+                :, :TAIFEX_INDEX_FUTURES_TENOR_SLOTS
+            ]
+            projected_options = projected_actions[
+                :, TAIFEX_INDEX_FUTURES_TENOR_SLOTS:
+            ]
+            option_gross = projected_options.sum(dim=-1, keepdim=True)
+            option_scale = torch.clamp(
+                projected_options.new_tensor(self.option_maximum_capital_fraction)
+                / option_gross.clamp_min(torch.finfo(projected_options.dtype).eps),
+                max=1.0,
+            )
+            risk_capped_actions = torch.cat(
+                (projected_futures, projected_options * option_scale), dim=-1
+            )
+            if self.use_exposure_gate:
+                capital_gate = torch.sigmoid(
+                    self.derivative_capital_head(market).float()
+                )
+                actions = risk_capped_actions * capital_gate
+            else:
+                capital_gate = torch.ones(
+                    (risk_capped_actions.size(0), 1),
+                    dtype=risk_capped_actions.dtype,
+                    device=risk_capped_actions.device,
+                )
+                actions = risk_capped_actions
+            allocator_aux = {
+                "derivative_projected_actions": projected_actions,
+                "derivative_risk_capped_actions": risk_capped_actions,
+                "derivative_capital_gate": capital_gate.squeeze(-1),
+                "projection_gross_exposure": actions.abs().sum(dim=-1),
+            }
         else:
-            capital_gate = torch.ones(
-                (risk_capped_actions.size(0), 1),
-                dtype=risk_capped_actions.dtype,
-                device=risk_capped_actions.device,
+            short_mask = torch.cat(
+                (
+                    future_mask,
+                    option_mask
+                    if self.allow_option_short
+                    else torch.zeros_like(option_mask),
+                ),
+                dim=-1,
             )
-            actions = risk_capped_actions
+            actions, entmax_parts = masked_cash_entmax15_weights(
+                allocation_logits,
+                candidate_mask,
+                short_mask=short_mask,
+                radius=self.maximum_capital_fraction,
+                return_parts=True,
+            )
+            allocator_aux = {
+                "derivative_relative_action_alloc": entmax_parts[
+                    "cash_entmax_relative_alloc"
+                ],
+                "derivative_action_conviction": entmax_parts[
+                    "cash_entmax_conviction"
+                ],
+                "derivative_risk_fraction": entmax_parts[
+                    "cash_entmax_risk_fraction"
+                ],
+                "derivative_cash_fraction": entmax_parts[
+                    "cash_entmax_cash_fraction"
+                ],
+            }
         actions = torch.where(
             has_stocks.unsqueeze(-1), actions, torch.zeros_like(actions)
         )
@@ -253,11 +315,7 @@ class CrossSectionalIndexDerivativesDayModel(FinancialTransformerModel):
         include_aux = bool(return_aux is True or (return_aux is None and self.return_aux))
         if include_aux:
             output_aux = dict(aux)
-            gross = actions[:, :TAIFEX_INDEX_FUTURES_TENOR_SLOTS].abs().sum(
-                dim=-1, keepdim=True
-            ) + actions[:, TAIFEX_INDEX_FUTURES_TENOR_SLOTS:].sum(
-                dim=-1, keepdim=True
-            )
+            gross = actions.abs().sum(dim=-1, keepdim=True)
             output_aux.update(
                 {
                     "z_stock": clean,
@@ -265,16 +323,15 @@ class CrossSectionalIndexDerivativesDayModel(FinancialTransformerModel):
                     "market_embedding": market,
                     "derivative_candidate_mask": candidate_mask,
                     "derivative_raw_actions": raw_actions,
-                    "derivative_projected_actions": projected_actions,
-                    "derivative_risk_capped_actions": risk_capped_actions,
-                    "derivative_capital_gate": capital_gate.squeeze(-1),
+                    "derivative_allocation_logits": allocation_logits,
                     "future_active_scores": future_raw_actions.abs(),
                     "option_active_scores": option_raw_actions,
                     "derivative_actions": actions,
-                    "projection_gross_exposure": gross.squeeze(-1),
-                    "cash_fraction": 1.0 - gross,
+                    "gross_exposure": gross.squeeze(-1),
+                    "cash_fraction": (1.0 - gross).clamp_min(0.0),
                 }
             )
+            output_aux.update(allocator_aux)
             if return_aux is True:
                 return actions, scores, output_aux
             return {
@@ -289,4 +346,5 @@ class CrossSectionalIndexDerivativesDayModel(FinancialTransformerModel):
 __all__ = [
     "CrossSectionalIndexDerivativesDayModel",
     "TW_INDEX_DERIVATIVE_DAY_ACTION_SCHEMA",
+    "TW_INDEX_DERIVATIVE_DAY_SHORT_ACTION_SCHEMA",
 ]

@@ -2859,13 +2859,13 @@ def run_backtest_torch(
             raise ValueError("future_returns must have shape [T,S]")
         if tuple(tradable_mask.shape) != (rows, symbols_count):
             raise ValueError("tradable_mask must have shape [T,S]")
-        if overnight_returns is None or tuple(overnight_returns.shape) != (
-            rows,
-            TAIFEX_INDEX_DERIVATIVE_ACTION_COUNT_V4,
-        ):
+        if overnight_returns is None or tuple(overnight_returns.shape) not in {
+            (rows, TAIFEX_INDEX_DERIVATIVE_ACTION_COUNT_V4),
+            (rows, TAIFEX_INDEX_DERIVATIVE_ACTION_COUNT_V4, 2),
+        }:
             raise ValueError(
                 "tw_index_derivatives_day requires derivative simple returns in "
-                "overnight_returns [T,4102]"
+                "overnight_returns [T,4102] or directional [T,4102,2]"
             )
         clean = torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
         derivative_returns = overnight_returns.to(
@@ -2874,7 +2874,7 @@ def run_backtest_torch(
         if state_advance_mask is not None:
             advance = state_advance_mask.to(device=weights.device, dtype=torch.bool)
             derivative_returns = torch.where(
-                advance.unsqueeze(-1),
+                advance.view(rows, *([1] * (derivative_returns.dim() - 1))),
                 derivative_returns,
                 torch.full_like(derivative_returns, float("nan")),
             )

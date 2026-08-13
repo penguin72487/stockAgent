@@ -384,24 +384,26 @@ def fetch_shioaji_stock_snapshots(
     # A subset of checkpoint symbols can be absent from the static MIS file
     # (suspensions, legacy listings, or an exchange-side partial response).  For
     # a Shioaji-observed live symbol, derive the remaining legal order bounds
-    # from the last completed panel close using the existing date-versioned TW
-    # tick/7%-10% rules. Known corporate-action transition masks still fail
-    # closed in the signal/execution layer.
+    # only from Shioaji's same-session official auction reference.  Previous
+    # close is not interchangeable with that reference around ex-rights,
+    # ex-dividend, capital reduction, or other reference-price adjustments.
+    # If the official reference is absent, leave both limits missing so the
+    # execution layer fails closed; never fabricate them from panel fallback.
     from stockagent.data.tw_price_rules import limit_price_numpy
 
-    fallback_reference = np.asarray(fallback_prices, dtype=np.float64)
     trading_date = np.datetime64(
         datetime.now(ZoneInfo("Asia/Taipei")).date().isoformat(), "D"
     )
-    derived_upper = limit_price_numpy(fallback_reference, 1.10, trading_date)
-    derived_lower = limit_price_numpy(fallback_reference, 0.90, trading_date)
+    official_reference = arrays["reference"]
+    derived_upper = limit_price_numpy(official_reference, 1.10, trading_date)
+    derived_lower = limit_price_numpy(official_reference, 0.90, trading_date)
     derived_count = 0
     for idx in range(len(requested)):
         if not available[idx]:
             continue
         if np.isfinite(arrays["upper"][idx]) and np.isfinite(arrays["lower"][idx]):
             continue
-        reference = fallback_reference[idx]
+        reference = official_reference[idx]
         upper = derived_upper[idx]
         lower = derived_lower[idx]
         if not (

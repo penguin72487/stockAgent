@@ -133,8 +133,8 @@ def txo_short_initial_margin_per_contract(
     strike_price: torch.Tensor | float,
     *,
     contract_multiplier: float = 50.0,
-    risk_margin_a_twd: float = 169_000.0,
-    risk_margin_b_twd: float = 85_000.0,
+    risk_margin_a_twd: float = 187_000.0,
+    risk_margin_b_twd: float = 94_000.0,
 ) -> torch.Tensor:
     """Return naked Call/Put initial margin using the official single-leg rule."""
 
@@ -198,8 +198,8 @@ def execute_option_tick_target(
     allow_option_short: bool,
     maximum_capital_fraction: float = 0.8,
     contract_multiplier: float = 50.0,
-    risk_margin_a_twd: float = 169_000.0,
-    risk_margin_b_twd: float = 85_000.0,
+    risk_margin_a_twd: float = 187_000.0,
+    risk_margin_b_twd: float = 94_000.0,
     fixed_fee_per_contract_per_side_twd: float = 20.0,
     transaction_tax_rate: float = 0.001,
     slippage_points_per_side: float = 0.5,
