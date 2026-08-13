@@ -20,6 +20,13 @@ UNIVERSE="${SHIOAJI_MICRO_UNIVERSE:-data_tw_microstructure/universe/top_200.csv}
 HFT_DATASET_ROOT="${SHIOAJI_HFT_DATASET_ROOT:-data_tw_microstructure/hft_dataset}"
 TAIFEX_PRIORITY_GATE="${SHIOAJI_TAIFEX_PRIORITY_GATE:-true}"
 TAIFEX_WORKERS="${SHIOAJI_TAIFEX_WORKERS:-3}"
+MAX_CONNECTIONS="${SHIOAJI_MAX_CONNECTIONS:-5}"
+# Discord opening inference and the one-minute paper executor each keep one
+# simulation-only stock quote login warm.  FOP capture remains higher priority
+# than Top-200, so fail closed instead of attempting six sessions on a
+# five-connection account.
+RESERVED_STOCK_QUOTE_CLIENTS="${SHIOAJI_RESERVED_STOCK_QUOTE_CLIENTS:-2}"
+TOP200_WORKERS=2
 LOG_FILE="$RUN_ROOT/run.log"
 LOCK_FILE="$RUN_ROOT/runner.lock"
 mkdir -p "$RUN_ROOT"
@@ -98,6 +105,15 @@ while true; do
   fi
 
   wait_for_taifex_priority
+
+  required_connections=$((TAIFEX_WORKERS + RESERVED_STOCK_QUOTE_CLIENTS + TOP200_WORKERS))
+  if (( required_connections > MAX_CONNECTIONS )); then
+    echo "[shioaji-top200] capture_skipped reason=connection_budget required=$required_connections max=$MAX_CONNECTIONS taifex=$TAIFEX_WORKERS reserved_day_trade_quotes=$RESERVED_STOCK_QUOTE_CLIENTS top200=$TOP200_WORKERS"
+    next_delay="$(seconds_until_next_capture_day)"
+    echo "[shioaji-top200] waiting_seconds=$next_delay reason=next_capture_day"
+    sleep "$next_delay"
+    continue
+  fi
 
   trade_date="$(TZ=Asia/Taipei date +%F)"
   echo "[shioaji-top200] universe_refresh date=$trade_date"

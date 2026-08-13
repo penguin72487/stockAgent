@@ -1,0 +1,13 @@
+base_config: ../markets/tw_day_trade_10m.yaml
+
+# Immutable inference contract for the restored TWD 10 million fold-11
+# checkpoint.  Keep all 99 saved features even when a separate research config
+# excludes slower official datasets.
+experiment_name: tw-day-trade-initial-capital-10m-fold11-deployment
+
+runner:
+  output_dir: artifacts/markets/tw_day_trade_10m
+  resume: false
+
+data:
+  feature_exclude: []

@@ -75,7 +75,13 @@ BASE_FEATURES = {
 # decision.  The opening price is observable before that decision.  All other
 # fields below use final session aggregates and therefore cannot be used to
 # establish a position at that same regular close.
-PRE_CLOSE_FEATURE_COLUMNS = ("open_logret_1d",)
+PRE_CLOSE_FEATURE_COLUMNS = (
+    "open_logret_1d",
+    # The day-trade panel constructs this dedicated final-row channel from the
+    # observed session-t open and close[t-1].  It is intentionally separate
+    # from session-t high/low/close/full-day aggregates.
+    "next_session_open_gap_logret",
+)
 CLOSE_COMPLETION_FEATURE_COLUMNS = (
     "max_logret_1d",
     "min_logret_1d",

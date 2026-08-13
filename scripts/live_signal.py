@@ -11,7 +11,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from stockagent.live.signal_engine import generate_live_signal
-from stockagent.live.market_config import load_market_config
+from stockagent.live.market_config import load_market_config, resolved_live_output_dir
 
 
 def parse_args() -> argparse.Namespace:
@@ -28,7 +28,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--panel-date", default=None, help="Panel date to use for model features, or latest.")
     parser.add_argument("--asof-date", default=None, help="Signal timestamp label. Defaults to the current source-market time.")
     parser.add_argument("--daily-bar-time", default=None, help="Display time for daily bars, e.g. 13:30 for TW close.")
-    parser.add_argument("--price-source", choices=("panel", "csv", "yahoo", "tw"), default=None)
+    parser.add_argument(
+        "--price-source",
+        choices=("panel", "csv", "yahoo", "tw", "shioaji"),
+        default=None,
+    )
     parser.add_argument("--prices-csv", default=None, help="CSV with symbol/code/ticker and price/close/last columns.")
     parser.add_argument("--yahoo-chunk-size", type=int, default=None)
     parser.add_argument("--device", default=None, help="Override config environment.device, e.g. cuda or cpu.")
@@ -72,6 +76,8 @@ def main() -> None:
     }
     if args.market_config:
         market_cfg = load_market_config(args.market_config)
+        if overrides["live_output_dir"] is None:
+            overrides["live_output_dir"] = str(resolved_live_output_dir(market_cfg))
         kwargs = market_cfg.signal_kwargs(**overrides)
     else:
         kwargs = {key: value for key, value in overrides.items() if value is not None}

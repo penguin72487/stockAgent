@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from stockagent.config import load_config
 from stockagent.live.market_config import load_market_config, load_market_configs
 from stockagent.live.model_deployment import (
     attempt_model_deployment,
@@ -188,7 +189,7 @@ def test_repo_tw_modes_have_independent_market_and_artifact_routes() -> None:
     assert multi_basis.fold_id == 11
     assert multi_basis.initial_capital == 10_000_000.0
     assert multi_basis.config_path == (
-        "configs/markets/tw_public_multi_basis_online_complete.yaml"
+        "configs/deployments/tw_day_trade_multi_basis_fold11.yaml"
     )
     assert multi_basis.output_dir == multi_basis_root
     assert multi_basis.checkpoint_path == (
@@ -201,3 +202,24 @@ def test_repo_tw_modes_have_independent_market_and_artifact_routes() -> None:
         == day_trade_100m.live_output_dir
         == "artifacts/live_signals"
     )
+    shared_refresh = (
+        "{python}",
+        "scripts/refresh_tw_public_live_snapshot.py",
+        "--config",
+        "configs/markets/tw_day_trade_10m.yaml",
+    )
+    assert day_trade_1m.pre_signal_command == shared_refresh
+    assert day_trade.pre_signal_command == shared_refresh
+    assert multi_basis.pre_signal_command == shared_refresh
+    assert day_trade_100m.pre_signal_command == shared_refresh
+
+
+def test_repo_multi_basis_fold11_deployment_keeps_checkpoint_model_contract() -> None:
+    root = Path(__file__).resolve().parents[1]
+    config = load_config(root / "configs/deployments/tw_day_trade_multi_basis_fold11.yaml")
+
+    assert config.runner.output_dir == (
+        "artifacts/markets/"
+        "tw_public_candles_multi_basis_online_complete_raw_feature_input_lookback32_v5"
+    )
+    assert config.training.transformer_base_portfolio.temporal_basis_input == "raw_features"

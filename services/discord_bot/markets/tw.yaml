@@ -13,27 +13,10 @@ freshness_scan_limit: 0
 holidays: []
 pre_signal_command:
   - "{python}"
-  - downloader/download_tw_official_data.py
-  - --mode
-  - daily
+  - scripts/refresh_tw_public_live_snapshot.py
   - --config
-  - configs/markets/tw_public.yaml
-  - --public-dir
-  - data_tw_public
-  - --stock-root
-  - data_tw_public/stocks
-  - --public-workers
-  - "2"
-  - --date-workers
-  - "4"
-  - --workers
-  - "8"
-  - --ohlcv-fallback
-  - yahoo
-  - --fallback-start-date
-  - "2000-01-01"
-  - --skip-raw
-pre_signal_timeout_seconds: 1800
+  - configs/markets/tw_day_trade_10m.yaml
+pre_signal_timeout_seconds: 14400
 previous_signal_backfill_limit: 512
 
 model_selection_path: ../models/tw.yaml

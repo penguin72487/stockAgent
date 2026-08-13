@@ -33,6 +33,14 @@ TAIFEX_INDEX_FUTURES_MULTIPLIERS: Final[dict[str, int]] = {
     "MTX": 50,
     "TMF": 10,
 }
+# User/broker fee assumptions shared by live and research one-contract
+# comparisons.  Exchange tax is date-versioned separately and must not be
+# folded into these fixed per-side amounts.
+TAIFEX_INDEX_FUTURES_FEE_PER_SIDE_TWD: Final[dict[str, float]] = {
+    "TX": 60.0,
+    "MTX": 24.0,
+    "TMF": 16.0,
+}
 # Shioaji and TAIFEX do not use the same root spelling for every product.
 # These roots are lookup hints only.  Live code must resolve a concrete
 # contract through Contract V2 rather than constructing an expiry code.
@@ -273,7 +281,11 @@ def _decoded_csv_stream(
                         newline="",
                     )
                     try:
-                        yield text, f"{source_path.name}:{member.filename}", source_sha256
+                        yield (
+                            text,
+                            f"{source_path.name}:{member.filename}",
+                            source_sha256,
+                        )
                     finally:
                         text.detach()
         return
@@ -342,9 +354,7 @@ def _iter_monthly_day_rows(
         ]
         missing = sorted(set(_REQUIRED_SOURCE_COLUMNS) - set(reader.fieldnames))
         if missing:
-            raise ValueError(
-                f"{source_name} is missing TAIFEX columns: {missing}"
-            )
+            raise ValueError(f"{source_name} is missing TAIFEX columns: {missing}")
         has_session_column = "交易時段" in reader.fieldnames
         for raw in reader:
             product = str(raw.get("契約") or "").strip().upper()
@@ -444,9 +454,7 @@ def _front_month_keys(
     for key, candidates in grouped.items():
         date_value, product = key
         calendar_month = str(date_value.astype("datetime64[M]")).replace("-", "")
-        nonexpired = [
-            row for row in candidates if row.contract_month >= calendar_month
-        ]
+        nonexpired = [row for row in candidates if row.contract_month >= calendar_month]
         pool = nonexpired if nonexpired else candidates
         front = min(pool, key=lambda row: row.contract_month)
         selected.add((date_value, product, front.contract_month))
@@ -612,9 +620,7 @@ def load_taifex_index_futures_day_session(
     normalized_products = _normalized_products(products)
     source = Path(path).expanduser().resolve()
     if not source.is_file():
-        raise FileNotFoundError(
-            f"TAIFEX day-session parquet does not exist: {source}"
-        )
+        raise FileNotFoundError(f"TAIFEX day-session parquet does not exist: {source}")
     table = pq.read_table(source)
     missing = sorted(set(_NORMALIZED_COLUMNS) - set(table.column_names))
     if missing:
@@ -625,8 +631,7 @@ def load_taifex_index_futures_day_session(
         TAIFEX_FUTURES_DATA_CONTRACT_VERSION
     ):
         raise ValueError(
-            f"{source} uses unsupported futures data contract "
-            f"{contract_version!r}"
+            f"{source} uses unsupported futures data contract {contract_version!r}"
         )
     expected_metadata = {
         b"stockagent.front_month_policy": b"nearest_unexpired_monthly",
@@ -686,9 +691,7 @@ def load_taifex_index_futures_day_session(
     )
     front_month_roll_mask = np.zeros((rows, columns), dtype=bool)
     date_to_row = {date_value: idx for idx, date_value in enumerate(dates)}
-    product_to_col = {
-        product: idx for idx, product in enumerate(normalized_products)
-    }
+    product_to_col = {product: idx for idx, product in enumerate(normalized_products)}
     seen: set[tuple[int, int]] = set()
 
     for source_row, (date_value, raw_product) in enumerate(
@@ -709,9 +712,7 @@ def load_taifex_index_futures_day_session(
                 f"{source} contains duplicate normalized row {date_value}/{product}"
             )
         seen.add(key)
-        contract_months[row, col] = str(
-            payload["contract_month"][source_row]
-        ).strip()
+        contract_months[row, col] = str(payload["contract_month"][source_row]).strip()
         open_prices[row, col] = float(payload["open"][source_row])
         high_prices[row, col] = float(payload["high"][source_row])
         low_prices[row, col] = float(payload["low"][source_row])

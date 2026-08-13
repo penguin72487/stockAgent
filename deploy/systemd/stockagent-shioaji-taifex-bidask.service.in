@@ -1,5 +1,5 @@
 [Unit]
-Description=StockAgent Shioaji TAIFEX Tick and five-level BidAsk capture
+Description=StockAgent Shioaji TAIFEX BidAsk capture and simulation strategies
 Wants=network-online.target time-sync.target
 After=network-online.target time-sync.target
 Before=stockagent-shioaji-top200.service

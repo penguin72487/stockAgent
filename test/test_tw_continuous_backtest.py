@@ -632,6 +632,55 @@ def test_tw_day_trade_cancels_entry_when_round_trip_valuation_is_nonfinite(
     assert not active.settlement_default[0].item()
 
 
+def test_tw_day_trade_two_sided_target_fails_flat_when_one_side_cannot_open() -> None:
+    target = torch.tensor([[0.5, -0.5]], dtype=torch.float64)
+    mask = torch.ones_like(target, dtype=torch.bool)
+    buy_open = torch.tensor([[False, True]])
+
+    result = run_tw_day_trade_continuous(
+        target,
+        torch.zeros_like(target),
+        mask,
+        mask,
+        mask,
+        mask,
+        mask,
+        torch.zeros(2, dtype=torch.float64),
+        torch.zeros(2, dtype=torch.float64),
+        day_trade_can_buy_open_mask=buy_open,
+        day_trade_can_sell_open_mask=mask,
+    )
+
+    torch.testing.assert_close(result.weights_history, torch.zeros_like(target))
+    assert result.turnovers[0].item() == pytest.approx(0.0)
+
+
+def test_tw_day_trade_two_sided_target_scales_better_filled_side_down() -> None:
+    target = torch.tensor([[0.5, -0.5]], dtype=torch.float64)
+    mask = torch.ones_like(target, dtype=torch.bool)
+
+    result = run_tw_day_trade_continuous(
+        target,
+        torch.zeros_like(target),
+        mask,
+        mask,
+        mask,
+        mask,
+        mask,
+        torch.zeros(2, dtype=torch.float64),
+        torch.zeros(2, dtype=torch.float64),
+        day_trade_can_buy_open_mask=mask,
+        day_trade_can_sell_open_mask=mask,
+        # One-leg volume capacities become 0.1 long and 0.5 short positions.
+        volume_limit_weights=torch.tensor([[0.2, 1.0]], dtype=torch.float64),
+    )
+
+    torch.testing.assert_close(
+        result.weights_history,
+        torch.tensor([[0.1, -0.1]], dtype=torch.float64),
+    )
+
+
 def test_tw_day_trade_open_sizing_is_invariant_to_the_later_close() -> None:
     mask = torch.ones((1, 1), dtype=torch.bool)
 

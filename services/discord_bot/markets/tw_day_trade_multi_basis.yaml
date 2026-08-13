@@ -5,43 +5,31 @@ market_type: tw
 timezone: Asia/Taipei
 open_time: "09:00"
 close_time: "13:30"
+schedule_time: "09:00"
+preopen_prepare_time: "08:30"
 summary_time: "14:00"
 data_ready_time: "13:40"
 freshness_max_lag_days: 3
 freshness_scan_limit: 0
 holidays: []
 initial_capital: 10000000.0
+day_trade_simulation_enabled: true
+day_trade_simulation_state_dir: artifacts/live/tw_day_trade_simulation
+day_trade_rule_data_dir: /srv/stockagent-live/data_tw_public
+day_trade_quote_interval_seconds: 60
 
-# This model shares the canonical TW public data layer with the other TW
-# day-trade modes. Users opt in through commands/subscriptions; it has no
-# independent automatic broadcast schedule.
+# This model shares the canonical TW public data layer with the other modes.
+# 09:00 is a gate; entry uses a causally later executable best quote.
 pre_signal_command:
   - "{python}"
-  - downloader/download_tw_official_data.py
-  - --mode
-  - daily
+  - scripts/refresh_tw_public_live_snapshot.py
   - --config
-  - configs/markets/tw_public_multi_basis_online_complete.yaml
-  - --public-dir
-  - data_tw_public
-  - --stock-root
-  - data_tw_public/stocks
-  - --public-workers
-  - "2"
-  - --date-workers
-  - "4"
-  - --workers
-  - "8"
-  - --ohlcv-fallback
-  - none
-  - --fallback-start-date
-  - "2000-01-01"
-  - --skip-raw
-pre_signal_timeout_seconds: 1800
+  - configs/markets/tw_day_trade_10m.yaml
+pre_signal_timeout_seconds: 14400
 previous_signal_backfill_limit: 512
 
 model_selection_path: ../models/tw_day_trade_multi_basis.yaml
-config_path: configs/markets/tw_public_multi_basis_online_complete.yaml
+config_path: configs/deployments/tw_day_trade_multi_basis_fold11.yaml
 output_dir: artifacts/markets/tw_public_candles_multi_basis_online_complete_raw_feature_input_lookback32_v5
 live_output_dir: artifacts/live_signals
 fold_id: 11

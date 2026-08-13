@@ -1386,20 +1386,16 @@ def _is_usd_trading_pair(path: Path) -> bool:
     return _symbol_name_from_path(path).upper().endswith("USD")
 
 
-def _tw_tick_size(price: np.ndarray) -> np.ndarray:
-    """TWSE tick size by price bucket (vectorized)."""
+def _tw_tick_size(
+    price: np.ndarray,
+    dates: np.ndarray | None = None,
+) -> np.ndarray:
+    """Regular-equity tick size under the TW rule active on each session."""
     if _panel_numba is not None:
-        return _panel_numba.tw_tick_size(price)
-    p = np.asarray(price, dtype=np.float64)
-    tick = np.full(p.shape, np.nan, dtype=np.float64)
-    valid = np.isfinite(p) & (p > 0.0)
-    tick[valid] = 5.0
-    tick[valid & (p < 1000.0)] = 1.0
-    tick[valid & (p < 500.0)] = 0.5
-    tick[valid & (p < 100.0)] = 0.1
-    tick[valid & (p < 50.0)] = 0.05
-    tick[valid & (p < 10.0)] = 0.01
-    return tick
+        return _panel_numba.tw_tick_size(price, dates)
+    from stockagent.data.tw_price_rules import tick_size_numpy
+
+    return tick_size_numpy(price, dates)
 
 
 def _to_float_array(values: Any, rows: int | None = None, default: float = np.nan) -> np.ndarray:
@@ -1447,29 +1443,37 @@ def _frame_column_bool_array(frame: Any, name: str, *, default: bool = False) ->
     return np.asarray(frame[name], dtype=bool)
 
 
-def _tw_limit_price(prev_close: np.ndarray, ratio: float) -> np.ndarray:
-    """Compute TW daily limit price from theoretical price.
+def _tw_limit_price(
+    prev_close: np.ndarray,
+    ratio: float,
+    dates: np.ndarray | None = None,
+) -> np.ndarray:
+    """Compute dated TW daily limit price from a reference price.
 
     TW limit-up prices are rounded down to the nearest tick, while limit-down
     prices are rounded up to the nearest tick. The asymmetry matters around
     half-tick boundaries, e.g. prev_close=524 -> theoretical down=471.6 ->
-    limit-down=472.0.
+    limit-down=472.0.  Historical rows use the pre-2005 tick buckets and the
+    pre-2015 7% limit rather than projecting today's rules backward.
     """
     if _panel_numba is not None:
-        return _panel_numba.tw_limit_price(prev_close, ratio)
-    prev = _to_float_array(prev_close)
-    theoretical = prev * ratio
-    tick = _tw_tick_size(theoretical)
+        return _panel_numba.tw_limit_price(prev_close, ratio, dates)
+    from stockagent.data.tw_price_rules import limit_price_numpy
 
-    out = np.full(theoretical.shape, np.nan, dtype=np.float64)
-    valid = np.isfinite(theoretical) & np.isfinite(tick) & (tick > 0.0)
-    scaled = theoretical[valid] / tick[valid]
-    # Small epsilon avoids floating-point edge cases around exact tick boundaries.
-    if float(ratio) < 1.0:
-        out[valid] = np.ceil(scaled - 1e-12) * tick[valid]
+    return limit_price_numpy(_to_float_array(prev_close), ratio, dates)
+
+
+def _frame_date_array(frame: Any) -> np.ndarray | None:
+    if "date" not in frame.columns:
+        return None
+    if pl is not None and isinstance(frame, pl.DataFrame):
+        values = frame.get_column("date").to_numpy()
     else:
-        out[valid] = np.floor(scaled + 1e-12) * tick[valid]
-    return _round_half_up(out, decimals=2)
+        values = np.asarray(frame["date"])
+    try:
+        return np.asarray(values).astype("datetime64[D]", copy=False)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("TW limit-rule frame dates must be datetime-like") from exc
 
 
 def _tw_reference_price_for_limits(frame: Any, prev_close_raw: np.ndarray) -> np.ndarray:
@@ -1496,7 +1500,7 @@ def _tw_reference_price_for_limits(frame: Any, prev_close_raw: np.ndarray) -> np
 
 
 def _compute_tw_limit_masks(frame: Any) -> tuple[np.ndarray, np.ndarray]:
-    """Return (can_buy, can_sell) masks under TW 10% daily limit assumptions.
+    """Return dated (can_buy, can_sell) masks under TW daily limit rules.
 
     Rule:
     - limit-up day: cannot buy, can sell
@@ -1504,6 +1508,7 @@ def _compute_tw_limit_masks(frame: Any) -> tuple[np.ndarray, np.ndarray]:
     """
     tradable = _frame_column_bool_array(frame, "tradable")
     close_raw = _round_half_up(_frame_column_float_array(frame, "close_raw"), decimals=2)
+    dates = _frame_date_array(frame)
     if _panel_numba is not None:
         dividends = (
             _frame_column_float_array(frame, "Dividends")
@@ -1515,12 +1520,18 @@ def _compute_tw_limit_masks(frame: Any) -> tuple[np.ndarray, np.ndarray]:
             if "Stock Splits" in frame.columns
             else np.full(tradable.shape, np.nan, dtype=np.float64)
         )
-        return _panel_numba.tw_limit_masks_from_arrays(close_raw, tradable, dividends, stock_splits)
+        return _panel_numba.tw_limit_masks_from_arrays(
+            close_raw,
+            tradable,
+            dividends,
+            stock_splits,
+            dates,
+        )
     prev_close_raw = _shift_array(close_raw, 1)
     reference_price = _tw_reference_price_for_limits(frame, prev_close_raw)
 
-    limit_up_price = _tw_limit_price(reference_price, 1.10)
-    limit_down_price = _tw_limit_price(reference_price, 0.90)
+    limit_up_price = _tw_limit_price(reference_price, 1.10, dates)
+    limit_down_price = _tw_limit_price(reference_price, 0.90, dates)
 
     # Use small price tolerance to absorb source rounding noise.
     is_limit_up = (close_raw >= (limit_up_price - 1e-9)) & (reference_price > 0.0)
@@ -1935,9 +1946,16 @@ def _tw_limit_masks_from_arrays(
     tradable: np.ndarray,
     dividends: np.ndarray,
     stock_splits: np.ndarray,
+    dates: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     if _panel_numba is not None:
-        return _panel_numba.tw_limit_masks_from_arrays(close_raw, tradable, dividends, stock_splits)
+        return _panel_numba.tw_limit_masks_from_arrays(
+            close_raw,
+            tradable,
+            dividends,
+            stock_splits,
+            dates,
+        )
     close = _round_half_up(np.asarray(close_raw, dtype=np.float64), decimals=2)
     prev_close = _shift_array(close, 1)
     reference = np.asarray(prev_close, dtype=np.float64).copy()
@@ -1950,8 +1968,8 @@ def _tw_limit_masks_from_arrays(
     reference[valid_split] = reference[valid_split] / splits[valid_split]
     reference = np.where(reference > 0.0, reference, np.nan)
 
-    limit_up = _tw_limit_price(reference, 1.10).astype(np.float64, copy=False)
-    limit_down = _tw_limit_price(reference, 0.90).astype(np.float64, copy=False)
+    limit_up = _tw_limit_price(reference, 1.10, dates).astype(np.float64, copy=False)
+    limit_down = _tw_limit_price(reference, 0.90, dates).astype(np.float64, copy=False)
 
     base = np.asarray(tradable, dtype=bool)
     is_limit_up = np.isfinite(reference) & (close >= (limit_up - 1e-9))
@@ -1965,6 +1983,7 @@ def _tw_open_limit_masks_from_arrays(
     tradable: np.ndarray,
     dividends: np.ndarray,
     stock_splits: np.ndarray,
+    dates: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return open-side masks using the prior close reference for session t.
 
@@ -1993,8 +2012,8 @@ def _tw_open_limit_masks_from_arrays(
     reference[valid_split] = reference[valid_split] / splits[valid_split]
     reference = np.where(reference > 0.0, reference, np.nan)
 
-    limit_up = _tw_limit_price(reference, 1.10).astype(np.float64, copy=False)
-    limit_down = _tw_limit_price(reference, 0.90).astype(np.float64, copy=False)
+    limit_up = _tw_limit_price(reference, 1.10, dates).astype(np.float64, copy=False)
+    limit_down = _tw_limit_price(reference, 0.90, dates).astype(np.float64, copy=False)
     if np.asarray(tradable).shape != open_px.shape:
         raise ValueError("tradable and open prices must share shape")
     # Do not intersect with the full-session tradable flag: that flag depends
@@ -2219,7 +2238,13 @@ def _symbol_arrays_from_arrow_table(
         if not bool(valid_dates.all()):
             dividends = dividends[valid_dates]
             stock_splits = stock_splits[valid_dates]
-        can_buy_mask, can_sell_mask = _tw_limit_masks_from_arrays(close_px, tradable, dividends, stock_splits)
+        can_buy_mask, can_sell_mask = _tw_limit_masks_from_arrays(
+            close_px,
+            tradable,
+            dividends,
+            stock_splits,
+            dates,
+        )
         day_trade_can_buy_open_mask, day_trade_can_sell_open_mask = (
             _tw_open_limit_masks_from_arrays(
                 open_px,
@@ -2227,6 +2252,7 @@ def _symbol_arrays_from_arrow_table(
                 tradable,
                 dividends,
                 stock_splits,
+                dates,
             )
         )
     elif tradable_mode == "tradable":
@@ -2453,7 +2479,13 @@ def _load_symbol_arrays_polars_lazy(
         if not bool(valid_dates.all()):
             dividends = dividends[valid_dates]
             stock_splits = stock_splits[valid_dates]
-        can_buy_mask, can_sell_mask = _tw_limit_masks_from_arrays(close_px, tradable, dividends, stock_splits)
+        can_buy_mask, can_sell_mask = _tw_limit_masks_from_arrays(
+            close_px,
+            tradable,
+            dividends,
+            stock_splits,
+            dates,
+        )
         day_trade_can_buy_open_mask, day_trade_can_sell_open_mask = (
             _tw_open_limit_masks_from_arrays(
                 open_px,
@@ -2461,6 +2493,7 @@ def _load_symbol_arrays_polars_lazy(
                 tradable,
                 dividends,
                 stock_splits,
+                dates,
             )
         )
     elif tradable_mode == "tradable":
@@ -3536,7 +3569,7 @@ def load_cached_panel(
     backend_key = (
         f"{selected_backend}|benchmark={benchmark_name}|"
         f"usd_only={usd_only_trading_pairs}|tradable_mode={tradable_mode}|"
-        f"tw_limit_rounding=v2|"
+        f"tw_price_rules=v3|"
         f"trading_volume_policy={trading_volume_policy}|security_filter={security_filter}|"
         f"external={external_key}|external_market_symbol={external_market_symbol}|"
         f"external_features={bool(external_include_features)}|"
@@ -4879,7 +4912,7 @@ def build_panel(
     backend_key = (
         f"{selected_backend}|benchmark={benchmark_name}|"
         f"usd_only={usd_only_trading_pairs}|tradable_mode={tradable_mode}|"
-        f"tw_limit_rounding=v2|"
+        f"tw_price_rules=v3|"
         f"trading_volume_policy={trading_volume_policy}|security_filter={security_filter}|"
         f"external={external_key}|external_market_symbol={external_market_symbol}|"
         f"external_features={bool(external_include_features)}|"

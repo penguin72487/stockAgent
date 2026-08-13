@@ -93,6 +93,7 @@ def _load_tw_symbol_rows(symbol: str) -> dict[str, dict[str, float]]:
         _TW_SYMBOL_CACHE[key] = {}
         return {}
     dates = [_date_key(value) for value in df.get_column("date").to_list()]
+    rule_dates = df.get_column("date").to_numpy().astype("datetime64[D]", copy=False)
     close_values = df.get_column("close").cast(pl.Float64, strict=False).to_numpy()
     dividends = (
         df.get_column("Dividends").cast(pl.Float64, strict=False).fill_null(0.0).to_numpy()
@@ -111,8 +112,8 @@ def _load_tw_symbol_rows(symbol: str) -> dict[str, dict[str, float]]:
     valid_split = np.isfinite(splits) & (splits > 0.0) & (splits != 1.0)
     reference[valid_split] = reference[valid_split] / splits[valid_split]
     reference = np.where(reference > 0.0, reference, np.nan)
-    limit_up_values = _tw_limit_price(reference, 1.10)
-    limit_down_values = _tw_limit_price(reference, 0.90)
+    limit_up_values = _tw_limit_price(reference, 1.10, rule_dates)
+    limit_down_values = _tw_limit_price(reference, 0.90, rule_dates)
     rows: dict[str, dict[str, float]] = {}
     for idx, date_key in enumerate(dates):
         rows[date_key] = {

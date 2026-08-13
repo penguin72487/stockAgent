@@ -1043,9 +1043,30 @@ def test_tw_day_trade_short_and_per_symbol_lot_override() -> None:
         initial_cash=300_000.0,
     )
 
-    # Each side is notionally 150,000 at the open: -1,000 shares and +1,500.
-    np.testing.assert_array_equal(result.positions[0], [-1_000, 1_500])
+    # The short side can express only one 1,000-share lot (100,000).  The
+    # better-filled long side is reduced by one 500-share lot so whole-lot
+    # rounding cannot turn a balanced request into a net-long execution.
+    np.testing.assert_array_equal(result.positions[0], [-1_000, 1_000])
     assert np.all(result.final_state.holdings == 0)
+    _assert_flat_ledger_identity(result)
+
+
+def test_tw_day_trade_integer_two_sided_target_fails_flat_when_one_side_has_no_lot() -> None:
+    targets = np.array([[0.5, -0.5]])
+    result = run_tw_day_trade_integer(
+        targets,
+        np.array([[100.0, 100.0]]),
+        np.array([[101.0, 99.0]]),
+        buy_fee_rates=0.0,
+        sell_fee_rates=0.0,
+        eligibility_mask=np.ones((1, 2), dtype=bool),
+        can_short_open_mask=np.array([[True, False]], dtype=bool),
+        **_open_masks(targets),
+        initial_cash=1_000_000.0,
+    )
+
+    np.testing.assert_array_equal(result.positions[0], [0, 0])
+    assert result.turnover[0] == pytest.approx(0.0)
     _assert_flat_ledger_identity(result)
 
 

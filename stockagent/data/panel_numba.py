@@ -5,6 +5,12 @@ import math
 import numpy as np
 import numba as nb
 
+from stockagent.data.tw_price_rules import (
+    TW_LIMIT_10_PERCENT_EFFECTIVE_ORDINAL,
+    TW_TICK_RULE_2005_EFFECTIVE_ORDINAL,
+    trade_date_ordinals,
+)
+
 
 @nb.njit(parallel=True, cache=True)
 def _round_half_up_flat(values: np.ndarray, factor: float) -> np.ndarray:
@@ -20,49 +26,66 @@ def _round_half_up_flat(values: np.ndarray, factor: float) -> np.ndarray:
     return out
 
 
+@nb.njit(inline="always")
+def _tw_tick_size_scalar(value: float, date_ordinal: int) -> float:
+    if not math.isfinite(value) or value <= 0.0:
+        return np.nan
+    if date_ordinal < TW_TICK_RULE_2005_EFFECTIVE_ORDINAL:
+        if value < 5.0:
+            return 0.01
+        if value < 15.0:
+            return 0.05
+        if value < 50.0:
+            return 0.1
+        if value < 150.0:
+            return 0.5
+        if value < 1000.0:
+            return 1.0
+        return 5.0
+    if value < 10.0:
+        return 0.01
+    if value < 50.0:
+        return 0.05
+    if value < 100.0:
+        return 0.1
+    if value < 500.0:
+        return 0.5
+    if value < 1000.0:
+        return 1.0
+    return 5.0
+
+
+@nb.njit(inline="always")
+def _tw_dated_limit_ratio(ratio: float, date_ordinal: int) -> float:
+    if date_ordinal < TW_LIMIT_10_PERCENT_EFFECTIVE_ORDINAL:
+        return 1.07 if ratio > 1.0 else 0.93
+    return 1.10 if ratio > 1.0 else 0.90
+
+
 @nb.njit(parallel=True, cache=True)
-def _tw_tick_size_flat(price: np.ndarray) -> np.ndarray:
+def _tw_tick_size_flat(price: np.ndarray, date_ordinals: np.ndarray) -> np.ndarray:
     out = np.empty(price.size, dtype=np.float64)
     for idx in nb.prange(price.size):
         value = float(price[idx])
-        if not math.isfinite(value) or value <= 0.0:
-            out[idx] = np.nan
-        elif value < 10.0:
-            out[idx] = 0.01
-        elif value < 50.0:
-            out[idx] = 0.05
-        elif value < 100.0:
-            out[idx] = 0.1
-        elif value < 500.0:
-            out[idx] = 0.5
-        elif value < 1000.0:
-            out[idx] = 1.0
-        else:
-            out[idx] = 5.0
+        out[idx] = _tw_tick_size_scalar(value, int(date_ordinals[idx]))
     return out
 
 
 @nb.njit(parallel=True, cache=True)
-def _tw_limit_price_flat(prev_close: np.ndarray, ratio: float) -> np.ndarray:
+def _tw_limit_price_flat(
+    prev_close: np.ndarray,
+    ratio: float,
+    date_ordinals: np.ndarray,
+) -> np.ndarray:
     out = np.empty(prev_close.size, dtype=np.float64)
     for idx in nb.prange(prev_close.size):
         prev = float(prev_close[idx])
-        theoretical = prev * ratio
+        dated_ratio = _tw_dated_limit_ratio(ratio, int(date_ordinals[idx]))
+        theoretical = prev * dated_ratio
         if not math.isfinite(theoretical) or theoretical <= 0.0:
             out[idx] = np.nan
             continue
-        if theoretical < 10.0:
-            tick = 0.01
-        elif theoretical < 50.0:
-            tick = 0.05
-        elif theoretical < 100.0:
-            tick = 0.1
-        elif theoretical < 500.0:
-            tick = 0.5
-        elif theoretical < 1000.0:
-            tick = 1.0
-        else:
-            tick = 5.0
+        tick = _tw_tick_size_scalar(theoretical, int(date_ordinals[idx]))
         if ratio < 1.0:
             rounded = math.ceil((theoretical / tick) - 1e-12) * tick
         else:
@@ -125,6 +148,7 @@ def _tw_limit_masks_kernel(
     tradable: np.ndarray,
     dividends: np.ndarray,
     stock_splits: np.ndarray,
+    date_ordinals: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
     rows = close_raw.size
     can_buy = np.empty(rows, dtype=np.bool_)
@@ -169,32 +193,11 @@ def _tw_limit_masks_kernel(
         is_limit_up = False
         is_limit_down = False
         if math.isfinite(reference) and reference > 0.0 and math.isfinite(close):
-            theoretical_up = reference * 1.10
-            theoretical_down = reference * 0.90
-            if theoretical_up < 10.0:
-                tick_up = 0.01
-            elif theoretical_up < 50.0:
-                tick_up = 0.05
-            elif theoretical_up < 100.0:
-                tick_up = 0.1
-            elif theoretical_up < 500.0:
-                tick_up = 0.5
-            elif theoretical_up < 1000.0:
-                tick_up = 1.0
-            else:
-                tick_up = 5.0
-            if theoretical_down < 10.0:
-                tick_down = 0.01
-            elif theoretical_down < 50.0:
-                tick_down = 0.05
-            elif theoretical_down < 100.0:
-                tick_down = 0.1
-            elif theoretical_down < 500.0:
-                tick_down = 0.5
-            elif theoretical_down < 1000.0:
-                tick_down = 1.0
-            else:
-                tick_down = 5.0
+            date_ordinal = int(date_ordinals[idx])
+            theoretical_up = reference * _tw_dated_limit_ratio(1.10, date_ordinal)
+            theoretical_down = reference * _tw_dated_limit_ratio(0.90, date_ordinal)
+            tick_up = _tw_tick_size_scalar(theoretical_up, date_ordinal)
+            tick_down = _tw_tick_size_scalar(theoretical_down, date_ordinal)
 
             limit_up = math.floor((theoretical_up / tick_up) + 1e-12) * tick_up
             limit_down = math.ceil((theoretical_down / tick_down) - 1e-12) * tick_down
@@ -218,14 +221,26 @@ def round_half_up(values: np.ndarray, decimals: int = 2) -> np.ndarray:
     return _round_half_up_flat(arr.reshape(-1), factor).reshape(arr.shape)
 
 
-def tw_tick_size(price: np.ndarray) -> np.ndarray:
+def tw_tick_size(price: np.ndarray, dates: np.ndarray | None = None) -> np.ndarray:
     arr = _as_float64_contiguous(price)
-    return _tw_tick_size_flat(arr.reshape(-1)).reshape(arr.shape)
+    ordinals = np.ascontiguousarray(
+        trade_date_ordinals(dates, arr.shape), dtype=np.int64
+    )
+    return _tw_tick_size_flat(arr.reshape(-1), ordinals.reshape(-1)).reshape(arr.shape)
 
 
-def tw_limit_price(prev_close: np.ndarray, ratio: float) -> np.ndarray:
+def tw_limit_price(
+    prev_close: np.ndarray,
+    ratio: float,
+    dates: np.ndarray | None = None,
+) -> np.ndarray:
     arr = _as_float64_contiguous(prev_close)
-    return _tw_limit_price_flat(arr.reshape(-1), float(ratio)).reshape(arr.shape)
+    ordinals = np.ascontiguousarray(
+        trade_date_ordinals(dates, arr.shape), dtype=np.int64
+    )
+    return _tw_limit_price_flat(
+        arr.reshape(-1), float(ratio), ordinals.reshape(-1)
+    ).reshape(arr.shape)
 
 
 def shift_array(values: np.ndarray, periods: int) -> np.ndarray:
@@ -257,11 +272,17 @@ def tw_limit_masks_from_arrays(
     tradable: np.ndarray,
     dividends: np.ndarray,
     stock_splits: np.ndarray,
+    dates: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     close = _as_float64_contiguous(close_raw).reshape(-1)
     base = np.ascontiguousarray(np.asarray(tradable, dtype=np.bool_)).reshape(-1)
     div = _as_float64_contiguous(dividends).reshape(-1)
     splits = _as_float64_contiguous(stock_splits).reshape(-1)
+    ordinals = np.ascontiguousarray(
+        trade_date_ordinals(dates, np.asarray(close_raw).shape), dtype=np.int64
+    ).reshape(-1)
     if not (close.size == base.size == div.size == splits.size):
         raise ValueError("TW limit mask inputs must have the same flattened length")
-    return _tw_limit_masks_kernel(close, base, div, splits)
+    if ordinals.size != close.size:
+        raise ValueError("TW limit mask dates must match close prices")
+    return _tw_limit_masks_kernel(close, base, div, splits, ordinals)
