@@ -1,6 +1,7 @@
 "use strict";
 
-const REFRESH_MS = 5000;
+const SUMMARY_REFRESH_MS = 5000;
+const FULL_REFRESH_MS = 15000;
 const SIGNAL_PAGE_SIZE = 250;
 const POSITION_PAGE_SIZE = 250;
 const MAX_EVENT_ROWS = 250;
@@ -8,15 +9,20 @@ const COLORS = ["#37d3ff", "#5ee0a0", "#a98cff", "#f5bd4f", "#ff7ac8", "#73e6d1"
 let snapshot = null;
 let lastFetchMs = null;
 let refreshInFlight = false;
+let summaryInFlight = false;
 let lastRenderedRevision = null;
+let lastFilterRevision = null;
 let signalRows = [];
 let signalDirectionSummary = {};
 let signalTotal = 0;
 let signalHasMore = false;
 let signalRecordCount = null;
 let signalLoading = false;
+let signalLoadError = "";
 let signalRequestSequence = 0;
 let signalFilterTimer = null;
+let signalAbortController = null;
+let filterAnimationFrame = null;
 let positionVisibleRows = POSITION_PAGE_SIZE;
 
 const $ = (id) => document.getElementById(id);
@@ -75,7 +81,8 @@ const countdown = (value) => {
 };
 const progress = (ratio, kind = "") => {
   const bounded = clampRatio(ratio);
-  return `<div class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${Math.round(bounded * 100)}"><span class="${esc(kind)}" style="width:${(bounded * 100).toFixed(2)}%"></span></div>`;
+  const value = (bounded * 100).toFixed(2);
+  return `<progress class="progress-track ${esc(kind)}" max="100" value="${value}" aria-label="${value}%"></progress>`;
 };
 const directionPair = (row = {}) => `多 ${pct(row.long_gross)} / 空 ${pct(row.short_gross)} · ${number(row.long_count)} / ${number(row.short_count)} 檔`;
 
@@ -142,7 +149,12 @@ function renderOverview(data) {
     && !String(mode.engine_status || "").startsWith("blocked")
   )).length;
   const openPositions = (data.positions || []).filter((row) => Number(row.signed_shares || 0) !== 0);
-  const stalePositions = openPositions.filter((row) => row.valuation_stale).length;
+  const openPositionCount = Number.isFinite(Number(data.open_position_count))
+    ? Number(data.open_position_count)
+    : openPositions.length;
+  const stalePositions = Number.isFinite(Number(data.stale_position_count))
+    ? Number(data.stale_position_count)
+    : openPositions.filter((row) => row.valuation_stale).length;
   const pnlValues = modes.map((mode) => {
     const initial = Number(mode.initial_capital_twd);
     const equity = Number(mode.total_equity_twd);
@@ -156,7 +168,7 @@ function renderOverview(data) {
   const pnlKind = pnlClass(totalPnl);
   const cards = [
     ["模式狀態", `${healthyModes}/${modes.length} 可解讀`, healthyModes === modes.length ? "所有 checkpoint 與執行狀態正常" : "有模式需要查看上方警示", healthKind],
-    ["今日持倉", `${number(openPositions.length)} 個`, stalePositions ? `${number(stalePositions)} 個估值延用` : "目前估值皆有新鮮報價", stalePositions ? "warn" : "good"],
+    ["今日持倉", `${number(openPositionCount)} 個`, stalePositions ? `${number(stalePositions)} 個估值延用` : "目前估值皆有新鮮報價", stalePositions ? "warn" : "good"],
     ["四模式淨損益", totalPnl == null ? "—" : `${totalPnl >= 0 ? "+" : ""}${compactMoney(totalPnl)}`, "四個獨立模擬帳本直接加總", pnlKind],
     ["報酬範圍", best == null ? "—" : `${best >= 0 ? "+" : ""}${displayPct(best)} ～ ${worst >= 0 ? "+" : ""}${displayPct(worst)}`, "各模式以自己的初始資金為分母", best != null && worst < 0 ? "warn" : pnlClass(best)],
   ];
@@ -209,10 +221,14 @@ function renderHeader(data) {
 function syncFilters(data) {
   const mode = $("mode-filter");
   const previous = mode.value;
-  mode.innerHTML = `<option value="all">全部模式</option>` + data.modes.map((row) => `<option value="${esc(row.market)}">${esc(row.label || row.market)}</option>`).join("");
-  if ([...mode.options].some((option) => option.value === previous)) mode.value = previous;
+  const revision = JSON.stringify(data.modes.map((row) => [row.market, row.label]));
+  if (revision !== lastFilterRevision) {
+    mode.innerHTML = `<option value="all">全部模式</option>` + data.modes.map((row) => `<option value="${esc(row.market)}">${esc(row.label || row.market)}</option>`).join("");
+    if ([...mode.options].some((option) => option.value === previous)) mode.value = previous;
+    lastFilterRevision = revision;
+  }
   const date = $("date-filter");
-  date.innerHTML = `<option value="${esc(data.session_date)}">${esc(data.session_date)}</option>`;
+  if (date.value !== data.session_date) date.innerHTML = `<option value="${esc(data.session_date)}">${esc(data.session_date)}</option>`;
 }
 
 function renderModes(data) {
@@ -264,7 +280,7 @@ function renderOperations(data) {
     ["盤前預熱", `${readyModes}/${totalModes || 0} READY`, warm.status || "pending", warmKind],
     ["目前階段", session.label || "—", `下一步 ${session.next_milestone_label || "—"} · ${countdown(session.next_milestone_at)}`, phaseKind],
     ["帳本心跳", `${sourceNumber(data.source_age_seconds)} 秒`, `目標每 ${number(session.decision_interval_seconds || 60)} 秒`, heartbeatKind],
-    ["面板 API", lastFetchMs == null ? "—" : `${number(lastFetchMs, 1)} ms`, `每 ${number(REFRESH_MS / 1000)} 秒刷新`, lastFetchMs != null && lastFetchMs > 1000 ? "warn" : "good"],
+    ["面板 API", lastFetchMs == null ? "—" : `${number(lastFetchMs, 1)} ms`, `摘要每 ${number(SUMMARY_REFRESH_MS / 1000)} 秒刷新`, lastFetchMs != null && lastFetchMs > 1000 ? "warn" : "good"],
   ].map(([label, value, note, kind]) => `<div class="operation-kpi"><span>${esc(label)}</span><strong>${esc(value)}</strong><small class="${esc(kind)}">${esc(note)}</small></div>`).join("");
 
   const workflowRows = [
@@ -348,7 +364,7 @@ function renderChart(data) {
     for (const row of valid.filter((item) => item.valuation_stale)) html += `<circle class="stale-dot" cx="${x(row.minute)}" cy="${y(row.return_pct)}" r="3"></circle>`;
     const latest = valid.at(-1);
     const latestText = latest ? `${Number(latest.return_pct) >= 0 ? "+" : ""}${sourceNumber(latest.return_pct)}%` : "—";
-    legend.push(`<span><i style="background:${color}"></i>${esc(labels.get(market) || market)} <strong class="${pnlClass(latest?.return_pct)}">${esc(latestText)}</strong></span>`);
+    legend.push(`<span><i class="series-${index % COLORS.length}"></i>${esc(labels.get(market) || market)} <strong class="${pnlClass(latest?.return_pct)}">${esc(latestText)}</strong></span>`);
   });
   svg.innerHTML = html;
   $("chart-legend").innerHTML = legend.join("");
@@ -382,7 +398,9 @@ function renderPositions(data) {
 }
 
 function renderSignals() {
-  $("signal-count").textContent = `${signalRows.length} / ${signalTotal} 筆`;
+  $("signal-count").textContent = signalLoadError
+    ? `${signalRows.length} / ${signalTotal} 筆 · 等待重試`
+    : `${signalRows.length} / ${signalTotal} 筆`;
   const loadMore = $("load-more-signals");
   loadMore.classList.toggle("hidden", !signalHasMore);
   loadMore.disabled = signalLoading;
@@ -395,13 +413,17 @@ function renderSignals() {
     ["整張／深度後", preBalance],
     ["方向平衡後", actual],
   ].map(([label, row]) => `<div><span>${esc(label)}</span><strong>${esc(directionPair(row))}</strong></div>`).join("");
-  $("signal-body").innerHTML = signalRows.map((row) => `<tr>
+  const errorRow = signalLoadError
+    ? `<tr class="signal-load-error"><td colspan="10">${esc(signalLoadError)}</td></tr>`
+    : "";
+  const rowHtml = signalRows.map((row) => `<tr>
     <td>${shortTime(row.signal_at)}</td><td>${esc(row.market)}</td><td><strong>${esc(row.symbol)}</strong><small>${esc(row.name || "")}</small></td>
 	    <td>${esc(row.side)}</td><td>${sourceNumber(row.raw_score ?? row.score)}</td><td>${pct(row.target_weight)}</td><td>${number(row.filled_shares)} / ${number(row.requested_shares)}<small>L1 上限 ${number(row.top_book_capacity_shares)}</small></td>
 	    <td>${sourceNumber(row.bid)} / ${sourceNumber(row.ask)}<small>${sourceNumber(row.bid_volume_lots)} / ${sourceNumber(row.ask_volume_lots)} 張 · ${shortTime(row.quote_at)}</small></td>
     <td>${row.day_trade_eligible ? badge(row.sell_first_allowed ? "可雙向" : "僅買先", row.sell_first_allowed ? "good" : "warn") : badge("不可當沖", "bad")}</td>
 	    <td>${badge(row.status, row.status === "ready" ? "good" : ["partial_depth", "partial_directional_mix"].includes(row.status) ? "warn" : row.status === "hold" ? "" : "bad")}<small>${esc(row.reason || "")}</small></td>
-  </tr>`).join("") || `<tr><td colspan="10">目前沒有符合篩選的訊號</td></tr>`;
+  </tr>`).join("");
+  $("signal-body").innerHTML = errorRow + (rowHtml || `<tr><td colspan="10">目前沒有符合篩選的訊號</td></tr>`);
 }
 
 function renderEvents(data) {
@@ -458,6 +480,9 @@ function render({heavy = true} = {}) {
 
 async function loadSignals({append = false} = {}) {
   if (!snapshot) return;
+  if (signalAbortController) signalAbortController.abort();
+  signalAbortController = new AbortController();
+  const controller = signalAbortController;
   const sequence = ++signalRequestSequence;
   const params = new URLSearchParams({
     mode: selectedMode(),
@@ -469,10 +494,11 @@ async function loadSignals({append = false} = {}) {
   signalLoading = true;
   renderSignals();
   try {
-    const response = await fetch(`api/signals?${params.toString()}`, {cache: "no-cache"});
+    const response = await fetch(`api/signals?${params.toString()}`, {cache: "default", signal: controller.signal});
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const page = await response.json();
     if (sequence !== signalRequestSequence) return;
+    signalLoadError = "";
     signalRows = append ? signalRows.concat(page.rows || []) : (page.rows || []);
     signalTotal = Number(page.total || 0);
     signalHasMore = Boolean(page.has_more);
@@ -480,11 +506,14 @@ async function loadSignals({append = false} = {}) {
     signalDirectionSummary = page.direction_summary || {};
   } catch (error) {
     if (sequence !== signalRequestSequence) return;
-    const alert = $("alert");
-    alert.classList.remove("hidden");
-    alert.textContent = `訊號分頁讀取失敗：${error}`;
+    if (error?.name === "AbortError") return;
+    signalLoadError = String(error).includes("HTTP 429")
+      ? "請求較密集，訊號明細會在下一輪自動重試；上方帳本摘要不受影響。"
+      : `訊號明細暫時無法更新：${error}`;
+    signalRecordCount = null;
   } finally {
     if (sequence === signalRequestSequence) {
+      if (signalAbortController === controller) signalAbortController = null;
       signalLoading = false;
       renderSignals();
     }
@@ -497,7 +526,7 @@ async function refresh() {
   refreshInFlight = true;
   try {
     const started = performance.now();
-    const response = await fetch("api/status", {cache: "no-cache"});
+    const response = await fetch("api/status", {cache: "default"});
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     snapshot = await response.json();
     lastFetchMs = performance.now() - started;
@@ -516,22 +545,55 @@ async function refresh() {
   }
 }
 
-function filtersChanged({debounceSignals = false} = {}) {
+async function refreshSummary() {
+  if (document.hidden || summaryInFlight || refreshInFlight || !snapshot) return;
+  summaryInFlight = true;
+  try {
+    const response = await fetch("api/summary", {cache: "default"});
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    snapshot = {...snapshot, ...(await response.json())};
+    renderHeader(snapshot);
+    renderOverview(snapshot);
+    const currentSignalCount = Number((snapshot.record_counts || {}).signals || 0);
+    if (signalRecordCount == null || currentSignalCount !== signalRecordCount) await loadSignals();
+  } catch (_error) {
+    // The slower full refresh remains the visible availability authority.
+  } finally {
+    summaryInFlight = false;
+  }
+}
+
+function renderFilteredDetails({includeChart = false} = {}) {
+  if (!snapshot) return;
+  if (includeChart) renderChart(snapshot);
+  renderPositions(snapshot);
+  renderEvents(snapshot);
+}
+
+function filtersChanged({debounceSignals = false, includeChart = false} = {}) {
   positionVisibleRows = POSITION_PAGE_SIZE;
-  render({heavy: true});
+  if (filterAnimationFrame != null) cancelAnimationFrame(filterAnimationFrame);
+  if (debounceSignals) {
+    filterAnimationFrame = requestAnimationFrame(() => {
+      filterAnimationFrame = null;
+      renderFilteredDetails({includeChart});
+    });
+  } else {
+    renderFilteredDetails({includeChart});
+  }
   window.clearTimeout(signalFilterTimer);
   if (debounceSignals) signalFilterTimer = window.setTimeout(() => loadSignals(), 180);
   else loadSignals();
 }
 
-$("mode-filter").addEventListener("change", () => filtersChanged());
+$("mode-filter").addEventListener("change", () => filtersChanged({includeChart: true}));
 $("status-filter").addEventListener("change", () => filtersChanged());
 $("symbol-filter").addEventListener("input", () => filtersChanged({debounceSignals: true}));
 $("reset-filters").addEventListener("click", () => {
   $("mode-filter").value = "all";
   $("symbol-filter").value = "";
   $("status-filter").value = "all";
-  filtersChanged();
+  filtersChanged({includeChart: true});
 });
 $("load-more-signals").addEventListener("click", () => loadSignals({append: true}));
 $("load-more-positions").addEventListener("click", () => {
@@ -539,5 +601,7 @@ $("load-more-positions").addEventListener("click", () => {
   renderPositions(snapshot);
 });
 setInterval(() => { $("clock").textContent = new Date().toLocaleString("zh-TW", {timeZone:"Asia/Taipei", hour12:false}); }, 1000);
-document.addEventListener("visibilitychange", () => { if (!document.hidden) refresh(); });
-refresh(); window.setInterval(refresh, REFRESH_MS);
+document.addEventListener("visibilitychange", () => { if (!document.hidden) void refresh(); });
+void refresh();
+window.setInterval(() => void refreshSummary(), SUMMARY_REFRESH_MS);
+window.setInterval(() => void refresh(), FULL_REFRESH_MS);

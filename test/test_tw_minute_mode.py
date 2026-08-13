@@ -15,6 +15,7 @@ import torch
 
 from stockagent.backtest.tw_minute import (
     MinuteExecutionConfig,
+    daily_guided_minute_target_weights,
     execute_minute_target,
     force_close_minute_session,
     initialize_minute_execution_state,
@@ -28,11 +29,13 @@ from stockagent.backtest.tw_execution import effective_fee_rate_vectors
 from stockagent.config import load_config
 from stockagent.data.tw_minute import (
     MINUTE_DATASET_SCHEMA_VERSION,
+    MINUTE_DAILY_GUIDANCE_FEATURE,
     MINUTE_DAILY_OPEN_GAP_FEATURE,
     MINUTE_DEVELOPING_CANDLE_CONTRACT,
     MINUTE_DEVELOPING_CANDLE_FEATURE_COLUMNS,
     MINUTE_FEATURE_COLUMNS,
     MINUTE_FEATURE_STATISTICS_CONTRACT,
+    MinuteDailyGuidance,
     MinuteDatasetIndex,
     MinuteDayPanel,
     MinuteFeatureNormalizer,
@@ -40,6 +43,7 @@ from stockagent.data.tw_minute import (
     _load_minute_short_rules,
     add_developing_daily_candle_features,
     load_minute_dataset_index,
+    minute_trainable_session_summaries,
     minute_static_daily_context_feature_names,
     summarize_minute_sessions_for_next_day,
 )
@@ -52,6 +56,7 @@ from stockagent.training.minute import (
     _fee_schedule,
     _first_calendar_year_indices,
     _global_session_batches,
+    _initialize_daily_guided_minute_head,
     _minute_benchmark_log_return,
     _minute_chunk_training_loss,
     _run_day_batch,
@@ -75,6 +80,39 @@ def _config() -> MinuteExecutionConfig:
         maximum_order_notional=1_000_000.0,
         slippage_bps_per_side=2.0,
     )
+
+
+def test_minute_trainable_sessions_exclude_zero_feature_partitions() -> None:
+    manifest = {
+        "dates": ["2024-11-29", "2024-12-01", "2024-12-02"],
+        "partitions": [
+            {"trade_date": "2024-11-29", "rows": 10, "feature_valid_rows": 8},
+            {"trade_date": "2024-12-01", "rows": 391, "feature_valid_rows": 0},
+            {"trade_date": "2024-12-02", "rows": 20, "feature_valid_rows": 15},
+        ],
+    }
+
+    dates, summaries, excluded = minute_trainable_session_summaries(manifest)
+
+    assert dates == ["2024-11-29", "2024-12-02"]
+    assert [row["trade_date"] for row in summaries] == dates
+    assert excluded == ("2024-12-01",)
+
+
+def test_minute_trainable_sessions_reject_manifest_partition_disagreement() -> None:
+    with pytest.raises(RuntimeError, match="date list and partition list disagree"):
+        minute_trainable_session_summaries(
+            {
+                "dates": ["2024-12-02"],
+                "partitions": [
+                    {
+                        "trade_date": "2024-12-03",
+                        "rows": 10,
+                        "feature_valid_rows": 8,
+                    }
+                ],
+            }
+        )
 
 
 def _completed_previous_minute_session() -> pl.DataFrame:
@@ -120,7 +158,9 @@ def _developing_current_session(*, future_high: float = 110.0) -> pl.DataFrame:
     )
 
 
-def test_developing_daily_candle_features_update_each_minute_without_future_leakage() -> None:
+def test_developing_daily_candle_features_update_each_minute_without_future_leakage() -> (
+    None
+):
     previous = _completed_previous_minute_session()
     ordinary = add_developing_daily_candle_features(
         _developing_current_session(future_high=110.0), previous
@@ -261,7 +301,9 @@ def test_minute_daily_context_uses_prior_complete_session_and_current_open(
         np.save(path, values)
         array_meta[name] = {
             "file": f"generations/g1/{name}.npy",
-            "content_fingerprint": {"sha256": hashlib.sha256(path.read_bytes()).hexdigest()},
+            "content_fingerprint": {
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest()
+            },
         }
     meta = cache / "meta.json"
     meta.write_text(
@@ -314,6 +356,24 @@ def test_minute_daily_context_uses_prior_complete_session_and_current_open(
     np.testing.assert_allclose(context.benchmark_log_returns, [0.10, 0.20])
     assert context.benchmark_price_available.tolist() == [True, True]
     assert len(context.benchmark_fingerprint) == 64
+
+    guided_context = _load_minute_daily_feature_context(
+        meta,
+        minute_symbols=("0050", "2330"),
+        minute_dates=np.asarray(["2026-01-05", "2026-01-06"], dtype="datetime64[D]"),
+        requested_feature_names=("daily_a",),
+        daily_guidance=MinuteDailyGuidance(
+            weights=np.asarray([[0.20, -0.10], [0.35, -0.25]], dtype=np.float32),
+            fingerprint="guide-fingerprint",
+            manifest={},
+        ),
+        benchmark_name="2330",
+    )
+    guided_history = guided_context.for_minute_day(1, lookback=2)
+    assert guided_context.feature_names[-1] == MINUTE_DAILY_GUIDANCE_FEATURE
+    np.testing.assert_allclose(guided_history[0, :, -1], 0.0)
+    np.testing.assert_allclose(guided_history[1, :, -1], [0.35, -0.25])
+
     with pytest.raises(RuntimeError, match="benchmark disagrees"):
         _load_minute_daily_feature_context(
             meta,
@@ -472,9 +532,9 @@ def test_minute_split_is_chronological_and_progress_counts_sessions(
         [row["benchmark_log_return"] for row in rows],
         [0.0, 0.02, 0.03, 0.04, 0.05],
     )
-    assert math.expm1(sum(row["benchmark_log_return"] for row in rows)) == pytest.approx(
-        math.expm1(0.14)
-    )
+    assert math.expm1(
+        sum(row["benchmark_log_return"] for row in rows)
+    ) == pytest.approx(math.expm1(0.14))
     progress = progress_instances[0]
     assert isinstance(progress, FakeProgress)
     assert progress.total == 5
@@ -594,9 +654,7 @@ def test_minute_benchmark_uses_aligned_adjusted_close_return_only() -> None:
     # consume only the independently aligned adjusted-close benchmark value.
     assert _minute_benchmark_log_return(day) == pytest.approx(0.125)
     assert math.isnan(
-        _minute_benchmark_log_return(
-            replace(day, benchmark_price_available=False)
-        )
+        _minute_benchmark_log_return(replace(day, benchmark_price_available=False))
     )
 
 
@@ -678,9 +736,10 @@ def test_minute_long_short_executor_enforces_capacity_and_covers_at_close() -> N
     )
     torch.testing.assert_close(closed.state.shares, torch.zeros(2))
     # Short cover uses the buy fee while the long liquidation uses sell fees.
-    expected_close_fees = 2_000.0 * 100.0 * 0.001 + float(
-        opened.state.shares[1]
-    ) * config.initial_equity * 100.0 * 0.002
+    expected_close_fees = (
+        2_000.0 * 100.0 * 0.001
+        + float(opened.state.shares[1]) * config.initial_equity * 100.0 * 0.002
+    )
     assert float(closed.explicit_fees) == pytest.approx(expected_close_fees)
 
 
@@ -784,9 +843,7 @@ def test_minute_cash_outside_option_is_universe_invariant_and_learnable() -> Non
         maximum_name_weight=1.0,
         outside_cash_logit=4.0,
     )
-    safe = reference_logits.masked_fill(
-        ~reference_mask, torch.finfo(torch.float32).min
-    )
+    safe = reference_logits.masked_fill(~reference_mask, torch.finfo(torch.float32).min)
     conditional = torch.softmax(safe, dim=1).masked_fill(~reference_mask, 0.0)
     log_mean_exp = torch.logsumexp(safe, dim=1, keepdim=True) - math.log(3.0)
     expected = conditional * 0.5 * torch.sigmoid(log_mean_exp - 4.0)
@@ -849,9 +906,12 @@ def test_minute_slab_adapter_fuses_identical_target_construction() -> None:
             return_aux: bool,
         ) -> torch.Tensor:
             del feature_slabs, return_aux
-            return torch.arange(mask.numel(), dtype=torch.float32).reshape(
-                -1, mask.size(-1)
-            ) / 8.0
+            return (
+                torch.arange(mask.numel(), dtype=torch.float32).reshape(
+                    -1, mask.size(-1)
+                )
+                / 8.0
+            )
 
     config = MinuteExecutionConfig(
         initial_equity=1_000_000.0,
@@ -880,6 +940,104 @@ def test_minute_slab_adapter_fuses_identical_target_construction() -> None:
         outside_cash_logit=4.0,
     )
 
+    torch.testing.assert_close(actual, expected)
+
+
+def test_daily_guided_minute_gate_preserves_direction_and_risk_envelope() -> None:
+    guide = torch.tensor([[0.40, -0.30, 0.20]], requires_grad=False)
+    logits = torch.tensor([[0.0, 20.0, -20.0]], requires_grad=True)
+    mask = torch.tensor([[True, True, False]])
+
+    actual = daily_guided_minute_target_weights(
+        guide,
+        mask,
+        gate_logits=logits,
+    )
+
+    torch.testing.assert_close(
+        actual,
+        torch.tensor([[0.20, -0.30, 0.0]]),
+        atol=1e-7,
+        rtol=1e-6,
+    )
+    assert bool(torch.all(actual.abs() <= guide.abs()))
+    assert bool(torch.all((actual == 0.0) | (actual.sign() == guide.sign())))
+    actual.sum().backward()
+    assert logits.grad is not None
+    assert bool(torch.isfinite(logits.grad).all())
+
+    static = daily_guided_minute_target_weights(guide, mask)
+    torch.testing.assert_close(static, torch.tensor([[0.40, -0.30, 0.0]]))
+
+
+def test_daily_guided_head_starts_near_the_guide_only_baseline() -> None:
+    model = torch.nn.Module()
+    model.score_head = torch.nn.Sequential(
+        torch.nn.Linear(3, 4),
+        torch.nn.ReLU(),
+        torch.nn.Linear(4, 1),
+    )
+
+    bias = _initialize_daily_guided_minute_head(model, initial_exposure=0.90)
+
+    final_layer = model.score_head[-1]
+    assert isinstance(final_layer, torch.nn.Linear)
+    torch.testing.assert_close(final_layer.weight, torch.zeros_like(final_layer.weight))
+    torch.testing.assert_close(
+        final_layer.bias, torch.full_like(final_layer.bias, bias)
+    )
+    actual = torch.sigmoid(model.score_head(torch.randn(5, 3)))
+    torch.testing.assert_close(actual, torch.full_like(actual, 0.90))
+
+
+def test_daily_guided_slab_adapter_uses_guide_as_context_and_target_ceiling() -> None:
+    class FakeGuidedModel(torch.nn.Module):
+        portfolio_output_mode = "logits"
+        daily_context_num_features = 2
+
+        def forward_from_batched_panel_slabs_with_daily_context(
+            self,
+            feature_slabs: torch.Tensor,
+            daily_context: torch.Tensor,
+            mask: torch.Tensor,
+            *,
+            return_aux: bool,
+        ) -> torch.Tensor:
+            del feature_slabs, mask, return_aux
+            # Prove the current guide is visible to the minute policy through
+            # the final daily-context row, without repeating it on each bar.
+            return daily_context[:, -1, :, 1].repeat_interleave(2, dim=0)
+
+    config = MinuteExecutionConfig(
+        initial_equity=10_000_000.0,
+        gross_exposure=1.0,
+        maximum_name_weight=None,
+        maximum_volume_participation=0.5,
+        maximum_order_notional=None,
+        slippage_bps_per_side=0.0,
+        outside_cash_logit=None,
+        long_only=False,
+    )
+    guide = torch.tensor([[0.40, -0.30, 0.20]])
+    daily = torch.zeros(1, 3, 3, 2)
+    daily[:, -1, :, 1] = guide
+    mask = torch.ones(1, 2, 3, dtype=torch.bool)
+    adapter = _MinuteSlabForwardAdapter(
+        FakeGuidedModel(),
+        config,
+        daily_guidance_feature_index=1,
+    )
+
+    actual = adapter(
+        torch.zeros(1, 3, 3, 1),
+        mask,
+        torch.ones_like(mask),
+        daily,
+        guide,
+    )
+    expected = guide.repeat_interleave(2, dim=0) * torch.sigmoid(
+        guide.repeat_interleave(2, dim=0)
+    )
     torch.testing.assert_close(actual, expected)
 
 
@@ -1153,9 +1311,7 @@ def test_minute_batch_cache_stores_only_model_features_in_bf16() -> None:
 def test_realized_minute_holdings_are_long_form_and_ranked(tmp_path: Path) -> None:
     dates = np.asarray(["2025-01-02", "2025-01-03"], dtype="datetime64[D]")
     symbols = ["2330", "2317", "0050"]
-    weights = np.asarray(
-        [[0.6, -0.3, 0.1], [0.0, 0.0, 0.0]], dtype=np.float64
-    )
+    weights = np.asarray([[0.6, -0.3, 0.1], [0.0, 0.0, 0.0]], dtype=np.float64)
     holdings, summary = build_realized_holdings_frames(
         dates,
         symbols,
@@ -1299,7 +1455,7 @@ def test_run_day_batch_full_day_credit_changes_earlier_chunk_gradient() -> None:
         config.training.minute_full_day_credit_assignment = full_day
         config.training.minute_full_day_activation_checkpoint = checkpoint
 
-        def model_forward(feature_slabs, _mask, _shortable, _daily):
+        def model_forward(feature_slabs, _mask, _shortable, _daily, _daily_guidance):
             return policy.targets(feature_slabs)
 
         def execution_forward(
@@ -1403,7 +1559,7 @@ def test_eval_day_reports_cash_l1_model_allocation_separately_from_fills() -> No
     buy_rates = torch.zeros(2)
     sell_rates = torch.zeros(2)
 
-    def model_forward(feature_slabs, _mask, _shortable, _daily):
+    def model_forward(feature_slabs, _mask, _shortable, _daily, _daily_guidance):
         minute_code = feature_slabs[:, -1, 0, 0]
         return torch.where(
             (minute_code < 1.5).unsqueeze(1),
@@ -1470,9 +1626,7 @@ def test_eval_day_reports_cash_l1_model_allocation_separately_from_fills() -> No
 
 
 def test_batched_minute_executor_matches_independent_day_oracle_and_gradients() -> None:
-    batched_logits = torch.tensor(
-        [[1.0, -0.25], [-0.5, 0.75]], requires_grad=True
-    )
+    batched_logits = torch.tensor([[1.0, -0.25], [-0.5, 0.75]], requires_grad=True)
     mask = torch.ones_like(batched_logits, dtype=torch.bool)
     batched_target = minute_target_weights_from_logits(
         batched_logits,
@@ -1639,9 +1793,7 @@ def test_bounded_minute_chunk_matches_sequential_batched_oracle_and_gradients() 
 
 
 def test_batched_panel_slabs_match_independent_canonical_slab_forwards() -> None:
-    config = load_config(
-        Path(__file__).parents[1] / "configs/markets/tw_minute.yaml"
-    )
+    config = load_config(Path(__file__).parents[1] / "configs/markets/tw_minute.yaml")
     config.training.lookback = 2
     config.training.enable_torch_compile = False
     config.training.transformer_base_portfolio.attention_mode = "temporal_only"
@@ -1660,9 +1812,7 @@ def test_batched_panel_slabs_match_independent_canonical_slab_forwards() -> None
         feature_names=MINUTE_FEATURE_COLUMNS,
     ).eval()
     generator = torch.Generator().manual_seed(7)
-    slabs = torch.randn(
-        2, 4, 3, len(MINUTE_FEATURE_COLUMNS), generator=generator
-    )
+    slabs = torch.randn(2, 4, 3, len(MINUTE_FEATURE_COLUMNS), generator=generator)
     mask = torch.tensor(
         [
             [[True, True, False], [True, True, True], [True, False, True]],
@@ -1671,14 +1821,10 @@ def test_batched_panel_slabs_match_independent_canonical_slab_forwards() -> None
     )
 
     with torch.no_grad():
-        batched = model.forward_from_batched_panel_slabs(
-            slabs, mask, return_aux=False
-        )
+        batched = model.forward_from_batched_panel_slabs(slabs, mask, return_aux=False)
         oracle = torch.cat(
             [
-                model.forward_from_panel_slab(
-                    slabs[day], mask[day], return_aux=False
-                )
+                model.forward_from_panel_slab(slabs[day], mask[day], return_aux=False)
                 for day in range(2)
             ],
             dim=0,
@@ -1688,12 +1834,9 @@ def test_batched_panel_slabs_match_independent_canonical_slab_forwards() -> None
 
 
 def test_financial_transformer_fuses_daily_context_without_bar_repetition() -> None:
-    config_path = (
-        Path(__file__).parents[1]
-        / "configs/markets/tw_minute_dual_5090.yaml"
-    )
+    config_path = Path(__file__).parents[1] / "configs/markets/tw_minute_dual_5090.yaml"
     config = load_config(config_path)
-    config.training.lookback = 2
+    config.training.lookback = 1
     fin = config.training.financial_transformer
     fin.attention_mode = "temporal_only"
     fin.use_latent_factors = False
@@ -1708,13 +1851,13 @@ def test_financial_transformer_fuses_daily_context_without_bar_repetition() -> N
     fin.daily_context_layers = 1
     model = build_model(
         config=config,
-        lookback=2,
+        lookback=1,
         num_features=len(MINUTE_FEATURE_COLUMNS),
         num_symbols=3,
         feature_names=MINUTE_FEATURE_COLUMNS,
         daily_context_feature_names=("daily_a", "daily_b", "daily_c"),
     )
-    slabs = torch.randn(2, 4, 3, len(MINUTE_FEATURE_COLUMNS))
+    slabs = torch.randn(2, 3, 3, len(MINUTE_FEATURE_COLUMNS))
     # A distinct two-day history is encoded once per day/symbol, not repeated
     # across minute rows.
     daily = torch.randn(2, 2, 3, 3)
@@ -1760,10 +1903,7 @@ def test_official_tw_minute_config_uses_a_separate_training_contract() -> None:
 
 
 def test_dual_5090_minute_config_is_within_fold_ddp() -> None:
-    config_path = (
-        Path(__file__).parents[1]
-        / "configs/markets/tw_minute_dual_5090.yaml"
-    )
+    config_path = Path(__file__).parents[1] / "configs/markets/tw_minute_dual_5090.yaml"
     config = load_config(config_path)
 
     assert config.training.multi_gpu_strategy == "distributed_data_parallel"
@@ -1789,17 +1929,11 @@ def test_dual_5090_minute_config_is_within_fold_ddp() -> None:
     assert config.training.transformer_base_portfolio.amp_native_position_add is True
     assert config.training.transformer_base_portfolio.checkpoint_blocks is True
     assert config.training.cache_train_features_in_amp_dtype is True
-    assert (
-        config.training.transformer_base_portfolio.portfolio_output_mode
-        == "cash_l1"
-    )
+    assert config.training.transformer_base_portfolio.portfolio_output_mode == "cash_l1"
     assert config.training.financial_transformer.temporal_pooling == "last"
     assert config.training.financial_transformer.temporal_query_mode == "last_only"
     assert config.training.financial_transformer.portfolio_mode == "long_short"
-    assert (
-        config.training.financial_transformer.portfolio_output_mode
-        == "cash_l1"
-    )
+    assert config.training.financial_transformer.portfolio_output_mode == "cash_l1"
     assert config.training.financial_transformer.center_long_short_logits is False
     assert config.training.transformer_base_portfolio.center_long_short_logits is False
     assert len(config.data.feature_include) == 99
@@ -1826,6 +1960,32 @@ def test_dual_5090_minute_config_is_within_fold_ddp() -> None:
     assert (
         config.data.minute_parquet_root
         == "data_tw_minute/research_dataset_developing_v5"
+    )
+
+
+def test_daily_guided_minute_config_reuses_runner_with_a_bounded_gate() -> None:
+    config_path = (
+        Path(__file__).parents[1]
+        / "configs/markets/tw_minute_daily_guided_dual_5090.yaml"
+    )
+    config = load_config(config_path)
+
+    assert config.trading.execution_mode == "tw_minute"
+    assert config.training.model_name == "financial_transformer"
+    assert config.data.minute_daily_context_panel_meta is not None
+    assert config.data.minute_daily_guidance_path == (
+        "data_tw_minute/daily_guidance/oof_requested_weights.parquet"
+    )
+    assert config.training.lookback == 1
+    assert config.training.financial_transformer.daily_context_lookback == 32
+    assert config.training.financial_transformer.portfolio_output_mode == "logits"
+    assert config.training.loss_portfolio_activation == "pre_normalized"
+    assert config.trading.portfolio_activation == "pre_normalized"
+    assert config.trading.tw_minute_gross_exposure == 1.0
+    assert config.trading.tw_minute_max_name_weight is None
+    assert config.trading.tw_minute_outside_cash_logit is None
+    assert config.runner.output_dir == (
+        "artifacts/markets/tw_minute_daily_guided_dual_5090_v1"
     )
 
 
@@ -1929,9 +2089,7 @@ def test_minute_partition_loads_sparse_full_market_rows_into_dense_day(
     frame.write_parquet(output)
     digest = hashlib.sha256(output.read_bytes()).hexdigest()
     counts = {name: 2 for name in MINUTE_FEATURE_COLUMNS}
-    sums = {
-        name: float(sum(feature_values[name])) for name in MINUTE_FEATURE_COLUMNS
-    }
+    sums = {name: float(sum(feature_values[name])) for name in MINUTE_FEATURE_COLUMNS}
     squares = {
         name: float(sum(value * value for value in feature_values[name]))
         for name in MINUTE_FEATURE_COLUMNS
@@ -2047,12 +2205,9 @@ def test_minute_training_reuses_canonical_group_artifacts(
                 "trade_date": date_string,
                 "output": str(output),
                 "output_sha256": hashlib.sha256(output.read_bytes()).hexdigest(),
-                "feature_counts": {
-                    name: rows for name in MINUTE_FEATURE_COLUMNS
-                },
+                "feature_counts": {name: rows for name in MINUTE_FEATURE_COLUMNS},
                 "feature_sums": {
-                    name: float(sum(values))
-                    for name, values in feature_values.items()
+                    name: float(sum(values)) for name, values in feature_values.items()
                 },
                 "feature_sum_squares": {
                     name: float(sum(value * value for value in values))
@@ -2146,9 +2301,7 @@ def test_minute_training_reuses_canonical_group_artifacts(
     canonical_run_manifest = json.loads(
         (output_dir / "run_manifest.json").read_text(encoding="utf-8")
     )
-    progress = json.loads(
-        (output_dir / "progress.json").read_text(encoding="utf-8")
-    )
+    progress = json.loads((output_dir / "progress.json").read_text(encoding="utf-8"))
     artifact_contract = json.loads(
         (output_dir / "fold_01" / "mode_artifact_contract.json").read_text(
             encoding="utf-8"

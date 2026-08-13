@@ -20,6 +20,10 @@ let strategySearch = "";
 let lastStrategyCatalog = [];
 let lastStrategyCounts = null;
 let lastHeavyRevision = "";
+let refreshInFlight = false;
+let historyInFlight = false;
+let lastHistoryEtag = "";
+let strategySearchFrame = null;
 
 function byId(id) { return document.getElementById(id); }
 function setText(id, value) { byId(id).textContent = value ?? "—"; }
@@ -645,9 +649,10 @@ function render(snapshot, {forceHeavy = false} = {}) {
 }
 
 async function refresh() {
-  if (document.hidden) return;
+  if (document.hidden || refreshInFlight) return;
+  refreshInFlight = true;
   try {
-    const response = await fetch("api/status", { cache: "no-cache" });
+    const response = await fetch("api/status", { cache: "default" });
     const payload = await response.json();
     if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
     render(payload);
@@ -657,15 +662,21 @@ async function refresh() {
     alert.textContent = `面板資料讀取失敗：${error.message}`;
     byId("live-dot").className = "live-dot blocked";
     setText("live-label", "OFFLINE");
+  } finally {
+    refreshInFlight = false;
   }
 }
 
 async function refreshHistory() {
-  if (document.hidden) return;
+  if (document.hidden || historyInFlight) return;
+  historyInFlight = true;
   try {
-    const response = await fetch("api/history", { cache: "no-cache" });
+    const response = await fetch("api/history", { cache: "default" });
+    const etag = response.headers.get("ETag") || "";
+    if (etag && etag === lastHistoryEtag) return;
     const payload = await response.json();
     if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+    lastHistoryEtag = etag;
     cachedHistory = Array.isArray(payload.history) ? payload.history : [];
     if (lastSnapshot) {
       lastSnapshot.history = cachedHistory;
@@ -675,6 +686,8 @@ async function refreshHistory() {
     }
   } catch (error) {
     setText("curve-wall-note", `曲線歷史暫時無法更新：${error.message}`);
+  } finally {
+    historyInFlight = false;
   }
 }
 
@@ -690,7 +703,11 @@ byId("strategy-category-filter").addEventListener("change", (event) => {
 byId("strategy-search").addEventListener("input", (event) => {
   strategySearch = event.target.value;
   guideVisibleCount = 12;
-  if (lastSnapshot) renderStrategyGuide(lastStrategyCatalog, lastStrategyCounts);
+  if (strategySearchFrame != null) cancelAnimationFrame(strategySearchFrame);
+  strategySearchFrame = requestAnimationFrame(() => {
+    strategySearchFrame = null;
+    if (lastSnapshot) renderStrategyGuide(lastStrategyCatalog, lastStrategyCounts);
+  });
 });
 byId("exposure-direction-filter").addEventListener("change", (event) => {
   selectedDirectionalExposure = event.target.value;
@@ -743,11 +760,11 @@ byId("guide-load-more").addEventListener("click", () => {
 });
 document.addEventListener("visibilitychange", () => {
   if (!document.hidden) {
-    refresh();
-    refreshHistory();
+    void refresh();
+    void refreshHistory();
   }
 });
-refresh();
-refreshHistory();
-window.setInterval(refresh, REFRESH_MS);
-window.setInterval(refreshHistory, 60000);
+void refresh();
+void refreshHistory();
+window.setInterval(() => void refresh(), REFRESH_MS);
+window.setInterval(() => void refreshHistory(), 60000);
