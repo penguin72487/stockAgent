@@ -5,7 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
 import polars as pl
@@ -51,9 +51,9 @@ MINUTE_FEATURE_COLUMNS = (
     *MINUTE_DEVELOPING_CANDLE_FEATURE_COLUMNS,
 )
 MINUTE_DAILY_OPEN_GAP_FEATURE = "next_session_open_gap_logret"
-MINUTE_DAILY_CONTEXT_CONTRACT = (
-    "causal_completed_daily_history_plus_observed_open_v3"
-)
+MINUTE_DAILY_CONTEXT_CONTRACT = "causal_completed_daily_history_plus_observed_open_v3"
+MINUTE_DAILY_GUIDANCE_FEATURE = "daily_model_target_weight"
+MINUTE_DAILY_GUIDANCE_CONTRACT = "walk_forward_oof_tw_day_trade_requested_weights_v1"
 _TW_MAX_ABS_DAILY_PRICE_LOG_RETURN = float(np.log(2.0))
 
 
@@ -130,11 +130,7 @@ def _developing_safe_log_return(
     denominator: pl.Expr,
 ) -> pl.Expr:
     value = (numerator / denominator).log()
-    valid = (
-        _positive_finite(numerator)
-        & _positive_finite(denominator)
-        & _finite(value)
-    )
+    valid = _positive_finite(numerator) & _positive_finite(denominator) & _finite(value)
     return pl.when(valid).then(value).otherwise(None)
 
 
@@ -163,9 +159,7 @@ def add_developing_daily_candle_features(
     }
     missing = sorted(required - set(frame.columns))
     if missing:
-        raise RuntimeError(
-            f"minute frame lacks developing-candle inputs: {missing}"
-        )
+        raise RuntimeError(f"minute frame lacks developing-candle inputs: {missing}")
     prior_required = {
         "symbol",
         "previous_open",
@@ -183,9 +177,7 @@ def add_developing_daily_candle_features(
             f"previous minute sessions lack baseline fields: {prior_missing}"
         )
     daily_baseline_names = {
-        name: f"_daily_{name}"
-        for name in prior_required
-        if name != "symbol"
+        name: f"_daily_{name}" for name in prior_required if name != "symbol"
     }
     daily_baseline = previous_sessions.select(sorted(prior_required)).rename(
         daily_baseline_names
@@ -195,9 +187,21 @@ def add_developing_daily_candle_features(
         frame.sort(["symbol", "ts"])
         .join(daily_baseline, on="symbol", how="left")
         .with_columns(
-            pl.col("Open").cast(pl.Float64).first().over("symbol").alias("_developing_open"),
-            pl.col("High").cast(pl.Float64).cum_max().over("symbol").alias("_developing_high"),
-            pl.col("Low").cast(pl.Float64).cum_min().over("symbol").alias("_developing_low"),
+            pl.col("Open")
+            .cast(pl.Float64)
+            .first()
+            .over("symbol")
+            .alias("_developing_open"),
+            pl.col("High")
+            .cast(pl.Float64)
+            .cum_max()
+            .over("symbol")
+            .alias("_developing_high"),
+            pl.col("Low")
+            .cast(pl.Float64)
+            .cum_min()
+            .over("symbol")
+            .alias("_developing_low"),
             pl.col("Close").cast(pl.Float64).alias("_developing_close"),
             pl.col("volume_shares")
             .cast(pl.Float64)
@@ -299,24 +303,18 @@ def add_developing_daily_candle_features(
             pl.col("_developing_volume"), pl.col("_daily_previous_volume")
         ).alias("trading_volume_logret_1d"),
     ).with_columns(
-        (
-            pl.col("body_ratio") - pl.col("_daily_previous_body_ratio")
-        ).alias("delta_body_ratio"),
+        (pl.col("body_ratio") - pl.col("_daily_previous_body_ratio")).alias(
+            "delta_body_ratio"
+        ),
         (pl.col("clv") - 0.5).alias("clv_centered"),
         (pl.col("clv") - pl.col("_daily_previous_clv")).alias("delta_clv"),
-        (pl.col("upper_shadow") - pl.col("lower_shadow")).alias(
-            "shadow_imbalance"
+        (pl.col("upper_shadow") - pl.col("lower_shadow")).alias("shadow_imbalance"),
+        ((close_px - open_px).sign() * pl.col("trading_volume_logret_1d")).alias(
+            "signed_vol"
         ),
-        (
-            (close_px - open_px).sign()
-            * pl.col("trading_volume_logret_1d")
-        ).alias("signed_vol"),
     )
     all_developing_finite = pl.all_horizontal(
-        *[
-            _finite(pl.col(name))
-            for name in MINUTE_DEVELOPING_CANDLE_FEATURE_COLUMNS
-        ]
+        *[_finite(pl.col(name)) for name in MINUTE_DEVELOPING_CANDLE_FEATURE_COLUMNS]
     )
     return output.with_columns(
         (
@@ -364,12 +362,11 @@ def summarize_minute_sessions_for_next_day(frame: pl.DataFrame) -> pl.DataFrame:
             pl.col("Low").cast(pl.Float64).min().alias("previous_low"),
             pl.col("Close").cast(pl.Float64).last().alias("previous_close"),
             pl.col("volume_shares").cast(pl.Float64).sum().alias("previous_volume"),
-            pl.col("source_volume_unit_valid").fill_null(False).all().alias(
-                "_volume_valid"
-            ),
-            pl.col("session_exit_valid").fill_null(False).any().alias(
-                "_exit_valid"
-            ),
+            pl.col("source_volume_unit_valid")
+            .fill_null(False)
+            .all()
+            .alias("_volume_valid"),
+            pl.col("session_exit_valid").fill_null(False).any().alias("_exit_valid"),
             (
                 _positive_finite(pl.col("Open"))
                 & _positive_finite(pl.col("High"))
@@ -440,9 +437,7 @@ def _sha256(path: Path) -> str:
 def _partition_verification_cache_path(root: Path) -> Path:
     """Return a machine-local receipt path without mutating the dataset tree."""
 
-    cache_root = Path(
-        os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache"))
-    )
+    cache_root = Path(os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache")))
     root_key = hashlib.sha256(str(root).encode("utf-8")).hexdigest()[:24]
     return cache_root / "stockagent" / "tw_minute_sha256" / f"{root_key}.json"
 
@@ -529,7 +524,9 @@ class MinuteFeatureNormalizer:
         if not np.isfinite(self.mean).all() or not np.isfinite(self.scale).all():
             raise ValueError("minute normalizer contains non-finite values")
         if np.any(self.scale <= 0.0) or np.any(self.counts <= 1):
-            raise ValueError("minute normalizer requires positive scales and counts > 1")
+            raise ValueError(
+                "minute normalizer requires positive scales and counts > 1"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -546,8 +543,24 @@ class MinuteDayPanel:
     short_open_mask: np.ndarray | None = None
     short_capacity_shares: np.ndarray | None = None
     daily_context_features: np.ndarray | None = None
+    daily_guidance_weights: np.ndarray | None = None
     benchmark_log_return: float = float("nan")
     benchmark_price_available: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class MinuteDailyGuidance:
+    """Signed causal daily targets aligned to minute sessions.
+
+    These are model requests, not fills.  The minute executor independently
+    applies exact-session permissions, liquidity, costs, and realised account
+    state.  Every row must be produced by a daily fold whose training and
+    validation years strictly precede the row's year.
+    """
+
+    weights: np.ndarray
+    fingerprint: str
+    manifest: dict[str, Any]
 
 
 @dataclass(frozen=True, slots=True)
@@ -571,6 +584,8 @@ class MinuteDailyFeatureContext:
     previous_session_indices: np.ndarray
     current_session_indices: np.ndarray
     opening_gap_output_index: int | None
+    daily_guidance: MinuteDailyGuidance | None
+    daily_guidance_output_index: int | None
     fingerprint: str
     benchmark_name: str
     benchmark_log_returns: np.ndarray
@@ -645,6 +660,15 @@ class MinuteDailyFeatureContext:
             output[:, :, gap_index] = np.where(valid, gap, 0.0).astype(
                 np.float32, copy=False
             )
+        guidance_index = self.daily_guidance_output_index
+        if guidance_index is not None:
+            if self.daily_guidance is None:
+                raise RuntimeError("tw_minute daily guidance tensor is missing")
+            # The guide is an as-of-session-D decision.  Do not fabricate a
+            # historical guide by attaching it to D-1 daily feature rows; only
+            # the final current-session context row receives today's causal
+            # out-of-fold target.
+            output[-1, :, guidance_index] = self.daily_guidance.weights[day_index]
         return output[0] if history == 1 else output
 
 
@@ -660,12 +684,15 @@ class MinuteDatasetIndex:
     short_rules_fingerprint: str | None = None
     daily_feature_context: MinuteDailyFeatureContext | None = None
     daily_context_lookback: int = 1
+    excluded_unusable_dates: tuple[str, ...] = ()
 
     @property
     def num_symbols(self) -> int:
         return len(self.symbols)
 
-    def fit_normalizer(self, indices: Sequence[int] | np.ndarray) -> MinuteFeatureNormalizer:
+    def fit_normalizer(
+        self, indices: Sequence[int] | np.ndarray
+    ) -> MinuteFeatureNormalizer:
         counts = np.zeros(len(MINUTE_FEATURE_COLUMNS), dtype=np.float64)
         sums = np.zeros_like(counts)
         sum_squares = np.zeros_like(counts)
@@ -683,8 +710,7 @@ class MinuteDatasetIndex:
                 )
         if np.any(counts <= 1.0):
             missing = [
-                MINUTE_FEATURE_COLUMNS[index]
-                for index in np.flatnonzero(counts <= 1.0)
+                MINUTE_FEATURE_COLUMNS[index] for index in np.flatnonzero(counts <= 1.0)
             ]
             raise RuntimeError(
                 f"minute training split has insufficient feature statistics: {missing}"
@@ -766,7 +792,9 @@ class MinuteDatasetIndex:
         minute_indices = minutes.astype(np.int64) - 1
         flat = minute_indices * self.num_symbols + symbol_indices
         if np.unique(flat).size != flat.size:
-            raise RuntimeError(f"minute partition has duplicate symbol timestamps: {path}")
+            raise RuntimeError(
+                f"minute partition has duplicate symbol timestamps: {path}"
+            )
 
         shape = (MINUTE_SESSION_BARS, self.num_symbols)
         features = np.zeros((*shape, len(MINUTE_FEATURE_COLUMNS)), dtype=np.float32)
@@ -832,10 +860,7 @@ class MinuteDatasetIndex:
             np.asarray(self.symbols, dtype=object), session_symbols
         )
         session_values = (
-            session_rows["session_close"]
-            .cast(pl.Float64)
-            .fill_null(0.0)
-            .to_numpy()
+            session_rows["session_close"].cast(pl.Float64).fill_null(0.0).to_numpy()
         )
         exit_values = session_rows["session_exit_valid"].fill_null(False).to_numpy()
         session_close[session_indices] = session_values.astype(np.float32, copy=False)
@@ -868,6 +893,12 @@ class MinuteDatasetIndex:
                     int(index), lookback=int(self.daily_context_lookback)
                 )
             ),
+            daily_guidance_weights=(
+                None
+                if self.daily_feature_context is None
+                or self.daily_feature_context.daily_guidance is None
+                else self.daily_feature_context.daily_guidance.weights[int(index)]
+            ),
             benchmark_log_return=(
                 float("nan")
                 if self.daily_feature_context is None
@@ -897,12 +928,156 @@ def _resolve_panel_cache_array_root(
     )
 
 
+def minute_daily_guidance_manifest_path(path: str | Path) -> Path:
+    return Path(path).with_suffix(".manifest.json")
+
+
+def _load_minute_daily_guidance(
+    path: str | Path,
+    *,
+    minute_symbols: tuple[str, ...],
+    minute_dates: np.ndarray,
+) -> MinuteDailyGuidance:
+    resolved = Path(path).resolve()
+    manifest_path = minute_daily_guidance_manifest_path(resolved)
+    if not resolved.is_file():
+        raise RuntimeError(f"tw_minute daily-guidance parquet is missing: {resolved}")
+    if not manifest_path.is_file():
+        raise RuntimeError(
+            f"tw_minute daily-guidance manifest is missing: {manifest_path}"
+        )
+    manifest = _read_json(manifest_path)
+    if int(manifest.get("schema_version", 0)) != 1:
+        raise RuntimeError("tw_minute daily-guidance schema is incompatible")
+    if manifest.get("contract") != MINUTE_DAILY_GUIDANCE_CONTRACT:
+        raise RuntimeError("tw_minute daily-guidance contract is incompatible")
+    if manifest.get("source_execution_mode") != "tw_day_trade":
+        raise RuntimeError(
+            "tw_minute daily guidance must come from tw_day_trade targets"
+        )
+    if manifest.get("decision_clock") != "observed_session_open":
+        raise RuntimeError(
+            "tw_minute daily guidance must declare its observed-open decision clock"
+        )
+    parquet_sha256 = _sha256(resolved)
+    if manifest.get("parquet_sha256") != parquet_sha256:
+        raise RuntimeError(
+            "tw_minute daily-guidance parquet fingerprint disagrees with its manifest"
+        )
+
+    target_years = sorted(
+        set(np.asarray(minute_dates, dtype="datetime64[Y]").astype(int) + 1970)
+    )
+    owner_rows = manifest.get("year_owners")
+    if not isinstance(owner_rows, list):
+        raise RuntimeError("tw_minute daily-guidance manifest lacks year owners")
+    owners: dict[int, dict[str, Any]] = {}
+    for row in owner_rows:
+        if not isinstance(row, dict):
+            raise RuntimeError("tw_minute daily-guidance year owner is malformed")
+        year = int(row.get("target_year", 0))
+        if year in owners:
+            raise RuntimeError(
+                f"tw_minute daily-guidance target year has multiple owners: {year}"
+            )
+        train_years = [int(value) for value in row.get("train_years", [])]
+        val_years = [int(value) for value in row.get("val_years", [])]
+        test_years = [int(value) for value in row.get("test_years", [])]
+        if (
+            not train_years
+            or not val_years
+            or not test_years
+            or year not in test_years
+            or max((*train_years, *val_years)) >= year
+            or not str(row.get("checkpoint_sha256", ""))
+            or not str(row.get("backtest_sha256", ""))
+        ):
+            raise RuntimeError(
+                "tw_minute daily-guidance owner is not strict walk-forward OOF: "
+                f"target_year={year}"
+            )
+        if (
+            int(row.get("zero_filled_missing_symbol_count", 0)) > 0
+            or int(row.get("zero_filled_missing_date_count", 0)) > 0
+        ) and not bool(manifest.get("allow_zero_fill_missing", False)):
+            raise RuntimeError(
+                "tw_minute daily-guidance manifest has undeclared zero-filled gaps: "
+                f"target_year={year}"
+            )
+        owners[year] = row
+    missing_years = [year for year in target_years if year not in owners]
+    if missing_years:
+        raise RuntimeError(
+            "tw_minute daily guidance lacks strict OOF owners for years: "
+            f"{missing_years}"
+        )
+
+    schema = pl.read_parquet_schema(resolved)
+    required_columns = ("date", *minute_symbols)
+    missing_symbols = [name for name in required_columns if name not in schema]
+    if missing_symbols:
+        raise RuntimeError(
+            "tw_minute daily-guidance parquet lacks minute symbols: "
+            f"{missing_symbols[:20]}"
+        )
+    frame = pl.read_parquet(resolved, columns=list(required_columns)).with_columns(
+        pl.col("date").cast(pl.Date)
+    )
+    guide_dates = frame["date"].to_numpy().astype("datetime64[D]")
+    if guide_dates.size == 0 or not bool(np.all(guide_dates[1:] > guide_dates[:-1])):
+        raise RuntimeError(
+            "tw_minute daily-guidance dates must be non-empty, unique, and sorted"
+        )
+    requested_dates = np.asarray(minute_dates, dtype="datetime64[D]")
+    positions = np.searchsorted(guide_dates, requested_dates)
+    exact = positions < guide_dates.size
+    exact &= guide_dates[np.clip(positions, 0, guide_dates.size - 1)] == requested_dates
+    if not bool(np.all(exact)):
+        missing_dates = [str(value) for value in requested_dates[~exact][:20]]
+        raise RuntimeError(
+            f"tw_minute daily guidance lacks minute sessions: {missing_dates}"
+        )
+    weights = (
+        frame.select(list(minute_symbols))
+        .to_numpy()
+        .astype(np.float32, copy=False)[positions]
+    )
+    if not bool(np.isfinite(weights).all()):
+        raise RuntimeError("tw_minute daily guidance contains non-finite targets")
+    gross = np.abs(weights.astype(np.float64)).sum(axis=1)
+    if bool(np.any(gross > 1.00001)):
+        bad = int(np.flatnonzero(gross > 1.00001)[0])
+        raise RuntimeError(
+            "tw_minute daily guidance exceeds its L1 risk budget: "
+            f"date={requested_dates[bad]} gross={gross[bad]:.9f}"
+        )
+    fingerprint = hashlib.sha256(
+        json.dumps(
+            {
+                "contract": MINUTE_DAILY_GUIDANCE_CONTRACT,
+                "parquet_sha256": parquet_sha256,
+                "manifest_sha256": _sha256(manifest_path),
+                "symbols": list(minute_symbols),
+                "dates": [str(value) for value in requested_dates],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return MinuteDailyGuidance(
+        weights=weights,
+        fingerprint=fingerprint,
+        manifest=manifest,
+    )
+
+
 def _load_minute_daily_feature_context(
     meta_path: str | Path,
     *,
     minute_symbols: tuple[str, ...],
     minute_dates: np.ndarray,
     requested_feature_names: Sequence[str],
+    daily_guidance: MinuteDailyGuidance | None = None,
     benchmark_name: str | None = None,
 ) -> MinuteDailyFeatureContext:
     resolved_meta = Path(meta_path).resolve()
@@ -918,9 +1093,7 @@ def _load_minute_daily_feature_context(
     def array_path(name: str) -> Path:
         entry = metadata.get("arrays", {}).get(name)
         if not isinstance(entry, dict) or not str(entry.get("file", "")):
-            raise RuntimeError(
-                f"tw_minute daily-context metadata lacks array {name!r}"
-            )
+            raise RuntimeError(f"tw_minute daily-context metadata lacks array {name!r}")
         path = (cache_root / str(entry["file"])).resolve()
         if not path.is_file():
             raise RuntimeError(
@@ -935,9 +1108,7 @@ def _load_minute_daily_feature_context(
     if not symbols_path.is_file() or not feature_names_path.is_file():
         raise RuntimeError("tw_minute daily-context symbol/feature metadata is missing")
     panel_symbols_payload = json.loads(symbols_path.read_text(encoding="utf-8"))
-    cached_feature_payload = json.loads(
-        feature_names_path.read_text(encoding="utf-8")
-    )
+    cached_feature_payload = json.loads(feature_names_path.read_text(encoding="utf-8"))
     if not isinstance(panel_symbols_payload, list) or not isinstance(
         cached_feature_payload, list
     ):
@@ -960,8 +1131,7 @@ def _load_minute_daily_feature_context(
     ]
     if missing:
         raise RuntimeError(
-            "tw_minute daily-context panel lacks minute symbols: "
-            f"{missing[:20]}"
+            f"tw_minute daily-context panel lacks minute symbols: {missing[:20]}"
         )
     panel_symbol_indices = np.asarray(
         [panel_symbol_lookup[str(symbol)] for symbol in minute_symbol_values],
@@ -994,6 +1164,13 @@ def _load_minute_daily_feature_context(
         name: index for index, name in enumerate(cached_feature_names)
     }
     requested = tuple(str(value) for value in requested_feature_names)
+    if daily_guidance is not None:
+        if MINUTE_DAILY_GUIDANCE_FEATURE in requested:
+            raise RuntimeError(
+                "tw_minute daily guidance feature is reserved for its audited "
+                "guidance artifact"
+            )
+        requested = (*requested, MINUTE_DAILY_GUIDANCE_FEATURE)
     if not requested:
         raise RuntimeError("tw_minute daily context requires at least one feature")
     if len(set(requested)) != len(requested):
@@ -1001,7 +1178,8 @@ def _load_minute_daily_feature_context(
     unsupported = [
         name
         for name in requested
-        if name != MINUTE_DAILY_OPEN_GAP_FEATURE and name not in cached_feature_lookup
+        if name not in {MINUTE_DAILY_OPEN_GAP_FEATURE, MINUTE_DAILY_GUIDANCE_FEATURE}
+        and name not in cached_feature_lookup
     ]
     if unsupported:
         raise RuntimeError(
@@ -1012,7 +1190,8 @@ def _load_minute_daily_feature_context(
         [
             index
             for index, name in enumerate(requested)
-            if name != MINUTE_DAILY_OPEN_GAP_FEATURE
+            if name
+            not in {MINUTE_DAILY_OPEN_GAP_FEATURE, MINUTE_DAILY_GUIDANCE_FEATURE}
         ],
         dtype=np.int64,
     )
@@ -1020,13 +1199,19 @@ def _load_minute_daily_feature_context(
         [
             cached_feature_lookup[name]
             for name in requested
-            if name != MINUTE_DAILY_OPEN_GAP_FEATURE
+            if name
+            not in {MINUTE_DAILY_OPEN_GAP_FEATURE, MINUTE_DAILY_GUIDANCE_FEATURE}
         ],
         dtype=np.int64,
     )
     opening_gap_output_index = (
         requested.index(MINUTE_DAILY_OPEN_GAP_FEATURE)
         if MINUTE_DAILY_OPEN_GAP_FEATURE in requested
+        else None
+    )
+    daily_guidance_output_index = (
+        requested.index(MINUTE_DAILY_GUIDANCE_FEATURE)
+        if MINUTE_DAILY_GUIDANCE_FEATURE in requested
         else None
     )
 
@@ -1045,8 +1230,7 @@ def _load_minute_daily_feature_context(
     current_session_indices = np.full(minute_day_values.shape, -1, dtype=np.int64)
     exact = insertion < panel_dates.size
     exact &= (
-        panel_dates[np.clip(insertion, 0, panel_dates.size - 1)]
-        == minute_day_values
+        panel_dates[np.clip(insertion, 0, panel_dates.size - 1)] == minute_day_values
     )
     current_session_indices[exact] = insertion[exact]
 
@@ -1082,18 +1266,23 @@ def _load_minute_daily_feature_context(
     digest_payload = {
         "contract": MINUTE_DAILY_CONTEXT_CONTRACT,
         "metadata_sha256": _sha256(resolved_meta),
-        "features_sha256": arrays.get("features", {}).get(
-            "content_fingerprint", {}
-        ).get("sha256"),
-        "open_prices_sha256": arrays.get("open_prices", {}).get(
-            "content_fingerprint", {}
-        ).get("sha256"),
-        "close_prices_sha256": arrays.get("close_prices", {}).get(
-            "content_fingerprint", {}
-        ).get("sha256"),
+        "features_sha256": arrays.get("features", {})
+        .get("content_fingerprint", {})
+        .get("sha256"),
+        "open_prices_sha256": arrays.get("open_prices", {})
+        .get("content_fingerprint", {})
+        .get("sha256"),
+        "close_prices_sha256": arrays.get("close_prices", {})
+        .get("content_fingerprint", {})
+        .get("sha256"),
         "feature_names": list(requested),
         "minute_symbols": list(minute_symbols),
         "minute_dates": [str(value) for value in minute_day_values],
+        **(
+            {"daily_guidance_fingerprint": daily_guidance.fingerprint}
+            if daily_guidance is not None
+            else {}
+        ),
     }
     if not all(
         isinstance(digest_payload[name], str) and digest_payload[name]
@@ -1114,12 +1303,12 @@ def _load_minute_daily_feature_context(
     benchmark_digest_payload = {
         "contract": "configured_symbol_adjusted_close_buy_hold_first_to_last_v1",
         "benchmark_name": resolved_benchmark_name,
-        "returns_1d_sha256": arrays.get("returns_1d", {}).get(
-            "content_fingerprint", {}
-        ).get("sha256"),
-        "close_prices_sha256": arrays.get("close_prices", {}).get(
-            "content_fingerprint", {}
-        ).get("sha256"),
+        "returns_1d_sha256": arrays.get("returns_1d", {})
+        .get("content_fingerprint", {})
+        .get("sha256"),
+        "close_prices_sha256": arrays.get("close_prices", {})
+        .get("content_fingerprint", {})
+        .get("sha256"),
         "minute_dates": [str(value) for value in minute_day_values],
     }
     if not all(
@@ -1148,6 +1337,8 @@ def _load_minute_daily_feature_context(
         previous_session_indices=previous_session_indices.astype(np.int64, copy=False),
         current_session_indices=current_session_indices,
         opening_gap_output_index=opening_gap_output_index,
+        daily_guidance=daily_guidance,
+        daily_guidance_output_index=daily_guidance_output_index,
         fingerprint=fingerprint,
         benchmark_name=resolved_benchmark_name,
         benchmark_log_returns=benchmark_log_returns,
@@ -1211,14 +1402,15 @@ def _load_minute_short_rules(
     )
     aligned &= dates[np.clip(date_indices, 0, dates.size - 1)] == date_values
     aligned &= (
-        symbol_array[np.clip(symbol_indices, 0, symbol_array.size - 1)]
-        == symbol_values
+        symbol_array[np.clip(symbol_indices, 0, symbol_array.size - 1)] == symbol_values
     )
     date_indices = date_indices[aligned]
     symbol_indices = symbol_indices[aligned]
     flat = date_indices * symbol_array.size + symbol_indices
     if np.unique(flat).size != flat.size:
-        raise RuntimeError("tw_minute short-rule parquet has duplicate date-symbol rows")
+        raise RuntimeError(
+            "tw_minute short-rule parquet has duplicate date-symbol rows"
+        )
 
     shape = (int(dates.size), int(symbol_array.size))
     eligible = np.zeros(shape, dtype=np.bool_)
@@ -1227,22 +1419,17 @@ def _load_minute_short_rules(
     source_capacity = np.zeros(shape, dtype=np.int64)
 
     def numeric(name: str) -> np.ndarray:
-        return (
-            frame[name]
-            .cast(pl.Float64)
-            .fill_null(float("nan"))
-            .to_numpy()[aligned]
-        )
+        return frame[name].cast(pl.Float64).fill_null(float("nan")).to_numpy()[aligned]
 
     eligible_values = numeric("_twpub_day_trade_eligible")
     direction_values = numeric("_twpub_day_trade_short_open")
     evidence_values = numeric("_twpub_margin_short_evidence_next_session")
     capacity_values = numeric("_twpub_short_capacity_shares_next_session")
-    eligible[date_indices, symbol_indices] = (
-        np.isfinite(eligible_values) & (eligible_values > 0.0)
+    eligible[date_indices, symbol_indices] = np.isfinite(eligible_values) & (
+        eligible_values > 0.0
     )
-    sell_first[date_indices, symbol_indices] = (
-        np.isfinite(direction_values) & (direction_values > 0.0)
+    sell_first[date_indices, symbol_indices] = np.isfinite(direction_values) & (
+        direction_values > 0.0
     )
     valid_capacity = (
         np.isfinite(evidence_values)
@@ -1278,6 +1465,53 @@ def _load_minute_short_rules(
     return short_open, short_capacity, digest.hexdigest()
 
 
+def minute_trainable_session_summaries(
+    manifest: Mapping[str, Any],
+) -> tuple[list[str], list[dict[str, Any]], tuple[str, ...]]:
+    """Return sessions with at least one observable model feature row.
+
+    A source can contain isolated off-calendar or malformed K bars that produce
+    executor labels but no causal model input.  Such a partition is not a
+    decision sample and must not enter chronological training, normalization,
+    daily-guidance alignment, or recurrent portfolio state.
+    """
+
+    date_strings = [str(value) for value in manifest.get("dates", [])]
+    if not date_strings or date_strings != sorted(set(date_strings)):
+        raise RuntimeError("minute manifest dates are empty, duplicated, or unsorted")
+    raw_summaries = list(manifest.get("partitions", []))
+    summaries: dict[str, dict[str, Any]] = {}
+    feature_rows_by_date: dict[str, int] = {}
+    for raw in raw_summaries:
+        if not isinstance(raw, dict):
+            raise RuntimeError("minute manifest partition summary is not an object")
+        key = str(raw.get("trade_date", ""))
+        if not key or key in summaries:
+            raise RuntimeError(f"duplicate or empty minute manifest partition: {key!r}")
+        feature_counts = raw.get("feature_counts", {})
+        inferred_feature_rows = (
+            max((int(value) for value in feature_counts.values()), default=-1)
+            if isinstance(feature_counts, dict)
+            else -1
+        )
+        feature_rows = int(raw.get("feature_valid_rows", inferred_feature_rows))
+        rows = int(raw.get("rows", feature_rows))
+        if rows <= 0 or feature_rows < 0 or feature_rows > rows:
+            raise RuntimeError(
+                f"minute partition {key} has invalid usable-row accounting"
+            )
+        summaries[key] = raw
+        feature_rows_by_date[key] = feature_rows
+    if set(summaries) != set(date_strings):
+        raise RuntimeError("minute manifest date list and partition list disagree")
+    excluded = tuple(key for key in date_strings if feature_rows_by_date[key] == 0)
+    excluded_set = set(excluded)
+    usable_dates = [key for key in date_strings if key not in excluded_set]
+    if not usable_dates:
+        raise RuntimeError("minute dataset has no trainable sessions")
+    return usable_dates, [summaries[key] for key in usable_dates], excluded
+
+
 def load_minute_dataset_index(
     root: str | Path,
     *,
@@ -1289,6 +1523,7 @@ def load_minute_dataset_index(
     daily_context_panel_meta: str | Path | None = None,
     daily_context_feature_names: Sequence[str] = (),
     daily_context_lookback: int = 1,
+    daily_guidance_path: str | Path | None = None,
     benchmark_name: str | None = None,
 ) -> MinuteDatasetIndex:
     resolved_root = Path(root).resolve()
@@ -1309,13 +1544,8 @@ def load_minute_dataset_index(
             "minute dataset feature statistics are stale; rebuild with "
             "Float64 accumulation"
         )
-    if (
-        manifest.get("developing_candle_contract")
-        != MINUTE_DEVELOPING_CANDLE_CONTRACT
-    ):
-        raise RuntimeError(
-            "minute dataset developing-candle contract is incompatible"
-        )
+    if manifest.get("developing_candle_contract") != MINUTE_DEVELOPING_CANDLE_CONTRACT:
+        raise RuntimeError("minute dataset developing-candle contract is incompatible")
     if manifest.get("source") != "shioaji_kbars_1m":
         raise RuntimeError("minute dataset source is not Shioaji Kbars")
     if require_research_ready and not bool(manifest.get("research_ready")):
@@ -1330,13 +1560,19 @@ def load_minute_dataset_index(
         raise RuntimeError("minute model feature schema is incompatible")
 
     symbols = tuple(sorted(str(value) for value in manifest.get("symbols", [])))
-    date_strings = [str(value) for value in manifest.get("dates", [])]
-    if not symbols or not date_strings:
+    if not symbols:
         raise RuntimeError("minute dataset has no symbols or dates")
-    if date_strings != sorted(set(date_strings)):
-        raise RuntimeError("minute manifest dates are not unique and sorted")
+    (
+        date_strings,
+        partition_summaries,
+        excluded_unusable_dates,
+    ) = minute_trainable_session_summaries(manifest)
+    if excluded_unusable_dates and progress is not None:
+        progress(
+            "[tw-minute data] excluded sessions with no causal feature rows: "
+            + ",".join(excluded_unusable_dates)
+        )
     partitions: dict[str, dict[str, Any]] = {}
-    partition_summaries = list(manifest.get("partitions", []))
     partition_paths: list[Path] = []
     partition_contracts: list[dict[str, int | str]] = []
     for summary in partition_summaries:
@@ -1383,10 +1619,14 @@ def load_minute_dataset_index(
                     f"expected={expected} actual={actual}"
                 )
         partitions[key] = summary
-        if progress is not None and not verification_cached and (
-            position == 1
-            or position % 100 == 0
-            or position == len(partition_summaries)
+        if (
+            progress is not None
+            and not verification_cached
+            and (
+                position == 1
+                or position % 100 == 0
+                or position == len(partition_summaries)
+            )
         ):
             progress(
                 "[tw-minute data] verified partitions="
@@ -1421,6 +1661,13 @@ def load_minute_dataset_index(
     resolved_daily_context_lookback = int(daily_context_lookback)
     if resolved_daily_context_lookback < 1:
         raise ValueError("tw_minute daily-context lookback must be positive")
+    daily_guidance = None
+    if daily_guidance_path is not None:
+        daily_guidance = _load_minute_daily_guidance(
+            daily_guidance_path,
+            minute_symbols=symbols,
+            minute_dates=dates,
+        )
     daily_feature_context = None
     if daily_context_panel_meta is not None:
         daily_feature_context = _load_minute_daily_feature_context(
@@ -1428,12 +1675,17 @@ def load_minute_dataset_index(
             minute_symbols=symbols,
             minute_dates=dates,
             requested_feature_names=daily_context_feature_names,
+            daily_guidance=daily_guidance,
             benchmark_name=benchmark_name,
         )
     elif daily_context_feature_names:
         raise RuntimeError(
             "tw_minute daily-context features require "
             "data.minute_daily_context_panel_meta"
+        )
+    elif daily_guidance is not None:
+        raise RuntimeError(
+            "tw_minute daily guidance requires data.minute_daily_context_panel_meta"
         )
     return MinuteDatasetIndex(
         root=resolved_root,
@@ -1446,6 +1698,7 @@ def load_minute_dataset_index(
         short_rules_fingerprint=short_rules_fingerprint,
         daily_feature_context=daily_feature_context,
         daily_context_lookback=resolved_daily_context_lookback,
+        excluded_unusable_dates=excluded_unusable_dates,
     )
 
 
@@ -1455,14 +1708,19 @@ __all__ = [
     "MINUTE_DEVELOPING_CANDLE_FEATURE_COLUMNS",
     "MINUTE_DEVELOPING_CANDLE_CONTRACT",
     "MINUTE_DAILY_CONTEXT_CONTRACT",
+    "MINUTE_DAILY_GUIDANCE_CONTRACT",
+    "MINUTE_DAILY_GUIDANCE_FEATURE",
     "MINUTE_DAILY_OPEN_GAP_FEATURE",
     "MINUTE_SESSION_BARS",
     "MinuteDailyFeatureContext",
+    "MinuteDailyGuidance",
     "MinuteDatasetIndex",
     "MinuteDayPanel",
     "MinuteFeatureNormalizer",
     "add_developing_daily_candle_features",
     "load_minute_dataset_index",
+    "minute_trainable_session_summaries",
     "minute_static_daily_context_feature_names",
+    "minute_daily_guidance_manifest_path",
     "summarize_minute_sessions_for_next_day",
 ]

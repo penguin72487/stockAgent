@@ -1,0 +1,38 @@
+base_config: tw_minute_dual_5090.yaml
+
+experiment_name: tw-full-market-minute-daily-guided-gate-v1
+
+runner:
+  output_dir: artifacts/markets/tw_minute_daily_guided_dual_5090_v1
+  resume: true
+
+data:
+  # Build this immutable OOF artifact with
+  # scripts/build_tw_minute_daily_guidance.py. Every minute year uses the most
+  # recent fold whose train/validation information ends before that year.
+  minute_daily_guidance_path: data_tw_minute/daily_guidance/oof_requested_weights.parquet
+
+trading:
+  # The daily target already owns the signed L1 portfolio risk budget.  The
+  # minute policy can only attenuate each name toward cash and cannot reverse
+  # the daily direction or enlarge its per-name allocation.
+  tw_minute_gross_exposure: 1.0
+  tw_minute_max_name_weight: null
+  tw_minute_outside_cash_logit: null
+  portfolio_activation: pre_normalized
+
+training:
+  # Raw logits become sigmoid exposure gates.  The existing target-delta
+  # ledger turns the resulting absolute target path into any number of exits
+  # and re-entries while charging every real trade.
+  # One completed bar is enough for this execution controller: the 15
+  # developing-session features already summarize the intraday path, while
+  # the separate daily encoder retains its full 32-session context. This lets
+  # the first 09:01 bar decide the next executable minute instead of waiting
+  # for 32 intraday bars and discarding the opening alpha.
+  lookback: 1
+  loss_portfolio_activation: pre_normalized
+  transformer_base_portfolio:
+    portfolio_output_mode: logits
+  financial_transformer:
+    portfolio_output_mode: logits
