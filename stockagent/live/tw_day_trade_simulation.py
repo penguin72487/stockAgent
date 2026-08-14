@@ -2554,6 +2554,10 @@ class TwDayTradeSimulationEngine:
                     "closing_auction_order_status": "filled"
                     if reason == "13_30_closing_auction_fill"
                     else position.get("closing_auction_order_status"),
+                    # A flat position has no remaining liquidation component.
+                    # Keep the cached total aligned with the final realized
+                    # result instead of leaving the preceding minute mark.
+                    "total_net_pnl_twd": realized_net,
                 }
             )
         elif reason.startswith("take_profit"):

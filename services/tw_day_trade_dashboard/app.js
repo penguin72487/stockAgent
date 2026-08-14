@@ -169,6 +169,27 @@ function executionStatusPresentation(value) {
   return presentations[status] || {label: status.replaceAll("_", " "), kind: "warn"};
 }
 
+function totalModeNetPnl(data) {
+  const modes = Array.isArray(data?.modes) ? data.modes : [];
+  const values = modes.map((mode) => {
+    const initial = Number(mode.initial_capital_twd);
+    const equity = Number(mode.total_equity_twd);
+    return Number.isFinite(initial) && Number.isFinite(equity) ? equity - initial : null;
+  }).filter((value) => value != null);
+  return values.length === modes.length && values.length
+    ? values.reduce((sum, value) => sum + value, 0)
+    : null;
+}
+
+function resolvedPositionPnl(row = {}) {
+  const signedShares = Number(row.signed_shares || 0);
+  const realized = row.realized_net_pnl_twd ?? (signedShares === 0 ? row.net_pnl_twd : null);
+  const unrealized = row.unrealized_net_pnl_twd ?? (signedShares === 0 ? 0 : row.last_complete_net_pnl_twd);
+  const reconciled = realized != null && unrealized != null ? Number(realized) + Number(unrealized) : null;
+  const total = row.reconciled_total_net_pnl_twd ?? reconciled ?? row.total_net_pnl_twd ?? row.net_pnl_twd ?? row.last_complete_net_pnl_twd;
+  return {signedShares, realized, unrealized, total};
+}
+
 function renderOverview(data) {
   const modes = Array.isArray(data.modes) ? data.modes : [];
   const healthyModes = modes.filter((mode) => (
@@ -183,21 +204,31 @@ function renderOverview(data) {
   const stalePositions = Number.isFinite(Number(data.stale_position_count))
     ? Number(data.stale_position_count)
     : openPositions.filter((row) => row.valuation_stale).length;
-  const pnlValues = modes.map((mode) => {
-    const initial = Number(mode.initial_capital_twd);
-    const equity = Number(mode.total_equity_twd);
-    return Number.isFinite(initial) && Number.isFinite(equity) ? equity - initial : null;
-  }).filter((value) => value != null);
-  const totalPnl = pnlValues.length ? pnlValues.reduce((sum, value) => sum + value, 0) : null;
+  const sumModeField = (field) => {
+    const values = modes
+      .filter((mode) => mode[field] != null && Number.isFinite(Number(mode[field])))
+      .map((mode) => Number(mode[field]));
+    return values.length === modes.length && values.length
+      ? values.reduce((sum, value) => sum + value, 0)
+      : null;
+  };
+  const totalPnl = totalModeNetPnl(data);
+  const realizedPnl = sumModeField("cumulative_realized_net_pnl_twd");
+  const unrealizedPnl = sumModeField("open_net_liquidation_pnl_twd");
+  const reconciliationDifference = [totalPnl, realizedPnl, unrealizedPnl].every((value) => value != null)
+    ? totalPnl - realizedPnl - unrealizedPnl
+    : null;
+  const reconciled = reconciliationDifference != null && Math.abs(reconciliationDifference) <= .01;
   const returns = modes.map((mode) => Number(mode.return_pct)).filter(Number.isFinite);
   const best = returns.length ? Math.max(...returns) : null;
   const worst = returns.length ? Math.min(...returns) : null;
   const healthKind = healthyModes === modes.length ? "good" : healthyModes ? "warn" : "bad";
-  const pnlKind = pnlClass(totalPnl);
   const cards = [
     ["模式狀態", `${healthyModes}/${modes.length} 可解讀`, healthyModes === modes.length ? "所有 checkpoint 與執行狀態正常" : "有模式需要查看上方警示", healthKind],
     ["所選日持倉", `${number(openPositionCount)} 個`, stalePositions ? `${number(stalePositions)} 個估值延用` : "目前估值皆有新鮮報價", stalePositions ? "warn" : "good"],
-    ["四模式淨損益", totalPnl == null ? "—" : `${totalPnl >= 0 ? "+" : ""}${compactMoney(totalPnl)}`, "四個獨立模擬帳本直接加總", pnlKind],
+    ["四模式已實現", realizedPnl == null ? "—" : `${realizedPnl >= 0 ? "+" : ""}${compactMoney(realizedPnl)}`, "已出場部分，已扣分攤後交易成本", pnlClass(realizedPnl)],
+    ["四模式未實現", unrealizedPnl == null ? "—" : `${unrealizedPnl >= 0 ? "+" : ""}${compactMoney(unrealizedPnl)}`, stalePositions ? `含 ${number(stalePositions)} 個延用估值` : "以可清算 bid／ask 並扣剩餘成本", stalePositions ? "warn" : pnlClass(unrealizedPnl)],
+    ["四模式總淨損益", totalPnl == null ? "—" : `${totalPnl >= 0 ? "+" : ""}${compactMoney(totalPnl)}`, reconciled ? "已實現＋未實現，已與總權益對帳" : reconciliationDifference == null ? "等待完整損益來源" : `對帳差異 ${summaryMoney(reconciliationDifference)}`, reconciled ? pnlClass(totalPnl) : "bad"],
     ["報酬範圍", best == null ? "—" : `${best >= 0 ? "+" : ""}${displayPct(best)} ～ ${worst >= 0 ? "+" : ""}${displayPct(worst)}`, "各模式以自己的初始資金為分母", best != null && worst < 0 ? "warn" : pnlClass(best)],
   ];
   $("overview-kpis").innerHTML = cards.map(([label, value, note, kind]) => `<div class="overview-kpi">
@@ -295,12 +326,13 @@ function renderModes(data) {
         <div><span>該日策略執行</span><strong class="${esc(execution.kind)}">${esc(execution.label)}</strong></div>
         <div><span>持倉／缺價</span><strong>${number(mode.open_position_count)} / ${number(mode.stale_position_count)}</strong></div>
         <div><span>已實現淨損益</span><strong class="${pnlClass(mode.cumulative_realized_net_pnl_twd)}">${summaryMoney(mode.cumulative_realized_net_pnl_twd)}</strong></div>
-        <div><span>13:24 未平</span><strong class="${Number(mode.force_exit_failures || 0) ? "negative" : ""}">${number(mode.force_exit_failures || 0)}</strong></div>
+        <div><span>未實現淨清算損益</span><strong class="${pnlClass(mode.open_net_liquidation_pnl_twd)}">${summaryMoney(mode.open_net_liquidation_pnl_twd)}</strong></div>
       </div>
       <details><summary>查看資金、訊號與曝險細節</summary><div class="metrics">
         <div><span>報酬率資金基準</span><strong>${money(initial)}</strong></div>
         <div><span>已賺手續費退佣</span><strong>${money(mode.cumulative_commission_rebate_accrued_twd)}</strong></div>
         <div><span>訊號時間</span><strong>${shortTime(mode.signal_at)}</strong></div>
+        <div><span>13:24 強平後未平</span><strong class="${Number(mode.force_exit_failures || 0) ? "negative" : ""}">${number(mode.force_exit_failures || 0)}</strong></div>
         ${mode.counterfactual_open_replay ? `<div class="wide"><span>開盤價重建</span><strong>實際開盤 ${shortTime(mode.signal_at)} · 原始訊號 ${shortTime(mode.source_signal_at)} · 非即時成交</strong></div>` : ""}
         <div class="wide"><span>方向總曝險：目標</span><strong>多 ${pct(mix.target_long_gross)} / 空 ${pct(mix.target_short_gross)}</strong></div>
         <div class="wide"><span>整張／深度後 → 平衡後</span><strong>多 ${pct(mix.pre_balance_long_gross)} / 空 ${pct(mix.pre_balance_short_gross)} → 多 ${pct(mix.post_balance_long_gross)} / 空 ${pct(mix.post_balance_short_gross)}</strong></div>
@@ -470,14 +502,17 @@ function renderPositions(data) {
   $("position-count").textContent = `${visible.length} / ${rows.length} 筆`;
   const loadMore = $("load-more-positions");
   loadMore.classList.toggle("hidden", visible.length >= rows.length);
-  $("position-body").innerHTML = visible.map((row) => `<tr>
-    <td><strong>${esc(row.market)}</strong> ${badge(row.side === "long" ? "多" : "空", row.side === "long" ? "good" : "bad")}<small>${esc(row.symbol)} ${esc(row.name || "")}</small></td>
-    <td><strong>${pct(row.target_weight)}</strong><small>成交 ${number(row.filled_shares)}／預計 ${number(row.requested_shares)} 股</small><small>剩餘 ${number(Math.abs(Number(row.signed_shares || 0)))} 股</small></td>
-    <td><strong>進 ${money(row.entry_price)}</strong><small>${shortTime(row.entry_at)}${row.simulation_replay ? ` · 開盤價重建；原始訊號 ${shortTime(row.source_signal_at)}` : ""}</small><small>清算 ${money(row.last_mark_price)} · ${shortTime(row.last_quote_at)}</small></td>
-    <td><strong>TP ${sourceNumber(row.take_profit_price)} · SL ${sourceNumber(row.stop_trigger_price)}</strong><small>${esc(row.stop_order_status)}</small><small>13:20 ${row.eod_limit_price == null ? "—" : sourceNumber(row.eod_limit_price)} · ${esc(row.eod_limit_order_status || "未到")} · ${shortTime(row.eod_limit_submitted_at)}</small></td>
+  $("position-body").innerHTML = visible.map((row) => {
+    const {signedShares, realized:realizedNet, unrealized:unrealizedNet, total:totalNet} = resolvedPositionPnl(row);
+    return `<tr>
+      <td><strong>${esc(row.market)}</strong> ${badge(row.side === "long" ? "多" : "空", row.side === "long" ? "good" : "bad")}<small>${esc(row.symbol)} ${esc(row.name || "")}</small></td>
+      <td><strong>${pct(row.target_weight)}</strong><small>成交 ${number(row.filled_shares)}／預計 ${number(row.requested_shares)} 股</small><small>剩餘 ${number(Math.abs(signedShares))} 股</small></td>
+      <td><strong>進 ${money(row.entry_price)}</strong><small>${shortTime(row.entry_at)}${row.simulation_replay ? ` · 開盤價重建；原始訊號 ${shortTime(row.source_signal_at)}` : ""}</small><small>清算 ${money(row.last_mark_price)} · ${shortTime(row.last_quote_at)}</small></td>
+      <td><strong>TP ${sourceNumber(row.take_profit_price)} · SL ${sourceNumber(row.stop_trigger_price)}</strong><small>${esc(row.stop_order_status)}</small><small>13:20 ${row.eod_limit_price == null ? "—" : sourceNumber(row.eod_limit_price)} · ${esc(row.eod_limit_order_status || "未到")} · ${shortTime(row.eod_limit_submitted_at)}</small></td>
 	    <td><strong>${row.exit_price == null ? (row.last_exit_price == null ? "持倉中" : `部分 ${money(row.last_exit_price)}`) : money(row.exit_price)}</strong><small>${esc(row.exit_reason || row.status || "—")}</small><small>${shortTime(row.exit_at || row.last_exit_at)}</small></td>
-	    <td><strong class="${pnlClass(row.total_net_pnl_twd ?? row.net_pnl_twd ?? row.last_complete_net_pnl_twd)}">${money(row.total_net_pnl_twd ?? row.net_pnl_twd ?? row.last_complete_net_pnl_twd)}</strong><small>${row.valuation_stale ? badge("延用", "warn") : badge("新鮮", "good")}</small></td>
-  </tr>`).join("") || `<tr><td colspan="6">目前沒有符合篩選的持倉</td></tr>`;
+	    <td><strong class="${pnlClass(totalNet)}">總 ${money(totalNet)}</strong><small class="${pnlClass(realizedNet)}">已實現 ${money(realizedNet)}</small><small class="${pnlClass(unrealizedNet)}">未實現 ${money(unrealizedNet)} · ${row.valuation_stale ? badge("延用", "warn") : badge("新鮮", "good")}</small></td>
+    </tr>`;
+  }).join("") || `<tr><td colspan="6">目前沒有符合篩選的持倉</td></tr>`;
 }
 
 function renderSignals() {
@@ -491,6 +526,8 @@ function renderSignals() {
   const target = signalDirectionSummary.target || {};
   const preBalance = signalDirectionSummary.pre_balance || {};
   const actual = signalDirectionSummary.actual || {};
+  const positionMap = new Map((snapshot?.positions || []).map((row) => [`${row.market}\u0000${row.symbol}`, row]));
+  const modeMap = new Map((snapshot?.modes || []).map((mode) => [mode.market, mode]));
   $("signal-direction-summary").innerHTML = [
     ["目前訊號目標", target],
     ["整張／深度後", preBalance],
@@ -499,14 +536,33 @@ function renderSignals() {
   const errorRow = signalLoadError
     ? `<tr class="signal-load-error"><td colspan="6">${esc(signalLoadError)}</td></tr>`
     : "";
-  const rowHtml = signalRows.map((row) => `<tr>
-    <td><strong>${esc(row.market)}</strong><small>${shortTime(row.signal_at)}</small></td>
-    <td><strong>${esc(row.symbol)}</strong> ${badge(row.side, row.side === "long" ? "good" : row.side === "short" ? "bad" : "")}<small>${esc(row.name || "")}</small></td>
-	    <td><strong>${sourceNumber(row.raw_score ?? row.score)}</strong><small>權重 ${pct(row.target_weight)}</small></td>
-	    <td><strong>${number(row.filled_shares)}／${number(row.requested_shares)} 股</strong><small>L1 上限 ${number(row.top_book_capacity_shares)} 股</small></td>
-	    <td><strong>${sourceNumber(row.bid)}／${sourceNumber(row.ask)}</strong><small>${sourceNumber(row.bid_volume_lots)}／${sourceNumber(row.ask_volume_lots)} 張 · ${shortTime(row.quote_at)}</small></td>
-    <td>${row.day_trade_eligible ? badge(row.sell_first_allowed ? "可雙向" : "僅買先", row.sell_first_allowed ? "good" : "warn") : badge("不可當沖", "bad")} ${badge(row.status, row.status === "ready" ? "good" : ["partial_depth", "partial_directional_mix"].includes(row.status) ? "warn" : row.status === "hold" ? "" : "bad")}<small>${esc(row.reason || "")}</small></td>
-  </tr>`).join("");
+  const rowHtml = signalRows.map((row) => {
+    const position = positionMap.get(`${row.market}\u0000${row.symbol}`);
+    const mode = modeMap.get(row.market);
+    const positionPnl = position ? resolvedPositionPnl(position) : null;
+    const hasPosition = Boolean(position && Number(position.filled_shares || 0) > 0);
+    const isOpen = hasPosition && positionPnl.signedShares !== 0;
+    const entryNotional = hasPosition ? Math.abs(Number(position.filled_shares || 0)) * Number(position.entry_price || 0) : null;
+    const modeTotalEquity = Number(mode?.total_equity_twd);
+    const equityImpactPct = hasPosition && positionPnl.total != null && Number.isFinite(modeTotalEquity) && Math.abs(modeTotalEquity) > .01
+      ? Number(positionPnl.total) / modeTotalEquity * 100
+      : null;
+    const currentPrice = isOpen ? position.last_mark_price : position?.exit_price ?? position?.last_exit_price;
+    const currentLabel = isOpen ? "現在可清算價" : hasPosition ? "已平倉價" : "未成交";
+    const currentAt = isOpen ? position.last_quote_at : position?.exit_at ?? position?.last_exit_at;
+    const eligibility = row.day_trade_eligible
+      ? badge(row.sell_first_allowed ? "可雙向" : "僅買先", row.sell_first_allowed ? "good" : "warn")
+      : badge("不可當沖", "bad");
+    const result = badge(row.status, row.status === "ready" ? "good" : ["partial_depth", "partial_directional_mix"].includes(row.status) ? "warn" : row.status === "hold" ? "" : "bad");
+    return `<tr>
+      <td><strong>${esc(row.market)}</strong><small>${shortTime(row.signal_at)}</small></td>
+      <td><strong>${esc(row.symbol)}</strong> ${badge(row.side, row.side === "long" ? "good" : row.side === "short" ? "bad" : "")}<small>${esc(row.name || "")}</small><small>${eligibility} ${result}</small></td>
+	    <td><strong>${sourceNumber(row.raw_score ?? row.score)}</strong><small>權重 ${pct(row.target_weight)}</small><small>${esc(row.reason || "")}</small></td>
+	    <td>${hasPosition ? `<strong>進場價 ${money(position.entry_price)}</strong><small>進場名目 ${money(entryNotional)} · 費用 ${money(position.entry_fee_twd)}</small>` : `<strong>未成交・無進場成本</strong>`}<small>成交 ${number(row.filled_shares)}／${number(row.requested_shares)} 股 · L1 ${number(row.top_book_capacity_shares)}</small></td>
+	    <td><strong>${currentLabel} ${hasPosition ? money(currentPrice) : "—"}</strong><small>${hasPosition ? shortTime(currentAt) : `訊號時 bid／ask ${sourceNumber(row.bid)}／${sourceNumber(row.ask)}`}</small><small class="${pnlClass(positionPnl?.total)}">該檔盈虧 ${hasPosition ? money(positionPnl.total) : "不計盈虧"}</small></td>
+	    <td><strong class="${pnlClass(positionPnl?.total)}">佔該模式總權益 ${equityImpactPct == null ? "—" : `${equityImpactPct >= 0 ? "+" : ""}${displayPct(equityImpactPct)}`}</strong><small>模式總權益 ${Number.isFinite(modeTotalEquity) ? summaryMoney(modeTotalEquity) : "—"}</small><small>${hasPosition ? (position.valuation_stale ? badge("估值延用", "warn") : badge("估值新鮮", "good")) : "未成交不納入"}</small></td>
+    </tr>`;
+  }).join("");
   $("signal-body").innerHTML = errorRow + (rowHtml || `<tr><td colspan="6">目前沒有符合篩選的訊號</td></tr>`);
 }
 
