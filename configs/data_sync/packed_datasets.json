@@ -8,12 +8,15 @@
       "publish": true,
       "pack_buckets": 64,
       "loose_threshold_mib": 8,
+      "excluded_subtrees": [
+        "stocks/panel_cache_v2"
+      ],
       "active_process_substrings": [
         "download_tw_public_data.py",
         "rebuild_tw_public_data_layer.py",
         "build_tw_public_training_features.py"
       ],
-      "note": "Immutable public TW training tree plus official raw receipts."
+      "note": "Immutable public TW training tree plus official raw receipts; reproducible panel_cache_v2 stays node-local."
     },
     {
       "dataset": "tw-minute-train",
