@@ -288,6 +288,9 @@ def test_public_pages_share_visual_tokens() -> None:
     assert "舊約 bid 與新約 ask 必須同時存在" in tw_javascript
     assert ".benchmark-grid" in tw_styles
     assert ".compact-table{table-layout:fixed;white-space:normal}" in tw_styles
+    assert ".overview-kpis{grid-template-columns:repeat(6,minmax(0,1fr))}" in tw_styles
+    assert "open_net_liquidation_pnl_twd" in tw_javascript
+    assert "reconciled_total_net_pnl_twd" in tw_javascript
     assert "maximumSignificantDigits" not in tw_javascript
     assert "@media(max-width:700px)" in tw_styles
     for dashboard in ("tw_day_trade_dashboard", "shioaji_api_dashboard"):

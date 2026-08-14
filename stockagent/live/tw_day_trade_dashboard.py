@@ -854,7 +854,27 @@ def _safe_position(position: Mapping[str, Any]) -> dict[str, Any]:
         "replay_source",
         "counterfactual_open_replay",
     )
-    return {key: position.get(key) for key in allowed if key in position}
+    row = {key: position.get(key) for key in allowed if key in position}
+    signed_shares = int(position.get("signed_shares") or 0)
+    realized = _finite_float(position.get("realized_net_pnl_twd"))
+    if realized is None and signed_shares == 0:
+        realized = _finite_float(position.get("net_pnl_twd"))
+    unrealized = (
+        0.0
+        if signed_shares == 0
+        else _finite_float(position.get("last_complete_net_pnl_twd"))
+    )
+    if realized is not None:
+        row["realized_net_pnl_twd"] = realized
+    row["unrealized_net_pnl_twd"] = unrealized
+    if realized is not None and unrealized is not None:
+        reconciled_total = realized + unrealized
+        row["reconciled_total_net_pnl_twd"] = reconciled_total
+        raw_total = _finite_float(position.get("total_net_pnl_twd"))
+        row["pnl_reconciliation_difference_twd"] = (
+            None if raw_total is None else raw_total - reconciled_total
+        )
+    return row
 
 
 def _historical_positions(root: Path, session_date: str) -> list[dict[str, Any]]:
@@ -1307,6 +1327,7 @@ def build_dashboard_snapshot(
             "missing_mark": "carry only the same open position's last complete liquidation value and flag stale",
             "eligibility": "exact-session TWSE and TPEx official day-trade membership; missing venue/date blocks",
             "fees": "gross commission and sell tax are charged first; earned commission rebate is recorded separately in economic NAV",
+            "pnl_split": "realized net PnL comes only from actual simulated exit fills with allocated entry and exit costs; unrealized net liquidation PnL values remaining shares at executable bid or ask after remaining costs; total net PnL is their reconciled sum",
             "comparison": "all strategies and benchmarks are compared as cumulative net return divided by their own capital basis; TX uses one-contract official initial margin, while 0050/2330 use one-board-lot entry notional",
             "benchmarks": "0050/2330 are anchored to the retained actual session open and marked at executable bid after tw_cash costs; future cash distributions are not credited. TXFR1 holds one real TX front-month contract across sessions, rolls only when the old bid and new ask coexist, never books the calendar spread as return, and includes TWD 60 per side plus statutory futures tax",
             "benchmark_history": (

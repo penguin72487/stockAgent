@@ -6,7 +6,7 @@
   <meta name="color-scheme" content="dark">
   <meta name="theme-color" content="#071019">
   <title>台股四模式當沖模擬</title>
-  <link rel="stylesheet" href="styles.css?v=9">
+  <link rel="stylesheet" href="styles.css?v=10">
   <link rel="stylesheet" href="../dashboard-core.css?v=2">
 </head>
 <body>
@@ -112,14 +112,14 @@
     <section class="panel table-panel">
 	      <div class="panel-head"><div><h2>持倉與完整生命週期</h2><p>依 |訊號權重| 由大到小；買多少、何時買、停利停損、13:20/13:24 狀態與賣出原因</p></div><div class="table-actions"><span id="position-count" class="count"></span><button id="load-more-positions" class="secondary hidden" type="button">載入更多</button></div></div>
 	      <div class="scroll-hint" aria-hidden="true">窄螢幕可左右滑動查看完整生命週期 →</div>
-	      <div class="table-scroll" tabindex="0" role="region" aria-label="持倉完整生命週期"><table class="compact-table position-table"><thead><tr><th>標的／方向</th><th>訊號／成交</th><th>進場／清算</th><th>TP／SL・13:20</th><th>出場</th><th>損益／估值</th></tr></thead><tbody id="position-body"></tbody></table></div>
+	      <div class="table-scroll" tabindex="0" role="region" aria-label="持倉完整生命週期"><table class="compact-table position-table"><thead><tr><th>標的／方向</th><th>訊號／成交</th><th>進場／清算</th><th>TP／SL・13:20</th><th>出場</th><th>損益拆分／估值</th></tr></thead><tbody id="position-body"></tbody></table></div>
     </section>
 
     <section class="panel table-panel">
-	      <div class="panel-head"><div><h2>所有訊號</h2><p>伺服器分頁，依 |目標權重| 由大到小；排序會先顯示少數高權重尾端，方向摘要只計每個模式目前的 signal_id</p></div><div class="table-actions"><span id="signal-count" class="count"></span><button id="load-more-signals" class="secondary hidden" type="button">載入更多</button></div></div>
+	      <div class="panel-head"><div><h2>所有訊號</h2><p>伺服器分頁，依 |目標權重| 由大到小；已成交訊號連結同日持倉，權益影響率＝該檔淨損益 ÷ 所屬模式目前總權益</p></div><div class="table-actions"><span id="signal-count" class="count"></span><button id="load-more-signals" class="secondary hidden" type="button">載入更多</button></div></div>
 	      <div id="signal-direction-summary" class="direction-summary"></div>
 	      <div class="scroll-hint" aria-hidden="true">窄螢幕可左右滑動查看訊號細節 →</div>
-	      <div class="table-scroll" tabindex="0" role="region" aria-label="所有訊號"><table class="compact-table signal-table"><thead><tr><th>時間／模式</th><th>股票／方向</th><th>分數／權重</th><th>成交／深度</th><th>bid／ask</th><th>資格／結果</th></tr></thead><tbody id="signal-body"></tbody></table></div>
+	      <div class="table-scroll" tabindex="0" role="region" aria-label="所有訊號"><table class="compact-table signal-table"><thead><tr><th>時間／模式</th><th>股票／方向／結果</th><th>分數／權重</th><th>進場成本／成交</th><th>現在市價／該檔盈虧</th><th>損益／模式總權益</th></tr></thead><tbody id="signal-body"></tbody></table></div>
     </section>
 
     <div id="operations" class="section-intro">
@@ -159,6 +159,6 @@
       </article>
     </section>
   </main>
-  <script src="app.js?v=12" defer></script>
+  <script src="app.js?v=15" defer></script>
 </body>
 </html>

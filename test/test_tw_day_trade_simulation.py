@@ -941,7 +941,16 @@ def test_1324_market_then_1325_limit_rod_and_1330_auction_fill(tmp_path: Path) -
     )
     assert position["signed_shares"] == 2_000
     assert position["status"] == "force_exit_partially_filled"
-    assert engine.state["modes"][spec.market]["force_exit_failures"] == 1
+    mode = engine.state["modes"][spec.market]
+    assert mode["force_exit_failures"] == 1
+    assert mode["total_equity_twd"] - mode["initial_capital_twd"] == pytest.approx(
+        mode["cumulative_realized_net_pnl_twd"]
+        + mode["open_net_liquidation_pnl_twd"]
+    )
+    assert position["total_net_pnl_twd"] == pytest.approx(
+        position["realized_net_pnl_twd"]
+        + position["last_complete_net_pnl_twd"]
+    )
 
     engine.update_readiness([spec], now=_now(14, 0))
     assert (
@@ -970,6 +979,25 @@ def test_1324_market_then_1325_limit_rod_and_1330_auction_fill(tmp_path: Path) -
     )
     assert position["signed_shares"] == 0
     assert position["status"] == "closed"
+    assert position["total_net_pnl_twd"] == pytest.approx(
+        position["realized_net_pnl_twd"]
+    )
+    assert mode["open_net_liquidation_pnl_twd"] == 0.0
+    assert mode["total_equity_twd"] - mode["initial_capital_twd"] == pytest.approx(
+        mode["cumulative_realized_net_pnl_twd"]
+    )
+    dashboard = build_dashboard_snapshot(
+        state_dir=engine.state_dir,
+        now=_now(13, 30).astimezone(ZoneInfo("UTC")),
+    )
+    dashboard_position = dashboard["positions"][0]
+    assert dashboard_position["unrealized_net_pnl_twd"] == 0.0
+    assert dashboard_position["reconciled_total_net_pnl_twd"] == pytest.approx(
+        dashboard_position["realized_net_pnl_twd"]
+    )
+    assert dashboard_position["pnl_reconciliation_difference_twd"] == pytest.approx(
+        0.0
+    )
     exit_fills = [
         row
         for row in (
@@ -1490,8 +1518,10 @@ def test_dashboard_html_is_local_and_refreshes_api() -> None:
     assert 'id="signal-direction-summary"' in html
     assert 'class="compact-table position-table"' in html
     assert 'class="compact-table signal-table"' in html
-    assert '<th>損益／估值</th>' in html
-    assert '<th>資格／結果</th>' in html
+    assert '<th>損益拆分／估值</th>' in html
+    assert '<th>進場成本／成交</th>' in html
+    assert '<th>現在市價／該檔盈虧</th>' in html
+    assert '<th>損益／模式總權益</th>' in html
     assert 'class="skip-link"' in html
     assert 'aria-label="公開面板導覽"' in html
     assert 'id="overview-kpis"' in html
@@ -1501,6 +1531,20 @@ def test_dashboard_html_is_local_and_refreshes_api() -> None:
     assert "目前訊號目標" in javascript
     assert "方向平衡後" in javascript
     assert "雙向整張不足・保持空倉" in javascript
+    assert "四模式已實現" in javascript
+    assert "四模式未實現" in javascript
+    assert "已實現＋未實現，已與總權益對帳" in javascript
+    assert "未實現淨清算損益" in javascript
+    assert "已實現 ${money(realizedNet)}" in javascript
+    assert "未實現 ${money(unrealizedNet)}" in javascript
+    assert "reconciled_total_net_pnl_twd" in javascript
+    assert "function resolvedPositionPnl(row = {})" in javascript
+    assert "進場名目 ${money(entryNotional)}" in javascript
+    assert "佔該模式總權益" in javascript
+    assert "模式總權益 ${Number.isFinite(modeTotalEquity) ? summaryMoney(modeTotalEquity) : \"—\"}" in javascript
+    assert "Number(positionPnl.total) / modeTotalEquity * 100" in javascript
+    assert "Number(positionPnl.total) / totalPortfolioPnl * 100" not in javascript
+    assert "未成交・無進場成本" in javascript
     assert "所選交易日當沖資格未完整覆蓋" in javascript
     assert "較晚補齊的資料不會回填成假成交" in javascript
     assert "錯過後每秒檢查並立即補跑" in javascript
