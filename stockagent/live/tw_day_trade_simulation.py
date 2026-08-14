@@ -180,6 +180,7 @@ def _prepare_entry_plan(
     evidence: LiveEligibility | None,
     signal_at: datetime,
     spec: ModeSpec,
+    allow_quote_at_signal: bool = False,
 ) -> dict[str, Any]:
     """Resolve one admissible entry before portfolio-level direction balancing."""
 
@@ -213,7 +214,11 @@ def _prepare_entry_plan(
         status, reason = "blocked", "official_open_price_unavailable"
     elif entry_price is None:
         status, reason = "blocked", "no_executable_best_quote"
-    elif quote_at is None or quote_at <= signal_at:
+    elif quote_at is None or (
+        quote_at < signal_at
+        if allow_quote_at_signal
+        else quote_at <= signal_at
+    ):
         status, reason = "blocked", "quote_not_after_signal"
     elif upper is None or lower is None:
         status, reason = "blocked", "price_limit_unavailable"
@@ -561,6 +566,8 @@ class TwDayTradeSimulationEngine:
         self.state_dir = Path(state_dir)
         self.state_path = self.state_dir / "state.json"
         self.status_path = self.state_dir / "status.json"
+        self.positions_path = self.state_dir / "positions.json"
+        self.position_history_dir = self.state_dir / "position_history"
         self.signals_path = self.state_dir / "signals.jsonl"
         self.orders_path = self.state_dir / "orders.jsonl"
         self.fills_path = self.state_dir / "fills.jsonl"
@@ -568,6 +575,136 @@ class TwDayTradeSimulationEngine:
         self.benchmark_marks_path = self.state_dir / "benchmark_marks.jsonl"
         self.events_path = self.state_dir / "events.jsonl"
         self.state = self._load_state()
+        self._reconcile_daily_duplicate_signal_ids()
+        self._restore_position_artifact_paths()
+
+    def _reconcile_daily_duplicate_signal_ids(self) -> None:
+        """Restore the accepted signal identity after a blocked duplicate.
+
+        Older state writers recorded a later ``daily_signal_already_consumed``
+        candidate as the mode's active signal even though the accepted signal,
+        positions, and execution ledger were left untouched.  The append-only
+        event ledger is authoritative for repairing that display-only mismatch.
+        """
+
+        if not self.events_path.is_file():
+            return
+        latest_registered: dict[str, str] = {}
+        latest_event: dict[str, tuple[str, str, str | None]] = {}
+        with self.events_path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    event = json.loads(line)
+                except (TypeError, ValueError):
+                    continue
+                market = str(event.get("market") or "")
+                if not market:
+                    continue
+                event_name = str(event.get("event") or "")
+                signal_id = str(event.get("signal_id") or "")
+                reason = (
+                    str(event.get("reason")) if event.get("reason") is not None else None
+                )
+                if event_name == "signal_registered" and signal_id:
+                    latest_registered[market] = signal_id
+                if event_name in {"signal_registered", "signal_blocked"}:
+                    latest_event[market] = (event_name, signal_id, reason)
+
+        for market, mode in (self.state.get("modes") or {}).items():
+            if not isinstance(mode, dict) or not mode.get("entry_completed_at"):
+                continue
+            registered_id = latest_registered.get(str(market))
+            event_name, duplicate_id, reason = latest_event.get(
+                str(market), ("", "", None)
+            )
+            if (
+                registered_id
+                and event_name == "signal_blocked"
+                and reason == "daily_signal_already_consumed"
+                and duplicate_id
+                and str(mode.get("signal_id") or "") == duplicate_id
+            ):
+                mode["signal_id"] = registered_id
+                mode["last_duplicate_signal_id"] = duplicate_id
+                mode["last_duplicate_signal_reason"] = reason
+
+    def _restore_position_artifact_paths(self) -> None:
+        """Backfill position artifact pointers for signals accepted before schema 1."""
+
+        for mode in (self.state.get("modes") or {}).values():
+            if not isinstance(mode, dict):
+                continue
+            mode["executed_positions_path"] = str(self.positions_path)
+            if mode.get("target_weights_path") and mode.get("target_positions_path"):
+                continue
+            source_path = str(mode.get("signal_source_path") or "").strip()
+            if not source_path:
+                continue
+            try:
+                summary = json.loads(Path(source_path).read_text(encoding="utf-8"))
+            except (OSError, TypeError, ValueError):
+                continue
+            if not isinstance(summary, Mapping) or str(
+                summary.get("signal_id") or ""
+            ) != str(mode.get("signal_id") or ""):
+                continue
+            mode["target_weights_path"] = summary.get("weights_path")
+            mode["target_positions_path"] = (
+                summary.get("positions_markdown_path") or summary.get("weights_path")
+            )
+            mode["target_symbol_count"] = summary.get("symbol_count")
+            mode["target_risk"] = summary.get("target_risk") or {}
+
+    @staticmethod
+    def _position_history_filename(market: object) -> str:
+        normalized = "".join(
+            character
+            if character.isalnum() or character in {"-", "_"}
+            else "_"
+            for character in str(market or "unknown")
+        )
+        return f"{normalized or 'unknown'}.json"
+
+    def _archive_mode_positions(
+        self,
+        mode: Mapping[str, Any],
+        *,
+        archived_at: datetime,
+    ) -> None:
+        """Persist the completed prior-session position lifecycle by date.
+
+        ``state.json`` intentionally owns only the latest session.  Without a
+        dated archive the dashboard date selector could retain marks and fills
+        but lose the corresponding closed position rows as soon as the next
+        signal arrived.
+        """
+
+        positions = [
+            dict(position)
+            for position in (mode.get("positions") or {}).values()
+            if isinstance(position, Mapping)
+        ]
+        session_date = str(mode.get("session_date") or "").strip()
+        if not session_date or not positions:
+            return
+        destination = (
+            self.position_history_dir
+            / session_date
+            / self._position_history_filename(mode.get("market"))
+        )
+        _atomic_json(
+            destination,
+            {
+                "schema_version": 1,
+                "session_date": session_date,
+                "market": mode.get("market"),
+                "signal_id": mode.get("signal_id"),
+                "archived_at": archived_at.isoformat(timespec="seconds"),
+                "simulation_only": True,
+                "production_order_possible": False,
+                "positions": positions,
+            },
+        )
 
     def _load_state(self) -> dict[str, Any]:
         if self.state_path.is_file():
@@ -764,7 +901,12 @@ class TwDayTradeSimulationEngine:
                         "valuation_stale",
                         "valuation_source",
                         "entry_at",
+                        "entry_price",
                         "roll_count",
+                        "previous_contract_code",
+                        "last_roll_at",
+                        "last_roll_old_bid",
+                        "last_roll_new_ask",
                         "fixed_fees_twd",
                         "transaction_tax_twd",
                     )
@@ -943,9 +1085,23 @@ class TwDayTradeSimulationEngine:
                         "contract_code": current_code,
                         "entry_price": current_ask,
                         "last_roll_at": now.isoformat(timespec="seconds"),
+                        "last_roll_old_bid": old_bid,
+                        "last_roll_new_ask": current_ask,
                         "roll_count": int(row.get("roll_count") or 0) + 1,
                     }
                 )
+                roll_history = list(row.get("roll_history") or ())
+                roll_history.append(
+                    {
+                        "rolled_at": now.isoformat(timespec="seconds"),
+                        "from_contract": held_code,
+                        "to_contract": current_code,
+                        "old_bid": old_bid,
+                        "new_ask": current_ask,
+                        "fee_per_side_twd": fee_per_side,
+                    }
+                )
+                row["roll_history"] = roll_history[-100:]
                 held_code = current_code
             else:
                 row["valuation_stale"] = True
@@ -1044,6 +1200,7 @@ class TwDayTradeSimulationEngine:
         mode["checkpoint_path"] = spec.checkpoint_path
         mode["live_output_dir"] = str(spec.live_output_dir)
         mode["signal_market"] = spec.signal_market or spec.market
+        mode["executed_positions_path"] = str(self.positions_path)
         mode["price_limit_offset_ticks"] = int(spec.price_limit_offset_ticks)
         mode["bracket_price_policy"] = (
             "inside_daily_limits_by_ticks"
@@ -1165,6 +1322,7 @@ class TwDayTradeSimulationEngine:
         mode["rearm_count"] = int(mode.get("rearm_count") or 0) + 1
         self._event(
             "flat_session_rearmed",
+            recorded_at=observed,
             market=market,
             session_date=session_date,
             reason=normalized_reason,
@@ -1204,6 +1362,7 @@ class TwDayTradeSimulationEngine:
         modes.pop(normalized_market)
         self._event(
             "simulation_mode_retired",
+            recorded_at=observed,
             market=normalized_market,
             reason=normalized_reason,
         )
@@ -1227,10 +1386,16 @@ class TwDayTradeSimulationEngine:
                     return True
         return False
 
-    def _event(self, event: str, **payload: Any) -> None:
+    def _event(
+        self,
+        event: str,
+        *,
+        recorded_at: datetime | None = None,
+        **payload: Any,
+    ) -> None:
         _append_jsonl(
             self.events_path,
-            {"recorded_at": _iso(), "event": event, **payload},
+            {"recorded_at": _iso(recorded_at), "event": event, **payload},
         )
 
     def _order(self, payload: Mapping[str, Any]) -> None:
@@ -1285,6 +1450,7 @@ class TwDayTradeSimulationEngine:
         eligibility: Mapping[str, LiveEligibility],
         eligibility_coverage: Mapping[str, Any],
         now: datetime | None = None,
+        counterfactual_open_replay: bool = False,
     ) -> str:
         observed = _now_taipei(now)
         mode = self._mode(spec)
@@ -1295,21 +1461,40 @@ class TwDayTradeSimulationEngine:
             return "already_processed"
         if str(summary.get("execution_mode") or "") != "tw_day_trade":
             return self._block_signal(mode, signal_id, "not_tw_day_trade", observed)
-        signal_at = _parse_timestamp(
+        source_signal_at = _parse_timestamp(
             summary.get("generated_at") or summary.get("asof_date")
         )
-        if signal_at is None:
+        if source_signal_at is None:
             return self._block_signal(
                 mode, signal_id, "invalid_signal_timestamp", observed
             )
-        if signal_at.date() != observed.date():
+        if source_signal_at.date() != observed.date():
             return self._block_signal(
                 mode, signal_id, "signal_not_current_session", observed
             )
         wall_time = observed.timetz().replace(tzinfo=None)
+        if counterfactual_open_replay:
+            if not bool(summary.get("simulation_replay")):
+                raise ValueError(
+                    "counterfactual open replay requires simulation_replay=true"
+                )
+            if str(summary.get("entry_fill_contract") or "") != (
+                "retrospective_actual_session_open_price_counterfactual"
+            ):
+                raise ValueError(
+                    "counterfactual open replay requires the retrospective "
+                    "session-open fill contract"
+                )
+            if wall_time != ENTRY_GATE:
+                raise ValueError(
+                    "counterfactual open replay must be recorded exactly at 09:00"
+                )
+            signal_at = observed
+        else:
+            signal_at = source_signal_at
         if wall_time < ENTRY_GATE or wall_time >= EXIT_LIMIT_TIME:
             return self._block_signal(mode, signal_id, "outside_entry_window", observed)
-        if wall_time < FIRST_MINUTE_EXECUTION_TIME:
+        if wall_time < FIRST_MINUTE_EXECUTION_TIME and not counterfactual_open_replay:
             mode["pending_signal_id"] = signal_id
             mode["pending_signal_at"] = signal_at.isoformat(timespec="seconds")
             mode["engine_status"] = "waiting_first_completed_minute"
@@ -1318,6 +1503,12 @@ class TwDayTradeSimulationEngine:
         if not bool(summary.get("live_session_open_feature_applied")):
             return self._block_signal(
                 mode, signal_id, "open_feature_not_observed", observed
+            )
+        if str(
+            mode.get("session_date") or ""
+        ) == observed.date().isoformat() and mode.get("entry_completed_at"):
+            return self._block_signal(
+                mode, signal_id, "daily_signal_already_consumed", observed
             )
         if any(
             int(position.get("signed_shares") or 0) != 0
@@ -1330,12 +1521,6 @@ class TwDayTradeSimulationEngine:
                 observed,
                 engine_status="critical_prior_position_unflattened",
             )
-        if str(
-            mode.get("session_date") or ""
-        ) == observed.date().isoformat() and mode.get("entry_completed_at"):
-            return self._block_signal(
-                mode, signal_id, "daily_signal_already_consumed", observed
-            )
 
         actionable_symbols = [
             str(row.get("symbol") or "")
@@ -1345,7 +1530,11 @@ class TwDayTradeSimulationEngine:
         later_quote_found = any(
             (quote_at := _parse_timestamp(quotes.get(symbol, {}).get("quote_at")))
             is not None
-            and quote_at > signal_at
+            and (
+                quote_at >= signal_at
+                if counterfactual_open_replay
+                else quote_at > signal_at
+            )
             for symbol in actionable_symbols
         )
         if actionable_symbols and not later_quote_found:
@@ -1373,14 +1562,35 @@ class TwDayTradeSimulationEngine:
             fee_schedule=spec.fee_schedule,
         )
 
+        prior_session_date = str(mode.get("session_date") or "")
+        if prior_session_date and prior_session_date != observed.date().isoformat():
+            self._archive_mode_positions(mode, archived_at=observed)
+
         mode["session_date"] = observed.date().isoformat()
         mode["signal_id"] = signal_id
         mode["signal_at"] = signal_at.isoformat(timespec="seconds")
+        mode["source_signal_at"] = source_signal_at.isoformat(timespec="seconds")
+        mode["counterfactual_open_replay"] = bool(counterfactual_open_replay)
         mode["signal_source_path"] = summary.get("summary_path")
+        mode["target_weights_path"] = summary.get("weights_path")
+        mode["target_positions_path"] = (
+            summary.get("positions_markdown_path") or summary.get("weights_path")
+        )
+        mode["target_symbol_count"] = summary.get("symbol_count") or len(signal_rows)
+        mode["target_risk"] = dict(summary.get("target_risk") or {})
         mode["feature_cutoff_date"] = summary.get("feature_cutoff_date")
         mode["checkpoint_fingerprint"] = summary.get("checkpoint_fingerprint")
         mode["config_fingerprint"] = summary.get("config_fingerprint")
         mode["eligibility_coverage"] = dict(eligibility_coverage)
+        mode["simulation_replay"] = bool(summary.get("simulation_replay", False))
+        mode["replay_basis"] = summary.get("replay_basis")
+        mode["replay_source"] = summary.get("replay_source")
+        mode["entry_fill_contract"] = summary.get("entry_fill_contract") or (
+            "best_ask_for_buy_best_bid_for_sell"
+        )
+        mode["entry_liquidity_assumption"] = summary.get(
+            "entry_liquidity_assumption"
+        ) or "minimum_of_level_one_displayed_volume_and_50pct_completed_minute_kbar_volume"
         mode["positions"] = {}
         mode["entry_completed_at"] = observed.isoformat(timespec="seconds")
         mode["exit_limit_submitted_at"] = None
@@ -1394,6 +1604,7 @@ class TwDayTradeSimulationEngine:
                 evidence=eligibility.get(str(row.get("symbol") or "")),
                 signal_at=signal_at,
                 spec=spec,
+                allow_quote_at_signal=counterfactual_open_replay,
             )
             for row in signal_rows
             if str(row.get("symbol") or "")
@@ -1470,6 +1681,7 @@ class TwDayTradeSimulationEngine:
                 "price_limit_offset_ticks": offset_ticks,
                 "signal_id": signal_id,
                 "signal_at": signal_at.isoformat(timespec="seconds"),
+                "source_signal_at": source_signal_at.isoformat(timespec="seconds"),
                 "symbol": symbol,
                 "name": row.get("name"),
                 "side": side,
@@ -1503,6 +1715,10 @@ class TwDayTradeSimulationEngine:
                 "eligibility_covered": bool(evidence and evidence.covered),
                 "day_trade_eligible": bool(evidence and evidence.eligible),
                 "sell_first_allowed": bool(evidence and evidence.short_open),
+                "quote_source": quote.get("source"),
+                "simulation_replay": bool(mode.get("simulation_replay")),
+                "replay_basis": mode.get("replay_basis"),
+                "counterfactual_open_replay": bool(counterfactual_open_replay),
             }
             _append_jsonl(self.signals_path, signal_record)
             counts[status] = counts.get(status, 0) + 1
@@ -1548,6 +1764,8 @@ class TwDayTradeSimulationEngine:
                 "signal_market": spec.signal_market or spec.market,
                 "session_date": observed.date().isoformat(),
                 "signal_id": signal_id,
+                "signal_at": signal_at.isoformat(timespec="seconds"),
+                "source_signal_at": source_signal_at.isoformat(timespec="seconds"),
                 "symbol": symbol,
                 "name": row.get("name"),
                 "side": side,
@@ -1597,6 +1815,10 @@ class TwDayTradeSimulationEngine:
                 "realized_exit_fee_twd": 0.0,
                 "realized_net_pnl_twd": 0.0,
                 "valuation_stale": False,
+                "simulation_replay": bool(mode.get("simulation_replay")),
+                "replay_basis": mode.get("replay_basis"),
+                "replay_source": mode.get("replay_source"),
+                "counterfactual_open_replay": bool(counterfactual_open_replay),
             }
             mode["positions"][position_id] = position
             mode["cumulative_commission_rebate_accrued_twd"] = (
@@ -1640,8 +1862,10 @@ class TwDayTradeSimulationEngine:
                     "fee_and_tax_twd": entry_fee,
                     "gross_fee_and_tax_twd": entry_gross_fee,
                     "commission_rebate_accrued_twd": entry_rebate,
-                    "fill_contract": "best_ask_for_buy_best_bid_for_sell",
-                    "depth_assumption": "minimum_of_level_one_displayed_volume_and_50pct_completed_minute_kbar_volume",
+                    "fill_contract": mode.get("entry_fill_contract"),
+                    "depth_assumption": mode.get("entry_liquidity_assumption"),
+                    "simulation_replay": bool(mode.get("simulation_replay")),
+                    "replay_basis": mode.get("replay_basis"),
                 }
             )
             for purpose, order_type, price, order_status in (
@@ -1685,10 +1909,15 @@ class TwDayTradeSimulationEngine:
         )
         self._event(
             "signal_registered",
+            recorded_at=observed,
             market=spec.market,
             signal_id=signal_id,
             counts=counts,
             execution_projection=asdict(directional_mix),
+            simulation_replay=bool(mode.get("simulation_replay")),
+            replay_basis=mode.get("replay_basis"),
+            source_signal_at=source_signal_at.isoformat(timespec="seconds"),
+            counterfactual_open_replay=bool(counterfactual_open_replay),
         )
         self._mark_mode(spec.market, observed, quotes)
         self._persist(observed)
@@ -1706,11 +1935,27 @@ class TwDayTradeSimulationEngine:
         processed = list(mode.get("processed_signal_ids") or ())
         processed.append(signal_id)
         mode["processed_signal_ids"] = processed[-32:]
+        if reason == "daily_signal_already_consumed":
+            mode["last_duplicate_signal_id"] = signal_id
+            mode["last_duplicate_signal_reason"] = reason
+            mode["last_duplicate_signal_blocked_at"] = now.isoformat(
+                timespec="seconds"
+            )
+            self._event(
+                "signal_blocked",
+                recorded_at=now,
+                market=mode.get("market"),
+                signal_id=signal_id,
+                reason=reason,
+            )
+            self._persist(now)
+            return "blocked"
         mode["signal_id"] = signal_id
         mode["engine_status"] = engine_status
         mode["blocked_reason"] = reason
         self._event(
             "signal_blocked",
+            recorded_at=now,
             market=mode.get("market"),
             signal_id=signal_id,
             reason=reason,
@@ -1732,10 +1977,36 @@ class TwDayTradeSimulationEngine:
                 int(position.get("signed_shares") or 0) != 0
                 for position in positions.values()
             ):
+                # Schema-migrated positions may only be reduced.  Reuse the
+                # ordinary bracket close path once a real executable quote and
+                # completed-minute capacity exist; never open or enlarge a
+                # legacy position merely to unblock the next session.
+                for position in positions.values():
+                    if int(position.get("signed_shares") or 0) == 0:
+                        continue
+                    quote = quotes.get(str(position.get("symbol"))) or {}
+                    self._apply_bracket(position, mode, quote, observed)
                 self._mark_mode(market, observed, quotes)
-                mode["engine_status"] = (
-                    "critical_legacy_position_requires_reconciliation"
+                still_open = any(
+                    int(position.get("signed_shares") or 0) != 0
+                    for position in positions.values()
                 )
+                if still_open:
+                    mode["engine_status"] = (
+                        "critical_legacy_position_requires_reconciliation"
+                    )
+                else:
+                    mode["legacy_execution_contract"] = False
+                    mode["legacy_reconciled_at"] = observed.isoformat(
+                        timespec="seconds"
+                    )
+                    mode["engine_status"] = "waiting_signal"
+                    self._event(
+                        "legacy_positions_reconciled",
+                        recorded_at=observed,
+                        market=market,
+                        session_date=observed.date().isoformat(),
+                    )
                 continue
             if wall_time < EXIT_LIMIT_TIME:
                 for position in positions.values():
@@ -1855,7 +2126,7 @@ class TwDayTradeSimulationEngine:
                 now=now,
                 purpose="13_20_exit_limit",
             )
-        self._event("exit_limits_submitted", market=market)
+        self._event("exit_limits_submitted", recorded_at=now, market=market)
 
     def _place_exit_limit(
         self,
@@ -1956,7 +2227,7 @@ class TwDayTradeSimulationEngine:
     ) -> None:
         if not mode.get("force_exit_started_at"):
             mode["force_exit_started_at"] = now.isoformat(timespec="seconds")
-            self._event("force_exit_started", market=market)
+            self._event("force_exit_started", recorded_at=now, market=market)
         failures = 0
         for position in (mode.get("positions") or {}).values():
             if int(position.get("signed_shares") or 0) == 0:
@@ -2047,6 +2318,7 @@ class TwDayTradeSimulationEngine:
             )
         self._event(
             "closing_auction_limits_submitted",
+            recorded_at=now,
             market=market,
             submitted=submitted,
         )
@@ -2091,7 +2363,7 @@ class TwDayTradeSimulationEngine:
                 position["closing_auction_order_status"] = "filled"
             else:
                 position["closing_auction_order_status"] = "part_filled"
-        self._event("closing_auction_settled", market=market)
+        self._event("closing_auction_settled", recorded_at=now, market=market)
 
     def _convert_residual_to_carry(
         self,
@@ -2185,6 +2457,7 @@ class TwDayTradeSimulationEngine:
             mode["engine_status"] = "critical_residual_carried_after_13_30"
         self._event(
             "residual_positions_reclassified",
+            recorded_at=now,
             market=market,
             converted=converted,
             unresolved=unresolved,
@@ -2456,6 +2729,47 @@ class TwDayTradeSimulationEngine:
         self.state["updated_at"] = observed.isoformat(timespec="seconds")
         _atomic_json(self.state_path, self.state)
         mode_rows = list(self.state.get("modes", {}).values())
+        _atomic_json(
+            self.positions_path,
+            {
+                "schema_version": 1,
+                "generated_at": observed.isoformat(timespec="seconds"),
+                "simulation_only": True,
+                "production_order_possible": False,
+                "position_contract": {
+                    "target": (
+                        "complete model targets are stored at target_weights_path "
+                        "and target_positions_path"
+                    ),
+                    "executed": (
+                        "positions contains paper-simulation fills; an empty list "
+                        "is an explicit flat position"
+                    ),
+                },
+                "modes": {
+                    str(item.get("market")): {
+                        "market": item.get("market"),
+                        "label": item.get("label"),
+                        "session_date": item.get("session_date"),
+                        "signal_id": item.get("signal_id"),
+                        "signal_at": item.get("signal_at"),
+                        "engine_status": item.get("engine_status"),
+                        "target_weights_path": item.get("target_weights_path"),
+                        "target_positions_path": item.get("target_positions_path"),
+                        "target_symbol_count": item.get("target_symbol_count"),
+                        "target_risk": item.get("target_risk") or {},
+                        "open_position_count": int(item.get("open_position_count") or 0),
+                        "positions": [
+                            dict(position)
+                            for position in (item.get("positions") or {}).values()
+                            if isinstance(position, Mapping)
+                            and int(position.get("signed_shares") or 0) != 0
+                        ],
+                    }
+                    for item in mode_rows
+                },
+            },
+        )
         critical = any(
             str(item.get("engine_status") or "").startswith("critical")
             for item in mode_rows
@@ -2518,6 +2832,11 @@ class TwDayTradeSimulationEngine:
                             "session_date",
                             "signal_id",
                             "signal_at",
+                            "target_weights_path",
+                            "target_positions_path",
+                            "executed_positions_path",
+                            "target_symbol_count",
+                            "target_risk",
                             "initial_capital_twd",
                             "total_equity_twd",
                             "cumulative_realized_net_pnl_twd",

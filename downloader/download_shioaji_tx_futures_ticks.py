@@ -14,6 +14,8 @@ from typing import Any
 
 import polars as pl
 
+from stockagent.live.shioaji_traffic_ledger import shioaji_query
+
 from downloader.download_shioaji_tw_kbars import (
     TrafficBudgetReached,
     _atomic_write_json,
@@ -257,11 +259,22 @@ def main() -> int:
             except TrafficBudgetReached:
                 stopped_for_traffic = True
                 break
-            ticks = api.ticks(
-                contract=contract,
-                date=trading_date.isoformat(),
-                timeout=int(args.timeout_ms),
-            )
+            with shioaji_query(
+                api,
+                consumer="futures_history_backfill",
+                method="ticks",
+                asset_class="futures",
+                details={
+                    "contract": str(args.contract),
+                    "date": trading_date.isoformat(),
+                },
+            ) as set_ledger_result:
+                ticks = api.ticks(
+                    contract=contract,
+                    date=trading_date.isoformat(),
+                    timeout=int(args.timeout_ms),
+                )
+                set_ledger_result(ticks)
             frame, source_order_monotonic = _ticks_frame(
                 ticks, trading_date=trading_date, contract_code=str(args.contract)
             )

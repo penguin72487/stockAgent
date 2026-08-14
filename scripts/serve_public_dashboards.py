@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 import gzip
 import hashlib
 from http import HTTPStatus
@@ -30,17 +30,23 @@ from stockagent.live.public_dashboards import (  # noqa: E402
     UnsafePublicDashboardPayload,
     sanitize_taifex_history,
     sanitize_taifex_status,
+    sanitize_tw_events,
     sanitize_tw_signals,
     sanitize_tw_status,
 )
 from stockagent.live.shioaji_api_dashboard import (  # noqa: E402
     build_shioaji_public_status,
 )
+from stockagent.live.tw_day_trade_dashboard import (  # noqa: E402
+    build_dashboard_event_page,
+    build_dashboard_snapshot,
+)
 
 
 MAX_UPSTREAM_BYTES: Final[int] = 8 * 1024 * 1024
 MAX_REQUEST_TARGET_BYTES: Final[int] = 2_048
 PUBLIC_SIGNAL_LIMIT: Final[int] = 250
+PUBLIC_EVENT_LIMIT: Final[int] = 250
 API_CONCURRENCY: Final[int] = 32
 MAX_CACHE_ENTRIES: Final[int] = 512
 _OPENER = build_opener(ProxyHandler({}))
@@ -107,18 +113,21 @@ def summarize_tw_status(payload: Mapping[str, Any]) -> dict[str, Any]:
 
     open_count, stale_count = _open_position_summary(payload)
     allowed = (
+        "schema_version",
         "dashboard_schema_version",
         "generated_at_utc",
         "health",
         "source_age_seconds",
         "source_updated_at",
         "session_date",
+        "available_session_dates",
         "simulation_only",
         "production_order_possible",
         "current_market_phase",
         "modes",
         "benchmarks",
         "record_counts",
+        "execution_records",
         "session_progress",
         "preopen",
     )
@@ -429,13 +438,21 @@ class PublicDashboardServer(ThreadingHTTPServer):
             builder=build,
         )
 
-    def tw_status(self) -> PreparedResponse:
-        return self.cached_json(
-            cache_key="tw-status",
-            upstream_url=f"{self.tw_upstream}/api/status",
+    def tw_status(self, session_date: str | None = None) -> PreparedResponse:
+        normalized_date = str(session_date or "").strip()
+        return self.cached_local_json(
+            cache_key=f"tw-status:{normalized_date or 'latest'}",
             ttl_seconds=2.0,
             cache_control="public, max-age=2, stale-while-revalidate=8",
-            sanitizer=sanitize_tw_status,
+            builder=lambda: sanitize_tw_status(
+                build_dashboard_snapshot(
+                    state_dir=self.repo_root
+                    / "artifacts/live/tw_day_trade_simulation",
+                    preopen_readiness_path=self.repo_root
+                    / "artifacts/discord_bot/preopen_readiness.json",
+                    session_date=normalized_date or None,
+                )
+            ),
         )
 
     def public_overview(self) -> Mapping[str, Any]:
@@ -625,19 +642,40 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
         )
 
     @staticmethod
+    def _date_query(raw_query: str) -> str | None:
+        query = parse_qs(
+            raw_query,
+            keep_blank_values=True,
+            strict_parsing=False,
+            max_num_fields=1,
+        )
+        if set(query) - {"date"} or any(
+            len(values) != 1 for values in query.values()
+        ):
+            raise ValueError("unsupported or repeated query field")
+        value = str(query.get("date", [""])[0]).strip()
+        if not value:
+            return None
+        date.fromisoformat(value)
+        return value
+
+    @staticmethod
     def _signal_query(raw_query: str) -> str:
         query = parse_qs(
             raw_query,
             keep_blank_values=True,
             strict_parsing=False,
-            max_num_fields=5,
+            max_num_fields=6,
         )
-        allowed = {"mode", "symbol", "status", "offset", "limit"}
+        allowed = {"date", "mode", "symbol", "status", "offset", "limit"}
         if set(query) - allowed or any(len(values) != 1 for values in query.values()):
             raise ValueError("unsupported or repeated query field")
         mode = str(query.get("mode", [""])[0])[:64]
         symbol = str(query.get("symbol", [""])[0])[:32]
         status = str(query.get("status", ["all"])[0])[:32]
+        session_date = str(query.get("date", [""])[0]).strip()
+        if session_date:
+            date.fromisoformat(session_date)
         offset = int(query.get("offset", ["0"])[0])
         limit = int(query.get("limit", [str(PUBLIC_SIGNAL_LIMIT)])[0])
         if offset < 0 or offset > 100_000:
@@ -647,9 +685,43 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
         limit = min(limit, PUBLIC_SIGNAL_LIMIT)
         return urlencode(
             {
+                "date": session_date,
                 "mode": mode,
                 "symbol": symbol,
                 "status": status,
+                "offset": offset,
+                "limit": limit,
+            }
+        )
+
+    @staticmethod
+    def _event_query(raw_query: str) -> str:
+        query = parse_qs(
+            raw_query,
+            keep_blank_values=True,
+            strict_parsing=False,
+            max_num_fields=5,
+        )
+        allowed = {"date", "mode", "symbol", "offset", "limit"}
+        if set(query) - allowed or any(len(values) != 1 for values in query.values()):
+            raise ValueError("unsupported or repeated query field")
+        mode = str(query.get("mode", [""])[0])[:64]
+        symbol = str(query.get("symbol", [""])[0])[:32]
+        session_date = str(query.get("date", [""])[0]).strip()
+        if session_date:
+            date.fromisoformat(session_date)
+        offset = int(query.get("offset", ["0"])[0])
+        limit = int(query.get("limit", [str(PUBLIC_EVENT_LIMIT)])[0])
+        if offset < 0 or offset > 100_000:
+            raise ValueError("offset is outside the public range")
+        if limit < 1:
+            raise ValueError("limit must be positive")
+        limit = min(limit, PUBLIC_EVENT_LIMIT)
+        return urlencode(
+            {
+                "date": session_date,
+                "mode": mode,
+                "symbol": symbol,
                 "offset": offset,
                 "limit": limit,
             }
@@ -680,14 +752,15 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                 sanitizer=sanitize_taifex_history,
             )
         if path == "/tw-day-trade/api/status":
-            return self.server.tw_status()
+            return self.server.tw_status(self._date_query(raw_query))
         if path == "/tw-day-trade/api/summary":
+            session_date = self._date_query(raw_query)
             return self.server.cached_local_json(
-                cache_key="tw-summary",
+                cache_key=f"tw-summary:{session_date or 'latest'}",
                 ttl_seconds=2.0,
                 cache_control="public, max-age=2, stale-while-revalidate=8",
                 builder=lambda: summarize_tw_status(
-                    _response_json(self.server.tw_status())
+                    _response_json(self.server.tw_status(session_date))
                 ),
             )
         if path == "/tw-day-trade/api/signals":
@@ -698,6 +771,30 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                 ttl_seconds=2.0,
                 cache_control="public, max-age=2, stale-while-revalidate=8",
                 sanitizer=sanitize_tw_signals,
+            )
+        if path == "/tw-day-trade/api/events":
+            normalized = self._event_query(raw_query)
+            query = parse_qs(normalized, keep_blank_values=True)
+            session_date = str(query.get("date", [""])[0]) or None
+            mode = str(query.get("mode", [""])[0])
+            symbol = str(query.get("symbol", [""])[0])
+            offset = int(query.get("offset", ["0"])[0])
+            limit = int(query.get("limit", [str(PUBLIC_EVENT_LIMIT)])[0])
+            return self.server.cached_local_json(
+                cache_key=f"tw-events:{normalized}",
+                ttl_seconds=2.0,
+                cache_control="public, max-age=2, stale-while-revalidate=8",
+                builder=lambda: sanitize_tw_events(
+                    build_dashboard_event_page(
+                        state_dir=self.server.repo_root
+                        / "artifacts/live/tw_day_trade_simulation",
+                        session_date=session_date,
+                        mode=mode,
+                        symbol=symbol,
+                        offset=offset,
+                        limit=limit,
+                    )
+                ),
             )
         if path == "/shioaji/api/status":
             return self.server.cached_local_json(

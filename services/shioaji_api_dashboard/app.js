@@ -9,16 +9,19 @@ let refreshInFlight = false;
 let lastHeavyRevision = "";
 
 function number(value, digits = 0) {
+  if (value == null || value === "") return "—";
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed.toLocaleString("zh-TW", {maximumFractionDigits: digits}) : "—";
 }
 
 function compact(value) {
+  if (value == null || value === "") return "—";
   const parsed = Number(value);
   return Number.isFinite(parsed) ? new Intl.NumberFormat("zh-TW", {notation: "compact", maximumFractionDigits: 2}).format(parsed) : "—";
 }
 
 function bytes(value) {
+  if (value == null || value === "") return "—";
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) return "—";
   const units = ["B", "KiB", "MiB", "GiB", "TiB"];
@@ -29,6 +32,7 @@ function bytes(value) {
 }
 
 function percent(value, digits = 1) {
+  if (value == null || value === "") return "—";
   const parsed = Number(value);
   return Number.isFinite(parsed) ? `${(parsed * 100).toFixed(digits)}%` : "—";
 }
@@ -66,6 +70,14 @@ function categoryLabel(category) {
 
 function quotaLabel(quota) {
   return ({historical: "計入歷史流量", realtime: "不扣歷史流量", none: "不呼叫 API"})[quota] || "配額待確認";
+}
+
+function storageClassLabel(storageClass) {
+  return ({source: "永豐來源", derived: "本機衍生", reference: "合約目錄", operations: "狀態／稽核"})[storageClass] || "其他";
+}
+
+function usageStatusLabel(status) {
+  return ({measured: "已量測", unattributed: "待新查詢事件", quota_exempt: "官方免計額度", local_only: "本機處理"})[status] || "待確認";
 }
 
 function metricValue(metric) {
@@ -242,6 +254,162 @@ function renderTrafficTable(history) {
   });
 }
 
+function renderTrafficLedger(ledger) {
+  const totals = ledger?.totals || {};
+  const observed = Boolean(ledger?.updated_at_utc);
+  setText("ledger-queries", number(observed ? totals.queries : null));
+  setText("ledger-avoided", number(observed ? totals.avoided_queries : null));
+  setText("ledger-bytes", bytes(observed ? totals.observed_usage_delta_bytes : null));
+  setText("ledger-failures", number(observed ? totals.failures : null));
+  setText("ledger-stream-ticks", compact(observed ? totals.stream_tick_events : null));
+  setText("ledger-stream-books", compact(observed ? totals.stream_book_events : null));
+  setText("ledger-stream-storage", bytes(observed ? totals.stream_stored_bytes : null));
+  setText("ledger-stream-dropped", number(observed ? totals.stream_dropped_events : null));
+  setText("ledger-observed", ledger?.updated_at_utc ? `更新 ${localTime(ledger.updated_at_utc)}` : "尚無紀錄");
+  const body = $("ledger-body");
+  body.replaceChildren();
+  const rows = Array.isArray(ledger?.by_consumer) ? ledger.by_consumer : [];
+  if (!rows.length) {
+    const row = document.createElement("tr");
+    const cell = document.createElement("td"); cell.colSpan = 8; cell.textContent = "尚無查詢或即時串流紀錄"; row.append(cell); body.append(row); return;
+  }
+  rows.sort((left, right) => Number(right.queries || 0) - Number(left.queries || 0)).forEach((item) => {
+    const row = document.createElement("tr");
+    appendCell(row, item.name || "unknown");
+    appendCell(row, number(item.queries));
+    appendCell(row, number(item.avoided_queries));
+    appendCell(row, compact(item.stream_tick_events));
+    appendCell(row, compact(item.stream_book_events));
+    appendCell(row, bytes(item.stream_stored_bytes));
+    appendCell(row, bytes(item.observed_usage_delta_bytes));
+    appendCell(row, `${number(item.failures)} / ${number(item.stream_dropped_events)}`);
+    body.append(row);
+  });
+}
+
+function renderTrafficBreakdown(rows) {
+  const body = $("traffic-breakdown-body");
+  body.replaceChildren();
+  const items = Array.isArray(rows) ? rows : [];
+  if (!items.length) {
+    const row = document.createElement("tr");
+    const cell = document.createElement("td"); cell.colSpan = 8; cell.textContent = "尚無流量分類"; row.append(cell); body.append(row); return;
+  }
+  items.forEach((item) => {
+    const row = document.createElement("tr");
+    appendCell(row, item.title || "—");
+    appendCell(row, item.api_surface || "—", "api-code");
+    appendCell(row, item.price_label || "—");
+    appendCell(row, quotaLabel(item.quota_class));
+    appendCell(row, bytes(item.attributed_bytes));
+    appendCell(row, `${number(item.queries)} / ${number(item.avoided_queries)}`);
+    appendCell(row, compact(item.stream_events));
+    appendCell(row, usageStatusLabel(item.usage_status), `usage-status ${item.usage_status || "unknown"}`);
+    body.append(row);
+  });
+}
+
+function renderStorageGrowthChart(rows) {
+  const svg = $("storage-growth-chart");
+  while (svg.lastChild && !["title", "desc"].includes(svg.lastChild.localName)) svg.lastChild.remove();
+  const items = Array.isArray(rows) ? rows.filter((row) => Number.isFinite(Number(row.bytes))) : [];
+  const maximum = Math.max(0, ...items.map((row) => Number(row.bytes)));
+  $("storage-chart-empty").hidden = items.length > 0 && maximum > 0;
+  if (!items.length || maximum <= 0) return;
+  const width = 960, height = 300, left = 72, right = 18, top = 20, bottom = 44;
+  const plotWidth = width - left - right, plotHeight = height - top - bottom;
+  [0, 0.5, 1].forEach((ratio) => {
+    const y = top + (1 - ratio) * plotHeight;
+    svg.append(svgNode("line", {x1: left, y1: y, x2: width - right, y2: y, class: "grid-line"}));
+    svg.append(svgNode("text", {x: left - 10, y: y + 4, class: "axis-label", "text-anchor": "end"}, bytes(maximum * ratio)));
+  });
+  const slot = plotWidth / items.length;
+  items.forEach((item, index) => {
+    const barHeight = (Number(item.bytes) / maximum) * plotHeight;
+    svg.append(svgNode("rect", {
+      x: left + index * slot + Math.max(1, slot * 0.14),
+      y: top + plotHeight - barHeight,
+      width: Math.max(2, slot * 0.72),
+      height: Math.max(1, barHeight),
+      rx: 2,
+      class: "storage-bar",
+    }));
+  });
+  svg.append(svgNode("text", {x: left, y: height - 13, class: "axis-label"}, items[0].date || "—"));
+  svg.append(svgNode("text", {x: width - right, y: height - 13, class: "axis-label", "text-anchor": "end"}, items.at(-1).date || "—"));
+}
+
+function renderStorageBars(datasets, totalBytes) {
+  const container = $("storage-bars");
+  container.replaceChildren();
+  const items = Array.isArray(datasets) ? datasets : [];
+  if (!items.length || !Number.isFinite(Number(totalBytes)) || Number(totalBytes) <= 0) {
+    container.append(node("p", "empty", "背景容量掃描尚未完成"));
+    return;
+  }
+  items.slice(0, 9).forEach((item) => {
+    const ratio = Math.max(0, Math.min(1, Number(item.bytes || 0) / Number(totalBytes)));
+    const row = node("div", "storage-bar-row");
+    const copy = node("div", "storage-bar-copy");
+    copy.append(node("span", "", item.title || "—"), node("strong", "", `${bytes(item.bytes)} · ${percent(ratio, 1)}`));
+    const progress = node("progress", "storage-progress");
+    progress.max = 100;
+    progress.value = ratio * 100;
+    progress.setAttribute("aria-label", `${item.title || "資料"}占總容量 ${percent(ratio, 1)}`);
+    row.append(copy, progress);
+    container.append(row);
+  });
+}
+
+function renderStorageTable(datasets) {
+  const body = $("storage-body");
+  body.replaceChildren();
+  const rows = Array.isArray(datasets) ? datasets : [];
+  if (!rows.length) {
+    const row = document.createElement("tr");
+    const cell = document.createElement("td"); cell.colSpan = 9; cell.textContent = "背景容量掃描尚未完成"; row.append(cell); body.append(row); return;
+  }
+  rows.forEach((item) => {
+    const row = document.createElement("tr");
+    appendCell(row, item.title || "—");
+    appendCell(row, storageClassLabel(item.storage_class));
+    appendCell(row, quotaLabel(item.quota_class));
+    appendCell(row, bytes(item.bytes));
+    appendCell(row, number(item.files));
+    appendCell(row, bytes(item.growth_window_bytes));
+    appendCell(row, bytes(item.average_daily_growth_bytes));
+    appendCell(row, `${number(item.active_growth_days)} / ${number(item.growth_window_days)}`);
+    appendCell(row, localTime(item.latest_changed_at_utc));
+    body.append(row);
+  });
+}
+
+function storageDaysLabel(value) {
+  if (value == null || value === "" || !Number.isFinite(Number(value))) return "—";
+  const days = Number(value);
+  if (days >= 365) return `${number(days / 365, 1)} 年`;
+  return `${number(days, 0)} 天`;
+}
+
+function renderStorage(storage, renderHeavy) {
+  const summary = storage?.summary || {};
+  setText("storage-total", bytes(summary.total_bytes));
+  setText("storage-files", `${number(summary.files)} 個實體檔案 · ${number(summary.datasets)} 個群組`);
+  setText("storage-source", bytes(summary.source_bytes));
+  setText("storage-derived", bytes(summary.derived_bytes));
+  setText("storage-growth", bytes(summary.average_daily_growth_bytes));
+  setText("storage-growth-window", `近 ${number(summary.growth_window_days)} 日共 ${bytes(summary.growth_window_bytes)}`);
+  setText("storage-free", bytes(summary.disk_free_bytes));
+  setText("storage-disk-ratio", `磁碟已使用 ${percent(summary.disk_used_ratio, 1)} · 總容量 ${bytes(summary.disk_total_bytes)}`);
+  setText("storage-days", storageDaysLabel(summary.estimated_days_remaining));
+  setText("storage-observed", storage?.generated_at_utc ? `掃描 ${ageLabel(storage.age_seconds)} · 耗時 ${number(storage.scan_seconds, 1)} 秒` : "背景掃描尚未完成");
+  if (renderHeavy) {
+    renderStorageGrowthChart(storage?.daily_growth);
+    renderStorageBars(storage?.datasets, summary.total_bytes);
+    renderStorageTable(storage?.datasets);
+  }
+}
+
 function renderContracts(rows) {
   const body = $("contracts-body");
   body.replaceChildren();
@@ -293,6 +461,9 @@ function render(data) {
       item.latest_at_utc, item.fields, item.metrics, item.warnings, item.service,
     ]),
     data.traffic?.history,
+    data.traffic_ledger,
+    data.traffic_breakdown,
+    data.storage,
     data.traffic?.guard_fraction,
     data.backfill?.contracts,
   ]);
@@ -319,12 +490,20 @@ function render(data) {
   setText("traffic-remaining", bytes(traffic.remaining_bytes));
   setText("traffic-safe-remaining", bytes(traffic.safe_remaining_bytes));
   setText("traffic-reset", traffic.reset_policy || "—");
+  setText("traffic-price", "無逐次資料費");
+  setText("traffic-tier", bytes(traffic.limit_bytes));
+  setText("traffic-attributed", bytes(traffic.attributed_bytes));
+  setText("traffic-unattributed", bytes(traffic.unattributed_bytes));
   const trafficObserved = traffic.observed_at_utc ? (Date.now() - new Date(traffic.observed_at_utc).getTime()) / 1000 : null;
   setText("traffic-observed", `用量觀測 ${ageLabel(trafficObserved)}`);
   if (renderHeavy) {
     renderTrafficChart(traffic.history, traffic.guard_fraction);
     renderTrafficTable(traffic.history);
+    renderTrafficLedger(data.traffic_ledger || {});
+    renderTrafficBreakdown(data.traffic_breakdown || []);
   }
+
+  renderStorage(data.storage || {}, renderHeavy);
 
   const backfill = data.backfill || {};
   const ratio = Number(backfill.progress_ratio) || 0;

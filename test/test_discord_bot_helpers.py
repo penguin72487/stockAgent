@@ -118,14 +118,17 @@ def test_user_facing_commands_support_user_install_and_private_contexts() -> Non
 def test_setup_hook_syncs_only_global_commands(monkeypatch: pytest.MonkeyPatch) -> None:
     sync_guilds: list[object | None] = []
     started_loops: list[str] = []
+    startup_events: list[str] = []
 
     async def fake_sync(_tree, *, guild=None):
+        startup_events.append("sync")
         sync_guilds.append(guild)
         return []
 
     def fake_start(loop, *args, **kwargs):
         del args, kwargs
         started_loops.append(loop.coro.__name__)
+        startup_events.append(f"start:{loop.coro.__name__}")
 
     monkeypatch.setattr(discord_bot.app_commands.CommandTree, "sync", fake_sync)
     monkeypatch.setattr(discord_bot.tasks.Loop, "start", fake_start)
@@ -140,3 +143,4 @@ def test_setup_hook_syncs_only_global_commands(monkeypatch: pytest.MonkeyPatch) 
         "artifact_backfill",
         "model_auto_deployment",
     }
+    assert startup_events[:2] == ["start:scheduled_signal", "sync"]

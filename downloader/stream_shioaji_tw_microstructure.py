@@ -19,6 +19,7 @@ from zoneinfo import ZoneInfo
 import polars as pl
 
 from stockagent.data.taifex_sessions import taifex_trading_date
+from stockagent.live.shioaji_traffic_ledger import StreamingLedgerRecorder
 
 
 TAIPEI = ZoneInfo("Asia/Taipei")
@@ -375,6 +376,7 @@ class PartWriter:
         self.part_sequence = 0
         self.total_rows = 0
         self.total_parts = 0
+        self.total_bytes = 0
         self.last_flush = time.monotonic()
 
     def append(self, row: dict[str, Any]) -> None:
@@ -421,6 +423,7 @@ class PartWriter:
             os.replace(temporary, path)
             self.total_rows += len(rows)
             self.total_parts += 1
+            self.total_bytes += int(path.stat().st_size)
         self.last_flush = time.monotonic()
 
 
@@ -454,6 +457,8 @@ class EventSink:
         self.stats_lock = threading.Lock()
         self.latest_books: dict[str, dict[str, Any]] = {}
         self.stale_ms = stale_ms
+        self.live_book_codes: set[str] = set()
+        self.live_books_path = output_dir / "runtime" / f"worker_{worker_index:02d}.json"
         options = {
             "worker_index": worker_index,
             "capture_id": capture_id,
@@ -492,6 +497,7 @@ class EventSink:
     def _emit_snapshots(self, second: int) -> None:
         snapshot_ns = second * 1_000_000_000
         snapshot_datetime = datetime.fromtimestamp(snapshot_ns / 1e9, tz=TAIPEI)
+        live_books: dict[str, dict[str, Any]] = {}
         for book in self.latest_books.values():
             snapshot_date = (
                 taifex_trading_date(snapshot_datetime)
@@ -518,6 +524,40 @@ class EventSink:
             }
             self.snapshot_writer.append(row)
             self.stats.book_1s_rows += 1
+            if str(book["code"]) in self.live_book_codes:
+                live_books[str(book["code"])] = {
+                    key: (str(value) if key == "trade_date" else value)
+                    for key, value in row.items()
+                    if key
+                    in {
+                        "snapshot_ts_ns",
+                        "code",
+                        "trade_date",
+                        "book_exchange_ts_ns",
+                        "book_receive_ts_ns",
+                        "book_age_ms",
+                        "stale",
+                        "suspend",
+                        "simtrade",
+                        "bid_price_1",
+                        "bid_volume_1",
+                        "ask_price_1",
+                        "ask_volume_1",
+                    }
+                }
+        if self.live_book_codes:
+            _atomic_json(
+                self.live_books_path,
+                {
+                    "schema_version": 1,
+                    "source": SOURCE_NAME,
+                    "published_at": snapshot_datetime.astimezone(timezone.utc)
+                    .isoformat()
+                    .replace("+00:00", "Z"),
+                    "worker_index": self.worker_index,
+                    "books": live_books,
+                },
+            )
 
     def _run(self) -> None:
         current_second = time.time_ns() // 1_000_000_000
@@ -693,6 +733,30 @@ def main() -> None:
             f"top-market-cap symbols missing Shioaji contracts: {missing}"
         )
     sink.start()
+    stream_ledger = StreamingLedgerRecorder(
+        consumer="stock_top200_stream",
+        asset_class="stock",
+        details={
+            "worker_index": int(args.worker_index),
+            "trade_date": datetime.now(TAIPEI).date().isoformat(),
+        },
+    )
+    last_ledger_observation = time.monotonic()
+
+    def observe_stream_ledger() -> None:
+        stats = sink.stats
+        stream_ledger.observe(
+            tick_events=stats.tick_events,
+            book_events=stats.book_events,
+            snapshot_rows=stats.book_1s_rows,
+            dropped_events=stats.dropped_events,
+            stored_bytes=(
+                sink.tick_writer.total_bytes
+                + sink.book_writer.total_bytes
+                + sink.snapshot_writer.total_bytes
+            ),
+        )
+
     subscribed = 0
     status = "running"
     try:
@@ -719,6 +783,9 @@ def main() -> None:
             flush=True,
         )
         while datetime.now(TAIPEI) < stop_at and not shutdown.wait(0.5):
+            if time.monotonic() - last_ledger_observation >= 60.0:
+                observe_stream_ledger()
+                last_ledger_observation = time.monotonic()
             if sink.fatal_event.is_set():
                 status = "failed_event_loss_or_normalization"
                 break
@@ -728,6 +795,7 @@ def main() -> None:
             status = "complete"
     finally:
         sink.stop()
+        observe_stream_ledger()
         try:
             api.logout()
         except Exception:

@@ -14,6 +14,8 @@ from typing import Any, Callable
 
 import polars as pl
 
+from stockagent.live.shioaji_traffic_ledger import shioaji_query
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
@@ -374,12 +376,24 @@ def query_minute_chunk(
         try:
             if request_started is not None:
                 request_started()
-            payload = api.kbars(
-                contract=contract,
-                start=start.isoformat(),
-                end=end.isoformat(),
-                timeout=int(timeout_ms),
-            )
+            with shioaji_query(
+                api,
+                consumer="stock_minute_backfill",
+                method="kbars",
+                asset_class="stock",
+                details={
+                    "contract": row.symbol,
+                    "start": start.isoformat(),
+                    "end": end.isoformat(),
+                },
+            ) as set_ledger_result:
+                payload = api.kbars(
+                    contract=contract,
+                    start=start.isoformat(),
+                    end=end.isoformat(),
+                    timeout=int(timeout_ms),
+                )
+                set_ledger_result(payload)
             frame, stats = clean_payload(payload)
             returned_dates = set(frame["date"].to_list()) if frame.height else set()
             missing_dates = sorted(expected_dates - returned_dates)
@@ -388,12 +402,24 @@ def query_minute_chunk(
                 for missing_date in missing_dates:
                     if request_started is not None:
                         request_started()
-                    fallback_payload = api.kbars(
-                        contract=contract,
-                        start=missing_date.isoformat(),
-                        end=missing_date.isoformat(),
-                        timeout=int(timeout_ms),
-                    )
+                    with shioaji_query(
+                        api,
+                        consumer="stock_minute_gap_recovery",
+                        method="kbars",
+                        asset_class="stock",
+                        details={
+                            "contract": row.symbol,
+                            "start": missing_date.isoformat(),
+                            "end": missing_date.isoformat(),
+                        },
+                    ) as set_fallback_ledger_result:
+                        fallback_payload = api.kbars(
+                            contract=contract,
+                            start=missing_date.isoformat(),
+                            end=missing_date.isoformat(),
+                            timeout=int(timeout_ms),
+                        )
+                        set_fallback_ledger_result(fallback_payload)
                     fallback, fallback_stats = clean_payload(fallback_payload)
                     for key, value in fallback_stats.items():
                         stats[key] += value

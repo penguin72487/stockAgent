@@ -6,7 +6,7 @@
   <meta name="color-scheme" content="dark">
   <meta name="theme-color" content="#071019">
   <title>台股四模式當沖模擬</title>
-  <link rel="stylesheet" href="styles.css?v=6">
+  <link rel="stylesheet" href="styles.css?v=9">
   <link rel="stylesheet" href="../dashboard-core.css?v=2">
 </head>
 <body>
@@ -36,8 +36,8 @@
   </header>
 
   <nav class="jump-nav" aria-label="本頁快速導覽">
-    <a href="#overview">今日總覽</a>
-    <a href="#performance">四模式績效</a>
+    <a href="#overview">交易日總覽</a>
+    <a href="#performance">策略與基準</a>
     <a href="#details">持倉與訊號</a>
     <a href="#operations">執行進度</a>
     <a href="#audit">資料稽核</a>
@@ -47,21 +47,26 @@
     <section id="alert" class="alert hidden" role="alert" aria-live="assertive"></section>
 
     <div id="overview" class="section-intro">
-      <div><span>01</span><h2>今日是否可解讀</h2></div>
+      <div><span>01</span><h2>所選交易日是否可解讀</h2></div>
       <p>資料狀態、完成模式、持倉與損益先於技術流程。</p>
     </div>
-    <section id="overview-kpis" class="overview-kpis" aria-label="今日核心摘要" aria-busy="true">
+    <section id="overview-kpis" class="overview-kpis" aria-label="所選交易日核心摘要" aria-busy="true">
       <div class="overview-kpi loading"><span>模式狀態</span><strong>讀取中</strong><small>—</small></div>
-      <div class="overview-kpi loading"><span>今日持倉</span><strong>—</strong><small>—</small></div>
+      <div class="overview-kpi loading"><span>所選日持倉</span><strong>—</strong><small>—</small></div>
       <div class="overview-kpi loading"><span>四模式淨損益</span><strong>—</strong><small>—</small></div>
       <div class="overview-kpi loading"><span>報酬範圍</span><strong>—</strong><small>—</small></div>
     </section>
 
     <div id="performance" class="section-intro">
-      <div><span>02</span><h2>四模式績效</h2></div>
-      <p>每個模式用自己的資金基準；不能直接把資金規模當成策略優劣。</p>
+      <div><span>02</span><h2>四模式與市場基準</h2></div>
+      <p>先分開看策略與市場；每條線都用自己的資金基準。</p>
     </div>
     <section id="mode-cards" class="mode-grid" aria-label="四模式績效卡片"></section>
+    <div id="baselines" class="subsection-head">
+      <div><h3>市場基準</h3><span>0050、2330、台指期前月連續持有</span></div>
+      <p>實際開盤起算；台指期換月不把合約價差灌入報酬。</p>
+    </div>
+    <section id="benchmark-cards" class="benchmark-grid" aria-label="市場基準績效卡片"></section>
 
     <div id="details" class="section-intro">
       <div><span>03</span><h2>持倉與訊號下鑽</h2></div>
@@ -94,6 +99,7 @@
         </ol>
         <dl class="source-list">
           <div><dt>訊號</dt><dd id="source-signal">—</dd></div>
+          <div><dt>開盤價重建</dt><dd id="source-replay">—</dd></div>
           <div><dt>成交</dt><dd id="source-fill">—</dd></div>
           <div><dt>成本</dt><dd id="source-fees">—</dd></div>
           <div><dt>百分比比較</dt><dd id="source-comparison">—</dd></div>
@@ -105,15 +111,15 @@
 
     <section class="panel table-panel">
 	      <div class="panel-head"><div><h2>持倉與完整生命週期</h2><p>依 |訊號權重| 由大到小；買多少、何時買、停利停損、13:20/13:24 狀態與賣出原因</p></div><div class="table-actions"><span id="position-count" class="count"></span><button id="load-more-positions" class="secondary hidden" type="button">載入更多</button></div></div>
-	      <div class="scroll-hint" aria-hidden="true">表格可左右滑動查看完整生命週期 →</div>
-	      <div class="table-scroll" tabindex="0" role="region" aria-label="持倉生命週期，可左右捲動"><table><thead><tr><th>模式／股票</th><th>方向</th><th>訊號權重</th><th>成交／剩餘</th><th>進場</th><th>即時清算</th><th>停利／停損</th><th>13:20</th><th>出場</th><th>淨損益</th><th>估值</th></tr></thead><tbody id="position-body"></tbody></table></div>
+	      <div class="scroll-hint" aria-hidden="true">窄螢幕可左右滑動查看完整生命週期 →</div>
+	      <div class="table-scroll" tabindex="0" role="region" aria-label="持倉完整生命週期"><table class="compact-table position-table"><thead><tr><th>標的／方向</th><th>訊號／成交</th><th>進場／清算</th><th>TP／SL・13:20</th><th>出場</th><th>損益／估值</th></tr></thead><tbody id="position-body"></tbody></table></div>
     </section>
 
     <section class="panel table-panel">
 	      <div class="panel-head"><div><h2>所有訊號</h2><p>伺服器分頁，依 |目標權重| 由大到小；排序會先顯示少數高權重尾端，方向摘要只計每個模式目前的 signal_id</p></div><div class="table-actions"><span id="signal-count" class="count"></span><button id="load-more-signals" class="secondary hidden" type="button">載入更多</button></div></div>
 	      <div id="signal-direction-summary" class="direction-summary"></div>
-	      <div class="scroll-hint" aria-hidden="true">表格可左右滑動查看訊號細節 →</div>
-	      <div class="table-scroll" tabindex="0" role="region" aria-label="所有訊號，可左右捲動"><table><thead><tr><th>時間</th><th>模式</th><th>股票</th><th>方向</th><th>分數</th><th>目標權重</th><th>成交／預計</th><th>bid / ask</th><th>資格</th><th>結果</th></tr></thead><tbody id="signal-body"></tbody></table></div>
+	      <div class="scroll-hint" aria-hidden="true">窄螢幕可左右滑動查看訊號細節 →</div>
+	      <div class="table-scroll" tabindex="0" role="region" aria-label="所有訊號"><table class="compact-table signal-table"><thead><tr><th>時間／模式</th><th>股票／方向</th><th>分數／權重</th><th>成交／深度</th><th>bid／ask</th><th>資格／結果</th></tr></thead><tbody id="signal-body"></tbody></table></div>
     </section>
 
     <div id="operations" class="section-intro">
@@ -122,7 +128,7 @@
     </div>
     <section class="panel operations-panel">
       <div class="panel-head">
-        <div><h2>啟動、預熱與執行進度</h2><p>只顯示狀態檔中的實際完成步驟；速度以本次實測耗時或帳本更新計算</p></div>
+        <div><h2>啟動、預熱與執行進度</h2><p>所選交易日事件帳本逐策略核對；09:00 後發現缺漏會立即補跑，盤前預熱則獨立呈現</p></div>
         <span id="operation-source" class="count">—</span>
       </div>
       <div id="operation-kpis" class="operation-kpis"></div>
@@ -132,7 +138,7 @@
           <div id="workflow-progress" class="progress-list"></div>
         </div>
         <div>
-          <h3>四模式預熱測速</h3>
+          <h3>四模式盤前預熱測速（不等同該日執行完成）</h3>
           <div id="preopen-progress" class="progress-list"></div>
         </div>
       </div>
@@ -144,7 +150,7 @@
     </div>
     <section class="grid-two compact">
       <article class="panel table-panel">
-        <div class="panel-head"><div><h2>委託與成交事件</h2><p>模擬委託、成交、撤單替換與 OCO 原因</p></div></div>
+        <div class="panel-head"><div><h2>委託與成交事件</h2><p>伺服器分頁呈現所選交易日的全部模擬委託、成交、撤單替換與 OCO 原因</p></div><div class="table-actions"><span id="event-count" class="count"></span><button id="load-more-events" class="secondary hidden" type="button">載入更多</button></div></div>
         <div class="table-scroll short"><table><thead><tr><th>時間</th><th>模式／股票</th><th>目的</th><th>類型</th><th>價量</th><th>狀態</th></tr></thead><tbody id="event-body"></tbody></table></div>
       </article>
       <article class="panel">
@@ -153,6 +159,6 @@
       </article>
     </section>
   </main>
-  <script src="app.js?v=5" defer></script>
+  <script src="app.js?v=12" defer></script>
 </body>
 </html>

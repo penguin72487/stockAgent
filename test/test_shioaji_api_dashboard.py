@@ -170,7 +170,7 @@ def test_shioaji_public_status_reconciles_quota_progress_and_capture(
     assert payload["capture"]["state"] == "capturing"
     assert payload["capture"]["workers"] == 2
     assert payload["capture"]["subscriptions"] == 400
-    assert payload["dashboard_schema_version"] == 2
+    assert payload["dashboard_schema_version"] == 4
     assert {item["id"] for item in payload["pipelines"]} == {
         "contract_catalog",
         "fop_stream",
@@ -187,6 +187,8 @@ def test_shioaji_public_status_reconciles_quota_progress_and_capture(
         for item in payload["pipelines"]
     )
     assert all(isinstance(item["fields"], list) for item in payload["pipelines"])
+    assert len(payload["traffic_breakdown"]) == 8
+    assert payload["storage"]["status"] == "collecting"
     forbidden = {
         "api_key",
         "secret",
@@ -206,12 +208,99 @@ def test_shioaji_dashboard_is_local_read_only_and_source_backed() -> None:
     javascript = (static_root / "app.js").read_text(encoding="utf-8")
     assert 'fetch("api/status"' in javascript
     assert "traffic-chart" in html
+    assert "ledger-body" in html
+    assert "traffic-breakdown-body" in html
+    assert "storage-growth-chart" in html
+    assert "storage-body" in html
     assert "fleet-progress-bar" in html
     assert "pipeline-grid" in html
     assert 'data-filter="historical"' in html
     assert 'data-filter="realtime"' in html
     assert "renderPipelines" in javascript
+    assert "renderTrafficLedger" in javascript
+    assert "renderTrafficBreakdown" in javascript
+    assert "renderStorage" in javascript
     assert "API Key、Secret" in html
     assert "http://" not in html and "https://" not in html
     assert "textContent" in javascript
     assert "innerHTML" not in javascript
+
+
+def test_shioaji_public_status_allowlists_storage_snapshot(tmp_path: Path) -> None:
+    observed = datetime(2026, 8, 14, 8, 0, tzinfo=UTC)
+    inventory = tmp_path / "contracts.csv"
+    inventory.write_text("contract,priority\n", encoding="utf-8")
+    target = tmp_path / "target.txt"
+    target.write_text("2026-08-13\n", encoding="utf-8")
+    storage = tmp_path / "storage.json"
+    storage.write_text(
+        json.dumps(
+            {
+                "generated_at_utc": "2026-08-14T07:59:00Z",
+                "scan_seconds": 12.5,
+                "summary": {
+                    "datasets": 1,
+                    "files": 4,
+                    "total_bytes": 1000,
+                    "source_bytes": 1000,
+                    "derived_bytes": 0,
+                    "operations_bytes": 0,
+                    "growth_window_days": 30,
+                    "growth_window_bytes": 300,
+                    "average_daily_growth_bytes": 10,
+                    "disk_total_bytes": 10000,
+                    "disk_used_bytes": 4000,
+                    "disk_free_bytes": 6000,
+                    "disk_used_ratio": 0.4,
+                    "estimated_days_remaining": 600,
+                },
+                "datasets": [
+                    {
+                        "id": "ticks",
+                        "title": "Tick",
+                        "storage_class": "source",
+                        "quota_class": "historical",
+                        "description": "tick files",
+                        "bytes": 1000,
+                        "files": 4,
+                        "growth_window_days": 30,
+                        "growth_window_bytes": 300,
+                        "average_daily_growth_bytes": 10,
+                        "average_active_day_growth_bytes": 100,
+                        "active_growth_days": 3,
+                        "growth_source": "file_mtime_estimate",
+                        "private_path": "/secret/data",
+                    }
+                ],
+                "daily_growth": [{"date": "2026-08-13", "bytes": 300}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def runner(args: list[str] | tuple[str, ...]) -> subprocess.CompletedProcess[str]:
+        command = list(args)
+        if command[0] == "systemctl":
+            stdout = "ActiveState=active\nSubState=running\nNRestarts=0\nInvocationID=test\n"
+        else:
+            stdout = ""
+        return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
+
+    payload = build_shioaji_public_status(
+        tmp_path,
+        now=observed,
+        runner=runner,
+        paths=ShioajiMonitorPaths(
+            alias_inventory=inventory,
+            txfr1_manifest=tmp_path / "tx.json",
+            futures_history_root=tmp_path / "history",
+            target_end_date=target,
+            capture_root=tmp_path / "capture",
+            storage_summary=storage,
+        ),
+    )
+    assert payload["storage"]["status"] == "ready"
+    assert payload["storage"]["age_seconds"] == 60
+    assert payload["storage"]["summary"]["total_bytes"] == 1000
+    assert payload["storage"]["datasets"][0]["average_daily_growth_bytes"] == 10
+    assert "private_path" not in json.dumps(payload)

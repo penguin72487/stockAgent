@@ -62,6 +62,8 @@ class ShioajiMonitorPaths:
     hft_audit_root: Path | None = None
     contract_inventory_manifest: Path | None = None
     snapshot_state: Path | None = None
+    traffic_ledger_summary: Path | None = None
+    storage_summary: Path | None = None
 
     @classmethod
     def from_repo(cls, repo_root: Path) -> ShioajiMonitorPaths:
@@ -88,7 +90,208 @@ class ShioajiMonitorPaths:
             contract_inventory_manifest=root
             / "data_tw_futures/shioaji_contracts/manifest.json",
             snapshot_state=root / "artifacts/live/tw_day_trade_simulation/state.json",
+            traffic_ledger_summary=root
+            / "artifacts/live/shioaji_traffic/summary.json",
+            storage_summary=root / "artifacts/live/shioaji_storage/summary.json",
         )
+
+
+def _traffic_ledger_view(payload: dict[str, Any] | None) -> dict[str, Any]:
+    source = payload or {}
+
+    def bucket(value: Any) -> dict[str, int]:
+        item = value if isinstance(value, dict) else {}
+        return {
+            key: int(item.get(key) or 0)
+            for key in (
+                "events",
+                "queries",
+                "avoided_queries",
+                "rows",
+                "failures",
+                "observed_usage_delta_bytes",
+                "stream_observations",
+                "stream_tick_events",
+                "stream_book_events",
+                "stream_snapshot_rows",
+                "stream_dropped_events",
+                "stream_stored_bytes",
+            )
+        }
+
+    return {
+        "ledger_date": source.get("ledger_date"),
+        "updated_at_utc": source.get("updated_at_utc"),
+        "totals": bucket(source.get("totals")),
+        "by_consumer": [
+            {"name": str(name), **bucket(value)}
+            for name, value in sorted((source.get("by_consumer") or {}).items())
+            if isinstance(value, dict)
+        ],
+        "by_method": [
+            {"name": str(name), **bucket(value)}
+            for name, value in sorted((source.get("by_method") or {}).items())
+            if isinstance(value, dict)
+        ],
+        "by_asset_class": [
+            {"name": str(name), **bucket(value)}
+            for name, value in sorted((source.get("by_asset_class") or {}).items())
+            if isinstance(value, dict)
+        ],
+    }
+
+
+def _storage_view(
+    payload: dict[str, Any] | None, *, now: datetime
+) -> dict[str, Any]:
+    """Allowlist a compact storage snapshot for the public response."""
+
+    source = payload if isinstance(payload, dict) else {}
+    generated_at = source.get("generated_at_utc")
+    parsed_at = _parse_datetime(generated_at)
+
+    def optional_number(value: Any) -> int | float | None:
+        return value if isinstance(value, (int, float)) and value >= 0 else None
+
+    summary_source = source.get("summary")
+    summary_item = summary_source if isinstance(summary_source, dict) else {}
+    summary_keys = (
+        "datasets",
+        "files",
+        "total_bytes",
+        "source_bytes",
+        "derived_bytes",
+        "operations_bytes",
+        "growth_window_days",
+        "growth_window_bytes",
+        "average_daily_growth_bytes",
+        "disk_total_bytes",
+        "disk_used_bytes",
+        "disk_free_bytes",
+        "disk_used_ratio",
+        "estimated_days_remaining",
+    )
+    datasets: list[dict[str, Any]] = []
+    source_datasets = source.get("datasets")
+    for row in (source_datasets if isinstance(source_datasets, list) else [])[:16]:
+        if not isinstance(row, dict):
+            continue
+        datasets.append(
+            {
+                "id": str(row.get("id") or "unknown"),
+                "title": str(row.get("title") or "未命名資料"),
+                "storage_class": str(row.get("storage_class") or "unknown"),
+                "quota_class": str(row.get("quota_class") or "none"),
+                "description": str(row.get("description") or ""),
+                "bytes": optional_number(row.get("bytes")),
+                "files": optional_number(row.get("files")),
+                "latest_changed_at_utc": row.get("latest_changed_at_utc"),
+                "growth_window_days": optional_number(row.get("growth_window_days")),
+                "growth_window_bytes": optional_number(row.get("growth_window_bytes")),
+                "average_daily_growth_bytes": optional_number(
+                    row.get("average_daily_growth_bytes")
+                ),
+                "average_active_day_growth_bytes": optional_number(
+                    row.get("average_active_day_growth_bytes")
+                ),
+                "active_growth_days": optional_number(row.get("active_growth_days")),
+                "growth_source": str(row.get("growth_source") or "unknown"),
+            }
+        )
+    daily_growth: list[dict[str, Any]] = []
+    source_growth = source.get("daily_growth")
+    for row in (source_growth if isinstance(source_growth, list) else [])[-30:]:
+        if not isinstance(row, dict) or not isinstance(row.get("date"), str):
+            continue
+        daily_growth.append(
+            {"date": row["date"], "bytes": optional_number(row.get("bytes"))}
+        )
+    definitions = source.get("definitions")
+    return {
+        "status": "ready" if datasets else "collecting",
+        "generated_at_utc": (
+            parsed_at.isoformat().replace("+00:00", "Z") if parsed_at else None
+        ),
+        "age_seconds": (
+            max(0.0, (now - parsed_at).total_seconds()) if parsed_at else None
+        ),
+        "scan_seconds": optional_number(source.get("scan_seconds")),
+        "summary": {
+            key: optional_number(summary_item.get(key)) for key in summary_keys
+        },
+        "datasets": datasets,
+        "daily_growth": daily_growth,
+        "definitions": {
+            str(key): str(value)
+            for key, value in (definitions if isinstance(definitions, dict) else {}).items()
+            if isinstance(value, str)
+        },
+    }
+
+
+_PIPELINE_CONSUMERS: Final[dict[str, tuple[str, ...]]] = {
+    "futures_history": ("futures_history_backfill",),
+    "stock_minute": ("stock_minute_backfill", "stock_minute_gap_recovery"),
+    "stock_daily": ("stock_daily_legacy_backfill", "stock_daily_materializer"),
+    "fop_stream": ("taifex_fop_stream",),
+    "top200_stream": ("stock_top200_stream",),
+    "on_demand_snapshots": (
+        "stock_quote_provider",
+        "tw_day_trade_futures_benchmark",
+    ),
+}
+
+
+def _traffic_breakdown(
+    pipelines: list[dict[str, Any]], ledger: dict[str, Any]
+) -> list[dict[str, Any]]:
+    consumers = {
+        str(item.get("name") or ""): item
+        for item in ledger.get("by_consumer", [])
+        if isinstance(item, dict)
+    }
+    rows: list[dict[str, Any]] = []
+    for pipeline in pipelines:
+        pipeline_id = str(pipeline.get("id") or "unknown")
+        names = _PIPELINE_CONSUMERS.get(pipeline_id, ())
+        matched = [consumers[name] for name in names if name in consumers]
+
+        def total(field: str) -> int:
+            return sum(int(item.get(field) or 0) for item in matched)
+
+        quota_class = str(pipeline.get("quota") or "none")
+        if quota_class == "historical":
+            usage_status = "measured" if matched else "unattributed"
+            attributed_bytes: int | None = (
+                total("observed_usage_delta_bytes") if matched else None
+            )
+            price_label = "無逐次資料費；受每日歷史流量額度限制"
+        elif quota_class == "realtime":
+            usage_status = "quota_exempt"
+            attributed_bytes = 0
+            price_label = "無逐次資料費；即時推送不扣歷史流量"
+        else:
+            usage_status = "local_only"
+            attributed_bytes = 0
+            price_label = "本機資料處理；不呼叫行情 API"
+        rows.append(
+            {
+                "id": pipeline_id,
+                "title": str(pipeline.get("title") or "未命名資料"),
+                "api_surface": str(pipeline.get("api_surface") or "—"),
+                "quota_class": quota_class,
+                "price_label": price_label,
+                "usage_status": usage_status,
+                "attributed_bytes": attributed_bytes,
+                "queries": total("queries"),
+                "avoided_queries": total("avoided_queries"),
+                "stream_events": total("stream_tick_events")
+                + total("stream_book_events"),
+                "stream_stored_bytes": total("stream_stored_bytes"),
+                "consumers": list(names),
+            }
+        )
+    return rows
 
 
 def _default_command_runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
@@ -1058,6 +1261,39 @@ def build_shioaji_public_status(
     )
     manifests = _history_manifests(selected_paths)
     traffic_history = _traffic_samples(history_entries, manifests)
+    ledger_payload = (
+        _read_json(selected_paths.traffic_ledger_summary)
+        if selected_paths.traffic_ledger_summary is not None
+        else None
+    )
+    ledger = _traffic_ledger_view(ledger_payload)
+    storage_payload = (
+        _read_json(selected_paths.storage_summary)
+        if selected_paths.storage_summary is not None
+        else None
+    )
+    storage = _storage_view(storage_payload, now=observed)
+    latest_ledger_usage = (ledger_payload or {}).get("latest_usage")
+    if isinstance(latest_ledger_usage, dict):
+        ledger_used = latest_ledger_usage.get("used_bytes")
+        ledger_limit = latest_ledger_usage.get("limit_bytes")
+        ledger_at = latest_ledger_usage.get("observed_at_utc")
+        parsed_at = _parse_datetime(ledger_at)
+        if isinstance(ledger_used, int) and isinstance(ledger_limit, int) and parsed_at:
+            traffic_history.append(
+                {
+                    "observed_at_utc": parsed_at.isoformat().replace("+00:00", "Z"),
+                    "used_bytes": ledger_used,
+                    "limit_bytes": ledger_limit,
+                    "remaining_bytes": max(0, ledger_limit - ledger_used),
+                    "used_ratio": ledger_used / ledger_limit if ledger_limit > 0 else None,
+                    "source_id": "traffic_ledger",
+                    "source_label": str(latest_ledger_usage.get("consumer") or "流量帳本"),
+                }
+            )
+            traffic_history = sorted(
+                traffic_history, key=lambda item: str(item.get("observed_at_utc") or "")
+            )[-MAX_TRAFFIC_SAMPLES:]
     backfill = _backfill_status(
         selected_paths, manifests, history_entries, history_service
     )
@@ -1096,8 +1332,25 @@ def build_shioaji_public_status(
         "guard_limit_bytes": guard_limit if limit > 0 else None,
         "safe_remaining_bytes": max(0, guard_limit - used) if limit > 0 else None,
         "reset_policy": "每個交易日上午 08:00 重置",
+        "pricing_policy": "免費註冊，行情 API 無逐次資料費；歷史查詢受每日額度限制",
+        "quota_tiers_bytes": [500_000_000, 2_000_000_000, 10_000_000_000],
+        "attributed_bytes": (
+            int(ledger["totals"].get("observed_usage_delta_bytes") or 0)
+            if ledger_payload is not None
+            else None
+        ),
+        "unattributed_bytes": (
+            max(
+                0,
+                used
+                - int(ledger["totals"].get("observed_usage_delta_bytes") or 0),
+            )
+            if limit > 0 and ledger_payload is not None
+            else None
+        ),
         "history": traffic_history,
     }
+    traffic_breakdown = _traffic_breakdown(pipelines, ledger)
 
     candidate_times: list[float] = []
     if traffic.get("observed_at_utc"):
@@ -1137,7 +1390,7 @@ def build_shioaji_public_status(
         health = "stale"
 
     return {
-        "dashboard_schema_version": 2,
+        "dashboard_schema_version": 4,
         "generated_at_utc": observed.isoformat().replace("+00:00", "Z"),
         "health": health,
         "source_age_seconds": round(source_age, 3) if source_age is not None else None,
@@ -1145,6 +1398,9 @@ def build_shioaji_public_status(
         "simulation_only": True,
         "production_order_possible": False,
         "traffic": traffic,
+        "traffic_ledger": ledger,
+        "traffic_breakdown": traffic_breakdown,
+        "storage": storage,
         "backfill": backfill,
         "capture": capture,
         "pipeline_summary": {
@@ -1176,6 +1432,12 @@ def build_shioaji_public_status(
             ),
             "quota_classes": (
                 "historical 會消耗歷史查詢流量；realtime 是推送訂閱；none 是本機衍生或目錄"
+            ),
+            "traffic_attribution": (
+                "可歸因流量是各功能呼叫前後的 api.usage() 正差；帳面已用與可歸因差額保留為未歸因，絕不假設為零"
+            ),
+            "storage_growth": (
+                "最近 30 個完整台北曆日，依檔案最後修改日估算；一次性回補會使日均增量偏高"
             ),
         },
     }
