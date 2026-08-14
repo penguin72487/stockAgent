@@ -64,6 +64,7 @@ from stockagent.live.market_config import (
 )
 from stockagent.live.market_status import MarketRuntimeStatus, runtime_status
 from stockagent.live.tw_day_trade_simulation import (
+    EXIT_LIMIT_TIME,
     require_exact_session_eligibility,
     resolve_day_trade_rule_data_dir,
 )
@@ -789,9 +790,78 @@ def _scheduled_signal_key(cfg: LiveMarketConfig, now: datetime) -> str | None:
             microsecond=0,
         )
         return f"{bucket.isoformat(timespec='minutes')}:{cfg.market}"
-    if now.strftime("%H:%M") != _market_schedule_time(cfg):
+    schedule_time = _market_schedule_time(cfg)
+    if now.strftime("%H:%M") == schedule_time:
+        return f"{now.strftime('%Y-%m-%d')}:{cfg.market}"
+    if not bool(getattr(cfg, "day_trade_simulation_enabled", False)):
         return None
+    schedule_minutes = _hhmm_minutes(schedule_time)
+    now_minutes = now.hour * 60 + now.minute
+    exit_limit_minutes = EXIT_LIMIT_TIME.hour * 60 + EXIT_LIMIT_TIME.minute
+    if (
+        schedule_minutes is None
+        or now.weekday() >= 5
+        or now.date().isoformat() in set(cfg.holidays)
+        or now_minutes < schedule_minutes
+        or now_minutes >= exit_limit_minutes
+    ):
+        return None
+    # A machine or bot restart after the configured minute must not silently
+    # omit a paper strategy for the whole session.  The daily key deduplicates
+    # within one process; scheduled_signal also checks durable artifacts so a
+    # second restart does not generate the same session again.
     return f"{now.strftime('%Y-%m-%d')}:{cfg.market}"
+
+
+def _scheduled_signal_requires_preopen_catch_up(
+    cfg: LiveMarketConfig, now: datetime
+) -> bool:
+    return bool(getattr(cfg, "day_trade_simulation_enabled", False)) and (
+        now.strftime("%H:%M") != _market_schedule_time(cfg)
+    )
+
+
+def _preopen_readiness_path() -> Path:
+    configured = _env(
+        "STOCKAGENT_PREOPEN_READINESS_PATH",
+        "artifacts/discord_bot/preopen_readiness.json",
+    )
+    return _resolve_repo_path(configured) or Path(str(configured))
+
+
+def _preopen_market_ready_for_session(
+    cfg: LiveMarketConfig, session_date: str
+) -> bool:
+    try:
+        payload = json.loads(
+            _preopen_readiness_path().read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError, TypeError):
+        return False
+    row = (payload.get("markets") or {}).get(str(cfg.market))
+    if not isinstance(row, dict) or row.get("status") != "ready":
+        return False
+    if not _summary_date_matches(row.get("completed_at"), session_date):
+        return False
+    limits = row.get("preopen_price_limits")
+    eligibility = row.get("same_session_eligibility")
+    venues = eligibility.get("venues") if isinstance(eligibility, dict) else None
+    return bool(
+        row.get("panel_date")
+        and row.get("checkpoint_fingerprint")
+        and int(row.get("symbol_count") or 0) > 0
+        and isinstance(limits, dict)
+        and str(limits.get("trading_date") or "") == session_date
+        and int(limits.get("prepared_count") or 0) > 0
+        and isinstance(eligibility, dict)
+        and str(eligibility.get("target_date") or "") == session_date
+        and isinstance(venues, dict)
+        and venues
+        and all(
+            isinstance(venue, dict) and bool(venue.get("covered"))
+            for venue in venues.values()
+        )
+    )
 
 
 def _preopen_prepare_key(cfg: LiveMarketConfig, now: datetime) -> str | None:
@@ -807,9 +877,17 @@ def _preopen_prepare_key(cfg: LiveMarketConfig, now: datetime) -> str | None:
     now_minutes = now.hour * 60 + now.minute
     if now.weekday() >= 5 or now.date().isoformat() in set(cfg.holidays):
         return None
-    if not (prepare_minutes <= now_minutes < open_minutes):
-        return None
-    return f"{now.date().isoformat()}:{cfg.market}:preopen"
+    session_date = now.date().isoformat()
+    if prepare_minutes <= now_minutes < open_minutes:
+        return f"{session_date}:{cfg.market}:preopen"
+    exit_limit_minutes = EXIT_LIMIT_TIME.hour * 60 + EXIT_LIMIT_TIME.minute
+    if (
+        bool(getattr(cfg, "day_trade_simulation_enabled", False))
+        and open_minutes <= now_minutes < exit_limit_minutes
+        and not _preopen_market_ready_for_session(cfg, session_date)
+    ):
+        return f"{session_date}:{cfg.market}:preopen-catch-up"
+    return None
 
 
 def _artifact_backfill_key(cfg: LiveMarketConfig, now: datetime) -> str | None:
@@ -841,6 +919,13 @@ def _artifact_backfill_key(cfg: LiveMarketConfig, now: datetime) -> str | None:
 
 def _scheduled_retry_delay_seconds() -> int:
     return max(1, _env_int("STOCKAGENT_SCHEDULED_RETRY_DELAY_SECONDS", 60) or 60)
+
+
+def _day_trade_confirmation_delay_seconds() -> int:
+    return max(
+        5,
+        _env_int("STOCKAGENT_DAY_TRADE_CONFIRMATION_DELAY_SECONDS", 15) or 15,
+    )
 
 
 def _scheduled_retry_allowed(retry_after: dict[str, float], key: str) -> bool:
@@ -1347,13 +1432,16 @@ class StockAgentBot(discord.Client):
         self._signal_now_background_waiters: dict[str, set[int]] = {}
 
     async def setup_hook(self) -> None:
+        # Strategy recording is the primary responsibility of this process.
+        # Start its catch-up loop before Discord command synchronization so a
+        # missed market schedule is recovered immediately after login.
+        scheduled_signal.start()
         synced = await self.tree.sync()
         print(
             f"synced {len(synced)} global app commands "
             "installs=guild,user contexts=guild,dm,private_channel",
             flush=True,
         )
-        scheduled_signal.start()
         preopen_prepare.start()
         daily_summary.start()
         artifact_backfill.start()
@@ -1434,7 +1522,7 @@ def _write_preopen_readiness(
     total: int | None = None,
     message: str | None = None,
 ) -> None:
-    path = ROOT / "artifacts" / "discord_bot" / "preopen_readiness.json"
+    path = _preopen_readiness_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     with _PREOPEN_READINESS_LOCK:
         try:
@@ -1443,11 +1531,24 @@ def _write_preopen_readiness(
             )
         except Exception:
             payload = {}
-        if not isinstance(payload, dict) or payload.get("run_id") != _BOT_RUN_ID:
+        if not isinstance(payload, dict):
             payload = {}
         markets = payload.get("markets")
         if not isinstance(markets, dict):
             markets = {}
+        if payload.get("run_id") != _BOT_RUN_ID:
+            session_date = datetime.now(
+                ZoneInfo(cfg.timezone or "Asia/Taipei")
+            ).date().isoformat()
+            markets = {
+                str(market): row
+                for market, row in markets.items()
+                if isinstance(row, dict)
+                and row.get("status") == "ready"
+                and _summary_date_matches(
+                    row.get("completed_at"), session_date
+                )
+            }
         terminal = str(status) in {"ready", "failed"}
         completed_at = (
             datetime.now(ZoneInfo(cfg.timezone or "Asia/Taipei")).isoformat(
@@ -2852,8 +2953,58 @@ def _latest_market_signal(cfg: LiveMarketConfig) -> tuple[Path, dict[str, Any]] 
         except Exception:
             continue
         if isinstance(summary, dict):
-                return path, summary
+            return path, summary
     return None
+
+
+def _market_has_generated_signal_for_session(
+    cfg: LiveMarketConfig, session_date: str
+) -> bool:
+    latest = _latest_market_signal(cfg)
+    if latest is None:
+        return False
+    _summary_path, summary = latest
+    return _summary_date_matches(summary.get("generated_at"), session_date)
+
+
+def _day_trade_schedule_state(
+    cfg: LiveMarketConfig, session_date: str
+) -> str:
+    """Reconcile the scheduler with the paper engine, not only artifacts."""
+
+    latest = _latest_market_signal(cfg)
+    if latest is None:
+        return "retry"
+    _summary_path, summary = latest
+    if not _summary_date_matches(summary.get("generated_at"), session_date):
+        return "retry"
+    configured = _env(
+        "TW_DAY_TRADE_STATE_DIR",
+        "artifacts/live/tw_day_trade_simulation",
+    )
+    state_dir = _resolve_repo_path(configured) or Path(str(configured))
+    try:
+        state = json.loads((state_dir / "state.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return "retry"
+    raw_mode = (state.get("modes") or {}).get(str(cfg.market))
+    if not isinstance(raw_mode, dict):
+        return "retry"
+    positions = raw_mode.get("positions") or {}
+    if isinstance(positions, dict) and any(
+        int(position.get("signed_shares") or 0) != 0
+        for position in positions.values()
+        if isinstance(position, dict)
+    ):
+        return "blocked_open_position"
+    if (
+        str(raw_mode.get("session_date") or "") == session_date
+        and _summary_date_matches(
+            raw_mode.get("entry_completed_at"), session_date
+        )
+    ):
+        return "completed"
+    return "retry"
 
 
 def _summary_date_matches(left: str | None, right: str | None) -> bool:
@@ -6673,9 +6824,6 @@ async def preopen_prepare() -> None:
 
 @tasks.loop(seconds=1)
 async def scheduled_signal() -> None:
-    channel = None
-    if bot.channel_id is not None and _public_broadcasts_enabled():
-        channel = bot.get_channel(bot.channel_id) or await bot.fetch_channel(bot.channel_id)
     for market in _scheduled_markets():
         cfg = _resolve_market(market)
         now = datetime.now(ZoneInfo(cfg.timezone or bot.tz.key))
@@ -6684,9 +6832,41 @@ async def scheduled_signal() -> None:
             continue
         if key in bot._last_scheduled_keys:
             continue
+        day_trade_simulation = bool(
+            getattr(cfg, "day_trade_simulation_enabled", False)
+        )
+        if day_trade_simulation:
+            execution_state = _day_trade_schedule_state(
+                cfg, now.date().isoformat()
+            )
+            if execution_state == "blocked_open_position":
+                continue
+        else:
+            execution_state = (
+                "completed"
+                if _market_has_generated_signal_for_session(
+                    cfg, now.date().isoformat()
+                )
+                else "retry"
+            )
+        if execution_state == "completed":
+            bot._last_scheduled_keys.add(key)
+            _clear_scheduled_retry(bot._scheduled_retry_after, key)
+            print(
+                f"[scheduled] market={market} status=already_recorded_after_restart "
+                f"session={now.date().isoformat()}",
+                flush=True,
+            )
+            continue
         if not _scheduled_retry_allowed(bot._scheduled_retry_after, key):
             continue
         try:
+            if _scheduled_signal_requires_preopen_catch_up(cfg, now):
+                # A restart may have missed both the pre-open preparation and
+                # the exact scheduled signal minute.  Reuse the complete
+                # pre-open contract so same-session eligibility and price
+                # limits exist before recording the strategy signal.
+                await asyncio.to_thread(_prewarm_market_signal_sync, cfg)
             resolved_price_source, _, _ = await asyncio.to_thread(
                 _prepare_realtime_signal_sync,
                 cfg,
@@ -6705,6 +6885,7 @@ async def scheduled_signal() -> None:
             if sanity_issues:
                 result.message = _prepend_sanity_notice(result.message, cfg, result.summary)
         except BotUserError as exc:
+            channel = await _scheduled_broadcast_channel()
             if channel is not None and not isinstance(exc, MarketClosedError):
                 await channel.send(str(exc))
             if not isinstance(exc, MarketClosedError):
@@ -6712,17 +6893,29 @@ async def scheduled_signal() -> None:
             continue
         except Exception as exc:
             _log_exception(f"scheduled_signal:{market}", exc)
+            channel = await _scheduled_broadcast_channel()
             if channel is not None:
                 await channel.send(f"`{market}` scheduled signal failed: `{type(exc).__name__}`")
             _mark_scheduled_retry(bot._scheduled_retry_after, key)
             continue
+        channel = await _scheduled_broadcast_channel()
         if channel is not None:
             await channel.send(result.message, view=SignalReviewView(
                 signal_id=str(result.summary.get("signal_id")),
                 market=str(result.summary.get("market") or market),
             ))
-        bot._last_scheduled_keys.add(key)
-        _clear_scheduled_retry(bot._scheduled_retry_after, key)
+        if day_trade_simulation:
+            bot._scheduled_retry_after[key] = (
+                time.monotonic() + _day_trade_confirmation_delay_seconds()
+            )
+            print(
+                f"[scheduled] market={market} status=awaiting_engine_confirmation "
+                f"session={now.date().isoformat()}",
+                flush=True,
+            )
+        else:
+            bot._last_scheduled_keys.add(key)
+            _clear_scheduled_retry(bot._scheduled_retry_after, key)
         await _send_subscription_notifications(cfg, result)
         if channel is not None:
             for pages in _scheduled_detail_page_groups(cfg, result):
@@ -6805,9 +6998,15 @@ async def artifact_backfill() -> None:
             _mark_scheduled_retry(bot._artifact_backfill_retry_after, key)
 
 
-@scheduled_signal.before_loop
-async def before_scheduled_signal() -> None:
-    await bot.wait_until_ready()
+async def _scheduled_broadcast_channel() -> Any | None:
+    if bot.channel_id is None or not _public_broadcasts_enabled():
+        return None
+    try:
+        return bot.get_channel(bot.channel_id) or await bot.fetch_channel(bot.channel_id)
+    except Exception as exc:
+        # Discord delivery must not delay or cancel the strategy ledger.
+        _log_exception("scheduled_signal:broadcast_channel", exc)
+        return None
 
 
 @preopen_prepare.before_loop

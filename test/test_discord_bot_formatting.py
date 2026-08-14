@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 from types import SimpleNamespace
 from datetime import datetime
@@ -34,6 +35,8 @@ from services.discord_bot.bot import (
     _market_notice,
     _market_artifact_backfill_time,
     _market_has_live_signal_for_date,
+    _market_has_generated_signal_for_session,
+    _day_trade_schedule_state,
     _validate_pre_signal_download_artifacts,
     BotUserError,
     _performance_message,
@@ -44,6 +47,8 @@ from services.discord_bot.bot import (
     _portfolio_history_block,
     _portfolio_history_pages,
     _preopen_prepare_key,
+    _preopen_market_ready_for_session,
+    _write_preopen_readiness,
     _validate_day_trade_portfolio_history_result,
     _prepare_realtime_signal_sync,
     _include_live_signals_in_portfolio_history,
@@ -64,6 +69,8 @@ from services.discord_bot.bot import (
     _run_day_trade_settlement_backfill,
     _risk_message,
     _scheduled_detail_page_groups,
+    _scheduled_signal_requires_preopen_catch_up,
+    _scheduled_signal_key,
     _scheduled_markets,
     _scheduled_retry_allowed,
     _mark_scheduled_retry,
@@ -342,13 +349,16 @@ def test_artifact_backfill_key_uses_backfill_time_and_skips_interval_markets(mon
     assert _artifact_backfill_key(interval_cfg, now) is None
 
 
-def test_preopen_prepare_key_requires_explicit_window() -> None:
+def test_preopen_prepare_key_catches_up_missing_day_trade_readiness(
+    monkeypatch,
+) -> None:
     now = datetime(2026, 7, 6, 8, 30, tzinfo=ZoneInfo("Asia/Taipei"))
     configured = SimpleNamespace(
         market="tw_day_trade",
         preopen_prepare_time="08:30",
         open_time="09:00",
         schedule_interval_minutes=None,
+        day_trade_simulation_enabled=True,
         holidays=(),
     )
     generic = SimpleNamespace(
@@ -356,14 +366,184 @@ def test_preopen_prepare_key_requires_explicit_window() -> None:
         preopen_prepare_time=None,
         open_time="09:00",
         schedule_interval_minutes=None,
+        day_trade_simulation_enabled=False,
         holidays=(),
     )
 
     assert _preopen_prepare_key(configured, now) == (
         "2026-07-06:tw_day_trade:preopen"
     )
+    monkeypatch.setattr(
+        "services.discord_bot.bot._preopen_market_ready_for_session",
+        lambda cfg, session_date: False,
+    )
+    assert _preopen_prepare_key(configured, now.replace(hour=9)) == (
+        "2026-07-06:tw_day_trade:preopen-catch-up"
+    )
+    monkeypatch.setattr(
+        "services.discord_bot.bot._preopen_market_ready_for_session",
+        lambda cfg, session_date: True,
+    )
     assert _preopen_prepare_key(configured, now.replace(hour=9)) is None
     assert _preopen_prepare_key(generic, now) is None
+
+
+def test_preopen_readiness_preserves_same_day_ready_rows_across_restart(
+    monkeypatch, tmp_path
+) -> None:
+    path = tmp_path / "preopen.json"
+    monkeypatch.setenv("STOCKAGENT_PREOPEN_READINESS_PATH", str(path))
+    today = datetime.now(ZoneInfo("Asia/Taipei")).date().isoformat()
+    path.write_text(
+        json.dumps(
+            {
+                "run_id": "previous-run",
+                "markets": {
+                    "tw_day_trade": {
+                        "status": "ready",
+                        "completed_at": f"{today}T08:40:00+08:00",
+                        "panel_date": "2026-08-13 13:30:00",
+                        "checkpoint_fingerprint": "abc",
+                        "symbol_count": 2744,
+                        "preopen_price_limits": {
+                            "trading_date": today,
+                            "prepared_count": 2000,
+                        },
+                        "same_session_eligibility": {
+                            "target_date": today,
+                            "venues": {"twse": {"covered": True}},
+                        },
+                    },
+                    "stale_mode": {
+                        "status": "ready",
+                        "completed_at": "2026-08-12T08:40:00+08:00",
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    cfg = SimpleNamespace(market="tw_day_trade_1m", timezone="Asia/Taipei")
+    _write_preopen_readiness(
+        cfg,
+        status="running",
+        started_at=f"{today}T10:00:00+08:00",
+        elapsed_seconds=1.0,
+        step=1,
+        total=23,
+        message="starting",
+    )
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert set(payload["markets"]) == {"tw_day_trade", "tw_day_trade_1m"}
+    ready_cfg = SimpleNamespace(market="tw_day_trade")
+    assert _preopen_market_ready_for_session(ready_cfg, today) is True
+
+
+def test_day_trade_schedule_catches_up_after_service_restart(monkeypatch) -> None:
+    monkeypatch.setattr("services.discord_bot.bot._market_state", lambda market: {})
+    cfg = SimpleNamespace(
+        market="tw_day_trade_1m",
+        schedule_time="09:00",
+        schedule_interval_minutes=None,
+        day_trade_simulation_enabled=True,
+        holidays=(),
+    )
+    morning = datetime(2026, 8, 14, 9, 12, tzinfo=ZoneInfo("Asia/Taipei"))
+
+    assert _scheduled_signal_key(cfg, morning) == "2026-08-14:tw_day_trade_1m"
+    assert _scheduled_signal_key(cfg, morning.replace(hour=13, minute=19)) == (
+        "2026-08-14:tw_day_trade_1m"
+    )
+    assert _scheduled_signal_key(cfg, morning.replace(hour=13, minute=20)) is None
+    assert _scheduled_signal_key(cfg, morning.replace(day=15)) is None
+    assert _scheduled_signal_requires_preopen_catch_up(cfg, morning) is True
+    assert (
+        _scheduled_signal_requires_preopen_catch_up(cfg, morning.replace(minute=0))
+        is False
+    )
+
+
+def test_non_day_trade_daily_schedule_still_requires_exact_minute(monkeypatch) -> None:
+    monkeypatch.setattr("services.discord_bot.bot._market_state", lambda market: {})
+    cfg = SimpleNamespace(
+        market="tw",
+        schedule_time="09:00",
+        schedule_interval_minutes=None,
+        day_trade_simulation_enabled=False,
+        holidays=(),
+    )
+    now = datetime(2026, 8, 14, 9, 12, tzinfo=ZoneInfo("Asia/Taipei"))
+
+    assert _scheduled_signal_key(cfg, now) is None
+    assert _scheduled_signal_key(cfg, now.replace(minute=0)) == "2026-08-14:tw"
+    assert _scheduled_signal_requires_preopen_catch_up(cfg, now) is False
+
+
+def test_day_trade_restart_deduplicates_from_latest_generated_signal(
+    monkeypatch, tmp_path
+) -> None:
+    cfg = SimpleNamespace(market="tw_day_trade")
+    monkeypatch.setattr(
+        "services.discord_bot.bot._latest_market_signal",
+        lambda _cfg: (
+            tmp_path / "summary.json",
+            {"generated_at": "2026-08-14T09:22:55+08:00"},
+        ),
+    )
+
+    assert _market_has_generated_signal_for_session(cfg, "2026-08-14") is True
+    assert _market_has_generated_signal_for_session(cfg, "2026-08-15") is False
+
+
+def test_day_trade_scheduler_waits_for_engine_execution_record(
+    monkeypatch, tmp_path
+) -> None:
+    cfg = SimpleNamespace(market="tw_day_trade")
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    signal_id = "today-signal"
+    monkeypatch.setenv("TW_DAY_TRADE_STATE_DIR", str(state_dir))
+    monkeypatch.setattr(
+        "services.discord_bot.bot._latest_market_signal",
+        lambda _cfg: (
+            tmp_path / "summary.json",
+            {
+                "generated_at": "2026-08-14T09:22:55+08:00",
+                "signal_id": signal_id,
+            },
+        ),
+    )
+
+    state = {
+        "modes": {
+            "tw_day_trade": {
+                "session_date": "2026-08-13",
+                "signal_id": "old",
+                "positions": {},
+            }
+        }
+    }
+    (state_dir / "state.json").write_text(json.dumps(state), encoding="utf-8")
+    assert _day_trade_schedule_state(cfg, "2026-08-14") == "retry"
+
+    state["modes"]["tw_day_trade"].update(
+        {
+            "session_date": "2026-08-14",
+            "signal_id": "first-consumed-signal",
+            "entry_completed_at": "2026-08-14T09:23:01+08:00",
+        }
+    )
+    (state_dir / "state.json").write_text(json.dumps(state), encoding="utf-8")
+    assert _day_trade_schedule_state(cfg, "2026-08-14") == "completed"
+
+    state["modes"]["tw_day_trade"]["positions"] = {
+        "legacy": {"signed_shares": -1_000}
+    }
+    (state_dir / "state.json").write_text(json.dumps(state), encoding="utf-8")
+    assert (
+        _day_trade_schedule_state(cfg, "2026-08-14")
+        == "blocked_open_position"
+    )
 
 
 def test_artifact_backfill_key_catches_up_previous_session_after_midnight(

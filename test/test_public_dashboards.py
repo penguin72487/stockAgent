@@ -20,6 +20,7 @@ from stockagent.live.public_dashboards import (
     UnsafePublicDashboardPayload,
     sanitize_taifex_history,
     sanitize_taifex_status,
+    sanitize_tw_events,
     sanitize_tw_signals,
     sanitize_tw_status,
 )
@@ -119,21 +120,68 @@ def test_tw_public_projection_scrubs_ids_paths_errors_and_bounds_events() -> Non
     }
     assert not (_keys(public) & forbidden)
     assert public["modes"][0]["readiness_error"] == "unavailable"
-    assert len(public["orders"]) == PUBLIC_MAX_EVENT_ROWS
-    assert public["payload_window"]["orders"] == PUBLIC_MAX_EVENT_ROWS
+    assert public["orders"] == []
+    assert public["fills"] == []
+    assert public["events"] == []
+    assert public["payload_window"]["orders"] == 0
     assert "artifacts/" not in public["source_contract"]["preopen"]
 
 
 def test_tw_signal_projection_removes_internal_signal_id() -> None:
-    public = sanitize_tw_signals({"rows": [{"signal_id": "private", "symbol": "2330"}]})
-    assert public == {"rows": [{"symbol": "2330"}]}
-
-
-def test_public_signal_query_accepts_dashboard_five_field_contract() -> None:
-    normalized = PublicDashboardHandler._signal_query(
-        "mode=all&symbol=&status=all&offset=0&limit=250"
+    public = sanitize_tw_signals(
+        {
+            "rows": [
+                {
+                    "signal_id": "private",
+                    "symbol": "2330",
+                    "bid": float("nan"),
+                }
+            ]
+        }
     )
-    assert normalized == "mode=all&symbol=&status=all&offset=0&limit=250"
+    assert public == {"rows": [{"symbol": "2330", "bid": None}]}
+    json.dumps(public, allow_nan=False)
+
+
+def test_tw_event_projection_enforces_simulation_and_scrubs_ids() -> None:
+    public = sanitize_tw_events(
+        {
+            "simulation_only": True,
+            "production_order_possible": False,
+            "rows": [
+                {
+                    "order_id": "private-order",
+                    "position_id": "private-position",
+                    "symbol": "2330",
+                    "price": float("nan"),
+                }
+            ],
+        }
+    )
+    assert public["rows"] == [{"symbol": "2330", "price": None}]
+    with pytest.raises(UnsafePublicDashboardPayload):
+        sanitize_tw_events(
+            {"simulation_only": False, "production_order_possible": False}
+        )
+
+
+def test_public_signal_query_accepts_dashboard_date_contract() -> None:
+    normalized = PublicDashboardHandler._signal_query(
+        "date=2026-08-13&mode=all&symbol=&status=all&offset=0&limit=250"
+    )
+    assert normalized == (
+        "date=2026-08-13&mode=all&symbol=&status=all&offset=0&limit=250"
+    )
+    assert PublicDashboardHandler._date_query("date=2026-08-14") == "2026-08-14"
+    with pytest.raises(ValueError):
+        PublicDashboardHandler._date_query("date=2026-08-14&date=2026-08-13")
+
+    events = PublicDashboardHandler._event_query(
+        "date=2026-08-13&mode=all&symbol=&offset=250&limit=999"
+    )
+    assert events == "date=2026-08-13&mode=all&symbol=&offset=250&limit=250"
+    with pytest.raises(ValueError):
+        PublicDashboardHandler._event_query("date=2026-08-13&unknown=true")
 
 
 def test_public_landing_exposes_live_safe_status_without_remote_assets() -> None:
@@ -159,6 +207,7 @@ def test_public_overview_and_tw_summary_exclude_large_ledgers() -> None:
         "source_age_seconds": 1.5,
         "session_date": "2026-08-13",
         "modes": [{"market": "tw"}, {"market": "tw_cash"}],
+        "execution_records": {"executed_count": 2, "mode_count": 2},
         "positions": [
             {"signed_shares": 1000, "valuation_stale": True},
             {"signed_shares": 0, "valuation_stale": False},
@@ -169,6 +218,7 @@ def test_public_overview_and_tw_summary_exclude_large_ledgers() -> None:
     summary = summarize_tw_status(tw)
     assert summary["open_position_count"] == 1
     assert summary["stale_position_count"] == 1
+    assert summary["execution_records"] == {"executed_count": 2, "mode_count": 2}
     assert not ({"positions", "marks", "orders"} & set(summary))
 
     overview = build_public_overview(
@@ -224,9 +274,22 @@ def test_public_pages_share_visual_tokens() -> None:
     tw_javascript = (root / "tw_day_trade_dashboard" / "app.js").read_text(
         encoding="utf-8"
     )
+    tw_html = (root / "tw_day_trade_dashboard" / "index.html").read_text(
+        encoding="utf-8"
+    )
+    tw_styles = (root / "tw_day_trade_dashboard" / "styles.css").read_text(
+        encoding="utf-8"
+    )
     assert re.search(r"\bREFRESH_MS\b", tw_javascript) is None
     assert "signalLoadError" in tw_javascript
     assert "alert.textContent = `訊號分頁" not in tw_javascript
+    assert 'id="benchmark-cards"' in tw_html
+    assert "function renderBenchmarks" in tw_javascript
+    assert "舊約 bid 與新約 ask 必須同時存在" in tw_javascript
+    assert ".benchmark-grid" in tw_styles
+    assert ".compact-table{table-layout:fixed;white-space:normal}" in tw_styles
+    assert "maximumSignificantDigits" not in tw_javascript
+    assert "@media(max-width:700px)" in tw_styles
     for dashboard in ("tw_day_trade_dashboard", "shioaji_api_dashboard"):
         javascript = (root / dashboard / "app.js").read_text(encoding="utf-8")
         assert "style=" not in javascript

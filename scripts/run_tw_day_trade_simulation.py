@@ -27,7 +27,7 @@ from stockagent.live.market_config import (  # noqa: E402
     resolved_live_output_dir,
 )
 from stockagent.live.quote_provider import (  # noqa: E402
-    fetch_shioaji_futures_snapshot,
+    fetch_futures_snapshot_prefer_stream,
     fetch_shioaji_stock_snapshots,
 )
 from stockagent.live.tw_day_trade_simulation import (  # noqa: E402
@@ -408,11 +408,12 @@ def main(argv: list[str] | None = None) -> int:
             last_benchmark_minute = minute_key
             previous_contract = engine.benchmark_tx_contract()
             try:
-                future_snapshot = fetch_shioaji_futures_snapshot(
+                future_snapshot = fetch_futures_snapshot_prefer_stream(
                     TX_CONTINUOUS_LOGICAL_CODE,
                     additional_contract_codes=(previous_contract,)
                     if previous_contract
                     else (),
+                    decision_time=observed,
                 )
             except Exception as exc:
                 print(

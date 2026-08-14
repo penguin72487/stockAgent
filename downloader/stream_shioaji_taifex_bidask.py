@@ -23,6 +23,7 @@ from downloader.stream_shioaji_tw_microstructure import (
     normalize_fop_book,
     normalize_fop_tick,
 )
+from stockagent.live.shioaji_traffic_ledger import StreamingLedgerRecorder
 from stockagent.research.taifex_volatility_metadata import (
     CATALOG_EXPANSION_ENTRY_NEXT_CYCLE,
     CATALOG_EXPANSION_ENTRY_POLICIES,
@@ -654,6 +655,13 @@ def main() -> int:
         workers=int(args.workers),
     )
     contracts = [_base(info) for info in selected_infos]
+    selected_contract_codes = {
+        str(getattr(contract, "code", "") or "") for contract in contracts
+    }
+    sink.live_book_codes = ({
+        str(getattr(future_base, "code", "") or ""),
+        str(getattr(hedge_base, "code", "") or ""),
+    } & selected_contract_codes) - {""}
     subscriptions_requested = len(contracts) * 2
     if subscriptions_requested > 200:
         api.logout()
@@ -786,6 +794,31 @@ def main() -> int:
             sink.fatal_event.set()
 
     sink.start()
+    stream_ledger = StreamingLedgerRecorder(
+        consumer="taifex_fop_stream",
+        asset_class="futures_options",
+        details={
+            "worker_index": int(args.worker_index),
+            "session": capture_session,
+            "trade_date": capture_trade_date.isoformat(),
+        },
+    )
+    last_ledger_observation = time.monotonic()
+
+    def observe_stream_ledger() -> None:
+        stats = sink.stats
+        stream_ledger.observe(
+            tick_events=stats.tick_events,
+            book_events=stats.book_events,
+            snapshot_rows=stats.book_1s_rows,
+            dropped_events=stats.dropped_events,
+            stored_bytes=(
+                sink.tick_writer.total_bytes
+                + sink.book_writer.total_bytes
+                + sink.snapshot_writer.total_bytes
+            ),
+        )
+
     subscribed = 0
     status = "running"
     try:
@@ -813,6 +846,9 @@ def main() -> int:
             flush=True,
         )
         while datetime.now(TAIPEI) < stop_at and not shutdown.wait(0.5):
+            if time.monotonic() - last_ledger_observation >= 60.0:
+                observe_stream_ledger()
+                last_ledger_observation = time.monotonic()
             if sink.fatal_event.is_set():
                 status = "failed_event_loss_or_normalization"
                 break
@@ -826,6 +862,7 @@ def main() -> int:
             status = "failed_no_bidask_events"
     finally:
         sink.stop()
+        observe_stream_ledger()
         if strategy_engine is not None:
             strategy_engine.close()
         try:

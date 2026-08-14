@@ -6,12 +6,19 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import json
 from pathlib import Path
+from typing import Any
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 import numpy as np
 import requests
+
+from stockagent.live.shioaji_traffic_ledger import (
+    record_avoided_query,
+    shioaji_query,
+)
 
 
 _YAHOO_SESSION_LOCK = threading.Lock()
@@ -306,6 +313,26 @@ def fetch_shioaji_stock_snapshots(
             if _SHIOAJI_STOCK_CONTRACTS[code] is not None:
                 missing_codes.append(code)
 
+        available_contracts = sum(
+            _SHIOAJI_STOCK_CONTRACTS.get(code) is not None for code in requested
+        )
+        uncached_batches = (available_contracts + 499) // 500
+        queried_batches = (len(missing_codes) + 499) // 500
+        avoided_batches = max(0, uncached_batches - queried_batches)
+        if avoided_batches:
+            record_avoided_query(
+                consumer="stock_quote_provider",
+                method="snapshots",
+                asset_class="stock",
+                reason="process_cache_hit",
+                count=avoided_batches,
+                rows=max(0, available_contracts - len(missing_codes)),
+                details={
+                    "symbol_count": available_contracts,
+                    "cache_scope": "process",
+                },
+            )
+
         for start in range(0, len(missing_codes), 500):
             batch_codes = missing_codes[start : start + 500]
             contracts = [
@@ -316,7 +343,15 @@ def fetch_shioaji_stock_snapshots(
             if not contracts:
                 continue
             received_ms = int(time.time() * 1000)
-            rows = list(api.snapshots(contracts))
+            with shioaji_query(
+                api,
+                consumer="stock_quote_provider",
+                method="snapshots",
+                asset_class="stock",
+                details={"contract_count": len(contracts)},
+            ) as set_ledger_result:
+                rows = list(api.snapshots(contracts))
+                set_ledger_result(rows)
             for row in rows:
                 code = str(getattr(row, "code", "") or "").strip()
                 contract = _SHIOAJI_STOCK_CONTRACTS.get(code)
@@ -536,7 +571,20 @@ def fetch_shioaji_futures_snapshot(
             if contract is not None:
                 contracts[code] = contract
         received_ms = int(time.time() * 1000)
-        rows = list(api.snapshots(list(contracts.values())))
+        requested_contracts = list(contracts.values())
+        with shioaji_query(
+            api,
+            consumer="tw_day_trade_futures_benchmark",
+            method="snapshots",
+            asset_class="futures",
+            details={
+                "logical_code": normalized_logical,
+                "contract_count": len(requested_contracts),
+                "contracts": list(contracts),
+            },
+        ) as set_ledger_result:
+            rows = list(api.snapshots(requested_contracts))
+            set_ledger_result(rows)
         quotes: dict[str, dict[str, float | int | str | None]] = {}
         for row in rows:
             code = str(getattr(row, "code", "") or "").strip().upper()
@@ -574,6 +622,102 @@ def fetch_shioaji_futures_snapshot(
             "received_at": quotes[current_code]["quote_at"],
             "source": "shioaji:futures_snapshot+contract_v2_target",
         }
+
+
+def fetch_futures_snapshot_prefer_stream(
+    logical_code: str = "TXFR1",
+    *,
+    additional_contract_codes: tuple[str, ...] = (),
+    decision_time: datetime | None = None,
+    max_age_seconds: float = 2.0,
+    capture_root: str | Path | None = None,
+) -> dict[str, object]:
+    """Use the causally available local FOP book, with the API as exact fallback."""
+
+    observed = decision_time or datetime.now(ZoneInfo("Asia/Taipei"))
+    if observed.tzinfo is None:
+        observed = observed.replace(tzinfo=ZoneInfo("Asia/Taipei"))
+    decision_ns = int(observed.timestamp() * 1_000_000_000)
+    normalized_logical = str(logical_code or "").strip().upper()
+    logical_root = normalized_logical.removesuffix("R1").removesuffix("R2")
+    selected_root = (
+        Path(capture_root)
+        if capture_root is not None
+        else Path(__file__).resolve().parents[2]
+        / "data_tw_index_derivatives_ticks/shioaji_fop_captures"
+    )
+    books: dict[str, dict[str, Any]] = {}
+    for path in sorted((selected_root / "runtime").glob("worker_*.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        for code, row in (payload.get("books") or {}).items():
+            if isinstance(row, dict):
+                books[str(code).strip().upper()] = row
+    current_codes = sorted(code for code in books if code.startswith(logical_root))
+    current_code = current_codes[0] if len(current_codes) == 1 else ""
+    required = {current_code, *(str(code).strip().upper() for code in additional_contract_codes)} - {""}
+    quotes: dict[str, dict[str, float | int | str | None]] = {}
+    for code in required:
+        row = books.get(code)
+        if not row:
+            break
+        receive_ns = int(row.get("book_receive_ts_ns") or 0)
+        snapshot_ns = int(row.get("snapshot_ts_ns") or 0)
+        age_seconds = (decision_ns - receive_ns) / 1_000_000_000
+        bid = float(row.get("bid_price_1") or 0.0)
+        ask = float(row.get("ask_price_1") or 0.0)
+        if (
+            receive_ns <= 0
+            or receive_ns > decision_ns
+            or snapshot_ns > decision_ns
+            or age_seconds < 0.0
+            or age_seconds > max(0.0, float(max_age_seconds))
+            or bool(row.get("stale"))
+            or bool(row.get("suspend"))
+            or bool(row.get("simtrade"))
+            or bid <= 0.0
+            or ask <= 0.0
+            or bid > ask
+        ):
+            break
+        quote_at = datetime.fromtimestamp(receive_ns / 1e9, tz=timezone.utc).astimezone(
+            ZoneInfo("Asia/Taipei")
+        ).isoformat(timespec="milliseconds")
+        quotes[code] = {
+            "contract_code": code,
+            "last": None,
+            "bid": bid,
+            "ask": ask,
+            "bid_volume": int(row.get("bid_volume_1") or 0),
+            "ask_volume": int(row.get("ask_volume_1") or 0),
+            "quote_at": quote_at,
+            "source": "shioaji:fop_stream_local_book",
+        }
+    if current_code and required and set(quotes) == required:
+        record_avoided_query(
+            consumer="tw_day_trade_futures_benchmark",
+            method="snapshots",
+            asset_class="futures",
+            reason="causal_fop_stream_book",
+            details={
+                "logical_code": normalized_logical,
+                "contracts": sorted(required),
+                "contract_count": len(required),
+            },
+        )
+        return {
+            "logical_code": normalized_logical,
+            "current_contract_code": current_code,
+            "quotes": quotes,
+            "received_at": quotes[current_code]["quote_at"],
+            "source": "shioaji:fop_stream_local_book+api_snapshot_fallback",
+        }
+    return fetch_shioaji_futures_snapshot(
+        normalized_logical,
+        additional_contract_codes=additional_contract_codes,
+    )
 
 
 def load_symbol_yahoo_map(parquet_root: str | Path) -> dict[str, str]:

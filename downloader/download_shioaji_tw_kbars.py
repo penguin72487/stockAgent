@@ -14,6 +14,8 @@ from zoneinfo import ZoneInfo
 
 import polars as pl
 
+from stockagent.live.shioaji_traffic_ledger import record_avoided_query, shioaji_query
+
 
 SHIOAJI_STOCK_HISTORY_START = date(2020, 3, 2)
 MAX_KBAR_QUERY_DAYS = 30
@@ -63,6 +65,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--output-dir", type=Path, default=Path("data_tw_public/shioaji")
+    )
+    parser.add_argument(
+        "--minute-cache-root",
+        type=Path,
+        default=Path("data_tw_minute/shioaji_1m"),
+        help="Receipt-backed canonical minute source used before any API KBar query.",
     )
     parser.add_argument(
         "--start-date", default=SHIOAJI_STOCK_HISTORY_START.isoformat()
@@ -483,12 +491,24 @@ def _query_chunk(
     last_error: Exception | None = None
     for attempt in range(max(0, retries) + 1):
         try:
-            payload = api.kbars(
-                contract=contract,
-                start=start.isoformat(),
-                end=end.isoformat(),
-                timeout=int(timeout_ms),
-            )
+            with shioaji_query(
+                api,
+                consumer="stock_daily_legacy_backfill",
+                method="kbars",
+                asset_class="stock",
+                details={
+                    "contract": row.symbol,
+                    "start": start.isoformat(),
+                    "end": end.isoformat(),
+                },
+            ) as set_ledger_result:
+                payload = api.kbars(
+                    contract=contract,
+                    start=start.isoformat(),
+                    end=end.isoformat(),
+                    timeout=int(timeout_ms),
+                )
+                set_ledger_result(payload)
             frame = normalize_kbars(
                 payload,
                 symbol=row.symbol,
@@ -510,6 +530,68 @@ def _query_chunk(
             time.sleep(float(retry_backoff) * (2**attempt))
     assert last_error is not None
     raise last_error
+
+
+def _cached_minute_chunk(
+    root: Path,
+    row: UniverseRow,
+    *,
+    start: date,
+    end: date,
+    expected_dates: set[date],
+) -> pl.DataFrame | None:
+    """Return a verified local minute slice, or None so the API path remains intact."""
+
+    manifest = _read_json(root / "symbols" / f"{row.symbol}.manifest.json")
+    if not manifest or manifest.get("source") != "shioaji_kbars_1m":
+        return None
+    try:
+        covered_start = date.fromisoformat(str(manifest["requested_start"]))
+        covered_end = date.fromisoformat(str(manifest["requested_end"]))
+    except (KeyError, ValueError):
+        return None
+    if covered_start > start or covered_end < end:
+        return None
+    gaps = {
+        date.fromisoformat(str(value))
+        for value in manifest.get("source_gap_dates", [])
+    }
+    if gaps & expected_dates:
+        return None
+    frames: list[pl.DataFrame] = []
+    for entry in manifest.get("chunks", []):
+        try:
+            entry_start = date.fromisoformat(str(entry["start_date"]))
+            entry_end = date.fromisoformat(str(entry["end_date"]))
+        except (KeyError, ValueError, TypeError):
+            return None
+        if entry_end < start or entry_start > end:
+            continue
+        data_path_text = entry.get("data_path")
+        if not data_path_text:
+            continue
+        data_path = Path(str(data_path_text))
+        expected_sha = str(entry.get("data_sha256") or "")
+        try:
+            if not data_path.is_file() or not expected_sha or _sha256(data_path) != expected_sha:
+                return None
+            frames.append(
+                pl.read_parquet(data_path).filter(
+                    (pl.col("date") >= pl.lit(start))
+                    & (pl.col("date") <= pl.lit(end))
+                )
+            )
+        except (OSError, pl.exceptions.PolarsError):
+            return None
+    if not frames:
+        return None if expected_dates else aggregate_daily(pl.DataFrame(), name=row.name)
+    frame = pl.concat(frames, how="vertical_relaxed").sort("ts")
+    if frame.get_column("ts").n_unique() != frame.height:
+        return None
+    returned_dates = set(frame.get_column("date")) if frame.height else set()
+    if not expected_dates.issubset(returned_dates):
+        return None
+    return frame
 
 
 def _chunk_paths(root: Path, symbol: str, start: date, end: date) -> tuple[Path, Path]:
@@ -929,28 +1011,50 @@ def main() -> None:
                         end=chunk_end,
                     ):
                         continue
-                    traffic = _check_traffic_budget(
-                        api,
-                        max_fraction=float(args.max_traffic_fraction),
-                        reserve_bytes=reserve_bytes,
-                    )
                     expected_dates = {
                         value
                         for value in positive_volume_dates
                         if chunk_start <= value <= chunk_end
                     }
-                    minute_frame = _query_chunk(
-                        api,
-                        contract,
+                    minute_frame = _cached_minute_chunk(
+                        args.minute_cache_root,
                         row,
-                        contract_unit=unit,
                         start=chunk_start,
                         end=chunk_end,
-                        timeout_ms=int(args.timeout_ms),
-                        retries=int(args.retries),
-                        retry_backoff=float(args.retry_backoff),
                         expected_dates=expected_dates,
                     )
+                    cache_reused = minute_frame is not None
+                    if minute_frame is None:
+                        traffic = _check_traffic_budget(
+                            api,
+                            max_fraction=float(args.max_traffic_fraction),
+                            reserve_bytes=reserve_bytes,
+                        )
+                        minute_frame = _query_chunk(
+                            api,
+                            contract,
+                            row,
+                            contract_unit=unit,
+                            start=chunk_start,
+                            end=chunk_end,
+                            timeout_ms=int(args.timeout_ms),
+                            retries=int(args.retries),
+                            retry_backoff=float(args.retry_backoff),
+                            expected_dates=expected_dates,
+                        )
+                    else:
+                        record_avoided_query(
+                            consumer="stock_daily_materializer",
+                            method="kbars",
+                            asset_class="stock",
+                            reason="verified_minute_chunk_reuse",
+                            rows=minute_frame.height,
+                            details={
+                                "contract": row.symbol,
+                                "start": chunk_start.isoformat(),
+                                "end": chunk_end.isoformat(),
+                            },
+                        )
                     # The API exposes intraday Kbars, but this module owns only
                     # daily history. Aggregate immediately and never persist the
                     # minute-level response.
@@ -975,6 +1079,10 @@ def main() -> None:
                             "rows": daily_chunk.height,
                             "daily_rows": daily_chunk.height,
                             "source_minute_rows": minute_frame.height,
+                            "minute_source_reused": cache_reused,
+                            "minute_source_root": (
+                                str(args.minute_cache_root) if cache_reused else None
+                            ),
                             "expected_positive_volume_sessions": len(expected_dates),
                             "output_receipt": output_receipt,
                             "downloaded_at_utc": datetime.now(timezone.utc)
@@ -983,12 +1091,13 @@ def main() -> None:
                         },
                     )
                     completed += 1
-                    queried_chunks += 1
-                    traffic = _check_traffic_budget(
-                        api,
-                        max_fraction=float(args.max_traffic_fraction),
-                        reserve_bytes=reserve_bytes,
-                    )
+                    if not cache_reused:
+                        queried_chunks += 1
+                        traffic = _check_traffic_budget(
+                            api,
+                            max_fraction=float(args.max_traffic_fraction),
+                            reserve_bytes=reserve_bytes,
+                        )
                     persist_progress(
                         state="running",
                         symbol_index=symbol_index,

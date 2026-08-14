@@ -9,6 +9,7 @@ read-only payload could represent production order capability.
 from __future__ import annotations
 
 from copy import deepcopy
+import math
 import threading
 import time
 from typing import Any, Final, Mapping
@@ -57,6 +58,8 @@ def _scrub_tw_value(value: Any) -> Any:
         return output
     if isinstance(value, list):
         return [_scrub_tw_value(item) for item in value]
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
     return value
 
 
@@ -98,10 +101,11 @@ def sanitize_tw_status(payload: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(output, dict):  # pragma: no cover - defensive typing guard
         raise TypeError("sanitized status is not an object")
 
+    # Detailed ledgers have their own bounded, server-filtered endpoints.  Do
+    # not retransmit hundreds of duplicate rows with every status refresh.
     for key in ("orders", "fills", "events"):
-        rows = output.get(key)
-        if isinstance(rows, list):
-            output[key] = rows[-PUBLIC_MAX_EVENT_ROWS:]
+        if isinstance(output.get(key), list):
+            output[key] = []
 
     payload_window = output.get("payload_window")
     if isinstance(payload_window, dict):
@@ -119,6 +123,10 @@ def sanitize_tw_status(payload: Mapping[str, Any]) -> dict[str, Any]:
         source_contract["signal"] = (
             "recorded live target weights after the observed opening quote"
         )
+        source_contract["events"] = (
+            "complete selected-day order and fill ledgers are available through "
+            "the bounded read-only event pages"
+        )
     return output
 
 
@@ -128,6 +136,16 @@ def sanitize_tw_signals(payload: Mapping[str, Any]) -> dict[str, Any]:
     output = _scrub_tw_value(deepcopy(dict(payload)))
     if not isinstance(output, dict):  # pragma: no cover - defensive typing guard
         raise TypeError("sanitized signal page is not an object")
+    return output
+
+
+def sanitize_tw_events(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Return one public event page after enforcing the simulation boundary."""
+
+    _require_simulation_only(payload)
+    output = _scrub_tw_value(deepcopy(dict(payload)))
+    if not isinstance(output, dict):  # pragma: no cover - defensive typing guard
+        raise TypeError("sanitized event page is not an object")
     return output
 
 
@@ -190,6 +208,7 @@ __all__ = [
     "UnsafePublicDashboardPayload",
     "sanitize_taifex_history",
     "sanitize_taifex_status",
+    "sanitize_tw_events",
     "sanitize_tw_signals",
     "sanitize_tw_status",
 ]

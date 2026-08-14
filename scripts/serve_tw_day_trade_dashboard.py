@@ -17,8 +17,10 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from stockagent.live.tw_day_trade_dashboard import (  # noqa: E402
+    build_dashboard_event_page,
     build_dashboard_signal_page,
     build_dashboard_snapshot,
+    build_dashboard_summary,
 )
 
 
@@ -28,6 +30,19 @@ STATIC_ROUTES = {
     "/app.js": ("app.js", "text/javascript; charset=utf-8"),
     "/styles.css": ("styles.css", "text/css; charset=utf-8"),
 }
+
+
+def _session_date_query(raw_query: str) -> str | None:
+    query = parse_qs(
+        raw_query,
+        keep_blank_values=True,
+        strict_parsing=False,
+        max_num_fields=1,
+    )
+    if set(query) - {"date"} or any(len(values) != 1 for values in query.values()):
+        raise ValueError("unsupported or repeated query field")
+    value = str(query.get("date", [""])[0]).strip()
+    return value or None
 
 
 class DashboardServer(ThreadingHTTPServer):
@@ -48,14 +63,25 @@ class DashboardServer(ThreadingHTTPServer):
             None if preopen_readiness_path is None else Path(preopen_readiness_path)
         )
 
-    def snapshot(self) -> dict[str, object]:
+    def snapshot(self, *, session_date: str | None = None) -> dict[str, object]:
         return build_dashboard_snapshot(
             state_dir=self.state_dir,
             preopen_readiness_path=self.preopen_readiness_path,
+            session_date=session_date,
         )
 
     def signal_page(self, **kwargs: object) -> dict[str, object]:
         return build_dashboard_signal_page(state_dir=self.state_dir, **kwargs)
+
+    def event_page(self, **kwargs: object) -> dict[str, object]:
+        return build_dashboard_event_page(state_dir=self.state_dir, **kwargs)
+
+    def summary(self, *, session_date: str | None = None) -> dict[str, object]:
+        return build_dashboard_summary(
+            state_dir=self.state_dir,
+            preopen_readiness_path=self.preopen_readiness_path,
+            session_date=session_date,
+        )
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
@@ -105,7 +131,26 @@ class DashboardHandler(BaseHTTPRequestHandler):
         path = parsed.path
         if path == "/api/status":
             try:
-                self._json(HTTPStatus.OK, self.server.snapshot())
+                self._json(
+                    HTTPStatus.OK,
+                    self.server.snapshot(
+                        session_date=_session_date_query(parsed.query)
+                    ),
+                )
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                self._json(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    {"health": "unavailable", "error": f"{type(exc).__name__}: {exc}"},
+                )
+            return
+        if path == "/api/summary":
+            try:
+                self._json(
+                    HTTPStatus.OK,
+                    self.server.summary(
+                        session_date=_session_date_query(parsed.query)
+                    ),
+                )
             except (OSError, ValueError, json.JSONDecodeError) as exc:
                 self._json(
                     HTTPStatus.SERVICE_UNAVAILABLE,
@@ -121,6 +166,26 @@ class DashboardHandler(BaseHTTPRequestHandler):
                         mode=str(query.get("mode", [""])[0]),
                         symbol=str(query.get("symbol", [""])[0]),
                         status=str(query.get("status", ["all"])[0]),
+                        session_date=str(query.get("date", [""])[0]) or None,
+                        offset=int(query.get("offset", ["0"])[0]),
+                        limit=int(query.get("limit", ["250"])[0]),
+                    ),
+                )
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                self._json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"health": "unavailable", "error": f"{type(exc).__name__}: {exc}"},
+                )
+            return
+        if path == "/api/events":
+            try:
+                query = parse_qs(parsed.query)
+                self._json(
+                    HTTPStatus.OK,
+                    self.server.event_page(
+                        mode=str(query.get("mode", [""])[0]),
+                        symbol=str(query.get("symbol", [""])[0]),
+                        session_date=str(query.get("date", [""])[0]) or None,
                         offset=int(query.get("offset", ["0"])[0]),
                         limit=int(query.get("limit", ["250"])[0]),
                     ),

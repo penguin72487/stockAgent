@@ -15,8 +15,11 @@ from stockagent.live.quote_provider import PriceSnapshot
 from stockagent.live.tw_day_trade_dashboard import (
     _line_count,
     _tail,
+    _tail_for_session,
+    build_dashboard_event_page,
     build_dashboard_signal_page,
     build_dashboard_snapshot,
+    build_dashboard_summary,
 )
 from stockagent.live.tw_day_trade_simulation import (
     DAY_TRADE_SHORTFALL_BORROW_FEE_RATE,
@@ -70,6 +73,10 @@ def _summary(signal_id: str = "signal-1") -> dict[str, object]:
         "feature_cutoff_date": "2026-08-12 13:30:00",
         "checkpoint_fingerprint": "abc",
         "config_fingerprint": "def",
+        "weights_path": "artifacts/live_signals/unit/target_weights.parquet",
+        "positions_markdown_path": "artifacts/live_signals/unit/target_positions.md",
+        "symbol_count": 1,
+        "target_risk": {"gross": 0.1, "long_gross": 0.1, "short_gross": 0.0},
     }
 
 
@@ -286,6 +293,41 @@ def test_schema2_open_position_migrates_fail_closed(tmp_path: Path) -> None:
     )
 
 
+def test_schema2_legacy_position_reconciles_only_with_executable_close(
+    tmp_path: Path,
+) -> None:
+    spec = _spec(tmp_path)
+    original = TwDayTradeSimulationEngine(tmp_path / "state")
+    original.register_signal(
+        spec=spec,
+        summary=_summary(),
+        signal_rows=[_row()],
+        quotes={"2330": _quote()},
+        eligibility=_eligibility(),
+        eligibility_coverage={},
+        now=_now(9, 1, 7),
+    )
+    persisted = json.loads(original.state_path.read_text(encoding="utf-8"))
+    persisted["schema_version"] = 2
+    original.state_path.write_text(json.dumps(persisted), encoding="utf-8")
+    engine = TwDayTradeSimulationEngine(original.state_dir)
+    mode = engine.state["modes"][spec.market]
+    position = next(iter(mode["positions"].values()))
+    assert mode["legacy_execution_contract"] is True
+
+    no_depth = _quote(last=899.0, bid=898.0, bid_volume=0.0)
+    engine.process_quotes(quotes={"2330": no_depth}, now=_now(9, 2))
+    assert position["signed_shares"] == 1_000
+    assert mode["legacy_execution_contract"] is True
+
+    executable = _quote(last=899.0, bid=898.0, bid_volume=2.0)
+    engine.process_quotes(quotes={"2330": executable}, now=_now(9, 3))
+    assert position["signed_shares"] == 0
+    assert mode["legacy_execution_contract"] is False
+    events = [json.loads(line) for line in engine.events_path.read_text().splitlines()]
+    assert events[-1]["event"] == "legacy_positions_reconciled"
+
+
 def test_inside_limit_mode_offsets_long_bracket_one_legal_tick(
     tmp_path: Path,
 ) -> None:
@@ -490,7 +532,9 @@ def test_entry_without_displayed_volume_fails_closed(tmp_path: Path) -> None:
     assert signal["reason"] == "minute_or_top_book_volume_unavailable"
 
 
-def test_second_signal_cannot_overwrite_an_open_position(tmp_path: Path) -> None:
+def test_second_same_day_signal_cannot_overwrite_an_open_position(
+    tmp_path: Path,
+) -> None:
     spec = _spec(tmp_path)
     engine = TwDayTradeSimulationEngine(tmp_path / "state")
     engine.register_signal(
@@ -517,6 +561,48 @@ def test_second_signal_cannot_overwrite_an_open_position(tmp_path: Path) -> None
     assert result == "blocked"
     assert position["signed_shares"] == 1_000
     assert position["signal_id"] == "signal-1"
+    mode = engine.state["modes"][spec.market]
+    assert mode["signal_id"] == "signal-1"
+    assert mode["last_duplicate_signal_id"] == "signal-2"
+    assert mode["last_duplicate_signal_reason"] == "daily_signal_already_consumed"
+    assert mode["engine_status"] == "active"
+
+
+def test_next_day_signal_blocks_when_prior_position_is_unflattened(
+    tmp_path: Path,
+) -> None:
+    spec = _spec(tmp_path)
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+    engine.register_signal(
+        spec=spec,
+        summary=_summary(),
+        signal_rows=[_row()],
+        quotes={"2330": _quote()},
+        eligibility=_eligibility(),
+        eligibility_coverage={},
+        now=_now(9, 1, 7),
+    )
+    next_day = datetime(2026, 8, 14, 9, 1, 7, tzinfo=TAIPEI)
+    summary = _summary("signal-2")
+    summary["generated_at"] = datetime(
+        2026, 8, 14, 9, 0, 5, tzinfo=TAIPEI
+    ).isoformat()
+    quote = _quote()
+    quote["quote_at"] = datetime(
+        2026, 8, 14, 9, 1, 6, tzinfo=TAIPEI
+    ).isoformat()
+
+    result = engine.register_signal(
+        spec=spec,
+        summary=summary,
+        signal_rows=[_row(-0.1)],
+        quotes={"2330": quote},
+        eligibility=_eligibility(),
+        eligibility_coverage={},
+        now=next_day,
+    )
+
+    assert result == "blocked"
     assert (
         engine.state["modes"][spec.market]["engine_status"]
         == "critical_prior_position_unflattened"
@@ -553,10 +639,73 @@ def test_only_one_daily_entry_is_allowed_after_the_first_is_closed(
     )
 
     assert result == "blocked"
-    assert (
-        engine.state["modes"][spec.market]["blocked_reason"]
-        == "daily_signal_already_consumed"
+    mode = engine.state["modes"][spec.market]
+    assert mode["signal_id"] == "signal-1"
+    assert mode["last_duplicate_signal_id"] == "signal-2"
+    assert mode["last_duplicate_signal_reason"] == "daily_signal_already_consumed"
+    assert mode["engine_status"] == "session_flat_after_exit"
+
+
+def test_positions_output_keeps_target_and_executed_layers_explicit(
+    tmp_path: Path,
+) -> None:
+    spec = _spec(tmp_path)
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+
+    engine.register_signal(
+        spec=spec,
+        summary=_summary(),
+        signal_rows=[_row()],
+        quotes={"2330": _quote()},
+        eligibility=_eligibility(),
+        eligibility_coverage={},
+        now=_now(9, 1, 7),
     )
+
+    output = json.loads(engine.positions_path.read_text(encoding="utf-8"))
+    mode = output["modes"][spec.market]
+    assert mode["signal_id"] == "signal-1"
+    assert mode["target_weights_path"].endswith("target_weights.parquet")
+    assert mode["target_positions_path"].endswith("target_positions.md")
+    assert mode["target_symbol_count"] == 1
+    assert mode["target_risk"]["gross"] == 0.1
+    assert len(mode["positions"]) == 1
+    assert mode["positions"][0]["signed_shares"] == 1_000
+
+
+def test_load_repairs_duplicate_signal_identity_from_event_ledger(
+    tmp_path: Path,
+) -> None:
+    spec = _spec(tmp_path)
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+    engine.register_signal(
+        spec=spec,
+        summary=_summary(),
+        signal_rows=[_row()],
+        quotes={"2330": _quote()},
+        eligibility=_eligibility(),
+        eligibility_coverage={},
+        now=_now(9, 1, 7),
+    )
+    engine.process_quotes(
+        quotes={"2330": _quote(bid=899.0, ask=900.0, last=900.0)},
+        now=_now(10, 0),
+    )
+    mode = engine.state["modes"][spec.market]
+    mode["signal_id"] = "signal-2"
+    engine._event(
+        "signal_blocked",
+        market=spec.market,
+        signal_id="signal-2",
+        reason="daily_signal_already_consumed",
+    )
+    engine._persist(_now(10, 1))
+
+    restored = TwDayTradeSimulationEngine(engine.state_dir)
+
+    restored_mode = restored.state["modes"][spec.market]
+    assert restored_mode["signal_id"] == "signal-1"
+    assert restored_mode["last_duplicate_signal_id"] == "signal-2"
 
 
 def test_rearm_flat_session_preserves_audit_and_allows_replacement_signal(
@@ -1059,6 +1208,18 @@ def test_percent_benchmarks_use_executable_books_costs_and_atomic_tx_roll(
     assert tx["contract_code"] == "TXFI6"
     assert tx["roll_count"] == 1
     assert tx["fixed_fees_twd"] == 180.0
+    assert tx["last_roll_old_bid"] == 45_150.0
+    assert tx["last_roll_new_ask"] == 45_200.0
+    assert tx["roll_history"] == [
+        {
+            "rolled_at": _now(10, 2).isoformat(),
+            "from_contract": "TXFH6",
+            "to_contract": "TXFI6",
+            "old_bid": 45_150.0,
+            "new_ask": 45_200.0,
+            "fee_per_side_twd": 60.0,
+        }
+    ]
 
     payload = build_dashboard_snapshot(
         state_dir=engine.state_dir,
@@ -1075,6 +1236,140 @@ def test_percent_benchmarks_use_executable_books_costs_and_atomic_tx_roll(
         if row["total_equity_twd"] is not None
     )
     assert "own capital basis" in payload["source_contract"]["comparison"]
+
+
+def test_dashboard_merges_actual_open_benchmark_history_and_rebases_live_marks(
+    tmp_path: Path,
+) -> None:
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+    schedule = TaiwanFeeSchedule(
+        commission_discount=0.2,
+        minimum_commission=20.0,
+        commission_rounding="half_up",
+        tax_rounding="floor",
+    )
+    now_14 = datetime(2026, 8, 14, 10, 0, tzinfo=TAIPEI)
+    engine.process_benchmarks(
+        stock_quotes={
+            "0050": {
+                "bid": 49.9,
+                "ask": 50.0,
+                "quote_at": now_14.isoformat(),
+                "source": "fixture",
+            },
+            "2330": {
+                "bid": 999.0,
+                "ask": 1_000.0,
+                "quote_at": now_14.isoformat(),
+                "source": "fixture",
+            },
+        },
+        stock_fee_schedule=schedule,
+        current_future_contract_code="TXFH6",
+        current_future_quote={
+            "bid": 45_000.0,
+            "ask": 45_001.0,
+            "quote_at": now_14.isoformat(),
+            "source": "fixture",
+        },
+        now=now_14,
+    )
+    live = engine.state["benchmarks"]
+    day_13_marks = []
+    canonical_entries = {
+        "benchmark_0050": (49.0, 49_000.0, 20.0, 0.0, 1_000.0),
+        "benchmark_2330": (990.0, 990_000.0, 20.0, 0.0, 1_000.0),
+        "benchmark_tx_continuous": (
+            44_900.0,
+            701_000.0,
+            60.0,
+            live["benchmark_tx_continuous"]["transaction_tax_twd"],
+            200.0,
+        ),
+    }
+    origins = {}
+    for benchmark_id, row in live.items():
+        entry, capital, entry_fee, entry_tax, multiplier = canonical_entries[
+            benchmark_id
+        ]
+        origin_at = datetime(
+            2026,
+            8,
+            13,
+            8 if benchmark_id == "benchmark_tx_continuous" else 9,
+            45 if benchmark_id == "benchmark_tx_continuous" else 0,
+            tzinfo=TAIPEI,
+        )
+        origins[benchmark_id] = {
+            "session_date": "2026-08-13",
+            "entry_at": origin_at.isoformat(),
+            "entry_price": entry,
+            "initial_capital_twd": capital,
+            "initial_fixed_fees_twd": entry_fee,
+            "initial_transaction_tax_twd": entry_tax,
+            "gross_pnl_multiplier": multiplier,
+            "live_origin": {
+                "entry_at": row["entry_at"],
+                "entry_price": row["entry_price"],
+                "initial_fixed_fees_twd": row["fixed_fees_twd"],
+                "initial_transaction_tax_twd": row.get(
+                    "transaction_tax_twd", 0.0
+                ),
+            },
+        }
+        day_13_marks.append(
+            {
+                "session_date": "2026-08-13",
+                "recorded_at": origin_at.isoformat(),
+                "minute": origin_at.isoformat(timespec="minutes"),
+                "benchmark_id": benchmark_id,
+                "label": row["label"],
+                "entry_at": origin_at.isoformat(),
+                "entry_price": entry,
+                "initial_capital_twd": capital,
+                "last_mark_price": entry,
+                "net_pnl_twd": -100.0,
+                "total_equity_twd": capital - 100.0,
+                "valuation_stale": False,
+                "benchmark_origin_rebased": True,
+                "counterfactual_open_replay": True,
+            }
+        )
+    (engine.state_dir / "benchmark_history.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "origins": origins,
+                "marks": day_13_marks,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    historical = build_dashboard_snapshot(
+        state_dir=engine.state_dir,
+        session_date="2026-08-13",
+        now=now_14.astimezone(ZoneInfo("UTC")),
+    )
+    assert len(historical["benchmark_marks"]) == 3
+    assert all(row["entry_at"].startswith("2026-08-13") for row in historical["benchmarks"])
+
+    current = build_dashboard_snapshot(
+        state_dir=engine.state_dir,
+        session_date="2026-08-14",
+        now=now_14.astimezone(ZoneInfo("UTC")),
+    )
+    by_id = {row["benchmark_id"]: row for row in current["benchmarks"]}
+    assert by_id["benchmark_0050"]["entry_price"] == 49.0
+    assert by_id["benchmark_0050"]["net_pnl_twd"] == pytest.approx(
+        live["benchmark_0050"]["net_pnl_twd"] + 1_000.0
+    )
+    assert by_id["benchmark_tx_continuous"]["entry_price"] == 44_900.0
+    assert by_id["benchmark_tx_continuous"]["net_pnl_twd"] == pytest.approx(
+        live["benchmark_tx_continuous"]["net_pnl_twd"] + 20_200.0
+    )
+    assert all(row["benchmark_origin_rebased"] for row in current["benchmark_marks"])
+    assert current["record_counts"]["benchmark_history_marks"] == 3
 
 
 def test_dashboard_contains_all_sources_without_broker_secrets(tmp_path: Path) -> None:
@@ -1152,7 +1447,7 @@ def test_dashboard_exposes_same_day_preopen_progress_and_measured_speed(
         now=_now(8, 59).astimezone(ZoneInfo("UTC")),
     )
 
-    assert payload["schema_version"] == 3
+    assert payload["schema_version"] == 4
     assert payload["preopen"]["status"] == "ready"
     assert payload["preopen"]["ready_count"] == 1
     assert payload["preopen"]["progress_ratio"] == 1.0
@@ -1173,23 +1468,30 @@ def test_dashboard_html_is_local_and_refreshes_api() -> None:
     assert "http://" not in html and "https://" not in html
     assert 'id="workflow-progress"' in html
     assert 'id="preopen-progress"' in html
-    assert 'fetch("api/status"' in javascript
+    assert "fetch(`api/status" in javascript
     assert "fetch(`api/signals?${params.toString()}`" in javascript
+    assert "fetch(`api/events?${params.toString()}`" in javascript
     assert "function renderOperations(data)" in javascript
     assert "function compareByAbsoluteWeight(a, b)" in javascript
     assert javascript.count(".sort(compareByAbsoluteWeight)") == 1
     assert "refreshInFlight" in javascript
     assert "SIGNAL_PAGE_SIZE" in javascript
     assert "const sourceNumber" in javascript
-    assert "maximumSignificantDigits: 15" in javascript
+    assert "maximumSignificantDigits" not in javascript
+    assert javascript.count("maximumFractionDigits: 2") >= 5
     assert "const monetaryNumber" in javascript
-    assert "maximumFractionDigits: 8" in javascript
+    assert "maximumFractionDigits: 8" not in javascript
     assert "number(row.bid,2)" not in javascript
     assert "number(row.raw_score ?? row.score,5)" not in javascript
     assert "(pnl / initial * 100).toFixed(3)" not in javascript
     assert 'id="load-more-signals"' in html
+    assert 'id="load-more-events"' in html
     assert 'id="load-more-positions"' in html
     assert 'id="signal-direction-summary"' in html
+    assert 'class="compact-table position-table"' in html
+    assert 'class="compact-table signal-table"' in html
+    assert '<th>損益／估值</th>' in html
+    assert '<th>資格／結果</th>' in html
     assert 'class="skip-link"' in html
     assert 'aria-label="公開面板導覽"' in html
     assert 'id="overview-kpis"' in html
@@ -1198,10 +1500,363 @@ def test_dashboard_html_is_local_and_refreshes_api() -> None:
     assert "13:24 強平後仍有未平部位" in javascript
     assert "目前訊號目標" in javascript
     assert "方向平衡後" in javascript
-    assert "今日當沖資格未完整覆蓋" in javascript
+    assert "雙向整張不足・保持空倉" in javascript
+    assert "所選交易日當沖資格未完整覆蓋" in javascript
     assert "較晚補齊的資料不會回填成假成交" in javascript
+    assert "錯過後每秒檢查並立即補跑" in javascript
+    assert javascript.count("const requestDate = selectedDate();") == 2
+    assert 'params = new URLSearchParams({\n    date: requestDate,' in javascript
+    assert '$("date-filter").addEventListener("change"' in javascript
+    assert "四模式盤前預熱測速（不等同該日執行完成）" in html
     assert "依 |目標權重| 由大到小" in html
-    assert "window.setInterval(refresh, REFRESH_MS)" in javascript
+    assert "window.setInterval(() => void refresh(), FULL_REFRESH_MS)" in javascript
+    assert (
+        "window.setInterval(() => void refreshSummary(), SUMMARY_REFRESH_MS)"
+        in javascript
+    )
+
+
+def test_dashboard_counts_only_same_day_execution_events(tmp_path: Path) -> None:
+    spec = _spec(tmp_path)
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+    engine.update_readiness([spec], now=_now(9, 5))
+    mode = engine.state["modes"][spec.market]
+    mode["signal_at"] = "2026-08-12T09:00:00+08:00"
+    mode["entry_completed_at"] = "2026-08-12T09:00:01+08:00"
+    engine._persist(_now(9, 5))
+
+    missing = build_dashboard_snapshot(
+        state_dir=engine.state_dir,
+        now=_now(9, 5).astimezone(ZoneInfo("UTC")),
+    )
+    assert missing["execution_records"]["executed_count"] == 0
+    assert missing["modes"][0]["today_execution_status"] == "starting"
+    assert missing["session_progress"]["signal_completed_modes"] == 0
+
+    engine.events_path.write_text(
+        json.dumps(
+            {
+                "event": "signal_blocked",
+                "market": spec.market,
+                "reason": "prior_position_unflattened",
+                "recorded_at": _now(9, 6).isoformat(),
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    recorded = build_dashboard_snapshot(
+        state_dir=engine.state_dir,
+        now=_now(9, 6).astimezone(ZoneInfo("UTC")),
+    )
+    assert recorded["execution_records"]["executed_count"] == 0
+    assert recorded["execution_records"]["attempted_count"] == 1
+    assert recorded["execution_records"]["blocked_count"] == 1
+    assert recorded["execution_records"]["all_executed"] is False
+    assert recorded["modes"][0]["today_execution_status"] == "blocked"
+    assert recorded["modes"][0]["today_execution_reason"] == (
+        "prior_position_unflattened"
+    )
+    assert recorded["session_progress"]["signal_completed_modes"] == 0
+
+    with engine.events_path.open("a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps(
+                {
+                    "event": "signal_registered",
+                    "market": spec.market,
+                    "signal_id": "consumed",
+                    "recorded_at": _now(9, 7).isoformat(),
+                }
+            )
+            + "\n"
+        )
+        handle.write(
+            json.dumps(
+                {
+                    "event": "signal_blocked",
+                    "market": spec.market,
+                    "signal_id": "duplicate",
+                    "reason": "daily_signal_already_consumed",
+                    "recorded_at": _now(9, 8).isoformat(),
+                }
+            )
+            + "\n"
+        )
+    duplicate = build_dashboard_snapshot(
+        state_dir=engine.state_dir,
+        now=_now(9, 8).astimezone(ZoneInfo("UTC")),
+    )
+    assert duplicate["execution_records"]["executed_count"] == 1
+    assert duplicate["execution_records"]["blocked_count"] == 0
+    assert duplicate["modes"][0]["today_execution_status"] == "completed"
+
+    summary = build_dashboard_summary(
+        state_dir=engine.state_dir,
+        now=_now(9, 8).astimezone(ZoneInfo("UTC")),
+    )
+    assert summary["execution_records"]["executed_count"] == 1
+    assert summary["modes"][0]["today_execution_status"] == "completed"
+    assert "signals" not in summary
+    assert "events" not in summary
+
+
+def test_dashboard_date_filter_switches_all_session_ledgers(tmp_path: Path) -> None:
+    spec = _spec(tmp_path)
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+    engine.update_readiness([spec], now=_now(8, 59))
+    rows = [
+        {
+            "event": "signal_registered",
+            "market": spec.market,
+            "signal_id": "day-13",
+            "recorded_at": "2026-08-13T09:01:00+08:00",
+        },
+        {
+            "event": "signal_blocked",
+            "market": spec.market,
+            "signal_id": "day-14",
+            "reason": "prior_position_unflattened",
+            "recorded_at": "2026-08-14T09:01:00+08:00",
+        },
+    ]
+    engine.events_path.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    engine.marks_path.write_text(
+        "".join(
+            json.dumps(row) + "\n"
+            for row in (
+                {
+                    "session_date": "2026-08-13",
+                    "market": spec.market,
+                    "minute": "2026-08-13T13:30+08:00",
+                    "initial_capital_twd": 10_000_000.0,
+                    "total_equity_twd": 10_010_000.0,
+                    "open_position_count": 0,
+                    "stale_position_count": 0,
+                },
+                {
+                    "session_date": "2026-08-14",
+                    "market": spec.market,
+                    "minute": "2026-08-14T09:01+08:00",
+                    "initial_capital_twd": 10_000_000.0,
+                    "total_equity_twd": 10_020_000.0,
+                    "open_position_count": 0,
+                    "stale_position_count": 0,
+                },
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    day_13 = build_dashboard_snapshot(
+        state_dir=engine.state_dir,
+        session_date="2026-08-13",
+        now=datetime(2026, 8, 14, 2, 0, tzinfo=ZoneInfo("UTC")),
+    )
+    assert day_13["available_session_dates"] == ["2026-08-14", "2026-08-13"]
+    assert day_13["session_date"] == "2026-08-13"
+    assert day_13["execution_records"]["executed_count"] == 1
+    assert day_13["marks"][0]["total_equity_twd"] == 10_010_000.0
+    assert {event["signal_id"] for event in day_13["events"]} == {"day-13"}
+
+    day_14 = build_dashboard_snapshot(
+        state_dir=engine.state_dir,
+        session_date="2026-08-14",
+        now=datetime(2026, 8, 14, 2, 0, tzinfo=ZoneInfo("UTC")),
+    )
+    assert day_14["execution_records"]["executed_count"] == 0
+    assert day_14["execution_records"]["blocked_count"] == 1
+    assert day_14["marks"][0]["total_equity_twd"] == 10_020_000.0
+    assert {event["signal_id"] for event in day_14["events"]} == {"day-14"}
+
+    with pytest.raises(ValueError, match="unavailable"):
+        build_dashboard_snapshot(
+            state_dir=engine.state_dir,
+            session_date="2026-08-12",
+            now=datetime(2026, 8, 14, 2, 0, tzinfo=ZoneInfo("UTC")),
+        )
+
+
+def test_next_session_archives_closed_positions_for_dashboard_history(
+    tmp_path: Path,
+) -> None:
+    spec = _spec(tmp_path)
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+    replay = _summary()
+    replay.update(
+        {
+            "simulation_replay": True,
+            "replay_basis": "recorded_open_to_official_close",
+            "replay_source": "fixture",
+            "entry_fill_contract": "retrospective_open_price",
+            "entry_liquidity_assumption": "counterfactual_unbounded",
+        }
+    )
+    assert (
+        engine.register_signal(
+            spec=spec,
+            summary=replay,
+            signal_rows=[_row()],
+            quotes={"2330": _quote()},
+            eligibility=_eligibility(),
+            eligibility_coverage={},
+            now=_now(9, 1, 7),
+        )
+        == "registered"
+    )
+    engine.process_quotes(
+        quotes={"2330": _quote(bid=1_010.0, ask=1_010.0, last=1_010.0)},
+        now=_now(13, 30),
+    )
+
+    next_day = datetime(2026, 8, 14, 9, 1, 7, tzinfo=TAIPEI)
+    next_summary = dict(replay)
+    next_summary["signal_id"] = "signal-2"
+    next_summary["generated_at"] = datetime(
+        2026, 8, 14, 9, 0, 5, tzinfo=TAIPEI
+    ).isoformat()
+    next_quote = _quote()
+    next_quote["quote_at"] = datetime(
+        2026, 8, 14, 9, 1, 6, tzinfo=TAIPEI
+    ).isoformat()
+    assert (
+        engine.register_signal(
+            spec=spec,
+            summary=next_summary,
+            signal_rows=[_row()],
+            quotes={"2330": next_quote},
+            eligibility=_eligibility(),
+            eligibility_coverage={},
+            now=next_day,
+        )
+        == "registered"
+    )
+
+    archive = (
+        engine.position_history_dir
+        / "2026-08-13"
+        / "tw_day_trade.json"
+    )
+    archived = json.loads(archive.read_text(encoding="utf-8"))
+    assert archived["positions"][0]["status"] == "closed"
+    snapshot = build_dashboard_snapshot(
+        state_dir=engine.state_dir,
+        session_date="2026-08-13",
+        now=datetime(2026, 8, 14, 2, 0, tzinfo=ZoneInfo("UTC")),
+    )
+    assert len(snapshot["positions"]) == 1
+    assert snapshot["positions"][0]["session_date"] == "2026-08-13"
+    assert snapshot["positions"][0]["simulation_replay"] is True
+    assert snapshot["modes"][0]["simulation_replay"] is True
+    registered = [
+        event
+        for event in snapshot["events"]
+        if event.get("event") == "signal_registered"
+    ]
+    assert registered[0]["recorded_at"] == _now(9, 1, 7).isoformat()
+
+
+def test_counterfactual_open_replay_records_every_entry_at_session_open(
+    tmp_path: Path,
+) -> None:
+    spec = _spec(tmp_path)
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+    replay = _summary()
+    replay.update(
+        {
+            "generated_at": _now(9, 43, 52).isoformat(),
+            "simulation_replay": True,
+            "replay_basis": "actual_session_open_to_official_close",
+            "replay_source": "fixture",
+            "entry_fill_contract": (
+                "retrospective_actual_session_open_price_counterfactual"
+            ),
+            "entry_liquidity_assumption": "counterfactual_unbounded",
+        }
+    )
+    open_at = _now(9, 0)
+    quote = _quote()
+    quote["quote_at"] = open_at.isoformat()
+
+    assert (
+        engine.register_signal(
+            spec=spec,
+            summary=replay,
+            signal_rows=[_row()],
+            quotes={"2330": quote},
+            eligibility=_eligibility(),
+            eligibility_coverage={},
+            now=open_at,
+            counterfactual_open_replay=True,
+        )
+        == "registered"
+    )
+
+    mode = engine.state["modes"][spec.market]
+    position = next(iter(mode["positions"].values()))
+    assert mode["signal_at"] == open_at.isoformat()
+    assert mode["source_signal_at"] == _now(9, 43, 52).isoformat()
+    assert mode["entry_completed_at"] == open_at.isoformat()
+    assert position["entry_at"] == open_at.isoformat()
+    assert position["entry_quote_at"] == open_at.isoformat()
+    assert position["source_signal_at"] == _now(9, 43, 52).isoformat()
+
+    for path in (engine.signals_path, engine.orders_path, engine.fills_path):
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        assert rows
+        assert {row["recorded_at"] for row in rows} == {open_at.isoformat()}
+    fills = [json.loads(line) for line in engine.fills_path.read_text().splitlines()]
+    assert {row["fill_at"] for row in fills} == {open_at.isoformat()}
+    events = [json.loads(line) for line in engine.events_path.read_text().splitlines()]
+    assert {row["recorded_at"] for row in events} == {open_at.isoformat()}
+    assert events[-1]["source_signal_at"] == _now(9, 43, 52).isoformat()
+    snapshot = build_dashboard_snapshot(
+        state_dir=engine.state_dir,
+        now=datetime(2026, 8, 13, 2, 0, tzinfo=ZoneInfo("UTC")),
+    )
+    assert snapshot["modes"][0]["signal_at"] == open_at.isoformat()
+    assert snapshot["modes"][0]["source_signal_at"] == _now(9, 43, 52).isoformat()
+    assert snapshot["modes"][0]["counterfactual_open_replay"] is True
+    assert snapshot["positions"][0]["source_signal_at"] == _now(
+        9, 43, 52
+    ).isoformat()
+
+
+def test_counterfactual_open_replay_cannot_relax_normal_live_signal_gate(
+    tmp_path: Path,
+) -> None:
+    spec = _spec(tmp_path)
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+    quote = _quote()
+    quote["quote_at"] = _now(9, 0).isoformat()
+
+    assert (
+        engine.register_signal(
+            spec=spec,
+            summary=_summary(),
+            signal_rows=[_row()],
+            quotes={"2330": quote},
+            eligibility=_eligibility(),
+            eligibility_coverage={},
+            now=_now(9, 0),
+        )
+        == "waiting_first_minute"
+    )
+
+    with pytest.raises(ValueError, match="simulation_replay=true"):
+        engine.register_signal(
+            spec=spec,
+            summary={**_summary(), "signal_id": "unsafe-replay"},
+            signal_rows=[_row()],
+            quotes={"2330": quote},
+            eligibility=_eligibility(),
+            eligibility_coverage={},
+            now=_now(9, 0),
+            counterfactual_open_replay=True,
+        )
 
 
 def test_dashboard_jsonl_tail_and_incremental_count(tmp_path: Path) -> None:
@@ -1221,6 +1876,24 @@ def test_dashboard_jsonl_tail_and_incremental_count(tmp_path: Path) -> None:
     path.write_text(json.dumps({"index": 9}) + "\n", encoding="utf-8")
     assert _line_count(path) == 1
     assert [row["index"] for row in _tail(path, 2)] == [9]
+
+
+def test_session_tail_is_not_crowded_out_by_a_later_date(tmp_path: Path) -> None:
+    path = tmp_path / "fills.jsonl"
+    rows = [
+        {"session_date": "2026-08-13", "index": index}
+        for index in range(5)
+    ] + [
+        {"session_date": "2026-08-14", "index": index}
+        for index in range(500)
+    ]
+    path.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+    )
+
+    selected = _tail_for_session(path, 3, "2026-08-13")
+
+    assert [row["index"] for row in selected] == [2, 3, 4]
 
 
 def test_dashboard_signal_page_filters_sorts_and_bounds_payload(tmp_path: Path) -> None:
@@ -1311,3 +1984,118 @@ def test_dashboard_signal_page_filters_sorts_and_bounds_payload(tmp_path: Path) 
     )
     assert filtered["total"] == 1
     assert filtered["rows"][0]["symbol"] == "2317"
+
+    prior = build_dashboard_signal_page(
+        state_dir=state_dir,
+        session_date="2026-08-12",
+        limit=10,
+    )
+    assert prior["session_date"] == "2026-08-12"
+    assert [row["symbol"] for row in prior["rows"]] == ["OLD"]
+
+
+def test_dashboard_event_page_returns_all_selected_day_rows_safely(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    (state_dir / "state.json").write_text(
+        json.dumps(
+            {
+                "modes": {
+                    "mode_a": {"session_date": "2026-08-14"},
+                    "mode_b": {"session_date": "2026-08-14"},
+                }
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    orders = [
+        {
+            "session_date": "2026-08-13",
+            "recorded_at": "2026-08-13T09:00:00+08:00",
+            "market": "mode_a",
+            "symbol": "2330",
+            "order_id": "private-order-1",
+            "position_id": "private-position-1",
+            "purpose": "entry",
+            "order_type": "MKT",
+            "price": 900.0,
+            "quantity": 1_000,
+            "status": "filled",
+        },
+        {
+            "session_date": "2026-08-13",
+            "recorded_at": "2026-08-13T09:01:00+08:00",
+            "market": "mode_b",
+            "symbol": "2317",
+            "order_id": "private-order-2",
+            "position_id": "private-position-2",
+            "purpose": "entry",
+            "order_type": "MKT",
+            "price": 200.0,
+            "quantity": 2_000,
+            "status": "filled",
+        },
+        {
+            "session_date": "2026-08-14",
+            "recorded_at": "2026-08-14T09:00:00+08:00",
+            "market": "mode_a",
+            "symbol": "2330",
+            "order_id": "later-day",
+        },
+    ]
+    fills = [
+        {
+            "session_date": "2026-08-13",
+            "recorded_at": "2026-08-13T09:00:00+08:00",
+            "fill_at": "2026-08-13T09:00:01+08:00",
+            "market": "mode_a",
+            "symbol": "2330",
+            "order_id": "private-order-1",
+            "position_id": "private-position-1",
+            "purpose": "entry",
+            "price": 900.0,
+            "quantity": 1_000,
+        }
+    ]
+    for filename, rows in (("orders.jsonl", orders), ("fills.jsonl", fills)):
+        (state_dir / filename).write_text(
+            "".join(json.dumps(row) + "\n" for row in rows),
+            encoding="utf-8",
+        )
+
+    first = build_dashboard_event_page(
+        state_dir=state_dir,
+        session_date="2026-08-13",
+        offset=0,
+        limit=2,
+    )
+    assert first["simulation_only"] is True
+    assert first["production_order_possible"] is False
+    assert first["total"] == 3
+    assert first["order_total"] == 2
+    assert first["fill_total"] == 1
+    assert first["has_more"] is True
+    assert [row["event_kind"] for row in first["rows"]] == ["order", "fill"]
+    keys = set().union(*(row.keys() for row in first["rows"]))
+    assert not ({"order_id", "position_id"} & keys)
+
+    second = build_dashboard_event_page(
+        state_dir=state_dir,
+        session_date="2026-08-13",
+        offset=2,
+        limit=2,
+    )
+    assert second["returned"] == 1
+    assert second["has_more"] is False
+    filtered = build_dashboard_event_page(
+        state_dir=state_dir,
+        session_date="2026-08-13",
+        mode="mode_a",
+        symbol="2330",
+        limit=10,
+    )
+    assert filtered["total"] == 2
+    assert {row["event_kind"] for row in filtered["rows"]} == {"order", "fill"}
