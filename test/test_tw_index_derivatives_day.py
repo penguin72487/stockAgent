@@ -170,8 +170,9 @@ def test_dual_5090_config_resolves_complete_ordinary_basis_contract() -> None:
     assert config.trading.execution_mode == "tw_index_derivatives_day"
     assert config.trading.tw_index_futures_initial_capital == 100_000_000.0
     assert config.trading.tw_index_futures_total_fee_per_side_twd == [60.0, 24.0, 16.0]
-    assert config.trading.tw_index_futures_sell_transaction_tax_rate == pytest.approx(0.0002)
+    assert config.trading.tw_index_futures_sell_transaction_tax_rate == pytest.approx(0.00002)
     assert config.trading.tw_index_derivatives_day_option_fixed_fee_per_contract_per_side_twd == 22.0
+    assert config.trading.tw_index_derivatives_day_option_transaction_tax_rate == pytest.approx(0.001)
     assert config.training.epochs == 1000
     assert config.training.eval_model_chunk_rows == 128
     assert config.training.financial_transformer.temporal_basis_input == "input_features"
@@ -268,6 +269,9 @@ def test_cash_entmax_v7_can_hold_cash_without_gate_or_option_cap() -> None:
     assert config.trading.tw_index_derivatives_day_option_risk_margin_b_twd == 94_000.0
     assert config.trading.tw_index_derivatives_day_option_risk_margin_c_twd == 18_800.0
     assert config.trading.tw_index_derivatives_day_option_margin_schedule_as_of == "2026-08-12"
+    # v7 remains reproducible under its original one-sided tax contract.
+    assert config.trading.tw_index_futures_sell_transaction_tax_rate == pytest.approx(0.0002)
+    assert config.trading.tw_index_derivatives_day_option_transaction_tax_rate == pytest.approx(0.0002)
     assert config.trading.tw_index_derivatives_day_underlying_index_path == (
         "data_tw_public/twse_taiex_ohlc.parquet"
     )
@@ -315,6 +319,22 @@ def test_cash_entmax_v7_can_hold_cash_without_gate_or_option_cap() -> None:
     assert all(torch.isfinite(gradient).all() for gradient in gradients)
 
 
+def test_cash_entmax_v8_uses_fresh_root_and_statutory_per_trade_taxes() -> None:
+    config = load_config(
+        "configs/markets/tw_index_derivatives_day_multi_basis_cash_entmax_v8.yaml"
+    )
+    assert config.training.financial_transformer.portfolio_output_mode == "cash_entmax15"
+    assert config.trading.buy_fee_rate == pytest.approx(0.000065)
+    assert config.trading.sell_fee_rate == pytest.approx(0.000065)
+    assert config.trading.tw_index_futures_sell_transaction_tax_rate == pytest.approx(
+        0.00002
+    )
+    assert config.trading.tw_index_derivatives_day_option_transaction_tax_rate == pytest.approx(
+        0.001
+    )
+    assert "cash_entmax_v8_statutory_tax" in str(config.runner.output_dir)
+
+
 def test_gated_v6_path_is_compatibility_alias_for_cash_entmax_v7() -> None:
     config = load_config(
         "configs/markets/tw_index_derivatives_day_multi_basis_gated_v6.yaml"
@@ -335,7 +355,7 @@ def test_option_simple_return_is_not_clipped_per_leg_below_minus_one() -> None:
         close_price / open_price
         - 1.0
         - 44.0 / (open_price * 50.0)
-        - 0.0002 * close_price / open_price
+        - 0.0002 * (1.0 + close_price / open_price)
         - 1.0 / open_price
     )
     assert candidates.option_simple_returns[1, 0] == pytest.approx(expected)
@@ -356,7 +376,7 @@ def test_short_option_uses_dated_naked_margin_and_directional_capital_return() -
     expected_short_pnl = (
         (100.0 - 120.0) * 50.0
         - 2.0 * 22.0
-        - 0.0002 * 100.0 * 50.0
+        - 0.0002 * (100.0 + 120.0) * 50.0
         - 2.0 * 0.5 * 50.0
     )
     assert candidates.option_short_simple_returns[1, 0] == pytest.approx(
@@ -556,7 +576,10 @@ def test_integer_costs_and_relative_tenor_mapping_finish_flat() -> None:
     assert result.futures_contract_quantities[1, 0].tolist() == [1, 0, 0]
     assert result.option_contract_quantities[1, 0] == 1
     assert result.fees_twd[1] == pytest.approx(2 * 60.0 + 2 * 22.0)
-    expected_tax = 23_100.0 * 200.0 * 0.0002 + 120.0 * 50.0 * 0.0002
+    expected_tax = (
+        (23_000.0 + 23_100.0) * 200.0 * 0.0002
+        + (100.0 + 120.0) * 50.0 * 0.0002
+    )
     assert result.tax_twd[1] == pytest.approx(expected_tax)
     assert result.terminal_flat.all()
 

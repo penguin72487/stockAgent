@@ -88,7 +88,7 @@ SCAN_CHUNK_CANDIDATES = (64, 128, 256, 512)
 # from silently turning a two-sided Taiwan day-trade target into a one-sided
 # bet.  v10 separated gross commission collection from the economically earned
 # broker rebate and added recurrent pending-rebate state.
-CANONICAL_BACKTEST_CONTRACT_VERSION = 11
+CANONICAL_BACKTEST_CONTRACT_VERSION = 12
 
 _SCAN_CHUNK_CACHE: dict[tuple, int] = {}
 _SCAN_COMPILED_CACHE: dict[

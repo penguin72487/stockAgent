@@ -289,8 +289,9 @@ class TaiwanIndexOptionPairDaySession:
                 close_over_open
                 - 1.0
                 - (2.0 * fee) / (open_values * float(self.multiplier))
-                # Long option: only the closing sale premium is taxable.
-                - tax * close_over_open
+                # Both the opening purchase and closing sale are taxable
+                # option-premium transactions.
+                - tax * (1.0 + close_over_open)
                 - (2.0 * slip) / open_values
             )
             safe = np.clip(net_simple, -0.999999, None)
@@ -403,8 +404,9 @@ class TaiwanIndexOptionChainDaySession:
             ratio
             - 1.0
             - (2.0 * fee) / (opens * float(self.multiplier))
-            # Long option: only the closing sale premium is taxable.
-            - tax * ratio
+            # Both the opening purchase and closing sale are taxable
+            # option-premium transactions.
+            - tax * (1.0 + ratio)
             - (2.0 * slip) / opens
         )
         values = np.log1p(np.clip(simple, -0.999999, None))

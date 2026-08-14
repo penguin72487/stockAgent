@@ -513,7 +513,7 @@ def build_causal_derivative_day_candidates(
                 ratio
                 - 1.0
                 - (2.0 * fee) / (open_price * float(options.multiplier))
-                - tax * ratio
+                - tax * (1.0 + ratio)
                 - (2.0 * slip) / open_price
             )
             if bool(allow_option_short):
@@ -534,7 +534,9 @@ def build_causal_derivative_day_candidates(
                     (
                         (open_price - close_price) * float(options.multiplier)
                         - 2.0 * fee
-                        - tax * open_price * float(options.multiplier)
+                        - tax
+                        * (open_price + close_price)
+                        * float(options.multiplier)
                         - 2.0 * slip * float(options.multiplier)
                     )
                     / margin
