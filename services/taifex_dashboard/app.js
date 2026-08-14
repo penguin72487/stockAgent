@@ -1,6 +1,6 @@
 "use strict";
 
-const REFRESH_MS = 5000;
+const PRICE_REFRESH_MS = 60000;
 const money = new Intl.NumberFormat("zh-TW", { maximumFractionDigits: 0 });
 const percent = new Intl.NumberFormat("zh-TW", { style: "percent", minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const ratio = new Intl.NumberFormat("zh-TW", { maximumFractionDigits: 2 });
@@ -70,6 +70,30 @@ function engineLabel(value) {
   return labels[value] || String(value || "未知狀態").replaceAll("_", " ");
 }
 
+function parityStateLabel(value) {
+  const labels = {
+    waiting_for_same_expiry_monthly_books: "等待同到期月五檔",
+    waiting_for_engine_contract_v8: "等待夜盤引擎啟動",
+    waiting_for_continuous_market: "等待連續交易",
+    no_positive_edge_after_cost: "成本後尚無正套利",
+    signal_pending_next_books: "等待訊號後新報價",
+    signal_cancelled_after_next_book_recheck: "新報價複核後取消",
+    locked_until_official_settlement: "套利已鎖定",
+    entry_closed_for_expiry_settlement: "到期日前停止進場",
+    settled_waiting_next_monthly_contract: "已結算，等待次月",
+    blocked_missing_official_final_settlement: "等待官方結算價",
+    forced_flat_until_next_monthly_contract: "強制平倉，等待次月",
+    unsupported_underlying_product: "需使用 TX",
+  };
+  return labels[value] || String(value || "未知狀態").replaceAll("_", " ");
+}
+
+function signedContracts(value, label) {
+  const quantity = Number(value);
+  if (!Number.isFinite(quantity) || quantity === 0) return `${label} 0`;
+  return `${label} ${quantity > 0 ? "多" : "空"} ${money.format(Math.abs(quantity))}`;
+}
+
 function healthPresentation(snapshot) {
   if (["active", "ready"].includes(snapshot.health)) return {label: "資料正常", state: "active"};
   if (snapshot.health === "degraded") return {label: "估值不完整", state: "degraded"};
@@ -134,6 +158,41 @@ function renderMetrics(snapshot) {
   setText("safety-state", safe ? "只讀模擬" : "安全契約失敗");
 }
 
+function renderParity(snapshot) {
+  const parity = snapshot.put_call_parity_tx || {};
+  const state = parity.state || "waiting_for_same_expiry_monthly_books";
+  const pill = byId("parity-state-pill");
+  pill.className = "pill";
+  if (state === "locked_until_official_settlement") pill.classList.add("valid");
+  else if (state.startsWith("blocked_") || state.startsWith("forced_")) pill.classList.add("invalid");
+  else pill.classList.add("stale");
+  pill.textContent = parityStateLabel(state);
+
+  const net = parity.locked_net_edge_after_estimated_cost_twd
+    ?? parity.net_after_estimated_cost_twd;
+  setText("parity-net-edge", formatTwd(net));
+  setText("parity-threshold", `進場門檻 > ${formatTwd(parity.minimum_net_edge_twd ?? 0)} · 融資利率 ${(Number(parity.financing_interest_rate || 0) * 100).toFixed(2)}%`);
+  setText("parity-gross-cost", `${formatTwd(parity.gross_locked_edge_twd)} / ${formatTwd(parity.total_estimated_cost_twd)}`);
+  const directions = {
+    sell_rich_synthetic_buy_tx: "賣貴的合成期貨／買 TX",
+    buy_cheap_synthetic_sell_tx: "買便宜合成期貨／賣 TX",
+  };
+  setText("parity-direction", directions[parity.direction] || "尚無可成交候選");
+  setText("parity-package", [
+    signedContracts(parity.call_contracts, "Call"),
+    signedContracts(parity.put_contracts, "Put"),
+    signedContracts(parity.future_contracts, "TX"),
+  ].join(" · "));
+  const strike = parity.strike == null ? "—" : money.format(parity.strike);
+  setText("parity-contracts", `${parity.series || "—"} · K ${strike} · ${parity.expiry_date || "—"}`);
+  setText("parity-prices", `C ${parity.call_code || "—"}@${parity.call_price ?? "—"} · P ${parity.put_code || "—"}@${parity.put_price ?? "—"} · TX ${parity.future_code || "—"}@${parity.future_price ?? "—"}`);
+  setText("parity-causal-state", parityStateLabel(state));
+  const counts = `掃描 ${parity.scanned_pair_count ?? 0} 組 · 可評估方向 ${parity.evaluable_direction_count ?? 0}`;
+  const age = parity.maximum_book_age_ms == null ? "" : ` · 最老報價 ${ratio.format(Number(parity.maximum_book_age_ms))} ms`;
+  const wait = parity.signal_wait_seconds == null ? "" : ` · 已等 ${formatAge(parity.signal_wait_seconds)}`;
+  setText("parity-book-age", `${counts}${age}${wait}`);
+}
+
 function renderCycle(snapshot) {
   const market = snapshot.market;
   const cycle = snapshot.active_cycle || {};
@@ -145,7 +204,7 @@ function renderCycle(snapshot) {
   setText("underlying-contract", market.underlying_contract);
   setText("hedge-contract", `${market.hedge_product || "—"} · ${market.hedge_contract || "—"} · ×${market.hedge_multiplier_twd_per_point || "—"}`);
   setText("option-risk-margins", `${formatTwd(market.option_risk_margin_a_twd)} / ${formatTwd(market.option_risk_margin_b_twd)} / ${formatTwd(market.option_risk_margin_c_twd)} · ${market.option_risk_margin_effective_trading_date || "—"} 起 · C 僅作組合式參考，本帳逐腿裸賣計提`);
-  setText("futures-initial-margin", `${market.hedge_product || "—"} 每口 ${formatTwd(market.futures_initial_margin_per_contract_twd)}`);
+  setText("futures-initial-margin", `套利 ${market.underlying_product || "TX"} 每口 ${formatTwd(market.underlying_initial_margin_per_contract_twd)}；避險 ${market.hedge_product || "—"} 每口 ${formatTwd(market.futures_initial_margin_per_contract_twd)}`);
   setText("maintenance-clearing-margin", `${market.hedge_product || "—"} 維持 ${formatTwd(maintenance.futures_twd)}／結算 ${formatTwd(clearing.futures_twd)}；TXO 維持 A/B/C ${formatTwd(maintenanceTxo.A)} / ${formatTwd(maintenanceTxo.B)} / ${formatTwd(maintenanceTxo.C)}；結算 ${formatTwd(clearingTxo.A)} / ${formatTwd(clearingTxo.B)} / ${formatTwd(clearingTxo.C)}`);
   setText("capital-buffer-multiple", market.strategy_capital_buffer_multiple == null ? "—" : `×${market.strategy_capital_buffer_multiple}`);
   setText("cycle-series", cycle.series || "flat");
@@ -287,6 +346,46 @@ function renderPerformanceSummary(summary) {
   setText("performance-cost", formatCompactTwd(summary.independent_strategy_explicit_cost_twd));
 }
 
+function appendTableMetric(cell, label, value, fullValue = "") {
+  const line = document.createElement("span");
+  line.className = "table-metric";
+  const term = document.createElement("span");
+  term.textContent = label;
+  const detail = document.createElement("strong");
+  detail.textContent = value;
+  if (fullValue && fullValue !== value) detail.title = fullValue;
+  line.append(term, detail);
+  cell.appendChild(line);
+}
+
+function appendTableTwd(cell, label, value) {
+  appendTableMetric(cell, label, formatCompactTwd(value), formatTwd(value));
+}
+
+function strategyStatusPill(row) {
+  const pill = document.createElement("span");
+  if (!row.alive) {
+    pill.className = "pill invalid";
+    pill.textContent = "RUINED";
+    pill.title = `absorbing ruin · margin calls=${row.margin_call_count}`;
+  } else if (row.forced_liquidation_pending || Number(row.margin_excess_twd) < 0) {
+    pill.className = "pill invalid";
+    pill.textContent = "MARGIN";
+    pill.title = `保證金不足；margin calls=${row.margin_call_count}`;
+  } else if (!row.valuation_available) {
+    pill.className = "pill invalid";
+    pill.textContent = "UNAVAILABLE";
+  } else if (row.valuation_stale) {
+    pill.className = "pill stale";
+    pill.textContent = "CARRIED";
+    pill.title = `缺報價，延用上一筆完整估值；age=${Number(row.valuation_age_seconds || 0).toFixed(1)}s`;
+  } else {
+    pill.className = "pill valid";
+    pill.textContent = "FRESH";
+  }
+  return pill;
+}
+
 function renderTable(strategies) {
   const body = byId("strategy-body");
   body.replaceChildren();
@@ -295,74 +394,68 @@ function renderTable(strategies) {
   for (const row of sortedStrategies(visible)) {
     const tr = document.createElement("tr");
     const title = document.createElement("td");
-    title.textContent = row.label;
+    title.className = "strategy-summary-cell";
+    title.dataset.label = "策略／狀態";
+    const titleLine = document.createElement("span");
+    titleLine.className = "strategy-title-line";
+    const name = document.createElement("strong");
+    name.textContent = row.label;
+    titleLine.append(name, strategyStatusPill(row));
+    title.appendChild(titleLine);
+    const category = document.createElement("span");
+    category.className = "strategy-category";
+    category.textContent = row.category || "—";
+    title.appendChild(category);
     const id = document.createElement("span");
     id.className = "strategy-id";
     id.textContent = `${row.strategy_id} · ${row.implementation_level}`;
     title.appendChild(id);
     tr.appendChild(title);
-    const category = document.createElement("td");
-    category.textContent = row.category;
-    tr.appendChild(category);
-    for (const value of [
-      row.directional_exposure_label,
-      row.volatility_exposure_label,
-      row.hedge_type_label
-    ]) {
-      const td = document.createElement("td");
-      td.className = "exposure-cell";
-      td.textContent = value || "—";
-      tr.appendChild(td);
-    }
-    const exposureRatio = document.createElement("td");
-    exposureRatio.className = "exposure-ratio-cell";
-    const designRatio = document.createElement("span");
-    designRatio.textContent = `設計 ${row.design_option_ratio_label || "—"}`;
-    const liveRatio = document.createElement("span");
-    liveRatio.textContent = `實際 ${row.live_option_ratio_label || "—"}`;
-    exposureRatio.append(designRatio, liveRatio);
-    tr.appendChild(exposureRatio);
-    const values = [
-      formatTwd(row.reserved_capital_twd),
-      formatTwd(row.one_unit_net_pnl_twd),
-      formatTwd(row.one_unit_net_pnl_abs_twd),
-      formatPercent(row.fixed_capital_return),
-      formatPercent(row.compounded_return_to_live_mark),
-      formatTwd(row.explicit_cost_twd),
-      formatRatio(row.net_pnl_to_explicit_cost_ratio),
-      formatTwd(row.margin_required_twd),
-      formatPercent(row.margin_utilization),
-      formatTwd(row.total_equity_twd),
-      formatTwd(row.margin_excess_twd),
-      formatTwd(row.open_liquidation_value_twd),
-      money.format(row.option_position_count),
-      money.format(row.futures_position)
-    ];
-    for (const value of values) {
-      const td = document.createElement("td"); td.textContent = value; tr.appendChild(td);
-    }
-    const valid = document.createElement("td");
-    const pill = document.createElement("span");
-    if (!row.alive) {
-      pill.className = "pill invalid";
-      pill.textContent = "RUINED";
-      pill.title = `absorbing ruin · margin calls=${row.margin_call_count}`;
-    } else if (row.forced_liquidation_pending || Number(row.margin_excess_twd) < 0) {
-      pill.className = "pill invalid";
-      pill.textContent = "MARGIN";
-      pill.title = `保證金不足；margin calls=${row.margin_call_count}`;
-    } else if (!row.valuation_available) {
-      pill.className = "pill invalid";
-      pill.textContent = "UNAVAILABLE";
-    } else if (row.valuation_stale) {
-      pill.className = "pill stale";
-      pill.textContent = "CARRIED";
-      pill.title = `缺報價，延用上一筆完整估值；age=${Number(row.valuation_age_seconds || 0).toFixed(1)}s`;
-    } else {
-      pill.className = "pill valid";
-      pill.textContent = "FRESH";
-    }
-    valid.appendChild(pill); tr.appendChild(valid); body.appendChild(tr);
+
+    const exposure = document.createElement("td");
+    exposure.className = "strategy-detail-cell exposure-cell";
+    exposure.dataset.label = "曝險／口數比";
+    appendTableMetric(exposure, "方向", row.directional_exposure_label || "—");
+    appendTableMetric(exposure, "波動", row.volatility_exposure_label || "—");
+    appendTableMetric(exposure, "避險", row.hedge_type_label || "—");
+    appendTableMetric(exposure, "口數比", `設 ${row.design_option_ratio_label || "—"} · 實 ${row.live_option_ratio_label || "—"}`);
+    tr.appendChild(exposure);
+
+    const returns = document.createElement("td");
+    returns.className = "strategy-detail-cell";
+    returns.dataset.label = "報酬";
+    appendTableMetric(returns, "固定", formatPercent(row.fixed_capital_return));
+    appendTableMetric(returns, "複利*", formatPercent(row.compounded_return_to_live_mark));
+    appendTableMetric(returns, "損益／成本", formatRatio(row.net_pnl_to_explicit_cost_ratio));
+    tr.appendChild(returns);
+
+    const pnl = document.createElement("td");
+    pnl.className = "strategy-detail-cell";
+    pnl.dataset.label = "損益／成本";
+    appendTableTwd(pnl, "單位淨損益", row.one_unit_net_pnl_twd);
+    appendTableTwd(pnl, "損益絕對值", row.one_unit_net_pnl_abs_twd);
+    appendTableTwd(pnl, "顯性成本", row.explicit_cost_twd);
+    tr.appendChild(pnl);
+
+    const capital = document.createElement("td");
+    capital.className = "strategy-detail-cell";
+    capital.dataset.label = "資金／保證金";
+    appendTableTwd(capital, "預留", row.reserved_capital_twd);
+    appendTableTwd(capital, "總權益", row.total_equity_twd);
+    appendTableTwd(capital, "保證金", row.margin_required_twd);
+    appendTableMetric(capital, "占用", formatPercent(row.margin_utilization));
+    appendTableTwd(capital, "餘裕", row.margin_excess_twd);
+    tr.appendChild(capital);
+
+    const position = document.createElement("td");
+    position.className = "strategy-detail-cell";
+    position.dataset.label = "部位／估值";
+    appendTableTwd(position, "清算價值", row.open_liquidation_value_twd);
+    appendTableMetric(position, "選擇權腿", money.format(row.option_position_count));
+    appendTableMetric(position, "避險期貨", money.format(row.futures_position));
+    appendTableMetric(position, "TX 套利", money.format(row.underlying_futures_position || 0));
+    tr.appendChild(position);
+    body.appendChild(tr);
   }
 }
 
@@ -597,7 +690,7 @@ function renderCounts(counts) {
 function render(snapshot, {forceHeavy = false} = {}) {
   snapshot.history = cachedHistory;
   lastSnapshot = snapshot;
-  renderHeader(snapshot); renderMetrics(snapshot); renderCycle(snapshot);
+  renderHeader(snapshot); renderMetrics(snapshot); renderParity(snapshot); renderCycle(snapshot);
   renderPerformanceSummary(snapshot.portfolio_summary);
   const compatibilityCatalog = snapshot.strategy_catalog || snapshot.strategies.map((row) => ({
     strategy_id: row.strategy_id,
@@ -633,7 +726,9 @@ function render(snapshot, {forceHeavy = false} = {}) {
       row.strategy_id, row.total_equity_twd, row.fixed_capital_return,
       row.compounded_return_to_live_mark, row.margin_excess_twd,
       row.valuation_status, row.valuation_age_seconds,
+      row.underlying_futures_position,
     ]),
+    snapshot.put_call_parity_tx,
     compatibilityCatalog.length,
   ]);
   if (!forceHeavy && revision === lastHeavyRevision) return;
@@ -759,12 +854,13 @@ byId("guide-load-more").addEventListener("click", () => {
   if (lastSnapshot) renderStrategyGuide(lastStrategyCatalog, lastStrategyCounts);
 });
 document.addEventListener("visibilitychange", () => {
-  if (!document.hidden) {
-    void refresh();
-    void refreshHistory();
-  }
+  if (!document.hidden) refreshMinuteSnapshot();
 });
-void refresh();
-void refreshHistory();
-window.setInterval(() => void refresh(), REFRESH_MS);
-window.setInterval(() => void refreshHistory(), 60000);
+
+function refreshMinuteSnapshot() {
+  void refresh();
+  void refreshHistory();
+}
+
+refreshMinuteSnapshot();
+window.setInterval(refreshMinuteSnapshot, PRICE_REFRESH_MS);

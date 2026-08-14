@@ -19,6 +19,7 @@ from stockagent.research.taifex_volatility_metadata import (
     CLASSIC_VARIANT_ID,
     DYNAMIC_HEDGE_STRATEGY_IDS,
     MODEL_VARIANT_PREFIX,
+    PUT_CALL_PARITY_TX_STRATEGY_ID,
     STRATEGY_MODE_DAILY,
     STRATEGY_MODE_INTRADAY_FUTURES,
     VOLATILITY_MODEL_IDS,
@@ -93,7 +94,10 @@ def _engine(
         state_dir=tmp_path,
         option_infos=option_infos,
         underlying=FuturesInstrument(
-            logical_code="TXFR1", code="TXFH6", contract=FakeBase("TXFH6")
+            logical_code="TXFR1",
+            code="TXFH6",
+            contract=FakeBase("TXFH6"),
+            last_trading_date=date(2026, 8, 19),
         ),
         hedge=FuturesInstrument(
             logical_code=hedge_logical_code,
@@ -179,6 +183,32 @@ def _seed_surface_books(
         )
 
 
+def _seed_profitable_put_call_parity_books(
+    engine: TaifexVolatilitySimulation,
+    *,
+    receive_ns: int,
+) -> None:
+    engine.on_book(
+        _book("TXFH6", bid=44_999.0, ask=45_000.0, receive_ns=receive_ns)
+    )
+    engine.on_book(
+        _book(
+            "TXO-20260819-45000-C",
+            bid=220.0,
+            ask=221.0,
+            receive_ns=receive_ns,
+        )
+    )
+    engine.on_book(
+        _book(
+            "TXO-20260819-45000-P",
+            bid=99.0,
+            ask=100.0,
+            receive_ns=receive_ns,
+        )
+    )
+
+
 def test_engine_opens_each_catalog_strategy_with_its_own_option_recipe(
     tmp_path: Path,
 ) -> None:
@@ -201,6 +231,9 @@ def test_engine_opens_each_catalog_strategy_with_its_own_option_recipe(
             "entered",
             "waiting_for_fresh_entry_depth",
             "waiting_for_contract_ladder",
+            "waiting_for_same_expiry_monthly_books",
+            "waiting_for_profitable_parity",
+            "signal_pending_next_books",
         }
         spec = STRATEGY_SPEC_BY_ID[strategy_id]
         if strategy["entry_state"] == "entered":
@@ -215,6 +248,161 @@ def test_engine_opens_each_catalog_strategy_with_its_own_option_recipe(
         if engine.state["strategies"][strategy_id]["entry_state"] == "entered"
         and STRATEGY_SPEC_BY_ID[strategy_id].option_legs
     )
+    engine.close()
+
+
+def test_put_call_parity_tx_waits_for_later_books_then_locks_positive_net_edge(
+    tmp_path: Path,
+) -> None:
+    engine = _engine(
+        tmp_path,
+        bootstrap_after=date(2026, 8, 12),
+        strategy_mode=STRATEGY_MODE_INTRADAY_FUTURES,
+    )
+    observed_at = datetime(2026, 8, 14, 10, 0, tzinfo=TAIPEI)
+    base_ns = int(observed_at.timestamp() * 1e9)
+    _seed_profitable_put_call_parity_books(engine, receive_ns=base_ns)
+
+    signal_ns = base_ns + 100_000_000
+    engine._maybe_run_put_call_parity(observed_at, signal_ns)
+    parity_state = engine.state["put_call_parity_tx"]
+    assert parity_state["pending_signal"]["signal_decision_ts_ns"] == signal_ns
+    assert parity_state["monitor"]["state"] == "signal_pending_next_books"
+    assert not (tmp_path / "ideal_ledger.jsonl").exists()
+
+    next_receive_ns = base_ns + 200_000_000
+    execution_ns = base_ns + 300_000_000
+    _seed_profitable_put_call_parity_books(
+        engine,
+        receive_ns=next_receive_ns,
+    )
+    engine._maybe_run_put_call_parity(observed_at, execution_ns)
+
+    ledger = engine.state["strategies"][PUT_CALL_PARITY_TX_STRATEGY_ID]
+    assert ledger["option_positions"] == {
+        "TXO-20260819-45000-C": -4,
+        "TXO-20260819-45000-P": 4,
+    }
+    assert ledger["underlying_futures_position"] == 1
+    assert ledger["futures_position"] == 0
+    assert ledger["initial_capital_twd"] > ledger["entry_capital_requirement_twd"]
+    monitor = engine.state["put_call_parity_tx"]["monitor"]
+    assert monitor["state"] == "locked_until_official_settlement"
+    assert monitor["net_after_estimated_cost_twd"] > 0.0
+    assert monitor["broker_submission"] is False
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "ideal_ledger.jsonl").read_text().splitlines()
+    ]
+    assert len(rows) == 3
+    assert {row["instrument_type"] for row in rows} == {"option", "future"}
+    assert all(
+        signal_ns < row["book_receive_ts_ns"] <= row["decision_ts_ns"]
+        for row in rows
+    )
+    assert {row["signal_decision_ts_ns"] for row in rows} == {signal_ns}
+    engine.close()
+
+
+def test_put_call_parity_tx_rejects_nonpositive_cost_adjusted_package(
+    tmp_path: Path,
+) -> None:
+    engine = _engine(
+        tmp_path,
+        bootstrap_after=date(2026, 8, 12),
+        strategy_mode=STRATEGY_MODE_INTRADAY_FUTURES,
+    )
+    observed_at = datetime(2026, 8, 14, 10, 0, tzinfo=TAIPEI)
+    decision_ns = int(observed_at.timestamp() * 1e9)
+    engine.on_book(
+        _book("TXFH6", bid=44_999.0, ask=45_001.0, receive_ns=decision_ns)
+    )
+    for right in ("C", "P"):
+        engine.on_book(
+            _book(
+                f"TXO-20260819-45000-{right}",
+                bid=149.0,
+                ask=151.0,
+                receive_ns=decision_ns,
+            )
+        )
+
+    engine._maybe_run_put_call_parity(observed_at, decision_ns + 100_000_000)
+
+    ledger = engine.state["strategies"][PUT_CALL_PARITY_TX_STRATEGY_ID]
+    assert ledger["option_positions"] == {}
+    assert ledger["underlying_futures_position"] == 0
+    assert ledger["entry_state"] == "waiting_for_profitable_parity"
+    assert engine.state["put_call_parity_tx"]["monitor"]["state"] == (
+        "no_positive_edge_after_cost"
+    )
+    assert engine.state["put_call_parity_tx"]["pending_signal"] is None
+    assert not (tmp_path / "ideal_ledger.jsonl").exists()
+    engine.close()
+
+
+def test_put_call_parity_tx_cash_settles_all_three_legs_at_official_price(
+    tmp_path: Path,
+) -> None:
+    engine = _engine(
+        tmp_path,
+        bootstrap_after=date(2026, 8, 12),
+        strategy_mode=STRATEGY_MODE_INTRADAY_FUTURES,
+    )
+    observed_at = datetime(2026, 8, 14, 10, 0, tzinfo=TAIPEI)
+    base_ns = int(observed_at.timestamp() * 1e9)
+    _seed_profitable_put_call_parity_books(engine, receive_ns=base_ns)
+    signal_ns = base_ns + 100_000_000
+    engine._maybe_run_put_call_parity(observed_at, signal_ns)
+    _seed_profitable_put_call_parity_books(
+        engine,
+        receive_ns=base_ns + 200_000_000,
+    )
+    engine._maybe_run_put_call_parity(observed_at, base_ns + 300_000_000)
+    locked_edge = engine.state["put_call_parity_tx"]["monitor"][
+        "locked_net_edge_after_estimated_cost_twd"
+    ]
+    pl.DataFrame(
+        {
+            "settlement_date": [date(2026, 8, 19)],
+            "option_series": ["202608"],
+            "final_settlement_price": [45_100.0],
+            "source_file": ["official.html"],
+            "source_sha256": ["b" * 64],
+        }
+    ).write_parquet(tmp_path / "settlements.parquet")
+
+    settlement_at = datetime(2026, 8, 20, 8, 46, tzinfo=TAIPEI)
+    settlement_ns = int(settlement_at.timestamp() * 1e9)
+    engine._maybe_settle_expired_put_call_parity(
+        settlement_at,
+        settlement_ns,
+    )
+
+    ledger = engine.state["strategies"][PUT_CALL_PARITY_TX_STRATEGY_ID]
+    assert ledger["option_positions"] == {}
+    assert ledger["underlying_futures_position"] == 0
+    assert ledger["entry_state"] == "settled_waiting_next_monthly_contract"
+    parity_state = engine.state["put_call_parity_tx"]
+    assert parity_state["open_position"] is None
+    assert parity_state["last_settled_expiry"] == "2026-08-19"
+    assert parity_state["monitor"]["state"] == (
+        "settled_waiting_next_monthly_contract"
+    )
+    assert parity_state["monitor"]["realized_cumulative_pnl_twd"] == pytest.approx(
+        locked_edge
+    )
+    settlement_rows = [
+        json.loads(line)
+        for line in (tmp_path / "ideal_ledger.jsonl").read_text().splitlines()
+        if json.loads(line)["reason"]
+        == "put_call_parity_tx_official_cash_settlement"
+    ]
+    assert len(settlement_rows) == 3
+    assert {row["price_source"] for row in settlement_rows} == {
+        "official_taifex_final_settlement",
+        "official_taifex_final_settlement_intrinsic_value",
+    }
     engine.close()
 
 
@@ -337,14 +525,19 @@ def test_complete_books_start_all_live_catalog_curves_without_margin_failure(
     _seed_surface_books(engine, observed_at=observed_at, receive_ns=receive_ns)
     engine.step(now=observed_at)
 
-    assert len(engine.state["strategies"]) == len(STRATEGY_IDS) == 53
+    assert len(engine.state["strategies"]) == len(STRATEGY_IDS) == 54
     for strategy_id in ("naked_short_call", "naked_short_put"):
         ledger = engine.state["strategies"][strategy_id]
         assert len(ledger["option_positions"]) == 1
         assert next(iter(ledger["option_positions"].values())) == -1
     assert {
-        ledger["entry_state"] for ledger in engine.state["strategies"].values()
+        ledger["entry_state"]
+        for strategy_id, ledger in engine.state["strategies"].items()
+        if strategy_id != PUT_CALL_PARITY_TX_STRATEGY_ID
     } == {"entered"}
+    assert engine.state["strategies"][PUT_CALL_PARITY_TX_STRATEGY_ID][
+        "entry_state"
+    ] in {"waiting_for_profitable_parity", "signal_pending_next_books"}
     assert all(ledger["alive"] for ledger in engine.state["strategies"].values())
     assert (
         sum(
@@ -581,6 +774,7 @@ def test_successful_step_clears_only_the_previous_transient_step_error(
 
 def test_intraday_mode_late_starts_and_calibrates_once_per_minute(
     tmp_path: Path,
+    monkeypatch,
 ) -> None:
     engine = _engine(
         tmp_path,
@@ -588,7 +782,11 @@ def test_intraday_mode_late_starts_and_calibrates_once_per_minute(
         strategy_mode=STRATEGY_MODE_INTRADAY_FUTURES,
     )
     observed_at = datetime(2026, 8, 12, 10, 0, tzinfo=TAIPEI)
-    receive_ns = int(datetime.now(timezone.utc).timestamp() * 1e9)
+    receive_ns = int(observed_at.timestamp() * 1e9)
+    monkeypatch.setattr(
+        "stockagent.live.taifex_volatility_simulation.time.time_ns",
+        lambda: receive_ns + 1_000_000,
+    )
     _seed_surface_books(
         engine,
         observed_at=observed_at,
@@ -660,6 +858,7 @@ def test_intraday_mode_flattens_all_model_futures_before_close(
 
 def test_intraday_mode_trades_night_session_on_following_trading_date(
     tmp_path: Path,
+    monkeypatch,
 ) -> None:
     engine = _engine(
         tmp_path,
@@ -667,7 +866,11 @@ def test_intraday_mode_trades_night_session_on_following_trading_date(
         strategy_mode=STRATEGY_MODE_INTRADAY_FUTURES,
     )
     observed_at = datetime(2026, 8, 12, 15, 1, tzinfo=TAIPEI)
-    receive_ns = int(datetime.now(timezone.utc).timestamp() * 1e9)
+    receive_ns = int(observed_at.timestamp() * 1e9)
+    monkeypatch.setattr(
+        "stockagent.live.taifex_volatility_simulation.time.time_ns",
+        lambda: receive_ns + 1_000_000,
+    )
     _seed_surface_books(engine, observed_at=observed_at, receive_ns=receive_ns)
 
     engine.step(now=observed_at)
@@ -829,7 +1032,11 @@ def test_intraday_one_lot_uses_tmf_granularity_and_user_fee(
         hedge_logical_code="TMFR1",
     )
     observed_at = datetime(2026, 8, 12, 10, 0, tzinfo=TAIPEI)
-    receive_ns = int(datetime.now(timezone.utc).timestamp() * 1e9)
+    receive_ns = int(observed_at.timestamp() * 1e9)
+    monkeypatch.setattr(
+        "stockagent.live.taifex_volatility_simulation.time.time_ns",
+        lambda: receive_ns + 1_000_000,
+    )
     _seed_surface_books(
         engine,
         observed_at=observed_at,

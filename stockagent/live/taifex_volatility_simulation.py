@@ -45,6 +45,7 @@ from stockagent.data.taifex_sessions import (
     NIGHT_CLOSE,
     NIGHT_OPEN,
     taifex_market_phase,
+    taifex_continuous_session_open,
     taifex_session_kind,
     taifex_trading_date,
 )
@@ -78,6 +79,7 @@ from stockagent.research.taifex_volatility_metadata import (
     DYNAMIC_HEDGE_STRATEGY_IDS,
     MODEL_BLACK_SCHOLES,
     MODEL_VARIANT_PREFIX,
+    PUT_CALL_PARITY_TX_STRATEGY_ID,
     STRATEGY_IDS,
     STRATEGY_MODE_DAILY,
     STRATEGY_MODE_INTRADAY_FUTURES,
@@ -90,7 +92,7 @@ from stockagent.research.taifex_volatility_metadata import (
 
 
 SCHEMA_VERSION: Final[int] = 1
-EXECUTION_CONTRACT_VERSION: Final[int] = 7
+EXECUTION_CONTRACT_VERSION: Final[int] = 8
 OPTION_MULTIPLIER: Final[float] = 50.0
 OPTION_FEE_PER_SIDE_TWD: Final[float] = 22.0
 DEFAULT_OPTION_RISK_MARGIN_A_TWD: Final[float] = TXO_RISK_MARGIN_TWD_2026_08_13["A"]
@@ -107,6 +109,10 @@ ENTRY_BOOK_MAX_AGE_SECONDS: Final[float] = 2.0
 SURFACE_BOOK_MAX_AGE_SECONDS: Final[float] = 120.0
 MARK_INTERVAL_SECONDS: Final[float] = 60.0
 STATUS_INTERVAL_SECONDS: Final[float] = 5.0
+PUT_CALL_PARITY_OPTION_QUANTITY: Final[int] = 4
+PUT_CALL_PARITY_FUTURE_QUANTITY: Final[int] = 1
+PUT_CALL_PARITY_SIGNAL_MAX_WAIT_SECONDS: Final[float] = 5.0
+PUT_CALL_PARITY_MIN_NET_EDGE_TWD: Final[float] = 0.0
 DEFAULT_INTRADAY_DECISION_INTERVAL_SECONDS: Final[int] = 60
 DEFAULT_INTRADAY_ENTRY_CUTOFF: Final[datetime_time] = datetime_time(13, 20)
 DEFAULT_INTRADAY_FLATTEN_TIME: Final[datetime_time] = datetime_time(13, 35)
@@ -196,6 +202,7 @@ def _new_strategy_ledger(*, entry_state: str = "pending") -> dict[str, Any]:
         "option_fees_twd": 0.0,
         "option_tax_twd": 0.0,
         "futures_position": 0,
+        "underlying_futures_position": 0,
         "option_positions": {},
         "option_position_metadata": {},
         "entry_state": entry_state,
@@ -211,7 +218,24 @@ def _new_strategy_ledger(*, entry_state: str = "pending") -> dict[str, Any]:
         "last_complete_mark_decision_ts_ns": None,
         "last_complete_mark_cycle_id": None,
         "last_complete_mark_futures_position": None,
+        "last_complete_mark_underlying_futures_position": None,
         "last_complete_mark_option_positions": None,
+    }
+
+
+def _new_put_call_parity_state() -> dict[str, Any]:
+    return {
+        "pending_signal": None,
+        "open_position": None,
+        "last_settled_expiry": None,
+        "blocked_expiry": None,
+        "monitor": {
+            "state": "waiting_for_same_expiry_monthly_books",
+            "minimum_net_edge_twd": PUT_CALL_PARITY_MIN_NET_EDGE_TWD,
+            "financing_interest_rate": 0.0,
+            "package": "4 TXO Call/Put synthetic forwards versus 1 TX",
+            "broker_submission": False,
+        },
     }
 
 
@@ -371,6 +395,64 @@ class FuturesInstrument:
     last_trading_date: date | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class PutCallParityCandidate:
+    direction: str
+    expiry: date
+    series: str
+    strike: float
+    call: OptionInstrument
+    put: OptionInstrument
+    call_contracts: int
+    put_contracts: int
+    future_contracts: int
+    call_price: float
+    put_price: float
+    future_price: float
+    call_liquidation_price: float
+    put_liquidation_price: float
+    call_receive_ts_ns: int
+    put_receive_ts_ns: int
+    future_receive_ts_ns: int
+    gross_locked_edge_twd: float
+    entry_fixed_fees_twd: float
+    entry_transaction_tax_twd: float
+    estimated_settlement_tax_twd: float
+    net_after_estimated_cost_twd: float
+
+    def public_payload(self) -> dict[str, Any]:
+        return {
+            "direction": self.direction,
+            "expiry_date": self.expiry.isoformat(),
+            "series": self.series,
+            "strike": self.strike,
+            "call_code": self.call.code,
+            "put_code": self.put.code,
+            "future_code": None,
+            "call_contracts": self.call_contracts,
+            "put_contracts": self.put_contracts,
+            "future_contracts": self.future_contracts,
+            "call_price": self.call_price,
+            "put_price": self.put_price,
+            "future_price": self.future_price,
+            "maximum_book_age_ms": None,
+            "gross_locked_edge_twd": self.gross_locked_edge_twd,
+            "entry_fixed_fees_twd": self.entry_fixed_fees_twd,
+            "entry_transaction_tax_twd": self.entry_transaction_tax_twd,
+            "estimated_settlement_tax_twd": self.estimated_settlement_tax_twd,
+            "total_estimated_cost_twd": (
+                self.entry_fixed_fees_twd
+                + self.entry_transaction_tax_twd
+                + self.estimated_settlement_tax_twd
+            ),
+            "net_after_estimated_cost_twd": self.net_after_estimated_cost_twd,
+            "profitable_after_cost": (
+                self.net_after_estimated_cost_twd
+                > PUT_CALL_PARITY_MIN_NET_EDGE_TWD
+            ),
+        }
+
+
 def option_instruments(infos: Iterable[Any]) -> tuple[OptionInstrument, ...]:
     output: list[OptionInstrument] = []
     for info in infos:
@@ -493,6 +575,13 @@ class TaifexVolatilitySimulation:
         self.catalog_expansion_entry_policy = expansion_policy
         self.underlying = underlying
         self.hedge = hedge
+        self.underlying_product = _continuous_future_product(underlying.logical_code)
+        self.underlying_multiplier = float(
+            TAIFEX_INDEX_FUTURES_MULTIPLIERS[self.underlying_product]
+        )
+        self.underlying_fee_per_side_twd = FUTURES_FEE_PER_SIDE_TWD[
+            self.underlying_product
+        ]
         self.hedge_product = _continuous_future_product(hedge.logical_code)
         self.hedge_multiplier = float(
             TAIFEX_INDEX_FUTURES_MULTIPLIERS[self.hedge_product]
@@ -611,6 +700,9 @@ class TaifexVolatilitySimulation:
             elif execution_version == 6:
                 payload["execution_contract_version"] = EXECUTION_CONTRACT_VERSION
                 migration_reasons.append("official_margin_schedule_migration")
+            elif execution_version == 7:
+                payload["execution_contract_version"] = EXECUTION_CONTRACT_VERSION
+                migration_reasons.append("same_expiry_put_call_parity_tx_migration")
             elif execution_version != EXECUTION_CONTRACT_VERSION:
                 raise RuntimeError("strategy execution contract mismatch")
 
@@ -680,6 +772,18 @@ class TaifexVolatilitySimulation:
             payload["catalog_expansion_entry_policy"] = (
                 self.catalog_expansion_entry_policy
             )
+            payload.setdefault("underlying_product", self.underlying_product)
+            payload.setdefault(
+                "underlying_multiplier_twd_per_point", self.underlying_multiplier
+            )
+            payload.setdefault(
+                "underlying_fee_per_side_twd", self.underlying_fee_per_side_twd
+            )
+            parity_state = payload.setdefault(
+                "put_call_parity_tx", _new_put_call_parity_state()
+            )
+            for key, value in _new_put_call_parity_state().items():
+                parity_state.setdefault(key, value)
             payload.setdefault("last_intraday_decision_session", None)
             stored_margin_a = float(
                 payload.get("option_risk_margin_a_twd", TXO_RISK_MARGIN_TWD["A"])
@@ -745,6 +849,12 @@ class TaifexVolatilitySimulation:
                     "strategy hedge product mismatch: "
                     f"state={payload.get('hedge_product')} "
                     f"runtime={self.hedge_product}"
+                )
+            if str(payload.get("underlying_product")) != self.underlying_product:
+                raise RuntimeError(
+                    "strategy underlying product mismatch: "
+                    f"state={payload.get('underlying_product')} "
+                    f"runtime={self.underlying_product}"
                 )
             if (
                 float(
@@ -820,6 +930,9 @@ class TaifexVolatilitySimulation:
             "production_order_possible": False,
             "strategy_ids": list(STRATEGY_IDS),
             "strategy_mode": self.strategy_mode,
+            "underlying_product": self.underlying_product,
+            "underlying_multiplier_twd_per_point": self.underlying_multiplier,
+            "underlying_fee_per_side_twd": self.underlying_fee_per_side_twd,
             "hedge_product": self.hedge_product,
             "hedge_multiplier_twd_per_point": self.hedge_multiplier,
             "hedge_fee_per_side_twd": self.hedge_fee_per_side_twd,
@@ -852,6 +965,7 @@ class TaifexVolatilitySimulation:
             "broker_orders_enabled": self.broker_orders_enabled,
             "engine_status": "waiting_for_bootstrap",
             "blocked_reason": None,
+            "put_call_parity_tx": _new_put_call_parity_state(),
             "strategies": {
                 strategy_id: _new_strategy_ledger() for strategy_id in STRATEGY_IDS
             },
@@ -881,6 +995,22 @@ class TaifexVolatilitySimulation:
         ledger = current_state["strategies"][strategy_id]
         spec = STRATEGY_SPEC_BY_ID[strategy_id]
         option_capital = float(ledger.get("entry_capital_requirement_twd") or 0.0)
+        if strategy_id == PUT_CALL_PARITY_TX_STRATEGY_ID:
+            if option_capital > 0.0:
+                return float(
+                    option_capital * self.strategy_capital_buffer_multiple
+                )
+            margin_date = taifex_trading_date(datetime.now(TAIPEI))
+            conservative_package_capital = (
+                PUT_CALL_PARITY_OPTION_QUANTITY * self.option_risk_margin_a_twd
+                + taifex_initial_margin_twd(self.underlying_product, margin_date)
+                + PUT_CALL_PARITY_OPTION_QUANTITY * 2 * OPTION_FEE_PER_SIDE_TWD
+                + self.underlying_fee_per_side_twd
+            )
+            return float(
+                conservative_package_capital
+                * self.strategy_capital_buffer_multiple
+            )
         margin_contracts = 0
         if spec.hedge_policy == "fixed_future":
             margin_contracts = abs(int(spec.hedge_parameter or 0.0))
@@ -947,6 +1077,9 @@ class TaifexVolatilitySimulation:
                         "decision_ts_ns": int(row.get("decision_ts_ns") or 0),
                         "cycle_id": row.get("active_cycle_id"),
                         "futures_position": int(row.get("futures_position") or 0),
+                        "underlying_futures_position": int(
+                            row.get("underlying_futures_position") or 0
+                        ),
                         "option_positions": row.get("option_positions"),
                     }
         return latest
@@ -976,6 +1109,9 @@ class TaifexVolatilitySimulation:
                 ledger["last_complete_mark_futures_position"] = cached[
                     "futures_position"
                 ]
+                ledger["last_complete_mark_underlying_futures_position"] = cached[
+                    "underlying_futures_position"
+                ]
                 ledger["last_complete_mark_option_positions"] = cached.get(
                     "option_positions"
                 )
@@ -983,6 +1119,9 @@ class TaifexVolatilitySimulation:
             ledger.setdefault("last_complete_mark_decision_ts_ns", None)
             ledger.setdefault("last_complete_mark_cycle_id", None)
             ledger.setdefault("last_complete_mark_futures_position", None)
+            ledger.setdefault(
+                "last_complete_mark_underlying_futures_position", None
+            )
             ledger.setdefault("last_complete_mark_option_positions", None)
 
     def _persist_state(self) -> None:
@@ -1194,18 +1333,37 @@ class TaifexVolatilitySimulation:
         fee_twd: float | None = None,
         tax_twd: float | None = None,
         price_source: str | None = None,
+        future_multiplier_twd_per_point: float | None = None,
+        future_fee_per_side_twd: float | None = None,
+        future_position_field: str = "futures_position",
+        signal_decision_ns: int | None = None,
     ) -> None:
         if strategy_id not in STRATEGY_IDS:
             raise ValueError(f"unknown strategy id: {strategy_id}")
         quantity = abs(int(delta_contracts))
-        multiplier = (
-            OPTION_MULTIPLIER if instrument_type == "option" else self.hedge_multiplier
-        )
+        multiplier = OPTION_MULTIPLIER
+        if instrument_type != "option":
+            multiplier = float(
+                future_multiplier_twd_per_point
+                if future_multiplier_twd_per_point is not None
+                else self.hedge_multiplier
+            )
+            if future_position_field not in {
+                "futures_position",
+                "underlying_futures_position",
+            }:
+                raise ValueError(
+                    f"unsupported futures position field: {future_position_field}"
+                )
         if fee_twd is None:
             rate = (
                 OPTION_FEE_PER_SIDE_TWD
                 if instrument_type == "option"
-                else self.hedge_fee_per_side_twd
+                else float(
+                    future_fee_per_side_twd
+                    if future_fee_per_side_twd is not None
+                    else self.hedge_fee_per_side_twd
+                )
             )
             fee_twd = quantity * rate
         if tax_twd is None:
@@ -1217,7 +1375,7 @@ class TaifexVolatilitySimulation:
             else:
                 tax_twd = quantity * taifex_tax_per_contract_twd(
                     price_points,
-                    multiplier_twd_per_point=self.hedge_multiplier,
+                    multiplier_twd_per_point=multiplier,
                     tax_rate=stock_index_futures_tax_rate(
                         datetime.fromtimestamp(decision_ns / 1e9, tz=TAIPEI).date()
                     ),
@@ -1251,9 +1409,9 @@ class TaifexVolatilitySimulation:
                 positions.pop(code, None)
                 ledger.setdefault("option_position_metadata", {}).pop(code, None)
         else:
-            ledger["futures_position"] = int(ledger["futures_position"]) + int(
-                delta_contracts
-            )
+            ledger[future_position_field] = int(
+                ledger.get(future_position_field) or 0
+            ) + int(delta_contracts)
         row = {
             "schema_version": SCHEMA_VERSION,
             "event": "ideal_executable_trade",
@@ -1266,6 +1424,9 @@ class TaifexVolatilitySimulation:
             "strike": strike,
             "option_right": option_right,
             "decision_ts_ns": int(decision_ns),
+            "signal_decision_ts_ns": (
+                int(signal_decision_ns) if signal_decision_ns is not None else None
+            ),
             "book_receive_ts_ns": int(receive_ns),
             "book_age_ms": max(0.0, (decision_ns - receive_ns) / 1e6),
             "price_source": price_source
@@ -1325,6 +1486,575 @@ class TaifexVolatilitySimulation:
             maximum_age_seconds=ENTRY_BOOK_MAX_AGE_SECONDS,
             require_one_lot=True,
         )
+
+    def _put_call_parity_pairs(
+        self,
+    ) -> list[tuple[date, str, float, OptionInstrument, OptionInstrument]]:
+        """Return worker-0 monthly pairs that settle with the current TX future."""
+
+        expiry = self.underlying.last_trading_date
+        if not isinstance(expiry, date):
+            return []
+        grouped: dict[tuple[str, float], dict[str, OptionInstrument]] = {}
+        for item in self.options:
+            if item.root != "TXO" or item.expiry != expiry:
+                continue
+            grouped.setdefault((item.series, item.strike), {})[item.right] = item
+        output = []
+        for (series, strike), rights in grouped.items():
+            if {"C", "P"} <= set(rights):
+                output.append((expiry, series, strike, rights["C"], rights["P"]))
+        output.sort(key=lambda item: (item[0], item[2], item[1]))
+        return output
+
+    def _put_call_parity_candidate(
+        self,
+        *,
+        decision_ns: int,
+        direction: str,
+        expiry: date,
+        series: str,
+        strike: float,
+        call: OptionInstrument,
+        put: OptionInstrument,
+        require_receive_after_ns: int | None = None,
+    ) -> PutCallParityCandidate | None:
+        if direction == "sell_rich_synthetic_buy_tx":
+            call_contracts = -PUT_CALL_PARITY_OPTION_QUANTITY
+            put_contracts = PUT_CALL_PARITY_OPTION_QUANTITY
+            future_contracts = PUT_CALL_PARITY_FUTURE_QUANTITY
+        elif direction == "buy_cheap_synthetic_sell_tx":
+            call_contracts = PUT_CALL_PARITY_OPTION_QUANTITY
+            put_contracts = -PUT_CALL_PARITY_OPTION_QUANTITY
+            future_contracts = -PUT_CALL_PARITY_FUTURE_QUANTITY
+        else:
+            raise ValueError(f"unsupported put-call parity direction: {direction}")
+
+        call_row = self.latest_books.get(call.code)
+        put_row = self.latest_books.get(put.code)
+        future_row = self.latest_books.get(self.underlying.code)
+        if call_row is None or put_row is None or future_row is None:
+            return None
+        rows = (call_row, put_row, future_row)
+        if require_receive_after_ns is not None and any(
+            int(row.get("receive_ts_ns") or 0) <= int(require_receive_after_ns)
+            for row in rows
+        ):
+            return None
+        call_fill = _depth_swept_price(
+            call_row,
+            delta_contracts=call_contracts,
+            decision_ns=decision_ns,
+            maximum_age_seconds=ENTRY_BOOK_MAX_AGE_SECONDS,
+        )
+        put_fill = _depth_swept_price(
+            put_row,
+            delta_contracts=put_contracts,
+            decision_ns=decision_ns,
+            maximum_age_seconds=ENTRY_BOOK_MAX_AGE_SECONDS,
+        )
+        future_fill = _depth_swept_price(
+            future_row,
+            delta_contracts=future_contracts,
+            decision_ns=decision_ns,
+            maximum_age_seconds=ENTRY_BOOK_MAX_AGE_SECONDS,
+        )
+        call_liquidation = _depth_swept_price(
+            call_row,
+            delta_contracts=-call_contracts,
+            decision_ns=decision_ns,
+            maximum_age_seconds=ENTRY_BOOK_MAX_AGE_SECONDS,
+        )
+        put_liquidation = _depth_swept_price(
+            put_row,
+            delta_contracts=-put_contracts,
+            decision_ns=decision_ns,
+            maximum_age_seconds=ENTRY_BOOK_MAX_AGE_SECONDS,
+        )
+        future_book = _executable_book(
+            future_row,
+            decision_ns=decision_ns,
+            maximum_age_seconds=ENTRY_BOOK_MAX_AGE_SECONDS,
+            require_one_lot=True,
+        )
+        if (
+            call_fill is None
+            or put_fill is None
+            or future_fill is None
+            or call_liquidation is None
+            or put_liquidation is None
+            or future_book is None
+        ):
+            return None
+        call_price, call_receive_ns = call_fill
+        put_price, put_receive_ns = put_fill
+        future_price, future_receive_ns = future_fill
+        entry_cash = -(
+            call_contracts * call_price + put_contracts * put_price
+        ) * OPTION_MULTIPLIER - (
+            future_contracts * future_price * self.underlying_multiplier
+        )
+        settlement_cash = (
+            future_contracts * strike * self.underlying_multiplier
+        )
+        gross_edge = entry_cash + settlement_cash
+        entry_fees = (
+            (abs(call_contracts) + abs(put_contracts)) * OPTION_FEE_PER_SIDE_TWD
+            + abs(future_contracts) * self.underlying_fee_per_side_twd
+        )
+        entry_tax = (
+            abs(call_contracts)
+            * option_premium_transaction_tax_twd(
+                call_price,
+                multiplier_twd_per_point=OPTION_MULTIPLIER,
+            )
+            + abs(put_contracts)
+            * option_premium_transaction_tax_twd(
+                put_price,
+                multiplier_twd_per_point=OPTION_MULTIPLIER,
+            )
+            + abs(future_contracts)
+            * taifex_tax_per_contract_twd(
+                future_price,
+                multiplier_twd_per_point=self.underlying_multiplier,
+                tax_rate=stock_index_futures_tax_rate(
+                    datetime.fromtimestamp(decision_ns / 1e9, tz=TAIPEI).date()
+                ),
+            )
+        )
+        settlement_proxy = sum(future_book) / 2.0
+        settlement_tax = (
+            PUT_CALL_PARITY_OPTION_QUANTITY
+            * option_cash_settlement_transaction_tax_twd(
+                settlement_proxy,
+                settlement_date=expiry,
+                multiplier_twd_per_point=OPTION_MULTIPLIER,
+            )
+            + PUT_CALL_PARITY_FUTURE_QUANTITY
+            * taifex_tax_per_contract_twd(
+                settlement_proxy,
+                multiplier_twd_per_point=self.underlying_multiplier,
+                tax_rate=stock_index_futures_tax_rate(expiry),
+            )
+        )
+        net_edge = gross_edge - entry_fees - entry_tax - settlement_tax
+        return PutCallParityCandidate(
+            direction=direction,
+            expiry=expiry,
+            series=series,
+            strike=strike,
+            call=call,
+            put=put,
+            call_contracts=call_contracts,
+            put_contracts=put_contracts,
+            future_contracts=future_contracts,
+            call_price=call_price,
+            put_price=put_price,
+            future_price=future_price,
+            call_liquidation_price=call_liquidation[0],
+            put_liquidation_price=put_liquidation[0],
+            call_receive_ts_ns=call_receive_ns,
+            put_receive_ts_ns=put_receive_ns,
+            future_receive_ts_ns=future_receive_ns,
+            gross_locked_edge_twd=float(gross_edge),
+            entry_fixed_fees_twd=float(entry_fees),
+            entry_transaction_tax_twd=float(entry_tax),
+            estimated_settlement_tax_twd=float(settlement_tax),
+            net_after_estimated_cost_twd=float(net_edge),
+        )
+
+    def _put_call_parity_payload(
+        self,
+        candidate: PutCallParityCandidate,
+        *,
+        decision_ns: int,
+    ) -> dict[str, Any]:
+        receive_times = (
+            candidate.call_receive_ts_ns,
+            candidate.put_receive_ts_ns,
+            candidate.future_receive_ts_ns,
+        )
+        return {
+            **candidate.public_payload(),
+            "future_code": self.underlying.code,
+            "observed_decision_ts_ns": int(decision_ns),
+            "maximum_book_age_ms": max(
+                0.0,
+                (int(decision_ns) - min(receive_times)) / 1e6,
+            ),
+        }
+
+    def _scan_put_call_parity(
+        self,
+        *,
+        decision_ns: int,
+        fixed_signal: Mapping[str, Any] | None = None,
+    ) -> tuple[PutCallParityCandidate | None, int, int]:
+        pairs = self._put_call_parity_pairs()
+        candidates: list[PutCallParityCandidate] = []
+        for expiry, series, strike, call, put in pairs:
+            if fixed_signal is not None and (
+                str(fixed_signal.get("expiry_date")) != expiry.isoformat()
+                or str(fixed_signal.get("series")) != series
+                or float(fixed_signal.get("strike") or math.nan) != strike
+            ):
+                continue
+            directions = (
+                (str(fixed_signal["direction"]),)
+                if fixed_signal is not None
+                else (
+                    "sell_rich_synthetic_buy_tx",
+                    "buy_cheap_synthetic_sell_tx",
+                )
+            )
+            for direction in directions:
+                candidate = self._put_call_parity_candidate(
+                    decision_ns=decision_ns,
+                    direction=direction,
+                    expiry=expiry,
+                    series=series,
+                    strike=strike,
+                    call=call,
+                    put=put,
+                    require_receive_after_ns=(
+                        int(fixed_signal["signal_decision_ts_ns"])
+                        if fixed_signal is not None
+                        else None
+                    ),
+                )
+                if candidate is not None:
+                    candidates.append(candidate)
+        best = max(
+            candidates,
+            key=lambda item: item.net_after_estimated_cost_twd,
+            default=None,
+        )
+        return best, len(pairs), len(candidates)
+
+    def _enter_put_call_parity(
+        self,
+        candidate: PutCallParityCandidate,
+        *,
+        signal_decision_ns: int,
+        execution_decision_ns: int,
+    ) -> None:
+        ledger = self.state["strategies"][PUT_CALL_PARITY_TX_STRATEGY_ID]
+        parity_state = self.state["put_call_parity_tx"]
+        if (
+            ledger.get("option_positions")
+            or int(ledger.get("underlying_futures_position") or 0) != 0
+            or parity_state.get("open_position") is not None
+        ):
+            raise RuntimeError("put-call parity entry requires a flat strategy ledger")
+        first_lifetime_entry = int(ledger.get("trade_sides") or 0) == 0
+        for instrument, contracts, price, receive_ns in (
+            (
+                candidate.call,
+                candidate.call_contracts,
+                candidate.call_price,
+                candidate.call_receive_ts_ns,
+            ),
+            (
+                candidate.put,
+                candidate.put_contracts,
+                candidate.put_price,
+                candidate.put_receive_ts_ns,
+            ),
+        ):
+            self._record_ideal_trade(
+                strategy_id=PUT_CALL_PARITY_TX_STRATEGY_ID,
+                instrument_type="option",
+                product="TXO",
+                code=instrument.code,
+                delta_contracts=contracts,
+                price_points=price,
+                decision_ns=execution_decision_ns,
+                receive_ns=receive_ns,
+                reason="put_call_parity_tx_positive_after_all_explicit_costs",
+                series=instrument.series,
+                strike=instrument.strike,
+                option_right=instrument.right,
+                price_source=(
+                    "strictly_later_five_level_ask_vwap"
+                    if contracts > 0
+                    else "strictly_later_five_level_bid_vwap"
+                ),
+                signal_decision_ns=signal_decision_ns,
+            )
+        self._record_ideal_trade(
+            strategy_id=PUT_CALL_PARITY_TX_STRATEGY_ID,
+            instrument_type="future",
+            product=self.underlying_product,
+            code=self.underlying.code,
+            delta_contracts=candidate.future_contracts,
+            price_points=candidate.future_price,
+            decision_ns=execution_decision_ns,
+            receive_ns=candidate.future_receive_ts_ns,
+            reason="put_call_parity_tx_positive_after_all_explicit_costs",
+            price_source="strictly_later_five_level_depth_vwap",
+            future_multiplier_twd_per_point=self.underlying_multiplier,
+            future_fee_per_side_twd=self.underlying_fee_per_side_twd,
+            future_position_field="underlying_futures_position",
+            signal_decision_ns=signal_decision_ns,
+        )
+
+        option_requirement = 0.0
+        for instrument, contracts, execution_price, liquidation_price in (
+            (
+                candidate.call,
+                candidate.call_contracts,
+                candidate.call_price,
+                candidate.call_liquidation_price,
+            ),
+            (
+                candidate.put,
+                candidate.put_contracts,
+                candidate.put_price,
+                candidate.put_liquidation_price,
+            ),
+        ):
+            fees = abs(contracts) * OPTION_FEE_PER_SIDE_TWD
+            taxes = abs(contracts) * option_premium_transaction_tax_twd(
+                execution_price,
+                multiplier_twd_per_point=OPTION_MULTIPLIER,
+            )
+            if contracts > 0:
+                option_requirement += (
+                    contracts * execution_price * OPTION_MULTIPLIER + fees + taxes
+                )
+            else:
+                option_requirement += (
+                    abs(contracts)
+                    * _txo_short_margin_twd(
+                        option_price=liquidation_price,
+                        underlying_price=candidate.future_price,
+                        strike=instrument.strike,
+                        option_right=instrument.right,
+                        risk_margin_a_twd=self.option_risk_margin_a_twd,
+                        risk_margin_b_twd=self.option_risk_margin_b_twd,
+                    )
+                    + abs(contracts)
+                    * (liquidation_price - execution_price)
+                    * OPTION_MULTIPLIER
+                    + fees
+                    + taxes
+                )
+        entry_date = datetime.fromtimestamp(
+            execution_decision_ns / 1e9, tz=TAIPEI
+        ).date()
+        future_tax = abs(candidate.future_contracts) * taifex_tax_per_contract_twd(
+            candidate.future_price,
+            multiplier_twd_per_point=self.underlying_multiplier,
+            tax_rate=stock_index_futures_tax_rate(entry_date),
+        )
+        capital_requirement = (
+            option_requirement
+            + abs(candidate.future_contracts)
+            * taifex_initial_margin_twd(self.underlying_product, entry_date)
+            + abs(candidate.future_contracts) * self.underlying_fee_per_side_twd
+            + future_tax
+            + candidate.estimated_settlement_tax_twd
+        )
+        ledger["entry_capital_requirement_twd"] = float(capital_requirement)
+        if first_lifetime_entry:
+            ledger["initial_capital_twd"] = max(
+                float(ledger.get("initial_capital_twd") or 0.0),
+                float(capital_requirement * self.strategy_capital_buffer_multiple),
+            )
+        ledger["entry_state"] = "entered"
+        public = self._put_call_parity_payload(
+            candidate,
+            decision_ns=execution_decision_ns,
+        )
+        open_position = {
+            **public,
+            "position_id": (
+                f"{candidate.expiry.isoformat()}_{candidate.series}_"
+                f"{candidate.strike:g}_{candidate.direction}"
+            ),
+            "signal_decision_ts_ns": int(signal_decision_ns),
+            "entry_decision_ts_ns": int(execution_decision_ns),
+            "locked_net_edge_after_estimated_cost_twd": (
+                candidate.net_after_estimated_cost_twd
+            ),
+            "status": "locked_until_official_settlement",
+        }
+        parity_state["open_position"] = open_position
+        parity_state["pending_signal"] = None
+        parity_state["monitor"] = {
+            **public,
+            "state": "locked_until_official_settlement",
+            "minimum_net_edge_twd": PUT_CALL_PARITY_MIN_NET_EDGE_TWD,
+            "financing_interest_rate": 0.0,
+            "broker_submission": False,
+            "locked_net_edge_after_estimated_cost_twd": (
+                candidate.net_after_estimated_cost_twd
+            ),
+        }
+        _append_jsonl(
+            self.events_path,
+            {
+                "event": "put_call_parity_tx_entered",
+                "at_utc": _now_iso(),
+                **open_position,
+            },
+        )
+        self._persist_state()
+
+    def _maybe_run_put_call_parity(
+        self,
+        now: datetime,
+        decision_ns: int,
+    ) -> None:
+        ledger = self.state["strategies"][PUT_CALL_PARITY_TX_STRATEGY_ID]
+        parity_state = self.state["put_call_parity_tx"]
+        if parity_state.get("open_position") is not None:
+            ledger["entry_state"] = "entered"
+            return
+        if not bool(ledger.get("alive", True)):
+            ledger["entry_state"] = "ruined"
+            return
+        expiry = self.underlying.last_trading_date
+        if parity_state.get("blocked_expiry") and (
+            not isinstance(expiry, date)
+            or str(parity_state["blocked_expiry"]) == expiry.isoformat()
+        ):
+            ledger["entry_state"] = "forced_flat"
+            parity_state["monitor"] = {
+                **(parity_state.get("monitor") or {}),
+                "state": "forced_flat_until_next_monthly_contract",
+            }
+            return
+        if isinstance(expiry, date) and parity_state.get("blocked_expiry"):
+            parity_state["blocked_expiry"] = None
+            ledger["entry_state"] = "waiting_for_profitable_parity"
+        if self.underlying_product != "TX":
+            ledger["entry_state"] = "waiting_for_tx_underlying"
+            parity_state["monitor"] = {
+                "state": "unsupported_underlying_product",
+                "underlying_product": self.underlying_product,
+                "minimum_net_edge_twd": PUT_CALL_PARITY_MIN_NET_EDGE_TWD,
+                "broker_submission": False,
+            }
+            return
+        if not taifex_continuous_session_open(now):
+            ledger["entry_state"] = "waiting_for_continuous_market"
+            parity_state["monitor"] = {
+                **(parity_state.get("monitor") or {}),
+                "state": "waiting_for_continuous_market",
+                "market_phase": taifex_market_phase(now),
+            }
+            return
+        trading_date = taifex_trading_date(now)
+        if not isinstance(expiry, date) or expiry < trading_date:
+            ledger["entry_state"] = "waiting_for_same_expiry_monthly_books"
+            parity_state["monitor"] = {
+                **(parity_state.get("monitor") or {}),
+                "state": "waiting_for_same_expiry_monthly_books",
+            }
+            return
+        if (
+            expiry == trading_date
+            and taifex_session_kind(now) == "day"
+            and now.time() >= datetime_time(13, 20)
+        ):
+            ledger["entry_state"] = "entry_closed_for_expiry_settlement"
+            parity_state["monitor"] = {
+                **(parity_state.get("monitor") or {}),
+                "state": "entry_closed_for_expiry_settlement",
+            }
+            return
+
+        pending = parity_state.get("pending_signal")
+        if isinstance(pending, Mapping):
+            signal_ns = int(pending.get("signal_decision_ts_ns") or 0)
+            wait_seconds = max(0.0, (decision_ns - signal_ns) / 1e9)
+            candidate, pair_count, evaluable_count = self._scan_put_call_parity(
+                decision_ns=decision_ns,
+                fixed_signal=pending,
+            )
+            if candidate is not None:
+                if (
+                    candidate.net_after_estimated_cost_twd
+                    > PUT_CALL_PARITY_MIN_NET_EDGE_TWD
+                ):
+                    self._enter_put_call_parity(
+                        candidate,
+                        signal_decision_ns=signal_ns,
+                        execution_decision_ns=decision_ns,
+                    )
+                    return
+                parity_state["pending_signal"] = None
+                ledger["entry_state"] = "waiting_for_profitable_parity"
+                parity_state["monitor"] = {
+                    **self._put_call_parity_payload(
+                        candidate,
+                        decision_ns=decision_ns,
+                    ),
+                    "state": "signal_cancelled_after_next_book_recheck",
+                    "scanned_pair_count": pair_count,
+                    "evaluable_direction_count": evaluable_count,
+                }
+                self._persist_state()
+                return
+            if wait_seconds <= PUT_CALL_PARITY_SIGNAL_MAX_WAIT_SECONDS:
+                ledger["entry_state"] = "signal_pending_next_books"
+                parity_state["monitor"] = {
+                    **(parity_state.get("monitor") or {}),
+                    "state": "signal_pending_next_books",
+                    "signal_wait_seconds": wait_seconds,
+                    "scanned_pair_count": pair_count,
+                    "evaluable_direction_count": evaluable_count,
+                }
+                return
+            parity_state["pending_signal"] = None
+
+        candidate, pair_count, evaluable_count = self._scan_put_call_parity(
+            decision_ns=decision_ns
+        )
+        if candidate is None:
+            ledger["entry_state"] = "waiting_for_same_expiry_monthly_books"
+            parity_state["monitor"] = {
+                "state": "waiting_for_same_expiry_monthly_books",
+                "expiry_date": expiry.isoformat(),
+                "scanned_pair_count": pair_count,
+                "evaluable_direction_count": evaluable_count,
+                "minimum_net_edge_twd": PUT_CALL_PARITY_MIN_NET_EDGE_TWD,
+                "financing_interest_rate": 0.0,
+                "broker_submission": False,
+            }
+            return
+        public = self._put_call_parity_payload(candidate, decision_ns=decision_ns)
+        if candidate.net_after_estimated_cost_twd <= PUT_CALL_PARITY_MIN_NET_EDGE_TWD:
+            ledger["entry_state"] = "waiting_for_profitable_parity"
+            parity_state["monitor"] = {
+                **public,
+                "state": "no_positive_edge_after_cost",
+                "scanned_pair_count": pair_count,
+                "evaluable_direction_count": evaluable_count,
+                "minimum_net_edge_twd": PUT_CALL_PARITY_MIN_NET_EDGE_TWD,
+                "financing_interest_rate": 0.0,
+                "broker_submission": False,
+            }
+            return
+        parity_state["pending_signal"] = {
+            "signal_decision_ts_ns": int(decision_ns),
+            "direction": candidate.direction,
+            "expiry_date": candidate.expiry.isoformat(),
+            "series": candidate.series,
+            "strike": candidate.strike,
+        }
+        ledger["entry_state"] = "signal_pending_next_books"
+        parity_state["monitor"] = {
+            **public,
+            "state": "signal_pending_next_books",
+            "scanned_pair_count": pair_count,
+            "evaluable_direction_count": evaluable_count,
+            "minimum_net_edge_twd": PUT_CALL_PARITY_MIN_NET_EDGE_TWD,
+            "financing_interest_rate": 0.0,
+            "broker_submission": False,
+        }
+        self._persist_state()
 
     def _intraday_session_state(self, now: datetime) -> dict[str, Any]:
         """Resolve causal day/night permissions for one observed timestamp."""
@@ -1395,6 +2125,8 @@ class TaifexVolatilitySimulation:
         *,
         decision_ns: int,
     ) -> bool:
+        if strategy_id == PUT_CALL_PARITY_TX_STRATEGY_ID:
+            return False
         cycle = self.state.get("active_cycle")
         if not isinstance(cycle, dict):
             return False
@@ -1520,6 +2252,8 @@ class TaifexVolatilitySimulation:
         if self.state.get("active_cycle") is None:
             return
         for strategy_id in STRATEGY_IDS:
+            if strategy_id == PUT_CALL_PARITY_TX_STRATEGY_ID:
+                continue
             self._enter_strategy_for_cycle(
                 strategy_id,
                 decision_ns=decision_ns,
@@ -1647,11 +2381,18 @@ class TaifexVolatilitySimulation:
             "strategy_mode": self.strategy_mode,
             "status": "open",
             "strategy_entries": {
-                strategy_id: "pending" for strategy_id in STRATEGY_IDS
+                strategy_id: (
+                    "independent_monthly_lifecycle"
+                    if strategy_id == PUT_CALL_PARITY_TX_STRATEGY_ID
+                    else "pending"
+                )
+                for strategy_id in STRATEGY_IDS
             },
             "broker_reference_opened": False,
         }
         for strategy_id in STRATEGY_IDS:
+            if strategy_id == PUT_CALL_PARITY_TX_STRATEGY_ID:
+                continue
             ledger = self.state["strategies"][strategy_id]
             ledger["entry_state"] = "pending"
             ledger["option_positions"] = {}
@@ -1726,6 +2467,45 @@ class TaifexVolatilitySimulation:
             )
         return True
 
+    def _execute_underlying_future_target(
+        self,
+        *,
+        strategy_id: str,
+        target: int,
+        decision_ns: int,
+        reason: str,
+    ) -> bool:
+        ledger = self.state["strategies"][strategy_id]
+        current = int(ledger.get("underlying_futures_position") or 0)
+        change = int(target) - current
+        if change == 0:
+            return True
+        swept = _depth_swept_price(
+            self.latest_books.get(self.underlying.code),
+            delta_contracts=change,
+            decision_ns=decision_ns,
+            maximum_age_seconds=ENTRY_BOOK_MAX_AGE_SECONDS,
+        )
+        if swept is None:
+            return False
+        self._record_ideal_trade(
+            strategy_id=strategy_id,
+            instrument_type="future",
+            product=self.underlying_product,
+            code=self.underlying.code,
+            delta_contracts=change,
+            price_points=swept[0],
+            decision_ns=decision_ns,
+            receive_ns=swept[1],
+            reason=reason,
+            price_source="causally_received_five_level_depth_vwap",
+            future_multiplier_twd_per_point=self.underlying_multiplier,
+            future_fee_per_side_twd=self.underlying_fee_per_side_twd,
+            future_position_field="underlying_futures_position",
+        )
+        self._persist_state()
+        return True
+
     def _force_liquidate_strategy(
         self,
         strategy_id: str,
@@ -1766,6 +2546,21 @@ class TaifexVolatilitySimulation:
         ):
             ledger["forced_liquidation_pending"] = True
             return False
+        underlying_future_position = int(
+            ledger.get("underlying_futures_position") or 0
+        )
+        if (
+            underlying_future_position
+            and _depth_swept_price(
+                self.latest_books.get(self.underlying.code),
+                delta_contracts=-underlying_future_position,
+                decision_ns=decision_ns,
+                maximum_age_seconds=ENTRY_BOOK_MAX_AGE_SECONDS,
+            )
+            is None
+        ):
+            ledger["forced_liquidation_pending"] = True
+            return False
         for code, position, price, receive_ns, leg in prepared:
             self._record_ideal_trade(
                 strategy_id=strategy_id,
@@ -1790,8 +2585,27 @@ class TaifexVolatilitySimulation:
         ):
             ledger["forced_liquidation_pending"] = True
             return False
+        if underlying_future_position and not self._execute_underlying_future_target(
+            strategy_id=strategy_id,
+            target=0,
+            decision_ns=decision_ns,
+            reason=reason,
+        ):
+            ledger["forced_liquidation_pending"] = True
+            return False
         ledger["forced_liquidation_pending"] = False
         ledger["entry_state"] = "forced_flat"
+        if strategy_id == PUT_CALL_PARITY_TX_STRATEGY_ID:
+            parity_state = self.state["put_call_parity_tx"]
+            open_position = parity_state.get("open_position") or {}
+            parity_state["blocked_expiry"] = open_position.get("expiry_date")
+            parity_state["open_position"] = None
+            parity_state["pending_signal"] = None
+            parity_state["monitor"] = {
+                **(parity_state.get("monitor") or {}),
+                "state": "forced_flat_until_next_monthly_contract",
+                "forced_flat_reason": reason,
+            }
         self.state.get("pending_targets", {}).pop(strategy_id, None)
         closed_mark = self._strategy_mark(strategy_id, decision_ns)
         total_equity = closed_mark.get("total_equity_twd")
@@ -2149,6 +2963,8 @@ class TaifexVolatilitySimulation:
             return
         settlement_price, source_file, source_sha = settlement
         for strategy_id in STRATEGY_IDS:
+            if strategy_id == PUT_CALL_PARITY_TX_STRATEGY_ID:
+                continue
             ledger = self.state["strategies"][strategy_id]
             positions = dict(ledger.get("option_positions") or {})
             metadata = ledger.get("option_position_metadata") or {}
@@ -2208,18 +3024,159 @@ class TaifexVolatilitySimulation:
         )
         self.state["active_cycle"] = None
         self.state["pending_targets"] = {}
-        for ledger in self.state["strategies"].values():
+        for strategy_id, ledger in self.state["strategies"].items():
+            if strategy_id == PUT_CALL_PARITY_TX_STRATEGY_ID:
+                continue
             ledger["entry_state"] = "pending"
         self.state["last_settled_expiry"] = expiry.isoformat()
         self.state["blocked_reason"] = None
         self.state["engine_status"] = "flat_ready_for_next_cycle"
         self._persist_state()
 
+    def _maybe_settle_expired_put_call_parity(
+        self,
+        now: datetime,
+        decision_ns: int,
+    ) -> None:
+        parity_state = self.state["put_call_parity_tx"]
+        open_position = parity_state.get("open_position")
+        if not isinstance(open_position, Mapping):
+            return
+        expiry = date.fromisoformat(str(open_position["expiry_date"]))
+        if expiry >= taifex_trading_date(now):
+            return
+        settlement = self._official_settlement(expiry)
+        if settlement is None:
+            parity_state["monitor"] = {
+                **(parity_state.get("monitor") or {}),
+                "state": "blocked_missing_official_final_settlement",
+            }
+            self.state["engine_status"] = "blocked_missing_official_final_settlement"
+            self.state["blocked_reason"] = (
+                f"missing_put_call_parity_tx_official_final_settlement:{expiry}"
+            )
+            return
+        settlement_price, source_file, source_sha = settlement
+        ledger = self.state["strategies"][PUT_CALL_PARITY_TX_STRATEGY_ID]
+        metadata = ledger.get("option_position_metadata") or {}
+        for code, raw_position in dict(ledger.get("option_positions") or {}).items():
+            position = int(raw_position)
+            if position == 0:
+                continue
+            leg = metadata.get(code) or {}
+            right = str(leg.get("option_right") or "")
+            strike = float(leg.get("strike") or 0.0)
+            if right == "C":
+                price = max(settlement_price - strike, 0.0)
+            elif right == "P":
+                price = max(strike - settlement_price, 0.0)
+            else:
+                raise RuntimeError(f"missing parity option right: {code}")
+            tax = (
+                abs(position)
+                * option_cash_settlement_transaction_tax_twd(
+                    settlement_price,
+                    settlement_date=expiry,
+                    multiplier_twd_per_point=OPTION_MULTIPLIER,
+                )
+                if price > 0.0
+                else 0.0
+            )
+            self._record_ideal_trade(
+                strategy_id=PUT_CALL_PARITY_TX_STRATEGY_ID,
+                instrument_type="option",
+                product="TXO",
+                code=code,
+                delta_contracts=-position,
+                price_points=price,
+                decision_ns=decision_ns,
+                receive_ns=decision_ns,
+                reason="put_call_parity_tx_official_cash_settlement",
+                series=str(leg.get("series") or open_position.get("series") or ""),
+                strike=strike,
+                option_right=right,
+                fee_twd=0.0,
+                tax_twd=tax,
+                price_source="official_taifex_final_settlement_intrinsic_value",
+            )
+        future_position = int(ledger.get("underlying_futures_position") or 0)
+        if future_position == 0:
+            raise RuntimeError("put-call parity settlement lost its TX future leg")
+        future_tax = abs(future_position) * taifex_tax_per_contract_twd(
+            settlement_price,
+            multiplier_twd_per_point=self.underlying_multiplier,
+            tax_rate=stock_index_futures_tax_rate(expiry),
+        )
+        self._record_ideal_trade(
+            strategy_id=PUT_CALL_PARITY_TX_STRATEGY_ID,
+            instrument_type="future",
+            product=self.underlying_product,
+            code=str(open_position.get("future_code") or self.underlying.code),
+            delta_contracts=-future_position,
+            price_points=settlement_price,
+            decision_ns=decision_ns,
+            receive_ns=decision_ns,
+            reason="put_call_parity_tx_official_cash_settlement",
+            fee_twd=0.0,
+            tax_twd=future_tax,
+            price_source="official_taifex_final_settlement",
+            future_multiplier_twd_per_point=self.underlying_multiplier,
+            future_fee_per_side_twd=self.underlying_fee_per_side_twd,
+            future_position_field="underlying_futures_position",
+        )
+        settled_mark = self._strategy_mark(
+            PUT_CALL_PARITY_TX_STRATEGY_ID,
+            decision_ns,
+        )
+        parity_state["open_position"] = None
+        parity_state["pending_signal"] = None
+        parity_state["last_settled_expiry"] = expiry.isoformat()
+        parity_state["monitor"] = {
+            **(parity_state.get("monitor") or {}),
+            "state": "settled_waiting_next_monthly_contract",
+            "settled_at_decision_ts_ns": int(decision_ns),
+            "official_final_settlement": settlement_price,
+            "realized_cumulative_pnl_twd": settled_mark.get("cumulative_pnl_twd"),
+        }
+        ledger["entry_state"] = "settled_waiting_next_monthly_contract"
+        if str(self.state.get("blocked_reason") or "").startswith(
+            "missing_put_call_parity_tx_official_final_settlement:"
+        ):
+            self.state["blocked_reason"] = None
+        _append_jsonl(
+            self.events_path,
+            {
+                "event": "put_call_parity_tx_cash_settled",
+                "at_utc": _now_iso(),
+                "position_id": open_position.get("position_id"),
+                "expiry_date": expiry.isoformat(),
+                "official_final_settlement": settlement_price,
+                "source_file": source_file,
+                "source_sha256": source_sha,
+                "realized_cumulative_pnl_twd": settled_mark.get(
+                    "cumulative_pnl_twd"
+                ),
+            },
+        )
+        self._persist_state()
+
     def _strategy_mark(self, strategy_id: str, decision_ns: int) -> dict[str, Any]:
         ledger = self.state["strategies"][strategy_id]
         fresh_open_value = 0.0
         cycle = self.state.get("active_cycle")
-        cycle_id = cycle.get("cycle_id") if cycle else None
+        parity_state = self.state.get("put_call_parity_tx") or {}
+        parity_position = (
+            parity_state.get("open_position")
+            if strategy_id == PUT_CALL_PARITY_TX_STRATEGY_ID
+            else None
+        )
+        cycle_id = (
+            parity_position.get("position_id")
+            if isinstance(parity_position, Mapping)
+            else cycle.get("cycle_id")
+            if cycle
+            else None
+        )
         option_positions = {
             str(code): int(quantity)
             for code, quantity in (ledger.get("option_positions") or {}).items()
@@ -2235,8 +3192,12 @@ class TaifexVolatilitySimulation:
             sum(underlying_book) / 2.0 if underlying_book is not None else None
         )
         option_metadata = ledger.get("option_position_metadata") or {}
-        option_books_valid = cycle is None and not option_positions
-        if cycle and ledger.get("entry_state") in {
+        option_books_valid = (
+            not option_positions
+            if strategy_id == PUT_CALL_PARITY_TX_STRATEGY_ID
+            else cycle is None and not option_positions
+        )
+        if (cycle or parity_position) and ledger.get("entry_state") in {
             "entered",
             "forced_flat",
             "ruined",
@@ -2282,6 +3243,28 @@ class TaifexVolatilitySimulation:
             fresh_open_value += (
                 future_position * future_sweep[0] * self.hedge_multiplier
             )
+        underlying_future_position = int(
+            ledger.get("underlying_futures_position") or 0
+        )
+        underlying_future_sweep = (
+            _depth_swept_price(
+                self.latest_books.get(self.underlying.code),
+                delta_contracts=-underlying_future_position,
+                decision_ns=decision_ns,
+                maximum_age_seconds=ENTRY_BOOK_MAX_AGE_SECONDS,
+            )
+            if underlying_future_position
+            else None
+        )
+        underlying_future_mark_valid = (
+            underlying_future_position == 0 or underlying_future_sweep is not None
+        )
+        if underlying_future_position and underlying_future_sweep:
+            fresh_open_value += (
+                underlying_future_position
+                * underlying_future_sweep[0]
+                * self.underlying_multiplier
+            )
         mark_at_taipei = datetime.fromtimestamp(decision_ns / 1e9, tz=TAIPEI)
         margin_trading_date = taifex_trading_date(mark_at_taipei)
         futures_margin_per_contract = taifex_initial_margin_twd(
@@ -2290,9 +3273,15 @@ class TaifexVolatilitySimulation:
         margin_required = (
             short_margin_required
             + abs(future_position) * futures_margin_per_contract
+            + abs(underlying_future_position)
+            * taifex_initial_margin_twd(self.underlying_product, margin_trading_date)
         )
 
-        live_complete = option_books_valid and future_mark_valid
+        live_complete = (
+            option_books_valid
+            and future_mark_valid
+            and underlying_future_mark_valid
+        )
         valuation_source = "unavailable"
         valuation_carried_forward = False
         valuation_age_seconds: float | None = None
@@ -2304,6 +3293,9 @@ class TaifexVolatilitySimulation:
             ledger["last_complete_mark_decision_ts_ns"] = int(decision_ns)
             ledger["last_complete_mark_cycle_id"] = cycle_id
             ledger["last_complete_mark_futures_position"] = future_position
+            ledger["last_complete_mark_underlying_futures_position"] = (
+                underlying_future_position
+            )
             ledger["last_complete_mark_option_positions"] = option_position_fingerprint
             valuation_age_seconds = 0.0
         else:
@@ -2312,6 +3304,8 @@ class TaifexVolatilitySimulation:
             cache_matches_position = (
                 ledger.get("last_complete_mark_cycle_id") == cycle_id
                 and ledger.get("last_complete_mark_futures_position") == future_position
+                and ledger.get("last_complete_mark_underlying_futures_position")
+                == underlying_future_position
                 and ledger.get("last_complete_mark_option_positions")
                 == option_position_fingerprint
             )
@@ -2374,17 +3368,27 @@ class TaifexVolatilitySimulation:
                 ledger.get("forced_liquidation_pending")
             ),
             "futures_position": future_position,
+            "underlying_futures_position": underlying_future_position,
             "option_positions": option_positions,
             "entry_state": ledger.get("entry_state"),
             "active_cycle_id": cycle_id,
             "option_books_valid": option_books_valid,
-            "future_book_valid": future_mark_valid,
+            "future_book_valid": (
+                future_mark_valid and underlying_future_mark_valid
+            ),
+            "hedge_future_book_valid": future_mark_valid,
+            "underlying_future_book_valid": underlying_future_mark_valid,
             "valuation_available": open_value is not None,
             "valuation_stale": valuation_carried_forward,
             "valuation_carried_forward": valuation_carried_forward,
             "valuation_age_seconds": valuation_age_seconds,
             "valuation_source": valuation_source,
             "mark_price_policy": ("five_level_depth_vwap_at_signed_liquidation_side"),
+            "put_call_parity_tx": (
+                parity_state.get("monitor")
+                if strategy_id == PUT_CALL_PARITY_TX_STRATEGY_ID
+                else None
+            ),
         }
 
     def _write_marks(self, decision_ns: int) -> None:
@@ -2498,6 +3502,15 @@ class TaifexVolatilitySimulation:
             "broker_order_failures": int(self.state.get("broker_order_failures", 0)),
             "inflight_order_count": len(self.state.get("inflight_orders") or {}),
             "underlying_contract": self.underlying.code,
+            "underlying_product": self.underlying_product,
+            "underlying_multiplier_twd_per_point": self.underlying_multiplier,
+            "underlying_fee_per_side_twd": self.underlying_fee_per_side_twd,
+            "underlying_initial_margin_per_contract_twd": (
+                taifex_initial_margin_twd(
+                    self.underlying_product,
+                    current_trading_date,
+                )
+            ),
             "hedge_contract": self.hedge.code,
             "hedge_product": self.hedge_product,
             "hedge_multiplier_twd_per_point": self.hedge_multiplier,
@@ -2534,6 +3547,7 @@ class TaifexVolatilitySimulation:
             "strategy_valuation_available_count": valuation_available_count,
             "strategy_fresh_valuation_count": fresh_valuation_count,
             "strategy_carried_valuation_count": carried_valuation_count,
+            "put_call_parity_tx": self.state.get("put_call_parity_tx"),
             "strategies": strategy_marks,
         }
         _atomic_json(self.status_path, payload)
@@ -2556,6 +3570,7 @@ class TaifexVolatilitySimulation:
             # clearing this transient error.
             previous_step_error = self.state.get("blocked_reason")
         try:
+            self._maybe_settle_expired_put_call_parity(observed_now, decision_ns)
             self._maybe_settle_expired_cycle(observed_now, decision_ns)
             self._maybe_open_cycle(observed_now, decision_ns)
             session_state = self._intraday_session_state(observed_now)
@@ -2569,6 +3584,7 @@ class TaifexVolatilitySimulation:
                 self._maybe_enter_cycle_strategies(decision_ns)
             self._maybe_execute_pending_targets(observed_now, decision_ns)
             self._maybe_apply_fixed_future_targets(observed_now, decision_ns)
+            self._maybe_run_put_call_parity(observed_now, decision_ns)
             self._maybe_flatten_expiry_hedges(observed_now, decision_ns)
             self._maybe_flatten_intraday_futures(observed_now, decision_ns)
             self._maybe_calibrate(observed_now, decision_ns)

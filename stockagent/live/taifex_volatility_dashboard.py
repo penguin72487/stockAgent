@@ -31,7 +31,7 @@ from stockagent.research.taifex_volatility_metadata import (
 )
 
 
-DASHBOARD_SCHEMA_VERSION: Final[int] = 6
+DASHBOARD_SCHEMA_VERSION: Final[int] = 7
 DEFAULT_MAX_SOURCE_AGE_SECONDS: Final[float] = 15.0
 DEFAULT_MARK_LIMIT_PER_STRATEGY: Final[int] = 360
 
@@ -333,6 +333,7 @@ def _portfolio_summary(strategy_rows: list[dict[str, Any]]) -> dict[str, Any]:
 def _live_position_exposure(
     option_positions: object,
     futures_position: object,
+    underlying_futures_position: object = 0,
 ) -> dict[str, Any]:
     positions = option_positions if isinstance(option_positions, Mapping) else {}
     long_contracts = 0
@@ -370,7 +371,22 @@ def _live_position_exposure(
         future_label = f"期貨空 {abs(future_quantity)} 口"
     else:
         future_direction = "flat"
-        future_label = "期貨空手"
+        future_label = "避險期貨空手"
+    try:
+        underlying_future_quantity = int(underlying_futures_position)
+    except (TypeError, ValueError):
+        underlying_future_quantity = 0
+    if underlying_future_quantity > 0:
+        underlying_future_direction = "long"
+        underlying_future_label = f"TX 套利多 {underlying_future_quantity} 口"
+    elif underlying_future_quantity < 0:
+        underlying_future_direction = "short"
+        underlying_future_label = (
+            f"TX 套利空 {abs(underlying_future_quantity)} 口"
+        )
+    else:
+        underlying_future_direction = "flat"
+        underlying_future_label = "TX 套利空手"
     return {
         "live_option_long_contracts": long_contracts,
         "live_option_short_contracts": short_contracts,
@@ -381,7 +397,11 @@ def _live_position_exposure(
         "live_option_ratio_label": option_ratio_label,
         "live_futures_direction": future_direction,
         "live_futures_direction_label": future_label,
-        "live_exposure_label": f"{option_ratio_label} · {future_label}",
+        "live_underlying_futures_direction": underlying_future_direction,
+        "live_underlying_futures_direction_label": underlying_future_label,
+        "live_exposure_label": (
+            f"{option_ratio_label} · {future_label} · {underlying_future_label}"
+        ),
     }
 
 
@@ -448,6 +468,75 @@ def _safe_cycle(value: object) -> dict[str, Any] | None:
         "status",
     )
     return {key: value.get(key) for key in allowed if key in value}
+
+
+_SAFE_PARITY_FIELDS: Final[tuple[str, ...]] = (
+    "state",
+    "position_id",
+    "status",
+    "direction",
+    "expiry_date",
+    "series",
+    "strike",
+    "call_code",
+    "put_code",
+    "future_code",
+    "call_contracts",
+    "put_contracts",
+    "future_contracts",
+    "call_price",
+    "put_price",
+    "future_price",
+    "gross_locked_edge_twd",
+    "entry_fixed_fees_twd",
+    "entry_transaction_tax_twd",
+    "estimated_settlement_tax_twd",
+    "total_estimated_cost_twd",
+    "net_after_estimated_cost_twd",
+    "locked_net_edge_after_estimated_cost_twd",
+    "profitable_after_cost",
+    "minimum_net_edge_twd",
+    "maximum_book_age_ms",
+    "scanned_pair_count",
+    "evaluable_direction_count",
+    "signal_wait_seconds",
+    "signal_decision_ts_ns",
+    "entry_decision_ts_ns",
+    "observed_decision_ts_ns",
+    "market_phase",
+    "financing_interest_rate",
+    "broker_submission",
+    "package",
+    "official_final_settlement",
+    "realized_cumulative_pnl_twd",
+)
+
+
+def _safe_parity_mapping(value: object) -> dict[str, Any] | None:
+    if not isinstance(value, Mapping):
+        return None
+    return {
+        key: value.get(key)
+        for key in _SAFE_PARITY_FIELDS
+        if key in value
+    }
+
+
+def _safe_put_call_parity(value: object) -> dict[str, Any]:
+    source = value if isinstance(value, Mapping) else {}
+    monitor = _safe_parity_mapping(source.get("monitor")) or {
+        "state": "waiting_for_engine_contract_v8",
+        "minimum_net_edge_twd": 0.0,
+        "financing_interest_rate": 0.0,
+        "broker_submission": False,
+    }
+    return {
+        **monitor,
+        "pending_signal": _safe_parity_mapping(source.get("pending_signal")),
+        "open_position": _safe_parity_mapping(source.get("open_position")),
+        "last_settled_expiry": source.get("last_settled_expiry"),
+        "blocked_expiry": source.get("blocked_expiry"),
+    }
 
 
 def _latest_api_receipt(root: Path) -> dict[str, Any] | None:
@@ -576,6 +665,13 @@ def build_dashboard_snapshot(
                 "fixed_fees_twd": float(mark.get("fixed_fees_twd", 0.0)),
                 "transaction_tax_twd": float(mark.get("transaction_tax_twd", 0.0)),
                 "futures_position": int(mark.get("futures_position", 0)),
+                "underlying_futures_position": int(
+                    mark.get(
+                        "underlying_futures_position",
+                        ledger.get("underlying_futures_position", 0),
+                    )
+                    or 0
+                ),
                 "option_books_valid": option_valid,
                 "future_book_valid": future_valid,
                 "books_valid": option_valid and future_valid,
@@ -591,6 +687,10 @@ def build_dashboard_snapshot(
                 **_live_position_exposure(
                     mark.get("option_positions", ledger.get("option_positions")),
                     mark.get("futures_position", ledger.get("futures_position", 0)),
+                    mark.get(
+                        "underlying_futures_position",
+                        ledger.get("underlying_futures_position", 0),
+                    ),
                 ),
             }
         )
@@ -665,7 +765,7 @@ def build_dashboard_snapshot(
     grouped_marks: dict[str, deque[dict[str, Any]]] = {
         str(strategy_id): deque(maxlen=mark_limit) for strategy_id in strategy_ids
     }
-    last_complete_open_value: dict[str, tuple[object, int, float, int]] = {}
+    last_complete_open_value: dict[str, tuple[object, int, int, float, int]] = {}
     capital_by_strategy = {
         row["strategy_id"]: float(row["initial_capital_twd"]) for row in strategy_rows
     }
@@ -676,6 +776,9 @@ def build_dashboard_snapshot(
         decision_ts_ns = int(mark.get("decision_ts_ns") or 0)
         cycle_id = mark.get("active_cycle_id")
         futures_position = int(mark.get("futures_position") or 0)
+        underlying_futures_position = int(
+            mark.get("underlying_futures_position") or 0
+        )
         gross_cash = float(mark.get("gross_cash_twd") or 0.0)
         fixed_fees = float(mark.get("fixed_fees_twd") or 0.0)
         transaction_tax = float(mark.get("transaction_tax_twd") or 0.0)
@@ -694,13 +797,18 @@ def build_dashboard_snapshot(
             last_complete_open_value[strategy_id] = (
                 cycle_id,
                 futures_position,
+                underlying_futures_position,
                 open_value,
                 decision_ts_ns,
             )
         elif "valuation_available" not in mark:
             cached = last_complete_open_value.get(strategy_id)
-            if cached is not None and cached[:2] == (cycle_id, futures_position):
-                open_value = cached[2]
+            if cached is not None and cached[:3] == (
+                cycle_id,
+                futures_position,
+                underlying_futures_position,
+            ):
+                open_value = cached[3]
                 carried = True
                 valuation_available = True
             else:
@@ -718,7 +826,7 @@ def build_dashboard_snapshot(
             cumulative_pnl = None
             total_equity = None
         cached_ts = (
-            last_complete_open_value.get(strategy_id, (None, 0, 0.0, 0))[3]
+            last_complete_open_value.get(strategy_id, (None, 0, 0, 0.0, 0))[4]
             if carried
             else decision_ts_ns
         )
@@ -737,6 +845,7 @@ def build_dashboard_snapshot(
                 "transaction_tax_twd": transaction_tax,
                 "explicit_cost_twd": fixed_fees + transaction_tax,
                 "futures_position": futures_position,
+                "underlying_futures_position": underlying_futures_position,
                 "fixed_capital_return": (
                     cumulative_pnl / capital_by_strategy[strategy_id]
                     if cumulative_pnl is not None
@@ -862,8 +971,21 @@ def build_dashboard_snapshot(
             "order_failures": int(status.get("broker_order_failures") or 0),
             "inflight_order_count": int(status.get("inflight_order_count") or 0),
         },
+        "put_call_parity_tx": _safe_put_call_parity(
+            status.get("put_call_parity_tx", state.get("put_call_parity_tx"))
+        ),
         "market": {
             "underlying_contract": status.get("underlying_contract"),
+            "underlying_product": status.get("underlying_product"),
+            "underlying_multiplier_twd_per_point": status.get(
+                "underlying_multiplier_twd_per_point"
+            ),
+            "underlying_fee_per_side_twd": status.get(
+                "underlying_fee_per_side_twd"
+            ),
+            "underlying_initial_margin_per_contract_twd": status.get(
+                "underlying_initial_margin_per_contract_twd"
+            ),
             "hedge_contract": status.get("hedge_contract"),
             "hedge_product": status.get("hedge_product"),
             "hedge_multiplier_twd_per_point": status.get(
@@ -978,6 +1100,12 @@ def build_dashboard_snapshot(
                 "Contracts with any latest callback divided by the worker-0 "
                 "subscription set; this is a generic feed metric, not proof that "
                 "every held leg can be valued."
+            ),
+            "put_call_parity_tx_locked_edge": (
+                "4 TXO calls/puts versus 1 same-expiry TX. Gross terminal cash "
+                "edge minus configured entry fees, entry transaction taxes, "
+                "and conservative estimated cash-settlement taxes; financing "
+                "interest is intentionally zero."
             ),
         },
         "exposure_taxonomy": EXPOSURE_TAXONOMY,

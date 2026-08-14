@@ -1003,6 +1003,10 @@ def build_dashboard_snapshot(
                 "exit_limit_submitted_at": mode.get("exit_limit_submitted_at"),
                 "force_exit_started_at": mode.get("force_exit_started_at"),
                 "force_exit_failures": mode.get("force_exit_failures", 0),
+                "terminal_flatten_count": mode.get("terminal_flatten_count", 0),
+                "terminal_flatten_degraded_count": mode.get(
+                    "terminal_flatten_degraded_count", 0
+                ),
                 "eligibility_coverage": mode.get("eligibility_coverage") or {},
                 "current_eligibility_coverage": mode.get("current_eligibility_coverage")
                 or {},
@@ -1327,7 +1331,7 @@ def build_dashboard_snapshot(
             "missing_mark": "carry only the same open position's last complete liquidation value and flag stale",
             "eligibility": "exact-session TWSE and TPEx official day-trade membership; missing venue/date blocks",
             "fees": "gross commission and sell tax are charged first; earned commission rebate is recorded separately in economic NAV",
-            "pnl_split": "realized net PnL comes only from actual simulated exit fills with allocated entry and exit costs; unrealized net liquidation PnL values remaining shares at executable bid or ask after remaining costs; total net PnL is their reconciled sum",
+            "pnl_split": "realized net PnL uses simulated executable exits plus any explicitly tagged 13:30 terminal ledger flatten, with allocated entry and exit costs; unrealized net liquidation PnL values remaining shares at executable bid or ask after remaining costs; total net PnL is their reconciled sum",
             "comparison": "all strategies and benchmarks are compared as cumulative net return divided by their own capital basis; TX uses one-contract official initial margin, while 0050/2330 use one-board-lot entry notional",
             "benchmarks": "0050/2330 are anchored to the retained actual session open and marked at executable bid after tw_cash costs; future cash distributions are not credited. TXFR1 holds one real TX front-month contract across sessions, rolls only when the old bid and new ask coexist, never books the calendar spread as return, and includes TWD 60 per side plus statutory futures tax",
             "benchmark_history": (
@@ -1338,6 +1342,7 @@ def build_dashboard_snapshot(
             ),
             "depth_limit": "each mode is an independent counterfactual; only displayed level-one MIS volume is fillable (lots x 1,000 shares), while queue and deeper book are unknown",
             "bracket_fill": "all four modes move TP and the local SL trigger one legal dated TW tick inward; this improves fill probability but does not guarantee a fill without a trigger and executable counterparty volume",
+            "terminal_flatten": "after the 13:30 auction simulation, every residual is closed in a simulation-only terminal ledger pass so a day-trade mode never carries overnight; this is explicitly tagged and is not claimed as an exchange fill",
         },
     }
 

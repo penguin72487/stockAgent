@@ -103,6 +103,17 @@ def _parse_timestamp(value: object) -> datetime | None:
     return parsed.astimezone(TAIPEI)
 
 
+def _timestamp_is_for_session(value: object, session_date: str) -> bool:
+    """Return whether a lifecycle marker belongs to the active session.
+
+    Persisted modes span trading days.  A truthy timestamp from yesterday must
+    never suppress today's closing-auction submission or terminal settlement.
+    """
+
+    parsed = _parse_timestamp(value)
+    return parsed is not None and parsed.date().isoformat() == str(session_date)
+
+
 def _finite(value: object) -> float | None:
     try:
         number = float(value)
@@ -170,6 +181,48 @@ def _executable_capacity_shares(
             lot_size=lot_size,
         ),
         _minute_kbar_capacity_shares(quote, lot_size=lot_size),
+    )
+
+
+def _force_exit_retry_capacity_shares(
+    position: dict[str, Any],
+    quote: Mapping[str, Any],
+    *,
+    transaction_side: str,
+    lot_size: int,
+    now: datetime,
+) -> int:
+    """Return remaining same-minute capacity for repeated market exits.
+
+    A fresh best quote may be retried every service poll from 13:24 to 13:25,
+    but the completed-minute participation budget may only be consumed once.
+    This prevents a two-second retry loop from multiplying the same one-minute
+    volume evidence into fabricated liquidity.
+    """
+
+    minute_key = now.replace(second=0, microsecond=0).isoformat(timespec="minutes")
+    observed_capacity = _minute_kbar_capacity_shares(quote, lot_size=lot_size)
+    if position.get("force_exit_liquidity_minute") != minute_key:
+        position["force_exit_liquidity_minute"] = minute_key
+        position["force_exit_minute_capacity_shares"] = observed_capacity
+        position["force_exit_minute_consumed_shares"] = 0
+    else:
+        position["force_exit_minute_capacity_shares"] = max(
+            int(position.get("force_exit_minute_capacity_shares") or 0),
+            observed_capacity,
+        )
+    remaining_volume_capacity = max(
+        0,
+        int(position.get("force_exit_minute_capacity_shares") or 0)
+        - int(position.get("force_exit_minute_consumed_shares") or 0),
+    )
+    return min(
+        _top_book_capacity_shares(
+            quote,
+            transaction_side=transaction_side,
+            lot_size=lot_size,
+        ),
+        remaining_volume_capacity,
     )
 
 
@@ -1595,6 +1648,12 @@ class TwDayTradeSimulationEngine:
         mode["entry_completed_at"] = observed.isoformat(timespec="seconds")
         mode["exit_limit_submitted_at"] = None
         mode["force_exit_started_at"] = None
+        mode["closing_auction_submitted_at"] = None
+        mode["closing_auction_settled_at"] = None
+        mode["residual_conversion_completed_at"] = None
+        mode["force_exit_failures"] = 0
+        mode["terminal_flatten_count"] = 0
+        mode["terminal_flatten_degraded_count"] = 0
         counts: dict[str, int] = {}
 
         plans = [
@@ -1968,6 +2027,7 @@ class TwDayTradeSimulationEngine:
         *,
         quotes: Mapping[str, Mapping[str, Any]],
         now: datetime | None = None,
+        append_mark_history: bool = True,
     ) -> None:
         observed = _now_taipei(now)
         wall_time = observed.timetz().replace(tzinfo=None)
@@ -1986,7 +2046,12 @@ class TwDayTradeSimulationEngine:
                         continue
                     quote = quotes.get(str(position.get("symbol"))) or {}
                     self._apply_bracket(position, mode, quote, observed)
-                self._mark_mode(market, observed, quotes)
+                self._mark_mode(
+                    market,
+                    observed,
+                    quotes,
+                    append_history=append_mark_history,
+                )
                 still_open = any(
                     int(position.get("signed_shares") or 0) != 0
                     for position in positions.values()
@@ -2026,7 +2091,12 @@ class TwDayTradeSimulationEngine:
                 self._submit_closing_auction_limits(market, mode, observed)
                 self._settle_closing_auction(market, mode, quotes, observed)
                 self._convert_residual_to_carry(market, mode, quotes, observed)
-            self._mark_mode(market, observed, quotes)
+            self._mark_mode(
+                market,
+                observed,
+                quotes,
+                append_history=append_mark_history,
+            )
         self._persist(observed)
 
     def _apply_bracket(
@@ -2235,16 +2305,19 @@ class TwDayTradeSimulationEngine:
             quote = quotes.get(str(position.get("symbol"))) or {}
             side = str(position.get("side"))
             executable = _finite(quote.get("bid" if side == "long" else "ask"))
-            capacity = _executable_capacity_shares(
+            capacity = _force_exit_retry_capacity_shares(
+                position,
                 quote,
                 transaction_side="sell" if side == "long" else "buy",
                 lot_size=int(position.get("lot_size") or 1_000),
+                now=now,
             )
             if executable is None or capacity <= 0:
                 failures += 1
                 position["status"] = "force_exit_unfilled_no_executable_depth"
                 position["eod_limit_order_status"] = "cancelled_at_13_24"
                 continue
+            before = abs(int(position.get("signed_shares") or 0))
             self._close_position(
                 position,
                 mode,
@@ -2254,6 +2327,10 @@ class TwDayTradeSimulationEngine:
                 reason="13_24_market_force_exit",
                 order_type="MKT",
                 quantity=capacity,
+            )
+            filled = before - abs(int(position.get("signed_shares") or 0))
+            position["force_exit_minute_consumed_shares"] = (
+                int(position.get("force_exit_minute_consumed_shares") or 0) + filled
             )
             if int(position.get("signed_shares") or 0) != 0:
                 failures += 1
@@ -2275,7 +2352,10 @@ class TwDayTradeSimulationEngine:
         13:30 auction result and never treats the indicative book as a fill.
         """
 
-        if mode.get("closing_auction_submitted_at"):
+        session_date = str(mode.get("session_date") or now.date().isoformat())
+        if _timestamp_is_for_session(
+            mode.get("closing_auction_submitted_at"), session_date
+        ):
             return
         mode["closing_auction_submitted_at"] = now.isoformat(timespec="seconds")
         submitted = 0
@@ -2330,7 +2410,10 @@ class TwDayTradeSimulationEngine:
         quotes: Mapping[str, Mapping[str, Any]],
         now: datetime,
     ) -> None:
-        if mode.get("closing_auction_settled_at"):
+        session_date = str(mode.get("session_date") or now.date().isoformat())
+        if _timestamp_is_for_session(
+            mode.get("closing_auction_settled_at"), session_date
+        ):
             return
         mode["closing_auction_settled_at"] = now.isoformat(timespec="seconds")
         for position in (mode.get("positions") or {}).values():
@@ -2372,96 +2455,74 @@ class TwDayTradeSimulationEngine:
         quotes: Mapping[str, Mapping[str, Any]],
         now: datetime,
     ) -> None:
-        """Reclassify 13:30 residuals and charge conservative maximum costs."""
+        """Close every residual in the simulation's terminal ledger pass.
 
-        if mode.get("residual_conversion_completed_at"):
+        The executable auction path remains separately audited above.  This
+        final simulation-only pass enforces the product contract requested by
+        the operator: a day-trade mode cannot carry an open position past the
+        session close.  Residuals are valued at the observed close when
+        available, otherwise at a conservative adverse legal limit, the last
+        complete mark, or finally the entry price.  These rows are explicitly
+        labelled as terminal ledger settlement rather than exchange fills.
+        """
+
+        session_date = str(mode.get("session_date") or now.date().isoformat())
+        if _timestamp_is_for_session(
+            mode.get("residual_conversion_completed_at"), session_date
+        ):
             return
-        total_cost = 0.0
-        converted = 0
-        unresolved = 0
+        flattened = 0
+        degraded = 0
         for position in (mode.get("positions") or {}).values():
             signed = int(position.get("signed_shares") or 0)
             if signed == 0:
                 continue
             quote = quotes.get(str(position.get("symbol"))) or {}
             close_price = _finite(quote.get("last"))
-            if close_price is None:
-                position["status"] = "residual_unclassified_missing_official_close"
-                unresolved += 1
-                continue
-            quantity = abs(signed)
             side = str(position.get("side"))
-            if side == "long":
-                principal = quantity * close_price * MARGIN_FINANCING_RATIO
-                interest = principal * MARGIN_FINANCING_ANNUAL_RATE / 365.0
-                cost = interest
-                position.update(
-                    {
-                        "carry_type": "margin_financing_long",
-                        "status": "carried_margin_financing_long",
-                        "financing_principal_twd": principal,
-                        "financing_ratio": MARGIN_FINANCING_RATIO,
-                        "financing_annual_rate": MARGIN_FINANCING_ANNUAL_RATE,
-                        "carry_interest_days_charged": 1,
-                        "carry_interest_twd": interest,
-                        "sell_fee_rate": float(position["cash_sell_fee_rate"]),
-                    }
+            price_source = "observed_session_close"
+            if close_price is None:
+                close_price = _finite(
+                    position.get("lower_limit" if side == "long" else "upper_limit")
                 )
-            else:
-                borrow_fee = (
-                    quantity * close_price * DAY_TRADE_SHORTFALL_BORROW_FEE_RATE
+                price_source = "adverse_daily_limit_fallback"
+                degraded += 1
+            if close_price is None:
+                close_price = _finite(position.get("last_mark_price"))
+                price_source = "last_complete_mark_fallback"
+            if close_price is None:
+                close_price = _finite(position.get("entry_price"))
+                price_source = "entry_price_last_resort"
+            if close_price is None:
+                raise RuntimeError(
+                    "terminal day-trade flatten has no positive ledger price "
+                    f"for {market}:{position.get('symbol')}"
                 )
-                handling_fee = (
-                    borrow_fee * DAY_TRADE_SHORTFALL_HANDLING_FEE_FRACTION
-                )
-                tax_adjustment = quantity * float(position["entry_price"]) * max(
-                    0.0,
-                    float(position["cash_sell_fee_rate"])
-                    - float(position["sell_fee_rate"]),
-                )
-                cost = borrow_fee + handling_fee + tax_adjustment
-                position.update(
-                    {
-                        "carry_type": "day_trade_securities_shortfall",
-                        "status": "carried_day_trade_securities_shortfall",
-                        "shortfall_borrow_fee_rate_per_day": (
-                            DAY_TRADE_SHORTFALL_BORROW_FEE_RATE
-                        ),
-                        "shortfall_borrow_fee_twd": borrow_fee,
-                        "shortfall_handling_fee_fraction": (
-                            DAY_TRADE_SHORTFALL_HANDLING_FEE_FRACTION
-                        ),
-                        "shortfall_handling_fee_twd": handling_fee,
-                        "normal_sell_tax_adjustment_twd": tax_adjustment,
-                        "short_margin_initial_rate": MARGIN_SHORT_INITIAL_MARGIN_RATE,
-                        "short_margin_collateral_twd": (
-                            quantity * close_price * MARGIN_SHORT_INITIAL_MARGIN_RATE
-                        ),
-                        "buy_fee_rate": float(position["cash_buy_fee_rate"]),
-                    }
-                )
-            position["carry_converted_at"] = now.isoformat(timespec="seconds")
-            position["carry_reference_close"] = close_price
-            position["carry_cost_twd"] = cost
-            position["remaining_entry_fee_twd"] = float(
-                position.get("remaining_entry_fee_twd") or 0.0
-            ) + cost
-            total_cost += cost
-            converted += 1
+            position["terminal_flatten_price_source"] = price_source
+            position["terminal_flatten_simulation_only"] = True
+            self._close_position(
+                position,
+                mode,
+                price=close_price,
+                quote=quote,
+                now=now,
+                reason="13_30_terminal_ledger_flatten",
+                order_type="SIM_TERMINAL",
+                quantity=abs(signed),
+            )
+            position["closing_auction_order_status"] = "terminal_ledger_flattened"
+            flattened += 1
         mode["residual_conversion_completed_at"] = now.isoformat(timespec="seconds")
-        mode["cumulative_carry_cost_twd"] = (
-            float(mode.get("cumulative_carry_cost_twd") or 0.0) + total_cost
-        )
-        mode["force_exit_failures"] = converted + unresolved
-        if converted or unresolved:
-            mode["engine_status"] = "critical_residual_carried_after_13_30"
+        mode["terminal_flatten_count"] = flattened
+        mode["terminal_flatten_degraded_count"] = degraded
+        mode["force_exit_failures"] = 0
         self._event(
-            "residual_positions_reclassified",
+            "residual_positions_terminal_flattened",
             recorded_at=now,
             market=market,
-            converted=converted,
-            unresolved=unresolved,
-            carry_cost_twd=total_cost,
+            flattened=flattened,
+            degraded=degraded,
+            simulation_only=True,
         )
 
     def _close_position(
@@ -2593,13 +2654,16 @@ class TwDayTradeSimulationEngine:
             "requested_quantity": remaining_before,
             "remaining_quantity": remaining_after,
             "simulation_only": True,
+            "synthetic_terminal_ledger": (
+                reason == "13_30_terminal_ledger_flatten"
+            ),
         }
         self._order(
             {
                 **common,
                 "side": "sell" if side == "long" else "buy_to_cover",
                 "order_type": order_type,
-                "price": float(price) if order_type.startswith("LMT") else None,
+                "price": None if order_type == "MKT" else float(price),
                 "status": "filled" if fully_closed else "part_filled",
             }
         )
@@ -2615,8 +2679,16 @@ class TwDayTradeSimulationEngine:
                 "entry_fee_allocated_twd": entry_fee_allocated,
                 "gross_pnl_twd": gross_pnl,
                 "net_pnl_twd": net_pnl,
-                "fill_contract": "best_bid_for_sell_best_ask_for_buy",
-                "depth_assumption": "minimum_of_level_one_and_50pct_minute_volume_except_closing_auction_which_uses_50pct_auction_minute_volume",
+                "fill_contract": (
+                    "simulation_terminal_ledger_not_exchange_fill"
+                    if reason == "13_30_terminal_ledger_flatten"
+                    else "best_bid_for_sell_best_ask_for_buy"
+                ),
+                "depth_assumption": (
+                    "full_residual_ledger_close_ignores_displayed_depth"
+                    if reason == "13_30_terminal_ledger_flatten"
+                    else "minimum_of_level_one_and_50pct_minute_volume_except_closing_auction_which_uses_50pct_auction_minute_volume"
+                ),
             }
         )
 
@@ -2625,6 +2697,8 @@ class TwDayTradeSimulationEngine:
         market: str,
         now: datetime,
         quotes: Mapping[str, Mapping[str, Any]],
+        *,
+        append_history: bool = True,
     ) -> None:
         mode = self.state.get("modes", {}).get(market)
         if not isinstance(mode, dict):
@@ -2709,6 +2783,8 @@ class TwDayTradeSimulationEngine:
                 ),
             }
         )
+        if not append_history:
+            return
         _append_jsonl(
             self.marks_path,
             {
@@ -2809,9 +2885,9 @@ class TwDayTradeSimulationEngine:
                     "fill_guarantee": False,
                     "fill_caveat": "inside-limit prices improve fill probability but cannot guarantee a fill without executable counterparty volume",
                     "exit_limit": "13:20 passive top-of-book limit",
-                    "continuous_force_exit": "13:24 market",
-                    "closing_auction": "13:25 adverse_daily_limit_LMT_ROD; settle_at_13:30",
-                    "residual": "13:30 margin-financing long or day-trade securities shortfall",
+                    "continuous_force_exit": "13:24<=t<13:25 market retry every service poll while residual exists",
+                    "closing_auction": "13:25 long sell at lower limit and short cover at upper limit using LMT_ROD; settle at 13:30 call auction",
+                    "residual": "13:30 simulation-only terminal ledger flatten; no overnight position",
                     "stress_rates": {
                         "financing_annual_rate": MARGIN_FINANCING_ANNUAL_RATE,
                         "shortfall_borrow_fee_rate_per_day": DAY_TRADE_SHORTFALL_BORROW_FEE_RATE,
@@ -2848,6 +2924,8 @@ class TwDayTradeSimulationEngine:
                             "open_position_count",
                             "stale_position_count",
                             "force_exit_failures",
+                            "terminal_flatten_count",
+                            "terminal_flatten_degraded_count",
                             "cumulative_carry_cost_twd",
                         )
                     }

@@ -31,6 +31,8 @@ from stockagent.live.quote_provider import (  # noqa: E402
     fetch_shioaji_stock_snapshots,
 )
 from stockagent.live.tw_day_trade_simulation import (  # noqa: E402
+    CLOSING_AUCTION_TIME,
+    FORCE_EXIT_TIME,
     ModeSpec,
     STOCK_BENCHMARKS,
     TX_CONTINUOUS_LOGICAL_CODE,
@@ -221,6 +223,26 @@ def _active_symbols(
     return sorted(symbols), fallback
 
 
+def _active_quote_due(
+    active_symbols: list[str],
+    *,
+    observed: datetime,
+    last_quote_minute: str | None,
+) -> bool:
+    """Keep polling an open ledger through terminal flatten catch-up."""
+
+    minute_key = observed.replace(second=0, microsecond=0).isoformat(
+        timespec="minutes"
+    )
+    wall_time = observed.timetz().replace(tzinfo=None)
+    force_exit_retry = FORCE_EXIT_TIME <= wall_time < CLOSING_AUCTION_TIME
+    return (
+        bool(active_symbols)
+        and wall_time >= datetime_time(9, 0)
+        and (force_exit_retry or last_quote_minute != minute_key)
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -357,10 +379,19 @@ def main(argv: list[str] | None = None) -> int:
 
         active_symbols, active_fallback = _active_symbols(engine)
         wall_time = observed.timetz().replace(tzinfo=None)
-        quote_due = (
+        same_minute_force_exit_retry = (
             bool(active_symbols)
-            and datetime_time(9, 0) <= wall_time <= datetime_time(13, 30)
-            and last_quote_minute != minute_key
+            and FORCE_EXIT_TIME <= wall_time < CLOSING_AUCTION_TIME
+            and last_quote_minute == minute_key
+        )
+        # Keep observing only while a paper position remains.  In particular,
+        # do not make terminal flatten depend on the process being alive during
+        # the exact 13:30 minute: a late start/restart must catch up immediately
+        # and the symbol set naturally becomes empty once the ledger is flat.
+        quote_due = _active_quote_due(
+            active_symbols,
+            observed=observed,
+            last_quote_minute=last_quote_minute,
         )
         benchmark_due = (
             observed.weekday() < 5
@@ -461,7 +492,11 @@ def main(argv: list[str] | None = None) -> int:
                 )
 
         if quote_due:
-            engine.process_quotes(quotes=quotes, now=observed)
+            engine.process_quotes(
+                quotes=quotes,
+                now=observed,
+                append_mark_history=not same_minute_force_exit_retry,
+            )
         if benchmark_due and specs:
             current_contract = str(future_snapshot.get("current_contract_code") or "")
             future_quotes = future_snapshot.get("quotes") or {}

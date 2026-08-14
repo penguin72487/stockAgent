@@ -108,9 +108,16 @@ while true; do
     echo "[shioaji-taifex] waiting_seconds=$delay reason=next_capture_window session=$capture_session trade_date=$trade_date stop_at=$stop_at"
     sleep "$delay"
   fi
-  if [[ "$EXECUTE_STRATEGIES" == true && "$capture_session" == day ]]; then
-    settlement_end="$(TZ=Asia/Taipei date -d yesterday +%F)"
-    echo "[shioaji-taifex] final_settlement_refresh_end=$settlement_end"
+  if [[ "$EXECUTE_STRATEGIES" == true ]]; then
+    if [[ "$capture_session" == night ]]; then
+      # The day-session TXO/TX expiry has finished before night pre-open.  Pull
+      # through today so Friday-night and other expiry-night strategies do not
+      # wait until the next business-day bootstrap for an already-published FSP.
+      settlement_end="$(TZ=Asia/Taipei date +%F)"
+    else
+      settlement_end="$(TZ=Asia/Taipei date -d yesterday +%F)"
+    fi
+    echo "[shioaji-taifex] final_settlement_refresh_session=$capture_session final_settlement_refresh_end=$settlement_end"
     if ! run_fintech_python scripts/download_taifex_final_settlement_history.py \
       --start-date 2012-11-01 \
       --end-date "$settlement_end" \
