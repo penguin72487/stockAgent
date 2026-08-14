@@ -78,3 +78,31 @@ def test_storage_snapshot_writer_preserves_one_total_per_day(tmp_path: Path) -> 
     )
     assert len(written["daily_totals"]) == 2
     assert output.stat().st_mode & 0o077 == 0
+
+
+def test_storage_capacity_uses_daily_net_growth_after_seven_complete_days(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "data").write_bytes(b"x" * 200)
+    specs = (
+        StorageDatasetSpec(
+            "source", "來源", "source", "historical", (source,), "source"
+        ),
+    )
+    payload = build_shioaji_storage_snapshot(
+        tmp_path,
+        now=datetime(2026, 8, 14, 4, 0, tzinfo=UTC),
+        previous={
+            "daily_totals": [
+                {"date": "2026-08-05", "bytes": 100},
+                {"date": "2026-08-13", "bytes": 180},
+            ]
+        },
+        specs=specs,
+    )
+    assert payload["summary"]["observed_growth_days"] == 8
+    assert payload["summary"]["observed_average_daily_net_growth_bytes"] == 10
+    assert payload["summary"]["capacity_growth_estimate_bytes"] == 10
+    assert payload["summary"]["capacity_growth_source"] == "daily_total_net_growth"

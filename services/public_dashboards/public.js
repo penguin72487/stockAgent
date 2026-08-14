@@ -1,6 +1,6 @@
 "use strict";
 
-const REFRESH_MS = 15000;
+const REFRESH_MS = 60000;
 let refreshInFlight = false;
 
 const $ = (id) => document.getElementById(id);
@@ -15,6 +15,9 @@ function healthPresentation(value) {
     blocked: "策略阻擋",
     critical: "需要注意",
     degraded: "部分異常",
+    starting: "啟動／稽核中",
+    complete: "封存完成",
+    stopped: "程序停止",
     unavailable: "暫時離線",
   };
   return {health: health === "ready" ? "active" : health, label: labels[health] || "狀態未知"};
@@ -36,7 +39,7 @@ function setHealth(prefix, value, overrideLabel = null) {
 }
 
 async function fetchJson(path) {
-  const response = await fetch(path, {cache: "default"});
+  const response = await fetch(path, {cache: "no-store"});
   if (!response.ok) throw new Error(`HTTP ${response.status}`);
   return response.json();
 }
@@ -75,14 +78,23 @@ function renderShioaji(data) {
     $("shioaji-progress").textContent = `${Number(data.completed_contracts || 0)}/${Number(data.inventory_contracts || 0)} 合約 · ${(Number(data.progress_ratio || 0) * 100).toFixed(2)}%`;
 }
 
+function renderOpenbb(data) {
+    setHealth("openbb", data.health, healthPresentation(data.health).label);
+    const snapshot = data.snapshot_state === "current" ? "快照新鮮" : "快照逾時";
+    $("openbb-freshness").textContent = `${snapshot} · ${ageLabel(data.source_age_seconds)}`;
+    $("openbb-progress").textContent = `${Number(data.completion_percent || 0).toFixed(2)}% · ${Number(data.accepted_tasks || 0).toLocaleString("zh-TW")}/${Number(data.total_tasks || 0).toLocaleString("zh-TW")}`;
+}
+
 function renderUnavailable() {
-  for (const prefix of ["taifex", "tw", "shioaji"]) setHealth(prefix, "unavailable");
+  for (const prefix of ["taifex", "tw", "shioaji", "openbb"]) setHealth(prefix, "unavailable");
   $("taifex-freshness").textContent = "無法取得";
   $("tw-freshness").textContent = "無法取得";
   $("taifex-summary").textContent = "進入面板查看";
   $("tw-summary").textContent = "進入面板查看";
   $("shioaji-traffic").textContent = "無法取得";
   $("shioaji-progress").textContent = "進入面板查看";
+  $("openbb-freshness").textContent = "無法取得";
+  $("openbb-progress").textContent = "進入面板查看";
 }
 
 async function refresh() {
@@ -93,6 +105,7 @@ async function refresh() {
     renderTaifex(data.taifex || {});
     renderTw(data.tw || {});
     renderShioaji(data.shioaji || {});
+    renderOpenbb(data.openbb || {});
   } catch (_error) {
     renderUnavailable();
   } finally {

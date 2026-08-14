@@ -7,7 +7,7 @@
   <meta name="theme-color" content="#071019">
   <title>StockAgent 即時資料面板</title>
   <link rel="stylesheet" href="public.css?v=2">
-  <link rel="stylesheet" href="dashboard-core.css?v=2">
+  <link rel="stylesheet" href="dashboard-core.css?v=4">
 </head>
 <body>
   <a class="skip-link" href="#dashboards">跳到即時面板</a>
@@ -19,7 +19,7 @@
   <main>
     <section class="hero" aria-labelledby="page-title">
       <p class="eyebrow">PUBLIC MARKET OBSERVATORY</p>
-      <h1 id="page-title">三個面板，<br>一個可信的即時視角</h1>
+      <h1 id="page-title">四個面板，<br>一個可信的即時視角</h1>
       <p class="lead">先確認資料新鮮度、API 流量與執行狀態，再查看模擬績效和完整帳本。所有頁面都是公開唯讀，不提供任何操作入口。</p>
       <div class="trust-row" aria-label="面板資料原則">
         <span>只讀模擬</span>
@@ -76,6 +76,22 @@
         </dl>
         <span class="card-action">開啟 API 面板 <b aria-hidden="true">→</b></span>
       </a>
+
+      <a class="dashboard-card openbb" href="openbb/">
+        <div class="card-topline">
+          <span class="market">OPENBB ARCHIVE</span>
+          <span id="openbb-health" class="health loading" aria-live="polite"><i aria-hidden="true"></i>讀取中</span>
+        </div>
+        <div>
+          <strong>歷史資料封存監控</strong>
+          <p>2000 年起可續傳封存、程序真實狀態、完成率、供應商配額與完整性稽核。</p>
+        </div>
+        <dl class="card-stats" aria-label="OpenBB 封存即時摘要">
+          <div><dt>完整稽核</dt><dd id="openbb-freshness">—</dd></div>
+          <div><dt>已接受進度</dt><dd id="openbb-progress">—</dd></div>
+        </dl>
+        <span class="card-action">開啟 OpenBB 面板 <b aria-hidden="true">→</b></span>
+      </a>
     </section>
 
     <aside class="safety-note">
@@ -86,7 +102,7 @@
       </div>
     </aside>
   </main>
-  <footer>StockAgent 公開觀測面板 · 台北時間 · 每 15 秒檢查入口狀態</footer>
-  <script src="public.js?v=2" defer></script>
+  <footer>StockAgent 公開觀測面板 · 台北時間 · 每 60 秒隨資料週期更新</footer>
+  <script src="public.js?v=4" defer></script>
 </body>
 </html>

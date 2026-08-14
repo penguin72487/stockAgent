@@ -6,8 +6,8 @@
   <meta name="color-scheme" content="dark">
   <meta name="theme-color" content="#071019">
   <title>TAIFEX 全策略模擬交易即時面板</title>
-  <link rel="stylesheet" href="styles.css?v=11">
-  <link rel="stylesheet" href="../dashboard-core.css?v=2">
+  <link rel="stylesheet" href="styles.css?v=12">
+  <link rel="stylesheet" href="../dashboard-core.css?v=4">
 </head>
 <body class="taifex-dashboard">
   <a class="skip-link" href="#main-content">跳到主要內容</a>
@@ -18,6 +18,7 @@
       <a class="active" href="./" aria-current="page">TAIFEX</a>
       <a href="../tw-day-trade/">台股當沖</a>
       <a href="../shioaji/">永豐 API</a>
+      <a href="../openbb/">OpenBB</a>
     </nav>
   </header>
 
@@ -103,7 +104,8 @@
             <select id="strategy-select" aria-label="選擇策略"></select>
           </label>
         </div>
-        <svg id="equity-chart" viewBox="0 0 900 300" role="img" aria-label="選擇策略的總權益曲線"></svg>
+        <div id="equity-time-range" class="time-range-control" role="group" aria-label="策略曲線時間範圍"><span>大圖與曲線一覽</span><button type="button" data-range="1h">1 小時</button><button type="button" data-range="1d">1 天</button><button type="button" data-range="1w">1 週</button><button type="button" data-range="1mo">1 月</button><button type="button" data-range="1q">1 季</button><button type="button" data-range="1y">1 年</button><button type="button" data-range="all">全部</button></div>
+        <div class="chart-scroll" tabindex="0" aria-label="TAIFEX 權益曲線，可在窄螢幕水平捲動"><svg id="equity-chart" viewBox="0 0 900 300" role="img" aria-label="選擇策略的總權益曲線"></svg></div>
         <p id="chart-note" class="chart-note"></p>
       </article>
 
@@ -284,6 +286,7 @@
       </div>
     </section>
   </main>
-  <script src="app.js?v=12" defer></script>
+  <script src="../time-axis.js?v=3" defer></script>
+  <script src="app.js?v=16" defer></script>
 </body>
 </html>

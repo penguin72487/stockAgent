@@ -1,16 +1,28 @@
 "use strict";
 
-const SUMMARY_REFRESH_MS = 5000;
-const FULL_REFRESH_MS = 15000;
+const PRICE_REFRESH_MS = 60000;
 const SIGNAL_PAGE_SIZE = 250;
 const POSITION_PAGE_SIZE = 250;
 const EVENT_PAGE_SIZE = 250;
 const COLORS = ["#37d3ff", "#5ee0a0", "#a98cff", "#f5bd4f", "#ff7ac8", "#73e6d1", "#ff9f68"];
+const TIME_RANGE_LABELS = {"1h": "1 小時", "1d": "1 天", "1w": "1 週", "1mo": "1 月", "1q": "1 季", "1y": "1 年", all: "全部"};
+const timeAxis = window.StockAgentTimeAxis;
+const TW_STOCK_SESSIONS = [
+  {label: "開", minute: 9 * 60},
+  {label: "收", minute: 13 * 60 + 30},
+];
+const HIDDEN_EQUITY_SERIES_STORAGE_KEY = "tw-day-trade-hidden-equity-series";
+const HISTORY_CLIENT_CACHE_MS = 45000;
 let snapshot = null;
+let chartHistory = null;
+let chartRange = "1d";
+let hiddenEquitySeries = new Set();
+let chartHistoryCache = new Map();
+let historyInFlight = false;
+let historyRetryTimer = null;
 let lastFetchMs = null;
 let refreshInFlight = false;
 let refreshQueued = false;
-let summaryInFlight = false;
 let lastRenderedRevision = null;
 let lastFilterRevision = null;
 let signalRows = [];
@@ -35,6 +47,13 @@ let eventRequestSequence = 0;
 let eventAbortController = null;
 let filterAnimationFrame = null;
 let positionVisibleRows = POSITION_PAGE_SIZE;
+
+try {
+  chartRange = localStorage.getItem("tw-day-trade-equity-time-range") || "1d";
+  const storedHiddenSeries = JSON.parse(localStorage.getItem(HIDDEN_EQUITY_SERIES_STORAGE_KEY) || "[]");
+  if (Array.isArray(storedHiddenSeries)) hiddenEquitySeries = new Set(storedHiddenSeries.map(String));
+} catch (_error) { /* storage can be disabled */ }
+if (!(chartRange in TIME_RANGE_LABELS)) chartRange = "1d";
 
 const $ = (id) => document.getElementById(id);
 const esc = (value) => String(value ?? "—").replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"})[c]);
@@ -137,7 +156,7 @@ function engineStatusLabel(value) {
     active: "執行正常",
     ready: "已就緒",
     waiting: "等待時段",
-    critical_unflattened_after_13_24: "13:24 強平後仍有未平部位",
+    critical_unflattened_after_13_24: "13:24 市價重試後有殘餘，已轉 13:25 集合競價",
     blocked_missing_eligibility: "缺少當日當沖資格資料，已停止執行",
     blocked_missing_checkpoint: "缺少模型權重，已停止執行",
   };
@@ -148,7 +167,7 @@ function engineStatusShortLabel(value) {
   const labels = {
     active: "執行正常",
     ready: "已就緒",
-    critical_unflattened_after_13_24: "13:24 後未平",
+    critical_unflattened_after_13_24: "轉 13:25 集合競價",
     flat_directional_mix_unexecutable: "雙向整張不足・保持空倉",
     flat_no_executable_signal: "該日無可執行訊號",
     session_flat_after_exit: "該日已平倉",
@@ -332,7 +351,7 @@ function renderModes(data) {
         <div><span>報酬率資金基準</span><strong>${money(initial)}</strong></div>
         <div><span>已賺手續費退佣</span><strong>${money(mode.cumulative_commission_rebate_accrued_twd)}</strong></div>
         <div><span>訊號時間</span><strong>${shortTime(mode.signal_at)}</strong></div>
-        <div><span>13:24 強平後未平</span><strong class="${Number(mode.force_exit_failures || 0) ? "negative" : ""}">${number(mode.force_exit_failures || 0)}</strong></div>
+        <div><span>13:24 市價重試後殘餘</span><strong class="${Number(mode.force_exit_failures || 0) ? "negative" : ""}">${number(mode.force_exit_failures || 0)}</strong></div>
         <div><span>13:30 帳務強平</span><strong>${number(mode.terminal_flatten_count || 0)}</strong></div>
         <div><span>強平價替代值</span><strong class="${Number(mode.terminal_flatten_degraded_count || 0) ? "negative" : ""}">${number(mode.terminal_flatten_degraded_count || 0)}</strong></div>
         ${mode.counterfactual_open_replay ? `<div class="wide"><span>開盤價重建</span><strong>實際開盤 ${shortTime(mode.signal_at)} · 原始訊號 ${shortTime(mode.source_signal_at)} · 非即時成交</strong></div>` : ""}
@@ -352,9 +371,12 @@ function renderBenchmarks(data) {
     const netPnl = row.net_pnl_twd == null ? null : Number(row.net_pnl_twd);
     const isTx = row.instrument_type === "continuous_long_future";
     const waitingRoll = String(row.valuation_source || "").includes("roll_waiting");
+    const actionBlocked = !isTx && String(row.valuation_source || "").includes("corporate_action_reference_unavailable");
     const stale = Boolean(row.valuation_stale);
     const status = returnPct == null
       ? {label:"等待有效價格", kind:"bad"}
+      : actionBlocked
+        ? {label:"除權息資料未覆蓋", kind:"bad"}
       : waitingRoll
         ? {label:"等待雙邊換月報價", kind:"warn"}
         : stale
@@ -365,7 +387,9 @@ function renderBenchmarks(data) {
       : `${number(row.quantity || 1000)} 股 · ${row.symbol || ""}`;
     const rollText = isTx
       ? `${number(row.roll_count || 0)} 次${row.last_roll_at ? ` · 最近 ${shortTime(row.last_roll_at)}` : " · 尚未換月"}`
-      : "不含未來現金股利／配息";
+      : row.total_return_contract
+        ? `官方除權息因子 ${sourceNumber(row.corporate_action_factor ?? 1)}× · ${number(row.corporate_action_count || 0)} 次 · 覆蓋至 ${row.corporate_action_coverage_end || "—"}`
+        : "等待下一個交易分鐘載入含息基準契約";
     const totalCosts = [row.fixed_fees_twd, row.transaction_tax_twd, row.liquidation_cost_twd]
       .map(Number).filter(Number.isFinite).reduce((sum, value) => sum + value, 0);
     return `<article class="panel benchmark-card">
@@ -397,20 +421,42 @@ function renderOperations(data) {
   const heartbeatKind = sourceAge <= 10 ? "good" : sourceAge <= 30 ? "warn" : "bad";
   const warmKind = warm.status === "ready" ? "good" : warm.status === "failed" ? "bad" : "warn";
   const phaseKind = ["active", "preopen"].includes(session.phase) ? "good" : session.phase === "force_exit" ? "bad" : "warn";
+  const latency = data.today_latency || data.latency || {};
+  const latencyStageLabels = {
+    signal_quote_fetch_ms: "訊號行情",
+    model_inference_ms: "模型推論",
+    signal_other_compute_ms: "其他訊號計算",
+    artifact_publish_ms: "原子發布",
+    artifact_discovery_ms: "消費端發現",
+    eligibility_load_ms: "資格載入",
+    executor_quote_fetch_ms: "執行行情",
+    ledger_compute_persist_ms: "帳本落盤",
+  };
+  const latencyValue = (value) => value == null ? "—" : `${number(value, 1)} ms`;
+  const noLatency = !Number(latency.sample_count || 0);
+  const latencyEmptyLabel = "今日尚無開盤樣本";
+  const latestBottleneck = latencyStageLabels[latency.latest_bottleneck_stage] || latency.latest_bottleneck_stage || "—";
+  $("latency-kpis").innerHTML = [
+    ["最新輸入→落盤", noLatency ? latencyEmptyLabel : latencyValue(latency.latest_ms), noLatency ? "不以舊日或估計值冒充今日速度" : `${esc(latency.latest_market || "—")} · ${shortTime(latency.latest_recorded_at)}`],
+    ["P50", latencyValue(latency.p50_ms), `${number(latency.sample_count || 0)} 個成功模式樣本`],
+    ["P95", latencyValue(latency.p95_ms), "訊號開始至模擬帳本 fsync 前後的牆鐘邊界"],
+    ["最慢", latencyValue(latency.max_ms), "所選交易日成功樣本最大值"],
+    ["最新瓶頸", noLatency ? "—" : latestBottleneck, noLatency ? "等待實測" : latencyValue(latency.latest_bottleneck_ms)],
+  ].map(([label, value, note]) => `<div class="latency-kpi"><span>${esc(label)}</span><strong>${esc(value)}</strong><small>${esc(note)}</small></div>`).join("");
   $("operation-kpis").innerHTML = [
     ["所選日策略執行", `${number(execution.executed_count || 0)}/${number(execution.mode_count || data.modes.length || 0)} 完成`, execution.all_executed ? "全部策略均已進入所選日執行流程" : `${number(execution.blocked_count || 0)} 個被安全阻擋；解除後立即補跑`, execution.all_executed ? "good" : "bad"],
     ["盤前預熱", `${readyModes}/${totalModes || 0} READY`, warm.status || "pending", warmKind],
     ["目前階段", session.label || "—", `下一步 ${session.next_milestone_label || "—"} · ${countdown(session.next_milestone_at)}`, phaseKind],
     ["帳本心跳", `${sourceNumber(data.source_age_seconds)} 秒`, `目標每 ${number(session.decision_interval_seconds || 60)} 秒`, heartbeatKind],
-    ["面板 API", lastFetchMs == null ? "—" : `${number(lastFetchMs, 1)} ms`, `摘要每 ${number(SUMMARY_REFRESH_MS / 1000)} 秒刷新`, lastFetchMs != null && lastFetchMs > 1000 ? "warn" : "good"],
+    ["面板 API", lastFetchMs == null ? "—" : `${number(lastFetchMs, 1)} ms`, `行情與權益每 ${number(PRICE_REFRESH_MS / 1000)} 秒刷新`, lastFetchMs != null && lastFetchMs > 1000 ? "warn" : "good"],
   ].map(([label, value, note, kind]) => `<div class="operation-kpi"><span>${esc(label)}</span><strong>${esc(value)}</strong><small class="${esc(kind)}">${esc(note)}</small></div>`).join("");
 
   const workflowRows = [
     {label:"四模式預熱", value:warmRatio, count:`${number(warm.completed_count || 0)} / ${number(totalModes)} · ${number(warmRatio * 100, 1)}%`, note:`牆鐘 ${duration(warm.wall_elapsed_seconds)} · ${warm.modes_per_minute == null ? "—" : `${sourceNumber(warm.modes_per_minute)} 模式/分`}`, kind:warmKind},
-    {label:"所選日策略執行", value:session.signal_progress_ratio, count:`${number(session.signal_completed_modes || 0)} / ${number(session.mode_count || 0)}`, note:"錯過後每秒檢查並立即補跑；阻擋不算執行完成", kind:"good"},
+    {label:"所選日策略執行", value:session.signal_progress_ratio, count:`${number(session.signal_completed_modes || 0)} / ${number(session.mode_count || 0)}`, note:"最新訊號指標每 0.1 秒檢查；阻擋不算執行完成", kind:"good"},
     {label:"進場處理終態", value:session.entry_progress_ratio, count:`${number(session.entry_completed_modes || 0)} / ${number(session.mode_count || 0)}`, note:"完成後可能有成交或依真實限制保持空倉", kind:"good"},
     {label:"每分鐘權益紀錄", value:session.mark_progress_ratio, count:`${number(session.observed_mode_minutes || 0)} / ${number(session.expected_mode_minutes || 0)}`, note:`目前 ${sourceNumber(session.mark_rows_per_minute || 0)} 模式紀錄/分`, kind:""},
-    {label:"13:20/13:24 退出", value:session.exit_progress_ratio, count:`${number(session.exit_started_modes || 0)} / ${number(session.mode_count || 0)}`, note:"先限價，13:24 撤換市價；缺價不假成交", kind:"warn"},
+    {label:"13:20/13:24/13:25 退出", value:session.exit_progress_ratio, count:`${number(session.exit_started_modes || 0)} / ${number(session.mode_count || 0)}`, note:"先限價、再市價重試；殘餘於 13:25 以漲跌停價參與收盤集合競價", kind:"warn"},
   ];
   $("workflow-progress").innerHTML = workflowRows.map((row) => `<div class="progress-row">
     <div class="progress-title"><strong>${esc(row.label)}</strong><span>${esc(row.count)}</span></div>
@@ -442,8 +488,9 @@ function renderOperations(data) {
 function renderChart(data) {
   const svg = $("equity-chart");
   const modes = selectedMode() === "all" ? data.modes.map((row) => row.market) : [selectedMode()];
-  const modeRows = (data.marks || []).filter((row) => modes.includes(row.market)).map((row) => ({...row, series_id: row.market}));
-  const benchmarkRows = (data.benchmark_marks || []).map((row) => ({...row, series_id: row.benchmark_id}));
+  const historyRows = Array.isArray(chartHistory?.history) ? chartHistory.history : null;
+  const modeRows = (historyRows || data.marks || []).filter((row) => row.series_type !== "benchmark" && modes.includes(row.market)).map((row) => ({...row, series_id: row.series_id || row.market}));
+  const benchmarkRows = (historyRows || data.benchmark_marks || []).filter((row) => historyRows ? row.series_type === "benchmark" : true).map((row) => ({...row, series_id: row.series_id || row.benchmark_id}));
   const rows = modeRows.concat(benchmarkRows);
   const byMode = new Map();
   for (const row of rows) {
@@ -451,16 +498,49 @@ function renderChart(data) {
     byMode.get(row.series_id).push(row);
   }
   for (const values of byMode.values()) values.sort((a, b) => String(a.minute).localeCompare(String(b.minute)));
-  const points = [...byMode.values()].flat().filter((row) => row.return_pct != null && Number.isFinite(Number(row.return_pct)));
-  $("chart-empty").classList.toggle("hidden", points.length > 0);
+  const labels = new Map([
+    ...data.modes.map((row) => [row.market, row.label || row.market]),
+    ...(data.benchmarks || []).map((row) => [row.benchmark_id, row.label || row.benchmark_id]),
+  ]);
+  const series = [...byMode.entries()].map(([seriesId, values], index) => ({
+    seriesId,
+    values,
+    index,
+    valid: values.filter((row) => row.return_pct != null && Number.isFinite(Number(row.return_pct))),
+  }));
+  const allPoints = series.flatMap((item) => item.valid);
+  const visibleSeries = series.filter((item) => !hiddenEquitySeries.has(item.seriesId));
+  const points = visibleSeries.flatMap((item) => item.valid);
+  $("chart-legend").innerHTML = series.map((item) => {
+    const latest = item.valid.at(-1);
+    const latestText = latest ? `${Number(latest.return_pct) >= 0 ? "+" : ""}${sourceNumber(latest.return_pct)}%` : "—";
+    const label = labels.get(item.seriesId) || item.seriesId;
+    const hidden = hiddenEquitySeries.has(item.seriesId);
+    return `<button type="button" class="legend-toggle${hidden ? " is-hidden" : ""}" data-series-id="${esc(item.seriesId)}" aria-pressed="${String(!hidden)}" aria-label="${hidden ? "顯示" : "隱藏"}${esc(label)}曲線"><i class="series-${item.index % COLORS.length}" aria-hidden="true"></i>${esc(label)} <strong class="${pnlClass(latest?.return_pct)}">${esc(latestText)}</strong></button>`;
+  }).join("");
+  const empty = $("chart-empty");
+  empty.textContent = allPoints.length ? "所有曲線已隱藏；點選圖例圓點可重新顯示。" : "目前尚無分鐘報酬率資料";
+  empty.classList.toggle("hidden", points.length > 0);
   svg.classList.toggle("hidden", points.length === 0);
-  if (!points.length) { svg.innerHTML = ""; $("chart-legend").innerHTML = ""; return; }
-  const width = 960, height = 360, left = 76, right = 22, top = 24, bottom = 42;
-  const times = [...new Set(points.map((row) => String(row.minute)))].sort();
+  if (!points.length) {
+    svg.innerHTML = "";
+    $("equity-range-note").textContent = allPoints.length
+      ? `${TIME_RANGE_LABELS[chartRange]} · 目前 ${number(series.length)} 條曲線皆已隱藏。`
+      : `${TIME_RANGE_LABELS[chartRange]}內沒有可繪製資料。`;
+    return;
+  }
+  const width = 960, height = 360, left = 76, right = 22, top = 24, bottom = 70;
+  const times = [...new Set(allPoints.map((row) => String(row.minute)))].sort();
+  const axis = timeAxis.buildTimeAxis({
+    range: chartRange,
+    timestamps: times.map((value) => new Date(value).getTime()),
+    sessions: TW_STOCK_SESSIONS,
+  });
+  if (!axis) return;
   let ymin = Math.min(0, ...points.map((row) => Number(row.return_pct)));
   let ymax = Math.max(0, ...points.map((row) => Number(row.return_pct)));
   const pad = Math.max(.01, (ymax - ymin) * .08); ymin -= pad; ymax += pad;
-  const x = (minute) => left + (times.length <= 1 ? 0 : times.indexOf(String(minute)) / (times.length - 1)) * (width - left - right);
+  const x = (minute) => timeAxis.position(axis, new Date(minute).getTime(), left, width - right);
   const y = (value) => top + (ymax - Number(value)) / (ymax - ymin) * (height - top - bottom);
   let html = "";
   for (let i = 0; i <= 4; i += 1) {
@@ -468,28 +548,78 @@ function renderChart(data) {
     const value = ymax - i / 4 * (ymax - ymin);
     html += `<line class="axis" x1="${left}" y1="${yy}" x2="${width-right}" y2="${yy}"></line><text class="axis-text" x="6" y="${yy+4}">${esc(sourceNumber(value))}%</text>`;
   }
-  [0, .25, .5, .75, 1].forEach((fraction) => {
-    const idx = Math.min(times.length - 1, Math.round((times.length - 1) * fraction));
-    const xx = x(times[idx]);
-    html += `<text class="axis-text" text-anchor="middle" x="${xx}" y="${height-12}">${esc(times[idx].slice(11,16))}</text>`;
-  });
-  const labels = new Map([
-    ...data.modes.map((row) => [row.market, row.label || row.market]),
-    ...(data.benchmarks || []).map((row) => [row.benchmark_id, row.label || row.benchmark_id]),
-  ]);
-  const legend = [];
-  [...byMode.entries()].forEach(([market, values], index) => {
-    const color = COLORS[index % COLORS.length];
-    const valid = values.filter((row) => row.return_pct != null && Number.isFinite(Number(row.return_pct)));
-    const path = valid.map((row, i) => `${i ? "L" : "M"}${x(row.minute).toFixed(1)},${y(row.return_pct).toFixed(1)}`).join(" ");
+  for (const tick of axis.ticks) {
+    const xx = timeAxis.position(axis, tick.timestamp, left, width - right);
+    const tickClass = tick.kind === "session" ? "axis-time session" : "axis-time";
+    const labelClass = tick.kind === "session" ? "axis-text axis-session-text" : "axis-text";
+    const anchor = tick.rotate ? "end" : "middle";
+    const labelY = tick.kind === "session" ? height - 34 : height - 8;
+    const transform = tick.rotate ? ` transform="rotate(-45 ${xx} ${labelY})"` : "";
+    html += `<line class="${tickClass}" x1="${xx}" y1="${top}" x2="${xx}" y2="${height-bottom}"></line><text class="${labelClass}" text-anchor="${anchor}" x="${xx}" y="${labelY}"${transform}>${esc(tick.label)}</text>`;
+  }
+  visibleSeries.forEach((item) => {
+    const color = COLORS[item.index % COLORS.length];
+    const path = item.valid.map((row, i) => `${i ? "L" : "M"}${x(row.minute).toFixed(1)},${y(row.return_pct).toFixed(1)}`).join(" ");
     html += `<path class="chart-line" stroke="${color}" d="${path}"></path>`;
-    for (const row of valid.filter((item) => item.valuation_stale)) html += `<circle class="stale-dot" cx="${x(row.minute)}" cy="${y(row.return_pct)}" r="3"></circle>`;
-    const latest = valid.at(-1);
-    const latestText = latest ? `${Number(latest.return_pct) >= 0 ? "+" : ""}${sourceNumber(latest.return_pct)}%` : "—";
-    legend.push(`<span><i class="series-${index % COLORS.length}"></i>${esc(labels.get(market) || market)} <strong class="${pnlClass(latest?.return_pct)}">${esc(latestText)}</strong></span>`);
+    for (const row of item.valid.filter((value) => value.valuation_stale)) html += `<circle class="stale-dot" cx="${x(row.minute)}" cy="${y(row.return_pct)}" r="3"></circle>`;
   });
   svg.innerHTML = html;
-  $("chart-legend").innerHTML = legend.join("");
+  const start = new Date(times[0]).toLocaleString("zh-TW", {timeZone:"Asia/Taipei", hour12:false});
+  const end = new Date(times.at(-1)).toLocaleString("zh-TW", {timeZone:"Asia/Taipei", hour12:false});
+  const sampled = chartHistory?.downsampled ? `；已保留端點與區間極值縮圖（原 ${number(chartHistory.raw_points_in_range)} 點）` : "";
+  $("equity-range-note").textContent = `${TIME_RANGE_LABELS[chartRange]} · ${start} ～ ${end} · 顯示 ${number(points.length)} 點、${number(visibleSeries.length)}/${number(series.length)} 條線${sampled}`;
+}
+
+function syncChartRangeControl() {
+  $("equity-time-range").querySelectorAll("button[data-range]").forEach((button) => {
+    button.setAttribute("aria-pressed", String(button.dataset.range === chartRange));
+  });
+}
+
+function applyChartHistory(payload) {
+  chartHistory = payload;
+  if (snapshot) renderChart(snapshot);
+}
+
+async function loadChartHistory({preferCache = false} = {}) {
+  if (document.hidden) return;
+  const requestedRange = chartRange;
+  const cached = chartHistoryCache.get(requestedRange);
+  if (preferCache) {
+    if (cached) applyChartHistory(cached.payload);
+    else {
+      chartHistory = null;
+      if (snapshot) renderChart(snapshot);
+    }
+    if (cached && Date.now() - cached.receivedAt < HISTORY_CLIENT_CACHE_MS) return;
+  }
+  if (historyInFlight) return;
+  historyInFlight = true;
+  try {
+    const response = await fetch(`api/history?range=${encodeURIComponent(requestedRange)}`, {cache:"default"});
+    if (response.status === 429) {
+      const retrySeconds = Math.min(30, Math.max(1, Number(response.headers.get("Retry-After")) || 5));
+      $("equity-range-note").textContent = `${TIME_RANGE_LABELS[requestedRange]}歷史請求稍多，保留目前曲線並於 ${number(retrySeconds)} 秒後自動重試。`;
+      if (historyRetryTimer != null) clearTimeout(historyRetryTimer);
+      historyRetryTimer = window.setTimeout(() => {
+        historyRetryTimer = null;
+        if (requestedRange === chartRange) void loadChartHistory();
+      }, retrySeconds * 1000);
+      return;
+    }
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const payload = await response.json();
+    if (requestedRange !== chartRange) return;
+    chartHistoryCache.set(requestedRange, {payload, receivedAt: Date.now()});
+    if (historyRetryTimer != null) clearTimeout(historyRetryTimer);
+    historyRetryTimer = null;
+    applyChartHistory(payload);
+  } catch (error) {
+    $("equity-range-note").textContent = `${TIME_RANGE_LABELS[requestedRange]}歷史載入失敗：${error}`;
+  } finally {
+    historyInFlight = false;
+    if (requestedRange !== chartRange) void loadChartHistory({preferCache: true});
+  }
 }
 
 function renderPositions(data) {
@@ -510,7 +640,7 @@ function renderPositions(data) {
       <td><strong>${esc(row.market)}</strong> ${badge(row.side === "long" ? "多" : "空", row.side === "long" ? "good" : "bad")}<small>${esc(row.symbol)} ${esc(row.name || "")}</small></td>
       <td><strong>${pct(row.target_weight)}</strong><small>成交 ${number(row.filled_shares)}／預計 ${number(row.requested_shares)} 股</small><small>剩餘 ${number(Math.abs(signedShares))} 股</small></td>
       <td><strong>進 ${money(row.entry_price)}</strong><small>${shortTime(row.entry_at)}${row.simulation_replay ? ` · 開盤價重建；原始訊號 ${shortTime(row.source_signal_at)}` : ""}</small><small>清算 ${money(row.last_mark_price)} · ${shortTime(row.last_quote_at)}</small></td>
-      <td><strong>TP ${sourceNumber(row.take_profit_price)} · SL ${sourceNumber(row.stop_trigger_price)}</strong><small>${esc(row.stop_order_status)}</small><small>13:20 ${row.eod_limit_price == null ? "—" : sourceNumber(row.eod_limit_price)} · ${esc(row.eod_limit_order_status || "未到")} · ${shortTime(row.eod_limit_submitted_at)}</small></td>
+      <td><strong>TP ${sourceNumber(row.take_profit_price)} · SL ${sourceNumber(row.stop_trigger_price)}</strong><small>${esc(row.stop_order_status)}</small><small>13:20 ${row.eod_limit_price == null ? "—" : sourceNumber(row.eod_limit_price)} · ${esc(row.eod_limit_order_status || "未到")} · ${shortTime(row.eod_limit_submitted_at)}</small><small>13:25 ${row.closing_auction_limit_price == null ? "—" : sourceNumber(row.closing_auction_limit_price)} · ${esc(row.closing_auction_order_status || "未到")}</small></td>
 	    <td><strong>${row.exit_price == null ? (row.last_exit_price == null ? "持倉中" : `部分 ${money(row.last_exit_price)}`) : money(row.exit_price)}</strong><small>${esc(row.exit_reason || row.status || "—")}</small><small>${shortTime(row.exit_at || row.last_exit_at)}</small></td>
 	    <td><strong class="${pnlClass(totalNet)}">總 ${money(totalNet)}</strong><small class="${pnlClass(realizedNet)}">已實現 ${money(realizedNet)}</small><small class="${pnlClass(unrealizedNet)}">未實現 ${money(unrealizedNet)} · ${row.valuation_stale ? badge("延用", "warn") : badge("新鮮", "good")}</small></td>
     </tr>`;
@@ -600,6 +730,8 @@ function renderAudit(data) {
   $("source-fees").textContent = contract.fees || "—";
   $("source-comparison").textContent = `${contract.comparison || "—"}；${contract.benchmarks || "—"}；${contract.benchmark_history || "—"}`;
   $("source-eligibility").textContent = contract.eligibility || "—"; $("source-depth").textContent = `${contract.depth_limit || "—"}；${contract.bracket_fill || "—"}；${contract.terminal_flatten || "—"}`;
+  $("source-exit").textContent = contract.exit_schedule || "—";
+  $("source-latency").textContent = contract.latency || "—";
 }
 
 function revisionOf(data) {
@@ -651,7 +783,7 @@ async function loadSignals({append = false} = {}) {
   signalLoading = true;
   renderSignals();
   try {
-    const response = await fetch(`api/signals?${params.toString()}`, {cache: "default", signal: controller.signal});
+    const response = await fetch(`api/signals?${params.toString()}`, {cache: "no-store", signal: controller.signal});
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const page = await response.json();
     if (sequence !== signalRequestSequence) return;
@@ -695,7 +827,7 @@ async function loadEvents({append = false} = {}) {
   eventLoading = true;
   renderEvents();
   try {
-    const response = await fetch(`api/events?${params.toString()}`, {cache: "default", signal: controller.signal});
+    const response = await fetch(`api/events?${params.toString()}`, {cache: "no-store", signal: controller.signal});
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const page = await response.json();
     if (sequence !== eventRequestSequence) return;
@@ -734,7 +866,7 @@ async function refresh() {
   try {
     const started = performance.now();
     const date = selectedDate();
-    const response = await fetch(`api/status${date ? `?date=${encodeURIComponent(date)}` : ""}`, {cache: "default"});
+    const response = await fetch(`api/status${date ? `?date=${encodeURIComponent(date)}` : ""}`, {cache: "no-store"});
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     snapshot = await response.json();
     lastFetchMs = performance.now() - started;
@@ -757,33 +889,6 @@ async function refresh() {
       refreshQueued = false;
       void refresh();
     }
-  }
-}
-
-async function refreshSummary() {
-  if (document.hidden || summaryInFlight || refreshInFlight || !snapshot) return;
-  summaryInFlight = true;
-  try {
-    const date = selectedDate();
-    const response = await fetch(`api/summary${date ? `?date=${encodeURIComponent(date)}` : ""}`, {cache: "default"});
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    const summary = await response.json();
-    if (date !== selectedDate()) return;
-    snapshot = {...snapshot, ...summary};
-    renderHeader(snapshot);
-    renderOverview(snapshot);
-    renderModes(snapshot);
-    renderBenchmarks(snapshot);
-    renderOperations(snapshot);
-    const currentSignalCount = Number((snapshot.record_counts || {}).signals || 0);
-    if (signalRecordCount == null || currentSignalCount !== signalRecordCount) await loadSignals();
-    const counts = snapshot.record_counts || {};
-    const currentEventRevision = JSON.stringify([selectedDate(), Number(counts.orders || 0), Number(counts.fills || 0)]);
-    if (eventRecordRevision == null || currentEventRevision !== eventRecordRevision) await loadEvents();
-  } catch (_error) {
-    // The slower full refresh remains the visible availability authority.
-  } finally {
-    summaryInFlight = false;
   }
 }
 
@@ -841,8 +946,28 @@ $("load-more-positions").addEventListener("click", () => {
   positionVisibleRows += POSITION_PAGE_SIZE;
   renderPositions(snapshot);
 });
+$("equity-time-range").addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-range]");
+  if (!button || !(button.dataset.range in TIME_RANGE_LABELS)) return;
+  chartRange = button.dataset.range;
+  if (historyRetryTimer != null) clearTimeout(historyRetryTimer);
+  historyRetryTimer = null;
+  try { localStorage.setItem("tw-day-trade-equity-time-range", chartRange); } catch (_error) { /* optional */ }
+  syncChartRangeControl();
+  void loadChartHistory({preferCache: true});
+});
+$("chart-legend").addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-series-id]");
+  if (!button) return;
+  const seriesId = button.dataset.seriesId;
+  if (hiddenEquitySeries.has(seriesId)) hiddenEquitySeries.delete(seriesId);
+  else hiddenEquitySeries.add(seriesId);
+  try { localStorage.setItem(HIDDEN_EQUITY_SERIES_STORAGE_KEY, JSON.stringify([...hiddenEquitySeries])); } catch (_error) { /* optional */ }
+  if (snapshot) renderChart(snapshot);
+});
 setInterval(() => { $("clock").textContent = new Date().toLocaleString("zh-TW", {timeZone:"Asia/Taipei", hour12:false}); }, 1000);
-document.addEventListener("visibilitychange", () => { if (!document.hidden) void refresh(); });
+document.addEventListener("visibilitychange", () => { if (!document.hidden) { void refresh(); void loadChartHistory(); } });
+syncChartRangeControl();
 void refresh();
-window.setInterval(() => void refreshSummary(), SUMMARY_REFRESH_MS);
-window.setInterval(() => void refresh(), FULL_REFRESH_MS);
+void loadChartHistory();
+window.setInterval(() => { void refresh(); void loadChartHistory(); }, PRICE_REFRESH_MS);

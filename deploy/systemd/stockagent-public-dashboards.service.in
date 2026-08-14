@@ -25,6 +25,7 @@ PrivateTmp=true
 PrivateDevices=true
 ProtectSystem=strict
 ProtectHome=read-only
+InaccessiblePaths=-/root/.ssh -/root/.codex -__REPO_ROOT__/.env -__REPO_ROOT__/.env.trade -__REPO_ROOT__/.env.futures
 ProtectProc=invisible
 ProcSubset=pid
 ProtectKernelTunables=true

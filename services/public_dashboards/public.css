@@ -54,7 +54,7 @@ h1 { margin: 0; max-width: 760px; overflow-wrap: anywhere; font-size: clamp(42px
 .lead { margin: 0; color: var(--muted); font-size: 16px; line-height: 1.8; }
 .trust-row { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 8px; margin-top: 4px; }
 .trust-row span { padding: 7px 10px; border: 1px solid var(--line); border-radius: 999px; color: #c8d6e2; font-size: 11px; }
-.cards { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 18px; margin: 44px 0 20px; scroll-margin-top: 20px; }
+.cards { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; margin: 44px 0 20px; scroll-margin-top: 20px; }
 .dashboard-card {
   position: relative;
   display: grid;
@@ -73,17 +73,19 @@ h1 { margin: 0; max-width: 760px; overflow-wrap: anywhere; font-size: clamp(42px
 .dashboard-card::after { content: ""; position: absolute; inset: 0 auto 0 0; width: 3px; background: var(--cyan); opacity: .75; }
 .dashboard-card.tw::after { background: var(--green); }
 .dashboard-card.shioaji::after { background: var(--amber); }
+.dashboard-card.openbb::after { background: #ae8bff; }
 .dashboard-card:hover, .dashboard-card:focus-visible { transform: translateY(-3px); border-color: var(--cyan); box-shadow: 0 28px 80px rgba(0, 0, 0, .34); outline: none; }
 .dashboard-card:focus-visible { box-shadow: 0 0 0 3px rgba(67, 215, 255, .2), 0 28px 80px rgba(0, 0, 0, .34); }
 .card-topline { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .market { color: var(--cyan); font-size: 11px; font-weight: 800; letter-spacing: .17em; }
 .tw .market { color: var(--green); }
 .shioaji .market { color: var(--amber); }
+.openbb .market { color: #c9b7ff; }
 .health { display: inline-flex; align-items: center; gap: 7px; color: var(--muted); font-size: 11px; }
 .health i { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
-.health.active { color: var(--green); }
-.health.waiting, .health.stale { color: var(--amber); }
-.health.blocked, .health.critical, .health.unavailable { color: var(--red); }
+.health.active, .health.complete { color: var(--green); }
+.health.waiting, .health.stale, .health.starting { color: var(--amber); }
+.health.blocked, .health.critical, .health.unavailable, .health.stopped { color: var(--red); }
 .health.degraded { color: var(--red); }
 .dashboard-card strong { display: block; font-size: clamp(23px, 2.2vw, 30px); line-height: 1.25; letter-spacing: -.02em; }
 .dashboard-card p { margin: 10px 0 0; color: var(--muted); font-size: 14px; line-height: 1.65; }
@@ -95,6 +97,7 @@ h1 { margin: 0; max-width: 760px; overflow-wrap: anywhere; font-size: clamp(42px
 .card-action b { color: var(--cyan); font-size: 21px; transition: transform .16s ease; }
 .tw .card-action b { color: var(--green); }
 .shioaji .card-action b { color: var(--amber); }
+.openbb .card-action b { color: #c9b7ff; }
 .dashboard-card:hover .card-action b { transform: translateX(4px); }
 .safety-note { display: grid; grid-template-columns: 110px 1fr; gap: 22px; padding: 22px 24px; border: 1px solid rgba(40, 65, 89, .72); border-radius: 14px; background: rgba(13, 27, 40, .72); }
 .note-index { color: var(--green); font-size: 11px; font-weight: 800; letter-spacing: .11em; }

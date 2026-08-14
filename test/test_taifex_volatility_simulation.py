@@ -70,24 +70,30 @@ def _engine(
     broker_orders_enabled: bool = False,
     strategy_capital_buffer_multiple: float = 2.0,
     catalog_expansion_entry_policy: str = "next_cycle",
+    option_infos_override: list[FakeOptionInfo] | None = None,
+    settlement_bootstrap_only: bool = False,
+    startup_now: datetime | None = None,
 ) -> TaifexVolatilitySimulation:
     expiry = date(2026, 8, 14)
-    option_infos = [
-        FakeOptionInfo(root="TXV", expiry=expiry, strike=strike, right=right)
-        for strike in range(44_000, 46_001, 100)
-        for right in ("C", "P")
-    ]
-    # Cross-expiry points are available to Local/SLV/Rough fits.
-    option_infos.extend(
-        FakeOptionInfo(
-            root="TXO",
-            expiry=date(2026, 8, 19),
-            strike=strike,
-            right=right,
+    if option_infos_override is None:
+        option_infos = [
+            FakeOptionInfo(root="TXV", expiry=expiry, strike=strike, right=right)
+            for strike in range(44_000, 46_001, 100)
+            for right in ("C", "P")
+        ]
+        # Cross-expiry points are available to Local/SLV/Rough fits.
+        option_infos.extend(
+            FakeOptionInfo(
+                root="TXO",
+                expiry=date(2026, 8, 19),
+                strike=strike,
+                right=right,
+            )
+            for strike in range(44_000, 46_001, 100)
+            for right in ("C", "P")
         )
-        for strike in range(44_000, 46_001, 100)
-        for right in ("C", "P")
-    )
+    else:
+        option_infos = option_infos_override
     return TaifexVolatilitySimulation(
         api=FakeApi(),
         shioaji_module=SimpleNamespace(),
@@ -113,6 +119,8 @@ def _engine(
         strategy_mode=strategy_mode,
         strategy_capital_buffer_multiple=strategy_capital_buffer_multiple,
         catalog_expansion_entry_policy=catalog_expansion_entry_policy,
+        settlement_bootstrap_only=settlement_bootstrap_only,
+        startup_now=startup_now,
     )
 
 
@@ -444,6 +452,34 @@ def test_missing_book_carries_last_complete_equity_for_same_position_only(
     engine.close()
 
 
+def test_flat_strategy_waiting_for_roll_entry_has_exact_zero_live_value(
+    tmp_path: Path,
+) -> None:
+    engine = _engine(
+        tmp_path,
+        bootstrap_after=date(2026, 8, 12),
+        strategy_mode=STRATEGY_MODE_INTRADAY_FUTURES,
+    )
+    engine.state["active_cycle"] = {"cycle_id": "next_nearest_weekly"}
+    ledger = engine.state["strategies"]["long_strap_2c1p"]
+    ledger["entry_state"] = "waiting_for_fresh_entry_depth"
+    ledger["option_positions"] = {}
+    ledger["futures_position"] = 0
+
+    decision_ns = int(datetime.now(timezone.utc).timestamp() * 1e9)
+    mark = engine._strategy_mark("long_strap_2c1p", decision_ns)
+
+    assert mark["valuation_available"] is True
+    assert mark["valuation_source"] == "fresh_executable_bidask"
+    assert mark["open_liquidation_value_twd"] == 0.0
+    assert mark["cumulative_pnl_twd"] == pytest.approx(
+        float(ledger["gross_cash_twd"])
+        - float(ledger["fees_twd"])
+        - float(ledger["tax_twd"])
+    )
+    engine.close()
+
+
 def test_engine_does_not_open_from_stale_books(tmp_path: Path) -> None:
     engine = _engine(tmp_path, bootstrap_after=date(2026, 8, 10))
     stale_ns = int(datetime.now(timezone.utc).timestamp() * 1e9) - 10_000_000_000
@@ -633,6 +669,137 @@ def test_restart_rejects_persisted_held_option_without_worker_subscription(
         match="persisted held option contracts are not subscribed on strategy worker 0",
     ):
         _engine(tmp_path, bootstrap_after=date(2026, 8, 12))
+
+
+def test_v8_restart_pair_repair_preserves_only_ideal_ledger_backed_positions(
+    tmp_path: Path,
+) -> None:
+    engine = _engine(
+        tmp_path,
+        bootstrap_after=date(2026, 8, 12),
+        strategy_mode=STRATEGY_MODE_INTRADAY_FUTURES,
+    )
+    call_code = "TXV-20260814-45000-C"
+    put_code = "TXV-20260814-45000-P"
+    engine.state["active_cycle"] = {
+        "cycle_id": "current_weekly_cycle",
+        "expiry_date": "2026-08-14",
+        "series": "TXV:202608:2026-08-14",
+        "strike": 45_000.0,
+        "call_code": call_code,
+        "put_code": put_code,
+        "strategy_entries": {
+            CLASSIC_VARIANT_ID: "entered",
+            "long_strap_2c1p": "waiting_for_fresh_entry_depth",
+            "underlying_hedge_future_long": "entered",
+            PUT_CALL_PARITY_TX_STRATEGY_ID: "independent_monthly_lifecycle",
+        },
+    }
+    decision_ns = int(datetime.now(timezone.utc).timestamp() * 1e9)
+    for code, right in ((call_code, "C"), (put_code, "P")):
+        engine._record_ideal_trade(
+            strategy_id=CLASSIC_VARIANT_ID,
+            instrument_type="option",
+            product="TXO",
+            code=code,
+            delta_contracts=1,
+            price_points=100.0,
+            decision_ns=decision_ns,
+            receive_ns=decision_ns,
+            reason="strategy_catalog_cycle_entry",
+            series="TXV:202608:2026-08-14",
+            strike=45_000.0,
+            option_right=right,
+            fee_twd=0.0,
+            tax_twd=0.0,
+        )
+    engine.state["strategies"][CLASSIC_VARIANT_ID]["entry_state"] = "entered"
+    fabricated_ids = (
+        "long_strap_2c1p",
+        "underlying_hedge_future_long",
+        PUT_CALL_PARITY_TX_STRATEGY_ID,
+    )
+    for strategy_id in fabricated_ids:
+        ledger = engine.state["strategies"][strategy_id]
+        ledger["option_positions"] = {call_code: 1, put_code: 1}
+        ledger["option_position_metadata"] = {
+            call_code: {
+                "series": "TXV:202608:2026-08-14",
+                "strike": 45_000.0,
+                "option_right": "C",
+            },
+            put_code: {
+                "series": "TXV:202608:2026-08-14",
+                "strike": 45_000.0,
+                "option_right": "P",
+            },
+        }
+    engine.state["strategies"]["long_strap_2c1p"]["entry_state"] = "entered"
+    engine.state["strategies"]["underlying_hedge_future_long"][
+        "entry_state"
+    ] = "entered"
+    engine.state["strategies"]["underlying_hedge_future_long"][
+        "futures_position"
+    ] = 1
+    engine.close()
+
+    state_path = tmp_path / "state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["execution_contract_version"] = 8
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    migrated = _engine(
+        tmp_path,
+        bootstrap_after=date(2026, 8, 12),
+        strategy_mode=STRATEGY_MODE_INTRADAY_FUTURES,
+    )
+    assert migrated.state["execution_contract_version"] == EXECUTION_CONTRACT_VERSION
+    assert migrated.state["strategies"][CLASSIC_VARIANT_ID][
+        "option_positions"
+    ] == {call_code: 1, put_code: 1}
+    assert migrated.state["strategies"]["long_strap_2c1p"][
+        "option_positions"
+    ] == {}
+    assert migrated.state["strategies"]["long_strap_2c1p"][
+        "entry_state"
+    ] == "waiting_for_fresh_entry_depth"
+    assert migrated.state["strategies"]["underlying_hedge_future_long"][
+        "option_positions"
+    ] == {}
+    assert migrated.state["strategies"]["underlying_hedge_future_long"][
+        "entry_state"
+    ] == "entered"
+    assert migrated.state["strategies"]["underlying_hedge_future_long"][
+        "futures_position"
+    ] == 1
+    assert migrated.state["strategies"][PUT_CALL_PARITY_TX_STRATEGY_ID][
+        "option_positions"
+    ] == {}
+    assert migrated.state["strategies"][PUT_CALL_PARITY_TX_STRATEGY_ID][
+        "entry_state"
+    ] == "waiting_for_same_expiry_monthly_books"
+    migration_events = [
+        json.loads(line)
+        for line in (tmp_path / "events.jsonl").read_text(encoding="utf-8").splitlines()
+        if json.loads(line).get("event") == "execution_contract_migrated"
+    ]
+    assert migration_events[-1]["repaired_v8_restart_strategy_ids"] == sorted(
+        fabricated_ids
+    )
+    migrated.close()
+
+    restarted = _engine(
+        tmp_path,
+        bootstrap_after=date(2026, 8, 12),
+        strategy_mode=STRATEGY_MODE_INTRADAY_FUTURES,
+    )
+    assert restarted.state["strategies"]["long_strap_2c1p"][
+        "option_positions"
+    ] == {}
+    assert restarted.state["strategies"][PUT_CALL_PARITY_TX_STRATEGY_ID][
+        "option_positions"
+    ] == {}
+    restarted.close()
 
 
 def test_restart_migrates_exact_official_2026_08_13_margin_step(
@@ -1168,3 +1335,144 @@ def test_expired_cycle_uses_official_settlement_and_finishes_flat(
     for strategy_id in STRATEGY_IDS:
         assert engine.state["strategies"][strategy_id]["futures_position"] == 0
     engine.close()
+
+
+def test_startup_settlement_bootstrap_migrates_v7_then_rolls_to_nearest_weekly(
+    tmp_path: Path,
+) -> None:
+    initial = _engine(
+        tmp_path,
+        bootstrap_after=date(2026, 8, 12),
+        strategy_mode=STRATEGY_MODE_INTRADAY_FUTURES,
+    )
+    initial.state["active_cycle"] = {
+        "cycle_id": "expired_weekly_cycle",
+        "expiry_date": "2026-08-14",
+        "series": "TXV:202608:2026-08-14",
+    }
+    ledger = initial.state["strategies"][CLASSIC_VARIANT_ID]
+    ledger["option_positions"] = {"TXV-20260814-45000-C": 1}
+    ledger["option_position_metadata"] = {
+        "TXV-20260814-45000-C": {
+            "series": "TXV:202608:2026-08-14",
+            "strike": 45_000.0,
+            "option_right": "C",
+        }
+    }
+    initial.close()
+
+    state_path = tmp_path / "state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["execution_contract_version"] = 7
+    state["strategy_ids"] = [
+        strategy_id
+        for strategy_id in state["strategy_ids"]
+        if strategy_id != PUT_CALL_PARITY_TX_STRATEGY_ID
+    ]
+    state["strategies"].pop(PUT_CALL_PARITY_TX_STRATEGY_ID)
+    state.pop("put_call_parity_tx", None)
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    pl.DataFrame(
+        {
+            "settlement_date": [date(2026, 8, 14)],
+            "option_series": ["202608F2"],
+            "final_settlement_price": [45_100.0],
+            "source_file": ["official.html"],
+            "source_sha256": ["c" * 64],
+        }
+    ).write_parquet(tmp_path / "settlements.parquet")
+
+    bootstrap = _engine(
+        tmp_path,
+        bootstrap_after=date(2026, 8, 12),
+        strategy_mode=STRATEGY_MODE_INTRADAY_FUTURES,
+        option_infos_override=[],
+        settlement_bootstrap_only=True,
+        startup_now=datetime(2026, 8, 14, 15, 1, tzinfo=TAIPEI),
+    )
+    assert bootstrap.state["execution_contract_version"] == EXECUTION_CONTRACT_VERSION
+    assert bootstrap.state["active_cycle"] is None
+    assert bootstrap.state["last_settled_expiry"] == "2026-08-14"
+    assert all(
+        not ledger["option_positions"]
+        for ledger in bootstrap.state["strategies"].values()
+    )
+    bootstrap.close()
+
+    next_options = [
+        FakeOptionInfo(
+            root=root,
+            expiry=expiry,
+            strike=strike,
+            right=right,
+        )
+        for root, expiry in (
+            ("TXO", date(2026, 8, 19)),
+            ("TXV", date(2026, 8, 21)),
+        )
+        for strike in range(44_000, 46_001, 100)
+        for right in ("C", "P")
+    ]
+    live = _engine(
+        tmp_path,
+        bootstrap_after=date(2026, 8, 12),
+        strategy_mode=STRATEGY_MODE_INTRADAY_FUTURES,
+        option_infos_override=next_options,
+    )
+    observed_at = datetime(2026, 8, 14, 15, 1, tzinfo=TAIPEI)
+    receive_ns = int(datetime.now(timezone.utc).timestamp() * 1e9)
+    _seed_surface_books(live, observed_at=observed_at, receive_ns=receive_ns)
+    live.step(now=observed_at)
+
+    assert live.state["active_cycle"]["expiry_date"] == "2026-08-21"
+    assert live.state["active_cycle"]["entry_session"] == "night"
+    assert live.state["active_cycle"]["call_code"].startswith("TXV-20260821-")
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert any(
+        row["event"] == "subscription_bootstrap_expired_positions_settled"
+        for row in events
+    )
+    assert events[-1]["event"] == "cycle_opened"
+    live.close()
+
+
+def test_startup_settlement_bootstrap_fails_closed_without_official_price(
+    tmp_path: Path,
+) -> None:
+    initial = _engine(
+        tmp_path,
+        bootstrap_after=date(2026, 8, 10),
+        strategy_mode=STRATEGY_MODE_INTRADAY_FUTURES,
+    )
+    initial.state["active_cycle"] = {
+        "cycle_id": "expired_without_settlement",
+        "expiry_date": "2026-08-12",
+        "series": "TXV:202608:2026-08-12",
+    }
+    ledger = initial.state["strategies"][CLASSIC_VARIANT_ID]
+    ledger["option_positions"] = {"TXV-EXPIRED-C": 1}
+    ledger["option_position_metadata"] = {
+        "TXV-EXPIRED-C": {
+            "series": "TXV:202608:2026-08-12",
+            "strike": 45_000.0,
+            "option_right": "C",
+        }
+    }
+    initial.close()
+
+    with pytest.raises(RuntimeError, match="missing_official_final_settlement"):
+        _engine(
+            tmp_path,
+            bootstrap_after=date(2026, 8, 10),
+            strategy_mode=STRATEGY_MODE_INTRADAY_FUTURES,
+            option_infos_override=[],
+            settlement_bootstrap_only=True,
+            startup_now=datetime(2026, 8, 13, 8, 46, tzinfo=TAIPEI),
+        )
+    state = json.loads((tmp_path / "state.json").read_text(encoding="utf-8"))
+    assert state["active_cycle"] is not None
+    assert state["engine_status"] == "blocked_subscription_bootstrap_settlement"
+    assert state["blocked_reason"] == "missing_official_final_settlement:2026-08-12"

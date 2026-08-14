@@ -92,7 +92,7 @@ from stockagent.research.taifex_volatility_metadata import (
 
 
 SCHEMA_VERSION: Final[int] = 1
-EXECUTION_CONTRACT_VERSION: Final[int] = 8
+EXECUTION_CONTRACT_VERSION: Final[int] = 9
 OPTION_MULTIPLIER: Final[float] = 50.0
 OPTION_FEE_PER_SIDE_TWD: Final[float] = 22.0
 DEFAULT_OPTION_RISK_MARGIN_A_TWD: Final[float] = TXO_RISK_MARGIN_TWD_2026_08_13["A"]
@@ -510,6 +510,8 @@ class TaifexVolatilitySimulation:
             DEFAULT_STRATEGY_CAPITAL_BUFFER_MULTIPLE
         ),
         catalog_expansion_entry_policy: str = CATALOG_EXPANSION_ENTRY_NEXT_CYCLE,
+        settlement_bootstrap_only: bool = False,
+        startup_now: datetime | None = None,
     ) -> None:
         normalized_mode = str(strategy_mode).strip().lower()
         if normalized_mode not in STRATEGY_MODES:
@@ -573,6 +575,7 @@ class TaifexVolatilitySimulation:
         self.option_risk_margin_c_twd = margin_c
         self.strategy_capital_buffer_multiple = capital_buffer_multiple
         self.catalog_expansion_entry_policy = expansion_policy
+        self.settlement_bootstrap_only = bool(settlement_bootstrap_only)
         self.underlying = underlying
         self.hedge = hedge
         self.underlying_product = _continuous_future_product(underlying.logical_code)
@@ -613,6 +616,13 @@ class TaifexVolatilitySimulation:
             ) from exc
         try:
             self.state = self._load_or_initialize_state(bootstrap_after)
+            if self.settlement_bootstrap_only:
+                self.broker_orders_enabled = False
+                self._settle_expired_positions_for_subscription_bootstrap(
+                    startup_now or datetime.now(TAIPEI)
+                )
+                self._write_status(force=True)
+                return
             missing_held_codes = sorted(
                 set(held_option_codes(self.state)) - set(self.options_by_code)
             )
@@ -637,6 +647,99 @@ class TaifexVolatilitySimulation:
                 self.lock_handle.close()
             raise
 
+    def _repair_v8_restart_fabricated_active_cycle_pairs(
+        self,
+        payload: dict[str, Any],
+        active_cycle: Mapping[str, Any],
+    ) -> list[str]:
+        """Remove the exact unbacked ATM pair fabricated by the v8 restart bug."""
+
+        call_code = str(active_cycle.get("call_code") or "")
+        put_code = str(active_cycle.get("put_code") or "")
+        if not call_code or not put_code or call_code == put_code:
+            return []
+        active_codes = {call_code, put_code}
+        net_ledger_deltas: dict[str, dict[str, int]] = {
+            strategy_id: {call_code: 0, put_code: 0}
+            for strategy_id in STRATEGY_IDS
+        }
+        if self.ledger_path.is_file():
+            with self.ledger_path.open("r", encoding="utf-8") as handle:
+                for line_number, line in enumerate(handle, start=1):
+                    try:
+                        row = json.loads(line)
+                    except json.JSONDecodeError as exc:
+                        raise RuntimeError(
+                            "cannot audit v8 restart positions against malformed "
+                            f"ideal ledger line {line_number}"
+                        ) from exc
+                    if (
+                        row.get("instrument_type") != "option"
+                        or str(row.get("code") or "") not in active_codes
+                    ):
+                        continue
+                    strategy_id = str(row.get("strategy_id") or "")
+                    if strategy_id not in net_ledger_deltas:
+                        continue
+                    code = str(row["code"])
+                    try:
+                        delta = int(row["delta_contracts"])
+                    except (KeyError, TypeError, ValueError) as exc:
+                        raise RuntimeError(
+                            "cannot audit v8 restart positions against invalid "
+                            f"ideal ledger quantity at line {line_number}"
+                        ) from exc
+                    net_ledger_deltas[strategy_id][code] += delta
+
+        cycle_entries = active_cycle.get("strategy_entries") or {}
+        repaired: list[str] = []
+        for strategy_id, ledger in (payload.get("strategies") or {}).items():
+            if not isinstance(ledger, dict):
+                continue
+            positions = {
+                str(code): int(quantity)
+                for code, quantity in (ledger.get("option_positions") or {}).items()
+                if int(quantity) != 0
+            }
+            if positions != {call_code: 1, put_code: 1}:
+                continue
+            ledger_deltas = net_ledger_deltas.get(str(strategy_id), {})
+            if any(int(ledger_deltas.get(code, 0)) != 0 for code in active_codes):
+                continue
+            ledger["option_positions"] = {}
+            metadata = ledger.get("option_position_metadata")
+            if isinstance(metadata, dict):
+                metadata.pop(call_code, None)
+                metadata.pop(put_code, None)
+                if not metadata:
+                    ledger["option_position_metadata"] = {}
+            if not bool(ledger.get("alive", True)):
+                ledger["entry_state"] = "ruined"
+            elif str(strategy_id) == PUT_CALL_PARITY_TX_STRATEGY_ID:
+                parity_state = payload.get("put_call_parity_tx") or {}
+                monitor_state = str(
+                    (parity_state.get("monitor") or {}).get("state") or ""
+                )
+                ledger["entry_state"] = (
+                    "waiting_for_profitable_parity"
+                    if monitor_state == "no_positive_edge_after_cost"
+                    else monitor_state or "waiting_for_same_expiry_monthly_books"
+                )
+            else:
+                cycle_entry = str(cycle_entries.get(strategy_id) or "pending")
+                ledger["entry_state"] = cycle_entry
+            for key in (
+                "last_complete_open_liquidation_value_twd",
+                "last_complete_mark_decision_ts_ns",
+                "last_complete_mark_cycle_id",
+                "last_complete_mark_futures_position",
+                "last_complete_mark_underlying_futures_position",
+                "last_complete_mark_option_positions",
+            ):
+                ledger[key] = None
+            repaired.append(str(strategy_id))
+        return sorted(repaired)
+
     def _load_or_initialize_state(self, bootstrap_after: date | None) -> dict[str, Any]:
         if self.state_path.is_file():
             payload = json.loads(self.state_path.read_text(encoding="utf-8"))
@@ -653,6 +756,7 @@ class TaifexVolatilitySimulation:
                 )
             execution_version = int(payload.get("execution_contract_version", 1))
             migration_reasons: list[str] = []
+            repaired_v8_restart_strategy_ids: list[str] = []
             if execution_version in {1, 2}:
                 nonflat = any(
                     int(row.get("futures_position", 0)) != 0
@@ -703,6 +807,9 @@ class TaifexVolatilitySimulation:
             elif execution_version == 7:
                 payload["execution_contract_version"] = EXECUTION_CONTRACT_VERSION
                 migration_reasons.append("same_expiry_put_call_parity_tx_migration")
+            elif execution_version == 8:
+                payload["execution_contract_version"] = EXECUTION_CONTRACT_VERSION
+                migration_reasons.append("restart_safe_active_cycle_migration")
             elif execution_version != EXECUTION_CONTRACT_VERSION:
                 raise RuntimeError("strategy execution contract mismatch")
 
@@ -715,7 +822,11 @@ class TaifexVolatilitySimulation:
                 ledger = strategies.setdefault(strategy_id, _new_strategy_ledger())
                 legacy_positions = ledger.setdefault("option_positions", {})
                 legacy_metadata = ledger.setdefault("option_position_metadata", {})
-                if active_cycle_mapping and not legacy_positions:
+                if (
+                    execution_version < 5
+                    and active_cycle_mapping
+                    and not legacy_positions
+                ):
                     for right, key in (("C", "call_code"), ("P", "put_code")):
                         code = str(active_cycle_mapping.get(key) or "")
                         if not code:
@@ -732,6 +843,13 @@ class TaifexVolatilitySimulation:
                         "entry_state",
                         "entered" if active_cycle_mapping else "pending",
                     )
+            if execution_version == 8 and active_cycle_mapping:
+                repaired_v8_restart_strategy_ids = (
+                    self._repair_v8_restart_fabricated_active_cycle_pairs(
+                        payload,
+                        active_cycle_mapping,
+                    )
+                )
             added_strategy_ids = [
                 strategy_id
                 for strategy_id in STRATEGY_IDS
@@ -910,6 +1028,13 @@ class TaifexVolatilitySimulation:
                         "after_twd": dict(TXO_RISK_MARGIN_TWD_2026_08_13),
                         "positions_and_pnl_preserved": True,
                     }
+                if repaired_v8_restart_strategy_ids:
+                    event["repaired_v8_restart_strategy_ids"] = (
+                        repaired_v8_restart_strategy_ids
+                    )
+                    event["repair_source"] = (
+                        "active_cycle_pair_vs_immutable_ideal_trade_ledger"
+                    )
                 _append_jsonl(self.events_path, event)
             return payload
         today = datetime.now(TAIPEI).date()
@@ -2942,6 +3067,66 @@ class TaifexVolatilitySimulation:
             str(row.get("source_sha256", "")),
         )
 
+    def _settle_expired_positions_for_subscription_bootstrap(
+        self,
+        now: datetime,
+    ) -> None:
+        """Cash-settle expired state before current-contract subscription checks."""
+
+        if now.tzinfo is None:
+            raise ValueError("subscription bootstrap time must be timezone-aware")
+        observed_now = now.astimezone(TAIPEI)
+        decision_ns = time.time_ns()
+        held_before = held_option_codes(self.state)
+        try:
+            self._maybe_settle_expired_put_call_parity(observed_now, decision_ns)
+            self._maybe_settle_expired_cycle(observed_now, decision_ns)
+        except Exception as exc:
+            self.state["engine_status"] = "blocked_subscription_bootstrap_settlement"
+            self.state["blocked_reason"] = (
+                "subscription_bootstrap_settlement_failed:"
+                f"{type(exc).__name__}:{exc}"
+            )
+            self._persist_state()
+            raise
+
+        trading_date = taifex_trading_date(observed_now)
+        pending_expiries: list[str] = []
+        cycle = self.state.get("active_cycle")
+        if isinstance(cycle, Mapping):
+            expiry = date.fromisoformat(str(cycle["expiry_date"]))
+            if expiry < trading_date:
+                pending_expiries.append(f"weekly_cycle:{expiry.isoformat()}")
+        parity_state = self.state.get("put_call_parity_tx") or {}
+        parity_position = parity_state.get("open_position")
+        if isinstance(parity_position, Mapping):
+            expiry = date.fromisoformat(str(parity_position["expiry_date"]))
+            if expiry < trading_date:
+                pending_expiries.append(f"put_call_parity_tx:{expiry.isoformat()}")
+        if pending_expiries:
+            reason = str(self.state.get("blocked_reason") or "")
+            if not reason:
+                reason = "expired_positions_remain:" + ",".join(pending_expiries)
+            self.state["engine_status"] = "blocked_subscription_bootstrap_settlement"
+            self.state["blocked_reason"] = reason
+            self._persist_state()
+            raise RuntimeError(reason)
+
+        held_after = held_option_codes(self.state)
+        if held_after != held_before:
+            _append_jsonl(
+                self.events_path,
+                {
+                    "event": "subscription_bootstrap_expired_positions_settled",
+                    "at_utc": _now_iso(),
+                    "trading_date": trading_date.isoformat(),
+                    "held_option_codes_before": list(held_before),
+                    "held_option_codes_after": list(held_after),
+                    "official_settlement_only": True,
+                },
+            )
+        self._persist_state()
+
     def _maybe_settle_expired_cycle(self, now: datetime, decision_ns: int) -> None:
         cycle = self.state.get("active_cycle")
         if not cycle:
@@ -3192,11 +3377,10 @@ class TaifexVolatilitySimulation:
             sum(underlying_book) / 2.0 if underlying_book is not None else None
         )
         option_metadata = ledger.get("option_position_metadata") or {}
-        option_books_valid = (
-            not option_positions
-            if strategy_id == PUT_CALL_PARITY_TX_STRATEGY_ID
-            else cycle is None and not option_positions
-        )
+        # A flat ledger has an exact zero liquidation value even while another
+        # catalogue strategy already owns the active cycle.  It must not depend
+        # on an option quote until it actually acquires a position.
+        option_books_valid = not option_positions
         if (cycle or parity_position) and ledger.get("entry_state") in {
             "entered",
             "forced_flat",

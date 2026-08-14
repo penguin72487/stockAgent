@@ -34,6 +34,8 @@ except ModuleNotFoundError:  # Direct execution from scripts/.
         MANIFEST_SOURCE_CAP_LIMITS,
     )
 
+from stockagent.live.openbb_archive_dashboard import project_openbb_history_row
+
 
 ACCEPTED_STATUSES = frozenset({"success", "empty"})
 FRED_RELEASE_PAGE_SIZE = 1000
@@ -4012,11 +4014,23 @@ def run(argv: Sequence[str] | None = None) -> int:
             _atomic_write_json(state_dir / "audit_latest.json", status)
     if args.append_history:
         history = state_dir / "monitor_history.jsonl"
+        dashboard_history = state_dir / "monitor_dashboard_history.jsonl"
         history.parent.mkdir(parents=True, exist_ok=True)
         with history.open("a", encoding="utf-8") as handle:
             handle.write(
                 json.dumps(status, ensure_ascii=False, separators=(",", ":")) + "\n"
             )
+        dashboard_row = project_openbb_history_row(status)
+        if dashboard_row:
+            with dashboard_history.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    json.dumps(
+                        dashboard_row,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                    + "\n"
+                )
     if args.field:
         value = status.get(args.field)
         if isinstance(value, (dict, list)):

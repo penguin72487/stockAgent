@@ -1,12 +1,30 @@
 "use strict";
 
-const REFRESH_MS = 10000;
+const REFRESH_MS = 60000;
 const SVG_NS = "http://www.w3.org/2000/svg";
+const TIME_RANGES = {"1h": 3600e3, "1d": 86400e3, "1w": 7 * 86400e3, "1mo": 30 * 86400e3, "1q": 90 * 86400e3, "1y": 365 * 86400e3, all: Infinity};
+const TIME_RANGE_LABELS = {"1h": "1 小時", "1d": "1 天", "1w": "1 週", "1mo": "1 月", "1q": "1 季", "1y": "1 年", all: "全部"};
+const HIDDEN_TRAFFIC_SERIES_STORAGE_KEY = "shioaji-hidden-traffic-series";
 const $ = (id) => document.getElementById(id);
 let latestPipelines = [];
 let activeFilter = "all";
 let refreshInFlight = false;
 let lastHeavyRevision = "";
+let trafficTimeRange = "1d";
+let storageTimeRange = "1mo";
+let latestTrafficHistory = [];
+let latestTrafficGuard = 0.9;
+let latestStorageGrowth = [];
+let hiddenTrafficSeries = new Set();
+
+try {
+  trafficTimeRange = localStorage.getItem("shioaji-traffic-time-range") || "1d";
+  storageTimeRange = localStorage.getItem("shioaji-storage-time-range") || "1mo";
+  const storedHiddenSeries = JSON.parse(localStorage.getItem(HIDDEN_TRAFFIC_SERIES_STORAGE_KEY) || "[]");
+  if (Array.isArray(storedHiddenSeries)) hiddenTrafficSeries = new Set(storedHiddenSeries.map(String));
+} catch (_error) { /* storage can be disabled */ }
+if (!(trafficTimeRange in TIME_RANGES)) trafficTimeRange = "1d";
+if (!(storageTimeRange in TIME_RANGES)) storageTimeRange = "1mo";
 
 function number(value, digits = 0) {
   if (value == null || value === "") return "—";
@@ -31,6 +49,12 @@ function bytes(value) {
   return `${amount.toLocaleString("zh-TW", {maximumFractionDigits: amount >= 100 ? 0 : 2})} ${units[unit]}`;
 }
 
+function signedBytes(value) {
+  if (value == null || value === "" || !Number.isFinite(Number(value))) return "—";
+  const parsed = Number(value);
+  return `${parsed > 0 ? "+" : parsed < 0 ? "−" : ""}${bytes(Math.abs(parsed))}`;
+}
+
 function percent(value, digits = 1) {
   if (value == null || value === "") return "—";
   const parsed = Number(value);
@@ -50,6 +74,20 @@ function localTime(value, options = {}) {
   const parsed = new Date(value);
   if (!value || Number.isNaN(parsed.getTime())) return "—";
   return parsed.toLocaleString("zh-TW", {timeZone: "Asia/Taipei", hour12: false, ...options});
+}
+
+function trailingRange(rows, rangeKey, timestampOf) {
+  const timed = (Array.isArray(rows) ? rows : []).map((row) => [row, timestampOf(row)]).filter((item) => Number.isFinite(item[1]));
+  if (!timed.length || rangeKey === "all") return timed.map((item) => item[0]);
+  const anchor = Math.max(...timed.map((item) => item[1]));
+  const cutoff = anchor - TIME_RANGES[rangeKey];
+  return timed.filter((item) => item[1] >= cutoff).map((item) => item[0]);
+}
+
+function syncTimeRangeControl(id, selected) {
+  $(id).querySelectorAll("button[data-range]").forEach((button) => {
+    button.setAttribute("aria-pressed", String(button.dataset.range === selected));
+  });
 }
 
 function setText(id, value) { $(id).textContent = value; }
@@ -193,11 +231,30 @@ function svgNode(name, attrs = {}, text = null) {
   return node;
 }
 
+function syncTrafficLegend() {
+  document.querySelectorAll("#traffic-legend button[data-series]").forEach((button) => {
+    const visible = !hiddenTrafficSeries.has(button.dataset.series);
+    button.classList.toggle("is-hidden", !visible);
+    button.setAttribute("aria-pressed", String(visible));
+    button.setAttribute("aria-label", `${visible ? "隱藏" : "顯示"}${button.textContent.trim()}曲線`);
+  });
+}
+
 function renderTrafficChart(history, guardFraction) {
   const svg = $("traffic-chart");
   while (svg.lastChild && !["title", "desc"].includes(svg.lastChild.localName)) svg.lastChild.remove();
-  const rows = Array.isArray(history) ? history.filter((row) => Number(row.limit_bytes) > 0) : [];
-  $("chart-empty").hidden = rows.length > 1;
+  latestTrafficHistory = Array.isArray(history) ? history : [];
+  latestTrafficGuard = guardFraction;
+  const rows = trailingRange(latestTrafficHistory, trafficTimeRange, (row) => new Date(row.observed_at_utc || "").getTime()).filter((row) => Number(row.limit_bytes) > 0);
+  const usageVisible = !hiddenTrafficSeries.has("usage");
+  const guardVisible = !hiddenTrafficSeries.has("guard");
+  const allHidden = !usageVisible && !guardVisible;
+  const chartEmpty = $("chart-empty");
+  chartEmpty.textContent = allHidden
+    ? "所有曲線已隱藏；點選圖例色點可重新顯示。"
+    : "累積兩筆觀測後會畫出趨勢；目前仍會顯示最新用量。";
+  chartEmpty.hidden = allHidden ? false : !(usageVisible && rows.length <= 1);
+  syncTrafficLegend();
   const width = 960, height = 300, left = 58, right = 22, top = 18, bottom = 42;
   const plotWidth = width - left - right, plotHeight = height - top - bottom;
   [0, 0.5, 1].forEach((ratio) => {
@@ -206,26 +263,31 @@ function renderTrafficChart(history, guardFraction) {
     svg.append(svgNode("text", {x: left - 12, y: y + 4, class: "axis-label", "text-anchor": "end"}, `${ratio * 100}%`));
   });
   const guard = Number.isFinite(Number(guardFraction)) ? Number(guardFraction) : 0.9;
-  const guardY = top + (1 - guard) * plotHeight;
-  svg.append(svgNode("line", {x1: left, y1: guardY, x2: width - right, y2: guardY, class: "guard-line"}));
-  svg.append(svgNode("text", {x: width - right, y: guardY - 8, class: "guard-label", "text-anchor": "end"}, `安全上限 ${percent(guard, 0)}`));
-  if (!rows.length) return;
+  if (guardVisible) {
+    const guardY = top + (1 - guard) * plotHeight;
+    svg.append(svgNode("line", {x1: left, y1: guardY, x2: width - right, y2: guardY, class: "guard-line"}));
+    svg.append(svgNode("text", {x: width - right, y: guardY - 8, class: "guard-label", "text-anchor": "end"}, `安全上限 ${percent(guard, 0)}`));
+  }
+  if (!rows.length) { setText("traffic-range-note", `${TIME_RANGE_LABELS[trafficTimeRange]}內沒有保留觀測。`); return; }
   const points = rows.map((row, index) => {
     const x = rows.length === 1 ? left + plotWidth : left + (index / (rows.length - 1)) * plotWidth;
     const ratio = Math.min(1, Math.max(0, Number(row.used_bytes) / Number(row.limit_bytes)));
     return [x, top + (1 - ratio) * plotHeight, ratio];
   });
-  const linePath = points.map((point, index) => `${index ? "L" : "M"}${point[0].toFixed(2)},${point[1].toFixed(2)}`).join(" ");
-  const areaPath = `${linePath} L${points.at(-1)[0]},${height - bottom} L${points[0][0]},${height - bottom} Z`;
-  svg.append(svgNode("path", {d: areaPath, class: "usage-area"}));
-  svg.append(svgNode("path", {d: linePath, class: "usage-line"}));
-  const latest = points.at(-1);
-  svg.append(svgNode("circle", {cx: latest[0], cy: latest[1], r: 5, class: "usage-point"}));
-  svg.append(svgNode("text", {x: latest[0] - 8, y: latest[1] - 12, class: "latest-label", "text-anchor": "end"}, percent(latest[2], 1)));
+  if (usageVisible) {
+    const linePath = points.map((point, index) => `${index ? "L" : "M"}${point[0].toFixed(2)},${point[1].toFixed(2)}`).join(" ");
+    const areaPath = `${linePath} L${points.at(-1)[0]},${height - bottom} L${points[0][0]},${height - bottom} Z`;
+    svg.append(svgNode("path", {d: areaPath, class: "usage-area"}));
+    svg.append(svgNode("path", {d: linePath, class: "usage-line"}));
+    const latest = points.at(-1);
+    svg.append(svgNode("circle", {cx: latest[0], cy: latest[1], r: 5, class: "usage-point"}));
+    svg.append(svgNode("text", {x: latest[0] - 8, y: latest[1] - 12, class: "latest-label", "text-anchor": "end"}, percent(latest[2], 1)));
+  }
   const firstTime = localTime(rows[0].observed_at_utc, {hour: "2-digit", minute: "2-digit"});
   const lastTime = localTime(rows.at(-1).observed_at_utc, {hour: "2-digit", minute: "2-digit"});
   svg.append(svgNode("text", {x: left, y: height - 12, class: "axis-label"}, firstTime));
   svg.append(svgNode("text", {x: width - right, y: height - 12, class: "axis-label", "text-anchor": "end"}, lastTime));
+  setText("traffic-range-note", `${TIME_RANGE_LABELS[trafficTimeRange]} · ${localTime(rows[0].observed_at_utc)} ～ ${localTime(rows.at(-1).observed_at_utc)} · ${number(rows.length)} 點；超出來源保留期的區間不會補造資料。`);
 }
 
 function appendCell(row, value, className = "") {
@@ -312,10 +374,11 @@ function renderTrafficBreakdown(rows) {
 function renderStorageGrowthChart(rows) {
   const svg = $("storage-growth-chart");
   while (svg.lastChild && !["title", "desc"].includes(svg.lastChild.localName)) svg.lastChild.remove();
-  const items = Array.isArray(rows) ? rows.filter((row) => Number.isFinite(Number(row.bytes))) : [];
+  latestStorageGrowth = Array.isArray(rows) ? rows : [];
+  const items = trailingRange(latestStorageGrowth, storageTimeRange, (row) => new Date(`${row.date || ""}T00:00:00+08:00`).getTime()).filter((row) => Number.isFinite(Number(row.bytes)));
   const maximum = Math.max(0, ...items.map((row) => Number(row.bytes)));
   $("storage-chart-empty").hidden = items.length > 0 && maximum > 0;
-  if (!items.length || maximum <= 0) return;
+  if (!items.length || maximum <= 0) { setText("storage-range-note", `${TIME_RANGE_LABELS[storageTimeRange]}內沒有完整日成長資料。`); return; }
   const width = 960, height = 300, left = 72, right = 18, top = 20, bottom = 44;
   const plotWidth = width - left - right, plotHeight = height - top - bottom;
   [0, 0.5, 1].forEach((ratio) => {
@@ -337,6 +400,7 @@ function renderStorageGrowthChart(rows) {
   });
   svg.append(svgNode("text", {x: left, y: height - 13, class: "axis-label"}, items[0].date || "—"));
   svg.append(svgNode("text", {x: width - right, y: height - 13, class: "axis-label", "text-anchor": "end"}, items.at(-1).date || "—"));
+  setText("storage-range-note", `${TIME_RANGE_LABELS[storageTimeRange]} · ${items[0].date || "—"} ～ ${items.at(-1).date || "—"} · ${number(items.length)} 日；來源目前保留的完整日才會顯示。`);
 }
 
 function renderStorageBars(datasets, totalBytes) {
@@ -397,8 +461,15 @@ function renderStorage(storage, renderHeavy) {
   setText("storage-files", `${number(summary.files)} 個實體檔案 · ${number(summary.datasets)} 個群組`);
   setText("storage-source", bytes(summary.source_bytes));
   setText("storage-derived", bytes(summary.derived_bytes));
-  setText("storage-growth", bytes(summary.average_daily_growth_bytes));
-  setText("storage-growth-window", `近 ${number(summary.growth_window_days)} 日共 ${bytes(summary.growth_window_bytes)}`);
+  const hasObservedGrowth = Number(summary.observed_growth_days || 0) >= 7
+    && Number.isFinite(Number(summary.observed_average_daily_net_growth_bytes));
+  setText("storage-growth-label", hasObservedGrowth ? "實測日均淨成長" : "mtime 日均變動量");
+  setText("storage-growth", hasObservedGrowth
+    ? signedBytes(summary.observed_average_daily_net_growth_bytes)
+    : bytes(summary.average_daily_growth_bytes));
+  setText("storage-growth-window", hasObservedGrowth
+    ? `${number(summary.observed_growth_days)} 個完整日的每日總量快照`
+    : `樣本未滿 7 日；近 ${number(summary.growth_window_days)} 日變動檔案共 ${bytes(summary.growth_window_bytes)}`);
   setText("storage-free", bytes(summary.disk_free_bytes));
   setText("storage-disk-ratio", `磁碟已使用 ${percent(summary.disk_used_ratio, 1)} · 總容量 ${bytes(summary.disk_total_bytes)}`);
   setText("storage-days", storageDaysLabel(summary.estimated_days_remaining));
@@ -490,7 +561,7 @@ function render(data) {
   setText("traffic-remaining", bytes(traffic.remaining_bytes));
   setText("traffic-safe-remaining", bytes(traffic.safe_remaining_bytes));
   setText("traffic-reset", traffic.reset_policy || "—");
-  setText("traffic-price", "無逐次資料費");
+  setText("traffic-price", traffic.pricing_evidence_label || "未取得費用欄位");
   setText("traffic-tier", bytes(traffic.limit_bytes));
   setText("traffic-attributed", bytes(traffic.attributed_bytes));
   setText("traffic-unattributed", bytes(traffic.unattributed_bytes));
@@ -537,7 +608,7 @@ async function refresh() {
   if (document.hidden || refreshInFlight) return;
   refreshInFlight = true;
   try {
-    const response = await fetch("api/status", {cache: "default"});
+    const response = await fetch("api/status", {cache: "no-store"});
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     render(await response.json());
   } catch (_error) {
@@ -562,5 +633,33 @@ document.querySelectorAll(".filter").forEach((button) => {
     renderPipelines(latestPipelines);
   });
 });
+$("traffic-time-range").addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-range]");
+  if (!button || !(button.dataset.range in TIME_RANGES)) return;
+  trafficTimeRange = button.dataset.range;
+  try { localStorage.setItem("shioaji-traffic-time-range", trafficTimeRange); } catch (_error) { /* optional */ }
+  syncTimeRangeControl("traffic-time-range", trafficTimeRange);
+  renderTrafficChart(latestTrafficHistory, latestTrafficGuard);
+});
+$("traffic-legend").addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-series]");
+  if (!button) return;
+  const seriesId = button.dataset.series;
+  if (hiddenTrafficSeries.has(seriesId)) hiddenTrafficSeries.delete(seriesId);
+  else hiddenTrafficSeries.add(seriesId);
+  try { localStorage.setItem(HIDDEN_TRAFFIC_SERIES_STORAGE_KEY, JSON.stringify([...hiddenTrafficSeries])); } catch (_error) { /* optional */ }
+  renderTrafficChart(latestTrafficHistory, latestTrafficGuard);
+});
+$("storage-time-range").addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-range]");
+  if (!button || !(button.dataset.range in TIME_RANGES)) return;
+  storageTimeRange = button.dataset.range;
+  try { localStorage.setItem("shioaji-storage-time-range", storageTimeRange); } catch (_error) { /* optional */ }
+  syncTimeRangeControl("storage-time-range", storageTimeRange);
+  renderStorageGrowthChart(latestStorageGrowth);
+});
+syncTimeRangeControl("traffic-time-range", trafficTimeRange);
+syncTimeRangeControl("storage-time-range", storageTimeRange);
+syncTrafficLegend();
 void refresh();
 window.setInterval(() => void refresh(), REFRESH_MS);

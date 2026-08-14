@@ -142,8 +142,11 @@ def _stock_mark(
     sell_rate: float,
     fee_schedule: Any,
     source: str,
+    corporate_action_factor: float,
+    corporate_actions: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    liquidation_notional = quantity * mark_price
+    adjusted_quantity = quantity * corporate_action_factor
+    liquidation_notional = adjusted_quantity * mark_price
     commission, tax = TwDayTradeSimulationEngine._stock_benchmark_order_cost(
         notional=liquidation_notional,
         commission_rate=buy_rate,
@@ -151,9 +154,7 @@ def _stock_mark(
         fee_schedule=fee_schedule,
     )
     initial_capital = quantity * entry_price
-    net_pnl = (
-        quantity * (mark_price - entry_price) - entry_fee - commission - tax
-    )
+    net_pnl = liquidation_notional - initial_capital - entry_fee - commission - tax
     total_equity = initial_capital + net_pnl
     row = _mark_base(
         benchmark_id=benchmark_id,
@@ -166,6 +167,7 @@ def _stock_mark(
             "benchmark_origin_session_date": entry_at.date().isoformat(),
             "symbol": symbol,
             "quantity": quantity,
+            "adjusted_quantity": adjusted_quantity,
             "entry_price": entry_price,
             "entry_at": entry_at.isoformat(timespec="seconds"),
             "initial_capital_twd": initial_capital,
@@ -181,9 +183,18 @@ def _stock_mark(
             "total_equity_twd": total_equity,
             "return_fraction": net_pnl / initial_capital,
             "return_pct": net_pnl / initial_capital * 100.0,
+            "total_return_contract": "official_ex_date_reference_reinvestment_v1",
+            "corporate_action_factor": corporate_action_factor,
+            "corporate_action_count": len(corporate_actions),
+            "last_corporate_action_date": (
+                corporate_actions[-1]["date"] if corporate_actions else None
+            ),
+            "corporate_action_coverage": True,
+            "corporate_action_status": "official_reference_complete",
+            "applied_corporate_actions": corporate_actions,
             "source": source,
             "valuation_source": (
-                "actual_session_open_entry_mark_at_recorded_bid_after_tw_cash_costs"
+                "total_return_units_marked_at_recorded_bid_after_tw_cash_costs"
             ),
         }
     )
@@ -301,6 +312,25 @@ def _iter_dates(start: date, end: date):
         current += timedelta(days=1)
 
 
+def _required_stock_adjustment(
+    engine: TwDayTradeSimulationEngine,
+    *,
+    symbol: str,
+    entry_at: datetime,
+    mark_date: date,
+) -> tuple[float, list[dict[str, Any]]]:
+    factor, actions, status = engine._stock_total_return_adjustment(
+        symbol=symbol,
+        entry_at=entry_at,
+        mark_date=mark_date,
+    )
+    if factor is None:
+        raise RuntimeError(
+            f"{symbol} corporate-action coverage failed at {mark_date}: {status}"
+        )
+    return factor, actions
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--state-dir", type=Path, required=True)
@@ -313,6 +343,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--stock-parquet-root",
         type=Path,
         default=Path("/srv/stockagent-live/data_tw_public/stocks"),
+    )
+    parser.add_argument(
+        "--corporate-action-reference",
+        type=Path,
+        default=Path(
+            "/srv/stockagent-live/data_tw_public/"
+            "tw_corporate_action_reference.parquet"
+        ),
     )
     parser.add_argument(
         "--fop-capture-root",
@@ -350,6 +388,14 @@ def main() -> None:
     if errors or not specs:
         raise RuntimeError(f"cannot resolve stock fee schedule: {errors}")
     fee_schedule = specs[0].fee_schedule
+    adjustment_engine = TwDayTradeSimulationEngine(state_dir)
+    corporate_action_path = args.corporate_action_reference.resolve()
+    adjustment_engine._load_corporate_actions(corporate_action_path)
+    if adjustment_engine._corporate_action_load_error is not None:
+        raise RuntimeError(
+            "corporate-action reference is required for total-return benchmarks: "
+            f"{adjustment_engine._corporate_action_load_error}"
+        )
     now = datetime.now(TAIPEI)
     current_open_path = state_dir / "replay_open_data" / f"{end.isoformat()}.parquet"
     current_opens = _current_open_rows(current_open_path, end)
@@ -363,6 +409,14 @@ def main() -> None:
         "current_open_path": str(current_open_path),
         "current_open_sha256": _sha256(current_open_path),
         "fop_capture_root": str(args.fop_capture_root.resolve()),
+        "corporate_action_reference_path": str(corporate_action_path),
+        "corporate_action_reference_sha256": _sha256(corporate_action_path),
+        "corporate_action_reference_summary_path": str(
+            corporate_action_path.with_suffix(".summary.json")
+        ),
+        "corporate_action_reference_summary_sha256": _sha256(
+            corporate_action_path.with_suffix(".summary.json")
+        ),
     }
 
     for benchmark_id, symbol, label, security_type in STOCK_BENCHMARKS:
@@ -394,6 +448,7 @@ def main() -> None:
             "initial_fixed_fees_twd": entry_fee,
             "initial_transaction_tax_twd": 0.0,
             "gross_pnl_multiplier": quantity,
+            "total_return_contract": "official_ex_date_reference_reinvestment_v1",
             "source": "official_daily_session_open",
             "live_origin": {
                 "entry_at": live.get("entry_at"),
@@ -414,6 +469,12 @@ def main() -> None:
                     raise ValueError(
                         f"retained same-session {symbol} open is unavailable for {trading_date}"
                     )
+                action_factor, actions = _required_stock_adjustment(
+                    adjustment_engine,
+                    symbol=symbol,
+                    entry_at=entry_at,
+                    mark_date=trading_date,
+                )
                 marks.append(
                     _stock_mark(
                         benchmark_id=benchmark_id,
@@ -431,6 +492,8 @@ def main() -> None:
                         sell_rate=sell_rate,
                         fee_schedule=fee_schedule,
                         source="retained_same_session_shioaji_snapshot_open",
+                        corporate_action_factor=action_factor,
+                        corporate_actions=actions,
                     )
                 )
                 continue
@@ -447,6 +510,12 @@ def main() -> None:
                     raise ValueError(
                         f"official {symbol} {price_key} is unavailable for {trading_date}"
                     )
+                action_factor, actions = _required_stock_adjustment(
+                    adjustment_engine,
+                    symbol=symbol,
+                    entry_at=entry_at,
+                    mark_date=trading_date,
+                )
                 marks.append(
                     _stock_mark(
                         benchmark_id=benchmark_id,
@@ -462,8 +531,31 @@ def main() -> None:
                         sell_rate=sell_rate,
                         fee_schedule=fee_schedule,
                         source=source,
+                        corporate_action_factor=action_factor,
+                        corporate_actions=actions,
                     )
                 )
+
+        live_entry_at = datetime.fromisoformat(str(live["entry_at"])).astimezone(
+            TAIPEI
+        )
+        pre_live_factor, pre_live_actions = _required_stock_adjustment(
+            adjustment_engine,
+            symbol=symbol,
+            entry_at=entry_at,
+            mark_date=live_entry_at.date(),
+        )
+        origins[benchmark_id]["corporate_action_factor_to_live_entry"] = (
+            pre_live_factor
+        )
+        origins[benchmark_id]["corporate_action_count_to_live_entry"] = len(
+            pre_live_actions
+        )
+        origins[benchmark_id]["corporate_action_coverage_end"] = (
+            adjustment_engine._corporate_action_coverage_end.isoformat()
+            if adjustment_engine._corporate_action_coverage_end is not None
+            else None
+        )
 
     live_tx = live_benchmarks[TX_CONTINUOUS_BENCHMARK_ID]
     contract_code = str(live_tx.get("contract_code") or "").strip().upper()
@@ -556,7 +648,8 @@ def main() -> None:
         "origin_contract": {
             "stocks": (
                 "one board lot entered at retained actual 09:00 open; official "
-                "close is used only for completed sessions"
+                "close is used only for completed sessions; official ex-date "
+                "reference factors reinvest cash distributions and adjust splits"
             ),
             "tx": (
                 "one real front-month TX entered at the first valid retained "
