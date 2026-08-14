@@ -121,7 +121,7 @@ def test_config_inherits_canonical_candles_baseline() -> None:
         16.0,
     ]
     assert config.trading.tw_index_futures_sell_transaction_tax_rate == pytest.approx(
-        0.0002
+        0.00002
     )
     assert config.trading.tw_index_futures_initial_capital == 100_000_000.0
     assert config.trading.tw_index_futures_data_path.endswith(

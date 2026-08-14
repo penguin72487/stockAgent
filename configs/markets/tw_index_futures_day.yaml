@@ -39,11 +39,11 @@ trading:
   min_trade_weight: 0.0
   portfolio_activation: pre_normalized
 
-  # Differentiable proxy: 0.45 bps fixed-cost approximation per side, plus the
-  # configured 2 bps sale tax in the sell-side rate. Exact evaluation below
-  # recomputes integer counts and TWD costs for every product/day.
-  buy_fee_rate: 0.000045
-  sell_fee_rate: 0.000245
+  # Differentiable proxy: 0.45 bps fixed-cost approximation plus the statutory
+  # 0.20 bps transaction tax per side. Exact evaluation below recomputes
+  # integer counts and TWD costs for every product/day.
+  buy_fee_rate: 0.000065
+  sell_fee_rate: 0.000065
 
   tw_index_futures_data_path: data_tw_index_futures/day_session_contracts.parquet
   tw_index_futures_reference_product: TX
@@ -57,8 +57,9 @@ trading:
   # the official exchange + clearing component.
   tw_index_futures_exchange_and_clearing_fee_per_side_twd: [20.0, 12.5, 8.0]
   tw_index_futures_total_fee_per_side_twd: [60.0, 24.0, 16.0]
-  # Charged once on the sale leg: close for a long, open for a short.
-  tw_index_futures_sell_transaction_tax_rate: 0.0002
+  # Statutory stock-index-futures tax per transaction.  Both opening and
+  # closing transactions are charged by the exact daily-flat executor.
+  tw_index_futures_sell_transaction_tax_rate: 0.00002
   tw_index_futures_slippage_points_per_side: [0.0, 0.0, 0.0]
   tw_index_futures_basket_fee_penalty: 1.0
 

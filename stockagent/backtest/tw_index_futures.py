@@ -24,13 +24,18 @@ from stockagent.data.tw_index_futures import (
 )
 
 
-# v4 charges the configured transaction tax on the sale leg only.  A long
-# round trip sells at the close; a short round trip sells at the open.  v3 and
-# earlier incorrectly charged both the buy and sell legs.
-TW_INDEX_FUTURES_DAY_BACKTEST_CONTRACT_VERSION: Final[int] = 4
-TW_INDEX_FUTURES_SELL_TAX_RATE: Final[float] = 0.0002
-# Compatibility export.  The value is a sell-side rate, not a two-sided rate.
-TW_INDEX_FUTURES_TAX_RATE: Final[float] = TW_INDEX_FUTURES_SELL_TAX_RATE
+# v5 applies the statutory stock-index-futures rate to every transaction.  A
+# daily-flat round trip has an opening and a closing transaction, irrespective
+# of direction.  The legacy config field still contains ``sell`` in its name,
+# but the value is now interpreted as the per-transaction rate.
+TW_INDEX_FUTURES_DAY_BACKTEST_CONTRACT_VERSION: Final[int] = 5
+TW_INDEX_FUTURES_TRANSACTION_TAX_RATE: Final[float] = 0.00002
+# Compatibility exports for downstream imports.  Both names now denote the
+# per-transaction rate, not a one-sided round-trip rate.
+TW_INDEX_FUTURES_SELL_TAX_RATE: Final[float] = (
+    TW_INDEX_FUTURES_TRANSACTION_TAX_RATE
+)
+TW_INDEX_FUTURES_TAX_RATE: Final[float] = TW_INDEX_FUTURES_TRANSACTION_TAX_RATE
 # Current TAIFEX exchange + clearing charges per contract per side.  A broker's
 # negotiated commission is separate and defaults to zero below.
 TAIFEX_FIXED_FEES_PER_SIDE_TWD: Final[dict[str, float]] = {
@@ -42,9 +47,9 @@ TAIFEX_FIXED_FEES_PER_SIDE_TWD: Final[dict[str, float]] = {
 
 @dataclass(frozen=True, slots=True)
 class FuturesCostSchedule:
-    # Tax applies only when a contract is sold.  Fixed fees and slippage remain
-    # per side and are therefore incurred twice for a daily-flat round trip.
-    tax_rate: float = TW_INDEX_FUTURES_SELL_TAX_RATE
+    # Tax, fixed fees, and slippage apply to both transactions in a daily-flat
+    # round trip. ``tax_rate`` is the statutory per-transaction rate.
+    tax_rate: float = TW_INDEX_FUTURES_TRANSACTION_TAX_RATE
     exchange_and_clearing_fee_per_side_twd: tuple[float, ...] = (20.0, 12.5, 8.0)
     broker_fee_per_side_twd: tuple[float, ...] = (0.0, 0.0, 0.0)
     slippage_points_per_side: tuple[float, ...] = (0.0, 0.0, 0.0)
@@ -340,13 +345,14 @@ def select_tw_index_futures_contract_basket(
             continue
         fixed_round_trip = float(np.dot(counts, fixed * 2.0))
         # Direction and closing prices are not known while choosing the basket
-        # at the open.  Use one opening sale-notional tax as the symmetric
-        # sizing estimate; the ledger below recomputes the exact long/short
-        # sale price.
+        # at the open.  Use twice the opening notional as the round-trip tax
+        # estimate; the ledger below replaces the second leg with its actual
+        # close price.
         tax_round_trip = float(
             np.dot(
                 counts,
-                np.where(valid, notionals, 0.0) * float(schedule.tax_rate),
+                np.where(valid, notionals, 0.0)
+                * (2.0 * float(schedule.tax_rate)),
             )
         )
         slippage_round_trip = float(np.dot(counts, slippage * multipliers * 2.0))
@@ -503,13 +509,12 @@ def run_tw_index_futures_day_integer(
         fees = float(
             np.dot(active_absolute_counts, fixed_per_side[active] * 2.0)
         )
-        # Long: buy open, sell close. Short: sell open, buy close. Transaction
-        # tax is charged exactly once, on the actual sale leg.
-        sale_prices = np.where(active_counts > 0.0, active_closes, active_opens)
+        # Opening and closing are separate taxable transactions for both long
+        # and short daily-flat positions.
         tax = float(
             np.dot(
                 active_absolute_counts * active_multipliers,
-                sale_prices * float(schedule.tax_rate),
+                (active_opens + active_closes) * float(schedule.tax_rate),
             )
         )
         slip = float(
@@ -564,6 +569,7 @@ __all__ = [
     "TW_INDEX_FUTURES_DAY_BACKTEST_CONTRACT_VERSION",
     "TW_INDEX_FUTURES_SELL_TAX_RATE",
     "TW_INDEX_FUTURES_TAX_RATE",
+    "TW_INDEX_FUTURES_TRANSACTION_TAX_RATE",
     "run_tw_index_futures_day_continuous",
     "run_tw_index_futures_day_integer",
     "select_tw_index_futures_contract_basket",
