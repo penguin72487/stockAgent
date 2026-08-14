@@ -22,11 +22,7 @@ from stockagent.live.tw_day_trade_dashboard import (
     build_dashboard_summary,
 )
 from stockagent.live.tw_day_trade_simulation import (
-    DAY_TRADE_SHORTFALL_BORROW_FEE_RATE,
-    DAY_TRADE_SHORTFALL_HANDLING_FEE_FRACTION,
     LiveEligibility,
-    MARGIN_FINANCING_ANNUAL_RATE,
-    MARGIN_FINANCING_RATIO,
     ModeSpec,
     TwDayTradeSimulationEngine,
     load_live_eligibility,
@@ -113,6 +109,37 @@ def test_runner_offsets_all_four_existing_modes_without_adding_a_fifth() -> None
     assert set(live_configs) == expected
     assert all(spec.signal_market is None for spec in specs)
     assert all(spec.price_limit_offset_ticks == 1 for spec in specs)
+
+
+def test_runner_keeps_quote_polling_for_post_close_terminal_catch_up() -> None:
+    from scripts.run_tw_day_trade_simulation import _active_quote_due
+
+    observed = _now(13, 35)
+    minute_key = observed.replace(second=0, microsecond=0).isoformat(
+        timespec="minutes"
+    )
+    assert _active_quote_due(
+        ["2330"], observed=observed, last_quote_minute=None
+    )
+    assert not _active_quote_due(
+        ["2330"], observed=observed, last_quote_minute=minute_key
+    )
+    assert not _active_quote_due([], observed=observed, last_quote_minute=None)
+
+    force_exit = _now(13, 24, 20)
+    force_minute = force_exit.replace(second=0, microsecond=0).isoformat(
+        timespec="minutes"
+    )
+    assert _active_quote_due(
+        ["2330"], observed=force_exit, last_quote_minute=force_minute
+    )
+    auction = _now(13, 25, 20)
+    auction_minute = auction.replace(second=0, microsecond=0).isoformat(
+        timespec="minutes"
+    )
+    assert not _active_quote_due(
+        ["2330"], observed=auction, last_quote_minute=auction_minute
+    )
 
 
 def _eligibility() -> dict[str, LiveEligibility]:
@@ -1009,8 +1036,105 @@ def test_1324_market_then_1325_limit_rod_and_1330_auction_fill(tmp_path: Path) -
     assert [row["quantity"] for row in exit_fills] == [1_000, 2_000]
 
 
+def test_1324_retries_market_until_1325_without_reusing_minute_capacity(
+    tmp_path: Path,
+) -> None:
+    spec = _spec(tmp_path)
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+    engine.register_signal(
+        spec=spec,
+        summary=_summary(),
+        signal_rows=[_row(0.3)],
+        quotes={"2330": _quote(ask_volume=3.0)},
+        eligibility=_eligibility(),
+        eligibility_coverage={},
+        now=_now(9, 1, 7),
+    )
+    position = next(iter(engine.state["modes"][spec.market]["positions"].values()))
+    marks_before = len(engine.marks_path.read_text().splitlines())
+
+    force_quote = _quote(
+        bid=1_004.0,
+        ask=1_006.0,
+        bid_volume=1.0,
+        minute_volume_lots=4.0,
+    )
+    engine.process_quotes(quotes={"2330": force_quote}, now=_now(13, 24, 1))
+    assert position["signed_shares"] == 2_000
+    engine.process_quotes(
+        quotes={"2330": force_quote},
+        now=_now(13, 24, 20),
+        append_mark_history=False,
+    )
+    assert position["signed_shares"] == 1_000
+    engine.process_quotes(
+        quotes={"2330": force_quote},
+        now=_now(13, 24, 40),
+        append_mark_history=False,
+    )
+    assert position["signed_shares"] == 1_000
+    assert position["force_exit_minute_capacity_shares"] == 2_000
+    assert position["force_exit_minute_consumed_shares"] == 2_000
+    assert len(engine.marks_path.read_text().splitlines()) == marks_before + 1
+
+    engine.process_quotes(quotes={"2330": force_quote}, now=_now(13, 25))
+    assert position["closing_auction_order_status"] == "working"
+    assert position["closing_auction_limit_price"] == 900.0
+    auction_order = next(
+        row
+        for row in (
+            json.loads(line) for line in engine.orders_path.read_text().splitlines()
+        )
+        if row["purpose"] == "13_25_closing_auction_force_exit"
+    )
+    assert auction_order["side"] == "sell"
+    assert auction_order["price"] == 900.0
+    assert auction_order["quantity"] == 1_000
+
+
+def test_1325_short_cover_uses_upper_limit_in_call_auction(tmp_path: Path) -> None:
+    spec = _spec(tmp_path)
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+    engine.register_signal(
+        spec=spec,
+        summary=_summary(),
+        signal_rows=[_row(-0.1)],
+        quotes={"2330": _quote()},
+        eligibility=_eligibility(),
+        eligibility_coverage={},
+        now=_now(9, 1, 7),
+    )
+    position = next(iter(engine.state["modes"][spec.market]["positions"].values()))
+
+    engine.process_quotes(
+        quotes={
+            "2330": _quote(
+                bid=998.0,
+                ask=1_000.0,
+                bid_volume=0.0,
+                ask_volume=0.0,
+                minute_volume_lots=0.0,
+            )
+        },
+        now=_now(13, 25),
+    )
+
+    assert position["signed_shares"] == -1_000
+    assert position["closing_auction_order_status"] == "working"
+    assert position["closing_auction_limit_price"] == 1_100.0
+    auction_order = next(
+        row
+        for row in (
+            json.loads(line) for line in engine.orders_path.read_text().splitlines()
+        )
+        if row["purpose"] == "13_25_closing_auction_force_exit"
+    )
+    assert auction_order["side"] == "buy_to_cover"
+    assert auction_order["price"] == 1_100.0
+
+
 @pytest.mark.parametrize("target_weight", [0.1, -0.1])
-def test_1330_residual_is_reclassified_with_conservative_carry_cost(
+def test_1330_residual_is_terminally_flattened_without_exchange_fill_claim(
     tmp_path: Path,
     target_weight: float,
 ) -> None:
@@ -1039,27 +1163,120 @@ def test_1330_residual_is_reclassified_with_conservative_carry_cost(
         now=_now(13, 30),
     )
 
-    assert abs(position["signed_shares"]) == 1_000
-    if target_weight > 0:
-        assert position["carry_type"] == "margin_financing_long"
-        expected_principal = 1_000 * 1_000.0 * MARGIN_FINANCING_RATIO
-        assert position["financing_principal_twd"] == expected_principal
-        assert position["carry_cost_twd"] == pytest.approx(
-            expected_principal * MARGIN_FINANCING_ANNUAL_RATE / 365.0
-        )
-    else:
-        assert position["carry_type"] == "day_trade_securities_shortfall"
-        expected_borrow = (
-            1_000 * 1_000.0 * DAY_TRADE_SHORTFALL_BORROW_FEE_RATE
-        )
-        assert position["shortfall_borrow_fee_twd"] == expected_borrow
-        assert position["shortfall_handling_fee_twd"] == pytest.approx(
-            expected_borrow * DAY_TRADE_SHORTFALL_HANDLING_FEE_FRACTION
-        )
-        assert position["normal_sell_tax_adjustment_twd"] > 0.0
-    assert engine.state["modes"][spec.market]["engine_status"] == (
-        "critical_residual_carried_after_13_30"
+    mode = engine.state["modes"][spec.market]
+    assert position["signed_shares"] == 0
+    assert position["exit_reason"] == "13_30_terminal_ledger_flatten"
+    assert position["terminal_flatten_price_source"] == "observed_session_close"
+    assert position["terminal_flatten_simulation_only"] is True
+    assert position["closing_auction_order_status"] == (
+        "terminal_ledger_flattened"
     )
+    assert mode["open_position_count"] == 0
+    assert mode["force_exit_failures"] == 0
+    assert mode["terminal_flatten_count"] == 1
+    assert mode["engine_status"] == "session_flat_after_exit"
+    terminal_fill = next(
+        row
+        for row in (
+            json.loads(line) for line in engine.fills_path.read_text().splitlines()
+        )
+        if row["purpose"] == "13_30_terminal_ledger_flatten"
+    )
+    assert terminal_fill["synthetic_terminal_ledger"] is True
+    assert terminal_fill["fill_contract"] == (
+        "simulation_terminal_ledger_not_exchange_fill"
+    )
+
+
+def test_new_signal_resets_prior_session_closing_markers(tmp_path: Path) -> None:
+    spec = _spec(tmp_path)
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+    engine.update_readiness([spec], now=_now(8, 0))
+    mode = engine.state["modes"][spec.market]
+    prior = "2026-08-12T13:30:00+08:00"
+    mode["closing_auction_submitted_at"] = prior
+    mode["closing_auction_settled_at"] = prior
+    mode["residual_conversion_completed_at"] = prior
+    mode["force_exit_failures"] = 99
+
+    engine.register_signal(
+        spec=spec,
+        summary=_summary(),
+        signal_rows=[_row()],
+        quotes={"2330": _quote()},
+        eligibility=_eligibility(),
+        eligibility_coverage={},
+        now=_now(9, 1, 7),
+    )
+
+    mode = engine.state["modes"][spec.market]
+    assert mode["closing_auction_submitted_at"] is None
+    assert mode["closing_auction_settled_at"] is None
+    assert mode["residual_conversion_completed_at"] is None
+    assert mode["force_exit_failures"] == 0
+
+    # Persisted stale markers must also be harmless for a process that loads
+    # the current session after it has already accepted the signal.
+    mode["closing_auction_submitted_at"] = prior
+    mode["closing_auction_settled_at"] = prior
+    mode["residual_conversion_completed_at"] = prior
+    engine.process_quotes(
+        quotes={
+            "2330": _quote(
+                bid_volume=0.0,
+                ask_volume=0.0,
+                minute_volume_lots=0.0,
+            )
+        },
+        now=_now(13, 30),
+    )
+    assert mode["open_position_count"] == 0
+    assert str(mode["closing_auction_submitted_at"]).startswith("2026-08-13")
+    assert str(mode["closing_auction_settled_at"]).startswith("2026-08-13")
+    assert str(mode["residual_conversion_completed_at"]).startswith("2026-08-13")
+
+
+@pytest.mark.parametrize(
+    ("target_weight", "expected_price"),
+    [(0.1, 900.0), (-0.1, 1_100.0)],
+)
+def test_terminal_flatten_uses_adverse_limit_when_close_is_missing(
+    tmp_path: Path,
+    target_weight: float,
+    expected_price: float,
+) -> None:
+    spec = _spec(tmp_path)
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+    engine.register_signal(
+        spec=spec,
+        summary=_summary(),
+        signal_rows=[_row(target_weight)],
+        quotes={"2330": _quote()},
+        eligibility=_eligibility(),
+        eligibility_coverage={},
+        now=_now(9, 1, 7),
+    )
+    position = next(iter(engine.state["modes"][spec.market]["positions"].values()))
+
+    engine.process_quotes(
+        quotes={
+            "2330": _quote(
+                bid_volume=0.0,
+                ask_volume=0.0,
+                minute_volume_lots=0.0,
+                last=None,
+            )
+        },
+        now=_now(13, 30),
+    )
+
+    mode = engine.state["modes"][spec.market]
+    assert position["signed_shares"] == 0
+    assert position["exit_price"] == expected_price
+    assert position["terminal_flatten_price_source"] == (
+        "adverse_daily_limit_fallback"
+    )
+    assert mode["terminal_flatten_degraded_count"] == 1
 
 
 def test_missing_mark_carries_same_position_equity_and_flags_stale(

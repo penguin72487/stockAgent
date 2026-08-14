@@ -60,6 +60,10 @@ def _fixture(tmp_path: Path, *, age_seconds: float = 2.0) -> tuple[Path, Path]:
             "broker_order_failures": 0,
             "inflight_order_count": 0,
             "underlying_contract": "TXFH6",
+            "underlying_product": "TX",
+            "underlying_multiplier_twd_per_point": 200.0,
+            "underlying_fee_per_side_twd": 60.0,
+            "underlying_initial_margin_per_contract_twd": 470_000.0,
             "hedge_contract": "MXFH6",
             "option_contract_count": 98,
             "latest_book_count": 100,
@@ -74,6 +78,29 @@ def _fixture(tmp_path: Path, *, age_seconds: float = 2.0) -> tuple[Path, Path]:
                 "account_id": "must-not-leak",
             },
             "pending_targets": {},
+            "put_call_parity_tx": {
+                "pending_signal": {
+                    "signal_decision_ts_ns": 123,
+                    "direction": "sell_rich_synthetic_buy_tx",
+                    "account_id": "must-not-leak",
+                },
+                "open_position": None,
+                "last_settled_expiry": None,
+                "blocked_expiry": None,
+                "monitor": {
+                    "state": "signal_pending_next_books",
+                    "direction": "sell_rich_synthetic_buy_tx",
+                    "expiry_date": "2026-08-19",
+                    "series": "202608",
+                    "strike": 45_000.0,
+                    "gross_locked_edge_twd": 24_000.0,
+                    "total_estimated_cost_twd": 840.0,
+                    "net_after_estimated_cost_twd": 23_160.0,
+                    "minimum_net_edge_twd": 0.0,
+                    "broker_submission": False,
+                    "private_path": "/must/not/leak",
+                },
+            },
             "strategies": marks,
         },
     )
@@ -141,7 +168,7 @@ def test_dashboard_snapshot_is_bounded_fresh_and_account_safe(tmp_path: Path) ->
         mark_limit_per_strategy=8,
     )
     assert payload["health"] == "active"
-    assert payload["dashboard_schema_version"] == 6
+    assert payload["dashboard_schema_version"] == 7
     assert payload["source_age_seconds"] == 2.0
     assert payload["market"]["book_coverage_ratio"] == 1.0
     assert payload["market"]["strategy_fresh_valuation_coverage_ratio"] == 1.0
@@ -149,7 +176,7 @@ def test_dashboard_snapshot_is_bounded_fresh_and_account_safe(tmp_path: Path) ->
     assert payload["market"]["strategy_fresh_valuation_count"] == 2
     assert payload["market"]["held_option_subscription_coverage_ratio"] == 1.0
     assert len(payload["strategies"]) == 2
-    assert payload["strategy_counts"]["live_ideal"] == 53
+    assert payload["strategy_counts"]["live_ideal"] == 54
     assert payload["strategy_counts"]["blocked_contract"] >= 1
     assert (
         len(payload["strategy_catalog"]) == payload["strategy_counts"]["catalog_total"]
@@ -182,6 +209,18 @@ def test_dashboard_snapshot_is_bounded_fresh_and_account_safe(tmp_path: Path) ->
     assert payload["catalog_expansion_entry_policy"] is None
     assert payload["current_trading_date"] == "2026-08-13"
     assert payload["night_flatten_time"] == "04:55:00"
+    assert payload["market"]["underlying_product"] == "TX"
+    assert payload["put_call_parity_tx"]["state"] == (
+        "signal_pending_next_books"
+    )
+    assert payload["put_call_parity_tx"]["net_after_estimated_cost_twd"] == (
+        23_160.0
+    )
+    assert payload["put_call_parity_tx"]["pending_signal"] == {
+        "direction": "sell_rich_synthetic_buy_tx",
+        "signal_decision_ts_ns": 123,
+    }
+    assert "private_path" not in payload["put_call_parity_tx"]
     first = payload["strategies"][0]
     assert first["reserved_capital_twd"] == 1_000.0
     assert first["one_unit_net_pnl_twd"] == 125.0
@@ -395,6 +434,7 @@ def test_dashboard_html_is_local_and_refreshes_the_read_only_api() -> None:
     root = Path(__file__).resolve().parents[1] / "services" / "taifex_dashboard"
     html = (root / "index.html").read_text(encoding="utf-8")
     javascript = (root / "app.js").read_text(encoding="utf-8")
+    stylesheet = (root / "styles.css").read_text(encoding="utf-8")
     assert "http://" not in html
     external_links = re.findall(r'href="(https://[^"]+)"', html)
     assert external_links == [
@@ -402,8 +442,11 @@ def test_dashboard_html_is_local_and_refreshes_the_read_only_api() -> None:
     ]
     assert 'fetch("api/status"' in javascript
     assert 'fetch("api/history"' in javascript
-    assert "window.setInterval(refresh, REFRESH_MS)" in javascript
-    assert "window.setInterval(refreshHistory, 60000)" in javascript
+    assert "const PRICE_REFRESH_MS = 60000" in javascript
+    assert "function refreshMinuteSnapshot()" in javascript
+    assert "window.setInterval(refreshMinuteSnapshot, PRICE_REFRESH_MS)" in javascript
+    assert javascript.count("window.setInterval(") == 1
+    assert "const REFRESH_MS = 5000" not in javascript
     assert "row.total_equity_twd" in javascript
     assert "row.total_equity_twd != null" in javascript
     assert "CARRIED" in javascript
@@ -432,9 +475,23 @@ def test_dashboard_html_is_local_and_refreshes_the_read_only_api() -> None:
     assert "row.design_option_ratio_label" in javascript
     assert "compounded_return_to_live_mark" in javascript
     assert 'return {label: "資料逾時", state: "blocked"}' in javascript
-    assert "if (document.hidden) return" in javascript
+    assert "if (document.hidden || refreshInFlight) return" in javascript
+    assert "if (document.hidden || historyInFlight) return" in javascript
     assert "curveVisibleCount" in javascript
     assert "guideVisibleCount" in javascript
     assert 'snapshot.health === "degraded"' in javascript
-    assert 'href="styles.css?v=8"' in html
-    assert 'src="app.js?v=8"' in html
+    assert 'href="styles.css?v=11"' in html
+    assert 'src="app.js?v=12"' in html
+    assert 'id="parity-net-edge"' in html
+    assert "function renderParity" in javascript
+    assert "row.underlying_futures_position" in javascript
+    assert "之後每 1 分鐘同步刷新" in html
+    assert 'class="strategy-table"' in html
+    assert '<th>策略／狀態</th><th>曝險／口數比</th><th>報酬</th><th>損益／成本</th><th>資金／保證金</th><th>部位／估值</th>' in html
+    assert "function appendTableMetric" in javascript
+    assert "function strategyStatusPill" in javascript
+    assert 'capital.dataset.label = "資金／保證金"' in javascript
+    assert "可左右滑動" not in html
+    assert ".strategy-table-wrap { overflow-x: visible; }" in stylesheet
+    assert ".strategy-table { table-layout: fixed;" in stylesheet
+    assert "@media (max-width: 900px)" in stylesheet
