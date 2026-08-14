@@ -162,8 +162,62 @@ def _validate_symlink_target(path: str, target: str) -> None:
             depth += 1
 
 
-def _collect_entries(source: Path) -> list[_SourceEntry]:
+def _normalize_excluded_subtrees(values: Iterable[str]) -> tuple[str, ...]:
+    selected: list[str] = []
+    for value in sorted(set(values)):
+        relative = _safe_relative_path(value, "excluded subtree").as_posix()
+        if any(
+            relative == parent or relative.startswith(f"{parent}/")
+            for parent in selected
+        ):
+            continue
+        selected.append(relative)
+    return tuple(selected)
+
+
+def _is_excluded(relative: str, excluded_subtrees: tuple[str, ...]) -> bool:
+    return any(
+        relative == prefix or relative.startswith(f"{prefix}/")
+        for prefix in excluded_subtrees
+    )
+
+
+def _collect_entries(
+    source: Path, *, excluded_subtrees: tuple[str, ...] = ()
+) -> tuple[list[_SourceEntry], dict[str, Any]]:
     entries: list[_SourceEntry] = []
+    portable = hashlib.sha256()
+    stability = hashlib.sha256()
+    files = directories = symlinks = logical_bytes = 0
+
+    def update_summary(
+        relative: str, kind: str, info: os.stat_result, extra: str
+    ) -> None:
+        nonlocal files, directories, symlinks, logical_bytes
+        path_bytes = relative.encode("utf-8", errors="surrogateescape")
+        extra_bytes = extra.encode("utf-8", errors="surrogateescape")
+        portable_size = info.st_size if kind == "F" else 0
+        portable.update(kind.encode("ascii") + b"\0" + path_bytes + b"\0")
+        portable.update(
+            str(portable_size).encode("ascii") + b"\0" + extra_bytes + b"\n"
+        )
+        stability.update(kind.encode("ascii") + b"\0" + path_bytes + b"\0")
+        stability.update(
+            (
+                f"{info.st_size}:{info.st_mode}:{info.st_mtime_ns}:"
+                f"{info.st_ctime_ns}:{info.st_dev}:{info.st_ino}:"
+            ).encode("ascii")
+            + extra_bytes
+            + b"\n"
+        )
+        if kind == "F":
+            files += 1
+            logical_bytes += info.st_size
+        elif kind == "D":
+            directories += 1
+        elif kind == "L":
+            symlinks += 1
+
     for current, dir_names, file_names in os.walk(
         source, topdown=True, followlinks=False
     ):
@@ -172,12 +226,16 @@ def _collect_entries(source: Path) -> list[_SourceEntry]:
         current_path = Path(current)
         for name in list(dir_names):
             path = current_path / name
-            info = path.lstat()
             relative = path.relative_to(source).as_posix()
+            if _is_excluded(relative, excluded_subtrees):
+                dir_names.remove(name)
+                continue
+            info = path.lstat()
             if stat.S_ISLNK(info.st_mode):
                 dir_names.remove(name)
                 target = os.readlink(path)
                 _validate_symlink_target(relative, target)
+                update_summary(relative, "L", info, target)
                 entries.append(
                     _SourceEntry(
                         path=relative,
@@ -187,6 +245,7 @@ def _collect_entries(source: Path) -> list[_SourceEntry]:
                     )
                 )
             elif stat.S_ISDIR(info.st_mode):
+                update_summary(relative, "D", info, "")
                 entries.append(
                     _SourceEntry(
                         path=relative,
@@ -198,9 +257,12 @@ def _collect_entries(source: Path) -> list[_SourceEntry]:
                 raise SnapshotError(f"unsupported directory entry type: {path}")
         for name in file_names:
             path = current_path / name
-            info = path.lstat()
             relative = path.relative_to(source).as_posix()
+            if _is_excluded(relative, excluded_subtrees):
+                continue
+            info = path.lstat()
             if stat.S_ISREG(info.st_mode):
+                update_summary(relative, "F", info, "")
                 entries.append(
                     _SourceEntry(
                         path=relative,
@@ -213,6 +275,7 @@ def _collect_entries(source: Path) -> list[_SourceEntry]:
             elif stat.S_ISLNK(info.st_mode):
                 target = os.readlink(path)
                 _validate_symlink_target(relative, target)
+                update_summary(relative, "L", info, target)
                 entries.append(
                     _SourceEntry(
                         path=relative,
@@ -224,7 +287,14 @@ def _collect_entries(source: Path) -> list[_SourceEntry]:
             else:
                 raise SnapshotError(f"special files are not snapshot-safe: {path}")
     entries.sort(key=lambda entry: entry.path)
-    return entries
+    return entries, {
+        "files": files,
+        "directories": directories,
+        "symlinks": symlinks,
+        "logical_bytes": logical_bytes,
+        "portable_fingerprint_sha256": portable.hexdigest(),
+        "stability_fingerprint_sha256": stability.hexdigest(),
+    }
 
 
 def _copy_and_hash(source: Path, destination: Path) -> str:
@@ -612,6 +682,7 @@ def publish_packed_snapshot(
     compression_level: int = DEFAULT_COMPRESSION_LEVEL,
     max_clock_skew_seconds: int = DEFAULT_MAX_CLOCK_SKEW_SECONDS,
     metadata: Mapping[str, str] | None = None,
+    excluded_subtrees: Iterable[str] = (),
     repo_root: Path | None = None,
 ) -> ResolvedSnapshot:
     sync_root = sync_root.resolve()
@@ -625,6 +696,7 @@ def publish_packed_snapshot(
         raise SnapshotError("pack_buckets must be between 1 and 4096")
     if not 0 <= compression_level <= 9:
         raise SnapshotError("compression_level must be between 0 and 9")
+    excluded = _normalize_excluded_subtrees(excluded_subtrees)
     node_identity = sync_root / ".local-state" / "node-id"
     initialize_packed_layout(
         sync_root,
@@ -634,8 +706,9 @@ def publish_packed_snapshot(
     lock_path = sync_root / ".local-state" / "locks" / f"publish-{dataset}.lock"
 
     with _exclusive_lock(lock_path):
-        before = scan_tree(source)
-        entries = _collect_entries(source)
+        entries, before = _collect_entries(
+            source, excluded_subtrees=excluded
+        )
         staging_root = sync_root / ".local-state" / "staging"
         staging_root.mkdir(parents=True, exist_ok=True)
         objects: list[dict[str, Any]] = []
@@ -722,7 +795,7 @@ def publish_packed_snapshot(
             inventory_temp, inventory_path, expected_sha256=inventory_sha
         )
 
-        after = scan_tree(source)
+        _, after = _collect_entries(source, excluded_subtrees=excluded)
         if (
             before["stability_fingerprint_sha256"]
             != after["stability_fingerprint_sha256"]
@@ -778,6 +851,7 @@ def publish_packed_snapshot(
             "publisher": {"node_id": publisher_node},
             "source": {
                 "snapshot_root_name": source.name,
+                "excluded_subtrees": list(excluded),
                 **{
                     key: value
                     for key, value in before.items()

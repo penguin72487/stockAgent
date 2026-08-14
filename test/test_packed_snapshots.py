@@ -116,6 +116,30 @@ def test_packed_snapshot_fetch_subtree_rejects_missing_directory(
         )
 
 
+def test_packed_snapshot_excludes_reproducible_subtree(tmp_path: Path) -> None:
+    source = _source_tree(tmp_path)
+    cache = source / "text" / "cache"
+    cache.mkdir()
+    (cache / "derived.npy").write_bytes(b"reproducible-cache")
+    sync_root = tmp_path / "sync"
+    initialize_packed_layout(sync_root, node_id="node-a")
+
+    resolved = publish_packed_snapshot(
+        sync_root,
+        "prices",
+        source,
+        excluded_subtrees=["text/cache"],
+    )
+    target = fetch_packed_snapshot(sync_root, tmp_path / "materialized", resolved)
+
+    assert resolved.manifest["source"]["excluded_subtrees"] == ["text/cache"]
+    assert not (target / "text" / "cache").exists()
+    assert (target / "text" / "first.json").is_file()
+    assert verify_packed_snapshot(sync_root, resolved, materialized_path=target)[
+        "materialized_verified"
+    ]
+
+
 def test_unchanged_publish_reuses_identical_content_objects(tmp_path: Path) -> None:
     source = _source_tree(tmp_path)
     sync_root = tmp_path / "sync"
