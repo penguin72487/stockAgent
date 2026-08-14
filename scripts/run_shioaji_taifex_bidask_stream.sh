@@ -124,6 +124,32 @@ while true; do
       --refresh; then
       echo "[shioaji-taifex] final_settlement_refresh_failed end=$settlement_end strategy_will_fail_closed_if_needed" >&2
     fi
+    echo "[shioaji-taifex] settlement_bootstrap_session=$capture_session trade_date=$trade_date"
+    if ! run_fintech_python -m downloader.stream_shioaji_taifex_bidask \
+      --simulation \
+      --settle-expired-strategy-state-only \
+      --capture-session "$capture_session" \
+      --trade-date "$trade_date" \
+      --stop-at "$stop_at" \
+      --future-code "$FUTURE_CODE" \
+      --hedge-future-code "$HEDGE_FUTURE_CODE" \
+      --strategy-state-dir "$STRATEGY_STATE_DIR" \
+      --final-settlement-path "$FINAL_SETTLEMENT_PATH" \
+      --strategy-mode "$STRATEGY_MODE" \
+      --strategy-intraday-interval-seconds "$STRATEGY_INTRADAY_INTERVAL_SECONDS" \
+      --strategy-intraday-entry-cutoff "$STRATEGY_INTRADAY_ENTRY_CUTOFF" \
+      --strategy-intraday-flatten-time "$STRATEGY_INTRADAY_FLATTEN_TIME" \
+      --strategy-night-entry-cutoff "$STRATEGY_NIGHT_ENTRY_CUTOFF" \
+      --strategy-night-flatten-time "$STRATEGY_NIGHT_FLATTEN_TIME" \
+      --strategy-option-risk-margin-a-twd "$STRATEGY_OPTION_RISK_MARGIN_A_TWD" \
+      --strategy-option-risk-margin-b-twd "$STRATEGY_OPTION_RISK_MARGIN_B_TWD" \
+      --strategy-option-risk-margin-c-twd "$STRATEGY_OPTION_RISK_MARGIN_C_TWD" \
+      --strategy-capital-buffer-multiple "$STRATEGY_CAPITAL_BUFFER_MULTIPLE" \
+      --strategy-catalog-expansion-entry-policy "$STRATEGY_CATALOG_EXPANSION_ENTRY_POLICY"; then
+      echo "[shioaji-taifex] settlement_bootstrap_failed trade_date=$trade_date retry_seconds=30" >&2
+      sleep 30
+      continue
+    fi
   fi
   capture_id="$(run_fintech_python -c 'import uuid; print(uuid.uuid4().hex)')"
   required_option_codes=""

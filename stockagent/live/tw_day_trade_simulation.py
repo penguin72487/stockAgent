@@ -232,6 +232,7 @@ def _prepare_entry_plan(
     quote: Mapping[str, Any],
     evidence: LiveEligibility | None,
     signal_at: datetime,
+    observation_at: datetime,
     spec: ModeSpec,
     allow_quote_at_signal: bool = False,
 ) -> dict[str, Any]:
@@ -244,7 +245,7 @@ def _prepare_entry_plan(
     quote_values = dict(quote)
     status = "ready"
     reason: str | None = None
-    sizing_price = _finite(quote_values.get("open"))
+    sizing_price = _finite(quote_values.get("open")) or _finite(row.get("open_price"))
     entry_price = _finite(quote_values.get("ask" if side == "long" else "bid"))
     quote_at = _parse_timestamp(quote_values.get("quote_at"))
     upper = _finite(quote_values.get("upper_limit"))
@@ -265,22 +266,12 @@ def _prepare_entry_plan(
         status, reason = "blocked", "sell_first_suspended"
     elif sizing_price is None:
         status, reason = "blocked", "official_open_price_unavailable"
-    elif entry_price is None:
-        status, reason = "blocked", "no_executable_best_quote"
-    elif quote_at is None or (
-        quote_at < signal_at
-        if allow_quote_at_signal
-        else quote_at <= signal_at
-    ):
-        status, reason = "blocked", "quote_not_after_signal"
-    elif upper is None or lower is None:
-        status, reason = "blocked", "price_limit_unavailable"
 
     requested_shares = 0
     filled_shares = 0
     top_book_capacity_shares = 0
     minute_kbar_capacity_shares = 0
-    if status == "ready" and entry_price is not None:
+    if status == "ready" and sizing_price is not None:
         requested_shares = int(
             math.floor(
                 abs(target_weight)
@@ -291,6 +282,19 @@ def _prepare_entry_plan(
         ) * int(spec.lot_size)
         if requested_shares <= 0:
             status, reason = "skipped", "below_one_board_lot"
+    if status == "ready":
+        if entry_price is None:
+            status, reason = "blocked", "no_executable_best_quote"
+        elif quote_at is None or (
+            quote_at < signal_at
+            if allow_quote_at_signal
+            else quote_at <= signal_at
+        ):
+            status, reason = "blocked", "quote_not_after_signal"
+        elif quote_at > observation_at:
+            status, reason = "blocked", "quote_after_local_observation"
+        elif upper is None or lower is None:
+            status, reason = "blocked", "price_limit_unavailable"
         else:
             top_book_capacity_shares = _top_book_capacity_shares(
                 quote_values,
@@ -301,15 +305,28 @@ def _prepare_entry_plan(
                 quote_values,
                 lot_size=spec.lot_size,
             )
-            filled_shares = min(
-                requested_shares,
-                top_book_capacity_shares,
-                minute_kbar_capacity_shares,
+            quote_wall_time = (
+                quote_at.astimezone(TAIPEI).timetz().replace(tzinfo=None)
+                if quote_at is not None
+                else None
             )
+            # At 09:00 no completed one-minute K bar exists yet. Requiring one
+            # delayed every entry until 09:01 even when a causally newer,
+            # executable best quote was already available. Opening orders use
+            # only fresh displayed level-one depth; later orders retain the
+            # conservative completed-minute participation cap.
+            if quote_wall_time is not None and quote_wall_time < time(9, 1):
+                filled_shares = min(requested_shares, top_book_capacity_shares)
+            else:
+                filled_shares = min(
+                    requested_shares,
+                    top_book_capacity_shares,
+                    minute_kbar_capacity_shares,
+                )
             if filled_shares <= 0:
-                status, reason = "blocked", "minute_or_top_book_volume_unavailable"
+                status, reason = "blocked", "marketable_depth_unavailable"
             elif filled_shares < requested_shares:
-                status, reason = "partial_depth", "minute_or_top_book_depth_exhausted"
+                status, reason = "partial_depth", "marketable_depth_exhausted"
     return {
         "row": row,
         "symbol": symbol,
@@ -627,6 +644,12 @@ class TwDayTradeSimulationEngine:
         self.marks_path = self.state_dir / "marks.jsonl"
         self.benchmark_marks_path = self.state_dir / "benchmark_marks.jsonl"
         self.events_path = self.state_dir / "events.jsonl"
+        self.latency_path = self.state_dir / "latency.jsonl"
+        self._corporate_action_reference_path: Path | None = None
+        self._corporate_action_cache_signature: tuple[int, ...] | None = None
+        self._corporate_actions_by_symbol: dict[str, list[dict[str, Any]]] = {}
+        self._corporate_action_load_error: str | None = None
+        self._corporate_action_coverage_end: date | None = None
         self.state = self._load_state()
         self._reconcile_daily_duplicate_signal_ids()
         self._restore_position_artifact_paths()
@@ -962,10 +985,140 @@ class TwDayTradeSimulationEngine:
                         "last_roll_new_ask",
                         "fixed_fees_twd",
                         "transaction_tax_twd",
+                        "total_return_contract",
+                        "corporate_action_factor",
+                        "adjusted_quantity",
+                        "corporate_action_count",
+                        "last_corporate_action_date",
+                        "corporate_action_coverage",
+                        "corporate_action_status",
+                        "corporate_action_coverage_end",
                     )
                 },
             },
         )
+
+    def _load_corporate_actions(
+        self, reference_path: str | Path | None
+    ) -> None:
+        """Cache the official ex-right/ex-dividend reference by file identity."""
+
+        if reference_path is None:
+            return
+        path = Path(reference_path).expanduser().resolve()
+        self._corporate_action_reference_path = path
+        try:
+            stat = path.stat()
+            summary_path = path.with_suffix(".summary.json")
+            summary_stat = summary_path.stat()
+            signature = (
+                stat.st_dev,
+                stat.st_ino,
+                stat.st_size,
+                stat.st_mtime_ns,
+                summary_stat.st_dev,
+                summary_stat.st_ino,
+                summary_stat.st_size,
+                summary_stat.st_mtime_ns,
+            )
+            if signature == self._corporate_action_cache_signature:
+                return
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            if (
+                not isinstance(summary, Mapping)
+                or not bool(summary.get("coverage_complete"))
+                or int(summary.get("failure_count") or 0) != 0
+            ):
+                raise ValueError("corporate-action completeness receipt failed")
+            coverage_end = date.fromisoformat(str(summary.get("end_date") or ""))
+            import polars as pl
+
+            frame = (
+                pl.scan_parquet(path)
+                .filter(pl.col("symbol").is_in([row[1] for row in STOCK_BENCHMARKS]))
+                .select(
+                    pl.col("date").cast(pl.Date),
+                    pl.col("symbol").cast(pl.String),
+                    pl.col("previous_close").cast(pl.Float64),
+                    pl.col("reference_price").cast(pl.Float64),
+                    pl.col("event_type").cast(pl.String),
+                )
+                .sort(["symbol", "date"])
+                .collect()
+            )
+            by_symbol: dict[str, list[dict[str, Any]]] = {}
+            for item in frame.iter_rows(named=True):
+                by_symbol.setdefault(str(item["symbol"]), []).append(dict(item))
+            self._corporate_actions_by_symbol = by_symbol
+            self._corporate_action_cache_signature = signature
+            self._corporate_action_load_error = None
+            self._corporate_action_coverage_end = coverage_end
+        except Exception as exc:
+            self._corporate_actions_by_symbol = {}
+            self._corporate_action_cache_signature = None
+            self._corporate_action_load_error = f"{type(exc).__name__}: {exc}"
+            self._corporate_action_coverage_end = None
+
+    def _stock_total_return_adjustment(
+        self,
+        *,
+        symbol: str,
+        entry_at: object,
+        mark_date: date,
+    ) -> tuple[float | None, list[dict[str, Any]], str]:
+        """Return the reinvested-unit factor implied by official reference prices.
+
+        A holder crossing an ex-date receives equivalent economic value when
+        units are multiplied by ``previous_close / reference_price``.  The
+        official factor handles cash distributions, stock dividends, splits,
+        reverse splits, and mixed capital actions without guessing their type.
+        """
+
+        if self._corporate_action_reference_path is None:
+            return 1.0, [], "not_configured"
+        if self._corporate_action_load_error is not None:
+            return None, [], "reference_unavailable"
+        if (
+            self._corporate_action_coverage_end is None
+            or self._corporate_action_coverage_end < mark_date
+        ):
+            return None, [], "reference_coverage_incomplete"
+        parsed_entry = _parse_timestamp(entry_at)
+        if parsed_entry is None:
+            return None, [], "entry_timestamp_invalid"
+        factor = 1.0
+        applied: list[dict[str, Any]] = []
+        for item in self._corporate_actions_by_symbol.get(str(symbol), ()):
+            action_date = item.get("date")
+            if not isinstance(action_date, date):
+                return None, [], "reference_date_invalid"
+            # The opening ask on the entry date is already ex-action.  Only
+            # actions crossed while holding the benchmark belong in return.
+            if not (parsed_entry.date() < action_date <= mark_date):
+                continue
+            previous_close = _finite(item.get("previous_close"))
+            reference_price = _finite(item.get("reference_price"))
+            if (
+                previous_close is None
+                or reference_price is None
+                or previous_close <= 0.0
+                or reference_price <= 0.0
+            ):
+                return None, [], "reference_factor_invalid"
+            action_factor = previous_close / reference_price
+            factor *= action_factor
+            applied.append(
+                {
+                    "date": action_date.isoformat(),
+                    "event_type": item.get("event_type"),
+                    "previous_close": previous_close,
+                    "reference_price": reference_price,
+                    "factor": action_factor,
+                }
+            )
+        if not math.isfinite(factor) or factor <= 0.0:
+            return None, [], "cumulative_factor_invalid"
+        return factor, applied, "official_reference_complete"
 
     def _mark_stock_benchmark(
         self,
@@ -1018,9 +1171,34 @@ class TwDayTradeSimulationEngine:
                 }
             )
         entry = _finite(row.get("entry_price"))
-        if entry is not None and bid is not None:
-            gross_pnl = quantity * (bid - entry)
-            liquidation_notional = quantity * bid
+        adjustment_factor, corporate_actions, action_status = (
+            self._stock_total_return_adjustment(
+                symbol=symbol,
+                entry_at=row.get("entry_at"),
+                mark_date=now.date(),
+            )
+        )
+        row.update(
+            {
+                "total_return_contract": (
+                    "official_ex_date_reference_reinvestment_v1"
+                ),
+                "corporate_action_coverage": action_status
+                == "official_reference_complete",
+                "corporate_action_status": action_status,
+                "corporate_action_coverage_end": (
+                    self._corporate_action_coverage_end.isoformat()
+                    if self._corporate_action_coverage_end is not None
+                    else None
+                ),
+            }
+        )
+        if entry is not None and bid is not None and adjustment_factor is not None:
+            adjusted_quantity = quantity * adjustment_factor
+            gross_value = adjusted_quantity * bid
+            entry_notional = quantity * entry
+            gross_pnl = gross_value - entry_notional
+            liquidation_notional = gross_value
             liquidation_commission, liquidation_tax = self._stock_benchmark_order_cost(
                 notional=liquidation_notional,
                 commission_rate=buy_rate,
@@ -1047,10 +1225,22 @@ class TwDayTradeSimulationEngine:
                     "return_pct": None
                     if return_fraction is None
                     else return_fraction * 100.0,
+                    "corporate_action_factor": adjustment_factor,
+                    "adjusted_quantity": adjusted_quantity,
+                    "corporate_action_count": len(corporate_actions),
+                    "last_corporate_action_date": (
+                        corporate_actions[-1]["date"] if corporate_actions else None
+                    ),
+                    "applied_corporate_actions": corporate_actions,
                     "valuation_stale": False,
-                    "valuation_source": "entry_at_best_ask_mark_at_best_bid_after_tw_cash_costs",
+                    "valuation_source": "total_return_units_at_best_bid_after_tw_cash_costs",
                     "source": quote.get("source"),
                 }
+            )
+        elif adjustment_factor is None:
+            row["valuation_stale"] = True
+            row["valuation_source"] = (
+                "corporate_action_reference_unavailable_fail_closed"
             )
         elif row.get("total_equity_twd") is not None:
             row["valuation_stale"] = True
@@ -1212,11 +1402,13 @@ class TwDayTradeSimulationEngine:
         current_future_contract_code: str | None,
         current_future_quote: Mapping[str, Any] | None,
         previous_future_quote: Mapping[str, Any] | None = None,
+        corporate_action_reference_path: str | Path | None = None,
         now: datetime | None = None,
     ) -> None:
         """Advance three independent, executable-price comparison ledgers."""
 
         observed = _now_taipei(now)
+        self._load_corporate_actions(corporate_action_reference_path)
         for benchmark_id, symbol, label, security_type in STOCK_BENCHMARKS:
             self._mark_stock_benchmark(
                 benchmark_id=benchmark_id,
@@ -1457,6 +1649,117 @@ class TwDayTradeSimulationEngine:
     def _fill(self, payload: Mapping[str, Any]) -> None:
         _append_jsonl(self.fills_path, payload)
 
+    def record_latency_sample(
+        self,
+        *,
+        market: str,
+        signal_id: str,
+        result: str,
+        summary: Mapping[str, Any],
+        consumer_detected_at: datetime,
+        ledger_persisted_at: datetime,
+        executor_quote_fetch_ms: float,
+        eligibility_load_ms: float,
+        ledger_compute_persist_ms: float,
+    ) -> None:
+        """Persist one measured input-to-ledger sample for the public panel."""
+
+        started_at = _parse_timestamp(
+            summary.get("signal_started_at") or summary.get("generated_at")
+        )
+        ready_at = _parse_timestamp(
+            summary.get("signal_ready_at")
+            or summary.get("artifact_published_at")
+            or summary.get("generated_at")
+        )
+        published_at = _parse_timestamp(
+            summary.get("artifact_published_at") or summary.get("signal_ready_at")
+        )
+        live_latency = dict(summary.get("live_latency") or {})
+        signal_quote_ms = _finite(live_latency.get("quote_fetch_ms"))
+        model_inference_ms = _finite(live_latency.get("model_inference_ms"))
+        signal_total_ms = _finite(live_latency.get("compute_before_publish_ms"))
+        signal_other_ms = (
+            max(
+                0.0,
+                signal_total_ms
+                - float(signal_quote_ms or 0.0)
+                - float(model_inference_ms or 0.0),
+            )
+            if signal_total_ms is not None
+            else None
+        )
+
+        def elapsed_ms(start: datetime | None, end: datetime | None) -> float | None:
+            if start is None or end is None:
+                return None
+            return round(max(0.0, (end - start).total_seconds() * 1000.0), 3)
+
+        stages = {
+            "signal_quote_fetch_ms": signal_quote_ms,
+            "model_inference_ms": model_inference_ms,
+            "signal_other_compute_ms": signal_other_ms,
+            "artifact_publish_ms": _finite(
+                live_latency.get("artifact_publish_ms")
+            ),
+            "artifact_discovery_ms": elapsed_ms(
+                published_at, consumer_detected_at
+            ),
+            "eligibility_load_ms": round(max(0.0, eligibility_load_ms), 3),
+            "executor_quote_fetch_ms": round(max(0.0, executor_quote_fetch_ms), 3),
+            "ledger_compute_persist_ms": round(
+                max(0.0, ledger_compute_persist_ms), 3
+            ),
+        }
+        finite_stages = {
+            key: float(value)
+            for key, value in stages.items()
+            if value is not None and math.isfinite(float(value))
+        }
+        bottleneck = (
+            max(finite_stages, key=finite_stages.get) if finite_stages else None
+        )
+        _append_jsonl(
+            self.latency_path,
+            {
+                "schema_version": 1,
+                "recorded_at": ledger_persisted_at.isoformat(timespec="microseconds"),
+                "session_date": ledger_persisted_at.astimezone(TAIPEI)
+                .date()
+                .isoformat(),
+                "market": market,
+                "signal_id": signal_id,
+                "result": result,
+                "simulation_only": True,
+                "measurement_boundary": "signal_input_to_simulation_ledger_persisted",
+                "signal_started_at": started_at.isoformat(timespec="microseconds")
+                if started_at
+                else None,
+                "signal_ready_at": ready_at.isoformat(timespec="microseconds")
+                if ready_at
+                else None,
+                "artifact_published_at": published_at.isoformat(
+                    timespec="microseconds"
+                )
+                if published_at
+                else None,
+                "consumer_detected_at": consumer_detected_at.isoformat(
+                    timespec="microseconds"
+                ),
+                "ledger_persisted_at": ledger_persisted_at.isoformat(
+                    timespec="microseconds"
+                ),
+                "input_to_ledger_ms": elapsed_ms(started_at, ledger_persisted_at),
+                "ready_to_ledger_ms": elapsed_ms(ready_at, ledger_persisted_at),
+                "signal_compute_total_ms": signal_total_ms,
+                "stages": stages,
+                "bottleneck_stage": bottleneck,
+                "bottleneck_ms": finite_stages.get(bottleneck)
+                if bottleneck
+                else None,
+            },
+        )
+
     @staticmethod
     def _entry_and_exit_rates(
         *,
@@ -1515,7 +1818,9 @@ class TwDayTradeSimulationEngine:
         if str(summary.get("execution_mode") or "") != "tw_day_trade":
             return self._block_signal(mode, signal_id, "not_tw_day_trade", observed)
         source_signal_at = _parse_timestamp(
-            summary.get("generated_at") or summary.get("asof_date")
+            summary.get("signal_started_at")
+            or summary.get("generated_at")
+            or summary.get("asof_date")
         )
         if source_signal_at is None:
             return self._block_signal(
@@ -1544,15 +1849,17 @@ class TwDayTradeSimulationEngine:
                 )
             signal_at = observed
         else:
-            signal_at = source_signal_at
+            signal_at = _parse_timestamp(
+                summary.get("signal_ready_at")
+                or summary.get("artifact_published_at")
+                or summary.get("generated_at")
+            )
+            if signal_at is None:
+                return self._block_signal(
+                    mode, signal_id, "invalid_signal_ready_timestamp", observed
+                )
         if wall_time < ENTRY_GATE or wall_time >= EXIT_LIMIT_TIME:
             return self._block_signal(mode, signal_id, "outside_entry_window", observed)
-        if wall_time < FIRST_MINUTE_EXECUTION_TIME and not counterfactual_open_replay:
-            mode["pending_signal_id"] = signal_id
-            mode["pending_signal_at"] = signal_at.isoformat(timespec="seconds")
-            mode["engine_status"] = "waiting_first_completed_minute"
-            self._persist(observed)
-            return "waiting_first_minute"
         if not bool(summary.get("live_session_open_feature_applied")):
             return self._block_signal(
                 mode, signal_id, "open_feature_not_observed", observed
@@ -1575,14 +1882,43 @@ class TwDayTradeSimulationEngine:
                 engine_status="critical_prior_position_unflattened",
             )
 
-        actionable_symbols = [
-            str(row.get("symbol") or "")
-            for row in signal_rows
-            if abs(float(row.get("target_weight") or 0.0)) > 0.0
-        ]
+        actionable_symbols: list[str] = []
+        for row in signal_rows:
+            symbol = str(row.get("symbol") or "")
+            weight = float(row.get("target_weight") or 0.0)
+            side_allowed = bool(row.get("can_buy")) if weight > 0.0 else bool(
+                row.get("can_sell")
+            )
+            evidence = eligibility.get(symbol)
+            sizing_price = _finite(row.get("open_price")) or _finite(
+                quotes.get(symbol, {}).get("open")
+            )
+            if (
+                not symbol
+                or weight == 0.0
+                or not bool(row.get("tradable"))
+                or not side_allowed
+                or evidence is None
+                or not evidence.covered
+                or not evidence.eligible
+                or (weight < 0.0 and not evidence.short_open)
+                or sizing_price is None
+            ):
+                continue
+            requested_shares = int(
+                math.floor(
+                    abs(weight)
+                    * float(spec.initial_capital_twd)
+                    / sizing_price
+                    / int(spec.lot_size)
+                )
+            ) * int(spec.lot_size)
+            if requested_shares > 0:
+                actionable_symbols.append(symbol)
         later_quote_found = any(
             (quote_at := _parse_timestamp(quotes.get(symbol, {}).get("quote_at")))
             is not None
+            and quote_at <= observed
             and (
                 quote_at >= signal_at
                 if counterfactual_open_replay
@@ -1643,7 +1979,7 @@ class TwDayTradeSimulationEngine:
         )
         mode["entry_liquidity_assumption"] = summary.get(
             "entry_liquidity_assumption"
-        ) or "minimum_of_level_one_displayed_volume_and_50pct_completed_minute_kbar_volume"
+        ) or "09:00_fresh_level_one_depth_then_minimum_with_50pct_completed_minute_volume"
         mode["positions"] = {}
         mode["entry_completed_at"] = observed.isoformat(timespec="seconds")
         mode["exit_limit_submitted_at"] = None
@@ -1662,6 +1998,7 @@ class TwDayTradeSimulationEngine:
                 quote=quotes.get(str(row.get("symbol") or "")) or {},
                 evidence=eligibility.get(str(row.get("symbol") or "")),
                 signal_at=signal_at,
+                observation_at=observed,
                 spec=spec,
                 allow_quote_at_signal=counterfactual_open_replay,
             )
@@ -1749,6 +2086,8 @@ class TwDayTradeSimulationEngine:
                 "raw_score": row.get("raw_score"),
                 "target_weight": target_weight,
                 "requested_shares": requested_shares,
+                "executable_order_shares": filled_shares,
+                "target_unsubmitted_shares": max(0, requested_shares - filled_shares),
                 "sizing_open_price": sizing_price,
                 "execution_price": entry_price,
                 "filled_shares": filled_shares,
@@ -1830,6 +2169,8 @@ class TwDayTradeSimulationEngine:
                 "side": side,
                 "target_weight": target_weight,
                 "requested_shares": requested_shares,
+                "executable_order_shares": filled_shares,
+                "target_unsubmitted_shares": max(0, requested_shares - filled_shares),
                 "pre_balance_filled_shares": int(plan["pre_balance_filled_shares"]),
                 "filled_shares": filled_shares,
                 "signed_shares": signed_shares,
@@ -1892,7 +2233,7 @@ class TwDayTradeSimulationEngine:
                 "price_limit_offset_ticks": offset_ticks,
                 "position_id": position_id,
                 "symbol": symbol,
-                "quantity": requested_shares,
+                "quantity": filled_shares,
                 "simulation_only": True,
             }
             self._order(
@@ -1902,11 +2243,13 @@ class TwDayTradeSimulationEngine:
                     "purpose": "entry",
                     "side": "buy" if side == "long" else "sell_short",
                     "order_type": "MKT",
-                    "status": "filled"
-                    if filled_shares == requested_shares
-                    else "part_filled",
+                    "status": "filled",
                     "filled_quantity": filled_shares,
-                    "unfilled_quantity": requested_shares - filled_shares,
+                    "unfilled_quantity": 0,
+                    "model_requested_quantity": requested_shares,
+                    "target_unsubmitted_quantity": max(
+                        0, requested_shares - filled_shares
+                    ),
                 }
             )
             self._fill(
@@ -2287,6 +2630,49 @@ class TwDayTradeSimulationEngine:
                     order_type="LMT",
                     quantity=capacity,
                 )
+                continue
+            # The user's 13:20 contract is to remain at the passive best quote,
+            # not merely to preserve the price observed exactly at 13:20. Once
+            # per new minute, an unfilled order is cancel-replaced to the
+            # current ask for a sell or bid for a buy-to-cover.
+            passive_price = _finite(quote.get("ask" if side == "long" else "bid"))
+            if passive_price is None or math.isclose(
+                passive_price,
+                limit_price,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            ):
+                continue
+            previous_price = limit_price
+            position["eod_limit_price"] = passive_price
+            position["eod_limit_submitted_at"] = now.isoformat(timespec="seconds")
+            position["eod_limit_order_status"] = "working"
+            position["eod_limit_reprice_count"] = int(
+                position.get("eod_limit_reprice_count") or 0
+            ) + 1
+            self._order(
+                {
+                    "recorded_at": now.isoformat(timespec="seconds"),
+                    "session_date": mode.get("session_date"),
+                    "market": mode.get("market"),
+                    "position_id": position.get("position_id"),
+                    "symbol": position.get("symbol"),
+                    "order_id": (
+                        f"{position.get('position_id')}:eod_limit:"
+                        f"reprice:{int(position['eod_limit_reprice_count'])}"
+                    ),
+                    "replaces_order_id": f"{position.get('position_id')}:eod_limit",
+                    "purpose": "13_20_exit_limit_reprice",
+                    "side": "sell" if side == "long" else "buy_to_cover",
+                    "order_type": "LMT",
+                    "previous_price": previous_price,
+                    "price": passive_price,
+                    "quantity": abs(int(position.get("signed_shares") or 0)),
+                    "status": "working",
+                    "simulation_only": True,
+                    "pricing_rule": "follow_passive_best_until_13_24",
+                }
+            )
 
     def _force_exit(
         self,

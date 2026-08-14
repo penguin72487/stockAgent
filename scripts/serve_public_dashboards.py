@@ -31,14 +31,20 @@ from stockagent.live.public_dashboards import (  # noqa: E402
     sanitize_taifex_history,
     sanitize_taifex_status,
     sanitize_tw_events,
+    sanitize_tw_history,
     sanitize_tw_signals,
     sanitize_tw_status,
 )
 from stockagent.live.shioaji_api_dashboard import (  # noqa: E402
     build_shioaji_public_status,
 )
+from stockagent.live.openbb_archive_dashboard import (  # noqa: E402
+    build_openbb_public_history,
+    build_openbb_public_status,
+)
 from stockagent.live.tw_day_trade_dashboard import (  # noqa: E402
     build_dashboard_event_page,
+    build_dashboard_history_snapshot,
     build_dashboard_snapshot,
 )
 
@@ -49,6 +55,9 @@ PUBLIC_SIGNAL_LIMIT: Final[int] = 250
 PUBLIC_EVENT_LIMIT: Final[int] = 250
 API_CONCURRENCY: Final[int] = 32
 MAX_CACHE_ENTRIES: Final[int] = 512
+PUBLIC_AUDIT_BURST_CAPACITY: Final[float] = 45.0
+PUBLIC_AUDIT_REFILL_PER_SECOND: Final[float] = 1.0
+PUBLIC_AUDIT_HISTORY_COST: Final[float] = 2.0
 _OPENER = build_opener(ProxyHandler({}))
 
 
@@ -141,6 +150,7 @@ def build_public_overview(
     taifex: Mapping[str, Any],
     tw: Mapping[str, Any],
     shioaji: Mapping[str, Any],
+    openbb: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return only the fields required by the public landing cards."""
 
@@ -152,6 +162,9 @@ def build_public_overview(
     pipeline_summary = shioaji.get("pipeline_summary")
     market = taifex.get("market")
     strategy_counts = taifex.get("strategy_counts")
+    openbb = openbb if isinstance(openbb, Mapping) else {}
+    openbb_archive = openbb.get("archive")
+    openbb_archive = openbb_archive if isinstance(openbb_archive, Mapping) else {}
     return {
         "schema_version": 1,
         "generated_at_utc": datetime.now(UTC).isoformat(),
@@ -209,6 +222,15 @@ def build_public_overview(
                 else 0
             ),
         },
+        "openbb": {
+            "health": openbb.get("health"),
+            "snapshot_state": openbb.get("snapshot_state"),
+            "source_age_seconds": openbb.get("source_age_seconds"),
+            "completion_percent": openbb_archive.get("completion_percent"),
+            "accepted_tasks": openbb_archive.get("accepted_tasks", 0),
+            "total_tasks": openbb_archive.get("total_tasks", 0),
+            "success_rows": openbb_archive.get("success_rows", 0),
+        },
     }
 
 
@@ -225,6 +247,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
         taifex_static_root: Path,
         tw_static_root: Path,
         shioaji_static_root: Path,
+        openbb_static_root: Path,
         repo_root: Path,
         taifex_upstream: str,
         tw_upstream: str,
@@ -234,10 +257,17 @@ class PublicDashboardServer(ThreadingHTTPServer):
         self.taifex_static_root = Path(taifex_static_root)
         self.tw_static_root = Path(tw_static_root)
         self.shioaji_static_root = Path(shioaji_static_root)
+        self.openbb_static_root = Path(openbb_static_root)
         self.repo_root = Path(repo_root)
         self.taifex_upstream = str(taifex_upstream).rstrip("/")
         self.tw_upstream = str(tw_upstream).rstrip("/")
-        self.rate_limiter = TokenBucketRateLimiter()
+        # Shadow-only burst accounting: requests are never rejected.  Seven
+        # ranges across both dashboards fit the normal exploration envelope;
+        # traffic above it is recorded for later review with action=allowed.
+        self.request_auditor = TokenBucketRateLimiter(
+            capacity=PUBLIC_AUDIT_BURST_CAPACITY,
+            refill_per_second=PUBLIC_AUDIT_REFILL_PER_SECOND,
+        )
         self.api_slots = threading.BoundedSemaphore(API_CONCURRENCY)
         self._cache: dict[str, CacheEntry] = {}
         self._cache_lock = threading.Lock()
@@ -249,13 +279,18 @@ class PublicDashboardServer(ThreadingHTTPServer):
         cache_key: str,
         response: PreparedResponse,
         ttl_seconds: float,
+        stale_grace_seconds: float | None = None,
     ) -> None:
         observed = time.monotonic()
-        stale_grace_seconds = max(15.0, float(ttl_seconds) * 3.0)
+        stale_grace = (
+            max(15.0, float(ttl_seconds) * 3.0)
+            if stale_grace_seconds is None
+            else max(0.0, float(stale_grace_seconds))
+        )
         with self._cache_lock:
             self._cache[cache_key] = CacheEntry(
                 expires_at=observed + float(ttl_seconds),
-                stale_until=observed + float(ttl_seconds) + stale_grace_seconds,
+                stale_until=observed + float(ttl_seconds) + stale_grace,
                 response=response,
                 last_accessed_at=observed,
             )
@@ -279,21 +314,26 @@ class PublicDashboardServer(ThreadingHTTPServer):
         *,
         cache_key: str,
         ttl_seconds: float,
+        stale_grace_seconds: float | None,
         builder: Callable[[], PreparedResponse],
         key_lock: threading.Lock,
     ) -> None:
         try:
             with key_lock:
                 response = builder()
-                self._store_cached_response(cache_key, response, ttl_seconds)
+                self._store_cached_response(
+                    cache_key,
+                    response,
+                    ttl_seconds,
+                    stale_grace_seconds,
+                )
         except Exception as error:  # keep the last verified response on refresh errors
             with self._cache_lock:
                 cached = self._cache.get(cache_key)
                 if cached is not None:
                     cached.expires_at = min(
                         cached.stale_until,
-                        time.monotonic()
-                        + min(2.0, max(0.5, float(ttl_seconds))),
+                        time.monotonic() + min(2.0, max(0.5, float(ttl_seconds))),
                     )
             sys.stderr.write(
                 f"public-dashboard background_refresh_failed key={cache_key} "
@@ -309,6 +349,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
         cache_key: str,
         ttl_seconds: float,
         builder: Callable[[], PreparedResponse],
+        stale_grace_seconds: float | None = None,
     ) -> PreparedResponse:
         """Per-key single-flight cache with stale-while-refresh behavior."""
 
@@ -320,9 +361,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
                 cached.last_accessed_at = observed
                 if cached.expires_at > observed:
                     return cached.response
-                key_lock = self._cache_key_locks.setdefault(
-                    cache_key, threading.Lock()
-                )
+                key_lock = self._cache_key_locks.setdefault(cache_key, threading.Lock())
                 if cached.stale_until > observed:
                     if cache_key not in self._refreshing:
                         self._refreshing.add(cache_key)
@@ -331,9 +370,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
                 else:
                     stale_response = None
             else:
-                key_lock = self._cache_key_locks.setdefault(
-                    cache_key, threading.Lock()
-                )
+                key_lock = self._cache_key_locks.setdefault(cache_key, threading.Lock())
                 stale_response = None
 
         if stale_response is not None:
@@ -343,6 +380,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
                     kwargs={
                         "cache_key": cache_key,
                         "ttl_seconds": ttl_seconds,
+                        "stale_grace_seconds": stale_grace_seconds,
                         "builder": builder,
                         "key_lock": key_lock,
                     },
@@ -359,7 +397,12 @@ class PublicDashboardServer(ThreadingHTTPServer):
                     cached.last_accessed_at = observed
                     return cached.response
             response = builder()
-            self._store_cached_response(cache_key, response, ttl_seconds)
+            self._store_cached_response(
+                cache_key,
+                response,
+                ttl_seconds,
+                stale_grace_seconds,
+            )
             return response
 
     def cached_local_json(
@@ -369,6 +412,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
         ttl_seconds: float,
         cache_control: str,
         builder: Callable[[], Mapping[str, Any]],
+        stale_grace_seconds: float | None = None,
     ) -> PreparedResponse:
         """Build and cache a local allowlisted status payload."""
 
@@ -392,6 +436,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
         return self._cached_response(
             cache_key=cache_key,
             ttl_seconds=ttl_seconds,
+            stale_grace_seconds=stale_grace_seconds,
             builder=build,
         )
 
@@ -403,6 +448,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
         ttl_seconds: float,
         cache_control: str,
         sanitizer: Callable[[Mapping[str, Any]], dict[str, Any]],
+        stale_grace_seconds: float | None = None,
     ) -> PreparedResponse:
         def build() -> PreparedResponse:
             request = _OPENER.open(upstream_url, timeout=15.0)
@@ -435,6 +481,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
         return self._cached_response(
             cache_key=cache_key,
             ttl_seconds=ttl_seconds,
+            stale_grace_seconds=stale_grace_seconds,
             builder=build,
         )
 
@@ -443,16 +490,49 @@ class PublicDashboardServer(ThreadingHTTPServer):
         return self.cached_local_json(
             cache_key=f"tw-status:{normalized_date or 'latest'}",
             ttl_seconds=2.0,
-            cache_control="public, max-age=2, stale-while-revalidate=8",
+            cache_control="no-store",
+            stale_grace_seconds=0.0,
             builder=lambda: sanitize_tw_status(
                 build_dashboard_snapshot(
-                    state_dir=self.repo_root
-                    / "artifacts/live/tw_day_trade_simulation",
+                    state_dir=self.repo_root / "artifacts/live/tw_day_trade_simulation",
                     preopen_readiness_path=self.repo_root
                     / "artifacts/discord_bot/preopen_readiness.json",
                     session_date=normalized_date or None,
                 )
             ),
+        )
+
+    def tw_history(self, range_key: str) -> PreparedResponse:
+        return self.cached_local_json(
+            cache_key=f"tw-history:{range_key}",
+            ttl_seconds=55.0,
+            cache_control="no-cache",
+            stale_grace_seconds=180.0,
+            builder=lambda: sanitize_tw_history(
+                build_dashboard_history_snapshot(
+                    state_dir=self.repo_root
+                    / "artifacts/live/tw_day_trade_simulation",
+                    range_key=range_key,
+                )
+            ),
+        )
+
+    def openbb_status(self) -> PreparedResponse:
+        return self.cached_local_json(
+            cache_key="openbb-status",
+            ttl_seconds=8.0,
+            cache_control="no-store",
+            stale_grace_seconds=0.0,
+            builder=lambda: build_openbb_public_status(self.repo_root),
+        )
+
+    def openbb_history(self, range_key: str) -> PreparedResponse:
+        return self.cached_local_json(
+            cache_key=f"openbb-history:{range_key}",
+            ttl_seconds=55.0,
+            cache_control="no-cache",
+            stale_grace_seconds=180.0,
+            builder=lambda: build_openbb_public_history(self.repo_root, range_key),
         )
 
     def public_overview(self) -> Mapping[str, Any]:
@@ -461,7 +541,8 @@ class PublicDashboardServer(ThreadingHTTPServer):
                 cache_key="taifex-status",
                 upstream_url=f"{self.taifex_upstream}/api/status",
                 ttl_seconds=2.0,
-                cache_control="public, max-age=2, stale-while-revalidate=8",
+                cache_control="no-store",
+                stale_grace_seconds=0.0,
                 sanitizer=sanitize_taifex_status,
             )
         )
@@ -470,11 +551,13 @@ class PublicDashboardServer(ThreadingHTTPServer):
             self.cached_local_json(
                 cache_key="shioaji-status",
                 ttl_seconds=8.0,
-                cache_control="public, max-age=5, stale-while-revalidate=15",
+                cache_control="no-store",
+                stale_grace_seconds=0.0,
                 builder=lambda: build_shioaji_public_status(self.repo_root),
             )
         )
-        return build_public_overview(taifex, tw, shioaji)
+        openbb = _response_json(self.openbb_status())
+        return build_public_overview(taifex, tw, shioaji, openbb)
 
 
 class PublicDashboardHandler(BaseHTTPRequestHandler):
@@ -485,6 +568,7 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
 
     def _security_headers(self) -> None:
         self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-XSS-Protection", "0")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Cross-Origin-Opener-Policy", "same-origin")
@@ -515,6 +599,12 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
         except ValueError:
             return peer
 
+    def _user_agent_fingerprint(self) -> str:
+        user_agent = str(self.headers.get("User-Agent") or "").strip()
+        if not user_agent:
+            return "none"
+        return hashlib.sha256(user_agent.encode("utf-8")).hexdigest()[:12]
+
     def _send_prepared(
         self,
         status: HTTPStatus,
@@ -544,7 +634,11 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
         self._security_headers()
         self.end_headers()
         if not head_only:
-            self.wfile.write(body)
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                # A browser navigation or aborted fetch is not a server fault.
+                return
 
     def _send_json(
         self,
@@ -601,6 +695,11 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                 "text/css; charset=utf-8",
                 "public, max-age=300",
             ),
+            "/time-axis.js": (
+                self.server.public_static_root / "time-axis.js",
+                "text/javascript; charset=utf-8",
+                "public, max-age=300",
+            ),
             "/robots.txt": (
                 self.server.public_static_root / "robots.txt",
                 "text/plain; charset=utf-8",
@@ -611,6 +710,7 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
             ("/taifex/", self.server.taifex_static_root),
             ("/tw-day-trade/", self.server.tw_static_root),
             ("/shioaji/", self.server.shioaji_static_root),
+            ("/openbb/", self.server.openbb_static_root),
         ):
             suffix = path.removeprefix(prefix) if path.startswith(prefix) else None
             if suffix in {"", "index.html"}:
@@ -649,9 +749,7 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
             strict_parsing=False,
             max_num_fields=1,
         )
-        if set(query) - {"date"} or any(
-            len(values) != 1 for values in query.values()
-        ):
+        if set(query) - {"date"} or any(len(values) != 1 for values in query.values()):
             raise ValueError("unsupported or repeated query field")
         value = str(query.get("date", [""])[0]).strip()
         if not value:
@@ -695,6 +793,23 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
         )
 
     @staticmethod
+    def _history_range_query(raw_query: str) -> str:
+        query = parse_qs(
+            raw_query,
+            keep_blank_values=True,
+            strict_parsing=False,
+            max_num_fields=1,
+        )
+        if set(query) - {"range"} or any(
+            len(values) != 1 for values in query.values()
+        ):
+            raise ValueError("unsupported or repeated query field")
+        value = str(query.get("range", ["1d"])[0]).strip().lower() or "1d"
+        if value not in {"1h", "1d", "1w", "1mo", "1q", "1y", "all"}:
+            raise ValueError("unsupported chart range")
+        return value
+
+    @staticmethod
     def _event_query(raw_query: str) -> str:
         query = parse_qs(
             raw_query,
@@ -732,7 +847,8 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
             return self.server.cached_local_json(
                 cache_key="public-overview",
                 ttl_seconds=2.0,
-                cache_control="public, max-age=2, stale-while-revalidate=8",
+                cache_control="no-store",
+                stale_grace_seconds=0.0,
                 builder=self.server.public_overview,
             )
         if path == "/taifex/api/status":
@@ -740,25 +856,34 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                 cache_key="taifex-status",
                 upstream_url=f"{self.server.taifex_upstream}/api/status",
                 ttl_seconds=2.0,
-                cache_control="public, max-age=2, stale-while-revalidate=8",
+                cache_control="no-store",
+                stale_grace_seconds=0.0,
                 sanitizer=sanitize_taifex_status,
             )
         if path == "/taifex/api/history":
+            range_key = self._history_range_query(raw_query)
             return self.server.cached_json(
-                cache_key="taifex-history",
-                upstream_url=f"{self.server.taifex_upstream}/api/history",
+                cache_key=f"taifex-history:{range_key}",
+                upstream_url=(
+                    f"{self.server.taifex_upstream}/api/history?"
+                    f"{urlencode({'range': range_key})}"
+                ),
                 ttl_seconds=55.0,
-                cache_control="public, max-age=30, stale-while-revalidate=30",
+                cache_control="no-cache",
+                stale_grace_seconds=180.0,
                 sanitizer=sanitize_taifex_history,
             )
         if path == "/tw-day-trade/api/status":
             return self.server.tw_status(self._date_query(raw_query))
+        if path == "/tw-day-trade/api/history":
+            return self.server.tw_history(self._history_range_query(raw_query))
         if path == "/tw-day-trade/api/summary":
             session_date = self._date_query(raw_query)
             return self.server.cached_local_json(
                 cache_key=f"tw-summary:{session_date or 'latest'}",
                 ttl_seconds=2.0,
-                cache_control="public, max-age=2, stale-while-revalidate=8",
+                cache_control="no-store",
+                stale_grace_seconds=0.0,
                 builder=lambda: summarize_tw_status(
                     _response_json(self.server.tw_status(session_date))
                 ),
@@ -769,7 +894,8 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                 cache_key=f"tw-signals:{normalized}",
                 upstream_url=f"{self.server.tw_upstream}/api/signals?{normalized}",
                 ttl_seconds=2.0,
-                cache_control="public, max-age=2, stale-while-revalidate=8",
+                cache_control="no-store",
+                stale_grace_seconds=0.0,
                 sanitizer=sanitize_tw_signals,
             )
         if path == "/tw-day-trade/api/events":
@@ -783,7 +909,8 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
             return self.server.cached_local_json(
                 cache_key=f"tw-events:{normalized}",
                 ttl_seconds=2.0,
-                cache_control="public, max-age=2, stale-while-revalidate=8",
+                cache_control="no-store",
+                stale_grace_seconds=0.0,
                 builder=lambda: sanitize_tw_events(
                     build_dashboard_event_page(
                         state_dir=self.server.repo_root
@@ -800,9 +927,14 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
             return self.server.cached_local_json(
                 cache_key="shioaji-status",
                 ttl_seconds=8.0,
-                cache_control="public, max-age=5, stale-while-revalidate=15",
+                cache_control="no-store",
+                stale_grace_seconds=0.0,
                 builder=lambda: build_shioaji_public_status(self.server.repo_root),
             )
+        if path == "/openbb/api/status":
+            return self.server.openbb_status()
+        if path == "/openbb/api/history":
+            return self.server.openbb_history(self._history_range_query(raw_query))
         raise KeyError(path)
 
     def _handle(self, *, head_only: bool) -> None:
@@ -815,7 +947,7 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
             return
         parsed = urlparse(self.path)
         path = parsed.path
-        if path in {"/taifex", "/tw-day-trade", "/shioaji"}:
+        if path in {"/taifex", "/tw-day-trade", "/shioaji", "/openbb"}:
             self._redirect(f"{path}/", head_only=head_only)
             return
         if path == "/healthz":
@@ -835,20 +967,19 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
             return
 
         is_api = "/api/" in path
-        if is_api and not self.server.rate_limiter.allow(
-            self._client_key(), cost=5.0 if path.endswith("/api/history") else 1.0
-        ):
-            self.send_response(HTTPStatus.TOO_MANY_REQUESTS)
-            self.send_header("Retry-After", "5")
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            body = b'{"error":"rate_limited"}\n'
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "no-store")
-            self._security_headers()
-            self.end_headers()
-            if not head_only:
-                self.wfile.write(body)
-            return
+        if is_api:
+            within_observation_envelope = self.server.request_auditor.allow(
+                self._client_key(),
+                cost=PUBLIC_AUDIT_HISTORY_COST
+                if path.endswith("/api/history")
+                else 1.0,
+            )
+            if not within_observation_envelope:
+                sys.stderr.write(
+                    "public-dashboard audit=burst_threshold_exceeded "
+                    f"action=allowed peer={self._client_key()} path={path} "
+                    f"user_agent_hash={self._user_agent_fingerprint()}\n"
+                )
 
         if is_api:
             if not self.server.api_slots.acquire(blocking=False):
@@ -933,6 +1064,7 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         sys.stderr.write(
             f"public-dashboard peer={self._client_key()} path={path} "
+            f"user_agent_hash={self._user_agent_fingerprint()} "
             f"message={format % args}\n"
         )
 
@@ -959,6 +1091,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path("services/shioaji_api_dashboard"),
     )
+    parser.add_argument(
+        "--openbb-static-root",
+        type=Path,
+        default=Path("services/openbb_archive_dashboard"),
+    )
     parser.add_argument("--repo-root", type=Path, default=REPO_ROOT)
     parser.add_argument("--taifex-upstream", default="http://127.0.0.1:8765")
     parser.add_argument("--tw-upstream", default="http://127.0.0.1:8766")
@@ -975,6 +1112,7 @@ def main(argv: list[str] | None = None) -> int:
         taifex_static_root=Path(args.taifex_static_root),
         tw_static_root=Path(args.tw_static_root),
         shioaji_static_root=Path(args.shioaji_static_root),
+        openbb_static_root=Path(args.openbb_static_root),
         repo_root=Path(args.repo_root),
         taifex_upstream=str(args.taifex_upstream),
         tw_upstream=str(args.tw_upstream),

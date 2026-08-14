@@ -28,6 +28,9 @@ body {
 
 .public-brand,
 .brand {
+  display: inline-flex;
+  min-height: 40px;
+  align-items: center;
   font-size: 12px;
   font-weight: 850;
   letter-spacing: .17em;
@@ -119,6 +122,7 @@ dd,
 .taifex-dashboard #equity-chart,
 .taifex-dashboard .curve-card,
 .taifex-dashboard .strategy-card,
+.taifex-dashboard .parity-grid > div,
 .taifex-dashboard .exposure-summary div,
 .taifex-dashboard .cycle-glance div {
   color: var(--ink);
@@ -186,6 +190,40 @@ dd,
     animation-iteration-count: 1 !important;
     transition-duration: .01ms !important;
   }
+}
+
+.time-range-control {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: .35rem;
+}
+.time-range-control > span {
+  color: var(--muted, #64748b);
+  font-size: .78rem;
+  margin-right: .15rem;
+}
+.time-range-control button {
+  min-height: 2rem;
+  padding: .35rem .58rem;
+  border: 1px solid var(--line, rgba(148, 163, 184, .35));
+  border-radius: 999px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: .78rem;
+  cursor: pointer;
+}
+.time-range-control button[aria-pressed="true"] {
+  border-color: var(--accent, #21c7a8);
+  background: rgba(33, 199, 168, .16);
+  color: var(--text, inherit);
+  font-weight: 700;
+}
+.time-range-note {
+  margin: .55rem 0 0;
+  color: var(--muted, #64748b);
+  font-size: .8rem;
 }
 
 @media print {

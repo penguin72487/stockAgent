@@ -29,6 +29,7 @@ from stockagent.live.market_config import (  # noqa: E402
 from stockagent.live.quote_provider import (  # noqa: E402
     fetch_futures_snapshot_prefer_stream,
     fetch_shioaji_stock_snapshots,
+    warm_shioaji_stock_quote_client,
 )
 from stockagent.live.tw_day_trade_simulation import (  # noqa: E402
     CLOSING_AUCTION_TIME,
@@ -44,6 +45,15 @@ from stockagent.live.tw_day_trade_simulation import (  # noqa: E402
 
 
 TAIPEI = ZoneInfo("Asia/Taipei")
+_LATEST_SIGNAL_CACHE: dict[
+    str, tuple[tuple[int, int], dict[str, Any], list[dict[str, Any]]]
+] = {}
+_ELIGIBILITY_CACHE: dict[
+    tuple[str, str, str], tuple[set[str], dict[str, Any], dict[str, Any]]
+] = {}
+_LEGACY_SIGNAL_SCAN_CACHE: dict[
+    str, tuple[float, tuple[dict[str, Any], list[dict[str, Any]]] | None]
+] = {}
 
 
 def _repo_path(value: str | Path) -> Path:
@@ -117,6 +127,49 @@ def _mode_specs(
 def _latest_signal(
     spec: ModeSpec, now: datetime
 ) -> tuple[dict[str, Any], list[dict[str, Any]]] | None:
+    pointer_path = spec.live_output_dir / "latest_signal.json"
+    try:
+        pointer_stat = pointer_path.stat()
+        signature = (pointer_stat.st_mtime_ns, pointer_stat.st_size)
+        cache_key = str(pointer_path.resolve())
+        cached = _LATEST_SIGNAL_CACHE.get(cache_key)
+        if cached and cached[0] == signature:
+            summary, rows = cached[1], cached[2]
+            if str(summary.get("asof_date") or "")[:10] == now.date().isoformat():
+                return dict(summary), list(rows)
+            return None
+        pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+        summary_path = Path(str(pointer.get("summary_path") or ""))
+        weights_path = Path(str(pointer.get("weights_path") or ""))
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        if (
+            isinstance(summary, dict)
+            and str(summary.get("market")) == str(spec.signal_market or spec.market)
+            and str(summary.get("asof_date") or "")[:10] == now.date().isoformat()
+            and weights_path.is_file()
+        ):
+            rows = pl.read_parquet(weights_path).to_dicts()
+            summary = dict(summary)
+            summary["summary_path"] = str(summary_path)
+            summary["weights_path"] = str(weights_path)
+            _LATEST_SIGNAL_CACHE[cache_key] = (signature, summary, rows)
+            return dict(summary), list(rows)
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        pass
+
+    # Compatibility path for artifacts written before latest_signal.json.
+    # Current writers avoid this recursive scan on the opening hot path, and
+    # old writers are sampled at most once per five seconds.
+    legacy_cache_key = f"{spec.live_output_dir.resolve()}:{now.date().isoformat()}"
+    cached_legacy = _LEGACY_SIGNAL_SCAN_CACHE.get(legacy_cache_key)
+    monotonic_now = time_module.monotonic()
+    if cached_legacy and monotonic_now < cached_legacy[0]:
+        cached_result = cached_legacy[1]
+        return (
+            (dict(cached_result[0]), list(cached_result[1]))
+            if cached_result is not None
+            else None
+        )
     candidates = list(
         spec.live_output_dir.glob(f"{now.date().isoformat()}*/**/summary.json")
     )
@@ -137,15 +190,66 @@ def _latest_signal(
         except Exception:
             continue
     if not ranked:
+        _LEGACY_SIGNAL_SCAN_CACHE[legacy_cache_key] = (monotonic_now + 5.0, None)
         return None
     _generated, summary_path, summary = max(ranked, key=lambda item: item[0])
     weights_path = summary_path.with_name("target_weights.parquet")
     if not weights_path.is_file():
+        _LEGACY_SIGNAL_SCAN_CACHE[legacy_cache_key] = (monotonic_now + 5.0, None)
         return None
     rows = pl.read_parquet(weights_path).to_dicts()
     summary = dict(summary)
     summary["summary_path"] = str(summary_path)
-    return summary, rows
+    result = (summary, rows)
+    _LEGACY_SIGNAL_SCAN_CACHE[legacy_cache_key] = (
+        monotonic_now + 5.0,
+        result,
+    )
+    return dict(summary), list(rows)
+
+
+def _entry_candidate_symbols(
+    *,
+    spec: ModeSpec,
+    rows: list[dict[str, Any]],
+    eligibility: dict[str, Any],
+) -> tuple[set[str], dict[str, float]]:
+    """Quote only eligible names capable of producing a whole-lot order."""
+
+    symbols: set[str] = set()
+    fallback: dict[str, float] = {}
+    for row in rows:
+        weight = float(row.get("target_weight") or 0.0)
+        if weight == 0.0 or not bool(row.get("tradable")):
+            continue
+        if weight > 0.0 and not bool(row.get("can_buy")):
+            continue
+        if weight < 0.0 and not bool(row.get("can_sell")):
+            continue
+        symbol = str(row.get("symbol") or "")
+        evidence = eligibility.get(symbol)
+        if (
+            not symbol
+            or evidence is None
+            or not evidence.covered
+            or not evidence.eligible
+            or (weight < 0.0 and not evidence.short_open)
+        ):
+            continue
+        sizing_price = float(
+            row.get("open_price") or row.get("current_price") or 0.0
+        )
+        if np.isfinite(sizing_price) and sizing_price > 0.0:
+            requested = int(
+                abs(weight) * float(spec.initial_capital_twd) / sizing_price
+            )
+            if requested < int(spec.lot_size):
+                continue
+            fallback[symbol] = sizing_price
+        else:
+            fallback[symbol] = 1.0
+        symbols.add(symbol)
+    return symbols, fallback
 
 
 def _fetch_quotes(
@@ -179,6 +283,36 @@ def _rule_data_dir(live: LiveMarketConfig, spec: ModeSpec) -> Path:
         parquet_root=spec.parquet_root,
         repo_root=REPO_ROOT,
     )
+
+
+def _cached_live_eligibility(
+    *,
+    rule_data_dir: Path,
+    parquet_root: Path,
+    symbols: list[str],
+    trading_date: datetime,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    requested = {symbol for symbol in symbols if symbol}
+    key = (
+        str(rule_data_dir.resolve()),
+        str(parquet_root.resolve()),
+        trading_date.date().isoformat(),
+    )
+    cached = _ELIGIBILITY_CACHE.get(key)
+    if cached and requested.issubset(cached[0]):
+        return ({symbol: cached[1][symbol] for symbol in requested}, dict(cached[2]))
+    union = requested | (cached[0] if cached else set())
+    resolved, coverage = load_live_eligibility(
+        rule_data_dir=rule_data_dir,
+        parquet_root=parquet_root,
+        symbols=sorted(union),
+        trading_date=trading_date.date(),
+    )
+    # Missing same-day files can legitimately appear during pre-open recovery;
+    # do not freeze a fail-closed miss in the process cache.
+    if all(bool(row.get("covered")) for row in coverage.values()):
+        _ELIGIBILITY_CACHE[key] = (union, resolved, coverage)
+    return ({symbol: resolved[symbol] for symbol in requested}, coverage)
 
 
 def _current_eligibility_coverage(
@@ -243,6 +377,26 @@ def _active_quote_due(
     )
 
 
+def _loop_sleep_seconds(
+    observed: datetime,
+    *,
+    fast_seconds: float,
+    has_pending_signal: bool,
+    has_open_position: bool,
+) -> float:
+    """Use 10 Hz only around latency-critical state transitions."""
+
+    wall_time = observed.timetz().replace(tzinfo=None)
+    opening_hot_path = datetime_time(8, 59, 30) <= wall_time < datetime_time(9, 10)
+    exit_hot_path = datetime_time(13, 19, 30) <= wall_time < CLOSING_AUCTION_TIME
+    force_exit_hot_path = (
+        has_open_position and FORCE_EXIT_TIME <= wall_time < CLOSING_AUCTION_TIME
+    )
+    if has_pending_signal or opening_hot_path or exit_hot_path or force_exit_hot_path:
+        return max(0.01, float(fast_seconds))
+    return max(1.0, float(fast_seconds))
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -253,7 +407,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path("artifacts/live/tw_day_trade_simulation"),
     )
-    parser.add_argument("--poll-seconds", type=float, default=2.0)
+    parser.add_argument("--poll-seconds", type=float, default=0.1)
     parser.add_argument("--once", action="store_true")
     parser.add_argument(
         "--rearm-flat-session",
@@ -318,11 +472,25 @@ def main(argv: list[str] | None = None) -> int:
     last_readiness = 0.0
     last_quote_minute: str | None = None
     last_benchmark_minute: str | None = None
-    pending_retry_minute: dict[str, str] = {}
+    pending_retry_after: dict[str, float] = {}
     print(
         f"[tw-day-trade-sim] state_dir={engine.state_dir} simulation_only=true",
         flush=True,
     )
+    prewarm_started = time_module.perf_counter()
+    try:
+        warm_shioaji_stock_quote_client()
+        print(
+            "[tw-day-trade-sim] shioaji_prewarm=ready "
+            f"elapsed_ms={(time_module.perf_counter() - prewarm_started) * 1000.0:.3f}",
+            flush=True,
+        )
+    except Exception as exc:
+        print(
+            f"[tw-day-trade-sim] shioaji_prewarm=failed "
+            f"error={type(exc).__name__}: {exc}",
+            flush=True,
+        )
 
     while True:
         monotonic_now = time_module.monotonic()
@@ -347,7 +515,16 @@ def main(argv: list[str] | None = None) -> int:
             last_readiness = monotonic_now
 
         pending: list[
-            tuple[ModeSpec, LiveMarketConfig, dict[str, Any], list[dict[str, Any]]]
+            tuple[
+                ModeSpec,
+                LiveMarketConfig,
+                dict[str, Any],
+                list[dict[str, Any]],
+                dict[str, Any],
+                dict[str, Any],
+                float,
+                datetime,
+            ]
         ] = []
         pending_symbols: set[str] = set()
         pending_fallback: dict[str, float] = {}
@@ -355,27 +532,60 @@ def main(argv: list[str] | None = None) -> int:
             timespec="minutes"
         )
         for spec in specs:
+            mode = engine.state.get("modes", {}).get(spec.market, {})
+            if (
+                str(mode.get("session_date") or "") == observed.date().isoformat()
+                and mode.get("entry_completed_at")
+            ):
+                continue
             latest = _latest_signal(spec, observed)
             if latest is None:
                 continue
             summary, rows = latest
-            mode = engine.state.get("modes", {}).get(spec.market, {})
+            detected_at = datetime.now(TAIPEI)
             signal_id = str(summary.get("signal_id") or "")
             if signal_id in set(mode.get("processed_signal_ids") or ()):
                 continue
-            if pending_retry_minute.get(spec.market) == minute_key:
+            if monotonic_now < pending_retry_after.get(spec.market, 0.0):
                 continue
-            pending.append((spec, live_configs[spec.market], summary, rows))
-            for row in rows:
-                if abs(float(row.get("target_weight") or 0.0)) <= 0.0:
-                    continue
-                symbol = str(row.get("symbol") or "")
-                if not symbol:
-                    continue
-                pending_symbols.add(symbol)
-                pending_fallback[symbol] = float(
-                    row.get("current_price") or row.get("open_price") or 1.0
+            live = live_configs[spec.market]
+            eligibility_started = time_module.perf_counter()
+            row_symbols = [str(row.get("symbol") or "") for row in rows]
+            try:
+                eligibility, coverage = _cached_live_eligibility(
+                    rule_data_dir=_rule_data_dir(live, spec),
+                    parquet_root=spec.parquet_root,
+                    symbols=row_symbols,
+                    trading_date=observed,
                 )
+            except Exception as exc:
+                print(
+                    f"[tw-day-trade-sim] market={spec.market} "
+                    f"eligibility_error={type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+                pending_retry_after[spec.market] = time_module.monotonic() + 0.5
+                continue
+            candidate_symbols, candidate_fallback = _entry_candidate_symbols(
+                spec=spec,
+                rows=rows,
+                eligibility=eligibility,
+            )
+            eligibility_ms = (time_module.perf_counter() - eligibility_started) * 1000.0
+            pending.append(
+                (
+                    spec,
+                    live,
+                    summary,
+                    rows,
+                    eligibility,
+                    coverage,
+                    eligibility_ms,
+                    detected_at,
+                )
+            )
+            pending_symbols.update(candidate_symbols)
+            pending_fallback.update(candidate_fallback)
 
         active_symbols, active_fallback = _active_symbols(engine)
         wall_time = observed.timetz().replace(tzinfo=None)
@@ -409,6 +619,7 @@ def main(argv: list[str] | None = None) -> int:
             | benchmark_symbols
         )
         quotes: dict[str, dict[str, Any]] = {}
+        quote_fetch_ms = 0.0
         if all_symbols and specs:
             fallback = {
                 **engine.benchmark_fallback_prices(),
@@ -421,6 +632,7 @@ def main(argv: list[str] | None = None) -> int:
                 # missing evidence rather than retried every two seconds.
                 last_quote_minute = minute_key
             try:
+                quote_started = time_module.perf_counter()
                 quotes = _fetch_quotes(
                     symbols=all_symbols,
                     fallback_by_symbol=fallback,
@@ -428,6 +640,7 @@ def main(argv: list[str] | None = None) -> int:
                     trading_date=observed,
                 )
                 quotes = engine.prepare_minute_quotes(quotes, now=observed)
+                quote_fetch_ms = (time_module.perf_counter() - quote_started) * 1000.0
             except Exception as exc:
                 print(
                     f"[tw-day-trade-sim] quote_error={type(exc).__name__}: {exc}",
@@ -453,15 +666,19 @@ def main(argv: list[str] | None = None) -> int:
                     flush=True,
                 )
 
-        for spec, live, summary, rows in pending:
-            symbols = [str(row.get("symbol") or "") for row in rows]
+        for (
+            spec,
+            _live,
+            summary,
+            rows,
+            eligibility,
+            coverage,
+            eligibility_ms,
+            detected_at,
+        ) in pending:
             try:
-                eligibility, coverage = load_live_eligibility(
-                    rule_data_dir=_rule_data_dir(live, spec),
-                    parquet_root=spec.parquet_root,
-                    symbols=symbols,
-                    trading_date=observed.date(),
-                )
+                ledger_started = time_module.perf_counter()
+                register_observed = datetime.now(TAIPEI)
                 result = engine.register_signal(
                     spec=spec,
                     summary=summary,
@@ -469,12 +686,25 @@ def main(argv: list[str] | None = None) -> int:
                     quotes=quotes,
                     eligibility=eligibility,
                     eligibility_coverage=coverage,
-                    now=observed,
+                    now=register_observed,
                 )
+                ledger_ms = (time_module.perf_counter() - ledger_started) * 1000.0
+                persisted_at = datetime.now(TAIPEI)
                 if result in {"waiting_quote", "waiting_first_minute"}:
-                    pending_retry_minute[spec.market] = minute_key
+                    pending_retry_after[spec.market] = time_module.monotonic() + 0.5
                 else:
-                    pending_retry_minute.pop(spec.market, None)
+                    pending_retry_after.pop(spec.market, None)
+                    engine.record_latency_sample(
+                        market=spec.market,
+                        signal_id=str(summary.get("signal_id") or ""),
+                        result=result,
+                        summary=summary,
+                        consumer_detected_at=detected_at,
+                        ledger_persisted_at=persisted_at,
+                        executor_quote_fetch_ms=quote_fetch_ms,
+                        eligibility_load_ms=eligibility_ms,
+                        ledger_compute_persist_ms=ledger_ms,
+                    )
                 if result == "registered":
                     # register_signal already persisted this minute's complete
                     # liquidation mark from the causally later fill quote.
@@ -494,7 +724,7 @@ def main(argv: list[str] | None = None) -> int:
         if quote_due:
             engine.process_quotes(
                 quotes=quotes,
-                now=observed,
+                now=datetime.now(TAIPEI),
                 append_mark_history=not same_minute_force_exit_retry,
             )
         if benchmark_due and specs:
@@ -507,12 +737,23 @@ def main(argv: list[str] | None = None) -> int:
                 current_future_contract_code=current_contract or None,
                 current_future_quote=future_quotes.get(current_contract) or {},
                 previous_future_quote=future_quotes.get(previous_contract) or {},
-                now=observed,
+                corporate_action_reference_path=(
+                    _rule_data_dir(live_configs[specs[0].market], specs[0])
+                    / "tw_corporate_action_reference.parquet"
+                ),
+                now=datetime.now(TAIPEI),
             )
 
         if args.once:
             return 0
-        time_module.sleep(float(args.poll_seconds))
+        time_module.sleep(
+            _loop_sleep_seconds(
+                datetime.now(TAIPEI),
+                fast_seconds=float(args.poll_seconds),
+                has_pending_signal=bool(pending),
+                has_open_position=bool(active_symbols),
+            )
+        )
 
 
 if __name__ == "__main__":

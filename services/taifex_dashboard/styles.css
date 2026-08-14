@@ -91,6 +91,10 @@ button:focus-visible, select:focus-visible, input:focus-visible, .table-scroll:f
 .chart-baseline { stroke: #7c8994; stroke-width: 1.2; stroke-dasharray: 5 5; }
 .chart-line { fill: none; stroke: var(--blue); stroke-width: 3; stroke-linecap: round; stroke-linejoin: round; }
 .chart-label { fill: var(--muted); font: 12px "SFMono-Regular", Consolas, monospace; }
+.chart-time-grid { stroke: var(--line); stroke-width: 1; opacity: .65; }
+.chart-time-grid.session { stroke: var(--gold); stroke-width: 1.4; stroke-dasharray: 4 3; opacity: 1; }
+.chart-session-label { fill: var(--gold); font-weight: 700; }
+.chart-scroll { overflow-x: auto; }
 .chart-note { min-height: 20px; margin: 10px 0 0; color: var(--muted); font-size: 13px; }
 .curve-wall { margin-bottom: 16px; }
 .exposure-controls { display: flex; justify-content: flex-end; gap: 8px; align-items: center; flex-wrap: wrap; }
@@ -118,6 +122,7 @@ button:focus-visible, select:focus-visible, input:focus-visible, .table-scroll:f
 .detail-list div { display: flex; justify-content: space-between; gap: 20px; padding: 11px 0; border-bottom: 1px solid #edf1f3; }
 .detail-list dt { color: var(--muted); }
 .detail-list dd { margin: 0; text-align: right; overflow-wrap: anywhere; }
+.detail-list a { display: inline-flex; min-height: 24px; align-items: center; }
 .cycle-glance { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; margin: 0 0 14px; }
 .cycle-glance div { min-width: 0; padding: 11px 12px; border-radius: 9px; background: #f7fafc; }
 .cycle-glance dt { color: var(--muted); font-size: 10px; }
@@ -255,7 +260,7 @@ td:first-child { white-space: normal; font-family: inherit; min-width: 280px; }
   .panel-head { display: grid; }
   label, select { width: 100%; }
   .detail-list.two-col { grid-template-columns: 1fr; }
-  #equity-chart { min-height: 230px; }
+  .chart-scroll #equity-chart { min-width: 820px; min-height: 230px; }
   .strategy-guide-grid { grid-template-columns: 1fr; }
   .curve-wall-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .exposure-controls { justify-content: stretch; }

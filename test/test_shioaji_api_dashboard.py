@@ -11,6 +11,7 @@ import pytest
 from stockagent.live.shioaji_api_dashboard import (
     CAPTURE_UNIT,
     HISTORY_UNIT,
+    TOP200_UNIT,
     ShioajiMonitorPaths,
     build_shioaji_public_status,
 )
@@ -176,18 +177,20 @@ def test_shioaji_public_status_reconciles_quota_progress_and_capture(
         "fop_stream",
         "futures_history",
         "hft_dataset",
+        "minute_research",
         "on_demand_snapshots",
         "stock_daily",
         "stock_minute",
         "top200_stream",
     }
-    assert payload["pipeline_summary"]["total"] == 8
+    assert payload["pipeline_summary"]["total"] == 9
     assert all(
         item["quota"] in {"historical", "realtime", "none"}
         for item in payload["pipelines"]
     )
     assert all(isinstance(item["fields"], list) for item in payload["pipelines"])
-    assert len(payload["traffic_breakdown"]) == 8
+    assert len(payload["traffic_breakdown"]) == 9
+    assert "實際費用依永豐最新帳戶契約" in payload["traffic"]["pricing_policy"]
     assert payload["storage"]["status"] == "collecting"
     forbidden = {
         "api_key",
@@ -208,6 +211,9 @@ def test_shioaji_dashboard_is_local_read_only_and_source_backed() -> None:
     javascript = (static_root / "app.js").read_text(encoding="utf-8")
     assert 'fetch("api/status"' in javascript
     assert "traffic-chart" in html
+    assert 'id="traffic-legend"' in html
+    assert 'data-series="usage"' in html
+    assert 'data-series="guard"' in html
     assert "ledger-body" in html
     assert "traffic-breakdown-body" in html
     assert "storage-growth-chart" in html
@@ -220,6 +226,9 @@ def test_shioaji_dashboard_is_local_read_only_and_source_backed() -> None:
     assert "renderTrafficLedger" in javascript
     assert "renderTrafficBreakdown" in javascript
     assert "renderStorage" in javascript
+    assert "HIDDEN_TRAFFIC_SERIES_STORAGE_KEY" in javascript
+    assert 'button[data-series]' in javascript
+    assert "syncTrafficLegend" in javascript
     assert "API Key、Secret" in html
     assert "http://" not in html and "https://" not in html
     assert "textContent" in javascript
@@ -281,7 +290,9 @@ def test_shioaji_public_status_allowlists_storage_snapshot(tmp_path: Path) -> No
     def runner(args: list[str] | tuple[str, ...]) -> subprocess.CompletedProcess[str]:
         command = list(args)
         if command[0] == "systemctl":
-            stdout = "ActiveState=active\nSubState=running\nNRestarts=0\nInvocationID=test\n"
+            stdout = (
+                "ActiveState=active\nSubState=running\nNRestarts=0\nInvocationID=test\n"
+            )
         else:
             stdout = ""
         return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
@@ -304,3 +315,55 @@ def test_shioaji_public_status_allowlists_storage_snapshot(tmp_path: Path) -> No
     assert payload["storage"]["summary"]["total_bytes"] == 1000
     assert payload["storage"]["datasets"][0]["average_daily_growth_bytes"] == 10
     assert "private_path" not in json.dumps(payload)
+
+
+def test_top200_connection_budget_is_intentional_wait_not_failure(
+    tmp_path: Path,
+) -> None:
+    inventory = tmp_path / "contracts.csv"
+    inventory.write_text("contract,priority\n", encoding="utf-8")
+    target = tmp_path / "target.txt"
+    target.write_text("2026-08-13\n", encoding="utf-8")
+
+    def runner(args: list[str] | tuple[str, ...]) -> subprocess.CompletedProcess[str]:
+        command = list(args)
+        if command[0] == "systemctl":
+            unit = command[2]
+            state = "inactive" if unit == TOP200_UNIT else "active"
+            stdout = (
+                f"ActiveState={state}\n"
+                f"SubState={'dead' if state == 'inactive' else 'running'}\n"
+                "NRestarts=0\nInvocationID=test\n"
+            )
+        else:
+            unit = command[command.index("--unit") + 1]
+            stdout = (
+                _journal_line(
+                    "capture_skipped reason=connection_budget",
+                    datetime(2026, 8, 14, 8, 0, tzinfo=UTC),
+                    "test",
+                )
+                if unit == TOP200_UNIT
+                else ""
+            )
+        return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
+
+    payload = build_shioaji_public_status(
+        tmp_path,
+        now=datetime(2026, 8, 14, 8, 0, tzinfo=UTC),
+        runner=runner,
+        paths=ShioajiMonitorPaths(
+            alias_inventory=inventory,
+            txfr1_manifest=tmp_path / "tx.json",
+            futures_history_root=tmp_path / "history",
+            target_end_date=target,
+            capture_root=tmp_path / "capture",
+            top200_capture_root=tmp_path / "top200",
+        ),
+    )
+    top200 = next(
+        item for item in payload["pipelines"] if item["id"] == "top200_stream"
+    )
+    assert top200["status"] == "waiting"
+    assert top200["status_label"] == "期權優先暫停"
+    assert not any(item["status"] == "failed" for item in payload["pipelines"])

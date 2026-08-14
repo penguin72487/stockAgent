@@ -5,6 +5,16 @@ const money = new Intl.NumberFormat("zh-TW", { maximumFractionDigits: 0 });
 const percent = new Intl.NumberFormat("zh-TW", { style: "percent", minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const ratio = new Intl.NumberFormat("zh-TW", { maximumFractionDigits: 2 });
 const compactMoney = new Intl.NumberFormat("zh-TW", { notation: "compact", maximumFractionDigits: 2 });
+const TIME_RANGES = {"1h": 3600e3, "1d": 86400e3, "1w": 7 * 86400e3, "1mo": 30 * 86400e3, "1q": 90 * 86400e3, "1y": 365 * 86400e3, all: Infinity};
+const TIME_RANGE_LABELS = {"1h": "1 小時", "1d": "1 天", "1w": "1 週", "1mo": "1 月", "1q": "1 季", "1y": "1 年", all: "全部"};
+const timeAxis = window.StockAgentTimeAxis;
+const TAIFEX_SESSIONS = [
+  {label: "夜收", minute: 5 * 60},
+  {label: "日開", minute: 8 * 60 + 45},
+  {label: "日收", minute: 13 * 60 + 45},
+  {label: "夜開", minute: 15 * 60},
+];
+const HISTORY_CLIENT_CACHE_MS = 45000;
 let selectedStrategy = "";
 let selectedCategory = "";
 let selectedDirectionalExposure = "";
@@ -14,6 +24,7 @@ let selectedSort = "fixed_capital_return";
 let sortDescending = true;
 let lastSnapshot = null;
 let cachedHistory = [];
+let cachedHistoryMeta = null;
 let curveVisibleCount = 12;
 let guideVisibleCount = 12;
 let strategySearch = "";
@@ -23,7 +34,13 @@ let lastHeavyRevision = "";
 let refreshInFlight = false;
 let historyInFlight = false;
 let lastHistoryEtag = "";
+let historyPayloadCache = new Map();
+let historyRetryTimer = null;
 let strategySearchFrame = null;
+let selectedTimeRange = "1d";
+
+try { selectedTimeRange = localStorage.getItem("taifex-equity-time-range") || "1d"; } catch (_error) { /* storage can be disabled */ }
+if (!(selectedTimeRange in TIME_RANGES)) selectedTimeRange = "1d";
 
 function byId(id) { return document.getElementById(id); }
 function setText(id, value) { byId(id).textContent = value ?? "—"; }
@@ -49,6 +66,27 @@ function localTime(value) {
     month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit",
     hour12: false, timeZone: "Asia/Taipei"
   }).format(new Date(value));
+}
+
+function historyTimeMs(row) {
+  const nanoseconds = Number(row?.decision_ts_ns);
+  if (Number.isFinite(nanoseconds) && nanoseconds > 0) return nanoseconds / 1e6;
+  const parsed = new Date(row?.recorded_at_utc || "").getTime();
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function filterHistoryByRange(history) {
+  const rows = (Array.isArray(history) ? history : []).filter((row) => historyTimeMs(row) != null);
+  if (!rows.length || selectedTimeRange === "all") return rows;
+  const anchor = Math.max(...rows.map(historyTimeMs));
+  const cutoff = anchor - TIME_RANGES[selectedTimeRange];
+  return rows.filter((row) => historyTimeMs(row) >= cutoff);
+}
+
+function syncTimeRangeControl() {
+  byId("equity-time-range").querySelectorAll("button[data-range]").forEach((button) => {
+    button.setAttribute("aria-pressed", String(button.dataset.range === selectedTimeRange));
+  });
 }
 
 function formatAge(value) {
@@ -185,7 +223,7 @@ function renderParity(snapshot) {
   ].join(" · "));
   const strike = parity.strike == null ? "—" : money.format(parity.strike);
   setText("parity-contracts", `${parity.series || "—"} · K ${strike} · ${parity.expiry_date || "—"}`);
-  setText("parity-prices", `C ${parity.call_code || "—"}@${parity.call_price ?? "—"} · P ${parity.put_code || "—"}@${parity.put_price ?? "—"} · TX ${parity.future_code || "—"}@${parity.future_price ?? "—"}`);
+  setText("parity-prices", `C ${parity.call_code || "—"}@${formatRatio(parity.call_price)} · P ${parity.put_code || "—"}@${formatRatio(parity.put_price)} · TX ${parity.future_code || "—"}@${formatRatio(parity.future_price)}`);
   setText("parity-causal-state", parityStateLabel(state));
   const counts = `掃描 ${parity.scanned_pair_count ?? 0} 組 · 可評估方向 ${parity.evaluable_direction_count ?? 0}`;
   const age = parity.maximum_book_age_ms == null ? "" : ` · 最老報價 ${ratio.format(Number(parity.maximum_book_age_ms))} ms`;
@@ -569,6 +607,7 @@ function svgNode(name, attrs = {}, text = "") {
 }
 
 function renderCurveWall(strategies, history) {
+  history = filterHistoryByRange(history);
   const grid = byId("curve-wall-grid");
   grid.replaceChildren();
   const filtered = sortedStrategies(filteredStrategies(strategies));
@@ -633,11 +672,12 @@ function renderCurveWall(strategies, history) {
   setText("curve-visible-count", `顯示 ${visible.length} / ${filtered.length}`);
   setText(
     "curve-wall-note",
-    `符合條件 ${filtered.length} / ${strategies.length} 條曲線；共用 Y 軸（${formatPercent(minY)} ～ ${formatPercent(maxY)}），以固定預留資金正規化；排序與下表一致。`
+    `${TIME_RANGE_LABELS[selectedTimeRange]} · 符合條件 ${filtered.length} / ${strategies.length} 條曲線；共用 Y 軸（${formatPercent(minY)} ～ ${formatPercent(maxY)}），以固定預留資金正規化；排序與下表一致。`
   );
 }
 
 function renderChart(history) {
+  history = filterHistoryByRange(history);
   const svg = byId("equity-chart");
   svg.replaceChildren();
   const rows = history.filter((row) => (
@@ -646,10 +686,10 @@ function renderChart(history) {
     && Number.isFinite(Number(row.total_equity_twd))
   ));
   if (rows.length < 2) {
-    setText("chart-note", "資料點不足；至少累積兩個每分鐘 mark 後才繪圖。");
+    setText("chart-note", `${TIME_RANGE_LABELS[selectedTimeRange]}內資料點不足；至少累積兩個每分鐘 mark 後才繪圖。`);
     return;
   }
-  const width = 900, height = 300, left = 76, right = 22, top = 22, bottom = 42;
+  const width = 900, height = 300, left = 76, right = 22, top = 22, bottom = 70;
   const values = rows.map((row) => Number(row.total_equity_twd));
   const baseline = Number(rows.at(-1).initial_capital_twd);
   const bounds = Number.isFinite(baseline) ? [...values, baseline] : values;
@@ -657,7 +697,13 @@ function renderChart(history) {
   if (minY === maxY) { minY -= 1; maxY += 1; }
   const pad = Math.max((maxY - minY) * 0.08, 1);
   minY -= pad; maxY += pad;
-  const x = (index) => left + index * (width - left - right) / (rows.length - 1);
+  const axis = timeAxis.buildTimeAxis({
+    range: selectedTimeRange,
+    timestamps: rows.map((row) => Number(row.decision_ts_ns) / 1e6),
+    sessions: TAIFEX_SESSIONS,
+  });
+  if (!axis) return;
+  const x = (row) => timeAxis.position(axis, Number(row.decision_ts_ns) / 1e6, left, width - right);
   const y = (value) => top + (maxY - value) * (height - top - bottom) / (maxY - minY);
   for (let i = 0; i <= 4; i += 1) {
     const value = minY + (maxY - minY) * i / 4;
@@ -666,18 +712,26 @@ function renderChart(history) {
     svg.appendChild(svgNode("text", { x: left - 10, y: yPos + 4, "text-anchor": "end", class: "chart-label" }, money.format(value)));
   }
   if (Number.isFinite(baseline)) svg.appendChild(svgNode("line", { x1: left, y1: y(baseline), x2: width - right, y2: y(baseline), class: "chart-baseline" }));
-  const points = rows.map((row, index) => `${x(index).toFixed(2)},${y(Number(row.total_equity_twd)).toFixed(2)}`).join(" ");
+  for (const tick of axis.ticks) {
+    const xPos = timeAxis.position(axis, tick.timestamp, left, width - right);
+    const lineClass = tick.kind === "session" ? "chart-time-grid session" : "chart-time-grid";
+    const labelClass = tick.kind === "session" ? "chart-label chart-session-label" : "chart-label";
+    svg.appendChild(svgNode("line", { x1: xPos, y1: top, x2: xPos, y2: height - bottom, class: lineClass }));
+    const labelY = tick.kind === "session" ? height - 34 : height - 8;
+    const attributes = { x: xPos, y: labelY, "text-anchor": tick.rotate ? "end" : "middle", class: labelClass };
+    if (tick.rotate) attributes.transform = `rotate(-45 ${xPos} ${labelY})`;
+    svg.appendChild(svgNode("text", attributes, tick.label));
+  }
+  const points = rows.map((row) => `${x(row).toFixed(2)},${y(Number(row.total_equity_twd)).toFixed(2)}`).join(" ");
   svg.appendChild(svgNode("polyline", { points, class: "chart-line" }));
   const first = new Date(Number(rows[0].decision_ts_ns) / 1e6);
   const last = new Date(Number(rows[rows.length - 1].decision_ts_ns) / 1e6);
-  svg.appendChild(svgNode("text", { x: left, y: height - 14, class: "chart-label" }, localTime(first.toISOString()).slice(6)));
-  svg.appendChild(svgNode("text", { x: width - right, y: height - 14, "text-anchor": "end", class: "chart-label" }, localTime(last.toISOString()).slice(6)));
   const changed = Math.max(...values) !== Math.min(...values);
   const carried = rows.filter((row) => row.valuation_carried_forward).length;
   const pnl = rows.at(-1).cumulative_pnl_twd;
   setText("chart-note", changed
-    ? `${rows.length} 個每分鐘點；${carried} 點延用上一筆完整估值；最後總權益 ${formatTwd(values.at(-1))}，累積損益 ${formatTwd(pnl)}。`
-    : `${rows.length} 個每分鐘點；${carried} 點延用上一筆完整估值；總權益維持 ${formatTwd(values.at(-1))}。`);
+    ? `${TIME_RANGE_LABELS[selectedTimeRange]} · ${rows.length} 點（${localTime(first.toISOString())} ～ ${localTime(last.toISOString())}）${cachedHistoryMeta?.downsampled ? "；長區間已保留區間高低極值縮圖" : ""}；${carried} 點延用上一筆完整估值；最後總權益 ${formatTwd(values.at(-1))}，累積損益 ${formatTwd(pnl)}。`
+    : `${TIME_RANGE_LABELS[selectedTimeRange]} · ${rows.length} 點（${localTime(first.toISOString())} ～ ${localTime(last.toISOString())}）${cachedHistoryMeta?.downsampled ? "；長區間已保留區間高低極值縮圖" : ""}；${carried} 點延用上一筆完整估值；總權益維持 ${formatTwd(values.at(-1))}。`);
 }
 
 function renderCounts(counts) {
@@ -747,7 +801,7 @@ async function refresh() {
   if (document.hidden || refreshInFlight) return;
   refreshInFlight = true;
   try {
-    const response = await fetch("api/status", { cache: "default" });
+    const response = await fetch("api/status", { cache: "no-store" });
     const payload = await response.json();
     if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
     render(payload);
@@ -762,27 +816,65 @@ async function refresh() {
   }
 }
 
-async function refreshHistory() {
-  if (document.hidden || historyInFlight) return;
+function applyHistoryPayload(payload, etag = "") {
+  lastHistoryEtag = etag;
+  cachedHistory = Array.isArray(payload.history) ? payload.history : [];
+  cachedHistoryMeta = payload;
+  if (lastSnapshot) {
+    lastSnapshot.history = cachedHistory;
+    renderChart(cachedHistory);
+    renderCurveWall(lastSnapshot.strategies, cachedHistory);
+    renderCounts(payload.record_counts || lastSnapshot.record_counts);
+  }
+}
+
+async function refreshHistory({preferCache = false} = {}) {
+  if (document.hidden) return;
+  const requestedRange = selectedTimeRange;
+  const cached = historyPayloadCache.get(requestedRange);
+  if (preferCache) {
+    if (cached) applyHistoryPayload(cached.payload, cached.etag);
+    else {
+      cachedHistory = [];
+      cachedHistoryMeta = null;
+      lastHistoryEtag = "";
+      if (lastSnapshot) { renderChart([]); renderCurveWall(lastSnapshot.strategies, []); }
+    }
+    if (cached && Date.now() - cached.receivedAt < HISTORY_CLIENT_CACHE_MS) return;
+  }
+  if (historyInFlight) return;
   historyInFlight = true;
   try {
-    const response = await fetch("api/history", { cache: "default" });
+    const response = await fetch(`api/history?range=${encodeURIComponent(requestedRange)}`, { cache: "default" });
+    if (response.status === 429) {
+      const retrySeconds = Math.min(30, Math.max(1, Number(response.headers.get("Retry-After")) || 5));
+      setText("curve-wall-note", `${TIME_RANGE_LABELS[requestedRange]}歷史請求稍多，保留目前曲線並於 ${retrySeconds} 秒後自動重試。`);
+      if (historyRetryTimer != null) clearTimeout(historyRetryTimer);
+      historyRetryTimer = window.setTimeout(() => {
+        historyRetryTimer = null;
+        if (requestedRange === selectedTimeRange) void refreshHistory();
+      }, retrySeconds * 1000);
+      return;
+    }
     const etag = response.headers.get("ETag") || "";
-    if (etag && etag === lastHistoryEtag) return;
+    if (requestedRange !== selectedTimeRange) return;
+    if (etag && cached?.etag === etag) {
+      cached.receivedAt = Date.now();
+      if (historyRetryTimer != null) clearTimeout(historyRetryTimer);
+      historyRetryTimer = null;
+      return;
+    }
     const payload = await response.json();
     if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
-    lastHistoryEtag = etag;
-    cachedHistory = Array.isArray(payload.history) ? payload.history : [];
-    if (lastSnapshot) {
-      lastSnapshot.history = cachedHistory;
-      renderChart(cachedHistory);
-      renderCurveWall(lastSnapshot.strategies, cachedHistory);
-      renderCounts(payload.record_counts || lastSnapshot.record_counts);
-    }
+    historyPayloadCache.set(requestedRange, {payload, etag, receivedAt: Date.now()});
+    if (historyRetryTimer != null) clearTimeout(historyRetryTimer);
+    historyRetryTimer = null;
+    applyHistoryPayload(payload, etag);
   } catch (error) {
     setText("curve-wall-note", `曲線歷史暫時無法更新：${error.message}`);
   } finally {
     historyInFlight = false;
+    if (requestedRange !== selectedTimeRange) void refreshHistory({preferCache: true});
   }
 }
 
@@ -853,6 +945,16 @@ byId("guide-load-more").addEventListener("click", () => {
   guideVisibleCount += 12;
   if (lastSnapshot) renderStrategyGuide(lastStrategyCatalog, lastStrategyCounts);
 });
+byId("equity-time-range").addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-range]");
+  if (!button || !(button.dataset.range in TIME_RANGES)) return;
+  selectedTimeRange = button.dataset.range;
+  if (historyRetryTimer != null) clearTimeout(historyRetryTimer);
+  historyRetryTimer = null;
+  try { localStorage.setItem("taifex-equity-time-range", selectedTimeRange); } catch (_error) { /* optional */ }
+  syncTimeRangeControl();
+  void refreshHistory({preferCache: true});
+});
 document.addEventListener("visibilitychange", () => {
   if (!document.hidden) refreshMinuteSnapshot();
 });
@@ -862,5 +964,6 @@ function refreshMinuteSnapshot() {
   void refreshHistory();
 }
 
+syncTimeRangeControl();
 refreshMinuteSnapshot();
 window.setInterval(refreshMinuteSnapshot, PRICE_REFRESH_MS);

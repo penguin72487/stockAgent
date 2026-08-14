@@ -9,6 +9,7 @@ import pytest
 
 from stockagent.live.taifex_volatility_dashboard import (
     _performance_metrics,
+    build_dashboard_history_snapshot,
     build_dashboard_snapshot,
 )
 
@@ -210,12 +211,8 @@ def test_dashboard_snapshot_is_bounded_fresh_and_account_safe(tmp_path: Path) ->
     assert payload["current_trading_date"] == "2026-08-13"
     assert payload["night_flatten_time"] == "04:55:00"
     assert payload["market"]["underlying_product"] == "TX"
-    assert payload["put_call_parity_tx"]["state"] == (
-        "signal_pending_next_books"
-    )
-    assert payload["put_call_parity_tx"]["net_after_estimated_cost_twd"] == (
-        23_160.0
-    )
+    assert payload["put_call_parity_tx"]["state"] == ("signal_pending_next_books")
+    assert payload["put_call_parity_tx"]["net_after_estimated_cost_twd"] == (23_160.0)
     assert payload["put_call_parity_tx"]["pending_signal"] == {
         "direction": "sell_rich_synthetic_buy_tx",
         "signal_decision_ts_ns": 123,
@@ -256,6 +253,28 @@ def test_dashboard_snapshot_fails_visible_when_source_is_stale(tmp_path: Path) -
         now=datetime(2026, 8, 12, 1, 30, tzinfo=timezone.utc),
     )
     assert payload["health"] == "stale"
+
+
+def test_dedicated_history_snapshot_is_range_aware_and_bounded(tmp_path: Path) -> None:
+    state_dir, receipts = _fixture(tmp_path)
+    now = datetime(2026, 8, 12, 1, 30, tzinfo=timezone.utc)
+    full = build_dashboard_snapshot(
+        state_dir=state_dir,
+        api_receipt_dir=receipts,
+        now=now,
+        mark_limit_per_strategy=8,
+    )
+    history = build_dashboard_history_snapshot(
+        state_dir=state_dir,
+        now=now,
+        mark_limit_per_strategy=8,
+    )
+    assert history["range"] == "1d"
+    assert {row["strategy_id"] for row in history["history"]} == {
+        row["strategy_id"] for row in full["history"]
+    }
+    assert history["history"][-1] == full["history"][-1]
+    assert history["record_counts"] == {"history_rows_returned": 16}
 
 
 def test_dashboard_marks_fresh_but_incomplete_strategy_valuation_as_degraded(
@@ -308,9 +327,7 @@ def test_dashboard_accepts_only_recent_explicit_carried_valuation_for_health(
     assert recent["market"]["strategy_recent_carried_valuation_count"] == 1
     assert recent["market"]["strategy_timely_valuation_count"] == 2
 
-    status["strategies"]["classic_opening_straddle"][
-        "valuation_age_seconds"
-    ] = 20.0
+    status["strategies"]["classic_opening_straddle"]["valuation_age_seconds"] = 20.0
     _write_json(status_path, status)
     old = build_dashboard_snapshot(
         state_dir=state_dir,
@@ -441,7 +458,11 @@ def test_dashboard_html_is_local_and_refreshes_the_read_only_api() -> None:
         "https://www.taifex.com.tw/cht/11/newsDetail?idx=17259&amp;newsType=1"
     ]
     assert 'fetch("api/status"' in javascript
-    assert 'fetch("api/history"' in javascript
+    assert "fetch(`api/history?range=${encodeURIComponent(requestedRange)}`" in javascript
+    assert "HISTORY_CLIENT_CACHE_MS" in javascript
+    assert "historyPayloadCache" in javascript
+    assert "response.status === 429" in javascript
+    assert "秒後自動重試" in javascript
     assert "const PRICE_REFRESH_MS = 60000" in javascript
     assert "function refreshMinuteSnapshot()" in javascript
     assert "window.setInterval(refreshMinuteSnapshot, PRICE_REFRESH_MS)" in javascript
@@ -476,18 +497,26 @@ def test_dashboard_html_is_local_and_refreshes_the_read_only_api() -> None:
     assert "compounded_return_to_live_mark" in javascript
     assert 'return {label: "資料逾時", state: "blocked"}' in javascript
     assert "if (document.hidden || refreshInFlight) return" in javascript
-    assert "if (document.hidden || historyInFlight) return" in javascript
+    assert "if (document.hidden) return" in javascript
+    assert "if (historyInFlight) return" in javascript
     assert "curveVisibleCount" in javascript
     assert "guideVisibleCount" in javascript
     assert 'snapshot.health === "degraded"' in javascript
-    assert 'href="styles.css?v=11"' in html
-    assert 'src="app.js?v=12"' in html
+    assert 'href="styles.css?v=12"' in html
+    assert 'src="../time-axis.js?v=3"' in html
+    assert 'src="app.js?v=16"' in html
+    assert 'id="equity-time-range"' in html
+    assert 'data-range="1y"' in html
+    assert 'data-range="all"' in html
     assert 'id="parity-net-edge"' in html
     assert "function renderParity" in javascript
     assert "row.underlying_futures_position" in javascript
     assert "之後每 1 分鐘同步刷新" in html
     assert 'class="strategy-table"' in html
-    assert '<th>策略／狀態</th><th>曝險／口數比</th><th>報酬</th><th>損益／成本</th><th>資金／保證金</th><th>部位／估值</th>' in html
+    assert (
+        "<th>策略／狀態</th><th>曝險／口數比</th><th>報酬</th><th>損益／成本</th><th>資金／保證金</th><th>部位／估值</th>"
+        in html
+    )
     assert "function appendTableMetric" in javascript
     assert "function strategyStatusPill" in javascript
     assert 'capital.dataset.label = "資金／保證金"' in javascript

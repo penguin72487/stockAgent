@@ -90,8 +90,7 @@ class ShioajiMonitorPaths:
             contract_inventory_manifest=root
             / "data_tw_futures/shioaji_contracts/manifest.json",
             snapshot_state=root / "artifacts/live/tw_day_trade_simulation/state.json",
-            traffic_ledger_summary=root
-            / "artifacts/live/shioaji_traffic/summary.json",
+            traffic_ledger_summary=root / "artifacts/live/shioaji_traffic/summary.json",
             storage_summary=root / "artifacts/live/shioaji_storage/summary.json",
         )
 
@@ -141,9 +140,7 @@ def _traffic_ledger_view(payload: dict[str, Any] | None) -> dict[str, Any]:
     }
 
 
-def _storage_view(
-    payload: dict[str, Any] | None, *, now: datetime
-) -> dict[str, Any]:
+def _storage_view(payload: dict[str, Any] | None, *, now: datetime) -> dict[str, Any]:
     """Allowlist a compact storage snapshot for the public response."""
 
     source = payload if isinstance(payload, dict) else {}
@@ -152,6 +149,9 @@ def _storage_view(
 
     def optional_number(value: Any) -> int | float | None:
         return value if isinstance(value, (int, float)) and value >= 0 else None
+
+    def optional_signed_number(value: Any) -> int | float | None:
+        return value if isinstance(value, (int, float)) else None
 
     summary_source = source.get("summary")
     summary_item = summary_source if isinstance(summary_source, dict) else {}
@@ -165,6 +165,8 @@ def _storage_view(
         "growth_window_days",
         "growth_window_bytes",
         "average_daily_growth_bytes",
+        "observed_growth_days",
+        "capacity_growth_estimate_bytes",
         "disk_total_bytes",
         "disk_used_bytes",
         "disk_free_bytes",
@@ -217,13 +219,21 @@ def _storage_view(
         ),
         "scan_seconds": optional_number(source.get("scan_seconds")),
         "summary": {
-            key: optional_number(summary_item.get(key)) for key in summary_keys
+            **{key: optional_number(summary_item.get(key)) for key in summary_keys},
+            "observed_average_daily_net_growth_bytes": optional_signed_number(
+                summary_item.get("observed_average_daily_net_growth_bytes")
+            ),
+            "capacity_growth_source": str(
+                summary_item.get("capacity_growth_source") or "unknown"
+            ),
         },
         "datasets": datasets,
         "daily_growth": daily_growth,
         "definitions": {
             str(key): str(value)
-            for key, value in (definitions if isinstance(definitions, dict) else {}).items()
+            for key, value in (
+                definitions if isinstance(definitions, dict) else {}
+            ).items()
             if isinstance(value, str)
         },
     }
@@ -265,11 +275,11 @@ def _traffic_breakdown(
             attributed_bytes: int | None = (
                 total("observed_usage_delta_bytes") if matched else None
             )
-            price_label = "無逐次資料費；受每日歷史流量額度限制"
+            price_label = "本地無費用欄位；受每日歷史流量額度限制"
         elif quota_class == "realtime":
             usage_status = "quota_exempt"
             attributed_bytes = 0
-            price_label = "無逐次資料費；即時推送不扣歷史流量"
+            price_label = "本地無費用欄位；即時推送不扣歷史流量"
         else:
             usage_status = "local_only"
             attributed_bytes = 0
@@ -630,9 +640,7 @@ def _latest_capture_receipt(root: Path | None) -> dict[str, Any]:
     return {
         "trade_date": str(latest.get("trade_date") or "") or None,
         "session": str(latest.get("capture_session") or "") or None,
-        "status": (
-            next(iter(status_values)) if len(status_values) == 1 else "mixed"
-        ),
+        "status": (next(iter(status_values)) if len(status_values) == 1 else "mixed"),
         "workers": len(selected),
         "instruments": sum(
             int(item.get("contract_count") or item.get("symbol_count") or 0)
@@ -713,12 +721,22 @@ def _top200_failure(entries: Iterable[dict[str, Any]]) -> dict[str, Any] | None:
         message = str(entry.get("MESSAGE") or "")
         code = None
         detail = None
+        if any(
+            marker in message
+            for marker in (
+                "runner_started=",
+                "capture_start=",
+                "capture_complete",
+                "reason=connection_budget",
+            )
+        ):
+            # A later clean lifecycle/wait record supersedes an older failed
+            # invocation.  Historical errors remain in the journal but must
+            # not permanently poison the current pipeline status.
+            failure = None
         if "ModuleNotFoundError" in message and "stockagent" in message:
             code = "runtime_import_error"
             detail = "執行環境找不到 stockagent 模組"
-        elif "reason=connection_budget" in message:
-            code = "connection_budget"
-            detail = "連線額度優先保留給期貨與選擇權即時擷取"
         elif "capture_failed" in message and failure is None:
             code = "capture_failed"
             detail = "最近一次擷取未完成"
@@ -727,6 +745,22 @@ def _top200_failure(entries: Iterable[dict[str, Any]]) -> dict[str, Any] | None:
         _epoch, observed_at = _entry_timestamp(entry)
         failure = {"code": code, "detail": detail, "observed_at_utc": observed_at}
     return failure
+
+
+def _top200_priority_wait(entries: Iterable[dict[str, Any]]) -> dict[str, Any] | None:
+    """Return the latest intentional derivatives-first connection gate."""
+
+    waiting: dict[str, Any] | None = None
+    for entry in entries:
+        if "reason=connection_budget" not in str(entry.get("MESSAGE") or ""):
+            continue
+        _epoch, observed_at = _entry_timestamp(entry)
+        waiting = {
+            "code": "connection_budget",
+            "detail": "連線額度依設定優先保留給期貨與選擇權即時擷取",
+            "observed_at_utc": observed_at,
+        }
+    return waiting
 
 
 def _capture_status(
@@ -904,9 +938,7 @@ def _build_pipelines(
         and (minute_audit or {}).get("status") == "research_ready"
     )
     minute_total = int((minute_summary or {}).get("selected_symbols") or 0)
-    minute_available = int(
-        (minute_audit or {}).get("available_source_symbols") or 0
-    )
+    minute_available = int((minute_audit or {}).get("available_source_symbols") or 0)
     minute_latest = _payload_time(
         minute_manifest,
         paths.minute_manifest,
@@ -949,9 +981,7 @@ def _build_pipelines(
 
     fop_receipt = _latest_capture_receipt(paths.capture_root)
     fop_audit = _latest_audit(paths.capture_root / "audits")
-    fop_latest = capture.get("latest_file_at_utc") or fop_receipt.get(
-        "finished_at_utc"
-    )
+    fop_latest = capture.get("latest_file_at_utc") or fop_receipt.get("finished_at_utc")
     if capture.get("state") == "capturing":
         fop_state, fop_label = "active", "即時寫入"
     elif capture_service.get("active"):
@@ -961,10 +991,13 @@ def _build_pipelines(
 
     top_receipt = _latest_capture_receipt(paths.top200_capture_root)
     top_failure = _top200_failure(top200_entries)
+    top_wait = _top200_priority_wait(top200_entries)
     if top200_service.get("active"):
         top_state, top_label = "active", "服務運行"
     elif top_failure:
         top_state, top_label = "failed", "最近執行失敗"
+    elif top_wait:
+        top_state, top_label = "waiting", "期權優先暫停"
     else:
         top_state, top_label = "stopped", "服務停止"
     top_latest = top_receipt.get("finished_at_utc")
@@ -1037,7 +1070,11 @@ def _build_pipelines(
             ],
             "warnings": (
                 ["歷史 Tick 的附帶 Bid/Ask 不是即時五檔委託簿。"]
-                + (["已到安全流量閘門，會等下一個配額窗口。"] if backfill_state == "waiting_quota" else [])
+                + (
+                    ["已到安全流量閘門，會等下一個配額窗口。"]
+                    if backfill_state == "waiting_quota"
+                    else []
+                )
             ),
             "service": _service_view(history_service),
         },
@@ -1057,17 +1094,66 @@ def _build_pipelines(
                 label="可研究標的",
             ),
             "latest_at_utc": minute_latest,
-            "fields": ["Open", "High", "Low", "Close", "Volume", "Amount", "1 分鐘時間"],
+            "fields": [
+                "Open",
+                "High",
+                "Low",
+                "Close",
+                "Volume",
+                "Amount",
+                "1 分鐘時間",
+            ],
             "metrics": [
                 _metric("完整標的", (minute_summary or {}).get("complete_symbols")),
-                _metric("來源缺口", (minute_summary or {}).get("complete_with_source_gap_symbols")),
+                _metric(
+                    "來源缺口",
+                    (minute_summary or {}).get("complete_with_source_gap_symbols"),
+                ),
                 _metric("交易日分區", (minute_audit or {}).get("partitions")),
-                _metric("研究列數", (minute_audit or {}).get("rows"), value_format="compact"),
+                _metric(
+                    "研究列數", (minute_audit or {}).get("rows"), value_format="compact"
+                ),
             ],
             "warnings": [
                 "88 檔有來源缺口、124 檔合約不可用；研究資料以遮罩保留可用範圍。"
-            ] if minute_ready and minute_total else [],
+            ]
+            if minute_ready and minute_total
+            else [],
             "service": _service_view(minute_service),
+        },
+        {
+            "id": "minute_research",
+            "title": "股票分鐘因果研究資料",
+            "category": "derived",
+            "api_surface": "由全市場 1 分 K 棒產生",
+            "quota": "none",
+            "status": "ready" if minute_ready else "partial",
+            "status_label": "研究稽核通過" if minute_ready else "等待完整稽核",
+            "detail": "將已落盤分鐘 K 棒轉成時間因果特徵、標籤與可交易遮罩。",
+            "coverage": _coverage(
+                (minute_audit or {}).get("available_source_symbols"),
+                minute_total,
+                unit="標的",
+                label="可研究標的",
+            ),
+            "latest_at_utc": minute_latest,
+            "fields": ["因果特徵", "報酬標籤", "可交易遮罩", "交易日分區"],
+            "metrics": [
+                _metric("交易日分區", (minute_audit or {}).get("partitions")),
+                _metric(
+                    "總列數", (minute_audit or {}).get("rows"), value_format="compact"
+                ),
+                _metric(
+                    "有效特徵列",
+                    (minute_audit or {}).get("feature_valid_rows"),
+                    value_format="compact",
+                ),
+                _metric(
+                    "可研究標的", (minute_audit or {}).get("available_source_symbols")
+                ),
+            ],
+            "warnings": ["這是本機衍生資料，不會額外呼叫 Shioaji API。"],
+            "service": None,
         },
         {
             "id": "stock_daily",
@@ -1088,14 +1174,22 @@ def _build_pipelines(
             "fields": ["日 Open", "High", "Low", "Close", "成交股數", "成交金額"],
             "metrics": [
                 _metric("完整標的", (daily_summary or {}).get("complete_symbols")),
-                _metric("不可用", (daily_summary or {}).get("contract_unavailable_symbols")),
+                _metric(
+                    "不可用", (daily_summary or {}).get("contract_unavailable_symbols")
+                ),
                 _metric("失敗", (daily_summary or {}).get("failed_symbols")),
-                _metric("上次執行用量", (daily_summary or {}).get("traffic_used_bytes"), value_format="bytes"),
+                _metric(
+                    "上次執行用量",
+                    (daily_summary or {}).get("traffic_used_bytes"),
+                    value_format="bytes",
+                ),
             ],
             "warnings": [
                 "這是舊次執行的流量紀錄，不代表上方本日全域配額。",
                 "混合資料尚未通過全市場最終完成閘門。",
-            ] if daily_summary else [],
+            ]
+            if daily_summary
+            else [],
             "service": {"active": False, "state": "manual", "restarts": None},
         },
         {
@@ -1109,16 +1203,33 @@ def _build_pipelines(
             "detail": "大台、微台與台指選擇權分三個 worker 擷取；即時推送不扣歷史流量。",
             "coverage": None,
             "latest_at_utc": fop_latest,
-            "fields": ["逐筆成交", "五檔價量", "委託量變化", "交易所時間", "接收時間", "1 秒簿快照"],
+            "fields": [
+                "逐筆成交",
+                "五檔價量",
+                "委託量變化",
+                "交易所時間",
+                "接收時間",
+                "1 秒簿快照",
+            ],
             "metrics": [
                 _metric("目前合約", capture.get("contracts")),
                 _metric("目前訂閱", capture.get("subscriptions")),
-                _metric("最近落盤 Tick", fop_receipt.get("tick_rows"), value_format="compact"),
-                _metric("稽核有效簿", fop_audit.get("valid_book_rows"), value_format="compact"),
+                _metric(
+                    "最近落盤 Tick",
+                    fop_receipt.get("tick_rows"),
+                    value_format="compact",
+                ),
+                _metric(
+                    "稽核有效簿",
+                    fop_audit.get("valid_book_rows"),
+                    value_format="compact",
+                ),
             ],
             "warnings": [
                 f"最近完成擷取遺失事件 {int(fop_receipt.get('dropped_events') or 0):,} 筆。"
-            ] if int(fop_receipt.get("dropped_events") or 0) > 0 else [],
+            ]
+            if int(fop_receipt.get("dropped_events") or 0) > 0
+            else [],
             "service": _service_view(capture_service),
         },
         {
@@ -1129,19 +1240,24 @@ def _build_pipelines(
             "quota": "realtime",
             "status": top_state,
             "status_label": top_label,
-            "detail": (top_failure or {}).get("detail") or "依官方市值名單擷取 200 檔股票微結構。",
+            "detail": (top_failure or top_wait or {}).get("detail")
+            or "依官方市值名單擷取 200 檔股票微結構。",
             "coverage": None,
             "latest_at_utc": top_latest,
             "fields": ["逐筆成交", "五檔價量", "委託量變化", "接收時間", "1 秒簿快照"],
             "metrics": [
                 _metric("最近標的", top_receipt.get("instruments")),
-                _metric("最近 Tick", top_receipt.get("tick_rows"), value_format="compact"),
-                _metric("最近簿事件", top_receipt.get("book_rows"), value_format="compact"),
+                _metric(
+                    "最近 Tick", top_receipt.get("tick_rows"), value_format="compact"
+                ),
+                _metric(
+                    "最近簿事件", top_receipt.get("book_rows"), value_format="compact"
+                ),
                 _metric("遺失事件", top_receipt.get("dropped_events")),
             ],
             "warnings": [
                 "期貨／選擇權擷取擁有連線優先權。",
-                *(([(top_failure or {}).get("detail")] if top_failure else [])),
+                *([(top_failure or {}).get("detail")] if top_failure else []),
             ],
             "service": _service_view(top200_service),
         },
@@ -1156,14 +1272,30 @@ def _build_pipelines(
             "detail": "把永豐事件流重建成每秒因果快照、微結構特徵與未來標籤。",
             "coverage": None,
             "latest_at_utc": hft_latest,
-            "fields": ["價差", "簿不平衡", "成交方向", "1/5/30/60 秒標籤", "跨價差 Markout"],
+            "fields": [
+                "價差",
+                "簿不平衡",
+                "成交方向",
+                "1/5/30/60 秒標籤",
+                "跨價差 Markout",
+            ],
             "metrics": [
                 _metric("交易日", hft_totals.get("dates")),
                 _metric("總列數", hft_totals.get("rows"), value_format="compact"),
-                _metric("有效特徵列", hft_totals.get("feature_valid_rows"), value_format="compact"),
-                _metric("最新有效率", hft_audit.get("feature_valid_rate"), value_format="percent"),
+                _metric(
+                    "有效特徵列",
+                    hft_totals.get("feature_valid_rows"),
+                    value_format="compact",
+                ),
+                _metric(
+                    "最新有效率",
+                    hft_audit.get("feature_valid_rate"),
+                    value_format="percent",
+                ),
             ],
-            "warnings": ["衍生資料不再呼叫 API；上游即時擷取停止時不會自動新增交易日。"],
+            "warnings": [
+                "衍生資料不再呼叫 API；上游即時擷取停止時不會自動新增交易日。"
+            ],
             "service": None,
         },
         {
@@ -1199,18 +1331,29 @@ def _build_pipelines(
             "api_surface": "api.snapshots",
             "quota": "historical",
             "status": "active" if snapshot_service.get("active") else "stopped",
-            "status_label": "隨需查詢" if snapshot_service.get("active") else "服務停止",
+            "status_label": "隨需查詢"
+            if snapshot_service.get("active")
+            else "服務停止",
             "detail": "供台股策略與 0050／2330／台指期基準取得當下可成交價，不持續輪詢。",
             "coverage": None,
             "latest_at_utc": snapshot_latest,
-            "fields": ["Last", "Bid/Ask", "Open/High/Low", "Volume", "Reference", "漲跌停價"],
+            "fields": [
+                "Last",
+                "Bid/Ask",
+                "Open/High/Low",
+                "Volume",
+                "Reference",
+                "漲跌停價",
+            ],
             "metrics": [
                 _metric("策略模式", len(safe_modes)),
                 _metric("行情基準", len(safe_benchmarks)),
                 _metric("永豐來源類型", len(snapshot_sources)),
                 _metric("最新報價", snapshot_latest, value_format="datetime"),
             ],
-            "warnings": ["Snapshot 是按需查詢，會反映在歷史行情用量；面板本身不會觸發查詢。"],
+            "warnings": [
+                "Snapshot 是按需查詢，會反映在歷史行情用量；面板本身不會觸發查詢。"
+            ],
             "service": _service_view(snapshot_service),
         },
     ]
@@ -1286,9 +1429,13 @@ def build_shioaji_public_status(
                     "used_bytes": ledger_used,
                     "limit_bytes": ledger_limit,
                     "remaining_bytes": max(0, ledger_limit - ledger_used),
-                    "used_ratio": ledger_used / ledger_limit if ledger_limit > 0 else None,
+                    "used_ratio": ledger_used / ledger_limit
+                    if ledger_limit > 0
+                    else None,
                     "source_id": "traffic_ledger",
-                    "source_label": str(latest_ledger_usage.get("consumer") or "流量帳本"),
+                    "source_label": str(
+                        latest_ledger_usage.get("consumer") or "流量帳本"
+                    ),
                 }
             )
             traffic_history = sorted(
@@ -1332,8 +1479,11 @@ def build_shioaji_public_status(
         "guard_limit_bytes": guard_limit if limit > 0 else None,
         "safe_remaining_bytes": max(0, guard_limit - used) if limit > 0 else None,
         "reset_policy": "每個交易日上午 08:00 重置",
-        "pricing_policy": "免費註冊，行情 API 無逐次資料費；歷史查詢受每日額度限制",
-        "quota_tiers_bytes": [500_000_000, 2_000_000_000, 10_000_000_000],
+        "pricing_policy": (
+            "官方文件提供免費註冊；api.usage() 僅回傳流量、不含費用欄位，"
+            "實際費用依永豐最新帳戶契約"
+        ),
+        "pricing_evidence_label": "usage 無費用欄位",
         "attributed_bytes": (
             int(ledger["totals"].get("observed_usage_delta_bytes") or 0)
             if ledger_payload is not None
@@ -1342,8 +1492,7 @@ def build_shioaji_public_status(
         "unattributed_bytes": (
             max(
                 0,
-                used
-                - int(ledger["totals"].get("observed_usage_delta_bytes") or 0),
+                used - int(ledger["totals"].get("observed_usage_delta_bytes") or 0),
             )
             if limit > 0 and ledger_payload is not None
             else None
@@ -1414,9 +1563,7 @@ def build_shioaji_public_status(
             "historical": sum(
                 item.get("category") == "historical" for item in pipelines
             ),
-            "realtime": sum(
-                item.get("category") == "realtime" for item in pipelines
-            ),
+            "realtime": sum(item.get("category") == "realtime" for item in pipelines),
         },
         "pipelines": pipelines,
         "definitions": {
@@ -1437,7 +1584,8 @@ def build_shioaji_public_status(
                 "可歸因流量是各功能呼叫前後的 api.usage() 正差；帳面已用與可歸因差額保留為未歸因，絕不假設為零"
             ),
             "storage_growth": (
-                "最近 30 個完整台北曆日，依檔案最後修改日估算；一次性回補會使日均增量偏高"
+                "mtime 指標是最近 30 個完整台北曆日的變動檔案量，不等於淨增加；"
+                "每日總量快照滿 7 日後才用實測淨成長推估容量"
             ),
         },
     }

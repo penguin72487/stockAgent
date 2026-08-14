@@ -1,0 +1,52 @@
+[Unit]
+Description=StockAgent resumable OpenBB historical archive supervisor
+Wants=network-online.target
+After=network-online.target local-fs.target
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=__REPO_ROOT__
+Environment="HOME=/root"
+Environment="PYTHONUNBUFFERED=1"
+Environment="OPENBB_OUTPUT_DIR=data_openBB"
+Environment="OPENBB_SUPERVISOR_TQDM=0"
+ExecStart=/usr/bin/bash "__REPO_ROOT__/scripts/run_openbb_archive_until_complete.sh"
+Restart=on-failure
+RestartPreventExitStatus=2 3
+RestartSec=60s
+TimeoutStopSec=120s
+KillMode=control-group
+UMask=0077
+Nice=10
+CPUWeight=20
+IOWeight=20
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+OOMScoreAdjust=500
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=full
+ProtectHome=no
+InaccessiblePaths=-/root/.ssh -/root/.codex -__REPO_ROOT__/.env -__REPO_ROOT__/.env.trade -__REPO_ROOT__/.env.futures
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectKernelLogs=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=~@clock @cpu-emulation @debug @module @mount @obsolete @privileged @raw-io @reboot @swap
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

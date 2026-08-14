@@ -8,7 +8,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
@@ -863,6 +863,18 @@ def _write_outputs_to_dir(result: LiveSignalResult, output_dir: str | Path) -> s
     return str(path)
 
 
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    """Publish a small JSON contract without exposing a partially written file."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
+    temporary.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temporary, path)
+
+
 def _make_signal_id(market: str, asof_date: str) -> str:
     prefix = str(market or "default").strip() or "default"
     stamp = datetime.now().strftime("%H%M%S")
@@ -1702,6 +1714,7 @@ def generate_live_signal(
     _panel_override: PanelData | None = None,
 ) -> LiveSignalResult:
     signal_started = time.perf_counter()
+    signal_started_wall_utc = datetime.now(timezone.utc)
     quote_latency_ms = 0.0
     inference_latency_ms = 0.0
     progress_total = 17
@@ -1732,6 +1745,9 @@ def generate_live_signal(
     display_timezone_name = str(display_timezone or DEFAULT_DISPLAY_TIMEZONE)
     display_tz = _display_zone(display_timezone_name)
     generated_at_text = datetime.now(display_tz).isoformat(timespec="seconds")
+    signal_started_at_text = signal_started_wall_utc.astimezone(display_tz).isoformat(
+        timespec="microseconds"
+    )
     trading_frequency = str(getattr(config.trading, "frequency", "") or "")
     intraday_frequency = _is_intraday_frequency(trading_frequency)
 
@@ -2393,9 +2409,13 @@ def generate_live_signal(
         resolved_asof=resolved_asof,
         uses_realtime_daily_prices=uses_realtime_daily_prices,
     )
+    signal_ready = time.perf_counter()
+    signal_ready_at_text = datetime.now(display_tz).isoformat(timespec="microseconds")
     summary: dict[str, Any] = {
         "signal_id": resolved_signal_id,
         "generated_at": generated_at_text,
+        "signal_started_at": signal_started_at_text,
+        "signal_ready_at": signal_ready_at_text,
         "asof_date": resolved_asof,
         "market": market_id,
         "market_label": market_name,
@@ -2447,7 +2467,7 @@ def generate_live_signal(
             "quote_fetch_ms": round(float(quote_latency_ms), 3),
             "model_inference_ms": round(float(inference_latency_ms), 3),
             "compute_before_publish_ms": round(
-                float((time.perf_counter() - signal_started) * 1000.0), 3
+                float((signal_ready - signal_started) * 1000.0), 3
             ),
         },
         "signal_price_contract": {
@@ -2540,9 +2560,28 @@ def generate_live_signal(
         )
         if live_weights_path:
             result.summary["live_weights_path"] = live_weights_path
-        (Path(result.output_dir) / "summary.json").write_text(
-            json.dumps(result.summary, indent=2, ensure_ascii=False),
-            encoding="utf-8",
+        published_at = datetime.now(display_tz).isoformat(timespec="microseconds")
+        result.summary["artifact_published_at"] = published_at
+        result.summary["live_latency"]["artifact_publish_ms"] = round(
+            float((time.perf_counter() - signal_ready) * 1000.0), 3
+        )
+        result.summary["live_latency"]["input_to_publish_ms"] = round(
+            float((time.perf_counter() - signal_started) * 1000.0), 3
+        )
+        summary_path = Path(result.output_dir) / "summary.json"
+        _atomic_write_json(summary_path, result.summary)
+        _atomic_write_json(
+            output_root / "latest_signal.json",
+            {
+                "schema_version": 1,
+                "market": market_id,
+                "signal_id": resolved_signal_id,
+                "signal_started_at": signal_started_at_text,
+                "signal_ready_at": signal_ready_at_text,
+                "artifact_published_at": published_at,
+                "summary_path": str(summary_path),
+                "weights_path": str(Path(result.output_dir) / "target_weights.parquet"),
+            },
         )
     _emit_progress(progress_callback, label=progress_name, step=17, total=progress_total, message="done")
     return result

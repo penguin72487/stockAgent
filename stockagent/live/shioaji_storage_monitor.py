@@ -183,9 +183,11 @@ def _scan_dataset(
             total_bytes += size
             file_count += 1
             latest_mtime = max(latest_mtime, float(stat_result.st_mtime))
-            changed_date = datetime.fromtimestamp(
-                stat_result.st_mtime, tz=UTC
-            ).astimezone(TAIPEI).date()
+            changed_date = (
+                datetime.fromtimestamp(stat_result.st_mtime, tz=UTC)
+                .astimezone(TAIPEI)
+                .date()
+            )
             if first_day <= changed_date < today:
                 daily[changed_date.isoformat()] += size
     recent_bytes = sum(daily.values())
@@ -263,9 +265,34 @@ def build_shioaji_storage_snapshot(
     average_daily_growth = growth_window_bytes / GROWTH_WINDOW_DAYS
     disk = shutil.disk_usage(Path(repo_root))
     today = observed.astimezone(TAIPEI).date().isoformat()
-    historical_totals = [row for row in _previous_daily_totals(previous) if row["date"] != today]
+    historical_totals = [
+        row for row in _previous_daily_totals(previous) if row["date"] != today
+    ]
     historical_totals.append({"date": today, "bytes": total_bytes})
     historical_totals = historical_totals[-MAX_DAILY_TOTALS:]
+    completed_totals = sorted(
+        (row for row in historical_totals if row["date"] < today),
+        key=lambda row: row["date"],
+    )
+    observed_average_net_growth: float | None = None
+    observed_growth_days = 0
+    if len(completed_totals) >= 2:
+        first = completed_totals[0]
+        last = completed_totals[-1]
+        elapsed = (
+            datetime.fromisoformat(last["date"]) - datetime.fromisoformat(first["date"])
+        ).days
+        if elapsed > 0:
+            observed_growth_days = elapsed
+            observed_average_net_growth = (
+                int(last["bytes"]) - int(first["bytes"])
+            ) / elapsed
+    use_observed_growth = observed_growth_days >= 7
+    capacity_growth_estimate = (
+        max(0.0, float(observed_average_net_growth or 0.0))
+        if use_observed_growth
+        else average_daily_growth
+    )
     return {
         "schema_version": STORAGE_SCHEMA_VERSION,
         "generated_at_utc": observed.isoformat().replace("+00:00", "Z"),
@@ -294,12 +321,22 @@ def build_shioaji_storage_snapshot(
             "growth_window_bytes": growth_window_bytes,
             "average_daily_growth_bytes": average_daily_growth,
             "growth_source": "file_mtime_estimate",
+            "observed_average_daily_net_growth_bytes": observed_average_net_growth,
+            "observed_growth_days": observed_growth_days,
+            "capacity_growth_estimate_bytes": capacity_growth_estimate,
+            "capacity_growth_source": (
+                "daily_total_net_growth"
+                if use_observed_growth
+                else "file_mtime_estimate"
+            ),
             "disk_total_bytes": disk.total,
             "disk_used_bytes": disk.used,
             "disk_free_bytes": disk.free,
             "disk_used_ratio": disk.used / disk.total if disk.total else None,
             "estimated_days_remaining": (
-                disk.free / average_daily_growth if average_daily_growth > 0 else None
+                disk.free / capacity_growth_estimate
+                if capacity_growth_estimate > 0
+                else None
             ),
         },
         "daily_growth": [
@@ -311,10 +348,13 @@ def build_shioaji_storage_snapshot(
         "definitions": {
             "total_bytes": "九個互不重疊資料群組的實體檔案大小加總；不跟隨 symlink。",
             "average_daily_growth": (
-                "最近 30 個完整台北曆日內，依檔案最後修改日歸屬的新增或更新檔案量除以 30；"
-                "大量一次性回補會使平均偏高。"
+                "最近 30 個完整台北曆日內，依檔案最後修改日歸屬的變動檔案完整大小除以 30；"
+                "這是寫入活動量，不是淨容量增加量，大量一次性回補或重寫會使數值偏高。"
             ),
-            "estimated_days_remaining": "目前可用磁碟空間除以近 30 日平均落盤量，僅為容量規劃估計。",
+            "observed_average_daily_net_growth": (
+                "以每日總容量快照首尾差除以曆日；至少累積 7 個完整日後，才取代 mtime 寫入活動量做容量估計。"
+            ),
+            "estimated_days_remaining": "目前可用磁碟空間除以選定的保守成長估計，僅為容量規劃估計。",
         },
     }
 
@@ -331,10 +371,14 @@ def write_shioaji_storage_snapshot(
     except (OSError, json.JSONDecodeError):
         previous = None
     payload = build_shioaji_storage_snapshot(
-        Path(repo_root), now=now, previous=previous if isinstance(previous, dict) else None
+        Path(repo_root),
+        now=now,
+        previous=previous if isinstance(previous, dict) else None,
     )
     selected.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary = tempfile.mkstemp(prefix=f".{selected.name}.", dir=selected.parent)
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=f".{selected.name}.", dir=selected.parent
+    )
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)

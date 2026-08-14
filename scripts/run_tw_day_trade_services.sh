@@ -33,7 +33,7 @@ trap stop_children EXIT INT TERM
   exec "$selected_python" scripts/run_tw_day_trade_simulation.py \
     --markets-dir "${TW_DAY_TRADE_MARKETS_DIR:-services/discord_bot/markets}" \
     --state-dir "${TW_DAY_TRADE_STATE_DIR:-artifacts/live/tw_day_trade_simulation}" \
-    --poll-seconds "${TW_DAY_TRADE_POLL_SECONDS:-2}"
+    --poll-seconds "${TW_DAY_TRADE_POLL_SECONDS:-0.1}"
 ) &
 child_pids+=("$!")
 

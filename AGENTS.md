@@ -406,6 +406,15 @@ Rules:
 
 ## Intentional Walk-Forward Semantics
 
+- Every equity or ETF benchmark is a total-return benchmark.  Daily research
+  uses the source's adjusted close so cash dividends, ETF distributions,
+  stock dividends, splits, and reverse splits are represented once.  Live raw
+  Bid/Ask benchmarks instead multiply held units by each official ex-date
+  `previous_close / reference_price` factor before executable liquidation
+  costs.  Never add a separate dividend cash flow to an already adjusted
+  close or adjusted-unit series.  Futures, FX, and crypto have no equity cash
+  distribution; preserve their product-specific price/roll return contract.
+
 - The `tw_index_futures_day` market comparator is not the strategy's daily
   open-to-close TX target. It is a gross, fully collateralized 1x long TX
   front-month buy-and-hold series. Preserve every monthly contract in futures
@@ -1137,6 +1146,27 @@ Walk-forward summary visualization rules:
 
 ## TAIFEX Live Strategy Dashboard Contract
 
+- Before the multi-worker runner freezes its one shared held-option subscription
+  snapshot, run the strategy engine once in settlement-only mode under the same
+  engine lock.  Cash-settle an expired weekly cycle and any expired
+  `put_call_parity_tx` package only from the official TAIFEX final-settlement
+  parquet, then snapshot the remaining current contracts.  Missing official
+  settlement, a residual futures hedge, or malformed leg metadata must fail
+  closed.  Do not require an expired contract to remain in the next trading
+  date's Shioaji catalogue; that ordering deadlocks settlement before startup.
+- Successful expiry settlement is a continuous-roll boundary, not a terminal
+  strategy state.  On the first complete fresh Bid/Ask set, alive weekly
+  strategies select the nearest listed weekly expiry strictly after the current
+  TAIFEX trading date, while `put_call_parity_tx` scans the current TX future's
+  same-expiry monthly TXO pairs.  Repeat this data-driven transition at every
+  expiry; never revive an absorbing-ruin ledger or fabricate a roll from stale
+  depth.
+- Active-cycle restart compatibility may reconstruct the old shared ATM
+  Call/Put pair only for pre-v5 execution states.  A current flat, pending,
+  futures-only, ruined, or independent parity ledger must remain exactly flat
+  across restart.  Contract v9 repairs only the evidenced v8 corruption shape:
+  exactly one active-cycle Call plus one Put whose net deltas are both zero in
+  the immutable ideal trade ledger; ledger-backed positions remain untouched.
 - The Shioaji TAIFEX strategy engine runs only on market-data worker 0. At the
   start of every multi-worker capture, read the persisted non-zero option
   positions exactly once, pass the same code snapshot to every worker, and pin

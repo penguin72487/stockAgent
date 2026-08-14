@@ -342,7 +342,6 @@ def fetch_shioaji_stock_snapshots(
             ]
             if not contracts:
                 continue
-            received_ms = int(time.time() * 1000)
             with shioaji_query(
                 api,
                 consumer="stock_quote_provider",
@@ -352,6 +351,9 @@ def fetch_shioaji_stock_snapshots(
             ) as set_ledger_result:
                 rows = list(api.snapshots(contracts))
                 set_ledger_result(rows)
+            # The causal observation boundary is when the complete response is
+            # locally available, never when the request was sent.
+            received_ms = int(time.time() * 1000)
             for row in rows:
                 code = str(getattr(row, "code", "") or "").strip()
                 contract = _SHIOAJI_STOCK_CONTRACTS.get(code)
@@ -570,7 +572,6 @@ def fetch_shioaji_futures_snapshot(
             contract = api.contracts.get(code)
             if contract is not None:
                 contracts[code] = contract
-        received_ms = int(time.time() * 1000)
         requested_contracts = list(contracts.values())
         with shioaji_query(
             api,
@@ -585,6 +586,7 @@ def fetch_shioaji_futures_snapshot(
         ) as set_ledger_result:
             rows = list(api.snapshots(requested_contracts))
             set_ledger_result(rows)
+        received_ms = int(time.time() * 1000)
         quotes: dict[str, dict[str, float | int | str | None]] = {}
         for row in rows:
             code = str(getattr(row, "code", "") or "").strip().upper()

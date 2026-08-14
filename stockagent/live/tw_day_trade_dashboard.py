@@ -16,6 +16,15 @@ DASHBOARD_SCHEMA_VERSION: Final[int] = 4
 DEFAULT_MAX_SOURCE_AGE_SECONDS: Final[float] = 30.0
 TAIPEI: Final[ZoneInfo] = ZoneInfo("Asia/Taipei")
 BENCHMARK_HISTORY_FILENAME: Final[str] = "benchmark_history.json"
+CHART_RANGE_SECONDS: Final[dict[str, int | None]] = {
+    "1h": 60 * 60,
+    "1d": 24 * 60 * 60,
+    "1w": 7 * 24 * 60 * 60,
+    "1mo": 30 * 24 * 60 * 60,
+    "1q": 90 * 24 * 60 * 60,
+    "1y": 365 * 24 * 60 * 60,
+    "all": None,
+}
 _LINE_COUNT_CACHE: dict[Path, tuple[int, int, int, int]] = {}
 _LINE_COUNT_LOCK = threading.Lock()
 _TAIL_CACHE: dict[
@@ -164,6 +173,82 @@ def _tail_for_session(
     return list(result)
 
 
+def _percentile(values: list[float], quantile: float) -> float | None:
+    finite = sorted(value for value in values if math.isfinite(value))
+    if not finite:
+        return None
+    if len(finite) == 1:
+        return round(finite[0], 3)
+    position = (len(finite) - 1) * min(1.0, max(0.0, quantile))
+    lower = int(math.floor(position))
+    upper = int(math.ceil(position))
+    value = finite[lower] + (finite[upper] - finite[lower]) * (position - lower)
+    return round(value, 3)
+
+
+def _latency_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    successful = [row for row in rows if str(row.get("result") or "") == "registered"]
+    values = [
+        float(value)
+        for row in successful
+        if (value := _finite_float(row.get("input_to_ledger_ms"))) is not None
+    ]
+    latest = successful[-1] if successful else None
+    stage_names = sorted(
+        {
+            str(name)
+            for row in successful
+            for name in (row.get("stages") or {})
+        }
+    )
+    stage_p50_ms = {
+        name: _percentile(
+            [
+                float(value)
+                for row in successful
+                if (value := _finite_float((row.get("stages") or {}).get(name)))
+                is not None
+            ],
+            0.5,
+        )
+        for name in stage_names
+    }
+    bottleneck_counts: dict[str, int] = {}
+    for row in successful:
+        name = str(row.get("bottleneck_stage") or "")
+        if name:
+            bottleneck_counts[name] = bottleneck_counts.get(name, 0) + 1
+    dominant_bottleneck = (
+        max(bottleneck_counts, key=lambda name: (bottleneck_counts[name], name))
+        if bottleneck_counts
+        else None
+    )
+    return {
+        "schema_version": 1,
+        "measurement_boundary": "signal_input_to_simulation_ledger_persisted",
+        "sample_count": len(values),
+        "terminal_sample_count": len(rows),
+        "registered_sample_count": len(successful),
+        "latest_ms": round(values[-1], 3) if values else None,
+        "p50_ms": _percentile(values, 0.5),
+        "p95_ms": _percentile(values, 0.95),
+        "max_ms": round(max(values), 3) if values else None,
+        "latest_market": latest.get("market") if latest else None,
+        "latest_recorded_at": latest.get("recorded_at") if latest else None,
+        "latest_ready_to_ledger_ms": latest.get("ready_to_ledger_ms")
+        if latest
+        else None,
+        "latest_bottleneck_stage": latest.get("bottleneck_stage")
+        if latest
+        else None,
+        "latest_bottleneck_ms": latest.get("bottleneck_ms") if latest else None,
+        "dominant_bottleneck_stage": dominant_bottleneck,
+        "stage_p50_ms": stage_p50_ms,
+        "simulation_only": True,
+        "not_external_order_or_venue_rtt": True,
+    }
+
+
 def _line_count(path: Path) -> int:
     if not path.is_file():
         return 0
@@ -307,7 +392,28 @@ def _rebase_live_benchmark(
     canonical_initial_tax = (
         _finite_float(origin.get("initial_transaction_tax_twd")) or 0.0
     )
-    gross_offset = (expected_price - canonical_entry) * gross_multiplier
+    live_action_factor = _finite_float(row.get("corporate_action_factor"))
+    prior_action_factor = _finite_float(
+        origin.get("corporate_action_factor_to_live_entry")
+    )
+    mark_price = _finite_float(row.get("last_mark_price"))
+    if (
+        str(row.get("instrument_type") or "").startswith("stock")
+        and live_action_factor is not None
+        and prior_action_factor is not None
+        and mark_price is not None
+    ):
+        raw_gross = gross_multiplier * (
+            live_action_factor * mark_price - expected_price
+        )
+        canonical_factor = prior_action_factor * live_action_factor
+        canonical_gross = gross_multiplier * (
+            canonical_factor * mark_price - canonical_entry
+        )
+        gross_offset = canonical_gross - raw_gross
+        row["corporate_action_factor"] = canonical_factor
+    else:
+        gross_offset = (expected_price - canonical_entry) * gross_multiplier
     net_pnl = (
         raw_net
         + gross_offset
@@ -345,6 +451,21 @@ def _rebase_live_benchmark(
             ),
         }
     )
+    if origin.get("total_return_contract"):
+        row["total_return_contract"] = origin.get("total_return_contract")
+        row["corporate_action_coverage"] = True
+        row["corporate_action_status"] = "official_reference_complete"
+        row["corporate_action_coverage_end"] = origin.get(
+            "corporate_action_coverage_end"
+        )
+        row["corporate_action_count"] = int(
+            origin.get("corporate_action_count_to_live_entry") or 0
+        ) + int(row.get("corporate_action_count") or 0)
+        row.setdefault(
+            "corporate_action_factor",
+            _finite_float(origin.get("corporate_action_factor_to_live_entry"))
+            or 1.0,
+        )
     return row
 
 
@@ -444,9 +565,7 @@ def _attach_execution_records(
         mode["today_execution_terminal"] = status in terminal_statuses
         status_counts[status] = status_counts.get(status, 0) + 1
 
-    executed_count = sum(
-        bool(mode.get("today_execution_terminal")) for mode in modes
-    )
+    executed_count = sum(bool(mode.get("today_execution_terminal")) for mode in modes)
     attempted_count = sum(
         str(mode.get("today_execution_status") or "") in attempted_statuses
         for mode in modes
@@ -502,9 +621,7 @@ def _available_session_dates(
     return sorted(dates, reverse=True)
 
 
-def _select_session_date(
-    requested: str | None, available: list[str]
-) -> str:
+def _select_session_date(requested: str | None, available: list[str]) -> str:
     text = str(requested or "").strip()
     if text:
         try:
@@ -517,6 +634,175 @@ def _select_session_date(
     if not available:
         raise ValueError("dashboard has no available session dates")
     return available[0]
+
+
+def _all_json_objects(path: Path):
+    if not path.is_file():
+        return
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            payload = json.loads(line)
+            if isinstance(payload, dict):
+                yield payload
+
+
+def _chart_timestamp(row: Mapping[str, Any]) -> float | None:
+    for field in ("minute", "recorded_at"):
+        value = row.get(field)
+        if not value:
+            continue
+        try:
+            return _timestamp(value).timestamp()
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _downsample_chart_series(
+    rows: list[dict[str, Any]], *, maximum_points: int
+) -> list[dict[str, Any]]:
+    """Preserve endpoints and local return extrema in a bounded curve."""
+
+    rows.sort(key=lambda row: float(row["timestamp_seconds"]))
+    if len(rows) <= maximum_points:
+        return rows
+    bucket_count = max(1, (maximum_points - 2) // 2)
+    interior = rows[1:-1]
+    output = [rows[0]]
+    for bucket_index in range(bucket_count):
+        start = len(interior) * bucket_index // bucket_count
+        stop = len(interior) * (bucket_index + 1) // bucket_count
+        bucket = interior[start:stop]
+        if not bucket:
+            continue
+        extrema = {
+            min(
+                range(len(bucket)),
+                key=lambda index: float(bucket[index].get("return_pct") or 0.0),
+            ),
+            max(
+                range(len(bucket)),
+                key=lambda index: float(bucket[index].get("return_pct") or 0.0),
+            ),
+        }
+        output.extend(bucket[index] for index in sorted(extrema))
+    output.append(rows[-1])
+    return output[:maximum_points]
+
+
+def build_dashboard_history_snapshot(
+    *,
+    state_dir: Path,
+    range_key: str = "1d",
+    maximum_points_per_series: int = 2_000,
+) -> dict[str, Any]:
+    """Return cross-session strategy and total-return benchmark curves.
+
+    Time windows are anchored to the newest retained observation rather than
+    wall-clock time, so historical/replay ledgers remain inspectable.  Longer
+    windows scan only the two append-only mark ledgers and are then bounded by
+    extrema-preserving downsampling at the API boundary.
+    """
+
+    normalized_range = str(range_key or "1d").strip().lower()
+    if normalized_range not in CHART_RANGE_SECONDS:
+        raise ValueError(f"unsupported chart range: {range_key}")
+    if not 100 <= int(maximum_points_per_series) <= 10_000:
+        raise ValueError("maximum_points_per_series must be between 100 and 10000")
+    root = Path(state_dir)
+    benchmark_history = _load_benchmark_history(root)
+    benchmark_origins = benchmark_history.get("origins") or {}
+    deduplicated: dict[tuple[str, str], dict[str, Any]] = {}
+
+    def add(source: Mapping[str, Any], *, series_type: str) -> None:
+        row = dict(source)
+        series_id = str(
+            row.get("market")
+            if series_type == "strategy"
+            else row.get("benchmark_id")
+            or ""
+        )
+        timestamp_seconds = _chart_timestamp(row)
+        if not series_id or timestamp_seconds is None:
+            return
+        return_fraction, return_pct = _capital_return(
+            row.get("initial_capital_twd"), row.get("total_equity_twd")
+        )
+        if return_pct is None:
+            return_pct = _finite_float(row.get("return_pct"))
+            return_fraction = _finite_float(row.get("return_fraction"))
+        if return_pct is None:
+            return
+        minute = datetime.fromtimestamp(timestamp_seconds, tz=timezone.utc).isoformat(
+            timespec="minutes"
+        )
+        deduplicated[(series_id, minute)] = {
+            "series_id": series_id,
+            "series_type": series_type,
+            "market": row.get("market") if series_type == "strategy" else None,
+            "benchmark_id": (
+                row.get("benchmark_id") if series_type == "benchmark" else None
+            ),
+            "minute": minute,
+            "timestamp_seconds": timestamp_seconds,
+            "return_fraction": return_fraction,
+            "return_pct": return_pct,
+            "valuation_stale": bool(row.get("valuation_stale", False)),
+        }
+
+    for row in _all_json_objects(root / "marks.jsonl") or ():
+        add(row, series_type="strategy")
+    for row in benchmark_history.get("marks") or ():
+        if isinstance(row, Mapping):
+            add(row, series_type="benchmark")
+    for source in _all_json_objects(root / "benchmark_marks.jsonl") or ():
+        benchmark_id = str(source.get("benchmark_id") or "")
+        add(
+            _rebase_live_benchmark(source, benchmark_origins.get(benchmark_id)),
+            series_type="benchmark",
+        )
+
+    rows = list(deduplicated.values())
+    anchor = max((float(row["timestamp_seconds"]) for row in rows), default=None)
+    duration = CHART_RANGE_SECONDS[normalized_range]
+    cutoff = None if anchor is None or duration is None else anchor - duration
+    if cutoff is not None:
+        rows = [row for row in rows if float(row["timestamp_seconds"]) >= cutoff]
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        grouped.setdefault(str(row["series_id"]), []).append(row)
+    sampled = [
+        row
+        for series_rows in grouped.values()
+        for row in _downsample_chart_series(
+            series_rows, maximum_points=int(maximum_points_per_series)
+        )
+    ]
+    sampled.sort(key=lambda row: (float(row["timestamp_seconds"]), row["series_id"]))
+    for row in sampled:
+        row.pop("timestamp_seconds", None)
+    coverage_start = sampled[0]["minute"] if sampled else None
+    coverage_end = sampled[-1]["minute"] if sampled else None
+    return {
+        "schema_version": DASHBOARD_SCHEMA_VERSION,
+        "simulation_only": True,
+        "production_order_possible": False,
+        "range": normalized_range,
+        "range_seconds": duration,
+        "anchor_at_utc": (
+            datetime.fromtimestamp(anchor, tz=timezone.utc).isoformat()
+            if anchor is not None
+            else None
+        ),
+        "coverage_start_utc": coverage_start,
+        "coverage_end_utc": coverage_end,
+        "raw_points_in_range": len(rows),
+        "returned_points": len(sampled),
+        "downsampled": len(sampled) < len(rows),
+        "history": sampled,
+    }
 
 
 def _preopen_progress(
@@ -703,6 +989,7 @@ def _session_progress(
     signal_at = at(9, 0)
     exit_limit_at = at(13, 20)
     force_exit_at = at(13, 24)
+    closing_auction_at = at(13, 25)
     session_end_at = at(13, 30)
     if local < preopen_at:
         phase = "waiting_prewarm"
@@ -724,24 +1011,30 @@ def _session_progress(
         label = "13:20 限價退出"
         phase_start, phase_end = exit_limit_at, force_exit_at
         next_label, next_at = "13:24 市價強平", force_exit_at
-    elif local < session_end_at:
+    elif local < closing_auction_at:
         phase = "force_exit"
-        label = "13:24 市價強平"
-        phase_start, phase_end = force_exit_at, session_end_at
-        next_label, next_at = "盤後完成檢查", session_end_at
+        label = "13:24 市價強平重試"
+        phase_start, phase_end = force_exit_at, closing_auction_at
+        next_label, next_at = "13:25 收盤集合競價", closing_auction_at
+    elif local < session_end_at:
+        phase = "closing_auction"
+        label = "13:25 收盤集合競價"
+        phase_start, phase_end = closing_auction_at, session_end_at
+        next_label, next_at = "13:30 撮合／帳務完成", session_end_at
     else:
         phase = "complete"
         label = "本日流程結束"
         phase_start, phase_end = signal_at, session_end_at
         next_label, next_at = "已完成", session_end_at
 
-    signal_completed = sum(
-        bool(mode.get("today_execution_terminal")) for mode in modes
-    )
+    signal_completed = sum(bool(mode.get("today_execution_terminal")) for mode in modes)
     entry_completed = signal_completed
     exit_started = sum(
         _is_taipei_session_date(mode.get("exit_limit_submitted_at"), day.isoformat())
         or _is_taipei_session_date(mode.get("force_exit_started_at"), day.isoformat())
+        or _is_taipei_session_date(
+            mode.get("closing_auction_submitted_at"), day.isoformat()
+        )
         for mode in modes
     )
     unique_mode_minutes = {
@@ -831,6 +1124,8 @@ def _safe_position(position: Mapping[str, Any]) -> dict[str, Any]:
         "eod_limit_submitted_at",
         "eod_limit_order_status",
         "eod_limit_liquidity_status",
+        "closing_auction_limit_price",
+        "closing_auction_order_status",
         "status",
         "last_mark_at",
         "last_quote_at",
@@ -1002,6 +1297,10 @@ def build_dashboard_snapshot(
                 "entry_completed_at": mode.get("entry_completed_at"),
                 "exit_limit_submitted_at": mode.get("exit_limit_submitted_at"),
                 "force_exit_started_at": mode.get("force_exit_started_at"),
+                "closing_auction_submitted_at": mode.get(
+                    "closing_auction_submitted_at"
+                ),
+                "closing_auction_settled_at": mode.get("closing_auction_settled_at"),
                 "force_exit_failures": mode.get("force_exit_failures", 0),
                 "terminal_flatten_count": mode.get("terminal_flatten_count", 0),
                 "terminal_flatten_degraded_count": mode.get(
@@ -1017,9 +1316,7 @@ def build_dashboard_snapshot(
                     mode.get("counterfactual_open_replay", False)
                 ),
                 "entry_fill_contract": mode.get("entry_fill_contract"),
-                "entry_liquidity_assumption": mode.get(
-                    "entry_liquidity_assumption"
-                ),
+                "entry_liquidity_assumption": mode.get("entry_liquidity_assumption"),
                 "position_count": len(mode_positions),
             }
         )
@@ -1053,9 +1350,7 @@ def build_dashboard_snapshot(
             row
             for row in rows
             if str(row.get("session_date") or "") == selected_session_date
-            or _is_taipei_session_date(
-                row.get("recorded_at"), selected_session_date
-            )
+            or _is_taipei_session_date(row.get("recorded_at"), selected_session_date)
         ]
 
     def observed_on_selected_date(
@@ -1064,9 +1359,7 @@ def build_dashboard_snapshot(
         return [
             row
             for row in rows
-            if _is_taipei_session_date(
-                row.get("recorded_at"), selected_session_date
-            )
+            if _is_taipei_session_date(row.get("recorded_at"), selected_session_date)
             or (
                 not row.get("recorded_at")
                 and str(row.get("session_date") or "") == selected_session_date
@@ -1124,12 +1417,30 @@ def build_dashboard_snapshot(
         selected_session_date,
         recorded_at_fallback=True,
     )
+    latency_rows = _tail_for_session(
+        root / "latency.jsonl",
+        min(maximum_event_rows, 2_000),
+        selected_session_date,
+        recorded_at_fallback=True,
+    )
+    latency = _latency_summary(latency_rows)
+    today_session_date = local_observed.date().isoformat()
+    today_latency_rows = (
+        latency_rows
+        if selected_session_date == today_session_date
+        else _tail_for_session(
+            root / "latency.jsonl",
+            min(maximum_event_rows, 2_000),
+            today_session_date,
+            recorded_at_fallback=True,
+        )
+    )
+    today_latency = _latency_summary(today_latency_rows)
+    today_latency["session_date"] = today_session_date
 
     if not current_view:
         latest_marks = {
-            str(row.get("market") or ""): row
-            for row in marks
-            if row.get("market")
+            str(row.get("market") or ""): row for row in marks if row.get("market")
         }
         events_by_market: dict[str, list[dict[str, Any]]] = {}
         for event in events:
@@ -1170,18 +1481,16 @@ def build_dashboard_snapshot(
             mode["session_date"] = selected_session_date
             mode["signal_id"] = (signal_event or {}).get("signal_id")
             mode["signal_at"] = (signal_event or {}).get("recorded_at")
-            mode["source_signal_at"] = (signal_event or {}).get(
-                "source_signal_at"
-            )
+            mode["source_signal_at"] = (signal_event or {}).get("source_signal_at")
             mode["entry_completed_at"] = (
                 (signal_event or {}).get("recorded_at")
                 if (signal_event or {}).get("event") == "signal_registered"
                 else None
             )
             mode["signal_counts"] = (signal_event or {}).get("counts") or {}
-            mode["execution_projection"] = (
-                (signal_event or {}).get("execution_projection") or {}
-            )
+            mode["execution_projection"] = (signal_event or {}).get(
+                "execution_projection"
+            ) or {}
             mode["simulation_replay"] = bool(
                 (signal_event or {}).get("simulation_replay", False)
             )
@@ -1281,6 +1590,7 @@ def build_dashboard_snapshot(
         "benchmark_marks": _line_count(root / "benchmark_marks.jsonl"),
         "benchmark_history_marks": len(benchmark_history.get("marks") or ()),
         "events": _line_count(root / "events.jsonl"),
+        "latency_samples": _line_count(root / "latency.jsonl"),
         "historical_positions": sum(
             len((_object(path).get("positions") or ()))
             for path in (root / "position_history").glob("*/*.json")
@@ -1300,6 +1610,8 @@ def build_dashboard_snapshot(
         "schedule": status.get("schedule") or {},
         "preopen": preopen,
         "execution_records": execution_records,
+        "latency": latency,
+        "today_latency": today_latency,
         "session_progress": session_progress,
         "modes": modes,
         "benchmarks": benchmarks,
@@ -1319,29 +1631,32 @@ def build_dashboard_snapshot(
             "marks": len(marks),
             "benchmark_marks": len(benchmark_marks),
             "events": len(events),
+            "latency_samples": len(latency_rows),
         },
         "source_contract": {
             "preopen": "artifacts/discord_bot/preopen_readiness.json; only same-day recorded stages are shown and missing intermediate states are not estimated",
             "execution_record": "today's append-only signal_registered or signal_blocked event per mode; stale prior-session timestamps never count",
-            "missed_start": "between 09:00 and 13:20, a missing execution record is checked every second and shown as immediate catch-up in progress; the public dashboard remains read-only",
+            "missed_start": "between 09:00 and 13:20, the atomic latest-signal pointer is checked every 0.1 seconds and a missing execution record is caught up immediately; the public dashboard remains read-only",
             "signal": "Discord live target_weights.parquet after observed opening quote",
             "replay": "simulation_replay=true is a retrospective, explicitly counterfactual fill at the actual session open from official daily data or a fresh same-session Shioaji snapshot; it is not a causally executable quote or real order fill",
-            "entry_fill": "causally later best ask for buy and best bid for sell",
+            "entry_fill": "causally later best ask for buy or best bid for sell is used immediately after the 09:00 signal-ready timestamp; submitted simulated market quantity is fully filled, while target quantity beyond fresh displayed depth is explicitly left unsubmitted",
+            "latency": "measured signal input through model, atomic artifact publication, consumer discovery, fresh executable quote, and durable simulation-ledger persistence on this host; it is not an external order acknowledgement or venue round-trip measurement",
             "mark": "best bid liquidates long; best ask covers short",
             "missing_mark": "carry only the same open position's last complete liquidation value and flag stale",
             "eligibility": "exact-session TWSE and TPEx official day-trade membership; missing venue/date blocks",
             "fees": "gross commission and sell tax are charged first; earned commission rebate is recorded separately in economic NAV",
             "pnl_split": "realized net PnL uses simulated executable exits plus any explicitly tagged 13:30 terminal ledger flatten, with allocated entry and exit costs; unrealized net liquidation PnL values remaining shares at executable bid or ask after remaining costs; total net PnL is their reconciled sum",
             "comparison": "all strategies and benchmarks are compared as cumulative net return divided by their own capital basis; TX uses one-contract official initial margin, while 0050/2330 use one-board-lot entry notional",
-            "benchmarks": "0050/2330 are anchored to the retained actual session open and marked at executable bid after tw_cash costs; future cash distributions are not credited. TXFR1 holds one real TX front-month contract across sessions, rolls only when the old bid and new ask coexist, never books the calendar spread as return, and includes TWD 60 per side plus statutory futures tax",
+            "benchmarks": "0050/2330 are total-return benchmarks anchored to the retained actual session open: official ex-date previous-close/reference-price factors reinvest cash dividends and ETF distributions and adjust stock dividends or splits exactly once, then adjusted units are marked at executable bid after tw_cash costs. TXFR1 has no cash distribution; it holds one real TX front-month contract across sessions, rolls only when the old bid and new ask coexist, never books the calendar spread as return, and includes TWD 60 per side plus statutory futures tax",
             "benchmark_history": (
                 "audited actual-open benchmark history is merged read-only with later live executable marks"
                 if benchmark_history.get("origins")
                 else benchmark_history.get("load_error")
                 or "live benchmark marks only; no historical origin file"
             ),
-            "depth_limit": "each mode is an independent counterfactual; only displayed level-one MIS volume is fillable (lots x 1,000 shares), while queue and deeper book are unknown",
+            "depth_limit": "each mode is an independent counterfactual; only fresh displayed Shioaji level-one volume is fillable (lots x 1,000 shares), while queue and deeper book are unknown; completed-minute participation is additionally required after the opening minute",
             "bracket_fill": "all four modes move TP and the local SL trigger one legal dated TW tick inward; this improves fill probability but does not guarantee a fill without a trigger and executable counterparty volume",
+            "exit_schedule": "from 13:20 through 13:23 each unfilled exit is checked for a real cross and otherwise cancel-repriced once per new minute to the current passive best ask for a sell or best bid for a buy-to-cover; at 13:24 it is replaced by a marketable exit attempt",
             "terminal_flatten": "after the 13:30 auction simulation, every residual is closed in a simulation-only terminal ledger pass so a day-trade mode never carries overnight; this is explicitly tagged and is not claimed as an exchange fill",
         },
     }
@@ -1663,6 +1978,7 @@ def build_dashboard_summary(
 
 __all__ = [
     "build_dashboard_event_page",
+    "build_dashboard_history_snapshot",
     "build_dashboard_signal_page",
     "build_dashboard_snapshot",
     "build_dashboard_summary",
