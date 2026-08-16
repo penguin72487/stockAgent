@@ -4,9 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 from datetime import datetime, time as datetime_time
 import json
+import os
 from pathlib import Path
+import select
 import sys
 import time as time_module
 from typing import Any
@@ -26,22 +29,36 @@ from stockagent.live.market_config import (  # noqa: E402
     load_market_configs,
     resolved_live_output_dir,
 )
+from stockagent.live.market_status import verified_tw_stock_session_day  # noqa: E402
 from stockagent.live.quote_provider import (  # noqa: E402
-    fetch_shioaji_futures_snapshot,
+    fetch_futures_snapshot_prefer_stream,
     fetch_shioaji_stock_snapshots,
+    warm_shioaji_stock_quote_client,
 )
 from stockagent.live.tw_day_trade_simulation import (  # noqa: E402
+    CLOSING_AUCTION_TIME,
+    FORCE_EXIT_TIME,
     ModeSpec,
     STOCK_BENCHMARKS,
     TX_CONTINUOUS_LOGICAL_CODE,
     TwDayTradeSimulationEngine,
     load_live_eligibility,
+    load_symbol_metadata,
     quote_map_from_snapshot,
     resolve_day_trade_rule_data_dir,
 )
 
 
 TAIPEI = ZoneInfo("Asia/Taipei")
+_LATEST_SIGNAL_CACHE: dict[
+    str, tuple[tuple[int, int], dict[str, Any], list[dict[str, Any]]]
+] = {}
+_ELIGIBILITY_CACHE: dict[
+    tuple[str, str, str], tuple[set[str], dict[str, Any], dict[str, Any]]
+] = {}
+_LEGACY_SIGNAL_SCAN_CACHE: dict[
+    str, tuple[float, tuple[dict[str, Any], list[dict[str, Any]]] | None]
+] = {}
 
 
 def _repo_path(value: str | Path) -> Path:
@@ -115,6 +132,77 @@ def _mode_specs(
 def _latest_signal(
     spec: ModeSpec, now: datetime
 ) -> tuple[dict[str, Any], list[dict[str, Any]]] | None:
+    pointer_path = spec.live_output_dir / "latest_signal.json"
+    try:
+        pointer_stat = pointer_path.stat()
+        signature = (pointer_stat.st_mtime_ns, pointer_stat.st_size)
+        cache_key = str(pointer_path.resolve())
+        cached = _LATEST_SIGNAL_CACHE.get(cache_key)
+        if cached and cached[0] == signature:
+            summary, rows = cached[1], cached[2]
+            if str(summary.get("asof_date") or "")[:10] == now.date().isoformat():
+                return dict(summary), list(rows)
+            return None
+        pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+        summary_path = Path(str(pointer.get("summary_path") or ""))
+        weights_path = Path(str(pointer.get("weights_path") or ""))
+        execution_weights_path = Path(
+            str(pointer.get("execution_weights_path") or "")
+        )
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        if (
+            isinstance(summary, dict)
+            and str(summary.get("market")) == str(spec.signal_market or spec.market)
+            and str(summary.get("asof_date") or "")[:10] == now.date().isoformat()
+            and (execution_weights_path.is_file() or weights_path.is_file())
+        ):
+            rows: list[dict[str, Any]] | None = None
+            if execution_weights_path.is_file():
+                try:
+                    execution_payload = json.loads(
+                        execution_weights_path.read_text(encoding="utf-8")
+                    )
+                    execution_rows = execution_payload.get("rows")
+                    if (
+                        int(execution_payload.get("schema_version") or 0) == 1
+                        and str(execution_payload.get("market") or "")
+                        == str(spec.signal_market or spec.market)
+                        and str(execution_payload.get("signal_id") or "")
+                        == str(summary.get("signal_id") or "")
+                        and isinstance(execution_rows, list)
+                        and all(isinstance(row, dict) for row in execution_rows)
+                    ):
+                        rows = [dict(row) for row in execution_rows]
+                except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                    rows = None
+            if rows is None:
+                rows = pl.read_parquet(weights_path).to_dicts()
+            summary = dict(summary)
+            summary["summary_path"] = str(summary_path)
+            summary["weights_path"] = str(weights_path)
+            summary["execution_weights_path"] = (
+                str(execution_weights_path)
+                if execution_weights_path.is_file()
+                else None
+            )
+            _LATEST_SIGNAL_CACHE[cache_key] = (signature, summary, rows)
+            return dict(summary), list(rows)
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        pass
+
+    # Compatibility path for artifacts written before latest_signal.json.
+    # Current writers avoid this recursive scan on the opening hot path, and
+    # old writers are sampled at most once per five seconds.
+    legacy_cache_key = f"{spec.live_output_dir.resolve()}:{now.date().isoformat()}"
+    cached_legacy = _LEGACY_SIGNAL_SCAN_CACHE.get(legacy_cache_key)
+    monotonic_now = time_module.monotonic()
+    if cached_legacy and monotonic_now < cached_legacy[0]:
+        cached_result = cached_legacy[1]
+        return (
+            (dict(cached_result[0]), list(cached_result[1]))
+            if cached_result is not None
+            else None
+        )
     candidates = list(
         spec.live_output_dir.glob(f"{now.date().isoformat()}*/**/summary.json")
     )
@@ -135,15 +223,66 @@ def _latest_signal(
         except Exception:
             continue
     if not ranked:
+        _LEGACY_SIGNAL_SCAN_CACHE[legacy_cache_key] = (monotonic_now + 5.0, None)
         return None
     _generated, summary_path, summary = max(ranked, key=lambda item: item[0])
     weights_path = summary_path.with_name("target_weights.parquet")
     if not weights_path.is_file():
+        _LEGACY_SIGNAL_SCAN_CACHE[legacy_cache_key] = (monotonic_now + 5.0, None)
         return None
     rows = pl.read_parquet(weights_path).to_dicts()
     summary = dict(summary)
     summary["summary_path"] = str(summary_path)
-    return summary, rows
+    result = (summary, rows)
+    _LEGACY_SIGNAL_SCAN_CACHE[legacy_cache_key] = (
+        monotonic_now + 5.0,
+        result,
+    )
+    return dict(summary), list(rows)
+
+
+def _entry_candidate_symbols(
+    *,
+    spec: ModeSpec,
+    rows: list[dict[str, Any]],
+    eligibility: dict[str, Any],
+) -> tuple[set[str], dict[str, float]]:
+    """Quote only eligible names capable of producing a whole-lot order."""
+
+    symbols: set[str] = set()
+    fallback: dict[str, float] = {}
+    for row in rows:
+        weight = float(row.get("target_weight") or 0.0)
+        if weight == 0.0 or not bool(row.get("tradable")):
+            continue
+        if weight > 0.0 and not bool(row.get("can_buy")):
+            continue
+        if weight < 0.0 and not bool(row.get("can_sell")):
+            continue
+        symbol = str(row.get("symbol") or "")
+        evidence = eligibility.get(symbol)
+        if (
+            not symbol
+            or evidence is None
+            or not evidence.covered
+            or not evidence.eligible
+            or (weight < 0.0 and not evidence.short_open)
+        ):
+            continue
+        sizing_price = float(
+            row.get("open_price") or row.get("current_price") or 0.0
+        )
+        if np.isfinite(sizing_price) and sizing_price > 0.0:
+            requested = int(
+                abs(weight) * float(spec.initial_capital_twd) / sizing_price
+            )
+            if requested < int(spec.lot_size):
+                continue
+            fallback[symbol] = sizing_price
+        else:
+            fallback[symbol] = 1.0
+        symbols.add(symbol)
+    return symbols, fallback
 
 
 def _fetch_quotes(
@@ -179,6 +318,36 @@ def _rule_data_dir(live: LiveMarketConfig, spec: ModeSpec) -> Path:
     )
 
 
+def _cached_live_eligibility(
+    *,
+    rule_data_dir: Path,
+    parquet_root: Path,
+    symbols: list[str],
+    trading_date: datetime,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    requested = {symbol for symbol in symbols if symbol}
+    key = (
+        str(rule_data_dir.resolve()),
+        str(parquet_root.resolve()),
+        trading_date.date().isoformat(),
+    )
+    cached = _ELIGIBILITY_CACHE.get(key)
+    if cached and requested.issubset(cached[0]):
+        return ({symbol: cached[1][symbol] for symbol in requested}, dict(cached[2]))
+    union = requested | (cached[0] if cached else set())
+    resolved, coverage = load_live_eligibility(
+        rule_data_dir=rule_data_dir,
+        parquet_root=parquet_root,
+        symbols=sorted(union),
+        trading_date=trading_date.date(),
+    )
+    # Missing same-day files can legitimately appear during pre-open recovery;
+    # do not freeze a fail-closed miss in the process cache.
+    if all(bool(row.get("covered")) for row in coverage.values()):
+        _ELIGIBILITY_CACHE[key] = (union, resolved, coverage)
+    return ({symbol: resolved[symbol] for symbol in requested}, coverage)
+
+
 def _current_eligibility_coverage(
     specs: list[ModeSpec],
     live_configs: dict[str, LiveMarketConfig],
@@ -202,6 +371,73 @@ def _current_eligibility_coverage(
     return by_market
 
 
+def _prewarm_live_eligibility(
+    specs: list[ModeSpec],
+    live_configs: dict[str, LiveMarketConfig],
+    *,
+    trading_date: datetime,
+) -> dict[str, dict[str, Any]]:
+    """Resolve the complete checkpoint universe before the opening event."""
+
+    warmed: dict[str, dict[str, Any]] = {}
+    grouped: dict[tuple[str, str], list[ModeSpec]] = {}
+    for spec in specs:
+        live = live_configs[spec.market]
+        rule_data_dir = _rule_data_dir(live, spec)
+        key = (str(rule_data_dir.resolve()), str(spec.parquet_root.resolve()))
+        grouped.setdefault(key, []).append(spec)
+
+    for (rule_dir_text, parquet_root_text), grouped_specs in grouped.items():
+        rule_data_dir = Path(rule_dir_text)
+        parquet_root = Path(parquet_root_text)
+        symbols = sorted(load_symbol_metadata(parquet_root))
+        started = time_module.perf_counter()
+        resolved, coverage = _cached_live_eligibility(
+            rule_data_dir=rule_data_dir,
+            parquet_root=parquet_root,
+            symbols=symbols,
+            trading_date=trading_date,
+        )
+        missing = {
+            venue: row
+            for venue, row in coverage.items()
+            if not bool(row.get("covered"))
+        }
+        if missing:
+            raise RuntimeError(f"same-session eligibility not covered: {missing}")
+        elapsed_ms = (time_module.perf_counter() - started) * 1000.0
+        row = {
+            "symbol_count": len(symbols),
+            "resolved_count": len(resolved),
+            "elapsed_ms": round(elapsed_ms, 3),
+            "coverage": coverage,
+        }
+        for spec in grouped_specs:
+            warmed[spec.market] = row
+    return warmed
+
+
+def _verified_stock_session(
+    specs: list[ModeSpec],
+    live_configs: dict[str, LiveMarketConfig],
+    *,
+    observed: datetime,
+) -> tuple[bool, dict[str, str]]:
+    """Fail closed before Shioaji access when any paper mode lacks a session."""
+
+    decisions: dict[str, str] = {}
+    for spec in specs:
+        live = live_configs[spec.market]
+        is_open, reason = verified_tw_stock_session_day(
+            observed.date(),
+            tuple(live.holidays or ()),
+            parquet_root=_rule_data_dir(live, spec),
+        )
+        if not is_open:
+            decisions[spec.market] = reason
+    return bool(specs) and not decisions, decisions
+
+
 def _active_symbols(
     engine: TwDayTradeSimulationEngine,
 ) -> tuple[list[str], dict[str, float]]:
@@ -221,6 +457,137 @@ def _active_symbols(
     return sorted(symbols), fallback
 
 
+def _active_quote_due(
+    active_symbols: list[str],
+    *,
+    observed: datetime,
+    last_quote_minute: str | None,
+) -> bool:
+    """Keep polling an open ledger through terminal flatten catch-up."""
+
+    minute_key = observed.replace(second=0, microsecond=0).isoformat(
+        timespec="minutes"
+    )
+    wall_time = observed.timetz().replace(tzinfo=None)
+    force_exit_retry = FORCE_EXIT_TIME <= wall_time < CLOSING_AUCTION_TIME
+    return (
+        bool(active_symbols)
+        and wall_time >= datetime_time(9, 0)
+        and (force_exit_retry or last_quote_minute != minute_key)
+    )
+
+
+def _loop_sleep_seconds(
+    observed: datetime,
+    *,
+    fast_seconds: float,
+    has_pending_signal: bool,
+    has_open_position: bool,
+) -> float:
+    """Use 10 Hz only around latency-critical state transitions."""
+
+    wall_time = observed.timetz().replace(tzinfo=None)
+    opening_hot_path = datetime_time(8, 59, 30) <= wall_time < datetime_time(9, 10)
+    exit_hot_path = datetime_time(13, 19, 30) <= wall_time < CLOSING_AUCTION_TIME
+    force_exit_hot_path = (
+        has_open_position and FORCE_EXIT_TIME <= wall_time < CLOSING_AUCTION_TIME
+    )
+    if has_pending_signal or opening_hot_path or exit_hot_path or force_exit_hot_path:
+        return max(0.01, float(fast_seconds))
+    return max(1.0, float(fast_seconds))
+
+
+class _SignalPointerWatcher:
+    """Wake immediately when an atomic latest_signal.json pointer is published.
+
+    Linux inotify removes the 0-100 ms polling quantization from the opening
+    path. The ordinary timeout remains a portable fail-safe and continues to
+    drive quote/exit/readiness work when no signal file changes.
+    """
+
+    _WATCH_MASK = 0x00000008 | 0x00000080 | 0x00000100 | 0x00004000
+
+    def __init__(self) -> None:
+        self._fd: int | None = None
+        self._watched_paths: set[str] = set()
+        try:
+            libc = ctypes.CDLL(None, use_errno=True)
+            init = libc.inotify_init1
+            init.argtypes = [ctypes.c_int]
+            init.restype = ctypes.c_int
+            fd = int(init(os.O_NONBLOCK | os.O_CLOEXEC))
+            if fd < 0:
+                raise OSError(ctypes.get_errno(), "inotify_init1 failed")
+            add_watch = libc.inotify_add_watch
+            add_watch.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32]
+            add_watch.restype = ctypes.c_int
+            self._libc = libc
+            self._add_watch = add_watch
+            self._fd = fd
+        except (AttributeError, OSError):
+            self._libc = None
+            self._add_watch = None
+
+    @property
+    def enabled(self) -> bool:
+        return self._fd is not None and bool(self._watched_paths)
+
+    def configure(self, directories: list[Path]) -> None:
+        if self._fd is None or self._add_watch is None:
+            return
+        for directory in directories:
+            try:
+                resolved = str(Path(directory).resolve())
+                if resolved in self._watched_paths or not Path(resolved).is_dir():
+                    continue
+                descriptor = int(
+                    self._add_watch(
+                        self._fd,
+                        os.fsencode(resolved),
+                        self._WATCH_MASK,
+                    )
+                )
+                if descriptor < 0:
+                    continue
+                self._watched_paths.add(resolved)
+            except OSError:
+                continue
+
+    def wait(self, timeout_seconds: float) -> bool:
+        timeout = max(0.0, float(timeout_seconds))
+        if not self.enabled or self._fd is None:
+            time_module.sleep(timeout)
+            return False
+        try:
+            ready, _writable, _errors = select.select(
+                [self._fd], [], [], timeout
+            )
+            if not ready:
+                return False
+            while True:
+                try:
+                    if not os.read(self._fd, 64 * 1024):
+                        break
+                except BlockingIOError:
+                    break
+            return True
+        except (OSError, ValueError):
+            time_module.sleep(timeout)
+            return False
+
+    def close(self) -> None:
+        if self._fd is None:
+            return
+        try:
+            os.close(self._fd)
+        finally:
+            self._fd = None
+            self._watched_paths.clear()
+
+    def __del__(self) -> None:
+        self.close()
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -231,7 +598,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path("artifacts/live/tw_day_trade_simulation"),
     )
-    parser.add_argument("--poll-seconds", type=float, default=2.0)
+    parser.add_argument("--poll-seconds", type=float, default=0.1)
     parser.add_argument("--once", action="store_true")
     parser.add_argument(
         "--rearm-flat-session",
@@ -296,36 +663,185 @@ def main(argv: list[str] | None = None) -> int:
     last_readiness = 0.0
     last_quote_minute: str | None = None
     last_benchmark_minute: str | None = None
-    pending_retry_minute: dict[str, str] = {}
+    pending_retry_after: dict[str, float] = {}
+    quote_client_warmed_session: str | None = None
+    quote_client_prewarm_retry_after = 0.0
+    eligibility_prewarmed_session: str | None = None
+    signal_watcher = _SignalPointerWatcher()
+    last_session_gate_log: tuple[str, tuple[tuple[str, str], ...]] | None = None
+    non_session_invalidation_attempts: set[tuple[str, str]] = set()
     print(
         f"[tw-day-trade-sim] state_dir={engine.state_dir} simulation_only=true",
         flush=True,
     )
-
     while True:
         monotonic_now = time_module.monotonic()
         observed = datetime.now(TAIPEI)
         if monotonic_now - last_reload >= 30.0 or not specs:
             specs, live_configs, errors = _mode_specs(markets_dir)
-            current_coverage = _current_eligibility_coverage(
+            signal_watcher.configure([spec.live_output_dir for spec in specs])
+            session_open, session_errors = _verified_stock_session(
                 specs,
                 live_configs,
-                trading_date=observed,
+                observed=observed,
             )
+            current_coverage = (
+                _current_eligibility_coverage(
+                    specs,
+                    live_configs,
+                    trading_date=observed,
+                )
+                if session_open
+                else {}
+            )
+            session_date_text = observed.date().isoformat()
+            eligibility_prewarm_due = (
+                observed.timetz().replace(tzinfo=None) >= datetime_time(8, 30)
+            )
+            if (
+                session_open
+                and eligibility_prewarm_due
+                and eligibility_prewarmed_session != session_date_text
+            ):
+                try:
+                    eligibility_warm = _prewarm_live_eligibility(
+                        specs,
+                        live_configs,
+                        trading_date=observed,
+                    )
+                    if eligibility_warm:
+                        slowest = max(
+                            eligibility_warm.values(),
+                            key=lambda row: float(row.get("elapsed_ms") or 0.0),
+                        )
+                        print(
+                            "[tw-day-trade-sim] eligibility_prewarm=ready "
+                            f"symbols={slowest.get('symbol_count')} "
+                            f"elapsed_ms={slowest.get('elapsed_ms')}",
+                            flush=True,
+                        )
+                    eligibility_prewarmed_session = session_date_text
+                except Exception as exc:
+                    errors = {
+                        **errors,
+                        **{
+                            spec.market: (
+                                "eligibility_prewarm_failed: "
+                                f"{type(exc).__name__}: {exc}"
+                            )
+                            for spec in specs
+                        },
+                    }
             engine.update_readiness(
                 specs,
                 now=observed,
-                errors=errors,
+                errors={
+                    **errors,
+                    **{
+                        market: f"market_session_blocked: {reason}"
+                        for market, reason in session_errors.items()
+                    },
+                },
                 current_eligibility_coverage=current_coverage,
             )
             last_reload = monotonic_now
             last_readiness = monotonic_now
-        elif monotonic_now - last_readiness >= 10.0:
+        session_open, session_errors = _verified_stock_session(
+            specs,
+            live_configs,
+            observed=observed,
+        )
+        if not session_open:
+            for market, reason in session_errors.items():
+                invalidation_key = (observed.date().isoformat(), market)
+                if invalidation_key in non_session_invalidation_attempts:
+                    continue
+                try:
+                    result = engine.invalidate_non_session_flat_signal(
+                        market,
+                        now=observed,
+                        reason=reason,
+                    )
+                    if result == "invalidated":
+                        print(
+                            "[tw-day-trade-sim] non_session_signal=invalidated "
+                            f"market={market} date={observed.date().isoformat()} "
+                            f"reason={reason}",
+                            flush=True,
+                        )
+                except Exception as exc:
+                    print(
+                        "[tw-day-trade-sim] non_session_signal=blocked "
+                        f"market={market} error={type(exc).__name__}: {exc}",
+                        flush=True,
+                    )
+                non_session_invalidation_attempts.add(invalidation_key)
+            if monotonic_now - last_readiness >= 10.0:
+                engine.update_readiness(
+                    specs,
+                    now=observed,
+                    errors={
+                        market: f"market_session_blocked: {reason}"
+                        for market, reason in session_errors.items()
+                    },
+                )
+                last_readiness = monotonic_now
+            gate_key = (
+                observed.date().isoformat(),
+                tuple(sorted(session_errors.items())),
+            )
+            if gate_key != last_session_gate_log:
+                print(
+                    "[tw-day-trade-sim] market_session=blocked "
+                    f"date={observed.date().isoformat()} reasons={session_errors}",
+                    flush=True,
+                )
+                last_session_gate_log = gate_key
+            if args.once:
+                return 0
+            time_module.sleep(max(1.0, float(args.poll_seconds)))
+            continue
+        last_session_gate_log = None
+        if monotonic_now - last_readiness >= 10.0:
             engine.update_readiness(specs, now=observed)
             last_readiness = monotonic_now
 
+        prewarm_wall_time = observed.timetz().replace(tzinfo=None)
+        prewarm_session = observed.date().isoformat()
+        if (
+            quote_client_warmed_session != prewarm_session
+            and prewarm_wall_time >= datetime_time(8, 55)
+            and monotonic_now >= quote_client_prewarm_retry_after
+        ):
+            prewarm_started = time_module.perf_counter()
+            try:
+                warm_shioaji_stock_quote_client()
+                quote_client_warmed_session = prewarm_session
+                print(
+                    "[tw-day-trade-sim] shioaji_prewarm=ready "
+                    f"elapsed_ms="
+                    f"{(time_module.perf_counter() - prewarm_started) * 1000.0:.3f}",
+                    flush=True,
+                )
+            except Exception as exc:
+                quote_client_prewarm_retry_after = time_module.monotonic() + 5.0
+                print(
+                    f"[tw-day-trade-sim] shioaji_prewarm=failed "
+                    f"error={type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+
         pending: list[
-            tuple[ModeSpec, LiveMarketConfig, dict[str, Any], list[dict[str, Any]]]
+            tuple[
+                ModeSpec,
+                LiveMarketConfig,
+                dict[str, Any],
+                list[dict[str, Any]],
+                dict[str, Any],
+                dict[str, Any],
+                float,
+                datetime,
+            ]
         ] = []
         pending_symbols: set[str] = set()
         pending_fallback: dict[str, float] = {}
@@ -333,34 +849,76 @@ def main(argv: list[str] | None = None) -> int:
             timespec="minutes"
         )
         for spec in specs:
+            mode = engine.state.get("modes", {}).get(spec.market, {})
+            if (
+                str(mode.get("session_date") or "") == observed.date().isoformat()
+                and mode.get("entry_completed_at")
+            ):
+                continue
             latest = _latest_signal(spec, observed)
             if latest is None:
                 continue
             summary, rows = latest
-            mode = engine.state.get("modes", {}).get(spec.market, {})
+            detected_at = datetime.now(TAIPEI)
             signal_id = str(summary.get("signal_id") or "")
             if signal_id in set(mode.get("processed_signal_ids") or ()):
                 continue
-            if pending_retry_minute.get(spec.market) == minute_key:
+            if monotonic_now < pending_retry_after.get(spec.market, 0.0):
                 continue
-            pending.append((spec, live_configs[spec.market], summary, rows))
-            for row in rows:
-                if abs(float(row.get("target_weight") or 0.0)) <= 0.0:
-                    continue
-                symbol = str(row.get("symbol") or "")
-                if not symbol:
-                    continue
-                pending_symbols.add(symbol)
-                pending_fallback[symbol] = float(
-                    row.get("current_price") or row.get("open_price") or 1.0
+            live = live_configs[spec.market]
+            eligibility_started = time_module.perf_counter()
+            row_symbols = [str(row.get("symbol") or "") for row in rows]
+            try:
+                eligibility, coverage = _cached_live_eligibility(
+                    rule_data_dir=_rule_data_dir(live, spec),
+                    parquet_root=spec.parquet_root,
+                    symbols=row_symbols,
+                    trading_date=observed,
                 )
+            except Exception as exc:
+                print(
+                    f"[tw-day-trade-sim] market={spec.market} "
+                    f"eligibility_error={type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+                pending_retry_after[spec.market] = time_module.monotonic() + 0.5
+                continue
+            candidate_symbols, candidate_fallback = _entry_candidate_symbols(
+                spec=spec,
+                rows=rows,
+                eligibility=eligibility,
+            )
+            eligibility_ms = (time_module.perf_counter() - eligibility_started) * 1000.0
+            pending.append(
+                (
+                    spec,
+                    live,
+                    summary,
+                    rows,
+                    eligibility,
+                    coverage,
+                    eligibility_ms,
+                    detected_at,
+                )
+            )
+            pending_symbols.update(candidate_symbols)
+            pending_fallback.update(candidate_fallback)
 
         active_symbols, active_fallback = _active_symbols(engine)
         wall_time = observed.timetz().replace(tzinfo=None)
-        quote_due = (
+        same_minute_force_exit_retry = (
             bool(active_symbols)
-            and datetime_time(9, 0) <= wall_time <= datetime_time(13, 30)
-            and last_quote_minute != minute_key
+            and FORCE_EXIT_TIME <= wall_time < CLOSING_AUCTION_TIME
+            and last_quote_minute == minute_key
+        )
+        # Keep observing only while a paper position remains.  In particular,
+        # do not make terminal flatten depend on the process being alive during
+        # the exact 13:30 minute: a late start/restart must catch up immediately
+        # and the symbol set naturally becomes empty once the ledger is flat.
+        quote_due = _active_quote_due(
+            active_symbols,
+            observed=observed,
+            last_quote_minute=last_quote_minute,
         )
         benchmark_due = (
             observed.weekday() < 5
@@ -378,6 +936,7 @@ def main(argv: list[str] | None = None) -> int:
             | benchmark_symbols
         )
         quotes: dict[str, dict[str, Any]] = {}
+        quote_fetch_ms = 0.0
         if all_symbols and specs:
             fallback = {
                 **engine.benchmark_fallback_prices(),
@@ -390,6 +949,7 @@ def main(argv: list[str] | None = None) -> int:
                 # missing evidence rather than retried every two seconds.
                 last_quote_minute = minute_key
             try:
+                quote_started = time_module.perf_counter()
                 quotes = _fetch_quotes(
                     symbols=all_symbols,
                     fallback_by_symbol=fallback,
@@ -397,6 +957,7 @@ def main(argv: list[str] | None = None) -> int:
                     trading_date=observed,
                 )
                 quotes = engine.prepare_minute_quotes(quotes, now=observed)
+                quote_fetch_ms = (time_module.perf_counter() - quote_started) * 1000.0
             except Exception as exc:
                 print(
                     f"[tw-day-trade-sim] quote_error={type(exc).__name__}: {exc}",
@@ -408,11 +969,12 @@ def main(argv: list[str] | None = None) -> int:
             last_benchmark_minute = minute_key
             previous_contract = engine.benchmark_tx_contract()
             try:
-                future_snapshot = fetch_shioaji_futures_snapshot(
+                future_snapshot = fetch_futures_snapshot_prefer_stream(
                     TX_CONTINUOUS_LOGICAL_CODE,
                     additional_contract_codes=(previous_contract,)
                     if previous_contract
                     else (),
+                    decision_time=observed,
                 )
             except Exception as exc:
                 print(
@@ -421,15 +983,19 @@ def main(argv: list[str] | None = None) -> int:
                     flush=True,
                 )
 
-        for spec, live, summary, rows in pending:
-            symbols = [str(row.get("symbol") or "") for row in rows]
+        for (
+            spec,
+            _live,
+            summary,
+            rows,
+            eligibility,
+            coverage,
+            eligibility_ms,
+            detected_at,
+        ) in pending:
             try:
-                eligibility, coverage = load_live_eligibility(
-                    rule_data_dir=_rule_data_dir(live, spec),
-                    parquet_root=spec.parquet_root,
-                    symbols=symbols,
-                    trading_date=observed.date(),
-                )
+                ledger_started = time_module.perf_counter()
+                register_observed = datetime.now(TAIPEI)
                 result = engine.register_signal(
                     spec=spec,
                     summary=summary,
@@ -437,12 +1003,25 @@ def main(argv: list[str] | None = None) -> int:
                     quotes=quotes,
                     eligibility=eligibility,
                     eligibility_coverage=coverage,
-                    now=observed,
+                    now=register_observed,
                 )
+                ledger_ms = (time_module.perf_counter() - ledger_started) * 1000.0
+                persisted_at = datetime.now(TAIPEI)
                 if result in {"waiting_quote", "waiting_first_minute"}:
-                    pending_retry_minute[spec.market] = minute_key
+                    pending_retry_after[spec.market] = time_module.monotonic() + 0.5
                 else:
-                    pending_retry_minute.pop(spec.market, None)
+                    pending_retry_after.pop(spec.market, None)
+                    engine.record_latency_sample(
+                        market=spec.market,
+                        signal_id=str(summary.get("signal_id") or ""),
+                        result=result,
+                        summary=summary,
+                        consumer_detected_at=detected_at,
+                        ledger_persisted_at=persisted_at,
+                        executor_quote_fetch_ms=quote_fetch_ms,
+                        eligibility_load_ms=eligibility_ms,
+                        ledger_compute_persist_ms=ledger_ms,
+                    )
                 if result == "registered":
                     # register_signal already persisted this minute's complete
                     # liquidation mark from the causally later fill quote.
@@ -460,7 +1039,11 @@ def main(argv: list[str] | None = None) -> int:
                 )
 
         if quote_due:
-            engine.process_quotes(quotes=quotes, now=observed)
+            engine.process_quotes(
+                quotes=quotes,
+                now=datetime.now(TAIPEI),
+                append_mark_history=not same_minute_force_exit_retry,
+            )
         if benchmark_due and specs:
             current_contract = str(future_snapshot.get("current_contract_code") or "")
             future_quotes = future_snapshot.get("quotes") or {}
@@ -471,12 +1054,23 @@ def main(argv: list[str] | None = None) -> int:
                 current_future_contract_code=current_contract or None,
                 current_future_quote=future_quotes.get(current_contract) or {},
                 previous_future_quote=future_quotes.get(previous_contract) or {},
-                now=observed,
+                corporate_action_reference_path=(
+                    _rule_data_dir(live_configs[specs[0].market], specs[0])
+                    / "tw_corporate_action_reference.parquet"
+                ),
+                now=datetime.now(TAIPEI),
             )
 
         if args.once:
             return 0
-        time_module.sleep(float(args.poll_seconds))
+        signal_watcher.wait(
+            _loop_sleep_seconds(
+                datetime.now(TAIPEI),
+                fast_seconds=float(args.poll_seconds),
+                has_pending_signal=bool(pending),
+                has_open_position=bool(active_symbols),
+            )
+        )
 
 
 if __name__ == "__main__":

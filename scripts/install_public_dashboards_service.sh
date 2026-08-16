@@ -13,7 +13,8 @@ sed "s&__REPO_ROOT__&$escaped_root&g" "$template" > "$temporary"
 install -m 0644 "$temporary" "$target"
 systemd-analyze verify "$target"
 systemctl daemon-reload
-systemctl enable --now stockagent-public-dashboards.service
+systemctl enable stockagent-public-dashboards.service
+systemctl restart stockagent-public-dashboards.service
 ready=false
 for _attempt in $(seq 1 10); do
     if systemctl is-active --quiet stockagent-public-dashboards.service \

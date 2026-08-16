@@ -17,7 +17,12 @@ import sqlite3
 import sys
 import threading
 import time
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from concurrent.futures import (
+    FIRST_COMPLETED,
+    ProcessPoolExecutor,
+    ThreadPoolExecutor,
+    wait,
+)
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from datetime import date, datetime, timedelta, timezone
@@ -91,12 +96,22 @@ COMPLETION_PERSISTENCE_BATCH_CAP = 256
 COMPLETION_BACKPRESSURE_CAP = 1024
 DEFAULT_ARCHIVE_THREAD_SWITCH_INTERVAL_SECONDS = 0.001
 FOLLOWUP_UPSERT_CHUNK_SIZE = 8192
+# A retryable response is not evidence that a task is unavailable, but it is
+# also not permission to call the same URL in a tight loop.  Keep this clock in
+# the manifest (rather than process memory) so supervisor and host restarts
+# preserve backpressure.  The deterministic 0.8--1.0 spread prevents a wave of
+# failed catalog URLs from becoming eligible in the same second.
+TASK_RETRY_BASE_SECONDS = 5 * 60.0
+TASK_RETRY_MAX_SECONDS = 24 * 60 * 60.0
 SEC_STATEMENT_VALIDATION_RECOVERY_REVISION = 1
 SEC_STATEMENT_WRAPPER_SHARD_RECOVERY_REVISION = 1
 PROVIDER_PARSER_SHAPE_RECOVERY_REVISION = 1
 HETEROGENEOUS_PARQUET_SCHEMA_RECOVERY_REVISION = 1
 SEC_ALL_COMPANY_FACTS = "__all__"
 BLS_SERIES_BATCH_SIZE = 50
+BLS_LABSTAT_BASE_URL = "https://download.bls.gov/pub/time.series/"
+BLS_LABSTAT_CACHE_SCHEMA_VERSION = 1
+BLS_LABSTAT_PARALLEL_BUILDS = 2
 FRED_RELEASE_PAGE_SIZE = 1000
 FMP_CONSTITUENT_INDEXES = ("dowjones", "sp500", "nasdaq")
 FMP_OWNERSHIP_SYMBOL_BATCH_SIZE = 50
@@ -112,6 +127,13 @@ _ECONDB_TOKEN_LOCK = threading.Lock()
 _ECONDB_CACHED_TOKEN: str | None = None
 _SEC_COMPANYFACTS_LOCKS_GUARD = threading.Lock()
 _SEC_COMPANYFACTS_LOCKS: dict[str, threading.Lock] = {}
+_BLS_LABSTAT_LOCKS_GUARD = threading.Lock()
+_BLS_LABSTAT_LOCKS: dict[str, threading.Lock] = {}
+_BLS_LABSTAT_READY_DATABASES: dict[str, tuple[int, int]] = {}
+# LABSTAT files are whole-survey snapshots and can be hundreds of MiB. Two
+# concurrent transfers keep the network busy without multiplying peak disk and
+# DuckDB import pressure across every BLS worker.
+_BLS_LABSTAT_BUILD_SEMAPHORE = threading.Semaphore(BLS_LABSTAT_PARALLEL_BUILDS)
 _SEC_STANDARDIZED_CACHE_GUARD = threading.Lock()
 _SEC_STANDARDIZED_CACHE: dict[
     tuple[str, tuple[str, ...], str, bool, bool], tuple[Any, set[str]]
@@ -151,11 +173,128 @@ SEC_COMPANYFACTS_STATEMENT_ENDPOINTS = frozenset(
 # CPU/GIL/cache bound after at most one SEC fetch per CIK.  Letting all 72 SEC
 # execution slots run projections starves truly network-bound filing, CIK,
 # N-PORT, and filing-header routes without increasing the 10 req/s HTTP rate.
-# Two tasks per sibling endpoint keeps both annual/growth cache keys warm while
-# reserving most SEC slots for requests that can advance the provider limiter.
+# Three tasks per sibling endpoint exposes up to 18 independent projections to
+# the 14-slot default CPU budget. The fair budget admits only host capacity,
+# while the remaining 54 of 72 SEC slots stay available to network-bound work.
 PROVIDER_ENDPOINT_CONCURRENCY_CAPS: dict[tuple[str, str], int] = {
-    ("sec", endpoint): 2 for endpoint in SEC_COMPANYFACTS_STATEMENT_ENDPOINTS
+    ("sec", endpoint): 3 for endpoint in SEC_COMPANYFACTS_STATEMENT_ENDPOINTS
 }
+
+
+class FairCpuSlotBudget:
+    """Bound native threads plus child processes to one host CPU budget."""
+
+    def __init__(self, total: int) -> None:
+        self.total = max(1, int(total))
+        self._available = self.total
+        self._condition = threading.Condition()
+        self._waiters: deque[tuple[object, int]] = deque()
+
+    def acquire(self, requested: int = 1) -> int:
+        count = max(1, min(self.total, int(requested)))
+        token = object()
+        with self._condition:
+            self._waiters.append((token, count))
+            try:
+                while (
+                    self._waiters[0][0] is not token or self._available < count
+                ):
+                    self._condition.wait()
+            except BaseException:
+                self._waiters = deque(
+                    item for item in self._waiters if item[0] is not token
+                )
+                self._condition.notify_all()
+                raise
+            self._waiters.popleft()
+            self._available -= count
+            self._condition.notify_all()
+        return count
+
+    def release(self, count: int = 1) -> None:
+        count = max(1, min(self.total, int(count)))
+        with self._condition:
+            self._available = min(self.total, self._available + count)
+            self._condition.notify_all()
+
+    @contextmanager
+    def claim(self, requested: int = 1) -> Iterator[None]:
+        count = self.acquire(requested)
+        try:
+            yield
+        finally:
+            self.release(count)
+
+
+def _local_cpu_slot_count() -> int:
+    cpu_count = max(1, os.cpu_count() or 1)
+    default = max(1, cpu_count - min(2, cpu_count - 1))
+    raw_override = os.environ.get("OPENBB_LOCAL_CPU_SLOTS")
+    if raw_override is None:
+        return default
+    try:
+        requested = int(raw_override)
+    except ValueError as exc:
+        raise ValueError("OPENBB_LOCAL_CPU_SLOTS must be a positive integer") from exc
+    if requested <= 0:
+        raise ValueError("OPENBB_LOCAL_CPU_SLOTS must be a positive integer")
+    return min(cpu_count, requested)
+
+
+_LOCAL_CPU_BUDGET = FairCpuSlotBudget(_local_cpu_slot_count())
+_SEC_PROCESS_THREADPOOL_LIMITER: Any | None = None
+
+
+def _sec_statement_process_worker_count() -> int:
+    raw_override = os.environ.get("OPENBB_SEC_PROCESS_WORKERS")
+    if raw_override is None:
+        return _LOCAL_CPU_BUDGET.total
+    try:
+        requested = int(raw_override)
+    except ValueError as exc:
+        raise ValueError(
+            "OPENBB_SEC_PROCESS_WORKERS must be a non-negative integer"
+        ) from exc
+    if requested < 0:
+        raise ValueError("OPENBB_SEC_PROCESS_WORKERS must be a non-negative integer")
+    return min(_LOCAL_CPU_BUDGET.total, requested)
+
+
+def _initialize_sec_statement_process() -> None:
+    """Prevent one child from starting its own nested native thread pool."""
+    global _SEC_PROCESS_THREADPOOL_LIMITER
+    try:
+        import ctypes
+        import signal
+
+        # Linux parent-death signal prevents workers from surviving a
+        # supervisor TERM/restart of the archive downloader.
+        parent_pid = os.getppid()
+        ctypes.CDLL(None).prctl(1, signal.SIGTERM)
+        if os.getppid() != parent_pid:
+            os.kill(os.getpid(), signal.SIGTERM)
+    except (AttributeError, OSError):  # pragma: no cover - non-Linux fallback
+        pass
+    pa.set_cpu_count(1)
+    try:
+        from threadpoolctl import threadpool_limits
+
+        _SEC_PROCESS_THREADPOOL_LIMITER = threadpool_limits(limits=1)
+    except ImportError:
+        pass
+
+
+def _create_sec_statement_process_pool() -> ProcessPoolExecutor | None:
+    workers = _sec_statement_process_worker_count()
+    if workers <= 0:
+        return None
+    import multiprocessing
+
+    return ProcessPoolExecutor(
+        max_workers=workers,
+        mp_context=multiprocessing.get_context("spawn"),
+        initializer=_initialize_sec_statement_process,
+    )
 
 
 @contextmanager
@@ -903,6 +1042,12 @@ class DownloadTask:
     # outcome alone cannot distinguish a stable subscription restriction from
     # a transient request failure.
     provider_evidence: dict[str, str] = field(default_factory=dict, compare=False)
+    # These scheduling fields are observations, not part of task identity.
+    # ``attempts`` remains the lifetime request audit counter, while
+    # ``transient_failures`` is the consecutive task-local failure streak used
+    # exclusively for durable exponential backoff.
+    attempts: int = field(default=0, compare=False)
+    transient_failures: int = field(default=0, compare=False)
 
 
 @dataclass(slots=True)
@@ -918,6 +1063,20 @@ class TaskResult:
     followups: list[DownloadTask] = field(default_factory=list, repr=False)
     provider_outcomes: dict[str, str] = field(default_factory=dict, repr=False)
     provider_evidence: dict[str, str] = field(default_factory=dict, repr=False)
+    retry_not_before: str | None = None
+    transient_failures: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class ColumnarTaskPayload:
+    """A provider result already normalized as an Arrow table.
+
+    Keeping this marker distinct from ordinary OpenBB results prevents the
+    worker from materializing a large Python ``list[dict]`` only to convert it
+    back to Arrow during Parquet publication.
+    """
+
+    table: pa.Table
 
 
 @dataclass(slots=True)
@@ -1032,6 +1191,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=[],
         metavar="PROVIDER=N",
         help="Override concurrent calls for one provider; repeatable.",
+    )
+    parser.add_argument(
+        "--bls-api-only",
+        action="store_true",
+        help=(
+            "Disable the official LABSTAT bulk-file path and use only the "
+            "quota-limited BLS Public Data API."
+        ),
     )
     parser.add_argument(
         "--plan-only",
@@ -3704,9 +3871,10 @@ class Manifest:
                 provider_evidence_json TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
-                execution_started_at TEXT
+                execution_started_at TEXT,
+                retry_not_before TEXT,
+                transient_failures INTEGER NOT NULL DEFAULT 0
             );
-            CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status, category, endpoint);
             CREATE TABLE IF NOT EXISTS provider_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 provider TEXT NOT NULL,
@@ -3753,6 +3921,138 @@ class Manifest:
         if "execution_started_at" not in columns:
             self.connection.execute(
                 "ALTER TABLE tasks ADD COLUMN execution_started_at TEXT"
+            )
+        if "retry_not_before" not in columns:
+            self.connection.execute(
+                "ALTER TABLE tasks ADD COLUMN retry_not_before TEXT"
+            )
+        if "transient_failures" not in columns:
+            self.connection.execute(
+                "ALTER TABLE tasks ADD COLUMN transient_failures "
+                "INTEGER NOT NULL DEFAULT 0"
+            )
+        congress_retry_migration = "congress_http_500_task_backoff_v1"
+        if (
+            self.connection.execute(
+                "SELECT 1 FROM archive_meta WHERE key=?", (congress_retry_migration,)
+            ).fetchone()
+            is None
+        ):
+            now_dt = datetime.now(timezone.utc)
+            retry_rows = self.connection.execute(
+                """
+                SELECT task_id, attempts
+                FROM tasks
+                WHERE active=1
+                  AND status IN ('pending','running')
+                  AND retry_not_before IS NULL
+                  AND attempts>0
+                  AND EXISTS (
+                      SELECT 1 FROM json_each(tasks.providers_json)
+                      WHERE value='congress_gov'
+                  )
+                  AND (
+                      LOWER(COALESCE(error,'')) LIKE '%http error 500%'
+                      OR LOWER(COALESCE(error,'')) LIKE '%http 500%'
+                      OR LOWER(COALESCE(error,'')) LIKE '%-> 500%'
+                      OR LOWER(COALESCE(error,'')) LIKE '%status 500%'
+                  )
+                """
+            ).fetchall()
+            retry_updates: list[tuple[int, str, str]] = []
+            for row in retry_rows:
+                streak = max(1, min(16, int(row["attempts"] or 0)))
+                retry_updates.append(
+                    (
+                        streak,
+                        _task_retry_deadline(
+                            str(row["task_id"]), streak, now=now_dt
+                        ),
+                        str(row["task_id"]),
+                    )
+                )
+            self.connection.executemany(
+                """
+                UPDATE tasks SET transient_failures=?, retry_not_before=?
+                WHERE task_id=?
+                """,
+                retry_updates,
+            )
+            self.connection.execute(
+                """
+                INSERT INTO archive_meta(key,value,updated_at) VALUES (?,?,?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value=excluded.value, updated_at=excluded.updated_at
+                """,
+                (
+                    congress_retry_migration,
+                    str(len(retry_updates)),
+                    now_dt.isoformat(),
+                ),
+            )
+        congress_cooldown_retry_migration = (
+            "congress_legacy_transient_cooldown_backoff_v1"
+        )
+        if (
+            self.connection.execute(
+                "SELECT 1 FROM archive_meta WHERE key=?",
+                (congress_cooldown_retry_migration,),
+            ).fetchone()
+            is None
+        ):
+            now_dt = datetime.now(timezone.utc)
+            # The old provider-global transient block could overwrite the
+            # preceding HTTP 500 in later task results with only "cooldown
+            # until".  A large positive attempt count distinguishes these
+            # legacy churn rows from quota responses, whose attempts are
+            # deliberately decremented to zero by the worker.
+            retry_rows = self.connection.execute(
+                """
+                SELECT task_id, attempts
+                FROM tasks
+                WHERE active=1
+                  AND status IN ('pending','running')
+                  AND retry_not_before IS NULL
+                  AND attempts>=20
+                  AND EXISTS (
+                      SELECT 1 FROM json_each(tasks.providers_json)
+                      WHERE value='congress_gov'
+                  )
+                  AND LOWER(COALESCE(error,'')) LIKE '%cooldown until%'
+                  AND LOWER(COALESCE(error,'')) NOT LIKE '%quota%'
+                  AND LOWER(COALESCE(error,'')) NOT LIKE '%rate limit%'
+                """
+            ).fetchall()
+            retry_updates = []
+            for row in retry_rows:
+                streak = max(1, min(16, int(row["attempts"] or 0)))
+                retry_updates.append(
+                    (
+                        streak,
+                        _task_retry_deadline(
+                            str(row["task_id"]), streak, now=now_dt
+                        ),
+                        str(row["task_id"]),
+                    )
+                )
+            self.connection.executemany(
+                """
+                UPDATE tasks SET transient_failures=?, retry_not_before=?
+                WHERE task_id=?
+                """,
+                retry_updates,
+            )
+            self.connection.execute(
+                """
+                INSERT INTO archive_meta(key,value,updated_at) VALUES (?,?,?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value=excluded.value, updated_at=excluded.updated_at
+                """,
+                (
+                    congress_cooldown_retry_migration,
+                    str(len(retry_updates)),
+                    now_dt.isoformat(),
+                ),
             )
         etf_name_migration = "yfinance_etf_info_missing_name_v1"
         if (
@@ -4347,6 +4647,31 @@ class Manifest:
             ON tasks(active, plan_token, status, endpoint)
             """
             )
+            self.connection.execute(
+                """
+            CREATE INDEX IF NOT EXISTS idx_tasks_retry_not_before
+            ON tasks(active, status, plan_token, retry_not_before)
+            WHERE retry_not_before IS NOT NULL
+            """
+            )
+            # SEC statements are six projections of the same companyfacts
+            # artifact. Scope ordering lets the scheduler admit sibling
+            # balance/cash/income tasks together so the in-memory standardized
+            # object is parsed once instead of once per endpoint.
+            self.connection.execute(
+                """
+            CREATE INDEX IF NOT EXISTS idx_tasks_sec_statement_affinity
+            ON tasks(active, status, plan_token, endpoint, updated_at, scope_key, task_id)
+            WHERE endpoint IN (
+                'equity.fundamental.balance',
+                'equity.fundamental.balance_growth',
+                'equity.fundamental.cash',
+                'equity.fundamental.cash_growth',
+                'equity.fundamental.income',
+                'equity.fundamental.income_growth'
+            )
+            """
+            )
             self.connection.commit()
         progress.update(1)
         progress.close()
@@ -4465,6 +4790,16 @@ class Manifest:
                     WHEN {provider_contract_changed}
                     THEN NULL
                     ELSE tasks.error
+                END,
+                retry_not_before=CASE
+                    WHEN {provider_contract_changed}
+                    THEN NULL
+                    ELSE tasks.retry_not_before
+                END,
+                transient_failures=CASE
+                    WHEN {provider_contract_changed}
+                    THEN 0
+                    ELSE tasks.transient_failures
                 END,
                 provider_outcomes_json=CASE
                     WHEN {provider_contract_changed}
@@ -5169,6 +5504,38 @@ class Manifest:
             )
         return repaired_transient, repaired_entitlement
 
+    def repair_bls_missing_series_title_bug(self, *, plan_token: str) -> int:
+        """Requeue LABSTAT tasks failed before nullable title normalization."""
+        migration_key = "bls_missing_series_title_v1"
+        if self.meta_value(migration_key) is not None:
+            return 0
+        now = datetime.now(timezone.utc).isoformat()
+        with self.connection:
+            cursor = self.connection.execute(
+                """
+                UPDATE tasks SET
+                    status='pending', selected_provider=NULL, attempts=0, rows=0,
+                    error='requeued: LABSTAT series catalog has nullable title',
+                    provider_outcomes_json='{}', execution_started_at=NULL,
+                    updated_at='0001-01-01T00:00:00+00:00'
+                WHERE active=1 AND plan_token=? AND status='failed'
+                  AND endpoint='economy.survey.bls_series'
+                  AND LOWER(COALESCE(error,'')) LIKE '%binderexception%'
+                  AND LOWER(COALESCE(error,'')) LIKE '%series_title%'
+                """,
+                (plan_token,),
+            )
+            repaired = max(0, int(cursor.rowcount))
+            self.connection.execute(
+                """
+                INSERT INTO archive_meta(key,value,updated_at) VALUES (?,?,?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value=excluded.value, updated_at=excluded.updated_at
+                """,
+                (migration_key, str(repaired), now),
+            )
+        return repaired
+
     def repair_adaptable_parameter_constraints(
         self,
         parameter_maximums: Mapping[tuple[str, str, str], int],
@@ -5422,6 +5789,8 @@ class Manifest:
                 """
                 UPDATE tasks SET
                     status='pending',
+                    retry_not_before=NULL,
+                    transient_failures=0,
                     provider_outcomes_json=COALESCE(
                         (
                             SELECT json_group_object(outcome.key, outcome.value)
@@ -5451,7 +5820,8 @@ class Manifest:
             execute_stage(
                 "retry empty",
                 f"UPDATE tasks SET status='pending', provider_outcomes_json='{{}}', "
-                f"updated_at=? WHERE active=1 AND status='empty'{plan_clause}",
+                f"retry_not_before=NULL, transient_failures=0, updated_at=? "
+                f"WHERE active=1 AND status='empty'{plan_clause}",
                 (now, *plan_args),
             )
         if repair_legacy:
@@ -5500,7 +5870,8 @@ class Manifest:
             execute_stage(
                 "refresh success",
                 f"UPDATE tasks SET status='pending', provider_outcomes_json='{{}}', "
-                f"updated_at=? WHERE active=1 AND status='success'{plan_clause}",
+                f"retry_not_before=NULL, transient_failures=0, updated_at=? "
+                f"WHERE active=1 AND status='success'{plan_clause}",
                 (now, *plan_args),
             )
         # A manifest entry cannot remain complete if its parquet disappeared.
@@ -5541,7 +5912,8 @@ class Manifest:
             enabled=show_progress,
         ):
             self.connection.executemany(
-                "UPDATE tasks SET status='pending', updated_at=? WHERE task_id=?",
+                "UPDATE tasks SET status='pending', retry_not_before=NULL, "
+                "transient_failures=0, updated_at=? WHERE task_id=?",
                 missing,
             )
         progress.update(1)
@@ -5640,7 +6012,8 @@ class Manifest:
         self.connection.executemany(
             """
             UPDATE tasks SET status='success', selected_provider=?, rows=?,
-                error=NULL, updated_at=?
+                error=NULL, retry_not_before=NULL, transient_failures=0,
+                execution_started_at=NULL, updated_at=?
             WHERE task_id=? AND status='running'
             """,
             [
@@ -5709,11 +6082,14 @@ class Manifest:
         # quota, or parser-negotiation failure never becomes terminal merely
         # because a counter crossed a threshold.
         _ = max_total_attempts
-        parameters: tuple[Any, ...] = (*excluded, limit)
+        now = datetime.now(timezone.utc).isoformat()
+        parameters: tuple[Any, ...] = (now, *excluded, limit)
         rows = self.connection.execute(
             f"""
             SELECT * FROM tasks
-            WHERE active=1 AND status='pending'{provider_clause}
+            WHERE active=1 AND status='pending'
+              AND (retry_not_before IS NULL OR retry_not_before<=?)
+              {provider_clause}
             ORDER BY category, endpoint, updated_at, task_id
             LIMIT ?
             """,
@@ -5733,10 +6109,13 @@ class Manifest:
             output_path=row["output_path"],
             provider_outcomes=dict(json.loads(row["provider_outcomes_json"] or "{}")),
             provider_evidence=dict(json.loads(row["provider_evidence_json"] or "{}")),
+            attempts=int(row["attempts"] or 0),
+            transient_failures=int(row["transient_failures"] or 0),
         )
 
     def _refresh_schedule(self, max_total_attempts: int, plan_token: str) -> None:
         _ = max_total_attempts
+        now = datetime.now(timezone.utc).isoformat()
         self._schedule_keys = [
             (str(row["category"]), str(row["endpoint"]))
             for row in self.connection.execute(
@@ -5744,10 +6123,11 @@ class Manifest:
                 SELECT category,endpoint
                 FROM tasks
                 WHERE active=1 AND status='pending' AND plan_token=?
+                  AND (retry_not_before IS NULL OR retry_not_before<=?)
                 GROUP BY category,endpoint
                 ORDER BY category,endpoint
                 """,
-                (plan_token,),
+                (plan_token, now),
             )
         ]
         self._schedule_token = plan_token
@@ -5815,25 +6195,33 @@ class Manifest:
               )
             """
             required_provider_parameters = (str(required_provider),)
+        order_fields = (
+            "updated_at, scope_key, task_id"
+            if endpoint in SEC_COMPANYFACTS_STATEMENT_ENDPOINTS
+            else "updated_at, task_id"
+        )
         with _sqlite_progress(
             self.connection,
             f"manifest:pending {category}/{endpoint}",
             enabled=self.show_progress,
         ):
+            now = datetime.now(timezone.utc).isoformat()
             rows = self.connection.execute(
                 f"""
             SELECT * FROM tasks
             WHERE active=1 AND status='pending' AND plan_token=?
               AND category=? AND endpoint=?
+              AND (retry_not_before IS NULL OR retry_not_before<=?)
               {required_provider_clause}
               {provider_clause}
-            ORDER BY updated_at, task_id
+            ORDER BY {order_fields}
             LIMIT ? OFFSET ?
                 """,
                 (
                     plan_token,
                     category,
                     endpoint,
+                    now,
                     *required_provider_parameters,
                     *required_excluded_parameters,
                     *excluded,
@@ -6017,6 +6405,38 @@ class Manifest:
         ).fetchone()
         return int(row[0])
 
+    def retry_deferred_state(
+        self, plan_token: str | None = None
+    ) -> tuple[int, str | None]:
+        """Return pending tasks held by durable task-local backoff and next due."""
+        now = datetime.now(timezone.utc).isoformat()
+        plan_clause = "" if plan_token is None else " AND plan_token=?"
+        parameters: tuple[Any, ...] = (
+            (now,) if plan_token is None else (now, plan_token)
+        )
+        row = self.connection.execute(
+            f"""
+            SELECT COUNT(*), MIN(retry_not_before)
+            FROM tasks
+            WHERE active=1 AND status='pending'
+              AND retry_not_before>?{plan_clause}
+            """,
+            parameters,
+        ).fetchone()
+        return int(row[0]), (None if row[1] is None else str(row[1]))
+
+    def next_retry_delay(self, plan_token: str | None = None) -> float | None:
+        _, deadline = self.retry_deferred_state(plan_token)
+        if deadline is None:
+            return None
+        try:
+            due = datetime.fromisoformat(deadline)
+            if due.tzinfo is None:
+                due = due.replace(tzinfo=timezone.utc)
+        except ValueError:
+            return 0.0
+        return max(0.0, (due - datetime.now(timezone.utc)).total_seconds())
+
     def accepted_endpoints(self, plan_token: str) -> set[str]:
         """Return routes with evidence of data or authoritative absence."""
         return {
@@ -6130,7 +6550,9 @@ class Manifest:
             UPDATE tasks SET status=?, selected_provider=?, attempts=attempts+?, rows=?,
                 kwargs_json=?,
                 output_path=COALESCE(?, output_path), error=?,
-                provider_outcomes_json=?, provider_evidence_json=?, updated_at=?
+                provider_outcomes_json=?, provider_evidence_json=?,
+                retry_not_before=?, transient_failures=?,
+                execution_started_at=NULL, updated_at=?
             WHERE task_id=?
             """,
             (
@@ -6143,6 +6565,8 @@ class Manifest:
                 result.error,
                 _canonical_json(result.provider_outcomes),
                 _canonical_json(result.provider_evidence),
+                result.retry_not_before,
+                max(0, int(result.transient_failures)),
                 now,
                 result.task.task_id,
             ),
@@ -7412,13 +7836,13 @@ class ProviderRuntime:
                         self._blocked_kind[provider_name] == "quota"
                         and "daily" in reason.lower()
                     ):
-                        self._blocked_until[provider_name] = max(
-                            self._blocked_until[provider_name],
-                            self._quota_reset_deadline(
-                                provider_name,
-                                reason,
-                                now,
-                            ),
+                        # The old checkpoint deadline was a generic cooldown,
+                        # not upstream reset evidence. Replace it with the
+                        # semantic provider boundary: keeping the maximum can
+                        # oversleep past midnight when the archive restarts in
+                        # the final hour of the provider day.
+                        self._blocked_until[provider_name] = (
+                            self._quota_reset_deadline(provider_name, reason, now)
                         )
             unavailable = payload.get("unavailable_providers", {})
             if isinstance(unavailable, Mapping):
@@ -8494,6 +8918,14 @@ class ProviderDeferredError(RuntimeError):
     """A request was withdrawn because another thread started a cooldown."""
 
 
+class BlsLabstatUnsupportedError(RuntimeError):
+    """LABSTAT cannot represent this exact request; the API may be used."""
+
+
+class SecCompanyfactsCacheInvalidError(RuntimeError):
+    """A child process found a missing or invalid main-process SEC raw cache."""
+
+
 class ProviderResponseShapeError(RuntimeError):
     """An upstream payload did not match the provider adapter's shape contract."""
 
@@ -8532,6 +8964,18 @@ def _provider_for_http_url(url: Any) -> str | None:
         if host == suffix or host.endswith(f".{suffix}"):
             return provider
     return None
+
+
+def _is_bls_labstat_bulk_url(url: Any) -> bool:
+    """Return whether a URL is the quota-free official LABSTAT file host."""
+    from urllib.parse import urlsplit
+
+    try:
+        host = str(urlsplit(str(url)).hostname or "").lower().rstrip(".")
+        path = str(urlsplit(str(url)).path or "")
+    except (TypeError, ValueError):
+        return False
+    return host == "download.bls.gov" and path.startswith("/pub/time.series/")
 
 
 def _is_intrinio_large_page_or_bulk_url(url: Any) -> bool:
@@ -8728,6 +9172,12 @@ def _consume_yfinance_transport_failure() -> str | None:
 
 def _wait_provider_http_boundary(provider: str, url: Any) -> None:
     """Claim exactly one real HTTP start for a non-SEC/Yahoo provider."""
+    if provider == "bls" and _is_bls_labstat_bulk_url(url):
+        # LABSTAT flat files are not BLS Public Data API queries and do not
+        # consume its daily account allocation. They are already bounded by
+        # _BLS_LABSTAT_BUILD_SEMAPHORE; applying a persisted API cooldown here
+        # would defeat the very fallback that is meant to bypass that quota.
+        return
     runtime = _PROVIDER_HTTP_RUNTIME
     if runtime is None:
         return
@@ -12402,14 +12852,10 @@ def _fetch_sec_companyfacts_response(
         return response
 
 
-def _sec_companyfacts_responses_for_symbol(
-    symbol: str,
-    *,
-    page_limiter: Any | None,
-    cache_dir: Path | None,
-    use_cache: bool,
-) -> tuple[str, list[dict[str, Any]]]:
-    """Resolve every CIK required for a ticker's complete SEC history."""
+def _sec_companyfacts_ciks_for_symbol(
+    symbol: str, *, page_limiter: Any | None
+) -> tuple[str, tuple[str, ...]]:
+    """Resolve the exact CIK set without loading any large companyfacts object."""
     from openbb_core.provider.utils.errors import EmptyDataError
     from openbb_sec.utils.company_facts import MULTI_CIK_TICKERS
 
@@ -12420,8 +12866,32 @@ def _sec_companyfacts_responses_for_symbol(
     if cik_values is None:
         mapped = _sec_symbol_cik_map(page_limiter).get(symbol_upper.replace(".", "-"))
         cik_values = [mapped] if mapped else []
-    if not cik_values:
+    normalized = tuple(
+        dict.fromkeys(
+            str(cik).lstrip("0").zfill(10) for cik in cik_values if str(cik or "").strip()
+        )
+    )
+    if not normalized:
         raise EmptyDataError(f"No CIK was found for symbol: {symbol_upper}")
+    return symbol_upper, normalized
+
+
+def _sec_companyfacts_cache_path(cache_dir: Path, cik: str) -> Path:
+    cik_text = str(cik).lstrip("0").zfill(10)
+    return cache_dir / cik_text[:4] / f"CIK{cik_text}.json.gz"
+
+
+def _sec_companyfacts_responses_for_symbol(
+    symbol: str,
+    *,
+    page_limiter: Any | None,
+    cache_dir: Path | None,
+    use_cache: bool,
+) -> tuple[str, list[dict[str, Any]]]:
+    """Resolve every CIK required for a ticker's complete SEC history."""
+    symbol_upper, cik_values = _sec_companyfacts_ciks_for_symbol(
+        symbol, page_limiter=page_limiter
+    )
     responses = [
         _fetch_sec_companyfacts_response(
             str(cik),
@@ -12456,6 +12926,23 @@ def _sec_standardized_disk_cache_path(
     }
     digest = hashlib.sha256(_canonical_json(cache_identity).encode("utf-8")).hexdigest()
     return cache_dir / "_standardized" / digest[:2] / f"{digest}.json.gz"
+
+
+@contextmanager
+def _interprocess_cache_lock(path: Path) -> Iterator[None]:
+    """Serialize one cache build across spawned SEC projection processes."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+b") as stream:
+        try:
+            import fcntl
+        except ImportError:  # pragma: no cover - non-POSIX fallback
+            yield
+            return
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
 
 def _read_sec_standardized_disk_cache(
@@ -12591,12 +13078,15 @@ def _resolve_sec_standardized_cached(
                 if cache_dir is not None
                 else None
             )
-            resolved = (
-                _read_sec_standardized_disk_cache(disk_path, key)
-                if disk_path is not None and disk_path.is_file()
-                else None
-            )
-            if resolved is None:
+
+            def load_or_resolve() -> Any:
+                cached = (
+                    _read_sec_standardized_disk_cache(disk_path, key)
+                    if disk_path is not None and disk_path.is_file()
+                    else None
+                )
+                if cached is not None:
+                    return cached
                 if len(responses) == 1:
                     facts_json = dict(responses[0])
                 else:
@@ -12608,14 +13098,25 @@ def _resolve_sec_standardized_cached(
                             *(dict(response) for response in responses)
                         ),
                     }
-                resolved = company_facts.resolve_company_facts(
+                parsed = company_facts.resolve_company_facts(
                     facts_json,
                     period=period,
                     pit_mode=pit_mode,
                     include_preliminary=include_preliminary,
                 )
                 if disk_path is not None:
-                    _write_sec_standardized_disk_cache(disk_path, key, resolved)
+                    _write_sec_standardized_disk_cache(disk_path, key, parsed)
+                return parsed
+
+            if disk_path is None:
+                resolved = load_or_resolve()
+            else:
+                with _interprocess_cache_lock(
+                    disk_path.with_name(f".{disk_path.name}.lock")
+                ):
+                    # Re-read after acquiring the OS lock: a sibling process may
+                    # have completed the shared three-statement projection.
+                    resolved = load_or_resolve()
             consumers: set[str] = set()
             entry = (resolved, consumers)
             with _SEC_STANDARDIZED_CACHE_GUARD:
@@ -12638,14 +13139,10 @@ def _resolve_sec_standardized_cached(
         return resolved
 
 
-def _fetch_sec_statement_workaround(
-    endpoint: str,
-    kwargs: Mapping[str, Any],
-    *,
-    page_limiter: Any | None,
-    cache_dir: Path,
-) -> Any:
-    """Project a shared raw SEC companyfacts response into one statement."""
+def _sec_statement_components(
+    endpoint: str, kwargs: Mapping[str, Any]
+) -> tuple[Any, str, bool, Any]:
+    """Resolve one SEC adapter and its normalized query in any process."""
     from openbb_sec.models.balance_sheet import SecBalanceSheetFetcher
     from openbb_sec.models.balance_sheet_growth import SecBalanceSheetGrowthFetcher
     from openbb_sec.models.cash_flow import SecCashFlowStatementFetcher
@@ -12693,15 +13190,21 @@ def _fetch_sec_statement_workaround(
         fetcher, statement_name, is_growth = adapters[endpoint]
     except KeyError as exc:
         raise ValueError(f"Unsupported SEC statement endpoint: {endpoint}") from exc
+    return fetcher, statement_name, is_growth, fetcher.transform_query(dict(kwargs))
 
-    query = fetcher.transform_query(dict(kwargs))
-    symbol, responses = _sec_companyfacts_responses_for_symbol(
-        str(query.symbol),
-        page_limiter=page_limiter,
-        cache_dir=cache_dir,
-        use_cache=False,
+
+def _project_sec_statement_responses(
+    endpoint: str,
+    kwargs: Mapping[str, Any],
+    responses: Sequence[Mapping[str, Any]],
+    *,
+    cache_dir: Path,
+) -> list[dict[str, Any]]:
+    """CPU-only SEC standardization and statement-model projection."""
+    fetcher, statement_name, is_growth, query = _sec_statement_components(
+        endpoint, kwargs
     )
-    del symbol
+
     period = str(query.period)
     if is_growth:
         period = {
@@ -12729,6 +13232,106 @@ def _fetch_sec_statement_workaround(
     # itself; passing the AnnotatedResult model would serialize one giant
     # ``result``/``metadata`` wrapper row.
     return _provider_result_rows(transformed)
+
+
+def _read_sec_companyfacts_responses_from_cache(
+    cache_dir: Path, cik_values: Sequence[str]
+) -> list[dict[str, Any]]:
+    """Load raw companyfacts inside a CPU worker without any network access."""
+    from openbb_core.provider.utils.errors import EmptyDataError
+
+    responses: list[dict[str, Any]] = []
+    for cik in cik_values:
+        cik_text = str(cik).lstrip("0").zfill(10)
+        cache_path = _sec_companyfacts_cache_path(cache_dir, cik_text)
+        cached = _read_sec_companyfacts_cache(cache_path, cik_text)
+        if cached is None:
+            raise SecCompanyfactsCacheInvalidError(
+                f"SEC companyfacts cache is missing or invalid for CIK {cik_text}"
+            )
+        if cached.get("_archive_cache_status") == "empty":
+            raise EmptyDataError(f"No company facts were found for CIK: {cik_text}")
+        responses.append(cached)
+    return responses
+
+
+def _project_sec_statement_cached_process(
+    endpoint: str,
+    kwargs: dict[str, Any],
+    cache_dir: str,
+    cik_values: tuple[str, ...],
+) -> list[dict[str, Any]]:
+    """Spawn-safe cache-only entrypoint for GIL-bound SEC projection work."""
+    path = Path(cache_dir)
+    responses = _read_sec_companyfacts_responses_from_cache(path, cik_values)
+    return _project_sec_statement_responses(
+        endpoint,
+        kwargs,
+        responses,
+        cache_dir=path,
+    )
+
+
+def _fetch_sec_statement_workaround(
+    endpoint: str,
+    kwargs: Mapping[str, Any],
+    *,
+    page_limiter: Any | None,
+    cache_dir: Path,
+    process_pool: ProcessPoolExecutor | None = None,
+) -> Any:
+    """Fetch centrally, then project cached companyfacts on CPU processes."""
+    _, _, _, query = _sec_statement_components(endpoint, kwargs)
+    if process_pool is None:
+        _, responses = _sec_companyfacts_responses_for_symbol(
+            str(query.symbol),
+            page_limiter=page_limiter,
+            cache_dir=cache_dir,
+            use_cache=False,
+        )
+        return _project_sec_statement_responses(
+            endpoint,
+            kwargs,
+            responses,
+            cache_dir=cache_dir,
+        )
+
+    _, cik_values = _sec_companyfacts_ciks_for_symbol(
+        str(query.symbol), page_limiter=page_limiter
+    )
+    for cik in cik_values:
+        if not _sec_companyfacts_cache_path(cache_dir, cik).is_file():
+            _fetch_sec_companyfacts_response(
+                cik,
+                page_limiter=page_limiter,
+                cache_dir=cache_dir,
+                use_cache=False,
+            )
+
+    def project_once() -> list[dict[str, Any]]:
+        future = process_pool.submit(
+            _project_sec_statement_cached_process,
+            endpoint,
+            dict(kwargs),
+            str(cache_dir),
+            cik_values,
+        )
+        return future.result()
+
+    with _LOCAL_CPU_BUDGET.claim(1):
+        try:
+            return project_once()
+        except SecCompanyfactsCacheInvalidError:
+            # Only the network-owning main process may repair a corrupt raw
+            # cache. Retry the pure child projection exactly once afterwards.
+            for cik in cik_values:
+                _fetch_sec_companyfacts_response(
+                    cik,
+                    page_limiter=page_limiter,
+                    cache_dir=cache_dir,
+                    use_cache=False,
+                )
+            return project_once()
 
 
 def _transform_sec_statement_resilient(
@@ -14266,6 +14869,66 @@ def _atomic_write_parquet(
         stage_progress.close()
 
 
+def _atomic_write_arrow_table(
+    table: pa.Table,
+    task: DownloadTask,
+    provider: str,
+    *,
+    show_progress: bool = False,
+) -> int:
+    """Publish an already normalized Arrow table without Python row materialization."""
+    output_path = Path(task.output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output_path.with_name(
+        f".{output_path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    )
+    progress = tqdm(
+        total=3,
+        desc=f"parquet:{task.endpoint}"[:64],
+        unit="stage",
+        position=2,
+        leave=False,
+        disable=not show_progress,
+    )
+    try:
+        progress.set_postfix(stage="add provenance", rows=table.num_rows, refresh=False)
+        provenance = {
+            "_openbb_endpoint": task.endpoint,
+            "_provider": provider,
+            "_scope_key": task.scope_key,
+            "_retrieved_at": datetime.now(timezone.utc).isoformat(),
+            "_query_json": _canonical_json(task.kwargs),
+        }
+        for name, value in provenance.items():
+            column = pa.repeat(pa.scalar(value, type=pa.string()), table.num_rows)
+            if name in table.column_names:
+                index = table.column_names.index(name)
+                table = table.set_column(index, name, column)
+            else:
+                table = table.append_column(name, column)
+        progress.update(1)
+        progress.set_postfix(stage="zstd parquet write", refresh=False)
+        with _LOCAL_CPU_BUDGET.claim(1):
+            pq.write_table(
+                table,
+                temporary,
+                compression="zstd",
+                compression_level=6,
+                use_dictionary=True,
+                write_statistics=True,
+            )
+        progress.update(1)
+        progress.set_postfix(stage="fsync and publish", refresh=False)
+        with temporary.open("rb") as handle:
+            os.fsync(handle.fileno())
+        temporary.replace(output_path)
+        progress.update(1)
+        return table.num_rows
+    finally:
+        temporary.unlink(missing_ok=True)
+        progress.close()
+
+
 _ATOMIC_PARQUET_TEMP_RE = re.compile(
     r"^\.(?P<final_name>.+\.parquet)\."
     r"(?P<pid>[1-9][0-9]*)\.(?P<thread>[1-9][0-9]*)\.tmp$"
@@ -14430,6 +15093,667 @@ def _filter_records_to_task_range(
     finally:
         progress.close()
     return filtered
+
+
+def _bls_labstat_lock(prefix: str) -> threading.Lock:
+    with _BLS_LABSTAT_LOCKS_GUARD:
+        return _BLS_LABSTAT_LOCKS.setdefault(prefix, threading.Lock())
+
+
+def _bls_labstat_build_threads() -> int:
+    """Divide native CPU threads across the bounded concurrent index builds."""
+    cpu_count = max(1, os.cpu_count() or 1)
+    default = max(1, _LOCAL_CPU_BUDGET.total // BLS_LABSTAT_PARALLEL_BUILDS)
+    raw_override = os.environ.get("OPENBB_BLS_BUILD_THREADS")
+    if raw_override is None:
+        return default
+    try:
+        requested = int(raw_override)
+    except ValueError as exc:
+        raise ValueError("OPENBB_BLS_BUILD_THREADS must be a positive integer") from exc
+    if requested <= 0:
+        raise ValueError("OPENBB_BLS_BUILD_THREADS must be a positive integer")
+    return min(cpu_count, requested)
+
+
+def _bls_labstat_headers() -> dict[str, str]:
+    """Use a declared archive identity accepted by the BLS download host."""
+    return {
+        "User-Agent": os.environ.get(
+            "BLS_USER_AGENT",
+            "stockAgent-openbb-archive/1.0 local-operator@example.com",
+        ),
+        "Accept": "text/plain,text/html;q=0.9,*/*;q=0.1",
+    }
+
+
+def _bls_labstat_receipt_path(path: Path) -> Path:
+    return path.with_name(f"{path.name}.receipt.json")
+
+
+def _bls_labstat_cached_file_valid(path: Path, url: str) -> bool:
+    receipt_path = _bls_labstat_receipt_path(path)
+    if not path.is_file() or not receipt_path.is_file():
+        return False
+    try:
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        return bool(
+            receipt.get("schema_version") == BLS_LABSTAT_CACHE_SCHEMA_VERSION
+            and receipt.get("url") == url
+            and int(receipt.get("size_bytes") or -1) == path.stat().st_size
+            and re.fullmatch(r"[0-9a-f]{64}", str(receipt.get("sha256") or ""))
+        )
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return False
+
+
+def _download_bls_labstat_file(
+    url: str,
+    path: Path,
+    *,
+    show_progress: bool = False,
+) -> Path:
+    """Download one LABSTAT artifact with a byte-resumable durable receipt."""
+    from urllib.error import HTTPError
+    from urllib.request import Request, urlopen
+
+    if _bls_labstat_cached_file_valid(path, url):
+        return path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    partial = path.with_name(f".{path.name}.part")
+    offset = partial.stat().st_size if partial.is_file() else 0
+    headers = _bls_labstat_headers()
+    if offset:
+        headers["Range"] = f"bytes={offset}-"
+    request = Request(url, headers=headers)
+    try:
+        response = urlopen(request, timeout=180)
+    except HTTPError as exc:
+        if exc.code == 416 and partial.is_file():
+            partial.unlink(missing_ok=True)
+        raise
+    with response:
+        status = int(getattr(response, "status", 200) or 200)
+        content_range = str(response.headers.get("Content-Range") or "")
+        appending = bool(
+            offset
+            and status == 206
+            and content_range.startswith(f"bytes {offset}-")
+        )
+        if not appending:
+            offset = 0
+        content_length = response.headers.get("Content-Length")
+        expected_total = (
+            offset + int(content_length) if content_length is not None else None
+        )
+        progress = tqdm(
+            total=expected_total,
+            initial=offset,
+            desc=f"bls:bulk {path.name}"[:64],
+            unit="B",
+            unit_scale=True,
+            position=2,
+            leave=False,
+            disable=not show_progress,
+        )
+        try:
+            with partial.open("ab" if appending else "wb") as stream:
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    stream.write(chunk)
+                    progress.update(len(chunk))
+                stream.flush()
+                os.fsync(stream.fileno())
+        finally:
+            progress.close()
+    if expected_total is not None and partial.stat().st_size != expected_total:
+        raise OSError(
+            f"Incomplete LABSTAT download for {url}: "
+            f"{partial.stat().st_size} != {expected_total}"
+        )
+    digest = hashlib.sha256()
+    hash_progress = tqdm(
+        total=partial.stat().st_size,
+        desc=f"bls:verify {path.name}"[:64],
+        unit="B",
+        unit_scale=True,
+        position=2,
+        leave=False,
+        disable=not show_progress,
+    )
+    try:
+        with partial.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(4 * 1024 * 1024), b""):
+                digest.update(chunk)
+                hash_progress.update(len(chunk))
+    finally:
+        hash_progress.close()
+    partial.replace(path)
+    _write_json_atomic(
+        _bls_labstat_receipt_path(path),
+        {
+            "schema_version": BLS_LABSTAT_CACHE_SCHEMA_VERSION,
+            "url": url,
+            "size_bytes": path.stat().st_size,
+            "sha256": digest.hexdigest(),
+            "retrieved_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+    return path
+
+
+def _bls_labstat_catalog_files(
+    page: str, prefix: str
+) -> tuple[str, str | None, list[str]]:
+    """Select a complete survey data file plus title/footnote dictionaries."""
+    from html import unescape
+    from urllib.parse import unquote, urlsplit
+
+    names: set[str] = set()
+    for href in re.findall(r"href\s*=\s*['\"]([^'\"]+)['\"]", page, re.I):
+        name = Path(unquote(urlsplit(unescape(href)).path)).name
+        if name and re.fullmatch(r"[A-Za-z0-9_.-]+", name):
+            names.add(name)
+    lower_to_name = {name.lower(): name for name in names}
+    series_name = lower_to_name.get(f"{prefix}.series")
+    if series_name is None:
+        raise BlsLabstatUnsupportedError(
+            f"LABSTAT directory {prefix!r} has no {prefix}.series catalog"
+        )
+    footnote_name = lower_to_name.get(f"{prefix}.footnote")
+    data_names = sorted(
+        name for name in names if name.lower().startswith(f"{prefix}.data.")
+    )
+    canonical_complete_suffixes = (".alldata", ".allitems", ".allcesseries")
+    complete = [
+        name
+        for name in data_names
+        if name.lower().endswith(canonical_complete_suffixes)
+    ]
+    if not complete:
+        complete = [
+            name
+            for name in data_names
+            if name.rsplit(".", 1)[-1].lower().startswith("all")
+        ]
+    selected = complete or [
+        name for name in data_names if not name.lower().endswith(".current")
+    ]
+    if not selected:
+        raise BlsLabstatUnsupportedError(
+            f"LABSTAT directory {prefix!r} has no complete historical data file"
+        )
+    return series_name, footnote_name, selected
+
+
+def _bls_labstat_database_valid(database: Path, receipt_path: Path) -> bool:
+    if not database.is_file() or not receipt_path.is_file():
+        return False
+    stat = database.stat()
+    fingerprint = (int(stat.st_size), int(stat.st_mtime_ns))
+    with _BLS_LABSTAT_LOCKS_GUARD:
+        if _BLS_LABSTAT_READY_DATABASES.get(str(database)) == fingerprint:
+            return True
+    try:
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        if receipt.get("schema_version") != BLS_LABSTAT_CACHE_SCHEMA_VERSION:
+            return False
+        import duckdb
+
+        connection = duckdb.connect(str(database), read_only=True)
+        try:
+            observed = int(
+                connection.execute("SELECT COUNT(*) FROM observations").fetchone()[0]
+            )
+        finally:
+            connection.close()
+        valid = observed == int(receipt.get("observation_rows") or -1)
+        if valid:
+            with _BLS_LABSTAT_LOCKS_GUARD:
+                _BLS_LABSTAT_READY_DATABASES[str(database)] = fingerprint
+        return valid
+    except Exception:
+        # DuckDB exception classes are version-specific. Invalid local caches
+        # are rebuilt under the prefix lock and never change task semantics.
+        return False
+
+
+def _create_bls_labstat_series_table(connection: Any, series_path: Path) -> None:
+    """Normalize survey-specific LABSTAT series schemas.
+
+    Not every official ``*.series`` catalog publishes a ``series_title``
+    column (notably the international and productivity surveys).  Inspect the
+    normalized CSV schema once at build time and preserve a nullable title
+    instead of letting DuckDB bind the output alias as a missing input column.
+    """
+    describe_rows = connection.execute(
+        """
+        DESCRIBE SELECT * FROM read_csv(
+            ?, delim='\t', header=true, all_varchar=true,
+            normalize_names=true, ignore_errors=true
+        )
+        """,
+        [str(series_path)],
+    ).fetchall()
+    columns = {str(row[0]) for row in describe_rows}
+    if "series_id" not in columns:
+        raise BlsLabstatUnsupportedError(
+            f"LABSTAT series catalog {series_path.name!r} has no series_id column"
+        )
+    title_expression = (
+        "nullif(trim(series_title), '')"
+        if "series_title" in columns
+        else "NULL::VARCHAR"
+    )
+    connection.execute(
+        f"""
+        CREATE TABLE series AS
+        SELECT trim(series_id) AS series_id,
+               {title_expression} AS series_title
+        FROM read_csv(
+            ?, delim='\t', header=true, all_varchar=true,
+            normalize_names=true, ignore_errors=true
+        )
+        WHERE trim(series_id) != ''
+        """,
+        [str(series_path)],
+    )
+
+
+def _ensure_bls_labstat_database(
+    prefix: str,
+    cache_dir: Path,
+    *,
+    show_progress: bool = False,
+) -> Path:
+    """Materialize one official LABSTAT survey into an indexed DuckDB cache."""
+    from urllib.error import HTTPError
+    from urllib.parse import urljoin
+
+    prefix = str(prefix).strip().lower()
+    if not re.fullmatch(r"[a-z0-9]{2}", prefix):
+        raise BlsLabstatUnsupportedError(f"Invalid LABSTAT series prefix: {prefix!r}")
+    prefix_dir = cache_dir / prefix
+    database = prefix_dir / f"{prefix}.duckdb"
+    database_receipt = prefix_dir / f"{prefix}.duckdb.receipt.json"
+    if _bls_labstat_database_valid(database, database_receipt):
+        return database
+    with _bls_labstat_lock(prefix):
+        if _bls_labstat_database_valid(database, database_receipt):
+            return database
+        with _BLS_LABSTAT_BUILD_SEMAPHORE:
+            directory_url = urljoin(BLS_LABSTAT_BASE_URL, f"{prefix}/")
+            listing_path = prefix_dir / "index.html"
+            try:
+                _download_bls_labstat_file(
+                    directory_url,
+                    listing_path,
+                    show_progress=show_progress,
+                )
+            except HTTPError as exc:
+                if exc.code in {400, 401, 403, 404}:
+                    raise BlsLabstatUnsupportedError(
+                        f"LABSTAT directory {prefix!r} returned HTTP {exc.code}"
+                    ) from exc
+                raise
+            page = listing_path.read_text(encoding="utf-8", errors="replace")
+            series_name, footnote_name, data_names = _bls_labstat_catalog_files(
+                page, prefix
+            )
+            raw_dir = prefix_dir / "raw"
+            requested_names = [series_name, *data_names]
+            if footnote_name is not None:
+                requested_names.append(footnote_name)
+            raw_paths: dict[str, Path] = {}
+            for name in requested_names:
+                try:
+                    raw_paths[name] = _download_bls_labstat_file(
+                        urljoin(directory_url, name),
+                        raw_dir / name,
+                        show_progress=show_progress,
+                    )
+                except HTTPError as exc:
+                    if exc.code in {400, 401, 403, 404}:
+                        raise BlsLabstatUnsupportedError(
+                            f"LABSTAT file {name!r} returned HTTP {exc.code}"
+                        ) from exc
+                    raise
+
+            import duckdb
+
+            prefix_dir.mkdir(parents=True, exist_ok=True)
+            temporary = database.with_name(
+                f".{database.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+            )
+            temporary.unlink(missing_ok=True)
+            observation_rows = 0
+            build_threads = _bls_labstat_build_threads()
+            cpu_slots = _LOCAL_CPU_BUDGET.acquire(build_threads)
+            connection = None
+            import_progress = None
+            try:
+                connection = duckdb.connect(str(temporary))
+                import_progress = tqdm(
+                    total=len(data_names) + 3,
+                    desc=f"bls:index {prefix}",
+                    unit="stage",
+                    position=2,
+                    leave=False,
+                    disable=not show_progress,
+                )
+                connection.execute(f"PRAGMA threads={build_threads}")
+                connection.execute(
+                    """
+                    CREATE TABLE observations(
+                        series_id VARCHAR,
+                        year INTEGER,
+                        period VARCHAR,
+                        value DOUBLE,
+                        footnote_codes VARCHAR
+                    )
+                    """
+                )
+                for name in data_names:
+                    import_progress.set_postfix(file=name[:40], refresh=False)
+                    connection.execute(
+                        """
+                        INSERT INTO observations
+                        SELECT
+                            trim(series_id),
+                            try_cast(trim(_year) AS INTEGER),
+                            trim(period),
+                            try_cast(trim(_value) AS DOUBLE),
+                            nullif(trim(footnote_codes), '')
+                        FROM read_csv(
+                            ?, delim='\t', header=true, all_varchar=true,
+                            normalize_names=true, ignore_errors=true
+                        )
+                        WHERE trim(series_id) != ''
+                          AND try_cast(trim(_year) AS INTEGER) IS NOT NULL
+                        """,
+                        [str(raw_paths[name])],
+                    )
+                    import_progress.update(1)
+                connection.execute(
+                    "CREATE INDEX observations_series_year "
+                    "ON observations(series_id, year)"
+                )
+                import_progress.update(1)
+                _create_bls_labstat_series_table(
+                    connection, raw_paths[series_name]
+                )
+                connection.execute("CREATE INDEX series_id_idx ON series(series_id)")
+                import_progress.update(1)
+                if footnote_name is not None:
+                    connection.execute(
+                        """
+                        CREATE TABLE footnotes AS
+                        SELECT trim(footnote_code) AS footnote_code,
+                               trim(footnote_text) AS footnote_text
+                        FROM read_csv(
+                            ?, delim='\t', header=true, all_varchar=true,
+                            normalize_names=true, ignore_errors=true
+                        )
+                        WHERE trim(footnote_code) != ''
+                        """,
+                        [str(raw_paths[footnote_name])],
+                    )
+                else:
+                    connection.execute(
+                        "CREATE TABLE footnotes("
+                        "footnote_code VARCHAR, footnote_text VARCHAR)"
+                    )
+                import_progress.update(1)
+                observation_rows = int(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM observations"
+                    ).fetchone()[0]
+                )
+                if observation_rows <= 0:
+                    raise BlsLabstatUnsupportedError(
+                        f"LABSTAT {prefix!r} import produced no observations"
+                    )
+                connection.execute("CHECKPOINT")
+            finally:
+                if connection is not None:
+                    connection.close()
+                if import_progress is not None:
+                    import_progress.close()
+                _LOCAL_CPU_BUDGET.release(cpu_slots)
+            temporary.replace(database)
+            _write_json_atomic(
+                database_receipt,
+                {
+                    "schema_version": BLS_LABSTAT_CACHE_SCHEMA_VERSION,
+                    "prefix": prefix,
+                    "source_url": directory_url,
+                    "source_files": requested_names,
+                    "observation_rows": observation_rows,
+                    "built_at": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+            built_stat = database.stat()
+            with _BLS_LABSTAT_LOCKS_GUARD:
+                _BLS_LABSTAT_READY_DATABASES[str(database)] = (
+                    int(built_stat.st_size),
+                    int(built_stat.st_mtime_ns),
+                )
+    return database
+
+
+def _fetch_bls_series_labstat_table(
+    kwargs: Mapping[str, Any],
+    *,
+    cache_dir: Path,
+    show_progress: bool = False,
+) -> pa.Table:
+    """Read and normalize official BLS bulk history on the native columnar path."""
+    import duckdb
+    from openbb_core.provider.utils.errors import EmptyDataError
+
+    raw_symbols = kwargs.get("symbol") or ""
+    symbols = [
+        str(item).strip().upper()
+        for item in (
+            raw_symbols.split(",")
+            if isinstance(raw_symbols, str)
+            else list(raw_symbols)
+        )
+        if str(item).strip()
+    ]
+    if not symbols:
+        raise EmptyDataError("No BLS series IDs were supplied.")
+    by_prefix: dict[str, list[str]] = {}
+    for symbol in dict.fromkeys(symbols):
+        if len(symbol) < 2 or not symbol[:2].isalnum():
+            raise BlsLabstatUnsupportedError(
+                f"Cannot map BLS series {symbol!r} to a LABSTAT survey"
+            )
+        by_prefix.setdefault(symbol[:2].lower(), []).append(symbol)
+
+    start = date.fromisoformat(
+        str(kwargs.get("start_date") or DEFAULT_START_DATE)[:10]
+    )
+    end = date.fromisoformat(
+        str(kwargs.get("end_date") or date.today().isoformat())[:10]
+    )
+    include_annual_average = bool(kwargs.get("annual_average", False))
+    calculate = bool(kwargs.get("calculations", True))
+    tables: list[pa.Table] = []
+    for prefix, prefix_symbols in by_prefix.items():
+        database = _ensure_bls_labstat_database(
+            prefix,
+            cache_dir,
+            show_progress=show_progress,
+        )
+        cpu_slots = _LOCAL_CPU_BUDGET.acquire(1)
+        connection = None
+        try:
+            connection = duckdb.connect(str(database), read_only=True)
+            # Every task query gets one native DuckDB thread. Parallelism lives
+            # across independent archive tasks, so N workers consume about N
+            # cores instead of each query recursively oversubscribing the host.
+            connection.execute("PRAGMA threads=1")
+            table = connection.execute(
+                r"""
+                WITH normalized AS (
+                    SELECT
+                        o.series_id,
+                        o.period,
+                        o.value,
+                        o.footnote_codes,
+                        s.series_title,
+                        CASE
+                            WHEN o.period BETWEEN 'M01' AND 'M12'
+                                THEN make_date(
+                                    o.year,
+                                    try_cast(substr(o.period, 2) AS INTEGER),
+                                    1
+                                )
+                            WHEN o.period = 'M13' THEN make_date(o.year, 12, 31)
+                            WHEN o.period IN ('A01', 'S01', 'Q01')
+                                THEN make_date(o.year, 1, 1)
+                            WHEN o.period = 'Q02' THEN make_date(o.year, 4, 1)
+                            WHEN o.period IN ('S02', 'Q03')
+                                THEN make_date(o.year, 7, 1)
+                            WHEN o.period = 'Q04' THEN make_date(o.year, 10, 1)
+                            WHEN o.period IN ('S03', 'Q05')
+                                THEN make_date(o.year, 12, 31)
+                            ELSE NULL
+                        END AS observation_date
+                    FROM observations AS o
+                    LEFT JOIN series AS s USING(series_id)
+                    WHERE o.series_id IN (SELECT unnest(?))
+                      AND o.year BETWEEN ? AND ?
+                      AND o.value IS NOT NULL
+                      AND (? OR o.period NOT IN ('M13', 'Q05', 'S03'))
+                ),
+                dated AS (
+                    SELECT * EXCLUDE(duplicate_rank)
+                    FROM (
+                        SELECT *, row_number() OVER (
+                            PARTITION BY series_id, observation_date
+                            ORDER BY period
+                        ) AS duplicate_rank
+                        FROM normalized
+                        WHERE observation_date IS NOT NULL
+                    )
+                    WHERE duplicate_rank = 1
+                ),
+                enriched AS (
+                    SELECT
+                        d.*,
+                        max(d.observation_date) OVER (
+                            PARTITION BY d.series_id
+                        ) AS latest_date,
+                        (
+                            SELECT string_agg(
+                                f.footnote_text,
+                                '; ' ORDER BY u.ordinality
+                            )
+                            FROM unnest(
+                                regexp_split_to_array(
+                                    coalesce(d.footnote_codes, ''),
+                                    '[,;\s]+'
+                                )
+                            ) WITH ORDINALITY AS u(code, ordinality)
+                            JOIN footnotes AS f
+                              ON f.footnote_code = trim(u.code)
+                            WHERE trim(u.code) != ''
+                        ) AS footnotes
+                    FROM dated AS d
+                )
+                SELECT
+                    d.series_id AS symbol,
+                    CASE
+                        WHEN d.series_title IS NULL THEN NULL
+                        WHEN d.period IN ('M13', 'Q05', 'S03')
+                            THEN d.series_title || ' (Annual Average)'
+                        ELSE d.series_title
+                    END AS title,
+                    strftime(d.observation_date, '%Y-%m-%d') AS date,
+                    d.value,
+                    d.observation_date = d.latest_date AS latest,
+                    d.footnotes,
+                    CASE WHEN ? THEN d.value - p1.value ELSE NULL::DOUBLE END
+                        AS "change_1M",
+                    CASE WHEN ? THEN d.value - p3.value ELSE NULL::DOUBLE END
+                        AS "change_3M",
+                    CASE WHEN ? THEN d.value - p6.value ELSE NULL::DOUBLE END
+                        AS "change_6M",
+                    CASE WHEN ? THEN d.value - p12.value ELSE NULL::DOUBLE END
+                        AS "change_12M",
+                    CASE WHEN ? AND p1.value != 0
+                        THEN round((d.value - p1.value) / p1.value, 3)
+                        ELSE NULL::DOUBLE END AS "change_percent_1M",
+                    CASE WHEN ? AND p3.value != 0
+                        THEN round((d.value - p3.value) / p3.value, 3)
+                        ELSE NULL::DOUBLE END AS "change_percent_3M",
+                    CASE WHEN ? AND p6.value != 0
+                        THEN round((d.value - p6.value) / p6.value, 3)
+                        ELSE NULL::DOUBLE END AS "change_percent_6M",
+                    CASE WHEN ? AND p12.value != 0
+                        THEN round((d.value - p12.value) / p12.value, 3)
+                        ELSE NULL::DOUBLE END AS "change_percent_12M",
+                    'labstat_bulk' AS _bls_source,
+                    ? AS _bls_labstat_prefix
+                FROM enriched AS d
+                LEFT JOIN dated AS p1
+                  ON p1.series_id = d.series_id
+                 AND p1.observation_date = d.observation_date - INTERVAL '1 month'
+                LEFT JOIN dated AS p3
+                  ON p3.series_id = d.series_id
+                 AND p3.observation_date = d.observation_date - INTERVAL '3 months'
+                LEFT JOIN dated AS p6
+                  ON p6.series_id = d.series_id
+                 AND p6.observation_date = d.observation_date - INTERVAL '6 months'
+                LEFT JOIN dated AS p12
+                  ON p12.series_id = d.series_id
+                 AND p12.observation_date = d.observation_date - INTERVAL '12 months'
+                WHERE d.observation_date BETWEEN ? AND ?
+                ORDER BY list_position(?, d.series_id), d.observation_date DESC
+                """,
+                [
+                    prefix_symbols,
+                    start.year - 1,
+                    end.year,
+                    include_annual_average,
+                    *([calculate] * 8),
+                    prefix,
+                    start,
+                    end,
+                    prefix_symbols,
+                ],
+            ).to_arrow_table()
+            tables.append(table)
+        finally:
+            if connection is not None:
+                connection.close()
+            _LOCAL_CPU_BUDGET.release(cpu_slots)
+    result = (
+        tables[0]
+        if len(tables) == 1
+        else pa.concat_tables(tables, promote_options="default")
+    )
+    if result.num_rows == 0:
+        raise EmptyDataError("The LABSTAT bulk request was returned empty.")
+    return result
+
+
+def _fetch_bls_series_labstat(
+    kwargs: Mapping[str, Any],
+    *,
+    cache_dir: Path,
+    show_progress: bool = False,
+) -> list[dict[str, Any]]:
+    """Compatibility wrapper for callers that explicitly require Python rows."""
+    return _fetch_bls_series_labstat_table(
+        kwargs,
+        cache_dir=cache_dir,
+        show_progress=show_progress,
+    ).to_pylist()
 
 
 def _fetch_bls_series_resilient(
@@ -14648,6 +15972,45 @@ def _is_provider_parser_shape_error(exc: Exception) -> bool:
     return _is_provider_parser_shape_error_text(f"{type(exc).__name__}: {exc}")
 
 
+def _task_retry_delay_seconds(task_id: str, transient_failures: int) -> float:
+    """Return bounded exponential delay with stable per-task spreading."""
+    streak = max(1, int(transient_failures))
+    exponent = min(30, streak - 1)
+    raw_delay = min(TASK_RETRY_MAX_SECONDS, TASK_RETRY_BASE_SECONDS * (2**exponent))
+    digest = hashlib.sha256(f"{task_id}:{streak}".encode("utf-8")).digest()
+    fraction = int.from_bytes(digest[:8], "big") / float((1 << 64) - 1)
+    return max(1.0, raw_delay * (0.8 + 0.2 * fraction))
+
+
+def _task_retry_deadline(
+    task_id: str,
+    transient_failures: int,
+    *,
+    now: datetime | None = None,
+) -> str:
+    current = now or datetime.now(timezone.utc)
+    return (
+        current
+        + timedelta(
+            seconds=_task_retry_delay_seconds(task_id, transient_failures)
+        )
+    ).isoformat()
+
+
+def _is_http_server_error(exc: Exception) -> bool:
+    """Return whether the failure is a task-local HTTP 5xx response."""
+    text = f"{type(exc).__name__}: {exc}".lower()
+    status_code = getattr(exc, "code", None) or getattr(exc, "status", None)
+    return bool(
+        (isinstance(status_code, int) and 500 <= status_code <= 599)
+        or re.search(
+            r"(?:http(?:error| error)?|status(?: code)?)\s*[:=]?\s*5\d{2}(?!\d)",
+            text,
+        )
+        or re.search(r"(?<!\d)5\d{2}(?!\d)\s*,\s*message\s*=", text)
+    )
+
+
 def classify_error(exc: Exception) -> str:
     text = f"{type(exc).__name__}: {exc}".lower()
     if "__archive_provider_deferred__" in text:
@@ -14857,7 +16220,21 @@ def _is_provider_global_auth_failure(provider: str, message: str) -> bool:
         )
     ):
         return True
-    return bool(re.search(r"(?<!\d)401(?!\d)", text)) and "invalid crumb" not in text
+    # A bare numeric search is unsafe here: provider URLs and series symbols
+    # legitimately contain tokens such as ``GRCPREND401IXOBQ``.  Treat 401 as
+    # provider-wide credential evidence only when the exception supplies HTTP
+    # status context.  This keeps one upstream 500 for that FRED series from
+    # disabling the entire provider across millions of independent tasks.
+    has_http_401 = bool(
+        re.search(
+            r"(?:\bhttp(?:\s+status)?\s*[:=]?\s*401\b"
+            r"|\bstatus(?:\s+code)?\s*[:=]\s*401\b"
+            r"|->\s*401\s*->"
+            r"|\b401\s+(?:client\s+error|unauthorized)\b)",
+            text,
+        )
+    )
+    return has_http_401 and "invalid crumb" not in text
 
 
 def _bounded_parameter_maximum(
@@ -14988,7 +16365,9 @@ class OpenBBWorker:
         metadata_only: bool,
         show_progress: bool = False,
         cache_capable_endpoints: Iterable[str] = (),
+        bls_labstat_cache_dir: Path | None = None,
         sec_companyfacts_cache_dir: Path | None = None,
+        sec_statement_process_pool: ProcessPoolExecutor | None = None,
         sec_insider_cache_dir: Path | None = None,
         request_checkpoint_dir: Path | None = None,
     ) -> None:
@@ -15002,9 +16381,39 @@ class OpenBBWorker:
         self.cache_capable_endpoints = frozenset(
             str(endpoint).lstrip(".") for endpoint in cache_capable_endpoints
         )
+        self.bls_labstat_cache_dir = bls_labstat_cache_dir
         self.sec_companyfacts_cache_dir = sec_companyfacts_cache_dir
+        self.sec_statement_process_pool = sec_statement_process_pool
         self.sec_insider_cache_dir = sec_insider_cache_dir
         self.request_checkpoint_dir = request_checkpoint_dir
+
+    def can_run_during_provider_cooldown(self, provider: str, endpoint: str) -> bool:
+        """Return whether a local official bulk path bypasses an API cooldown."""
+        return bool(
+            provider == "bls"
+            and endpoint == "economy.survey.bls_series"
+            and self.bls_labstat_cache_dir is not None
+        )
+
+    def local_cooldown_bypass_providers(self) -> set[str]:
+        return {"bls"} if self.bls_labstat_cache_dir is not None else set()
+
+    def _availability(
+        self,
+        provider: str,
+        endpoint: str,
+        capability_domain: str | None,
+    ) -> tuple[bool, str | None]:
+        available, reason = self.runtime.availability(
+            provider, endpoint, capability_domain
+        )
+        if (
+            not available
+            and str(reason or "").startswith("cooldown until")
+            and self.can_run_during_provider_cooldown(provider, endpoint)
+        ):
+            return True, "official local bulk path bypasses API cooldown"
+        return available, reason
 
     def _request_checkpoint_dir(self, task: DownloadTask, provider: str) -> Path | None:
         if self.request_checkpoint_dir is None:
@@ -15029,13 +16438,14 @@ class OpenBBWorker:
             if provider in task.providers
         }
         saw_retryable = False
+        saw_task_transient = False
         last_provider: str | None = None
         for provider in provider_execution_order(task.providers):
             if provider in provider_outcomes:
                 continue
             last_provider = provider
             capability_domain = _provider_capability_domain(provider, task.kwargs)
-            available, reason = self.runtime.availability(
+            available, reason = self._availability(
                 provider, task.endpoint, capability_domain
             )
             if not available:
@@ -15057,7 +16467,7 @@ class OpenBBWorker:
                 )
                 try:
                     limiter = self.runtime.limiter(provider)
-                    available, reason = self.runtime.availability(
+                    available, reason = self._availability(
                         provider, task.endpoint, capability_domain
                     )
                     if not available:
@@ -15077,15 +16487,20 @@ class OpenBBWorker:
                         # urllib/SDK workarounds explicitly claim the first and
                         # every continuation page. Only proven one-request
                         # routes use the outer command ticket.
+                        local_bls_bulk = bool(
+                            provider == "bls"
+                            and task.endpoint == "economy.survey.bls_series"
+                            and self.bls_labstat_cache_dir is not None
+                        )
                         if provider == "sec":
                             _install_sec_http_limiter(self.runtime)
                         elif provider == "yfinance":
                             _install_yfinance_http_limiter(self.runtime)
                         elif provider in HTTP_BOUNDARY_PACED_PROVIDERS:
                             _install_provider_http_limiter(self.runtime)
-                        else:
+                        elif not local_bls_bulk:
                             limiter.wait()
-                        available, reason = self.runtime.availability(
+                        available, reason = self._availability(
                             provider, task.endpoint, capability_domain
                         )
                         if not available:
@@ -15212,6 +16627,7 @@ class OpenBBWorker:
                                 provider_kwargs,
                                 page_limiter=limiter,
                                 cache_dir=self.sec_companyfacts_cache_dir,
+                                process_pool=self.sec_statement_process_pool,
                             )
                         elif (
                             task.endpoint == "equity.ownership.insider_trading"
@@ -15421,12 +16837,48 @@ class OpenBBWorker:
                             task.endpoint == "economy.survey.bls_series"
                             and provider == "bls"
                         ):
-                            result = _fetch_bls_series_resilient(
-                                provider_kwargs,
-                                self.obb,
-                                page_limiter=limiter,
-                                show_progress=self.show_progress,
-                            )
+                            if self.bls_labstat_cache_dir is not None:
+                                try:
+                                    result = ColumnarTaskPayload(
+                                        _fetch_bls_series_labstat_table(
+                                            provider_kwargs,
+                                            cache_dir=self.bls_labstat_cache_dir,
+                                            show_progress=self.show_progress,
+                                        )
+                                    )
+                                except BlsLabstatUnsupportedError:
+                                    api_available, api_reason = (
+                                        self.runtime.availability(
+                                            provider,
+                                            task.endpoint,
+                                            capability_domain,
+                                        )
+                                    )
+                                    if not api_available:
+                                        raise ProviderDeferredError(
+                                            "__archive_provider_deferred__: BLS "
+                                            + str(
+                                                api_reason
+                                                or "BLS API is unavailable"
+                                            )
+                                        )
+                                    # The bulk route made no API claim. Claim
+                                    # the first API request here; the resilient
+                                    # helper accounts for every continuation.
+                                    limiter.wait()
+                                    result = _fetch_bls_series_resilient(
+                                        provider_kwargs,
+                                        self.obb,
+                                        page_limiter=limiter,
+                                        show_progress=self.show_progress,
+                                    )
+                            else:
+                                result = _fetch_bls_series_resilient(
+                                    provider_kwargs,
+                                    self.obb,
+                                    page_limiter=limiter,
+                                    show_progress=self.show_progress,
+                                )
                         elif (
                             task.endpoint == "commodity.petroleum_status_report"
                             and provider == "eia"
@@ -15538,6 +16990,27 @@ class OpenBBWorker:
                         else:
                             func = _resolve_callable(self.obb, task.endpoint)
                             result = func(provider=provider, **provider_kwargs)
+                    if isinstance(result, ColumnarTaskPayload):
+                        rows = _atomic_write_arrow_table(
+                            result.table,
+                            effective_task,
+                            provider,
+                            show_progress=self.show_progress,
+                        )
+                        _clear_request_checkpoints(
+                            self._request_checkpoint_dir(task, provider)
+                        )
+                        return TaskResult(
+                            effective_task,
+                            "success",
+                            provider,
+                            rows,
+                            task.output_path,
+                            attempts,
+                            records=[],
+                            provider_outcomes=provider_outcomes,
+                            provider_evidence=provider_evidence,
+                        )
                     records = (
                         _normalize_bls_search_result(
                             result,
@@ -15726,6 +17199,13 @@ class OpenBBWorker:
                         provider_evidence[provider] = message[:2000]
                         break
                     saw_retryable = True
+                    saw_task_transient = True
+                    # A server response for this concrete URL is task-local
+                    # evidence.  Repeating it immediately only consumes the
+                    # upstream request budget; persist a task deadline below
+                    # and let unrelated URLs continue through the provider.
+                    if _is_http_server_error(exc):
+                        break
                     if attempt + 1 < self.max_retries:
                         delay = min(self.max_backoff, self.base_backoff * (2**attempt))
                         delay *= random.uniform(0.8, 1.2)
@@ -15761,6 +17241,18 @@ class OpenBBWorker:
             if terminal_unavailable
             else "failed"
         )
+        transient_failures = (
+            task.transient_failures + 1
+            if status == "pending" and saw_task_transient
+            else task.transient_failures
+            if status == "pending"
+            else 0
+        )
+        retry_not_before = (
+            _task_retry_deadline(task.task_id, transient_failures)
+            if status == "pending" and saw_task_transient
+            else None
+        )
         return TaskResult(
             task=task,
             status=status,
@@ -15771,6 +17263,8 @@ class OpenBBWorker:
             error=" | ".join(errors)[-8000:] or "no available provider",
             provider_outcomes=provider_outcomes,
             provider_evidence=provider_evidence,
+            retry_not_before=retry_not_before,
+            transient_failures=transient_failures,
         )
 
 
@@ -16489,10 +17983,30 @@ def _load_resumable_plan(
     return initial_task_count, coverage, dict(summary)
 
 
+def _task_execution_affinity(task: DownloadTask) -> str | None:
+    """Return a shared-expensive-artifact key for cache-local scheduling."""
+    if task.endpoint not in SEC_COMPANYFACTS_STATEMENT_ENDPOINTS:
+        return None
+    family = "growth" if task.endpoint.endswith("_growth") else "raw"
+    return _canonical_json(
+        {
+            "kind": "sec_statement",
+            "family": family,
+            "symbol": str(task.kwargs.get("symbol") or "").upper(),
+            "period": str(task.kwargs.get("period") or ""),
+            "pit_mode": bool(task.kwargs.get("pit_mode", True)),
+            "include_preliminary": bool(
+                task.kwargs.get("include_preliminary", True)
+            ),
+        }
+    )
+
+
 def _pop_fairest_endpoint_task(
     tasks: deque[DownloadTask],
     active_by_endpoint: Mapping[str, int],
     endpoint_caps: Mapping[str, int] | None = None,
+    preferred_affinities: set[str] | None = None,
 ) -> DownloadTask | None:
     """Pop the oldest task from the least-active endpoint in one provider.
 
@@ -16515,6 +18029,15 @@ def _pop_fairest_endpoint_task(
     best_index = min(
         eligible_indices,
         key=lambda index: (
+            (
+                0
+                if (
+                    preferred_affinities
+                    and _task_execution_affinity(tasks[index])
+                    in preferred_affinities
+                )
+                else 1
+            ),
             int(active_by_endpoint.get(tasks[index].endpoint, 0)),
             index,
         ),
@@ -16672,10 +18195,13 @@ def execute_download_tasks(
 
     def scheduler_excluded_providers(endpoint: str | None = None) -> set[str]:
         """Providers that cannot be the next runnable fallback for a route."""
-        excluded = cooldown_providers()
+        cooldown = cooldown_providers()
+        excluded = set(cooldown)
+        globally_unavailable: set[str] = set()
         unavailable_method = getattr(runtime, "unavailable", None)
         if callable(unavailable_method):
-            excluded.update(str(item) for item in unavailable_method())
+            globally_unavailable.update(str(item) for item in unavailable_method())
+            excluded.update(globally_unavailable)
         if endpoint is not None:
             unavailable_routes_method = getattr(runtime, "unavailable_routes", None)
             if callable(unavailable_routes_method):
@@ -16684,6 +18210,20 @@ def execute_download_tasks(
                     for provider, route_endpoint in unavailable_routes_method()
                     if route_endpoint == endpoint
                 )
+        local_bypass = getattr(worker, "can_run_during_provider_cooldown", None)
+        if callable(local_bypass):
+            candidates = (
+                cooldown
+                if endpoint is not None
+                else set(
+                    getattr(worker, "local_cooldown_bypass_providers", lambda: set())()
+                )
+            )
+            for provider in candidates:
+                if provider in globally_unavailable:
+                    continue
+                if endpoint is None or local_bypass(provider, endpoint):
+                    excluded.discard(provider)
         return excluded
 
     def scheduler_excluded_endpoints() -> set[str]:
@@ -16708,6 +18248,10 @@ def execute_download_tasks(
         method = getattr(runtime, "next_cooldown_delay", None)
         return method() if callable(method) else None
 
+    def next_task_retry_delay() -> float | None:
+        method = getattr(manifest, "next_retry_delay", None)
+        return method(plan_token) if callable(method) else None
+
     def scheduling_provider(task: DownloadTask) -> str | None:
         """Predict the first provider that can actually consume this task.
 
@@ -16727,6 +18271,15 @@ def execute_download_tasks(
             available, reason = availability(provider, task.endpoint)
             if available:
                 return provider
+            local_bypass = getattr(
+                worker, "can_run_during_provider_cooldown", None
+            )
+            if (
+                callable(local_bypass)
+                and str(reason or "").startswith("cooldown until")
+                and local_bypass(provider, task.endpoint)
+            ):
+                return provider
             if reason and str(reason).startswith("cooldown until"):
                 saw_cooldown = True
         if saw_cooldown:
@@ -16738,6 +18291,29 @@ def execute_download_tasks(
         # status is persisted.  Give those cheap bookkeeping tasks a bounded,
         # provider-independent bucket rather than starving them forever.
         return unavailable_bucket
+
+    def provider_available_for_scheduling(provider: str, endpoint: str) -> bool:
+        """Apply the worker's local cooldown bypass at every refill boundary.
+
+        ``ProviderRuntime.availability`` describes the remote API.  A worker
+        can still make progress through a local/official bulk path, so refill
+        code must use the same effective availability rule as
+        ``scheduling_provider``.  Keeping this predicate here prevents the
+        initial queue and provider-specific top-ups from disagreeing after an
+        API quota enters cooldown.
+        """
+        availability = getattr(runtime, "availability", None)
+        if not callable(availability):
+            return True
+        available, reason = availability(provider, endpoint)
+        if available:
+            return True
+        local_bypass = getattr(worker, "can_run_during_provider_cooldown", None)
+        return bool(
+            callable(local_bypass)
+            and str(reason or "").startswith("cooldown until")
+            and local_bypass(provider, endpoint)
+        )
 
     def scheduling_limit(provider: str | None) -> int:
         if provider is None:
@@ -16879,6 +18455,12 @@ def execute_download_tasks(
             if callable(unavailable_method)
             else set()
         )
+        retry_state_method = getattr(manifest, "retry_deferred_state", None)
+        retry_deferred_total, next_task_retry_at = (
+            retry_state_method(plan_token)
+            if callable(retry_state_method)
+            else (0, None)
+        )
 
         def provider_key(provider: str | None) -> str:
             return "__unassigned__" if provider is None else str(provider)
@@ -16911,7 +18493,7 @@ def execute_download_tasks(
         _write_json_atomic(
             scheduler_state_path,
             {
-                "schema_version": 2,
+                "schema_version": 3,
                 "phase": phase,
                 "pid": os.getpid(),
                 "plan_token": plan_token,
@@ -16933,6 +18515,8 @@ def execute_download_tasks(
                 )
                 > completion_backpressure_limit,
                 "buffered_total": buffered_task_count(),
+                "retry_deferred_total": int(retry_deferred_total),
+                "next_task_retry_at": next_task_retry_at,
                 "providers": provider_rows,
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             },
@@ -16951,12 +18535,16 @@ def execute_download_tasks(
         ready: list[tuple[str | None, DownloadTask]] = []
         active = active_reservation_counts()
         active_endpoints: dict[tuple[str | None, str], int] = {}
+        active_affinities: dict[str | None, set[str]] = {}
         for future, task in futures.items():
             if future.done():
                 continue
             provider = scheduled_provider.get(future)
             key = (provider, task.endpoint)
             active_endpoints[key] = active_endpoints.get(key, 0) + 1
+            affinity = _task_execution_affinity(task)
+            if affinity is not None:
+                active_affinities.setdefault(provider, set()).add(affinity)
         global_capacity = max(0, target_inflight - len(futures))
         if global_capacity <= 0:
             return 0
@@ -16993,6 +18581,7 @@ def execute_download_tasks(
                             if active_provider == provider
                         },
                         endpoint_caps(provider),
+                        active_affinities.get(provider),
                     )
                     if task is None:
                         break
@@ -17002,6 +18591,9 @@ def execute_download_tasks(
                     active_endpoints[endpoint_key] = (
                         active_endpoints.get(endpoint_key, 0) + 1
                     )
+                    affinity = _task_execution_affinity(task)
+                    if affinity is not None:
+                        active_affinities.setdefault(provider, set()).add(affinity)
                     provider_capacity -= 1
                 if not tasks:
                     buffered_tasks.pop(provider, None)
@@ -17110,8 +18702,7 @@ def execute_download_tasks(
                 visited_routes = 0
                 for category, endpoint in rotated_routes:
                     visited_routes += 1
-                    provider_available, _ = availability(provider, endpoint)
-                    if not provider_available:
+                    if not provider_available_for_scheduling(provider, endpoint):
                         continue
                     seed_tasks = manifest.pending_endpoint_batch(
                         category,
@@ -17462,8 +19053,7 @@ def execute_download_tasks(
                         break
                     visited += 1
                     route_key = (provider, category, endpoint)
-                    provider_available, _ = availability(provider, endpoint)
-                    if not provider_available:
+                    if not provider_available_for_scheduling(provider, endpoint):
                         exhausted_routes.add(route_key)
                         continue
                     endpoint_exclusions = scheduler_excluded_providers(endpoint)
@@ -17569,17 +19159,29 @@ def execute_download_tasks(
                             break
                         if refill(executor) > 0:
                             continue
-                        delay = next_cooldown_delay()
-                        if delay is None:
+                        provider_delay = next_cooldown_delay()
+                        task_retry_delay = next_task_retry_delay()
+                        wait_candidates = [
+                            (reason, delay)
+                            for reason, delay in (
+                                ("provider cooldown", provider_delay),
+                                ("task retry backoff", task_retry_delay),
+                            )
+                            if delay is not None
+                        ]
+                        if not wait_candidates:
                             break
+                        wait_reason, delay = min(
+                            wait_candidates, key=lambda item: float(item[1])
+                        )
                         scheduler_progress.set_postfix(
-                            status="provider cooldown",
+                            status=wait_reason,
                             waiting_s=max(0, int(delay)),
                             refresh=False,
                         )
                         scheduler_progress.refresh()
                         publish_scheduler_state()
-                        time.sleep(min(5.0, max(0.05, delay)))
+                        time.sleep(min(30.0, max(0.05, delay)))
                         continue
                     completed, _ = wait(
                         tuple(futures), timeout=1.0, return_when=FIRST_COMPLETED
@@ -17936,6 +19538,11 @@ def run(argv: Sequence[str] | None = None) -> int:
     credential_disabled_providers = providers_missing_required_credentials(
         credential_names
     )
+    # Official LABSTAT flat files do not require a registration key. Keep BLS
+    # selectable when bulk mode is enabled; the API key remains only a fallback
+    # credential for an unsupported survey shape.
+    if not args.bls_api_only:
+        credential_disabled_providers.discard("bls")
     bootstrap_progress.update(1)
     bootstrap_progress.set_postfix(stage="load symbol universes", refresh=False)
     effective_disabled_providers = disabled_providers | credential_disabled_providers
@@ -18048,7 +19655,7 @@ def run(argv: Sequence[str] | None = None) -> int:
             maintenance_version_key
         ) == str(RESUME_MAINTENANCE_VERSION)
         maintenance_progress = tqdm(
-            total=16,
+            total=17,
             desc="openbb:manifest maintenance",
             unit="stage",
             disable=args.no_progress,
@@ -18220,6 +19827,13 @@ def run(argv: Sequence[str] | None = None) -> int:
         )
         maintenance_progress.update(1)
         maintenance_progress.set_postfix(
+            stage="repair BLS nullable titles", refresh=False
+        )
+        repaired_bls_title_tasks = manifest.repair_bls_missing_series_title_bug(
+            plan_token=plan_token
+        )
+        maintenance_progress.update(1)
+        maintenance_progress.set_postfix(
             stage="finalize provider outcomes", refresh=False
         )
         finalized_provider_outcomes = (
@@ -18323,6 +19937,12 @@ def run(argv: Sequence[str] | None = None) -> int:
                 f"entitlement:{repaired_entitlement_errors:,}",
                 flush=True,
             )
+        if repaired_bls_title_tasks:
+            print(
+                "[openbb-manifest] requeued_bls_nullable_title_tasks="
+                f"{repaired_bls_title_tasks:,}",
+                flush=True,
+            )
         if finalized_provider_outcomes:
             print(
                 "[openbb-manifest] finalized_complete_provider_outcomes="
@@ -18383,14 +20003,28 @@ def run(argv: Sequence[str] | None = None) -> int:
             for provider in set(rps)
             | {item for values in commands.values() for item in values}
         }
-        concurrency.update(
-            {
-                key: int(value)
-                for key, value in _parse_positive_overrides(
-                    args.provider_concurrency, integer=True
-                ).items()
-            }
-        )
+        concurrency_overrides = {
+            key: int(value)
+            for key, value in _parse_positive_overrides(
+                args.provider_concurrency, integer=True
+            ).items()
+        }
+        concurrency.update(concurrency_overrides)
+        if not args.bls_api_only and "bls" not in concurrency_overrides:
+            # LABSTAT query connections are deliberately single-threaded. Use
+            # at most one task lane per logical CPU; extra lanes only increase
+            # scheduler and storage contention. An explicit operator override
+            # remains authoritative for hardware-specific measurements.
+            concurrency["bls"] = min(
+                int(concurrency.get("bls", 1)), max(1, os.cpu_count() or 1)
+            )
+            print(
+                "[openbb-bulk] bls_task_concurrency="
+                f"{concurrency['bls']} parallel_builds="
+                f"{BLS_LABSTAT_PARALLEL_BUILDS} threads_per_build="
+                f"{_bls_labstat_build_threads()}",
+                flush=True,
+            )
         runtime_state_path = args.output_dir / "_state" / "provider_cooldowns.json"
         if args.refresh:
             runtime_state_path.unlink(missing_ok=True)
@@ -18571,6 +20205,13 @@ def run(argv: Sequence[str] | None = None) -> int:
                 f"{len(entitlement_probe_task_ids):,}",
                 flush=True,
             )
+        sec_statement_process_pool = _create_sec_statement_process_pool()
+        print(
+            "[openbb-runtime] local_cpu_slots="
+            f"{_LOCAL_CPU_BUDGET.total} sec_statement_process_workers="
+            f"{_sec_statement_process_worker_count()}",
+            flush=True,
+        )
         worker = OpenBBWorker(
             obb,
             runtime,
@@ -18579,6 +20220,17 @@ def run(argv: Sequence[str] | None = None) -> int:
             max_backoff=args.max_backoff,
             metadata_only=True,
             show_progress=not args.no_progress,
+            bls_labstat_cache_dir=(
+                None
+                if args.bls_api_only
+                else (
+                    args.output_dir
+                    / "_state"
+                    / "raw_cache"
+                    / "bls_labstat"
+                    / f"as_of={end_date}"
+                )
+            ),
             sec_companyfacts_cache_dir=(
                 args.output_dir
                 / "_state"
@@ -18586,6 +20238,7 @@ def run(argv: Sequence[str] | None = None) -> int:
                 / "sec_companyfacts"
                 / f"as_of={end_date}"
             ),
+            sec_statement_process_pool=sec_statement_process_pool,
             sec_insider_cache_dir=(
                 args.output_dir / "_state" / "raw_cache" / "sec_insider_transactions"
             ),
@@ -18642,19 +20295,26 @@ def run(argv: Sequence[str] | None = None) -> int:
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             },
         )
-        attempted, totals = execute_download_tasks(
-            context,
-            manifest,
-            worker,
-            plan_token=plan_token,
-            workers=args.workers,
-            batch_size=args.batch_size,
-            max_tasks=args.max_tasks,
-            max_total_attempts=args.max_total_attempts,
-            no_discovery=args.no_discovery,
-            no_progress=args.no_progress,
-            entitlement_probe_task_ids=entitlement_probe_task_ids,
-        )
+        try:
+            attempted, totals = execute_download_tasks(
+                context,
+                manifest,
+                worker,
+                plan_token=plan_token,
+                workers=args.workers,
+                batch_size=args.batch_size,
+                max_tasks=args.max_tasks,
+                max_total_attempts=args.max_total_attempts,
+                no_discovery=args.no_discovery,
+                no_progress=args.no_progress,
+                entitlement_probe_task_ids=entitlement_probe_task_ids,
+            )
+        finally:
+            if sec_statement_process_pool is not None:
+                sec_statement_process_pool.shutdown(
+                    wait=True,
+                    cancel_futures=True,
+                )
 
         _write_json_atomic(
             phase_path,

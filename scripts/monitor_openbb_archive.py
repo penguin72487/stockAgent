@@ -34,6 +34,8 @@ except ModuleNotFoundError:  # Direct execution from scripts/.
         MANIFEST_SOURCE_CAP_LIMITS,
     )
 
+from stockagent.live.openbb_archive_dashboard import project_openbb_history_row
+
 
 ACCEPTED_STATUSES = frozenset({"success", "empty"})
 FRED_RELEASE_PAGE_SIZE = 1000
@@ -46,6 +48,28 @@ REQUIRED_ARCHIVE_COLUMNS = (
 )
 FMP_BASIC_DAILY_CALL_CAP = 250
 QUOTA_FEASIBILITY_CRITICAL_DAYS = 365
+
+
+def _active_local_cooldown_bypass_endpoints(
+    state_dir: Path,
+) -> set[tuple[str, str]]:
+    """Return local bulk routes enabled by the live downloader invocation."""
+    pid_path = state_dir / "downloader.pid"
+    try:
+        pid = int(pid_path.read_text(encoding="utf-8").strip())
+        command = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+    except (OSError, ValueError):
+        return set()
+    arguments = {
+        item.decode("utf-8", errors="replace") for item in command if item
+    }
+    if not any(
+        item.endswith("downloader/download_openbb_archive.py") for item in arguments
+    ):
+        return set()
+    if "--bls-api-only" in arguments:
+        return set()
+    return {("bls", "economy.survey.bls_series")}
 
 
 def _daily_quota_projection(
@@ -1473,6 +1497,10 @@ def collect_status(
         str(row[1]) for row in connection.execute("PRAGMA table_info(tasks)")
     }
     execution_tracking_available = "execution_started_at" in task_columns
+    retry_tracking_available = {
+        "retry_not_before",
+        "transient_failures",
+    }.issubset(task_columns)
     plan_token = _active_plan_token(connection)
     active_where, active_parameters = _active_where(plan_token)
     actionable_provider = """
@@ -1485,6 +1513,28 @@ def collect_status(
         )
     """
     now = _utc_now()
+    now_iso = now.isoformat()
+    if retry_tracking_available:
+        retry_eligible_expression = (
+            "(retry_not_before IS NULL OR retry_not_before<=?)"
+        )
+        retry_deferred_expression = (
+            "CASE WHEN status='pending' AND retry_not_before>? THEN 1 ELSE 0 END"
+        )
+        retry_deadline_expression = (
+            "CASE WHEN status='pending' AND retry_not_before>? "
+            "THEN retry_not_before ELSE NULL END"
+        )
+        retry_aggregate_parameters: tuple[str, ...] = (
+            now_iso,
+            now_iso,
+            now_iso,
+        )
+    else:
+        retry_eligible_expression = "1"
+        retry_deferred_expression = "0"
+        retry_deadline_expression = "NULL"
+        retry_aggregate_parameters = ()
     # Read provider cooldowns before the single manifest aggregate so pristine
     # tasks can be classified from their remaining provider chain. A task does
     # not need an old per-row 429/error string to prove why it is deferred.
@@ -1573,7 +1623,13 @@ def collect_status(
                 selected_provider,
                 COUNT(*) count,
                 COALESCE(SUM(CASE WHEN status='success' THEN rows ELSE 0 END),0) success_rows,
-                SUM(CASE WHEN status='pending' AND ({actionable_provider}) THEN 1 ELSE 0 END) pending_eligible,
+                SUM(
+                    CASE WHEN status='pending' AND ({actionable_provider})
+                              AND {retry_eligible_expression}
+                         THEN 1 ELSE 0 END
+                ) pending_eligible,
+                SUM({retry_deferred_expression}) pending_retry_deferred,
+                MIN({retry_deadline_expression}) next_task_retry_at,
                 SUM(CASE WHEN status='pending' AND error IS NOT NULL THEN 1 ELSE 0 END) pending_with_error,
                 SUM(
                     CASE
@@ -1716,6 +1772,9 @@ def collect_status(
             """.format(
                     active_where=active_where,
                     actionable_provider=actionable_provider,
+                    retry_eligible_expression=retry_eligible_expression,
+                    retry_deferred_expression=retry_deferred_expression,
+                    retry_deadline_expression=retry_deadline_expression,
                     buffered_running_expression=buffered_running_expression,
                     executing_expression=executing_expression,
                     stale_buffered_expression=stale_buffered_expression,
@@ -1723,6 +1782,7 @@ def collect_status(
                     runtime_cooldown_expression=runtime_cooldown_expression,
                 ),
                 (
+                    *retry_aggregate_parameters,
                     *cooldown_provider_names,
                     max_total_attempts,
                     *stale_parameters,
@@ -1746,6 +1806,8 @@ def collect_status(
         recent_by_provider: dict[str, dict[str, int]] = {}
         total_rows = 0
         pending_eligible = 0
+        pending_retry_deferred = 0
+        next_task_retry_at = None
         pending_with_error = 0
         pending_cooldown = 0
         pending_rate_limited = 0
@@ -1829,6 +1891,12 @@ def collect_status(
                 )
             total_rows += int(row["success_rows"] or 0)
             pending_eligible += int(row["pending_eligible"] or 0)
+            pending_retry_deferred += int(row["pending_retry_deferred"] or 0)
+            row_retry_at = row["next_task_retry_at"]
+            if row_retry_at is not None and (
+                next_task_retry_at is None or str(row_retry_at) < next_task_retry_at
+            ):
+                next_task_retry_at = str(row_retry_at)
             pending_with_error += int(row["pending_with_error"] or 0)
             pending_cooldown += int(row["pending_cooldown"] or 0)
             pending_rate_limited += int(row["pending_rate_limited"] or 0)
@@ -2019,10 +2087,11 @@ def collect_status(
         resolved_tasks = accepted_tasks + unavailable_tasks
         unresolved_tasks = total_tasks - accepted_tasks
         actionable_unresolved_tasks = total_tasks - resolved_tasks
-        retryable_tasks = (
+        runnable_retryable_tasks = (
             pending_eligible + failed_retryable + status_counts.get("running", 0)
         )
-        tasks_per_minute = recent_tasks / 15.0
+        retryable_tasks = runnable_retryable_tasks + pending_retry_deferred
+        accepted_tasks_per_minute = recent_tasks / 15.0
         minutes_since_last_accepted = (
             max(
                 0.0,
@@ -2033,13 +2102,13 @@ def collect_status(
             else None
         )
         accepted_progress_stalled = bool(
-            retryable_tasks > 0
+            runnable_retryable_tasks > 0
             and minutes_since_last_accepted is not None
             and minutes_since_last_accepted >= max(1, accepted_stall_minutes)
         )
         raw_estimated_hours = (
-            actionable_unresolved_tasks / tasks_per_minute / 60.0
-            if tasks_per_minute > 0
+            actionable_unresolved_tasks / accepted_tasks_per_minute / 60.0
+            if accepted_tasks_per_minute > 0
             else None
         )
         active_endpoints = [
@@ -2180,6 +2249,9 @@ def collect_status(
         )
         provider_runtime_limits = _provider_runtime_limits(state_dir)
         provider_scheduler = _provider_scheduler_state(state_dir)
+        local_cooldown_bypass_endpoints = (
+            _active_local_cooldown_bypass_endpoints(state_dir)
+        )
         scheduler_invariant_violations: list[dict[str, Any]] = []
         for provider, pool in provider_scheduler.get("providers", {}).items():
             execution_limit = int(pool.get("execution_limit") or 0)
@@ -2250,6 +2322,19 @@ def collect_status(
         # Derive unresolved provider backlog from the fallback chain itself so
         # stall detection applies equally to every market/provider, rather
         # than silently watching only the historically troublesome trio.
+        # A task held by its own durable deadline is recoverable backlog, but
+        # it is not currently eligible provider demand and must not trigger a
+        # false provider-stall or HTTP ETA projection.
+        provider_retry_clause = (
+            "AND (retry_not_before IS NULL OR retry_not_before<=?)"
+            if retry_tracking_available
+            else ""
+        )
+        provider_backlog_parameters: tuple[Any, ...] = (
+            (*active_parameters, now_iso)
+            if retry_tracking_available
+            else active_parameters
+        )
         with _sqlite_progress(
             connection,
             "monitor:aggregate provider backlog",
@@ -2276,13 +2361,14 @@ def collect_status(
                 FROM tasks, json_each(tasks.providers_json) AS provider
                 WHERE {active_where}
                   AND status='pending'
+                  {provider_retry_clause}
                   AND NOT EXISTS (
                       SELECT 1 FROM json_each(tasks.provider_outcomes_json) AS outcome
                       WHERE outcome.key=provider.value
                   )
                 GROUP BY provider.value,tasks.category,tasks.endpoint
                 """,
-                active_parameters,
+                provider_backlog_parameters,
             ).fetchall()
         provider_endpoint_backlogs = [
             {
@@ -2291,9 +2377,20 @@ def collect_status(
                 "endpoint": str(row["endpoint"]),
                 "eligible_backlog_tasks": int(row["backlog"] or 0),
                 "exclusive_backlog_tasks": int(row["exclusive_backlog"] or 0),
+                "local_cooldown_bypass": (
+                    (str(row["provider"]), str(row["endpoint"]))
+                    in local_cooldown_bypass_endpoints
+                ),
             }
             for row in provider_backlog_rows
         ]
+        provider_non_bypass_backlogs: Counter[str] = Counter()
+        for row in provider_endpoint_backlogs:
+            if row["local_cooldown_bypass"]:
+                continue
+            provider_non_bypass_backlogs[str(row["provider"])] += int(
+                row["eligible_backlog_tasks"]
+            )
         # Convert task backlog into actual HTTP demand using the downloader's
         # transport-boundary observations.  Unseen endpoints default to one
         # request per task, explicitly marked as unobserved, so an adapter's
@@ -2411,6 +2508,14 @@ def collect_status(
             ):
                 continue
             provider_backlogs[provider] = dynamic_provider_backlogs[provider]
+        fully_local_bypass_providers = {
+            provider
+            for provider, backlog in provider_backlogs.items()
+            if backlog > 0 and provider_non_bypass_backlogs.get(provider, 0) == 0
+        }
+        effective_cooldown_providers = set(active_provider_cooldowns).difference(
+            fully_local_bypass_providers
+        )
         provider_progress_stalls = [
             {
                 "provider": provider,
@@ -2419,7 +2524,7 @@ def collect_status(
             }
             for provider, backlog in provider_backlogs.items()
             if backlog > 0
-            and provider not in active_provider_cooldowns
+            and provider not in effective_cooldown_providers
             and recent_provider_tasks.get(provider, 0) == 0
         ]
         # A global recent-rate projection is valid only when every provider
@@ -2433,7 +2538,7 @@ def collect_status(
             for provider, backlog in provider_backlogs.items()
             if backlog > 0
             and (
-                provider in active_provider_cooldowns
+                provider in effective_cooldown_providers
                 or recent_provider_tasks.get(provider, 0) == 0
             )
         )
@@ -2468,7 +2573,7 @@ def collect_status(
                 provider_unobserved_exclusive_request_cost_tasks.get(provider, 0)
             )
             recent_accepted = int(recent_provider_tasks.get(provider, 0))
-            tasks_per_minute = recent_accepted / 15.0
+            provider_tasks_per_minute = recent_accepted / 15.0
             runtime = provider_runtime_limits.get(provider, {})
             requests_per_second = float(runtime.get("requests_per_second", 0.0))
             daily_cap = int(runtime.get("declared_daily_request_cap") or 0)
@@ -2478,6 +2583,9 @@ def collect_status(
                 runtime.get("declared_hourly_requests_remaining") or 0
             )
             cooldown = active_provider_cooldowns.get(provider)
+            local_cooldown_bypass = provider in fully_local_bypass_providers
+            quota_daily_cap = 0 if local_cooldown_bypass else daily_cap
+            quota_hourly_cap = 0 if local_cooldown_bypass else hourly_cap
             provider_eta_projections.append(
                 {
                     "provider": provider,
@@ -2499,15 +2607,15 @@ def collect_status(
                         "observed_http_boundary_mean_with_one_request_default"
                     ),
                     "recent_accepted_tasks_15m": recent_accepted,
-                    "recent_tasks_per_minute": round(tasks_per_minute, 6),
+                    "recent_tasks_per_minute": round(provider_tasks_per_minute, 6),
                     "exclusive_eta_hours_at_recent_rate": (
-                        round(exclusive_backlog / tasks_per_minute / 60.0, 2)
-                        if exclusive_backlog > 0 and tasks_per_minute > 0
+                        round(exclusive_backlog / provider_tasks_per_minute / 60.0, 2)
+                        if exclusive_backlog > 0 and provider_tasks_per_minute > 0
                         else None
                     ),
                     "eligible_pressure_hours_at_recent_rate": (
-                        round(eligible_backlog / tasks_per_minute / 60.0, 2)
-                        if eligible_backlog > 0 and tasks_per_minute > 0
+                        round(eligible_backlog / provider_tasks_per_minute / 60.0, 2)
+                        if eligible_backlog > 0 and provider_tasks_per_minute > 0
                         else None
                     ),
                     # One task can fan out to several HTTP requests, so RPS is
@@ -2534,8 +2642,14 @@ def collect_status(
                         daily_remaining if daily_cap else None
                     ),
                     "optimistic_daily_quota_windows_for_exclusive_backlog": (
-                        (estimated_exclusive_http_requests + daily_cap - 1) // daily_cap
-                        if estimated_exclusive_http_requests > 0 and daily_cap > 0
+                        (
+                            estimated_exclusive_http_requests
+                            + quota_daily_cap
+                            - 1
+                        )
+                        // quota_daily_cap
+                        if estimated_exclusive_http_requests > 0
+                        and quota_daily_cap > 0
                         else None
                     ),
                     "optimistic_additional_daily_resets_required": (
@@ -2544,11 +2658,11 @@ def collect_status(
                                 0,
                                 estimated_exclusive_http_requests - daily_remaining,
                             )
-                            + daily_cap
+                            + quota_daily_cap
                             - 1
                         )
-                        // daily_cap
-                        if exclusive_backlog > 0 and daily_cap > 0
+                        // quota_daily_cap
+                        if exclusive_backlog > 0 and quota_daily_cap > 0
                         else None
                     ),
                     "durable_claims_current_utc_hour": int(
@@ -2560,9 +2674,10 @@ def collect_status(
                         hourly_remaining if hourly_cap else None
                     ),
                     "optimistic_hourly_quota_windows_for_exclusive_backlog": (
-                        (estimated_exclusive_http_requests + hourly_cap - 1)
-                        // hourly_cap
-                        if estimated_exclusive_http_requests > 0 and hourly_cap > 0
+                        (estimated_exclusive_http_requests + quota_hourly_cap - 1)
+                        // quota_hourly_cap
+                        if estimated_exclusive_http_requests > 0
+                        and quota_hourly_cap > 0
                         else None
                     ),
                     "optimistic_additional_hourly_resets_required": (
@@ -2571,18 +2686,24 @@ def collect_status(
                                 0,
                                 estimated_exclusive_http_requests - hourly_remaining,
                             )
-                            + hourly_cap
+                            + quota_hourly_cap
                             - 1
                         )
-                        // hourly_cap
-                        if exclusive_backlog > 0 and hourly_cap > 0
+                        // quota_hourly_cap
+                        if exclusive_backlog > 0 and quota_hourly_cap > 0
                         else None
                     ),
                     "observed_quota_limit": runtime.get("observed_quota_limit"),
                     "cooldown_until": cooldown.get("until") if cooldown else None,
+                    "local_cooldown_bypass": local_cooldown_bypass,
+                    "local_cooldown_bypass_endpoints": sorted(
+                        endpoint
+                        for item_provider, endpoint in local_cooldown_bypass_endpoints
+                        if item_provider == provider
+                    ),
                     "state": (
                         "cooldown"
-                        if cooldown
+                        if cooldown and not local_cooldown_bypass
                         else "active"
                         if recent_accepted > 0
                         else "stalled"
@@ -2604,7 +2725,7 @@ def collect_status(
             category = str(item["category"])
             unresolved = int(item["unresolved_tasks"])
             recent = int(recent_by_category.get(category, {}).get("tasks", 0))
-            tasks_per_minute = recent / 15.0
+            category_tasks_per_minute = recent / 15.0
             ownership = category_backlogs.get(category, [])
             exclusive_owners = {
                 str(row["provider"]): int(row["exclusive_backlog_tasks"])
@@ -2614,12 +2735,12 @@ def collect_status(
             blockers = sorted(
                 provider
                 for provider in exclusive_owners
-                if provider in active_provider_cooldowns
+                if provider in effective_cooldown_providers
                 or recent_provider_tasks.get(provider, 0) == 0
             )
             raw_hours = (
-                unresolved / tasks_per_minute / 60.0
-                if unresolved > 0 and tasks_per_minute > 0
+                unresolved / category_tasks_per_minute / 60.0
+                if unresolved > 0 and category_tasks_per_minute > 0
                 else None
             )
             category_eta_projections.append(
@@ -2627,7 +2748,7 @@ def collect_status(
                     "category": category,
                     "unresolved_tasks": unresolved,
                     "recent_accepted_tasks_15m": recent,
-                    "recent_tasks_per_minute": round(tasks_per_minute, 6),
+                    "recent_tasks_per_minute": round(category_tasks_per_minute, 6),
                     "raw_eta_hours_at_recent_rate": (
                         round(raw_hours, 2) if raw_hours is not None else None
                     ),
@@ -2645,6 +2766,8 @@ def collect_status(
         provider_quota_feasibility: dict[str, list[dict[str, Any]]] = {}
         for projection in provider_eta_projections:
             provider = str(projection["provider"])
+            if projection.get("local_cooldown_bypass"):
+                continue
             exclusive_backlog = int(projection["exclusive_backlog_tasks"])
             estimated_exclusive_requests = int(
                 projection.get("estimated_exclusive_http_requests") or exclusive_backlog
@@ -2768,6 +2891,8 @@ def collect_status(
             )[:50],
             "status_counts": dict(sorted(status_counts.items())),
             "pending_eligible": pending_eligible,
+            "pending_retry_deferred": pending_retry_deferred,
+            "next_task_retry_at": next_task_retry_at,
             "pending_with_error": pending_with_error,
             "pending_cooldown": pending_cooldown,
             "pending_rate_limited": pending_rate_limited,
@@ -2799,6 +2924,11 @@ def collect_status(
             },
             "provider_quota_feasibility": provider_quota_feasibility,
             "active_provider_cooldowns": active_provider_cooldowns,
+            "local_cooldown_bypass_endpoints": [
+                {"provider": provider, "endpoint": endpoint}
+                for provider, endpoint in sorted(local_cooldown_bypass_endpoints)
+            ],
+            "fully_local_bypass_providers": sorted(fully_local_bypass_providers),
             "provider_runtime_limits": provider_runtime_limits,
             "provider_scheduler": provider_scheduler,
             "scheduler_invariant_violations": scheduler_invariant_violations,
@@ -2830,10 +2960,12 @@ def collect_status(
             "category_eta_projections": category_eta_projections,
             "provider_progress_stalls": provider_progress_stalls,
             "failed_retryable": failed_retryable,
+            "runnable_retryable_tasks": runnable_retryable_tasks,
             "retryable_tasks": retryable_tasks,
             "exhausted_tasks": exhausted,
             "high_attempt_tasks": high_attempt,
             "execution_tracking_available": execution_tracking_available,
+            "retry_tracking_available": retry_tracking_available,
             "buffered_running_tasks": buffered_running,
             "executing_tasks": executing,
             "stale_buffered_tasks": stale_buffered,
@@ -2894,7 +3026,7 @@ def collect_status(
                     )
                 ],
             },
-            "tasks_per_minute_last_15m": round(tasks_per_minute, 4),
+            "tasks_per_minute_last_15m": round(accepted_tasks_per_minute, 4),
             "raw_estimated_hours_at_recent_rate": round(raw_estimated_hours, 2)
             if raw_estimated_hours is not None
             else None,
@@ -2963,7 +3095,8 @@ def collect_status(
                 "warning",
                 "high_attempt_tasks",
                 f"{high_attempt:,} transient tasks crossed the diagnostic attempt "
-                "threshold but remain schedulable; inspect their grouped signatures.",
+                f"threshold; {pending_retry_deferred:,} pending tasks are currently "
+                "isolated by durable retry deadlines.",
             )
         if fred_pagination_gaps:
             add_alert(
@@ -3114,7 +3247,7 @@ def collect_status(
         active_quota_constraints = {
             provider: count
             for provider, count in quota_constraints.items()
-            if count > 0
+            if count > 0 and provider not in fully_local_bypass_providers
         }
         if active_quota_constraints:
             add_alert(
@@ -3524,6 +3657,8 @@ def _provider_scheduler_state(state_dir: Path) -> dict[str, Any]:
         "active_total": int(payload.get("active_total", 0)),
         "completed_pending_total": int(payload.get("completed_pending_total", 0)),
         "buffered_total": int(payload.get("buffered_total", 0)),
+        "retry_deferred_total": int(payload.get("retry_deferred_total", 0)),
+        "next_task_retry_at": payload.get("next_task_retry_at"),
         "completion_persistence_batch_size": int(
             payload.get("completion_persistence_batch_size", 0)
         ),
@@ -3692,6 +3827,8 @@ def _print_human(status: dict[str, Any]) -> None:
         f"({status['completion_percent']:.4f}%) rows={status['success_rows']:,} "
         f"unavailable={status['unavailable_tasks']:,} "
         f"status={counts} retryable={status['retryable_tasks']:,} exhausted={status['exhausted_tasks']:,} "
+        f"retry_deferred={status.get('pending_retry_deferred', 0):,} "
+        f"next_retry={status.get('next_task_retry_at') or '-'} "
         f"pending_error={status['pending_with_error']:,} "
         f"rate_limited={status['pending_rate_limited']:,} "
         f"cooldown={status['pending_cooldown']:,} "
@@ -4012,11 +4149,23 @@ def run(argv: Sequence[str] | None = None) -> int:
             _atomic_write_json(state_dir / "audit_latest.json", status)
     if args.append_history:
         history = state_dir / "monitor_history.jsonl"
+        dashboard_history = state_dir / "monitor_dashboard_history.jsonl"
         history.parent.mkdir(parents=True, exist_ok=True)
         with history.open("a", encoding="utf-8") as handle:
             handle.write(
                 json.dumps(status, ensure_ascii=False, separators=(",", ":")) + "\n"
             )
+        dashboard_row = project_openbb_history_row(status)
+        if dashboard_row:
+            with dashboard_history.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    json.dumps(
+                        dashboard_row,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                    + "\n"
+                )
     if args.field:
         value = status.get(args.field)
         if isinstance(value, (dict, list)):

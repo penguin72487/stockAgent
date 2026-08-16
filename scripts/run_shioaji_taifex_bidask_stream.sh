@@ -108,14 +108,47 @@ while true; do
     echo "[shioaji-taifex] waiting_seconds=$delay reason=next_capture_window session=$capture_session trade_date=$trade_date stop_at=$stop_at"
     sleep "$delay"
   fi
-  if [[ "$EXECUTE_STRATEGIES" == true && "$capture_session" == day ]]; then
-    settlement_end="$(TZ=Asia/Taipei date -d yesterday +%F)"
-    echo "[shioaji-taifex] final_settlement_refresh_end=$settlement_end"
+  if [[ "$EXECUTE_STRATEGIES" == true ]]; then
+    if [[ "$capture_session" == night ]]; then
+      # The day-session TXO/TX expiry has finished before night pre-open.  Pull
+      # through today so Friday-night and other expiry-night strategies do not
+      # wait until the next business-day bootstrap for an already-published FSP.
+      settlement_end="$(TZ=Asia/Taipei date +%F)"
+    else
+      settlement_end="$(TZ=Asia/Taipei date -d yesterday +%F)"
+    fi
+    echo "[shioaji-taifex] final_settlement_refresh_session=$capture_session final_settlement_refresh_end=$settlement_end"
     if ! run_fintech_python scripts/download_taifex_final_settlement_history.py \
       --start-date 2012-11-01 \
       --end-date "$settlement_end" \
       --refresh; then
       echo "[shioaji-taifex] final_settlement_refresh_failed end=$settlement_end strategy_will_fail_closed_if_needed" >&2
+    fi
+    echo "[shioaji-taifex] settlement_bootstrap_session=$capture_session trade_date=$trade_date"
+    if ! run_fintech_python -m downloader.stream_shioaji_taifex_bidask \
+      --simulation \
+      --settle-expired-strategy-state-only \
+      --capture-session "$capture_session" \
+      --trade-date "$trade_date" \
+      --stop-at "$stop_at" \
+      --future-code "$FUTURE_CODE" \
+      --hedge-future-code "$HEDGE_FUTURE_CODE" \
+      --strategy-state-dir "$STRATEGY_STATE_DIR" \
+      --final-settlement-path "$FINAL_SETTLEMENT_PATH" \
+      --strategy-mode "$STRATEGY_MODE" \
+      --strategy-intraday-interval-seconds "$STRATEGY_INTRADAY_INTERVAL_SECONDS" \
+      --strategy-intraday-entry-cutoff "$STRATEGY_INTRADAY_ENTRY_CUTOFF" \
+      --strategy-intraday-flatten-time "$STRATEGY_INTRADAY_FLATTEN_TIME" \
+      --strategy-night-entry-cutoff "$STRATEGY_NIGHT_ENTRY_CUTOFF" \
+      --strategy-night-flatten-time "$STRATEGY_NIGHT_FLATTEN_TIME" \
+      --strategy-option-risk-margin-a-twd "$STRATEGY_OPTION_RISK_MARGIN_A_TWD" \
+      --strategy-option-risk-margin-b-twd "$STRATEGY_OPTION_RISK_MARGIN_B_TWD" \
+      --strategy-option-risk-margin-c-twd "$STRATEGY_OPTION_RISK_MARGIN_C_TWD" \
+      --strategy-capital-buffer-multiple "$STRATEGY_CAPITAL_BUFFER_MULTIPLE" \
+      --strategy-catalog-expansion-entry-policy "$STRATEGY_CATALOG_EXPANSION_ENTRY_POLICY"; then
+      echo "[shioaji-taifex] settlement_bootstrap_failed trade_date=$trade_date retry_seconds=30" >&2
+      sleep 30
+      continue
     fi
   fi
   capture_id="$(run_fintech_python -c 'import uuid; print(uuid.uuid4().hex)')"

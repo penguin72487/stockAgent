@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#071019">
+  <title>StockAgent 全資料監控</title>
+  <link rel="stylesheet" href="../dashboard-core.css?v=5">
+  <link rel="stylesheet" href="styles.css?v=2">
+</head>
+<body>
+  <a class="skip-link" href="#source-list">跳到資料來源</a>
+  <header class="site-header topbar">
+    <a class="brand" href="../">STOCKAGENT</a>
+    <nav aria-label="公開面板導覽">
+      <a href="../">總覽</a>
+      <a href="../taifex/">TAIFEX</a>
+      <a href="../tw-day-trade/">台股當沖</a>
+      <a href="../shioaji/">永豐 API</a>
+      <a href="../openbb/">OpenBB</a>
+      <a href="./" aria-current="page">全資料</a>
+      <a href="../traffic/">流量</a>
+    </nav>
+  </header>
+
+  <main>
+    <section class="hero" aria-labelledby="page-title">
+      <div>
+        <p class="eyebrow">DATA FLEET OBSERVATORY</p>
+        <h1 id="page-title">所有資料，<br>一張即時健康圖</h1>
+        <p class="lead">從永豐 Shioaji、yfinance、MOPS、TWSE、TPEx、TAIFEX，到 OpenBB、OKX、Bybit 與外匯來源。每個已有紀錄的資料群組都由同一份註冊表追蹤。</p>
+      </div>
+      <div class="hero-status">
+        <div class="status-line">
+          <span id="overall-health" class="health loading" role="status" aria-live="polite"><i aria-hidden="true"></i>讀取中</span>
+          <time id="updated-at">—</time>
+        </div>
+        <strong id="overall-percent">—</strong>
+        <progress id="overall-progress" max="1" aria-label="來源層級健康或進行中比例"></progress>
+        <p>來源層級狀態比例；不同來源的日期、標的、任務與列數不混加。</p>
+      </div>
+    </section>
+
+    <section class="kpis" aria-label="資料監控摘要">
+      <article><span>已註冊項目</span><strong id="registered-items">—</strong><small id="registered-detail">—</small></article>
+      <article><span>正常／進行中</span><strong id="healthy-items">—</strong><small>含配額等待與連續串流</small></article>
+      <article><span>需要處理</span><strong id="attention-items">—</strong><small>逾時、缺口或無法驗證</small></article>
+      <article><span>已知資料列</span><strong id="known-rows">—</strong><small>只加總不重複的群組回執</small></article>
+    </section>
+
+    <section class="section-block" aria-labelledby="groups-title">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">PHYSICAL DATA GROUPS</p>
+          <h2 id="groups-title">實體資料群組</h2>
+        </div>
+        <p>這些群組對應實際註冊、發佈與更新責任；點選有詳情頁的群組可深入查看。</p>
+      </div>
+      <div id="group-grid" class="group-grid" aria-live="polite"></div>
+    </section>
+
+    <section id="source-list" class="section-block" aria-labelledby="sources-title">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">SOURCE REGISTRY</p>
+          <h2 id="sources-title">逐來源進度與 ETA</h2>
+        </div>
+        <p id="result-count">—</p>
+      </div>
+
+      <form id="filters" class="filters" role="search">
+        <label>搜尋
+          <input id="search" type="search" placeholder="資料集、供應商或更新器" autocomplete="off">
+        </label>
+        <label>供應商
+          <select id="provider-filter"><option value="all">全部供應商</option></select>
+        </label>
+        <label>狀態
+          <select id="status-filter">
+            <option value="all">全部狀態</option>
+            <option value="current">正常</option>
+            <option value="updating">更新中</option>
+            <option value="complete">完成</option>
+            <option value="waiting">等待</option>
+            <option value="stale">需更新</option>
+            <option value="degraded">有缺口</option>
+            <option value="blocked">阻擋</option>
+            <option value="unavailable">不可用</option>
+            <option value="legacy">封存</option>
+          </select>
+        </label>
+        <label>範圍
+          <select id="scope-filter">
+            <option value="all">全部項目</option>
+            <option value="storage_group">只看資料群組</option>
+            <option value="logical_source">只看逐來源</option>
+          </select>
+        </label>
+      </form>
+
+      <div class="table-scroll" tabindex="0" role="region" aria-label="所有資料來源監控明細，可用方向鍵水平捲動">
+        <table>
+          <thead>
+            <tr>
+              <th>資料來源</th>
+              <th>狀態／新鮮度</th>
+              <th>完整度</th>
+              <th>預估完成</th>
+              <th>資料到期</th>
+              <th>更新責任</th>
+            </tr>
+          </thead>
+          <tbody id="source-rows"></tbody>
+        </table>
+      </div>
+      <div id="empty-state" class="empty-state" hidden>沒有符合目前篩選條件的來源。</div>
+    </section>
+
+    <aside class="boundary-note" aria-labelledby="boundary-title">
+      <span>資料誠信邊界</span>
+      <div>
+        <h2 id="boundary-title">新鮮，不等於完整；持續串流，也沒有「抓完」日期。</h2>
+        <p id="boundary-copy">即時 Tick／BidAsk 只顯示實際落盤資料。歷史 Tick 無法重建從未擷取的五檔委託簿；零吞吐、休市或配額等待時不會捏造 ETA。</p>
+      </div>
+    </aside>
+  </main>
+
+  <footer>StockAgent 全資料監控 · 台北時間 · 每 10 秒讀取最新回執</footer>
+  <script src="app.js?v=3" defer></script>
+</body>
+</html>

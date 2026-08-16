@@ -8,12 +8,15 @@
       "publish": true,
       "pack_buckets": 64,
       "loose_threshold_mib": 8,
+      "excluded_subtrees": [
+        "stocks/panel_cache_v2"
+      ],
       "active_process_substrings": [
         "download_tw_public_data.py",
         "rebuild_tw_public_data_layer.py",
         "build_tw_public_training_features.py"
       ],
-      "note": "Immutable public TW training tree plus official raw receipts."
+      "note": "Immutable public TW training tree plus official raw receipts; reproducible panel_cache_v2 stays node-local."
     },
     {
       "dataset": "tw-minute-train",
@@ -116,6 +119,18 @@
         "download_bybit_perp_daily.py"
       ],
       "note": "Bybit public perpetual market data."
+    },
+    {
+      "dataset": "binance",
+      "source": "data_binance",
+      "role": "training",
+      "publish": true,
+      "pack_buckets": 16,
+      "loose_threshold_mib": 8,
+      "active_process_substrings": [
+        "download_binance_perp_15m.py"
+      ],
+      "note": "Binance USD-M perpetual 15-minute market data."
     },
     {
       "dataset": "tw-index-futures",

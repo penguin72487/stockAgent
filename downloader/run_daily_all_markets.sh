@@ -58,6 +58,10 @@ BYBIT_WORKERS="${BYBIT_WORKERS:-16}"
 BYBIT_REQUEST_INTERVAL="${BYBIT_REQUEST_INTERVAL:-}"
 BYBIT_MAX_RETRIES="${BYBIT_MAX_RETRIES:-8}"
 BYBIT_CATEGORIES="${BYBIT_CATEGORIES:-linear inverse}"
+RUN_BINANCE_PERP="${RUN_BINANCE_PERP:-1}"
+BINANCE_WORKERS="${BINANCE_WORKERS:-32}"
+BINANCE_REQUEST_WEIGHT_PER_MINUTE="${BINANCE_REQUEST_WEIGHT_PER_MINUTE:-}"
+BINANCE_MAX_RETRIES="${BINANCE_MAX_RETRIES:-8}"
 RUN_ALPACA_US="${RUN_ALPACA_US:-1}"
 ALPACA_US_WORKERS="${ALPACA_US_WORKERS:-16}"
 ALPACA_US_METADATA_WORKERS="${ALPACA_US_METADATA_WORKERS:-4}"
@@ -486,6 +490,7 @@ run_cex_incremental() {
   read -r -a bybit_categories <<< "$BYBIT_CATEGORIES"
   local -a okx_cmd=()
   local -a bybit_cmd=()
+  local -a binance_cmd=()
   okx_cmd=(
     "$PYTHON_BIN" downloader/download_okx_perp_15m.py
     --mode incremental
@@ -510,6 +515,24 @@ run_cex_incremental() {
     bybit_cmd+=(--request-interval "$BYBIT_REQUEST_INTERVAL")
   fi
   run_step bybit_perp_15m_update "${bybit_cmd[@]}" || rc=1
+
+  if [[ "$RUN_BINANCE_PERP" == "1" ]]; then
+    binance_cmd=(
+      "$PYTHON_BIN" downloader/download_binance_perp_15m.py
+      --mode incremental
+      --end-date "$today"
+      --workers "$BINANCE_WORKERS"
+      --max-retries "$BINANCE_MAX_RETRIES"
+    )
+    if [[ -n "$BINANCE_REQUEST_WEIGHT_PER_MINUTE" ]]; then
+      binance_cmd+=(
+        --request-weight-per-minute "$BINANCE_REQUEST_WEIGHT_PER_MINUTE"
+      )
+    fi
+    run_step binance_perp_15m_update "${binance_cmd[@]}" || rc=1
+  else
+    log "skip=binance_perp_15m_update reason=RUN_BINANCE_PERP=${RUN_BINANCE_PERP}"
+  fi
   return "$rc"
 }
 

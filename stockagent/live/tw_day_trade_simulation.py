@@ -50,6 +50,7 @@ from stockagent.research.taifex_transaction_tax import (
 
 TAIPEI: Final[ZoneInfo] = ZoneInfo("Asia/Taipei")
 SIMULATION_SCHEMA_VERSION: Final[int] = 3
+TX_CONTINUOUS_ROLL_CONTRACT_VERSION: Final[int] = 2
 ENTRY_GATE: Final[time] = time(9, 0)
 FIRST_MINUTE_EXECUTION_TIME: Final[time] = time(9, 1)
 EXIT_LIMIT_TIME: Final[time] = time(13, 20)
@@ -74,6 +75,10 @@ STOCK_BENCHMARKS: Final[tuple[tuple[str, str, str, str], ...]] = (
 )
 TX_CONTINUOUS_BENCHMARK_ID: Final[str] = "benchmark_tx_continuous"
 TX_CONTINUOUS_LOGICAL_CODE: Final[str] = "TXFR1"
+DEFAULT_TAIFEX_INDEX_FINAL_SETTLEMENT_PATH: Final[Path] = (
+    Path(__file__).resolve().parents[2]
+    / "data_tw_index_options_daily/txo_final_settlement_history.parquet"
+)
 
 
 def _now_taipei(now: datetime | None = None) -> datetime:
@@ -103,12 +108,37 @@ def _parse_timestamp(value: object) -> datetime | None:
     return parsed.astimezone(TAIPEI)
 
 
+def _timestamp_is_for_session(value: object, session_date: str) -> bool:
+    """Return whether a lifecycle marker belongs to the active session.
+
+    Persisted modes span trading days.  A truthy timestamp from yesterday must
+    never suppress today's closing-auction submission or terminal settlement.
+    """
+
+    parsed = _parse_timestamp(value)
+    return parsed is not None and parsed.date().isoformat() == str(session_date)
+
+
 def _finite(value: object) -> float | None:
     try:
         number = float(value)
     except (TypeError, ValueError):
         return None
     return number if math.isfinite(number) and number > 0.0 else None
+
+
+def _date_value(value: object) -> date | None:
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return date.fromisoformat(text[:10])
+    except ValueError:
+        return None
 
 
 def _top_book_capacity_shares(
@@ -173,13 +203,57 @@ def _executable_capacity_shares(
     )
 
 
+def _force_exit_retry_capacity_shares(
+    position: dict[str, Any],
+    quote: Mapping[str, Any],
+    *,
+    transaction_side: str,
+    lot_size: int,
+    now: datetime,
+) -> int:
+    """Return remaining same-minute capacity for repeated market exits.
+
+    A fresh best quote may be retried every service poll from 13:24 to 13:25,
+    but the completed-minute participation budget may only be consumed once.
+    This prevents a two-second retry loop from multiplying the same one-minute
+    volume evidence into fabricated liquidity.
+    """
+
+    minute_key = now.replace(second=0, microsecond=0).isoformat(timespec="minutes")
+    observed_capacity = _minute_kbar_capacity_shares(quote, lot_size=lot_size)
+    if position.get("force_exit_liquidity_minute") != minute_key:
+        position["force_exit_liquidity_minute"] = minute_key
+        position["force_exit_minute_capacity_shares"] = observed_capacity
+        position["force_exit_minute_consumed_shares"] = 0
+    else:
+        position["force_exit_minute_capacity_shares"] = max(
+            int(position.get("force_exit_minute_capacity_shares") or 0),
+            observed_capacity,
+        )
+    remaining_volume_capacity = max(
+        0,
+        int(position.get("force_exit_minute_capacity_shares") or 0)
+        - int(position.get("force_exit_minute_consumed_shares") or 0),
+    )
+    return min(
+        _top_book_capacity_shares(
+            quote,
+            transaction_side=transaction_side,
+            lot_size=lot_size,
+        ),
+        remaining_volume_capacity,
+    )
+
+
 def _prepare_entry_plan(
     raw_row: Mapping[str, Any],
     *,
     quote: Mapping[str, Any],
     evidence: LiveEligibility | None,
     signal_at: datetime,
+    observation_at: datetime,
     spec: ModeSpec,
+    allow_quote_at_signal: bool = False,
 ) -> dict[str, Any]:
     """Resolve one admissible entry before portfolio-level direction balancing."""
 
@@ -190,7 +264,7 @@ def _prepare_entry_plan(
     quote_values = dict(quote)
     status = "ready"
     reason: str | None = None
-    sizing_price = _finite(quote_values.get("open"))
+    sizing_price = _finite(quote_values.get("open")) or _finite(row.get("open_price"))
     entry_price = _finite(quote_values.get("ask" if side == "long" else "bid"))
     quote_at = _parse_timestamp(quote_values.get("quote_at"))
     upper = _finite(quote_values.get("upper_limit"))
@@ -211,18 +285,12 @@ def _prepare_entry_plan(
         status, reason = "blocked", "sell_first_suspended"
     elif sizing_price is None:
         status, reason = "blocked", "official_open_price_unavailable"
-    elif entry_price is None:
-        status, reason = "blocked", "no_executable_best_quote"
-    elif quote_at is None or quote_at <= signal_at:
-        status, reason = "blocked", "quote_not_after_signal"
-    elif upper is None or lower is None:
-        status, reason = "blocked", "price_limit_unavailable"
 
     requested_shares = 0
     filled_shares = 0
     top_book_capacity_shares = 0
     minute_kbar_capacity_shares = 0
-    if status == "ready" and entry_price is not None:
+    if status == "ready" and sizing_price is not None:
         requested_shares = int(
             math.floor(
                 abs(target_weight)
@@ -233,6 +301,19 @@ def _prepare_entry_plan(
         ) * int(spec.lot_size)
         if requested_shares <= 0:
             status, reason = "skipped", "below_one_board_lot"
+    if status == "ready":
+        if entry_price is None:
+            status, reason = "blocked", "no_executable_best_quote"
+        elif quote_at is None or (
+            quote_at < signal_at
+            if allow_quote_at_signal
+            else quote_at <= signal_at
+        ):
+            status, reason = "blocked", "quote_not_after_signal"
+        elif quote_at > observation_at:
+            status, reason = "blocked", "quote_after_local_observation"
+        elif upper is None or lower is None:
+            status, reason = "blocked", "price_limit_unavailable"
         else:
             top_book_capacity_shares = _top_book_capacity_shares(
                 quote_values,
@@ -243,15 +324,28 @@ def _prepare_entry_plan(
                 quote_values,
                 lot_size=spec.lot_size,
             )
-            filled_shares = min(
-                requested_shares,
-                top_book_capacity_shares,
-                minute_kbar_capacity_shares,
+            quote_wall_time = (
+                quote_at.astimezone(TAIPEI).timetz().replace(tzinfo=None)
+                if quote_at is not None
+                else None
             )
+            # At 09:00 no completed one-minute K bar exists yet. Requiring one
+            # delayed every entry until 09:01 even when a causally newer,
+            # executable best quote was already available. Opening orders use
+            # only fresh displayed level-one depth; later orders retain the
+            # conservative completed-minute participation cap.
+            if quote_wall_time is not None and quote_wall_time < time(9, 1):
+                filled_shares = min(requested_shares, top_book_capacity_shares)
+            else:
+                filled_shares = min(
+                    requested_shares,
+                    top_book_capacity_shares,
+                    minute_kbar_capacity_shares,
+                )
             if filled_shares <= 0:
-                status, reason = "blocked", "minute_or_top_book_volume_unavailable"
+                status, reason = "blocked", "marketable_depth_unavailable"
             elif filled_shares < requested_shares:
-                status, reason = "partial_depth", "minute_or_top_book_depth_exhausted"
+                status, reason = "partial_depth", "marketable_depth_exhausted"
     return {
         "row": row,
         "symbol": symbol,
@@ -285,13 +379,36 @@ def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
 
 
 def _append_jsonl(path: Path, payload: Mapping[str, Any]) -> None:
+    _append_jsonl_many(path, (payload,))
+
+
+def _append_jsonl_many(
+    path: Path,
+    payloads: Sequence[Mapping[str, Any]],
+) -> None:
+    """Durably append one logical ledger batch with a single fsync.
+
+    A full-universe signal contains thousands of audit rows. Syncing every
+    row separately made ledger persistence several seconds slower without
+    improving the durability boundary of the logical signal transaction.
+    Encode the complete batch first, then append and fsync it once.
+    """
+
+    if not payloads:
+        return
     path.parent.mkdir(parents=True, exist_ok=True)
-    encoded = (
+    encoded = "".join(
         json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str) + "\n"
+        for payload in payloads
     ).encode("utf-8")
     descriptor = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
     try:
-        os.write(descriptor, encoded)
+        view = memoryview(encoded)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError(f"short append to {path}")
+            view = view[written:]
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
@@ -557,17 +674,263 @@ def quote_map_from_snapshot(
 class TwDayTradeSimulationEngine:
     """One durable simulation ledger shared by all stock day-trade modes."""
 
-    def __init__(self, state_dir: Path) -> None:
+    def __init__(
+        self,
+        state_dir: Path,
+        *,
+        final_settlement_path: str | Path = DEFAULT_TAIFEX_INDEX_FINAL_SETTLEMENT_PATH,
+    ) -> None:
         self.state_dir = Path(state_dir)
         self.state_path = self.state_dir / "state.json"
         self.status_path = self.state_dir / "status.json"
+        self.positions_path = self.state_dir / "positions.json"
+        self.position_history_dir = self.state_dir / "position_history"
         self.signals_path = self.state_dir / "signals.jsonl"
         self.orders_path = self.state_dir / "orders.jsonl"
         self.fills_path = self.state_dir / "fills.jsonl"
         self.marks_path = self.state_dir / "marks.jsonl"
         self.benchmark_marks_path = self.state_dir / "benchmark_marks.jsonl"
         self.events_path = self.state_dir / "events.jsonl"
+        self.latency_path = self.state_dir / "latency.jsonl"
+        self.final_settlement_path = Path(final_settlement_path)
+        self._tx_final_settlement_error: str | None = None
+        self._corporate_action_reference_path: Path | None = None
+        self._corporate_action_cache_signature: tuple[int, ...] | None = None
+        self._corporate_actions_by_symbol: dict[str, list[dict[str, Any]]] = {}
+        self._corporate_action_load_error: str | None = None
+        self._corporate_action_coverage_end: date | None = None
         self.state = self._load_state()
+        tx_benchmark_migrated = self._migrate_tx_continuous_benchmark_contract()
+        self._reconcile_daily_duplicate_signal_ids()
+        self._restore_position_artifact_paths()
+        if tx_benchmark_migrated:
+            _atomic_json(self.state_path, self.state)
+
+    def _migrate_tx_continuous_benchmark_contract(self) -> bool:
+        row = (self.state.get("benchmarks") or {}).get(
+            TX_CONTINUOUS_BENCHMARK_ID
+        )
+        if not isinstance(row, dict):
+            return False
+        row["roll_contract_version"] = TX_CONTINUOUS_ROLL_CONTRACT_VERSION
+        row["official_final_settlement_path"] = str(self.final_settlement_path)
+        if int(row.get("roll_count") or 0) == 0:
+            row.setdefault("origin_entry_price", row.get("entry_price"))
+            row.setdefault("origin_entry_at", row.get("entry_at"))
+            row.setdefault("current_contract_entry_price", row.get("entry_price"))
+            row.setdefault("current_contract_entry_at", row.get("entry_at"))
+        elif row.get("origin_entry_price") is None:
+            # A legacy already-rolled row cannot prove its immutable origin
+            # from the current-contract basis alone.  Keep it visible but do
+            # not manufacture a rebase identity.
+            row["roll_contract_migration_error"] = (
+                "legacy_rolled_benchmark_origin_unavailable"
+            )
+        return True
+
+    def _official_tx_final_settlement(
+        self,
+        *,
+        delivery_date: date,
+        delivery_month: str,
+    ) -> dict[str, Any] | None:
+        """Resolve one monthly TX terminal value from the official index FSP file.
+
+        The retained file is produced from TAIFEX's index-option table, but a
+        monthly TXO row and TX/MTX/TMF use the same underlying-index final
+        settlement formula and value.  Requiring both date and six-digit month
+        prevents a weekly option settlement from being mistaken for the
+        expiring monthly future.
+        """
+
+        self._tx_final_settlement_error = None
+        month = str(delivery_month or "").strip()
+        if len(month) != 6 or not month.isdigit():
+            self._tx_final_settlement_error = (
+                f"invalid_contract_delivery_month:{delivery_month}"
+            )
+            return None
+        if not self.final_settlement_path.is_file():
+            self._tx_final_settlement_error = (
+                f"missing_official_final_settlement_file:{self.final_settlement_path}"
+            )
+            return None
+        try:
+            import polars as pl
+
+            frame = pl.read_parquet(self.final_settlement_path)
+            required = {"settlement_date", "final_settlement_price"}
+            if not required <= set(frame.columns):
+                raise ValueError(
+                    "official final-settlement file lacks settlement_date or price"
+                )
+            series_column = (
+                "option_series"
+                if "option_series" in frame.columns
+                else "contract_delivery_month"
+                if "contract_delivery_month" in frame.columns
+                else None
+            )
+            if series_column is None:
+                raise ValueError(
+                    "official final-settlement file lacks a contract month column"
+                )
+            matched = frame.filter(
+                (pl.col("settlement_date") == delivery_date)
+                & (pl.col(series_column).cast(pl.String) == month)
+            )
+            if matched.height != 1:
+                self._tx_final_settlement_error = (
+                    "missing_official_tx_final_settlement:"
+                    f"{delivery_date.isoformat()}:{month}:rows={matched.height}"
+                )
+                return None
+            row = matched.row(0, named=True)
+            price = _finite(row.get("final_settlement_price"))
+            if price is None:
+                raise ValueError("official TX final settlement is not positive finite")
+        except Exception as exc:
+            self._tx_final_settlement_error = (
+                f"invalid_official_final_settlement:{type(exc).__name__}:{exc}"
+            )
+            return None
+        return {
+            "price": price,
+            "settlement_date": delivery_date.isoformat(),
+            "delivery_month": month,
+            "source_file": str(row.get("source_file") or self.final_settlement_path),
+            "source_sha256": str(row.get("source_sha256") or ""),
+            "source_url": str(row.get("source_url") or ""),
+            "price_source": "official_taifex_index_final_settlement",
+        }
+
+    def _reconcile_daily_duplicate_signal_ids(self) -> None:
+        """Restore the accepted signal identity after a blocked duplicate.
+
+        Older state writers recorded a later ``daily_signal_already_consumed``
+        candidate as the mode's active signal even though the accepted signal,
+        positions, and execution ledger were left untouched.  The append-only
+        event ledger is authoritative for repairing that display-only mismatch.
+        """
+
+        if not self.events_path.is_file():
+            return
+        latest_registered: dict[str, str] = {}
+        latest_event: dict[str, tuple[str, str, str | None]] = {}
+        with self.events_path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    event = json.loads(line)
+                except (TypeError, ValueError):
+                    continue
+                market = str(event.get("market") or "")
+                if not market:
+                    continue
+                event_name = str(event.get("event") or "")
+                signal_id = str(event.get("signal_id") or "")
+                reason = (
+                    str(event.get("reason")) if event.get("reason") is not None else None
+                )
+                if event_name == "signal_registered" and signal_id:
+                    latest_registered[market] = signal_id
+                if event_name in {"signal_registered", "signal_blocked"}:
+                    latest_event[market] = (event_name, signal_id, reason)
+
+        for market, mode in (self.state.get("modes") or {}).items():
+            if not isinstance(mode, dict) or not mode.get("entry_completed_at"):
+                continue
+            registered_id = latest_registered.get(str(market))
+            event_name, duplicate_id, reason = latest_event.get(
+                str(market), ("", "", None)
+            )
+            if (
+                registered_id
+                and event_name == "signal_blocked"
+                and reason == "daily_signal_already_consumed"
+                and duplicate_id
+                and str(mode.get("signal_id") or "") == duplicate_id
+            ):
+                mode["signal_id"] = registered_id
+                mode["last_duplicate_signal_id"] = duplicate_id
+                mode["last_duplicate_signal_reason"] = reason
+
+    def _restore_position_artifact_paths(self) -> None:
+        """Backfill position artifact pointers for signals accepted before schema 1."""
+
+        for mode in (self.state.get("modes") or {}).values():
+            if not isinstance(mode, dict):
+                continue
+            mode["executed_positions_path"] = str(self.positions_path)
+            if mode.get("target_weights_path") and mode.get("target_positions_path"):
+                continue
+            source_path = str(mode.get("signal_source_path") or "").strip()
+            if not source_path:
+                continue
+            try:
+                summary = json.loads(Path(source_path).read_text(encoding="utf-8"))
+            except (OSError, TypeError, ValueError):
+                continue
+            if not isinstance(summary, Mapping) or str(
+                summary.get("signal_id") or ""
+            ) != str(mode.get("signal_id") or ""):
+                continue
+            mode["target_weights_path"] = summary.get("weights_path")
+            mode["target_positions_path"] = (
+                summary.get("positions_markdown_path") or summary.get("weights_path")
+            )
+            mode["target_symbol_count"] = summary.get("symbol_count")
+            mode["target_risk"] = summary.get("target_risk") or {}
+
+    @staticmethod
+    def _position_history_filename(market: object) -> str:
+        normalized = "".join(
+            character
+            if character.isalnum() or character in {"-", "_"}
+            else "_"
+            for character in str(market or "unknown")
+        )
+        return f"{normalized or 'unknown'}.json"
+
+    def _archive_mode_positions(
+        self,
+        mode: Mapping[str, Any],
+        *,
+        archived_at: datetime,
+    ) -> None:
+        """Persist the completed prior-session position lifecycle by date.
+
+        ``state.json`` intentionally owns only the latest session.  Without a
+        dated archive the dashboard date selector could retain marks and fills
+        but lose the corresponding closed position rows as soon as the next
+        signal arrived.
+        """
+
+        positions = [
+            dict(position)
+            for position in (mode.get("positions") or {}).values()
+            if isinstance(position, Mapping)
+        ]
+        session_date = str(mode.get("session_date") or "").strip()
+        if not session_date or not positions:
+            return
+        destination = (
+            self.position_history_dir
+            / session_date
+            / self._position_history_filename(mode.get("market"))
+        )
+        _atomic_json(
+            destination,
+            {
+                "schema_version": 1,
+                "session_date": session_date,
+                "market": mode.get("market"),
+                "signal_id": mode.get("signal_id"),
+                "archived_at": archived_at.isoformat(timespec="seconds"),
+                "simulation_only": True,
+                "production_order_possible": False,
+                "positions": positions,
+            },
+        )
 
     def _load_state(self) -> dict[str, Any]:
         if self.state_path.is_file():
@@ -764,13 +1127,148 @@ class TwDayTradeSimulationEngine:
                         "valuation_stale",
                         "valuation_source",
                         "entry_at",
+                        "entry_price",
                         "roll_count",
+                        "previous_contract_code",
+                        "last_roll_at",
+                        "last_roll_old_bid",
+                        "last_roll_new_ask",
                         "fixed_fees_twd",
                         "transaction_tax_twd",
+                        "total_return_contract",
+                        "corporate_action_factor",
+                        "adjusted_quantity",
+                        "corporate_action_count",
+                        "last_corporate_action_date",
+                        "corporate_action_coverage",
+                        "corporate_action_status",
+                        "corporate_action_coverage_end",
                     )
                 },
             },
         )
+
+    def _load_corporate_actions(
+        self, reference_path: str | Path | None
+    ) -> None:
+        """Cache the official ex-right/ex-dividend reference by file identity."""
+
+        if reference_path is None:
+            return
+        path = Path(reference_path).expanduser().resolve()
+        self._corporate_action_reference_path = path
+        try:
+            stat = path.stat()
+            summary_path = path.with_suffix(".summary.json")
+            summary_stat = summary_path.stat()
+            signature = (
+                stat.st_dev,
+                stat.st_ino,
+                stat.st_size,
+                stat.st_mtime_ns,
+                summary_stat.st_dev,
+                summary_stat.st_ino,
+                summary_stat.st_size,
+                summary_stat.st_mtime_ns,
+            )
+            if signature == self._corporate_action_cache_signature:
+                return
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            if (
+                not isinstance(summary, Mapping)
+                or not bool(summary.get("coverage_complete"))
+                or int(summary.get("failure_count") or 0) != 0
+            ):
+                raise ValueError("corporate-action completeness receipt failed")
+            coverage_end = date.fromisoformat(str(summary.get("end_date") or ""))
+            import polars as pl
+
+            frame = (
+                pl.scan_parquet(path)
+                .filter(pl.col("symbol").is_in([row[1] for row in STOCK_BENCHMARKS]))
+                .select(
+                    pl.col("date").cast(pl.Date),
+                    pl.col("symbol").cast(pl.String),
+                    pl.col("previous_close").cast(pl.Float64),
+                    pl.col("reference_price").cast(pl.Float64),
+                    pl.col("event_type").cast(pl.String),
+                )
+                .sort(["symbol", "date"])
+                .collect()
+            )
+            by_symbol: dict[str, list[dict[str, Any]]] = {}
+            for item in frame.iter_rows(named=True):
+                by_symbol.setdefault(str(item["symbol"]), []).append(dict(item))
+            self._corporate_actions_by_symbol = by_symbol
+            self._corporate_action_cache_signature = signature
+            self._corporate_action_load_error = None
+            self._corporate_action_coverage_end = coverage_end
+        except Exception as exc:
+            self._corporate_actions_by_symbol = {}
+            self._corporate_action_cache_signature = None
+            self._corporate_action_load_error = f"{type(exc).__name__}: {exc}"
+            self._corporate_action_coverage_end = None
+
+    def _stock_total_return_adjustment(
+        self,
+        *,
+        symbol: str,
+        entry_at: object,
+        mark_date: date,
+    ) -> tuple[float | None, list[dict[str, Any]], str]:
+        """Return the reinvested-unit factor implied by official reference prices.
+
+        A holder crossing an ex-date receives equivalent economic value when
+        units are multiplied by ``previous_close / reference_price``.  The
+        official factor handles cash distributions, stock dividends, splits,
+        reverse splits, and mixed capital actions without guessing their type.
+        """
+
+        if self._corporate_action_reference_path is None:
+            return 1.0, [], "not_configured"
+        if self._corporate_action_load_error is not None:
+            return None, [], "reference_unavailable"
+        if (
+            self._corporate_action_coverage_end is None
+            or self._corporate_action_coverage_end < mark_date
+        ):
+            return None, [], "reference_coverage_incomplete"
+        parsed_entry = _parse_timestamp(entry_at)
+        if parsed_entry is None:
+            return None, [], "entry_timestamp_invalid"
+        factor = 1.0
+        applied: list[dict[str, Any]] = []
+        for item in self._corporate_actions_by_symbol.get(str(symbol), ()):
+            action_date = item.get("date")
+            if not isinstance(action_date, date):
+                return None, [], "reference_date_invalid"
+            # The opening ask on the entry date is already ex-action.  Only
+            # actions crossed while holding the benchmark belong in return.
+            if not (parsed_entry.date() < action_date <= mark_date):
+                continue
+            previous_close = _finite(item.get("previous_close"))
+            reference_price = _finite(item.get("reference_price"))
+            if (
+                previous_close is None
+                or reference_price is None
+                or previous_close <= 0.0
+                or reference_price <= 0.0
+            ):
+                return None, [], "reference_factor_invalid"
+            action_factor = previous_close / reference_price
+            factor *= action_factor
+            applied.append(
+                {
+                    "date": action_date.isoformat(),
+                    "event_type": item.get("event_type"),
+                    "previous_close": previous_close,
+                    "reference_price": reference_price,
+                    "factor": action_factor,
+                }
+            )
+        if not math.isfinite(factor) or factor <= 0.0:
+            return None, [], "cumulative_factor_invalid"
+        return factor, applied, "official_reference_complete"
 
     def _mark_stock_benchmark(
         self,
@@ -823,9 +1321,34 @@ class TwDayTradeSimulationEngine:
                 }
             )
         entry = _finite(row.get("entry_price"))
-        if entry is not None and bid is not None:
-            gross_pnl = quantity * (bid - entry)
-            liquidation_notional = quantity * bid
+        adjustment_factor, corporate_actions, action_status = (
+            self._stock_total_return_adjustment(
+                symbol=symbol,
+                entry_at=row.get("entry_at"),
+                mark_date=now.date(),
+            )
+        )
+        row.update(
+            {
+                "total_return_contract": (
+                    "official_ex_date_reference_reinvestment_v1"
+                ),
+                "corporate_action_coverage": action_status
+                == "official_reference_complete",
+                "corporate_action_status": action_status,
+                "corporate_action_coverage_end": (
+                    self._corporate_action_coverage_end.isoformat()
+                    if self._corporate_action_coverage_end is not None
+                    else None
+                ),
+            }
+        )
+        if entry is not None and bid is not None and adjustment_factor is not None:
+            adjusted_quantity = quantity * adjustment_factor
+            gross_value = adjusted_quantity * bid
+            entry_notional = quantity * entry
+            gross_pnl = gross_value - entry_notional
+            liquidation_notional = gross_value
             liquidation_commission, liquidation_tax = self._stock_benchmark_order_cost(
                 notional=liquidation_notional,
                 commission_rate=buy_rate,
@@ -852,10 +1375,22 @@ class TwDayTradeSimulationEngine:
                     "return_pct": None
                     if return_fraction is None
                     else return_fraction * 100.0,
+                    "corporate_action_factor": adjustment_factor,
+                    "adjusted_quantity": adjusted_quantity,
+                    "corporate_action_count": len(corporate_actions),
+                    "last_corporate_action_date": (
+                        corporate_actions[-1]["date"] if corporate_actions else None
+                    ),
+                    "applied_corporate_actions": corporate_actions,
                     "valuation_stale": False,
-                    "valuation_source": "entry_at_best_ask_mark_at_best_bid_after_tw_cash_costs",
+                    "valuation_source": "total_return_units_at_best_bid_after_tw_cash_costs",
                     "source": quote.get("source"),
                 }
+            )
+        elif adjustment_factor is None:
+            row["valuation_stale"] = True
+            row["valuation_source"] = (
+                "corporate_action_reference_unavailable_fail_closed"
             )
         elif row.get("total_equity_twd") is not None:
             row["valuation_stale"] = True
@@ -891,9 +1426,12 @@ class TwDayTradeSimulationEngine:
                 "fixed_fees_twd": 0.0,
                 "transaction_tax_twd": 0.0,
                 "roll_count": 0,
+                "roll_contract_version": TX_CONTINUOUS_ROLL_CONTRACT_VERSION,
                 "valuation_stale": True,
             },
         )
+        row["roll_contract_version"] = TX_CONTINUOUS_ROLL_CONTRACT_VERSION
+        row["official_final_settlement_path"] = str(self.final_settlement_path)
         current_code = str(current_contract_code or "").strip().upper()
         held_code = str(row.get("contract_code") or "").strip().upper()
         current_ask = _finite(current_quote.get("ask"))
@@ -901,12 +1439,28 @@ class TwDayTradeSimulationEngine:
         fee_per_side = TAIFEX_INDEX_FUTURES_FEE_PER_SIDE_TWD["TX"]
         multiplier = TAIFEX_INDEX_FUTURES_MULTIPLIERS["TX"]
 
+        def update_contract_identity(
+            target: dict[str, Any], quote: Mapping[str, Any]
+        ) -> None:
+            delivery_month = str(quote.get("delivery_month") or "").strip()
+            delivery_date = _date_value(
+                quote.get("last_trading_date") or quote.get("delivery_date")
+            )
+            if delivery_month:
+                target["contract_delivery_month"] = delivery_month
+            if delivery_date is not None:
+                target["contract_last_trading_date"] = delivery_date.isoformat()
+
         if row.get("entry_price") is None and current_code and current_ask is not None:
             row.update(
                 {
                     "contract_code": current_code,
                     "entry_price": current_ask,
                     "entry_at": now.isoformat(timespec="seconds"),
+                    "origin_entry_price": current_ask,
+                    "origin_entry_at": now.isoformat(timespec="seconds"),
+                    "current_contract_entry_price": current_ask,
+                    "current_contract_entry_at": now.isoformat(timespec="seconds"),
                     "initial_capital_twd": taifex_initial_margin_twd("TX", now.date()),
                     "fixed_fees_twd": fee_per_side,
                     "transaction_tax_twd": self._tx_trade_tax(
@@ -915,7 +1469,19 @@ class TwDayTradeSimulationEngine:
                     "capital_basis": "official_taifex_initial_margin_at_entry",
                 }
             )
+            update_contract_identity(row, current_quote)
             held_code = current_code
+
+        if row.get("entry_price") is not None:
+            row.setdefault("origin_entry_price", row.get("entry_price"))
+            row.setdefault("origin_entry_at", row.get("entry_at"))
+            row["current_contract_entry_price"] = row.get("entry_price")
+            row.setdefault("current_contract_entry_at", row.get("entry_at"))
+
+        if held_code == current_code:
+            update_contract_identity(row, current_quote)
+        elif held_code:
+            update_contract_identity(row, previous_contract_quote)
 
         if (
             row.get("entry_price") is not None
@@ -923,18 +1489,55 @@ class TwDayTradeSimulationEngine:
             and held_code != current_code
         ):
             old_bid = _finite(previous_contract_quote.get("bid"))
-            if old_bid is not None and current_ask is not None:
+            held_last_trading_date = _date_value(
+                row.get("contract_last_trading_date")
+            )
+            held_delivery_month = str(
+                row.get("contract_delivery_month") or ""
+            ).strip()
+            expired = (
+                held_last_trading_date is not None
+                and (
+                    now.date() > held_last_trading_date
+                    or (
+                        now.date() == held_last_trading_date
+                        and now.time() >= SESSION_CLOSE
+                    )
+                )
+            )
+            official_settlement = (
+                self._official_tx_final_settlement(
+                    delivery_date=held_last_trading_date,
+                    delivery_month=held_delivery_month,
+                )
+                if expired and held_last_trading_date is not None
+                else None
+            )
+            old_exit_price = (
+                float(official_settlement["price"])
+                if official_settlement is not None
+                else old_bid
+                if not expired
+                else None
+            )
+            if old_exit_price is not None and current_ask is not None:
                 entry = float(row["entry_price"])
                 row["realized_gross_pnl_twd"] = (
                     float(row.get("realized_gross_pnl_twd") or 0.0)
-                    + (old_bid - entry) * multiplier
+                    + (old_exit_price - entry) * multiplier
                 )
+                old_exit_fee = 0.0 if official_settlement is not None else fee_per_side
                 row["fixed_fees_twd"] = (
-                    float(row.get("fixed_fees_twd") or 0.0) + 2.0 * fee_per_side
+                    float(row.get("fixed_fees_twd") or 0.0)
+                    + old_exit_fee
+                    + fee_per_side
                 )
                 row["transaction_tax_twd"] = (
                     float(row.get("transaction_tax_twd") or 0.0)
-                    + self._tx_trade_tax(old_bid, trading_date=now.date())
+                    + self._tx_trade_tax(
+                        old_exit_price,
+                        trading_date=held_last_trading_date or now.date(),
+                    )
                     + self._tx_trade_tax(current_ask, trading_date=now.date())
                 )
                 row.update(
@@ -942,14 +1545,95 @@ class TwDayTradeSimulationEngine:
                         "previous_contract_code": held_code,
                         "contract_code": current_code,
                         "entry_price": current_ask,
+                        "current_contract_entry_price": current_ask,
+                        "current_contract_entry_at": now.isoformat(
+                            timespec="seconds"
+                        ),
                         "last_roll_at": now.isoformat(timespec="seconds"),
+                        "last_roll_old_bid": (
+                            old_bid if official_settlement is None else None
+                        ),
+                        "last_roll_old_price": old_exit_price,
+                        "last_roll_old_price_source": (
+                            "official_taifex_index_final_settlement"
+                            if official_settlement is not None
+                            else "executable_old_contract_bid"
+                        ),
+                        "last_roll_official_final_settlement": (
+                            official_settlement["price"]
+                            if official_settlement is not None
+                            else None
+                        ),
+                        "last_roll_official_settlement_source_file": (
+                            official_settlement["source_file"]
+                            if official_settlement is not None
+                            else None
+                        ),
+                        "last_roll_official_settlement_source_sha256": (
+                            official_settlement["source_sha256"]
+                            if official_settlement is not None
+                            else None
+                        ),
+                        "last_roll_new_ask": current_ask,
                         "roll_count": int(row.get("roll_count") or 0) + 1,
                     }
+                )
+                update_contract_identity(row, current_quote)
+                roll_history = list(row.get("roll_history") or ())
+                roll_history.append(
+                    {
+                        "rolled_at": now.isoformat(timespec="seconds"),
+                        "from_contract": held_code,
+                        "to_contract": current_code,
+                        "old_bid": old_bid if official_settlement is None else None,
+                        "old_exit_price": old_exit_price,
+                        "old_exit_price_source": (
+                            "official_taifex_index_final_settlement"
+                            if official_settlement is not None
+                            else "executable_old_contract_bid"
+                        ),
+                        "official_final_settlement": official_settlement,
+                        "new_ask": current_ask,
+                        "old_exit_fee_twd": old_exit_fee,
+                        "new_entry_fee_twd": fee_per_side,
+                    }
+                )
+                row["roll_history"] = roll_history[-100:]
+                row["roll_blocked_reason"] = None
+                _append_jsonl(
+                    self.events_path,
+                    {
+                        "event": "benchmark_tx_continuous_rolled",
+                        "recorded_at": now.isoformat(timespec="seconds"),
+                        "from_contract": held_code,
+                        "to_contract": current_code,
+                        "old_exit_price": old_exit_price,
+                        "old_exit_price_source": row[
+                            "last_roll_old_price_source"
+                        ],
+                        "new_entry_ask": current_ask,
+                        "official_final_settlement": official_settlement,
+                        "realized_gross_pnl_twd": row[
+                            "realized_gross_pnl_twd"
+                        ],
+                        "roll_contract_version": (
+                            TX_CONTINUOUS_ROLL_CONTRACT_VERSION
+                        ),
+                    },
                 )
                 held_code = current_code
             else:
                 row["valuation_stale"] = True
-                row["valuation_source"] = "roll_waiting_for_old_bid_and_new_ask"
+                if expired and official_settlement is None:
+                    row["roll_blocked_reason"] = self._tx_final_settlement_error
+                    row["valuation_source"] = (
+                        "roll_waiting_for_official_final_settlement_and_new_ask"
+                    )
+                else:
+                    row["roll_blocked_reason"] = (
+                        "missing_old_bid" if old_bid is None else "missing_new_ask"
+                    )
+                    row["valuation_source"] = "roll_waiting_for_old_bid_and_new_ask"
                 self._append_benchmark_mark(row, now=now)
                 return
 
@@ -986,7 +1670,10 @@ class TwDayTradeSimulationEngine:
                     if return_fraction is None
                     else return_fraction * 100.0,
                     "valuation_stale": False,
-                    "valuation_source": "one_tx_ask_entry_bid_liquidation_with_roll_fee_and_tax",
+                    "valuation_source": (
+                        "one_tx_ask_entry_bid_liquidation_with_official_expiry_"
+                        "settlement_roll_fee_and_tax"
+                    ),
                     "source": current_quote.get("source"),
                 }
             )
@@ -1003,11 +1690,13 @@ class TwDayTradeSimulationEngine:
         current_future_contract_code: str | None,
         current_future_quote: Mapping[str, Any] | None,
         previous_future_quote: Mapping[str, Any] | None = None,
+        corporate_action_reference_path: str | Path | None = None,
         now: datetime | None = None,
     ) -> None:
         """Advance three independent, executable-price comparison ledgers."""
 
         observed = _now_taipei(now)
+        self._load_corporate_actions(corporate_action_reference_path)
         for benchmark_id, symbol, label, security_type in STOCK_BENCHMARKS:
             self._mark_stock_benchmark(
                 benchmark_id=benchmark_id,
@@ -1044,6 +1733,7 @@ class TwDayTradeSimulationEngine:
         mode["checkpoint_path"] = spec.checkpoint_path
         mode["live_output_dir"] = str(spec.live_output_dir)
         mode["signal_market"] = spec.signal_market or spec.market
+        mode["executed_positions_path"] = str(self.positions_path)
         mode["price_limit_offset_ticks"] = int(spec.price_limit_offset_ticks)
         mode["bracket_price_policy"] = (
             "inside_daily_limits_by_ticks"
@@ -1086,6 +1776,13 @@ class TwDayTradeSimulationEngine:
                     if observed.timetz().replace(tzinfo=None) >= FORCE_EXIT_TIME
                     else "active"
                 )
+            elif (
+                mode.get("session_valid") is False
+                and str(mode.get("session_date") or "")
+                == observed.date().isoformat()
+                and mode.get("non_session_invalidated_at")
+            ):
+                mode["engine_status"] = "invalid_non_trading_session"
             elif not checkpoint_ready:
                 mode["engine_status"] = "blocked_missing_checkpoint"
             elif str(
@@ -1165,6 +1862,7 @@ class TwDayTradeSimulationEngine:
         mode["rearm_count"] = int(mode.get("rearm_count") or 0) + 1
         self._event(
             "flat_session_rearmed",
+            recorded_at=observed,
             market=market,
             session_date=session_date,
             reason=normalized_reason,
@@ -1174,6 +1872,59 @@ class TwDayTradeSimulationEngine:
         )
         self._persist(observed)
         return "rearmed"
+
+    def invalidate_non_session_flat_signal(
+        self,
+        market: str,
+        *,
+        now: datetime | None = None,
+        reason: str,
+    ) -> str:
+        """Void an impossible non-session signal without deleting its audit trail."""
+
+        observed = _now_taipei(now)
+        normalized_reason = str(reason or "").strip()
+        if not normalized_reason:
+            raise ValueError("non-session invalidation requires an audit reason")
+        mode = (self.state.get("modes") or {}).get(str(market))
+        if not isinstance(mode, dict):
+            raise KeyError(f"unknown simulation market: {market}")
+        session_date = str(mode.get("session_date") or "")
+        if session_date != observed.date().isoformat():
+            return "no_current_session_signal"
+        if mode.get("non_session_invalidated_at"):
+            return "already_invalidated"
+        if mode.get("positions"):
+            raise RuntimeError(
+                f"{market} has positions; non-session signal cannot be auto-invalidated"
+            )
+        if self._session_has_fill(str(market), session_date):
+            raise RuntimeError(
+                f"{market} has fills; non-session signal cannot be auto-invalidated"
+            )
+        previous_signal_id = mode.get("signal_id")
+        previous_entry_completed_at = mode.get("entry_completed_at")
+        mode["entry_completed_at"] = None
+        mode["pending_signal_id"] = None
+        mode["pending_signal_at"] = None
+        mode["engine_status"] = "invalid_non_trading_session"
+        mode["blocked_reason"] = "non_trading_session"
+        mode["session_valid"] = False
+        mode["non_session_invalidated_at"] = observed.isoformat(timespec="seconds")
+        mode["non_session_invalidation_reason"] = normalized_reason
+        self._event(
+            "non_session_signal_invalidated",
+            recorded_at=observed,
+            market=market,
+            session_date=session_date,
+            signal_id=previous_signal_id,
+            reason=normalized_reason,
+            previous_entry_completed_at=previous_entry_completed_at,
+            positions=0,
+            fills=0,
+        )
+        self._persist(observed)
+        return "invalidated"
 
     def retire_flat_mode(
         self,
@@ -1204,6 +1955,7 @@ class TwDayTradeSimulationEngine:
         modes.pop(normalized_market)
         self._event(
             "simulation_mode_retired",
+            recorded_at=observed,
             market=normalized_market,
             reason=normalized_reason,
         )
@@ -1227,10 +1979,16 @@ class TwDayTradeSimulationEngine:
                     return True
         return False
 
-    def _event(self, event: str, **payload: Any) -> None:
+    def _event(
+        self,
+        event: str,
+        *,
+        recorded_at: datetime | None = None,
+        **payload: Any,
+    ) -> None:
         _append_jsonl(
             self.events_path,
-            {"recorded_at": _iso(), "event": event, **payload},
+            {"recorded_at": _iso(recorded_at), "event": event, **payload},
         )
 
     def _order(self, payload: Mapping[str, Any]) -> None:
@@ -1238,6 +1996,130 @@ class TwDayTradeSimulationEngine:
 
     def _fill(self, payload: Mapping[str, Any]) -> None:
         _append_jsonl(self.fills_path, payload)
+
+    def record_latency_sample(
+        self,
+        *,
+        market: str,
+        signal_id: str,
+        result: str,
+        summary: Mapping[str, Any],
+        consumer_detected_at: datetime,
+        ledger_persisted_at: datetime,
+        executor_quote_fetch_ms: float,
+        eligibility_load_ms: float,
+        ledger_compute_persist_ms: float,
+    ) -> None:
+        """Persist one measured input-to-ledger sample for the public panel."""
+
+        started_at = _parse_timestamp(
+            summary.get("signal_started_at") or summary.get("generated_at")
+        )
+        ready_at = _parse_timestamp(
+            summary.get("signal_ready_at")
+            or summary.get("artifact_published_at")
+            or summary.get("generated_at")
+        )
+        published_at = _parse_timestamp(
+            summary.get("artifact_published_at") or summary.get("signal_ready_at")
+        )
+        live_latency = dict(summary.get("live_latency") or {})
+        signal_quote_ms = _finite(live_latency.get("quote_fetch_ms"))
+        model_inference_ms = _finite(live_latency.get("model_inference_ms"))
+        signal_total_ms = _finite(live_latency.get("compute_before_publish_ms"))
+        detailed_signal_stages = {
+            "signal_pre_quote_prepare_ms": _finite(
+                live_latency.get("pre_quote_prepare_ms")
+            ),
+            "signal_pre_inference_prepare_ms": _finite(
+                live_latency.get("pre_inference_prepare_ms")
+            ),
+            "signal_post_inference_format_ms": _finite(
+                live_latency.get("post_inference_format_ms")
+            ),
+        }
+        has_detailed_signal_stages = any(
+            value is not None for value in detailed_signal_stages.values()
+        )
+        signal_other_ms = None
+        if signal_total_ms is not None and not has_detailed_signal_stages:
+            signal_other_ms = max(
+                0.0,
+                signal_total_ms
+                - float(signal_quote_ms or 0.0)
+                - float(model_inference_ms or 0.0),
+            )
+
+        def elapsed_ms(start: datetime | None, end: datetime | None) -> float | None:
+            if start is None or end is None:
+                return None
+            return round(max(0.0, (end - start).total_seconds() * 1000.0), 3)
+
+        stages = {
+            **detailed_signal_stages,
+            "signal_quote_fetch_ms": signal_quote_ms,
+            "model_inference_ms": model_inference_ms,
+            "signal_other_compute_ms": signal_other_ms,
+            "artifact_publish_ms": _finite(
+                live_latency.get("artifact_publish_ms")
+            ),
+            "artifact_discovery_ms": elapsed_ms(
+                published_at, consumer_detected_at
+            ),
+            "eligibility_load_ms": round(max(0.0, eligibility_load_ms), 3),
+            "executor_quote_fetch_ms": round(max(0.0, executor_quote_fetch_ms), 3),
+            "ledger_compute_persist_ms": round(
+                max(0.0, ledger_compute_persist_ms), 3
+            ),
+        }
+        finite_stages = {
+            key: float(value)
+            for key, value in stages.items()
+            if value is not None and math.isfinite(float(value))
+        }
+        bottleneck = (
+            max(finite_stages, key=finite_stages.get) if finite_stages else None
+        )
+        _append_jsonl(
+            self.latency_path,
+            {
+                "schema_version": 1,
+                "recorded_at": ledger_persisted_at.isoformat(timespec="microseconds"),
+                "session_date": ledger_persisted_at.astimezone(TAIPEI)
+                .date()
+                .isoformat(),
+                "market": market,
+                "signal_id": signal_id,
+                "result": result,
+                "simulation_only": True,
+                "measurement_boundary": "signal_input_to_simulation_ledger_persisted",
+                "signal_started_at": started_at.isoformat(timespec="microseconds")
+                if started_at
+                else None,
+                "signal_ready_at": ready_at.isoformat(timespec="microseconds")
+                if ready_at
+                else None,
+                "artifact_published_at": published_at.isoformat(
+                    timespec="microseconds"
+                )
+                if published_at
+                else None,
+                "consumer_detected_at": consumer_detected_at.isoformat(
+                    timespec="microseconds"
+                ),
+                "ledger_persisted_at": ledger_persisted_at.isoformat(
+                    timespec="microseconds"
+                ),
+                "input_to_ledger_ms": elapsed_ms(started_at, ledger_persisted_at),
+                "ready_to_ledger_ms": elapsed_ms(ready_at, ledger_persisted_at),
+                "signal_compute_total_ms": signal_total_ms,
+                "stages": stages,
+                "bottleneck_stage": bottleneck,
+                "bottleneck_ms": finite_stages.get(bottleneck)
+                if bottleneck
+                else None,
+            },
+        )
 
     @staticmethod
     def _entry_and_exit_rates(
@@ -1285,6 +2167,7 @@ class TwDayTradeSimulationEngine:
         eligibility: Mapping[str, LiveEligibility],
         eligibility_coverage: Mapping[str, Any],
         now: datetime | None = None,
+        counterfactual_open_replay: bool = False,
     ) -> str:
         observed = _now_taipei(now)
         mode = self._mode(spec)
@@ -1295,29 +2178,58 @@ class TwDayTradeSimulationEngine:
             return "already_processed"
         if str(summary.get("execution_mode") or "") != "tw_day_trade":
             return self._block_signal(mode, signal_id, "not_tw_day_trade", observed)
-        signal_at = _parse_timestamp(
-            summary.get("generated_at") or summary.get("asof_date")
+        source_signal_at = _parse_timestamp(
+            summary.get("signal_started_at")
+            or summary.get("generated_at")
+            or summary.get("asof_date")
         )
-        if signal_at is None:
+        if source_signal_at is None:
             return self._block_signal(
                 mode, signal_id, "invalid_signal_timestamp", observed
             )
-        if signal_at.date() != observed.date():
+        if source_signal_at.date() != observed.date():
             return self._block_signal(
                 mode, signal_id, "signal_not_current_session", observed
             )
         wall_time = observed.timetz().replace(tzinfo=None)
+        if counterfactual_open_replay:
+            if not bool(summary.get("simulation_replay")):
+                raise ValueError(
+                    "counterfactual open replay requires simulation_replay=true"
+                )
+            if str(summary.get("entry_fill_contract") or "") != (
+                "retrospective_actual_session_open_price_counterfactual"
+            ):
+                raise ValueError(
+                    "counterfactual open replay requires the retrospective "
+                    "session-open fill contract"
+                )
+            if wall_time != ENTRY_GATE:
+                raise ValueError(
+                    "counterfactual open replay must be recorded exactly at 09:00"
+                )
+            signal_at = observed
+        else:
+            signal_at = _parse_timestamp(
+                summary.get("signal_ready_at")
+                or summary.get("artifact_published_at")
+                or summary.get("generated_at")
+            )
+            if signal_at is None:
+                return self._block_signal(
+                    mode, signal_id, "invalid_signal_ready_timestamp", observed
+                )
         if wall_time < ENTRY_GATE or wall_time >= EXIT_LIMIT_TIME:
             return self._block_signal(mode, signal_id, "outside_entry_window", observed)
-        if wall_time < FIRST_MINUTE_EXECUTION_TIME:
-            mode["pending_signal_id"] = signal_id
-            mode["pending_signal_at"] = signal_at.isoformat(timespec="seconds")
-            mode["engine_status"] = "waiting_first_completed_minute"
-            self._persist(observed)
-            return "waiting_first_minute"
         if not bool(summary.get("live_session_open_feature_applied")):
             return self._block_signal(
                 mode, signal_id, "open_feature_not_observed", observed
+            )
+        if str(
+            mode.get("session_date") or ""
+        ) == observed.date().isoformat() and mode.get("entry_completed_at"):
+            return self._block_signal(
+                mode, signal_id, "daily_signal_already_consumed", observed
             )
         if any(
             int(position.get("signed_shares") or 0) != 0
@@ -1330,22 +2242,49 @@ class TwDayTradeSimulationEngine:
                 observed,
                 engine_status="critical_prior_position_unflattened",
             )
-        if str(
-            mode.get("session_date") or ""
-        ) == observed.date().isoformat() and mode.get("entry_completed_at"):
-            return self._block_signal(
-                mode, signal_id, "daily_signal_already_consumed", observed
-            )
 
-        actionable_symbols = [
-            str(row.get("symbol") or "")
-            for row in signal_rows
-            if abs(float(row.get("target_weight") or 0.0)) > 0.0
-        ]
+        actionable_symbols: list[str] = []
+        for row in signal_rows:
+            symbol = str(row.get("symbol") or "")
+            weight = float(row.get("target_weight") or 0.0)
+            side_allowed = bool(row.get("can_buy")) if weight > 0.0 else bool(
+                row.get("can_sell")
+            )
+            evidence = eligibility.get(symbol)
+            sizing_price = _finite(row.get("open_price")) or _finite(
+                quotes.get(symbol, {}).get("open")
+            )
+            if (
+                not symbol
+                or weight == 0.0
+                or not bool(row.get("tradable"))
+                or not side_allowed
+                or evidence is None
+                or not evidence.covered
+                or not evidence.eligible
+                or (weight < 0.0 and not evidence.short_open)
+                or sizing_price is None
+            ):
+                continue
+            requested_shares = int(
+                math.floor(
+                    abs(weight)
+                    * float(spec.initial_capital_twd)
+                    / sizing_price
+                    / int(spec.lot_size)
+                )
+            ) * int(spec.lot_size)
+            if requested_shares > 0:
+                actionable_symbols.append(symbol)
         later_quote_found = any(
             (quote_at := _parse_timestamp(quotes.get(symbol, {}).get("quote_at")))
             is not None
-            and quote_at > signal_at
+            and quote_at <= observed
+            and (
+                quote_at >= signal_at
+                if counterfactual_open_replay
+                else quote_at > signal_at
+            )
             for symbol in actionable_symbols
         )
         if actionable_symbols and not later_quote_found:
@@ -1373,19 +2312,53 @@ class TwDayTradeSimulationEngine:
             fee_schedule=spec.fee_schedule,
         )
 
+        prior_session_date = str(mode.get("session_date") or "")
+        if prior_session_date and prior_session_date != observed.date().isoformat():
+            self._archive_mode_positions(mode, archived_at=observed)
+
         mode["session_date"] = observed.date().isoformat()
+        mode["session_valid"] = True
+        mode.pop("non_session_invalidated_at", None)
+        mode.pop("non_session_invalidation_reason", None)
+        mode["blocked_reason"] = None
         mode["signal_id"] = signal_id
         mode["signal_at"] = signal_at.isoformat(timespec="seconds")
+        mode["source_signal_at"] = source_signal_at.isoformat(timespec="seconds")
+        mode["counterfactual_open_replay"] = bool(counterfactual_open_replay)
         mode["signal_source_path"] = summary.get("summary_path")
+        mode["target_weights_path"] = summary.get("weights_path")
+        mode["target_positions_path"] = (
+            summary.get("positions_markdown_path") or summary.get("weights_path")
+        )
+        mode["target_symbol_count"] = summary.get("symbol_count") or len(signal_rows)
+        mode["target_risk"] = dict(summary.get("target_risk") or {})
         mode["feature_cutoff_date"] = summary.get("feature_cutoff_date")
         mode["checkpoint_fingerprint"] = summary.get("checkpoint_fingerprint")
         mode["config_fingerprint"] = summary.get("config_fingerprint")
         mode["eligibility_coverage"] = dict(eligibility_coverage)
+        mode["simulation_replay"] = bool(summary.get("simulation_replay", False))
+        mode["replay_basis"] = summary.get("replay_basis")
+        mode["replay_source"] = summary.get("replay_source")
+        mode["entry_fill_contract"] = summary.get("entry_fill_contract") or (
+            "best_ask_for_buy_best_bid_for_sell"
+        )
+        mode["entry_liquidity_assumption"] = summary.get(
+            "entry_liquidity_assumption"
+        ) or "09:00_fresh_level_one_depth_then_minimum_with_50pct_completed_minute_volume"
         mode["positions"] = {}
         mode["entry_completed_at"] = observed.isoformat(timespec="seconds")
         mode["exit_limit_submitted_at"] = None
         mode["force_exit_started_at"] = None
+        mode["closing_auction_submitted_at"] = None
+        mode["closing_auction_settled_at"] = None
+        mode["residual_conversion_completed_at"] = None
+        mode["force_exit_failures"] = 0
+        mode["terminal_flatten_count"] = 0
+        mode["terminal_flatten_degraded_count"] = 0
         counts: dict[str, int] = {}
+        signal_records: list[dict[str, Any]] = []
+        order_records: list[dict[str, Any]] = []
+        fill_records: list[dict[str, Any]] = []
 
         plans = [
             _prepare_entry_plan(
@@ -1393,7 +2366,9 @@ class TwDayTradeSimulationEngine:
                 quote=quotes.get(str(row.get("symbol") or "")) or {},
                 evidence=eligibility.get(str(row.get("symbol") or "")),
                 signal_at=signal_at,
+                observation_at=observed,
                 spec=spec,
+                allow_quote_at_signal=counterfactual_open_replay,
             )
             for row in signal_rows
             if str(row.get("symbol") or "")
@@ -1470,6 +2445,7 @@ class TwDayTradeSimulationEngine:
                 "price_limit_offset_ticks": offset_ticks,
                 "signal_id": signal_id,
                 "signal_at": signal_at.isoformat(timespec="seconds"),
+                "source_signal_at": source_signal_at.isoformat(timespec="seconds"),
                 "symbol": symbol,
                 "name": row.get("name"),
                 "side": side,
@@ -1478,6 +2454,8 @@ class TwDayTradeSimulationEngine:
                 "raw_score": row.get("raw_score"),
                 "target_weight": target_weight,
                 "requested_shares": requested_shares,
+                "executable_order_shares": filled_shares,
+                "target_unsubmitted_shares": max(0, requested_shares - filled_shares),
                 "sizing_open_price": sizing_price,
                 "execution_price": entry_price,
                 "filled_shares": filled_shares,
@@ -1503,8 +2481,12 @@ class TwDayTradeSimulationEngine:
                 "eligibility_covered": bool(evidence and evidence.covered),
                 "day_trade_eligible": bool(evidence and evidence.eligible),
                 "sell_first_allowed": bool(evidence and evidence.short_open),
+                "quote_source": quote.get("source"),
+                "simulation_replay": bool(mode.get("simulation_replay")),
+                "replay_basis": mode.get("replay_basis"),
+                "counterfactual_open_replay": bool(counterfactual_open_replay),
             }
-            _append_jsonl(self.signals_path, signal_record)
+            signal_records.append(signal_record)
             counts[status] = counts.get(status, 0) + 1
             if (
                 status
@@ -1548,11 +2530,15 @@ class TwDayTradeSimulationEngine:
                 "signal_market": spec.signal_market or spec.market,
                 "session_date": observed.date().isoformat(),
                 "signal_id": signal_id,
+                "signal_at": signal_at.isoformat(timespec="seconds"),
+                "source_signal_at": source_signal_at.isoformat(timespec="seconds"),
                 "symbol": symbol,
                 "name": row.get("name"),
                 "side": side,
                 "target_weight": target_weight,
                 "requested_shares": requested_shares,
+                "executable_order_shares": filled_shares,
+                "target_unsubmitted_shares": max(0, requested_shares - filled_shares),
                 "pre_balance_filled_shares": int(plan["pre_balance_filled_shares"]),
                 "filled_shares": filled_shares,
                 "signed_shares": signed_shares,
@@ -1597,6 +2583,10 @@ class TwDayTradeSimulationEngine:
                 "realized_exit_fee_twd": 0.0,
                 "realized_net_pnl_twd": 0.0,
                 "valuation_stale": False,
+                "simulation_replay": bool(mode.get("simulation_replay")),
+                "replay_basis": mode.get("replay_basis"),
+                "replay_source": mode.get("replay_source"),
+                "counterfactual_open_replay": bool(counterfactual_open_replay),
             }
             mode["positions"][position_id] = position
             mode["cumulative_commission_rebate_accrued_twd"] = (
@@ -1611,24 +2601,26 @@ class TwDayTradeSimulationEngine:
                 "price_limit_offset_ticks": offset_ticks,
                 "position_id": position_id,
                 "symbol": symbol,
-                "quantity": requested_shares,
+                "quantity": filled_shares,
                 "simulation_only": True,
             }
-            self._order(
+            order_records.append(
                 {
                     **order_base,
                     "order_id": entry_order_id,
                     "purpose": "entry",
                     "side": "buy" if side == "long" else "sell_short",
                     "order_type": "MKT",
-                    "status": "filled"
-                    if filled_shares == requested_shares
-                    else "part_filled",
+                    "status": "filled",
                     "filled_quantity": filled_shares,
-                    "unfilled_quantity": requested_shares - filled_shares,
+                    "unfilled_quantity": 0,
+                    "model_requested_quantity": requested_shares,
+                    "target_unsubmitted_quantity": max(
+                        0, requested_shares - filled_shares
+                    ),
                 }
             )
-            self._fill(
+            fill_records.append(
                 {
                     **order_base,
                     "order_id": entry_order_id,
@@ -1640,8 +2632,10 @@ class TwDayTradeSimulationEngine:
                     "fee_and_tax_twd": entry_fee,
                     "gross_fee_and_tax_twd": entry_gross_fee,
                     "commission_rebate_accrued_twd": entry_rebate,
-                    "fill_contract": "best_ask_for_buy_best_bid_for_sell",
-                    "depth_assumption": "minimum_of_level_one_displayed_volume_and_50pct_completed_minute_kbar_volume",
+                    "fill_contract": mode.get("entry_fill_contract"),
+                    "depth_assumption": mode.get("entry_liquidity_assumption"),
+                    "simulation_replay": bool(mode.get("simulation_replay")),
+                    "replay_basis": mode.get("replay_basis"),
                 }
             )
             for purpose, order_type, price, order_status in (
@@ -1653,7 +2647,7 @@ class TwDayTradeSimulationEngine:
                     "armed",
                 ),
             ):
-                self._order(
+                order_records.append(
                     {
                         **order_base,
                         "order_id": f"{position_id}:{purpose}",
@@ -1665,6 +2659,13 @@ class TwDayTradeSimulationEngine:
                         "status": order_status,
                     }
                 )
+
+        # One signal is one logical append transaction per ledger. This keeps
+        # every row durable before state.json points at the accepted signal,
+        # while avoiding thousands of per-row fsync calls on the 09:00 path.
+        _append_jsonl_many(self.signals_path, signal_records)
+        _append_jsonl_many(self.orders_path, order_records)
+        _append_jsonl_many(self.fills_path, fill_records)
 
         processed = list(mode.get("processed_signal_ids") or ())
         processed.append(signal_id)
@@ -1685,10 +2686,15 @@ class TwDayTradeSimulationEngine:
         )
         self._event(
             "signal_registered",
+            recorded_at=observed,
             market=spec.market,
             signal_id=signal_id,
             counts=counts,
             execution_projection=asdict(directional_mix),
+            simulation_replay=bool(mode.get("simulation_replay")),
+            replay_basis=mode.get("replay_basis"),
+            source_signal_at=source_signal_at.isoformat(timespec="seconds"),
+            counterfactual_open_replay=bool(counterfactual_open_replay),
         )
         self._mark_mode(spec.market, observed, quotes)
         self._persist(observed)
@@ -1706,11 +2712,27 @@ class TwDayTradeSimulationEngine:
         processed = list(mode.get("processed_signal_ids") or ())
         processed.append(signal_id)
         mode["processed_signal_ids"] = processed[-32:]
+        if reason == "daily_signal_already_consumed":
+            mode["last_duplicate_signal_id"] = signal_id
+            mode["last_duplicate_signal_reason"] = reason
+            mode["last_duplicate_signal_blocked_at"] = now.isoformat(
+                timespec="seconds"
+            )
+            self._event(
+                "signal_blocked",
+                recorded_at=now,
+                market=mode.get("market"),
+                signal_id=signal_id,
+                reason=reason,
+            )
+            self._persist(now)
+            return "blocked"
         mode["signal_id"] = signal_id
         mode["engine_status"] = engine_status
         mode["blocked_reason"] = reason
         self._event(
             "signal_blocked",
+            recorded_at=now,
             market=mode.get("market"),
             signal_id=signal_id,
             reason=reason,
@@ -1723,6 +2745,7 @@ class TwDayTradeSimulationEngine:
         *,
         quotes: Mapping[str, Mapping[str, Any]],
         now: datetime | None = None,
+        append_mark_history: bool = True,
     ) -> None:
         observed = _now_taipei(now)
         wall_time = observed.timetz().replace(tzinfo=None)
@@ -1732,10 +2755,41 @@ class TwDayTradeSimulationEngine:
                 int(position.get("signed_shares") or 0) != 0
                 for position in positions.values()
             ):
-                self._mark_mode(market, observed, quotes)
-                mode["engine_status"] = (
-                    "critical_legacy_position_requires_reconciliation"
+                # Schema-migrated positions may only be reduced.  Reuse the
+                # ordinary bracket close path once a real executable quote and
+                # completed-minute capacity exist; never open or enlarge a
+                # legacy position merely to unblock the next session.
+                for position in positions.values():
+                    if int(position.get("signed_shares") or 0) == 0:
+                        continue
+                    quote = quotes.get(str(position.get("symbol"))) or {}
+                    self._apply_bracket(position, mode, quote, observed)
+                self._mark_mode(
+                    market,
+                    observed,
+                    quotes,
+                    append_history=append_mark_history,
                 )
+                still_open = any(
+                    int(position.get("signed_shares") or 0) != 0
+                    for position in positions.values()
+                )
+                if still_open:
+                    mode["engine_status"] = (
+                        "critical_legacy_position_requires_reconciliation"
+                    )
+                else:
+                    mode["legacy_execution_contract"] = False
+                    mode["legacy_reconciled_at"] = observed.isoformat(
+                        timespec="seconds"
+                    )
+                    mode["engine_status"] = "waiting_signal"
+                    self._event(
+                        "legacy_positions_reconciled",
+                        recorded_at=observed,
+                        market=market,
+                        session_date=observed.date().isoformat(),
+                    )
                 continue
             if wall_time < EXIT_LIMIT_TIME:
                 for position in positions.values():
@@ -1755,7 +2809,12 @@ class TwDayTradeSimulationEngine:
                 self._submit_closing_auction_limits(market, mode, observed)
                 self._settle_closing_auction(market, mode, quotes, observed)
                 self._convert_residual_to_carry(market, mode, quotes, observed)
-            self._mark_mode(market, observed, quotes)
+            self._mark_mode(
+                market,
+                observed,
+                quotes,
+                append_history=append_mark_history,
+            )
         self._persist(observed)
 
     def _apply_bracket(
@@ -1855,7 +2914,7 @@ class TwDayTradeSimulationEngine:
                 now=now,
                 purpose="13_20_exit_limit",
             )
-        self._event("exit_limits_submitted", market=market)
+        self._event("exit_limits_submitted", recorded_at=now, market=market)
 
     def _place_exit_limit(
         self,
@@ -1946,6 +3005,49 @@ class TwDayTradeSimulationEngine:
                     order_type="LMT",
                     quantity=capacity,
                 )
+                continue
+            # The user's 13:20 contract is to remain at the passive best quote,
+            # not merely to preserve the price observed exactly at 13:20. Once
+            # per new minute, an unfilled order is cancel-replaced to the
+            # current ask for a sell or bid for a buy-to-cover.
+            passive_price = _finite(quote.get("ask" if side == "long" else "bid"))
+            if passive_price is None or math.isclose(
+                passive_price,
+                limit_price,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            ):
+                continue
+            previous_price = limit_price
+            position["eod_limit_price"] = passive_price
+            position["eod_limit_submitted_at"] = now.isoformat(timespec="seconds")
+            position["eod_limit_order_status"] = "working"
+            position["eod_limit_reprice_count"] = int(
+                position.get("eod_limit_reprice_count") or 0
+            ) + 1
+            self._order(
+                {
+                    "recorded_at": now.isoformat(timespec="seconds"),
+                    "session_date": mode.get("session_date"),
+                    "market": mode.get("market"),
+                    "position_id": position.get("position_id"),
+                    "symbol": position.get("symbol"),
+                    "order_id": (
+                        f"{position.get('position_id')}:eod_limit:"
+                        f"reprice:{int(position['eod_limit_reprice_count'])}"
+                    ),
+                    "replaces_order_id": f"{position.get('position_id')}:eod_limit",
+                    "purpose": "13_20_exit_limit_reprice",
+                    "side": "sell" if side == "long" else "buy_to_cover",
+                    "order_type": "LMT",
+                    "previous_price": previous_price,
+                    "price": passive_price,
+                    "quantity": abs(int(position.get("signed_shares") or 0)),
+                    "status": "working",
+                    "simulation_only": True,
+                    "pricing_rule": "follow_passive_best_until_13_24",
+                }
+            )
 
     def _force_exit(
         self,
@@ -1956,7 +3058,7 @@ class TwDayTradeSimulationEngine:
     ) -> None:
         if not mode.get("force_exit_started_at"):
             mode["force_exit_started_at"] = now.isoformat(timespec="seconds")
-            self._event("force_exit_started", market=market)
+            self._event("force_exit_started", recorded_at=now, market=market)
         failures = 0
         for position in (mode.get("positions") or {}).values():
             if int(position.get("signed_shares") or 0) == 0:
@@ -1964,16 +3066,19 @@ class TwDayTradeSimulationEngine:
             quote = quotes.get(str(position.get("symbol"))) or {}
             side = str(position.get("side"))
             executable = _finite(quote.get("bid" if side == "long" else "ask"))
-            capacity = _executable_capacity_shares(
+            capacity = _force_exit_retry_capacity_shares(
+                position,
                 quote,
                 transaction_side="sell" if side == "long" else "buy",
                 lot_size=int(position.get("lot_size") or 1_000),
+                now=now,
             )
             if executable is None or capacity <= 0:
                 failures += 1
                 position["status"] = "force_exit_unfilled_no_executable_depth"
                 position["eod_limit_order_status"] = "cancelled_at_13_24"
                 continue
+            before = abs(int(position.get("signed_shares") or 0))
             self._close_position(
                 position,
                 mode,
@@ -1983,6 +3088,10 @@ class TwDayTradeSimulationEngine:
                 reason="13_24_market_force_exit",
                 order_type="MKT",
                 quantity=capacity,
+            )
+            filled = before - abs(int(position.get("signed_shares") or 0))
+            position["force_exit_minute_consumed_shares"] = (
+                int(position.get("force_exit_minute_consumed_shares") or 0) + filled
             )
             if int(position.get("signed_shares") or 0) != 0:
                 failures += 1
@@ -2004,7 +3113,10 @@ class TwDayTradeSimulationEngine:
         13:30 auction result and never treats the indicative book as a fill.
         """
 
-        if mode.get("closing_auction_submitted_at"):
+        session_date = str(mode.get("session_date") or now.date().isoformat())
+        if _timestamp_is_for_session(
+            mode.get("closing_auction_submitted_at"), session_date
+        ):
             return
         mode["closing_auction_submitted_at"] = now.isoformat(timespec="seconds")
         submitted = 0
@@ -2047,6 +3159,7 @@ class TwDayTradeSimulationEngine:
             )
         self._event(
             "closing_auction_limits_submitted",
+            recorded_at=now,
             market=market,
             submitted=submitted,
         )
@@ -2058,7 +3171,10 @@ class TwDayTradeSimulationEngine:
         quotes: Mapping[str, Mapping[str, Any]],
         now: datetime,
     ) -> None:
-        if mode.get("closing_auction_settled_at"):
+        session_date = str(mode.get("session_date") or now.date().isoformat())
+        if _timestamp_is_for_session(
+            mode.get("closing_auction_settled_at"), session_date
+        ):
             return
         mode["closing_auction_settled_at"] = now.isoformat(timespec="seconds")
         for position in (mode.get("positions") or {}).values():
@@ -2091,7 +3207,7 @@ class TwDayTradeSimulationEngine:
                 position["closing_auction_order_status"] = "filled"
             else:
                 position["closing_auction_order_status"] = "part_filled"
-        self._event("closing_auction_settled", market=market)
+        self._event("closing_auction_settled", recorded_at=now, market=market)
 
     def _convert_residual_to_carry(
         self,
@@ -2100,95 +3216,74 @@ class TwDayTradeSimulationEngine:
         quotes: Mapping[str, Mapping[str, Any]],
         now: datetime,
     ) -> None:
-        """Reclassify 13:30 residuals and charge conservative maximum costs."""
+        """Close every residual in the simulation's terminal ledger pass.
 
-        if mode.get("residual_conversion_completed_at"):
+        The executable auction path remains separately audited above.  This
+        final simulation-only pass enforces the product contract requested by
+        the operator: a day-trade mode cannot carry an open position past the
+        session close.  Residuals are valued at the observed close when
+        available, otherwise at a conservative adverse legal limit, the last
+        complete mark, or finally the entry price.  These rows are explicitly
+        labelled as terminal ledger settlement rather than exchange fills.
+        """
+
+        session_date = str(mode.get("session_date") or now.date().isoformat())
+        if _timestamp_is_for_session(
+            mode.get("residual_conversion_completed_at"), session_date
+        ):
             return
-        total_cost = 0.0
-        converted = 0
-        unresolved = 0
+        flattened = 0
+        degraded = 0
         for position in (mode.get("positions") or {}).values():
             signed = int(position.get("signed_shares") or 0)
             if signed == 0:
                 continue
             quote = quotes.get(str(position.get("symbol"))) or {}
             close_price = _finite(quote.get("last"))
-            if close_price is None:
-                position["status"] = "residual_unclassified_missing_official_close"
-                unresolved += 1
-                continue
-            quantity = abs(signed)
             side = str(position.get("side"))
-            if side == "long":
-                principal = quantity * close_price * MARGIN_FINANCING_RATIO
-                interest = principal * MARGIN_FINANCING_ANNUAL_RATE / 365.0
-                cost = interest
-                position.update(
-                    {
-                        "carry_type": "margin_financing_long",
-                        "status": "carried_margin_financing_long",
-                        "financing_principal_twd": principal,
-                        "financing_ratio": MARGIN_FINANCING_RATIO,
-                        "financing_annual_rate": MARGIN_FINANCING_ANNUAL_RATE,
-                        "carry_interest_days_charged": 1,
-                        "carry_interest_twd": interest,
-                        "sell_fee_rate": float(position["cash_sell_fee_rate"]),
-                    }
+            price_source = "observed_session_close"
+            if close_price is None:
+                close_price = _finite(
+                    position.get("lower_limit" if side == "long" else "upper_limit")
                 )
-            else:
-                borrow_fee = (
-                    quantity * close_price * DAY_TRADE_SHORTFALL_BORROW_FEE_RATE
+                price_source = "adverse_daily_limit_fallback"
+                degraded += 1
+            if close_price is None:
+                close_price = _finite(position.get("last_mark_price"))
+                price_source = "last_complete_mark_fallback"
+            if close_price is None:
+                close_price = _finite(position.get("entry_price"))
+                price_source = "entry_price_last_resort"
+            if close_price is None:
+                raise RuntimeError(
+                    "terminal day-trade flatten has no positive ledger price "
+                    f"for {market}:{position.get('symbol')}"
                 )
-                handling_fee = (
-                    borrow_fee * DAY_TRADE_SHORTFALL_HANDLING_FEE_FRACTION
-                )
-                tax_adjustment = quantity * float(position["entry_price"]) * max(
-                    0.0,
-                    float(position["cash_sell_fee_rate"])
-                    - float(position["sell_fee_rate"]),
-                )
-                cost = borrow_fee + handling_fee + tax_adjustment
-                position.update(
-                    {
-                        "carry_type": "day_trade_securities_shortfall",
-                        "status": "carried_day_trade_securities_shortfall",
-                        "shortfall_borrow_fee_rate_per_day": (
-                            DAY_TRADE_SHORTFALL_BORROW_FEE_RATE
-                        ),
-                        "shortfall_borrow_fee_twd": borrow_fee,
-                        "shortfall_handling_fee_fraction": (
-                            DAY_TRADE_SHORTFALL_HANDLING_FEE_FRACTION
-                        ),
-                        "shortfall_handling_fee_twd": handling_fee,
-                        "normal_sell_tax_adjustment_twd": tax_adjustment,
-                        "short_margin_initial_rate": MARGIN_SHORT_INITIAL_MARGIN_RATE,
-                        "short_margin_collateral_twd": (
-                            quantity * close_price * MARGIN_SHORT_INITIAL_MARGIN_RATE
-                        ),
-                        "buy_fee_rate": float(position["cash_buy_fee_rate"]),
-                    }
-                )
-            position["carry_converted_at"] = now.isoformat(timespec="seconds")
-            position["carry_reference_close"] = close_price
-            position["carry_cost_twd"] = cost
-            position["remaining_entry_fee_twd"] = float(
-                position.get("remaining_entry_fee_twd") or 0.0
-            ) + cost
-            total_cost += cost
-            converted += 1
+            position["terminal_flatten_price_source"] = price_source
+            position["terminal_flatten_simulation_only"] = True
+            self._close_position(
+                position,
+                mode,
+                price=close_price,
+                quote=quote,
+                now=now,
+                reason="13_30_terminal_ledger_flatten",
+                order_type="SIM_TERMINAL",
+                quantity=abs(signed),
+            )
+            position["closing_auction_order_status"] = "terminal_ledger_flattened"
+            flattened += 1
         mode["residual_conversion_completed_at"] = now.isoformat(timespec="seconds")
-        mode["cumulative_carry_cost_twd"] = (
-            float(mode.get("cumulative_carry_cost_twd") or 0.0) + total_cost
-        )
-        mode["force_exit_failures"] = converted + unresolved
-        if converted or unresolved:
-            mode["engine_status"] = "critical_residual_carried_after_13_30"
+        mode["terminal_flatten_count"] = flattened
+        mode["terminal_flatten_degraded_count"] = degraded
+        mode["force_exit_failures"] = 0
         self._event(
-            "residual_positions_reclassified",
+            "residual_positions_terminal_flattened",
+            recorded_at=now,
             market=market,
-            converted=converted,
-            unresolved=unresolved,
-            carry_cost_twd=total_cost,
+            flattened=flattened,
+            degraded=degraded,
+            simulation_only=True,
         )
 
     def _close_position(
@@ -2281,6 +3376,10 @@ class TwDayTradeSimulationEngine:
                     "closing_auction_order_status": "filled"
                     if reason == "13_30_closing_auction_fill"
                     else position.get("closing_auction_order_status"),
+                    # A flat position has no remaining liquidation component.
+                    # Keep the cached total aligned with the final realized
+                    # result instead of leaving the preceding minute mark.
+                    "total_net_pnl_twd": realized_net,
                 }
             )
         elif reason.startswith("take_profit"):
@@ -2316,13 +3415,16 @@ class TwDayTradeSimulationEngine:
             "requested_quantity": remaining_before,
             "remaining_quantity": remaining_after,
             "simulation_only": True,
+            "synthetic_terminal_ledger": (
+                reason == "13_30_terminal_ledger_flatten"
+            ),
         }
         self._order(
             {
                 **common,
                 "side": "sell" if side == "long" else "buy_to_cover",
                 "order_type": order_type,
-                "price": float(price) if order_type.startswith("LMT") else None,
+                "price": None if order_type == "MKT" else float(price),
                 "status": "filled" if fully_closed else "part_filled",
             }
         )
@@ -2338,8 +3440,16 @@ class TwDayTradeSimulationEngine:
                 "entry_fee_allocated_twd": entry_fee_allocated,
                 "gross_pnl_twd": gross_pnl,
                 "net_pnl_twd": net_pnl,
-                "fill_contract": "best_bid_for_sell_best_ask_for_buy",
-                "depth_assumption": "minimum_of_level_one_and_50pct_minute_volume_except_closing_auction_which_uses_50pct_auction_minute_volume",
+                "fill_contract": (
+                    "simulation_terminal_ledger_not_exchange_fill"
+                    if reason == "13_30_terminal_ledger_flatten"
+                    else "best_bid_for_sell_best_ask_for_buy"
+                ),
+                "depth_assumption": (
+                    "full_residual_ledger_close_ignores_displayed_depth"
+                    if reason == "13_30_terminal_ledger_flatten"
+                    else "minimum_of_level_one_and_50pct_minute_volume_except_closing_auction_which_uses_50pct_auction_minute_volume"
+                ),
             }
         )
 
@@ -2348,6 +3458,8 @@ class TwDayTradeSimulationEngine:
         market: str,
         now: datetime,
         quotes: Mapping[str, Mapping[str, Any]],
+        *,
+        append_history: bool = True,
     ) -> None:
         mode = self.state.get("modes", {}).get(market)
         if not isinstance(mode, dict):
@@ -2432,6 +3544,8 @@ class TwDayTradeSimulationEngine:
                 ),
             }
         )
+        if not append_history:
+            return
         _append_jsonl(
             self.marks_path,
             {
@@ -2456,6 +3570,47 @@ class TwDayTradeSimulationEngine:
         self.state["updated_at"] = observed.isoformat(timespec="seconds")
         _atomic_json(self.state_path, self.state)
         mode_rows = list(self.state.get("modes", {}).values())
+        _atomic_json(
+            self.positions_path,
+            {
+                "schema_version": 1,
+                "generated_at": observed.isoformat(timespec="seconds"),
+                "simulation_only": True,
+                "production_order_possible": False,
+                "position_contract": {
+                    "target": (
+                        "complete model targets are stored at target_weights_path "
+                        "and target_positions_path"
+                    ),
+                    "executed": (
+                        "positions contains paper-simulation fills; an empty list "
+                        "is an explicit flat position"
+                    ),
+                },
+                "modes": {
+                    str(item.get("market")): {
+                        "market": item.get("market"),
+                        "label": item.get("label"),
+                        "session_date": item.get("session_date"),
+                        "signal_id": item.get("signal_id"),
+                        "signal_at": item.get("signal_at"),
+                        "engine_status": item.get("engine_status"),
+                        "target_weights_path": item.get("target_weights_path"),
+                        "target_positions_path": item.get("target_positions_path"),
+                        "target_symbol_count": item.get("target_symbol_count"),
+                        "target_risk": item.get("target_risk") or {},
+                        "open_position_count": int(item.get("open_position_count") or 0),
+                        "positions": [
+                            dict(position)
+                            for position in (item.get("positions") or {}).values()
+                            if isinstance(position, Mapping)
+                            and int(position.get("signed_shares") or 0) != 0
+                        ],
+                    }
+                    for item in mode_rows
+                },
+            },
+        )
         critical = any(
             str(item.get("engine_status") or "").startswith("critical")
             for item in mode_rows
@@ -2491,9 +3646,9 @@ class TwDayTradeSimulationEngine:
                     "fill_guarantee": False,
                     "fill_caveat": "inside-limit prices improve fill probability but cannot guarantee a fill without executable counterparty volume",
                     "exit_limit": "13:20 passive top-of-book limit",
-                    "continuous_force_exit": "13:24 market",
-                    "closing_auction": "13:25 adverse_daily_limit_LMT_ROD; settle_at_13:30",
-                    "residual": "13:30 margin-financing long or day-trade securities shortfall",
+                    "continuous_force_exit": "13:24<=t<13:25 market retry every service poll while residual exists",
+                    "closing_auction": "13:25 long sell at lower limit and short cover at upper limit using LMT_ROD; settle at 13:30 call auction",
+                    "residual": "13:30 simulation-only terminal ledger flatten; no overnight position",
                     "stress_rates": {
                         "financing_annual_rate": MARGIN_FINANCING_ANNUAL_RATE,
                         "shortfall_borrow_fee_rate_per_day": DAY_TRADE_SHORTFALL_BORROW_FEE_RATE,
@@ -2518,6 +3673,11 @@ class TwDayTradeSimulationEngine:
                             "session_date",
                             "signal_id",
                             "signal_at",
+                            "target_weights_path",
+                            "target_positions_path",
+                            "executed_positions_path",
+                            "target_symbol_count",
+                            "target_risk",
                             "initial_capital_twd",
                             "total_equity_twd",
                             "cumulative_realized_net_pnl_twd",
@@ -2525,6 +3685,8 @@ class TwDayTradeSimulationEngine:
                             "open_position_count",
                             "stale_position_count",
                             "force_exit_failures",
+                            "terminal_flatten_count",
+                            "terminal_flatten_degraded_count",
                             "cumulative_carry_cost_twd",
                         )
                     }

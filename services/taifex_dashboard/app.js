@@ -1,10 +1,21 @@
 "use strict";
 
-const REFRESH_MS = 5000;
+const PRICE_REFRESH_MS = 60000;
+const FETCH_TIMEOUT_MS = 15000;
 const money = new Intl.NumberFormat("zh-TW", { maximumFractionDigits: 0 });
 const percent = new Intl.NumberFormat("zh-TW", { style: "percent", minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const ratio = new Intl.NumberFormat("zh-TW", { maximumFractionDigits: 2 });
 const compactMoney = new Intl.NumberFormat("zh-TW", { notation: "compact", maximumFractionDigits: 2 });
+const TIME_RANGES = {"1h": 3600e3, "1d": 86400e3, "1w": 7 * 86400e3, "1mo": 30 * 86400e3, "1q": 90 * 86400e3, "1y": 365 * 86400e3, all: Infinity};
+const TIME_RANGE_LABELS = {"1h": "1 小時", "1d": "1 天", "1w": "1 週", "1mo": "1 月", "1q": "1 季", "1y": "1 年", all: "全部"};
+const timeAxis = window.StockAgentTimeAxis;
+const TAIFEX_SESSIONS = [
+  {label: "夜收", minute: 5 * 60},
+  {label: "日開", minute: 8 * 60 + 45},
+  {label: "日收", minute: 13 * 60 + 45},
+  {label: "夜開", minute: 15 * 60},
+];
+const HISTORY_CLIENT_CACHE_MS = 45000;
 let selectedStrategy = "";
 let selectedCategory = "";
 let selectedDirectionalExposure = "";
@@ -14,6 +25,7 @@ let selectedSort = "fixed_capital_return";
 let sortDescending = true;
 let lastSnapshot = null;
 let cachedHistory = [];
+let cachedHistoryMeta = null;
 let curveVisibleCount = 12;
 let guideVisibleCount = 12;
 let strategySearch = "";
@@ -23,10 +35,24 @@ let lastHeavyRevision = "";
 let refreshInFlight = false;
 let historyInFlight = false;
 let lastHistoryEtag = "";
+let historyPayloadCache = new Map();
 let strategySearchFrame = null;
+let selectedTimeRange = "1d";
+
+try { selectedTimeRange = localStorage.getItem("taifex-equity-time-range") || "1d"; } catch (_error) { /* storage can be disabled */ }
+if (!(selectedTimeRange in TIME_RANGES)) selectedTimeRange = "1d";
 
 function byId(id) { return document.getElementById(id); }
 function setText(id, value) { byId(id).textContent = value ?? "—"; }
+async function fetchWithTimeout(path, options = {}) {
+  const controller = new AbortController();
+  const timer = window.setTimeout(
+    () => controller.abort(new DOMException("Request timed out", "TimeoutError")),
+    FETCH_TIMEOUT_MS,
+  );
+  try { return await fetch(path, {...options, signal: controller.signal}); }
+  finally { window.clearTimeout(timer); }
+}
 function formatTwd(value) {
   if (value == null || !Number.isFinite(Number(value))) return "—";
   return `${money.format(Number(value))} TWD`;
@@ -51,6 +77,27 @@ function localTime(value) {
   }).format(new Date(value));
 }
 
+function historyTimeMs(row) {
+  const nanoseconds = Number(row?.decision_ts_ns);
+  if (Number.isFinite(nanoseconds) && nanoseconds > 0) return nanoseconds / 1e6;
+  const parsed = new Date(row?.recorded_at_utc || "").getTime();
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function filterHistoryByRange(history) {
+  const rows = (Array.isArray(history) ? history : []).filter((row) => historyTimeMs(row) != null);
+  if (!rows.length || selectedTimeRange === "all") return rows;
+  const anchor = Math.max(...rows.map(historyTimeMs));
+  const cutoff = anchor - TIME_RANGES[selectedTimeRange];
+  return rows.filter((row) => historyTimeMs(row) >= cutoff);
+}
+
+function syncTimeRangeControl() {
+  byId("equity-time-range").querySelectorAll("button[data-range]").forEach((button) => {
+    button.setAttribute("aria-pressed", String(button.dataset.range === selectedTimeRange));
+  });
+}
+
 function formatAge(value) {
   const seconds = Number(value);
   if (!Number.isFinite(seconds)) return "—";
@@ -68,6 +115,30 @@ function engineLabel(value) {
     active: "策略運作中",
   };
   return labels[value] || String(value || "未知狀態").replaceAll("_", " ");
+}
+
+function parityStateLabel(value) {
+  const labels = {
+    waiting_for_same_expiry_monthly_books: "等待同到期月五檔",
+    waiting_for_engine_contract_v8: "等待夜盤引擎啟動",
+    waiting_for_continuous_market: "等待連續交易",
+    no_positive_edge_after_cost: "成本後尚無正套利",
+    signal_pending_next_books: "等待訊號後新報價",
+    signal_cancelled_after_next_book_recheck: "新報價複核後取消",
+    locked_until_official_settlement: "套利已鎖定",
+    entry_closed_for_expiry_settlement: "到期日前停止進場",
+    settled_waiting_next_monthly_contract: "已結算，等待次月",
+    blocked_missing_official_final_settlement: "等待官方結算價",
+    forced_flat_until_next_monthly_contract: "強制平倉，等待次月",
+    unsupported_underlying_product: "需使用 TX",
+  };
+  return labels[value] || String(value || "未知狀態").replaceAll("_", " ");
+}
+
+function signedContracts(value, label) {
+  const quantity = Number(value);
+  if (!Number.isFinite(quantity) || quantity === 0) return `${label} 0`;
+  return `${label} ${quantity > 0 ? "多" : "空"} ${money.format(Math.abs(quantity))}`;
 }
 
 function healthPresentation(snapshot) {
@@ -134,6 +205,41 @@ function renderMetrics(snapshot) {
   setText("safety-state", safe ? "只讀模擬" : "安全契約失敗");
 }
 
+function renderParity(snapshot) {
+  const parity = snapshot.put_call_parity_tx || {};
+  const state = parity.state || "waiting_for_same_expiry_monthly_books";
+  const pill = byId("parity-state-pill");
+  pill.className = "pill";
+  if (state === "locked_until_official_settlement") pill.classList.add("valid");
+  else if (state.startsWith("blocked_") || state.startsWith("forced_")) pill.classList.add("invalid");
+  else pill.classList.add("stale");
+  pill.textContent = parityStateLabel(state);
+
+  const net = parity.locked_net_edge_after_estimated_cost_twd
+    ?? parity.net_after_estimated_cost_twd;
+  setText("parity-net-edge", formatTwd(net));
+  setText("parity-threshold", `進場門檻 > ${formatTwd(parity.minimum_net_edge_twd ?? 0)} · 融資利率 ${(Number(parity.financing_interest_rate || 0) * 100).toFixed(2)}%`);
+  setText("parity-gross-cost", `${formatTwd(parity.gross_locked_edge_twd)} / ${formatTwd(parity.total_estimated_cost_twd)}`);
+  const directions = {
+    sell_rich_synthetic_buy_tx: "賣貴的合成期貨／買 TX",
+    buy_cheap_synthetic_sell_tx: "買便宜合成期貨／賣 TX",
+  };
+  setText("parity-direction", directions[parity.direction] || "尚無可成交候選");
+  setText("parity-package", [
+    signedContracts(parity.call_contracts, "Call"),
+    signedContracts(parity.put_contracts, "Put"),
+    signedContracts(parity.future_contracts, "TX"),
+  ].join(" · "));
+  const strike = parity.strike == null ? "—" : money.format(parity.strike);
+  setText("parity-contracts", `${parity.series || "—"} · K ${strike} · ${parity.expiry_date || "—"}`);
+  setText("parity-prices", `C ${parity.call_code || "—"}@${formatRatio(parity.call_price)} · P ${parity.put_code || "—"}@${formatRatio(parity.put_price)} · TX ${parity.future_code || "—"}@${formatRatio(parity.future_price)}`);
+  setText("parity-causal-state", parityStateLabel(state));
+  const counts = `掃描 ${parity.scanned_pair_count ?? 0} 組 · 可評估方向 ${parity.evaluable_direction_count ?? 0}`;
+  const age = parity.maximum_book_age_ms == null ? "" : ` · 最老報價 ${ratio.format(Number(parity.maximum_book_age_ms))} ms`;
+  const wait = parity.signal_wait_seconds == null ? "" : ` · 已等 ${formatAge(parity.signal_wait_seconds)}`;
+  setText("parity-book-age", `${counts}${age}${wait}`);
+}
+
 function renderCycle(snapshot) {
   const market = snapshot.market;
   const cycle = snapshot.active_cycle || {};
@@ -145,7 +251,7 @@ function renderCycle(snapshot) {
   setText("underlying-contract", market.underlying_contract);
   setText("hedge-contract", `${market.hedge_product || "—"} · ${market.hedge_contract || "—"} · ×${market.hedge_multiplier_twd_per_point || "—"}`);
   setText("option-risk-margins", `${formatTwd(market.option_risk_margin_a_twd)} / ${formatTwd(market.option_risk_margin_b_twd)} / ${formatTwd(market.option_risk_margin_c_twd)} · ${market.option_risk_margin_effective_trading_date || "—"} 起 · C 僅作組合式參考，本帳逐腿裸賣計提`);
-  setText("futures-initial-margin", `${market.hedge_product || "—"} 每口 ${formatTwd(market.futures_initial_margin_per_contract_twd)}`);
+  setText("futures-initial-margin", `套利 ${market.underlying_product || "TX"} 每口 ${formatTwd(market.underlying_initial_margin_per_contract_twd)}；避險 ${market.hedge_product || "—"} 每口 ${formatTwd(market.futures_initial_margin_per_contract_twd)}`);
   setText("maintenance-clearing-margin", `${market.hedge_product || "—"} 維持 ${formatTwd(maintenance.futures_twd)}／結算 ${formatTwd(clearing.futures_twd)}；TXO 維持 A/B/C ${formatTwd(maintenanceTxo.A)} / ${formatTwd(maintenanceTxo.B)} / ${formatTwd(maintenanceTxo.C)}；結算 ${formatTwd(clearingTxo.A)} / ${formatTwd(clearingTxo.B)} / ${formatTwd(clearingTxo.C)}`);
   setText("capital-buffer-multiple", market.strategy_capital_buffer_multiple == null ? "—" : `×${market.strategy_capital_buffer_multiple}`);
   setText("cycle-series", cycle.series || "flat");
@@ -287,6 +393,46 @@ function renderPerformanceSummary(summary) {
   setText("performance-cost", formatCompactTwd(summary.independent_strategy_explicit_cost_twd));
 }
 
+function appendTableMetric(cell, label, value, fullValue = "") {
+  const line = document.createElement("span");
+  line.className = "table-metric";
+  const term = document.createElement("span");
+  term.textContent = label;
+  const detail = document.createElement("strong");
+  detail.textContent = value;
+  if (fullValue && fullValue !== value) detail.title = fullValue;
+  line.append(term, detail);
+  cell.appendChild(line);
+}
+
+function appendTableTwd(cell, label, value) {
+  appendTableMetric(cell, label, formatCompactTwd(value), formatTwd(value));
+}
+
+function strategyStatusPill(row) {
+  const pill = document.createElement("span");
+  if (!row.alive) {
+    pill.className = "pill invalid";
+    pill.textContent = "RUINED";
+    pill.title = `absorbing ruin · margin calls=${row.margin_call_count}`;
+  } else if (row.forced_liquidation_pending || Number(row.margin_excess_twd) < 0) {
+    pill.className = "pill invalid";
+    pill.textContent = "MARGIN";
+    pill.title = `保證金不足；margin calls=${row.margin_call_count}`;
+  } else if (!row.valuation_available) {
+    pill.className = "pill invalid";
+    pill.textContent = "UNAVAILABLE";
+  } else if (row.valuation_stale) {
+    pill.className = "pill stale";
+    pill.textContent = "CARRIED";
+    pill.title = `缺報價，延用上一筆完整估值；age=${Number(row.valuation_age_seconds || 0).toFixed(1)}s`;
+  } else {
+    pill.className = "pill valid";
+    pill.textContent = "FRESH";
+  }
+  return pill;
+}
+
 function renderTable(strategies) {
   const body = byId("strategy-body");
   body.replaceChildren();
@@ -295,74 +441,68 @@ function renderTable(strategies) {
   for (const row of sortedStrategies(visible)) {
     const tr = document.createElement("tr");
     const title = document.createElement("td");
-    title.textContent = row.label;
+    title.className = "strategy-summary-cell";
+    title.dataset.label = "策略／狀態";
+    const titleLine = document.createElement("span");
+    titleLine.className = "strategy-title-line";
+    const name = document.createElement("strong");
+    name.textContent = row.label;
+    titleLine.append(name, strategyStatusPill(row));
+    title.appendChild(titleLine);
+    const category = document.createElement("span");
+    category.className = "strategy-category";
+    category.textContent = row.category || "—";
+    title.appendChild(category);
     const id = document.createElement("span");
     id.className = "strategy-id";
     id.textContent = `${row.strategy_id} · ${row.implementation_level}`;
     title.appendChild(id);
     tr.appendChild(title);
-    const category = document.createElement("td");
-    category.textContent = row.category;
-    tr.appendChild(category);
-    for (const value of [
-      row.directional_exposure_label,
-      row.volatility_exposure_label,
-      row.hedge_type_label
-    ]) {
-      const td = document.createElement("td");
-      td.className = "exposure-cell";
-      td.textContent = value || "—";
-      tr.appendChild(td);
-    }
-    const exposureRatio = document.createElement("td");
-    exposureRatio.className = "exposure-ratio-cell";
-    const designRatio = document.createElement("span");
-    designRatio.textContent = `設計 ${row.design_option_ratio_label || "—"}`;
-    const liveRatio = document.createElement("span");
-    liveRatio.textContent = `實際 ${row.live_option_ratio_label || "—"}`;
-    exposureRatio.append(designRatio, liveRatio);
-    tr.appendChild(exposureRatio);
-    const values = [
-      formatTwd(row.reserved_capital_twd),
-      formatTwd(row.one_unit_net_pnl_twd),
-      formatTwd(row.one_unit_net_pnl_abs_twd),
-      formatPercent(row.fixed_capital_return),
-      formatPercent(row.compounded_return_to_live_mark),
-      formatTwd(row.explicit_cost_twd),
-      formatRatio(row.net_pnl_to_explicit_cost_ratio),
-      formatTwd(row.margin_required_twd),
-      formatPercent(row.margin_utilization),
-      formatTwd(row.total_equity_twd),
-      formatTwd(row.margin_excess_twd),
-      formatTwd(row.open_liquidation_value_twd),
-      money.format(row.option_position_count),
-      money.format(row.futures_position)
-    ];
-    for (const value of values) {
-      const td = document.createElement("td"); td.textContent = value; tr.appendChild(td);
-    }
-    const valid = document.createElement("td");
-    const pill = document.createElement("span");
-    if (!row.alive) {
-      pill.className = "pill invalid";
-      pill.textContent = "RUINED";
-      pill.title = `absorbing ruin · margin calls=${row.margin_call_count}`;
-    } else if (row.forced_liquidation_pending || Number(row.margin_excess_twd) < 0) {
-      pill.className = "pill invalid";
-      pill.textContent = "MARGIN";
-      pill.title = `保證金不足；margin calls=${row.margin_call_count}`;
-    } else if (!row.valuation_available) {
-      pill.className = "pill invalid";
-      pill.textContent = "UNAVAILABLE";
-    } else if (row.valuation_stale) {
-      pill.className = "pill stale";
-      pill.textContent = "CARRIED";
-      pill.title = `缺報價，延用上一筆完整估值；age=${Number(row.valuation_age_seconds || 0).toFixed(1)}s`;
-    } else {
-      pill.className = "pill valid";
-      pill.textContent = "FRESH";
-    }
-    valid.appendChild(pill); tr.appendChild(valid); body.appendChild(tr);
+
+    const exposure = document.createElement("td");
+    exposure.className = "strategy-detail-cell exposure-cell";
+    exposure.dataset.label = "曝險／口數比";
+    appendTableMetric(exposure, "方向", row.directional_exposure_label || "—");
+    appendTableMetric(exposure, "波動", row.volatility_exposure_label || "—");
+    appendTableMetric(exposure, "避險", row.hedge_type_label || "—");
+    appendTableMetric(exposure, "口數比", `設 ${row.design_option_ratio_label || "—"} · 實 ${row.live_option_ratio_label || "—"}`);
+    tr.appendChild(exposure);
+
+    const returns = document.createElement("td");
+    returns.className = "strategy-detail-cell";
+    returns.dataset.label = "報酬";
+    appendTableMetric(returns, "固定", formatPercent(row.fixed_capital_return));
+    appendTableMetric(returns, "複利*", formatPercent(row.compounded_return_to_live_mark));
+    appendTableMetric(returns, "損益／成本", formatRatio(row.net_pnl_to_explicit_cost_ratio));
+    tr.appendChild(returns);
+
+    const pnl = document.createElement("td");
+    pnl.className = "strategy-detail-cell";
+    pnl.dataset.label = "損益／成本";
+    appendTableTwd(pnl, "單位淨損益", row.one_unit_net_pnl_twd);
+    appendTableTwd(pnl, "損益絕對值", row.one_unit_net_pnl_abs_twd);
+    appendTableTwd(pnl, "顯性成本", row.explicit_cost_twd);
+    tr.appendChild(pnl);
+
+    const capital = document.createElement("td");
+    capital.className = "strategy-detail-cell";
+    capital.dataset.label = "資金／保證金";
+    appendTableTwd(capital, "預留", row.reserved_capital_twd);
+    appendTableTwd(capital, "總權益", row.total_equity_twd);
+    appendTableTwd(capital, "保證金", row.margin_required_twd);
+    appendTableMetric(capital, "占用", formatPercent(row.margin_utilization));
+    appendTableTwd(capital, "餘裕", row.margin_excess_twd);
+    tr.appendChild(capital);
+
+    const position = document.createElement("td");
+    position.className = "strategy-detail-cell";
+    position.dataset.label = "部位／估值";
+    appendTableTwd(position, "清算價值", row.open_liquidation_value_twd);
+    appendTableMetric(position, "選擇權腿", money.format(row.option_position_count));
+    appendTableMetric(position, "避險期貨", money.format(row.futures_position));
+    appendTableMetric(position, "TX 套利", money.format(row.underlying_futures_position || 0));
+    tr.appendChild(position);
+    body.appendChild(tr);
   }
 }
 
@@ -476,6 +616,7 @@ function svgNode(name, attrs = {}, text = "") {
 }
 
 function renderCurveWall(strategies, history) {
+  history = filterHistoryByRange(history);
   const grid = byId("curve-wall-grid");
   grid.replaceChildren();
   const filtered = sortedStrategies(filteredStrategies(strategies));
@@ -540,11 +681,12 @@ function renderCurveWall(strategies, history) {
   setText("curve-visible-count", `顯示 ${visible.length} / ${filtered.length}`);
   setText(
     "curve-wall-note",
-    `符合條件 ${filtered.length} / ${strategies.length} 條曲線；共用 Y 軸（${formatPercent(minY)} ～ ${formatPercent(maxY)}），以固定預留資金正規化；排序與下表一致。`
+    `${TIME_RANGE_LABELS[selectedTimeRange]} · 符合條件 ${filtered.length} / ${strategies.length} 條曲線；共用 Y 軸（${formatPercent(minY)} ～ ${formatPercent(maxY)}），以固定預留資金正規化；排序與下表一致。`
   );
 }
 
 function renderChart(history) {
+  history = filterHistoryByRange(history);
   const svg = byId("equity-chart");
   svg.replaceChildren();
   const rows = history.filter((row) => (
@@ -553,10 +695,10 @@ function renderChart(history) {
     && Number.isFinite(Number(row.total_equity_twd))
   ));
   if (rows.length < 2) {
-    setText("chart-note", "資料點不足；至少累積兩個每分鐘 mark 後才繪圖。");
+    setText("chart-note", `${TIME_RANGE_LABELS[selectedTimeRange]}內資料點不足；至少累積兩個每分鐘 mark 後才繪圖。`);
     return;
   }
-  const width = 900, height = 300, left = 76, right = 22, top = 22, bottom = 42;
+  const width = 900, height = 300, left = 76, right = 22, top = 22, bottom = 70;
   const values = rows.map((row) => Number(row.total_equity_twd));
   const baseline = Number(rows.at(-1).initial_capital_twd);
   const bounds = Number.isFinite(baseline) ? [...values, baseline] : values;
@@ -564,7 +706,13 @@ function renderChart(history) {
   if (minY === maxY) { minY -= 1; maxY += 1; }
   const pad = Math.max((maxY - minY) * 0.08, 1);
   minY -= pad; maxY += pad;
-  const x = (index) => left + index * (width - left - right) / (rows.length - 1);
+  const axis = timeAxis.buildTimeAxis({
+    range: selectedTimeRange,
+    timestamps: rows.map((row) => Number(row.decision_ts_ns) / 1e6),
+    sessions: TAIFEX_SESSIONS,
+  });
+  if (!axis) return;
+  const x = (row) => timeAxis.position(axis, Number(row.decision_ts_ns) / 1e6, left, width - right);
   const y = (value) => top + (maxY - value) * (height - top - bottom) / (maxY - minY);
   for (let i = 0; i <= 4; i += 1) {
     const value = minY + (maxY - minY) * i / 4;
@@ -573,18 +721,26 @@ function renderChart(history) {
     svg.appendChild(svgNode("text", { x: left - 10, y: yPos + 4, "text-anchor": "end", class: "chart-label" }, money.format(value)));
   }
   if (Number.isFinite(baseline)) svg.appendChild(svgNode("line", { x1: left, y1: y(baseline), x2: width - right, y2: y(baseline), class: "chart-baseline" }));
-  const points = rows.map((row, index) => `${x(index).toFixed(2)},${y(Number(row.total_equity_twd)).toFixed(2)}`).join(" ");
+  for (const tick of axis.ticks) {
+    const xPos = timeAxis.position(axis, tick.timestamp, left, width - right);
+    const lineClass = tick.kind === "session" ? "chart-time-grid session" : "chart-time-grid";
+    const labelClass = tick.kind === "session" ? "chart-label chart-session-label" : "chart-label";
+    svg.appendChild(svgNode("line", { x1: xPos, y1: top, x2: xPos, y2: height - bottom, class: lineClass }));
+    const labelY = tick.kind === "session" ? height - 34 : height - 8;
+    const attributes = { x: xPos, y: labelY, "text-anchor": tick.rotate ? "end" : "middle", class: labelClass };
+    if (tick.rotate) attributes.transform = `rotate(-45 ${xPos} ${labelY})`;
+    svg.appendChild(svgNode("text", attributes, tick.label));
+  }
+  const points = rows.map((row) => `${x(row).toFixed(2)},${y(Number(row.total_equity_twd)).toFixed(2)}`).join(" ");
   svg.appendChild(svgNode("polyline", { points, class: "chart-line" }));
   const first = new Date(Number(rows[0].decision_ts_ns) / 1e6);
   const last = new Date(Number(rows[rows.length - 1].decision_ts_ns) / 1e6);
-  svg.appendChild(svgNode("text", { x: left, y: height - 14, class: "chart-label" }, localTime(first.toISOString()).slice(6)));
-  svg.appendChild(svgNode("text", { x: width - right, y: height - 14, "text-anchor": "end", class: "chart-label" }, localTime(last.toISOString()).slice(6)));
   const changed = Math.max(...values) !== Math.min(...values);
   const carried = rows.filter((row) => row.valuation_carried_forward).length;
   const pnl = rows.at(-1).cumulative_pnl_twd;
   setText("chart-note", changed
-    ? `${rows.length} 個每分鐘點；${carried} 點延用上一筆完整估值；最後總權益 ${formatTwd(values.at(-1))}，累積損益 ${formatTwd(pnl)}。`
-    : `${rows.length} 個每分鐘點；${carried} 點延用上一筆完整估值；總權益維持 ${formatTwd(values.at(-1))}。`);
+    ? `${TIME_RANGE_LABELS[selectedTimeRange]} · ${rows.length} 點（${localTime(first.toISOString())} ～ ${localTime(last.toISOString())}）${cachedHistoryMeta?.downsampled ? "；長區間已保留區間高低極值縮圖" : ""}；${carried} 點延用上一筆完整估值；最後總權益 ${formatTwd(values.at(-1))}，累積損益 ${formatTwd(pnl)}。`
+    : `${TIME_RANGE_LABELS[selectedTimeRange]} · ${rows.length} 點（${localTime(first.toISOString())} ～ ${localTime(last.toISOString())}）${cachedHistoryMeta?.downsampled ? "；長區間已保留區間高低極值縮圖" : ""}；${carried} 點延用上一筆完整估值；總權益維持 ${formatTwd(values.at(-1))}。`);
 }
 
 function renderCounts(counts) {
@@ -597,7 +753,7 @@ function renderCounts(counts) {
 function render(snapshot, {forceHeavy = false} = {}) {
   snapshot.history = cachedHistory;
   lastSnapshot = snapshot;
-  renderHeader(snapshot); renderMetrics(snapshot); renderCycle(snapshot);
+  renderHeader(snapshot); renderMetrics(snapshot); renderParity(snapshot); renderCycle(snapshot);
   renderPerformanceSummary(snapshot.portfolio_summary);
   const compatibilityCatalog = snapshot.strategy_catalog || snapshot.strategies.map((row) => ({
     strategy_id: row.strategy_id,
@@ -633,7 +789,9 @@ function render(snapshot, {forceHeavy = false} = {}) {
       row.strategy_id, row.total_equity_twd, row.fixed_capital_return,
       row.compounded_return_to_live_mark, row.margin_excess_twd,
       row.valuation_status, row.valuation_age_seconds,
+      row.underlying_futures_position,
     ]),
+    snapshot.put_call_parity_tx,
     compatibilityCatalog.length,
   ]);
   if (!forceHeavy && revision === lastHeavyRevision) return;
@@ -652,7 +810,7 @@ async function refresh() {
   if (document.hidden || refreshInFlight) return;
   refreshInFlight = true;
   try {
-    const response = await fetch("api/status", { cache: "default" });
+    const response = await fetchWithTimeout("api/status", { cache: "no-store" });
     const payload = await response.json();
     if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
     render(payload);
@@ -667,27 +825,51 @@ async function refresh() {
   }
 }
 
-async function refreshHistory() {
-  if (document.hidden || historyInFlight) return;
+function applyHistoryPayload(payload, etag = "") {
+  lastHistoryEtag = etag;
+  cachedHistory = Array.isArray(payload.history) ? payload.history : [];
+  cachedHistoryMeta = payload;
+  if (lastSnapshot) {
+    lastSnapshot.history = cachedHistory;
+    renderChart(cachedHistory);
+    renderCurveWall(lastSnapshot.strategies, cachedHistory);
+    renderCounts(payload.record_counts || lastSnapshot.record_counts);
+  }
+}
+
+async function refreshHistory({preferCache = false} = {}) {
+  if (document.hidden) return;
+  const requestedRange = selectedTimeRange;
+  const cached = historyPayloadCache.get(requestedRange);
+  if (preferCache) {
+    if (cached) applyHistoryPayload(cached.payload, cached.etag);
+    else {
+      cachedHistory = [];
+      cachedHistoryMeta = null;
+      lastHistoryEtag = "";
+      if (lastSnapshot) { renderChart([]); renderCurveWall(lastSnapshot.strategies, []); }
+    }
+    if (cached && Date.now() - cached.receivedAt < HISTORY_CLIENT_CACHE_MS) return;
+  }
+  if (historyInFlight) return;
   historyInFlight = true;
   try {
-    const response = await fetch("api/history", { cache: "default" });
+    const response = await fetchWithTimeout(`api/history?range=${encodeURIComponent(requestedRange)}`, { cache: "default" });
     const etag = response.headers.get("ETag") || "";
-    if (etag && etag === lastHistoryEtag) return;
+    if (requestedRange !== selectedTimeRange) return;
+    if (etag && cached?.etag === etag) {
+      cached.receivedAt = Date.now();
+      return;
+    }
     const payload = await response.json();
     if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
-    lastHistoryEtag = etag;
-    cachedHistory = Array.isArray(payload.history) ? payload.history : [];
-    if (lastSnapshot) {
-      lastSnapshot.history = cachedHistory;
-      renderChart(cachedHistory);
-      renderCurveWall(lastSnapshot.strategies, cachedHistory);
-      renderCounts(payload.record_counts || lastSnapshot.record_counts);
-    }
+    historyPayloadCache.set(requestedRange, {payload, etag, receivedAt: Date.now()});
+    applyHistoryPayload(payload, etag);
   } catch (error) {
     setText("curve-wall-note", `曲線歷史暫時無法更新：${error.message}`);
   } finally {
     historyInFlight = false;
+    if (requestedRange !== selectedTimeRange) void refreshHistory({preferCache: true});
   }
 }
 
@@ -758,13 +940,23 @@ byId("guide-load-more").addEventListener("click", () => {
   guideVisibleCount += 12;
   if (lastSnapshot) renderStrategyGuide(lastStrategyCatalog, lastStrategyCounts);
 });
-document.addEventListener("visibilitychange", () => {
-  if (!document.hidden) {
-    void refresh();
-    void refreshHistory();
-  }
+byId("equity-time-range").addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-range]");
+  if (!button || !(button.dataset.range in TIME_RANGES)) return;
+  selectedTimeRange = button.dataset.range;
+  try { localStorage.setItem("taifex-equity-time-range", selectedTimeRange); } catch (_error) { /* optional */ }
+  syncTimeRangeControl();
+  void refreshHistory({preferCache: true});
 });
-void refresh();
-void refreshHistory();
-window.setInterval(() => void refresh(), REFRESH_MS);
-window.setInterval(() => void refreshHistory(), 60000);
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) refreshMinuteSnapshot();
+});
+
+function refreshMinuteSnapshot() {
+  void refresh();
+  void refreshHistory();
+}
+
+syncTimeRangeControl();
+refreshMinuteSnapshot();
+window.setInterval(refreshMinuteSnapshot, PRICE_REFRESH_MS);

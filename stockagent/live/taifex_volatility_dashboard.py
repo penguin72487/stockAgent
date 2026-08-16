@@ -31,9 +31,18 @@ from stockagent.research.taifex_volatility_metadata import (
 )
 
 
-DASHBOARD_SCHEMA_VERSION: Final[int] = 6
+DASHBOARD_SCHEMA_VERSION: Final[int] = 7
 DEFAULT_MAX_SOURCE_AGE_SECONDS: Final[float] = 15.0
 DEFAULT_MARK_LIMIT_PER_STRATEGY: Final[int] = 360
+HISTORY_RANGE_SECONDS: Final[dict[str, int | None]] = {
+    "1h": 60 * 60,
+    "1d": 24 * 60 * 60,
+    "1w": 7 * 24 * 60 * 60,
+    "1mo": 30 * 24 * 60 * 60,
+    "1q": 90 * 24 * 60 * 60,
+    "1y": 365 * 24 * 60 * 60,
+    "all": None,
+}
 
 _LINE_COUNT_LOCK = threading.Lock()
 _LINE_COUNT_CACHE: dict[Path, tuple[int, int, int, int, int]] = {}
@@ -120,12 +129,18 @@ def _tail_json_objects(path: Path, *, maximum_rows: int) -> list[dict[str, Any]]
     chunk_size = 64 * 1024
     with path.open("rb") as handle:
         position = handle.seek(0, 2)
-        buffer = b""
-        while position > 0 and buffer.count(b"\n") <= maximum_rows:
+        chunks: list[bytes] = []
+        newline_count = 0
+        while position > 0 and newline_count <= maximum_rows:
             read_size = min(chunk_size, position)
             position -= read_size
             handle.seek(position)
-            buffer = handle.read(read_size) + buffer
+            chunk = handle.read(read_size)
+            chunks.append(chunk)
+            newline_count += chunk.count(b"\n")
+    # Joining once is linear in bytes read.  Repeatedly prepending chunks makes
+    # a large live ledger quadratic and was the dominant cold-history latency.
+    buffer = b"".join(reversed(chunks))
     raw_rows = deque(
         (line for line in buffer.splitlines() if line.strip()),
         maxlen=maximum_rows,
@@ -136,6 +151,67 @@ def _tail_json_objects(path: Path, *, maximum_rows: int) -> list[dict[str, Any]]
         if isinstance(payload, dict):
             output.append(payload)
     return output
+
+
+def _iter_json_objects(path: Path):
+    if not path.is_file():
+        return
+    with path.open("rb") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            payload = json.loads(line)
+            if isinstance(payload, dict):
+                yield payload
+
+
+def _first_mark_timestamp_ns(path: Path) -> int | None:
+    for row in _iter_json_objects(path) or ():
+        value = int(row.get("decision_ts_ns") or 0)
+        if value > 0:
+            return value
+    return None
+
+
+def _downsample_history_rows(
+    rows: list[dict[str, Any]], *, maximum_rows: int
+) -> list[dict[str, Any]]:
+    rows.sort(key=lambda row: int(row["decision_ts_ns"]))
+    if len(rows) <= maximum_rows:
+        return rows
+    if maximum_rows <= 2:
+        return [rows[0], rows[-1]][:maximum_rows]
+    bucket_count = max(1, (maximum_rows - 2) // 2)
+    interior = rows[1:-1]
+    output = [rows[0]]
+    for bucket_index in range(bucket_count):
+        start = len(interior) * bucket_index // bucket_count
+        stop = len(interior) * (bucket_index + 1) // bucket_count
+        bucket = interior[start:stop]
+        if not bucket:
+            continue
+        minimum = min(
+            bucket,
+            key=lambda row: float(row.get("fixed_capital_return") or 0.0),
+        )
+        maximum = max(
+            bucket,
+            key=lambda row: float(row.get("fixed_capital_return") or 0.0),
+        )
+        output.extend(
+            sorted(
+                {int(row["decision_ts_ns"]): row for row in (minimum, maximum)}.values(),
+                key=lambda row: int(row["decision_ts_ns"]),
+            )
+        )
+    output.append(rows[-1])
+    output = list(
+        {int(row["decision_ts_ns"]): row for row in output}.values()
+    )
+    output.sort(key=lambda row: int(row["decision_ts_ns"]))
+    if len(output) <= maximum_rows:
+        return output
+    return output[: maximum_rows - 1] + [rows[-1]]
 
 
 def _trading_date_from_ns(decision_ts_ns: int) -> str | None:
@@ -333,6 +409,7 @@ def _portfolio_summary(strategy_rows: list[dict[str, Any]]) -> dict[str, Any]:
 def _live_position_exposure(
     option_positions: object,
     futures_position: object,
+    underlying_futures_position: object = 0,
 ) -> dict[str, Any]:
     positions = option_positions if isinstance(option_positions, Mapping) else {}
     long_contracts = 0
@@ -370,7 +447,20 @@ def _live_position_exposure(
         future_label = f"期貨空 {abs(future_quantity)} 口"
     else:
         future_direction = "flat"
-        future_label = "期貨空手"
+        future_label = "避險期貨空手"
+    try:
+        underlying_future_quantity = int(underlying_futures_position)
+    except (TypeError, ValueError):
+        underlying_future_quantity = 0
+    if underlying_future_quantity > 0:
+        underlying_future_direction = "long"
+        underlying_future_label = f"TX 套利多 {underlying_future_quantity} 口"
+    elif underlying_future_quantity < 0:
+        underlying_future_direction = "short"
+        underlying_future_label = f"TX 套利空 {abs(underlying_future_quantity)} 口"
+    else:
+        underlying_future_direction = "flat"
+        underlying_future_label = "TX 套利空手"
     return {
         "live_option_long_contracts": long_contracts,
         "live_option_short_contracts": short_contracts,
@@ -381,7 +471,11 @@ def _live_position_exposure(
         "live_option_ratio_label": option_ratio_label,
         "live_futures_direction": future_direction,
         "live_futures_direction_label": future_label,
-        "live_exposure_label": f"{option_ratio_label} · {future_label}",
+        "live_underlying_futures_direction": underlying_future_direction,
+        "live_underlying_futures_direction_label": underlying_future_label,
+        "live_exposure_label": (
+            f"{option_ratio_label} · {future_label} · {underlying_future_label}"
+        ),
     }
 
 
@@ -450,6 +544,71 @@ def _safe_cycle(value: object) -> dict[str, Any] | None:
     return {key: value.get(key) for key in allowed if key in value}
 
 
+_SAFE_PARITY_FIELDS: Final[tuple[str, ...]] = (
+    "state",
+    "position_id",
+    "status",
+    "direction",
+    "expiry_date",
+    "series",
+    "strike",
+    "call_code",
+    "put_code",
+    "future_code",
+    "call_contracts",
+    "put_contracts",
+    "future_contracts",
+    "call_price",
+    "put_price",
+    "future_price",
+    "gross_locked_edge_twd",
+    "entry_fixed_fees_twd",
+    "entry_transaction_tax_twd",
+    "estimated_settlement_tax_twd",
+    "total_estimated_cost_twd",
+    "net_after_estimated_cost_twd",
+    "locked_net_edge_after_estimated_cost_twd",
+    "profitable_after_cost",
+    "minimum_net_edge_twd",
+    "maximum_book_age_ms",
+    "scanned_pair_count",
+    "evaluable_direction_count",
+    "signal_wait_seconds",
+    "signal_decision_ts_ns",
+    "entry_decision_ts_ns",
+    "observed_decision_ts_ns",
+    "market_phase",
+    "financing_interest_rate",
+    "broker_submission",
+    "package",
+    "official_final_settlement",
+    "realized_cumulative_pnl_twd",
+)
+
+
+def _safe_parity_mapping(value: object) -> dict[str, Any] | None:
+    if not isinstance(value, Mapping):
+        return None
+    return {key: value.get(key) for key in _SAFE_PARITY_FIELDS if key in value}
+
+
+def _safe_put_call_parity(value: object) -> dict[str, Any]:
+    source = value if isinstance(value, Mapping) else {}
+    monitor = _safe_parity_mapping(source.get("monitor")) or {
+        "state": "waiting_for_engine_contract_v8",
+        "minimum_net_edge_twd": 0.0,
+        "financing_interest_rate": 0.0,
+        "broker_submission": False,
+    }
+    return {
+        **monitor,
+        "pending_signal": _safe_parity_mapping(source.get("pending_signal")),
+        "open_position": _safe_parity_mapping(source.get("open_position")),
+        "last_settled_expiry": source.get("last_settled_expiry"),
+        "blocked_expiry": source.get("blocked_expiry"),
+    }
+
+
 def _latest_api_receipt(root: Path) -> dict[str, Any] | None:
     paths = sorted(root.glob("*-futures-simulation-lifecycle.json"))
     if not paths:
@@ -465,6 +624,261 @@ def _latest_api_receipt(root: Path) -> dict[str, Any] | None:
         "baseline_position": payload.get("baseline_position"),
         "final_position": payload.get("final_position"),
         "finished_at_utc": payload.get("finished_at_utc"),
+    }
+
+
+def _build_history_rows(
+    *,
+    state_dir: Path,
+    strategy_ids: tuple[str, ...],
+    capital_by_strategy: Mapping[str, float],
+    mark_limit_per_strategy: int,
+    minimum_decision_ts_ns: int | None = None,
+    bucket_width_ns: int | None = None,
+    scan_all: bool = False,
+) -> list[dict[str, Any]]:
+    """Build only the bounded public curve from the tail of the marks ledger."""
+
+    mark_limit = max(1, min(int(mark_limit_per_strategy), 1_440))
+    mark_path = Path(state_dir) / "marks.jsonl"
+    raw_marks = (
+        _iter_json_objects(mark_path)
+        if scan_all
+        else _tail_json_objects(
+            mark_path,
+            maximum_rows=max(1, mark_limit * max(1, len(strategy_ids)) * 2),
+        )
+    )
+    grouped_marks: dict[str, deque[dict[str, Any]]] = {
+        str(strategy_id): deque(maxlen=mark_limit) for strategy_id in strategy_ids
+    }
+    grouped_buckets: dict[str, dict[int, list[dict[str, Any]]]] = {
+        str(strategy_id): {} for strategy_id in strategy_ids
+    }
+    last_complete_open_value: dict[str, tuple[object, int, int, float, int]] = {}
+    for mark in raw_marks:
+        strategy_id = str(mark.get("strategy_id") or "")
+        if strategy_id not in grouped_marks:
+            continue
+        decision_ts_ns = int(mark.get("decision_ts_ns") or 0)
+        cycle_id = mark.get("active_cycle_id")
+        futures_position = int(mark.get("futures_position") or 0)
+        underlying_futures_position = int(mark.get("underlying_futures_position") or 0)
+        gross_cash = float(mark.get("gross_cash_twd") or 0.0)
+        fixed_fees = float(mark.get("fixed_fees_twd") or 0.0)
+        transaction_tax = float(mark.get("transaction_tax_twd") or 0.0)
+        has_validity_flags = "option_books_valid" in mark or "future_book_valid" in mark
+        fresh_complete = (
+            bool(mark.get("option_books_valid")) and bool(mark.get("future_book_valid"))
+            if has_validity_flags
+            else True
+        )
+        open_value = _optional_float(mark.get("open_liquidation_value_twd"))
+        carried = bool(mark.get("valuation_carried_forward"))
+        valuation_available = bool(
+            mark.get("valuation_available", open_value is not None)
+        )
+        if fresh_complete and open_value is not None:
+            last_complete_open_value[strategy_id] = (
+                cycle_id,
+                futures_position,
+                underlying_futures_position,
+                open_value,
+                decision_ts_ns,
+            )
+        elif "valuation_available" not in mark:
+            cached = last_complete_open_value.get(strategy_id)
+            if cached is not None and cached[:3] == (
+                cycle_id,
+                futures_position,
+                underlying_futures_position,
+            ):
+                open_value = cached[3]
+                carried = True
+                valuation_available = True
+            else:
+                open_value = None
+                valuation_available = False
+        cumulative_pnl = _optional_float(
+            mark.get("cumulative_pnl_twd", mark.get("net_equity_twd"))
+        )
+        if carried and open_value is not None:
+            cumulative_pnl = gross_cash + open_value - fixed_fees - transaction_tax
+        total_equity = _optional_float(mark.get("total_equity_twd"))
+        initial_capital = float(capital_by_strategy.get(strategy_id, 0.0))
+        if cumulative_pnl is not None and (total_equity is None or carried):
+            total_equity = initial_capital + cumulative_pnl
+        if not valuation_available:
+            cumulative_pnl = None
+            total_equity = None
+        cached_ts = (
+            last_complete_open_value.get(strategy_id, (None, 0, 0, 0.0, 0))[4]
+            if carried
+            else decision_ts_ns
+        )
+        public_row = {
+                "recorded_at_utc": mark.get("recorded_at_utc"),
+                "decision_ts_ns": decision_ts_ns,
+                "strategy_id": strategy_id,
+                "net_equity_twd": cumulative_pnl,
+                "cumulative_pnl_twd": cumulative_pnl,
+                "initial_capital_twd": initial_capital,
+                "total_equity_twd": total_equity,
+                "gross_cash_twd": gross_cash,
+                "open_liquidation_value_twd": open_value,
+                "fixed_fees_twd": fixed_fees,
+                "transaction_tax_twd": transaction_tax,
+                "explicit_cost_twd": fixed_fees + transaction_tax,
+                "futures_position": futures_position,
+                "underlying_futures_position": underlying_futures_position,
+                "fixed_capital_return": (
+                    cumulative_pnl / initial_capital
+                    if cumulative_pnl is not None and initial_capital > 0.0
+                    else None
+                ),
+                "valuation_available": valuation_available,
+                "valuation_stale": carried,
+                "valuation_carried_forward": carried,
+                "valuation_age_seconds": (
+                    max(0.0, (decision_ts_ns - cached_ts) / 1e9)
+                    if carried and cached_ts
+                    else 0.0
+                    if valuation_available
+                    else None
+                ),
+            }
+        if minimum_decision_ts_ns is not None and decision_ts_ns < int(
+            minimum_decision_ts_ns
+        ):
+            continue
+        if scan_all and bucket_width_ns is not None:
+            bucket_key = decision_ts_ns // max(1, int(bucket_width_ns))
+            bucket = grouped_buckets[strategy_id].setdefault(bucket_key, [])
+            value = _optional_float(public_row.get("fixed_capital_return"))
+            if value is None:
+                continue
+            candidates = [*bucket, public_row]
+            minimum = min(
+                candidates,
+                key=lambda row: float(row.get("fixed_capital_return") or 0.0),
+            )
+            maximum = max(
+                candidates,
+                key=lambda row: float(row.get("fixed_capital_return") or 0.0),
+            )
+            bucket[:] = sorted(
+                {int(row["decision_ts_ns"]): row for row in (minimum, maximum)}.values(),
+                key=lambda row: int(row["decision_ts_ns"]),
+            )
+        else:
+            grouped_marks[strategy_id].append(public_row)
+    if scan_all and bucket_width_ns is not None:
+        history = []
+        for strategy_id in strategy_ids:
+            series_rows = [
+                row
+                for bucket in grouped_buckets[str(strategy_id)].values()
+                for row in bucket
+            ]
+            history.extend(
+                _downsample_history_rows(series_rows, maximum_rows=mark_limit)
+            )
+    else:
+        history = [
+            row
+            for strategy_id in strategy_ids
+            for row in grouped_marks[str(strategy_id)]
+        ]
+    history.sort(key=lambda row: (row["decision_ts_ns"], row["strategy_id"]))
+    return history
+
+
+def build_dashboard_history_snapshot(
+    *,
+    state_dir: Path,
+    now: datetime | None = None,
+    mark_limit_per_strategy: int = DEFAULT_MARK_LIMIT_PER_STRATEGY,
+    range_key: str = "1d",
+) -> dict[str, Any]:
+    """Build the curve endpoint without scanning unrelated dashboard ledgers."""
+
+    selected_state_dir = Path(state_dir)
+    status = _load_object(selected_state_dir / "status.json")
+    state = _load_object(selected_state_dir / "state.json")
+    observed_now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    strategy_ids = tuple(
+        str(strategy_id)
+        for strategy_id in (state.get("strategy_ids") or status.get("strategies") or ())
+    )
+    capital_by_strategy: dict[str, float] = {}
+    for strategy_id in strategy_ids:
+        mark = status.get("strategies", {}).get(strategy_id, {})
+        ledger = state.get("strategies", {}).get(strategy_id, {})
+        capital_by_strategy[strategy_id] = float(
+            _optional_float(
+                mark.get("initial_capital_twd", ledger.get("initial_capital_twd"))
+            )
+            or 0.0
+        )
+    normalized_range = str(range_key or "1d").strip().lower()
+    if normalized_range not in HISTORY_RANGE_SECONDS:
+        raise ValueError(f"unsupported dashboard history range: {range_key}")
+    mark_path = selected_state_dir / "marks.jsonl"
+    earliest_ns = _first_mark_timestamp_ns(mark_path)
+    tail = _tail_json_objects(mark_path, maximum_rows=max(1, len(strategy_ids) * 2))
+    anchor_ns = max((int(row.get("decision_ts_ns") or 0) for row in tail), default=0)
+    duration_seconds = HISTORY_RANGE_SECONDS[normalized_range]
+    requested_cutoff_ns = (
+        None
+        if duration_seconds is None or anchor_ns <= 0
+        else anchor_ns - int(duration_seconds * 1_000_000_000)
+    )
+    cutoff_ns = max(
+        earliest_ns or 0,
+        requested_cutoff_ns if requested_cutoff_ns is not None else earliest_ns or 0,
+    )
+    effective_span_ns = max(60_000_000_000, anchor_ns - cutoff_ns)
+    # Two extrema per bucket keep the public payload near the historical
+    # 360-point-per-strategy envelope while retaining local spikes.
+    bucket_width_ns = max(60_000_000_000, math.ceil(effective_span_ns / 180))
+    history = _build_history_rows(
+        state_dir=selected_state_dir,
+        strategy_ids=strategy_ids,
+        capital_by_strategy=capital_by_strategy,
+        mark_limit_per_strategy=mark_limit_per_strategy,
+        minimum_decision_ts_ns=cutoff_ns,
+        bucket_width_ns=bucket_width_ns,
+        scan_all=True,
+    )
+    source_updated = _parse_utc(status.get("updated_at_utc"))
+    return {
+        "dashboard_schema_version": DASHBOARD_SCHEMA_VERSION,
+        "generated_at_utc": observed_now.isoformat(),
+        "source_updated_at_utc": source_updated.isoformat(),
+        "range": normalized_range,
+        "range_seconds": duration_seconds,
+        "anchor_at_utc": (
+            datetime.fromtimestamp(anchor_ns / 1e9, tz=timezone.utc).isoformat()
+            if anchor_ns > 0
+            else None
+        ),
+        "coverage_start_utc": (
+            datetime.fromtimestamp(
+                int(history[0]["decision_ts_ns"]) / 1e9, tz=timezone.utc
+            ).isoformat()
+            if history
+            else None
+        ),
+        "coverage_end_utc": (
+            datetime.fromtimestamp(
+                int(history[-1]["decision_ts_ns"]) / 1e9, tz=timezone.utc
+            ).isoformat()
+            if history
+            else None
+        ),
+        "downsampled": bool(bucket_width_ns > 60_000_000_000),
+        "history": history,
+        "record_counts": {"history_rows_returned": len(history)},
     }
 
 
@@ -576,6 +990,13 @@ def build_dashboard_snapshot(
                 "fixed_fees_twd": float(mark.get("fixed_fees_twd", 0.0)),
                 "transaction_tax_twd": float(mark.get("transaction_tax_twd", 0.0)),
                 "futures_position": int(mark.get("futures_position", 0)),
+                "underlying_futures_position": int(
+                    mark.get(
+                        "underlying_futures_position",
+                        ledger.get("underlying_futures_position", 0),
+                    )
+                    or 0
+                ),
                 "option_books_valid": option_valid,
                 "future_book_valid": future_valid,
                 "books_valid": option_valid and future_valid,
@@ -591,6 +1012,10 @@ def build_dashboard_snapshot(
                 **_live_position_exposure(
                     mark.get("option_positions", ledger.get("option_positions")),
                     mark.get("futures_position", ledger.get("futures_position", 0)),
+                    mark.get(
+                        "underlying_futures_position",
+                        ledger.get("underlying_futures_position", 0),
+                    ),
                 ),
             }
         )
@@ -612,8 +1037,7 @@ def build_dashboard_snapshot(
             not bool(row["valuation_stale"])
             or (
                 row["valuation_age_seconds"] is not None
-                and float(row["valuation_age_seconds"])
-                <= float(max_source_age_seconds)
+                and float(row["valuation_age_seconds"]) <= float(max_source_age_seconds)
             )
         )
         for row in strategy_rows
@@ -653,122 +1077,25 @@ def build_dashboard_snapshot(
             )
         )
 
-    mark_limit = max(1, min(int(mark_limit_per_strategy), 1_440))
-    raw_marks = (
-        _tail_json_objects(
-            state_dir / "marks.jsonl",
-            maximum_rows=max(1, mark_limit * max(1, len(strategy_ids)) * 2),
+    capital_by_strategy = {
+        row["strategy_id"]: float(row["initial_capital_twd"]) for row in strategy_rows
+    }
+    history = (
+        _build_history_rows(
+            state_dir=state_dir,
+            strategy_ids=strategy_ids,
+            capital_by_strategy=capital_by_strategy,
+            mark_limit_per_strategy=mark_limit_per_strategy,
         )
         if include_history
         else []
     )
-    grouped_marks: dict[str, deque[dict[str, Any]]] = {
-        str(strategy_id): deque(maxlen=mark_limit) for strategy_id in strategy_ids
-    }
-    last_complete_open_value: dict[str, tuple[object, int, float, int]] = {}
-    capital_by_strategy = {
-        row["strategy_id"]: float(row["initial_capital_twd"]) for row in strategy_rows
-    }
-    for mark in raw_marks:
-        strategy_id = str(mark.get("strategy_id") or "")
-        if strategy_id not in grouped_marks:
-            continue
-        decision_ts_ns = int(mark.get("decision_ts_ns") or 0)
-        cycle_id = mark.get("active_cycle_id")
-        futures_position = int(mark.get("futures_position") or 0)
-        gross_cash = float(mark.get("gross_cash_twd") or 0.0)
-        fixed_fees = float(mark.get("fixed_fees_twd") or 0.0)
-        transaction_tax = float(mark.get("transaction_tax_twd") or 0.0)
-        has_validity_flags = "option_books_valid" in mark or "future_book_valid" in mark
-        fresh_complete = (
-            bool(mark.get("option_books_valid")) and bool(mark.get("future_book_valid"))
-            if has_validity_flags
-            else True
-        )
-        open_value = _optional_float(mark.get("open_liquidation_value_twd"))
-        carried = bool(mark.get("valuation_carried_forward"))
-        valuation_available = bool(
-            mark.get("valuation_available", open_value is not None)
-        )
-        if fresh_complete and open_value is not None:
-            last_complete_open_value[strategy_id] = (
-                cycle_id,
-                futures_position,
-                open_value,
-                decision_ts_ns,
-            )
-        elif "valuation_available" not in mark:
-            cached = last_complete_open_value.get(strategy_id)
-            if cached is not None and cached[:2] == (cycle_id, futures_position):
-                open_value = cached[2]
-                carried = True
-                valuation_available = True
-            else:
-                open_value = None
-                valuation_available = False
-        cumulative_pnl = _optional_float(
-            mark.get("cumulative_pnl_twd", mark.get("net_equity_twd"))
-        )
-        if carried and open_value is not None:
-            cumulative_pnl = gross_cash + open_value - fixed_fees - transaction_tax
-        total_equity = _optional_float(mark.get("total_equity_twd"))
-        if cumulative_pnl is not None and (total_equity is None or carried):
-            total_equity = capital_by_strategy[strategy_id] + cumulative_pnl
-        if not valuation_available:
-            cumulative_pnl = None
-            total_equity = None
-        cached_ts = (
-            last_complete_open_value.get(strategy_id, (None, 0, 0.0, 0))[3]
-            if carried
-            else decision_ts_ns
-        )
-        grouped_marks[strategy_id].append(
-            {
-                "recorded_at_utc": mark.get("recorded_at_utc"),
-                "decision_ts_ns": decision_ts_ns,
-                "strategy_id": strategy_id,
-                "net_equity_twd": cumulative_pnl,
-                "cumulative_pnl_twd": cumulative_pnl,
-                "initial_capital_twd": capital_by_strategy[strategy_id],
-                "total_equity_twd": total_equity,
-                "gross_cash_twd": gross_cash,
-                "open_liquidation_value_twd": open_value,
-                "fixed_fees_twd": fixed_fees,
-                "transaction_tax_twd": transaction_tax,
-                "explicit_cost_twd": fixed_fees + transaction_tax,
-                "futures_position": futures_position,
-                "fixed_capital_return": (
-                    cumulative_pnl / capital_by_strategy[strategy_id]
-                    if cumulative_pnl is not None
-                    and capital_by_strategy[strategy_id] > 0.0
-                    else None
-                ),
-                "valuation_available": valuation_available,
-                "valuation_stale": carried,
-                "valuation_carried_forward": carried,
-                "valuation_age_seconds": (
-                    max(0.0, (decision_ts_ns - cached_ts) / 1e9)
-                    if carried and cached_ts
-                    else 0.0
-                    if valuation_available
-                    else None
-                ),
-            }
-        )
-    history = [
-        row for strategy_id in strategy_ids for row in grouped_marks[str(strategy_id)]
-    ]
-    history.sort(key=lambda row: (row["decision_ts_ns"], row["strategy_id"]))
 
     option_contract_count = int(status.get("option_contract_count") or 0)
     latest_book_count = int(status.get("latest_book_count") or 0)
     expected_book_count = option_contract_count + 2
-    held_option_contract_count = int(
-        status.get("held_option_contract_count") or 0
-    )
-    held_option_subscribed_count = int(
-        status.get("held_option_subscribed_count") or 0
-    )
+    held_option_contract_count = int(status.get("held_option_contract_count") or 0)
+    held_option_subscribed_count = int(status.get("held_option_subscribed_count") or 0)
     held_option_book_count = int(status.get("held_option_book_count") or 0)
     pending_targets = status.get("pending_targets") or {}
     pending_rows = []
@@ -862,8 +1189,19 @@ def build_dashboard_snapshot(
             "order_failures": int(status.get("broker_order_failures") or 0),
             "inflight_order_count": int(status.get("inflight_order_count") or 0),
         },
+        "put_call_parity_tx": _safe_put_call_parity(
+            status.get("put_call_parity_tx", state.get("put_call_parity_tx"))
+        ),
         "market": {
             "underlying_contract": status.get("underlying_contract"),
+            "underlying_product": status.get("underlying_product"),
+            "underlying_multiplier_twd_per_point": status.get(
+                "underlying_multiplier_twd_per_point"
+            ),
+            "underlying_fee_per_side_twd": status.get("underlying_fee_per_side_twd"),
+            "underlying_initial_margin_per_contract_twd": status.get(
+                "underlying_initial_margin_per_contract_twd"
+            ),
             "hedge_contract": status.get("hedge_contract"),
             "hedge_product": status.get("hedge_product"),
             "hedge_multiplier_twd_per_point": status.get(
@@ -912,23 +1250,17 @@ def build_dashboard_snapshot(
             "strategy_fresh_valuation_count": fresh_valuation_count,
             "strategy_carried_valuation_count": carried_valuation_count,
             "strategy_timely_valuation_count": timely_valuation_count,
-            "strategy_recent_carried_valuation_count": (
-                recent_carried_valuation_count
-            ),
+            "strategy_recent_carried_valuation_count": (recent_carried_valuation_count),
             "strategy_valuation_coverage_ratio": (
                 valuation_available_count / strategy_count
                 if strategy_count > 0
                 else 0.0
             ),
             "strategy_fresh_valuation_coverage_ratio": (
-                fresh_valuation_count / strategy_count
-                if strategy_count > 0
-                else 0.0
+                fresh_valuation_count / strategy_count if strategy_count > 0 else 0.0
             ),
             "strategy_timely_valuation_coverage_ratio": (
-                timely_valuation_count / strategy_count
-                if strategy_count > 0
-                else 0.0
+                timely_valuation_count / strategy_count if strategy_count > 0 else 0.0
             ),
         },
         "active_cycle": _safe_cycle(status.get("active_cycle")),
@@ -979,6 +1311,12 @@ def build_dashboard_snapshot(
                 "subscription set; this is a generic feed metric, not proof that "
                 "every held leg can be valued."
             ),
+            "put_call_parity_tx_locked_edge": (
+                "4 TXO calls/puts versus 1 same-expiry TX. Gross terminal cash "
+                "edge minus configured entry fees, entry transaction taxes, "
+                "and conservative estimated cash-settlement taxes; financing "
+                "interest is intentionally zero."
+            ),
         },
         "exposure_taxonomy": EXPOSURE_TAXONOMY,
         "exposure_summary": _exposure_summary(strategy_rows, catalog_rows),
@@ -1019,5 +1357,6 @@ __all__ = [
     "DASHBOARD_SCHEMA_VERSION",
     "DEFAULT_MARK_LIMIT_PER_STRATEGY",
     "DEFAULT_MAX_SOURCE_AGE_SECONDS",
+    "build_dashboard_history_snapshot",
     "build_dashboard_snapshot",
 ]

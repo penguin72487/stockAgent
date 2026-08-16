@@ -3,11 +3,13 @@ from __future__ import annotations
 from collections import deque
 from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import date
+from datetime import date, datetime, timezone
+from email.utils import parsedate_to_datetime
 import hashlib
 import http.client
 import ipaddress
 import json
+import math
 import os
 from pathlib import Path
 from queue import Queue
@@ -161,6 +163,30 @@ PROVIDER_RATE_LIMITS: dict[str, ProviderRateLimit] = {
         source_url="https://www.okx.com/docs-v5/en/",
         note="GET /api/v5/market/history-candles",
     ),
+    "okx_history_mark_price_candles": ProviderRateLimit(
+        provider="okx_history_mark_price_candles",
+        requests=20,
+        seconds=2,
+        basis="official endpoint limit; IP",
+        source_url="https://www.okx.com/docs-v5/en/",
+        note="GET /api/v5/market/history-mark-price-candles",
+    ),
+    "okx_history_index_candles": ProviderRateLimit(
+        provider="okx_history_index_candles",
+        requests=10,
+        seconds=2,
+        basis="official endpoint limit; IP",
+        source_url="https://www.okx.com/docs-v5/en/",
+        note="GET /api/v5/market/history-index-candles",
+    ),
+    "okx_funding_rate_history": ProviderRateLimit(
+        provider="okx_funding_rate_history",
+        requests=10,
+        seconds=2,
+        basis="official endpoint limit; IP + Instrument ID",
+        source_url="https://www.okx.com/docs-v5/en/",
+        note="GET /api/v5/public/funding-rate-history; limiter is partitioned by instId.",
+    ),
     "bybit_public_rest": ProviderRateLimit(
         provider="bybit_public_rest",
         requests=600,
@@ -168,6 +194,31 @@ PROVIDER_RATE_LIMITS: dict[str, ProviderRateLimit] = {
         basis="official HTTP IP limit",
         source_url="https://bybit-exchange.github.io/docs/v5/rate-limit",
         note="Public market data shares the api.bybit.com IP bucket.",
+    ),
+    "binance_usdm_request_weight": ProviderRateLimit(
+        provider="binance_usdm_request_weight",
+        requests=2400,
+        seconds=60,
+        basis="official USD-M exchangeInfo REQUEST_WEIGHT fallback; IP",
+        source_url=(
+            "https://developers.binance.com/en/docs/catalog/"
+            "core-trading-derivatives-trading-usd-s-m-futures/api/rest-api/market-data"
+        ),
+        note=(
+            "Runtime exchangeInfo limits are authoritative. One limiter cost unit "
+            "equals one request-weight unit."
+        ),
+    ),
+    "shioaji_quote_query": ProviderRateLimit(
+        provider="shioaji_quote_query",
+        requests=50,
+        seconds=5,
+        basis="user-selected account ceiling; matches legacy PDF/C# 50/5s",
+        source_url="https://sinotrade.github.io/tutor/limit/",
+        note=(
+            "Ticks, snapshots, Kbars, credit and short-source queries share this "
+            "ceiling. Current Python docs also contain a conflicting 50/10s value."
+        ),
     ),
     "frankfurter_public": ProviderRateLimit(
         provider="frankfurter_public",
@@ -238,7 +289,7 @@ class SharedRateLimiter:
         # request-start rate.  The dispatcher never performs provider work: it
         # only claims the host-global slot, records it, and releases one waiter.
         self._dispatch_condition = threading.Condition()
-        self._dispatch_queue: deque[threading.Event] = deque()
+        self._dispatch_queue: deque[tuple[threading.Event, float]] = deque()
         self._dispatcher_thread: threading.Thread | None = None
         # Granted-slot telemetry can persist JSON and contend with hundreds of
         # provider workers. It must never run in the cadence-owning dispatcher
@@ -255,6 +306,8 @@ class SharedRateLimiter:
         self._grant_session_started_at = time.time()
         self._grant_times: deque[float] = deque()
         self._grant_total = 0
+        self._grant_cost_times: deque[tuple[float, float]] = deque()
+        self._grant_cost_total = 0.0
 
         root_value = state_dir or os.environ.get("STOCKAGENT_RATE_LIMIT_DIR")
         if root_value is None:
@@ -264,20 +317,32 @@ class SharedRateLimiter:
         digest = hashlib.sha256(self.name.encode("utf-8")).hexdigest()[:20]
         self._state_path = root / f"{digest}.state"
 
-    def _claim_process_shared(self) -> tuple[bool, float]:
+    @staticmethod
+    def _validated_cost(cost: float) -> float:
+        value = float(cost)
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError(
+                f"rate-limit cost must be finite and positive, got {cost!r}"
+            )
+        return value
+
+    def _claim_process_shared(self, cost: float = 1.0) -> tuple[bool, float]:
         """Claim the current slot only when it is ready.
 
         A caller that is too early gets a delay but does not reserve a future
         slot.  It must sleep and retry, which lets a concurrent ``defer()``
         extend the provider-wide cooldown before the request is sent.
         """
+        claim_cost = self._validated_cost(cost)
         if fcntl is None:
             with self._lock:
                 now = time.monotonic()
                 wait_s = max(0.0, self._next_time - now)
                 if wait_s > 0.0:
                     return False, wait_s
-                self._next_time = self._next_deadline(self._next_time, now)
+                self._next_time = self._next_deadline(
+                    self._next_time, now, cost=claim_cost
+                )
                 return True, 0.0
 
         self._state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -298,7 +363,7 @@ class SharedRateLimiter:
                 wait_s = max(0.0, next_time - now)
                 claimed = wait_s <= 0.0
                 if claimed:
-                    next_time = self._next_deadline(next_time, now)
+                    next_time = self._next_deadline(next_time, now, cost=claim_cost)
                     handle.seek(0)
                     handle.truncate()
                     handle.write(f"{next_time:.9f}\n")
@@ -307,7 +372,9 @@ class SharedRateLimiter:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
         return claimed, wait_s
 
-    def _next_deadline(self, previous_deadline: float, now: float) -> float:
+    def _next_deadline(
+        self, previous_deadline: float, now: float, *, cost: float = 1.0
+    ) -> float:
         """Advance an absolute schedule without accumulating wake-up jitter.
 
         Reset after a full missed interval so a suspended process never emits
@@ -316,11 +383,12 @@ class SharedRateLimiter:
         permanently lowers a 10 req/s policy to roughly 8 req/s under load.
         """
         interval = self.interval_seconds
+        claim_cost = self._validated_cost(cost)
         if interval <= 0.0:
             return now
         if previous_deadline <= 0.0 or now - previous_deadline >= interval:
-            return now + interval
-        return previous_deadline + interval
+            return now + interval * claim_cost
+        return previous_deadline + interval * claim_cost
 
     def _defer_process_shared(self, seconds: float) -> None:
         if fcntl is None:
@@ -390,9 +458,9 @@ class SharedRateLimiter:
             with self._dispatch_condition:
                 while not self._dispatch_queue:
                     self._dispatch_condition.wait()
-                ticket = self._dispatch_queue[0]
+                ticket, cost = self._dispatch_queue[0]
 
-            claimed, wait_s = self._claim_process_shared()
+            claimed, wait_s = self._claim_process_shared(cost=cost)
             if not claimed:
                 if wait_s > 0.0:
                     time.sleep(wait_s)
@@ -401,26 +469,27 @@ class SharedRateLimiter:
             with self._dispatch_condition:
                 # Only this dispatcher removes local tickets.  Keeping the
                 # identity check makes a future cancellation extension safe.
-                if not self._dispatch_queue or self._dispatch_queue[0] is not ticket:
+                if not self._dispatch_queue or self._dispatch_queue[0][0] is not ticket:
                     continue
                 self._dispatch_queue.popleft()
-                self._record_grant_locked()
+                self._record_grant_locked(cost=cost)
             if self._on_claim is not None:
                 with self._dispatch_condition:
                     self._ensure_claim_observer_locked()
                 self._claim_observer_queue.put(None)
             ticket.set()
 
-    def wait(self) -> None:
+    def wait(self, cost: float = 1.0) -> None:
+        claim_cost = self._validated_cost(cost)
         if self.interval_seconds <= 0.0:
             with self._dispatch_condition:
-                self._record_grant_locked()
+                self._record_grant_locked(cost=claim_cost)
             self._notify_claim()
             self._notify_caller_claim()
             return
         ticket = threading.Event()
         with self._dispatch_condition:
-            self._dispatch_queue.append(ticket)
+            self._dispatch_queue.append((ticket, claim_cost))
             self._ensure_dispatcher_locked()
             self._dispatch_condition.notify()
         ticket.wait()
@@ -453,13 +522,17 @@ class SharedRateLimiter:
         with self._dispatch_condition:
             return len(self._dispatch_queue)
 
-    def _record_grant_locked(self) -> None:
+    def _record_grant_locked(self, *, cost: float = 1.0) -> None:
         now = time.time()
         self._grant_times.append(now)
         self._grant_total += 1
+        self._grant_cost_times.append((now, float(cost)))
+        self._grant_cost_total += float(cost)
         cutoff = now - 60.0
         while self._grant_times and self._grant_times[0] < cutoff:
             self._grant_times.popleft()
+        while self._grant_cost_times and self._grant_cost_times[0][0] < cutoff:
+            self._grant_cost_times.popleft()
 
     def grant_activity(self, now: float | None = None) -> dict[str, float | int]:
         """Return dispatcher-boundary activity without observer timestamp lag."""
@@ -468,6 +541,8 @@ class SharedRateLimiter:
             cutoff = current - 60.0
             while self._grant_times and self._grant_times[0] < cutoff:
                 self._grant_times.popleft()
+            while self._grant_cost_times and self._grant_cost_times[0][0] < cutoff:
+                self._grant_cost_times.popleft()
             window_seconds = min(
                 60.0,
                 max(0.001, current - self._grant_session_started_at),
@@ -475,6 +550,10 @@ class SharedRateLimiter:
             return {
                 "grants_total": int(self._grant_total),
                 "grants_last_60s": len(self._grant_times),
+                "grant_cost_total": float(self._grant_cost_total),
+                "grant_cost_last_60s": float(
+                    sum(cost for _, cost in self._grant_cost_times)
+                ),
                 "window_seconds": window_seconds,
                 "pending_claim_observations": self._claim_observer_queue.qsize(),
             }
@@ -495,6 +574,67 @@ class SharedRateLimiter:
         delay = max(0.0, float(seconds))
         if delay > 0.0:
             self._defer_process_shared(delay)
+
+
+def parse_retry_after_seconds(
+    value: str | None,
+    *,
+    now: datetime | None = None,
+) -> float | None:
+    """Parse an HTTP Retry-After delta or date into non-negative seconds."""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        seconds = float(text)
+    except ValueError:
+        try:
+            retry_at = parsedate_to_datetime(text)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=timezone.utc)
+        current = now or datetime.now(timezone.utc)
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=timezone.utc)
+        seconds = (retry_at - current.astimezone(timezone.utc)).total_seconds()
+    if not math.isfinite(seconds):
+        return None
+    return max(0.0, seconds)
+
+
+def retry_delay_seconds(
+    attempt: int,
+    *,
+    base: float,
+    cap: float = 30.0,
+    retry_after: str | None = None,
+) -> float:
+    """Return the larger of bounded exponential backoff and Retry-After."""
+    exponential = min(
+        max(0.0, float(cap)), max(0.0, float(base)) * (2 ** max(0, int(attempt)))
+    )
+    provider_delay = parse_retry_after_seconds(retry_after)
+    return max(exponential, provider_delay or 0.0)
+
+
+def resolve_incremental_reconcile_start_ms(
+    *,
+    expected_first_ms: int,
+    earliest_existing_ms: int | None,
+    latest_existing_ms: int | None,
+    overlap_ms: int,
+) -> tuple[int, bool]:
+    """Resolve a tail update start without preserving a truncated history head."""
+    expected = int(expected_first_ms)
+    overlap = max(0, int(overlap_ms))
+    if (
+        earliest_existing_ms is None
+        or latest_existing_ms is None
+        or int(earliest_existing_ms) > expected + overlap
+    ):
+        return expected, True
+    return max(expected, int(latest_existing_ms) - overlap), False
 
 
 def provider_rate_limit(provider: str) -> ProviderRateLimit:

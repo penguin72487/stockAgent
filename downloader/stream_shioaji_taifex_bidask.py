@@ -23,6 +23,7 @@ from downloader.stream_shioaji_tw_microstructure import (
     normalize_fop_book,
     normalize_fop_tick,
 )
+from stockagent.live.shioaji_traffic_ledger import StreamingLedgerRecorder
 from stockagent.research.taifex_volatility_metadata import (
     CATALOG_EXPANSION_ENTRY_NEXT_CYCLE,
     CATALOG_EXPANSION_ENTRY_POLICIES,
@@ -84,6 +85,14 @@ def parse_args() -> argparse.Namespace:
         help=(
             "run the catalogued-strategy Shioaji simulation engine on worker 0; "
             "requires --simulation"
+        ),
+    )
+    parser.add_argument(
+        "--settle-expired-strategy-state-only",
+        action="store_true",
+        help=(
+            "cash-settle expired persisted strategy positions from the official "
+            "final-settlement file, then exit before subscriptions"
         ),
     )
     parser.add_argument(
@@ -503,6 +512,81 @@ def _stop_datetime(*, stop_time: str, stop_at: str) -> datetime:
     return datetime.combine(now.date(), parsed_time, tzinfo=TAIPEI)
 
 
+def _build_strategy_engine(
+    *,
+    args: argparse.Namespace,
+    api: Any,
+    shioaji_module: Any,
+    option_infos: Iterable[Any],
+    future_base: Any,
+    future_info: Any,
+    hedge_base: Any,
+    hedge_info: Any,
+    settlement_bootstrap_only: bool = False,
+) -> Any:
+    from stockagent.live.taifex_volatility_simulation import (
+        FuturesInstrument,
+        TaifexVolatilitySimulation,
+    )
+
+    bootstrap_after = (
+        date.fromisoformat(str(args.strategy_bootstrap_after))
+        if str(args.strategy_bootstrap_after).strip()
+        else None
+    )
+    return TaifexVolatilitySimulation(
+        api=api,
+        shioaji_module=shioaji_module,
+        state_dir=Path(args.strategy_state_dir),
+        option_infos=option_infos,
+        underlying=FuturesInstrument(
+            logical_code=str(args.future_code),
+            code=str(getattr(future_base, "code")),
+            contract=future_base,
+            last_trading_date=getattr(future_info, "last_trading_date", None),
+        ),
+        hedge=FuturesInstrument(
+            logical_code=str(args.hedge_future_code),
+            code=str(getattr(hedge_base, "code")),
+            contract=hedge_base,
+            last_trading_date=getattr(hedge_info, "last_trading_date", None),
+        ),
+        final_settlement_path=Path(args.final_settlement_path),
+        calibration_time=datetime_time.fromisoformat(
+            str(args.strategy_calibration_time)
+        ),
+        bootstrap_after=bootstrap_after,
+        broker_orders_enabled=not settlement_bootstrap_only,
+        strategy_mode=str(args.strategy_mode),
+        intraday_decision_interval_seconds=int(
+            args.strategy_intraday_interval_seconds
+        ),
+        intraday_entry_cutoff=datetime_time.fromisoformat(
+            str(args.strategy_intraday_entry_cutoff)
+        ),
+        intraday_flatten_time=datetime_time.fromisoformat(
+            str(args.strategy_intraday_flatten_time)
+        ),
+        night_entry_cutoff=datetime_time.fromisoformat(
+            str(args.strategy_night_entry_cutoff)
+        ),
+        night_flatten_time=datetime_time.fromisoformat(
+            str(args.strategy_night_flatten_time)
+        ),
+        option_risk_margin_a_twd=float(args.strategy_option_risk_margin_a_twd),
+        option_risk_margin_b_twd=float(args.strategy_option_risk_margin_b_twd),
+        option_risk_margin_c_twd=float(args.strategy_option_risk_margin_c_twd),
+        strategy_capital_buffer_multiple=float(
+            args.strategy_capital_buffer_multiple
+        ),
+        catalog_expansion_entry_policy=str(
+            args.strategy_catalog_expansion_entry_policy
+        ),
+        settlement_bootstrap_only=settlement_bootstrap_only,
+        startup_now=datetime.now(TAIPEI),
+    )
+
+
 def main() -> int:
     args = parse_args()
     if args.workers < 1 or not 0 <= args.worker_index < args.workers:
@@ -511,6 +595,12 @@ def main() -> int:
         raise RuntimeError("strategy execution requires the literal --simulation mode")
     if args.execute_strategies and int(args.worker_index) != 0:
         raise RuntimeError("strategy execution is owned only by worker 0")
+    if args.settle_expired_strategy_state_only and not args.simulation:
+        raise RuntimeError("strategy settlement bootstrap requires --simulation")
+    if args.settle_expired_strategy_state_only and args.execute_strategies:
+        raise RuntimeError(
+            "strategy settlement bootstrap cannot execute live strategy steps"
+        )
     capture_id = str(args.capture_id).strip() or f"single-{time.time_ns()}"
     if re.fullmatch(r"[A-Za-z0-9_.-]+", capture_id) is None:
         raise ValueError("capture-id contains unsupported characters")
@@ -539,16 +629,6 @@ def main() -> int:
     capture_trade_date = args.trade_date or taifex_trading_date(observed_start)
     shutdown = threading.Event()
     event_sequence = itertools.count(1)
-    sink = EventSink(
-        args.output_dir,
-        worker_index=int(args.worker_index),
-        capture_id=capture_id,
-        queue_size=int(args.queue_size),
-        flush_rows=int(args.flush_rows),
-        flush_seconds=float(args.flush_seconds),
-        stale_ms=float(args.stale_ms),
-    )
-
     def request_shutdown(_signum: int, _frame: Any) -> None:
         shutdown.set()
 
@@ -599,6 +679,31 @@ def main() -> int:
         raise LookupError(
             f"hedge future info not found: {getattr(hedge_base, 'code', '')}"
         )
+    if args.settle_expired_strategy_state_only:
+        strategy_engine = None
+        try:
+            strategy_engine = _build_strategy_engine(
+                args=args,
+                api=api,
+                shioaji_module=sj,
+                option_infos=(),
+                future_base=future_base,
+                future_info=future_info,
+                hedge_base=hedge_base,
+                hedge_info=hedge_info,
+                settlement_bootstrap_only=True,
+            )
+            print(
+                "[shioaji-taifex] expired_strategy_state_settlement=complete "
+                f"trade_date={capture_trade_date.isoformat()} "
+                f"state_dir={args.strategy_state_dir}",
+                flush=True,
+            )
+        finally:
+            if strategy_engine is not None:
+                strategy_engine.close()
+            api.logout()
+        return 0
     option_roots = tuple(
         dict.fromkeys(
             root.strip().upper()
@@ -654,6 +759,22 @@ def main() -> int:
         workers=int(args.workers),
     )
     contracts = [_base(info) for info in selected_infos]
+    sink = EventSink(
+        args.output_dir,
+        worker_index=int(args.worker_index),
+        capture_id=capture_id,
+        queue_size=int(args.queue_size),
+        flush_rows=int(args.flush_rows),
+        flush_seconds=float(args.flush_seconds),
+        stale_ms=float(args.stale_ms),
+    )
+    selected_contract_codes = {
+        str(getattr(contract, "code", "") or "") for contract in contracts
+    }
+    sink.live_book_codes = ({
+        str(getattr(future_base, "code", "") or ""),
+        str(getattr(hedge_base, "code", "") or ""),
+    } & selected_contract_codes) - {""}
     subscriptions_requested = len(contracts) * 2
     if subscriptions_requested > 200:
         api.logout()
@@ -674,78 +795,23 @@ def main() -> int:
         )
         for info in selected_infos
     ]
+    sink.live_book_metadata = {
+        str(row.get("code") or ""): row
+        for row in contract_metadata
+        if str(row.get("code") or "") in sink.live_book_codes
+    }
 
     strategy_engine = None
     if args.execute_strategies:
-        from stockagent.live.taifex_volatility_simulation import (
-            FuturesInstrument,
-            TaifexVolatilitySimulation,
-        )
-
-        bootstrap_after = (
-            date.fromisoformat(str(args.strategy_bootstrap_after))
-            if str(args.strategy_bootstrap_after).strip()
-            else None
-        )
-        calibration_time = datetime_time.fromisoformat(
-            str(args.strategy_calibration_time)
-        )
-        intraday_entry_cutoff = datetime_time.fromisoformat(
-            str(args.strategy_intraday_entry_cutoff)
-        )
-        intraday_flatten_time = datetime_time.fromisoformat(
-            str(args.strategy_intraday_flatten_time)
-        )
-        night_entry_cutoff = datetime_time.fromisoformat(
-            str(args.strategy_night_entry_cutoff)
-        )
-        night_flatten_time = datetime_time.fromisoformat(
-            str(args.strategy_night_flatten_time)
-        )
-        strategy_engine = TaifexVolatilitySimulation(
+        strategy_engine = _build_strategy_engine(
+            args=args,
             api=api,
             shioaji_module=sj,
-            state_dir=Path(args.strategy_state_dir),
             option_infos=selected_infos[len(futures_infos) :],
-            underlying=FuturesInstrument(
-                logical_code=str(args.future_code),
-                code=str(getattr(future_base, "code")),
-                contract=future_base,
-                last_trading_date=getattr(future_info, "last_trading_date", None),
-            ),
-            hedge=FuturesInstrument(
-                logical_code=str(args.hedge_future_code),
-                code=str(getattr(hedge_base, "code")),
-                contract=hedge_base,
-                last_trading_date=getattr(hedge_info, "last_trading_date", None),
-            ),
-            final_settlement_path=Path(args.final_settlement_path),
-            calibration_time=calibration_time,
-            bootstrap_after=bootstrap_after,
-            broker_orders_enabled=True,
-            strategy_mode=str(args.strategy_mode),
-            intraday_decision_interval_seconds=int(
-                args.strategy_intraday_interval_seconds
-            ),
-            intraday_entry_cutoff=intraday_entry_cutoff,
-            intraday_flatten_time=intraday_flatten_time,
-            night_entry_cutoff=night_entry_cutoff,
-            night_flatten_time=night_flatten_time,
-            option_risk_margin_a_twd=float(
-                args.strategy_option_risk_margin_a_twd
-            ),
-            option_risk_margin_b_twd=float(
-                args.strategy_option_risk_margin_b_twd
-            ),
-            option_risk_margin_c_twd=float(
-                args.strategy_option_risk_margin_c_twd
-            ),
-            strategy_capital_buffer_multiple=float(
-                args.strategy_capital_buffer_multiple
-            ),
-            catalog_expansion_entry_policy=str(
-                args.strategy_catalog_expansion_entry_policy
-            ),
+            future_base=future_base,
+            future_info=future_info,
+            hedge_base=hedge_base,
+            hedge_info=hedge_info,
         )
         api.set_order_callback(strategy_engine.on_order_event)
 
@@ -786,6 +852,31 @@ def main() -> int:
             sink.fatal_event.set()
 
     sink.start()
+    stream_ledger = StreamingLedgerRecorder(
+        consumer="taifex_fop_stream",
+        asset_class="futures_options",
+        details={
+            "worker_index": int(args.worker_index),
+            "session": capture_session,
+            "trade_date": capture_trade_date.isoformat(),
+        },
+    )
+    last_ledger_observation = time.monotonic()
+
+    def observe_stream_ledger() -> None:
+        stats = sink.stats
+        stream_ledger.observe(
+            tick_events=stats.tick_events,
+            book_events=stats.book_events,
+            snapshot_rows=stats.book_1s_rows,
+            dropped_events=stats.dropped_events,
+            stored_bytes=(
+                sink.tick_writer.total_bytes
+                + sink.book_writer.total_bytes
+                + sink.snapshot_writer.total_bytes
+            ),
+        )
+
     subscribed = 0
     status = "running"
     try:
@@ -813,6 +904,9 @@ def main() -> int:
             flush=True,
         )
         while datetime.now(TAIPEI) < stop_at and not shutdown.wait(0.5):
+            if time.monotonic() - last_ledger_observation >= 60.0:
+                observe_stream_ledger()
+                last_ledger_observation = time.monotonic()
             if sink.fatal_event.is_set():
                 status = "failed_event_loss_or_normalization"
                 break
@@ -826,6 +920,7 @@ def main() -> int:
             status = "failed_no_bidask_events"
     finally:
         sink.stop()
+        observe_stream_ledger()
         if strategy_engine is not None:
             strategy_engine.close()
         try:

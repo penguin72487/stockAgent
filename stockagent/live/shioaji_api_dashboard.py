@@ -9,8 +9,9 @@ from __future__ import annotations
 
 import csv
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import json
+import math
 from pathlib import Path
 import re
 import subprocess
@@ -37,6 +38,12 @@ _CAPTURE_START_PATTERN = re.compile(
 _WORKER_PATTERN = re.compile(
     r"worker=(\d+)/(\d+)\s+contracts=(\d+)\s+subscriptions=(\d+)"
 )
+_HISTORY_PROGRESS_PATTERN = re.compile(
+    r"^\[shioaji-futures-history\]\s+(\d+)/(\d+)\s+"
+    r"contract=([A-Z0-9]+)\b"
+)
+HISTORY_RATE_SAMPLE_LIMIT: Final[int] = 120
+QUOTA_WINDOW_SCENARIO_SECONDS: Final[int] = 24 * 60 * 60
 
 
 CommandRunner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
@@ -53,6 +60,8 @@ class ShioajiMonitorPaths:
     capture_root: Path
     daily_summary: Path | None = None
     daily_progress: Path | None = None
+    daily_dataset_summary: Path | None = None
+    daily_audit: Path | None = None
     minute_summary: Path | None = None
     minute_manifest: Path | None = None
     minute_audit: Path | None = None
@@ -62,6 +71,8 @@ class ShioajiMonitorPaths:
     hft_audit_root: Path | None = None
     contract_inventory_manifest: Path | None = None
     snapshot_state: Path | None = None
+    traffic_ledger_summary: Path | None = None
+    storage_summary: Path | None = None
 
     @classmethod
     def from_repo(cls, repo_root: Path) -> ShioajiMonitorPaths:
@@ -77,6 +88,9 @@ class ShioajiMonitorPaths:
             capture_root=root / "data_tw_index_derivatives_ticks/shioaji_fop_captures",
             daily_summary=root / "data_tw_public/shioaji/download_summary.json",
             daily_progress=root / "data_tw_public/shioaji/progress.json",
+            daily_dataset_summary=root
+            / "data_tw_public/shioaji/stocks/shioaji_dataset_summary.json",
+            daily_audit=root / "artifacts/data_quality/tw_shioaji_audit.json",
             minute_summary=root / "data_tw_minute/shioaji_1m/download_summary.json",
             minute_manifest=root / "data_tw_minute/research_dataset/manifest.json",
             minute_audit=root / "data_tw_minute/audits/full_latest.json",
@@ -88,7 +102,246 @@ class ShioajiMonitorPaths:
             contract_inventory_manifest=root
             / "data_tw_futures/shioaji_contracts/manifest.json",
             snapshot_state=root / "artifacts/live/tw_day_trade_simulation/state.json",
+            traffic_ledger_summary=root / "artifacts/live/shioaji_traffic/summary.json",
+            storage_summary=root / "artifacts/live/shioaji_storage/summary.json",
         )
+
+
+def _traffic_ledger_view(payload: dict[str, Any] | None) -> dict[str, Any]:
+    source = payload or {}
+
+    def bucket(value: Any) -> dict[str, int]:
+        item = value if isinstance(value, dict) else {}
+        return {
+            key: int(item.get(key) or 0)
+            for key in (
+                "events",
+                "queries",
+                "avoided_queries",
+                "rows",
+                "failures",
+                "observed_usage_delta_bytes",
+                "stream_observations",
+                "stream_tick_events",
+                "stream_book_events",
+                "stream_snapshot_rows",
+                "stream_dropped_events",
+                "stream_stored_bytes",
+            )
+        }
+
+    return {
+        "ledger_date": source.get("ledger_date"),
+        "observation_date": source.get("observation_date"),
+        "updated_at_utc": source.get("updated_at_utc"),
+        "quota_epoch": {
+            "id": (source.get("quota_epoch") or {}).get("id"),
+            "started_at_utc": (source.get("quota_epoch") or {}).get(
+                "started_at_utc"
+            ),
+            "boundary_kind": (source.get("quota_epoch") or {}).get(
+                "boundary_kind"
+            ),
+            "reset_observed": bool(
+                (source.get("quota_epoch") or {}).get("reset_observed")
+            ),
+        },
+        "latest_reset": {
+            key: (source.get("latest_reset") or {}).get(key)
+            for key in (
+                "kind",
+                "observed_at_utc",
+                "previous_used_bytes",
+                "new_used_bytes",
+                "previous_limit_bytes",
+                "new_limit_bytes",
+                "consumer",
+                "method",
+            )
+        }
+        if isinstance(source.get("latest_reset"), dict)
+        else None,
+        "totals": bucket(source.get("totals")),
+        "by_consumer": [
+            {"name": str(name), **bucket(value)}
+            for name, value in sorted((source.get("by_consumer") or {}).items())
+            if isinstance(value, dict)
+        ],
+        "by_method": [
+            {"name": str(name), **bucket(value)}
+            for name, value in sorted((source.get("by_method") or {}).items())
+            if isinstance(value, dict)
+        ],
+        "by_asset_class": [
+            {"name": str(name), **bucket(value)}
+            for name, value in sorted((source.get("by_asset_class") or {}).items())
+            if isinstance(value, dict)
+        ],
+    }
+
+
+def _storage_view(payload: dict[str, Any] | None, *, now: datetime) -> dict[str, Any]:
+    """Allowlist a compact storage snapshot for the public response."""
+
+    source = payload if isinstance(payload, dict) else {}
+    generated_at = source.get("generated_at_utc")
+    parsed_at = _parse_datetime(generated_at)
+
+    def optional_number(value: Any) -> int | float | None:
+        return value if isinstance(value, (int, float)) and value >= 0 else None
+
+    def optional_signed_number(value: Any) -> int | float | None:
+        return value if isinstance(value, (int, float)) else None
+
+    summary_source = source.get("summary")
+    summary_item = summary_source if isinstance(summary_source, dict) else {}
+    summary_keys = (
+        "datasets",
+        "files",
+        "total_bytes",
+        "source_bytes",
+        "derived_bytes",
+        "operations_bytes",
+        "growth_window_days",
+        "growth_window_bytes",
+        "average_daily_growth_bytes",
+        "observed_growth_days",
+        "capacity_growth_estimate_bytes",
+        "disk_total_bytes",
+        "disk_used_bytes",
+        "disk_free_bytes",
+        "disk_used_ratio",
+        "estimated_days_remaining",
+    )
+    datasets: list[dict[str, Any]] = []
+    source_datasets = source.get("datasets")
+    for row in (source_datasets if isinstance(source_datasets, list) else [])[:16]:
+        if not isinstance(row, dict):
+            continue
+        datasets.append(
+            {
+                "id": str(row.get("id") or "unknown"),
+                "title": str(row.get("title") or "未命名資料"),
+                "storage_class": str(row.get("storage_class") or "unknown"),
+                "quota_class": str(row.get("quota_class") or "none"),
+                "description": str(row.get("description") or ""),
+                "bytes": optional_number(row.get("bytes")),
+                "files": optional_number(row.get("files")),
+                "latest_changed_at_utc": row.get("latest_changed_at_utc"),
+                "growth_window_days": optional_number(row.get("growth_window_days")),
+                "growth_window_bytes": optional_number(row.get("growth_window_bytes")),
+                "average_daily_growth_bytes": optional_number(
+                    row.get("average_daily_growth_bytes")
+                ),
+                "average_active_day_growth_bytes": optional_number(
+                    row.get("average_active_day_growth_bytes")
+                ),
+                "active_growth_days": optional_number(row.get("active_growth_days")),
+                "growth_source": str(row.get("growth_source") or "unknown"),
+            }
+        )
+    daily_growth: list[dict[str, Any]] = []
+    source_growth = source.get("daily_growth")
+    for row in (source_growth if isinstance(source_growth, list) else [])[-30:]:
+        if not isinstance(row, dict) or not isinstance(row.get("date"), str):
+            continue
+        daily_growth.append(
+            {"date": row["date"], "bytes": optional_number(row.get("bytes"))}
+        )
+    definitions = source.get("definitions")
+    return {
+        "status": "ready" if datasets else "collecting",
+        "generated_at_utc": (
+            parsed_at.isoformat().replace("+00:00", "Z") if parsed_at else None
+        ),
+        "age_seconds": (
+            max(0.0, (now - parsed_at).total_seconds()) if parsed_at else None
+        ),
+        "scan_seconds": optional_number(source.get("scan_seconds")),
+        "summary": {
+            **{key: optional_number(summary_item.get(key)) for key in summary_keys},
+            "observed_average_daily_net_growth_bytes": optional_signed_number(
+                summary_item.get("observed_average_daily_net_growth_bytes")
+            ),
+            "capacity_growth_source": str(
+                summary_item.get("capacity_growth_source") or "unknown"
+            ),
+        },
+        "datasets": datasets,
+        "daily_growth": daily_growth,
+        "definitions": {
+            str(key): str(value)
+            for key, value in (
+                definitions if isinstance(definitions, dict) else {}
+            ).items()
+            if isinstance(value, str)
+        },
+    }
+
+
+_PIPELINE_CONSUMERS: Final[dict[str, tuple[str, ...]]] = {
+    "futures_history": ("futures_history_backfill",),
+    "stock_minute": ("stock_minute_backfill", "stock_minute_gap_recovery"),
+    "stock_daily": ("stock_daily_legacy_backfill", "stock_daily_materializer"),
+    "fop_stream": ("taifex_fop_stream",),
+    "top200_stream": ("stock_top200_stream",),
+    "on_demand_snapshots": (
+        "stock_quote_provider",
+        "tw_day_trade_futures_benchmark",
+    ),
+}
+
+
+def _traffic_breakdown(
+    pipelines: list[dict[str, Any]], ledger: dict[str, Any]
+) -> list[dict[str, Any]]:
+    consumers = {
+        str(item.get("name") or ""): item
+        for item in ledger.get("by_consumer", [])
+        if isinstance(item, dict)
+    }
+    rows: list[dict[str, Any]] = []
+    for pipeline in pipelines:
+        pipeline_id = str(pipeline.get("id") or "unknown")
+        names = _PIPELINE_CONSUMERS.get(pipeline_id, ())
+        matched = [consumers[name] for name in names if name in consumers]
+
+        def total(field: str) -> int:
+            return sum(int(item.get(field) or 0) for item in matched)
+
+        quota_class = str(pipeline.get("quota") or "none")
+        if quota_class == "historical":
+            usage_status = "measured" if matched else "unattributed"
+            attributed_bytes: int | None = (
+                total("observed_usage_delta_bytes") if matched else None
+            )
+            price_label = "本地無費用欄位；受每日歷史流量額度限制"
+        elif quota_class == "realtime":
+            usage_status = "quota_exempt"
+            attributed_bytes = 0
+            price_label = "本地無費用欄位；即時推送不扣歷史流量"
+        else:
+            usage_status = "local_only"
+            attributed_bytes = 0
+            price_label = "本機資料處理；不呼叫行情 API"
+        rows.append(
+            {
+                "id": pipeline_id,
+                "title": str(pipeline.get("title") or "未命名資料"),
+                "api_surface": str(pipeline.get("api_surface") or "—"),
+                "quota_class": quota_class,
+                "price_label": price_label,
+                "usage_status": usage_status,
+                "attributed_bytes": attributed_bytes,
+                "queries": total("queries"),
+                "avoided_queries": total("avoided_queries"),
+                "stream_events": total("stream_tick_events")
+                + total("stream_book_events"),
+                "stream_stored_bytes": total("stream_stored_bytes"),
+                "consumers": list(names),
+            }
+        )
+    return rows
 
 
 def _default_command_runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
@@ -193,6 +446,318 @@ def _coverage(
     }
 
 
+def _eta(
+    state: str,
+    *,
+    remaining_seconds: int | float | None = None,
+    estimated_complete_at_utc: str | None = None,
+    confidence: str = "not_applicable",
+    basis: str,
+    processing_seconds: int | float | None = None,
+    sample_units: int | None = None,
+    sample_seconds: int | float | None = None,
+    units_per_hour: int | float | None = None,
+    quota_windows_remaining: int | None = None,
+    assumption: str | None = None,
+) -> dict[str, Any]:
+    """Return one stable, public-safe ETA contract for every pipeline."""
+
+    def seconds(value: int | float | None) -> int | None:
+        if not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+            return None
+        return max(0, int(math.ceil(float(value))))
+
+    return {
+        "state": state,
+        "remaining_seconds": seconds(remaining_seconds),
+        "estimated_complete_at_utc": estimated_complete_at_utc,
+        "confidence": confidence,
+        "basis": basis,
+        "processing_seconds": seconds(processing_seconds),
+        "sample_units": sample_units if isinstance(sample_units, int) else None,
+        "sample_seconds": seconds(sample_seconds),
+        "units_per_hour": (
+            round(float(units_per_hour), 3)
+            if isinstance(units_per_hour, (int, float))
+            and math.isfinite(float(units_per_hour))
+            and float(units_per_hour) >= 0
+            else None
+        ),
+        "quota_windows_remaining": (
+            quota_windows_remaining
+            if isinstance(quota_windows_remaining, int)
+            and quota_windows_remaining >= 0
+            else None
+        ),
+        "assumption": assumption,
+    }
+
+
+def _complete_eta(basis: str) -> dict[str, Any]:
+    return _eta(
+        "complete",
+        remaining_seconds=0,
+        confidence="high",
+        basis=basis,
+        processing_seconds=0,
+    )
+
+
+def _continuous_eta(basis: str) -> dict[str, Any]:
+    return _eta("continuous", confidence="not_applicable", basis=basis)
+
+
+def _history_progress_sample(
+    entries: Iterable[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Measure recent receipt throughput without persisting monitor-side state."""
+
+    points: list[tuple[float, str, str, int, int, int | None]] = []
+    for entry in entries:
+        message = str(entry.get("MESSAGE") or "")
+        match = _HISTORY_PROGRESS_PATTERN.search(message)
+        if match is None:
+            continue
+        epoch, _observed_at = _entry_timestamp(entry)
+        if epoch <= 0:
+            continue
+        sequence, total, contract = match.groups()
+        traffic_match = _TRAFFIC_PATTERN.search(message)
+        used = (
+            int(traffic_match.group(1).replace(",", ""))
+            if traffic_match is not None
+            else None
+        )
+        points.append(
+            (
+                epoch,
+                str(entry.get("_SYSTEMD_INVOCATION_ID") or "unknown"),
+                contract,
+                int(sequence),
+                int(total),
+                used,
+            )
+        )
+    if len(points) < 2:
+        return None
+
+    # A long-lived wrapper can restart the per-contract command after a quota
+    # reset, which resets N/total to 1. Keep only the latest monotonic run.
+    runs: list[list[tuple[float, str, str, int, int, int | None]]] = []
+    for point in sorted(points):
+        if not runs:
+            runs.append([point])
+            continue
+        previous = runs[-1][-1]
+        same_run = (
+            point[1] == previous[1]
+            and point[2] == previous[2]
+            and point[4] == previous[4]
+            and point[3] > previous[3]
+        )
+        if same_run:
+            runs[-1].append(point)
+        else:
+            runs.append([point])
+    run = max(runs, key=lambda item: item[-1][0])[-HISTORY_RATE_SAMPLE_LIMIT:]
+    if len(run) < 2:
+        return None
+    elapsed = run[-1][0] - run[0][0]
+    completed_units = run[-1][3] - run[0][3]
+    if elapsed <= 0 or completed_units <= 0:
+        return None
+    positive_usage_delta = 0
+    for previous, current in zip(run, run[1:]):
+        if previous[5] is None or current[5] is None:
+            continue
+        positive_usage_delta += max(0, current[5] - previous[5])
+    rate = completed_units / elapsed
+    return {
+        "sample_contract": run[-1][2],
+        "sample_units": completed_units,
+        "sample_seconds": elapsed,
+        "units_per_second": rate,
+        "units_per_hour": rate * 3600,
+        "bytes_per_unit": (
+            positive_usage_delta / completed_units
+            if positive_usage_delta > 0
+            else None
+        ),
+        "observed_at_utc": _iso_from_epoch(run[-1][0]),
+    }
+
+
+def _history_eta(
+    backfill: dict[str, Any],
+    traffic: dict[str, Any],
+    *,
+    now: datetime,
+) -> dict[str, Any]:
+    if backfill.get("state") == "complete":
+        return _complete_eta("所有目標合約交易日皆已有 receipt。")
+
+    current = int(backfill.get("resolved_contract_dates") or 0)
+    total = int(backfill.get("expected_contract_dates") or 0)
+    remaining_units = max(0, total - current)
+    sample = backfill.get("rate_sample")
+    if total <= 0:
+        return _eta(
+            "unknown",
+            confidence="none",
+            basis="尚未建立完整合約交易日母數。",
+        )
+    if remaining_units <= 0:
+        return _complete_eta("所有目標合約交易日皆已有 receipt。")
+    if not isinstance(sample, dict) or not isinstance(
+        sample.get("units_per_second"), (int, float)
+    ):
+        return _eta(
+            "unknown",
+            confidence="none",
+            basis="尚未累積至少兩個同一批次的逐日 receipt 速度樣本。",
+        )
+    rate = float(sample["units_per_second"])
+    if rate <= 0 or not math.isfinite(rate):
+        return _eta(
+            "unknown", confidence="none", basis="最近樣本沒有正的完成速度。"
+        )
+
+    processing_seconds = remaining_units / rate
+    remaining_seconds = processing_seconds
+    quota_windows = 0
+    assumption = None
+    confidence = "medium" if int(sample.get("sample_units") or 0) >= 30 else "low"
+    sample_contract = str(sample.get("sample_contract") or "目前合約")
+    basis = (
+        f"最近 {sample_contract} 的 {int(sample.get('sample_units') or 0):,} 個 "
+        "receipt 實測速度；"
+        "不含尚未發生的等待。"
+    )
+    bytes_per_unit = sample.get("bytes_per_unit")
+    guard_limit = traffic.get("guard_limit_bytes")
+    safe_remaining = traffic.get("safe_remaining_bytes")
+    if (
+        isinstance(bytes_per_unit, (int, float))
+        and float(bytes_per_unit) > 0
+        and isinstance(guard_limit, int)
+        and guard_limit > 0
+        and isinstance(safe_remaining, int)
+    ):
+        full_window_units = max(1, int(guard_limit / float(bytes_per_unit)))
+        current_window_units = max(0, int(safe_remaining / float(bytes_per_unit)))
+        units_after_current_window = max(0, remaining_units - current_window_units)
+        quota_windows = (
+            math.ceil(units_after_current_window / full_window_units)
+            if units_after_current_window > 0
+            else 0
+        )
+        if quota_windows > 0:
+            final_window_units = units_after_current_window - (
+                quota_windows - 1
+            ) * full_window_units
+            quota_scenario_seconds = (
+                quota_windows * QUOTA_WINDOW_SCENARIO_SECONDS
+                + final_window_units / rate
+            )
+            remaining_seconds = max(processing_seconds, quota_scenario_seconds)
+            confidence = "low"
+            assumption = "one_equivalent_quota_window_per_24h_scenario"
+            basis = (
+                f"最近 {sample_contract} 的 {int(sample.get('sample_units') or 0):,} "
+                "個 receipt 速度與單位流量外推全佇列；商品流量差異大。日曆時間以"
+                "每 24 小時取得一個同等安全額度窗口作低信心情境，並非已確認的"
+                "永豐重置政策。"
+            )
+
+    waiting_observed = _parse_datetime(backfill.get("waiting_observed_at_utc"))
+    waiting_seconds = backfill.get("waiting_seconds_at_observation")
+    if (
+        quota_windows == 0
+        and waiting_observed is not None
+        and isinstance(waiting_seconds, int)
+    ):
+        remaining_wait = max(
+            0.0,
+            float(waiting_seconds) - max(0.0, (now - waiting_observed).total_seconds()),
+        )
+        remaining_seconds += remaining_wait
+
+    service_active = bool(backfill.get("service_active"))
+    eta_state = (
+        "waiting_quota"
+        if backfill.get("state") == "waiting_quota"
+        else "waiting_market"
+        if backfill.get("state") == "waiting_market"
+        else "estimated"
+        if service_active
+        else "paused"
+    )
+    completion = (
+        (now + timedelta(seconds=remaining_seconds))
+        .isoformat()
+        .replace("+00:00", "Z")
+        if service_active
+        else None
+    )
+    return _eta(
+        eta_state,
+        remaining_seconds=remaining_seconds,
+        estimated_complete_at_utc=completion,
+        confidence=confidence,
+        basis=basis,
+        processing_seconds=processing_seconds,
+        sample_units=int(sample.get("sample_units") or 0),
+        sample_seconds=sample.get("sample_seconds"),
+        units_per_hour=sample.get("units_per_hour"),
+        quota_windows_remaining=quota_windows,
+        assumption=assumption,
+    )
+
+
+def _progress_eta(
+    *,
+    current: int,
+    total: int,
+    elapsed_seconds: int | float | None,
+    active: bool,
+    complete: bool,
+    complete_basis: str,
+    running_basis: str,
+    paused_basis: str,
+    now: datetime,
+) -> dict[str, Any]:
+    if complete or (total > 0 and current >= total):
+        return _complete_eta(complete_basis)
+    if (
+        current <= 0
+        or total <= current
+        or not isinstance(elapsed_seconds, (int, float))
+        or float(elapsed_seconds) <= 0
+    ):
+        return _eta(
+            "unknown",
+            confidence="none",
+            basis="尚無完成工作量與經過時間的成對樣本。",
+        )
+    rate = current / float(elapsed_seconds)
+    remaining = (total - current) / rate
+    return _eta(
+        "estimated" if active else "paused",
+        remaining_seconds=remaining,
+        estimated_complete_at_utc=(
+            (now + timedelta(seconds=remaining)).isoformat().replace("+00:00", "Z")
+            if active
+            else None
+        ),
+        confidence="medium" if active else "low",
+        basis=running_basis if active else paused_basis,
+        processing_seconds=remaining,
+        sample_units=current,
+        sample_seconds=elapsed_seconds,
+        units_per_hour=rate * 3600,
+    )
+
+
 def _iso_from_epoch(value: float) -> str:
     return datetime.fromtimestamp(value, tz=UTC).isoformat().replace("+00:00", "Z")
 
@@ -212,6 +777,7 @@ def _journal_entries(
                 unit,
                 f"--since={since}",
                 "--output=json",
+                "--output-fields=MESSAGE,__REALTIME_TIMESTAMP,_SYSTEMD_INVOCATION_ID",
                 "--no-pager",
                 f"--lines={int(lines)}",
             )
@@ -427,9 +993,7 @@ def _latest_capture_receipt(root: Path | None) -> dict[str, Any]:
     return {
         "trade_date": str(latest.get("trade_date") or "") or None,
         "session": str(latest.get("capture_session") or "") or None,
-        "status": (
-            next(iter(status_values)) if len(status_values) == 1 else "mixed"
-        ),
+        "status": (next(iter(status_values)) if len(status_values) == 1 else "mixed"),
         "workers": len(selected),
         "instruments": sum(
             int(item.get("contract_count") or item.get("symbol_count") or 0)
@@ -510,12 +1074,22 @@ def _top200_failure(entries: Iterable[dict[str, Any]]) -> dict[str, Any] | None:
         message = str(entry.get("MESSAGE") or "")
         code = None
         detail = None
+        if any(
+            marker in message
+            for marker in (
+                "runner_started=",
+                "capture_start=",
+                "capture_complete",
+                "reason=connection_budget",
+            )
+        ):
+            # A later clean lifecycle/wait record supersedes an older failed
+            # invocation.  Historical errors remain in the journal but must
+            # not permanently poison the current pipeline status.
+            failure = None
         if "ModuleNotFoundError" in message and "stockagent" in message:
             code = "runtime_import_error"
             detail = "執行環境找不到 stockagent 模組"
-        elif "reason=connection_budget" in message:
-            code = "connection_budget"
-            detail = "連線額度優先保留給期貨與選擇權即時擷取"
         elif "capture_failed" in message and failure is None:
             code = "capture_failed"
             detail = "最近一次擷取未完成"
@@ -524,6 +1098,22 @@ def _top200_failure(entries: Iterable[dict[str, Any]]) -> dict[str, Any] | None:
         _epoch, observed_at = _entry_timestamp(entry)
         failure = {"code": code, "detail": detail, "observed_at_utc": observed_at}
     return failure
+
+
+def _top200_priority_wait(entries: Iterable[dict[str, Any]]) -> dict[str, Any] | None:
+    """Return the latest intentional derivatives-first connection gate."""
+
+    waiting: dict[str, Any] | None = None
+    for entry in entries:
+        if "reason=connection_budget" not in str(entry.get("MESSAGE") or ""):
+            continue
+        _epoch, observed_at = _entry_timestamp(entry)
+        waiting = {
+            "code": "connection_budget",
+            "detail": "連線額度依設定優先保留給期貨與選擇權即時擷取",
+            "observed_at_utc": observed_at,
+        }
+    return waiting
 
 
 def _capture_status(
@@ -593,6 +1183,15 @@ def _backfill_status(
     entries: list[dict[str, Any]],
     service: dict[str, Any],
 ) -> dict[str, Any]:
+    invocation_id = service.get("invocation_id")
+    if invocation_id:
+        current_entries = [
+            item
+            for item in entries
+            if item.get("_SYSTEMD_INVOCATION_ID") == invocation_id
+        ]
+        if current_entries:
+            entries = current_entries
     alias_count = _inventory_count(paths.alias_inventory)
     expected_per_contract = max(
         (int(item.get("expected_trading_dates") or 0) for item in manifests),
@@ -604,8 +1203,21 @@ def _backfill_status(
     current_contract = None
     waiting_reason = None
     waiting_seconds = None
+    waiting_observed_at = None
     for entry in entries:
         message = str(entry.get("MESSAGE") or "")
+        if (
+            "runner_started=" in message
+            or "contract_start=" in message
+            or message.startswith("[shioaji-futures-history]")
+        ):
+            # The dashboard service may not be allowed to query systemd's
+            # InvocationID.  In that hardened fallback, a later lifecycle or
+            # progress record must supersede an older quota wait from the
+            # preceding service invocation.
+            waiting_reason = None
+            waiting_seconds = None
+            waiting_observed_at = None
         contract_match = _CONTRACT_PATTERN.search(message)
         if contract_match:
             current_contract = contract_match.group(1)
@@ -614,6 +1226,7 @@ def _backfill_status(
             waiting_seconds = int(wait_match.group(1))
             waiting_reason = wait_match.group(2)
             current_contract = wait_match.group(3)
+            _epoch, waiting_observed_at = _entry_timestamp(entry)
     current = next(
         (item for item in manifests if item.get("contract") == current_contract), None
     )
@@ -646,6 +1259,7 @@ def _backfill_status(
         "state": state,
         "waiting_reason": waiting_reason,
         "waiting_seconds_at_observation": waiting_seconds,
+        "waiting_observed_at_utc": waiting_observed_at,
         "target_end_date": target_end_date or None,
         "inventory_contracts": alias_count,
         "started_contracts": len(manifests),
@@ -663,6 +1277,7 @@ def _backfill_status(
         "current_contract_expected_dates": int(
             (current or {}).get("expected_trading_dates") or expected_per_contract
         ),
+        "rate_sample": _history_progress_sample(entries),
         "contracts": [
             {
                 "contract": str(item.get("contract") or ""),
@@ -690,6 +1305,7 @@ def _build_pipelines(
     top200_service: dict[str, Any],
     snapshot_service: dict[str, Any],
     top200_entries: list[dict[str, Any]],
+    traffic: dict[str, Any],
 ) -> list[dict[str, Any]]:
     minute_summary = _read_json(paths.minute_summary) if paths.minute_summary else None
     minute_manifest = (
@@ -701,9 +1317,7 @@ def _build_pipelines(
         and (minute_audit or {}).get("status") == "research_ready"
     )
     minute_total = int((minute_summary or {}).get("selected_symbols") or 0)
-    minute_available = int(
-        (minute_audit or {}).get("available_source_symbols") or 0
-    )
+    minute_available = int((minute_audit or {}).get("available_source_symbols") or 0)
     minute_latest = _payload_time(
         minute_manifest,
         paths.minute_manifest,
@@ -712,11 +1326,31 @@ def _build_pipelines(
 
     daily_summary = _read_json(paths.daily_summary) if paths.daily_summary else None
     daily_progress = _read_json(paths.daily_progress) if paths.daily_progress else None
+    daily_dataset_summary = (
+        _read_json(paths.daily_dataset_summary) if paths.daily_dataset_summary else None
+    )
+    daily_audit = _read_json(paths.daily_audit) if paths.daily_audit else None
     daily_total = int((daily_summary or {}).get("selected_symbols") or 0)
     daily_reported = int((daily_summary or {}).get("reported_symbols") or 0)
-    if (daily_summary or {}).get("universe_coverage_complete"):
-        daily_state = "complete"
-        daily_label = "全部完成"
+    daily_ready = bool(
+        (daily_summary or {}).get("universe_coverage_complete")
+        and (daily_summary or {}).get("materialization_mode")
+        == "verified_local_minute"
+        and int((daily_summary or {}).get("api_requests_started", -1)) == 0
+        and (daily_dataset_summary or {}).get("source")
+        == "tw_public_before_shioaji_after"
+        and (daily_audit or {}).get("status") == "ok"
+        and (daily_audit or {}).get("materialization_mode")
+        == "verified_local_minute"
+        and int((daily_audit or {}).get("api_requests_started", -1)) == 0
+        and (daily_audit or {}).get("source_minute_summary_receipt_verified") is True
+    )
+    if daily_ready:
+        daily_state = "ready"
+        daily_label = "本機物化稽核通過"
+    elif (daily_summary or {}).get("universe_coverage_complete"):
+        daily_state = "partial"
+        daily_label = "等待混合資料稽核"
     elif (daily_summary or {}).get("stopped_for_traffic"):
         daily_state = "waiting"
         daily_label = "流量保護暫停"
@@ -727,10 +1361,13 @@ def _build_pipelines(
         daily_state = "unavailable"
         daily_label = "尚無資料"
     daily_latest = _payload_time(
-        daily_progress or daily_summary,
-        paths.daily_progress or paths.daily_summary,
-        "updated_at_utc",
+        daily_audit or daily_dataset_summary or daily_progress or daily_summary,
+        paths.daily_audit
+        or paths.daily_dataset_summary
+        or paths.daily_progress
+        or paths.daily_summary,
         "written_at_utc",
+        "updated_at_utc",
     )
 
     inventory = (
@@ -746,9 +1383,7 @@ def _build_pipelines(
 
     fop_receipt = _latest_capture_receipt(paths.capture_root)
     fop_audit = _latest_audit(paths.capture_root / "audits")
-    fop_latest = capture.get("latest_file_at_utc") or fop_receipt.get(
-        "finished_at_utc"
-    )
+    fop_latest = capture.get("latest_file_at_utc") or fop_receipt.get("finished_at_utc")
     if capture.get("state") == "capturing":
         fop_state, fop_label = "active", "即時寫入"
     elif capture_service.get("active"):
@@ -758,10 +1393,13 @@ def _build_pipelines(
 
     top_receipt = _latest_capture_receipt(paths.top200_capture_root)
     top_failure = _top200_failure(top200_entries)
+    top_wait = _top200_priority_wait(top200_entries)
     if top200_service.get("active"):
         top_state, top_label = "active", "服務運行"
     elif top_failure:
         top_state, top_label = "failed", "最近執行失敗"
+    elif top_wait:
+        top_state, top_label = "waiting", "期權優先暫停"
     else:
         top_state, top_label = "stopped", "服務停止"
     top_latest = top_receipt.get("finished_at_utc")
@@ -803,6 +1441,40 @@ def _build_pipelines(
         "complete": ("complete", "全部完成"),
         "stopped": ("stopped", "服務停止"),
     }.get(backfill_state, ("unavailable", "狀態未知"))
+    history_eta = _history_eta(backfill, traffic, now=now)
+    minute_eta = (
+        _complete_eta("分鐘來源完成，且 research_ready 全量稽核已通過。")
+        if minute_ready
+        else _progress_eta(
+            current=int((minute_summary or {}).get("reported_symbols") or 0),
+            total=minute_total,
+            elapsed_seconds=(minute_summary or {}).get("elapsed_seconds"),
+            active=bool(minute_service.get("active")),
+            complete=False,
+            complete_basis="分鐘來源與研究稽核皆已完成。",
+            running_basis="本次分鐘下載的已處理標的與經過時間。",
+            paused_basis="最近一次分鐘下載的已處理標的與經過時間；目前未執行。",
+            now=now,
+        )
+    )
+    daily_eta = (
+        _complete_eta("既有分鐘物件已本機彙總，混合資料與來源血緣稽核皆通過。")
+        if daily_ready
+        else _progress_eta(
+            current=int(
+                (daily_progress or {}).get("reported_symbols_this_run")
+                or daily_reported
+            ),
+            total=int((daily_progress or {}).get("selected_symbols") or daily_total),
+            elapsed_seconds=(daily_progress or {}).get("elapsed_seconds"),
+            active=bool(minute_service.get("active")),
+            complete=False,
+            complete_basis="本機日 K 與混合資料稽核皆已完成。",
+            running_basis="本機分鐘物件轉日 K 的已處理標的與經過時間。",
+            paused_basis="等待下次分鐘補檔服務執行本機物化與最終稽核。",
+            now=now,
+        )
+    )
 
     pipelines = [
         {
@@ -825,6 +1497,7 @@ def _build_pipelines(
                 if backfill.get("contracts")
                 else None
             ),
+            "eta": history_eta,
             "fields": ["成交時間", "價格", "數量", "買賣方向", "附帶一檔 Bid/Ask"],
             "metrics": [
                 _metric("已完成合約", backfill.get("completed_contracts")),
@@ -834,7 +1507,11 @@ def _build_pipelines(
             ],
             "warnings": (
                 ["歷史 Tick 的附帶 Bid/Ask 不是即時五檔委託簿。"]
-                + (["已到安全流量閘門，會等下一個配額窗口。"] if backfill_state == "waiting_quota" else [])
+                + (
+                    ["已到安全流量閘門，會等下一個配額窗口。"]
+                    if backfill_state == "waiting_quota"
+                    else []
+                )
             ),
             "service": _service_view(history_service),
         },
@@ -854,46 +1531,124 @@ def _build_pipelines(
                 label="可研究標的",
             ),
             "latest_at_utc": minute_latest,
-            "fields": ["Open", "High", "Low", "Close", "Volume", "Amount", "1 分鐘時間"],
+            "eta": minute_eta,
+            "fields": [
+                "Open",
+                "High",
+                "Low",
+                "Close",
+                "Volume",
+                "Amount",
+                "1 分鐘時間",
+            ],
             "metrics": [
                 _metric("完整標的", (minute_summary or {}).get("complete_symbols")),
-                _metric("來源缺口", (minute_summary or {}).get("complete_with_source_gap_symbols")),
+                _metric(
+                    "來源缺口",
+                    (minute_summary or {}).get("complete_with_source_gap_symbols"),
+                ),
                 _metric("交易日分區", (minute_audit or {}).get("partitions")),
-                _metric("研究列數", (minute_audit or {}).get("rows"), value_format="compact"),
+                _metric(
+                    "研究列數", (minute_audit or {}).get("rows"), value_format="compact"
+                ),
             ],
             "warnings": [
                 "88 檔有來源缺口、124 檔合約不可用；研究資料以遮罩保留可用範圍。"
-            ] if minute_ready and minute_total else [],
+            ]
+            if minute_ready and minute_total
+            else [],
             "service": _service_view(minute_service),
+        },
+        {
+            "id": "minute_research",
+            "title": "股票分鐘因果研究資料",
+            "category": "derived",
+            "api_surface": "由全市場 1 分 K 棒產生",
+            "quota": "none",
+            "status": "ready" if minute_ready else "partial",
+            "status_label": "研究稽核通過" if minute_ready else "等待完整稽核",
+            "detail": "將已落盤分鐘 K 棒轉成時間因果特徵、標籤與可交易遮罩。",
+            "coverage": _coverage(
+                (minute_audit or {}).get("available_source_symbols"),
+                minute_total,
+                unit="標的",
+                label="可研究標的",
+            ),
+            "latest_at_utc": minute_latest,
+            "eta": (
+                _complete_eta("本機分鐘研究資料的全量稽核已通過。")
+                if minute_ready
+                else _eta(
+                    "waiting_upstream",
+                    confidence="none",
+                    basis="等待上游分鐘來源完成後才能執行最終稽核。",
+                )
+            ),
+            "fields": ["因果特徵", "報酬標籤", "可交易遮罩", "交易日分區"],
+            "metrics": [
+                _metric("交易日分區", (minute_audit or {}).get("partitions")),
+                _metric(
+                    "總列數", (minute_audit or {}).get("rows"), value_format="compact"
+                ),
+                _metric(
+                    "有效特徵列",
+                    (minute_audit or {}).get("feature_valid_rows"),
+                    value_format="compact",
+                ),
+                _metric(
+                    "可研究標的", (minute_audit or {}).get("available_source_symbols")
+                ),
+            ],
+            "warnings": ["這是本機衍生資料，不會額外呼叫 Shioaji API。"],
+            "service": None,
         },
         {
             "id": "stock_daily",
             "title": "台股日 K 混合資料",
-            "category": "historical",
-            "api_surface": "api.kbars",
-            "quota": "historical",
+            "category": "derived",
+            "api_surface": "由已落盤 Shioaji 1 分 K 本機彙總",
+            "quota": "none",
             "status": daily_state,
             "status_label": daily_label,
-            "detail": "2020 年後以永豐日 K 取代公開來源；目前仍是部分回補成果。",
+            "detail": (
+                "2020 年後優先使用永豐 1 分 K 彙總日 K；只在永豐收據明確證明"
+                "缺日的交易日保留公開來源，並保留 2020 年前公開歷史。全程不額外"
+                "呼叫 API。"
+            ),
             "coverage": _coverage(
-                daily_reported,
+                (daily_audit or {}).get("symbols") if daily_ready else daily_reported,
                 daily_total,
                 unit="標的",
-                label="已處理標的",
+                label="稽核標的" if daily_ready else "已處理標的",
             ),
             "latest_at_utc": daily_latest,
+            "eta": daily_eta,
             "fields": ["日 Open", "High", "Low", "Close", "成交股數", "成交金額"],
             "metrics": [
-                _metric("完整標的", (daily_summary or {}).get("complete_symbols")),
-                _metric("不可用", (daily_summary or {}).get("contract_unavailable_symbols")),
-                _metric("失敗", (daily_summary or {}).get("failed_symbols")),
-                _metric("上次執行用量", (daily_summary or {}).get("traffic_used_bytes"), value_format="bytes"),
+                _metric("混合標的", (daily_audit or {}).get("hybrid_symbols")),
+                _metric(
+                    "來源缺日回退",
+                    (daily_audit or {}).get("public_source_gap_fallback_rows"),
+                ),
+                _metric(
+                    "無永豐覆蓋",
+                    sum(
+                        int((daily_audit or {}).get(key) or 0)
+                        for key in (
+                            "public_only_contract_unavailable_symbols",
+                            "public_only_outside_source_window_symbols",
+                            "public_only_not_yet_listed_symbols",
+                        )
+                    ),
+                ),
+                _metric("新增 API 請求", (daily_summary or {}).get("api_requests_started")),
             ],
-            "warnings": [
-                "這是舊次執行的流量紀錄，不代表上方本日全域配額。",
-                "混合資料尚未通過全市場最終完成閘門。",
-            ] if daily_summary else [],
-            "service": {"active": False, "state": "manual", "restarts": None},
+            "warnings": (
+                ["來源缺日回退只允許出現在分鐘 manifest 已列出的缺口日期。"]
+                if daily_ready
+                else ["尚未同時通過本機物化、混合資料與來源血緣三個完成閘門。"]
+            ),
+            "service": _service_view(minute_service),
         },
         {
             "id": "fop_stream",
@@ -906,16 +1661,36 @@ def _build_pipelines(
             "detail": "大台、微台與台指選擇權分三個 worker 擷取；即時推送不扣歷史流量。",
             "coverage": None,
             "latest_at_utc": fop_latest,
-            "fields": ["逐筆成交", "五檔價量", "委託量變化", "交易所時間", "接收時間", "1 秒簿快照"],
+            "eta": _continuous_eta(
+                "依台指期貨／選擇權盤別持續擷取；每一盤收盤即完成當盤，不存在總完工日。"
+            ),
+            "fields": [
+                "逐筆成交",
+                "五檔價量",
+                "委託量變化",
+                "交易所時間",
+                "接收時間",
+                "1 秒簿快照",
+            ],
             "metrics": [
                 _metric("目前合約", capture.get("contracts")),
                 _metric("目前訂閱", capture.get("subscriptions")),
-                _metric("最近落盤 Tick", fop_receipt.get("tick_rows"), value_format="compact"),
-                _metric("稽核有效簿", fop_audit.get("valid_book_rows"), value_format="compact"),
+                _metric(
+                    "最近落盤 Tick",
+                    fop_receipt.get("tick_rows"),
+                    value_format="compact",
+                ),
+                _metric(
+                    "稽核有效簿",
+                    fop_audit.get("valid_book_rows"),
+                    value_format="compact",
+                ),
             ],
             "warnings": [
                 f"最近完成擷取遺失事件 {int(fop_receipt.get('dropped_events') or 0):,} 筆。"
-            ] if int(fop_receipt.get("dropped_events") or 0) > 0 else [],
+            ]
+            if int(fop_receipt.get("dropped_events") or 0) > 0
+            else [],
             "service": _service_view(capture_service),
         },
         {
@@ -926,19 +1701,27 @@ def _build_pipelines(
             "quota": "realtime",
             "status": top_state,
             "status_label": top_label,
-            "detail": (top_failure or {}).get("detail") or "依官方市值名單擷取 200 檔股票微結構。",
+            "detail": (top_failure or top_wait or {}).get("detail")
+            or "依官方市值名單擷取 200 檔股票微結構。",
             "coverage": None,
             "latest_at_utc": top_latest,
+            "eta": _continuous_eta(
+                "依股票盤別持續擷取；期貨／選擇權連線優先，不存在總完工日。"
+            ),
             "fields": ["逐筆成交", "五檔價量", "委託量變化", "接收時間", "1 秒簿快照"],
             "metrics": [
                 _metric("最近標的", top_receipt.get("instruments")),
-                _metric("最近 Tick", top_receipt.get("tick_rows"), value_format="compact"),
-                _metric("最近簿事件", top_receipt.get("book_rows"), value_format="compact"),
+                _metric(
+                    "最近 Tick", top_receipt.get("tick_rows"), value_format="compact"
+                ),
+                _metric(
+                    "最近簿事件", top_receipt.get("book_rows"), value_format="compact"
+                ),
                 _metric("遺失事件", top_receipt.get("dropped_events")),
             ],
             "warnings": [
                 "期貨／選擇權擷取擁有連線優先權。",
-                *(([(top_failure or {}).get("detail")] if top_failure else [])),
+                *([(top_failure or {}).get("detail")] if top_failure else []),
             ],
             "service": _service_view(top200_service),
         },
@@ -953,14 +1736,33 @@ def _build_pipelines(
             "detail": "把永豐事件流重建成每秒因果快照、微結構特徵與未來標籤。",
             "coverage": None,
             "latest_at_utc": hft_latest,
-            "fields": ["價差", "簿不平衡", "成交方向", "1/5/30/60 秒標籤", "跨價差 Markout"],
+            "eta": _continuous_eta(
+                "每個新即時交易日落盤後持續產生衍生資料，不存在總完工日。"
+            ),
+            "fields": [
+                "價差",
+                "簿不平衡",
+                "成交方向",
+                "1/5/30/60 秒標籤",
+                "跨價差 Markout",
+            ],
             "metrics": [
                 _metric("交易日", hft_totals.get("dates")),
                 _metric("總列數", hft_totals.get("rows"), value_format="compact"),
-                _metric("有效特徵列", hft_totals.get("feature_valid_rows"), value_format="compact"),
-                _metric("最新有效率", hft_audit.get("feature_valid_rate"), value_format="percent"),
+                _metric(
+                    "有效特徵列",
+                    hft_totals.get("feature_valid_rows"),
+                    value_format="compact",
+                ),
+                _metric(
+                    "最新有效率",
+                    hft_audit.get("feature_valid_rate"),
+                    value_format="percent",
+                ),
             ],
-            "warnings": ["衍生資料不再呼叫 API；上游即時擷取停止時不會自動新增交易日。"],
+            "warnings": [
+                "衍生資料不再呼叫 API；上游即時擷取停止時不會自動新增交易日。"
+            ],
             "service": None,
         },
         {
@@ -979,6 +1781,21 @@ def _build_pipelines(
                 label="已列舉",
             ),
             "latest_at_utc": inventory_latest,
+            "eta": (
+                _eta(
+                    "up_to_date",
+                    remaining_seconds=0,
+                    confidence="high",
+                    basis="目前目錄已建立；換月時再刷新 target code。",
+                    processing_seconds=0,
+                )
+                if inventory
+                else _eta(
+                    "unknown",
+                    confidence="none",
+                    basis="尚無目錄產物與可量測執行樣本。",
+                )
+            ),
             "fields": ["商品根", "交易所", "R1/R2", "目前 target code", "合約名稱"],
             "metrics": [
                 _metric("期貨商品根", (inventory or {}).get("futures_roots")),
@@ -996,18 +1813,34 @@ def _build_pipelines(
             "api_surface": "api.snapshots",
             "quota": "historical",
             "status": "active" if snapshot_service.get("active") else "stopped",
-            "status_label": "隨需查詢" if snapshot_service.get("active") else "服務停止",
+            "status_label": "隨需查詢"
+            if snapshot_service.get("active")
+            else "服務停止",
             "detail": "供台股策略與 0050／2330／台指期基準取得當下可成交價，不持續輪詢。",
             "coverage": None,
             "latest_at_utc": snapshot_latest,
-            "fields": ["Last", "Bid/Ask", "Open/High/Low", "Volume", "Reference", "漲跌停價"],
+            "eta": _eta(
+                "on_demand",
+                confidence="not_applicable",
+                basis="只在策略需要報價時查詢，每次查詢獨立完成，沒有固定下載佇列。",
+            ),
+            "fields": [
+                "Last",
+                "Bid/Ask",
+                "Open/High/Low",
+                "Volume",
+                "Reference",
+                "漲跌停價",
+            ],
             "metrics": [
                 _metric("策略模式", len(safe_modes)),
                 _metric("行情基準", len(safe_benchmarks)),
                 _metric("永豐來源類型", len(snapshot_sources)),
                 _metric("最新報價", snapshot_latest, value_format="datetime"),
             ],
-            "warnings": ["Snapshot 是按需查詢，會反映在歷史行情用量；面板本身不會觸發查詢。"],
+            "warnings": [
+                "Snapshot 是按需查詢，會反映在歷史行情用量；面板本身不會觸發查詢。"
+            ],
             "service": _service_view(snapshot_service),
         },
     ]
@@ -1058,25 +1891,49 @@ def build_shioaji_public_status(
     )
     manifests = _history_manifests(selected_paths)
     traffic_history = _traffic_samples(history_entries, manifests)
+    ledger_payload = (
+        _read_json(selected_paths.traffic_ledger_summary)
+        if selected_paths.traffic_ledger_summary is not None
+        else None
+    )
+    ledger = _traffic_ledger_view(ledger_payload)
+    storage_payload = (
+        _read_json(selected_paths.storage_summary)
+        if selected_paths.storage_summary is not None
+        else None
+    )
+    storage = _storage_view(storage_payload, now=observed)
+    latest_ledger_usage = (ledger_payload or {}).get("latest_usage")
+    if isinstance(latest_ledger_usage, dict):
+        ledger_used = latest_ledger_usage.get("used_bytes")
+        ledger_limit = latest_ledger_usage.get("limit_bytes")
+        ledger_at = latest_ledger_usage.get("observed_at_utc")
+        parsed_at = _parse_datetime(ledger_at)
+        if isinstance(ledger_used, int) and isinstance(ledger_limit, int) and parsed_at:
+            traffic_history.append(
+                {
+                    "observed_at_utc": parsed_at.isoformat().replace("+00:00", "Z"),
+                    "used_bytes": ledger_used,
+                    "limit_bytes": ledger_limit,
+                    "remaining_bytes": max(0, ledger_limit - ledger_used),
+                    "used_ratio": ledger_used / ledger_limit
+                    if ledger_limit > 0
+                    else None,
+                    "source_id": "traffic_ledger",
+                    "source_label": str(
+                        latest_ledger_usage.get("consumer") or "流量帳本"
+                    ),
+                }
+            )
+            traffic_history = sorted(
+                traffic_history, key=lambda item: str(item.get("observed_at_utc") or "")
+            )[-MAX_TRAFFIC_SAMPLES:]
     backfill = _backfill_status(
         selected_paths, manifests, history_entries, history_service
     )
     capture = _capture_status(
         selected_paths, capture_entries, capture_service, now=observed
     )
-    pipelines = _build_pipelines(
-        selected_paths,
-        now=observed,
-        backfill=backfill,
-        capture=capture,
-        history_service=history_service,
-        capture_service=capture_service,
-        minute_service=minute_service,
-        top200_service=top200_service,
-        snapshot_service=snapshot_service,
-        top200_entries=top200_entries,
-    )
-
     latest_traffic = traffic_history[-1] if traffic_history else {}
     used = int(latest_traffic.get("used_bytes") or 0)
     limit = int(latest_traffic.get("limit_bytes") or 0)
@@ -1084,6 +1941,19 @@ def build_shioaji_public_status(
         min(int(limit * TRAFFIC_FRACTION_GUARD), limit - TRAFFIC_RESERVE_BYTES)
         if limit > 0
         else 0
+    )
+    latest_reset = (ledger_payload or {}).get("latest_reset")
+    reset_observed_at = (
+        latest_reset.get("observed_at_utc")
+        if isinstance(latest_reset, dict)
+        and latest_reset.get("kind") == "observed_counter_drop"
+        else None
+    )
+    reset_policy = (
+        "永豐 api.usage() 計數器下降才認定重置；最近觀測："
+        f"{reset_observed_at}（08:00 僅為預期政策）"
+        if reset_observed_at
+        else "尚未觀測到永豐 api.usage() 計數器下降；08:00 僅為預期政策"
     )
     traffic = {
         "observed_at_utc": latest_traffic.get("observed_at_utc"),
@@ -1095,9 +1965,51 @@ def build_shioaji_public_status(
         "guard_reserve_bytes": TRAFFIC_RESERVE_BYTES,
         "guard_limit_bytes": guard_limit if limit > 0 else None,
         "safe_remaining_bytes": max(0, guard_limit - used) if limit > 0 else None,
-        "reset_policy": "每個交易日上午 08:00 重置",
+        "reset_policy": reset_policy,
+        "reset_observed_at_utc": reset_observed_at,
+        "reset_detection": "observed_api_usage_counter_drop",
+        "quota_epoch_id": (ledger.get("quota_epoch") or {}).get("id"),
+        "quota_epoch_boundary_kind": (ledger.get("quota_epoch") or {}).get(
+            "boundary_kind"
+        ),
+        "pricing_policy": (
+            "官方文件提供免費註冊；api.usage() 僅回傳流量、不含費用欄位，"
+            "實際費用依永豐最新帳戶契約"
+        ),
+        "pricing_evidence_label": "usage 無費用欄位",
+        "attributed_bytes": (
+            int(ledger["totals"].get("observed_usage_delta_bytes") or 0)
+            if ledger_payload is not None
+            else None
+        ),
+        "unattributed_bytes": (
+            max(
+                0,
+                used - int(ledger["totals"].get("observed_usage_delta_bytes") or 0),
+            )
+            if limit > 0 and ledger_payload is not None
+            else None
+        ),
         "history": traffic_history,
     }
+    pipelines = _build_pipelines(
+        selected_paths,
+        now=observed,
+        backfill=backfill,
+        capture=capture,
+        history_service=history_service,
+        capture_service=capture_service,
+        minute_service=minute_service,
+        top200_service=top200_service,
+        snapshot_service=snapshot_service,
+        top200_entries=top200_entries,
+        traffic=traffic,
+    )
+    history_pipeline = next(
+        (item for item in pipelines if item.get("id") == "futures_history"), None
+    )
+    backfill["eta"] = (history_pipeline or {}).get("eta")
+    traffic_breakdown = _traffic_breakdown(pipelines, ledger)
 
     candidate_times: list[float] = []
     if traffic.get("observed_at_utc"):
@@ -1137,7 +2049,7 @@ def build_shioaji_public_status(
         health = "stale"
 
     return {
-        "dashboard_schema_version": 2,
+        "dashboard_schema_version": 5,
         "generated_at_utc": observed.isoformat().replace("+00:00", "Z"),
         "health": health,
         "source_age_seconds": round(source_age, 3) if source_age is not None else None,
@@ -1145,6 +2057,9 @@ def build_shioaji_public_status(
         "simulation_only": True,
         "production_order_possible": False,
         "traffic": traffic,
+        "traffic_ledger": ledger,
+        "traffic_breakdown": traffic_breakdown,
+        "storage": storage,
         "backfill": backfill,
         "capture": capture,
         "pipeline_summary": {
@@ -1158,9 +2073,7 @@ def build_shioaji_public_status(
             "historical": sum(
                 item.get("category") == "historical" for item in pipelines
             ),
-            "realtime": sum(
-                item.get("category") == "realtime" for item in pipelines
-            ),
+            "realtime": sum(item.get("category") == "realtime" for item in pipelines),
         },
         "pipelines": pipelines,
         "definitions": {
@@ -1176,6 +2089,18 @@ def build_shioaji_public_status(
             ),
             "quota_classes": (
                 "historical 會消耗歷史查詢流量；realtime 是推送訂閱；none 是本機衍生或目錄"
+            ),
+            "traffic_attribution": (
+                "可歸因流量是各功能呼叫前後的 api.usage() 正差；帳面已用與可歸因差額保留為未歸因，絕不假設為零"
+            ),
+            "storage_growth": (
+                "mtime 指標是最近 30 個完整台北曆日的變動檔案量，不等於淨增加；"
+                "每日總量快照滿 7 日後才用實測淨成長推估容量"
+            ),
+            "eta": (
+                "有限下載使用剩餘工作量乘以最近實測速度；若受歷史流量限制，"
+                "日曆時間另列每 24 小時一個同等額度窗口的低信心情境。"
+                "持續擷取與隨需查詢沒有總完工日。"
             ),
         },
     }

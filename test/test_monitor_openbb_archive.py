@@ -3,12 +3,13 @@ from __future__ import annotations
 import json
 import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+import scripts.monitor_openbb_archive as monitor
 from downloader.download_openbb_archive import DownloadTask, Manifest, TaskResult
 from scripts.monitor_openbb_archive import (
     _daily_quota_projection,
@@ -33,6 +34,79 @@ def test_daily_quota_projection_exposes_optimistic_lower_bound() -> None:
         "lower_bound_only": True,
     }
     assert _daily_quota_projection("fmp", "basic", 10, 250, 0) is None
+
+
+def test_monitor_excludes_active_bls_bulk_route_from_api_quota_floor(
+    tmp_path: Path, monkeypatch
+) -> None:
+    task = DownloadTask(
+        task_id="bls-local-bulk",
+        endpoint="economy.survey.bls_series",
+        category="economy",
+        scope_key="series=INUS0001",
+        kwargs={"symbol": "INUS0001"},
+        providers=("bls",),
+        output_path=str(tmp_path / "data" / "bls.parquet"),
+    )
+    manifest = Manifest(tmp_path / "_state" / "openbb_archive.sqlite3")
+    try:
+        manifest.upsert_tasks([task])
+        manifest.connection.execute(
+            "UPDATE tasks SET error=? WHERE task_id=?",
+            ("bls: daily threshold reached; quota resets tomorrow", task.task_id),
+        )
+        manifest.connection.commit()
+    finally:
+        manifest.close()
+    (tmp_path / "_state" / "provider_cooldowns.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 3,
+                "rate_limits_rps": {"bls": 5.0},
+                "concurrency": {"bls": 16},
+                "rate_activity": {
+                    "providers": {
+                        "bls": {
+                            "declared_daily_request_cap": 500,
+                            "declared_daily_requests_remaining": 0,
+                        }
+                    }
+                },
+                "providers": {
+                    "bls": {
+                        "blocked_until": time.time() + 3600,
+                        "kind": "quota",
+                        "reason": "daily threshold reached",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        monitor,
+        "_active_local_cooldown_bypass_endpoints",
+        lambda _state_dir: {("bls", "economy.survey.bls_series")},
+    )
+
+    status = monitor.collect_status(tmp_path, min_free_gib=0, show_progress=False)
+
+    assert status["fully_local_bypass_providers"] == ["bls"]
+    assert status["provider_quota_feasibility"] == {}
+    projection = next(
+        row
+        for row in status["provider_eta_projections"]
+        if row["provider"] == "bls"
+    )
+    assert projection["local_cooldown_bypass"] is True
+    assert projection["state"] == "stalled"
+    assert projection["optimistic_additional_daily_resets_required"] is None
+    assert status["provider_progress_stalls"] == [
+        {"provider": "bls", "backlog_tasks": 1, "recent_accepted_tasks": 0}
+    ]
+    assert "provider_quota_deferred" not in {
+        alert["code"] for alert in status["alerts"]
+    }
 
 
 def test_process_runtime_metrics_are_machine_readable() -> None:
@@ -64,6 +138,41 @@ def test_monitor_distinguishes_buffered_from_executing_tasks(
         assert executing["executing_tasks"] == 1
     finally:
         manifest.close()
+
+
+def test_monitor_reports_durable_task_retry_backoff_as_deferred(
+    tmp_path: Path,
+) -> None:
+    manifest = Manifest(tmp_path / "_state" / "openbb_archive.sqlite3")
+    task = _task(tmp_path, "http-500-deferred")
+    deadline = (datetime.now(timezone.utc) + timedelta(hours=6)).isoformat()
+    try:
+        manifest.upsert_tasks([task])
+        manifest.claim([task])
+        manifest.complete(
+            TaskResult(
+                task,
+                "pending",
+                "yfinance",
+                0,
+                None,
+                42,
+                error="yfinance: HTTP Error 500",
+                retry_not_before=deadline,
+                transient_failures=10,
+            )
+        )
+    finally:
+        manifest.close()
+
+    status = collect_status(tmp_path, min_free_gib=0, show_progress=False)
+
+    assert status["retry_tracking_available"] is True
+    assert status["pending_eligible"] == 0
+    assert status["pending_retry_deferred"] == 1
+    assert status["next_task_retry_at"] == deadline
+    assert status["runnable_retryable_tasks"] == 0
+    assert status["retryable_tasks"] == 1
 
 
 def _task(root: Path, task_id: str) -> DownloadTask:

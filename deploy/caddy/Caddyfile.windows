@@ -42,12 +42,15 @@ penguin72487.ddnsgeek.com {
 		X-Frame-Options "DENY"
 		Cross-Origin-Opener-Policy "same-origin"
 		Cross-Origin-Resource-Policy "same-origin"
-		Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=(), usb=()"
+		Origin-Agent-Cluster "?1"
+		X-Permitted-Cross-Domain-Policies "none"
+		Permissions-Policy "accelerometer=(), autoplay=(), camera=(), display-capture=(), encrypted-media=(), fullscreen=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), payment=(), picture-in-picture=(), publickey-credentials-get=(), screen-wake-lock=(), usb=(), web-share=()"
 		X-Robots-Tag "noindex, nofollow, noarchive"
-		Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+		Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; font-src 'self'; media-src 'none'; frame-src 'none'; worker-src 'none'; manifest-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; script-src-attr 'none'; style-src-attr 'none'"
 	}
 
 	@write_methods not method GET HEAD
+	header @write_methods Allow "GET, HEAD"
 	respond @write_methods 405
 
 	reverse_proxy 127.0.0.1:8770 {
@@ -63,7 +66,6 @@ penguin72487.ddnsgeek.com {
 			dial_timeout 2s
 			response_header_timeout 20s
 			keepalive 30s
-			max_conns_per_host 32
 		}
 	}
 

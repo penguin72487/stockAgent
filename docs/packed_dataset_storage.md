@@ -22,6 +22,11 @@ Syncthing 發布庫（固定 hash 分桶 ZIP + 大檔 blob + manifest/head）
 `configs/data_sync/packed_datasets.json` 是所有資料集的登錄表；
 `scripts/publish_data_releases.py` 負責拒絕仍有下載器寫入的資料集。
 
+可重建的訓練快取不屬於 canonical 資料。登錄表可用
+`excluded_subtrees` 明確排除；目前 `tw-public` 排除
+`stocks/panel_cache_v2`，各節點在本地按模型設定重建，避免每個 cache variant
+都佔用同步流量與永久 CAS 空間。排除清單會寫入 manifest，不能暗中忽略資料。
+
 ## 為什麼不是單一巨檔
 
 - 單一巨檔只改一筆也要重傳整檔，且損毀半徑最大。
