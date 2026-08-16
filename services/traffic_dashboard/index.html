@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#071019">
+  <title>網站流量與延遲｜StockAgent</title>
+  <link rel="stylesheet" href="../dashboard-core.css?v=5">
+  <link rel="stylesheet" href="styles.css?v=1">
+</head>
+<body>
+  <a class="skip-link" href="#main">跳到主要內容</a>
+  <header class="public-nav">
+    <a class="public-brand" href="../">STOCKAGENT</a>
+    <nav aria-label="公開面板導覽">
+      <a href="../">總覽</a>
+      <a href="../taifex/">TAIFEX</a>
+      <a href="../tw-day-trade/">台股當沖</a>
+      <a href="../shioaji/">永豐 API</a>
+      <a href="../openbb/">OpenBB</a>
+      <a href="../data-monitor/">全資料</a>
+      <a href="./" aria-current="page">流量</a>
+    </nav>
+  </header>
+
+  <main id="main" class="shell">
+    <section class="hero" aria-labelledby="page-title">
+      <div>
+        <p class="eyebrow">PUBLIC GATEWAY · LIVE OBSERVABILITY</p>
+        <h1 id="page-title">網站流量與延遲</h1>
+        <p class="subtitle">追蹤公開閘道的請求量、吞吐、回應 body、延遲分位數與快取效率；此頁的記憶體計量不依 IP 或 User-Agent 分群，也不公開訪客身分。</p>
+      </div>
+      <div class="live-card" role="status" aria-live="polite">
+        <span id="live-dot" class="live-dot"></span>
+        <div><small>觀察狀態</small><strong id="live-status">連線中</strong></div>
+        <button id="refresh-now" type="button">立即刷新</button>
+        <time id="updated-at">—</time>
+      </div>
+    </section>
+
+    <section class="kpi-grid" aria-label="最近一分鐘關鍵指標">
+      <article class="kpi"><span>最近 1 分鐘請求</span><strong id="kpi-requests">—</strong><small>完成的 GET／HEAD</small></article>
+      <article class="kpi"><span>平均吞吐</span><strong id="kpi-rps">—</strong><small>requests／second</small></article>
+      <article class="kpi"><span>延遲 p50</span><strong id="kpi-p50">—</strong><small>閘道 wall time</small></article>
+      <article class="kpi"><span>延遲 p95</span><strong id="kpi-p95">—</strong><small>histogram 上界</small></article>
+      <article class="kpi"><span>延遲 p99</span><strong id="kpi-p99">—</strong><small>histogram 上界</small></article>
+      <article class="kpi"><span>目前／峰值併發</span><strong id="kpi-concurrency">—</strong><small>不設應用層硬上限</small></article>
+    </section>
+
+    <div class="section-intro"><div><span>01</span><h2>最近一小時</h2></div><p>每分鐘請求率與 p95 延遲</p></div>
+    <section class="panel chart-panel">
+      <div class="panel-head">
+        <div><h2>吞吐與延遲趨勢</h2><p>青色為 requests/s；紫色為 p95 ms。空分鐘不是遺失資料，而是沒有請求。</p></div>
+        <div class="legend" aria-label="圖例"><span><i class="rps-key"></i>RPS</span><span><i class="latency-key"></i>p95</span></div>
+      </div>
+      <svg id="traffic-chart" viewBox="0 0 960 270" role="img" aria-label="最近一小時網站請求率與 p95 延遲折線圖">
+        <g id="chart-grid"></g><g id="chart-lines"></g>
+      </svg>
+      <p id="chart-empty" class="empty" hidden>最近一小時尚無可繪製請求。</p>
+    </section>
+
+    <div class="section-intro"><div><span>02</span><h2>這台瀏覽器的互動延遲</h2></div><p>從按下刷新或排程發出 fetch，到資料解析及 DOM 更新</p></div>
+    <section class="local-grid" aria-label="本次瀏覽器資料取得延遲">
+      <article class="local-metric"><span>伺服器處理</span><strong id="local-server">—</strong><small>Server-Timing</small></article>
+      <article class="local-metric"><span>收到 headers</span><strong id="local-network">—</strong><small>fetch 至 response</small></article>
+      <article class="local-metric"><span>下載 body</span><strong id="local-download">—</strong><small>response.text</small></article>
+      <article class="local-metric"><span>JSON 解析</span><strong id="local-parse">—</strong><small>JSON.parse</small></article>
+      <article class="local-metric"><span>DOM 更新</span><strong id="local-render">—</strong><small>render 函式</small></article>
+      <article class="local-metric accent"><span>請求到下一幀</span><strong id="local-total">—</strong><small>使用者感知總延遲</small></article>
+    </section>
+
+    <div class="section-intro"><div><span>03</span><h2>時間窗與路由</h2></div><p>同一計量來源，可互相加總核對</p></div>
+    <section class="grid-two">
+      <article class="panel">
+        <div class="panel-head"><div><h2>時間窗比較</h2><p>1 分鐘、5 分鐘與 1 小時</p></div></div>
+        <div class="table-wrap" tabindex="0" role="region" aria-label="各時間窗流量與延遲比較，可水平捲動">
+          <table><thead><tr><th>時間窗</th><th>請求</th><th>RPS</th><th>p50</th><th>p95</th><th>p99</th><th>body</th><th>錯誤率</th></tr></thead><tbody id="window-rows"></tbody></table>
+        </div>
+      </article>
+      <article class="panel cache-panel">
+        <div class="panel-head"><div><h2>伺服器快取</h2><p>JSON 與靜態資源查找</p></div></div>
+        <dl>
+          <div><dt>命中率</dt><dd id="cache-ratio">—</dd></div>
+          <div><dt>命中</dt><dd id="cache-hits">—</dd></div>
+          <div><dt>建置／更新</dt><dd id="cache-builds">—</dd></div>
+          <div><dt>程序運行</dt><dd id="uptime">—</dd></div>
+          <div><dt>全域 rate limit</dt><dd>停用</dd></div>
+          <div><dt>應用層併發上限</dt><dd>停用</dd></div>
+        </dl>
+      </article>
+    </section>
+
+    <section class="panel route-panel">
+      <div class="panel-head"><div><h2>最近一小時路由明細</h2><p>未知路徑與靜態資源會聚合，避免任意 URL 造成無界 cardinality</p></div><span id="route-count" class="count">—</span></div>
+      <div class="table-wrap" tabindex="0" role="region" aria-label="最近一小時路由流量明細，可水平捲動">
+        <table><thead><tr><th>路由</th><th>請求</th><th>占比</th><th>平均</th><th>p95</th><th>最大</th><th>body</th><th>錯誤率</th></tr></thead><tbody id="route-rows"></tbody></table>
+      </div>
+    </section>
+
+    <details class="panel definitions">
+      <summary>口徑、隱私與限制</summary>
+      <dl id="definition-list"></dl>
+    </details>
+  </main>
+  <script src="app.js?v=1" defer></script>
+</body>
+</html>

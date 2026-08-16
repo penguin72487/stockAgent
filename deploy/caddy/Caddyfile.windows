@@ -66,7 +66,6 @@ penguin72487.ddnsgeek.com {
 			dial_timeout 2s
 			response_header_timeout 20s
 			keepalive 30s
-			max_conns_per_host 32
 		}
 	}
 

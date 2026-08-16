@@ -21,7 +21,15 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from common import describe_rate_limit, resolve_end_date, resolve_request_interval, run_parallel_tasks
+from common import (
+    SharedRateLimiter,
+    describe_rate_limit,
+    resolve_end_date,
+    resolve_incremental_reconcile_start_ms,
+    resolve_request_interval,
+    retry_delay_seconds,
+    run_parallel_tasks,
+)
 
 
 BASE_URL = "https://api.bybit.com"
@@ -52,7 +60,9 @@ def _write_parquet(frame: pl.DataFrame, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     try:
-        pq.write_table(frame.to_arrow(), tmp_path, compression="snappy", write_statistics=True)
+        pq.write_table(
+            frame.to_arrow(), tmp_path, compression="snappy", write_statistics=True
+        )
         tmp_path.replace(path)
     finally:
         if tmp_path.exists():
@@ -91,6 +101,7 @@ class ExistingCandleInfo:
     rows: int
     latest_ms: int | None
     interval_ok: bool
+    earliest_ms: int | None = None
     error: str | None = None
 
 
@@ -103,27 +114,44 @@ def parse_args() -> argparse.Namespace:
         "--mode",
         choices=["incremental", "daily-update", "full"],
         default="incremental",
-        help="incremental: only fetch missing 15m candles; daily-update: deprecated alias; full: skip existing unless --refresh.",
+        help="incremental: reconcile missing head/tail coverage; daily-update: deprecated alias; full: reconcile requested coverage; --refresh forces rebuild.",
     )
-    parser.add_argument("--start-date", default="2019-01-01", help="Inclusive start date YYYY-MM-DD")
-    parser.add_argument("--end-date", default="today", help="Inclusive end date YYYY-MM-DD or 'today'")
+    parser.add_argument(
+        "--start-date", default="2019-01-01", help="Inclusive start date YYYY-MM-DD"
+    )
+    parser.add_argument(
+        "--end-date", default="today", help="Inclusive end date YYYY-MM-DD or 'today'"
+    )
     parser.add_argument(
         "--categories",
         nargs="+",
         default=["linear", "inverse"],
         help="Bybit categories to fetch: linear inverse (default: both)",
     )
-    parser.add_argument("--workers", type=int, default=16, help="Parallel symbol workers")
-    parser.add_argument("--limit", type=int, default=None, help="Optional symbol limit for quick tests")
-    parser.add_argument("--refresh", action="store_true", help="Re-download even if parquet exists")
+    parser.add_argument(
+        "--workers", type=int, default=16, help="Parallel symbol workers"
+    )
+    parser.add_argument(
+        "--limit", type=int, default=None, help="Optional symbol limit for quick tests"
+    )
+    parser.add_argument(
+        "--refresh", action="store_true", help="Re-download even if parquet exists"
+    )
     parser.add_argument(
         "--request-interval",
         type=float,
         default=None,
         help="Global minimum seconds between API requests. Default uses official Bybit public REST IP profile.",
     )
-    parser.add_argument("--max-retries", type=int, default=8, help="Max retries per HTTP request")
-    parser.add_argument("--retry-base", type=float, default=0.6, help="Base seconds for exponential backoff")
+    parser.add_argument(
+        "--max-retries", type=int, default=8, help="Max retries per HTTP request"
+    )
+    parser.add_argument(
+        "--retry-base",
+        type=float,
+        default=0.6,
+        help="Base seconds for exponential backoff",
+    )
     return parser.parse_args()
 
 
@@ -154,38 +182,29 @@ def _normalize_date_frame(frame: pl.DataFrame) -> pl.DataFrame:
     if frame.is_empty() or "date" not in frame.columns:
         return frame
     normalized = frame.with_columns(
-        pl.col("date").str.to_datetime(strict=False).dt.strftime("%Y-%m-%d %H:%M:%S").alias("date")
+        pl.col("date")
+        .str.to_datetime(strict=False)
+        .dt.strftime("%Y-%m-%d %H:%M:%S")
+        .alias("date")
         if frame.schema.get("date") == pl.String
-        else pl.col("date").cast(pl.Datetime("us"), strict=False).dt.strftime("%Y-%m-%d %H:%M:%S").alias("date")
+        else pl.col("date")
+        .cast(pl.Datetime("us"), strict=False)
+        .dt.strftime("%Y-%m-%d %H:%M:%S")
+        .alias("date")
     )
     return normalized.drop_nulls("date").sort("date")
 
 
-def _resolve_next_start_ms(existing_df: pl.DataFrame, fallback_start_ms: int) -> int:
-    if "date" not in existing_df.columns:
-        return fallback_start_ms
-
-    parsed = _normalize_date_frame(existing_df)
-    if parsed.is_empty():
-        return fallback_start_ms
-
-    latest = parsed.select(pl.col("date").str.to_datetime(strict=False).max()).item()
-    latest_ms = int(latest.replace(tzinfo=timezone.utc).timestamp() * 1000)
-    return max(fallback_start_ms, latest_ms - CANDLE_INTERVAL_MS)
-
-
-def _resolve_next_start_ms_from_latest(latest_ms: int | None, fallback_start_ms: int) -> int:
-    if latest_ms is None:
-        return fallback_start_ms
-    return max(fallback_start_ms, int(latest_ms) - CANDLE_INTERVAL_MS)
-
-
 def _ms_to_date_string(ms: int) -> str:
-    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
 
 
 def _latest_closed_candle_start_ms(now: datetime | None = None) -> int:
-    current = now.astimezone(timezone.utc) if now is not None else datetime.now(timezone.utc)
+    current = (
+        now.astimezone(timezone.utc) if now is not None else datetime.now(timezone.utc)
+    )
     current_ms = int(current.timestamp() * 1000)
     return (current_ms // CANDLE_INTERVAL_MS) * CANDLE_INTERVAL_MS - CANDLE_INTERVAL_MS
 
@@ -197,10 +216,16 @@ def _frames_equal(left: pl.DataFrame, right: pl.DataFrame) -> bool:
     return left.select(common).equals(right.select(common))
 
 
-def _merge_existing_with_fresh(existing_df: pl.DataFrame, fresh_df: pl.DataFrame, effective_start_ms: int) -> tuple[pl.DataFrame, bool]:
+def _merge_existing_with_fresh(
+    existing_df: pl.DataFrame, fresh_df: pl.DataFrame, effective_start_ms: int
+) -> tuple[pl.DataFrame, bool]:
     existing = _normalize_date_frame(existing_df)
     cutoff = _ms_to_date_string(effective_start_ms)
-    kept_existing = existing.filter(pl.col("date") < cutoff) if "date" in existing.columns else existing
+    kept_existing = (
+        existing.filter(pl.col("date") < cutoff)
+        if "date" in existing.columns
+        else existing
+    )
     combined = (
         pl.concat([kept_existing, fresh_df], how="diagonal_relaxed")
         .sort("date")
@@ -214,7 +239,11 @@ def _frame_matches_15m_interval(frame: pl.DataFrame) -> bool:
     if frame.is_empty() or "date" not in frame.columns:
         return True
 
-    parsed = _normalize_date_frame(frame).select(pl.col("date").str.to_datetime(strict=False).alias("date")).drop_nulls("date")
+    parsed = (
+        _normalize_date_frame(frame)
+        .select(pl.col("date").str.to_datetime(strict=False).alias("date"))
+        .drop_nulls("date")
+    )
     if parsed.height < 3:
         return True
 
@@ -228,7 +257,9 @@ def _frame_matches_15m_interval(frame: pl.DataFrame) -> bool:
         return True
 
     median_delta = float(deltas.select(pl.col("delta").median()).item())
-    large_gap_share = float(deltas.select(pl.col("delta").ge(12 * 60 * 60).mean()).item())
+    large_gap_share = float(
+        deltas.select(pl.col("delta").ge(12 * 60 * 60).mean()).item()
+    )
     if large_gap_share > 0.05:
         return False
     midnight_share = float(
@@ -259,20 +290,43 @@ def _latest_ms_from_date_frame(frame: pl.DataFrame) -> int | None:
     return int(latest.replace(tzinfo=timezone.utc).timestamp() * 1000)
 
 
+def _earliest_ms_from_date_frame(frame: pl.DataFrame) -> int | None:
+    if frame.is_empty() or "date" not in frame.columns:
+        return None
+    parsed = _normalize_date_frame(frame)
+    if parsed.is_empty():
+        return None
+    earliest = parsed.select(pl.col("date").str.to_datetime(strict=False).min()).item()
+    if earliest is None:
+        return None
+    return int(earliest.replace(tzinfo=timezone.utc).timestamp() * 1000)
+
+
 def _load_existing_candle_info(path: Path) -> ExistingCandleInfo:
     try:
         row_count = _read_parquet_row_count(path)
         schema_names = set(pq.read_schema(path).names)
         if "date" not in schema_names:
-            return ExistingCandleInfo(row_count, None, False, "missing date column")
+            return ExistingCandleInfo(
+                rows=row_count,
+                latest_ms=None,
+                interval_ok=False,
+                error="missing date column",
+            )
         date_frame = _read_date_column(path)
         return ExistingCandleInfo(
             rows=row_count,
             latest_ms=_latest_ms_from_date_frame(date_frame),
             interval_ok=_frame_matches_15m_interval(date_frame),
+            earliest_ms=_earliest_ms_from_date_frame(date_frame),
         )
     except Exception as exc:
-        return ExistingCandleInfo(0, None, False, f"{type(exc).__name__}: {exc}")
+        return ExistingCandleInfo(
+            rows=0,
+            latest_ms=None,
+            interval_ok=False,
+            error=f"{type(exc).__name__}: {exc}",
+        )
 
 
 def _iter_windows(start_ms: int, end_ms: int) -> list[tuple[int, int]]:
@@ -288,29 +342,49 @@ def _iter_windows(start_ms: int, end_ms: int) -> list[tuple[int, int]]:
 
 
 class BybitClient:
-    def __init__(self, request_interval: float | None, max_retries: int, retry_base: float) -> None:
-        self.request_interval = resolve_request_interval("bybit_public_rest", request_interval)
+    def __init__(
+        self, request_interval: float | None, max_retries: int, retry_base: float
+    ) -> None:
+        self.request_interval = resolve_request_interval(
+            "bybit_public_rest", request_interval
+        )
         self.max_retries = max(0, max_retries)
         self.retry_base = max(0.1, retry_base)
-        self._lock = threading.Lock()
-        self._last_request_time = 0.0
-        print(f"[bybit] {describe_rate_limit('bybit_public_rest', self.request_interval)}", flush=True)
+        self.limiter = SharedRateLimiter(
+            self.request_interval,
+            name="bybit_public_rest",
+        )
+        print(
+            f"[bybit] {describe_rate_limit('bybit_public_rest', self.request_interval)}",
+            flush=True,
+        )
 
-    def _wait_for_slot(self) -> None:
-        if self.request_interval <= 0:
-            return
-        with self._lock:
-            now = time.monotonic()
-            elapsed = now - self._last_request_time
-            wait_s = self.request_interval - elapsed
-            if wait_s > 0:
-                time.sleep(wait_s)
-            self._last_request_time = time.monotonic()
+    def _defer_retry(
+        self,
+        attempt: int,
+        *,
+        headers: Any = None,
+        minimum_seconds: float = 0.0,
+    ) -> None:
+        retry_after = headers.get("Retry-After") if headers is not None else None
+        delay = retry_delay_seconds(
+            attempt,
+            base=self.retry_base,
+            retry_after=retry_after,
+        )
+        if headers is not None:
+            reset_value = headers.get("X-Bapi-Limit-Reset-Timestamp")
+            try:
+                reset_delay = float(reset_value) / 1000.0 - time.time()
+            except (TypeError, ValueError):
+                reset_delay = 0.0
+            delay = max(delay, reset_delay)
+        self.limiter.defer(max(delay, float(minimum_seconds)))
 
     def get(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
         last_error: Exception | None = None
         for attempt in range(self.max_retries + 1):
-            self._wait_for_slot()
+            self.limiter.wait()
             url = f"{BASE_URL}{path}?{urlencode(params)}"
             req = Request(
                 url,
@@ -322,6 +396,7 @@ class BybitClient:
 
             try:
                 with urlopen(req, timeout=30) as response:
+                    response_headers = response.headers
                     payload = json.load(response)
 
                 if int(payload.get("retCode", -1)) == 0:
@@ -331,23 +406,27 @@ class BybitClient:
                 message = str(payload.get("retMsg") or "")
                 retriable_code = {"10006", "429", "10000"}
                 if code in retriable_code and attempt < self.max_retries:
-                    backoff = self.retry_base * (2**attempt)
-                    time.sleep(min(backoff, 30.0))
+                    self._defer_retry(attempt, headers=response_headers)
                     continue
                 raise RuntimeError(f"Bybit API error retCode={code} retMsg={message}")
 
             except HTTPError as exc:
                 last_error = exc
-                if exc.code in {429, 500, 502, 503, 504} and attempt < self.max_retries:
-                    backoff = self.retry_base * (2**attempt)
-                    time.sleep(min(backoff, 30.0))
+                if (
+                    exc.code in {403, 429, 500, 502, 503, 504}
+                    and attempt < self.max_retries
+                ):
+                    self._defer_retry(
+                        attempt,
+                        headers=exc.headers,
+                        minimum_seconds=600.0 if exc.code == 403 else 0.0,
+                    )
                     continue
                 raise
             except URLError as exc:
                 last_error = exc
                 if attempt < self.max_retries:
-                    backoff = self.retry_base * (2**attempt)
-                    time.sleep(min(backoff, 30.0))
+                    self._defer_retry(attempt)
                     continue
                 raise
 
@@ -444,7 +523,13 @@ def _normalize_candles(raw_rows: list[list[str]]) -> pl.DataFrame:
     if not rows:
         return pl.DataFrame({column: [] for column in OUTPUT_COLUMNS})
 
-    return pl.DataFrame(rows).sort("ts").unique(subset=["date"], keep="last").sort("ts").drop("ts")
+    return (
+        pl.DataFrame(rows)
+        .sort("ts")
+        .unique(subset=["date"], keep="last")
+        .sort("ts")
+        .drop("ts")
+    )
 
 
 def _download_symbol_15m(
@@ -459,6 +544,16 @@ def _download_symbol_15m(
     output_path = output_dir / f"{record.code}_features.parquet"
     existing_info: ExistingCandleInfo | None = None
     effective_start_ms = start_ms
+    if record.launch_time:
+        effective_start_ms = max(
+            effective_start_ms,
+            int(
+                datetime.strptime(record.launch_time, "%Y-%m-%d %H:%M:%S")
+                .replace(tzinfo=timezone.utc)
+                .timestamp()
+                * 1000
+            ),
+        )
 
     if output_path.exists() and not refresh:
         existing_info = _load_existing_candle_info(output_path)
@@ -469,19 +564,13 @@ def _download_symbol_15m(
             )
             existing_info = None
 
-        if mode == "full" and existing_info is not None:
-            return DownloadResult(
-                asset_class="crypto_bybit_perp",
-                code=record.code,
-                bybit_symbol=record.bybit_symbol,
-                market=record.market,
-                status="skipped_existing",
-                rows=existing_info.rows,
-                output_path=str(output_path),
-            )
-
         if existing_info is not None and existing_info.rows > 0:
-            effective_start_ms = _resolve_next_start_ms_from_latest(existing_info.latest_ms, start_ms)
+            effective_start_ms, _ = resolve_incremental_reconcile_start_ms(
+                expected_first_ms=effective_start_ms,
+                earliest_existing_ms=existing_info.earliest_ms,
+                latest_existing_ms=existing_info.latest_ms,
+                overlap_ms=CANDLE_INTERVAL_MS,
+            )
             if effective_start_ms > end_ms:
                 return DownloadResult(
                     asset_class="crypto_bybit_perp",
@@ -533,7 +622,9 @@ def _download_symbol_15m(
         )
 
     closed_end_ms = min(end_ms, _latest_closed_candle_start_ms())
-    filtered_rows = [row for row in all_rows if effective_start_ms <= int(row[0]) <= closed_end_ms]
+    filtered_rows = [
+        row for row in all_rows if effective_start_ms <= int(row[0]) <= closed_end_ms
+    ]
     df = _normalize_candles(filtered_rows)
     if df.is_empty():
         if existing_info is not None and existing_info.rows > 0:
@@ -559,7 +650,9 @@ def _download_symbol_15m(
 
     if existing_info is not None and existing_info.rows > 0:
         existing_df = _read_parquet(output_path)
-        combined, changed = _merge_existing_with_fresh(existing_df, df, effective_start_ms)
+        combined, changed = _merge_existing_with_fresh(
+            existing_df, df, effective_start_ms
+        )
         if not changed:
             return DownloadResult(
                 asset_class="crypto_bybit_perp",
@@ -682,7 +775,9 @@ def main() -> None:
 
     result_rows = [asdict(r) for r in results]
     result_df = (
-        pl.DataFrame(result_rows, infer_schema_length=None).sort(["status", "bybit_symbol"])
+        pl.DataFrame(result_rows, infer_schema_length=None).sort(
+            ["status", "bybit_symbol"]
+        )
         if result_rows
         else pl.DataFrame()
     )
@@ -703,7 +798,9 @@ def main() -> None:
         "start_date": start_date,
         "end_date": end_date,
     }
-    summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    summary_path.write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
 
     print(f"[bybit] symbols.csv -> {symbols_path}")
     print(f"[bybit] download_report.csv -> {report_path}")

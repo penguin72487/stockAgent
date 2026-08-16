@@ -16,6 +16,7 @@ const pages = [
   ["shioaji", "/shioaji/"],
   ["openbb", "/openbb/"],
   ["data-monitor", "/data-monitor/"],
+  ["traffic", "/traffic/"],
 ];
 
 fs.mkdirSync(outputDir, {recursive: true});
@@ -208,6 +209,27 @@ for (const [name, suffix] of pages) {
   });
   await send("Page.navigate", {url: `${baseUrl}${suffix}`});
   await waitUntilReady(send);
+  let interactionLatency = null;
+  if (name === "traffic") {
+    const interaction = await send("Runtime.evaluate", {
+      expression: `new Promise((resolve) => {
+        const output = document.getElementById("local-total");
+        const button = document.getElementById("refresh-now");
+        if (!output || !button) { resolve({error: "missing traffic controls"}); return; }
+        const started = performance.now();
+        const observer = new MutationObserver(() => {
+          observer.disconnect();
+          resolve({milliseconds: performance.now() - started, displayed: output.textContent});
+        });
+        observer.observe(output, {childList: true, characterData: true, subtree: true});
+        button.click();
+        setTimeout(() => { observer.disconnect(); resolve({error: "timeout"}); }, 5000);
+      })`,
+      awaitPromise: true,
+      returnByValue: true,
+    });
+    interactionLatency = interaction.result?.value || null;
+  }
   const evaluated = await send("Runtime.evaluate", {
     expression,
     returnByValue: true,
@@ -220,7 +242,7 @@ for (const [name, suffix] of pages) {
     path.join(outputDir, `${name}-${width}x${height}.png`),
     Buffer.from(screenshot.data, "base64"),
   );
-  results.push({...evaluated.result.value, consoleErrors});
+  results.push({...evaluated.result.value, interactionLatency, consoleErrors});
   socket.close();
 }
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import threading
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
@@ -11,12 +12,21 @@ import polars as pl
 import pyarrow.parquet as pq
 import requests
 
-from common import SharedRateLimiter, describe_rate_limit, resolve_end_date, resolve_request_interval, run_parallel_tasks
+from common import (
+    SharedRateLimiter,
+    describe_rate_limit,
+    resolve_end_date,
+    resolve_request_interval,
+    retry_delay_seconds,
+    run_parallel_tasks,
+)
 
 API_BASE = "https://api.frankfurter.app"
 DEFAULT_SYMBOLS_PATH = Path("data_yahoo") / "forex" / "symbols.csv"
 _RATE_LIMITER: SharedRateLimiter | None = None
 _HTTP_LOCAL = threading.local()
+_MAX_RETRIES = 4
+_RETRY_BASE = 0.6
 
 
 def _read_parquet(path: Path) -> pl.DataFrame:
@@ -33,7 +43,36 @@ def _read_date_column(path: Path) -> pl.DataFrame:
 
 def _write_parquet(frame: pl.DataFrame, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    pq.write_table(frame.to_arrow(), path, compression="snappy", write_statistics=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        pq.write_table(
+            frame.to_arrow(),
+            temporary,
+            compression="snappy",
+            write_statistics=True,
+        )
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _write_csv(frame: pl.DataFrame, path: Path) -> None:
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        frame.write_csv(temporary)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _write_text(path: Path, value: str) -> None:
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_text(value, encoding="utf-8")
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
 
 @dataclass(slots=True)
 class SymbolRecord:
@@ -54,30 +93,44 @@ class DownloadResult:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Download forex OHLC-like data from Frankfurter (ECB rates).")
+    parser = argparse.ArgumentParser(
+        description="Download forex OHLC-like data from Frankfurter (ECB rates)."
+    )
     parser.add_argument(
         "--mode",
         choices=["daily-update", "full"],
         default="daily-update",
         help="daily-update: append only missing dates; full: skip existing unless --refresh.",
     )
-    parser.add_argument("--start-date", default="2000-01-01", help="Inclusive start date (YYYY-MM-DD)")
+    parser.add_argument(
+        "--start-date", default="2000-01-01", help="Inclusive start date (YYYY-MM-DD)"
+    )
     parser.add_argument(
         "--end-date",
         default="today",
         help="Inclusive end date in YYYY-MM-DD, or 'today'/'now' to use current local date.",
     )
-    parser.add_argument("--output-dir", default="data_forex_frankfurter", help="Output directory")
-    parser.add_argument("--symbols-file", default=None, help="Optional text file with one 6-letter pair per line")
+    parser.add_argument(
+        "--output-dir", default="data_forex_frankfurter", help="Output directory"
+    )
+    parser.add_argument(
+        "--symbols-file",
+        default=None,
+        help="Optional text file with one 6-letter pair per line",
+    )
     parser.add_argument("--workers", type=int, default=8, help="Concurrent workers")
     parser.add_argument("--timeout", type=int, default=30, help="HTTP timeout seconds")
+    parser.add_argument("--max-retries", type=int, default=4)
+    parser.add_argument("--retry-base", type=float, default=0.6)
     parser.add_argument(
         "--request-interval",
         type=float,
         default=None,
         help="Global minimum seconds between API requests. Default uses Frankfurter public profile.",
     )
-    parser.add_argument("--refresh", action="store_true", help="Re-download even if parquet exists")
+    parser.add_argument(
+        "--refresh", action="store_true", help="Re-download even if parquet exists"
+    )
     parser.add_argument(
         "--incremental",
         action="store_true",
@@ -92,8 +145,6 @@ def parse_args() -> argparse.Namespace:
 
 
 def _get_json(url: str, timeout: int) -> dict:
-    if _RATE_LIMITER is not None:
-        _RATE_LIMITER.wait()
     session = getattr(_HTTP_LOCAL, "session", None)
     if session is None:
         session = requests.Session()
@@ -101,12 +152,34 @@ def _get_json(url: str, timeout: int) -> dict:
         session.mount("https://", adapter)
         session.mount("http://", adapter)
         _HTTP_LOCAL.session = session
-    response = session.get(url, timeout=timeout)
-    response.raise_for_status()
-    data = response.json()
-    if not isinstance(data, dict):
-        raise RuntimeError(f"Unexpected response shape for {url}")
-    return data
+    last_error: Exception | None = None
+    for attempt in range(max(0, int(_MAX_RETRIES)) + 1):
+        if _RATE_LIMITER is not None:
+            _RATE_LIMITER.wait()
+        try:
+            response = session.get(url, timeout=timeout)
+            response.raise_for_status()
+            data = response.json()
+            if not isinstance(data, dict):
+                raise RuntimeError(f"Unexpected response shape for {url}")
+            return data
+        except (requests.RequestException, ValueError) as exc:
+            last_error = exc
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            retriable = status in {408, 425, 429, 500, 502, 503, 504} or status is None
+            if attempt >= _MAX_RETRIES or not retriable:
+                raise
+            headers = getattr(getattr(exc, "response", None), "headers", {})
+            delay = retry_delay_seconds(
+                attempt,
+                base=_RETRY_BASE,
+                retry_after=headers.get("Retry-After"),
+            )
+            if _RATE_LIMITER is not None:
+                _RATE_LIMITER.defer(delay)
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError(f"Frankfurter request failed without explicit error: {url}")
 
 
 def _load_supported_currencies(timeout: int) -> set[str]:
@@ -125,11 +198,26 @@ def _resolve_api_end_date(timeout: int) -> str:
 def _load_default_pairs() -> list[str]:
     if not DEFAULT_SYMBOLS_PATH.exists():
         return [
-            "EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "USDCHF", "NZDUSD",
-            "EURJPY", "EURGBP", "EURCHF", "EURAUD", "EURNZD", "EURCAD", "GBPJPY", "GBPCHF",
+            "EURUSD",
+            "GBPUSD",
+            "USDJPY",
+            "AUDUSD",
+            "USDCAD",
+            "USDCHF",
+            "NZDUSD",
+            "EURJPY",
+            "EURGBP",
+            "EURCHF",
+            "EURAUD",
+            "EURNZD",
+            "EURCAD",
+            "GBPJPY",
+            "GBPCHF",
         ]
 
-    frame = pl.read_csv(DEFAULT_SYMBOLS_PATH, infer_schema=False, ignore_errors=True).fill_null("")
+    frame = pl.read_csv(
+        DEFAULT_SYMBOLS_PATH, infer_schema=False, ignore_errors=True
+    ).fill_null("")
     if "code" not in frame.columns:
         return []
 
@@ -163,7 +251,9 @@ def _build_symbol_records(pairs: list[str], supported: set[str]) -> list[SymbolR
         base, quote = pair[:3], pair[3:]
         if base not in supported or quote not in supported:
             continue
-        records.append(SymbolRecord(code=pair, name=pair, market="forex", base=base, quote=quote))
+        records.append(
+            SymbolRecord(code=pair, name=pair, market="forex", base=base, quote=quote)
+        )
     return records
 
 
@@ -201,7 +291,11 @@ def _existing_row_count_and_latest_date(path: Path) -> tuple[int, str | None]:
                 value = stats.max
                 if isinstance(value, bytes):
                     value = value.decode("utf-8", errors="ignore")
-                parsed = value.date().isoformat() if isinstance(value, datetime) else str(value)[:10]
+                parsed = (
+                    value.date().isoformat()
+                    if isinstance(value, datetime)
+                    else str(value)[:10]
+                )
                 latest = parsed if latest is None else max(latest, parsed)
             if latest is not None:
                 return rows, latest
@@ -210,7 +304,9 @@ def _existing_row_count_and_latest_date(path: Path) -> tuple[int, str | None]:
     return rows, _max_frame_date(_read_date_column(path))
 
 
-def _normalize_rate_rows(rows: list[dict[str, object]], fetch_start_date: str, end_date: str) -> pl.DataFrame:
+def _normalize_rate_rows(
+    rows: list[dict[str, object]], fetch_start_date: str, end_date: str
+) -> pl.DataFrame:
     if not rows:
         return pl.DataFrame()
     start_dt = datetime.strptime(fetch_start_date, "%Y-%m-%d")
@@ -221,7 +317,14 @@ def _normalize_rate_rows(rows: list[dict[str, object]], fetch_start_date: str, e
             pl.col("date").str.to_datetime(strict=False).alias("date"),
             *[
                 pl.col(column).cast(pl.Float64, strict=False).alias(column)
-                for column in ("open", "max", "min", "close", "adjclose", "Trading_Volume")
+                for column in (
+                    "open",
+                    "max",
+                    "min",
+                    "close",
+                    "adjclose",
+                    "Trading_Volume",
+                )
                 if column in rows[0]
             ],
         )
@@ -249,12 +352,20 @@ def _download_pair(
 
     if output_path.exists() and incremental:
         try:
-            existing_rows, latest_date = _existing_row_count_and_latest_date(output_path)
+            existing_rows, latest_date = _existing_row_count_and_latest_date(
+                output_path
+            )
             has_existing = existing_rows > 0
             if latest_date is not None:
-                next_date = (datetime.strptime(latest_date, "%Y-%m-%d") + timedelta(days=1)).date().isoformat()
+                next_date = (
+                    (datetime.strptime(latest_date, "%Y-%m-%d") + timedelta(days=1))
+                    .date()
+                    .isoformat()
+                )
                 fetch_start_date = max(start_date, next_date)
-            if datetime.strptime(fetch_start_date, "%Y-%m-%d") > datetime.strptime(end_date, "%Y-%m-%d"):
+            if datetime.strptime(fetch_start_date, "%Y-%m-%d") > datetime.strptime(
+                end_date, "%Y-%m-%d"
+            ):
                 return DownloadResult(
                     code=record.code,
                     status="up_to_date",
@@ -273,7 +384,12 @@ def _download_pair(
     if output_path.exists() and not refresh and not incremental:
         try:
             rows = _read_parquet_row_count(output_path)
-            return DownloadResult(code=record.code, status="skipped_existing", rows=int(rows), output_path=str(output_path))
+            return DownloadResult(
+                code=record.code,
+                status="skipped_existing",
+                rows=int(rows),
+                output_path=str(output_path),
+            )
         except Exception as exc:
             return DownloadResult(
                 code=record.code,
@@ -288,7 +404,13 @@ def _download_pair(
         payload = _get_json(url, timeout)
         rates = payload.get("rates", {})
         if not isinstance(rates, dict) or not rates:
-            return DownloadResult(code=record.code, status="empty", rows=0, output_path=None, message="No rates returned")
+            return DownloadResult(
+                code=record.code,
+                status="empty",
+                rows=0,
+                output_path=None,
+                message="No rates returned",
+            )
 
         rows: list[dict[str, object]] = []
         for d, item in rates.items():
@@ -311,16 +433,31 @@ def _download_pair(
             )
 
         if not rows:
-            return DownloadResult(code=record.code, status="empty", rows=0, output_path=None, message="No usable rate points")
+            return DownloadResult(
+                code=record.code,
+                status="empty",
+                rows=0,
+                output_path=None,
+                message="No usable rate points",
+            )
 
         frame = _normalize_rate_rows(rows, fetch_start_date, end_date)
         if frame.is_empty():
-            return DownloadResult(code=record.code, status="empty", rows=0, output_path=None, message="No usable rate points after date filtering")
+            return DownloadResult(
+                code=record.code,
+                status="empty",
+                rows=0,
+                output_path=None,
+                message="No usable rate points after date filtering",
+            )
 
         if incremental and has_existing:
             existing_frame = _read_parquet(output_path)
             merged = (
-                pl.concat([_normalize_date_frame(existing_frame), frame], how="diagonal_relaxed")
+                pl.concat(
+                    [_normalize_date_frame(existing_frame), frame],
+                    how="diagonal_relaxed",
+                )
                 .sort("date")
                 .unique(subset=["date"], keep="last", maintain_order=True)
                 .sort("date")
@@ -334,21 +471,41 @@ def _download_pair(
             )
 
         _write_parquet(frame, output_path)
-        return DownloadResult(code=record.code, status="updated", rows=int(frame.height), output_path=str(output_path))
+        return DownloadResult(
+            code=record.code,
+            status="updated",
+            rows=int(frame.height),
+            output_path=str(output_path),
+        )
     except Exception as exc:
-        return DownloadResult(code=record.code, status="failed", rows=0, output_path=None, message=str(exc))
+        return DownloadResult(
+            code=record.code,
+            status="failed",
+            rows=0,
+            output_path=None,
+            message=str(exc),
+        )
 
 
 def main() -> None:
-    global _RATE_LIMITER
+    global _MAX_RETRIES, _RATE_LIMITER, _RETRY_BASE
     args = parse_args()
+    _MAX_RETRIES = max(0, int(args.max_retries))
+    _RETRY_BASE = max(0.1, float(args.retry_base))
     incremental_mode = args.incremental or args.mode == "daily-update"
-    request_interval = resolve_request_interval("frankfurter_public", args.request_interval)
+    request_interval = resolve_request_interval(
+        "frankfurter_public", args.request_interval
+    )
     _RATE_LIMITER = SharedRateLimiter(request_interval, name="frankfurter_public")
-    print(f"[frankfurter] {describe_rate_limit('frankfurter_public', request_interval)}", flush=True)
+    print(
+        f"[frankfurter] {describe_rate_limit('frankfurter_public', request_interval)}",
+        flush=True,
+    )
 
     if args.refresh and incremental_mode:
-        raise RuntimeError("--refresh cannot be combined with daily incremental mode (--mode daily-update or --incremental)")
+        raise RuntimeError(
+            "--refresh cannot be combined with daily incremental mode (--mode daily-update or --incremental)"
+        )
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -368,7 +525,10 @@ def main() -> None:
         raise RuntimeError("No valid forex pairs resolved for Frankfurter")
 
     if not args.skip_manifest:
-        pl.DataFrame([asdict(item) for item in records]).write_csv(output_dir / "symbols.csv")
+        _write_csv(
+            pl.DataFrame([asdict(item) for item in records]),
+            output_dir / "symbols.csv",
+        )
 
     def _worker(record: SymbolRecord) -> DownloadResult:
         return _download_pair(
@@ -398,7 +558,7 @@ def main() -> None:
         if report_rows
         else pl.DataFrame({column: [] for column in report_columns})
     )
-    report_frame.write_csv(output_dir / "download_report.csv")
+    _write_csv(report_frame, output_dir / "download_report.csv")
 
     status_counts: dict[str, int] = {}
     row_count = 0
@@ -417,7 +577,10 @@ def main() -> None:
         "row_count": row_count,
         "status_counts": status_counts,
     }
-    (output_dir / "download_summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+    _write_text(
+        output_dir / "download_summary.json",
+        json.dumps(summary, indent=2, ensure_ascii=False) + "\n",
+    )
 
     print(
         "[download] provider=frankfurter "
@@ -425,6 +588,11 @@ def main() -> None:
         f"provider_latest={api_latest} applied_end={applied_end} symbols={len(records)}"
     )
     print(f"[download] completed status_counts={status_counts}")
+    failed = sum(
+        count for status, count in status_counts.items() if status.startswith("failed")
+    )
+    if failed:
+        raise RuntimeError(f"Frankfurter download incomplete: {failed} pairs failed")
 
 
 if __name__ == "__main__":

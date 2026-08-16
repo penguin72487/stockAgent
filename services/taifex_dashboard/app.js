@@ -36,7 +36,6 @@ let refreshInFlight = false;
 let historyInFlight = false;
 let lastHistoryEtag = "";
 let historyPayloadCache = new Map();
-let historyRetryTimer = null;
 let strategySearchFrame = null;
 let selectedTimeRange = "1d";
 
@@ -856,29 +855,15 @@ async function refreshHistory({preferCache = false} = {}) {
   historyInFlight = true;
   try {
     const response = await fetchWithTimeout(`api/history?range=${encodeURIComponent(requestedRange)}`, { cache: "default" });
-    if (response.status === 429) {
-      const retrySeconds = Math.min(30, Math.max(1, Number(response.headers.get("Retry-After")) || 5));
-      setText("curve-wall-note", `${TIME_RANGE_LABELS[requestedRange]}歷史請求稍多，保留目前曲線並於 ${retrySeconds} 秒後自動重試。`);
-      if (historyRetryTimer != null) clearTimeout(historyRetryTimer);
-      historyRetryTimer = window.setTimeout(() => {
-        historyRetryTimer = null;
-        if (requestedRange === selectedTimeRange) void refreshHistory();
-      }, retrySeconds * 1000);
-      return;
-    }
     const etag = response.headers.get("ETag") || "";
     if (requestedRange !== selectedTimeRange) return;
     if (etag && cached?.etag === etag) {
       cached.receivedAt = Date.now();
-      if (historyRetryTimer != null) clearTimeout(historyRetryTimer);
-      historyRetryTimer = null;
       return;
     }
     const payload = await response.json();
     if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
     historyPayloadCache.set(requestedRange, {payload, etag, receivedAt: Date.now()});
-    if (historyRetryTimer != null) clearTimeout(historyRetryTimer);
-    historyRetryTimer = null;
     applyHistoryPayload(payload, etag);
   } catch (error) {
     setText("curve-wall-note", `曲線歷史暫時無法更新：${error.message}`);
@@ -959,8 +944,6 @@ byId("equity-time-range").addEventListener("click", (event) => {
   const button = event.target.closest("button[data-range]");
   if (!button || !(button.dataset.range in TIME_RANGES)) return;
   selectedTimeRange = button.dataset.range;
-  if (historyRetryTimer != null) clearTimeout(historyRetryTimer);
-  historyRetryTimer = null;
   try { localStorage.setItem("taifex-equity-time-range", selectedTimeRange); } catch (_error) { /* optional */ }
   syncTimeRangeControl();
   void refreshHistory({preferCache: true});

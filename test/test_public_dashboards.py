@@ -11,16 +11,11 @@ import time
 import pytest
 
 from scripts.serve_public_dashboards import (
-    PUBLIC_AUDIT_BURST_CAPACITY,
-    PUBLIC_AUDIT_HISTORY_COST,
-    PUBLIC_AUDIT_REFILL_PER_SECOND,
-    PUBLIC_GLOBAL_BURST_CAPACITY,
-    PUBLIC_GLOBAL_RATE_KEY,
-    PUBLIC_GLOBAL_REFILL_PER_SECOND,
     InvalidPublicRequest,
     PublicRouteNotFound,
     PublicDashboardHandler,
     PublicDashboardServer,
+    PublicTrafficObserver,
     build_public_overview,
     summarize_tw_status,
 )
@@ -167,7 +162,7 @@ def test_tw_signal_projection_removes_internal_signal_id() -> None:
                     "symbol": "2330",
                     "bid": float("nan"),
                 }
-            ]
+            ],
         }
     )
     assert public == {
@@ -260,12 +255,13 @@ def test_public_landing_exposes_live_safe_status_without_remote_assets() -> None
     root = Path(__file__).resolve().parents[1] / "services" / "public_dashboards"
     html = (root / "index.html").read_text(encoding="utf-8")
     javascript = (root / "public.js").read_text(encoding="utf-8")
-    assert 'src="public.js?v=6"' in html
+    assert 'src="public.js?v=7"' in html
     assert 'id="taifex-health"' in html
     assert 'id="tw-health"' in html
     assert 'id="shioaji-health"' in html
     assert 'id="openbb-health"' in html
     assert 'id="data-health"' in html
+    assert 'id="traffic-health"' in html
     assert "http://" not in html and "https://" not in html
     assert 'fetchJson("api/overview")' in javascript
     assert "taifex/api/status" not in javascript
@@ -274,6 +270,7 @@ def test_public_landing_exposes_live_safe_status_without_remote_assets() -> None
     assert '"流量保護"' in javascript
     assert "renderOpenbb(data.openbb || {})" in javascript
     assert "renderDataMonitor(data.data_monitor || {})" in javascript
+    assert "renderTraffic(data.traffic || {})" in javascript
     assert "textContent" in javascript
     assert 'seconds == null || seconds === ""' in javascript
 
@@ -327,6 +324,17 @@ def test_public_overview_and_tw_summary_exclude_large_ledgers() -> None:
                 "success_rows": 1234,
             },
         },
+        {},
+        {
+            "windows": {
+                "1m": {
+                    "requests": 41,
+                    "requests_per_second": 2.5,
+                    "latency_p95_ms": 8.0,
+                }
+            },
+            "connections": {"in_flight": 3, "peak_in_flight": 57},
+        },
     )
     assert overview["taifex"]["live_strategies"] == 53
     assert overview["tw"] == {
@@ -344,6 +352,13 @@ def test_public_overview_and_tw_summary_exclude_large_ledgers() -> None:
         "accepted_tasks": 72,
         "total_tasks": 100,
         "success_rows": 1234,
+    }
+    assert overview["traffic"] == {
+        "requests_1m": 41,
+        "requests_per_second_1m": 2.5,
+        "latency_p95_ms_1m": 8.0,
+        "in_flight": 3,
+        "peak_in_flight": 57,
     }
     encoded = json.dumps(overview)
     assert '"marks"' not in encoded
@@ -365,13 +380,18 @@ def test_public_pages_share_visual_tokens() -> None:
         "shioaji_api_dashboard/index.html",
         "openbb_archive_dashboard/index.html",
         "data_monitor_dashboard/index.html",
+        "traffic_dashboard/index.html",
     ):
         html = (root / relative).read_text(encoding="utf-8")
         assert "dashboard-core.css?v=5" in html
-        assert 'href="../data-monitor/">全資料</a>' in html or (
-            relative == "data_monitor_dashboard/index.html"
-            and 'href="./" aria-current="page">全資料</a>' in html
-        ) or relative == "public_dashboards/index.html"
+        assert (
+            'href="../data-monitor/">全資料</a>' in html
+            or (
+                relative == "data_monitor_dashboard/index.html"
+                and 'href="./" aria-current="page">全資料</a>' in html
+            )
+            or relative == "public_dashboards/index.html"
+        )
         assert '<meta name="theme-color" content="#071019">' in html
     for relative in (
         "taifex_dashboard/index.html",
@@ -392,6 +412,11 @@ def test_public_pages_share_visual_tokens() -> None:
         javascript = (root / relative).read_text(encoding="utf-8")
         assert "FETCH_TIMEOUT_MS = 15000" in javascript
         assert "AbortController" in javascript
+    traffic_javascript = (root / "traffic_dashboard" / "app.js").read_text(
+        encoding="utf-8"
+    )
+    assert "FETCH_TIMEOUT_MS = 5000" in traffic_javascript
+    assert "AbortController" in traffic_javascript
 
     tw_javascript = (root / "tw_day_trade_dashboard" / "app.js").read_text(
         encoding="utf-8"
@@ -436,6 +461,7 @@ def _test_server() -> PublicDashboardServer:
         shioaji_static_root=root / "services/shioaji_api_dashboard",
         openbb_static_root=root / "services/openbb_archive_dashboard",
         data_monitor_static_root=root / "services/data_monitor_dashboard",
+        traffic_static_root=root / "services/traffic_dashboard",
         repo_root=root,
         taifex_upstream="http://127.0.0.1:1",
         tw_upstream="http://127.0.0.1:1",
@@ -465,9 +491,7 @@ def test_public_gateway_protocol_is_read_only_fail_closed_and_hardened() -> None
         assert response.status == 200
         assert json.loads(response.read()) == {"health": "ok"}
         assert response.getheader("Content-Security-Policy") is not None
-        assert "script-src-attr 'none'" in response.getheader(
-            "Content-Security-Policy"
-        )
+        assert "script-src-attr 'none'" in response.getheader("Content-Security-Policy")
         assert response.getheader("Origin-Agent-Cluster") == "?1"
         assert response.getheader("X-Permitted-Cross-Domain-Policies") == "none"
 
@@ -498,20 +522,21 @@ def test_public_gateway_protocol_is_read_only_fail_closed_and_hardened() -> None
             "error": "temporarily_unavailable",
         }
 
-        server.global_api_limiter = TokenBucketRateLimiter(
-            capacity=1.0,
-            refill_per_second=0.001,
-            maximum_clients=1,
-        )
-        connection.request("GET", "/unknown/api/path")
+        for _ in range(3):
+            connection.request("GET", "/unknown/api/path")
+            response = connection.getresponse()
+            assert response.status == 404
+            assert json.loads(response.read()) == {"error": "not_found"}
+
+        connection.request("GET", "/traffic/api/status")
         response = connection.getresponse()
-        assert response.status == 404
-        response.read()
-        connection.request("GET", "/unknown/api/path")
-        response = connection.getresponse()
-        assert response.status == 429
-        assert response.getheader("Retry-After") == "2"
-        assert json.loads(response.read()) == {"error": "rate_limited"}
+        assert response.status == 200
+        traffic = json.loads(response.read())
+        assert traffic["read_only"] is True
+        assert traffic["production_control_possible"] is False
+        assert traffic["limits"]["global_rate_limit_enabled"] is False
+        assert traffic["limits"]["application_concurrency_limit_enabled"] is False
+        assert response.getheader("Server-Timing") is not None
     finally:
         connection.close()
         server.shutdown()
@@ -521,16 +546,15 @@ def test_public_gateway_protocol_is_read_only_fail_closed_and_hardened() -> None
 
 def test_caddy_and_gateway_security_policy_stay_aligned() -> None:
     root = Path(__file__).resolve().parents[1]
-    gateway = (root / "scripts/serve_public_dashboards.py").read_text(
-        encoding="utf-8"
-    )
+    gateway = (root / "scripts/serve_public_dashboards.py").read_text(encoding="utf-8")
     caddy = (root / "deploy/caddy/Caddyfile.windows").read_text(encoding="utf-8")
-    launcher = (root / "scripts/run_public_dashboards.sh").read_text(
+    launcher = (root / "scripts/run_public_dashboards.sh").read_text(encoding="utf-8")
+    installer = (root / "scripts/install_public_dashboards_service.sh").read_text(
         encoding="utf-8"
     )
-    unit = (
-        root / "deploy/systemd/stockagent-public-dashboards.service.in"
-    ).read_text(encoding="utf-8")
+    unit = (root / "deploy/systemd/stockagent-public-dashboards.service.in").read_text(
+        encoding="utf-8"
+    )
     for token in (
         "Origin-Agent-Cluster",
         "X-Permitted-Cross-Domain-Policies",
@@ -542,11 +566,12 @@ def test_caddy_and_gateway_security_policy_stay_aligned() -> None:
         assert token in caddy
     assert "max_header_size 16KB" in caddy
     assert "read_header 5s" in caddy
-    assert "max_conns_per_host 32" in caddy
+    assert "max_conns_per_host" not in caddy
     assert "@write_methods not method GET HEAD" in caddy
     assert 'header @write_methods Allow "GET, HEAD"' in caddy
     assert 'MALLOC_ARENA_MAX="${MALLOC_ARENA_MAX:-2}"' in launcher
     assert 'Environment="MALLOC_ARENA_MAX=2"' in unit
+    assert "systemctl restart stockagent-public-dashboards.service" in installer
 
 
 def test_expired_cache_returns_stale_while_refreshing_in_background() -> None:
@@ -697,7 +722,9 @@ def test_same_cold_cache_key_is_built_once_under_concurrency() -> None:
 
 
 def test_overview_cache_matches_one_minute_client_refresh_contract() -> None:
-    source = (Path(__file__).resolve().parents[1] / "scripts/serve_public_dashboards.py").read_text(encoding="utf-8")
+    source = (
+        Path(__file__).resolve().parents[1] / "scripts/serve_public_dashboards.py"
+    ).read_text(encoding="utf-8")
     assert 'cache_key="public-overview"' in source
     assert "ttl_seconds=55.0" in source
     assert "ThreadPoolExecutor" in source
@@ -717,37 +744,92 @@ def test_token_bucket_rate_limiter_refills_and_caps_client_table() -> None:
     assert len(limiter._buckets) == 2
 
 
-def test_public_audit_envelope_covers_all_ranges_on_both_dashboards() -> None:
-    limiter = TokenBucketRateLimiter(
-        capacity=PUBLIC_AUDIT_BURST_CAPACITY,
-        refill_per_second=PUBLIC_AUDIT_REFILL_PER_SECOND,
-    )
-    for _dashboard in ("taifex", "tw-day-trade"):
-        for _range in ("1h", "1d", "1w", "1mo", "1q", "1y", "all"):
-            assert limiter.allow(
-                "one-public-client",
-                cost=PUBLIC_AUDIT_HISTORY_COST,
-                now=0.0,
-            )
-    for _background_request in range(10):
-        assert limiter.allow("one-public-client", cost=1.0, now=0.0)
+def test_public_traffic_observer_is_bounded_anonymous_and_reconcilable() -> None:
+    observer = PublicTrafficObserver()
+    for path, status, latency_ms, size in (
+        ("/", 200, 0.4, 100),
+        ("/traffic/api/status", 200, 3.0, 200),
+        ("/arbitrary/private-looking/path", 404, 17.0, 30),
+    ):
+        observed = observer.request_started(path)
+        observer.request_finished(
+            observed=observed,
+            path=path,
+            status=status,
+            latency_ms=latency_ms,
+            response_body_bytes=size,
+        )
+    observer.record_cache("static_build")
+    observer.record_cache("static_hit")
+
+    snapshot = observer.snapshot()
+    minute = snapshot["windows"]["1m"]
+    assert minute["requests"] == 3
+    assert minute["response_body_bytes"] == 330
+    assert minute["latency_p50_ms"] <= minute["latency_p95_ms"]
+    assert minute["latency_p95_ms"] <= minute["latency_p99_ms"]
+    assert minute["latency_p99_ms"] <= minute["latency_max_ms"]
+    assert sum(row["requests"] for row in snapshot["routes"]) == 3
+    assert {row["route"] for row in snapshot["routes"]} == {
+        "/",
+        "/traffic/api/status",
+        "其他／未命中",
+    }
+    assert snapshot["cache"]["hit_ratio"] == 0.5
+    encoded = json.dumps(snapshot, ensure_ascii=False).lower()
+    assert "user_agent" not in _keys(snapshot)
+    assert "user-agent" in snapshot["definitions"]["visitor"].lower()
+    assert "127.0.0.1" not in encoded
+    assert "private-looking" not in encoded
 
 
-def test_public_gateway_has_nat_safe_audit_and_global_flood_ceiling() -> None:
-    source = (Path(__file__).resolve().parents[1] / "scripts" / "serve_public_dashboards.py").read_text(encoding="utf-8")
-    assert "HTTPStatus.TOO_MANY_REQUESTS" in source
-    assert "audit=burst_threshold_exceeded" in source
-    assert "action=allowed" in source
-    assert "user_agent_hash=" in source
-    limiter = TokenBucketRateLimiter(
-        capacity=PUBLIC_GLOBAL_BURST_CAPACITY,
-        refill_per_second=PUBLIC_GLOBAL_REFILL_PER_SECOND,
-        maximum_clients=1,
-    )
-    for _request in range(int(PUBLIC_GLOBAL_BURST_CAPACITY)):
-        assert limiter.allow(PUBLIC_GLOBAL_RATE_KEY, now=0.0)
-    assert not limiter.allow(PUBLIC_GLOBAL_RATE_KEY, now=0.0)
-    assert limiter.allow(PUBLIC_GLOBAL_RATE_KEY, now=1.0)
+def test_public_gateway_has_no_global_rate_or_fixed_concurrency_ceiling() -> None:
+    root = Path(__file__).resolve().parents[1]
+    source = (root / "scripts/serve_public_dashboards.py").read_text(encoding="utf-8")
+    caddy = (root / "deploy/caddy/Caddyfile.windows").read_text(encoding="utf-8")
+    assert "HTTPStatus.TOO_MANY_REQUESTS" not in source
+    assert "global_api_limiter" not in source
+    assert "api_slots" not in source
+    assert "max_conns_per_host" not in caddy
+
+    server = _test_server()
+    original_cached_static = server.cached_static
+    all_requests_entered = threading.Barrier(48)
+
+    def delayed_cached_static(*args: object, **kwargs: object):
+        all_requests_entered.wait(timeout=5)
+        return original_cached_static(*args, **kwargs)
+
+    server.cached_static = delayed_cached_static  # type: ignore[method-assign]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    statuses: list[int] = []
+    lock = threading.Lock()
+
+    def request_static() -> None:
+        connection = HTTPConnection("127.0.0.1", server.server_address[1], timeout=5)
+        try:
+            connection.request("GET", "/traffic/app.js")
+            response = connection.getresponse()
+            response.read()
+            with lock:
+                statuses.append(response.status)
+        finally:
+            connection.close()
+
+    workers = [threading.Thread(target=request_static) for _ in range(48)]
+    try:
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=8)
+        assert all(not worker.is_alive() for worker in workers)
+        assert statuses == [200] * 48
+        assert server.traffic_observer.snapshot()["connections"]["peak_in_flight"] > 32
+    finally:
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
 
 
 def test_public_route_and_request_errors_are_distinct_from_internal_failures() -> None:
@@ -756,17 +838,3 @@ def test_public_route_and_request_errors_are_distinct_from_internal_failures() -
     with pytest.raises(InvalidPublicRequest):
         PublicDashboardHandler._history_range_query("range=unsupported")
     assert issubclass(PublicRouteNotFound, KeyError)
-
-
-def test_public_audit_uses_forwarded_client_and_anonymous_user_agent_hash() -> None:
-    handler = SimpleNamespace(
-        client_address=("127.0.0.1", 12345),
-        headers={
-            "X-Forwarded-For": "203.0.113.8, 127.0.0.1",
-            "User-Agent": "dashboard-test-agent",
-        },
-    )
-    assert PublicDashboardHandler._client_key(handler) == "203.0.113.8"
-    fingerprint = PublicDashboardHandler._user_agent_fingerprint(handler)
-    assert len(fingerprint) == 12
-    assert "dashboard-test-agent" not in fingerprint

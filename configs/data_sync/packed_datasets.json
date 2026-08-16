@@ -121,6 +121,18 @@
       "note": "Bybit public perpetual market data."
     },
     {
+      "dataset": "binance",
+      "source": "data_binance",
+      "role": "training",
+      "publish": true,
+      "pack_buckets": 16,
+      "loose_threshold_mib": 8,
+      "active_process_substrings": [
+        "download_binance_perp_15m.py"
+      ],
+      "note": "Binance USD-M perpetual 15-minute market data."
+    },
+    {
       "dataset": "tw-index-futures",
       "source": "data_tw_index_futures",
       "role": "training",

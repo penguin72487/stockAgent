@@ -1965,7 +1965,7 @@ def test_provider_runtime_upgrades_old_daily_quota_checkpoint(
     upgraded = datetime.fromisoformat(
         runtime.cooldown_deadlines()["tiingo"]
     ).astimezone(fixed_est)
-    assert upgraded.timestamp() > old_deadline
+    assert upgraded.timestamp() > time.time()
     assert (upgraded.hour, upgraded.minute) == (0, 5)
 
 

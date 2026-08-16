@@ -9,7 +9,10 @@ from pathlib import Path
 
 import polars as pl
 
-from common import resolve_end_date, run_parallel_tasks
+try:
+    from downloader.common import resolve_end_date, run_parallel_tasks
+except ModuleNotFoundError:  # direct script execution
+    from common import resolve_end_date, run_parallel_tasks
 
 try:
     import pyarrow.parquet as pq
@@ -20,7 +23,7 @@ except Exception:  # pragma: no cover - optional dependency guard
 FEATURE_SUFFIX = "_features.parquet"
 REQUIRED_COLUMNS = ("date", "open", "max", "min", "close")
 READ_COLUMNS = ("date", "open", "max", "min", "close", "adjclose", "Trading_Volume")
-INTRADAY_ROOT_HINTS = ("crypto", "data_okx", "data_bybit")
+INTRADAY_ROOT_HINTS = ("crypto", "data_okx", "data_bybit", "data_binance", "binance")
 DEFAULT_ROOTS = (
     "data_tw_public/stocks",
     "data_yahoo/us_stocks",
@@ -28,6 +31,7 @@ DEFAULT_ROOTS = (
     "data_yahoo/crypto",
     "data_okx",
     "data_bybit",
+    "data_binance",
     "data_forex_frankfurter",
     "data_peperstone",
 )
@@ -80,21 +84,50 @@ AUDIT_REPORT_SCHEMA: dict[str, pl.DataType] = {
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Audit saved OHLCV parquet files for common data quality issues.")
-    parser.add_argument("--roots", nargs="+", default=list(DEFAULT_ROOTS), help="Data roots to scan.")
-    parser.add_argument("--output-dir", default="artifacts/data_quality", help="Directory for audit artifacts.")
-    parser.add_argument("--run-id", default=None, help="Optional run id. Defaults to UTC timestamp.")
-    parser.add_argument("--workers", type=int, default=max(1, os.cpu_count() or 1), help="Concurrent file readers.")
-    parser.add_argument("--end-date", default="today", help="Target end date for stale checks.")
-    parser.add_argument("--stale-max-lag-days", type=int, default=14, help="Warn when latest row is older than this.")
-    parser.add_argument("--daily-gap-days", type=int, default=10, help="Warn on daily data gaps larger than this.")
+    parser = argparse.ArgumentParser(
+        description="Audit saved OHLCV parquet files for common data quality issues."
+    )
+    parser.add_argument(
+        "--roots", nargs="+", default=list(DEFAULT_ROOTS), help="Data roots to scan."
+    )
+    parser.add_argument(
+        "--output-dir",
+        default="artifacts/data_quality",
+        help="Directory for audit artifacts.",
+    )
+    parser.add_argument(
+        "--run-id", default=None, help="Optional run id. Defaults to UTC timestamp."
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=max(1, os.cpu_count() or 1),
+        help="Concurrent file readers.",
+    )
+    parser.add_argument(
+        "--end-date", default="today", help="Target end date for stale checks."
+    )
+    parser.add_argument(
+        "--stale-max-lag-days",
+        type=int,
+        default=14,
+        help="Warn when latest row is older than this.",
+    )
+    parser.add_argument(
+        "--daily-gap-days",
+        type=int,
+        default=10,
+        help="Warn on daily data gaps larger than this.",
+    )
     parser.add_argument(
         "--intraday-gap-multiple",
         type=float,
         default=4.0,
         help="Warn when intraday gaps exceed inferred interval times this multiple.",
     )
-    parser.add_argument("--limit", type=int, default=None, help="Optional file limit for smoke checks.")
+    parser.add_argument(
+        "--limit", type=int, default=None, help="Optional file limit for smoke checks."
+    )
     return parser.parse_args()
 
 
@@ -134,7 +167,9 @@ def _read_audit_frame(path: Path) -> tuple[pl.DataFrame, set[str]]:
         return pl.from_arrow(pq.read_table(path, columns=columns)), schema_columns
 
     frame = pl.from_arrow(pq.read_table(path))
-    return frame.select([column for column in READ_COLUMNS if column in frame.columns]), set(frame.columns)
+    return frame.select(
+        [column for column in READ_COLUMNS if column in frame.columns]
+    ), set(frame.columns)
 
 
 def _summarize_gaps(
@@ -167,6 +202,22 @@ def _summarize_gaps(
     return max_gap, int(deltas.select(pl.col("delta").gt(threshold).sum()).item())
 
 
+def _timestamps_are_intraday(timestamps: pl.DataFrame, root: Path) -> bool:
+    if _is_intraday_root(root) or timestamps.height < 2:
+        return _is_intraday_root(root)
+    deltas = (
+        timestamps.sort("date")
+        .unique("date")
+        .select(pl.col("date").diff().dt.total_seconds().alias("delta"))
+        .drop_nulls("delta")
+        .filter(pl.col("delta") > 0)
+    )
+    if deltas.is_empty():
+        return False
+    median_delta = float(deltas.select(pl.col("delta").median()).item())
+    return median_delta < 12 * 60 * 60
+
+
 def _date_expr(frame: pl.DataFrame) -> object:
     if frame.schema.get("date") == pl.String:
         return pl.col("date").str.to_datetime(strict=False).alias("date")
@@ -175,7 +226,10 @@ def _date_expr(frame: pl.DataFrame) -> object:
 
 def _numeric_frame(frame: pl.DataFrame, columns: list[str]) -> pl.DataFrame:
     return frame.select(
-        [pl.col(column).cast(pl.Float64, strict=False).fill_nan(None).alias(column) for column in columns]
+        [
+            pl.col(column).cast(pl.Float64, strict=False).fill_nan(None).alias(column)
+            for column in columns
+        ]
     )
 
 
@@ -215,23 +269,30 @@ def _audit_file(payload: tuple[Path, Path, argparse.Namespace]) -> AuditResult:
         result.issues = "|".join(sorted(set(issues)))
         return result
 
-    bounds = valid_dates.select(pl.col("date").min().alias("first_date"), pl.col("date").max().alias("last_date")).to_dicts()[0]
+    bounds = valid_dates.select(
+        pl.col("date").min().alias("first_date"),
+        pl.col("date").max().alias("last_date"),
+    ).to_dicts()[0]
     first_dt = bounds["first_date"]
     last_dt = bounds["last_date"]
     result.first_date = first_dt.date().isoformat()
     result.last_date = last_dt.date().isoformat()
-    target_end = datetime.strptime(resolve_end_date(str(args.end_date)), "%Y-%m-%d").date()
+    target_end = datetime.strptime(
+        resolve_end_date(str(args.end_date)), "%Y-%m-%d"
+    ).date()
     result.stale_lag_days = int((target_end - last_dt.date()).days)
     if result.stale_lag_days > args.stale_max_lag_days:
         issues.append("stale")
 
     date_key = (
         valid_dates.select(pl.col("date").dt.truncate("1s").alias("date_key"))
-        if _is_intraday_root(root)
+        if _timestamps_are_intraday(valid_dates, root)
         else valid_dates.select(pl.col("date").dt.date().alias("date_key"))
     )
     duplicate_groups = date_key.group_by("date_key").len().filter(pl.col("len") > 1)
-    result.duplicate_dates = int(duplicate_groups.select(pl.col("len").sum()).item() or 0)
+    result.duplicate_dates = int(
+        duplicate_groups.select(pl.col("len").sum()).item() or 0
+    )
     if result.duplicate_dates:
         issues.append("duplicate_dates")
 
@@ -246,10 +307,14 @@ def _audit_file(payload: tuple[Path, Path, argparse.Namespace]) -> AuditResult:
     if gap_count:
         issues.append("large_gaps")
 
-    ohlc_columns = [column for column in ("open", "max", "min", "close") if column in frame.columns]
+    ohlc_columns = [
+        column for column in ("open", "max", "min", "close") if column in frame.columns
+    ]
     if ohlc_columns:
         ohlc = _numeric_frame(frame, ohlc_columns)
-        result.nan_ohlc_rows = int(ohlc.select(pl.any_horizontal(pl.all().is_null()).sum()).item())
+        result.nan_ohlc_rows = int(
+            ohlc.select(pl.any_horizontal(pl.all().is_null()).sum()).item()
+        )
         if result.nan_ohlc_rows:
             issues.append("nan_ohlc")
 
@@ -270,7 +335,9 @@ def _audit_file(payload: tuple[Path, Path, argparse.Namespace]) -> AuditResult:
             if result.bad_ohlc_rows:
                 issues.append("bad_ohlc")
 
-        result.nonpositive_price_rows = int(ohlc.select(pl.any_horizontal(pl.all().le(0)).sum()).item())
+        result.nonpositive_price_rows = int(
+            ohlc.select(pl.any_horizontal(pl.all().le(0)).sum()).item()
+        )
         if result.nonpositive_price_rows:
             issues.append("nonpositive_price")
 
@@ -313,6 +380,26 @@ def _report_frame(results: list[AuditResult]) -> pl.DataFrame:
     )
 
 
+def _write_csv_atomic(frame: pl.DataFrame, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        frame.write_csv(temporary)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _write_text_atomic(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_text(text, encoding="utf-8")
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def main() -> None:
     args = parse_args()
     run_id = args.run_id or _utc_run_id()
@@ -334,7 +421,7 @@ def main() -> None:
     summary_path = output_dir / "data_quality_summary.json"
     latest_summary_path = Path(args.output_dir) / "latest_summary.json"
 
-    _report_frame(results).write_csv(report_path)
+    _write_csv_atomic(_report_frame(results), report_path)
 
     status_counts: dict[str, int] = {}
     for item in results:
@@ -356,9 +443,8 @@ def main() -> None:
         "summary_path": str(summary_path),
     }
     summary_text = json.dumps(summary, ensure_ascii=False, indent=2)
-    summary_path.write_text(summary_text, encoding="utf-8")
-    latest_summary_path.parent.mkdir(parents=True, exist_ok=True)
-    latest_summary_path.write_text(summary_text, encoding="utf-8")
+    _write_text_atomic(summary_path, summary_text)
+    _write_text_atomic(latest_summary_path, summary_text)
 
     print(f"[audit] report -> {report_path}")
     print(f"[audit] summary -> {summary_path}")

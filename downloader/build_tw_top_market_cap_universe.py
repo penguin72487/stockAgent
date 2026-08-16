@@ -7,17 +7,31 @@ import json
 import os
 from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 import polars as pl
+
+try:
+    from downloader.common import (
+        SharedRateLimiter,
+        describe_rate_limit,
+        resolve_request_interval,
+        retry_delay_seconds,
+    )
+except ModuleNotFoundError:  # direct script execution
+    from common import (
+        SharedRateLimiter,
+        describe_rate_limit,
+        resolve_request_interval,
+        retry_delay_seconds,
+    )
 
 
 TWSE_COMPANIES_URL = "https://openapi.twse.com.tw/v1/opendata/t187ap03_L"
 TWSE_CLOSE_URL = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
 TPEX_COMPANIES_URL = "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_O"
-TPEX_MARKET_VALUE_URL = (
-    "https://www.tpex.org.tw/openapi/v1/tpex_daily_market_value"
-)
+TPEX_MARKET_VALUE_URL = "https://www.tpex.org.tw/openapi/v1/tpex_daily_market_value"
 SOURCE_NAME = "twse_tpex_official_market_cap"
 
 
@@ -36,17 +50,70 @@ def parse_args() -> argparse.Namespace:
         default=Path("data_tw_microstructure/universe"),
     )
     parser.add_argument("--timeout", type=float, default=30.0)
+    parser.add_argument("--max-retries", type=int, default=4)
+    parser.add_argument("--retry-base", type=float, default=0.6)
+    parser.add_argument(
+        "--request-interval",
+        type=float,
+        default=None,
+        help=(
+            "Host-global minimum interval for TW official endpoints. The "
+            "default is the documented stockAgent safety policy, not an "
+            "upstream-published numeric quota."
+        ),
+    )
     return parser.parse_args()
 
 
-def _fetch_json(url: str, *, timeout: float) -> tuple[list[dict[str, Any]], bytes]:
-    request = Request(url, headers={"User-Agent": "stockAgent/1.0"})
-    with urlopen(request, timeout=timeout) as response:  # noqa: S310 - fixed HTTPS URLs
-        body = response.read()
-    payload = json.loads(body)
-    if not isinstance(payload, list) or not all(isinstance(row, dict) for row in payload):
-        raise RuntimeError(f"official endpoint returned a non-tabular payload: {url}")
-    return payload, body
+def _fetch_json(
+    url: str,
+    *,
+    timeout: float,
+    limiter: SharedRateLimiter,
+    max_retries: int,
+    retry_base: float,
+) -> tuple[list[dict[str, Any]], bytes]:
+    last_error: Exception | None = None
+    for attempt in range(max(0, int(max_retries)) + 1):
+        limiter.wait()
+        request = Request(url, headers={"User-Agent": "stockAgent/1.0"})
+        try:
+            with urlopen(request, timeout=timeout) as response:  # noqa: S310
+                body = response.read()
+            payload = json.loads(body)
+            if not isinstance(payload, list) or not all(
+                isinstance(row, dict) for row in payload
+            ):
+                raise RuntimeError(
+                    f"official endpoint returned a non-tabular payload: {url}"
+                )
+            return payload, body
+        except HTTPError as exc:
+            last_error = exc
+            if (
+                exc.code not in {408, 425, 429, 500, 502, 503, 504}
+                or attempt >= max_retries
+            ):
+                raise
+            limiter.defer(
+                retry_delay_seconds(
+                    attempt,
+                    base=retry_base,
+                    retry_after=(
+                        exc.headers.get("Retry-After")
+                        if exc.headers is not None
+                        else None
+                    ),
+                )
+            )
+        except (URLError, json.JSONDecodeError) as exc:
+            last_error = exc
+            if attempt >= max_retries:
+                raise
+            limiter.defer(retry_delay_seconds(attempt, base=retry_base))
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError(f"official endpoint failed without explicit error: {url}")
 
 
 def _number(value: Any) -> float | None:
@@ -101,7 +168,9 @@ def build_universe(
         rows.append(
             {
                 "symbol": code,
-                "name": str(company.get("公司簡稱") or quote.get("Name") or code).strip(),
+                "name": str(
+                    company.get("公司簡稱") or quote.get("Name") or code
+                ).strip(),
                 "market": "twse",
                 "market_cap_ntd": close * shares,
                 "close": close,
@@ -116,7 +185,12 @@ def build_universe(
         market_value_million = _number(item.get("MarketValue"))
         close = _number(item.get("ClosePrice"))
         shares = _number(item.get("Capitals"))
-        if company is None or market_value_million is None or close is None or shares is None:
+        if (
+            company is None
+            or market_value_million is None
+            or close is None
+            or shares is None
+        ):
             continue
         source_date = _roc_date(item.get("Date"))
         rows.append(
@@ -149,7 +223,9 @@ def build_universe(
         )
     )
     if frame["symbol"].n_unique() != frame.height:
-        raise RuntimeError("combined official market-cap universe contains duplicate symbols")
+        raise RuntimeError(
+            "combined official market-cap universe contains duplicate symbols"
+        )
     return frame
 
 
@@ -162,6 +238,12 @@ def _atomic_write(path: Path, body: bytes) -> None:
 
 def main() -> None:
     args = parse_args()
+    request_interval = resolve_request_interval("tw_public", args.request_interval)
+    limiter = SharedRateLimiter(request_interval, name="tw_public")
+    print(
+        f"[tw-market-cap] {describe_rate_limit('tw_public', request_interval)}",
+        flush=True,
+    )
     endpoints = {
         "twse_companies": TWSE_COMPANIES_URL,
         "twse_close": TWSE_CLOSE_URL,
@@ -172,7 +254,13 @@ def main() -> None:
     receipts: dict[str, dict[str, Any]] = {}
     raw_dir = args.output_dir / "raw"
     for name, url in endpoints.items():
-        payload, body = _fetch_json(url, timeout=float(args.timeout))
+        payload, body = _fetch_json(
+            url,
+            timeout=float(args.timeout),
+            limiter=limiter,
+            max_retries=max(0, int(args.max_retries)),
+            retry_base=max(0.1, float(args.retry_base)),
+        )
         raw_path = raw_dir / f"{name}.json"
         _atomic_write(raw_path, body)
         payloads[name] = payload
@@ -210,7 +298,9 @@ def main() -> None:
     }
     _atomic_write(
         args.output_dir / f"top_{int(args.count)}.summary.json",
-        (json.dumps(summary, ensure_ascii=True, indent=2, sort_keys=True) + "\n").encode(),
+        (
+            json.dumps(summary, ensure_ascii=True, indent=2, sort_keys=True) + "\n"
+        ).encode(),
     )
     print(
         f"[tw-market-cap] count={frame.height} twse={summary['twse_symbols']} "

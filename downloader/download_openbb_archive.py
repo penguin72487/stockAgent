@@ -7836,13 +7836,13 @@ class ProviderRuntime:
                         self._blocked_kind[provider_name] == "quota"
                         and "daily" in reason.lower()
                     ):
-                        self._blocked_until[provider_name] = max(
-                            self._blocked_until[provider_name],
-                            self._quota_reset_deadline(
-                                provider_name,
-                                reason,
-                                now,
-                            ),
+                        # The old checkpoint deadline was a generic cooldown,
+                        # not upstream reset evidence. Replace it with the
+                        # semantic provider boundary: keeping the maximum can
+                        # oversleep past midnight when the archive restarts in
+                        # the final hour of the provider day.
+                        self._blocked_until[provider_name] = (
+                            self._quota_reset_deadline(provider_name, reason, now)
                         )
             unavailable = payload.get("unavailable_providers", {})
             if isinstance(unavailable, Mapping):
