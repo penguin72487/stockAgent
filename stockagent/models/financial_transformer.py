@@ -587,6 +587,7 @@ class FinancialTransformerModel(TransformerBasePortfolioModel):
                 None,
                 None,
                 rope_positions,
+                checkpoint_blocks_override=self.checkpoint_blocks,
             )
         if self.daily_context_pooling == "last":
             pooled = sequence[:, -1]

@@ -260,7 +260,49 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
             target_returns = np.broadcast_to(
                 reference_returns[:, None], panel.tradable_mask.shape
             ).copy()
-            if derivatives_day_execution:
+            if self.execution_mode == "tw_index_futures_day":
+                derivative_candidate_features = getattr(
+                    panel, "index_futures_candidate_features", None
+                )
+                derivative_candidate_mask = getattr(
+                    panel, "index_futures_candidate_mask", None
+                )
+                futures_execution_returns = getattr(
+                    panel, "index_futures_execution_returns", None
+                )
+                if (
+                    derivative_candidate_features is None
+                    or derivative_candidate_mask is None
+                    or futures_execution_returns is None
+                ):
+                    raise ValueError(
+                        "tw_index_futures_day requires causal 18-slot model "
+                        "context and exact executor returns"
+                    )
+                derivative_candidate_features = np.asarray(
+                    derivative_candidate_features, dtype=np.float32
+                )
+                derivative_candidate_mask = np.asarray(
+                    derivative_candidate_mask, dtype=bool
+                )
+                futures_execution_returns = np.asarray(
+                    futures_execution_returns, dtype=np.float32
+                )
+                if (
+                    derivative_candidate_features.ndim != 3
+                    or derivative_candidate_features.shape[:2]
+                    != derivative_candidate_mask.shape
+                    or futures_execution_returns.shape
+                    != (derivative_candidate_mask.shape[0], 18, 3)
+                    or derivative_candidate_features.shape[0] != panel.num_dates
+                    or derivative_candidate_mask.shape[1] < 18
+                ):
+                    raise ValueError(
+                        "tw_index_futures_day context must be [T,K>=18,F], mask "
+                        "[T,K], and execution returns [T,18,3]"
+                    )
+                overnight_returns = futures_execution_returns
+            elif derivatives_day_execution:
                 derivative_returns = getattr(
                     panel, "index_derivatives_simple_returns", None
                 )
@@ -325,6 +367,22 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
                     "masks; close-session masks must not be reused for the open"
                 )
             target_returns = np.asarray(panel.intraday_returns)
+            if panel.day_trade_minute_execution is not None:
+                minute_execution = np.asarray(
+                    panel.day_trade_minute_execution, dtype=np.float32
+                )
+                if (
+                    minute_execution.ndim != 3
+                    or minute_execution.shape[:2] != panel.tradable_mask.shape
+                ):
+                    raise ValueError(
+                        "PanelData.day_trade_minute_execution must have shape [T,S,C]"
+                    )
+                # overnight_log_returns is an executor-only side channel for
+                # tw_day_trade; it is never a model input.  Reusing this
+                # existing windowed tensor path keeps the daily model ABI and
+                # avoids copying a 3-D label through a second loader stack.
+                overnight_returns = minute_execution
             day_trade_eligible = np.asarray(
                 panel.day_trade_eligible_mask, dtype=bool
             )

@@ -1,15 +1,16 @@
 base_config: tw_minute_dual_5090.yaml
 
-experiment_name: tw-full-market-minute-daily-guided-gate-v1
+experiment_name: tw-full-market-minute-daily-guided-gate-v2
 
 runner:
-  output_dir: artifacts/markets/tw_minute_daily_guided_dual_5090_v1
+  output_dir: artifacts/markets/tw_minute_daily_guided_dual_5090_v2
   resume: true
 
 data:
   # Build this immutable OOF artifact with
-  # scripts/build_tw_minute_daily_guidance.py. Every minute year uses the most
-  # recent fold whose train/validation information ends before that year.
+  # scripts/build_tw_minute_daily_guidance.py. Every minute session uses the
+  # most recent exact-date fold whose train/validation information ends before
+  # that year; an older causal fold covers only split-local lookback gaps.
   minute_daily_guidance_path: data_tw_minute/daily_guidance/oof_requested_weights.parquet
 
 trading:

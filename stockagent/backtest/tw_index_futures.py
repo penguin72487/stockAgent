@@ -1,10 +1,10 @@
-"""Canonical day-session execution for TX, MTX, and TMF.
+"""Canonical day-session execution for TX/MTX/TMF across E1..E6.
 
-The strategy owns one signed Taiwan-index exposure.  The model does not choose
-three independent directions for products with the same underlying.  The
-continuous path is used by the differentiable objective; the integer path
-turns that exposure into a same-direction basket of TX/MTX/TMF contracts and
-flattens the complete basket in the same general trading session.
+The current contract uses 18 direct signed capital fractions and converts each
+one to whole contracts without adding unrequested lots.  Exact per-contract
+fees, tax, slippage, and the recurrent equity path are shared by the loss
+forward and integer audit.  A scalar front-month basket path remains only for
+the previous caller ABI and regression comparisons.
 """
 
 from __future__ import annotations
@@ -12,23 +12,30 @@ from __future__ import annotations
 from dataclasses import dataclass
 import math
 from numbers import Real
-from typing import Final
+import os
+from typing import Callable, Final
 
 import numpy as np
 import torch
 
 from stockagent.data.tw_index_futures import (
+    TAIFEX_INDEX_FUTURES_ACTION_COUNT,
     TAIFEX_INDEX_FUTURES_MULTIPLIERS,
     TAIFEX_INDEX_FUTURES_PRODUCTS,
+    TAIFEX_INDEX_FUTURES_TENOR_SLOTS,
     TaiwanIndexFuturesDaySession,
 )
 
 
-# v5 applies the statutory stock-index-futures rate to every transaction.  A
-# daily-flat round trip has an opening and a closing transaction, irrespective
-# of direction.  The legacy config field still contains ``sell`` in its name,
-# but the value is now interpreted as the per-transaction rate.
-TW_INDEX_FUTURES_DAY_BACKTEST_CONTRACT_VERSION: Final[int] = 5
+# v7 is the direct 18-action, exact whole-contract recurrent-equity contract.
+# It applies the statutory rate to both transactions of every daily-flat round
+# trip and keeps the same forward ledger in eager, fixed-block compiled loss,
+# chunked evaluation, and the final integer artifact.
+TW_INDEX_FUTURES_DAY_BACKTEST_CONTRACT_VERSION: Final[int] = 7
+# v2 preserves directional PnL gradients at exactly zero requested exposure.
+# Forward whole-contract counts, costs, returns, and equity are unchanged, but
+# optimizer trajectories from v1 must not resume silently under this gradient.
+TW_INDEX_FUTURES_TRAINING_GRADIENT_CONTRACT_VERSION: Final[int] = 2
 TW_INDEX_FUTURES_TRANSACTION_TAX_RATE: Final[float] = 0.00002
 # Compatibility exports for downstream imports.  Both names now denote the
 # per-transaction rate, not a one-sided round-trip rate.
@@ -43,6 +50,22 @@ TAIFEX_FIXED_FEES_PER_SIDE_TWD: Final[dict[str, float]] = {
     "MTX": 12.5,
     "TMF": 8.0,
 }
+TW_INDEX_FUTURES_COMPILED_BLOCK_ROWS: Final[int] = 32
+_COMPILED_ALL_TENOR_BLOCKS: dict[
+    tuple[object, ...], Callable[..., tuple[torch.Tensor, ...]]
+] = {}
+_FAILED_ALL_TENOR_BLOCKS: set[tuple[object, ...]] = set()
+_ALL_TENOR_COMPILE_STATS: dict[str, int] = {
+    "compiled_block_calls": 0,
+    "compiled_day_calls": 0,
+    "eager_fallback_calls": 0,
+}
+
+
+def get_tw_index_futures_compile_stats() -> dict[str, int]:
+    """Return process-local fixed-block usage counters."""
+
+    return dict(_ALL_TENOR_COMPILE_STATS)
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,6 +129,10 @@ class FuturesContinuousBacktest:
     executed_exposure: torch.Tensor
     turnovers: torch.Tensor
     tradable_mask: torch.Tensor
+    executed_actions: torch.Tensor | None = None
+    equity_scale_history: torch.Tensor | None = None
+    final_equity_scale: torch.Tensor | None = None
+    final_alive: torch.Tensor | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,6 +161,533 @@ class FuturesIntegerBacktest:
     equity: np.ndarray
     alive: np.ndarray
     contract_months: np.ndarray
+
+
+def build_tw_index_futures_day_execution_tensor(
+    market: TaiwanIndexFuturesDaySession,
+    *,
+    cost_schedule: FuturesCostSchedule | None = None,
+) -> np.ndarray:
+    """Return exact per-opening-notional long/short outcomes and notionals.
+
+    Channels are ``[long_net_simple_return, short_net_simple_return,
+    one_contract_open_notional_twd]`` in the same stable product-major 18-slot
+    order as the model.  Fees, tax, and slippage are charged on both legs.
+    Invalid executor rows remain NaN and are never interpreted as zero-return
+    trades.
+    """
+
+    schedule = FuturesCostSchedule() if cost_schedule is None else cost_schedule
+    (
+        _months,
+        opens,
+        _highs,
+        _lows,
+        closes,
+        _volumes,
+        _log_returns,
+        tradable,
+    ) = market.flattened_tenor_panel()
+    multipliers = np.repeat(
+        np.asarray(market.multipliers, dtype=np.float64),
+        TAIFEX_INDEX_FUTURES_TENOR_SLOTS,
+    )
+    product_index = np.repeat(
+        np.arange(len(market.products), dtype=np.int64),
+        TAIFEX_INDEX_FUTURES_TENOR_SLOTS,
+    )
+    fixed = schedule.fixed_fee_per_side_twd[product_index]
+    slippage = np.asarray(
+        schedule.slippage_points_per_side, dtype=np.float64
+    )[product_index]
+    valid = (
+        np.asarray(tradable, dtype=bool)
+        & np.isfinite(opens)
+        & (opens > 0.0)
+        & np.isfinite(closes)
+        & (closes > 0.0)
+    )
+    contract_notional = opens * multipliers[None, :]
+    round_trip_cost = (
+        2.0 * fixed[None, :]
+        + (opens + closes)
+        * multipliers[None, :]
+        * float(schedule.tax_rate)
+        + 2.0 * slippage[None, :] * multipliers[None, :]
+    )
+    gross_long = (closes - opens) * multipliers[None, :]
+    gross_short = -gross_long
+    long_return = (gross_long - round_trip_cost) / contract_notional
+    short_return = (gross_short - round_trip_cost) / contract_notional
+    output = np.stack((long_return, short_return, contract_notional), axis=-1)
+    output[~valid] = np.nan
+    return output.astype(np.float32, copy=False)
+
+
+def _run_tw_index_futures_all_tenors_day_torch_impl(
+    actions: torch.Tensor,
+    execution_tensor: torch.Tensor,
+    *,
+    initial_capital: float,
+    max_abs_exposure: float = 1.0,
+    initial_equity_scale: torch.Tensor | None = None,
+    initial_alive: torch.Tensor | None = None,
+) -> FuturesContinuousBacktest:
+    """Execute direct 18-slot actions with exact-forward whole contracts.
+
+    Contract counts are floored independently, so the executor never adds
+    risk the model did not request and never forces a minimum one-contract
+    position.  A straight-through executed fraction preserves useful action
+    gradients while the forward values, costs, PnL, and equity path are the
+    exact integer ledger represented by ``execution_tensor``.
+    """
+
+    capital = _finite_nonnegative("initial_capital", initial_capital)
+    limit = _finite_nonnegative("max_abs_exposure", max_abs_exposure)
+    if capital <= 0.0 or limit <= 0.0:
+        raise ValueError("initial_capital and max_abs_exposure must be positive")
+    if actions.ndim != 2 or int(actions.size(1)) != TAIFEX_INDEX_FUTURES_ACTION_COUNT:
+        raise ValueError("actions must have shape [T,18]")
+    if tuple(execution_tensor.shape) != (
+        int(actions.size(0)),
+        TAIFEX_INDEX_FUTURES_ACTION_COUNT,
+        3,
+    ):
+        raise ValueError("execution_tensor must have shape [T,18,3]")
+
+    clean = torch.nan_to_num(actions.float(), nan=0.0, posinf=0.0, neginf=0.0)
+    gross_requested = clean.abs().sum(dim=-1, keepdim=True)
+    exact_scale = torch.clamp(
+        clean.new_tensor(float(limit))
+        / gross_requested.clamp_min(torch.finfo(clean.dtype).eps),
+        max=1.0,
+    )
+    # The model normally emits gross exactly at the limit. Different reduction
+    # trees may place that value on opposite sides of clamp's derivative kink.
+    # Keep the exact capped forward value while using the identity derivative
+    # inside a one-ppm boundary band; outside the band retain the true
+    # normalization derivative.
+    stable_scale = torch.where(
+        gross_requested
+        <= clean.new_tensor(float(limit) * (1.0 + 1e-6)),
+        torch.ones_like(exact_scale),
+        exact_scale,
+    )
+    scale = stable_scale + (exact_scale - stable_scale).detach()
+    clean = clean * scale
+    valid = torch.isfinite(execution_tensor).all(dim=-1)
+    long_returns = torch.nan_to_num(execution_tensor[..., 0].float(), nan=0.0)
+    short_returns = torch.nan_to_num(execution_tensor[..., 1].float(), nan=0.0)
+    notionals = torch.nan_to_num(
+        execution_tensor[..., 2].float(), nan=0.0, posinf=0.0, neginf=0.0
+    )
+    requested_history: list[torch.Tensor] = []
+    executed_history: list[torch.Tensor] = []
+    return_history: list[torch.Tensor] = []
+    turnover_history: list[torch.Tensor] = []
+    starting_scale = (
+        clean.new_ones(())
+        if initial_equity_scale is None
+        else initial_equity_scale.to(device=clean.device, dtype=clean.dtype)
+    )
+    equity = clean.new_tensor(float(capital)) * starting_scale
+    alive = (
+        torch.ones((), dtype=torch.bool, device=clean.device)
+        if initial_alive is None
+        else initial_alive.to(device=clean.device, dtype=torch.bool)
+    )
+    equity_scale_history: list[torch.Tensor] = []
+    for row in range(int(clean.size(0))):
+        requested = torch.where(valid[row] & alive, clean[row], torch.zeros_like(clean[row]))
+        target = requested.abs() * equity.detach()
+        contract_ratio = (
+            target
+            / notionals[row].clamp_min(torch.finfo(notionals.dtype).tiny)
+        )
+        # Model actions may arrive through BF16/FP32.  Treat ratios within one
+        # part per million of an integer as that exact integer so representable
+        # 1% requests do not spuriously lose a whole contract.
+        counts = torch.floor(contract_ratio + 1e-6)
+        counts = torch.where(valid[row] & alive, counts, torch.zeros_like(counts))
+        actual_abs = counts * notionals[row] / equity.detach().clamp_min(1e-12)
+        # Forward equals the integer fraction.  The signed straight-through
+        # value retains the directional PnL derivative even at requested=0;
+        # using only abs(requested) plus a long/short branch would make cash an
+        # artificial absorbing point because d(abs(x))/dx is zero at x=0.
+        executed_abs = requested.abs() + (actual_abs - requested.abs()).detach()
+        actual_signed = torch.copysign(actual_abs, requested)
+        signed_executed = requested + (actual_signed - requested).detach()
+        directional_returns = 0.5 * (long_returns[row] - short_returns[row])
+        round_trip_cost_returns = -0.5 * (
+            long_returns[row] + short_returns[row]
+        )
+        strategy_return = torch.sum(
+            signed_executed * directional_returns
+            - executed_abs * round_trip_cost_returns
+        )
+        next_equity = equity * (1.0 + strategy_return)
+        row_alive = torch.isfinite(next_equity) & (next_equity > 0.0)
+        equity = torch.where(row_alive, next_equity, torch.zeros_like(next_equity))
+        alive = alive & row_alive
+        equity_scale_history.append(equity / float(capital))
+        requested_history.append(requested)
+        executed_history.append(signed_executed)
+        return_history.append(strategy_return)
+        turnover_history.append(2.0 * actual_abs.sum())
+    if return_history:
+        strategy_returns = torch.stack(return_history)
+        executed_actions = torch.stack(executed_history)
+        turnovers = torch.stack(turnover_history)
+        requested_actions = torch.stack(requested_history)
+        equity_scales = torch.stack(equity_scale_history)
+    else:
+        strategy_returns = clean.new_empty((0,))
+        executed_actions = clean.new_empty((0, TAIFEX_INDEX_FUTURES_ACTION_COUNT))
+        turnovers = clean.new_empty((0,))
+        requested_actions = executed_actions
+        equity_scales = clean.new_empty((0,))
+    return FuturesContinuousBacktest(
+        strategy_returns=strategy_returns,
+        gross_returns=strategy_returns,
+        cost_returns=torch.zeros_like(strategy_returns),
+        requested_exposure=requested_actions.abs().sum(dim=-1),
+        executed_exposure=executed_actions.abs().sum(dim=-1),
+        turnovers=turnovers,
+        tradable_mask=valid.any(dim=-1),
+        executed_actions=executed_actions,
+        equity_scale_history=equity_scales,
+        final_equity_scale=(
+            equity_scales[-1] if equity_scales.numel() else starting_scale
+        ),
+        final_alive=alive,
+    )
+
+
+def _futures_result_tuple(
+    result: FuturesContinuousBacktest,
+) -> tuple[torch.Tensor, ...]:
+    if (
+        result.executed_actions is None
+        or result.equity_scale_history is None
+        or result.final_equity_scale is None
+        or result.final_alive is None
+    ):
+        raise RuntimeError("direct futures result is missing recurrent state")
+    return (
+        result.strategy_returns,
+        result.requested_exposure,
+        result.executed_exposure,
+        result.turnovers,
+        result.tradable_mask,
+        result.executed_actions,
+        result.equity_scale_history,
+        result.final_equity_scale,
+        result.final_alive,
+    )
+
+
+def _compiled_all_tenor_block(
+    actions: torch.Tensor,
+    *,
+    block_rows: int,
+    initial_capital: float,
+    max_abs_exposure: float,
+) -> tuple[tuple[object, ...], Callable[..., tuple[torch.Tensor, ...]]]:
+    device_index = (
+        actions.device.index
+        if actions.device.index is not None
+        else torch.cuda.current_device()
+    )
+    key: tuple[object, ...] = (
+        int(device_index),
+        str(actions.dtype),
+        int(block_rows),
+        float(initial_capital),
+        float(max_abs_exposure),
+    )
+    compiled = _COMPILED_ALL_TENOR_BLOCKS.get(key)
+    if compiled is not None:
+        return key, compiled
+
+    def block(
+        block_actions: torch.Tensor,
+        block_execution: torch.Tensor,
+        equity_scale: torch.Tensor,
+        alive: torch.Tensor,
+    ) -> tuple[torch.Tensor, ...]:
+        return _futures_result_tuple(
+            _run_tw_index_futures_all_tenors_day_torch_impl(
+                block_actions,
+                block_execution,
+                initial_capital=initial_capital,
+                max_abs_exposure=max_abs_exposure,
+                initial_equity_scale=equity_scale,
+                initial_alive=alive,
+            )
+        )
+
+    compiled = torch.compile(
+        block,
+        fullgraph=True,
+        dynamic=False,
+        options={"triton.cudagraphs": False},
+    )
+    _COMPILED_ALL_TENOR_BLOCKS[key] = compiled
+    return key, compiled
+
+
+def _futures_result_from_tuple(
+    values: tuple[torch.Tensor, ...],
+) -> FuturesContinuousBacktest:
+    return FuturesContinuousBacktest(
+        strategy_returns=values[0],
+        gross_returns=values[0],
+        cost_returns=torch.zeros_like(values[0]),
+        requested_exposure=values[1],
+        executed_exposure=values[2],
+        turnovers=values[3],
+        tradable_mask=values[4],
+        executed_actions=values[5],
+        equity_scale_history=values[6],
+        final_equity_scale=values[7],
+        final_alive=values[8],
+    )
+
+
+def _slice_futures_result_rows(
+    result: FuturesContinuousBacktest,
+    rows: int,
+) -> FuturesContinuousBacktest:
+    """Discard inert padding rows while preserving the block terminal state."""
+
+    return FuturesContinuousBacktest(
+        strategy_returns=result.strategy_returns[:rows],
+        gross_returns=result.gross_returns[:rows],
+        cost_returns=result.cost_returns[:rows],
+        requested_exposure=result.requested_exposure[:rows],
+        executed_exposure=result.executed_exposure[:rows],
+        turnovers=result.turnovers[:rows],
+        tradable_mask=result.tradable_mask[:rows],
+        executed_actions=(
+            None
+            if result.executed_actions is None
+            else result.executed_actions[:rows]
+        ),
+        equity_scale_history=(
+            None
+            if result.equity_scale_history is None
+            else result.equity_scale_history[:rows]
+        ),
+        final_equity_scale=result.final_equity_scale,
+        final_alive=result.final_alive,
+    )
+
+
+def run_tw_index_futures_all_tenors_day_torch(
+    actions: torch.Tensor,
+    execution_tensor: torch.Tensor,
+    *,
+    initial_capital: float,
+    max_abs_exposure: float = 1.0,
+    initial_equity_scale: torch.Tensor | None = None,
+    initial_alive: torch.Tensor | None = None,
+) -> FuturesContinuousBacktest:
+    """Run the exact ledger in reusable fixed-size CUDA blocks.
+
+    The eager implementation remains the semantic oracle.  Compiling an
+    entire training batch unrolls the equity recurrence once per row and makes
+    compile latency proportional to batch size.  A fixed block is compiled
+    once and reused while its differentiable equity/alive state is chained
+    across calls.  A non-aligned tail is padded with inert, non-tradable rows
+    and sent through the same fixed graph, then sliced back to the true length.
+    This keeps every real row on the compiled exact ledger without introducing
+    a second tail formula or a length-specific graph.
+    """
+
+    try:
+        block_rows = int(
+            os.environ.get(
+                "STOCKAGENT_TW_CONTINUOUS_COMPILE_CHUNK_ROWS",
+                str(TW_INDEX_FUTURES_COMPILED_BLOCK_ROWS),
+            )
+        )
+    except ValueError:
+        block_rows = 0
+    compile_blocks = bool(
+        block_rows > 0
+        and actions.device.type == "cuda"
+        and hasattr(torch, "compile")
+        and os.environ.get("STOCKAGENT_BACKTEST_COMPILE", "1")
+        .strip()
+        .lower()
+        in {"1", "true", "on", "yes"}
+        and not torch.compiler.is_compiling()
+        and int(actions.size(0)) >= block_rows
+    )
+    if not compile_blocks:
+        return _run_tw_index_futures_all_tenors_day_torch_impl(
+            actions,
+            execution_tensor,
+            initial_capital=initial_capital,
+            max_abs_exposure=max_abs_exposure,
+            initial_equity_scale=initial_equity_scale,
+            initial_alive=initial_alive,
+        )
+
+    capital = _finite_nonnegative("initial_capital", initial_capital)
+    limit = _finite_nonnegative("max_abs_exposure", max_abs_exposure)
+    if capital <= 0.0 or limit <= 0.0:
+        raise ValueError("initial_capital and max_abs_exposure must be positive")
+    if actions.ndim != 2 or int(actions.size(1)) != TAIFEX_INDEX_FUTURES_ACTION_COUNT:
+        raise ValueError("actions must have shape [T,18]")
+    if tuple(execution_tensor.shape) != (
+        int(actions.size(0)),
+        TAIFEX_INDEX_FUTURES_ACTION_COUNT,
+        3,
+    ):
+        raise ValueError("execution_tensor must have shape [T,18,3]")
+
+    equity_scale = (
+        actions.new_ones((), dtype=torch.float32)
+        if initial_equity_scale is None
+        else initial_equity_scale.to(device=actions.device, dtype=torch.float32)
+    )
+    alive = (
+        torch.ones((), dtype=torch.bool, device=actions.device)
+        if initial_alive is None
+        else initial_alive.to(device=actions.device, dtype=torch.bool)
+    )
+    try:
+        key, compiled_block = _compiled_all_tenor_block(
+            actions,
+            block_rows=block_rows,
+            initial_capital=capital,
+            max_abs_exposure=limit,
+        )
+    except Exception:
+        if os.environ.get("STOCKAGENT_STRICT_NO_FALLBACK", "0").strip().lower() in {
+            "1",
+            "true",
+            "on",
+            "yes",
+        }:
+            raise
+        _ALL_TENOR_COMPILE_STATS["eager_fallback_calls"] += 1
+        return _run_tw_index_futures_all_tenors_day_torch_impl(
+            actions,
+            execution_tensor,
+            initial_capital=capital,
+            max_abs_exposure=limit,
+            initial_equity_scale=equity_scale,
+            initial_alive=alive,
+        )
+    if key in _FAILED_ALL_TENOR_BLOCKS:
+        if os.environ.get("STOCKAGENT_STRICT_NO_FALLBACK", "0").strip().lower() in {
+            "1",
+            "true",
+            "on",
+            "yes",
+        }:
+            raise RuntimeError("compiled futures block previously failed")
+        _ALL_TENOR_COMPILE_STATS["eager_fallback_calls"] += 1
+        return _run_tw_index_futures_all_tenors_day_torch_impl(
+            actions,
+            execution_tensor,
+            initial_capital=capital,
+            max_abs_exposure=limit,
+            initial_equity_scale=equity_scale,
+            initial_alive=alive,
+        )
+
+    chunks: list[FuturesContinuousBacktest] = []
+    total_rows = int(actions.size(0))
+    full_stop = total_rows - total_rows % block_rows
+    try:
+        for start in range(0, full_stop, block_rows):
+            stop = start + block_rows
+            result = _futures_result_from_tuple(
+                compiled_block(
+                    actions[start:stop],
+                    execution_tensor[start:stop],
+                    equity_scale,
+                    alive,
+                )
+            )
+            chunks.append(result)
+            _ALL_TENOR_COMPILE_STATS["compiled_block_calls"] += 1
+            _ALL_TENOR_COMPILE_STATS["compiled_day_calls"] += block_rows
+            if result.final_equity_scale is None or result.final_alive is None:
+                raise RuntimeError("compiled futures block omitted terminal state")
+            equity_scale = result.final_equity_scale
+            alive = result.final_alive
+        if full_stop < total_rows:
+            tail_rows = total_rows - full_stop
+            pad_rows = block_rows - tail_rows
+            padded_actions = torch.cat(
+                (
+                    actions[full_stop:],
+                    actions.new_zeros((pad_rows, TAIFEX_INDEX_FUTURES_ACTION_COUNT)),
+                ),
+                dim=0,
+            )
+            padded_execution = torch.cat(
+                (
+                    execution_tensor[full_stop:],
+                    execution_tensor.new_full(
+                        (pad_rows, TAIFEX_INDEX_FUTURES_ACTION_COUNT, 3),
+                        float("nan"),
+                    ),
+                ),
+                dim=0,
+            )
+            padded_tail = _futures_result_from_tuple(
+                compiled_block(
+                    padded_actions,
+                    padded_execution,
+                    equity_scale,
+                    alive,
+                )
+            )
+            tail = _slice_futures_result_rows(padded_tail, tail_rows)
+            chunks.append(tail)
+            _ALL_TENOR_COMPILE_STATS["compiled_block_calls"] += 1
+            _ALL_TENOR_COMPILE_STATS["compiled_day_calls"] += tail_rows
+    except Exception:
+        _FAILED_ALL_TENOR_BLOCKS.add(key)
+        if os.environ.get("STOCKAGENT_STRICT_NO_FALLBACK", "0").strip().lower() in {
+            "1",
+            "true",
+            "on",
+            "yes",
+        }:
+            raise
+        _ALL_TENOR_COMPILE_STATS["eager_fallback_calls"] += 1
+        return _run_tw_index_futures_all_tenors_day_torch_impl(
+            actions,
+            execution_tensor,
+            initial_capital=capital,
+            max_abs_exposure=limit,
+            initial_equity_scale=initial_equity_scale,
+            initial_alive=initial_alive,
+        )
+
+    def concatenate(name: str) -> torch.Tensor:
+        return torch.cat([getattr(chunk, name) for chunk in chunks], dim=0)
+
+    final = chunks[-1]
+    return FuturesContinuousBacktest(
+        strategy_returns=concatenate("strategy_returns"),
+        gross_returns=concatenate("gross_returns"),
+        cost_returns=concatenate("cost_returns"),
+        requested_exposure=concatenate("requested_exposure"),
+        executed_exposure=concatenate("executed_exposure"),
+        turnovers=concatenate("turnovers"),
+        tradable_mask=concatenate("tradable_mask"),
+        executed_actions=concatenate("executed_actions"),
+        equity_scale_history=concatenate("equity_scale_history"),
+        final_equity_scale=final.final_equity_scale,
+        final_alive=final.final_alive,
+    )
 
 
 def _finite_nonnegative(name: str, value: object) -> float:
@@ -393,7 +947,7 @@ def run_tw_index_futures_day_integer(
     max_abs_exposure: float = 1.0,
     cost_schedule: FuturesCostSchedule | None = None,
 ) -> FuturesIntegerBacktest:
-    """Execute and flatten an integer TX/MTX/TMF basket every day."""
+    """Execute direct E1..E6 actions or the legacy scalar front basket."""
 
     initial_equity = _finite_nonnegative("initial_capital", initial_capital)
     if initial_equity <= 0.0:
@@ -401,8 +955,141 @@ def run_tw_index_futures_day_integer(
     exposure_limit = _finite_nonnegative("max_abs_exposure", max_abs_exposure)
     if exposure_limit <= 0.0:
         raise ValueError("max_abs_exposure must be positive")
+    raw_exposure = np.asarray(exposure, dtype=np.float64)
+    if raw_exposure.ndim == 2:
+        if raw_exposure.shape != (
+            int(market.dates.size),
+            TAIFEX_INDEX_FUTURES_ACTION_COUNT,
+        ):
+            raise ValueError("direct futures actions must have shape [T,18]")
+        schedule = FuturesCostSchedule() if cost_schedule is None else cost_schedule
+        execution = build_tw_index_futures_day_execution_tensor(
+            market, cost_schedule=schedule
+        ).astype(np.float64, copy=False)
+        months, opens, _highs, _lows, closes, _volumes, _returns, tradable = (
+            market.flattened_tenor_panel()
+        )
+        rows = int(market.dates.size)
+        clean = np.nan_to_num(
+            raw_exposure,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+        requested_gross = np.abs(clean).sum(axis=-1, keepdims=True)
+        clean *= np.minimum(
+            1.0,
+            exposure_limit / np.maximum(requested_gross, 1e-12),
+        )
+        quantities = np.zeros_like(clean, dtype=np.int64)
+        executed = np.zeros(rows, dtype=np.float64)
+        gross_pnl = np.zeros(rows, dtype=np.float64)
+        fixed_fees = np.zeros(rows, dtype=np.float64)
+        taxes = np.zeros(rows, dtype=np.float64)
+        slippage_costs = np.zeros(rows, dtype=np.float64)
+        net_pnl = np.zeros(rows, dtype=np.float64)
+        strategy_returns = np.zeros(rows, dtype=np.float64)
+        turnovers = np.zeros(rows, dtype=np.float64)
+        equity = np.zeros(rows, dtype=np.float64)
+        alive = np.ones(rows, dtype=bool)
+        multipliers = np.repeat(
+            np.asarray(market.multipliers, dtype=np.float64),
+            TAIFEX_INDEX_FUTURES_TENOR_SLOTS,
+        )
+        product_index = np.repeat(
+            np.arange(len(market.products), dtype=np.int64),
+            TAIFEX_INDEX_FUTURES_TENOR_SLOTS,
+        )
+        fixed_per_side = schedule.fixed_fee_per_side_twd[product_index]
+        slip_points = np.asarray(
+            schedule.slippage_points_per_side, dtype=np.float64
+        )[product_index]
+        current_equity = float(initial_equity)
+        still_alive = True
+        valid_all = np.asarray(tradable, dtype=bool) & np.isfinite(execution).all(axis=-1)
+        for row in range(rows):
+            if not still_alive:
+                equity[row] = current_equity
+                alive[row] = False
+                continue
+            requested = np.where(valid_all[row], clean[row], 0.0)
+            notionals = execution[row, :, 2]
+            contract_ratio = np.divide(
+                    np.abs(requested) * current_equity,
+                    notionals,
+                    out=np.zeros_like(requested),
+                    where=valid_all[row] & (notionals > 0.0),
+                )
+            counts_abs = np.floor(contract_ratio + 1e-6).astype(np.int64)
+            signed_counts = counts_abs * np.sign(requested).astype(np.int64)
+            quantities[row] = signed_counts
+            active = signed_counts != 0
+            if not bool(active.any()):
+                equity[row] = current_equity
+                continue
+            active_abs = counts_abs[active].astype(np.float64)
+            active_signed = signed_counts[active].astype(np.float64)
+            active_multipliers = multipliers[active]
+            active_opens = opens[row, active]
+            active_closes = closes[row, active]
+            gross = float(
+                np.dot(
+                    active_signed * active_multipliers,
+                    active_closes - active_opens,
+                )
+            )
+            fees = float(np.dot(active_abs, 2.0 * fixed_per_side[active]))
+            tax = float(
+                np.dot(
+                    active_abs * active_multipliers,
+                    (active_opens + active_closes) * float(schedule.tax_rate),
+                )
+            )
+            slip = float(
+                np.dot(
+                    active_abs,
+                    2.0 * slip_points[active] * active_multipliers,
+                )
+            )
+            net = gross - fees - tax - slip
+            actual_abs_notional = float(
+                np.dot(active_abs, active_opens * active_multipliers)
+            )
+            gross_pnl[row] = gross
+            fixed_fees[row] = fees
+            taxes[row] = tax
+            slippage_costs[row] = slip
+            net_pnl[row] = net
+            strategy_returns[row] = net / current_equity
+            executed[row] = actual_abs_notional / current_equity
+            turnovers[row] = 2.0 * executed[row]
+            next_equity = current_equity + net
+            if not math.isfinite(next_equity) or next_equity <= 0.0:
+                current_equity = 0.0
+                still_alive = False
+            else:
+                current_equity = next_equity
+            equity[row] = current_equity
+            alive[row] = still_alive
+        return FuturesIntegerBacktest(
+            dates=np.asarray(market.dates, dtype="datetime64[D]").copy(),
+            products=market.tenor_action_symbols(),
+            requested_exposure=clean,
+            executed_exposure=executed,
+            contract_quantities=quantities,
+            gross_pnl_twd=gross_pnl,
+            fees_twd=fixed_fees,
+            tax_twd=taxes,
+            slippage_twd=slippage_costs,
+            net_pnl_twd=net_pnl,
+            strategy_returns=strategy_returns,
+            turnovers=turnovers,
+            equity=equity,
+            alive=alive,
+            contract_months=months.copy(),
+        )
     requested = np.nan_to_num(
-        np.asarray(exposure, dtype=np.float64),
+        raw_exposure,
         nan=0.0,
         posinf=exposure_limit,
         neginf=-exposure_limit,
@@ -567,9 +1254,14 @@ __all__ = [
     "FuturesIntegerBacktest",
     "TAIFEX_FIXED_FEES_PER_SIDE_TWD",
     "TW_INDEX_FUTURES_DAY_BACKTEST_CONTRACT_VERSION",
+    "TW_INDEX_FUTURES_TRAINING_GRADIENT_CONTRACT_VERSION",
+    "TW_INDEX_FUTURES_COMPILED_BLOCK_ROWS",
     "TW_INDEX_FUTURES_SELL_TAX_RATE",
     "TW_INDEX_FUTURES_TAX_RATE",
     "TW_INDEX_FUTURES_TRANSACTION_TAX_RATE",
+    "build_tw_index_futures_day_execution_tensor",
+    "get_tw_index_futures_compile_stats",
+    "run_tw_index_futures_all_tenors_day_torch",
     "run_tw_index_futures_day_continuous",
     "run_tw_index_futures_day_integer",
     "select_tw_index_futures_contract_basket",

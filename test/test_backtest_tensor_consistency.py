@@ -1684,6 +1684,76 @@ def test_tw_cash_long_short_decoupled_eval_requires_complete_short_contract(
         )
 
 
+def test_futures_chunked_eval_preserves_recurrent_equity_scale() -> None:
+    rows, stocks = 3, 2
+    weights = torch.zeros((rows, 18), dtype=torch.float32)
+    weights[:, 0] = 0.1
+    execution = torch.full((rows, 18, 3), float("nan"), dtype=torch.float32)
+    execution[:, 0, 0] = torch.tensor([0.01, -0.005, 0.002])
+    execution[:, 0, 1] = -execution[:, 0, 0]
+    execution[:, 0, 2] = 1_000_000.0
+    stock_shape = (rows, stocks)
+    runtime = trainer_module._ExecutionRuntime(
+        mode="tw_index_futures_day",
+        buy_fee_rates=None,
+        sell_fee_rates=None,
+        lot_sizes=None,
+        settlement_lag_sessions=0,
+        futures_initial_capital=100_000_000.0,
+    )
+    result, _ = trainer_module._run_eval_backtest_from_weight_buffers(
+        weights,
+        torch.zeros(stock_shape),
+        torch.ones(stock_shape, dtype=torch.bool),
+        torch.ones(stock_shape, dtype=torch.bool),
+        torch.ones(stock_shape, dtype=torch.bool),
+        torch.ones(stock_shape, dtype=torch.bool),
+        torch.zeros(stock_shape, dtype=torch.bool),
+        torch.zeros(stock_shape, dtype=torch.bool),
+        torch.zeros(rows),
+        device=torch.device("cpu"),
+        non_blocking=False,
+        long_only=False,
+        buy_fee_rate=0.0,
+        sell_fee_rate=0.0,
+        max_turnover_ratio=0.0,
+        gross_leverage=1.0,
+        min_trade_weight=0.0,
+        backtest_chunk_rows=2,
+        compute_metrics_summary=False,
+        return_weights_history=True,
+        profile_timing=False,
+        progress_label=None,
+        timing=TimingBreakdown(),
+        reset_at_rows=None,
+        portfolio_activation="pre_normalized",
+        overnight_log_returns_all=execution,
+        execution_runtime=runtime,
+    )
+    full = run_backtest_torch(
+        weights,
+        torch.zeros(stock_shape),
+        torch.ones(stock_shape, dtype=torch.bool),
+        torch.zeros(rows),
+        0.0,
+        0.0,
+        long_only=False,
+        portfolio_activation="pre_normalized",
+        overnight_returns=execution,
+        execution_mode="tw_index_futures_day",
+        return_weights_history=True,
+        day_trade_execution_initial_capital=100_000_000.0,
+    )
+
+    assert result.equity_scale_history is not None
+    assert result.final_equity_scale is not None
+    torch.testing.assert_close(
+        result.equity_scale_history,
+        full.equity_scale_history,
+    )
+    torch.testing.assert_close(result.final_equity_scale, full.final_equity_scale)
+
+
 def test_force_exit_at_backtest_chunk_boundary_matches_full_and_ragged_tail() -> None:
     rows = 5
     raw_weights = torch.ones((rows, 1), dtype=torch.float32)

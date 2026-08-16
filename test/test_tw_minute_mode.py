@@ -52,6 +52,7 @@ from stockagent.training.minute import (
     _MinuteDayCache,
     _MinuteSlabForwardAdapter,
     _build_windows,
+    _disable_redundant_single_minute_block_checkpointing,
     _execute_minute_chunk,
     _fee_schedule,
     _first_calendar_year_indices,
@@ -988,6 +989,25 @@ def test_daily_guided_head_starts_near_the_guide_only_baseline() -> None:
     )
     actual = torch.sigmoid(model.score_head(torch.randn(5, 3)))
     torch.testing.assert_close(actual, torch.full_like(actual, 0.90))
+
+
+def test_lookback_one_outer_checkpoint_disables_redundant_block_checkpoints() -> None:
+    config_path = (
+        Path(__file__).parents[1]
+        / "configs/markets/tw_minute_daily_guided_dual_5090.yaml"
+    )
+    config = load_config(config_path)
+    model = SimpleNamespace(checkpoint_blocks=True)
+
+    assert _disable_redundant_single_minute_block_checkpointing(model, config)
+    assert model.checkpoint_blocks is True
+    assert model.minute_checkpoint_blocks is False
+
+    model.minute_checkpoint_blocks = True
+    config.training.lookback = 32
+    assert not _disable_redundant_single_minute_block_checkpointing(model, config)
+    assert model.checkpoint_blocks is True
+    assert model.minute_checkpoint_blocks is True
 
 
 def test_daily_guided_slab_adapter_uses_guide_as_context_and_target_ceiling() -> None:
@@ -1985,7 +2005,7 @@ def test_daily_guided_minute_config_reuses_runner_with_a_bounded_gate() -> None:
     assert config.trading.tw_minute_max_name_weight is None
     assert config.trading.tw_minute_outside_cash_logit is None
     assert config.runner.output_dir == (
-        "artifacts/markets/tw_minute_daily_guided_dual_5090_v1"
+        "artifacts/markets/tw_minute_daily_guided_dual_5090_v2"
     )
 
 

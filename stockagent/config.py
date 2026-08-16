@@ -16,6 +16,9 @@ from stockagent.backtest.tw_execution import (
     TaiwanMarginShortSchedule,
     normalize_execution_mode,
 )
+from stockagent.backtest.tw_commission_rebate import (
+    normalize_commission_rebate_timing,
+)
 from stockagent.backtest.tw_index_futures import FuturesCostSchedule
 from stockagent.backtest.tw_index_derivatives_day import OptionDayCostSchedule
 from stockagent.data.tw_index_futures import (
@@ -828,6 +831,13 @@ class DataConfig:
     # This path is consumed only by execution_mode=tw_minute and never by the
     # daily panel builder.
     minute_parquet_root: str = "data_tw_minute/research_dataset"
+    # Optional executor-only minute tape for the *daily* tw_day_trade model.
+    # When set, the daily loss uses the 09:01/13:20/13:24/13:30 execution
+    # schedule instead of the legacy open-to-close return proxy.
+    day_trade_minute_execution_root: str | None = None
+    day_trade_minute_execution_cache_dir: str = (
+        "artifacts/cache/tw_day_trade_minute_execution_v1"
+    )
     minute_require_research_ready: bool = True
     minute_verify_partition_sha256: bool = True
     # Optional immutable daily-panel cache metadata used as causal context by
@@ -911,6 +921,15 @@ class TradingConfig:
     tw_etf_sell_tax: float = 0.001
     tw_day_trade_stock_sell_tax: float = 0.0015
     tw_day_trade_etf_sell_tax: float = 0.001
+    # Optional daily open-to-close research contract.  Closing-leg failures
+    # are accounting-closed through unlimited margin conversion.  Stock
+    # positions remain flat, while only the resulting net cash difference
+    # enters the T+2-close claim ledger; no settlement default is modeled.
+    tw_day_trade_unlimited_margin_conversion: bool = False
+    tw_day_trade_margin_financing_ratio: float = 0.60
+    tw_day_trade_margin_financing_annual_rate: float = 0.16
+    tw_day_trade_margin_short_handling_fee_rate: float = 0.001
+    tw_day_trade_margin_short_annual_borrow_rate: float = 0.20
     # Optional broker/account profile for exact integer evaluation.  Defaults
     # intentionally preserve pure proportional fees; e.g. a 20 TWD minimum is
     # common but not universal across brokers and order channels.
@@ -958,11 +977,20 @@ class TradingConfig:
     # explicit counterfactual account contract that leaves eligible shorts
     # uncapped while preserving every other short-sale rule.
     tw_short_capacity_limit_enabled: bool = True
-    # Daily TX/MTX/TMF execution. The three products are integer-sizing
-    # instruments for one signed TAIEX exposure, not independent alpha heads.
+    # Daily TX/MTX/TMF E1..E6 execution. The current joint model emits 18
+    # direct bounded actions; legacy checkpoints may still use one scalar
+    # TAIEX exposure and the front-month basket compatibility executor.
     tw_index_futures_data_path: str = (
         "data_tw_index_futures/day_session_contracts.parquet"
     )
+    tw_index_futures_all_products_context_path: str = (
+        "data_tw_index_futures/all_products_day_session_front.parquet"
+    )
+    # Optional causal after-hours context.  TAIFEX labels the after-hours row
+    # by its volume-attribution date; it ends at 05:00 and is visible at that
+    # labelled date's 08:45 day-session open. ``None`` preserves the historical
+    # day-session-only input contract.
+    tw_index_futures_all_products_afterhours_context_path: str | None = None
     tw_index_futures_reference_product: str = "TX"
     tw_index_futures_initial_capital: float = 100_000_000.0
     tw_index_futures_max_abs_exposure: float = 1.0
@@ -1204,6 +1232,24 @@ class TransformerBasePortfolioModelConfig:
     default_temperature: float = 1.0
     portfolio_mode: str = "auto"
     portfolio_output_mode: str = "activation_l1"
+    # The dedicated index-futures model may either emit 18 independent signed
+    # targets (legacy) or one learnable signed exposure distributed across the
+    # valid executable slots.  The latter has a genuine cash/no-trade state and
+    # cannot waste gross exposure on offsetting contracts of the same index.
+    futures_action_mode: str = "independent"
+    # ``tanh`` preserves the historical directional head.  ``softsign`` is a
+    # slower-saturating alternative for exact-integer objectives, where tanh
+    # can round to exactly +/-1 and erase the exposure-head gradient.
+    futures_exposure_activation: str = "tanh"
+    # Zero preserves the historical unbounded allocation logits.  A positive
+    # scale bounds centered logits with softsign before softmax; temperature
+    # controls the input scale and both values are part of the model contract.
+    futures_allocation_logit_scale: float = 0.0
+    futures_allocation_temperature: float = 1.0
+    # A joint stock+futures experiment should fail closed when its required
+    # futures token context is absent instead of retaining a dead, context-free
+    # pooling head in the optimizer.
+    futures_require_joint_context: bool = False
     center_long_short_logits: bool = True
     max_full_tokens: int = 4096
     checkpoint_blocks: bool = False
@@ -2085,6 +2131,58 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
             transformer_base_portfolio.get("portfolio_output_mode")
         )
     )
+    futures_action_mode = (
+        str(transformer_base_portfolio["futures_action_mode"])
+        .strip()
+        .lower()
+        .replace("-", "_")
+    )
+    if futures_action_mode not in {"independent", "directional_allocation"}:
+        raise ValueError(
+            "training.transformer_base_portfolio.futures_action_mode must be "
+            "one of: independent, directional_allocation"
+        )
+    transformer_base_portfolio["futures_action_mode"] = futures_action_mode
+    futures_exposure_activation = (
+        str(transformer_base_portfolio["futures_exposure_activation"])
+        .strip()
+        .lower()
+        .replace("-", "_")
+    )
+    if futures_exposure_activation not in {"tanh", "softsign"}:
+        raise ValueError(
+            "training.transformer_base_portfolio."
+            "futures_exposure_activation must be one of: tanh, softsign"
+        )
+    transformer_base_portfolio["futures_exposure_activation"] = (
+        futures_exposure_activation
+    )
+    futures_allocation_logit_scale = float(
+        transformer_base_portfolio["futures_allocation_logit_scale"]
+    )
+    if not math.isfinite(futures_allocation_logit_scale) or (
+        futures_allocation_logit_scale < 0.0
+    ):
+        raise ValueError(
+            "training.transformer_base_portfolio."
+            "futures_allocation_logit_scale must be finite and non-negative"
+        )
+    transformer_base_portfolio["futures_allocation_logit_scale"] = (
+        futures_allocation_logit_scale
+    )
+    futures_allocation_temperature = float(
+        transformer_base_portfolio["futures_allocation_temperature"]
+    )
+    if not math.isfinite(futures_allocation_temperature) or (
+        futures_allocation_temperature <= 0.0
+    ):
+        raise ValueError(
+            "training.transformer_base_portfolio."
+            "futures_allocation_temperature must be finite and positive"
+        )
+    transformer_base_portfolio["futures_allocation_temperature"] = (
+        futures_allocation_temperature
+    )
     transformer_base_portfolio["categorical_feature_names"] = _normalize_string_list(
         transformer_base_portfolio.get("categorical_feature_names"),
         field_name="training.transformer_base_portfolio.categorical_feature_names",
@@ -2697,6 +2795,61 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         if raw_minute_guidance_path is None or not str(raw_minute_guidance_path).strip()
         else str(raw_minute_guidance_path).strip()
     )
+    raw_day_trade_execution_root = data.get("day_trade_minute_execution_root")
+    data["day_trade_minute_execution_root"] = (
+        None
+        if raw_day_trade_execution_root is None
+        or not str(raw_day_trade_execution_root).strip()
+        else str(raw_day_trade_execution_root).strip()
+    )
+    if data["day_trade_minute_execution_root"] is not None:
+        if trading["execution_mode"] != "tw_day_trade":
+            raise ValueError(
+                "data.day_trade_minute_execution_root is valid only for "
+                "trading.execution_mode='tw_day_trade'"
+            )
+        if _normalized_contract_name(trading["frequency"]) != "daily":
+            raise ValueError(
+                "daily-model minute execution requires trading.frequency='daily'"
+            )
+        if abs(float(trading["max_volume_participation"]) - 0.5) > 1.0e-12:
+            raise ValueError(
+                "daily-model minute execution contract requires "
+                "trading.max_volume_participation=0.5"
+            )
+    if bool(trading["tw_day_trade_unlimited_margin_conversion"]):
+        if trading["execution_mode"] != "tw_day_trade":
+            raise ValueError(
+                "tw_day_trade_unlimited_margin_conversion is valid only for "
+                "trading.execution_mode='tw_day_trade'"
+            )
+        if data["day_trade_minute_execution_root"] is not None:
+            raise ValueError(
+                "daily unlimited-margin conversion and minute execution are "
+                "mutually exclusive contracts"
+            )
+        if _normalized_contract_name(trading["frequency"]) != "daily":
+            raise ValueError(
+                "daily unlimited-margin conversion requires frequency='daily'"
+            )
+        if normalize_commission_rebate_timing(
+            trading["tw_commission_rebate_timing"]
+        ) != "daily_close":
+            raise ValueError(
+                "daily unlimited-margin conversion requires "
+                "tw_commission_rebate_timing='daily_close' so no rebate state "
+                "is carried across sessions"
+            )
+        for name in (
+            "tw_day_trade_margin_financing_ratio",
+            "tw_day_trade_margin_financing_annual_rate",
+            "tw_day_trade_margin_short_handling_fee_rate",
+            "tw_day_trade_margin_short_annual_borrow_rate",
+        ):
+            value = float(trading[name])
+            if not math.isfinite(value) or value < 0.0:
+                raise ValueError(f"{name} must be finite and non-negative")
+            trading[name] = value
     if (
         trading["execution_mode"] == "tw_minute"
         and data["minute_daily_context_panel_meta"] is not None
@@ -2771,6 +2924,26 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     if not futures_data_path:
         raise ValueError("trading.tw_index_futures_data_path must not be empty")
     trading["tw_index_futures_data_path"] = futures_data_path
+    all_futures_context_path = str(
+        trading["tw_index_futures_all_products_context_path"]
+    ).strip()
+    if not all_futures_context_path:
+        raise ValueError(
+            "trading.tw_index_futures_all_products_context_path must not be empty"
+        )
+    trading["tw_index_futures_all_products_context_path"] = (
+        all_futures_context_path
+    )
+    raw_afterhours_context_path = trading[
+        "tw_index_futures_all_products_afterhours_context_path"
+    ]
+    if raw_afterhours_context_path is None:
+        trading["tw_index_futures_all_products_afterhours_context_path"] = None
+    else:
+        afterhours_context_path = str(raw_afterhours_context_path).strip()
+        trading["tw_index_futures_all_products_afterhours_context_path"] = (
+            afterhours_context_path or None
+        )
     trading["tw_index_futures_reference_product"] = (
         normalize_taifex_index_futures_product(
             trading["tw_index_futures_reference_product"]

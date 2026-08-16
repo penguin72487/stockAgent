@@ -53,7 +53,7 @@ MINUTE_FEATURE_COLUMNS = (
 MINUTE_DAILY_OPEN_GAP_FEATURE = "next_session_open_gap_logret"
 MINUTE_DAILY_CONTEXT_CONTRACT = "causal_completed_daily_history_plus_observed_open_v3"
 MINUTE_DAILY_GUIDANCE_FEATURE = "daily_model_target_weight"
-MINUTE_DAILY_GUIDANCE_CONTRACT = "walk_forward_oof_tw_day_trade_requested_weights_v1"
+MINUTE_DAILY_GUIDANCE_CONTRACT = "walk_forward_oof_tw_day_trade_requested_weights_v2"
 _TW_MAX_ABS_DAILY_PRICE_LOG_RETURN = float(np.log(2.0))
 
 
@@ -947,7 +947,7 @@ def _load_minute_daily_guidance(
             f"tw_minute daily-guidance manifest is missing: {manifest_path}"
         )
     manifest = _read_json(manifest_path)
-    if int(manifest.get("schema_version", 0)) != 1:
+    if int(manifest.get("schema_version", 0)) != 2:
         raise RuntimeError("tw_minute daily-guidance schema is incompatible")
     if manifest.get("contract") != MINUTE_DAILY_GUIDANCE_CONTRACT:
         raise RuntimeError("tw_minute daily-guidance contract is incompatible")
@@ -968,49 +968,88 @@ def _load_minute_daily_guidance(
     target_years = sorted(
         set(np.asarray(minute_dates, dtype="datetime64[Y]").astype(int) + 1970)
     )
-    owner_rows = manifest.get("year_owners")
+    owner_rows = manifest.get("owner_segments")
     if not isinstance(owner_rows, list):
-        raise RuntimeError("tw_minute daily-guidance manifest lacks year owners")
-    owners: dict[int, dict[str, Any]] = {}
+        raise RuntimeError("tw_minute daily-guidance manifest lacks owner segments")
+    requested_dates = np.asarray(minute_dates, dtype="datetime64[D]")
+    coverage = np.zeros(requested_dates.size, dtype=np.int16)
     for row in owner_rows:
         if not isinstance(row, dict):
-            raise RuntimeError("tw_minute daily-guidance year owner is malformed")
+            raise RuntimeError("tw_minute daily-guidance owner segment is malformed")
         year = int(row.get("target_year", 0))
-        if year in owners:
-            raise RuntimeError(
-                f"tw_minute daily-guidance target year has multiple owners: {year}"
-            )
         train_years = [int(value) for value in row.get("train_years", [])]
         val_years = [int(value) for value in row.get("val_years", [])]
         test_years = [int(value) for value in row.get("test_years", [])]
+        try:
+            start = np.datetime64(str(row["date_start"]), "D")
+            end = np.datetime64(str(row["date_end"]), "D")
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "tw_minute daily-guidance owner segment has invalid dates"
+            ) from exc
+        segment_mask = (
+            (requested_dates >= start)
+            & (requested_dates <= end)
+            & (
+                requested_dates.astype("datetime64[Y]").astype(int) + 1970
+                == year
+            )
+        )
         if (
             not train_years
             or not val_years
             or not test_years
             or year not in test_years
             or max((*train_years, *val_years)) >= year
+            or end < start
+            or int(row.get("target_rows", 0)) != int(segment_mask.sum())
             or not str(row.get("checkpoint_sha256", ""))
             or not str(row.get("backtest_sha256", ""))
         ):
             raise RuntimeError(
-                "tw_minute daily-guidance owner is not strict walk-forward OOF: "
+                "tw_minute daily-guidance owner segment is not strict "
+                "walk-forward OOF: "
                 f"target_year={year}"
             )
-        if (
-            int(row.get("zero_filled_missing_symbol_count", 0)) > 0
-            or int(row.get("zero_filled_missing_date_count", 0)) > 0
-        ) and not bool(manifest.get("allow_zero_fill_missing", False)):
+        if int(row.get("zero_filled_missing_symbol_count", 0)) > 0 and not bool(
+            manifest.get("allow_zero_fill_missing", False)
+        ):
             raise RuntimeError(
                 "tw_minute daily-guidance manifest has undeclared zero-filled gaps: "
                 f"target_year={year}"
             )
-        owners[year] = row
-    missing_years = [year for year in target_years if year not in owners]
-    if missing_years:
+        coverage[segment_mask] += 1
+    if bool(np.any(coverage > 1)):
+        duplicated = [str(value) for value in requested_dates[coverage > 1][:20]]
         raise RuntimeError(
-            "tw_minute daily guidance lacks strict OOF owners for years: "
-            f"{missing_years}"
+            "tw_minute daily guidance has overlapping owner segments: "
+            f"{duplicated}"
         )
+    missing_coverage = coverage == 0
+    declared_missing = int(manifest.get("zero_filled_missing_date_count", 0))
+    if bool(missing_coverage.any()) and not bool(
+        manifest.get("allow_zero_fill_missing", False)
+    ):
+        missing = [str(value) for value in requested_dates[missing_coverage][:20]]
+        raise RuntimeError(
+            "tw_minute daily guidance lacks strict OOF owners for dates: "
+            f"{missing}"
+        )
+    if declared_missing != int(missing_coverage.sum()):
+        raise RuntimeError(
+            "tw_minute daily-guidance declared missing-date count disagrees "
+            "with owner coverage"
+        )
+    covered_years = set(
+        requested_dates[coverage > 0].astype("datetime64[Y]").astype(int) + 1970
+    )
+    if not bool(manifest.get("allow_zero_fill_missing", False)):
+        missing_years = [year for year in target_years if year not in covered_years]
+        if missing_years:
+            raise RuntimeError(
+                "tw_minute daily guidance lacks strict OOF owners for years: "
+                f"{missing_years}"
+            )
 
     schema = pl.read_parquet_schema(resolved)
     required_columns = ("date", *minute_symbols)
@@ -1028,7 +1067,6 @@ def _load_minute_daily_guidance(
         raise RuntimeError(
             "tw_minute daily-guidance dates must be non-empty, unique, and sorted"
         )
-    requested_dates = np.asarray(minute_dates, dtype="datetime64[D]")
     positions = np.searchsorted(guide_dates, requested_dates)
     exact = positions < guide_dates.size
     exact &= guide_dates[np.clip(positions, 0, guide_dates.size - 1)] == requested_dates
