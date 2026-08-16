@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#071019">
+  <title>OpenBB 歷史封存監控｜StockAgent</title>
+  <link rel="stylesheet" href="styles.css?v=2">
+  <link rel="stylesheet" href="../dashboard-core.css?v=5">
+</head>
+<body>
+  <a class="skip-link" href="#main">跳到主要內容</a>
+  <header class="site-header">
+    <a class="brand" href="../">STOCKAGENT</a>
+    <nav aria-label="公開面板導覽">
+      <a href="../">總覽</a>
+      <a href="../taifex/">TAIFEX</a>
+      <a href="../tw-day-trade/">台股當沖</a>
+      <a href="../shioaji/">永豐 API</a>
+      <a href="./" aria-current="page">OpenBB</a>
+      <a href="../data-monitor/">全資料</a>
+      <a href="../traffic/">流量</a>
+    </nav>
+  </header>
+
+  <main id="main">
+    <section class="hero" aria-labelledby="page-title">
+      <div>
+        <p class="eyebrow">OPENBB · RESUMABLE ARCHIVE OBSERVATORY</p>
+        <h1 id="page-title">OpenBB<br>歷史資料封存</h1>
+        <p class="lead">從 2000-01-01 到固定右界的可續傳封存。程序存活、工作進度與完整性稽核分開判定；本頁只讀，不會啟動、停止或改寫下載。</p>
+      </div>
+      <div class="health-panel">
+        <span>執行狀態</span>
+        <strong id="connection-status" class="status loading" aria-live="polite"><i aria-hidden="true"></i>讀取中</strong>
+        <p id="source-freshness">正在取得程序與稽核證據…</p>
+        <small>systemd 開機續跑 · 公開 API 已移除路徑、PID 與原始錯誤</small>
+      </div>
+    </section>
+
+    <nav class="jump-nav" aria-label="頁內導覽">
+      <a href="#overview">進度</a>
+      <a href="#trend">歷史曲線</a>
+      <a href="#categories">分類</a>
+      <a href="#providers">供應商</a>
+      <a href="#alerts">稽核警示</a>
+      <a href="#method">口徑說明</a>
+    </nav>
+
+    <section id="runtime-alert" class="runtime-alert" hidden aria-live="polite">
+      <strong id="runtime-alert-title">—</strong>
+      <p id="runtime-alert-copy">—</p>
+    </section>
+
+    <section id="overview" class="section-block" aria-labelledby="overview-title">
+      <header class="section-heading">
+        <span>01</span>
+        <div><h2 id="overview-title">封存進度</h2><p id="archive-boundary">固定資料邊界載入中…</p></div>
+      </header>
+      <div class="progress-hero">
+        <div>
+          <span>已接受任務／總任務</span>
+          <strong id="completion-percent">—</strong>
+          <p id="accepted-fraction">—</p>
+        </div>
+        <progress id="progress-fill" class="progress-track" aria-label="OpenBB 已接受任務比例" max="100" value="0">0%</progress>
+      </div>
+      <div class="kpi-grid">
+        <article class="kpi"><span>成功資料列</span><strong id="success-rows">—</strong><p>實際寫入 Parquet 的列數</p></article>
+        <article class="kpi"><span>可處理待辦</span><strong id="unresolved-tasks">—</strong><p>尚未接受且非永久不可用</p></article>
+        <article class="kpi"><span>可重試</span><strong id="retryable-tasks">—</strong><p id="retryable-detail">尚未終止的錯誤任務</p></article>
+        <article class="kpi"><span>不可用</span><strong id="unavailable-tasks">—</strong><p>與已接受資料分開呈現</p></article>
+        <article class="kpi"><span>最近 15 分鐘</span><strong id="recent-throughput">—</strong><p id="recent-detail">—</p></article>
+        <article class="kpi"><span>可用磁碟</span><strong id="disk-free">—</strong><p id="disk-floor">安全門檻 —</p></article>
+      </div>
+    </section>
+
+    <section id="trend" class="section-block" aria-labelledby="trend-title">
+      <header class="section-heading split-heading">
+        <span>02</span>
+        <div><h2 id="trend-title">歷史進度曲線</h2><p>點擊彩色圓點可隱藏或顯示曲線；時間範圍不會觸發 OpenBB 上游請求。</p></div>
+        <div class="range-picker" role="group" aria-label="歷史時間範圍">
+          <button type="button" data-range="1h">1 小時</button>
+          <button type="button" data-range="1d" class="active" aria-pressed="true">天</button>
+          <button type="button" data-range="1w">週</button>
+          <button type="button" data-range="1mo">月</button>
+          <button type="button" data-range="1q">季</button>
+          <button type="button" data-range="1y">年</button>
+          <button type="button" data-range="all">全部</button>
+        </div>
+      </header>
+      <div class="chart-card">
+        <div id="chart-legend" class="legend" aria-label="曲線顯示控制"></div>
+        <div class="chart-scroll" tabindex="0" aria-label="OpenBB 歷史曲線，可在窄螢幕水平捲動">
+          <svg id="progress-chart" viewBox="0 0 1000 320" role="img" aria-labelledby="chart-title chart-description">
+            <title id="chart-title">OpenBB 封存歷史進度</title>
+            <desc id="chart-description">顯示已接受、已判定與尚未接受任務占總任務的百分比。</desc>
+            <g id="chart-grid"></g>
+            <g id="chart-lines"></g>
+          </svg>
+        </div>
+        <p id="chart-empty" class="empty" hidden>這個時間範圍尚無完整稽核快照。</p>
+        <div class="chart-axis"><span id="chart-start">—</span><span id="chart-end">—</span></div>
+      </div>
+    </section>
+
+    <section id="categories" class="section-block" aria-labelledby="categories-title">
+      <header class="section-heading"><span>03</span><div><h2 id="categories-title">資料分類</h2><p>依尚未取得資料量排序；待下載與供應商權限／能力不可用分開呈現。</p></div></header>
+      <div id="category-grid" class="category-grid" aria-live="polite"></div>
+    </section>
+
+    <section id="providers" class="section-block" aria-labelledby="providers-title">
+      <header class="section-heading"><span>04</span><div><h2 id="providers-title">供應商與配額</h2><p>速率與並行度只描述排程能力；日配額造成的時間下限不能靠加執行緒消除。</p></div></header>
+      <div class="table-wrap" tabindex="0" role="region" aria-label="OpenBB 供應商與配額明細，可用方向鍵水平捲動">
+        <table>
+          <thead><tr><th>供應商</th><th>已接受</th><th>資料列</th><th>待辦／獨占</th><th>近況</th><th>RPS／並行</th><th>狀態</th></tr></thead>
+          <tbody id="provider-body"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="alerts" class="section-block" aria-labelledby="alerts-title">
+      <header class="section-heading"><span>05</span><div><h2 id="alerts-title">完整性稽核警示</h2><p>只顯示代碼與安全摘要；上游回應、查詢內容、路徑和憑證不會送到瀏覽器。</p></div></header>
+      <div id="alert-list" class="alert-list" aria-live="polite"></div>
+    </section>
+
+    <section id="method" class="section-block method" aria-labelledby="method-title">
+      <header class="section-heading"><span>06</span><div><h2 id="method-title">如何讀這個面板</h2><p>用可驗證的因果鏈解釋狀態，不用單一綠燈代替完整性。</p></div></header>
+      <div class="method-grid">
+        <article><strong>程序存活 ≠ 封存完成</strong><p>Supervisor 和 downloader 的 PID 與活動時間只證明工作仍在跑；完成必須通過完整 manifest、檔案與後續任務稽核。</p></article>
+        <article><strong>已接受任務</strong><p>成功資料或經契約判定的權威空結果才算 accepted。這是主進度，不把無法取得的資料灌進完成率。</p></article>
+        <article><strong>不可用任務</strong><p>Unavailable 代表供應商、權限或資料邊界不能取得，與 accepted 分欄。Resolved 可包含 unavailable，不能冒充資料完整率。</p></article>
+        <article><strong>快照新鮮度</strong><p>完整稽核成本高，所以與每分鐘活動證據分開。快照逾時會明示 stale，即使下載程序仍然存活。</p></article>
+        <article><strong>固定日期右界</strong><p>第一次執行後日期邊界即被釘住，重新啟動只續傳同一份封存，不會每天偷偷擴張研究樣本。</p></article>
+        <article><strong>開機自動續跑</strong><p><code>stockagent-openbb-archive.service</code> 擁有長期程序；異常退出會重啟，正常完成則停止，不建立重複 downloader。</p></article>
+      </div>
+    </section>
+  </main>
+
+  <footer>OpenBB 歷史封存觀測 · 公開唯讀 · 頁面每 60 秒更新</footer>
+  <script src="../time-axis.js?v=3" defer></script>
+  <script src="app.js?v=7" defer></script>
+</body>
+</html>

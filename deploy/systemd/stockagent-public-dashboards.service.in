@@ -12,6 +12,7 @@ Group=root
 WorkingDirectory=__REPO_ROOT__
 Environment="HOME=/root"
 Environment="PYTHONUNBUFFERED=1"
+Environment="MALLOC_ARENA_MAX=2"
 ExecStart=/usr/bin/bash "__REPO_ROOT__/scripts/run_public_dashboards.sh"
 Restart=on-failure
 RestartSec=5s
@@ -25,6 +26,7 @@ PrivateTmp=true
 PrivateDevices=true
 ProtectSystem=strict
 ProtectHome=read-only
+InaccessiblePaths=-/root/.ssh -/root/.codex -__REPO_ROOT__/.env -__REPO_ROOT__/.env.trade -__REPO_ROOT__/.env.futures
 ProtectProc=invisible
 ProcSubset=pid
 ProtectKernelTunables=true

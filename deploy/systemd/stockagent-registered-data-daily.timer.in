@@ -1,0 +1,10 @@
+[Unit]
+Description=Refresh yfinance and registered daily data after US close
+
+[Timer]
+OnCalendar=*-*-* 06:30:00 Asia/Taipei
+Persistent=true
+Unit=stockagent-registered-data-daily.service
+
+[Install]
+WantedBy=timers.target

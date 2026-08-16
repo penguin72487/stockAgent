@@ -6,8 +6,8 @@
   <meta name="color-scheme" content="dark">
   <meta name="theme-color" content="#071019">
   <title>永豐 Shioaji API 資料監控｜StockAgent</title>
-  <link rel="stylesheet" href="styles.css?v=3">
-  <link rel="stylesheet" href="../dashboard-core.css?v=2">
+  <link rel="stylesheet" href="styles.css?v=6">
+  <link rel="stylesheet" href="../dashboard-core.css?v=5">
 </head>
 <body>
   <a class="skip-link" href="#main">跳到主要內容</a>
@@ -18,6 +18,9 @@
       <a href="../taifex/">TAIFEX</a>
       <a href="../tw-day-trade/">台股當沖</a>
       <a href="./" aria-current="page">永豐 API</a>
+      <a href="../openbb/">OpenBB</a>
+      <a href="../data-monitor/">全資料</a>
+      <a href="../traffic/">流量</a>
     </nav>
   </header>
 
@@ -38,7 +41,8 @@
 
     <nav class="jump-nav" aria-label="頁內導覽">
       <a href="#pipelines">全部管線</a>
-      <a href="#traffic">流量額度</a>
+      <a href="#traffic">流量與費用</a>
+      <a href="#storage">儲存容量</a>
       <a href="#backfill">期貨明細</a>
       <a href="#capture">即時摘要</a>
       <a href="#method">口徑說明</a>
@@ -83,8 +87,8 @@
       <header class="section-heading">
         <span>02</span>
         <div>
-          <h2 id="traffic-title">今日歷史行情流量</h2>
-          <p>帳面剩餘與安全可用額度分開顯示；即時訂閱不計入這個配額。</p>
+          <h2 id="traffic-title">流量、費用與資料歸因</h2>
+          <p>帳面剩餘與安全可用額度分開顯示；每一類資料也標示是否免費、是否扣額度，以及今天可歸因的實際用量。</p>
         </div>
       </header>
       <div class="kpi-grid traffic-kpis">
@@ -112,15 +116,36 @@
 
       <figure class="chart-card">
         <figcaption>
-          <div><strong>近 24 小時用量軌跡</strong><span>每分鐘保留最後一次 api.usage() 觀測</span></div>
-          <div class="legend" aria-hidden="true"><span class="usage-key">已用量</span><span class="guard-key">安全上限</span></div>
+          <div><strong>歷史用量軌跡</strong><span>每分鐘保留最後一次 api.usage() 觀測</span></div>
+          <div id="traffic-legend" class="legend" role="group" aria-label="流量曲線顯示開關"><button type="button" class="legend-toggle usage-key" data-series="usage" aria-pressed="true">已用量</button><button type="button" class="legend-toggle guard-key" data-series="guard" aria-pressed="true">安全上限</button></div>
         </figcaption>
+        <div id="traffic-time-range" class="time-range-control" role="group" aria-label="流量曲線時間範圍"><span>時間範圍</span><button type="button" data-range="1h">1 小時</button><button type="button" data-range="1d">1 天</button><button type="button" data-range="1w">1 週</button><button type="button" data-range="1mo">1 月</button><button type="button" data-range="1q">1 季</button><button type="button" data-range="1y">1 年</button><button type="button" data-range="all">全部</button></div>
         <svg id="traffic-chart" viewBox="0 0 960 300" role="img" aria-labelledby="traffic-chart-title traffic-chart-desc">
           <title id="traffic-chart-title">Shioaji 歷史行情流量時間序列</title>
           <desc id="traffic-chart-desc">顯示已用流量占每日額度比例，並標示百分之九十安全上限。</desc>
         </svg>
         <p id="chart-empty" class="empty" hidden>累積兩筆觀測後會畫出趨勢；目前仍會顯示最新用量。</p>
+        <p id="traffic-range-note" class="time-range-note" aria-live="polite"></p>
       </figure>
+
+      <header class="subsection-heading">
+        <div><strong>費用與流量口徑</strong><span>帳面總量與功能歸因分開呈現</span></div>
+      </header>
+      <div class="kpi-grid traffic-kpis">
+        <article class="kpi featured"><span>費用證據</span><strong id="traffic-price">—</strong><p>免費註冊不代表所有帳務費用皆為零；以最新契約為準</p></article>
+        <article class="kpi"><span>目前每日額度</span><strong id="traffic-tier">—</strong><p>直接採用 api.usage() 回傳的帳戶上限</p></article>
+        <article class="kpi"><span>今天可歸因</span><strong id="traffic-attributed">—</strong><p>各功能 api.usage() 前後差</p></article>
+        <article class="kpi"><span>今天尚未歸因</span><strong id="traffic-unattributed">—</strong><p>不以 0 假裝已量測</p></article>
+      </div>
+      <details class="audit-details" open>
+        <summary>逐項查看所有資料的費用與流量</summary>
+        <div class="table-wrap" tabindex="0" role="region" aria-label="所有永豐資料費用與流量明細，可左右捲動">
+          <table class="wide-table">
+            <thead><tr><th>資料</th><th>API</th><th>費用</th><th>額度分類</th><th>今日可歸因</th><th>查詢／避免</th><th>即時事件</th><th>量測狀態</th></tr></thead>
+            <tbody id="traffic-breakdown-body"><tr><td colspan="8">讀取中</td></tr></tbody>
+          </table>
+        </div>
+      </details>
 
       <details class="audit-details">
         <summary>查看最近用量觀測</summary>
@@ -131,11 +156,78 @@
           </table>
         </div>
       </details>
+
+      <header class="subsection-heading">
+        <div><strong>流量帳本</strong><span id="ledger-observed">尚無紀錄</span></div>
+      </header>
+      <div class="kpi-grid traffic-kpis">
+        <article class="kpi"><span>今日遠端查詢</span><strong id="ledger-queries">—</strong><p>snapshots / ticks / kbars</p></article>
+        <article class="kpi featured"><span>已避免查詢</span><strong id="ledger-avoided">—</strong><p>本機快取或即時串流命中</p></article>
+        <article class="kpi"><span>可歸因流量</span><strong id="ledger-bytes">—</strong><p>依 api.usage() 前後差觀測</p></article>
+        <article class="kpi"><span>查詢失敗</span><strong id="ledger-failures">—</strong><p>帳本不會吞掉原始例外</p></article>
+        <article class="kpi featured"><span>即時 Tick</span><strong id="ledger-stream-ticks">—</strong><p>subscribe 推送，永豐額度 0 B</p></article>
+        <article class="kpi"><span>即時 BidAsk</span><strong id="ledger-stream-books">—</strong><p>subscribe 推送，永豐額度 0 B</p></article>
+        <article class="kpi"><span>即時落盤</span><strong id="ledger-stream-storage">—</strong><p>包含本機衍生的一秒五檔</p></article>
+        <article class="kpi"><span>即時丟失</span><strong id="ledger-stream-dropped">—</strong><p>應維持為 0</p></article>
+      </div>
+      <details class="audit-details">
+        <summary>依功能查看今日流量</summary>
+        <div class="table-wrap" tabindex="0" role="region" aria-label="今日永豐流量帳本，可左右捲動">
+          <table>
+            <thead><tr><th>功能</th><th>查詢</th><th>避免</th><th>即時 Tick</th><th>即時 BidAsk</th><th>落盤</th><th>額度流量</th><th>失敗／丟失</th></tr></thead>
+            <tbody id="ledger-body"><tr><td colspan="8">讀取中</td></tr></tbody>
+          </table>
+        </div>
+      </details>
+    </section>
+
+    <section id="storage" class="section-block" aria-labelledby="storage-title">
+      <header class="section-heading">
+        <span>03</span>
+        <div>
+          <h2 id="storage-title">儲存容量與每日成長</h2>
+          <p>統計九個互不重疊的實體資料群組；累積滿 7 個完整日就以每日總容量快照計算淨成長，之前明確顯示 mtime 寫入活動量。</p>
+        </div>
+      </header>
+      <div class="kpi-grid capacity-kpis">
+        <article class="kpi featured"><span>資料總量</span><strong id="storage-total">—</strong><p id="storage-files">—</p></article>
+        <article class="kpi"><span>永豐來源／目錄</span><strong id="storage-source">—</strong><p>原始 Tick、K 棒、五檔與合約目錄</p></article>
+        <article class="kpi"><span>本機衍生資料</span><strong id="storage-derived">—</strong><p>研究面板與 HFT 特徵</p></article>
+        <article class="kpi featured"><span id="storage-growth-label">日均成長證據</span><strong id="storage-growth">—</strong><p id="storage-growth-window">—</p></article>
+        <article class="kpi"><span>磁碟可用</span><strong id="storage-free">—</strong><p id="storage-disk-ratio">—</p></article>
+        <article class="kpi"><span>容量估計</span><strong id="storage-days">—</strong><p>可用空間 ÷ 已達樣本門檻的淨成長；不足時採 mtime 保守估計</p></article>
+      </div>
+      <div class="storage-layout">
+        <figure class="chart-card storage-chart-card">
+          <figcaption><div><strong>資料落盤量</strong><span>一次性大量回補會形成明顯尖峰</span></div><span id="storage-observed">背景掃描尚未完成</span></figcaption>
+          <div id="storage-time-range" class="time-range-control" role="group" aria-label="落盤量圖時間範圍"><span>時間範圍</span><button type="button" data-range="1h">1 小時</button><button type="button" data-range="1d">1 天</button><button type="button" data-range="1w">1 週</button><button type="button" data-range="1mo">1 月</button><button type="button" data-range="1q">1 季</button><button type="button" data-range="1y">1 年</button><button type="button" data-range="all">全部</button></div>
+          <svg id="storage-growth-chart" viewBox="0 0 960 300" role="img" aria-labelledby="storage-chart-title storage-chart-desc">
+            <title id="storage-chart-title">最近 30 日資料落盤量</title>
+            <desc id="storage-chart-desc">依每個檔案最後修改日統計每日新增或更新的檔案大小。</desc>
+          </svg>
+          <p id="storage-chart-empty" class="empty" hidden>尚無完整日的檔案成長觀測。</p>
+          <p id="storage-range-note" class="time-range-note" aria-live="polite"></p>
+        </figure>
+        <section class="storage-bars-card" aria-labelledby="storage-bars-title">
+          <header><strong id="storage-bars-title">容量占比</strong><span>按實體資料群組</span></header>
+          <div id="storage-bars" class="storage-bars"><p class="empty">讀取中</p></div>
+        </section>
+      </div>
+      <details class="audit-details" open>
+        <summary>逐項查看容量與平均增量</summary>
+        <div class="table-wrap" tabindex="0" role="region" aria-label="永豐資料儲存容量明細，可左右捲動">
+          <table class="wide-table">
+            <thead><tr><th>資料</th><th>類型</th><th>流量分類</th><th>目前大小</th><th>檔案數</th><th>近 30 日變動量</th><th>mtime 日均</th><th>有變動日</th><th>最近變動</th></tr></thead>
+            <tbody id="storage-body"><tr><td colspan="9">讀取中</td></tr></tbody>
+          </table>
+        </div>
+      </details>
+      <p class="data-note">mtime 數字是檔案寫入活動量，不是淨增加，也不是永豐帳單；同一檔案重寫會按完整大小歸入當日。每日總量快照滿 7 個完整日後，容量倒數才改採實測淨成長。</p>
     </section>
 
     <section id="backfill" class="section-block" aria-labelledby="backfill-title">
       <header class="section-heading">
-        <span>03</span>
+        <span>04</span>
         <div>
           <h2 id="backfill-title">期貨歷史 Tick 回補</h2>
           <p>用 receipt 覆蓋率衡量完成度；服務活著不等於資料完成。</p>
@@ -144,8 +236,9 @@
       <div class="progress-card">
         <div class="progress-copy">
           <div><span>全合約進度</span><strong id="fleet-progress-label">—</strong></div>
-          <p id="fleet-progress-detail">—</p>
+          <div class="fleet-eta"><span>預計還要</span><strong id="fleet-eta-label">—</strong><p id="fleet-eta-detail">—</p></div>
         </div>
+        <p id="fleet-progress-detail" class="fleet-progress-detail">—</p>
         <progress id="fleet-progress-bar" class="progress-track" aria-label="全合約歷史回補進度" max="100" value="0"></progress>
       </div>
       <div class="kpi-grid backfill-kpis">
@@ -167,7 +260,7 @@
 
     <section id="capture" class="section-block" aria-labelledby="capture-title">
       <header class="section-heading">
-        <span>04</span>
+        <span>05</span>
         <div>
           <h2 id="capture-title">即時 Tick / BidAsk 擷取</h2>
           <p>以最新落盤檔案與目前 worker 訂閱證據判斷，不用歷史流量額度。</p>
@@ -189,18 +282,18 @@
 
     <section id="method" class="section-block method" aria-labelledby="method-title">
       <header class="section-heading">
-        <span>05</span>
+        <span>06</span>
         <div><h2 id="method-title">你看到的數字怎麼來</h2><p>公開面板只呈現必要的聚合證據。</p></div>
       </header>
       <div class="method-grid">
-        <article><strong>零額外 API 成本</strong><p>面板不呼叫 login、ticks 或 kbars；只讀既有 manifest、receipt、systemd 狀態與嚴格解析後的 journal 數字。</p></article>
+        <article><strong>零額外行情查詢</strong><p>面板不呼叫 login、ticks 或 kbars；只讀既有 manifest、receipt、systemd 狀態與嚴格解析後的 journal 數字。</p></article>
         <article><strong>三種配額口徑</strong><p>「歷史流量」會累積 api.usage()；「即時推送」不扣歷史額度；「本機衍生」不再呼叫永豐 API。</p></article>
         <article><strong>公開資料最小化</strong><p>不輸出 API Key、Secret、身分、帳號、憑證、本機路徑、capture ID 或 systemd invocation ID。</p></article>
         <article><strong>完成與運行分離</strong><p>批次資料以 manifest 與稽核判定完成；即時資料才以服務狀態及最新落盤時間判定是否健康。</p></article>
       </div>
     </section>
   </main>
-  <footer>StockAgent · 永豐 Shioaji API 公開唯讀監控 · 每 10 秒更新</footer>
-  <script src="app.js?v=4" defer></script>
+  <footer>StockAgent · 永豐 Shioaji API 公開唯讀監控 · 每 60 秒隨資料週期更新</footer>
+  <script src="app.js?v=10" defer></script>
 </body>
 </html>

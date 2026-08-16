@@ -6,20 +6,28 @@
   <meta name="color-scheme" content="dark">
   <meta name="theme-color" content="#071019">
   <title>StockAgent 即時資料面板</title>
-  <link rel="stylesheet" href="public.css?v=2">
-  <link rel="stylesheet" href="dashboard-core.css?v=2">
+  <link rel="stylesheet" href="public.css?v=3">
+  <link rel="stylesheet" href="dashboard-core.css?v=5">
 </head>
 <body>
   <a class="skip-link" href="#dashboards">跳到即時面板</a>
   <header class="site-header">
     <a class="brand" href="./" aria-label="StockAgent 公開面板首頁">STOCKAGENT</a>
-    <span class="read-only"><i aria-hidden="true"></i>公開唯讀</span>
+    <nav aria-label="公開面板導覽">
+      <a href="./" aria-current="page">總覽</a>
+      <a href="taifex/">TAIFEX</a>
+      <a href="tw-day-trade/">台股當沖</a>
+      <a href="shioaji/">永豐 API</a>
+      <a href="openbb/">OpenBB</a>
+      <a href="data-monitor/">全資料</a>
+      <a href="traffic/">流量</a>
+    </nav>
   </header>
 
   <main>
     <section class="hero" aria-labelledby="page-title">
       <p class="eyebrow">PUBLIC MARKET OBSERVATORY</p>
-      <h1 id="page-title">三個面板，<br>一個可信的即時視角</h1>
+      <h1 id="page-title">六個面板，<br>一個可信的即時視角</h1>
       <p class="lead">先確認資料新鮮度、API 流量與執行狀態，再查看模擬績效和完整帳本。所有頁面都是公開唯讀，不提供任何操作入口。</p>
       <div class="trust-row" aria-label="面板資料原則">
         <span>只讀模擬</span>
@@ -36,7 +44,7 @@
         </div>
         <div>
           <strong>期貨選擇權策略模擬</strong>
-          <p>53 條策略曲線、可成交價理想帳、風險與合約週期。</p>
+          <p>全策略曲線、可成交價理想帳、風險與合約週期。</p>
         </div>
         <dl class="card-stats" aria-label="TAIFEX 即時摘要">
           <div><dt>資料更新</dt><dd id="taifex-freshness">—</dd></div>
@@ -68,13 +76,61 @@
         </div>
         <div>
           <strong>永豐 API 資料管線</strong>
-          <p>歷史行情流量、剩餘安全額度、743 合約回補與即時擷取。</p>
+          <p>歷史行情流量、剩餘安全額度、合約回補與即時擷取。</p>
         </div>
         <dl class="card-stats" aria-label="永豐 API 即時摘要">
           <div><dt>歷史流量</dt><dd id="shioaji-traffic">—</dd></div>
           <div><dt>回補進度</dt><dd id="shioaji-progress">—</dd></div>
         </dl>
         <span class="card-action">開啟 API 面板 <b aria-hidden="true">→</b></span>
+      </a>
+
+      <a class="dashboard-card openbb" href="openbb/">
+        <div class="card-topline">
+          <span class="market">OPENBB ARCHIVE</span>
+          <span id="openbb-health" class="health loading" aria-live="polite"><i aria-hidden="true"></i>讀取中</span>
+        </div>
+        <div>
+          <strong>歷史資料封存監控</strong>
+          <p>2000 年起可續傳封存、程序真實狀態、完成率、供應商配額與完整性稽核。</p>
+        </div>
+        <dl class="card-stats" aria-label="OpenBB 封存即時摘要">
+          <div><dt>完整稽核</dt><dd id="openbb-freshness">—</dd></div>
+          <div><dt>已接受進度</dt><dd id="openbb-progress">—</dd></div>
+        </dl>
+        <span class="card-action">開啟 OpenBB 面板 <b aria-hidden="true">→</b></span>
+      </a>
+
+      <a class="dashboard-card data" href="data-monitor/">
+        <div class="card-topline">
+          <span class="market">ALL DATA SOURCES</span>
+          <span id="data-health" class="health loading" aria-live="polite"><i aria-hidden="true"></i>讀取中</span>
+        </div>
+        <div>
+          <strong>全資料來源監控</strong>
+          <p>永豐、yfinance、MOPS、臺灣官方資料、OpenBB、加密貨幣與外匯的完整度、新鮮度、進度與 ETA。</p>
+        </div>
+        <dl class="card-stats" aria-label="全資料來源即時摘要">
+          <div><dt>監控項目</dt><dd id="data-registered">—</dd></div>
+          <div><dt>正常／待處理</dt><dd id="data-progress">—</dd></div>
+        </dl>
+        <span class="card-action">開啟全資料面板 <b aria-hidden="true">→</b></span>
+      </a>
+
+      <a class="dashboard-card traffic" href="traffic/">
+        <div class="card-topline">
+          <span class="market">PUBLIC TRAFFIC</span>
+          <span id="traffic-health" class="health loading" aria-live="polite"><i aria-hidden="true"></i>讀取中</span>
+        </div>
+        <div>
+          <strong>網站流量與互動延遲</strong>
+          <p>公開請求量、吞吐、p50／p95／p99、路由 body 流量、快取命中與這台瀏覽器的 fetch-to-render 延遲。</p>
+        </div>
+        <dl class="card-stats" aria-label="網站流量即時摘要">
+          <div><dt>最近 1 分鐘</dt><dd id="traffic-requests">—</dd></div>
+          <div><dt>閘道 p95</dt><dd id="traffic-latency">—</dd></div>
+        </dl>
+        <span class="card-action">開啟流量面板 <b aria-hidden="true">→</b></span>
       </a>
     </section>
 
@@ -86,7 +142,7 @@
       </div>
     </aside>
   </main>
-  <footer>StockAgent 公開觀測面板 · 台北時間 · 每 15 秒檢查入口狀態</footer>
-  <script src="public.js?v=2" defer></script>
+  <footer>StockAgent 公開觀測面板 · 台北時間 · 每 60 秒隨資料週期更新</footer>
+  <script src="public.js?v=7" defer></script>
 </body>
 </html>

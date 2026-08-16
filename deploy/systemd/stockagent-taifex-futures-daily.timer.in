@@ -1,0 +1,10 @@
+[Unit]
+Description=Refresh official TAIFEX all-futures daily history after market close
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 16:30:00 Asia/Taipei
+Persistent=true
+Unit=stockagent-taifex-futures-daily.service
+
+[Install]
+WantedBy=timers.target

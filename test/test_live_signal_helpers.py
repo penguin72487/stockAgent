@@ -395,6 +395,49 @@ def test_tw_quote_with_zero_coverage_falls_back_without_claiming_realtime(monkey
     np.testing.assert_array_equal(snapshot.prices, fallback)
 
 
+def test_day_trade_shioaji_snapshot_queries_only_active_universe(monkeypatch) -> None:
+    requested: list[str] = []
+
+    def fake_snapshot(symbols, fallback_prices, *, cache_ttl_seconds):
+        del cache_ttl_seconds
+        requested.extend(symbols)
+        size = len(symbols)
+        return PriceSnapshot(
+            prices=np.asarray(fallback_prices, dtype=np.float64) + 1.0,
+            source="shioaji:fixture",
+            timestamp="2026-08-17T09:00:00+08:00",
+            available_count=size,
+            requested_count=size,
+            available_mask=np.ones((size,), dtype=bool),
+            open_prices=np.asarray(fallback_prices, dtype=np.float64),
+            bid_prices=np.asarray(fallback_prices, dtype=np.float64) - 0.1,
+            ask_prices=np.asarray(fallback_prices, dtype=np.float64) + 0.1,
+            timestamps_ms=np.arange(1, size + 1, dtype=np.int64),
+        )
+
+    monkeypatch.setattr(
+        "stockagent.live.signal_engine.fetch_shioaji_stock_snapshots",
+        fake_snapshot,
+    )
+    fallback = np.array([10.0, 20.0, 30.0])
+    snapshot = _price_snapshot(
+        source="shioaji",
+        symbols=["A", "B", "C"],
+        fallback_prices=fallback,
+        parquet_root="unused",
+        prices_csv=None,
+        yahoo_chunk_size=80,
+        request_mask=np.array([True, False, True]),
+    )
+
+    assert requested == ["A", "C"]
+    assert snapshot.requested_count == 2
+    assert snapshot.available_count == 2
+    np.testing.assert_array_equal(snapshot.available_mask, [True, False, True])
+    np.testing.assert_allclose(snapshot.prices, [11.0, 20.0, 31.0])
+    assert np.isnan(snapshot.open_prices[1])
+
+
 def test_live_market_config_passes_close_time_as_daily_bar_time() -> None:
     cfg = LiveMarketConfig(
         market="tw",

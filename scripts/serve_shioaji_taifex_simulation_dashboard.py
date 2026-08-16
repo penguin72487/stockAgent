@@ -12,7 +12,7 @@ import sys
 import threading
 import time
 from typing import Final
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -20,6 +20,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from stockagent.live.taifex_volatility_dashboard import (  # noqa: E402
     DEFAULT_MARK_LIMIT_PER_STRATEGY,
+    build_dashboard_history_snapshot,
     build_dashboard_snapshot,
 )
 
@@ -47,6 +48,21 @@ STATIC_ROUTES: Final[dict[str, tuple[str, str]]] = {
 }
 
 
+def _history_range_query(raw_query: str) -> str:
+    query = parse_qs(
+        raw_query,
+        keep_blank_values=True,
+        strict_parsing=False,
+        max_num_fields=1,
+    )
+    if set(query) - {"range"} or any(len(values) != 1 for values in query.values()):
+        raise ValueError("unsupported or repeated query field")
+    value = str(query.get("range", ["1d"])[0]).strip().lower() or "1d"
+    if value not in {"1h", "1d", "1w", "1mo", "1q", "1y", "all"}:
+        raise ValueError("unsupported dashboard history range")
+    return value
+
+
 class DashboardHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
 
@@ -66,7 +82,7 @@ class DashboardHTTPServer(ThreadingHTTPServer):
         self.mark_limit_per_strategy = mark_limit_per_strategy
         self._snapshot_cache: tuple[float, dict[str, object]] | None = None
         self._snapshot_lock = threading.Lock()
-        self._history_cache: tuple[float, dict[str, object]] | None = None
+        self._history_cache: dict[str, tuple[float, dict[str, object]]] = {}
         self._history_lock = threading.Lock()
 
     def snapshot(self) -> dict[str, object]:
@@ -91,33 +107,38 @@ class DashboardHTTPServer(ThreadingHTTPServer):
             self._snapshot_cache = (time.monotonic(), snapshot)
             return snapshot
 
-    def history_snapshot(self) -> dict[str, object]:
+    def history_snapshot(self, *, range_key: str) -> dict[str, object]:
         now_monotonic = time.monotonic()
-        cached = self._history_cache
+        cached = self._history_cache.get(range_key)
         if cached is not None and now_monotonic - cached[0] < 55.0:
             return cached[1]
         with self._history_lock:
             now_monotonic = time.monotonic()
-            cached = self._history_cache
+            cached = self._history_cache.get(range_key)
             if cached is not None and now_monotonic - cached[0] < 55.0:
                 return cached[1]
-            full = build_dashboard_snapshot(
+            full = build_dashboard_history_snapshot(
                 state_dir=self.state_dir,
-                api_receipt_dir=self.api_receipt_dir,
                 mark_limit_per_strategy=self.mark_limit_per_strategy,
-                include_history=True,
+                range_key=range_key,
             )
             snapshot = {
                 "dashboard_schema_version": full["dashboard_schema_version"],
                 "generated_at_utc": full["generated_at_utc"],
                 "source_updated_at_utc": full["source_updated_at_utc"],
+                "range": full["range"],
+                "range_seconds": full["range_seconds"],
+                "anchor_at_utc": full["anchor_at_utc"],
+                "coverage_start_utc": full["coverage_start_utc"],
+                "coverage_end_utc": full["coverage_end_utc"],
+                "downsampled": full["downsampled"],
                 "history": [
                     {key: row.get(key) for key in HISTORY_DISPLAY_FIELDS}
                     for row in full["history"]
                 ],
                 "record_counts": full["record_counts"],
             }
-            self._history_cache = (time.monotonic(), snapshot)
+            self._history_cache[range_key] = (time.monotonic(), snapshot)
             return snapshot
 
 
@@ -156,7 +177,8 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         )
 
     def do_GET(self) -> None:  # noqa: N802 - stdlib handler API
-        path = urlparse(self.path).path
+        parsed = urlparse(self.path)
+        path = parsed.path
         if path == "/api/status":
             try:
                 self._send_json(HTTPStatus.OK, self.server.snapshot())
@@ -168,10 +190,15 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/history":
             try:
-                self._send_json(HTTPStatus.OK, self.server.history_snapshot())
+                self._send_json(
+                    HTTPStatus.OK,
+                    self.server.history_snapshot(
+                        range_key=_history_range_query(parsed.query)
+                    ),
+                )
             except (OSError, ValueError, json.JSONDecodeError) as exc:
                 self._send_json(
-                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    HTTPStatus.BAD_REQUEST,
                     {"health": "unavailable", "error": f"{type(exc).__name__}: {exc}"},
                 )
             return

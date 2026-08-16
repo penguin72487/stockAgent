@@ -18,6 +18,12 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+try:
+    from downloader.common import SharedRateLimiter
+except ModuleNotFoundError:  # direct script execution
+    from common import SharedRateLimiter
+from stockagent.live.shioaji_traffic_ledger import shioaji_query
+
 from downloader.download_shioaji_tw_kbars import (  # noqa: E402
     MAX_KBAR_QUERY_DAYS,
     SHIOAJI_STOCK_HISTORY_START,
@@ -344,9 +350,7 @@ def query_minute_chunk(
                 ~outside_reference_date & all_zero_placeholder
             ).height,
             "negative_correction_rows_dropped": raw.filter(
-                ~outside_reference_date
-                & ~all_zero_placeholder
-                & negative_correction
+                ~outside_reference_date & ~all_zero_placeholder & negative_correction
             ).height,
             "out_of_session_rows_dropped": raw.filter(
                 ~outside_reference_date
@@ -374,12 +378,24 @@ def query_minute_chunk(
         try:
             if request_started is not None:
                 request_started()
-            payload = api.kbars(
-                contract=contract,
-                start=start.isoformat(),
-                end=end.isoformat(),
-                timeout=int(timeout_ms),
-            )
+            with shioaji_query(
+                api,
+                consumer="stock_minute_backfill",
+                method="kbars",
+                asset_class="stock",
+                details={
+                    "contract": row.symbol,
+                    "start": start.isoformat(),
+                    "end": end.isoformat(),
+                },
+            ) as set_ledger_result:
+                payload = api.kbars(
+                    contract=contract,
+                    start=start.isoformat(),
+                    end=end.isoformat(),
+                    timeout=int(timeout_ms),
+                )
+                set_ledger_result(payload)
             frame, stats = clean_payload(payload)
             returned_dates = set(frame["date"].to_list()) if frame.height else set()
             missing_dates = sorted(expected_dates - returned_dates)
@@ -388,12 +404,24 @@ def query_minute_chunk(
                 for missing_date in missing_dates:
                     if request_started is not None:
                         request_started()
-                    fallback_payload = api.kbars(
-                        contract=contract,
-                        start=missing_date.isoformat(),
-                        end=missing_date.isoformat(),
-                        timeout=int(timeout_ms),
-                    )
+                    with shioaji_query(
+                        api,
+                        consumer="stock_minute_gap_recovery",
+                        method="kbars",
+                        asset_class="stock",
+                        details={
+                            "contract": row.symbol,
+                            "start": missing_date.isoformat(),
+                            "end": missing_date.isoformat(),
+                        },
+                    ) as set_fallback_ledger_result:
+                        fallback_payload = api.kbars(
+                            contract=contract,
+                            start=missing_date.isoformat(),
+                            end=missing_date.isoformat(),
+                            timeout=int(timeout_ms),
+                        )
+                        set_fallback_ledger_result(fallback_payload)
                     fallback, fallback_stats = clean_payload(fallback_payload)
                     for key, value in fallback_stats.items():
                         stats[key] += value
@@ -957,12 +985,9 @@ def restore_extended_tail_from_archived_manifest(
     )
     returned = set(frame["date"].to_list()) if frame.height else set()
     source_gaps = {
-        date.fromisoformat(str(value))
-        for value in old_tail.get("source_gap_dates", [])
+        date.fromisoformat(str(value)) for value in old_tail.get("source_gap_dates", [])
     }
-    expected_tail = {
-        value for value in expected_dates if new_start <= value <= new_end
-    }
+    expected_tail = {value for value in expected_dates if new_start <= value <= new_end}
     if not expected_tail.issubset(returned | source_gaps):
         return False
     units = frame["contract_unit"].unique().to_list() if frame.height else []
@@ -1033,9 +1058,21 @@ def _write_run_summary(
     counters: dict[str, int],
     rate: dict[str, float | int],
     fatal_error: str,
-) -> None:
+) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
-    report_path = output_dir / "download_report.csv"
+    strict_complete = len(results) == len(selected) and all(
+        item.status == "complete" for item in results
+    )
+    collection_complete = len(results) == len(selected) and all(
+        item.status in {"complete", "complete_with_source_gaps", "contract_unavailable"}
+        for item in results
+    )
+    # An interrupted extension is run progress, not a new canonical catalog.
+    # Keep the last terminal summary/report published until the full selected
+    # universe reaches a terminal state for the new requested end date.
+    report_path = output_dir / (
+        "download_report.csv" if collection_complete else "latest_run_report.csv"
+    )
     if results:
         pl.DataFrame([asdict(item) for item in results]).sort("symbol").write_csv(
             report_path
@@ -1044,15 +1081,11 @@ def _write_run_summary(
         pl.DataFrame(
             schema={name: pl.String for name in SymbolResult.__dataclass_fields__}
         ).write_csv(report_path)
-    strict_complete = len(results) == len(selected) and all(
-        item.status == "complete" for item in results
-    )
-    collection_complete = len(results) == len(selected) and all(
-        item.status in {"complete", "complete_with_source_gaps", "contract_unavailable"}
-        for item in results
+    summary_path = output_dir / (
+        "download_summary.json" if collection_complete else "latest_run_summary.json"
     )
     _atomic_write_json(
-        output_dir / "download_summary.json",
+        summary_path,
         {
             "schema_version": 1,
             "source": SOURCE_NAME,
@@ -1069,9 +1102,7 @@ def _write_run_summary(
             "observed_request_start_rps": float(rate["overall_rps"]),
             "processed_chunks_this_run": int(counters["processed_chunks"]),
             "queried_chunks_this_run": int(counters["queried_chunks"]),
-            "skipped_empty_chunks_this_run": int(
-                counters["skipped_empty_chunks"]
-            ),
+            "skipped_empty_chunks_this_run": int(counters["skipped_empty_chunks"]),
             "selected_symbols": len(selected),
             "reported_symbols": len(results),
             "complete_symbols": sum(x.status == "complete" for x in results),
@@ -1085,6 +1116,7 @@ def _write_run_summary(
             "partial_symbols": sum(x.status == "partial" for x in results),
             "selected_coverage_complete": strict_complete,
             "resumable_collection_complete": collection_complete,
+            "published_terminal_catalog": collection_complete,
             "stopped_for_traffic": stopped_for_traffic,
             "stopped_for_market_hours": stopped_for_market_hours,
             "fatal_error": fatal_error or None,
@@ -1096,6 +1128,7 @@ def _write_run_summary(
             .isoformat(),
         },
     )
+    return summary_path
 
 
 def _partial_symbol_result(
@@ -1132,6 +1165,7 @@ def _download_symbol(
     end: date,
     chunks: list[tuple[date, date]],
     limiter: SharedRequestRateLimiter,
+    host_rate_limiter: SharedRateLimiter,
     counters: SharedDownloadCounters,
     traffic_guard: SharedTrafficBudgetGuard,
     stop_event: Any,
@@ -1219,6 +1253,10 @@ def _download_symbol(
                 message=contract_message,
             )
 
+        def acquire_request_slot() -> None:
+            limiter.acquire(stop_event)
+            host_rate_limiter.wait()
+
         for chunk_index, (chunk_start, chunk_end) in enumerate(chunks, start=1):
             data_path, receipt_path = minute_chunk_paths(
                 args.output_dir, row.symbol, chunk_start, chunk_end
@@ -1256,7 +1294,7 @@ def _download_symbol(
                     retries=int(args.retries),
                     retry_backoff=float(args.retry_backoff),
                     expected_dates=expected_dates,
-                    request_started=lambda: limiter.acquire(stop_event),
+                    request_started=acquire_request_slot,
                 )
             else:
                 # The public point-in-time panel is the universe and coverage
@@ -1279,9 +1317,7 @@ def _download_symbol(
             )
             returned_dates = sorted(
                 value.isoformat()
-                for value in (
-                    set(frame["date"].to_list()) if frame.height else set()
-                )
+                for value in (set(frame["date"].to_list()) if frame.height else set())
             )
             output_receipt = (
                 _write_minute_parquet(frame, data_path) if frame.height else None
@@ -1315,9 +1351,7 @@ def _download_symbol(
                     "returned_dates": returned_dates,
                     "query_performed": query_performed,
                     "query_skipped_reason": (
-                        None
-                        if query_performed
-                        else "no_public_positive_volume_session"
+                        None if query_performed else "no_public_positive_volume_session"
                     ),
                     "zero_placeholder_rows_dropped": int(
                         query_audit["zero_placeholder_rows_dropped"]
@@ -1436,6 +1470,10 @@ def _parallel_download_worker(
 ) -> None:
     api: Any | None = None
     contracts_by_code: dict[str, Any] = {}
+    host_rate_limiter = SharedRateLimiter(
+        1.0 / DEFAULT_REQUESTS_PER_SECOND,
+        name="shioaji_quote_query",
+    )
     init_error = ""
     try:
         import shioaji as sj
@@ -1477,6 +1515,7 @@ def _parallel_download_worker(
                 end=end,
                 chunks=chunks,
                 limiter=limiter,
+                host_rate_limiter=host_rate_limiter,
                 counters=counters,
                 traffic_guard=traffic_guard,
                 stop_event=stop_event,
@@ -1511,9 +1550,7 @@ def main() -> None:
     if not 1 <= int(args.chunk_days) <= MAX_KBAR_QUERY_DAYS:
         raise ValueError("--chunk-days must be between 1 and 30")
     if not 1 <= int(args.workers) <= SHIOAJI_MAX_CONNECTIONS:
-        raise ValueError(
-            f"--workers must be between 1 and {SHIOAJI_MAX_CONNECTIONS}"
-        )
+        raise ValueError(f"--workers must be between 1 and {SHIOAJI_MAX_CONNECTIONS}")
     if not 0.0 < float(args.requests_per_second) <= DEFAULT_REQUESTS_PER_SECOND:
         raise ValueError(
             "--requests-per-second must be positive and no greater than "
@@ -1696,15 +1733,23 @@ def main() -> None:
                 process.terminate()
                 process.join(timeout=5.0)
 
-    deduplicated = {
-        int(symbol_index): result for symbol_index, result in result_items
-    }
+    # A quota stop can leave thousands of unconsumed tasks in the parent-side
+    # multiprocessing feeder buffer.  Do not let Queue's interpreter-exit join
+    # turn a completed run into a hung systemd service.
+    for queue in (task_queue, result_queue, error_queue):
+        try:
+            queue.cancel_join_thread()
+            queue.close()
+        except (AttributeError, OSError, ValueError):
+            pass
+
+    deduplicated = {int(symbol_index): result for symbol_index, result in result_items}
     results = [deduplicated[index] for index in sorted(deduplicated)]
     traffic = traffic_guard.last_usage()
     counter_snapshot = counters.snapshot()
     rate_snapshot = limiter.snapshot()
     elapsed_seconds = round(time.monotonic() - started, 3)
-    _write_run_summary(
+    published_summary_path = _write_run_summary(
         args.output_dir,
         args=args,
         selected=selected,
@@ -1740,9 +1785,7 @@ def main() -> None:
             "reported_symbols": len(results),
             "processed_chunks_this_run": counter_snapshot["processed_chunks"],
             "queried_chunks_this_run": counter_snapshot["queried_chunks"],
-            "skipped_empty_chunks_this_run": counter_snapshot[
-                "skipped_empty_chunks"
-            ],
+            "skipped_empty_chunks_this_run": counter_snapshot["skipped_empty_chunks"],
             "api_requests_started_this_run": int(rate_snapshot["total_requests"]),
             "observed_request_start_rps": float(rate_snapshot["overall_rps"]),
             "request_window_rps": float(rate_snapshot["window_rps"]),
@@ -1763,11 +1806,12 @@ def main() -> None:
         f"partial={sum(x.status == 'partial' for x in results)} "
         f"api_requests={int(rate_snapshot['total_requests'])} "
         f"request_rps={float(rate_snapshot['overall_rps']):.3f} "
-        f"summary={args.output_dir / 'download_summary.json'}",
+        f"summary={published_summary_path}",
         flush=True,
     )
     if fatal_error:
         raise RuntimeError(fatal_error)
+
 
 if __name__ == "__main__":
     main()

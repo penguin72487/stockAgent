@@ -9,10 +9,24 @@ import fcntl
 import json
 import os
 from pathlib import Path
-import time
+import sys
 from typing import Any
 
 import polars as pl
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+try:
+    from downloader.common import (
+        SharedRateLimiter,
+        describe_rate_limit,
+        resolve_request_interval,
+    )
+except ModuleNotFoundError:  # direct script execution
+    from common import SharedRateLimiter, describe_rate_limit, resolve_request_interval
+from stockagent.live.shioaji_traffic_ledger import shioaji_query
 
 from downloader.download_shioaji_tw_kbars import (
     TrafficBudgetReached,
@@ -47,7 +61,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--end-date", default=(date.today() - timedelta(days=1)).isoformat()
     )
-    parser.add_argument("--request-interval", type=float, default=0.5)
+    parser.add_argument(
+        "--request-interval",
+        type=float,
+        default=None,
+        help=(
+            "Host-global seconds between quote requests; defaults to the official "
+            "selected 10 requests/second account-wide ceiling."
+        ),
+    )
     parser.add_argument("--timeout-ms", type=int, default=120_000)
     parser.add_argument("--max-traffic-fraction", type=float, default=0.90)
     parser.add_argument("--traffic-reserve-mb", type=float, default=128.0)
@@ -194,14 +216,25 @@ def _write_manifest(
 
 def main() -> int:
     args = parse_args()
+    if args.request_interval is not None and float(args.request_interval) < 0.0:
+        raise ValueError("--request-interval must be >= 0")
+    request_interval = resolve_request_interval(
+        "shioaji_quote_query", args.request_interval
+    )
+    rate_limiter = SharedRateLimiter(request_interval, name="shioaji_quote_query")
+    print(
+        "[shioaji-tx-history] "
+        f"{describe_rate_limit('shioaji_quote_query', request_interval)}",
+        flush=True,
+    )
     start = max(date.fromisoformat(args.start_date), HISTORY_START)
     end = date.fromisoformat(args.end_date)
     if start > end:
         raise ValueError("start date must not be after end date")
     if not 0.0 < args.max_traffic_fraction < 1.0:
         raise ValueError("max traffic fraction must be between zero and one")
-    if args.request_interval < 0.0 or args.timeout_ms < 1 or args.max_dates < 0:
-        raise ValueError("request interval, timeout, and max dates must be valid")
+    if args.timeout_ms < 1 or args.max_dates < 0:
+        raise ValueError("timeout and max dates must be valid")
     if _taiwan_market_hours_now() and not args.allow_market_hours:
         raise RuntimeError("refusing historical download during Taiwan market hours")
 
@@ -257,11 +290,23 @@ def main() -> int:
             except TrafficBudgetReached:
                 stopped_for_traffic = True
                 break
-            ticks = api.ticks(
-                contract=contract,
-                date=trading_date.isoformat(),
-                timeout=int(args.timeout_ms),
-            )
+            with shioaji_query(
+                api,
+                consumer="futures_history_backfill",
+                method="ticks",
+                asset_class="futures",
+                details={
+                    "contract": str(args.contract),
+                    "date": trading_date.isoformat(),
+                },
+            ) as set_ledger_result:
+                rate_limiter.wait()
+                ticks = api.ticks(
+                    contract=contract,
+                    date=trading_date.isoformat(),
+                    timeout=int(args.timeout_ms),
+                )
+                set_ledger_result(ticks)
             frame, source_order_monotonic = _ticks_frame(
                 ticks, trading_date=trading_date, contract_code=str(args.contract)
             )
@@ -294,7 +339,6 @@ def main() -> int:
                     f"contract={args.contract} date={trading_date} status=source_empty",
                     flush=True,
                 )
-                time.sleep(float(args.request_interval))
                 continue
             output = _write_parquet_atomic(frame, _data_path(args.output_dir, trading_date))
             receipt = {
@@ -316,7 +360,6 @@ def main() -> int:
                 f"traffic={usage[0]:,}/{usage[1]:,}",
                 flush=True,
             )
-            time.sleep(float(args.request_interval))
         if usage is None:
             current = api.usage()
             usage = int(current.bytes), int(current.limit_bytes)

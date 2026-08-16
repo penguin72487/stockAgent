@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import argparse
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 import hashlib
 import json
 import math
@@ -14,8 +14,18 @@ import polars as pl
 SHIOAJI_SOURCE = "shioaji_kbars_1m"
 STORAGE_FREQUENCY = "daily"
 HYBRID_SOURCE = "tw_public_before_shioaji_after"
-ALLOWED_DOWNLOAD_STATUSES = {"complete", "contract_unavailable"}
-ALLOWED_BUILD_STATUSES = {"hybrid", "public_only_contract_unavailable"}
+ALLOWED_DOWNLOAD_STATUSES = {
+    "complete",
+    "contract_unavailable",
+    "not_yet_listed",
+    "outside_source_window",
+}
+ALLOWED_BUILD_STATUSES = {
+    "hybrid",
+    "public_only_contract_unavailable",
+    "public_only_not_yet_listed",
+    "public_only_outside_source_window",
+}
 QUOTE_COLUMNS = ("open", "max", "min", "close", "Trading_Volume")
 
 
@@ -262,6 +272,19 @@ def audit(
         and int(download_summary.get("partial_symbols", -1)) == 0
     ):
         raise RuntimeError("Shioaji download summary does not prove complete coverage")
+    materialization_mode = str(download_summary.get("materialization_mode") or "")
+    local_materialization = materialization_mode == "verified_local_minute"
+    source_minute_summary_receipt_verified = False
+    if local_materialization:
+        if int(download_summary.get("api_requests_started", -1)) != 0:
+            raise RuntimeError("local daily materialization started Shioaji API requests")
+        source_receipt = download_summary.get("source_minute_summary_receipt")
+        source_path = Path(str((source_receipt or {}).get("path", "")))
+        source_minute_summary_receipt_verified = _receipt_matches(
+            source_path, source_receipt, checksum=True
+        )
+        if not source_minute_summary_receipt_verified:
+            raise RuntimeError("source minute download-summary receipt mismatch")
     download_report = _report_map(shioaji_root / "download_report.csv")
     if set(download_report) != base_symbols:
         raise RuntimeError("Shioaji download report does not account for the full universe")
@@ -289,6 +312,9 @@ def audit(
 
     hybrid_symbols = 0
     public_only_symbols = 0
+    public_only_not_yet_listed_symbols = 0
+    public_only_outside_source_window_symbols = 0
+    public_source_gap_fallback_rows = 0
     daily_chunk_receipts = 0
     daily_chunk_ok_receipts = 0
     hybrid_rows = 0
@@ -301,12 +327,28 @@ def audit(
         output_path = dataset_root / f"{symbol}_features.parquet"
         if not output_path.is_file():
             raise RuntimeError(f"missing hybrid symbol parquet: {output_path}")
-        if download_status == "contract_unavailable":
-            if build_status != "public_only_contract_unavailable":
+        if download_status in {
+            "contract_unavailable",
+            "not_yet_listed",
+            "outside_source_window",
+        }:
+            expected_build_status = (
+                "public_only_not_yet_listed"
+                if download_status == "not_yet_listed"
+                else "public_only_outside_source_window"
+                if download_status == "outside_source_window"
+                else "public_only_contract_unavailable"
+            )
+            if build_status != expected_build_status:
                 raise RuntimeError(f"{symbol}: unavailable contract/build status mismatch")
             if _sha256(base_path) != _sha256(output_path):
                 raise RuntimeError(f"{symbol}: public-only output differs from base parquet")
-            public_only_symbols += 1
+            if download_status == "not_yet_listed":
+                public_only_not_yet_listed_symbols += 1
+            elif download_status == "outside_source_window":
+                public_only_outside_source_window_symbols += 1
+            else:
+                public_only_symbols += 1
             rows = pl.scan_parquet(output_path).select(pl.len()).collect().item()
             public_rows += int(rows)
             hybrid_rows += int(rows)
@@ -327,12 +369,31 @@ def audit(
             )
         ):
             raise RuntimeError(f"{symbol}: invalid daily receipt")
-        receipt_count, ok_count = _audit_daily_chunks(
-            shioaji_root,
-            symbol,
-            daily_summary,
-            verify_checksum=verify_chunk_checksums,
-        )
+        if local_materialization:
+            minute_manifest_receipt = daily_summary.get("minute_manifest_receipt")
+            minute_manifest_path = Path(
+                str((minute_manifest_receipt or {}).get("path", ""))
+            )
+            if not (
+                daily_summary.get("materialization_mode")
+                == "verified_local_minute"
+                and _receipt_matches(
+                    minute_manifest_path,
+                    minute_manifest_receipt,
+                    checksum=True,
+                )
+                and int(daily_summary.get("source_minute_chunks_verified", 0)) > 0
+            ):
+                raise RuntimeError(f"{symbol}: invalid local minute lineage")
+            receipt_count = int(daily_summary["source_minute_chunks_verified"])
+            ok_count = receipt_count
+        else:
+            receipt_count, ok_count = _audit_daily_chunks(
+                shioaji_root,
+                symbol,
+                daily_summary,
+                verify_checksum=verify_chunk_checksums,
+            )
         daily_chunk_receipts += receipt_count
         daily_chunk_ok_receipts += ok_count
         daily = pl.read_parquet(
@@ -341,25 +402,68 @@ def audit(
         ).sort("date")
         output = pl.read_parquet(
             output_path,
-            columns=["date", *QUOTE_COLUMNS, "data_source", "adjclose"],
+            columns=[
+                "date",
+                *QUOTE_COLUMNS,
+                "data_source",
+                "fallback_reason",
+                "adjclose",
+            ],
         ).sort("date")
         if daily.height != int(daily_summary.get("daily_rows", -1)) or daily.is_empty():
             raise RuntimeError(f"{symbol}: invalid daily row count")
         first_shioaji = daily["date"].min()
         output_after = output.filter(pl.col("date") >= first_shioaji)
         output_before = output.filter(pl.col("date") < first_shioaji)
-        base_before = pl.read_parquet(base_path, columns=["date"]).filter(
+        base_quotes = pl.read_parquet(base_path, columns=["date", *QUOTE_COLUMNS])
+        base_before = base_quotes.select("date").filter(
             pl.col("date") < first_shioaji
         )
         if output_before["date"].to_list() != base_before["date"].to_list():
             raise RuntimeError(f"{symbol}: public pre-cutover dates changed")
-        if output_after["date"].to_list() != daily["date"].to_list():
-            raise RuntimeError(f"{symbol}: post-cutover dates do not exactly match Shioaji")
-        if output_after.filter(pl.col("data_source") != SHIOAJI_SOURCE).height:
-            raise RuntimeError(f"{symbol}: public quote row remains after Shioaji cutover")
+        declared_gaps = {
+            date.fromisoformat(str(value))
+            for value in daily_summary.get("declared_source_gap_dates", [])
+        }
+        daily_dates = set(daily["date"])
+        fallback_dates = {
+            value
+            for value in declared_gaps
+            if value >= first_shioaji
+            and value in set(base_quotes["date"])
+            and value not in daily_dates
+        }
+        if output_after["date"].to_list() != sorted(daily_dates | fallback_dates):
+            raise RuntimeError(
+                f"{symbol}: post-cutover dates do not match Shioaji plus declared gaps"
+            )
+        output_shioaji = output_after.filter(
+            pl.col("data_source") == SHIOAJI_SOURCE
+        )
+        output_fallback = output_after.filter(
+            pl.col("data_source") != SHIOAJI_SOURCE
+        )
+        if output_shioaji["date"].to_list() != daily["date"].to_list():
+            raise RuntimeError(f"{symbol}: Shioaji output dates changed")
+        if (
+            set(output_fallback["date"]) != fallback_dates
+            or output_fallback.filter(
+                pl.col("fallback_reason") != "shioaji_declared_source_gap"
+            ).height
+        ):
+            raise RuntimeError(f"{symbol}: undeclared public fallback after cutover")
         for column in QUOTE_COLUMNS:
-            if not _allclose(output_after[column], daily[column]):
+            if not _allclose(output_shioaji[column], daily[column]):
                 raise RuntimeError(f"{symbol}: quote mismatch in {column}")
+        if fallback_dates:
+            base_fallback = base_quotes.filter(
+                pl.col("date").is_in(sorted(fallback_dates))
+            ).sort("date")
+            for column in QUOTE_COLUMNS:
+                if not _allclose(output_fallback[column], base_fallback[column]):
+                    raise RuntimeError(
+                        f"{symbol}: public source-gap fallback mismatch in {column}"
+                    )
         invalid_adjclose = output.filter(
             pl.col("adjclose").is_null()
             | ~pl.col("adjclose").is_finite()
@@ -370,12 +474,18 @@ def audit(
         hybrid_symbols += 1
         hybrid_rows += output.height
         shioaji_rows += daily.height
-        public_rows += output_before.height
+        public_rows += output_before.height + output_fallback.height
+        public_source_gap_fallback_rows += output_fallback.height
 
     expected = {
         "symbols": len(base_symbols),
         "hybrid_symbols": hybrid_symbols,
         "public_only_contract_unavailable_symbols": public_only_symbols,
+        "public_only_not_yet_listed_symbols": public_only_not_yet_listed_symbols,
+        "public_only_outside_source_window_symbols": (
+            public_only_outside_source_window_symbols
+        ),
+        "public_source_gap_fallback_rows": public_source_gap_fallback_rows,
         "rows": hybrid_rows,
         "public_rows": public_rows,
         "shioaji_rows": shioaji_rows,
@@ -391,10 +501,26 @@ def audit(
         "status": "ok",
         **expected,
         "storage_frequency": STORAGE_FREQUENCY,
-        "daily_chunk_receipts": daily_chunk_receipts,
-        "daily_chunk_ok_receipts": daily_chunk_ok_receipts,
+        "daily_chunk_receipts": 0 if local_materialization else daily_chunk_receipts,
+        "daily_chunk_ok_receipts": (
+            0 if local_materialization else daily_chunk_ok_receipts
+        ),
+        "source_minute_chunk_receipts": (
+            daily_chunk_receipts if local_materialization else 0
+        ),
+        "source_minute_chunk_ok_receipts": (
+            daily_chunk_ok_receipts if local_materialization else 0
+        ),
         "daily_chunk_checksums_verified": verify_chunk_checksums,
         "download_end_date": download_summary.get("end_date"),
+        "materialization_mode": materialization_mode,
+        "api_requests_started": download_summary.get("api_requests_started"),
+        "source_minute_summary_receipt_verified": (
+            source_minute_summary_receipt_verified
+        ),
+        "written_at_utc": datetime.now(timezone.utc)
+        .replace(microsecond=0)
+        .isoformat(),
     }
 
 
@@ -418,6 +544,8 @@ def main() -> None:
         f"hybrid={result['hybrid_symbols']} public_only="
         f"{result['public_only_contract_unavailable_symbols']} "
         f"daily_chunk_receipts={result['daily_chunk_receipts']} "
+        f"source_minute_chunk_receipts="
+        f"{result['source_minute_chunk_receipts']} "
         f"output={args.output}",
         flush=True,
     )

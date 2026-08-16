@@ -13,6 +13,8 @@ import pytest
 from downloader.download_shioaji_tw_kbars import UniverseRow
 from downloader.download_shioaji_tw_minute_kbars import (
     SharedRequestRateLimiter,
+    SymbolResult,
+    _write_run_summary,
     completed_symbol_manifest_result,
     contract_for_stock_symbol,
     minute_chunk_paths,
@@ -209,6 +211,63 @@ def test_minute_chunk_paths_are_separate_from_daily_storage() -> None:
     assert "daily_chunks" not in str(data_path)
 
 
+def test_incomplete_extension_does_not_replace_terminal_catalog(
+    tmp_path: Path,
+) -> None:
+    canonical_summary = tmp_path / "download_summary.json"
+    canonical_report = tmp_path / "download_report.csv"
+    canonical_summary.write_text('{"terminal": true}\n', encoding="utf-8")
+    canonical_report.write_text("symbol,status\n2330,complete\n", encoding="utf-8")
+    row = UniverseRow(
+        symbol="2330",
+        name="台積電",
+        market="twse",
+        security_type="stock",
+        base_path=tmp_path / "2330.parquet",
+    )
+    result = SymbolResult(
+        symbol="2330",
+        status="partial",
+        chunks_total=2,
+        chunks_complete=1,
+        source_minute_rows=0,
+        daily_rows=0,
+        first_date=None,
+        last_date=None,
+        output_path="",
+        message="traffic guard",
+    )
+    output = _write_run_summary(
+        tmp_path,
+        args=SimpleNamespace(
+            start_date="2020-03-02",
+            end_date="2026-08-14",
+            chunk_days=29,
+            simulation=True,
+            workers=5,
+            requests_per_second=10.0,
+        ),
+        selected=[row],
+        results=[result],
+        traffic=(1_900_000_000, 2_147_483_648),
+        stopped_for_traffic=True,
+        stopped_for_market_hours=False,
+        counters={
+            "processed_chunks": 0,
+            "queried_chunks": 0,
+            "skipped_empty_chunks": 0,
+        },
+        rate={"total_requests": 0, "overall_rps": 0.0},
+        fatal_error="",
+    )
+    assert output == tmp_path / "latest_run_summary.json"
+    assert json.loads(canonical_summary.read_text())["terminal"] is True
+    assert "2330,complete" in canonical_report.read_text()
+    latest = json.loads(output.read_text())
+    assert latest["published_terminal_catalog"] is False
+    assert latest["partial_symbols"] == 1
+
+
 def test_research_gate_allows_audited_source_gaps_but_rejects_failures(
     tmp_path: Path,
 ) -> None:
@@ -250,7 +309,7 @@ def test_research_gate_allows_audited_source_gaps_but_rejects_failures(
 def test_account_wide_rate_limiter_is_shared_across_processes() -> None:
     context = mp.get_context("spawn")
     output = context.Queue()
-    # Scale the official 50/5s boundary down to a fast 50/0.05s test while
+    # Scale the configured 50/5s boundary down to a fast 50/0.05s test while
     # preserving its 50-request sliding-window shape.
     limiter = SharedRequestRateLimiter(
         context,

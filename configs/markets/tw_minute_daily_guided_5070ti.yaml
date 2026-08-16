@@ -27,4 +27,9 @@ training:
   minute_decision_chunk_rows: 8
   minute_eval_decision_chunk_rows: 8
   minute_data_workers: 4
-  minute_cpu_cache_gb: 64.0
+  # This node also runs the live public-data rebuild/audit. A complete fold
+  # cache consumed 52.4 GiB while parquet fetch cost only 3.9 seconds/epoch;
+  # retaining it pushed the shared host into swap and starved the GPU. Keep
+  # the existing one-batch asynchronous prefetch, but do not retain batches
+  # after consumption on this 125 GiB node.
+  minute_cpu_cache_gb: 0.0

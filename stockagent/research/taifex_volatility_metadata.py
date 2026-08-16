@@ -47,6 +47,7 @@ VOLATILITY_MODEL_IMPLEMENTATION: Final[dict[str, str]] = {
 }
 
 CLASSIC_VARIANT_ID: Final[str] = "classic_opening_straddle"
+PUT_CALL_PARITY_TX_STRATEGY_ID: Final[str] = "put_call_parity_tx"
 MODEL_VARIANT_PREFIX: Final[str] = "daily_vol_model_gamma__"
 STRATEGY_MODE_DAILY: Final[str] = "daily_close_next_open"
 STRATEGY_MODE_INTRADAY_FUTURES: Final[str] = "intraday_futures"
@@ -146,6 +147,7 @@ _DIRECTIONAL_EXPOSURE_BY_ID: Final[dict[str, str]] = _expand_exposure_groups(
                 "bs_overhedge_125",
                 "conversion",
                 "reversal",
+                PUT_CALL_PARITY_TX_STRATEGY_ID,
             ),
         ),
         (
@@ -244,6 +246,7 @@ _VOLATILITY_EXPOSURE_BY_ID: Final[dict[str, str]] = _expand_exposure_groups(
                 "synthetic_short",
                 "conversion",
                 "reversal",
+                PUT_CALL_PARITY_TX_STRATEGY_ID,
             ),
         ),
         (
@@ -329,7 +332,10 @@ _HEDGE_TYPE_BY_ID: Final[dict[str, str]] = _expand_exposure_groups(
                 "jade_lizard",
             ),
         ),
-        ("parity_locked", ("long_box", "conversion", "reversal")),
+        (
+            "parity_locked",
+            ("long_box", "conversion", "reversal", PUT_CALL_PARITY_TX_STRATEGY_ID),
+        ),
         ("synthetic_linear", ("synthetic_long", "synthetic_short")),
         (
             "contract_pending",
@@ -1083,6 +1089,21 @@ _MULTI_LEG_LIVE_SPECS: Final[tuple[StrategySpec, ...]] = (
         hedge_policy="fixed_index_equivalent",
         hedge_parameter=-1.0,
     ),
+    _live(
+        PUT_CALL_PARITY_TX_STRATEGY_ID,
+        "Put–Call Parity + TX 成本後套利",
+        "arbitrage",
+        "套利",
+        "掃描同到期月選 Call/Put 與 TX；只有整包 Bid/Ask 毛利扣除手續費、進場交易稅與估計結算稅後嚴格為正才建立鎖定組合。",
+        "以 4 組 TXO 對 1 口 TX 同時計算兩個方向；先用完整五檔形成訊號，再等待每一腿都收到嚴格較晚的新報價並重新驗證淨利。",
+        "不做一般策略的日／夜盤末平倉；同到期 TXO 與 TX 持有至 TAIFEX 官方最後結算價現金結算。",
+        "理想帳假設三腿可整包完成，沒有跨商品原子委託保證；資金採逐腿裸賣與 TX 原始保證金、不套組合折抵，融資利率設為 0。",
+        "live_same_expiry_put_call_parity_cost_gate",
+        option_legs=(("C", 0, -4), ("P", 0, 4)),
+        hedge_policy="same_expiry_tx_parity_lock",
+        hedge_parameter=1.0,
+        broker_monitoring="ideal_only_no_broker_submission",
+    ),
     _structure(
         "jade_lizard",
         "Jade Lizard",
@@ -1115,7 +1136,9 @@ STRATEGY_SPEC_BY_ID: Final[dict[str, StrategySpec]] = {
     spec.strategy_id: spec for spec in LIVE_STRATEGY_SPECS
 }
 DYNAMIC_HEDGE_STRATEGY_IDS: Final[tuple[str, ...]] = tuple(
-    spec.strategy_id for spec in LIVE_STRATEGY_SPECS if spec.hedge_policy != "none"
+    spec.strategy_id
+    for spec in LIVE_STRATEGY_SPECS
+    if spec.hedge_policy not in {"none", "same_expiry_tx_parity_lock"}
 )
 
 
@@ -1278,6 +1301,7 @@ __all__ = [
     "MODEL_SABR",
     "MODEL_SLV",
     "MODEL_VARIANT_PREFIX",
+    "PUT_CALL_PARITY_TX_STRATEGY_ID",
     "REFERENCE_STRATEGY_SPECS",
     "STRATEGY_CATALOG",
     "STRATEGY_IDS",

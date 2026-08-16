@@ -8,7 +8,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
@@ -71,6 +71,7 @@ LIVE_SIGNAL_WEIGHTS_NAME = "live_signal_weights.parquet"
 ProgressCallback = Callable[[dict[str, Any]], None]
 _LIVE_PANEL_CACHE_MAX_ENTRIES = 3
 _LIVE_PANEL_CACHE: OrderedDict[str, PanelData] = OrderedDict()
+_LIVE_PANEL_SOURCE_KEY_CACHE: dict[str, str] = {}
 _LIVE_PANEL_CACHE_LOCK = threading.Lock()
 _LIVE_CHECKPOINT_CACHE_MAX_ENTRIES = 8
 _LIVE_CHECKPOINT_CACHE: OrderedDict[str, dict[str, Any]] = OrderedDict()
@@ -83,6 +84,7 @@ _LIVE_MODEL_CACHE_LOCK = threading.Lock()
 def clear_live_panel_memory_cache() -> None:
     with _LIVE_PANEL_CACHE_LOCK:
         _LIVE_PANEL_CACHE.clear()
+        _LIVE_PANEL_SOURCE_KEY_CACHE.clear()
 
 
 def clear_live_inference_memory_cache() -> None:
@@ -182,20 +184,38 @@ def _live_panel_cache_key(
     digest.update(str(int(live_tail_rows)).encode("ascii"))
     digest.update(repr(sorted(panel_kwargs.items())).encode("utf-8"))
     root = Path(config.data.parquet_root)
-    source_paths = sorted(root.glob("*_features.parquet"))
+    # Refresh workflows explicitly call clear_live_panel_memory_cache(). Keep
+    # three cheap sentinels as defense in depth, but do not resolve/stat all
+    # ~2,700 symbol parquets merely to prove that a RAM cache entry exists.
+    sentinel_paths = [root, root / "symbols.csv"]
     external_path = panel_kwargs.get("external_feature_path")
     if external_path:
-        source_paths.append(Path(str(external_path)))
-    symbols_path = root / "symbols.csv"
-    if symbols_path.exists():
-        source_paths.append(symbols_path)
-    for path in source_paths:
+        sentinel_paths.append(Path(str(external_path)))
+    for path in sentinel_paths:
+        if not path.exists():
+            continue
         stat = path.stat()
         digest.update(str(path.resolve()).encode("utf-8"))
         digest.update(
             f":{stat.st_size}:{stat.st_mtime_ns}:{stat.st_ctime_ns}".encode("ascii")
         )
-    return digest.hexdigest()
+    source_identity = digest.hexdigest()
+    with _LIVE_PANEL_CACHE_LOCK:
+        cached_key = _LIVE_PANEL_SOURCE_KEY_CACHE.get(source_identity)
+        if cached_key is not None:
+            return cached_key
+
+    source_digest = hashlib.sha256(source_identity.encode("ascii"))
+    for path in sorted(root.glob("*_features.parquet")):
+        stat = path.stat()
+        source_digest.update(str(path.name).encode("utf-8"))
+        source_digest.update(
+            f":{stat.st_size}:{stat.st_mtime_ns}:{stat.st_ctime_ns}".encode("ascii")
+        )
+    resolved = source_digest.hexdigest()
+    with _LIVE_PANEL_CACHE_LOCK:
+        _LIVE_PANEL_SOURCE_KEY_CACHE[source_identity] = resolved
+    return resolved
 
 
 def _cached_live_panel(key: str) -> PanelData | None:
@@ -303,7 +323,11 @@ def _datetime64_second(value: object) -> np.datetime64 | None:
             return None
 
 
-def _build_panel(config: ExperimentConfig, *, live_tail: bool = False) -> PanelData:
+def _build_panel(
+    config: ExperimentConfig,
+    *,
+    live_tail: bool = False,
+) -> tuple[PanelData, bool]:
     live_tail_rows = int(getattr(config.data, "live_tail_panel_rows", 0) or 0)
     use_tw_public_features = bool(config.data.use_tw_public_features)
     use_tw_public_rules = bool(config.data.use_tw_public_rules)
@@ -344,7 +368,7 @@ def _build_panel(config: ExperimentConfig, *, live_tail: bool = False) -> PanelD
                 f"[panel] live memory cache hit dates={cached.num_dates} "
                 f"symbols={cached.num_symbols}"
             )
-            return cached
+            return cached, True
         panel = build_tail_panel(
             config.data.parquet_root,
             tail_rows=live_tail_rows,
@@ -369,10 +393,13 @@ def _build_panel(config: ExperimentConfig, *, live_tail: bool = False) -> PanelD
             panel_start_date=config.data.panel_start_date,
         )
         _remember_live_panel(cache_key, panel)
-        return panel
-    return build_panel(
-        config.data.parquet_root,
-        **panel_kwargs,
+        return panel, False
+    return (
+        build_panel(
+            config.data.parquet_root,
+            **panel_kwargs,
+        ),
+        False,
     )
 
 
@@ -771,11 +798,17 @@ def _price_snapshot(
     parquet_root: str | Path,
     prices_csv: str | Path | None,
     yahoo_chunk_size: int,
+    request_mask: np.ndarray | None = None,
 ) -> PriceSnapshot:
     source_norm = str(source).strip().lower()
     if source_norm == "panel":
         prices = np.asarray(fallback_prices, dtype=np.float64).copy()
-        return PriceSnapshot(prices=prices, source="panel_close", available_count=int(np.isfinite(prices).sum()))
+        return PriceSnapshot(
+            prices=prices,
+            source="panel_close",
+            available_count=int(np.isfinite(prices).sum()),
+            requested_count=len(symbols),
+        )
     if source_norm == "csv":
         if prices_csv is None:
             raise ValueError("--prices-csv is required when price_source=csv")
@@ -788,9 +821,18 @@ def _price_snapshot(
             chunk_size=yahoo_chunk_size,
         )
     if source_norm in {"shioaji", "sj", "sinopac", "永豐"}:
-        return fetch_shioaji_stock_snapshots(
-            symbols,
-            fallback_prices,
+        indices = np.arange(len(symbols), dtype=np.int64)
+        if request_mask is not None:
+            normalized_mask = np.asarray(request_mask, dtype=bool)
+            if normalized_mask.shape != (len(symbols),):
+                raise ValueError("Shioaji request_mask must have shape [symbols]")
+            indices = np.flatnonzero(normalized_mask)
+        if indices.size <= 0:
+            raise RuntimeError("Shioaji active-universe request is empty")
+        requested_symbols = [symbols[int(idx)] for idx in indices]
+        partial = fetch_shioaji_stock_snapshots(
+            requested_symbols,
+            np.asarray(fallback_prices, dtype=np.float64)[indices],
             cache_ttl_seconds=max(
                 0.0,
                 float(
@@ -801,6 +843,45 @@ def _price_snapshot(
                     or "15"
                 ),
             ),
+        )
+        if indices.size == len(symbols):
+            return partial
+
+        size = len(symbols)
+
+        def expanded(values: np.ndarray | None, *, integer: bool = False):
+            if values is None:
+                return None
+            fill = 0 if integer else np.nan
+            dtype = np.int64 if integer else np.float64
+            output = np.full((size,), fill, dtype=dtype)
+            output[indices] = np.asarray(values, dtype=dtype)
+            return output
+
+        prices = np.asarray(fallback_prices, dtype=np.float64).copy()
+        prices[indices] = np.asarray(partial.prices, dtype=np.float64)
+        available_mask = np.zeros((size,), dtype=bool)
+        if partial.available_mask is not None:
+            available_mask[indices] = np.asarray(partial.available_mask, dtype=bool)
+        return PriceSnapshot(
+            prices=prices,
+            source=f"{partial.source}+active_universe_subset",
+            timestamp=partial.timestamp,
+            available_count=int(partial.available_count),
+            requested_count=int(indices.size),
+            available_mask=available_mask,
+            open_prices=expanded(partial.open_prices),
+            high_prices=expanded(partial.high_prices),
+            low_prices=expanded(partial.low_prices),
+            volumes=expanded(partial.volumes),
+            upper_limit_prices=expanded(partial.upper_limit_prices),
+            lower_limit_prices=expanded(partial.lower_limit_prices),
+            bid_prices=expanded(partial.bid_prices),
+            ask_prices=expanded(partial.ask_prices),
+            bid_volumes=expanded(partial.bid_volumes),
+            ask_volumes=expanded(partial.ask_volumes),
+            reference_prices=expanded(partial.reference_prices),
+            timestamps_ms=expanded(partial.timestamps_ms, integer=True),
         )
     if source_norm in {"tw", "twse", "tpex", "mis", "tw_mis"}:
         snapshot = fetch_tw_mis_last_prices(
@@ -851,16 +932,43 @@ def _write_outputs_to_dir(result: LiveSignalResult, output_dir: str | Path) -> s
 
     path = Path(output_dir)
     path.mkdir(parents=True, exist_ok=True)
-    (path / "summary.json").write_text(
-        json.dumps(result.summary, indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
+    _atomic_write_json(path / "summary.json", result.summary)
     (path / "discord_message.md").write_text(result.message, encoding="utf-8")
     pl.DataFrame(result.weights_rows).write_parquet(path / "target_weights.parquet")
     pl.DataFrame(result.rebalance_rows).write_parquet(path / "rebalance.parquet")
     pl.DataFrame(result.decision_rows).write_parquet(path / "decision_explanations.parquet")
     _write_text_artifacts(result, path)
     return str(path)
+
+
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    """Publish a small JSON contract without exposing a partially written file."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
+    temporary.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temporary, path)
+
+
+def _atomic_write_compact_json(path: Path, payload: dict[str, Any]) -> None:
+    """Atomically publish a latency-sensitive local IPC payload."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
+    temporary.write_text(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temporary, path)
 
 
 def _make_signal_id(market: str, asof_date: str) -> str:
@@ -1702,6 +1810,7 @@ def generate_live_signal(
     _panel_override: PanelData | None = None,
 ) -> LiveSignalResult:
     signal_started = time.perf_counter()
+    signal_started_wall_utc = datetime.now(timezone.utc)
     quote_latency_ms = 0.0
     inference_latency_ms = 0.0
     progress_total = 17
@@ -1732,6 +1841,9 @@ def generate_live_signal(
     display_timezone_name = str(display_timezone or DEFAULT_DISPLAY_TIMEZONE)
     display_tz = _display_zone(display_timezone_name)
     generated_at_text = datetime.now(display_tz).isoformat(timespec="seconds")
+    signal_started_at_text = signal_started_wall_utc.astimezone(display_tz).isoformat(
+        timespec="microseconds"
+    )
     trading_frequency = str(getattr(config.trading, "frequency", "") or "")
     intraday_frequency = _is_intraday_frequency(trading_frequency)
 
@@ -1751,11 +1863,11 @@ def generate_live_signal(
     if not isinstance(state_dict, dict):
         raise ValueError(f"Checkpoint does not contain model_state_dict: {checkpoint}")
 
-    panel = (
-        _panel_override
-        if _panel_override is not None
-        else _build_panel(config, live_tail=True)
-    )
+    if _panel_override is not None:
+        panel = _panel_override
+        panel_cache_hit = True
+    else:
+        panel, panel_cache_hit = _build_panel(config, live_tail=True)
     _emit_progress(progress_callback, label=progress_name, step=4, total=progress_total, message="panel ready")
     panel = align_panel_to_checkpoint_universe(
         panel,
@@ -1805,8 +1917,14 @@ def generate_live_signal(
         parquet_root=config.data.parquet_root,
         prices_csv=prices_csv,
         yahoo_chunk_size=yahoo_chunk_size,
+        request_mask=(
+            np.asarray(panel.alive_mask[panel_idx], dtype=bool)
+            if execution_mode == "tw_day_trade"
+            else None
+        ),
     )
-    quote_latency_ms = (time.perf_counter() - quote_started) * 1000.0
+    quote_finished = time.perf_counter()
+    quote_latency_ms = (quote_finished - quote_started) * 1000.0
     if str(price_snapshot.source).startswith("panel_close:fallback_tw_mis_unavailable"):
         quote_notice = (
             "TWSE/TPEx MIS 本次未回傳任何盤中報價；本訊號明確改用最後完整收盤價，"
@@ -1832,10 +1950,13 @@ def generate_live_signal(
         )
     elif (
         str(price_snapshot.source).startswith("shioaji:")
-        and int(price_snapshot.available_count) < int(panel.num_symbols)
+        and int(price_snapshot.available_count)
+        < int(price_snapshot.requested_count or panel.num_symbols)
     ):
         quote_notice = (
-            f"永豐 Shioaji snapshot 覆蓋 {price_snapshot.available_count}/{panel.num_symbols}；"
+            "永豐 Shioaji snapshot 覆蓋本次模型存活標的 "
+            f"{price_snapshot.available_count}/"
+            f"{price_snapshot.requested_count or panel.num_symbols}；"
             "未取得 snapshot 的標的沿用最後完整收盤價，且沒有開盤價者不進入本次模型可交易遮罩。"
         )
         market_notice = (
@@ -1937,17 +2058,29 @@ def generate_live_signal(
             _panel_override=panel,
         )
 
-    previous_weights, previous_weights_date, previous_weights_path = _load_previous_weights(
-        panel.symbols,
-        output_dir=resolved_output_dir,
-        fold_id=resolved_fold_id,
-        weights_path=weights_path,
-        asof_date=expected_previous_data_date or panel_date_str,
-        prefer_live_weights=True,
-        # expected_previous_data_date is already the resolved prior session for
-        # panel-close signals (or today's panel date for realtime marks).
-        strictly_before_asof=False,
-    )
+    if execution_mode == "tw_day_trade":
+        # The canonical day-trade account starts every session flat. Reading a
+        # 2,700-column prior-weight parquet on the opening path cannot change
+        # the model input, target, turnover, or executable order and cost about
+        # 0.2 s on this host. Retain the prior close only as the price basis.
+        previous_weights = np.zeros((panel.num_symbols,), dtype=np.float64)
+        previous_weights_date = expected_previous_data_date or panel_date_str
+        previous_weights_path = None
+    else:
+        previous_weights, previous_weights_date, previous_weights_path = (
+            _load_previous_weights(
+                panel.symbols,
+                output_dir=resolved_output_dir,
+                fold_id=resolved_fold_id,
+                weights_path=weights_path,
+                asof_date=expected_previous_data_date or panel_date_str,
+                prefer_live_weights=True,
+                # expected_previous_data_date is already the resolved prior
+                # session for panel-close signals (or today's panel date for
+                # realtime marks).
+                strictly_before_asof=False,
+            )
+        )
     previous_weights_data_date = previous_weights_date
     previous_weights_display_date = (
         previous_weights_date if intraday_frequency else _daily_bar_timestamp(previous_weights_date, daily_bar_time)
@@ -2175,7 +2308,8 @@ def generate_live_signal(
             estimated_trade_cost = -float(backtest.strategy_returns[0].detach().float().cpu().item())
     if runtime_device.type == "cuda":
         torch.cuda.synchronize(runtime_device)
-    inference_latency_ms = (time.perf_counter() - inference_started) * 1000.0
+    inference_finished = time.perf_counter()
+    inference_latency_ms = (inference_finished - inference_started) * 1000.0
     _emit_progress(progress_callback, label=progress_name, step=13, total=progress_total, message="trading constraints applied")
 
     if execution_preview_only:
@@ -2393,9 +2527,13 @@ def generate_live_signal(
         resolved_asof=resolved_asof,
         uses_realtime_daily_prices=uses_realtime_daily_prices,
     )
+    signal_ready = time.perf_counter()
+    signal_ready_at_text = datetime.now(display_tz).isoformat(timespec="microseconds")
     summary: dict[str, Any] = {
         "signal_id": resolved_signal_id,
         "generated_at": generated_at_text,
+        "signal_started_at": signal_started_at_text,
+        "signal_ready_at": signal_ready_at_text,
         "asof_date": resolved_asof,
         "market": market_id,
         "market_label": market_name,
@@ -2417,9 +2555,16 @@ def generate_live_signal(
         "execution_constraints_notice": execution_constraints_notice,
         "previous_period_label": "上個訊號到現在" if intraday_frequency else "上個交易日到現在",
         "previous_weights_policy": (
-            "live_signal_before_asof"
-            if previous_weights_path and Path(previous_weights_path).name.startswith("live_signal_weights")
-            else "daily_weights_previous_trading_day"
+            "session_starts_flat"
+            if execution_mode == "tw_day_trade"
+            else (
+                "live_signal_before_asof"
+                if previous_weights_path
+                and Path(previous_weights_path).name.startswith(
+                    "live_signal_weights"
+                )
+                else "daily_weights_previous_trading_day"
+            )
         ),
         "data_timezone": source_timezone,
         "display_timezone": display_timezone_name,
@@ -2439,15 +2584,28 @@ def generate_live_signal(
         "price_timestamp": price_timestamp,
         "price_data_date": price_timestamp,
         "price_available_count": int(price_snapshot.available_count),
+        "price_requested_count": int(
+            price_snapshot.requested_count or panel.num_symbols
+        ),
         "opening_price_available_count": opening_price_available_count,
         "live_latency": {
-            "schema_version": 1,
+            "schema_version": 2,
+            "panel_cache_hit": bool(panel_cache_hit),
             "checkpoint_cache_hit": bool(checkpoint_cache_hit),
             "model_cache_hit": bool(model_cache_hit),
+            "pre_quote_prepare_ms": round(
+                float((quote_started - signal_started) * 1000.0), 3
+            ),
             "quote_fetch_ms": round(float(quote_latency_ms), 3),
+            "pre_inference_prepare_ms": round(
+                float((inference_started - quote_finished) * 1000.0), 3
+            ),
             "model_inference_ms": round(float(inference_latency_ms), 3),
+            "post_inference_format_ms": round(
+                float((signal_ready - inference_finished) * 1000.0), 3
+            ),
             "compute_before_publish_ms": round(
-                float((time.perf_counter() - signal_started) * 1000.0), 3
+                float((signal_ready - signal_started) * 1000.0), 3
             ),
         },
         "signal_price_contract": {
@@ -2512,6 +2670,9 @@ def generate_live_signal(
         summary["output_dir"] = str(output_path)
         summary["summary_path"] = str(output_path / "summary.json")
         summary["weights_path"] = str(output_path / "target_weights.parquet")
+        summary["execution_weights_path"] = str(
+            output_path / "execution_weights.json"
+        )
         summary["rebalance_path"] = str(output_path / "rebalance.parquet")
         summary["decision_explanation_path"] = str(output_path / "decision_explanations.parquet")
         summary["positions_markdown_path"] = str(output_path / "target_positions.md")
@@ -2531,18 +2692,87 @@ def generate_live_signal(
         output_dir=None,
     )
     if write:
-        result.output_dir = _write_outputs_to_dir(result, summary["output_dir"])
+        result_path = Path(summary["output_dir"])
+        result_path.mkdir(parents=True, exist_ok=True)
+        result.output_dir = str(result_path)
         result.summary["output_dir"] = result.output_dir
+        execution_fields = (
+            "symbol",
+            "name",
+            "action",
+            "score",
+            "raw_score",
+            "target_weight",
+            "tradable",
+            "can_buy",
+            "can_sell",
+            "open_price",
+            "current_price",
+        )
+        _atomic_write_compact_json(
+            result_path / "execution_weights.json",
+            {
+                "schema_version": 1,
+                "market": market_id,
+                "signal_id": resolved_signal_id,
+                "rows": [
+                    {key: row.get(key) for key in execution_fields}
+                    for row in result.weights_rows
+                ],
+            },
+        )
+        published_at = datetime.now(display_tz).isoformat(timespec="microseconds")
+        result.summary["artifact_published_at"] = published_at
+        result.summary["live_latency"]["artifact_publish_ms"] = round(
+            float((time.perf_counter() - signal_ready) * 1000.0), 3
+        )
+        result.summary["live_latency"]["input_to_publish_ms"] = round(
+            float((time.perf_counter() - signal_started) * 1000.0), 3
+        )
+        summary_path = result_path / "summary.json"
+        _atomic_write_json(summary_path, result.summary)
+        pointer_payload = {
+            "schema_version": 2,
+            "market": market_id,
+            "signal_id": resolved_signal_id,
+            "signal_started_at": signal_started_at_text,
+            "signal_ready_at": signal_ready_at_text,
+            "artifact_published_at": published_at,
+            "artifact_complete": False,
+            "summary_path": str(summary_path),
+            "weights_path": str(result_path / "target_weights.parquet"),
+            "execution_weights_path": str(
+                result_path / "execution_weights.json"
+            ),
+        }
+        _atomic_write_json(
+            output_root / "latest_signal.json",
+            pointer_payload,
+        )
+        # The execution contract is now visible to the separate simulation
+        # process. Rich Parquet/Markdown/Discord artifacts are completed after
+        # that causal handoff and may not delay the order-simulation ledger.
+        result.output_dir = _write_outputs_to_dir(result, result_path)
         live_weights_path = (
             None
             if execution_preview_only
-            else write_live_weights_history(checkpoint.parent, result.summary, result.weights_rows)
+            else write_live_weights_history(
+                checkpoint.parent,
+                result.summary,
+                result.weights_rows,
+            )
         )
         if live_weights_path:
             result.summary["live_weights_path"] = live_weights_path
-        (Path(result.output_dir) / "summary.json").write_text(
-            json.dumps(result.summary, indent=2, ensure_ascii=False),
-            encoding="utf-8",
+        completed_at = datetime.now(display_tz).isoformat(timespec="microseconds")
+        result.summary["artifact_completed_at"] = completed_at
+        result.summary["live_latency"]["rich_artifact_complete_ms"] = round(
+            float((time.perf_counter() - signal_ready) * 1000.0), 3
+        )
+        _atomic_write_json(summary_path, result.summary)
+        _atomic_write_json(
+            output_root / "latest_signal.json",
+            {**pointer_payload, "artifact_complete": True},
         )
     _emit_progress(progress_callback, label=progress_name, step=17, total=progress_total, message="done")
     return result

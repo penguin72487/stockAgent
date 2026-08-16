@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh registered crypto data every 15 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=15min
+Persistent=true
+Unit=stockagent-registered-data-intraday.service
+
+[Install]
+WantedBy=timers.target

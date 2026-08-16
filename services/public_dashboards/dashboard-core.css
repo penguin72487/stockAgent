@@ -28,9 +28,22 @@ body {
 
 .public-brand,
 .brand {
+  display: inline-flex;
+  min-height: 40px;
+  align-items: center;
   font-size: 12px;
   font-weight: 850;
   letter-spacing: .17em;
+}
+
+.public-nav nav,
+.site-header nav {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  max-width: calc(100% - 120px);
+  overflow-x: auto;
+  scrollbar-width: thin;
 }
 
 .public-nav nav a,
@@ -59,8 +72,8 @@ select:focus-visible,
 input:focus-visible,
 a:focus-visible,
 [tabindex]:focus-visible {
-  outline: 3px solid rgba(67, 215, 255, .24);
-  outline-offset: 2px;
+  outline: 3px solid var(--dashboard-cyan) !important;
+  outline-offset: 3px;
 }
 
 table,
@@ -119,6 +132,7 @@ dd,
 .taifex-dashboard #equity-chart,
 .taifex-dashboard .curve-card,
 .taifex-dashboard .strategy-card,
+.taifex-dashboard .parity-grid > div,
 .taifex-dashboard .exposure-summary div,
 .taifex-dashboard .cycle-glance div {
   color: var(--ink);
@@ -165,7 +179,7 @@ dd,
   .site-header nav {
     width: 100%;
     max-width: none;
-    justify-content: space-between;
+    justify-content: flex-start;
     gap: 3px;
     overflow-x: auto;
   }
@@ -186,6 +200,40 @@ dd,
     animation-iteration-count: 1 !important;
     transition-duration: .01ms !important;
   }
+}
+
+.time-range-control {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: .35rem;
+}
+.time-range-control > span {
+  color: var(--muted, #64748b);
+  font-size: .78rem;
+  margin-right: .15rem;
+}
+.time-range-control button {
+  min-height: 2rem;
+  padding: .35rem .58rem;
+  border: 1px solid var(--line, rgba(148, 163, 184, .35));
+  border-radius: 999px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: .78rem;
+  cursor: pointer;
+}
+.time-range-control button[aria-pressed="true"] {
+  border-color: var(--accent, #21c7a8);
+  background: rgba(33, 199, 168, .16);
+  color: var(--text, inherit);
+  font-weight: 700;
+}
+.time-range-note {
+  margin: .55rem 0 0;
+  color: var(--muted, #64748b);
+  font-size: .8rem;
 }
 
 @media print {

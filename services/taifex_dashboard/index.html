@@ -6,8 +6,8 @@
   <meta name="color-scheme" content="dark">
   <meta name="theme-color" content="#071019">
   <title>TAIFEX 全策略模擬交易即時面板</title>
-  <link rel="stylesheet" href="styles.css?v=8">
-  <link rel="stylesheet" href="../dashboard-core.css?v=2">
+  <link rel="stylesheet" href="styles.css?v=14">
+  <link rel="stylesheet" href="../dashboard-core.css?v=5">
 </head>
 <body class="taifex-dashboard">
   <a class="skip-link" href="#main-content">跳到主要內容</a>
@@ -18,6 +18,9 @@
       <a class="active" href="./" aria-current="page">TAIFEX</a>
       <a href="../tw-day-trade/">台股當沖</a>
       <a href="../shioaji/">永豐 API</a>
+      <a href="../openbb/">OpenBB</a>
+      <a href="../data-monitor/">全資料</a>
+      <a href="../traffic/">流量</a>
     </nav>
   </header>
 
@@ -37,6 +40,7 @@
 
     <nav class="jump-nav" aria-label="本頁快速導覽">
       <a href="#overview">狀態總覽</a>
+      <a href="#parity">Parity 套利</a>
       <a href="#performance">績效趨勢</a>
       <a href="#strategies">策略比較</a>
       <a href="#audit">資料稽核</a>
@@ -58,6 +62,24 @@
       <article class="metric"><span>模擬委託</span><strong id="broker-status">—</strong><small id="broker-detail">—</small></article>
       <article class="metric"><span>狀態延遲</span><strong id="source-age">—</strong><small>超過 15 秒即標示 stale</small></article>
       <article class="metric"><span>安全邊界</span><strong id="safety-state">—</strong><small>正式下單必須永遠不可用</small></article>
+    </section>
+
+    <section id="parity" class="panel parity-panel" aria-labelledby="parity-title">
+      <div class="panel-head">
+        <div>
+          <h2 id="parity-title">Put–Call Parity + TX 成本後套利</h2>
+          <p>4 組同到期月 TXO 合成期貨對 1 口 TX；成本後嚴格大於 0 才等待下一組新報價成交</p>
+        </div>
+        <span id="parity-state-pill" class="pill stale">載入中</span>
+      </div>
+      <div class="parity-grid">
+        <div><span>成本後淨利</span><strong id="parity-net-edge">—</strong><small id="parity-threshold">門檻 &gt; 0 TWD</small></div>
+        <div><span>毛利／估計總成本</span><strong id="parity-gross-cost">—</strong><small>含進場費稅與估計結算稅</small></div>
+        <div><span>套利方向</span><strong id="parity-direction">—</strong><small id="parity-package">—</small></div>
+        <div><span>同到期合約</span><strong id="parity-contracts">—</strong><small id="parity-prices">—</small></div>
+        <div><span>因果成交閘門</span><strong id="parity-causal-state">—</strong><small id="parity-book-age">—</small></div>
+        <div><span>帳務邊界</span><strong>理想帳、持有至結算</strong><small>無跨商品原子成交保證；永豐正式委託停用</small></div>
+      </div>
     </section>
 
     <div id="performance" class="section-intro">
@@ -84,7 +106,8 @@
             <select id="strategy-select" aria-label="選擇策略"></select>
           </label>
         </div>
-        <svg id="equity-chart" viewBox="0 0 900 300" role="img" aria-label="選擇策略的總權益曲線"></svg>
+        <div id="equity-time-range" class="time-range-control" role="group" aria-label="策略曲線時間範圍"><span>大圖與曲線一覽</span><button type="button" data-range="1h">1 小時</button><button type="button" data-range="1d">1 天</button><button type="button" data-range="1w">1 週</button><button type="button" data-range="1mo">1 月</button><button type="button" data-range="1q">1 季</button><button type="button" data-range="1y">1 年</button><button type="button" data-range="all">全部</button></div>
+        <div class="chart-scroll" tabindex="0" aria-label="TAIFEX 權益曲線，可在窄螢幕水平捲動"><svg id="equity-chart" viewBox="0 0 900 300" role="img" aria-label="選擇策略的總權益曲線"></svg></div>
         <p id="chart-note" class="chart-note"></p>
       </article>
 
@@ -101,7 +124,7 @@
           <dl class="detail-list">
           <div><dt>避險期貨</dt><dd id="hedge-contract">—</dd></div>
           <div><dt>TXO 風險保證金 A/B/C</dt><dd id="option-risk-margins">—</dd></div>
-          <div><dt>避險期貨原始保證金</dt><dd id="futures-initial-margin">—</dd></div>
+          <div><dt>期貨原始保證金</dt><dd id="futures-initial-margin">—</dd></div>
           <div><dt>維持／結算保證金</dt><dd id="maintenance-clearing-margin">—</dd></div>
           <div><dt>規則來源</dt><dd><a href="https://www.taifex.com.tw/cht/11/newsDetail?idx=17259&amp;newsType=1" target="_blank" rel="noopener noreferrer">TAIFEX 2026-08-11 公告</a></dd></div>
           <div><dt>策略資金緩衝</dt><dd id="capital-buffer-multiple">—</dd></div>
@@ -189,10 +212,13 @@
           <button id="sort-direction" type="button">由高到低 ↓</button>
         </div>
       </div>
-      <div class="scroll-hint" aria-hidden="true">表格可左右滑動查看完整欄位 →</div>
-      <div class="table-scroll" tabindex="0" role="region" aria-label="53 個策略帳本，可左右捲動">
-        <table>
-          <thead><tr><th>策略</th><th>分類</th><th>方向曝險</th><th>波動曝險</th><th>避險型態</th><th>選擇權多:空口數比</th><th>預留資金</th><th>一單位淨損益</th><th>損益絕對值</th><th>固定資金報酬</th><th>逐日複利*</th><th>顯性成本</th><th>損益／成本</th><th>保證金</th><th>資金占用</th><th>總權益</th><th>餘裕</th><th>清算價值</th><th>選擇權腿</th><th>期貨</th><th>狀態</th></tr></thead>
+      <div class="table-scroll strategy-table-wrap" tabindex="0" role="region" aria-label="策略帳本六欄摘要">
+        <table class="strategy-table">
+          <colgroup>
+            <col class="strategy-col-name"><col class="strategy-col-exposure"><col class="strategy-col-return">
+            <col class="strategy-col-pnl"><col class="strategy-col-capital"><col class="strategy-col-position">
+          </colgroup>
+          <thead><tr><th>策略／狀態</th><th>曝險／口數比</th><th>報酬</th><th>損益／成本</th><th>資金／保證金</th><th>部位／估值</th></tr></thead>
           <tbody id="strategy-body"></tbody>
         </table>
       </div>
@@ -216,7 +242,7 @@
       <article class="panel methodology">
         <div class="panel-head"><div><h2>資料與限制</h2><p>面板為唯讀，不參與交易決策</p></div></div>
         <ul>
-          <li><code>status.json</code>：5 秒粒度。</li>
+          <li><code>status.json</code> 仍負責引擎狀態；公開頁面的價格、損益與曲線在開頁時立即載入，之後每 1 分鐘同步刷新。</li>
           <li>TX／TMF／TXO 日盤 08:30 起接收盤前試撮、08:45–13:45 連續交易；夜盤 14:50 起接收盤前試撮、15:00–05:00 連續交易。</li>
           <li>盤前試撮五檔會保存，但 <code>simtrade=true</code> 不可當作成交；理想帳只在連續交易取得非試撮、未過期且數量足夠的五檔時成交。</li>
           <li>13:45–14:50 與 05:00–08:30 為休市監控空窗；supervisor 保持在線，但不會偽造委託或成交。</li>
@@ -226,8 +252,11 @@
           <li>「設計多空比」由最小策略配方計算；「實際多空比」由目前理想帳持倉計算，兩者都只按選擇權口數。</li>
           <li>預留資金是每個策略帳本固定的 <code>initial_capital_twd</code>；固定資金報酬 = 累積淨損益 ÷ 預留資金。</li>
           <li>複利只在 TAIFEX 交易日之間發生：∏(1 + 當日損益增量 ÷ 固定預留資金) − 1；目前交易日是未結算即時值。</li>
-          <li>預留資金合計假設 53 個策略各自獨立部署，不宣稱可共用擔保品或享有價差／SPAN 折抵。</li>
+          <li>預留資金合計假設所有策略各自獨立部署，不宣稱可共用擔保品或享有價差／SPAN 折抵。</li>
           <li>進場買 Ask／賣 Bid；清算多單賣 Bid、空單買 Ask，數量需由五檔顯示量完整承接。</li>
+          <li><code>put_call_parity_tx</code> 用 4 組同到期月 TXO 對 1 口 TX，兩方向都掃描；毛利扣除設定手續費、進場交易稅與保守估計結算稅後必須嚴格為正。</li>
+          <li>Parity 第一次完整五檔只形成訊號；三腿都收到時間戳嚴格晚於訊號的新報價、整包仍有利潤才記入理想成交。融資利率依本次需求設為 0。</li>
+          <li>Parity 曲線以可立即反向清算的 Bid/Ask 計價，因此持有期間可能低於進場時的鎖定到期淨利；兩者不可混為同一指標。</li>
           <li>裸賣逐腿使用 TXO 單一部位保證金，不假設尚未驗證的價差或 SPAN 折抵。</li>
           <li>任一持倉腿缺報價時，只延用完全相同持倉指紋的上一筆完整清算值，並標示 CARRIED。</li>
           <li>永豐模擬帳戶只鏡射共用參考 Straddle 與既有六模型期貨；其他策略為可歸屬的 Bid/Ask 理想帳。</li>
@@ -259,6 +288,7 @@
       </div>
     </section>
   </main>
-  <script src="app.js?v=9" defer></script>
+  <script src="../time-axis.js?v=3" defer></script>
+  <script src="app.js?v=18" defer></script>
 </body>
 </html>

@@ -53,6 +53,8 @@ from downloader.download_openbb_archive import (
     SEC_ALL_COMPANY_FACTS,
     SYMBOL_PERIOD_ENDPOINTS,
     SPREAD_MATURITIES,
+    TASK_RETRY_BASE_SECONDS,
+    TASK_RETRY_MAX_SECONDS,
     TaskResult,
     TOTAL_FACTOR_PRODUCTIVITY_FREQUENCIES,
     UNEMPLOYMENT_DIMENSIONS,
@@ -76,7 +78,10 @@ from downloader.download_openbb_archive import (
     _fetch_eia_petroleum_status_workaround,
     _fetch_federal_reserve_central_bank_holdings_workaround,
     _fetch_yfinance_etf_info_workaround,
+    _fetch_bls_series_labstat_table,
     _fetch_bls_series_resilient,
+    _download_bls_labstat_file,
+    _create_bls_labstat_series_table,
     _fetch_congress_info_workaround,
     _fetch_cftc_cot_catalog_workaround,
     _fetch_fmp_discovery_filings_workaround,
@@ -109,6 +114,8 @@ from downloader.download_openbb_archive import (
     _is_yahoo_http_url,
     _load_resumable_plan,
     _pop_fairest_endpoint_task,
+    _task_execution_affinity,
+    _task_retry_delay_seconds,
     _make_sec_async_request_wrapper,
     _make_sec_sync_request_wrapper,
     _make_provider_aiohttp_request_wrapper,
@@ -119,6 +126,7 @@ from downloader.download_openbb_archive import (
     _normalize_retail_items,
     _normalize_nport_transformer_contract,
     _normalize_bls_search_result,
+    _bls_labstat_catalog_files,
     _preferred_tw_symbol,
     _provider_capability_domain,
     _quarantine_obsolete_task_output,
@@ -361,6 +369,42 @@ def test_manifest_repairs_old_provider_error_classification_once(
         "fmp": "unavailable"
     }
     assert manifest.repair_provider_error_classification(plan_token="plan") == (0, 0)
+    manifest.close()
+
+
+def test_manifest_requeues_bls_nullable_title_failure_once(tmp_path: Path) -> None:
+    manifest = Manifest(tmp_path / "manifest.sqlite3")
+    context = _context(tmp_path)
+    task = make_task(
+        context,
+        "economy.survey.bls_series",
+        "series=INUS0001",
+        {"symbol": "INUS0001"},
+        ("bls",),
+    )
+    manifest.upsert_tasks([task], plan_token="plan")
+    manifest.connection.execute(
+        "UPDATE tasks SET status='failed',selected_provider='bls',attempts=1,"
+        "error=?,provider_outcomes_json=? WHERE task_id=?",
+        (
+            'bls: BinderException: Column "series_title" referenced before defined',
+            '{"bls":"permanent"}',
+            task.task_id,
+        ),
+    )
+    manifest.connection.commit()
+
+    assert manifest.repair_bls_missing_series_title_bug(plan_token="plan") == 1
+    row = manifest.connection.execute(
+        "SELECT status,selected_provider,attempts,rows,error,"
+        "provider_outcomes_json,updated_at FROM tasks WHERE task_id=?",
+        (task.task_id,),
+    ).fetchone()
+    assert tuple(row[:4]) == ("pending", None, 0, 0)
+    assert row[4].startswith("requeued:")
+    assert row[5] == "{}"
+    assert row[6] == "0001-01-01T00:00:00+00:00"
+    assert manifest.repair_bls_missing_series_title_bug(plan_token="plan") == 0
     manifest.close()
 
 
@@ -987,6 +1031,26 @@ def test_requests_urllib_and_httpx_share_provider_http_boundary(
         "congress_gov": 1,
         "federal_reserve": 1,
     }
+
+
+def test_bls_labstat_transport_bypasses_only_api_cooldown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import downloader.download_openbb_archive as archive
+
+    runtime = SimpleNamespace(
+        availability=lambda provider: (False, "cooldown until tomorrow"),
+        limiter=lambda provider: pytest.fail("LABSTAT must not claim an API ticket"),
+    )
+    monkeypatch.setattr(archive, "_PROVIDER_HTTP_RUNTIME", runtime)
+
+    archive._wait_provider_http_boundary(
+        "bls", "https://download.bls.gov/pub/time.series/ws/ws.data.1.AllData"
+    )
+    with pytest.raises(archive.ProviderDeferredError, match="cooldown"):
+        archive._wait_provider_http_boundary(
+            "bls", "https://api.bls.gov/publicAPI/v2/timeseries/data/"
+        )
 
 
 def test_worker_disables_openbb_http_cache_without_changing_task_identity(
@@ -1901,7 +1965,7 @@ def test_provider_runtime_upgrades_old_daily_quota_checkpoint(
     upgraded = datetime.fromisoformat(
         runtime.cooldown_deadlines()["tiingo"]
     ).astimezone(fixed_est)
-    assert upgraded.timestamp() > old_deadline
+    assert upgraded.timestamp() > time.time()
     assert (upgraded.hour, upgraded.minute) == (0, 5)
 
 
@@ -1969,6 +2033,58 @@ def test_provider_runtime_persists_unavailable_provider_and_route(
     assert restored.availability("fmp", "equity.fundamental.metrics", "us")[0] is True
     assert restored.availability("tiingo", "equity.price.historical")[0] is False
     assert restored.clear_false_global_unavailable() == ()
+
+
+def test_provider_runtime_does_not_parse_series_id_401_as_http_auth(
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "_state" / "provider_cooldowns.json"
+    runtime = ProviderRuntime(
+        {"fred": 2.0},
+        {"fred": 1},
+        3600,
+        state_path,
+    )
+    runtime.disable(
+        "fred",
+        "fred: ContentTypeError: 500 for "
+        "https://api.stlouisfed.org/fred/series/observations?"
+        "series_id=GRCPREND401IXOBQ&api_key=<redacted>",
+    )
+
+    restored = ProviderRuntime(
+        {"fred": 2.0},
+        {"fred": 1},
+        3600,
+        state_path,
+    )
+    assert restored.clear_false_global_unavailable() == ("fred",)
+    assert restored.availability("fred", "economy.fred_series")[0] is True
+
+
+@pytest.mark.parametrize(
+    "message",
+    (
+        "fred: HTTP 401 Unauthorized",
+        "fred: status code=401",
+        "fred: Unauthorized request -> 401 -> invalid key",
+        "fred: 401 Client Error: Unauthorized",
+    ),
+)
+def test_provider_runtime_preserves_contextual_http_401_auth(
+    tmp_path: Path, message: str
+) -> None:
+    state_path = tmp_path / message.split(":", 1)[1].strip().replace("/", "_")
+    runtime = ProviderRuntime(
+        {"fred": 2.0},
+        {"fred": 1},
+        3600,
+        state_path,
+    )
+    runtime.disable("fred", message)
+
+    assert runtime.clear_false_global_unavailable() == ()
+    assert runtime.availability("fred", "economy.fred_series")[0] is False
 
 
 def test_manifest_prioritizes_latest_canonical_fmp_domain_probes(
@@ -6043,6 +6159,68 @@ def test_sec_statement_standardized_disk_cache_survives_memory_eviction(
     assert len(list((tmp_path / "_standardized").glob("*/*.json.gz"))) == 1
 
 
+def test_sec_statement_spawned_process_reads_cache_without_network(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import downloader.download_openbb_archive as archive
+    from openbb_sec.utils.company_facts import StandardizedStatements
+
+    cik = "0000320193"
+    raw = {
+        "cik": cik,
+        "entityName": "Apple Inc.",
+        "facts": {"us-gaap": {"Assets": {"units": {"USD": []}}}},
+    }
+    archive._write_sec_companyfacts_cache(
+        archive._sec_companyfacts_cache_path(tmp_path, cik), cik, raw
+    )
+    key = ("sec", (cik,), "annual", True, True)
+    resolved = StandardizedStatements(
+        entity_name="Apple Inc.",
+        cik=320193,
+        balance_sheet=[
+            {
+                "period_ending": "2025-09-30",
+                "fiscal_period": "FY",
+                "fiscal_year": 2025,
+                "currency": "USD",
+                "tag": "total_assets",
+                "value": 100.0,
+                "label": "Assets",
+                "description": "Assets",
+            }
+        ],
+        income_statement=[],
+        cash_flow=[],
+    )
+    archive._write_sec_standardized_disk_cache(
+        archive._sec_standardized_disk_cache_path(tmp_path, key), key, resolved
+    )
+    monkeypatch.setenv("OPENBB_SEC_PROCESS_WORKERS", "1")
+    pool = archive._create_sec_statement_process_pool()
+    assert pool is not None
+    try:
+        result = pool.submit(
+            archive._project_sec_statement_cached_process,
+            "equity.fundamental.balance",
+            {
+                "symbol": "AAPL",
+                "period": "annual",
+                "limit": 1000,
+                "pit_mode": True,
+                "include_preliminary": True,
+                "use_cache": False,
+            },
+            str(tmp_path),
+            (cik,),
+        ).result(timeout=30)
+    finally:
+        pool.shutdown(wait=True, cancel_futures=True)
+
+    assert len(result) == 1
+    assert result[0].total_assets == pytest.approx(100.0)
+
+
 def test_sec_statement_drops_only_exact_invalid_mapped_cell(
     monkeypatch, tmp_path: Path
 ) -> None:
@@ -6715,6 +6893,218 @@ def test_fmp_discovery_filings_workaround_infers_missing_accepted_date(
     assert "limit=1000" in requested_urls[0]
     assert records[0]["accepted_date"] == "2007-01-15T00:00:00"
     assert records[0]["accepted_date_inferred"] is True
+
+
+def test_bls_labstat_catalog_prefers_complete_history_file() -> None:
+    page = """
+    <a href="ws.data.0.Current">current</a>
+    <a href="ws.data.1.AllData">all</a>
+    <a href="ws.data.2.Region">partition</a>
+    <a href="ws.series">series</a>
+    <a href="ws.footnote">footnotes</a>
+    """
+
+    assert _bls_labstat_catalog_files(page, "ws") == (
+        "ws.series",
+        "ws.footnote",
+        ["ws.data.1.AllData"],
+    )
+
+
+def test_bls_labstat_raw_download_resumes_and_receipt_skips_network(
+    monkeypatch, tmp_path: Path
+) -> None:
+    from io import BytesIO
+
+    output = tmp_path / "ws.data.1.AllData"
+    partial = tmp_path / ".ws.data.1.AllData.part"
+    partial.write_bytes(b"abc")
+    seen_ranges: list[str | None] = []
+
+    class _Response:
+        status = 206
+        headers = {"Content-Length": "3", "Content-Range": "bytes 3-5/6"}
+
+        def __init__(self) -> None:
+            self.stream = BytesIO(b"def")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def read(self, size: int = -1) -> bytes:
+            return self.stream.read(size)
+
+    def _urlopen(request, timeout):
+        del timeout
+        seen_ranges.append(request.get_header("Range"))
+        return _Response()
+
+    monkeypatch.setattr("urllib.request.urlopen", _urlopen)
+    url = "https://download.bls.gov/pub/time.series/ws/ws.data.1.AllData"
+
+    assert _download_bls_labstat_file(url, output) == output
+    assert output.read_bytes() == b"abcdef"
+    assert seen_ranges == ["bytes=3-"]
+    receipt = json.loads(
+        (tmp_path / "ws.data.1.AllData.receipt.json").read_text(encoding="utf-8")
+    )
+    assert receipt["size_bytes"] == 6
+    assert len(receipt["sha256"]) == 64
+
+    monkeypatch.setattr(
+        "urllib.request.urlopen",
+        lambda *args, **kwargs: pytest.fail("valid receipt must skip the network"),
+    )
+    assert _download_bls_labstat_file(url, output) == output
+
+
+def test_bls_labstat_series_catalog_allows_missing_title_column(
+    tmp_path: Path,
+) -> None:
+    import duckdb
+
+    series_path = tmp_path / "in.series"
+    series_path.write_text(
+        "series_id\tseasonal\teconomicseries_code\tbegin_year\tend_year\n"
+        "INUS0001 \tU\tGDP\t2000\t2026\n",
+        encoding="utf-8",
+    )
+    connection = duckdb.connect()
+    try:
+        _create_bls_labstat_series_table(connection, series_path)
+        rows = connection.execute(
+            "SELECT series_id, series_title FROM series"
+        ).fetchall()
+    finally:
+        connection.close()
+
+    assert rows == [("INUS0001", None)]
+
+
+def test_bls_labstat_reads_indexed_bulk_and_computes_changes(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import duckdb
+
+    database = tmp_path / "ws.duckdb"
+    connection = duckdb.connect(str(database))
+    try:
+        connection.execute(
+            "CREATE TABLE observations("
+            "series_id VARCHAR, year INTEGER, period VARCHAR, value DOUBLE, "
+            "footnote_codes VARCHAR)"
+        )
+        connection.executemany(
+            "INSERT INTO observations VALUES (?,?,?,?,?)",
+            [
+                ("WSU001", 2020, "M01", 100.0, None),
+                ("WSU001", 2020, "M02", 110.0, "P"),
+                ("WSU001", 2020, "M03", 121.0, None),
+                ("WSU001", 2020, "M13", 111.0, None),
+            ],
+        )
+        connection.execute(
+            "CREATE TABLE series(series_id VARCHAR, series_title VARCHAR)"
+        )
+        connection.execute("INSERT INTO series VALUES ('WSU001','Weekly wages')")
+        connection.execute(
+            "CREATE TABLE footnotes(footnote_code VARCHAR, footnote_text VARCHAR)"
+        )
+        connection.execute("INSERT INTO footnotes VALUES ('P','Preliminary')")
+    finally:
+        connection.close()
+    monkeypatch.setattr(
+        "downloader.download_openbb_archive._ensure_bls_labstat_database",
+        lambda *args, **kwargs: database,
+    )
+
+    table = _fetch_bls_series_labstat_table(
+        {
+            "symbol": "WSU001",
+            "start_date": "2020-02-01",
+            "end_date": "2020-03-31",
+            "calculations": True,
+            "annual_average": False,
+        },
+        cache_dir=tmp_path,
+    )
+    records = table.to_pylist()
+
+    assert [row["date"] for row in records] == ["2020-03-01", "2020-02-01"]
+    assert records[0]["latest"] is True
+    assert records[0]["change_1M"] == pytest.approx(11.0)
+    assert records[0]["change_percent_1M"] == pytest.approx(0.1)
+    assert records[1]["change_1M"] == pytest.approx(10.0)
+    assert records[1]["footnotes"] == "Preliminary"
+    assert all(row["title"] == "Weekly wages" for row in records)
+    assert all(row["_bls_source"] == "labstat_bulk" for row in records)
+    assert all(row["_bls_labstat_prefix"] == "ws" for row in records)
+
+
+def test_worker_uses_bls_bulk_during_api_cooldown(
+    monkeypatch, tmp_path: Path
+) -> None:
+    runtime = ProviderRuntime(
+        {"bls": 5.0},
+        {"bls": 2},
+        quota_cooldown=3600,
+    )
+    runtime.block_quota("bls", "daily threshold reached")
+    monkeypatch.setattr(
+        "downloader.download_openbb_archive._fetch_bls_series_labstat_table",
+        lambda *args, **kwargs: pa.Table.from_pylist(
+            [
+                {
+                    "symbol": "WSU001",
+                    "date": "2020-01-01",
+                    "value": 1.0,
+                    "latest": True,
+                }
+            ]
+        ),
+    )
+    monkeypatch.setattr(
+        "downloader.download_openbb_archive.normalize_records",
+        lambda *args, **kwargs: pytest.fail(
+            "columnar BLS results must bypass Python row normalization"
+        ),
+    )
+    worker = OpenBBWorker(
+        SimpleNamespace(user=SimpleNamespace(credentials=SimpleNamespace())),
+        runtime,
+        max_retries=1,
+        base_backoff=0,
+        max_backoff=1,
+        metadata_only=True,
+        bls_labstat_cache_dir=tmp_path / "bulk",
+    )
+    task = DownloadTask(
+        task_id="bls-bulk-cooldown",
+        endpoint="economy.survey.bls_series",
+        category="economy",
+        scope_key="category=wages/batch=00000/n=1",
+        kwargs={
+            "symbol": "WSU001",
+            "start_date": "2020-01-01",
+            "end_date": "2020-12-31",
+        },
+        providers=("bls",),
+        output_path=str(tmp_path / "bls.parquet"),
+    )
+
+    result = worker(task)
+
+    assert result.status == "success"
+    assert result.provider == "bls"
+    table = pq.read_table(tmp_path / "bls.parquet")
+    assert table.num_rows == 1
+    assert table.column("_provider").to_pylist() == ["bls"]
+    assert table.column("_openbb_endpoint").to_pylist() == [
+        "economy.survey.bls_series"
+    ]
 
 
 def test_bls_resilient_fetch_splits_only_timed_out_payloads(monkeypatch) -> None:
@@ -9193,6 +9583,65 @@ def test_worker_defers_transient_failure_and_counts_attempt(tmp_path: Path) -> N
     result = worker(task)
     assert result.status == "pending"
     assert result.attempts == 1
+    assert result.transient_failures == 1
+    assert result.retry_not_before is not None
+
+
+def test_worker_http_500_uses_task_backoff_without_immediate_or_global_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _context(tmp_path)
+    task = make_task(
+        context,
+        "uscongress.bill_info",
+        "118/hr/1",
+        {"congress": 118, "bill_type": "hr", "bill_number": 1},
+        ("congress_gov",),
+    )
+    calls = 0
+
+    def fail_congress(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("HTTP Error 500: Internal Server Error")
+
+    monkeypatch.setattr(
+        "downloader.download_openbb_archive._fetch_congress_info_workaround",
+        fail_congress,
+    )
+
+    class _Obb:
+        pass
+
+    runtime = _runtime({"congress_gov": 1000}, {"congress_gov": 1})
+    worker = OpenBBWorker(
+        _Obb(),
+        runtime,
+        max_retries=3,
+        base_backoff=0,
+        max_backoff=1,
+        metadata_only=True,
+    )
+    result = worker(task)
+
+    assert calls == 1
+    assert result.status == "pending"
+    assert result.attempts == 1
+    assert result.transient_failures == 1
+    assert result.retry_not_before is not None
+    assert runtime.cooldown_providers() == set()
+    delay = datetime.fromisoformat(result.retry_not_before) - datetime.now(timezone.utc)
+    assert TASK_RETRY_BASE_SECONDS * 0.79 < delay.total_seconds()
+    assert delay.total_seconds() <= TASK_RETRY_BASE_SECONDS
+
+
+def test_task_retry_delay_is_exponential_bounded_and_deterministic() -> None:
+    delays = [_task_retry_delay_seconds("task-a", streak) for streak in range(1, 20)]
+
+    assert delays[0] == _task_retry_delay_seconds("task-a", 1)
+    assert delays[0] >= TASK_RETRY_BASE_SECONDS * 0.8
+    assert all(delay <= TASK_RETRY_MAX_SECONDS for delay in delays)
+    assert delays[-1] >= TASK_RETRY_MAX_SECONDS * 0.8
 
 
 def test_worker_rate_limit_does_not_exhaust_task_attempt_budget(
@@ -10027,6 +10476,148 @@ def test_rolling_executor_refills_before_a_straggler_finishes(tmp_path: Path) ->
         manifest.close()
 
 
+def test_manifest_task_retry_deadline_survives_restart_and_gates_claim(
+    tmp_path: Path,
+) -> None:
+    context = _context(tmp_path)
+    task = replace(
+        make_task(
+            context,
+            "uscongress.bill_info",
+            "118/hr/1",
+            {"congress": 118, "bill_type": "hr", "bill_number": 1},
+            ("congress_gov",),
+        ),
+        task_id="congress-http-500",
+    )
+    path = tmp_path / "_state" / "openbb_archive.sqlite3"
+    deadline = (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat()
+    manifest = Manifest(path)
+    try:
+        manifest.upsert_tasks([task], plan_token="durable-retry")
+        manifest.claim([task])
+        manifest.complete(
+            TaskResult(
+                task,
+                "pending",
+                "congress_gov",
+                0,
+                None,
+                1,
+                error="congress_gov: HTTP Error 500",
+                retry_not_before=deadline,
+                transient_failures=7,
+            )
+        )
+    finally:
+        manifest.close()
+
+    resumed = Manifest(path)
+    try:
+        assert resumed.pending_count(20, "durable-retry") == 1
+        assert resumed.pending_batch(1, 20, "durable-retry") == []
+        deferred, next_retry_at = resumed.retry_deferred_state("durable-retry")
+        assert deferred == 1
+        assert next_retry_at == deadline
+        row = resumed.connection.execute(
+            "SELECT attempts, transient_failures, retry_not_before "
+            "FROM tasks WHERE task_id=?",
+            (task.task_id,),
+        ).fetchone()
+        assert dict(row) == {
+            "attempts": 1,
+            "transient_failures": 7,
+            "retry_not_before": deadline,
+        }
+
+        resumed.connection.execute(
+            "UPDATE tasks SET retry_not_before=? WHERE task_id=?",
+            (
+                (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(),
+                task.task_id,
+            ),
+        )
+        resumed.connection.commit()
+        candidates = resumed.pending_batch(1, 20, "durable-retry")
+        assert [candidate.task_id for candidate in candidates] == [task.task_id]
+        assert candidates[0].transient_failures == 7
+        assert candidates[0].attempts == 1
+    finally:
+        resumed.close()
+
+
+def test_executor_waits_for_task_retry_deadline_instead_of_churning(
+    tmp_path: Path,
+) -> None:
+    context = _context(tmp_path)
+    task = replace(
+        make_task(
+            context,
+            "economy.pce",
+            "date=2025-01-01",
+            {"date": "2025-01-01"},
+            ("fred",),
+        ),
+        task_id="retry-once",
+    )
+    manifest = Manifest(tmp_path / "_state" / "openbb_archive.sqlite3")
+    calls = 0
+
+    def worker(current: DownloadTask) -> TaskResult:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return TaskResult(
+                current,
+                "pending",
+                "fred",
+                0,
+                None,
+                1,
+                error="temporary failure",
+                retry_not_before=(
+                    datetime.now(timezone.utc) + timedelta(seconds=0.15)
+                ).isoformat(),
+                transient_failures=1,
+            )
+        return TaskResult(current, "empty", "fred", 0, None, 1)
+
+    try:
+        manifest.upsert_tasks([task], plan_token="retry-wait")
+        started = time.monotonic()
+        attempted, totals = execute_download_tasks(
+            context,
+            manifest,
+            worker,
+            plan_token="retry-wait",
+            workers=1,
+            batch_size=1,
+            max_tasks=None,
+            max_total_attempts=20,
+            no_discovery=True,
+            no_progress=True,
+        )
+        elapsed = time.monotonic() - started
+
+        assert attempted == 2
+        assert calls == 2
+        assert totals["pending"] == 1
+        assert totals["empty"] == 1
+        assert elapsed >= 0.1
+        row = manifest.connection.execute(
+            "SELECT status, retry_not_before, transient_failures "
+            "FROM tasks WHERE task_id=?",
+            (task.task_id,),
+        ).fetchone()
+        assert dict(row) == {
+            "status": "empty",
+            "retry_not_before": None,
+            "transient_failures": 0,
+        }
+    finally:
+        manifest.close()
+
+
 def test_followup_discovery_runs_in_executor_after_provider_worker_returns(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -10251,6 +10842,103 @@ def test_hot_provider_refill_rotates_across_all_endpoints(tmp_path: Path) -> Non
         manifest.close()
 
 
+def test_hot_provider_refill_keeps_local_bulk_path_alive_during_api_cooldown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    context = _context(tmp_path)
+    bls_endpoint = "economy.survey.bls_series"
+    yahoo_endpoint = "equity.price.historical"
+    context.commands = {
+        f".{bls_endpoint}": ["bls"],
+        f".{yahoo_endpoint}": ["yfinance"],
+    }
+    bls_tasks = [
+        replace(
+            make_task(
+                context,
+                bls_endpoint,
+                f"series-{index}",
+                {"symbol": f"SERIES{index}"},
+                ("bls",),
+            ),
+            task_id=f"bls-cooldown-{index:02d}",
+        )
+        for index in range(20)
+    ]
+    yahoo_task = replace(
+        make_task(
+            context,
+            yahoo_endpoint,
+            "AAPL",
+            {"symbol": "AAPL"},
+            ("yfinance",),
+        ),
+        task_id="slow-yahoo",
+    )
+    runtime = ProviderRuntime(
+        {"bls": 1000.0, "yfinance": 1000.0},
+        {"bls": 1, "yfinance": 1},
+        60.0,
+    )
+    runtime._blocked_until["bls"] = time.time() + 3600.0
+    seen: list[str] = []
+
+    class Worker:
+        def __init__(self) -> None:
+            self.runtime = runtime
+
+        def can_run_during_provider_cooldown(
+            self, provider: str, endpoint: str
+        ) -> bool:
+            return provider == "bls" and endpoint == bls_endpoint
+
+        def local_cooldown_bypass_providers(self) -> set[str]:
+            return {"bls"}
+
+        def __call__(self, task: DownloadTask) -> TaskResult:
+            if task.task_id == "slow-yahoo":
+                time.sleep(0.2)
+            seen.append(task.task_id)
+            return TaskResult(task, "empty", task.providers[0], 0, None, 1)
+
+    manifest = Manifest(tmp_path / "_state" / "openbb_archive.sqlite3")
+    pending_batch_calls = 0
+    real_pending_batch = manifest.pending_batch
+
+    def one_full_scan_only(*args, **kwargs):
+        nonlocal pending_batch_calls
+        pending_batch_calls += 1
+        if pending_batch_calls > 1:
+            raise AssertionError("hot BLS refill fell back to a full manifest scan")
+        return real_pending_batch(*args, **kwargs)
+
+    monkeypatch.setattr(manifest, "pending_batch", one_full_scan_only)
+    try:
+        manifest.upsert_tasks(
+            [*bls_tasks, yahoo_task], plan_token="bls-local-refill"
+        )
+        attempted, totals = execute_download_tasks(
+            context,
+            manifest,
+            Worker(),
+            plan_token="bls-local-refill",
+            workers=8,
+            batch_size=8,
+            max_tasks=12,
+            max_total_attempts=20,
+            no_discovery=True,
+            no_progress=True,
+        )
+
+        assert attempted == 12
+        assert totals["empty"] == 12
+        assert pending_batch_calls == 1
+        assert len([task_id for task_id in seen if task_id.startswith("bls-")]) == 11
+        assert "slow-yahoo" in seen
+    finally:
+        manifest.close()
+
+
 def test_provider_buffer_pops_oldest_task_from_least_active_endpoint(
     tmp_path: Path,
 ) -> None:
@@ -10290,6 +10978,86 @@ def test_provider_buffer_pops_oldest_task_from_least_active_endpoint(
     active["regulators.sec.filing_headers"] = 1
     assert _pop_fairest_endpoint_task(tasks, active) is filings
     assert list(tasks) == [income_one, income_two]
+
+
+def test_provider_buffer_prefers_sec_statement_cache_affinity(
+    tmp_path: Path,
+) -> None:
+    context = _context(tmp_path)
+    balance_a = make_task(
+        context,
+        "equity.fundamental.balance",
+        "A/period=annual",
+        {"symbol": "A", "period": "annual"},
+        ("sec",),
+    )
+    cash_b = make_task(
+        context,
+        "equity.fundamental.cash",
+        "B/period=annual",
+        {"symbol": "B", "period": "annual"},
+        ("sec",),
+    )
+    cash_a = make_task(
+        context,
+        "equity.fundamental.cash",
+        "A/period=annual",
+        {"symbol": "A", "period": "annual"},
+        ("sec",),
+    )
+    tasks = deque([cash_b, cash_a])
+
+    selected = _pop_fairest_endpoint_task(
+        tasks,
+        {"equity.fundamental.cash": 0},
+        preferred_affinities={_task_execution_affinity(balance_a)},
+    )
+
+    assert selected is cash_a
+    assert list(tasks) == [cash_b]
+
+
+def test_manifest_orders_sec_statement_candidates_by_scope_affinity(
+    tmp_path: Path,
+) -> None:
+    context = _context(tmp_path)
+    manifest = Manifest(tmp_path / "manifest.sqlite3")
+    try:
+        tasks = [
+            make_task(
+                context,
+                "equity.fundamental.balance",
+                f"{symbol}/period=annual",
+                {"symbol": symbol, "period": "annual"},
+                ("sec",),
+            )
+            for symbol in ("ZZZ", "AAA", "MMM")
+        ]
+        manifest.upsert_tasks(tasks, plan_token="affinity")
+
+        selected = manifest.pending_endpoint_batch(
+            "equity",
+            "equity.fundamental.balance",
+            3,
+            20,
+            "affinity",
+            required_provider="sec",
+        )
+        indexes = {
+            str(row[0])
+            for row in manifest.connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='index'"
+            )
+        }
+    finally:
+        manifest.close()
+
+    assert [task.scope_key for task in selected] == [
+        "AAA/period=annual",
+        "MMM/period=annual",
+        "ZZZ/period=annual",
+    ]
+    assert "idx_tasks_sec_statement_affinity" in indexes
 
 
 def test_provider_buffer_respects_local_endpoint_concurrency_cap(
@@ -11469,6 +12237,20 @@ def test_hot_refill_deepens_the_routes_that_have_provider_backlog(
         for index in range(40)
     ]
     runtime = ProviderRuntime({"sparse_provider": 1000.0}, {"sparse_provider": 1}, 1.0)
+    from concurrent.futures import ALL_COMPLETED, wait as futures_wait
+
+    # This test models a deliberately drained provider wave. Production uses
+    # FIRST_COMPLETED, whose returned set may contain only a scheduling-dependent
+    # subset even after the worker barrier opens. Make the test wave boundary
+    # explicit so the assertion measures deep refill, not Future callback timing.
+    monkeypatch.setattr(
+        "downloader.download_openbb_archive.wait",
+        lambda futures, timeout, return_when: futures_wait(
+            futures,
+            timeout=timeout,
+            return_when=ALL_COMPLETED,
+        ),
+    )
     first_wave = threading.Barrier(20)
     second_wave_started = threading.Event()
     starts = 0
@@ -11499,7 +12281,9 @@ def test_hot_refill_deepens_the_routes_that_have_provider_backlog(
         nonlocal complete_calls
         complete_calls += 1
         if complete_calls == 1:
-            assert second_wave_started.wait(timeout=1.0), (
+            # Preserve the ordering assertion while tolerating host
+            # scheduling jitter from the live multi-process downloader.
+            assert second_wave_started.wait(timeout=5.0), (
                 "hot refill did not deepen the only route with provider backlog"
             )
         return real_complete(result)

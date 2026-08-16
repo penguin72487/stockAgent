@@ -115,6 +115,12 @@ def build_parser() -> argparse.ArgumentParser:
     publish.add_argument(
         "--compression-level", type=int, default=DEFAULT_COMPRESSION_LEVEL
     )
+    publish.add_argument(
+        "--exclude-subtree",
+        action="append",
+        default=[],
+        help="omit a reproducible or node-local relative subtree from the release",
+    )
     publish.add_argument("--metadata", action="append", default=[])
     publish.add_argument(
         "--max-clock-skew-seconds",
@@ -178,6 +184,7 @@ def main(argv: list[str] | None = None) -> int:
                 compression_level=args.compression_level,
                 max_clock_skew_seconds=args.max_clock_skew_seconds,
                 metadata=_metadata(args.metadata),
+                excluded_subtrees=args.exclude_subtree,
                 repo_root=REPO_ROOT,
             )
             archive = resolved.manifest["archive"]

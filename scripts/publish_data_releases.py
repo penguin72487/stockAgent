@@ -169,6 +169,9 @@ def main(argv: list[str] | None = None) -> int:
                 * 1024
                 * 1024,
                 pack_buckets=int(entry["pack_buckets"]),
+                excluded_subtrees=[
+                    str(value) for value in entry.get("excluded_subtrees", [])
+                ],
                 metadata={"role": str(entry["role"]), "catalog_schema": "1"},
                 repo_root=REPO_ROOT,
             )
@@ -198,4 +201,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
