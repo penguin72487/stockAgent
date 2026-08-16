@@ -39,25 +39,35 @@ def _progress(root: Path, names: list[str], folds: int, epochs: int) -> tuple[fl
         for name in names
         for fold in range(1, folds + 1)
     )
-    active_name, active_fold, active_epoch = "preflight", 0, 0
-    newest = 0.0
+    active_rows: list[tuple[float, str, int, int]] = []
     for name in names:
+        newest_for_name: tuple[float, str, int, int] | None = None
         for curve in (root / name).glob("train_*/epoch_curve.jsonl"):
             try:
                 modified = curve.stat().st_mtime
             except OSError:
                 continue
-            if modified <= newest:
-                continue
             row = _last_json(curve)
-            newest = modified
-            active_name = name
-            active_fold = len(curve.parent.name.removeprefix("train_").split("-"))
-            active_epoch = int(row.get("epoch", 0))
+            fold = len(curve.parent.name.removeprefix("train_").split("-"))
+            if (root / name / f"fold_{fold:02d}" / "fold_complete.json").is_file():
+                continue
+            candidate = (modified, name, fold, int(row.get("epoch", 0)))
+            if newest_for_name is None or modified > newest_for_name[0]:
+                newest_for_name = candidate
+        if newest_for_name is not None:
+            active_rows.append(newest_for_name)
     total = len(names) * folds
-    fractional = min(1.0, active_epoch / max(1, epochs)) if active_fold else 0.0
+    fractional = sum(
+        min(1.0, epoch / max(1, epochs))
+        for _, _, _, epoch in active_rows
+    )
     percent = 100.0 * min(total, complete + fractional) / max(1, total)
-    label = f"{active_name} fold {active_fold}/{folds} epoch {active_epoch}/{epochs}" if active_fold else active_name
+    active_rows.sort(reverse=True)
+    descriptions = [
+        f"{name} fold {fold}/{folds} epoch {epoch}/{epochs}"
+        for _, name, fold, epoch in active_rows[:2]
+    ]
+    label = " + ".join(descriptions) if descriptions else "preflight"
     return percent, f"folds {complete}/{total} | {label}"
 
 
@@ -66,19 +76,65 @@ def _bar(percent: float, label: str, *, width: int = 36) -> str:
     return f"[ablation] |{'█' * filled}{'░' * (width - filled)}| {percent:6.2f}% | {label}"
 
 
+def _descendant_process_ids(root_pid: int) -> list[int]:
+    try:
+        result = subprocess.run(
+            ["ps", "-e", "-o", "pid=,ppid="],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    children: dict[int, list[int]] = {}
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if len(fields) != 2:
+            continue
+        try:
+            pid, parent = (int(field) for field in fields)
+        except ValueError:
+            continue
+        children.setdefault(parent, []).append(pid)
+    descendants: list[int] = []
+    frontier = list(children.get(int(root_pid), ()))
+    while frontier:
+        pid = frontier.pop()
+        descendants.append(pid)
+        frontier.extend(children.get(pid, ()))
+    return descendants
+
+
+def _pid_is_live(pid: int) -> bool:
+    try:
+        state = Path(f"/proc/{int(pid)}/stat").read_text(encoding="utf-8").split()[2]
+    except (OSError, IndexError):
+        return False
+    return state != "Z"
+
+
 def _terminate_group(process: subprocess.Popen, grace_s: float = 10.0) -> None:
-    if process.poll() is not None:
-        return
+    known = {int(process.pid), *_descendant_process_ids(int(process.pid))}
     for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGKILL):
+        known.update(_descendant_process_ids(int(process.pid)))
+        for pid in sorted(known, reverse=True):
+            if not _pid_is_live(pid):
+                continue
+            try:
+                os.kill(pid, sig)
+            except ProcessLookupError:
+                pass
         try:
             os.killpg(process.pid, sig)
         except ProcessLookupError:
-            return
-        try:
-            process.wait(timeout=grace_s if sig != signal.SIGKILL else 2.0)
-            return
-        except subprocess.TimeoutExpired:
-            continue
+            pass
+        deadline = time.monotonic() + (grace_s if sig != signal.SIGKILL else 2.0)
+        while time.monotonic() < deadline:
+            if not any(_pid_is_live(pid) for pid in known):
+                process.poll()
+                return
+            time.sleep(0.1)
+    process.poll()
 
 
 def _run_checked(command: list[str], *, log=None) -> None:
@@ -93,6 +149,17 @@ def main() -> None:
     parser.add_argument("--output-root", type=Path, default=None)
     parser.add_argument("--poll-seconds", type=float, default=2.0)
     parser.add_argument("--multi-gpu-strategy", default="distributed_data_parallel")
+    parser.add_argument(
+        "--parallel-jobs",
+        type=int,
+        default=2,
+        help=(
+            "Requested independent experiment concurrency. All-visible-GPU "
+            "DDP is automatically capped at one job to prevent oversubscription."
+        ),
+    )
+    parser.add_argument("--max-no-progress-retries", type=int, default=3)
+    parser.add_argument("--retry-backoff-seconds", type=float, default=5.0)
     args = parser.parse_args()
 
     spec_path = args.spec.resolve()
@@ -104,7 +171,8 @@ def main() -> None:
     # Generate and validate effective configs without training.
     dry_run = [sys.executable, str(REPO_ROOT / "scripts/run_ablation_experiments.py"),
                "--spec", str(spec_path), "--output-root", str(root), "--dry-run",
-               "--multi-gpu-strategy", args.multi_gpu_strategy]
+               "--multi-gpu-strategy", args.multi_gpu_strategy,
+               "--parallel-jobs", str(args.parallel_jobs)]
     _run_checked(dry_run)
     # Derive the run set from the current spec, not from every historical file
     # left under generated_configs. This keeps removed/renamed experiments out
@@ -131,7 +199,11 @@ def main() -> None:
 
     command = [sys.executable, str(REPO_ROOT / "scripts/run_ablation_experiments.py"),
                "--spec", str(spec_path), "--output-root", str(root),
-               "--multi-gpu-strategy", args.multi_gpu_strategy, "--stop-on-fail"]
+               "--multi-gpu-strategy", args.multi_gpu_strategy,
+               "--parallel-jobs", str(args.parallel_jobs), "--auto-resume",
+               "--max-no-progress-retries", str(args.max_no_progress_retries),
+               "--retry-backoff-seconds", str(args.retry_backoff_seconds),
+               "--stop-on-fail"]
     log_path = root / "ablation_run.log"
     started = time.monotonic()
     with log_path.open("a", encoding="utf-8", buffering=1) as log:
@@ -146,7 +218,11 @@ def main() -> None:
                 print("\r" + _bar(percent, f"{label} | {eta_text}"), end="", flush=True)
                 time.sleep(max(.5, args.poll_seconds))
         except KeyboardInterrupt:
-            print("\n[ablation] interrupt received; stopping the entire DDP process group...", flush=True)
+            print(
+                "\n[ablation] interrupt received; stopping the entire DDP "
+                "descendant tree...",
+                flush=True,
+            )
             _terminate_group(process)
             raise SystemExit(130)
         returncode = process.wait()

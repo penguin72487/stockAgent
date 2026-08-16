@@ -95,7 +95,7 @@ def test_build_and_load_strict_oof_daily_guidance(tmp_path: Path) -> None:
     )
 
     assert manifest["contract"] == MINUTE_DAILY_GUIDANCE_CONTRACT
-    assert [row["fold_id"] for row in manifest["year_owners"]] == [1, 2]
+    assert [row["fold_id"] for row in manifest["owner_segments"]] == [1, 2]
     np.testing.assert_allclose(
         guidance.weights,
         [[0.60, -0.40], [-0.20, 0.80]],
@@ -140,7 +140,7 @@ def test_daily_guidance_loader_rejects_noncausal_year_owner(
     )
     sidecar = minute_daily_guidance_manifest_path(output)
     manifest = json.loads(sidecar.read_text(encoding="utf-8"))
-    manifest["year_owners"][0]["val_years"] = [2020]
+    manifest["owner_segments"][0]["val_years"] = [2020]
     sidecar.write_text(json.dumps(manifest), encoding="utf-8")
 
     with pytest.raises(RuntimeError, match="not strict walk-forward OOF"):
@@ -149,3 +149,72 @@ def test_daily_guidance_loader_rejects_noncausal_year_owner(
             minute_symbols=("0050", "2330"),
             minute_dates=np.asarray(["2020-01-02"], dtype="datetime64[D]"),
         )
+
+
+def test_guidance_uses_older_causal_fold_for_latest_fold_warmup_gap(
+    tmp_path: Path,
+) -> None:
+    daily_root = tmp_path / "daily"
+    daily_root.mkdir()
+    (daily_root / "summary.json").write_text(
+        json.dumps(
+            [
+                {
+                    "fold_id": 1,
+                    "train_years": [2017],
+                    "val_years": [2018],
+                    "test_years": [2019, 2020],
+                },
+                {
+                    "fold_id": 2,
+                    "train_years": [2017, 2018],
+                    "val_years": [2019],
+                    "test_years": [2020],
+                },
+            ]
+        ),
+        encoding="utf-8",
+    )
+    _write_daily_fold(
+        daily_root,
+        fold_id=1,
+        dates=["2020-01-02", "2020-02-03"],
+        requested_weights=np.asarray([[0.60, -0.40], [0.50, -0.50]]),
+    )
+    # The more recent fold has the ordinary split-local lookback gap and only
+    # becomes executable after its first 32 target rows.
+    _write_daily_fold(
+        daily_root,
+        fold_id=2,
+        dates=["2020-02-03"],
+        requested_weights=np.asarray([[-0.20, 0.80]]),
+    )
+    minute_manifest = tmp_path / "minute_manifest.json"
+    minute_manifest.write_text(
+        json.dumps(
+            {
+                "symbols": ["0050", "2330"],
+                "dates": ["2020-01-02", "2020-02-03"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    output = tmp_path / "oof_requested_weights.parquet"
+
+    manifest = build_guidance(
+        daily_output_dirs=(daily_root,),
+        minute_manifest_path=minute_manifest,
+        output_path=output,
+    )
+    guidance = _load_minute_daily_guidance(
+        output,
+        minute_symbols=("0050", "2330"),
+        minute_dates=np.asarray(["2020-01-02", "2020-02-03"], dtype="datetime64[D]"),
+    )
+
+    assert [row["fold_id"] for row in manifest["owner_segments"]] == [1, 2]
+    assert manifest["zero_filled_missing_date_count"] == 0
+    np.testing.assert_allclose(
+        guidance.weights,
+        [[0.60, -0.40], [-0.20, 0.80]],
+    )

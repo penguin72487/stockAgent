@@ -1,5 +1,5 @@
-# Canonical train.py experiment: completed stock cross-section -> one signed
-# TAIEX exposure -> exact same-day TX/MTX/TMF basket.
+# Canonical train.py experiment: completed stock cross-section plus completed
+# TX/MTX/TMF E1..E6 context -> 18 direct same-day futures actions.
 #
 # Causal clock:
 # - At the futures day-session open on date t, features end at stock session t-1.
@@ -8,14 +8,14 @@
 #   there is no night-session or overnight position.
 base_config: tw_public_lanten_market_candles.yaml
 
-experiment_name: tw-stock-cross-section-index-futures-day-100m-rolling-v2-exact-v4
+experiment_name: tw-stock-futures-joint-index-futures-day-100m-all-tenors-v7
 
 runner:
   # Preserve checkpoints produced by the retired standalone trainer. They do
   # not have the canonical train.py manifest and cannot safely resume.
-  # Exact integer execution contract v4 taxes only the sale leg. Keep older
-  # checkpoints as inference-only evidence.
-  output_dir: artifacts/markets/tw_index_futures_day_canonical_100m_rolling_v2_exact_v4
+  # The 18-action checkpoint/output contract is incompatible with the retired
+  # scalar front-month head, so it owns a fresh artifact root.
+  output_dir: artifacts/markets/tw_index_futures_day_joint_18_100m_exact_v7
   mode: train
   resume: true
   post_train_infer: true
@@ -39,13 +39,16 @@ trading:
   min_trade_weight: 0.0
   portfolio_activation: pre_normalized
 
-  # Differentiable proxy: 0.45 bps fixed-cost approximation plus the statutory
-  # 0.20 bps transaction tax per side. Exact evaluation below recomputes
-  # integer counts and TWD costs for every product/day.
-  buy_fee_rate: 0.000065
-  sell_fee_rate: 0.000065
+  # Fees are already embedded per concrete contract in the [T,18,3] executor
+  # tensor. Keep generic stock-rate fields at zero to prevent double charging.
+  buy_fee_rate: 0.0
+  sell_fee_rate: 0.0
 
   tw_index_futures_data_path: data_tw_index_futures/day_session_contracts.parquet
+  # Every general-session futures root with a valid outright daily row enters
+  # as a prior-session front-contract context token. The final 18 context slots
+  # are the separately verified TX/MTX/TMF E1..E6 executable actions.
+  tw_index_futures_all_products_context_path: data_tw_index_futures/all_products_day_session_front.parquet
   tw_index_futures_reference_product: TX
   # The executable ledger is intentionally capitalized at TWD 100m so the
   # smallest TMF contract is about 0.3%-0.5% rather than a 29%-49% position.
@@ -71,9 +74,8 @@ training:
   postprocess_benchmark_after_fold: false
   postprocess_benchmark_after_best_val: false
 
-  # Keep the inherited Transformer explicitly pinned to the requested
-  # last/last_only behavior. The dedicated head pools the current stock
-  # cross-section into one bounded futures exposure.
+  # Stock lookback tokens and prior-session futures tokens are mixed by the
+  # dedicated joint cross-sectional Transformer before the 18 action heads.
   transformer_base_portfolio:
     temporal_pooling: last
     temporal_query_mode: last_only

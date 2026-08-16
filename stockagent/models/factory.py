@@ -372,7 +372,20 @@ def build_model(
             {
                 "max_abs_exposure": (
                     config.trading.tw_index_futures_max_abs_exposure
-                )
+                ),
+                "futures_action_mode": tbp_cfg.futures_action_mode,
+                "futures_exposure_activation": (
+                    tbp_cfg.futures_exposure_activation
+                ),
+                "futures_allocation_logit_scale": (
+                    tbp_cfg.futures_allocation_logit_scale
+                ),
+                "futures_allocation_temperature": (
+                    tbp_cfg.futures_allocation_temperature
+                ),
+                "futures_require_joint_context": (
+                    tbp_cfg.futures_require_joint_context
+                ),
             }
             if model_name in _CROSS_SECTIONAL_INDEX_FUTURES_NAMES
             else {}

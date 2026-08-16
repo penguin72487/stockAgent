@@ -1106,6 +1106,8 @@ def main() -> None:
         validate_walk_forward_year_contract,
     )
     from stockagent.training.trainer import (
+        _checkpoint_manifest,
+        _finalize_isolated_training_lifecycle,
         _load_checkpoint,
         _load_completed_fold_result,
         _refresh_walkforward_artifacts,
@@ -1312,11 +1314,53 @@ def main() -> None:
         return
 
     panel = _build_panel_rank_coordinated(build_panel, config, active_strategy)
+    if (
+        str(config.trading.execution_mode) == "tw_day_trade"
+        and config.data.day_trade_minute_execution_root is not None
+    ):
+        from stockagent.data.tw_day_trade_execution import (
+            load_tw_day_trade_execution_tape,
+        )
+
+        if panel.open_prices is None:
+            raise RuntimeError(
+                "daily minute-execution loss requires official panel open prices"
+            )
+        def _load_execution_tape():
+            return load_tw_day_trade_execution_tape(
+                config.data.day_trade_minute_execution_root,
+                panel_dates=panel.dates,
+                panel_symbols=panel.symbols,
+                official_open_prices=panel.open_prices,
+                cache_dir=config.data.day_trade_minute_execution_cache_dir,
+            )
+
+        if _distributed_ready() and _distributed_world_size() > 1:
+            tape_error = None
+            if _distributed_rank() == 0:
+                try:
+                    panel.day_trade_minute_execution = _load_execution_tape()
+                except Exception as exc:
+                    tape_error = exc
+            _raise_if_distributed_phase_failed(
+                "rank0_day_trade_execution_tape", tape_error
+            )
+            if _distributed_rank() != 0:
+                try:
+                    panel.day_trade_minute_execution = _load_execution_tape()
+                except Exception as exc:
+                    tape_error = exc
+            _raise_if_distributed_phase_failed(
+                "worker_day_trade_execution_tape", tape_error
+            )
+        else:
+            panel.day_trade_minute_execution = _load_execution_tape()
     if str(config.trading.execution_mode) in {
         "tw_index_futures_day",
         "tw_index_derivatives_day",
     }:
         from stockagent.data.tw_index_futures import (
+            build_causal_taifex_futures_model_context,
             load_taifex_index_futures_day_session,
         )
 
@@ -1327,6 +1371,91 @@ def main() -> None:
         panel.index_futures_reference_product = (
             config.trading.tw_index_futures_reference_product
         )
+        if str(config.trading.execution_mode) == "tw_index_futures_day":
+            from stockagent.backtest.tw_index_futures import (
+                FuturesCostSchedule,
+                build_tw_index_futures_day_execution_tensor,
+            )
+            from stockagent.data.tw_all_futures import (
+                load_taifex_all_futures_afterhours_context,
+                load_taifex_all_futures_front_context,
+            )
+
+            total_fees = tuple(
+                float(value)
+                for value in config.trading.tw_index_futures_total_fee_per_side_twd
+            )
+            exchange_fees = tuple(
+                float(value)
+                for value in config.trading.tw_index_futures_exchange_and_clearing_fee_per_side_twd
+            )
+            schedule = FuturesCostSchedule(
+                tax_rate=float(
+                    config.trading.tw_index_futures_sell_transaction_tax_rate
+                ),
+                exchange_and_clearing_fee_per_side_twd=exchange_fees,
+                broker_fee_per_side_twd=tuple(
+                    total - exchange
+                    for total, exchange in zip(
+                        total_fees, exchange_fees, strict=True
+                    )
+                ),
+                slippage_points_per_side=tuple(
+                    float(value)
+                    for value in config.trading.tw_index_futures_slippage_points_per_side
+                ),
+                basket_fee_penalty=float(
+                    config.trading.tw_index_futures_basket_fee_penalty
+                ),
+            )
+            all_features, all_mask, all_symbols = (
+                load_taifex_all_futures_front_context(
+                    config.trading.tw_index_futures_all_products_context_path,
+                    panel_dates=panel.dates,
+                )
+            )
+            context_feature_blocks = [all_features]
+            context_mask_blocks = [all_mask]
+            afterhours_context_path = (
+                config.trading.tw_index_futures_all_products_afterhours_context_path
+            )
+            context_symbols = (
+                [f"DAY:{symbol}" for symbol in all_symbols]
+                if afterhours_context_path is not None
+                else list(all_symbols)
+            )
+            if afterhours_context_path is not None:
+                night_features, night_mask, night_symbols = (
+                    load_taifex_all_futures_afterhours_context(
+                        afterhours_context_path,
+                        panel_dates=panel.dates,
+                    )
+                )
+                context_feature_blocks.append(night_features)
+                context_mask_blocks.append(night_mask)
+                context_symbols.extend(
+                    f"NIGHT:{symbol}" for symbol in night_symbols
+                )
+            index_features, index_mask = build_causal_taifex_futures_model_context(
+                panel.index_futures_day_session
+            )
+            context_feature_blocks.append(index_features)
+            context_mask_blocks.append(index_mask)
+            panel.index_futures_candidate_features = np.concatenate(
+                context_feature_blocks, axis=1
+            )
+            panel.index_futures_candidate_mask = np.concatenate(
+                context_mask_blocks, axis=1
+            )
+            panel.index_futures_context_symbols = tuple(context_symbols) + tuple(
+                panel.index_futures_day_session.tenor_action_symbols()
+            )
+            panel.index_futures_execution_returns = (
+                build_tw_index_futures_day_execution_tensor(
+                    panel.index_futures_day_session,
+                    cost_schedule=schedule,
+                )
+            )
         if str(config.trading.execution_mode) == "tw_index_derivatives_day":
             from stockagent.data.tw_index_options_daily import (
                 combine_taifex_option_chains,
@@ -1436,6 +1565,22 @@ def main() -> None:
             f"{panel.num_dates}, rolls={int(benchmark_rolls.sum())}",
             flush=True,
         )
+        if str(config.trading.execution_mode) == "tw_index_futures_day":
+            causal_mask = np.asarray(
+                panel.index_futures_candidate_mask, dtype=bool
+            )
+            execution_rows = np.isfinite(
+                np.asarray(panel.index_futures_execution_returns)[..., 0]
+            )
+            print(
+                "[runner] attached joint stock+futures model context: "
+                f"all_root_inputs={len(panel.index_futures_context_symbols) - 18}, "
+                f"total_futures_tokens={len(panel.index_futures_context_symbols)}, "
+                "executable_actions=TX/MTX/TMF x E1..E6=18, "
+                f"max_causal_tokens={int(causal_mask.sum(axis=1).max())}, "
+                f"max_executable_contracts={int(execution_rows.sum(axis=1).max())}",
+                flush=True,
+            )
         if str(config.trading.execution_mode) == "tw_index_derivatives_day":
             candidates = panel.index_derivatives_day_candidates
             option_visible = np.asarray(candidates.option_candidate_mask, dtype=bool)
@@ -1547,7 +1692,34 @@ def main() -> None:
             "use the same train.py/run_training path in a fresh CUDA process",
             flush=True,
         )
-        _run_isolated_train_fold_processes(folds, argv=sys.argv[1:])
+        experiment_manifest = _checkpoint_manifest(panel, config)
+        completed_before_launch: dict[int, object] = {}
+        if (
+            resume
+            and os.environ.get("STOCKAGENT_RETRAIN_COMPLETED_FOLDS", "0") != "1"
+        ):
+            for fold in folds:
+                completed = _load_completed_fold_result(
+                    Path(output_dir),
+                    int(fold.fold_id),
+                    expected_manifest=experiment_manifest,
+                    expected_fold=fold,
+                )
+                if completed is not None:
+                    completed_before_launch[int(fold.fold_id)] = completed
+        pending_folds = [
+            fold
+            for fold in folds
+            if int(fold.fold_id) not in completed_before_launch
+        ]
+        if completed_before_launch:
+            print(
+                "[runner] isolated resume preflight: skipping "
+                f"{len(completed_before_launch)} contract-compatible completed "
+                f"fold(s); launching {len(pending_folds)} pending fold(s)",
+                flush=True,
+            )
+        _run_isolated_train_fold_processes(pending_folds, argv=sys.argv[1:])
         if post_train_infer:
             _run_isolated_post_train_inference(argv=sys.argv[1:])
         results = []
@@ -1555,6 +1727,8 @@ def main() -> None:
             completed = _load_completed_fold_result(
                 Path(output_dir),
                 int(fold.fold_id),
+                expected_manifest=experiment_manifest,
+                expected_fold=fold,
             )
             if completed is None:
                 raise RuntimeError(
@@ -1573,6 +1747,13 @@ def main() -> None:
             results,
             panel=panel,
             config=config,
+        )
+        _finalize_isolated_training_lifecycle(
+            panel,
+            folds,
+            config,
+            Path(output_dir),
+            results,
         )
     else:
         results = run_training(

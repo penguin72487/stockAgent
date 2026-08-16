@@ -73,9 +73,18 @@ from stockagent.backtest.tw_execution import (
 )
 from stockagent.backtest.tw_index_futures import (
     FuturesCostSchedule,
+    get_tw_index_futures_compile_stats,
 )
 from stockagent.backtest.tw_index_derivatives_day import OptionDayCostSchedule
 from stockagent.backtest.tw_continuous import get_tw_continuous_compile_stats
+from stockagent.backtest.tw_day_trade_daily import (
+    compiled_block_rows as tw_day_trade_daily_compiled_block_rows,
+    get_tw_day_trade_daily_compile_stats,
+)
+from stockagent.backtest.tw_day_trade_minute import (
+    COMPILED_BLOCK_ROWS as TW_DAY_TRADE_MINUTE_COMPILED_BLOCK_ROWS,
+    get_tw_day_trade_minute_compile_stats,
+)
 from stockagent.backtest.tw_dual_session_compiled import (
     COMPILED_BLOCK_ROWS as TW_DUAL_SESSION_COMPILED_BLOCK_ROWS,
     get_tw_dual_session_compile_stats,
@@ -86,6 +95,9 @@ from stockagent.backtest.tw_integer_execution import (
 from stockagent.config import ExperimentConfig
 from stockagent.data.panel import PanelData
 from stockagent.data.tw_index_futures import (
+    TAIFEX_INDEX_FUTURES_ACTION_COUNT,
+    TAIFEX_INDEX_FUTURES_PRODUCTS,
+    TAIFEX_INDEX_FUTURES_TENOR_SLOTS,
     TaiwanIndexFuturesDaySession,
     load_taifex_index_futures_day_session,
 )
@@ -600,6 +612,12 @@ class _ExecutionRuntime:
     sell_fee_rates: torch.Tensor | None
     lot_sizes: np.ndarray | None
     settlement_lag_sessions: int
+    normal_sell_fee_rates: torch.Tensor | None = None
+    day_trade_unlimited_margin_conversion: bool = False
+    day_trade_margin_financing_ratio: float = 0.60
+    day_trade_margin_financing_annual_rate: float = 0.16
+    day_trade_margin_short_handling_fee_rate: float = 0.001
+    day_trade_margin_short_annual_borrow_rate: float = 0.20
     commission_rebate_rates: torch.Tensor | None = None
     commission_rebate_timing: str = "daily_close"
     minimum_commission: float = 0.0
@@ -832,6 +850,11 @@ def _build_execution_runtime(
         mode,
         fee_schedule=schedule,
     )
+    _, normal_sell_rates = gross_fee_rate_vectors(
+        panel.symbols,
+        "tw_cash",
+        fee_schedule=schedule,
+    )
     rebate_rates = commission_rebate_rate_vector(
         panel.symbols,
         mode,
@@ -855,6 +878,26 @@ def _build_execution_runtime(
             sell_rates,
             device=device,
             dtype=torch.float32,
+        ),
+        normal_sell_fee_rates=torch.as_tensor(
+            normal_sell_rates,
+            device=device,
+            dtype=torch.float32,
+        ),
+        day_trade_unlimited_margin_conversion=bool(
+            config.trading.tw_day_trade_unlimited_margin_conversion
+        ),
+        day_trade_margin_financing_ratio=float(
+            config.trading.tw_day_trade_margin_financing_ratio
+        ),
+        day_trade_margin_financing_annual_rate=float(
+            config.trading.tw_day_trade_margin_financing_annual_rate
+        ),
+        day_trade_margin_short_handling_fee_rate=float(
+            config.trading.tw_day_trade_margin_short_handling_fee_rate
+        ),
+        day_trade_margin_short_annual_borrow_rate=float(
+            config.trading.tw_day_trade_margin_short_annual_borrow_rate
         ),
         commission_rebate_rates=torch.as_tensor(
             rebate_rates,
@@ -1055,13 +1098,22 @@ def _integer_audit_requested_weights(
         )
     requested_array = np.asarray(requested)
     realised_shape = tuple(np.asarray(result.weights_history).shape)
-    if runtime.mode == "tw_index_derivatives_day":
+    if runtime.mode in {"tw_index_futures_day", "tw_index_derivatives_day"}:
         if requested_array.ndim != 2 or int(requested_array.shape[0]) != int(
             realised_shape[0]
         ):
             raise RuntimeError(
-                "tw_index_derivatives_day integer audit requires direct "
-                f"[T,D_derivatives] actions, got {requested_array.shape}"
+                f"{runtime.mode} integer audit requires direct actions, got "
+                f"{requested_array.shape}"
+            )
+        expected_width = (
+            TAIFEX_INDEX_FUTURES_ACTION_COUNT
+            if runtime.mode == "tw_index_futures_day"
+            else TAIFEX_INDEX_DERIVATIVE_ACTION_COUNT_V4
+        )
+        if int(requested_array.shape[1]) != expected_width:
+            raise RuntimeError(
+                f"{runtime.mode} direct action width must be {expected_width}"
             )
         return requested_array
     if (
@@ -1090,6 +1142,38 @@ def _integer_audit_requested_weights(
             "tw_overnight integer audit requires [T,3,S] model actions"
         )
     return requested_array
+
+
+def _canonical_tensor_day_trade_enabled(
+    config: ExperimentConfig,
+    runtime: _ExecutionRuntime,
+) -> bool:
+    """Whether the tensor day-trade forward is the experiment's primary result."""
+
+    return bool(
+        runtime.mode == "tw_day_trade"
+        and (
+            config.data.day_trade_minute_execution_root is not None
+            or runtime.day_trade_unlimited_margin_conversion
+        )
+    )
+
+
+def _tensor_day_trade_is_whole_lot_exact(
+    config: ExperimentConfig,
+    runtime: _ExecutionRuntime,
+) -> bool:
+    """Whether a tensor result may stand in for the separate integer audit.
+
+    The minute event executor rounds its forward to exact board lots.  The
+    daily open-to-close T+3 executor deliberately permits fractional weights,
+    so reusing it under an ``integer_share`` filename is a semantic error.
+    """
+
+    return bool(
+        runtime.mode == "tw_day_trade"
+        and config.data.day_trade_minute_execution_root is not None
+    )
 
 
 def _active_panel_execution_rows(
@@ -1337,6 +1421,9 @@ class TimingBreakdown:
     backward_s: float = 0.0
     grad_s: float = 0.0
     grad_cuda_s: float = 0.0
+    gradient_norm_before_clip_sum: float = 0.0
+    gradient_norm_zero_batches: int = 0
+    gradient_norm_observations: int = 0
     clip_s: float = 0.0
     clip_cuda_s: float = 0.0
     finite_check_s: float = 0.0
@@ -1416,7 +1503,18 @@ def _broadcast_epoch_eval_timing(
     values = payload.detach().cpu().tolist()
     resolved = TimingBreakdown()
     for name, raw in zip(names, values[:-2], strict=True):
-        setattr(resolved, name, int(raw) if name == "batches" else float(raw))
+        setattr(
+            resolved,
+            name,
+            int(raw)
+            if name
+            in {
+                "batches",
+                "gradient_norm_zero_batches",
+                "gradient_norm_observations",
+            }
+            else float(raw),
+        )
     return resolved, float(values[-2]), float(values[-1])
 
 
@@ -1483,6 +1581,15 @@ def _log_timing(label: str, timing: TimingBreakdown) -> None:
         value = getattr(timing, name)
         if value > 0:
             parts.append(f"{name[:-2]}={value:.3f}s")
+    if timing.gradient_norm_observations > 0:
+        parts.append(
+            "grad_norm_before_clip="
+            f"{timing.gradient_norm_before_clip_sum / timing.gradient_norm_observations:.6g}"
+        )
+        parts.append(
+            "zero_grad_batches="
+            f"{timing.gradient_norm_zero_batches}/{timing.gradient_norm_observations}"
+        )
     print(" ".join(parts))
 
 
@@ -1519,6 +1626,9 @@ def _add_timing(dst: TimingBreakdown, src: TimingBreakdown) -> None:
         "backward_s",
         "grad_s",
         "grad_cuda_s",
+        "gradient_norm_before_clip_sum",
+        "gradient_norm_zero_batches",
+        "gradient_norm_observations",
         "clip_s",
         "clip_cuda_s",
         "finite_check_s",
@@ -1812,6 +1922,12 @@ def _mark_compiled_loss_dynamic_symbol_axis(
 
 def _strict_no_fallback_enabled() -> bool:
     return _env_truthy("STOCKAGENT_STRICT_NO_FALLBACK", "0")
+
+
+def _isolated_fold_child_enabled() -> bool:
+    """Whether the fresh-fold child must defer global artifacts to its parent."""
+
+    return _env_truthy("STOCKAGENT_FOLD_ISOLATION_CHILD", "0")
 
 
 def _progress(message: str) -> None:
@@ -2189,6 +2305,36 @@ def _evaluated_backtest_loss(
         ),
         sell_fee_rates=(
             None if execution_runtime is None else execution_runtime.sell_fee_rates
+        ),
+        normal_sell_fee_rates=(
+            None
+            if execution_runtime is None
+            else execution_runtime.normal_sell_fee_rates
+        ),
+        day_trade_unlimited_margin_conversion=(
+            False
+            if execution_runtime is None
+            else execution_runtime.day_trade_unlimited_margin_conversion
+        ),
+        day_trade_margin_financing_ratio=(
+            0.60
+            if execution_runtime is None
+            else execution_runtime.day_trade_margin_financing_ratio
+        ),
+        day_trade_margin_financing_annual_rate=(
+            0.16
+            if execution_runtime is None
+            else execution_runtime.day_trade_margin_financing_annual_rate
+        ),
+        day_trade_margin_short_handling_fee_rate=(
+            0.001
+            if execution_runtime is None
+            else execution_runtime.day_trade_margin_short_handling_fee_rate
+        ),
+        day_trade_margin_short_annual_borrow_rate=(
+            0.20
+            if execution_runtime is None
+            else execution_runtime.day_trade_margin_short_annual_borrow_rate
         ),
         commission_rebate_rates=(
             None
@@ -3495,6 +3641,16 @@ def _timing_curve_payload(
         calls = max(1.0, float(train_backtest_runtime_stats.get("calls", 0.0)))
         return float(train_backtest_runtime_stats.get(key, 0.0)) * 1000.0 / calls
 
+    gradient_norm_observations = max(
+        0, int(train_timing.gradient_norm_observations)
+    )
+    gradient_norm_mean = (
+        float(train_timing.gradient_norm_before_clip_sum)
+        / float(gradient_norm_observations)
+        if gradient_norm_observations > 0
+        else 0.0
+    )
+
     def _loss_avg_ms(key: str) -> float:
         return float(loss_runtime_stats.get(key, 0.0)) * 1000.0 / float(batches)
 
@@ -3612,6 +3768,15 @@ def _timing_curve_payload(
         "train_backward_autograd_cuda_ms_per_batch": _avg_ms(train_timing.grad_cuda_s),
         "train_grad_ms_per_batch": _avg_ms(train_timing.grad_s),
         "train_grad_cuda_ms_per_batch": _avg_ms(train_timing.grad_cuda_s),
+        # These are actual pre-clip L2 gradient norms, not timing fields.  The
+        # measured flag prevents an unavailable norm from being mistaken for
+        # a genuine all-zero gradient epoch when clipping is disabled.
+        "train_grad_norm_measured": int(gradient_norm_observations > 0),
+        "train_grad_norm_before_clip_mean": gradient_norm_mean,
+        "train_zero_grad_batches": int(
+            train_timing.gradient_norm_zero_batches
+        ),
+        "train_grad_norm_observations": gradient_norm_observations,
         "train_clip_ms_per_batch": _avg_ms(train_timing.clip_s),
         "train_clip_cuda_ms_per_batch": _avg_ms(train_timing.clip_cuda_s),
         "train_finite_check_ms_per_batch": _avg_ms(train_timing.finite_check_s),
@@ -4000,6 +4165,28 @@ def _run_gradient_clip_(
     _maybe_sync_cuda(device, profile_timing)
     timing.clip_s += time.perf_counter() - clip_start
     return gradient_total_norm
+
+
+def _accumulate_gradient_norm_diagnostic_(
+    gradient_total_norm: torch.Tensor | None,
+    *,
+    norm_sum: torch.Tensor,
+    zero_count: torch.Tensor,
+    observation_count: torch.Tensor,
+) -> None:
+    """Accumulate pre-clip norm diagnostics without a per-batch GPU sync."""
+
+    if gradient_total_norm is None:
+        return
+    finite_norm = torch.nan_to_num(
+        gradient_total_norm.detach().float(),
+        nan=0.0,
+        posinf=torch.finfo(torch.float32).max,
+        neginf=0.0,
+    )
+    norm_sum.add_(finite_norm)
+    zero_count.add_((finite_norm == 0.0).to(dtype=zero_count.dtype))
+    observation_count.add_(1.0)
 
 
 def _panel_forward_module(model: nn.Module) -> nn.Module | None:
@@ -5204,14 +5391,19 @@ def _save_backtest_artifact(
     requested_weights_history = result.requested_weights_history
     if requested_weights_history is not None:
         requested_array = np.asarray(requested_weights_history)
-        if mode == "tw_index_derivatives_day":
+        if mode in {"tw_index_futures_day", "tw_index_derivatives_day"}:
+            expected_width = (
+                TAIFEX_INDEX_FUTURES_ACTION_COUNT
+                if mode == "tw_index_futures_day"
+                else TAIFEX_INDEX_DERIVATIVE_ACTION_COUNT_V4
+            )
             if requested_array.shape != (
                 rows,
-                TAIFEX_INDEX_DERIVATIVE_ACTION_COUNT_V4,
+                expected_width,
             ):
                 raise ValueError(
-                    "tw_index_derivatives_day requested_weights_history must "
-                    "have direct shape [rows,D_derivatives]"
+                    f"{mode} requested_weights_history must have direct shape "
+                    f"[rows,{expected_width}]"
                 )
         elif (
             requested_array.ndim not in {2, 3}
@@ -5532,15 +5724,20 @@ def _save_backtest_artifact(
             f"{mode} backtest artifact requires settlement_ledger_unit="
             "'currency' or 'nav_ratio'"
         )
-    if ledger_unit == "nav_ratio":
+    has_equity_scale_contract = (
+        ledger_unit == "nav_ratio" or mode == "tw_index_futures_day"
+    )
+    if has_equity_scale_contract:
         if result.equity_scale_history is None:
             raise ValueError(
-                f"{mode} normalized settlement artifact requires equity_scale_history"
+                f"{mode} equity-scaled artifact requires equity_scale_history"
             )
-        if terminal_field_count == len(terminal_fields) and result.final_equity_scale is None:
+        if (
+            mode == "tw_index_futures_day"
+            or terminal_field_count == len(terminal_fields)
+        ) and result.final_equity_scale is None:
             raise ValueError(
-                f"{mode} normalized settlement artifact with terminal state "
-                "requires final_equity_scale"
+                f"{mode} equity-scaled artifact requires final_equity_scale"
             )
     elif result.equity_scale_history is not None or result.final_equity_scale is not None:
         raise ValueError(
@@ -6382,6 +6579,13 @@ def _save_fold_output_artifacts(
     requested_mode = normalize_execution_mode(
         getattr(trading_config, "execution_mode", "naive")
     )
+    canonical_tensor_day_trade = bool(
+        requested_mode == "tw_day_trade"
+        and (
+            config.data.day_trade_minute_execution_root is not None
+            or config.trading.tw_day_trade_unlimited_margin_conversion
+        )
+    )
     if requested_mode in {
         *TW_MINUTE_EXECUTION_MODES,
         *TW_DERIVATIVES_TICK_EXECUTION_MODES,
@@ -6395,6 +6599,31 @@ def _save_fold_output_artifacts(
             raise RuntimeError(
                 "specialized intraday artifacts come from their native event "
                 "ledger and must not attach a daily integer-share oracle"
+            )
+    elif canonical_tensor_day_trade:
+        if test_integer_backtest is None:
+            raise RuntimeError(
+                "canonical tensor tw_day_trade artifacts require their "
+                "no-proxy "
+                "tensor-forward result as the canonical integer audit"
+            )
+        if (
+            normalize_execution_mode(test_backtest.execution_mode)
+            != requested_mode
+            or normalize_execution_mode(test_integer_backtest.execution_mode)
+            != requested_mode
+        ):
+            raise RuntimeError(
+                "canonical tensor artifact mode differs from configuration"
+            )
+        test_backtest = test_integer_backtest
+        fold_result.test_metrics = compute_metrics(test_backtest)
+        fold_result.test_integer_metrics = dict(fold_result.test_metrics)
+        fold_result.test_continuous_surrogate_metrics = None
+        if deployment_dates is not None:
+            deployment_backtest = _prefix_backtest_result(
+                test_backtest,
+                int(np.asarray(deployment_dates).size),
             )
     elif requested_mode != "naive":
         if test_integer_backtest is None:
@@ -6494,11 +6723,15 @@ def _save_fold_output_artifacts(
     save_timing["settlement_audit_s"] = float(time.perf_counter() - stage_start)
 
     stage_start = time.perf_counter()
+    weight_symbols, reporting_weights = _reporting_weight_table_payload(
+        test_backtest,
+        symbols,
+    )
     _maybe_save_daily_weights_table(
         fold_dir / "daily_weights",
         test_dates,
-        symbols,
-        test_backtest.weights_history,
+        weight_symbols,
+        reporting_weights,
         enabled=bool(config.training.save_daily_weights_table),
         table_output_format=table_output_format,
     )
@@ -7025,6 +7258,34 @@ def _save_daily_weights_table(
     _write_dataframe_table(data, output_path)
 
 
+def _reporting_weight_table_payload(
+    result: BacktestResult,
+    symbols: list[str],
+) -> tuple[list[str], np.ndarray]:
+    """Resolve the economically owned action axis for daily weight tables."""
+
+    if normalize_execution_mode(result.execution_mode) == "tw_index_futures_day":
+        requested = result.requested_weights_history
+        if requested is None:
+            raise ValueError(
+                "tw_index_futures_day daily weights require requested action history"
+            )
+        actions = np.asarray(requested)
+        if actions.ndim != 2 or int(actions.shape[1]) != (
+            TAIFEX_INDEX_FUTURES_ACTION_COUNT
+        ):
+            raise ValueError(
+                "tw_index_futures_day daily weights require direct [T,18] actions"
+            )
+        action_symbols = [
+            f"{product}_E{tenor + 1}"
+            for product in TAIFEX_INDEX_FUTURES_PRODUCTS
+            for tenor in range(TAIFEX_INDEX_FUTURES_TENOR_SLOTS)
+        ]
+        return action_symbols, actions
+    return symbols, np.asarray(result.weights_history)
+
+
 def _maybe_save_daily_weights_table(
     base_path: Path,
     dates: np.ndarray,
@@ -7100,11 +7361,15 @@ def _save_integer_share_audit_artifacts(
     if write_daily_weights_table:
         stage_start = time.perf_counter()
         daily_weights_path = _table_path(daily_weights_base, table_output_format)
+        weight_symbols, reporting_weights = _reporting_weight_table_payload(
+            result,
+            symbols,
+        )
         _save_daily_weights_table(
             daily_weights_path,
             dates,
-            symbols,
-            result.weights_history,
+            weight_symbols,
+            reporting_weights,
         )
         elapsed = float(time.perf_counter() - stage_start)
         timing["daily_weights_table_s"] = elapsed
@@ -7551,13 +7816,18 @@ def _load_backtest_artifact(output_path: Path) -> tuple[BacktestResult, np.ndarr
             )
     if result.requested_weights_history is not None:
         requested = np.asarray(result.requested_weights_history)
-        if execution_mode == "tw_index_derivatives_day":
+        if execution_mode in {"tw_index_futures_day", "tw_index_derivatives_day"}:
+            expected_width = (
+                TAIFEX_INDEX_FUTURES_ACTION_COUNT
+                if execution_mode == "tw_index_futures_day"
+                else TAIFEX_INDEX_DERIVATIVE_ACTION_COUNT_V4
+            )
             if requested.shape != (
                 rows,
-                TAIFEX_INDEX_DERIVATIVE_ACTION_COUNT_V4,
+                expected_width,
             ):
                 raise ValueError(
-                    "backtest derivative request history has invalid direct-axis shape"
+                    "backtest futures/derivative request history has invalid direct-axis shape"
                 )
         elif (
             requested.ndim not in {2, 3}
@@ -7937,18 +8207,22 @@ def _load_backtest_artifact(output_path: Path) -> tuple[BacktestResult, np.ndarr
         raise ValueError(
             f"{execution_mode} backtest artifact cannot contain a settlement ledger"
         )
-    if ledger_unit == "nav_ratio":
+    has_equity_scale_contract = (
+        ledger_unit == "nav_ratio" or execution_mode == "tw_index_futures_day"
+    )
+    if has_equity_scale_contract:
         has_scale_history = result.equity_scale_history is not None
         has_final_scale = result.final_equity_scale is not None
-        if has_final_scale and not has_scale_history:
+        if not has_scale_history:
             raise ValueError(
-                "normalized settlement artifact has final_equity_scale without "
-                "equity_scale_history"
+                "equity-scaled artifact is missing equity_scale_history"
             )
-        if has_scale_history and terminal_field_count == len(terminal_fields) and not has_final_scale:
+        if (
+            execution_mode == "tw_index_futures_day"
+            or terminal_field_count == len(terminal_fields)
+        ) and not has_final_scale:
             raise ValueError(
-                "normalized settlement artifact with terminal state is missing "
-                "final_equity_scale"
+                "equity-scaled artifact is missing final_equity_scale"
             )
     elif result.equity_scale_history is not None or result.final_equity_scale is not None:
         raise ValueError(
@@ -8446,10 +8720,84 @@ def _deployment_test_prefix_rows(
     return deployment_rows
 
 
+def _index_futures_flat_terminal_state_at_row(
+    result: BacktestResult,
+    end_row: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Reconstruct exact daily-flat futures state after ``end_row`` rows."""
+
+    if normalize_execution_mode(result.execution_mode) != "tw_index_futures_day":
+        raise ValueError(
+            "flat futures terminal reconstruction requires "
+            "tw_index_futures_day"
+        )
+    total_rows = int(result.strategy_returns.shape[0])
+    endpoint = int(end_row)
+    if endpoint < 0 or endpoint > total_rows:
+        raise ValueError(
+            "tw_index_futures_day terminal endpoint is outside the result"
+        )
+    if result.equity_scale_history is None:
+        raise ValueError(
+            "tw_index_futures_day terminal reconstruction requires "
+            "equity_scale_history"
+        )
+    equity_scale_history = np.asarray(result.equity_scale_history)
+    if equity_scale_history.shape != (total_rows,):
+        raise ValueError(
+            "tw_index_futures_day equity_scale_history must have one value "
+            "per strategy-return row"
+        )
+    # Full-horizon futures evaluations start at normalized equity 1.0.  All
+    # non-empty deployment segments use the absolute stitched equity path, so
+    # the value at endpoint-1 is also their exact account terminal state.
+    final_scale = (
+        np.asarray(1.0, dtype=equity_scale_history.dtype)
+        if endpoint == 0
+        else np.asarray(equity_scale_history[endpoint - 1]).copy()
+    )
+    final_alive = np.asarray(
+        bool(np.isfinite(final_scale).item() and final_scale.item() > 0.0),
+        dtype=np.bool_,
+    )
+    if result.final_weights is not None:
+        final_weights = np.zeros_like(np.asarray(result.final_weights))
+    else:
+        weights_history = np.asarray(result.weights_history)
+        final_weights = np.zeros(
+            weights_history.shape[1:], dtype=weights_history.dtype
+        )
+    return final_weights, final_alive, final_scale
+
+
 def _prefix_backtest_result(result: BacktestResult, rows: int) -> BacktestResult:
     total_rows = int(result.strategy_returns.shape[0])
     rows = max(0, min(int(rows), total_rows))
     preserves_terminal_state = rows == total_rows
+    mode = normalize_execution_mode(result.execution_mode)
+
+    # A partial carrying-ledger prefix cannot inherit the source result's
+    # terminal state: unsettled cash and inventory depend on the exact prefix
+    # endpoint.  Index futures are flat after every session, so their endpoint
+    # state is exactly reconstructible from the already-computed equity path.
+    prefix_final_weights: np.ndarray | None = None
+    prefix_final_alive: np.ndarray | None = None
+    prefix_final_equity_scale: np.ndarray | None = None
+    if preserves_terminal_state:
+        if result.final_weights is not None:
+            prefix_final_weights = np.asarray(result.final_weights).copy()
+        if result.final_alive is not None:
+            prefix_final_alive = np.asarray(result.final_alive).copy()
+        if result.final_equity_scale is not None:
+            prefix_final_equity_scale = np.asarray(
+                result.final_equity_scale
+            ).copy()
+    elif mode == "tw_index_futures_day":
+        (
+            prefix_final_weights,
+            prefix_final_alive,
+            prefix_final_equity_scale,
+        ) = _index_futures_flat_terminal_state_at_row(result, rows)
     integer_state = result.final_integer_state
     if not preserves_terminal_state or integer_state is None:
         prefixed_integer_state = None
@@ -8617,11 +8965,7 @@ def _prefix_backtest_result(result: BacktestResult, rows: int) -> BacktestResult
             if result.short_margin_collateral_history is None
             else np.asarray(result.short_margin_collateral_history[:rows]).copy()
         ),
-        final_weights=(
-            None
-            if not preserves_terminal_state or result.final_weights is None
-            else np.asarray(result.final_weights).copy()
-        ),
+        final_weights=prefix_final_weights,
         final_due_weights=(
             None
             if not preserves_terminal_state or result.final_due_weights is None
@@ -8660,16 +9004,8 @@ def _prefix_backtest_result(result: BacktestResult, rows: int) -> BacktestResult
             or result.final_commission_rebate_month_id is None
             else np.asarray(result.final_commission_rebate_month_id).copy()
         ),
-        final_alive=(
-            None
-            if not preserves_terminal_state or result.final_alive is None
-            else np.asarray(result.final_alive).copy()
-        ),
-        final_equity_scale=(
-            None
-            if not preserves_terminal_state or result.final_equity_scale is None
-            else np.asarray(result.final_equity_scale).copy()
-        ),
+        final_alive=prefix_final_alive,
+        final_equity_scale=prefix_final_equity_scale,
         final_short_sale_collateral=(
             None
             if not preserves_terminal_state
@@ -10298,7 +10634,7 @@ def _run_eval_backtest_from_weight_buffers(
     execution_mode = "naive" if execution_runtime is None else execution_runtime.mode
     num_symbols = int(
         future_log_returns_all.size(-1)
-        if execution_mode == "tw_index_derivatives_day"
+        if execution_mode in {"tw_index_futures_day", "tw_index_derivatives_day"}
         else weights_all.size(-1)
     )
     if total_rows <= 0:
@@ -10353,6 +10689,14 @@ def _run_eval_backtest_from_weight_buffers(
     commission_rebate_paid_history_out: torch.Tensor | None = None
     commission_rebate_current_history_out: torch.Tensor | None = None
     commission_rebate_due_history_out: torch.Tensor | None = None
+    equity_scaled_execution = bool(
+        execution_mode in TW_STOCK_EXECUTION_MODES
+        or execution_mode == "tw_index_futures_day"
+    )
+    if equity_scaled_execution:
+        equity_scale_history_out = torch.empty(
+            (total_rows,), device=device, dtype=output_dtype
+        )
     if execution_mode in TW_STOCK_EXECUTION_MODES:
         lag = int(execution_runtime.settlement_lag_sessions) if execution_runtime is not None else 2
         cash_history_out = torch.empty((total_rows,), device=device, dtype=output_dtype)
@@ -10367,9 +10711,6 @@ def _run_eval_backtest_from_weight_buffers(
             (total_rows, receivable_rows), device=device, dtype=output_dtype
         )
         settlement_default_out = torch.empty((total_rows,), device=device, dtype=torch.bool)
-        equity_scale_history_out = torch.empty(
-            (total_rows,), device=device, dtype=output_dtype
-        )
         commission_rebate_accrued_history_out = torch.empty(
             (total_rows,), device=device, dtype=output_dtype
         )
@@ -10800,6 +11141,36 @@ def _run_eval_backtest_from_weight_buffers(
                     sell_fee_rates=(
                         None if execution_runtime is None else execution_runtime.sell_fee_rates
                     ),
+                    normal_sell_fee_rates=(
+                        None
+                        if execution_runtime is None
+                        else execution_runtime.normal_sell_fee_rates
+                    ),
+                    day_trade_unlimited_margin_conversion=(
+                        False
+                        if execution_runtime is None
+                        else execution_runtime.day_trade_unlimited_margin_conversion
+                    ),
+                    day_trade_margin_financing_ratio=(
+                        0.60
+                        if execution_runtime is None
+                        else execution_runtime.day_trade_margin_financing_ratio
+                    ),
+                    day_trade_margin_financing_annual_rate=(
+                        0.16
+                        if execution_runtime is None
+                        else execution_runtime.day_trade_margin_financing_annual_rate
+                    ),
+                    day_trade_margin_short_handling_fee_rate=(
+                        0.001
+                        if execution_runtime is None
+                        else execution_runtime.day_trade_margin_short_handling_fee_rate
+                    ),
+                    day_trade_margin_short_annual_borrow_rate=(
+                        0.20
+                        if execution_runtime is None
+                        else execution_runtime.day_trade_margin_short_annual_borrow_rate
+                    ),
                     commission_rebate_rates=(
                         None
                         if execution_runtime is None
@@ -10843,6 +11214,12 @@ def _run_eval_backtest_from_weight_buffers(
                     initial_short_sale_collateral=prev_short_sale_collateral,
                     initial_short_margin_collateral=prev_short_margin_collateral,
                     symbol_indices=symbol_indices,
+                    day_trade_execution_initial_capital=(
+                        float(execution_runtime.futures_initial_capital)
+                        if execution_runtime is not None
+                        and execution_runtime.mode == "tw_index_futures_day"
+                        else float(volume_participation_equity)
+                    ),
                 )
         except RuntimeError as exc:
             raise RuntimeError(
@@ -10934,13 +11311,20 @@ def _run_eval_backtest_from_weight_buffers(
                     due_weights_history_out[start:end].copy_(
                         backtest_chunk.due_weights_history[:valid_rows]
                     )
+        if equity_scale_history_out is not None:
+            if backtest_chunk.equity_scale_history is None:
+                raise RuntimeError(
+                    f"{execution_mode} backtest omitted required equity-scale history"
+                )
+            equity_scale_history_out[start:end].copy_(
+                backtest_chunk.equity_scale_history[:valid_rows]
+            )
         if cash_history_out is not None:
             if (
                 backtest_chunk.cash_history is None
                 or backtest_chunk.payables_history is None
                 or backtest_chunk.receivables_history is None
                 or backtest_chunk.settlement_default is None
-                or backtest_chunk.equity_scale_history is None
             ):
                 raise RuntimeError(
                     f"{execution_mode} backtest omitted required settlement audit tensors"
@@ -10949,9 +11333,6 @@ def _run_eval_backtest_from_weight_buffers(
             payables_history_out[start:end].copy_(backtest_chunk.payables_history[:valid_rows])
             receivables_history_out[start:end].copy_(backtest_chunk.receivables_history[:valid_rows])
             settlement_default_out[start:end].copy_(backtest_chunk.settlement_default[:valid_rows])
-            equity_scale_history_out[start:end].copy_(
-                backtest_chunk.equity_scale_history[:valid_rows]
-            )
             rebate_histories = (
                 backtest_chunk.commission_rebate_accrued_history,
                 backtest_chunk.commission_rebate_paid_history,
@@ -12228,6 +12609,20 @@ def _slice_backtest_rows(
     def terminal(value: np.ndarray | None) -> np.ndarray | None:
         return None if value is None or not keep_terminal else np.asarray(value).copy()
 
+    slice_final_weights = terminal(result.final_weights)
+    slice_final_alive = terminal(result.final_alive)
+    slice_final_equity_scale = terminal(result.final_equity_scale)
+    if (
+        not keep_terminal
+        and normalize_execution_mode(result.execution_mode)
+        == "tw_index_futures_day"
+    ):
+        (
+            slice_final_weights,
+            slice_final_alive,
+            slice_final_equity_scale,
+        ) = _index_futures_flat_terminal_state_at_row(result, end)
+
     integer_state = result.final_integer_state if keep_terminal else None
     if integer_state is not None:
         integer_state = TaiwanIntegerState(
@@ -12315,7 +12710,7 @@ def _slice_backtest_rows(
         short_margin_collateral_history=rows(
             result.short_margin_collateral_history
         ),
-        final_weights=terminal(result.final_weights),
+        final_weights=slice_final_weights,
         final_due_weights=terminal(result.final_due_weights),
         final_cash=terminal(result.final_cash),
         final_payables=terminal(result.final_payables),
@@ -12329,8 +12724,8 @@ def _slice_backtest_rows(
         final_commission_rebate_month_id=terminal(
             result.final_commission_rebate_month_id
         ),
-        final_alive=terminal(result.final_alive),
-        final_equity_scale=terminal(result.final_equity_scale),
+        final_alive=slice_final_alive,
+        final_equity_scale=slice_final_equity_scale,
         final_short_sale_collateral=terminal(
             result.final_short_sale_collateral
         ),
@@ -12370,13 +12765,16 @@ def _replay_taiwan_stitched_deployment(
     panel: PanelData,
     config: ExperimentConfig,
 ) -> BacktestResult | None:
-    """Replay every owned fold row once through one exact T+2 account.
+    """Replay every owned fold row once through one canonical T+2 account.
 
     Per-fold test metrics intentionally remain independent diagnostics.  The
     stitched deployment is different: model ownership may change, but cash,
     positions, settlement claims, and absorbing default must not reset.  Model
     requests are therefore expanded into the immutable full-panel symbol order
-    and sent through one O(T*S) exact ledger pass.
+    and sent through one O(T*S) ledger pass.  A daily no-default day-trade
+    experiment must reuse its differentiable daily forward here; replacing it
+    with the separate whole-lot audit changes the declared loss contract and can
+    round a diversified portfolio to an artificial all-cash deployment.
     """
 
     mode = normalize_execution_mode(config.trading.execution_mode)
@@ -12422,14 +12820,19 @@ def _replay_taiwan_stitched_deployment(
         requests_array = np.asarray(requests, dtype=np.float64)
         if requests_array.ndim not in {2, 3} or requests_array.shape[0] != rows:
             raise RuntimeError("deployment requested-weight history has invalid shape")
-        if mode == "tw_index_derivatives_day":
+        if mode in {"tw_index_futures_day", "tw_index_derivatives_day"}:
+            expected_width = (
+                TAIFEX_INDEX_FUTURES_ACTION_COUNT
+                if mode == "tw_index_futures_day"
+                else TAIFEX_INDEX_DERIVATIVE_ACTION_COUNT_V4
+            )
             if requests_array.shape != (
                 rows,
-                TAIFEX_INDEX_DERIVATIVE_ACTION_COUNT_V4,
+                expected_width,
             ):
                 raise RuntimeError(
-                    "derivative deployment requests must use the direct "
-                    "[T,D_derivatives] axis"
+                    f"{mode} deployment requests must use direct width "
+                    f"{expected_width}"
                 )
             request_parts.append(requests_array)
             date_parts.append(fold_dates)
@@ -12491,12 +12894,23 @@ def _replay_taiwan_stitched_deployment(
         )
 
     full_requests = np.concatenate(request_parts, axis=0)
+    canonical_daily_day_trade = bool(
+        mode == "tw_day_trade"
+        and config.data.day_trade_minute_execution_root is None
+        and config.trading.tw_day_trade_unlimited_margin_conversion
+    )
     execution_dataset = CrossSectionalDataset(
         panel,
         np.arange(panel.num_dates, dtype=np.int64),
         lookback=1,
         allow_empty=True,
-        include_volume_notional=False,
+        include_volume_notional=(
+            canonical_daily_day_trade
+            and _volume_participation_enabled(
+                config.trading.max_volume_participation,
+                config.trading.volume_participation_equity,
+            )
+        ),
         execution_mode=mode,
         short_capacity_limit_enabled=config.trading.tw_short_capacity_limit_enabled,
         tw_corporate_action_mode=config.trading.tw_corporate_action_mode,
@@ -12530,51 +12944,157 @@ def _replay_taiwan_stitched_deployment(
         # Their exact integer continuation remains close[t] -> close[t+1];
         # the phase dataset's intraday leg is not that legacy forward label.
         stitched_future_returns = np.asarray(panel.returns_1d)[panel_rows]
-    stitched, _ = run_backtest_integer_shares(
-        weights=full_requests,
-        future_returns=stitched_future_returns,
-        tradable_mask=selected(execution_dataset.tradable_mask_t).astype(np.bool_, copy=False),
-        can_buy_mask=selected(execution_dataset.can_buy_mask_t).astype(np.bool_, copy=False),
-        can_sell_mask=selected(execution_dataset.can_sell_mask_t).astype(np.bool_, copy=False),
-        can_short_open_mask=selected(execution_dataset.can_short_open_mask_t).astype(np.bool_, copy=False),
-        force_short_cover_mask=selected(execution_dataset.force_short_cover_mask_t).astype(np.bool_, copy=False),
-        force_exit_mask=selected(execution_dataset.force_exit_mask_t).astype(np.bool_, copy=False),
-        benchmark_returns=selected(execution_dataset.benchmark_t),
-        initial_capital=_integer_audit_initial_capital(config, runtime),
-        buy_fee_rate=config.trading.buy_fee_rate,
-        sell_fee_rate=config.trading.sell_fee_rate,
-        long_only=config.trading.long_only,
-        max_turnover_ratio=config.trading.max_turnover_ratio,
-        max_volume_participation=config.trading.max_volume_participation,
-        gross_leverage=1.0,
-        min_trade_weight=config.trading.min_trade_weight,
-        portfolio_activation=config.trading.portfolio_activation,
-        close_prices=close_prices,
-        daily_volumes=None,
-        cash_close_volume_reference=(
-            causal_volumes if mode in TW_CARRYING_EXECUTION_MODES else None
-        ),
-        day_trade_entry_volume_reference=(
-            causal_volumes if mode == "tw_day_trade" else None
-        ),
-        symbols=global_symbols,
-        dates=stitched_dates,
-        collect_holdings=False,
-        **_integer_execution_runtime_kwargs(
-            runtime,
-            open_prices=open_prices,
-            day_trade_eligible_mask=day_eligible,
-            day_trade_can_buy_open_mask=day_buy_open,
-            day_trade_can_sell_open_mask=day_sell_open,
-            unresolved_corporate_action_mask=unresolved_actions,
-            cash_dividend_yield=cash_dividend_yield,
-            cash_dividend_payment_delay_sessions=cash_dividend_delay,
-            can_short_open_open_mask=can_short_open_open,
-            state_advance_mask=np.ones(stitched_dates.size, dtype=np.bool_),
-            short_capacity_shares=stitched_short_capacity_shares,
-            short_margin_rate=stitched_short_margin_rate,
-        ),
-    )
+    if canonical_daily_day_trade:
+        request_tensor = torch.as_tensor(full_requests, dtype=torch.float32)
+        volume_limit_weights = _volume_limit_weights_from_notional(
+            (
+                None
+                if execution_dataset.volume_notional_t is None
+                else execution_dataset.volume_notional_t[
+                    torch.from_numpy(panel_rows)
+                ]
+            ),
+            max_volume_participation=config.trading.max_volume_participation,
+            volume_participation_equity=config.trading.volume_participation_equity,
+            device=torch.device("cpu"),
+            dtype=request_tensor.dtype,
+        )
+        with _temporary_env("STOCKAGENT_BACKTEST_COMPILE", "0"):
+            stitched_tensor = run_backtest_torch(
+                request_tensor,
+                torch.as_tensor(stitched_future_returns, dtype=torch.float32),
+                torch.as_tensor(
+                    selected(execution_dataset.tradable_mask_t), dtype=torch.bool
+                ),
+                torch.as_tensor(
+                    selected(execution_dataset.benchmark_t), dtype=torch.float32
+                ),
+                config.trading.buy_fee_rate,
+                config.trading.sell_fee_rate,
+                long_only=config.trading.long_only,
+                max_turnover_ratio=config.trading.max_turnover_ratio,
+                gross_leverage=1.0,
+                min_trade_weight=config.trading.min_trade_weight,
+                portfolio_activation=config.trading.portfolio_activation,
+                can_buy_mask=torch.as_tensor(
+                    selected(execution_dataset.can_buy_mask_t), dtype=torch.bool
+                ),
+                can_sell_mask=torch.as_tensor(
+                    selected(execution_dataset.can_sell_mask_t), dtype=torch.bool
+                ),
+                can_short_open_mask=torch.as_tensor(
+                    selected(execution_dataset.can_short_open_mask_t),
+                    dtype=torch.bool,
+                ),
+                can_short_open_open_mask=torch.as_tensor(
+                    selected(execution_dataset.can_short_open_open_mask_t),
+                    dtype=torch.bool,
+                ),
+                force_short_cover_mask=torch.as_tensor(
+                    selected(execution_dataset.force_short_cover_mask_t),
+                    dtype=torch.bool,
+                ),
+                force_exit_mask=torch.as_tensor(
+                    selected(execution_dataset.force_exit_mask_t), dtype=torch.bool
+                ),
+                return_weights_history=True,
+                volume_limit_weights=volume_limit_weights,
+                execution_mode=runtime.mode,
+                buy_fee_rates=runtime.buy_fee_rates,
+                sell_fee_rates=runtime.sell_fee_rates,
+                normal_sell_fee_rates=runtime.normal_sell_fee_rates,
+                day_trade_unlimited_margin_conversion=True,
+                day_trade_margin_financing_ratio=(
+                    runtime.day_trade_margin_financing_ratio
+                ),
+                day_trade_margin_financing_annual_rate=(
+                    runtime.day_trade_margin_financing_annual_rate
+                ),
+                day_trade_margin_short_handling_fee_rate=(
+                    runtime.day_trade_margin_short_handling_fee_rate
+                ),
+                day_trade_margin_short_annual_borrow_rate=(
+                    runtime.day_trade_margin_short_annual_borrow_rate
+                ),
+                commission_rebate_rates=runtime.commission_rebate_rates,
+                commission_rebate_timing=runtime.commission_rebate_timing,
+                session_month_ids=torch.as_tensor(
+                    selected(execution_dataset.session_month_ids_t),
+                    dtype=torch.int64,
+                ),
+                commission_rebate_payment_eligible_mask=torch.as_tensor(
+                    selected(
+                        execution_dataset.commission_rebate_payment_eligible_mask_t
+                    ),
+                    dtype=torch.bool,
+                ),
+                settlement_lag_sessions=runtime.settlement_lag_sessions,
+                state_advance_mask=torch.ones(
+                    stitched_dates.size, dtype=torch.bool
+                ),
+                day_trade_eligible_mask=torch.as_tensor(
+                    selected(execution_dataset.day_trade_eligible_mask_t),
+                    dtype=torch.bool,
+                ),
+                day_trade_can_buy_open_mask=torch.as_tensor(
+                    selected(execution_dataset.day_trade_can_buy_open_mask_t),
+                    dtype=torch.bool,
+                ),
+                day_trade_can_sell_open_mask=torch.as_tensor(
+                    selected(execution_dataset.day_trade_can_sell_open_mask_t),
+                    dtype=torch.bool,
+                ),
+                unresolved_corporate_action_mask=torch.as_tensor(
+                    unresolved_actions, dtype=torch.bool
+                ),
+            )
+        stitched = stitched_tensor.to_numpy()
+    else:
+        stitched, _ = run_backtest_integer_shares(
+            weights=full_requests,
+            future_returns=stitched_future_returns,
+            tradable_mask=selected(execution_dataset.tradable_mask_t).astype(np.bool_, copy=False),
+            can_buy_mask=selected(execution_dataset.can_buy_mask_t).astype(np.bool_, copy=False),
+            can_sell_mask=selected(execution_dataset.can_sell_mask_t).astype(np.bool_, copy=False),
+            can_short_open_mask=selected(execution_dataset.can_short_open_mask_t).astype(np.bool_, copy=False),
+            force_short_cover_mask=selected(execution_dataset.force_short_cover_mask_t).astype(np.bool_, copy=False),
+            force_exit_mask=selected(execution_dataset.force_exit_mask_t).astype(np.bool_, copy=False),
+            benchmark_returns=selected(execution_dataset.benchmark_t),
+            initial_capital=_integer_audit_initial_capital(config, runtime),
+            buy_fee_rate=config.trading.buy_fee_rate,
+            sell_fee_rate=config.trading.sell_fee_rate,
+            long_only=config.trading.long_only,
+            max_turnover_ratio=config.trading.max_turnover_ratio,
+            max_volume_participation=config.trading.max_volume_participation,
+            gross_leverage=1.0,
+            min_trade_weight=config.trading.min_trade_weight,
+            portfolio_activation=config.trading.portfolio_activation,
+            close_prices=close_prices,
+            daily_volumes=None,
+            cash_close_volume_reference=(
+                causal_volumes if mode in TW_CARRYING_EXECUTION_MODES else None
+            ),
+            day_trade_entry_volume_reference=(
+                causal_volumes if mode == "tw_day_trade" else None
+            ),
+            symbols=global_symbols,
+            dates=stitched_dates,
+            collect_holdings=False,
+            **_integer_execution_runtime_kwargs(
+                runtime,
+                open_prices=open_prices,
+                day_trade_eligible_mask=day_eligible,
+                day_trade_can_buy_open_mask=day_buy_open,
+                day_trade_can_sell_open_mask=day_sell_open,
+                unresolved_corporate_action_mask=unresolved_actions,
+                cash_dividend_yield=cash_dividend_yield,
+                cash_dividend_payment_delay_sessions=cash_dividend_delay,
+                can_short_open_open_mask=can_short_open_open,
+                state_advance_mask=np.ones(stitched_dates.size, dtype=np.bool_),
+                short_capacity_shares=stitched_short_capacity_shares,
+                short_margin_rate=stitched_short_margin_rate,
+            ),
+        )
 
     compression = str(
         getattr(config.training, "backtest_artifact_compression", "none")
@@ -12705,7 +13225,7 @@ def _refresh_walkforward_artifacts(
             concentration_weights = fold_backtest.weights_history
             if (
                 normalize_execution_mode(fold_backtest.execution_mode)
-                == "tw_index_derivatives_day"
+                in {"tw_index_futures_day", "tw_index_derivatives_day"}
                 and fold_backtest.requested_weights_history is not None
             ):
                 # Derivative strategies finish each day flat, so their carried
@@ -13250,10 +13770,12 @@ def _probe_compiled_loss_forward_backward(
             else 1
         )
         action_shape = tuple(batch["future_log_returns"].shape)
-        if split.execution_mode == "tw_index_derivatives_day":
+        if split.execution_mode in {"tw_index_futures_day", "tw_index_derivatives_day"}:
             action_shape = (
                 int(action_shape[0]),
-                TAIFEX_INDEX_DERIVATIVE_ACTION_COUNT_V4,
+                TAIFEX_INDEX_FUTURES_ACTION_COUNT
+                if split.execution_mode == "tw_index_futures_day"
+                else TAIFEX_INDEX_DERIVATIVE_ACTION_COUNT_V4,
             )
         elif action_channels > 1:
             action_shape = (
@@ -13432,6 +13954,10 @@ def _probe_compiled_loss_forward_backward(
             ),
             "initial_alive": torch.ones((), device=device, dtype=torch.bool),
         }
+        if split.execution_mode == "tw_index_futures_day":
+            aux_outputs["initial_equity_scale"] = torch.ones(
+                (), device=device, dtype=torch.float32
+            )
         if split.execution_mode in TW_STOCK_EXECUTION_MODES:
             aux_outputs["initial_cash"] = torch.ones(
                 (), device=device, dtype=torch.float32
@@ -14204,6 +14730,7 @@ def _train_epoch_windowed_tensor(
         portfolio_prev_weights
     )
     total_loss_t = torch.zeros((), device=device, dtype=torch.float32)
+    gradient_norm_stats = torch.zeros((3,), device=device, dtype=torch.float32)
     steps = 0
     timing = TimingBreakdown()
     total_start = time.perf_counter()
@@ -14427,6 +14954,10 @@ def _train_epoch_windowed_tensor(
                 aux_outputs = dict(aux_outputs or {})
                 aux_outputs["initial_weights"] = portfolio_prev_weights
                 aux_outputs["initial_alive"] = portfolio_prev_alive
+                if split.execution_mode == "tw_index_futures_day":
+                    aux_outputs["initial_equity_scale"] = (
+                        portfolio_prev_equity_scale
+                    )
                 if split.execution_mode in TW_STOCK_EXECUTION_MODES:
                     aux_outputs["initial_cash"] = portfolio_prev_cash
                     aux_outputs["initial_payables"] = portfolio_prev_payables
@@ -14642,6 +15173,12 @@ def _train_epoch_windowed_tensor(
                     device=device,
                     profile_timing=profile_timing,
                 )
+            _accumulate_gradient_norm_diagnostic_(
+                gradient_total_norm,
+                norm_sum=gradient_norm_stats[0],
+                zero_count=gradient_norm_stats[1],
+                observation_count=gradient_norm_stats[2],
+            )
             if should_check_finite:
                 finite_start = time.perf_counter()
                 gradients_are_finite = (
@@ -14682,6 +15219,12 @@ def _train_epoch_windowed_tensor(
                     device=device,
                     profile_timing=profile_timing,
                 )
+            _accumulate_gradient_norm_diagnostic_(
+                gradient_total_norm,
+                norm_sum=gradient_norm_stats[0],
+                zero_count=gradient_norm_stats[1],
+                observation_count=gradient_norm_stats[2],
+            )
             if should_check_finite:
                 finite_start = time.perf_counter()
                 gradients_are_finite = (
@@ -14721,6 +15264,10 @@ def _train_epoch_windowed_tensor(
                 f"loss={float(loss.detach().cpu()):.8f} elapsed={time.perf_counter() - batch_start:.1f}s"
             )
 
+    gradient_norm_values = gradient_norm_stats.detach().cpu().tolist()
+    timing.gradient_norm_before_clip_sum = float(gradient_norm_values[0])
+    timing.gradient_norm_zero_batches = int(gradient_norm_values[1])
+    timing.gradient_norm_observations = int(gradient_norm_values[2])
     timing.total_s = time.perf_counter() - total_start
     timing.batches = steps
     if steps == 0:
@@ -14849,6 +15396,7 @@ def _train_epoch_windowed_tensor_ddp(
         portfolio_prev_weights
     )
     total_loss_t = torch.zeros((), device=device, dtype=torch.float32)
+    gradient_norm_stats = torch.zeros((3,), device=device, dtype=torch.float32)
     steps = 0
     timing = TimingBreakdown()
     total_start = time.perf_counter()
@@ -15073,6 +15621,10 @@ def _train_epoch_windowed_tensor_ddp(
                     "initial_weights": portfolio_prev_weights,
                     "initial_alive": portfolio_prev_alive,
                 }
+                if split.execution_mode == "tw_index_futures_day":
+                    aux_outputs["initial_equity_scale"] = (
+                        portfolio_prev_equity_scale
+                    )
                 if split.execution_mode in TW_STOCK_EXECUTION_MODES:
                     aux_outputs["initial_cash"] = portfolio_prev_cash
                     aux_outputs["initial_payables"] = portfolio_prev_payables
@@ -15254,6 +15806,12 @@ def _train_epoch_windowed_tensor_ddp(
                     device=device,
                     profile_timing=profile_timing,
                 )
+            _accumulate_gradient_norm_diagnostic_(
+                gradient_total_norm,
+                norm_sum=gradient_norm_stats[0],
+                zero_count=gradient_norm_stats[1],
+                observation_count=gradient_norm_stats[2],
+            )
             if should_check_finite:
                 finite_start = time.perf_counter()
                 gradients_are_finite = (
@@ -15291,6 +15849,12 @@ def _train_epoch_windowed_tensor_ddp(
                     device=device,
                     profile_timing=profile_timing,
                 )
+            _accumulate_gradient_norm_diagnostic_(
+                gradient_total_norm,
+                norm_sum=gradient_norm_stats[0],
+                zero_count=gradient_norm_stats[1],
+                observation_count=gradient_norm_stats[2],
+            )
             if should_check_finite:
                 finite_start = time.perf_counter()
                 gradients_are_finite = (
@@ -15329,6 +15893,10 @@ def _train_epoch_windowed_tensor_ddp(
                 f"loss={float(loss.detach().cpu()):.8f} elapsed={time.perf_counter() - batch_start:.1f}s"
             )
 
+    gradient_norm_values = gradient_norm_stats.detach().cpu().tolist()
+    timing.gradient_norm_before_clip_sum = float(gradient_norm_values[0])
+    timing.gradient_norm_zero_batches = int(gradient_norm_values[1])
+    timing.gradient_norm_observations = int(gradient_norm_values[2])
     timing.total_s = time.perf_counter() - total_start
     timing.batches = steps
     if steps == 0:
@@ -15431,6 +15999,8 @@ def _format_fold_evaluation_lines(
     test_ic: Mapping[str, Any],
     test_metrics: Mapping[str, float],
     test_integer_metrics: Mapping[str, float] | None,
+    canonical_tensor_exact: bool = False,
+    canonical_tensor_label: str = "exact-minute",
 ) -> tuple[str, ...]:
     """Label continuous and exact metrics without presenting one as the other."""
 
@@ -15453,6 +16023,11 @@ def _format_fold_evaluation_lines(
         return (
             line("val", val_ic, val_metrics),
             line("test", test_ic, test_metrics),
+        )
+    if canonical_tensor_exact:
+        return (
+            line(f"val {canonical_tensor_label}", val_ic, val_metrics),
+            line(f"test {canonical_tensor_label}", test_ic, test_metrics),
         )
     if test_integer_metrics is None:
         raise ValueError(
@@ -15833,6 +16408,13 @@ def _run_training_tree_models(
                 symbols=test_symbols,
                 dates=test_dates,
                 collect_holdings=write_integer_holdings_table,
+                precomputed_exact_backtest=(
+                    test_bt
+                    if _tensor_day_trade_is_whole_lot_exact(
+                        config, execution_runtime
+                    )
+                    else None
+                ),
                 **_integer_execution_runtime_kwargs(
                     execution_runtime,
                     open_prices=test_open_prices,
@@ -15849,8 +16431,13 @@ def _run_training_tree_models(
                 ),
             )
             test_integer_met = compute_metrics(test_integer_bt)
+            canonical_tensor_day_trade = _canonical_tensor_day_trade_enabled(
+                config, execution_runtime
+            )
             canonical_test_bt = (
-                test_integer_bt if execution_runtime.mode != "naive" else test_bt
+                test_bt
+                if execution_runtime.mode == "naive" or canonical_tensor_day_trade
+                else test_integer_bt
             )
             deployment_test_bt = _prefix_backtest_result(
                 canonical_test_bt,
@@ -15868,6 +16455,12 @@ def _run_training_tree_models(
                         test_ic=test_ic,
                         test_metrics=test_met,
                         test_integer_metrics=test_integer_met,
+                        canonical_tensor_exact=canonical_tensor_day_trade,
+                        canonical_tensor_label=(
+                            "daily-tplus2-close"
+                            if execution_runtime.day_trade_unlimited_margin_conversion
+                            else "exact-minute"
+                        ),
                     )
                 )
             )
@@ -15882,13 +16475,16 @@ def _run_training_tree_models(
                 val_metrics=val_met,
                 test_ic=test_ic,
                 test_metrics=(
-                    test_integer_met
-                    if execution_runtime.mode != "naive"
-                    else test_met
+                    test_met
+                    if execution_runtime.mode == "naive" or canonical_tensor_day_trade
+                    else test_integer_met
                 ),
                 test_integer_metrics=test_integer_met,
                 test_continuous_surrogate_metrics=(
-                    test_met if execution_runtime.mode != "naive" else None
+                    test_met
+                    if execution_runtime.mode != "naive"
+                    and not canonical_tensor_day_trade
+                    else None
                 ),
             )
             results_by_fold[fold.fold_id] = fold_result
@@ -15907,7 +16503,7 @@ def _run_training_tree_models(
             _save_backtest_artifact(
                 _backtest_path(fold_dir), canonical_test_bt, test_dates
             )
-            if execution_runtime.mode != "naive":
+            if execution_runtime.mode != "naive" and not canonical_tensor_day_trade:
                 _save_backtest_artifact(
                     fold_dir / "test_backtest_continuous_surrogate.npz",
                     test_bt,
@@ -15976,6 +16572,123 @@ def _run_training_tree_models(
     return [results_by_fold[fold.fold_id] for fold in fold_list if fold.fold_id in results_by_fold]
 
 
+def _training_dataset_identity(panel: PanelData) -> dict[str, Any]:
+    return {
+        "dates": int(panel.num_dates),
+        "first_date": (
+            None if panel.num_dates == 0 else str(np.asarray(panel.dates[0]))
+        ),
+        "last_date": (
+            None if panel.num_dates == 0 else str(np.asarray(panel.dates[-1]))
+        ),
+        "symbols": int(panel.num_symbols),
+        "features": int(len(panel.feature_names)),
+        "symbol_names": [str(symbol) for symbol in panel.symbols],
+        "feature_names": [str(name) for name in panel.feature_names],
+    }
+
+
+def _start_training_lifecycle(
+    panel: PanelData,
+    folds: Sequence[WalkForwardFold],
+    config: ExperimentConfig,
+    output_dir: str | Path,
+) -> TrainingRunLifecycle:
+    configuration = asdict(config)
+    dataset_identity = _training_dataset_identity(panel)
+    lifecycle = TrainingRunLifecycle(
+        output_dir,
+        execution_mode=config.trading.execution_mode,
+        run_mode="train",
+        strategy=str(
+            getattr(config.training, "multi_gpu_strategy", "none") or "none"
+        ),
+        model_name=config.training.model_name,
+        writer_enabled=_distributed_should_write(),
+    )
+    lifecycle.start(
+        fold_ids=[fold.fold_id for fold in folds],
+        dataset_fingerprint=_stable_fingerprint(dataset_identity),
+        configuration_fingerprint=_stable_fingerprint(
+            _configuration_fingerprint_snapshot(config)
+        ),
+        contract_versions={
+            "canonical_backtest": int(CANONICAL_BACKTEST_CONTRACT_VERSION),
+        },
+        data_summary=dataset_identity,
+        configuration=configuration,
+        mode_details={"benchmark_name": str(config.data.benchmark_name)},
+    )
+    return lifecycle
+
+
+def _finalize_isolated_training_lifecycle(
+    panel: PanelData,
+    folds: Sequence[WalkForwardFold],
+    config: ExperimentConfig,
+    output_dir: str | Path,
+    results: Sequence[FoldResult],
+) -> None:
+    """Publish and validate one complete lifecycle after isolated fold workers.
+
+    A fresh-process worker deliberately owns only one fold.  It therefore
+    cannot validate the root summary or selected-fold identity for the full
+    parent run.  The orchestration parent calls this after rebuilding the
+    complete walk-forward artifacts.
+    """
+
+    fold_list = list(folds)
+    completed_fold_ids = sorted({int(result.fold_id) for result in results})
+    expected_fold_ids = sorted({int(fold.fold_id) for fold in fold_list})
+    if completed_fold_ids != expected_fold_ids:
+        raise RuntimeError(
+            "isolated training lifecycle cannot complete with partial fold "
+            f"coverage: expected={expected_fold_ids} "
+            f"completed={completed_fold_ids}"
+        )
+
+    lifecycle = _start_training_lifecycle(panel, fold_list, config, output_dir)
+    experiment_manifest = _checkpoint_manifest(panel, config)
+    lifecycle.update_manifest(
+        dataset_fingerprint=str(
+            experiment_manifest.get("fingerprints", {}).get("data", "")
+        ),
+        configuration_fingerprint=str(
+            experiment_manifest.get("configuration_fingerprint", "")
+        ),
+        contract_versions={
+            "checkpoint_manifest_schema": int(
+                experiment_manifest.get("schema_version", 0)
+            ),
+            "canonical_backtest": int(CANONICAL_BACKTEST_CONTRACT_VERSION),
+        },
+    )
+
+    grouped_folds: dict[tuple[int, ...], list[WalkForwardFold]] = {}
+    for fold in fold_list:
+        grouped_folds.setdefault(_group_key(fold.train_years), []).append(fold)
+    grouped_fold_items = list(grouped_folds.items())
+    for group_index, (train_years_key, group_folds) in enumerate(
+        grouped_fold_items,
+        start=1,
+    ):
+        train_years = list(train_years_key)
+        lifecycle.start_group(
+            group_name=_group_id(train_years),
+            group_index=group_index,
+            group_total=len(grouped_fold_items),
+            fold_ids=[fold.fold_id for fold in group_folds],
+            epoch_total=int(config.training.epochs),
+            message=f"Finalize isolated Train {train_years}",
+        )
+        for fold in group_folds:
+            lifecycle.finish_fold(fold.fold_id)
+    lifecycle.complete(
+        fold_ids=completed_fold_ids,
+        message=f"completed {len(results)} isolated fold(s)",
+    )
+
+
 def run_training(
     panel: PanelData,
     folds: Iterable[WalkForwardFold],
@@ -15991,43 +16704,7 @@ def run_training(
     deployment_fold_list = (
         fold_list if deployment_folds is None else list(deployment_folds)
     )
-    configuration = asdict(config)
-    dataset_identity = {
-        "dates": int(panel.num_dates),
-        "first_date": (
-            None if panel.num_dates == 0 else str(np.asarray(panel.dates[0]))
-        ),
-        "last_date": (
-            None if panel.num_dates == 0 else str(np.asarray(panel.dates[-1]))
-        ),
-        "symbols": int(panel.num_symbols),
-        "features": int(len(panel.feature_names)),
-        "symbol_names": [str(symbol) for symbol in panel.symbols],
-        "feature_names": [str(name) for name in panel.feature_names],
-    }
-    lifecycle = TrainingRunLifecycle(
-        output_dir,
-        execution_mode=config.trading.execution_mode,
-        run_mode="train",
-        strategy=str(
-            getattr(config.training, "multi_gpu_strategy", "none") or "none"
-        ),
-        model_name=config.training.model_name,
-        writer_enabled=_distributed_should_write(),
-    )
-    lifecycle.start(
-        fold_ids=[fold.fold_id for fold in fold_list],
-        dataset_fingerprint=_stable_fingerprint(dataset_identity),
-        configuration_fingerprint=_stable_fingerprint(
-            _configuration_fingerprint_snapshot(config)
-        ),
-        contract_versions={
-            "canonical_backtest": int(CANONICAL_BACKTEST_CONTRACT_VERSION),
-        },
-        data_summary=dataset_identity,
-        configuration=configuration,
-        mode_details={"benchmark_name": str(config.data.benchmark_name)},
-    )
+    lifecycle = _start_training_lifecycle(panel, fold_list, config, output_dir)
     try:
         results = _run_training_impl(
             panel,
@@ -16043,6 +16720,20 @@ def run_training(
         lifecycle.fail(exc)
         raise
     completed_fold_ids = [result.fold_id for result in results]
+
+    # A fold-isolation child cannot truthfully validate or publish the root
+    # lifecycle: its selected-fold view contains exactly one fold, while the
+    # canonical summary belongs to the parent selection.  Returning here also
+    # avoids rebuilding global plots in every fresh child.  The parent performs
+    # one full refresh and calls _finalize_isolated_training_lifecycle.
+    if _isolated_fold_child_enabled():
+        if _distributed_should_write():
+            print(
+                "[lifecycle] isolated fold artifacts complete; root lifecycle "
+                "completion deferred to parent",
+                flush=True,
+            )
+        return results
 
     def complete_lifecycle_on_rank0() -> None:
         lifecycle.complete(
@@ -16387,6 +17078,13 @@ def _run_inference_tree_models(
             symbols=test_symbols,
             dates=test_dates,
             collect_holdings=write_integer_holdings_table,
+            precomputed_exact_backtest=(
+                test_bt
+                if _tensor_day_trade_is_whole_lot_exact(
+                    config, execution_runtime
+                )
+                else None
+            ),
             **_integer_execution_runtime_kwargs(
                 execution_runtime,
                 open_prices=test_open_prices,
@@ -16403,8 +17101,13 @@ def _run_inference_tree_models(
             ),
         )
         test_integer_met = compute_metrics(test_integer_bt)
+        canonical_tensor_day_trade = _canonical_tensor_day_trade_enabled(
+            config, execution_runtime
+        )
         canonical_test_bt = (
-            test_integer_bt if execution_runtime.mode != "naive" else test_bt
+            test_bt
+            if execution_runtime.mode == "naive" or canonical_tensor_day_trade
+            else test_integer_bt
         )
         deployment_test_bt = _prefix_backtest_result(
             canonical_test_bt,
@@ -16421,13 +17124,16 @@ def _run_inference_tree_models(
             val_metrics=val_met,
             test_ic=test_ic,
             test_metrics=(
-                test_integer_met
-                if execution_runtime.mode != "naive"
-                else test_met
+                test_met
+                if execution_runtime.mode == "naive" or canonical_tensor_day_trade
+                else test_integer_met
             ),
             test_integer_metrics=test_integer_met,
             test_continuous_surrogate_metrics=(
-                test_met if execution_runtime.mode != "naive" else None
+                test_met
+                if execution_runtime.mode != "naive"
+                and not canonical_tensor_day_trade
+                else None
             ),
         )
         results_by_fold[fold.fold_id] = fold_result
@@ -16438,7 +17144,7 @@ def _run_inference_tree_models(
         _save_backtest_artifact(
             _backtest_path(fold_dir), canonical_test_bt, test_dates
         )
-        if execution_runtime.mode != "naive":
+        if execution_runtime.mode != "naive" and not canonical_tensor_day_trade:
             _save_backtest_artifact(
                 fold_dir / "test_backtest_continuous_surrogate.npz",
                 test_bt,
@@ -16625,7 +17331,62 @@ def _run_inference_neural_models(
         panel_slab_model: nn.Module | None = None
         if _model_supports_panel_slab_forward(model):
             panel_slab_model = _PanelSlabForwardWrapper(model)
-            print(f"[Fold {fold.fold_id}] inference mode=windowed panel_slab_forward=eager")
+            compile_inference_slab = bool(
+                config.training.enable_torch_compile
+                and getattr(config.training, "compile_eval_model", False)
+            )
+            if compile_inference_slab:
+                can_compile, reason = _can_enable_torch_compile(device)
+                if can_compile:
+                    try:
+                        compile_mode = str(
+                            getattr(
+                                config.training,
+                                "torch_compile_mode",
+                                "default",
+                            )
+                            or "default"
+                        )
+                        panel_slab_model = torch.compile(
+                            panel_slab_model,
+                            fullgraph=True,
+                            dynamic=False,
+                            options=_torch_compile_options(
+                                compile_mode,
+                                cudagraphs=False,
+                            ),
+                        )
+                        print(
+                            f"[Fold {fold.fold_id}] inference mode=windowed "
+                            "panel_slab_forward=compiled:fullgraph:"
+                            f"cudagraphs_false ({reason})"
+                        )
+                    except Exception as exc:
+                        if bool(config.training.strict_no_fallback):
+                            raise RuntimeError(
+                                f"[Fold {fold.fold_id}] inference panel-slab "
+                                "compile failed; strict_no_fallback=true"
+                            ) from exc
+                        panel_slab_model = _PanelSlabForwardWrapper(model)
+                        print(
+                            f"[Fold {fold.fold_id}] inference panel-slab compile "
+                            f"failed, using eager: {type(exc).__name__}: {exc}"
+                        )
+                else:
+                    if bool(config.training.strict_no_fallback):
+                        raise RuntimeError(
+                            f"[Fold {fold.fold_id}] inference compile unavailable "
+                            f"({reason}); strict_no_fallback=true"
+                        )
+                    print(
+                        f"[Fold {fold.fold_id}] inference mode=windowed "
+                        f"panel_slab_forward=eager ({reason})"
+                    )
+            else:
+                print(
+                    f"[Fold {fold.fold_id}] inference mode=windowed "
+                    "panel_slab_forward=eager"
+                )
         else:
             print(f"[Fold {fold.fold_id}] inference mode=windowed panel_forward=fallback")
 
@@ -16939,6 +17700,13 @@ def _run_inference_neural_models(
             symbols=test_symbols,
             dates=test_dates,
             collect_holdings=write_integer_holdings_table,
+            precomputed_exact_backtest=(
+                test_bt
+                if _tensor_day_trade_is_whole_lot_exact(
+                    config, fold_execution_runtime
+                )
+                else None
+            ),
             **_integer_execution_runtime_kwargs(
                 fold_execution_runtime,
                 open_prices=test_open_prices,
@@ -16961,10 +17729,13 @@ def _run_inference_neural_models(
             ),
         )
         test_integer_met = compute_metrics(test_integer_bt)
+        canonical_tensor_exact = _canonical_tensor_day_trade_enabled(
+            config, fold_execution_runtime
+        )
         canonical_test_bt = (
-            test_integer_bt
-            if fold_execution_runtime.mode != "naive"
-            else test_bt
+            test_bt
+            if fold_execution_runtime.mode == "naive" or canonical_tensor_exact
+            else test_integer_bt
         )
         deployment_test_bt = _prefix_backtest_result(
             canonical_test_bt,
@@ -16981,13 +17752,16 @@ def _run_inference_neural_models(
             val_metrics=val_met,
             test_ic=test_ic,
             test_metrics=(
-                test_integer_met
-                if fold_execution_runtime.mode != "naive"
-                else test_met
+                test_met
+                if fold_execution_runtime.mode == "naive" or canonical_tensor_exact
+                else test_integer_met
             ),
             test_integer_metrics=test_integer_met,
             test_continuous_surrogate_metrics=(
-                test_met if fold_execution_runtime.mode != "naive" else None
+                test_met
+                if fold_execution_runtime.mode != "naive"
+                and not canonical_tensor_exact
+                else None
             ),
         )
         results_by_fold[fold.fold_id] = fold_result
@@ -16998,7 +17772,7 @@ def _run_inference_neural_models(
         _save_backtest_artifact(
             _backtest_path(fold_dir), canonical_test_bt, test_dates
         )
-        if fold_execution_runtime.mode != "naive":
+        if fold_execution_runtime.mode != "naive" and not canonical_tensor_exact:
             _save_backtest_artifact(
                 fold_dir / "test_backtest_continuous_surrogate.npz",
                 test_bt,
@@ -17289,6 +18063,12 @@ def _run_training_impl(
     risk_loss_kwargs = {**factor_loss_kwargs, **portfolio_autoencoder_loss_kwargs}
     risk_loss_kwargs["min_trade_weight"] = loss_min_trade_weight
     risk_loss_kwargs["portfolio_activation"] = loss_portfolio_activation
+    risk_loss_kwargs["day_trade_execution_initial_capital"] = float(
+        config.trading.tw_index_futures_initial_capital
+        if normalize_execution_mode(config.trading.execution_mode)
+        == "tw_index_futures_day"
+        else config.trading.volume_participation_equity
+    )
     risk_loss_kwargs["net_exposure_weight"] = config.training.multitask_loss.net_exposure_weight
     factor_aug_kwargs = _factor_augmentation_kwargs(config, loss_objective)
     if factor_aug_kwargs and _distributed_is_rank0():
@@ -17335,6 +18115,22 @@ def _run_training_impl(
             "execution_mode": execution_runtime.mode,
             "buy_fee_rates": execution_runtime.buy_fee_rates,
             "sell_fee_rates": execution_runtime.sell_fee_rates,
+            "normal_sell_fee_rates": execution_runtime.normal_sell_fee_rates,
+            "day_trade_unlimited_margin_conversion": (
+                execution_runtime.day_trade_unlimited_margin_conversion
+            ),
+            "day_trade_margin_financing_ratio": (
+                execution_runtime.day_trade_margin_financing_ratio
+            ),
+            "day_trade_margin_financing_annual_rate": (
+                execution_runtime.day_trade_margin_financing_annual_rate
+            ),
+            "day_trade_margin_short_handling_fee_rate": (
+                execution_runtime.day_trade_margin_short_handling_fee_rate
+            ),
+            "day_trade_margin_short_annual_borrow_rate": (
+                execution_runtime.day_trade_margin_short_annual_borrow_rate
+            ),
             "commission_rebate_rates": execution_runtime.commission_rebate_rates,
             "commission_rebate_timing": (
                 execution_runtime.commission_rebate_timing
@@ -17423,6 +18219,7 @@ def _run_training_impl(
     )
     next_fold_by_id = _next_fold_by_id(deployment_fold_list)
 
+    isolated_fold_child = _isolated_fold_child_enabled()
     retrain_completed_folds = _env_truthy("STOCKAGENT_RETRAIN_COMPLETED_FOLDS", "0")
     resume_artifact_error: BaseException | None = None
     if resume and not retrain_completed_folds:
@@ -17438,7 +18235,12 @@ def _run_training_impl(
         pending_resume_folds = [
             fold for fold in fold_list if fold.fold_id not in results_by_fold
         ]
-        if results_by_fold and not pending_resume_folds:
+        if results_by_fold and not pending_resume_folds and isolated_fold_child:
+            print(
+                "[resume] isolated fold child defers walk-forward artifact "
+                "refresh to its parent process"
+            )
+        elif results_by_fold and not pending_resume_folds:
             try:
                 _refresh_walkforward_artifacts(
                     output_path,
@@ -18238,8 +19040,26 @@ def _run_training_impl(
         compile_loss_requested = _env_truthy(
             "STOCKAGENT_COMPILE_LOSS", default_compile_loss
         )
+        tw_day_trade_minute_compile = bool(
+            execution_runtime.mode == "tw_day_trade"
+            and train_windowed is not None
+            and train_windowed.overnight_log_returns is not None
+            and train_windowed.overnight_log_returns.dim() == 3
+        )
+        tw_day_trade_daily_compile = bool(
+            execution_runtime.mode == "tw_day_trade"
+            and execution_runtime.day_trade_unlimited_margin_conversion
+            and not tw_day_trade_minute_compile
+        )
+        tw_index_futures_compile = bool(
+            execution_runtime.mode == "tw_index_futures_day"
+        )
         tw_settlement_compiled_rows = (
-            int(TW_DUAL_SESSION_COMPILED_BLOCK_ROWS)
+            int(TW_DAY_TRADE_MINUTE_COMPILED_BLOCK_ROWS)
+            if tw_day_trade_minute_compile
+            else int(tw_day_trade_daily_compiled_block_rows())
+            if tw_day_trade_daily_compile
+            else int(TW_DUAL_SESSION_COMPILED_BLOCK_ROWS)
             if execution_runtime.mode in TW_CARRYING_EXECUTION_MODES
             else int(
                 getattr(
@@ -18254,11 +19074,13 @@ def _run_training_impl(
             and (
                 execution_runtime.mode in TW_CARRYING_EXECUTION_MODES
                 or execution_runtime.mode == "tw_day_trade"
+                or tw_index_futures_compile
             )
             and device.type == "cuda"
             and bool(config.training.backtest_compile)
             and (
                 execution_runtime.mode in TW_CARRYING_EXECUTION_MODES
+                or tw_index_futures_compile
                 or tw_settlement_compiled_rows > 0
             )
         )
@@ -18276,6 +19098,7 @@ def _run_training_impl(
             # full-horizon graph.
             and execution_runtime.mode not in TW_CARRYING_EXECUTION_MODES
             and execution_runtime.mode != "tw_day_trade"
+            and not tw_index_futures_compile
         )
         # Bucketed compaction already bounds expanding groups to a small set of
         # fixed widths. Compile one loss graph per bucket instead of reusing the
@@ -18543,6 +19366,7 @@ def _run_training_impl(
                                     execution_runtime.mode
                                     in TW_CARRYING_EXECUTION_MODES
                                     or execution_runtime.mode == "tw_day_trade"
+                                    or tw_index_futures_compile
                                 )
                                 else "off:eager"
                             )
@@ -18596,6 +19420,7 @@ def _run_training_impl(
         elif (
             execution_runtime.mode in TW_CARRYING_EXECUTION_MODES
             or execution_runtime.mode == "tw_day_trade"
+            or tw_index_futures_compile
         ):
             loss_compile_status = "off:tw_outer_compile_guard:eager"
         else:
@@ -18840,8 +19665,14 @@ def _run_training_impl(
         loss_probe_rank_ordered = rank_ordered_compile_probes
         tw_compile_stats_before = get_tw_continuous_compile_stats()
         tw_compile_stats_after = dict(tw_compile_stats_before)
+        tw_minute_stats_before = get_tw_day_trade_minute_compile_stats()
+        tw_minute_stats_after = dict(tw_minute_stats_before)
+        tw_daily_stats_before = get_tw_day_trade_daily_compile_stats()
+        tw_daily_stats_after = dict(tw_daily_stats_before)
         tw_dual_stats_before = get_tw_dual_session_compile_stats()
         tw_dual_stats_after = dict(tw_dual_stats_before)
+        tw_futures_stats_before = get_tw_index_futures_compile_stats()
+        tw_futures_stats_after = dict(tw_futures_stats_before)
         tw_compiled_calls_delta = 0
         tw_compiled_day_calls_delta = 0
         tw_fallback_calls_delta = 0
@@ -18907,9 +19738,35 @@ def _run_training_impl(
                 and compiled_loss_fn.disabled
             )
             tw_compile_stats_after = get_tw_continuous_compile_stats()
+            tw_minute_stats_after = get_tw_day_trade_minute_compile_stats()
+            tw_daily_stats_after = get_tw_day_trade_daily_compile_stats()
             tw_dual_stats_after = get_tw_dual_session_compile_stats()
+            tw_futures_stats_after = get_tw_index_futures_compile_stats()
             if tw_settlement_chunk_compile:
-                if execution_runtime.mode in TW_CARRYING_EXECUTION_MODES:
+                if tw_day_trade_minute_compile:
+                    chunk_calls = int(
+                        tw_minute_stats_after["compiled_day_calls"]
+                        - tw_minute_stats_before["compiled_day_calls"]
+                    )
+                    tw_compiled_day_calls_delta = chunk_calls
+                    chunk_fallbacks = int(
+                        tw_minute_stats_after["eager_fallback_calls"]
+                        - tw_minute_stats_before["eager_fallback_calls"]
+                    )
+                elif tw_day_trade_daily_compile:
+                    chunk_calls = int(
+                        tw_daily_stats_after["compiled_block_calls"]
+                        - tw_daily_stats_before["compiled_block_calls"]
+                    )
+                    tw_compiled_day_calls_delta = int(
+                        tw_daily_stats_after["compiled_day_calls"]
+                        - tw_daily_stats_before["compiled_day_calls"]
+                    )
+                    chunk_fallbacks = int(
+                        tw_daily_stats_after["eager_fallback_calls"]
+                        - tw_daily_stats_before["eager_fallback_calls"]
+                    )
+                elif execution_runtime.mode in TW_CARRYING_EXECUTION_MODES:
                     chunk_calls = int(
                         tw_dual_stats_after["compiled_block_calls"]
                         - tw_dual_stats_before["compiled_block_calls"]
@@ -18921,6 +19778,19 @@ def _run_training_impl(
                     chunk_fallbacks = int(
                         tw_dual_stats_after["eager_fallback_calls"]
                         - tw_dual_stats_before["eager_fallback_calls"]
+                    )
+                elif tw_index_futures_compile:
+                    chunk_calls = int(
+                        tw_futures_stats_after["compiled_block_calls"]
+                        - tw_futures_stats_before["compiled_block_calls"]
+                    )
+                    tw_compiled_day_calls_delta = int(
+                        tw_futures_stats_after["compiled_day_calls"]
+                        - tw_futures_stats_before["compiled_day_calls"]
+                    )
+                    chunk_fallbacks = int(
+                        tw_futures_stats_after["eager_fallback_calls"]
+                        - tw_futures_stats_before["eager_fallback_calls"]
                     )
                 else:
                     chunk_calls = int(
@@ -19070,7 +19940,7 @@ def _run_training_impl(
             f"model_dynamic_symbol_bounds={dynamic_model_symbol_bounds}; "
             f"loss_compile={loss_compile_status}; "
             f"loss_compile_dynamic_symbols={compile_loss_dynamic_symbols}; "
-            f"tw_settlement_compile_chunk_rows={int(getattr(config.training, 'tw_continuous_compile_chunk_rows', 8))}; "
+            f"tw_settlement_compile_chunk_rows={int(tw_settlement_compiled_rows)}; "
             f"backtest_compile={bool(config.training.backtest_compile)}; "
             f"backtest_stateful_compile={bool(config.training.backtest_compile_stateful)}; "
             f"backtest_compile_dynamic={bool(getattr(config.training, 'backtest_compile_dynamic', False))}; "
@@ -19134,13 +20004,23 @@ def _run_training_impl(
                 safety_margin_gb=float(config.training.vram_safety_margin_gb),
             )
 
+        # In parallel epoch evaluation rank 1 intentionally leaves validation
+        # on CPU, while its already-cached train split may still own the exact
+        # same immutable full-panel base.  Prefer the GPU validation base when
+        # present, otherwise try the train base before allocating another
+        # ~4 GiB copy solely for sampled test metadata.
+        test_cached_base = (
+            combined_val_windowed
+            if _tensor_on_requested_device(combined_val_windowed.features, device)
+            else train_windowed
+        )
         combined_test_windowed_shared = _maybe_share_windowed_base_from_cached(
             name=f"test windowed tensors {train_years}",
             split=combined_test_windowed,
             device=device,
             non_blocking=non_blocking,
             enabled=bool(config.training.cache_eval_tensors_on_gpu and cache_test_on_rank),
-            cached_base=combined_val_windowed,
+            cached_base=test_cached_base,
         )
         if combined_test_windowed_shared is not None:
             combined_test_windowed = combined_test_windowed_shared
@@ -19477,6 +20357,13 @@ def _run_training_impl(
                 symbols=test_symbols,
                 dates=test_dates,
                 collect_holdings=write_integer_holdings_table,
+                precomputed_exact_backtest=(
+                    test_bt
+                    if _tensor_day_trade_is_whole_lot_exact(
+                        config, execution_runtime
+                    )
+                    else None
+                ),
                 **_integer_execution_runtime_kwargs(
                     execution_runtime,
                     open_prices=test_open_prices,
@@ -19605,6 +20492,17 @@ def _run_training_impl(
                         "best_val": f"{min(c.best_val_loss for c in fold_contexts.values()):.6f}",
                         "no_improve": no_improve_epochs,
                         "lr": f"{optimizer.param_groups[0]['lr']:.2e}",
+                        "grad_norm": (
+                            f"{train_timing.gradient_norm_before_clip_sum / train_timing.gradient_norm_observations:.3e}"
+                            if train_timing.gradient_norm_observations > 0
+                            else "not_measured"
+                        ),
+                        "zero_grad": (
+                            f"{train_timing.gradient_norm_zero_batches}/"
+                            f"{train_timing.gradient_norm_observations}"
+                            if train_timing.gradient_norm_observations > 0
+                            else "not_measured"
+                        ),
                         "bt": (
                             f"{bt_stats_after['hits']}/"
                             f"{bt_stats_after['misses']}/"
@@ -20198,6 +21096,17 @@ def _run_training_impl(
                         "best_val": f"{min(c.best_val_loss for c in fold_contexts.values()):.8f}",
                         "no_improve": no_improve_epochs,
                         "lr": f"{optimizer.param_groups[0]['lr']:.2e}",
+                        "grad_norm": (
+                            f"{train_timing.gradient_norm_before_clip_sum / train_timing.gradient_norm_observations:.3e}"
+                            if train_timing.gradient_norm_observations > 0
+                            else "not_measured"
+                        ),
+                        "zero_grad": (
+                            f"{train_timing.gradient_norm_zero_batches}/"
+                            f"{train_timing.gradient_norm_observations}"
+                            if train_timing.gradient_norm_observations > 0
+                            else "not_measured"
+                        ),
                         "bt": (
                             f"{bt_stats_after['hits']}/"
                             f"{bt_stats_after['misses']}/"
@@ -20603,6 +21512,13 @@ def _run_training_impl(
                     symbols=test_symbols,
                     dates=test_dates,
                     collect_holdings=write_integer_holdings_table,
+                    precomputed_exact_backtest=(
+                        test_bt
+                        if _tensor_day_trade_is_whole_lot_exact(
+                            config, execution_runtime
+                        )
+                        else None
+                    ),
                     **_integer_execution_runtime_kwargs(
                         execution_runtime,
                         open_prices=test_open_prices,
@@ -20638,6 +21554,16 @@ def _run_training_impl(
                             test_ic=test_ic,
                             test_metrics=test_met,
                             test_integer_metrics=test_integer_met,
+                            canonical_tensor_exact=(
+                                _canonical_tensor_day_trade_enabled(
+                                    config, execution_runtime
+                                )
+                            ),
+                            canonical_tensor_label=(
+                                "daily-tplus2-close"
+                                if execution_runtime.day_trade_unlimited_margin_conversion
+                                else "exact-minute"
+                            ),
                         )
                     )
                 )
@@ -20694,7 +21620,12 @@ def _run_training_impl(
                 selected_folds_complete = all(
                     selected.fold_id in results_by_fold for selected in fold_list
                 )
-                if selected_folds_complete:
+                if selected_folds_complete and isolated_fold_child:
+                    plot_timing["walkforward_refresh_s"] = 0.0
+                    plot_timing["walkforward_refresh_status"] = (
+                        "deferred_to_isolation_parent"
+                    )
+                elif selected_folds_complete:
                     refresh_start = time.perf_counter()
                     _refresh_walkforward_artifacts(
                         output_path,

@@ -1,0 +1,63 @@
+base_config: tw_day_trade_1m.yaml
+
+# 真實「每日模型」：模型每個交易日只在開盤時輸出一次權重；訓練 loss
+# 本身依序執行 09:01 首分鐘 VWAP、13:20 限價、13:24 市價、13:25
+# Limit ROD / 13:30 收盤集合競價，並以每一分鐘 K 量 50% 作成交上限。
+experiment_name: tw-day-trade-daily-policy-minute-execution-tplus2-close-v3
+
+runner:
+  # execution contract v16：T 日只留下淨差額，T+2 收盤後入帳、T+3
+  # 開盤才能用於 sizing。與 v2 即時複利 checkpoint 不相容，使用新 root。
+  output_dir: artifacts/markets/tw_day_trade_1m_tplus2_close_v3
+  resume: true
+  # 訓練的 final artifact pass 已直接保存同一個 compiled exact-minute
+  # executor。避免完成後再以另一個模型執行 ABI 重播並覆寫結果。
+  post_train_infer: false
+
+data:
+  # 完整市場、通過稽核的分鐘 K 首日是 2020-03-02；不可把缺失的
+  # 2014--2020 分鐘成交路徑補成 open-to-close proxy。
+  panel_start_date: '2020-03-02'
+  day_trade_minute_execution_root: data_tw_minute/research_dataset
+
+walk_forward:
+  expected_first_year: 2020
+  min_train_years: 1
+  val_years: 1
+  require_future_test_year: false
+  require_contiguous_years: true
+
+trading:
+  execution_mode: tw_day_trade
+  frequency: daily
+  volume_participation_equity: 1000000.0
+  max_volume_participation: 0.5
+
+training:
+  # 事件執行器保留逐日 recurrence；只編譯固定形狀的四日事件核心並在
+  # 整段序列重用，避免把完整 batch 展開成無法排程的巨型 Triton kernel。
+  # train/validation/test 都走同一個精確 forward 與同一條 STE backward。
+  compile_loss: false
+  backtest_compile: true
+  backtest_compile_stateful: true
+  eval_backtest_compile: true
+
+  # Dual RTX 5090 實測：四日核心的 Fold 6 batch 96/128/192 =
+  # 1.100/0.977/1.089 秒，故選 128。相同 batch 的 DDP-2 為 0.994 秒，
+  # 仍慢於單卡且冷編譯約 60.7 秒；兩 rank 都必須保留同一條全域 NAV
+  # recurrence，第二張卡應平行跑其他實驗。
+  multi_gpu_strategy: none
+  batch_size_train: 128
+  batch_size_eval: 32
+  auto_batch_size: false
+  # 分鐘事件 tensor forward 已是整張 forward；保留其 daily weights 表，
+  # 但不再產生舊 open-to-close ledger 的逐股 holdings 偽稽核表。
+  save_integer_share_holdings_table: false
+
+  # 100 萬資本無法對 2,700 多檔 dense L1 初始權重各買一張。
+  # L1-ball projection 是每日模型本身的可微稀疏多空 head；它保留 raw
+  # score 正負方向並用 soft-threshold 產生精確零。train、infer、live 共用
+  # 同一輸出，避免 action-sparsemax 的 long/short 對稱抵銷，也避免用
+  # loss-only top-k 偷渡另一套策略。
+  financial_transformer:
+    portfolio_output_mode: projection_l1

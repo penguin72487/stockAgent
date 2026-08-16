@@ -1,0 +1,51 @@
+# V11 keeps the exact integer ledger and fee-adjusted log-utility forward, but
+# removes two numerically saturating policy parameterizations observed in V10.
+# Tensor-shape knobs remain powers of two; 18 action slots and 1000 epochs are
+# semantic/user contracts and intentionally remain exact.
+base_config: tw_index_futures_day_directional_night_dual_5090_v10.yaml
+
+experiment_name: tw-stock-futures-directional-night-dual-5090-100m-power2-v11
+
+runner:
+  output_dir: artifacts/markets/tw_index_futures_day_directional_night_dual_5090_100m_power2_v11
+  resume: true
+
+training:
+  # Daily futures direction supplies only one supervised economic outcome per
+  # session.  Use a smaller policy, stronger regularization, and fewer noisy
+  # validation comparisons instead of fitting a large stock encoder 1000 times.
+  learning_rate: 0.0001220703125       # 2^-13
+  weight_decay: 0.03125                # 2^-5
+  enable_lr_scheduler: true
+  lr_scheduler: warmup_cosine
+  lr_scheduler_warmup_steps: 64
+  lr_scheduler_eta_min: 0.00000762939453125  # 2^-17
+  val_interval_epochs: 8
+  curve_test_interval: 8
+  curve_plot_interval: 8
+  early_stopping_no_improve_ratio: 0.015625  # 16 checks = 128 epochs
+
+  transformer_base_portfolio:
+    d_model: 16
+    use_latent_factors: false
+    use_market_tokens: true
+    temporal_layers: 1
+    temporal_heads: 2
+    temporal_ffn_mult: 2
+    cross_layers: 1
+    cross_heads: 2
+    cross_ffn_mult: 2
+    joint_layers: 1
+    joint_heads: 2
+    joint_ffn_mult: 2
+    num_market_tokens: 4
+    head_hidden_dim: 16
+    dropout: 0.25
+
+    # Softsign does not round finite, ordinary logits to exactly +/-1 like
+    # tanh.  Centered/bounded allocation logits prevent softmax from becoming
+    # an untrainable one-hot selector merely by increasing score magnitude.
+    futures_exposure_activation: softsign
+    futures_allocation_logit_scale: 2.0
+    futures_allocation_temperature: 2.0
+    futures_require_joint_context: true
