@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 import gzip
@@ -17,7 +18,6 @@ import sys
 import threading
 import time
 from typing import Any, Callable, Final, Mapping
-from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlencode, urlparse
 from urllib.request import ProxyHandler, build_opener
 
@@ -42,6 +42,9 @@ from stockagent.live.openbb_archive_dashboard import (  # noqa: E402
     build_openbb_public_history,
     build_openbb_public_status,
 )
+from stockagent.live.data_monitor_dashboard import (  # noqa: E402
+    build_data_monitor_public_status,
+)
 from stockagent.live.tw_day_trade_dashboard import (  # noqa: E402
     build_dashboard_event_page,
     build_dashboard_history_snapshot,
@@ -58,7 +61,18 @@ MAX_CACHE_ENTRIES: Final[int] = 512
 PUBLIC_AUDIT_BURST_CAPACITY: Final[float] = 45.0
 PUBLIC_AUDIT_REFILL_PER_SECOND: Final[float] = 1.0
 PUBLIC_AUDIT_HISTORY_COST: Final[float] = 2.0
+PUBLIC_GLOBAL_BURST_CAPACITY: Final[float] = 180.0
+PUBLIC_GLOBAL_REFILL_PER_SECOND: Final[float] = 30.0
+PUBLIC_GLOBAL_RATE_KEY: Final[str] = "all-public-api"
 _OPENER = build_opener(ProxyHandler({}))
+
+
+class InvalidPublicRequest(ValueError):
+    """A caller-controlled query error that is safe to report as HTTP 400."""
+
+
+class PublicRouteNotFound(KeyError):
+    """An unknown public route, distinct from an internal mapping failure."""
 
 
 @dataclass(frozen=True)
@@ -151,6 +165,7 @@ def build_public_overview(
     tw: Mapping[str, Any],
     shioaji: Mapping[str, Any],
     openbb: Mapping[str, Any] | None = None,
+    data_monitor: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return only the fields required by the public landing cards."""
 
@@ -165,6 +180,9 @@ def build_public_overview(
     openbb = openbb if isinstance(openbb, Mapping) else {}
     openbb_archive = openbb.get("archive")
     openbb_archive = openbb_archive if isinstance(openbb_archive, Mapping) else {}
+    data_monitor = data_monitor if isinstance(data_monitor, Mapping) else {}
+    data_summary = data_monitor.get("summary")
+    data_summary = data_summary if isinstance(data_summary, Mapping) else {}
     return {
         "schema_version": 1,
         "generated_at_utc": datetime.now(UTC).isoformat(),
@@ -231,6 +249,15 @@ def build_public_overview(
             "total_tasks": openbb_archive.get("total_tasks", 0),
             "success_rows": openbb_archive.get("success_rows", 0),
         },
+        "data_monitor": {
+            "health": data_monitor.get("health"),
+            "registered_items": data_summary.get("registered_items", 0),
+            "healthy_or_progressing": data_summary.get(
+                "healthy_or_progressing", 0
+            ),
+            "attention_required": data_summary.get("attention_required", 0),
+            "source_level_ratio": data_summary.get("source_level_ratio"),
+        },
     }
 
 
@@ -248,6 +275,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
         tw_static_root: Path,
         shioaji_static_root: Path,
         openbb_static_root: Path,
+        data_monitor_static_root: Path,
         repo_root: Path,
         taifex_upstream: str,
         tw_upstream: str,
@@ -258,6 +286,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
         self.tw_static_root = Path(tw_static_root)
         self.shioaji_static_root = Path(shioaji_static_root)
         self.openbb_static_root = Path(openbb_static_root)
+        self.data_monitor_static_root = Path(data_monitor_static_root)
         self.repo_root = Path(repo_root)
         self.taifex_upstream = str(taifex_upstream).rstrip("/")
         self.tw_upstream = str(tw_upstream).rstrip("/")
@@ -267,6 +296,16 @@ class PublicDashboardServer(ThreadingHTTPServer):
         self.request_auditor = TokenBucketRateLimiter(
             capacity=PUBLIC_AUDIT_BURST_CAPACITY,
             refill_per_second=PUBLIC_AUDIT_REFILL_PER_SECOND,
+        )
+        # A global limiter is deliberately generous and independent of client
+        # identity.  IPv4 visitors can share one router address, while a flood
+        # still needs a hard application-level ceiling before expensive JSON
+        # scans and compression.  The concurrency semaphore remains the
+        # instantaneous work bound.
+        self.global_api_limiter = TokenBucketRateLimiter(
+            capacity=PUBLIC_GLOBAL_BURST_CAPACITY,
+            refill_per_second=PUBLIC_GLOBAL_REFILL_PER_SECOND,
+            maximum_clients=1,
         )
         self.api_slots = threading.BoundedSemaphore(API_CONCURRENCY)
         self._cache: dict[str, CacheEntry] = {}
@@ -535,9 +574,34 @@ class PublicDashboardServer(ThreadingHTTPServer):
             builder=lambda: build_openbb_public_history(self.repo_root, range_key),
         )
 
+    def data_monitor_status(
+        self,
+        *,
+        shioaji_status: Mapping[str, Any] | None = None,
+        openbb_status: Mapping[str, Any] | None = None,
+    ) -> PreparedResponse:
+        return self.cached_local_json(
+            cache_key="data-monitor-status",
+            ttl_seconds=8.0,
+            cache_control="no-store",
+            stale_grace_seconds=0.0,
+            builder=lambda: build_data_monitor_public_status(
+                self.repo_root,
+                shioaji_status=shioaji_status,
+                openbb_status=openbb_status,
+            ),
+        )
+
     def public_overview(self) -> Mapping[str, Any]:
-        taifex = _response_json(
-            self.cached_json(
+        # These sources are independent.  Build their verified snapshots on
+        # the critical path concurrently, then reuse Shioaji/OpenBB in the
+        # dependent all-data projection instead of reading them twice.
+        with ThreadPoolExecutor(
+            max_workers=4,
+            thread_name_prefix="public-overview",
+        ) as executor:
+            taifex_future = executor.submit(
+                self.cached_json,
                 cache_key="taifex-status",
                 upstream_url=f"{self.taifex_upstream}/api/status",
                 ttl_seconds=2.0,
@@ -545,19 +609,42 @@ class PublicDashboardServer(ThreadingHTTPServer):
                 stale_grace_seconds=0.0,
                 sanitizer=sanitize_taifex_status,
             )
-        )
-        tw = _response_json(self.tw_status())
-        shioaji = _response_json(
-            self.cached_local_json(
+            tw_future = executor.submit(self.tw_status)
+            shioaji_future = executor.submit(
+                self.cached_local_json,
                 cache_key="shioaji-status",
                 ttl_seconds=8.0,
                 cache_control="no-store",
                 stale_grace_seconds=0.0,
                 builder=lambda: build_shioaji_public_status(self.repo_root),
             )
+            openbb_future = executor.submit(self.openbb_status)
+            taifex = _response_json(taifex_future.result())
+            tw = _response_json(tw_future.result())
+            shioaji = _response_json(shioaji_future.result())
+            openbb = _response_json(openbb_future.result())
+        data_monitor = _response_json(
+            self.data_monitor_status(
+                shioaji_status=shioaji,
+                openbb_status=openbb,
+            )
         )
-        openbb = _response_json(self.openbb_status())
-        return build_public_overview(taifex, tw, shioaji, openbb)
+        return build_public_overview(taifex, tw, shioaji, openbb, data_monitor)
+
+    def prewarm_overview(self) -> None:
+        try:
+            self.cached_local_json(
+                cache_key="public-overview",
+                ttl_seconds=55.0,
+                cache_control="no-store",
+                stale_grace_seconds=0.0,
+                builder=self.public_overview,
+            )
+        except Exception as error:
+            sys.stderr.write(
+                "public-dashboard prewarm_failed "
+                f"error={type(error).__name__}\n"
+            )
 
 
 class PublicDashboardHandler(BaseHTTPRequestHandler):
@@ -573,17 +660,33 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Cross-Origin-Opener-Policy", "same-origin")
         self.send_header("Cross-Origin-Resource-Policy", "same-origin")
+        self.send_header("Origin-Agent-Cluster", "?1")
+        self.send_header("X-Permitted-Cross-Domain-Policies", "none")
         self.send_header(
             "Permissions-Policy",
-            "camera=(), microphone=(), geolocation=(), payment=(), usb=()",
+            "accelerometer=(), autoplay=(), camera=(), display-capture=(), "
+            "encrypted-media=(), fullscreen=(), geolocation=(), gyroscope=(), "
+            "magnetometer=(), microphone=(), payment=(), picture-in-picture=(), "
+            "publickey-credentials-get=(), screen-wake-lock=(), usb=(), "
+            "web-share=()",
         )
         self.send_header("X-Robots-Tag", "noindex, nofollow, noarchive")
         self.send_header(
             "Content-Security-Policy",
             "default-src 'self'; script-src 'self'; style-src 'self'; "
             "img-src 'self' data:; connect-src 'self'; object-src 'none'; "
-            "base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+            "font-src 'self'; media-src 'none'; frame-src 'none'; "
+            "worker-src 'none'; manifest-src 'none'; base-uri 'none'; "
+            "form-action 'none'; frame-ancestors 'none'; "
+            "script-src-attr 'none'; style-src-attr 'none'",
         )
+
+    def _write_body(self, body: bytes) -> None:
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            # Browser navigation and aborted fetches are normal client events.
+            return
 
     def _client_key(self) -> str:
         peer = str(self.client_address[0])
@@ -634,11 +737,7 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
         self._security_headers()
         self.end_headers()
         if not head_only:
-            try:
-                self.wfile.write(body)
-            except (BrokenPipeError, ConnectionResetError):
-                # A browser navigation or aborted fetch is not a server fault.
-                return
+            self._write_body(body)
 
     def _send_json(
         self,
@@ -671,7 +770,7 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
         self._security_headers()
         self.end_headers()
         if not head_only:
-            self.wfile.write(body)
+            self._write_body(body)
 
     def _static_response(self, path: str) -> PreparedResponse | None:
         routes: dict[str, tuple[Path, str, str]] = {
@@ -711,6 +810,7 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
             ("/tw-day-trade/", self.server.tw_static_root),
             ("/shioaji/", self.server.shioaji_static_root),
             ("/openbb/", self.server.openbb_static_root),
+            ("/data-monitor/", self.server.data_monitor_static_root),
         ):
             suffix = path.removeprefix(prefix) if path.startswith(prefix) else None
             if suffix in {"", "index.html"}:
@@ -743,110 +843,136 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
 
     @staticmethod
     def _date_query(raw_query: str) -> str | None:
-        query = parse_qs(
-            raw_query,
-            keep_blank_values=True,
-            strict_parsing=False,
-            max_num_fields=1,
-        )
-        if set(query) - {"date"} or any(len(values) != 1 for values in query.values()):
-            raise ValueError("unsupported or repeated query field")
-        value = str(query.get("date", [""])[0]).strip()
-        if not value:
-            return None
-        date.fromisoformat(value)
-        return value
+        try:
+            query = parse_qs(
+                raw_query,
+                keep_blank_values=True,
+                strict_parsing=False,
+                max_num_fields=1,
+            )
+            if set(query) - {"date"} or any(
+                len(values) != 1 for values in query.values()
+            ):
+                raise InvalidPublicRequest("unsupported or repeated query field")
+            value = str(query.get("date", [""])[0]).strip()
+            if not value:
+                return None
+            date.fromisoformat(value)
+            return value
+        except InvalidPublicRequest:
+            raise
+        except (ValueError, OverflowError) as error:
+            raise InvalidPublicRequest("invalid date query") from error
 
     @staticmethod
     def _signal_query(raw_query: str) -> str:
-        query = parse_qs(
-            raw_query,
-            keep_blank_values=True,
-            strict_parsing=False,
-            max_num_fields=6,
-        )
-        allowed = {"date", "mode", "symbol", "status", "offset", "limit"}
-        if set(query) - allowed or any(len(values) != 1 for values in query.values()):
-            raise ValueError("unsupported or repeated query field")
-        mode = str(query.get("mode", [""])[0])[:64]
-        symbol = str(query.get("symbol", [""])[0])[:32]
-        status = str(query.get("status", ["all"])[0])[:32]
-        session_date = str(query.get("date", [""])[0]).strip()
-        if session_date:
-            date.fromisoformat(session_date)
-        offset = int(query.get("offset", ["0"])[0])
-        limit = int(query.get("limit", [str(PUBLIC_SIGNAL_LIMIT)])[0])
-        if offset < 0 or offset > 100_000:
-            raise ValueError("offset is outside the public range")
-        if limit < 1:
-            raise ValueError("limit must be positive")
-        limit = min(limit, PUBLIC_SIGNAL_LIMIT)
-        return urlencode(
-            {
-                "date": session_date,
-                "mode": mode,
-                "symbol": symbol,
-                "status": status,
-                "offset": offset,
-                "limit": limit,
-            }
-        )
+        try:
+            query = parse_qs(
+                raw_query,
+                keep_blank_values=True,
+                strict_parsing=False,
+                max_num_fields=6,
+            )
+            allowed = {"date", "mode", "symbol", "status", "offset", "limit"}
+            if set(query) - allowed or any(
+                len(values) != 1 for values in query.values()
+            ):
+                raise InvalidPublicRequest("unsupported or repeated query field")
+            mode = str(query.get("mode", [""])[0])[:64]
+            symbol = str(query.get("symbol", [""])[0])[:32]
+            status = str(query.get("status", ["all"])[0])[:32]
+            session_date = str(query.get("date", [""])[0]).strip()
+            if session_date:
+                date.fromisoformat(session_date)
+            offset = int(query.get("offset", ["0"])[0])
+            limit = int(query.get("limit", [str(PUBLIC_SIGNAL_LIMIT)])[0])
+            if offset < 0 or offset > 100_000:
+                raise InvalidPublicRequest("offset is outside the public range")
+            if limit < 1:
+                raise InvalidPublicRequest("limit must be positive")
+            limit = min(limit, PUBLIC_SIGNAL_LIMIT)
+            return urlencode(
+                {
+                    "date": session_date,
+                    "mode": mode,
+                    "symbol": symbol,
+                    "status": status,
+                    "offset": offset,
+                    "limit": limit,
+                }
+            )
+        except InvalidPublicRequest:
+            raise
+        except (ValueError, OverflowError) as error:
+            raise InvalidPublicRequest("invalid signal query") from error
 
     @staticmethod
     def _history_range_query(raw_query: str) -> str:
-        query = parse_qs(
-            raw_query,
-            keep_blank_values=True,
-            strict_parsing=False,
-            max_num_fields=1,
-        )
-        if set(query) - {"range"} or any(
-            len(values) != 1 for values in query.values()
-        ):
-            raise ValueError("unsupported or repeated query field")
-        value = str(query.get("range", ["1d"])[0]).strip().lower() or "1d"
-        if value not in {"1h", "1d", "1w", "1mo", "1q", "1y", "all"}:
-            raise ValueError("unsupported chart range")
-        return value
+        try:
+            query = parse_qs(
+                raw_query,
+                keep_blank_values=True,
+                strict_parsing=False,
+                max_num_fields=1,
+            )
+            if set(query) - {"range"} or any(
+                len(values) != 1 for values in query.values()
+            ):
+                raise InvalidPublicRequest("unsupported or repeated query field")
+            value = str(query.get("range", ["1d"])[0]).strip().lower() or "1d"
+            if value not in {"1h", "1d", "1w", "1mo", "1q", "1y", "all"}:
+                raise InvalidPublicRequest("unsupported chart range")
+            return value
+        except InvalidPublicRequest:
+            raise
+        except (ValueError, OverflowError) as error:
+            raise InvalidPublicRequest("invalid history query") from error
 
     @staticmethod
     def _event_query(raw_query: str) -> str:
-        query = parse_qs(
-            raw_query,
-            keep_blank_values=True,
-            strict_parsing=False,
-            max_num_fields=5,
-        )
-        allowed = {"date", "mode", "symbol", "offset", "limit"}
-        if set(query) - allowed or any(len(values) != 1 for values in query.values()):
-            raise ValueError("unsupported or repeated query field")
-        mode = str(query.get("mode", [""])[0])[:64]
-        symbol = str(query.get("symbol", [""])[0])[:32]
-        session_date = str(query.get("date", [""])[0]).strip()
-        if session_date:
-            date.fromisoformat(session_date)
-        offset = int(query.get("offset", ["0"])[0])
-        limit = int(query.get("limit", [str(PUBLIC_EVENT_LIMIT)])[0])
-        if offset < 0 or offset > 100_000:
-            raise ValueError("offset is outside the public range")
-        if limit < 1:
-            raise ValueError("limit must be positive")
-        limit = min(limit, PUBLIC_EVENT_LIMIT)
-        return urlencode(
-            {
-                "date": session_date,
-                "mode": mode,
-                "symbol": symbol,
-                "offset": offset,
-                "limit": limit,
-            }
-        )
+        try:
+            query = parse_qs(
+                raw_query,
+                keep_blank_values=True,
+                strict_parsing=False,
+                max_num_fields=5,
+            )
+            allowed = {"date", "mode", "symbol", "offset", "limit"}
+            if set(query) - allowed or any(
+                len(values) != 1 for values in query.values()
+            ):
+                raise InvalidPublicRequest("unsupported or repeated query field")
+            mode = str(query.get("mode", [""])[0])[:64]
+            symbol = str(query.get("symbol", [""])[0])[:32]
+            session_date = str(query.get("date", [""])[0]).strip()
+            if session_date:
+                date.fromisoformat(session_date)
+            offset = int(query.get("offset", ["0"])[0])
+            limit = int(query.get("limit", [str(PUBLIC_EVENT_LIMIT)])[0])
+            if offset < 0 or offset > 100_000:
+                raise InvalidPublicRequest("offset is outside the public range")
+            if limit < 1:
+                raise InvalidPublicRequest("limit must be positive")
+            limit = min(limit, PUBLIC_EVENT_LIMIT)
+            return urlencode(
+                {
+                    "date": session_date,
+                    "mode": mode,
+                    "symbol": symbol,
+                    "offset": offset,
+                    "limit": limit,
+                }
+            )
+        except InvalidPublicRequest:
+            raise
+        except (ValueError, OverflowError) as error:
+            raise InvalidPublicRequest("invalid event query") from error
 
     def _api_response(self, path: str, raw_query: str) -> PreparedResponse:
         if path == "/api/overview":
             return self.server.cached_local_json(
                 cache_key="public-overview",
-                ttl_seconds=2.0,
+                ttl_seconds=55.0,
                 cache_control="no-store",
                 stale_grace_seconds=0.0,
                 builder=self.server.public_overview,
@@ -935,7 +1061,9 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
             return self.server.openbb_status()
         if path == "/openbb/api/history":
             return self.server.openbb_history(self._history_range_query(raw_query))
-        raise KeyError(path)
+        if path == "/data-monitor/api/status":
+            return self.server.data_monitor_status()
+        raise PublicRouteNotFound(path)
 
     def _handle(self, *, head_only: bool) -> None:
         if len(self.path.encode("utf-8", errors="ignore")) > MAX_REQUEST_TARGET_BYTES:
@@ -947,7 +1075,13 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
             return
         parsed = urlparse(self.path)
         path = parsed.path
-        if path in {"/taifex", "/tw-day-trade", "/shioaji", "/openbb"}:
+        if path in {
+            "/taifex",
+            "/tw-day-trade",
+            "/shioaji",
+            "/openbb",
+            "/data-monitor",
+        }:
             self._redirect(f"{path}/", head_only=head_only)
             return
         if path == "/healthz":
@@ -968,11 +1102,12 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
 
         is_api = "/api/" in path
         if is_api:
+            cost = (
+                PUBLIC_AUDIT_HISTORY_COST if path.endswith("/api/history") else 1.0
+            )
             within_observation_envelope = self.server.request_auditor.allow(
                 self._client_key(),
-                cost=PUBLIC_AUDIT_HISTORY_COST
-                if path.endswith("/api/history")
-                else 1.0,
+                cost=cost,
             )
             if not within_observation_envelope:
                 sys.stderr.write(
@@ -980,6 +1115,21 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                     f"action=allowed peer={self._client_key()} path={path} "
                     f"user_agent_hash={self._user_agent_fingerprint()}\n"
                 )
+            if not self.server.global_api_limiter.allow(
+                PUBLIC_GLOBAL_RATE_KEY,
+                cost=cost,
+            ):
+                self.send_response(HTTPStatus.TOO_MANY_REQUESTS)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                body = b'{"error":"rate_limited"}\n'
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Retry-After", "2")
+                self._security_headers()
+                self.end_headers()
+                if not head_only:
+                    self._write_body(body)
+                return
 
         if is_api:
             if not self.server.api_slots.acquire(blocking=False):
@@ -991,27 +1141,28 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                 return
             try:
                 response = self._api_response(path, parsed.query)
-            except KeyError:
+            except PublicRouteNotFound:
                 self._send_json(
                     HTTPStatus.NOT_FOUND,
                     {"error": "not_found"},
                     head_only=head_only,
                 )
                 return
-            except ValueError:
+            except InvalidPublicRequest:
                 self._send_json(
                     HTTPStatus.BAD_REQUEST,
                     {"error": "invalid_request"},
                     head_only=head_only,
                 )
                 return
-            except (
-                HTTPError,
-                URLError,
-                OSError,
-                json.JSONDecodeError,
-                UnsafePublicDashboardPayload,
-            ):
+            except Exception as error:
+                # Public payload builders must fail closed.  Log only the
+                # exception class so paths, records, and upstream text never
+                # become an accidental public-service side channel.
+                sys.stderr.write(
+                    "public-dashboard api_failure "
+                    f"path={path} error={type(error).__name__}\n"
+                )
                 self._send_json(
                     HTTPStatus.SERVICE_UNAVAILABLE,
                     {"health": "unavailable", "error": "temporarily_unavailable"},
@@ -1051,7 +1202,7 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self._security_headers()
         self.end_headers()
-        self.wfile.write(body)
+        self._write_body(body)
 
     do_POST = _method_not_allowed
     do_PUT = _method_not_allowed
@@ -1096,6 +1247,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path("services/openbb_archive_dashboard"),
     )
+    parser.add_argument(
+        "--data-monitor-static-root",
+        type=Path,
+        default=Path("services/data_monitor_dashboard"),
+    )
     parser.add_argument("--repo-root", type=Path, default=REPO_ROOT)
     parser.add_argument("--taifex-upstream", default="http://127.0.0.1:8765")
     parser.add_argument("--tw-upstream", default="http://127.0.0.1:8766")
@@ -1113,10 +1269,16 @@ def main(argv: list[str] | None = None) -> int:
         tw_static_root=Path(args.tw_static_root),
         shioaji_static_root=Path(args.shioaji_static_root),
         openbb_static_root=Path(args.openbb_static_root),
+        data_monitor_static_root=Path(args.data_monitor_static_root),
         repo_root=Path(args.repo_root),
         taifex_upstream=str(args.taifex_upstream),
         tw_upstream=str(args.tw_upstream),
     )
+    threading.Thread(
+        target=server.prewarm_overview,
+        name="public-overview-prewarm",
+        daemon=True,
+    ).start()
     print(
         f"[public-dashboards] listening=http://{args.host}:{args.port} "
         "upstreams=localhost-only",

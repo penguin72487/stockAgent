@@ -1,6 +1,7 @@
 "use strict";
 
 const REFRESH_MS = 60000;
+const FETCH_TIMEOUT_MS = 15000;
 let refreshInFlight = false;
 
 const $ = (id) => document.getElementById(id);
@@ -16,6 +17,7 @@ function healthPresentation(value) {
     critical: "需要注意",
     degraded: "部分異常",
     starting: "啟動／稽核中",
+    updating: "回補進行中",
     complete: "封存完成",
     stopped: "程序停止",
     unavailable: "暫時離線",
@@ -24,6 +26,7 @@ function healthPresentation(value) {
 }
 
 function ageLabel(seconds) {
+  if (seconds == null || seconds === "") return "無更新時間";
   const value = Number(seconds);
   if (!Number.isFinite(value)) return "無更新時間";
   if (value < 60) return `${Math.max(0, Math.round(value))} 秒前`;
@@ -38,8 +41,25 @@ function setHealth(prefix, value, overrideLabel = null) {
   target.lastChild.textContent = overrideLabel || label;
 }
 
+async function fetchWithTimeout(path, options = {}) {
+  const controller = new AbortController();
+  const upstream = options.signal;
+  const forwardAbort = () => controller.abort(upstream?.reason);
+  if (upstream?.aborted) forwardAbort();
+  else upstream?.addEventListener("abort", forwardAbort, {once: true});
+  const timer = window.setTimeout(
+    () => controller.abort(new DOMException("Request timed out", "TimeoutError")),
+    FETCH_TIMEOUT_MS,
+  );
+  try { return await fetch(path, {...options, signal: controller.signal}); }
+  finally {
+    window.clearTimeout(timer);
+    upstream?.removeEventListener("abort", forwardAbort);
+  }
+}
+
 async function fetchJson(path) {
-  const response = await fetch(path, {cache: "no-store"});
+  const response = await fetchWithTimeout(path, {cache: "no-store"});
   if (!response.ok) throw new Error(`HTTP ${response.status}`);
   return response.json();
 }
@@ -85,8 +105,17 @@ function renderOpenbb(data) {
     $("openbb-progress").textContent = `${Number(data.completion_percent || 0).toFixed(2)}% · ${Number(data.accepted_tasks || 0).toLocaleString("zh-TW")}/${Number(data.total_tasks || 0).toLocaleString("zh-TW")}`;
 }
 
+function renderDataMonitor(data) {
+    const label = data.health === "active" ? "全部正常" : data.health === "updating" ? "回補進行中" : "有來源需處理";
+    setHealth("data", data.health, label);
+    $("data-registered").textContent = `${Number(data.registered_items || 0).toLocaleString("zh-TW")} 項`;
+    const healthy = Number(data.healthy_or_progressing || 0);
+    const attention = Number(data.attention_required || 0);
+    $("data-progress").textContent = `${healthy.toLocaleString("zh-TW")} 正常 · ${attention.toLocaleString("zh-TW")} 待處理`;
+}
+
 function renderUnavailable() {
-  for (const prefix of ["taifex", "tw", "shioaji", "openbb"]) setHealth(prefix, "unavailable");
+  for (const prefix of ["taifex", "tw", "shioaji", "openbb", "data"]) setHealth(prefix, "unavailable");
   $("taifex-freshness").textContent = "無法取得";
   $("tw-freshness").textContent = "無法取得";
   $("taifex-summary").textContent = "進入面板查看";
@@ -95,6 +124,8 @@ function renderUnavailable() {
   $("shioaji-progress").textContent = "進入面板查看";
   $("openbb-freshness").textContent = "無法取得";
   $("openbb-progress").textContent = "進入面板查看";
+  $("data-registered").textContent = "無法取得";
+  $("data-progress").textContent = "進入面板查看";
 }
 
 async function refresh() {
@@ -106,6 +137,7 @@ async function refresh() {
     renderTw(data.tw || {});
     renderShioaji(data.shioaji || {});
     renderOpenbb(data.openbb || {});
+    renderDataMonitor(data.data_monitor || {});
   } catch (_error) {
     renderUnavailable();
   } finally {

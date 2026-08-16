@@ -82,7 +82,7 @@ def test_shioaji_kbars_normalize_and_aggregate_volume_lots_to_shares() -> None:
     ]
 
 
-def test_shioaji_daily_aggregation_rejects_wrong_contract_unit() -> None:
+def test_shioaji_daily_aggregation_infers_historical_volume_unit_from_amount() -> None:
     minute = normalize_kbars(
         {
             "ts": [1583110860000000000],
@@ -97,8 +97,9 @@ def test_shioaji_daily_aggregation_rejects_wrong_contract_unit() -> None:
         market="twse",
         contract_unit=1.0,
     )
-    with pytest.raises(ValueError, match="amount/volume scale"):
-        aggregate_daily(minute, name="台積電")
+    daily = aggregate_daily(minute, name="台積電")
+    assert daily["Trading_Volume"].item() == 2000.0
+    assert daily["shioaji_volume_lots"].item() == 2000.0
 
 
 def _base_frame() -> pl.DataFrame:
@@ -197,6 +198,23 @@ def test_hybrid_dataset_drops_public_gap_instead_of_silent_fallback() -> None:
     ]
     assert date(2020, 3, 3) not in output.get_column("date").to_list()
     assert stats["dropped_public_rows_after_cutover"] == 1
+
+
+def test_hybrid_dataset_retains_only_receipt_declared_source_gap() -> None:
+    output, stats = merge_symbol_frames(
+        _base_frame(),
+        _shioaji_frame(omit_middle=True),
+        cutover=date(2020, 3, 2),
+        declared_source_gap_dates={date(2020, 3, 3)},
+    )
+    fallback = output.filter(pl.col("date") == date(2020, 3, 3)).row(
+        0, named=True
+    )
+    assert fallback["data_source"] == "twse_official"
+    assert fallback["fallback_reason"] == "shioaji_declared_source_gap"
+    assert fallback["close"] == 50.0
+    assert stats["public_source_gap_fallback_rows"] == 1
+    assert stats["dropped_public_rows_after_cutover"] == 0
 
 
 def test_hybrid_dataset_quarantines_new_row_without_public_adjustment_evidence() -> None:

@@ -1,6 +1,7 @@
 "use strict";
 
 const PRICE_REFRESH_MS = 60000;
+const FETCH_TIMEOUT_MS = 15000;
 const money = new Intl.NumberFormat("zh-TW", { maximumFractionDigits: 0 });
 const percent = new Intl.NumberFormat("zh-TW", { style: "percent", minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const ratio = new Intl.NumberFormat("zh-TW", { maximumFractionDigits: 2 });
@@ -44,6 +45,15 @@ if (!(selectedTimeRange in TIME_RANGES)) selectedTimeRange = "1d";
 
 function byId(id) { return document.getElementById(id); }
 function setText(id, value) { byId(id).textContent = value ?? "—"; }
+async function fetchWithTimeout(path, options = {}) {
+  const controller = new AbortController();
+  const timer = window.setTimeout(
+    () => controller.abort(new DOMException("Request timed out", "TimeoutError")),
+    FETCH_TIMEOUT_MS,
+  );
+  try { return await fetch(path, {...options, signal: controller.signal}); }
+  finally { window.clearTimeout(timer); }
+}
 function formatTwd(value) {
   if (value == null || !Number.isFinite(Number(value))) return "—";
   return `${money.format(Number(value))} TWD`;
@@ -801,7 +811,7 @@ async function refresh() {
   if (document.hidden || refreshInFlight) return;
   refreshInFlight = true;
   try {
-    const response = await fetch("api/status", { cache: "no-store" });
+    const response = await fetchWithTimeout("api/status", { cache: "no-store" });
     const payload = await response.json();
     if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
     render(payload);
@@ -845,7 +855,7 @@ async function refreshHistory({preferCache = false} = {}) {
   if (historyInFlight) return;
   historyInFlight = true;
   try {
-    const response = await fetch(`api/history?range=${encodeURIComponent(requestedRange)}`, { cache: "default" });
+    const response = await fetchWithTimeout(`api/history?range=${encodeURIComponent(requestedRange)}`, { cache: "default" });
     if (response.status === 429) {
       const retrySeconds = Math.min(30, Math.max(1, Number(response.headers.get("Retry-After")) || 5));
       setText("curve-wall-note", `${TIME_RANGE_LABELS[requestedRange]}歷史請求稍多，保留目前曲線並於 ${retrySeconds} 秒後自動重試。`);

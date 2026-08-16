@@ -26,6 +26,8 @@ def _snapshot(checked_at: datetime) -> dict[str, object]:
         "completion_percent": 72.0,
         "success_rows": 123456,
         "retryable_tasks": 8,
+        "pending_retry_deferred": 3,
+        "next_task_retry_at": (checked_at + timedelta(hours=2)).isoformat(),
         "unavailable_tasks": 18,
         "endpoint_count": 4,
         "min_free_bytes": 1,
@@ -106,6 +108,13 @@ def test_public_status_separates_live_process_truth_from_stale_audit(
     assert public["process"]["supervisor_alive"] is True
     assert public["process"]["downloader_alive"] is False
     assert public["archive"]["completion_percent"] == 72.0
+    assert public["archive"]["actionable_unresolved_tasks"] == 9
+    assert public["archive"]["retry_deferred_tasks"] == 3
+    assert public["archive"]["next_task_retry_at"] == (
+        now - timedelta(days=2) + timedelta(hours=2)
+    ).isoformat()
+    assert public["categories"][0]["missing_tasks"] == 5
+    assert public["categories"][0]["unavailable_tasks"] == 2
     assert public["providers"][0]["requests_per_second"] == 4.0
     assert public["alerts"][0]["message"].startswith("供應商配額形成")
     encoded = json.dumps(public, ensure_ascii=False)
@@ -118,6 +127,18 @@ def test_public_status_separates_live_process_truth_from_stale_audit(
         "/secret",
     ):
         assert forbidden not in encoded
+
+
+def test_openbb_page_uses_actionable_backlog_without_double_counting_unavailable() -> None:
+    root = Path(__file__).resolve().parents[1] / "services/openbb_archive_dashboard"
+    html = (root / "index.html").read_text(encoding="utf-8")
+    javascript = (root / "app.js").read_text(encoding="utf-8")
+    assert "可處理待辦" in html
+    assert "尚未接受且非永久不可用" in html
+    assert "archive.actionable_unresolved_tasks" in javascript
+    assert 'label: "尚未接受"' in javascript
+    assert 'let range = "1d"' in javascript
+    assert 'data-range="1d" class="active" aria-pressed="true"' in html
 
 
 def test_public_status_fails_closed_when_incomplete_processes_are_dead(

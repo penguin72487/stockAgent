@@ -1,16 +1,17 @@
 "use strict";
 
 const REFRESH_MS = 60000;
+const FETCH_TIMEOUT_MS = 15000;
 const timeAxis = window.StockAgentTimeAxis;
 const number = new Intl.NumberFormat("zh-TW");
 const compact = new Intl.NumberFormat("zh-TW", {notation: "compact", maximumFractionDigits: 2});
 const series = [
   {key: "accepted_percent", label: "已接受", color: "#ae8bff"},
   {key: "resolved_percent", label: "已判定", color: "#43d7ff"},
-  {key: "unresolved_percent", label: "尚未解決", color: "#f5bd4f"},
+  {key: "unresolved_percent", label: "尚未接受", color: "#f5bd4f"},
 ];
 const hiddenSeries = new Set();
-let range = "all";
+let range = "1d";
 let refreshInFlight = false;
 
 const $ = (id) => document.getElementById(id);
@@ -18,6 +19,7 @@ const finite = (value, fallback = 0) => Number.isFinite(Number(value)) ? Number(
 const pct = (value) => `${finite(value).toFixed(2)}%`;
 
 function ageLabel(seconds) {
+  if (seconds == null || seconds === "") return "無時間證據";
   const value = Number(seconds);
   if (!Number.isFinite(value)) return "無時間證據";
   if (value < 60) return `${Math.round(value)} 秒前`;
@@ -39,8 +41,18 @@ function healthLabel(health) {
   return ({active: "下載中", starting: "啟動／稽核中", complete: "封存完成", degraded: "活動逾時", stopped: "程序停止", unavailable: "無法取得"})[health] || "狀態未知";
 }
 
+async function fetchWithTimeout(path, options = {}) {
+  const controller = new AbortController();
+  const timer = window.setTimeout(
+    () => controller.abort(new DOMException("Request timed out", "TimeoutError")),
+    FETCH_TIMEOUT_MS,
+  );
+  try { return await fetch(path, {...options, signal: controller.signal}); }
+  finally { window.clearTimeout(timer); }
+}
+
 async function fetchJson(path) {
-  const response = await fetch(path, {cache: "no-store"});
+  const response = await fetchWithTimeout(path, {cache: "no-store"});
   if (!response.ok) throw new Error(`HTTP ${response.status}`);
   return response.json();
 }
@@ -66,9 +78,22 @@ function renderStatus(data) {
   $("progress-fill").value = width;
   $("progress-fill").textContent = `${width}%`;
   $("success-rows").textContent = compact.format(finite(archive.success_rows));
-  $("unresolved-tasks").textContent = number.format(finite(archive.unresolved_tasks));
+  const unaccepted = finite(archive.unresolved_tasks);
+  const unavailable = finite(archive.unavailable_tasks);
+  const actionable = finite(
+    archive.actionable_unresolved_tasks,
+    Math.max(0, unaccepted - unavailable),
+  );
+  $("unresolved-tasks").textContent = number.format(actionable);
   $("retryable-tasks").textContent = number.format(finite(archive.retryable_tasks));
-  $("unavailable-tasks").textContent = number.format(finite(archive.unavailable_tasks));
+  const deferred = finite(archive.retry_deferred_tasks);
+  const retryAt = archive.next_task_retry_at
+    ? new Date(archive.next_task_retry_at).toLocaleString("zh-TW", {hour12: false})
+    : "—";
+  $("retryable-detail").textContent = deferred > 0
+    ? `其中 ${number.format(deferred)} 項已隔離退避 · 下次 ${retryAt}`
+    : "尚未終止的錯誤任務";
+  $("unavailable-tasks").textContent = number.format(unavailable);
   $("recent-throughput").textContent = `${finite(recent.tasks_per_minute_last_15m).toFixed(2)}/分`;
   $("recent-detail").textContent = `15 分鐘接受 ${number.format(finite(recent.accepted_tasks_last_15m))} 項`;
   $("disk-free").textContent = bytes(storage.free_bytes);
@@ -110,7 +135,7 @@ function renderCategories(rows) {
     track.value = Math.max(0, Math.min(100, finite(row.completion_percent)));
     track.setAttribute("aria-label", `${row.category} 完成度`);
     const detail = document.createElement("p");
-    detail.textContent = `已接受 ${number.format(finite(row.accepted_tasks))}／${number.format(finite(row.total_tasks))} · 未解決 ${number.format(finite(row.unresolved_tasks))} · ${compact.format(finite(row.success_rows))} 列`;
+    detail.textContent = `已接受 ${number.format(finite(row.accepted_tasks))}／${number.format(finite(row.total_tasks))} · 待下載 ${number.format(finite(row.unresolved_tasks))} · 供應商不可用 ${number.format(finite(row.unavailable_tasks))} · ${compact.format(finite(row.success_rows))} 列`;
     card.append(head, track, detail);
     root.append(card);
   }

@@ -6,8 +6,8 @@
   <meta name="color-scheme" content="dark">
   <meta name="theme-color" content="#071019">
   <title>永豐 Shioaji API 資料監控｜StockAgent</title>
-  <link rel="stylesheet" href="styles.css?v=5">
-  <link rel="stylesheet" href="../dashboard-core.css?v=4">
+  <link rel="stylesheet" href="styles.css?v=6">
+  <link rel="stylesheet" href="../dashboard-core.css?v=5">
 </head>
 <body>
   <a class="skip-link" href="#main">跳到主要內容</a>
@@ -19,6 +19,7 @@
       <a href="../tw-day-trade/">台股當沖</a>
       <a href="./" aria-current="page">永豐 API</a>
       <a href="../openbb/">OpenBB</a>
+      <a href="../data-monitor/">全資料</a>
     </nav>
   </header>
 
@@ -234,8 +235,9 @@
       <div class="progress-card">
         <div class="progress-copy">
           <div><span>全合約進度</span><strong id="fleet-progress-label">—</strong></div>
-          <p id="fleet-progress-detail">—</p>
+          <div class="fleet-eta"><span>預計還要</span><strong id="fleet-eta-label">—</strong><p id="fleet-eta-detail">—</p></div>
         </div>
+        <p id="fleet-progress-detail" class="fleet-progress-detail">—</p>
         <progress id="fleet-progress-bar" class="progress-track" aria-label="全合約歷史回補進度" max="100" value="0"></progress>
       </div>
       <div class="kpi-grid backfill-kpis">
@@ -291,6 +293,6 @@
     </section>
   </main>
   <footer>StockAgent · 永豐 Shioaji API 公開唯讀監控 · 每 60 秒隨資料週期更新</footer>
-  <script src="app.js?v=9" defer></script>
+  <script src="app.js?v=10" defer></script>
 </body>
 </html>

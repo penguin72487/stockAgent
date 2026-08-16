@@ -334,9 +334,13 @@ def _rebase_live_benchmark(
         return row
     expected = origin.get("live_origin") or {}
     expected_at = str(expected.get("entry_at") or "")
-    observed_at = str(row.get("entry_at") or "")
+    observed_at = str(row.get("origin_entry_at") or row.get("entry_at") or "")
     expected_price = _finite_float(expected.get("entry_price"))
-    observed_price = _finite_float(row.get("entry_price"))
+    observed_price = _finite_float(
+        row.get("origin_entry_price")
+        if row.get("origin_entry_price") is not None
+        else row.get("entry_price")
+    )
     if observed_price is None and observed_at == expected_at:
         # Schema-3 benchmark marks retained entry_at but not entry_price.  The
         # audited live origin supplies that immutable value after identity is
@@ -860,6 +864,14 @@ def _preopen_progress(
         symbol_count = int(item.get("symbol_count") or 0)
         latency = item.get("live_latency")
         latency = dict(latency) if isinstance(latency, Mapping) else {}
+        final_arm = item.get("final_arm")
+        final_arm = dict(final_arm) if isinstance(final_arm, Mapping) else {}
+        final_arm_latency = final_arm.get("live_latency")
+        final_arm_latency = (
+            dict(final_arm_latency)
+            if isinstance(final_arm_latency, Mapping)
+            else {}
+        )
         inference_ms = _finite_float(latency.get("model_inference_ms"))
         price_limits = item.get("preopen_price_limits")
         price_limits = dict(price_limits) if isinstance(price_limits, Mapping) else {}
@@ -911,6 +923,26 @@ def _preopen_progress(
                 ),
                 "checkpoint_cache_hit": latency.get("checkpoint_cache_hit"),
                 "model_cache_hit": latency.get("model_cache_hit"),
+                "panel_cache_hit": latency.get("panel_cache_hit"),
+                "final_arm_status": final_arm.get("status"),
+                "final_arm_completed_at": final_arm.get("completed_at"),
+                "final_arm_elapsed_seconds": _finite_float(
+                    final_arm.get("elapsed_seconds")
+                ),
+                "final_arm_attempts": int(final_arm.get("attempts") or 0),
+                "final_arm_panel_cache_hit": final_arm_latency.get(
+                    "panel_cache_hit"
+                ),
+                "final_arm_checkpoint_cache_hit": final_arm_latency.get(
+                    "checkpoint_cache_hit"
+                ),
+                "final_arm_model_cache_hit": final_arm_latency.get(
+                    "model_cache_hit"
+                ),
+                "final_arm_compute_ms": _finite_float(
+                    final_arm_latency.get("compute_before_publish_ms")
+                ),
+                "final_arm_error": final_arm.get("error"),
                 "price_limit_prepared": prepared,
                 "price_limit_requested": requested,
                 "price_limit_coverage_ratio": _ratio(prepared, requested),
@@ -1636,7 +1668,7 @@ def build_dashboard_snapshot(
         "source_contract": {
             "preopen": "artifacts/discord_bot/preopen_readiness.json; only same-day recorded stages are shown and missing intermediate states are not estimated",
             "execution_record": "today's append-only signal_registered or signal_blocked event per mode; stale prior-session timestamps never count",
-            "missed_start": "between 09:00 and 13:20, the atomic latest-signal pointer is checked every 0.1 seconds and a missing execution record is caught up immediately; the public dashboard remains read-only",
+            "missed_start": "between 09:00 and 13:20, Linux inotify wakes the executor when the atomic latest-signal pointer is published; a 0.1-second timeout remains only as a portable catch-up fallback and the public dashboard remains read-only",
             "signal": "Discord live target_weights.parquet after observed opening quote",
             "replay": "simulation_replay=true is a retrospective, explicitly counterfactual fill at the actual session open from official daily data or a fresh same-session Shioaji snapshot; it is not a causally executable quote or real order fill",
             "entry_fill": "causally later best ask for buy or best bid for sell is used immediately after the 09:00 signal-ready timestamp; submitted simulated market quantity is fully filled, while target quantity beyond fresh displayed depth is explicitly left unsubmitted",
@@ -1647,7 +1679,7 @@ def build_dashboard_snapshot(
             "fees": "gross commission and sell tax are charged first; earned commission rebate is recorded separately in economic NAV",
             "pnl_split": "realized net PnL uses simulated executable exits plus any explicitly tagged 13:30 terminal ledger flatten, with allocated entry and exit costs; unrealized net liquidation PnL values remaining shares at executable bid or ask after remaining costs; total net PnL is their reconciled sum",
             "comparison": "all strategies and benchmarks are compared as cumulative net return divided by their own capital basis; TX uses one-contract official initial margin, while 0050/2330 use one-board-lot entry notional",
-            "benchmarks": "0050/2330 are total-return benchmarks anchored to the retained actual session open: official ex-date previous-close/reference-price factors reinvest cash dividends and ETF distributions and adjust stock dividends or splits exactly once, then adjusted units are marked at executable bid after tw_cash costs. TXFR1 has no cash distribution; it holds one real TX front-month contract across sessions, rolls only when the old bid and new ask coexist, never books the calendar spread as return, and includes TWD 60 per side plus statutory futures tax",
+            "benchmarks": "0050/2330 are total-return benchmarks anchored to the retained actual session open: official ex-date previous-close/reference-price factors reinvest cash dividends and ETF distributions and adjust stock dividends or splits exactly once, then adjusted units are marked at executable bid after tw_cash costs. TXFR1 has no cash distribution; it holds one real TX front-month contract across sessions. Before expiry it rolls only when the old bid and new ask coexist; after expiry it cash-settles the old month only at the official TAIFEX final settlement price and opens the new month at ask. The two bases stay separate, so the calendar spread is never booked as return; fees and statutory futures tax remain explicit",
             "benchmark_history": (
                 "audited actual-open benchmark history is merged read-only with later live executable marks"
                 if benchmark_history.get("origins")
@@ -1794,6 +1826,8 @@ def build_dashboard_signal_page(
     page = filtered[offset : offset + limit]
     return {
         "schema_version": DASHBOARD_SCHEMA_VERSION,
+        "simulation_only": True,
+        "production_order_possible": False,
         "session_date": selected_session_date,
         "available_session_dates": available_session_dates,
         "offset": offset,

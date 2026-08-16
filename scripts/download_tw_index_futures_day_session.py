@@ -10,9 +10,11 @@ all-contract parquet.
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 from datetime import date, timedelta
 import json
 from pathlib import Path
+import re
 import sys
 import time
 from typing import Final
@@ -22,8 +24,10 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from stockagent.data.tw_index_futures import (  # noqa: E402
+    TAIFEX_ALL_FUTURES_DAILY_CONTRACT_VERSION,
     TAIFEX_FUTURES_DATA_CONTRACT_VERSION,
     TAIFEX_INDEX_FUTURES_PRODUCTS,
+    build_taifex_all_futures_daily_sessions,
     build_taifex_index_futures_day_session,
 )
 from scripts.taifex_daily_download_common import (  # noqa: E402
@@ -37,6 +41,10 @@ from scripts.taifex_daily_download_common import (  # noqa: E402
 
 TAIFEX_DOWNLOAD_URL: Final[str] = (
     "https://www.taifex.com.tw/cht/3/futDataDown"
+)
+_ANNUAL_RECEIPT_RE: Final[re.Pattern[str]] = re.compile(r"^(\d{4})_fut\.zip$")
+_RANGE_RECEIPT_RE: Final[re.Pattern[str]] = re.compile(
+    r"^(\d{4}-\d{2}-\d{2})_(\d{4}-\d{2}-\d{2})_all\.csv$"
 )
 
 
@@ -78,6 +86,84 @@ def _validate_receipt(path: Path) -> None:
     validate_taifex_receipt(path)
 
 
+def _select_rebuild_receipts(raw_dir: Path) -> list[Path]:
+    annual: dict[int, Path] = {}
+    latest_range: dict[tuple[int, int], tuple[date, Path]] = {}
+    for path in sorted([*raw_dir.rglob("*.zip"), *raw_dir.rglob("*.csv")]):
+        annual_match = _ANNUAL_RECEIPT_RE.fullmatch(path.name)
+        if annual_match is not None:
+            year = int(annual_match.group(1))
+            if year in annual:
+                raise ValueError(f"duplicate annual TAIFEX receipt for {year}")
+            annual[year] = path
+            continue
+        range_match = _RANGE_RECEIPT_RE.fullmatch(path.name)
+        if range_match is None:
+            continue
+        start = date.fromisoformat(range_match.group(1))
+        end = date.fromisoformat(range_match.group(2))
+        if end < start or (end.year, end.month) != (start.year, start.month):
+            raise ValueError(f"invalid monthly TAIFEX receipt range: {path.name}")
+        key = (start.year, start.month)
+        previous = latest_range.get(key)
+        if previous is None or end > previous[0]:
+            latest_range[key] = (end, path)
+    selected = [annual[year] for year in sorted(annual)]
+    selected.extend(latest_range[key][1] for key in sorted(latest_range))
+    return selected
+
+
+def _all_futures_quality(path: Path) -> dict[str, object]:
+    import pyarrow.parquet as pq
+
+    parquet = pq.ParquetFile(path)
+    metadata = parquet.schema_arrow.metadata or {}
+    expected_contract = str(TAIFEX_ALL_FUTURES_DAILY_CONTRACT_VERSION).encode(
+        "ascii"
+    )
+    if metadata.get(b"stockagent.contract_version") != expected_contract:
+        raise ValueError(f"{path} has unsupported all-futures contract metadata")
+    products: set[str] = set()
+    sessions: Counter[str] = Counter()
+    series: Counter[str] = Counter()
+    first_date: date | None = None
+    last_date: date | None = None
+    rows = 0
+    for batch in parquet.iter_batches(
+        columns=["date", "product", "session", "series_type"],
+        batch_size=131_072,
+    ):
+        payload = batch.to_pydict()
+        batch_dates = payload["date"]
+        rows += len(batch_dates)
+        if batch_dates:
+            batch_first = min(batch_dates)
+            batch_last = max(batch_dates)
+            first_date = (
+                batch_first if first_date is None else min(first_date, batch_first)
+            )
+            last_date = (
+                batch_last if last_date is None else max(last_date, batch_last)
+            )
+        products.update(str(value) for value in payload["product"])
+        sessions.update(str(value) for value in payload["session"])
+        series.update(str(value) for value in payload["series_type"])
+    if rows != parquet.metadata.num_rows or not rows:
+        raise ValueError(
+            f"{path} row-count validation failed: {rows} != "
+            f"{parquet.metadata.num_rows}"
+        )
+    return {
+        "rows": rows,
+        "first_date": first_date.isoformat() if first_date else None,
+        "last_date": last_date.isoformat() if last_date else None,
+        "product_count": len(products),
+        "products": sorted(products),
+        "session_counts": dict(sorted(sessions.items())),
+        "series_type_counts": dict(sorted(series.items())),
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -85,7 +171,7 @@ def main() -> int:
         default="data_tw_index_futures",
         help="Raw receipts and normalized parquet root.",
     )
-    parser.add_argument("--start-year", type=int, default=2005)
+    parser.add_argument("--start-year", type=int, default=1998)
     parser.add_argument(
         "--end-date",
         type=_parse_date,
@@ -117,10 +203,10 @@ def main() -> int:
     raw_dir = output_dir / "raw"
     receipts: list[Path] = []
     if args.rebuild_normalized_only:
-        receipts = sorted(
-            [*raw_dir.rglob("*.zip"), *raw_dir.rglob("*.csv")],
-            key=lambda path: str(path),
-        )
+        try:
+            receipts = _select_rebuild_receipts(raw_dir)
+        except ValueError as exc:
+            parser.error(str(exc))
         if not receipts:
             parser.error(
                 "--rebuild-normalized-only found no raw ZIP/CSV receipts under "
@@ -131,6 +217,7 @@ def main() -> int:
     else:
         for year in range(args.start_year, args.end_date.year):
             target = raw_dir / "annual" / f"{year}_fut.zip"
+            was_cached = target.is_file() and target.stat().st_size > 0
             receipts.append(
                 _download(
                     {"down_type": "2", "his_year": str(year)},
@@ -140,13 +227,15 @@ def main() -> int:
                 )
             )
             _validate_receipt(receipts[-1])
-            time.sleep(args.request_interval)
+            if not was_cached:
+                time.sleep(args.request_interval)
 
         current_start = date(args.end_date.year, 1, 1)
         for range_start, range_end in _month_ranges(current_start, args.end_date):
             target = raw_dir / "ranges" / (
                 f"{range_start.isoformat()}_{range_end.isoformat()}_all.csv"
             )
+            was_cached = target.is_file() and target.stat().st_size > 0
             receipts.append(
                 _download(
                     {
@@ -162,7 +251,8 @@ def main() -> int:
                 )
             )
             _validate_receipt(receipts[-1])
-            time.sleep(args.request_interval)
+            if not was_cached:
+                time.sleep(args.request_interval)
 
     normalized = output_dir / "day_session_contracts.parquet"
     build_taifex_index_futures_day_session(
@@ -170,6 +260,9 @@ def main() -> int:
         normalized,
         products=TAIFEX_INDEX_FUTURES_PRODUCTS,
     )
+    all_futures = output_dir / "all_futures_daily_sessions.parquet"
+    build_taifex_all_futures_daily_sessions(receipts, all_futures)
+    all_futures_quality = _all_futures_quality(all_futures)
     manifest = {
         "dataset": "tw_index_futures_day_session_contracts",
         "contract_version": TAIFEX_FUTURES_DATA_CONTRACT_VERSION,
@@ -183,6 +276,14 @@ def main() -> int:
         "end_date": args.end_date.isoformat(),
         "normalized_path": str(normalized),
         "normalized_sha256": _sha256(normalized),
+        "all_futures_daily": {
+            "contract_version": TAIFEX_ALL_FUTURES_DAILY_CONTRACT_VERSION,
+            "path": str(all_futures),
+            "sha256": _sha256(all_futures),
+            "session_policy": "source_sessions_separate",
+            "legacy_session_policy": "day_only_unreported",
+            "quality": all_futures_quality,
+        },
         "receipts": [
             {
                 "path": str(path),
@@ -200,7 +301,11 @@ def main() -> int:
     )
     temporary_manifest.replace(manifest_path)
     print(
-        f"built {normalized} from {len(receipts)} official receipt(s)",
+        f"built {normalized} and {all_futures} from {len(receipts)} official "
+        f"receipt(s); all-futures rows={all_futures_quality['rows']:,}, "
+        f"products={all_futures_quality['product_count']:,}, "
+        f"coverage={all_futures_quality['first_date']}.."
+        f"{all_futures_quality['last_date']}",
         flush=True,
     )
     return 0

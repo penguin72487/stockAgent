@@ -208,9 +208,13 @@ def test_fop_normalization_derives_trade_date_and_preserves_five_levels() -> Non
 def test_fop_night_session_is_assigned_to_following_trading_date() -> None:
     monday_night = datetime(2026, 8, 10, 15, 0, 1)
     saturday_early = datetime(2026, 8, 15, 2, 0, 1)
+    saturday_close_grace = datetime(2026, 8, 15, 5, 0, 4)
+    saturday_final_snapshot = datetime(2026, 8, 15, 5, 0, 5)
     for event_dt, expected in (
         (monday_night, date(2026, 8, 11)),
         (saturday_early, date(2026, 8, 17)),
+        (saturday_close_grace, date(2026, 8, 17)),
+        (saturday_final_snapshot, date(2026, 8, 17)),
     ):
         tick = normalize_fop_tick(
             Payload({"code": "TXFH6", "datetime": event_dt, "close": 20_000}),

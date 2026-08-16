@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import date, datetime
 import json
+import os
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -14,6 +15,7 @@ from stockagent.backtest.tw_execution import TaiwanFeeSchedule
 from stockagent.live.quote_provider import PriceSnapshot
 from stockagent.live.tw_day_trade_dashboard import (
     _line_count,
+    _rebase_live_benchmark,
     _session_progress,
     _tail,
     _tail_for_session,
@@ -171,6 +173,93 @@ def test_runner_reads_atomic_latest_signal_pointer(tmp_path: Path) -> None:
     assert _LATEST_SIGNAL_CACHE
 
 
+def test_runner_prefers_compact_execution_payload_over_parquet(tmp_path: Path) -> None:
+    from scripts.run_tw_day_trade_simulation import _LATEST_SIGNAL_CACHE, _latest_signal
+
+    spec = _spec(tmp_path)
+    output = spec.live_output_dir / "2026-08-13" / "signal-compact"
+    output.mkdir(parents=True)
+    summary_path = output / "summary.json"
+    weights_path = output / "target_weights.parquet"
+    execution_weights_path = output / "execution_weights.json"
+    summary_path.write_text(
+        json.dumps(
+            {
+                **_summary("signal-compact"),
+                "market": spec.market,
+                "asof_date": "2026-08-13 09:00:01",
+            }
+        ),
+        encoding="utf-8",
+    )
+    pl.DataFrame([_row()]).write_parquet(weights_path)
+    execution_weights_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "market": spec.market,
+                "signal_id": "signal-compact",
+                "rows": [{**_row(), "symbol": "0050", "name": "元大台灣50"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    spec.live_output_dir.mkdir(parents=True, exist_ok=True)
+    (spec.live_output_dir / "latest_signal.json").write_text(
+        json.dumps(
+            {
+                "summary_path": str(summary_path),
+                "weights_path": str(weights_path),
+                "execution_weights_path": str(execution_weights_path),
+            }
+        ),
+        encoding="utf-8",
+    )
+    _LATEST_SIGNAL_CACHE.clear()
+
+    summary, rows = _latest_signal(spec, _now(9, 0, 1)) or ({}, [])
+
+    assert summary["signal_id"] == "signal-compact"
+    assert rows[0]["symbol"] == "0050"
+    assert summary["execution_weights_path"] == str(execution_weights_path)
+
+
+def test_signal_pointer_watcher_wakes_on_atomic_publish(tmp_path: Path) -> None:
+    from scripts.run_tw_day_trade_simulation import _SignalPointerWatcher
+
+    watcher = _SignalPointerWatcher()
+    watcher.configure([tmp_path])
+    if not watcher.enabled:
+        pytest.skip("Linux inotify is unavailable")
+    temporary = tmp_path / "latest_signal.json.tmp"
+    pointer = tmp_path / "latest_signal.json"
+    temporary.write_text("{}", encoding="utf-8")
+    os.replace(temporary, pointer)
+    try:
+        assert watcher.wait(0.5) is True
+    finally:
+        watcher.close()
+
+
+def test_jsonl_batch_uses_one_durability_sync(tmp_path: Path, monkeypatch) -> None:
+    from stockagent.live.tw_day_trade_simulation import _append_jsonl_many
+
+    calls = 0
+    real_fsync = os.fsync
+
+    def counted_fsync(descriptor: int) -> None:
+        nonlocal calls
+        calls += 1
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(os, "fsync", counted_fsync)
+    path = tmp_path / "signals.jsonl"
+    _append_jsonl_many(path, [{"row": idx} for idx in range(2_744)])
+
+    assert calls == 1
+    assert len(path.read_text(encoding="utf-8").splitlines()) == 2_744
+
+
 def _row(weight: float = 0.1) -> dict[str, object]:
     return {
         "symbol": "2330",
@@ -204,6 +293,49 @@ def test_runner_offsets_all_four_existing_modes_without_adding_a_fifth() -> None
     assert set(live_configs) == expected
     assert all(spec.signal_market is None for spec in specs)
     assert all(spec.price_limit_offset_ticks == 1 for spec in specs)
+
+
+def test_runner_blocks_weekend_before_quote_or_eligibility_work(tmp_path: Path) -> None:
+    from scripts.run_tw_day_trade_simulation import _mode_specs, _verified_stock_session
+
+    repo_root = Path(__file__).resolve().parents[1]
+    specs, live_configs, errors = _mode_specs(
+        repo_root / "services/discord_bot/markets"
+    )
+    assert errors == {}
+    public_root = tmp_path / "data_tw_public"
+    public_root.mkdir()
+    pl.DataFrame(
+        {
+            "Name": ["中華民國開國紀念日"],
+            "Date": ["1150101"],
+            "_dataset": ["twse_api_holidayschedule_holidayschedule"],
+            "_source": ["TWSE OpenAPI"],
+            "_as_of_date": ["2026-08-14"],
+        }
+    ).write_parquet(
+        public_root / "twse_api_holidayschedule_holidayschedule.parquet"
+    )
+    live_configs = {
+        market: replace(config, day_trade_rule_data_dir=str(public_root))
+        for market, config in live_configs.items()
+    }
+
+    friday_open, friday_errors = _verified_stock_session(
+        specs,
+        live_configs,
+        observed=datetime(2026, 8, 14, 9, 0, tzinfo=TAIPEI),
+    )
+    saturday_open, saturday_errors = _verified_stock_session(
+        specs,
+        live_configs,
+        observed=datetime(2026, 8, 15, 9, 0, tzinfo=TAIPEI),
+    )
+
+    assert friday_open is True and friday_errors == {}
+    assert saturday_open is False
+    assert set(saturday_errors) == {spec.market for spec in specs}
+    assert all("weekend" in reason for reason in saturday_errors.values())
 
 
 def test_runner_keeps_quote_polling_for_post_close_terminal_catch_up() -> None:
@@ -970,6 +1102,90 @@ def test_rearm_flat_session_refuses_any_position_history(tmp_path: Path) -> None
         )
 
 
+def test_non_session_invalidation_voids_only_zero_fill_signal(tmp_path: Path) -> None:
+    spec = _spec(tmp_path)
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+    missing = LiveEligibility(
+        symbol="2330",
+        venue="twse",
+        security_type="stock",
+        eligible=False,
+        short_open=False,
+        covered=False,
+        source_date="2026-08-12",
+        reason="exact_session_eligibility_missing",
+    )
+    engine.register_signal(
+        spec=spec,
+        summary=_summary(),
+        signal_rows=[_row()],
+        quotes={"2330": _quote()},
+        eligibility={"2330": missing},
+        eligibility_coverage={},
+        now=_now(9, 1, 7),
+    )
+
+    assert engine.invalidate_non_session_flat_signal(
+        spec.market,
+        now=_now(9, 30),
+        reason="official calendar says closed",
+    ) == "invalidated"
+    mode = engine.state["modes"][spec.market]
+    assert mode["entry_completed_at"] is None
+    assert mode["session_valid"] is False
+    assert mode["engine_status"] == "invalid_non_trading_session"
+    assert mode["processed_signal_ids"] == ["signal-1"]
+    engine.update_readiness([spec], now=_now(10, 0))
+    assert mode["engine_status"] == "invalid_non_trading_session"
+    events = [json.loads(line) for line in engine.events_path.read_text().splitlines()]
+    assert events[-1]["event"] == "non_session_signal_invalidated"
+    assert events[-1]["positions"] == 0
+    assert events[-1]["fills"] == 0
+
+    next_session = datetime(2026, 8, 14, 9, 1, 7, tzinfo=TAIPEI)
+    replacement = _summary("signal-2")
+    replacement["generated_at"] = datetime(
+        2026, 8, 14, 9, 0, 5, tzinfo=TAIPEI
+    ).isoformat()
+    quote = _quote()
+    quote["quote_at"] = datetime(
+        2026, 8, 14, 9, 1, 6, tzinfo=TAIPEI
+    ).isoformat()
+    assert engine.register_signal(
+        spec=spec,
+        summary=replacement,
+        signal_rows=[_row()],
+        quotes={"2330": quote},
+        eligibility=_eligibility(),
+        eligibility_coverage={},
+        now=next_session,
+    ) == "registered"
+    assert mode["session_valid"] is True
+    assert "non_session_invalidated_at" not in mode
+    assert mode["blocked_reason"] is None
+
+
+def test_non_session_invalidation_refuses_position_history(tmp_path: Path) -> None:
+    spec = _spec(tmp_path)
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+    engine.register_signal(
+        spec=spec,
+        summary=_summary(),
+        signal_rows=[_row()],
+        quotes={"2330": _quote()},
+        eligibility=_eligibility(),
+        eligibility_coverage={},
+        now=_now(9, 1, 7),
+    )
+
+    with pytest.raises(RuntimeError, match="has positions"):
+        engine.invalidate_non_session_flat_signal(
+            spec.market,
+            now=_now(9, 30),
+            reason="official calendar says closed",
+        )
+
+
 def test_retire_flat_mode_removes_only_state_and_keeps_audit_log(
     tmp_path: Path,
 ) -> None:
@@ -1613,16 +1829,19 @@ def test_percent_benchmarks_use_executable_books_costs_and_atomic_tx_roll(
     assert tx["fixed_fees_twd"] == 180.0
     assert tx["last_roll_old_bid"] == 45_150.0
     assert tx["last_roll_new_ask"] == 45_200.0
-    assert tx["roll_history"] == [
-        {
-            "rolled_at": _now(10, 2).isoformat(),
-            "from_contract": "TXFH6",
-            "to_contract": "TXFI6",
-            "old_bid": 45_150.0,
-            "new_ask": 45_200.0,
-            "fee_per_side_twd": 60.0,
-        }
-    ]
+    assert len(tx["roll_history"]) == 1
+    assert tx["roll_history"][0] == {
+        "rolled_at": _now(10, 2).isoformat(),
+        "from_contract": "TXFH6",
+        "to_contract": "TXFI6",
+        "old_bid": 45_150.0,
+        "old_exit_price": 45_150.0,
+        "old_exit_price_source": "executable_old_contract_bid",
+        "official_final_settlement": None,
+        "new_ask": 45_200.0,
+        "old_exit_fee_twd": 60.0,
+        "new_entry_fee_twd": 60.0,
+    }
     payload = build_dashboard_snapshot(
         state_dir=engine.state_dir,
         now=_now(10, 2).astimezone(ZoneInfo("UTC")),
@@ -1638,6 +1857,174 @@ def test_percent_benchmarks_use_executable_books_costs_and_atomic_tx_roll(
         if row["total_equity_twd"] is not None
     )
     assert "own capital basis" in payload["source_contract"]["comparison"]
+
+
+def test_expired_tx_continuous_roll_uses_official_settlement_not_zero(
+    tmp_path: Path,
+) -> None:
+    settlement_path = tmp_path / "tx_final_settlement.parquet"
+    pl.DataFrame(
+        {
+            "settlement_date": [date(2026, 8, 19)],
+            "option_series": ["202608"],
+            "final_settlement_price": [45_123],
+            "source_file": ["official-fsp.html"],
+            "source_sha256": ["a" * 64],
+            "source_url": ["https://www.taifex.com.tw/cht/5/futIndxFSP"],
+        }
+    ).write_parquet(settlement_path)
+    engine = TwDayTradeSimulationEngine(
+        tmp_path / "state",
+        final_settlement_path=settlement_path,
+    )
+    schedule = TaiwanFeeSchedule()
+    entry_time = datetime(2026, 8, 19, 10, 0, tzinfo=TAIPEI)
+    engine.process_benchmarks(
+        stock_quotes={},
+        stock_fee_schedule=schedule,
+        current_future_contract_code="TXFH6",
+        current_future_quote={
+            "bid": 45_000.0,
+            "ask": 45_001.0,
+            "delivery_month": "202608",
+            "last_trading_date": "2026-08-19",
+            "quote_at": entry_time.isoformat(),
+            "source": "fixture",
+        },
+        now=entry_time,
+    )
+
+    # The expiring TX month stops trading at 13:30 on its last trading day.
+    # Its same-calendar-day night session already belongs to the next month,
+    # so the old leg must use the official FSP without waiting for midnight.
+    roll_time = datetime(2026, 8, 19, 15, 0, tzinfo=TAIPEI)
+    engine.process_benchmarks(
+        stock_quotes={},
+        stock_fee_schedule=schedule,
+        current_future_contract_code="TXFI6",
+        current_future_quote={
+            "bid": 45_199.0,
+            "ask": 45_200.0,
+            "delivery_month": "202609",
+            "last_trading_date": "2026-09-16",
+            "quote_at": roll_time.isoformat(),
+            "source": "fixture",
+        },
+        previous_future_quote={
+            "bid": 0.0,
+            "delivery_month": "202608",
+            "last_trading_date": "2026-08-19",
+        },
+        now=roll_time,
+    )
+
+    row = engine.state["benchmarks"]["benchmark_tx_continuous"]
+    assert row["contract_code"] == "TXFI6"
+    assert row["entry_price"] == 45_200.0
+    assert row["roll_count"] == 1
+    assert row["last_roll_old_bid"] is None
+    assert row["last_roll_old_price"] == 45_123.0
+    assert row["last_roll_official_final_settlement"] == 45_123.0
+    assert row["last_roll_old_price_source"] == (
+        "official_taifex_index_final_settlement"
+    )
+    assert row["realized_gross_pnl_twd"] == pytest.approx(
+        (45_123.0 - 45_001.0) * 200.0
+    )
+    # The expiry event has no fabricated sell fee; only the new-month entry
+    # adds one side after the original entry fee.
+    assert row["fixed_fees_twd"] == 120.0
+    assert row["roll_history"][0]["official_final_settlement"]["price"] == 45_123.0
+    assert row["net_pnl_twd"] > -100_000.0
+
+
+def test_expired_tx_roll_fails_closed_when_official_settlement_is_missing(
+    tmp_path: Path,
+) -> None:
+    missing_path = tmp_path / "missing.parquet"
+    engine = TwDayTradeSimulationEngine(
+        tmp_path / "state",
+        final_settlement_path=missing_path,
+    )
+    schedule = TaiwanFeeSchedule()
+    entry_time = datetime(2026, 8, 19, 10, 0, tzinfo=TAIPEI)
+    engine.process_benchmarks(
+        stock_quotes={},
+        stock_fee_schedule=schedule,
+        current_future_contract_code="TXFH6",
+        current_future_quote={
+            "bid": 45_000.0,
+            "ask": 45_001.0,
+            "delivery_month": "202608",
+            "last_trading_date": "2026-08-19",
+        },
+        now=entry_time,
+    )
+    before = dict(engine.state["benchmarks"]["benchmark_tx_continuous"])
+
+    engine.process_benchmarks(
+        stock_quotes={},
+        stock_fee_schedule=schedule,
+        current_future_contract_code="TXFI6",
+        current_future_quote={"bid": 45_199.0, "ask": 45_200.0},
+        previous_future_quote={"bid": 0.0},
+        now=datetime(2026, 8, 20, 9, 0, tzinfo=TAIPEI),
+    )
+
+    row = engine.state["benchmarks"]["benchmark_tx_continuous"]
+    assert row["contract_code"] == "TXFH6"
+    assert row["roll_count"] == 0
+    assert row["realized_gross_pnl_twd"] == 0.0
+    assert row["total_equity_twd"] == before["total_equity_twd"]
+    assert row["valuation_stale"] is True
+    assert row["valuation_source"] == (
+        "roll_waiting_for_official_final_settlement_and_new_ask"
+    )
+    assert str(row["roll_blocked_reason"]).startswith(
+        "missing_official_final_settlement_file:"
+    )
+
+
+def test_tx_benchmark_rebase_keeps_immutable_origin_across_contract_roll() -> None:
+    source = {
+        "benchmark_id": "benchmark_tx_continuous",
+        "instrument_type": "continuous_long_future",
+        "entry_at": "2026-08-13T10:00:00+08:00",
+        "entry_price": 45_200.0,
+        "origin_entry_at": "2026-08-13T10:00:00+08:00",
+        "origin_entry_price": 45_000.0,
+        "current_contract_entry_price": 45_200.0,
+        "roll_count": 1,
+        "net_pnl_twd": 1_000.0,
+        "fixed_fees_twd": 180.0,
+        "transaction_tax_twd": 540.0,
+        "last_mark_price": 45_210.0,
+        "valuation_source": "official_settlement_roll",
+    }
+    origin = {
+        "session_date": "2026-08-13",
+        "entry_at": "2026-08-13T08:45:00+08:00",
+        "entry_price": 44_900.0,
+        "initial_capital_twd": 701_000.0,
+        "initial_fixed_fees_twd": 60.0,
+        "initial_transaction_tax_twd": 180.0,
+        "gross_pnl_multiplier": 200.0,
+        "live_origin": {
+            "entry_at": "2026-08-13T10:00:00+08:00",
+            "entry_price": 45_000.0,
+            "initial_fixed_fees_twd": 60.0,
+            "initial_transaction_tax_twd": 180.0,
+        },
+    }
+
+    row = _rebase_live_benchmark(source, origin)
+
+    assert row["benchmark_origin_rebased"] is True
+    assert row["entry_price"] == 44_900.0
+    assert row["current_contract_entry_price"] == 45_200.0
+    assert row["net_pnl_twd"] == 21_000.0
+    assert row["total_equity_twd"] == 722_000.0
+    assert row.get("benchmark_origin_error") is None
 
 
 def test_stock_benchmark_reinvests_official_actions_once(tmp_path: Path) -> None:
@@ -1985,9 +2372,9 @@ def test_dashboard_html_is_local_and_refreshes_api() -> None:
     assert "http://" not in html and "https://" not in html
     assert 'id="workflow-progress"' in html
     assert 'id="preopen-progress"' in html
-    assert "fetch(`api/status" in javascript
-    assert "fetch(`api/signals?${params.toString()}`" in javascript
-    assert "fetch(`api/events?${params.toString()}`" in javascript
+    assert "fetchWithTimeout(`api/status" in javascript
+    assert "fetchWithTimeout(`api/signals?${params.toString()}`" in javascript
+    assert "fetchWithTimeout(`api/events?${params.toString()}`" in javascript
     assert "function renderOperations(data)" in javascript
     assert "function compareByAbsoluteWeight(a, b)" in javascript
     assert javascript.count(".sort(compareByAbsoluteWeight)") == 1
@@ -2040,7 +2427,7 @@ def test_dashboard_html_is_local_and_refreshes_api() -> None:
     assert "未成交・無進場成本" in javascript
     assert "所選交易日當沖資格未完整覆蓋" in javascript
     assert "較晚補齊的資料不會回填成假成交" in javascript
-    assert "最新訊號指標每 0.1 秒檢查" in javascript
+    assert "原子指標由 inotify 事件即時喚醒" in javascript
     assert 'id="latency-kpis"' in html
     assert "今日尚無開盤樣本" in javascript
     assert "這不是券商回報或交易所往返時間" in html
@@ -2499,6 +2886,8 @@ def test_dashboard_signal_page_filters_sorts_and_bounds_payload(tmp_path: Path) 
         offset=0,
         limit=2,
     )
+    assert first["simulation_only"] is True
+    assert first["production_order_possible"] is False
     assert first["total"] == 3
     assert first["has_more"] is True
     assert [row["symbol"] for row in first["rows"]] == ["2317", "2454"]

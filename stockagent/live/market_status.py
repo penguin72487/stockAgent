@@ -24,6 +24,8 @@ from stockagent.live.market_config import LiveMarketConfig
 FEATURE_SUFFIX = "_features.parquet"
 TW_HOLIDAY_SCHEDULE_NAME = "twse_api_holidayschedule_holidayschedule.parquet"
 TW_TRADING_DAY_MARKERS = ("開始交易", "最後交易")
+TW_HOLIDAY_DATASET = "twse_api_holidayschedule_holidayschedule"
+TW_HOLIDAY_SOURCE = "TWSE OpenAPI"
 
 
 @dataclass(slots=True)
@@ -408,6 +410,122 @@ def _tw_exchange_holidays(parquet_root: Path | None, year: int) -> set[date]:
             int(year),
         )
     )
+
+
+@lru_cache(maxsize=16)
+def _verified_tw_exchange_schedule_cached(
+    path_text: str,
+    size_bytes: int,
+    mtime_ns: int,
+    year: int,
+) -> tuple[tuple[tuple[date, tuple[str, ...]], ...], str]:
+    """Validate the official holiday schedule used by live session gates.
+
+    The ordinary status helper above remains tolerant for display/freshness
+    purposes.  A live order or simulation scheduler needs a stronger contract:
+    the file must carry the expected official provenance and contain the
+    requested ROC year.  Unknown evidence therefore fails closed.
+    """
+
+    del size_bytes, mtime_ns
+    path = Path(path_text)
+    required = {
+        "Name",
+        "Date",
+        "_dataset",
+        "_source",
+        "_as_of_date",
+    }
+    rows: list[dict[str, object]] = []
+    if pq is not None:
+        try:
+            schema = set(pq.read_schema(path).names)
+            if not required.issubset(schema):
+                raise ValueError("official holiday schedule provenance columns are missing")
+            table = pq.read_table(path, columns=sorted(required))
+            rows = table.to_pylist()
+        except Exception as exc:
+            raise ValueError(f"official holiday schedule is unreadable: {exc}") from exc
+    else:
+        try:
+            import polars as pl
+
+            frame = pl.read_parquet(path, columns=sorted(required))
+            rows = frame.to_dicts()
+        except Exception as exc:
+            raise ValueError(f"official holiday schedule is unreadable: {exc}") from exc
+
+    names_by_day: dict[date, set[str]] = {}
+    as_of_dates: set[str] = set()
+    for row in rows:
+        if str(row.get("_dataset") or "") != TW_HOLIDAY_DATASET:
+            raise ValueError("official holiday schedule dataset provenance mismatch")
+        if str(row.get("_source") or "") != TW_HOLIDAY_SOURCE:
+            raise ValueError("official holiday schedule source provenance mismatch")
+        as_of = str(row.get("_as_of_date") or "")[:10]
+        try:
+            date.fromisoformat(as_of)
+        except ValueError as exc:
+            raise ValueError("official holiday schedule has invalid as-of dates") from exc
+        as_of_dates.add(as_of)
+        day = _parse_roc_calendar_date(row.get("Date"))
+        if day is None or day.year != int(year):
+            continue
+        name = str(row.get("Name") or "").strip()
+        if not name:
+            raise ValueError("official holiday schedule has an empty event name")
+        names_by_day.setdefault(day, set()).add(name)
+
+    if not names_by_day:
+        raise ValueError(f"official holiday schedule has no rows for {year}")
+    return (
+        tuple(
+            (day, tuple(sorted(names)))
+            for day, names in sorted(names_by_day.items())
+        ),
+        max(as_of_dates),
+    )
+
+
+def verified_tw_stock_session_day(
+    day: date,
+    holidays: tuple[str, ...] = (),
+    *,
+    parquet_root: Path | None,
+) -> tuple[bool, str]:
+    """Return a fail-closed TWSE/TPEx stock-session decision with evidence."""
+
+    if day.weekday() >= 5:
+        return False, f"{day.isoformat()} is a weekend"
+    if day.isoformat() in set(holidays):
+        return False, f"{day.isoformat()} is a configured market holiday"
+    path = _tw_holiday_schedule_path(parquet_root)
+    if path is None:
+        return False, "official TWSE holiday schedule is missing"
+    try:
+        stat = path.stat()
+        rows, as_of = _verified_tw_exchange_schedule_cached(
+            str(path.resolve()),
+            int(stat.st_size),
+            int(stat.st_mtime_ns),
+            int(day.year),
+        )
+    except (OSError, ValueError) as exc:
+        return False, f"official TWSE holiday schedule is unverified: {exc}"
+
+    names = dict(rows).get(day)
+    if not names:
+        return True, f"official TWSE schedule as-of {as_of}: ordinary weekday session"
+    markers = [
+        name
+        for name in names
+        if any(marker in name for marker in TW_TRADING_DAY_MARKERS)
+    ]
+    if markers and len(markers) == len(names):
+        return True, f"official TWSE schedule as-of {as_of}: {', '.join(markers)}"
+    if markers:
+        return False, "official TWSE holiday schedule has conflicting open/closed events"
+    return False, f"official TWSE schedule as-of {as_of}: {', '.join(names)}"
 
 
 def is_trading_day(

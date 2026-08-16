@@ -28,12 +28,10 @@ exec > >(tee -a "$LOG_FILE") 2>&1
 
 if [[ -n "${SHIOAJI_MINUTE_END_DATE:-}" ]]; then
   BACKFILL_END_DATE="$SHIOAJI_MINUTE_END_DATE"
-elif [[ -s "$TARGET_FILE" ]]; then
-  BACKFILL_END_DATE="$(tr -d '[:space:]' < "$TARGET_FILE")"
 else
   BACKFILL_END_DATE="$(TZ=Asia/Taipei date -d yesterday +%F)"
-  printf '%s\n' "$BACKFILL_END_DATE" > "$TARGET_FILE"
 fi
+printf '%s\n' "$BACKFILL_END_DATE" > "$TARGET_FILE"
 
 seconds_until_after_close() {
   run_fintech_python - <<'PY'
@@ -132,7 +130,7 @@ while true; do
 
   echo "[shioaji-minute-runner] download_start=$(TZ=Asia/Taipei date --iso-8601=seconds)"
   set +e
-  run_fintech_python downloader/download_shioaji_tw_minute_kbars.py \
+  run_fintech_python -m downloader.download_shioaji_tw_minute_kbars \
     --simulation \
     --all-symbols \
     --workers "${SHIOAJI_MINUTE_WORKERS:-5}" \
@@ -143,35 +141,47 @@ while true; do
   set -e
   echo "[shioaji-minute-runner] download_exit=$download_rc at=$(TZ=Asia/Taipei date --iso-8601=seconds)"
 
-  summary_state="$(run_fintech_python - <<'PY'
+  summary_state="$(run_fintech_python - "$BACKFILL_END_DATE" <<'PY'
 import json
+import sys
 from pathlib import Path
 
+target_end = sys.argv[1]
 path = Path("data_tw_minute/shioaji_1m/download_summary.json")
+run_path = Path("data_tw_minute/shioaji_1m/latest_run_summary.json")
 if not path.is_file():
     print("missing")
 else:
     payload = json.loads(path.read_text(encoding="utf-8"))
+    run_payload = (
+        json.loads(run_path.read_text(encoding="utf-8"))
+        if run_path.is_file()
+        else payload
+    )
     print(
         "complete=" + str(bool(payload.get("selected_coverage_complete"))).lower()
         + " collected=" + str(bool(payload.get("resumable_collection_complete"))).lower()
-        + " selected=" + str(payload.get("selected_symbols", 0))
-        + " reported=" + str(payload.get("reported_symbols", 0))
+        + " selected=" + str(run_payload.get("selected_symbols", 0))
+        + " reported=" + str(run_payload.get("reported_symbols", 0))
         + " done=" + str(payload.get("complete_symbols", 0))
         + " gap_symbols=" + str(payload.get("complete_with_source_gap_symbols", 0))
         + " unavailable=" + str(payload.get("contract_unavailable_symbols", 0))
-        + " failed=" + str(payload.get("failed_symbols", 0))
-        + " partial=" + str(payload.get("partial_symbols", 0))
-        + " traffic_stop=" + str(bool(payload.get("stopped_for_traffic"))).lower()
-        + " market_stop=" + str(bool(payload.get("stopped_for_market_hours"))).lower()
-        + " traffic=" + str(payload.get("traffic_used_bytes"))
-        + "/" + str(payload.get("traffic_limit_bytes"))
+        + " failed=" + str(run_payload.get("failed_symbols", 0))
+        + " partial=" + str(run_payload.get("partial_symbols", 0))
+        + " end_date=" + str(payload.get("end_date"))
+        + " target_match=" + str(payload.get("end_date") == target_end).lower()
+        + " traffic_stop=" + str(bool(run_payload.get("stopped_for_traffic"))).lower()
+        + " market_stop=" + str(bool(run_payload.get("stopped_for_market_hours"))).lower()
+        + " traffic=" + str(run_payload.get("traffic_used_bytes"))
+        + "/" + str(run_payload.get("traffic_limit_bytes"))
     )
 PY
 )"
   echo "[shioaji-minute-runner] summary $summary_state"
 
-  if [[ "$summary_state" == *"collected=true"* ]]; then
+  if (( download_rc == 0 )) \
+    && [[ "$summary_state" == *"collected=true"* ]] \
+    && [[ "$summary_state" == *"target_match=true"* ]]; then
     echo "[shioaji-minute-runner] building audited available-source research dataset"
     run_fintech_python scripts/build_shioaji_tw_minute_dataset.py
     latest_date="$(
@@ -190,7 +200,15 @@ PY
     run_fintech_python -m pytest -q \
       test/test_shioaji_tw_minute_kbars.py \
       test/test_tw_minute_mode.py
+    echo "[shioaji-minute-runner] materializing zero-traffic daily and hybrid datasets"
+    run_fintech_python -m downloader.download_shioaji_tw_kbars \
+      --local-only \
+      --start-date 2020-03-02 \
+      --end-date "$BACKFILL_END_DATE"
+    run_fintech_python -m scripts.build_tw_shioaji_dataset
+    run_fintech_python -m scripts.audit_tw_shioaji_dataset
     echo "[shioaji-minute-runner] research_ready=true contract=audited_available_source source_gaps_are_masked=true"
+    echo "[shioaji-minute-runner] daily_ready=true materialization=verified_local_minute api_requests_started=0"
     echo "[shioaji-minute-runner] collection_completed_at=$(TZ=Asia/Taipei date --iso-8601=seconds)"
     exit 0
   fi

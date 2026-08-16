@@ -27,19 +27,32 @@ if [[ ! -s "$TARGET_FILE" ]]; then
 fi
 END_DATE="$(tr -d '[:space:]' < "$TARGET_FILE")"
 
-next_window_seconds() {
+market_priority_window_seconds() {
   run_fintech_python - <<'PY'
 from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 tz = ZoneInfo("Asia/Taipei")
 now = datetime.now(tz)
-target_date = now.date() + timedelta(days=1)
-while target_date.weekday() >= 5:
-    target_date += timedelta(days=1)
+target_date = now.date()
 target = datetime.combine(target_date, time(14, 31), tzinfo=tz)
+if now >= target:
+    target_date += timedelta(days=1)
+    while target_date.weekday() >= 5:
+        target_date += timedelta(days=1)
+    target = datetime.combine(target_date, time(14, 31), tzinfo=tz)
 print(max(60, int((target - now).total_seconds())))
 PY
 }
+
+# Quota reset timing is an observed broker-side fact, not a trading-calendar
+# rule.  Recheck api.usage() periodically so a weekend or otherwise unexpected
+# counter drop resumes the receipt-backed download without waiting several days.
+QUOTA_RECHECK_SECONDS="${SHIOAJI_FUTURES_HISTORY_QUOTA_RECHECK_SECONDS:-300}"
+if [[ ! "$QUOTA_RECHECK_SECONDS" =~ ^[0-9]+$ ]] || \
+   (( QUOTA_RECHECK_SECONDS < 60 || QUOTA_RECHECK_SECONDS > 3600 )); then
+  echo "[shioaji-futures-history-runner] SHIOAJI_FUTURES_HISTORY_QUOTA_RECHECK_SECONDS must be an integer within 60..3600" >&2
+  exit 2
+fi
 
 if [[ ! -f "$ALIAS_FILE" ]]; then
   echo "[shioaji-futures-history-runner] missing alias inventory: $ALIAS_FILE" >&2
@@ -81,13 +94,14 @@ for contract in "${CONTRACTS[@]}"; do
       echo "[shioaji-futures-history-runner] failed contract=$contract rc=$rc" >&2
       exit "$rc"
     fi
-    delay="$(next_window_seconds)"
     if (( rc == 76 )); then
+      delay="$(market_priority_window_seconds)"
       reason="market_hours_priority_gate"
     else
+      delay="$QUOTA_RECHECK_SECONDS"
       reason="next_quota_window"
     fi
-    echo "[shioaji-futures-history-runner] waiting_seconds=$delay reason=$reason contract=$contract"
+    echo "[shioaji-futures-history-runner] waiting_seconds=$delay reason=$reason contract=$contract quota_recheck_seconds=$QUOTA_RECHECK_SECONDS"
     sleep "$delay"
   done
 done

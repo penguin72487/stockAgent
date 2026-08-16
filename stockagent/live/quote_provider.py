@@ -45,6 +45,7 @@ class PriceSnapshot:
     source: str
     timestamp: str | None = None
     available_count: int = 0
+    requested_count: int = 0
     available_mask: np.ndarray | None = None
     open_prices: np.ndarray | None = None
     high_prices: np.ndarray | None = None
@@ -511,6 +512,7 @@ def fetch_shioaji_stock_snapshots(
         source=source,
         timestamp=timestamp,
         available_count=count,
+        requested_count=len(requested),
         available_mask=available,
         open_prices=arrays["open"],
         high_prices=arrays["high"],
@@ -598,6 +600,8 @@ def fetch_shioaji_futures_snapshot(
                 contract,
                 received_ms=received_ms,
             )
+            delivery_date = getattr(contract, "delivery_date", None)
+            last_trading_date = getattr(contract, "last_trading_date", None)
             quotes[code] = {
                 "contract_code": code,
                 "last": values.get("price"),
@@ -612,6 +616,20 @@ def fetch_shioaji_futures_snapshot(
                 .astimezone(ZoneInfo("Asia/Taipei"))
                 .isoformat(timespec="milliseconds"),
                 "source": "shioaji:futures_snapshot",
+                "logical_code": normalized_logical if code == current_code else None,
+                "delivery_month": str(
+                    getattr(contract, "delivery_month", "") or ""
+                ),
+                "delivery_date": (
+                    delivery_date.isoformat()
+                    if hasattr(delivery_date, "isoformat")
+                    else str(delivery_date or "")
+                ),
+                "last_trading_date": (
+                    last_trading_date.isoformat()
+                    if hasattr(last_trading_date, "isoformat")
+                    else str(last_trading_date or delivery_date or "")
+                ),
             }
         if current_code not in quotes:
             raise RuntimeError(
@@ -649,6 +667,7 @@ def fetch_futures_snapshot_prefer_stream(
         / "data_tw_index_derivatives_ticks/shioaji_fop_captures"
     )
     books: dict[str, dict[str, Any]] = {}
+    contract_metadata: dict[str, dict[str, Any]] = {}
     for path in sorted((selected_root / "runtime").glob("worker_*.json")):
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
@@ -657,6 +676,9 @@ def fetch_futures_snapshot_prefer_stream(
         for code, row in (payload.get("books") or {}).items():
             if isinstance(row, dict):
                 books[str(code).strip().upper()] = row
+        for code, row in (payload.get("contract_metadata") or {}).items():
+            if isinstance(row, dict):
+                contract_metadata[str(code).strip().upper()] = row
     current_codes = sorted(code for code in books if code.startswith(logical_root))
     current_code = current_codes[0] if len(current_codes) == 1 else ""
     required = {current_code, *(str(code).strip().upper() for code in additional_contract_codes)} - {""}
@@ -696,6 +718,18 @@ def fetch_futures_snapshot_prefer_stream(
             "ask_volume": int(row.get("ask_volume_1") or 0),
             "quote_at": quote_at,
             "source": "shioaji:fop_stream_local_book",
+            "logical_code": (contract_metadata.get(code) or {}).get(
+                "logical_code"
+            ),
+            "delivery_month": (contract_metadata.get(code) or {}).get(
+                "delivery_month"
+            ),
+            "delivery_date": (contract_metadata.get(code) or {}).get(
+                "delivery_date"
+            ),
+            "last_trading_date": (contract_metadata.get(code) or {}).get(
+                "last_trading_date"
+            ),
         }
     if current_code and required and set(quotes) == required:
         record_avoided_query(

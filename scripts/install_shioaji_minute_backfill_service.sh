@@ -2,9 +2,12 @@
 set -euo pipefail
 
 SERVICE_NAME="stockagent-shioaji-minute-backfill.service"
+TIMER_NAME="stockagent-shioaji-minute-backfill.timer"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TEMPLATE="$REPO_ROOT/deploy/systemd/$SERVICE_NAME.in"
+TIMER_TEMPLATE="$REPO_ROOT/deploy/systemd/$TIMER_NAME.in"
 UNIT_PATH="/etc/systemd/system/$SERVICE_NAME"
+TIMER_PATH="/etc/systemd/system/$TIMER_NAME"
 START_NOW=true
 
 usage() {
@@ -31,8 +34,8 @@ if (( EUID != 0 )); then
   echo "[shioaji-minute-service] root privileges are required" >&2
   exit 2
 fi
-if [[ ! -f "$TEMPLATE" || ! -f "$REPO_ROOT/.env" ]]; then
-  echo "[shioaji-minute-service] template or .env is missing" >&2
+if [[ ! -f "$TEMPLATE" || ! -f "$TIMER_TEMPLATE" || ! -f "$REPO_ROOT/.env" ]]; then
+  echo "[shioaji-minute-service] service/timer template or .env is missing" >&2
   exit 2
 fi
 
@@ -57,25 +60,30 @@ escape_replacement() {
 }
 
 rendered_unit="$(mktemp --suffix=.service)"
-trap 'rm -f "$rendered_unit"' EXIT
+rendered_timer="$(mktemp --suffix=.timer)"
+trap 'rm -f "$rendered_unit" "$rendered_timer"' EXIT
 sed \
   -e "s|@REPO_ROOT@|$(escape_replacement "$REPO_ROOT")|g" \
   -e "s|@SERVICE_USER@|$(escape_replacement "$SERVICE_USER")|g" \
   -e "s|@SERVICE_GROUP@|$(escape_replacement "$SERVICE_GROUP")|g" \
   -e "s|@SERVICE_HOME@|$(escape_replacement "$SERVICE_HOME")|g" \
   "$TEMPLATE" > "$rendered_unit"
+cp "$TIMER_TEMPLATE" "$rendered_timer"
 
-systemd-analyze verify "$rendered_unit"
+systemd-analyze verify "$rendered_unit" "$rendered_timer"
 install -m 0644 "$rendered_unit" "$UNIT_PATH"
+install -m 0644 "$rendered_timer" "$TIMER_PATH"
 chmod 0755 "$REPO_ROOT/scripts/run_shioaji_minute_full_backfill.sh"
 chmod go-rwx "$REPO_ROOT/.env"
 systemctl daemon-reload
 systemctl enable "$SERVICE_NAME"
+systemctl enable --now "$TIMER_NAME"
 if [[ "$START_NOW" == true ]]; then
   systemctl restart "$SERVICE_NAME"
 fi
 
 echo "[shioaji-minute-service] installed=$UNIT_PATH enabled=$(systemctl is-enabled "$SERVICE_NAME")"
+echo "[shioaji-minute-service] timer=$TIMER_PATH enabled=$(systemctl is-enabled "$TIMER_NAME")"
 if [[ "$START_NOW" == true ]]; then
   echo "[shioaji-minute-service] active=$(systemctl is-active "$SERVICE_NAME")"
 fi

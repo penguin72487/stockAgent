@@ -795,6 +795,11 @@ def main() -> int:
         )
         for info in selected_infos
     ]
+    sink.live_book_metadata = {
+        str(row.get("code") or ""): row
+        for row in contract_metadata
+        if str(row.get("code") or "") in sink.live_book_codes
+    }
 
     strategy_engine = None
     if args.execute_strategies:

@@ -6,8 +6,8 @@
   <meta name="color-scheme" content="dark">
   <meta name="theme-color" content="#071019">
   <title>OpenBB 歷史封存監控｜StockAgent</title>
-  <link rel="stylesheet" href="styles.css?v=1">
-  <link rel="stylesheet" href="../dashboard-core.css?v=4">
+  <link rel="stylesheet" href="styles.css?v=2">
+  <link rel="stylesheet" href="../dashboard-core.css?v=5">
 </head>
 <body>
   <a class="skip-link" href="#main">跳到主要內容</a>
@@ -19,6 +19,7 @@
       <a href="../tw-day-trade/">台股當沖</a>
       <a href="../shioaji/">永豐 API</a>
       <a href="./" aria-current="page">OpenBB</a>
+      <a href="../data-monitor/">全資料</a>
     </nav>
   </header>
 
@@ -66,8 +67,8 @@
       </div>
       <div class="kpi-grid">
         <article class="kpi"><span>成功資料列</span><strong id="success-rows">—</strong><p>實際寫入 Parquet 的列數</p></article>
-        <article class="kpi"><span>尚未解決</span><strong id="unresolved-tasks">—</strong><p>仍需工作或重新判定</p></article>
-        <article class="kpi"><span>可重試</span><strong id="retryable-tasks">—</strong><p>尚未終止的錯誤任務</p></article>
+        <article class="kpi"><span>可處理待辦</span><strong id="unresolved-tasks">—</strong><p>尚未接受且非永久不可用</p></article>
+        <article class="kpi"><span>可重試</span><strong id="retryable-tasks">—</strong><p id="retryable-detail">尚未終止的錯誤任務</p></article>
         <article class="kpi"><span>不可用</span><strong id="unavailable-tasks">—</strong><p>與已接受資料分開呈現</p></article>
         <article class="kpi"><span>最近 15 分鐘</span><strong id="recent-throughput">—</strong><p id="recent-detail">—</p></article>
         <article class="kpi"><span>可用磁碟</span><strong id="disk-free">—</strong><p id="disk-floor">安全門檻 —</p></article>
@@ -80,12 +81,12 @@
         <div><h2 id="trend-title">歷史進度曲線</h2><p>點擊彩色圓點可隱藏或顯示曲線；時間範圍不會觸發 OpenBB 上游請求。</p></div>
         <div class="range-picker" role="group" aria-label="歷史時間範圍">
           <button type="button" data-range="1h">1 小時</button>
-          <button type="button" data-range="1d">天</button>
+          <button type="button" data-range="1d" class="active" aria-pressed="true">天</button>
           <button type="button" data-range="1w">週</button>
           <button type="button" data-range="1mo">月</button>
           <button type="button" data-range="1q">季</button>
           <button type="button" data-range="1y">年</button>
-          <button type="button" data-range="all" class="active" aria-pressed="true">全部</button>
+          <button type="button" data-range="all">全部</button>
         </div>
       </header>
       <div class="chart-card">
@@ -93,7 +94,7 @@
         <div class="chart-scroll" tabindex="0" aria-label="OpenBB 歷史曲線，可在窄螢幕水平捲動">
           <svg id="progress-chart" viewBox="0 0 1000 320" role="img" aria-labelledby="chart-title chart-description">
             <title id="chart-title">OpenBB 封存歷史進度</title>
-            <desc id="chart-description">顯示已接受、已判定與尚未解決任務占總任務的百分比。</desc>
+            <desc id="chart-description">顯示已接受、已判定與尚未接受任務占總任務的百分比。</desc>
             <g id="chart-grid"></g>
             <g id="chart-lines"></g>
           </svg>
@@ -104,13 +105,13 @@
     </section>
 
     <section id="categories" class="section-block" aria-labelledby="categories-title">
-      <header class="section-heading"><span>03</span><div><h2 id="categories-title">資料分類</h2><p>依尚未解決任務排序，先看真正限制完成度的工作。</p></div></header>
+      <header class="section-heading"><span>03</span><div><h2 id="categories-title">資料分類</h2><p>依尚未取得資料量排序；待下載與供應商權限／能力不可用分開呈現。</p></div></header>
       <div id="category-grid" class="category-grid" aria-live="polite"></div>
     </section>
 
     <section id="providers" class="section-block" aria-labelledby="providers-title">
       <header class="section-heading"><span>04</span><div><h2 id="providers-title">供應商與配額</h2><p>速率與並行度只描述排程能力；日配額造成的時間下限不能靠加執行緒消除。</p></div></header>
-      <div class="table-wrap">
+      <div class="table-wrap" tabindex="0" role="region" aria-label="OpenBB 供應商與配額明細，可用方向鍵水平捲動">
         <table>
           <thead><tr><th>供應商</th><th>已接受</th><th>資料列</th><th>待辦／獨占</th><th>近況</th><th>RPS／並行</th><th>狀態</th></tr></thead>
           <tbody id="provider-body"></tbody>
@@ -138,6 +139,6 @@
 
   <footer>OpenBB 歷史封存觀測 · 公開唯讀 · 頁面每 60 秒更新</footer>
   <script src="../time-axis.js?v=3" defer></script>
-  <script src="app.js?v=2" defer></script>
+  <script src="app.js?v=6" defer></script>
 </body>
 </html>

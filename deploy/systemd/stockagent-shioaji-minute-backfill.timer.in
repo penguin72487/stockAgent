@@ -1,0 +1,10 @@
+[Unit]
+Description=Schedule StockAgent Shioaji minute/daily data refresh after Taiwan close
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 14:45:00 Asia/Taipei
+Persistent=true
+Unit=stockagent-shioaji-minute-backfill.service
+
+[Install]
+WantedBy=timers.target

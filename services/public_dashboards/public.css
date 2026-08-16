@@ -44,6 +44,8 @@ a { color: inherit; }
   border-bottom: 1px solid rgba(40, 65, 89, .65);
 }
 .brand { color: var(--text); font-size: 13px; font-weight: 850; letter-spacing: .17em; text-decoration: none; }
+.site-header nav a { padding: 0 9px; color: var(--muted); font-size: 12px; font-weight: 700; text-decoration: none; white-space: nowrap; }
+.site-header nav a:hover, .site-header nav a:focus-visible { color: var(--cyan); background: rgba(67, 215, 255, .08); }
 .read-only { display: inline-flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12px; }
 .read-only i { width: 8px; height: 8px; border-radius: 50%; background: var(--green); box-shadow: 0 0 0 4px rgba(94, 224, 160, .12); }
 main { width: min(1120px, calc(100% - 36px)); margin: 0 auto; padding: clamp(52px, 8vw, 96px) 0 44px; }
@@ -74,6 +76,7 @@ h1 { margin: 0; max-width: 760px; overflow-wrap: anywhere; font-size: clamp(42px
 .dashboard-card.tw::after { background: var(--green); }
 .dashboard-card.shioaji::after { background: var(--amber); }
 .dashboard-card.openbb::after { background: #ae8bff; }
+.dashboard-card.data::after { background: #ff8fc8; }
 .dashboard-card:hover, .dashboard-card:focus-visible { transform: translateY(-3px); border-color: var(--cyan); box-shadow: 0 28px 80px rgba(0, 0, 0, .34); outline: none; }
 .dashboard-card:focus-visible { box-shadow: 0 0 0 3px rgba(67, 215, 255, .2), 0 28px 80px rgba(0, 0, 0, .34); }
 .card-topline { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
@@ -81,9 +84,10 @@ h1 { margin: 0; max-width: 760px; overflow-wrap: anywhere; font-size: clamp(42px
 .tw .market { color: var(--green); }
 .shioaji .market { color: var(--amber); }
 .openbb .market { color: #c9b7ff; }
+.data .market { color: #ffadd6; }
 .health { display: inline-flex; align-items: center; gap: 7px; color: var(--muted); font-size: 11px; }
 .health i { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
-.health.active, .health.complete { color: var(--green); }
+.health.active, .health.complete, .health.updating { color: var(--green); }
 .health.waiting, .health.stale, .health.starting { color: var(--amber); }
 .health.blocked, .health.critical, .health.unavailable, .health.stopped { color: var(--red); }
 .health.degraded { color: var(--red); }
@@ -98,6 +102,7 @@ h1 { margin: 0; max-width: 760px; overflow-wrap: anywhere; font-size: clamp(42px
 .tw .card-action b { color: var(--green); }
 .shioaji .card-action b { color: var(--amber); }
 .openbb .card-action b { color: #c9b7ff; }
+.data .card-action b { color: #ffadd6; }
 .dashboard-card:hover .card-action b { transform: translateX(4px); }
 .safety-note { display: grid; grid-template-columns: 110px 1fr; gap: 22px; padding: 22px 24px; border: 1px solid rgba(40, 65, 89, .72); border-radius: 14px; background: rgba(13, 27, 40, .72); }
 .note-index { color: var(--green); font-size: 11px; font-weight: 800; letter-spacing: .11em; }

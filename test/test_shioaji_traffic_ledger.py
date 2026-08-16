@@ -12,14 +12,15 @@ from stockagent.live import quote_provider
 from stockagent.live.shioaji_traffic_ledger import (
     StreamingLedgerRecorder,
     quota_window_date,
+    rebuild_traffic_summary,
     record_avoided_query,
     shioaji_query,
 )
 
 
-def test_traffic_ledger_rolls_over_at_taipei_0800() -> None:
+def test_traffic_ledger_groups_raw_events_by_local_observation_date() -> None:
     assert quota_window_date(datetime(2026, 8, 14, 23, 59, tzinfo=timezone.utc)) == (
-        "2026-08-14"
+        "2026-08-15"
     )
     assert quota_window_date(datetime(2026, 8, 15, 0, 0, tzinfo=timezone.utc)) == (
         "2026-08-15"
@@ -60,6 +61,49 @@ def test_traffic_ledger_attributes_queries_and_avoided_calls(monkeypatch, tmp_pa
     assert summary["by_consumer"]["test_consumer"]["rows"] == 2
     ledger = next((tmp_path / "daily").glob("*.jsonl")).read_text(encoding="utf-8")
     assert "secret" not in ledger.lower()
+
+
+def test_traffic_ledger_starts_quota_epoch_only_after_observed_counter_drop(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("STOCKAGENT_SHIOAJI_TRAFFIC_LEDGER_ROOT", str(tmp_path))
+    api = _UsageApi()
+    api.used = 900
+    with shioaji_query(
+        api,
+        consumer="history",
+        method="ticks",
+        asset_class="futures",
+    ) as set_result:
+        api.used = 950
+        set_result([1])
+
+    api.used = 0
+    with shioaji_query(
+        api,
+        consumer="strategy",
+        method="snapshots",
+        asset_class="stock",
+    ) as set_result:
+        api.used = 25
+        set_result([1, 2])
+
+    summary = json.loads((tmp_path / "summary.json").read_text(encoding="utf-8"))
+    assert summary["schema_version"] == 2
+    assert summary["quota_epoch"]["boundary_kind"] == "observed_counter_drop"
+    assert summary["quota_epoch"]["reset_observed"] is True
+    assert summary["latest_reset"]["previous_used_bytes"] == 950
+    assert summary["latest_reset"]["new_used_bytes"] == 0
+    assert summary["latest_usage"]["used_bytes"] == 25
+    assert summary["totals"]["queries"] == 1
+    assert summary["totals"]["observed_usage_delta_bytes"] == 25
+    assert set(summary["by_consumer"]) == {"strategy"}
+
+    (tmp_path / "summary.json").unlink()
+    rebuilt = rebuild_traffic_summary(root=tmp_path)
+    assert rebuilt["latest_reset"]["previous_used_bytes"] == 950
+    assert rebuilt["latest_usage"]["used_bytes"] == 25
+    assert rebuilt["totals"]["queries"] == 1
 
 
 def test_streaming_ledger_records_deltas_as_quota_exempt(
@@ -109,6 +153,14 @@ def test_futures_stream_book_is_causal_and_falls_back_when_stale(
     (runtime / "worker_00.json").write_text(
         json.dumps(
             {
+                "contract_metadata": {
+                    "TXFH6": {
+                        "logical_code": "TXFR1",
+                        "delivery_month": "202608",
+                        "delivery_date": "2026-08-19",
+                        "last_trading_date": "2026-08-19",
+                    }
+                },
                 "books": {
                     "TXFH6": {
                         "snapshot_ts_ns": receive_ns,
@@ -146,6 +198,8 @@ def test_futures_stream_book_is_causal_and_falls_back_when_stale(
     )
     assert fresh["current_contract_code"] == "TXFH6"
     assert fresh["quotes"]["TXFH6"]["bid"] == 100.0
+    assert fresh["quotes"]["TXFH6"]["delivery_month"] == "202608"
+    assert fresh["quotes"]["TXFH6"]["last_trading_date"] == "2026-08-19"
     assert stale == {"source": "fallback"}
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from http.client import HTTPConnection
 import json
 import re
 from types import SimpleNamespace
@@ -13,6 +14,11 @@ from scripts.serve_public_dashboards import (
     PUBLIC_AUDIT_BURST_CAPACITY,
     PUBLIC_AUDIT_HISTORY_COST,
     PUBLIC_AUDIT_REFILL_PER_SECOND,
+    PUBLIC_GLOBAL_BURST_CAPACITY,
+    PUBLIC_GLOBAL_RATE_KEY,
+    PUBLIC_GLOBAL_REFILL_PER_SECOND,
+    InvalidPublicRequest,
+    PublicRouteNotFound,
     PublicDashboardHandler,
     PublicDashboardServer,
     build_public_overview,
@@ -152,6 +158,9 @@ def test_tw_public_projection_scrubs_ids_paths_errors_and_bounds_events() -> Non
 def test_tw_signal_projection_removes_internal_signal_id() -> None:
     public = sanitize_tw_signals(
         {
+            "simulation_only": True,
+            "production_order_possible": False,
+            "private_runtime_state": "drop",
             "rows": [
                 {
                     "signal_id": "private",
@@ -161,8 +170,17 @@ def test_tw_signal_projection_removes_internal_signal_id() -> None:
             ]
         }
     )
-    assert public == {"rows": [{"symbol": "2330", "bid": None}]}
+    assert public == {
+        "simulation_only": True,
+        "production_order_possible": False,
+        "rows": [{"symbol": "2330", "bid": None}],
+    }
+    assert "private_runtime_state" not in public
     json.dumps(public, allow_nan=False)
+    with pytest.raises(UnsafePublicDashboardPayload):
+        sanitize_tw_signals(
+            {"simulation_only": False, "production_order_possible": False}
+        )
 
 
 def test_tw_event_projection_enforces_simulation_and_scrubs_ids() -> None:
@@ -242,11 +260,12 @@ def test_public_landing_exposes_live_safe_status_without_remote_assets() -> None
     root = Path(__file__).resolve().parents[1] / "services" / "public_dashboards"
     html = (root / "index.html").read_text(encoding="utf-8")
     javascript = (root / "public.js").read_text(encoding="utf-8")
-    assert 'src="public.js?v=4"' in html
+    assert 'src="public.js?v=6"' in html
     assert 'id="taifex-health"' in html
     assert 'id="tw-health"' in html
     assert 'id="shioaji-health"' in html
     assert 'id="openbb-health"' in html
+    assert 'id="data-health"' in html
     assert "http://" not in html and "https://" not in html
     assert 'fetchJson("api/overview")' in javascript
     assert "taifex/api/status" not in javascript
@@ -254,7 +273,9 @@ def test_public_landing_exposes_live_safe_status_without_remote_assets() -> None
     assert "shioaji/api/status" not in javascript
     assert '"流量保護"' in javascript
     assert "renderOpenbb(data.openbb || {})" in javascript
+    assert "renderDataMonitor(data.data_monitor || {})" in javascript
     assert "textContent" in javascript
+    assert 'seconds == null || seconds === ""' in javascript
 
 
 def test_public_overview_and_tw_summary_exclude_large_ledgers() -> None:
@@ -343,9 +364,14 @@ def test_public_pages_share_visual_tokens() -> None:
         "tw_day_trade_dashboard/index.html",
         "shioaji_api_dashboard/index.html",
         "openbb_archive_dashboard/index.html",
+        "data_monitor_dashboard/index.html",
     ):
         html = (root / relative).read_text(encoding="utf-8")
-        assert "dashboard-core.css?v=4" in html
+        assert "dashboard-core.css?v=5" in html
+        assert 'href="../data-monitor/">全資料</a>' in html or (
+            relative == "data_monitor_dashboard/index.html"
+            and 'href="./" aria-current="page">全資料</a>' in html
+        ) or relative == "public_dashboards/index.html"
         assert '<meta name="theme-color" content="#071019">' in html
     for relative in (
         "taifex_dashboard/index.html",
@@ -354,6 +380,18 @@ def test_public_pages_share_visual_tokens() -> None:
     ):
         html = (root / relative).read_text(encoding="utf-8")
         assert 'src="../time-axis.js?v=3"' in html
+
+    for relative in (
+        "public_dashboards/public.js",
+        "taifex_dashboard/app.js",
+        "tw_day_trade_dashboard/app.js",
+        "shioaji_api_dashboard/app.js",
+        "openbb_archive_dashboard/app.js",
+        "data_monitor_dashboard/app.js",
+    ):
+        javascript = (root / relative).read_text(encoding="utf-8")
+        assert "FETCH_TIMEOUT_MS = 15000" in javascript
+        assert "AbortController" in javascript
 
     tw_javascript = (root / "tw_day_trade_dashboard" / "app.js").read_text(
         encoding="utf-8"
@@ -379,6 +417,7 @@ def test_public_pages_share_visual_tokens() -> None:
     assert ".legend-toggle.is-hidden" in tw_styles
     assert "open_net_liquidation_pnl_twd" in tw_javascript
     assert "reconciled_total_net_pnl_twd" in tw_javascript
+    assert 'historical_session_complete: "歷史交易日已完成"' in tw_javascript
     assert "maximumSignificantDigits" not in tw_javascript
     assert "@media(max-width:700px)" in tw_styles
     for dashboard in ("tw_day_trade_dashboard", "shioaji_api_dashboard"):
@@ -396,6 +435,7 @@ def _test_server() -> PublicDashboardServer:
         tw_static_root=root / "services/tw_day_trade_dashboard",
         shioaji_static_root=root / "services/shioaji_api_dashboard",
         openbb_static_root=root / "services/openbb_archive_dashboard",
+        data_monitor_static_root=root / "services/data_monitor_dashboard",
         repo_root=root,
         taifex_upstream="http://127.0.0.1:1",
         tw_upstream="http://127.0.0.1:1",
@@ -412,6 +452,101 @@ def test_public_gateway_serves_shared_time_axis() -> None:
         assert b"buildTimeAxis" in response.body
     finally:
         server.server_close()
+
+
+def test_public_gateway_protocol_is_read_only_fail_closed_and_hardened() -> None:
+    server = _test_server()
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    connection = HTTPConnection("127.0.0.1", server.server_address[1], timeout=3)
+    try:
+        connection.request("GET", "/healthz")
+        response = connection.getresponse()
+        assert response.status == 200
+        assert json.loads(response.read()) == {"health": "ok"}
+        assert response.getheader("Content-Security-Policy") is not None
+        assert "script-src-attr 'none'" in response.getheader(
+            "Content-Security-Policy"
+        )
+        assert response.getheader("Origin-Agent-Cluster") == "?1"
+        assert response.getheader("X-Permitted-Cross-Domain-Policies") == "none"
+
+        connection.request("POST", "/", body=b"")
+        response = connection.getresponse()
+        assert response.status == 405
+        assert response.getheader("Allow") == "GET, HEAD"
+        assert json.loads(response.read()) == {"error": "method_not_allowed"}
+
+        connection.request("GET", "/.env")
+        response = connection.getresponse()
+        assert response.status == 404
+        assert json.loads(response.read()) == {"error": "not_found"}
+
+        connection.request("GET", "/tw-day-trade/api/history?range=invalid")
+        response = connection.getresponse()
+        assert response.status == 400
+        assert json.loads(response.read()) == {"error": "invalid_request"}
+
+        server.data_monitor_status = lambda: (_ for _ in ()).throw(
+            ValueError("private internal detail")
+        )
+        connection.request("GET", "/data-monitor/api/status")
+        response = connection.getresponse()
+        assert response.status == 503
+        assert json.loads(response.read()) == {
+            "health": "unavailable",
+            "error": "temporarily_unavailable",
+        }
+
+        server.global_api_limiter = TokenBucketRateLimiter(
+            capacity=1.0,
+            refill_per_second=0.001,
+            maximum_clients=1,
+        )
+        connection.request("GET", "/unknown/api/path")
+        response = connection.getresponse()
+        assert response.status == 404
+        response.read()
+        connection.request("GET", "/unknown/api/path")
+        response = connection.getresponse()
+        assert response.status == 429
+        assert response.getheader("Retry-After") == "2"
+        assert json.loads(response.read()) == {"error": "rate_limited"}
+    finally:
+        connection.close()
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+
+
+def test_caddy_and_gateway_security_policy_stay_aligned() -> None:
+    root = Path(__file__).resolve().parents[1]
+    gateway = (root / "scripts/serve_public_dashboards.py").read_text(
+        encoding="utf-8"
+    )
+    caddy = (root / "deploy/caddy/Caddyfile.windows").read_text(encoding="utf-8")
+    launcher = (root / "scripts/run_public_dashboards.sh").read_text(
+        encoding="utf-8"
+    )
+    unit = (
+        root / "deploy/systemd/stockagent-public-dashboards.service.in"
+    ).read_text(encoding="utf-8")
+    for token in (
+        "Origin-Agent-Cluster",
+        "X-Permitted-Cross-Domain-Policies",
+        "script-src-attr 'none'",
+        "style-src-attr 'none'",
+        "frame-src 'none'",
+    ):
+        assert token in gateway
+        assert token in caddy
+    assert "max_header_size 16KB" in caddy
+    assert "read_header 5s" in caddy
+    assert "max_conns_per_host 32" in caddy
+    assert "@write_methods not method GET HEAD" in caddy
+    assert 'header @write_methods Allow "GET, HEAD"' in caddy
+    assert 'MALLOC_ARENA_MAX="${MALLOC_ARENA_MAX:-2}"' in launcher
+    assert 'Environment="MALLOC_ARENA_MAX=2"' in unit
 
 
 def test_expired_cache_returns_stale_while_refreshing_in_background() -> None:
@@ -524,6 +659,51 @@ def test_unrelated_cache_keys_do_not_block_each_other() -> None:
         server.server_close()
 
 
+def test_same_cold_cache_key_is_built_once_under_concurrency() -> None:
+    server = _test_server()
+    calls = 0
+    calls_lock = threading.Lock()
+    responses: list[bytes] = []
+
+    def builder() -> dict[str, int]:
+        nonlocal calls
+        with calls_lock:
+            calls += 1
+        time.sleep(0.05)
+        return {"value": 1}
+
+    def request() -> None:
+        response = server.cached_local_json(
+            cache_key="same-key",
+            ttl_seconds=10.0,
+            cache_control="no-store",
+            builder=builder,
+            stale_grace_seconds=0.0,
+        )
+        responses.append(response.body)
+
+    workers = [threading.Thread(target=request) for _ in range(12)]
+    try:
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=2)
+        assert all(not worker.is_alive() for worker in workers)
+        assert calls == 1
+        assert len(responses) == len(workers)
+        assert all(json.loads(body) == {"value": 1} for body in responses)
+    finally:
+        server.server_close()
+
+
+def test_overview_cache_matches_one_minute_client_refresh_contract() -> None:
+    source = (Path(__file__).resolve().parents[1] / "scripts/serve_public_dashboards.py").read_text(encoding="utf-8")
+    assert 'cache_key="public-overview"' in source
+    assert "ttl_seconds=55.0" in source
+    assert "ThreadPoolExecutor" in source
+    assert "prewarm_overview" in source
+
+
 def test_token_bucket_rate_limiter_refills_and_caps_client_table() -> None:
     limiter = TokenBucketRateLimiter(
         capacity=2.0, refill_per_second=1.0, maximum_clients=2
@@ -553,12 +733,29 @@ def test_public_audit_envelope_covers_all_ranges_on_both_dashboards() -> None:
         assert limiter.allow("one-public-client", cost=1.0, now=0.0)
 
 
-def test_public_gateway_burst_threshold_is_audit_only() -> None:
+def test_public_gateway_has_nat_safe_audit_and_global_flood_ceiling() -> None:
     source = (Path(__file__).resolve().parents[1] / "scripts" / "serve_public_dashboards.py").read_text(encoding="utf-8")
-    assert "HTTPStatus.TOO_MANY_REQUESTS" not in source
+    assert "HTTPStatus.TOO_MANY_REQUESTS" in source
     assert "audit=burst_threshold_exceeded" in source
     assert "action=allowed" in source
     assert "user_agent_hash=" in source
+    limiter = TokenBucketRateLimiter(
+        capacity=PUBLIC_GLOBAL_BURST_CAPACITY,
+        refill_per_second=PUBLIC_GLOBAL_REFILL_PER_SECOND,
+        maximum_clients=1,
+    )
+    for _request in range(int(PUBLIC_GLOBAL_BURST_CAPACITY)):
+        assert limiter.allow(PUBLIC_GLOBAL_RATE_KEY, now=0.0)
+    assert not limiter.allow(PUBLIC_GLOBAL_RATE_KEY, now=0.0)
+    assert limiter.allow(PUBLIC_GLOBAL_RATE_KEY, now=1.0)
+
+
+def test_public_route_and_request_errors_are_distinct_from_internal_failures() -> None:
+    with pytest.raises(InvalidPublicRequest):
+        PublicDashboardHandler._signal_query("limit=not-a-number")
+    with pytest.raises(InvalidPublicRequest):
+        PublicDashboardHandler._history_range_query("range=unsupported")
+    assert issubclass(PublicRouteNotFound, KeyError)
 
 
 def test_public_audit_uses_forwarded_client_and_anonymous_user_agent_hash() -> None:

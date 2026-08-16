@@ -128,8 +128,18 @@ def test_shioaji_futures_snapshot_resolves_target_and_fetches_old_roll_contract(
     monkeypatch,
 ):
     logical = SimpleNamespace(code="TXFR1", target_code="TXFH6")
-    current = SimpleNamespace(code="TXFH6")
-    previous = SimpleNamespace(code="TXFG6")
+    current = SimpleNamespace(
+        code="TXFH6",
+        delivery_month="202608",
+        delivery_date=None,
+        last_trading_date=None,
+    )
+    previous = SimpleNamespace(
+        code="TXFG6",
+        delivery_month="202607",
+        delivery_date=None,
+        last_trading_date=None,
+    )
     api = _FakeApi(
         {
             "TXFR1": logical,
@@ -148,6 +158,8 @@ def test_shioaji_futures_snapshot_resolves_target_and_fetches_old_roll_contract(
     assert set(payload["quotes"]) == {"TXFH6", "TXFG6"}
     assert payload["quotes"]["TXFH6"]["bid"] == 100.5
     assert payload["quotes"]["TXFH6"]["ask"] == 101.0
+    assert payload["quotes"]["TXFH6"]["delivery_month"] == "202608"
+    assert payload["quotes"]["TXFG6"]["delivery_month"] == "202607"
     assert payload["source"].endswith("contract_v2_target")
 
 

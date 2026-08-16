@@ -8,6 +8,8 @@ import numpy as np
 import pytest
 
 from stockagent.data.tw_index_futures import (
+    TAIFEX_ALL_FUTURES_DAILY_CONTRACT_VERSION,
+    build_taifex_all_futures_daily_sessions,
     build_taifex_index_futures_day_session,
     load_taifex_index_futures_day_session,
 )
@@ -227,4 +229,76 @@ def test_overlapping_sources_must_agree(tmp_path: Path) -> None:
         build_taifex_index_futures_day_session(
             [first, second],
             tmp_path / "normalized.parquet",
+        )
+
+
+def test_build_all_futures_daily_sessions_keeps_products_and_sessions(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "all_futures.csv"
+    _write_csv(
+        source,
+        [
+            _row("2025/01/02", "TX", "202501", 20000, 20100),
+            _row(
+                "2025/01/02",
+                "TX",
+                "202501",
+                19900,
+                20000,
+                session="盤後",
+            ),
+            _row("2025/01/02", "MTX", "202501W1", 20010, 20110),
+            _row("2025/01/02", "CAF", "202501/202502", -2, -1),
+            _row("2025/01/02", "CDF", "202501", 1000, 1010),
+            _row("2025/01/02", "CCF", "202501", 50, 50, volume=0),
+        ],
+    )
+    output = build_taifex_all_futures_daily_sessions(
+        [source],
+        tmp_path / "all.parquet",
+        batch_rows=2,
+    )
+
+    import pyarrow.parquet as pq
+
+    table = pq.read_table(output)
+    assert table.num_rows == 4
+    assert set(table["product"].to_pylist()) == {"TX", "MTX", "CDF"}
+    assert set(table["session"].to_pylist()) == {"一般", "盤後"}
+    assert set(table["series_type"].to_pylist()) == {"monthly", "weekly"}
+    assert all(table["session_reported"].to_pylist())
+    metadata = table.schema.metadata or {}
+    assert metadata[b"stockagent.dataset"] == b"taifex_all_futures_daily_sessions"
+    assert int(metadata[b"stockagent.contract_version"]) == (
+        TAIFEX_ALL_FUTURES_DAILY_CONTRACT_VERSION
+    )
+
+
+def test_all_futures_legacy_rows_are_explicitly_day_only(tmp_path: Path) -> None:
+    source = tmp_path / "legacy.csv"
+    _write_legacy_csv(
+        source,
+        [_row("2005/01/03", "TX", "200501", 6000, 6010)],
+    )
+    output = build_taifex_all_futures_daily_sessions(
+        [source], tmp_path / "all.parquet"
+    )
+
+    import pyarrow.parquet as pq
+
+    table = pq.read_table(output)
+    assert table["session"].to_pylist() == ["一般"]
+    assert table["session_reported"].to_pylist() == [False]
+
+
+def test_all_futures_duplicate_bar_fails_closed(tmp_path: Path) -> None:
+    first = tmp_path / "first.csv"
+    second = tmp_path / "second.csv"
+    _write_csv(first, [_row("2025/01/02", "TX", "202501", 20000, 20100)])
+    _write_csv(second, [_row("2025/01/02", "TX", "202501", 20000, 20100)])
+
+    with pytest.raises(ValueError, match="duplicate TAIFEX futures daily bar"):
+        build_taifex_all_futures_daily_sessions(
+            [first, second], tmp_path / "all.parquet"
         )
