@@ -1,5 +1,6 @@
 import threading
 import time
+from datetime import datetime, timezone
 
 import pytest
 
@@ -7,8 +8,11 @@ import downloader.common as downloader_common
 from downloader.common import (
     DEFAULT_UNSPECIFIED_REQUESTS_PER_SECOND,
     SharedRateLimiter,
+    parse_retry_after_seconds,
     provider_rate_limit,
+    resolve_incremental_reconcile_start_ms,
     resolve_request_interval,
+    retry_delay_seconds,
 )
 
 
@@ -16,10 +20,14 @@ def test_documented_provider_defaults_use_exact_average_limit() -> None:
     okx = provider_rate_limit("okx_history_candles")
     bybit = provider_rate_limit("bybit_public_rest")
     alpaca = provider_rate_limit("alpaca_market_data_basic")
+    binance = provider_rate_limit("binance_usdm_request_weight")
+    shioaji = provider_rate_limit("shioaji_quote_query")
 
     assert round(okx.requests_per_second, 2) == 10.00
     assert round(bybit.requests_per_second, 2) == 120.00
     assert alpaca.requests_per_second == 200 / 60
+    assert binance.requests_per_second == 2400 / 60
+    assert shioaji.requests_per_second == 10
     assert resolve_request_interval("okx_history_candles", None) == okx.interval_seconds
     assert resolve_request_interval("bybit_public_rest", None) == bybit.interval_seconds
     assert (
@@ -266,3 +274,66 @@ def test_defer_reblocks_threads_that_are_already_sleeping(
     assert len(completed_at) == worker_count
     # Every not-yet-sent request must observe the later provider-wide cooldown.
     assert min(completed_at) - deferred_at >= cooldown - 0.02
+
+
+def test_weighted_claim_reserves_one_interval_per_cost_unit(
+    tmp_path, monkeypatch
+) -> None:
+    limiter = SharedRateLimiter(0.1, name="weighted-test", state_dir=tmp_path)
+    clock = iter((100.0, 100.5))
+    monkeypatch.setattr(downloader_common.time, "monotonic", lambda: next(clock))
+
+    assert limiter._claim_process_shared(cost=5) == (True, 0.0)
+    assert float(limiter._state_path.read_text().strip()) == pytest.approx(100.5)
+    assert limiter._claim_process_shared() == (True, 0.0)
+    assert float(limiter._state_path.read_text().strip()) == pytest.approx(100.6)
+
+
+def test_weighted_wait_reports_request_weight_activity(tmp_path) -> None:
+    limiter = SharedRateLimiter(0.0, name="weighted-activity", state_dir=tmp_path)
+    limiter.wait(cost=2)
+    limiter.wait(cost=5)
+
+    activity = limiter.grant_activity()
+    assert activity["grants_total"] == 2
+    assert activity["grant_cost_total"] == 7.0
+    assert activity["grant_cost_last_60s"] == 7.0
+
+
+@pytest.mark.parametrize("cost", [0, -1, float("inf"), float("nan")])
+def test_weighted_wait_rejects_non_positive_or_non_finite_cost(
+    tmp_path, cost: float
+) -> None:
+    limiter = SharedRateLimiter(0.0, name="invalid-cost", state_dir=tmp_path)
+    with pytest.raises(ValueError, match="finite and positive"):
+        limiter.wait(cost=cost)
+
+
+def test_retry_after_supports_delta_seconds_and_http_date() -> None:
+    now = datetime(2026, 8, 16, 0, 0, tzinfo=timezone.utc)
+    assert parse_retry_after_seconds("12", now=now) == 12.0
+    assert parse_retry_after_seconds("Sun, 16 Aug 2026 00:00:20 GMT", now=now) == 20.0
+    assert parse_retry_after_seconds("invalid", now=now) is None
+    assert retry_delay_seconds(2, base=0.5, retry_after="3") == 3.0
+
+
+def test_incremental_reconcile_repairs_missing_head_before_tail_append() -> None:
+    interval = 15 * 60 * 1000
+    expected = 1_700_000_000_000
+    complete_start, repaired = resolve_incremental_reconcile_start_ms(
+        expected_first_ms=expected,
+        earliest_existing_ms=expected + 20 * interval,
+        latest_existing_ms=expected + 100 * interval,
+        overlap_ms=interval,
+    )
+    tail_start, tail_repaired = resolve_incremental_reconcile_start_ms(
+        expected_first_ms=expected,
+        earliest_existing_ms=expected,
+        latest_existing_ms=expected + 100 * interval,
+        overlap_ms=interval,
+    )
+
+    assert repaired
+    assert complete_start == expected
+    assert not tail_repaired
+    assert tail_start == expected + 99 * interval

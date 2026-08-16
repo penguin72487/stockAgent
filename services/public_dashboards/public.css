@@ -77,6 +77,7 @@ h1 { margin: 0; max-width: 760px; overflow-wrap: anywhere; font-size: clamp(42px
 .dashboard-card.shioaji::after { background: var(--amber); }
 .dashboard-card.openbb::after { background: #ae8bff; }
 .dashboard-card.data::after { background: #ff8fc8; }
+.dashboard-card.traffic::after { background: #48d7ff; }
 .dashboard-card:hover, .dashboard-card:focus-visible { transform: translateY(-3px); border-color: var(--cyan); box-shadow: 0 28px 80px rgba(0, 0, 0, .34); outline: none; }
 .dashboard-card:focus-visible { box-shadow: 0 0 0 3px rgba(67, 215, 255, .2), 0 28px 80px rgba(0, 0, 0, .34); }
 .card-topline { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
@@ -85,6 +86,7 @@ h1 { margin: 0; max-width: 760px; overflow-wrap: anywhere; font-size: clamp(42px
 .shioaji .market { color: var(--amber); }
 .openbb .market { color: #c9b7ff; }
 .data .market { color: #ffadd6; }
+.traffic .market { color: #79e4ff; }
 .health { display: inline-flex; align-items: center; gap: 7px; color: var(--muted); font-size: 11px; }
 .health i { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
 .health.active, .health.complete, .health.updating { color: var(--green); }
@@ -103,6 +105,7 @@ h1 { margin: 0; max-width: 760px; overflow-wrap: anywhere; font-size: clamp(42px
 .shioaji .card-action b { color: var(--amber); }
 .openbb .card-action b { color: #c9b7ff; }
 .data .card-action b { color: #ffadd6; }
+.traffic .card-action b { color: #79e4ff; }
 .dashboard-card:hover .card-action b { transform: translateX(4px); }
 .safety-note { display: grid; grid-template-columns: 110px 1fr; gap: 22px; padding: 22px 24px; border: 1px solid rgba(40, 65, 89, .72); border-radius: 14px; background: rgba(13, 27, 40, .72); }
 .note-index { color: var(--green); font-size: 11px; font-weight: 800; letter-spacing: .11em; }

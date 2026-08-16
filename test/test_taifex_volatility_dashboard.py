@@ -461,8 +461,8 @@ def test_dashboard_html_is_local_and_refreshes_the_read_only_api() -> None:
     assert "fetchWithTimeout(`api/history?range=${encodeURIComponent(requestedRange)}`" in javascript
     assert "HISTORY_CLIENT_CACHE_MS" in javascript
     assert "historyPayloadCache" in javascript
-    assert "response.status === 429" in javascript
-    assert "秒後自動重試" in javascript
+    assert "response.status === 429" not in javascript
+    assert "秒後自動重試" not in javascript
     assert "const PRICE_REFRESH_MS = 60000" in javascript
     assert "function refreshMinuteSnapshot()" in javascript
     assert "window.setInterval(refreshMinuteSnapshot, PRICE_REFRESH_MS)" in javascript
@@ -504,7 +504,7 @@ def test_dashboard_html_is_local_and_refreshes_the_read_only_api() -> None:
     assert 'snapshot.health === "degraded"' in javascript
     assert 'href="styles.css?v=14"' in html
     assert 'src="../time-axis.js?v=3"' in html
-    assert 'src="app.js?v=17"' in html
+    assert 'src="app.js?v=18"' in html
     assert 'id="equity-time-range"' in html
     assert 'data-range="1y"' in html
     assert 'data-range="all"' in html

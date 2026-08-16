@@ -2446,8 +2446,8 @@ def test_dashboard_html_is_local_and_refreshes_api() -> None:
     assert "HIDDEN_EQUITY_SERIES_STORAGE_KEY" in javascript
     assert "HISTORY_CLIENT_CACHE_MS" in javascript
     assert "chartHistoryCache" in javascript
-    assert "response.status === 429" in javascript
-    assert "秒後自動重試" in javascript
+    assert "response.status === 429" not in javascript
+    assert "秒後自動重試" not in javascript
     assert 'button[data-series-id]' in javascript
     assert 'aria-pressed="${String(!hidden)}"' in javascript
     assert "refreshSummary" not in javascript

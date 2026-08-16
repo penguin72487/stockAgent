@@ -20,7 +20,6 @@ let chartRange = "1d";
 let hiddenEquitySeries = new Set();
 let chartHistoryCache = new Map();
 let historyInFlight = false;
-let historyRetryTimer = null;
 let lastFetchMs = null;
 let refreshInFlight = false;
 let refreshQueued = false;
@@ -626,22 +625,10 @@ async function loadChartHistory({preferCache = false} = {}) {
   historyInFlight = true;
   try {
     const response = await fetchWithTimeout(`api/history?range=${encodeURIComponent(requestedRange)}`, {cache:"default"});
-    if (response.status === 429) {
-      const retrySeconds = Math.min(30, Math.max(1, Number(response.headers.get("Retry-After")) || 5));
-      $("equity-range-note").textContent = `${TIME_RANGE_LABELS[requestedRange]}歷史請求稍多，保留目前曲線並於 ${number(retrySeconds)} 秒後自動重試。`;
-      if (historyRetryTimer != null) clearTimeout(historyRetryTimer);
-      historyRetryTimer = window.setTimeout(() => {
-        historyRetryTimer = null;
-        if (requestedRange === chartRange) void loadChartHistory();
-      }, retrySeconds * 1000);
-      return;
-    }
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const payload = await response.json();
     if (requestedRange !== chartRange) return;
     chartHistoryCache.set(requestedRange, {payload, receivedAt: Date.now()});
-    if (historyRetryTimer != null) clearTimeout(historyRetryTimer);
-    historyRetryTimer = null;
     applyChartHistory(payload);
   } catch (error) {
     $("equity-range-note").textContent = `${TIME_RANGE_LABELS[requestedRange]}歷史載入失敗：${error}`;
@@ -826,9 +813,7 @@ async function loadSignals({append = false} = {}) {
   } catch (error) {
     if (sequence !== signalRequestSequence) return;
     if (error?.name === "AbortError") return;
-    signalLoadError = String(error).includes("HTTP 429")
-      ? "請求較密集，訊號明細會在下一輪自動重試；上方帳本摘要不受影響。"
-      : `訊號明細暫時無法更新：${error}`;
+    signalLoadError = `訊號明細暫時無法更新：${error}`;
     signalRecordCount = null;
   } finally {
     if (sequence === signalRequestSequence) {
@@ -872,9 +857,7 @@ async function loadEvents({append = false} = {}) {
   } catch (error) {
     if (sequence !== eventRequestSequence) return;
     if (error?.name === "AbortError") return;
-    eventLoadError = String(error).includes("HTTP 429")
-      ? "請求較密集，事件明細會在下一輪自動重試。"
-      : `事件明細暫時無法更新：${error}`;
+    eventLoadError = `事件明細暫時無法更新：${error}`;
     eventRecordRevision = null;
   } finally {
     if (sequence === eventRequestSequence) {
@@ -905,10 +888,12 @@ async function refresh() {
     lastRenderedRevision = revision;
     render({heavy});
     const currentSignalCount = Number((snapshot.record_counts || {}).signals || 0);
-    if (signalRecordCount == null || currentSignalCount !== signalRecordCount) await loadSignals();
+    const detailLoads = [];
+    if (signalRecordCount == null || currentSignalCount !== signalRecordCount) detailLoads.push(loadSignals());
     const counts = snapshot.record_counts || {};
     const currentEventRevision = JSON.stringify([selectedDate(), Number(counts.orders || 0), Number(counts.fills || 0)]);
-    if (eventRecordRevision == null || currentEventRevision !== eventRecordRevision) await loadEvents();
+    if (eventRecordRevision == null || currentEventRevision !== eventRecordRevision) detailLoads.push(loadEvents());
+    await Promise.all(detailLoads);
   } catch (error) {
     const alert = $("alert"); alert.classList.remove("hidden"); alert.textContent = `面板讀取失敗：${error}`;
     $("health").textContent = "UNAVAILABLE"; $("health").className = "pill critical";
@@ -979,8 +964,6 @@ $("equity-time-range").addEventListener("click", (event) => {
   const button = event.target.closest("button[data-range]");
   if (!button || !(button.dataset.range in TIME_RANGE_LABELS)) return;
   chartRange = button.dataset.range;
-  if (historyRetryTimer != null) clearTimeout(historyRetryTimer);
-  historyRetryTimer = null;
   try { localStorage.setItem("tw-day-trade-equity-time-range", chartRange); } catch (_error) { /* optional */ }
   syncChartRangeControl();
   void loadChartHistory({preferCache: true});

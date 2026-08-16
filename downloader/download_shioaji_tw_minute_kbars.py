@@ -14,11 +14,15 @@ from typing import Any, Callable
 
 import polars as pl
 
-from stockagent.live.shioaji_traffic_ledger import shioaji_query
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+
+try:
+    from downloader.common import SharedRateLimiter
+except ModuleNotFoundError:  # direct script execution
+    from common import SharedRateLimiter
+from stockagent.live.shioaji_traffic_ledger import shioaji_query
 
 from downloader.download_shioaji_tw_kbars import (  # noqa: E402
     MAX_KBAR_QUERY_DAYS,
@@ -346,9 +350,7 @@ def query_minute_chunk(
                 ~outside_reference_date & all_zero_placeholder
             ).height,
             "negative_correction_rows_dropped": raw.filter(
-                ~outside_reference_date
-                & ~all_zero_placeholder
-                & negative_correction
+                ~outside_reference_date & ~all_zero_placeholder & negative_correction
             ).height,
             "out_of_session_rows_dropped": raw.filter(
                 ~outside_reference_date
@@ -983,12 +985,9 @@ def restore_extended_tail_from_archived_manifest(
     )
     returned = set(frame["date"].to_list()) if frame.height else set()
     source_gaps = {
-        date.fromisoformat(str(value))
-        for value in old_tail.get("source_gap_dates", [])
+        date.fromisoformat(str(value)) for value in old_tail.get("source_gap_dates", [])
     }
-    expected_tail = {
-        value for value in expected_dates if new_start <= value <= new_end
-    }
+    expected_tail = {value for value in expected_dates if new_start <= value <= new_end}
     if not expected_tail.issubset(returned | source_gaps):
         return False
     units = frame["contract_unit"].unique().to_list() if frame.height else []
@@ -1103,9 +1102,7 @@ def _write_run_summary(
             "observed_request_start_rps": float(rate["overall_rps"]),
             "processed_chunks_this_run": int(counters["processed_chunks"]),
             "queried_chunks_this_run": int(counters["queried_chunks"]),
-            "skipped_empty_chunks_this_run": int(
-                counters["skipped_empty_chunks"]
-            ),
+            "skipped_empty_chunks_this_run": int(counters["skipped_empty_chunks"]),
             "selected_symbols": len(selected),
             "reported_symbols": len(results),
             "complete_symbols": sum(x.status == "complete" for x in results),
@@ -1168,6 +1165,7 @@ def _download_symbol(
     end: date,
     chunks: list[tuple[date, date]],
     limiter: SharedRequestRateLimiter,
+    host_rate_limiter: SharedRateLimiter,
     counters: SharedDownloadCounters,
     traffic_guard: SharedTrafficBudgetGuard,
     stop_event: Any,
@@ -1255,6 +1253,10 @@ def _download_symbol(
                 message=contract_message,
             )
 
+        def acquire_request_slot() -> None:
+            limiter.acquire(stop_event)
+            host_rate_limiter.wait()
+
         for chunk_index, (chunk_start, chunk_end) in enumerate(chunks, start=1):
             data_path, receipt_path = minute_chunk_paths(
                 args.output_dir, row.symbol, chunk_start, chunk_end
@@ -1292,7 +1294,7 @@ def _download_symbol(
                     retries=int(args.retries),
                     retry_backoff=float(args.retry_backoff),
                     expected_dates=expected_dates,
-                    request_started=lambda: limiter.acquire(stop_event),
+                    request_started=acquire_request_slot,
                 )
             else:
                 # The public point-in-time panel is the universe and coverage
@@ -1315,9 +1317,7 @@ def _download_symbol(
             )
             returned_dates = sorted(
                 value.isoformat()
-                for value in (
-                    set(frame["date"].to_list()) if frame.height else set()
-                )
+                for value in (set(frame["date"].to_list()) if frame.height else set())
             )
             output_receipt = (
                 _write_minute_parquet(frame, data_path) if frame.height else None
@@ -1351,9 +1351,7 @@ def _download_symbol(
                     "returned_dates": returned_dates,
                     "query_performed": query_performed,
                     "query_skipped_reason": (
-                        None
-                        if query_performed
-                        else "no_public_positive_volume_session"
+                        None if query_performed else "no_public_positive_volume_session"
                     ),
                     "zero_placeholder_rows_dropped": int(
                         query_audit["zero_placeholder_rows_dropped"]
@@ -1472,6 +1470,10 @@ def _parallel_download_worker(
 ) -> None:
     api: Any | None = None
     contracts_by_code: dict[str, Any] = {}
+    host_rate_limiter = SharedRateLimiter(
+        1.0 / DEFAULT_REQUESTS_PER_SECOND,
+        name="shioaji_quote_query",
+    )
     init_error = ""
     try:
         import shioaji as sj
@@ -1513,6 +1515,7 @@ def _parallel_download_worker(
                 end=end,
                 chunks=chunks,
                 limiter=limiter,
+                host_rate_limiter=host_rate_limiter,
                 counters=counters,
                 traffic_guard=traffic_guard,
                 stop_event=stop_event,
@@ -1547,9 +1550,7 @@ def main() -> None:
     if not 1 <= int(args.chunk_days) <= MAX_KBAR_QUERY_DAYS:
         raise ValueError("--chunk-days must be between 1 and 30")
     if not 1 <= int(args.workers) <= SHIOAJI_MAX_CONNECTIONS:
-        raise ValueError(
-            f"--workers must be between 1 and {SHIOAJI_MAX_CONNECTIONS}"
-        )
+        raise ValueError(f"--workers must be between 1 and {SHIOAJI_MAX_CONNECTIONS}")
     if not 0.0 < float(args.requests_per_second) <= DEFAULT_REQUESTS_PER_SECOND:
         raise ValueError(
             "--requests-per-second must be positive and no greater than "
@@ -1742,9 +1743,7 @@ def main() -> None:
         except (AttributeError, OSError, ValueError):
             pass
 
-    deduplicated = {
-        int(symbol_index): result for symbol_index, result in result_items
-    }
+    deduplicated = {int(symbol_index): result for symbol_index, result in result_items}
     results = [deduplicated[index] for index in sorted(deduplicated)]
     traffic = traffic_guard.last_usage()
     counter_snapshot = counters.snapshot()
@@ -1786,9 +1785,7 @@ def main() -> None:
             "reported_symbols": len(results),
             "processed_chunks_this_run": counter_snapshot["processed_chunks"],
             "queried_chunks_this_run": counter_snapshot["queried_chunks"],
-            "skipped_empty_chunks_this_run": counter_snapshot[
-                "skipped_empty_chunks"
-            ],
+            "skipped_empty_chunks_this_run": counter_snapshot["skipped_empty_chunks"],
             "api_requests_started_this_run": int(rate_snapshot["total_requests"]),
             "observed_request_start_rps": float(rate_snapshot["overall_rps"]),
             "request_window_rps": float(rate_snapshot["window_rps"]),
@@ -1814,6 +1811,7 @@ def main() -> None:
     )
     if fatal_error:
         raise RuntimeError(fatal_error)
+
 
 if __name__ == "__main__":
     main()

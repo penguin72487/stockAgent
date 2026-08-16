@@ -114,8 +114,15 @@ function renderDataMonitor(data) {
     $("data-progress").textContent = `${healthy.toLocaleString("zh-TW")} 正常 · ${attention.toLocaleString("zh-TW")} 待處理`;
 }
 
+function renderTraffic(data) {
+    setHealth("traffic", "active", "即時觀察");
+    $("traffic-requests").textContent = `${Number(data.requests_1m || 0).toLocaleString("zh-TW")} 次 · ${Number(data.requests_per_second_1m || 0).toLocaleString("zh-TW", {maximumFractionDigits: 2})} RPS`;
+    const latency = Number(data.latency_p95_ms_1m);
+    $("traffic-latency").textContent = Number.isFinite(latency) ? `${latency.toLocaleString("zh-TW", {maximumFractionDigits: 2})} ms` : "尚無樣本";
+}
+
 function renderUnavailable() {
-  for (const prefix of ["taifex", "tw", "shioaji", "openbb", "data"]) setHealth(prefix, "unavailable");
+  for (const prefix of ["taifex", "tw", "shioaji", "openbb", "data", "traffic"]) setHealth(prefix, "unavailable");
   $("taifex-freshness").textContent = "無法取得";
   $("tw-freshness").textContent = "無法取得";
   $("taifex-summary").textContent = "進入面板查看";
@@ -126,6 +133,8 @@ function renderUnavailable() {
   $("openbb-progress").textContent = "進入面板查看";
   $("data-registered").textContent = "無法取得";
   $("data-progress").textContent = "進入面板查看";
+  $("traffic-requests").textContent = "無法取得";
+  $("traffic-latency").textContent = "進入面板查看";
 }
 
 async function refresh() {
@@ -138,6 +147,7 @@ async function refresh() {
     renderShioaji(data.shioaji || {});
     renderOpenbb(data.openbb || {});
     renderDataMonitor(data.data_monitor || {});
+    renderTraffic(data.traffic || {});
   } catch (_error) {
     renderUnavailable();
   } finally {

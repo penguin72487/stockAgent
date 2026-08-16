@@ -309,7 +309,7 @@ def test_research_gate_allows_audited_source_gaps_but_rejects_failures(
 def test_account_wide_rate_limiter_is_shared_across_processes() -> None:
     context = mp.get_context("spawn")
     output = context.Queue()
-    # Scale the official 50/5s boundary down to a fast 50/0.05s test while
+    # Scale the configured 50/5s boundary down to a fast 50/0.05s test while
     # preserving its 50-request sliding-window shape.
     limiter = SharedRequestRateLimiter(
         context,

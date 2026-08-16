@@ -196,7 +196,15 @@ def _path_requires_trading_volume(path: Path, policy: str | bool | None) -> bool
         return False
     if "frankfurter" in path_text or "pepperstone" in path_text:
         return False
-    volume_assets = {"tw_stocks", "us_stocks", "crypto", "data_parquet", "data_okx", "data_bybit"}
+    volume_assets = {
+        "tw_stocks",
+        "us_stocks",
+        "crypto",
+        "data_parquet",
+        "data_okx",
+        "data_bybit",
+        "data_binance",
+    }
     return bool(volume_assets & parts)
 
 

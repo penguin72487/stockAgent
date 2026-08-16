@@ -20,13 +20,14 @@
       <a href="shioaji/">永豐 API</a>
       <a href="openbb/">OpenBB</a>
       <a href="data-monitor/">全資料</a>
+      <a href="traffic/">流量</a>
     </nav>
   </header>
 
   <main>
     <section class="hero" aria-labelledby="page-title">
       <p class="eyebrow">PUBLIC MARKET OBSERVATORY</p>
-      <h1 id="page-title">五個面板，<br>一個可信的即時視角</h1>
+      <h1 id="page-title">六個面板，<br>一個可信的即時視角</h1>
       <p class="lead">先確認資料新鮮度、API 流量與執行狀態，再查看模擬績效和完整帳本。所有頁面都是公開唯讀，不提供任何操作入口。</p>
       <div class="trust-row" aria-label="面板資料原則">
         <span>只讀模擬</span>
@@ -115,6 +116,22 @@
         </dl>
         <span class="card-action">開啟全資料面板 <b aria-hidden="true">→</b></span>
       </a>
+
+      <a class="dashboard-card traffic" href="traffic/">
+        <div class="card-topline">
+          <span class="market">PUBLIC TRAFFIC</span>
+          <span id="traffic-health" class="health loading" aria-live="polite"><i aria-hidden="true"></i>讀取中</span>
+        </div>
+        <div>
+          <strong>網站流量與互動延遲</strong>
+          <p>公開請求量、吞吐、p50／p95／p99、路由 body 流量、快取命中與這台瀏覽器的 fetch-to-render 延遲。</p>
+        </div>
+        <dl class="card-stats" aria-label="網站流量即時摘要">
+          <div><dt>最近 1 分鐘</dt><dd id="traffic-requests">—</dd></div>
+          <div><dt>閘道 p95</dt><dd id="traffic-latency">—</dd></div>
+        </dl>
+        <span class="card-action">開啟流量面板 <b aria-hidden="true">→</b></span>
+      </a>
     </section>
 
     <aside class="safety-note">
@@ -126,6 +143,6 @@
     </aside>
   </main>
   <footer>StockAgent 公開觀測面板 · 台北時間 · 每 60 秒隨資料週期更新</footer>
-  <script src="public.js?v=6" defer></script>
+  <script src="public.js?v=7" defer></script>
 </body>
 </html>

@@ -8,12 +8,25 @@ import json
 import math
 import os
 from pathlib import Path
+import sys
 import time
 from typing import Any, Iterable
 from zoneinfo import ZoneInfo
 
 import polars as pl
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+try:
+    from downloader.common import (
+        SharedRateLimiter,
+        describe_rate_limit,
+        resolve_request_interval,
+    )
+except ModuleNotFoundError:  # direct script execution
+    from common import SharedRateLimiter, describe_rate_limit, resolve_request_interval
 from stockagent.live.shioaji_traffic_ledger import record_avoided_query, shioaji_query
 
 
@@ -87,9 +100,7 @@ def parse_args() -> argparse.Namespace:
             "never imports, logs in to, or queries Shioaji."
         ),
     )
-    parser.add_argument(
-        "--start-date", default=SHIOAJI_STOCK_HISTORY_START.isoformat()
-    )
+    parser.add_argument("--start-date", default=SHIOAJI_STOCK_HISTORY_START.isoformat())
     parser.add_argument(
         "--end-date", default=(date.today() - timedelta(days=1)).isoformat()
     )
@@ -97,8 +108,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--request-interval",
         type=float,
-        default=0.25,
-        help="Seconds between requests. 0.25 stays below the documented 50/10s cap.",
+        default=None,
+        help="Host-global seconds between quote requests; defaults to the selected 10 req/s account ceiling.",
     )
     parser.add_argument("--timeout-ms", type=int, default=30_000)
     parser.add_argument("--retries", type=int, default=3)
@@ -135,7 +146,9 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def iter_date_chunks(start: date, end: date, chunk_days: int) -> Iterable[tuple[date, date]]:
+def iter_date_chunks(
+    start: date, end: date, chunk_days: int
+) -> Iterable[tuple[date, date]]:
     if not 1 <= int(chunk_days) <= MAX_KBAR_QUERY_DAYS:
         raise ValueError(
             f"chunk_days must be between 1 and {MAX_KBAR_QUERY_DAYS}, got {chunk_days}"
@@ -204,7 +217,9 @@ def _load_local_minute_catalog(
     report_path = root / "download_report.csv"
     summary = _read_json(summary_path)
     if summary is None:
-        raise RuntimeError(f"local minute summary is missing or invalid: {summary_path}")
+        raise RuntimeError(
+            f"local minute summary is missing or invalid: {summary_path}"
+        )
     checks = {
         "source": summary.get("source") == SOURCE_NAME,
         "storage_frequency": (
@@ -234,7 +249,9 @@ def _load_local_minute_catalog(
     required = {"symbol", "status"}
     missing = sorted(required - set(report_frame.columns))
     if missing:
-        raise RuntimeError(f"local minute report lacks columns {missing}: {report_path}")
+        raise RuntimeError(
+            f"local minute report lacks columns {missing}: {report_path}"
+        )
     report: dict[str, dict[str, str]] = {}
     for row in report_frame.iter_rows(named=True):
         symbol = str(row.get("symbol") or "").strip().upper()
@@ -307,7 +324,9 @@ def _receipt_valid(
 def _load_universe(root: Path) -> list[UniverseRow]:
     manifest_path = root / "symbols.csv"
     if not manifest_path.is_file():
-        raise FileNotFoundError(f"TW public symbol manifest is missing: {manifest_path}")
+        raise FileNotFoundError(
+            f"TW public symbol manifest is missing: {manifest_path}"
+        )
     frame = pl.read_csv(manifest_path, infer_schema_length=0)
     required = {"code", "name", "market", "security_type"}
     missing = sorted(required - set(frame.columns))
@@ -388,17 +407,21 @@ def normalize_kbars(
                 "contract_unit": pl.Float64,
             }
         )
-    frame = pl.DataFrame({name: values[name] for name in required}).with_columns(
-        pl.col("ts").cast(pl.Datetime("ns"), strict=False),
-        *[
-            pl.col(name).cast(pl.Float64, strict=False).fill_nan(None).alias(name)
-            for name in ("Open", "High", "Low", "Close", "Volume", "Amount")
-        ],
-    ).with_columns(
-        pl.col("ts").cast(pl.Date).alias("date"),
-        pl.lit(symbol).alias("symbol"),
-        pl.lit(market).alias("market"),
-        pl.lit(float(contract_unit)).alias("contract_unit"),
+    frame = (
+        pl.DataFrame({name: values[name] for name in required})
+        .with_columns(
+            pl.col("ts").cast(pl.Datetime("ns"), strict=False),
+            *[
+                pl.col(name).cast(pl.Float64, strict=False).fill_nan(None).alias(name)
+                for name in ("Open", "High", "Low", "Close", "Volume", "Amount")
+            ],
+        )
+        .with_columns(
+            pl.col("ts").cast(pl.Date).alias("date"),
+            pl.lit(symbol).alias("symbol"),
+            pl.lit(market).alias("market"),
+            pl.lit(float(contract_unit)).alias("contract_unit"),
+        )
     )
     valid = (
         pl.col("ts").is_not_null()
@@ -424,7 +447,9 @@ def normalize_kbars(
         raise ValueError(f"Shioaji returned {invalid} invalid Kbar rows for {symbol}")
     duplicate = frame.group_by("ts").len().filter(pl.col("len") > 1).height
     if duplicate:
-        raise ValueError(f"Shioaji returned {duplicate} duplicate timestamps for {symbol}")
+        raise ValueError(
+            f"Shioaji returned {duplicate} duplicate timestamps for {symbol}"
+        )
     return frame.sort("ts")
 
 
@@ -637,10 +662,12 @@ def _query_chunk(
     retries: int,
     retry_backoff: float,
     expected_dates: set[date],
+    rate_limiter: SharedRateLimiter,
 ) -> pl.DataFrame:
     last_error: Exception | None = None
     for attempt in range(max(0, retries) + 1):
         try:
+            rate_limiter.wait()
             with shioaji_query(
                 api,
                 consumer="stock_daily_legacy_backfill",
@@ -703,8 +730,7 @@ def _cached_minute_chunk(
     if covered_start > start or covered_end < end:
         return None
     gaps = {
-        date.fromisoformat(str(value))
-        for value in manifest.get("source_gap_dates", [])
+        date.fromisoformat(str(value)) for value in manifest.get("source_gap_dates", [])
     }
     if gaps & expected_dates:
         return None
@@ -723,18 +749,23 @@ def _cached_minute_chunk(
         data_path = Path(str(data_path_text))
         expected_sha = str(entry.get("data_sha256") or "")
         try:
-            if not data_path.is_file() or not expected_sha or _sha256(data_path) != expected_sha:
+            if (
+                not data_path.is_file()
+                or not expected_sha
+                or _sha256(data_path) != expected_sha
+            ):
                 return None
             frames.append(
                 pl.read_parquet(data_path).filter(
-                    (pl.col("date") >= pl.lit(start))
-                    & (pl.col("date") <= pl.lit(end))
+                    (pl.col("date") >= pl.lit(start)) & (pl.col("date") <= pl.lit(end))
                 )
             )
         except (OSError, pl.exceptions.PolarsError):
             return None
     if not frames:
-        return None if expected_dates else aggregate_daily(pl.DataFrame(), name=row.name)
+        return (
+            None if expected_dates else aggregate_daily(pl.DataFrame(), name=row.name)
+        )
     frame = pl.concat(frames, how="vertical_relaxed").sort("ts")
     if frame.get_column("ts").n_unique() != frame.height:
         return None
@@ -787,9 +818,7 @@ def _finalize_symbol(
     minute_manifest_receipt: dict[str, Any] | None = None,
     declared_source_gap_dates: list[str] | None = None,
 ) -> SymbolResult:
-    daily, source_minute_rows = _aggregate_symbol_from_receipts(
-        output_dir, row, chunks
-    )
+    daily, source_minute_rows = _aggregate_symbol_from_receipts(output_dir, row, chunks)
     daily_path = output_dir / "daily" / f"{row.symbol}.parquet"
     output_receipt = _write_parquet_atomic(daily, daily_path)
     _atomic_write_json(
@@ -847,8 +876,7 @@ def _completed_daily_result(
     local_lineage_ok = minute_manifest_sha256 is None or (
         summary.get("materialization_mode") == "verified_local_minute"
         and isinstance(summary.get("minute_manifest_receipt"), dict)
-        and summary["minute_manifest_receipt"].get("sha256")
-        == minute_manifest_sha256
+        and summary["minute_manifest_receipt"].get("sha256") == minute_manifest_sha256
     )
     if not (
         summary.get("source") == SOURCE_NAME
@@ -874,9 +902,7 @@ def _completed_daily_result(
         first_date=(
             str(summary.get("first_date")) if summary.get("first_date") else None
         ),
-        last_date=(
-            str(summary.get("last_date")) if summary.get("last_date") else None
-        ),
+        last_date=(str(summary.get("last_date")) if summary.get("last_date") else None),
         output_path=str(daily_path),
     )
 
@@ -898,7 +924,9 @@ def _verified_minute_symbol_frame(
         covered_start = date.fromisoformat(str(manifest["requested_start"]))
         covered_end = date.fromisoformat(str(manifest["requested_end"]))
     except (KeyError, ValueError) as exc:
-        raise RuntimeError(f"invalid minute manifest coverage: {manifest_path}") from exc
+        raise RuntimeError(
+            f"invalid minute manifest coverage: {manifest_path}"
+        ) from exc
     identity_ok = (
         manifest.get("source") == SOURCE_NAME
         and manifest.get("storage_frequency") == MINUTE_STORAGE_FREQUENCY
@@ -907,7 +935,9 @@ def _verified_minute_symbol_frame(
         and covered_end >= requested_end
     )
     if not identity_ok:
-        raise RuntimeError(f"minute manifest identity/coverage mismatch: {manifest_path}")
+        raise RuntimeError(
+            f"minute manifest identity/coverage mismatch: {manifest_path}"
+        )
 
     source_gap_dates = sorted(
         str(value)
@@ -940,7 +970,11 @@ def _verified_minute_symbol_frame(
             continue
         data_path = Path(str(data_path_text))
         expected_sha = str(entry.get("data_sha256") or "")
-        if not data_path.is_file() or not expected_sha or _sha256(data_path) != expected_sha:
+        if (
+            not data_path.is_file()
+            or not expected_sha
+            or _sha256(data_path) != expected_sha
+        ):
             raise RuntimeError(f"minute chunk checksum mismatch: {data_path}")
         frame = pl.read_parquet(data_path).filter(
             (pl.col("date") >= pl.lit(requested_start))
@@ -1044,12 +1078,10 @@ def _run_local_materialization(
     universe: list[UniverseRow],
     selected: list[UniverseRow],
 ) -> None:
-    minute_summary, minute_report, minute_summary_receipt = (
-        _load_local_minute_catalog(
-            args.minute_cache_root,
-            requested_start=start,
-            requested_end=end,
-        )
+    minute_summary, minute_report, minute_summary_receipt = _load_local_minute_catalog(
+        args.minute_cache_root,
+        requested_start=start,
+        requested_end=end,
     )
     results: list[SymbolResult] = []
     avoided_requests = 0
@@ -1126,7 +1158,9 @@ def _run_local_materialization(
                 )
             )
             continue
-        manifest_path = args.minute_cache_root / "symbols" / f"{row.symbol}.manifest.json"
+        manifest_path = (
+            args.minute_cache_root / "symbols" / f"{row.symbol}.manifest.json"
+        )
         manifest_sha = _sha256(manifest_path) if manifest_path.is_file() else ""
         completed = _completed_daily_result(
             args.output_dir,
@@ -1283,7 +1317,9 @@ def _write_summary(
     report_path = output_dir / "download_report.csv"
     report_path.parent.mkdir(parents=True, exist_ok=True)
     if results:
-        pl.DataFrame([asdict(item) for item in results]).sort("symbol").write_csv(report_path)
+        pl.DataFrame([asdict(item) for item in results]).sort("symbol").write_csv(
+            report_path
+        )
     else:
         pl.DataFrame(
             schema={name: pl.String for name in SymbolResult.__dataclass_fields__}
@@ -1294,9 +1330,8 @@ def _write_summary(
         "not_yet_listed",
         "outside_source_window",
     }
-    selected_complete = (
-        len(results) == selected_size
-        and all(item.status in complete_statuses for item in results)
+    selected_complete = len(results) == selected_size and all(
+        item.status in complete_statuses for item in results
     )
     full_selection = not str(args.symbols).strip() and int(args.max_symbols) <= 0
     summary = {
@@ -1338,9 +1373,7 @@ def _write_summary(
         "traffic_used_bytes": traffic[0] if traffic else None,
         "traffic_limit_bytes": traffic[1] if traffic else None,
         "api_requests_started": (
-            int(api_requests_started)
-            if api_requests_started is not None
-            else None
+            int(api_requests_started) if api_requests_started is not None else None
         ),
         "avoided_api_requests": int(avoided_api_requests),
         "source_minute_summary_receipt": local_minute_summary_receipt,
@@ -1362,8 +1395,16 @@ def main() -> None:
         raise ValueError("--start-date must not be after --end-date")
     if not 0.0 < float(args.max_traffic_fraction) < 1.0:
         raise ValueError("--max-traffic-fraction must be between 0 and 1")
-    if float(args.request_interval) < 0.0:
+    if args.request_interval is not None and float(args.request_interval) < 0.0:
         raise ValueError("--request-interval must be >= 0")
+    request_interval = resolve_request_interval(
+        "shioaji_quote_query", args.request_interval
+    )
+    rate_limiter = SharedRateLimiter(request_interval, name="shioaji_quote_query")
+    print(
+        f"[shioaji] {describe_rate_limit('shioaji_quote_query', request_interval)}",
+        flush=True,
+    )
     list(iter_date_chunks(start, end, int(args.chunk_days)))
 
     universe = _load_universe(args.base_stock_root)
@@ -1374,7 +1415,9 @@ def main() -> None:
         known = {item.symbol for item in universe}
         unknown = sorted(requested - known)
         if unknown:
-            raise ValueError(f"requested symbols are absent from the public universe: {unknown}")
+            raise ValueError(
+                f"requested symbols are absent from the public universe: {unknown}"
+            )
         selected = [item for item in universe if item.symbol in requested]
     else:
         selected = list(universe)
@@ -1385,7 +1428,12 @@ def main() -> None:
             len(
                 list(
                     iter_date_chunks(
-                        max(start, pl.read_parquet(item.base_path, columns=["date"])["date"].min()),
+                        max(
+                            start,
+                            pl.read_parquet(item.base_path, columns=["date"])[
+                                "date"
+                            ].min(),
+                        ),
                         end,
                         int(args.chunk_days),
                     )
@@ -1541,7 +1589,9 @@ def main() -> None:
             force=True,
         )
         for symbol_index, row in enumerate(selected, start=1):
-            base_dates = pl.read_parquet(row.base_path, columns=["date"]).get_column("date")
+            base_dates = pl.read_parquet(row.base_path, columns=["date"]).get_column(
+                "date"
+            )
             symbol_start = max(start, base_dates.min())
             chunks = list(iter_date_chunks(symbol_start, end, int(args.chunk_days)))
             completed_daily = _completed_daily_result(
@@ -1559,7 +1609,9 @@ def main() -> None:
             )
             completed = sum(
                 _receipt_valid(
-                    _chunk_paths(args.output_dir, row.symbol, chunk_start, chunk_end)[1],
+                    _chunk_paths(args.output_dir, row.symbol, chunk_start, chunk_end)[
+                        1
+                    ],
                     symbol=row.symbol,
                     start=chunk_start,
                     end=chunk_end,
@@ -1636,6 +1688,7 @@ def main() -> None:
                             retries=int(args.retries),
                             retry_backoff=float(args.retry_backoff),
                             expected_dates=expected_dates,
+                            rate_limiter=rate_limiter,
                         )
                     else:
                         record_avoided_query(
@@ -1700,8 +1753,6 @@ def main() -> None:
                         chunk_index=chunk_index,
                         chunk_total=len(chunks),
                     )
-                    if float(args.request_interval):
-                        time.sleep(float(args.request_interval))
                 results.append(
                     _finalize_symbol(
                         args.output_dir,

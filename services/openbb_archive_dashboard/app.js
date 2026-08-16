@@ -274,15 +274,17 @@ async function loadHistory() {
 async function refresh() {
   if (document.hidden || refreshInFlight) return;
   refreshInFlight = true;
+  const statusPromise = fetchJson("api/status");
+  const historyPromise = loadHistory();
   try {
-    renderStatus(await fetchJson("api/status"));
-    await loadHistory();
+    renderStatus(await statusPromise);
   } catch (_error) {
     const status = $("connection-status");
     status.className = "status unavailable";
     status.lastChild.textContent = "無法取得";
     $("source-freshness").textContent = "公開狀態 API 暫時不可用";
   } finally {
+    await historyPromise;
     refreshInFlight = false;
   }
 }
