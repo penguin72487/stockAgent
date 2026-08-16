@@ -458,6 +458,7 @@ class EventSink:
         self.latest_books: dict[str, dict[str, Any]] = {}
         self.stale_ms = stale_ms
         self.live_book_codes: set[str] = set()
+        self.live_book_metadata: dict[str, dict[str, Any]] = {}
         self.live_books_path = output_dir / "runtime" / f"worker_{worker_index:02d}.json"
         options = {
             "worker_index": worker_index,
@@ -549,12 +550,17 @@ class EventSink:
             _atomic_json(
                 self.live_books_path,
                 {
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "source": SOURCE_NAME,
                     "published_at": snapshot_datetime.astimezone(timezone.utc)
                     .isoformat()
                     .replace("+00:00", "Z"),
                     "worker_index": self.worker_index,
+                    "contract_metadata": {
+                        code: self.live_book_metadata[code]
+                        for code in sorted(live_books)
+                        if code in self.live_book_metadata
+                    },
                     "books": live_books,
                 },
             )

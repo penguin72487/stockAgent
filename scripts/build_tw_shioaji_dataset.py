@@ -35,6 +35,7 @@ class BuildResult:
     first_date: str | None
     last_date: str | None
     output_path: str
+    public_source_gap_fallback_rows: int = 0
     message: str = ""
 
 
@@ -121,7 +122,7 @@ def _load_report(root: Path) -> dict[str, dict[str, Any]]:
     }
 
 
-def _validate_daily_receipt(path: Path) -> None:
+def _validate_daily_receipt(path: Path) -> dict[str, Any]:
     summary_path = path.with_suffix(".summary.json")
     summary = _read_json(summary_path)
     output = summary.get("output_receipt")
@@ -143,6 +144,7 @@ def _validate_daily_receipt(path: Path) -> None:
     failed = [name for name, passed in checks.items() if not passed]
     if failed:
         raise RuntimeError(f"Shioaji daily receipt failed checks {failed}: {summary_path}")
+    return summary
 
 
 def _finite_positive(value: Any) -> bool:
@@ -181,6 +183,7 @@ def merge_symbol_frames(
     shioaji: pl.DataFrame,
     *,
     cutover: date,
+    declared_source_gap_dates: set[date] | None = None,
 ) -> tuple[pl.DataFrame, dict[str, int]]:
     required_base = {
         "date",
@@ -251,36 +254,63 @@ def merge_symbol_frames(
         value for value in base.get_column("date") if value >= effective_cutover
     }
     shioaji_dates = set(shioaji.get_column("date"))
+    declared_source_gap_dates = declared_source_gap_dates or set()
+    fallback_dates = {
+        value
+        for value in declared_source_gap_dates
+        if value >= effective_cutover
+        and value in base_rows
+        and value not in shioaji_dates
+    }
+    shioaji_rows_by_date = {
+        row["date"]: row for row in shioaji.iter_rows(named=True)
+    }
     shioaji_only_rows = 0
     quarantined_transitions = 0
-    for quote in shioaji.iter_rows(named=True):
-        quote_date = quote["date"]
+    for quote_date in sorted(shioaji_dates | fallback_dates):
+        quote = shioaji_rows_by_date.get(quote_date)
         public_row = base_rows.get(quote_date)
         row = (
             dict(public_row)
             if public_row is not None
             else {column: None for column in base.columns}
         )
-        if public_row is None:
-            shioaji_only_rows += 1
-        row.update(
-            {
-                "date": quote_date,
-                "open": float(quote["open"]),
-                "max": float(quote["max"]),
-                "min": float(quote["min"]),
-                "close": float(quote["close"]),
-                "Trading_Volume": float(quote["Trading_Volume"]),
-                "data_source": SHIOAJI_SOURCE_NAME,
-                "fallback_reason": None,
-                "shioaji_trading_value": float(quote["Trading_Value"]),
-                "shioaji_volume_lots": float(quote["shioaji_volume_lots"]),
-                "shioaji_minute_bars": int(quote["shioaji_minute_bars"]),
-            }
-        )
+        if quote is not None:
+            if public_row is None:
+                shioaji_only_rows += 1
+            row.update(
+                {
+                    "date": quote_date,
+                    "open": float(quote["open"]),
+                    "max": float(quote["max"]),
+                    "min": float(quote["min"]),
+                    "close": float(quote["close"]),
+                    "Trading_Volume": float(quote["Trading_Volume"]),
+                    "data_source": SHIOAJI_SOURCE_NAME,
+                    "fallback_reason": None,
+                    "shioaji_trading_value": float(quote["Trading_Value"]),
+                    "shioaji_volume_lots": float(quote["shioaji_volume_lots"]),
+                    "shioaji_minute_bars": int(quote["shioaji_minute_bars"]),
+                }
+            )
+        else:
+            assert public_row is not None
+            row.update(
+                {
+                    "date": quote_date,
+                    "fallback_reason": "shioaji_declared_source_gap",
+                    "shioaji_trading_value": None,
+                    "shioaji_volume_lots": None,
+                    "shioaji_minute_bars": None,
+                }
+            )
         if not output_rows:
             row["adjclose"] = 10.0
-            row["adjustment_source"] = "shioaji_first_observation"
+            row["adjustment_source"] = (
+                "shioaji_first_observation"
+                if quote is not None
+                else "public_source_gap_first_observation"
+            )
         else:
             previous = output_rows[-1]
             previous_public = base_rows.get(previous["date"])
@@ -296,6 +326,8 @@ def merge_symbol_frames(
                 )
                 row["adjustment_source"] = (
                     "shioaji_close_with_public_corporate_action_factor"
+                    if quote is not None
+                    else "public_source_gap_with_public_corporate_action_factor"
                 )
             else:
                 if _finite_positive(previous.get("adjclose")) and _finite_positive(
@@ -306,7 +338,11 @@ def merge_symbol_frames(
                     )
                 else:
                     row["adjclose"] = 10.0
-                row["adjustment_source"] = "shioaji_unadjusted_close_quarantined"
+                row["adjustment_source"] = (
+                    "shioaji_unadjusted_close_quarantined"
+                    if quote is not None
+                    else "public_source_gap_unadjusted_close_quarantined"
+                )
                 if not bool(previous.get("return_quarantined")):
                     quarantined_transitions += 1
                 previous["return_quarantined"] = True
@@ -323,6 +359,7 @@ def merge_symbol_frames(
     # hybrid builder must still be able to write an explicit quarantine reason.
     schema["return_quarantine_reason"] = pl.String
     schema["adjustment_source"] = pl.String
+    schema["fallback_reason"] = pl.String
     schema.update(
         {
             "shioaji_trading_value": pl.Float64,
@@ -337,19 +374,25 @@ def merge_symbol_frames(
         (pl.col("date") >= pl.lit(effective_cutover))
         & (pl.col("data_source") != SHIOAJI_SOURCE_NAME)
     )
-    if public_after.height:
+    invalid_public_after = public_after.filter(
+        (pl.col("fallback_reason") != "shioaji_declared_source_gap")
+        | ~pl.col("date").is_in(sorted(fallback_dates))
+    )
+    if invalid_public_after.height or public_after.height != len(fallback_dates):
         raise RuntimeError(
-            f"hybrid output retained {public_after.height} public rows after cutover"
+            "hybrid output retained public rows without declared Shioaji source gaps"
         )
     stats = {
         "public_rows": int(output.height - shioaji.height),
         "shioaji_rows": int(shioaji.height),
         "dropped_public_rows_after_cutover": int(
-            len(base_dates_after - shioaji_dates)
+            len(base_dates_after - shioaji_dates - fallback_dates)
         ),
         "shioaji_only_rows": int(shioaji_only_rows),
         "quarantined_transitions": int(quarantined_transitions),
     }
+    if fallback_dates:
+        stats["public_source_gap_fallback_rows"] = len(fallback_dates)
     return output, stats
 
 
@@ -448,17 +491,28 @@ def main() -> None:
             if report is None or str(report.get("status")) != "complete":
                 if report is not None and str(report.get("status")) not in {
                     "contract_unavailable",
+                    "not_yet_listed",
+                    "outside_source_window",
                     "",
                 }:
                     raise RuntimeError(
                         f"Shioaji symbol status is not buildable: {report.get('status')}"
                     )
+                public_only_status = (
+                    "public_only_not_yet_listed"
+                    if report is not None
+                    and str(report.get("status")) == "not_yet_listed"
+                    else "public_only_outside_source_window"
+                    if report is not None
+                    and str(report.get("status")) == "outside_source_window"
+                    else "public_only_contract_unavailable"
+                )
                 shutil.copy2(base_path, output_path)
                 base = pl.read_parquet(base_path, columns=["date"])
                 results.append(
                     BuildResult(
                         symbol=symbol,
-                        status="public_only_contract_unavailable",
+                        status=public_only_status,
                         rows=base.height,
                         public_rows=base.height,
                         shioaji_rows=0,
@@ -474,10 +528,19 @@ def main() -> None:
                     )
                 )
                 continue
-            _validate_daily_receipt(daily_path)
+            daily_summary = _validate_daily_receipt(daily_path)
             base = pl.read_parquet(base_path)
             shioaji = pl.read_parquet(daily_path)
-            merged, stats = merge_symbol_frames(base, shioaji, cutover=cutover)
+            declared_source_gap_dates = {
+                date.fromisoformat(str(value))
+                for value in daily_summary.get("declared_source_gap_dates", [])
+            }
+            merged, stats = merge_symbol_frames(
+                base,
+                shioaji,
+                cutover=cutover,
+                declared_source_gap_dates=declared_source_gap_dates,
+            )
             _write_symbol(merged, output_path, cutover=cutover)
             results.append(
                 BuildResult(
@@ -523,6 +586,10 @@ def main() -> None:
                 "kind": (
                     "public_adjustment_factor_with_shioaji_quotes"
                     if item.status == "hybrid"
+                    else "public_reference_index_unchanged_not_yet_listed"
+                    if item.status == "public_only_not_yet_listed"
+                    else "public_reference_index_unchanged_outside_source_window"
+                    if item.status == "public_only_outside_source_window"
                     else "public_reference_index_unchanged_contract_unavailable"
                 ),
                 "source": SOURCE_NAME if item.status == "hybrid" else "tw_public",
@@ -551,6 +618,12 @@ def main() -> None:
         "public_only_contract_unavailable_symbols": sum(
             item.status == "public_only_contract_unavailable" for item in results
         ),
+        "public_only_not_yet_listed_symbols": sum(
+            item.status == "public_only_not_yet_listed" for item in results
+        ),
+        "public_only_outside_source_window_symbols": sum(
+            item.status == "public_only_outside_source_window" for item in results
+        ),
         "rows": sum(item.rows for item in results),
         "public_rows": sum(item.public_rows for item in results),
         "shioaji_rows": sum(item.shioaji_rows for item in results),
@@ -560,6 +633,9 @@ def main() -> None:
         "shioaji_only_rows": sum(item.shioaji_only_rows for item in results),
         "quarantined_transitions": sum(
             item.quarantined_transitions for item in results
+        ),
+        "public_source_gap_fallback_rows": sum(
+            item.public_source_gap_fallback_rows for item in results
         ),
         "download_summary_receipt": {
             "path": str(args.shioaji_root / "download_summary.json"),
@@ -574,7 +650,11 @@ def main() -> None:
     print(
         f"[tw-shioaji-build] symbols={len(results)} "
         f"hybrid={summary['hybrid_symbols']} "
-        f"public_only={summary['public_only_contract_unavailable_symbols']} "
+        f"public_only_unavailable={summary['public_only_contract_unavailable_symbols']} "
+        f"public_only_not_yet_listed={summary['public_only_not_yet_listed_symbols']} "
+        f"public_only_outside_window="
+        f"{summary['public_only_outside_source_window_symbols']} "
+        f"source_gap_fallback_rows={summary['public_source_gap_fallback_rows']} "
         f"shioaji_rows={summary['shioaji_rows']} "
         f"summary={args.output_dir / 'shioaji_dataset_summary.json'}",
         flush=True,

@@ -50,6 +50,7 @@ from stockagent.research.taifex_transaction_tax import (
 
 TAIPEI: Final[ZoneInfo] = ZoneInfo("Asia/Taipei")
 SIMULATION_SCHEMA_VERSION: Final[int] = 3
+TX_CONTINUOUS_ROLL_CONTRACT_VERSION: Final[int] = 2
 ENTRY_GATE: Final[time] = time(9, 0)
 FIRST_MINUTE_EXECUTION_TIME: Final[time] = time(9, 1)
 EXIT_LIMIT_TIME: Final[time] = time(13, 20)
@@ -74,6 +75,10 @@ STOCK_BENCHMARKS: Final[tuple[tuple[str, str, str, str], ...]] = (
 )
 TX_CONTINUOUS_BENCHMARK_ID: Final[str] = "benchmark_tx_continuous"
 TX_CONTINUOUS_LOGICAL_CODE: Final[str] = "TXFR1"
+DEFAULT_TAIFEX_INDEX_FINAL_SETTLEMENT_PATH: Final[Path] = (
+    Path(__file__).resolve().parents[2]
+    / "data_tw_index_options_daily/txo_final_settlement_history.parquet"
+)
 
 
 def _now_taipei(now: datetime | None = None) -> datetime:
@@ -120,6 +125,20 @@ def _finite(value: object) -> float | None:
     except (TypeError, ValueError):
         return None
     return number if math.isfinite(number) and number > 0.0 else None
+
+
+def _date_value(value: object) -> date | None:
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return date.fromisoformat(text[:10])
+    except ValueError:
+        return None
 
 
 def _top_book_capacity_shares(
@@ -360,13 +379,36 @@ def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
 
 
 def _append_jsonl(path: Path, payload: Mapping[str, Any]) -> None:
+    _append_jsonl_many(path, (payload,))
+
+
+def _append_jsonl_many(
+    path: Path,
+    payloads: Sequence[Mapping[str, Any]],
+) -> None:
+    """Durably append one logical ledger batch with a single fsync.
+
+    A full-universe signal contains thousands of audit rows. Syncing every
+    row separately made ledger persistence several seconds slower without
+    improving the durability boundary of the logical signal transaction.
+    Encode the complete batch first, then append and fsync it once.
+    """
+
+    if not payloads:
+        return
     path.parent.mkdir(parents=True, exist_ok=True)
-    encoded = (
+    encoded = "".join(
         json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str) + "\n"
+        for payload in payloads
     ).encode("utf-8")
     descriptor = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
     try:
-        os.write(descriptor, encoded)
+        view = memoryview(encoded)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError(f"short append to {path}")
+            view = view[written:]
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
@@ -632,7 +674,12 @@ def quote_map_from_snapshot(
 class TwDayTradeSimulationEngine:
     """One durable simulation ledger shared by all stock day-trade modes."""
 
-    def __init__(self, state_dir: Path) -> None:
+    def __init__(
+        self,
+        state_dir: Path,
+        *,
+        final_settlement_path: str | Path = DEFAULT_TAIFEX_INDEX_FINAL_SETTLEMENT_PATH,
+    ) -> None:
         self.state_dir = Path(state_dir)
         self.state_path = self.state_dir / "state.json"
         self.status_path = self.state_dir / "status.json"
@@ -645,14 +692,117 @@ class TwDayTradeSimulationEngine:
         self.benchmark_marks_path = self.state_dir / "benchmark_marks.jsonl"
         self.events_path = self.state_dir / "events.jsonl"
         self.latency_path = self.state_dir / "latency.jsonl"
+        self.final_settlement_path = Path(final_settlement_path)
+        self._tx_final_settlement_error: str | None = None
         self._corporate_action_reference_path: Path | None = None
         self._corporate_action_cache_signature: tuple[int, ...] | None = None
         self._corporate_actions_by_symbol: dict[str, list[dict[str, Any]]] = {}
         self._corporate_action_load_error: str | None = None
         self._corporate_action_coverage_end: date | None = None
         self.state = self._load_state()
+        tx_benchmark_migrated = self._migrate_tx_continuous_benchmark_contract()
         self._reconcile_daily_duplicate_signal_ids()
         self._restore_position_artifact_paths()
+        if tx_benchmark_migrated:
+            _atomic_json(self.state_path, self.state)
+
+    def _migrate_tx_continuous_benchmark_contract(self) -> bool:
+        row = (self.state.get("benchmarks") or {}).get(
+            TX_CONTINUOUS_BENCHMARK_ID
+        )
+        if not isinstance(row, dict):
+            return False
+        row["roll_contract_version"] = TX_CONTINUOUS_ROLL_CONTRACT_VERSION
+        row["official_final_settlement_path"] = str(self.final_settlement_path)
+        if int(row.get("roll_count") or 0) == 0:
+            row.setdefault("origin_entry_price", row.get("entry_price"))
+            row.setdefault("origin_entry_at", row.get("entry_at"))
+            row.setdefault("current_contract_entry_price", row.get("entry_price"))
+            row.setdefault("current_contract_entry_at", row.get("entry_at"))
+        elif row.get("origin_entry_price") is None:
+            # A legacy already-rolled row cannot prove its immutable origin
+            # from the current-contract basis alone.  Keep it visible but do
+            # not manufacture a rebase identity.
+            row["roll_contract_migration_error"] = (
+                "legacy_rolled_benchmark_origin_unavailable"
+            )
+        return True
+
+    def _official_tx_final_settlement(
+        self,
+        *,
+        delivery_date: date,
+        delivery_month: str,
+    ) -> dict[str, Any] | None:
+        """Resolve one monthly TX terminal value from the official index FSP file.
+
+        The retained file is produced from TAIFEX's index-option table, but a
+        monthly TXO row and TX/MTX/TMF use the same underlying-index final
+        settlement formula and value.  Requiring both date and six-digit month
+        prevents a weekly option settlement from being mistaken for the
+        expiring monthly future.
+        """
+
+        self._tx_final_settlement_error = None
+        month = str(delivery_month or "").strip()
+        if len(month) != 6 or not month.isdigit():
+            self._tx_final_settlement_error = (
+                f"invalid_contract_delivery_month:{delivery_month}"
+            )
+            return None
+        if not self.final_settlement_path.is_file():
+            self._tx_final_settlement_error = (
+                f"missing_official_final_settlement_file:{self.final_settlement_path}"
+            )
+            return None
+        try:
+            import polars as pl
+
+            frame = pl.read_parquet(self.final_settlement_path)
+            required = {"settlement_date", "final_settlement_price"}
+            if not required <= set(frame.columns):
+                raise ValueError(
+                    "official final-settlement file lacks settlement_date or price"
+                )
+            series_column = (
+                "option_series"
+                if "option_series" in frame.columns
+                else "contract_delivery_month"
+                if "contract_delivery_month" in frame.columns
+                else None
+            )
+            if series_column is None:
+                raise ValueError(
+                    "official final-settlement file lacks a contract month column"
+                )
+            matched = frame.filter(
+                (pl.col("settlement_date") == delivery_date)
+                & (pl.col(series_column).cast(pl.String) == month)
+            )
+            if matched.height != 1:
+                self._tx_final_settlement_error = (
+                    "missing_official_tx_final_settlement:"
+                    f"{delivery_date.isoformat()}:{month}:rows={matched.height}"
+                )
+                return None
+            row = matched.row(0, named=True)
+            price = _finite(row.get("final_settlement_price"))
+            if price is None:
+                raise ValueError("official TX final settlement is not positive finite")
+        except Exception as exc:
+            self._tx_final_settlement_error = (
+                f"invalid_official_final_settlement:{type(exc).__name__}:{exc}"
+            )
+            return None
+        return {
+            "price": price,
+            "settlement_date": delivery_date.isoformat(),
+            "delivery_month": month,
+            "source_file": str(row.get("source_file") or self.final_settlement_path),
+            "source_sha256": str(row.get("source_sha256") or ""),
+            "source_url": str(row.get("source_url") or ""),
+            "price_source": "official_taifex_index_final_settlement",
+        }
 
     def _reconcile_daily_duplicate_signal_ids(self) -> None:
         """Restore the accepted signal identity after a blocked duplicate.
@@ -1276,9 +1426,12 @@ class TwDayTradeSimulationEngine:
                 "fixed_fees_twd": 0.0,
                 "transaction_tax_twd": 0.0,
                 "roll_count": 0,
+                "roll_contract_version": TX_CONTINUOUS_ROLL_CONTRACT_VERSION,
                 "valuation_stale": True,
             },
         )
+        row["roll_contract_version"] = TX_CONTINUOUS_ROLL_CONTRACT_VERSION
+        row["official_final_settlement_path"] = str(self.final_settlement_path)
         current_code = str(current_contract_code or "").strip().upper()
         held_code = str(row.get("contract_code") or "").strip().upper()
         current_ask = _finite(current_quote.get("ask"))
@@ -1286,12 +1439,28 @@ class TwDayTradeSimulationEngine:
         fee_per_side = TAIFEX_INDEX_FUTURES_FEE_PER_SIDE_TWD["TX"]
         multiplier = TAIFEX_INDEX_FUTURES_MULTIPLIERS["TX"]
 
+        def update_contract_identity(
+            target: dict[str, Any], quote: Mapping[str, Any]
+        ) -> None:
+            delivery_month = str(quote.get("delivery_month") or "").strip()
+            delivery_date = _date_value(
+                quote.get("last_trading_date") or quote.get("delivery_date")
+            )
+            if delivery_month:
+                target["contract_delivery_month"] = delivery_month
+            if delivery_date is not None:
+                target["contract_last_trading_date"] = delivery_date.isoformat()
+
         if row.get("entry_price") is None and current_code and current_ask is not None:
             row.update(
                 {
                     "contract_code": current_code,
                     "entry_price": current_ask,
                     "entry_at": now.isoformat(timespec="seconds"),
+                    "origin_entry_price": current_ask,
+                    "origin_entry_at": now.isoformat(timespec="seconds"),
+                    "current_contract_entry_price": current_ask,
+                    "current_contract_entry_at": now.isoformat(timespec="seconds"),
                     "initial_capital_twd": taifex_initial_margin_twd("TX", now.date()),
                     "fixed_fees_twd": fee_per_side,
                     "transaction_tax_twd": self._tx_trade_tax(
@@ -1300,7 +1469,19 @@ class TwDayTradeSimulationEngine:
                     "capital_basis": "official_taifex_initial_margin_at_entry",
                 }
             )
+            update_contract_identity(row, current_quote)
             held_code = current_code
+
+        if row.get("entry_price") is not None:
+            row.setdefault("origin_entry_price", row.get("entry_price"))
+            row.setdefault("origin_entry_at", row.get("entry_at"))
+            row["current_contract_entry_price"] = row.get("entry_price")
+            row.setdefault("current_contract_entry_at", row.get("entry_at"))
+
+        if held_code == current_code:
+            update_contract_identity(row, current_quote)
+        elif held_code:
+            update_contract_identity(row, previous_contract_quote)
 
         if (
             row.get("entry_price") is not None
@@ -1308,18 +1489,55 @@ class TwDayTradeSimulationEngine:
             and held_code != current_code
         ):
             old_bid = _finite(previous_contract_quote.get("bid"))
-            if old_bid is not None and current_ask is not None:
+            held_last_trading_date = _date_value(
+                row.get("contract_last_trading_date")
+            )
+            held_delivery_month = str(
+                row.get("contract_delivery_month") or ""
+            ).strip()
+            expired = (
+                held_last_trading_date is not None
+                and (
+                    now.date() > held_last_trading_date
+                    or (
+                        now.date() == held_last_trading_date
+                        and now.time() >= SESSION_CLOSE
+                    )
+                )
+            )
+            official_settlement = (
+                self._official_tx_final_settlement(
+                    delivery_date=held_last_trading_date,
+                    delivery_month=held_delivery_month,
+                )
+                if expired and held_last_trading_date is not None
+                else None
+            )
+            old_exit_price = (
+                float(official_settlement["price"])
+                if official_settlement is not None
+                else old_bid
+                if not expired
+                else None
+            )
+            if old_exit_price is not None and current_ask is not None:
                 entry = float(row["entry_price"])
                 row["realized_gross_pnl_twd"] = (
                     float(row.get("realized_gross_pnl_twd") or 0.0)
-                    + (old_bid - entry) * multiplier
+                    + (old_exit_price - entry) * multiplier
                 )
+                old_exit_fee = 0.0 if official_settlement is not None else fee_per_side
                 row["fixed_fees_twd"] = (
-                    float(row.get("fixed_fees_twd") or 0.0) + 2.0 * fee_per_side
+                    float(row.get("fixed_fees_twd") or 0.0)
+                    + old_exit_fee
+                    + fee_per_side
                 )
                 row["transaction_tax_twd"] = (
                     float(row.get("transaction_tax_twd") or 0.0)
-                    + self._tx_trade_tax(old_bid, trading_date=now.date())
+                    + self._tx_trade_tax(
+                        old_exit_price,
+                        trading_date=held_last_trading_date or now.date(),
+                    )
                     + self._tx_trade_tax(current_ask, trading_date=now.date())
                 )
                 row.update(
@@ -1327,28 +1545,95 @@ class TwDayTradeSimulationEngine:
                         "previous_contract_code": held_code,
                         "contract_code": current_code,
                         "entry_price": current_ask,
+                        "current_contract_entry_price": current_ask,
+                        "current_contract_entry_at": now.isoformat(
+                            timespec="seconds"
+                        ),
                         "last_roll_at": now.isoformat(timespec="seconds"),
-                        "last_roll_old_bid": old_bid,
+                        "last_roll_old_bid": (
+                            old_bid if official_settlement is None else None
+                        ),
+                        "last_roll_old_price": old_exit_price,
+                        "last_roll_old_price_source": (
+                            "official_taifex_index_final_settlement"
+                            if official_settlement is not None
+                            else "executable_old_contract_bid"
+                        ),
+                        "last_roll_official_final_settlement": (
+                            official_settlement["price"]
+                            if official_settlement is not None
+                            else None
+                        ),
+                        "last_roll_official_settlement_source_file": (
+                            official_settlement["source_file"]
+                            if official_settlement is not None
+                            else None
+                        ),
+                        "last_roll_official_settlement_source_sha256": (
+                            official_settlement["source_sha256"]
+                            if official_settlement is not None
+                            else None
+                        ),
                         "last_roll_new_ask": current_ask,
                         "roll_count": int(row.get("roll_count") or 0) + 1,
                     }
                 )
+                update_contract_identity(row, current_quote)
                 roll_history = list(row.get("roll_history") or ())
                 roll_history.append(
                     {
                         "rolled_at": now.isoformat(timespec="seconds"),
                         "from_contract": held_code,
                         "to_contract": current_code,
-                        "old_bid": old_bid,
+                        "old_bid": old_bid if official_settlement is None else None,
+                        "old_exit_price": old_exit_price,
+                        "old_exit_price_source": (
+                            "official_taifex_index_final_settlement"
+                            if official_settlement is not None
+                            else "executable_old_contract_bid"
+                        ),
+                        "official_final_settlement": official_settlement,
                         "new_ask": current_ask,
-                        "fee_per_side_twd": fee_per_side,
+                        "old_exit_fee_twd": old_exit_fee,
+                        "new_entry_fee_twd": fee_per_side,
                     }
                 )
                 row["roll_history"] = roll_history[-100:]
+                row["roll_blocked_reason"] = None
+                _append_jsonl(
+                    self.events_path,
+                    {
+                        "event": "benchmark_tx_continuous_rolled",
+                        "recorded_at": now.isoformat(timespec="seconds"),
+                        "from_contract": held_code,
+                        "to_contract": current_code,
+                        "old_exit_price": old_exit_price,
+                        "old_exit_price_source": row[
+                            "last_roll_old_price_source"
+                        ],
+                        "new_entry_ask": current_ask,
+                        "official_final_settlement": official_settlement,
+                        "realized_gross_pnl_twd": row[
+                            "realized_gross_pnl_twd"
+                        ],
+                        "roll_contract_version": (
+                            TX_CONTINUOUS_ROLL_CONTRACT_VERSION
+                        ),
+                    },
+                )
                 held_code = current_code
             else:
                 row["valuation_stale"] = True
-                row["valuation_source"] = "roll_waiting_for_old_bid_and_new_ask"
+                if expired and official_settlement is None:
+                    row["roll_blocked_reason"] = self._tx_final_settlement_error
+                    row["valuation_source"] = (
+                        "roll_waiting_for_official_final_settlement_and_new_ask"
+                    )
+                else:
+                    row["roll_blocked_reason"] = (
+                        "missing_old_bid" if old_bid is None else "missing_new_ask"
+                    )
+                    row["valuation_source"] = "roll_waiting_for_old_bid_and_new_ask"
                 self._append_benchmark_mark(row, now=now)
                 return
 
@@ -1385,7 +1670,10 @@ class TwDayTradeSimulationEngine:
                     if return_fraction is None
                     else return_fraction * 100.0,
                     "valuation_stale": False,
-                    "valuation_source": "one_tx_ask_entry_bid_liquidation_with_roll_fee_and_tax",
+                    "valuation_source": (
+                        "one_tx_ask_entry_bid_liquidation_with_official_expiry_"
+                        "settlement_roll_fee_and_tax"
+                    ),
                     "source": current_quote.get("source"),
                 }
             )
@@ -1488,6 +1776,13 @@ class TwDayTradeSimulationEngine:
                     if observed.timetz().replace(tzinfo=None) >= FORCE_EXIT_TIME
                     else "active"
                 )
+            elif (
+                mode.get("session_valid") is False
+                and str(mode.get("session_date") or "")
+                == observed.date().isoformat()
+                and mode.get("non_session_invalidated_at")
+            ):
+                mode["engine_status"] = "invalid_non_trading_session"
             elif not checkpoint_ready:
                 mode["engine_status"] = "blocked_missing_checkpoint"
             elif str(
@@ -1577,6 +1872,59 @@ class TwDayTradeSimulationEngine:
         )
         self._persist(observed)
         return "rearmed"
+
+    def invalidate_non_session_flat_signal(
+        self,
+        market: str,
+        *,
+        now: datetime | None = None,
+        reason: str,
+    ) -> str:
+        """Void an impossible non-session signal without deleting its audit trail."""
+
+        observed = _now_taipei(now)
+        normalized_reason = str(reason or "").strip()
+        if not normalized_reason:
+            raise ValueError("non-session invalidation requires an audit reason")
+        mode = (self.state.get("modes") or {}).get(str(market))
+        if not isinstance(mode, dict):
+            raise KeyError(f"unknown simulation market: {market}")
+        session_date = str(mode.get("session_date") or "")
+        if session_date != observed.date().isoformat():
+            return "no_current_session_signal"
+        if mode.get("non_session_invalidated_at"):
+            return "already_invalidated"
+        if mode.get("positions"):
+            raise RuntimeError(
+                f"{market} has positions; non-session signal cannot be auto-invalidated"
+            )
+        if self._session_has_fill(str(market), session_date):
+            raise RuntimeError(
+                f"{market} has fills; non-session signal cannot be auto-invalidated"
+            )
+        previous_signal_id = mode.get("signal_id")
+        previous_entry_completed_at = mode.get("entry_completed_at")
+        mode["entry_completed_at"] = None
+        mode["pending_signal_id"] = None
+        mode["pending_signal_at"] = None
+        mode["engine_status"] = "invalid_non_trading_session"
+        mode["blocked_reason"] = "non_trading_session"
+        mode["session_valid"] = False
+        mode["non_session_invalidated_at"] = observed.isoformat(timespec="seconds")
+        mode["non_session_invalidation_reason"] = normalized_reason
+        self._event(
+            "non_session_signal_invalidated",
+            recorded_at=observed,
+            market=market,
+            session_date=session_date,
+            signal_id=previous_signal_id,
+            reason=normalized_reason,
+            previous_entry_completed_at=previous_entry_completed_at,
+            positions=0,
+            fills=0,
+        )
+        self._persist(observed)
+        return "invalidated"
 
     def retire_flat_mode(
         self,
@@ -1679,16 +2027,28 @@ class TwDayTradeSimulationEngine:
         signal_quote_ms = _finite(live_latency.get("quote_fetch_ms"))
         model_inference_ms = _finite(live_latency.get("model_inference_ms"))
         signal_total_ms = _finite(live_latency.get("compute_before_publish_ms"))
-        signal_other_ms = (
-            max(
+        detailed_signal_stages = {
+            "signal_pre_quote_prepare_ms": _finite(
+                live_latency.get("pre_quote_prepare_ms")
+            ),
+            "signal_pre_inference_prepare_ms": _finite(
+                live_latency.get("pre_inference_prepare_ms")
+            ),
+            "signal_post_inference_format_ms": _finite(
+                live_latency.get("post_inference_format_ms")
+            ),
+        }
+        has_detailed_signal_stages = any(
+            value is not None for value in detailed_signal_stages.values()
+        )
+        signal_other_ms = None
+        if signal_total_ms is not None and not has_detailed_signal_stages:
+            signal_other_ms = max(
                 0.0,
                 signal_total_ms
                 - float(signal_quote_ms or 0.0)
                 - float(model_inference_ms or 0.0),
             )
-            if signal_total_ms is not None
-            else None
-        )
 
         def elapsed_ms(start: datetime | None, end: datetime | None) -> float | None:
             if start is None or end is None:
@@ -1696,6 +2056,7 @@ class TwDayTradeSimulationEngine:
             return round(max(0.0, (end - start).total_seconds() * 1000.0), 3)
 
         stages = {
+            **detailed_signal_stages,
             "signal_quote_fetch_ms": signal_quote_ms,
             "model_inference_ms": model_inference_ms,
             "signal_other_compute_ms": signal_other_ms,
@@ -1956,6 +2317,10 @@ class TwDayTradeSimulationEngine:
             self._archive_mode_positions(mode, archived_at=observed)
 
         mode["session_date"] = observed.date().isoformat()
+        mode["session_valid"] = True
+        mode.pop("non_session_invalidated_at", None)
+        mode.pop("non_session_invalidation_reason", None)
+        mode["blocked_reason"] = None
         mode["signal_id"] = signal_id
         mode["signal_at"] = signal_at.isoformat(timespec="seconds")
         mode["source_signal_at"] = source_signal_at.isoformat(timespec="seconds")
@@ -1991,6 +2356,9 @@ class TwDayTradeSimulationEngine:
         mode["terminal_flatten_count"] = 0
         mode["terminal_flatten_degraded_count"] = 0
         counts: dict[str, int] = {}
+        signal_records: list[dict[str, Any]] = []
+        order_records: list[dict[str, Any]] = []
+        fill_records: list[dict[str, Any]] = []
 
         plans = [
             _prepare_entry_plan(
@@ -2118,7 +2486,7 @@ class TwDayTradeSimulationEngine:
                 "replay_basis": mode.get("replay_basis"),
                 "counterfactual_open_replay": bool(counterfactual_open_replay),
             }
-            _append_jsonl(self.signals_path, signal_record)
+            signal_records.append(signal_record)
             counts[status] = counts.get(status, 0) + 1
             if (
                 status
@@ -2236,7 +2604,7 @@ class TwDayTradeSimulationEngine:
                 "quantity": filled_shares,
                 "simulation_only": True,
             }
-            self._order(
+            order_records.append(
                 {
                     **order_base,
                     "order_id": entry_order_id,
@@ -2252,7 +2620,7 @@ class TwDayTradeSimulationEngine:
                     ),
                 }
             )
-            self._fill(
+            fill_records.append(
                 {
                     **order_base,
                     "order_id": entry_order_id,
@@ -2279,7 +2647,7 @@ class TwDayTradeSimulationEngine:
                     "armed",
                 ),
             ):
-                self._order(
+                order_records.append(
                     {
                         **order_base,
                         "order_id": f"{position_id}:{purpose}",
@@ -2291,6 +2659,13 @@ class TwDayTradeSimulationEngine:
                         "status": order_status,
                     }
                 )
+
+        # One signal is one logical append transaction per ledger. This keeps
+        # every row durable before state.json points at the accepted signal,
+        # while avoiding thousands of per-row fsync calls on the 09:00 path.
+        _append_jsonl_many(self.signals_path, signal_records)
+        _append_jsonl_many(self.orders_path, order_records)
+        _append_jsonl_many(self.fills_path, fill_records)
 
         processed = list(mode.get("processed_signal_ids") or ())
         processed.append(signal_id)

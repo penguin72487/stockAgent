@@ -4,9 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 from datetime import datetime, time as datetime_time
 import json
+import os
 from pathlib import Path
+import select
 import sys
 import time as time_module
 from typing import Any
@@ -26,6 +29,7 @@ from stockagent.live.market_config import (  # noqa: E402
     load_market_configs,
     resolved_live_output_dir,
 )
+from stockagent.live.market_status import verified_tw_stock_session_day  # noqa: E402
 from stockagent.live.quote_provider import (  # noqa: E402
     fetch_futures_snapshot_prefer_stream,
     fetch_shioaji_stock_snapshots,
@@ -39,6 +43,7 @@ from stockagent.live.tw_day_trade_simulation import (  # noqa: E402
     TX_CONTINUOUS_LOGICAL_CODE,
     TwDayTradeSimulationEngine,
     load_live_eligibility,
+    load_symbol_metadata,
     quote_map_from_snapshot,
     resolve_day_trade_rule_data_dir,
 )
@@ -141,17 +146,45 @@ def _latest_signal(
         pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
         summary_path = Path(str(pointer.get("summary_path") or ""))
         weights_path = Path(str(pointer.get("weights_path") or ""))
+        execution_weights_path = Path(
+            str(pointer.get("execution_weights_path") or "")
+        )
         summary = json.loads(summary_path.read_text(encoding="utf-8"))
         if (
             isinstance(summary, dict)
             and str(summary.get("market")) == str(spec.signal_market or spec.market)
             and str(summary.get("asof_date") or "")[:10] == now.date().isoformat()
-            and weights_path.is_file()
+            and (execution_weights_path.is_file() or weights_path.is_file())
         ):
-            rows = pl.read_parquet(weights_path).to_dicts()
+            rows: list[dict[str, Any]] | None = None
+            if execution_weights_path.is_file():
+                try:
+                    execution_payload = json.loads(
+                        execution_weights_path.read_text(encoding="utf-8")
+                    )
+                    execution_rows = execution_payload.get("rows")
+                    if (
+                        int(execution_payload.get("schema_version") or 0) == 1
+                        and str(execution_payload.get("market") or "")
+                        == str(spec.signal_market or spec.market)
+                        and str(execution_payload.get("signal_id") or "")
+                        == str(summary.get("signal_id") or "")
+                        and isinstance(execution_rows, list)
+                        and all(isinstance(row, dict) for row in execution_rows)
+                    ):
+                        rows = [dict(row) for row in execution_rows]
+                except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                    rows = None
+            if rows is None:
+                rows = pl.read_parquet(weights_path).to_dicts()
             summary = dict(summary)
             summary["summary_path"] = str(summary_path)
             summary["weights_path"] = str(weights_path)
+            summary["execution_weights_path"] = (
+                str(execution_weights_path)
+                if execution_weights_path.is_file()
+                else None
+            )
             _LATEST_SIGNAL_CACHE[cache_key] = (signature, summary, rows)
             return dict(summary), list(rows)
     except (OSError, TypeError, ValueError, json.JSONDecodeError):
@@ -338,6 +371,73 @@ def _current_eligibility_coverage(
     return by_market
 
 
+def _prewarm_live_eligibility(
+    specs: list[ModeSpec],
+    live_configs: dict[str, LiveMarketConfig],
+    *,
+    trading_date: datetime,
+) -> dict[str, dict[str, Any]]:
+    """Resolve the complete checkpoint universe before the opening event."""
+
+    warmed: dict[str, dict[str, Any]] = {}
+    grouped: dict[tuple[str, str], list[ModeSpec]] = {}
+    for spec in specs:
+        live = live_configs[spec.market]
+        rule_data_dir = _rule_data_dir(live, spec)
+        key = (str(rule_data_dir.resolve()), str(spec.parquet_root.resolve()))
+        grouped.setdefault(key, []).append(spec)
+
+    for (rule_dir_text, parquet_root_text), grouped_specs in grouped.items():
+        rule_data_dir = Path(rule_dir_text)
+        parquet_root = Path(parquet_root_text)
+        symbols = sorted(load_symbol_metadata(parquet_root))
+        started = time_module.perf_counter()
+        resolved, coverage = _cached_live_eligibility(
+            rule_data_dir=rule_data_dir,
+            parquet_root=parquet_root,
+            symbols=symbols,
+            trading_date=trading_date,
+        )
+        missing = {
+            venue: row
+            for venue, row in coverage.items()
+            if not bool(row.get("covered"))
+        }
+        if missing:
+            raise RuntimeError(f"same-session eligibility not covered: {missing}")
+        elapsed_ms = (time_module.perf_counter() - started) * 1000.0
+        row = {
+            "symbol_count": len(symbols),
+            "resolved_count": len(resolved),
+            "elapsed_ms": round(elapsed_ms, 3),
+            "coverage": coverage,
+        }
+        for spec in grouped_specs:
+            warmed[spec.market] = row
+    return warmed
+
+
+def _verified_stock_session(
+    specs: list[ModeSpec],
+    live_configs: dict[str, LiveMarketConfig],
+    *,
+    observed: datetime,
+) -> tuple[bool, dict[str, str]]:
+    """Fail closed before Shioaji access when any paper mode lacks a session."""
+
+    decisions: dict[str, str] = {}
+    for spec in specs:
+        live = live_configs[spec.market]
+        is_open, reason = verified_tw_stock_session_day(
+            observed.date(),
+            tuple(live.holidays or ()),
+            parquet_root=_rule_data_dir(live, spec),
+        )
+        if not is_open:
+            decisions[spec.market] = reason
+    return bool(specs) and not decisions, decisions
+
+
 def _active_symbols(
     engine: TwDayTradeSimulationEngine,
 ) -> tuple[list[str], dict[str, float]]:
@@ -395,6 +495,97 @@ def _loop_sleep_seconds(
     if has_pending_signal or opening_hot_path or exit_hot_path or force_exit_hot_path:
         return max(0.01, float(fast_seconds))
     return max(1.0, float(fast_seconds))
+
+
+class _SignalPointerWatcher:
+    """Wake immediately when an atomic latest_signal.json pointer is published.
+
+    Linux inotify removes the 0-100 ms polling quantization from the opening
+    path. The ordinary timeout remains a portable fail-safe and continues to
+    drive quote/exit/readiness work when no signal file changes.
+    """
+
+    _WATCH_MASK = 0x00000008 | 0x00000080 | 0x00000100 | 0x00004000
+
+    def __init__(self) -> None:
+        self._fd: int | None = None
+        self._watched_paths: set[str] = set()
+        try:
+            libc = ctypes.CDLL(None, use_errno=True)
+            init = libc.inotify_init1
+            init.argtypes = [ctypes.c_int]
+            init.restype = ctypes.c_int
+            fd = int(init(os.O_NONBLOCK | os.O_CLOEXEC))
+            if fd < 0:
+                raise OSError(ctypes.get_errno(), "inotify_init1 failed")
+            add_watch = libc.inotify_add_watch
+            add_watch.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32]
+            add_watch.restype = ctypes.c_int
+            self._libc = libc
+            self._add_watch = add_watch
+            self._fd = fd
+        except (AttributeError, OSError):
+            self._libc = None
+            self._add_watch = None
+
+    @property
+    def enabled(self) -> bool:
+        return self._fd is not None and bool(self._watched_paths)
+
+    def configure(self, directories: list[Path]) -> None:
+        if self._fd is None or self._add_watch is None:
+            return
+        for directory in directories:
+            try:
+                resolved = str(Path(directory).resolve())
+                if resolved in self._watched_paths or not Path(resolved).is_dir():
+                    continue
+                descriptor = int(
+                    self._add_watch(
+                        self._fd,
+                        os.fsencode(resolved),
+                        self._WATCH_MASK,
+                    )
+                )
+                if descriptor < 0:
+                    continue
+                self._watched_paths.add(resolved)
+            except OSError:
+                continue
+
+    def wait(self, timeout_seconds: float) -> bool:
+        timeout = max(0.0, float(timeout_seconds))
+        if not self.enabled or self._fd is None:
+            time_module.sleep(timeout)
+            return False
+        try:
+            ready, _writable, _errors = select.select(
+                [self._fd], [], [], timeout
+            )
+            if not ready:
+                return False
+            while True:
+                try:
+                    if not os.read(self._fd, 64 * 1024):
+                        break
+                except BlockingIOError:
+                    break
+            return True
+        except (OSError, ValueError):
+            time_module.sleep(timeout)
+            return False
+
+    def close(self) -> None:
+        if self._fd is None:
+            return
+        try:
+            os.close(self._fd)
+        finally:
+            self._fd = None
+            self._watched_paths.clear()
+
+    def __del__(self) -> None:
+        self.close()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -473,46 +664,172 @@ def main(argv: list[str] | None = None) -> int:
     last_quote_minute: str | None = None
     last_benchmark_minute: str | None = None
     pending_retry_after: dict[str, float] = {}
+    quote_client_warmed_session: str | None = None
+    quote_client_prewarm_retry_after = 0.0
+    eligibility_prewarmed_session: str | None = None
+    signal_watcher = _SignalPointerWatcher()
+    last_session_gate_log: tuple[str, tuple[tuple[str, str], ...]] | None = None
+    non_session_invalidation_attempts: set[tuple[str, str]] = set()
     print(
         f"[tw-day-trade-sim] state_dir={engine.state_dir} simulation_only=true",
         flush=True,
     )
-    prewarm_started = time_module.perf_counter()
-    try:
-        warm_shioaji_stock_quote_client()
-        print(
-            "[tw-day-trade-sim] shioaji_prewarm=ready "
-            f"elapsed_ms={(time_module.perf_counter() - prewarm_started) * 1000.0:.3f}",
-            flush=True,
-        )
-    except Exception as exc:
-        print(
-            f"[tw-day-trade-sim] shioaji_prewarm=failed "
-            f"error={type(exc).__name__}: {exc}",
-            flush=True,
-        )
-
     while True:
         monotonic_now = time_module.monotonic()
         observed = datetime.now(TAIPEI)
         if monotonic_now - last_reload >= 30.0 or not specs:
             specs, live_configs, errors = _mode_specs(markets_dir)
-            current_coverage = _current_eligibility_coverage(
+            signal_watcher.configure([spec.live_output_dir for spec in specs])
+            session_open, session_errors = _verified_stock_session(
                 specs,
                 live_configs,
-                trading_date=observed,
+                observed=observed,
             )
+            current_coverage = (
+                _current_eligibility_coverage(
+                    specs,
+                    live_configs,
+                    trading_date=observed,
+                )
+                if session_open
+                else {}
+            )
+            session_date_text = observed.date().isoformat()
+            eligibility_prewarm_due = (
+                observed.timetz().replace(tzinfo=None) >= datetime_time(8, 30)
+            )
+            if (
+                session_open
+                and eligibility_prewarm_due
+                and eligibility_prewarmed_session != session_date_text
+            ):
+                try:
+                    eligibility_warm = _prewarm_live_eligibility(
+                        specs,
+                        live_configs,
+                        trading_date=observed,
+                    )
+                    if eligibility_warm:
+                        slowest = max(
+                            eligibility_warm.values(),
+                            key=lambda row: float(row.get("elapsed_ms") or 0.0),
+                        )
+                        print(
+                            "[tw-day-trade-sim] eligibility_prewarm=ready "
+                            f"symbols={slowest.get('symbol_count')} "
+                            f"elapsed_ms={slowest.get('elapsed_ms')}",
+                            flush=True,
+                        )
+                    eligibility_prewarmed_session = session_date_text
+                except Exception as exc:
+                    errors = {
+                        **errors,
+                        **{
+                            spec.market: (
+                                "eligibility_prewarm_failed: "
+                                f"{type(exc).__name__}: {exc}"
+                            )
+                            for spec in specs
+                        },
+                    }
             engine.update_readiness(
                 specs,
                 now=observed,
-                errors=errors,
+                errors={
+                    **errors,
+                    **{
+                        market: f"market_session_blocked: {reason}"
+                        for market, reason in session_errors.items()
+                    },
+                },
                 current_eligibility_coverage=current_coverage,
             )
             last_reload = monotonic_now
             last_readiness = monotonic_now
-        elif monotonic_now - last_readiness >= 10.0:
+        session_open, session_errors = _verified_stock_session(
+            specs,
+            live_configs,
+            observed=observed,
+        )
+        if not session_open:
+            for market, reason in session_errors.items():
+                invalidation_key = (observed.date().isoformat(), market)
+                if invalidation_key in non_session_invalidation_attempts:
+                    continue
+                try:
+                    result = engine.invalidate_non_session_flat_signal(
+                        market,
+                        now=observed,
+                        reason=reason,
+                    )
+                    if result == "invalidated":
+                        print(
+                            "[tw-day-trade-sim] non_session_signal=invalidated "
+                            f"market={market} date={observed.date().isoformat()} "
+                            f"reason={reason}",
+                            flush=True,
+                        )
+                except Exception as exc:
+                    print(
+                        "[tw-day-trade-sim] non_session_signal=blocked "
+                        f"market={market} error={type(exc).__name__}: {exc}",
+                        flush=True,
+                    )
+                non_session_invalidation_attempts.add(invalidation_key)
+            if monotonic_now - last_readiness >= 10.0:
+                engine.update_readiness(
+                    specs,
+                    now=observed,
+                    errors={
+                        market: f"market_session_blocked: {reason}"
+                        for market, reason in session_errors.items()
+                    },
+                )
+                last_readiness = monotonic_now
+            gate_key = (
+                observed.date().isoformat(),
+                tuple(sorted(session_errors.items())),
+            )
+            if gate_key != last_session_gate_log:
+                print(
+                    "[tw-day-trade-sim] market_session=blocked "
+                    f"date={observed.date().isoformat()} reasons={session_errors}",
+                    flush=True,
+                )
+                last_session_gate_log = gate_key
+            if args.once:
+                return 0
+            time_module.sleep(max(1.0, float(args.poll_seconds)))
+            continue
+        last_session_gate_log = None
+        if monotonic_now - last_readiness >= 10.0:
             engine.update_readiness(specs, now=observed)
             last_readiness = monotonic_now
+
+        prewarm_wall_time = observed.timetz().replace(tzinfo=None)
+        prewarm_session = observed.date().isoformat()
+        if (
+            quote_client_warmed_session != prewarm_session
+            and prewarm_wall_time >= datetime_time(8, 55)
+            and monotonic_now >= quote_client_prewarm_retry_after
+        ):
+            prewarm_started = time_module.perf_counter()
+            try:
+                warm_shioaji_stock_quote_client()
+                quote_client_warmed_session = prewarm_session
+                print(
+                    "[tw-day-trade-sim] shioaji_prewarm=ready "
+                    f"elapsed_ms="
+                    f"{(time_module.perf_counter() - prewarm_started) * 1000.0:.3f}",
+                    flush=True,
+                )
+            except Exception as exc:
+                quote_client_prewarm_retry_after = time_module.monotonic() + 5.0
+                print(
+                    f"[tw-day-trade-sim] shioaji_prewarm=failed "
+                    f"error={type(exc).__name__}: {exc}",
+                    flush=True,
+                )
 
         pending: list[
             tuple[
@@ -746,7 +1063,7 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.once:
             return 0
-        time_module.sleep(
+        signal_watcher.wait(
             _loop_sleep_seconds(
                 datetime.now(TAIPEI),
                 fast_seconds=float(args.poll_seconds),

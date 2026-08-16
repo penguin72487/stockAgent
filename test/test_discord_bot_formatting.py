@@ -47,7 +47,9 @@ from services.discord_bot.bot import (
     _portfolio_history_block,
     _portfolio_history_pages,
     _preopen_prepare_key,
+    _preopen_market_final_armed_for_session,
     _preopen_market_ready_for_session,
+    _write_preopen_final_arm,
     _write_preopen_readiness,
     _validate_day_trade_portfolio_history_result,
     _prepare_realtime_signal_sync,
@@ -71,6 +73,7 @@ from services.discord_bot.bot import (
     _scheduled_detail_page_groups,
     _scheduled_signal_requires_preopen_catch_up,
     _scheduled_signal_key,
+    _scheduled_market_session_day,
     _scheduled_markets,
     _scheduled_retry_allowed,
     _mark_scheduled_retry,
@@ -352,6 +355,10 @@ def test_artifact_backfill_key_uses_backfill_time_and_skips_interval_markets(mon
 def test_preopen_prepare_key_catches_up_missing_day_trade_readiness(
     monkeypatch,
 ) -> None:
+    monkeypatch.setattr(
+        "services.discord_bot.bot._scheduled_market_session_day",
+        lambda _cfg, current: (current.weekday() < 5, "fixture calendar"),
+    )
     now = datetime(2026, 7, 6, 8, 30, tzinfo=ZoneInfo("Asia/Taipei"))
     configured = SimpleNamespace(
         market="tw_day_trade",
@@ -371,6 +378,24 @@ def test_preopen_prepare_key_catches_up_missing_day_trade_readiness(
     )
 
     assert _preopen_prepare_key(configured, now) == (
+        "2026-07-06:tw_day_trade:preopen"
+    )
+    monkeypatch.setattr(
+        "services.discord_bot.bot._preopen_market_ready_for_session",
+        lambda cfg, session_date: True,
+    )
+    monkeypatch.setattr(
+        "services.discord_bot.bot._preopen_market_final_armed_for_session",
+        lambda cfg, session_date: False,
+    )
+    assert _preopen_prepare_key(configured, now.replace(minute=55)) == (
+        "2026-07-06:tw_day_trade:preopen-final-arm"
+    )
+    monkeypatch.setattr(
+        "services.discord_bot.bot._preopen_market_final_armed_for_session",
+        lambda cfg, session_date: True,
+    )
+    assert _preopen_prepare_key(configured, now.replace(minute=55)) == (
         "2026-07-06:tw_day_trade:preopen"
     )
     monkeypatch.setattr(
@@ -437,15 +462,48 @@ def test_preopen_readiness_preserves_same_day_ready_rows_across_restart(
     assert set(payload["markets"]) == {"tw_day_trade", "tw_day_trade_1m"}
     ready_cfg = SimpleNamespace(market="tw_day_trade")
     assert _preopen_market_ready_for_session(ready_cfg, today) is True
+    armed_cfg = SimpleNamespace(market="tw_day_trade", timezone="Asia/Taipei")
+    _write_preopen_final_arm(
+        armed_cfg,
+        status="ready",
+        started_at=f"{today}T08:55:00+08:00",
+        elapsed_seconds=0.2,
+        summary={
+            "live_latency": {
+                "panel_cache_hit": True,
+                "checkpoint_cache_hit": True,
+                "model_cache_hit": True,
+            }
+        },
+    )
+    assert _preopen_market_final_armed_for_session(armed_cfg, today) is True
 
 
-def test_day_trade_schedule_catches_up_after_service_restart(monkeypatch) -> None:
+def test_day_trade_schedule_catches_up_after_service_restart(
+    monkeypatch, tmp_path
+) -> None:
     monkeypatch.setattr("services.discord_bot.bot._market_state", lambda market: {})
+    public_root = tmp_path / "data_tw_public"
+    public_root.mkdir()
+    pl.DataFrame(
+        {
+            "Name": ["中華民國開國紀念日"],
+            "Date": ["1150101"],
+            "_dataset": ["twse_api_holidayschedule_holidayschedule"],
+            "_source": ["TWSE OpenAPI"],
+            "_as_of_date": ["2026-08-14"],
+        }
+    ).write_parquet(
+        public_root / "twse_api_holidayschedule_holidayschedule.parquet"
+    )
     cfg = SimpleNamespace(
         market="tw_day_trade_1m",
+        market_type="tw",
         schedule_time="09:00",
         schedule_interval_minutes=None,
         day_trade_simulation_enabled=True,
+        day_trade_rule_data_dir=str(public_root),
+        config_path="",
         holidays=(),
     )
     morning = datetime(2026, 8, 14, 9, 12, tzinfo=ZoneInfo("Asia/Taipei"))
@@ -456,6 +514,7 @@ def test_day_trade_schedule_catches_up_after_service_restart(monkeypatch) -> Non
     )
     assert _scheduled_signal_key(cfg, morning.replace(hour=13, minute=20)) is None
     assert _scheduled_signal_key(cfg, morning.replace(day=15)) is None
+    assert _scheduled_market_session_day(cfg, morning.replace(day=15))[0] is False
     assert _scheduled_signal_requires_preopen_catch_up(cfg, morning) is True
     assert (
         _scheduled_signal_requires_preopen_catch_up(cfg, morning.replace(minute=0))
@@ -465,6 +524,10 @@ def test_day_trade_schedule_catches_up_after_service_restart(monkeypatch) -> Non
 
 def test_non_day_trade_daily_schedule_still_requires_exact_minute(monkeypatch) -> None:
     monkeypatch.setattr("services.discord_bot.bot._market_state", lambda market: {})
+    monkeypatch.setattr(
+        "services.discord_bot.bot._scheduled_market_session_day",
+        lambda _cfg, current: (current.weekday() < 5, "fixture calendar"),
+    )
     cfg = SimpleNamespace(
         market="tw",
         schedule_time="09:00",

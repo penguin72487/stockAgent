@@ -1059,9 +1059,21 @@ def _write_run_summary(
     counters: dict[str, int],
     rate: dict[str, float | int],
     fatal_error: str,
-) -> None:
+) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
-    report_path = output_dir / "download_report.csv"
+    strict_complete = len(results) == len(selected) and all(
+        item.status == "complete" for item in results
+    )
+    collection_complete = len(results) == len(selected) and all(
+        item.status in {"complete", "complete_with_source_gaps", "contract_unavailable"}
+        for item in results
+    )
+    # An interrupted extension is run progress, not a new canonical catalog.
+    # Keep the last terminal summary/report published until the full selected
+    # universe reaches a terminal state for the new requested end date.
+    report_path = output_dir / (
+        "download_report.csv" if collection_complete else "latest_run_report.csv"
+    )
     if results:
         pl.DataFrame([asdict(item) for item in results]).sort("symbol").write_csv(
             report_path
@@ -1070,15 +1082,11 @@ def _write_run_summary(
         pl.DataFrame(
             schema={name: pl.String for name in SymbolResult.__dataclass_fields__}
         ).write_csv(report_path)
-    strict_complete = len(results) == len(selected) and all(
-        item.status == "complete" for item in results
-    )
-    collection_complete = len(results) == len(selected) and all(
-        item.status in {"complete", "complete_with_source_gaps", "contract_unavailable"}
-        for item in results
+    summary_path = output_dir / (
+        "download_summary.json" if collection_complete else "latest_run_summary.json"
     )
     _atomic_write_json(
-        output_dir / "download_summary.json",
+        summary_path,
         {
             "schema_version": 1,
             "source": SOURCE_NAME,
@@ -1111,6 +1119,7 @@ def _write_run_summary(
             "partial_symbols": sum(x.status == "partial" for x in results),
             "selected_coverage_complete": strict_complete,
             "resumable_collection_complete": collection_complete,
+            "published_terminal_catalog": collection_complete,
             "stopped_for_traffic": stopped_for_traffic,
             "stopped_for_market_hours": stopped_for_market_hours,
             "fatal_error": fatal_error or None,
@@ -1122,6 +1131,7 @@ def _write_run_summary(
             .isoformat(),
         },
     )
+    return summary_path
 
 
 def _partial_symbol_result(
@@ -1722,6 +1732,16 @@ def main() -> None:
                 process.terminate()
                 process.join(timeout=5.0)
 
+    # A quota stop can leave thousands of unconsumed tasks in the parent-side
+    # multiprocessing feeder buffer.  Do not let Queue's interpreter-exit join
+    # turn a completed run into a hung systemd service.
+    for queue in (task_queue, result_queue, error_queue):
+        try:
+            queue.cancel_join_thread()
+            queue.close()
+        except (AttributeError, OSError, ValueError):
+            pass
+
     deduplicated = {
         int(symbol_index): result for symbol_index, result in result_items
     }
@@ -1730,7 +1750,7 @@ def main() -> None:
     counter_snapshot = counters.snapshot()
     rate_snapshot = limiter.snapshot()
     elapsed_seconds = round(time.monotonic() - started, 3)
-    _write_run_summary(
+    published_summary_path = _write_run_summary(
         args.output_dir,
         args=args,
         selected=selected,
@@ -1789,7 +1809,7 @@ def main() -> None:
         f"partial={sum(x.status == 'partial' for x in results)} "
         f"api_requests={int(rate_snapshot['total_requests'])} "
         f"request_rps={float(rate_snapshot['overall_rps']):.3f} "
-        f"summary={args.output_dir / 'download_summary.json'}",
+        f"summary={published_summary_path}",
         flush=True,
     )
     if fatal_error:

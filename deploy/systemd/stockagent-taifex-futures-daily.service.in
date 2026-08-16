@@ -1,0 +1,20 @@
+[Unit]
+Description=StockAgent official TAIFEX all-futures daily history refresh
+Wants=network-online.target time-sync.target
+After=network-online.target time-sync.target
+
+[Service]
+Type=oneshot
+User=@SERVICE_USER@
+Group=@SERVICE_GROUP@
+WorkingDirectory=@REPO_ROOT@
+Environment="HOME=@SERVICE_HOME@"
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=/usr/bin/bash "@REPO_ROOT@/scripts/run_taifex_all_futures_daily.sh"
+Nice=10
+CPUWeight=25
+IOWeight=25
+TimeoutStartSec=30min
+
+[Install]
+WantedBy=multi-user.target

@@ -8,7 +8,7 @@ a failed trading/simulation observation.
 from __future__ import annotations
 
 from contextlib import contextmanager
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 import fcntl
 import json
 import os
@@ -21,15 +21,20 @@ from zoneinfo import ZoneInfo
 
 
 T = TypeVar("T")
-LEDGER_SCHEMA_VERSION = 1
+LEDGER_SCHEMA_VERSION = 2
 TAIPEI = ZoneInfo("Asia/Taipei")
 
 
 def quota_window_date(observed: datetime) -> str:
-    """Return the trading quota day, whose boundary is 08:00 Asia/Taipei."""
+    """Return the local observation date, not an inferred broker quota reset.
+
+    The name is retained for compatibility with existing callers.  A quota
+    epoch can only be established by ordered ``api.usage()`` observations; a
+    wall-clock boundary must never manufacture a broker reset.
+    """
 
     selected = observed if observed.tzinfo is not None else observed.replace(tzinfo=UTC)
-    return (selected.astimezone(TAIPEI) - timedelta(hours=8)).date().isoformat()
+    return selected.astimezone(TAIPEI).date().isoformat()
 
 
 def traffic_ledger_root() -> Path:
@@ -39,7 +44,7 @@ def traffic_ledger_root() -> Path:
     return Path(__file__).resolve().parents[2] / "artifacts/live/shioaji_traffic"
 
 
-def _usage(api: Any) -> dict[str, int] | None:
+def _usage(api: Any) -> dict[str, Any] | None:
     try:
         value = api.usage()
         used = int(getattr(value, "bytes"))
@@ -48,7 +53,11 @@ def _usage(api: Any) -> dict[str, int] | None:
         return None
     if used < 0 or limit <= 0:
         return None
-    return {"used_bytes": used, "limit_bytes": limit}
+    return {
+        "used_bytes": used,
+        "limit_bytes": limit,
+        "observed_at_utc": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+    }
 
 
 def _safe_details(details: dict[str, Any] | None) -> dict[str, Any]:
@@ -126,6 +135,199 @@ def _increment(bucket: dict[str, Any], event: dict[str, Any]) -> None:
     )
 
 
+def _parse_utc(value: Any) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def _usage_observations(event: dict[str, Any]) -> list[dict[str, Any]]:
+    fallback_at = str(event.get("observed_at_utc") or "")
+    observations: list[dict[str, Any]] = []
+    for phase_rank, phase in enumerate(("usage_before", "usage_after")):
+        raw = event.get(phase)
+        if not isinstance(raw, dict):
+            continue
+        try:
+            used = int(raw.get("used_bytes"))
+            limit = int(raw.get("limit_bytes"))
+        except (TypeError, ValueError):
+            continue
+        if used < 0 or limit <= 0:
+            continue
+        observed_at = str(raw.get("observed_at_utc") or fallback_at)
+        if _parse_utc(observed_at) is None:
+            continue
+        observations.append(
+            {
+                "used_bytes": used,
+                "limit_bytes": limit,
+                "observed_at_utc": observed_at,
+                "event_id": str(event.get("event_id") or ""),
+                "phase": phase,
+                "phase_rank": phase_rank,
+            }
+        )
+    return sorted(
+        observations,
+        key=lambda item: (
+            _parse_utc(item["observed_at_utc"]) or datetime.min.replace(tzinfo=UTC),
+            int(item["phase_rank"]),
+        ),
+    )
+
+
+def _blank_summary(
+    *,
+    observed_at_utc: str,
+    boundary_kind: str,
+    boundary: dict[str, Any] | None = None,
+    previous_reset: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    observed = _parse_utc(observed_at_utc) or datetime.now(UTC)
+    observed_text = observed.isoformat().replace("+00:00", "Z")
+    local_date = quota_window_date(observed)
+    reset = boundary if boundary_kind == "observed_counter_drop" else previous_reset
+    return {
+        "schema_version": LEDGER_SCHEMA_VERSION,
+        "ledger_date": local_date,
+        "observation_date": local_date,
+        "quota_epoch": {
+            "id": f"{boundary_kind}:{observed_text}",
+            "started_at_utc": observed_text,
+            "boundary_kind": boundary_kind,
+            "reset_observed": boundary_kind == "observed_counter_drop",
+        },
+        "latest_boundary": boundary,
+        "latest_reset": reset,
+        "totals": {},
+        "by_consumer": {},
+        "by_method": {},
+        "by_asset_class": {},
+    }
+
+
+def _upgrade_summary(summary: dict[str, Any], *, observed_at_utc: str) -> dict[str, Any]:
+    if int(summary.get("schema_version") or 0) >= LEDGER_SCHEMA_VERSION:
+        return summary
+    observed = _parse_utc(observed_at_utc) or datetime.now(UTC)
+    local_date = quota_window_date(observed)
+    summary["schema_version"] = LEDGER_SCHEMA_VERSION
+    summary["observation_date"] = local_date
+    summary.setdefault("ledger_date", local_date)
+    summary.setdefault(
+        "quota_epoch",
+        {
+            "id": f"legacy_import:{summary.get('ledger_date') or local_date}",
+            "started_at_utc": None,
+            "boundary_kind": "legacy_import_without_reset_evidence",
+            "reset_observed": False,
+        },
+    )
+    summary.setdefault("latest_boundary", None)
+    summary.setdefault("latest_reset", None)
+    return summary
+
+
+def _observation_is_newer(
+    observation: dict[str, Any],
+    latest: dict[str, Any] | None,
+) -> bool:
+    if not isinstance(latest, dict):
+        return True
+    current_at = _parse_utc(observation.get("observed_at_utc"))
+    latest_at = _parse_utc(latest.get("observed_at_utc"))
+    if current_at is None:
+        return False
+    if latest_at is None or current_at > latest_at:
+        return True
+    if current_at < latest_at:
+        return False
+    return bool(
+        observation.get("event_id")
+        and observation.get("event_id") == latest.get("event_id")
+        and int(observation.get("phase_rank") or 0)
+        > int(latest.get("phase_rank") or 0)
+    )
+
+
+def _apply_event_to_summary(
+    summary: dict[str, Any],
+    event: dict[str, Any],
+    *,
+    recent_ledger: str,
+) -> dict[str, Any]:
+    event_at = str(event.get("observed_at_utc") or "")
+    if _parse_utc(event_at) is None:
+        return summary
+    if not summary:
+        summary = _blank_summary(
+            observed_at_utc=event_at,
+            boundary_kind="initial_local_event",
+        )
+    else:
+        summary = _upgrade_summary(summary, observed_at_utc=event_at)
+
+    for observation in _usage_observations(event):
+        latest = summary.get("latest_usage")
+        if not _observation_is_newer(observation, latest):
+            continue
+        boundary_kind: str | None = None
+        if isinstance(latest, dict):
+            prior_used = int(latest.get("used_bytes") or 0)
+            prior_limit = int(latest.get("limit_bytes") or 0)
+            if int(observation["limit_bytes"]) != prior_limit:
+                boundary_kind = "observed_limit_change"
+            elif int(observation["used_bytes"]) < prior_used:
+                boundary_kind = "observed_counter_drop"
+        if boundary_kind is not None:
+            boundary = {
+                "kind": boundary_kind,
+                "observed_at_utc": observation["observed_at_utc"],
+                "previous_used_bytes": int(latest.get("used_bytes") or 0),
+                "new_used_bytes": int(observation["used_bytes"]),
+                "previous_limit_bytes": int(latest.get("limit_bytes") or 0),
+                "new_limit_bytes": int(observation["limit_bytes"]),
+                "consumer": event.get("consumer"),
+                "method": event.get("method"),
+                "event_id": event.get("event_id"),
+            }
+            summary = _blank_summary(
+                observed_at_utc=observation["observed_at_utc"],
+                boundary_kind=boundary_kind,
+                boundary=boundary,
+                previous_reset=summary.get("latest_reset"),
+            )
+        summary["latest_usage"] = {
+            "used_bytes": int(observation["used_bytes"]),
+            "limit_bytes": int(observation["limit_bytes"]),
+            "observed_at_utc": observation["observed_at_utc"],
+            "event_id": event.get("event_id"),
+            "phase": observation["phase"],
+            "phase_rank": int(observation["phase_rank"]),
+            "consumer": event.get("consumer"),
+            "method": event.get("method"),
+        }
+
+    _increment(summary.setdefault("totals", {}), event)
+    for field in ("consumer", "method", "asset_class"):
+        key = str(event.get(field) or "unknown")
+        _increment(summary.setdefault(f"by_{field}", {}).setdefault(key, {}), event)
+    observed = _parse_utc(event_at) or datetime.now(UTC)
+    summary["ledger_date"] = quota_window_date(observed)
+    summary["observation_date"] = quota_window_date(observed)
+    summary["updated_at_utc"] = event_at
+    summary["recent_ledger"] = recent_ledger
+    return summary
+
+
 def record_traffic_event(event: dict[str, Any], *, root: Path | None = None) -> None:
     if root is None and "PYTEST_CURRENT_TEST" in os.environ and not os.getenv(
         "STOCKAGENT_SHIOAJI_TRAFFIC_LEDGER_ROOT"
@@ -134,7 +336,7 @@ def record_traffic_event(event: dict[str, Any], *, root: Path | None = None) -> 
     selected = Path(root) if root is not None else traffic_ledger_root()
     selected.mkdir(parents=True, exist_ok=True)
     observed = datetime.now(UTC)
-    ledger_date = quota_window_date(observed)
+    observation_date = quota_window_date(observed)
     payload = {
         "schema_version": LEDGER_SCHEMA_VERSION,
         "event_id": uuid.uuid4().hex,
@@ -142,7 +344,7 @@ def record_traffic_event(event: dict[str, Any], *, root: Path | None = None) -> 
         "pid": os.getpid(),
         **event,
     }
-    day_path = selected / "daily" / f"{ledger_date}.jsonl"
+    day_path = selected / "daily" / f"{observation_date}.jsonl"
     summary_path = selected / "summary.json"
     lock_path = selected / "ledger.lock"
     day_path.parent.mkdir(parents=True, exist_ok=True)
@@ -156,30 +358,59 @@ def record_traffic_event(event: dict[str, Any], *, root: Path | None = None) -> 
             summary = json.loads(summary_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             summary = {}
-        if summary.get("ledger_date") != ledger_date:
-            summary = {
-                "schema_version": LEDGER_SCHEMA_VERSION,
-                "ledger_date": ledger_date,
-                "totals": {},
-                "by_consumer": {},
-                "by_method": {},
-                "by_asset_class": {},
-            }
-        _increment(summary.setdefault("totals", {}), payload)
-        for field in ("consumer", "method", "asset_class"):
-            key = str(payload.get(field) or "unknown")
-            _increment(summary.setdefault(f"by_{field}", {}).setdefault(key, {}), payload)
-        after = payload.get("usage_after")
-        if isinstance(after, dict):
-            summary["latest_usage"] = {
-                **after,
-                "observed_at_utc": payload["observed_at_utc"],
-                "consumer": payload.get("consumer"),
-                "method": payload.get("method"),
-            }
-        summary["updated_at_utc"] = payload["observed_at_utc"]
-        summary["recent_ledger"] = str(day_path.relative_to(selected))
+        summary = _apply_event_to_summary(
+            summary if isinstance(summary, dict) else {},
+            payload,
+            recent_ledger=str(day_path.relative_to(selected)),
+        )
         _atomic_json(summary_path, summary)
+
+
+def rebuild_traffic_summary(*, root: Path | None = None) -> dict[str, Any]:
+    """Rebuild the current observed quota epoch from append-only raw events."""
+
+    selected = Path(root) if root is not None else traffic_ledger_root()
+    selected.mkdir(parents=True, exist_ok=True)
+    summary_path = selected / "summary.json"
+    lock_path = selected / "ledger.lock"
+    with lock_path.open("a+b") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        events: list[tuple[datetime, str, str, dict[str, Any]]] = []
+        for path in sorted((selected / "daily").glob("*.jsonl")):
+            try:
+                lines = path.read_text(encoding="utf-8").splitlines()
+            except OSError:
+                continue
+            for line in lines:
+                try:
+                    event = json.loads(line)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if not isinstance(event, dict):
+                    continue
+                observed = _parse_utc(event.get("observed_at_utc"))
+                if observed is None:
+                    continue
+                events.append(
+                    (
+                        observed,
+                        str(event.get("event_id") or ""),
+                        str(path.relative_to(selected)),
+                        event,
+                    )
+                )
+        events.sort(key=lambda item: (item[0], item[1]))
+        summary: dict[str, Any] = {}
+        for _observed, _event_id, relative_path, event in events:
+            summary = _apply_event_to_summary(
+                summary,
+                event,
+                recent_ledger=relative_path,
+            )
+        if not summary:
+            return {}
+        _atomic_json(summary_path, summary)
+    return summary
 
 
 def _best_effort_record(event: dict[str, Any]) -> None:
@@ -382,6 +613,7 @@ class StreamingLedgerRecorder:
 
 __all__ = [
     "LEDGER_SCHEMA_VERSION",
+    "rebuild_traffic_summary",
     "record_avoided_query",
     "record_streaming_observation",
     "StreamingLedgerRecorder",

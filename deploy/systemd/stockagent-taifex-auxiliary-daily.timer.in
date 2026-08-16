@@ -1,0 +1,10 @@
+[Unit]
+Description=Refresh TAIFEX options and recent tick archives after market close
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 17:00:00 Asia/Taipei
+Persistent=true
+Unit=stockagent-taifex-auxiliary-daily.service
+
+[Install]
+WantedBy=timers.target

@@ -59,7 +59,11 @@ def taifex_trading_date(value: datetime) -> date:
     local = _localize(value)
     if local.time() >= NIGHT_PREOPEN:
         return _next_weekday(local.date() + timedelta(days=1))
-    if local.time() < NIGHT_CLOSE and local.weekday() == 5:
+    # The collector intentionally remains connected for five seconds after the
+    # 05:00 night close so final exchange book messages can drain.  Those
+    # closing-grace callbacks still belong to Friday night's following trading
+    # date, not to Saturday's calendar date.
+    if local.time() <= NIGHT_CAPTURE_CLOSE and local.weekday() == 5:
         return _next_weekday(local.date())
     return local.date()
 

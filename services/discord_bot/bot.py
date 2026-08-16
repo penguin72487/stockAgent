@@ -62,7 +62,12 @@ from stockagent.live.market_config import (
     load_market_configs,
     resolved_live_output_dir,
 )
-from stockagent.live.market_status import MarketRuntimeStatus, runtime_status
+from stockagent.live.market_status import (
+    MarketRuntimeStatus,
+    is_trading_day,
+    runtime_status,
+    verified_tw_stock_session_day,
+)
 from stockagent.live.tw_day_trade_simulation import (
     EXIT_LIMIT_TIME,
     require_exact_session_eligibility,
@@ -777,7 +782,66 @@ def _scheduled_markets() -> list[str]:
     return sorted(key for key, cfg in configs.items() if _market_enabled(cfg))
 
 
+@lru_cache(maxsize=32)
+def _scheduled_calendar_root(
+    rule_data_dir: str,
+    config_path: str,
+) -> Path | None:
+    if rule_data_dir:
+        return _resolve_repo_path(rule_data_dir)
+    if not config_path:
+        return None
+    try:
+        experiment = load_config(_resolve_repo_path(config_path) or config_path)
+    except Exception:
+        return None
+    return _resolve_repo_path(experiment.data.parquet_root)
+
+
+def _scheduled_market_session_day(
+    cfg: LiveMarketConfig,
+    now: datetime,
+) -> tuple[bool, str]:
+    """Resolve the scheduled market session before any data/API work."""
+
+    market = str(getattr(cfg, "market", "") or "").lower()
+    kind = str(getattr(cfg, "market_type", "") or "").lower()
+    if not kind:
+        kind = (
+            "crypto"
+            if "crypto" in market
+            else "forex"
+            if "forex" in market or market == "fx"
+            else "us"
+            if market.startswith("us")
+            else "tw"
+            if market.startswith("tw")
+            else "generic"
+        )
+    holidays = tuple(getattr(cfg, "holidays", ()) or ())
+    if kind in {"tw", "taiwan"}:
+        calendar_root = _scheduled_calendar_root(
+            str(getattr(cfg, "day_trade_rule_data_dir", "") or ""),
+            str(getattr(cfg, "config_path", "") or ""),
+        )
+        return verified_tw_stock_session_day(
+            now.date(),
+            holidays,
+            parquet_root=calendar_root,
+        )
+    is_open = is_trading_day(kind, now.date(), holidays)
+    return (
+        is_open,
+        "calendar session"
+        if is_open
+        else f"{now.date().isoformat()} is not a {kind} trading day",
+    )
+
+
 def _scheduled_signal_key(cfg: LiveMarketConfig, now: datetime) -> str | None:
+    session_open, _session_reason = _scheduled_market_session_day(cfg, now)
+    if not session_open:
+        return None
     interval = _market_schedule_interval_minutes(cfg)
     if interval is not None:
         ready_time = now - timedelta(seconds=_market_schedule_delay_seconds(cfg))
@@ -800,8 +864,6 @@ def _scheduled_signal_key(cfg: LiveMarketConfig, now: datetime) -> str | None:
     exit_limit_minutes = EXIT_LIMIT_TIME.hour * 60 + EXIT_LIMIT_TIME.minute
     if (
         schedule_minutes is None
-        or now.weekday() >= 5
-        or now.date().isoformat() in set(cfg.holidays)
         or now_minutes < schedule_minutes
         or now_minutes >= exit_limit_minutes
     ):
@@ -864,6 +926,29 @@ def _preopen_market_ready_for_session(
     )
 
 
+def _preopen_market_final_armed_for_session(
+    cfg: LiveMarketConfig, session_date: str
+) -> bool:
+    try:
+        payload = json.loads(_preopen_readiness_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return False
+    row = (payload.get("markets") or {}).get(str(cfg.market))
+    final_arm = row.get("final_arm") if isinstance(row, dict) else None
+    if not isinstance(final_arm, dict):
+        return False
+    latency = final_arm.get("live_latency")
+    latency = latency if isinstance(latency, dict) else {}
+    return bool(
+        final_arm.get("status") == "ready"
+        and final_arm.get("run_id") == _BOT_RUN_ID
+        and _summary_date_matches(final_arm.get("completed_at"), session_date)
+        and latency.get("panel_cache_hit") is True
+        and latency.get("checkpoint_cache_hit") is True
+        and latency.get("model_cache_hit") is True
+    )
+
+
 def _preopen_prepare_key(cfg: LiveMarketConfig, now: datetime) -> str | None:
     if _market_schedule_interval_minutes(cfg) is not None:
         return None
@@ -875,10 +960,24 @@ def _preopen_prepare_key(cfg: LiveMarketConfig, now: datetime) -> str | None:
     if prepare_minutes is None or open_minutes is None:
         return None
     now_minutes = now.hour * 60 + now.minute
-    if now.weekday() >= 5 or now.date().isoformat() in set(cfg.holidays):
+    session_open, _session_reason = _scheduled_market_session_day(cfg, now)
+    if not session_open:
         return None
     session_date = now.date().isoformat()
     if prepare_minutes <= now_minutes < open_minutes:
+        final_arm_lead = max(
+            1,
+            min(
+                15,
+                _env_int("STOCKAGENT_PREOPEN_FINAL_ARM_LEAD_MINUTES", 5) or 5,
+            ),
+        )
+        if (
+            now_minutes >= open_minutes - final_arm_lead
+            and _preopen_market_ready_for_session(cfg, session_date)
+            and not _preopen_market_final_armed_for_session(cfg, session_date)
+        ):
+            return f"{session_date}:{cfg.market}:preopen-final-arm"
         return f"{session_date}:{cfg.market}:preopen"
     exit_limit_minutes = EXIT_LIMIT_TIME.hour * 60 + EXIT_LIMIT_TIME.minute
     if (
@@ -1363,9 +1462,10 @@ def _signal_kwargs(
     progress_callback: Any | None = None,
     progress_label: str | None = None,
     include_unconstrained_raw_scores: bool = False,
+    prepared_status: MarketRuntimeStatus | None = None,
 ) -> dict:
     cfg = _effective_market_config(_resolve_market(market))
-    status = _ensure_signal_ready(cfg, scheduled=scheduled)
+    status = prepared_status or _ensure_signal_ready(cfg, scheduled=scheduled)
     configured_backfill = max(0, int(getattr(cfg, "previous_signal_backfill_limit", 32)))
     backfill_limit = max(
         0,
@@ -1591,6 +1691,68 @@ def _write_preopen_readiness(
         os.replace(temporary, path)
 
 
+def _write_preopen_final_arm(
+    cfg: LiveMarketConfig,
+    *,
+    status: str,
+    started_at: str,
+    elapsed_seconds: float,
+    summary: dict[str, Any] | None = None,
+    attempts: int = 1,
+    error: str | None = None,
+) -> None:
+    path = _preopen_readiness_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _PREOPEN_READINESS_LOCK:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        markets = payload.get("markets")
+        if not isinstance(markets, dict):
+            markets = {}
+        row = markets.get(cfg.market)
+        row = dict(row) if isinstance(row, dict) else {}
+        terminal = str(status) in {"ready", "failed"}
+        completed_at = (
+            datetime.now(ZoneInfo(cfg.timezone or "Asia/Taipei")).isoformat(
+                timespec="seconds"
+            )
+            if terminal
+            else None
+        )
+        row["final_arm"] = {
+            "status": str(status),
+            "run_id": _BOT_RUN_ID,
+            "started_at": started_at,
+            "completed_at": completed_at,
+            "elapsed_seconds": round(float(elapsed_seconds), 3),
+            "attempts": max(1, int(attempts)),
+            "live_latency": (summary or {}).get("live_latency"),
+            "error": error,
+        }
+        markets[cfg.market] = row
+        payload.update(
+            {
+                "schema_version": max(3, int(payload.get("schema_version") or 0)),
+                "run_id": _BOT_RUN_ID,
+                "run_started_at": _BOT_RUN_STARTED_AT,
+                "updated_at": datetime.now().astimezone().isoformat(
+                    timespec="seconds"
+                ),
+                "markets": markets,
+            }
+        )
+        temporary = path.with_suffix(".json.tmp")
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
+
+
 def _prewarm_market_signal_sync(cfg: LiveMarketConfig) -> LiveSignalResult:
     started = time.perf_counter()
     started_at = datetime.now(
@@ -1617,6 +1779,9 @@ def _prewarm_market_signal_sync(cfg: LiveMarketConfig) -> LiveSignalResult:
         status = _runtime_status(cfg)
         if not status.data.fresh:
             _require_fresh_data_for_artifact_generation(cfg, status)
+        # Previous live-weight history is reporting state for tw_day_trade;
+        # reconcile it before the opening gate, never on the 09:00 hot path.
+        _sync_latest_live_weights_to_market_artifact(cfg)
         update_progress(3, "runtime data fresh")
         experiment = load_config(cfg.config_path)
         observed = datetime.now(ZoneInfo(cfg.timezone or "Asia/Taipei"))
@@ -1701,6 +1866,74 @@ def _prewarm_market_signal_sync(cfg: LiveMarketConfig) -> LiveSignalResult:
             step=progress_total,
             total=progress_total,
             message="failed",
+        )
+        raise
+
+
+def _final_arm_market_signal_sync(cfg: LiveMarketConfig) -> LiveSignalResult:
+    """Prove the panel/checkpoint/GPU model hot immediately before 09:00."""
+
+    timezone_name = cfg.timezone or "Asia/Taipei"
+    observed = datetime.now(ZoneInfo(timezone_name))
+    session_date = observed.date().isoformat()
+    if not _preopen_market_ready_for_session(cfg, session_date):
+        return _prewarm_market_signal_sync(cfg)
+    started = time.perf_counter()
+    started_at = observed.isoformat(timespec="seconds")
+    attempts = 0
+    try:
+        warm_shioaji_stock_quote_client()
+        _sync_latest_live_weights_to_market_artifact(cfg)
+
+        def run_once() -> LiveSignalResult:
+            nonlocal attempts
+            attempts += 1
+            kwargs = _signal_kwargs(
+                market=cfg.market,
+                price_source="panel",
+                scheduled=True,
+                progress_label=f"final-arm:{cfg.market}",
+            )
+            kwargs.update(
+                write=False,
+                ensure_previous_signal=False,
+                previous_signal_backfill_limit=0,
+            )
+            with _MODEL_INFERENCE_LOCK:
+                return generate_live_signal(**kwargs)
+
+        result = run_once()
+        latency = dict(result.summary.get("live_latency") or {})
+        cache_keys = (
+            "panel_cache_hit",
+            "checkpoint_cache_hit",
+            "model_cache_hit",
+        )
+        if not all(latency.get(key) is True for key in cache_keys):
+            # A cold first pass is allowed before the deadline; the second pass
+            # is the evidence that 09:00 will not pay that cost again.
+            result = run_once()
+            latency = dict(result.summary.get("live_latency") or {})
+        missing = [key for key in cache_keys if latency.get(key) is not True]
+        if missing:
+            raise RuntimeError(f"preopen final arm cache proof failed: {missing}")
+        _write_preopen_final_arm(
+            cfg,
+            status="ready",
+            started_at=started_at,
+            elapsed_seconds=time.perf_counter() - started,
+            summary=result.summary,
+            attempts=attempts,
+        )
+        return result
+    except Exception as exc:
+        _write_preopen_final_arm(
+            cfg,
+            status="failed",
+            started_at=started_at,
+            elapsed_seconds=time.perf_counter() - started,
+            attempts=max(1, attempts),
+            error=f"{type(exc).__name__}: {exc}",
         )
         raise
 
@@ -6803,11 +7036,18 @@ async def preopen_prepare() -> None:
         if not _scheduled_retry_allowed(bot._preopen_retry_after, key):
             continue
         try:
-            result = await asyncio.to_thread(_prewarm_market_signal_sync, cfg)
+            final_arm = key.endswith(":preopen-final-arm")
+            result = await asyncio.to_thread(
+                _final_arm_market_signal_sync
+                if final_arm
+                else _prewarm_market_signal_sync,
+                cfg,
+            )
             bot._last_preopen_prepare_keys.add(key)
             _clear_scheduled_retry(bot._preopen_retry_after, key)
             print(
-                f"[preopen] market={market} status=ready "
+                f"[preopen] market={market} "
+                f"phase={'final_arm' if final_arm else 'prepare'} status=ready "
                 f"panel={result.summary.get('panel_date')} "
                 f"latency={result.summary.get('live_latency')}",
                 flush=True,
@@ -6827,6 +7067,12 @@ async def scheduled_signal() -> None:
     for market in _scheduled_markets():
         cfg = _resolve_market(market)
         now = datetime.now(ZoneInfo(cfg.timezone or bot.tz.key))
+        session_open, _session_reason = _scheduled_market_session_day(cfg, now)
+        if not session_open:
+            # Defense in depth: no future change to schedule-key construction
+            # may reach refresh, Snapshot, inference, or simulation on a
+            # closed/unknown session.
+            continue
         key = _scheduled_signal_key(cfg, now)
         if key is None:
             continue
@@ -6867,17 +7113,17 @@ async def scheduled_signal() -> None:
                 # pre-open contract so same-session eligibility and price
                 # limits exist before recording the strategy signal.
                 await asyncio.to_thread(_prewarm_market_signal_sync, cfg)
-            resolved_price_source, _, _ = await asyncio.to_thread(
+            resolved_price_source, prepared_status, _ = await asyncio.to_thread(
                 _prepare_realtime_signal_sync,
                 cfg,
                 requested_price_source="auto",
                 force_refresh=False,
             )
-            await asyncio.to_thread(_sync_latest_live_weights_to_market_artifact, cfg)
             result = await _run_market_signal(
                 market=market,
                 scheduled=True,
                 price_source=resolved_price_source,
+                prepared_status=prepared_status,
                 progress_label=f"scheduled:{market}",
             )
             result = _enrich_signal_performance_for_discord(cfg, result, max_rows=0)
@@ -7012,6 +7258,16 @@ async def _scheduled_broadcast_channel() -> Any | None:
 @preopen_prepare.before_loop
 async def before_preopen_prepare() -> None:
     await bot.wait_until_ready()
+
+
+@scheduled_signal.before_loop
+async def before_scheduled_signal() -> None:
+    # discord.ext tasks keep the phase established by their first iteration.
+    # Align that phase to the wall-clock second so the 09:00 gate does not pay
+    # an arbitrary 0-999 ms service-start offset.
+    delay = 1.0 - (time.time() % 1.0)
+    if delay < 0.999:
+        await asyncio.sleep(delay)
 
 
 @daily_summary.before_loop

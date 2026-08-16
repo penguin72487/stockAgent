@@ -36,6 +36,16 @@ body {
   letter-spacing: .17em;
 }
 
+.public-nav nav,
+.site-header nav {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  max-width: calc(100% - 120px);
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+
 .public-nav nav a,
 .site-header nav a {
   min-height: 40px;
@@ -62,8 +72,8 @@ select:focus-visible,
 input:focus-visible,
 a:focus-visible,
 [tabindex]:focus-visible {
-  outline: 3px solid rgba(67, 215, 255, .24);
-  outline-offset: 2px;
+  outline: 3px solid var(--dashboard-cyan) !important;
+  outline-offset: 3px;
 }
 
 table,
@@ -169,7 +179,7 @@ dd,
   .site-header nav {
     width: 100%;
     max-width: none;
-    justify-content: space-between;
+    justify-content: flex-start;
     gap: 3px;
     overflow-x: auto;
   }

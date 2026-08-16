@@ -15,6 +15,7 @@ const pages = [
   ["tw-day-trade", "/tw-day-trade/"],
   ["shioaji", "/shioaji/"],
   ["openbb", "/openbb/"],
+  ["data-monitor", "/data-monitor/"],
 ];
 
 fs.mkdirSync(outputDir, {recursive: true});
@@ -80,9 +81,16 @@ const expression = `(() => {
     const rect = element.getBoundingClientRect();
     return style.display !== "none" && style.visibility !== "hidden" && rect.width > 0 && rect.height > 0;
   };
+  const insideIntentionalScroller = (element) => {
+    for (let parent = element.parentElement; parent; parent = parent.parentElement) {
+      const overflowX = getComputedStyle(parent).overflowX;
+      if (["auto", "scroll"].includes(overflowX) && parent.scrollWidth > parent.clientWidth + 1) return true;
+    }
+    return false;
+  };
   const horizontalOverflow = Math.max(0, document.documentElement.scrollWidth - document.documentElement.clientWidth);
   const offenders = [...document.querySelectorAll("body *")]
-    .filter(visible)
+    .filter((element) => visible(element) && !insideIntentionalScroller(element))
     .map((element) => ({
       tag: element.tagName.toLowerCase(),
       id: element.id || null,
@@ -121,6 +129,39 @@ const expression = `(() => {
     || (element.id && document.querySelector('label[for="' + CSS.escape(element.id) + '"]'))
     || element.closest("label")
   )).map((element) => ({tag: element.tagName.toLowerCase(), id: element.id || null}));
+  const idCounts = new Map();
+  for (const element of document.querySelectorAll("[id]")) {
+    idCounts.set(element.id, (idCounts.get(element.id) || 0) + 1);
+  }
+  const duplicateIds = [...idCounts.entries()]
+    .filter(([, count]) => count > 1)
+    .map(([id, count]) => ({id, count}));
+  const globalNavigation = document.querySelector("header nav[aria-label*='公開面板']");
+  const unlabeledFields = [...document.querySelectorAll("input,select,textarea")]
+    .filter(visible)
+    .filter((element) => !(
+      element.getAttribute("aria-label")
+      || element.closest("label")
+      || (element.id && document.querySelector('label[for="' + CSS.escape(element.id) + '"]'))
+    ))
+    .map((element) => ({tag: element.tagName.toLowerCase(), id: element.id || null}));
+  const inaccessibleTableRegions = [...document.querySelectorAll("table")]
+    .filter(visible)
+    .filter((table) => {
+      const region = table.closest(".table-scroll,.table-wrap");
+      return region && (region.tabIndex < 0 || region.getAttribute("role") !== "region");
+    })
+    .map((table) => table.id || table.className || "unnamed-table");
+  const tinyText = [...document.querySelectorAll("body *")]
+    .filter(visible)
+    .filter((element) => element.children.length === 0 && element.textContent.trim())
+    .map((element) => ({
+      tag: element.tagName.toLowerCase(),
+      text: element.textContent.trim().slice(0, 50),
+      size: Number.parseFloat(getComputedStyle(element).fontSize),
+    }))
+    .filter((row) => Number.isFinite(row.size) && row.size < 10)
+    .slice(0, 20);
   return {
     title: document.title,
     url: location.href,
@@ -133,6 +174,15 @@ const expression = `(() => {
     interactiveCount: interactive.length,
     smallTargets,
     unnamedTargets,
+    lang: document.documentElement.lang,
+    mainCount: document.querySelectorAll("main").length,
+    h1Count: document.querySelectorAll("h1").length,
+    duplicateIds,
+    globalNavLinkCount: globalNavigation?.querySelectorAll("a").length || 0,
+    currentPageLinkCount: globalNavigation?.querySelectorAll('[aria-current="page"]').length || 0,
+    unlabeledFields,
+    inaccessibleTableRegions,
+    tinyText,
     domContentLoadedMs: navigation ? Math.round(navigation.domContentLoadedEventEnd) : null,
     loadMs: navigation ? Math.round(navigation.loadEventEnd) : null,
     resourceTransferBytes: resources.reduce((sum, row) => sum + Number(row.transferSize || 0), 0),
@@ -149,6 +199,7 @@ for (const [name, suffix] of pages) {
   await send("Runtime.enable");
   await send("Log.enable");
   await send("Network.enable");
+  await send("Network.setCacheDisabled", {cacheDisabled: true});
   await send("Emulation.setDeviceMetricsOverride", {
     width,
     height,

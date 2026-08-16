@@ -1,6 +1,7 @@
 "use strict";
 
 const REFRESH_MS = 60000;
+const FETCH_TIMEOUT_MS = 15000;
 const SVG_NS = "http://www.w3.org/2000/svg";
 const TIME_RANGES = {"1h": 3600e3, "1d": 86400e3, "1w": 7 * 86400e3, "1mo": 30 * 86400e3, "1q": 90 * 86400e3, "1y": 365 * 86400e3, all: Infinity};
 const TIME_RANGE_LABELS = {"1h": "1 小時", "1d": "1 天", "1w": "1 週", "1mo": "1 月", "1q": "1 季", "1y": "1 年", all: "全部"};
@@ -16,6 +17,16 @@ let latestTrafficHistory = [];
 let latestTrafficGuard = 0.9;
 let latestStorageGrowth = [];
 let hiddenTrafficSeries = new Set();
+
+async function fetchWithTimeout(path, options = {}) {
+  const controller = new AbortController();
+  const timer = window.setTimeout(
+    () => controller.abort(new DOMException("Request timed out", "TimeoutError")),
+    FETCH_TIMEOUT_MS,
+  );
+  try { return await fetch(path, {...options, signal: controller.signal}); }
+  finally { window.clearTimeout(timer); }
+}
 
 try {
   trafficTimeRange = localStorage.getItem("shioaji-traffic-time-range") || "1d";
@@ -68,6 +79,59 @@ function ageLabel(value) {
   if (seconds < 60) return `${Math.max(0, Math.round(seconds))} 秒前`;
   if (seconds < 3600) return `${Math.round(seconds / 60)} 分鐘前`;
   return `${Math.round(seconds / 3600)} 小時前`;
+}
+
+function durationLabel(value) {
+  const seconds = Number(value);
+  if (!Number.isFinite(seconds) || seconds < 0) return "—";
+  if (seconds < 60) return `${Math.max(0, Math.ceil(seconds))} 秒`;
+  if (seconds < 3600) return `${Math.ceil(seconds / 60)} 分鐘`;
+  if (seconds < 86400) {
+    const hours = Math.floor(seconds / 3600);
+    const minutes = Math.ceil((seconds % 3600) / 60);
+    return minutes > 0 ? `${hours} 小時 ${minutes} 分鐘` : `${hours} 小時`;
+  }
+  if (seconds < 365 * 86400) {
+    const days = Math.floor(seconds / 86400);
+    const hours = Math.round((seconds % 86400) / 3600);
+    return hours > 0 ? `${days} 天 ${hours} 小時` : `${days} 天`;
+  }
+  const years = Math.floor(seconds / (365 * 86400));
+  const months = Math.round((seconds % (365 * 86400)) / (30.4375 * 86400));
+  return months > 0 ? `${years} 年 ${months} 個月` : `${years} 年`;
+}
+
+function etaPresentation(eta) {
+  const item = eta && typeof eta === "object" ? eta : {};
+  const confidence = ({high: "高信心", medium: "中信心", low: "低信心", none: "無樣本"})[item.confidence] || "";
+  const state = String(item.state || "unknown");
+  const duration = durationLabel(item.remaining_seconds);
+  const staticValues = {
+    complete: "已完成",
+    up_to_date: "目前已更新",
+    continuous: "持續擷取",
+    on_demand: "按需執行",
+    waiting_upstream: "等待上游",
+    unknown: "尚無法估算",
+  };
+  let value = staticValues[state] || (duration === "—" ? "尚無法估算" : `約 ${duration}`);
+  if (state === "paused" && duration !== "—") value = `約 ${duration}（執行時間）`;
+
+  const details = [];
+  if (item.estimated_complete_at_utc) {
+    const prefix = item.assumption ? "情境完成" : "預計完成";
+    details.push(`${prefix} ${localTime(item.estimated_complete_at_utc, {year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit"})}`);
+  } else if (state === "paused" && duration !== "—") {
+    details.push("恢復執行後開始計時，暫無固定完成日期");
+  }
+  if (Number.isFinite(Number(item.processing_seconds)) && Number(item.processing_seconds) >= 0 && item.assumption) {
+    details.push(`純下載約 ${durationLabel(item.processing_seconds)}`);
+  }
+  if (Number.isFinite(Number(item.quota_windows_remaining)) && Number(item.quota_windows_remaining) > 0) {
+    details.push(`約 ${number(item.quota_windows_remaining)} 個同等額度窗口`);
+  }
+  if (confidence) details.push(confidence);
+  return {state, value, detail: details.join(" · ") || "—", basis: item.basis || "尚無估算依據"};
 }
 
 function localTime(value, options = {}) {
@@ -164,6 +228,16 @@ function pipelineCard(item) {
     article.append(coverage);
   }
 
+  const etaView = etaPresentation(item.eta);
+  const eta = node("div", `pipeline-eta eta-${etaView.state}`);
+  eta.append(
+    node("span", "eta-label", "預計還要"),
+    node("strong", "eta-value", etaView.value),
+    node("small", "eta-detail", etaView.detail),
+    node("small", "eta-basis", etaView.basis),
+  );
+  article.append(eta);
+
   const metrics = node("dl", "pipeline-metrics");
   (Array.isArray(item.metrics) ? item.metrics : []).forEach((metric) => {
     const row = node("div");
@@ -201,7 +275,7 @@ function renderPipelines(pipelines) {
   $("pipeline-empty").hidden = visible.length > 0;
 }
 
-function updatePipelineAges(pipelines) {
+function updatePipelineDynamics(pipelines) {
   const byId = new Map((Array.isArray(pipelines) ? pipelines : []).map((item) => [String(item.id || ""), item]));
   document.querySelectorAll(".pipeline-card[data-pipeline-id]").forEach((card) => {
     const item = byId.get(card.dataset.pipelineId || "");
@@ -209,6 +283,16 @@ function updatePipelineAges(pipelines) {
     if (!item || !target) return;
     const serviceText = item.service ? (item.service.active ? "服務運行" : item.service.state === "manual" ? "手動執行" : item.service.state === "unavailable" ? "無獨立服務" : "服務停止") : "資料產物";
     target.textContent = `${serviceText} · 更新 ${ageLabel(item.latest_age_seconds)}`;
+    const etaView = etaPresentation(item.eta);
+    const etaNode = card.querySelector(".pipeline-eta");
+    if (!etaNode) return;
+    etaNode.className = `pipeline-eta eta-${etaView.state}`;
+    const valueNode = etaNode.querySelector(".eta-value");
+    const detailNode = etaNode.querySelector(".eta-detail");
+    const basisNode = etaNode.querySelector(".eta-basis");
+    if (valueNode) valueNode.textContent = etaView.value;
+    if (detailNode) detailNode.textContent = etaView.detail;
+    if (basisNode) basisNode.textContent = etaView.basis;
   });
 }
 
@@ -530,6 +614,10 @@ function render(data) {
     (data.pipelines || []).map((item) => [
       item.id, item.status, item.status_label, item.detail, item.coverage,
       item.latest_at_utc, item.fields, item.metrics, item.warnings, item.service,
+      item.eta ? [item.eta.state, item.eta.remaining_seconds, item.eta.confidence,
+        item.eta.basis, item.eta.processing_seconds, item.eta.sample_units,
+        item.eta.sample_seconds, item.eta.units_per_hour,
+        item.eta.quota_windows_remaining, item.eta.assumption] : null,
     ]),
     data.traffic?.history,
     data.traffic_ledger,
@@ -553,7 +641,7 @@ function render(data) {
   setText("pipeline-ready", number(summary.ready));
   setText("pipeline-attention", number(summary.attention));
   if (renderHeavy) renderPipelines(data.pipelines);
-  else updatePipelineAges(data.pipelines);
+  else updatePipelineDynamics(data.pipelines);
 
   const traffic = data.traffic || {};
   setText("traffic-used", `${bytes(traffic.used_bytes)} / ${bytes(traffic.limit_bytes)}`);
@@ -580,6 +668,9 @@ function render(data) {
   const ratio = Number(backfill.progress_ratio) || 0;
   setText("fleet-progress-label", percent(ratio, 2));
   setText("fleet-progress-detail", `${number(backfill.resolved_contract_dates)} / ${number(backfill.expected_contract_dates)} 個合約交易日已有 receipt`);
+  const fleetEta = etaPresentation(backfill.eta);
+  setText("fleet-eta-label", fleetEta.value);
+  setText("fleet-eta-detail", `${fleetEta.detail} · ${fleetEta.basis}`);
   $("fleet-progress-bar").value = Math.max(0, Math.min(100, ratio * 100));
   setText("contracts-complete", `${number(backfill.completed_contracts)} / ${number(backfill.inventory_contracts)}`);
   setText("contracts-started", `${number(backfill.started_contracts)} 個合約已開始`);
@@ -608,7 +699,7 @@ async function refresh() {
   if (document.hidden || refreshInFlight) return;
   refreshInFlight = true;
   try {
-    const response = await fetch("api/status", {cache: "no-store"});
+    const response = await fetchWithTimeout("api/status", {cache: "no-store"});
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     render(await response.json());
   } catch (_error) {

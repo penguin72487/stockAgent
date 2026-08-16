@@ -30,7 +30,7 @@ _ALERT_MESSAGES = {
     "disk_space_low": "可用磁碟空間低於安全門檻，封存程序會停止以保護資料。",
     "downloader_inactive": "下載程序目前未執行。",
     "endpoints_without_accepted_data": "仍有端點尚未產生成功資料或權威空結果。",
-    "high_attempt_tasks": "部分任務重試次數偏高，仍會保留在可排程集合。",
+    "high_attempt_tasks": "部分任務曾重試過多；具期限者已隔離，期限到達後才會重新排程。",
     "non_authoritative_terminal_unavailable": "部分終止任務缺少足夠證據，不能計為完整封存。",
     "permanent_provider_outcomes": "部分供應商回應被分類為永久結果，需要持續稽核。",
     "provider_progress_stalled": "仍有待辦的供應商近期沒有新增已接受任務。",
@@ -183,20 +183,23 @@ def _category_rows(snapshot: Mapping[str, Any]) -> list[dict[str, Any]]:
         category = _name(raw.get("category"))
         if category is None:
             continue
+        total_tasks = _integer(raw.get("total_tasks"))
+        accepted_tasks = _integer(raw.get("accepted_tasks"))
         result.append(
             {
                 "category": category,
                 "completion_percent": round(
                     _finite(raw.get("completion_percent"), 0.0) or 0.0, 6
                 ),
-                "accepted_tasks": _integer(raw.get("accepted_tasks")),
-                "total_tasks": _integer(raw.get("total_tasks")),
+                "accepted_tasks": accepted_tasks,
+                "total_tasks": total_tasks,
+                "missing_tasks": max(0, total_tasks - accepted_tasks),
                 "unresolved_tasks": _integer(raw.get("unresolved_tasks")),
                 "unavailable_tasks": _integer(raw.get("unavailable_tasks")),
                 "success_rows": _integer(raw.get("success_rows")),
             }
         )
-    return sorted(result, key=lambda row: (-row["unresolved_tasks"], row["category"]))
+    return sorted(result, key=lambda row: (-row["missing_tasks"], row["category"]))
 
 
 def _provider_rows(
@@ -388,6 +391,12 @@ def build_openbb_public_status(
     except OSError:
         pass
     min_free = _integer(snapshot.get("min_free_bytes"), 100 * 1024**3)
+    retry_deferred = _integer(snapshot.get("pending_retry_deferred"))
+    next_task_retry_at = snapshot.get("next_task_retry_at")
+    if scheduler_current and "retry_deferred_total" in scheduler:
+        retry_deferred = _integer(scheduler.get("retry_deferred_total"))
+        next_task_retry_at = scheduler.get("next_task_retry_at")
+    parsed_retry_at = _datetime(next_task_retry_at)
 
     return {
         "schema_version": OPENBB_PUBLIC_SCHEMA_VERSION,
@@ -437,6 +446,10 @@ def build_openbb_public_status(
                 snapshot.get("actionable_unresolved_tasks")
             ),
             "retryable_tasks": _integer(snapshot.get("retryable_tasks")),
+            "retry_deferred_tasks": retry_deferred,
+            "next_task_retry_at": (
+                parsed_retry_at.isoformat() if parsed_retry_at is not None else None
+            ),
             "unavailable_tasks": _integer(snapshot.get("unavailable_tasks")),
             "success_rows": _integer(snapshot.get("success_rows")),
             "endpoint_count": _integer(snapshot.get("endpoint_count")),

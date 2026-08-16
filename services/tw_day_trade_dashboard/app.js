@@ -1,6 +1,7 @@
 "use strict";
 
 const PRICE_REFRESH_MS = 60000;
+const FETCH_TIMEOUT_MS = 15000;
 const SIGNAL_PAGE_SIZE = 250;
 const POSITION_PAGE_SIZE = 250;
 const EVENT_PAGE_SIZE = 250;
@@ -56,6 +57,22 @@ try {
 if (!(chartRange in TIME_RANGE_LABELS)) chartRange = "1d";
 
 const $ = (id) => document.getElementById(id);
+async function fetchWithTimeout(path, options = {}) {
+  const controller = new AbortController();
+  const upstream = options.signal;
+  const forwardAbort = () => controller.abort(upstream?.reason);
+  if (upstream?.aborted) forwardAbort();
+  else upstream?.addEventListener("abort", forwardAbort, {once: true});
+  const timer = window.setTimeout(
+    () => controller.abort(new DOMException("Request timed out", "TimeoutError")),
+    FETCH_TIMEOUT_MS,
+  );
+  try { return await fetch(path, {...options, signal: controller.signal}); }
+  finally {
+    window.clearTimeout(timer);
+    upstream?.removeEventListener("abort", forwardAbort);
+  }
+}
 const esc = (value) => String(value ?? "—").replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"})[c]);
 const number = (value, digits = 0) => {
   if (value == null || !Number.isFinite(Number(value))) return "—";
@@ -171,6 +188,10 @@ function engineStatusShortLabel(value) {
     flat_directional_mix_unexecutable: "雙向整張不足・保持空倉",
     flat_no_executable_signal: "該日無可執行訊號",
     session_flat_after_exit: "該日已平倉",
+    historical_session_complete: "歷史交易日已完成",
+    historical_session_closed_with_residual: "歷史交易日有殘餘紀錄",
+    historical_session_missed: "歷史交易日執行缺漏",
+    historical_signal_blocked: "歷史訊號已安全阻擋",
   };
   return labels[value] || engineStatusLabel(value);
 }
@@ -423,8 +444,11 @@ function renderOperations(data) {
   const phaseKind = ["active", "preopen"].includes(session.phase) ? "good" : session.phase === "force_exit" ? "bad" : "warn";
   const latency = data.today_latency || data.latency || {};
   const latencyStageLabels = {
+    signal_pre_quote_prepare_ms: "訊號盤前骨架",
     signal_quote_fetch_ms: "訊號行情",
+    signal_pre_inference_prepare_ms: "推論輸入準備",
     model_inference_ms: "模型推論",
+    signal_post_inference_format_ms: "推論後格式化",
     signal_other_compute_ms: "其他訊號計算",
     artifact_publish_ms: "原子發布",
     artifact_discovery_ms: "消費端發現",
@@ -453,7 +477,7 @@ function renderOperations(data) {
 
   const workflowRows = [
     {label:"四模式預熱", value:warmRatio, count:`${number(warm.completed_count || 0)} / ${number(totalModes)} · ${number(warmRatio * 100, 1)}%`, note:`牆鐘 ${duration(warm.wall_elapsed_seconds)} · ${warm.modes_per_minute == null ? "—" : `${sourceNumber(warm.modes_per_minute)} 模式/分`}`, kind:warmKind},
-    {label:"所選日策略執行", value:session.signal_progress_ratio, count:`${number(session.signal_completed_modes || 0)} / ${number(session.mode_count || 0)}`, note:"最新訊號指標每 0.1 秒檢查；阻擋不算執行完成", kind:"good"},
+    {label:"所選日策略執行", value:session.signal_progress_ratio, count:`${number(session.signal_completed_modes || 0)} / ${number(session.mode_count || 0)}`, note:"原子指標由 inotify 事件即時喚醒；0.1 秒只作備援，阻擋不算完成", kind:"good"},
     {label:"進場處理終態", value:session.entry_progress_ratio, count:`${number(session.entry_completed_modes || 0)} / ${number(session.mode_count || 0)}`, note:"完成後可能有成交或依真實限制保持空倉", kind:"good"},
     {label:"每分鐘權益紀錄", value:session.mark_progress_ratio, count:`${number(session.observed_mode_minutes || 0)} / ${number(session.expected_mode_minutes || 0)}`, note:`目前 ${sourceNumber(session.mark_rows_per_minute || 0)} 模式紀錄/分`, kind:""},
     {label:"13:20/13:24/13:25 退出", value:session.exit_progress_ratio, count:`${number(session.exit_started_modes || 0)} / ${number(session.mode_count || 0)}`, note:"先限價、再市價重試；殘餘於 13:25 以漲跌停價參與收盤集合競價", kind:"warn"},
@@ -475,7 +499,12 @@ function renderOperations(data) {
     const inference = row.model_inference_ms == null ? "—" : `${duration(Number(row.model_inference_ms) / 1000)} 模型`;
     const limits = row.price_limit_requested ? `${number(row.price_limit_prepared)}/${number(row.price_limit_requested)} 漲跌停` : "漲跌停待準備";
     const eligibility = row.eligibility_ready ? `${row.eligibility_target_date || data.session_date || "所選日"} TWSE/TPEx 資格 READY` : "所選日資格待確認";
-    const detail = row.error || row.message || `${duration(row.elapsed_seconds)} · ${speed} · ${inference} · ${limits} · ${eligibility}${eta == null ? "" : ` · ETA ${duration(eta)}`}`;
+    const armed = row.final_arm_status === "ready" && row.final_arm_panel_cache_hit === true && row.final_arm_checkpoint_cache_hit === true && row.final_arm_model_cache_hit === true;
+    const armText = armed
+      ? `09:00 HOT READY ${shortTime(row.final_arm_completed_at)} · ${duration(row.final_arm_elapsed_seconds)} · ${number(row.final_arm_attempts || 1)} 次驗證`
+      : row.final_arm_error || "08:55 最後武裝待驗證";
+    const measuredDetail = `${duration(row.elapsed_seconds)} · ${speed} · ${inference} · ${limits} · ${eligibility} · ${armText}${eta == null ? "" : ` · ETA ${duration(eta)}`}`;
+    const detail = row.error || (status === "running" && row.message) || measuredDetail;
     return `<div class="progress-row">
       <div class="progress-title"><strong>${esc(row.label || row.market)}</strong>${badge(stepText, kind)}</div>
       ${progress(row.progress_ratio, kind)}
@@ -596,7 +625,7 @@ async function loadChartHistory({preferCache = false} = {}) {
   if (historyInFlight) return;
   historyInFlight = true;
   try {
-    const response = await fetch(`api/history?range=${encodeURIComponent(requestedRange)}`, {cache:"default"});
+    const response = await fetchWithTimeout(`api/history?range=${encodeURIComponent(requestedRange)}`, {cache:"default"});
     if (response.status === 429) {
       const retrySeconds = Math.min(30, Math.max(1, Number(response.headers.get("Retry-After")) || 5));
       $("equity-range-note").textContent = `${TIME_RANGE_LABELS[requestedRange]}歷史請求稍多，保留目前曲線並於 ${number(retrySeconds)} 秒後自動重試。`;
@@ -783,7 +812,7 @@ async function loadSignals({append = false} = {}) {
   signalLoading = true;
   renderSignals();
   try {
-    const response = await fetch(`api/signals?${params.toString()}`, {cache: "no-store", signal: controller.signal});
+    const response = await fetchWithTimeout(`api/signals?${params.toString()}`, {cache: "no-store", signal: controller.signal});
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const page = await response.json();
     if (sequence !== signalRequestSequence) return;
@@ -827,7 +856,7 @@ async function loadEvents({append = false} = {}) {
   eventLoading = true;
   renderEvents();
   try {
-    const response = await fetch(`api/events?${params.toString()}`, {cache: "no-store", signal: controller.signal});
+    const response = await fetchWithTimeout(`api/events?${params.toString()}`, {cache: "no-store", signal: controller.signal});
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const page = await response.json();
     if (sequence !== eventRequestSequence) return;
@@ -866,7 +895,7 @@ async function refresh() {
   try {
     const started = performance.now();
     const date = selectedDate();
-    const response = await fetch(`api/status${date ? `?date=${encodeURIComponent(date)}` : ""}`, {cache: "no-store"});
+    const response = await fetchWithTimeout(`api/status${date ? `?date=${encodeURIComponent(date)}` : ""}`, {cache: "no-store"});
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     snapshot = await response.json();
     lastFetchMs = performance.now() - started;

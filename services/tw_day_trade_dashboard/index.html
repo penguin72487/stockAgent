@@ -6,8 +6,8 @@
   <meta name="color-scheme" content="dark">
   <meta name="theme-color" content="#071019">
   <title>台股四模式當沖模擬</title>
-  <link rel="stylesheet" href="styles.css?v=12">
-  <link rel="stylesheet" href="../dashboard-core.css?v=4">
+  <link rel="stylesheet" href="styles.css?v=15">
+  <link rel="stylesheet" href="../dashboard-core.css?v=5">
 </head>
 <body>
   <a class="skip-link" href="#main-content">跳到主要內容</a>
@@ -19,6 +19,7 @@
       <a class="active" href="./" aria-current="page">台股當沖</a>
       <a href="../shioaji/">永豐 API</a>
       <a href="../openbb/">OpenBB</a>
+      <a href="../data-monitor/">全資料</a>
     </nav>
   </header>
 
@@ -159,7 +160,7 @@
     <section class="grid-two compact">
       <article class="panel table-panel">
         <div class="panel-head"><div><h2>委託與成交事件</h2><p>伺服器分頁呈現所選交易日的全部模擬委託、成交、撤單替換與 OCO 原因</p></div><div class="table-actions"><span id="event-count" class="count"></span><button id="load-more-events" class="secondary hidden" type="button">載入更多</button></div></div>
-        <div class="table-scroll short"><table><thead><tr><th>時間</th><th>模式／股票</th><th>目的</th><th>類型</th><th>價量</th><th>狀態</th></tr></thead><tbody id="event-body"></tbody></table></div>
+        <div class="table-scroll short" tabindex="0" role="region" aria-label="模擬委託與成交事件，可用方向鍵水平捲動"><table><thead><tr><th>時間</th><th>模式／股票</th><th>目的</th><th>類型</th><th>價量</th><th>狀態</th></tr></thead><tbody id="event-body"></tbody></table></div>
       </article>
       <article class="panel">
         <div class="panel-head"><div><h2>稽核與就緒狀態</h2><p>checkpoint、資料日期、事件筆數與關鍵失敗會留在這裡</p></div></div>
@@ -168,6 +169,6 @@
     </section>
   </main>
   <script src="../time-axis.js?v=3" defer></script>
-  <script src="app.js?v=22" defer></script>
+  <script src="app.js?v=24" defer></script>
 </body>
 </html>

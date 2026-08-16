@@ -52,9 +52,14 @@ SHIOAJI_FUTURES_ROOTS: Final[dict[str, str]] = {
 
 TAIFEX_DAY_SESSION_LABEL: Final[str] = "一般"
 TAIFEX_FUTURES_DATA_CONTRACT_VERSION: Final[int] = 2
+TAIFEX_ALL_FUTURES_DAILY_CONTRACT_VERSION: Final[int] = 1
 _MONTHLY_CONTRACT_RE = re.compile(r"^[0-9]{6}$")
+_WEEKLY_CONTRACT_RE = re.compile(r"^[0-9]{6}W[1-5]$")
 _DAY_SESSION_ALIASES: Final[frozenset[str]] = frozenset(
     {"一般", "一般交易時段", "day", "day_session", "regular"}
+)
+_AFTER_HOURS_SESSION_ALIASES: Final[frozenset[str]] = frozenset(
+    {"盤後", "盤後交易時段", "after_hours", "night", "night_session"}
 )
 TAIFEX_DAY_SESSION_ALIASES: Final[frozenset[str]] = _DAY_SESSION_ALIASES
 _REQUIRED_SOURCE_COLUMNS: Final[tuple[str, ...]] = (
@@ -870,8 +875,272 @@ def parse_taifex_trading_date(value: object) -> np.datetime64 | None:
     return _parse_trading_date(value)
 
 
+def _parse_optional_finite_number(value: object) -> float | None:
+    text = str(value or "").strip().replace(",", "")
+    if text in {"", "-", "--"}:
+        return None
+    try:
+        parsed = float(text)
+    except ValueError:
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
+def _parse_optional_nonnegative_count(value: object) -> int | None:
+    parsed = _parse_optional_finite_number(value)
+    if parsed is None or parsed < 0.0 or not float(parsed).is_integer():
+        return None
+    return int(parsed)
+
+
+def _taifex_futures_series_type(contract: str) -> str:
+    if _MONTHLY_CONTRACT_RE.fullmatch(contract) is not None:
+        return "monthly"
+    if _WEEKLY_CONTRACT_RE.fullmatch(contract) is not None:
+        return "weekly"
+    if "/" in contract:
+        return "calendar_spread"
+    return "other"
+
+
+def _taifex_futures_session(
+    raw_session: object,
+    *,
+    source_has_session: bool,
+    source_name: str,
+) -> tuple[str, bool]:
+    if not source_has_session:
+        return TAIFEX_DAY_SESSION_LABEL, False
+    normalized = str(raw_session or "").strip().casefold()
+    if normalized in _DAY_SESSION_ALIASES:
+        return TAIFEX_DAY_SESSION_LABEL, True
+    if normalized in _AFTER_HOURS_SESSION_ALIASES:
+        return "盤後", True
+    raise ValueError(
+        f"{source_name} contains unsupported futures session {raw_session!r}"
+    )
+
+
+def build_taifex_all_futures_daily_sessions(
+    source_paths: Iterable[str | Path],
+    output_path: str | Path,
+    *,
+    batch_rows: int = 100_000,
+) -> Path:
+    """Build all official TAIFEX futures trade bars without Shioaji traffic.
+
+    The output keeps every historical product and every outright monthly or
+    weekly contract with a real OHLCV bar.  Calendar-spread order instruments
+    are excluded because they are not individual futures contracts and the
+    legacy source can contain multiple bars for one spread label.  Day and
+    after-hours rows remain separate because the legacy archive has no after-
+    hours field and silently combining the two would change the trading-date
+    clock.  Pre-2017 rows are explicitly marked ``session_reported=False`` and
+    treated as day-session observations, matching the source schema available
+    at that time.
+    """
+
+    if batch_rows < 1:
+        raise ValueError("batch_rows must be positive")
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    schema = pa.schema(
+        [
+            pa.field("date", pa.date32(), nullable=False),
+            pa.field("product", pa.string(), nullable=False),
+            pa.field("contract", pa.string(), nullable=False),
+            pa.field("series_type", pa.string(), nullable=False),
+            pa.field("session", pa.string(), nullable=False),
+            pa.field("session_reported", pa.bool_(), nullable=False),
+            pa.field("open", pa.float64(), nullable=False),
+            pa.field("high", pa.float64(), nullable=False),
+            pa.field("low", pa.float64(), nullable=False),
+            pa.field("close", pa.float64(), nullable=False),
+            pa.field("volume", pa.int64(), nullable=False),
+            pa.field("settlement", pa.float64()),
+            pa.field("open_interest", pa.int64()),
+            pa.field("last_bid", pa.float64()),
+            pa.field("last_ask", pa.float64()),
+            pa.field("historical_high", pa.float64()),
+            pa.field("historical_low", pa.float64()),
+            pa.field("suspension_status", pa.string()),
+            pa.field("spread_order_volume", pa.int64()),
+            pa.field("source_file", pa.string(), nullable=False),
+            pa.field("source_sha256", pa.string(), nullable=False),
+        ],
+        metadata={
+            b"stockagent.dataset": b"taifex_all_futures_daily_sessions",
+            b"stockagent.contract_version": str(
+                TAIFEX_ALL_FUTURES_DAILY_CONTRACT_VERSION
+            ).encode("ascii"),
+            b"stockagent.session_policy": b"source_sessions_separate",
+            b"stockagent.legacy_session_policy": b"day_only_unreported",
+            b"stockagent.instrument_scope": b"outright_no_calendar_spreads",
+        },
+    )
+    target = Path(output_path).expanduser().resolve()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_suffix(target.suffix + ".tmp")
+    if temporary.exists():
+        temporary.unlink()
+
+    writer: pq.ParquetWriter | None = None
+    pending: list[dict[str, object]] = []
+    seen_keys: set[tuple[np.datetime64, str, str, str]] = set()
+    rows_written = 0
+
+    def flush() -> None:
+        nonlocal pending, rows_written, writer
+        if not pending:
+            return
+        if writer is None:
+            writer = pq.ParquetWriter(
+                temporary,
+                schema,
+                compression="zstd",
+                use_dictionary=True,
+            )
+        table = pa.Table.from_pylist(pending, schema=schema)
+        writer.write_table(table)
+        rows_written += len(pending)
+        pending = []
+
+    try:
+        for raw_path in source_paths:
+            path = Path(raw_path).expanduser().resolve()
+            if not path.is_file():
+                raise FileNotFoundError(f"TAIFEX source does not exist: {path}")
+            for stream, source_name, source_sha256 in _decoded_csv_stream(path):
+                reader = csv.DictReader(stream)
+                if reader.fieldnames is None:
+                    raise ValueError(f"{source_name} has no CSV header")
+                reader.fieldnames = [
+                    str(name or "").lstrip("\ufeff").strip()
+                    for name in reader.fieldnames
+                ]
+                missing = sorted(
+                    set(_REQUIRED_SOURCE_COLUMNS) - set(reader.fieldnames)
+                )
+                if missing:
+                    raise ValueError(
+                        f"{source_name} is missing TAIFEX columns: {missing}"
+                    )
+                has_session = "交易時段" in reader.fieldnames
+                for raw in reader:
+                    product = str(raw.get("契約") or "").strip().upper()
+                    contract = str(raw.get("到期月份(週別)") or "").strip()
+                    if not product or not contract:
+                        continue
+                    date_value = _parse_trading_date(raw.get("交易日期"))
+                    if date_value is None:
+                        continue
+                    session, session_reported = _taifex_futures_session(
+                        raw.get("交易時段"),
+                        source_has_session=has_session,
+                        source_name=source_name,
+                    )
+                    series_type = _taifex_futures_series_type(contract)
+                    if series_type == "calendar_spread":
+                        continue
+                    prices = tuple(
+                        _parse_optional_finite_number(raw.get(column))
+                        for column in ("開盤價", "最高價", "最低價", "收盤價")
+                    )
+                    volume = _parse_optional_nonnegative_count(raw.get("成交量"))
+                    if any(value is None for value in prices) or not volume:
+                        continue
+                    open_price, high_price, low_price, close_price = (
+                        float(value) for value in prices if value is not None
+                    )
+                    if not all(
+                        value > 0.0
+                        for value in (open_price, high_price, low_price, close_price)
+                    ):
+                        continue
+                    if high_price < max(open_price, close_price, low_price):
+                        raise ValueError(
+                            f"{source_name} has invalid high for "
+                            f"{date_value}/{product}/{contract}/{session}"
+                        )
+                    if low_price > min(open_price, close_price, high_price):
+                        raise ValueError(
+                            f"{source_name} has invalid low for "
+                            f"{date_value}/{product}/{contract}/{session}"
+                        )
+                    key = (date_value, product, contract, session)
+                    if key in seen_keys:
+                        raise ValueError(
+                            "duplicate TAIFEX futures daily bar for "
+                            f"{date_value}/{product}/{contract}/{session}"
+                        )
+                    seen_keys.add(key)
+                    suspension = str(
+                        raw.get("是否因訊息面暫停交易") or ""
+                    ).strip()
+                    pending.append(
+                        {
+                            "date": date.fromisoformat(str(date_value)),
+                            "product": product,
+                            "contract": contract,
+                            "series_type": series_type,
+                            "session": session,
+                            "session_reported": session_reported,
+                            "open": open_price,
+                            "high": high_price,
+                            "low": low_price,
+                            "close": close_price,
+                            "volume": int(volume),
+                            "settlement": _parse_optional_finite_number(
+                                raw.get("結算價")
+                            ),
+                            "open_interest": _parse_optional_nonnegative_count(
+                                raw.get("未沖銷契約數")
+                            ),
+                            "last_bid": _parse_optional_finite_number(
+                                raw.get("最後最佳買價")
+                            ),
+                            "last_ask": _parse_optional_finite_number(
+                                raw.get("最後最佳賣價")
+                            ),
+                            "historical_high": _parse_optional_finite_number(
+                                raw.get("歷史最高價")
+                            ),
+                            "historical_low": _parse_optional_finite_number(
+                                raw.get("歷史最低價")
+                            ),
+                            "suspension_status": suspension or None,
+                            "spread_order_volume": (
+                                _parse_optional_nonnegative_count(
+                                    raw.get("價差對單式委託成交量")
+                                )
+                            ),
+                            "source_file": source_name,
+                            "source_sha256": source_sha256,
+                        }
+                    )
+                    if len(pending) >= batch_rows:
+                        flush()
+        flush()
+        if writer is None or rows_written == 0:
+            raise ValueError("no usable TAIFEX futures daily bars were found")
+        writer.close()
+        writer = None
+
+        temporary.replace(target)
+        return target
+    except Exception:
+        if writer is not None:
+            writer.close()
+        if temporary.exists():
+            temporary.unlink()
+        raise
+
+
 __all__ = [
     "SHIOAJI_FUTURES_ROOTS",
+    "TAIFEX_ALL_FUTURES_DAILY_CONTRACT_VERSION",
     "TAIFEX_DAY_SESSION_LABEL",
     "TAIFEX_DAY_SESSION_ALIASES",
     "TAIFEX_FUTURES_DATA_CONTRACT_VERSION",
@@ -879,6 +1148,7 @@ __all__ = [
     "TAIFEX_INDEX_FUTURES_PRODUCTS",
     "TAIFEX_INDEX_FUTURES_TENOR_SLOTS",
     "TaiwanIndexFuturesDaySession",
+    "build_taifex_all_futures_daily_sessions",
     "build_taifex_index_futures_day_session",
     "iter_taifex_daily_csv_streams",
     "load_taifex_index_futures_day_session",

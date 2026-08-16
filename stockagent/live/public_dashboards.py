@@ -296,7 +296,27 @@ def sanitize_tw_history(payload: Mapping[str, Any]) -> dict[str, Any]:
 def sanitize_tw_signals(payload: Mapping[str, Any]) -> dict[str, Any]:
     """Return one public signal page without the internal signal identifiers."""
 
-    output = _scrub_public_value(deepcopy(dict(payload)))
+    _require_simulation_only(payload)
+    allowed = {
+        "schema_version",
+        "simulation_only",
+        "production_order_possible",
+        "session_date",
+        "available_session_dates",
+        "offset",
+        "limit",
+        "returned",
+        "total",
+        "has_more",
+        "source_rows_scanned",
+        "record_count",
+        "direction_summary_scope",
+        "direction_summary",
+        "rows",
+    }
+    output = _scrub_public_value(
+        {key: deepcopy(value) for key, value in payload.items() if key in allowed}
+    )
     if not isinstance(output, dict):  # pragma: no cover - defensive typing guard
         raise TypeError("sanitized signal page is not an object")
     _project_rows(
@@ -335,7 +355,25 @@ def sanitize_tw_events(payload: Mapping[str, Any]) -> dict[str, Any]:
     """Return one public event page after enforcing the simulation boundary."""
 
     _require_simulation_only(payload)
-    output = _scrub_public_value(deepcopy(dict(payload)))
+    allowed = {
+        "schema_version",
+        "simulation_only",
+        "production_order_possible",
+        "session_date",
+        "available_session_dates",
+        "offset",
+        "limit",
+        "returned",
+        "total",
+        "order_total",
+        "fill_total",
+        "has_more",
+        "record_counts",
+        "rows",
+    }
+    output = _scrub_public_value(
+        {key: deepcopy(value) for key, value in payload.items() if key in allowed}
+    )
     if not isinstance(output, dict):  # pragma: no cover - defensive typing guard
         raise TypeError("sanitized event page is not an object")
     _project_rows(

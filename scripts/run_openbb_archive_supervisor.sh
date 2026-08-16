@@ -134,6 +134,30 @@ rotate_log_if_needed() {
   fi
 }
 
+process_tree_rss_kib() {
+  local root_pid="$1"
+  ps -eo pid=,ppid=,rss= 2>/dev/null \
+    | awk -v root="$root_pid" '
+      { pid[NR]=$1; parent[$1]=$2; rss[$1]=$3 }
+      END {
+        total=0
+        for (i=1; i<=NR; i++) {
+          current=pid[i]
+          depth=0
+          while (current > 1 && depth < 128) {
+            if (current == root) {
+              total += rss[pid[i]]
+              break
+            }
+            current=parent[current]
+            depth++
+          }
+        }
+        printf "%.0f\n", total
+      }
+    '
+}
+
 monitor_pid=""
 run_snapshot_monitor() {
   timeout --signal=TERM --kill-after=30s "${full_monitor_timeout}s" \
@@ -264,12 +288,14 @@ while true; do
         fi
       fi
       if ((max_downloader_rss_bytes > 0)) && [[ -r "/proc/$download_pid/status" ]]; then
-        rss_kib="$(awk '$1 == "VmRSS:" {print $2; exit}' "/proc/$download_pid/status")"
+        # SEC projections run in spawned processes to escape the Python GIL.
+        # Guard the complete downloader process tree, not only its parent RSS.
+        rss_kib="$(process_tree_rss_kib "$download_pid")"
         rss_kib="${rss_kib:-0}"
         if [[ "$rss_kib" =~ ^[0-9]+$ ]]; then
           rss_bytes=$((rss_kib * 1024))
           if ((rss_bytes >= max_downloader_rss_bytes)); then
-            echo "[openbb-supervisor] downloader rss_bytes=$rss_bytes reached limit=$max_downloader_rss_bytes; restarting to release provider/Arrow/Python working sets" >&2
+            echo "[openbb-supervisor] downloader process_tree_rss_bytes=$rss_bytes reached limit=$max_downloader_rss_bytes; restarting to release provider/Arrow/Python working sets" >&2
             terminate_downloader "$download_pid"
             break
           fi

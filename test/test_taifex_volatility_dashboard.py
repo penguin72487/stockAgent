@@ -457,8 +457,8 @@ def test_dashboard_html_is_local_and_refreshes_the_read_only_api() -> None:
     assert external_links == [
         "https://www.taifex.com.tw/cht/11/newsDetail?idx=17259&amp;newsType=1"
     ]
-    assert 'fetch("api/status"' in javascript
-    assert "fetch(`api/history?range=${encodeURIComponent(requestedRange)}`" in javascript
+    assert 'fetchWithTimeout("api/status"' in javascript
+    assert "fetchWithTimeout(`api/history?range=${encodeURIComponent(requestedRange)}`" in javascript
     assert "HISTORY_CLIENT_CACHE_MS" in javascript
     assert "historyPayloadCache" in javascript
     assert "response.status === 429" in javascript
@@ -502,9 +502,9 @@ def test_dashboard_html_is_local_and_refreshes_the_read_only_api() -> None:
     assert "curveVisibleCount" in javascript
     assert "guideVisibleCount" in javascript
     assert 'snapshot.health === "degraded"' in javascript
-    assert 'href="styles.css?v=12"' in html
+    assert 'href="styles.css?v=14"' in html
     assert 'src="../time-axis.js?v=3"' in html
-    assert 'src="app.js?v=16"' in html
+    assert 'src="app.js?v=17"' in html
     assert 'id="equity-time-range"' in html
     assert 'data-range="1y"' in html
     assert 'data-range="all"' in html
