@@ -9,6 +9,15 @@ selected_python="$(resolve_fintech_python)"
 # Homepage prewarming deliberately fans out independent local readers.  Keep
 # glibc from retaining one large malloc arena per short-lived worker thread.
 export MALLOC_ARENA_MAX="${MALLOC_ARENA_MAX:-2}"
+# This read-only HTTP process does not need numerical-kernel thread affinity.
+# The hardened systemd unit intentionally blocks sched_setaffinity; disabling
+# OpenMP binding keeps imported analytics libraries from aborting on that EPERM.
+export KMP_AFFINITY="${KMP_AFFINITY:-disabled}"
+export OMP_PROC_BIND="${OMP_PROC_BIND:-false}"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
+export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"
+export NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-1}"
 exec "$selected_python" scripts/serve_public_dashboards.py \
   --host "${STOCKAGENT_PUBLIC_DASHBOARD_HOST:-127.0.0.1}" \
   --port "${STOCKAGENT_PUBLIC_DASHBOARD_PORT:-8770}"

@@ -291,6 +291,7 @@ def build_tw_public_training_features(
         _build_day_trade_rule_features(
             input_dir,
             symbols=symbols,
+            end_date=end_date,
             allow_missing_latest_session=allow_daily_publication_lag,
         ),
     ]
@@ -1179,6 +1180,7 @@ def _build_day_trade_rule_features(
     input_dir: Path,
     *,
     symbols: set[str] | None = None,
+    end_date: date | None = None,
     allow_missing_latest_session: bool = False,
 ) -> pl.DataFrame:
     """Build exact-session TWSE/TPEx day-trade masks with explicit negatives.
@@ -1221,6 +1223,19 @@ def _build_day_trade_rule_features(
             "day-trade rule build requires receipt-certified TWSE and TPEx "
             "daily OHLCV universes"
         )
+
+    # A next-session rule master is intentionally published before that
+    # session has an official close.  It must remain in the mutable rule
+    # archive for live execution, while a feature build ending at the prior
+    # close must compare only dates inside its declared build horizon.  Keep
+    # the default strict for direct callers without an explicit horizon so a
+    # genuinely corrupt extra date is not silently hidden.
+    if end_date is not None:
+        horizon = pl.lit(end_date)
+        twse_eligible = twse_eligible.filter(pl.col("date") <= horizon)
+        tpex_eligible = tpex_eligible.filter(pl.col("date") <= horizon)
+        twse_universe = twse_universe.filter(pl.col("date") <= horizon)
+        tpex_universe = tpex_universe.filter(pl.col("date") <= horizon)
 
     frames: list[pl.DataFrame] = []
     for market, universe, eligible in (

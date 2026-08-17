@@ -217,6 +217,10 @@ run_fintech_python scripts/manage_gpu_jobs.py status \
 
 ## Market Data Downloads
 
+For the registered Dune on-chain and SEC/crypto-ETF issuer history pipelines,
+including `.env` placement, point-in-time rules, resumable receipts, and panel
+status, see [docs/dune_sec_crypto_etf_history.md](docs/dune_sec_crypto_etf_history.md).
+
 - Source `scripts/runtime_env.sh` first and use `run_fintech_python` for every Python entrypoint; bare `python` is not a supported runtime selector for this repository.
 - Run `run_fintech_python downloader/download_yahoo_ohlcv.py` to download four separate folders under `data_yahoo/`: `tw_stocks/`, `us_stocks/`, `crypto/`, and `forex/`.
 - The downloader defaults to `2000-01-01` through today.
@@ -233,9 +237,51 @@ run_fintech_python scripts/manage_gpu_jobs.py status \
 - The Alpaca downloader batches many symbols into each paginated request. Basic accounts use the exact `200 requests/minute` limit by default; set `ALPACA_REQUESTS_PER_MINUTE=10000` for Algo Trader Plus.
 - Use `run_fintech_python downloader/download_cboe_us_ohlcv.py --mode daily-update` when Cboe delayed historical OHLCV is preferred as an alternative U.S. source.
 - The old Yahoo U.S. path remains available with `run_fintech_python downloader/download_yahoo_ohlcv.py --asset us_stocks`, but daily automation defaults to Alpaca because Yahoo often rate-limits large U.S. refreshes.
-- Use `run_fintech_python downloader/download_yahoo_ohlcv.py --asset crypto` to download only the expanded crypto universe.
-- Use `run_fintech_python downloader/download_yahoo_ohlcv.py --asset crypto --mode incremental` to refresh only missing/stale Yahoo crypto 15-minute bars.
-- Yahoo crypto uses 15-minute bars; existing crypto parquet files that look like old daily data are rebuilt from the 15-minute source instead of being merged.
+- Yahoo crypto is a manual gap-diagnostic fallback only; registered automation uses exchange-native data and does not run a duplicate Yahoo crypto bulk archive.
+- If explicitly needed, `run_fintech_python downloader/download_yahoo_ohlcv.py --asset crypto --mode incremental` refreshes its rolling one-minute fallback under `data_yahoo/crypto/1m`; legacy daily or 15-minute files are never merged into that directory.
+
+### Canonical crypto acquisition
+
+`configs/crypto_data_acquisition.json` is the value-ranked fact registry and
+`configs/crypto_source_allocation.json` assigns exactly one canonical owner or
+fallback role to each fact. Different venues remain different markets; a
+fallback fills missing canonical keys and never creates a parallel duplicate
+archive.
+
+Put keyed-provider credentials in the repository `.env` using the names in
+`.env.example`, then run:
+
+```bash
+source scripts/runtime_env.sh
+run_fintech_python downloader/download_crypto_keyed_context.py
+run_fintech_python downloader/download_free_public_context.py
+run_fintech_python downloader/download_coinmetrics_community.py
+```
+
+The keyed runner loads only its explicit allowlist and never publishes secret
+values. CoinGecko owns asset identity and aggregate market snapshots;
+CoinMarketCap is fallback/QA only. Dune requires saved query contracts in
+`configs/dune_crypto_queries.json`, and CoinGlass/Etherscan are not treated as
+usable merely because a key is present. Compact outputs live under
+`data_crypto_reference`, `data_free_public`, and `data_coinmetrics_community`.
+Binance spot and dated-futures one-minute history now use the official public
+archive and require no API key. Always plan the exact S3 object set and capacity
+before starting the resumable checksum-verified download:
+
+```bash
+source scripts/runtime_env.sh
+run_fintech_python downloader/download_binance_public_archive.py --mode plan
+run_fintech_python downloader/download_binance_public_archive.py --mode download
+```
+
+The canonical key is `(market, symbol, open_time)`. Daily objects override
+monthly objects, 2025+ Spot microsecond timestamps are normalized to
+milliseconds, and semantically invalid monthly partitions are quarantined and
+rebuilt from their complete daily object set instead of rounding timestamps.
+`scripts/install_registered_data_refresh_services.sh` installs the daily 12:30
+Asia/Taipei timer. Full trade-tick/L2/liquidation capture remains separately
+capacity-gated because its retention cost is materially larger than one-minute
+bars.
 
 ### Taiwan full-market one-minute Kbar research
 
@@ -286,18 +332,18 @@ instead of being redistributed.
 - Use `run_fintech_python downloader/download_pepperstone.py` to download grouped Pepperstone-style data to `data_peperstone/24hTrading`, `data_peperstone/commodites`, `data_peperstone/crypto`, and `data_peperstone/fores`.
 - Use `run_fintech_python downloader/download_pepperstone.py --groups crypto fores` to download only selected groups.
 - Use `run_fintech_python downloader/download_pepperstone.py --mode daily-update --groups all` for daily incremental updates across groups.
-- Use `run_fintech_python downloader/download_okx_perp_15m.py --output-dir data_okx` to download all OKX perpetual swap 15-minute bars.
-- Use `run_fintech_python downloader/download_okx_perp_15m.py --start-date 2020-01-01 --workers 6` to control download range and parallelism.
-- Use `run_fintech_python downloader/download_okx_perp_15m.py --mode incremental` for incremental updates (only missing 15-minute candles).
-- Use `run_fintech_python downloader/download_okx_perp_15m.py --mode full --refresh` when you need a full re-download.
-- Use `run_fintech_python downloader/download_bybit_perp_15m.py --output-dir data_bybit` to download Bybit perpetual swap 15-minute bars.
-- Use `run_fintech_python downloader/download_bybit_perp_15m.py --categories linear inverse --start-date 2020-01-01 --workers 6` to control Bybit categories, range, and parallelism.
-- Use `run_fintech_python downloader/download_bybit_perp_15m.py --mode incremental` for incremental updates (only missing 15-minute candles).
+- Use `run_fintech_python downloader/download_okx_perp_1m.py --output-dir data_okx/1m` to download all OKX perpetual swap one-minute bars.
+- Use `run_fintech_python downloader/download_okx_perp_1m.py --start-date 2020-01-01 --workers 6` to control download range and parallelism.
+- Use `run_fintech_python downloader/download_okx_perp_1m.py --mode incremental` for incremental updates (only missing one-minute candles).
+- Use `run_fintech_python downloader/download_okx_perp_1m.py --mode full --refresh` when you need a full re-download.
+- Use `run_fintech_python downloader/download_bybit_perp_1m.py --output-dir data_bybit/1m` to download Bybit perpetual swap one-minute bars.
+- Use `run_fintech_python downloader/download_bybit_perp_1m.py --categories linear inverse --start-date 2020-01-01 --workers 6` to control Bybit categories, range, and parallelism.
+- Use `run_fintech_python downloader/download_bybit_perp_1m.py --mode incremental` for incremental updates (only missing one-minute candles).
 - Use `run_fintech_python downloader/download_forex_frankfurter.py --mode daily-update --output-dir data_yahoo/forex` for daily incremental FX updates from Frankfurter.
 - Each asset folder includes `symbols.csv`, `download_report.csv`, and `download_summary.json` alongside `*_features.parquet` files.
 - Parquet output includes at least `date`, `open`, `max`, `min`, `close`, `adjclose`, `Trading_Volume`, and also preserves extra Yahoo columns when available (for example `Dividends`, `Stock Splits`).
 - Override the default universe with `--symbols` or `--symbols-file`, for example `run_fintech_python downloader/download_yahoo_ohlcv.py --asset forex --symbols EURUSD GBPUSD USDJPY`.
-- Use `run_fintech_python downloader/download_yahoo_ohlcv.py --mode incremental --asset all` for incremental updates across Yahoo assets; crypto remains 15-minute.
+- Use `run_fintech_python downloader/download_yahoo_ohlcv.py --mode incremental --asset all` for incremental updates across Yahoo assets; crypto uses one-minute bars while stocks and FX remain daily.
 
 ## Taiwan Public Data Download
 
@@ -358,7 +404,7 @@ instead of being redistributed.
 
 - Use `bash downloader/run_daily_all_markets.sh` to run daily updates across all configured markets.
 - Use `bash downloader/daily_downloader_daemon.sh start` for unattended market-close updates and `bash downloader/daily_downloader_daemon.sh status` to verify the scheduler. Taiwan updates start at 13:40 Asia/Taipei by default, after the 13:30 close. The TW pipeline retries the complete official-data build with `TW_PUBLIC_PIPELINE_ATTEMPTS` and `TW_PUBLIC_PIPELINE_RETRY_SECONDS`; a market date is marked complete only after the strict TW audit succeeds.
-- The script runs only the source-of-truth feed for each configured market by default: Alpaca `us_stocks`, Taiwan TWSE/TPEx public data plus feature rebuild and official OHLCV sync, Frankfurter forex incremental update to `data_yahoo/forex`, and OKX/Bybit perpetual 15-minute crypto updates. Yahoo and Pepperstone grouped downloads are opt-in fallback or research paths, not the fast daily default.
+- The script runs the configured source-of-truth feeds independently: Alpaca `us_stocks`, Taiwan TWSE/TPEx public data, Frankfurter forex, and OKX/Bybit/Binance perpetual one-minute updates. Providers without a shared quota run in parallel; each provider still obeys its own official limiter.
 - Independent provider groups run concurrently by default; set `DAILY_PARALLEL_GROUPS=0` to force the old serial order.
 - Set `RUN_TW_PUBLIC_DATA=0` to skip the Taiwan public data downloader. The first enabled run may backfill many historical official-data dates.
 - Set `RUN_TW_PUBLIC_FEATURES=0` to skip rebuilding `data_tw_public/features/tw_public_stock_daily.parquet`.
@@ -393,7 +439,7 @@ instead of being redistributed.
   `/portfolio_history market:tw days:32 current_capital:1000000` shows recent
   PnL, current exposure, and holding changes from fold artifacts scaled to the
   supplied capital. Daily markets use days; crypto can set
-  `history_frequency: bar` to show 15-minute bars. `/stock_history market:tw
+  `history_frequency: bar` to show one-minute bars. `/stock_history market:tw
   symbol:2330 limit:32` shows recent per-symbol trade/adjustment records.
   `/positions` and `/rebalance` accept `current_capital` to estimate
   current/target/trade amounts.
@@ -401,7 +447,7 @@ instead of being redistributed.
   filter by symbol/action, sort by delta/score/target/return/rank, and
   optionally attach the full markdown decision report.
 - Crypto Discord scheduling can use `schedule_interval_minutes: 15` plus a
-  `pre_signal_command` data updater so each completed 15-minute bar is fetched
+  `pre_signal_command` data updater so each completed one-minute bar is fetched
   before the bot sends the next signal. For manual testing, run
   `/signal_now market:crypto refresh_data:true`.
 - `/signal_now` with `price_source:auto` now treats open markets as realtime:

@@ -1228,14 +1228,22 @@ class TwDayTradeSimulationEngine:
             return 1.0, [], "not_configured"
         if self._corporate_action_load_error is not None:
             return None, [], "reference_unavailable"
+        parsed_entry = _parse_timestamp(entry_at)
+        if parsed_entry is None:
+            return None, [], "entry_timestamp_invalid"
+        # Both prices in a same-session benchmark are already on the same side
+        # of that session's ex-right/ex-dividend boundary.  No distribution or
+        # split can be crossed between the opening ask and a later bid, so the
+        # exact total-return factor is 1 even while the official daily archive
+        # still ends at the preceding completed session.  Cross-session marks
+        # continue to fail closed until the reference covers the mark date.
+        if parsed_entry.date() == mark_date:
+            return 1.0, [], "same_session_no_action_boundary"
         if (
             self._corporate_action_coverage_end is None
             or self._corporate_action_coverage_end < mark_date
         ):
             return None, [], "reference_coverage_incomplete"
-        parsed_entry = _parse_timestamp(entry_at)
-        if parsed_entry is None:
-            return None, [], "entry_timestamp_invalid"
         factor = 1.0
         applied: list[dict[str, Any]] = []
         for item in self._corporate_actions_by_symbol.get(str(symbol), ()):

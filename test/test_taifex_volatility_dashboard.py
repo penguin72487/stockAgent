@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -177,7 +178,7 @@ def test_dashboard_snapshot_is_bounded_fresh_and_account_safe(tmp_path: Path) ->
     assert payload["market"]["strategy_fresh_valuation_count"] == 2
     assert payload["market"]["held_option_subscription_coverage_ratio"] == 1.0
     assert len(payload["strategies"]) == 2
-    assert payload["strategy_counts"]["live_ideal"] == 54
+    assert payload["strategy_counts"]["live_ideal"] == 58
     assert payload["strategy_counts"]["blocked_contract"] >= 1
     assert (
         len(payload["strategy_catalog"]) == payload["strategy_counts"]["catalog_total"]
@@ -275,6 +276,88 @@ def test_dedicated_history_snapshot_is_range_aware_and_bounded(tmp_path: Path) -
     }
     assert history["history"][-1] == full["history"][-1]
     assert history["record_counts"] == {"history_rows_returned": 16}
+
+
+def test_history_snapshot_merges_receipted_backfill_and_prefers_live_on_collision(
+    tmp_path: Path,
+) -> None:
+    state_dir, _receipts = _fixture(tmp_path)
+    strategy_id = "classic_opening_straddle"
+    backfill_dir = state_dir / "backfills" / "rolling_straddles_bidask_v1"
+    backfill_dir.mkdir(parents=True)
+    older_ns = int(datetime(2026, 8, 10, 1, 0, tzinfo=timezone.utc).timestamp() * 1e9)
+    live_first = json.loads((state_dir / "marks.jsonl").read_text().splitlines()[0])
+    rows = [
+        {
+            "decision_ts_ns": older_ns,
+            "strategy_id": strategy_id,
+            "cumulative_pnl_twd": 200.0,
+            "initial_capital_twd": 2_000.0,
+            "gross_cash_twd": 0.0,
+            "open_liquidation_value_twd": 200.0,
+            "fixed_fees_twd": 0.0,
+            "transaction_tax_twd": 0.0,
+            "futures_position": 0,
+            "option_books_valid": True,
+            "future_book_valid": True,
+            "valuation_available": True,
+            "history_source": "shioaji_worker0_completed_second_bidask",
+            "replay_id": "receipt-test",
+        },
+        {
+            **live_first,
+            "strategy_id": strategy_id,
+            "cumulative_pnl_twd": 999.0,
+            "net_equity_twd": 999.0,
+            "history_source": "must_be_replaced_by_live",
+        },
+    ]
+    backfill_mark_path = backfill_dir / "marks.jsonl"
+    backfill_mark_path.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    _write_json(
+        backfill_dir / "receipt.json",
+        {
+            "status": "partial_receipt_backfill",
+            "replay_id": "receipt-test",
+            "source": "shioaji_worker0_completed_second_bidask",
+            "strategy_ids": [strategy_id],
+            "requested_start_date": "2026-08-10",
+            "requested_end_date": "2026-08-12",
+            "source_coverage": [],
+            "record_counts": {"marks": 2},
+            "output_sha256": {
+                "marks.jsonl": hashlib.sha256(
+                    backfill_mark_path.read_bytes()
+                ).hexdigest()
+            },
+        },
+    )
+
+    history = build_dashboard_history_snapshot(
+        state_dir=state_dir,
+        now=datetime(2026, 8, 12, 1, 30, tzinfo=timezone.utc),
+        mark_limit_per_strategy=100,
+        range_key="all",
+    )
+    older = next(
+        row for row in history["history"] if row["decision_ts_ns"] == older_ns
+    )
+    collision = next(
+        row
+        for row in history["history"]
+        if row["decision_ts_ns"] == live_first["decision_ts_ns"]
+        and row["strategy_id"] == strategy_id
+    )
+    assert older["initial_capital_twd"] == 2_000.0
+    assert older["fixed_capital_return"] == pytest.approx(0.1)
+    assert older["history_source"] == "shioaji_worker0_completed_second_bidask"
+    assert collision["history_source"] == "live_forward_ledger"
+    assert collision["cumulative_pnl_twd"] != 999.0
+    assert history["record_counts"]["backfill_mark_rows"] == 2
+    assert history["backfills"][0]["replay_id"] == "receipt-test"
 
 
 def test_dashboard_marks_fresh_but_incomplete_strategy_valuation_as_degraded(
@@ -458,7 +541,10 @@ def test_dashboard_html_is_local_and_refreshes_the_read_only_api() -> None:
         "https://www.taifex.com.tw/cht/11/newsDetail?idx=17259&amp;newsType=1"
     ]
     assert 'fetchWithTimeout("api/status"' in javascript
-    assert "fetchWithTimeout(`api/history?range=${encodeURIComponent(requestedRange)}`" in javascript
+    assert (
+        "fetchWithTimeout(`api/history?range=${encodeURIComponent(requestedRange)}`"
+        in javascript
+    )
     assert "HISTORY_CLIENT_CACHE_MS" in javascript
     assert "historyPayloadCache" in javascript
     assert "response.status === 429" not in javascript
@@ -503,8 +589,10 @@ def test_dashboard_html_is_local_and_refreshes_the_read_only_api() -> None:
     assert "guideVisibleCount" in javascript
     assert 'snapshot.health === "degraded"' in javascript
     assert 'href="styles.css?v=14"' in html
-    assert 'src="../time-axis.js?v=3"' in html
-    assert 'src="app.js?v=18"' in html
+    assert 'src="../time-axis.js?v=4"' in html
+    assert 'src="app.js?v=20"' in html
+    assert "collapseEmptyIntervals: true" in javascript
+    assert "全策略皆無資料的區段已略過、不補 0" in javascript
     assert 'id="equity-time-range"' in html
     assert 'data-range="1y"' in html
     assert 'data-range="all"' in html

@@ -20,6 +20,11 @@ from stockagent.research.taifex_volatility_metadata import (
     DYNAMIC_HEDGE_STRATEGY_IDS,
     MODEL_VARIANT_PREFIX,
     PUT_CALL_PARITY_TX_STRATEGY_ID,
+    ROLLING_ITM_LONG_STRADDLE_ID,
+    ROLLING_ITM_SHORT_STRADDLE_ID,
+    ROLLING_OTM_LONG_STRADDLE_ID,
+    ROLLING_OTM_SHORT_STRADDLE_ID,
+    ROLLING_STRADDLE_IDS,
     STRATEGY_MODE_DAILY,
     STRATEGY_MODE_INTRADAY_FUTURES,
     VOLATILITY_MODEL_IDS,
@@ -73,6 +78,7 @@ def _engine(
     option_infos_override: list[FakeOptionInfo] | None = None,
     settlement_bootstrap_only: bool = False,
     startup_now: datetime | None = None,
+    active_strategy_ids: tuple[str, ...] | None = None,
 ) -> TaifexVolatilitySimulation:
     expiry = date(2026, 8, 14)
     if option_infos_override is None:
@@ -121,6 +127,7 @@ def _engine(
         catalog_expansion_entry_policy=catalog_expansion_entry_policy,
         settlement_bootstrap_only=settlement_bootstrap_only,
         startup_now=startup_now,
+        active_strategy_ids=active_strategy_ids,
     )
 
 
@@ -196,9 +203,7 @@ def _seed_profitable_put_call_parity_books(
     *,
     receive_ns: int,
 ) -> None:
-    engine.on_book(
-        _book("TXFH6", bid=44_999.0, ask=45_000.0, receive_ns=receive_ns)
-    )
+    engine.on_book(_book("TXFH6", bid=44_999.0, ask=45_000.0, receive_ns=receive_ns))
     engine.on_book(
         _book(
             "TXO-20260819-45000-C",
@@ -259,6 +264,170 @@ def test_engine_opens_each_catalog_strategy_with_its_own_option_recipe(
     engine.close()
 
 
+def test_engine_can_scope_a_receipt_replay_to_rolling_straddles(
+    tmp_path: Path,
+) -> None:
+    engine = _engine(
+        tmp_path,
+        bootstrap_after=date(2026, 8, 10),
+        strategy_mode=STRATEGY_MODE_INTRADAY_FUTURES,
+        active_strategy_ids=ROLLING_STRADDLE_IDS,
+    )
+    observed_at = datetime(2026, 8, 12, 8, 46, tzinfo=TAIPEI)
+    decision_ns = int(observed_at.timestamp() * 1e9)
+    _seed_surface_books(engine, observed_at=observed_at, receive_ns=decision_ns)
+    engine._maybe_open_cycle(observed_at, decision_ns + 100_000_000)
+
+    assert tuple(engine.state["strategy_ids"]) == ROLLING_STRADDLE_IDS
+    assert set(engine.state["strategies"]) == set(ROLLING_STRADDLE_IDS)
+    assert all(
+        engine.state["strategies"][strategy_id]["entry_state"] == "entered"
+        for strategy_id in ROLLING_STRADDLE_IDS
+    )
+    engine._maybe_enforce_strategy_margin(decision_ns + 200_000_000)
+    engine.close()
+
+
+@pytest.mark.parametrize(
+    ("strategy_id", "rolled_right", "quantity"),
+    (
+        (ROLLING_ITM_LONG_STRADDLE_ID, "C", 1),
+        (ROLLING_ITM_SHORT_STRADDLE_ID, "C", -1),
+        (ROLLING_OTM_LONG_STRADDLE_ID, "P", 1),
+        (ROLLING_OTM_SHORT_STRADDLE_ID, "P", -1),
+    ),
+)
+def test_rolling_straddles_atomically_replace_selected_leg_on_later_books(
+    tmp_path: Path,
+    strategy_id: str,
+    rolled_right: str,
+    quantity: int,
+) -> None:
+    engine = _engine(tmp_path, bootstrap_after=date(2026, 8, 10))
+    observed_at = datetime(2026, 8, 12, 8, 46, tzinfo=TAIPEI)
+    base_ns = int(datetime.now(timezone.utc).timestamp() * 1e9)
+    _seed_surface_books(
+        engine,
+        observed_at=observed_at,
+        receive_ns=base_ns,
+    )
+    engine._maybe_open_cycle(observed_at, base_ns + 100_000_000)
+
+    old_code = f"TXV-20260814-45000-{rolled_right}"
+    new_code = f"TXV-20260814-45100-{rolled_right}"
+    untouched_right = "P" if rolled_right == "C" else "C"
+    untouched_code = f"TXV-20260814-45000-{untouched_right}"
+    signal_ns = base_ns + 300_000_000
+    engine.on_book(
+        _book(
+            "TXFH6",
+            bid=45_095.0,
+            ask=45_105.0,
+            receive_ns=base_ns + 200_000_000,
+        )
+    )
+    engine._maybe_roll_straddles(signal_ns)
+
+    ledger = engine.state["strategies"][strategy_id]
+    assert ledger["pending_option_roll"]["signal_decision_ts_ns"] == signal_ns
+    assert ledger["trade_sides"] == 2
+    assert ledger["option_positions"] == {
+        "TXV-20260814-45000-C": quantity,
+        "TXV-20260814-45000-P": quantity,
+    }
+
+    later_receive_ns = signal_ns + 100_000_000
+    engine.on_book(
+        _book(
+            old_code,
+            bid=111.0,
+            ask=113.0,
+            receive_ns=later_receive_ns,
+        )
+    )
+    engine.on_book(
+        _book(
+            new_code,
+            bid=201.0,
+            ask=207.0,
+            receive_ns=later_receive_ns + 1,
+        )
+    )
+    execution_ns = later_receive_ns + 100_000_000
+    engine._maybe_roll_straddles(execution_ns)
+
+    assert ledger["pending_option_roll"] is None
+    assert ledger["option_roll_count"] == 1
+    assert ledger["trade_sides"] == 4
+    assert ledger["option_positions"] == {
+        new_code: quantity,
+        untouched_code: quantity,
+    }
+    rolling_rows = []
+    for line in (tmp_path / "ideal_ledger.jsonl").read_text().splitlines():
+        row = json.loads(line)
+        if row["strategy_id"] == strategy_id and str(row["reason"]).startswith(
+            "rolling_straddle_"
+        ):
+            rolling_rows.append(row)
+    assert len(rolling_rows) == 2
+    close_row, open_row = rolling_rows
+    assert close_row["code"] == old_code
+    assert close_row["delta_contracts"] == -quantity
+    assert close_row["price_points"] == (113.0 if quantity < 0 else 111.0)
+    assert open_row["code"] == new_code
+    assert open_row["delta_contracts"] == quantity
+    assert open_row["price_points"] == (207.0 if quantity > 0 else 201.0)
+    assert all(
+        row["signal_decision_ts_ns"] == signal_ns
+        and signal_ns < row["book_receive_ts_ns"] <= execution_ns
+        for row in rolling_rows
+    )
+    engine.close()
+
+
+def test_rolling_straddle_waits_without_mutating_when_one_later_book_is_missing(
+    tmp_path: Path,
+) -> None:
+    engine = _engine(tmp_path, bootstrap_after=date(2026, 8, 10))
+    observed_at = datetime(2026, 8, 12, 8, 46, tzinfo=TAIPEI)
+    base_ns = int(datetime.now(timezone.utc).timestamp() * 1e9)
+    _seed_surface_books(
+        engine,
+        observed_at=observed_at,
+        receive_ns=base_ns,
+    )
+    engine._maybe_open_cycle(observed_at, base_ns + 100_000_000)
+    engine.on_book(
+        _book(
+            "TXFH6",
+            bid=45_095.0,
+            ask=45_105.0,
+            receive_ns=base_ns + 200_000_000,
+        )
+    )
+    signal_ns = base_ns + 300_000_000
+    engine._maybe_roll_straddles(signal_ns)
+
+    ledger = engine.state["strategies"][ROLLING_ITM_LONG_STRADDLE_ID]
+    before_positions = dict(ledger["option_positions"])
+    before_trade_sides = ledger["trade_sides"]
+    engine.on_book(
+        _book(
+            "TXV-20260814-45100-C",
+            bid=201.0,
+            ask=207.0,
+            receive_ns=signal_ns + 100_000_000,
+        )
+    )
+    engine._maybe_roll_straddles(signal_ns + 200_000_000)
+
+    assert ledger["pending_option_roll"] is not None
+    assert ledger["option_positions"] == before_positions
+    assert ledger["trade_sides"] == before_trade_sides
+    engine.close()
+
+
 def test_put_call_parity_tx_waits_for_later_books_then_locks_positive_net_edge(
     tmp_path: Path,
 ) -> None:
@@ -305,8 +474,7 @@ def test_put_call_parity_tx_waits_for_later_books_then_locks_positive_net_edge(
     assert len(rows) == 3
     assert {row["instrument_type"] for row in rows} == {"option", "future"}
     assert all(
-        signal_ns < row["book_receive_ts_ns"] <= row["decision_ts_ns"]
-        for row in rows
+        signal_ns < row["book_receive_ts_ns"] <= row["decision_ts_ns"] for row in rows
     )
     assert {row["signal_decision_ts_ns"] for row in rows} == {signal_ns}
     engine.close()
@@ -322,9 +490,7 @@ def test_put_call_parity_tx_rejects_nonpositive_cost_adjusted_package(
     )
     observed_at = datetime(2026, 8, 14, 10, 0, tzinfo=TAIPEI)
     decision_ns = int(observed_at.timestamp() * 1e9)
-    engine.on_book(
-        _book("TXFH6", bid=44_999.0, ask=45_001.0, receive_ns=decision_ns)
-    )
+    engine.on_book(_book("TXFH6", bid=44_999.0, ask=45_001.0, receive_ns=decision_ns))
     for right in ("C", "P"):
         engine.on_book(
             _book(
@@ -394,17 +560,14 @@ def test_put_call_parity_tx_cash_settles_all_three_legs_at_official_price(
     parity_state = engine.state["put_call_parity_tx"]
     assert parity_state["open_position"] is None
     assert parity_state["last_settled_expiry"] == "2026-08-19"
-    assert parity_state["monitor"]["state"] == (
-        "settled_waiting_next_monthly_contract"
-    )
+    assert parity_state["monitor"]["state"] == ("settled_waiting_next_monthly_contract")
     assert parity_state["monitor"]["realized_cumulative_pnl_twd"] == pytest.approx(
         locked_edge
     )
     settlement_rows = [
         json.loads(line)
         for line in (tmp_path / "ideal_ledger.jsonl").read_text().splitlines()
-        if json.loads(line)["reason"]
-        == "put_call_parity_tx_official_cash_settlement"
+        if json.loads(line)["reason"] == "put_call_parity_tx_official_cash_settlement"
     ]
     assert len(settlement_rows) == 3
     assert {row["price_source"] for row in settlement_rows} == {
@@ -561,7 +724,7 @@ def test_complete_books_start_all_live_catalog_curves_without_margin_failure(
     _seed_surface_books(engine, observed_at=observed_at, receive_ns=receive_ns)
     engine.step(now=observed_at)
 
-    assert len(engine.state["strategies"]) == len(STRATEGY_IDS) == 54
+    assert len(engine.state["strategies"]) == len(STRATEGY_IDS) == 58
     for strategy_id in ("naked_short_call", "naked_short_put"):
         ledger = engine.state["strategies"][strategy_id]
         assert len(ledger["option_positions"]) == 1
@@ -592,8 +755,7 @@ def test_complete_books_start_all_live_catalog_curves_without_margin_failure(
     assert status["strategy_valuation_available_count"] == len(STRATEGY_IDS)
     assert status["held_option_contract_count"] > 0
     assert (
-        status["held_option_subscribed_count"]
-        == status["held_option_contract_count"]
+        status["held_option_subscribed_count"] == status["held_option_contract_count"]
     )
     assert status["missing_held_option_subscription_codes"] == []
     engine.close()
@@ -666,7 +828,10 @@ def test_restart_rejects_persisted_held_option_without_worker_subscription(
 
     with pytest.raises(
         RuntimeError,
-        match="persisted held option contracts are not subscribed on strategy worker 0",
+        match=(
+            "persisted held or pending-roll option contracts are not subscribed "
+            "on strategy worker 0"
+        ),
     ):
         _engine(tmp_path, bootstrap_after=date(2026, 8, 12))
 
@@ -735,12 +900,10 @@ def test_v8_restart_pair_repair_preserves_only_ideal_ledger_backed_positions(
             },
         }
     engine.state["strategies"]["long_strap_2c1p"]["entry_state"] = "entered"
-    engine.state["strategies"]["underlying_hedge_future_long"][
-        "entry_state"
-    ] = "entered"
-    engine.state["strategies"]["underlying_hedge_future_long"][
-        "futures_position"
-    ] = 1
+    engine.state["strategies"]["underlying_hedge_future_long"]["entry_state"] = (
+        "entered"
+    )
+    engine.state["strategies"]["underlying_hedge_future_long"]["futures_position"] = 1
     engine.close()
 
     state_path = tmp_path / "state.json"
@@ -754,30 +917,35 @@ def test_v8_restart_pair_repair_preserves_only_ideal_ledger_backed_positions(
         strategy_mode=STRATEGY_MODE_INTRADAY_FUTURES,
     )
     assert migrated.state["execution_contract_version"] == EXECUTION_CONTRACT_VERSION
-    assert migrated.state["strategies"][CLASSIC_VARIANT_ID][
-        "option_positions"
-    ] == {call_code: 1, put_code: 1}
-    assert migrated.state["strategies"]["long_strap_2c1p"][
-        "option_positions"
-    ] == {}
-    assert migrated.state["strategies"]["long_strap_2c1p"][
-        "entry_state"
-    ] == "waiting_for_fresh_entry_depth"
-    assert migrated.state["strategies"]["underlying_hedge_future_long"][
-        "option_positions"
-    ] == {}
-    assert migrated.state["strategies"]["underlying_hedge_future_long"][
-        "entry_state"
-    ] == "entered"
-    assert migrated.state["strategies"]["underlying_hedge_future_long"][
-        "futures_position"
-    ] == 1
-    assert migrated.state["strategies"][PUT_CALL_PARITY_TX_STRATEGY_ID][
-        "option_positions"
-    ] == {}
-    assert migrated.state["strategies"][PUT_CALL_PARITY_TX_STRATEGY_ID][
-        "entry_state"
-    ] == "waiting_for_same_expiry_monthly_books"
+    assert migrated.state["strategies"][CLASSIC_VARIANT_ID]["option_positions"] == {
+        call_code: 1,
+        put_code: 1,
+    }
+    assert migrated.state["strategies"]["long_strap_2c1p"]["option_positions"] == {}
+    assert (
+        migrated.state["strategies"]["long_strap_2c1p"]["entry_state"]
+        == "waiting_for_fresh_entry_depth"
+    )
+    assert (
+        migrated.state["strategies"]["underlying_hedge_future_long"]["option_positions"]
+        == {}
+    )
+    assert (
+        migrated.state["strategies"]["underlying_hedge_future_long"]["entry_state"]
+        == "entered"
+    )
+    assert (
+        migrated.state["strategies"]["underlying_hedge_future_long"]["futures_position"]
+        == 1
+    )
+    assert (
+        migrated.state["strategies"][PUT_CALL_PARITY_TX_STRATEGY_ID]["option_positions"]
+        == {}
+    )
+    assert (
+        migrated.state["strategies"][PUT_CALL_PARITY_TX_STRATEGY_ID]["entry_state"]
+        == "waiting_for_same_expiry_monthly_books"
+    )
     migration_events = [
         json.loads(line)
         for line in (tmp_path / "events.jsonl").read_text(encoding="utf-8").splitlines()
@@ -793,12 +961,13 @@ def test_v8_restart_pair_repair_preserves_only_ideal_ledger_backed_positions(
         bootstrap_after=date(2026, 8, 12),
         strategy_mode=STRATEGY_MODE_INTRADAY_FUTURES,
     )
-    assert restarted.state["strategies"]["long_strap_2c1p"][
-        "option_positions"
-    ] == {}
-    assert restarted.state["strategies"][PUT_CALL_PARITY_TX_STRATEGY_ID][
-        "option_positions"
-    ] == {}
+    assert restarted.state["strategies"]["long_strap_2c1p"]["option_positions"] == {}
+    assert (
+        restarted.state["strategies"][PUT_CALL_PARITY_TX_STRATEGY_ID][
+            "option_positions"
+        ]
+        == {}
+    )
     restarted.close()
 
 
@@ -823,14 +992,48 @@ def test_restart_migrates_exact_official_2026_08_13_margin_step(
     assert migrated.state["option_risk_margin_b_twd"] == 94_000.0
     assert migrated.state["option_risk_margin_c_twd"] == 18_800.0
     assert (
-        migrated.state["strategies"][CLASSIC_VARIANT_ID]["gross_cash_twd"]
-        == 12_345.0
+        migrated.state["strategies"][CLASSIC_VARIANT_ID]["gross_cash_twd"] == 12_345.0
     )
     migration = json.loads(
         (tmp_path / "events.jsonl").read_text(encoding="utf-8").splitlines()[-1]
     )
     assert migration["event"] == "execution_contract_migrated"
     assert migration["margin_schedule"]["positions_and_pnl_preserved"] is True
+    migrated.close()
+
+
+def test_restart_migrates_v9_ledgers_to_causal_rolling_state(tmp_path: Path) -> None:
+    engine = _engine(tmp_path, bootstrap_after=date(2026, 8, 12))
+    engine.state["strategies"][CLASSIC_VARIANT_ID]["gross_cash_twd"] = 12_345.0
+    engine.close()
+    state_path = tmp_path / "state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["execution_contract_version"] = 9
+    for ledger in state["strategies"].values():
+        for key in (
+            "pending_option_roll",
+            "option_roll_count",
+            "last_option_roll_decision_ts_ns",
+            "last_option_roll_signal_ts_ns",
+            "last_option_roll_forward_mid",
+            "last_option_roll_atm_strike",
+        ):
+            ledger.pop(key, None)
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    migrated = _engine(tmp_path, bootstrap_after=date(2026, 8, 12))
+
+    assert migrated.state["execution_contract_version"] == EXECUTION_CONTRACT_VERSION
+    classic = migrated.state["strategies"][CLASSIC_VARIANT_ID]
+    assert classic["gross_cash_twd"] == 12_345.0
+    assert classic["pending_option_roll"] is None
+    assert classic["option_roll_count"] == 0
+    migration = json.loads(
+        (tmp_path / "events.jsonl").read_text(encoding="utf-8").splitlines()[-1]
+    )
+    assert migration["event"] == "execution_contract_migrated"
+    assert migration["from_version"] == 9
+    assert migration["reason"] == "causal_rolling_straddle_migration"
     migrated.close()
 
 

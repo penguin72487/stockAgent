@@ -71,8 +71,8 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--timeout-ms", type=int, default=120_000)
-    parser.add_argument("--max-traffic-fraction", type=float, default=0.90)
-    parser.add_argument("--traffic-reserve-mb", type=float, default=128.0)
+    parser.add_argument("--max-traffic-fraction", type=float, default=0.75)
+    parser.add_argument("--traffic-reserve-mb", type=float, default=512.0)
     parser.add_argument("--simulation", action="store_true")
     parser.add_argument("--allow-market-hours", action="store_true")
     parser.add_argument("--max-dates", type=int, default=0)
@@ -233,10 +233,17 @@ def main() -> int:
         raise ValueError("start date must not be after end date")
     if not 0.0 < args.max_traffic_fraction < 1.0:
         raise ValueError("max traffic fraction must be between zero and one")
+    if not 0.0 <= args.traffic_reserve_mb < float("inf"):
+        raise ValueError("traffic reserve must be finite and nonnegative")
     if args.timeout_ms < 1 or args.max_dates < 0:
         raise ValueError("timeout and max dates must be valid")
     if _taiwan_market_hours_now() and not args.allow_market_hours:
-        raise RuntimeError("refusing historical download during Taiwan market hours")
+        print(
+            "[shioaji-tx-history] status=stopped_for_market_hours "
+            "window=07:45-14:31",
+            flush=True,
+        )
+        return 76
 
     expected = _calendar(args.calendar_path, start, end)
     if not expected:

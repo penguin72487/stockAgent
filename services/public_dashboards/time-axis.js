@@ -150,7 +150,57 @@
     return ticks;
   }
 
-  function buildTimeAxis({range, timestamps, sessions = []}) {
+  function nearestObserved(times, timestamp) {
+    let low = 0;
+    let high = times.length;
+    while (low < high) {
+      const middle = Math.floor((low + high) / 2);
+      if (times[middle] < timestamp) low = middle + 1;
+      else high = middle;
+    }
+    const candidates = [];
+    if (low < times.length) candidates.push(low);
+    if (low > 0) candidates.push(low - 1);
+    if (!candidates.length) return null;
+    const index = candidates.reduce((best, candidate) => (
+      Math.abs(times[candidate] - timestamp) < Math.abs(times[best] - timestamp)
+        ? candidate : best
+    ));
+    return {index, timestamp: times[index], distance: Math.abs(times[index] - timestamp)};
+  }
+
+  function tickToleranceMs(spec) {
+    if (spec.unit === "minute") return spec.step * MINUTE_MS / 2;
+    if (spec.unit === "hour") return spec.step * HOUR_MS / 2;
+    if (spec.unit === "day") return spec.step * DAY_MS / 2;
+    if (spec.unit === "week") return spec.step * 7 * DAY_MS / 2;
+    if (spec.unit === "month") return spec.step * 31 * DAY_MS / 2;
+    if (spec.unit === "year") return spec.step * 366 * DAY_MS / 2;
+    return HOUR_MS / 2;
+  }
+
+  function mapTicksToObserved(ticks, observedTimes, spec) {
+    const tolerance = tickToleranceMs(spec);
+    const seen = new Set();
+    const mapped = [];
+    for (const tick of ticks) {
+      const nearest = nearestObserved(observedTimes, tick.timestamp);
+      const allowedDistance = tick.kind === "session"
+        ? Math.min(tolerance, 30 * MINUTE_MS) : tolerance;
+      if (nearest === null || nearest.distance > allowedDistance) continue;
+      const key = `${tick.kind}:${nearest.index}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      mapped.push({
+        ...tick,
+        observedTimestamp: nearest.timestamp,
+        observedIndex: nearest.index,
+      });
+    }
+    return mapped;
+  }
+
+  function buildTimeAxis({range, timestamps, sessions = [], collapseEmptyIntervals = false}) {
     const times = finiteTimes(timestamps);
     if (!times.length) return null;
     let startMs = times[0];
@@ -165,11 +215,28 @@
       ticks.push(...important);
       ticks.sort((left, right) => left.timestamp - right.timestamp);
     }
-    return {startMs, endMs, ticks};
+    if (!collapseEmptyIntervals) return {startMs, endMs, ticks};
+    const observedTimes = [...new Set(
+      times.filter((timestamp) => timestamp >= startMs && timestamp <= endMs),
+    )];
+    if (!observedTimes.length) return null;
+    return {
+      startMs,
+      endMs,
+      ticks: mapTicksToObserved(ticks, observedTimes, spec),
+      observedTimes,
+      collapseEmptyIntervals: true,
+    };
   }
 
   function position(axis, timestamp, left, right) {
     const value = timestamp instanceof Date ? timestamp.getTime() : Number(timestamp);
+    if (axis.collapseEmptyIntervals && Array.isArray(axis.observedTimes)) {
+      if (axis.observedTimes.length === 1) return left + (right - left) / 2;
+      const nearest = nearestObserved(axis.observedTimes, value);
+      const ratio = nearest.index / (axis.observedTimes.length - 1);
+      return left + ratio * (right - left);
+    }
     const ratio = (value - axis.startMs) / (axis.endMs - axis.startMs);
     return left + ratio * (right - left);
   }

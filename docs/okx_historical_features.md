@@ -1,18 +1,18 @@
 # OKX 永續合約歷史特徵下載契約
 
-本文件描述 `downloader/download_okx_perp_15m.py` 在既有 15 分鐘完成柱之外，
+本文件描述 `downloader/download_okx_perp_1m.py` 在既有 1 分鐘完成柱之外，
 會下載哪些 OKX 公開歷史資料、如何對齊，以及哪些 snapshot/stream 資料刻意排除。
 
 完整機器可讀分類會由每次下載寫到：
 
 ```text
-data_okx/okx_historical_feature_catalog.json
+data_okx/1m/okx_historical_feature_catalog.json
 ```
 
 逐商品 coverage 與失敗原因會寫到：
 
 ```text
-data_okx/historical_feature_report.csv
+data_okx/1m/historical_feature_report.csv
 ```
 
 ## 預設納入
@@ -23,7 +23,7 @@ data_okx/historical_feature_report.csv
 | Mark price | `/api/v5/market/history-mark-price-candles` | 近年 | mark OHLC、return、range |
 | Index price | `/api/v5/market/history-index-candles` | 近年 | index OHLC、return、range |
 | Funding | `market-data-history module=3` ＋ `/api/v5/public/funding-rate-history` | archive coverage 持續回補；REST 最多三個月 | realized/predicted-at-settlement、間隔、age、年化值 |
-| OI | `/api/v5/rubik/stat/contracts/open-interest-history` | 最新 1,440 筆；15m 約 15 天 | contracts、coin、USD、15m 變化 |
+| OI | `/api/v5/rubik/stat/contracts/open-interest-history` | 最新 1,440 筆；原生最細 5m 約 5 天 | contracts、coin、USD、相鄰原生觀測變化 |
 | Taker flow | `/api/v5/rubik/stat/taker-volume-contract` | 最新 1,440 筆 | buy/sell contracts、imbalance |
 | 全體帳戶 ratio | `/api/v5/rubik/stat/contracts/long-short-account-ratio-contract` | 最新 1,440 筆 | account-count long/short ratio |
 | Top trader 帳戶 ratio | `/api/v5/rubik/stat/contracts/long-short-account-ratio-contract-top-trader` | 最新 1,440 筆 | top 5% account-count ratio |
@@ -33,22 +33,24 @@ data_okx/historical_feature_report.csv
 OI 每一口同時存在多方和空方，因此 OI 上升也不會被命名為「多頭增加」。
 
 Raw nominal mark/index OHLC 只作 provenance 與衍生計算；給模型時應優先選擇
-`*_log_return_15m`、`*_range_log`、basis、OI change、taker imbalance 等正規化欄位。
+`*_log_return_1m`、`*_range_log`、basis、OI change、taker imbalance 等正規化欄位。
+Rubik OI／ratio／taker 統計的官方最細粒度是 5m；下載器保留 5m 原生標籤，
+只做因果向後對齊，不把它冒充為 1m 新觀測。
 
-## 歷史存在，但不放進預設 compact 15m 層
+## 歷史存在，但不放進預設 compact 1m 層
 
 | 類別 | 來源 | 原因 |
 |---|---|---|
-| Raw premium samples | `/api/v5/public/premium-history` | 六個月高頻樣本；15m mark/index 歷史已能重建同一 fair-value 機制 |
+| Raw premium samples | `/api/v5/public/premium-history` | 六個月高頻樣本；1m mark/index 歷史已能重建同一 fair-value 機制 |
 | Tick trades | `market-data-history module=1` | 可重建 trade count、size、精確 CVD，但全市場歷史量很大，需要獨立 archive 預算 |
 | 400/5000-level L2 | `market-data-history module=4/5` | 可歷史重建，但 2026-07-20 至 2026-07-25 的 BTC-USDT 400-level 實測約 1,973 MB |
-| 1m candle archive | `market-data-history module=2` | 與既有官方 15m K 線重複 |
+| 1m candle archive | `market-data-history module=2` | 與既有官方 1m REST K 線重複；可作大規模回補加速器，但要獨立 checksum receipt |
 | Borrowing-rate archive | `market-data-history module=11` | 是 margin borrowing，不是目前 SWAP 商品粒度 |
 | Options Trading Statistics | Rubik options endpoints | 主要是 BTC/ETH 市場級 context，不是每個 SWAP 的相同 grain |
 
 這些資料不是 snapshot-only；它們只是不能在沒有儲存與運算預算的情況下，
-悄悄併入每 15 分鐘 live updater。若要使用 tick/L2，應建立獨立 immutable
-raw archive、容量上限、receipt、缺口稽核及 15 分鐘 materializer。
+悄悄併入每 1 分鐘 live updater。若要使用 tick/L2，應建立獨立 immutable
+raw archive、容量上限、receipt、缺口稽核及 1 分鐘 materializer。
 
 ## 明確排除：無法 point-in-time 重建
 
@@ -64,20 +66,20 @@ raw archive、容量上限、receipt、缺口稽核及 15 分鐘 materializer。
 
 ## 因果對齊
 
-- K 線與 Rubik 15m 統計只保留已完成 bar。
+- K 線只保留已完成 1m bar；Rubik 統計保留官方 5m 原生時間戳。
 - Funding event 使用 `fundingTime <= bar_close_ts` 的最後一筆，並保存
   `okx_funding_age_hours`。
 - Funding interval 用前一個已知 settlement 計算；下載器額外抓 24 小時 causal
   context，避免 requested range 第一筆事件失去間隔。
-- 模型若在 15 分鐘 bar close 後決策，必須在 next-bar open 或更晚執行。
+- 模型若在 1 分鐘 bar close 後決策，必須在 next-bar open 或更晚執行。
 - 短 coverage 欄位的舊歷史保持 null，不會用今天的值回填。
 
 ## 執行與進度
 
 ```bash
 source scripts/runtime_env.sh
-run_fintech_python downloader/download_okx_perp_15m.py \
-  --output-dir data_okx \
+run_fintech_python downloader/download_okx_perp_1m.py \
+  --output-dir data_okx/1m \
   --mode incremental \
   --start-date 2019-01-01 \
   --end-date today \
@@ -92,4 +94,3 @@ run_fintech_python downloader/download_okx_perp_15m.py \
 
 緊急只更新 K 線時可明確使用 `--skip-historical-features`。若只想跳過月度 funding
 ZIP，可使用 `--skip-funding-archive`；這時 funding 只剩官方 REST 的三個月邊界。
-

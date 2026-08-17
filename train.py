@@ -1314,6 +1314,15 @@ def main() -> None:
         return
 
     panel = _build_panel_rank_coordinated(build_panel, config, active_strategy)
+    if str(config.trading.execution_mode) == "tw_futures_portfolio_day":
+        from stockagent.data.tw_futures_portfolio_daily import (
+            attach_futures_portfolio_daily,
+        )
+
+        panel = attach_futures_portfolio_daily(
+            panel,
+            config.trading.tw_futures_portfolio_data_path,
+        )
     if (
         str(config.trading.execution_mode) == "tw_day_trade"
         and config.data.day_trade_minute_execution_root is not None

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import date as datetime_date
 import gzip
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -19,6 +20,7 @@ if str(REPO_ROOT) not in sys.path:
 from stockagent.live.tw_day_trade_dashboard import (  # noqa: E402
     build_dashboard_event_page,
     build_dashboard_history_snapshot,
+    build_dashboard_position_page,
     build_dashboard_signal_page,
     build_dashboard_snapshot,
     build_dashboard_summary,
@@ -46,16 +48,27 @@ def _session_date_query(raw_query: str) -> str | None:
     return value or None
 
 
-def _history_range_query(raw_query: str) -> str:
+def _history_query(raw_query: str) -> dict[str, str | None]:
     query = parse_qs(
         raw_query,
         keep_blank_values=True,
         strict_parsing=False,
-        max_num_fields=1,
+        max_num_fields=3,
     )
-    if set(query) - {"range"} or any(len(values) != 1 for values in query.values()):
+    if set(query) - {"range", "start_date", "end_date"} or any(
+        len(values) != 1 for values in query.values()
+    ):
         raise ValueError("unsupported or repeated query field")
-    return str(query.get("range", ["1d"])[0]).strip() or "1d"
+    range_key = str(query.get("range", ["1d"])[0]).strip() or "1d"
+    start_date = str(query.get("start_date", [""])[0]).strip() or None
+    end_date = str(query.get("end_date", [""])[0]).strip() or None
+    if start_date is not None:
+        datetime_date.fromisoformat(start_date)
+    if end_date is not None:
+        datetime_date.fromisoformat(end_date)
+    if start_date is not None and end_date is not None and start_date > end_date:
+        raise ValueError("history start_date must not be after end_date")
+    return {"range_key": range_key, "start_date": start_date, "end_date": end_date}
 
 
 class DashboardServer(ThreadingHTTPServer):
@@ -86,13 +99,24 @@ class DashboardServer(ThreadingHTTPServer):
     def signal_page(self, **kwargs: object) -> dict[str, object]:
         return build_dashboard_signal_page(state_dir=self.state_dir, **kwargs)
 
+    def position_page(self, **kwargs: object) -> dict[str, object]:
+        return build_dashboard_position_page(state_dir=self.state_dir, **kwargs)
+
     def event_page(self, **kwargs: object) -> dict[str, object]:
         return build_dashboard_event_page(state_dir=self.state_dir, **kwargs)
 
-    def history(self, *, range_key: str) -> dict[str, object]:
+    def history(
+        self,
+        *,
+        range_key: str,
+        start_date: str | None = None,
+        end_date: str | None = None,
+    ) -> dict[str, object]:
         return build_dashboard_history_snapshot(
             state_dir=self.state_dir,
             range_key=range_key,
+            start_date=start_date,
+            end_date=end_date,
         )
 
     def summary(self, *, session_date: str | None = None) -> dict[str, object]:
@@ -178,9 +202,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/history":
             try:
+                history_query = _history_query(parsed.query)
                 self._json(
                     HTTPStatus.OK,
-                    self.server.history(range_key=_history_range_query(parsed.query)),
+                    self.server.history(**history_query),
                 )
             except (OSError, ValueError, json.JSONDecodeError) as exc:
                 self._json(
@@ -198,6 +223,30 @@ class DashboardHandler(BaseHTTPRequestHandler):
                         symbol=str(query.get("symbol", [""])[0]),
                         status=str(query.get("status", ["all"])[0]),
                         session_date=str(query.get("date", [""])[0]) or None,
+                        start_date=str(query.get("start_date", [""])[0]) or None,
+                        end_date=str(query.get("end_date", [""])[0]) or None,
+                        offset=int(query.get("offset", ["0"])[0]),
+                        limit=int(query.get("limit", ["250"])[0]),
+                    ),
+                )
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                self._json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"health": "unavailable", "error": f"{type(exc).__name__}: {exc}"},
+                )
+            return
+        if path == "/api/positions":
+            try:
+                query = parse_qs(parsed.query)
+                self._json(
+                    HTTPStatus.OK,
+                    self.server.position_page(
+                        mode=str(query.get("mode", [""])[0]),
+                        symbol=str(query.get("symbol", [""])[0]),
+                        status=str(query.get("status", ["all"])[0]),
+                        session_date=str(query.get("date", [""])[0]) or None,
+                        start_date=str(query.get("start_date", [""])[0]) or None,
+                        end_date=str(query.get("end_date", [""])[0]) or None,
                         offset=int(query.get("offset", ["0"])[0]),
                         limit=int(query.get("limit", ["250"])[0]),
                     ),
@@ -217,6 +266,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                         mode=str(query.get("mode", [""])[0]),
                         symbol=str(query.get("symbol", [""])[0]),
                         session_date=str(query.get("date", [""])[0]) or None,
+                        start_date=str(query.get("start_date", [""])[0]) or None,
+                        end_date=str(query.get("end_date", [""])[0]) or None,
                         offset=int(query.get("offset", ["0"])[0]),
                         limit=int(query.get("limit", ["250"])[0]),
                     ),

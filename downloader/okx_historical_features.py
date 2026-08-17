@@ -19,8 +19,10 @@ import pyarrow.parquet as pq
 from tqdm import tqdm
 
 
-KLINE_BAR = "15m"
-CANDLE_INTERVAL_MS = 15 * 60 * 1000
+KLINE_BAR = "1m"
+RUBIK_PERIOD = "5m"
+CANDLE_INTERVAL_MS = 60 * 1000
+RUBIK_INTERVAL_MS = 5 * 60 * 1000
 FEATURE_SCHEMA_VERSION = 1
 
 MARK_PRICE_HISTORY_ENDPOINT = "/api/v5/market/history-mark-price-candles"
@@ -76,15 +78,15 @@ RAW_FEATURE_COLUMNS = (
 )
 
 DERIVED_FEATURE_COLUMNS = (
-    "okx_mark_log_return_15m",
-    "okx_index_log_return_15m",
+    "okx_mark_log_return_1m",
+    "okx_index_log_return_1m",
     "okx_mark_range_log",
     "okx_index_range_log",
     "okx_contract_mark_basis_log",
     "okx_mark_index_basis_log",
     "okx_funding_realized_annualized",
-    "okx_open_interest_contracts_log_change_15m",
-    "okx_open_interest_usd_log_change_15m",
+    "okx_open_interest_contracts_log_change_5m",
+    "okx_open_interest_usd_log_change_5m",
     "okx_open_interest_usd_to_volume_log",
     "okx_taker_imbalance",
     "okx_long_short_account_ratio_log",
@@ -108,32 +110,32 @@ FAMILY_PRIMARY_COLUMN = {
 
 HISTORICAL_FEATURE_CATALOG: tuple[dict[str, Any], ...] = (
     {
-        "id": "trade_candles_15m",
+        "id": "trade_candles_1m",
         "category": "price_volume",
         "download_status": "included_existing",
         "endpoint": "/api/v5/market/history-candles",
-        "history_contract": "recent years; 15m completed bars",
-        "grain": "instrument_15m",
+        "history_contract": "recent years; completed one-minute bars",
+        "grain": "instrument_1m",
         "model_role": "OHLCV source of truth",
         "reason": "Canonical price/volume series already downloaded by the parent downloader.",
     },
     {
-        "id": "mark_price_candles_15m",
+        "id": "mark_price_candles_1m",
         "category": "fair_value",
         "download_status": "included",
         "endpoint": MARK_PRICE_HISTORY_ENDPOINT,
         "history_contract": "recent years",
-        "grain": "instrument_15m",
+        "grain": "instrument_1m",
         "model_role": "mark return, mark range, contract-mark basis",
         "reason": "Historical candles are point-in-time reconstructable.",
     },
     {
-        "id": "index_price_candles_15m",
+        "id": "index_price_candles_1m",
         "category": "fair_value",
         "download_status": "included",
         "endpoint": INDEX_PRICE_HISTORY_ENDPOINT,
         "history_contract": "recent years",
-        "grain": "instrument_family_15m",
+        "grain": "instrument_family_1m",
         "model_role": "index return, index range, mark-index and contract-index basis",
         "reason": "Historical candles are point-in-time reconstructable.",
     },
@@ -149,57 +151,57 @@ HISTORICAL_FEATURE_CATALOG: tuple[dict[str, Any], ...] = (
             "archive coverage varies and is backfilled by OKX; REST history is limited "
             "to three months"
         ),
-        "grain": "instrument_settlement_event_asof_15m",
+        "grain": "instrument_settlement_event_asof_1m",
         "model_role": "realized funding, settlement prediction, interval, age, annualized carry",
         "reason": "Monthly archive reconstructs old realized rates; REST supplies recent metadata.",
     },
     {
-        "id": "open_interest_15m",
+        "id": "open_interest_5m",
         "category": "leverage",
         "download_status": "included_limited_history",
         "endpoint": OPEN_INTEREST_HISTORY_ENDPOINT,
-        "history_contract": "latest 1,440 entries; about 15 days at 15m",
-        "grain": "instrument_15m",
+        "history_contract": "latest 1,440 entries; about 5 days at native 5m",
+        "grain": "instrument_native_5m_aligned_to_1m",
         "model_role": "OI contracts/coin/USD and causal changes",
         "reason": "Historical endpoint exists, but the short coverage boundary is retained.",
     },
     {
-        "id": "contract_taker_volume_15m",
+        "id": "contract_taker_volume_5m",
         "category": "order_flow",
         "download_status": "included_limited_history",
         "endpoint": TAKER_VOLUME_HISTORY_ENDPOINT,
-        "history_contract": "latest 1,440 entries; about 15 days at 15m",
-        "grain": "instrument_15m",
+        "history_contract": "latest 1,440 entries; about 5 days at native 5m",
+        "grain": "instrument_native_5m_aligned_to_1m",
         "model_role": "taker buy/sell contracts and imbalance",
         "reason": "Historical aggregate is reconstructable without a live trade snapshot.",
     },
     {
-        "id": "contract_long_short_account_ratio_15m",
+        "id": "contract_long_short_account_ratio_5m",
         "category": "positioning",
         "download_status": "included_limited_history",
         "endpoint": LONG_SHORT_ACCOUNT_RATIO_ENDPOINT,
-        "history_contract": "latest 1,440 entries; about 15 days at 15m",
-        "grain": "instrument_15m",
+        "history_contract": "latest 1,440 entries; about 5 days at native 5m",
+        "grain": "instrument_native_5m_aligned_to_1m",
         "model_role": "all-trader account-count long/short ratio",
         "reason": "Historical endpoint exists; account ratio is not position notional.",
     },
     {
-        "id": "top_trader_account_ratio_15m",
+        "id": "top_trader_account_ratio_5m",
         "category": "positioning",
         "download_status": "included_limited_history",
         "endpoint": TOP_TRADER_ACCOUNT_RATIO_ENDPOINT,
         "history_contract": "latest 1,440 entries",
-        "grain": "instrument_15m",
+        "grain": "instrument_native_5m_aligned_to_1m",
         "model_role": "top-5%-trader account-count long/short ratio",
         "reason": "Historical endpoint exists and is distinct from position ratio.",
     },
     {
-        "id": "top_trader_position_ratio_15m",
+        "id": "top_trader_position_ratio_5m",
         "category": "positioning",
         "download_status": "included_limited_history",
         "endpoint": TOP_TRADER_POSITION_RATIO_ENDPOINT,
         "history_contract": "latest 1,440 entries",
-        "grain": "instrument_15m",
+        "grain": "instrument_native_5m_aligned_to_1m",
         "model_role": "top-5%-trader position-notional long/short ratio",
         "reason": "Historical endpoint exists and is distinct from account ratio.",
     },
@@ -212,7 +214,7 @@ HISTORICAL_FEATURE_CATALOG: tuple[dict[str, Any], ...] = (
         "grain": "instrument_event",
         "model_role": "premium index",
         "reason": (
-            "The same causal mechanism is reconstructed at 15m from historical mark and "
+            "The same causal mechanism is reconstructed at 1m from historical mark and "
             "index candles; downloading every raw premium sample would multiply requests."
         ),
     },
@@ -225,7 +227,7 @@ HISTORICAL_FEATURE_CATALOG: tuple[dict[str, Any], ...] = (
         "grain": "tick",
         "model_role": "trade count, size distribution, exact CVD",
         "reason": (
-            "Historically reconstructable but materially larger than the compact 15m "
+            "Historically reconstructable but materially larger than the compact 1m "
             "feature layer; do not silently download it for every live SWAP."
         ),
     },
@@ -249,8 +251,8 @@ HISTORICAL_FEATURE_CATALOG: tuple[dict[str, Any], ...] = (
         "endpoint": f"{MARKET_DATA_HISTORY_ENDPOINT} module=2",
         "history_contract": "T+2; OKX backfill coverage varies",
         "grain": "instrument_1m",
-        "model_role": "none in the current 15m source contract",
-        "reason": "The canonical downloader already obtains official completed 15m candles.",
+        "model_role": "canonical one-minute archive fallback",
+        "reason": "The canonical downloader obtains official completed 1m candles; archive files can accelerate full backfill.",
     },
     {
         "id": "borrowing_rate_archive",
@@ -424,8 +426,9 @@ def feature_catalog_payload() -> dict[str, Any]:
         "schema_version": FEATURE_SCHEMA_VERSION,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "bar": KLINE_BAR,
+        "statistics_period": RUBIK_PERIOD,
         "decision_contract": (
-            "A row is available only after its 15-minute bar closes. Event series use "
+            "A row is available only after its one-minute bar closes. Event series use "
             "event_ts <= bar_close_ts; execution must occur at or after the next bar open."
         ),
         "catalog": list(HISTORICAL_FEATURE_CATALOG),
@@ -433,14 +436,18 @@ def feature_catalog_payload() -> dict[str, Any]:
 
 
 def _ms_to_date_string(ms: int) -> str:
-    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
 
 
 def _write_parquet(frame: pl.DataFrame, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_name(f".{path.name}.{os.getpid()}.features.tmp")
     try:
-        pq.write_table(frame.to_arrow(), tmp_path, compression="snappy", write_statistics=True)
+        pq.write_table(
+            frame.to_arrow(), tmp_path, compression="snappy", write_statistics=True
+        )
         tmp_path.replace(path)
     finally:
         if tmp_path.exists():
@@ -655,7 +662,9 @@ def _monthly_query_ranges(start_ms: int, end_ms: int) -> list[tuple[int, int]]:
     while cursor <= end_dt:
         next_cursor = _add_months(cursor, 20)
         chunk_end = min(end_dt, next_cursor)
-        ranges.append((int(cursor.timestamp() * 1000), int(chunk_end.timestamp() * 1000)))
+        ranges.append(
+            (int(cursor.timestamp() * 1000), int(chunk_end.timestamp() * 1000))
+        )
         cursor = next_cursor
     return ranges
 
@@ -697,7 +706,9 @@ def _fetch_funding_archive(
                 if not member.lower().endswith(".csv"):
                     continue
                 with archive.open(member) as handle:
-                    reader = csv.DictReader(io.TextIOWrapper(handle, encoding="utf-8-sig"))
+                    reader = csv.DictReader(
+                        io.TextIOWrapper(handle, encoding="utf-8-sig")
+                    )
                     for row in reader:
                         symbol = str(
                             row.get("instrument_name")
@@ -803,8 +814,7 @@ def _materialize_funding_asof(
     selected = (
         frame.select(["date", _datetime_ms_expr("date").alias("_bar_open_ms")])
         .filter(
-            (pl.col("_bar_open_ms") >= start_ms)
-            & (pl.col("_bar_open_ms") <= end_ms)
+            (pl.col("_bar_open_ms") >= start_ms) & (pl.col("_bar_open_ms") <= end_ms)
         )
         .sort("_bar_open_ms")
     )
@@ -840,15 +850,11 @@ def _materialize_funding_asof(
     return pl.DataFrame(
         {
             "date": selected["date"],
-            "okx_funding_rate_at_settlement": values(
-                "okx_funding_rate_at_settlement"
-            ),
+            "okx_funding_rate_at_settlement": values("okx_funding_rate_at_settlement"),
             "okx_funding_realized_rate": values("okx_funding_realized_rate"),
             "okx_funding_interval_hours": values("okx_funding_interval_hours"),
             "okx_funding_age_hours": age_hours,
-            "okx_funding_formula_with_rate": values(
-                "okx_funding_formula_with_rate"
-            ),
+            "okx_funding_formula_with_rate": values("okx_funding_formula_with_rate"),
             "okx_funding_method_current_period": values(
                 "okx_funding_method_current_period"
             ),
@@ -908,12 +914,32 @@ def _positive_log_ratio(numerator: str, denominator: str, alias: str) -> pl.Expr
 def _contiguous_log_change(column: str, alias: str) -> pl.Expr:
     contiguous = _datetime_ms_expr("date").diff() == CANDLE_INTERVAL_MS
     return (
-        pl.when(
-            contiguous
-            & (pl.col(column) > 0)
-            & (pl.col(column).shift(1) > 0)
-        )
+        pl.when(contiguous & (pl.col(column) > 0) & (pl.col(column).shift(1) > 0))
         .then(pl.col(column).log() - pl.col(column).shift(1).log())
+        .otherwise(None)
+        .alias(alias)
+    )
+
+
+def _observation_log_change(column: str, alias: str) -> pl.Expr:
+    """Change between native sparse observations, emitted only on observation rows."""
+
+    previous_observation = pl.col(column).forward_fill().shift(1)
+    observation_ts = pl.when(pl.col(column).is_not_null()).then(
+        _datetime_ms_expr("date")
+    )
+    previous_observation_ts = observation_ts.forward_fill().shift(1)
+    return (
+        pl.when(
+            pl.col(column).is_not_null()
+            & (pl.col(column) > 0)
+            & (previous_observation > 0)
+            & (
+                (_datetime_ms_expr("date") - previous_observation_ts)
+                <= RUBIK_INTERVAL_MS
+            )
+        )
+        .then(pl.col(column).log() - previous_observation.log())
         .otherwise(None)
         .alias(alias)
     )
@@ -923,15 +949,9 @@ def _add_derived_features(frame: pl.DataFrame) -> pl.DataFrame:
     frame = _ensure_raw_columns(frame).sort("date")
     derived = frame.with_columns(
         [
-            _contiguous_log_change(
-                "okx_mark_close", "okx_mark_log_return_15m"
-            ),
-            _contiguous_log_change(
-                "okx_index_close", "okx_index_log_return_15m"
-            ),
-            _positive_log_ratio(
-                "okx_mark_high", "okx_mark_low", "okx_mark_range_log"
-            ),
+            _contiguous_log_change("okx_mark_close", "okx_mark_log_return_1m"),
+            _contiguous_log_change("okx_index_close", "okx_index_log_return_1m"),
+            _positive_log_ratio("okx_mark_high", "okx_mark_low", "okx_mark_range_log"),
             _positive_log_ratio(
                 "okx_index_high", "okx_index_low", "okx_index_range_log"
             ),
@@ -954,17 +974,16 @@ def _add_derived_features(frame: pl.DataFrame) -> pl.DataFrame:
             )
             .otherwise(None)
             .alias("okx_funding_realized_annualized"),
-            _contiguous_log_change(
+            _observation_log_change(
                 "okx_open_interest_contracts",
-                "okx_open_interest_contracts_log_change_15m",
+                "okx_open_interest_contracts_log_change_5m",
             ),
-            _contiguous_log_change(
+            _observation_log_change(
                 "okx_open_interest_usd",
-                "okx_open_interest_usd_log_change_15m",
+                "okx_open_interest_usd_log_change_5m",
             ),
             pl.when(
-                (pl.col("okx_open_interest_usd") >= 0)
-                & (pl.col("Trading_Volume") >= 0)
+                (pl.col("okx_open_interest_usd") >= 0) & (pl.col("Trading_Volume") >= 0)
             )
             .then(
                 pl.col("okx_open_interest_usd").log1p()
@@ -1062,18 +1081,14 @@ def enrich_symbol_historical_features(
     dataset_start_ms = max(start_ms, int(base_start_value))
     closed_end_ms = min(end_ms, int(base_end_value))
     inst_family = str(
-        getattr(record, "inst_family", None)
-        or getattr(record, "uly", None)
-        or ""
+        getattr(record, "inst_family", None) or getattr(record, "uly", None) or ""
     ).strip()
     if not inst_family:
         inst_family = str(record.okx_symbol).removesuffix("-SWAP")
 
     def mark_stage() -> None:
         nonlocal frame
-        feature_start = _latest_non_null_ms(
-            frame, "okx_mark_close", dataset_start_ms
-        )
+        feature_start = _latest_non_null_ms(frame, "okx_mark_close", dataset_start_ms)
         rows = _fetch_array_history(
             client,
             MARK_PRICE_HISTORY_ENDPOINT,
@@ -1101,9 +1116,7 @@ def enrich_symbol_historical_features(
 
     def index_stage() -> None:
         nonlocal frame
-        feature_start = _latest_non_null_ms(
-            frame, "okx_index_close", dataset_start_ms
-        )
+        feature_start = _latest_non_null_ms(frame, "okx_index_close", dataset_start_ms)
         rows = _fetch_array_history(
             client,
             INDEX_PRICE_HISTORY_ENDPOINT,
@@ -1218,7 +1231,7 @@ def enrich_symbol_historical_features(
                 path,
                 {
                     "instId": record.okx_symbol,
-                    "period": KLINE_BAR,
+                    "period": RUBIK_PERIOD,
                     **(extra_params or {}),
                 },
                 start_ms=feature_start,
@@ -1310,8 +1323,14 @@ def enrich_symbol_historical_features(
 
 
 class _StageProgress:
-    def __init__(self, symbol_count: int) -> None:
+    def __init__(
+        self,
+        symbol_count: int,
+        *,
+        external_callback: Callable[[str, str, str], None] | None = None,
+    ) -> None:
         self._lock = threading.Lock()
+        self._external_callback = external_callback
         self._seen: set[tuple[str, str]] = set()
         self._counts: Counter[str] = Counter()
         self._bar = tqdm(
@@ -1333,6 +1352,8 @@ class _StageProgress:
                 failed=self._counts["failed"],
                 refresh=False,
             )
+        if self._external_callback is not None:
+            self._external_callback(code, stage, status)
 
     def fill_missing(self, code: str, status: str) -> None:
         for stage in FEATURE_STAGE_IDS:
@@ -1351,6 +1372,7 @@ def run_historical_feature_downloads(
     end_ms: int,
     workers: int,
     include_funding_archive: bool,
+    stage_progress_callback: Callable[[str, str, str], None] | None = None,
 ) -> list[HistoricalFeatureResult]:
     eligible = [
         record
@@ -1360,7 +1382,7 @@ def run_historical_feature_downloads(
     if not eligible:
         return []
 
-    progress = _StageProgress(len(eligible))
+    progress = _StageProgress(len(eligible), external_callback=stage_progress_callback)
     results: list[HistoricalFeatureResult] = []
 
     def worker(record: Any) -> HistoricalFeatureResult:

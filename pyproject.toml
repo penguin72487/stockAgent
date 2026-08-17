@@ -1,6 +1,15 @@
 [tool.pytest.ini_options]
 testpaths = ["test"]
 python_files = ["test_*.py"]
+filterwarnings = [
+  # Treat new warnings as failures. These two exact deprecations are emitted by
+  # OpenBB 4.7.2 internals and cannot be repaired from stockAgent; keep the
+  # exceptions narrow by message and originating module until OpenBB removes
+  # its aiohttp subclass and classmethod Pydantic validator.
+  "error",
+  "ignore:Inheritance class ClientSession from ClientSession is discouraged:DeprecationWarning:openbb_core\\.provider\\.utils\\.client",
+  "ignore:Using `@model_validator` with mode='after' on a classmethod is deprecated.*:DeprecationWarning:openbb_core\\.app\\.model\\.system_settings",
+]
 
 [tool.ruff]
 target-version = "py312"

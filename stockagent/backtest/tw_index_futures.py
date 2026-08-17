@@ -14,6 +14,7 @@ import math
 from numbers import Real
 import os
 from typing import Callable, Final
+import warnings
 
 import numpy as np
 import torch
@@ -246,15 +247,6 @@ def _run_tw_index_futures_all_tenors_day_torch_impl(
     limit = _finite_nonnegative("max_abs_exposure", max_abs_exposure)
     if capital <= 0.0 or limit <= 0.0:
         raise ValueError("initial_capital and max_abs_exposure must be positive")
-    if actions.ndim != 2 or int(actions.size(1)) != TAIFEX_INDEX_FUTURES_ACTION_COUNT:
-        raise ValueError("actions must have shape [T,18]")
-    if tuple(execution_tensor.shape) != (
-        int(actions.size(0)),
-        TAIFEX_INDEX_FUTURES_ACTION_COUNT,
-        3,
-    ):
-        raise ValueError("execution_tensor must have shape [T,18,3]")
-
     clean = torch.nan_to_num(actions.float(), nan=0.0, posinf=0.0, neginf=0.0)
     gross_requested = clean.abs().sum(dim=-1, keepdim=True)
     exact_scale = torch.clamp(
@@ -504,6 +496,15 @@ def run_tw_index_futures_all_tenors_day_torch(
     a second tail formula or a length-specific graph.
     """
 
+    if actions.ndim != 2 or int(actions.size(1)) != TAIFEX_INDEX_FUTURES_ACTION_COUNT:
+        raise ValueError("actions must have shape [T,18]")
+    if tuple(execution_tensor.shape) != (
+        int(actions.size(0)),
+        TAIFEX_INDEX_FUTURES_ACTION_COUNT,
+        3,
+    ):
+        raise ValueError("execution_tensor must have shape [T,18,3]")
+
     try:
         block_rows = int(
             os.environ.get(
@@ -602,11 +603,42 @@ def run_tw_index_futures_all_tenors_day_torch(
     chunks: list[FuturesContinuousBacktest] = []
     total_rows = int(actions.size(0))
     full_stop = total_rows - total_rows % block_rows
+
+    def call_compiled_block(
+        block_actions: torch.Tensor,
+        block_execution: torch.Tensor,
+        block_equity_scale: torch.Tensor,
+        block_alive: torch.Tensor,
+    ) -> tuple[torch.Tensor, ...]:
+        # PyTorch Dynamo probes ``.grad`` while wrapping non-leaf tensor
+        # inputs.  Pytest's repository-wide warnings-as-errors policy can turn
+        # that internal, non-semantic probe into an InternalTorchDynamoError.
+        # Keep the suppression limited to this exact upstream warning; the
+        # compiled graph, gradients, and strict no-fallback behavior remain
+        # unchanged.
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message=r"The \.grad attribute of a Tensor that is not a leaf Tensor.*",
+                category=UserWarning,
+            )
+            warnings.filterwarnings(
+                "ignore",
+                message=r"`torch\.jit\.script_method` is deprecated\..*",
+                category=DeprecationWarning,
+            )
+            return compiled_block(
+                block_actions,
+                block_execution,
+                block_equity_scale,
+                block_alive,
+            )
+
     try:
         for start in range(0, full_stop, block_rows):
             stop = start + block_rows
             result = _futures_result_from_tuple(
-                compiled_block(
+                call_compiled_block(
                     actions[start:stop],
                     execution_tensor[start:stop],
                     equity_scale,
@@ -641,7 +673,7 @@ def run_tw_index_futures_all_tenors_day_torch(
                 dim=0,
             )
             padded_tail = _futures_result_from_tuple(
-                compiled_block(
+                call_compiled_block(
                     padded_actions,
                     padded_execution,
                     equity_scale,

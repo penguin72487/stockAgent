@@ -6,7 +6,7 @@
   <meta name="color-scheme" content="dark">
   <meta name="theme-color" content="#071019">
   <title>台股四模式當沖模擬</title>
-  <link rel="stylesheet" href="styles.css?v=15">
+  <link rel="stylesheet" href="styles.css?v=17">
   <link rel="stylesheet" href="../dashboard-core.css?v=5">
 </head>
 <body>
@@ -77,7 +77,8 @@
     </div>
     <section class="controls panel" aria-label="明細篩選">
       <div class="controls-title"><strong>明細篩選</strong><span>模式、股票與狀態</span></div>
-      <label>交易日<select id="date-filter"></select></label>
+      <label>起始日<input id="detail-start-date" type="date"></label>
+      <label>終止日<input id="detail-end-date" type="date"></label>
       <label>模式<select id="mode-filter"><option value="all">全部模式</option></select></label>
       <label>股票<input id="symbol-filter" type="search" placeholder="輸入代號或名稱" autocomplete="off"></label>
       <label>狀態<select id="status-filter"><option value="all">全部狀態</option><option value="open">持倉中</option><option value="closed">已平倉</option><option value="blocked">未執行</option></select></label>
@@ -88,7 +89,7 @@
     <section class="grid-two">
       <article class="panel chart-panel">
         <div class="panel-head"><div><h2>每分鐘累積報酬率比較（%）</h2><p>每條線都除以自己的資金基準；策略含成本，股票／ETF 基準含配息與分割，並以可成交 ask 進場、bid 清算。點選彩色圓點可隱藏或顯示曲線。</p></div><div id="chart-legend" class="legend" role="group" aria-label="曲線顯示開關"></div></div>
-        <div id="equity-time-range" class="time-range-control" role="group" aria-label="權益曲線時間範圍"><span>時間範圍</span><button type="button" data-range="1h">1 小時</button><button type="button" data-range="1d">1 天</button><button type="button" data-range="1w">1 週</button><button type="button" data-range="1mo">1 月</button><button type="button" data-range="1q">1 季</button><button type="button" data-range="1y">1 年</button><button type="button" data-range="all">全部</button></div>
+        <div id="equity-time-range" class="time-range-control" role="group" aria-label="權益曲線時間範圍"><span>快速區間</span><button type="button" data-range="1h">1 小時</button><button type="button" data-range="1d">1 天</button><button type="button" data-range="1w">1 週</button><button type="button" data-range="1mo">1 月</button><button type="button" data-range="1q">1 季</button><button type="button" data-range="1y">1 年</button><button type="button" data-range="all">全部</button><div class="date-range-picker" role="group" aria-label="自訂起訖日期"><label for="equity-start-date">起始日<input id="equity-start-date" type="date"></label><span aria-hidden="true">到</span><label for="equity-end-date">終止日<input id="equity-end-date" type="date"></label><button id="clear-equity-dates" class="clear-date-range" type="button">清除日期</button></div></div>
         <div id="chart-empty" class="empty hidden">目前尚無分鐘報酬率資料</div>
         <div class="chart-scroll" tabindex="0" aria-label="台股累積報酬曲線，可在窄螢幕水平捲動"><svg id="equity-chart" viewBox="0 0 960 360" role="img" aria-label="每分鐘累積報酬率百分比曲線"></svg></div>
         <p id="equity-range-note" class="time-range-note" aria-live="polite"></p>
@@ -169,7 +170,7 @@
       </article>
     </section>
   </main>
-  <script src="../time-axis.js?v=3" defer></script>
-  <script src="app.js?v=25" defer></script>
+  <script src="../time-axis.js?v=4" defer></script>
+  <script src="app.js?v=27" defer></script>
 </body>
 </html>

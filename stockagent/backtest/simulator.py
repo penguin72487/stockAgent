@@ -44,6 +44,10 @@ from stockagent.backtest.tw_execution import (
     TW_CARRYING_EXECUTION_MODES,
     normalize_execution_mode,
 )
+from stockagent.backtest.tw_futures_portfolio import (
+    run_tw_futures_portfolio_continuous_numpy,
+    run_tw_futures_portfolio_continuous_torch,
+)
 from stockagent.backtest.tw_integer_execution import (
     TaiwanIntegerBacktestResult,
     TaiwanIntegerState,
@@ -2873,6 +2877,49 @@ def run_backtest_torch(
 ) -> BacktestResultTensor:
     """Simulate daily portfolio execution from model weights in torch."""
     mode = normalize_execution_mode(execution_mode)
+    if mode == "tw_futures_portfolio_day":
+        if force_exit_mask is None:
+            raise ValueError(
+                "tw_futures_portfolio_day requires must-liquidate rows in "
+                "force_exit_mask"
+            )
+        prepped_weights, _, prepped_buy, prepped_sell = _prepare_scan_inputs(
+            weights,
+            tradable_mask,
+            can_buy_mask,
+            can_sell_mask,
+            long_only,
+            gross_leverage,
+            min_trade_weight,
+            portfolio_activation,
+        )
+        result = run_tw_futures_portfolio_continuous_torch(
+            prepped_weights,
+            future_returns,
+            prepped_buy & prepped_sell,
+            force_exit_mask,
+            buy_fee_rate=float(buy_fee_rate),
+            sell_fee_rate=float(sell_fee_rate),
+            max_turnover_ratio=float(max_turnover_ratio),
+            volume_limit_weights=volume_limit_weights,
+            state_advance_mask=state_advance_mask,
+            return_weights_history=return_weights_history,
+            initial_weights=initial_weights,
+            initial_alive=initial_alive,
+        )
+        return BacktestResultTensor(
+            strategy_returns=result.strategy_returns,
+            benchmark_returns=benchmark_returns.to(
+                device=result.strategy_returns.device, dtype=torch.float32
+            ),
+            turnovers=result.turnovers,
+            weights_history=result.weights_history,
+            requested_weights_history=(weights if return_weights_history else None),
+            final_weights=result.final_weights,
+            final_alive=result.final_alive,
+            execution_mode=mode,
+            settlement_ledger_unit="notional_weight",
+        )
     if mode == "tw_index_derivatives_day":
         if weights.dim() != 2 or int(weights.size(1)) != TAIFEX_INDEX_DERIVATIVE_ACTION_COUNT_V4:
             raise ValueError(
@@ -4437,6 +4484,83 @@ def run_backtest_integer_shares(
     lower-fidelity open-to-close integer audit.
     """
     mode = normalize_execution_mode(execution_mode)
+    if mode == "tw_futures_portfolio_day":
+        raw_weights = np.asarray(weights, dtype=np.float64)
+        raw_returns = np.asarray(future_returns, dtype=np.float64)
+        raw_tradable = np.asarray(tradable_mask)
+        raw_benchmark = np.asarray(benchmark_returns, dtype=np.float32)
+        _require_side_masks_if_strict(
+            can_buy_mask,
+            can_sell_mask,
+            context="tw_futures_portfolio_day execution",
+        )
+        raw_can_buy = np.asarray(
+            raw_tradable if can_buy_mask is None else can_buy_mask,
+            dtype=bool,
+        )
+        raw_can_sell = np.asarray(
+            raw_tradable if can_sell_mask is None else can_sell_mask,
+            dtype=bool,
+        )
+        if force_exit_mask is None:
+            raise ValueError(
+                "tw_futures_portfolio_day requires must-liquidate rows in "
+                "force_exit_mask"
+            )
+        valid_shapes = (
+            raw_weights.ndim == 2
+            and raw_returns.shape == raw_weights.shape
+            and raw_tradable.shape == raw_weights.shape
+            and raw_can_buy.shape == raw_weights.shape
+            and raw_can_sell.shape == raw_weights.shape
+            and raw_benchmark.shape == (raw_weights.shape[0],)
+        )
+        if not valid_shapes:
+            raise ValueError("tw_futures_portfolio_day arrays have invalid shapes")
+        gross_budget = _resolve_exposure_budget(gross_leverage)
+        target_weights = np.stack(
+            [
+                _apply_min_trade_weight_row_numpy(
+                    _normalize_target_weights_row_numpy(
+                        row,
+                        long_only=long_only,
+                        gross_budget=gross_budget,
+                        portfolio_activation=portfolio_activation,
+                    ),
+                    min_trade_weight,
+                )
+                for row in np.nan_to_num(raw_weights)
+            ],
+            axis=0,
+        )
+        target_weights = np.where(raw_tradable, target_weights, 0.0)
+        continuous = run_tw_futures_portfolio_continuous_numpy(
+            target_weights,
+            raw_returns,
+            (
+                raw_tradable.astype(bool, copy=False)
+                & raw_can_buy
+                & raw_can_sell
+            ),
+            np.asarray(force_exit_mask, dtype=bool),
+            buy_fee_rate=float(buy_fee_rate),
+            sell_fee_rate=float(sell_fee_rate),
+            max_turnover_ratio=float(max_turnover_ratio),
+        )
+        return (
+            BacktestResult(
+                strategy_returns=continuous.strategy_returns,
+                benchmark_returns=raw_benchmark,
+                turnovers=continuous.turnovers,
+                weights_history=continuous.weights_history,
+                requested_weights_history=raw_weights.astype(np.float32),
+                final_weights=continuous.final_weights,
+                final_alive=continuous.final_alive,
+                execution_mode=mode,
+                settlement_ledger_unit="notional_weight",
+            ),
+            [],
+        )
     if precomputed_exact_backtest is not None:
         if mode != "tw_day_trade":
             raise ValueError(

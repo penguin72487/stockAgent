@@ -34,7 +34,7 @@ from stockagent.data.taifex_sessions import (
     taifex_session_kind,
     taifex_trading_date,
 )
-from stockagent.live.taifex_strategy_state import load_held_option_codes
+from stockagent.live.taifex_strategy_state import load_required_option_codes
 
 
 SOURCE_NAME = "shioaji_taifex_tick_bidask_v1"
@@ -125,12 +125,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--strategy-intraday-interval-seconds", type=int, default=60)
     parser.add_argument("--strategy-intraday-entry-cutoff", default="13:20:00")
     parser.add_argument("--strategy-intraday-flatten-time", default="13:35:00")
-    parser.add_argument(
-        "--strategy-night-entry-cutoff", default="04:40:00"
-    )
-    parser.add_argument(
-        "--strategy-night-flatten-time", default="04:55:00"
-    )
+    parser.add_argument("--strategy-night-entry-cutoff", default="04:40:00")
+    parser.add_argument("--strategy-night-flatten-time", default="04:55:00")
     parser.add_argument(
         "--strategy-option-risk-margin-a-twd", type=float, default=187_000.0
     )
@@ -140,9 +136,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--strategy-option-risk-margin-c-twd", type=float, default=18_800.0
     )
-    parser.add_argument(
-        "--strategy-capital-buffer-multiple", type=float, default=2.0
-    )
+    parser.add_argument("--strategy-capital-buffer-multiple", type=float, default=2.0)
     parser.add_argument(
         "--strategy-catalog-expansion-entry-policy",
         choices=CATALOG_EXPANSION_ENTRY_POLICIES,
@@ -348,10 +342,7 @@ def prioritize_required_option_pairs(
             not root
             or not isinstance(delivery_date, date)
             or delivery_date < trade_date
-            or (
-                isinstance(last_trading_date, date)
-                and last_trading_date < trade_date
-            )
+            or (isinstance(last_trading_date, date) and last_trading_date < trade_date)
         ):
             continue
         try:
@@ -411,7 +402,9 @@ def prioritize_required_option_pairs(
             pair_keys.add((root, delivery_date, strike))
             rights.add(_option_right(getattr(info, "option_right", None)))
         if len(pair_keys) != 1 or rights != {"C", "P"}:
-            raise ValueError("selected options are not adjacent complete Call/Put pairs")
+            raise ValueError(
+                "selected options are not adjacent complete Call/Put pairs"
+            )
         selected_keys.append(next(iter(pair_keys)))
 
     target_pair_count = len(selected_keys)
@@ -558,9 +551,7 @@ def _build_strategy_engine(
         bootstrap_after=bootstrap_after,
         broker_orders_enabled=not settlement_bootstrap_only,
         strategy_mode=str(args.strategy_mode),
-        intraday_decision_interval_seconds=int(
-            args.strategy_intraday_interval_seconds
-        ),
+        intraday_decision_interval_seconds=int(args.strategy_intraday_interval_seconds),
         intraday_entry_cutoff=datetime_time.fromisoformat(
             str(args.strategy_intraday_entry_cutoff)
         ),
@@ -576,9 +567,7 @@ def _build_strategy_engine(
         option_risk_margin_a_twd=float(args.strategy_option_risk_margin_a_twd),
         option_risk_margin_b_twd=float(args.strategy_option_risk_margin_b_twd),
         option_risk_margin_c_twd=float(args.strategy_option_risk_margin_c_twd),
-        strategy_capital_buffer_multiple=float(
-            args.strategy_capital_buffer_multiple
-        ),
+        strategy_capital_buffer_multiple=float(args.strategy_capital_buffer_multiple),
         catalog_expansion_entry_policy=str(
             args.strategy_catalog_expansion_entry_policy
         ),
@@ -629,6 +618,7 @@ def main() -> int:
     capture_trade_date = args.trade_date or taifex_trading_date(observed_start)
     shutdown = threading.Event()
     event_sequence = itertools.count(1)
+
     def request_shutdown(_signum: int, _frame: Any) -> None:
         shutdown.set()
 
@@ -733,7 +723,7 @@ def main() -> int:
         max_pairs=(max_contracts - len(futures_infos)) // 2,
     )
     if args.strategy_required_option_codes is None:
-        required_option_codes = load_held_option_codes(args.strategy_state_dir)
+        required_option_codes = load_required_option_codes(args.strategy_state_dir)
     else:
         required_option_codes = tuple(
             sorted(
@@ -771,10 +761,13 @@ def main() -> int:
     selected_contract_codes = {
         str(getattr(contract, "code", "") or "") for contract in contracts
     }
-    sink.live_book_codes = ({
-        str(getattr(future_base, "code", "") or ""),
-        str(getattr(hedge_base, "code", "") or ""),
-    } & selected_contract_codes) - {""}
+    sink.live_book_codes = (
+        {
+            str(getattr(future_base, "code", "") or ""),
+            str(getattr(hedge_base, "code", "") or ""),
+        }
+        & selected_contract_codes
+    ) - {""}
     subscriptions_requested = len(contracts) * 2
     if subscriptions_requested > 200:
         api.logout()

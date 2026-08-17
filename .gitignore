@@ -123,6 +123,7 @@ activemq-data/
 .env.futures
 .env.trade
 .envrc
+configs/daily_downloader.env
 .venv
 env/
 venv/
@@ -206,6 +207,13 @@ data_forex_frankfurter/*
 data_forex_frankfurter_all/*
 data_okx/*
 data_bybit/*
+/data_binance/
+/data_binance_archive/
+/data_free_public/
+/data_coinmetrics_community/
+/data_crypto_reference/
+/data_dune_crypto/
+/data_crypto_etf/
 data_yahoo_tw_ohlcv/*
 data/*
 /data_tw_public
