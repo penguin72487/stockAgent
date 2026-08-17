@@ -358,6 +358,10 @@ class PanelData:
     index_derivatives_candidate_features: np.ndarray | None = None
     index_derivatives_candidate_mask: np.ndarray | None = None
     index_derivatives_simple_returns: np.ndarray | None = None
+    # Executor-only TAIFEX stock/ETF/index futures physical-contract identities.
+    # The generic feature tensor remains owned by this PanelData;
+    # physical contract codes and liquidation labels are never model inputs.
+    futures_portfolio_daily: Any | None = None
 
     @property
     def num_dates(self) -> int:
@@ -460,6 +464,53 @@ class _SymbolPanelArrays:
     day_trade_can_sell_open_mask: np.ndarray
     alive_mask: np.ndarray
     day_trade_eligible_mask: np.ndarray | None = None
+
+
+def _slice_symbol_arrays_start(
+    arrays: _SymbolPanelArrays,
+    panel_start_date: np.datetime64 | None,
+) -> _SymbolPanelArrays:
+    """Trim loaded rows before dense materialization.
+
+    Per-symbol forward labels are already computed by the native reader, so
+    slicing here preserves the existing panel-start semantics while avoiding a
+    potentially huge dense allocation for dates that will immediately be
+    discarded by ``_slice_panel_start``.
+    """
+
+    if panel_start_date is None or arrays.dates.size == 0:
+        return arrays
+    start = int(
+        np.searchsorted(
+            np.asarray(arrays.dates, dtype="datetime64[D]"),
+            panel_start_date,
+            side="left",
+        )
+    )
+    if start == 0:
+        return arrays
+    slc = slice(start, None)
+
+    def sliced(values: np.ndarray | None) -> np.ndarray | None:
+        return None if values is None else values[slc]
+
+    return _SymbolPanelArrays(
+        symbol=arrays.symbol,
+        dates=arrays.dates[slc],
+        features=arrays.features[slc],
+        returns_1d=arrays.returns_1d[slc],
+        close_prices=arrays.close_prices[slc],
+        open_prices=arrays.open_prices[slc],
+        intraday_returns=arrays.intraday_returns[slc],
+        daily_volumes=arrays.daily_volumes[slc],
+        tradable_mask=arrays.tradable_mask[slc],
+        can_buy_mask=arrays.can_buy_mask[slc],
+        can_sell_mask=arrays.can_sell_mask[slc],
+        day_trade_can_buy_open_mask=arrays.day_trade_can_buy_open_mask[slc],
+        day_trade_can_sell_open_mask=arrays.day_trade_can_sell_open_mask[slc],
+        alive_mask=arrays.alive_mask[slc],
+        day_trade_eligible_mask=sliced(arrays.day_trade_eligible_mask),
+    )
 
 
 @dataclass(slots=True)
@@ -1271,11 +1322,46 @@ _POINT_IN_TIME_STATE_FEATURES = {
 }
 
 
+def _is_point_in_time_state_feature(name: str) -> bool:
+    return name in _POINT_IN_TIME_STATE_FEATURES or name.startswith(
+        _POINT_IN_TIME_STATE_FEATURE_PREFIXES
+    )
+
+
+def _seed_point_in_time_features_before_panel_start(
+    target: np.ndarray,
+    feature_names: list[str],
+    panel_dates: np.ndarray,
+    source_dates: np.ndarray,
+    source_values: np.ndarray,
+) -> None:
+    """Restore the last known PIT state before an early-materialized horizon."""
+
+    if (
+        target.ndim != 2
+        or target.shape[0] == 0
+        or panel_dates.size == 0
+        or source_dates.size == 0
+        or source_values.ndim != 2
+    ):
+        return
+    cutoff = int(np.searchsorted(source_dates, panel_dates[0], side="left"))
+    if cutoff <= 0:
+        return
+    prior = source_values[:cutoff]
+    for col_idx, name in enumerate(feature_names):
+        if not _is_point_in_time_state_feature(name):
+            continue
+        valid = np.flatnonzero(np.isfinite(prior[:, col_idx]))
+        if valid.size:
+            target[0, col_idx] = prior[int(valid[-1]), col_idx]
+
+
 def _forward_fill_point_in_time_features(values: np.ndarray, feature_names: list[str]) -> None:
     if values.ndim != 2 or values.shape[0] == 0:
         return
     for col_idx, name in enumerate(feature_names):
-        if name not in _POINT_IN_TIME_STATE_FEATURES and not name.startswith(_POINT_IN_TIME_STATE_FEATURE_PREFIXES):
+        if not _is_point_in_time_state_feature(name):
             continue
         column = values[:, col_idx]
         valid = np.flatnonzero(np.isfinite(column))
@@ -2668,6 +2754,13 @@ def _build_panel_from_symbol_arrays(
             external_features.market_dates,
             market_values,
         )
+        _seed_point_in_time_features_before_panel_start(
+            market_external,
+            selected_external_feature_names,
+            all_dates,
+            external_features.market_dates,
+            market_values,
+        )
         _forward_fill_point_in_time_features(
             market_external,
             selected_external_feature_names,
@@ -2701,6 +2794,13 @@ def _build_panel_from_symbol_arrays(
             if symbol_external is not None:
                 symbol_values = symbol_external[1][:, external_source_indexer]
                 target = symbol_features[:, external_dest_indexer]
+                _seed_point_in_time_features_before_panel_start(
+                    target,
+                    selected_external_feature_names,
+                    all_dates,
+                    symbol_external[0],
+                    symbol_values,
+                )
                 _overlay_external_values(target, all_dates, symbol_external[0], symbol_values)
                 _forward_fill_point_in_time_features(target, selected_external_feature_names)
                 if not external_dest_is_slice:
@@ -5016,6 +5116,15 @@ def build_panel(
             continue
         if arrays is not None:
             valid_arrays.append(arrays)
+    if normalized_panel_start_date is not None:
+        valid_arrays = [
+            _slice_symbol_arrays_start(arrays, normalized_panel_start_date)
+            for arrays in valid_arrays
+        ]
+        print(
+            "[panel] pruned per-symbol rows before dense materialization "
+            f"for panel_start_date={normalized_panel_start_date}"
+        )
     external_features = (
         _load_external_feature_arrays(
             external_feature_path,

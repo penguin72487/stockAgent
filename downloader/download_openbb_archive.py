@@ -12643,14 +12643,18 @@ _SEC_FUND_SERIES_CACHE: dict[str, str] | None = None
 
 def _sec_symbol_cik_map(page_limiter: Any | None = None) -> dict[str, str]:
     """Load SEC stock/fund identifiers once so each archive task is one request."""
-    import asyncio
-
-    from openbb_sec.utils.helpers import get_all_companies, get_mf_and_etf_map
-
     global _SEC_SYMBOL_CIK_CACHE, _SEC_CIK_SYMBOL_CACHE, _SEC_FUND_SERIES_CACHE
     with _SEC_SYMBOL_CIK_LOCK:
         if _SEC_SYMBOL_CIK_CACHE is not None:
             return _SEC_SYMBOL_CIK_CACHE
+
+        # OpenBB provider initialization is expensive and currently emits
+        # upstream deprecation warnings. Do not initialize it when the shared
+        # catalog is already populated (including tests and warm workers).
+        import asyncio
+
+        from openbb_sec.utils.helpers import get_all_companies, get_mf_and_etf_map
+
         if page_limiter is not None:
             _wait_sec_http_limiter(page_limiter)
         with _suppress_sec_helper_pacing():
@@ -12693,14 +12697,14 @@ def _fetch_sec_identifier_map_workaround(
     page_limiter: Any | None,
 ) -> list[dict[str, str]]:
     """Project symbol/CIK tasks from one shared official SEC catalog load."""
-    from openbb_core.provider.utils.errors import EmptyDataError
-
     mapping = _sec_symbol_cik_map(page_limiter)
     query = str(kwargs.get("query") or kwargs.get("symbol") or "").strip().upper()
     if endpoint == "regulators.sec.cik_map":
         symbol = query.replace(".", "-")
         cik = mapping.get(symbol)
         if not symbol or not cik:
+            from openbb_core.provider.utils.errors import EmptyDataError
+
             raise EmptyDataError(f"No SEC CIK was found for symbol: {query}")
         return [{"symbol": symbol, "cik": cik}]
     if endpoint != "regulators.sec.symbol_map":
@@ -12716,6 +12720,8 @@ def _fetch_sec_identifier_map_workaround(
         }
     symbols = reverse.get(cik, ())
     if not symbols:
+        from openbb_core.provider.utils.errors import EmptyDataError
+
         raise EmptyDataError(f"No SEC symbol was found for CIK: {query}")
     return [{"symbol": symbol, "cik": cik} for symbol in symbols]
 

@@ -59,6 +59,7 @@ from stockagent.backtest.simulator import (
     run_backtest_torch,
 )
 from stockagent.backtest.tw_execution import (
+    CONTINUOUS_WEIGHT_EXECUTION_MODES,
     TW_CARRYING_EXECUTION_MODES,
     TW_DERIVATIVES_TICK_EXECUTION_MODES,
     TW_MINUTE_EXECUTION_MODES,
@@ -655,7 +656,7 @@ def _build_execution_runtime(
 
     mode = normalize_execution_mode(config.trading.execution_mode)
     lag = int(config.trading.tw_settlement_lag_sessions)
-    if mode == "naive":
+    if mode in CONTINUOUS_WEIGHT_EXECUTION_MODES:
         return _ExecutionRuntime(
             mode=mode,
             buy_fee_rates=None,
@@ -946,7 +947,7 @@ def _integer_execution_runtime_kwargs(
     """Bridge the differentiable runtime schedule into the exact CPU oracle."""
 
     kwargs: dict[str, Any] = {"execution_mode": runtime.mode}
-    if runtime.mode == "naive":
+    if runtime.mode in CONTINUOUS_WEIGHT_EXECUTION_MODES:
         return kwargs
     if runtime.mode in {"tw_index_futures_day", "tw_index_derivatives_day"}:
         if runtime.futures_market is None or runtime.futures_cost_schedule is None:
@@ -1068,7 +1069,7 @@ def _integer_audit_initial_capital(
 ) -> float:
     """Use the same absolute-equity anchor as the volume-cap surrogate."""
 
-    if runtime.mode == "naive":
+    if runtime.mode in CONTINUOUS_WEIGHT_EXECUTION_MODES:
         return 1_000_000.0
     if runtime.mode in {"tw_index_futures_day", "tw_index_derivatives_day"}:
         return float(runtime.futures_initial_capital)
@@ -6640,7 +6641,7 @@ def _save_fold_output_artifacts(
                 test_backtest,
                 int(np.asarray(deployment_dates).size),
             )
-    elif requested_mode != "naive":
+    elif requested_mode not in CONTINUOUS_WEIGHT_EXECUTION_MODES:
         if test_integer_backtest is None:
             raise RuntimeError(
                 f"{requested_mode} final artifacts require the exact integer-share oracle"
@@ -12808,13 +12809,15 @@ def _replay_taiwan_stitched_deployment(
     panel: PanelData,
     config: ExperimentConfig,
 ) -> BacktestResult | None:
-    """Replay every owned fold row once through one canonical T+2 account.
+    """Replay every owned fold row once through one canonical account.
 
     Per-fold test metrics intentionally remain independent diagnostics.  The
     stitched deployment is different: model ownership may change, but cash,
     positions, settlement claims, and absorbing default must not reset.  Model
     requests are therefore expanded into the immutable full-panel symbol order
-    and sent through one O(T*S) ledger pass.  A daily no-default day-trade
+    and sent through one O(T*S) ledger pass.  Taiwan cash modes use the exact
+    integer/T+2 oracle; ``tw_futures_portfolio_day`` deliberately uses its
+    continuous-notional, cross-session futures ledger.  A daily no-default day-trade
     experiment must reuse its differentiable daily forward here; replacing it
     with the separate whole-lot audit changes the declared loss contract and can
     round a diversified portfolio to an artificial all-cash deployment.
@@ -16063,7 +16066,7 @@ def _format_fold_evaluation_lines(
             f"excess={float(metrics['excess_return_vs_benchmark']):+.4f}"
         )
 
-    if normalize_execution_mode(execution_mode) == "naive":
+    if normalize_execution_mode(execution_mode) in CONTINUOUS_WEIGHT_EXECUTION_MODES:
         return (
             line("val", val_ic, val_metrics),
             line("test", test_ic, test_metrics),
@@ -16480,7 +16483,8 @@ def _run_training_tree_models(
             )
             canonical_test_bt = (
                 test_bt
-                if execution_runtime.mode == "naive" or canonical_tensor_day_trade
+                if execution_runtime.mode in CONTINUOUS_WEIGHT_EXECUTION_MODES
+                or canonical_tensor_day_trade
                 else test_integer_bt
             )
             deployment_test_bt = _prefix_backtest_result(
@@ -16520,13 +16524,18 @@ def _run_training_tree_models(
                 test_ic=test_ic,
                 test_metrics=(
                     test_met
-                    if execution_runtime.mode == "naive" or canonical_tensor_day_trade
+                    if execution_runtime.mode in CONTINUOUS_WEIGHT_EXECUTION_MODES
+                    or canonical_tensor_day_trade
                     else test_integer_met
                 ),
-                test_integer_metrics=test_integer_met,
+                test_integer_metrics=(
+                    test_integer_met
+                    if execution_runtime.mode not in CONTINUOUS_WEIGHT_EXECUTION_MODES
+                    else None
+                ),
                 test_continuous_surrogate_metrics=(
                     test_met
-                    if execution_runtime.mode != "naive"
+                    if execution_runtime.mode not in CONTINUOUS_WEIGHT_EXECUTION_MODES
                     and not canonical_tensor_day_trade
                     else None
                 ),
@@ -16547,7 +16556,10 @@ def _run_training_tree_models(
             _save_backtest_artifact(
                 _backtest_path(fold_dir), canonical_test_bt, test_dates
             )
-            if execution_runtime.mode != "naive" and not canonical_tensor_day_trade:
+            if (
+                execution_runtime.mode not in CONTINUOUS_WEIGHT_EXECUTION_MODES
+                and not canonical_tensor_day_trade
+            ):
                 _save_backtest_artifact(
                     fold_dir / "test_backtest_continuous_surrogate.npz",
                     test_bt,
@@ -17150,7 +17162,8 @@ def _run_inference_tree_models(
         )
         canonical_test_bt = (
             test_bt
-            if execution_runtime.mode == "naive" or canonical_tensor_day_trade
+            if execution_runtime.mode in CONTINUOUS_WEIGHT_EXECUTION_MODES
+            or canonical_tensor_day_trade
             else test_integer_bt
         )
         deployment_test_bt = _prefix_backtest_result(
@@ -17169,13 +17182,18 @@ def _run_inference_tree_models(
             test_ic=test_ic,
             test_metrics=(
                 test_met
-                if execution_runtime.mode == "naive" or canonical_tensor_day_trade
+                if execution_runtime.mode in CONTINUOUS_WEIGHT_EXECUTION_MODES
+                or canonical_tensor_day_trade
                 else test_integer_met
             ),
-            test_integer_metrics=test_integer_met,
+            test_integer_metrics=(
+                test_integer_met
+                if execution_runtime.mode not in CONTINUOUS_WEIGHT_EXECUTION_MODES
+                else None
+            ),
             test_continuous_surrogate_metrics=(
                 test_met
-                if execution_runtime.mode != "naive"
+                if execution_runtime.mode not in CONTINUOUS_WEIGHT_EXECUTION_MODES
                 and not canonical_tensor_day_trade
                 else None
             ),
@@ -17188,7 +17206,10 @@ def _run_inference_tree_models(
         _save_backtest_artifact(
             _backtest_path(fold_dir), canonical_test_bt, test_dates
         )
-        if execution_runtime.mode != "naive" and not canonical_tensor_day_trade:
+        if (
+            execution_runtime.mode not in CONTINUOUS_WEIGHT_EXECUTION_MODES
+            and not canonical_tensor_day_trade
+        ):
             _save_backtest_artifact(
                 fold_dir / "test_backtest_continuous_surrogate.npz",
                 test_bt,
@@ -17778,7 +17799,8 @@ def _run_inference_neural_models(
         )
         canonical_test_bt = (
             test_bt
-            if fold_execution_runtime.mode == "naive" or canonical_tensor_exact
+            if fold_execution_runtime.mode in CONTINUOUS_WEIGHT_EXECUTION_MODES
+            or canonical_tensor_exact
             else test_integer_bt
         )
         deployment_test_bt = _prefix_backtest_result(
@@ -17797,13 +17819,18 @@ def _run_inference_neural_models(
             test_ic=test_ic,
             test_metrics=(
                 test_met
-                if fold_execution_runtime.mode == "naive" or canonical_tensor_exact
+                if fold_execution_runtime.mode in CONTINUOUS_WEIGHT_EXECUTION_MODES
+                or canonical_tensor_exact
                 else test_integer_met
             ),
-            test_integer_metrics=test_integer_met,
+            test_integer_metrics=(
+                test_integer_met
+                if fold_execution_runtime.mode not in CONTINUOUS_WEIGHT_EXECUTION_MODES
+                else None
+            ),
             test_continuous_surrogate_metrics=(
                 test_met
-                if fold_execution_runtime.mode != "naive"
+                if fold_execution_runtime.mode not in CONTINUOUS_WEIGHT_EXECUTION_MODES
                 and not canonical_tensor_exact
                 else None
             ),
@@ -17816,7 +17843,10 @@ def _run_inference_neural_models(
         _save_backtest_artifact(
             _backtest_path(fold_dir), canonical_test_bt, test_dates
         )
-        if fold_execution_runtime.mode != "naive" and not canonical_tensor_exact:
+        if (
+            fold_execution_runtime.mode not in CONTINUOUS_WEIGHT_EXECUTION_MODES
+            and not canonical_tensor_exact
+        ):
             _save_backtest_artifact(
                 fold_dir / "test_backtest_continuous_surrogate.npz",
                 test_bt,
@@ -20440,7 +20470,11 @@ def _run_training_impl(
                 val_metrics=val_met,
                 test_ic=test_ic,
                 test_metrics=test_met,
-                test_integer_metrics=test_integer_met,
+                test_integer_metrics=(
+                    test_integer_met
+                    if execution_runtime.mode not in CONTINUOUS_WEIGHT_EXECUTION_MODES
+                    else None
+                ),
             )
             _save_fold_output_artifacts(
                 fold_dir=fold_dir,
@@ -21631,7 +21665,11 @@ def _run_training_impl(
                     val_metrics=val_met,
                     test_ic=test_ic,
                     test_metrics=test_met,
-                    test_integer_metrics=test_integer_met,
+                    test_integer_metrics=(
+                        test_integer_met
+                        if execution_runtime.mode not in CONTINUOUS_WEIGHT_EXECUTION_MODES
+                        else None
+                    ),
                 )
                 results_by_fold[fold.fold_id] = fold_result
 

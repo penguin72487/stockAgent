@@ -28,6 +28,7 @@ try:
 except ModuleNotFoundError:  # direct script execution
     from common import SharedRateLimiter, describe_rate_limit, resolve_request_interval
 from stockagent.live.shioaji_traffic_ledger import record_avoided_query, shioaji_query
+from stockagent.live.shioaji_schedule import historical_query_is_protected
 
 
 SHIOAJI_STOCK_HISTORY_START = date(2020, 3, 2)
@@ -117,13 +118,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-traffic-fraction",
         type=float,
-        default=0.90,
+        default=0.75,
         help="Stop cleanly after this fraction of the Shioaji daily traffic quota.",
     )
     parser.add_argument(
         "--traffic-reserve-mb",
         type=float,
-        default=25.0,
+        default=256.0,
         help="Always leave at least this much daily traffic unused.",
     )
     parser.add_argument(
@@ -610,11 +611,10 @@ def _usage_values(api: Any) -> tuple[int, int]:
 
 
 def _taiwan_market_hours_now() -> bool:
-    now = datetime.now(ZoneInfo("Asia/Taipei"))
-    minute = now.hour * 60 + now.minute
-    # A conservative buffer around the continuous 09:00-13:30 session. The
-    # official fair-use guidance asks historical queries to run after market.
-    return now.weekday() < 5 and 8 * 60 + 30 <= minute <= 14 * 60 + 30
+    # Compatibility name retained for the existing downloaders.  The protected
+    # period begins before the observed broker quota reset, not merely before
+    # the exchange opens.
+    return historical_query_is_protected()
 
 
 def _check_traffic_budget(
@@ -1395,6 +1395,10 @@ def main() -> None:
         raise ValueError("--start-date must not be after --end-date")
     if not 0.0 < float(args.max_traffic_fraction) < 1.0:
         raise ValueError("--max-traffic-fraction must be between 0 and 1")
+    if not math.isfinite(float(args.traffic_reserve_mb)) or float(
+        args.traffic_reserve_mb
+    ) < 0.0:
+        raise ValueError("--traffic-reserve-mb must be finite and nonnegative")
     if args.request_interval is not None and float(args.request_interval) < 0.0:
         raise ValueError("--request-interval must be >= 0")
     request_interval = resolve_request_interval(
@@ -1461,7 +1465,7 @@ def main() -> None:
     if _taiwan_market_hours_now() and not args.allow_market_hours:
         raise RuntimeError(
             "Refusing a historical Shioaji backfill during Taiwan market hours "
-            "(08:30-14:30 safety window). Run it after market close; use "
+            "(07:45-14:31 live-priority window). Run it after market close; use "
             "--allow-market-hours only for a deliberate exception."
         )
 

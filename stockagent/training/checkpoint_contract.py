@@ -792,6 +792,30 @@ def _trading_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
             contract["taiwan_index_futures_day"][
                 "all_products_afterhours_context_path"
             ] = str(afterhours_context_path)
+    if execution_mode == "tw_futures_portfolio_day":
+        from stockagent.data.tw_futures_portfolio_daily import (
+            TAIFEX_FUTURES_PORTFOLIO_BACKTEST_CONTRACT_VERSION,
+            TAIFEX_FUTURES_PORTFOLIO_DATA_CONTRACT_VERSION,
+        )
+
+        contract["taiwan_futures_portfolio_day"] = {
+            "data_contract_version": int(
+                TAIFEX_FUTURES_PORTFOLIO_DATA_CONTRACT_VERSION
+            ),
+            "backtest_contract_version": int(
+                TAIFEX_FUTURES_PORTFOLIO_BACKTEST_CONTRACT_VERSION
+            ),
+            "data_path": str(trading.tw_futures_portfolio_data_path),
+            "symbol_contract": (
+                "delivery_month_or_week_slot_with_lifetime_stable_overlap_lane"
+            ),
+            "tenor_sort_key": (
+                "weekly_numbered_wednesday_monthly_third_wednesday_ordering_"
+                "proxy_not_legal_last_trade_date"
+            ),
+            "roll_gap_treatment": "mandatory_old_contract_own_close_no_gap_return",
+            "accounting": "continuous_notional_research_surrogate",
+        }
     if execution_mode == "tw_index_derivatives_day":
         allow_option_short = bool(
             trading.tw_index_derivatives_day_allow_option_short

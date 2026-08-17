@@ -10,7 +10,15 @@ _ROW_INDEX_COL = "__stockagent_row_index"
 
 
 def is_bar_frequency(value: str | None) -> bool:
-    return str(value or "").strip().lower() in {"bar", "intraday", "15m", "15min", "interval"}
+    return str(value or "").strip().lower() in {
+        "bar",
+        "intraday",
+        "1m",
+        "1min",
+        "15m",  # legacy artifact compatibility
+        "15min",
+        "interval",
+    }
 
 
 @dataclass(slots=True)

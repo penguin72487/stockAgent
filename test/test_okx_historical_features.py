@@ -45,9 +45,9 @@ def test_funding_asof_uses_only_events_available_by_bar_close() -> None:
     base = pl.DataFrame(
         {
             "date": [
-                "2026-01-01 00:00:00",
-                "2026-01-01 00:15:00",
-                "2026-01-01 00:30:00",
+                "2026-01-01 00:18:00",
+                "2026-01-01 00:19:00",
+                "2026-01-01 00:20:00",
             ]
         }
     )
@@ -80,7 +80,7 @@ def test_funding_asof_uses_only_events_available_by_bar_close() -> None:
     ]
     assert materialized["okx_funding_age_hours"].to_list()[0] is None
     assert materialized["okx_funding_age_hours"].to_list()[1] == pytest.approx(
-        10 / 60
+        0.0
     )
 
 
@@ -89,7 +89,7 @@ def test_derived_features_are_normalized_and_gap_aware() -> None:
         {
             "date": [
                 "2026-01-01 00:00:00",
-                "2026-01-01 00:15:00",
+                "2026-01-01 00:05:00",
                 "2026-01-01 01:00:00",
             ],
             "close": [100.0, 102.0, 110.0],
@@ -114,10 +114,10 @@ def test_derived_features_are_normalized_and_gap_aware() -> None:
     assert derived["okx_taker_imbalance"].to_list() == pytest.approx(
         [0.2, 0.5, 0.0]
     )
-    assert derived["okx_open_interest_usd_log_change_15m"][1] == pytest.approx(
+    assert derived["okx_open_interest_usd_log_change_5m"][1] == pytest.approx(
         math.log(1.2)
     )
-    assert derived["okx_open_interest_usd_log_change_15m"][2] is None
+    assert derived["okx_open_interest_usd_log_change_5m"][2] is None
     assert derived["okx_mark_index_basis_log"][0] == pytest.approx(
         math.log(101.0 / 100.5)
     )

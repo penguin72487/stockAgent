@@ -14,6 +14,9 @@ from stockagent.backtest.simulator import BacktestResult
 _PLOT_LOG_MIN = -60.0
 _PLOT_LOG_MAX = 60.0
 _MATPLOTLIB_TRANSFORM_DOT_WARNING = r".*invalid value encountered in dot.*"
+_MATPLOTLIB_TIGHT_LAYOUT_AXES_WARNING = (
+    r"This figure includes Axes that are not compatible with tight_layout.*"
+)
 _PLOT_ASPECT_RATIO = 17.0 / 6.0
 _DEFAULT_PLOT_HEIGHT = 6.0
 
@@ -77,6 +80,11 @@ def _safe_tight_layout() -> None:
             "ignore",
             message=_MATPLOTLIB_TRANSFORM_DOT_WARNING,
             category=RuntimeWarning,
+        )
+        warnings.filterwarnings(
+            "ignore",
+            message=_MATPLOTLIB_TIGHT_LAYOUT_AXES_WARNING,
+            category=UserWarning,
         )
         plt.tight_layout()
 

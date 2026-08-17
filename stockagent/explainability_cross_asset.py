@@ -29,6 +29,9 @@ from stockagent.models.normalization import (
 MODULE_NAME = "abstract_cross_asset_transmission"
 DEFAULT_SHOCKS = ("zero", "momentum", "gap", "volume", "volatility", "liquidity")
 _MATPLOTLIB_TRANSFORM_DOT_WARNING = r".*invalid value encountered in dot.*"
+_MATPLOTLIB_TIGHT_LAYOUT_AXES_WARNING = (
+    r"This figure includes Axes that are not compatible with tight_layout.*"
+)
 _GRAPH_BACKENDS = {"auto", "polars", "cugraph"}
 _GRAPH_EDGE_KEY_COLUMNS = ["shock", "source_index", "target_index"]
 _GRAPH_EDGE_SORT_COLUMNS = ["validated_transmission", "shock", "source_index", "target_index"]
@@ -279,6 +282,11 @@ def _safe_matplotlib_tight_layout(fig: Any) -> None:
             "ignore",
             message=_MATPLOTLIB_TRANSFORM_DOT_WARNING,
             category=RuntimeWarning,
+        )
+        warnings.filterwarnings(
+            "ignore",
+            message=_MATPLOTLIB_TIGHT_LAYOUT_AXES_WARNING,
+            category=UserWarning,
         )
         fig.tight_layout()
 

@@ -64,6 +64,24 @@ def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
     temporary.replace(path)
 
 
+def _retained_rule_response_kind(dataset: str, raw: bytes) -> str:
+    """Identify the retained official schema without changing its contents."""
+
+    if dataset != "twse_day_trade_eligibility":
+        return "json"
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"retained {dataset} receipt is not valid JSON"
+        ) from exc
+    return "twse_day_trade_openapi_json" if isinstance(payload, list) else "json"
+
+
+def _is_weekend(day: date) -> bool:
+    return day.weekday() >= 5
+
+
 def _latest_valid_signal(
     spec: ModeSpec,
     trading_date: date,
@@ -149,7 +167,7 @@ def _materialize_exact_session_rules(
             DEFAULT_DATASETS[dataset],
             trading_date,
             raw,
-            "json",
+            _retained_rule_response_kind(dataset, raw),
         )
         destination = destination_root / f"{dataset}.parquet"
         frame.write_parquet(destination)
@@ -559,13 +577,21 @@ def main() -> None:
             "source_signal_time": "retained separately for provenance",
         },
         "state_dir": str(state_dir),
+        "skipped_sessions": [],
         "sessions": [],
     }
 
     day = start
     while day <= end:
-        if day.weekday() >= 5:
-            raise ValueError(f"weekend session requested: {day}")
+        if _is_weekend(day):
+            receipt["skipped_sessions"].append(
+                {
+                    "session_date": day.isoformat(),
+                    "reason": "weekend_non_session",
+                }
+            )
+            day += timedelta(days=1)
+            continue
         limit_path = (args.price_limit_dir / f"{day.isoformat()}.parquet").resolve()
         if not limit_path.is_file():
             raise FileNotFoundError(limit_path)

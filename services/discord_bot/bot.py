@@ -1403,7 +1403,7 @@ def _auto_signal_price_source(cfg: LiveMarketConfig, status: MarketRuntimeStatus
         return text
     market_type = str(getattr(cfg, "market_type", "") or "").strip().lower()
     frequency = str(getattr(cfg, "history_frequency", "daily") or "daily").strip().lower()
-    if market_type in {"crypto", "forex", "fx"} or frequency in {"bar", "intraday", "15m"}:
+    if market_type in {"crypto", "forex", "fx"} or frequency in {"bar", "intraday", "1m", "15m"}:
         if not status.market_open:
             return None
         return "panel"
@@ -2193,7 +2193,10 @@ def _performance_window_label(cfg: LiveMarketConfig, recent: dict[str, Any]) -> 
     except Exception:
         window = int(configured_window)
     frequency = str(getattr(cfg, "history_frequency", "daily") or "").strip().lower()
-    if frequency in {"bar", "bars", "intraday", "15m", "15min", "15minute", "15minutes"}:
+    if frequency in {
+        "bar", "bars", "intraday", "1m", "1min", "1minute", "1minutes",
+        "15m", "15min", "15minute", "15minutes",
+    }:
         try:
             market_cfg = _load_experiment_config_cached(str(_resolve_repo_path(cfg.config_path) or Path(cfg.config_path)))
             trading_frequency = str(getattr(market_cfg.trading, "frequency", "") or "").strip()
@@ -3287,7 +3290,7 @@ def _can_reuse_latest_signal_now(
     if status.market_open:
         market_type = str(getattr(cfg, "market_type", "") or "").strip().lower()
         frequency = str(getattr(cfg, "history_frequency", "daily") or "daily").strip().lower()
-        if market_type in {"crypto", "forex", "fx"} or frequency in {"bar", "intraday", "15m"}:
+        if market_type in {"crypto", "forex", "fx"} or frequency in {"bar", "intraday", "1m", "15m"}:
             if requested not in {"", "auto", "panel"}:
                 return False, None
             latest_data_date = getattr(status.data, "last_data_date", None) or getattr(status.data, "panel_date", None)
@@ -4542,6 +4545,8 @@ def _annotate_history_rows_with_display_time(cfg: LiveMarketConfig, rows: list[d
     day_trade_open_records = execution_mode == "tw_day_trade" and frequency not in {
         "bar",
         "intraday",
+        "1m",
+        "1min",
         "15m",
         "15min",
         "interval",
@@ -6818,7 +6823,7 @@ async def stock_history_command(
 @bot.tree.command(name="portfolio_history", description="Show recent PnL and holding changes.")
 @app_commands.describe(
     market="Market id.",
-    days="Periods to show. Daily markets use days; crypto can use 15m bars. Default 32. 0 means all.",
+    days="Periods to show. Daily markets use days; crypto uses 1m bars. Default 32. 0 means all.",
     top_changes="Top holding changes per period (0-20; all requested rows are shown).",
     min_abs_change="Hide weight-only changes below this absolute ratio.",
     initial_capital="Scale fold values from the first fold NAV.",

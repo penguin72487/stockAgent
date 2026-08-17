@@ -1,0 +1,124 @@
+{
+  "schema_version": 2,
+  "queries": [
+    {
+      "id": "dune_dex_asset_activity_daily_v1",
+      "enabled": true,
+      "execution_mode": "sql_file",
+      "sql_file": "dune_queries/dex_asset_activity_daily_v1.sql",
+      "query_id": 0,
+      "fact_family": "dex_asset_activity",
+      "primary_key": [
+        "event_date",
+        "blockchain",
+        "project",
+        "asset_symbol",
+        "token_address",
+        "flow_direction"
+      ],
+      "event_time_column": "event_date",
+      "expected_columns": [
+        "event_date",
+        "blockchain",
+        "project",
+        "asset_symbol",
+        "token_address",
+        "flow_direction",
+        "trade_legs",
+        "transaction_count",
+        "taker_count",
+        "amount_usd"
+      ],
+      "history_start": "2018-01-01",
+      "chunk_months": 3,
+      "cadence_seconds": 86400,
+      "performance": "medium",
+      "description": "Daily DEX buy/sell activity for major crypto and stablecoin assets. This adds venue, direction and active-trader state beyond DefiLlama aggregate volume."
+    },
+    {
+      "id": "dune_cex_labeled_flows_daily_v1",
+      "enabled": true,
+      "execution_mode": "sql_file",
+      "sql_file": "dune_queries/cex_labeled_flows_daily_v1.sql",
+      "query_id": 0,
+      "fact_family": "cex_labeled_token_flows",
+      "primary_key": [
+        "event_date",
+        "blockchain",
+        "exchange",
+        "asset_symbol",
+        "token_address",
+        "flow_direction",
+        "label_version"
+      ],
+      "event_time_column": "event_date",
+      "expected_columns": [
+        "event_date",
+        "blockchain",
+        "exchange",
+        "asset_symbol",
+        "token_address",
+        "flow_direction",
+        "transfer_count",
+        "transaction_count",
+        "amount_native",
+        "amount_usd",
+        "label_version"
+      ],
+      "history_start": "2020-01-01",
+      "chunk_months": 3,
+      "cadence_seconds": 86400,
+      "performance": "medium",
+      "description": "Flows touching Dune addresses labelled as Binance, OKX or Bybit users. The label snapshot version is part of the key; this is not called proof of reserves."
+    },
+    {
+      "id": "dune_stablecoin_issuance_daily_v1",
+      "enabled": true,
+      "execution_mode": "sql_file",
+      "sql_file": "dune_queries/stablecoin_issuance_daily_v1.sql",
+      "query_id": 0,
+      "fact_family": "stablecoin_mint_burn",
+      "primary_key": [
+        "event_date",
+        "blockchain",
+        "asset_symbol",
+        "token_address",
+        "supply_direction"
+      ],
+      "event_time_column": "event_date",
+      "expected_columns": [
+        "event_date",
+        "blockchain",
+        "asset_symbol",
+        "token_address",
+        "supply_direction",
+        "transfer_count",
+        "transaction_count",
+        "amount_native",
+        "amount_usd"
+      ],
+      "history_start": "2018-01-01",
+      "chunk_months": 3,
+      "cadence_seconds": 86400,
+      "performance": "medium",
+      "description": "Realized mint and burn events for major stablecoins, kept separate from DefiLlama outstanding-supply snapshots."
+    }
+  ],
+  "contract": {
+    "required_fields": [
+      "id",
+      "execution_mode",
+      "fact_family",
+      "primary_key",
+      "event_time_column",
+      "expected_columns",
+      "cadence_seconds",
+      "history_start",
+      "chunk_months"
+    ],
+    "lineage_rule": "Persist the local SQL SHA-256, Dune query_id, execution_id, result metadata, retrieval window and expected schema. Raw SQL is executed only from a version-controlled registered sql_file.",
+    "causal_rule": "event_time_column is the source event time; the local result becomes usable no earlier than the Dune execution completion time.",
+    "dedup_rule": "Rows are unique by query contract id plus primary_key inside a non-overlapping calendar partition; a query or label schema change requires a new contract version.",
+    "cost_rule": "Calendar partitions are independently resumable. HTTP 402 or exhausted credits fail closed and preserve completed partitions without uncontrolled retries."
+  }
+}

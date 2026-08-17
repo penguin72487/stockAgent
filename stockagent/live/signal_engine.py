@@ -448,7 +448,20 @@ def _is_intraday_frequency(frequency: object) -> bool:
     text = str(frequency or "").strip().lower().replace("_", "-")
     if not text:
         return False
-    if text in {"bar", "intraday", "minute", "minutes", "15m", "15min", "15-min", "15-minute"}:
+    if text in {
+        "bar",
+        "intraday",
+        "minute",
+        "minutes",
+        "1m",
+        "1min",
+        "1-min",
+        "1-minute",
+        "15m",  # legacy artifact compatibility
+        "15min",
+        "15-min",
+        "15-minute",
+    }:
         return True
     return text.endswith("m") and text[:-1].isdigit()
 

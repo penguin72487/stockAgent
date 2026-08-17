@@ -29,7 +29,10 @@ from downloader.stream_shioaji_taifex_bidask import (
     select_balanced_option_strips,
     select_option_strip,
 )
-from stockagent.live.taifex_strategy_state import load_held_option_codes
+from stockagent.live.taifex_strategy_state import (
+    load_held_option_codes,
+    load_required_option_codes,
+)
 
 
 def test_taifex_capture_module_cli_imports_from_repo_root() -> None:
@@ -407,7 +410,15 @@ def test_held_option_pair_is_pinned_to_strategy_worker_without_growing_selection
                         "option_positions": {
                             "TXV-44900-C": 1,
                             "ignored-flat": 0,
-                        }
+                        },
+                        "pending_option_roll": {
+                            "legs": [
+                                {
+                                    "old_code": "TXV-44900-C",
+                                    "new_code": "TXV-45000-C",
+                                }
+                            ]
+                        },
                     },
                     "short": {"option_positions": {"TXV-44900-P": -2}},
                 }
@@ -418,6 +429,11 @@ def test_held_option_pair_is_pinned_to_strategy_worker_without_growing_selection
     assert load_held_option_codes(state_dir) == (
         "TXV-44900-C",
         "TXV-44900-P",
+    )
+    assert load_required_option_codes(state_dir) == (
+        "TXV-44900-C",
+        "TXV-44900-P",
+        "TXV-45000-C",
     )
 
 

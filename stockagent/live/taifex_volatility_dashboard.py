@@ -10,6 +10,7 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import hashlib
 import json
 import math
 import os
@@ -163,6 +164,59 @@ def _iter_json_objects(path: Path):
             payload = json.loads(line)
             if isinstance(payload, dict):
                 yield payload
+
+
+def _history_backfill_receipts(state_dir: Path) -> list[dict[str, Any]]:
+    receipts: list[dict[str, Any]] = []
+    for path in sorted((Path(state_dir) / "backfills").glob("*/receipt.json")):
+        try:
+            payload = _load_object(path)
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+        mark_path = path.parent / "marks.jsonl"
+        if not mark_path.is_file():
+            continue
+        expected_hash = str(
+            (payload.get("output_sha256") or {}).get("marks.jsonl") or ""
+        )
+        if not expected_hash:
+            continue
+        digest = hashlib.sha256()
+        try:
+            with mark_path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        except OSError:
+            continue
+        if digest.hexdigest() != expected_hash:
+            # The producer commits receipt.json last.  During a refresh, readers
+            # see either the old verified generation or no backfill, never a
+            # partially replaced curve.
+            continue
+        receipts.append(
+            {
+                "path": path,
+                "mark_path": mark_path,
+                "status": payload.get("status"),
+                "replay_id": payload.get("replay_id"),
+                "source": payload.get("source"),
+                "strategy_ids": payload.get("strategy_ids") or [],
+                "requested_start_date": payload.get("requested_start_date"),
+                "requested_end_date": payload.get("requested_end_date"),
+                "source_coverage": payload.get("source_coverage") or [],
+                "record_counts": payload.get("record_counts") or {},
+                "marks_sha256": expected_hash,
+            }
+        )
+    return receipts
+
+
+def _history_mark_paths(state_dir: Path) -> list[Path]:
+    paths = [
+        row["mark_path"] for row in _history_backfill_receipts(Path(state_dir))
+    ]
+    paths.append(Path(state_dir) / "marks.jsonl")
+    return paths
 
 
 def _first_mark_timestamp_ns(path: Path) -> int | None:
@@ -640,14 +694,31 @@ def _build_history_rows(
     """Build only the bounded public curve from the tail of the marks ledger."""
 
     mark_limit = max(1, min(int(mark_limit_per_strategy), 1_440))
-    mark_path = Path(state_dir) / "marks.jsonl"
-    raw_marks = (
-        _iter_json_objects(mark_path)
-        if scan_all
-        else _tail_json_objects(
-            mark_path,
-            maximum_rows=max(1, mark_limit * max(1, len(strategy_ids)) * 2),
+    maximum_source_rows = max(
+        1, mark_limit * max(1, len(strategy_ids)) * 2
+    )
+    raw_marks_by_key: dict[tuple[str, int], dict[str, Any]] = {}
+    # Backfills are read first.  A formal live mark at the same strategy/time
+    # is authoritative and replaces the historical replay row.
+    for mark_path in _history_mark_paths(Path(state_dir)):
+        source_rows = (
+            _iter_json_objects(mark_path)
+            if scan_all
+            else _tail_json_objects(
+                mark_path,
+                maximum_rows=maximum_source_rows,
+            )
         )
+        for mark in source_rows or ():
+            strategy_id = str(mark.get("strategy_id") or "")
+            decision_ts_ns = int(mark.get("decision_ts_ns") or 0)
+            raw_marks_by_key[(strategy_id, decision_ts_ns)] = mark
+    raw_marks = sorted(
+        raw_marks_by_key.values(),
+        key=lambda row: (
+            int(row.get("decision_ts_ns") or 0),
+            str(row.get("strategy_id") or ""),
+        ),
     )
     grouped_marks: dict[str, deque[dict[str, Any]]] = {
         str(strategy_id): deque(maxlen=mark_limit) for strategy_id in strategy_ids
@@ -705,7 +776,12 @@ def _build_history_rows(
         if carried and open_value is not None:
             cumulative_pnl = gross_cash + open_value - fixed_fees - transaction_tax
         total_equity = _optional_float(mark.get("total_equity_twd"))
-        initial_capital = float(capital_by_strategy.get(strategy_id, 0.0))
+        mark_initial_capital = _optional_float(mark.get("initial_capital_twd"))
+        initial_capital = float(
+            mark_initial_capital
+            if mark_initial_capital is not None and mark_initial_capital > 0.0
+            else capital_by_strategy.get(strategy_id, 0.0)
+        )
         if cumulative_pnl is not None and (total_equity is None or carried):
             total_equity = initial_capital + cumulative_pnl
         if not valuation_available:
@@ -746,6 +822,10 @@ def _build_history_rows(
                     if valuation_available
                     else None
                 ),
+                "history_source": mark.get("history_source", "live_forward_ledger"),
+                "replay_id": mark.get("replay_id"),
+                "replay_contract_version": mark.get("replay_contract_version"),
+                "history_event": mark.get("history_event"),
             }
         if minimum_decision_ts_ns is not None and decision_ts_ns < int(
             minimum_decision_ts_ns
@@ -824,7 +904,15 @@ def build_dashboard_history_snapshot(
     if normalized_range not in HISTORY_RANGE_SECONDS:
         raise ValueError(f"unsupported dashboard history range: {range_key}")
     mark_path = selected_state_dir / "marks.jsonl"
-    earliest_ns = _first_mark_timestamp_ns(mark_path)
+    earliest_candidates = [
+        timestamp
+        for timestamp in (
+            _first_mark_timestamp_ns(path)
+            for path in _history_mark_paths(selected_state_dir)
+        )
+        if timestamp is not None
+    ]
+    earliest_ns = min(earliest_candidates) if earliest_candidates else None
     tail = _tail_json_objects(mark_path, maximum_rows=max(1, len(strategy_ids) * 2))
     anchor_ns = max((int(row.get("decision_ts_ns") or 0) for row in tail), default=0)
     duration_seconds = HISTORY_RANGE_SECONDS[normalized_range]
@@ -851,6 +939,7 @@ def build_dashboard_history_snapshot(
         scan_all=True,
     )
     source_updated = _parse_utc(status.get("updated_at_utc"))
+    backfill_receipts = _history_backfill_receipts(selected_state_dir)
     return {
         "dashboard_schema_version": DASHBOARD_SCHEMA_VERSION,
         "generated_at_utc": observed_now.isoformat(),
@@ -878,7 +967,27 @@ def build_dashboard_history_snapshot(
         ),
         "downsampled": bool(bucket_width_ns > 60_000_000_000),
         "history": history,
-        "record_counts": {"history_rows_returned": len(history)},
+        "backfills": [
+            {
+                key: value
+                for key, value in receipt.items()
+                if key not in {"path", "mark_path", "marks_sha256"}
+            }
+            for receipt in backfill_receipts
+        ],
+        "record_counts": {
+            "history_rows_returned": len(history),
+            **(
+                {
+                    "backfill_mark_rows": sum(
+                        int((receipt.get("record_counts") or {}).get("marks") or 0)
+                        for receipt in backfill_receipts
+                    )
+                }
+                if backfill_receipts
+                else {}
+            ),
+        },
     }
 
 

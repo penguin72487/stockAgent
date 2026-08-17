@@ -1,5 +1,5 @@
 [Unit]
-Description=StockAgent registered 15-minute crypto data refresh
+Description=StockAgent registered one-minute crypto data refresh
 Wants=network-online.target time-sync.target
 After=network-online.target time-sync.target
 

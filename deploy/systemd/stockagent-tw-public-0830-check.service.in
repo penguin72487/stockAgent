@@ -1,0 +1,20 @@
+[Unit]
+Description=Run the unified 08:30 Taiwan official-data acceptance gate
+Wants=network-online.target time-sync.target
+After=network-online.target time-sync.target
+
+[Service]
+Type=oneshot
+User=@SERVICE_USER@
+Group=@SERVICE_GROUP@
+WorkingDirectory=@REPO_ROOT@
+Environment="HOME=@SERVICE_HOME@"
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=/usr/bin/bash "@REPO_ROOT@/scripts/run_tw_public_0830_check.sh"
+Nice=0
+CPUWeight=100
+IOWeight=100
+TimeoutStartSec=4h
+
+[Install]
+WantedBy=multi-user.target

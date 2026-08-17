@@ -7,7 +7,7 @@
   <meta name="theme-color" content="#071019">
   <title>StockAgent 全資料監控</title>
   <link rel="stylesheet" href="../dashboard-core.css?v=5">
-  <link rel="stylesheet" href="styles.css?v=2">
+  <link rel="stylesheet" href="styles.css?v=4">
 </head>
 <body>
   <a class="skip-link" href="#source-list">跳到資料來源</a>
@@ -29,7 +29,7 @@
       <div>
         <p class="eyebrow">DATA FLEET OBSERVATORY</p>
         <h1 id="page-title">所有資料，<br>一張即時健康圖</h1>
-        <p class="lead">從永豐 Shioaji、yfinance、MOPS、TWSE、TPEx、TAIFEX，到 OpenBB、OKX、Bybit 與外匯來源。每個已有紀錄的資料群組都由同一份註冊表追蹤。</p>
+        <p class="lead">從永豐 Shioaji、yfinance、MOPS、TWSE、TPEx、TAIFEX，到 OpenBB、Binance、OKX、Bybit、CoinGecko、DefiLlama 與鏈上來源。每個已有紀錄的資料群組都由同一份註冊表追蹤。</p>
       </div>
       <div class="hero-status">
         <div class="status-line">
@@ -38,14 +38,16 @@
         </div>
         <strong id="overall-percent">—</strong>
         <progress id="overall-progress" max="1" aria-label="來源層級健康或進行中比例"></progress>
-        <p>來源層級狀態比例；不同來源的日期、標的、任務與列數不混加。</p>
+        <p>已完成或正在有效串流的端點比例；不同來源的日期、標的、任務與列數不混加。</p>
       </div>
     </section>
 
     <section class="kpis" aria-label="資料監控摘要">
       <article><span>已註冊項目</span><strong id="registered-items">—</strong><small id="registered-detail">—</small></article>
-      <article><span>正常／進行中</span><strong id="healthy-items">—</strong><small>含配額等待與連續串流</small></article>
-      <article><span>需要處理</span><strong id="attention-items">—</strong><small>逾時、缺口或無法驗證</small></article>
+      <article class="catching-up"><span>正在抓／未最新</span><strong id="catching-up-items">—</strong><small>執行中、待排程或等待配額</small></article>
+      <article class="streaming"><span>正在串流</span><strong id="streaming-items">—</strong><small>交易時窗內且有新落盤心跳</small></article>
+      <article class="complete"><span>已完成／已最新</span><strong id="completed-items">—</strong><small>最近完整度與新鮮度證據通過</small></article>
+      <article class="unable"><span>無法完成</span><strong id="unable-items">—</strong><small>缺管線、阻擋或完整性失敗</small></article>
       <article><span>已知資料列</span><strong id="known-rows">—</strong><small>只加總不重複的群組回執</small></article>
     </section>
 
@@ -64,9 +66,9 @@
       <div class="section-heading">
         <div>
           <p class="eyebrow">SOURCE REGISTRY</p>
-          <h2 id="sources-title">逐來源進度與 ETA</h2>
+          <h2 id="sources-title">逐端點進度、串流時窗與 ETA</h2>
         </div>
-        <p id="result-count">—</p>
+        <p><span id="result-count">—</span><br><span class="sort-contract">固定排序：未最新 → 串流 → 完成 → 無法完成</span></p>
       </div>
 
       <form id="filters" class="filters" role="search">
@@ -79,15 +81,18 @@
         <label>狀態
           <select id="status-filter">
             <option value="all">全部狀態</option>
-            <option value="current">正常</option>
-            <option value="updating">更新中</option>
-            <option value="complete">完成</option>
-            <option value="waiting">等待</option>
-            <option value="stale">需更新</option>
-            <option value="degraded">有缺口</option>
-            <option value="blocked">阻擋</option>
-            <option value="unavailable">不可用</option>
-            <option value="legacy">封存</option>
+            <option value="catching_up">正在抓／還沒到最新</option>
+            <option value="streaming">正在串流</option>
+            <option value="complete">已完成／已到最新</option>
+            <option value="unable">無法完成</option>
+          </select>
+        </label>
+        <label>粒度
+          <select id="granularity-filter">
+            <option value="all">全部粒度</option>
+            <option value="daily">日資料</option>
+            <option value="1m">1 分鐘</option>
+            <option value="tick">Tick／逐筆</option>
           </select>
         </label>
         <label>範圍
@@ -95,6 +100,9 @@
             <option value="all">全部項目</option>
             <option value="storage_group">只看資料群組</option>
             <option value="logical_source">只看逐來源</option>
+            <option value="product_granularity">只看產品 × 粒度</option>
+            <option value="credential_gate">只看 API 憑證</option>
+            <option value="crypto_fact_family">只看加密唯一事實</option>
           </select>
         </label>
       </form>
@@ -104,11 +112,12 @@
           <thead>
             <tr>
               <th>資料來源</th>
-              <th>狀態／新鮮度</th>
+              <th>排序狀態</th>
               <th>完整度</th>
+              <th>串流／下次更新</th>
               <th>預估完成</th>
-              <th>資料到期</th>
-              <th>更新責任</th>
+              <th>最近驗證／資料截至</th>
+              <th>責任／證據</th>
             </tr>
           </thead>
           <tbody id="source-rows"></tbody>
@@ -127,6 +136,6 @@
   </main>
 
   <footer>StockAgent 全資料監控 · 台北時間 · 每 10 秒讀取最新回執</footer>
-  <script src="app.js?v=3" defer></script>
+  <script src="app.js?v=6" defer></script>
 </body>
 </html>

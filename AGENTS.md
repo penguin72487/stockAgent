@@ -693,13 +693,24 @@ Compile/runtime rules:
 
 ## Crypto Downloader Baseline
 
-The active crypto downloader baseline is 15-minute bars.
+The active crypto downloader baseline is one-minute bars.
 
 Rules:
 
-- Yahoo `crypto`, OKX perpetual, and Bybit perpetual downloaders should treat 15m candles as the source of truth.
-- Do not silently merge old daily crypto parquet rows with new 15m rows in the same file.
-- If an existing crypto parquet file looks like a daily-frequency artifact, rebuild it from the 15m source instead of appending to it.
+- Yahoo `crypto`, OKX perpetual, Bybit perpetual, and Binance USD-M perpetual
+  downloaders should treat completed `1m` candles as the canonical intraday
+  candle source.
+- Keep canonical `daily`, `1m`, and actual `tick` data in separate directories.
+  Never relabel candles or snapshots as tick events.
+- Do not silently merge legacy daily or 15-minute crypto parquet rows with new
+  one-minute rows. Rebuild/migrate into the dedicated `1m` path instead.
+- Derive daily crypto bars from validated one-minute rows only when a stronger
+  provider-native daily adjustment contract is unavailable, and persist minute
+  row counts plus expected-row coverage.
+- Provider statistics that are natively slower than one minute (for example
+  five-minute OI/ratio series) must retain their native grain and may be
+  causally carried/aligned to a one-minute decision grid; never fabricate
+  one-minute observations.
 - Keep stock and FX Yahoo downloads on daily bars unless the user explicitly changes those markets too.
 
 ## Feature Engineering Guardrails

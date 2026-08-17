@@ -27,6 +27,7 @@ from stockagent.live.public_dashboards import (
     sanitize_taifex_status,
     sanitize_tw_events,
     sanitize_tw_history,
+    sanitize_tw_positions,
     sanitize_tw_signals,
     sanitize_tw_status,
 )
@@ -82,6 +83,16 @@ def test_taifex_history_is_an_explicit_allowlist() -> None:
                     "total_equity_twd": 101.1234,
                     "fixed_capital_return": 0.01234567891,
                     "gross_cash_twd": 99.0,
+                    "history_source": "receipt_bidask",
+                    "replay_id": "safe-replay-id",
+                }
+            ],
+            "backfills": [
+                {
+                    "replay_id": "safe-replay-id",
+                    "source": "receipt_bidask",
+                    "source_coverage": [],
+                    "path": "/private/path",
                 }
             ],
             "record_counts": {"marks": 1},
@@ -94,6 +105,15 @@ def test_taifex_history_is_an_explicit_allowlist() -> None:
             "strategy_id": "a",
             "total_equity_twd": 101.12,
             "fixed_capital_return": 0.01234568,
+            "history_source": "receipt_bidask",
+            "replay_id": "safe-replay-id",
+        }
+    ]
+    assert public["backfills"] == [
+        {
+            "replay_id": "safe-replay-id",
+            "source": "receipt_bidask",
+            "source_coverage": [],
         }
     ]
 
@@ -200,12 +220,45 @@ def test_tw_event_projection_enforces_simulation_and_scrubs_ids() -> None:
         )
 
 
+def test_tw_position_projection_enforces_simulation_and_scrubs_ids() -> None:
+    public = sanitize_tw_positions(
+        {
+            "simulation_only": True,
+            "production_order_possible": False,
+            "start_date": "2026-08-13",
+            "end_date": "2026-08-14",
+            "rows": [
+                {
+                    "position_id": "private-position",
+                    "signal_id": "private-signal",
+                    "session_date": "2026-08-13",
+                    "symbol": "2330",
+                    "entry_price": float("nan"),
+                }
+            ],
+        }
+    )
+    assert public["start_date"] == "2026-08-13"
+    assert public["end_date"] == "2026-08-14"
+    assert public["rows"] == [
+        {"session_date": "2026-08-13", "symbol": "2330", "entry_price": None}
+    ]
+    with pytest.raises(UnsafePublicDashboardPayload):
+        sanitize_tw_positions(
+            {"simulation_only": False, "production_order_possible": False}
+        )
+
+
 def test_tw_history_projection_and_range_query_are_bounded() -> None:
     public = sanitize_tw_history(
         {
             "simulation_only": True,
             "production_order_possible": False,
             "range": "1y",
+            "start_date": "2026-08-13",
+            "end_date": "2026-08-14",
+            "available_start_date": "2026-08-13",
+            "available_end_date": "2026-08-17",
             "history": [
                 {
                     "series_id": "benchmark_0050",
@@ -219,6 +272,10 @@ def test_tw_history_projection_and_range_query_are_bounded() -> None:
         }
     )
     assert public["range"] == "1y"
+    assert public["start_date"] == "2026-08-13"
+    assert public["end_date"] == "2026-08-14"
+    assert public["available_start_date"] == "2026-08-13"
+    assert public["available_end_date"] == "2026-08-17"
     assert public["history"] == [
         {
             "series_id": "benchmark_0050",
@@ -228,8 +285,19 @@ def test_tw_history_projection_and_range_query_are_bounded() -> None:
         }
     ]
     assert PublicDashboardHandler._history_range_query("range=all") == "all"
+    assert PublicDashboardHandler._tw_history_query(
+        "range=all&start_date=2026-08-13&end_date=2026-08-14"
+    ) == {
+        "range_key": "all",
+        "start_date": "2026-08-13",
+        "end_date": "2026-08-14",
+    }
     with pytest.raises(ValueError):
         PublicDashboardHandler._history_range_query("range=5y")
+    with pytest.raises(ValueError):
+        PublicDashboardHandler._tw_history_query(
+            "range=all&start_date=2026-08-15&end_date=2026-08-14"
+        )
 
 
 def test_public_signal_query_accepts_dashboard_date_contract() -> None:
@@ -247,6 +315,20 @@ def test_public_signal_query_accepts_dashboard_date_contract() -> None:
         "date=2026-08-13&mode=all&symbol=&offset=250&limit=999"
     )
     assert events == "date=2026-08-13&mode=all&symbol=&offset=250&limit=250"
+    ranged = PublicDashboardHandler._signal_query(
+        "start_date=2026-08-13&end_date=2026-08-16&mode=all&status=all"
+    )
+    assert "start_date=2026-08-13" in ranged
+    assert "end_date=2026-08-16" in ranged
+    ranged_events = PublicDashboardHandler._event_query(
+        "start_date=2026-08-13&end_date=2026-08-16"
+    )
+    assert "start_date=2026-08-13" in ranged_events
+    assert "end_date=2026-08-16" in ranged_events
+    with pytest.raises(ValueError):
+        PublicDashboardHandler._signal_query(
+            "start_date=2026-08-16&end_date=2026-08-13"
+        )
     with pytest.raises(ValueError):
         PublicDashboardHandler._event_query("date=2026-08-13&unknown=true")
 
@@ -393,13 +475,14 @@ def test_public_pages_share_visual_tokens() -> None:
             or relative == "public_dashboards/index.html"
         )
         assert '<meta name="theme-color" content="#071019">' in html
-    for relative in (
-        "taifex_dashboard/index.html",
-        "tw_day_trade_dashboard/index.html",
-        "openbb_archive_dashboard/index.html",
-    ):
+    time_axis_versions = {
+        "taifex_dashboard/index.html": 4,
+        "tw_day_trade_dashboard/index.html": 4,
+        "openbb_archive_dashboard/index.html": 3,
+    }
+    for relative, version in time_axis_versions.items():
         html = (root / relative).read_text(encoding="utf-8")
-        assert 'src="../time-axis.js?v=3"' in html
+        assert f'src="../time-axis.js?v={version}"' in html
 
     for relative in (
         "public_dashboards/public.js",
@@ -433,7 +516,10 @@ def test_public_pages_share_visual_tokens() -> None:
     assert 'id="benchmark-cards"' in tw_html
     assert "function renderBenchmarks" in tw_javascript
     assert "timeAxis.buildTimeAxis" in tw_javascript
+    assert "collapseEmptyIntervals: true" in tw_javascript
     assert "TW_STOCK_SESSIONS" in tw_javascript
+    assert 'id="equity-start-date" type="date"' in tw_html
+    assert 'id="equity-end-date" type="date"' in tw_html
     assert "舊約 bid 與新約 ask 必須同時存在" in tw_javascript
     assert ".benchmark-grid" in tw_styles
     assert ".compact-table{table-layout:fixed;white-space:normal}" in tw_styles
@@ -445,6 +531,7 @@ def test_public_pages_share_visual_tokens() -> None:
     assert 'historical_session_complete: "歷史交易日已完成"' in tw_javascript
     assert "maximumSignificantDigits" not in tw_javascript
     assert "@media(max-width:700px)" in tw_styles
+    assert ".date-range-picker" in tw_styles
     for dashboard in ("tw_day_trade_dashboard", "shioaji_api_dashboard"):
         javascript = (root / dashboard / "app.js").read_text(encoding="utf-8")
         assert "style=" not in javascript

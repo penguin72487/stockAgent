@@ -38,6 +38,10 @@ HISTORY_DISPLAY_FIELDS: Final[tuple[str, ...]] = (
     "total_equity_twd",
     "fixed_capital_return",
     "valuation_carried_forward",
+    "history_source",
+    "replay_id",
+    "replay_contract_version",
+    "history_event",
 )
 
 STATIC_ROUTES: Final[dict[str, tuple[str, str]]] = {
@@ -132,6 +136,7 @@ class DashboardHTTPServer(ThreadingHTTPServer):
                 "coverage_start_utc": full["coverage_start_utc"],
                 "coverage_end_utc": full["coverage_end_utc"],
                 "downsampled": full["downsampled"],
+                "backfills": full.get("backfills", []),
                 "history": [
                     {key: row.get(key) for key in HISTORY_DISPLAY_FIELDS}
                     for row in full["history"]

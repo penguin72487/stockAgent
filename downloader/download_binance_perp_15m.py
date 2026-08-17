@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
+import math
 import os
 import sys
 import threading
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -29,13 +31,19 @@ from common import (  # noqa: E402
     retry_delay_seconds,
     run_parallel_tasks,
 )
+from binance_historical_features import (  # noqa: E402
+    FEATURE_STAGE_IDS,
+    feature_catalog_payload,
+    result_rows as historical_feature_result_rows,
+    run_historical_feature_downloads,
+)
 
 
 BASE_URL = "https://fapi.binance.com"
 EXCHANGE_INFO_ENDPOINT = "/fapi/v1/exchangeInfo"
 KLINE_ENDPOINT = "/fapi/v1/klines"
-KLINE_INTERVAL = "15m"
-CANDLE_INTERVAL_MS = 15 * 60 * 1000
+KLINE_INTERVAL = "1m"
+CANDLE_INTERVAL_MS = 60 * 1000
 
 # Binance charges request weight 2 for [100, 500) rows. 499 therefore yields
 # 249.5 bars/weight, the best documented kline efficiency tier.
@@ -97,14 +105,98 @@ class DownloadResult:
     message: str | None = None
 
 
+class _PipelineProgress:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        total_units: int,
+        started_at: datetime,
+    ) -> None:
+        self.path = path
+        self.started_at = started_at
+        self.total = max(0, int(total_units))
+        self.current = 0
+        self.status_counts: dict[str, int] = {}
+        self.recent_errors: list[dict[str, str]] = []
+        self._lock = threading.Lock()
+        self._write("running", "initializing")
+
+    def _write(self, state: str, phase: str) -> None:
+        observed = datetime.now(timezone.utc)
+        elapsed = max(0.001, (observed - self.started_at).total_seconds())
+        rate = self.current / elapsed if self.current else 0.0
+        remaining = max(0, self.total - self.current)
+        eta_seconds = int(math.ceil(remaining / rate)) if rate > 0 else None
+        payload = {
+            "schema_version": 1,
+            "state": state,
+            "label": "Binance USD-M K線與歷史特徵",
+            "phase": phase,
+            "current": self.current,
+            "total": self.total,
+            "unit": "request-page-or-feature-stage",
+            "ratio": self.current / self.total if self.total else 1.0,
+            "started_at_utc": self.started_at.isoformat(),
+            "updated_at_utc": observed.isoformat(),
+            "elapsed_seconds": elapsed,
+            "items_per_second": rate,
+            "remaining_seconds": eta_seconds,
+            "estimated_complete_at_utc": (
+                (observed + timedelta(seconds=eta_seconds)).isoformat()
+                if eta_seconds is not None
+                else None
+            ),
+            "status_counts": dict(sorted(self.status_counts.items())),
+            "recent_errors": list(self.recent_errors),
+            "basis": (
+                "completed one-minute request pages and feature stages divided by "
+                "full elapsed time; archive and endpoint depth can change the estimate"
+            ),
+        }
+        _write_text_atomic(
+            self.path,
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        )
+
+    def update(
+        self,
+        phase: str,
+        status: str,
+        *,
+        item: str | None = None,
+        message: str | None = None,
+    ) -> None:
+        with self._lock:
+            self.current = min(self.total, self.current + 1)
+            self.status_counts[status] = self.status_counts.get(status, 0) + 1
+            if status in {"failed", "partial"}:
+                self.recent_errors.append(
+                    {
+                        "phase": str(phase),
+                        "item": str(item or "unknown"),
+                        "status": str(status),
+                        "message": str(message or "no error detail supplied"),
+                    }
+                )
+                self.recent_errors = self.recent_errors[-20:]
+            self._write("running", phase)
+
+    def finish(self, *, failed: bool) -> None:
+        with self._lock:
+            if not failed:
+                self.current = self.total
+            self._write("failed" if failed else "complete", "complete")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Download Binance USD-M perpetual 15-minute candles with dynamic "
+            "Download Binance USD-M perpetual one-minute candles with dynamic "
             "request-weight pacing and atomic parquet publication."
         )
     )
-    parser.add_argument("--output-dir", default="data_binance")
+    parser.add_argument("--output-dir", default="data_binance/1m")
     parser.add_argument(
         "--mode",
         choices=["incremental", "daily-update", "full"],
@@ -116,7 +208,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--start-date", default="2019-09-08")
     parser.add_argument("--end-date", default="today")
-    parser.add_argument("--workers", type=int, default=32)
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=32,
+        help="Concurrent symbol workers; official shared buckets control actual request starts.",
+    )
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--refresh", action="store_true")
     parser.add_argument(
@@ -130,6 +227,20 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-retries", type=int, default=8)
     parser.add_argument("--retry-base", type=float, default=0.6)
+    parser.add_argument(
+        "--skip-historical-features",
+        action="store_true",
+        help=(
+            "Skip mark/index/premium, funding, OI, positioning, taker-flow and "
+            "basis enrichment. The default captures every anonymous historical feature."
+        ),
+    )
+    parser.add_argument(
+        "--feature-workers",
+        type=int,
+        default=None,
+        help="Parallel feature workers; defaults to --workers.",
+    )
     return parser.parse_args()
 
 
@@ -189,7 +300,7 @@ def _earliest_ms(frame: pl.DataFrame) -> int | None:
     return int(earliest.replace(tzinfo=timezone.utc).timestamp() * 1000)
 
 
-def _frame_matches_15m_interval(frame: pl.DataFrame) -> bool:
+def _frame_matches_1m_interval(frame: pl.DataFrame) -> bool:
     normalized = _normalize_date_frame(frame)
     if normalized.height < 3 or "date" not in normalized.columns:
         return True
@@ -222,7 +333,7 @@ def _load_existing_info(path: Path) -> ExistingCandleInfo:
         return ExistingCandleInfo(
             rows=rows,
             latest_ms=_latest_ms(dates),
-            interval_ok=_frame_matches_15m_interval(dates),
+            interval_ok=_frame_matches_1m_interval(dates),
             earliest_ms=_earliest_ms(dates),
         )
     except Exception as exc:
@@ -402,6 +513,16 @@ class BinanceClient:
         self.retry_base = max(0.1, float(retry_base))
         self._limiter_lock = threading.Lock()
         self.limiter = self._new_limiter(self.weight_per_minute)
+        self._endpoint_limiters = {
+            "/fapi/v1/fundingRate": SharedRateLimiter(
+                provider_rate_limit("binance_usdm_funding_history").interval_seconds,
+                name="binance_usdm_funding_history",
+            ),
+            "futures_data": SharedRateLimiter(
+                provider_rate_limit("binance_usdm_statistics_history").interval_seconds,
+                name="binance_usdm_statistics_history",
+            ),
+        }
 
     @staticmethod
     def _new_limiter(weight_per_minute: float) -> SharedRateLimiter:
@@ -460,6 +581,13 @@ class BinanceClient:
         for attempt in range(self.max_retries + 1):
             with self._limiter_lock:
                 limiter = self.limiter
+            endpoint_limiter = None
+            if path == "/fapi/v1/fundingRate":
+                endpoint_limiter = self._endpoint_limiters[path]
+            elif path.startswith("/futures/data/"):
+                endpoint_limiter = self._endpoint_limiters["futures_data"]
+            if endpoint_limiter is not None:
+                endpoint_limiter.wait()
             limiter.wait(cost=weight)
             query = f"?{urlencode(params)}" if params else ""
             request = Request(
@@ -588,6 +716,7 @@ def _download_symbol(
     end_ms: int,
     mode: str,
     refresh: bool,
+    page_progress_callback: Any = None,
 ) -> DownloadResult:
     output_path = output_dir / f"{record.code}_features.parquet"
     existing: ExistingCandleInfo | None = None
@@ -657,6 +786,8 @@ def _download_symbol(
             },
             weight=KLINE_REQUEST_WEIGHT,
         )
+        if page_progress_callback is not None:
+            page_progress_callback(record.code)
         if not isinstance(payload, list):
             raise RuntimeError("Binance kline endpoint returned a non-list payload")
         chunk = [row for row in payload if isinstance(row, list) and len(row) >= 11]
@@ -744,10 +875,16 @@ def main() -> None:
     args = parse_args()
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = output_dir / ".download.lock"
+    lock_handle = lock_path.open("a+", encoding="utf-8")
+    print(f"[binance] waiting for exclusive dataset lock: {lock_path}", flush=True)
+    fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+    print(f"[binance] acquired exclusive dataset lock: {lock_path}", flush=True)
     symbols_path = output_dir / "symbols.csv"
     report_path = output_dir / "download_report.csv"
     summary_path = output_dir / "download_summary.json"
     receipt_path = output_dir / "download_receipt.json"
+    progress_path = output_dir / "progress.json"
     start_date = args.start_date.strip()
     end_date = resolve_end_date(args.end_date)
     start_ms = _date_to_ms(start_date, end_of_day=False)
@@ -767,6 +904,37 @@ def main() -> None:
     if not symbols:
         raise RuntimeError("No Binance USD-M perpetual symbols found")
     _write_csv_atomic(pl.DataFrame([asdict(row) for row in symbols]), symbols_path)
+    closed_end_ms = min(end_ms, _latest_closed_candle_start_ms())
+    expected_candle_pages = 0
+    for record in symbols:
+        output_path = output_dir / f"{record.code}_features.parquet"
+        if output_path.is_file() and not args.refresh:
+            expected_candle_pages += 1
+            continue
+        listing_start = start_ms
+        if record.onboard_time:
+            listing_start = max(
+                listing_start,
+                int(
+                    datetime.strptime(record.onboard_time, "%Y-%m-%d %H:%M:%S")
+                    .replace(tzinfo=timezone.utc)
+                    .timestamp()
+                    * 1000
+                ),
+            )
+        candle_count = max(
+            0, (closed_end_ms - listing_start) // CANDLE_INTERVAL_MS + 1
+        )
+        expected_candle_pages += max(
+            1, (candle_count + KLINE_LIMIT - 1) // KLINE_LIMIT
+        )
+    pipeline_progress = _PipelineProgress(
+        progress_path,
+        total_units=expected_candle_pages
+        + len(symbols)
+        * (0 if args.skip_historical_features else len(FEATURE_STAGE_IDS)),
+        started_at=started_at,
+    )
 
     print(
         "[binance] start "
@@ -777,7 +945,7 @@ def main() -> None:
     )
 
     def worker(record: SymbolRecord) -> DownloadResult:
-        return _download_symbol(
+        result = _download_symbol(
             client,
             record,
             output_dir,
@@ -785,10 +953,14 @@ def main() -> None:
             end_ms=end_ms,
             mode=args.mode,
             refresh=args.refresh,
+            page_progress_callback=lambda code: pipeline_progress.update(
+                "candles", "page_fetched", item=code
+            ),
         )
+        return result
 
     def on_error(record: SymbolRecord, exc: Exception) -> DownloadResult:
-        return DownloadResult(
+        result = DownloadResult(
             "crypto_binance_usdm_perp",
             record.code,
             record.binance_symbol,
@@ -798,6 +970,10 @@ def main() -> None:
             None,
             message=f"{type(exc).__name__}: {exc}",
         )
+        pipeline_progress.update(
+            "candles", result.status, item=record.code, message=result.message
+        )
+        return result
 
     results = run_parallel_tasks(
         symbols,
@@ -807,7 +983,72 @@ def main() -> None:
         unit="symbol",
         on_error=on_error,
     )
-    result_rows = [asdict(result) for result in results]
+
+    feature_catalog_path = output_dir / "binance_historical_feature_catalog.json"
+    _write_text_atomic(
+        feature_catalog_path,
+        json.dumps(feature_catalog_payload(), ensure_ascii=False, indent=2) + "\n",
+    )
+    observed_at_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    historical_feature_results = []
+    if not args.skip_historical_features:
+        historical_feature_results = run_historical_feature_downloads(
+            client,
+            symbols,
+            output_dir,
+            start_ms=start_ms,
+            end_ms=end_ms,
+            workers=args.feature_workers or args.workers,
+            observed_at_ms=observed_at_ms,
+            stage_progress_callback=lambda code, stage, status: (
+                pipeline_progress.update(stage, status, item=code)
+            ),
+        )
+    historical_feature_report_path = output_dir / "historical_feature_report.csv"
+    feature_rows = historical_feature_result_rows(historical_feature_results)
+    feature_report = (
+        pl.DataFrame(feature_rows, infer_schema_length=None)
+        if feature_rows
+        else pl.DataFrame(
+            schema={
+                "code": pl.String,
+                "binance_symbol": pl.String,
+                "status": pl.String,
+                "rows": pl.Int64,
+                "output_path": pl.String,
+                "changed": pl.Boolean,
+                "stage_status_json": pl.String,
+                "coverage_json": pl.String,
+                "errors_json": pl.String,
+            }
+        )
+    )
+    _write_csv_atomic(feature_report, historical_feature_report_path)
+
+    historical_by_code = {result.code: result for result in historical_feature_results}
+    result_rows = []
+    for result in results:
+        row = asdict(result)
+        historical = historical_by_code.get(result.code)
+        row.update(
+            {
+                "historical_feature_status": (
+                    historical.status
+                    if historical is not None
+                    else "disabled_or_missing"
+                ),
+                "historical_feature_changed": (
+                    historical.changed if historical is not None else False
+                ),
+                "historical_feature_coverage_json": (
+                    historical.coverage_json if historical is not None else "{}"
+                ),
+                "historical_feature_errors_json": (
+                    historical.errors_json if historical is not None else "{}"
+                ),
+            }
+        )
+        result_rows.append(row)
     report = pl.DataFrame(result_rows, infer_schema_length=None).sort(
         ["status", "binance_symbol"]
     )
@@ -816,6 +1057,11 @@ def main() -> None:
     status_counts: dict[str, int] = {}
     for result in results:
         status_counts[result.status] = status_counts.get(result.status, 0) + 1
+    historical_status_counts: dict[str, int] = {}
+    for result in historical_feature_results:
+        historical_status_counts[result.status] = (
+            historical_status_counts.get(result.status, 0) + 1
+        )
     ended_at = datetime.now(timezone.utc)
     limiter_activity = client.limiter.grant_activity()
     summary = {
@@ -823,6 +1069,11 @@ def main() -> None:
         "interval": KLINE_INTERVAL,
         "symbol_count": len(symbols),
         "status_counts": status_counts,
+        "row_count": sum(int(result.rows) for result in results),
+        "historical_features_enabled": not args.skip_historical_features,
+        "historical_feature_status_counts": historical_status_counts,
+        "historical_feature_report": str(historical_feature_report_path),
+        "historical_feature_catalog": str(feature_catalog_path),
         "start_date": start_date,
         "end_date": end_date,
         "started_at_utc": started_at.isoformat(),
@@ -852,7 +1103,13 @@ def main() -> None:
         },
         "artifacts": {
             path.name: {"bytes": path.stat().st_size, "sha256": _sha256(path)}
-            for path in (symbols_path, report_path, summary_path)
+            for path in (
+                symbols_path,
+                report_path,
+                summary_path,
+                historical_feature_report_path,
+                feature_catalog_path,
+            )
         },
         "status_counts": status_counts,
         "generated_at_utc": ended_at.isoformat(),
@@ -861,15 +1118,26 @@ def main() -> None:
         receipt_path,
         json.dumps(receipt, ensure_ascii=False, indent=2) + "\n",
     )
+    failed = status_counts.get("failed", 0)
+    feature_incomplete = historical_status_counts.get(
+        "failed", 0
+    ) + historical_status_counts.get("partial", 0)
+    pipeline_progress.finish(failed=bool(failed or feature_incomplete))
 
     print(f"[binance] symbols -> {symbols_path}")
     print(f"[binance] report -> {report_path}")
     print(f"[binance] summary -> {summary_path}")
     print(f"[binance] receipt -> {receipt_path}")
+    print(f"[binance] feature report -> {historical_feature_report_path}")
+    print(f"[binance] feature catalog -> {feature_catalog_path}")
     print(f"[binance] done: {json.dumps(summary, ensure_ascii=False)}")
-    failed = status_counts.get("failed", 0)
     if failed:
         raise RuntimeError(f"Binance download incomplete: {failed} symbols failed")
+    if feature_incomplete:
+        raise RuntimeError(
+            "Binance historical features incomplete: "
+            f"{feature_incomplete} symbols were partial or failed"
+        )
 
 
 if __name__ == "__main__":

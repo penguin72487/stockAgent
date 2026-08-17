@@ -13,20 +13,21 @@ from stockagent.config import load_config
 from stockagent.live.market_config import load_market_config
 
 
-def test_crypto_market_config_is_15m() -> None:
+def test_crypto_market_config_is_1m() -> None:
     config = load_config("configs/markets/crypto.yaml")
 
-    assert config.trading.frequency == "15m"
-    assert config.data.parquet_root == "data_okx"
+    assert config.trading.frequency == "1m"
+    assert config.data.parquet_root == "data_okx/1m"
 
 
-def test_discord_crypto_market_uses_15m_incremental_updater() -> None:
+def test_discord_crypto_market_uses_1m_incremental_updater() -> None:
     cfg = load_market_config("services/discord_bot/markets/crypto.yaml")
 
     assert cfg.pre_signal_command[0] == "{python}"
-    assert cfg.schedule_interval_minutes == 15
+    assert cfg.schedule_interval_minutes == 1
     assert cfg.history_frequency == "bar"
-    assert "downloader/download_okx_perp_15m.py" in cfg.pre_signal_command
+    assert "downloader/download_okx_perp_1m.py" in cfg.pre_signal_command
+    assert "data_okx/1m" in cfg.pre_signal_command
     assert "incremental" in cfg.pre_signal_command
 
 
@@ -125,7 +126,7 @@ def test_live_market_config_rejects_unsupported_nested_keys(tmp_path: Path) -> N
         load_market_config(path)
 
 
-def test_crypto_downloaders_accept_incremental_15m_mode(monkeypatch) -> None:
+def test_crypto_downloaders_accept_incremental_1m_mode(monkeypatch) -> None:
     monkeypatch.setattr(sys, "argv", ["download_yahoo_ohlcv.py", "--asset", "crypto", "--mode", "incremental"])
     yahoo_args = yahoo.parse_args()
     assert yahoo_args.asset == "crypto"
@@ -141,10 +142,35 @@ def test_crypto_downloaders_accept_incremental_15m_mode(monkeypatch) -> None:
     assert bybit_args.mode == "incremental"
 
 
+def test_bybit_inventory_retains_delisted_files_without_hiding_rows(
+    tmp_path: Path,
+) -> None:
+    for code, rows in (("CURRENTUSDT", 2), ("DELISTEDUSDT", 3)):
+        bybit._write_parquet(
+            bybit.pl.DataFrame(
+                {"date": [f"2026-08-16 00:{i:02d}:00" for i in range(rows)]}
+            ),
+            tmp_path / f"{code}_features.parquet",
+        )
+
+    inventory = bybit._stored_parquet_inventory(
+        tmp_path,
+        current_codes={"CURRENTUSDT"},
+    )
+
+    assert inventory == {
+        "stored_symbol_count": 2,
+        "stored_row_count": 5,
+        "retained_historical_symbol_count": 1,
+        "retained_historical_row_count": 3,
+        "retained_historical_symbols": ["DELISTEDUSDT"],
+    }
+
+
 def test_crypto_downloader_overlap_replaces_existing_tail() -> None:
     existing = okx.pl.DataFrame(
         {
-            "date": ["2026-06-22 00:00:00", "2026-06-22 00:15:00"],
+            "date": ["2026-06-22 00:00:00", "2026-06-22 00:01:00"],
             "open": [100.0, 110.0],
             "max": [101.0, 111.0],
             "min": [99.0, 109.0],
@@ -155,7 +181,7 @@ def test_crypto_downloader_overlap_replaces_existing_tail() -> None:
     )
     fresh = okx.pl.DataFrame(
         {
-            "date": ["2026-06-22 00:00:00", "2026-06-22 00:15:00"],
+            "date": ["2026-06-22 00:00:00", "2026-06-22 00:01:00"],
             "open": [100.0, 110.0],
             "max": [102.0, 112.0],
             "min": [98.0, 108.0],
@@ -170,13 +196,13 @@ def test_crypto_downloader_overlap_replaces_existing_tail() -> None:
 
     assert changed
     assert merged.height == 2
-    assert merged.filter(okx.pl.col("date") == "2026-06-22 00:15:00").select("Trading_Volume").item() == 20.0
+    assert merged.filter(okx.pl.col("date") == "2026-06-22 00:01:00").select("Trading_Volume").item() == 20.0
 
 
 def test_crypto_downloader_overlap_preserves_historical_feature_columns() -> None:
     existing = okx.pl.DataFrame(
         {
-            "date": ["2026-06-22 00:00:00", "2026-06-22 00:15:00"],
+            "date": ["2026-06-22 00:00:00", "2026-06-22 00:01:00"],
             "open": [100.0, 110.0],
             "max": [101.0, 111.0],
             "min": [99.0, 109.0],

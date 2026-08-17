@@ -400,6 +400,28 @@ def _validate_tw_index_futures_mode_contract(
         )
 
 
+def _validate_tw_futures_portfolio_mode_contract(
+    *,
+    execution_mode: str,
+    frequency: object,
+    loss_type: object,
+    max_volume_participation: object,
+) -> None:
+    if execution_mode != "tw_futures_portfolio_day":
+        return
+    if _normalized_contract_name(frequency) not in {"daily", "day", "1d"}:
+        raise ValueError("tw_futures_portfolio_day requires trading.frequency='daily'")
+    if _normalized_contract_name(loss_type) not in _TW_PHASE_RETURN_OBJECTIVES:
+        raise ValueError(
+            "tw_futures_portfolio_day supports only canonical log-utility objectives"
+        )
+    if float(max_volume_participation) != 0.0:
+        raise ValueError(
+            "tw_futures_portfolio_day v1 requires max_volume_participation=0; "
+            "the public daily report has no causal opening depth"
+        )
+
+
 def _validate_tw_index_derivatives_day_mode_contract(
     *,
     execution_mode: str,
@@ -1006,6 +1028,13 @@ class TradingConfig:
         default_factory=lambda: [0.0, 0.0, 0.0]
     )
     tw_index_futures_basket_fee_penalty: float = 1.0
+    # Historical and current TAIFEX stock/ETF/domestic+foreign index futures,
+    # standardized as independent, lifetime-stable delivery-month/week sleeves.
+    # Physical contract identity and mandatory own-close liquidation live in
+    # this receipt-backed table and are never inferred from price jumps.
+    tw_futures_portfolio_data_path: str = (
+        "data_tw_futures/taifex_portfolio_daily/continuous_daily.parquet"
+    )
     tw_index_options_monthly_data_path: str = (
         "data_tw_index_options_daily/monthly_full_chain.parquet"
     )
@@ -2747,6 +2776,12 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         volatility_regime_weight=training["multitask_loss"]["volatility_regime_weight"],
         concentration_weight=training["multitask_loss"]["concentration_weight"],
     )
+    _validate_tw_futures_portfolio_mode_contract(
+        execution_mode=trading["execution_mode"],
+        frequency=trading["frequency"],
+        loss_type=training["loss_type"],
+        max_volume_participation=trading["max_volume_participation"],
+    )
     _validate_tw_index_derivatives_day_mode_contract(
         execution_mode=trading["execution_mode"],
         model_name=training["model_name"],
@@ -2924,6 +2959,12 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     if not futures_data_path:
         raise ValueError("trading.tw_index_futures_data_path must not be empty")
     trading["tw_index_futures_data_path"] = futures_data_path
+    futures_portfolio_data_path = str(
+        trading["tw_futures_portfolio_data_path"]
+    ).strip()
+    if not futures_portfolio_data_path:
+        raise ValueError("trading.tw_futures_portfolio_data_path must not be empty")
+    trading["tw_futures_portfolio_data_path"] = futures_portfolio_data_path
     all_futures_context_path = str(
         trading["tw_index_futures_all_products_context_path"]
     ).strip()
