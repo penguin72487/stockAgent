@@ -46,7 +46,14 @@ let eventLoadError = "";
 let eventRequestSequence = 0;
 let eventAbortController = null;
 let filterAnimationFrame = null;
-let positionVisibleRows = POSITION_PAGE_SIZE;
+let positionRows = [];
+let positionTotal = 0;
+let positionHasMore = false;
+let positionLoading = false;
+let positionLoadError = "";
+let positionRequestSequence = 0;
+let positionAbortController = null;
+let availableDetailDates = [];
 
 try {
   chartRange = localStorage.getItem("tw-day-trade-equity-time-range") || "1d";
@@ -135,7 +142,29 @@ const progress = (ratio, kind = "") => {
 const directionPair = (row = {}) => `多 ${pct(row.long_gross)} / 空 ${pct(row.short_gross)} · ${number(row.long_count)} / ${number(row.short_count)} 檔`;
 
 function selectedMode() { return $("mode-filter").value || "all"; }
-function selectedDate() { return $("date-filter").value || ""; }
+function selectedDetailStartDate() { return $("detail-start-date").value || ""; }
+function selectedDetailEndDate() { return $("detail-end-date").value || ""; }
+function selectedDate() {
+  const boundary = selectedDetailEndDate();
+  return availableDetailDates.find((value) => value <= boundary) || boundary;
+}
+function detailRangeKey() { return `${selectedDetailStartDate()}|${selectedDetailEndDate()}`; }
+function selectedChartStartDate() { return $("equity-start-date").value || ""; }
+function selectedChartEndDate() { return $("equity-end-date").value || ""; }
+function hasCustomChartDates() { return Boolean(selectedChartStartDate() || selectedChartEndDate()); }
+function chartWindowLabel() {
+  const start = selectedChartStartDate();
+  const end = selectedChartEndDate();
+  if (!start && !end) return TIME_RANGE_LABELS[chartRange];
+  return `${start || "最早資料"} ～ ${end || "最新資料"}`;
+}
+function chartRequestKey() {
+  return JSON.stringify([
+    hasCustomChartDates() ? "all" : chartRange,
+    selectedChartStartDate(),
+    selectedChartEndDate(),
+  ]);
+}
 function textFilter() { return $("symbol-filter").value.trim().toLowerCase(); }
 function matchesMode(row) { return selectedMode() === "all" || row.market === selectedMode(); }
 function matchesSymbol(row) {
@@ -327,20 +356,29 @@ function renderHeader(data) {
 function syncFilters(data) {
   const mode = $("mode-filter");
   const previousMode = mode.value;
-  const date = $("date-filter");
-  const previousDate = date.value;
-  const dates = Array.isArray(data.available_session_dates) && data.available_session_dates.length
+  const startDate = $("detail-start-date");
+  const endDate = $("detail-end-date");
+  const previousStart = startDate.value;
+  const previousEnd = endDate.value;
+  const sourceDates = Array.isArray(data.available_session_dates) && data.available_session_dates.length
     ? data.available_session_dates
     : [data.session_date].filter(Boolean);
-  const revision = JSON.stringify([data.modes.map((row) => [row.market, row.label]), dates]);
+  availableDetailDates = [...sourceDates].map(String).sort((left, right) => right.localeCompare(left));
+  const revision = JSON.stringify([data.modes.map((row) => [row.market, row.label]), availableDetailDates]);
   if (revision !== lastFilterRevision) {
     mode.innerHTML = `<option value="all">全部模式</option>` + data.modes.map((row) => `<option value="${esc(row.market)}">${esc(row.label || row.market)}</option>`).join("");
     if ([...mode.options].some((option) => option.value === previousMode)) mode.value = previousMode;
-    date.innerHTML = dates.map((value) => `<option value="${esc(value)}">${esc(value)}</option>`).join("");
-    date.value = dates.includes(previousDate) ? previousDate : data.session_date;
+    const earliest = availableDetailDates.at(-1) || data.session_date || "";
+    const latest = availableDetailDates[0] || data.session_date || "";
+    startDate.min = earliest; startDate.max = latest;
+    endDate.min = earliest; endDate.max = latest;
+    const withinCoverage = (value) => Boolean(value && earliest <= value && value <= latest);
+    startDate.value = withinCoverage(previousStart) ? previousStart : data.session_date;
+    endDate.value = withinCoverage(previousEnd) ? previousEnd : data.session_date;
     lastFilterRevision = revision;
   }
-  if (date.value !== data.session_date) date.value = data.session_date;
+  if (!endDate.value) endDate.value = data.session_date;
+  if (!startDate.value) startDate.value = endDate.value;
 }
 
 function renderModes(data) {
@@ -407,6 +445,8 @@ function renderBenchmarks(data) {
       : `${number(row.quantity || 1000)} 股 · ${row.symbol || ""}`;
     const rollText = isTx
       ? `${number(row.roll_count || 0)} 次${row.last_roll_at ? ` · 最近 ${shortTime(row.last_roll_at)}` : " · 尚未換月"}`
+      : row.corporate_action_status === "same_session_no_action_boundary"
+        ? "同日進出未跨除權息界線 · 因子 1×"
       : row.total_return_contract
         ? `官方除權息因子 ${sourceNumber(row.corporate_action_factor ?? 1)}× · ${number(row.corporate_action_count || 0)} 次 · 覆蓋至 ${row.corporate_action_coverage_end || "—"}`
         : "等待下一個交易分鐘載入含息基準契約";
@@ -553,16 +593,17 @@ function renderChart(data) {
   if (!points.length) {
     svg.innerHTML = "";
     $("equity-range-note").textContent = allPoints.length
-      ? `${TIME_RANGE_LABELS[chartRange]} · 目前 ${number(series.length)} 條曲線皆已隱藏。`
-      : `${TIME_RANGE_LABELS[chartRange]}內沒有可繪製資料。`;
+      ? `${chartWindowLabel()} · 目前 ${number(series.length)} 條曲線皆已隱藏。`
+      : `${chartWindowLabel()}內沒有可繪製資料。`;
     return;
   }
   const width = 960, height = 360, left = 76, right = 22, top = 24, bottom = 70;
   const times = [...new Set(allPoints.map((row) => String(row.minute)))].sort();
   const axis = timeAxis.buildTimeAxis({
-    range: chartRange,
+    range: hasCustomChartDates() ? "all" : chartRange,
     timestamps: times.map((value) => new Date(value).getTime()),
     sessions: TW_STOCK_SESSIONS,
+    collapseEmptyIntervals: true,
   });
   if (!axis) return;
   let ymin = Math.min(0, ...points.map((row) => Number(row.return_pct)));
@@ -595,24 +636,33 @@ function renderChart(data) {
   const start = new Date(times[0]).toLocaleString("zh-TW", {timeZone:"Asia/Taipei", hour12:false});
   const end = new Date(times.at(-1)).toLocaleString("zh-TW", {timeZone:"Asia/Taipei", hour12:false});
   const sampled = chartHistory?.downsampled ? `；已保留端點與區間極值縮圖（原 ${number(chartHistory.raw_points_in_range)} 點）` : "";
-  $("equity-range-note").textContent = `${TIME_RANGE_LABELS[chartRange]} · ${start} ～ ${end} · 顯示 ${number(points.length)} 點、${number(visibleSeries.length)}/${number(series.length)} 條線${sampled}`;
+  $("equity-range-note").textContent = `${chartWindowLabel()} · ${start} ～ ${end} · 顯示 ${number(points.length)} 點、${number(visibleSeries.length)}/${number(series.length)} 條線；全體無資料的時間已壓縮${sampled}`;
 }
 
 function syncChartRangeControl() {
   $("equity-time-range").querySelectorAll("button[data-range]").forEach((button) => {
-    button.setAttribute("aria-pressed", String(button.dataset.range === chartRange));
+    button.setAttribute("aria-pressed", String(!hasCustomChartDates() && button.dataset.range === chartRange));
   });
 }
 
 function applyChartHistory(payload) {
   chartHistory = payload;
+  const startInput = $("equity-start-date");
+  const endInput = $("equity-end-date");
+  startInput.min = payload.available_start_date || "";
+  startInput.max = payload.available_end_date || "";
+  endInput.min = payload.available_start_date || "";
+  endInput.max = payload.available_end_date || "";
   if (snapshot) renderChart(snapshot);
 }
 
 async function loadChartHistory({preferCache = false} = {}) {
   if (document.hidden) return;
-  const requestedRange = chartRange;
-  const cached = chartHistoryCache.get(requestedRange);
+  const requestedRange = hasCustomChartDates() ? "all" : chartRange;
+  const requestedStart = selectedChartStartDate();
+  const requestedEnd = selectedChartEndDate();
+  const requestedKey = chartRequestKey();
+  const cached = chartHistoryCache.get(requestedKey);
   if (preferCache) {
     if (cached) applyChartHistory(cached.payload);
     else {
@@ -624,43 +674,47 @@ async function loadChartHistory({preferCache = false} = {}) {
   if (historyInFlight) return;
   historyInFlight = true;
   try {
-    const response = await fetchWithTimeout(`api/history?range=${encodeURIComponent(requestedRange)}`, {cache:"default"});
+    const params = new URLSearchParams({range: requestedRange});
+    if (requestedStart) params.set("start_date", requestedStart);
+    if (requestedEnd) params.set("end_date", requestedEnd);
+    const response = await fetchWithTimeout(`api/history?${params.toString()}`, {cache:"default"});
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const payload = await response.json();
-    if (requestedRange !== chartRange) return;
-    chartHistoryCache.set(requestedRange, {payload, receivedAt: Date.now()});
+    if (requestedKey !== chartRequestKey()) return;
+    chartHistoryCache.set(requestedKey, {payload, receivedAt: Date.now()});
     applyChartHistory(payload);
   } catch (error) {
-    $("equity-range-note").textContent = `${TIME_RANGE_LABELS[requestedRange]}歷史載入失敗：${error}`;
+    $("equity-range-note").textContent = `${chartWindowLabel()}歷史載入失敗：${error}`;
   } finally {
     historyInFlight = false;
-    if (requestedRange !== chartRange) void loadChartHistory({preferCache: true});
+    if (requestedKey !== chartRequestKey()) void loadChartHistory({preferCache: true});
   }
 }
 
 function renderPositions(data) {
-  const status = $("status-filter").value;
-  const rows = data.positions.filter(matchesMode).filter(matchesSymbol).filter((row) => {
-    if (status === "all") return true;
-    if (status === "open") return Number(row.signed_shares || 0) !== 0;
-    if (status === "closed") return row.status === "closed";
-    return false;
-  }).sort(compareByAbsoluteWeight);
-  const visible = rows.slice(0, positionVisibleRows);
-  $("position-count").textContent = `${visible.length} / ${rows.length} 筆`;
+  const rows = positionRows;
+  $("position-count").textContent = positionLoadError
+    ? `${rows.length} / ${positionTotal} 筆 · 等待重試`
+    : `${rows.length} / ${positionTotal} 筆`;
   const loadMore = $("load-more-positions");
-  loadMore.classList.toggle("hidden", visible.length >= rows.length);
-  $("position-body").innerHTML = visible.map((row) => {
+  loadMore.classList.toggle("hidden", !positionHasMore);
+  loadMore.disabled = positionLoading;
+  loadMore.textContent = positionLoading ? "載入中…" : "載入更多";
+  const errorRow = positionLoadError
+    ? `<tr><td colspan="6">${esc(positionLoadError)}</td></tr>`
+    : "";
+  const rowHtml = rows.map((row) => {
     const {signedShares, realized:realizedNet, unrealized:unrealizedNet, total:totalNet} = resolvedPositionPnl(row);
     return `<tr>
-      <td><strong>${esc(row.market)}</strong> ${badge(row.side === "long" ? "多" : "空", row.side === "long" ? "good" : "bad")}<small>${esc(row.symbol)} ${esc(row.name || "")}</small></td>
+      <td><strong>${esc(row.market)}</strong> ${badge(row.side === "long" ? "多" : "空", row.side === "long" ? "good" : "bad")}<small>${esc(row.session_date)} · ${esc(row.symbol)} ${esc(row.name || "")}</small></td>
       <td><strong>${pct(row.target_weight)}</strong><small>成交 ${number(row.filled_shares)}／預計 ${number(row.requested_shares)} 股</small><small>剩餘 ${number(Math.abs(signedShares))} 股</small></td>
       <td><strong>進 ${money(row.entry_price)}</strong><small>${shortTime(row.entry_at)}${row.simulation_replay ? ` · 開盤價重建；原始訊號 ${shortTime(row.source_signal_at)}` : ""}</small><small>清算 ${money(row.last_mark_price)} · ${shortTime(row.last_quote_at)}</small></td>
       <td><strong>TP ${sourceNumber(row.take_profit_price)} · SL ${sourceNumber(row.stop_trigger_price)}</strong><small>${esc(row.stop_order_status)}</small><small>13:20 ${row.eod_limit_price == null ? "—" : sourceNumber(row.eod_limit_price)} · ${esc(row.eod_limit_order_status || "未到")} · ${shortTime(row.eod_limit_submitted_at)}</small><small>13:25 ${row.closing_auction_limit_price == null ? "—" : sourceNumber(row.closing_auction_limit_price)} · ${esc(row.closing_auction_order_status || "未到")}</small></td>
 	    <td><strong>${row.exit_price == null ? (row.last_exit_price == null ? "持倉中" : `部分 ${money(row.last_exit_price)}`) : money(row.exit_price)}</strong><small>${esc(row.exit_reason || row.status || "—")}</small><small>${shortTime(row.exit_at || row.last_exit_at)}</small></td>
 	    <td><strong class="${pnlClass(totalNet)}">總 ${money(totalNet)}</strong><small class="${pnlClass(realizedNet)}">已實現 ${money(realizedNet)}</small><small class="${pnlClass(unrealizedNet)}">未實現 ${money(unrealizedNet)} · ${row.valuation_stale ? badge("延用", "warn") : badge("新鮮", "good")}</small></td>
     </tr>`;
-  }).join("") || `<tr><td colspan="6">目前沒有符合篩選的持倉</td></tr>`;
+  }).join("");
+  $("position-body").innerHTML = errorRow + (rowHtml || `<tr><td colspan="6">目前沒有符合篩選的持倉</td></tr>`);
 }
 
 function renderSignals() {
@@ -674,10 +728,10 @@ function renderSignals() {
   const target = signalDirectionSummary.target || {};
   const preBalance = signalDirectionSummary.pre_balance || {};
   const actual = signalDirectionSummary.actual || {};
-  const positionMap = new Map((snapshot?.positions || []).map((row) => [`${row.market}\u0000${row.symbol}`, row]));
+  const positionMap = new Map(positionRows.map((row) => [`${row.session_date}\u0000${row.market}\u0000${row.symbol}`, row]));
   const modeMap = new Map((snapshot?.modes || []).map((mode) => [mode.market, mode]));
   $("signal-direction-summary").innerHTML = [
-    ["目前訊號目標", target],
+    ["區間訊號目標", target],
     ["整張／深度後", preBalance],
     ["方向平衡後", actual],
   ].map(([label, row]) => `<div><span>${esc(label)}</span><strong>${esc(directionPair(row))}</strong></div>`).join("");
@@ -685,13 +739,13 @@ function renderSignals() {
     ? `<tr class="signal-load-error"><td colspan="6">${esc(signalLoadError)}</td></tr>`
     : "";
   const rowHtml = signalRows.map((row) => {
-    const position = positionMap.get(`${row.market}\u0000${row.symbol}`);
+    const position = positionMap.get(`${row.session_date}\u0000${row.market}\u0000${row.symbol}`);
     const mode = modeMap.get(row.market);
     const positionPnl = position ? resolvedPositionPnl(position) : null;
     const hasPosition = Boolean(position && Number(position.filled_shares || 0) > 0);
     const isOpen = hasPosition && positionPnl.signedShares !== 0;
     const entryNotional = hasPosition ? Math.abs(Number(position.filled_shares || 0)) * Number(position.entry_price || 0) : null;
-    const modeTotalEquity = Number(mode?.total_equity_twd);
+    const modeTotalEquity = row.session_date === snapshot?.session_date ? Number(mode?.total_equity_twd) : NaN;
     const equityImpactPct = hasPosition && positionPnl.total != null && Number.isFinite(modeTotalEquity) && Math.abs(modeTotalEquity) > .01
       ? Number(positionPnl.total) / modeTotalEquity * 100
       : null;
@@ -703,7 +757,7 @@ function renderSignals() {
       : badge("不可當沖", "bad");
     const result = badge(row.status, row.status === "ready" ? "good" : ["partial_depth", "partial_directional_mix"].includes(row.status) ? "warn" : row.status === "hold" ? "" : "bad");
     return `<tr>
-      <td><strong>${esc(row.market)}</strong><small>${shortTime(row.signal_at)}</small></td>
+      <td><strong>${esc(row.market)}</strong><small>${esc(row.session_date)} · ${shortTime(row.signal_at)}</small></td>
       <td><strong>${esc(row.symbol)}</strong> ${badge(row.side, row.side === "long" ? "good" : row.side === "short" ? "bad" : "")}<small>${esc(row.name || "")}</small><small>${eligibility} ${result}</small></td>
 	    <td><strong>${sourceNumber(row.raw_score ?? row.score)}</strong><small>權重 ${pct(row.target_weight)}</small><small>${esc(row.reason || "")}</small></td>
 	    <td>${hasPosition ? `<strong>進場價 ${money(position.entry_price)}</strong><small>進場名目 ${money(entryNotional)} · 費用 ${money(position.entry_fee_twd)}</small>` : `<strong>未成交・無進場成本</strong>`}<small>成交 ${number(row.filled_shares)}／${number(row.requested_shares)} 股 · L1 ${number(row.top_book_capacity_shares)}</small></td>
@@ -725,7 +779,7 @@ function renderEvents() {
   const errorRow = eventLoadError
     ? `<tr><td colspan="6">${esc(eventLoadError)}</td></tr>`
     : "";
-  const rowHtml = eventRows.map((row) => `<tr><td>${shortTime(row.fill_at || row.recorded_at)}</td><td>${esc(row.market)}<small>${esc(row.symbol)}</small></td><td>${esc(row.purpose)}</td><td>${esc(row.order_type || row.event_kind)}</td><td>${sourceNumber(row.price)} × ${number(row.quantity)}</td><td>${esc(row.status || row.event_kind)}</td></tr>`).join("");
+  const rowHtml = eventRows.map((row) => `<tr><td>${esc(row.session_date)}<small>${shortTime(row.fill_at || row.recorded_at)}</small></td><td>${esc(row.market)}<small>${esc(row.symbol)}</small></td><td>${esc(row.purpose)}</td><td>${esc(row.order_type || row.event_kind)}</td><td>${sourceNumber(row.price)} × ${number(row.quantity)}</td><td>${esc(row.status || row.event_kind)}</td></tr>`).join("");
   $("event-body").innerHTML = errorRow + (rowHtml || `<tr><td colspan="6">尚無委託／成交事件</td></tr>`);
 }
 
@@ -787,9 +841,10 @@ async function loadSignals({append = false} = {}) {
   signalAbortController = new AbortController();
   const controller = signalAbortController;
   const sequence = ++signalRequestSequence;
-  const requestDate = selectedDate();
+  const requestRange = detailRangeKey();
   const params = new URLSearchParams({
-    date: requestDate,
+    start_date: selectedDetailStartDate(),
+    end_date: selectedDetailEndDate(),
     mode: selectedMode(),
     symbol: $("symbol-filter").value.trim(),
     status: $("status-filter").value,
@@ -803,7 +858,7 @@ async function loadSignals({append = false} = {}) {
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const page = await response.json();
     if (sequence !== signalRequestSequence) return;
-    if (requestDate !== selectedDate()) return;
+    if (requestRange !== detailRangeKey()) return;
     signalLoadError = "";
     signalRows = append ? signalRows.concat(page.rows || []) : (page.rows || []);
     signalTotal = Number(page.total || 0);
@@ -824,15 +879,58 @@ async function loadSignals({append = false} = {}) {
   }
 }
 
+async function loadPositions({append = false} = {}) {
+  if (!snapshot) return;
+  if (positionAbortController) positionAbortController.abort();
+  positionAbortController = new AbortController();
+  const controller = positionAbortController;
+  const sequence = ++positionRequestSequence;
+  const requestRange = detailRangeKey();
+  const params = new URLSearchParams({
+    start_date: selectedDetailStartDate(),
+    end_date: selectedDetailEndDate(),
+    mode: selectedMode(),
+    symbol: $("symbol-filter").value.trim(),
+    status: $("status-filter").value,
+    offset: String(append ? positionRows.length : 0),
+    limit: String(POSITION_PAGE_SIZE),
+  });
+  positionLoading = true;
+  renderPositions(snapshot);
+  try {
+    const response = await fetchWithTimeout(`api/positions?${params.toString()}`, {cache: "no-store", signal: controller.signal});
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const page = await response.json();
+    if (sequence !== positionRequestSequence) return;
+    if (requestRange !== detailRangeKey()) return;
+    positionLoadError = "";
+    positionRows = append ? positionRows.concat(page.rows || []) : (page.rows || []);
+    positionTotal = Number(page.total || 0);
+    positionHasMore = Boolean(page.has_more);
+  } catch (error) {
+    if (sequence !== positionRequestSequence) return;
+    if (error?.name === "AbortError") return;
+    positionLoadError = `持倉明細暫時無法更新：${error}`;
+  } finally {
+    if (sequence === positionRequestSequence) {
+      if (positionAbortController === controller) positionAbortController = null;
+      positionLoading = false;
+      renderPositions(snapshot);
+      renderSignals();
+    }
+  }
+}
+
 async function loadEvents({append = false} = {}) {
   if (!snapshot) return;
   if (eventAbortController) eventAbortController.abort();
   eventAbortController = new AbortController();
   const controller = eventAbortController;
   const sequence = ++eventRequestSequence;
-  const requestDate = selectedDate();
+  const requestRange = detailRangeKey();
   const params = new URLSearchParams({
-    date: requestDate,
+    start_date: selectedDetailStartDate(),
+    end_date: selectedDetailEndDate(),
     mode: selectedMode(),
     symbol: $("symbol-filter").value.trim(),
     offset: String(append ? eventRows.length : 0),
@@ -845,7 +943,7 @@ async function loadEvents({append = false} = {}) {
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const page = await response.json();
     if (sequence !== eventRequestSequence) return;
-    if (requestDate !== selectedDate()) return;
+    if (requestRange !== detailRangeKey()) return;
     eventLoadError = "";
     eventRows = append ? eventRows.concat(page.rows || []) : (page.rows || []);
     eventTotal = Number(page.total || 0);
@@ -853,7 +951,7 @@ async function loadEvents({append = false} = {}) {
     eventFillTotal = Number(page.fill_total || 0);
     eventHasMore = Boolean(page.has_more);
     const counts = page.record_counts || {};
-    eventRecordRevision = JSON.stringify([requestDate, Number(counts.orders || 0), Number(counts.fills || 0)]);
+    eventRecordRevision = JSON.stringify([requestRange, Number(counts.orders || 0), Number(counts.fills || 0)]);
   } catch (error) {
     if (sequence !== eventRequestSequence) return;
     if (error?.name === "AbortError") return;
@@ -888,10 +986,10 @@ async function refresh() {
     lastRenderedRevision = revision;
     render({heavy});
     const currentSignalCount = Number((snapshot.record_counts || {}).signals || 0);
-    const detailLoads = [];
+    const detailLoads = [loadPositions()];
     if (signalRecordCount == null || currentSignalCount !== signalRecordCount) detailLoads.push(loadSignals());
     const counts = snapshot.record_counts || {};
-    const currentEventRevision = JSON.stringify([selectedDate(), Number(counts.orders || 0), Number(counts.fills || 0)]);
+    const currentEventRevision = JSON.stringify([detailRangeKey(), Number(counts.orders || 0), Number(counts.fills || 0)]);
     if (eventRecordRevision == null || currentEventRevision !== eventRecordRevision) detailLoads.push(loadEvents());
     await Promise.all(detailLoads);
   } catch (error) {
@@ -914,7 +1012,6 @@ function renderFilteredDetails({includeChart = false} = {}) {
 }
 
 function filtersChanged({debounceSignals = false, includeChart = false, reloadEvents = true} = {}) {
-  positionVisibleRows = POSITION_PAGE_SIZE;
   if (filterAnimationFrame != null) cancelAnimationFrame(filterAnimationFrame);
   if (debounceSignals) {
     filterAnimationFrame = requestAnimationFrame(() => {
@@ -926,26 +1023,40 @@ function filtersChanged({debounceSignals = false, includeChart = false, reloadEv
   }
   window.clearTimeout(signalFilterTimer);
   if (debounceSignals) signalFilterTimer = window.setTimeout(() => {
+    void loadPositions();
     void loadSignals();
     if (reloadEvents) void loadEvents();
   }, 180);
   else {
+    void loadPositions();
     void loadSignals();
     if (reloadEvents) void loadEvents();
   }
 }
 
 $("mode-filter").addEventListener("change", () => filtersChanged({includeChart: true}));
-$("date-filter").addEventListener("change", () => {
+function detailDateChanged(event) {
+  const startInput = $("detail-start-date");
+  const endInput = $("detail-end-date");
+  if (startInput.value && endInput.value && startInput.value > endInput.value) {
+    if (event.target === startInput) endInput.value = startInput.value;
+    else startInput.value = endInput.value;
+  }
   lastRenderedRevision = null;
   signalRecordCount = null;
   signalRows = [];
   eventRecordRevision = null;
   eventRows = [];
+  positionRows = [];
+  positionTotal = 0;
+  positionHasMore = false;
   if (signalAbortController) signalAbortController.abort();
   if (eventAbortController) eventAbortController.abort();
+  if (positionAbortController) positionAbortController.abort();
   void refresh();
-});
+}
+$("detail-start-date").addEventListener("change", detailDateChanged);
+$("detail-end-date").addEventListener("change", detailDateChanged);
 $("status-filter").addEventListener("change", () => filtersChanged({reloadEvents: false}));
 $("symbol-filter").addEventListener("input", () => filtersChanged({debounceSignals: true}));
 $("reset-filters").addEventListener("click", () => {
@@ -956,15 +1067,34 @@ $("reset-filters").addEventListener("click", () => {
 });
 $("load-more-signals").addEventListener("click", () => loadSignals({append: true}));
 $("load-more-events").addEventListener("click", () => loadEvents({append: true}));
-$("load-more-positions").addEventListener("click", () => {
-  positionVisibleRows += POSITION_PAGE_SIZE;
-  renderPositions(snapshot);
-});
+$("load-more-positions").addEventListener("click", () => loadPositions({append: true}));
 $("equity-time-range").addEventListener("click", (event) => {
   const button = event.target.closest("button[data-range]");
   if (!button || !(button.dataset.range in TIME_RANGE_LABELS)) return;
   chartRange = button.dataset.range;
+  $("equity-start-date").value = "";
+  $("equity-end-date").value = "";
   try { localStorage.setItem("tw-day-trade-equity-time-range", chartRange); } catch (_error) { /* optional */ }
+  syncChartRangeControl();
+  void loadChartHistory({preferCache: true});
+});
+function chartDateChanged(event) {
+  const startInput = $("equity-start-date");
+  const endInput = $("equity-end-date");
+  if (startInput.value && endInput.value && startInput.value > endInput.value) {
+    if (event.target === startInput) endInput.value = startInput.value;
+    else startInput.value = endInput.value;
+  }
+  syncChartRangeControl();
+  chartHistory = null;
+  if (snapshot) renderChart(snapshot);
+  void loadChartHistory({preferCache: true});
+}
+$("equity-start-date").addEventListener("change", chartDateChanged);
+$("equity-end-date").addEventListener("change", chartDateChanged);
+$("clear-equity-dates").addEventListener("click", () => {
+  $("equity-start-date").value = "";
+  $("equity-end-date").value = "";
   syncChartRangeControl();
   void loadChartHistory({preferCache: true});
 });

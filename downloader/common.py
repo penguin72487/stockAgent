@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import deque
 from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 import hashlib
 import http.client
@@ -13,6 +13,7 @@ import math
 import os
 from pathlib import Path
 from queue import Queue
+import re
 import socket
 import threading
 import tempfile
@@ -29,6 +30,149 @@ from tqdm import tqdm
 
 TItem = TypeVar("TItem")
 TResult = TypeVar("TResult")
+
+
+_ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def load_env_file(
+    path: str | Path,
+    *,
+    allowed_names: Iterable[str],
+    override: bool = False,
+) -> set[str]:
+    """Load an allowlisted subset of a dotenv file without logging values.
+
+    Existing process variables win by default.  The intentionally small parser
+    accepts the ordinary ``NAME=value``, ``export NAME=value``, and matching
+    single/double quoted forms used by this repository; it does not execute
+    shell expansion.
+    """
+
+    target = Path(path)
+    allowed = {str(name) for name in allowed_names if _ENV_NAME.fullmatch(str(name))}
+    loaded: set[str] = set()
+    if not target.is_file() or not allowed:
+        return loaded
+    try:
+        lines = target.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError):
+        return loaded
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        if "=" not in line:
+            continue
+        name, raw_value = line.split("=", 1)
+        name = name.strip()
+        if name not in allowed or not _ENV_NAME.fullmatch(name):
+            continue
+        value = raw_value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        if not value or (not override and os.environ.get(name, "").strip()):
+            continue
+        os.environ[name] = value
+        loaded.add(name)
+    return loaded
+
+
+def atomic_write_text(path: str | Path, text: str, *, encoding: str = "utf-8") -> None:
+    """Publish a small text/CSV/JSON artifact without exposing partial bytes."""
+
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(
+        f".{target.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    )
+    try:
+        temporary.write_text(str(text), encoding=encoding)
+        os.replace(temporary, target)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+class PersistentProgress:
+    """Thread-safe, atomically published progress/ETA receipt for downloaders."""
+
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        label: str,
+        total: int,
+        unit: str,
+        basis: str,
+        started_at: datetime | None = None,
+    ) -> None:
+        self.path = Path(path)
+        self.label = str(label)
+        self.total = max(0, int(total))
+        self.unit = str(unit)
+        self.basis = str(basis)
+        self.started_at = started_at or datetime.now(timezone.utc)
+        if self.started_at.tzinfo is None:
+            self.started_at = self.started_at.replace(tzinfo=timezone.utc)
+        self.current = 0
+        self.status_counts: dict[str, int] = {}
+        self._lock = threading.Lock()
+        self._write("running", "initializing")
+
+    def _write(self, state: str, phase: str) -> None:
+        observed = datetime.now(timezone.utc)
+        elapsed = max(0.001, (observed - self.started_at).total_seconds())
+        rate = self.current / elapsed if self.current else 0.0
+        remaining = max(0, self.total - self.current)
+        eta_seconds = int(math.ceil(remaining / rate)) if rate > 0 else None
+        payload = {
+            "schema_version": 1,
+            "state": str(state),
+            "label": self.label,
+            "phase": str(phase),
+            "current": self.current,
+            "total": self.total,
+            "unit": self.unit,
+            "ratio": self.current / self.total if self.total else 1.0,
+            "started_at_utc": self.started_at.isoformat(),
+            "updated_at_utc": observed.isoformat(),
+            "elapsed_seconds": elapsed,
+            "items_per_second": rate,
+            "remaining_seconds": eta_seconds,
+            "estimated_complete_at_utc": (
+                (observed + timedelta(seconds=eta_seconds)).isoformat()
+                if eta_seconds is not None
+                else None
+            ),
+            "status_counts": dict(sorted(self.status_counts.items())),
+            "basis": self.basis,
+        }
+        atomic_write_text(
+            self.path,
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        )
+
+    def update(self, phase: str, status: str, *, count: int = 1) -> None:
+        increment = max(0, int(count))
+        with self._lock:
+            self.current = min(self.total, self.current + increment)
+            key = str(status)
+            self.status_counts[key] = self.status_counts.get(key, 0) + increment
+            self._write("running", phase)
+
+    def heartbeat(self, phase: str) -> None:
+        """Refresh a long-running phase without falsely incrementing progress."""
+
+        with self._lock:
+            self._write("running", phase)
+
+    def finish(self, *, failed: bool = False) -> None:
+        with self._lock:
+            if not failed:
+                self.current = self.total
+            self._write("failed" if failed else "complete", "complete")
 
 
 _SYSTEM_GETADDRINFO = socket.getaddrinfo
@@ -193,7 +337,10 @@ PROVIDER_RATE_LIMITS: dict[str, ProviderRateLimit] = {
         seconds=5,
         basis="official HTTP IP limit",
         source_url="https://bybit-exchange.github.io/docs/v5/rate-limit",
-        note="Public market data shares the api.bybit.com IP bucket.",
+        note=(
+            "Public market data shares the api.bybit.com IP bucket and also "
+            "returns endpoint-specific X-Bapi-Limit headers."
+        ),
     ),
     "binance_usdm_request_weight": ProviderRateLimit(
         provider="binance_usdm_request_weight",
@@ -207,6 +354,31 @@ PROVIDER_RATE_LIMITS: dict[str, ProviderRateLimit] = {
         note=(
             "Runtime exchangeInfo limits are authoritative. One limiter cost unit "
             "equals one request-weight unit."
+        ),
+    ),
+    "binance_usdm_funding_history": ProviderRateLimit(
+        provider="binance_usdm_funding_history",
+        requests=500,
+        seconds=300,
+        basis="official shared fundingRate/fundingInfo IP limit",
+        source_url=(
+            "https://developers.binance.com/en/docs/catalog/"
+            "core-trading-derivatives-trading-usd-s-m-futures/api/rest-api/market-data"
+        ),
+        note="GET /fapi/v1/fundingRate shares this bucket with fundingInfo.",
+    ),
+    "binance_usdm_statistics_history": ProviderRateLimit(
+        provider="binance_usdm_statistics_history",
+        requests=1000,
+        seconds=300,
+        basis="official futures-data IP limit",
+        source_url=(
+            "https://developers.binance.com/en/docs/catalog/"
+            "core-trading-derivatives-trading-usd-s-m-futures/api/rest-api/market-data"
+        ),
+        note=(
+            "Rolling futures/data statistics endpoints retain only the latest "
+            "30 days; append-only recurring capture is required."
         ),
     ),
     "shioaji_quote_query": ProviderRateLimit(
@@ -257,6 +429,195 @@ PROVIDER_RATE_LIMITS: dict[str, ProviderRateLimit] = {
         basis="official Basic historical market-data limit; account",
         source_url="https://docs.alpaca.markets/docs/about-market-data-api",
         note="Algo Trader Plus supports 10,000 requests per minute via downloader configuration.",
+    ),
+    "defillama_public": ProviderRateLimit(
+        provider="defillama_public",
+        requests=DEFAULT_UNSPECIFIED_REQUESTS_PER_SECOND,
+        seconds=1,
+        basis="client-side safety policy; free endpoint has no stable numeric limit",
+        source_url="https://defillama.com/docs/api",
+        note="Compact TVL, stablecoin and yield snapshots; no Pro endpoint is used.",
+    ),
+    "hyperliquid_info": ProviderRateLimit(
+        provider="hyperliquid_info",
+        requests=60,
+        seconds=60,
+        basis="official 1200 weight/minute IP limit with conservative weight 20 per info request",
+        source_url=(
+            "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/"
+            "api/rate-limits-and-user-limits"
+        ),
+        note="Most info calls cost 20 weight; physical request rate remains below 10 req/s.",
+    ),
+    "deribit_public": ProviderRateLimit(
+        provider="deribit_public",
+        requests=DEFAULT_UNSPECIFIED_REQUESTS_PER_SECOND,
+        seconds=1,
+        basis="client-side safety policy below Deribit credit-based limits",
+        source_url="https://docs.deribit.com/",
+        note="Anonymous public book-summary snapshots only.",
+    ),
+    "coinmetrics_community": ProviderRateLimit(
+        provider="coinmetrics_community",
+        requests=10,
+        seconds=6,
+        basis="official Community API sliding-window IP limit",
+        source_url="https://docs.coinmetrics.io/api/v4/",
+        note="No API key; community data is licensed separately and is not assumed commercial-use free.",
+    ),
+    "coinbase_exchange_public": ProviderRateLimit(
+        provider="coinbase_exchange_public",
+        requests=10,
+        seconds=1,
+        basis="official Exchange REST public-endpoint IP limit",
+        source_url="https://docs.cdp.coinbase.com/exchange/rest-api/rate-limits",
+        note="Use the sustained 10 req/s rate and do not consume the documented burst allowance.",
+    ),
+    "kraken_public": ProviderRateLimit(
+        provider="kraken_public",
+        requests=DEFAULT_UNSPECIFIED_REQUESTS_PER_SECOND,
+        seconds=1,
+        basis="client-side safety policy; selected public catalog has no numeric cap documented",
+        source_url="https://docs.kraken.com/api/",
+        note="The selected compact catalog call needs one request per run.",
+    ),
+    "bitfinex_public": ProviderRateLimit(
+        provider="bitfinex_public",
+        requests=DEFAULT_UNSPECIFIED_REQUESTS_PER_SECOND,
+        seconds=1,
+        basis="client-side safety policy; endpoint-specific public limits vary",
+        source_url="https://docs.bitfinex.com/reference/rest-public-tickers",
+        note="One all-symbol ticker snapshot is captured per run.",
+    ),
+    "alternative_me_public": ProviderRateLimit(
+        provider="alternative_me_public",
+        requests=DEFAULT_UNSPECIFIED_REQUESTS_PER_SECOND,
+        seconds=1,
+        basis="client-side safety policy; no numeric public limit documented",
+        source_url="https://alternative.me/crypto/api/",
+        note="The complete Fear and Greed history is returned in one request.",
+    ),
+    "mempool_space_public": ProviderRateLimit(
+        provider="mempool_space_public",
+        requests=DEFAULT_UNSPECIFIED_REQUESTS_PER_SECOND,
+        seconds=1,
+        basis="client-side safety policy; public service documents 429 and ban enforcement",
+        source_url="https://mempool.space/docs/api/rest",
+        note="Compact Bitcoin network, fee and mining state only; never request the full mempool txid list.",
+    ),
+    "blockscout_ethereum_public": ProviderRateLimit(
+        provider="blockscout_ethereum_public",
+        requests=10,
+        seconds=60,
+        basis="runtime x-ratelimit-limit header on the public Ethereum instance",
+        source_url="https://docs.blockscout.com/api-reference/get-stats-counters",
+        note=(
+            "Anonymous per-instance API; selected stats and latest-block calls are "
+            "compact. Blockscout has announced future migration to its PRO API."
+        ),
+    ),
+    "binance_public_archive": ProviderRateLimit(
+        provider="binance_public_archive",
+        requests=DEFAULT_UNSPECIFIED_REQUESTS_PER_SECOND,
+        seconds=1,
+        basis="client-side ceiling; public S3 archive has no documented numeric request cap",
+        source_url="https://github.com/binance/binance-public-data",
+        note=(
+            "Checksum and ZIP downloads share one archive-host limiter; "
+            "retries honor HTTP throttling."
+        ),
+    ),
+    "binance_public_listing": ProviderRateLimit(
+        provider="binance_public_listing",
+        requests=DEFAULT_UNSPECIFIED_REQUESTS_PER_SECOND,
+        seconds=1,
+        basis="client-side ceiling; public S3 listing has no documented numeric request cap",
+        source_url="https://github.com/binance/binance-public-data",
+        note="Independent host-global bucket for the official S3 ListObjects endpoint.",
+    ),
+    "coingecko_demo": ProviderRateLimit(
+        provider="coingecko_demo",
+        requests=100,
+        seconds=60,
+        basis="official free Demo API key limit",
+        source_url="https://www.coingecko.com/en/api/pricing",
+        note=(
+            "Demo also has a 10,000 call monthly cap. Endpoint cache freshness and "
+            "remaining monthly credits, not the minute limit, determine polling cadence."
+        ),
+    ),
+    "coinmarketcap_basic": ProviderRateLimit(
+        provider="coinmarketcap_basic",
+        requests=50,
+        seconds=60,
+        basis="official free Basic plan minute limit; API key",
+        source_url="https://coinmarketcap.com/api/",
+        note=(
+            "Basic has 15,000 monthly call credits. Runtime /v1/key/info is "
+            "authoritative for plan limits and remaining credits."
+        ),
+    ),
+    "coinglass_keyed": ProviderRateLimit(
+        provider="coinglass_keyed",
+        requests=30,
+        seconds=60,
+        basis="lowest currently published API plan limit; API key",
+        source_url="https://www.coinglass.com/pricing",
+        note=(
+            "Do not send data requests until an entitlement probe succeeds. Runtime "
+            "API-KEY-MAX-LIMIT headers override this floor when present."
+        ),
+    ),
+    "etherscan_free": ProviderRateLimit(
+        provider="etherscan_free",
+        requests=3,
+        seconds=1,
+        basis="official Etherscan free-tier key limit",
+        source_url="https://docs.etherscan.io/resources/rate-limits",
+        note="Free tier also has a 100,000 calls/day cap and selected-chain restrictions.",
+    ),
+    "dune_free_low": ProviderRateLimit(
+        provider="dune_free_low",
+        requests=15,
+        seconds=60,
+        basis="official Dune Free low-limit endpoint bucket; API key",
+        source_url="https://docs.dune.com/api-reference/overview/rate-limits",
+        note="Query execution and other write-heavy endpoints use this bucket and consume credits.",
+    ),
+    "dune_free_high": ProviderRateLimit(
+        provider="dune_free_high",
+        requests=40,
+        seconds=60,
+        basis="official Dune Free high-limit endpoint bucket; API key",
+        source_url="https://docs.dune.com/api-reference/overview/rate-limits",
+        note="Read-heavy result and status endpoints use this independent bucket.",
+    ),
+    "sec_edgar": ProviderRateLimit(
+        provider="sec_edgar",
+        requests=10,
+        seconds=1,
+        basis="official SEC fair-access maximum request rate; user agent required",
+        source_url="https://www.sec.gov/filergroup/announcements-old/new-rate-control-limits",
+        note=(
+            "All SEC submissions, companyfacts and primary-document requests share "
+            "this process- and host-global limiter."
+        ),
+    ),
+    "ishares_public": ProviderRateLimit(
+        provider="ishares_public",
+        requests=DEFAULT_UNSPECIFIED_REQUESTS_PER_SECOND,
+        seconds=1,
+        basis="client-side safety policy; no upstream numeric limit documented",
+        source_url="https://www.ishares.com/us/library/2025-tax-kit",
+        note="Official tax-history workbooks and current holdings files.",
+    ),
+    "bitwise_public": ProviderRateLimit(
+        provider="bitwise_public",
+        requests=DEFAULT_UNSPECIFIED_REQUESTS_PER_SECOND,
+        seconds=1,
+        basis="client-side safety policy; no upstream numeric limit documented",
+        source_url="https://bitbetf.com/",
+        note="Official BITB page data; full page is versioned before normalization.",
     ),
 }
 

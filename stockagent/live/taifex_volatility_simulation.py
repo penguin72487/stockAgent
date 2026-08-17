@@ -49,7 +49,10 @@ from stockagent.data.taifex_sessions import (
     taifex_session_kind,
     taifex_trading_date,
 )
-from stockagent.live.taifex_strategy_state import held_option_codes
+from stockagent.live.taifex_strategy_state import (
+    held_option_codes,
+    required_option_codes,
+)
 from stockagent.research.taifex_transaction_tax import (
     option_cash_settlement_transaction_tax_twd,
     option_premium_transaction_tax_twd,
@@ -80,6 +83,7 @@ from stockagent.research.taifex_volatility_metadata import (
     MODEL_BLACK_SCHOLES,
     MODEL_VARIANT_PREFIX,
     PUT_CALL_PARITY_TX_STRATEGY_ID,
+    ROLLING_STRADDLE_IDS,
     STRATEGY_IDS,
     STRATEGY_MODE_DAILY,
     STRATEGY_MODE_INTRADAY_FUTURES,
@@ -92,7 +96,7 @@ from stockagent.research.taifex_volatility_metadata import (
 
 
 SCHEMA_VERSION: Final[int] = 1
-EXECUTION_CONTRACT_VERSION: Final[int] = 9
+EXECUTION_CONTRACT_VERSION: Final[int] = 10
 OPTION_MULTIPLIER: Final[float] = 50.0
 OPTION_FEE_PER_SIDE_TWD: Final[float] = 22.0
 DEFAULT_OPTION_RISK_MARGIN_A_TWD: Final[float] = TXO_RISK_MARGIN_TWD_2026_08_13["A"]
@@ -212,6 +216,12 @@ def _new_strategy_ledger(*, entry_state: str = "pending") -> dict[str, Any]:
         "entry_capital_requirement_twd": 0.0,
         "margin_call_count": 0,
         "forced_liquidation_pending": False,
+        "pending_option_roll": None,
+        "option_roll_count": 0,
+        "last_option_roll_decision_ts_ns": None,
+        "last_option_roll_signal_ts_ns": None,
+        "last_option_roll_forward_mid": None,
+        "last_option_roll_atm_strike": None,
         "trade_sides": 0,
         "initial_capital_twd": 0.0,
         "last_complete_open_liquidation_value_twd": None,
@@ -447,8 +457,7 @@ class PutCallParityCandidate:
             ),
             "net_after_estimated_cost_twd": self.net_after_estimated_cost_twd,
             "profitable_after_cost": (
-                self.net_after_estimated_cost_twd
-                > PUT_CALL_PARITY_MIN_NET_EDGE_TWD
+                self.net_after_estimated_cost_twd > PUT_CALL_PARITY_MIN_NET_EDGE_TWD
             ),
         }
 
@@ -512,12 +521,33 @@ class TaifexVolatilitySimulation:
         catalog_expansion_entry_policy: str = CATALOG_EXPANSION_ENTRY_NEXT_CYCLE,
         settlement_bootstrap_only: bool = False,
         startup_now: datetime | None = None,
+        active_strategy_ids: Iterable[str] | None = None,
     ) -> None:
         normalized_mode = str(strategy_mode).strip().lower()
         if normalized_mode not in STRATEGY_MODES:
             raise ValueError(f"unsupported strategy mode: {strategy_mode!r}")
         if int(intraday_decision_interval_seconds) < 1:
             raise ValueError("intraday decision interval must be positive")
+        requested_strategy_ids = tuple(
+            dict.fromkeys(
+                str(strategy_id)
+                for strategy_id in (
+                    STRATEGY_IDS
+                    if active_strategy_ids is None
+                    else active_strategy_ids
+                )
+            )
+        )
+        if not requested_strategy_ids:
+            raise ValueError("active strategy scope must not be empty")
+        unknown_requested_strategy_ids = set(requested_strategy_ids) - set(
+            STRATEGY_IDS
+        )
+        if unknown_requested_strategy_ids:
+            raise ValueError(
+                "active strategy scope contains unknown variants: "
+                + ",".join(sorted(unknown_requested_strategy_ids))
+            )
         if not DAY_OPEN < intraday_entry_cutoff < intraday_flatten_time:
             raise ValueError(
                 "intraday clock must satisfy day open < entry cutoff < flatten time"
@@ -548,9 +578,7 @@ class TaifexVolatilitySimulation:
             or margin_b > margin_a
             or margin_c > margin_b
         ):
-            raise ValueError(
-                "option risk margins must satisfy finite A >= B >= C > 0"
-            )
+            raise ValueError("option risk margins must satisfy finite A >= B >= C > 0")
         self.api = api
         self.sj = shioaji_module
         self.state_dir = Path(state_dir)
@@ -576,6 +604,7 @@ class TaifexVolatilitySimulation:
         self.strategy_capital_buffer_multiple = capital_buffer_multiple
         self.catalog_expansion_entry_policy = expansion_policy
         self.settlement_bootstrap_only = bool(settlement_bootstrap_only)
+        self.strategy_ids = requested_strategy_ids
         self.underlying = underlying
         self.hedge = hedge
         self.underlying_product = _continuous_future_product(underlying.logical_code)
@@ -623,13 +652,14 @@ class TaifexVolatilitySimulation:
                 )
                 self._write_status(force=True)
                 return
-            missing_held_codes = sorted(
-                set(held_option_codes(self.state)) - set(self.options_by_code)
+            missing_required_codes = sorted(
+                set(required_option_codes(self.state)) - set(self.options_by_code)
             )
-            if missing_held_codes:
+            if missing_required_codes:
                 raise RuntimeError(
-                    "persisted held option contracts are not subscribed on "
-                    "strategy worker 0: " + ",".join(missing_held_codes)
+                    "persisted held or pending-roll option contracts are not "
+                    "subscribed on strategy worker 0: "
+                    + ",".join(missing_required_codes)
                 )
             # A prior timeout/reconciliation failure is a persistent fail-closed
             # decision.  A process restart must not silently re-enable broker-side
@@ -661,7 +691,7 @@ class TaifexVolatilitySimulation:
         active_codes = {call_code, put_code}
         net_ledger_deltas: dict[str, dict[str, int]] = {
             strategy_id: {call_code: 0, put_code: 0}
-            for strategy_id in STRATEGY_IDS
+            for strategy_id in self.strategy_ids
         }
         if self.ledger_path.is_file():
             with self.ledger_path.open("r", encoding="utf-8") as handle:
@@ -754,6 +784,14 @@ class TaifexVolatilitySimulation:
                     "strategy state contains unknown variants: "
                     + ",".join(sorted(unknown_strategy_ids))
                 )
+            out_of_scope_strategy_ids = set(stored_strategy_ids) - set(
+                self.strategy_ids
+            )
+            if out_of_scope_strategy_ids:
+                raise RuntimeError(
+                    "strategy state exceeds the configured active scope: "
+                    + ",".join(sorted(out_of_scope_strategy_ids))
+                )
             execution_version = int(payload.get("execution_contract_version", 1))
             migration_reasons: list[str] = []
             repaired_v8_restart_strategy_ids: list[str] = []
@@ -810,6 +848,9 @@ class TaifexVolatilitySimulation:
             elif execution_version == 8:
                 payload["execution_contract_version"] = EXECUTION_CONTRACT_VERSION
                 migration_reasons.append("restart_safe_active_cycle_migration")
+            elif execution_version == 9:
+                payload["execution_contract_version"] = EXECUTION_CONTRACT_VERSION
+                migration_reasons.append("causal_rolling_straddle_migration")
             elif execution_version != EXECUTION_CONTRACT_VERSION:
                 raise RuntimeError("strategy execution contract mismatch")
 
@@ -852,7 +893,7 @@ class TaifexVolatilitySimulation:
                 )
             added_strategy_ids = [
                 strategy_id
-                for strategy_id in STRATEGY_IDS
+                for strategy_id in self.strategy_ids
                 if strategy_id not in stored_strategy_ids
             ]
             enter_added_now = bool(
@@ -869,8 +910,8 @@ class TaifexVolatilitySimulation:
                 strategies[strategy_id] = _new_strategy_ledger(
                     entry_state=added_entry_state
                 )
-            if added_strategy_ids or stored_strategy_ids != STRATEGY_IDS:
-                payload["strategy_ids"] = list(STRATEGY_IDS)
+            if added_strategy_ids or stored_strategy_ids != self.strategy_ids:
+                payload["strategy_ids"] = list(self.strategy_ids)
                 migration_reasons.append(
                     "strategy_catalog_expanded_immediate_live"
                     if enter_added_now
@@ -918,12 +959,9 @@ class TaifexVolatilitySimulation:
                 and stored_margin_b == TXO_RISK_MARGIN_TWD["B"]
                 and stored_margin_c
                 in {TXO_RISK_MARGIN_TWD["C"], TXO_RISK_MARGIN_TWD_2026_08_13["C"]}
-                and self.option_risk_margin_a_twd
-                == TXO_RISK_MARGIN_TWD_2026_08_13["A"]
-                and self.option_risk_margin_b_twd
-                == TXO_RISK_MARGIN_TWD_2026_08_13["B"]
-                and self.option_risk_margin_c_twd
-                == TXO_RISK_MARGIN_TWD_2026_08_13["C"]
+                and self.option_risk_margin_a_twd == TXO_RISK_MARGIN_TWD_2026_08_13["A"]
+                and self.option_risk_margin_b_twd == TXO_RISK_MARGIN_TWD_2026_08_13["B"]
+                and self.option_risk_margin_c_twd == TXO_RISK_MARGIN_TWD_2026_08_13["C"]
             )
             if official_margin_step:
                 payload["option_risk_margin_a_twd"] = self.option_risk_margin_a_twd
@@ -1053,7 +1091,7 @@ class TaifexVolatilitySimulation:
             "execution_contract_version": EXECUTION_CONTRACT_VERSION,
             "simulation_only": True,
             "production_order_possible": False,
-            "strategy_ids": list(STRATEGY_IDS),
+            "strategy_ids": list(self.strategy_ids),
             "strategy_mode": self.strategy_mode,
             "underlying_product": self.underlying_product,
             "underlying_multiplier_twd_per_point": self.underlying_multiplier,
@@ -1092,7 +1130,8 @@ class TaifexVolatilitySimulation:
             "blocked_reason": None,
             "put_call_parity_tx": _new_put_call_parity_state(),
             "strategies": {
-                strategy_id: _new_strategy_ledger() for strategy_id in STRATEGY_IDS
+                strategy_id: _new_strategy_ledger()
+                for strategy_id in self.strategy_ids
             },
         }
         self.state = payload
@@ -1122,9 +1161,7 @@ class TaifexVolatilitySimulation:
         option_capital = float(ledger.get("entry_capital_requirement_twd") or 0.0)
         if strategy_id == PUT_CALL_PARITY_TX_STRATEGY_ID:
             if option_capital > 0.0:
-                return float(
-                    option_capital * self.strategy_capital_buffer_multiple
-                )
+                return float(option_capital * self.strategy_capital_buffer_multiple)
             margin_date = taifex_trading_date(datetime.now(TAIPEI))
             conservative_package_capital = (
                 PUT_CALL_PARITY_OPTION_QUANTITY * self.option_risk_margin_a_twd
@@ -1133,8 +1170,7 @@ class TaifexVolatilitySimulation:
                 + self.underlying_fee_per_side_twd
             )
             return float(
-                conservative_package_capital
-                * self.strategy_capital_buffer_multiple
+                conservative_package_capital * self.strategy_capital_buffer_multiple
             )
         margin_contracts = 0
         if spec.hedge_policy == "fixed_future":
@@ -1192,7 +1228,7 @@ class TaifexVolatilitySimulation:
                 except (json.JSONDecodeError, KeyError, TypeError, ValueError):
                     continue
                 if (
-                    strategy_id in STRATEGY_IDS
+                    strategy_id in self.strategy_ids
                     and bool(row.get("option_books_valid"))
                     and bool(row.get("future_book_valid"))
                     and math.isfinite(open_value)
@@ -1211,7 +1247,7 @@ class TaifexVolatilitySimulation:
 
     def _ensure_strategy_reporting_state(self, payload: dict[str, Any]) -> None:
         recovered = self._latest_complete_mark_cache()
-        for strategy_id in STRATEGY_IDS:
+        for strategy_id in self.strategy_ids:
             ledger = payload["strategies"][strategy_id]
             defaults = _new_strategy_ledger()
             for key, value in defaults.items():
@@ -1244,9 +1280,7 @@ class TaifexVolatilitySimulation:
             ledger.setdefault("last_complete_mark_decision_ts_ns", None)
             ledger.setdefault("last_complete_mark_cycle_id", None)
             ledger.setdefault("last_complete_mark_futures_position", None)
-            ledger.setdefault(
-                "last_complete_mark_underlying_futures_position", None
-            )
+            ledger.setdefault("last_complete_mark_underlying_futures_position", None)
             ledger.setdefault("last_complete_mark_option_positions", None)
 
     def _persist_state(self) -> None:
@@ -1463,7 +1497,7 @@ class TaifexVolatilitySimulation:
         future_position_field: str = "futures_position",
         signal_decision_ns: int | None = None,
     ) -> None:
-        if strategy_id not in STRATEGY_IDS:
+        if strategy_id not in self.strategy_ids:
             raise ValueError(f"unknown strategy id: {strategy_id}")
         quantity = abs(int(delta_contracts))
         multiplier = OPTION_MULTIPLIER
@@ -1719,14 +1753,13 @@ class TaifexVolatilitySimulation:
         ) * OPTION_MULTIPLIER - (
             future_contracts * future_price * self.underlying_multiplier
         )
-        settlement_cash = (
-            future_contracts * strike * self.underlying_multiplier
-        )
+        settlement_cash = future_contracts * strike * self.underlying_multiplier
         gross_edge = entry_cash + settlement_cash
         entry_fees = (
-            (abs(call_contracts) + abs(put_contracts)) * OPTION_FEE_PER_SIDE_TWD
-            + abs(future_contracts) * self.underlying_fee_per_side_twd
-        )
+            abs(call_contracts) + abs(put_contracts)
+        ) * OPTION_FEE_PER_SIDE_TWD + abs(
+            future_contracts
+        ) * self.underlying_fee_per_side_twd
         entry_tax = (
             abs(call_contracts)
             * option_premium_transaction_tax_twd(
@@ -2376,13 +2409,362 @@ class TaifexVolatilitySimulation:
     def _maybe_enter_cycle_strategies(self, decision_ns: int) -> None:
         if self.state.get("active_cycle") is None:
             return
-        for strategy_id in STRATEGY_IDS:
+        for strategy_id in self.strategy_ids:
             if strategy_id == PUT_CALL_PARITY_TX_STRATEGY_ID:
                 continue
             self._enter_strategy_for_cycle(
                 strategy_id,
                 decision_ns=decision_ns,
             )
+
+    def _active_cycle_atm_pair(
+        self,
+        decision_ns: int,
+    ) -> tuple[float, int, float, OptionInstrument, OptionInstrument] | None:
+        """Resolve the current ATM pair from one causal underlying book."""
+
+        cycle = self.state.get("active_cycle")
+        if not isinstance(cycle, Mapping):
+            return None
+        underlying_row = self.latest_books.get(self.underlying.code)
+        underlying_book = _executable_book(
+            underlying_row,
+            decision_ns=decision_ns,
+            maximum_age_seconds=ENTRY_BOOK_MAX_AGE_SECONDS,
+            require_one_lot=True,
+        )
+        if underlying_book is None or underlying_row is None:
+            return None
+        expiry = date.fromisoformat(str(cycle["expiry_date"]))
+        series = str(cycle["series"])
+        grouped: dict[float, dict[str, OptionInstrument]] = {}
+        for instrument in self.options:
+            if instrument.expiry != expiry or instrument.series != series:
+                continue
+            grouped.setdefault(instrument.strike, {})[instrument.right] = instrument
+        pairs = [
+            (strike, rights["C"], rights["P"])
+            for strike, rights in grouped.items()
+            if {"C", "P"} <= set(rights)
+        ]
+        if not pairs:
+            return None
+        forward = sum(underlying_book) / 2.0
+        strike, call, put = min(
+            pairs,
+            key=lambda pair: (abs(pair[0] - forward), pair[0]),
+        )
+        return (
+            float(forward),
+            int(underlying_row["receive_ts_ns"]),
+            float(strike),
+            call,
+            put,
+        )
+
+    @staticmethod
+    def _option_leg_matches_roll_policy(
+        *,
+        policy: str,
+        option_right: str,
+        strike: float,
+        forward: float,
+    ) -> bool:
+        if policy == "itm_to_atm":
+            return (option_right == "C" and strike < forward) or (
+                option_right == "P" and strike > forward
+            )
+        if policy == "otm_to_atm":
+            return (option_right == "C" and strike > forward) or (
+                option_right == "P" and strike < forward
+            )
+        raise ValueError(f"unsupported option roll policy: {policy!r}")
+
+    def _rolling_strategy_legs(
+        self,
+        strategy_id: str,
+    ) -> dict[str, tuple[OptionInstrument, int]]:
+        """Return the strategy's one Call and one Put or fail closed."""
+
+        ledger = self.state["strategies"][strategy_id]
+        positions = {
+            str(code): int(quantity)
+            for code, quantity in (ledger.get("option_positions") or {}).items()
+            if int(quantity) != 0
+        }
+        expected = {
+            right: int(quantity)
+            for right, _offset, quantity in STRATEGY_SPEC_BY_ID[strategy_id].option_legs
+        }
+        by_right: dict[str, tuple[OptionInstrument, int]] = {}
+        for code, quantity in positions.items():
+            instrument = self.options_by_code.get(code)
+            if instrument is None:
+                raise RuntimeError(
+                    f"rolling strategy holds unsubscribed option: {strategy_id}/{code}"
+                )
+            if instrument.right in by_right:
+                raise RuntimeError(
+                    f"rolling strategy has duplicate option right: "
+                    f"{strategy_id}/{instrument.right}"
+                )
+            by_right[instrument.right] = (instrument, quantity)
+        if set(by_right) != {"C", "P"} or any(
+            by_right[right][1] != expected.get(right) for right in ("C", "P")
+        ):
+            raise RuntimeError(
+                f"rolling strategy position invariant failed: {strategy_id}/{positions}"
+            )
+        return by_right
+
+    def _execute_pending_option_roll(
+        self,
+        strategy_id: str,
+        *,
+        decision_ns: int,
+    ) -> bool:
+        ledger = self.state["strategies"][strategy_id]
+        pending = ledger.get("pending_option_roll")
+        if not isinstance(pending, Mapping):
+            return False
+        cycle = self.state.get("active_cycle")
+        if not isinstance(cycle, Mapping) or str(pending.get("cycle_id")) != str(
+            cycle.get("cycle_id")
+        ):
+            raise RuntimeError(
+                f"pending option roll cycle identity mismatch: {strategy_id}"
+            )
+        signal_ns = int(pending["signal_decision_ts_ns"])
+        if decision_ns <= signal_ns:
+            return False
+        current_legs = self._rolling_strategy_legs(strategy_id)
+        prepared: list[
+            tuple[
+                OptionInstrument,
+                OptionInstrument,
+                int,
+                float,
+                int,
+                float,
+                int,
+            ]
+        ] = []
+        for leg in pending.get("legs") or ():
+            right = str(leg["option_right"])
+            old_code = str(leg["old_code"])
+            new_code = str(leg["new_code"])
+            quantity = int(leg["quantity"])
+            current_instrument, current_quantity = current_legs.get(right, (None, 0))
+            if (
+                current_instrument is None
+                or current_instrument.code != old_code
+                or current_quantity != quantity
+            ):
+                raise RuntimeError(
+                    f"pending option roll position changed: {strategy_id}/{right}"
+                )
+            new_instrument = self.options_by_code.get(new_code)
+            if new_instrument is None or new_instrument.right != right:
+                raise RuntimeError(
+                    f"pending option roll target unavailable: {strategy_id}/{new_code}"
+                )
+            close_sweep = _depth_swept_price(
+                self.latest_books.get(old_code),
+                delta_contracts=-quantity,
+                decision_ns=decision_ns,
+                maximum_age_seconds=ENTRY_BOOK_MAX_AGE_SECONDS,
+            )
+            open_sweep = _depth_swept_price(
+                self.latest_books.get(new_code),
+                delta_contracts=quantity,
+                decision_ns=decision_ns,
+                maximum_age_seconds=ENTRY_BOOK_MAX_AGE_SECONDS,
+            )
+            if (
+                close_sweep is None
+                or open_sweep is None
+                or close_sweep[1] <= signal_ns
+                or open_sweep[1] <= signal_ns
+            ):
+                return False
+            prepared.append(
+                (
+                    current_instrument,
+                    new_instrument,
+                    quantity,
+                    close_sweep[0],
+                    close_sweep[1],
+                    open_sweep[0],
+                    open_sweep[1],
+                )
+            )
+        if not prepared:
+            raise RuntimeError(f"pending option roll has no legs: {strategy_id}")
+
+        policy = str(pending["policy"])
+        for (
+            old_instrument,
+            new_instrument,
+            quantity,
+            close_price,
+            close_receive_ns,
+            open_price,
+            open_receive_ns,
+        ) in prepared:
+            self._record_ideal_trade(
+                strategy_id=strategy_id,
+                instrument_type="option",
+                product="TXO",
+                code=old_instrument.code,
+                delta_contracts=-quantity,
+                price_points=close_price,
+                decision_ns=decision_ns,
+                receive_ns=close_receive_ns,
+                signal_decision_ns=signal_ns,
+                reason=f"rolling_straddle_{policy}_close_old_leg",
+                series=old_instrument.series,
+                strike=old_instrument.strike,
+                option_right=old_instrument.right,
+                price_source=(
+                    "causally_received_post_signal_five_level_ask_vwap"
+                    if quantity < 0
+                    else "causally_received_post_signal_five_level_bid_vwap"
+                ),
+            )
+            self._record_ideal_trade(
+                strategy_id=strategy_id,
+                instrument_type="option",
+                product="TXO",
+                code=new_instrument.code,
+                delta_contracts=quantity,
+                price_points=open_price,
+                decision_ns=decision_ns,
+                receive_ns=open_receive_ns,
+                signal_decision_ns=signal_ns,
+                reason=f"rolling_straddle_{policy}_open_new_atm_leg",
+                series=new_instrument.series,
+                strike=new_instrument.strike,
+                option_right=new_instrument.right,
+                price_source=(
+                    "causally_received_post_signal_five_level_ask_vwap"
+                    if quantity > 0
+                    else "causally_received_post_signal_five_level_bid_vwap"
+                ),
+            )
+        ledger["pending_option_roll"] = None
+        ledger["option_roll_count"] = int(ledger.get("option_roll_count") or 0) + len(
+            prepared
+        )
+        ledger["last_option_roll_decision_ts_ns"] = int(decision_ns)
+        ledger["last_option_roll_signal_ts_ns"] = signal_ns
+        ledger["last_option_roll_forward_mid"] = float(pending["forward_mid"])
+        ledger["last_option_roll_atm_strike"] = float(pending["atm_strike"])
+        _append_jsonl(
+            self.events_path,
+            {
+                "event": "rolling_straddle_legs_replaced",
+                "at_utc": _now_iso(),
+                "strategy_id": strategy_id,
+                "cycle_id": cycle["cycle_id"],
+                "policy": policy,
+                "signal_decision_ts_ns": signal_ns,
+                "execution_decision_ts_ns": int(decision_ns),
+                "forward_mid": float(pending["forward_mid"]),
+                "atm_strike": float(pending["atm_strike"]),
+                "leg_count": len(prepared),
+                "strictly_later_complete_books": True,
+                "atomic_prevalidation": True,
+            },
+        )
+        self._persist_state()
+        return True
+
+    def _maybe_roll_straddles(self, decision_ns: int) -> None:
+        cycle = self.state.get("active_cycle")
+        if not isinstance(cycle, Mapping):
+            return
+
+        signalled = False
+        for strategy_id in ROLLING_STRADDLE_IDS:
+            ledger = self.state["strategies"][strategy_id]
+            if ledger.get("entry_state") != "entered" or not bool(
+                ledger.get("alive", True)
+            ):
+                continue
+            if isinstance(ledger.get("pending_option_roll"), Mapping):
+                self._execute_pending_option_roll(
+                    strategy_id,
+                    decision_ns=decision_ns,
+                )
+
+        atm_pair = self._active_cycle_atm_pair(decision_ns)
+        if atm_pair is None:
+            return
+        forward, underlying_receive_ns, atm_strike, call, put = atm_pair
+        atm_by_right = {"C": call, "P": put}
+        for strategy_id in ROLLING_STRADDLE_IDS:
+            ledger = self.state["strategies"][strategy_id]
+            if (
+                ledger.get("entry_state") != "entered"
+                or not bool(ledger.get("alive", True))
+                or isinstance(ledger.get("pending_option_roll"), Mapping)
+            ):
+                continue
+            policy = STRATEGY_SPEC_BY_ID[strategy_id].option_roll_policy
+            legs = self._rolling_strategy_legs(strategy_id)
+            replacements: list[dict[str, Any]] = []
+            for right in ("C", "P"):
+                old_instrument, quantity = legs[right]
+                new_instrument = atm_by_right[right]
+                if old_instrument.code == new_instrument.code:
+                    continue
+                if not self._option_leg_matches_roll_policy(
+                    policy=policy,
+                    option_right=right,
+                    strike=old_instrument.strike,
+                    forward=forward,
+                ):
+                    continue
+                replacements.append(
+                    {
+                        "option_right": right,
+                        "quantity": quantity,
+                        "old_code": old_instrument.code,
+                        "old_strike": old_instrument.strike,
+                        "new_code": new_instrument.code,
+                        "new_strike": new_instrument.strike,
+                    }
+                )
+            if not replacements:
+                continue
+            ledger["pending_option_roll"] = {
+                "state": "waiting_for_strictly_later_complete_books",
+                "cycle_id": str(cycle["cycle_id"]),
+                "policy": policy,
+                "signal_decision_ts_ns": int(decision_ns),
+                "underlying_book_receive_ts_ns": int(underlying_receive_ns),
+                "forward_mid": float(forward),
+                "atm_strike": float(atm_strike),
+                "legs": replacements,
+            }
+            _append_jsonl(
+                self.events_path,
+                {
+                    "event": "rolling_straddle_signal_created",
+                    "at_utc": _now_iso(),
+                    "strategy_id": strategy_id,
+                    "cycle_id": cycle["cycle_id"],
+                    "policy": policy,
+                    "signal_decision_ts_ns": int(decision_ns),
+                    "underlying_book_receive_ts_ns": int(underlying_receive_ns),
+                    "forward_mid": float(forward),
+                    "atm_strike": float(atm_strike),
+                    "legs": replacements,
+                },
+            )
+            signalled = True
+        if signalled:
+            self._persist_state()
 
     def _fixed_future_target(self, strategy_id: str) -> int | None:
         spec = STRATEGY_SPEC_BY_ID[strategy_id]
@@ -2411,6 +2793,8 @@ class TaifexVolatilitySimulation:
         elif not (DAY_OPEN <= now.time() < datetime_time(9, 5)):
             return
         for strategy_id in DYNAMIC_HEDGE_STRATEGY_IDS:
+            if strategy_id not in self.strategy_ids:
+                continue
             target = self._fixed_future_target(strategy_id)
             if target is None:
                 continue
@@ -2511,17 +2895,18 @@ class TaifexVolatilitySimulation:
                     if strategy_id == PUT_CALL_PARITY_TX_STRATEGY_ID
                     else "pending"
                 )
-                for strategy_id in STRATEGY_IDS
+                for strategy_id in self.strategy_ids
             },
             "broker_reference_opened": False,
         }
-        for strategy_id in STRATEGY_IDS:
+        for strategy_id in self.strategy_ids:
             if strategy_id == PUT_CALL_PARITY_TX_STRATEGY_ID:
                 continue
             ledger = self.state["strategies"][strategy_id]
             ledger["entry_state"] = "pending"
             ledger["option_positions"] = {}
             ledger["option_position_metadata"] = {}
+            ledger["pending_option_roll"] = None
         self.state["pending_targets"] = {}
         self.state["engine_status"] = (
             "intraday_cycle_open"
@@ -2671,9 +3056,7 @@ class TaifexVolatilitySimulation:
         ):
             ledger["forced_liquidation_pending"] = True
             return False
-        underlying_future_position = int(
-            ledger.get("underlying_futures_position") or 0
-        )
+        underlying_future_position = int(ledger.get("underlying_futures_position") or 0)
         if (
             underlying_future_position
             and _depth_swept_price(
@@ -2719,6 +3102,7 @@ class TaifexVolatilitySimulation:
             ledger["forced_liquidation_pending"] = True
             return False
         ledger["forced_liquidation_pending"] = False
+        ledger["pending_option_roll"] = None
         ledger["entry_state"] = "forced_flat"
         if strategy_id == PUT_CALL_PARITY_TX_STRATEGY_ID:
             parity_state = self.state["put_call_parity_tx"]
@@ -2752,7 +3136,7 @@ class TaifexVolatilitySimulation:
         return True
 
     def _maybe_enforce_strategy_margin(self, decision_ns: int) -> None:
-        for strategy_id in STRATEGY_IDS:
+        for strategy_id in self.strategy_ids:
             ledger = self.state["strategies"][strategy_id]
             if not bool(ledger.get("alive", True)):
                 continue
@@ -2892,6 +3276,8 @@ class TaifexVolatilitySimulation:
         all_targets_executed = True
         fitted_models: dict[str, Any] = {}
         for strategy_id in DYNAMIC_HEDGE_STRATEGY_IDS:
+            if strategy_id not in self.strategy_ids:
+                continue
             spec = STRATEGY_SPEC_BY_ID[strategy_id]
             if spec.hedge_policy in {"fixed_future", "fixed_index_equivalent"}:
                 continue
@@ -3003,7 +3389,7 @@ class TaifexVolatilitySimulation:
             return
         session = str(session_state["session"])
         all_flat = True
-        for strategy_id in STRATEGY_IDS:
+        for strategy_id in self.strategy_ids:
             if not self._execute_future_target(
                 strategy_id=strategy_id,
                 target=0,
@@ -3035,7 +3421,7 @@ class TaifexVolatilitySimulation:
         if not (datetime_time(13, 24) <= now.time() < datetime_time(13, 30)):
             return
         all_flat = True
-        for strategy_id in STRATEGY_IDS:
+        for strategy_id in self.strategy_ids:
             if not self._execute_future_target(
                 strategy_id=strategy_id,
                 target=0,
@@ -3084,8 +3470,7 @@ class TaifexVolatilitySimulation:
         except Exception as exc:
             self.state["engine_status"] = "blocked_subscription_bootstrap_settlement"
             self.state["blocked_reason"] = (
-                "subscription_bootstrap_settlement_failed:"
-                f"{type(exc).__name__}:{exc}"
+                f"subscription_bootstrap_settlement_failed:{type(exc).__name__}:{exc}"
             )
             self._persist_state()
             raise
@@ -3136,7 +3521,7 @@ class TaifexVolatilitySimulation:
             return
         if any(
             int(self.state["strategies"][strategy_id]["futures_position"]) != 0
-            for strategy_id in STRATEGY_IDS
+            for strategy_id in self.strategy_ids
         ):
             raise RuntimeError(
                 "cannot cash-settle cycle while a shadow futures hedge remains open"
@@ -3147,7 +3532,7 @@ class TaifexVolatilitySimulation:
             self.state["blocked_reason"] = f"missing_official_final_settlement:{expiry}"
             return
         settlement_price, source_file, source_sha = settlement
-        for strategy_id in STRATEGY_IDS:
+        for strategy_id in self.strategy_ids:
             if strategy_id == PUT_CALL_PARITY_TX_STRATEGY_ID:
                 continue
             ledger = self.state["strategies"][strategy_id]
@@ -3213,6 +3598,7 @@ class TaifexVolatilitySimulation:
             if strategy_id == PUT_CALL_PARITY_TX_STRATEGY_ID:
                 continue
             ledger["entry_state"] = "pending"
+            ledger["pending_option_roll"] = None
         self.state["last_settled_expiry"] = expiry.isoformat()
         self.state["blocked_reason"] = None
         self.state["engine_status"] = "flat_ready_for_next_cycle"
@@ -3338,9 +3724,7 @@ class TaifexVolatilitySimulation:
                 "official_final_settlement": settlement_price,
                 "source_file": source_file,
                 "source_sha256": source_sha,
-                "realized_cumulative_pnl_twd": settled_mark.get(
-                    "cumulative_pnl_twd"
-                ),
+                "realized_cumulative_pnl_twd": settled_mark.get("cumulative_pnl_twd"),
             },
         )
         self._persist_state()
@@ -3427,9 +3811,7 @@ class TaifexVolatilitySimulation:
             fresh_open_value += (
                 future_position * future_sweep[0] * self.hedge_multiplier
             )
-        underlying_future_position = int(
-            ledger.get("underlying_futures_position") or 0
-        )
+        underlying_future_position = int(ledger.get("underlying_futures_position") or 0)
         underlying_future_sweep = (
             _depth_swept_price(
                 self.latest_books.get(self.underlying.code),
@@ -3462,9 +3844,7 @@ class TaifexVolatilitySimulation:
         )
 
         live_complete = (
-            option_books_valid
-            and future_mark_valid
-            and underlying_future_mark_valid
+            option_books_valid and future_mark_valid and underlying_future_mark_valid
         )
         valuation_source = "unavailable"
         valuation_carried_forward = False
@@ -3543,23 +3923,32 @@ class TaifexVolatilitySimulation:
             "margin_required_twd": float(margin_required),
             "margin_excess_twd": margin_excess,
             "margin_trading_date": margin_trading_date.isoformat(),
-            "futures_initial_margin_per_contract_twd": (
-                futures_margin_per_contract
-            ),
+            "futures_initial_margin_per_contract_twd": (futures_margin_per_contract),
             "alive": bool(ledger.get("alive", True)),
             "margin_call_count": int(ledger.get("margin_call_count") or 0),
             "forced_liquidation_pending": bool(
                 ledger.get("forced_liquidation_pending")
             ),
+            "option_roll_policy": STRATEGY_SPEC_BY_ID[strategy_id].option_roll_policy,
+            "option_roll_pending": isinstance(
+                ledger.get("pending_option_roll"), Mapping
+            ),
+            "option_roll_count": int(ledger.get("option_roll_count") or 0),
+            "last_option_roll_decision_ts_ns": ledger.get(
+                "last_option_roll_decision_ts_ns"
+            ),
+            "last_option_roll_signal_ts_ns": ledger.get(
+                "last_option_roll_signal_ts_ns"
+            ),
+            "last_option_roll_forward_mid": ledger.get("last_option_roll_forward_mid"),
+            "last_option_roll_atm_strike": ledger.get("last_option_roll_atm_strike"),
             "futures_position": future_position,
             "underlying_futures_position": underlying_future_position,
             "option_positions": option_positions,
             "entry_state": ledger.get("entry_state"),
             "active_cycle_id": cycle_id,
             "option_books_valid": option_books_valid,
-            "future_book_valid": (
-                future_mark_valid and underlying_future_mark_valid
-            ),
+            "future_book_valid": (future_mark_valid and underlying_future_mark_valid),
             "hedge_future_book_valid": future_mark_valid,
             "underlying_future_book_valid": underlying_future_mark_valid,
             "valuation_available": open_value is not None,
@@ -3576,7 +3965,7 @@ class TaifexVolatilitySimulation:
         }
 
     def _write_marks(self, decision_ns: int) -> None:
-        for strategy_id in STRATEGY_IDS:
+        for strategy_id in self.strategy_ids:
             _append_jsonl(
                 self.marks_path, self._strategy_mark(strategy_id, decision_ns)
             )
@@ -3610,12 +3999,11 @@ class TaifexVolatilitySimulation:
         }
         strategy_marks = {
             strategy_id: self._strategy_mark(strategy_id, timestamp_ns)
-            for strategy_id in STRATEGY_IDS
+            for strategy_id in self.strategy_ids
         }
         strategy_count = len(strategy_marks)
         valuation_available_count = sum(
-            bool(mark.get("valuation_available"))
-            for mark in strategy_marks.values()
+            bool(mark.get("valuation_available")) for mark in strategy_marks.values()
         )
         fresh_valuation_count = sum(
             mark.get("valuation_source") == "fresh_executable_bidask"
@@ -3766,6 +4154,7 @@ class TaifexVolatilitySimulation:
                 and DAY_OPEN <= observed_now.time() < datetime_time(9, 5)
             ):
                 self._maybe_enter_cycle_strategies(decision_ns)
+            self._maybe_roll_straddles(decision_ns)
             self._maybe_execute_pending_targets(observed_now, decision_ns)
             self._maybe_apply_fixed_future_targets(observed_now, decision_ns)
             self._maybe_run_put_call_parity(observed_now, decision_ns)

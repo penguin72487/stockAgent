@@ -1,0 +1,108 @@
+# All historical and currently listed TAIFEX stock, ETF, domestic-index, and
+# foreign-index futures available in the official archive. Physical contracts
+# use stable delivery-month/week slots such as PRODUCT_M09_L1. A far-month
+# contract never changes symbol before expiry.
+base_config: tw_public_lanten_market_candles.yaml
+
+experiment_name: tw-taifex-all-equity-index-futures-expiry-month-daily-v2
+
+runner:
+  output_dir: artifacts/markets/tw_futures_portfolio_day_v2
+  mode: train
+  resume: true
+  post_train_infer: true
+  start_fold: 1
+  isolate_train_folds: true
+
+data:
+  parquet_root: data_tw_futures/taifex_portfolio_daily/symbols
+  # build_panel first uses the union calendar; attach_futures_portfolio_daily
+  # then installs the no-roll-gap TX front-month benchmark from the audited
+  # physical-contract table.
+  benchmark_name: universe_average_return
+  panel_start_date: "2005-01-01"
+  security_filter: none
+  usd_only_trading_pairs: false
+  tradable_mode: tradable
+  trading_volume_policy: required
+  panel_backend: auto
+  use_tw_public_features: true
+  # Cash-market eligibility, price limits, corporate actions, and borrow rules
+  # do not gate a TAIFEX contract. Their public numeric fields remain features,
+  # while execution uses only the futures contract data/expiry contract.
+  use_tw_public_rules: false
+  tw_public_feature_path: data_tw_futures/taifex_portfolio_daily/model_features.parquet
+  tw_public_market_symbol: __MARKET__
+  feature_include: ["*"]
+  feature_exclude:
+    # Permanent snapshot-only exclusions from AGENTS.md. They remain in the
+    # original public archive for audit and are never model inputs.
+    - twpub_tdcc_*
+    - twpub_company_*
+    - twpub_monthly_revenue_*
+    - twpub_cumulative_revenue_yoy
+    - twpub_financial_*
+    - twpub_insider_*
+    - twpub_borrow_*
+    - twpub_sbl_*
+    - twpub_short_sale_available_*
+  feature_zero_fill: ["*"]
+  day_trade_open_feature: false
+  feature_shift_next_session: []
+  allow_same_close_feature_approximation: false
+
+walk_forward:
+  min_train_years: 1
+  val_years: 1
+  require_future_test_year: true
+  expected_first_year: 2005
+  require_contiguous_years: true
+  lookback_context: panel_history
+  split_start_year: 2007
+
+trading:
+  execution_mode: tw_futures_portfolio_day
+  frequency: daily
+  long_only: false
+  max_turnover_ratio: 0.0
+  max_volume_participation: 0.0
+  min_trade_weight: 0.0
+  portfolio_activation: identity
+
+  # Differentiable continuous-notional research proxy.  It combines an
+  # explicit per-side fee allowance and statutory-tax allowance, but is not
+  # presented as an exact contract-count ledger because a complete historical
+  # multiplier/margin/broker-fee master for all 745 products is not available.
+  buy_fee_rate: 0.000065
+  sell_fee_rate: 0.000065
+  tw_futures_portfolio_data_path: data_tw_futures/taifex_portfolio_daily/continuous_daily.parquet
+
+training:
+  model_name: transformer_base_portfolio
+  loss_type: log_utility
+  loss_portfolio_activation: identity
+  lookback: 32
+  # The generated universe currently has 6,793 delivery-month/week slots.
+  # Start conservatively; re-benchmark before raising these values.
+  batch_size_train: 8
+  batch_size_eval: 4
+  explain_after_each_fold: false
+  postprocess_benchmark_after_fold: false
+  postprocess_benchmark_after_best_val: false
+
+  transformer_base_portfolio:
+    attention_mode: market_token
+    use_latent_factors: false
+    use_market_tokens: true
+    temporal_pooling: attention
+    temporal_query_mode: full_then_last
+    portfolio_mode: long_short
+    portfolio_output_mode: logits
+    return_aux: false
+    return_aux_details: false
+
+  multitask_loss:
+    return_rank_ic_weight: 0.0
+    direction_weight: 0.0
+    volatility_regime_weight: 0.0
+    concentration_weight: 0.0

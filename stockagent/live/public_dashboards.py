@@ -114,6 +114,7 @@ def sanitize_taifex_history(payload: Mapping[str, Any]) -> dict[str, Any]:
         "coverage_start_utc",
         "coverage_end_utc",
         "downsampled",
+        "backfills",
     }
     output = {
         key: _scrub_public_value(deepcopy(value))
@@ -131,6 +132,10 @@ def sanitize_taifex_history(payload: Mapping[str, Any]) -> dict[str, Any]:
             "strategy_id",
             "total_equity_twd",
             "valuation_carried_forward",
+            "history_source",
+            "replay_id",
+            "replay_contract_version",
+            "history_event",
         },
     )
     history = output.get("history")
@@ -247,7 +252,7 @@ def sanitize_tw_status(payload: Mapping[str, Any]) -> dict[str, Any]:
             "recorded live target weights after the observed opening quote"
         )
         source_contract["events"] = (
-            "complete selected-day order and fill ledgers are available through "
+            "complete selected-range order and fill ledgers are available through "
             "the bounded read-only event pages"
         )
     return output
@@ -263,6 +268,10 @@ def sanitize_tw_history(payload: Mapping[str, Any]) -> dict[str, Any]:
         "production_order_possible",
         "range",
         "range_seconds",
+        "start_date",
+        "end_date",
+        "available_start_date",
+        "available_end_date",
         "anchor_at_utc",
         "coverage_start_utc",
         "coverage_end_utc",
@@ -302,6 +311,9 @@ def sanitize_tw_signals(payload: Mapping[str, Any]) -> dict[str, Any]:
         "simulation_only",
         "production_order_possible",
         "session_date",
+        "start_date",
+        "end_date",
+        "session_dates",
         "available_session_dates",
         "offset",
         "limit",
@@ -338,6 +350,7 @@ def sanitize_tw_signals(payload: Mapping[str, Any]) -> dict[str, Any]:
             "requested_shares",
             "score",
             "sell_first_allowed",
+            "session_date",
             "side",
             "signal_at",
             "simulation_replay",
@@ -346,6 +359,79 @@ def sanitize_tw_signals(payload: Mapping[str, Any]) -> dict[str, Any]:
             "symbol",
             "target_weight",
             "top_book_capacity_shares",
+        },
+    )
+    return output
+
+
+def sanitize_tw_positions(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Return a bounded public position page without internal ledger IDs."""
+
+    _require_simulation_only(payload)
+    allowed = {
+        "schema_version",
+        "simulation_only",
+        "production_order_possible",
+        "session_date",
+        "start_date",
+        "end_date",
+        "session_dates",
+        "available_session_dates",
+        "offset",
+        "limit",
+        "returned",
+        "total",
+        "has_more",
+        "record_count",
+        "rows",
+    }
+    output = _scrub_public_value(
+        {key: deepcopy(value) for key, value in payload.items() if key in allowed}
+    )
+    if not isinstance(output, dict):  # pragma: no cover - defensive typing guard
+        raise TypeError("sanitized position page is not an object")
+    _project_rows(
+        output,
+        "rows",
+        allowed_fields={
+            "closing_auction_limit_price",
+            "closing_auction_order_status",
+            "counterfactual_open_replay",
+            "entry_at",
+            "entry_fee_twd",
+            "entry_price",
+            "eod_limit_order_status",
+            "eod_limit_price",
+            "eod_limit_submitted_at",
+            "exit_at",
+            "exit_price",
+            "exit_reason",
+            "filled_shares",
+            "last_complete_net_pnl_twd",
+            "last_exit_at",
+            "last_exit_price",
+            "last_mark_price",
+            "last_quote_at",
+            "market",
+            "name",
+            "net_pnl_twd",
+            "realized_net_pnl_twd",
+            "reconciled_total_net_pnl_twd",
+            "requested_shares",
+            "session_date",
+            "side",
+            "signed_shares",
+            "simulation_replay",
+            "source_signal_at",
+            "status",
+            "stop_order_status",
+            "stop_trigger_price",
+            "symbol",
+            "take_profit_price",
+            "target_weight",
+            "total_net_pnl_twd",
+            "unrealized_net_pnl_twd",
+            "valuation_stale",
         },
     )
     return output
@@ -360,6 +446,9 @@ def sanitize_tw_events(payload: Mapping[str, Any]) -> dict[str, Any]:
         "simulation_only",
         "production_order_possible",
         "session_date",
+        "start_date",
+        "end_date",
+        "session_dates",
         "available_session_dates",
         "offset",
         "limit",
@@ -389,6 +478,7 @@ def sanitize_tw_events(payload: Mapping[str, Any]) -> dict[str, Any]:
             "purpose",
             "quantity",
             "recorded_at",
+            "session_date",
             "side",
             "simulation_only",
             "status",
@@ -459,6 +549,7 @@ __all__ = [
     "sanitize_taifex_status",
     "sanitize_tw_events",
     "sanitize_tw_history",
+    "sanitize_tw_positions",
     "sanitize_tw_signals",
     "sanitize_tw_status",
 ]

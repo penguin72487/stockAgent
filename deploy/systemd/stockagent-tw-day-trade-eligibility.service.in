@@ -1,0 +1,20 @@
+[Unit]
+Description=Fetch exact-session TWSE and TPEx day-trade eligibility on publication
+Wants=network-online.target time-sync.target
+After=network-online.target time-sync.target
+
+[Service]
+Type=oneshot
+User=@SERVICE_USER@
+Group=@SERVICE_GROUP@
+WorkingDirectory=@REPO_ROOT@
+Environment="HOME=@SERVICE_HOME@"
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=/usr/bin/bash "@REPO_ROOT@/scripts/run_tw_day_trade_eligibility_watcher.sh"
+Nice=5
+CPUWeight=50
+IOWeight=50
+TimeoutStartSec=2h
+
+[Install]
+WantedBy=multi-user.target

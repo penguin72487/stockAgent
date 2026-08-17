@@ -135,6 +135,9 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
             "tw_index_futures_day",
             "tw_index_derivatives_day",
         }
+        futures_portfolio_execution = (
+            self.execution_mode == "tw_futures_portfolio_day"
+        )
         derivatives_day_execution = self.execution_mode == "tw_index_derivatives_day"
         self.lookback_context = normalize_lookback_context(lookback_context)
         self.short_capacity_limit_enabled = bool(short_capacity_limit_enabled)
@@ -399,6 +402,14 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
                 prior_alive
                 & np.asarray(reference_valid, dtype=bool)[:, None]
             )
+        elif futures_portfolio_execution:
+            # The open[t] order is selected from rows completed through t-1.
+            # Current open availability and the eventual next-open/own-close
+            # holding label remain executor-only.
+            prior_alive = np.zeros_like(panel.alive_mask, dtype=bool)
+            prior_alive[1:] = np.asarray(panel.alive_mask[:-1], dtype=bool)
+            tradable = prior_alive
+            close_tradable = np.asarray(panel.tradable_mask, dtype=bool) & finite_target
         elif day_trade_eligible is not None:
             close_tradable = close_tradable & day_trade_eligible
             # The model target is committed before the opening auction.  Even
@@ -489,7 +500,20 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
                     | force_exit[valid_indices].any(axis=1)
                 )
                 valid_indices = valid_indices[executable_or_terminal]
+            elif valid_indices.size > 0 and futures_portfolio_execution:
+                executable_or_terminal = (
+                    close_tradable[valid_indices].any(axis=1)
+                    | force_exit[valid_indices].any(axis=1)
+                )
+                valid_indices = valid_indices[executable_or_terminal]
         self.valid_indices = valid_indices
+
+        if futures_portfolio_execution and self.valid_indices.size > 0:
+            # Contract-expiry/rank-change rows are source facts.  A fold end is
+            # an additional research-horizon liquidation so evaluation never
+            # omits the cost of closing an otherwise carryable final position.
+            force_exit = np.asarray(force_exit, dtype=bool).copy()
+            force_exit[int(self.valid_indices[-1]), :] = True
 
         if futures_execution:
             if self.valid_indices.size > 0:

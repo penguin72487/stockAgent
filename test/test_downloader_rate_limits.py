@@ -5,9 +5,12 @@ from datetime import datetime, timezone
 import pytest
 
 import downloader.common as downloader_common
+from downloader.download_okx_perp_daily import OkxClient
 from downloader.common import (
     DEFAULT_UNSPECIFIED_REQUESTS_PER_SECOND,
+    PersistentProgress,
     SharedRateLimiter,
+    atomic_write_text,
     parse_retry_after_seconds,
     provider_rate_limit,
     resolve_incremental_reconcile_start_ms,
@@ -21,13 +24,21 @@ def test_documented_provider_defaults_use_exact_average_limit() -> None:
     bybit = provider_rate_limit("bybit_public_rest")
     alpaca = provider_rate_limit("alpaca_market_data_basic")
     binance = provider_rate_limit("binance_usdm_request_weight")
+    binance_funding = provider_rate_limit("binance_usdm_funding_history")
+    binance_statistics = provider_rate_limit("binance_usdm_statistics_history")
     shioaji = provider_rate_limit("shioaji_quote_query")
+    hyperliquid = provider_rate_limit("hyperliquid_info")
+    coinmetrics = provider_rate_limit("coinmetrics_community")
 
     assert round(okx.requests_per_second, 2) == 10.00
     assert round(bybit.requests_per_second, 2) == 120.00
     assert alpaca.requests_per_second == 200 / 60
     assert binance.requests_per_second == 2400 / 60
+    assert binance_funding.requests_per_second == 500 / 300
+    assert binance_statistics.requests_per_second == 1000 / 300
     assert shioaji.requests_per_second == 10
+    assert hyperliquid.requests_per_second == 1
+    assert coinmetrics.requests_per_second == 10 / 6
     assert resolve_request_interval("okx_history_candles", None) == okx.interval_seconds
     assert resolve_request_interval("bybit_public_rest", None) == bybit.interval_seconds
     assert (
@@ -56,6 +67,63 @@ def test_unpublished_and_unknown_providers_default_to_ten_rps() -> None:
         profile = provider_rate_limit(provider)
         assert profile.requests_per_second == DEFAULT_UNSPECIFIED_REQUESTS_PER_SECOND
         assert resolve_request_interval(provider, None) == 0.1
+
+
+def test_compact_public_profiles_use_official_or_unspecified_fallback_ceiling() -> None:
+    for name in (
+        "coinbase_exchange_public",
+        "kraken_public",
+        "bitfinex_public",
+        "alternative_me_public",
+        "mempool_space_public",
+    ):
+        assert provider_rate_limit(name).requests_per_second <= 10.0
+
+
+def test_okx_client_keeps_independent_official_endpoint_buckets() -> None:
+    client = OkxClient(request_interval=0.0, max_retries=0, retry_base=0.1)
+    candles = client._limiter_for_request("/api/v5/market/history-candles")
+    mark = client._limiter_for_request("/api/v5/market/history-mark-price-candles")
+    assert candles.name == "okx_history_candles"
+    assert mark.name == "okx_history_mark_price_candles"
+    assert candles is not mark
+
+
+def test_persistent_progress_publishes_measured_eta_atomically(tmp_path) -> None:
+    path = tmp_path / "progress.json"
+    progress = PersistentProgress(
+        path,
+        label="fixture",
+        total=2,
+        unit="symbol",
+        basis="measured completions",
+        started_at=datetime.now(timezone.utc),
+    )
+    progress.update("candles", "updated")
+    running = downloader_common.json.loads(path.read_text())
+    progress.heartbeat("provider-query-running")
+    heartbeat = downloader_common.json.loads(path.read_text())
+    progress.update("candles", "updated")
+    progress.finish()
+    complete = downloader_common.json.loads(path.read_text())
+
+    assert running["state"] == "running"
+    assert running["current"] == 1
+    assert running["total"] == 2
+    assert running["remaining_seconds"] is not None
+    assert heartbeat["phase"] == "provider-query-running"
+    assert heartbeat["current"] == 1
+    assert complete["state"] == "complete"
+    assert complete["ratio"] == 1.0
+
+
+def test_atomic_write_text_replaces_complete_artifact(tmp_path) -> None:
+    path = tmp_path / "summary.json"
+    atomic_write_text(path, "old")
+    atomic_write_text(path, "new\n")
+
+    assert path.read_text() == "new\n"
+    assert not list(tmp_path.glob(".*.tmp"))
 
 
 def test_named_limiters_share_host_global_schedule_and_cooldown(tmp_path) -> None:

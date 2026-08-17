@@ -35,18 +35,8 @@ printf '%s\n' "$BACKFILL_END_DATE" > "$TARGET_FILE"
 
 seconds_until_after_close() {
   run_fintech_python - <<'PY'
-from datetime import datetime, time, timedelta
-from zoneinfo import ZoneInfo
-
-tz = ZoneInfo("Asia/Taipei")
-now = datetime.now(tz)
-if now.weekday() >= 5:
-    print(0)
-elif time(8, 30) <= now.time() <= time(14, 30):
-    target = datetime.combine(now.date(), time(14, 31), tzinfo=tz)
-    print(max(60, int((target - now).total_seconds())))
-else:
-    print(0)
+from stockagent.live.shioaji_schedule import historical_query_pause_seconds
+print(historical_query_pause_seconds())
 PY
 }
 
@@ -79,8 +69,8 @@ def audit_ok(path: Path) -> bool:
     )
 
 
-# Historical KBar backfill remains outside the conservative 08:30-14:30
-# market-hours window even if the Top-200 capture finishes a little earlier.
+# Historical KBar backfill remains outside the conservative 07:45-14:31
+# live-priority window even if the Top-200 capture finishes a little earlier.
 after_close = datetime.combine(now.date(), time(14, 31), tzinfo=tz)
 if now < after_close:
     print(f"{max(60, int((after_close - now).total_seconds()))} top200_then_market_close")
@@ -135,6 +125,8 @@ while true; do
     --all-symbols \
     --workers "${SHIOAJI_MINUTE_WORKERS:-5}" \
     --requests-per-second "${SHIOAJI_MINUTE_REQUESTS_PER_SECOND:-10}" \
+    --max-traffic-fraction "${SHIOAJI_MINUTE_MAX_TRAFFIC_FRACTION:-0.75}" \
+    --traffic-reserve-mb "${SHIOAJI_MINUTE_TRAFFIC_RESERVE_MB:-256}" \
     --start-date 2020-03-02 \
     --end-date "$BACKFILL_END_DATE"
   download_rc=$?

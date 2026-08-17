@@ -6,19 +6,19 @@ timezone: UTC
 open_time:
 close_time:
 schedule_time:
-schedule_interval_minutes: 15
+schedule_interval_minutes: 1
 schedule_delay_seconds: 45
 summary_time:
 data_ready_time: "00:00"
 freshness_max_lag_days: 1
-freshness_max_lag_minutes: 90
+freshness_max_lag_minutes: 10
 freshness_scan_limit: 0
 history_frequency: bar
 pre_signal_command:
   - "{python}"
-  - downloader/download_okx_perp_15m.py
+  - downloader/download_okx_perp_1m.py
   - --output-dir
-  - data_okx
+  - data_okx/1m
   - --mode
   - incremental
   - --workers

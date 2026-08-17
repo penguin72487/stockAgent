@@ -235,9 +235,12 @@ def _mode_label(args: argparse.Namespace) -> str:
     return str(getattr(args, "mode", "") or "download")
 
 
-YF_CRYPTO_INTRADAY_INTERVAL = "15m"
-YF_CRYPTO_INTRADAY_SECONDS = 15 * 60
-YF_CRYPTO_MAX_LOOKBACK_DAYS = 59
+YF_CRYPTO_INTRADAY_INTERVAL = "1m"
+YF_CRYPTO_INTRADAY_SECONDS = 60
+# Yahoo/yfinance exposes only a short rolling one-minute window.  Seven days
+# stays inside the upstream boundary even when the inclusive/exclusive dates
+# straddle a UTC day boundary.
+YF_CRYPTO_MAX_LOOKBACK_DAYS = 7
 DEFAULT_SYMBOLS: dict[str, list[tuple[str, str, str]]] = {
     "us_stocks": [
         ("AAPL", "Apple", "AAPL"),
@@ -635,7 +638,7 @@ def parse_args() -> argparse.Namespace:
         help=(
             "download: grab the configured universe; "
             "repair: check existing parquet files and refill missing/stale data; "
-            "incremental: refresh missing/stale data; crypto uses 15m bars; "
+            "incremental: refresh missing/stale data; crypto uses 1m bars; "
             "daily-update: deprecated alias for incremental."
         ),
     )
@@ -706,7 +709,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--alpha-vantage-api-key",
-        default=os.environ.get("ALPHAVANTAGE_API_KEY", "9IXWNBG0V9S16NPI"),
+        default=os.environ.get("ALPHAVANTAGE_API_KEY", ""),
         help="Alpha Vantage API key for US delisted listing status (or set ALPHAVANTAGE_API_KEY env).",
     )
     parser.add_argument(
@@ -3599,7 +3602,8 @@ def _resolve_asset_output_dir(args: argparse.Namespace, asset_class: str) -> Pat
         if args.asset == "all":
             raise ValueError("--output-dir cannot be combined with --asset all. Use --output-root instead.")
         return Path(args.output_dir)
-    return Path(args.output_root) / asset_class
+    output = Path(args.output_root) / asset_class
+    return output / "1m" if asset_class == "crypto" else output
 
 
 def _load_existing_file_info(output_path: Path) -> ExistingFileInfo:

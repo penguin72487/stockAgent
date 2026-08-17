@@ -79,7 +79,7 @@ Market configs:
 - `enabled` controls whether the bot can produce signals for the market.
 - `timezone`, `open_time`, `close_time`, `schedule_time`, `summary_time`, and
   `data_ready_time` control market-hours scheduling and data freshness checks.
-- 24/7 intraday markets such as crypto can set `schedule_interval_minutes: 15`
+- 24/7 intraday markets such as crypto can set `schedule_interval_minutes: 1`
   instead of `schedule_time`; the bot deduplicates one alert per completed bar.
   `schedule_delay_seconds` waits briefly after bar close before running.
 - Daily markets also run a private artifact backfill once per day. The default
@@ -90,10 +90,10 @@ Market configs:
 - `history_frequency: bar` makes `/portfolio_history` and `/stock_history`
   show recent bars instead of collapsing artifacts to daily rows.
 - `pre_signal_command` can run a data updater before scheduled signals. Crypto
-  uses `downloader/download_okx_perp_15m.py --mode incremental` before alerting.
+  uses `downloader/download_okx_perp_1m.py --mode incremental` before alerting.
 - `freshness_max_lag_days` is mainly for 24/7 crypto data; daily markets compare
   the latest parquet/benchmark date against the expected latest trading day.
-  For 15-minute crypto, prefer `freshness_max_lag_minutes`.
+  For one-minute crypto, prefer `freshness_max_lag_minutes`.
 - `trader_role_ids` / `trader_role_names` can grant restricted command access
   in addition to Discord administrator permission and the default `trader` role.
 - `initial_capital` / `current_capital` can define default capital used for
@@ -126,7 +126,7 @@ Useful commands:
   paged rebalance deltas with estimated trade amounts.
 - `/portfolio_history market:tw days:32 top_changes:5` shows recent PnL,
   cumulative return, exposure, position counts, and the largest holding changes
-  from fold artifacts. Daily markets use days; crypto can use 15-minute bars.
+  from fold artifacts. Daily markets use days; crypto can use one-minute bars.
   Add `initial_capital` to scale from the fold's first NAV, or
   `current_capital` to scale from the latest fold NAV.
 - `/stock_history market:tw symbol:2330 limit:32` shows recent per-symbol

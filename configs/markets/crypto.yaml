@@ -12,7 +12,7 @@ environment:
   amp_dtype: bf16
 
 data:
-  parquet_root: data_okx
+  parquet_root: data_okx/1m
   benchmark_name: "BTCUSDTSWAP"
   usd_only_trading_pairs: false
   panel_backend: auto
@@ -29,7 +29,7 @@ walk_forward:
   require_future_test_year: false
 
 trading:
-  frequency: 15m
+  frequency: 1m
   buy_fee_rate: 0.0005
   sell_fee_rate: 0.0005
   max_turnover_ratio: 50.0
@@ -121,7 +121,7 @@ training:
   explain_cross_asset_graph_betweenness_max_vertices: 512
   explain_cross_asset_graph_plot_max_nodes: 80
   table_output_format: parquet
-  # Legacy artifact names use "daily", but crypto rows are 15m bars.
+  # Legacy artifact names use "daily", but crypto rows are one-minute bars.
   save_daily_weights_table: true
   save_integer_share_daily_weights_table: true
   save_integer_share_holdings_table: true

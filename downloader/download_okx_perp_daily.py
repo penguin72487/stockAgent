@@ -21,7 +21,9 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from common import (  # noqa: E402
+    PersistentProgress,
     SharedRateLimiter,
+    atomic_write_text,
     describe_rate_limit,
     provider_rate_limit,
     resolve_end_date,
@@ -31,6 +33,7 @@ from common import (  # noqa: E402
     run_parallel_tasks,
 )
 from okx_historical_features import (  # noqa: E402
+    FEATURE_STAGE_IDS,
     feature_catalog_payload,
     result_rows as historical_feature_result_rows,
     run_historical_feature_downloads,
@@ -41,8 +44,8 @@ BASE_URL = "https://www.okx.com"
 INSTRUMENTS_ENDPOINT = "/api/v5/public/instruments"
 HISTORY_CANDLES_ENDPOINT = "/api/v5/market/history-candles"
 OUTPUT_COLUMNS = ["date", "open", "max", "min", "close", "adjclose", "Trading_Volume"]
-KLINE_BAR = "15m"
-CANDLE_INTERVAL_MS = 15 * 60 * 1000
+KLINE_BAR = "1m"
+CANDLE_INTERVAL_MS = 60 * 1000
 OKX_HISTORY_LIMIT = "300"
 
 
@@ -110,9 +113,9 @@ class ExistingCandleInfo:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Download all OKX perpetual swap 15-minute bars to parquet files."
+        description="Download all OKX perpetual swap one-minute bars to parquet files."
     )
-    parser.add_argument("--output-dir", default="data_okx", help="Output folder.")
+    parser.add_argument("--output-dir", default="data_okx/1m", help="Output folder.")
     parser.add_argument(
         "--mode",
         choices=["incremental", "daily-update", "full"],
@@ -153,7 +156,7 @@ def parse_args() -> argparse.Namespace:
         "--skip-historical-features",
         action="store_true",
         help=(
-            "Download only canonical 15m candles. By default, point-in-time "
+            "Download only canonical 1m candles. By default, point-in-time "
             "reconstructable OKX historical features are also updated."
         ),
     )
@@ -416,7 +419,7 @@ def _merge_existing_with_fresh(
     return combined, not _frames_equal(existing, combined)
 
 
-def _frame_matches_15m_interval(frame: pl.DataFrame) -> bool:
+def _frame_matches_1m_interval(frame: pl.DataFrame) -> bool:
     if frame.is_empty() or "date" not in frame.columns:
         return True
 
@@ -498,7 +501,7 @@ def _load_existing_candle_info(path: Path) -> ExistingCandleInfo:
         return ExistingCandleInfo(
             rows=row_count,
             latest_ms=_latest_ms_from_date_frame(date_frame),
-            interval_ok=_frame_matches_15m_interval(date_frame),
+            interval_ok=_frame_matches_1m_interval(date_frame),
             earliest_ms=_earliest_ms_from_date_frame(date_frame),
         )
     except Exception as exc:
@@ -583,7 +586,7 @@ def _normalize_candles(raw_rows: list[list[str]]) -> pl.DataFrame:
     )
 
 
-def _download_symbol_15m(
+def _download_symbol_1m(
     client: OkxClient,
     record: SymbolRecord,
     output_dir: Path,
@@ -591,6 +594,7 @@ def _download_symbol_15m(
     end_ms: int,
     mode: str,
     refresh: bool,
+    page_progress_callback: Any = None,
 ) -> DownloadResult:
     output_path = output_dir / f"{record.code}_features.parquet"
     existing_info: ExistingCandleInfo | None = None
@@ -647,6 +651,8 @@ def _download_symbol_15m(
             params["after"] = cursor_after
 
         payload = client.get(HISTORY_CANDLES_ENDPOINT, params)
+        if page_progress_callback is not None:
+            page_progress_callback(record.code)
         chunk = payload.get("data", [])
         if not chunk:
             break
@@ -736,6 +742,7 @@ def _download_symbol_15m(
 
 
 def main() -> None:
+    started_at = datetime.now(timezone.utc)
     args = parse_args()
     output_dir = Path(args.output_dir)
 
@@ -756,10 +763,52 @@ def main() -> None:
 
     output_dir.mkdir(parents=True, exist_ok=True)
     symbols_path = output_dir / "symbols.csv"
-    pl.DataFrame([asdict(s) for s in symbols]).write_csv(symbols_path)
+    atomic_write_text(
+        symbols_path,
+        pl.DataFrame([asdict(s) for s in symbols]).write_csv(),
+    )
+    closed_end_ms = min(end_ms, _latest_closed_candle_start_ms())
+    expected_candle_pages = 0
+    for record in symbols:
+        output_path = output_dir / f"{record.code}_features.parquet"
+        if output_path.is_file() and not args.refresh:
+            expected_candle_pages += 1
+            continue
+        listing_start = start_ms
+        if record.list_time:
+            listing_start = max(
+                listing_start,
+                int(
+                    datetime.strptime(record.list_time, "%Y-%m-%d %H:%M:%S")
+                    .replace(tzinfo=timezone.utc)
+                    .timestamp()
+                    * 1000
+                ),
+            )
+        candle_count = max(
+            0, (closed_end_ms - listing_start) // CANDLE_INTERVAL_MS + 1
+        )
+        expected_candle_pages += max(
+            1,
+            (candle_count + int(OKX_HISTORY_LIMIT) - 1)
+            // int(OKX_HISTORY_LIMIT),
+        )
+    pipeline_progress = PersistentProgress(
+        output_dir / "progress.json",
+        label="OKX 永續合約 1 分鐘 K線與歷史特徵",
+        total=expected_candle_pages
+        + len(symbols)
+        * (0 if args.skip_historical_features else len(FEATURE_STAGE_IDS)),
+        unit="request-page-or-feature-stage",
+        basis=(
+            "completed one-minute request pages and feature stages divided by full "
+            "elapsed time; funding archives can change the estimate"
+        ),
+        started_at=started_at,
+    )
 
     def _worker(record: SymbolRecord) -> DownloadResult:
-        return _download_symbol_15m(
+        result = _download_symbol_1m(
             client,
             record,
             output_dir,
@@ -767,10 +816,14 @@ def main() -> None:
             end_ms,
             args.mode,
             args.refresh,
+            page_progress_callback=lambda _code: pipeline_progress.update(
+                "candles", "page_fetched"
+            ),
         )
+        return result
 
     def _on_error(record: SymbolRecord, exc: Exception) -> DownloadResult:
-        return DownloadResult(
+        result = DownloadResult(
             asset_class="crypto_okx_perp",
             code=record.code,
             okx_symbol=record.okx_symbol,
@@ -780,6 +833,8 @@ def main() -> None:
             output_path=None,
             message=str(exc),
         )
+        pipeline_progress.update("candles", result.status)
+        return result
 
     results = run_parallel_tasks(
         symbols,
@@ -791,9 +846,9 @@ def main() -> None:
     )
 
     feature_catalog_path = output_dir / "okx_historical_feature_catalog.json"
-    feature_catalog_path.write_text(
-        json.dumps(feature_catalog_payload(), ensure_ascii=False, indent=2),
-        encoding="utf-8",
+    atomic_write_text(
+        feature_catalog_path,
+        json.dumps(feature_catalog_payload(), ensure_ascii=False, indent=2) + "\n",
     )
 
     historical_feature_results = []
@@ -806,11 +861,14 @@ def main() -> None:
             end_ms=end_ms,
             workers=args.feature_workers or args.workers,
             include_funding_archive=not args.skip_funding_archive,
+            stage_progress_callback=lambda _code, stage, status: (
+                pipeline_progress.update(stage, status)
+            ),
         )
 
     historical_feature_report_path = output_dir / "historical_feature_report.csv"
     feature_rows = historical_feature_result_rows(historical_feature_results)
-    (
+    feature_report = (
         pl.DataFrame(feature_rows, infer_schema_length=None)
         if feature_rows
         else pl.DataFrame(
@@ -826,7 +884,11 @@ def main() -> None:
                 "errors_json": pl.String,
             }
         )
-    ).write_csv(historical_feature_report_path)
+    )
+    atomic_write_text(
+        historical_feature_report_path,
+        feature_report.write_csv(),
+    )
 
     report_path = output_dir / "download_report.csv"
     summary_path = output_dir / "download_summary.json"
@@ -862,7 +924,7 @@ def main() -> None:
         if result_rows
         else pl.DataFrame()
     )
-    result_df.write_csv(report_path)
+    atomic_write_text(report_path, result_df.write_csv())
     status_counts: dict[str, int] = {}
     row_count = 0
     for result in results:
@@ -890,8 +952,16 @@ def main() -> None:
         "start_date": start_date,
         "end_date": end_date,
     }
-    summary_path.write_text(
-        json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
+    atomic_write_text(
+        summary_path,
+        json.dumps(summary, ensure_ascii=False, indent=2) + "\n",
+    )
+    feature_incomplete = any(
+        result.status in {"failed", "partial"} for result in historical_feature_results
+    )
+    pipeline_progress.finish(
+        failed=any(result.status == "failed" for result in results)
+        or feature_incomplete
     )
 
     print(f"[okx] symbols.csv -> {symbols_path}")

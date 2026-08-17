@@ -101,7 +101,7 @@
       "pack_buckets": 16,
       "loose_threshold_mib": 8,
       "active_process_substrings": [
-        "download_okx_perp_15m.py",
+        "download_okx_perp_1m.py",
         "download_okx_perp_daily.py",
         "okx_historical_features.py"
       ],
@@ -115,7 +115,7 @@
       "pack_buckets": 16,
       "loose_threshold_mib": 8,
       "active_process_substrings": [
-        "download_bybit_perp_15m.py",
+        "download_bybit_perp_1m.py",
         "download_bybit_perp_daily.py"
       ],
       "note": "Bybit public perpetual market data."
@@ -128,9 +128,81 @@
       "pack_buckets": 16,
       "loose_threshold_mib": 8,
       "active_process_substrings": [
-        "download_binance_perp_15m.py"
+        "download_binance_perp_1m.py"
       ],
-      "note": "Binance USD-M perpetual 15-minute market data."
+      "note": "Binance USD-M perpetual one-minute market data plus deterministic daily materialization."
+    },
+    {
+      "dataset": "binance-public-archive",
+      "source": "data_binance_archive",
+      "role": "training-and-point-in-time-audit",
+      "publish": true,
+      "pack_buckets": 32,
+      "loose_threshold_mib": 8,
+      "active_process_substrings": [
+        "download_binance_public_archive.py"
+      ],
+      "note": "Checksum-verified Binance spot and dated-futures one-minute archives, instrument lifecycle, exact capacity plan and daily-over-monthly source precedence."
+    },
+    {
+      "dataset": "crypto-reference",
+      "source": "data_crypto_reference",
+      "role": "local-analytics-and-source-resolution",
+      "publish": false,
+      "pack_buckets": 0,
+      "loose_threshold_mib": 0,
+      "active_process_substrings": [
+        "download_crypto_keyed_context.py"
+      ],
+      "note": "Non-duplicated keyed crypto reference facts, entitlement receipts and canonical/fallback source allocation. Kept local because free-plan access does not imply redistribution rights."
+    },
+    {
+      "dataset": "free-public-context",
+      "source": "data_free_public",
+      "role": "analytics-and-audit",
+      "publish": true,
+      "pack_buckets": 16,
+      "loose_threshold_mib": 8,
+      "active_process_substrings": [
+        "download_free_public_context.py"
+      ],
+      "note": "Append-only causal snapshots from non-venue public context sources. Hyperliquid, Deribit, Coinbase, Kraken and Bitfinex adapters are retained only for old files and are disabled while active exchange acquisition is limited to Binance, OKX and Bybit."
+    },
+    {
+      "dataset": "coinmetrics-community",
+      "source": "data_coinmetrics_community",
+      "role": "local-analytics-and-vintage-audit",
+      "publish": false,
+      "pack_buckets": 0,
+      "loose_threshold_mib": 0,
+      "active_process_substrings": [
+        "download_coinmetrics_community.py"
+      ],
+      "note": "All catalog-declared Community daily metrics plus retrieval vintages; kept local because free access does not imply unrestricted redistribution."
+    },
+    {
+      "dataset": "dune-crypto",
+      "source": "data_dune_crypto",
+      "role": "local-analytics-and-query-lineage",
+      "publish": false,
+      "pack_buckets": 0,
+      "loose_threshold_mib": 0,
+      "active_process_substrings": [
+        "download_dune_crypto_history.py"
+      ],
+      "note": "Versioned Dune SQL results for DEX activity, stablecoin issuance, and Binance/OKX/Bybit labelled flows; local-only because API access does not imply redistribution rights."
+    },
+    {
+      "dataset": "crypto-etf-history",
+      "source": "data_crypto_etf",
+      "role": "regulatory-and-issuer-history",
+      "publish": false,
+      "pack_buckets": 0,
+      "loose_threshold_mib": 0,
+      "active_process_substrings": [
+        "download_crypto_etf_history.py"
+      ],
+      "note": "SEC filing/company-fact history plus content-addressed official issuer NAV, holdings, asset-per-share and reserve snapshots with conservative availability timestamps."
     },
     {
       "dataset": "tw-index-futures",
@@ -177,9 +249,11 @@
       "pack_buckets": 16,
       "loose_threshold_mib": 8,
       "active_process_substrings": [
-        "download_shioaji_tx_futures_ticks.py"
+        "download_shioaji_tx_futures_ticks.py",
+        "download_taifex_contract_codes.py",
+        "build_taifex_futures_portfolio_daily.py"
       ],
-      "note": "Shioaji/TAIFEX futures data."
+      "note": "Shioaji/TAIFEX futures data, including historical+current stock/ETF/domestic+foreign-index delivery-month-slot daily training data."
     },
     {
       "dataset": "forex-frankfurter",

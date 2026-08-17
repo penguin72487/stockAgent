@@ -57,6 +57,9 @@ except ImportError:  # pragma: no cover - direct script execution from downloade
 
 
 DATA_GOV_DATASET_API = "https://data.gov.tw/api/v2/rest/dataset/{dataset_id}"
+TWSE_DAY_TRADE_OPENAPI_URL = (
+    "https://openapi.twse.com.tw/v1/exchangeReport/TWTB4U"
+)
 USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/126.0 Safari/537.36 stockAgent/1.0"
@@ -222,8 +225,10 @@ HISTORICAL_PARSER_CONTRACT_VERSION_BY_DATASET = {
     # the selected-table title and top-level payload date remain independently
     # bound to the requested session. v4 canonicalizes whitespace inside the
     # official sell-first header because the pre-open payload inserts a newline
-    # in that field name without changing its meaning.
-    "twse_day_trade_eligibility": 4,
+    # in that field name without changing its meaning. v5 adds the official
+    # TWSE OpenAPI current-session schema as the latency-sensitive pre-open
+    # source while retaining the dated rwd endpoint for historical sessions.
+    "twse_day_trade_eligibility": 5,
     # v6 treated two real TPEx OHLCV HTML generations as the same layout and
     # silently shifted their price/volume columns. v7 separated the layouts,
     # but missed three corporate-action rows whose split direction cell is
@@ -2235,6 +2240,22 @@ def _validated_tpex_session_dates(
     return selected
 
 
+def _calendar_end_before_same_session(same_session_day: date) -> date:
+    """Return the last possible weekday before a same-session rule request.
+
+    The official session archive cannot contain Saturday or Sunday rows. A
+    Monday pre-open request must therefore validate history through Friday,
+    not require the archive to claim coverage through Sunday. Weekday holidays
+    are deliberately not skipped here because doing so without an official
+    calendar receipt would weaken the fail-closed contract.
+    """
+
+    candidate = same_session_day - timedelta(days=1)
+    while candidate.weekday() >= 5:
+        candidate -= timedelta(days=1)
+    return candidate
+
+
 def _plan_historical_download(
     spec: DatasetSpec,
     args: argparse.Namespace,
@@ -2258,7 +2279,7 @@ def _plan_historical_download(
     taiex_calendar_receipt: str | None = None
     if spec.name in TPEX_SESSION_DEPENDENT_DATASETS:
         calendar_end = (
-            min(end, same_session_day - timedelta(days=1))
+            min(end, _calendar_end_before_same_session(same_session_day))
             if same_session_day is not None
             else end
         )
@@ -2289,7 +2310,7 @@ def _plan_historical_download(
             all_weekdays.add(same_session_day)
     elif _uses_taiex_session_calendar(spec, args):
         calendar_end = (
-            min(end, same_session_day - timedelta(days=1))
+            min(end, _calendar_end_before_same_session(same_session_day))
             if same_session_day is not None
             else end
         )
@@ -5005,6 +5026,41 @@ def _historical_request_info(spec: DatasetSpec, day: date) -> tuple[str, str]:
     )
 
 
+def _historical_request_sources(
+    spec: DatasetSpec,
+    day: date,
+    args: argparse.Namespace,
+) -> list[tuple[str, str]]:
+    """Return ordered official sources for one historical/session request.
+
+    The dated TWSE web report is the canonical historical archive, but it can
+    remain empty before the cash-market open even after the official current-
+    session OpenAPI has published the complete TWTB4U master. Use OpenAPI only
+    for the explicitly requested same-session rule date; its row-level ROC date
+    is validated before any data can be promoted.
+    """
+
+    primary_url, response_kind = _historical_request_info(spec, day)
+    sources: list[tuple[str, str]] = []
+    same_session_text = str(
+        getattr(args, "same_session_rule_date", None) or ""
+    ).strip()
+    if spec.name == "twse_day_trade_eligibility" and same_session_text:
+        try:
+            same_session_day = _parse_date(same_session_text)
+        except ValueError:
+            same_session_day = None
+        if day == same_session_day:
+            sources.append(
+                (TWSE_DAY_TRADE_OPENAPI_URL, "twse_day_trade_openapi_json")
+            )
+    sources.append((primary_url, response_kind))
+    fallback_url = _historical_response_fallback_url(spec, primary_url)
+    if fallback_url is not None:
+        sources.append((fallback_url, response_kind))
+    return sources
+
+
 def _historical_response_fallback_url(spec: DatasetSpec, primary_url: str) -> str | None:
     replacements = {
         "twse_daily_ohlcv": (
@@ -5038,6 +5094,71 @@ def _historical_response_fallback_url(spec: DatasetSpec, primary_url: str) -> st
 def _historical_cache_busted_url(url: str) -> str:
     separator = "&" if "?" in url else "?"
     return f"{url}{separator}_={time.time_ns()}"
+
+
+def _parse_twse_day_trade_openapi_payload(
+    payload: Any,
+    request_date: date,
+) -> pl.DataFrame:
+    if not isinstance(payload, list) or not payload:
+        raise HistoricalResponseError(
+            "official TWSE day-trade OpenAPI returned no rows"
+        )
+
+    required_fields = {"Date", "Code", "Name", "Suspension"}
+    records: list[dict[str, Any]] = []
+    declared_dates: set[date] = set()
+    for row_index, row in enumerate(payload):
+        if not isinstance(row, dict):
+            raise HistoricalResponseError(
+                "official TWSE day-trade OpenAPI contains a non-object row: "
+                f"row={row_index}"
+            )
+        missing = sorted(required_fields - set(row))
+        if missing:
+            raise HistoricalResponseError(
+                "official TWSE day-trade OpenAPI row missing required fields: "
+                f"row={row_index} fields={','.join(missing)}"
+            )
+        raw_date = str(row["Date"] or "").strip()
+        try:
+            if re.fullmatch(r"\d{7}", raw_date):
+                declared = date(
+                    int(raw_date[:3]) + 1911,
+                    int(raw_date[3:5]),
+                    int(raw_date[5:7]),
+                )
+            elif re.fullmatch(r"\d{8}", raw_date):
+                declared = datetime.strptime(raw_date, "%Y%m%d").date()
+            else:
+                raise ValueError("unsupported compact date")
+        except ValueError as exc:
+            raise HistoricalResponseError(
+                "official TWSE day-trade OpenAPI contains an invalid Date: "
+                f"row={row_index} value={raw_date!r}"
+            ) from exc
+        declared_dates.add(declared)
+        if row["Suspension"] is None:
+            raise HistoricalResponseError(
+                "official TWSE day-trade OpenAPI contains a null suspension "
+                f"marker: row={row_index}"
+            )
+        records.append(
+            {
+                DATE_COLUMN: declared.isoformat(),
+                "證券代號": row["Code"],
+                "證券名稱": row["Name"],
+                "暫停現股賣出後現款買進當沖註記": row["Suspension"],
+                "_row_index": row_index,
+            }
+        )
+
+    _validate_historical_response_date(
+        DEFAULT_DATASETS["twse_day_trade_eligibility"],
+        request_date,
+        declared_dates,
+    )
+    return _frame_from_records(records)
 
 
 def _parse_historical_response_content(
@@ -5100,6 +5221,11 @@ def _parse_historical_response_content(
         raise HistoricalResponseError(
             f"official response is not valid JSON: {exc}"
         ) from exc
+    if response_kind == "twse_day_trade_openapi_json":
+        frame = _parse_twse_day_trade_openapi_payload(payload, day)
+        frame = _normalize_historical_frame(spec, frame)
+        _validate_historical_frame(spec, day, frame)
+        return frame, ".json"
     _validate_json_historical_response_date(payload, spec, day)
     explicit_no_data = _json_payload_explicitly_reports_no_data(
         payload
@@ -5189,17 +5315,16 @@ def _download_historical_date(
     args: argparse.Namespace,
     output_dir: Path,
 ) -> HistoricalDateResult:
-    primary_url, response_kind = _historical_request_info(spec, day)
-    request_urls = [primary_url]
-    fallback_url = _historical_response_fallback_url(spec, primary_url)
-    if fallback_url is not None:
-        request_urls.append(fallback_url)
+    request_sources = _historical_request_sources(spec, day, args)
+    primary_url, _primary_response_kind = request_sources[0]
     last_url = primary_url
     total_response_attempts = 0
     primary_returned_structured_empty = False
     try:
         response_retry_count = max(0, int(args.retries))
-        for request_url_index, base_url in enumerate(request_urls):
+        for request_url_index, (base_url, response_kind) in enumerate(
+            request_sources
+        ):
             for response_attempt in range(response_retry_count + 1):
                 url = (
                     base_url
@@ -5213,7 +5338,9 @@ def _download_historical_date(
                     verify_ssl=bool(args.verify_ssl),
                     retries=int(args.retries),
                     retry_backoff=float(args.retry_backoff),
-                    retry_security_blocks=request_url_index == len(request_urls) - 1,
+                    retry_security_blocks=(
+                        request_url_index == len(request_sources) - 1
+                    ),
                 )
                 total_response_attempts += max(
                     1,
@@ -5235,7 +5362,9 @@ def _download_historical_date(
                     # historical cache/backend.  Do not let one unsafe HTTP
                     # 200 contaminate every later date handled by this worker.
                     _discard_http_session()
-                    try_fallback_url = request_url_index < len(request_urls) - 1
+                    try_fallback_url = (
+                        request_url_index < len(request_sources) - 1
+                    )
                     retry_same_url = (
                         not try_fallback_url
                         and response_attempt < response_retry_count
@@ -5277,14 +5406,17 @@ def _download_historical_date(
                 # semantic anomaly (2009-02-02). Treat an otherwise valid empty
                 # response conservatively too: confirm it through TWSE's official
                 # exchangeReport/IND route before recording a weekday as empty.
-                if frame.is_empty() and request_url_index < len(request_urls) - 1:
+                if (
+                    frame.is_empty()
+                    and request_url_index < len(request_sources) - 1
+                ):
                     primary_returned_structured_empty = True
                     break
 
                 final_fallback_empty = (
                     frame.is_empty()
-                    and len(request_urls) > 1
-                    and request_url_index == len(request_urls) - 1
+                    and len(request_sources) > 1
+                    and request_url_index == len(request_sources) - 1
                 )
                 strict_open_session = _requires_strict_session_calendar(spec, args)
                 retry_cross_checked_empty = final_fallback_empty and (

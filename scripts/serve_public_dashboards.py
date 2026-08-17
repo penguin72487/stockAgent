@@ -31,6 +31,7 @@ from stockagent.live.public_dashboards import (  # noqa: E402
     sanitize_taifex_status,
     sanitize_tw_events,
     sanitize_tw_history,
+    sanitize_tw_positions,
     sanitize_tw_signals,
     sanitize_tw_status,
 )
@@ -47,6 +48,7 @@ from stockagent.live.data_monitor_dashboard import (  # noqa: E402
 from stockagent.live.tw_day_trade_dashboard import (  # noqa: E402
     build_dashboard_event_page,
     build_dashboard_history_snapshot,
+    build_dashboard_position_page,
     build_dashboard_snapshot,
 )
 
@@ -83,6 +85,7 @@ _PUBLIC_API_ROUTES: Final[frozenset[str]] = frozenset(
         "/taifex/api/history",
         "/tw-day-trade/api/status",
         "/tw-day-trade/api/history",
+        "/tw-day-trade/api/positions",
         "/tw-day-trade/api/summary",
         "/tw-day-trade/api/signals",
         "/tw-day-trade/api/events",
@@ -960,9 +963,16 @@ class PublicDashboardServer(ThreadingHTTPServer):
             ),
         )
 
-    def tw_history(self, range_key: str) -> PreparedResponse:
+    def tw_history(
+        self,
+        range_key: str,
+        *,
+        start_date: str | None = None,
+        end_date: str | None = None,
+    ) -> PreparedResponse:
+        date_key = f"{start_date or ''}:{end_date or ''}"
         return self.cached_local_json(
-            cache_key=f"tw-history:{range_key}",
+            cache_key=f"tw-history:{range_key}:{date_key}",
             ttl_seconds=55.0,
             cache_control="no-cache",
             stale_grace_seconds=180.0,
@@ -970,6 +980,8 @@ class PublicDashboardServer(ThreadingHTTPServer):
                 build_dashboard_history_snapshot(
                     state_dir=self.repo_root / "artifacts/live/tw_day_trade_simulation",
                     range_key=range_key,
+                    start_date=start_date,
+                    end_date=end_date,
                 )
             ),
         )
@@ -1286,9 +1298,18 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                 raw_query,
                 keep_blank_values=True,
                 strict_parsing=False,
-                max_num_fields=6,
+                max_num_fields=8,
             )
-            allowed = {"date", "mode", "symbol", "status", "offset", "limit"}
+            allowed = {
+                "date",
+                "start_date",
+                "end_date",
+                "mode",
+                "symbol",
+                "status",
+                "offset",
+                "limit",
+            }
             if set(query) - allowed or any(
                 len(values) != 1 for values in query.values()
             ):
@@ -1297,8 +1318,16 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
             symbol = str(query.get("symbol", [""])[0])[:32]
             status = str(query.get("status", ["all"])[0])[:32]
             session_date = str(query.get("date", [""])[0]).strip()
+            start_date = str(query.get("start_date", [""])[0]).strip()
+            end_date = str(query.get("end_date", [""])[0]).strip()
             if session_date:
                 date.fromisoformat(session_date)
+            if start_date:
+                date.fromisoformat(start_date)
+            if end_date:
+                date.fromisoformat(end_date)
+            if start_date and end_date and start_date > end_date:
+                raise InvalidPublicRequest("start_date must not be after end_date")
             offset = int(query.get("offset", ["0"])[0])
             limit = int(query.get("limit", [str(PUBLIC_SIGNAL_LIMIT)])[0])
             if offset < 0 or offset > 100_000:
@@ -1306,9 +1335,13 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
             if limit < 1:
                 raise InvalidPublicRequest("limit must be positive")
             limit = min(limit, PUBLIC_SIGNAL_LIMIT)
-            return urlencode(
+            normalized = {"date": session_date}
+            if start_date:
+                normalized["start_date"] = start_date
+            if end_date:
+                normalized["end_date"] = end_date
+            normalized.update(
                 {
-                    "date": session_date,
                     "mode": mode,
                     "symbol": symbol,
                     "status": status,
@@ -1316,6 +1349,7 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                     "limit": limit,
                 }
             )
+            return urlencode(normalized)
         except InvalidPublicRequest:
             raise
         except (ValueError, OverflowError) as error:
@@ -1344,15 +1378,63 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
             raise InvalidPublicRequest("invalid history query") from error
 
     @staticmethod
+    def _tw_history_query(raw_query: str) -> dict[str, str | None]:
+        try:
+            query = parse_qs(
+                raw_query,
+                keep_blank_values=True,
+                strict_parsing=False,
+                max_num_fields=3,
+            )
+            if set(query) - {"range", "start_date", "end_date"} or any(
+                len(values) != 1 for values in query.values()
+            ):
+                raise InvalidPublicRequest("unsupported or repeated query field")
+            range_key = str(query.get("range", ["1d"])[0]).strip().lower() or "1d"
+            if range_key not in {"1h", "1d", "1w", "1mo", "1q", "1y", "all"}:
+                raise InvalidPublicRequest("unsupported chart range")
+            start_date = str(query.get("start_date", [""])[0]).strip() or None
+            end_date = str(query.get("end_date", [""])[0]).strip() or None
+            if start_date is not None:
+                date.fromisoformat(start_date)
+            if end_date is not None:
+                date.fromisoformat(end_date)
+            if (
+                start_date is not None
+                and end_date is not None
+                and start_date > end_date
+            ):
+                raise InvalidPublicRequest(
+                    "history start_date must not be after end_date"
+                )
+            return {
+                "range_key": range_key,
+                "start_date": start_date,
+                "end_date": end_date,
+            }
+        except InvalidPublicRequest:
+            raise
+        except (ValueError, OverflowError) as error:
+            raise InvalidPublicRequest("invalid TW history query") from error
+
+    @staticmethod
     def _event_query(raw_query: str) -> str:
         try:
             query = parse_qs(
                 raw_query,
                 keep_blank_values=True,
                 strict_parsing=False,
-                max_num_fields=5,
+                max_num_fields=7,
             )
-            allowed = {"date", "mode", "symbol", "offset", "limit"}
+            allowed = {
+                "date",
+                "start_date",
+                "end_date",
+                "mode",
+                "symbol",
+                "offset",
+                "limit",
+            }
             if set(query) - allowed or any(
                 len(values) != 1 for values in query.values()
             ):
@@ -1360,8 +1442,16 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
             mode = str(query.get("mode", [""])[0])[:64]
             symbol = str(query.get("symbol", [""])[0])[:32]
             session_date = str(query.get("date", [""])[0]).strip()
+            start_date = str(query.get("start_date", [""])[0]).strip()
+            end_date = str(query.get("end_date", [""])[0]).strip()
             if session_date:
                 date.fromisoformat(session_date)
+            if start_date:
+                date.fromisoformat(start_date)
+            if end_date:
+                date.fromisoformat(end_date)
+            if start_date and end_date and start_date > end_date:
+                raise InvalidPublicRequest("start_date must not be after end_date")
             offset = int(query.get("offset", ["0"])[0])
             limit = int(query.get("limit", [str(PUBLIC_EVENT_LIMIT)])[0])
             if offset < 0 or offset > 100_000:
@@ -1369,15 +1459,20 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
             if limit < 1:
                 raise InvalidPublicRequest("limit must be positive")
             limit = min(limit, PUBLIC_EVENT_LIMIT)
-            return urlencode(
+            normalized = {"date": session_date}
+            if start_date:
+                normalized["start_date"] = start_date
+            if end_date:
+                normalized["end_date"] = end_date
+            normalized.update(
                 {
-                    "date": session_date,
                     "mode": mode,
                     "symbol": symbol,
                     "offset": offset,
                     "limit": limit,
                 }
             )
+            return urlencode(normalized)
         except InvalidPublicRequest:
             raise
         except (ValueError, OverflowError) as error:
@@ -1417,7 +1512,12 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
         if path == "/tw-day-trade/api/status":
             return self.server.tw_status(self._date_query(raw_query))
         if path == "/tw-day-trade/api/history":
-            return self.server.tw_history(self._history_range_query(raw_query))
+            history_query = self._tw_history_query(raw_query)
+            return self.server.tw_history(
+                str(history_query["range_key"]),
+                start_date=history_query["start_date"],
+                end_date=history_query["end_date"],
+            )
         if path == "/tw-day-trade/api/summary":
             session_date = self._date_query(raw_query)
             return self.server.cached_local_json(
@@ -1439,10 +1539,35 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                 stale_grace_seconds=0.0,
                 sanitizer=sanitize_tw_signals,
             )
+        if path == "/tw-day-trade/api/positions":
+            normalized = self._signal_query(raw_query)
+            query = parse_qs(normalized, keep_blank_values=True)
+            return self.server.cached_local_json(
+                cache_key=f"tw-positions:{normalized}",
+                ttl_seconds=2.0,
+                cache_control="no-store",
+                stale_grace_seconds=0.0,
+                builder=lambda: sanitize_tw_positions(
+                    build_dashboard_position_page(
+                        state_dir=self.server.repo_root
+                        / "artifacts/live/tw_day_trade_simulation",
+                        session_date=str(query.get("date", [""])[0]) or None,
+                        start_date=str(query.get("start_date", [""])[0]) or None,
+                        end_date=str(query.get("end_date", [""])[0]) or None,
+                        mode=str(query.get("mode", [""])[0]),
+                        symbol=str(query.get("symbol", [""])[0]),
+                        status=str(query.get("status", ["all"])[0]),
+                        offset=int(query.get("offset", ["0"])[0]),
+                        limit=int(query.get("limit", [str(PUBLIC_SIGNAL_LIMIT)])[0]),
+                    )
+                ),
+            )
         if path == "/tw-day-trade/api/events":
             normalized = self._event_query(raw_query)
             query = parse_qs(normalized, keep_blank_values=True)
             session_date = str(query.get("date", [""])[0]) or None
+            start_date = str(query.get("start_date", [""])[0]) or None
+            end_date = str(query.get("end_date", [""])[0]) or None
             mode = str(query.get("mode", [""])[0])
             symbol = str(query.get("symbol", [""])[0])
             offset = int(query.get("offset", ["0"])[0])
@@ -1457,6 +1582,8 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                         state_dir=self.server.repo_root
                         / "artifacts/live/tw_day_trade_simulation",
                         session_date=session_date,
+                        start_date=start_date,
+                        end_date=end_date,
                         mode=mode,
                         symbol=symbol,
                         offset=offset,

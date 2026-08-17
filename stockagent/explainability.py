@@ -129,6 +129,9 @@ PAPER_TOKENS = {
 }
 
 _MATPLOTLIB_TRANSFORM_DOT_WARNING = r".*invalid value encountered in dot.*"
+_MATPLOTLIB_TIGHT_LAYOUT_AXES_WARNING = (
+    r"This figure includes Axes that are not compatible with tight_layout.*"
+)
 _DEFAULT_MARKET_ARTIFACTS_ROOT = Path("artifacts/markets")
 _DEFAULT_MARKET_CONFIG_ROOT = Path("configs/markets")
 _EXPLAINABILITY_SPLIT = "test"
@@ -215,6 +218,14 @@ def _safe_matplotlib_tight_layout(fig: Any) -> None:
             "ignore",
             message=_MATPLOTLIB_TRANSFORM_DOT_WARNING,
             category=RuntimeWarning,
+        )
+        # Colorbar/inset axes are intentionally outside tight_layout's layout
+        # graph. Matplotlib cannot improve them and emits this advisory even
+        # though the saved figure is padded and visually validated afterward.
+        warnings.filterwarnings(
+            "ignore",
+            message=_MATPLOTLIB_TIGHT_LAYOUT_AXES_WARNING,
+            category=UserWarning,
         )
         fig.tight_layout()
 

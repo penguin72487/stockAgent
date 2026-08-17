@@ -1,0 +1,20 @@
+[Unit]
+Description=StockAgent checksum-verified Binance spot and dated-futures archive
+Wants=network-online.target time-sync.target
+After=network-online.target time-sync.target
+
+[Service]
+Type=oneshot
+User=@SERVICE_USER@
+Group=@SERVICE_GROUP@
+WorkingDirectory=@REPO_ROOT@
+Environment="HOME=@SERVICE_HOME@"
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=/usr/bin/bash "@REPO_ROOT@/scripts/run_binance_public_archive.sh"
+Nice=10
+CPUWeight=20
+IOWeight=20
+TimeoutStartSec=infinity
+
+[Install]
+WantedBy=multi-user.target

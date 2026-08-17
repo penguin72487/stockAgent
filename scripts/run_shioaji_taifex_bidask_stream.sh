@@ -154,7 +154,7 @@ while true; do
   capture_id="$(run_fintech_python -c 'import uuid; print(uuid.uuid4().hex)')"
   required_option_codes=""
   if [[ "$EXECUTE_STRATEGIES" == true ]]; then
-    required_option_codes="$(run_fintech_python -c 'from pathlib import Path; import sys; from stockagent.live.taifex_strategy_state import load_held_option_codes; print(",".join(load_held_option_codes(Path(sys.argv[1]))))' "$STRATEGY_STATE_DIR")"
+    required_option_codes="$(run_fintech_python -c 'from pathlib import Path; import sys; from stockagent.live.taifex_strategy_state import load_required_option_codes; print(",".join(load_required_option_codes(Path(sys.argv[1]))))' "$STRATEGY_STATE_DIR")"
   fi
   echo "[shioaji-taifex] capture_start=$(TZ=Asia/Taipei date --iso-8601=seconds) capture_id=$capture_id session=$capture_session trade_date=$trade_date stop_at=$stop_at"
   worker_pids=()

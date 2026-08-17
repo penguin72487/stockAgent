@@ -1,0 +1,174 @@
+{
+  "schema_version": 1,
+  "contract": {
+    "canonical_granularities": ["daily", "1m", "tick"],
+    "crypto_active_intraday_granularity": "1m",
+    "crypto_event_data_policy": "deferred_until_explicit_user_reenable",
+    "daily_rule": "Prefer provider-native daily data when it has a stronger adjustment contract; otherwise aggregate validated completed one-minute bars by exchange calendar.",
+    "minute_rule": "One-minute bars are the only canonical intraday candle grain. A slower native statistic stays labelled at its native grain and is never relabelled as one-minute.",
+    "tick_rule": "Tick means an actual trade event or quote/book event. Candles and snapshots must never be relabelled as ticks.",
+    "causal_rule": "Persist event_ts, observed_at and available_at where supplied; use data only after available_at."
+  },
+  "products": [
+    {
+      "id": "tw_listed_stocks",
+      "title": "臺灣上市櫃股票／ETF",
+      "provider": "TWSE / TPEx / Shioaji",
+      "granularities": [
+        {"granularity": "daily", "parent_dataset": "tw-public", "implementation": "reused_existing", "availability": "full_public_history", "storage_path": "data_tw_public/stocks", "summary_path": "data_tw_public/download_summary.json", "cadence": "每交易日收盤後"},
+        {"granularity": "1m", "parent_dataset": "tw-minute-source-cold", "implementation": "reused_existing", "availability": "broker_entitlement_history", "storage_path": "data_tw_minute/shioaji_1m", "summary_path": "data_tw_minute/shioaji_1m/download_summary.json", "progress_path": "data_tw_minute/shioaji_1m/progress.json", "cadence": "交易日 14:45 回補", "credential_id": "shioaji"},
+        {"granularity": "tick", "parent_dataset": "tw-microstructure-captures-cold", "implementation": "reused_existing_partial_universe", "availability": "prospective_stream_plus_selected_history", "storage_path": "data_tw_microstructure/captures", "cadence": "盤中連續串流；股票目前 Top-200", "credential_id": "shioaji", "stream": true}
+      ]
+    },
+    {
+      "id": "tw_index_futures",
+      "title": "臺灣指數期貨",
+      "provider": "TAIFEX / Shioaji",
+      "granularities": [
+        {"granularity": "daily", "parent_dataset": "tw-index-futures", "implementation": "reused_existing", "availability": "full_official_history", "storage_path": "data_tw_index_futures", "summary_path": "data_tw_index_futures/manifest.json", "cadence": "交易日 16:30"},
+        {"granularity": "1m", "parent_dataset": "tw-futures", "implementation": "registered_materializer_pending", "availability": "derivable_from_verified_ticks", "storage_path": "data_tw_futures/1m", "cadence": "逐筆回補完成後聚合", "credential_id": "shioaji"},
+        {"granularity": "tick", "parent_dataset": "tw-futures", "implementation": "reused_existing", "availability": "broker_history_and_realtime", "storage_path": "data_tw_futures", "summary_path": "data_tw_futures/shioaji_contracts/manifest.json", "cadence": "配額允許時回補；盤中串流", "credential_id": "shioaji", "stream": true}
+      ]
+    },
+    {
+      "id": "tw_index_options",
+      "title": "臺灣指數選擇權",
+      "provider": "TAIFEX / Shioaji",
+      "granularities": [
+        {"granularity": "daily", "parent_dataset": "tw-index-options-daily", "implementation": "reused_existing", "availability": "full_official_history", "storage_path": "data_tw_index_options_daily", "summary_path": "data_tw_index_options_daily/manifest.json", "cadence": "交易日 17:00"},
+        {"granularity": "1m", "parent_dataset": "tw-index-derivatives-ticks", "implementation": "registered_materializer_pending", "availability": "derivable_for_tick_coverage", "storage_path": "data_tw_index_derivatives_ticks/1m", "cadence": "逐筆檔完成後聚合"},
+        {"granularity": "tick", "parent_dataset": "tw-index-derivatives-ticks", "implementation": "reused_existing", "availability": "official_recent_30_sessions_plus_realtime", "storage_path": "data_tw_index_derivatives_ticks", "summary_path": "data_tw_index_derivatives_ticks/manifest.json", "cadence": "交易日 17:00；盤中串流", "stream": true}
+      ]
+    },
+    {
+      "id": "yahoo_global_equities",
+      "title": "Yahoo 全球股票／ETF",
+      "provider": "Yahoo Finance / yfinance",
+      "granularities": [
+        {"granularity": "daily", "parent_dataset": "yahoo-market", "implementation": "reused_existing", "availability": "source_max_history", "storage_path": "data_yahoo/us_stocks", "summary_path": "data_yahoo/us_stocks/download_summary.json", "cadence": "每日 06:30"},
+        {"granularity": "1m", "parent_dataset": "yahoo-market", "implementation": "registered_source_limited", "availability": "rolling_recent_only", "storage_path": "data_yahoo/us_stocks/1m", "cadence": "尚未啟用；來源只保留近期盤中資料"},
+        {"granularity": "tick", "parent_dataset": "yahoo-market", "implementation": "not_available", "availability": "no_historical_trade_tick_contract", "cadence": "不適用"}
+      ]
+    },
+    {
+      "id": "yahoo_crypto_spot",
+      "title": "Yahoo 加密貨幣現貨代理",
+      "provider": "Yahoo Finance / yfinance",
+      "granularities": [
+        {"granularity": "daily", "parent_dataset": "yahoo-market", "implementation": "registered_fallback_disabled", "availability": "noncanonical_aggregate_proxy; derived_from_rolling_1m", "storage_path": "data_yahoo/crypto/daily", "summary_path": "data_yahoo/crypto/daily/download_summary.json", "cadence": "只在人工缺口診斷時"},
+        {"granularity": "1m", "parent_dataset": "yahoo-market", "implementation": "registered_fallback_disabled", "availability": "noncanonical_aggregate_proxy; rolling_7_day_boundary", "storage_path": "data_yahoo/crypto/1m", "summary_path": "data_yahoo/crypto/1m/download_summary.json", "cadence": "只在原生來源缺口的人工診斷時"},
+        {"granularity": "tick", "parent_dataset": "yahoo-market", "implementation": "not_available", "availability": "no_historical_trade_tick_contract", "cadence": "不適用"}
+      ]
+    },
+    {
+      "id": "okx_perpetual_swaps",
+      "title": "OKX 永續合約",
+      "provider": "OKX",
+      "granularities": [
+        {"granularity": "daily", "parent_dataset": "okx", "implementation": "implemented_materialized", "availability": "derived_from_validated_1m", "storage_path": "data_okx/daily", "summary_path": "data_okx/daily/download_summary.json", "cadence": "每輪 1m 完成後"},
+        {"granularity": "1m", "parent_dataset": "okx", "implementation": "implemented", "availability": "recent_years_rest_plus_archive", "storage_path": "data_okx/1m", "summary_path": "data_okx/1m/download_summary.json", "progress_path": "data_okx/1m/progress.json", "cadence": "本輪完成後 1 分鐘"},
+        {"granularity": "tick", "parent_dataset": "okx", "implementation": "deferred_by_user_1m_only", "availability": "official_t_plus_2_archive_and_realtime", "storage_path": "data_okx/tick", "cadence": "暫停；待使用者明確重新啟用逐筆", "acquisition_enabled": false, "stream": false}
+      ]
+    },
+    {
+      "id": "bybit_perpetuals",
+      "title": "Bybit 永續合約",
+      "provider": "Bybit",
+      "granularities": [
+        {"granularity": "daily", "parent_dataset": "bybit", "implementation": "implemented_materialized", "availability": "derived_from_validated_1m", "storage_path": "data_bybit/daily", "summary_path": "data_bybit/daily/download_summary.json", "cadence": "每輪 1m 完成後"},
+        {"granularity": "1m", "parent_dataset": "bybit", "implementation": "implemented", "availability": "historical_rest", "storage_path": "data_bybit/1m", "summary_path": "data_bybit/1m/download_summary.json", "progress_path": "data_bybit/1m/progress.json", "cadence": "本輪完成後 1 分鐘"},
+        {"granularity": "tick", "parent_dataset": "bybit", "implementation": "deferred_by_user_1m_only", "availability": "historical_trade_files_and_realtime", "storage_path": "data_bybit/tick", "cadence": "暫停；待使用者明確重新啟用逐筆", "acquisition_enabled": false, "stream": false}
+      ]
+    },
+    {
+      "id": "binance_usdm_perpetuals",
+      "title": "Binance USD-M 永續合約",
+      "provider": "Binance",
+      "granularities": [
+        {"granularity": "daily", "parent_dataset": "binance", "implementation": "implemented_materialized", "availability": "derived_from_validated_1m", "storage_path": "data_binance/daily", "summary_path": "data_binance/daily/download_summary.json", "cadence": "每輪 1m 完成後"},
+        {"granularity": "1m", "parent_dataset": "binance", "implementation": "implemented", "availability": "full_rest_and_checksum_archive", "storage_path": "data_binance/1m", "summary_path": "data_binance/1m/download_summary.json", "progress_path": "data_binance/1m/progress.json", "cadence": "本輪完成後 1 分鐘"},
+        {"granularity": "tick", "parent_dataset": "binance", "implementation": "deferred_by_user_1m_only", "availability": "official_daily_monthly_trades_and_aggtrades", "storage_path": "data_binance/tick", "cadence": "暫停；待使用者明確重新啟用逐筆", "acquisition_enabled": false, "stream": false}
+      ]
+    },
+    {
+      "id": "alpaca_us_equities",
+      "title": "Alpaca 美國股票",
+      "provider": "Alpaca",
+      "granularities": [
+        {"granularity": "daily", "parent_dataset": "yahoo-market", "implementation": "implemented_credential_gate", "availability": "free_plan_history", "storage_path": "data_alpaca/us_stocks", "summary_path": "data_alpaca/us_stocks/download_summary.json", "cadence": "每日；有憑證才執行", "credential_id": "alpaca"},
+        {"granularity": "1m", "parent_dataset": "yahoo-market", "implementation": "registered_credential_gate", "availability": "plan_dependent", "storage_path": "data_alpaca/us_stocks/1m", "cadence": "待免費方案權限驗證", "credential_id": "alpaca"},
+        {"granularity": "tick", "parent_dataset": "yahoo-market", "implementation": "registered_credential_gate", "availability": "feed_and_plan_dependent", "storage_path": "data_alpaca/us_stocks/tick", "cadence": "待免費方案權限驗證", "credential_id": "alpaca", "stream": true}
+      ]
+    },
+    {
+      "id": "fx_reference_rates",
+      "title": "外匯參考匯率",
+      "provider": "Frankfurter / ECB",
+      "granularities": [
+        {"granularity": "daily", "parent_dataset": "forex-frankfurter", "implementation": "reused_existing", "availability": "business_day_reference_rates", "storage_path": "data_forex_frankfurter", "summary_path": "data_forex_frankfurter/download_summary.json", "cadence": "每個歐洲營業日"},
+        {"granularity": "1m", "parent_dataset": "forex-frankfurter", "implementation": "not_available", "availability": "reference_rate_source_has_no_intraday_contract", "cadence": "不適用"},
+        {"granularity": "tick", "parent_dataset": "forex-frankfurter", "implementation": "not_available", "availability": "reference_rate_source_has_no_tick_contract", "cadence": "不適用"}
+      ]
+    },
+    {
+      "id": "pepperstone_fx_cfd",
+      "title": "Pepperstone 外匯／CFD 歷史",
+      "provider": "Pepperstone",
+      "granularities": [
+        {"granularity": "daily", "parent_dataset": "forex-pepperstone", "implementation": "reused_existing", "availability": "existing_downloaded_history", "storage_path": "data_peperstone/fores", "summary_path": "data_peperstone/fores/download_summary.json", "cadence": "依既有下載器排程"},
+        {"granularity": "1m", "parent_dataset": "forex-pepperstone", "implementation": "registered_source_contract_pending", "availability": "requires_verified_free_history_contract", "storage_path": "data_peperstone/1m", "cadence": "待來源授權與端點契約確認"},
+        {"granularity": "tick", "parent_dataset": "forex-pepperstone", "implementation": "registered_source_contract_pending", "availability": "requires_verified_free_tick_contract", "storage_path": "data_peperstone/tick", "cadence": "待來源授權與端點契約確認", "stream": true}
+      ]
+    },
+    {
+      "id": "coinbase_spot",
+      "title": "Coinbase Exchange 現貨",
+      "provider": "Coinbase Exchange",
+      "granularities": [
+        {"granularity": "daily", "parent_dataset": "free-public-context", "implementation": "deferred_by_user_exchange_scope", "availability": "public_candles_with_exchange_limits", "storage_path": "data_coinbase/daily", "cadence": "暫停；目前只啟用 Binance、OKX、Bybit", "acquisition_enabled": false},
+        {"granularity": "1m", "parent_dataset": "free-public-context", "implementation": "deferred_by_user_exchange_scope", "availability": "public_candles_recent_window", "storage_path": "data_coinbase/1m", "cadence": "暫停；目前只啟用 Binance、OKX、Bybit", "acquisition_enabled": false},
+        {"granularity": "tick", "parent_dataset": "free-public-context", "implementation": "deferred_by_user_exchange_scope", "availability": "public_trades_and_realtime_websocket", "storage_path": "data_coinbase/tick", "cadence": "暫停；目前只啟用 Binance、OKX、Bybit", "acquisition_enabled": false, "stream": false}
+      ]
+    },
+    {
+      "id": "kraken_spot",
+      "title": "Kraken 現貨／衍生品",
+      "provider": "Kraken",
+      "granularities": [
+        {"granularity": "daily", "parent_dataset": "free-public-context", "implementation": "deferred_by_user_exchange_scope", "availability": "public_ohlc_recent_window", "storage_path": "data_kraken/daily", "cadence": "暫停；目前只啟用 Binance、OKX、Bybit", "acquisition_enabled": false},
+        {"granularity": "1m", "parent_dataset": "free-public-context", "implementation": "deferred_by_user_exchange_scope", "availability": "public_ohlc_last_720_bars", "storage_path": "data_kraken/1m", "cadence": "暫停；目前只啟用 Binance、OKX、Bybit", "acquisition_enabled": false},
+        {"granularity": "tick", "parent_dataset": "free-public-context", "implementation": "deferred_by_user_exchange_scope", "availability": "public_trades_cursor_and_realtime", "storage_path": "data_kraken/tick", "cadence": "暫停；目前只啟用 Binance、OKX、Bybit", "acquisition_enabled": false, "stream": false}
+      ]
+    },
+    {
+      "id": "bitfinex_spot_derivatives",
+      "title": "Bitfinex 現貨／衍生品",
+      "provider": "Bitfinex",
+      "granularities": [
+        {"granularity": "daily", "parent_dataset": "free-public-context", "implementation": "deferred_by_user_exchange_scope", "availability": "public_candle_history", "storage_path": "data_bitfinex/daily", "cadence": "暫停；目前只啟用 Binance、OKX、Bybit", "acquisition_enabled": false},
+        {"granularity": "1m", "parent_dataset": "free-public-context", "implementation": "deferred_by_user_exchange_scope", "availability": "public_one_minute_candles", "storage_path": "data_bitfinex/1m", "cadence": "暫停；目前只啟用 Binance、OKX、Bybit", "acquisition_enabled": false},
+        {"granularity": "tick", "parent_dataset": "free-public-context", "implementation": "deferred_by_user_exchange_scope", "availability": "public_trade_history_and_realtime", "storage_path": "data_bitfinex/tick", "cadence": "暫停；目前只啟用 Binance、OKX、Bybit", "acquisition_enabled": false, "stream": false}
+      ]
+    },
+    {
+      "id": "hyperliquid_perpetuals",
+      "title": "Hyperliquid 永續合約／現貨",
+      "provider": "Hyperliquid",
+      "granularities": [
+        {"granularity": "daily", "parent_dataset": "free-public-context", "implementation": "deferred_by_user_exchange_scope", "availability": "derived_from_public_1m_with_retention_boundary", "storage_path": "data_hyperliquid/daily", "cadence": "暫停；目前只啟用 Binance、OKX、Bybit", "acquisition_enabled": false},
+        {"granularity": "1m", "parent_dataset": "free-public-context", "implementation": "deferred_by_user_exchange_scope", "availability": "public_candle_snapshot_recent_history", "storage_path": "data_hyperliquid/1m", "cadence": "暫停；目前只啟用 Binance、OKX、Bybit", "acquisition_enabled": false},
+        {"granularity": "tick", "parent_dataset": "free-public-context", "implementation": "deferred_by_user_exchange_scope", "availability": "realtime_public_stream_and_requester_pays_archive", "storage_path": "data_hyperliquid/tick", "cadence": "暫停；目前只啟用 Binance、OKX、Bybit", "acquisition_enabled": false, "stream": false}
+      ]
+    },
+    {
+      "id": "deribit_derivatives",
+      "title": "Deribit 選擇權／期貨",
+      "provider": "Deribit",
+      "granularities": [
+        {"granularity": "daily", "parent_dataset": "free-public-context", "implementation": "deferred_by_user_exchange_scope", "availability": "derived_from_public_1m_or_native_chart_data", "storage_path": "data_deribit/daily", "cadence": "暫停；目前只啟用 Binance、OKX、Bybit", "acquisition_enabled": false},
+        {"granularity": "1m", "parent_dataset": "free-public-context", "implementation": "deferred_by_user_exchange_scope", "availability": "public_chart_data_resolution_60", "storage_path": "data_deribit/1m", "cadence": "暫停；目前只啟用 Binance、OKX、Bybit", "acquisition_enabled": false},
+        {"granularity": "tick", "parent_dataset": "free-public-context", "implementation": "deferred_by_user_exchange_scope", "availability": "public_last_trades_and_realtime_subscriptions", "storage_path": "data_deribit/tick", "cadence": "暫停；目前只啟用 Binance、OKX、Bybit", "acquisition_enabled": false, "stream": false}
+      ]
+    }
+  ]
+}

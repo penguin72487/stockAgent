@@ -1,0 +1,162 @@
+{
+  "schema_version": 1,
+  "acquisition_registry": "configs/crypto_data_acquisition.json",
+  "execution_scope": {
+    "canonical_intraday_market_granularity": "1m",
+    "active_exchange_venues": ["Binance", "OKX", "Bybit"],
+    "deferred_fact_ids": ["venue_trade_ticks", "venue_top_of_book", "venue_l2_order_book", "venue_liquidations", "options_chain_greeks_iv"],
+    "provider_assignment_rule": "assigned_facts records future canonical ownership; deferred_fact_ids must be removed before execution and may not consume provider traffic."
+  },
+  "selection_order": [
+    "operational configured API with entitlement for its assigned unique fact",
+    "anonymous venue or network-native public endpoint",
+    "free aggregator assigned as the canonical owner",
+    "fallback only for missing canonical keys"
+  ],
+  "providers": [
+    {
+      "id": "binance",
+      "role": "venue_native_primary",
+      "credential_id": null,
+      "operational_gate": "public endpoint reachable",
+      "limit_profiles": ["binance_usdm_request_weight", "binance_usdm_funding_history", "binance_usdm_statistics_history", "binance_public_listing", "binance_public_archive"],
+      "parallel_group": "binance",
+      "assigned_facts": ["venue_instrument_lifecycle", "venue_spot_ohlcv_1m", "venue_perpetual_ohlcv_1m", "venue_dated_futures_ohlcv_1m", "venue_mark_index_premium", "venue_funding_settlements", "venue_open_interest", "venue_positioning_and_taker_flow", "options_chain_greeks_iv", "venue_trade_ticks", "venue_top_of_book", "venue_l2_order_book", "venue_liquidations"]
+    },
+    {
+      "id": "okx",
+      "role": "venue_native_primary",
+      "credential_id": null,
+      "operational_gate": "public endpoint reachable",
+      "limit_profiles": ["okx_history_candles", "okx_history_mark_price_candles", "okx_history_index_candles", "okx_funding_rate_history"],
+      "parallel_group": "okx",
+      "assigned_facts": ["venue_instrument_lifecycle", "venue_spot_ohlcv_1m", "venue_perpetual_ohlcv_1m", "venue_dated_futures_ohlcv_1m", "venue_mark_index_premium", "venue_funding_settlements", "venue_open_interest", "venue_positioning_and_taker_flow", "options_chain_greeks_iv", "venue_trade_ticks", "venue_top_of_book", "venue_l2_order_book", "venue_liquidations"]
+    },
+    {
+      "id": "bybit",
+      "role": "venue_native_primary",
+      "credential_id": null,
+      "operational_gate": "public endpoint reachable",
+      "limit_profiles": ["bybit_public_rest"],
+      "parallel_group": "bybit",
+      "assigned_facts": ["venue_instrument_lifecycle", "venue_spot_ohlcv_1m", "venue_perpetual_ohlcv_1m", "venue_dated_futures_ohlcv_1m", "venue_mark_index_premium", "venue_funding_settlements", "venue_open_interest", "venue_positioning_and_taker_flow", "options_chain_greeks_iv", "venue_trade_ticks", "venue_top_of_book", "venue_l2_order_book", "venue_liquidations"]
+    },
+    {
+      "id": "coingecko",
+      "role": "configured_aggregate_primary",
+      "credential_id": "coingecko",
+      "operational_gate": "configured key passes /ping",
+      "limit_profiles": ["coingecko_demo"],
+      "parallel_group": "coingecko",
+      "assigned_facts": ["aggregate_asset_identity", "aggregate_market_cap_supply"],
+      "monthly_budget_rule": "At most one full catalog and one full market snapshot per UTC day; current Demo monthly cap is 10,000 calls."
+    },
+    {
+      "id": "coinmarketcap",
+      "role": "configured_fallback_and_validation",
+      "credential_id": "coinmarketcap",
+      "operational_gate": "configured key passes /v1/key/info and has remaining credits",
+      "limit_profiles": ["coinmarketcap_basic"],
+      "parallel_group": "coinmarketcap",
+      "assigned_facts": ["aggregate_asset_identity", "aggregate_market_cap_supply"],
+      "activation_rule": "Run only when CoinGecko misses canonical IDs or as a bounded QA sample; never store a second full canonical market archive."
+    },
+    {
+      "id": "etherscan",
+      "role": "configured_chain_fallback",
+      "credential_id": "etherscan",
+      "operational_gate": "V2 response status=1",
+      "limit_profiles": ["etherscan_free"],
+      "parallel_group": "etherscan",
+      "assigned_facts": ["ethereum_realtime_gas"],
+      "activation_rule": "Run only after the configured key passes a live V2 response; Blockscout is the current anonymous primary."
+    },
+    {
+      "id": "blockscout_ethereum",
+      "role": "anonymous_ethereum_realtime_primary",
+      "credential_id": null,
+      "operational_gate": "Ethereum instance stats and latest-block endpoints both return valid timestamps",
+      "limit_profiles": ["blockscout_ethereum_public"],
+      "parallel_group": "blockscout_ethereum",
+      "assigned_facts": ["ethereum_realtime_gas"],
+      "migration_warning": "Per-instance API is announced for future deprecation; preserve an explicit provider migration state."
+    },
+    {
+      "id": "dune",
+      "role": "configured_query_engine",
+      "credential_id": "dune",
+      "operational_gate": "key configured plus registered query IDs, SQL lineage and expected result key",
+      "limit_profiles": ["dune_free_low", "dune_free_high"],
+      "parallel_group": "dune",
+      "assigned_facts": ["bridge_flows", "cex_reserves_and_flows", "token_unlocks_and_emissions", "custom_onchain_queries"],
+      "activation_rule": "A key alone does not authorize arbitrary SQL executions; only configs/dune_crypto_queries.json entries run."
+    },
+    {
+      "id": "coinglass",
+      "role": "configured_unique_fact_fallback",
+      "credential_id": "coinglass",
+      "operational_gate": "supported-coins probe returns code=0 rather than Upgrade plan",
+      "limit_profiles": ["coinglass_keyed"],
+      "parallel_group": "coinglass",
+      "assigned_facts": ["venue_liquidations", "crypto_etf_flows_holdings"],
+      "activation_rule": "Never duplicate venue-native price, OI or funding; run only entitled unique aggregate facts."
+    },
+    {
+      "id": "defillama",
+      "role": "anonymous_defi_primary",
+      "credential_id": null,
+      "operational_gate": "selected free endpoint reachable",
+      "limit_profiles": ["defillama_public"],
+      "parallel_group": "defillama",
+      "assigned_facts": ["stablecoin_supply_and_peg", "defi_tvl", "dex_derivatives_options_volume", "protocol_fees_revenue", "defi_yields_and_borrow_rates"]
+    },
+    {
+      "id": "coinmetrics",
+      "role": "anonymous_network_primary",
+      "credential_id": null,
+      "operational_gate": "community catalog declares the metric and asset",
+      "limit_profiles": ["coinmetrics_community"],
+      "parallel_group": "coinmetrics",
+      "assigned_facts": ["onchain_network_metrics_daily"]
+    },
+    {
+      "id": "mempool_space",
+      "role": "anonymous_bitcoin_realtime_primary",
+      "credential_id": null,
+      "operational_gate": "compact public endpoint reachable",
+      "limit_profiles": ["mempool_space_public"],
+      "parallel_group": "mempool_space",
+      "assigned_facts": ["bitcoin_mempool_and_fees"]
+    },
+    {
+      "id": "venue_context",
+      "role": "disabled_by_active_exchange_scope",
+      "credential_id": null,
+      "operational_gate": "disabled; active exchange acquisition is limited to Binance, OKX and Bybit",
+      "limit_profiles": ["hyperliquid_info", "deribit_public", "coinbase_exchange_public", "kraken_public", "bitfinex_public"],
+      "parallel_group": "venue_context",
+      "acquisition_enabled": false,
+      "assigned_facts": []
+    }
+  ],
+  "provider_parallel_groups": [
+    "binance",
+    "okx",
+    "bybit",
+    "coingecko",
+    "coinmarketcap",
+    "etherscan",
+    "dune",
+    "coinglass",
+    "defillama",
+    "coinmetrics",
+    "mempool_space",
+    "blockscout_ethereum",
+    "venue_context"
+  ],
+  "default_disabled_duplicates": [
+    "yahoo_crypto_1m_bulk",
+    "duplicate_cmc_market_archive",
+    "coinglass_exchange_oi_funding_copy"
+  ]
+}
