@@ -1,7 +1,13 @@
 import json
 from pathlib import Path
 
-from scripts.run_tw_day_trade_ablation import _bar, _last_json, _progress
+from scripts.run_tw_day_trade_ablation import (
+    POSTPROCESS_PLOT_SPECS,
+    _bar,
+    _last_json,
+    _progress,
+    _single_experiment_concurrency,
+)
 
 
 def test_last_json_reads_latest_epoch(tmp_path: Path) -> None:
@@ -24,7 +30,9 @@ def test_progress_counts_completed_folds_and_active_epoch(tmp_path: Path) -> Non
     assert "fold 2/2 epoch 50/100" in label
 
 
-def test_progress_sums_two_concurrent_experiment_epochs(tmp_path: Path) -> None:
+def test_progress_sums_durable_partial_epochs_but_labels_only_current_job(
+    tmp_path: Path,
+) -> None:
     for name, epoch in (("baseline", 25), ("variant", 75)):
         curve_dir = tmp_path / name / "train_2014"
         curve_dir.mkdir(parents=True)
@@ -37,11 +45,32 @@ def test_progress_sums_two_concurrent_experiment_epochs(tmp_path: Path) -> None:
     )
 
     assert percent == 25.0
-    assert "baseline fold 1/2 epoch 25/100" in label
     assert "variant fold 1/2 epoch 75/100" in label
+    assert "baseline fold 1/2 epoch 25/100" not in label
+
+
+def test_tw_day_trade_supervisor_always_runs_one_experiment() -> None:
+    assert _single_experiment_concurrency(1) == 1
+    assert _single_experiment_concurrency(2) == 1
 
 
 def test_bar_has_exact_percentage_and_label() -> None:
     rendered = _bar(12.5, "baseline fold 1")
     assert "12.50%" in rendered
     assert rendered.endswith("baseline fold 1")
+
+
+def test_primary_test_plot_uses_owned_next_lookback_handoff_interval() -> None:
+    assert POSTPROCESS_PLOT_SPECS == (
+        ("val", "val", "Validation tensor loss contract"),
+        (
+            "deployment",
+            "test",
+            "Owned test: current-year lookback complete through next-year pre-lookback",
+        ),
+        (
+            "test",
+            "full_horizon_integer_audit",
+            "Diagnostic only: expanding full-future exact whole-lot horizon",
+        ),
+    )

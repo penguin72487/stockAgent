@@ -19,6 +19,25 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_SPEC = REPO_ROOT / "configs/ablations/financial_transformer_tw_day_trade.yaml"
 
+# ``deployment_test_backtest.npz`` is the non-overlapping test ownership
+# interval: this model's first valid in-split lookback row through the row just
+# before the next model's first valid in-split lookback row. It is therefore
+# the primary test surface. The expanding full-future artifact remains a
+# diagnostic only and must never be presented as the canonical test period.
+POSTPROCESS_PLOT_SPECS = (
+    ("val", "val", "Validation tensor loss contract"),
+    (
+        "deployment",
+        "test",
+        "Owned test: current-year lookback complete through next-year pre-lookback",
+    ),
+    (
+        "test",
+        "full_horizon_integer_audit",
+        "Diagnostic only: expanding full-future exact whole-lot horizon",
+    ),
+)
+
 
 def _last_json(path: Path) -> dict:
     try:
@@ -63,12 +82,25 @@ def _progress(root: Path, names: list[str], folds: int, epochs: int) -> tuple[fl
     )
     percent = 100.0 * min(total, complete + fractional) / max(1, total)
     active_rows.sort(reverse=True)
+    # This supervisor deliberately runs one experiment at a time. Historical
+    # incomplete epoch curves can remain for several variants after a resume;
+    # showing the two newest made a sequential DDP run look concurrent. The
+    # newest writer is the sole current-job hint, while every durable partial
+    # epoch still contributes to the aggregate completion percentage.
     descriptions = [
         f"{name} fold {fold}/{folds} epoch {epoch}/{epochs}"
-        for _, name, fold, epoch in active_rows[:2]
+        for _, name, fold, epoch in active_rows[:1]
     ]
     label = " + ".join(descriptions) if descriptions else "preflight"
     return percent, f"folds {complete}/{total} | {label}"
+
+
+def _single_experiment_concurrency(requested: int) -> int:
+    """Make the TW day-trade ablation wrapper sequential by contract."""
+
+    if int(requested) <= 0:
+        raise ValueError("parallel_jobs must be positive")
+    return 1
 
 
 def _bar(percent: float, label: str, *, width: int = 36) -> str:
@@ -152,27 +184,45 @@ def main() -> None:
     parser.add_argument(
         "--parallel-jobs",
         type=int,
-        default=2,
+        default=1,
         help=(
-            "Requested independent experiment concurrency. All-visible-GPU "
-            "DDP is automatically capped at one job to prevent oversubscription."
+            "Compatibility input; this TW day-trade supervisor always runs "
+            "exactly one independent experiment using all visible GPUs."
         ),
     )
     parser.add_argument("--max-no-progress-retries", type=int, default=3)
     parser.add_argument("--retry-backoff-seconds", type=float, default=5.0)
     args = parser.parse_args()
+    parallel_jobs = _single_experiment_concurrency(args.parallel_jobs)
+    if int(args.parallel_jobs) != parallel_jobs:
+        print(
+            "[ablation] forcing independent experiment concurrency to 1 so "
+            "the current run owns all visible GPUs and host thread budgets",
+            flush=True,
+        )
 
     spec_path = args.spec.resolve()
     spec = yaml.safe_load(spec_path.read_text(encoding="utf-8"))
     folds = int(spec["expected_fold_count"])
     root = (args.output_root or (REPO_ROOT / spec["output_root"])).resolve()
     root.mkdir(parents=True, exist_ok=True)
+    baseline_root_raw = spec.get("baseline_artifact_root")
+    baseline_root = (
+        (REPO_ROOT / str(baseline_root_raw)).resolve()
+        if baseline_root_raw
+        else None
+    )
+    if baseline_root is not None and not (baseline_root / "summary.json").is_file():
+        raise SystemExit(
+            "baseline_artifact_root does not contain summary.json: "
+            f"{baseline_root}"
+        )
 
     # Generate and validate effective configs without training.
     dry_run = [sys.executable, str(REPO_ROOT / "scripts/run_ablation_experiments.py"),
                "--spec", str(spec_path), "--output-root", str(root), "--dry-run",
                "--multi-gpu-strategy", args.multi_gpu_strategy,
-               "--parallel-jobs", str(args.parallel_jobs)]
+               "--parallel-jobs", str(parallel_jobs)]
     _run_checked(dry_run)
     # Derive the run set from the current spec, not from every historical file
     # left under generated_configs. This keeps removed/renamed experiments out
@@ -200,7 +250,7 @@ def main() -> None:
     command = [sys.executable, str(REPO_ROOT / "scripts/run_ablation_experiments.py"),
                "--spec", str(spec_path), "--output-root", str(root),
                "--multi-gpu-strategy", args.multi_gpu_strategy,
-               "--parallel-jobs", str(args.parallel_jobs), "--auto-resume",
+               "--parallel-jobs", str(parallel_jobs), "--auto-resume",
                "--max-no-progress-retries", str(args.max_no_progress_retries),
                "--retry-backoff-seconds", str(args.retry_backoff_seconds),
                "--stop-on-fail"]
@@ -230,11 +280,28 @@ def main() -> None:
     if returncode:
         raise SystemExit(f"ablation failed with exit code {returncode}; inspect {log_path}")
 
-    # Validation is the selection surface; test charts remain descriptive and separate.
+    # Validation is the selection surface. The primary test calculation uses
+    # the non-overlapping handoff interval. The expanding full-future exact
+    # whole-lot result is retained under an explicit diagnostic-only prefix.
     plotter = str(REPO_ROOT / "scripts/plot_ablation_analysis.py")
-    for split in ("val", "test"):
-        _run_checked([sys.executable, plotter, "--root", str(root), "--output-dir", str(root),
-                      "--split", split, "--prefix", split])
+    for split, prefix, scope_label in POSTPROCESS_PLOT_SPECS:
+        command = [
+            sys.executable,
+            plotter,
+            "--root",
+            str(root),
+            "--output-dir",
+            str(root),
+            "--split",
+            split,
+            "--prefix",
+            prefix,
+            "--scope-label",
+            scope_label,
+        ]
+        if baseline_root is not None:
+            command.extend(["--baseline-root", str(baseline_root)])
+        _run_checked(command)
     print(_bar(100.0, f"complete | charts and CSVs: {root}"), flush=True)
 
 

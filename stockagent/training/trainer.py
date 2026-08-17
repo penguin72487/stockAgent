@@ -6407,6 +6407,7 @@ def _save_deployment_test_artifacts(
     *,
     symbols: Sequence[str] | None = None,
     backtest_artifact_compression: str = "none",
+    write_plots: bool = False,
 ) -> dict[str, float | int | str]:
     """Persist the non-overlapping deployment view separately from full test."""
     date_values = np.asarray(dates)
@@ -6470,8 +6471,22 @@ def _save_deployment_test_artifacts(
         )
     (fold_dir / "deployment_annual_report.txt").write_text(report, encoding="utf-8")
     timing["annual_report_s"] = float(time.perf_counter() - stage_start)
+    stage_start = time.perf_counter()
+    deployment_plot_path = fold_dir / "deployment_equity_curve.png"
+    if write_plots:
+        if rows > 0:
+            plot_equity_curve(
+                result,
+                date_values,
+                deployment_plot_path,
+            )
+        elif deployment_plot_path.exists():
+            deployment_plot_path.unlink()
+    timing["equity_curve_s"] = float(time.perf_counter() - stage_start)
     timing["total_s"] = float(
-        float(timing["backtest_npz_s"]) + float(timing["annual_report_s"])
+        float(timing["backtest_npz_s"])
+        + float(timing["annual_report_s"])
+        + float(timing["equity_curve_s"])
     )
     return timing
 
@@ -8636,10 +8651,38 @@ def _split_valid_indices(
 
 
 def _next_fold_by_id(folds: Iterable[WalkForwardFold]) -> dict[int, WalkForwardFold | None]:
+    """Return the next strictly later test-window owner for each fold.
+
+    ``require_future_test_year=false`` appends an experimental fold whose
+    validation and test window can duplicate the preceding fold's first test
+    year. That same-year experiment is not a next-year deployment model: the
+    earlier unbiased fold keeps the interval, while every later duplicate is
+    mapped to itself so its owned deployment prefix is empty.
+    """
+
     ordered = sorted(list(folds), key=lambda item: int(item.fold_id))
+    canonical: list[WalkForwardFold] = []
+    duplicate_folds: list[WalkForwardFold] = []
+    seen_test_starts: set[int] = set()
+    for fold in ordered:
+        test_indices = np.asarray(fold.test_indices, dtype=np.int64)
+        if test_indices.size == 0:
+            duplicate_folds.append(fold)
+            continue
+        test_start = int(test_indices.min())
+        if test_start in seen_test_starts:
+            duplicate_folds.append(fold)
+            continue
+        seen_test_starts.add(test_start)
+        canonical.append(fold)
+
     result: dict[int, WalkForwardFold | None] = {}
-    for idx, fold in enumerate(ordered):
-        result[int(fold.fold_id)] = ordered[idx + 1] if idx + 1 < len(ordered) else None
+    for idx, fold in enumerate(canonical):
+        result[int(fold.fold_id)] = (
+            canonical[idx + 1] if idx + 1 < len(canonical) else None
+        )
+    for fold in duplicate_folds:
+        result[int(fold.fold_id)] = fold
     return result
 
 
@@ -8654,7 +8697,7 @@ def _deployment_test_indices(
     """Raw test date indices owned by this fold's model.
 
     The interval ends just before the next fold's first valid row. Under the
-    legacy split-only policy this leaves the new year's warmup with the prior
+    split-only policy this leaves the new year's warmup with the prior
     model. Under panel-history policy the next model owns its first target day
     because its feature window can read causal rows from earlier years.
     """
@@ -13146,6 +13189,7 @@ def _replay_taiwan_stitched_deployment(
             stitched_dates[start:end],
             symbols=global_symbols,
             backtest_artifact_compression=compression,
+            write_plots=True,
         )
     return stitched
 

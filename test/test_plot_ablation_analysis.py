@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import csv
 import json
+import subprocess
+import sys
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from scripts.plot_ablation_analysis import (
@@ -67,6 +70,172 @@ def test_load_uses_baseline_snapshot_and_includes_new_complete_run(tmp_path: Pat
 
 
 def test_initial_capital_labels_are_explicit() -> None:
-    assert display_label("baseline") == "Baseline (capital TWD 1M)"
+    assert display_label("baseline") == "Baseline (capital TWD 10M)"
+    assert display_label("initial_capital_1m") == "Capital TWD 1M"
     assert display_label("initial_capital_10m") == "Capital TWD 10M"
     assert display_label("initial_capital_100m") == "Capital TWD 100M"
+
+
+def _write_deployment_run(
+    run_dir: Path,
+    *,
+    strategy_returns: list[float],
+) -> None:
+    run_dir.mkdir(parents=True)
+    summary = [
+        {
+            "fold_id": 1,
+            "train_years": [2014],
+            "val_years": [2015],
+            "test_years": [2016],
+        }
+    ]
+    (run_dir / "summary.json").write_text(json.dumps(summary))
+    fold_dir = run_dir / "fold_01"
+    fold_dir.mkdir()
+    rows = len(strategy_returns)
+    np.savez(
+        fold_dir / "deployment_test_backtest.npz",
+        strategy_returns=np.asarray(strategy_returns, dtype=np.float64),
+        benchmark_returns=np.zeros(rows, dtype=np.float64),
+        turnovers=np.full(rows, 0.5, dtype=np.float64),
+        dates=np.arange(
+            np.datetime64("2016-01-04"),
+            np.datetime64("2016-01-04") + np.timedelta64(rows, "D"),
+        ),
+    )
+
+
+def test_load_deployment_uses_explicit_external_baseline_and_canonical_metrics(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "ablation"
+    baseline_root = tmp_path / "baseline"
+    _write_deployment_run(baseline_root, strategy_returns=[0.001, 0.002])
+    _write_deployment_run(
+        root / "variant",
+        strategy_returns=[0.002, 0.003],
+    )
+
+    runs = load(root, "deployment", baseline_root=baseline_root)
+
+    assert list(runs) == ["variant", "baseline"]
+    assert runs["variant"][0]["deployment_rows"] == 2
+    assert runs["variant"][0]["deployment_metrics"]["turnover"] == 0.5
+    assert runs["variant"][0]["deployment_metrics"]["cagr"] > 0.0
+
+
+def test_deployment_csv_audits_exact_calculation_date_interval(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "ablation"
+    output_dir = tmp_path / "plots"
+    _write_deployment_run(root / "baseline", strategy_returns=[0.001, 0.002])
+    _write_deployment_run(root / "variant", strategy_returns=[0.002, 0.003])
+    script = Path(__file__).resolve().parents[1] / "scripts/plot_ablation_analysis.py"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "--root",
+            str(root),
+            "--output-dir",
+            str(output_dir),
+            "--split",
+            "deployment",
+            "--prefix",
+            "test",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    with (output_dir / "test_baseline_fold_metrics.csv").open(newline="") as fh:
+        row = next(csv.DictReader(fh))
+    assert row["calculation_rows"] == "2"
+    assert row["calculation_date_start"] == "2016-01-04"
+    assert row["calculation_date_end"] == "2016-01-05"
+
+
+def test_same_year_experimental_fold_cannot_replace_prior_owned_test(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "baseline"
+    run_dir.mkdir()
+    summary = [
+        {
+            "fold_id": 11,
+            "train_years": [2014, 2024],
+            "val_years": [2025],
+            "test_years": [2026],
+        },
+        {
+            "fold_id": 12,
+            "train_years": [2014, 2025],
+            "val_years": [2026],
+            "test_years": [2026],
+        },
+    ]
+    (run_dir / "summary.json").write_text(json.dumps(summary))
+    for fold_id, deployment_returns in ((11, []), (12, [0.9])):
+        fold_dir = run_dir / f"fold_{fold_id:02d}"
+        fold_dir.mkdir()
+        rows = len(deployment_returns)
+        np.savez(
+            fold_dir / "deployment_test_backtest.npz",
+            strategy_returns=np.asarray(deployment_returns, dtype=np.float64),
+            benchmark_returns=np.zeros(rows, dtype=np.float64),
+            turnovers=np.zeros(rows, dtype=np.float64),
+            dates=np.arange(
+                np.datetime64("2026-01-01"),
+                np.datetime64("2026-01-01") + np.timedelta64(rows, "D"),
+            ),
+        )
+    np.savez(
+        run_dir / "fold_11" / "test_backtest.npz",
+        strategy_returns=np.asarray([0.001, 0.002], dtype=np.float64),
+        benchmark_returns=np.zeros(2, dtype=np.float64),
+        turnovers=np.full(2, 0.5, dtype=np.float64),
+        dates=np.asarray(["2026-02-26", "2026-02-27"], dtype="datetime64[D]"),
+    )
+
+    runs = load(tmp_path, "deployment")
+
+    assert [row["fold_id"] for row in runs["baseline"]] == [11]
+    assert runs["baseline"][0]["deployment_rows"] == 2
+    assert runs["baseline"][0]["deployment_date_start"] == "2026-02-26"
+    assert runs["baseline"][0]["deployment_metrics"]["cagr"] > 0.0
+
+
+def test_deployment_plot_cli_bootstraps_repo_imports(tmp_path: Path) -> None:
+    root = tmp_path / "ablation"
+    baseline_root = tmp_path / "baseline"
+    output_dir = tmp_path / "plots"
+    _write_deployment_run(baseline_root, strategy_returns=[0.001, 0.002])
+    _write_deployment_run(root / "variant", strategy_returns=[0.002, 0.003])
+    script = Path(__file__).resolve().parents[1] / "scripts/plot_ablation_analysis.py"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "--root",
+            str(root),
+            "--baseline-root",
+            str(baseline_root),
+            "--output-dir",
+            str(output_dir),
+            "--split",
+            "deployment",
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert (output_dir / "deployment_paired_sharpe_effects.png").is_file()

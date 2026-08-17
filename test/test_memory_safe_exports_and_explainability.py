@@ -9,7 +9,12 @@ import pyarrow.parquet as pq
 import pytest
 import torch
 
-from plot_epoch_curves import _load_curve, _write_parquet_table_as_csv, export_report_csvs
+from plot_epoch_curves import (
+    _load_curve,
+    _sample_rows,
+    _write_parquet_table_as_csv,
+    export_report_csvs,
+)
 from stockagent import explainability as explainability_module
 from stockagent.explainability import (
     ExplainabilitySettings,
@@ -130,6 +135,15 @@ def test_load_curve_replaces_float_nan_without_touching_strings(
 
     assert [row["phase"] for row in rows] == ["train", "validation"]
     assert rows[1]["loss"] is None
+
+
+def test_epoch_curve_interval_one_preserves_every_recorded_epoch() -> None:
+    rows = [
+        {"epoch": epoch, "train_loss": 1.0 / epoch}
+        for epoch in range(1, 1001)
+    ]
+
+    assert _sample_rows(rows, interval=1) == rows
 
 
 def test_explainability_reads_compacted_universe_from_parquet_weight_schema(tmp_path: Path) -> None:

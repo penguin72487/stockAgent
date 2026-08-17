@@ -1,9 +1,9 @@
 # Output-contract-only OFAT matrix for open-aware TW day-trade long/short.
-# The projection_l1 control and five other new modes train in this root. The
-# l1 variant is semantically identical to the completed architecture suite's
-# baseline and is linked into this root after exact effective-config validation.
+# The projection_l1 control and every output-mode variant use the canonical
+# TWD 10M baseline capital. Preserved TWD 1M checkpoints are not linked into
+# this root because capital changes execution feasibility and optimizer loss.
 base_config: configs/markets/tw_public_lanten_market_candles.yaml
-output_root: artifacts/ablations/financial_transformer_tw_day_trade_output_modes_projection_l1
+output_root: artifacts/ablations/financial_transformer_tw_day_trade_output_modes_projection_l1_capital10m_split_only_v3
 expected_fold_count: 12
 
 runtime:
@@ -14,6 +14,10 @@ matrix:
   mode: one_factor_at_a_time
   include_baseline: true
   fixed_overrides:
+    walk_forward:
+      # Keep every output-mode comparison on the same year-local lookback and
+      # next-model handoff interval.
+      lookback_context: split_only
     trading:
       execution_mode: tw_day_trade
       long_only: false
@@ -24,6 +28,7 @@ matrix:
     runner:
       post_train_infer: false
     trading:
+      volume_participation_equity: 10000000.0
       portfolio_activation: pre_normalized
     training:
       loss_portfolio_activation: pre_normalized

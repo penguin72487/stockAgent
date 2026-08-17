@@ -516,6 +516,13 @@ The user cares about total epoch wall time, not only train step time.
 
 Rules:
 
+- `scripts/run_tw_day_trade_ablation.py` runs independent experiments strictly
+  one at a time.  Each experiment keeps within-fold DDP ownership of every
+  visible GPU and receives the full host CPU/Inductor thread budgets; do not
+  divide GPUs or threads across concurrent ablation variants.  Historical
+  partial epoch curves may contribute to aggregate progress, but the live UI
+  must label only the single newest/current experiment so it cannot imply that
+  stale resumable variants are running concurrently.
 - For the dual-RTX-5090 `tw_minute` FinancialTransformer config that inherits
   `tw_public_lanten_market_candles.yaml`, the measured throughput-only capacity
   is global `batch_size_train: 64`, `batch_size_eval: 16`, and train/eval

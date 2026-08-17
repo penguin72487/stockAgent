@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 from torch import nn
 
+import stockagent.training.trainer as trainer_module
 from stockagent.backtest.simulator import BacktestResult, run_backtest_integer_shares
 from stockagent.backtest.tw_integer_execution import TaiwanIntegerState
 from stockagent.training.trainer import (
@@ -649,6 +650,33 @@ def test_index_futures_nonterminal_stitched_slice_has_exact_terminal_state(
         loaded.final_equity_scale,
         segment.final_equity_scale,
     )
+
+
+def test_deployment_artifact_can_render_a_distinct_equity_curve(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[tuple[np.ndarray, Path]] = []
+    monkeypatch.setattr(
+        trainer_module,
+        "plot_equity_curve",
+        lambda _result, dates, path: captured.append(
+            (np.asarray(dates), Path(path))
+        ),
+    )
+    result = _continuous_result()
+    dates = np.asarray(["2026-01-02", "2026-01-05"], dtype="datetime64[D]")
+
+    timing = _save_deployment_test_artifacts(
+        tmp_path,
+        result,
+        dates,
+        symbols=["A", "B"],
+        write_plots=True,
+    )
+
+    assert captured == [(dates, tmp_path / "deployment_equity_curve.png")]
+    assert timing["equity_curve_s"] >= 0.0
 
 
 def test_schema_six_continuous_commission_rebate_round_trip(
