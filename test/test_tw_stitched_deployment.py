@@ -255,6 +255,74 @@ def test_stitched_replay_preserves_t2_claim_and_expands_dynamic_symbols(
     )
 
 
+def test_daily_no_default_stitched_replay_uses_same_fractional_tplus3_forward(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _disable_stitched_plots(monkeypatch)
+    panel = _day_trade_panel(
+        np.asarray(
+            [
+                [10.0, 11.0, 10.0],
+                [10.0, 10.0, 10.0],
+                [10.0, 10.0, 10.0],
+            ]
+        )
+    )
+    fold_one = _write_fold_requests(
+        tmp_path,
+        fold_id=1,
+        dates=panel.dates[:1],
+        symbols=("2330",),
+        requests=np.asarray([[1.0]]),
+    )
+    fold_two = _write_fold_requests(
+        tmp_path,
+        fold_id=2,
+        dates=panel.dates[1:],
+        symbols=("2317", "2330"),
+        requests=np.asarray([[1.0, 0.0], [0.0, 0.0]]),
+    )
+    config = _day_trade_config()
+    config.trading.tw_day_trade_unlimited_margin_conversion = True
+    # This contract deliberately has no whole-lot rounding.  A 1,000-share
+    # audit with only TWD 100 would be identically flat and is not allowed to
+    # replace the canonical differentiable daily loss during stitched replay.
+    config.trading.tw_day_trade_lot_size = 1000
+
+    stitched = trainer_module._replay_taiwan_stitched_deployment(
+        tmp_path,
+        [fold_two, fold_one],
+        panel=panel,
+        config=config,
+    )
+
+    assert stitched is not None
+    assert stitched.settlement_ledger_unit == "nav_ratio"
+    assert stitched.final_integer_state is None
+    assert stitched.shares_history is None
+    np.testing.assert_allclose(
+        stitched.requested_weights_history,
+        np.asarray(
+            [
+                [0.0, 1.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0],
+            ]
+        ),
+    )
+    np.testing.assert_allclose(
+        stitched.strategy_returns[0], np.log(1.10), atol=2.0e-8
+    )
+    np.testing.assert_allclose(
+        stitched.receivables_history,
+        np.asarray([[0.0, 0.10], [0.10, 0.0], [0.0, 0.0]]),
+        atol=1.0e-7,
+    )
+    np.testing.assert_allclose(stitched.cash_history, [1.0, 1.0, 1.10])
+    assert np.count_nonzero(stitched.weights_history) == 2
+
+
 def test_stitched_replay_keeps_ruin_absorbing_across_fold_handoff(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

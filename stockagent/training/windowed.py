@@ -16,6 +16,10 @@ from stockagent.data.tw_index_derivatives_day import (
     TAIFEX_OPTION_CANDIDATE_CAPACITY,
     TAIFEX_OPTION_CANDIDATE_FEATURE_DIM,
 )
+from stockagent.data.tw_index_futures import (
+    TAIFEX_INDEX_FUTURES_ACTION_COUNT,
+    TAIFEX_INDEX_FUTURES_CONTEXT_FEATURE_DIM,
+)
 
 
 @dataclass(slots=True)
@@ -94,13 +98,33 @@ class WindowedSplitTensors:
                 "shape [T,D_options]"
             )
         elif (
-            self.execution_mode != "tw_index_derivatives_day"
+            self.execution_mode == "tw_index_futures_day"
+            and tuple(self.overnight_log_returns.shape)
+            != (
+                int(self.features.size(0)),
+                TAIFEX_INDEX_FUTURES_ACTION_COUNT,
+                3,
+            )
+        ):
+            raise ValueError(
+                "tw_index_futures_day execution tensor must have shape [T,18,3]"
+            )
+        elif (
+            self.execution_mode not in {"tw_index_derivatives_day", "tw_day_trade"}
+            and self.execution_mode != "tw_index_futures_day"
             and tuple(self.overnight_log_returns.shape) != expected_symbol_shape
         ):
             raise ValueError(
                 "overnight_log_returns must have shape [T,S] matching "
                 f"future_log_returns: {tuple(self.overnight_log_returns.shape)} "
                 f"!= {expected_symbol_shape}"
+            )
+        elif self.execution_mode == "tw_day_trade" and (
+            self.overnight_log_returns.dim() not in {2, 3}
+            or tuple(self.overnight_log_returns.shape[:2]) != expected_symbol_shape
+        ):
+            raise ValueError(
+                "tw_day_trade overnight/execution tensor must have shape [T,S] or [T,S,C]"
             )
         if self.execution_mode == "tw_index_derivatives_day":
             expected_rows = int(self.features.size(0))
@@ -135,6 +159,32 @@ class WindowedSplitTensors:
                 raise ValueError(
                     "tw_index_derivatives_day candidate mask must have "
                     "shape [T,4102]"
+                )
+            self.derivative_candidate_mask = self.derivative_candidate_mask.to(
+                dtype=torch.bool
+            )
+        elif self.execution_mode == "tw_index_futures_day":
+            expected_rows = int(self.features.size(0))
+            if self.derivative_candidate_features is None or tuple(
+                self.derivative_candidate_features.shape[:1]
+            ) != (expected_rows,) or (
+                self.derivative_candidate_features is not None
+                and (
+                    self.derivative_candidate_features.dim() != 3
+                    or int(self.derivative_candidate_features.size(1))
+                    < TAIFEX_INDEX_FUTURES_ACTION_COUNT
+                    or int(self.derivative_candidate_features.size(2))
+                    != TAIFEX_INDEX_FUTURES_CONTEXT_FEATURE_DIM
+                )
+            ):
+                raise ValueError(
+                    "tw_index_futures_day model context must have shape [T,K>=18,13]"
+                )
+            if self.derivative_candidate_mask is None or tuple(
+                self.derivative_candidate_mask.shape
+            ) != tuple(self.derivative_candidate_features.shape[:2]):
+                raise ValueError(
+                    "tw_index_futures_day context mask must match [T,K]"
                 )
             self.derivative_candidate_mask = self.derivative_candidate_mask.to(
                 dtype=torch.bool

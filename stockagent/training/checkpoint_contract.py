@@ -25,6 +25,7 @@ from stockagent.backtest.tw_execution import (
 )
 from stockagent.backtest.tw_index_futures import (
     TW_INDEX_FUTURES_DAY_BACKTEST_CONTRACT_VERSION,
+    TW_INDEX_FUTURES_TRAINING_GRADIENT_CONTRACT_VERSION,
 )
 from stockagent.backtest.tw_index_derivatives_day import (
     TW_INDEX_DERIVATIVES_DAY_BACKTEST_CONTRACT_VERSION,
@@ -179,6 +180,29 @@ def _project_temporal_basis_model_config(
         projected.pop("daily_context_layers", None)
         projected.pop("daily_context_lookback", None)
         projected.pop("daily_context_pooling", None)
+    if str(projected.get("futures_action_mode", "independent")) == "independent":
+        # The field post-dates the original 18-independent-action model.  Its
+        # disabled/default value has no parameter or forward-path effect, so
+        # omit it to keep those checkpoints loadable.  The directional mode is
+        # retained and therefore owns a distinct strict model fingerprint.
+        projected.pop("futures_action_mode", None)
+        projected.pop("futures_exposure_activation", None)
+        projected.pop("futures_allocation_logit_scale", None)
+        projected.pop("futures_allocation_temperature", None)
+        projected.pop("futures_require_joint_context", None)
+    else:
+        # Omit historical directional defaults so checkpoints written before
+        # these controls existed retain the same strict fingerprint.  Every
+        # non-default anti-saturation setting remains explicit in the model
+        # contract and therefore requires a fresh optimizer trajectory.
+        if str(projected.get("futures_exposure_activation", "tanh")) == "tanh":
+            projected.pop("futures_exposure_activation", None)
+        if float(projected.get("futures_allocation_logit_scale", 0.0)) == 0.0:
+            projected.pop("futures_allocation_logit_scale", None)
+        if float(projected.get("futures_allocation_temperature", 1.0)) == 1.0:
+            projected.pop("futures_allocation_temperature", None)
+        if not bool(projected.get("futures_require_joint_context", False)):
+            projected.pop("futures_require_joint_context", None)
     return projected
 
 
@@ -521,6 +545,10 @@ def _training_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
         },
     }
     execution_mode = normalize_execution_mode(config.trading.execution_mode)
+    if execution_mode == "tw_index_futures_day":
+        contract["integer_gradient_contract_version"] = int(
+            TW_INDEX_FUTURES_TRAINING_GRADIENT_CONTRACT_VERSION
+        )
     if (
         execution_mode in TW_CARRYING_EXECUTION_MODES
         or execution_mode == "tw_day_trade"
@@ -737,6 +765,9 @@ def _trading_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
                 TW_INDEX_FUTURES_DAY_BACKTEST_CONTRACT_VERSION
             ),
             "data_path": str(trading.tw_index_futures_data_path),
+            "all_products_context_path": str(
+                trading.tw_index_futures_all_products_context_path
+            ),
             "reference_product": str(trading.tw_index_futures_reference_product),
             "initial_capital": float(trading.tw_index_futures_initial_capital),
             "max_abs_exposure": float(trading.tw_index_futures_max_abs_exposure),
@@ -754,6 +785,13 @@ def _trading_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
             ),
             "basket_fee_penalty": float(trading.tw_index_futures_basket_fee_penalty),
         }
+        afterhours_context_path = (
+            trading.tw_index_futures_all_products_afterhours_context_path
+        )
+        if afterhours_context_path is not None:
+            contract["taiwan_index_futures_day"][
+                "all_products_afterhours_context_path"
+            ] = str(afterhours_context_path)
     if execution_mode == "tw_futures_portfolio_day":
         from stockagent.data.tw_futures_portfolio_daily import (
             TAIFEX_FUTURES_PORTFOLIO_BACKTEST_CONTRACT_VERSION,
@@ -1271,6 +1309,34 @@ def _checkpoint_manifest(
                     ),
                 }
             )
+            if execution_mode == "tw_index_futures_day":
+                context_features = panel.index_futures_candidate_features
+                context_mask = panel.index_futures_candidate_mask
+                context_symbols = panel.index_futures_context_symbols
+                present = (
+                    context_features is not None,
+                    context_mask is not None,
+                    context_symbols is not None,
+                )
+                if any(present) and not all(present):
+                    raise ValueError(
+                        "tw_index_futures_day checkpoint manifest requires a "
+                        "complete ordered all-products futures context"
+                    )
+                if all(present):
+                    panel_arrays.update(
+                        {
+                            "index_futures_context_features": _array_content_fingerprint(
+                                context_features
+                            ),
+                            "index_futures_context_mask": _array_content_fingerprint(
+                                context_mask
+                            ),
+                            "index_futures_context_symbols": _array_content_fingerprint(
+                                np.asarray(context_symbols, dtype="U32")
+                            ),
+                        }
+                    )
             if execution_mode == "tw_index_derivatives_day":
                 option_chain = panel.index_options_chain_day_session
                 candidates = panel.index_derivatives_day_candidates

@@ -123,6 +123,71 @@ def _make_model(**overrides) -> TransformerBasePortfolioModel:
     return TransformerBasePortfolioModel(**params).to(_device())
 
 
+def test_single_key_self_attention_fast_path_preserves_output_and_optimizer_gradients() -> None:
+    """Singleton attention is value-only, including explicit zero Q/K grads."""
+
+    torch.manual_seed(29)
+    generic = FlashSDPAAttention(
+        dim=16,
+        num_heads=4,
+        dropout=0.0,
+        use_flash_attention=True,
+        qk_norm=True,
+        max_rope_steps=1,
+    ).train()
+    generic.single_key_value_fast_path = False
+    optimized = copy.deepcopy(generic)
+    optimized.single_key_value_fast_path = True
+    generic_input = torch.randn(7, 1, 16, requires_grad=True)
+    optimized_input = generic_input.detach().clone().requires_grad_(True)
+    rope_positions = torch.zeros(1)
+
+    generic_output = generic(generic_input, rope_positions=rope_positions)
+    optimized_output = optimized(optimized_input, rope_positions=rope_positions)
+    upstream = torch.randn_like(generic_output)
+    (generic_output * upstream).sum().backward()
+    (optimized_output * upstream).sum().backward()
+
+    torch.testing.assert_close(optimized_output, generic_output, atol=2e-7, rtol=1e-6)
+    torch.testing.assert_close(
+        optimized_input.grad, generic_input.grad, atol=2e-7, rtol=1e-6
+    )
+    for generic_parameter, optimized_parameter in zip(
+        generic.parameters(), optimized.parameters(), strict=True
+    ):
+        assert generic_parameter.grad is not None
+        assert optimized_parameter.grad is not None
+        torch.testing.assert_close(
+            optimized_parameter.grad,
+            generic_parameter.grad,
+            atol=1e-6,
+            rtol=1e-6,
+        )
+    assert optimized.in_proj.weight.grad is not None
+    assert torch.count_nonzero(optimized.in_proj.weight.grad[: 2 * optimized.dim]) == 0
+
+
+def test_daily_checkpoint_override_survives_minute_checkpoint_suppression(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = _make_model(checkpoint_blocks=True).train()
+    model.minute_checkpoint_blocks = False
+    calls: list[bool] = []
+
+    def fake_checkpoint(function, *args, **kwargs):
+        calls.append(bool(kwargs.get("use_reentrant") is False))
+        return function(*args)
+
+    monkeypatch.setattr(transformer_module, "activation_checkpoint", fake_checkpoint)
+    block = model.temporal_blocks[0]
+    value = torch.randn(2, 3, model.d_model, device=_device(), requires_grad=True)
+
+    model._run_block(block, value)
+    assert calls == []
+    model._run_block(block, value, checkpoint_blocks_override=True)
+    assert calls == [True]
+
+
 def test_legacy_dynamic_market_checkpoint_is_reconstructed_strictly() -> None:
     device = _device()
     source = _make_model(

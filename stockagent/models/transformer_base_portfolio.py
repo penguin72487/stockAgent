@@ -1285,6 +1285,11 @@ class FlashSDPAAttention(nn.Module):
         self.capture_max_elements = 2_000_000
         self.captured_attention: torch.Tensor | None = None
         self.captured_attention_shape: tuple[int, ...] | None = None
+        # A one-key, zero-dropout attention has softmax([x]) == [1]
+        # identically.  Keeping this as a runtime (non-state-dict) switch makes
+        # it possible for equivalence tests to compare the algebraic fast path
+        # with the generic SDPA implementation.
+        self.single_key_value_fast_path = True
 
     def _apply(self, fn, recurse: bool = True):
         module = super()._apply(fn, recurse=recurse)
@@ -1361,11 +1366,37 @@ class FlashSDPAAttention(nn.Module):
         key_rope_positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
         bsz, query_steps, _ = query.shape
+        key_steps = query_steps if context is None else int(context.size(1))
+        if (
+            bool(self.single_key_value_fast_path)
+            and context is None
+            and query_steps == 1
+            and key_steps == 1
+            and (not self.training or self.dropout_p == 0.0)
+            and key_mask is None
+            and not bool(self.capture_attention)
+        ):
+            # First principles: for one self-attention key, softmax has one
+            # element and is exactly one. Q/K, their normalization, RoPE, and
+            # SDPA cannot affect the result; only the V and output projections
+            # remain. Preserve a zero-valued autograd edge to the unused Q/K
+            # slices so AdamW/DDP see the same explicit zero gradients as the
+            # combined generic QKV projection rather than grad=None.
+            value_weight = self.in_proj.weight[2 * self.dim :]
+            value_bias = (
+                None
+                if self.in_proj.bias is None
+                else self.in_proj.bias[2 * self.dim :]
+            )
+            value = F.linear(query, value_weight, value_bias)
+            qk_zero = self.in_proj.weight[: 2 * self.dim].sum() * 0.0
+            if self.in_proj.bias is not None:
+                qk_zero = qk_zero + self.in_proj.bias[: 2 * self.dim].sum() * 0.0
+            value = value + qk_zero.to(dtype=value.dtype)
+            return self.out_proj(value)
         if context is None:
-            key_steps = query_steps
             q, k, v = self._project_self(query)
         else:
-            key_steps = int(context.size(1))
             q, k, v = self._project_cross(query, context)
         if rope_positions is not None and int(rope_positions.numel()) >= max(query_steps, key_steps):
             query_positions = rope_positions[:query_steps] if query_rope_positions is None else query_rope_positions
@@ -1692,6 +1723,11 @@ class TransformerBasePortfolioModel(nn.Module):
         self.center_long_short_logits = bool(center_long_short_logits)
         self.max_full_tokens = int(max_full_tokens)
         self.checkpoint_blocks = bool(checkpoint_blocks)
+        # Runtime executors may place a larger checkpoint around the intraday
+        # model path. Keep that optimization separate from checkpoint_blocks:
+        # FinancialTransformer's much larger daily-history encoder still needs
+        # its own block checkpoints even when the minute path does not.
+        self.minute_checkpoint_blocks = self.checkpoint_blocks
         self.return_aux = bool(return_aux)
         self.return_aux_details = bool(return_aux_details)
         self.runtime_shape_check = bool(runtime_shape_check)
@@ -2238,8 +2274,18 @@ class TransformerBasePortfolioModel(nn.Module):
                 module.captured_attention_shape = None
         return captures
 
-    def _run_block(self, block: TransformerPortfolioBlock, *args) -> torch.Tensor:
-        if self.checkpoint_blocks and self.training and torch.is_grad_enabled():
+    def _run_block(
+        self,
+        block: TransformerPortfolioBlock,
+        *args,
+        checkpoint_blocks_override: bool | None = None,
+    ) -> torch.Tensor:
+        checkpoint_blocks = (
+            bool(self.minute_checkpoint_blocks)
+            if checkpoint_blocks_override is None
+            else bool(checkpoint_blocks_override)
+        )
+        if checkpoint_blocks and self.training and torch.is_grad_enabled():
             return activation_checkpoint(block, *args, use_reentrant=False)
         return block(*args)
 

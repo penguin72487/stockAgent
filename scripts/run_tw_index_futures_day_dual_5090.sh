@@ -11,10 +11,12 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
 
 source scripts/runtime_env.sh
 run_fintech_python scripts/check_environment.py --require-cuda --strict
+if [[ ! -s data_tw_index_futures/all_products_day_session_front.parquet ]]; then
+  run_fintech_python scripts/build_tw_all_futures_day_context.py
+fi
 run_fintech_python train.py \
   --config configs/markets/tw_index_futures_day_dual_5090.yaml \
   --multi-gpu-strategy distributed_data_parallel \
   --cpu-threads 112 \
   --torch-compile-threads 16 \
   "$@"
-

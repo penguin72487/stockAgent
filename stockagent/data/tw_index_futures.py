@@ -28,6 +28,27 @@ import numpy as np
 
 TAIFEX_INDEX_FUTURES_PRODUCTS: Final[tuple[str, ...]] = ("TX", "MTX", "TMF")
 TAIFEX_INDEX_FUTURES_TENOR_SLOTS: Final[int] = 6
+TAIFEX_INDEX_FUTURES_ACTION_COUNT: Final[int] = (
+    len(TAIFEX_INDEX_FUTURES_PRODUCTS) * TAIFEX_INDEX_FUTURES_TENOR_SLOTS
+)
+TAIFEX_INDEX_FUTURES_CONTEXT_FEATURE_NAMES: Final[tuple[str, ...]] = (
+    "prior_log_open_close",
+    "prior_log_high_open",
+    "prior_log_low_open",
+    "prior_log_high_low",
+    "prior_close_location",
+    "prior_log_volume_scaled",
+    "prior_log_price_volume_scaled",
+    "prior_5d_mean_log_return",
+    "prior_5d_volatility",
+    "prior_20d_mean_log_return",
+    "prior_20d_volatility",
+    "contract_multiplier_scaled",
+    "relative_tenor_scaled",
+)
+TAIFEX_INDEX_FUTURES_CONTEXT_FEATURE_DIM: Final[int] = len(
+    TAIFEX_INDEX_FUTURES_CONTEXT_FEATURE_NAMES
+)
 TAIFEX_INDEX_FUTURES_MULTIPLIERS: Final[dict[str, int]] = {
     "TX": 200,
     "MTX": 50,
@@ -146,6 +167,60 @@ class TaiwanIndexFuturesDaySession:
             )
         return tuple(np.asarray(value) for value in values)  # type: ignore[arg-type,return-value]
 
+    def flattened_tenor_panel(self) -> tuple[np.ndarray, ...]:
+        """Return the E1..E6 panel in stable product-major action order.
+
+        The action axis is ``TX_E1..TX_E6, MTX_E1..MTX_E6,
+        TMF_E1..TMF_E6``.  Concrete contract months remain row metadata and
+        never become learned identities.
+        """
+
+        (
+            months,
+            opens,
+            highs,
+            lows,
+            closes,
+            volumes,
+            log_returns,
+            tradable,
+        ) = self.require_tenor_panel()
+        rows = int(self.dates.size)
+
+        def flatten(values: np.ndarray) -> np.ndarray:
+            if values.shape != (
+                rows,
+                TAIFEX_INDEX_FUTURES_TENOR_SLOTS,
+                len(self.products),
+            ):
+                raise ValueError(
+                    "TAIFEX tenor tensor must have shape [T,E,products]"
+                )
+            return np.transpose(values, (0, 2, 1)).reshape(
+                rows, TAIFEX_INDEX_FUTURES_ACTION_COUNT
+            )
+
+        flat_months = np.tile(months[:, None, :], (1, len(self.products), 1)).reshape(
+            rows, TAIFEX_INDEX_FUTURES_ACTION_COUNT
+        )
+        return (
+            flat_months,
+            flatten(opens),
+            flatten(highs),
+            flatten(lows),
+            flatten(closes),
+            flatten(volumes),
+            flatten(log_returns),
+            flatten(tradable),
+        )
+
+    def tenor_action_symbols(self) -> tuple[str, ...]:
+        return tuple(
+            f"{product}_E{tenor + 1}"
+            for product in self.products
+            for tenor in range(TAIFEX_INDEX_FUTURES_TENOR_SLOTS)
+        )
+
     def product_index(self, product: str) -> int:
         normalized = normalize_taifex_index_futures_product(product)
         try:
@@ -195,6 +270,126 @@ class TaiwanIndexFuturesDaySession:
                 "it with futures data contract v2"
             )
         return self.front_month_roll_mask[:, self.product_index(product)]
+
+
+def build_causal_taifex_futures_model_context(
+    market: TaiwanIndexFuturesDaySession,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build prior-session-only model tokens for every product/tenor slot.
+
+    Row ``t`` is computed exclusively from completed rows through ``t-1``.
+    The returned mask is therefore an information-availability mask, not the
+    current session's executor mask.  Current opens, closes, and volumes never
+    enter the model context.
+    """
+
+    (
+        _months,
+        opens,
+        highs,
+        lows,
+        closes,
+        volumes,
+        log_returns,
+        tradable,
+    ) = market.flattened_tenor_panel()
+    rows, actions = opens.shape
+    if actions != TAIFEX_INDEX_FUTURES_ACTION_COUNT:
+        raise ValueError("flattened TAIFEX action width mismatch")
+
+    valid = (
+        np.asarray(tradable, dtype=bool)
+        & np.isfinite(opens)
+        & (opens > 0.0)
+        & np.isfinite(highs)
+        & (highs > 0.0)
+        & np.isfinite(lows)
+        & (lows > 0.0)
+        & np.isfinite(closes)
+        & (closes > 0.0)
+        & (np.asarray(volumes) > 0)
+    )
+    safe_open = np.where(valid, opens, 1.0)
+    safe_high = np.where(valid, highs, safe_open)
+    safe_low = np.where(valid, lows, safe_open)
+    safe_close = np.where(valid, closes, safe_open)
+    safe_volume = np.where(valid, volumes, 0.0).astype(np.float64, copy=False)
+    clean_returns = np.where(valid, log_returns, 0.0)
+    price_range = np.maximum(safe_high - safe_low, 0.0)
+    close_location = np.where(
+        price_range > 0.0,
+        2.0 * (safe_close - safe_low) / np.maximum(price_range, 1e-12) - 1.0,
+        0.0,
+    )
+
+    multipliers = np.repeat(
+        np.asarray(market.multipliers, dtype=np.float64),
+        TAIFEX_INDEX_FUTURES_TENOR_SLOTS,
+    )
+    tenor_scaled = np.tile(
+        np.linspace(0.0, 1.0, TAIFEX_INDEX_FUTURES_TENOR_SLOTS),
+        len(market.products),
+    )
+
+    def rolling_moments(window: int) -> tuple[np.ndarray, np.ndarray]:
+        means = np.zeros_like(clean_returns, dtype=np.float64)
+        vols = np.zeros_like(clean_returns, dtype=np.float64)
+        for end in range(rows):
+            start = max(0, end - window + 1)
+            values = clean_returns[start : end + 1]
+            masks = valid[start : end + 1]
+            counts = masks.sum(axis=0)
+            sums = values.sum(axis=0)
+            mean = np.divide(
+                sums,
+                counts,
+                out=np.zeros(actions, dtype=np.float64),
+                where=counts > 0,
+            )
+            centered = np.where(masks, values - mean[None, :], 0.0)
+            variance = np.divide(
+                np.square(centered).sum(axis=0),
+                counts,
+                out=np.zeros(actions, dtype=np.float64),
+                where=counts > 0,
+            )
+            means[end] = mean
+            vols[end] = np.sqrt(np.maximum(variance, 0.0))
+        return means, vols
+
+    mean_5, vol_5 = rolling_moments(5)
+    mean_20, vol_20 = rolling_moments(20)
+    price_volume = safe_open * safe_volume
+    raw = np.stack(
+        (
+            clean_returns,
+            np.log(safe_high / safe_open),
+            np.log(safe_low / safe_open),
+            np.log(safe_high / safe_low),
+            close_location,
+            np.log1p(safe_volume) / 20.0,
+            np.log1p(price_volume) / 30.0,
+            mean_5,
+            vol_5,
+            mean_20,
+            vol_20,
+            np.broadcast_to(
+                np.log(multipliers) / math.log(200.0),
+                (rows, actions),
+            ),
+            np.broadcast_to(tenor_scaled, (rows, actions)),
+        ),
+        axis=-1,
+    )
+    raw = np.where(valid[..., None], raw, 0.0)
+    context = np.zeros_like(raw, dtype=np.float32)
+    context_mask = np.zeros_like(valid, dtype=bool)
+    if rows > 1:
+        context[1:] = raw[:-1].astype(np.float32, copy=False)
+        context_mask[1:] = valid[:-1]
+    if not bool(np.isfinite(context).all()):
+        raise ValueError("causal TAIFEX futures context contains non-finite values")
+    return context, context_mask
 
 
 @dataclass(frozen=True, slots=True)
@@ -1144,10 +1339,14 @@ __all__ = [
     "TAIFEX_DAY_SESSION_LABEL",
     "TAIFEX_DAY_SESSION_ALIASES",
     "TAIFEX_FUTURES_DATA_CONTRACT_VERSION",
+    "TAIFEX_INDEX_FUTURES_ACTION_COUNT",
+    "TAIFEX_INDEX_FUTURES_CONTEXT_FEATURE_DIM",
+    "TAIFEX_INDEX_FUTURES_CONTEXT_FEATURE_NAMES",
     "TAIFEX_INDEX_FUTURES_MULTIPLIERS",
     "TAIFEX_INDEX_FUTURES_PRODUCTS",
     "TAIFEX_INDEX_FUTURES_TENOR_SLOTS",
     "TaiwanIndexFuturesDaySession",
+    "build_causal_taifex_futures_model_context",
     "build_taifex_all_futures_daily_sessions",
     "build_taifex_index_futures_day_session",
     "iter_taifex_daily_csv_streams",

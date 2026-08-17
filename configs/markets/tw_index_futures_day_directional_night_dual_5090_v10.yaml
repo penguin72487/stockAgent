@@ -1,0 +1,9 @@
+# v10 keeps the v9 data/model design but starts a fresh optimizer trajectory
+# after repairing the exact-integer loss derivative at zero exposure.
+base_config: tw_index_futures_day_directional_night_dual_5090.yaml
+
+experiment_name: tw-stock-futures-directional-night-dual-5090-100m-power2-v10
+
+runner:
+  output_dir: artifacts/markets/tw_index_futures_day_directional_night_dual_5090_100m_power2_v10
+  resume: true

@@ -329,6 +329,10 @@ class PanelData:
     # Optional per-session/per-symbol legal or broker margin ratio.  Historical
     # sources in this module do not guess it; unknown values remain NaN/None.
     short_margin_rate: np.ndarray | None = None
+    # Executor-only compressed minute events [T,S,C] for a daily policy.  They
+    # are attached by train.py after panel-cache loading and never enter model
+    # features or the ordinary panel cache.
+    day_trade_minute_execution: np.ndarray | None = None
     # Exact logical-array hashes supplied only by an immutable panel-cache
     # generation. Synthetic or caller-mutated panels leave this unset and are
     # hashed directly by checkpoint construction.
@@ -337,6 +341,13 @@ class PanelData:
     # the stock panel has been built/cached and are never model input features.
     index_futures_day_session: Any | None = None
     index_futures_reference_product: str | None = None
+    # Prior-session-only TX/MTX/TMF x E1..E6 model tokens and current-session
+    # executor outcomes.  The former may enter the model; the latter are
+    # labels/execution facts and must never be concatenated to stock features.
+    index_futures_candidate_features: np.ndarray | None = None
+    index_futures_candidate_mask: np.ndarray | None = None
+    index_futures_context_symbols: tuple[str, ...] | None = None
+    index_futures_execution_returns: np.ndarray | None = None
     index_options_monthly_day_session: Any | None = None
     index_options_weekly_day_session: Any | None = None
     index_options_chain_day_session: Any | None = None

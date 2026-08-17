@@ -121,7 +121,7 @@ _EXECUTION_MODE_ALIASES: Final[dict[str, str]] = {
     "minute_day_trade": "tw_minute",
     "一分鐘當沖": "tw_minute",
     "分鐘當沖": "tw_minute",
-    # One signed TAIEX exposure, executed with a same-day TX/MTX/TMF basket.
+    # All-root futures context with 18 direct TX/MTX/TMF E1..E6 actions.
     "tw_index_futures_day": "tw_index_futures_day",
     "tw_index_future_day": "tw_index_futures_day",
     "tw_futures_day": "tw_index_futures_day",

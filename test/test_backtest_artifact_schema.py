@@ -17,6 +17,7 @@ from stockagent.training.trainer import (
     _load_backtest_artifact,
     _prefix_backtest_result,
     _save_backtest_artifact,
+    _save_deployment_test_artifacts,
     _save_fold_output_artifacts,
     _save_settlement_audit_artifacts,
     _slice_backtest_rows,
@@ -97,6 +98,22 @@ def _continuous_result() -> BacktestResult:
         final_receivables=np.asarray([0.0, 0.0], dtype=np.float32),
         final_alive=np.asarray(True, dtype=np.bool_),
         final_equity_scale=np.asarray(np.exp(0.01), dtype=np.float32),
+    )
+
+
+def _index_futures_result() -> BacktestResult:
+    return BacktestResult(
+        strategy_returns=np.asarray([0.01, -0.02], dtype=np.float32),
+        benchmark_returns=np.asarray([0.005, -0.01], dtype=np.float32),
+        turnovers=np.asarray([0.8, 0.6], dtype=np.float32),
+        weights_history=np.zeros((2, 2), dtype=np.float32),
+        execution_mode="tw_index_futures_day",
+        settlement_ledger_unit="none",
+        requested_weights_history=np.zeros((2, 18), dtype=np.float32),
+        equity_scale_history=np.asarray([1.01, 0.9898], dtype=np.float32),
+        final_weights=np.zeros(2, dtype=np.float32),
+        final_alive=np.asarray(True, dtype=np.bool_),
+        final_equity_scale=np.asarray(0.9898, dtype=np.float32),
     )
 
 
@@ -532,6 +549,106 @@ def test_integer_backtest_npz_round_trip_preserves_precision_units_and_terminal_
         np.testing.assert_array_equal(
             archive["integer_state_last_weights"], result.final_weights
         )
+
+
+def test_index_futures_round_trip_preserves_equity_scale_without_stock_ledger(
+    tmp_path: Path,
+) -> None:
+    result = _index_futures_result()
+    dates = np.asarray(["2026-01-02", "2026-01-05"], dtype="datetime64[D]")
+    path = tmp_path / "index-futures.npz"
+
+    _save_backtest_artifact(path, result, dates)
+    loaded, loaded_dates = _load_backtest_artifact(path)
+
+    assert loaded.execution_mode == "tw_index_futures_day"
+    assert loaded.settlement_ledger_unit is None
+    np.testing.assert_array_equal(loaded_dates, dates)
+    np.testing.assert_array_equal(
+        loaded.equity_scale_history, result.equity_scale_history
+    )
+    np.testing.assert_array_equal(
+        loaded.final_equity_scale, result.final_equity_scale
+    )
+
+
+def test_index_futures_prefix_reconstructs_daily_flat_terminal_state(
+    tmp_path: Path,
+) -> None:
+    result = _index_futures_result()
+    prefix = _prefix_backtest_result(result, 1)
+
+    np.testing.assert_array_equal(
+        prefix.equity_scale_history,
+        np.asarray([1.01], dtype=np.float32),
+    )
+    np.testing.assert_array_equal(
+        prefix.final_equity_scale,
+        np.asarray(1.01, dtype=np.float32),
+    )
+    np.testing.assert_array_equal(
+        prefix.final_alive,
+        np.asarray(True, dtype=np.bool_),
+    )
+    np.testing.assert_array_equal(
+        prefix.final_weights,
+        np.zeros(2, dtype=np.float32),
+    )
+    assert not np.shares_memory(prefix.final_weights, result.final_weights)
+
+    path = tmp_path / "index-futures-prefix.npz"
+    dates = np.asarray(["2026-01-02"], dtype="datetime64[D]")
+    _save_backtest_artifact(path, prefix, dates)
+    loaded, loaded_dates = _load_backtest_artifact(path)
+
+    np.testing.assert_array_equal(loaded_dates, dates)
+    np.testing.assert_array_equal(
+        loaded.final_equity_scale,
+        prefix.final_equity_scale,
+    )
+    np.testing.assert_array_equal(loaded.final_alive, prefix.final_alive)
+    np.testing.assert_array_equal(loaded.final_weights, prefix.final_weights)
+
+
+def test_index_futures_nonterminal_stitched_slice_has_exact_terminal_state(
+    tmp_path: Path,
+) -> None:
+    result = _index_futures_result()
+    segment = _slice_backtest_rows(
+        result,
+        0,
+        1,
+        preserve_terminal_state=False,
+    )
+
+    np.testing.assert_array_equal(
+        segment.final_equity_scale,
+        np.asarray(1.01, dtype=np.float32),
+    )
+    np.testing.assert_array_equal(
+        segment.final_alive,
+        np.asarray(True, dtype=np.bool_),
+    )
+    np.testing.assert_array_equal(
+        segment.final_weights,
+        np.zeros(2, dtype=np.float32),
+    )
+
+    dates = np.asarray(["2026-01-02"], dtype="datetime64[D]")
+    _save_deployment_test_artifacts(
+        tmp_path,
+        segment,
+        dates,
+        symbols=["A", "B"],
+    )
+    loaded, loaded_dates = _load_backtest_artifact(
+        tmp_path / "deployment_test_backtest.npz"
+    )
+    np.testing.assert_array_equal(loaded_dates, dates)
+    np.testing.assert_array_equal(
+        loaded.final_equity_scale,
+        segment.final_equity_scale,
+    )
 
 
 def test_schema_six_continuous_commission_rebate_round_trip(
