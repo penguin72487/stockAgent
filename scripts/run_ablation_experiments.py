@@ -2,16 +2,18 @@ from __future__ import annotations
 
 import argparse
 import csv
+from dataclasses import dataclass
 import json
 import os
 import re
+import signal
 import shlex
 import subprocess
 import sys
 import time
 from copy import deepcopy
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 import yaml
 
@@ -20,6 +22,191 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_SPEC = REPO_ROOT / "configs/ablations/transformer_base_portfolio.yaml"
 DEFAULT_RUNNER = REPO_ROOT / "coda_runner.sh"
 _SAFE_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+
+
+@dataclass
+class _ActiveRun:
+    order: int
+    run: dict[str, Any]
+    command: list[str]
+    process: subprocess.Popen
+    started: float
+    log_handle: TextIO | None
+    log_path: Path | None
+    log_start_offset: int
+    attempt: int
+    consecutive_no_progress_failures: int
+    progress_before: tuple[int, int, int]
+
+
+def _per_job_thread_budget(total: object | None, parallel_jobs: int) -> int | None:
+    """Split a host-wide thread budget without producing zero-thread jobs."""
+
+    if total is None:
+        return None
+    resolved = int(total)
+    if resolved <= 0:
+        raise ValueError("ablation thread budgets must be positive")
+    return max(1, resolved // max(1, int(parallel_jobs)))
+
+
+def _effective_parallel_jobs(requested: int, multi_gpu_strategy: object) -> int:
+    """Respect the GPU ownership contract of an independent training job.
+
+    A DDP experiment already owns every visible GPU. Launching N such jobs does
+    not create N times more GPU capacity; it places N ranks on each GPU and can
+    OOM during the compile probe. Until the scheduler assigns disjoint device
+    sets, all-visible-GPU DDP jobs must run one at a time.
+    """
+
+    resolved = int(requested)
+    if resolved <= 0:
+        raise ValueError("parallel_jobs must be positive")
+    strategy = str(multi_gpu_strategy or "").strip().lower().replace("-", "_")
+    if strategy in {
+        "ddp",
+        "distributed",
+        "torch_ddp",
+        "distributed_data_parallel",
+    }:
+        return 1
+    return resolved
+
+
+def _latest_jsonl_epoch(path: Path) -> int:
+    if not path.is_file():
+        return 0
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return 0
+    for line in reversed(lines):
+        if not line.strip():
+            continue
+        try:
+            payload = json.loads(line)
+            return max(0, int(payload.get("epoch", 0)))
+        except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+    return 0
+
+
+def _run_progress_signature(output_dir: Path) -> tuple[int, int, int]:
+    """Cheap durable-work signature used to distinguish progress from loops."""
+
+    complete_folds = sum(
+        path.is_file() for path in output_dir.glob("fold_*/fold_complete.json")
+    )
+    epoch_sum = sum(
+        _latest_jsonl_epoch(path)
+        for path in output_dir.glob("train_*/epoch_curve.jsonl")
+    )
+    checkpoint_mtime_ns = 0
+    for path in output_dir.glob("train_*/checkpoint_last.pt"):
+        try:
+            checkpoint_mtime_ns = max(checkpoint_mtime_ns, path.stat().st_mtime_ns)
+        except OSError:
+            continue
+    return int(complete_folds), int(epoch_sum), int(checkpoint_mtime_ns)
+
+
+def _attempt_log_text(job: _ActiveRun) -> str:
+    if job.log_path is None or not job.log_path.is_file():
+        return ""
+    try:
+        with job.log_path.open("rb") as handle:
+            handle.seek(max(0, int(job.log_start_offset)))
+            return handle.read().decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def _failure_kind(returncode: int, log_text: str) -> str:
+    lowered = log_text.lower()
+    if "outofmemoryerror" in lowered or "cuda out of memory" in lowered:
+        return "cuda_oom"
+    if "childfailederror" in lowered:
+        return "distributed_worker_failure"
+    if returncode < 0 or returncode in {
+        128 + signal.SIGINT,
+        128 + signal.SIGTERM,
+        128 + signal.SIGKILL,
+    }:
+        return "signal_termination"
+    return "worker_failure"
+
+
+def _descendant_process_ids(root_pid: int) -> list[int]:
+    """Snapshot descendants without adding a psutil runtime dependency."""
+
+    try:
+        result = subprocess.run(
+            ["ps", "-e", "-o", "pid=,ppid="],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    children: dict[int, list[int]] = {}
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if len(fields) != 2:
+            continue
+        try:
+            pid, parent = (int(field) for field in fields)
+        except ValueError:
+            continue
+        children.setdefault(parent, []).append(pid)
+    descendants: list[int] = []
+    frontier = list(children.get(int(root_pid), ()))
+    while frontier:
+        pid = frontier.pop()
+        descendants.append(pid)
+        frontier.extend(children.get(pid, ()))
+    return descendants
+
+
+def _pid_is_live(pid: int) -> bool:
+    try:
+        state = Path(f"/proc/{int(pid)}/stat").read_text(encoding="utf-8").split()[2]
+    except (OSError, IndexError):
+        return False
+    return state != "Z"
+
+
+def _terminate_process_tree(
+    process: subprocess.Popen,
+    *,
+    grace_s: float = 10.0,
+) -> None:
+    """Stop a runner plus torchrun ranks that may create their own groups."""
+
+    known = {int(process.pid), *_descendant_process_ids(int(process.pid))}
+    for sig, timeout in (
+        (signal.SIGINT, grace_s),
+        (signal.SIGTERM, grace_s),
+        (signal.SIGKILL, 2.0),
+    ):
+        known.update(_descendant_process_ids(int(process.pid)))
+        for pid in sorted(known, reverse=True):
+            if not _pid_is_live(pid):
+                continue
+            try:
+                os.kill(pid, sig)
+            except ProcessLookupError:
+                pass
+        try:
+            os.killpg(int(process.pid), sig)
+        except ProcessLookupError:
+            pass
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if not any(_pid_is_live(pid) for pid in known):
+                process.poll()
+                return
+            time.sleep(0.1)
+    process.poll()
 
 
 def _load_yaml(path: Path) -> dict[str, Any]:
@@ -327,10 +514,44 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Host-wide Inductor worker budget; defaults to spec.runtime.torch_compile_threads.",
     )
+    parser.add_argument(
+        "--parallel-jobs",
+        type=int,
+        default=None,
+        help=(
+            "Concurrent independent experiments. Each job keeps its configured "
+            "single-device/DDP semantics; host-wide CPU budgets are divided "
+            "across jobs. Defaults to spec.runtime.parallel_jobs or 1."
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--collect-only", action="store_true")
     parser.add_argument("--force", action="store_true", help="Run even when all requested fold markers exist.")
     parser.add_argument("--stop-on-fail", action="store_true")
+    parser.add_argument(
+        "--auto-resume",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Automatically requeue failed experiments from their durable "
+            "fold/epoch checkpoints (default: enabled)."
+        ),
+    )
+    parser.add_argument(
+        "--max-no-progress-retries",
+        type=int,
+        default=3,
+        help=(
+            "Maximum consecutive retries that produce no new fold, epoch, or "
+            "checkpoint progress. Progress resets this counter."
+        ),
+    )
+    parser.add_argument(
+        "--retry-backoff-seconds",
+        type=float,
+        default=5.0,
+        help="Initial automatic-resume backoff; consecutive delays are exponential.",
+    )
     return parser.parse_args()
 
 
@@ -362,6 +583,21 @@ def main() -> None:
         if args.torch_compile_threads is not None
         else runtime.get("torch_compile_threads")
     )
+    requested_parallel_jobs = int(
+        args.parallel_jobs
+        if args.parallel_jobs is not None
+        else runtime.get("parallel_jobs", 1)
+    )
+    parallel_jobs = _effective_parallel_jobs(
+        requested_parallel_jobs,
+        args.multi_gpu_strategy,
+    )
+    if args.max_no_progress_retries < 0:
+        raise ValueError("max_no_progress_retries must be non-negative")
+    if args.retry_backoff_seconds < 0:
+        raise ValueError("retry_backoff_seconds must be non-negative")
+    job_cpu_threads = _per_job_thread_budget(cpu_threads, parallel_jobs)
+    job_compile_threads = _per_job_thread_budget(compile_threads, parallel_jobs)
     expected_fold_count_raw = spec.get("expected_fold_count")
     expected_fold_count = (
         None if expected_fold_count_raw is None else int(expected_fold_count_raw)
@@ -369,11 +605,78 @@ def main() -> None:
     if expected_fold_count is not None and expected_fold_count <= 0:
         raise ValueError("ablation spec expected_fold_count must be positive")
 
-    summary_rows: list[dict[str, Any]] = []
+    summary_by_order: dict[int, dict[str, Any]] = {}
     total_runs = len(runs)
-    _print_progress(0, total_runs, "ready")
+    _print_progress(
+        0,
+        total_runs,
+        f"ready parallel_jobs={parallel_jobs} "
+        f"requested_parallel_jobs={requested_parallel_jobs} "
+        f"cpu_threads/job={job_cpu_threads or 'config'} "
+        f"compile_threads/job={job_compile_threads or 'config'}",
+    )
+    if parallel_jobs != requested_parallel_jobs:
+        print(
+            "[scheduler] capped independent experiment concurrency from "
+            f"{requested_parallel_jobs} to {parallel_jobs}: "
+            "distributed_data_parallel already owns every visible GPU",
+            flush=True,
+        )
+
+    def write_current_summary() -> None:
+        _write_summary(
+            output_root,
+            [summary_by_order[index] for index in sorted(summary_by_order)],
+        )
+
+    def record_result(
+        *,
+        order: int,
+        run: dict[str, Any],
+        status: str,
+        returncode: int | None,
+        elapsed_s: float,
+        attempts: int = 0,
+        failure_kind: str | None = None,
+        consecutive_no_progress_failures: int = 0,
+    ) -> None:
+        complete_after, requested_after = _fold_status(
+            run["output_dir"],
+            args.start_fold,
+            args.max_folds,
+            expected_fold_count,
+        )
+        summary_by_order[order] = {
+            "name": run["name"],
+            "description": run["description"],
+            "status": status,
+            "returncode": returncode,
+            "elapsed_s": elapsed_s,
+            "attempts": int(attempts),
+            "failure_kind": failure_kind,
+            "consecutive_no_progress_failures": int(
+                consecutive_no_progress_failures
+            ),
+            "folds_complete": complete_after,
+            "folds_requested": requested_after,
+            "output_dir": str(run["output_dir"]),
+            "source_config_path": str(run["source_config_path"]),
+            "config_path": str(run["config_path"]),
+            **_collect_metrics(run["output_dir"]),
+        }
+        write_current_summary()
+        _print_progress(
+            len(summary_by_order), total_runs, f"{run['name']}: {status}"
+        )
+        print(
+            f"[{run['name']}] {status} "
+            f"folds={_format_fold_status(complete_after, requested_after)} "
+            f"elapsed={elapsed_s:.1f}s",
+            flush=True,
+        )
+
+    pending: list[dict[str, Any]] = []
     for run_index, run in enumerate(runs, start=1):
-        _print_progress(run_index - 1, total_runs, f"starting {run['name']}")
         command = [str(args.runner.resolve()), "-c", str(run["config_path"]), "--"]
         for flag, value in (
             ("--start-fold", args.start_fold),
@@ -381,8 +684,8 @@ def main() -> None:
             ("--epochs", args.epochs),
             ("--seed", args.seed),
             ("--multi-gpu-strategy", args.multi_gpu_strategy),
-            ("--cpu-threads", cpu_threads),
-            ("--torch-compile-threads", compile_threads),
+            ("--cpu-threads", job_cpu_threads),
+            ("--torch-compile-threads", job_compile_threads),
         ):
             if value is not None:
                 command.extend([flag, str(value)])
@@ -398,63 +701,260 @@ def main() -> None:
             and requested > 0
             and complete_before == requested
         )
-        returncode: int | None = None
-        elapsed_s = 0.0
-        status = "complete" if already_complete else "pending"
         if args.dry_run:
             print(shlex.join(command))
-            status = "dry_run"
+            continue
         elif args.collect_only:
-            status = "complete" if already_complete else "collected"
+            record_result(
+                order=run_index,
+                run=run,
+                status="complete" if already_complete else "collected",
+                returncode=None,
+                elapsed_s=0.0,
+            )
         elif already_complete and not args.force:
             print(f"[{run['name']}] skip: requested folds already complete", flush=True)
+            record_result(
+                order=run_index,
+                run=run,
+                status="complete",
+                returncode=None,
+                elapsed_s=0.0,
+            )
         else:
-            print(f"[{run['name']}] running: {shlex.join(command)}", flush=True)
-            started = time.perf_counter()
-            env = os.environ.copy()
-            env.setdefault("PYTHONUNBUFFERED", "1")
-            try:
-                result = subprocess.run(command, cwd=REPO_ROOT, env=env)
-                returncode = int(result.returncode)
-            except KeyboardInterrupt:
-                returncode = 130
-                raise
-            finally:
-                elapsed_s = time.perf_counter() - started
-            status = "succeeded" if returncode == 0 else "failed"
+            pending.append(
+                {
+                    "order": run_index,
+                    "run": run,
+                    "command": command,
+                    "attempt": 1,
+                    "consecutive_no_progress_failures": 0,
+                    "ready_at": 0.0,
+                }
+            )
 
-        complete_after, requested_after = _fold_status(
-            run["output_dir"],
-            args.start_fold,
-            args.max_folds,
-            expected_fold_count,
-        )
-        row = {
-            "name": run["name"],
-            "description": run["description"],
-            "status": status,
-            "returncode": returncode,
-            "elapsed_s": elapsed_s,
-            "folds_complete": complete_after,
-            "folds_requested": requested_after,
-            "output_dir": str(run["output_dir"]),
-            "source_config_path": str(run["source_config_path"]),
-            "config_path": str(run["config_path"]),
-            **_collect_metrics(run["output_dir"]),
-        }
-        summary_rows.append(row)
-        _write_summary(output_root, summary_rows)
-        _print_progress(run_index, total_runs, f"{run['name']}: {status}")
+    if args.dry_run:
+        _print_progress(total_runs, total_runs, "dry-run configs validated")
+        return
+
+    active: dict[int, _ActiveRun] = {}
+    first_failure: int | None = None
+    try:
+        while pending or active:
+            while pending and len(active) < parallel_jobs and first_failure is None:
+                now = time.monotonic()
+                ready_index = next(
+                    (
+                        index
+                        for index, candidate in enumerate(pending)
+                        if float(candidate.get("ready_at", 0.0)) <= now
+                    ),
+                    None,
+                )
+                if ready_index is None:
+                    break
+                item = pending.pop(ready_index)
+                run = item["run"]
+                command = item["command"]
+                attempt = int(item.get("attempt", 1))
+                env = os.environ.copy()
+                env.setdefault("PYTHONUNBUFFERED", "1")
+                log_handle: TextIO | None = None
+                stdout = None
+                worker_log: Path | None = None
+                log_start_offset = 0
+                if parallel_jobs > 1 or bool(args.auto_resume):
+                    worker_log = run["output_dir"] / "ablation_worker.log"
+                    worker_log.parent.mkdir(parents=True, exist_ok=True)
+                    try:
+                        log_start_offset = worker_log.stat().st_size
+                    except OSError:
+                        log_start_offset = 0
+                    log_handle = worker_log.open(
+                        "a", encoding="utf-8", buffering=1
+                    )
+                    log_handle.write(
+                        f"\n[ablation worker] attempt={attempt} "
+                        f"command={shlex.join(command)}\n"
+                    )
+                    stdout = log_handle
+                print(
+                    f"[{run['name']}] running attempt={attempt}: "
+                    f"{shlex.join(command)}"
+                    + (
+                        f" (log={run['output_dir'] / 'ablation_worker.log'})"
+                        if worker_log is not None
+                        else ""
+                    ),
+                    flush=True,
+                )
+                try:
+                    process = subprocess.Popen(
+                        command,
+                        cwd=REPO_ROOT,
+                        env=env,
+                        stdout=stdout,
+                        stderr=(
+                            subprocess.STDOUT if log_handle is not None else None
+                        ),
+                        start_new_session=True,
+                        text=True,
+                    )
+                except OSError:
+                    if log_handle is not None:
+                        log_handle.close()
+                    record_result(
+                        order=item["order"],
+                        run=run,
+                        status="failed_to_launch",
+                        returncode=127,
+                        elapsed_s=0.0,
+                    )
+                    if args.stop_on_fail:
+                        first_failure = 127
+                    continue
+                active[int(process.pid)] = _ActiveRun(
+                    order=item["order"],
+                    run=run,
+                    command=command,
+                    process=process,
+                    started=time.perf_counter(),
+                    log_handle=log_handle,
+                    log_path=worker_log,
+                    log_start_offset=log_start_offset,
+                    attempt=attempt,
+                    consecutive_no_progress_failures=int(
+                        item.get("consecutive_no_progress_failures", 0)
+                    ),
+                    progress_before=_run_progress_signature(run["output_dir"]),
+                )
+
+            finished = [
+                pid
+                for pid, job in active.items()
+                if job.process.poll() is not None
+            ]
+            if not finished:
+                if active:
+                    time.sleep(0.25)
+                    continue
+                if pending:
+                    next_ready = min(
+                        float(item.get("ready_at", 0.0)) for item in pending
+                    )
+                    delay = max(0.01, min(0.25, next_ready - time.monotonic()))
+                    time.sleep(delay)
+                    continue
+                break
+            for pid in finished:
+                job = active.pop(pid)
+                returncode = int(job.process.returncode or 0)
+                elapsed_s = time.perf_counter() - job.started
+                if job.log_handle is not None:
+                    job.log_handle.close()
+                failure_kind: str | None = None
+                no_progress_failures = job.consecutive_no_progress_failures
+                if returncode != 0:
+                    failure_kind = _failure_kind(
+                        returncode,
+                        _attempt_log_text(job),
+                    )
+                    progress_after = _run_progress_signature(job.run["output_dir"])
+                    made_progress = progress_after > job.progress_before
+                    no_progress_failures = (
+                        0
+                        if made_progress
+                        else job.consecutive_no_progress_failures + 1
+                    )
+                    retry_allowed = bool(args.auto_resume) and (
+                        made_progress
+                        or no_progress_failures <= args.max_no_progress_retries
+                    )
+                    if retry_allowed:
+                        exponent = max(0, no_progress_failures - 1)
+                        retry_delay = min(
+                            300.0,
+                            float(args.retry_backoff_seconds) * (2**exponent),
+                        )
+                        pending.append(
+                            {
+                                "order": job.order,
+                                "run": job.run,
+                                "command": job.command,
+                                "attempt": job.attempt + 1,
+                                "consecutive_no_progress_failures": (
+                                    no_progress_failures
+                                ),
+                                "ready_at": time.monotonic() + retry_delay,
+                            }
+                        )
+                        complete_after, requested_after = _fold_status(
+                            job.run["output_dir"],
+                            args.start_fold,
+                            args.max_folds,
+                            expected_fold_count,
+                        )
+                        print(
+                            f"[{job.run['name']}] auto-resume queued "
+                            f"attempt={job.attempt + 1} kind={failure_kind} "
+                            f"progress={'yes' if made_progress else 'no'} "
+                            f"no_progress_failures={no_progress_failures}/"
+                            f"{args.max_no_progress_retries} "
+                            f"folds={_format_fold_status(complete_after, requested_after)} "
+                            f"backoff={retry_delay:.1f}s",
+                            flush=True,
+                        )
+                        continue
+                record_result(
+                    order=job.order,
+                    run=job.run,
+                    status="succeeded" if returncode == 0 else "failed",
+                    returncode=returncode,
+                    elapsed_s=elapsed_s,
+                    attempts=job.attempt,
+                    failure_kind=failure_kind,
+                    consecutive_no_progress_failures=no_progress_failures,
+                )
+                if returncode != 0 and args.stop_on_fail and first_failure is None:
+                    first_failure = returncode
+
+            if first_failure is not None:
+                for job in list(active.values()):
+                    print(
+                        f"[{job.run['name']}] stopping after peer failure",
+                        flush=True,
+                    )
+                    _terminate_process_tree(job.process)
+                    returncode = job.process.poll()
+                    if returncode is None:
+                        returncode = job.process.wait()
+                    if job.log_handle is not None:
+                        job.log_handle.close()
+                    record_result(
+                        order=job.order,
+                        run=job.run,
+                        status="cancelled_after_peer_failure",
+                        returncode=int(returncode),
+                        elapsed_s=time.perf_counter() - job.started,
+                    )
+                active.clear()
+                break
+    except KeyboardInterrupt:
         print(
-            f"[{run['name']}] {status} "
-            f"folds={_format_fold_status(complete_after, requested_after)} "
-            f"elapsed={elapsed_s:.1f}s",
+            "\n[ablation] interrupt received; stopping every runner and "
+            "torchrun descendant...",
             flush=True,
         )
-        if returncode not in (None, 0) and args.stop_on_fail:
-            raise SystemExit(returncode)
+        for job in list(active.values()):
+            _terminate_process_tree(job.process)
+            if job.log_handle is not None:
+                job.log_handle.close()
+        raise SystemExit(130)
 
-    _write_summary(output_root, summary_rows)
+    write_current_summary()
+    if first_failure is not None:
+        raise SystemExit(first_failure)
+    summary_rows = [summary_by_order[index] for index in sorted(summary_by_order)]
     if any(row["returncode"] not in (None, 0) for row in summary_rows):
         raise SystemExit(1)
 

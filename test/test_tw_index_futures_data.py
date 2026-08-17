@@ -13,6 +13,12 @@ from stockagent.data.tw_index_futures import (
     build_taifex_index_futures_day_session,
     load_taifex_index_futures_day_session,
 )
+from stockagent.data.tw_all_futures import (
+    build_taifex_all_futures_front_panel,
+    build_taifex_all_futures_front_panels,
+    load_taifex_all_futures_afterhours_context,
+    load_taifex_all_futures_front_context,
+)
 
 
 _HEADER = [
@@ -230,6 +236,93 @@ def test_overlapping_sources_must_agree(tmp_path: Path) -> None:
             [first, second],
             tmp_path / "normalized.parquet",
         )
+
+
+def test_all_product_context_keeps_every_root_and_is_prior_session_only(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "all.csv"
+    _write_csv(
+        source,
+        [
+            _row("2025/01/02", "TX", "202501", 20000, 20100),
+            _row("2025/01/02", "TX", "202502", 20010, 20110),
+            _row("2025/01/02", "TE", "202501", 1000, 1010),
+            _row("2025/01/03", "TX", "202501", 20100, 20000),
+            _row("2025/01/03", "TE", "202501", 1010, 1000),
+        ],
+    )
+    normalized = build_taifex_all_futures_front_panel(
+        [source], tmp_path / "all_front.parquet"
+    )
+    features, mask, roots = load_taifex_all_futures_front_context(
+        normalized,
+        panel_dates=np.asarray(["2025-01-02", "2025-01-03"], dtype="datetime64[D]"),
+    )
+
+    assert roots == ("TE", "TX")
+    assert features.shape == (2, 2, 13)
+    assert not mask[0].any()
+    assert mask[1].all()
+    tx = roots.index("TX")
+    assert features[1, tx, 0] == pytest.approx(np.log(20100 / 20000))
+
+
+def test_all_product_afterhours_context_is_visible_on_attributed_session(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "all_sessions.csv"
+    _write_csv(
+        source,
+        [
+            _row("2025/01/02", "TX", "202501", 20000, 20100),
+            _row(
+                "2025/01/02",
+                "TX",
+                "202501",
+                20120,
+                20200,
+                session="盤後",
+            ),
+            _row("2025/01/03", "TX", "202501", 20210, 20150),
+            _row(
+                "2025/01/03",
+                "TX",
+                "202501",
+                20160,
+                20300,
+                session="盤後",
+            ),
+        ],
+    )
+    outputs = build_taifex_all_futures_front_panels(
+        [source],
+        {
+            "regular": tmp_path / "regular.parquet",
+            "afterhours": tmp_path / "afterhours.parquet",
+        },
+    )
+    panel_dates = np.asarray(
+        ["2025-01-02", "2025-01-03", "2025-01-06"],
+        dtype="datetime64[D]",
+    )
+    day_features, day_mask, day_roots = load_taifex_all_futures_front_context(
+        outputs["regular"], panel_dates=panel_dates
+    )
+    night_features, night_mask, night_roots = (
+        load_taifex_all_futures_afterhours_context(
+            outputs["afterhours"], panel_dates=panel_dates
+        )
+    )
+
+    assert day_roots == night_roots == ("TX",)
+    assert not day_mask[0, 0] and night_mask[0, 0]
+    assert night_features[0, 0, 0] == pytest.approx(np.log(20200 / 20120))
+    assert day_features[1, 0, 0] == pytest.approx(np.log(20100 / 20000))
+    assert night_features[1, 0, 0] == pytest.approx(np.log(20300 / 20160))
+    # There is no fabricated forward-fill into Monday when no attributed
+    # after-hours row exists for Monday.
+    assert not night_mask[2, 0]
 
 
 def test_build_all_futures_daily_sessions_keeps_products_and_sessions(

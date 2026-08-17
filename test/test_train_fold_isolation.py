@@ -5,6 +5,7 @@ import subprocess
 from types import SimpleNamespace
 
 import train
+from stockagent.training import trainer as trainer_module
 
 
 class _Fold:
@@ -131,6 +132,32 @@ def test_single_selected_fold_still_uses_fresh_process_boundary(
     )
 
 
+def test_isolated_fold_child_defers_global_walkforward_refresh(monkeypatch) -> None:
+    monkeypatch.delenv(train._FOLD_ISOLATION_CHILD_ENV, raising=False)
+    assert not trainer_module._isolated_fold_child_enabled()
+
+    monkeypatch.setenv(train._FOLD_ISOLATION_CHILD_ENV, "1")
+    assert trainer_module._isolated_fold_child_enabled()
+
+
+def test_isolated_lifecycle_finalizer_rejects_partial_fold_coverage() -> None:
+    folds = [_Fold(1), _Fold(2)]
+    results = [SimpleNamespace(fold_id=1)]
+
+    try:
+        trainer_module._finalize_isolated_training_lifecycle(
+            SimpleNamespace(),
+            folds,
+            SimpleNamespace(),
+            "unused",
+            results,
+        )
+    except RuntimeError as exc:
+        assert "expected=[1, 2] completed=[1]" in str(exc)
+    else:
+        raise AssertionError("expected partial isolated lifecycle to fail closed")
+
+
 def test_isolated_parent_rebuilds_complete_walkforward_with_panel_and_config() -> None:
     tree = ast.parse(train.Path(train.__file__).read_text(encoding="utf-8"))
     calls = [
@@ -147,3 +174,13 @@ def test_isolated_parent_rebuilds_complete_walkforward_with_panel_and_config() -
     assert isinstance(call.args[1], ast.Name) and call.args[1].id == "results"
     keyword_names = {keyword.arg for keyword in call.keywords}
     assert keyword_names == {"panel", "config"}
+
+    finalizers = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_finalize_isolated_training_lifecycle"
+    ]
+    assert len(finalizers) == 1
+    assert finalizers[0].lineno > call.lineno

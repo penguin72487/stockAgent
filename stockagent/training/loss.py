@@ -19,6 +19,7 @@ from stockagent.backtest.tw_execution import (
 from stockagent.data.tw_index_derivatives_day import (
     TAIFEX_INDEX_DERIVATIVE_ACTION_COUNT_V4,
 )
+from stockagent.data.tw_index_futures import TAIFEX_INDEX_FUTURES_ACTION_COUNT
 from stockagent.models.normalization import DEFAULT_PORTFOLIO_ACTIVATION
 
 
@@ -340,6 +341,12 @@ def factor_generalization_loss(
     execution_mode: str = "naive",
     buy_fee_rates: Tensor | None = None,
     sell_fee_rates: Tensor | None = None,
+    normal_sell_fee_rates: Tensor | None = None,
+    day_trade_unlimited_margin_conversion: bool = False,
+    day_trade_margin_financing_ratio: float = 0.60,
+    day_trade_margin_financing_annual_rate: float = 0.16,
+    day_trade_margin_short_handling_fee_rate: float = 0.001,
+    day_trade_margin_short_annual_borrow_rate: float = 0.20,
     commission_rebate_rates: Tensor | None = None,
     commission_rebate_timing: str = "daily_close",
     session_month_ids: Tensor | None = None,
@@ -498,6 +505,20 @@ def factor_generalization_loss(
         execution_mode=execution_mode,
         buy_fee_rates=buy_fee_rates,
         sell_fee_rates=sell_fee_rates,
+        normal_sell_fee_rates=normal_sell_fee_rates,
+        day_trade_unlimited_margin_conversion=(
+            day_trade_unlimited_margin_conversion
+        ),
+        day_trade_margin_financing_ratio=day_trade_margin_financing_ratio,
+        day_trade_margin_financing_annual_rate=(
+            day_trade_margin_financing_annual_rate
+        ),
+        day_trade_margin_short_handling_fee_rate=(
+            day_trade_margin_short_handling_fee_rate
+        ),
+        day_trade_margin_short_annual_borrow_rate=(
+            day_trade_margin_short_annual_borrow_rate
+        ),
         commission_rebate_rates=commission_rebate_rates,
         commission_rebate_timing=commission_rebate_timing,
         session_month_ids=session_month_ids,
@@ -663,6 +684,7 @@ def portfolio_autoencoder_loss(
     execution_mode: str = "naive",
     buy_fee_rates: Tensor | None = None,
     sell_fee_rates: Tensor | None = None,
+    normal_sell_fee_rates: Tensor | None = None,
     commission_rebate_rates: Tensor | None = None,
     commission_rebate_timing: str = "daily_close",
     session_month_ids: Tensor | None = None,
@@ -787,6 +809,7 @@ def portfolio_autoencoder_loss(
         execution_mode=execution_mode,
         buy_fee_rates=buy_fee_rates,
         sell_fee_rates=sell_fee_rates,
+        normal_sell_fee_rates=normal_sell_fee_rates,
         commission_rebate_rates=commission_rebate_rates,
         commission_rebate_timing=commission_rebate_timing,
         session_month_ids=session_month_ids,
@@ -1145,6 +1168,12 @@ def risk_aware_loss(
     execution_mode: str = "naive",
     buy_fee_rates: Tensor | None = None,
     sell_fee_rates: Tensor | None = None,
+    normal_sell_fee_rates: Tensor | None = None,
+    day_trade_unlimited_margin_conversion: bool = False,
+    day_trade_margin_financing_ratio: float = 0.60,
+    day_trade_margin_financing_annual_rate: float = 0.16,
+    day_trade_margin_short_handling_fee_rate: float = 0.001,
+    day_trade_margin_short_annual_borrow_rate: float = 0.20,
     commission_rebate_rates: Tensor | None = None,
     commission_rebate_timing: str = "daily_close",
     session_month_ids: Tensor | None = None,
@@ -1203,6 +1232,7 @@ def risk_aware_loss(
     autoencoder_lambda_latent: float = 0.001,
     overnight_log_returns: Tensor | None = None,
     can_short_open_open_mask: Tensor | None = None,
+    day_trade_execution_initial_capital: float = 1_000_000.0,
 ) -> Tensor:
     """Risk-aware loss with configurable objective, including excess-CVaR-drawdown."""
     normalize_start = _loss_timer_start()
@@ -1238,6 +1268,30 @@ def risk_aware_loss(
         if overnight_log_returns is None:
             raise ValueError(
                 "tw_index_derivatives_day requires aligned derivative simple returns"
+            )
+    if mode == "tw_index_futures_day":
+        if weights.dim() != 2 or int(weights.size(1)) != TAIFEX_INDEX_FUTURES_ACTION_COUNT:
+            raise ValueError(
+                "tw_index_futures_day requires direct model actions [T,18], "
+                f"got {tuple(weights.shape)}"
+            )
+        if objective_norm not in {
+            "log_utility",
+            "log_util",
+            "kelly",
+            "growth",
+            "mean_log_return",
+        }:
+            raise ValueError(
+                "tw_index_futures_day supports only canonical log utility"
+            )
+        if overnight_log_returns is None or tuple(overnight_log_returns.shape) != (
+            int(weights.size(0)),
+            TAIFEX_INDEX_FUTURES_ACTION_COUNT,
+            3,
+        ):
+            raise ValueError(
+                "tw_index_futures_day requires exact execution tensor [T,18,3]"
             )
     if mode in TW_CARRYING_EXECUTION_MODES:
         phase_actions = mode == "tw_overnight" or weights.dim() == 3
@@ -1299,6 +1353,7 @@ def risk_aware_loss(
             execution_mode=execution_mode,
             buy_fee_rates=buy_fee_rates,
             sell_fee_rates=sell_fee_rates,
+            normal_sell_fee_rates=normal_sell_fee_rates,
             commission_rebate_rates=commission_rebate_rates,
             commission_rebate_timing=commission_rebate_timing,
             session_month_ids=session_month_ids,
@@ -1351,6 +1406,7 @@ def risk_aware_loss(
             execution_mode=execution_mode,
             buy_fee_rates=buy_fee_rates,
             sell_fee_rates=sell_fee_rates,
+            normal_sell_fee_rates=normal_sell_fee_rates,
             commission_rebate_rates=commission_rebate_rates,
             commission_rebate_timing=commission_rebate_timing,
             session_month_ids=session_month_ids,
@@ -1602,6 +1658,20 @@ def risk_aware_loss(
         execution_mode=execution_mode,
         buy_fee_rates=buy_fee_rates,
         sell_fee_rates=sell_fee_rates,
+        normal_sell_fee_rates=normal_sell_fee_rates,
+        day_trade_unlimited_margin_conversion=(
+            day_trade_unlimited_margin_conversion
+        ),
+        day_trade_margin_financing_ratio=day_trade_margin_financing_ratio,
+        day_trade_margin_financing_annual_rate=(
+            day_trade_margin_financing_annual_rate
+        ),
+        day_trade_margin_short_handling_fee_rate=(
+            day_trade_margin_short_handling_fee_rate
+        ),
+        day_trade_margin_short_annual_borrow_rate=(
+            day_trade_margin_short_annual_borrow_rate
+        ),
         commission_rebate_rates=commission_rebate_rates,
         commission_rebate_timing=commission_rebate_timing,
         session_month_ids=session_month_ids,
@@ -1630,6 +1700,7 @@ def risk_aware_loss(
         initial_short_margin_collateral=initial_short_margin_collateral,
         symbol_indices=symbol_indices,
         overnight_returns=overnight_log_returns,
+        day_trade_execution_initial_capital=day_trade_execution_initial_capital,
     )
     _loss_timer_stop("backtest", backtest_start)
 

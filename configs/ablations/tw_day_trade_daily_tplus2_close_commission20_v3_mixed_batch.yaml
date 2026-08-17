@@ -1,0 +1,219 @@
+# Daily TW day-trade OFAT with per-experiment physical batch sizing.
+#
+# Batch size is intentionally not an invariant in this matrix. All ordinary
+# last-query experiments start at global batch 512. The known high-memory
+# full-history pooling experiments are fixed at their measured global batch
+# 128 limit. A batch change alters the optimizer trajectory, so this policy
+# owns a fresh artifact root and must never resume checkpoints from the
+# uniform-batch OFAT root.
+base_config: configs/markets/tw_day_trade_daily_no_default.yaml
+output_root: artifacts/ablations/tw_day_trade_daily_tplus2_close_commission20_v3_ofat_mixed_batch_v2
+expected_fold_count: 12
+
+batch_policy:
+  default_global_train_batch: 512
+  attention_pooling_global_train_batch: 128
+  oom_fallback_order: [512, 256, 128, 64]
+  resolved_experiment_batches:
+    # Fold-12 compiled forward/backward: 512 OOM at 30.80 GiB/card;
+    # 256 completed the canonical one-epoch preflight.
+    lookback128_batch256: 256
+    # full_then_last retains all temporal activations. Both 512 and 256 OOM;
+    # 128 completed the canonical one-epoch preflight.
+    mean_pooling: 128
+    attention_pooling: 128
+
+runtime:
+  cpu_threads: 112
+  torch_compile_threads: 16
+
+matrix:
+  mode: one_factor_at_a_time
+  include_baseline: false
+  fixed_overrides:
+    data:
+      panel_start_date: '2014-01-01'
+      day_trade_minute_execution_root: null
+    trading:
+      execution_mode: tw_day_trade
+      frequency: daily
+      long_only: false
+      volume_participation_equity: 1000000.0
+      tw_short_capacity_limit_enabled: false
+      tw_commission_discount: 0.2
+      tw_commission_rebate_timing: daily_close
+      tw_day_trade_unlimited_margin_conversion: true
+      tw_day_trade_margin_financing_ratio: 0.6
+      tw_day_trade_margin_financing_annual_rate: 0.16
+      tw_day_trade_margin_short_handling_fee_rate: 0.001
+      tw_day_trade_margin_short_annual_borrow_rate: 0.2
+    training:
+      model_name: financial_transformer
+      epochs: 1000
+      loss_type: log_utility
+      auto_batch_size: false
+  base_overrides:
+    runner:
+      post_train_infer: false
+    training:
+      batch_size_train: 512
+      batch_size_eval: 128
+
+  dimensions:
+  - name: lookback_batch
+    enabled: true
+    paths:
+    - training.lookback
+    - training.batch_size_train
+    baseline: [32, 512]
+    values:
+    - name: lookback128_batch256
+      experiment_name: lookback128_batch256
+      value: [128, 256]
+      overrides:
+        training:
+          batch_size_eval: 32
+          eval_model_chunk_rows: 32
+          eval_auto_chunk_rows_cap: 32
+
+  - name: information_bottleneck
+    enabled: true
+    baseline: [true, true]
+    variants:
+    - name: latent_only
+      experiment_name: latent_only
+      overrides:
+        training:
+          financial_transformer:
+            use_latent_factors: true
+            use_market_tokens: false
+    - name: market_only
+      experiment_name: market_only
+      overrides:
+        training:
+          financial_transformer:
+            use_latent_factors: false
+            use_market_tokens: true
+    - name: temporal_only
+      experiment_name: temporal_only
+      overrides:
+        training:
+          financial_transformer:
+            use_latent_factors: false
+            use_market_tokens: false
+
+  - name: temporal_rope
+    enabled: true
+    path: training.financial_transformer.rope_temporal
+    baseline: true
+    values:
+    - name: disabled
+      experiment_name: no_rope_temporal
+      value: false
+
+  - name: learned_time_position
+    enabled: true
+    path: training.financial_transformer.use_time_pos
+    baseline: true
+    values:
+    - name: disabled
+      experiment_name: no_time_position
+      value: false
+
+  - name: learned_symbol_position
+    enabled: true
+    path: training.financial_transformer.use_symbol_pos
+    baseline: false
+    values:
+    - name: enabled
+      experiment_name: with_symbol_position
+      value: true
+
+  - name: qk_normalization
+    enabled: true
+    path: training.financial_transformer.qk_norm
+    baseline: true
+    values:
+    - name: disabled
+      experiment_name: no_qk_norm
+      value: false
+
+  - name: temporal_pooling
+    enabled: true
+    baseline: last
+    variants:
+    - name: mean
+      experiment_name: mean_pooling
+      overrides:
+        training:
+          batch_size_train: 128
+          financial_transformer:
+            temporal_pooling: mean
+            temporal_query_mode: full_then_last
+    - name: attention
+      experiment_name: attention_pooling
+      overrides:
+        training:
+          batch_size_train: 128
+          financial_transformer:
+            temporal_pooling: attention
+            temporal_query_mode: full_then_last
+
+  - name: normalization
+    enabled: true
+    path: training.financial_transformer.norm_type
+    baseline: rmsnorm
+    values:
+    - name: layernorm
+      experiment_name: layernorm
+      value: layernorm
+
+  - name: feed_forward
+    enabled: true
+    path: training.financial_transformer.ffn_type
+    baseline: swiglu
+    values:
+    - name: gelu
+      experiment_name: gelu_ffn
+      value: gelu
+
+  - name: portfolio_output_mode
+    enabled: true
+    baseline: l1
+    variants:
+    - name: activation_l1
+      experiment_name: output_activation_l1
+      overrides:
+        trading:
+          portfolio_activation: identity
+        training:
+          loss_portfolio_activation: identity
+          financial_transformer:
+            portfolio_output_mode: activation_l1
+    - name: logits
+      experiment_name: output_logits
+      overrides:
+        trading:
+          portfolio_activation: identity
+        training:
+          loss_portfolio_activation: identity
+          financial_transformer:
+            portfolio_output_mode: logits
+    - name: signed_softmax
+      experiment_name: output_signed_softmax
+      overrides:
+        training:
+          financial_transformer:
+            portfolio_output_mode: signed_softmax
+    - name: signed_entmax15
+      experiment_name: output_signed_entmax15
+      overrides:
+        training:
+          financial_transformer:
+            portfolio_output_mode: signed_entmax15
+    - name: signed_sparsemax
+      experiment_name: output_signed_sparsemax
+      overrides:
+        training:
+          financial_transformer:
+            portfolio_output_mode: signed_sparsemax

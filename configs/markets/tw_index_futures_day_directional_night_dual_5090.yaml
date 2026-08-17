@@ -1,0 +1,33 @@
+# First-principles v9 of the dual-RTX-5090 TX/MTX/TMF day strategy.
+#
+# It preserves the exact 18-slot integer ledger and fee-adjusted log-utility
+# loss.  Only the model's feasible action parameterization, causal information
+# set, and validation sample size change relative to v8.
+base_config: tw_index_futures_day_dual_5090.yaml
+
+experiment_name: tw-stock-futures-directional-night-dual-5090-100m-power2-v9
+
+runner:
+  # New inputs and action semantics make v8 optimizer state incompatible.
+  output_dir: artifacts/markets/tw_index_futures_day_directional_night_dual_5090_100m_power2_v9
+  resume: true
+
+walk_forward:
+  # Training targets still begin in 2014.  Four training years plus two
+  # validation years avoid selecting a deployment checkpoint from one noisy
+  # year; the first unbiased test year is therefore 2020.
+  min_train_years: 4
+  val_years: 2
+
+trading:
+  # TAIFEX labels night data by its volume-attribution date. The session has
+  # ended by 05:00, so it is causal at that labelled date's 08:45 decision.
+  tw_index_futures_all_products_afterhours_context_path: data_tw_index_futures/all_products_afterhours_front.parquet
+
+training:
+  transformer_base_portfolio:
+    # One signed exposure with a learnable zero/cash state, allocated across
+    # all valid TX/MTX/TMF E1..E6 slots.  This forbids self-cancelling gross.
+    futures_action_mode: directional_allocation
+    # 1/8 regularization for the small number of independent yearly samples.
+    dropout: 0.125

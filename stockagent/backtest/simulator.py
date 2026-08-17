@@ -17,6 +17,12 @@ from stockagent.backtest.tw_continuous import (
     run_tw_cash_continuous,
     run_tw_day_trade_continuous,
 )
+from stockagent.backtest.tw_day_trade_minute import (
+    run_tw_day_trade_minute_execution,
+)
+from stockagent.backtest.tw_day_trade_daily import (
+    run_tw_day_trade_daily_execution,
+)
 from stockagent.backtest.tw_commission_rebate import (
     commission_rebate_calendar,
     normalize_commission_rebate_timing,
@@ -50,6 +56,7 @@ from stockagent.backtest.tw_integer_execution import (
 )
 from stockagent.backtest.tw_index_futures import (
     FuturesCostSchedule,
+    run_tw_index_futures_all_tenors_day_torch,
     run_tw_index_futures_day_continuous,
     run_tw_index_futures_day_integer,
 )
@@ -59,6 +66,7 @@ from stockagent.backtest.tw_index_derivatives_day import (
     run_tw_index_derivatives_day_integer,
 )
 from stockagent.data.tw_index_futures import (
+    TAIFEX_INDEX_FUTURES_ACTION_COUNT,
     TAIFEX_INDEX_FUTURES_TENOR_SLOTS,
     TAIFEX_INDEX_FUTURES_PRODUCTS,
     TaiwanIndexFuturesDaySession,
@@ -88,11 +96,21 @@ except Exception:  # pragma: no cover - Numba is an acceleration dependency
 INT64_MIN_FLOAT_SAFE = np.nextafter(float(np.iinfo(np.int64).min), 0.0)
 INT64_MAX_FLOAT_SAFE = np.nextafter(float(np.iinfo(np.int64).max + 1), 0.0)
 SCAN_CHUNK_CANDIDATES = (64, 128, 256, 512)
+# v17 applies the same T+2-close net-claim ledger to the daily open-to-close
+# day-trade executor.  Daily sizing now uses deployable cash rather than
+# economic NAV, so T claims affect NAV immediately but first fund T+3 orders.
+# v16 restores exact-minute day-trade T+2 semantics: securities offset on T,
+# while only the signed net cash difference enters the receivable/payable
+# queue and settles two trading sessions later. Economic NAV recognizes the
+# claim on T; cash posts after T+2 orders, so new sizing first uses it on T+3.
+# v15 adds the 2014+ daily no-settlement day-trade contract: blocked closing
+# legs receive unlimited margin conversion with explicit costs, all sessions
+# accounting-close flat, and no T+2/default recurrence.
 # v11 prevents point-in-time side masks, liquidity caps, and whole-lot rounding
 # from silently turning a two-sided Taiwan day-trade target into a one-sided
 # bet.  v10 separated gross commission collection from the economically earned
 # broker rebate and added recurrent pending-rebate state.
-CANONICAL_BACKTEST_CONTRACT_VERSION = 12
+CANONICAL_BACKTEST_CONTRACT_VERSION = 18
 
 _SCAN_CHUNK_CACHE: dict[tuple, int] = {}
 _SCAN_COMPILED_CACHE: dict[
@@ -2824,6 +2842,12 @@ def run_backtest_torch(
     execution_mode: str = "naive",
     buy_fee_rates: torch.Tensor | None = None,
     sell_fee_rates: torch.Tensor | None = None,
+    normal_sell_fee_rates: torch.Tensor | None = None,
+    day_trade_unlimited_margin_conversion: bool = False,
+    day_trade_margin_financing_ratio: float = 0.60,
+    day_trade_margin_financing_annual_rate: float = 0.16,
+    day_trade_margin_short_handling_fee_rate: float = 0.001,
+    day_trade_margin_short_annual_borrow_rate: float = 0.20,
     commission_rebate_rates: torch.Tensor | None = None,
     commission_rebate_timing: str = "daily_close",
     session_month_ids: torch.Tensor | None = None,
@@ -2849,6 +2873,7 @@ def run_backtest_torch(
     initial_short_margin_collateral: torch.Tensor | None = None,
     overnight_returns: torch.Tensor | None = None,
     can_short_open_open_mask: torch.Tensor | None = None,
+    day_trade_execution_initial_capital: float = 1_000_000.0,
 ) -> BacktestResultTensor:
     """Simulate daily portfolio execution from model weights in torch."""
     mode = normalize_execution_mode(execution_mode)
@@ -2963,6 +2988,72 @@ def run_backtest_torch(
             execution_mode=mode,
         )
     if mode == "tw_index_futures_day":
+        if (
+            weights.dim() == 2
+            and int(weights.size(1)) == TAIFEX_INDEX_FUTURES_ACTION_COUNT
+            and overnight_returns is not None
+            and tuple(overnight_returns.shape)
+            == (int(weights.size(0)), TAIFEX_INDEX_FUTURES_ACTION_COUNT, 3)
+        ):
+            rows = int(weights.size(0))
+            symbols_count = int(future_returns.size(1))
+            if tuple(future_returns.shape) != (rows, symbols_count):
+                raise ValueError("future_returns must retain stock-panel shape [T,S]")
+            if tuple(tradable_mask.shape) != (rows, symbols_count):
+                raise ValueError("tradable_mask must retain stock-panel shape [T,S]")
+            execution = overnight_returns.to(
+                device=weights.device, dtype=torch.float32
+            )
+            if state_advance_mask is not None:
+                advance = state_advance_mask.to(
+                    device=weights.device, dtype=torch.bool
+                )
+                execution = torch.where(
+                    advance[:, None, None],
+                    execution,
+                    torch.full_like(execution, float("nan")),
+                )
+            direct = run_tw_index_futures_all_tenors_day_torch(
+                weights,
+                execution,
+                initial_capital=float(day_trade_execution_initial_capital),
+                max_abs_exposure=_resolve_exposure_budget(gross_leverage),
+                initial_equity_scale=initial_equity_scale,
+                initial_alive=initial_alive,
+            )
+            stock_history = torch.zeros(
+                (rows, symbols_count),
+                device=weights.device,
+                dtype=torch.float32,
+            )
+            return BacktestResultTensor(
+                strategy_returns=_portfolio_simple_returns_to_log_torch(
+                    direct.strategy_returns
+                ),
+                benchmark_returns=benchmark_returns.to(
+                    device=weights.device, dtype=torch.float32
+                ),
+                turnovers=direct.turnovers,
+                weights_history=(
+                    stock_history
+                    if return_weights_history
+                    else stock_history.new_empty((0, symbols_count))
+                ),
+                requested_weights_history=(
+                    weights.float() if return_weights_history else None
+                ),
+                final_weights=torch.zeros(
+                    symbols_count, device=weights.device, dtype=torch.float32
+                ),
+                final_alive=(
+                    direct.final_alive
+                    if direct.final_alive is not None
+                    else torch.ones((), device=weights.device, dtype=torch.bool)
+                ),
+                equity_scale_history=direct.equity_scale_history,
+                final_equity_scale=direct.final_equity_scale,
+                execution_mode=mode,
+            )
         if weights.dim() != 2:
             raise ValueError(
                 "tw_index_futures_day expects canonical pseudo weights [T,S]"
@@ -3465,6 +3556,213 @@ def run_backtest_torch(
                         dtype=torch.bool,
                     )
                     & prepped_sell_open
+                )
+            if overnight_returns is not None and overnight_returns.dim() == 3:
+                if normal_sell_fee_rates is None:
+                    raise ValueError(
+                        "exact-minute tw_day_trade requires explicit normal "
+                        "sell fee rates for residual margin conversion"
+                    )
+                active_normal_sell_fees = normal_sell_fee_rates
+                if symbol_indices is not None:
+                    active_normal_sell_fees = normal_sell_fee_rates.index_select(
+                        0,
+                        symbol_indices.to(
+                            device=normal_sell_fee_rates.device,
+                            dtype=torch.long,
+                        ),
+                    )
+                elif int(normal_sell_fee_rates.numel()) != n_symbols:
+                    raise ValueError(
+                        "normal_sell_fee_rates length differs from the active "
+                        "symbol dimension; symbol_indices is required"
+                    )
+                minute_result = run_tw_day_trade_minute_execution(
+                    prepped_weights,
+                    overnight_returns,
+                    prepped_tradable,
+                    prepped_short_open,
+                    day_trade_eligible_mask.to(
+                        device=prepped_weights.device, dtype=torch.bool
+                    ),
+                    prepped_buy_open,
+                    prepped_sell_open,
+                    buy_fee_rates,
+                    sell_fee_rates,
+                    active_normal_sell_fees,
+                    initial_capital_twd=day_trade_execution_initial_capital,
+                    settlement_lag_sessions=settlement_lag_sessions,
+                    state_advance_mask=state_advance_mask,
+                    initial_cash=initial_cash,
+                    initial_payables=initial_payables,
+                    initial_receivables=initial_receivables,
+                    initial_equity_scale=initial_equity_scale,
+                )
+                symbols = int(prepped_weights.size(1))
+                rows = int(prepped_weights.size(0))
+                zero_rows = torch.zeros(
+                    rows,
+                    device=minute_result.strategy_returns.device,
+                    dtype=torch.float32,
+                )
+                return BacktestResultTensor(
+                    strategy_returns=minute_result.strategy_returns,
+                    benchmark_returns=benchmark_returns.to(
+                        device=minute_result.strategy_returns.device,
+                        dtype=minute_result.strategy_returns.dtype,
+                    ),
+                    turnovers=minute_result.turnovers,
+                    weights_history=(
+                        minute_result.weights_history
+                        if return_weights_history
+                        else minute_result.weights_history.new_empty((0, symbols))
+                    ),
+                    requested_weights_history=(
+                        weights if return_weights_history else None
+                    ),
+                    final_weights=torch.zeros(
+                        symbols,
+                        device=minute_result.strategy_returns.device,
+                        dtype=torch.float32,
+                    ),
+                    final_alive=minute_result.final_equity_scale > 0.0,
+                    execution_mode=mode,
+                    settlement_ledger_unit="nav_ratio",
+                    cash_history=minute_result.cash_history,
+                    payables_history=minute_result.payables_history,
+                    receivables_history=minute_result.receivables_history,
+                    settlement_default=torch.zeros(
+                        rows,
+                        device=minute_result.strategy_returns.device,
+                        dtype=torch.bool,
+                    ),
+                    equity_scale_history=minute_result.equity_scale_history,
+                    final_cash=minute_result.final_cash,
+                    final_payables=minute_result.final_payables,
+                    final_receivables=minute_result.final_receivables,
+                    commission_rebate_accrued_history=zero_rows,
+                    commission_rebate_paid_history=zero_rows.clone(),
+                    commission_rebate_current_history=zero_rows.clone(),
+                    commission_rebate_due_history=zero_rows.clone(),
+                    final_commission_rebate_current=zero_rows.new_zeros(()),
+                    final_commission_rebate_due=zero_rows.new_zeros(()),
+                    final_commission_rebate_month_id=torch.zeros(
+                        (),
+                        device=minute_result.strategy_returns.device,
+                        dtype=torch.long,
+                    ),
+                    final_equity_scale=minute_result.final_equity_scale,
+                )
+            if day_trade_unlimited_margin_conversion:
+                if normal_sell_fee_rates is None:
+                    raise ValueError(
+                        "daily T+2-close tw_day_trade requires normal sell "
+                        "fee rates for residual margin conversion"
+                    )
+                active_normal_sell_fees = normal_sell_fee_rates
+                if symbol_indices is not None:
+                    active_normal_sell_fees = normal_sell_fee_rates.index_select(
+                        0,
+                        symbol_indices.to(
+                            device=normal_sell_fee_rates.device,
+                            dtype=torch.long,
+                        ),
+                    )
+                elif int(normal_sell_fee_rates.numel()) != n_symbols:
+                    raise ValueError(
+                        "normal_sell_fee_rates length differs from the active "
+                        "symbol dimension; symbol_indices is required"
+                    )
+                daily_result = run_tw_day_trade_daily_execution(
+                    prepped_weights,
+                    future_returns,
+                    prepped_tradable,
+                    prepped_buy,
+                    prepped_sell,
+                    prepped_short_open,
+                    day_trade_eligible_mask.to(
+                        device=prepped_weights.device,
+                        dtype=torch.bool,
+                    ),
+                    prepped_buy_open,
+                    prepped_sell_open,
+                    buy_fee_rates,
+                    sell_fee_rates,
+                    active_normal_sell_fees,
+                    commission_rebate_rates,
+                    prepped_volume,
+                    max_turnover_ratio=max_turnover_ratio,
+                    margin_financing_ratio=day_trade_margin_financing_ratio,
+                    margin_financing_annual_rate=(
+                        day_trade_margin_financing_annual_rate
+                    ),
+                    margin_short_handling_fee_rate=(
+                        day_trade_margin_short_handling_fee_rate
+                    ),
+                    margin_short_annual_borrow_rate=(
+                        day_trade_margin_short_annual_borrow_rate
+                    ),
+                    settlement_lag_sessions=settlement_lag_sessions,
+                    state_advance_mask=state_advance_mask,
+                    initial_cash=initial_cash,
+                    initial_payables=initial_payables,
+                    initial_receivables=initial_receivables,
+                    initial_equity_scale=initial_equity_scale,
+                )
+                symbols = int(prepped_weights.size(1))
+                rows = int(prepped_weights.size(0))
+                zero_rows = torch.zeros(
+                    rows,
+                    device=daily_result.strategy_returns.device,
+                    dtype=torch.float32,
+                )
+                return BacktestResultTensor(
+                    strategy_returns=daily_result.strategy_returns,
+                    benchmark_returns=benchmark_returns.to(
+                        device=daily_result.strategy_returns.device,
+                        dtype=daily_result.strategy_returns.dtype,
+                    ),
+                    turnovers=daily_result.turnovers,
+                    weights_history=(
+                        daily_result.weights_history
+                        if return_weights_history
+                        else daily_result.weights_history.new_empty((0, symbols))
+                    ),
+                    requested_weights_history=(
+                        weights if return_weights_history else None
+                    ),
+                    final_weights=torch.zeros(
+                        symbols,
+                        device=daily_result.strategy_returns.device,
+                        dtype=torch.float32,
+                    ),
+                    final_alive=daily_result.final_equity_scale > 0.0,
+                    execution_mode=mode,
+                    settlement_ledger_unit="nav_ratio",
+                    cash_history=daily_result.cash_history,
+                    payables_history=daily_result.payables_history,
+                    receivables_history=daily_result.receivables_history,
+                    settlement_default=torch.zeros(
+                        rows,
+                        device=daily_result.strategy_returns.device,
+                        dtype=torch.bool,
+                    ),
+                    equity_scale_history=daily_result.equity_scale_history,
+                    final_cash=daily_result.final_cash,
+                    final_payables=daily_result.final_payables,
+                    final_receivables=daily_result.final_receivables,
+                    commission_rebate_accrued_history=zero_rows,
+                    commission_rebate_paid_history=zero_rows.clone(),
+                    commission_rebate_current_history=zero_rows.clone(),
+                    commission_rebate_due_history=zero_rows.clone(),
+                    final_commission_rebate_current=zero_rows.new_zeros(()),
+                    final_commission_rebate_due=zero_rows.new_zeros(()),
+                    final_commission_rebate_month_id=torch.zeros(
+                        (),
+                        device=daily_result.strategy_returns.device,
+                        dtype=torch.long,
+                    ),
+                    final_equity_scale=daily_result.final_equity_scale,
                 )
             tw_result = run_tw_day_trade_continuous(
                 prepped_weights,
@@ -4106,6 +4404,7 @@ def run_backtest_integer_shares(
     symbols: list[str] | None = None,
     dates: np.ndarray | None = None,
     collect_holdings: bool = True,
+    precomputed_exact_backtest: BacktestResult | None = None,
     execution_mode: str = "naive",
     buy_fee_rates: np.ndarray | None = None,
     sell_fee_rates: np.ndarray | None = None,
@@ -4178,6 +4477,11 @@ def run_backtest_integer_shares(
     ``symbol_indices`` projection as full-universe fee and lot vectors.  The
     flag removes an otherwise unresolvable ambiguity when both lengths happen
     to equal the active symbol count but their orders differ.
+
+    ``precomputed_exact_backtest`` is reserved for an executor whose tensor
+    forward already uses exact integer lots and the experiment's canonical
+    event tape. It prevents reporting from replacing that result with a
+    lower-fidelity open-to-close integer audit.
     """
     mode = normalize_execution_mode(execution_mode)
     if mode == "tw_futures_portfolio_day":
@@ -4257,6 +4561,24 @@ def run_backtest_integer_shares(
             ),
             [],
         )
+    if precomputed_exact_backtest is not None:
+        if mode != "tw_day_trade":
+            raise ValueError(
+                "precomputed_exact_backtest is only valid for tw_day_trade"
+            )
+        if (
+            normalize_execution_mode(precomputed_exact_backtest.execution_mode)
+            != mode
+        ):
+            raise ValueError(
+                "precomputed exact backtest execution mode does not match request"
+            )
+        expected_rows = int(np.asarray(weights).shape[0])
+        if int(precomputed_exact_backtest.strategy_returns.shape[0]) != expected_rows:
+            raise ValueError(
+                "precomputed exact backtest row count does not match weights"
+            )
+        return precomputed_exact_backtest, []
     if mode == "tw_index_derivatives_day":
         raw_weights = np.asarray(weights, dtype=np.float64)
         raw_returns = np.asarray(future_returns)
@@ -4381,12 +4703,16 @@ def run_backtest_integer_shares(
         raw_tradable = np.asarray(tradable_mask)
         raw_benchmark = np.asarray(benchmark_returns, dtype=np.float32)
         if raw_weights.ndim != 2 or raw_weights.shape[0] <= 0:
-            raise ValueError("tw_index_futures_day weights must have shape [T,S]")
-        rows, symbols_count = raw_weights.shape
-        if raw_returns.shape != raw_weights.shape:
-            raise ValueError("future_returns must match futures weights [T,S]")
-        if raw_tradable.shape != raw_weights.shape or raw_tradable.dtype != np.bool_:
-            raise ValueError("tradable_mask must be boolean and match weights [T,S]")
+            raise ValueError("tw_index_futures_day weights must have shape [T,D]")
+        rows = int(raw_weights.shape[0])
+        direct_tenor_actions = int(raw_weights.shape[1]) == TAIFEX_INDEX_FUTURES_ACTION_COUNT
+        if raw_returns.ndim != 2 or int(raw_returns.shape[0]) != rows:
+            raise ValueError("future_returns must retain stock-panel shape [T,S]")
+        symbols_count = int(raw_returns.shape[1])
+        if raw_tradable.shape != raw_returns.shape or raw_tradable.dtype != np.bool_:
+            raise ValueError("tradable_mask must be boolean and match future_returns")
+        if not direct_tenor_actions and raw_returns.shape != raw_weights.shape:
+            raise ValueError("legacy futures pseudo weights must match [T,S]")
         if raw_benchmark.shape != (rows,):
             raise ValueError("benchmark_returns must have shape [T]")
         if futures_market is None:
@@ -4433,7 +4759,136 @@ def run_backtest_integer_shares(
                 if futures_market.front_month_roll_mask is None
                 else futures_market.front_month_roll_mask[row_indices]
             ),
+            tenor_contract_months=(
+                None
+                if futures_market.tenor_contract_months is None
+                else futures_market.tenor_contract_months[row_indices]
+            ),
+            tenor_open_prices=(
+                None
+                if futures_market.tenor_open_prices is None
+                else futures_market.tenor_open_prices[row_indices]
+            ),
+            tenor_high_prices=(
+                None
+                if futures_market.tenor_high_prices is None
+                else futures_market.tenor_high_prices[row_indices]
+            ),
+            tenor_low_prices=(
+                None
+                if futures_market.tenor_low_prices is None
+                else futures_market.tenor_low_prices[row_indices]
+            ),
+            tenor_close_prices=(
+                None
+                if futures_market.tenor_close_prices is None
+                else futures_market.tenor_close_prices[row_indices]
+            ),
+            tenor_volumes=(
+                None
+                if futures_market.tenor_volumes is None
+                else futures_market.tenor_volumes[row_indices]
+            ),
+            tenor_log_returns=(
+                None
+                if futures_market.tenor_log_returns is None
+                else futures_market.tenor_log_returns[row_indices]
+            ),
+            tenor_tradable_mask=(
+                None
+                if futures_market.tenor_tradable_mask is None
+                else futures_market.tenor_tradable_mask[row_indices]
+            ),
         )
+        if direct_tenor_actions:
+            integer = run_tw_index_futures_day_integer(
+                raw_weights,
+                selected_market,
+                initial_capital=initial_capital,
+                max_abs_exposure=min(
+                    _resolve_exposure_budget(gross_leverage),
+                    (
+                        _resolve_exposure_budget(futures_max_abs_exposure)
+                        if futures_max_abs_exposure is not None
+                        else 1.0
+                    ),
+                ),
+                cost_schedule=futures_cost_schedule,
+            )
+            result = BacktestResult(
+                strategy_returns=_portfolio_simple_returns_to_log_numpy(
+                    integer.strategy_returns
+                ),
+                benchmark_returns=raw_benchmark,
+                turnovers=integer.turnovers.astype(np.float32, copy=False),
+                weights_history=np.zeros(
+                    (rows, symbols_count), dtype=np.float32
+                ),
+                requested_weights_history=raw_weights.astype(
+                    np.float32, copy=False
+                ),
+                equity_scale_history=(
+                    integer.equity / float(initial_capital)
+                ).astype(np.float32, copy=False),
+                final_weights=np.zeros(symbols_count, dtype=np.float32),
+                final_alive=np.asarray(
+                    integer.alive[-1] if integer.alive.size else True,
+                    dtype=bool,
+                ),
+                final_equity_scale=np.asarray(
+                    (
+                        integer.equity[-1] / float(initial_capital)
+                        if integer.equity.size
+                        else 1.0
+                    ),
+                    dtype=np.float32,
+                ),
+                execution_mode=mode,
+            )
+            records: list[HoldingsRecord] = []
+            if collect_holdings:
+                (
+                    months,
+                    opens,
+                    _highs,
+                    _lows,
+                    closes,
+                    _volumes,
+                    _log_returns,
+                    _tradable,
+                ) = selected_market.flattened_tenor_panel()
+                multipliers = np.repeat(
+                    selected_market.multipliers.astype(np.float64),
+                    TAIFEX_INDEX_FUTURES_TENOR_SLOTS,
+                )
+                prior_equity = float(initial_capital)
+                for row in range(rows):
+                    denominator = max(prior_equity, 1e-12)
+                    for slot, action_symbol in enumerate(integer.products):
+                        quantity = int(integer.contract_quantities[row, slot])
+                        if quantity == 0:
+                            continue
+                        concrete_symbol = f"{action_symbol.split('_', 1)[0]}_{months[row, slot]}"
+                        for record_type, signed, price in (
+                            ("entry", quantity, opens[row, slot]),
+                            ("exit", -quantity, closes[row, slot]),
+                        ):
+                            value = signed * multipliers[slot] * float(price)
+                            records.append(
+                                HoldingsRecord(
+                                    date=str(requested_dates[row]),
+                                    symbol=concrete_symbol,
+                                    shares=signed,
+                                    price=float(price),
+                                    market_value=float(value),
+                                    holding_ratio=float(value / denominator),
+                                    is_cash=False,
+                                    record_type=record_type,
+                                    side="buy" if signed > 0 else "sell",
+                                )
+                            )
+                    prior_equity = float(integer.equity[row])
+            return result, records
         clean_weights = np.nan_to_num(
             raw_weights, nan=0.0, posinf=0.0, neginf=0.0
         )

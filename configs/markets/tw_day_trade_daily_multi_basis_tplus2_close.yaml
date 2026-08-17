@@ -1,0 +1,39 @@
+base_config: tw_day_trade_daily_no_default.yaml
+
+# 與純日頻 T+2-close/T+3-usable 策略共用同一 canonical execution forward；
+# 唯一模型差異是加入完整多基底分解，不能改用舊 tw_day_trade proxy loss。
+experiment_name: tw-day-trade-daily-multi-basis-tplus2-close-commission20-v1
+
+runner:
+  # 多基底輸入 schema、T+3 現金與二折費率都會改變 checkpoint fingerprint。
+  output_dir: artifacts/markets/tw_day_trade_daily_multi_basis_tplus2_close_commission20_v1
+  resume: true
+  post_train_infer: false
+
+training:
+  # 保持每日 FinancialTransformer 與 1,000 epochs；基底係數和普通特徵
+  # 共用同一 RMSNorm/CandleEncoder projection，不設獨立 gate 或 encoder。
+  model_name: financial_transformer
+  epochs: 1000
+  transformer_base_portfolio:
+    temporal_basis_input: input_features
+    temporal_basis_families:
+      - haar
+      - swt_db2
+      - swt_sym4
+      - wavelet_packet
+      - walsh
+      - fourier
+      - dct
+      - dpss
+      - local_cosine
+      - morlet
+      - exponential
+      - laguerre
+      - difference
+      - ar_innovation
+      - bspline
+      - legendre
+      - chebyshev
+      - learned
+    temporal_basis_components: 4

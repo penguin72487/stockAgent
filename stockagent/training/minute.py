@@ -244,6 +244,32 @@ class _MinuteSlabForwardAdapter(nn.Module):
         )
 
 
+def _disable_redundant_single_minute_block_checkpointing(
+    model: nn.Module,
+    config: ExperimentConfig,
+) -> bool:
+    """Let the outer policy checkpoint own a lookback-one model graph.
+
+    The full-day trainer checkpoints every fixed-size policy chunk. Nesting a
+    second checkpoint around every Transformer block makes backward recompute
+    those blocks again. At lookback one, retaining one recomputed chunk's block
+    activations is bounded by ``D * chunk * S * d_model`` rather than the full
+    session, so the inner checkpoints provide no full-day memory saving. The
+    change is algebraically transparent: forward values, loss, and gradients
+    are unchanged.
+    """
+
+    if not (
+        int(config.training.lookback) == 1
+        and bool(config.training.minute_full_day_credit_assignment)
+        and bool(config.training.minute_full_day_activation_checkpoint)
+        and bool(getattr(model, "checkpoint_blocks", False))
+    ):
+        return False
+    model.minute_checkpoint_blocks = False
+    return True
+
+
 class _NullTrainingRunLifecycle:
     """Non-writer lifecycle used by DDP ranks other than rank zero."""
 
@@ -2760,6 +2786,15 @@ def _run_minute_training_impl(
                     f"(checkpoint={group_checkpoint_path})"
                 )
 
+        outer_policy_checkpoint_only = (
+            _disable_redundant_single_minute_block_checkpointing(model, config)
+        )
+        if outer_policy_checkpoint_only:
+            _progress(
+                f"[Train {train_years}] lookback=1 outer policy checkpoint "
+                "owns activation recomputation; disabled redundant nested "
+                "Transformer block checkpoints"
+            )
         if not hasattr(model, "forward_from_batched_panel_slabs"):
             raise RuntimeError(
                 "tw_minute requires a model with forward_from_batched_panel_slabs"
@@ -2905,6 +2940,8 @@ def _run_minute_training_impl(
                         f"[Train {train_years}] torch.compile failed; "
                         f"using eager model: {type(exc).__name__}: {exc}"
                     )
+        if outer_policy_checkpoint_only:
+            model_compile_status += ":outer_policy_checkpoint_only"
         if distributed:
             slab_forward_module = _wrap_distributed_data_parallel_model(
                 slab_forward_module,

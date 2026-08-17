@@ -74,3 +74,36 @@ def test_cuda_event_timing_can_be_disabled_without_touching_cuda(monkeypatch) ->
         pass
 
     assert timing.cuda_events == []
+
+
+def test_gradient_norm_diagnostic_distinguishes_zero_from_unmeasured() -> None:
+    stats = torch.zeros(3)
+    trainer._accumulate_gradient_norm_diagnostic_(
+        torch.tensor(0.0),
+        norm_sum=stats[0],
+        zero_count=stats[1],
+        observation_count=stats[2],
+    )
+    trainer._accumulate_gradient_norm_diagnostic_(
+        torch.tensor(2.0),
+        norm_sum=stats[0],
+        zero_count=stats[1],
+        observation_count=stats[2],
+    )
+    timing = trainer.TimingBreakdown(
+        batches=2,
+        gradient_norm_before_clip_sum=float(stats[0]),
+        gradient_norm_zero_batches=int(stats[1]),
+        gradient_norm_observations=int(stats[2]),
+    )
+    measured = trainer._timing_curve_payload(train_timing=timing)
+    unmeasured = trainer._timing_curve_payload(
+        train_timing=trainer.TimingBreakdown(batches=2)
+    )
+
+    assert measured["train_grad_norm_measured"] == 1
+    assert measured["train_grad_norm_before_clip_mean"] == 1.0
+    assert measured["train_zero_grad_batches"] == 1
+    assert measured["train_grad_norm_observations"] == 2
+    assert unmeasured["train_grad_norm_measured"] == 0
+    assert unmeasured["train_grad_norm_observations"] == 0

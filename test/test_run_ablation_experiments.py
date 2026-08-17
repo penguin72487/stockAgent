@@ -3,12 +3,15 @@ from pathlib import Path
 import pytest
 import yaml
 
+import scripts.run_ablation_experiments as ablation_module
 from scripts.run_ablation_experiments import (
     _build_configs,
     _deep_merge,
+    _effective_parallel_jobs,
     _experiment_rows,
     _fold_status,
     _format_fold_status,
+    _per_job_thread_budget,
 )
 
 
@@ -20,6 +23,248 @@ def test_deep_merge_preserves_unmodified_nested_values() -> None:
         "training": {"epochs": 10, "model": {"dropout": 0.0, "layers": 2}}
     }
     assert base["training"]["model"]["dropout"] == 0.1
+
+
+def test_parallel_jobs_split_host_wide_thread_budgets() -> None:
+    assert _per_job_thread_budget(112, 2) == 56
+    assert _per_job_thread_budget(16, 2) == 8
+    assert _per_job_thread_budget(1, 2) == 1
+    assert _per_job_thread_budget(None, 2) is None
+
+    with pytest.raises(ValueError, match="must be positive"):
+        _per_job_thread_budget(0, 2)
+
+
+def test_ddp_experiments_own_all_visible_gpus_and_run_sequentially() -> None:
+    assert _effective_parallel_jobs(4, "distributed_data_parallel") == 1
+    assert _effective_parallel_jobs(2, "ddp") == 1
+    assert _effective_parallel_jobs(4, "none") == 4
+
+
+def test_parallel_scheduler_launches_two_independent_runs_and_splits_threads(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    spec = tmp_path / "parallel.yaml"
+    spec.write_text(
+        """
+base_config: configs/markets/tw_day_trade_daily_no_default.yaml
+expected_fold_count: 1
+runtime:
+  cpu_threads: 112
+  torch_compile_threads: 16
+matrix:
+  include_baseline: true
+  dimensions:
+    - name: learning_rate
+      enabled: true
+      path: training.learning_rate
+      values:
+        - name: variant
+          experiment_name: variant
+          value: 0.0002
+""",
+        encoding="utf-8",
+    )
+    output_root = tmp_path / "output"
+
+    class FakeProcess:
+        next_pid = 90_000
+        live = 0
+        peak_live = 0
+        commands: list[list[str]] = []
+
+        def __init__(self, command, **_kwargs):
+            type(self).next_pid += 1
+            self.pid = type(self).next_pid
+            self.returncode = None
+            type(self).live += 1
+            type(self).peak_live = max(type(self).peak_live, type(self).live)
+            type(self).commands.append(list(command))
+
+        def poll(self):
+            if self.returncode is None:
+                self.returncode = 0
+                type(self).live -= 1
+            return self.returncode
+
+    monkeypatch.setattr(ablation_module.subprocess, "Popen", FakeProcess)
+    monkeypatch.setattr(
+        ablation_module.sys,
+        "argv",
+        [
+            "run_ablation_experiments.py",
+            "--spec",
+            str(spec),
+            "--output-root",
+            str(output_root),
+            "--runner",
+            "/bin/true",
+            "--parallel-jobs",
+            "2",
+            "--max-folds",
+            "1",
+        ],
+    )
+
+    ablation_module.main()
+
+    assert FakeProcess.peak_live == 2
+    assert len(FakeProcess.commands) == 2
+    assert all("--cpu-threads" in command for command in FakeProcess.commands)
+    assert all(
+        command[command.index("--cpu-threads") + 1] == "56"
+        for command in FakeProcess.commands
+    )
+    assert all(
+        command[command.index("--torch-compile-threads") + 1] == "8"
+        for command in FakeProcess.commands
+    )
+    summary = yaml.safe_load(
+        (output_root / "summary.json").read_text(encoding="utf-8")
+    )
+    assert [row["status"] for row in summary] == ["succeeded", "succeeded"]
+
+
+def test_scheduler_auto_resumes_failed_worker_until_success(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    spec = tmp_path / "retry.yaml"
+    spec.write_text(
+        """
+base_config: configs/markets/tw_day_trade_daily_no_default.yaml
+expected_fold_count: 1
+matrix:
+  include_baseline: false
+  dimensions:
+    - name: learning_rate
+      enabled: true
+      path: training.learning_rate
+      values:
+        - name: variant
+          experiment_name: variant
+          value: 0.0002
+""",
+        encoding="utf-8",
+    )
+    output_root = tmp_path / "output"
+
+    class FakeProcess:
+        next_pid = 91_000
+        attempts = 0
+
+        def __init__(self, _command, **_kwargs):
+            type(self).next_pid += 1
+            type(self).attempts += 1
+            self.pid = type(self).next_pid
+            self.returncode = None
+            self.attempt = type(self).attempts
+
+        def poll(self):
+            if self.returncode is None:
+                self.returncode = 1 if self.attempt == 1 else 0
+            return self.returncode
+
+    monkeypatch.setattr(ablation_module.subprocess, "Popen", FakeProcess)
+    monkeypatch.setattr(
+        ablation_module.sys,
+        "argv",
+        [
+            "run_ablation_experiments.py",
+            "--spec",
+            str(spec),
+            "--output-root",
+            str(output_root),
+            "--runner",
+            "/bin/true",
+            "--max-folds",
+            "1",
+            "--retry-backoff-seconds",
+            "0",
+        ],
+    )
+
+    ablation_module.main()
+
+    assert FakeProcess.attempts == 2
+    summary = yaml.safe_load(
+        (output_root / "summary.json").read_text(encoding="utf-8")
+    )
+    assert summary[0]["status"] == "succeeded"
+    assert summary[0]["attempts"] == 2
+
+
+def test_scheduler_fails_closed_after_consecutive_no_progress_limit(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    spec = tmp_path / "retry_limit.yaml"
+    spec.write_text(
+        """
+base_config: configs/markets/tw_day_trade_daily_no_default.yaml
+expected_fold_count: 1
+matrix:
+  include_baseline: false
+  dimensions:
+    - name: learning_rate
+      enabled: true
+      path: training.learning_rate
+      values:
+        - name: variant
+          experiment_name: variant
+          value: 0.0002
+""",
+        encoding="utf-8",
+    )
+    output_root = tmp_path / "output"
+
+    class AlwaysFailProcess:
+        next_pid = 92_000
+        attempts = 0
+
+        def __init__(self, _command, **_kwargs):
+            type(self).next_pid += 1
+            type(self).attempts += 1
+            self.pid = type(self).next_pid
+            self.returncode = None
+
+        def poll(self):
+            self.returncode = 1
+            return self.returncode
+
+    monkeypatch.setattr(ablation_module.subprocess, "Popen", AlwaysFailProcess)
+    monkeypatch.setattr(
+        ablation_module.sys,
+        "argv",
+        [
+            "run_ablation_experiments.py",
+            "--spec",
+            str(spec),
+            "--output-root",
+            str(output_root),
+            "--runner",
+            "/bin/true",
+            "--max-folds",
+            "1",
+            "--max-no-progress-retries",
+            "1",
+            "--retry-backoff-seconds",
+            "0",
+        ],
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        ablation_module.main()
+
+    assert exc_info.value.code == 1
+    assert AlwaysFailProcess.attempts == 2
+    summary = yaml.safe_load(
+        (output_root / "summary.json").read_text(encoding="utf-8")
+    )
+    assert summary[0]["status"] == "failed"
+    assert summary[0]["attempts"] == 2
+    assert summary[0]["consecutive_no_progress_failures"] == 2
 
 
 def test_experiment_rows_filter_and_validate_names(tmp_path: Path) -> None:
@@ -265,3 +510,51 @@ def test_tw_day_trade_unified_matrix_keeps_projection_control_except_output_mode
     )
     assert effective["initial_capital_10m"]["trading"]["tw_short_initial_margin_rate"] == 0.9
     assert effective["initial_capital_100m"]["trading"]["tw_short_initial_margin_rate"] == 0.9
+
+
+def test_tw_day_trade_mixed_batch_matrix_resolves_only_measured_oom_variants(
+    tmp_path: Path,
+) -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    spec_path = (
+        repo_root
+        / "configs/ablations/tw_day_trade_daily_tplus2_close_commission20_v3_mixed_batch.yaml"
+    )
+    spec, experiments = _experiment_rows(spec_path)
+    assert len(experiments) == 17
+
+    runs = _build_configs(spec_path, spec, experiments, tmp_path)
+    effective = {
+        run["name"]: yaml.safe_load(run["config_path"].read_text(encoding="utf-8"))
+        for run in runs
+    }
+    batches = {
+        name: int(raw["training"]["batch_size_train"])
+        for name, raw in effective.items()
+    }
+    assert batches["lookback128_batch256"] == 256
+    assert batches["mean_pooling"] == 128
+    assert batches["attention_pooling"] == 128
+    assert {
+        batch
+        for name, batch in batches.items()
+        if name not in {"lookback128_batch256", "mean_pooling", "attention_pooling"}
+    } == {512}
+
+    for name, raw in effective.items():
+        assert raw["trading"]["execution_mode"] == "tw_day_trade"
+        assert raw["trading"]["frequency"] == "daily"
+        assert raw["training"]["auto_batch_size"] is False
+        assert raw["training"]["epochs"] == 1000
+    assert (
+        effective["mean_pooling"]["training"]["financial_transformer"][
+            "temporal_query_mode"
+        ]
+        == "full_then_last"
+    )
+    assert (
+        effective["attention_pooling"]["training"]["financial_transformer"][
+            "temporal_query_mode"
+        ]
+        == "full_then_last"
+    )

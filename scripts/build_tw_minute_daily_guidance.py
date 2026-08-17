@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """Build strict walk-forward daily targets for the one-minute policy.
 
-Each minute year is owned by the most recent daily fold whose complete train
-and validation horizon precedes that year and whose test horizon contains it.
-This uses every available causal checkpoint without letting a final daily
-checkpoint leak future years into historical minute inputs.  The output stores
-the daily model's requested signed target weights; minute execution rules and
-fills are applied later by the canonical tw_minute ledger.
+Each minute session is owned by the most recent daily fold whose complete train
+and validation horizon precedes that session's year, whose test horizon contains
+the year, and whose artifact contains that exact date.  Date-level ownership is
+necessary because split-local daily lookback deliberately removes the first
+``lookback - 1`` test targets from every fold.  An older causal fold supplies
+only those warmup-gap dates; no final checkpoint may leak future years into
+historical minute inputs.  The output stores the daily model's requested signed
+target weights; minute execution rules and fills are applied later by the
+canonical tw_minute ledger.
 """
 
 from __future__ import annotations
@@ -64,12 +67,16 @@ def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def _causal_owners(
+def _causal_candidates(
     sources: Sequence[tuple[Path, list[dict[str, Any]]]],
     target_years: Sequence[int],
-) -> dict[int, tuple[Path, dict[str, Any]]]:
-    owners: dict[int, tuple[Path, dict[str, Any]]] = {}
-    scores: dict[int, tuple[int, int]] = {}
+) -> dict[int, list[tuple[Path, dict[str, Any]]]]:
+    candidates: dict[int, list[tuple[Path, dict[str, Any]]]] = {
+        int(year): [] for year in target_years
+    }
+    scored_identities: dict[int, dict[tuple[int, int], tuple[Path, int]]] = {
+        int(year): {} for year in target_years
+    }
     for root, summary in sources:
         for row in summary:
             train_years = [int(value) for value in row.get("train_years", [])]
@@ -82,22 +89,27 @@ def _causal_owners(
                 if target_year not in test_years or information_cutoff >= target_year:
                     continue
                 score = (max(val_years), max(train_years))
-                previous_score = scores.get(target_year)
-                if previous_score is None or score > previous_score:
-                    owners[target_year] = (root, row)
-                    scores[target_year] = score
-                elif score == previous_score:
-                    previous_root, previous_row = owners[target_year]
-                    if previous_root.resolve() != root.resolve() or int(
-                        previous_row["fold_id"]
-                    ) != int(row["fold_id"]):
-                        raise RuntimeError(
-                            "daily guidance has ambiguous equally recent causal "
-                            f"owners for {target_year}: "
-                            f"{previous_root}/fold_{int(previous_row['fold_id']):02d} "
-                            f"and {root}/fold_{int(row['fold_id']):02d}"
-                        )
-    return owners
+                identity = (root.resolve(), int(row["fold_id"]))
+                previous = scored_identities[target_year].get(score)
+                if previous is not None and previous != identity:
+                    previous_root, previous_fold = previous
+                    raise RuntimeError(
+                        "daily guidance has ambiguous equally recent causal "
+                        f"owners for {target_year}: "
+                        f"{previous_root}/fold_{previous_fold:02d} and "
+                        f"{root}/fold_{int(row['fold_id']):02d}"
+                    )
+                scored_identities[target_year][score] = identity
+                candidates[target_year].append((root, row))
+    for year, rows in candidates.items():
+        rows.sort(
+            key=lambda item: (
+                max(int(value) for value in item[1]["val_years"]),
+                max(int(value) for value in item[1]["train_years"]),
+            ),
+            reverse=True,
+        )
+    return candidates
 
 
 def build_guidance(
@@ -148,8 +160,8 @@ def build_guidance(
             set(minute_dates.astype("datetime64[Y]").astype(int) + 1970)
         )
     ]
-    owners = _causal_owners(daily_sources, target_years)
-    missing_owner_years = [year for year in target_years if year not in owners]
+    candidates = _causal_candidates(daily_sources, target_years)
+    missing_owner_years = [year for year in target_years if not candidates[year]]
     if missing_owner_years:
         raise RuntimeError(
             "daily outputs lack a causal OOF fold covering each minute "
@@ -162,10 +174,19 @@ def build_guidance(
     output_symbol_lookup = {
         symbol: index for index, symbol in enumerate(minute_symbols)
     }
-    year_owners: list[dict[str, Any]] = []
-    for target_year in target_years:
-        daily_output_dir, owner = owners[target_year]
+    source_cache: dict[tuple[Path, int], dict[str, Any]] = {}
+    owner_segments: list[dict[str, Any]] = []
+    zero_filled_dates: list[str] = []
+
+    def load_source(
+        daily_output_dir: Path,
+        owner: dict[str, Any],
+    ) -> dict[str, Any]:
         fold_id = int(owner["fold_id"])
+        cache_key = (daily_output_dir.resolve(), fold_id)
+        cached = source_cache.get(cache_key)
+        if cached is not None:
+            return cached
         fold_dir = daily_output_dir / f"fold_{fold_id:02d}"
         checkpoint_path = fold_dir / "checkpoint_best.pt"
         backtest_path = fold_dir / "test_backtest.npz"
@@ -176,17 +197,16 @@ def build_guidance(
 
         weight_schema = pl.read_parquet_schema(weights_table_path)
         source_symbols = tuple(name for name in weight_schema if name != "date")
-        source_symbol_set = set(source_symbols)
+        source_symbol_lookup = {
+            symbol: index for index, symbol in enumerate(source_symbols)
+        }
         missing_symbols = [
-            symbol for symbol in minute_symbols if symbol not in source_symbol_set
+            symbol for symbol in minute_symbols if symbol not in source_symbol_lookup
         ]
         if missing_symbols and not allow_zero_fill_missing:
             raise RuntimeError(
                 f"daily fold {fold_id} lacks minute symbols: {missing_symbols[:20]}"
             )
-        source_symbol_lookup = {
-            symbol: index for index, symbol in enumerate(source_symbols)
-        }
         matched_output_indices = np.asarray(
             [
                 index
@@ -211,7 +231,9 @@ def build_guidance(
                     "expected 'tw_day_trade'"
                 )
             source_dates = payload["dates"].astype("datetime64[D]")
-            requested = payload["requested_weights_history"]
+            requested = payload["requested_weights_history"].astype(
+                np.float32, copy=False
+            )
         if requested.shape != (int(source_dates.size), len(source_symbols)):
             raise RuntimeError(
                 f"daily fold {fold_id} requested target shape disagrees with symbols"
@@ -233,59 +255,90 @@ def build_guidance(
             raise RuntimeError(
                 f"daily fold {fold_id} backtest dates are not sorted and unique"
             )
+        cached = {
+            "fold_id": fold_id,
+            "source_dates": source_dates,
+            "requested": requested,
+            "matched_output_indices": matched_output_indices,
+            "matched_source_indices": matched_source_indices,
+            "missing_symbols": missing_symbols,
+            "checkpoint_sha256": _sha256(checkpoint_path),
+            "backtest_sha256": _sha256(backtest_path),
+            "weights_table_sha256": _sha256(weights_table_path),
+        }
+        source_cache[cache_key] = cached
+        return cached
 
+    for target_year in target_years:
         target_rows = np.flatnonzero(
             minute_dates.astype("datetime64[Y]").astype(int) + 1970 == target_year
         )
-        positions = np.searchsorted(source_dates, minute_dates[target_rows])
-        exact = positions < source_dates.size
-        exact &= (
-            source_dates[np.clip(positions, 0, source_dates.size - 1)]
-            == minute_dates[target_rows]
-        )
-        if not bool(np.all(exact)) and not allow_zero_fill_missing:
-            missing_dates = [
-                str(value) for value in minute_dates[target_rows][~exact][:20]
-            ]
-            raise RuntimeError(
-                f"daily fold {fold_id} lacks target-year minute dates: {missing_dates}"
+        target_dates = minute_dates[target_rows]
+        unresolved = np.ones(target_rows.size, dtype=np.bool_)
+        for daily_output_dir, owner in candidates[target_year]:
+            source = load_source(daily_output_dir, owner)
+            source_dates = source["source_dates"]
+            positions = np.searchsorted(source_dates, target_dates)
+            exact = positions < source_dates.size
+            exact &= (
+                source_dates[np.clip(positions, 0, source_dates.size - 1)]
+                == target_dates
             )
-        selected = np.zeros(
-            (int(target_rows.size), len(minute_symbols)), dtype=np.float32
-        )
-        exact_rows = np.flatnonzero(exact)
-        if exact_rows.size > 0 and matched_output_indices.size > 0:
-            selected[np.ix_(exact_rows, matched_output_indices)] = requested[
-                positions[exact_rows]
-            ][:, matched_source_indices]
-        gross = np.abs(selected.astype(np.float64)).sum(axis=1)
-        if bool(np.any(gross > 1.00001)):
-            bad = int(np.flatnonzero(gross > 1.00001)[0])
-            raise RuntimeError(
-                f"daily fold {fold_id} target exceeds L1=1 on "
-                f"{minute_dates[target_rows[bad]]}: {gross[bad]:.9f}"
-            )
-        output_weights[target_rows] = selected
-        year_owners.append(
-            {
-                "target_year": int(target_year),
-                "daily_output_dir": str(daily_output_dir),
-                "fold_id": fold_id,
-                "train_years": [int(value) for value in owner["train_years"]],
-                "val_years": [int(value) for value in owner["val_years"]],
-                "test_years": [int(value) for value in owner["test_years"]],
-                "checkpoint_sha256": _sha256(checkpoint_path),
-                "backtest_sha256": _sha256(backtest_path),
-                "weights_table_sha256": _sha256(weights_table_path),
-                "target_rows": int(target_rows.size),
-                "zero_filled_missing_symbol_count": len(missing_symbols),
-                "zero_filled_missing_symbols": missing_symbols[:20],
-                "zero_filled_missing_date_count": int((~exact).sum()),
-                "zero_filled_missing_dates": [
-                    str(value) for value in minute_dates[target_rows][~exact][:20]
-                ],
-            }
-        )
+            fill = unresolved & exact
+            fill_rows = np.flatnonzero(fill)
+            if fill_rows.size == 0:
+                continue
+            matched_output_indices = source["matched_output_indices"]
+            matched_source_indices = source["matched_source_indices"]
+            if matched_output_indices.size > 0:
+                destination_rows = target_rows[fill_rows]
+                output_weights[np.ix_(destination_rows, matched_output_indices)] = (
+                    source["requested"][positions[fill_rows]][
+                        :, matched_source_indices
+                    ]
+                )
+            unresolved[fill_rows] = False
+
+            run_boundaries = np.flatnonzero(np.diff(fill_rows) > 1) + 1
+            for run in np.split(fill_rows, run_boundaries):
+                owner_segments.append(
+                    {
+                        "target_year": int(target_year),
+                        "date_start": str(target_dates[int(run[0])]),
+                        "date_end": str(target_dates[int(run[-1])]),
+                        "target_rows": int(run.size),
+                        "daily_output_dir": str(daily_output_dir),
+                        "fold_id": int(source["fold_id"]),
+                        "train_years": [
+                            int(value) for value in owner["train_years"]
+                        ],
+                        "val_years": [int(value) for value in owner["val_years"]],
+                        "test_years": [
+                            int(value) for value in owner["test_years"]
+                        ],
+                        "checkpoint_sha256": source["checkpoint_sha256"],
+                        "backtest_sha256": source["backtest_sha256"],
+                        "weights_table_sha256": source["weights_table_sha256"],
+                        "zero_filled_missing_symbol_count": len(
+                            source["missing_symbols"]
+                        ),
+                        "zero_filled_missing_symbols": source[
+                            "missing_symbols"
+                        ][:20],
+                    }
+                )
+            if not bool(unresolved.any()):
+                break
+        if bool(unresolved.any()):
+            missing_dates = [str(value) for value in target_dates[unresolved]]
+            if not allow_zero_fill_missing:
+                raise RuntimeError(
+                    "daily outputs lack an exact causal OOF row for minute dates: "
+                    f"{missing_dates[:20]}"
+                )
+            zero_filled_dates.extend(missing_dates)
+
+    owner_segments.sort(key=lambda row: (row["date_start"], row["fold_id"]))
 
     if not bool(np.isfinite(output_weights).all()):
         raise RuntimeError("built daily guidance contains non-finite values")
@@ -317,7 +370,7 @@ def build_guidance(
 
     gross = np.abs(output_weights.astype(np.float64)).sum(axis=1)
     manifest = {
-        "schema_version": 1,
+        "schema_version": 2,
         "contract": MINUTE_DAILY_GUIDANCE_CONTRACT,
         "source_execution_mode": "tw_day_trade",
         "source_tensor": "test_backtest.npz/requested_weights_history",
@@ -337,7 +390,9 @@ def build_guidance(
         "gross_min": float(gross.min()),
         "gross_mean": float(gross.mean()),
         "gross_max": float(gross.max()),
-        "year_owners": year_owners,
+        "owner_segments": owner_segments,
+        "zero_filled_missing_date_count": len(zero_filled_dates),
+        "zero_filled_missing_dates": zero_filled_dates[:100],
     }
     manifest_path = minute_daily_guidance_manifest_path(output_path)
     _atomic_json(manifest_path, manifest)
@@ -353,7 +408,8 @@ def main() -> None:
         required=True,
         help=(
             "Daily training output root; repeat to form a causal checkpoint "
-            "catalog. The latest pre-year train/validation cutoff wins."
+            "catalog. The latest exact-date, pre-year train/validation "
+            "cutoff wins."
         ),
     )
     parser.add_argument(
