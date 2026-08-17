@@ -432,6 +432,7 @@ def test_tw_day_trade_unified_matrix_keeps_projection_control_except_output_mode
         repo_root / "configs/ablations/financial_transformer_tw_day_trade.yaml"
     )
     spec, experiments = _experiment_rows(spec_path)
+    assert spec["output_root"].endswith("capital10m_split_only_v3")
     expected_names = [
         "baseline",
         "lookback256_batch32",
@@ -446,7 +447,7 @@ def test_tw_day_trade_unified_matrix_keeps_projection_control_except_output_mode
         "attention_pooling",
         "layernorm",
         "gelu_ffn",
-        "initial_capital_10m",
+        "initial_capital_1m",
         "initial_capital_100m",
         "output_activation_l1",
         "output_l1",
@@ -466,6 +467,7 @@ def test_tw_day_trade_unified_matrix_keeps_projection_control_except_output_mode
         assert raw["trading"]["execution_mode"] == "tw_day_trade"
         assert raw["trading"]["long_only"] is False
         assert raw["training"]["loss_type"] == "log_utility"
+        assert raw["walk_forward"]["lookback_context"] == "split_only"
 
     output_modes = {
         "output_activation_l1": "activation_l1",
@@ -499,17 +501,41 @@ def test_tw_day_trade_unified_matrix_keeps_projection_control_except_output_mode
     assert (
         effective["lookback256_batch32"]["training"]["batch_size_train"] == 32
     )
-    assert effective["baseline"]["trading"]["volume_participation_equity"] == 1_000_000.0
+    assert effective["baseline"]["trading"]["volume_participation_equity"] == 10_000_000.0
     assert (
-        effective["initial_capital_10m"]["trading"]["volume_participation_equity"]
-        == 10_000_000.0
+        effective["initial_capital_1m"]["trading"]["volume_participation_equity"]
+        == 1_000_000.0
     )
     assert (
         effective["initial_capital_100m"]["trading"]["volume_participation_equity"]
         == 100_000_000.0
     )
-    assert effective["initial_capital_10m"]["trading"]["tw_short_initial_margin_rate"] == 0.9
+    assert {
+        raw["trading"]["volume_participation_equity"]
+        for name, raw in effective.items()
+        if name not in {"initial_capital_1m", "initial_capital_100m"}
+    } == {10_000_000.0}
+    assert effective["initial_capital_1m"]["trading"]["tw_short_initial_margin_rate"] == 0.9
     assert effective["initial_capital_100m"]["trading"]["tw_short_initial_margin_rate"] == 0.9
+
+
+def test_tw_day_trade_output_mode_matrix_uses_ten_million_for_every_run(
+    tmp_path: Path,
+) -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    spec_path = (
+        repo_root
+        / "configs/ablations/financial_transformer_tw_day_trade_output_modes.yaml"
+    )
+    spec, experiments = _experiment_rows(spec_path)
+    runs = _build_configs(spec_path, spec, experiments, tmp_path)
+
+    assert spec["output_root"].endswith("projection_l1_capital10m_split_only_v3")
+    for run in runs:
+        raw = yaml.safe_load(run["config_path"].read_text(encoding="utf-8"))
+        assert raw["trading"]["execution_mode"] == "tw_day_trade"
+        assert raw["trading"]["volume_participation_equity"] == 10_000_000.0
+        assert raw["walk_forward"]["lookback_context"] == "split_only"
 
 
 def test_tw_day_trade_mixed_batch_matrix_resolves_only_measured_oom_variants(
@@ -521,7 +547,7 @@ def test_tw_day_trade_mixed_batch_matrix_resolves_only_measured_oom_variants(
         / "configs/ablations/tw_day_trade_daily_tplus2_close_commission20_v3_mixed_batch.yaml"
     )
     spec, experiments = _experiment_rows(spec_path)
-    assert len(experiments) == 17
+    assert len(experiments) == 20
 
     runs = _build_configs(spec_path, spec, experiments, tmp_path)
     effective = {
@@ -544,8 +570,22 @@ def test_tw_day_trade_mixed_batch_matrix_resolves_only_measured_oom_variants(
     for name, raw in effective.items():
         assert raw["trading"]["execution_mode"] == "tw_day_trade"
         assert raw["trading"]["frequency"] == "daily"
+        assert raw["walk_forward"]["lookback_context"] == "split_only"
         assert raw["training"]["auto_batch_size"] is False
         assert raw["training"]["epochs"] == 1000
+        assert raw["training"]["record_epoch_curve"] is True
+        assert raw["training"]["curve_plot_interval"] == 1
+        assert raw["training"]["curve_plot_async"] is True
+        assert raw["training"]["defer_epoch_curve_plot_until_end"] is False
+    assert "baseline_artifact_root" not in spec
+    assert spec["output_root"].endswith("mixed_batch_v3_capital10m")
+    assert effective["initial_capital_1m"]["trading"]["volume_participation_equity"] == 1_000_000.0
+    assert effective["initial_capital_100m"]["trading"]["volume_participation_equity"] == 100_000_000.0
+    assert {
+        raw["trading"]["volume_participation_equity"]
+        for name, raw in effective.items()
+        if name not in {"initial_capital_1m", "initial_capital_100m"}
+    } == {10_000_000.0}
     assert (
         effective["mean_pooling"]["training"]["financial_transformer"][
             "temporal_query_mode"

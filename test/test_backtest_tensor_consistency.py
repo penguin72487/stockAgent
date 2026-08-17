@@ -41,6 +41,7 @@ from stockagent.training.trainer import (
     _evaluate_windowed_tensor_batch,
     _maybe_cache_tensors_on_device,
     _maybe_share_windowed_base_from_cached,
+    _next_fold_by_id,
     _normalize_ddp_global_batch_size,
     _PanelSlabForwardWrapper,
     _pad_eval_chunk_first_dim,
@@ -56,6 +57,7 @@ from stockagent.training.trainer import (
     _require_training_aux_outputs,
     _requires_full_objective_evaluation,
     _should_check_finite,
+    _split_valid_indices,
     _train_epoch_windowed_tensor,
     _train_epoch_windowed_tensor_ddp,
     _timing_curve_payload,
@@ -2780,6 +2782,45 @@ def test_deployment_test_indices_assign_next_year_warmup_to_previous_model() -> 
         first_full_ds.valid_indices[: len(first_ds)],
     )
 
+    # Exchange-aware day trade executes on t from completed feature rows
+    # through t-1, so lookback=4 becomes executable on the fifth in-split row.
+    # The prior model owns the next year's first four warmup rows, and the next
+    # model starts on its fifth row with no overlap or missing test session.
+    first_day_trade_raw = _deployment_test_indices(
+        panel,
+        folds[0],
+        folds[1],
+        lookback,
+        execution_mode="tw_day_trade",
+        lookback_context="split_only",
+    )
+    second_day_trade_raw = _deployment_test_indices(
+        panel,
+        folds[1],
+        None,
+        lookback,
+        execution_mode="tw_day_trade",
+        lookback_context="split_only",
+    )
+    first_day_trade_valid = _split_valid_indices(
+        panel,
+        first_day_trade_raw,
+        lookback,
+        "tw_day_trade",
+        "split_only",
+    )
+    second_day_trade_valid = _split_valid_indices(
+        panel,
+        second_day_trade_raw,
+        lookback,
+        "tw_day_trade",
+        "split_only",
+    )
+    assert panel.dates[first_day_trade_valid[0]] == np.datetime64("2022-01-05")
+    assert panel.dates[first_day_trade_valid[-1]] == np.datetime64("2023-01-04")
+    assert panel.dates[second_day_trade_valid[0]] == np.datetime64("2023-01-05")
+    assert np.intersect1d(first_day_trade_valid, second_day_trade_valid).size == 0
+
 
 def test_panel_history_hands_new_year_first_target_to_new_model() -> None:
     lookback = 4
@@ -2873,7 +2914,7 @@ def test_panel_history_hands_new_year_first_target_to_new_model() -> None:
     ) == len(first_ds)
 
 
-def test_full_test_survives_zero_row_experimental_deployment_handoff() -> None:
+def test_same_year_experimental_fold_does_not_steal_prior_test_ownership() -> None:
     lookback = 4
     dates = np.concatenate(
         [
@@ -2907,13 +2948,24 @@ def test_full_test_survives_zero_row_experimental_deployment_handoff() -> None:
     assert penultimate.test_years == experimental.test_years == [2023]
 
     full_ds = CrossSectionalDataset(panel, penultimate.test_indices, lookback)
+    experimental_ds = CrossSectionalDataset(panel, experimental.test_indices, lookback)
     assert len(full_ds) > 0
+    successors = _next_fold_by_id(folds)
+    assert successors[penultimate.fold_id] is None
+    assert successors[experimental.fold_id] is experimental
     assert _deployment_test_prefix_rows(
         panel,
         penultimate,
-        experimental,
+        successors[penultimate.fold_id],
         lookback,
         full_ds.valid_indices,
+    ) == len(full_ds)
+    assert _deployment_test_prefix_rows(
+        panel,
+        experimental,
+        successors[experimental.fold_id],
+        lookback,
+        experimental_ds.valid_indices,
     ) == 0
 
 

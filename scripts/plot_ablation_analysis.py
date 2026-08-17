@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render paired, fold-level charts for the Transformer OFAT ablation matrix."""
+"""Render paired, fold-level charts for an OFAT ablation matrix."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import argparse
 import csv
 import json
 import math
+import sys
 import warnings
 from pathlib import Path
 
@@ -14,8 +15,13 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+
 LABELS = {
-    "baseline": "Baseline (capital TWD 1M)",
+    "baseline": "Baseline (capital TWD 10M)",
     "lookback256_batch32": "Lookback 256 / batch 32",
     "lookback64_batch64": "Lookback 64 / batch 64",
     "lookback32_batch128": "Lookback 32 / batch 128",
@@ -30,6 +36,9 @@ LABELS = {
     "attention_pooling": "Attention pooling",
     "layernorm": "LayerNorm",
     "gelu_ffn": "GELU FFN",
+    "initial_capital_1m": "Capital TWD 1M",
+    # Compatibility label for preserved historical roots. New OFAT contracts
+    # use TWD 10M as baseline rather than generating this variant.
     "initial_capital_10m": "Capital TWD 10M",
     "initial_capital_100m": "Capital TWD 100M",
     "output_activation_l1": "Output: activation L1",
@@ -39,6 +48,15 @@ LABELS = {
     "output_signed_entmax15": "Output: signed entmax15",
     "output_signed_sparsemax": "Output: signed sparsemax",
 }
+
+METRIC_NAMES = (
+    "cagr",
+    "sharpe",
+    "sortino",
+    "max_drawdown",
+    "turnover",
+    "daily_hit_rate",
+)
 
 
 def _years(value: str) -> list[int]:
@@ -53,31 +71,145 @@ def _load_baseline_snapshot(root: Path, split: str) -> list[dict]:
     charts is still a lossless source for every baseline metric used here.
     """
 
-    path = root / f"{split}_baseline_fold_metrics.csv"
-    if not path.is_file():
+    candidates = [root / f"{split}_baseline_fold_metrics.csv"]
+    if split == "deployment":
+        # The owned handoff interval is the primary test surface, so current
+        # runs intentionally publish it under the user-facing ``test`` prefix.
+        candidates.append(root / "test_baseline_fold_metrics.csv")
+    path = next((candidate for candidate in candidates if candidate.is_file()), None)
+    if path is None:
         return []
     rows: list[dict] = []
     with path.open(newline="") as fh:
         for row in csv.DictReader(fh):
-            rows.append(
-                {
-                    "fold_id": int(row["fold_id"]),
-                    "train_years": _years(row["train_years"]),
-                    "val_years": _years(row["val_years"]),
-                    "test_years": _years(row["test_years"]),
-                    f"{split}_metrics": {
-                        name: float(row[name])
-                        for name in (
-                            "cagr",
-                            "sharpe",
-                            "sortino",
-                            "max_drawdown",
-                            "turnover",
-                            "daily_hit_rate",
-                        )
-                    },
-                }
+            parsed = {
+                "fold_id": int(row["fold_id"]),
+                "train_years": _years(row["train_years"]),
+                "val_years": _years(row["val_years"]),
+                "test_years": _years(row["test_years"]),
+                f"{split}_metrics": {
+                    name: float(row[name])
+                    for name in METRIC_NAMES
+                },
+            }
+            if split == "deployment" and row.get("calculation_rows"):
+                parsed.update(
+                    deployment_rows=int(row["calculation_rows"]),
+                    deployment_date_start=str(row["calculation_date_start"]),
+                    deployment_date_end=str(row["calculation_date_end"]),
+                )
+            rows.append(parsed)
+    return rows
+
+
+def _load_summary_rows(run_dir: Path) -> list[dict]:
+    path = run_dir / "summary.json"
+    if not path.is_file():
+        return []
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, list) or not payload:
+        return []
+    return sorted(payload, key=lambda row: int(row["fold_id"]))
+
+
+def _deployment_metric_rows(run_dir: Path, summary_rows: list[dict]) -> list[dict]:
+    """Compute non-overlapping fold metrics from persisted deployment ledgers.
+
+    These artifacts are the stitched, stateful tensor executions used for the
+    deployable walk-forward view.  They must remain separate from ``test_metrics``,
+    which can be an exact TWD-capital/whole-lot audit with economically correct
+    all-flat folds.
+    """
+
+    from stockagent.backtest.report import compute_metrics
+    from stockagent.backtest.simulator import BacktestResult
+
+    # The optional final experimental fold can duplicate the preceding fold's
+    # first test year. It is not a next-year handoff and must not replace the
+    # earlier unbiased model in the non-overlapping test series.
+    canonical_fold_ids: set[int] = set()
+    duplicate_test_starts: set[int] = set()
+    seen_test_starts: set[int] = set()
+    for summary_row in summary_rows:
+        test_years = [int(year) for year in summary_row.get("test_years", [])]
+        if not test_years:
+            raise ValueError(
+                f"fold {summary_row.get('fold_id')} has no test-year ownership"
             )
+        test_start = int(test_years[0])
+        fold_id = int(summary_row["fold_id"])
+        if test_start in seen_test_starts:
+            duplicate_test_starts.add(test_start)
+        else:
+            seen_test_starts.add(test_start)
+            canonical_fold_ids.add(fold_id)
+
+    rows: list[dict] = []
+    for summary_row in summary_rows:
+        fold_id = int(summary_row["fold_id"])
+        if fold_id not in canonical_fold_ids:
+            continue
+        artifact_path = (
+            run_dir / f"fold_{fold_id:02d}" / "deployment_test_backtest.npz"
+        )
+        if not artifact_path.is_file():
+            raise FileNotFoundError(artifact_path)
+        with np.load(artifact_path, allow_pickle=False) as archive:
+            strategy = np.asarray(archive["strategy_returns"], dtype=np.float64)
+            benchmark = np.asarray(archive["benchmark_returns"], dtype=np.float64)
+            turnovers = np.asarray(archive["turnovers"], dtype=np.float64)
+            dates = np.asarray(archive["dates"], dtype="datetime64[D]")
+        lengths = {
+            int(strategy.size),
+            int(benchmark.size),
+            int(turnovers.size),
+            int(dates.size),
+        }
+        if len(lengths) != 1:
+            raise ValueError(
+                f"invalid deployment artifact rows for {artifact_path}: "
+                f"strategy={strategy.size}, benchmark={benchmark.size}, "
+                f"turnover={turnovers.size}, dates={dates.size}"
+            )
+        # Scope-v2 artifacts assigned a same-year duplicate to the experimental
+        # fold, leaving the earlier unbiased fold empty. Recover the correct
+        # final interval from that fold's full test ledger without inference.
+        test_start = int(summary_row["test_years"][0])
+        if not strategy.size and test_start in duplicate_test_starts:
+            fallback_path = run_dir / f"fold_{fold_id:02d}" / "test_backtest.npz"
+            if not fallback_path.is_file():
+                raise FileNotFoundError(fallback_path)
+            with np.load(fallback_path, allow_pickle=False) as archive:
+                strategy = np.asarray(archive["strategy_returns"], dtype=np.float64)
+                benchmark = np.asarray(archive["benchmark_returns"], dtype=np.float64)
+                turnovers = np.asarray(archive["turnovers"], dtype=np.float64)
+                dates = np.asarray(archive["dates"], dtype="datetime64[D]")
+            lengths = {
+                int(strategy.size),
+                int(benchmark.size),
+                int(turnovers.size),
+                int(dates.size),
+            }
+            if len(lengths) != 1:
+                raise ValueError(
+                    f"invalid recovered owned-test rows for {fallback_path}"
+                )
+        # An empty canonical interval is absence of an observation, not a
+        # synthetic zero-return fold.
+        if not strategy.size:
+            continue
+        result = BacktestResult(
+            strategy_returns=strategy,
+            benchmark_returns=benchmark,
+            turnovers=turnovers,
+            weights_history=np.empty((strategy.size, 0), dtype=np.float64),
+        )
+        row = dict(summary_row)
+        row["deployment_metrics"] = compute_metrics(result)
+        row["deployment_rows"] = int(strategy.size)
+        row["deployment_date_start"] = str(dates[0])
+        row["deployment_date_end"] = str(dates[-1])
+        rows.append(row)
     return rows
 
 
@@ -95,24 +227,49 @@ def ordered_variant_names(runs: dict[str, list[dict]]) -> list[str]:
     return sorted(names, key=lambda name: (rank.get(name, len(rank)), name))
 
 
-def load(root: Path, split: str) -> dict[str, list[dict]]:
+def load(
+    root: Path,
+    split: str,
+    *,
+    baseline_root: Path | None = None,
+) -> dict[str, list[dict]]:
     runs: dict[str, list[dict]] = {}
     for path in sorted(root.glob("*/summary.json")):
-        rows = json.loads(path.read_text())
-        if isinstance(rows, list) and rows:
-            runs[path.parent.name] = sorted(rows, key=lambda row: int(row["fold_id"]))
+        rows = _load_summary_rows(path.parent)
+        if not rows:
+            continue
+        if split == "deployment":
+            try:
+                rows = _deployment_metric_rows(path.parent, rows)
+            except (FileNotFoundError, KeyError, OSError, ValueError) as exc:
+                warnings.warn(
+                    f"excluding {path.parent.name}: incomplete deployment metrics: {exc}",
+                    stacklevel=2,
+                )
+                continue
+        runs[path.parent.name] = rows
     if "baseline" not in runs:
-        baseline_rows = _load_baseline_snapshot(root, split)
+        baseline_rows: list[dict] = []
+        if baseline_root is not None:
+            baseline_rows = _load_summary_rows(baseline_root)
+            if split == "deployment" and baseline_rows:
+                baseline_rows = _deployment_metric_rows(
+                    baseline_root,
+                    baseline_rows,
+                )
+        if not baseline_rows:
+            baseline_rows = _load_baseline_snapshot(root, split)
         if not baseline_rows:
             raise RuntimeError(
                 "A baseline summary was not found and no baseline fold-metrics "
-                f"snapshot exists for split={split!r}"
+                f"snapshot exists for split={split!r}; baseline_root={baseline_root}"
             )
-        warnings.warn(
-            f"baseline/summary.json is unavailable; using {split} baseline "
-            "fold-metrics snapshot",
-            stacklevel=2,
-        )
+        if baseline_root is None:
+            warnings.warn(
+                f"baseline/summary.json is unavailable; using {split} baseline "
+                "fold-metrics snapshot",
+                stacklevel=2,
+            )
         runs["baseline"] = sorted(
             baseline_rows, key=lambda row: int(row["fold_id"])
         )
@@ -139,6 +296,18 @@ def metric(rows: list[dict], split: str, name: str) -> np.ndarray:
     return np.asarray([r[f"{split}_metrics"][name] for r in rows], dtype=float)
 
 
+def _row_coverage(row: dict, split: str) -> tuple[int | str, str, str]:
+    if split != "deployment":
+        return "", "", ""
+    if "deployment_rows" not in row:
+        return "", "", ""
+    return (
+        int(row["deployment_rows"]),
+        str(row["deployment_date_start"]),
+        str(row["deployment_date_end"]),
+    )
+
+
 def bootstrap_ci(values: np.ndarray, rng: np.random.Generator) -> tuple[float, float]:
     draws = rng.choice(values, size=(20_000, len(values)), replace=True).mean(axis=1)
     return tuple(np.quantile(draws, [0.025, 0.975]))
@@ -148,13 +317,23 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--split", choices=("val", "test"), default="val")
+    parser.add_argument(
+        "--split",
+        choices=("val", "test", "deployment"),
+        default="val",
+    )
     parser.add_argument("--prefix", default=None)
+    parser.add_argument("--baseline-root", type=Path, default=None)
+    parser.add_argument("--scope-label", default=None)
     args = parser.parse_args()
-    runs = load(args.root, args.split)
+    runs = load(args.root, args.split, baseline_root=args.baseline_root)
     fold_count = len(runs["baseline"])
     prefix = args.prefix or args.split
-    split_label = "validation" if args.split == "val" else "test"
+    split_label = args.scope_label or {
+        "val": "validation",
+        "test": "test",
+        "deployment": "non-overlapping deployment",
+    }[args.split]
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     names = ordered_variant_names(runs)
@@ -189,17 +368,64 @@ def main() -> None:
     with baseline_metrics_path.open("w", newline="") as fh:
         writer = csv.writer(fh)
         writer.writerow([
-            "fold_id", "train_years", "val_years", "test_years", "cagr", "sharpe",
-            "sortino", "max_drawdown", "turnover", "daily_hit_rate",
+            "fold_id", "train_years", "val_years", "test_years",
+            "calculation_rows", "calculation_date_start", "calculation_date_end",
+            "cagr", "sharpe", "sortino", "max_drawdown", "turnover",
+            "daily_hit_rate",
         ])
         for row in baseline_rows:
             values = row[f"{args.split}_metrics"]
+            coverage = _row_coverage(row, args.split)
             writer.writerow([
                 row["fold_id"], "-".join(map(str, row["train_years"])),
                 "-".join(map(str, row["val_years"])), "-".join(map(str, row["test_years"])),
+                *coverage,
                 values["cagr"], values["sharpe"], values["sortino"], values["max_drawdown"],
                 values["turnover"], values["daily_hit_rate"],
             ])
+
+    with (args.output_dir / f"{prefix}_flat_fold_diagnostics.csv").open(
+        "w", newline=""
+    ) as fh:
+        writer = csv.writer(fh)
+        writer.writerow(
+            [
+                "variant",
+                "fold_id",
+                "calculation_rows",
+                "calculation_date_start",
+                "calculation_date_end",
+                "all_flat",
+                "cagr",
+                "sharpe",
+                "max_drawdown",
+                "turnover",
+                "daily_hit_rate",
+            ]
+        )
+        for name in ["baseline"] + names:
+            for row in runs[name]:
+                values = row[f"{args.split}_metrics"]
+                coverage = _row_coverage(row, args.split)
+                all_flat = bool(
+                    float(values["turnover"]) == 0.0
+                    and float(values["cagr"]) == 0.0
+                    and float(values["max_drawdown"]) == 0.0
+                    and float(values["daily_hit_rate"]) == 0.0
+                )
+                writer.writerow(
+                    [
+                        name,
+                        int(row["fold_id"]),
+                        *coverage,
+                        int(all_flat),
+                        values["cagr"],
+                        values["sharpe"],
+                        values["max_drawdown"],
+                        values["turnover"],
+                        values["daily_hit_rate"],
+                    ]
+                )
 
     plt.rcParams.update({"font.size": 10, "axes.titleweight": "bold", "figure.facecolor": "white"})
     blue, orange, ink, grid = "#2864A8", "#D9782D", "#252A34", "#D9DEE7"
@@ -216,7 +442,7 @@ def main() -> None:
     ax.axvline(0, color=ink, lw=1)
     ax.set_yticks(y, [display_label(s[0]) for s in effect_stats])
     ax.set_xlabel(f"Mean paired difference in {split_label} Sharpe vs baseline")
-    fig.suptitle(f"Transformer ablations: paired change in {split_label} Sharpe", y=.985, fontweight="bold")
+    fig.suptitle(f"Model ablations: paired change in {split_label} Sharpe", y=.985, fontweight="bold")
     fig.text(.5, .95, f"{fold_count} walk-forward folds; whiskers are fold-bootstrap 95% CIs; positive favors variant",
              ha="center", color="#596273")
     ax.grid(axis="x", color=grid, lw=.7)
@@ -268,31 +494,75 @@ def main() -> None:
     fig.savefig(args.output_dir / f"{prefix}_fold_sharpe_heatmap.png", dpi=180, bbox_inches="tight")
     plt.close(fig)
 
-    # Risk/return view uses robust fold medians because long-horizon cumulative returns are heavy-tailed.
-    fig, ax = plt.subplots(figsize=(10, 7.2))
+    # Risk/return comparison uses aligned categorical dot plots.  A scatter
+    # becomes unreadable when the exact whole-lot audit legitimately places
+    # many variants at the same (0, 0) coordinate.
     all_names = ["baseline"] + names
-    label_offsets = {
-        "temporal_only": (5, -14), "no_time_position": (5, 7),
-        "lookback256_batch32": (5, 7), "lookback64_batch64": (5, 7),
-        "with_symbol_position": (5, -14),
-    }
-    for name in all_names:
-        x = np.median(metric(runs[name], args.split, "max_drawdown"))
-        yv = np.median(metric(runs[name], args.split, "cagr"))
-        color = ink if name == "baseline" else blue
-        ax.scatter(x, yv, s=80 if name == "baseline" else 48, color=color, edgecolor="white", linewidth=.7)
-        ax.annotate(display_label(name), (x, yv), xytext=label_offsets.get(name, (5, 4)),
-                    textcoords="offset points", fontsize=8)
-    ax.axhline(0, color=grid, lw=.9)
-    ax.set_xlabel(f"Median {split_label} max drawdown (less negative is better)")
-    ax.set_ylabel(f"Median {split_label} CAGR")
-    fig.suptitle("Risk-return profile across ablations", y=.985, fontweight="bold")
+    risk_rows = [
+        (
+            name,
+            float(np.median(metric(runs[name], args.split, "cagr"))),
+            float(np.median(metric(runs[name], args.split, "max_drawdown"))),
+        )
+        for name in all_names
+    ]
+    figure_height = max(7.2, 0.44 * len(risk_rows) + 2.3)
+    fig, (ax_return, ax_risk) = plt.subplots(
+        1,
+        2,
+        figsize=(14, figure_height),
+        sharey=True,
+        gridspec_kw={"wspace": 0.08},
+    )
+    y = np.arange(len(risk_rows), dtype=np.float64)
+    cagr_values = np.asarray([row[1] for row in risk_rows], dtype=np.float64)
+    drawdown_values = np.asarray([row[2] for row in risk_rows], dtype=np.float64)
+    colors = [ink if row[0] == "baseline" else blue for row in risk_rows]
+    sizes = [78 if row[0] == "baseline" else 48 for row in risk_rows]
+    markers = ["D" if row[0] == "baseline" else "o" for row in risk_rows]
+    for index, marker in enumerate(markers):
+        ax_return.scatter(
+            cagr_values[index],
+            y[index],
+            s=sizes[index],
+            color=colors[index],
+            marker=marker,
+            edgecolor="white",
+            linewidth=.7,
+            zorder=3,
+        )
+        ax_risk.scatter(
+            drawdown_values[index],
+            y[index],
+            s=sizes[index],
+            color=colors[index],
+            marker=marker,
+            edgecolor="white",
+            linewidth=.7,
+            zorder=3,
+        )
+    ax_return.set_yticks(y, [display_label(row[0]) for row in risk_rows])
+    ax_return.invert_yaxis()
+    ax_return.axvline(0, color=ink, lw=.8)
+    ax_risk.axvline(0, color=ink, lw=.8)
+    ax_return.set_xlabel(f"Median {split_label} CAGR")
+    ax_risk.set_xlabel(
+        f"Median {split_label} max drawdown\n(less negative is better)"
+    )
+    fig.suptitle("Risk and return medians across ablations", y=.985, fontweight="bold")
     fig.text(.5, .95, f"Each point summarizes {fold_count} walk-forward folds using medians",
              ha="center", color="#596273")
-    ax.grid(color=grid, lw=.7)
-    for spine in ("top", "right"):
-        ax.spines[spine].set_visible(False)
-    fig.tight_layout(rect=(0, 0, 1, .93))
+    for ax in (ax_return, ax_risk):
+        ax.grid(axis="x", color=grid, lw=.7)
+        for spine in ("top", "right"):
+            ax.spines[spine].set_visible(False)
+    fig.subplots_adjust(
+        left=0.24,
+        right=0.98,
+        bottom=0.11,
+        top=0.89,
+        wspace=0.08,
+    )
     fig.savefig(args.output_dir / f"{prefix}_risk_return_medians.png", dpi=180, bbox_inches="tight")
     plt.close(fig)
 

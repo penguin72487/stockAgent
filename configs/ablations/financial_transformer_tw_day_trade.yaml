@@ -2,7 +2,7 @@
 # model. Architecture variants hold projection-L1 fixed; the final dimension
 # deliberately varies the portfolio output contract.
 base_config: configs/markets/tw_public_lanten_market_candles.yaml
-output_root: artifacts/ablations/financial_transformer_tw_day_trade_long_short_candles_projection_l1
+output_root: artifacts/ablations/financial_transformer_tw_day_trade_long_short_candles_projection_l1_capital10m_split_only_v3
 expected_fold_count: 12
 
 runtime:
@@ -13,6 +13,10 @@ matrix:
   mode: one_factor_at_a_time
   include_baseline: true
   fixed_overrides:
+    walk_forward:
+      # Test ownership is [this year's first complete in-split lookback,
+      # next year's first complete in-split lookback), not panel-history day 1.
+      lookback_context: split_only
     trading:
       execution_mode: tw_day_trade
       # Buy/open-long -> sell-at-close and sell-first -> cover-at-close are
@@ -28,9 +32,9 @@ matrix:
       # metrics/artifacts; a second post-train inference pass is redundant.
       post_train_infer: false
     trading:
-      # Keep the declared OFAT baseline independent of the current production
-      # capital anchor inherited from the source market config.
-      volume_participation_equity: 1000000.0
+      # Canonical OFAT capital. Every non-capital ablation inherits TWD 10M;
+      # only the explicit initial_capital dimension may change it.
+      volume_participation_equity: 10000000.0
       # Baseline post-processing for model outputs that already satisfy the
       # signed gross-exposure contract.
       portfolio_activation: pre_normalized
@@ -149,11 +153,11 @@ matrix:
       # and by the causal volume-participation weight cap. It is distinct from
       # tw_short_initial_margin_rate, which remains the official margin ratio.
       path: trading.volume_participation_equity
-      baseline: 1000000.0
+      baseline: 10000000.0
       values:
-        - name: 10m
-          experiment_name: initial_capital_10m
-          value: 10000000.0
+        - name: 1m
+          experiment_name: initial_capital_1m
+          value: 1000000.0
         - name: 100m
           experiment_name: initial_capital_100m
           value: 100000000.0

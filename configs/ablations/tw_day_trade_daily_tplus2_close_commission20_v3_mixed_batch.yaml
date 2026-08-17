@@ -7,7 +7,11 @@
 # owns a fresh artifact root and must never resume checkpoints from the
 # uniform-batch OFAT root.
 base_config: configs/markets/tw_day_trade_daily_no_default.yaml
-output_root: artifacts/ablations/tw_day_trade_daily_tplus2_close_commission20_v3_ofat_mixed_batch_v2
+output_root: artifacts/ablations/tw_day_trade_daily_tplus2_close_commission20_v3_ofat_mixed_batch_v3_capital10m
+# This root deliberately does not reuse the historical TWD 1M market baseline.
+# Initial capital affects whole-lot feasibility, the causal volume cap, loss,
+# and the optimizer trajectory, so the TWD 10M baseline must be trained under
+# the same fresh OFAT contract as every non-capital variant.
 expected_fold_count: 12
 
 batch_policy:
@@ -24,21 +28,26 @@ batch_policy:
     attention_pooling: 128
 
 runtime:
+  parallel_jobs: 1
   cpu_threads: 112
   torch_compile_threads: 16
 
 matrix:
   mode: one_factor_at_a_time
-  include_baseline: false
+  include_baseline: true
   fixed_overrides:
     data:
       panel_start_date: '2014-01-01'
       day_trade_minute_execution_root: null
+    walk_forward:
+      # A test model becomes eligible only after its own calendar-year split
+      # has accumulated a complete lookback. Until the next model reaches that
+      # boundary, its warmup rows remain owned by the preceding model.
+      lookback_context: split_only
     trading:
       execution_mode: tw_day_trade
       frequency: daily
       long_only: false
-      volume_participation_equity: 1000000.0
       tw_short_capacity_limit_enabled: false
       tw_commission_discount: 0.2
       tw_commission_rebate_timing: daily_close
@@ -52,9 +61,20 @@ matrix:
       epochs: 1000
       loss_type: log_utility
       auto_batch_size: false
+      # Persist one loss row per epoch and refresh the full-resolution curve
+      # while training.  The asynchronous plotter may coalesce overlapping
+      # render requests, but every recorded epoch remains in the PNG series.
+      record_epoch_curve: true
+      curve_plot_interval: 1
+      curve_plot_async: true
+      defer_epoch_curve_plot_until_end: false
   base_overrides:
     runner:
       post_train_infer: false
+    trading:
+      # Canonical OFAT capital. Every non-capital ablation inherits TWD 10M;
+      # only the explicit initial_capital dimension may change it.
+      volume_participation_equity: 10000000.0
     training:
       batch_size_train: 512
       batch_size_eval: 128
@@ -176,6 +196,21 @@ matrix:
     - name: gelu
       experiment_name: gelu_ffn
       value: gelu
+
+  - name: initial_capital
+    enabled: true
+    # This is the absolute-equity anchor used by the exact whole-lot audit and
+    # causal volume-participation cap. TWD 10M is the baseline; all other
+    # capital levels are explicit OFAT variants.
+    path: trading.volume_participation_equity
+    baseline: 10000000.0
+    values:
+    - name: 1m
+      experiment_name: initial_capital_1m
+      value: 1000000.0
+    - name: 100m
+      experiment_name: initial_capital_100m
+      value: 100000000.0
 
   - name: portfolio_output_mode
     enabled: true
