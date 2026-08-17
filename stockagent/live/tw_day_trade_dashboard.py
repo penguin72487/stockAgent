@@ -619,6 +619,12 @@ def _available_session_dates(
     for row in benchmark_history.get("marks") or ():
         if isinstance(row, Mapping) and row.get("session_date"):
             dates.add(str(row["session_date"])[:10])
+    for path in (root / "position_history").glob("*/*.json"):
+        try:
+            datetime_date.fromisoformat(path.parent.name)
+        except ValueError:
+            continue
+        dates.add(path.parent.name)
     local = observed.astimezone(TAIPEI)
     if not dates and local.weekday() < 5:
         dates.add(local.date().isoformat())
@@ -638,6 +644,36 @@ def _select_session_date(requested: str | None, available: list[str]) -> str:
     if not available:
         raise ValueError("dashboard has no available session dates")
     return available[0]
+
+
+def _select_session_range(
+    *,
+    start_date: str | None,
+    end_date: str | None,
+    session_date: str | None,
+    available: list[str],
+) -> tuple[str, str, list[str]]:
+    """Resolve calendar boundaries over the actual retained trading sessions."""
+
+    if not available:
+        raise ValueError("dashboard has no available session dates")
+    if session_date and not start_date and not end_date:
+        selected_end = _select_session_date(session_date, available)
+        selected_start = selected_end
+    else:
+        selected_end = str(end_date or session_date or start_date or available[0])
+        selected_start = str(start_date or session_date or selected_end)
+        try:
+            datetime_date.fromisoformat(selected_start)
+            datetime_date.fromisoformat(selected_end)
+        except ValueError as exc:
+            raise ValueError("invalid detail date range") from exc
+    if selected_start > selected_end:
+        raise ValueError("detail start_date must not be after end_date")
+    selected_dates = sorted(
+        value for value in available if selected_start <= value <= selected_end
+    )
+    return selected_start, selected_end, selected_dates
 
 
 def _all_json_objects(path: Path):
@@ -700,6 +736,8 @@ def build_dashboard_history_snapshot(
     *,
     state_dir: Path,
     range_key: str = "1d",
+    start_date: str | datetime_date | None = None,
+    end_date: str | datetime_date | None = None,
     maximum_points_per_series: int = 2_000,
 ) -> dict[str, Any]:
     """Return cross-session strategy and total-return benchmark curves.
@@ -715,6 +753,23 @@ def build_dashboard_history_snapshot(
         raise ValueError(f"unsupported chart range: {range_key}")
     if not 100 <= int(maximum_points_per_series) <= 10_000:
         raise ValueError("maximum_points_per_series must be between 100 and 10000")
+    selected_start = (
+        start_date
+        if isinstance(start_date, datetime_date)
+        else datetime_date.fromisoformat(str(start_date))
+        if start_date
+        else None
+    )
+    selected_end = (
+        end_date
+        if isinstance(end_date, datetime_date)
+        else datetime_date.fromisoformat(str(end_date))
+        if end_date
+        else None
+    )
+    if selected_start is not None and selected_end is not None:
+        if selected_start > selected_end:
+            raise ValueError("history start_date must not be after end_date")
     root = Path(state_dir)
     benchmark_history = _load_benchmark_history(root)
     benchmark_origins = benchmark_history.get("origins") or {}
@@ -769,9 +824,45 @@ def build_dashboard_history_snapshot(
         )
 
     rows = list(deduplicated.values())
+    available_dates = [
+        datetime.fromtimestamp(float(row["timestamp_seconds"]), tz=timezone.utc)
+        .astimezone(TAIPEI)
+        .date()
+        for row in rows
+    ]
+    if selected_start is not None or selected_end is not None:
+        rows = [
+            row
+            for row in rows
+            if (
+                selected_start is None
+                or datetime.fromtimestamp(
+                    float(row["timestamp_seconds"]), tz=timezone.utc
+                )
+                .astimezone(TAIPEI)
+                .date()
+                >= selected_start
+            )
+            and (
+                selected_end is None
+                or datetime.fromtimestamp(
+                    float(row["timestamp_seconds"]), tz=timezone.utc
+                )
+                .astimezone(TAIPEI)
+                .date()
+                <= selected_end
+            )
+        ]
     anchor = max((float(row["timestamp_seconds"]) for row in rows), default=None)
     duration = CHART_RANGE_SECONDS[normalized_range]
-    cutoff = None if anchor is None or duration is None else anchor - duration
+    cutoff = (
+        None
+        if selected_start is not None
+        or selected_end is not None
+        or anchor is None
+        or duration is None
+        else anchor - duration
+    )
     if cutoff is not None:
         rows = [row for row in rows if float(row["timestamp_seconds"]) >= cutoff]
     grouped: dict[str, list[dict[str, Any]]] = {}
@@ -795,6 +886,14 @@ def build_dashboard_history_snapshot(
         "production_order_possible": False,
         "range": normalized_range,
         "range_seconds": duration,
+        "start_date": selected_start.isoformat() if selected_start else None,
+        "end_date": selected_end.isoformat() if selected_end else None,
+        "available_start_date": min(available_dates).isoformat()
+        if available_dates
+        else None,
+        "available_end_date": max(available_dates).isoformat()
+        if available_dates
+        else None,
         "anchor_at_utc": (
             datetime.fromtimestamp(anchor, tz=timezone.utc).isoformat()
             if anchor is not None
@@ -1698,6 +1797,8 @@ def build_dashboard_signal_page(
     *,
     state_dir: Path,
     session_date: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
     mode: str = "",
     symbol: str = "",
     status: str = "all",
@@ -1719,10 +1820,15 @@ def build_dashboard_signal_page(
         state=state,
         observed=observed,
     )
-    selected_session_date = _select_session_date(
-        session_date,
-        available_session_dates,
+    selected_start_date, selected_end_date, selected_session_dates = (
+        _select_session_range(
+            start_date=start_date,
+            end_date=end_date,
+            session_date=session_date,
+            available=available_session_dates,
+        )
     )
+    selected_date_set = set(selected_session_dates)
     normalized_mode = str(mode or "").strip()
     normalized_symbol = str(symbol or "").strip().casefold()
     normalized_status = str(status or "all").strip().casefold()
@@ -1730,8 +1836,7 @@ def build_dashboard_signal_page(
     current_rows = [
         row
         for row in rows
-        if not row.get("session_date")
-        or str(row.get("session_date")) == selected_session_date
+        if str(row.get("session_date") or "")[:10] in selected_date_set
     ]
 
     def included(row: Mapping[str, Any]) -> bool:
@@ -1753,10 +1858,11 @@ def build_dashboard_signal_page(
 
     filtered = [row for row in current_rows if included(row)]
 
-    def sort_key(row: Mapping[str, Any]) -> tuple[float, float, str, str]:
+    def sort_key(row: Mapping[str, Any]) -> tuple[int, float, float, str, str]:
         weight = _finite_float(row.get("target_weight"))
         resolved = weight if weight is not None else 0.0
         return (
+            -int(str(row.get("session_date") or "0000-00-00").replace("-", "")),
             -abs(resolved),
             -resolved,
             str(row.get("market") or ""),
@@ -1769,12 +1875,13 @@ def build_dashboard_signal_page(
         for market, raw_mode in (state.get("modes") or {}).items()
         if isinstance(raw_mode, Mapping)
     }
-    current_signal_ids: dict[str, str] = {}
+    current_signal_ids: dict[tuple[str, str], str] = {}
     for row in current_rows:
+        row_date = str(row.get("session_date") or "")[:10]
         market = str(row.get("market") or "")
         signal_id = str(row.get("signal_id") or "")
-        if market and signal_id:
-            current_signal_ids[market] = signal_id
+        if row_date and market and signal_id:
+            current_signal_ids[(row_date, market)] = signal_id
     direction_summary: dict[str, dict[str, float | int]] = {
         stage: {
             "long_count": 0,
@@ -1787,9 +1894,19 @@ def build_dashboard_signal_page(
     summary_rows = [
         row
         for row in filtered
-        if not current_signal_ids.get(str(row.get("market") or ""))
+        if not current_signal_ids.get(
+            (
+                str(row.get("session_date") or "")[:10],
+                str(row.get("market") or ""),
+            )
+        )
         or str(row.get("signal_id") or "")
-        == current_signal_ids[str(row.get("market") or "")]
+        == current_signal_ids[
+            (
+                str(row.get("session_date") or "")[:10],
+                str(row.get("market") or ""),
+            )
+        ]
     ]
     for row in summary_rows:
         target = _finite_float(row.get("target_weight")) or 0.0
@@ -1828,7 +1945,10 @@ def build_dashboard_signal_page(
         "schema_version": DASHBOARD_SCHEMA_VERSION,
         "simulation_only": True,
         "production_order_possible": False,
-        "session_date": selected_session_date,
+        "session_date": selected_end_date,
+        "start_date": selected_start_date,
+        "end_date": selected_end_date,
+        "session_dates": selected_session_dates,
         "available_session_dates": available_session_dates,
         "offset": offset,
         "limit": limit,
@@ -1843,10 +1963,114 @@ def build_dashboard_signal_page(
     }
 
 
+def build_dashboard_position_page(
+    *,
+    state_dir: Path,
+    session_date: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    mode: str = "",
+    symbol: str = "",
+    status: str = "all",
+    offset: int = 0,
+    limit: int = 250,
+) -> dict[str, Any]:
+    """Return bounded position snapshots for an inclusive session range."""
+
+    if offset < 0:
+        raise ValueError("offset must be non-negative")
+    if not 1 <= limit <= 1_000:
+        raise ValueError("limit must be between 1 and 1000")
+    root = Path(state_dir)
+    state = _object(root / "state.json")
+    available_session_dates = _available_session_dates(
+        root=root,
+        state=state,
+        observed=datetime.now(timezone.utc),
+    )
+    selected_start_date, selected_end_date, selected_session_dates = (
+        _select_session_range(
+            start_date=start_date,
+            end_date=end_date,
+            session_date=session_date,
+            available=available_session_dates,
+        )
+    )
+    selected_date_set = set(selected_session_dates)
+    rows = [
+        position
+        for selected_date in selected_session_dates
+        for position in _historical_positions(root, selected_date)
+    ]
+    for raw_mode in (state.get("modes") or {}).values():
+        if not isinstance(raw_mode, Mapping):
+            continue
+        for position in (raw_mode.get("positions") or {}).values():
+            if not isinstance(position, Mapping):
+                continue
+            safe = _safe_position(position)
+            if str(safe.get("session_date") or "")[:10] in selected_date_set:
+                rows.append(safe)
+    deduplicated = {
+        str(row.get("position_id") or f"{row.get('session_date')}:{row.get('market')}:{row.get('symbol')}"): row
+        for row in rows
+    }
+    normalized_mode = str(mode or "").strip()
+    normalized_symbol = str(symbol or "").strip().casefold()
+    normalized_status = str(status or "all").strip().casefold()
+
+    def included(row: Mapping[str, Any]) -> bool:
+        if normalized_mode and normalized_mode != "all":
+            if str(row.get("market") or "") != normalized_mode:
+                return False
+        if normalized_symbol:
+            haystack = f"{row.get('symbol') or ''} {row.get('name') or ''}".casefold()
+            if normalized_symbol not in haystack:
+                return False
+        signed_shares = int(row.get("signed_shares") or 0)
+        if normalized_status == "open":
+            return signed_shares != 0
+        if normalized_status == "closed":
+            return signed_shares == 0
+        if normalized_status == "blocked":
+            return False
+        return True
+
+    filtered = [row for row in deduplicated.values() if included(row)]
+    filtered.sort(
+        key=lambda row: (
+            -int(str(row.get("session_date") or "0000-00-00").replace("-", "")),
+            str(row.get("market") or ""),
+            -abs(_finite_float(row.get("target_weight")) or 0.0),
+            str(row.get("symbol") or ""),
+        )
+    )
+    page = filtered[offset : offset + limit]
+    return {
+        "schema_version": DASHBOARD_SCHEMA_VERSION,
+        "simulation_only": True,
+        "production_order_possible": False,
+        "session_date": selected_end_date,
+        "start_date": selected_start_date,
+        "end_date": selected_end_date,
+        "session_dates": selected_session_dates,
+        "available_session_dates": available_session_dates,
+        "offset": offset,
+        "limit": limit,
+        "returned": len(page),
+        "total": len(filtered),
+        "has_more": offset + len(page) < len(filtered),
+        "record_count": len(deduplicated),
+        "rows": page,
+    }
+
+
 def build_dashboard_event_page(
     *,
     state_dir: Path,
     session_date: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
     mode: str = "",
     symbol: str = "",
     offset: int = 0,
@@ -1867,9 +2091,13 @@ def build_dashboard_event_page(
         state=state,
         observed=observed,
     )
-    selected_session_date = _select_session_date(
-        session_date,
-        available_session_dates,
+    selected_start_date, selected_end_date, selected_session_dates = (
+        _select_session_range(
+            start_date=start_date,
+            end_date=end_date,
+            session_date=session_date,
+            available=available_session_dates,
+        )
     )
     normalized_mode = str(mode or "").strip()
     normalized_symbol = str(symbol or "").strip().casefold()
@@ -1925,19 +2153,17 @@ def build_dashboard_event_page(
 
     orders = [
         safe_event(row, "order")
+        for selected_date in selected_session_dates
         for row in _tail_for_session(
-            root / "orders.jsonl",
-            maximum_scan_rows,
-            selected_session_date,
+            root / "orders.jsonl", maximum_scan_rows, selected_date
         )
         if included(row)
     ]
     fills = [
         safe_event(row, "fill")
+        for selected_date in selected_session_dates
         for row in _tail_for_session(
-            root / "fills.jsonl",
-            maximum_scan_rows,
-            selected_session_date,
+            root / "fills.jsonl", maximum_scan_rows, selected_date
         )
         if included(row)
     ]
@@ -1956,7 +2182,10 @@ def build_dashboard_event_page(
         "schema_version": DASHBOARD_SCHEMA_VERSION,
         "simulation_only": True,
         "production_order_possible": False,
-        "session_date": selected_session_date,
+        "session_date": selected_end_date,
+        "start_date": selected_start_date,
+        "end_date": selected_end_date,
+        "session_dates": selected_session_dates,
         "available_session_dates": available_session_dates,
         "offset": offset,
         "limit": limit,
@@ -2013,6 +2242,7 @@ def build_dashboard_summary(
 __all__ = [
     "build_dashboard_event_page",
     "build_dashboard_history_snapshot",
+    "build_dashboard_position_page",
     "build_dashboard_signal_page",
     "build_dashboard_snapshot",
     "build_dashboard_summary",

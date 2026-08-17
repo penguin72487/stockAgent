@@ -21,6 +21,7 @@ from stockagent.live.tw_day_trade_dashboard import (
     _tail_for_session,
     build_dashboard_event_page,
     build_dashboard_history_snapshot,
+    build_dashboard_position_page,
     build_dashboard_signal_page,
     build_dashboard_snapshot,
     build_dashboard_summary,
@@ -2103,6 +2104,67 @@ def test_stock_benchmark_reinvests_official_actions_once(tmp_path: Path) -> None
     assert row["total_equity_twd"] == pytest.approx(first_total)
 
 
+def test_same_session_stock_benchmark_does_not_require_future_close_receipt(
+    tmp_path: Path,
+) -> None:
+    reference = tmp_path / "tw_corporate_action_reference.parquet"
+    pl.DataFrame(
+        {
+            "date": [date(2026, 8, 14)],
+            "symbol": ["0050"],
+            "previous_close": [100.0],
+            "reference_price": [95.0],
+            "event_type": ["息"],
+        }
+    ).write_parquet(reference)
+    reference.with_suffix(".summary.json").write_text(
+        json.dumps(
+            {
+                "coverage_complete": True,
+                "failure_count": 0,
+                "end_date": "2026-08-14",
+            }
+        ),
+        encoding="utf-8",
+    )
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+    observed = datetime(2026, 8, 17, 10, 0, tzinfo=TAIPEI)
+    engine.process_benchmarks(
+        stock_quotes={
+            "0050": {
+                "bid": 100.0,
+                "ask": 100.1,
+                "quote_at": observed.isoformat(),
+                "source": "fixture",
+            },
+            "2330": {
+                "bid": 1_000.0,
+                "ask": 1_001.0,
+                "quote_at": observed.isoformat(),
+                "source": "fixture",
+            },
+        },
+        stock_fee_schedule=TaiwanFeeSchedule(),
+        current_future_contract_code="TXFH6",
+        current_future_quote={
+            "bid": 45_000.0,
+            "ask": 45_001.0,
+            "quote_at": observed.isoformat(),
+            "source": "fixture",
+        },
+        corporate_action_reference_path=reference,
+        now=observed,
+    )
+
+    for benchmark_id in ("benchmark_0050", "benchmark_2330"):
+        row = engine.state["benchmarks"][benchmark_id]
+        assert row["corporate_action_status"] == "same_session_no_action_boundary"
+        assert row["corporate_action_factor"] == 1.0
+        assert row["last_mark_price"] is not None
+        assert row["return_pct"] is not None
+        assert row["valuation_stale"] is False
+
+
 def test_dashboard_history_ranges_anchor_to_latest_retained_mark(
     tmp_path: Path,
 ) -> None:
@@ -2134,6 +2196,12 @@ def test_dashboard_history_ranges_anchor_to_latest_retained_mark(
 
     one_hour = build_dashboard_history_snapshot(state_dir=root, range_key="1h")
     all_time = build_dashboard_history_snapshot(state_dir=root, range_key="all")
+    selected_day = build_dashboard_history_snapshot(
+        state_dir=root,
+        range_key="all",
+        start_date="2026-08-14",
+        end_date="2026-08-14",
+    )
 
     assert one_hour["range"] == "1h"
     assert one_hour["raw_points_in_range"] == 2
@@ -2141,6 +2209,12 @@ def test_dashboard_history_ranges_anchor_to_latest_retained_mark(
         [2.0, 3.0]
     )
     assert all_time["raw_points_in_range"] == 3
+    assert selected_day["start_date"] == "2026-08-14"
+    assert selected_day["end_date"] == "2026-08-14"
+    assert selected_day["available_start_date"] == "2026-08-13"
+    assert selected_day["available_end_date"] == "2026-08-14"
+    assert selected_day["raw_points_in_range"] == 2
+
 
 def test_dashboard_merges_actual_open_benchmark_history_and_rebases_live_marks(
     tmp_path: Path,
@@ -2374,10 +2448,11 @@ def test_dashboard_html_is_local_and_refreshes_api() -> None:
     assert 'id="preopen-progress"' in html
     assert "fetchWithTimeout(`api/status" in javascript
     assert "fetchWithTimeout(`api/signals?${params.toString()}`" in javascript
+    assert "fetchWithTimeout(`api/positions?${params.toString()}`" in javascript
     assert "fetchWithTimeout(`api/events?${params.toString()}`" in javascript
     assert "function renderOperations(data)" in javascript
     assert "function compareByAbsoluteWeight(a, b)" in javascript
-    assert javascript.count(".sort(compareByAbsoluteWeight)") == 1
+    assert javascript.count(".sort(compareByAbsoluteWeight)") == 0
     assert "refreshInFlight" in javascript
     assert "SIGNAL_PAGE_SIZE" in javascript
     assert "const sourceNumber" in javascript
@@ -2405,7 +2480,7 @@ def test_dashboard_html_is_local_and_refreshes_api() -> None:
     assert "function renderOverview(data)" in javascript
     assert "13:24 市價重試後有殘餘，已轉 13:25 集合競價" in javascript
     assert "13:20/13:24/13:25 退出" in javascript
-    assert "目前訊號目標" in javascript
+    assert "區間訊號目標" in javascript
     assert "方向平衡後" in javascript
     assert "雙向整張不足・保持空倉" in javascript
     assert "四模式已實現" in javascript
@@ -2431,9 +2506,13 @@ def test_dashboard_html_is_local_and_refreshes_api() -> None:
     assert 'id="latency-kpis"' in html
     assert "今日尚無開盤樣本" in javascript
     assert "這不是券商回報或交易所往返時間" in html
-    assert javascript.count("const requestDate = selectedDate();") == 2
-    assert "params = new URLSearchParams({\n    date: requestDate," in javascript
-    assert '$("date-filter").addEventListener("change"' in javascript
+    assert javascript.count("const requestRange = detailRangeKey();") == 3
+    assert "start_date: selectedDetailStartDate()" in javascript
+    assert "end_date: selectedDetailEndDate()" in javascript
+    assert 'id="detail-start-date" type="date"' in html
+    assert 'id="detail-end-date" type="date"' in html
+    assert '$("detail-start-date").addEventListener("change", detailDateChanged)' in javascript
+    assert '$("detail-end-date").addEventListener("change", detailDateChanged)' in javascript
     assert "四模式盤前預熱測速（不等同該日執行完成）" in html
     assert "依 |目標權重| 由大到小" in html
     assert "const PRICE_REFRESH_MS = 60000" in javascript
@@ -2918,6 +2997,110 @@ def test_dashboard_signal_page_filters_sorts_and_bounds_payload(tmp_path: Path) 
     assert prior["session_date"] == "2026-08-12"
     assert [row["symbol"] for row in prior["rows"]] == ["OLD"]
 
+    ranged = build_dashboard_signal_page(
+        state_dir=state_dir,
+        start_date="2026-08-12",
+        end_date="2026-08-16",
+        limit=10,
+    )
+    assert ranged["start_date"] == "2026-08-12"
+    assert ranged["end_date"] == "2026-08-16"
+    assert ranged["session_dates"] == ["2026-08-12", "2026-08-13"]
+    assert ranged["total"] == 5
+    assert ranged["rows"][-1]["symbol"] == "OLD"
+
+    closed_weekend = build_dashboard_signal_page(
+        state_dir=state_dir,
+        start_date="2026-08-15",
+        end_date="2026-08-16",
+        limit=10,
+    )
+    assert closed_weekend["session_dates"] == []
+    assert closed_weekend["rows"] == []
+
+
+def test_dashboard_position_page_filters_an_inclusive_calendar_range(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "state"
+    history_dir = state_dir / "position_history" / "2026-08-13"
+    history_dir.mkdir(parents=True)
+    current_position = {
+        "position_id": "current-private-id",
+        "session_date": "2026-08-14",
+        "market": "mode_a",
+        "symbol": "2330",
+        "name": "台積電",
+        "side": "long",
+        "signed_shares": 1_000,
+        "filled_shares": 1_000,
+        "requested_shares": 1_000,
+        "entry_price": 1_000.0,
+        "target_weight": 0.1,
+        "status": "open",
+    }
+    historical_position = {
+        "position_id": "historical-private-id",
+        "session_date": "2026-08-13",
+        "market": "mode_b",
+        "symbol": "2317",
+        "name": "鴻海",
+        "side": "short",
+        "signed_shares": 0,
+        "filled_shares": 2_000,
+        "requested_shares": 2_000,
+        "entry_price": 200.0,
+        "target_weight": -0.2,
+        "status": "closed",
+    }
+    (state_dir / "state.json").write_text(
+        json.dumps(
+            {
+                "modes": {
+                    "mode_a": {
+                        "session_date": "2026-08-14",
+                        "positions": {"current-private-id": current_position},
+                    }
+                }
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (history_dir / "mode_b.json").write_text(
+        json.dumps(
+            {
+                "session_date": "2026-08-13",
+                "market": "mode_b",
+                "positions": [historical_position],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    ranged = build_dashboard_position_page(
+        state_dir=state_dir,
+        start_date="2026-08-13",
+        end_date="2026-08-16",
+        limit=10,
+    )
+    assert ranged["start_date"] == "2026-08-13"
+    assert ranged["end_date"] == "2026-08-16"
+    assert ranged["session_dates"] == ["2026-08-13", "2026-08-14"]
+    assert ranged["total"] == 2
+    assert [row["symbol"] for row in ranged["rows"]] == ["2330", "2317"]
+
+    closed = build_dashboard_position_page(
+        state_dir=state_dir,
+        start_date="2026-08-13",
+        end_date="2026-08-16",
+        status="closed",
+        limit=10,
+    )
+    assert closed["total"] == 1
+    assert closed["rows"][0]["symbol"] == "2317"
+
 
 def test_dashboard_event_page_returns_all_selected_day_rows_safely(
     tmp_path: Path,
@@ -3024,3 +3207,16 @@ def test_dashboard_event_page_returns_all_selected_day_rows_safely(
     )
     assert filtered["total"] == 2
     assert {row["event_kind"] for row in filtered["rows"]} == {"order", "fill"}
+
+    ranged = build_dashboard_event_page(
+        state_dir=state_dir,
+        start_date="2026-08-13",
+        end_date="2026-08-16",
+        limit=10,
+    )
+    assert ranged["session_dates"] == ["2026-08-13", "2026-08-14"]
+    assert ranged["total"] == 4
+    assert {row["session_date"] for row in ranged["rows"]} == {
+        "2026-08-13",
+        "2026-08-14",
+    }

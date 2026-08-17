@@ -22,7 +22,9 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from common import (
+    PersistentProgress,
     SharedRateLimiter,
+    atomic_write_text,
     describe_rate_limit,
     resolve_end_date,
     resolve_incremental_reconcile_start_ms,
@@ -36,9 +38,9 @@ BASE_URL = "https://api.bybit.com"
 INSTRUMENTS_ENDPOINT = "/v5/market/instruments-info"
 KLINE_ENDPOINT = "/v5/market/kline"
 OUTPUT_COLUMNS = ["date", "open", "max", "min", "close", "adjclose", "Trading_Volume"]
-KLINE_INTERVAL = "15"
-KLINE_INTERVAL_LABEL = "15m"
-CANDLE_INTERVAL_MS = 15 * 60 * 1000
+KLINE_INTERVAL = "1"
+KLINE_INTERVAL_LABEL = "1m"
+CANDLE_INTERVAL_MS = 60 * 1000
 BYBIT_MAX_KLINE_LIMIT = "1000"
 BYBIT_MAX_CANDLES_PER_REQUEST = int(BYBIT_MAX_KLINE_LIMIT)
 BYBIT_WINDOW_SPAN_MS = (BYBIT_MAX_CANDLES_PER_REQUEST - 1) * CANDLE_INTERVAL_MS
@@ -50,6 +52,33 @@ def _read_parquet(path: Path) -> pl.DataFrame:
 
 def _read_parquet_row_count(path: Path) -> int:
     return int(pq.ParquetFile(path, memory_map=True).metadata.num_rows)
+
+
+def _stored_parquet_inventory(
+    output_dir: Path,
+    *,
+    current_codes: set[str],
+) -> dict[str, Any]:
+    """Count current and retained historical files without deleting delistings."""
+
+    stored_rows = 0
+    retained_rows = 0
+    retained_symbols: list[str] = []
+    paths = sorted(output_dir.glob("*_features.parquet"))
+    for path in paths:
+        code = path.name.removesuffix("_features.parquet")
+        rows = _read_parquet_row_count(path)
+        stored_rows += rows
+        if code not in current_codes:
+            retained_symbols.append(code)
+            retained_rows += rows
+    return {
+        "stored_symbol_count": len(paths),
+        "stored_row_count": stored_rows,
+        "retained_historical_symbol_count": len(retained_symbols),
+        "retained_historical_row_count": retained_rows,
+        "retained_historical_symbols": retained_symbols,
+    }
 
 
 def _read_date_column(path: Path) -> pl.DataFrame:
@@ -107,9 +136,9 @@ class ExistingCandleInfo:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Download Bybit perpetual futures 15-minute bars to parquet files."
+        description="Download Bybit perpetual futures one-minute bars to parquet files."
     )
-    parser.add_argument("--output-dir", default="data_bybit", help="Output folder.")
+    parser.add_argument("--output-dir", default="data_bybit/1m", help="Output folder.")
     parser.add_argument(
         "--mode",
         choices=["incremental", "daily-update", "full"],
@@ -235,7 +264,7 @@ def _merge_existing_with_fresh(
     return combined, not _frames_equal(existing, combined)
 
 
-def _frame_matches_15m_interval(frame: pl.DataFrame) -> bool:
+def _frame_matches_1m_interval(frame: pl.DataFrame) -> bool:
     if frame.is_empty() or "date" not in frame.columns:
         return True
 
@@ -317,7 +346,7 @@ def _load_existing_candle_info(path: Path) -> ExistingCandleInfo:
         return ExistingCandleInfo(
             rows=row_count,
             latest_ms=_latest_ms_from_date_frame(date_frame),
-            interval_ok=_frame_matches_15m_interval(date_frame),
+            interval_ok=_frame_matches_1m_interval(date_frame),
             earliest_ms=_earliest_ms_from_date_frame(date_frame),
         )
     except Exception as exc:
@@ -532,7 +561,7 @@ def _normalize_candles(raw_rows: list[list[str]]) -> pl.DataFrame:
     )
 
 
-def _download_symbol_15m(
+def _download_symbol_1m(
     client: BybitClient,
     record: SymbolRecord,
     output_dir: Path,
@@ -540,6 +569,7 @@ def _download_symbol_15m(
     end_ms: int,
     mode: str,
     refresh: bool,
+    page_progress_callback: Any = None,
 ) -> DownloadResult:
     output_path = output_dir / f"{record.code}_features.parquet"
     existing_info: ExistingCandleInfo | None = None
@@ -595,6 +625,8 @@ def _download_symbol_15m(
                 "limit": BYBIT_MAX_KLINE_LIMIT,
             },
         )
+        if page_progress_callback is not None:
+            page_progress_callback(record.code)
         chunk = payload.get("result", {}).get("list", [])
         if chunk:
             all_rows.extend(chunk)
@@ -680,6 +712,7 @@ def _download_symbol_15m(
 
 
 def main() -> None:
+    started_at = datetime.now(timezone.utc)
     args = parse_args()
     categories = _resolve_categories(args.categories)
     output_dir = Path(args.output_dir)
@@ -701,9 +734,49 @@ def main() -> None:
 
     output_dir.mkdir(parents=True, exist_ok=True)
     symbols_path = output_dir / "symbols.csv"
-    pl.DataFrame([asdict(s) for s in symbols]).write_csv(symbols_path)
+    atomic_write_text(
+        symbols_path,
+        pl.DataFrame([asdict(s) for s in symbols]).write_csv(),
+    )
 
     total_symbols = len(symbols)
+    closed_end_ms = min(end_ms, _latest_closed_candle_start_ms())
+    expected_candle_pages = 0
+    for record in symbols:
+        output_path = output_dir / f"{record.code}_features.parquet"
+        if output_path.is_file() and not args.refresh:
+            expected_candle_pages += 1
+            continue
+        listing_start = start_ms
+        if record.launch_time:
+            listing_start = max(
+                listing_start,
+                int(
+                    datetime.strptime(record.launch_time, "%Y-%m-%d %H:%M:%S")
+                    .replace(tzinfo=timezone.utc)
+                    .timestamp()
+                    * 1000
+                ),
+            )
+        candle_count = max(
+            0, (closed_end_ms - listing_start) // CANDLE_INTERVAL_MS + 1
+        )
+        expected_candle_pages += max(
+            1,
+            (candle_count + BYBIT_MAX_CANDLES_PER_REQUEST - 1)
+            // BYBIT_MAX_CANDLES_PER_REQUEST,
+        )
+    pipeline_progress = PersistentProgress(
+        output_dir / "progress.json",
+        label="Bybit 永續合約 1 分鐘 K線",
+        total=expected_candle_pages,
+        unit="request-page",
+        basis=(
+            "completed one-minute request pages divided by full elapsed time; "
+            "listing age determines the estimated total page count"
+        ),
+        started_at=started_at,
+    )
     print(
         "[bybit] start "
         f"symbols={total_symbols} interval={KLINE_INTERVAL_LABEL} "
@@ -727,7 +800,7 @@ def main() -> None:
                 f"{record.bybit_symbol} ({record.category})"
             )
 
-        result = _download_symbol_15m(
+        result = _download_symbol_1m(
             client,
             record,
             output_dir,
@@ -735,6 +808,9 @@ def main() -> None:
             end_ms,
             args.mode,
             args.refresh,
+            page_progress_callback=lambda _code: pipeline_progress.update(
+                "candles", "page_fetched"
+            ),
         )
 
         with progress_lock:
@@ -750,7 +826,7 @@ def main() -> None:
         return result
 
     def _on_error(record: SymbolRecord, exc: Exception) -> DownloadResult:
-        return DownloadResult(
+        result = DownloadResult(
             asset_class="crypto_bybit_perp",
             code=record.code,
             bybit_symbol=record.bybit_symbol,
@@ -760,6 +836,8 @@ def main() -> None:
             output_path=None,
             message=str(exc),
         )
+        pipeline_progress.update("candles", result.status)
+        return result
 
     results = run_parallel_tasks(
         symbols,
@@ -781,25 +859,38 @@ def main() -> None:
         if result_rows
         else pl.DataFrame()
     )
-    result_df.write_csv(report_path)
+    atomic_write_text(report_path, result_df.write_csv())
     status_counts: dict[str, int] = {}
     row_count = 0
     for result in results:
         status_counts[result.status] = status_counts.get(result.status, 0) + 1
         row_count += int(result.rows)
+    stored_inventory = _stored_parquet_inventory(
+        output_dir,
+        current_codes={record.code for record in symbols},
+    )
 
     summary = {
         "asset_class": "crypto_bybit_perp",
         "interval": KLINE_INTERVAL_LABEL,
         "symbol_count": len(symbols),
         "row_count": row_count,
+        "current_symbol_count": len(symbols),
+        "current_row_count": row_count,
+        **stored_inventory,
         "status_counts": status_counts,
         "categories": categories,
         "start_date": start_date,
         "end_date": end_date,
+        "started_at_utc": started_at.isoformat(),
+        "ended_at_utc": datetime.now(timezone.utc).isoformat(),
     }
-    summary_path.write_text(
-        json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
+    atomic_write_text(
+        summary_path,
+        json.dumps(summary, ensure_ascii=False, indent=2) + "\n",
+    )
+    pipeline_progress.finish(
+        failed=any(result.status == "failed" for result in results)
     )
 
     print(f"[bybit] symbols.csv -> {symbols_path}")

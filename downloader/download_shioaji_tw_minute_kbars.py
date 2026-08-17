@@ -516,8 +516,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout-ms", type=int, default=30_000)
     parser.add_argument("--retries", type=int, default=3)
     parser.add_argument("--retry-backoff", type=float, default=3.0)
-    parser.add_argument("--max-traffic-fraction", type=float, default=0.90)
-    parser.add_argument("--traffic-reserve-mb", type=float, default=25.0)
+    parser.add_argument("--max-traffic-fraction", type=float, default=0.75)
+    parser.add_argument("--traffic-reserve-mb", type=float, default=256.0)
     parser.add_argument("--simulation", action="store_true")
     parser.add_argument("--allow-market-hours", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
@@ -1562,6 +1562,10 @@ def main() -> None:
         raise ValueError("--traffic-check-interval must be positive")
     if not 0 < float(args.max_traffic_fraction) < 1:
         raise ValueError("--max-traffic-fraction must be between 0 and 1")
+    if not math.isfinite(float(args.traffic_reserve_mb)) or float(
+        args.traffic_reserve_mb
+    ) < 0.0:
+        raise ValueError("--traffic-reserve-mb must be finite and nonnegative")
 
     universe = _load_universe(args.base_stock_root)
     selected = select_universe(
@@ -1596,7 +1600,7 @@ def main() -> None:
     if _taiwan_market_hours_now() and not args.allow_market_hours:
         raise RuntimeError(
             "Refusing historical minute backfill during Taiwan market hours "
-            "(08:30-14:30 safety window)."
+            "(07:45-14:31 live-priority window)."
         )
     api_key = os.environ.get("SHIOAJI_API_KEY", "").strip()
     secret_key = os.environ.get("SHIOAJI_SECRET_KEY", "").strip()

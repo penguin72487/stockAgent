@@ -3139,11 +3139,11 @@ def test_signal_enrichment_adds_capital_pnl_and_crypto_window_label() -> None:
     assert enriched.summary["portfolio_pnl_value"] == 6_000.0
     assert enriched.summary["benchmark_pnl_value"] == 2_000.0
     assert enriched.summary["excess_pnl_value"] == 4_000.0
-    assert enriched.summary["recent_performance"]["window_label"] == "過去32根15m"
+    assert enriched.summary["recent_performance"]["window_label"] == "過去32根1m"
     assert enriched.summary["recent_performance"]["strategy_pnl_value"] == 50_000.0
     assert "上個訊號到現在" in enriched.message
     assert "`baseline=+0.40%`" in enriched.message
     assert "`capital=500,000`" in enriched.message
     assert "`pnl=+6,000`" in enriched.message
-    assert "過去32根15m" in enriched.message
+    assert "過去32根1m" in enriched.message
     assert "`baseline_pnl=+10,000`" in enriched.message

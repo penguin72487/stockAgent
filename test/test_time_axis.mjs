@@ -56,3 +56,23 @@ test("all-history axis adapts to monthly ticks for a long span", () => {
   assert.ok(axis.ticks.length <= 21);
   assert.ok(axis.ticks.every((tick) => /\d{4}\/\d{2}/.test(tick.label)));
 });
+
+test("collapsed axis removes globally empty intervals and maps ticks to observations", () => {
+  const friday = Date.parse("2026-08-13T16:00:00Z"); // Friday 00:00 Taipei
+  const monday = Date.parse("2026-08-16T16:00:00Z"); // Monday 00:00 Taipei
+  const axis = timeAxis.buildTimeAxis({
+    range: "all",
+    timestamps: [friday, monday],
+    collapseEmptyIntervals: true,
+  });
+  assert.deepEqual(axis.observedTimes, [friday, monday]);
+  assert.equal(timeAxis.position(axis, friday, 0, 100), 0);
+  assert.equal(timeAxis.position(axis, monday, 0, 100), 100);
+  assert.deepEqual(
+    axis.ticks.map((tick) => tick.observedTimestamp),
+    [friday, monday],
+  );
+  assert.ok(axis.ticks.every((tick) => (
+    tick.observedTimestamp === friday || tick.observedTimestamp === monday
+  )));
+});

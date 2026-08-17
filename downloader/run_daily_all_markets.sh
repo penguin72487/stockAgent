@@ -62,6 +62,28 @@ RUN_BINANCE_PERP="${RUN_BINANCE_PERP:-1}"
 BINANCE_WORKERS="${BINANCE_WORKERS:-32}"
 BINANCE_REQUEST_WEIGHT_PER_MINUTE="${BINANCE_REQUEST_WEIGHT_PER_MINUTE:-}"
 BINANCE_MAX_RETRIES="${BINANCE_MAX_RETRIES:-8}"
+BINANCE_FEATURE_WORKERS="${BINANCE_FEATURE_WORKERS:-$BINANCE_WORKERS}"
+CRYPTO_DAILY_MATERIALIZE_WORKERS="${CRYPTO_DAILY_MATERIALIZE_WORKERS:-8}"
+RUN_FREE_PUBLIC_CONTEXT="${RUN_FREE_PUBLIC_CONTEXT:-1}"
+FREE_PUBLIC_CONTEXT_OUTPUT_DIR="${FREE_PUBLIC_CONTEXT_OUTPUT_DIR:-data_free_public}"
+RUN_COINMETRICS_COMMUNITY="${RUN_COINMETRICS_COMMUNITY:-1}"
+COINMETRICS_OUTPUT_DIR="${COINMETRICS_OUTPUT_DIR:-data_coinmetrics_community}"
+COINMETRICS_WORKERS="${COINMETRICS_WORKERS:-4}"
+COINMETRICS_BATCH_ASSETS="${COINMETRICS_BATCH_ASSETS:-50}"
+RUN_CRYPTO_REFERENCE="${RUN_CRYPTO_REFERENCE:-1}"
+CRYPTO_REFERENCE_OUTPUT_DIR="${CRYPTO_REFERENCE_OUTPUT_DIR:-data_crypto_reference}"
+RUN_DUNE_CRYPTO_HISTORY="${RUN_DUNE_CRYPTO_HISTORY:-0}"
+DUNE_CRYPTO_OUTPUT_DIR="${DUNE_CRYPTO_OUTPUT_DIR:-data_dune_crypto}"
+DUNE_CRYPTO_WORKERS="${DUNE_CRYPTO_WORKERS:-3}"
+RUN_CRYPTO_ETF_HISTORY="${RUN_CRYPTO_ETF_HISTORY:-0}"
+CRYPTO_ETF_OUTPUT_DIR="${CRYPTO_ETF_OUTPUT_DIR:-data_crypto_etf}"
+CRYPTO_ETF_SEC_WORKERS="${CRYPTO_ETF_SEC_WORKERS:-10}"
+CRYPTO_ETF_ISSUER_WORKERS="${CRYPTO_ETF_ISSUER_WORKERS:-4}"
+CRYPTO_ETF_PRIMARY_DOCUMENTS="${CRYPTO_ETF_PRIMARY_DOCUMENTS:-1}"
+CRYPTO_ACTIVE_INTRADAY_GRAIN="${CRYPTO_ACTIVE_INTRADAY_GRAIN:-1m}"
+RUN_CRYPTO_TRADE_TICKS="${RUN_CRYPTO_TRADE_TICKS:-0}"
+RUN_CRYPTO_ORDER_BOOK="${RUN_CRYPTO_ORDER_BOOK:-0}"
+RUN_CRYPTO_LIQUIDATIONS="${RUN_CRYPTO_LIQUIDATIONS:-0}"
 RUN_ALPACA_US="${RUN_ALPACA_US:-1}"
 ALPACA_US_WORKERS="${ALPACA_US_WORKERS:-16}"
 ALPACA_US_METADATA_WORKERS="${ALPACA_US_METADATA_WORKERS:-4}"
@@ -100,7 +122,7 @@ RUN_TW_SHORT_RESTRICTIONS="${RUN_TW_SHORT_RESTRICTIONS:-1}"
 TW_PUBLIC_FEATURE_PATH="${TW_PUBLIC_FEATURE_PATH:-data_tw_public/features/tw_public_stock_daily.parquet}"
 TW_OFFICIAL_BACKFILL_WORKERS="${TW_OFFICIAL_BACKFILL_WORKERS:-8}"
 RUN_DATA_QUALITY_AUDIT="${RUN_DATA_QUALITY_AUDIT:-0}"
-AUDIT_ROOTS="${AUDIT_ROOTS:-data_tw_public/stocks data_yahoo/us_stocks data_yahoo/forex data_yahoo/crypto data_okx data_bybit data_forex_frankfurter data_peperstone}"
+AUDIT_ROOTS="${AUDIT_ROOTS:-data_tw_public/stocks data_yahoo/us_stocks data_yahoo/forex data_okx/1m data_okx/daily data_bybit/1m data_bybit/daily data_binance/1m data_binance/daily data_crypto_reference data_forex_frankfurter data_peperstone}"
 AUDIT_OUTPUT_DIR="${AUDIT_OUTPUT_DIR:-artifacts/data_quality}"
 AUDIT_WORKERS="${AUDIT_WORKERS:-16}"
 AUDIT_STALE_MAX_LAG_DAYS="${AUDIT_STALE_MAX_LAG_DAYS:-14}"
@@ -360,7 +382,7 @@ run_yahoo_incremental() {
     local step_suffix="daily_update"
     if [[ "$asset" == "crypto" ]]; then
       yahoo_mode="incremental"
-      step_suffix="15m_update"
+      step_suffix="1m_update"
     fi
     base_cmd=(
       "$PYTHON_BIN" downloader/download_yahoo_ohlcv.py
@@ -387,7 +409,17 @@ run_yahoo_incremental() {
       fi
     fi
 
-    run_step "yahoo_${asset}_${step_suffix}" "${run_cmd[@]}" || rc=1
+    if ! run_step "yahoo_${asset}_${step_suffix}" "${run_cmd[@]}"; then
+      rc=1
+      continue
+    fi
+    if [[ "$asset" == "crypto" ]]; then
+      run_step yahoo_crypto_daily_materialize \
+        "$PYTHON_BIN" downloader/materialize_ohlcv_daily.py \
+        --input-dir data_yahoo/crypto/1m \
+        --output-dir data_yahoo/crypto/daily \
+        --provider Yahoo || rc=1
+    fi
   done
   return "$rc"
 }
@@ -476,64 +508,153 @@ run_pepperstone_incremental() {
   fi
 }
 
-run_cex_incremental() {
+run_okx_perp_incremental() {
   local today
-  local rc=0
-  local -a bybit_categories=()
+  local -a cmd=()
 
   today="$(date +%F)"
   if [[ "$RUN_CEX_PERP" != "1" ]]; then
-    log "skip=cex_perp_15m_update reason=RUN_CEX_PERP=${RUN_CEX_PERP}"
+    log "skip=okx_perp_1m_update reason=RUN_CEX_PERP=${RUN_CEX_PERP}"
     return 0
   fi
-
-  read -r -a bybit_categories <<< "$BYBIT_CATEGORIES"
-  local -a okx_cmd=()
-  local -a bybit_cmd=()
-  local -a binance_cmd=()
-  okx_cmd=(
-    "$PYTHON_BIN" downloader/download_okx_perp_15m.py
+  cmd=(
+    "$PYTHON_BIN" downloader/download_okx_perp_1m.py
     --mode incremental
     --end-date "$today"
     --workers "$OKX_WORKERS"
     --max-retries "$OKX_MAX_RETRIES"
   )
   if [[ -n "$OKX_REQUEST_INTERVAL" ]]; then
-    okx_cmd+=(--request-interval "$OKX_REQUEST_INTERVAL")
+    cmd+=(--request-interval "$OKX_REQUEST_INTERVAL")
   fi
-  run_step okx_perp_15m_update "${okx_cmd[@]}" || rc=1
+  run_step okx_perp_1m_update "${cmd[@]}" || return $?
+  run_step okx_perp_daily_materialize \
+    "$PYTHON_BIN" downloader/materialize_ohlcv_daily.py \
+    --input-dir data_okx/1m --output-dir data_okx/daily \
+    --provider OKX --workers "$CRYPTO_DAILY_MATERIALIZE_WORKERS"
+}
 
-  bybit_cmd=(
-    "$PYTHON_BIN" downloader/download_bybit_perp_15m.py
+run_bybit_perp_incremental() {
+  local today
+  local -a categories=()
+  local -a cmd=()
+
+  today="$(date +%F)"
+  if [[ "$RUN_CEX_PERP" != "1" ]]; then
+    log "skip=bybit_perp_1m_update reason=RUN_CEX_PERP=${RUN_CEX_PERP}"
+    return 0
+  fi
+  read -r -a categories <<< "$BYBIT_CATEGORIES"
+  cmd=(
+    "$PYTHON_BIN" downloader/download_bybit_perp_1m.py
     --mode incremental
     --end-date "$today"
     --workers "$BYBIT_WORKERS"
     --max-retries "$BYBIT_MAX_RETRIES"
-    --categories "${bybit_categories[@]}"
+    --categories "${categories[@]}"
   )
   if [[ -n "$BYBIT_REQUEST_INTERVAL" ]]; then
-    bybit_cmd+=(--request-interval "$BYBIT_REQUEST_INTERVAL")
+    cmd+=(--request-interval "$BYBIT_REQUEST_INTERVAL")
   fi
-  run_step bybit_perp_15m_update "${bybit_cmd[@]}" || rc=1
+  run_step bybit_perp_1m_update "${cmd[@]}" || return $?
+  run_step bybit_perp_daily_materialize \
+    "$PYTHON_BIN" downloader/materialize_ohlcv_daily.py \
+    --input-dir data_bybit/1m --output-dir data_bybit/daily \
+    --provider Bybit --workers "$CRYPTO_DAILY_MATERIALIZE_WORKERS"
+}
 
-  if [[ "$RUN_BINANCE_PERP" == "1" ]]; then
-    binance_cmd=(
-      "$PYTHON_BIN" downloader/download_binance_perp_15m.py
-      --mode incremental
-      --end-date "$today"
-      --workers "$BINANCE_WORKERS"
-      --max-retries "$BINANCE_MAX_RETRIES"
-    )
-    if [[ -n "$BINANCE_REQUEST_WEIGHT_PER_MINUTE" ]]; then
-      binance_cmd+=(
-        --request-weight-per-minute "$BINANCE_REQUEST_WEIGHT_PER_MINUTE"
-      )
-    fi
-    run_step binance_perp_15m_update "${binance_cmd[@]}" || rc=1
-  else
-    log "skip=binance_perp_15m_update reason=RUN_BINANCE_PERP=${RUN_BINANCE_PERP}"
+run_binance_perp_incremental() {
+  local today
+  local -a cmd=()
+
+  today="$(date +%F)"
+  if [[ "$RUN_CEX_PERP" != "1" || "$RUN_BINANCE_PERP" != "1" ]]; then
+    log "skip=binance_perp_1m_update reason=RUN_CEX_PERP:${RUN_CEX_PERP},RUN_BINANCE_PERP:${RUN_BINANCE_PERP}"
+    return 0
   fi
-  return "$rc"
+  cmd=(
+    "$PYTHON_BIN" downloader/download_binance_perp_1m.py
+    --mode incremental
+    --end-date "$today"
+    --workers "$BINANCE_WORKERS"
+    --feature-workers "$BINANCE_FEATURE_WORKERS"
+    --max-retries "$BINANCE_MAX_RETRIES"
+  )
+  if [[ -n "$BINANCE_REQUEST_WEIGHT_PER_MINUTE" ]]; then
+    cmd+=(--request-weight-per-minute "$BINANCE_REQUEST_WEIGHT_PER_MINUTE")
+  fi
+  run_step binance_perp_1m_update "${cmd[@]}" || return $?
+  run_step binance_perp_daily_materialize \
+    "$PYTHON_BIN" downloader/materialize_ohlcv_daily.py \
+    --input-dir data_binance/1m --output-dir data_binance/daily \
+    --provider Binance --workers "$CRYPTO_DAILY_MATERIALIZE_WORKERS"
+}
+
+run_free_public_context_incremental() {
+  if [[ "$RUN_FREE_PUBLIC_CONTEXT" == "1" ]]; then
+    run_step free_public_context_update \
+      "$PYTHON_BIN" downloader/download_free_public_context.py \
+      --output-dir "$FREE_PUBLIC_CONTEXT_OUTPUT_DIR"
+    return
+  fi
+  log "skip=free_public_context_update reason=RUN_FREE_PUBLIC_CONTEXT=${RUN_FREE_PUBLIC_CONTEXT}"
+}
+
+run_coinmetrics_community_incremental() {
+  local today
+
+  today="$(date +%F)"
+  if [[ "$RUN_COINMETRICS_COMMUNITY" == "1" ]]; then
+    run_step coinmetrics_community_update \
+      "$PYTHON_BIN" downloader/download_coinmetrics_community.py \
+      --output-dir "$COINMETRICS_OUTPUT_DIR" \
+      --end-date "$today" \
+      --workers "$COINMETRICS_WORKERS" \
+      --batch-assets "$COINMETRICS_BATCH_ASSETS"
+    return
+  fi
+  log "skip=coinmetrics_community_update reason=RUN_COINMETRICS_COMMUNITY=${RUN_COINMETRICS_COMMUNITY}"
+}
+
+run_crypto_reference_incremental() {
+  if [[ "$RUN_CRYPTO_REFERENCE" == "1" ]]; then
+    run_step crypto_reference_update \
+      "$PYTHON_BIN" downloader/download_crypto_keyed_context.py \
+      --output-dir "$CRYPTO_REFERENCE_OUTPUT_DIR"
+    return
+  fi
+  log "skip=crypto_reference_update reason=RUN_CRYPTO_REFERENCE=${RUN_CRYPTO_REFERENCE}"
+}
+
+run_dune_crypto_history_incremental() {
+  if [[ "$RUN_DUNE_CRYPTO_HISTORY" == "1" ]]; then
+    run_step dune_crypto_history_update \
+      "$PYTHON_BIN" downloader/download_dune_crypto_history.py \
+      --output-dir "$DUNE_CRYPTO_OUTPUT_DIR" \
+      --end-date today \
+      --workers "$DUNE_CRYPTO_WORKERS"
+    return
+  fi
+  log "skip=dune_crypto_history_update reason=RUN_DUNE_CRYPTO_HISTORY=${RUN_DUNE_CRYPTO_HISTORY}"
+}
+
+run_crypto_etf_history_incremental() {
+  local -a cmd=(
+    "$PYTHON_BIN" downloader/download_crypto_etf_history.py
+    --output-dir "$CRYPTO_ETF_OUTPUT_DIR"
+    --sec-workers "$CRYPTO_ETF_SEC_WORKERS"
+    --issuer-workers "$CRYPTO_ETF_ISSUER_WORKERS"
+  )
+  if [[ "$RUN_CRYPTO_ETF_HISTORY" != "1" ]]; then
+    log "skip=crypto_etf_history_update reason=RUN_CRYPTO_ETF_HISTORY=${RUN_CRYPTO_ETF_HISTORY}"
+    return 0
+  fi
+  if [[ "$CRYPTO_ETF_PRIMARY_DOCUMENTS" == "1" ]]; then
+    cmd+=(--primary-documents)
+  else
+    cmd+=(--no-primary-documents)
+  fi
+  run_step crypto_etf_history_update "${cmd[@]}"
 }
 
 run_tw_public_data_update() {
@@ -690,7 +811,15 @@ run_market_close_cycle() {
     cex_date="$(TZ="$CEX_CLOSE_TZ" date +%F)"
     log "market=cex due date=${cex_date} close=${CEX_CLOSE_TIME} tz=${CEX_CLOSE_TZ}"
     failures_before="${#FAILED_STEPS[@]}"
-    run_cex_incremental
+    run_parallel_groups \
+      okx_perpetuals run_okx_perp_incremental \
+      bybit_perpetuals run_bybit_perp_incremental \
+      binance_perpetuals run_binance_perp_incremental \
+      crypto_reference run_crypto_reference_incremental \
+      dune_crypto_history run_dune_crypto_history_incremental \
+      crypto_etf_history run_crypto_etf_history_incremental \
+      free_public_context run_free_public_context_incremental \
+      coinmetrics_community run_coinmetrics_community_incremental
     did_run=1
     if (( ${#FAILED_STEPS[@]} == failures_before )); then
       LAST_RUN_CEX="$cex_date"
@@ -733,7 +862,14 @@ run_once_cycle() {
     tw_public run_tw_public_data_update \
     frankfurter run_frankfurter_incremental \
     pepperstone run_pepperstone_incremental \
-    cex run_cex_incremental
+    okx_perpetuals run_okx_perp_incremental \
+    bybit_perpetuals run_bybit_perp_incremental \
+    binance_perpetuals run_binance_perp_incremental \
+    crypto_reference run_crypto_reference_incremental \
+    dune_crypto_history run_dune_crypto_history_incremental \
+    crypto_etf_history run_crypto_etf_history_incremental \
+    free_public_context run_free_public_context_incremental \
+    coinmetrics_community run_coinmetrics_community_incremental
 
   run_data_quality_audit "$cycle_id" || true
 
@@ -781,6 +917,14 @@ validate_settings() {
     echo "[daily] DAILY_PARALLEL_GROUPS must be 0 or 1" >&2
     exit 2
   fi
+  if [[ "$CRYPTO_ACTIVE_INTRADAY_GRAIN" != "1m" ]]; then
+    echo "[daily] CRYPTO_ACTIVE_INTRADAY_GRAIN must be 1m while the active crypto scope is candle-only" >&2
+    exit 2
+  fi
+  if [[ "$RUN_CRYPTO_TRADE_TICKS" != "0" || "$RUN_CRYPTO_ORDER_BOOK" != "0" || "$RUN_CRYPTO_LIQUIDATIONS" != "0" ]]; then
+    echo "[daily] crypto event acquisition is deferred; trade ticks, order books and liquidations must remain disabled" >&2
+    exit 2
+  fi
   if [[ "$TEE_LOG" != "0" && "$TEE_LOG" != "1" ]]; then
     echo "[daily] TEE_LOG must be 0 or 1" >&2
     exit 2
@@ -803,6 +947,18 @@ validate_settings() {
   fi
   if [[ "$RUN_DATA_QUALITY_AUDIT" != "0" && "$RUN_DATA_QUALITY_AUDIT" != "1" ]]; then
     echo "[daily] RUN_DATA_QUALITY_AUDIT must be 0 or 1" >&2
+    exit 2
+  fi
+  if [[ "$RUN_DUNE_CRYPTO_HISTORY" != "0" && "$RUN_DUNE_CRYPTO_HISTORY" != "1" ]]; then
+    echo "[daily] RUN_DUNE_CRYPTO_HISTORY must be 0 or 1" >&2
+    exit 2
+  fi
+  if [[ "$RUN_CRYPTO_ETF_HISTORY" != "0" && "$RUN_CRYPTO_ETF_HISTORY" != "1" ]]; then
+    echo "[daily] RUN_CRYPTO_ETF_HISTORY must be 0 or 1" >&2
+    exit 2
+  fi
+  if [[ "$CRYPTO_ETF_PRIMARY_DOCUMENTS" != "0" && "$CRYPTO_ETF_PRIMARY_DOCUMENTS" != "1" ]]; then
+    echo "[daily] CRYPTO_ETF_PRIMARY_DOCUMENTS must be 0 or 1" >&2
     exit 2
   fi
   if [[ "$TW_PUBLIC_OHLCV_FALLBACK" != "yahoo" && "$TW_PUBLIC_OHLCV_FALLBACK" != "none" ]]; then
@@ -887,5 +1043,5 @@ init_run_logging
 validate_settings
 acquire_lock
 load_schedule_state
-log "scheduler boot run_id=${RUN_ID} run_mode=${RUN_MODE} parallel_groups=${DAILY_PARALLEL_GROUPS} interval_sec=${INTERVAL_SECONDS} max_cycles=${MAX_CYCLES} python=${PYTHON_BIN} log_file=${RUN_LOG_FILE}"
+log "scheduler boot run_id=${RUN_ID} run_mode=${RUN_MODE} parallel_groups=${DAILY_PARALLEL_GROUPS} interval_sec=${INTERVAL_SECONDS} max_cycles=${MAX_CYCLES} crypto_grain=${CRYPTO_ACTIVE_INTRADAY_GRAIN} crypto_events=disabled python=${PYTHON_BIN} log_file=${RUN_LOG_FILE}"
 run_scheduler

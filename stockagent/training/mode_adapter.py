@@ -118,6 +118,22 @@ _MODE_SPECS: Final[tuple[TrainingModeSpec, ...]] = (
         split_ownership="year_expanding_walk_forward",
     ),
     TrainingModeSpec(
+        execution_mode="tw_futures_portfolio_day",
+        product_family=(
+            "taifex_historical_and_current_stock_etf_domestic_and_foreign_"
+            "index_futures"
+        ),
+        frequency="daily_general_session",
+        decision_clock="completed_prior_general_session_and_public_features",
+        execution_clock="next_general_session_open_then_next_open_or_own_close",
+        recurrent_state_scope="cross_session_independent_delivery_month_positions",
+        terminal_policy="mandatory_own_contract_close_at_expiry_or_fold_end",
+        split_ownership="year_expanding_walk_forward",
+        benchmark_contract="tx_front_month_same_physical_contract_no_roll_gap",
+        weight_snapshot_contract="open_target_before_mandatory_close_liquidation",
+        turnover_contract="gross_notional_change_plus_mandatory_close_over_nav",
+    ),
+    TrainingModeSpec(
         execution_mode="tw_index_futures_day",
         product_family="taiwan_index_futures_tx_mtx_tmf",
         frequency="daily_session",

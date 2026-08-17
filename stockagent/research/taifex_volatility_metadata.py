@@ -48,6 +48,16 @@ VOLATILITY_MODEL_IMPLEMENTATION: Final[dict[str, str]] = {
 
 CLASSIC_VARIANT_ID: Final[str] = "classic_opening_straddle"
 PUT_CALL_PARITY_TX_STRATEGY_ID: Final[str] = "put_call_parity_tx"
+ROLLING_ITM_LONG_STRADDLE_ID: Final[str] = "long_rolling_itm_straddle"
+ROLLING_ITM_SHORT_STRADDLE_ID: Final[str] = "short_rolling_itm_straddle"
+ROLLING_OTM_LONG_STRADDLE_ID: Final[str] = "long_rolling_otm_straddle"
+ROLLING_OTM_SHORT_STRADDLE_ID: Final[str] = "short_rolling_otm_straddle"
+ROLLING_STRADDLE_IDS: Final[tuple[str, ...]] = (
+    ROLLING_ITM_LONG_STRADDLE_ID,
+    ROLLING_ITM_SHORT_STRADDLE_ID,
+    ROLLING_OTM_LONG_STRADDLE_ID,
+    ROLLING_OTM_SHORT_STRADDLE_ID,
+)
 MODEL_VARIANT_PREFIX: Final[str] = "daily_vol_model_gamma__"
 STRATEGY_MODE_DAILY: Final[str] = "daily_close_next_open"
 STRATEGY_MODE_INTRADAY_FUTURES: Final[str] = "intraday_futures"
@@ -135,6 +145,7 @@ _DIRECTIONAL_EXPOSURE_BY_ID: Final[dict[str, str]] = _expand_exposure_groups(
                 "iron_butterfly",
                 "iron_condor",
                 "variance_vol_swaps",
+                *ROLLING_STRADDLE_IDS,
             ),
         ),
         (
@@ -200,6 +211,8 @@ _VOLATILITY_EXPOSURE_BY_ID: Final[dict[str, str]] = _expand_exposure_groups(
                 "protective_call_with_future",
                 "call_ratio_backspread",
                 "put_ratio_backspread",
+                ROLLING_ITM_LONG_STRADDLE_ID,
+                ROLLING_OTM_LONG_STRADDLE_ID,
             ),
         ),
         (
@@ -218,6 +231,8 @@ _VOLATILITY_EXPOSURE_BY_ID: Final[dict[str, str]] = _expand_exposure_groups(
                 "put_ratio_spread",
                 "covered_call",
                 "jade_lizard",
+                ROLLING_ITM_SHORT_STRADDLE_ID,
+                ROLLING_OTM_SHORT_STRADDLE_ID,
             ),
         ),
         (
@@ -336,6 +351,7 @@ _HEDGE_TYPE_BY_ID: Final[dict[str, str]] = _expand_exposure_groups(
             "parity_locked",
             ("long_box", "conversion", "reversal", PUT_CALL_PARITY_TX_STRATEGY_ID),
         ),
+        ("dynamic_option_roll", ROLLING_STRADDLE_IDS),
         ("synthetic_linear", ("synthetic_long", "synthetic_short")),
         (
             "contract_pending",
@@ -444,6 +460,10 @@ EXPOSURE_TAXONOMY: Final[dict[str, dict[str, dict[str, str]]]] = {
             "label": "Parity／鎖定對沖",
             "definition": "以 put-call parity 或 box 結構鎖定相對現金流。",
         },
+        "dynamic_option_roll": {
+            "label": "動態選擇權換腿",
+            "definition": "依即時價內／價外狀態先平舊腿，再以嚴格較晚的五檔報價換到新 ATM 腿。",
+        },
         "synthetic_linear": {
             "label": "合成線性",
             "definition": "Call/Put 組合抵銷部分波動敏感度並形成方向性線性 payoff。",
@@ -478,6 +498,7 @@ class StrategySpec:
     option_legs: tuple[tuple[str, int, int], ...] = ()
     hedge_policy: str = "none"
     hedge_parameter: float | None = None
+    option_roll_policy: str = "none"
     blocker: str | None = None
 
     def exposure_payload(self) -> dict[str, object]:
@@ -567,6 +588,7 @@ def _live(
     option_legs: tuple[tuple[str, int, int], ...] = (),
     hedge_policy: str = "none",
     hedge_parameter: float | None = None,
+    option_roll_policy: str = "none",
     broker_monitoring: str = "ideal_only",
 ) -> StrategySpec:
     return StrategySpec(
@@ -584,6 +606,7 @@ def _live(
         option_legs=option_legs,
         hedge_policy=hedge_policy,
         hedge_parameter=hedge_parameter,
+        option_roll_policy=option_roll_policy,
     )
 
 
@@ -725,6 +748,62 @@ _STATIC_LIVE_SPECS: Final[tuple[StrategySpec, ...]] = (
         "絕大多數小行情可能雙腿歸零；不能用少數尾端獲利推論穩定性。",
         "direct_long_premium",
         option_legs=(("C", 2, 1), ("P", -2, 1)),
+    ),
+)
+
+
+_ROLLING_STRADDLE_LIVE_SPECS: Final[tuple[StrategySpec, ...]] = (
+    _live(
+        ROLLING_ITM_LONG_STRADDLE_ID,
+        "Long Rolling ITM Straddle",
+        "dynamic_straddle_roll",
+        "動態選擇權",
+        "開盤買進 ATM Call 與 Put；其後只把已進入價內的舊腿平倉並換成同權利別的新 ATM 腿。",
+        "週期第一組完整 ATM Call/Put 五檔以 Ask 建倉；TX 中價只使用決策前已收到的報價。",
+        "Call 履約價低於 TX 中價或 Put 履約價高於 TX 中價時產生換腿訊號；舊腿賣 Bid、新 ATM 腿買 Ask，兩者都必須是訊號後嚴格較晚且完整的五檔，最後以官方週結算。",
+        "頻繁穿越履約價會反覆支付價差、手續費與稅；長方最大損失不只初始權利金，還包含後續換腿投入。",
+        "live_causal_atomic_single_leg_itm_to_atm_roll",
+        option_legs=_ATM_STRADDLE,
+        option_roll_policy="itm_to_atm",
+    ),
+    _live(
+        ROLLING_ITM_SHORT_STRADDLE_ID,
+        "Short Rolling ITM Straddle",
+        "dynamic_straddle_roll",
+        "動態選擇權",
+        "開盤賣出 ATM Call 與 Put；其後只把已進入價內的舊腿回補並重新賣出同權利別的新 ATM 腿。",
+        "週期第一組完整 ATM Call/Put 五檔以 Bid 建倉；逐腿採保守裸賣保證金，不套未驗證的組合折抵。",
+        "Call 履約價低於 TX 中價或 Put 履約價高於 TX 中價時產生換腿訊號；舊腿回補 Ask、新 ATM 腿賣 Bid，兩者都必須是訊號後嚴格較晚且完整的五檔，最後以官方週結算。",
+        "裸賣雙尾損失可能遠超權利金；追著價內腿換倉會實現虧損並承受價差、稅、流動性與強平風險。",
+        "live_causal_atomic_single_leg_itm_to_atm_roll_conservative_naked_margin",
+        option_legs=(("C", 0, -1), ("P", 0, -1)),
+        option_roll_policy="itm_to_atm",
+    ),
+    _live(
+        ROLLING_OTM_LONG_STRADDLE_ID,
+        "Long Rolling OTM Straddle",
+        "dynamic_straddle_roll",
+        "動態選擇權",
+        "開盤買進 ATM Call 與 Put；其後只把已進入價外的舊腿平倉並換成同權利別的新 ATM 腿。",
+        "週期第一組完整 ATM Call/Put 五檔以 Ask 建倉；TX 中價只使用決策前已收到的報價。",
+        "Call 履約價高於 TX 中價或 Put 履約價低於 TX 中價時產生換腿訊號；舊腿賣 Bid、新 ATM 腿買 Ask，兩者都必須是訊號後嚴格較晚且完整的五檔，最後以官方週結算。",
+        "反覆把價外腿拉回 ATM 會持續支付較高時間價值、價差、手續費與稅，震盪行情可能快速侵蝕資金。",
+        "live_causal_atomic_single_leg_otm_to_atm_roll",
+        option_legs=_ATM_STRADDLE,
+        option_roll_policy="otm_to_atm",
+    ),
+    _live(
+        ROLLING_OTM_SHORT_STRADDLE_ID,
+        "Short Rolling OTM Straddle",
+        "dynamic_straddle_roll",
+        "動態選擇權",
+        "開盤賣出 ATM Call 與 Put；其後只把已進入價外的舊腿回補並重新賣出同權利別的新 ATM 腿。",
+        "週期第一組完整 ATM Call/Put 五檔以 Bid 建倉；逐腿採保守裸賣保證金，不套未驗證的組合折抵。",
+        "Call 履約價高於 TX 中價或 Put 履約價低於 TX 中價時產生換腿訊號；舊腿回補 Ask、新 ATM 腿賣 Bid，兩者都必須是訊號後嚴格較晚且完整的五檔，最後以官方週結算。",
+        "裸賣仍承擔雙尾與保證金風險；重賣 ATM 雖提高收取權利金，也會重設最大 Gamma 區並增加換手成本。",
+        "live_causal_atomic_single_leg_otm_to_atm_roll_conservative_naked_margin",
+        option_legs=(("C", 0, -1), ("P", 0, -1)),
+        option_roll_policy="otm_to_atm",
     ),
 )
 
@@ -1125,6 +1204,7 @@ _MULTI_LEG_LIVE_SPECS: Final[tuple[StrategySpec, ...]] = (
 
 LIVE_STRATEGY_SPECS: Final[tuple[StrategySpec, ...]] = (
     *_STATIC_LIVE_SPECS,
+    *_ROLLING_STRADDLE_LIVE_SPECS,
     *_MODEL_LIVE_SPECS,
     *_POLICY_LIVE_SPECS,
     *_MULTI_LEG_LIVE_SPECS,
@@ -1302,6 +1382,11 @@ __all__ = [
     "MODEL_SLV",
     "MODEL_VARIANT_PREFIX",
     "PUT_CALL_PARITY_TX_STRATEGY_ID",
+    "ROLLING_ITM_LONG_STRADDLE_ID",
+    "ROLLING_ITM_SHORT_STRADDLE_ID",
+    "ROLLING_OTM_LONG_STRADDLE_ID",
+    "ROLLING_OTM_SHORT_STRADDLE_ID",
+    "ROLLING_STRADDLE_IDS",
     "REFERENCE_STRATEGY_SPECS",
     "STRATEGY_CATALOG",
     "STRATEGY_IDS",

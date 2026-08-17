@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import date
 import json
+from types import SimpleNamespace
 
 import polars as pl
 import pytest
@@ -29,6 +30,86 @@ def test_day_trade_history_specs_use_official_daily_endpoints() -> None:
         "https://www.tpex.org.tw/www/zh-tw/intraday/list"
         "?date=2024/07/15&code="
     )
+
+
+def test_twse_same_session_uses_openapi_before_dated_history() -> None:
+    spec = downloader.DEFAULT_DATASETS["twse_day_trade_eligibility"]
+    sources = downloader._historical_request_sources(
+        spec,
+        date(2026, 8, 17),
+        SimpleNamespace(same_session_rule_date="2026-08-17"),
+    )
+
+    assert sources[0] == (
+        downloader.TWSE_DAY_TRADE_OPENAPI_URL,
+        "twse_day_trade_openapi_json",
+    )
+    assert sources[1] == (
+        "https://wwwc.twse.com.tw/rwd/zh/dayTrading/TWTB4U"
+        "?date=20260817&selectType=All&response=json",
+        "json",
+    )
+
+
+def test_same_session_calendar_end_skips_only_weekends() -> None:
+    assert downloader._calendar_end_before_same_session(
+        date(2026, 8, 17)
+    ) == date(2026, 8, 14)
+    assert downloader._calendar_end_before_same_session(
+        date(2026, 8, 18)
+    ) == date(2026, 8, 17)
+
+
+def test_twse_day_trade_openapi_binds_roc_date_and_schema() -> None:
+    spec = downloader.DEFAULT_DATASETS["twse_day_trade_eligibility"]
+    payload = [
+        {
+            "Date": "1150817",
+            "Code": "2330",
+            "Name": "台積電",
+            "Suspension": "",
+        },
+        {
+            "Date": "1150817",
+            "Code": "2317",
+            "Name": "鴻海",
+            "Suspension": "Y",
+        },
+    ]
+
+    frame, suffix = downloader._parse_historical_response_content(
+        spec,
+        date(2026, 8, 17),
+        json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        "twse_day_trade_openapi_json",
+    )
+
+    assert suffix == ".json"
+    assert frame.select(
+        "date",
+        "證券代號",
+        "暫停現股賣出後現款買進當沖註記",
+    ).to_dicts() == [
+        {
+            "date": "2026-08-17",
+            "證券代號": "2330",
+            "暫停現股賣出後現款買進當沖註記": "",
+        },
+        {
+            "date": "2026-08-17",
+            "證券代號": "2317",
+            "暫停現股賣出後現款買進當沖註記": "Y",
+        },
+    ]
+
+    stale = [{**payload[0], "Date": "1150814"}]
+    with pytest.raises(downloader.HistoricalResponseError, match="date mismatch"):
+        downloader._parse_historical_response_content(
+            spec,
+            date(2026, 8, 17),
+            json.dumps(stale, ensure_ascii=False).encode("utf-8"),
+            "twse_day_trade_openapi_json",
+        )
 
 
 def test_twse_day_trade_history_selects_rule_table_and_binds_both_dates() -> None:
@@ -419,6 +500,37 @@ def test_day_trade_feature_builder_rejects_incomplete_session_coverage(tmp_path)
 
     with pytest.raises(ValueError, match="coverage does not match"):
         _build_day_trade_rule_features(tmp_path)
+
+
+def test_day_trade_feature_builder_preserves_but_excludes_next_session_master(
+    tmp_path,
+) -> None:
+    _write_day_trade_inputs(tmp_path)
+    next_session = date(2014, 7, 1)
+    for dataset in (
+        "twse_day_trade_eligibility",
+        "tpex_day_trade_eligibility",
+    ):
+        path = tmp_path / f"{dataset}.parquet"
+        existing = pl.read_parquet(path)
+        future = existing.tail(1).with_columns(pl.lit(next_session).alias("date"))
+        pl.concat([existing, future]).write_parquet(path)
+
+    with pytest.raises(ValueError, match="extra=.*2014, 7, 1"):
+        _build_day_trade_rule_features(tmp_path)
+
+    rules = _build_day_trade_rule_features(
+        tmp_path,
+        end_date=date(2014, 6, 30),
+    )
+    assert rules["date"].max() == date(2014, 6, 30)
+    assert next_session not in rules["date"].to_list()
+    for dataset in (
+        "twse_day_trade_eligibility",
+        "tpex_day_trade_eligibility",
+    ):
+        persisted = pl.read_parquet(tmp_path / f"{dataset}.parquet")
+        assert next_session in persisted["date"].to_list()
 
 
 def test_day_trade_feature_builder_can_fail_closed_on_missing_latest_receipt(

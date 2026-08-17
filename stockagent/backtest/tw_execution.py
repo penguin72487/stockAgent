@@ -28,6 +28,7 @@ EXECUTION_MODES: Final[tuple[str, ...]] = (
     "tw_day_trade",
     "tw_minute",
     "tw_overnight",
+    "tw_futures_portfolio_day",
     "tw_index_futures_day",
     "tw_index_derivatives_day",
     "tw_index_derivatives_tick",
@@ -48,6 +49,17 @@ TW_DERIVATIVES_TICK_EXECUTION_MODES: Final[tuple[str, ...]] = (
     "tw_index_derivatives_tick",
     "tw_index_options_tick_long",
     "tw_index_options_tick_short",
+)
+TW_FUTURES_PORTFOLIO_EXECUTION_MODES: Final[tuple[str, ...]] = (
+    "tw_futures_portfolio_day",
+)
+# These modes use the shared continuous target-weight portfolio ledger as
+# their canonical research accounting.  The TAIFEX portfolio mode deliberately
+# remains notional until a complete point-in-time multiplier/margin/fee master
+# exists for every listed product.
+CONTINUOUS_WEIGHT_EXECUTION_MODES: Final[tuple[str, ...]] = (
+    "naive",
+    *TW_FUTURES_PORTFOLIO_EXECUTION_MODES,
 )
 FEE_ROUNDING_MODES: Final[tuple[str, ...]] = ("none", "floor", "half_up")
 _DIRECTIONAL_GROSS_EPS: Final[float] = 1.0e-12
@@ -115,6 +127,12 @@ _EXECUTION_MODE_ALIASES: Final[dict[str, str]] = {
     "tw_futures_day": "tw_index_futures_day",
     "taiex_futures_day": "tw_index_futures_day",
     "台指期日盤": "tw_index_futures_day",
+    # Independent, lifetime-stable delivery-month/week positions across every
+    # selected TAIFEX stock, ETF, domestic-index, and foreign-index family.
+    "tw_futures_portfolio_day": "tw_futures_portfolio_day",
+    "tw_all_futures_day": "tw_futures_portfolio_day",
+    "taifex_futures_portfolio_day": "tw_futures_portfolio_day",
+    "全期貨日線": "tw_futures_portfolio_day",
     # Daily-flat joint TX/MTX/TMF plus full-chain monthly/weekly TXO.
     "tw_index_derivatives_day": "tw_index_derivatives_day",
     "tw_futures_options_day": "tw_index_derivatives_day",
@@ -152,7 +170,7 @@ def normalize_execution_mode(mode: object) -> str:
         raise ValueError(
             "execution_mode must be one of "
             "'naive', 'tw_cash', 'tw_day_trade', 'tw_minute', 'tw_overnight', or "
-            "'tw_index_futures_day', 'tw_index_derivatives_day', "
+            "'tw_futures_portfolio_day', 'tw_index_futures_day', 'tw_index_derivatives_day', "
             "'tw_index_derivatives_tick', "
             "'tw_index_options_tick_long', or 'tw_index_options_tick_short'"
         )
@@ -162,7 +180,7 @@ def normalize_execution_mode(mode: object) -> str:
         raise ValueError(
             "execution_mode must be one of "
             "'naive', 'tw_cash', 'tw_day_trade', 'tw_minute', 'tw_overnight', or "
-            "'tw_index_futures_day', 'tw_index_derivatives_day', "
+            "'tw_futures_portfolio_day', 'tw_index_futures_day', 'tw_index_derivatives_day', "
             "'tw_index_derivatives_tick', "
             "'tw_index_options_tick_long', or 'tw_index_options_tick_short'"
         )
@@ -946,9 +964,11 @@ __all__ = [
     "DEFAULT_TAIWAN_FEE_SCHEDULE",
     "DEFAULT_TAIWAN_MARGIN_SHORT_SCHEDULE",
     "EXECUTION_MODES",
+    "CONTINUOUS_WEIGHT_EXECUTION_MODES",
     "TW_CARRYING_EXECUTION_MODES",
     "TW_DERIVATIVES_TICK_EXECUTION_MODES",
     "TW_MINUTE_EXECUTION_MODES",
+    "TW_FUTURES_PORTFOLIO_EXECUTION_MODES",
     "FEE_ROUNDING_MODES",
     "DirectionalLotMixAudit",
     "TaiwanFeeSchedule",

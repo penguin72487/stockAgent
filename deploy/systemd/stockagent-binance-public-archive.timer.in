@@ -1,0 +1,10 @@
+[Unit]
+Description=Refresh Binance public daily/monthly archives after next-day publication
+
+[Timer]
+OnCalendar=*-*-* 12:30:00 Asia/Taipei
+Persistent=true
+Unit=stockagent-binance-public-archive.service
+
+[Install]
+WantedBy=timers.target

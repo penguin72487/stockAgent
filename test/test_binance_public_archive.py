@@ -1,0 +1,152 @@
+from __future__ import annotations
+
+from io import BytesIO
+from pathlib import Path
+import shutil
+from zipfile import ZIP_DEFLATED, ZipFile
+
+import polars as pl
+
+from downloader.download_binance_public_archive import (
+    ArchiveObject,
+    _canonical_merge,
+    _capacity_receipt,
+    _is_requested_symbol,
+    _parse_kline_zip,
+    _parse_listing,
+    _promote_monthly_repairs,
+    _record_state,
+    _completed_etags,
+)
+
+
+def _object(*, granularity: str = "monthly", size: int = 100) -> ArchiveObject:
+    period = "2025-01" if granularity == "monthly" else "2025-01-01"
+    return ArchiveObject(
+        market="spot",
+        symbol="BTCUSDT",
+        archive_granularity=granularity,
+        period=period,
+        partition="2025-01",
+        key=(
+            f"data/spot/{granularity}/klines/BTCUSDT/1m/"
+            f"BTCUSDT-1m-{period}.zip"
+        ),
+        etag="etag",
+        compressed_bytes=size,
+        archive_last_modified_utc="2025-02-03T00:00:00Z",
+    )
+
+
+def _zip_csv(text: str) -> bytes:
+    payload = BytesIO()
+    with ZipFile(payload, "w", compression=ZIP_DEFLATED) as archive:
+        archive.writestr("BTCUSDT-1m-2025-01.csv", text)
+    return payload.getvalue()
+
+
+def test_parse_s3_listing_with_namespace_and_pagination() -> None:
+    payload = b"""<?xml version='1.0' encoding='UTF-8'?>
+    <ListBucketResult xmlns='http://s3.amazonaws.com/doc/2006-03-01/'>
+      <Contents><Key>data/a.zip</Key><LastModified>2025-01-02T00:00:00Z</LastModified><ETag>&quot;abc&quot;</ETag><Size>123</Size></Contents>
+      <CommonPrefixes><Prefix>data/BTCUSDT/</Prefix></CommonPrefixes>
+      <NextContinuationToken>next</NextContinuationToken>
+    </ListBucketResult>"""
+
+    objects, prefixes, token = _parse_listing(payload)
+
+    assert objects == [
+        {
+            "key": "data/a.zip",
+            "etag": "abc",
+            "size": 123,
+            "last_modified": "2025-01-02T00:00:00Z",
+        }
+    ]
+    assert prefixes == ["data/BTCUSDT/"]
+    assert token == "next"
+
+
+def test_spot_microsecond_archive_is_normalized_to_milliseconds() -> None:
+    row = (
+        "1735689600000000,1,3,0.5,2,10,1735689659999999,20,5,4,8,0\n"
+    )
+
+    frame = _parse_kline_zip(_zip_csv(row), _object())
+
+    assert frame["open_time"].item() == 1_735_689_600_000
+    assert frame["close_time"].item() == 1_735_689_659_999
+    assert frame["source_timestamp_unit"].item() == "microseconds"
+
+
+def test_daily_row_overrides_monthly_row_for_same_open_time() -> None:
+    monthly = pl.DataFrame(
+        {
+            "market": ["spot"],
+            "symbol": ["BTCUSDT"],
+            "open_time": [1_000],
+            "close": [10.0],
+            "source_priority": [1],
+            "available_at_utc": ["2025-02-01T00:00:00Z"],
+            "archive_key": ["monthly.zip"],
+        }
+    )
+    daily = monthly.with_columns(
+        pl.lit(11.0).alias("close"),
+        pl.lit(2).alias("source_priority"),
+        pl.lit("2025-01-02T00:00:00Z").alias("available_at_utc"),
+        pl.lit("daily.zip").alias("archive_key"),
+    )
+
+    merged = _canonical_merge(monthly, [daily])
+
+    assert merged.height == 1
+    assert merged["close"].item() == 11.0
+    assert merged["archive_key"].item() == "daily.zip"
+
+
+def test_derivatives_scope_only_accepts_dated_futures() -> None:
+    assert _is_requested_symbol("spot", "BTCUSDT")
+    assert _is_requested_symbol("um", "BTCUSDT_250627")
+    assert _is_requested_symbol("cm", "BTCUSD_250627")
+    assert not _is_requested_symbol("um", "BTCUSDT")
+    assert not _is_requested_symbol("cm", "BTCUSD_PERP")
+
+
+def test_capacity_gate_fails_before_download(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(
+        shutil,
+        "disk_usage",
+        lambda _: shutil._ntuple_diskusage(total=1_000, used=100, free=900),
+    )
+
+    receipt = _capacity_receipt(
+        tmp_path,
+        [_object(size=400)],
+        reserve_gib=0,
+        max_download_bytes=0,
+    )
+
+    assert receipt["accepted"] is False
+    assert receipt["estimated_peak_new_bytes"] == 1_000
+    assert receipt["reasons"] == [
+        "estimated_peak_bytes_exceeds_free_space_after_reserve"
+    ]
+
+
+def test_invalid_monthly_object_is_quarantined_for_daily_rebuild(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "state.sqlite3"
+    item = _object()
+    _record_state(
+        state,
+        item,
+        status="failed",
+        error=f"{item.key}: 3 invalid OHLCV rows",
+    )
+
+    repairs = _promote_monthly_repairs(state)
+
+    assert repairs == {("spot", "BTCUSDT", "2025-01")}
+    assert _completed_etags(state) == {item.key: item.etag}

@@ -681,7 +681,7 @@ function renderCurveWall(strategies, history) {
   setText("curve-visible-count", `顯示 ${visible.length} / ${filtered.length}`);
   setText(
     "curve-wall-note",
-    `${TIME_RANGE_LABELS[selectedTimeRange]} · 符合條件 ${filtered.length} / ${strategies.length} 條曲線；共用 Y 軸（${formatPercent(minY)} ～ ${formatPercent(maxY)}），以固定預留資金正規化；排序與下表一致。`
+    `${TIME_RANGE_LABELS[selectedTimeRange]} · 符合條件 ${filtered.length} / ${strategies.length} 條曲線；共用 Y 軸（${formatPercent(minY)} ～ ${formatPercent(maxY)}），以固定預留資金正規化；全策略皆無資料的區段已略過、不補 0；排序與下表一致。`
   );
 }
 
@@ -708,8 +708,13 @@ function renderChart(history) {
   minY -= pad; maxY += pad;
   const axis = timeAxis.buildTimeAxis({
     range: selectedTimeRange,
-    timestamps: rows.map((row) => Number(row.decision_ts_ns) / 1e6),
+    timestamps: history.filter((row) => (
+      row.decision_ts_ns > 0
+      && row.total_equity_twd != null
+      && Number.isFinite(Number(row.total_equity_twd))
+    )).map((row) => Number(row.decision_ts_ns) / 1e6),
     sessions: TAIFEX_SESSIONS,
+    collapseEmptyIntervals: true,
   });
   if (!axis) return;
   const x = (row) => timeAxis.position(axis, Number(row.decision_ts_ns) / 1e6, left, width - right);
@@ -722,7 +727,7 @@ function renderChart(history) {
   }
   if (Number.isFinite(baseline)) svg.appendChild(svgNode("line", { x1: left, y1: y(baseline), x2: width - right, y2: y(baseline), class: "chart-baseline" }));
   for (const tick of axis.ticks) {
-    const xPos = timeAxis.position(axis, tick.timestamp, left, width - right);
+    const xPos = timeAxis.position(axis, tick.observedTimestamp ?? tick.timestamp, left, width - right);
     const lineClass = tick.kind === "session" ? "chart-time-grid session" : "chart-time-grid";
     const labelClass = tick.kind === "session" ? "chart-label chart-session-label" : "chart-label";
     svg.appendChild(svgNode("line", { x1: xPos, y1: top, x2: xPos, y2: height - bottom, class: lineClass }));
@@ -737,10 +742,21 @@ function renderChart(history) {
   const last = new Date(Number(rows[rows.length - 1].decision_ts_ns) / 1e6);
   const changed = Math.max(...values) !== Math.min(...values);
   const carried = rows.filter((row) => row.valuation_carried_forward).length;
+  const replayed = rows.filter((row) => (
+    row.history_source && row.history_source !== "live_forward_ledger"
+  )).length;
+  const replayNote = replayed
+    ? `；${replayed} 點為核章五檔歷史回補（與正式即時帳分層）`
+    : "";
+  const partialBackfill = (cachedHistoryMeta?.backfills || []).some((row) => (
+    String(row?.status || "").startsWith("partial")
+  ));
+  const coverageNote = partialBackfill ? "；未完成 manifest 的時段維持缺口" : "";
   const pnl = rows.at(-1).cumulative_pnl_twd;
+  const missingIntervalNote = "；全策略皆無資料的區段已略過、不補 0，下一筆有效資料直接接續";
   setText("chart-note", changed
-    ? `${TIME_RANGE_LABELS[selectedTimeRange]} · ${rows.length} 點（${localTime(first.toISOString())} ～ ${localTime(last.toISOString())}）${cachedHistoryMeta?.downsampled ? "；長區間已保留區間高低極值縮圖" : ""}；${carried} 點延用上一筆完整估值；最後總權益 ${formatTwd(values.at(-1))}，累積損益 ${formatTwd(pnl)}。`
-    : `${TIME_RANGE_LABELS[selectedTimeRange]} · ${rows.length} 點（${localTime(first.toISOString())} ～ ${localTime(last.toISOString())}）${cachedHistoryMeta?.downsampled ? "；長區間已保留區間高低極值縮圖" : ""}；${carried} 點延用上一筆完整估值；總權益維持 ${formatTwd(values.at(-1))}。`);
+    ? `${TIME_RANGE_LABELS[selectedTimeRange]} · ${rows.length} 點（${localTime(first.toISOString())} ～ ${localTime(last.toISOString())}）${cachedHistoryMeta?.downsampled ? "；長區間已保留區間高低極值縮圖" : ""}${missingIntervalNote}${replayNote}${coverageNote}；${carried} 點延用上一筆完整估值；最後總權益 ${formatTwd(values.at(-1))}，累積損益 ${formatTwd(pnl)}。`
+    : `${TIME_RANGE_LABELS[selectedTimeRange]} · ${rows.length} 點（${localTime(first.toISOString())} ～ ${localTime(last.toISOString())}）${cachedHistoryMeta?.downsampled ? "；長區間已保留區間高低極值縮圖" : ""}${missingIntervalNote}${replayNote}${coverageNote}；${carried} 點延用上一筆完整估值；總權益維持 ${formatTwd(values.at(-1))}。`);
 }
 
 function renderCounts(counts) {
