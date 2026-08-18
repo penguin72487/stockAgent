@@ -52,8 +52,7 @@ def run_tw_futures_portfolio_continuous_torch(
     tradable_mask: torch.Tensor,
     must_liquidate_mask: torch.Tensor,
     *,
-    buy_fee_rate: float,
-    sell_fee_rate: float,
+    fee_rate_per_open_notional: torch.Tensor,
     max_turnover_ratio: float = 0.0,
     volume_limit_weights: torch.Tensor | None = None,
     state_advance_mask: torch.Tensor | None = None,
@@ -75,14 +74,20 @@ def run_tw_futures_portfolio_continuous_torch(
         tuple(tradable_mask.shape),
         tuple(must_liquidate_mask.shape),
     )
-    if buy_fee_rate < 0.0 or sell_fee_rate < 0.0:
-        raise ValueError("futures portfolio fee rates must be non-negative")
     if max_turnover_ratio < 0.0:
         raise ValueError("max_turnover_ratio must be non-negative")
     weights = target_weights.to(dtype=torch.float32)
     returns = holding_log_returns.to(device=weights.device, dtype=torch.float32)
     tradable = tradable_mask.to(device=weights.device, dtype=torch.bool)
     liquidate = must_liquidate_mask.to(device=weights.device, dtype=torch.bool)
+    fee_rates = fee_rate_per_open_notional.to(
+        device=weights.device,
+        dtype=torch.float32,
+    )
+    if tuple(fee_rates.shape) != tuple(weights.shape):
+        raise ValueError(
+            "fee_rate_per_open_notional must match weights [T,S]"
+        )
     simple_returns = torch.expm1(returns)
     t_len, n_symbols = weights.shape
     history = (
@@ -150,6 +155,7 @@ def run_tw_futures_portfolio_continuous_torch(
         held = prev + delta
         opening_buy = delta.clamp_min(0.0).sum()
         opening_sell = (-delta).clamp_min(0.0).sum()
+        row_fee_rates = fee_rates[row]
         valid_return = torch.isfinite(simple_returns[row]) | (held.abs() <= 1.0e-8)
         invalid_active = ~valid_return.all()
         clean_asset_return = torch.where(
@@ -165,19 +171,40 @@ def run_tw_futures_portfolio_continuous_torch(
         )
         forced_buy = (-closing_notional).clamp_min(0.0).sum()
         forced_sell = closing_notional.clamp_min(0.0).sum()
+        fee_active = (delta.abs() > 1.0e-8) | (
+            row_advances & liquidate[row] & (held.abs() > 1.0e-8)
+        )
+        invalid_fee = fee_active & (
+            ~torch.isfinite(row_fee_rates) | (row_fee_rates < 0.0)
+        )
+        clean_fee_rates = torch.where(
+            row_advances
+            & torch.isfinite(row_fee_rates)
+            & (row_fee_rates >= 0.0),
+            row_fee_rates,
+            torch.zeros_like(row_fee_rates),
+        )
+        # delta/held are opening-NAV notional weights.  Dividing the fixed
+        # per-contract fee by open*multiplier converts each fractional
+        # contract trade directly to the same NAV denominator.  A forced
+        # close charges the number of held contracts, not ending notional.
+        fixed_commission = (
+            delta.abs() * clean_fee_rates
+            + torch.where(liquidate[row], held.abs(), torch.zeros_like(held))
+            * clean_fee_rates
+        ).sum()
         gross_simple = torch.where(
             row_advances,
             (held * clean_asset_return).sum(),
             torch.zeros((), device=weights.device, dtype=torch.float32),
         )
         net_simple = (
-            gross_simple
-            - float(buy_fee_rate) * (opening_buy + forced_buy)
-            - float(sell_fee_rate) * (opening_sell + forced_sell)
+            gross_simple - fixed_commission
         )
         survived = (
             alive
             & ~invalid_active
+            & ~invalid_fee.any()
             & torch.isfinite(net_simple)
             & (net_simple > -1.0)
         )
@@ -212,8 +239,7 @@ def run_tw_futures_portfolio_continuous_numpy(
     tradable_mask: np.ndarray,
     must_liquidate_mask: np.ndarray,
     *,
-    buy_fee_rate: float,
-    sell_fee_rate: float,
+    fee_rate_per_open_notional: np.ndarray,
     max_turnover_ratio: float = 0.0,
 ) -> FuturesPortfolioNumpyResult:
     _validate_shapes(
@@ -226,6 +252,11 @@ def run_tw_futures_portfolio_continuous_numpy(
     returns = np.expm1(np.asarray(holding_log_returns, dtype=np.float64))
     tradable = np.asarray(tradable_mask, dtype=bool)
     liquidate = np.asarray(must_liquidate_mask, dtype=bool)
+    fee_rates = np.asarray(fee_rate_per_open_notional, dtype=np.float64)
+    if fee_rates.shape != weights.shape:
+        raise ValueError(
+            "fee_rate_per_open_notional must match weights [T,S]"
+        )
     t_len, n_symbols = weights.shape
     history = np.zeros((t_len, n_symbols), dtype=np.float32)
     strategy = np.zeros(t_len, dtype=np.float32)
@@ -250,15 +281,25 @@ def run_tw_futures_portfolio_continuous_numpy(
         closing = np.where(liquidate[row], ending_notional, 0.0)
         forced_buy = float(np.clip(-closing, 0.0, None).sum())
         forced_sell = float(np.clip(closing, 0.0, None).sum())
+        fee_active = (np.abs(delta) > 1.0e-8) | (
+            liquidate[row] & (np.abs(held) > 1.0e-8)
+        )
+        valid_fee = np.isfinite(fee_rates[row]) & (fee_rates[row] >= 0.0)
+        clean_fee = np.where(valid_fee, fee_rates[row], 0.0)
+        fixed_commission = float(
+            np.sum(
+                np.abs(delta) * clean_fee
+                + np.where(liquidate[row], np.abs(held), 0.0) * clean_fee
+            )
+        )
         gross = float(np.sum(held * clean_return))
         net = (
-            gross
-            - buy_fee_rate * (opening_buy + forced_buy)
-            - sell_fee_rate * (opening_sell + forced_sell)
+            gross - fixed_commission
         )
         survived = bool(
             alive
             and valid_return.all()
+            and valid_fee[fee_active].all()
             and np.isfinite(net)
             and net > -1.0
         )

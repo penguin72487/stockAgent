@@ -406,6 +406,8 @@ def _validate_tw_futures_portfolio_mode_contract(
     frequency: object,
     loss_type: object,
     max_volume_participation: object,
+    buy_fee_rate: object,
+    sell_fee_rate: object,
 ) -> None:
     if execution_mode != "tw_futures_portfolio_day":
         return
@@ -417,8 +419,13 @@ def _validate_tw_futures_portfolio_mode_contract(
         )
     if float(max_volume_participation) != 0.0:
         raise ValueError(
-            "tw_futures_portfolio_day v1 requires max_volume_participation=0; "
+            "tw_futures_portfolio_day requires max_volume_participation=0; "
             "the public daily report has no causal opening depth"
+        )
+    if float(buy_fee_rate) != 0.0 or float(sell_fee_rate) != 0.0:
+        raise ValueError(
+            "tw_futures_portfolio_day uses fixed per-contract commission; "
+            "buy_fee_rate and sell_fee_rate must both be zero"
         )
 
 
@@ -1033,8 +1040,15 @@ class TradingConfig:
     # Physical contract identity and mandatory own-close liquidation live in
     # this receipt-backed table and are never inferred from price jumps.
     tw_futures_portfolio_data_path: str = (
-        "data_tw_futures/taifex_portfolio_daily/continuous_daily.parquet"
+        "data_tw_futures/taifex_portfolio_daily_v3/continuous_daily.parquet"
     )
+    # User/account-specific SinoPac network-order fixed commission, TWD per
+    # contract per side. Product classification and notional multipliers are
+    # owned by the receipt-backed futures data contract.
+    tw_futures_portfolio_fee_large_twd: float = 60.0
+    tw_futures_portfolio_fee_standard_twd: float = 24.0
+    tw_futures_portfolio_fee_stock_twd: float = 40.0
+    tw_futures_portfolio_fee_micro_twd: float = 16.0
     tw_index_options_monthly_data_path: str = (
         "data_tw_index_options_daily/monthly_full_chain.parquet"
     )
@@ -2781,6 +2795,8 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         frequency=trading["frequency"],
         loss_type=training["loss_type"],
         max_volume_participation=trading["max_volume_participation"],
+        buy_fee_rate=trading["buy_fee_rate"],
+        sell_fee_rate=trading["sell_fee_rate"],
     )
     _validate_tw_index_derivatives_day_mode_contract(
         execution_mode=trading["execution_mode"],
@@ -2965,6 +2981,16 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     if not futures_portfolio_data_path:
         raise ValueError("trading.tw_futures_portfolio_data_path must not be empty")
     trading["tw_futures_portfolio_data_path"] = futures_portfolio_data_path
+    for fee_key in (
+        "tw_futures_portfolio_fee_large_twd",
+        "tw_futures_portfolio_fee_standard_twd",
+        "tw_futures_portfolio_fee_stock_twd",
+        "tw_futures_portfolio_fee_micro_twd",
+    ):
+        fee_value = float(trading[fee_key])
+        if not math.isfinite(fee_value) or fee_value < 0.0:
+            raise ValueError(f"trading.{fee_key} must be finite and non-negative")
+        trading[fee_key] = fee_value
     all_futures_context_path = str(
         trading["tw_index_futures_all_products_context_path"]
     ).strip()

@@ -15,6 +15,9 @@ from stockagent.data.tw_futures_portfolio_daily import (
     build_continuous_daily,
     build_product_master,
 )
+from stockagent.models.transformer_base_portfolio import (
+    action_channels_for_execution_mode,
+)
 
 
 def _source_row(
@@ -195,33 +198,78 @@ def test_historical_product_master_uses_official_codes_and_explicit_scope(
     assert i5f["region"] == "foreign"
 
 
+def test_historical_product_master_does_not_require_current_broker_catalogue(
+    tmp_path: Path,
+) -> None:
+    missing_products = tmp_path / "missing-products.csv"
+    stocks = tmp_path / "stocks.csv"
+    official = tmp_path / "official.csv"
+    pl.DataFrame(
+        {
+            "code": ["2104", "2384"],
+            "name": ["國際中橡", "勝華"],
+            "security_type": ["stock", "stock"],
+        }
+    ).write_csv(stocks)
+    _write_official_codes(
+        official,
+        [("DT1", "勝華期貨"), ("FJF", "中橡期貨"), ("TX", "臺股期貨")],
+    )
+
+    master = build_product_master(
+        missing_products,
+        stocks,
+        official,
+        source_products=["DT1", "FJF", "TX"],
+    )
+
+    assert master["official_product"].to_list() == ["DT1", "FJF", "TX"]
+    assert master["underlying_symbol"].to_list() == ["2384", "2104", None]
+    assert master["shioaji_roots"].to_list() == ["", "", ""]
+    assert master["listing_scope"].to_list() == [
+        "historical",
+        "historical",
+        "historical",
+    ]
+    assert master["fixed_fee_research_supported"].to_list() == [False, True, True]
+    assert master["contract_multiplier"].to_list() == [None, 2000.0, 200.0]
+    assert master["sinopac_network_fee_group"].to_list() == [None, "stock", "large"]
+
+
+def test_futures_portfolio_uses_one_signed_target_action_channel() -> None:
+    assert action_channels_for_execution_mode("tw_futures_portfolio_day") == (
+        "target",
+    )
+
+
 def test_tensor_ledger_closes_after_return_and_matches_numpy() -> None:
     weights = torch.tensor([[1.0], [1.0]], requires_grad=True)
     returns = torch.log1p(torch.tensor([[0.10], [0.20]]))
     tradable = torch.ones_like(weights, dtype=torch.bool)
     liquidate = torch.tensor([[False], [True]])
     benchmark = torch.zeros(2)
+    fee_rates = torch.tensor([[0.01], [0.02]])
     result = run_backtest_torch(
         weights,
         returns,
         tradable,
         benchmark,
-        buy_fee_rate=0.01,
-        sell_fee_rate=0.02,
+        buy_fee_rate=0.0,
+        sell_fee_rate=0.0,
         long_only=True,
         portfolio_activation="identity",
         execution_mode="tw_futures_portfolio_day",
         can_buy_mask=tradable,
         can_sell_mask=tradable,
         force_exit_mask=liquidate,
+        overnight_returns=fee_rates,
     )
     expected = run_tw_futures_portfolio_continuous_numpy(
         np.ones((2, 1), dtype=np.float32),
         returns.detach().numpy(),
         tradable.numpy(),
         liquidate.numpy(),
-        buy_fee_rate=0.01,
-        sell_fee_rate=0.02,
+        fee_rate_per_open_notional=fee_rates.numpy(),
     )
     np.testing.assert_allclose(
         result.strategy_returns.detach().numpy(), expected.strategy_returns, rtol=1e-6
@@ -250,6 +298,7 @@ def test_current_open_execution_mask_does_not_leak_or_ruin_account() -> None:
         can_buy_mask=current_executable,
         can_sell_mask=current_executable,
         force_exit_mask=torch.tensor([[False], [True]]),
+        overnight_returns=torch.zeros_like(weights),
     )
     # The model was allowed to request the contract from prior information,
     # but the executor rejects row 0 because the current open is unavailable.
@@ -277,6 +326,7 @@ def test_existing_position_is_carried_across_zero_transaction_day() -> None:
         can_buy_mask=current_executable,
         can_sell_mask=current_executable,
         force_exit_mask=torch.tensor([[False], [False], [True]]),
+        overnight_returns=torch.zeros_like(weights),
     )
     # Row 1 cannot trade, so its zero target cannot flatten the existing lot.
     # The position remains valued and earns the bridge return until trading
@@ -294,5 +344,13 @@ def test_new_training_config_uses_canonical_daily_trainer() -> None:
     assert config.trading.execution_mode == "tw_futures_portfolio_day"
     assert config.training.model_name == "transformer_base_portfolio"
     assert config.training.loss_type == "log_utility"
+    assert config.training.epochs == 1000
     assert config.data.use_tw_public_features
     assert not config.data.use_tw_public_rules
+    assert config.trading.buy_fee_rate == 0.0
+    assert config.trading.sell_fee_rate == 0.0
+    assert config.trading.tw_futures_portfolio_fee_large_twd == 60.0
+    assert config.trading.tw_futures_portfolio_fee_standard_twd == 24.0
+    assert config.trading.tw_futures_portfolio_fee_stock_twd == 40.0
+    assert config.trading.tw_futures_portfolio_fee_micro_twd == 16.0
+    assert "taifex_portfolio_daily_v3" in config.trading.tw_futures_portfolio_data_path

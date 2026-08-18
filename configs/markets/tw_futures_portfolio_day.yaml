@@ -4,18 +4,25 @@
 # contract never changes symbol before expiry.
 base_config: tw_public_lanten_market_candles.yaml
 
-experiment_name: tw-taifex-all-equity-index-futures-expiry-month-daily-v2
+experiment_name: tw-taifex-verified-notional-fixed-fee-daily-v3
 
 runner:
-  output_dir: artifacts/markets/tw_futures_portfolio_day_v2
+  output_dir: artifacts/markets/tw_futures_portfolio_day_v3
   mode: train
   resume: true
   post_train_infer: true
   start_fold: 1
   isolate_train_folds: true
 
+environment:
+  # GPU0/GPU1 are attached to NUMA nodes 3/2.  The launcher pins each rank to
+  # its 28 local logical CPUs, so the host-wide PyTorch budget is 56 rather
+  # than oversubscribing the inherited 112-thread TW cash baseline.
+  cpu_threads: 56
+  torch_compile_threads: 16
+
 data:
-  parquet_root: data_tw_futures/taifex_portfolio_daily/symbols
+  parquet_root: data_tw_futures/taifex_portfolio_daily_v3/symbols
   # build_panel first uses the union calendar; attach_futures_portfolio_daily
   # then installs the no-roll-gap TX front-month benchmark from the audited
   # physical-contract table.
@@ -31,7 +38,7 @@ data:
   # do not gate a TAIFEX contract. Their public numeric fields remain features,
   # while execution uses only the futures contract data/expiry contract.
   use_tw_public_rules: false
-  tw_public_feature_path: data_tw_futures/taifex_portfolio_daily/model_features.parquet
+  tw_public_feature_path: data_tw_futures/taifex_portfolio_daily_v3/model_features.parquet
   tw_public_market_symbol: __MARKET__
   feature_include: ["*"]
   feature_exclude:
@@ -69,21 +76,26 @@ trading:
   min_trade_weight: 0.0
   portfolio_activation: identity
 
-  # Differentiable continuous-notional research proxy.  It combines an
-  # explicit per-side fee allowance and statutory-tax allowance, but is not
-  # presented as an exact contract-count ledger because a complete historical
-  # multiplier/margin/broker-fee master for all 745 products is not available.
-  buy_fee_rate: 0.000065
-  sell_fee_rate: 0.000065
-  tw_futures_portfolio_data_path: data_tw_futures/taifex_portfolio_daily/continuous_daily.parquet
+  # Continuous fractional-contract research, gross notional <= 1x. There is no
+  # tax, margin, slippage, liquidity, or whole-contract execution model. The
+  # only cost is this account's SinoPac network-order fixed commission per
+  # contract per side, converted row-by-row by open*contract_multiplier.
+  buy_fee_rate: 0.0
+  sell_fee_rate: 0.0
+  tw_futures_portfolio_fee_large_twd: 60.0
+  tw_futures_portfolio_fee_standard_twd: 24.0
+  tw_futures_portfolio_fee_stock_twd: 40.0
+  tw_futures_portfolio_fee_micro_twd: 16.0
+  tw_futures_portfolio_data_path: data_tw_futures/taifex_portfolio_daily_v3/continuous_daily.parquet
 
 training:
   model_name: transformer_base_portfolio
   loss_type: log_utility
   loss_portfolio_activation: identity
   lookback: 32
-  # The generated universe currently has 6,793 delivery-month/week slots.
-  # Start conservatively; re-benchmark before raising these values.
+  # Measured on this dual RTX 5090 host with S=6,790, F=115 and lookback=32.
+  # Complete steady epoch-2 wall time was 2.01s/1.75s/3.27s for global batch
+  # 4/8/32 respectively; batch 8 is the bracketed kernel sweet spot.
   batch_size_train: 8
   batch_size_eval: 4
   explain_after_each_fold: false

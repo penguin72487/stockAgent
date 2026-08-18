@@ -2883,6 +2883,16 @@ def run_backtest_torch(
                 "tw_futures_portfolio_day requires must-liquidate rows in "
                 "force_exit_mask"
             )
+        if overnight_returns is None:
+            raise ValueError(
+                "tw_futures_portfolio_day requires aligned fixed commission "
+                "rates in the executor auxiliary tensor"
+            )
+        if float(buy_fee_rate) != 0.0 or float(sell_fee_rate) != 0.0:
+            raise ValueError(
+                "tw_futures_portfolio_day fixed per-contract commission is "
+                "mutually exclusive with proportional buy/sell fee rates"
+            )
         prepped_weights, _, prepped_buy, prepped_sell = _prepare_scan_inputs(
             weights,
             tradable_mask,
@@ -2898,8 +2908,7 @@ def run_backtest_torch(
             future_returns,
             prepped_buy & prepped_sell,
             force_exit_mask,
-            buy_fee_rate=float(buy_fee_rate),
-            sell_fee_rate=float(sell_fee_rate),
+            fee_rate_per_open_notional=overnight_returns,
             max_turnover_ratio=float(max_turnover_ratio),
             volume_limit_weights=volume_limit_weights,
             state_advance_mask=state_advance_mask,
@@ -4442,6 +4451,7 @@ def run_backtest_integer_shares(
     derivatives_day_candidates: TaiwanIndexDerivativeDayCandidates | None = None,
     option_day_cost_schedule: OptionDayCostSchedule | None = None,
     derivatives_maximum_capital_fraction: float = 0.98,
+    futures_fee_rates: np.ndarray | None = None,
 ) -> tuple[BacktestResult, list[HoldingsRecord]]:
     """Integer-share audit backtest for naive or Taiwan settlement execution.
 
@@ -4484,6 +4494,25 @@ def run_backtest_integer_shares(
     lower-fidelity open-to-close integer audit.
     """
     mode = normalize_execution_mode(execution_mode)
+    if precomputed_exact_backtest is not None:
+        if mode not in {"tw_day_trade", "tw_futures_portfolio_day"}:
+            raise ValueError(
+                "precomputed_exact_backtest is valid only for canonical "
+                "tensor execution contracts"
+            )
+        if (
+            normalize_execution_mode(precomputed_exact_backtest.execution_mode)
+            != mode
+        ):
+            raise ValueError(
+                "precomputed exact backtest execution mode does not match request"
+            )
+        expected_rows = int(np.asarray(weights).shape[0])
+        if int(precomputed_exact_backtest.strategy_returns.shape[0]) != expected_rows:
+            raise ValueError(
+                "precomputed exact backtest row count does not match weights"
+            )
+        return precomputed_exact_backtest, []
     if mode == "tw_futures_portfolio_day":
         raw_weights = np.asarray(weights, dtype=np.float64)
         raw_returns = np.asarray(future_returns, dtype=np.float64)
@@ -4506,6 +4535,14 @@ def run_backtest_integer_shares(
             raise ValueError(
                 "tw_futures_portfolio_day requires must-liquidate rows in "
                 "force_exit_mask"
+            )
+        if futures_fee_rates is None:
+            raise ValueError(
+                "tw_futures_portfolio_day requires fixed fee rates [T,S]"
+            )
+        if float(buy_fee_rate) != 0.0 or float(sell_fee_rate) != 0.0:
+            raise ValueError(
+                "fixed futures commission cannot be combined with proportional fees"
             )
         valid_shapes = (
             raw_weights.ndim == 2
@@ -4543,8 +4580,10 @@ def run_backtest_integer_shares(
                 & raw_can_sell
             ),
             np.asarray(force_exit_mask, dtype=bool),
-            buy_fee_rate=float(buy_fee_rate),
-            sell_fee_rate=float(sell_fee_rate),
+            fee_rate_per_open_notional=np.asarray(
+                futures_fee_rates,
+                dtype=np.float64,
+            ),
             max_turnover_ratio=float(max_turnover_ratio),
         )
         return (
@@ -4561,24 +4600,6 @@ def run_backtest_integer_shares(
             ),
             [],
         )
-    if precomputed_exact_backtest is not None:
-        if mode != "tw_day_trade":
-            raise ValueError(
-                "precomputed_exact_backtest is only valid for tw_day_trade"
-            )
-        if (
-            normalize_execution_mode(precomputed_exact_backtest.execution_mode)
-            != mode
-        ):
-            raise ValueError(
-                "precomputed exact backtest execution mode does not match request"
-            )
-        expected_rows = int(np.asarray(weights).shape[0])
-        if int(precomputed_exact_backtest.strategy_returns.shape[0]) != expected_rows:
-            raise ValueError(
-                "precomputed exact backtest row count does not match weights"
-            )
-        return precomputed_exact_backtest, []
     if mode == "tw_index_derivatives_day":
         raw_weights = np.asarray(weights, dtype=np.float64)
         raw_returns = np.asarray(future_returns)

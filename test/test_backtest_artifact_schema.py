@@ -1389,6 +1389,62 @@ def test_fold_output_uses_integer_oracle_as_canonical_taiwan_artifact(
     assert metrics["test_metrics"] == metrics["test_integer_metrics"]
 
 
+def test_futures_portfolio_artifact_ignores_compatibility_share_replay(
+    tmp_path: Path,
+) -> None:
+    continuous = BacktestResult(
+        strategy_returns=np.asarray([0.01, -0.02], dtype=np.float32),
+        benchmark_returns=np.zeros(2, dtype=np.float32),
+        turnovers=np.asarray([0.2, 0.3], dtype=np.float32),
+        weights_history=np.asarray([[0.5, -0.5], [0.4, -0.4]], dtype=np.float32),
+        execution_mode="tw_futures_portfolio_day",
+        settlement_ledger_unit="notional_weight",
+        final_weights=np.asarray([0.4, -0.4], dtype=np.float32),
+        final_alive=np.asarray(True, dtype=np.bool_),
+    )
+    fold_result = FoldResult(
+        fold_id=1,
+        train_years=[2023],
+        val_years=[2024],
+        test_years=[2025],
+        best_val_loss=0.0,
+        val_ic={},
+        val_metrics={},
+        test_ic={},
+        test_metrics={"cumulative_return": 0.0},
+    )
+    config = SimpleNamespace(
+        trading=SimpleNamespace(execution_mode="tw_futures_portfolio_day"),
+        training=SimpleNamespace(
+            table_output_format="parquet",
+            save_daily_weights_table=False,
+            save_integer_share_daily_weights_table=True,
+            save_integer_share_holdings_table=True,
+            backtest_artifact_compression="none",
+        ),
+    )
+    dates = np.asarray(["2026-01-02", "2026-01-05"], dtype="datetime64[D]")
+
+    _save_fold_output_artifacts(
+        fold_dir=tmp_path,
+        fold_result=fold_result,
+        model=nn.Linear(2, 1),
+        test_backtest=continuous,
+        test_dates=dates,
+        symbols=["A", "B"],
+        config=config,  # type: ignore[arg-type]
+        test_integer_backtest=_integer_result(),
+        print_report=False,
+        write_plots=False,
+    )
+
+    saved, _ = _load_backtest_artifact(tmp_path / "test_backtest.npz")
+    assert saved.execution_mode == "tw_futures_portfolio_day"
+    assert saved.settlement_ledger_unit == "notional_weight"
+    assert not (tmp_path / "test_integer_share_backtest.npz").exists()
+    assert not (tmp_path / "integer_share_daily_weights.parquet").exists()
+
+
 def test_taiwan_artifact_requires_explicit_ledger_units(tmp_path: Path) -> None:
     result = _continuous_result()
     result.settlement_ledger_unit = None

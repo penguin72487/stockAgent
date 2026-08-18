@@ -1167,13 +1167,18 @@ def _tensor_day_trade_is_whole_lot_exact(
     """Whether a tensor result may stand in for the separate integer audit.
 
     The minute event executor rounds its forward to exact board lots.  The
-    daily open-to-close T+3 executor deliberately permits fractional weights,
-    so reusing it under an ``integer_share`` filename is a semantic error.
+    futures portfolio explicitly has no integer-execution research layer, so
+    its canonical continuous fractional-contract result is also the only
+    reportable result.  The daily cash executor deliberately permits
+    fractional weights and therefore cannot be reused under an integer label.
     """
 
     return bool(
-        runtime.mode == "tw_day_trade"
-        and config.data.day_trade_minute_execution_root is not None
+        runtime.mode == "tw_futures_portfolio_day"
+        or (
+            runtime.mode == "tw_day_trade"
+            and config.data.day_trade_minute_execution_root is not None
+        )
     )
 
 
@@ -3171,6 +3176,28 @@ def _parse_group_years_from_dir_name(name: str) -> list[int] | None:
     return years
 
 
+def _try_load_readable_checkpoint(
+    checkpoint_path: Path,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Load a checkpoint for recovery decisions without hiding semantic errors.
+
+    This helper only converts storage/read failures into an explicit reason.
+    Manifest, batch-size, and train-year validation remains fail-closed at the
+    normal consumer after a readable mapping has been returned.
+    """
+
+    try:
+        size_bytes = checkpoint_path.stat().st_size
+    except OSError as exc:
+        return None, f"stat failed: {type(exc).__name__}: {exc}"
+    if size_bytes <= 0:
+        return None, f"empty file ({size_bytes} bytes)"
+    try:
+        return _load_checkpoint(checkpoint_path), None
+    except Exception as exc:
+        return None, f"load failed: {type(exc).__name__}: {exc}"
+
+
 def _latest_group_checkpoint(output_path: Path) -> tuple[Path, list[int]] | None:
     candidates: list[tuple[list[int], float, Path]] = []
     for candidate in output_path.glob("train_*/checkpoint_last.pt"):
@@ -3185,10 +3212,21 @@ def _latest_group_checkpoint(output_path: Path) -> tuple[Path, list[int]] | None
     if not candidates:
         return None
 
-    # Prefer the checkpoint with the widest train-year span, then newest year, then latest mtime.
+    # Prefer the checkpoint with the widest train-year span, then newest year,
+    # then latest mtime. A killed process or failed filesystem write can leave
+    # an unreadable historical checkpoint; recovery must continue searching
+    # instead of repeatedly selecting the same bad file.
     candidates.sort(key=lambda item: (len(item[0]), item[0][-1], item[1]))
-    years, _, path = candidates[-1]
-    return path, years
+    for years, _, path in reversed(candidates):
+        _, read_error = _try_load_readable_checkpoint(path)
+        if read_error is None:
+            return path, years
+        if _distributed_should_write():
+            print(
+                f"[resume] ignoring unreadable group checkpoint {path}: "
+                f"{read_error}"
+            )
+    return None
 
 
 def _group_curve_path(output_path: Path, train_years: list[int]) -> Path:
@@ -4784,7 +4822,40 @@ def _atomic_torch_save(payload: Mapping[str, Any], checkpoint_path: Path) -> Non
     )
     try:
         torch.save(dict(payload), temporary_path)
+        try:
+            size_bytes = temporary_path.stat().st_size
+        except OSError as exc:
+            raise OSError(
+                f"checkpoint temporary file cannot be inspected: {temporary_path}"
+            ) from exc
+        if size_bytes <= 0:
+            raise OSError(
+                f"checkpoint temporary file is empty: {temporary_path}"
+            )
+        # torch.save returning is not sufficient evidence on networked or
+        # interrupted filesystems. Flush bytes, then parse the exact temporary
+        # artifact with the production-safe loader before it may replace the
+        # last known-good checkpoint.
+        with temporary_path.open("rb") as handle:
+            os.fsync(handle.fileno())
+        try:
+            _load_checkpoint(temporary_path)
+        except Exception as exc:
+            raise OSError(
+                f"checkpoint temporary file failed read-back validation: "
+                f"{temporary_path}"
+            ) from exc
         os.replace(temporary_path, checkpoint_path)
+        # Persist the directory entry where supported. The replacement is
+        # already valid if a filesystem does not implement directory fsync.
+        try:
+            directory_fd = os.open(checkpoint_path.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except OSError:
+            pass
     finally:
         try:
             temporary_path.unlink(missing_ok=True)
@@ -5714,7 +5785,13 @@ def _save_backtest_artifact(
             f"{mode} backtest artifact requires complete settlement histories"
         )
     ledger_unit = result.settlement_ledger_unit
-    if mode not in TW_STOCK_EXECUTION_MODES:
+    if mode in CONTINUOUS_WEIGHT_EXECUTION_MODES and mode != "naive":
+        if ledger_unit != "notional_weight":
+            raise ValueError(
+                f"{mode} backtest artifact requires "
+                "settlement_ledger_unit='notional_weight'"
+            )
+    elif mode not in TW_STOCK_EXECUTION_MODES:
         if ledger_unit not in {None, "none"}:
             raise ValueError(
                 f"{mode} backtest artifact cannot declare settlement ledger units"
@@ -6595,6 +6672,13 @@ def _save_fold_output_artifacts(
     requested_mode = normalize_execution_mode(
         getattr(trading_config, "execution_mode", "naive")
     )
+    # Continuous-weight research modes deliberately have no point-in-time
+    # integer contract specification.  The generic evaluator may still return
+    # a compatibility share replay, but publishing it would falsely label a
+    # continuous-notional strategy as an exact share/contract ledger.
+    if requested_mode in CONTINUOUS_WEIGHT_EXECUTION_MODES:
+        test_integer_backtest = None
+        holdings_records = None
     canonical_tensor_day_trade = bool(
         requested_mode == "tw_day_trade"
         and (
@@ -8216,10 +8300,20 @@ def _load_backtest_artifact(output_path: Path) -> tuple[BacktestResult, np.ndarr
         raise ValueError(
             f"{execution_mode} backtest artifact has invalid settlement ledger units"
         )
-    if execution_mode not in TW_STOCK_EXECUTION_MODES and ledger_unit not in {
-        None,
-        "none",
-    }:
+    if (
+        execution_mode in CONTINUOUS_WEIGHT_EXECUTION_MODES
+        and execution_mode != "naive"
+        and ledger_unit != "notional_weight"
+    ):
+        raise ValueError(
+            f"{execution_mode} backtest artifact requires "
+            "settlement_ledger_unit='notional_weight'"
+        )
+    if (
+        execution_mode not in TW_STOCK_EXECUTION_MODES
+        and execution_mode not in CONTINUOUS_WEIGHT_EXECUTION_MODES
+        and ledger_unit not in {None, "none"}
+    ):
         raise ValueError(
             f"{execution_mode} backtest artifact cannot contain a settlement ledger"
         )
@@ -11442,7 +11536,14 @@ def _run_eval_backtest_from_weight_buffers(
         final_alive=prev_alive,
         execution_mode=execution_mode,
         settlement_ledger_unit=(
-            "nav_ratio" if execution_mode in TW_STOCK_EXECUTION_MODES else None
+            "nav_ratio"
+            if execution_mode in TW_STOCK_EXECUTION_MODES
+            else (
+                "notional_weight"
+                if execution_mode in CONTINUOUS_WEIGHT_EXECUTION_MODES
+                and execution_mode != "naive"
+                else None
+            )
         ),
         cash_history=cash_history_out,
         payables_history=payables_history_out,
@@ -12990,7 +13091,7 @@ def _replay_taiwan_stitched_deployment(
         # Their exact integer continuation remains close[t] -> close[t+1];
         # the phase dataset's intraday leg is not that legacy forward label.
         stitched_future_returns = np.asarray(panel.returns_1d)[panel_rows]
-    if canonical_daily_day_trade:
+    if canonical_daily_day_trade or mode == "tw_futures_portfolio_day":
         request_tensor = torch.as_tensor(full_requests, dtype=torch.float32)
         volume_limit_weights = _volume_limit_weights_from_notional(
             (
@@ -13042,6 +13143,10 @@ def _replay_taiwan_stitched_deployment(
                 ),
                 force_exit_mask=torch.as_tensor(
                     selected(execution_dataset.force_exit_mask_t), dtype=torch.bool
+                ),
+                overnight_returns=torch.as_tensor(
+                    selected(execution_dataset.overnight_log_returns_t),
+                    dtype=torch.float32,
                 ),
                 return_weights_history=True,
                 volume_limit_weights=volume_limit_weights,
@@ -16606,16 +16711,17 @@ def _run_training_tree_models(
                 fold_dir,
                 config,
             )
-            _save_integer_share_audit_artifacts(
-                fold_dir,
-                test_integer_bt,
-                test_dates,
-                panel.symbols,
-                holdings_records,
-                write_daily_weights_table=bool(config.training.save_integer_share_daily_weights_table),
-                write_holdings_table=write_integer_holdings_table,
-                table_output_format=table_output_format,
-            )
+            if execution_runtime.mode not in CONTINUOUS_WEIGHT_EXECUTION_MODES:
+                _save_integer_share_audit_artifacts(
+                    fold_dir,
+                    test_integer_bt,
+                    test_dates,
+                    panel.symbols,
+                    holdings_records,
+                    write_daily_weights_table=bool(config.training.save_integer_share_daily_weights_table),
+                    write_holdings_table=write_integer_holdings_table,
+                    table_output_format=table_output_format,
+                )
             _write_fold_complete_marker(fold_dir, fold_result, source="tree_training_final")
 
             _refresh_walkforward_artifacts(
@@ -17255,16 +17361,17 @@ def _run_inference_tree_models(
             fold_dir,
             config,
         )
-        _save_integer_share_audit_artifacts(
-            fold_dir,
-            test_integer_bt,
-            test_dates,
-            panel.symbols,
-            holdings_records,
-            write_daily_weights_table=bool(config.training.save_integer_share_daily_weights_table),
-            write_holdings_table=write_integer_holdings_table,
-            table_output_format=table_output_format,
-        )
+        if execution_runtime.mode not in CONTINUOUS_WEIGHT_EXECUTION_MODES:
+            _save_integer_share_audit_artifacts(
+                fold_dir,
+                test_integer_bt,
+                test_dates,
+                panel.symbols,
+                holdings_records,
+                write_daily_weights_table=bool(config.training.save_integer_share_daily_weights_table),
+                write_holdings_table=write_integer_holdings_table,
+                table_output_format=table_output_format,
+            )
         _write_fold_complete_marker(fold_dir, fold_result, source="tree_inference_final")
 
     if results_by_fold:
@@ -17892,16 +17999,17 @@ def _run_inference_neural_models(
             fold_dir,
             config,
         )
-        _save_integer_share_audit_artifacts(
-            fold_dir,
-            test_integer_bt,
-            test_dates,
-            fold_panel.symbols,
-            holdings_records,
-            write_daily_weights_table=bool(config.training.save_integer_share_daily_weights_table),
-            write_holdings_table=write_integer_holdings_table,
-            table_output_format=table_output_format,
-        )
+        if fold_execution_runtime.mode not in CONTINUOUS_WEIGHT_EXECUTION_MODES:
+            _save_integer_share_audit_artifacts(
+                fold_dir,
+                test_integer_bt,
+                test_dates,
+                fold_panel.symbols,
+                holdings_records,
+                write_daily_weights_table=bool(config.training.save_integer_share_daily_weights_table),
+                write_holdings_table=write_integer_holdings_table,
+                table_output_format=table_output_format,
+            )
         _write_fold_complete_marker(fold_dir, fold_result, source="neural_inference_final")
 
     if results_by_fold:
@@ -18426,7 +18534,17 @@ def _run_training_impl(
         )
         if not pending_folds:
             if config.training.warm_start_from_previous_fold and group_checkpoint_path.exists():
-                warm_start_checkpoint_path = group_checkpoint_path
+                _, checkpoint_read_error = _try_load_readable_checkpoint(
+                    group_checkpoint_path
+                )
+                if checkpoint_read_error is None:
+                    warm_start_checkpoint_path = group_checkpoint_path
+                elif _distributed_should_write():
+                    print(
+                        "[resume] completed group has an unreadable warm-start "
+                        f"checkpoint; keeping the previous healthy checkpoint: "
+                        f"{group_checkpoint_path}: {checkpoint_read_error}"
+                    )
             print(f"[Train {train_years}] already completed, skipping")
             completed_postprocess_error: BaseException | None = None
             try:
@@ -18837,16 +18955,25 @@ def _run_training_impl(
         )
 
         if config.training.warm_start_from_previous_fold and warm_start_checkpoint_path is not None and warm_start_checkpoint_path.exists():
-            warm_start_checkpoint = _load_checkpoint(warm_start_checkpoint_path)
-            _validate_checkpoint_manifest(
-                warm_start_checkpoint,
-                experiment_manifest,
-                checkpoint_path=warm_start_checkpoint_path,
-                scope="model",
+            warm_start_checkpoint, warm_start_read_error = (
+                _try_load_readable_checkpoint(warm_start_checkpoint_path)
             )
-            if "model_state_dict" in warm_start_checkpoint:
-                _load_state_dict(model, warm_start_checkpoint["model_state_dict"])
-                print(f"[Train {train_years}] warm-started from {warm_start_checkpoint_path.name}")
+            if warm_start_checkpoint is None:
+                print(
+                    f"[Train {train_years}] ignoring unreadable warm-start "
+                    f"checkpoint {warm_start_checkpoint_path}: "
+                    f"{warm_start_read_error}"
+                )
+            else:
+                _validate_checkpoint_manifest(
+                    warm_start_checkpoint,
+                    experiment_manifest,
+                    checkpoint_path=warm_start_checkpoint_path,
+                    scope="model",
+                )
+                if "model_state_dict" in warm_start_checkpoint:
+                    _load_state_dict(model, warm_start_checkpoint["model_state_dict"])
+                    print(f"[Train {train_years}] warm-started from {warm_start_checkpoint_path.name}")
 
         compiled_train_model: nn.Module = model
         eval_model: nn.Module = model
@@ -18921,43 +19048,52 @@ def _run_training_impl(
             resume_checkpoint_path = latest_resume_checkpoint
 
         if resume and resume_checkpoint_path.exists():
-            checkpoint = _load_checkpoint(resume_checkpoint_path)
-            _validate_checkpoint_manifest(
-                checkpoint,
-                experiment_manifest,
-                checkpoint_path=resume_checkpoint_path,
-                scope="resume",
-                expected_train_years=train_years,
+            checkpoint, resume_read_error = _try_load_readable_checkpoint(
+                resume_checkpoint_path
             )
-            _validate_checkpoint_effective_train_batch_size(
-                checkpoint,
-                effective_train_batch_size=train_batch_size,
-                checkpoint_path=resume_checkpoint_path,
-            )
-            if list(checkpoint.get("train_years", [])) == train_years:
-                _load_state_dict(model, checkpoint["model_state_dict"])
-                optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-                scaler_state = checkpoint.get("scaler_state_dict")
-                if scaler_state:
-                    try:
-                        scaler.load_state_dict(scaler_state)
-                    except RuntimeError as exc:
-                        # A checkpoint may come from a run where GradScaler was disabled.
-                        print(f"[Train {train_years}] skip scaler resume: {exc}")
-                if scheduler is not None:
-                    scheduler_state = checkpoint.get("scheduler_state_dict")
-                    if scheduler_state:
-                        scheduler.load_state_dict(scheduler_state)
-                resume_rng_state = checkpoint.get("rng_state")
-                start_epoch = int(checkpoint.get("epoch", 0)) + 1
-                resume_no_improve_epochs, resume_no_improve_source = _resume_no_improve_epochs_from_checkpoint(
-                    checkpoint,
-                    group_curve_path,
-                )
+            if checkpoint is None:
                 print(
-                    f"[Train {train_years}] resumed from epoch {start_epoch} "
-                    f"(checkpoint={resume_checkpoint_path})"
+                    f"[Train {train_years}] ignoring unreadable resume checkpoint "
+                    f"and restarting this train group from epoch 1: "
+                    f"{resume_checkpoint_path}: {resume_read_error}"
                 )
+            else:
+                _validate_checkpoint_manifest(
+                    checkpoint,
+                    experiment_manifest,
+                    checkpoint_path=resume_checkpoint_path,
+                    scope="resume",
+                    expected_train_years=train_years,
+                )
+                _validate_checkpoint_effective_train_batch_size(
+                    checkpoint,
+                    effective_train_batch_size=train_batch_size,
+                    checkpoint_path=resume_checkpoint_path,
+                )
+                if list(checkpoint.get("train_years", [])) == train_years:
+                    _load_state_dict(model, checkpoint["model_state_dict"])
+                    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+                    scaler_state = checkpoint.get("scaler_state_dict")
+                    if scaler_state:
+                        try:
+                            scaler.load_state_dict(scaler_state)
+                        except RuntimeError as exc:
+                            # A checkpoint may come from a run where GradScaler was disabled.
+                            print(f"[Train {train_years}] skip scaler resume: {exc}")
+                    if scheduler is not None:
+                        scheduler_state = checkpoint.get("scheduler_state_dict")
+                        if scheduler_state:
+                            scheduler.load_state_dict(scheduler_state)
+                    resume_rng_state = checkpoint.get("rng_state")
+                    start_epoch = int(checkpoint.get("epoch", 0)) + 1
+                    resume_no_improve_epochs, resume_no_improve_source = _resume_no_improve_epochs_from_checkpoint(
+                        checkpoint,
+                        group_curve_path,
+                    )
+                    print(
+                        f"[Train {train_years}] resumed from epoch {start_epoch} "
+                        f"(checkpoint={resume_checkpoint_path})"
+                    )
 
         will_train_epochs = start_epoch <= config.training.epochs
         if not will_train_epochs:

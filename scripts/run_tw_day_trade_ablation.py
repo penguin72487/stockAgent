@@ -192,7 +192,10 @@ def main() -> None:
     )
     parser.add_argument("--max-no-progress-retries", type=int, default=3)
     parser.add_argument("--retry-backoff-seconds", type=float, default=5.0)
+    parser.add_argument("--cuda-health-poll-seconds", type=float, default=30.0)
     args = parser.parse_args()
+    if args.cuda_health_poll_seconds <= 0:
+        raise SystemExit("--cuda-health-poll-seconds must be positive")
     parallel_jobs = _single_experiment_concurrency(args.parallel_jobs)
     if int(args.parallel_jobs) != parallel_jobs:
         print(
@@ -229,7 +232,10 @@ def main() -> None:
     # of the progress denominator without deleting their audit artifacts.
     if str(REPO_ROOT) not in sys.path:
         sys.path.insert(0, str(REPO_ROOT))
-    from scripts.run_ablation_experiments import _experiment_rows
+    from scripts.run_ablation_experiments import (
+        _cuda_runtime_health,
+        _experiment_rows,
+    )
 
     _, experiment_rows = _experiment_rows(spec_path)
     names = [str(row["name"]) for row in experiment_rows]
@@ -244,7 +250,25 @@ def main() -> None:
         raise SystemExit("no generated ablation configs")
     epochs = max(int(yaml.safe_load(path.read_text())["training"]["epochs"]) for path in configs)
 
-    # Fail before expensive work if CUDA/toolchain contracts are not satisfied.
+    # NVML/nvidia-smi can remain readable while CUDA Driver API or UVM is
+    # broken. Wait for a real allocation before running the strict compiler and
+    # environment preflight. This lets a long ablation supervisor survive host
+    # driver recovery without consuming any experiment retry budget.
+    while True:
+        cuda_healthy, cuda_health_detail = _cuda_runtime_health()
+        if cuda_healthy:
+            print(f"[ablation] CUDA compute path healthy: {cuda_health_detail}")
+            break
+        print(
+            "[ablation] CUDA compute path unavailable; waiting without "
+            "starting or charging an experiment retry. "
+            f"next_probe={args.cuda_health_poll_seconds:.1f}s "
+            f"detail={cuda_health_detail}",
+            flush=True,
+        )
+        time.sleep(args.cuda_health_poll_seconds)
+
+    # Fail before expensive work if non-CUDA toolchain contracts are not satisfied.
     _run_checked([sys.executable, str(REPO_ROOT / "scripts/check_environment.py"), "--require-cuda", "--strict"])
 
     command = [sys.executable, str(REPO_ROOT / "scripts/run_ablation_experiments.py"),
@@ -253,6 +277,7 @@ def main() -> None:
                "--parallel-jobs", str(parallel_jobs), "--auto-resume",
                "--max-no-progress-retries", str(args.max_no_progress_retries),
                "--retry-backoff-seconds", str(args.retry_backoff_seconds),
+               "--cuda-health-poll-seconds", str(args.cuda_health_poll_seconds),
                "--stop-on-fail"]
     log_path = root / "ablation_run.log"
     started = time.monotonic()

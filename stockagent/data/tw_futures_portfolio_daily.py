@@ -36,9 +36,9 @@ except Exception:  # pragma: no cover - validated at the public entry points
     pq = None
 
 
-TAIFEX_FUTURES_PORTFOLIO_DATA_CONTRACT_VERSION: Final[int] = 2
+TAIFEX_FUTURES_PORTFOLIO_DATA_CONTRACT_VERSION: Final[int] = 3
 TAIFEX_FUTURES_PORTFOLIO_FEATURE_CONTRACT_VERSION: Final[int] = 2
-TAIFEX_FUTURES_PORTFOLIO_BACKTEST_CONTRACT_VERSION: Final[int] = 1
+TAIFEX_FUTURES_PORTFOLIO_BACKTEST_CONTRACT_VERSION: Final[int] = 2
 
 DEFAULT_SOURCE_PATH: Final[str] = (
     "data_tw_index_futures/all_futures_daily_sessions.parquet"
@@ -53,7 +53,7 @@ DEFAULT_STOCK_MASTER_PATH: Final[str] = "data_tw_public/stocks/symbols.csv"
 DEFAULT_PUBLIC_FEATURE_PATH: Final[str] = (
     "data_tw_public/features/tw_public_stock_daily.parquet"
 )
-DEFAULT_OUTPUT_ROOT: Final[str] = "data_tw_futures/taifex_portfolio_daily"
+DEFAULT_OUTPUT_ROOT: Final[str] = "data_tw_futures/taifex_portfolio_daily_v3"
 
 # These products are listed by TAIFEX but are outside the requested
 # equity/ETF/index scope.  Keep the exclusion explicit and audited.
@@ -104,6 +104,45 @@ _DOMESTIC_INDEX_ROOTS: Final[frozenset[str]] = frozenset(
     }
 )
 
+# Point-value multipliers from the TAIFEX product specifications.  MSF is
+# deliberately absent: the retired MSCI Taiwan future was USD-denominated and
+# needs a point-in-time FX series before a TWD fixed commission can be divided
+# by contract notional.  Adjusted single-stock/ETF roots (suffix ``1``) are
+# also resolved as unsupported below because their contract units vary by
+# corporate action and must come from the historical adjustment notices.
+TAIFEX_INDEX_FUTURES_MULTIPLIERS_TWD: Final[dict[str, float]] = {
+    "TX": 200.0,
+    "MTX": 50.0,
+    "TMF": 10.0,
+    "TE": 4_000.0,
+    "ZEF": 500.0,
+    "TF": 1_000.0,
+    "ZFF": 250.0,
+    "T5F": 100.0,
+    "XIF": 10.0,
+    "GTF": 4_000.0,
+    "G2F": 50.0,
+    "E4F": 100.0,
+    "BTF": 50.0,
+    "SHF": 1_000.0,
+    "SOF": 50.0,
+    "M1F": 10.0,
+    "TJF": 200.0,
+    "I5F": 50.0,
+    "UDF": 20.0,
+    "SPF": 200.0,
+    "UNF": 50.0,
+    "SXF": 80.0,
+    "F1F": 50.0,
+}
+
+_SINOPAC_LARGE_FEE_INDEX_ROOTS: Final[frozenset[str]] = frozenset(
+    {"TX", "TE", "TF", "T5F", "GTF", "XIF"}
+)
+_SINOPAC_MICRO_FEE_INDEX_ROOTS: Final[frozenset[str]] = frozenset(
+    {"TMF", "M1F"}
+)
+
 # Shioaji roots and the official TAIFEX daily-report product identifiers are
 # not identical for the original four index futures.  MX2 is the current
 # weekly-small-TAIEX Shioaji root and belongs to the same official MTX family.
@@ -119,6 +158,10 @@ _OFFICIAL_PRODUCT_OVERRIDES: Final[dict[str, str]] = {
 # currently listed PSF contract is MiTAC Holdings (3706), not the retired 2315.
 _UNDERLYING_OVERRIDES: Final[dict[str, str]] = {
     "CM2": "2887",  # 台新金 -> 台新新光金
+    "DT1": "2384",  # 勝華（歷史下市標的）
+    "DTF": "2384",  # 勝華（歷史下市標的）
+    "ES1": "1704",  # 榮化（歷史下市標的）
+    "ESF": "1704",  # 榮化（歷史下市標的）
     "FJF": "2104",  # 中橡 -> 國際中橡
     "FP1": "2206",
     "FPF": "2206",  # 三陽 -> 三陽工業
@@ -166,9 +209,53 @@ class TaiwanFuturesPortfolioDaily:
     executable_mask: np.ndarray
     must_liquidate_mask: np.ndarray
     can_hold_overnight_mask: np.ndarray
+    contract_multipliers: np.ndarray
+    fee_per_contract_per_side_twd: np.ndarray
+    fee_rate_per_open_notional: np.ndarray
     source_path: str
     manifest_path: str
     contract_version: int = TAIFEX_FUTURES_PORTFOLIO_DATA_CONTRACT_VERSION
+
+
+def _fixed_fee_contract_metadata(
+    official_product: str,
+    product_name: str,
+    asset_class: str,
+) -> tuple[float | None, str | None, str | None]:
+    """Return multiplier, account fee group, and unsupported reason.
+
+    Fee groups are the user's SinoPac network-order account schedule.  The
+    amounts remain configuration values; this data contract owns only the
+    unambiguous product-to-group mapping.
+    """
+
+    product = str(official_product).strip().upper()
+    name = unicodedata.normalize("NFKC", str(product_name or "")).replace(
+        "臺", "台"
+    )
+    if product == "MSF":
+        return None, None, "legacy_usd_notional_requires_historical_fx"
+    if asset_class in {"stock_future", "etf_future"} and product.endswith("1"):
+        return None, None, "adjusted_contract_unit_requires_historical_notice"
+    if asset_class == "index_future":
+        multiplier = TAIFEX_INDEX_FUTURES_MULTIPLIERS_TWD.get(product)
+        if multiplier is None:
+            return None, None, "missing_official_index_multiplier"
+        if product in _SINOPAC_LARGE_FEE_INDEX_ROOTS:
+            group = "large"
+        elif product in _SINOPAC_MICRO_FEE_INDEX_ROOTS:
+            group = "micro"
+        else:
+            group = "standard"
+        return multiplier, group, None
+    is_small = name.startswith("小型")
+    if asset_class == "stock_future":
+        return (100.0 if is_small else 2_000.0), "stock", None
+    if asset_class == "etf_future":
+        return (1_000.0 if is_small else 10_000.0), (
+            "micro" if is_small else "standard"
+        ), None
+    return None, None, f"unsupported_asset_class:{asset_class}"
 
 
 def _require_dependencies() -> None:
@@ -238,9 +325,19 @@ def build_product_master(
             f"official TAIFEX product-code master is missing: {official_path}; "
             "run scripts/download_taifex_contract_codes.py"
         )
-    products = pl.read_csv(products_path, infer_schema_length=10_000).with_columns(
-        pl.col("root").cast(pl.String).str.strip_chars().str.to_uppercase(),
-        pl.col("product_name").cast(pl.String).str.strip_chars(),
+    # The broker catalogue contributes current live aliases only.  Historical
+    # research ownership comes from the official archive plus the official
+    # TAIFEX code table, so an offline rebuild must not require broker
+    # credentials or a point-in-time-incorrect current catalogue.
+    products = (
+        pl.read_csv(products_path, infer_schema_length=10_000).select(
+            pl.col("root").cast(pl.String).str.strip_chars().str.to_uppercase(),
+            pl.col("product_name").cast(pl.String).str.strip_chars(),
+        )
+        if products_path.exists()
+        else pl.DataFrame(
+            schema={"root": pl.String, "product_name": pl.String}
+        )
     )
     official_codes = pl.read_csv(official_path, infer_schema_length=10_000).with_columns(
         pl.col("code").cast(pl.String).str.strip_chars().str.to_uppercase(),
@@ -322,6 +419,11 @@ def build_product_master(
                 )
             asset_class = f"{security_type}_future"
             region = "domestic"
+        multiplier, fee_group, unsupported_reason = _fixed_fee_contract_metadata(
+            official_product,
+            product_name,
+            asset_class,
+        )
         records.append(
             {
                 "shioaji_roots": ",".join(
@@ -336,6 +438,10 @@ def build_product_master(
                 "listing_scope": (
                     "current" if official_product in current_aliases else "historical"
                 ),
+                "contract_multiplier": multiplier,
+                "sinopac_network_fee_group": fee_group,
+                "fixed_fee_research_supported": unsupported_reason is None,
+                "fixed_fee_research_exclusion_reason": unsupported_reason,
             }
         )
 
@@ -512,7 +618,12 @@ def build_continuous_daily(
         official_product_code_path,
         source_products=source_products,
     )
-    selected = product_master["official_product"].to_list()
+    # Fixed-per-contract commissions cannot be represented truthfully without
+    # a TWD contract notional.  Exclude only explicitly audited unsupported
+    # families; do not fall back to a guessed multiplier.
+    selected = product_master.filter(
+        pl.col("fixed_fee_research_supported")
+    )["official_product"].to_list()
     raw = (
         source
         .filter(
@@ -690,6 +801,11 @@ def build_continuous_daily(
     frame = frame.join(metadata, on="product", how="left", validate="m:1")
     if frame["asset_class"].null_count():
         raise RuntimeError("selected TAIFEX rows lost product classification")
+    if (
+        frame["contract_multiplier"].null_count()
+        or frame["sinopac_network_fee_group"].null_count()
+    ):
+        raise RuntimeError("fixed-fee TAIFEX rows lost multiplier/fee classification")
 
     previous_valid = same_previous
     frame = frame.with_columns(
@@ -879,7 +995,6 @@ def build_dataset(
     output_root = Path(output_root)
     for required in (
         source_path,
-        product_master_path,
         stock_master_path,
         official_product_code_path,
         public_feature_path,
@@ -940,7 +1055,7 @@ def build_dataset(
         "session": "一般",
         "scope": (
             "historical_and_current_taifex_stock_etf_domestic_and_foreign_"
-            "index_futures"
+            "index_futures_with_verified_twd_contract_notional"
         ),
         "excluded_roots": sorted(_EXCLUDED_NON_EQUITY_ROOTS),
         "rows": int(continuous.height),
@@ -956,6 +1071,27 @@ def build_dataset(
             ).height
         ),
         "products": int(product_master.height),
+        "fixed_fee_research_products": int(
+            product_master["fixed_fee_research_supported"].sum()
+        ),
+        "fixed_fee_research_exclusions": [
+            {
+                "product": str(row[0]),
+                "reason": str(row[1]),
+            }
+            for row in product_master.filter(
+                ~pl.col("fixed_fee_research_supported")
+            )
+            .select(
+                "official_product",
+                "fixed_fee_research_exclusion_reason",
+            )
+            .iter_rows()
+        ],
+        "fixed_fee_contract": (
+            "continuous_fractional_contracts; per_side_fee_twd divided_by "
+            "valuation_open_times_contract_multiplier; no_tax_no_slippage"
+        ),
         "logical_symbols": int(symbol_count),
         "maximum_tenor_rank": int(continuous["tenor_rank"].max()),
         "maximum_expiry_slot_lane": int(continuous["expiry_slot_lane"].max()),
@@ -976,7 +1112,6 @@ def build_dataset(
     }
     for label, path in {
         "official_all_futures_daily": source_path,
-        "shioaji_current_product_master": product_master_path,
         "official_taifex_product_codes": official_product_code_path,
         "twse_tpex_stock_master": stock_master_path,
         "tw_public_daily_features": public_feature_path,
@@ -986,6 +1121,16 @@ def build_dataset(
             "size": int(path.stat().st_size),
             "sha256": _sha256_file(path),
         }
+    manifest["sources"]["shioaji_current_product_master"] = (
+        {
+            "path": str(product_master_path),
+            "size": int(product_master_path.stat().st_size),
+            "sha256": _sha256_file(product_master_path),
+            "required": False,
+        }
+        if product_master_path.exists()
+        else {"path": str(product_master_path), "present": False, "required": False}
+    )
     for label, path in {
         "continuous_daily": continuous_path,
         "product_master": product_output_path,
@@ -1011,6 +1156,8 @@ def build_dataset(
 def attach_futures_portfolio_daily(
     panel: PanelData,
     data_path: str | Path,
+    *,
+    fee_per_side_twd_by_group: dict[str, float],
 ) -> PanelData:
     """Align executor labels to a generic panel without changing features."""
 
@@ -1049,6 +1196,8 @@ def attach_futures_portfolio_daily(
             "executable",
             "must_liquidate",
             "can_hold_overnight",
+            "contract_multiplier",
+            "sinopac_network_fee_group",
         ],
         filters=[("date", ">=", date_start), ("date", "<=", date_end)],
         memory_map=True,
@@ -1070,6 +1219,9 @@ def attach_futures_portfolio_daily(
     executable = np.zeros(shape, dtype=bool)
     must_liquidate = np.zeros(shape, dtype=bool)
     can_hold = np.zeros(shape, dtype=bool)
+    multipliers = np.full(shape, np.nan, dtype=np.float32)
+    fee_per_contract = np.full(shape, np.nan, dtype=np.float32)
+    fee_rate_per_open_notional = np.full(shape, np.nan, dtype=np.float32)
     contracts = np.full(shape, "", dtype="U16")
     benchmark_returns = np.zeros(len(dates), dtype=np.float32)
     benchmark_assigned = np.zeros(len(dates), dtype=bool)
@@ -1086,6 +1238,31 @@ def attach_futures_portfolio_daily(
         executable[di, si] = bool(row["executable"])
         must_liquidate[di, si] = bool(row["must_liquidate"])
         can_hold[di, si] = bool(row["can_hold_overnight"])
+        multiplier = float(row["contract_multiplier"])
+        fee_group = str(row["sinopac_network_fee_group"])
+        if fee_group not in fee_per_side_twd_by_group:
+            raise ValueError(
+                f"missing SinoPac network fee for group={fee_group!r}"
+            )
+        fee = float(fee_per_side_twd_by_group[fee_group])
+        opening_price = float(row["open"])
+        if (
+            not np.isfinite(multiplier)
+            or multiplier <= 0.0
+            or not np.isfinite(fee)
+            or fee < 0.0
+            or not np.isfinite(opening_price)
+            or opening_price <= 0.0
+        ):
+            raise ValueError(
+                "invalid fixed-fee contract metadata for "
+                f"product={row['product']!r} symbol={row['symbol']!r}"
+            )
+        multipliers[di, si] = multiplier
+        fee_per_contract[di, si] = fee
+        fee_rate_per_open_notional[di, si] = fee / (
+            opening_price * multiplier
+        )
         contracts[di, si] = str(row["contract"])
         if str(row["product"]) == "TX" and int(row["tenor_rank"]) == 1:
             if benchmark_assigned[di]:
@@ -1103,6 +1280,12 @@ def attach_futures_portfolio_daily(
         raise ValueError("executable TAIFEX futures rows have non-finite holding returns")
     if bool((can_hold & must_liquidate).any()):
         raise ValueError("can_hold_overnight and must_liquidate overlap")
+    invalid_fee = (executable | must_liquidate | can_hold) & (
+        ~np.isfinite(fee_rate_per_open_notional)
+        | (fee_rate_per_open_notional < 0.0)
+    )
+    if bool(invalid_fee.any()):
+        raise ValueError("active TAIFEX futures rows have invalid fixed fee rates")
 
     panel.returns_1d = returns
     panel.open_prices = open_prices
@@ -1130,6 +1313,9 @@ def attach_futures_portfolio_daily(
         executable_mask=executable,
         must_liquidate_mask=must_liquidate,
         can_hold_overnight_mask=can_hold,
+        contract_multipliers=multipliers,
+        fee_per_contract_per_side_twd=fee_per_contract,
+        fee_rate_per_open_notional=fee_rate_per_open_notional,
         source_path=str(data_path),
         manifest_path=str(manifest_path),
     )
