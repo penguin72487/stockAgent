@@ -1322,6 +1322,12 @@ def main() -> None:
         panel = attach_futures_portfolio_daily(
             panel,
             config.trading.tw_futures_portfolio_data_path,
+            fee_per_side_twd_by_group={
+                "large": config.trading.tw_futures_portfolio_fee_large_twd,
+                "standard": config.trading.tw_futures_portfolio_fee_standard_twd,
+                "stock": config.trading.tw_futures_portfolio_fee_stock_twd,
+                "micro": config.trading.tw_futures_portfolio_fee_micro_twd,
+            },
         )
     if (
         str(config.trading.execution_mode) == "tw_day_trade"

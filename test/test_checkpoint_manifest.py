@@ -22,6 +22,7 @@ from stockagent.training.trainer import (
     _atomic_torch_save,
     _capture_rng_state,
     _fold_dir,
+    _latest_group_checkpoint,
     _load_checkpoint,
     _load_completed_fold_result,
     _load_state_dict,
@@ -1823,3 +1824,36 @@ def test_atomic_checkpoint_save_preserves_previous_file_on_write_failure(
 
     assert checkpoint_path.read_bytes() == b"previous readable checkpoint"
     assert not list(tmp_path.glob(".*.tmp"))
+
+
+def test_atomic_checkpoint_save_rejects_empty_completed_temporary_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checkpoint_path = tmp_path / "checkpoint.pt"
+    _atomic_torch_save({"epoch": 2}, checkpoint_path)
+    previous = checkpoint_path.read_bytes()
+
+    def _empty_save(_payload, path):
+        Path(path).write_bytes(b"")
+
+    monkeypatch.setattr(torch, "save", _empty_save)
+    with pytest.raises(OSError, match="temporary file is empty"):
+        _atomic_torch_save({"epoch": 3}, checkpoint_path)
+
+    assert checkpoint_path.read_bytes() == previous
+    assert _load_checkpoint(checkpoint_path)["epoch"] == 2
+    assert not list(tmp_path.glob(".*.tmp"))
+
+
+def test_latest_group_checkpoint_skips_empty_newest_candidate(
+    tmp_path: Path,
+) -> None:
+    healthy = tmp_path / "train_2014-2015" / "checkpoint_last.pt"
+    corrupt = tmp_path / "train_2014-2015-2016" / "checkpoint_last.pt"
+    _atomic_torch_save({"epoch": 100}, healthy)
+    corrupt.parent.mkdir(parents=True)
+    corrupt.write_bytes(b"")
+
+    selected = _latest_group_checkpoint(tmp_path)
+
+    assert selected == (healthy, [2014, 2015])

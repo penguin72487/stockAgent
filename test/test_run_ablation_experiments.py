@@ -9,6 +9,7 @@ from scripts.run_ablation_experiments import (
     _deep_merge,
     _effective_parallel_jobs,
     _experiment_rows,
+    _failure_kind,
     _fold_status,
     _format_fold_status,
     _per_job_thread_budget,
@@ -23,6 +24,49 @@ def test_deep_merge_preserves_unmodified_nested_values() -> None:
         "training": {"epochs": 10, "model": {"dropout": 0.0, "layers": 2}}
     }
     assert base["training"]["model"]["dropout"] == 0.1
+
+
+def test_ablation_spec_inheritance_reuses_matrix_and_overrides_contract(
+    tmp_path: Path,
+) -> None:
+    base = tmp_path / "base.yaml"
+    base.write_text(
+        """
+base_config: configs/markets/tw_day_trade_daily_no_default.yaml
+output_root: artifacts/ablations/base
+expected_fold_count: 12
+runtime:
+  parallel_jobs: 1
+matrix:
+  include_baseline: true
+  dimensions:
+    - name: learning_rate
+      enabled: true
+      path: training.learning_rate
+      values:
+        - name: variant
+          experiment_name: variant
+          value: 0.0002
+""",
+        encoding="utf-8",
+    )
+    child = tmp_path / "child.yaml"
+    child.write_text(
+        """
+base_spec: base.yaml
+base_config: configs/markets/tw_day_trade_daily_multi_basis_tplus2_close_capital10m.yaml
+output_root: artifacts/ablations/multi_basis_capital10m
+""",
+        encoding="utf-8",
+    )
+
+    spec, rows = _experiment_rows(child)
+
+    assert spec["base_config"].endswith("multi_basis_tplus2_close_capital10m.yaml")
+    assert spec["output_root"].endswith("multi_basis_capital10m")
+    assert spec["runtime"]["parallel_jobs"] == 1
+    assert spec["expected_fold_count"] == 12
+    assert [row["name"] for row in rows] == ["baseline", "variant"]
 
 
 def test_parallel_jobs_split_host_wide_thread_budgets() -> None:
@@ -265,6 +309,104 @@ matrix:
     assert summary[0]["status"] == "failed"
     assert summary[0]["attempts"] == 2
     assert summary[0]["consecutive_no_progress_failures"] == 2
+
+
+def test_failure_kind_distinguishes_cuda_infrastructure_from_oom() -> None:
+    assert (
+        _failure_kind(1, "CUDA initialization: CUDA unknown error")
+        == "cuda_infrastructure_unavailable"
+    )
+    assert (
+        _failure_kind(1, "open /dev/nvidia-uvm: Input/output error")
+        == "cuda_infrastructure_unavailable"
+    )
+    assert _failure_kind(1, "CUDA out of memory") == "cuda_oom"
+
+
+def test_cuda_infrastructure_wait_does_not_consume_retry_budget(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    spec = tmp_path / "cuda_wait.yaml"
+    spec.write_text(
+        """
+base_config: configs/markets/tw_day_trade_daily_no_default.yaml
+expected_fold_count: 1
+matrix:
+  include_baseline: false
+  dimensions:
+    - name: learning_rate
+      enabled: true
+      path: training.learning_rate
+      values:
+        - name: variant
+          experiment_name: variant
+          value: 0.0002
+""",
+        encoding="utf-8",
+    )
+    output_root = tmp_path / "output"
+
+    class CudaFailThenSucceedProcess:
+        next_pid = 93_000
+        attempts = 0
+
+        def __init__(self, _command, **kwargs):
+            type(self).next_pid += 1
+            type(self).attempts += 1
+            self.pid = type(self).next_pid
+            self.returncode = None
+            self.attempt = type(self).attempts
+            if self.attempt == 1:
+                kwargs["stdout"].write(
+                    "CUDA initialization: CUDA unknown error\n"
+                )
+                kwargs["stdout"].flush()
+
+        def poll(self):
+            if self.returncode is None:
+                self.returncode = 1 if self.attempt == 1 else 0
+            return self.returncode
+
+    health_probes = 0
+
+    def _healthy_after_failure():
+        nonlocal health_probes
+        health_probes += 1
+        return True, "healthy CUDA devices=2"
+
+    monkeypatch.setattr(
+        ablation_module.subprocess, "Popen", CudaFailThenSucceedProcess
+    )
+    monkeypatch.setattr(ablation_module, "_cuda_runtime_health", _healthy_after_failure)
+    monkeypatch.setattr(
+        ablation_module.sys,
+        "argv",
+        [
+            "run_ablation_experiments.py",
+            "--spec",
+            str(spec),
+            "--output-root",
+            str(output_root),
+            "--runner",
+            "/bin/true",
+            "--max-folds",
+            "1",
+            "--max-no-progress-retries",
+            "0",
+        ],
+    )
+
+    ablation_module.main()
+
+    assert CudaFailThenSucceedProcess.attempts == 2
+    assert health_probes == 1
+    summary = yaml.safe_load(
+        (output_root / "summary.json").read_text(encoding="utf-8")
+    )
+    assert summary[0]["status"] == "succeeded"
+    assert summary[0]["attempts"] == 2
+    assert summary[0]["consecutive_no_progress_failures"] == 0
 
 
 def test_experiment_rows_filter_and_validate_names(tmp_path: Path) -> None:

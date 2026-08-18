@@ -349,6 +349,41 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
                         "relative-tenor returns/mask/features have invalid shapes"
                     )
                 overnight_returns = derivative_returns
+        elif futures_portfolio_execution:
+            target_returns = np.asarray(panel.returns_1d, dtype=np.float32)
+            futures_daily = getattr(panel, "futures_portfolio_daily", None)
+            if futures_daily is None:
+                raise ValueError(
+                    "tw_futures_portfolio_day requires the attached fixed-fee "
+                    "futures data contract"
+                )
+            fixed_fee_rates = np.asarray(
+                futures_daily.fee_rate_per_open_notional,
+                dtype=np.float32,
+            )
+            if fixed_fee_rates.shape != panel.tradable_mask.shape:
+                raise ValueError(
+                    "futures fee-rate matrix must match the panel [T,S]"
+                )
+            active = (
+                np.asarray(panel.tradable_mask, dtype=bool)
+                | np.asarray(panel.force_exit_mask, dtype=bool)
+                | np.asarray(
+                    futures_daily.can_hold_overnight_mask,
+                    dtype=bool,
+                )
+            )
+            if np.any(
+                active
+                & (~np.isfinite(fixed_fee_rates) | (fixed_fee_rates < 0.0))
+            ):
+                raise ValueError(
+                    "active futures rows require finite non-negative fixed fee rates"
+                )
+            # This existing tensor is an executor-only auxiliary side channel,
+            # never a model feature.  For this mode it carries per-contract
+            # fixed commission divided by the row's opening contract notional.
+            overnight_returns = fixed_fee_rates
         elif self.execution_mode == "tw_day_trade":
             if panel.intraday_returns is None:
                 raise ValueError(

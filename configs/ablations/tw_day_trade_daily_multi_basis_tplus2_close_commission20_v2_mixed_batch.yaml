@@ -1,0 +1,6 @@
+# Reuse the validated 20-run OFAT matrix and change only the model family/base
+# contract plus the fresh output root.  The inherited matrix fixes the baseline
+# at TWD 10M, uses 1000 epochs, mixed power-of-two batches, and sequential DDP.
+base_spec: tw_day_trade_daily_tplus2_close_commission20_v3_mixed_batch.yaml
+base_config: configs/markets/tw_day_trade_daily_multi_basis_tplus2_close_capital10m.yaml
+output_root: artifacts/ablations/tw_day_trade_daily_multi_basis_tplus2_close_commission20_v2_ofat_mixed_batch_capital10m

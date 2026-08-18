@@ -22,6 +22,17 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_SPEC = REPO_ROOT / "configs/ablations/transformer_base_portfolio.yaml"
 DEFAULT_RUNNER = REPO_ROOT / "coda_runner.sh"
 _SAFE_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+_CUDA_INFRASTRUCTURE_FAILURE_PATTERNS = (
+    "cuda is not available in this environment",
+    "cuda driver initialization failed",
+    "cuda initialization: cuda unknown error",
+    "cuda_error_unknown",
+    "cudaerrorinitializationerror",
+    "found no nvidia driver",
+    "driver/library version mismatch",
+    "failed to initialize nvml",
+    "/dev/nvidia-uvm",
+)
 
 
 @dataclass
@@ -125,6 +136,10 @@ def _failure_kind(returncode: int, log_text: str) -> str:
     lowered = log_text.lower()
     if "outofmemoryerror" in lowered or "cuda out of memory" in lowered:
         return "cuda_oom"
+    if any(
+        pattern in lowered for pattern in _CUDA_INFRASTRUCTURE_FAILURE_PATTERNS
+    ):
+        return "cuda_infrastructure_unavailable"
     if "childfailederror" in lowered:
         return "distributed_worker_failure"
     if returncode < 0 or returncode in {
@@ -134,6 +149,48 @@ def _failure_kind(returncode: int, log_text: str) -> str:
     }:
         return "signal_termination"
     return "worker_failure"
+
+
+def _cuda_runtime_health() -> tuple[bool, str]:
+    """Probe the actual CUDA compute path in an isolated interpreter.
+
+    NVML-backed tools such as nvidia-smi can remain healthy while CUDA Driver
+    API initialization or /dev/nvidia-uvm is broken. A one-element allocation
+    on every visible device tests the path training actually needs without
+    contaminating this long-lived scheduler process with CUDA state.
+    """
+
+    probe = """
+import torch
+
+if not torch.cuda.is_available():
+    raise RuntimeError("torch.cuda.is_available() is false")
+count = torch.cuda.device_count()
+if count <= 0:
+    raise RuntimeError("torch.cuda.device_count() is zero")
+for index in range(count):
+    value = torch.ones(1, device=f"cuda:{index}")
+    torch.cuda.synchronize(index)
+    if value.item() != 1.0:
+        raise RuntimeError(f"CUDA allocation verification failed on cuda:{index}")
+print(f"healthy CUDA devices={count}")
+"""
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-c", probe],
+            cwd=REPO_ROOT,
+            env=os.environ.copy(),
+            capture_output=True,
+            text=True,
+            timeout=30.0,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, f"probe failed: {type(exc).__name__}: {exc}"
+    output = "\n".join(
+        part.strip() for part in (completed.stdout, completed.stderr) if part.strip()
+    )
+    detail = output.splitlines()[-1] if output else f"returncode={completed.returncode}"
+    return completed.returncode == 0, detail
 
 
 def _descendant_process_ids(root_pid: int) -> list[int]:
@@ -217,6 +274,29 @@ def _load_yaml(path: Path) -> dict[str, Any]:
     return payload
 
 
+def _load_ablation_spec(
+    path: Path,
+    stack: tuple[Path, ...] = (),
+) -> dict[str, Any]:
+    """Load a reusable ablation matrix with fail-closed single inheritance."""
+
+    resolved = path.expanduser().resolve()
+    if resolved in stack:
+        cycle = " -> ".join(str(item) for item in (*stack, resolved))
+        raise ValueError(f"Ablation spec inheritance cycle detected: {cycle}")
+    payload = _load_yaml(resolved)
+    base_raw = payload.pop("base_spec", None)
+    if base_raw is None:
+        return payload
+    if not isinstance(base_raw, str) or not base_raw.strip():
+        raise ValueError(f"{resolved} base_spec must be a non-empty path")
+    base_path = Path(base_raw).expanduser()
+    if not base_path.is_absolute():
+        base_path = resolved.parent / base_path
+    base = _load_ablation_spec(base_path, (*stack, resolved))
+    return _deep_merge(base, payload)
+
+
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
     merged = deepcopy(base)
     for key, value in override.items():
@@ -246,7 +326,7 @@ def _set_dotted(raw: dict[str, Any], path: str, value: Any) -> None:
 
 
 def _experiment_rows(spec_path: Path, selected: set[str] | None = None) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    spec = _load_yaml(spec_path)
+    spec = _load_ablation_spec(spec_path)
     base_config_raw = spec.get("base_config")
     if not isinstance(base_config_raw, str) or not base_config_raw.strip():
         raise ValueError("ablation spec requires a non-empty base_config")
@@ -552,6 +632,15 @@ def parse_args() -> argparse.Namespace:
         default=5.0,
         help="Initial automatic-resume backoff; consecutive delays are exponential.",
     )
+    parser.add_argument(
+        "--cuda-health-poll-seconds",
+        type=float,
+        default=30.0,
+        help=(
+            "Seconds between real CUDA allocation probes after a driver/UVM "
+            "failure. Infrastructure waiting does not consume experiment retries."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -596,6 +685,8 @@ def main() -> None:
         raise ValueError("max_no_progress_retries must be non-negative")
     if args.retry_backoff_seconds < 0:
         raise ValueError("retry_backoff_seconds must be non-negative")
+    if args.cuda_health_poll_seconds <= 0:
+        raise ValueError("cuda_health_poll_seconds must be positive")
     job_cpu_threads = _per_job_thread_budget(cpu_threads, parallel_jobs)
     job_compile_threads = _per_job_thread_budget(compile_threads, parallel_jobs)
     expected_fold_count_raw = spec.get("expected_fold_count")
@@ -739,10 +830,36 @@ def main() -> None:
 
     active: dict[int, _ActiveRun] = {}
     first_failure: int | None = None
+    cuda_health_blocked = False
+    next_cuda_health_probe_at = 0.0
     try:
         while pending or active:
             while pending and len(active) < parallel_jobs and first_failure is None:
                 now = time.monotonic()
+                if cuda_health_blocked:
+                    if now < next_cuda_health_probe_at:
+                        break
+                    cuda_healthy, cuda_health_detail = _cuda_runtime_health()
+                    if not cuda_healthy:
+                        next_cuda_health_probe_at = (
+                            now + float(args.cuda_health_poll_seconds)
+                        )
+                        print(
+                            "[scheduler] CUDA compute path is still unhealthy; "
+                            "all pending experiments remain paused and no retry "
+                            "budget is consumed. "
+                            f"next_probe={args.cuda_health_poll_seconds:.1f}s "
+                            f"detail={cuda_health_detail}",
+                            flush=True,
+                        )
+                        break
+                    cuda_health_blocked = False
+                    next_cuda_health_probe_at = 0.0
+                    print(
+                        "[scheduler] CUDA compute path recovered; resuming the "
+                        f"same experiment ({cuda_health_detail})",
+                        flush=True,
+                    )
                 ready_index = next(
                     (
                         index
@@ -839,8 +956,12 @@ def main() -> None:
                     time.sleep(0.25)
                     continue
                 if pending:
-                    next_ready = min(
-                        float(item.get("ready_at", 0.0)) for item in pending
+                    next_ready = (
+                        next_cuda_health_probe_at
+                        if cuda_health_blocked
+                        else min(
+                            float(item.get("ready_at", 0.0)) for item in pending
+                        )
                     )
                     delay = max(0.01, min(0.25, next_ready - time.monotonic()))
                     time.sleep(delay)
@@ -861,47 +982,79 @@ def main() -> None:
                     )
                     progress_after = _run_progress_signature(job.run["output_dir"])
                     made_progress = progress_after > job.progress_before
-                    no_progress_failures = (
-                        0
-                        if made_progress
-                        else job.consecutive_no_progress_failures + 1
+                    infrastructure_wait = (
+                        failure_kind == "cuda_infrastructure_unavailable"
                     )
-                    retry_allowed = bool(args.auto_resume) and (
-                        made_progress
-                        or no_progress_failures <= args.max_no_progress_retries
-                    )
+                    if infrastructure_wait:
+                        # A host driver/UVM outage is not evidence that this
+                        # experiment cannot progress. Preserve its retry budget
+                        # and pause the entire queue so sibling experiments do
+                        # not burn their own retries against the same bad host.
+                        no_progress_failures = (
+                            0
+                            if made_progress
+                            else job.consecutive_no_progress_failures
+                        )
+                        retry_allowed = bool(args.auto_resume)
+                    else:
+                        no_progress_failures = (
+                            0
+                            if made_progress
+                            else job.consecutive_no_progress_failures + 1
+                        )
+                        retry_allowed = bool(args.auto_resume) and (
+                            made_progress
+                            or no_progress_failures <= args.max_no_progress_retries
+                        )
                     if retry_allowed:
-                        exponent = max(0, no_progress_failures - 1)
-                        retry_delay = min(
-                            300.0,
-                            float(args.retry_backoff_seconds) * (2**exponent),
-                        )
-                        pending.append(
-                            {
-                                "order": job.order,
-                                "run": job.run,
-                                "command": job.command,
-                                "attempt": job.attempt + 1,
-                                "consecutive_no_progress_failures": (
-                                    no_progress_failures
-                                ),
-                                "ready_at": time.monotonic() + retry_delay,
-                            }
-                        )
+                        if infrastructure_wait:
+                            retry_delay = 0.0
+                            cuda_health_blocked = True
+                            next_cuda_health_probe_at = time.monotonic()
+                        else:
+                            exponent = max(0, no_progress_failures - 1)
+                            retry_delay = min(
+                                300.0,
+                                float(args.retry_backoff_seconds) * (2**exponent),
+                            )
+                        retry_item = {
+                            "order": job.order,
+                            "run": job.run,
+                            "command": job.command,
+                            "attempt": job.attempt + 1,
+                            "consecutive_no_progress_failures": (
+                                no_progress_failures
+                            ),
+                            "ready_at": time.monotonic() + retry_delay,
+                        }
+                        if infrastructure_wait:
+                            pending.insert(0, retry_item)
+                        else:
+                            pending.append(retry_item)
                         complete_after, requested_after = _fold_status(
                             job.run["output_dir"],
                             args.start_fold,
                             args.max_folds,
                             expected_fold_count,
                         )
+                        retry_label = (
+                            "CUDA infrastructure wait queued"
+                            if infrastructure_wait
+                            else "auto-resume queued"
+                        )
+                        retry_suffix = (
+                            "retry_budget_consumed=no"
+                            if infrastructure_wait
+                            else f"backoff={retry_delay:.1f}s"
+                        )
                         print(
-                            f"[{job.run['name']}] auto-resume queued "
+                            f"[{job.run['name']}] {retry_label} "
                             f"attempt={job.attempt + 1} kind={failure_kind} "
                             f"progress={'yes' if made_progress else 'no'} "
                             f"no_progress_failures={no_progress_failures}/"
                             f"{args.max_no_progress_retries} "
                             f"folds={_format_fold_status(complete_after, requested_after)} "
-                            f"backoff={retry_delay:.1f}s",
+                            f"{retry_suffix}",
                             flush=True,
                         )
                         continue
