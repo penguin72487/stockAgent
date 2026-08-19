@@ -31,7 +31,10 @@ Syncthing 發布庫（固定 hash 分桶 ZIP + 大檔 blob + manifest/head）
 
 - 單一巨檔只改一筆也要重傳整檔，且損毀半徑最大。
 - 每個小檔直接同步會消耗 Syncthing 掃描、資料庫與 inode。
-- 固定路徑雜湊分桶使同一路徑永遠落入同一 ZIP；一次變更只重做一個桶。
+- 第一版以固定路徑雜湊分桶建立 base packs。後續 manifest 逐檔比較 SHA；
+  未變檔案沿用既有 pack member，只有新增或變更檔案寫入 delta packs。
+- 每個增量 manifest 都直接列出完整可重建物件集合，不需要依序重播整條 delta chain；
+  被部分沿用的舊 pack 會標記為 subset reference，fetch 只解出目前 inventory 成員。
 - 大於門檻的 Parquet/NPY 直接成為 SHA-256 blob，不做無效二次壓縮。
 - 接收端仍可 materialize 舊目錄契約，既有訓練 reader 不必同時重寫。
 
@@ -173,6 +176,7 @@ COLD_ONLY -- use/完整驗證 --> HOT -- 7 天未續租 --> COLD_ONLY
 ```bash
 ./scripts/run_data_cache.sh status
 ./scripts/run_data_cache.sh status tw-public
+./scripts/run_data_cache.sh status --human
 ```
 
 自行解封最新版本並取得路徑：
@@ -221,6 +225,15 @@ printf 'training data: %s\n' "$data_path"
 
 ```bash
 sudo ./scripts/install_data_cache_gc_service.sh
+```
+
+安裝後可在任意目錄直接使用：
+
+```bash
+stockagent-data status
+stockagent-data status --human
+stockagent-data use tw-public --path-only
+stockagent-data gc --dry-run
 ```
 
 新資料的增量冷存仍使用既有發布入口。固定 hash bucket 與 content-addressed

@@ -154,3 +154,23 @@ def test_status_distinguishes_current_and_outdated_hot_release(
     assert row["cold"]["snapshot_id"] == second_id
     assert row["hot"]["snapshot_id"] == first_id
     assert row["hot"]["state"] == "hot-outdated"
+
+
+def test_status_reports_an_existing_unmanaged_materialization(
+    tmp_path: Path,
+) -> None:
+    sync_root, snapshot_id = _release(tmp_path)
+    hot_root = tmp_path / "hot"
+    target = hot_root / "prices" / snapshot_id
+    target.mkdir(parents=True)
+    (target / "manual.txt").write_text("manual", encoding="utf-8")
+
+    status = materialized_cache_status(
+        sync_root, hot_root, dataset="prices", now_ns=BASE_NS + DAY_NS
+    )
+
+    hot = status["datasets"][0]["hot"]
+    assert hot["state"] == "hot-unmanaged"
+    assert hot["materialized_count"] == 1
+    assert hot["materializations"][0]["snapshot_id"] == snapshot_id
+    assert hot["materializations"][0]["managed"] is False

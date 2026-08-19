@@ -383,6 +383,19 @@ def _write_pack(
             entry.sha256 = digest.hexdigest()
 
 
+def _hash_source_entry(source: Path, entry: _SourceEntry) -> str:
+    source_path = source.joinpath(*PurePosixPath(entry.path).parts)
+    _ensure_source_stat(source_path, entry)
+    digest = sha256_file(source_path)
+    _ensure_source_stat(source_path, entry)
+    return digest
+
+
+def _is_ordered_subset(selected: list[str], available: list[str]) -> bool:
+    iterator = iter(available)
+    return all(any(candidate == expected for candidate in iterator) for expected in selected)
+
+
 def _write_inventory(temporary: Path, entries: Iterable[_SourceEntry]) -> str:
     digest = hashlib.sha256()
     with temporary.open("xb") as raw_stream:
@@ -726,12 +739,54 @@ def publish_packed_snapshot(
         )
         staging_root = sync_root / ".local-state" / "staging"
         staging_root.mkdir(parents=True, exist_ok=True)
-        objects: list[dict[str, Any]] = []
+        previous: ResolvedSnapshot | None = None
+        previous_files: dict[str, dict[str, Any]] = {}
+        previous_objects: dict[str, dict[str, Any]] = {}
+        if any((sync_root / "heads" / dataset).glob("*.json")):
+            previous = resolve_latest_packed(
+                sync_root,
+                dataset,
+                max_clock_skew_seconds=max_clock_skew_seconds,
+            )
+            previous_inventory = _load_inventory(sync_root, previous.manifest)
+            _validate_inventory(previous.manifest, previous_inventory)
+            previous_files = {
+                str(row["path"]): row
+                for row in previous_inventory
+                if row.get("kind") == "file"
+            }
+            previous_objects = {
+                str(item["sha256"]): dict(item)
+                for item in previous.manifest["archive"]["objects"]
+            }
+
+        reused_files = 0
+        changed_files: list[_SourceEntry] = []
+        for entry in entries:
+            if entry.kind != "file":
+                continue
+            entry.sha256 = _hash_source_entry(source, entry)
+            prior = previous_files.get(entry.path)
+            prior_storage = prior.get("storage") if prior else None
+            if (
+                prior is not None
+                and int(prior.get("size", -1)) == entry.size
+                and prior.get("sha256") == entry.sha256
+                and isinstance(prior_storage, Mapping)
+                and str(prior_storage.get("object_sha256")) in previous_objects
+            ):
+                entry.storage = dict(prior_storage)
+                reused_files += 1
+            else:
+                changed_files.append(entry)
+
+        created_objects: dict[str, dict[str, Any]] = {}
+        newly_installed_hashes: set[str] = set()
 
         large_files = [
             entry
-            for entry in entries
-            if entry.kind == "file" and entry.size >= loose_file_threshold_bytes
+            for entry in changed_files
+            if entry.size >= loose_file_threshold_bytes
         ]
         for entry in large_files:
             source_path = source.joinpath(*PurePosixPath(entry.path).parts)
@@ -739,16 +794,21 @@ def publish_packed_snapshot(
             temporary = staging_root / f"blob-{uuid.uuid4().hex}.partial"
             digest = _copy_and_hash(source_path, temporary)
             _ensure_source_stat(source_path, entry)
+            if digest != entry.sha256:
+                raise SnapshotError(f"source file changed while packing: {source_path}")
             relpath = _object_relpath("blobs", digest, ".blob")
             destination = sync_root.joinpath(*relpath.parts)
-            _install_immutable_object(temporary, destination, expected_sha256=digest)
+            already_present = _install_immutable_object(
+                temporary, destination, expected_sha256=digest
+            )
+            if not already_present:
+                newly_installed_hashes.add(digest)
             entry.sha256 = digest
             entry.storage = {
                 "kind": "blob",
                 "object_sha256": digest,
             }
-            objects.append(
-                {
+            created_objects[digest] = {
                     "bytes": entry.size,
                     "file_count": 1,
                     "kind": "blob",
@@ -756,11 +816,10 @@ def publish_packed_snapshot(
                     "relpath": relpath.as_posix(),
                     "sha256": digest,
                 }
-            )
 
         buckets: dict[int, list[_SourceEntry]] = {}
-        for entry in entries:
-            if entry.kind == "file" and entry.size < loose_file_threshold_bytes:
+        for entry in changed_files:
+            if entry.size < loose_file_threshold_bytes:
                 bucket = _bucket_for_path(entry.path, pack_buckets)
                 buckets.setdefault(bucket, []).append(entry)
         for bucket, bucket_entries in sorted(buckets.items()):
@@ -775,7 +834,11 @@ def publish_packed_snapshot(
             relpath = _object_relpath("packs", digest, ".zip")
             destination = sync_root.joinpath(*relpath.parts)
             size = temporary.stat().st_size
-            _install_immutable_object(temporary, destination, expected_sha256=digest)
+            already_present = _install_immutable_object(
+                temporary, destination, expected_sha256=digest
+            )
+            if not already_present:
+                newly_installed_hashes.add(digest)
             logical_bytes = sum(entry.size for entry in bucket_entries)
             for entry in bucket_entries:
                 entry.storage = {
@@ -783,8 +846,7 @@ def publish_packed_snapshot(
                     "member": entry.path,
                     "object_sha256": digest,
                 }
-            objects.append(
-                {
+            created_objects[digest] = {
                     "bucket": bucket,
                     "bytes": size,
                     "file_count": len(bucket_entries),
@@ -793,7 +855,6 @@ def publish_packed_snapshot(
                     "relpath": relpath.as_posix(),
                     "sha256": digest,
                 }
-            )
 
         for entry in entries:
             if entry.kind == "file" and (not entry.sha256 or not entry.storage):
@@ -806,7 +867,7 @@ def publish_packed_snapshot(
         inventory_relpath = _object_relpath("inventories", inventory_sha, ".jsonl.gz")
         inventory_path = sync_root.joinpath(*inventory_relpath.parts)
         inventory_bytes = inventory_temp.stat().st_size
-        _install_immutable_object(
+        inventory_already_present = _install_immutable_object(
             inventory_temp, inventory_path, expected_sha256=inventory_sha
         )
 
@@ -844,19 +905,40 @@ def publish_packed_snapshot(
             f"{publisher_node[:40]}-{inventory_sha[:16]}",
             "snapshot_id",
         )
-        unique_objects: dict[str, dict[str, Any]] = {}
-        for item in objects:
-            digest = str(item["sha256"])
-            existing = unique_objects.get(digest)
-            if existing is None:
-                unique_objects[digest] = item
+        object_usage: dict[str, dict[str, int]] = {}
+        for entry in entries:
+            if entry.kind != "file" or not entry.storage:
                 continue
-            if any(existing[key] != item[key] for key in ("bytes", "kind", "relpath")):
+            digest = str(entry.storage["object_sha256"])
+            usage = object_usage.setdefault(
+                digest, {"file_count": 0, "logical_bytes": 0}
+            )
+            usage["file_count"] += 1
+            usage["logical_bytes"] += entry.size
+        unique_objects: dict[str, dict[str, Any]] = {}
+        for digest, usage in object_usage.items():
+            original = created_objects.get(digest) or previous_objects.get(digest)
+            if original is None:
                 raise SnapshotError(
-                    f"inconsistent duplicate object descriptor: {digest}"
+                    f"inventory references an unavailable packed object: {digest}"
                 )
-            existing["file_count"] += int(item["file_count"])
-            existing["logical_bytes"] += int(item["logical_bytes"])
+            item = dict(original)
+            stored_file_count = int(
+                item.get("stored_file_count", item.get("file_count", -1))
+            )
+            stored_logical_bytes = int(
+                item.get("stored_logical_bytes", item.get("logical_bytes", -1))
+            )
+            item["file_count"] = usage["file_count"]
+            item["logical_bytes"] = usage["logical_bytes"]
+            if item["kind"] == "pack" and (
+                item.get("member_selection") == "subset"
+                or usage["file_count"] != stored_file_count
+            ):
+                item["member_selection"] = "subset"
+                item["stored_file_count"] = stored_file_count
+                item["stored_logical_bytes"] = stored_logical_bytes
+            unique_objects[digest] = item
         objects = sorted(
             unique_objects.values(),
             key=lambda item: (str(item["kind"]), str(item["sha256"])),
@@ -897,6 +979,18 @@ def publish_packed_snapshot(
                 "object_count": len(objects),
                 "stored_bytes": sum(int(item["bytes"]) for item in objects)
                 + inventory_bytes,
+                "base_snapshot_id": (
+                    previous.manifest["snapshot_id"] if previous else None
+                ),
+                "reused_files": reused_files,
+                "changed_files": len(changed_files),
+                "new_object_count": len(newly_installed_hashes)
+                + (0 if inventory_already_present else 1),
+                "new_stored_bytes": sum(
+                    int(created_objects[digest]["bytes"])
+                    for digest in newly_installed_hashes
+                )
+                + (0 if inventory_already_present else inventory_bytes),
             },
             "metadata": dict(sorted((metadata or {}).items())),
         }
@@ -1008,6 +1102,10 @@ def _validate_inventory(
         members = object_members[digest]
         if len(members) != int(item["file_count"]):
             raise SnapshotError(f"object file count mismatch: {digest}")
+        if item.get("member_selection") == "subset":
+            stored_file_count = int(item.get("stored_file_count", -1))
+            if item["kind"] != "pack" or not len(members) <= stored_file_count:
+                raise SnapshotError(f"invalid subset pack descriptor: {digest}")
         if item["kind"] == "blob" and not members:
             raise SnapshotError(f"blob object has no inventory references: {digest}")
     return {"counts": counts, "object_members": object_members}
@@ -1046,7 +1144,12 @@ def verify_packed_snapshot(
                     bad_member = archive.testzip()
             except (OSError, zipfile.BadZipFile) as exc:
                 raise SnapshotError(f"invalid ZIP pack {path}: {exc}") from exc
-            if names != expected_names:
+            if item.get("member_selection") == "subset":
+                if not _is_ordered_subset(expected_names, names):
+                    raise SnapshotError(
+                        f"ZIP members do not contain inventory subset: {path}"
+                    )
+            elif names != expected_names:
                 raise SnapshotError(f"ZIP member list differs from inventory: {path}")
             if bad_member is not None:
                 raise SnapshotError(f"ZIP CRC check failed for {bad_member} in {path}")

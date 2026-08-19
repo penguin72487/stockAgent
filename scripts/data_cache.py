@@ -45,6 +45,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     status = subparsers.add_parser("status", help="show cold and hot state")
     status.add_argument("dataset", nargs="?")
+    status.add_argument(
+        "--human",
+        action="store_true",
+        help="print a compact cold/hot table instead of JSON",
+    )
 
     use = subparsers.add_parser("use", help="materialize and renew a hot lease")
     use.add_argument("dataset")
@@ -90,17 +95,58 @@ def _print(value: object) -> None:
     print(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True))
 
 
+def _print_human_status(value: dict[str, object]) -> None:
+    print(
+        "DATASET\tCOLD_PAYLOAD_GB\tHOT_LOGICAL_GB\tSTATE\tHOT_VERSION\tEXPIRES"
+    )
+    for raw in value["datasets"]:  # type: ignore[index]
+        row = dict(raw)  # type: ignore[arg-type]
+        cold = dict(row["cold"])
+        hot = dict(row["hot"])
+        cold_bytes = int(cold.get("stored_bytes") or 0)
+        materializations = list(hot.get("materializations") or [])
+        hot_bytes = sum(
+            int(dict(item).get("source_logical_bytes") or 0)
+            for item in materializations
+        )
+        only_materialization = (
+            dict(materializations[0]) if len(materializations) == 1 else {}
+        )
+        print(
+            "\t".join(
+                (
+                    str(row["dataset"]),
+                    f"{cold_bytes / 1_000_000_000:.3f}",
+                    f"{hot_bytes / 1_000_000_000:.3f}",
+                    str(hot.get("state", "unknown")),
+                    str(
+                        hot.get("snapshot_id")
+                        or only_materialization.get("snapshot_id")
+                        or "-"
+                    ),
+                    str(
+                        hot.get("expires_at")
+                        or only_materialization.get("expires_at")
+                        or "-"
+                    ),
+                )
+            )
+        )
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         if args.command == "status":
-            _print(
-                materialized_cache_status(
-                    args.sync_root,
-                    args.materialized_root,
-                    dataset=args.dataset,
-                )
+            status = materialized_cache_status(
+                args.sync_root,
+                args.materialized_root,
+                dataset=args.dataset,
             )
+            if args.human:
+                _print_human_status(status)
+            else:
+                _print(status)
             return 0
         if args.command == "use":
             lease = use_materialized_snapshot(
