@@ -6594,13 +6594,38 @@ def _plot_paper_time_importance(frame: pl.DataFrame, *, output_path: Path, value
     plt.close(fig)
 
 
-def _plot_paper_feature_correlations(frame: pl.DataFrame, *, output_path: Path, subtitle: str) -> None:
+def _plot_paper_feature_correlations(
+    frame: pl.DataFrame,
+    *,
+    output_path: Path,
+    subtitle: str,
+    feature_order: pl.DataFrame | None = None,
+) -> None:
     if _is_empty_frame(frame) or not {"feature", "source", "score_corr", "weight_corr"}.issubset(frame.columns):
         return
     data = _with_numeric(frame, "score_corr", "weight_corr").with_columns(
         pl.max_horizontal(pl.col("score_corr").abs(), pl.col("weight_corr").abs()).alias("max_abs_corr")
     )
-    data = data.drop_nulls(subset=["max_abs_corr"]).sort("max_abs_corr", descending=True)
+    data = data.drop_nulls(subset=["max_abs_corr"])
+    ordered_by_attribution = (
+        feature_order is not None
+        and not _is_empty_frame(feature_order)
+        and "feature" in feature_order.columns
+    )
+    if ordered_by_attribution:
+        order = (
+            feature_order.select("feature")
+            .unique(maintain_order=True)
+            .with_row_index("attribution_rank")
+        )
+        missing_rank = order.height
+        data = (
+            data.join(order, on="feature", how="left")
+            .with_columns(pl.col("attribution_rank").fill_null(missing_rank))
+            .sort(["attribution_rank", "source"])
+        )
+    else:
+        data = data.sort("max_abs_corr", descending=True)
     if data.is_empty():
         return
     data = data.with_columns(
@@ -6637,7 +6662,12 @@ def _plot_paper_feature_correlations(frame: pl.DataFrame, *, output_path: Path, 
         ax.set_title(f"Feature-source pairs {start + 1}–{end}", fontsize=10)
         _finish_paper_axes(ax)
     axes.flat[0].legend(loc="best", frameon=True, fontsize=8)
-    fig.suptitle("Simple feature correlations test for shortcut rules", fontsize=16, y=0.995)
+    title = (
+        "Feature correlations in global-attribution order"
+        if ordered_by_attribution
+        else "Simple feature correlations test for shortcut rules"
+    )
+    fig.suptitle(title, fontsize=16, y=0.995)
     fig.text(0.5, 0.975, subtitle, ha="center", va="top", fontsize=9, color=PAPER_TOKENS["muted"])
     output_path.parent.mkdir(parents=True, exist_ok=True)
     _save_matplotlib_figure(fig, output_path, pad_to_standard_aspect=False)
@@ -7048,7 +7078,7 @@ def _plot_all_paper_figures(
     generated: list[Path] = []
     scope = _paper_scope(metadata, summary)
     paper_progress = tqdm(
-        total=17,
+        total=18,
         desc="Paper plots",
         unit="plot",
         leave=False,
@@ -7148,6 +7178,17 @@ def _plot_all_paper_figures(
     _time_plot(
         "feature_correlations_shortcut_checks_s",
         lambda: _plot_paper_feature_correlations(frames.get("feature_correlations", pl.DataFrame()), output_path=out, subtitle=scope),
+        out,
+    )
+    out = plot_dir / "feature_correlations_by_global_attribution.png"
+    _time_plot(
+        "feature_correlations_by_global_attribution_s",
+        lambda: _plot_paper_feature_correlations(
+            frames.get("feature_correlations", pl.DataFrame()),
+            output_path=out,
+            subtitle=f"Ordered by mean global attribution share, strongest first; correlation magnitudes are not used for sorting. {scope}",
+            feature_order=global_table,
+        ),
         out,
     )
     out = plot_dir / "trust_checks.png"
@@ -7280,6 +7321,11 @@ PAPER_FIGURE_GUIDE: dict[str, tuple[str, str, str]] = {
         "Checks simple linear correlation between raw feature values and model scores/weights.",
         "High absolute correlations are not proof of leakage, but they are a fast shortcut detector.",
         "Very high correlation with raw price level, raw volume, or liquidity proxies means the model may not generalize cross-sectionally.",
+    ),
+    "feature_correlations_by_global_attribution.png": (
+        "Shows the same raw-feature correlations in the feature order used by global attribution.",
+        "Read from the strongest mean global-attribution feature downward, then compare score and weight correlation without changing that order.",
+        "Correlation magnitude is not attribution: a highly attributed feature can have weak linear correlation because the model uses it nonlinearly.",
     ),
     "trust_checks.png": (
         "Summarizes concentration, turnover, mask leakage, attribution dominance, and aux collapse checks.",
@@ -7463,6 +7509,11 @@ FIGURE_GUIDE_ZH: dict[str, tuple[str, str, str]] = {
         "檢查原始特徵值與模型分數／權重之間的簡單線性相關。",
         "高絕對相關不是洩漏證明，但可快速找出模型可能依賴的捷徑。",
         "與原始價格、成交量或流動性代理高度相關，可能削弱跨股票泛化能力。",
+    ),
+    "feature_correlations_by_global_attribution.png": (
+        "用全域特徵歸因的順序，呈現相同的原始特徵與模型分數／權重相關係數。",
+        "由平均全域歸因最高的特徵往下讀，再比較 score 與 weight correlation；排序不受 correlation 大小影響。",
+        "相關係數不等於歸因；高歸因但低線性相關，可能代表模型使用的是非線性或交互效果。",
     ),
     "feature_correlations.png": (
         "檢查原始特徵值與模型分數／權重之間的簡單線性相關。",
@@ -7687,6 +7738,7 @@ def _expected_explainability_plot_paths(
             ("feature_time_perturbation", "feature_time_perturbation_weight_abs_delta_heatmap.png", ("feature", "lookback_from_end", "weight_abs_delta")),
             ("time_importance_gradient", "time_importance_gradient.png", ("lookback_from_end", "grad_x_input_abs")),
             ("feature_correlations", "feature_correlations_shortcut_checks.png", ("feature", "source", "score_corr", "weight_corr")),
+            ("feature_correlations", "feature_correlations_by_global_attribution.png", ("feature", "source", "score_corr", "weight_corr")),
             ("trust_checks", "trust_checks.png", ("check", "value", "status")),
             ("regime_analysis", "regime_analysis.png", ("regime",)),
             ("decision_case_studies", "decision_case_studies.png", ("date",)),
@@ -8013,6 +8065,7 @@ def _cross_fold_figure_spec(relative_path: str) -> _CrossFoldFigureSpec | None:
         "decision_case_studies.png": _CrossFoldFigureSpec("decision_case_studies.csv", ("case_type",), ("gross_contribution", "abs_weight"), "group_mean_abs"),
         "feature_correlations.png": _CrossFoldFigureSpec("feature_correlations.csv", ("source", "feature"), ("score_corr", "weight_corr")),
         "feature_correlations_shortcut_checks.png": _CrossFoldFigureSpec("feature_correlations.csv", ("source", "feature"), ("score_corr", "weight_corr")),
+        "feature_correlations_by_global_attribution.png": _CrossFoldFigureSpec("feature_correlations.csv", ("source", "feature"), ("score_corr", "weight_corr")),
         "feature_importance_gradient_grad_x_input_abs.png": _CrossFoldFigureSpec("feature_importance_gradient.csv", ("feature",), ("grad_x_input_abs",)),
         "feature_importance_integrated_gradients_integrated_gradients_abs.png": _CrossFoldFigureSpec("feature_importance_integrated_gradients.csv", ("feature",), ("integrated_gradients_abs",)),
         "feature_importance_perturbation_weight_abs_delta.png": _CrossFoldFigureSpec("feature_importance_perturbation.csv", ("feature",), ("weight_abs_delta",)),
@@ -10739,6 +10792,30 @@ def load_explanation_context(
     )
 
 
+def _canonical_explainability_destination(
+    *,
+    output_dir: Path,
+    fold_id: int,
+    split: str,
+    requested: Path | None = None,
+) -> Path:
+    """Keep every explanation artifact inside its owning experiment root."""
+
+    root = Path(output_dir) / "explainability"
+    destination = root / f"fold_{int(fold_id):02d}_{str(split)}"
+    if requested is None:
+        return destination
+
+    requested_path = Path(requested)
+    allowed = {root.resolve(), destination.resolve()}
+    if requested_path.resolve() not in allowed:
+        raise ValueError(
+            "Explainability output must remain inside its experiment directory: "
+            f"expected {root} (or {destination} for one fold), got {requested_path}."
+        )
+    return destination
+
+
 def run_loaded_model_explanation(
     *,
     config: ExperimentConfig,
@@ -10868,10 +10945,11 @@ def run_loaded_model_explanation(
     runner_progress.update(1)
     runner_progress.set_postfix(stage="write_outputs", refresh=True)
 
-    destination = explain_output_dir or (
-        output_dir
-        / "explainability"
-        / f"fold_{int(fold.fold_id):02d}_{split_norm}"
+    destination = _canonical_explainability_destination(
+        output_dir=output_dir,
+        fold_id=int(fold.fold_id),
+        split=split_norm,
+        requested=explain_output_dir,
     )
     metadata = {
         "model_name": config.training.model_name,
@@ -10915,7 +10993,7 @@ def run_loaded_model_explanation(
 
     if write_fold_stability and bool(settings.fold_stability):
         stability_start = time.perf_counter()
-        stability_dir = write_fold_stability_outputs(output_dir / "explainability")
+        stability_dir = write_fold_stability_outputs(Path(output_dir) / "explainability")
         runner_timing["fold_stability_s"] = float(time.perf_counter() - stability_start)
         runner_timing["fold_stability_output"] = str(stability_dir) if stability_dir is not None else ""
     else:
@@ -11326,11 +11404,7 @@ def _run_explainability_for_config(
             print(f"[rank {rank}] explainability output (fold {fold_id}): {out_dir}")
         _distributed_barrier()
         if rank == 0 and settings.fold_stability:
-            stability_root = (
-                Path(explain_output_dir)
-                if explain_output_dir is not None
-                else resolved_output_dir / "explainability"
-            )
+            stability_root = resolved_output_dir / "explainability"
             stability_dir = write_fold_stability_outputs(
                 stability_root,
                 strict_no_fallback=bool(settings.strict_no_fallback),
@@ -11373,7 +11447,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output-dir", default=None, type=Path)
     parser.add_argument("--fold", default=None, type=int, help="Fold id. If omitted, explains all folds with checkpoint_best.pt.")
     parser.add_argument("--checkpoint", default=None, type=Path, help="Optional explicit checkpoint path.")
-    parser.add_argument("--explain-output-dir", default=None, type=Path)
+    parser.add_argument(
+        "--explain-output-dir",
+        default=None,
+        type=Path,
+        help=(
+            "Compatibility option. It may only name the canonical "
+            "<experiment-output>/explainability directory; external shared roots are rejected."
+        ),
+    )
     parser.add_argument(
         "--reports-only",
         action="store_true",
@@ -11531,13 +11613,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     if bool(args.reports_only):
-        if args.explain_output_dir is not None:
-            explainability_root = Path(args.explain_output_dir)
-        elif args.output_dir is not None:
-            candidate = Path(args.output_dir)
-            explainability_root = candidate if candidate.name == "explainability" else candidate / "explainability"
+        if args.output_dir is not None:
+            reports_output_dir = Path(args.output_dir)
+        elif args.config is not None:
+            reports_output_dir = Path(load_config(args.config).runner.output_dir)
         else:
-            raise ValueError("--reports-only requires --explain-output-dir or --output-dir")
+            raise ValueError("--reports-only requires --output-dir or --config")
+        explainability_root = reports_output_dir / "explainability"
+        if args.explain_output_dir is not None:
+            requested_root = Path(args.explain_output_dir)
+            if requested_root.resolve() != explainability_root.resolve():
+                raise ValueError(
+                    "Explainability reports must remain inside their experiment directory: "
+                    f"expected {explainability_root}, got {requested_root}."
+                )
         output = refresh_saved_explainability_reports(
             explainability_root,
             progress_enabled=bool(args.progress),
@@ -11610,11 +11699,8 @@ def main(argv: list[str] | None = None) -> None:
             fold_id=args.fold,
         )
         print(f"explaining market artifact directories under {args.market_artifacts_root}: {len(market_runs)} found")
-        multi_market = len(market_runs) > 1
         for run in market_runs:
             explain_output_dir = args.explain_output_dir
-            if explain_output_dir is not None and multi_market:
-                explain_output_dir = Path(explain_output_dir) / run.market
             print(f"[{run.market}] config={run.config_path} output_dir={run.output_dir}")
             _run_explainability_for_config(
                 args,

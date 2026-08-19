@@ -33,6 +33,11 @@ _CUDA_INFRASTRUCTURE_FAILURE_PATTERNS = (
     "failed to initialize nvml",
     "/dev/nvidia-uvm",
 )
+_CHECKPOINT_CONTRACT_FAILURE_PATTERNS = (
+    "checkpoint semantic fingerprint mismatch",
+    "checkpoint settings do not match",
+    "checkpoint data fingerprint does not match",
+)
 
 
 @dataclass
@@ -134,6 +139,8 @@ def _attempt_log_text(job: _ActiveRun) -> str:
 
 def _failure_kind(returncode: int, log_text: str) -> str:
     lowered = log_text.lower()
+    if any(pattern in lowered for pattern in _CHECKPOINT_CONTRACT_FAILURE_PATTERNS):
+        return "checkpoint_contract_mismatch"
     if "outofmemoryerror" in lowered or "cuda out of memory" in lowered:
         return "cuda_oom"
     if any(
@@ -310,6 +317,112 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
 def _resolve_path(raw: str | Path, *, relative_to: Path) -> Path:
     path = Path(raw).expanduser()
     return path.resolve() if path.is_absolute() else (relative_to / path).resolve()
+
+
+def _resolve_pinned_panel_cache_env(spec: dict[str, Any]) -> dict[str, str]:
+    """Resolve an immutable panel receipt without embedding host paths in YAML."""
+
+    raw = spec.get("pinned_panel_cache")
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError("pinned_panel_cache must be a mapping")
+
+    explicit_manifest = str(raw.get("manifest_path", "")).strip()
+    if explicit_manifest:
+        manifest_path = _resolve_path(explicit_manifest, relative_to=REPO_ROOT)
+    else:
+        snapshot_id = str(raw.get("snapshot_id", "")).strip()
+        variant_id = str(raw.get("variant_id", "")).strip()
+        if not snapshot_id or Path(snapshot_id).name != snapshot_id:
+            raise ValueError(
+                "pinned_panel_cache.snapshot_id must be one directory name"
+            )
+        if not re.fullmatch(r"[0-9a-f]{64}", variant_id):
+            raise ValueError(
+                "pinned_panel_cache.variant_id must be a 64-character sha256"
+            )
+        stores: list[Path] = []
+        configured_store = os.environ.get(
+            "STOCKAGENT_TW_PUBLIC_SNAPSHOT_STORE", ""
+        ).strip()
+        if configured_store:
+            stores.append(Path(configured_store).expanduser())
+        active_public = REPO_ROOT / "data_tw_public"
+        if active_public.exists():
+            try:
+                stores.append(active_public.resolve().parent)
+            except OSError:
+                pass
+        stores.append(Path("/srv/stockagent-snapshots/tw-public"))
+        candidates: list[Path] = []
+        seen: set[Path] = set()
+        for store in stores:
+            resolved_store = store.resolve()
+            if resolved_store in seen:
+                continue
+            seen.add(resolved_store)
+            candidates.append(
+                resolved_store
+                / snapshot_id
+                / "stocks"
+                / "panel_cache_v2"
+                / "variants"
+                / f"{variant_id}.json"
+            )
+        manifest_path = next(
+            (candidate for candidate in candidates if candidate.is_file()),
+            candidates[0] if candidates else Path(),
+        )
+        if not manifest_path.is_file():
+            raise FileNotFoundError(
+                "pinned panel cache manifest was not found; searched: "
+                + ", ".join(str(candidate) for candidate in candidates)
+            )
+
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            f"invalid pinned panel cache manifest: {manifest_path}"
+        ) from exc
+    if not isinstance(manifest, dict):
+        raise ValueError(
+            f"pinned panel cache manifest must be a mapping: {manifest_path}"
+        )
+
+    expected = {
+        "version": str(raw.get("version", "")).strip(),
+        "generation": str(raw.get("generation", "")).strip(),
+        "source_hash": str(raw.get("source_hash", "")).strip(),
+    }
+    actual = {
+        "version": str(manifest.get("version", "")).strip(),
+        "generation": str(manifest.get("generation", "")).strip(),
+        "source_hash": str(manifest.get("source_hash", "")).strip(),
+    }
+    missing = [name for name, value in expected.items() if not value]
+    if missing:
+        raise ValueError(
+            "pinned_panel_cache requires explicit " + ", ".join(missing)
+        )
+    mismatches = [
+        f"{name}: expected={expected[name]} actual={actual[name]}"
+        for name in expected
+        if expected[name] != actual[name]
+    ]
+    if mismatches:
+        raise ValueError(
+            "pinned panel cache identity mismatch ("
+            + "; ".join(mismatches)
+            + f"): {manifest_path}"
+        )
+    return {
+        "STOCKAGENT_PINNED_PANEL_CACHE_MANIFEST": str(manifest_path.resolve()),
+        "STOCKAGENT_PINNED_PANEL_CACHE_VERSION": expected["version"],
+        "STOCKAGENT_PINNED_PANEL_CACHE_GENERATION": expected["generation"],
+        "STOCKAGENT_PINNED_PANEL_CACHE_SOURCE_HASH": expected["source_hash"],
+    }
 
 
 def _set_dotted(raw: dict[str, Any], path: str, value: Any) -> None:
@@ -653,6 +766,14 @@ def main() -> None:
         else None
     )
     spec, experiments = _experiment_rows(spec_path, selected)
+    pinned_panel_cache_env = _resolve_pinned_panel_cache_env(spec)
+    if pinned_panel_cache_env:
+        print(
+            "[ablation] pinned panel cache "
+            f"generation={pinned_panel_cache_env['STOCKAGENT_PINNED_PANEL_CACHE_GENERATION']} "
+            f"manifest={pinned_panel_cache_env['STOCKAGENT_PINNED_PANEL_CACHE_MANIFEST']}",
+            flush=True,
+        )
     output_root = (
         args.output_root.resolve()
         if args.output_root
@@ -876,6 +997,7 @@ def main() -> None:
                 attempt = int(item.get("attempt", 1))
                 env = os.environ.copy()
                 env.setdefault("PYTHONUNBUFFERED", "1")
+                env.update(pinned_panel_cache_env)
                 log_handle: TextIO | None = None
                 stdout = None
                 worker_log: Path | None = None
@@ -985,6 +1107,9 @@ def main() -> None:
                     infrastructure_wait = (
                         failure_kind == "cuda_infrastructure_unavailable"
                     )
+                    non_retryable_contract_failure = (
+                        failure_kind == "checkpoint_contract_mismatch"
+                    )
                     if infrastructure_wait:
                         # A host driver/UVM outage is not evidence that this
                         # experiment cannot progress. Preserve its retry budget
@@ -996,6 +1121,13 @@ def main() -> None:
                             else job.consecutive_no_progress_failures
                         )
                         retry_allowed = bool(args.auto_resume)
+                    elif non_retryable_contract_failure:
+                        no_progress_failures = (
+                            0
+                            if made_progress
+                            else job.consecutive_no_progress_failures + 1
+                        )
+                        retry_allowed = False
                     else:
                         no_progress_failures = (
                             0

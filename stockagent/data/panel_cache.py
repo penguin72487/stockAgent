@@ -597,6 +597,125 @@ def load_panel_cache_v2(
     raise FileNotFoundError(f"unable to load panel cache v2 under {cache_dir}")
 
 
+def load_panel_cache_v2_manifest(
+    manifest_path: str | Path,
+    *,
+    mmap_mode: str | None = "r",
+    expected_version: int | None = None,
+    expected_generation: str | None = None,
+    expected_source_hash: str | None = None,
+) -> dict[str, Any]:
+    """Load one explicitly pinned immutable cache generation.
+
+    Ordinary panel loading validates the current source files and backend key.
+    A long-running experiment instead needs to keep reading the exact panel
+    generation recorded when its first checkpoint was written, even after the
+    live ``data_tw_public`` symlink advances. This entry point accepts a
+    concrete metadata receipt, validates its identity and array ABI, and never
+    follows the mutable top-level pointer.
+    """
+
+    path = Path(manifest_path).expanduser().resolve()
+    try:
+        meta = _read_json(path)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"invalid pinned panel cache manifest: {path}") from exc
+    if not isinstance(meta, dict):
+        raise ValueError(f"pinned panel cache manifest must be a mapping: {path}")
+
+    try:
+        version = int(meta.get("version", -1))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"pinned panel cache manifest has invalid version: {path}"
+        ) from exc
+    generation = str(meta.get("generation", "")).strip()
+    source_hash = str(meta.get("source_hash", "")).strip()
+    if expected_version is not None and version != int(expected_version):
+        raise ValueError(
+            "pinned panel cache version mismatch: "
+            f"expected={int(expected_version)} actual={version} path={path}"
+        )
+    if expected_generation is not None and generation != str(expected_generation):
+        raise ValueError(
+            "pinned panel cache generation mismatch: "
+            f"expected={expected_generation} actual={generation} path={path}"
+        )
+    if expected_source_hash is not None and source_hash != str(expected_source_hash):
+        raise ValueError(
+            "pinned panel cache source hash mismatch: "
+            f"expected={expected_source_hash} actual={source_hash} path={path}"
+        )
+    if not generation or not source_hash:
+        raise ValueError(
+            f"pinned panel cache manifest lacks generation/source_hash: {path}"
+        )
+
+    cache_dir = (
+        path.parent.parent
+        if path.parent.name == PANEL_CACHE_V2_VARIANTS_DIRNAME
+        else path.parent
+    )
+    cache_root = cache_dir.resolve()
+    referenced_files = [
+        str(meta.get("symbols_file", "symbols.json")),
+        str(meta.get("feature_names_file", "feature_names.json")),
+    ]
+    arrays_meta = meta.get("arrays")
+    if not isinstance(arrays_meta, dict):
+        raise ValueError(f"pinned panel cache manifest lacks arrays: {path}")
+    for name in REQUIRED_ARRAY_NAMES:
+        item = arrays_meta.get(name)
+        if not isinstance(item, dict) or not str(item.get("file", "")).strip():
+            raise ValueError(
+                f"pinned panel cache manifest lacks required array {name!r}: {path}"
+            )
+    referenced_files.extend(
+        str(item.get("file", f"{name}.npy"))
+        for name, item in arrays_meta.items()
+        if isinstance(item, dict)
+    )
+    for relative in referenced_files:
+        referenced = (cache_dir / relative).resolve()
+        if not referenced.is_relative_to(cache_root):
+            raise ValueError(
+                f"pinned panel cache reference escapes cache directory: {relative}"
+            )
+        if not referenced.is_file():
+            raise FileNotFoundError(
+                f"pinned panel cache reference is missing: {referenced}"
+            )
+
+    payload = _load_panel_cache_v2_generation(
+        cache_dir,
+        meta,
+        mmap_mode=mmap_mode,
+    )
+    for name, item in arrays_meta.items():
+        if name not in payload or payload[name] is None or not isinstance(item, dict):
+            continue
+        array = np.asarray(payload[name])
+        expected_shape = item.get("shape")
+        expected_dtype = item.get("dtype")
+        if expected_shape != [int(size) for size in array.shape]:
+            raise ValueError(
+                f"pinned panel cache shape mismatch for {name}: "
+                f"expected={expected_shape} actual={list(array.shape)}"
+            )
+        if expected_dtype != str(array.dtype):
+            raise ValueError(
+                f"pinned panel cache dtype mismatch for {name}: "
+                f"expected={expected_dtype} actual={array.dtype}"
+            )
+    payload["_pinned_manifest"] = {
+        "path": str(path),
+        "version": version,
+        "generation": generation,
+        "source_hash": source_hash,
+    }
+    return payload
+
+
 def _panel_cache_required_paths(
     cache_dir: Path,
     meta: dict[str, Any],

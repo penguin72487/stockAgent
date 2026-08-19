@@ -10,7 +10,9 @@ import stockagent.data.panel_cache as panel_cache
 from stockagent.data.panel import PanelData, _compute_source_hash
 from stockagent.data.panel_cache import (
     load_panel_cache_v2,
+    load_panel_cache_v2_manifest,
     panel_cache_v2_is_valid,
+    panel_cache_v2_variant_meta_path,
     save_panel_cache_v2,
 )
 
@@ -69,6 +71,54 @@ def test_panel_cache_v2_round_trips_memmap_payload(tmp_path) -> None:
     assert panel.content_fingerprints["features"] == payload[
         "_content_fingerprints"
     ]["features"]
+
+
+def test_panel_cache_v2_loads_an_explicit_immutable_variant_receipt(tmp_path) -> None:
+    masks = np.ones((2, 1), dtype=bool)
+    panel = PanelData(
+        dates=np.arange(2).astype("datetime64[D]"),
+        symbols=["AAA"],
+        feature_names=["f0"],
+        features=np.arange(2, dtype=np.float32).reshape(2, 1, 1),
+        returns_1d=np.zeros((2, 1), dtype=np.float32),
+        tradable_mask=masks,
+        can_buy_mask=masks.copy(),
+        can_sell_mask=masks.copy(),
+        alive_mask=masks.copy(),
+        benchmark_returns=np.zeros((2,), dtype=np.float32),
+        close_prices=np.ones((2, 1), dtype=np.float32),
+    )
+    backend_key = "test-backend"
+    save_panel_cache_v2(
+        tmp_path,
+        panel,
+        source_hash="frozen-source",
+        backend_key=backend_key,
+        version=123,
+    )
+    manifest_path = panel_cache_v2_variant_meta_path(
+        tmp_path,
+        source_hash="frozen-source",
+        backend_key=backend_key,
+        version=123,
+    )
+    manifest = panel_cache._read_json(manifest_path)
+
+    payload = load_panel_cache_v2_manifest(
+        manifest_path,
+        mmap_mode="r",
+        expected_version=123,
+        expected_generation=manifest["generation"],
+        expected_source_hash="frozen-source",
+    )
+
+    assert np.array_equal(payload["features"], panel.features)
+    assert payload["_pinned_manifest"]["generation"] == manifest["generation"]
+    with pytest.raises(ValueError, match="source hash mismatch"):
+        load_panel_cache_v2_manifest(
+            manifest_path,
+            expected_source_hash="different-source",
+        )
 
 
 def test_source_hash_invalidates_same_size_replacement_with_preserved_mtime(tmp_path) -> None:

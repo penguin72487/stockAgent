@@ -13,6 +13,7 @@ from scripts.run_ablation_experiments import (
     _fold_status,
     _format_fold_status,
     _per_job_thread_budget,
+    _resolve_pinned_panel_cache_env,
 )
 
 
@@ -321,6 +322,53 @@ def test_failure_kind_distinguishes_cuda_infrastructure_from_oom() -> None:
         == "cuda_infrastructure_unavailable"
     )
     assert _failure_kind(1, "CUDA out of memory") == "cuda_oom"
+    assert (
+        _failure_kind(1, "Checkpoint semantic fingerprint mismatch (data: saved=x)")
+        == "checkpoint_contract_mismatch"
+    )
+
+
+def test_pinned_panel_cache_resolves_snapshot_receipt_and_checks_identity(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    store = tmp_path / "snapshots"
+    snapshot_id = "tw-public-test"
+    variant_id = "a" * 64
+    manifest_path = (
+        store
+        / snapshot_id
+        / "stocks"
+        / "panel_cache_v2"
+        / "variants"
+        / f"{variant_id}.json"
+    )
+    manifest_path.parent.mkdir(parents=True)
+    manifest_path.write_text(
+        '{"version": 51, "generation": "generation-v1", '
+        '"source_hash": "source-v1"}',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("STOCKAGENT_TW_PUBLIC_SNAPSHOT_STORE", str(store))
+    spec = {
+        "pinned_panel_cache": {
+            "snapshot_id": snapshot_id,
+            "variant_id": variant_id,
+            "version": 51,
+            "generation": "generation-v1",
+            "source_hash": "source-v1",
+        }
+    }
+
+    env = _resolve_pinned_panel_cache_env(spec)
+
+    assert env["STOCKAGENT_PINNED_PANEL_CACHE_MANIFEST"] == str(
+        manifest_path.resolve()
+    )
+    assert env["STOCKAGENT_PINNED_PANEL_CACHE_GENERATION"] == "generation-v1"
+    spec["pinned_panel_cache"]["generation"] = "wrong-generation"
+    with pytest.raises(ValueError, match="identity mismatch"):
+        _resolve_pinned_panel_cache_env(spec)
 
 
 def test_cuda_infrastructure_wait_does_not_consume_retry_budget(
@@ -690,6 +738,9 @@ def test_tw_day_trade_mixed_batch_matrix_resolves_only_measured_oom_variants(
     )
     spec, experiments = _experiment_rows(spec_path)
     assert len(experiments) == 20
+    assert spec["pinned_panel_cache"]["generation"] == (
+        "0287b07e62da4030967877bd9b3e3bac"
+    )
 
     runs = _build_configs(spec_path, spec, experiments, tmp_path)
     effective = {

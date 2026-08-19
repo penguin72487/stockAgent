@@ -5,6 +5,7 @@ from scripts.run_tw_day_trade_ablation import (
     POSTPROCESS_PLOT_SPECS,
     _bar,
     _last_json,
+    _load_effective_spec,
     _progress,
     _single_experiment_concurrency,
 )
@@ -52,6 +53,39 @@ def test_progress_sums_durable_partial_epochs_but_labels_only_current_job(
 def test_tw_day_trade_supervisor_always_runs_one_experiment() -> None:
     assert _single_experiment_concurrency(1) == 1
     assert _single_experiment_concurrency(2) == 1
+
+
+def test_supervisor_resolves_inherited_ablation_spec(tmp_path: Path) -> None:
+    base = tmp_path / "base.yaml"
+    base.write_text(
+        """
+base_config: configs/markets/base.yaml
+output_root: artifacts/ablations/base
+expected_fold_count: 12
+matrix:
+  include_baseline: true
+  dimensions:
+    - name: placeholder
+      enabled: false
+""",
+        encoding="utf-8",
+    )
+    child = tmp_path / "child.yaml"
+    child.write_text(
+        """
+base_spec: base.yaml
+base_config: configs/markets/multi_basis.yaml
+output_root: artifacts/ablations/multi_basis
+""",
+        encoding="utf-8",
+    )
+
+    spec, rows = _load_effective_spec(child)
+
+    assert spec["expected_fold_count"] == 12
+    assert spec["base_config"] == "configs/markets/multi_basis.yaml"
+    assert spec["output_root"] == "artifacts/ablations/multi_basis"
+    assert [row["name"] for row in rows] == ["baseline"]
 
 
 def test_bar_has_exact_percentage_and_label() -> None:

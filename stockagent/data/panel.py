@@ -32,6 +32,7 @@ from stockagent.data.panel_cache import (
     legacy_panel_cache_path,
     legacy_panel_meta_path,
     load_panel_cache_v2,
+    load_panel_cache_v2_manifest,
     panel_cache_v2_is_valid,
     panel_cache_v2_dir,
     save_panel_cache_v2,
@@ -4865,6 +4866,34 @@ def _load_valid_panel_cache(
     backend_key: str,
     source_hash: str,
 ) -> PanelData | None:
+    pinned_manifest = os.environ.get(
+        "STOCKAGENT_PINNED_PANEL_CACHE_MANIFEST", ""
+    ).strip()
+    if pinned_manifest:
+        expected_version = os.environ.get(
+            "STOCKAGENT_PINNED_PANEL_CACHE_VERSION", ""
+        ).strip()
+        expected_generation = os.environ.get(
+            "STOCKAGENT_PINNED_PANEL_CACHE_GENERATION", ""
+        ).strip()
+        expected_source_hash = os.environ.get(
+            "STOCKAGENT_PINNED_PANEL_CACHE_SOURCE_HASH", ""
+        ).strip()
+        print(
+            "[panel] loading explicitly pinned cache generation: "
+            f"{pinned_manifest}"
+        )
+        return _panel_from_cache_payload(
+            load_panel_cache_v2_manifest(
+                pinned_manifest,
+                mmap_mode="c",
+                expected_version=(
+                    int(expected_version) if expected_version else None
+                ),
+                expected_generation=expected_generation or None,
+                expected_source_hash=expected_source_hash or None,
+            )
+        )
     if panel_cache_v2_is_valid(
         parquet_root,
         source_hash=source_hash,

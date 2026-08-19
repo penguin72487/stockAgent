@@ -5,6 +5,7 @@ import logging
 import math
 import os
 import pickle
+import re
 import shutil
 import subprocess
 import sys
@@ -3272,7 +3273,18 @@ def _write_loss_contract_metadata(
 def _trim_group_curve(path: Path, start_epoch: int) -> None:
     if not _distributed_should_write():
         return
-    if not path.exists() or start_epoch <= 1:
+    if not path.exists():
+        return
+    if start_epoch <= 1:
+        archived = _archive_restart_artifact(
+            path,
+            reason="unresumable_restart_from_epoch1",
+        )
+        if archived is not None:
+            print(
+                "[resume] archived stale epoch curve before a clean epoch-1 "
+                f"restart: {archived}"
+            )
         return
     kept: list[str] = []
     with path.open("r", encoding="utf-8") as handle:
@@ -3290,6 +3302,18 @@ def _trim_group_curve(path: Path, start_epoch: int) -> None:
     with path.open("w", encoding="utf-8") as handle:
         for line in kept:
             handle.write(line + "\n")
+
+
+def _archive_restart_artifact(path: Path, *, reason: str) -> Path | None:
+    """Move an unusable partial artifact aside without deleting evidence."""
+
+    if not path.exists():
+        return None
+    normalized_reason = re.sub(r"[^a-z0-9_-]+", "_", reason.lower()).strip("_")
+    suffix = f".{normalized_reason}.{time.time_ns()}"
+    archived = path.with_name(f"{path.stem}{suffix}{path.suffix}")
+    path.replace(archived)
+    return archived
 
 
 def _coerce_nonnegative_int(value: object) -> int | None:
@@ -18522,6 +18546,12 @@ def _run_training_impl(
             )
         group_checkpoint_path = _group_checkpoint_path(output_path, train_years)
         group_curve_path = _group_curve_path(output_path, train_years)
+        group_resume_checkpoint_readable = False
+        if resume and group_checkpoint_path.exists():
+            _, group_checkpoint_read_error = _try_load_readable_checkpoint(
+                group_checkpoint_path
+            )
+            group_resume_checkpoint_readable = group_checkpoint_read_error is None
         pending_folds = [fold for fold in group_folds if fold.fold_id not in results_by_fold]
         pre_epoch_timing: _PreEpochTimingRecorder | None = (
             _PreEpochTimingRecorder(
@@ -18793,7 +18823,30 @@ def _run_training_impl(
                 checkpoint_best_path=checkpoint_best_path,
             )
 
-            if resume and checkpoint_best_path.exists():
+            if checkpoint_best_path.exists() and (
+                not resume or not group_resume_checkpoint_readable
+            ):
+                archive_error: BaseException | None = None
+                archived_checkpoint: Path | None = None
+                try:
+                    if _distributed_should_write():
+                        archived_checkpoint = _archive_restart_artifact(
+                            checkpoint_best_path,
+                            reason="unresumable_without_optimizer_state",
+                        )
+                except BaseException as exc:
+                    archive_error = exc
+                _raise_if_distributed_phase_failed(
+                    f"archive_unresumable_fold_{fold.fold_id}_checkpoint",
+                    archive_error,
+                )
+                if archived_checkpoint is not None:
+                    print(
+                        f"[Fold {fold.fold_id}] archived validation-best "
+                        "checkpoint because no readable same-group optimizer "
+                        f"checkpoint exists: {archived_checkpoint}"
+                    )
+            elif resume and checkpoint_best_path.exists():
                 checkpoint = _load_checkpoint(checkpoint_best_path)
                 _validate_checkpoint_manifest(
                     checkpoint,

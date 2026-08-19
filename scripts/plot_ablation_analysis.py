@@ -58,6 +58,14 @@ METRIC_NAMES = (
     "daily_hit_rate",
 )
 
+RISK_SCATTER_Y_METRICS = (
+    ("cagr", "CAGR"),
+    ("sharpe", "Sharpe ratio"),
+    ("sortino", "Sortino ratio"),
+    ("turnover", "turnover"),
+    ("daily_hit_rate", "daily hit rate"),
+)
+
 
 def _years(value: str) -> list[int]:
     return [int(year) for year in value.split("-") if year]
@@ -494,77 +502,204 @@ def main() -> None:
     fig.savefig(args.output_dir / f"{prefix}_fold_sharpe_heatmap.png", dpi=180, bbox_inches="tight")
     plt.close(fig)
 
-    # Risk/return comparison uses aligned categorical dot plots.  A scatter
-    # becomes unreadable when the exact whole-lot audit legitimately places
-    # many variants at the same (0, 0) coordinate.
+    # One relationship per file: x is always median max drawdown and y changes
+    # across the other canonical metrics. Every chart keeps every compatible
+    # ablation on one scatter axes. Full experiment names are placed on the
+    # nearest side of the axes and connected back to their data points; this
+    # keeps names readable without replacing them with opaque point codes.
     all_names = ["baseline"] + names
-    risk_rows = [
-        (
-            name,
-            float(np.median(metric(runs[name], args.split, "cagr"))),
-            float(np.median(metric(runs[name], args.split, "max_drawdown"))),
-        )
+    median_metrics = {
+        name: {
+            metric_name: float(
+                np.median(metric(runs[name], args.split, metric_name))
+            )
+            for metric_name in METRIC_NAMES
+        }
         for name in all_names
-    ]
-    figure_height = max(7.2, 0.44 * len(risk_rows) + 2.3)
-    fig, (ax_return, ax_risk) = plt.subplots(
-        1,
-        2,
-        figsize=(14, figure_height),
-        sharey=True,
-        gridspec_kw={"wspace": 0.08},
+    }
+    risk_axis_label = {
+        "val": "validation",
+        "deployment": "test",
+        "test": "full-horizon test",
+    }[args.split]
+    all_drawdowns = np.asarray(
+        [median_metrics[name]["max_drawdown"] for name in all_names],
+        dtype=np.float64,
     )
-    y = np.arange(len(risk_rows), dtype=np.float64)
-    cagr_values = np.asarray([row[1] for row in risk_rows], dtype=np.float64)
-    drawdown_values = np.asarray([row[2] for row in risk_rows], dtype=np.float64)
-    colors = [ink if row[0] == "baseline" else blue for row in risk_rows]
-    sizes = [78 if row[0] == "baseline" else 48 for row in risk_rows]
-    markers = ["D" if row[0] == "baseline" else "o" for row in risk_rows]
-    for index, marker in enumerate(markers):
-        ax_return.scatter(
-            cagr_values[index],
-            y[index],
-            s=sizes[index],
-            color=colors[index],
-            marker=marker,
-            edgecolor="white",
-            linewidth=.7,
-            zorder=3,
-        )
-        ax_risk.scatter(
-            drawdown_values[index],
-            y[index],
-            s=sizes[index],
-            color=colors[index],
-            marker=marker,
-            edgecolor="white",
-            linewidth=.7,
-            zorder=3,
-        )
-    ax_return.set_yticks(y, [display_label(row[0]) for row in risk_rows])
-    ax_return.invert_yaxis()
-    ax_return.axvline(0, color=ink, lw=.8)
-    ax_risk.axvline(0, color=ink, lw=.8)
-    ax_return.set_xlabel(f"Median {split_label} CAGR")
-    ax_risk.set_xlabel(
-        f"Median {split_label} max drawdown\n(less negative is better)"
+    drawdown_span = max(float(np.ptp(all_drawdowns)), 1e-6)
+    common_xlim = (
+        float(np.min(all_drawdowns) - 0.06 * drawdown_span),
+        float(np.max(all_drawdowns) + 0.12 * drawdown_span),
     )
-    fig.suptitle("Risk and return medians across ablations", y=.985, fontweight="bold")
-    fig.text(.5, .95, f"Each point summarizes {fold_count} walk-forward folds using medians",
-             ha="center", color="#596273")
-    for ax in (ax_return, ax_risk):
-        ax.grid(axis="x", color=grid, lw=.7)
+
+    def render_metric_scatter(
+        y_metric: str,
+        y_label: str,
+        *,
+        output_path: Path,
+    ) -> None:
+        y_values = np.asarray(
+            [median_metrics[name][y_metric] for name in all_names],
+            dtype=np.float64,
+        )
+        y_span = max(float(np.ptp(y_values)), 1e-6)
+        y_min = float(np.min(y_values) - 0.08 * y_span)
+        y_max = float(np.max(y_values) + 0.10 * y_span)
+        reference_value: float | None = None
+        if y_metric in {"cagr", "sharpe", "sortino"}:
+            reference_value = 0.0
+        elif y_metric == "daily_hit_rate":
+            reference_value = 0.5
+        if reference_value is not None:
+            y_min = min(reference_value, y_min)
+            y_max = max(reference_value, y_max)
+
+        fig, ax = plt.subplots(figsize=(16, 8.6))
+        for name in all_names:
+            drawdown = median_metrics[name]["max_drawdown"]
+            y_value = median_metrics[name][y_metric]
+            color = ink if name == "baseline" else blue
+            ax.scatter(
+                drawdown,
+                y_value,
+                s=100 if name == "baseline" else 72,
+                color=color,
+                edgecolor="white",
+                linewidth=.9,
+                zorder=3,
+            )
+        ax.set_xlim(*common_xlim)
+        ax.set_ylim(y_min, y_max)
+
+        # Split by x rank rather than the numeric midpoint so each side gets a
+        # balanced number of labels even when drawdowns are highly clustered.
+        x_ranked_names = sorted(
+            all_names,
+            key=lambda name: median_metrics[name]["max_drawdown"],
+        )
+        split_at = (len(x_ranked_names) + 1) // 2
+        side_names = {
+            "left": x_ranked_names[:split_at],
+            "right": x_ranked_names[split_at:],
+        }
+
+        def spread_label_positions(side: str) -> dict[str, float]:
+            side_order = sorted(
+                side_names[side],
+                key=lambda name: median_metrics[name][y_metric],
+            )
+            if not side_order:
+                return {}
+            positions = np.asarray(
+                [
+                    (median_metrics[name][y_metric] - y_min) / (y_max - y_min)
+                    for name in side_order
+                ],
+                dtype=np.float64,
+            )
+            low, high = .035, .965
+            positions = np.clip(positions, low, high)
+            minimum_gap = min(.052, (high - low) / max(len(side_order) - 1, 1))
+            for index in range(1, len(positions)):
+                positions[index] = max(
+                    positions[index], positions[index - 1] + minimum_gap
+                )
+            if positions[-1] > high:
+                positions -= positions[-1] - high
+            for index in range(len(positions) - 2, -1, -1):
+                positions[index] = min(
+                    positions[index], positions[index + 1] - minimum_gap
+                )
+            if positions[0] < low:
+                positions += low - positions[0]
+            return dict(zip(side_order, positions, strict=True))
+
+        for side, label_x, horizontal_alignment in (
+            ("left", -.035, "right"),
+            ("right", 1.035, "left"),
+        ):
+            label_positions = spread_label_positions(side)
+            for name in side_names[side]:
+                drawdown = median_metrics[name]["max_drawdown"]
+                y_value = median_metrics[name][y_metric]
+                color = ink if name == "baseline" else blue
+                ax.annotate(
+                    display_label(name),
+                    xy=(drawdown, y_value),
+                    xycoords="data",
+                    xytext=(label_x, label_positions[name]),
+                    textcoords="axes fraction",
+                    ha=horizontal_alignment,
+                    va="center",
+                    fontsize=8.1,
+                    fontweight="bold" if name == "baseline" else "normal",
+                    color=color,
+                    annotation_clip=False,
+                    arrowprops={
+                        "arrowstyle": "-",
+                        "color": color,
+                        "alpha": .62,
+                        "linewidth": .7,
+                        "shrinkA": 2,
+                        "shrinkB": 4,
+                    },
+                    zorder=2,
+                )
+        if reference_value is not None and y_min <= reference_value <= y_max:
+            ax.axhline(reference_value, color=ink, lw=.8)
+        ax.set_xlabel(
+            f"Median {risk_axis_label} max drawdown (less negative is better)"
+        )
+        # A vertical y label would intersect the full experiment names placed
+        # on the left. Keep the metric explicit inside the one scatter axes.
+        ax.text(
+            .012,
+            .982,
+            f"Median {risk_axis_label} {y_label}",
+            transform=ax.transAxes,
+            ha="left",
+            va="top",
+            fontsize=10,
+            color=ink,
+            bbox={"facecolor": "white", "edgecolor": "none", "alpha": .84},
+            zorder=5,
+        )
+        fig.suptitle(
+            f"Median {risk_axis_label} max drawdown vs {y_label} across ablations",
+            y=.985,
+            fontweight="bold",
+        )
+        fig.text(
+            .5,
+            .95,
+            f"All {len(all_names)} experiments; each point summarizes "
+            f"{fold_count} walk-forward folds using medians",
+            ha="center",
+            color="#596273",
+        )
+        ax.grid(color=grid, lw=.7)
         for spine in ("top", "right"):
             ax.spines[spine].set_visible(False)
-    fig.subplots_adjust(
-        left=0.24,
-        right=0.98,
-        bottom=0.11,
-        top=0.89,
-        wspace=0.08,
+        fig.subplots_adjust(left=.23, right=.77, bottom=.11, top=.89)
+        fig.savefig(output_path, dpi=180, bbox_inches="tight")
+        plt.close(fig)
+
+    for y_metric, y_label in RISK_SCATTER_Y_METRICS:
+        render_metric_scatter(
+            y_metric,
+            y_label,
+            output_path=(
+                args.output_dir
+                / f"{prefix}_risk_return_{y_metric}_medians.png"
+            ),
+        )
+    # Historical filename remains an exact duplicate of the CAGR scatter for
+    # downstream consumers that have not migrated to the explicit metric name.
+    render_metric_scatter(
+        "cagr",
+        "CAGR",
+        output_path=args.output_dir / f"{prefix}_risk_return_medians.png",
     )
-    fig.savefig(args.output_dir / f"{prefix}_risk_return_medians.png", dpi=180, bbox_inches="tight")
-    plt.close(fig)
 
     folds = np.asarray([row["fold_id"] for row in baseline_rows])
     baseline_sharpe = metric(baseline_rows, args.split, "sharpe")

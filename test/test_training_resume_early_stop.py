@@ -5,6 +5,7 @@ from stockagent.training.trainer import (
     _EpochCurveLifecycle,
     _infer_no_improve_epochs_from_curve,
     _resume_no_improve_epochs_from_checkpoint,
+    _trim_group_curve,
 )
 from stockagent.training import trainer
 
@@ -125,6 +126,24 @@ def test_epoch_curve_lifecycle_reuses_resume_record_and_deferred_plot(
 
     assert [name for name, _ in calls] == ["trim", "append", "plot"]
     assert timing == {"total_s": 0.1}
+
+
+def test_epoch_curve_epoch_one_restart_archives_incompatible_partial_history(
+    tmp_path: Path,
+) -> None:
+    curve_path = tmp_path / "train_2020" / "epoch_curve.jsonl"
+    _write_curve_rows(curve_path, [{"epoch": 1}, {"epoch": 2}])
+
+    _trim_group_curve(curve_path, 1)
+
+    assert not curve_path.exists()
+    archived = list(
+        curve_path.parent.glob(
+            "epoch_curve.unresumable_restart_from_epoch1.*.jsonl"
+        )
+    )
+    assert len(archived) == 1
+    assert archived[0].read_text(encoding="utf-8").count("\n") == 2
 
 
 def test_epoch_curve_lifecycle_honors_synchronous_incremental_plot(
