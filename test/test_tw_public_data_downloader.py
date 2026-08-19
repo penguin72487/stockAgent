@@ -105,7 +105,7 @@ def test_download_modes_have_stable_legacy_aliases():
         ("tpex_margin_balance", 8),
         ("tpex_institutional_trades", 6),
         ("tpex_daily_valuation", 7),
-        ("twse_day_trade_eligibility", 4),
+        ("twse_day_trade_eligibility", 5),
     ],
 )
 def test_historical_parser_contract_is_versioned_per_dataset(
@@ -3841,6 +3841,7 @@ def test_direct_cli_does_not_require_taiex_calendar_by_default(monkeypatch):
 
     assert args.require_taiex_session_calendar is False
     assert args.write_run_metadata is True
+    assert args.run_metadata_dir is None
 
 
 def test_targeted_cli_can_preserve_parent_run_metadata(monkeypatch):

@@ -187,6 +187,8 @@ refresh_watchdog_state() {
   running_tasks="${fields[8]:-0}"
   current_manifest_task_update="${fields[9]:--}"
   next_cooldown_until_epoch="${fields[11]:-0}"
+  scheduler_wait_reason="${fields[12]:--}"
+  scheduler_wait_until_epoch="${fields[13]:-0}"
 }
 
 download_pid=""
@@ -393,6 +395,19 @@ while true; do
         && "$running_tasks" == "0" ]]; then
         last_progress_epoch="$(date +%s)"
         echo "[openbb-supervisor] waiting for provider cooldown; stall watchdog paused"
+      fi
+      # Execution eligibility belongs to the scheduler.  Its zero-refill
+      # decision is more precise than a periodic full-manifest monitor count:
+      # a task can look generally eligible while every remaining provider is
+      # currently behind a durable cooldown or task retry deadline.
+      now_epoch="$(date +%s)"
+      if [[ "$scheduler_phase" == "waiting" \
+        && "$scheduler_active" == "0" \
+        && "$scheduler_completed" == "0" \
+        && "$scheduler_wait_until_epoch" =~ ^[0-9]+$ \
+        && "$scheduler_wait_until_epoch" -gt "$now_epoch" ]]; then
+        last_progress_epoch="$now_epoch"
+        echo "[openbb-supervisor] scheduler waiting reason=$scheduler_wait_reason until_epoch=$scheduler_wait_until_epoch; stall watchdog paused"
       fi
       now_epoch="$(date +%s)"
       stall_seconds=$((now_epoch - last_progress_epoch))

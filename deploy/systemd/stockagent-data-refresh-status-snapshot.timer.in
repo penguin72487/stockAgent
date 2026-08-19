@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh public data-monitor service state every 30 seconds
+
+[Timer]
+OnBootSec=5s
+OnUnitActiveSec=30s
+AccuracySec=1s
+Unit=stockagent-data-refresh-status-snapshot.service
+
+[Install]
+WantedBy=timers.target

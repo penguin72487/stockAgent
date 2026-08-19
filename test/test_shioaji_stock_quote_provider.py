@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from types import SimpleNamespace
 
 import numpy as np
@@ -41,6 +42,127 @@ class _FakeApi:
 
     def logout(self):
         self.logged_out = True
+
+
+def _reset_shioaji_connection_state(monkeypatch):
+    monkeypatch.setattr(quote_provider, "_SHIOAJI_STOCK_API", None)
+    monkeypatch.setattr(quote_provider, "_SHIOAJI_STOCK_CONTRACTS", {})
+    monkeypatch.setattr(quote_provider, "_SHIOAJI_STOCK_CACHE", {})
+    monkeypatch.setattr(quote_provider, "_SHIOAJI_STOCK_LOGIN_RETRY_AFTER", 0.0)
+    monkeypatch.setattr(quote_provider, "_SHIOAJI_STOCK_LAST_LOGIN_ERROR", None)
+
+
+def test_shioaji_warm_client_validates_and_replaces_expired_session(monkeypatch):
+    class ExpiredApi:
+        def __init__(self):
+            self.logged_out = False
+
+        def usage(self):
+            raise RuntimeError("401 Token is expired")
+
+        def logout(self):
+            self.logged_out = True
+
+    class FreshApi:
+        def __init__(self, *, simulation):
+            assert simulation is True
+            self.login_kwargs = None
+            self.usage_calls = 0
+
+        def set_event_callback(self, _callback):
+            return None
+
+        def login(self, **kwargs):
+            self.login_kwargs = kwargs
+
+        def usage(self):
+            self.usage_calls += 1
+            return 0
+
+        def logout(self):
+            return None
+
+    expired = ExpiredApi()
+    fresh_instances: list[FreshApi] = []
+
+    def create_fresh(*, simulation):
+        api = FreshApi(simulation=simulation)
+        fresh_instances.append(api)
+        return api
+
+    _reset_shioaji_connection_state(monkeypatch)
+    monkeypatch.setattr(quote_provider, "_SHIOAJI_STOCK_API", expired)
+    monkeypatch.setitem(sys.modules, "shioaji", SimpleNamespace(Shioaji=create_fresh))
+    monkeypatch.setenv("SHIOAJI_API_KEY", "test-key")
+    monkeypatch.setenv("SHIOAJI_SECRET_KEY", "test-secret")
+
+    quote_provider.warm_shioaji_stock_quote_client()
+
+    assert expired.logged_out is True
+    assert len(fresh_instances) == 1
+    assert fresh_instances[0].login_kwargs == {
+        "api_key": "test-key",
+        "secret_key": "test-secret",
+        "subscribe_trade": False,
+        "force_refresh": True,
+    }
+    assert fresh_instances[0].usage_calls == 1
+    assert quote_provider._SHIOAJI_STOCK_API is fresh_instances[0]
+
+
+def test_shioaji_stock_snapshot_reconnects_once_after_session_failure(
+    monkeypatch, tmp_path
+):
+    contract = SimpleNamespace(
+        code="2330",
+        reference=100.0,
+        limit_up=110.0,
+        limit_down=90.0,
+    )
+
+    class ExpiredApi(_FakeApi):
+        def snapshots(self, contracts):
+            raise RuntimeError("SessionNotEstablished")
+
+    class FreshApi(_FakeApi):
+        def __init__(self, *, simulation):
+            assert simulation is True
+            super().__init__({"2330": contract})
+            self.login_kwargs = None
+
+        def set_event_callback(self, _callback):
+            return None
+
+        def login(self, **kwargs):
+            self.login_kwargs = kwargs
+
+    expired = ExpiredApi({"2330": contract})
+    fresh_instances: list[FreshApi] = []
+
+    def create_fresh(*, simulation):
+        api = FreshApi(simulation=simulation)
+        fresh_instances.append(api)
+        return api
+
+    monkeypatch.setenv("STOCKAGENT_TW_PRICE_LIMIT_ROOT", str(tmp_path))
+    monkeypatch.setattr(quote_provider, "_TW_LIMIT_CACHE_KEY", None)
+    monkeypatch.setattr(quote_provider, "_TW_LIMIT_CACHE", {})
+    _reset_shioaji_connection_state(monkeypatch)
+    monkeypatch.setattr(quote_provider, "_SHIOAJI_STOCK_API", expired)
+    monkeypatch.setitem(sys.modules, "shioaji", SimpleNamespace(Shioaji=create_fresh))
+    monkeypatch.setenv("SHIOAJI_API_KEY", "test-key")
+    monkeypatch.setenv("SHIOAJI_SECRET_KEY", "test-secret")
+
+    snapshot = quote_provider.fetch_shioaji_stock_snapshots(
+        ["2330"],
+        np.asarray([99.0], dtype=np.float64),
+    )
+
+    assert expired.logged_out is True
+    assert len(fresh_instances) == 1
+    assert fresh_instances[0].login_kwargs["force_refresh"] is True
+    assert snapshot.available_count == 1
+    np.testing.assert_allclose(snapshot.bid_prices, [100.5])
 
 
 def test_shioaji_stock_snapshots_batch_and_reuse_cache(monkeypatch, tmp_path):

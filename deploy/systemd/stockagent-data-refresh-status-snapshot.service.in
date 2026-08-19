@@ -1,0 +1,38 @@
+[Unit]
+Description=Snapshot allowlisted data-refresh systemd state for the public monitor
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+WorkingDirectory=__REPO_ROOT__
+Environment="HOME=/root"
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=/usr/bin/bash "__REPO_ROOT__/scripts/run_data_refresh_status_snapshot.sh"
+UMask=0077
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=__REPO_ROOT__/artifacts/live/data_monitor
+InaccessiblePaths=-/root/.ssh -/root/.codex -__REPO_ROOT__/.env -__REPO_ROOT__/.env.trade -__REPO_ROOT__/.env.futures
+ProtectProc=invisible
+ProcSubset=pid
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectKernelLogs=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictAddressFamilies=AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=~@clock @cpu-emulation @debug @module @mount @obsolete @privileged @raw-io @reboot @resources @swap
+SystemCallErrorNumber=EPERM

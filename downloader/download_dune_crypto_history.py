@@ -686,12 +686,16 @@ def main() -> int:
         for future in as_completed(futures):
             results.append(future.result())
 
-    failed = any(item.status in {"failed", "blocked_credits", "not_started"} for item in results)
-    progress.finish(failed=failed)
+    hard_failed = any(item.status == "failed" for item in results)
+    blocked = any(
+        item.status in {"blocked_credits", "not_started"} for item in results
+    )
+    state = "failed" if hard_failed else "blocked" if blocked else "complete"
+    progress.finish(state=state)
     summary = {
         "schema_version": SCHEMA_VERSION,
         "generated_at_utc": datetime.now(UTC).isoformat(),
-        "state": "failed" if failed else "complete",
+        "state": state,
         "registered_queries": len(contracts),
         "registered_partitions": len(all_partitions),
         "due_partitions": len(due),
@@ -703,7 +707,10 @@ def main() -> int:
     }
     _atomic_json(output_dir / "download_summary.json", summary)
     print(json.dumps({key: summary[key] for key in ("state", "due_partitions", "completed_partitions", "failed_partitions", "blocked_credit_partitions", "rows")}, ensure_ascii=False), flush=True)
-    return 1 if failed else 0
+    # Credit exhaustion is an observed external capacity gate, not an updater
+    # crash. Keep it visible as ``blocked`` in the receipts while allowing the
+    # umbrella daily refresh to complete its unrelated public-data stages.
+    return 1 if hard_failed else 0
 
 
 if __name__ == "__main__":

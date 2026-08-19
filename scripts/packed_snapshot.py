@@ -121,6 +121,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         help="omit a reproducible or node-local relative subtree from the release",
     )
+    publish.add_argument(
+        "--maximum-file-bytes",
+        type=int,
+        help=(
+            "include only regular files at or below this size; directories and "
+            "safe symlinks remain in the inventory"
+        ),
+    )
     publish.add_argument("--metadata", action="append", default=[])
     publish.add_argument(
         "--max-clock-skew-seconds",
@@ -185,6 +193,7 @@ def main(argv: list[str] | None = None) -> int:
                 max_clock_skew_seconds=args.max_clock_skew_seconds,
                 metadata=_metadata(args.metadata),
                 excluded_subtrees=args.exclude_subtree,
+                maximum_file_bytes=args.maximum_file_bytes,
                 repo_root=REPO_ROOT,
             )
             archive = resolved.manifest["archive"]

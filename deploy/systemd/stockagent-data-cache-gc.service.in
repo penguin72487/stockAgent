@@ -1,0 +1,40 @@
+[Unit]
+Description=Evict expired StockAgent materialized dataset caches
+After=local-fs.target
+ConditionPathIsDirectory=/srv/stockagent-packed
+ConditionPathIsDirectory=/srv/stockagent-packed-materialized
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+WorkingDirectory=__REPO_ROOT__
+Environment="PYTHONUNBUFFERED=1"
+Environment="STOCKAGENT_DATA_CACHE_TTL_DAYS=7"
+ExecStart=/usr/bin/bash "__REPO_ROOT__/scripts/run_data_cache.sh" gc
+UMask=0077
+Nice=19
+CPUWeight=1
+IOWeight=1
+IOSchedulingClass=idle
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=full
+ProtectHome=no
+InaccessiblePaths=-/root/.ssh -/root/.codex -__REPO_ROOT__/.env -__REPO_ROOT__/.env.trade -__REPO_ROOT__/.env.futures
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectKernelLogs=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictAddressFamilies=AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=~@clock @cpu-emulation @debug @module @mount @obsolete @privileged @raw-io @reboot @swap
+SystemCallErrorNumber=EPERM
+TimeoutStartSec=infinity

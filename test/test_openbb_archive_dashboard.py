@@ -96,6 +96,26 @@ def test_public_status_separates_live_process_truth_from_stale_audit(
             "plan_token": "private-plan",
         },
     )
+    _write_json(
+        state / "l1_compaction_latest.json",
+        {
+            "generated_at_utc": (now - timedelta(minutes=5)).isoformat(),
+            "endpoints": 4,
+            "success_files": 100,
+            "success_rows": 1000,
+            "compacted_files": 80,
+            "compacted_rows": 750,
+            "pending_files": 20,
+            "pending_rows": 250,
+            "active_segments": 3,
+            "source_bytes": 10000,
+            "output_bytes": 4000,
+            "new_segments": 1,
+            "stale_segments": 0,
+            "l0_deleted": False,
+            "query_database": "/private/path/openbb_l1.duckdb",
+        },
+    )
     monkeypatch.setattr(
         dashboard, "_pid_alive", lambda path, fragments: path.name == "supervisor.pid"
     )
@@ -116,8 +136,12 @@ def test_public_status_separates_live_process_truth_from_stale_audit(
     assert public["categories"][0]["missing_tasks"] == 5
     assert public["categories"][0]["unavailable_tasks"] == 2
     assert public["providers"][0]["requests_per_second"] == 4.0
+    assert public["l1_compaction"]["compacted_files"] == 80
+    assert public["l1_compaction"]["pending_files"] == 20
+    assert public["l1_compaction"]["l0_deleted"] is False
     assert public["alerts"][0]["message"].startswith("供應商配額形成")
     encoded = json.dumps(public, ensure_ascii=False)
+    assert "/private/path" not in encoded
     for forbidden in (
         "private",
         "raw upstream",
@@ -171,3 +195,11 @@ def test_compact_history_projection_and_range_filter(tmp_path: Path) -> None:
     assert len(all_rows["history"]) == 2
     assert all_rows["history"][0]["accepted_percent"] == 72.0
     assert "output_dir" not in json.dumps(all_rows)
+
+    appended = dashboard.project_openbb_history_row(
+        _snapshot(now - timedelta(minutes=5))
+    )
+    with (state / "monitor_dashboard_history.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(appended) + "\n")
+    refreshed = dashboard.build_openbb_public_history(tmp_path, "1h", now=now)
+    assert len(refreshed["history"]) == 2

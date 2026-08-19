@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from io import BytesIO
 from pathlib import Path
 import shutil
 from zipfile import ZIP_DEFLATED, ZipFile
 
 import polars as pl
+import pytest
 
 from downloader.download_binance_public_archive import (
     ArchiveObject,
@@ -45,6 +48,13 @@ def _zip_csv(text: str) -> bytes:
     return payload.getvalue()
 
 
+def _kline_row(*, open_time: int = 1_735_689_600_000, close: str = "2") -> str:
+    return (
+        f"{open_time},1,3,0.5,{close},10,{open_time + 59_999},"
+        "20,5,4,8,0\n"
+    )
+
+
 def test_parse_s3_listing_with_namespace_and_pagination() -> None:
     payload = b"""<?xml version='1.0' encoding='UTF-8'?>
     <ListBucketResult xmlns='http://s3.amazonaws.com/doc/2006-03-01/'>
@@ -77,6 +87,22 @@ def test_spot_microsecond_archive_is_normalized_to_milliseconds() -> None:
     assert frame["open_time"].item() == 1_735_689_600_000
     assert frame["close_time"].item() == 1_735_689_659_999
     assert frame["source_timestamp_unit"].item() == "microseconds"
+
+
+def test_exact_official_duplicate_rows_are_losslessly_deduplicated() -> None:
+    row = _kline_row()
+
+    frame = _parse_kline_zip(_zip_csv(row + row), _object())
+
+    assert frame.height == 1
+    assert frame["source_exact_duplicate_rows_removed"].item() == 1
+
+
+def test_conflicting_official_duplicate_rows_fail_closed() -> None:
+    payload = _zip_csv(_kline_row(close="2") + _kline_row(close="2.5"))
+
+    with pytest.raises(ValueError, match="conflicting duplicate"):
+        _parse_kline_zip(payload, _object())
 
 
 def test_daily_row_overrides_monthly_row_for_same_open_time() -> None:
@@ -150,3 +176,27 @@ def test_invalid_monthly_object_is_quarantined_for_daily_rebuild(
 
     assert repairs == {("spot", "BTCUSDT", "2025-01")}
     assert _completed_etags(state) == {item.key: item.etag}
+
+
+def test_parallel_state_writes_are_serialized(tmp_path: Path) -> None:
+    state = tmp_path / "state.sqlite3"
+    items = [
+        replace(
+            _object(),
+            key=f"data/spot/daily/klines/BTCUSDT/1m/BTCUSDT-1m-2025-01-{day:02d}.zip",
+            etag=f"etag-{day}",
+        )
+        for day in range(1, 33)
+    ]
+
+    with ThreadPoolExecutor(max_workers=32) as executor:
+        list(
+            executor.map(
+                lambda item: _record_state(state, item, status="complete"),
+                items,
+            )
+        )
+
+    completed = _completed_etags(state)
+    assert len(completed) == len(items)
+    assert set(completed) == {item.key for item in items}

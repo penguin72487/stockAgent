@@ -140,6 +140,38 @@ def test_packed_snapshot_excludes_reproducible_subtree(tmp_path: Path) -> None:
     ]
 
 
+def test_packed_snapshot_can_select_only_small_files(tmp_path: Path) -> None:
+    source = _source_tree(tmp_path)
+    sync_root = tmp_path / "sync"
+    initialize_packed_layout(sync_root, node_id="node-a")
+
+    resolved = publish_packed_snapshot(
+        sync_root,
+        "small-prices",
+        source,
+        loose_file_threshold_bytes=1024,
+        pack_buckets=4,
+        maximum_file_bytes=1023,
+    )
+    target = fetch_packed_snapshot(sync_root, tmp_path / "materialized", resolved)
+
+    assert resolved.manifest["source"]["selection"] == {
+        "maximum_file_bytes": 1023,
+        "symlinks": "included",
+    }
+    assert resolved.manifest["source"]["files"] == 2
+    assert resolved.manifest["source"]["omitted_files_above_maximum"] == 2
+    assert all(
+        item["kind"] == "pack" for item in resolved.manifest["archive"]["objects"]
+    )
+    assert (target / "text" / "first.json").is_file()
+    assert not (target / "large-a.bin").exists()
+    assert not (target / "large-b.bin").exists()
+    assert verify_packed_snapshot(sync_root, resolved, materialized_path=target)[
+        "materialized_verified"
+    ]
+
+
 def test_unchanged_publish_reuses_identical_content_objects(tmp_path: Path) -> None:
     source = _source_tree(tmp_path)
     sync_root = tmp_path / "sync"

@@ -25,6 +25,8 @@ class WatchdogState:
     manifest_last_task_update: str = ""
     monitor_checked_at: str = ""
     next_cooldown_until_epoch: int = 0
+    scheduler_wait_reason: str = ""
+    scheduler_wait_until_epoch: int = 0
 
 
 def _read_json_object(path: Path) -> dict[str, Any]:
@@ -62,6 +64,15 @@ def _next_cooldown_epoch(cooldowns: Any) -> int:
     return min(deadlines, default=0)
 
 
+def _timestamp_epoch(value: Any) -> int:
+    try:
+        if isinstance(value, (int, float)):
+            return max(0, int(value))
+        return max(0, int(datetime.fromisoformat(str(value)).timestamp()))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
 def build_watchdog_state(state_dir: Path) -> WatchdogState:
     """Return a fail-open snapshot without scanning the manifest database."""
 
@@ -89,6 +100,8 @@ def build_watchdog_state(state_dir: Path) -> WatchdogState:
         manifest_last_task_update=str(monitor.get("last_task_update") or ""),
         monitor_checked_at=str(monitor.get("checked_at") or ""),
         next_cooldown_until_epoch=_next_cooldown_epoch(cooldowns),
+        scheduler_wait_reason=str(scheduler.get("wait_reason") or ""),
+        scheduler_wait_until_epoch=_timestamp_epoch(scheduler.get("wait_until")),
     )
 
 
@@ -108,6 +121,8 @@ def _shell_lines(state: WatchdogState) -> tuple[str, ...]:
         state.manifest_last_task_update or "-",
         state.monitor_checked_at or "-",
         str(state.next_cooldown_until_epoch),
+        state.scheduler_wait_reason or "-",
+        str(state.scheduler_wait_until_epoch),
     )
 
 

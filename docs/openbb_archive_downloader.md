@@ -287,6 +287,19 @@ FRED 的 OpenBB 內部 limiter 也會在 import 前設定成同一個間隔，�
 
 ## DuckDB 合併與 Polars/PyArrow 驗證
 
+下載仍在進行時，使用 append-only shadow L1，不必等待整個 archive 完成：
+
+```bash
+./scripts/run_openbb_l1_compaction.sh
+./scripts/run_openbb_l1_compaction.sh --audit-only
+```
+
+L1 只壓實已成功且未註冊的 shard，建立 `openbb_l1.duckdb`，不重寫舊 segment、
+不刪除 L0，完整契約見 [欄式資料湖儲存契約](columnar_storage_architecture.md)。
+定期服務可用 `scripts/install_openbb_l1_compaction_service.sh` 安裝。
+
+整個 archive 完成後，才執行原有 endpoint L2 合併：
+
 下載完成或累積一批資料後執行：
 
 ```bash

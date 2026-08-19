@@ -117,6 +117,25 @@ def test_dune_lineage_upgrade_is_local_and_credit_free(tmp_path: Path) -> None:
     assert receipt["dune_query_id"] == 0
 
 
+def test_progress_can_publish_external_block_without_fabricating_completion(
+    tmp_path: Path,
+) -> None:
+    progress = dune.PersistentProgress(
+        tmp_path / "progress.json",
+        label="Dune fixture",
+        total=10,
+        unit="partitions",
+        basis="fixture",
+    )
+    progress.update("fixture", "blocked_credits")
+    progress.finish(state="blocked")
+
+    payload = json.loads((tmp_path / "progress.json").read_text(encoding="utf-8"))
+    assert payload["state"] == "blocked"
+    assert payload["current"] == 1
+    assert payload["ratio"] == 0.1
+
+
 def test_generic_public_context_cannot_reenable_non_selected_exchanges() -> None:
     deferred = public.DEFERRED_EXCHANGE_DATASETS
 
