@@ -234,7 +234,12 @@ stockagent-data status
 stockagent-data status --human
 stockagent-data use tw-public --path-only
 stockagent-data gc --dry-run
+stockagent-data publish-status tw-public
+stockagent-data publish tw-public
 ```
+
+`publish` 仍會套用 catalog 的 active-downloader blocker、排除規則、完整來源穩定性
+檢查與原子 head 更新；它不是繞過發布門檻的捷徑。
 
 新資料的增量冷存仍使用既有發布入口。固定 hash bucket 與 content-addressed
 blob 使未改變物件直接重用，只傳輸變動 bucket/blob：
