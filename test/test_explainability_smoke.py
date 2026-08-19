@@ -24,6 +24,7 @@ from stockagent.explainability import (
     _perturbation_importance,
     _portfolio_j_lens,
     _combine_j_lens_frames_from_chunks,
+    _canonical_explainability_destination,
     _cross_fold_figure_spec,
     _plot_all_explanation_figures,
     _representation_aux_summary,
@@ -54,6 +55,31 @@ class _TinyResidualBlock(torch.nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x + 0.1 * torch.tanh(self.linear(x))
+
+
+def test_explainability_destination_cannot_escape_experiment_root(tmp_path: Path) -> None:
+    experiment = tmp_path / "experiment"
+    canonical = experiment / "explainability" / "fold_03_test"
+
+    assert _canonical_explainability_destination(
+        output_dir=experiment,
+        fold_id=3,
+        split="test",
+    ) == canonical
+    assert _canonical_explainability_destination(
+        output_dir=experiment,
+        fold_id=3,
+        split="test",
+        requested=experiment / "explainability",
+    ) == canonical
+
+    with pytest.raises(ValueError, match="must remain inside its experiment directory"):
+        _canonical_explainability_destination(
+            output_dir=experiment,
+            fold_id=3,
+            split="test",
+            requested=tmp_path / "shared-explainability",
+        )
 
 
 class _TinyJLensePortfolio(torch.nn.Module):
@@ -508,6 +534,7 @@ def test_explainability_smoke(tmp_path: Path) -> None:
     assert (out_dir / "plots_paper" / "feature_time_gradient_grad_x_input_abs_heatmap.png").exists()
     assert (out_dir / "plots_paper" / "feature_attribution_coverage_curve.png").exists()
     assert (out_dir / "plots_paper" / "portfolio_exposure_coverage_curve.png").exists()
+    assert (out_dir / "plots_paper" / "feature_correlations_by_global_attribution.png").exists()
     summary = json.loads((out_dir / "summary.json").read_text(encoding="utf-8"))
     assert summary["plots_generated"]
     assert summary["paper_plots"]

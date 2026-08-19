@@ -14,6 +14,17 @@ output_root: artifacts/ablations/tw_day_trade_daily_tplus2_close_commission20_v3
 # the same fresh OFAT contract as every non-capital variant.
 expected_fold_count: 12
 
+# This suite began on the immutable 2026-08-04 public-data panel. Keep every
+# resumed and not-yet-started fold on that exact cached generation even after
+# the live data_tw_public symlink advances; mixing panel generations would make
+# the OFAT comparison invalid and causes strict checkpoint fingerprints to fail.
+pinned_panel_cache:
+  snapshot_id: tw-public-20260804T083108590889195Z-l0-lab203-7e95d25803d82230
+  variant_id: 75dc0b0a2b09ddb0eeaa783ca627e4ae04115c0f60ad7a7ea1762a084f6b171f
+  version: 51
+  generation: 0287b07e62da4030967877bd9b3e3bac
+  source_hash: 59226dbf7b98ad626d0d4b8caef670b251b248d20d386c410413ae03ababff7f
+
 batch_policy:
   default_global_train_batch: 512
   attention_pooling_global_train_batch: 128

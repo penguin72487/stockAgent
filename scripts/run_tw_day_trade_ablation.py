@@ -175,6 +175,16 @@ def _run_checked(command: list[str], *, log=None) -> None:
         raise SystemExit(result.returncode)
 
 
+def _load_effective_spec(spec_path: Path) -> tuple[dict, list[dict]]:
+    """Load the same recursively inherited spec used by the worker runner."""
+
+    if str(REPO_ROOT) not in sys.path:
+        sys.path.insert(0, str(REPO_ROOT))
+    from scripts.run_ablation_experiments import _experiment_rows
+
+    return _experiment_rows(spec_path.resolve())
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--spec", type=Path, default=DEFAULT_SPEC)
@@ -205,7 +215,7 @@ def main() -> None:
         )
 
     spec_path = args.spec.resolve()
-    spec = yaml.safe_load(spec_path.read_text(encoding="utf-8"))
+    spec, experiment_rows = _load_effective_spec(spec_path)
     folds = int(spec["expected_fold_count"])
     root = (args.output_root or (REPO_ROOT / spec["output_root"])).resolve()
     root.mkdir(parents=True, exist_ok=True)
@@ -230,14 +240,8 @@ def main() -> None:
     # Derive the run set from the current spec, not from every historical file
     # left under generated_configs. This keeps removed/renamed experiments out
     # of the progress denominator without deleting their audit artifacts.
-    if str(REPO_ROOT) not in sys.path:
-        sys.path.insert(0, str(REPO_ROOT))
-    from scripts.run_ablation_experiments import (
-        _cuda_runtime_health,
-        _experiment_rows,
-    )
+    from scripts.run_ablation_experiments import _cuda_runtime_health
 
-    _, experiment_rows = _experiment_rows(spec_path)
     names = [str(row["name"]) for row in experiment_rows]
     configs = [root / "generated_configs" / f"{name}.yaml" for name in names]
     missing_configs = [str(path) for path in configs if not path.is_file()]

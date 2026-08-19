@@ -239,3 +239,14 @@ def test_deployment_plot_cli_bootstraps_repo_imports(tmp_path: Path) -> None:
 
     assert result.returncode == 0, result.stderr
     assert (output_dir / "deployment_paired_sharpe_effects.png").is_file()
+    assert (output_dir / "deployment_risk_return_medians.png").is_file()
+    for metric_name in (
+        "cagr",
+        "sharpe",
+        "sortino",
+        "turnover",
+        "daily_hit_rate",
+    ):
+        assert (
+            output_dir / f"deployment_risk_return_{metric_name}_medians.png"
+        ).is_file()
