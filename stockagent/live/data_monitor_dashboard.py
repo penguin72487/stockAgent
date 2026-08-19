@@ -223,6 +223,7 @@ _SUMMARY_CANDIDATES: Final[dict[str, tuple[str, ...]]] = {
     ),
     "tw-futures": ("shioaji_contracts/manifest.json",),
     "forex-frankfurter": ("download_summary.json",),
+    "forex-pepperstone": ("download_summary.json",),
 }
 
 _STATUS_PRIORITY: Final[dict[str, int]] = {
@@ -275,6 +276,10 @@ _REFRESH_UNITS: Final[dict[str, dict[str, str | None]]] = {
         "service": "stockagent-openbb-archive.service",
         "timer": None,
     },
+    "openbb_l1_compaction": {
+        "service": "stockagent-openbb-l1-compaction.service",
+        "timer": "stockagent-openbb-l1-compaction.timer",
+    },
     "binance_backfill": {
         "service": "stockagent-binance-public-backfill-v4.service",
         "timer": None,
@@ -287,13 +292,39 @@ _REFRESH_UNITS: Final[dict[str, dict[str, str | None]]] = {
         "service": "stockagent-discord-bot.service",
         "timer": None,
     },
+    "tw_public_publication": {
+        "service": "stockagent-tw-public-publication-sweep.service",
+        "timer": "stockagent-tw-public-publication-sweep.timer",
+    },
+    "tw_public_source_events": {
+        "service": "stockagent-tw-public-source-events.service",
+        "timer": None,
+    },
+    "tw_public_0830": {
+        "service": "stockagent-tw-public-0830-check.service",
+        "timer": "stockagent-tw-public-0830-check.timer",
+    },
+    "tw_public_eligibility": {
+        "service": "stockagent-tw-day-trade-eligibility.service",
+        "timer": "stockagent-tw-day-trade-eligibility.timer",
+    },
+    "tw_day_trade_preopen_gate": {
+        "service": "stockagent-tw-day-trade-preopen-gate.service",
+        "timer": "stockagent-tw-day-trade-preopen-gate.timer",
+    },
 }
 
 _AUTOMATION_PROFILES: Final[dict[str, dict[str, Any]]] = {
     "group:tw-public": {
         "mode": "preopen_gate",
-        "service_keys": ("tw_public_preopen",),
-        "schedule_label": "交易日前置檢查按需觸發不可變快照更新",
+        "service_keys": (
+            "tw_public_source_events",
+            "tw_public_publication",
+            "tw_public_0830",
+            "tw_public_eligibility",
+            "tw_day_trade_preopen_gate",
+        ),
+        "schedule_label": "156 項來源版本事件持續監測、公布邊界掃描、08:20/08:30 嚴格快照與 08:59:30 最終守門",
         "active_means_running": False,
     },
     "group:tw-minute-train": {
@@ -458,6 +489,7 @@ _TQDM_RE: Final[re.Pattern[str]] = re.compile(
     r"(?P<current>\d+)/(?P<total>\d+)\s*"
     r"\[(?P<elapsed>[0-9:]+)<(?P<remaining>[0-9:?]+),"
 )
+_REFRESH_SERVICE_SNAPSHOT_MAX_AGE_SECONDS: Final[int] = 180
 
 
 def _read_json(path: Path, default: Any = None) -> Any:
@@ -511,19 +543,101 @@ def _systemd_properties(unit: str, properties: tuple[str, ...]) -> dict[str, str
     return fields
 
 
-def _service_state(unit: str, timer: str | None = None) -> dict[str, Any]:
+def _systemd_property_sets(
+    units: tuple[str, ...], properties: tuple[str, ...]
+) -> dict[str, dict[str, str]]:
+    """Read all fixed units through one D-Bus round trip."""
+
+    if not units:
+        return {}
+    try:
+        result = subprocess.run(
+            (
+                "systemctl",
+                "show",
+                *units,
+                f"--property=Id,{','.join(properties)}",
+                "--no-pager",
+            ),
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=3.0,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    output: dict[str, dict[str, str]] = {}
+    fields: dict[str, str] = {}
+    for line in [*result.stdout.splitlines(), ""]:
+        if line:
+            key, separator, value = line.partition("=")
+            if separator:
+                fields[key] = value
+            continue
+        unit_id = str(fields.get("Id") or "")
+        if unit_id:
+            output[unit_id] = fields
+        fields = {}
+    return output
+
+
+def _fresh_refresh_service_snapshot(
+    path: Path,
+    *,
+    now: datetime | None = None,
+) -> dict[str, dict[str, Any]] | None:
+    payload = _read_json(path, {})
+    if not isinstance(payload, Mapping):
+        return None
+    try:
+        generated = datetime.fromisoformat(
+            str(payload.get("generated_at_utc") or "").replace("Z", "+00:00")
+        )
+    except ValueError:
+        return None
+    if generated.tzinfo is None:
+        generated = generated.replace(tzinfo=UTC)
+    observed = (now or datetime.now(UTC)).astimezone(UTC)
+    age_seconds = (observed - generated.astimezone(UTC)).total_seconds()
+    if age_seconds < -30 or age_seconds > _REFRESH_SERVICE_SNAPSHOT_MAX_AGE_SECONDS:
+        return None
+    services = payload.get("services")
+    if not isinstance(services, Mapping):
+        return None
+    output: dict[str, dict[str, Any]] = {}
+    for key, value in services.items():
+        if not isinstance(value, Mapping):
+            continue
+        output[str(key)] = {
+            **dict(value),
+            "evidence_source": "systemd_snapshot",
+            "evidence_generated_at_utc": generated.astimezone(UTC).isoformat(),
+        }
+    return output or None
+
+
+def _service_state(
+    unit: str,
+    timer: str | None = None,
+    *,
+    property_sets: Mapping[str, Mapping[str, str]] | None = None,
+) -> dict[str, Any]:
     """Read a fixed service and timer without exposing invocation identifiers."""
 
-    fields = _systemd_properties(
-        unit,
-        (
-            "ActiveState",
-            "SubState",
-            "NRestarts",
-            "Result",
-            "ExecMainStartTimestamp",
-            "ExecMainExitTimestamp",
-        ),
+    fields = (
+        dict(property_sets.get(unit, {}))
+        if property_sets is not None
+        else _systemd_properties(
+            unit,
+            (
+                "ActiveState",
+                "SubState",
+                "NRestarts",
+                "Result",
+                "ExecMainStartTimestamp",
+                "ExecMainExitTimestamp",
+            ),
+        )
     )
     active = fields.get("ActiveState") in {"active", "activating", "reloading"}
     if not fields:
@@ -535,7 +649,9 @@ def _service_state(unit: str, timer: str | None = None) -> dict[str, Any]:
         if active:
             fields = {"ActiveState": "active", "SubState": "running"}
     timer_fields = (
-        _systemd_properties(
+        dict(property_sets.get(timer, {}))
+        if timer and property_sets is not None
+        else _systemd_properties(
             timer,
             (
                 "ActiveState",
@@ -566,14 +682,53 @@ def _service_state(unit: str, timer: str | None = None) -> dict[str, Any]:
     return output
 
 
-def _refresh_service_states() -> dict[str, dict[str, Any]]:
-    return {
+def _refresh_service_states(
+    *,
+    snapshot_path: Path | None = None,
+    now: datetime | None = None,
+    prefer_snapshot: bool = False,
+) -> dict[str, dict[str, Any]]:
+    if prefer_snapshot and snapshot_path is not None:
+        snapshot = _fresh_refresh_service_snapshot(snapshot_path, now=now)
+        if snapshot is not None:
+            return snapshot
+    units = tuple(
+        dict.fromkeys(
+            str(unit)
+            for values in _REFRESH_UNITS.values()
+            for unit in (values.get("service"), values.get("timer"))
+            if unit
+        )
+    )
+    property_sets = _systemd_property_sets(
+        units,
+        (
+            "ActiveState",
+            "SubState",
+            "NRestarts",
+            "Result",
+            "ExecMainStartTimestamp",
+            "ExecMainExitTimestamp",
+            "NextElapseUSecRealtime",
+            "LastTriggerUSec",
+        ),
+    )
+    if not property_sets and snapshot_path is not None:
+        snapshot = _fresh_refresh_service_snapshot(snapshot_path, now=now)
+        if snapshot is not None:
+            return snapshot
+    states = {
         name: _service_state(
             str(units["service"]),
             str(units["timer"]) if units.get("timer") else None,
+            property_sets=property_sets,
         )
         for name, units in _REFRESH_UNITS.items()
     }
+    evidence_source = "systemd_live" if property_sets else "cgroup_fallback"
+    for state in states.values():
+        state["evidence_source"] = evidence_source
+    return states
 
 
 def _duration_seconds(value: str) -> int | None:
@@ -687,12 +842,17 @@ def _parse_time(value: Any) -> datetime | None:
     if not text:
         return None
     try:
-        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        # A date-only ``data_through`` value means coverage through that UTC
+        # date, not the first instant of it. Python accepts YYYY-MM-DD as
+        # midnight, which made a successful 06:30 refresh appear stale roughly
+        # one day too early.
+        parsed = datetime.fromisoformat(
+            f"{text}T23:59:59+00:00"
+            if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text)
+            else text.replace("Z", "+00:00")
+        )
     except ValueError:
-        try:
-            parsed = datetime.fromisoformat(f"{text}T23:59:59+00:00")
-        except ValueError:
-            return None
+        return None
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=UTC)
     return parsed.astimezone(UTC)
@@ -1060,6 +1220,15 @@ def _tw_public_sources(root: Path, *, now: datetime) -> list[dict[str, Any]]:
     manifest = _read_json(base / "dataset_manifest.json", [])
     summary = _read_json(base / "download_summary.json", {})
     receipt = _read_json(root / "artifacts/data_refresh/tw_public/latest.json", {})
+    event_receipt = _read_json(
+        root / "artifacts/data_refresh/tw_public/events/latest.json", {}
+    )
+    event_rows = (
+        event_receipt.get("datasets", {})
+        if isinstance(event_receipt, Mapping)
+        else {}
+    )
+    event_rows = event_rows if isinstance(event_rows, Mapping) else {}
     if not isinstance(manifest, list):
         return []
     report: dict[str, dict[str, str]] = {}
@@ -1101,7 +1270,25 @@ def _tw_public_sources(root: Path, *, now: datetime) -> list[dict[str, Any]]:
             and failed == 0
             and missing == 0
         )
-        if failed or missing or raw_status in {"failed", "incomplete", "error"}:
+        event_row = event_rows.get(name, {})
+        event_row = event_row if isinstance(event_row, Mapping) else {}
+        event_applied = bool(
+            event_row.get("last_probe_status") == "ok"
+            and event_row.get("observed_version")
+            and event_row.get("observed_version") == event_row.get("applied_version")
+        )
+        if event_row and not event_applied:
+            status = "degraded"
+            label = (
+                "來源探測失敗"
+                if event_row.get("last_probe_status") == "failed"
+                else "已發現新版本，等待下載驗證"
+            )
+            eta = _unknown_eta(
+                "running_unmeasured",
+                "來源事件監測器會持續重試，直到下載與驗證收據成功。",
+            )
+        elif failed or missing or raw_status in {"failed", "incomplete", "error"}:
             status = "degraded"
             label = f"缺 {missing:,} 日／失敗 {failed:,} 日"
             eta = _unknown_eta(
@@ -1124,6 +1311,8 @@ def _tw_public_sources(root: Path, *, now: datetime) -> list[dict[str, Any]]:
             label = "缺少完整度證據"
             eta = _unknown_eta("unknown", "缺少逐資料集完整度回執。")
         warnings = []
+        if not event_row:
+            warnings.append("尚未取得此資料集的來源版本事件監測證據。")
         if isinstance(source_unavailable, Mapping) and name in source_unavailable:
             warnings.append("含官方來源已確認不可取得的日期；未將其偽裝成成功資料。")
         tags = item.get("tags") if isinstance(item.get("tags"), list) else []
@@ -1140,9 +1329,16 @@ def _tw_public_sources(root: Path, *, now: datetime) -> list[dict[str, Any]]:
                 "category": ", ".join(str(tag) for tag in tags[:3]),
                 "status": status,
                 "status_label": label,
-                "cadence": "每個交易日收盤後",
-                "update_owner": "不可變快照更新器",
-                "latest_at_utc": _iso(generated),
+                "cadence": (
+                    f"來源版本每 {int(event_row.get('interval_seconds'))} 秒探測"
+                    if _integer(event_row.get("interval_seconds"))
+                    else "來源版本持續探測"
+                ),
+                "update_owner": "來源事件監測器＋不可變快照更新器",
+                "latest_at_utc": _iso(
+                    _parse_time(event_row.get("last_checked_at_taipei"))
+                    or generated
+                ),
                 "data_through": str(summary.get("end_date") or "") or None,
                 "freshness": dict(fresh),
                 "coverage": _coverage(
@@ -1152,7 +1348,10 @@ def _tw_public_sources(root: Path, *, now: datetime) -> list[dict[str, Any]]:
                 "rows": _integer(audit.get("rows")),
                 "publishable": True,
                 "automation_eligible": True,
-                "detail": str(item.get("description") or "官方公開資料集。"),
+                "detail": (
+                    str(item.get("description") or "官方公開資料集。")
+                    + " 來源變更只有在定向下載、解析與驗證成功後才會確認套用。"
+                ),
                 "warnings": warnings,
                 "detail_link": None,
             }
@@ -1228,7 +1427,7 @@ def _openbb_sources(
 ) -> list[dict[str, Any]]:
     providers = status.get("providers")
     if not isinstance(providers, list):
-        return []
+        providers = []
     latest = now
     source_age = _number(status.get("source_age_seconds"))
     if source_age is not None:
@@ -1301,6 +1500,81 @@ def _openbb_sources(
                 "warnings": ["供應商 unavailable 與成功資料分開計數。"]
                 if cooldown
                 else [],
+                "detail_link": "../openbb/",
+            }
+        )
+    l1 = status.get("l1_compaction")
+    if isinstance(l1, Mapping) and l1.get("generated_at_utc") is not None:
+        success_files = _integer(l1.get("success_files")) or 0
+        compacted_files = _integer(l1.get("compacted_files")) or 0
+        pending_files = max(
+            _integer(l1.get("pending_files")) or 0,
+            success_files - compacted_files,
+        )
+        source_age = _number(l1.get("source_age_seconds"))
+        latest = now - timedelta(seconds=source_age) if source_age is not None else None
+        if pending_files == 0:
+            row_status = "complete"
+            status_label = "目前成功 shard 已全部壓實"
+            eta = _complete_eta("目前沒有待壓實的成功 shard。")
+        elif source_age is None or source_age > 2 * 3600:
+            row_status = "stale"
+            status_label = "壓實狀態逾時"
+            eta = _unknown_eta(
+                "stale_status", "L1 狀態超過兩小時未更新，不能可靠估計完成時間。"
+            )
+        else:
+            row_status = "waiting"
+            status_label = "等待下一輪增量壓實"
+            # The installed timer starts at most 20,000 new shards per run and
+            # is scheduled every 30 minutes. This is a low-confidence
+            # no-new-arrivals capacity projection, not a completion promise.
+            runs = math.ceil(pending_files / 20_000)
+            seconds = runs * 30 * 60
+            eta = {
+                "state": "estimating",
+                "remaining_seconds": seconds,
+                "estimated_complete_at_utc": _iso(now + timedelta(seconds=seconds)),
+                "confidence": "low",
+                "basis": "依每半小時最多 20,000 shard 且沒有新資料的容量估計；小於 128 檔的 endpoint tail 會等待累積。",
+            }
+        source_bytes = _integer(l1.get("source_bytes")) or 0
+        output_bytes = _integer(l1.get("output_bytes")) or 0
+        reduction = (
+            100.0 * (1.0 - output_bytes / source_bytes) if source_bytes else 0.0
+        )
+        output.append(
+            {
+                "id": "openbb:l1-compaction",
+                "parent_id": "group:openbb-compact",
+                "scope": "logical_source",
+                "title": "OpenBB L1 Parquet 壓實",
+                "provider": "本機 DuckDB／Polars／PyArrow",
+                "category": "storage-compaction",
+                "status": row_status,
+                "status_label": status_label,
+                "cadence": "每半小時",
+                "update_owner": "OpenBB L1 壓實 timer",
+                "latest_at_utc": _iso(latest),
+                "data_through": None,
+                "freshness": _freshness(latest, now=now, window_seconds=2 * 3600),
+                "coverage": _coverage(
+                    compacted_files,
+                    success_files,
+                    unit="shard",
+                    label="已壓實／成功 L0",
+                ),
+                "eta": eta,
+                "rows": _integer(l1.get("compacted_rows")),
+                "publishable": True,
+                "automation_eligible": True,
+                "detail": (
+                    f"active segments {_integer(l1.get('active_segments')) or 0:,}；"
+                    f"待壓實 {pending_files:,} shards；已壓實來源空間縮減 {reduction:.2f}%。"
+                ),
+                "warnings": [
+                    "L1 是 shadow query layer；L0 原始 shard 保留且未刪除。"
+                ],
                 "detail_link": "../openbb/",
             }
         )
@@ -2362,11 +2636,19 @@ def _crypto_history_sources(root: Path, *, now: datetime) -> list[dict[str, Any]
     dune_config = _read_json(root / "configs/dune_crypto_queries.json", {})
     dune_summary = _read_json(root / "data_dune_crypto/download_summary.json", {})
     dune_progress = _read_json(root / "data_dune_crypto/progress.json", {})
-    dune_results = {
-        str(item.get("query_id")): item
-        for item in dune_summary.get("results", [])
-        if isinstance(item, Mapping)
-    } if isinstance(dune_summary, Mapping) else {}
+    dune_results: dict[str, list[Mapping[str, Any]]] = {}
+    if isinstance(dune_summary, Mapping):
+        for item in dune_summary.get("results", []):
+            if not isinstance(item, Mapping):
+                continue
+            dune_results.setdefault(str(item.get("query_id")), []).append(item)
+    dune_run_blocked = (
+        isinstance(dune_summary, Mapping)
+        and (
+            str(dune_summary.get("state") or "") == "blocked"
+            or (_integer(dune_summary.get("blocked_credit_partitions")) or 0) > 0
+        )
+    )
     progress_updated = _parse_time(dune_progress.get("updated_at_utc")) if isinstance(dune_progress, Mapping) else None
     progress_live = (
         isinstance(dune_progress, Mapping)
@@ -2390,8 +2672,18 @@ def _crypto_history_sources(root: Path, *, now: datetime) -> list[dict[str, Any]
             int(query.get("chunk_months") or 3),
         )
         latest = _latest_time(receipts, receipt_payloads)
-        result = dune_results.get(query_id, {})
-        result_status = str(result.get("status") or "")
+        query_results = dune_results.get(query_id, [])
+        query_statuses = {str(item.get("status") or "") for item in query_results}
+        result_status = next(
+            (
+                status
+                for status in ("blocked_credits", "failed", "not_started", "complete")
+                if status in query_statuses
+            ),
+            "",
+        )
+        if dune_run_blocked and query_statuses & {"blocked_credits", "not_started"}:
+            result_status = "blocked_credits"
         query_progress_live = progress_live and query_id in str(
             dune_progress.get("phase") or ""
         )
@@ -2661,6 +2953,9 @@ def _specialize_groups(
     by_id = {row["id"]: row for row in groups}
     tw_summary = _read_json(root / "data_tw_public/download_summary.json", {})
     tw_receipt = _read_json(root / "artifacts/data_refresh/tw_public/latest.json", {})
+    tw_events = _read_json(
+        root / "artifacts/data_refresh/tw_public/events/latest.json", {}
+    )
     tw = by_id.get("group:tw-public")
     if tw is not None and isinstance(tw_summary, Mapping):
         total = _integer(tw_summary.get("dataset_count")) or 0
@@ -2681,6 +2976,53 @@ def _specialize_groups(
         elif coverage_complete:
             tw["status"] = "stale"
             tw["status_label"] = "完整快照需要更新"
+        event_registered = (
+            _integer(tw_events.get("registered_dataset_count"))
+            if isinstance(tw_events, Mapping)
+            else None
+        )
+        event_observed = (
+            _integer(tw_events.get("observed_dataset_count"))
+            if isinstance(tw_events, Mapping)
+            else None
+        )
+        event_healthy = bool(
+            isinstance(tw_events, Mapping)
+            and tw_events.get("status") == "ok"
+            and tw_events.get("coverage_complete") is True
+            and event_registered is not None
+            and event_registered > 0
+            and event_observed == event_registered
+            and _integer(tw_events.get("failed_probe_count")) == 0
+            and _integer(tw_events.get("unapplied_event_count")) == 0
+        )
+        tw["event_monitor"] = {
+            "healthy": event_healthy,
+            "status": tw_events.get("status")
+            if isinstance(tw_events, Mapping)
+            else None,
+            "registered": event_registered,
+            "observed": event_observed,
+            "failed_probes": _integer(tw_events.get("failed_probe_count"))
+            if isinstance(tw_events, Mapping)
+            else None,
+            "unapplied_events": _integer(tw_events.get("unapplied_event_count"))
+            if isinstance(tw_events, Mapping)
+            else None,
+            "updated_at": tw_events.get("updated_at_taipei")
+            if isinstance(tw_events, Mapping)
+            else None,
+        }
+        tw["cadence"] = "來源事件每 60–300 秒；08:20/08:30 全量驗收"
+        tw["update_owner"] = "來源事件監測器＋不可變快照更新器"
+        if event_healthy and tw.get("status") == "current":
+            tw["status_label"] = "156/156 來源事件健康，快照完整最新"
+        elif not event_healthy:
+            tw["status"] = "degraded"
+            tw["status_label"] = "來源版本事件監測尚未全數健康"
+            tw["eta"] = _unknown_eta(
+                "running_unmeasured", "等待 156 項來源完成探測與事件套用。"
+            )
 
     pipeline_by_id = {
         str(row.get("id")): row
@@ -3284,7 +3626,13 @@ def build_data_monitor_public_status(
         else build_openbb_public_status(root)
     )
     service_states = (
-        _refresh_service_states()
+        _refresh_service_states(
+            snapshot_path=(
+                root / "artifacts/live/data_monitor/refresh_services.json"
+            ),
+            now=observed,
+            prefer_snapshot=True,
+        )
         if refresh_services is None
         else {str(key): dict(value) for key, value in refresh_services.items()}
     )

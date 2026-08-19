@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
-from datetime import datetime, time as datetime_time
+from datetime import datetime, time as datetime_time, timedelta
 import json
 import os
 from pathlib import Path
@@ -13,6 +13,7 @@ import select
 import sys
 import time as time_module
 from typing import Any
+import uuid
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -61,9 +62,82 @@ _LEGACY_SIGNAL_SCAN_CACHE: dict[
 ] = {}
 
 
+def _pending_signal_retry_delay_seconds(result: str, observed: datetime) -> float:
+    if result != "waiting_first_minute":
+        return 0.5
+    next_minute = observed.replace(second=0, microsecond=0) + timedelta(minutes=1)
+    return max(0.5, (next_minute - observed).total_seconds() + 0.05)
+
+
 def _repo_path(value: str | Path) -> Path:
     path = Path(value)
     return path if path.is_absolute() else REPO_ROOT / path
+
+
+def _write_preopen_readiness(
+    state_dir: Path,
+    *,
+    session_date: str,
+    component: str,
+    status: str,
+    observed: datetime,
+    elapsed_ms: float | None = None,
+    details: dict[str, Any] | None = None,
+    error: str | None = None,
+) -> dict[str, Any]:
+    """Atomically receipt the executor's independent pre-open dependencies."""
+
+    path = Path(state_dir) / "preopen_readiness.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError):
+        payload = {}
+    if not isinstance(payload, dict) or payload.get("session_date") != session_date:
+        payload = {
+            "schema_version": 1,
+            "session_date": session_date,
+            "simulation_only": True,
+            "production_order_possible": False,
+            "components": {},
+        }
+    components = payload.get("components")
+    if not isinstance(components, dict):
+        components = {}
+    components[component] = {
+        "status": str(status),
+        "checked_at": observed.isoformat(timespec="milliseconds"),
+        "elapsed_ms": (
+            round(max(0.0, float(elapsed_ms)), 3)
+            if elapsed_ms is not None
+            else None
+        ),
+        "details": dict(details or {}),
+        "error": error,
+    }
+    payload["components"] = components
+    component_statuses = {
+        str((components.get(name) or {}).get("status") or "pending")
+        for name in ("eligibility", "shioaji_quote")
+    }
+    payload["status"] = (
+        "failed"
+        if "failed" in component_statuses
+        else "ready"
+        if component_statuses == {"ready"}
+        else "warming"
+    )
+    payload["updated_at"] = observed.isoformat(timespec="milliseconds")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + f".tmp.{uuid.uuid4().hex}")
+    try:
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return payload
 
 
 def _fee_schedule(config: Any) -> TaiwanFeeSchedule:
@@ -720,8 +794,34 @@ def main(argv: list[str] | None = None) -> int:
                             f"elapsed_ms={slowest.get('elapsed_ms')}",
                             flush=True,
                         )
+                        _write_preopen_readiness(
+                            engine.state_dir,
+                            session_date=session_date_text,
+                            component="eligibility",
+                            status="ready",
+                            observed=datetime.now(TAIPEI),
+                            elapsed_ms=float(slowest.get("elapsed_ms") or 0.0),
+                            details={
+                                "proof": "exact_session_twse_tpex_coverage",
+                                "symbol_count": int(
+                                    slowest.get("symbol_count") or 0
+                                ),
+                                "markets": {
+                                    market: dict(row)
+                                    for market, row in eligibility_warm.items()
+                                },
+                            },
+                        )
                     eligibility_prewarmed_session = session_date_text
                 except Exception as exc:
+                    _write_preopen_readiness(
+                        engine.state_dir,
+                        session_date=session_date_text,
+                        component="eligibility",
+                        status="failed",
+                        observed=datetime.now(TAIPEI),
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
                     errors = {
                         **errors,
                         **{
@@ -816,15 +916,45 @@ def main(argv: list[str] | None = None) -> int:
             prewarm_started = time_module.perf_counter()
             try:
                 warm_shioaji_stock_quote_client()
+                prewarm_elapsed_ms = (
+                    time_module.perf_counter() - prewarm_started
+                ) * 1000.0
                 quote_client_warmed_session = prewarm_session
+                _write_preopen_readiness(
+                    engine.state_dir,
+                    session_date=prewarm_session,
+                    component="shioaji_quote",
+                    status="ready",
+                    observed=datetime.now(TAIPEI),
+                    elapsed_ms=prewarm_elapsed_ms,
+                    details={
+                        "proof": "simulation_client_usage_probe",
+                        "fresh_login_required_on_new_client": True,
+                    },
+                )
                 print(
                     "[tw-day-trade-sim] shioaji_prewarm=ready "
-                    f"elapsed_ms="
-                    f"{(time_module.perf_counter() - prewarm_started) * 1000.0:.3f}",
+                    f"elapsed_ms={prewarm_elapsed_ms:.3f}",
                     flush=True,
                 )
             except Exception as exc:
                 quote_client_prewarm_retry_after = time_module.monotonic() + 5.0
+                _write_preopen_readiness(
+                    engine.state_dir,
+                    session_date=prewarm_session,
+                    component="shioaji_quote",
+                    status="failed",
+                    observed=datetime.now(TAIPEI),
+                    elapsed_ms=(
+                        time_module.perf_counter() - prewarm_started
+                    )
+                    * 1000.0,
+                    details={
+                        "proof": "simulation_client_usage_probe",
+                        "retry_after_seconds": 5.0,
+                    },
+                    error=f"{type(exc).__name__}: {exc}",
+                )
                 print(
                     f"[tw-day-trade-sim] shioaji_prewarm=failed "
                     f"error={type(exc).__name__}: {exc}",
@@ -1008,7 +1138,10 @@ def main(argv: list[str] | None = None) -> int:
                 ledger_ms = (time_module.perf_counter() - ledger_started) * 1000.0
                 persisted_at = datetime.now(TAIPEI)
                 if result in {"waiting_quote", "waiting_first_minute"}:
-                    pending_retry_after[spec.market] = time_module.monotonic() + 0.5
+                    pending_retry_after[spec.market] = (
+                        time_module.monotonic()
+                        + _pending_signal_retry_delay_seconds(result, persisted_at)
+                    )
                 else:
                     pending_retry_after.pop(spec.market, None)
                     engine.record_latency_sample(

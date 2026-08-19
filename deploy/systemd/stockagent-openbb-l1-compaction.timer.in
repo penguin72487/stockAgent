@@ -1,0 +1,11 @@
+[Unit]
+Description=Incrementally compact completed OpenBB shards every 30 minutes
+
+[Timer]
+OnCalendar=*-*-* *:00,30:00
+RandomizedDelaySec=2min
+Persistent=true
+Unit=stockagent-openbb-l1-compaction.service
+
+[Install]
+WantedBy=timers.target

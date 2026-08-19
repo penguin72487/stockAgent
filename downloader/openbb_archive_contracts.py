@@ -12,6 +12,37 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 
+AUTHORITATIVE_UNAVAILABLE_EVIDENCE_MARKERS = (
+    "restricted endpoint",
+    "not available under your current subscription",
+    "not available under current subscription",
+    "premium query parameter",
+    "http 402",
+    "-> 402",
+    "payment required",
+    "permission to access the news api",
+    "missing credential",
+    "missing api key",
+    "api key is required",
+    "invalid api key",
+    "invalid registration key",
+    # FMP explicitly states that these retired routes are available only to
+    # subscriptions grandfathered before a named cutoff date.  This is stable
+    # route-capability evidence, not a transient 403.
+    "legacy endpoint",
+)
+
+
+def is_authoritative_unavailable_evidence(value: object) -> bool:
+    """Return whether text positively proves a stable capability denial."""
+    text = str(value or "").lower()
+    if not text:
+        return False
+    return any(
+        marker in text for marker in AUTHORITATIVE_UNAVAILABLE_EVIDENCE_MARKERS
+    ) or ("observed " in text and " distinct " in text and "zero successful" in text)
+
+
 PAGINATION_FIELD_NAMES = frozenset(
     {
         "all_pages",
@@ -57,6 +88,7 @@ MANIFEST_SOURCE_CAP_LIMITS: dict[str, int] = {
 ENTITLEMENT_CAPPED_NONPAGEABLE_CONTRACTS = frozenset(
     {
         ("equity.fundamental.employee_count", "fmp"),
+        ("equity.fundamental.historical_eps", "fmp"),
         ("equity.fundamental.metrics", "fmp"),
         ("equity.fundamental.ratios", "fmp"),
     }

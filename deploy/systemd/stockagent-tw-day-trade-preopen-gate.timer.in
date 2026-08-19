@@ -1,0 +1,15 @@
+[Unit]
+Description=Start and verify Taiwan stock paper simulation before 09:00
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 08:50:00 Asia/Taipei
+OnCalendar=Mon..Fri *-*-* 08:56:00 Asia/Taipei
+OnCalendar=Mon..Fri *-*-* 08:58:00 Asia/Taipei
+OnCalendar=Mon..Fri *-*-* 08:59:30 Asia/Taipei
+AccuracySec=1s
+RandomizedDelaySec=0
+Persistent=true
+Unit=stockagent-tw-day-trade-preopen-gate.service
+
+[Install]
+WantedBy=timers.target

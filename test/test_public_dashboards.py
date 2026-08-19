@@ -20,6 +20,7 @@ from scripts.serve_public_dashboards import (
     summarize_tw_status,
 )
 from stockagent.live.public_dashboards import (
+    PUBLIC_INITIAL_POSITION_ROWS,
     PUBLIC_MAX_EVENT_ROWS,
     TokenBucketRateLimiter,
     UnsafePublicDashboardPayload,
@@ -170,6 +171,43 @@ def test_tw_public_projection_scrubs_ids_paths_errors_and_bounds_events() -> Non
     assert "artifacts/" not in public["source_contract"]["preopen"]
 
 
+def test_tw_public_status_caps_initial_positions_without_mutating_source() -> None:
+    positions = [
+        {
+            "position_id": f"private-{index}",
+            "session_date": "2026-08-17",
+            "market": "tw_day_trade",
+            "symbol": str(index),
+            "target_weight": index / 1_000,
+            "signed_shares": 1_000,
+        }
+        for index in range(PUBLIC_INITIAL_POSITION_ROWS + 25)
+    ]
+    payload = {
+        "simulation_only": True,
+        "production_order_possible": False,
+        "positions": positions,
+        "marks": [
+            {"market": "tw_day_trade", "minute": f"2026-08-17T09:0{index}:00"}
+            for index in range(3)
+        ],
+        "payload_window": {"positions": len(positions), "marks": 3},
+    }
+
+    public = sanitize_tw_status(payload)
+
+    assert len(public["positions"]) == PUBLIC_INITIAL_POSITION_ROWS
+    assert public["payload_window"]["positions"] == len(positions)
+    assert [row["minute"] for row in public["marks"]] == [
+        "2026-08-17T09:01:00",
+        "2026-08-17T09:02:00",
+    ]
+    assert public["payload_window"]["marks"] == 3
+    assert len(payload["positions"]) == PUBLIC_INITIAL_POSITION_ROWS + 25
+    assert len(payload["marks"]) == 3
+    assert payload["positions"][0]["position_id"] == "private-0"
+
+
 def test_tw_signal_projection_removes_internal_signal_id() -> None:
     public = sanitize_tw_signals(
         {
@@ -181,14 +219,27 @@ def test_tw_signal_projection_removes_internal_signal_id() -> None:
                     "signal_id": "private",
                     "symbol": "2330",
                     "bid": float("nan"),
+                    "sizing_open_price": 100.0,
                 }
             ],
+            "opening_execution_audit": {
+                "tw_day_trade": {
+                    "nonzero_signal_count": 1,
+                    "opening_price_covered_count": 1,
+                }
+            },
         }
     )
     assert public == {
         "simulation_only": True,
         "production_order_possible": False,
-        "rows": [{"symbol": "2330", "bid": None}],
+        "opening_execution_audit": {
+            "tw_day_trade": {
+                "nonzero_signal_count": 1,
+                "opening_price_covered_count": 1,
+            }
+        },
+        "rows": [{"symbol": "2330", "bid": None, "sizing_open_price": 100.0}],
     }
     assert "private_runtime_state" not in public
     json.dumps(public, allow_nan=False)
@@ -562,7 +613,39 @@ def test_public_gateway_serves_shared_time_axis() -> None:
         response = PublicDashboardHandler._static_response(handler, "/time-axis.js")
         assert response is not None
         assert response.content_type == "text/javascript; charset=utf-8"
+        assert response.cache_control == "public, max-age=31536000, immutable"
         assert b"buildTimeAxis" in response.body
+    finally:
+        server.server_close()
+
+
+def test_data_monitor_summary_omits_heavy_detail_rows() -> None:
+    server = _test_server()
+    try:
+        full = server.cached_local_json(
+            cache_key="data-monitor-test-full",
+            ttl_seconds=60.0,
+            cache_control="no-store",
+            builder=lambda: {
+                "schema_version": 1,
+                "generated_at_utc": "2026-08-17T00:00:00+00:00",
+                "health": "active",
+                "read_only": True,
+                "production_control_possible": False,
+                "summary": {"registered_items": 390},
+                "endpoint_inventory": {"total": 390},
+                "provider_summaries": [{"provider": "fixture"}],
+                "definitions": {"freshness": "fixture"},
+                "groups": [{"id": "large"}],
+                "sources": [{"endpoint_id": "private-heavy-row"}],
+            },
+        )
+        server.data_monitor_status = lambda **_kwargs: full  # type: ignore[method-assign]
+        summary = json.loads(server.data_monitor_summary().body)
+        assert summary["summary"]["registered_items"] == 390
+        assert "groups" not in summary
+        assert "sources" not in summary
+        assert "private-heavy-row" not in json.dumps(summary)
     finally:
         server.server_close()
 
@@ -659,6 +742,14 @@ def test_caddy_and_gateway_security_policy_stay_aligned() -> None:
     assert 'MALLOC_ARENA_MAX="${MALLOC_ARENA_MAX:-2}"' in launcher
     assert 'Environment="MALLOC_ARENA_MAX=2"' in unit
     assert "systemctl restart stockagent-public-dashboards.service" in installer
+    snapshot_unit = (
+        root
+        / "deploy/systemd/stockagent-data-refresh-status-snapshot.service.in"
+    ).read_text(encoding="utf-8")
+    assert "RestrictAddressFamilies=AF_UNIX" in snapshot_unit
+    assert "ReadWritePaths=__REPO_ROOT__/artifacts/live/data_monitor" in snapshot_unit
+    assert "AF_UNIX" not in unit
+    assert "stockagent-data-refresh-status-snapshot.timer" in installer
 
 
 def test_expired_cache_returns_stale_while_refreshing_in_background() -> None:

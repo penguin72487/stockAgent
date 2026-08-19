@@ -158,6 +158,82 @@ STOCKAGENT_SYNC_NODE_ID=penguin \
   --sync-root /srv/stockagent-packed
 ```
 
+## 自助式冷庫與七日工作集
+
+`/srv/stockagent-packed` 是唯一需要長期保存與同步的冷庫；
+`/srv/stockagent-packed-materialized` 只是可刪除的本機工作集。狀態機是：
+
+```text
+COLD_ONLY -- use/完整驗證 --> HOT -- 7 天未續租 --> COLD_ONLY
+                       \-- 再次 use：O(1) ready proof + 續租
+```
+
+查看每個資料集的冷庫大小、解封狀態、版本與到期時間：
+
+```bash
+./scripts/run_data_cache.sh status
+./scripts/run_data_cache.sh status tw-public
+```
+
+自行解封最新版本並取得路徑：
+
+```bash
+./scripts/run_data_cache.sh use tw-public
+
+data_path="$(./scripts/run_data_cache.sh use tw-public --path-only)"
+printf 'training data: %s\n' "$data_path"
+```
+
+每次 `use` 都把七日租約重新起算。工具也會維護穩定連結：
+
+```text
+/srv/stockagent-packed-materialized/current/<dataset>
+```
+
+若既有訓練程式要求固定路徑，可在完整驗證後原子切換一個**既有 symlink**；
+工具拒絕覆蓋實體目錄：
+
+```bash
+./scripts/run_data_cache.sh use tw-public \
+  --link /root/stockAgent/data_tw_public
+```
+
+想重新做完整逐檔 SHA 驗證時加 `--verify`。平常重複 `use` 只驗 READY proof，
+不會每次重讀十萬個檔案。
+
+手動預覽或執行清理：
+
+```bash
+./scripts/run_data_cache.sh gc --dry-run
+./scripts/run_data_cache.sh gc
+./scripts/run_data_cache.sh evict tw-public --dry-run
+```
+
+自動清理只會刪除同時符合以下條件的 materialized tree：
+
+- 租約超過七天；
+- packed manifest 與全部 cold objects 仍在本機；
+- materialization READY proof 與 manifest 相符；
+- 沒有 `.pin.json` 保護；
+- `/proc` 中沒有程序的 fd、mmap、cwd、root 或 executable 指向該 tree。
+
+安裝每日 timer；有 systemd 時安裝 timer，vast.ai container 則安裝 cron fallback：
+
+```bash
+sudo ./scripts/install_data_cache_gc_service.sh
+```
+
+新資料的增量冷存仍使用既有發布入口。固定 hash bucket 與 content-addressed
+blob 使未改變物件直接重用，只傳輸變動 bucket/blob：
+
+```bash
+./scripts/run_downloader_with_release.sh tw-public /srv/stockagent-packed -- \
+  ./downloader/run_daily_all_markets.sh
+```
+
+冷庫 manifest、objects、heads 不受工作集 GC 影響；GC 不會刪
+`/srv/stockagent-packed` 內任何資料。
+
 垃圾回收目前刻意只有報告，沒有自動刪除。必須先確認所有節點已收到所有 manifests、
 保留版本政策已決定，才可另行加入可恢復的 GC。
 

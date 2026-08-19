@@ -2,6 +2,7 @@
 Description=Run the unified 08:30 Taiwan official-data acceptance gate
 Wants=network-online.target time-sync.target
 After=network-online.target time-sync.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=oneshot
@@ -15,6 +16,8 @@ Nice=0
 CPUWeight=100
 IOWeight=100
 TimeoutStartSec=4h
+Restart=on-failure
+RestartSec=1min
 
 [Install]
 WantedBy=multi-user.target

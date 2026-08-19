@@ -1,8 +1,16 @@
 "use strict";
 
 const REFRESH_MS = 10000;
+const FULL_REFRESH_TICKS = 6;
+const SOURCE_PAGE_SIZE = 100;
 const FETCH_TIMEOUT_MS = 15000;
-const state = {data: null, refreshInFlight: false};
+const state = {
+  data: null,
+  refreshInFlight: false,
+  refreshTick: 0,
+  visibleRows: SOURCE_PAGE_SIZE,
+  heavyRevision: "",
+};
 const $ = (id) => document.getElementById(id);
 const DETAIL_LINKS = new Set(["../shioaji/", "../openbb/"]);
 
@@ -357,13 +365,27 @@ function filteredRows() {
   }));
 }
 
-function renderRows() {
+function renderRows({reset = false} = {}) {
+  if (reset) state.visibleRows = SOURCE_PAGE_SIZE;
   const rows = filteredRows();
+  const visible = rows.slice(0, state.visibleRows);
   const fragment = document.createDocumentFragment();
-  for (const row of rows) fragment.append(tableRow(row));
+  for (const row of visible) fragment.append(tableRow(row));
   $("source-rows").replaceChildren(fragment);
-  $("result-count").textContent = `顯示 ${formatInteger(rows.length)}／${formatInteger(state.data?.sources?.length || 0)} 項`;
+  $("result-count").textContent = `顯示 ${formatInteger(visible.length)}／${formatInteger(rows.length)} 項符合結果 · 全部 ${formatInteger(state.data?.sources?.length || 0)} 項`;
+  $("load-more").hidden = visible.length >= rows.length;
   $("empty-state").hidden = rows.length !== 0;
+}
+
+function heavyRevision(data) {
+  return JSON.stringify([
+    data.groups,
+    (data.sources || []).map((row) => [
+      row.endpoint_id, row.id, row.status, row.operation_state,
+      row.execution_state, row.coverage, row.eta, row.data_through,
+      row.rows, row.last_verified_at_utc, row.automation, row.warnings,
+    ]),
+  ]);
 }
 
 async function fetchJson(path) {
@@ -379,16 +401,22 @@ async function fetchJson(path) {
   return response.json();
 }
 
-async function refresh() {
+async function refresh({details = false} = {}) {
   if (document.hidden || state.refreshInFlight) return;
   state.refreshInFlight = true;
   try {
-    const data = await fetchJson("api/status");
-    state.data = data;
+    const data = await fetchJson(details ? "api/status" : "api/summary");
     renderSummary(data);
-    renderGroups(data.groups || []);
-    populateProviders(data.sources || []);
-    renderRows();
+    if (details) {
+      state.data = data;
+      const revision = heavyRevision(data);
+      if (revision !== state.heavyRevision) {
+        state.heavyRevision = revision;
+        renderGroups(data.groups || []);
+        populateProviders(data.sources || []);
+        renderRows({reset: true});
+      }
+    }
   } catch (_error) {
     setHealth($("overall-health"), "unavailable", "監控 API 暫時離線");
   } finally {
@@ -397,9 +425,16 @@ async function refresh() {
 }
 
 for (const id of ["search", "provider-filter", "status-filter", "granularity-filter", "scope-filter"]) {
-  $(id).addEventListener(id === "search" ? "input" : "change", renderRows);
+  $(id).addEventListener(id === "search" ? "input" : "change", () => renderRows({reset: true}));
 }
+$("load-more").addEventListener("click", () => {
+  state.visibleRows += SOURCE_PAGE_SIZE;
+  renderRows();
+});
 $("filters").addEventListener("submit", (event) => event.preventDefault());
-document.addEventListener("visibilitychange", () => { if (!document.hidden) void refresh(); });
-void refresh();
-window.setInterval(() => void refresh(), REFRESH_MS);
+document.addEventListener("visibilitychange", () => { if (!document.hidden) void refresh({details: true}); });
+void refresh({details: true});
+window.setInterval(() => {
+  state.refreshTick += 1;
+  void refresh({details: state.refreshTick % FULL_REFRESH_TICKS === 0});
+}, REFRESH_MS);

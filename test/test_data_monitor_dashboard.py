@@ -1,11 +1,17 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import json
 from pathlib import Path
 
 from stockagent.live import data_monitor_dashboard as dashboard
 from stockagent.live.data_monitor_dashboard import build_data_monitor_public_status
+
+
+def test_date_only_coverage_is_measured_through_end_of_day() -> None:
+    parsed = dashboard._parse_time("2026-08-17")
+
+    assert parsed == datetime(2026, 8, 17, 23, 59, 59, tzinfo=UTC)
 
 
 def test_data_monitor_registers_catalog_and_marks_stale_receipt(tmp_path: Path) -> None:
@@ -151,6 +157,40 @@ def test_sequential_service_does_not_mark_future_provider_stage_active(
     assert payload["groups"][0]["operation_state"] == "unable"
 
 
+def test_refresh_services_use_fresh_sanitized_snapshot(
+    monkeypatch, tmp_path: Path
+) -> None:
+    snapshot = tmp_path / "refresh_services.json"
+    snapshot.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "generated_at_utc": "2026-08-18T02:00:00+00:00",
+                "services": {
+                    "registered_daily": {
+                        "active": False,
+                        "state": "failed",
+                        "result": "exit-code",
+                        "timer_active": True,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(dashboard, "_systemd_property_sets", lambda *_: {})
+
+    states = dashboard._refresh_service_states(
+        snapshot_path=snapshot,
+        now=datetime(2026, 8, 18, 2, 1, tzinfo=UTC),
+        prefer_snapshot=True,
+    )
+
+    assert states["registered_daily"]["state"] == "failed"
+    assert states["registered_daily"]["timer_active"] is True
+    assert states["registered_daily"]["evidence_source"] == "systemd_snapshot"
+
+
 def test_data_monitor_page_is_local_read_only_and_exposes_progress() -> None:
     root = Path(__file__).resolve().parents[1] / "services/data_monitor_dashboard"
     html = (root / "index.html").read_text(encoding="utf-8")
@@ -162,7 +202,10 @@ def test_data_monitor_page_is_local_read_only_and_exposes_progress() -> None:
     assert 'id="overall-progress"' in html
     assert 'id="source-rows"' in html
     assert "http://" not in html and "https://" not in html
-    assert 'fetchJson("api/status")' in javascript
+    assert 'details ? "api/status" : "api/summary"' in javascript
+    assert "FULL_REFRESH_TICKS = 6" in javascript
+    assert "SOURCE_PAGE_SIZE = 100" in javascript
+    assert 'id="load-more"' in html
     assert "textContent" in javascript
     assert "remaining_seconds" in javascript
     assert "OPERATION_ORDER" in javascript
@@ -297,6 +340,42 @@ def test_data_monitor_reuses_prebuilt_dependency_snapshots(
         openbb_status={},
     )
     assert payload["read_only"] is True
+
+
+def test_data_monitor_registers_openbb_l1_compaction_progress(tmp_path: Path) -> None:
+    now = datetime(2026, 8, 18, 2, 0, tzinfo=UTC)
+    registry = tmp_path / "configs/data_sync/packed_datasets.json"
+    registry.parent.mkdir(parents=True)
+    registry.write_text(json.dumps({"datasets": []}), encoding="utf-8")
+    payload = dashboard.build_data_monitor_public_status(
+        tmp_path,
+        now=now,
+        refresh_services={},
+        shioaji_status={"pipelines": []},
+        openbb_status={
+            "providers": [],
+            "l1_compaction": {
+                "generated_at_utc": (now - timedelta(minutes=5)).isoformat(),
+                "source_age_seconds": 300,
+                "success_files": 50_000,
+                "compacted_files": 10_000,
+                "compacted_rows": 123_456,
+                "pending_files": 40_000,
+                "active_segments": 5,
+                "source_bytes": 1_000_000,
+                "output_bytes": 250_000,
+                "l0_deleted": False,
+            },
+        },
+    )
+    row = next(
+        item for item in payload["sources"] if item["id"] == "openbb:l1-compaction"
+    )
+    assert row["status"] == "waiting"
+    assert row["coverage"]["current"] == 10_000
+    assert row["coverage"]["total"] == 50_000
+    assert row["eta"]["remaining_seconds"] == 3600
+    assert "75.00%" in row["detail"]
 
 
 def test_free_public_registry_maps_one_source_to_multiple_datasets(

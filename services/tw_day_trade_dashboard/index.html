@@ -28,7 +28,7 @@
     <div>
       <p class="eyebrow">TW STOCKS · PUBLIC READ-ONLY SIMULATION</p>
       <h1>台股四模式當沖模擬</h1>
-      <p class="subtitle">先看四模式結果與風險，再下鑽到訊號、成交和執行進度。</p>
+      <p class="subtitle">先看執行進度與盤前守門，再下鑽到四模式結果、訊號和成交。</p>
     </div>
     <div id="connection-status" class="healthbox" role="status" aria-live="polite">
       <small>資料狀態</small>
@@ -39,18 +39,41 @@
   </header>
 
   <nav class="jump-nav" aria-label="本頁快速導覽">
+    <a href="#operations">執行進度</a>
     <a href="#overview">交易日總覽</a>
     <a href="#performance">策略與基準</a>
     <a href="#details">持倉與訊號</a>
-    <a href="#operations">執行進度</a>
     <a href="#audit">資料稽核</a>
   </nav>
 
   <main id="main-content">
     <section id="alert" class="alert hidden" role="alert" aria-live="assertive"></section>
 
+    <div id="operations" class="section-intro">
+      <div><span>01</span><h2>執行進度</h2></div>
+      <p>先回答「流程走到哪裡」，再看績效與明細。</p>
+    </div>
+    <section class="panel operations-panel">
+      <div class="panel-head">
+        <div><h2>今日端到端速度、預熱與執行進度</h2><p>從訊號輸入到模擬帳本耐久落盤；這不是券商回報或交易所往返時間</p></div>
+        <span id="operation-source" class="count">—</span>
+      </div>
+      <div id="latency-kpis" class="latency-kpis" aria-label="所選交易日端到端延遲"></div>
+      <div id="operation-kpis" class="operation-kpis"></div>
+      <div class="operation-body">
+        <div>
+          <h3>工作流程</h3>
+          <div id="workflow-progress" class="progress-list"></div>
+        </div>
+        <div>
+          <h3>四模式盤前預熱測速（不等同該日執行完成）</h3>
+          <div id="preopen-progress" class="progress-list"></div>
+        </div>
+      </div>
+    </section>
+
     <div id="overview" class="section-intro">
-      <div><span>01</span><h2>所選交易日是否可解讀</h2></div>
+      <div><span>02</span><h2>所選交易日是否可解讀</h2></div>
       <p>資料狀態、完成模式、持倉與損益先於技術流程。</p>
     </div>
     <section id="overview-kpis" class="overview-kpis" aria-label="所選交易日核心摘要" aria-busy="true">
@@ -61,7 +84,7 @@
     </section>
 
     <div id="performance" class="section-intro">
-      <div><span>02</span><h2>四模式與市場基準</h2></div>
+      <div><span>03</span><h2>四模式與市場基準</h2></div>
       <p>先分開看策略與市場；每條線都用自己的資金基準。</p>
     </div>
     <section id="mode-cards" class="mode-grid" aria-label="四模式績效卡片"></section>
@@ -72,7 +95,7 @@
     <section id="benchmark-cards" class="benchmark-grid" aria-label="市場基準績效卡片"></section>
 
     <div id="details" class="section-intro">
-      <div><span>03</span><h2>持倉與訊號下鑽</h2></div>
+      <div><span>04</span><h2>持倉與訊號下鑽</h2></div>
       <p>篩選只影響比較圖與下方明細，不會改變原始帳本。</p>
     </div>
     <section class="controls panel" aria-label="明細篩選">
@@ -126,33 +149,10 @@
     </section>
 
     <section class="panel table-panel">
-	      <div class="panel-head"><div><h2>所有訊號</h2><p>伺服器分頁，依 |目標權重| 由大到小；已成交訊號連結同日持倉，權益影響率＝該檔淨損益 ÷ 所屬模式目前總權益</p></div><div class="table-actions"><span id="signal-count" class="count"></span><button id="load-more-signals" class="secondary hidden" type="button">載入更多</button></div></div>
+	      <div class="panel-head"><div><h2>所有訊號</h2><p>依 |目標權重| 由大到小；每個非零訊號都顯示開盤計價，未成交會保留整張、資格、方向平衡等原因，不會偽造成交</p></div><div class="table-actions"><span id="signal-count" class="count"></span><button id="load-more-signals" class="secondary hidden" type="button">載入更多</button></div></div>
 	      <div id="signal-direction-summary" class="direction-summary"></div>
 	      <div class="scroll-hint" aria-hidden="true">窄螢幕可左右滑動查看訊號細節 →</div>
-	      <div class="table-scroll" tabindex="0" role="region" aria-label="所有訊號"><table class="compact-table signal-table"><thead><tr><th>時間／模式</th><th>股票／方向／結果</th><th>分數／權重</th><th>進場成本／成交</th><th>現在市價／該檔盈虧</th><th>損益／模式總權益</th></tr></thead><tbody id="signal-body"></tbody></table></div>
-    </section>
-
-    <div id="operations" class="section-intro">
-      <div><span>04</span><h2>執行進度</h2></div>
-      <p>這裡回答「流程走到哪裡」，不是績效結論。</p>
-    </div>
-    <section class="panel operations-panel">
-      <div class="panel-head">
-        <div><h2>今日端到端速度、預熱與執行進度</h2><p>從訊號輸入到模擬帳本耐久落盤；這不是券商回報或交易所往返時間</p></div>
-        <span id="operation-source" class="count">—</span>
-      </div>
-      <div id="latency-kpis" class="latency-kpis" aria-label="所選交易日端到端延遲"></div>
-      <div id="operation-kpis" class="operation-kpis"></div>
-      <div class="operation-body">
-        <div>
-          <h3>工作流程</h3>
-          <div id="workflow-progress" class="progress-list"></div>
-        </div>
-        <div>
-          <h3>四模式盤前預熱測速（不等同該日執行完成）</h3>
-          <div id="preopen-progress" class="progress-list"></div>
-        </div>
-      </div>
+	      <div class="table-scroll" tabindex="0" role="region" aria-label="所有訊號"><table class="compact-table signal-table"><thead><tr><th>時間／模式</th><th>股票／方向／結果</th><th>分數／權重</th><th>開盤計價／市價成交</th><th>現在市價／該檔盈虧</th><th>損益／模式總權益</th></tr></thead><tbody id="signal-body"></tbody></table></div>
     </section>
 
     <div id="audit" class="section-intro">
@@ -171,6 +171,6 @@
     </section>
   </main>
   <script src="../time-axis.js?v=4" defer></script>
-  <script src="app.js?v=27" defer></script>
+  <script src="app.js?v=30" defer></script>
 </body>
 </html>

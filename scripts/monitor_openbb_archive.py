@@ -24,6 +24,7 @@ try:
         ENTITLEMENT_CAPPED_NONPAGEABLE_CONTRACTS,
         FMP_MANIFEST_PAGINATED_ENDPOINTS,
         MANIFEST_SOURCE_CAP_LIMITS,
+        is_authoritative_unavailable_evidence,
     )
 except ModuleNotFoundError:  # Direct execution from scripts/.
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -32,6 +33,7 @@ except ModuleNotFoundError:  # Direct execution from scripts/.
         ENTITLEMENT_CAPPED_NONPAGEABLE_CONTRACTS,
         FMP_MANIFEST_PAGINATED_ENDPOINTS,
         MANIFEST_SOURCE_CAP_LIMITS,
+        is_authoritative_unavailable_evidence,
     )
 
 from stockagent.live.openbb_archive_dashboard import project_openbb_history_row
@@ -636,27 +638,7 @@ def _is_authoritative_unavailable_evidence(value: object) -> bool:
     the absence of a timeout marker. Keep this predicate deliberately narrow:
     quota, transport, and adaptable query-boundary messages never satisfy it.
     """
-    text = str(value or "").lower()
-    if not text:
-        return False
-    return any(
-        marker in text
-        for marker in (
-            "restricted endpoint",
-            "not available under your current subscription",
-            "not available under current subscription",
-            "premium query parameter",
-            "http 402",
-            "-> 402",
-            "payment required",
-            "permission to access the news api",
-            "missing credential",
-            "missing api key",
-            "api key is required",
-            "invalid api key",
-            "invalid registration key",
-        )
-    ) or ("observed " in text and " distinct " in text and "zero successful" in text)
+    return is_authoritative_unavailable_evidence(value)
 
 
 def _provider_capability_evidence(

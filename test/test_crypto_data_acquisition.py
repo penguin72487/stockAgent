@@ -12,6 +12,7 @@ from downloader.download_crypto_keyed_context import (
     _coingecko_catalog_frame,
     _coingecko_market_frame,
     _dataset_due,
+    _etherscan_frame,
 )
 from stockagent.live.data_monitor_dashboard import build_data_monitor_public_status
 
@@ -169,6 +170,18 @@ def test_coingecko_normalization_uses_provider_id_not_ambiguous_symbol() -> None
     assert catalog.filter(pl.col("asset_id") == "asset-one")["platforms_json"].item() == (
         '{"ethereum": "0x1"}'
     )
+
+
+def test_etherscan_wei_supply_preserves_arbitrary_precision_as_decimal() -> None:
+    supply = "1234567890123456789012345678901234567890"
+
+    frame = _etherscan_frame(
+        {"result": {"LastBlock": "123", "SafeGasPrice": "1"}},
+        {"status": "1", "result": supply},
+    )
+
+    assert frame.schema["ether_supply_wei"] == pl.String
+    assert frame["ether_supply_wei"].item() == supply
 
 
 def test_cadence_receipt_prevents_duplicate_requests(tmp_path: Path) -> None:

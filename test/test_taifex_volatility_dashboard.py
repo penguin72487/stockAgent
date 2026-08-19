@@ -5,9 +5,14 @@ import hashlib
 import json
 from pathlib import Path
 import re
+import threading
+import time
 
 import pytest
 
+from scripts import serve_shioaji_taifex_simulation_dashboard as dashboard_server
+
+from stockagent.live import taifex_volatility_dashboard as taifex_dashboard
 from stockagent.live.taifex_volatility_dashboard import (
     _performance_metrics,
     build_dashboard_history_snapshot,
@@ -18,6 +23,80 @@ from stockagent.live.taifex_volatility_dashboard import (
 def _write_json(path: Path, payload: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+
+
+def test_history_server_returns_verified_stale_curve_while_refreshing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = 0
+    refreshed = threading.Event()
+
+    def build_history(**_kwargs: object) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            refreshed.set()
+        return {
+            "dashboard_schema_version": 7,
+            "generated_at_utc": f"2026-08-17T00:00:0{calls}+00:00",
+            "source_updated_at_utc": "2026-08-17T00:00:00+00:00",
+            "range": "1d",
+            "range_seconds": 86400,
+            "anchor_at_utc": "2026-08-17T00:00:00+00:00",
+            "coverage_start_utc": "2026-08-17T00:00:00+00:00",
+            "coverage_end_utc": "2026-08-17T00:00:00+00:00",
+            "downsampled": False,
+            "backfills": [],
+            "history": [
+                {
+                    "strategy_id": "fixture",
+                    "decision_ts_ns": calls,
+                    "fixed_capital_return": 0.0,
+                }
+            ],
+            "record_counts": {"history_rows_returned": 1},
+        }
+
+    monkeypatch.setattr(
+        dashboard_server, "build_dashboard_history_snapshot", build_history
+    )
+    server = dashboard_server.DashboardHTTPServer(
+        ("127.0.0.1", 0),
+        state_dir=tmp_path,
+        api_receipt_dir=tmp_path,
+        static_root=tmp_path,
+        mark_limit_per_strategy=10,
+    )
+    try:
+        first = server.history_snapshot(range_key="1d")
+        server._history_cache["1d"] = (time.monotonic() - 60.0, first)
+        stale = server.history_snapshot(range_key="1d")
+        assert stale == first
+        assert refreshed.wait(1.0)
+        deadline = time.monotonic() + 1.0
+        while server._history_cache["1d"][1] == first:
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        assert calls == 2
+    finally:
+        server.server_close()
+
+
+def test_direct_history_projection_omits_default_and_null_fields() -> None:
+    assert dashboard_server._display_history_row(
+        {
+            "strategy_id": "fixture",
+            "decision_ts_ns": 123,
+            "cumulative_pnl_twd": 10.0,
+            "history_source": "live_forward_ledger",
+            "replay_id": None,
+            "private": "must-not-leak",
+        }
+    ) == {
+        "strategy_id": "fixture",
+        "decision_ts_ns": 123,
+        "cumulative_pnl_twd": 10.0,
+    }
 
 
 def _fixture(tmp_path: Path, *, age_seconds: float = 2.0) -> tuple[Path, Path]:
@@ -276,6 +355,121 @@ def test_dedicated_history_snapshot_is_range_aware_and_bounded(tmp_path: Path) -
     }
     assert history["history"][-1] == full["history"][-1]
     assert history["record_counts"] == {"history_rows_returned": 16}
+
+
+def test_modern_bounded_history_fast_reader_matches_canonical_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if taifex_dashboard.pl is None:
+        pytest.skip("Polars fast reader is unavailable")
+    state_dir, _receipts = _fixture(tmp_path)
+    mark_path = state_dir / "marks.jsonl"
+    rows = [json.loads(line) for line in mark_path.read_text().splitlines()]
+    for row in rows:
+        row["valuation_available"] = True
+        row["valuation_carried_forward"] = False
+    mark_path.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+    selected = taifex_dashboard._filtered_history_rows_polars(
+        mark_path,
+        minimum_decision_ts_ns=min(int(row["decision_ts_ns"]) for row in rows),
+    )
+    assert selected is not None
+    assert len(selected) == len(rows)
+
+    now = datetime(2026, 8, 12, 1, 30, tzinfo=timezone.utc)
+    fast = build_dashboard_history_snapshot(
+        state_dir=state_dir,
+        now=now,
+        mark_limit_per_strategy=8,
+        range_key="1d",
+    )
+    monkeypatch.setattr(taifex_dashboard, "pl", None)
+    fallback = build_dashboard_history_snapshot(
+        state_dir=state_dir,
+        now=now,
+        mark_limit_per_strategy=8,
+        range_key="1d",
+    )
+    assert fast == fallback
+
+
+def test_fast_reader_defers_legacy_valuation_carry_to_canonical_path(
+    tmp_path: Path,
+) -> None:
+    if taifex_dashboard.pl is None:
+        pytest.skip("Polars fast reader is unavailable")
+    state_dir, _receipts = _fixture(tmp_path)
+    mark_path = state_dir / "marks.jsonl"
+    assert (
+        taifex_dashboard._filtered_history_rows_polars(
+            mark_path,
+            minimum_decision_ts_ns=0,
+        )
+        is None
+    )
+
+
+def test_bounded_fast_reader_preserves_pre_window_valuation_seed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if taifex_dashboard.pl is None:
+        pytest.skip("Polars fast reader is unavailable")
+    state_dir, _receipts = _fixture(tmp_path)
+    now = datetime(2026, 8, 12, 1, 30, tzinfo=timezone.utc)
+    seed_ns = int((now - timedelta(days=2)).timestamp() * 1e9)
+    current_ns = int(now.timestamp() * 1e9)
+    common = {
+        "strategy_id": "classic_opening_straddle",
+        "active_cycle_id": "same-cycle",
+        "gross_cash_twd": 0.0,
+        "open_liquidation_value_twd": 100.0,
+        "fixed_fees_twd": 0.0,
+        "transaction_tax_twd": 0.0,
+        "futures_position": 0,
+        "underlying_futures_position": 0,
+        "valuation_available": True,
+    }
+    rows = [
+        {
+            **common,
+            "decision_ts_ns": seed_ns,
+            "option_books_valid": True,
+            "future_book_valid": True,
+            "valuation_carried_forward": False,
+        },
+        {
+            **common,
+            "decision_ts_ns": current_ns,
+            "option_books_valid": False,
+            "future_book_valid": True,
+            "valuation_carried_forward": True,
+        },
+    ]
+    (state_dir / "marks.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+    fast = build_dashboard_history_snapshot(
+        state_dir=state_dir,
+        now=now,
+        range_key="1d",
+    )
+    monkeypatch.setattr(taifex_dashboard, "pl", None)
+    fallback = build_dashboard_history_snapshot(
+        state_dir=state_dir,
+        now=now,
+        range_key="1d",
+    )
+    assert fast == fallback
+    assert len(fast["history"]) == 1
+    assert fast["history"][0]["valuation_age_seconds"] == 2 * 24 * 60 * 60
 
 
 def test_history_snapshot_merges_receipted_backfill_and_prefers_live_on_collision(

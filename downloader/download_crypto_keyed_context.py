@@ -764,7 +764,11 @@ def _etherscan_frame(gas_payload: Any, supply_payload: Any | None) -> pl.DataFra
         )
     if isinstance(supply_payload, dict) and str(supply_payload.get("status")) == "1":
         try:
-            row["ether_supply_wei"] = int(supply_payload.get("result"))
+            # Wei totals exceed signed 64-bit and may be inferred by Arrow as
+            # an int128 extension that Polars cannot ingest. Preserve the exact
+            # integer as a canonical decimal string; consumers can choose their
+            # own arbitrary-precision representation without float loss.
+            row["ether_supply_wei"] = str(int(supply_payload.get("result")))
         except (TypeError, ValueError, OverflowError):
             row["ether_supply_wei"] = None
     return pl.DataFrame([row], infer_schema_length=None)

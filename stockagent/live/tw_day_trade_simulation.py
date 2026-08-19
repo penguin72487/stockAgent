@@ -2301,6 +2301,25 @@ class TwDayTradeSimulationEngine:
             mode["engine_status"] = "waiting_causally_later_quote"
             self._persist(observed)
             return "waiting_quote"
+        if (
+            actionable_symbols
+            and wall_time >= FIRST_MINUTE_EXECUTION_TIME
+            and all(
+                _finite(quotes.get(symbol, {}).get("minute_volume_lots")) is None
+                for symbol in actionable_symbols
+            )
+        ):
+            # After 09:01, displayed depth alone is insufficient: entry also
+            # needs an isolated completed-minute volume budget.  A process
+            # restart has no adjacent cumulative-volume baseline on its first
+            # observation, so keep the signal pending until the next minute
+            # instead of consuming the one allowed daily entry as false-flat.
+            mode["pending_signal_id"] = signal_id
+            mode["pending_signal_at"] = signal_at.isoformat(timespec="seconds")
+            mode["pending_wait_reason"] = "completed_minute_liquidity_unavailable"
+            mode["engine_status"] = "waiting_completed_minute_liquidity"
+            self._persist(observed)
+            return "waiting_first_minute"
 
         security_types = []
         symbols = []
@@ -2355,6 +2374,7 @@ class TwDayTradeSimulationEngine:
         ) or "09:00_fresh_level_one_depth_then_minimum_with_50pct_completed_minute_volume"
         mode["positions"] = {}
         mode["entry_completed_at"] = observed.isoformat(timespec="seconds")
+        mode.pop("pending_wait_reason", None)
         mode["exit_limit_submitted_at"] = None
         mode["force_exit_started_at"] = None
         mode["closing_auction_submitted_at"] = None

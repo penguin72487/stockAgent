@@ -183,12 +183,16 @@ def _is_excluded(relative: str, excluded_subtrees: tuple[str, ...]) -> bool:
 
 
 def _collect_entries(
-    source: Path, *, excluded_subtrees: tuple[str, ...] = ()
+    source: Path,
+    *,
+    excluded_subtrees: tuple[str, ...] = (),
+    maximum_file_bytes: int | None = None,
 ) -> tuple[list[_SourceEntry], dict[str, Any]]:
     entries: list[_SourceEntry] = []
     portable = hashlib.sha256()
     stability = hashlib.sha256()
     files = directories = symlinks = logical_bytes = 0
+    omitted_files = omitted_bytes = 0
 
     def update_summary(
         relative: str, kind: str, info: os.stat_result, extra: str
@@ -262,6 +266,10 @@ def _collect_entries(
                 continue
             info = path.lstat()
             if stat.S_ISREG(info.st_mode):
+                if maximum_file_bytes is not None and info.st_size > maximum_file_bytes:
+                    omitted_files += 1
+                    omitted_bytes += int(info.st_size)
+                    continue
                 update_summary(relative, "F", info, "")
                 entries.append(
                     _SourceEntry(
@@ -292,6 +300,8 @@ def _collect_entries(
         "directories": directories,
         "symlinks": symlinks,
         "logical_bytes": logical_bytes,
+        "omitted_files_above_maximum": omitted_files,
+        "omitted_bytes_above_maximum": omitted_bytes,
         "portable_fingerprint_sha256": portable.hexdigest(),
         "stability_fingerprint_sha256": stability.hexdigest(),
     }
@@ -683,6 +693,7 @@ def publish_packed_snapshot(
     max_clock_skew_seconds: int = DEFAULT_MAX_CLOCK_SKEW_SECONDS,
     metadata: Mapping[str, str] | None = None,
     excluded_subtrees: Iterable[str] = (),
+    maximum_file_bytes: int | None = None,
     repo_root: Path | None = None,
 ) -> ResolvedSnapshot:
     sync_root = sync_root.resolve()
@@ -696,6 +707,8 @@ def publish_packed_snapshot(
         raise SnapshotError("pack_buckets must be between 1 and 4096")
     if not 0 <= compression_level <= 9:
         raise SnapshotError("compression_level must be between 0 and 9")
+    if maximum_file_bytes is not None and maximum_file_bytes < 0:
+        raise SnapshotError("maximum_file_bytes must be non-negative")
     excluded = _normalize_excluded_subtrees(excluded_subtrees)
     node_identity = sync_root / ".local-state" / "node-id"
     initialize_packed_layout(
@@ -707,7 +720,9 @@ def publish_packed_snapshot(
 
     with _exclusive_lock(lock_path):
         entries, before = _collect_entries(
-            source, excluded_subtrees=excluded
+            source,
+            excluded_subtrees=excluded,
+            maximum_file_bytes=maximum_file_bytes,
         )
         staging_root = sync_root / ".local-state" / "staging"
         staging_root.mkdir(parents=True, exist_ok=True)
@@ -795,7 +810,11 @@ def publish_packed_snapshot(
             inventory_temp, inventory_path, expected_sha256=inventory_sha
         )
 
-        _, after = _collect_entries(source, excluded_subtrees=excluded)
+        _, after = _collect_entries(
+            source,
+            excluded_subtrees=excluded,
+            maximum_file_bytes=maximum_file_bytes,
+        )
         if (
             before["stability_fingerprint_sha256"]
             != after["stability_fingerprint_sha256"]
@@ -852,6 +871,10 @@ def publish_packed_snapshot(
             "source": {
                 "snapshot_root_name": source.name,
                 "excluded_subtrees": list(excluded),
+                "selection": {
+                    "maximum_file_bytes": maximum_file_bytes,
+                    "symlinks": "included",
+                },
                 **{
                     key: value
                     for key, value in before.items()

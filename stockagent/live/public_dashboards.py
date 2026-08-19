@@ -8,14 +8,16 @@ read-only payload could represent production order capability.
 
 from __future__ import annotations
 
-from copy import deepcopy
+from collections.abc import Mapping
 import math
 import threading
 import time
-from typing import Any, Final, Mapping
+from typing import Any, Final
 
 
 PUBLIC_MAX_EVENT_ROWS: Final[int] = 250
+PUBLIC_INITIAL_POSITION_ROWS: Final[int] = 100
+PUBLIC_STATUS_FALLBACK_POINTS_PER_SERIES: Final[int] = 2
 
 
 class UnsafePublicDashboardPayload(ValueError):
@@ -86,11 +88,33 @@ def _project_rows(
     ]
 
 
+def _retain_latest_series_rows(
+    payload: dict[str, Any], key: str, *, series_field: str
+) -> None:
+    """Keep a tiny chart fallback; full curves use the history endpoint."""
+
+    rows = payload.get(key)
+    if not isinstance(rows, list):
+        return
+    by_series: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        series = str(row.get(series_field) or "")
+        if not series:
+            continue
+        bucket = by_series.setdefault(series, [])
+        bucket.append(row)
+        if len(bucket) > PUBLIC_STATUS_FALLBACK_POINTS_PER_SERIES:
+            del bucket[0]
+    payload[key] = [row for bucket in by_series.values() for row in bucket]
+
+
 def sanitize_taifex_status(payload: Mapping[str, Any]) -> dict[str, Any]:
     """Return the TAIFEX status payload without local receipt/file identities."""
 
     _require_simulation_only(payload)
-    output = _scrub_public_value(deepcopy(dict(payload)))
+    output = _scrub_public_value(dict(payload))
     if not isinstance(output, dict):  # pragma: no cover - defensive typing guard
         raise TypeError("sanitized status is not an object")
     active_cycle = output.get("active_cycle")
@@ -117,7 +141,7 @@ def sanitize_taifex_history(payload: Mapping[str, Any]) -> dict[str, Any]:
         "backfills",
     }
     output = {
-        key: _scrub_public_value(deepcopy(value))
+        key: _scrub_public_value(value)
         for key, value in payload.items()
         if key in allowed
     }
@@ -155,6 +179,16 @@ def sanitize_taifex_history(payload: Mapping[str, Any]) -> dict[str, Any]:
                     row[field] = round(row[field], 2)
             if isinstance(row.get("fixed_capital_return"), float):
                 row["fixed_capital_return"] = round(row["fixed_capital_return"], 8)
+            for optional_field in (
+                "history_source",
+                "replay_id",
+                "replay_contract_version",
+                "history_event",
+            ):
+                if row.get(optional_field) is None:
+                    row.pop(optional_field, None)
+            if row.get("history_source") == "live_forward_ledger":
+                row.pop("history_source", None)
     return output
 
 
@@ -162,22 +196,16 @@ def sanitize_tw_status(payload: Mapping[str, Any]) -> dict[str, Any]:
     """Return the stock dashboard status with operational identities removed."""
 
     _require_simulation_only(payload)
-    output = _scrub_public_value(deepcopy(dict(payload)))
-    if not isinstance(output, dict):  # pragma: no cover - defensive typing guard
-        raise TypeError("sanitized status is not an object")
-
-    # Detailed ledgers have their own bounded, server-filtered endpoints.  Do
-    # not retransmit hundreds of duplicate rows with every status refresh.
-    for key in ("orders", "fills", "events"):
-        if isinstance(output.get(key), list):
-            output[key] = []
-
     # These arrays dominate the status payload.  Their complete private rows
     # repeat accounting provenance that is not rendered by the public page.
-    # Projecting at the trust boundary reduces JSON parsing and DOM refresh
-    # latency without weakening the private audit ledger.
+    # Project before the recursive scrub so discarded fields are never copied
+    # or inspected on the request path.
+    projected = dict(payload)
+    for key in ("signals", "orders", "fills", "events"):
+        if isinstance(projected.get(key), list):
+            projected[key] = []
     _project_rows(
-        output,
+        projected,
         "positions",
         allowed_fields={
             "counterfactual_open_replay",
@@ -204,6 +232,7 @@ def sanitize_tw_status(payload: Mapping[str, Any]) -> dict[str, Any]:
             "realized_net_pnl_twd",
             "reconciled_total_net_pnl_twd",
             "requested_shares",
+            "session_date",
             "side",
             "signed_shares",
             "simulation_replay",
@@ -219,13 +248,28 @@ def sanitize_tw_status(payload: Mapping[str, Any]) -> dict[str, Any]:
             "valuation_stale",
         },
     )
+    positions = projected.get("positions")
+    if isinstance(positions, list):
+        positions.sort(
+            key=lambda row: (
+                str(row.get("session_date") or ""),
+                abs(float(row.get("target_weight") or 0.0))
+                if isinstance(row.get("target_weight"), (int, float))
+                and math.isfinite(float(row.get("target_weight") or 0.0))
+                else 0.0,
+                str(row.get("market") or ""),
+                str(row.get("symbol") or ""),
+            ),
+            reverse=True,
+        )
+        projected["positions"] = positions[:PUBLIC_INITIAL_POSITION_ROWS]
     _project_rows(
-        output,
+        projected,
         "marks",
         allowed_fields={"market", "minute", "return_pct", "valuation_stale"},
     )
     _project_rows(
-        output,
+        projected,
         "benchmark_marks",
         allowed_fields={
             "benchmark_id",
@@ -234,10 +278,19 @@ def sanitize_tw_status(payload: Mapping[str, Any]) -> dict[str, Any]:
             "valuation_stale",
         },
     )
+    _retain_latest_series_rows(projected, "marks", series_field="market")
+    _retain_latest_series_rows(
+        projected,
+        "benchmark_marks",
+        series_field="benchmark_id",
+    )
+    output = _scrub_public_value(projected)
+    if not isinstance(output, dict):  # pragma: no cover - defensive typing guard
+        raise TypeError("sanitized status is not an object")
 
     payload_window = output.get("payload_window")
     if isinstance(payload_window, dict):
-        for key in ("orders", "fills", "events"):
+        for key in ("signals", "orders", "fills", "events"):
             rows = output.get(key)
             if isinstance(rows, list):
                 payload_window[key] = len(rows)
@@ -281,7 +334,7 @@ def sanitize_tw_history(payload: Mapping[str, Any]) -> dict[str, Any]:
         "history",
     }
     output = {
-        key: _scrub_public_value(deepcopy(value))
+        key: _scrub_public_value(value)
         for key, value in payload.items()
         if key in allowed
     }
@@ -324,10 +377,12 @@ def sanitize_tw_signals(payload: Mapping[str, Any]) -> dict[str, Any]:
         "record_count",
         "direction_summary_scope",
         "direction_summary",
+        "opening_execution_audit_scope",
+        "opening_execution_audit",
         "rows",
     }
     output = _scrub_public_value(
-        {key: deepcopy(value) for key, value in payload.items() if key in allowed}
+        {key: value for key, value in payload.items() if key in allowed}
     )
     if not isinstance(output, dict):  # pragma: no cover - defensive typing guard
         raise TypeError("sanitized signal page is not an object")
@@ -354,6 +409,7 @@ def sanitize_tw_signals(payload: Mapping[str, Any]) -> dict[str, Any]:
             "side",
             "signal_at",
             "simulation_replay",
+            "sizing_open_price",
             "source_signal_at",
             "status",
             "symbol",
@@ -386,7 +442,7 @@ def sanitize_tw_positions(payload: Mapping[str, Any]) -> dict[str, Any]:
         "rows",
     }
     output = _scrub_public_value(
-        {key: deepcopy(value) for key, value in payload.items() if key in allowed}
+        {key: value for key, value in payload.items() if key in allowed}
     )
     if not isinstance(output, dict):  # pragma: no cover - defensive typing guard
         raise TypeError("sanitized position page is not an object")
@@ -461,7 +517,7 @@ def sanitize_tw_events(payload: Mapping[str, Any]) -> dict[str, Any]:
         "rows",
     }
     output = _scrub_public_value(
-        {key: deepcopy(value) for key, value in payload.items() if key in allowed}
+        {key: value for key, value in payload.items() if key in allowed}
     )
     if not isinstance(output, dict):  # pragma: no cover - defensive typing guard
         raise TypeError("sanitized event page is not an object")

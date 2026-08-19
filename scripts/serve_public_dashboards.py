@@ -49,6 +49,7 @@ from stockagent.live.tw_day_trade_dashboard import (  # noqa: E402
     build_dashboard_event_page,
     build_dashboard_history_snapshot,
     build_dashboard_position_page,
+    build_dashboard_signal_page,
     build_dashboard_snapshot,
 )
 
@@ -58,6 +59,11 @@ MAX_REQUEST_TARGET_BYTES: Final[int] = 2_048
 PUBLIC_SIGNAL_LIMIT: Final[int] = 250
 PUBLIC_EVENT_LIMIT: Final[int] = 250
 MAX_CACHE_ENTRIES: Final[int] = 512
+MONITOR_STATUS_STALE_GRACE_SECONDS: Final[float] = 30.0
+OVERVIEW_STALE_GRACE_SECONDS: Final[float] = 90.0
+IMMUTABLE_ASSET_CACHE_CONTROL: Final[str] = (
+    "public, max-age=31536000, immutable"
+)
 _OPENER = build_opener(ProxyHandler({}))
 _LATENCY_BUCKETS_MS: Final[tuple[float, ...]] = (
     0.25,
@@ -93,6 +99,7 @@ _PUBLIC_API_ROUTES: Final[frozenset[str]] = frozenset(
         "/openbb/api/status",
         "/openbb/api/history",
         "/data-monitor/api/status",
+        "/data-monitor/api/summary",
         "/traffic/api/status",
     }
 )
@@ -1010,16 +1017,55 @@ class PublicDashboardServer(ThreadingHTTPServer):
         shioaji_status: Mapping[str, Any] | None = None,
         openbb_status: Mapping[str, Any] | None = None,
     ) -> PreparedResponse:
+        if shioaji_status is None:
+            shioaji_status = _response_json(
+                self.cached_local_json(
+                    cache_key="shioaji-status",
+                    ttl_seconds=8.0,
+                    cache_control="no-store",
+                    stale_grace_seconds=MONITOR_STATUS_STALE_GRACE_SECONDS,
+                    builder=lambda: build_shioaji_public_status(self.repo_root),
+                )
+            )
+        if openbb_status is None:
+            openbb_status = _response_json(self.openbb_status())
         return self.cached_local_json(
             cache_key="data-monitor-status",
             ttl_seconds=8.0,
             cache_control="no-store",
-            stale_grace_seconds=0.0,
+            stale_grace_seconds=MONITOR_STATUS_STALE_GRACE_SECONDS,
             builder=lambda: build_data_monitor_public_status(
                 self.repo_root,
                 shioaji_status=shioaji_status,
                 openbb_status=openbb_status,
             ),
+        )
+
+    def data_monitor_summary(self) -> PreparedResponse:
+        def build() -> Mapping[str, Any]:
+            payload = _response_json(self.data_monitor_status())
+            return {
+                key: payload[key]
+                for key in (
+                    "schema_version",
+                    "generated_at_utc",
+                    "health",
+                    "read_only",
+                    "production_control_possible",
+                    "summary",
+                    "endpoint_inventory",
+                    "provider_summaries",
+                    "definitions",
+                )
+                if key in payload
+            }
+
+        return self.cached_local_json(
+            cache_key="data-monitor-summary",
+            ttl_seconds=8.0,
+            cache_control="no-store",
+            stale_grace_seconds=MONITOR_STATUS_STALE_GRACE_SECONDS,
+            builder=build,
         )
 
     def public_overview(self) -> Mapping[str, Any]:
@@ -1074,13 +1120,68 @@ class PublicDashboardServer(ThreadingHTTPServer):
                 cache_key="public-overview",
                 ttl_seconds=55.0,
                 cache_control="no-store",
-                stale_grace_seconds=0.0,
+                stale_grace_seconds=OVERVIEW_STALE_GRACE_SECONDS,
                 builder=self.public_overview,
             )
         except Exception as error:
             sys.stderr.write(
                 f"public-dashboard prewarm_failed error={type(error).__name__}\n"
             )
+
+    def prewarm_default_views(self) -> None:
+        """Warm every first-view cache without delaying the listener."""
+
+        def taifex_history_builder() -> PreparedResponse:
+            return self.cached_json(
+                cache_key="taifex-history:1d",
+                upstream_url=f"{self.taifex_upstream}/api/history?range=1d",
+                ttl_seconds=55.0,
+                cache_control="no-cache",
+                stale_grace_seconds=180.0,
+                sanitizer=sanitize_taifex_history,
+            )
+        # Build the largest default payload first.  An immediate request joins
+        # this cache key's single flight, while unrelated prewarm work waits
+        # instead of competing for CPU and disk bandwidth.
+        try:
+            taifex_history_builder()
+        except Exception as error:
+            sys.stderr.write(
+                "public-dashboard critical_view_prewarm_failed "
+                f"error={type(error).__name__}\n"
+            )
+        builders: tuple[Callable[[], object], ...] = (
+            self.prewarm_overview,
+            lambda: self.tw_history("1d"),
+            lambda: self.openbb_history("1d"),
+            lambda: build_dashboard_signal_page(
+                state_dir=self.repo_root / "artifacts/live/tw_day_trade_simulation",
+                status="all",
+                limit=100,
+            ),
+            lambda: build_dashboard_position_page(
+                state_dir=self.repo_root / "artifacts/live/tw_day_trade_simulation",
+                status="all",
+                limit=100,
+            ),
+            lambda: build_dashboard_event_page(
+                state_dir=self.repo_root / "artifacts/live/tw_day_trade_simulation",
+                limit=100,
+            ),
+        )
+        with ThreadPoolExecutor(
+            max_workers=len(builders),
+            thread_name_prefix="public-prewarm",
+        ) as executor:
+            futures = [executor.submit(builder) for builder in builders]
+            for future in futures:
+                try:
+                    future.result()
+                except Exception as error:
+                    sys.stderr.write(
+                        "public-dashboard view_prewarm_failed "
+                        f"error={type(error).__name__}\n"
+                    )
 
 
 class PublicDashboardHandler(BaseHTTPRequestHandler):
@@ -1208,22 +1309,22 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
             "/public.css": (
                 self.server.public_static_root / "public.css",
                 "text/css; charset=utf-8",
-                "public, max-age=300",
+                IMMUTABLE_ASSET_CACHE_CONTROL,
             ),
             "/public.js": (
                 self.server.public_static_root / "public.js",
                 "text/javascript; charset=utf-8",
-                "public, max-age=300",
+                IMMUTABLE_ASSET_CACHE_CONTROL,
             ),
             "/dashboard-core.css": (
                 self.server.public_static_root / "dashboard-core.css",
                 "text/css; charset=utf-8",
-                "public, max-age=300",
+                IMMUTABLE_ASSET_CACHE_CONTROL,
             ),
             "/time-axis.js": (
                 self.server.public_static_root / "time-axis.js",
                 "text/javascript; charset=utf-8",
-                "public, max-age=300",
+                IMMUTABLE_ASSET_CACHE_CONTROL,
             ),
             "/robots.txt": (
                 self.server.public_static_root / "robots.txt",
@@ -1250,13 +1351,13 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                 routes[path] = (
                     root / "app.js",
                     "text/javascript; charset=utf-8",
-                    "public, max-age=300",
+                    IMMUTABLE_ASSET_CACHE_CONTROL,
                 )
             elif suffix == "styles.css":
                 routes[path] = (
                     root / "styles.css",
                     "text/css; charset=utf-8",
-                    "public, max-age=300",
+                    IMMUTABLE_ASSET_CACHE_CONTROL,
                 )
         selected = routes.get(path)
         if selected is None:
@@ -1484,7 +1585,7 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                 cache_key="public-overview",
                 ttl_seconds=55.0,
                 cache_control="no-store",
-                stale_grace_seconds=0.0,
+                stale_grace_seconds=OVERVIEW_STALE_GRACE_SECONDS,
                 builder=self.server.public_overview,
             )
         if path == "/taifex/api/status":
@@ -1531,13 +1632,28 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
             )
         if path == "/tw-day-trade/api/signals":
             normalized = self._signal_query(raw_query)
-            return self.server.cached_json(
+            query = parse_qs(normalized, keep_blank_values=True)
+            return self.server.cached_local_json(
                 cache_key=f"tw-signals:{normalized}",
-                upstream_url=f"{self.server.tw_upstream}/api/signals?{normalized}",
                 ttl_seconds=2.0,
                 cache_control="no-store",
                 stale_grace_seconds=0.0,
-                sanitizer=sanitize_tw_signals,
+                builder=lambda: sanitize_tw_signals(
+                    build_dashboard_signal_page(
+                        state_dir=self.server.repo_root
+                        / "artifacts/live/tw_day_trade_simulation",
+                        session_date=str(query.get("date", [""])[0]) or None,
+                        start_date=str(query.get("start_date", [""])[0]) or None,
+                        end_date=str(query.get("end_date", [""])[0]) or None,
+                        mode=str(query.get("mode", [""])[0]),
+                        symbol=str(query.get("symbol", [""])[0]),
+                        status=str(query.get("status", ["all"])[0]),
+                        offset=int(query.get("offset", ["0"])[0]),
+                        limit=int(
+                            query.get("limit", [str(PUBLIC_SIGNAL_LIMIT)])[0]
+                        ),
+                    )
+                ),
             )
         if path == "/tw-day-trade/api/positions":
             normalized = self._signal_query(raw_query)
@@ -1596,7 +1712,7 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                 cache_key="shioaji-status",
                 ttl_seconds=8.0,
                 cache_control="no-store",
-                stale_grace_seconds=0.0,
+                stale_grace_seconds=MONITOR_STATUS_STALE_GRACE_SECONDS,
                 builder=lambda: build_shioaji_public_status(self.server.repo_root),
             )
         if path == "/openbb/api/status":
@@ -1605,6 +1721,8 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
             return self.server.openbb_history(self._history_range_query(raw_query))
         if path == "/data-monitor/api/status":
             return self.server.data_monitor_status()
+        if path == "/data-monitor/api/summary":
+            return self.server.data_monitor_summary()
         if path == "/traffic/api/status":
             body = (
                 json.dumps(
@@ -1818,8 +1936,8 @@ def main(argv: list[str] | None = None) -> int:
         tw_upstream=str(args.tw_upstream),
     )
     threading.Thread(
-        target=server.prewarm_overview,
-        name="public-overview-prewarm",
+        target=server.prewarm_default_views,
+        name="public-default-views-prewarm",
         daemon=True,
     ).start()
     print(

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from http.client import IncompleteRead
+import json
 import sys
 from pathlib import Path
 
@@ -165,6 +167,38 @@ def test_bybit_inventory_retains_delisted_files_without_hiding_rows(
         "retained_historical_row_count": 3,
         "retained_historical_symbols": ["DELISTEDUSDT"],
     }
+
+
+def test_bybit_retries_truncated_http_body(monkeypatch) -> None:
+    class Response:
+        headers: dict[str, str] = {}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, *_args) -> bytes:
+            return json.dumps({"retCode": 0, "result": {"list": []}}).encode()
+
+    outcomes = [IncompleteRead(b"partial", 10), Response()]
+    monkeypatch.setattr(
+        bybit,
+        "urlopen",
+        lambda *_args, **_kwargs: (
+            (_ for _ in ()).throw(outcomes.pop(0))
+            if isinstance(outcomes[0], BaseException)
+            else outcomes.pop(0)
+        ),
+    )
+    client = bybit.BybitClient(None, max_retries=2, retry_base=0.1)
+    monkeypatch.setattr(client.limiter, "wait", lambda: None)
+    monkeypatch.setattr(client, "_defer_retry", lambda *_args, **_kwargs: None)
+
+    payload = client.get("/fixture", {})
+
+    assert payload["retCode"] == 0
 
 
 def test_crypto_downloader_overlap_replaces_existing_tail() -> None:

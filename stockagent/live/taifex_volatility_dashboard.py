@@ -19,6 +19,15 @@ from statistics import median
 import threading
 from typing import Any, Final, Mapping
 
+try:
+    import polars as pl
+    from polars.exceptions import PolarsError
+except ImportError:  # pragma: no cover - the fintech runtime includes Polars.
+    pl = None
+
+    class PolarsError(Exception):
+        """Compatibility exception used when the optional fast reader is absent."""
+
 from stockagent.data.taifex_sessions import (
     TAIPEI,
     taifex_market_phase,
@@ -61,6 +70,35 @@ class _DailyEndpointCache:
 
 _PERFORMANCE_LOCK = threading.Lock()
 _PERFORMANCE_CACHE: dict[Path, _DailyEndpointCache] = {}
+
+_HISTORY_POLARS_SCHEMA: Final[dict[str, Any]] = (
+    {
+        "recorded_at_utc": pl.String,
+        "decision_ts_ns": pl.Int64,
+        "strategy_id": pl.String,
+        "cumulative_pnl_twd": pl.Float64,
+        "net_equity_twd": pl.Float64,
+        "initial_capital_twd": pl.Float64,
+        "total_equity_twd": pl.Float64,
+        "gross_cash_twd": pl.Float64,
+        "open_liquidation_value_twd": pl.Float64,
+        "fixed_fees_twd": pl.Float64,
+        "transaction_tax_twd": pl.Float64,
+        "futures_position": pl.Int64,
+        "underlying_futures_position": pl.Int64,
+        "active_cycle_id": pl.String,
+        "option_books_valid": pl.Boolean,
+        "future_book_valid": pl.Boolean,
+        "valuation_available": pl.Boolean,
+        "valuation_carried_forward": pl.Boolean,
+        "history_source": pl.String,
+        "replay_id": pl.String,
+        "replay_contract_version": pl.Int64,
+        "history_event": pl.String,
+    }
+    if pl is not None
+    else {}
+)
 
 
 def _load_object(path: Path) -> dict[str, Any]:
@@ -164,6 +202,63 @@ def _iter_json_objects(path: Path):
             payload = json.loads(line)
             if isinstance(payload, dict):
                 yield payload
+
+
+def _filtered_history_rows_polars(
+    path: Path,
+    *,
+    minimum_decision_ts_ns: int,
+) -> list[dict[str, Any]] | None:
+    """Read a modern bounded history window without materializing the raw ledger.
+
+    Polars parses NDJSON and projects only public-curve inputs in native code.
+    Modern marks persist explicit valuation availability, so rows before the
+    requested window cannot affect their valuation.  A selected legacy row
+    without that field returns ``None`` and deliberately falls back to the
+    complete Python scan, preserving its historical carry-forward semantics.
+    """
+
+    if pl is None or not path.is_file():
+        return None
+    try:
+        frame = pl.read_ndjson(
+            path,
+            schema=_HISTORY_POLARS_SCHEMA,
+            low_memory=False,
+        )
+        selected = frame.filter(
+            pl.col("decision_ts_ns").fill_null(0)
+            >= int(minimum_decision_ts_ns)
+        )
+    except (OSError, PolarsError):
+        return None
+    if selected.is_empty():
+        return []
+    if selected.get_column("valuation_available").null_count() > 0:
+        return None
+    has_validity_flags = pl.col("option_books_valid").is_not_null() | pl.col(
+        "future_book_valid"
+    ).is_not_null()
+    fresh_complete = (~has_validity_flags) | (
+        pl.col("option_books_valid").fill_null(False)
+        & pl.col("future_book_valid").fill_null(False)
+    )
+    seeds = (
+        frame.filter(
+            (pl.col("decision_ts_ns").fill_null(0) < int(minimum_decision_ts_ns))
+            & pl.col("open_liquidation_value_twd").is_not_null()
+            & fresh_complete
+        )
+        .sort("decision_ts_ns")
+        .unique(subset=["strategy_id"], keep="last", maintain_order=True)
+    )
+    frame = pl.concat((seeds, selected), how="vertical")
+    # Missing JSON keys become null under an explicit projection.  Removing
+    # null keys preserves dict.get(default) behavior in the canonical projector.
+    return [
+        {key: value for key, value in row.items() if value is not None}
+        for row in frame.to_dicts()
+    ]
 
 
 def _history_backfill_receipts(state_dir: Path) -> list[dict[str, Any]]:
@@ -701,8 +796,18 @@ def _build_history_rows(
     # Backfills are read first.  A formal live mark at the same strategy/time
     # is authoritative and replaces the historical replay row.
     for mark_path in _history_mark_paths(Path(state_dir)):
+        fast_rows = (
+            _filtered_history_rows_polars(
+                mark_path,
+                minimum_decision_ts_ns=int(minimum_decision_ts_ns),
+            )
+            if scan_all and minimum_decision_ts_ns is not None
+            else None
+        )
         source_rows = (
-            _iter_json_objects(mark_path)
+            fast_rows
+            if fast_rows is not None
+            else _iter_json_objects(mark_path)
             if scan_all
             else _tail_json_objects(
                 mark_path,

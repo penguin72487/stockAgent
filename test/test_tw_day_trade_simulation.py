@@ -343,6 +343,7 @@ def test_runner_keeps_quote_polling_for_post_close_terminal_catch_up() -> None:
     from scripts.run_tw_day_trade_simulation import (
         _active_quote_due,
         _loop_sleep_seconds,
+        _pending_signal_retry_delay_seconds,
     )
 
     observed = _now(13, 35)
@@ -385,6 +386,12 @@ def test_runner_keeps_quote_polling_for_post_close_terminal_catch_up() -> None:
         has_pending_signal=True,
         has_open_position=False,
     ) == pytest.approx(0.1)
+    assert _pending_signal_retry_delay_seconds(
+        "waiting_quote", _now(9, 18, 7)
+    ) == pytest.approx(0.5)
+    assert _pending_signal_retry_delay_seconds(
+        "waiting_first_minute", _now(9, 18, 7)
+    ) == pytest.approx(53.05)
 
 
 def _eligibility() -> dict[str, LiveEligibility]:
@@ -468,6 +475,48 @@ def test_entry_executes_during_opening_minute_without_waiting_for_kbar(
     assert result == "registered"
     position = next(iter(engine.state["modes"][spec.market]["positions"].values()))
     assert position["filled_shares"] == 1_000
+
+
+def test_late_entry_waits_for_adjacent_completed_minute_after_restart(
+    tmp_path: Path,
+) -> None:
+    spec = _spec(tmp_path)
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+    quote = _quote()
+    quote["minute_volume_lots"] = None
+    quote["quote_at"] = _now(9, 18, 6).isoformat()
+
+    result = engine.register_signal(
+        spec=spec,
+        summary=_summary(),
+        signal_rows=[_row()],
+        quotes={"2330": quote},
+        eligibility=_eligibility(),
+        eligibility_coverage={},
+        now=_now(9, 18, 7),
+    )
+
+    assert result == "waiting_first_minute"
+    mode = engine.state["modes"][spec.market]
+    assert mode.get("entry_completed_at") is None
+    assert mode["processed_signal_ids"] == []
+    assert mode["engine_status"] == "waiting_completed_minute_liquidity"
+
+    next_quote = _quote(minute_volume_lots=100.0)
+    next_quote["quote_at"] = _now(9, 19, 6).isoformat()
+    assert (
+        engine.register_signal(
+            spec=spec,
+            summary=_summary(),
+            signal_rows=[_row()],
+            quotes={"2330": next_quote},
+            eligibility=_eligibility(),
+            eligibility_coverage={},
+            now=_now(9, 19, 7),
+        )
+        == "registered"
+    )
+    assert next(iter(mode["positions"].values()))["filled_shares"] == 1_000
 
 
 def test_market_entry_uses_best_ask_and_records_board_lot(tmp_path: Path) -> None:
@@ -2418,6 +2467,35 @@ def test_dashboard_exposes_same_day_preopen_progress_and_measured_speed(
         + "\n",
         encoding="utf-8",
     )
+    (engine.state_dir / "preopen_readiness.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "session_date": "2026-08-13",
+                "status": "ready",
+                "updated_at": _now(8, 55).isoformat(),
+                "components": {
+                    "eligibility": {
+                        "status": "ready",
+                        "checked_at": _now(8, 30).isoformat(),
+                        "elapsed_ms": 30.0,
+                        "details": {
+                            "proof": "exact_session_twse_tpex_coverage",
+                            "symbol_count": 3_000,
+                        },
+                    },
+                    "shioaji_quote": {
+                        "status": "ready",
+                        "checked_at": _now(8, 55).isoformat(),
+                        "elapsed_ms": 50.0,
+                        "details": {"proof": "simulation_client_usage_probe"},
+                    },
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
     payload = build_dashboard_snapshot(
         state_dir=engine.state_dir,
@@ -2436,7 +2514,89 @@ def test_dashboard_exposes_same_day_preopen_progress_and_measured_speed(
     assert mode["price_limit_coverage_ratio"] == 0.8
     assert mode["eligibility_ready"] is True
     assert mode["eligibility_target_date"] == "2026-08-13"
+    assert payload["preopen"]["simulation"]["ready"] is True
+    assert (
+        payload["preopen"]["simulation"]["components"]["shioaji_quote"]["proof"]
+        == "simulation_client_usage_probe"
+    )
     assert payload["session_progress"]["phase"] == "preopen"
+
+
+def test_dashboard_default_view_exposes_today_prewarm_before_first_signal(
+    tmp_path: Path,
+) -> None:
+    spec = _spec(tmp_path)
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+    engine.update_readiness([spec], now=_now(8, 29))
+    state = json.loads(engine.state_path.read_text(encoding="utf-8"))
+    state["modes"][spec.market]["session_date"] = "2026-08-12"
+    engine.state_path.write_text(
+        json.dumps(state) + "\n",
+        encoding="utf-8",
+    )
+    readiness_path = tmp_path / "preopen_readiness.json"
+    readiness_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "updated_at": _now(8, 45).isoformat(),
+                "markets": {
+                    spec.market: {
+                        "status": "ready",
+                        "started_at": _now(8, 30).isoformat(),
+                        "completed_at": _now(8, 45).isoformat(),
+                        "elapsed_seconds": 900.0,
+                        "step": 23,
+                        "total": 23,
+                        "message": "ready",
+                        "panel_date": "2026-08-12 13:30:00",
+                        "symbol_count": 3_000,
+                    }
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    payload = build_dashboard_snapshot(
+        state_dir=engine.state_dir,
+        preopen_readiness_path=readiness_path,
+        now=_now(8, 46).astimezone(ZoneInfo("UTC")),
+    )
+
+    assert payload["session_date"] == "2026-08-12"
+    assert payload["preopen"]["ready_count"] == 1
+    assert payload["preopen"]["updated_at"] == _now(8, 45).isoformat()
+    assert payload["preopen"]["simulation"]["session_date"] == "2026-08-13"
+    assert payload["preopen"]["status"] == "pending"
+
+
+def test_simulation_executor_preopen_receipt_requires_both_components(
+    tmp_path: Path,
+) -> None:
+    from scripts.run_tw_day_trade_simulation import _write_preopen_readiness
+
+    state_dir = tmp_path / "state"
+    first = _write_preopen_readiness(
+        state_dir,
+        session_date="2026-08-13",
+        component="eligibility",
+        status="ready",
+        observed=_now(8, 30),
+        details={"proof": "exact_session_twse_tpex_coverage"},
+    )
+    assert first["status"] == "warming"
+    ready = _write_preopen_readiness(
+        state_dir,
+        session_date="2026-08-13",
+        component="shioaji_quote",
+        status="ready",
+        observed=_now(8, 55),
+        details={"proof": "simulation_client_usage_probe"},
+    )
+    assert ready["status"] == "ready"
+    assert json.loads((state_dir / "preopen_readiness.json").read_text())["status"] == "ready"
 
 
 def test_dashboard_html_is_local_and_refreshes_api() -> None:
@@ -2451,10 +2611,17 @@ def test_dashboard_html_is_local_and_refreshes_api() -> None:
     assert "fetchWithTimeout(`api/positions?${params.toString()}`" in javascript
     assert "fetchWithTimeout(`api/events?${params.toString()}`" in javascript
     assert "function renderOperations(data)" in javascript
+    assert "模擬執行器盤前守門" in javascript
+    assert "Shioaji usage 探測" in javascript
     assert "function compareByAbsoluteWeight(a, b)" in javascript
     assert javascript.count(".sort(compareByAbsoluteWeight)") == 0
     assert "refreshInFlight" in javascript
     assert "SIGNAL_PAGE_SIZE" in javascript
+    assert "const SIGNAL_PAGE_SIZE = 100" in javascript
+    assert "const POSITION_PAGE_SIZE = 100" in javascript
+    assert "function hydrateDefaultPositions(data)" in javascript
+    assert "const detailLoads = positionsHydrated ? [] : [loadPositions()]" in javascript
+    assert "}, 80);" in javascript
     assert "const sourceNumber" in javascript
     assert "maximumSignificantDigits" not in javascript
     assert javascript.count("maximumFractionDigits: 2") >= 5
@@ -2467,10 +2634,12 @@ def test_dashboard_html_is_local_and_refreshes_api() -> None:
     assert 'id="load-more-events"' in html
     assert 'id="load-more-positions"' in html
     assert 'id="signal-direction-summary"' in html
+    assert "signalOpeningExecutionAudit" in javascript
+    assert "開盤計價 ${money(openingPrice)}" in javascript
     assert 'class="compact-table position-table"' in html
     assert 'class="compact-table signal-table"' in html
     assert "<th>損益拆分／估值</th>" in html
-    assert "<th>進場成本／成交</th>" in html
+    assert "<th>開盤計價／市價成交</th>" in html
     assert "<th>現在市價／該檔盈虧</th>" in html
     assert "<th>損益／模式總權益</th>" in html
     assert 'class="skip-link"' in html
@@ -2491,7 +2660,7 @@ def test_dashboard_html_is_local_and_refreshes_api() -> None:
     assert "未實現 ${money(unrealizedNet)}" in javascript
     assert "reconciled_total_net_pnl_twd" in javascript
     assert "function resolvedPositionPnl(row = {})" in javascript
-    assert "進場名目 ${money(entryNotional)}" in javascript
+    assert "名目 ${money(entryNotional)}" in javascript
     assert "佔該模式總權益" in javascript
     assert (
         '模式總權益 ${Number.isFinite(modeTotalEquity) ? summaryMoney(modeTotalEquity) : "—"}'
@@ -2499,7 +2668,7 @@ def test_dashboard_html_is_local_and_refreshes_api() -> None:
     )
     assert "Number(positionPnl.total) / modeTotalEquity * 100" in javascript
     assert "Number(positionPnl.total) / totalPortfolioPnl * 100" not in javascript
-    assert "未成交・無進場成本" in javascript
+    assert "未成交・${esc(row.reason || row.status || \"受限\")}" in javascript
     assert "所選交易日當沖資格未完整覆蓋" in javascript
     assert "較晚補齊的資料不會回填成假成交" in javascript
     assert "原子指標由 inotify 事件即時喚醒" in javascript
@@ -2898,6 +3067,54 @@ def test_session_tail_is_not_crowded_out_by_a_later_date(tmp_path: Path) -> None
     assert [row["index"] for row in selected] == [2, 3, 4]
 
 
+def test_available_session_date_cache_invalidates_when_ledger_grows(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    (state_dir / "state.json").write_text(
+        json.dumps({"modes": {"mode_a": {"session_date": "2026-08-13"}}}) + "\n",
+        encoding="utf-8",
+    )
+    signals_path = state_dir / "signals.jsonl"
+    signals_path.write_text(
+        json.dumps(
+            {
+                "session_date": "2026-08-13",
+                "market": "mode_a",
+                "symbol": "2330",
+                "status": "ready",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    first = build_dashboard_signal_page(state_dir=state_dir, limit=10)
+    assert first["available_session_dates"] == ["2026-08-13"]
+
+    with signals_path.open("a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps(
+                {
+                    "session_date": "2026-08-14",
+                    "market": "mode_a",
+                    "symbol": "2317",
+                    "status": "ready",
+                }
+            )
+            + "\n"
+        )
+
+    second = build_dashboard_signal_page(
+        state_dir=state_dir,
+        start_date="2026-08-13",
+        end_date="2026-08-14",
+        limit=10,
+    )
+    assert second["available_session_dates"] == ["2026-08-14", "2026-08-13"]
+    assert second["total"] == 2
+
+
 def test_dashboard_signal_page_filters_sorts_and_bounds_payload(tmp_path: Path) -> None:
     state_dir = tmp_path / "state"
     state_dir.mkdir()
@@ -2928,6 +3145,10 @@ def test_dashboard_signal_page_filters_sorts_and_bounds_payload(tmp_path: Path) 
             "name": "台積電",
             "target_weight": 0.1,
             "status": "ready",
+            "sizing_open_price": 100.0,
+            "execution_price": 100.5,
+            "requested_shares": 1_000,
+            "filled_shares": 1_000,
         },
         {
             "session_date": "2026-08-13",
@@ -2936,6 +3157,7 @@ def test_dashboard_signal_page_filters_sorts_and_bounds_payload(tmp_path: Path) 
             "name": "鴻海",
             "target_weight": -0.3,
             "status": "missing_quote",
+            "reason": "missing_quote",
         },
         {
             "session_date": "2026-08-13",
@@ -2944,6 +3166,10 @@ def test_dashboard_signal_page_filters_sorts_and_bounds_payload(tmp_path: Path) 
             "name": "聯發科",
             "target_weight": 0.2,
             "status": "partial_depth",
+            "sizing_open_price": 900.0,
+            "execution_price": 901.0,
+            "requested_shares": 1_000,
+            "filled_shares": 500,
         },
         {
             "session_date": "2026-08-13",
@@ -2977,6 +3203,17 @@ def test_dashboard_signal_page_filters_sorts_and_bounds_payload(tmp_path: Path) 
         "short_count": 1,
         "long_gross": pytest.approx(0.3),
         "short_gross": pytest.approx(0.3),
+    }
+    assert first["opening_execution_audit"]["mode_a"] == {
+        "nonzero_signal_count": 3,
+        "opening_price_covered_count": 2,
+        "opening_price_missing_count": 1,
+        "execution_price_covered_count": 2,
+        "requested_signal_count": 2,
+        "filled_signal_count": 2,
+        "unfilled_signal_count": 1,
+        "missing_open_symbols": ["2317"],
+        "unfilled_reason_counts": {"missing_quote": 1},
     }
 
     filtered = build_dashboard_signal_page(

@@ -3,8 +3,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SERVICE_NAME="stockagent-tw-day-trade-simulation.service"
-TEMPLATE="$REPO_ROOT/deploy/systemd/$SERVICE_NAME.in"
-UNIT_PATH="/etc/systemd/system/$SERVICE_NAME"
+PREOPEN_TIMER="stockagent-tw-day-trade-preopen-gate.timer"
 
 if (( EUID != 0 )); then
   echo "[tw-day-trade-service] root privileges are required" >&2
@@ -17,17 +16,28 @@ SERVICE_HOME="$(getent passwd "$SERVICE_USER" | cut -d: -f6)"
 
 escape_replacement() { printf '%s' "$1" | sed 's/[&|\\]/\\&/g'; }
 
-rendered_unit="$(mktemp --suffix=.service)"
-trap 'rm -f "$rendered_unit"' EXIT
-sed \
-  -e "s|@REPO_ROOT@|$(escape_replacement "$REPO_ROOT")|g" \
-  -e "s|@SERVICE_USER@|$(escape_replacement "$SERVICE_USER")|g" \
-  -e "s|@SERVICE_GROUP@|$(escape_replacement "$SERVICE_GROUP")|g" \
-  -e "s|@SERVICE_HOME@|$(escape_replacement "$SERVICE_HOME")|g" \
-  "$TEMPLATE" > "$rendered_unit"
+temporary_dir="$(mktemp -d)"
+trap 'rm -rf "$temporary_dir"' EXIT
+units=(
+  "$SERVICE_NAME"
+  stockagent-tw-day-trade-preopen-gate.service
+  "$PREOPEN_TIMER"
+)
+for unit in "${units[@]}"; do
+  sed \
+    -e "s|@REPO_ROOT@|$(escape_replacement "$REPO_ROOT")|g" \
+    -e "s|@SERVICE_USER@|$(escape_replacement "$SERVICE_USER")|g" \
+    -e "s|@SERVICE_GROUP@|$(escape_replacement "$SERVICE_GROUP")|g" \
+    -e "s|@SERVICE_HOME@|$(escape_replacement "$SERVICE_HOME")|g" \
+    "$REPO_ROOT/deploy/systemd/$unit.in" > "$temporary_dir/$unit"
+done
 
-systemd-analyze verify "$rendered_unit"
-install -m 0644 "$rendered_unit" "$UNIT_PATH"
+systemd-analyze verify "$temporary_dir"/*.service "$temporary_dir"/*.timer
+install -m 0644 "$temporary_dir"/* /etc/systemd/system/
+chmod 0755 \
+  "$REPO_ROOT/scripts/check_tw_day_trade_preopen_readiness.py" \
+  "$REPO_ROOT/scripts/run_tw_day_trade_preopen_gate.sh"
 systemctl daemon-reload
 systemctl enable --now "$SERVICE_NAME"
-echo "[tw-day-trade-service] installed=$UNIT_PATH active=$(systemctl is-active "$SERVICE_NAME")"
+systemctl enable --now "$PREOPEN_TIMER"
+echo "[tw-day-trade-service] service_active=$(systemctl is-active "$SERVICE_NAME") preopen_timer_active=$(systemctl is-active "$PREOPEN_TIMER")"

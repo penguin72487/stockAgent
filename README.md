@@ -220,6 +220,9 @@ run_fintech_python scripts/manage_gpu_jobs.py status \
 For the registered Dune on-chain and SEC/crypto-ETF issuer history pipelines,
 including `.env` placement, point-in-time rules, resumable receipts, and panel
 status, see [docs/dune_sec_crypto_etf_history.md](docs/dune_sec_crypto_etf_history.md).
+For every reserved public-data credential field, its canonical storage location,
+registration link, and secret-free audit contract, see
+[docs/data_api_credentials.md](docs/data_api_credentials.md).
 
 - Source `scripts/runtime_env.sh` first and use `run_fintech_python` for every Python entrypoint; bare `python` is not a supported runtime selector for this repository.
 - Run `run_fintech_python downloader/download_yahoo_ohlcv.py` to download four separate folders under `data_yahoo/`: `tw_stocks/`, `us_stocks/`, `crypto/`, and `forex/`.

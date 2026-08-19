@@ -1019,6 +1019,17 @@ def parse_args() -> argparse.Namespace:
             "refresh whose parent workflow owns the directory-level metadata."
         ),
     )
+    parser.add_argument(
+        "--run-metadata-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Optional directory for dataset_manifest.json, download_report.csv, "
+            "and download_summary.json. Data files still go to --output-dir. "
+            "Use this for publication probes so their evidence cannot overwrite "
+            "the canonical live-root run metadata."
+        ),
+    )
     parser.add_argument("--workers", type=int, default=4, help="Concurrent historical dataset workers.")
     parser.add_argument(
         "--date-workers",
@@ -6334,16 +6345,22 @@ def main() -> None:
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    metadata_dir = (
+        Path(args.run_metadata_dir)
+        if args.run_metadata_dir is not None
+        else output_dir
+    )
     if args.write_run_metadata:
+        metadata_dir.mkdir(parents=True, exist_ok=True)
         _write_json(
-            output_dir / "dataset_manifest.json",
+            metadata_dir / "dataset_manifest.json",
             [asdict(spec) for spec in specs],
         )
 
     results = _run_selected_downloads(specs, args, output_dir)
     results.sort(key=lambda row: row.dataset)
     if args.write_run_metadata:
-        _write_csv_report(output_dir / "download_report.csv", results)
+        _write_csv_report(metadata_dir / "download_report.csv", results)
 
     failed_statuses = {"failed", "incomplete", "unsupported"}
     historical_names = {
@@ -6402,6 +6419,7 @@ def main() -> None:
         "start_date": args.start_date,
         "end_date": resolved_end_date,
         "output_dir": str(output_dir),
+        "run_metadata_dir": str(metadata_dir),
         "request_interval_seconds": request_interval,
         "configured_requests_per_second": 1.0 / request_interval if request_interval > 0 else None,
         "rate_limit_scope": "host-global per provider across threads and subprocesses",
@@ -6442,14 +6460,14 @@ def main() -> None:
         "rows_total": sum(row.rows for row in results),
     }
     if args.write_run_metadata:
-        _write_json(output_dir / "download_summary.json", summary)
+        _write_json(metadata_dir / "download_summary.json", summary)
         print(
             f"[tw-public] download_report.csv -> "
-            f"{output_dir / 'download_report.csv'}"
+            f"{metadata_dir / 'download_report.csv'}"
         )
         print(
             f"[tw-public] download_summary.json -> "
-            f"{output_dir / 'download_summary.json'}"
+            f"{metadata_dir / 'download_summary.json'}"
         )
     else:
         print(

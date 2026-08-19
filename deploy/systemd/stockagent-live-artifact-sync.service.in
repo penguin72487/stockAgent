@@ -1,0 +1,24 @@
+[Unit]
+Description=Direct local-authoritative StockAgent artifact synchronization
+Wants=network-online.target syncthing@root.service
+After=network-online.target syncthing@root.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=@SERVICE_USER@
+Group=@SERVICE_GROUP@
+WorkingDirectory=@REPO_ROOT@
+Environment="HOME=@SERVICE_HOME@"
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=/usr/bin/bash "@REPO_ROOT@/scripts/run_live_artifact_sync.sh"
+Restart=always
+RestartSec=2s
+Nice=5
+CPUWeight=50
+IOWeight=50
+StateDirectory=stockagent-live-artifact-sync
+TimeoutStopSec=2min
+
+[Install]
+WantedBy=multi-user.target
