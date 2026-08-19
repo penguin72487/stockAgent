@@ -21,6 +21,13 @@ chmod 0755 \
   "$repo_root/scripts/run_data_cache.sh" \
   "$repo_root/scripts/install_data_cache_gc_service.sh"
 
+cli_path=/usr/local/bin/stockagent-data
+if [ -e "$cli_path" ] && [ ! -L "$cli_path" ]; then
+  printf 'Refusing to replace non-symlink CLI: %s\n' "$cli_path" >&2
+  exit 64
+fi
+ln -sfn "$repo_root/scripts/run_data_cache.sh" "$cli_path"
+
 if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
   systemd-analyze verify "$temporary_dir"/*.service "$temporary_dir"/*.timer
   install -m 0644 "$temporary_dir"/* /etc/systemd/system/
@@ -40,3 +47,4 @@ printf '%s\n' \
   >"$temporary_dir/stockagent-data-cache-gc.cron"
 install -m 0644 "$temporary_dir/stockagent-data-cache-gc.cron" "$cron_path"
 printf 'Installed cron fallback: %s\n' "$cron_path"
+printf 'Installed self-service CLI: %s\n' "$cli_path"

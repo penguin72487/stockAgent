@@ -546,6 +546,48 @@ def materialized_cache_status(
             "current_link": str(current_link),
             "target": None,
         }
+        dataset_root = materialized_root / name
+        materializations: list[dict[str, Any]] = []
+        if dataset_root.is_dir():
+            for target in sorted(dataset_root.iterdir()):
+                if (
+                    not target.is_dir()
+                    or target.is_symlink()
+                    or target.name.startswith(".")
+                ):
+                    continue
+                snapshot = target.name
+                lease = lease_by_target.get(str(target))
+                try:
+                    historical = resolve_packed_snapshot_id(
+                        sync_root, name, snapshot
+                    )
+                    source_logical_bytes = int(
+                        historical.manifest["source"]["logical_bytes"]
+                    )
+                except (OSError, SnapshotError):
+                    source_logical_bytes = (
+                        lease.get("source_logical_bytes") if lease else None
+                    )
+                materializations.append(
+                    {
+                        "snapshot_id": snapshot,
+                        "target": str(target),
+                        "managed": lease is not None,
+                        "lease_state": lease.get("state") if lease else None,
+                        "last_used_at": lease.get("last_used_at") if lease else None,
+                        "expires_at": lease.get("expires_at") if lease else None,
+                        "ready": _ready_path(
+                            materialized_root, name, snapshot
+                        ).is_file(),
+                        "pinned": snapshot in pinned,
+                        "source_logical_bytes": source_logical_bytes,
+                    }
+                )
+        hot["materializations"] = materializations
+        hot["materialized_count"] = len(materializations)
+        if materializations:
+            hot["state"] = "hot-unmanaged"
         if os.path.lexists(current_link):
             if not current_link.is_symlink():
                 hot["state"] = "invalid-link"

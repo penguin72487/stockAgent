@@ -183,6 +183,21 @@ def main(argv: list[str] | None = None) -> int:
                     "source_bytes": resolved.manifest["source"]["logical_bytes"],
                     "sync_objects": resolved.manifest["archive"]["object_count"] + 1,
                     "sync_bytes": resolved.manifest["archive"]["stored_bytes"],
+                    "base_snapshot_id": resolved.manifest["archive"].get(
+                        "base_snapshot_id"
+                    ),
+                    "reused_files": resolved.manifest["archive"].get(
+                        "reused_files", 0
+                    ),
+                    "changed_files": resolved.manifest["archive"].get(
+                        "changed_files"
+                    ),
+                    "new_sync_objects": resolved.manifest["archive"].get(
+                        "new_object_count"
+                    ),
+                    "new_sync_bytes": resolved.manifest["archive"].get(
+                        "new_stored_bytes"
+                    ),
                 }
             )
         print(
