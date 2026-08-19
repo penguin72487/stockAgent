@@ -14,7 +14,9 @@ case "${1:-}" in
     ;;
   publish-status)
     shift
-    exec "${script_dir}/run_data_release.sh" status "$@"
+    packed_sync_root="${STOCKAGENT_PACKED_SYNC_ROOT:-/srv/stockagent-packed}"
+    exec "${script_dir}/run_data_release.sh" status "$@" \
+      --sync-root "${packed_sync_root}"
     ;;
 esac
 

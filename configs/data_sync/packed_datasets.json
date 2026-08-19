@@ -16,6 +16,17 @@
         "rebuild_tw_public_data_layer.py",
         "build_tw_public_training_features.py"
       ],
+      "freshness": {
+        "receipt": "download_summary.json",
+        "field": "end_date",
+        "format": "iso-date",
+        "required_values": {
+          "coverage_complete": true,
+          "failed_dates": 0,
+          "incomplete_count": 0,
+          "missing_dates_after": 0
+        }
+      },
       "note": "Immutable public TW training tree plus official raw receipts; reproducible panel_cache_v2 stays node-local."
     },
     {
