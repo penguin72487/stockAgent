@@ -145,10 +145,9 @@ def test_repo_tw_modes_have_independent_market_and_artifact_routes() -> None:
     assert {
         "tw",
         "tw_cash",
-        "tw_day_trade_1m",
-        "tw_day_trade",
         "tw_day_trade_multi_basis",
         "tw_day_trade_100m",
+        "tw_day_trade_multi_basis_projection_l1_gelu",
     }.issubset(configs)
     naive = configs["tw"]
     assert naive.market_type == "tw"
@@ -157,22 +156,6 @@ def test_repo_tw_modes_have_independent_market_and_artifact_routes() -> None:
     assert naive.output_dir == "artifacts/markets/tw"
     assert naive.checkpoint_path == "artifacts/markets/tw/fold_25/checkpoint_best.pt"
     assert configs["tw_cash"].output_dir != configs["tw"].output_dir
-    day_trade_1m = configs["tw_day_trade_1m"]
-    assert day_trade_1m.fold_id == 11
-    assert day_trade_1m.initial_capital == 1_000_000.0
-    assert day_trade_1m.config_path == "configs/deployments/tw_day_trade_1m_fold11.yaml"
-    assert day_trade_1m.output_dir == "artifacts/markets/tw_day_trade_1m"
-    assert day_trade_1m.checkpoint_path == (
-        "artifacts/markets/tw_day_trade_1m/fold_11/checkpoint_best.pt"
-    )
-    day_trade = configs["tw_day_trade"]
-    assert day_trade.fold_id == 11
-    assert day_trade.initial_capital == 10_000_000.0
-    assert day_trade.config_path == "configs/deployments/tw_day_trade_10m_fold11.yaml"
-    assert day_trade.output_dir == "artifacts/markets/tw_day_trade_10m"
-    assert day_trade.checkpoint_path == (
-        "artifacts/markets/tw_day_trade_10m/fold_11/checkpoint_best.pt"
-    )
     day_trade_100m = configs["tw_day_trade_100m"]
     assert day_trade_100m.fold_id == 11
     assert day_trade_100m.initial_capital == 100_000_000.0
@@ -195,23 +178,28 @@ def test_repo_tw_modes_have_independent_market_and_artifact_routes() -> None:
     assert multi_basis.checkpoint_path == (
         f"{multi_basis_root}/fold_11/checkpoint_best.pt"
     )
+    projection = configs["tw_day_trade_multi_basis_projection_l1_gelu"]
+    assert projection.fold_id == 11
+    assert projection.initial_capital == 10_000_000.0
+    assert projection.config_path == (
+        "configs/deployments/tw_day_trade_multi_basis_projection_l1_gelu_fold11.yaml"
+    )
     assert (
-        day_trade_1m.live_output_dir
-        == day_trade.live_output_dir
-        == multi_basis.live_output_dir
+        multi_basis.live_output_dir
         == day_trade_100m.live_output_dir
+        == projection.live_output_dir
         == "artifacts/live_signals"
     )
     shared_refresh = (
-        "{python}",
-        "scripts/refresh_tw_public_live_snapshot.py",
-        "--config",
-        "configs/markets/tw_day_trade_10m.yaml",
+        "scripts/run_data_cache.sh",
+        "use",
+        "tw-public",
+        "--link",
+        "data_tw_public",
     )
-    assert day_trade_1m.pre_signal_command == shared_refresh
-    assert day_trade.pre_signal_command == shared_refresh
     assert multi_basis.pre_signal_command == shared_refresh
     assert day_trade_100m.pre_signal_command == shared_refresh
+    assert projection.pre_signal_command == shared_refresh
 
 
 def test_repo_multi_basis_fold11_deployment_keeps_checkpoint_model_contract() -> None:

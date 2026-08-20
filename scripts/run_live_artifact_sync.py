@@ -170,12 +170,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--local-root", type=Path, default=Path("artifacts"))
     parser.add_argument(
-        "--sync-root", type=Path, default=Path("/srv/stockagent-artifacts-live")
+        "--sync-root", type=Path, default=Path("/srv/stockagent-artifacts-hot")
     )
     parser.add_argument(
         "--status-path",
         type=Path,
-        default=Path("/var/lib/stockagent-live-artifact-sync/status.json"),
+        default=Path("/var/lib/stockagent-hot-artifact-sync/status.json"),
     )
     parser.add_argument("--settle-seconds", type=float, default=1.0)
     parser.add_argument("--full-scan-seconds", type=float, default=300.0)

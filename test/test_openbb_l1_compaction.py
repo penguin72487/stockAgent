@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
+import json
+import os
 import sqlite3
 
 import duckdb
@@ -10,14 +12,20 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from downloader.download_openbb_archive import DownloadTask, Manifest, TaskResult
-from scripts.compact_openbb_l1 import TaskShard, _segment_batches, run
+from scripts.compact_openbb_l1 import (
+    TaskShard,
+    _archive_compaction_allowed,
+    _segment_batches,
+    run,
+)
 
 
 ENDPOINT = "equity.price.historical"
 
 
-def test_segment_batches_enforce_rows_and_uncompressed_bytes_before_file_minimum(
-) -> None:
+def test_segment_batches_enforce_rows_and_uncompressed_bytes_before_file_minimum() -> (
+    None
+):
     shards = [
         TaskShard(
             task_id=f"task-{index}",
@@ -48,6 +56,75 @@ def test_segment_batches_enforce_rows_and_uncompressed_bytes_before_file_minimum
         ["task-1"],
         ["task-2"],
     ]
+
+
+def test_segment_batches_never_union_different_parquet_schemas() -> None:
+    shards = [
+        TaskShard(
+            task_id=f"task-{index}",
+            endpoint=ENDPOINT,
+            output_path=f"/{index}.parquet",
+            rows=1,
+            task_updated_at="2026-01-01T00:00:00+00:00",
+            bytes=10,
+            uncompressed_bytes=20,
+            mtime_ns=index,
+            schema_fingerprint="schema-a" if index % 2 == 0 else "schema-b",
+        )
+        for index in range(4)
+    ]
+    batches = list(
+        _segment_batches(
+            shards,
+            max_files=100,
+            max_bytes=1_000,
+            max_uncompressed_bytes=1_000,
+            max_rows=100,
+            min_files=1,
+            include_tail=True,
+        )
+    )
+    assert [[item.task_id for item in batch] for batch in batches] == [
+        ["task-0", "task-2"],
+        ["task-1", "task-3"],
+    ]
+
+
+def test_archive_idle_guard_prioritizes_downloader_work(tmp_path: Path) -> None:
+    state = tmp_path / "_state"
+    state.mkdir()
+    (state / "downloader.pid").write_text(str(os.getpid()), encoding="utf-8")
+    phase_path = state / "downloader_phase.json"
+    scheduler_path = state / "provider_scheduler.json"
+
+    phase_path.write_text(json.dumps({"phase": "planning"}), encoding="utf-8")
+    assert _archive_compaction_allowed(state) == (False, "archive_phase_planning")
+
+    phase_path.write_text(json.dumps({"phase": "download"}), encoding="utf-8")
+    scheduler_path.write_text(
+        json.dumps(
+            {
+                "phase": "waiting",
+                "active_total": 0,
+                "buffered_total": 0,
+                "completed_pending_total": 0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    phase_mtime = phase_path.stat().st_mtime_ns
+    os.utime(scheduler_path, ns=(phase_mtime + 1, phase_mtime + 1))
+    assert _archive_compaction_allowed(state) == (
+        True,
+        "archive_waiting_for_provider_quota",
+    )
+
+    scheduler_path.write_text(json.dumps({"phase": "running"}), encoding="utf-8")
+    os.utime(scheduler_path, ns=(phase_mtime + 2, phase_mtime + 2))
+    assert _archive_compaction_allowed(state) == (
+        False,
+        "archive_scheduler_running",
+    )
 
 
 def _task(root: Path, task_id: str) -> DownloadTask:

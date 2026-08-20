@@ -234,11 +234,14 @@
       "publish": true,
       "pack_buckets": 32,
       "loose_threshold_mib": 8,
+      "excluded_subtrees": [
+        "shioaji_fop_captures/runtime"
+      ],
       "active_process_substrings": [
         "download_taifex_recent_index_derivatives_ticks.py",
         "build_taifex_index_derivatives_tick_dataset.py"
       ],
-      "note": "Official raw tick downloads, normalized outputs, receipts and manifests."
+      "note": "Official raw tick downloads, normalized outputs, receipts, manifests and immutable live-capture parts; node-local mutable runtime worker state is excluded."
     },
     {
       "dataset": "tw-index-options-daily",

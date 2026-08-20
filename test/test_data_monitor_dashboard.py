@@ -121,6 +121,117 @@ def test_data_monitor_uses_fresh_progress_receipt_for_eta(tmp_path: Path) -> Non
     )
 
 
+def test_running_legacy_page_progress_cannot_claim_false_hundred_percent(
+    tmp_path: Path,
+) -> None:
+    registry = tmp_path / "configs/data_sync"
+    registry.mkdir(parents=True)
+    (registry / "packed_datasets.json").write_text(
+        json.dumps(
+            {
+                "datasets": [
+                    {
+                        "dataset": "binance",
+                        "source": "data_binance",
+                        "role": "training",
+                        "publish": True,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    data = tmp_path / "data_binance/1m"
+    data.mkdir(parents=True)
+    (data / "progress.json").write_text(
+        json.dumps(
+            {
+                "state": "running",
+                "phase": "taker_buy_sell_volume",
+                "current": 6_270,
+                "total": 6_270,
+                "unit": "request-page-or-feature-stage",
+                "remaining_seconds": 0,
+                "updated_at_utc": "2026-08-20T01:00:00+00:00",
+                "status_counts": {"page_fetched": 400_000, "ok": 800},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    payload = build_data_monitor_public_status(
+        tmp_path,
+        now=datetime(2026, 8, 20, 1, 1, tzinfo=UTC),
+        refresh_services={},
+    )
+    group = payload["groups"][0]
+
+    assert group["status"] == "updating"
+    assert group["coverage"] is None
+    assert group["eta"]["state"] == "warming_up"
+    assert group["eta"]["remaining_seconds"] is None
+    assert any("假 100%" in warning for warning in group["warnings"])
+
+
+def test_partial_archive_summary_cannot_be_hidden_by_complete_progress(
+    tmp_path: Path,
+) -> None:
+    registry = tmp_path / "configs/data_sync"
+    registry.mkdir(parents=True)
+    (registry / "packed_datasets.json").write_text(
+        json.dumps(
+            {
+                "datasets": [
+                    {
+                        "dataset": "binance-public-archive",
+                        "source": "data_binance_archive",
+                        "role": "training",
+                        "publish": True,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    archive = tmp_path / "data_binance_archive"
+    archive.mkdir()
+    (archive / "download_summary.json").write_text(
+        json.dumps(
+            {
+                "state": "partial",
+                "end_date": "2026-08-19",
+                "status_counts": {
+                    "complete": 306_378,
+                    "quarantined_repair_required": 1_355,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (archive / "progress.json").write_text(
+        json.dumps(
+            {
+                "state": "complete",
+                "current": 307_733,
+                "total": 307_733,
+                "updated_at_utc": "2026-08-20T00:00:00+00:00",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    payload = build_data_monitor_public_status(
+        tmp_path,
+        now=datetime(2026, 8, 20, 1, 0, tzinfo=UTC),
+        refresh_services={},
+    )
+    group = payload["groups"][0]
+
+    assert group["status"] == "degraded"
+    assert group["coverage"]["ratio"] < 1.0
+    assert "失敗" in group["status_label"]
+
+
 def test_sequential_service_does_not_mark_future_provider_stage_active(
     tmp_path: Path,
 ) -> None:
@@ -195,7 +306,8 @@ def test_data_monitor_page_is_local_read_only_and_exposes_progress() -> None:
     root = Path(__file__).resolve().parents[1] / "services/data_monitor_dashboard"
     html = (root / "index.html").read_text(encoding="utf-8")
     javascript = (root / "app.js").read_text(encoding="utf-8")
-    assert "dashboard-core.css?v=5" in html
+    assert "dashboard-core.css?v=6" in html
+    assert 'src="../dashboard-core.js?v=1"' in html
     assert 'role="status" aria-live="polite"' in html
     assert 'class="table-scroll" tabindex="0" role="region"' in html
     assert "DETAIL_LINKS.has" in javascript
@@ -210,6 +322,13 @@ def test_data_monitor_page_is_local_read_only_and_exposes_progress() -> None:
     assert "remaining_seconds" in javascript
     assert "OPERATION_ORDER" in javascript
     assert "automation.next_run_at_utc" in javascript
+    assert "publicationLines" in javascript
+    assert "row.acquisition_progress" in javascript
+    assert "發布／偵測／下次取得" in html
+    assert "首筆到達就推進下一資料日" in html
+    assert "min-width:1440px" not in (root / "styles.css").read_text(
+        encoding="utf-8"
+    )
     assert "正在抓／還沒到最新" in html
     assert "正在串流" in html
     assert "已完成／已到最新" in html
@@ -257,6 +376,103 @@ def test_operation_sort_and_endpoint_timing_reconcile(tmp_path: Path) -> None:
     assert payload["endpoint_inventory"]["timing_defined"] == len(rows)
     assert all(row["endpoint_id"] for row in rows)
     assert all(row["automation"]["schedule_label"] for row in rows)
+    assert all(row["publication"]["schedule_label"] for row in rows)
+    assert all("acquisition_progress" in row for row in rows)
+
+
+def test_first_data_advances_next_date_without_claiming_full_completion() -> None:
+    row = {
+        "id": "fixture:daily",
+        "parent_id": "group:yahoo-market",
+        "scope": "logical_source",
+        "title": "fixture daily",
+        "provider": "fixture",
+        "status": "updating",
+        "status_label": "running",
+        "cadence": "每日",
+        "latest_at_utc": "2026-08-19T06:01:00Z",
+        "data_through": "2026-08-19",
+        "coverage": {
+            "current": 1,
+            "total": 10,
+            "ratio": 0.1,
+            "unit": "檔",
+            "label": "目前批次",
+        },
+        "freshness": {"state": "current", "age_seconds": 60},
+        "eta": {"state": "estimating", "remaining_seconds": 90},
+        "automation_eligible": True,
+    }
+
+    enriched = dashboard._enrich_and_sort_rows(
+        [row],
+        now=datetime(2026, 8, 19, 6, 2, tzinfo=UTC),
+        refresh_services={"registered_daily": {"active": True}},
+    )[0]
+    progress = enriched["acquisition_progress"]
+
+    assert progress["first_data_observed"] is True
+    assert progress["preparing_for_date"] == "2026-08-20"
+    assert progress["ratio"] == 0.1
+    assert progress["batch_complete"] is False
+    assert progress["up_to_date"] is False
+    assert progress["state"] == "acquiring"
+
+
+def test_unknown_denominator_stays_unknown_until_completed_receipt() -> None:
+    publication = {"detected_at_utc": None, "applied_at_utc": None}
+    partial = dashboard._acquisition_progress(
+        {"data_through": "2026-08-19", "rows": 1, "coverage": None},
+        operation="catching_up",
+        execution="running",
+        publication=publication,
+    )
+    complete = dashboard._acquisition_progress(
+        {
+            "data_through": "2026-08-19",
+            "rows": 1,
+            "coverage": None,
+            "latest_at_utc": "2026-08-19T06:00:00Z",
+            "eta": {"state": "complete"},
+        },
+        operation="complete",
+        execution="idle_current",
+        publication=publication,
+    )
+
+    assert partial["ratio"] is None
+    assert partial["up_to_date"] is False
+    assert complete["ratio"] == 1.0
+    assert complete["unit"] == "完成收據"
+    assert complete["up_to_date"] is True
+
+
+def test_tw_publication_receipt_keeps_probe_boundary_and_detection_separate(
+    tmp_path: Path,
+) -> None:
+    receipt = tmp_path / "artifacts/data_refresh/tw_public/publications/close"
+    receipt.mkdir(parents=True)
+    (receipt / "latest.json").write_text(
+        json.dumps(
+            {
+                "phase": "close",
+                "scheduled_boundary": "14:00:00",
+                "official_basis": "fixture product boundary",
+                "started_at_taipei": "2026-08-19T14:00:01+08:00",
+                "completed_at_taipei": "2026-08-19T14:00:03+08:00",
+                "status": "ok",
+                "selected_datasets": ["fixture"],
+                "changed_datasets": [{"dataset": "fixture"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    index = dashboard._tw_public_publication_index(tmp_path)
+
+    assert index["fixture"][0]["scheduled_boundary"] == "14:00:00"
+    assert index["fixture"][0]["content_change_observed"] is True
+    assert index["fixture"][0]["last_completed_at_utc"] == "2026-08-19T06:00:03Z"
 
 
 def test_streaming_requires_open_window_and_recent_endpoint_heartbeat() -> None:
@@ -614,6 +830,15 @@ def test_registered_refresh_reuses_downloaders_and_preserves_tw_snapshot_owner()
     assert 'YAHOO_ASSETS=""' in runner
     assert "RUN_YAHOO=0" in runner
     assert "RUN_CEX_PERP=1" in runner
+    assert "CRYPTO_TAIL_ONLY=1" in runner
+    assert "CRYPTO_HISTORICAL_FEATURES=0" in runner
+    assert "CRYPTO_HISTORICAL_FEATURES=1" in runner
+    assert "registered-backfill" in runner
+    assert "CRYPTO_TAIL_ONLY=0" in runner
+    assert "registered_backfill" in dashboard._REFRESH_UNITS
+    assert "registered_backfill" in dashboard._AUTOMATION_PROFILES[
+        "group:okx"
+    ]["service_keys"]
     assert "RUN_CRYPTO_REFERENCE=1" in runner
     assert "CRYPTO_ACTIVE_INTRADAY_GRAIN=1m" in runner
     assert "RUN_CRYPTO_TRADE_TICKS=0" in runner

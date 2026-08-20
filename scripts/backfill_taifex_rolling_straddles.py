@@ -28,7 +28,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from downloader.shioaji_capture_parts import (  # noqa: E402
-    read_capture_manifests,
+    read_capture_manifest_groups,
     select_capture_part_paths,
 )
 from stockagent.data.taifex_sessions import TAIPEI  # noqa: E402
@@ -38,13 +38,13 @@ from stockagent.live.taifex_volatility_simulation import (  # noqa: E402
     TaifexVolatilitySimulation,
 )
 from stockagent.research.taifex_volatility_metadata import (  # noqa: E402
-    ROLLING_STRADDLE_IDS,
+    STRATEGY_IDS,
     STRATEGY_MODE_INTRADAY_FUTURES,
 )
 
 
-REPLAY_CONTRACT_VERSION = 1
-REPLAY_SOURCE = "shioaji_worker0_completed_second_bidask"
+REPLAY_CONTRACT_VERSION = 2
+REPLAY_SOURCE = "shioaji_worker0_completed_second_bidask_recapitalizing"
 BOOK_COLUMNS = [
     "snapshot_ts_ns",
     "code",
@@ -95,19 +95,24 @@ def _atomic_jsonl(path: Path, rows: Iterable[Mapping[str, Any]]) -> int:
     return count
 
 
-def _manifest_paths(capture_root: Path, trade_date: date) -> list[Path]:
-    return sorted(
-        (capture_root / "manifests" / f"trade_date={trade_date.isoformat()}").glob(
-            "worker=*.json"
-        )
-    )
+def _manifest_paths(
+    capture_root: Path,
+    trade_date: date,
+    capture_session: str | None,
+) -> list[Path]:
+    root = capture_root / "manifests" / f"trade_date={trade_date.isoformat()}"
+    if capture_session is not None:
+        root = root / f"session={capture_session}"
+    return sorted(root.glob("worker=*.json"))
 
 
 def _validate_manifest_group(
     capture_root: Path,
     trade_date: date,
+    capture_session: str | None,
+    manifests: Iterable[Mapping[str, Any]],
 ) -> tuple[list[dict[str, Any]], dict[str, Any], list[Path]]:
-    manifests = read_capture_manifests(capture_root, trade_date.isoformat())
+    manifests = [dict(row) for row in manifests]
     if not manifests:
         raise RuntimeError(f"no finalized capture manifests for {trade_date}")
     declared_workers = {int(row.get("workers", 0)) for row in manifests}
@@ -119,13 +124,24 @@ def _validate_manifest_group(
     capture_ids = {str(row.get("capture_id") or "") for row in manifests}
     if len(capture_ids) != 1 or "" in capture_ids:
         raise RuntimeError(f"worker capture identity mismatch for {trade_date}")
+    statuses = {str(manifest.get("status") or "") for manifest in manifests}
+    if len(statuses) != 1 or not statuses <= {"complete", "stopped_by_signal"}:
+        raise RuntimeError(
+            f"capture is not finalized for {trade_date}/{capture_session}: "
+            f"{sorted(statuses)}"
+        )
     for manifest in manifests:
         if manifest.get("source") != "shioaji_taifex_tick_bidask_v1":
             raise RuntimeError(f"unexpected capture source for {trade_date}")
-        if manifest.get("status") != "complete":
-            raise RuntimeError(f"capture is not complete for {trade_date}")
         if int(manifest.get("dropped_events", -1)) != 0:
             raise RuntimeError(f"capture dropped callback events for {trade_date}")
+        declared_session = str(manifest.get("capture_session") or "day")
+        expected_session = str(capture_session or declared_session)
+        if declared_session != expected_session:
+            raise RuntimeError(
+                f"capture session mismatch for {trade_date}: "
+                f"manifest={declared_session} path={expected_session}"
+            )
     worker_zero = [row for row in manifests if int(row.get("worker_index", -1)) == 0]
     if len(worker_zero) != 1:
         raise RuntimeError(f"capture has no unique strategy worker 0 for {trade_date}")
@@ -221,7 +237,19 @@ def _iter_completed_seconds(
 ) -> Iterable[tuple[int, list[dict[str, Any]]]]:
     pending_timestamp: int | None = None
     pending_rows: list[dict[str, Any]] = []
-    for path in paths:
+    paths = list(paths)
+    first_snapshot_by_path = {
+        path: int(
+            pl.read_parquet(path, columns=["snapshot_ts_ns"])
+            .get_column("snapshot_ts_ns")
+            .min()
+        )
+        for path in paths
+    }
+    for path in sorted(
+        paths,
+        key=lambda candidate: (first_snapshot_by_path[candidate], str(candidate)),
+    ):
         frame = pl.read_parquet(path, columns=BOOK_COLUMNS).sort(
             ["snapshot_ts_ns", "code"]
         )
@@ -292,7 +320,7 @@ def main() -> int:
     if end_date < args.start_date:
         raise ValueError("end date is before start date")
     output_dir = args.output_dir or (
-        args.state_dir / "backfills" / "rolling_straddles_bidask_v1"
+        args.state_dir / "backfills" / "all_strategies_bidask_recapitalizing_v2"
     )
     output_dir.mkdir(parents=True, exist_ok=True)
     lock_path = output_dir / "backfill.lock"
@@ -300,14 +328,13 @@ def main() -> int:
     try:
         fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError as exc:
-        raise RuntimeError("another rolling-straddle backfill is running") from exc
+        raise RuntimeError("another TAIFEX strategy backfill is running") from exc
 
     replay_id = (
-        f"rolling-straddles-{args.start_date.isoformat()}-{end_date.isoformat()}-"
+        f"all-strategies-{args.start_date.isoformat()}-{end_date.isoformat()}-"
         f"v{REPLAY_CONTRACT_VERSION}"
     )
-    finalized_days: list[date] = []
-    day_sources: dict[date, dict[str, Any]] = {}
+    replay_sources: list[dict[str, Any]] = []
     all_metadata: dict[str, dict[str, Any]] = {}
     manifest_receipts: list[dict[str, Any]] = []
     for manifest_dir in sorted((args.capture_root / "manifests").glob("trade_date=*")):
@@ -317,67 +344,98 @@ def main() -> int:
             continue
         if not args.start_date <= trade_date <= end_date:
             continue
-        manifests, worker_zero, parts = _validate_manifest_group(
-            args.capture_root, trade_date
-        )
-        if str(worker_zero.get("capture_session") or "day") != "day":
-            continue
-        metadata = _instrument_metadata([worker_zero])
-        for code, row in metadata.items():
-            existing = all_metadata.get(code)
-            if existing is not None and _contract_identity(
-                existing
-            ) != _contract_identity(row):
-                raise RuntimeError(f"contract metadata changed across replay: {code}")
-            all_metadata.setdefault(code, row)
-        finalized_days.append(trade_date)
-        day_sources[trade_date] = {
-            "manifests": manifests,
-            "worker_zero": worker_zero,
-            "parts": parts,
-            "metadata": metadata,
-        }
-        manifest_paths = _manifest_paths(args.capture_root, trade_date)
-        manifest_receipts.append(
-            {
-                "trade_date": trade_date.isoformat(),
-                "capture_id": str(worker_zero["capture_id"]),
-                "capture_session": str(worker_zero.get("capture_session") or "day"),
-                "worker_count": len(manifests),
-                "worker_0_contract_count": int(worker_zero["contract_count"]),
-                "worker_0_book_1s_rows": int(worker_zero["book_1s_rows_written"]),
-                "worker_0_book_1s_parts": len(parts),
-                "dropped_events": sum(int(row["dropped_events"]) for row in manifests),
-                "manifest_sha256": {
-                    str(path.relative_to(args.capture_root)): _sha256(path)
-                    for path in manifest_paths
-                },
-                "part_inventory_sha256": hashlib.sha256(
-                    "\n".join(
-                        f"{path.relative_to(args.capture_root)}|{path.stat().st_size}|"
-                        f"{path.stat().st_mtime_ns}"
-                        for path in parts
-                    ).encode("utf-8")
-                ).hexdigest(),
+        for capture_session, raw_manifests in read_capture_manifest_groups(
+            args.capture_root,
+            trade_date.isoformat(),
+        ):
+            manifests, worker_zero, parts = _validate_manifest_group(
+                args.capture_root,
+                trade_date,
+                capture_session,
+                raw_manifests,
+            )
+            metadata = _instrument_metadata([worker_zero])
+            for code, row in metadata.items():
+                existing = all_metadata.get(code)
+                if existing is not None and _contract_identity(
+                    existing
+                ) != _contract_identity(row):
+                    raise RuntimeError(
+                        f"contract metadata changed across replay: {code}"
+                    )
+                all_metadata.setdefault(code, row)
+            started_at = datetime.fromisoformat(
+                str(worker_zero["started_at_utc"]).replace("Z", "+00:00")
+            )
+            source = {
+                "trade_date": trade_date,
+                "capture_session": str(
+                    worker_zero.get("capture_session") or capture_session or "day"
+                ),
+                "started_ts_ns": int(started_at.timestamp() * 1e9),
+                "manifests": manifests,
+                "worker_zero": worker_zero,
+                "parts": parts,
+                "metadata": metadata,
             }
+            replay_sources.append(source)
+            manifest_paths = _manifest_paths(
+                args.capture_root,
+                trade_date,
+                capture_session,
+            )
+            manifest_receipts.append(
+                {
+                    "trade_date": trade_date.isoformat(),
+                    "capture_id": str(worker_zero["capture_id"]),
+                    "capture_session": source["capture_session"],
+                    "capture_status": str(worker_zero["status"]),
+                    "worker_count": len(manifests),
+                    "worker_0_contract_count": int(worker_zero["contract_count"]),
+                    "worker_0_book_1s_rows": int(
+                        worker_zero["book_1s_rows_written"]
+                    ),
+                    "worker_0_book_1s_parts": len(parts),
+                    "dropped_events": sum(
+                        int(row["dropped_events"]) for row in manifests
+                    ),
+                    "manifest_sha256": {
+                        str(path.relative_to(args.capture_root)): _sha256(path)
+                        for path in manifest_paths
+                    },
+                    "part_inventory_sha256": hashlib.sha256(
+                        "\n".join(
+                            f"{path.relative_to(args.capture_root)}|"
+                            f"{path.stat().st_size}|{path.stat().st_mtime_ns}"
+                            for path in parts
+                        ).encode("utf-8")
+                    ).hexdigest(),
+                }
+            )
+    replay_sources.sort(
+        key=lambda row: (
+            int(row["started_ts_ns"]),
+            str(row["capture_session"]),
         )
-    if not finalized_days:
-        raise RuntimeError("no complete day-session captures are replayable")
+    )
+    if not replay_sources:
+        raise RuntimeError("no finalized day/night capture groups are replayable")
+    finalized_days = sorted({source["trade_date"] for source in replay_sources})
 
     option_infos = [
         _option_info(row)
         for row in all_metadata.values()
         if str(row.get("security_type") or "") == "OPT"
     ]
-    metadata_rows = list(all_metadata.values())
-    underlying = _future_instrument(metadata_rows, logical_code="TXFR1")
-    hedge = _future_instrument(metadata_rows, logical_code="TMFR1")
+    initial_metadata_rows = list(replay_sources[0]["metadata"].values())
+    underlying = _future_instrument(initial_metadata_rows, logical_code="TXFR1")
+    hedge = _future_instrument(initial_metadata_rows, logical_code="TMFR1")
     marks: list[dict[str, Any]] = []
     replayed_seconds = 0
-    first_snapshot_by_day: dict[str, int] = {}
-    last_snapshot_by_day: dict[str, int] = {}
+    first_snapshot_by_source: dict[str, int] = {}
+    last_snapshot_by_source: dict[str, int] = {}
     uncaptured_held_codes: dict[str, list[str]] = {}
-    with tempfile.TemporaryDirectory(prefix="taifex-rolling-backfill-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="taifex-strategy-backfill-") as temporary:
         replay_state_dir = Path(temporary) / "state"
         fake_api = SimpleNamespace(futopt_account=SimpleNamespace())
         engine = TaifexVolatilitySimulation(
@@ -391,14 +449,33 @@ def main() -> int:
             bootstrap_after=args.start_date - timedelta(days=1),
             broker_orders_enabled=False,
             strategy_mode=STRATEGY_MODE_INTRADAY_FUTURES,
-            active_strategy_ids=ROLLING_STRADDLE_IDS,
+            active_strategy_ids=STRATEGY_IDS,
         )
         option_by_code = dict(engine.options_by_code)
         last_mark_bucket: int | None = None
         last_snapshot_ns = 0
-        for trade_date in finalized_days:
-            source = day_sources[trade_date]
+        for source in replay_sources:
+            trade_date = source["trade_date"]
+            source_key = (
+                f"{trade_date.isoformat()}:{source['capture_session']}:"
+                f"{source['worker_zero']['capture_id']}"
+            )
+            source_replayed_seconds = 0
+            print(
+                "[taifex-strategy-backfill] "
+                f"group_start={source_key} parts={len(source['parts'])}",
+                flush=True,
+            )
             subscribed_codes = set(source["metadata"])
+            source_metadata_rows = list(source["metadata"].values())
+            engine.underlying = _future_instrument(
+                source_metadata_rows,
+                logical_code="TXFR1",
+            )
+            engine.hedge = _future_instrument(
+                source_metadata_rows,
+                logical_code="TMFR1",
+            )
             current_options = tuple(
                 option_by_code[code]
                 for code in subscribed_codes
@@ -416,9 +493,10 @@ def main() -> int:
                     ),
                 )
             )
+            engine.latest_books.clear()
             held_codes = {
                 str(code)
-                for strategy_id in ROLLING_STRADDLE_IDS
+                for strategy_id in STRATEGY_IDS
                 for code, quantity in (
                     engine.state["strategies"][strategy_id].get("option_positions")
                     or {}
@@ -427,30 +505,40 @@ def main() -> int:
             }
             missing_held = sorted(held_codes - subscribed_codes)
             if missing_held:
-                uncaptured_held_codes[trade_date.isoformat()] = missing_held
+                uncaptured_held_codes[source_key] = missing_held
             for snapshot_ns, rows in _iter_completed_seconds(source["parts"]):
                 if snapshot_ns <= last_snapshot_ns:
                     raise RuntimeError("completed-second replay clock is not increasing")
                 last_snapshot_ns = snapshot_ns
-                first_snapshot_by_day.setdefault(trade_date.isoformat(), snapshot_ns)
-                last_snapshot_by_day[trade_date.isoformat()] = snapshot_ns
+                first_snapshot_by_source.setdefault(source_key, snapshot_ns)
+                last_snapshot_by_source[source_key] = snapshot_ns
                 for row in rows:
                     engine.on_book(row)
                 observed_now = datetime.fromtimestamp(snapshot_ns / 1e9, tz=TAIPEI)
+                engine._maybe_settle_expired_put_call_parity(
+                    observed_now,
+                    snapshot_ns,
+                )
                 engine._maybe_settle_expired_cycle(observed_now, snapshot_ns)
                 engine._maybe_open_cycle(observed_now, snapshot_ns)
                 session_state = engine._intraday_session_state(observed_now)
                 if bool(session_state["entry_allowed"]):
                     engine._maybe_enter_cycle_strategies(snapshot_ns)
                 engine._maybe_roll_straddles(snapshot_ns)
+                engine._maybe_execute_pending_targets(observed_now, snapshot_ns)
+                engine._maybe_apply_fixed_future_targets(observed_now, snapshot_ns)
+                engine._maybe_run_put_call_parity(observed_now, snapshot_ns)
                 engine._maybe_flatten_expiry_hedges(observed_now, snapshot_ns)
+                engine._maybe_flatten_intraday_futures(observed_now, snapshot_ns)
+                engine._maybe_calibrate(observed_now, snapshot_ns)
                 engine._maybe_enforce_strategy_margin(snapshot_ns)
                 replayed_seconds += 1
+                source_replayed_seconds += 1
                 mark_bucket = snapshot_ns // 60_000_000_000
                 if mark_bucket == last_mark_bucket:
                     continue
                 last_mark_bucket = mark_bucket
-                for strategy_id in ROLLING_STRADDLE_IDS:
+                for strategy_id in STRATEGY_IDS:
                     mark = engine._strategy_mark(strategy_id, snapshot_ns)
                     mark.update(
                         {
@@ -458,12 +546,18 @@ def main() -> int:
                             "replay_contract_version": REPLAY_CONTRACT_VERSION,
                             "replay_id": replay_id,
                             "source_trade_date": trade_date.isoformat(),
+                            "source_capture_session": source["capture_session"],
                             "source_capture_id": str(
                                 source["worker_zero"]["capture_id"]
                             ),
                         }
                     )
                     marks.append(mark)
+            print(
+                "[taifex-strategy-backfill] "
+                f"group_complete={source_key} seconds={source_replayed_seconds}",
+                flush=True,
+            )
 
         cycle = engine.state.get("active_cycle")
         if isinstance(cycle, Mapping):
@@ -480,7 +574,7 @@ def main() -> int:
                     raise RuntimeError(
                         f"official final settlement did not close replay cycle {expiry}"
                     )
-                for strategy_id in ROLLING_STRADDLE_IDS:
+                for strategy_id in STRATEGY_IDS:
                     mark = engine._strategy_mark(strategy_id, settlement_ns)
                     mark.update(
                         {
@@ -514,6 +608,11 @@ def main() -> int:
             output_dir / "events.jsonl",
             replay_id=replay_id,
         )
+        capital_contribution_count = _copy_jsonl_with_replay_provenance(
+            replay_state_dir / "capital_contributions.jsonl",
+            output_dir / "capital_contributions.jsonl",
+            replay_id=replay_id,
+        )
         _atomic_json(output_dir / "terminal_state.json", terminal_state)
 
     terminal_summary = {
@@ -530,6 +629,28 @@ def main() -> int:
                 terminal_state["strategies"][strategy_id].get("initial_capital_twd")
                 or 0.0
             ),
+            "cumulative_contributed_capital_twd": float(
+                terminal_state["strategies"][strategy_id].get(
+                    "cumulative_contributed_capital_twd"
+                )
+                or 0.0
+            ),
+            "capital_contribution_count": int(
+                terminal_state["strategies"][strategy_id].get(
+                    "capital_contribution_count"
+                )
+                or 0
+            ),
+            "recapitalization_count": int(
+                terminal_state["strategies"][strategy_id].get(
+                    "recapitalization_count"
+                )
+                or 0
+            ),
+            "bankruptcy_count": int(
+                terminal_state["strategies"][strategy_id].get("bankruptcy_count")
+                or 0
+            ),
             "trade_sides": int(
                 terminal_state["strategies"][strategy_id].get("trade_sides") or 0
             ),
@@ -539,34 +660,42 @@ def main() -> int:
             ),
             "alive": bool(terminal_state["strategies"][strategy_id].get("alive")),
         }
-        for strategy_id in ROLLING_STRADDLE_IDS
+        for strategy_id in STRATEGY_IDS
     }
     source_coverage = []
-    for trade_date in finalized_days:
-        key = trade_date.isoformat()
+    for source in replay_sources:
+        trade_date = source["trade_date"]
+        key = (
+            f"{trade_date.isoformat()}:{source['capture_session']}:"
+            f"{source['worker_zero']['capture_id']}"
+        )
+        if key not in first_snapshot_by_source:
+            continue
         source_coverage.append(
             {
-                "trade_date": key,
-                "capture_session": "day",
+                "trade_date": trade_date.isoformat(),
+                "capture_session": source["capture_session"],
+                "capture_id": str(source["worker_zero"]["capture_id"]),
+                "capture_status": str(source["worker_zero"]["status"]),
                 "coverage_start_utc": datetime.fromtimestamp(
-                    first_snapshot_by_day[key] / 1e9, tz=timezone.utc
+                    first_snapshot_by_source[key] / 1e9, tz=timezone.utc
                 ).isoformat(),
                 "coverage_end_utc": datetime.fromtimestamp(
-                    last_snapshot_by_day[key] / 1e9, tz=timezone.utc
+                    last_snapshot_by_source[key] / 1e9, tz=timezone.utc
                 ).isoformat(),
                 "pre_capture_gap": True,
+                "post_capture_gap": str(source["worker_zero"]["status"])
+                != "complete",
             }
         )
     pending_capture_dates = sorted(
         {
-            path.parent.name.split("=", 1)[1]
-            for path in (args.capture_root / "book_events").glob(
-                "trade_date=*/hour=*"
-            )
-            if path.parent.name.split("=", 1)[1]
+            path.name.split("=", 1)[1]
+            for path in (args.capture_root / "book_1s").glob("trade_date=*")
+            if path.name.split("=", 1)[1]
             not in {day.isoformat() for day in finalized_days}
             and args.start_date.isoformat()
-            <= path.parent.name.split("=", 1)[1]
+            <= path.name.split("=", 1)[1]
             <= end_date.isoformat()
         }
     )
@@ -577,10 +706,12 @@ def main() -> int:
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "requested_start_date": args.start_date.isoformat(),
         "requested_end_date": end_date.isoformat(),
-        "strategy_ids": list(ROLLING_STRADDLE_IDS),
+        "strategy_ids": list(STRATEGY_IDS),
         "execution_contract_version": EXECUTION_CONTRACT_VERSION,
         "replay_contract_version": REPLAY_CONTRACT_VERSION,
         "source": REPLAY_SOURCE,
+        "history_authority": "receipt_verified_replay_over_live_same_interval",
+        "supersedes_replay_contract_versions": [1],
         "causal_clock": {
             "decision": "completed local-receive second on worker 0",
             "entry": "first complete fresh five-level Call/Put and TX books",
@@ -588,6 +719,8 @@ def main() -> int:
             "roll_execution": "strictly later complete old/new five-level books; sell Bid and buy Ask; atomic prevalidation",
             "mark": "signed immediate five-level liquidation side; explicitly labelled carry only",
             "settlement": "official TAIFEX final settlement; never zero or synthetic",
+            "bankruptcy": "force-liquidate only from complete five-level books",
+            "recapitalization": "strictly later TAIFEX trading date; contribute enough to restore one complete strategy-package capital; cumulative P&L never resets",
         },
         "manifest_receipts": manifest_receipts,
         "source_coverage": source_coverage,
@@ -595,8 +728,8 @@ def main() -> int:
         "pending_unfinalized_capture_dates": pending_capture_dates,
         "uncaptured_counterfactual_held_codes": uncaptured_held_codes,
         "limitations": [
-            "Only finalized day-session worker-0 captures can be replayed.",
-            "The 08:30-to-capture-start interval and all sessions without a complete manifest remain unavailable.",
+            "Only receipt-finalized worker-0 day/night capture intervals are replayed; stopped-by-signal intervals are explicitly partial.",
+            "Every pre-capture, post-capture, weekend, holiday, and unmanifested interval remains unavailable and is not interpolated.",
             "No transaction print, midpoint fill, forward fill, cross-worker substitution, or fabricated depth is used.",
             "This is a historical ideal-ledger replay layer and does not mutate the forward live account state or broker simulation ledger.",
         ],
@@ -605,6 +738,7 @@ def main() -> int:
             "marks": mark_count,
             "ideal_trades": trade_count,
             "events": event_count,
+            "capital_contributions": capital_contribution_count,
         },
         "terminal_strategies": terminal_summary,
         "output_sha256": {
@@ -613,14 +747,15 @@ def main() -> int:
                 "marks.jsonl",
                 "ideal_ledger.jsonl",
                 "events.jsonl",
+                "capital_contributions.jsonl",
                 "terminal_state.json",
             )
         },
     }
     _atomic_json(output_dir / "receipt.json", receipt)
     print(
-        "[taifex-rolling-backfill] "
-        f"status={receipt['status']} dates={len(finalized_days)} "
+        "[taifex-strategy-backfill] "
+        f"status={receipt['status']} groups={len(replay_sources)} "
         f"seconds={replayed_seconds} marks={mark_count} trades={trade_count} "
         f"output={output_dir}",
         flush=True,

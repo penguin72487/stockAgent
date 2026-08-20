@@ -1,0 +1,705 @@
+{
+  "surface": "report",
+  "manifest": {
+    "version": 1,
+    "surface": "report",
+    "title": "OpenBB 歷史封存：效能診斷與修正驗收",
+    "description": "2000 年後 OpenBB 歷史資料封存的即時狀態、第一性原理瓶頸分析、程式修正與現場效能驗收。",
+    "generatedAt": "2026-08-20T12:39:23+08:00",
+    "blocks": [
+      {
+        "id": "title",
+        "type": "markdown",
+        "body": "# OpenBB 歷史封存：效能診斷與修正驗收"
+      },
+      {
+        "id": "technical-summary",
+        "type": "markdown",
+        "body": "## Technical Summary\n\nOpenBB 現在有在運作，但已完成所有目前可立即執行的工作，因此進入低成本等待。8,909,579 個有效任務中已有 8,899,586 個進入終止狀態；剩餘 9,993 個任務由 FMP 每日配額與 Congress.gov 暫時性錯誤控制，不是本機算力不足。修正後，等待期跨過一次 30 秒心跳的 20 秒實測為 CPU 0.000 秒、實體讀取 0、邏輯讀取 0，只寫入 8 KB 狀態檔。"
+      },
+      {
+        "id": "summary-metrics",
+        "type": "metric-strip",
+        "cardIds": [
+          "resolved-rate",
+          "accepted-rate",
+          "success-rows",
+          "wait-cpu"
+        ]
+      },
+      {
+        "id": "key-findings",
+        "type": "markdown",
+        "body": "## Key Findings\n\n- 舊瓶頸不是 API，而是每次重啟重新規劃數百萬任務、逐檔核對成功 shard，以及在等待期每 30 秒掃描大型 SQLite manifest。\n- 穩定 resume 現在沿用同一 plan；一次性的外來 plan 1,505,804 個 active 任務已退休，沒有遺失既有成功進度。\n- 9,968 個 pending 任務只剩 FMP 可用，而目前每日 250-request 配額已耗盡；提高本機 workers 無法突破帳號配額。\n- 25 個 Congress.gov 任務使用 durable exponential backoff；12:29 到期時只做受控重試，沒有重現每分鐘數十次的 retry churn。"
+      },
+      {
+        "id": "pending-chart-block",
+        "type": "chart",
+        "chartId": "pending-by-endpoint"
+      },
+      {
+        "id": "resource-heading",
+        "type": "markdown",
+        "body": "## Current Resource Attribution\n\nOpenBB 等待程序目前約 0.43 GiB RSS。主機上較高的 CPU 與記憶體消耗主要來自獨立的 Bybit、Binance 與 OKX 永續合約分鐘資料程序；它們不屬於本次 OpenBB 工作，因此沒有被停止或修改。"
+      },
+      {
+        "id": "resource-table-block",
+        "type": "table",
+        "tableId": "resource-attribution"
+      },
+      {
+        "id": "efficiency-heading",
+        "type": "markdown",
+        "body": "## Before / After Evidence\n\n重新啟動成本從至少 1,068 秒且仍未完成規劃，降為 34–39 秒進入既有 plan 的下載排程；保守改善下限為 27.4 倍。等待期也不再重掃 manifest。"
+      },
+      {
+        "id": "efficiency-table-block",
+        "type": "table",
+        "tableId": "efficiency-comparison"
+      },
+      {
+        "id": "scope-data-metrics",
+        "type": "markdown",
+        "body": "## Scope, Data, and Metric Definitions\n\n範圍是 active plan `56e52165c96966261d74547b`，日期 2000-01-01 至 2026-07-18。`accepted` 定義為 success + confirmed empty；`resolved terminal` 再加 unavailable。Unavailable 代表目前 provider/權限/資料能力已證明不可取得，不應假裝成 pending。News 的 473,824 個任務全數屬 unavailable，並非仍在背景等待下載。"
+      },
+      {
+        "id": "methodology",
+        "type": "markdown",
+        "body": "## Methodology\n\n以 SQLite task manifest、scheduler JSON、systemd journal、`/proc/<pid>/io` 與 systemd cgroup 統計交叉驗證。修正後重啟正式服務，確認相同 plan 被恢復、foreign active tasks 為 0、scheduler 進入 waiting，並在跨越 heartbeat 的觀察窗量測 CPU 與 I/O 差分。程式驗證涵蓋 350 項 OpenBB 測試，以及 shell 語法、Python 編譯、Ruff 與 diff whitespace checks。"
+      },
+      {
+        "id": "limitations",
+        "type": "markdown",
+        "body": "## Limitations and Robustness\n\n舊版啟動的 1,068 秒是觀察下限，當時仍停在 planning，因此真實完整成本更高。程序表的 CPU% 是 `ps` 自程序啟動起的平均值，而等待期 CPU/I/O 是短窗差分，兩者不可直接當成同一統計口徑。FMP 的至少 40 個額外 reset boundaries 假設每個 pending 任務約消耗一個 HTTP request；實際 endpoint request cost 可能使時間更長。"
+      },
+      {
+        "id": "next-steps",
+        "type": "markdown",
+        "body": "## Next Steps\n\n1. 保持 archive service 執行；它會在 Congress deadline 或 FMP reset 時自動醒來。\n2. 不再增加 FMP concurrency，因為帳號每日配額才是限制。若維持免費額度，9,968 件至少跨 40 個額外配額重置週期。\n3. L1 壓縮只在 archive 等待時執行，分段上限已縮為 128 檔、DuckDB 1 GB、cgroup 3 GB，且單次服務最多 20 分鐘；L0 原始 Parquet 永不刪除。\n4. 網站持續合併每 30 秒 scheduler heartbeat；完整 manifest 稽核在下載活躍時維持 15 分鐘，純等待時降為 6 小時，避免為了刷新同一組數字反覆掃描 890 萬列。"
+      },
+      {
+        "id": "further-questions",
+        "type": "markdown",
+        "body": "## Further Questions\n\n唯一會實質改變完工時間的決策，是升級 FMP 配額或接受免費額度下的多日排程；再增加 CPU、threads 或重啟次數不會縮短這個外部配額下限。"
+      }
+    ],
+    "cards": [
+      {
+        "id": "resolved-rate",
+        "description": "success、confirmed empty 與 unavailable 合計占 active plan 的比例。",
+        "dataset": "archive_summary",
+        "sourceId": "manifest-live",
+        "metrics": [
+          {
+            "label": "終止狀態已解析",
+            "field": "resolved_rate",
+            "format": "percent"
+          },
+          {
+            "label": "尚待處理",
+            "field": "pending_tasks",
+            "format": "compact"
+          }
+        ]
+      },
+      {
+        "id": "accepted-rate",
+        "description": "success + confirmed empty；不把 unavailable 偽裝成已下載。",
+        "dataset": "archive_summary",
+        "sourceId": "manifest-live",
+        "metrics": [
+          {
+            "label": "可接受完成率",
+            "field": "accepted_rate",
+            "format": "percent"
+          },
+          {
+            "label": "Unavailable",
+            "field": "unavailable_tasks",
+            "format": "compact"
+          }
+        ]
+      },
+      {
+        "id": "success-rows",
+        "description": "已保存於成功 Parquet shards 的資料列總數。",
+        "dataset": "archive_summary",
+        "sourceId": "manifest-live",
+        "metrics": [
+          {
+            "label": "成功資料列",
+            "field": "success_rows",
+            "format": "compact"
+          },
+          {
+            "label": "Success tasks",
+            "field": "success_tasks",
+            "format": "compact"
+          }
+        ]
+      },
+      {
+        "id": "wait-cpu",
+        "description": "修正後等待期 20 秒差分，占單一 CPU core 的比例。",
+        "dataset": "wait_efficiency",
+        "sourceId": "procfs-wait-sample",
+        "filter": {
+          "version": "after"
+        },
+        "metrics": [
+          {
+            "label": "等待期 CPU",
+            "field": "one_core_cpu_rate",
+            "format": "percent"
+          },
+          {
+            "label": "邏輯讀取 B/s",
+            "field": "logical_read_bps",
+            "format": "compact"
+          }
+        ]
+      }
+    ],
+    "charts": [
+      {
+        "id": "pending-by-endpoint",
+        "title": "Remaining pending tasks by endpoint",
+        "subtitle": "2026-08-20 12:39 CST；9,968 件受 FMP 日配額限制，25 件受 Congress.gov durable backoff 控制。",
+        "intent": "comparison",
+        "question": "剩餘工作集中在哪些 endpoint，真正限制是什麼？",
+        "rationale": "六個 endpoint 是離散類別，水平長條可同時容納長標籤並直接比較數量級。",
+        "comparisonContext": {
+          "denominator": "9,993 active pending tasks",
+          "grain": "endpoint",
+          "unit": "tasks",
+          "semanticFamily": "remaining backlog"
+        },
+        "type": "horizontalBar",
+        "dataset": "pending_by_endpoint",
+        "sourceId": "manifest-live",
+        "encodings": {
+          "x": {
+            "field": "endpoint",
+            "type": "nominal",
+            "label": "Endpoint"
+          },
+          "y": {
+            "field": "pending_tasks",
+            "type": "quantitative",
+            "format": "number",
+            "label": "Pending tasks",
+            "unit": "tasks"
+          },
+          "tooltip": [
+            {
+              "field": "category",
+              "type": "nominal",
+              "label": "Category"
+            },
+            {
+              "field": "provider_blocker",
+              "type": "nominal",
+              "label": "Blocker"
+            },
+            {
+              "field": "pending_share",
+              "type": "quantitative",
+              "format": "percent",
+              "label": "Share of pending"
+            }
+          ]
+        },
+        "layout": "full",
+        "settings": {
+          "orientation": "horizontal",
+          "sort": "descending",
+          "showValues": true
+        },
+        "surface": {
+          "surface": "card",
+          "showControls": false,
+          "viewMode": "both"
+        }
+      }
+    ],
+    "tables": [
+      {
+        "id": "resource-attribution",
+        "title": "Process resource snapshot",
+        "subtitle": "2026-08-20 12:39 CST；CPU% 為 ps lifetime average，RSS 為當下 resident memory。",
+        "dataset": "resource_snapshot",
+        "sourceId": "procfs-process-snapshot",
+        "density": "dense",
+        "layout": "full",
+        "defaultSort": {
+          "field": "rss_gib",
+          "direction": "desc"
+        },
+        "columns": [
+          {
+            "field": "scope",
+            "label": "Scope",
+            "type": "text"
+          },
+          {
+            "field": "process",
+            "label": "Process",
+            "type": "text"
+          },
+          {
+            "field": "cpu_percent",
+            "label": "CPU %",
+            "format": "number"
+          },
+          {
+            "field": "rss_gib",
+            "label": "RSS GiB",
+            "format": "number"
+          },
+          {
+            "field": "state",
+            "label": "State",
+            "type": "text"
+          }
+        ]
+      },
+      {
+        "id": "efficiency-comparison",
+        "title": "Measured efficiency before and after",
+        "subtitle": "相同主機、正式 archive plan；啟動舊值為仍未完成的觀察下限。",
+        "dataset": "efficiency_comparison",
+        "sourceId": "journal-performance",
+        "density": "dense",
+        "layout": "full",
+        "columns": [
+          {
+            "field": "metric",
+            "label": "Metric",
+            "type": "text"
+          },
+          {
+            "field": "before",
+            "label": "Before",
+            "type": "text"
+          },
+          {
+            "field": "after",
+            "label": "After",
+            "type": "text"
+          },
+          {
+            "field": "result",
+            "label": "Result",
+            "type": "text"
+          }
+        ]
+      }
+    ],
+    "sources": [
+      {
+        "id": "manifest-live",
+        "label": "OpenBB active-plan SQLite manifest",
+        "query": {
+          "engine": "SQLite",
+          "id": "openbb-active-plan-status-20260820T123923+0800",
+          "language": "sql",
+          "executed_at": "2026-08-20T12:39:23+08:00",
+          "description": "Count active tasks by status and pending endpoint for the selected archive plan.",
+          "sql": "SELECT status, COUNT(*), SUM(rows) FROM tasks WHERE active=1 AND plan_token=:plan_token GROUP BY status; SELECT endpoint, COUNT(*) FROM tasks WHERE active=1 AND plan_token=:plan_token AND status='pending' GROUP BY endpoint;",
+          "tables_used": [
+            "tasks"
+          ],
+          "filters": [
+            "active = 1",
+            "plan_token = 56e52165c96966261d74547b"
+          ],
+          "metric_definitions": [
+            "accepted_rate = (success + empty) / total active tasks",
+            "resolved_rate = (success + empty + unavailable) / total active tasks",
+            "pending_share = endpoint pending tasks / all pending tasks"
+          ]
+        }
+      },
+      {
+        "id": "monitor-live",
+        "label": "OpenBB archive monitor snapshot",
+        "query": {
+          "engine": "JSON monitor",
+          "id": "openbb-monitor-20260820T122709+0800",
+          "language": "jsonpath",
+          "executed_at": "2026-08-20T12:27:09+08:00",
+          "description": "Read success row totals, provider constraints, category status and audit health from the monitor snapshot.",
+          "sql": "jq '{progress, task_status, category_progress, provider_backlog}' monitor_latest.json",
+          "query": "$.progress, $.task_status, $.category_progress, $.provider_backlog",
+          "tables_used": [
+            "monitor_latest"
+          ],
+          "metric_definitions": [
+            "success_rows is the sum of rows recorded by successful active tasks"
+          ]
+        }
+      },
+      {
+        "id": "procfs-wait-sample",
+        "label": "OpenBB downloader procfs wait-window sample",
+        "query": {
+          "engine": "Reviewed measurement snapshot",
+          "id": "openbb-wait-delta-20260820T123728+0800",
+          "language": "sql",
+          "executed_at": "2026-08-20T12:37:48+08:00",
+          "description": "Measure downloader utime/stime and /proc PID I/O counters across a 20-second window that crosses a scheduler heartbeat.",
+          "sql": "SELECT * FROM wait_efficiency WHERE version='after';",
+          "tables_used": [
+            "proc.pid.stat",
+            "proc.pid.io"
+          ],
+          "metric_definitions": [
+            "one_core_cpu_rate = CPU seconds / elapsed wall seconds",
+            "logical_read_bps = rchar delta / elapsed wall seconds"
+          ]
+        }
+      },
+      {
+        "id": "procfs-process-snapshot",
+        "label": "Linux process resource snapshot",
+        "query": {
+          "engine": "Reviewed measurement snapshot",
+          "id": "process-snapshot-20260820T123923+0800",
+          "language": "sql",
+          "executed_at": "2026-08-20T12:39:23+08:00",
+          "description": "Attribute host CPU and resident memory to OpenBB and independent market-data downloaders.",
+          "sql": "SELECT scope, process, cpu_percent, rss_gib, state FROM resource_snapshot ORDER BY rss_gib DESC;",
+          "query": "ps -eo pid,etimes,pcpu,rss,stat,args --sort=-pcpu",
+          "tables_used": [
+            "proc.processes"
+          ],
+          "metric_definitions": [
+            "rss_gib = RSS KiB / 1048576",
+            "cpu_percent is the procps lifetime-average process CPU percentage"
+          ]
+        }
+      },
+      {
+        "id": "journal-performance",
+        "label": "OpenBB systemd journal and scheduler performance observations",
+        "query": {
+          "engine": "Reviewed measurement snapshot",
+          "id": "openbb-startup-comparison-20260820",
+          "language": "sql",
+          "executed_at": "2026-08-20T12:39:23+08:00",
+          "description": "Compare the observed legacy full-replan lower bound with two compatible-resume startup runs and before/after wait-window I/O samples.",
+          "sql": "SELECT metric, before, after, result FROM efficiency_comparison;",
+          "query": "journalctl -u stockagent-openbb-archive.service with monotonic timestamp differences; procfs counter deltas",
+          "tables_used": [
+            "stockagent-openbb-archive.service journal",
+            "provider_scheduler state",
+            "procfs wait samples"
+          ],
+          "metric_definitions": [
+            "startup seconds = supervisor round start to initialized download runtime",
+            "improvement floor = 1068 seconds / 39 seconds"
+          ]
+        }
+      }
+    ]
+  },
+  "snapshot": {
+    "version": 1,
+    "generatedAt": "2026-08-20T12:39:23+08:00",
+    "status": "ready",
+    "datasets": {
+      "archive_summary": [
+        {
+          "plan_token": "56e52165c96966261d74547b",
+          "start_date": "2000-01-01",
+          "end_date": "2026-07-18",
+          "total_tasks": 8909579,
+          "success_tasks": 7317543,
+          "empty_tasks": 46163,
+          "unavailable_tasks": 1535880,
+          "pending_tasks": 9993,
+          "accepted_tasks": 7363706,
+          "resolved_tasks": 8899586,
+          "accepted_rate": 0.826493149,
+          "resolved_rate": 0.998878398,
+          "success_rows": 297718311,
+          "foreign_active_tasks": 0
+        }
+      ],
+      "wait_efficiency": [
+        {
+          "version": "before",
+          "sample_seconds": 10,
+          "cpu_seconds": 0.07,
+          "one_core_cpu_rate": 0.007,
+          "physical_read_bytes": 0,
+          "physical_write_bytes": 8192,
+          "logical_read_bytes": 54444032,
+          "logical_read_bps": 5444403.2,
+          "heartbeats_crossed": 1
+        },
+        {
+          "version": "after",
+          "sample_seconds": 20,
+          "cpu_seconds": 0.0,
+          "one_core_cpu_rate": 0.0,
+          "physical_read_bytes": 0,
+          "physical_write_bytes": 8192,
+          "logical_read_bytes": 0,
+          "logical_read_bps": 0.0,
+          "heartbeats_crossed": 1
+        }
+      ],
+      "pending_by_endpoint": [
+        {
+          "rank": 1,
+          "endpoint": "equity.ownership.share_statistics",
+          "category": "equity",
+          "pending_tasks": 8957,
+          "pending_share": 0.896327429,
+          "provider": "fmp",
+          "provider_blocker": "FMP daily quota exhausted",
+          "state": "provider cooldown",
+          "next_action": "wait for FMP reset or increase entitlement"
+        },
+        {
+          "rank": 2,
+          "endpoint": "equity.price.historical",
+          "category": "equity",
+          "pending_tasks": 835,
+          "pending_share": 0.083558491,
+          "provider": "fmp",
+          "provider_blocker": "FMP daily quota exhausted after fallbacks",
+          "state": "provider cooldown",
+          "next_action": "wait for FMP reset or increase entitlement"
+        },
+        {
+          "rank": 3,
+          "endpoint": "equity.profile",
+          "category": "equity",
+          "pending_tasks": 126,
+          "pending_share": 0.012608826,
+          "provider": "fmp",
+          "provider_blocker": "FMP daily quota exhausted",
+          "state": "provider cooldown",
+          "next_action": "wait for FMP reset or increase entitlement"
+        },
+        {
+          "rank": 4,
+          "endpoint": "etf.historical",
+          "category": "etf",
+          "pending_tasks": 50,
+          "pending_share": 0.005003502,
+          "provider": "fmp",
+          "provider_blocker": "FMP daily quota exhausted after fallbacks",
+          "state": "provider cooldown",
+          "next_action": "wait for FMP reset or increase entitlement"
+        },
+        {
+          "rank": 5,
+          "endpoint": "uscongress.bill_info",
+          "category": "uscongress",
+          "pending_tasks": 23,
+          "pending_share": 0.002301611,
+          "provider": "congress_gov",
+          "provider_blocker": "HTTP 500 transient errors",
+          "state": "durable exponential backoff",
+          "next_action": "automatic retry at task-local deadline"
+        },
+        {
+          "rank": 6,
+          "endpoint": "uscongress.amendment_info",
+          "category": "uscongress",
+          "pending_tasks": 2,
+          "pending_share": 0.00020014,
+          "provider": "congress_gov",
+          "provider_blocker": "HTTP 500 transient errors",
+          "state": "durable exponential backoff",
+          "next_action": "automatic retry at task-local deadline"
+        }
+      ],
+      "resource_snapshot": [
+        {
+          "scope": "outside OpenBB",
+          "process": "Bybit perpetual 1m downloader",
+          "cpu_percent": 95.4,
+          "rss_gib": 27.4857,
+          "state": "running"
+        },
+        {
+          "scope": "outside OpenBB",
+          "process": "Binance perpetual 1m downloader",
+          "cpu_percent": 73.2,
+          "rss_gib": 24.0958,
+          "state": "running"
+        },
+        {
+          "scope": "outside OpenBB",
+          "process": "OKX perpetual 1m downloader",
+          "cpu_percent": 24.0,
+          "rss_gib": 5.9756,
+          "state": "running"
+        },
+        {
+          "scope": "OpenBB",
+          "process": "Historical archive downloader",
+          "cpu_percent": 0.0,
+          "rss_gib": 0.4300,
+          "state": "waiting; current 20s CPU sample"
+        },
+        {
+          "scope": "OpenBB",
+          "process": "L1 compactor",
+          "cpu_percent": 0.0,
+          "rss_gib": 0.0,
+          "state": "inactive; next bounded timer run"
+        }
+      ],
+      "efficiency_comparison": [
+        {
+          "metric": "Restart to usable scheduler",
+          "before": ">= 1,068 s; planning still incomplete",
+          "after": "34-39 s; existing plan resumed",
+          "result": ">= 27.4x faster conservatively"
+        },
+        {
+          "metric": "Wait heartbeat logical reads",
+          "before": "54,444,032 bytes / 10 s",
+          "after": "0 bytes / 20 s",
+          "result": "manifest rescan removed"
+        },
+        {
+          "metric": "Wait heartbeat CPU",
+          "before": "0.07 CPU s / 10 s",
+          "after": "0.00 CPU s / 20 s",
+          "result": "idle cost below sample resolution"
+        },
+        {
+          "metric": "L1 compaction segment bound",
+          "before": "512 files; DuckDB 2 GB; cgroup 4 GB",
+          "after": "128 files; DuckDB 1 GB; cgroup 3 GB",
+          "result": "4x shorter interruption unit"
+        },
+        {
+          "metric": "Full manifest audit while waiting",
+          "before": "every 15 minutes",
+          "after": "every 6 hours; live heartbeat remains 30 seconds",
+          "result": "removes repeated 8.9M-row idle scans"
+        },
+        {
+          "metric": "Foreign active plan tasks",
+          "before": "1,505,804",
+          "after": "0",
+          "result": "one-time partial replan retired"
+        }
+      ]
+    }
+  },
+  "sources": [
+    {
+      "id": "manifest-live",
+      "label": "OpenBB active-plan SQLite manifest",
+      "query": {
+        "engine": "SQLite",
+        "id": "openbb-active-plan-status-20260820T123923+0800",
+        "language": "sql",
+        "executed_at": "2026-08-20T12:39:23+08:00",
+        "description": "Count active tasks by status and pending endpoint for the selected archive plan.",
+        "sql": "SELECT status, COUNT(*), SUM(rows) FROM tasks WHERE active=1 AND plan_token=:plan_token GROUP BY status; SELECT endpoint, COUNT(*) FROM tasks WHERE active=1 AND plan_token=:plan_token AND status='pending' GROUP BY endpoint;",
+        "tables_used": [
+          "tasks"
+        ],
+        "filters": [
+          "active = 1",
+          "plan_token = 56e52165c96966261d74547b"
+        ],
+        "metric_definitions": [
+          "accepted_rate = (success + empty) / total active tasks",
+          "resolved_rate = (success + empty + unavailable) / total active tasks",
+          "pending_share = endpoint pending tasks / all pending tasks"
+        ]
+      }
+    },
+    {
+      "id": "monitor-live",
+      "label": "OpenBB archive monitor snapshot",
+      "query": {
+        "engine": "JSON monitor",
+        "id": "openbb-monitor-20260820T122709+0800",
+        "language": "jsonpath",
+        "executed_at": "2026-08-20T12:27:09+08:00",
+        "description": "Read success row totals, provider constraints, category status and audit health from the monitor snapshot.",
+        "sql": "jq '{progress, task_status, category_progress, provider_backlog}' monitor_latest.json",
+        "query": "$.progress, $.task_status, $.category_progress, $.provider_backlog",
+        "tables_used": [
+          "monitor_latest"
+        ],
+        "metric_definitions": [
+          "success_rows is the sum of rows recorded by successful active tasks"
+        ]
+      }
+    },
+    {
+      "id": "procfs-wait-sample",
+      "label": "OpenBB downloader procfs wait-window sample",
+      "query": {
+        "engine": "Reviewed measurement snapshot",
+        "id": "openbb-wait-delta-20260820T123728+0800",
+        "language": "sql",
+        "executed_at": "2026-08-20T12:37:48+08:00",
+        "description": "Measure downloader utime/stime and /proc PID I/O counters across a 20-second window that crosses a scheduler heartbeat.",
+        "sql": "SELECT * FROM wait_efficiency WHERE version='after';",
+        "tables_used": [
+          "proc.pid.stat",
+          "proc.pid.io"
+        ],
+        "metric_definitions": [
+          "one_core_cpu_rate = CPU seconds / elapsed wall seconds",
+          "logical_read_bps = rchar delta / elapsed wall seconds"
+        ]
+      }
+    },
+    {
+      "id": "procfs-process-snapshot",
+      "label": "Linux process resource snapshot",
+      "query": {
+        "engine": "Reviewed measurement snapshot",
+        "id": "process-snapshot-20260820T123923+0800",
+        "language": "sql",
+        "executed_at": "2026-08-20T12:39:23+08:00",
+        "description": "Attribute host CPU and resident memory to OpenBB and independent market-data downloaders.",
+        "sql": "SELECT scope, process, cpu_percent, rss_gib, state FROM resource_snapshot ORDER BY rss_gib DESC;",
+        "query": "ps -eo pid,etimes,pcpu,rss,stat,args --sort=-pcpu",
+        "tables_used": [
+          "proc.processes"
+        ],
+        "metric_definitions": [
+          "rss_gib = RSS KiB / 1048576",
+          "cpu_percent is the procps lifetime-average process CPU percentage"
+        ]
+      }
+    },
+    {
+      "id": "journal-performance",
+      "label": "OpenBB systemd journal and scheduler performance observations",
+      "query": {
+        "engine": "Reviewed measurement snapshot",
+        "id": "openbb-startup-comparison-20260820",
+        "language": "sql",
+        "executed_at": "2026-08-20T12:39:23+08:00",
+        "description": "Compare the observed legacy full-replan lower bound with two compatible-resume startup runs and before/after wait-window I/O samples.",
+        "sql": "SELECT metric, before, after, result FROM efficiency_comparison;",
+        "query": "journalctl -u stockagent-openbb-archive.service with monotonic timestamp differences; procfs counter deltas",
+        "tables_used": [
+          "stockagent-openbb-archive.service journal",
+          "provider_scheduler state",
+          "procfs wait samples"
+        ],
+        "metric_definitions": [
+          "startup seconds = supervisor round start to initialized download runtime",
+          "improvement floor = 1068 seconds / 39 seconds"
+        ]
+      }
+    }
+  ]
+}

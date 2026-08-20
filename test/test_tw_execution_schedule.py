@@ -16,7 +16,6 @@ from stockagent.backtest.tw_execution import (
     lot_size_vector,
     normalize_execution_mode,
     official_tw_short_initial_margin_rates,
-    preserve_directional_lot_mix,
     settlement_session_indices,
 )
 
@@ -37,7 +36,9 @@ from stockagent.backtest.tw_execution import (
         ("當沖", "tw_day_trade"),
     ],
 )
-def test_normalize_execution_mode_accepts_explicit_aliases(raw: str, expected: str) -> None:
+def test_normalize_execution_mode_accepts_explicit_aliases(
+    raw: str, expected: str
+) -> None:
     assert normalize_execution_mode(raw) == expected
 
 
@@ -100,7 +101,9 @@ def test_fee_schedule_rejects_unknown_commission_rebate_timing(
         TaiwanFeeSchedule(commission_rebate_timing=bad_value)  # type: ignore[arg-type]
 
 
-def test_margin_short_schedule_defaults_are_checkpoint_safe_and_broker_neutral() -> None:
+def test_margin_short_schedule_defaults_are_checkpoint_safe_and_broker_neutral() -> (
+    None
+):
     schedule = TaiwanMarginShortSchedule()
 
     assert schedule.initial_margin_rate == 0.9
@@ -194,7 +197,9 @@ def test_official_margin_rate_helper_covers_raise_and_restore_boundaries() -> No
     "date_like",
     [np.datetime64("2025-04-07"), date(2025, 4, 7), datetime(2025, 4, 7, 15, 30)],
 )
-def test_official_margin_rate_helper_accepts_scalar_date_like(date_like: object) -> None:
+def test_official_margin_rate_helper_accepts_scalar_date_like(
+    date_like: object,
+) -> None:
     rate = official_tw_short_initial_margin_rates(date_like)
 
     assert isinstance(rate, np.ndarray)
@@ -235,7 +240,9 @@ def test_official_margin_rate_helper_rejects_missing_numeric_or_invalid_dates(
         "minimum_commission",
     ],
 )
-@pytest.mark.parametrize("bad_value", [-0.0001, math.nan, math.inf, -math.inf, True, "0.1"])
+@pytest.mark.parametrize(
+    "bad_value", [-0.0001, math.nan, math.inf, -math.inf, True, "0.1"]
+)
 def test_fee_schedule_rejects_invalid_rates(field_name: str, bad_value: object) -> None:
     with pytest.raises(ValueError):
         replace(TaiwanFeeSchedule(), **{field_name: bad_value})
@@ -300,7 +307,9 @@ def test_tw_cash_fee_vectors_distinguish_stock_and_etf_tax() -> None:
 
     assert buy.dtype == np.float64
     assert sell.dtype == np.float64
-    np.testing.assert_allclose(buy, [commission, commission, commission], rtol=0.0, atol=0.0)
+    np.testing.assert_allclose(
+        buy, [commission, commission, commission], rtol=0.0, atol=0.0
+    )
     np.testing.assert_allclose(
         sell,
         [commission + 0.003, commission + 0.001, commission + 0.001],
@@ -379,7 +388,9 @@ def test_custom_fee_schedule_is_applied_without_discounting_tax() -> None:
         stock_sell_tax=0.004,
         etf_sell_tax=0.002,
     )
-    buy, sell = effective_fee_rate_vectors(["2330", "0050"], "tw_cash", fee_schedule=schedule)
+    buy, sell = effective_fee_rate_vectors(
+        ["2330", "0050"], "tw_cash", fee_schedule=schedule
+    )
 
     np.testing.assert_allclose(buy, [0.001, 0.001], rtol=0.0, atol=0.0)
     np.testing.assert_allclose(sell, [0.005, 0.003], rtol=0.0, atol=0.0)
@@ -450,7 +461,9 @@ def test_lot_size_vectors_cover_cash_day_trade_and_override() -> None:
 
 
 @pytest.mark.parametrize("bad_lot_size", [0, -1, 1.5, math.nan, math.inf, True, "1000"])
-def test_day_trade_lot_override_must_be_a_positive_integer(bad_lot_size: object) -> None:
+def test_day_trade_lot_override_must_be_a_positive_integer(
+    bad_lot_size: object,
+) -> None:
     with pytest.raises(ValueError, match="positive integer"):
         lot_size_vector(
             ["2330"],
@@ -474,7 +487,9 @@ def test_settlement_indices_count_sessions_and_preserve_tail_obligations() -> No
 
     assert indices.dtype == np.int64
     np.testing.assert_array_equal(indices, [2, 3, 4, 5])
-    np.testing.assert_array_equal(settlement_session_indices(0), np.asarray([], dtype=np.int64))
+    np.testing.assert_array_equal(
+        settlement_session_indices(0), np.asarray([], dtype=np.int64)
+    )
 
 
 @pytest.mark.parametrize(
@@ -487,73 +502,3 @@ def test_settlement_indices_validate_integer_session_arguments(
 ) -> None:
     with pytest.raises(ValueError):
         settlement_session_indices(num_sessions, lag=lag)  # type: ignore[arg-type]
-
-
-def test_directional_lot_mix_never_leaves_a_two_sided_target_one_sided() -> None:
-    adjusted, audit = preserve_directional_lot_mix(
-        np.asarray([0.50, -0.50]),
-        np.asarray([0, 4_000]),
-        np.asarray([100.0, 100.0]),
-        np.asarray([1_000, 1_000]),
-        capital=1_000_000.0,
-    )
-
-    np.testing.assert_array_equal(adjusted, [0, 0])
-    assert audit.pre_balance_long_gross == 0.0
-    assert audit.pre_balance_short_gross == 0.4
-    assert audit.post_balance_long_gross == 0.0
-    assert audit.post_balance_short_gross == 0.0
-    assert audit.collapsed_to_flat is True
-
-
-def test_directional_lot_mix_marks_an_all_unexecutable_two_sided_target_flat() -> None:
-    adjusted, audit = preserve_directional_lot_mix(
-        np.asarray([0.50, -0.50]),
-        np.asarray([0, 0]),
-        np.asarray([np.nan, np.nan]),
-        np.asarray([1_000, 1_000]),
-        capital=1_000_000.0,
-    )
-
-    np.testing.assert_array_equal(adjusted, [0, 0])
-    assert audit.common_fill_rate == 0.0
-    assert audit.collapsed_to_flat is True
-
-
-def test_directional_lot_mix_prunes_low_conviction_lots_without_adding_exposure() -> None:
-    adjusted, audit = preserve_directional_lot_mix(
-        # The first long reaches 10% gross.  Shorts reach 14%, so their common
-        # 10% fill rate is restored by removing the lower-conviction short and
-        # one lot from the higher-conviction short.
-        np.asarray([0.50, -0.10, -0.40]),
-        np.asarray([1_000, 1_000, 4_000]),
-        np.asarray([100.0, 20.0, 30.0]),
-        np.asarray([1_000, 1_000, 1_000]),
-        capital=1_000_000.0,
-    )
-
-    np.testing.assert_array_equal(adjusted, [1_000, 0, 3_000])
-    assert audit.target_long_gross == 0.5
-    assert audit.target_short_gross == 0.5
-    assert audit.pre_balance_long_gross == 0.1
-    assert audit.pre_balance_short_gross == 0.14
-    assert audit.post_balance_long_gross == 0.1
-    assert audit.post_balance_short_gross == 0.09
-    assert audit.common_fill_rate == pytest.approx(0.2)
-    assert audit.adjusted is True
-    assert audit.collapsed_to_flat is False
-
-
-def test_directional_lot_mix_leaves_a_directional_model_target_unchanged() -> None:
-    adjusted, audit = preserve_directional_lot_mix(
-        np.asarray([0.0, -0.75, -0.25]),
-        np.asarray([0, 3_000, 1_000]),
-        np.asarray([np.nan, 100.0, 100.0]),
-        np.asarray([1_000, 1_000, 1_000]),
-        capital=1_000_000.0,
-    )
-
-    np.testing.assert_array_equal(adjusted, [0, 3_000, 1_000])
-    assert audit.target_long_gross == 0.0
-    assert audit.target_short_gross == 1.0
-    assert audit.adjusted is False

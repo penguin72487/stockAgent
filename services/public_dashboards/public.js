@@ -1,10 +1,11 @@
 "use strict";
 
 const REFRESH_MS = 60000;
-const FETCH_TIMEOUT_MS = 15000;
 let refreshInFlight = false;
 
-const $ = (id) => document.getElementById(id);
+const Dashboard = window.StockAgentDashboard;
+const $ = Dashboard.byId;
+const fetchJson = Dashboard.createJsonFetcher({timeoutMs: 15000, cache: "no-store"});
 
 function healthPresentation(value) {
   const health = String(value || "unavailable").toLowerCase();
@@ -26,12 +27,7 @@ function healthPresentation(value) {
 }
 
 function ageLabel(seconds) {
-  if (seconds == null || seconds === "") return "無更新時間";
-  const value = Number(seconds);
-  if (!Number.isFinite(value)) return "無更新時間";
-  if (value < 60) return `${Math.max(0, Math.round(value))} 秒前`;
-  if (value < 3600) return `${Math.round(value / 60)} 分鐘前`;
-  return `${Math.round(value / 3600)} 小時前`;
+  return Dashboard.formatAge(seconds, {emptyLabel: "無更新時間", hourDigits: 0, dayDigits: 0});
 }
 
 function setHealth(prefix, value, overrideLabel = null) {
@@ -39,29 +35,6 @@ function setHealth(prefix, value, overrideLabel = null) {
   const {health, label} = healthPresentation(value);
   target.className = `health ${health}`;
   target.lastChild.textContent = overrideLabel || label;
-}
-
-async function fetchWithTimeout(path, options = {}) {
-  const controller = new AbortController();
-  const upstream = options.signal;
-  const forwardAbort = () => controller.abort(upstream?.reason);
-  if (upstream?.aborted) forwardAbort();
-  else upstream?.addEventListener("abort", forwardAbort, {once: true});
-  const timer = window.setTimeout(
-    () => controller.abort(new DOMException("Request timed out", "TimeoutError")),
-    FETCH_TIMEOUT_MS,
-  );
-  try { return await fetch(path, {...options, signal: controller.signal}); }
-  finally {
-    window.clearTimeout(timer);
-    upstream?.removeEventListener("abort", forwardAbort);
-  }
-}
-
-async function fetchJson(path) {
-  const response = await fetchWithTimeout(path, {cache: "no-store"});
-  if (!response.ok) throw new Error(`HTTP ${response.status}`);
-  return response.json();
 }
 
 function renderTaifex(data) {
@@ -83,13 +56,7 @@ function renderTw(data) {
 }
 
 function bytes(value) {
-  const parsed = Number(value);
-  if (!Number.isFinite(parsed)) return "—";
-  const units = ["B", "KiB", "MiB", "GiB"];
-  let amount = parsed;
-  let unit = 0;
-  while (amount >= 1024 && unit < units.length - 1) { amount /= 1024; unit += 1; }
-  return `${amount.toFixed(amount >= 100 ? 0 : 1)} ${units[unit]}`;
+  return Dashboard.formatBytes(value, {maximumFractionDigits: 1});
 }
 
 function renderShioaji(data) {
@@ -155,8 +122,4 @@ async function refresh() {
   }
 }
 
-document.addEventListener("visibilitychange", () => {
-  if (!document.hidden) void refresh();
-});
-void refresh();
-window.setInterval(() => void refresh(), REFRESH_MS);
+Dashboard.scheduleRefresh(refresh, {intervalMs: REFRESH_MS});

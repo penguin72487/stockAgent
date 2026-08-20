@@ -3,8 +3,8 @@
 這個模式不建立使用者可見的資料快照。新的穩態 transport 使用
 `/srv/stockagent-artifacts-hot`；`stockagent-hot-artifact-sync.service` 會將
 penguin 的 hot 檔案送入 transport，並把新收到、penguin 尚未擁有的路徑立即
-放進 `/root/stockAgent/artifacts`。舊 `/srv/stockagent-artifacts-live` 只在
-lab203 遷移完成前保留。
+放進 `/root/stockAgent/artifacts`。舊 `/srv/stockagent-artifacts-live` 與
+`stockagent-artifacts-live` Folder ID 已退役並刪除，不得重新建立。
 
 ## 第一性分層：hot 路徑與 cold 小檔
 
@@ -26,9 +26,8 @@ artifacts ──SHA/ZIP packs──> /srv/stockagent-packed
                   然後才加入該節點的 .stignore-cold-local
 ```
 
-既有 `stockagent-artifacts-live` 已經索引過的路徑不會因為事後加入 ignore
-而從歷史 index 消失，所以採平行 Folder ID 遷移，不能原地假裝已縮小。
-在 lab203 的新 folder 完成度達 100% 前，舊 folder 不退役。
+舊 folder 已完成平行遷移。現在只有 `stockagent-artifacts-hot` 承擔低延遲
+operational artifacts；已完成且可驗證的 cold artifacts 走 `stockagent-packed`。
 
 冷資料登錄表是 `configs/data_sync/cold_artifacts.json`。只有通過明確 completion
 contract 且超過穩定時間的來源可以發布；目前首批只包含通過完整 training
@@ -50,7 +49,7 @@ sudo ./scripts/install_hot_artifact_sync_service.sh
 不留下使用者可見的 snapshot tree。每個節點的 cold ignore 都是本機生成，不能
 直接複製別台機器的「已完成」狀態。
 
-lab203 必須先讓舊 folder 完成，再依序執行：
+lab203 第一次加入新架構時依序執行：
 
 ```bash
 cd /root/stockAgent
@@ -61,7 +60,7 @@ cd /root/stockAgent
   --conflict-policy packed-wins
 
 install -m 0644 \
-  deploy/syncthing/stockagent-artifacts-live.stignore \
+  deploy/syncthing/stockagent-artifacts-hot.stignore \
   /root/stockAgent/artifacts/.stignore
 
 ./scripts/manage_cold_artifacts.py \
@@ -70,8 +69,7 @@ install -m 0644 \
 ```
 
 記錄輸出的 `conflicts_detected` 與 `replaced`；`packed-wins` 會用已驗證的 penguin
-release 覆寫這些 cold 衝突。完成後再暫停並移除舊 `stockagent-artifacts-live` 的
-Syncthing 設定（不刪實體目錄），接受：
+release 覆寫這些 cold 衝突。完成後接受唯一的 hot folder：
 
 ```text
 Folder ID:   stockagent-artifacts-hot
@@ -81,7 +79,13 @@ Ignore file: /root/stockAgent/artifacts/.stignore
 ```
 
 新 folder 必須達到 `idle`、`needBytes=0`、`needItems=0`、`remoteState=valid`
-且保持 QUIC/TLS 1.3，才可在 penguin 移除舊 Folder ID。
+且保持 QUIC/TLS 1.3，才算完成。
+
+`vastai1T` 不加入 `stockagent-artifacts-hot`。它的 `artifacts` 主要是大型訓練與
+ablation 工作集，直接加入會把 penguin、lab203 與 Vast 的完整輸出做聯集，造成數百 GB
+額外同步與索引。Vast 的執行中產物保持 node-local；完成且通過 lifecycle gate 的 run
+選擇性封裝到 `stockagent-packed`，由各節點驗證後 materialize。這是角色分工，不是
+漏配 folder。
 
 衝突規則：
 
@@ -116,8 +120,8 @@ sudo ./scripts/install_artifact_dedup_service.sh
 penguin 的 Syncthing folder：
 
 ```text
-Folder ID:   stockagent-artifacts-live
-Folder Path: /srv/stockagent-artifacts-live
+Folder ID:   stockagent-artifacts-hot
+Folder Path: /srv/stockagent-artifacts-hot
 Folder Type: Send & Receive
 Watch delay: 1 second
 Ignore deletes: enabled
@@ -125,15 +129,15 @@ Versioning:  disabled
 ```
 
 peer 接受相同 Folder ID，但 Folder Path 使用該機器的
-`/root/stockAgent/artifacts`。peer 必須套用
-`deploy/syncthing/stockagent-artifacts-live.stignore`，並設為 Send & Receive。
+`/root/stockAgent/artifacts`。peer 必須套用 hot artifact ignore 規則，並設為
+Send & Receive。
 
 安裝本機橋接服務：
 
 ```bash
-sudo ./scripts/install_live_artifact_sync_service.sh
-systemctl status stockagent-live-artifact-sync.service --no-pager
-cat /var/lib/stockagent-live-artifact-sync/status.json
+sudo ./scripts/install_hot_artifact_sync_service.sh
+systemctl status stockagent-hot-artifact-sync.service --no-pager
+cat /var/lib/stockagent-hot-artifact-sync/status.json
 ```
 
 第一次建立 folder 會索引既有 artifacts；之後由 filesystem watcher 觸發，

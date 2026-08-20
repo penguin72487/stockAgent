@@ -35,7 +35,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--artifact-root", type=Path, default=REPO_ROOT / "artifacts")
     parser.add_argument("--sync-root", type=Path, default=Path("/srv/stockagent-packed"))
     parser.add_argument(
-        "--live-sync-root", type=Path, default=Path("/srv/stockagent-artifacts-live")
+        "--live-sync-root", type=Path, default=Path("/srv/stockagent-artifacts-hot")
     )
     parser.add_argument(
         "--state-root",

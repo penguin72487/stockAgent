@@ -1,5 +1,11 @@
 # Multi-writer data synchronization with Git, desync, and Syncthing
 
+> **Retired architecture.** This document is retained only for historical
+> audit. The `stockagent-desync` Folder ID, `/srv/stockagent-sync`, and
+> `/srv/stockagent-snapshots` have been retired. Do not run the commands below
+> on a current node. Use `docs/packed_dataset_storage.md` and
+> `scripts/run_data_cache.sh` instead.
+
 This repository uses three separate consistency planes. They must not be aimed
 at the same writable tree:
 

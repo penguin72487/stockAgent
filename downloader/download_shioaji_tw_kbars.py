@@ -28,7 +28,11 @@ try:
 except ModuleNotFoundError:  # direct script execution
     from common import SharedRateLimiter, describe_rate_limit, resolve_request_interval
 from stockagent.live.shioaji_traffic_ledger import record_avoided_query, shioaji_query
-from stockagent.live.shioaji_schedule import historical_query_is_protected
+from stockagent.live.shioaji_schedule import (
+    HISTORICAL_MAX_TRAFFIC_FRACTION,
+    STOCK_HISTORY_TRAFFIC_RESERVE_MB,
+    historical_query_is_protected,
+)
 
 
 SHIOAJI_STOCK_HISTORY_START = date(2020, 3, 2)
@@ -118,13 +122,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-traffic-fraction",
         type=float,
-        default=0.75,
+        default=HISTORICAL_MAX_TRAFFIC_FRACTION,
         help="Stop cleanly after this fraction of the Shioaji daily traffic quota.",
     )
     parser.add_argument(
         "--traffic-reserve-mb",
         type=float,
-        default=256.0,
+        default=STOCK_HISTORY_TRAFFIC_RESERVE_MB,
         help="Always leave at least this much daily traffic unused.",
     )
     parser.add_argument(

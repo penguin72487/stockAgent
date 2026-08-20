@@ -11,14 +11,15 @@ WorkingDirectory=__REPO_ROOT__
 Environment="HOME=/root"
 Environment="PYTHONUNBUFFERED=1"
 Environment="OPENBB_OUTPUT_DIR=data_openBB"
-ExecStart=/usr/bin/bash "__REPO_ROOT__/scripts/run_openbb_l1_compaction.sh" --max-source-files 20000 --max-files-per-segment 2000 --max-source-bytes-per-segment 268435456 --max-uncompressed-bytes-per-segment 536870912 --max-source-rows-per-segment 10000000 --min-files-per-segment 128 --threads 4 --memory-limit 4GB --no-progress
+ExecStart=/usr/bin/bash "__REPO_ROOT__/scripts/run_openbb_l1_compaction.sh" --archive-idle-only --max-source-files 2048 --max-files-per-segment 128 --max-source-bytes-per-segment 16777216 --max-uncompressed-bytes-per-segment 33554432 --max-source-rows-per-segment 500000 --min-files-per-segment 32 --include-tail --threads 2 --memory-limit 1GB --no-progress
 UMask=0077
 Nice=15
 CPUWeight=10
 IOWeight=10
 IOSchedulingClass=idle
-MemoryHigh=6G
-MemoryMax=8G
+MemoryHigh=2G
+MemoryMax=3G
+TimeoutStartSec=20min
 NoNewPrivileges=true
 PrivateTmp=true
 PrivateDevices=true

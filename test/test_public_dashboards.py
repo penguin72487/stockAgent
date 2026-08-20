@@ -151,6 +151,22 @@ def test_tw_public_projection_scrubs_ids_paths_errors_and_bounds_events() -> Non
                 "preopen": "artifacts/private.json",
                 "signal": "private.parquet",
             },
+            "operational_issues": [
+                {
+                    "severity": "error",
+                    "code": "preopen_data_update_failed",
+                    "title": "盤前模型資料準備失敗",
+                    "detail": "盤前資料未完成。",
+                    "public_error_message": "可公開的安全說明",
+                    "calendar_error": "private traceback",
+                }
+            ],
+            "benchmarks": [
+                {
+                    "benchmark_id": "tx",
+                    "last_roll_official_settlement_source_file": "/root/private.html",
+                }
+            ],
         }
     )
     forbidden = {
@@ -169,6 +185,14 @@ def test_tw_public_projection_scrubs_ids_paths_errors_and_bounds_events() -> Non
     assert public["events"] == []
     assert public["payload_window"]["orders"] == 0
     assert "artifacts/" not in public["source_contract"]["preopen"]
+    assert public["operational_issues"][0]["code"] == (
+        "preopen_data_update_failed"
+    )
+    assert public["operational_issues"][0]["public_error_message"] == (
+        "可公開的安全說明"
+    )
+    assert public["operational_issues"][0]["calendar_error"] == "unavailable"
+    assert "last_roll_official_settlement_source_file" not in public["benchmarks"][0]
 
 
 def test_tw_public_status_caps_initial_positions_without_mutating_source() -> None:
@@ -388,7 +412,8 @@ def test_public_landing_exposes_live_safe_status_without_remote_assets() -> None
     root = Path(__file__).resolve().parents[1] / "services" / "public_dashboards"
     html = (root / "index.html").read_text(encoding="utf-8")
     javascript = (root / "public.js").read_text(encoding="utf-8")
-    assert 'src="public.js?v=7"' in html
+    assert 'src="dashboard-core.js?v=1"' in html
+    assert 'src="public.js?v=8"' in html
     assert 'id="taifex-health"' in html
     assert 'id="tw-health"' in html
     assert 'id="shioaji-health"' in html
@@ -405,7 +430,7 @@ def test_public_landing_exposes_live_safe_status_without_remote_assets() -> None
     assert "renderDataMonitor(data.data_monitor || {})" in javascript
     assert "renderTraffic(data.traffic || {})" in javascript
     assert "textContent" in javascript
-    assert 'seconds == null || seconds === ""' in javascript
+    assert "Dashboard.formatAge" in javascript
 
 
 def test_public_overview_and_tw_summary_exclude_large_ledgers() -> None:
@@ -506,24 +531,22 @@ def test_public_pages_share_visual_tokens() -> None:
     )
     assert "--dashboard-cyan" in shared
     assert "content-visibility: auto" in shared
-    for relative in (
-        "public_dashboards/index.html",
-        "taifex_dashboard/index.html",
-        "tw_day_trade_dashboard/index.html",
-        "shioaji_api_dashboard/index.html",
-        "openbb_archive_dashboard/index.html",
-        "data_monitor_dashboard/index.html",
-        "traffic_dashboard/index.html",
-    ):
+    pages = {
+        "public_dashboards/index.html": "overview",
+        "taifex_dashboard/index.html": "taifex",
+        "tw_day_trade_dashboard/index.html": "tw-day-trade",
+        "shioaji_api_dashboard/index.html": "shioaji",
+        "openbb_archive_dashboard/index.html": "openbb",
+        "data_monitor_dashboard/index.html": "data-monitor",
+        "traffic_dashboard/index.html": "traffic",
+    }
+    for relative, dashboard_id in pages.items():
         html = (root / relative).read_text(encoding="utf-8")
-        assert "dashboard-core.css?v=5" in html
-        assert (
-            'href="../data-monitor/">全資料</a>' in html
-            or (
-                relative == "data_monitor_dashboard/index.html"
-                and 'href="./" aria-current="page">全資料</a>' in html
-            )
-            or relative == "public_dashboards/index.html"
+        assert "dashboard-core.css?v=6" in html
+        assert f'data-dashboard-nav="{dashboard_id}"' in html
+        assert 'dashboard-core.js?v=1" defer' in html
+        assert html.index("dashboard-core.js?v=1") < html.index(
+            "app.js" if relative != "public_dashboards/index.html" else "public.js"
         )
         assert '<meta name="theme-color" content="#071019">' in html
     time_axis_versions = {
@@ -535,6 +558,16 @@ def test_public_pages_share_visual_tokens() -> None:
         html = (root / relative).read_text(encoding="utf-8")
         assert f'src="../time-axis.js?v={version}"' in html
 
+    shared_javascript = (
+        root / "public_dashboards" / "dashboard-core.js"
+    ).read_text(encoding="utf-8")
+    assert "Public dashboard requests must stay on the same origin" in shared_javascript
+    assert "credentials: \"same-origin\"" in shared_javascript
+    assert "upstreamSignal?.addEventListener" in shared_javascript
+    assert "scheduleRefresh" in shared_javascript
+    assert "escapeHtml" in shared_javascript
+    assert "NAV_ITEMS" in shared_javascript
+
     for relative in (
         "public_dashboards/public.js",
         "taifex_dashboard/app.js",
@@ -544,13 +577,13 @@ def test_public_pages_share_visual_tokens() -> None:
         "data_monitor_dashboard/app.js",
     ):
         javascript = (root / relative).read_text(encoding="utf-8")
-        assert "FETCH_TIMEOUT_MS = 15000" in javascript
-        assert "AbortController" in javascript
+        assert "window.StockAgentDashboard" in javascript
+        assert "createFetch" in javascript or "createJsonFetcher" in javascript
     traffic_javascript = (root / "traffic_dashboard" / "app.js").read_text(
         encoding="utf-8"
     )
     assert "FETCH_TIMEOUT_MS = 5000" in traffic_javascript
-    assert "AbortController" in traffic_javascript
+    assert "Dashboard.fetchWithTimeout" in traffic_javascript
 
     tw_javascript = (root / "tw_day_trade_dashboard" / "app.js").read_text(
         encoding="utf-8"
@@ -589,6 +622,31 @@ def test_public_pages_share_visual_tokens() -> None:
         assert ".style." not in javascript
 
 
+def test_public_pages_have_valid_accessible_static_shells() -> None:
+    root = Path(__file__).resolve().parents[1] / "services"
+    pages = (
+        "public_dashboards/index.html",
+        "taifex_dashboard/index.html",
+        "tw_day_trade_dashboard/index.html",
+        "shioaji_api_dashboard/index.html",
+        "openbb_archive_dashboard/index.html",
+        "data_monitor_dashboard/index.html",
+        "traffic_dashboard/index.html",
+    )
+    for relative in pages:
+        html = (root / relative).read_text(encoding="utf-8")
+        ids = re.findall(r'\bid="([^"]+)"', html)
+        assert len(ids) == len(set(ids)), f"duplicate id in {relative}"
+        assert len(re.findall(r"<main\b", html)) == 1
+        assert len(re.findall(r"<h1\b", html)) == 1
+        assert " style=" not in html
+        assert re.search(r"\son(?:click|load|error|change|input)=", html) is None
+        assert re.search(r"<script(?![^>]*\bsrc=)", html) is None
+        skip_target = re.search(r'class="skip-link" href="#([^"]+)"', html)
+        assert skip_target is not None
+        assert skip_target.group(1) in ids
+
+
 def _test_server() -> PublicDashboardServer:
     root = Path(__file__).resolve().parents[1]
     return PublicDashboardServer(
@@ -606,15 +664,22 @@ def _test_server() -> PublicDashboardServer:
     )
 
 
-def test_public_gateway_serves_shared_time_axis() -> None:
+@pytest.mark.parametrize(
+    ("path", "needle"),
+    [
+        ("/time-axis.js", b"buildTimeAxis"),
+        ("/dashboard-core.js", b"StockAgentDashboard"),
+    ],
+)
+def test_public_gateway_serves_shared_javascript(path: str, needle: bytes) -> None:
     server = _test_server()
     try:
         handler = SimpleNamespace(server=server)
-        response = PublicDashboardHandler._static_response(handler, "/time-axis.js")
+        response = PublicDashboardHandler._static_response(handler, path)
         assert response is not None
         assert response.content_type == "text/javascript; charset=utf-8"
         assert response.cache_control == "public, max-age=31536000, immutable"
-        assert b"buildTimeAxis" in response.body
+        assert needle in response.body
     finally:
         server.server_close()
 

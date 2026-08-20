@@ -1,11 +1,17 @@
-from datetime import datetime
+from datetime import date, datetime
+from pathlib import Path
+import sys
 from zoneinfo import ZoneInfo
 
+from downloader import download_shioaji_tx_futures_ticks
 from stockagent.live.shioaji_schedule import (
+    FUTURES_HISTORY_TRAFFIC_RESERVE_MB,
+    HISTORICAL_MAX_TRAFFIC_FRACTION,
+    STOCK_HISTORY_TRAFFIC_RESERVE_MB,
     historical_query_is_protected,
     historical_query_pause_seconds,
 )
-from downloader import download_shioaji_tw_kbars
+from downloader import download_shioaji_tw_kbars, download_shioaji_tw_minute_kbars
 
 
 TAIPEI = ZoneInfo("Asia/Taipei")
@@ -36,3 +42,78 @@ def test_existing_downloaders_share_the_schedule_guard(monkeypatch) -> None:
         lambda: True,
     )
     assert download_shioaji_tw_kbars._taiwan_market_hours_now()
+
+
+def test_history_downloaders_default_to_the_ninety_percent_safety_limit(
+    monkeypatch,
+) -> None:
+    assert HISTORICAL_MAX_TRAFFIC_FRACTION == 0.90
+    for module, expected_reserve_mb in (
+        (download_shioaji_tw_kbars, STOCK_HISTORY_TRAFFIC_RESERVE_MB),
+        (download_shioaji_tw_minute_kbars, STOCK_HISTORY_TRAFFIC_RESERVE_MB),
+        (download_shioaji_tx_futures_ticks, FUTURES_HISTORY_TRAFFIC_RESERVE_MB),
+    ):
+        monkeypatch.setattr(sys, "argv", [module.__name__])
+        args = module.parse_args()
+        assert args.max_traffic_fraction == 0.90
+        assert args.traffic_reserve_mb == expected_reserve_mb
+
+    limit_bytes = 2 * 1024**3
+    futures_ceiling = min(
+        int(limit_bytes * HISTORICAL_MAX_TRAFFIC_FRACTION),
+        limit_bytes - int(FUTURES_HISTORY_TRAFFIC_RESERVE_MB * 1024**2),
+    )
+    assert futures_ceiling == int(limit_bytes * 0.90)
+
+
+def test_service_runners_do_not_override_the_shared_ninety_percent_policy() -> None:
+    root = Path(__file__).resolve().parents[1]
+    futures_runner = (root / "scripts/run_shioaji_tx_history_backfill.sh").read_text()
+    minute_runner = (root / "scripts/run_shioaji_minute_full_backfill.sh").read_text()
+    assert "SHIOAJI_FUTURES_HISTORY_MAX_TRAFFIC_FRACTION:-0.90" in futures_runner
+    assert "SHIOAJI_FUTURES_HISTORY_TRAFFIC_RESERVE_MB:-128" in futures_runner
+    assert "SHIOAJI_MINUTE_MAX_TRAFFIC_FRACTION:-0.90" in minute_runner
+    assert "SHIOAJI_MINUTE_TRAFFIC_RESERVE_MB:-25" in minute_runner
+
+
+def test_completed_futures_contract_does_not_login_again(monkeypatch, tmp_path) -> None:
+    trading_date = date(2026, 8, 19)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            download_shioaji_tx_futures_ticks.__name__,
+            "--contract",
+            "TXFR1",
+            "--output-dir",
+            str(tmp_path),
+            "--start-date",
+            trading_date.isoformat(),
+            "--end-date",
+            trading_date.isoformat(),
+        ],
+    )
+    monkeypatch.setattr(
+        download_shioaji_tx_futures_ticks,
+        "_calendar",
+        lambda *_args: [trading_date],
+    )
+    monkeypatch.setattr(
+        download_shioaji_tx_futures_ticks,
+        "_valid_receipt",
+        lambda *_args: {"status": "complete"},
+    )
+    monkeypatch.setattr(
+        download_shioaji_tx_futures_ticks,
+        "_write_manifest",
+        lambda *_args, **_kwargs: {
+            "status": "complete",
+            "resolved_trading_dates": 1,
+            "expected_trading_dates": 1,
+            "rows": 1,
+            "bytes": 1,
+        },
+    )
+    monkeypatch.setitem(sys.modules, "shioaji", None)
+
+    assert download_shioaji_tx_futures_ticks.main() == 0

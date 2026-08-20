@@ -61,10 +61,12 @@ python_bin="$(resolve_fintech_python)" || {
 }
 
 "$python_bin" - <<'PY'
-import duckdb  # noqa: F401
-from openbb import obb  # noqa: F401
-import polars  # noqa: F401
-import pyarrow  # noqa: F401
+import importlib.util
+
+required = ("duckdb", "openbb", "polars", "pyarrow")
+missing = [name for name in required if importlib.util.find_spec(name) is None]
+if missing:
+    raise SystemExit("Missing fintech runtime modules: " + ", ".join(missing))
 PY
 
 min_free_bytes="${OPENBB_MIN_FREE_BYTES:-107374182400}"

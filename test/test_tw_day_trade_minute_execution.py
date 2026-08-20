@@ -56,9 +56,7 @@ def _run(
     buy_fees = zeros if buy_fee_rates is None else buy_fee_rates
     sell_fees = zeros if sell_fee_rates is None else sell_fee_rates
     normal_sell_fees = (
-        sell_fees
-        if normal_sell_fee_rates is None
-        else normal_sell_fee_rates
+        sell_fees if normal_sell_fee_rates is None else normal_sell_fee_rates
     )
     return run_tw_day_trade_minute_execution(
         weights,
@@ -79,12 +77,12 @@ def test_daily_target_executes_first_minute_then_limit_market_and_auction() -> N
     # 10% / official open 100 = exactly 1,000 requested shares.  The first
     # later bar penetrates the 105 sell limit and has 2,000-share capacity, so
     # the complete position exits there; equality-only later bars are inert.
-    returns, turnover, history, equity = _run(
-        torch.tensor([[0.10]]), _tape()
-    )
+    returns, turnover, history, equity = _run(torch.tensor([[0.10]]), _tape())
     assert torch.allclose(history, torch.tensor([[0.101]]))
     assert torch.allclose(returns.exp() - 1.0, torch.tensor([0.004]), atol=1e-7)
-    assert torch.allclose(turnover, torch.tensor([(101_000.0 + 105_000.0) / 1_000_000.0]))
+    assert torch.allclose(
+        turnover, torch.tensor([(101_000.0 + 105_000.0) / 1_000_000.0])
+    )
     assert torch.allclose(equity, torch.tensor([1.004]))
 
 
@@ -318,9 +316,7 @@ def test_log_utility_loss_carries_the_same_t_plus_2_net_claim_state() -> None:
     assert weights.grad is not None
     assert torch.isfinite(weights.grad).all()
     assert torch.allclose(aux["_final_cash"], torch.tensor(1.004), atol=1.0e-7)
-    assert torch.equal(
-        aux["_final_payables"], torch.zeros_like(aux["_final_payables"])
-    )
+    assert torch.equal(aux["_final_payables"], torch.zeros_like(aux["_final_payables"]))
     assert torch.equal(
         aux["_final_receivables"], torch.zeros_like(aux["_final_receivables"])
     )
@@ -339,21 +335,23 @@ def test_exact_forward_lot_rounding_still_supplies_training_gradient() -> None:
     assert weights.grad.abs().sum() > 0.0
 
 
-def test_two_sided_request_fails_closed_when_one_side_has_no_executable_lot() -> None:
+def test_two_sided_request_keeps_side_with_an_executable_lot() -> None:
     tape = _tape(symbols=2)
     tape[:, 1, F.ENTRY_VOLUME_0901] = 0.0
     returns, turnover, history, _ = _run(torch.tensor([[0.10, -0.10]]), tape)
-    assert torch.equal(history, torch.zeros_like(history))
-    assert torch.equal(turnover, torch.zeros_like(turnover))
-    assert torch.equal(returns, torch.zeros_like(returns))
+    assert history[0, 0] > 0.0
+    assert history[0, 1] == 0.0
+    assert turnover[0] > 0.0
+    assert returns[0] != 0.0
 
 
-def test_fail_closed_cold_start_keeps_nonzero_concentration_gradient() -> None:
+def test_independent_side_execution_keeps_nonzero_gradient() -> None:
     tape = _tape(symbols=2)
     tape[:, 1, F.ENTRY_VOLUME_0901] = 0.0
     weights = torch.tensor([[0.10, -0.10]], requires_grad=True)
     returns, _, history, _ = _run(weights, tape)
-    assert torch.equal(history, torch.zeros_like(history))
+    assert history[0, 0] > 0.0
+    assert history[0, 1] == 0.0
     (-returns.sum()).backward()
     assert weights.grad is not None
     assert torch.isfinite(weights.grad).all()
@@ -381,9 +379,7 @@ def test_four_day_block_and_padded_tail_preserve_daily_recurrence() -> None:
     returns, _, history, equity = _run(weights, _tape(days=6))
     assert returns.shape == (6,)
     assert history.shape == (6, 1)
-    expected_simple = 0.004 / (
-        1.0 + torch.arange(6, dtype=torch.float32) * 0.004
-    )
+    expected_simple = 0.004 / (1.0 + torch.arange(6, dtype=torch.float32) * 0.004)
     assert torch.allclose(returns.exp() - 1.0, expected_simple, atol=1.0e-7)
     expected_equity = 1.0 + torch.arange(1, 7, dtype=torch.float32) * 0.004
     assert torch.allclose(equity, expected_equity, atol=1.0e-6)

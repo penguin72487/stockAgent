@@ -1,7 +1,8 @@
 "use strict";
 
 const REFRESH_MS = 60000;
-const FETCH_TIMEOUT_MS = 15000;
+const Dashboard = window.StockAgentDashboard;
+const fetchJson = Dashboard.createJsonFetcher({timeoutMs: 15000, cache: "no-store"});
 const timeAxis = window.StockAgentTimeAxis;
 const number = new Intl.NumberFormat("zh-TW");
 const compact = new Intl.NumberFormat("zh-TW", {notation: "compact", maximumFractionDigits: 2});
@@ -14,47 +15,20 @@ const hiddenSeries = new Set();
 let range = "1d";
 let refreshInFlight = false;
 
-const $ = (id) => document.getElementById(id);
-const finite = (value, fallback = 0) => Number.isFinite(Number(value)) ? Number(value) : fallback;
+const $ = Dashboard.byId;
+const finite = (value, fallback = 0) => Dashboard.finiteNumber(value, fallback);
 const pct = (value) => `${finite(value).toFixed(2)}%`;
 
 function ageLabel(seconds) {
-  if (seconds == null || seconds === "") return "無時間證據";
-  const value = Number(seconds);
-  if (!Number.isFinite(value)) return "無時間證據";
-  if (value < 60) return `${Math.round(value)} 秒前`;
-  if (value < 3600) return `${Math.round(value / 60)} 分鐘前`;
-  if (value < 86400) return `${(value / 3600).toFixed(1)} 小時前`;
-  return `${(value / 86400).toFixed(1)} 天前`;
+  return Dashboard.formatAge(seconds, {emptyLabel: "無時間證據"});
 }
 
 function bytes(value) {
-  let amount = Number(value);
-  if (!Number.isFinite(amount)) return "—";
-  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
-  let unit = 0;
-  while (amount >= 1024 && unit < units.length - 1) { amount /= 1024; unit += 1; }
-  return `${amount.toFixed(amount >= 100 ? 0 : amount >= 10 ? 1 : 2)} ${units[unit]}`;
+  return Dashboard.formatBytes(value);
 }
 
 function healthLabel(health) {
   return ({active: "下載中", starting: "啟動／稽核中", complete: "封存完成", degraded: "活動逾時", stopped: "程序停止", unavailable: "無法取得"})[health] || "狀態未知";
-}
-
-async function fetchWithTimeout(path, options = {}) {
-  const controller = new AbortController();
-  const timer = window.setTimeout(
-    () => controller.abort(new DOMException("Request timed out", "TimeoutError")),
-    FETCH_TIMEOUT_MS,
-  );
-  try { return await fetch(path, {...options, signal: controller.signal}); }
-  finally { window.clearTimeout(timer); }
-}
-
-async function fetchJson(path) {
-  const response = await fetchWithTimeout(path, {cache: "no-store"});
-  if (!response.ok) throw new Error(`HTTP ${response.status}`);
-  return response.json();
 }
 
 function renderStatus(data) {
@@ -87,11 +61,19 @@ function renderStatus(data) {
   $("unresolved-tasks").textContent = number.format(actionable);
   $("retryable-tasks").textContent = number.format(finite(archive.retryable_tasks));
   const deferred = finite(archive.retry_deferred_tasks);
+  const repair = finite(archive.repair_queue_tasks);
   const retryAt = archive.next_task_retry_at
     ? new Date(archive.next_task_retry_at).toLocaleString("zh-TW", {hour12: false})
     : "—";
-  $("retryable-detail").textContent = deferred > 0
-    ? `其中 ${number.format(deferred)} 項已隔離退避 · 下次 ${retryAt}`
+  const retryDetails = [];
+  if (deferred > 0) {
+    retryDetails.push(`${number.format(deferred)} 項退避至 ${retryAt}`);
+  }
+  if (repair > 0) {
+    retryDetails.push(`${number.format(repair)} 項已停用並移至修復佇列`);
+  }
+  $("retryable-detail").textContent = retryDetails.length > 0
+    ? retryDetails.join(" · ")
     : "尚未終止的錯誤任務";
   $("unavailable-tasks").textContent = number.format(unavailable);
   $("recent-throughput").textContent = `${finite(recent.tasks_per_minute_last_15m).toFixed(2)}/分`;
@@ -302,6 +284,4 @@ for (const button of document.querySelectorAll("[data-range]")) {
   });
 }
 renderLegend();
-document.addEventListener("visibilitychange", () => { if (!document.hidden) void refresh(); });
-void refresh();
-window.setInterval(() => void refresh(), REFRESH_MS);
+Dashboard.scheduleRefresh(refresh, {intervalMs: REFRESH_MS});

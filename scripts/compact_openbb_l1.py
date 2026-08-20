@@ -14,8 +14,9 @@ import argparse
 from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -40,6 +41,7 @@ from stockagent.data.columnar_lake import (
 SCHEMA_VERSION = 1
 SEGMENT_TABLE = "l1_compaction_segments"
 MEMBER_TABLE = "l1_compaction_members"
+FAILURE_TABLE = "l1_compaction_failures"
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,6 +54,7 @@ class TaskShard:
     bytes: int
     uncompressed_bytes: int
     mtime_ns: int
+    schema_fingerprint: str = ""
 
     def source_contract(self) -> SourceFileContract:
         return SourceFileContract(
@@ -116,6 +119,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--memory-limit", default="4GB")
     parser.add_argument("--row-group-size", type=int, default=122_880)
     parser.add_argument(
+        "--archive-idle-only",
+        action="store_true",
+        help=(
+            "Run only while the live archive downloader is waiting for quota; "
+            "stop between segments when downloading resumes."
+        ),
+    )
+    parser.add_argument(
         "--audit-only",
         action="store_true",
         help="Deep-audit active L1 segments, source contracts, and query views.",
@@ -141,6 +152,67 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _read_json_object(path: Path) -> dict[str, object]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _live_pid(path: Path) -> int | None:
+    try:
+        pid = int(path.read_text(encoding="utf-8").strip())
+        os.kill(pid, 0)
+    except (OSError, ValueError):
+        return None
+    return pid
+
+
+def _archive_compaction_allowed(state_dir: Path) -> tuple[bool, str]:
+    """Return whether derivative work can run without stealing archive I/O."""
+
+    downloader_pid = _live_pid(state_dir / "downloader.pid")
+    if downloader_pid is None:
+        return True, "archive_downloader_not_running"
+
+    phase_path = state_dir / "downloader_phase.json"
+    phase = _read_json_object(phase_path)
+    phase_name = str(phase.get("phase") or "unknown")
+    if phase_name != "download":
+        return False, f"archive_phase_{phase_name}"
+
+    scheduler_path = state_dir / "provider_scheduler.json"
+    scheduler = _read_json_object(scheduler_path)
+    try:
+        scheduler_is_current = (
+            scheduler_path.stat().st_mtime_ns >= phase_path.stat().st_mtime_ns
+        )
+    except OSError:
+        scheduler_is_current = False
+    if not scheduler_is_current:
+        return False, "archive_scheduler_not_current"
+    if str(scheduler.get("phase") or "unknown") != "waiting":
+        return False, f"archive_scheduler_{scheduler.get('phase') or 'unknown'}"
+    for key in ("active_total", "buffered_total", "completed_pending_total"):
+        if int(scheduler.get(key) or 0) > 0:
+            return False, f"archive_scheduler_{key}"
+    return True, "archive_waiting_for_provider_quota"
+
+
+def _clean_duckdb_temp_files(path: Path) -> int:
+    """Remove spill files left by an interrupted compactor under its lock."""
+
+    if not path.is_dir():
+        return 0
+    removed = 0
+    for item in path.iterdir():
+        if item.is_file():
+            item.unlink(missing_ok=True)
+            removed += 1
+    return removed
 
 
 def _sql_string(value: str | Path) -> str:
@@ -244,12 +316,23 @@ def _open_manifest(path: Path) -> sqlite3.Connection:
             task_updated_at TEXT NOT NULL,
             FOREIGN KEY(segment_id) REFERENCES {SEGMENT_TABLE}(segment_id)
         );
+        CREATE TABLE IF NOT EXISTS {FAILURE_TABLE} (
+            source_signature TEXT PRIMARY KEY,
+            endpoint TEXT NOT NULL,
+            source_files INTEGER NOT NULL,
+            attempts INTEGER NOT NULL,
+            last_error TEXT NOT NULL,
+            next_retry_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
         CREATE INDEX IF NOT EXISTS idx_l1_segments_endpoint_status
             ON {SEGMENT_TABLE}(endpoint, status);
         CREATE INDEX IF NOT EXISTS idx_l1_members_segment
             ON {MEMBER_TABLE}(segment_id);
         CREATE INDEX IF NOT EXISTS idx_l1_members_endpoint
             ON {MEMBER_TABLE}(endpoint);
+        CREATE INDEX IF NOT EXISTS idx_l1_failures_retry
+            ON {FAILURE_TABLE}(next_retry_at, endpoint);
         """
     )
     for table in (SEGMENT_TABLE, MEMBER_TABLE):
@@ -340,9 +423,7 @@ def _mark_stale_segments(
         try:
             if not path.is_file():
                 derivative_error = "L1 output file is missing"
-            elif int(pq.ParquetFile(path).metadata.num_rows) != int(
-                row["output_rows"]
-            ):
+            elif int(pq.ParquetFile(path).metadata.num_rows) != int(row["output_rows"]):
                 derivative_error = "L1 output row count changed"
             elif parquet_schema_fingerprint(path) != row["schema_fingerprint"]:
                 derivative_error = "L1 output schema fingerprint changed"
@@ -447,6 +528,8 @@ def _load_unassigned_shards(
         stat = path.stat()
         parquet_file = pq.ParquetFile(path)
         metadata = parquet_file.metadata
+        schema = parquet_file.schema_arrow.remove_metadata()
+        schema_fingerprint = hashlib.sha256(schema.serialize().to_pybytes()).hexdigest()
         metadata_rows = int(metadata.num_rows)
         uncompressed_bytes = sum(
             int(metadata.row_group(index).total_byte_size)
@@ -469,6 +552,7 @@ def _load_unassigned_shards(
                 bytes=int(stat.st_size),
                 uncompressed_bytes=uncompressed_bytes,
                 mtime_ns=int(stat.st_mtime_ns),
+                schema_fingerprint=schema_fingerprint,
             )
         )
     return output
@@ -486,15 +570,15 @@ def _segment_batches(
     flush_endpoints: set[str] | None = None,
 ) -> Iterator[list[TaskShard]]:
     forced = flush_endpoints or set()
-    by_endpoint: dict[str, list[TaskShard]] = defaultdict(list)
+    by_endpoint_schema: dict[tuple[str, str], list[TaskShard]] = defaultdict(list)
     for shard in shards:
-        by_endpoint[shard.endpoint].append(shard)
-    for endpoint in sorted(by_endpoint):
+        by_endpoint_schema[(shard.endpoint, shard.schema_fingerprint)].append(shard)
+    for endpoint, schema_fingerprint in sorted(by_endpoint_schema):
         batch: list[TaskShard] = []
         bytes_in_batch = 0
         uncompressed_bytes_in_batch = 0
         rows_in_batch = 0
-        for shard in by_endpoint[endpoint]:
+        for shard in by_endpoint_schema[(endpoint, schema_fingerprint)]:
             exceeds = batch and (
                 len(batch) >= max_files
                 or bytes_in_batch + shard.bytes > max_bytes
@@ -521,9 +605,7 @@ def _segment_batches(
                 bytes_in_batch = 0
                 uncompressed_bytes_in_batch = 0
                 rows_in_batch = 0
-        if batch and (
-            len(batch) >= min_files or include_tail or endpoint in forced
-        ):
+        if batch and (len(batch) >= min_files or include_tail or endpoint in forced):
             yield batch
 
 
@@ -554,6 +636,74 @@ def _available_segment_id(
             )
         revision += 1
         candidate = f"{base}-r{revision}"
+
+
+def _failure_retry_ready(
+    connection: sqlite3.Connection, signature: str
+) -> tuple[bool, str | None]:
+    row = connection.execute(
+        f"SELECT next_retry_at FROM {FAILURE_TABLE} WHERE source_signature=?",
+        (signature,),
+    ).fetchone()
+    if row is None:
+        return True, None
+    retry_at = str(row["next_retry_at"])
+    try:
+        return datetime.fromisoformat(retry_at) <= datetime.now(timezone.utc), retry_at
+    except ValueError:
+        return True, retry_at
+
+
+def _record_compaction_failure(
+    connection: sqlite3.Connection,
+    *,
+    signature: str,
+    endpoint: str,
+    source_files: int,
+    error: Exception,
+) -> str:
+    row = connection.execute(
+        f"SELECT attempts FROM {FAILURE_TABLE} WHERE source_signature=?",
+        (signature,),
+    ).fetchone()
+    attempts = int(row["attempts"] or 0) + 1 if row is not None else 1
+    delay_seconds = min(24 * 60 * 60, 60 * 60 * (2 ** min(4, attempts - 1)))
+    retry_at = (
+        datetime.now(timezone.utc) + timedelta(seconds=delay_seconds)
+    ).isoformat()
+    with connection:
+        connection.execute(
+            f"""
+            INSERT INTO {FAILURE_TABLE} (
+                source_signature, endpoint, source_files, attempts,
+                last_error, next_retry_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(source_signature) DO UPDATE SET
+                endpoint=excluded.endpoint,
+                source_files=excluded.source_files,
+                attempts=excluded.attempts,
+                last_error=excluded.last_error,
+                next_retry_at=excluded.next_retry_at,
+                updated_at=excluded.updated_at
+            """,
+            (
+                signature,
+                endpoint,
+                int(source_files),
+                attempts,
+                f"{type(error).__name__}: {str(error)[:4000]}",
+                retry_at,
+                _now(),
+            ),
+        )
+    return retry_at
+
+
+def _clear_compaction_failure(connection: sqlite3.Connection, signature: str) -> None:
+    with connection:
+        connection.execute(
+            f"DELETE FROM {FAILURE_TABLE} WHERE source_signature=?", (signature,)
+        )
 
 
 def _segment_output(output_dir: Path, endpoint: str, segment_id: str) -> Path:
@@ -589,8 +739,7 @@ def _record_segment(
                 current["status"] != "success"
                 or int(current["active"] or 0) != 1
                 or current["endpoint"] != endpoint
-                or str(Path(str(current["output_path"])).resolve())
-                != shard.output_path
+                or str(Path(str(current["output_path"])).resolve()) != shard.output_path
                 or int(current["rows"] or -1) != shard.rows
                 or current["updated_at"] != shard.task_updated_at
             ):
@@ -760,7 +909,9 @@ def _grouped_counts(
     filter_clause, parameters = _filter_sql(filters, alias=alias)
     return {
         str(row["endpoint"]): row
-        for row in connection.execute(sql.format(filter_clause=filter_clause), parameters)
+        for row in connection.execute(
+            sql.format(filter_clause=filter_clause), parameters
+        )
     }
 
 
@@ -988,7 +1139,9 @@ def _audit_segments(
                         )
                     source_path = Path(str(member["source_path"]))
                     stat = source_path.stat()
-                    source_file_rows = int(pq.ParquetFile(source_path).metadata.num_rows)
+                    source_file_rows = int(
+                        pq.ParquetFile(source_path).metadata.num_rows
+                    )
                     source_metadata = pq.ParquetFile(source_path).metadata
                     source_uncompressed_bytes = sum(
                         int(source_metadata.row_group(index).total_byte_size)
@@ -1057,9 +1210,10 @@ def _audit_segments(
                         f"source={source_rows} recorded={segment['output_rows']} "
                         f"arrow={arrow_rows} polars={polars_rows} duckdb={duckdb_rows}"
                     )
-                if parquet_schema_fingerprint(output_path) != segment[
-                    "schema_fingerprint"
-                ]:
+                if (
+                    parquet_schema_fingerprint(output_path)
+                    != segment["schema_fingerprint"]
+                ):
                     raise RuntimeError("output schema fingerprint mismatch")
                 if database is None:
                     raise RuntimeError("openbb_l1.duckdb is missing")
@@ -1148,7 +1302,13 @@ def run(argv: Sequence[str] | None = None) -> int:
     state_dir = output_dir / "_state"
     state_path = state_dir / "openbb_archive.sqlite3"
     lock_path = state_dir / "openbb_l1_compaction.lock"
+    if args.archive_idle_only:
+        allowed, reason = _archive_compaction_allowed(state_dir)
+        if not allowed:
+            print(f"[openbb-l1] skipped=archive_busy reason={reason}", flush=True)
+            return 0
     with _exclusive_lock(lock_path):
+        cleaned_temp_files = _clean_duckdb_temp_files(state_dir / "duckdb_l1_tmp")
         manifest = _open_manifest(state_path)
         try:
             if args.audit_only:
@@ -1182,9 +1342,7 @@ def run(argv: Sequence[str] | None = None) -> int:
                     shards,
                     max_files=args.max_files_per_segment,
                     max_bytes=args.max_source_bytes_per_segment,
-                    max_uncompressed_bytes=(
-                        args.max_uncompressed_bytes_per_segment
-                    ),
+                    max_uncompressed_bytes=(args.max_uncompressed_bytes_per_segment),
                     max_rows=args.max_source_rows_per_segment,
                     min_files=args.min_files_per_segment,
                     include_tail=args.include_tail,
@@ -1198,39 +1356,84 @@ def run(argv: Sequence[str] | None = None) -> int:
                 disable=args.no_progress,
             )
             new_segments = 0
+            failed_segments = 0
+            deferred_failed_segments = 0
+            stopped_for_archive = False
             for batch in progress:
+                if args.archive_idle_only:
+                    allowed, reason = _archive_compaction_allowed(state_dir)
+                    if not allowed:
+                        stopped_for_archive = True
+                        print(
+                            "[openbb-l1] paused=archive_resumed "
+                            f"reason={reason} new_segments={new_segments}",
+                            flush=True,
+                        )
+                        break
                 endpoint = batch[0].endpoint
                 contracts = [item.source_contract() for item in batch]
                 signature = source_signature(contracts)
-                segment_id = _available_segment_id(manifest, endpoint, signature)
-                output_path = _segment_output(output_dir, endpoint, segment_id)
-                receipt = compact_parquet_files(
-                    [item.output_path for item in batch],
-                    output_path,
-                    expected_rows=sum(item.rows for item in batch),
-                    threads=args.threads,
-                    memory_limit=args.memory_limit,
-                    compression="zstd",
-                    row_group_size_rows=args.row_group_size,
-                    temp_directory=state_dir / "duckdb_l1_tmp",
-                )
-                try:
-                    _record_segment(
-                        manifest,
-                        endpoint,
-                        segment_id,
-                        signature,
-                        batch,
-                        receipt,
+                retry_ready, retry_at = _failure_retry_ready(manifest, signature)
+                if not retry_ready:
+                    deferred_failed_segments += 1
+                    progress.set_postfix(
+                        endpoint=endpoint,
+                        deferred_failure=retry_at,
+                        refresh=False,
                     )
-                except Exception:
-                    # Publication reached the filesystem but not the manifest.
-                    # Preserve the file for diagnosis instead of deleting data.
-                    orphan = _quarantine_path(output_dir, segment_id, output_path)
-                    orphan.parent.mkdir(parents=True, exist_ok=True)
-                    if output_path.exists():
-                        os.replace(output_path, orphan)
-                    raise
+                    continue
+                try:
+                    segment_id = _available_segment_id(manifest, endpoint, signature)
+                    output_path = _segment_output(output_dir, endpoint, segment_id)
+                    for stale_temp in output_path.parent.glob(
+                        f".{output_path.name}.*.tmp"
+                    ):
+                        stale_temp.unlink(missing_ok=True)
+                    receipt = compact_parquet_files(
+                        [item.output_path for item in batch],
+                        output_path,
+                        expected_rows=sum(item.rows for item in batch),
+                        threads=args.threads,
+                        memory_limit=args.memory_limit,
+                        compression="zstd",
+                        row_group_size_rows=args.row_group_size,
+                        temp_directory=state_dir / "duckdb_l1_tmp",
+                    )
+                    try:
+                        _record_segment(
+                            manifest,
+                            endpoint,
+                            segment_id,
+                            signature,
+                            batch,
+                            receipt,
+                        )
+                    except Exception:
+                        # Publication reached the filesystem but not the manifest.
+                        # Preserve the file for diagnosis instead of deleting data.
+                        orphan = _quarantine_path(output_dir, segment_id, output_path)
+                        orphan.parent.mkdir(parents=True, exist_ok=True)
+                        if output_path.exists():
+                            os.replace(output_path, orphan)
+                        raise
+                except Exception as exc:
+                    failed_segments += 1
+                    retry_at = _record_compaction_failure(
+                        manifest,
+                        signature=signature,
+                        endpoint=endpoint,
+                        source_files=len(batch),
+                        error=exc,
+                    )
+                    print(
+                        "[openbb-l1] isolated_failed_segment "
+                        f"endpoint={endpoint} files={len(batch)} "
+                        f"retry_at={retry_at} error={type(exc).__name__}: "
+                        f"{str(exc)[:500]}",
+                        flush=True,
+                    )
+                    continue
+                _clear_compaction_failure(manifest, signature)
                 new_segments += 1
                 progress.set_postfix(
                     endpoint=endpoint,
@@ -1238,6 +1441,15 @@ def run(argv: Sequence[str] | None = None) -> int:
                     rows=receipt.output_rows,
                     refresh=False,
                 )
+
+            if stopped_for_archive:
+                print(
+                    "[openbb-l1] deferred_publication=archive_busy "
+                    f"new_segments={new_segments} failed_segments={failed_segments} "
+                    f"cleaned_temp_files={cleaned_temp_files}",
+                    flush=True,
+                )
+                return 0
 
             view_count = _publish_views(manifest, output_dir / "openbb_l1.duckdb")
             quarantined_segments = _quarantine_stale_outputs(
@@ -1253,6 +1465,9 @@ def run(argv: Sequence[str] | None = None) -> int:
             print(
                 "[openbb-l1] "
                 f"new_segments={new_segments} stale_segments={stale_segments} "
+                f"failed_segments={failed_segments} "
+                f"deferred_failed_segments={deferred_failed_segments} "
+                f"cleaned_temp_files={cleaned_temp_files} "
                 f"quarantined_segments={quarantined_segments} "
                 f"views={view_count} compacted_files={status['compacted_files']} "
                 f"pending_files={status['pending_files']} l0_deleted=false",

@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import math
 from numbers import Real
-from typing import Final
+from typing import Final, Sequence
 
 import torch
 
@@ -104,6 +104,38 @@ def sweep_five_level_depth(
     return filled, point_notional
 
 
+def sweep_five_level_depth_scalar(
+    requested_contracts: float,
+    prices: Sequence[float],
+    volumes: Sequence[float],
+) -> tuple[float, float]:
+    """Scalar live/replay adapter for the canonical five-level sweep contract."""
+
+    if len(prices) != 5 or len(volumes) != 5:
+        raise ValueError("five-level prices and volumes must have length 5")
+    requested = max(
+        0.0,
+        float(requested_contracts)
+        if math.isfinite(float(requested_contracts))
+        else 0.0,
+    )
+    remaining = requested
+    filled = 0.0
+    point_notional = 0.0
+    for raw_price, raw_volume in zip(prices, volumes, strict=True):
+        price = float(raw_price)
+        volume = float(raw_volume)
+        if not math.isfinite(price) or price <= 0.0:
+            continue
+        if not math.isfinite(volume) or volume <= 0.0:
+            continue
+        level_fill = min(remaining, volume)
+        filled += level_fill
+        point_notional += level_fill * price
+        remaining = max(0.0, remaining - level_fill)
+    return filled, point_notional
+
+
 def option_target_weights_from_logits(
     logits: torch.Tensor,
     mask: torch.Tensor,
@@ -163,6 +195,40 @@ def txo_short_initial_margin_per_contract(
         prices.new_tensor(float(margin_b)),
     )
     return premium_value + risk
+
+
+def txo_short_initial_margin_per_contract_scalar(
+    option_price: float,
+    underlying_price: float,
+    strike_price: float,
+    *,
+    option_right: str,
+    contract_multiplier: float = 50.0,
+    risk_margin_a_twd: float = 187_000.0,
+    risk_margin_b_twd: float = 94_000.0,
+) -> float:
+    """Scalar live/replay adapter for the canonical naked-option margin rule."""
+
+    multiplier = _finite_nonnegative("contract_multiplier", contract_multiplier)
+    margin_a = _finite_nonnegative("risk_margin_a_twd", risk_margin_a_twd)
+    margin_b = _finite_nonnegative("risk_margin_b_twd", risk_margin_b_twd)
+    premium = _finite_nonnegative("option_price", option_price)
+    underlying = _finite_nonnegative("underlying_price", underlying_price)
+    strike = _finite_nonnegative("strike_price", strike_price)
+    if multiplier <= 0.0 or margin_a <= 0.0 or margin_b <= 0.0:
+        raise ValueError("option multiplier and A/B margins must be positive")
+    if margin_b > margin_a:
+        raise ValueError("risk_margin_b_twd must not exceed risk_margin_a_twd")
+    right = str(option_right).strip().upper()
+    if right == "C":
+        out_of_money = max(strike - underlying, 0.0) * multiplier
+    elif right == "P":
+        out_of_money = max(underlying - strike, 0.0) * multiplier
+    else:
+        raise ValueError(f"unsupported option right: {option_right!r}")
+    return float(
+        premium * multiplier + max(margin_a - out_of_money, margin_b)
+    )
 
 
 def initialize_option_tick_state(
@@ -672,6 +738,8 @@ __all__ = [
     "run_tw_index_derivatives_tick_bidask_continuous",
     "run_tw_index_derivatives_tick_continuous",
     "sweep_five_level_depth",
+    "sweep_five_level_depth_scalar",
     "txo_short_initial_margin_per_contract",
+    "txo_short_initial_margin_per_contract_scalar",
     "tw_index_derivatives_tick_log_utility_loss",
 ]

@@ -1,12 +1,13 @@
 "use strict";
 
 const REFRESH_MS = 60000;
-const FETCH_TIMEOUT_MS = 15000;
+const Dashboard = window.StockAgentDashboard;
+const fetchWithTimeout = Dashboard.createFetch({timeoutMs: 15000});
 const SVG_NS = "http://www.w3.org/2000/svg";
 const TIME_RANGES = {"1h": 3600e3, "1d": 86400e3, "1w": 7 * 86400e3, "1mo": 30 * 86400e3, "1q": 90 * 86400e3, "1y": 365 * 86400e3, all: Infinity};
 const TIME_RANGE_LABELS = {"1h": "1 小時", "1d": "1 天", "1w": "1 週", "1mo": "1 月", "1q": "1 季", "1y": "1 年", all: "全部"};
 const HIDDEN_TRAFFIC_SERIES_STORAGE_KEY = "shioaji-hidden-traffic-series";
-const $ = (id) => document.getElementById(id);
+const $ = Dashboard.byId;
 let latestPipelines = [];
 let activeFilter = "all";
 let refreshInFlight = false;
@@ -17,16 +18,6 @@ let latestTrafficHistory = [];
 let latestTrafficGuard = 0.9;
 let latestStorageGrowth = [];
 let hiddenTrafficSeries = new Set();
-
-async function fetchWithTimeout(path, options = {}) {
-  const controller = new AbortController();
-  const timer = window.setTimeout(
-    () => controller.abort(new DOMException("Request timed out", "TimeoutError")),
-    FETCH_TIMEOUT_MS,
-  );
-  try { return await fetch(path, {...options, signal: controller.signal}); }
-  finally { window.clearTimeout(timer); }
-}
 
 try {
   trafficTimeRange = localStorage.getItem("shioaji-traffic-time-range") || "1d";
@@ -50,20 +41,11 @@ function compact(value) {
 }
 
 function bytes(value) {
-  if (value == null || value === "") return "—";
-  const parsed = Number(value);
-  if (!Number.isFinite(parsed)) return "—";
-  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
-  let amount = Math.max(0, parsed);
-  let unit = 0;
-  while (amount >= 1024 && unit < units.length - 1) { amount /= 1024; unit += 1; }
-  return `${amount.toLocaleString("zh-TW", {maximumFractionDigits: amount >= 100 ? 0 : 2})} ${units[unit]}`;
+  return Dashboard.formatBytes(value);
 }
 
 function signedBytes(value) {
-  if (value == null || value === "" || !Number.isFinite(Number(value))) return "—";
-  const parsed = Number(value);
-  return `${parsed > 0 ? "+" : parsed < 0 ? "−" : ""}${bytes(Math.abs(parsed))}`;
+  return Dashboard.formatBytes(value, {showPositive: true});
 }
 
 function percent(value, digits = 1) {
@@ -73,12 +55,7 @@ function percent(value, digits = 1) {
 }
 
 function ageLabel(value) {
-  if (value == null || value === "") return "無更新時間";
-  const seconds = Number(value);
-  if (!Number.isFinite(seconds)) return "無更新時間";
-  if (seconds < 60) return `${Math.max(0, Math.round(seconds))} 秒前`;
-  if (seconds < 3600) return `${Math.round(seconds / 60)} 分鐘前`;
-  return `${Math.round(seconds / 3600)} 小時前`;
+  return Dashboard.formatAge(value, {emptyLabel: "無更新時間", hourDigits: 0, dayDigits: 0});
 }
 
 function durationLabel(value) {
@@ -712,7 +689,6 @@ async function refresh() {
   }
 }
 
-document.addEventListener("visibilitychange", () => { if (!document.hidden) void refresh(); });
 document.querySelectorAll(".filter").forEach((button) => {
   button.addEventListener("click", () => {
     activeFilter = button.dataset.filter || "all";
@@ -752,5 +728,4 @@ $("storage-time-range").addEventListener("click", (event) => {
 syncTimeRangeControl("traffic-time-range", trafficTimeRange);
 syncTimeRangeControl("storage-time-range", storageTimeRange);
 syncTrafficLegend();
-void refresh();
-window.setInterval(() => void refresh(), REFRESH_MS);
+Dashboard.scheduleRefresh(refresh, {intervalMs: REFRESH_MS});

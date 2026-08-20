@@ -23,6 +23,10 @@ try:
 except ModuleNotFoundError:  # direct script execution
     from common import SharedRateLimiter
 from stockagent.live.shioaji_traffic_ledger import shioaji_query
+from stockagent.live.shioaji_schedule import (
+    HISTORICAL_MAX_TRAFFIC_FRACTION,
+    STOCK_HISTORY_TRAFFIC_RESERVE_MB,
+)
 
 from downloader.download_shioaji_tw_kbars import (  # noqa: E402
     MAX_KBAR_QUERY_DAYS,
@@ -516,8 +520,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout-ms", type=int, default=30_000)
     parser.add_argument("--retries", type=int, default=3)
     parser.add_argument("--retry-backoff", type=float, default=3.0)
-    parser.add_argument("--max-traffic-fraction", type=float, default=0.75)
-    parser.add_argument("--traffic-reserve-mb", type=float, default=256.0)
+    parser.add_argument(
+        "--max-traffic-fraction",
+        type=float,
+        default=HISTORICAL_MAX_TRAFFIC_FRACTION,
+    )
+    parser.add_argument(
+        "--traffic-reserve-mb",
+        type=float,
+        default=STOCK_HISTORY_TRAFFIC_RESERVE_MB,
+    )
     parser.add_argument("--simulation", action="store_true")
     parser.add_argument("--allow-market-hours", action="store_true")
     parser.add_argument("--dry-run", action="store_true")

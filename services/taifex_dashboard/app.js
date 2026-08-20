@@ -1,7 +1,8 @@
 "use strict";
 
 const PRICE_REFRESH_MS = 60000;
-const FETCH_TIMEOUT_MS = 15000;
+const Dashboard = window.StockAgentDashboard;
+const fetchWithTimeout = Dashboard.createFetch({timeoutMs: 15000});
 const money = new Intl.NumberFormat("zh-TW", { maximumFractionDigits: 0 });
 const percent = new Intl.NumberFormat("zh-TW", { style: "percent", minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const ratio = new Intl.NumberFormat("zh-TW", { maximumFractionDigits: 2 });
@@ -42,17 +43,8 @@ let selectedTimeRange = "1d";
 try { selectedTimeRange = localStorage.getItem("taifex-equity-time-range") || "1d"; } catch (_error) { /* storage can be disabled */ }
 if (!(selectedTimeRange in TIME_RANGES)) selectedTimeRange = "1d";
 
-function byId(id) { return document.getElementById(id); }
-function setText(id, value) { byId(id).textContent = value ?? "—"; }
-async function fetchWithTimeout(path, options = {}) {
-  const controller = new AbortController();
-  const timer = window.setTimeout(
-    () => controller.abort(new DOMException("Request timed out", "TimeoutError")),
-    FETCH_TIMEOUT_MS,
-  );
-  try { return await fetch(path, {...options, signal: controller.signal}); }
-  finally { window.clearTimeout(timer); }
-}
+const byId = Dashboard.byId;
+function setText(id, value) { Dashboard.setText(id, value); }
 function formatTwd(value) {
   if (value == null || !Number.isFinite(Number(value))) return "—";
   return `${money.format(Number(value))} TWD`;
@@ -254,6 +246,7 @@ function renderCycle(snapshot) {
   setText("futures-initial-margin", `套利 ${market.underlying_product || "TX"} 每口 ${formatTwd(market.underlying_initial_margin_per_contract_twd)}；避險 ${market.hedge_product || "—"} 每口 ${formatTwd(market.futures_initial_margin_per_contract_twd)}`);
   setText("maintenance-clearing-margin", `${market.hedge_product || "—"} 維持 ${formatTwd(maintenance.futures_twd)}／結算 ${formatTwd(clearing.futures_twd)}；TXO 維持 A/B/C ${formatTwd(maintenanceTxo.A)} / ${formatTwd(maintenanceTxo.B)} / ${formatTwd(maintenanceTxo.C)}；結算 ${formatTwd(clearingTxo.A)} / ${formatTwd(clearingTxo.B)} / ${formatTwd(clearingTxo.C)}`);
   setText("capital-buffer-multiple", market.strategy_capital_buffer_multiple == null ? "—" : `×${market.strategy_capital_buffer_multiple}`);
+  setText("recapitalization-policy", snapshot.strategy_recapitalization_policy || "—");
   setText("cycle-series", cycle.series || "flat");
   setText("strategy-mode", snapshot.strategy_mode || "—");
   setText("catalog-entry-policy", snapshot.catalog_expansion_entry_policy || "next_cycle");
@@ -413,8 +406,8 @@ function strategyStatusPill(row) {
   const pill = document.createElement("span");
   if (!row.alive) {
     pill.className = "pill invalid";
-    pill.textContent = "RUINED";
-    pill.title = `absorbing ruin · margin calls=${row.margin_call_count}`;
+    pill.textContent = row.recapitalization_eligible_now ? "REFILL READY" : "WAIT REFILL";
+    pill.title = `已清算，等待下一個 TAIFEX 交易日補足一個策略單位；破產=${row.bankruptcy_count}，補資=${row.recapitalization_count}`;
   } else if (row.forced_liquidation_pending || Number(row.margin_excess_twd) < 0) {
     pill.className = "pill invalid";
     pill.textContent = "MARGIN";
@@ -487,11 +480,12 @@ function renderTable(strategies) {
     const capital = document.createElement("td");
     capital.className = "strategy-detail-cell";
     capital.dataset.label = "資金／保證金";
-    appendTableTwd(capital, "預留", row.reserved_capital_twd);
+    appendTableTwd(capital, "累積注資", row.reserved_capital_twd);
     appendTableTwd(capital, "總權益", row.total_equity_twd);
     appendTableTwd(capital, "保證金", row.margin_required_twd);
     appendTableMetric(capital, "占用", formatPercent(row.margin_utilization));
     appendTableTwd(capital, "餘裕", row.margin_excess_twd);
+    appendTableMetric(capital, "破產／補資", `${row.bankruptcy_count || 0} / ${row.recapitalization_count || 0}`);
     tr.appendChild(capital);
 
     const position = document.createElement("td");
@@ -681,7 +675,7 @@ function renderCurveWall(strategies, history) {
   setText("curve-visible-count", `顯示 ${visible.length} / ${filtered.length}`);
   setText(
     "curve-wall-note",
-    `${TIME_RANGE_LABELS[selectedTimeRange]} · 符合條件 ${filtered.length} / ${strategies.length} 條曲線；共用 Y 軸（${formatPercent(minY)} ～ ${formatPercent(maxY)}），以固定預留資金正規化；全策略皆無資料的區段已略過、不補 0；排序與下表一致。`
+    `${TIME_RANGE_LABELS[selectedTimeRange]} · 符合條件 ${filtered.length} / ${strategies.length} 條曲線；共用 Y 軸（${formatPercent(minY)} ～ ${formatPercent(maxY)}），以截至該點的累積注資正規化；全策略皆無資料的區段已略過、不補 0；排序與下表一致。`
   );
 }
 
@@ -700,8 +694,9 @@ function renderChart(history) {
   }
   const width = 900, height = 300, left = 76, right = 22, top = 22, bottom = 70;
   const values = rows.map((row) => Number(row.total_equity_twd));
-  const baseline = Number(rows.at(-1).initial_capital_twd);
-  const bounds = Number.isFinite(baseline) ? [...values, baseline] : values;
+  const capitalValues = rows.map((row) => Number(row.cumulative_contributed_capital_twd));
+  const finiteCapitalValues = capitalValues.filter(Number.isFinite);
+  const bounds = [...values, ...finiteCapitalValues];
   let minY = Math.min(...bounds), maxY = Math.max(...bounds);
   if (minY === maxY) { minY -= 1; maxY += 1; }
   const pad = Math.max((maxY - minY) * 0.08, 1);
@@ -725,7 +720,10 @@ function renderChart(history) {
     svg.appendChild(svgNode("line", { x1: left, y1: yPos, x2: width - right, y2: yPos, class: "chart-grid" }));
     svg.appendChild(svgNode("text", { x: left - 10, y: yPos + 4, "text-anchor": "end", class: "chart-label" }, money.format(value)));
   }
-  if (Number.isFinite(baseline)) svg.appendChild(svgNode("line", { x1: left, y1: y(baseline), x2: width - right, y2: y(baseline), class: "chart-baseline" }));
+  if (finiteCapitalValues.length === rows.length) {
+    const capitalPoints = rows.map((row, index) => `${x(row).toFixed(2)},${y(capitalValues[index]).toFixed(2)}`).join(" ");
+    svg.appendChild(svgNode("polyline", { points: capitalPoints, class: "chart-baseline" }));
+  }
   for (const tick of axis.ticks) {
     const xPos = timeAxis.position(axis, tick.observedTimestamp ?? tick.timestamp, left, width - right);
     const lineClass = tick.kind === "session" ? "chart-time-grid session" : "chart-time-grid";
@@ -763,6 +761,7 @@ function renderCounts(counts) {
   setText("count-trades", money.format(counts.ideal_trades));
   setText("count-marks", money.format(counts.marks));
   setText("count-calibrations", money.format(counts.calibrations));
+  setText("count-contributions", money.format(counts.capital_contributions));
   setText("count-events", money.format(counts.events));
 }
 
@@ -964,15 +963,10 @@ byId("equity-time-range").addEventListener("click", (event) => {
   syncTimeRangeControl();
   void refreshHistory({preferCache: true});
 });
-document.addEventListener("visibilitychange", () => {
-  if (!document.hidden) refreshMinuteSnapshot();
-});
-
 function refreshMinuteSnapshot() {
   void refresh();
   void refreshHistory();
 }
 
 syncTimeRangeControl();
-refreshMinuteSnapshot();
-window.setInterval(refreshMinuteSnapshot, PRICE_REFRESH_MS);
+Dashboard.scheduleRefresh(refreshMinuteSnapshot, {intervalMs: PRICE_REFRESH_MS});

@@ -60,7 +60,9 @@ def _assert_tw_cash_margin_identity(result) -> None:
 
 def test_naive_dispatch_is_exactly_backward_compatible() -> None:
     weights = torch.tensor([[0.8, 0.2], [0.1, 0.9], [0.4, 0.6]], dtype=torch.float32)
-    returns = torch.tensor([[0.01, -0.02], [0.03, 0.01], [-0.01, 0.02]], dtype=torch.float32)
+    returns = torch.tensor(
+        [[0.01, -0.02], [0.03, 0.01], [-0.01, 0.02]], dtype=torch.float32
+    )
     mask = _mask_like(weights)
     benchmark = torch.zeros(3)
 
@@ -156,7 +158,9 @@ def test_tw_cash_margin_short_open_locks_proceeds_and_posts_t_plus_two_margin() 
     _assert_tw_cash_margin_identity(result)
 
 
-def test_tw_cash_margin_short_cover_releases_collateral_as_t_plus_two_net_claim() -> None:
+def test_tw_cash_margin_short_cover_releases_collateral_as_t_plus_two_net_claim() -> (
+    None
+):
     # With zero prices/costs, opening a 0.5 short posts 0.45 margin on T+2.
     # Covering releases sale collateral 0.50 plus margin 0.45, pays 0.50 for
     # the shares, and therefore creates one net 0.45 T+2 receivable.
@@ -213,12 +217,8 @@ def test_tw_cash_partial_cover_retains_whole_account_maintenance_collateral() ->
         unresolved_corporate_action_mask=torch.zeros_like(mask),
         initial_weights=torch.tensor([-0.5, -0.5], dtype=torch.float64),
         initial_cash=torch.tensor(0.5, dtype=torch.float64),
-        initial_short_sale_collateral=torch.tensor(
-            [0.8, 0.2], dtype=torch.float64
-        ),
-        initial_short_margin_collateral=torch.tensor(
-            [0.2, 0.3], dtype=torch.float64
-        ),
+        initial_short_sale_collateral=torch.tensor([0.8, 0.2], dtype=torch.float64),
+        initial_short_margin_collateral=torch.tensor([0.2, 0.3], dtype=torch.float64),
     )
 
     torch.testing.assert_close(
@@ -255,12 +255,8 @@ def test_tw_cash_undermaintenance_partial_cover_releases_no_collateral() -> None
         unresolved_corporate_action_mask=torch.zeros_like(mask),
         initial_weights=torch.tensor([-0.5, -0.5], dtype=torch.float64),
         initial_cash=torch.tensor(1.5, dtype=torch.float64),
-        initial_short_sale_collateral=torch.tensor(
-            [0.2, 0.1], dtype=torch.float64
-        ),
-        initial_short_margin_collateral=torch.tensor(
-            [0.1, 0.1], dtype=torch.float64
-        ),
+        initial_short_sale_collateral=torch.tensor([0.2, 0.1], dtype=torch.float64),
+        initial_short_margin_collateral=torch.tensor([0.1, 0.1], dtype=torch.float64),
     )
 
     torch.testing.assert_close(
@@ -293,12 +289,8 @@ def test_tw_cash_full_cover_releases_all_restricted_short_collateral() -> None:
         unresolved_corporate_action_mask=torch.zeros_like(mask),
         initial_weights=torch.tensor([-0.5, -0.5], dtype=torch.float64),
         initial_cash=torch.tensor(0.5, dtype=torch.float64),
-        initial_short_sale_collateral=torch.tensor(
-            [0.8, 0.2], dtype=torch.float64
-        ),
-        initial_short_margin_collateral=torch.tensor(
-            [0.2, 0.3], dtype=torch.float64
-        ),
+        initial_short_sale_collateral=torch.tensor([0.8, 0.2], dtype=torch.float64),
+        initial_short_margin_collateral=torch.tensor([0.2, 0.3], dtype=torch.float64),
     )
 
     torch.testing.assert_close(
@@ -313,7 +305,9 @@ def test_tw_cash_full_cover_releases_all_restricted_short_collateral() -> None:
     _assert_tw_cash_margin_identity(result)
 
 
-def test_tw_cash_forced_short_cover_becomes_absorbing_default_if_buy_is_blocked() -> None:
+def test_tw_cash_forced_short_cover_becomes_absorbing_default_if_buy_is_blocked() -> (
+    None
+):
     target = torch.full((2, 1), -0.5, dtype=torch.float64)
     mask = torch.ones_like(target, dtype=torch.bool)
     can_buy = mask.clone()
@@ -337,7 +331,9 @@ def test_tw_cash_forced_short_cover_becomes_absorbing_default_if_buy_is_blocked(
     assert result.settlement_default.tolist() == [False, True]
     assert result.strategy_returns[1].item() == pytest.approx(math.log(1.0e-6))
     assert not result.final_alive.item()
-    torch.testing.assert_close(result.final_weights, torch.zeros_like(result.final_weights))
+    torch.testing.assert_close(
+        result.final_weights, torch.zeros_like(result.final_weights)
+    )
 
 
 def test_tw_cash_margin_short_recurrent_chunk_state_matches_full_run() -> None:
@@ -442,13 +438,21 @@ def test_tw_day_trade_manual_round_trip_and_flat_close() -> None:
     )
 
     # Buy claim=1.01, sell claim=1.10*(1-.02)=1.078, net T+2 receivable=.068.
-    assert result.strategy_returns[0].item() == pytest.approx(math.log(1.068), abs=1.0e-6)
+    assert result.strategy_returns[0].item() == pytest.approx(
+        math.log(1.068), abs=1.0e-6
+    )
     assert result.receivables_history is not None
-    assert result.receivables_history[0, 1].item() == pytest.approx(0.068 / 1.068, abs=1.0e-6)
-    assert result.receivables_history[1, 0].item() == pytest.approx(0.068 / 1.068, abs=1.0e-6)
+    assert result.receivables_history[0, 1].item() == pytest.approx(
+        0.068 / 1.068, abs=1.0e-6
+    )
+    assert result.receivables_history[1, 0].item() == pytest.approx(
+        0.068 / 1.068, abs=1.0e-6
+    )
     assert result.receivables_history[2].sum().item() == pytest.approx(0.0)
     assert result.final_weights is not None
-    torch.testing.assert_close(result.final_weights, torch.zeros_like(result.final_weights))
+    torch.testing.assert_close(
+        result.final_weights, torch.zeros_like(result.final_weights)
+    )
 
 
 @pytest.mark.parametrize("execution_mode", ["tw_cash", "tw_day_trade"])
@@ -463,9 +467,7 @@ def test_simulator_dispatch_exposes_initial_and_final_equity_scale(
         "sell_fee_rates": torch.zeros(1, dtype=torch.float64),
     }
     if execution_mode == "tw_cash":
-        mode_kwargs["unresolved_corporate_action_mask"] = torch.zeros_like(
-            mask
-        )
+        mode_kwargs["unresolved_corporate_action_mask"] = torch.zeros_like(mask)
     else:
         mode_kwargs["day_trade_eligible_mask"] = mask
         mode_kwargs["day_trade_can_buy_open_mask"] = mask
@@ -569,7 +571,9 @@ def test_tw_cash_negative_forced_sale_proceeds_become_a_net_payable() -> None:
     assert result.strategy_returns[0].item() == pytest.approx(math.log(0.85))
 
 
-@pytest.mark.parametrize("bad_return", [float("nan"), float("inf"), float("-inf"), 1.0e4])
+@pytest.mark.parametrize(
+    "bad_return", [float("nan"), float("inf"), float("-inf"), 1.0e4]
+)
 def test_tw_cash_defaults_on_nonfinite_valuation_only_for_executed_holdings(
     bad_return: float,
 ) -> None:
@@ -597,10 +601,14 @@ def test_tw_cash_defaults_on_nonfinite_valuation_only_for_executed_holdings(
     assert active.settlement_default[0].item()
     assert active.strategy_returns[0].item() == pytest.approx(math.log(1.0e-6))
     assert not active.final_alive.item()
-    torch.testing.assert_close(active.final_weights, torch.zeros_like(active.final_weights))
+    torch.testing.assert_close(
+        active.final_weights, torch.zeros_like(active.final_weights)
+    )
 
 
-@pytest.mark.parametrize("bad_return", [float("nan"), float("inf"), float("-inf"), 1.0e4])
+@pytest.mark.parametrize(
+    "bad_return", [float("nan"), float("inf"), float("-inf"), 1.0e4]
+)
 def test_tw_day_trade_cancels_entry_when_round_trip_valuation_is_nonfinite(
     bad_return: float,
 ) -> None:
@@ -632,7 +640,7 @@ def test_tw_day_trade_cancels_entry_when_round_trip_valuation_is_nonfinite(
     assert not active.settlement_default[0].item()
 
 
-def test_tw_day_trade_two_sided_target_fails_flat_when_one_side_cannot_open() -> None:
+def test_tw_day_trade_two_sided_target_keeps_side_that_can_open() -> None:
     target = torch.tensor([[0.5, -0.5]], dtype=torch.float64)
     mask = torch.ones_like(target, dtype=torch.bool)
     buy_open = torch.tensor([[False, True]])
@@ -651,11 +659,14 @@ def test_tw_day_trade_two_sided_target_fails_flat_when_one_side_cannot_open() ->
         day_trade_can_sell_open_mask=mask,
     )
 
-    torch.testing.assert_close(result.weights_history, torch.zeros_like(target))
-    assert result.turnovers[0].item() == pytest.approx(0.0)
+    torch.testing.assert_close(
+        result.weights_history,
+        torch.tensor([[0.0, -0.5]], dtype=torch.float64),
+    )
+    assert result.turnovers[0].item() == pytest.approx(1.0)
 
 
-def test_tw_day_trade_two_sided_target_scales_better_filled_side_down() -> None:
+def test_tw_day_trade_two_sided_target_keeps_independent_volume_caps() -> None:
     target = torch.tensor([[0.5, -0.5]], dtype=torch.float64)
     mask = torch.ones_like(target, dtype=torch.bool)
 
@@ -677,7 +688,7 @@ def test_tw_day_trade_two_sided_target_scales_better_filled_side_down() -> None:
 
     torch.testing.assert_close(
         result.weights_history,
-        torch.tensor([[0.1, -0.1]], dtype=torch.float64),
+        torch.tensor([[0.1, -0.5]], dtype=torch.float64),
     )
 
 
@@ -1008,7 +1019,9 @@ def test_tw_cash_float32_distributed_material_short_still_requires_collateral() 
         )
 
 
-def test_tw_cash_carried_account_allows_and_reassigns_orphaned_short_collateral() -> None:
+def test_tw_cash_carried_account_allows_and_reassigns_orphaned_short_collateral() -> (
+    None
+):
     target = torch.tensor([[0.0, -0.5]], dtype=torch.float64)
     mask = torch.ones_like(target, dtype=torch.bool)
     result = run_tw_cash_continuous(
@@ -1022,12 +1035,8 @@ def test_tw_cash_carried_account_allows_and_reassigns_orphaned_short_collateral(
         unresolved_corporate_action_mask=torch.zeros_like(mask),
         initial_weights=torch.tensor([0.0, -0.5], dtype=torch.float64),
         initial_cash=torch.tensor(0.55, dtype=torch.float64),
-        initial_short_sale_collateral=torch.tensor(
-            [0.1, 0.4], dtype=torch.float64
-        ),
-        initial_short_margin_collateral=torch.tensor(
-            [0.1, 0.35], dtype=torch.float64
-        ),
+        initial_short_sale_collateral=torch.tensor([0.1, 0.4], dtype=torch.float64),
+        initial_short_margin_collateral=torch.tensor([0.1, 0.35], dtype=torch.float64),
     )
 
     torch.testing.assert_close(
@@ -1277,7 +1286,10 @@ def test_tw_state_is_exact_across_chunks(mode: str) -> None:
         torch.zeros(2, dtype=torch.float64),
         0.0,
         0.0,
-        **{**common, "day_trade_eligible_mask": mask[:2] if mode == "tw_day_trade" else None},
+        **{
+            **common,
+            "day_trade_eligible_mask": mask[:2] if mode == "tw_day_trade" else None,
+        },
         **_real_execution_masks(weights[:2], mode),
     )
     second = run_backtest_torch(
@@ -1292,7 +1304,10 @@ def test_tw_state_is_exact_across_chunks(mode: str) -> None:
         initial_payables=first.final_payables,
         initial_receivables=first.final_receivables,
         initial_alive=first.final_alive,
-        **{**common, "day_trade_eligible_mask": mask[2:] if mode == "tw_day_trade" else None},
+        **{
+            **common,
+            "day_trade_eligible_mask": mask[2:] if mode == "tw_day_trade" else None,
+        },
         **_real_execution_masks(weights[2:], mode),
     )
 
@@ -1302,10 +1317,18 @@ def test_tw_state_is_exact_across_chunks(mode: str) -> None:
         rtol=1e-12,
         atol=1e-12,
     )
-    torch.testing.assert_close(second.final_weights, full.final_weights, rtol=1e-12, atol=1e-12)
-    torch.testing.assert_close(second.final_cash, full.final_cash, rtol=1e-12, atol=1e-12)
-    torch.testing.assert_close(second.final_payables, full.final_payables, rtol=1e-12, atol=1e-12)
-    torch.testing.assert_close(second.final_receivables, full.final_receivables, rtol=1e-12, atol=1e-12)
+    torch.testing.assert_close(
+        second.final_weights, full.final_weights, rtol=1e-12, atol=1e-12
+    )
+    torch.testing.assert_close(
+        second.final_cash, full.final_cash, rtol=1e-12, atol=1e-12
+    )
+    torch.testing.assert_close(
+        second.final_payables, full.final_payables, rtol=1e-12, atol=1e-12
+    )
+    torch.testing.assert_close(
+        second.final_receivables, full.final_receivables, rtol=1e-12, atol=1e-12
+    )
     assert bool(second.final_alive) == bool(full.final_alive)
 
 
@@ -1536,7 +1559,9 @@ def test_tw_finance_state_stays_fp32_for_bf16_model_outputs() -> None:
     assert result.strategy_returns.dtype == torch.float32
     assert result.turnovers.dtype == torch.float32
     assert result.weights_history.dtype == torch.float32
-    assert result.final_weights is not None and result.final_weights.dtype == torch.float32
+    assert (
+        result.final_weights is not None and result.final_weights.dtype == torch.float32
+    )
     assert result.final_cash is not None and result.final_cash.dtype == torch.float32
 
 
@@ -1560,9 +1585,7 @@ def test_cash_blocked_sale_cannot_fund_gross_budget_break() -> None:
         volume_limit_weights=torch.tensor([[0.0, float("inf")]]),
     )
 
-    torch.testing.assert_close(
-        result.weights_history[0], torch.tensor([0.5, 0.0])
-    )
+    torch.testing.assert_close(result.weights_history[0], torch.tensor([0.5, 0.0]))
     assert result.weights_history[0].sum().item() <= 0.5
 
 
@@ -1622,18 +1645,14 @@ def test_cash_volume_cap_tracks_compounded_nav_across_chunks_and_exact_oracle() 
     """A fixed share cap must not grow merely because the account became richer."""
 
     targets = torch.tensor([[1.0, 0.0], [0.0, 1.0]], dtype=torch.float64)
-    returns = torch.tensor(
-        [[math.log(2.0), 0.0], [0.0, 0.0]], dtype=torch.float64
-    )
+    returns = torch.tensor([[math.log(2.0), 0.0], [0.0, 0.0]], dtype=torch.float64)
     mask = torch.ones_like(targets, dtype=torch.bool)
     actions = torch.zeros_like(targets, dtype=torch.bool)
     fees = torch.zeros(2, dtype=torch.float64)
     # Causal capped notional / reference equity.  On row 1 the second symbol's
     # cap is 200 / 1000 = .2, but current NAV is 2000, so its current-NAV weight
     # cap is .2 / 2 = .1 (20 shares at TWD 10), not .2.
-    reference_caps = torch.tensor(
-        [[1.0, 0.0], [2.0, 0.2]], dtype=torch.float64
-    )
+    reference_caps = torch.tensor([[1.0, 0.0], [2.0, 0.2]], dtype=torch.float64)
 
     def execute(
         target: torch.Tensor,
@@ -1763,7 +1782,9 @@ def test_cash_weights_history_uses_exact_post_fee_execution_nav() -> None:
     )
 
 
-def test_day_trade_volume_cap_tracks_compounded_nav_across_chunks_and_exact_oracle() -> None:
+def test_day_trade_volume_cap_tracks_compounded_nav_across_chunks_and_exact_oracle() -> (
+    None
+):
     targets = torch.ones((2, 1), dtype=torch.float64)
     returns = torch.tensor([[math.log(2.0)], [0.0]], dtype=torch.float64)
     mask = torch.ones_like(targets, dtype=torch.bool)
@@ -1900,10 +1921,7 @@ def test_many_padding_rows_are_bitwise_state_identity() -> None:
     initial_payables = torch.tensor([0.01357924, 0.02468013])
     initial_receivables = torch.tensor([0.03753186, 0.04864297])
     initial_cash = (
-        1.0
-        - initial_weights.sum()
-        - initial_receivables.sum()
-        + initial_payables.sum()
+        1.0 - initial_weights.sum() - initial_receivables.sum() + initial_payables.sum()
     )
     result = run_backtest_torch(
         weights,
@@ -1950,7 +1968,9 @@ def test_admitted_zero_return_cash_trades_do_not_false_default() -> None:
             ),
         )
         assert result.settlement_default is not None
-        assert not bool(result.settlement_default.any()), f"false default at seed={seed}"
+        assert not bool(result.settlement_default.any()), (
+            f"false default at seed={seed}"
+        )
 
 
 def test_tw_continuous_path_is_differentiable() -> None:
@@ -2150,9 +2170,7 @@ def test_tw_cash_compiled_chunks_preserve_cross_chunk_gradient(
     actions = torch.zeros_like(mask)
     buy_fees = torch.tensor([0.000855, 0.000855], device="cuda")
     sell_fees = torch.tensor([0.003855, 0.001855], device="cuda")
-    initial_weights = torch.tensor(
-        [0.10, 0.20], device="cuda", requires_grad=True
-    )
+    initial_weights = torch.tensor([0.10, 0.20], device="cuda", requires_grad=True)
     initial_cash = torch.tensor(0.70, device="cuda", requires_grad=True)
     initial_payables = torch.zeros(2, device="cuda", requires_grad=True)
     initial_receivables = torch.zeros(2, device="cuda", requires_grad=True)
@@ -2316,8 +2334,7 @@ def test_tw_day_trade_compiled_chunks_match_eager_and_preserve_gradient(
         **common,
     )
     reference_objective = (
-        reference.strategy_returns[2:].sum()
-        + reference.final_equity_scale * 0.3
+        reference.strategy_returns[2:].sum() + reference.final_equity_scale * 0.3
     )
     reference_objective.backward()
     reference_weight_grad = weights_eager.grad.detach().clone()
@@ -2340,8 +2357,7 @@ def test_tw_day_trade_compiled_chunks_match_eager_and_preserve_gradient(
         **common,
     )
     chunked_objective = (
-        chunked.strategy_returns[2:].sum()
-        + chunked.final_equity_scale * 0.3
+        chunked.strategy_returns[2:].sum() + chunked.final_equity_scale * 0.3
     )
     chunked_objective.backward()
 
@@ -3044,9 +3060,13 @@ def test_zero_cost_unchanged_cash_target_has_zero_gradient(rows: int) -> None:
 
     objective = result.strategy_returns.sum()
     objective.backward()
-    torch.testing.assert_close(objective, torch.zeros_like(objective), rtol=0.0, atol=0.0)
+    torch.testing.assert_close(
+        objective, torch.zeros_like(objective), rtol=0.0, atol=0.0
+    )
     assert weights.grad is not None
-    torch.testing.assert_close(weights.grad, torch.zeros_like(weights), rtol=0.0, atol=0.0)
+    torch.testing.assert_close(
+        weights.grad, torch.zeros_like(weights), rtol=0.0, atol=0.0
+    )
 
 
 def test_fixed_reference_cap_has_finite_gradient_at_zero_equity_scale() -> None:
@@ -3225,12 +3245,8 @@ def test_cash_and_day_trade_ledgers_pass_double_precision_gradcheck() -> None:
     mask = torch.ones((2, 2), dtype=torch.bool)
     fees_buy = torch.tensor([0.000855, 0.000855], dtype=torch.float64)
     fees_sell = torch.tensor([0.003855, 0.001855], dtype=torch.float64)
-    cash_returns = torch.tensor(
-        [[0.01, -0.02], [0.015, 0.005]], dtype=torch.float64
-    )
-    day_returns = torch.tensor(
-        [[0.012, -0.008], [-0.009, 0.011]], dtype=torch.float64
-    )
+    cash_returns = torch.tensor([[0.01, -0.02], [0.015, 0.005]], dtype=torch.float64)
+    day_returns = torch.tensor([[0.012, -0.008], [-0.009, 0.011]], dtype=torch.float64)
 
     def cash_objective(weights: torch.Tensor) -> torch.Tensor:
         return run_tw_cash_continuous(
@@ -3275,9 +3291,7 @@ def test_cash_and_day_trade_ledgers_pass_double_precision_gradcheck() -> None:
 def test_log_utility_loss_updates_real_settlement_state(
     execution_mode: str,
 ) -> None:
-    weights = torch.tensor(
-        [[0.4, 0.3], [0.2, 0.5], [0.3, 0.4]], requires_grad=True
-    )
+    weights = torch.tensor([[0.4, 0.3], [0.2, 0.5], [0.3, 0.4]], requires_grad=True)
     if execution_mode == "tw_day_trade":
         weights = torch.tensor(
             [[0.4, -0.3], [-0.2, 0.5], [0.3, -0.4]], requires_grad=True
@@ -3416,7 +3430,9 @@ def test_compiled_canonical_loss_returns_carried_equity_scale() -> None:
     "objective",
     ["log_utility", "portfolio_autoencoder", "factor_generalization"],
 )
-@pytest.mark.parametrize("bad_return", [float("nan"), float("inf"), float("-inf"), 1.0e4])
+@pytest.mark.parametrize(
+    "bad_return", [float("nan"), float("inf"), float("-inf"), 1.0e4]
+)
 def test_taiwan_loss_handles_active_invalid_return_without_device_assertion(
     execution_mode: str,
     objective: str,
@@ -3526,6 +3542,10 @@ def test_numpy_tw_dispatch_matches_torch() -> None:
             torch.from_numpy(mask), dtype=torch.bool
         ),
     ).to_numpy()
-    np.testing.assert_array_equal(numpy_result.strategy_returns, torch_result.strategy_returns)
+    np.testing.assert_array_equal(
+        numpy_result.strategy_returns, torch_result.strategy_returns
+    )
     np.testing.assert_array_equal(numpy_result.turnovers, torch_result.turnovers)
-    np.testing.assert_array_equal(numpy_result.weights_history, torch_result.weights_history)
+    np.testing.assert_array_equal(
+        numpy_result.weights_history, torch_result.weights_history
+    )

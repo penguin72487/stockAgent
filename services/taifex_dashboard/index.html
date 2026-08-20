@@ -7,21 +7,13 @@
   <meta name="theme-color" content="#071019">
   <title>TAIFEX 全策略模擬交易即時面板</title>
   <link rel="stylesheet" href="styles.css?v=14">
-  <link rel="stylesheet" href="../dashboard-core.css?v=5">
+  <link rel="stylesheet" href="../dashboard-core.css?v=6">
 </head>
 <body class="taifex-dashboard">
   <a class="skip-link" href="#main-content">跳到主要內容</a>
   <header class="public-nav">
     <a class="public-brand" href="../">STOCKAGENT</a>
-    <nav aria-label="公開面板導覽">
-      <a href="../">總覽</a>
-      <a class="active" href="./" aria-current="page">TAIFEX</a>
-      <a href="../tw-day-trade/">台股當沖</a>
-      <a href="../shioaji/">永豐 API</a>
-      <a href="../openbb/">OpenBB</a>
-      <a href="../data-monitor/">全資料</a>
-      <a href="../traffic/">流量</a>
-    </nav>
+    <nav data-dashboard-nav="taifex" aria-label="公開面板導覽"></nav>
   </header>
 
   <main id="main-content" class="shell">
@@ -88,7 +80,7 @@
     </div>
     <section class="metrics performance-metrics" aria-label="全策略績效摘要">
       <article class="metric"><span>有效曲線</span><strong id="performance-count">—</strong><small>有固定資金分母的策略</small></article>
-      <article class="metric"><span>預留資金合計</span><strong id="performance-reserve">—</strong><small>各最小策略單位獨立預留後加總</small></article>
+      <article class="metric"><span>累積注資合計</span><strong id="performance-reserve">—</strong><small>初始資金與歷次破產補資加總</small></article>
       <article class="metric"><span>中位固定資金報酬</span><strong id="performance-median">—</strong><small>一單位淨損益 ÷ 固定預留資金</small></article>
       <article class="metric"><span>目前最佳</span><strong id="performance-best">—</strong><small id="performance-best-name">—</small></article>
       <article class="metric"><span>目前最差</span><strong id="performance-worst">—</strong><small id="performance-worst-name">—</small></article>
@@ -128,6 +120,7 @@
           <div><dt>維持／結算保證金</dt><dd id="maintenance-clearing-margin">—</dd></div>
           <div><dt>規則來源</dt><dd><a href="https://www.taifex.com.tw/cht/11/newsDetail?idx=17259&amp;newsType=1" target="_blank" rel="noopener noreferrer">TAIFEX 2026-08-11 公告</a></dd></div>
           <div><dt>策略資金緩衝</dt><dd id="capital-buffer-multiple">—</dd></div>
+          <div><dt>破產重啟規則</dt><dd id="recapitalization-policy">—</dd></div>
           <div><dt>週選序列</dt><dd id="cycle-series">—</dd></div>
           <div><dt>策略模式</dt><dd id="strategy-mode">—</dd></div>
           <div><dt>新增策略進場</dt><dd id="catalog-entry-policy">—</dd></div>
@@ -155,7 +148,7 @@
       <div class="panel-head">
         <div>
           <h2 id="curve-wall-title">所有策略曲線一覽</h2>
-          <p>每條線是一個最小策略單位的累積淨損益 ÷ 固定預留資金；點卡片可切換上方大圖</p>
+          <p>每條線是一個最小策略單位的累積淨損益 ÷ 截至該點的累積注資；點卡片可切換上方大圖</p>
         </div>
         <div class="exposure-controls" aria-label="曝險分類篩選">
           <label>方向
@@ -222,7 +215,7 @@
           <tbody id="strategy-body"></tbody>
         </table>
       </div>
-      <p class="table-footnote">* 逐 TAIFEX 交易日以固定預留資金計算日報酬後連乘；包含目前尚未結束的夜盤／交易日 mark。多空比例是選擇權絕對口數占比，不是 Delta、Vega、名目本金、權利金或保證金占比。</p>
+      <p class="table-footnote">* 逐 TAIFEX 交易日以當時累積注資計算日報酬後連乘；包含目前尚未結束的夜盤／交易日 mark。多空比例是選擇權絕對口數占比，不是 Delta、Vega、名目本金、權利金或保證金占比。</p>
     </section>
 
     <div id="audit" class="section-intro">
@@ -236,6 +229,7 @@
           <div><dt>理想成交 legs</dt><dd id="count-trades">—</dd></div>
           <div><dt>每分鐘 marks</dt><dd id="count-marks">—</dd></div>
           <div><dt>模型校準</dt><dd id="count-calibrations">—</dd></div>
+          <div><dt>外部注資</dt><dd id="count-contributions">—</dd></div>
           <div><dt>引擎事件</dt><dd id="count-events">—</dd></div>
         </dl>
       </article>
@@ -250,9 +244,10 @@
           <li>「最小一單位」是可執行策略配方，不一定只有一腿；例如 Strap 的一單位含 2 Call + 1 Put。</li>
           <li>方向／波動／避險型態是策略 payoff 與目標分類；「中性對沖目標」不代表目前實測 Delta 恰為零。</li>
           <li>「設計多空比」由最小策略配方計算；「實際多空比」由目前理想帳持倉計算，兩者都只按選擇權口數。</li>
-          <li>預留資金是每個策略帳本固定的 <code>initial_capital_twd</code>；固定資金報酬 = 累積淨損益 ÷ 預留資金。</li>
-          <li>複利只在 TAIFEX 交易日之間發生：∏(1 + 當日損益增量 ÷ 固定預留資金) − 1；目前交易日是未結算即時值。</li>
-          <li>預留資金合計假設所有策略各自獨立部署，不宣稱可共用擔保品或享有價差／SPAN 折抵。</li>
+          <li>報酬分母是每個策略帳本的 <code>cumulative_contributed_capital_twd</code>：初始一個策略單位資金，加上歷次破產後的外部補資；累積損益永不歸零。</li>
+          <li>權益破產時先用完整五檔強制清算；同一 TAIFEX 交易日不得復活。下一個有資料的較晚交易日，只有完整策略配方都能成交時，才補足到一個策略單位並重啟。</li>
+          <li>複利只在 TAIFEX 交易日之間發生：∏(1 + 當日損益增量 ÷ 當時累積注資) − 1；目前交易日是未結算即時值。</li>
+          <li>累積注資合計假設所有策略各自獨立部署，不宣稱可共用擔保品或享有價差／SPAN 折抵。</li>
           <li>進場買 Ask／賣 Bid；清算多單賣 Bid、空單買 Ask，數量需由五檔顯示量完整承接。</li>
           <li><code>put_call_parity_tx</code> 用 4 組同到期月 TXO 對 1 口 TX，兩方向都掃描；毛利扣除設定手續費、進場交易稅與保守估計結算稅後必須嚴格為正。</li>
           <li>Parity 第一次完整五檔只形成訊號；三腿都收到時間戳嚴格晚於訊號的新報價、整包仍有利潤才記入理想成交。融資利率依本次需求設為 0。</li>
@@ -288,7 +283,8 @@
       </div>
     </section>
   </main>
+  <script src="../dashboard-core.js?v=1" defer></script>
   <script src="../time-axis.js?v=4" defer></script>
-  <script src="app.js?v=20" defer></script>
+  <script src="app.js?v=22" defer></script>
 </body>
 </html>

@@ -13,9 +13,12 @@
         │ packed publish
         ▼
 Syncthing 發布庫（固定 hash 分桶 ZIP + 大檔 blob + manifest/head）
-        │ verify / fetch
+        │ watcher 即時增量同步 + cold verify
         ▼
-各訓練機器的唯讀 materialized tree
+各節點預設 COLD_ONLY（不自動 fetch/use/materialize）
+        │ 僅人工按需 use
+        ▼
+本機唯讀 materialized 暫存樹
 ```
 
 `scripts/packed_snapshot.py` 實作發布庫；
@@ -58,10 +61,9 @@ Syncthing 發布庫（固定 hash 分桶 ZIP + 大檔 blob + manifest/head）
 錯誤的 quarantine tree，沒有登錄成發布資料。OpenBB task shards 在 compact 與
 audit 完成前也不得刪除，只是不進 Syncthing。
 
-## Penguin 建立新的發布資料夾
+## Canonical packed 發布資料夾
 
-不要覆蓋目前可用的 `stockagent-desync`。先用獨立 Syncthing Folder ID
-`stockagent-packed` 做平行遷移：
+所有 current nodes 只使用 Syncthing Folder ID `stockagent-packed`：
 
 ```bash
 cd /root/stockAgent
@@ -84,11 +86,27 @@ Folder Path: /srv/stockagent-packed
 Folder Type: Send & Receive
 ```
 
+此 folder 必須開啟 filesystem watcher，且不可 paused。Syncthing 只複寫已發布的
+immutable manifests、heads、packs/blobs；每次通過 build/audit 並原子更新 release 後，
+變更物件即由 watcher 增量送出。接收端不配置任何自動 `fetch`、`use` 或 materialize
+工作，所以同步完成只增加冷庫，不會產生 `data_*` 解封目錄。
+
 `.local-state` 已由 `.stignore` 排除；每台機器有自己的永久 node ID。`heads/<dataset>/<node>.json`
 保留多寫者，HLC 後寫者勝出。任何較新的 head 若尚未收齊 objects，接收端會 fail closed，
 不會退回舊版本假裝成功。
 
-## Lab203 接收與 materialize
+目前 canonical 拓撲中，penguin、lab203 與 vastai1T 都加入
+`stockagent-packed`；只有 penguin/lab203 加入低延遲 `stockagent-artifacts-hot`。
+Vast 的大量訓練 artifacts 只能在通過 completion contract 後選擇性發布成 cold release，
+不可把整個 node-local `artifacts` 工作集直接加入 hot folder。舊 `stockagent-desync`、
+`stockagent-artifacts-live` 與 Git working-tree folder 已退役；不要重新接受 invitation。
+
+作業系統的 service manager 不屬於資料契約：penguin/lab203 使用 systemd，Vast container
+使用平台 supervisor。兩種部署都必須達成同一組內容與連線驗收：永久 Device ID、永久
+packed node ID、相同 Folder ID、`needBytes=0`、`needTotalItems=0`、無 errors、object
+verify 通過，以及實際觀測到的 TLS/QUIC 連線。
+
+## Lab203 接收（預設 cold-only）
 
 等 Syncthing 顯示 `idle / Up to Date`、`needBytes=0` 後：
 
@@ -101,28 +119,19 @@ cd /root/stockAgent
 
 ./scripts/run_packed_snapshot.sh verify tw-public \
   --sync-root /srv/stockagent-packed
-
-./scripts/run_packed_snapshot.sh fetch tw-public \
-  --sync-root /srv/stockagent-packed \
-  --materialized-root /srv/stockagent-packed-materialized \
-  --pin /srv/stockagent-packed-materialized/tw-public.pin.json
 ```
 
-`fetch` 先驗 manifest、inventory、所有 pack/blob，再逐檔驗 size/SHA，寫入
-`.partial.*`，整棵樹成功才用 `os.replace` 原子升級。舊資料 symlink 只在驗證後切換：
+正常接收流程到此結束，不執行 `fetch`，也不建立 `data_tw_public` symlink。只有本機工作
+負載確實需要可瀏覽目錄時才人工解封：`use` 先驗 manifest、inventory、所有 pack/blob，
+再逐檔驗 size/SHA；成功後才原子切換 symlink：
 
 ```bash
-snapshot_path="$(
-  ./scripts/run_packed_snapshot.sh fetch tw-public \
-    --sync-root /srv/stockagent-packed \
-    --materialized-root /srv/stockagent-packed-materialized \
-  | jq -r .materialized_path
-)"
-# 檢查 snapshot_path 後才執行：ln -sfn "$snapshot_path" data_tw_public
+./scripts/run_data_cache.sh use tw-public \
+  --link /path/to/stockAgent/data_tw_public
 ```
 
-文件刻意把實際 `ln -sfn` 切換留為人工確認步驟，避免誤換正式訓練資料。舊 desync
-庫至少保留兩次成功發布/接收循環再退役。
+工具只會替換既有 symlink，不會覆蓋實體目錄；七日未續租且沒有程序引用時自動回收。
+這是明確 opt-in 的本機快取行為，不是 Syncthing 接收流程的一部分。
 
 ## 下載完成後自動發布
 
@@ -164,7 +173,8 @@ STOCKAGENT_SYNC_NODE_ID=penguin \
 ## 自助式冷庫與七日工作集
 
 `/srv/stockagent-packed` 是唯一需要長期保存與同步的冷庫；
-`/srv/stockagent-packed-materialized` 只是可刪除的本機工作集。狀態機是：
+`/srv/stockagent-packed-materialized` 只是可刪除的本機工作集。所有接收節點的正常穩態
+都是 `COLD_ONLY`；只有人工 `use` 才會進入 `HOT`。狀態機是：
 
 ```text
 COLD_ONLY -- use/完整驗證 --> HOT -- 7 天未續租 --> COLD_ONLY
@@ -179,7 +189,7 @@ COLD_ONLY -- use/完整驗證 --> HOT -- 7 天未續租 --> COLD_ONLY
 ./scripts/run_data_cache.sh status --human
 ```
 
-自行解封最新版本並取得路徑：
+真的需要使用資料時，才自行解封最新版本並取得路徑：
 
 ```bash
 ./scripts/run_data_cache.sh use tw-public
@@ -259,7 +269,11 @@ blob 使未改變物件直接重用，只傳輸變動 bucket/blob：
 垃圾回收目前刻意只有報告，沒有自動刪除。必須先確認所有節點已收到所有 manifests、
 保留版本政策已決定，才可另行加入可恢復的 GC。
 
-## 已完成的真實 smoke
+## 歷史 smoke 證據（2026-08-11）
+
+以下數字只證明當時的 pack、verify 與 fetch 實作通過，不代表目前 Syncthing
+進度、資料大小或 latest snapshot。現況一律用 `stockagent-data status`、
+`run_packed_snapshot.sh status` 與 Syncthing 的 pending/error 指標重新量測。
 
 來源：`data_tw_public/raw/twse_day_trade_eligibility`
 
@@ -274,9 +288,9 @@ Smoke 位於 `/srv/stockagent-packed-smoke` 與
 `/srv/stockagent-packed-smoke-materialized`，沒有加入現有 Syncthing folder，也沒有刪除
 任何來源或舊 snapshot。
 
-## 已建立的正式平行發布版
+## 歷史首次正式平行發布（2026-08-11）
 
-`tw-public` 已非破壞發布到 `/srv/stockagent-packed`，尚未自動加入 Syncthing：
+當時 `tw-public` 首次非破壞發布到 `/srv/stockagent-packed` 的 receipt 為：
 
 - snapshot：`tw-public-20260811T184933239639615Z-l0-penguin-07e9b4c645ec020c`
 - 來源：104,041 files、337 directories、29,811,139,176 bytes
@@ -287,6 +301,7 @@ Smoke 位於 `/srv/stockagent-packed-smoke` 與
 - object SHA、ZIP CRC、inventory 與 head resolution：通過
 - 未引用 objects：0；刪除 objects：0
 
-下一個外部狀態步驟是把 `/srv/stockagent-packed` 以 Folder ID
-`stockagent-packed` 分享給 `lab203`。收到 100% 後在 `lab203` 執行前述 verify/fetch，
-成功前不要切換 `data_tw_public`，也不要退役 `stockagent-desync`。
+目前任何節點都不得沿用這段的「下一步」或 snapshot ID。部署與驗收請依根
+[`README.md`](../README.md) 的「資料冷庫與多機同步」及「Syncthing 驗收」執行；
+必須先達 `needBytes=0`、`needTotalItems=0`、`errors=0`、`remoteState=valid`，再做
+packed object verify；接收端預設不得自動執行 `stockagent-data use`。

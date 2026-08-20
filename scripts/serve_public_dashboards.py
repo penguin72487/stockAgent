@@ -1191,6 +1191,16 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     disable_nagle_algorithm = True
 
+    def handle(self) -> None:
+        try:
+            super().handle()
+        except (BrokenPipeError, ConnectionResetError):
+            # A browser can cancel a keep-alive request while navigating or
+            # refreshing.  The response writer already handles this case; the
+            # request-line reader needs the same narrow treatment so normal
+            # client disconnects do not become server tracebacks.
+            return
+
     def _security_headers(self) -> None:
         request_started_ns = getattr(self, "_request_started_ns", None)
         if isinstance(request_started_ns, int):
@@ -1319,6 +1329,11 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
             "/dashboard-core.css": (
                 self.server.public_static_root / "dashboard-core.css",
                 "text/css; charset=utf-8",
+                IMMUTABLE_ASSET_CACHE_CONTROL,
+            ),
+            "/dashboard-core.js": (
+                self.server.public_static_root / "dashboard-core.js",
+                "text/javascript; charset=utf-8",
                 IMMUTABLE_ASSET_CACHE_CONTROL,
             ),
             "/time-axis.js": (

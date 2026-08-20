@@ -27,6 +27,7 @@ from stockagent.live.tw_day_trade_dashboard import (
     build_dashboard_summary,
 )
 from stockagent.live.tw_day_trade_simulation import (
+    ENTRY_FILL_POLICY_SYNTHETIC_OPEN_TICK,
     LiveEligibility,
     ModeSpec,
     TwDayTradeSimulationEngine,
@@ -174,6 +175,19 @@ def test_runner_reads_atomic_latest_signal_pointer(tmp_path: Path) -> None:
     assert _LATEST_SIGNAL_CACHE
 
 
+def test_runner_engine_lock_rejects_a_second_state_writer(tmp_path: Path) -> None:
+    from scripts.run_tw_day_trade_simulation import _acquire_engine_lock
+
+    first = _acquire_engine_lock(tmp_path / "state")
+    try:
+        with pytest.raises(RuntimeError, match="live writer"):
+            _acquire_engine_lock(tmp_path / "state")
+    finally:
+        first.close()
+    second = _acquire_engine_lock(tmp_path / "state")
+    second.close()
+
+
 def test_runner_prefers_compact_execution_payload_over_parquet(tmp_path: Path) -> None:
     from scripts.run_tw_day_trade_simulation import _LATEST_SIGNAL_CACHE, _latest_signal
 
@@ -274,7 +288,7 @@ def _row(weight: float = 0.1) -> dict[str, object]:
     }
 
 
-def test_runner_offsets_all_four_existing_modes_without_adding_a_fifth() -> None:
+def test_runner_keeps_retired_modes_available_only_for_historical_rebuild() -> None:
     from scripts.run_tw_day_trade_simulation import _mode_specs
 
     repo_root = Path(__file__).resolve().parents[1]
@@ -282,18 +296,30 @@ def test_runner_offsets_all_four_existing_modes_without_adding_a_fifth() -> None
         repo_root / "services/discord_bot/markets"
     )
     by_market = {spec.market: spec for spec in specs}
-    expected = {
-        "tw_day_trade_1m",
-        "tw_day_trade",
+    active_expected = {
         "tw_day_trade_multi_basis",
         "tw_day_trade_100m",
+        "tw_day_trade_multi_basis_projection_l1_gelu",
     }
+    historical_expected = set(active_expected)
 
     assert errors == {}
-    assert set(by_market) == expected
-    assert set(live_configs) == expected
+    assert set(by_market) == active_expected
+    assert set(live_configs) == active_expected
+    specs, live_configs, errors = _mode_specs(
+        repo_root / "services/discord_bot/markets",
+        include_disabled=True,
+    )
+    assert errors == {}
+    assert {spec.market for spec in specs} == historical_expected
+    assert set(live_configs) == historical_expected
     assert all(spec.signal_market is None for spec in specs)
     assert all(spec.price_limit_offset_ticks == 1 for spec in specs)
+    assert all(
+        spec.entry_fill_policy == ENTRY_FILL_POLICY_SYNTHETIC_OPEN_TICK
+        for spec in specs
+    )
+    assert all(spec.entry_price_offset_ticks == 1 for spec in specs)
 
 
 def test_runner_blocks_weekend_before_quote_or_eligibility_work(tmp_path: Path) -> None:
@@ -314,9 +340,7 @@ def test_runner_blocks_weekend_before_quote_or_eligibility_work(tmp_path: Path) 
             "_source": ["TWSE OpenAPI"],
             "_as_of_date": ["2026-08-14"],
         }
-    ).write_parquet(
-        public_root / "twse_api_holidayschedule_holidayschedule.parquet"
-    )
+    ).write_parquet(public_root / "twse_api_holidayschedule_holidayschedule.parquet")
     live_configs = {
         market: replace(config, day_trade_rule_data_dir=str(public_root))
         for market, config in live_configs.items()
@@ -392,6 +416,97 @@ def test_runner_keeps_quote_polling_for_post_close_terminal_catch_up() -> None:
     assert _pending_signal_retry_delay_seconds(
         "waiting_first_minute", _now(9, 18, 7)
     ) == pytest.approx(53.05)
+
+
+def test_runner_recovers_missing_daily_limits_without_replacing_shioaji_book(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from scripts import run_tw_day_trade_simulation as runner
+
+    without_limits = PriceSnapshot(
+        prices=np.asarray([999.0]),
+        source="shioaji:stock_snapshot",
+        available_count=1,
+        # Price-limit recovery must not depend on Shioaji quote availability;
+        # the official daily limits have their own source contract.
+        available_mask=np.asarray([False]),
+        open_prices=np.asarray([995.0]),
+        bid_prices=np.asarray([998.0]),
+        ask_prices=np.asarray([1_000.0]),
+        bid_volumes=np.asarray([20.0]),
+        ask_volumes=np.asarray([10.0]),
+        upper_limit_prices=np.asarray([np.nan]),
+        lower_limit_prices=np.asarray([np.nan]),
+        reference_prices=np.asarray([np.nan]),
+        timestamps_ms=np.asarray([int(_now(9, 0, 6).timestamp() * 1_000)]),
+    )
+    with_limits = PriceSnapshot(
+        prices=without_limits.prices,
+        source="shioaji:stock_snapshot+prepared_limits",
+        available_count=1,
+        available_mask=without_limits.available_mask,
+        open_prices=without_limits.open_prices,
+        bid_prices=without_limits.bid_prices,
+        ask_prices=without_limits.ask_prices,
+        bid_volumes=without_limits.bid_volumes,
+        ask_volumes=without_limits.ask_volumes,
+        upper_limit_prices=np.asarray([1_100.0]),
+        lower_limit_prices=np.asarray([900.0]),
+        reference_prices=np.asarray([1_000.0]),
+        timestamps_ms=without_limits.timestamps_ms,
+    )
+    snapshots = iter((without_limits, with_limits))
+    quote_ttls: list[float] = []
+    prepared: list[dict[str, object]] = []
+
+    def fake_quotes(
+        symbols: list[str], fallback: np.ndarray, *, cache_ttl_seconds: float
+    ) -> PriceSnapshot:
+        assert symbols == ["2330"]
+        assert fallback.tolist() == [995.0]
+        quote_ttls.append(cache_ttl_seconds)
+        return next(snapshots)
+
+    def fake_prepare(
+        symbols: list[str],
+        fallback: np.ndarray,
+        *,
+        parquet_root: str | Path,
+        trading_date: str,
+    ) -> dict[str, object]:
+        prepared.append(
+            {
+                "symbols": symbols,
+                "fallback": fallback.tolist(),
+                "parquet_root": Path(parquet_root),
+                "trading_date": trading_date,
+            }
+        )
+        return {"prepared_count": 1}
+
+    monkeypatch.setattr(runner, "fetch_shioaji_stock_snapshots", fake_quotes)
+    monkeypatch.setattr(runner, "prepare_tw_price_limit_snapshot", fake_prepare)
+
+    quotes = runner._fetch_quotes(
+        symbols=["2330"],
+        fallback_by_symbol={"2330": 995.0},
+        parquet_root=tmp_path,
+        trading_date=_now(9, 0, 7),
+    )
+
+    assert quote_ttls == [0.0, 60.0]
+    assert prepared == [
+        {
+            "symbols": ["2330"],
+            "fallback": [995.0],
+            "parquet_root": tmp_path,
+            "trading_date": "2026-08-13",
+        }
+    ]
+    assert quotes["2330"]["bid"] == 998.0
+    assert quotes["2330"]["ask"] == 1_000.0
+    assert quotes["2330"]["upper_limit"] == 1_100.0
+    assert quotes["2330"]["lower_limit"] == 900.0
 
 
 def _eligibility() -> dict[str, LiveEligibility]:
@@ -551,6 +666,61 @@ def test_market_entry_uses_best_ask_and_records_board_lot(tmp_path: Path) -> Non
     assert position["stop_trigger_price"] == 900.0
 
 
+@pytest.mark.parametrize(
+    ("weight", "expected_entry"),
+    ((0.5, 1_005.0), (-0.5, 999.0)),
+)
+def test_synthetic_open_tick_policy_fills_all_legal_board_lots_at_adverse_tick(
+    tmp_path: Path,
+    weight: float,
+    expected_entry: float,
+) -> None:
+    spec = replace(
+        _spec(tmp_path),
+        entry_fill_policy=ENTRY_FILL_POLICY_SYNTHETIC_OPEN_TICK,
+        entry_price_offset_ticks=1,
+    )
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+    quote = _quote(
+        open_price=1_000.0,
+        bid_volume=0.0,
+        ask_volume=0.0,
+        minute_volume_lots=0.0,
+    )
+    quote["bid"] = None
+    quote["ask"] = None
+    quote["quote_at"] = None
+
+    result = engine.register_signal(
+        spec=spec,
+        summary=_summary(),
+        signal_rows=[_row(weight)],
+        quotes={"2330": quote},
+        eligibility=_eligibility(),
+        eligibility_coverage={},
+        now=_now(9, 0, 10),
+    )
+
+    assert result == "registered"
+    mode = engine.state["modes"][spec.market]
+    position = next(iter(mode["positions"].values()))
+    assert position["entry_price"] == expected_entry
+    assert position["requested_shares"] == 5_000
+    assert position["filled_shares"] == 5_000
+    assert position["entry_fill_is_synthetic"] is True
+    assert position["fill_guaranteed"] is True
+    assert mode["entry_fill_outcome"] == "filled"
+    assert mode["entry_unfilled_shares"] == 0
+    assert mode["signal_reason_counts"] == {"synthetic_open_tick_fill": 1}
+    entry_order = next(
+        json.loads(line)
+        for line in engine.orders_path.read_text().splitlines()
+        if json.loads(line)["purpose"] == "entry"
+    )
+    assert entry_order["order_type"] == "SYNTHETIC_OPEN_TICK"
+    assert entry_order["synthetic_fill"] is True
+
+
 def test_sub_board_lot_signal_finishes_without_requesting_a_quote(
     tmp_path: Path,
 ) -> None:
@@ -657,7 +827,7 @@ def test_schema2_open_position_migrates_fail_closed(tmp_path: Path) -> None:
     engine = TwDayTradeSimulationEngine(state_dir)
 
     mode = engine.state["modes"]["tw_day_trade"]
-    assert engine.state["schema_version"] == 3
+    assert engine.state["schema_version"] == 4
     assert mode["legacy_execution_contract"] is True
     assert mode["engine_status"] == ("critical_legacy_position_requires_reconciliation")
 
@@ -789,7 +959,7 @@ def test_entry_only_fills_displayed_level_one_volume(tmp_path: Path) -> None:
     assert signal["top_book_capacity_shares"] == 1_000
 
 
-def test_two_sided_live_signal_reduces_only_the_better_filled_side(
+def test_two_sided_live_signal_keeps_each_symbols_independent_fill(
     tmp_path: Path,
 ) -> None:
     spec = _spec(tmp_path)
@@ -829,14 +999,11 @@ def test_two_sided_live_signal_reduces_only_the_better_filled_side(
     mode = engine.state["modes"][spec.market]
     by_symbol = {row["symbol"]: row for row in mode["positions"].values()}
     assert by_symbol["2330"]["filled_shares"] == 1_000
-    assert by_symbol["2317"]["pre_balance_filled_shares"] == 20_000
-    assert by_symbol["2317"]["filled_shares"] == 1_000
-    assert mode["execution_projection"]["pre_balance_short_gross"] == 0.2
-    assert mode["execution_projection"]["post_balance_long_gross"] == 0.01
-    assert mode["execution_projection"]["post_balance_short_gross"] == 0.01
+    assert by_symbol["2317"]["filled_shares"] == 20_000
+    assert "execution_projection" not in mode
 
 
-def test_two_sided_live_signal_fails_complete_portfolio_flat_when_one_side_has_no_lot(
+def test_two_sided_live_signal_keeps_executable_side_when_other_side_has_no_depth(
     tmp_path: Path,
 ) -> None:
     spec = _spec(tmp_path)
@@ -871,9 +1038,12 @@ def test_two_sided_live_signal_fails_complete_portfolio_flat_when_one_side_has_n
     )
 
     mode = engine.state["modes"][spec.market]
-    assert mode["positions"] == {}
-    assert mode["execution_projection"]["collapsed_to_flat"] is True
-    assert mode["engine_status"] == "flat_directional_mix_unexecutable"
+    by_symbol = {row["symbol"]: row for row in mode["positions"].values()}
+    assert set(by_symbol) == {"2317"}
+    assert by_symbol["2317"]["filled_shares"] == 5_000
+    assert by_symbol["2317"]["signed_shares"] == -5_000
+    assert "execution_projection" not in mode
+    assert mode["engine_status"] == "active"
 
 
 def test_entry_without_displayed_volume_fails_closed(tmp_path: Path) -> None:
@@ -1175,11 +1345,14 @@ def test_non_session_invalidation_voids_only_zero_fill_signal(tmp_path: Path) ->
         now=_now(9, 1, 7),
     )
 
-    assert engine.invalidate_non_session_flat_signal(
-        spec.market,
-        now=_now(9, 30),
-        reason="official calendar says closed",
-    ) == "invalidated"
+    assert (
+        engine.invalidate_non_session_flat_signal(
+            spec.market,
+            now=_now(9, 30),
+            reason="official calendar says closed",
+        )
+        == "invalidated"
+    )
     mode = engine.state["modes"][spec.market]
     assert mode["entry_completed_at"] is None
     assert mode["session_valid"] is False
@@ -1198,18 +1371,19 @@ def test_non_session_invalidation_voids_only_zero_fill_signal(tmp_path: Path) ->
         2026, 8, 14, 9, 0, 5, tzinfo=TAIPEI
     ).isoformat()
     quote = _quote()
-    quote["quote_at"] = datetime(
-        2026, 8, 14, 9, 1, 6, tzinfo=TAIPEI
-    ).isoformat()
-    assert engine.register_signal(
-        spec=spec,
-        summary=replacement,
-        signal_rows=[_row()],
-        quotes={"2330": quote},
-        eligibility=_eligibility(),
-        eligibility_coverage={},
-        now=next_session,
-    ) == "registered"
+    quote["quote_at"] = datetime(2026, 8, 14, 9, 1, 6, tzinfo=TAIPEI).isoformat()
+    assert (
+        engine.register_signal(
+            spec=spec,
+            summary=replacement,
+            signal_rows=[_row()],
+            quotes={"2330": quote},
+            eligibility=_eligibility(),
+            eligibility_coverage={},
+            now=next_session,
+        )
+        == "registered"
+    )
     assert mode["session_valid"] is True
     assert "non_session_invalidated_at" not in mode
     assert mode["blocked_reason"] is None
@@ -1978,9 +2152,7 @@ def test_expired_tx_continuous_roll_uses_official_settlement_not_zero(
     assert row["last_roll_old_price_source"] == (
         "official_taifex_index_final_settlement"
     )
-    assert row["realized_gross_pnl_twd"] == pytest.approx(
-        (45_123.0 - 45_001.0) * 200.0
-    )
+    assert row["realized_gross_pnl_twd"] == pytest.approx((45_123.0 - 45_001.0) * 200.0)
     # The expiry event has no fabricated sell fee; only the new-month entry
     # adds one side after the original entry fee.
     assert row["fixed_fees_twd"] == 120.0
@@ -2075,6 +2247,47 @@ def test_tx_benchmark_rebase_keeps_immutable_origin_across_contract_roll() -> No
     assert row["net_pnl_twd"] == 21_000.0
     assert row["total_equity_twd"] == 722_000.0
     assert row.get("benchmark_origin_error") is None
+
+
+def test_tx_benchmark_rebase_uses_audited_roll_offset_without_calendar_gap() -> None:
+    source = {
+        "benchmark_id": "benchmark_tx_continuous",
+        "instrument_type": "continuous_long_future",
+        "entry_at": "2026-08-20T12:18:43+08:00",
+        "entry_price": 44_806.0,
+        "origin_entry_at": "2026-08-20T12:18:43+08:00",
+        "origin_entry_price": 44_806.0,
+        "net_pnl_twd": 1_000.0,
+        "fixed_fees_twd": 60.0,
+        "transaction_tax_twd": 180.0,
+        "last_mark_price": 44_810.0,
+        "valuation_source": "live_book",
+    }
+    origin = {
+        "session_date": "2026-08-13",
+        "entry_at": "2026-08-13T08:45:00+08:00",
+        "entry_price": 45_350.0,
+        "initial_capital_twd": 701_000.0,
+        "initial_fixed_fees_twd": 60.0,
+        "initial_transaction_tax_twd": 180.0,
+        "gross_pnl_multiplier": 200.0,
+        "live_net_pnl_offset_twd": -2_500.0,
+        "fixed_fees_twd_to_live_origin": 120.0,
+        "transaction_tax_twd_to_live_origin": 520.0,
+        "live_origin": {
+            "entry_at": "2026-08-20T12:18:43+08:00",
+            "entry_price": 44_806.0,
+            "initial_fixed_fees_twd": 60.0,
+            "initial_transaction_tax_twd": 180.0,
+        },
+    }
+
+    row = _rebase_live_benchmark(source, origin)
+
+    assert row["net_pnl_twd"] == -1_500.0
+    assert row["total_equity_twd"] == 699_500.0
+    assert row["fixed_fees_twd"] == 120.0
+    assert row["transaction_tax_twd"] == 520.0
 
 
 def test_stock_benchmark_reinvests_official_actions_once(tmp_path: Path) -> None:
@@ -2503,7 +2716,7 @@ def test_dashboard_exposes_same_day_preopen_progress_and_measured_speed(
         now=_now(8, 59).astimezone(ZoneInfo("UTC")),
     )
 
-    assert payload["schema_version"] == 4
+    assert payload["schema_version"] == 5
     assert payload["preopen"]["status"] == "ready"
     assert payload["preopen"]["ready_count"] == 1
     assert payload["preopen"]["progress_ratio"] == 1.0
@@ -2596,7 +2809,10 @@ def test_simulation_executor_preopen_receipt_requires_both_components(
         details={"proof": "simulation_client_usage_probe"},
     )
     assert ready["status"] == "ready"
-    assert json.loads((state_dir / "preopen_readiness.json").read_text())["status"] == "ready"
+    assert (
+        json.loads((state_dir / "preopen_readiness.json").read_text())["status"]
+        == "ready"
+    )
 
 
 def test_dashboard_html_is_local_and_refreshes_api() -> None:
@@ -2614,13 +2830,31 @@ def test_dashboard_html_is_local_and_refreshes_api() -> None:
     assert "模擬執行器盤前守門" in javascript
     assert "Shioaji usage 探測" in javascript
     assert "function compareByAbsoluteWeight(a, b)" in javascript
-    assert javascript.count(".sort(compareByAbsoluteWeight)") == 0
+    assert javascript.count(".sort(compareByAbsoluteWeight)") == 1
+    assert "function beginSilentTableUpdate" in javascript
+    assert javascript.count("signalRows = [];") == 1
+    assert javascript.count("positionRows = [];") == 1
+    assert javascript.count("eventRows = [];") == 1
+    assert "location.reload" not in javascript
+    assert "window.location" not in javascript
+    assert (
+        'beginSilentTableUpdate("signal-body", "load-more-signals", append)'
+        in javascript
+    )
+    assert (
+        'beginSilentTableUpdate("position-body", "load-more-positions", append)'
+        in javascript
+    )
+    assert (
+        'beginSilentTableUpdate("event-body", "load-more-events", append)' in javascript
+    )
     assert "refreshInFlight" in javascript
     assert "SIGNAL_PAGE_SIZE" in javascript
     assert "const SIGNAL_PAGE_SIZE = 100" in javascript
     assert "const POSITION_PAGE_SIZE = 100" in javascript
     assert "function hydrateDefaultPositions(data)" in javascript
-    assert "const detailLoads = positionsHydrated ? [] : [loadPositions()]" in javascript
+    assert "const detailLoads = [];" in javascript
+    assert "if (shouldReloadPositions) detailLoads.push(loadPositions());" in javascript
     assert "}, 80);" in javascript
     assert "const sourceNumber" in javascript
     assert "maximumSignificantDigits" not in javascript
@@ -2650,8 +2884,9 @@ def test_dashboard_html_is_local_and_refreshes_api() -> None:
     assert "13:24 市價重試後有殘餘，已轉 13:25 集合競價" in javascript
     assert "13:20/13:24/13:25 退出" in javascript
     assert "區間訊號目標" in javascript
-    assert "方向平衡後" in javascript
-    assert "雙向整張不足・保持空倉" in javascript
+    assert "資格／整張／深度後實際成交" in javascript
+    assert "方向平衡後" not in javascript
+    assert "雙向整張不足・保持空倉" not in javascript
     assert "四模式已實現" in javascript
     assert "四模式未實現" in javascript
     assert "已實現＋未實現，已與總權益對帳" in javascript
@@ -2668,7 +2903,7 @@ def test_dashboard_html_is_local_and_refreshes_api() -> None:
     )
     assert "Number(positionPnl.total) / modeTotalEquity * 100" in javascript
     assert "Number(positionPnl.total) / totalPortfolioPnl * 100" not in javascript
-    assert "未成交・${esc(row.reason || row.status || \"受限\")}" in javascript
+    assert '未成交・${esc(row.reason || row.status || "受限")}' in javascript
     assert "所選交易日當沖資格未完整覆蓋" in javascript
     assert "較晚補齊的資料不會回填成假成交" in javascript
     assert "原子指標由 inotify 事件即時喚醒" in javascript
@@ -2680,12 +2915,19 @@ def test_dashboard_html_is_local_and_refreshes_api() -> None:
     assert "end_date: selectedDetailEndDate()" in javascript
     assert 'id="detail-start-date" type="date"' in html
     assert 'id="detail-end-date" type="date"' in html
-    assert '$("detail-start-date").addEventListener("change", detailDateChanged)' in javascript
-    assert '$("detail-end-date").addEventListener("change", detailDateChanged)' in javascript
+    assert (
+        '$("detail-start-date").addEventListener("change", detailDateChanged)'
+        in javascript
+    )
+    assert (
+        '$("detail-end-date").addEventListener("change", detailDateChanged)'
+        in javascript
+    )
     assert "四模式盤前預熱測速（不等同該日執行完成）" in html
-    assert "依 |目標權重| 由大到小" in html
+    assert "依 |持倉目標 %| 由大到小" in html
     assert "const PRICE_REFRESH_MS = 60000" in javascript
-    assert "window.setInterval(() => { void refresh(); void loadChartHistory(); }, PRICE_REFRESH_MS)" in javascript
+    assert "Dashboard.scheduleRefresh(() => {" in javascript
+    assert "}, {intervalMs: PRICE_REFRESH_MS});" in javascript
     assert 'id="equity-time-range"' in html
     assert 'id="chart-legend"' in html
     assert 'aria-label="曲線顯示開關"' in html
@@ -2696,7 +2938,7 @@ def test_dashboard_html_is_local_and_refreshes_api() -> None:
     assert "chartHistoryCache" in javascript
     assert "response.status === 429" not in javascript
     assert "秒後自動重試" not in javascript
-    assert 'button[data-series-id]' in javascript
+    assert "button[data-series-id]" in javascript
     assert 'aria-pressed="${String(!hidden)}"' in javascript
     assert "refreshSummary" not in javascript
 
@@ -2739,6 +2981,9 @@ def test_dashboard_counts_only_same_day_execution_events(tmp_path: Path) -> None
     assert recorded["execution_records"]["blocked_count"] == 1
     assert recorded["execution_records"]["all_executed"] is False
     assert recorded["modes"][0]["today_execution_status"] == "blocked"
+    assert recorded["modes"][0]["today_execution_outcome"] == "blocked"
+    assert recorded["operational_issues"]
+    assert recorded["health"] in {"degraded", "stale"}
     assert recorded["modes"][0]["today_execution_reason"] == (
         "prior_position_unflattened"
     )
@@ -2775,6 +3020,7 @@ def test_dashboard_counts_only_same_day_execution_events(tmp_path: Path) -> None
     assert duplicate["execution_records"]["executed_count"] == 1
     assert duplicate["execution_records"]["blocked_count"] == 0
     assert duplicate["modes"][0]["today_execution_status"] == "completed"
+    assert duplicate["modes"][0]["today_execution_outcome"] == "no_order"
 
     summary = build_dashboard_summary(
         state_dir=engine.state_dir,
@@ -3244,7 +3490,24 @@ def test_dashboard_signal_page_filters_sorts_and_bounds_payload(tmp_path: Path) 
     assert ranged["end_date"] == "2026-08-16"
     assert ranged["session_dates"] == ["2026-08-12", "2026-08-13"]
     assert ranged["total"] == 5
-    assert ranged["rows"][-1]["symbol"] == "OLD"
+    assert [row["symbol"] for row in ranged["rows"]] == [
+        "OLD",
+        "2330",
+        "2317",
+        "2454",
+        "2330",
+    ]
+
+    ranged_first_page = build_dashboard_signal_page(
+        state_dir=state_dir,
+        start_date="2026-08-12",
+        end_date="2026-08-16",
+        limit=2,
+    )
+    assert [row["target_weight"] for row in ranged_first_page["rows"]] == [
+        9.0,
+        0.8,
+    ]
 
     closed_weekend = build_dashboard_signal_page(
         state_dir=state_dir,

@@ -106,11 +106,13 @@ SCAN_CHUNK_CANDIDATES = (64, 128, 256, 512)
 # v15 adds the 2014+ daily no-settlement day-trade contract: blocked closing
 # legs receive unlimited margin conversion with explicit costs, all sessions
 # accounting-close flat, and no T+2/default recurrence.
-# v11 prevents point-in-time side masks, liquidity caps, and whole-lot rounding
-# from silently turning a two-sided Taiwan day-trade target into a one-sided
-# bet.  v10 separated gross commission collection from the economically earned
+# v19 removes portfolio-level long/short fill balancing.  After each symbol is
+# independently constrained by permissions, capacity, turnover, and whole lots,
+# its remaining executable quantity is retained without cross-symbol reduction.
+# v11 added the former direction-balancing behavior.  v10 separated gross
+# commission collection from the economically earned
 # broker rebate and added recurrent pending-rebate state.
-CANONICAL_BACKTEST_CONTRACT_VERSION = 18
+CANONICAL_BACKTEST_CONTRACT_VERSION = 19
 
 _SCAN_CHUNK_CACHE: dict[tuple, int] = {}
 _SCAN_COMPILED_CACHE: dict[
@@ -128,7 +130,9 @@ _SCAN_COMPILED_CACHE: dict[
         ],
     ],
 ] = {}
-_PREP_COMPILED_CACHE: dict[tuple, Callable[..., tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]] = {}
+_PREP_COMPILED_CACHE: dict[
+    tuple, Callable[..., tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]
+] = {}
 _SCAN_COMPILE_FAILED: set[tuple] = set()
 _PREP_COMPILE_FAILED: set[tuple] = set()
 _SCAN_COMPILE_STATS: dict[str, int] = {
@@ -195,7 +199,9 @@ def _is_tw_symbol(symbol: str) -> bool:
     return bool(symbol) and symbol[0].isdigit()
 
 
-def _clip_to_int64_storage_bounds(values: np.ndarray | float, *, non_negative: bool = False) -> np.ndarray:
+def _clip_to_int64_storage_bounds(
+    values: np.ndarray | float, *, non_negative: bool = False
+) -> np.ndarray:
     """Clip numeric values to safe float bounds that can be cast to int64."""
     arr = np.nan_to_num(
         np.asarray(values, dtype=np.float64),
@@ -207,7 +213,9 @@ def _clip_to_int64_storage_bounds(values: np.ndarray | float, *, non_negative: b
     return np.clip(arr, lower, INT64_MAX_FLOAT_SAFE)
 
 
-def _floor_to_int64(values: np.ndarray | float, *, non_negative: bool = False) -> np.ndarray:
+def _floor_to_int64(
+    values: np.ndarray | float, *, non_negative: bool = False
+) -> np.ndarray:
     """Floor and cast to int64 after clipping strictly to int64 storage bounds."""
     clipped = _clip_to_int64_storage_bounds(values, non_negative=non_negative)
     return np.floor(clipped).astype(np.int64)
@@ -270,8 +278,14 @@ def _asset_log_returns_to_simple_torch(
     return torch.expm1(clean)
 
 
-def _portfolio_simple_returns_to_log_torch(simple_returns: torch.Tensor) -> torch.Tensor:
-    floor = torch.as_tensor(_MIN_PORTFOLIO_SIMPLE_RETURN, device=simple_returns.device, dtype=simple_returns.dtype)
+def _portfolio_simple_returns_to_log_torch(
+    simple_returns: torch.Tensor,
+) -> torch.Tensor:
+    floor = torch.as_tensor(
+        _MIN_PORTFOLIO_SIMPLE_RETURN,
+        device=simple_returns.device,
+        dtype=simple_returns.dtype,
+    )
     clean = torch.nan_to_num(
         simple_returns,
         nan=0.0,
@@ -352,7 +366,9 @@ def _apply_portfolio_activation_numpy(
     activation_name = normalize_portfolio_activation(activation)
     out = values.astype(dtype, copy=False)
     if activation_name in {"identity", "pre_normalized"}:
-        return np.where(np.isfinite(out), out, dtype.type(0.0)).astype(dtype, copy=False)
+        return np.where(np.isfinite(out), out, dtype.type(0.0)).astype(
+            dtype, copy=False
+        )
     out = np.nan_to_num(out, nan=0.0, posinf=20.0, neginf=-20.0)
     out = np.clip(out, dtype.type(-20.0), dtype.type(20.0))
     if activation_name == "tanh":
@@ -362,9 +378,13 @@ def _apply_portfolio_activation_numpy(
     if activation_name == "isru":
         return out / np.sqrt(dtype.type(1.0) + np.square(out))
     if activation_name == "erf":
-        return _erf_numpy(out * dtype.type(math.sqrt(math.pi) / 2.0)).astype(dtype, copy=False)
+        return _erf_numpy(out * dtype.type(math.sqrt(math.pi) / 2.0)).astype(
+            dtype, copy=False
+        )
     if activation_name == "atan":
-        return (dtype.type(2.0 / math.pi) * np.arctan(out * dtype.type(math.pi / 2.0))).astype(dtype, copy=False)
+        return (
+            dtype.type(2.0 / math.pi) * np.arctan(out * dtype.type(math.pi / 2.0))
+        ).astype(dtype, copy=False)
     if activation_name == "gudermannian":
         return (
             dtype.type(2.0 / math.pi)
@@ -382,7 +402,9 @@ def _normalize_target_weights_numpy(
 ) -> np.ndarray:
     """Normalize target weights via bounded activation + L1 and apply gross budget."""
     activation_name = normalize_portfolio_activation(portfolio_activation)
-    out = _apply_portfolio_activation_numpy(weights, np.dtype(np.float32), activation_name)
+    out = _apply_portfolio_activation_numpy(
+        weights, np.dtype(np.float32), activation_name
+    )
     if long_only:
         out = np.clip(out, 0.0, None)
     if activation_name == "pre_normalized":
@@ -415,7 +437,9 @@ def _normalize_target_weights_row_numpy(
 ) -> np.ndarray:
     """Single-row variant of bounded activation + L1 normalization for integer-share path."""
     activation_name = normalize_portfolio_activation(portfolio_activation)
-    row = _apply_portfolio_activation_numpy(weights_row, np.dtype(np.float64), activation_name)
+    row = _apply_portfolio_activation_numpy(
+        weights_row, np.dtype(np.float64), activation_name
+    )
     if long_only:
         row = np.clip(row, 0.0, None)
     l1 = float(np.abs(row).sum(dtype=np.float64))
@@ -472,12 +496,16 @@ def _normalize_target_weights_torch(
     return normalized * leverage
 
 
-def _apply_min_trade_weight_numpy(weights: np.ndarray, min_trade_weight: float) -> np.ndarray:
+def _apply_min_trade_weight_numpy(
+    weights: np.ndarray, min_trade_weight: float
+) -> np.ndarray:
     threshold = float(min_trade_weight)
     if threshold <= 0.0:
         return weights
     gross_before = np.abs(weights).sum(axis=1, keepdims=True).astype(np.float32)
-    out = np.where(np.abs(weights) >= np.float32(threshold), weights, np.float32(0.0)).astype(np.float32, copy=False)
+    out = np.where(
+        np.abs(weights) >= np.float32(threshold), weights, np.float32(0.0)
+    ).astype(np.float32, copy=False)
     gross_after = np.abs(out).sum(axis=1, keepdims=True).astype(np.float32)
     scale = np.divide(
         gross_before,
@@ -488,19 +516,25 @@ def _apply_min_trade_weight_numpy(weights: np.ndarray, min_trade_weight: float) 
     return (out * scale).astype(np.float32, copy=False)
 
 
-def _apply_min_trade_weight_row_numpy(weights_row: np.ndarray, min_trade_weight: float) -> np.ndarray:
+def _apply_min_trade_weight_row_numpy(
+    weights_row: np.ndarray, min_trade_weight: float
+) -> np.ndarray:
     threshold = float(min_trade_weight)
     if threshold <= 0.0:
         return weights_row
     gross_before = float(np.abs(weights_row).sum(dtype=np.float64))
-    out = np.where(np.abs(weights_row) >= threshold, weights_row, 0.0).astype(weights_row.dtype, copy=False)
+    out = np.where(np.abs(weights_row) >= threshold, weights_row, 0.0).astype(
+        weights_row.dtype, copy=False
+    )
     gross_after = float(np.abs(out).sum(dtype=np.float64))
     if gross_before <= 1e-12 or gross_after <= 1e-12:
         return out
     return (out * (gross_before / gross_after)).astype(weights_row.dtype, copy=False)
 
 
-def _apply_min_trade_weight_torch(weights: torch.Tensor, min_trade_weight: float) -> torch.Tensor:
+def _apply_min_trade_weight_torch(
+    weights: torch.Tensor, min_trade_weight: float
+) -> torch.Tensor:
     threshold = float(min_trade_weight)
     if threshold <= 0.0:
         return weights
@@ -570,7 +604,8 @@ def _apply_gross_exposure_cap_torch(
     same_direction = (prev_weights * proposed_weights) > 0.0
     reduced_base = torch.where(
         same_direction,
-        torch.sign(prev_weights) * torch.minimum(prev_weights.abs(), proposed_weights.abs()),
+        torch.sign(prev_weights)
+        * torch.minimum(prev_weights.abs(), proposed_weights.abs()),
         torch.zeros_like(prev_weights),
     )
     additions = proposed_weights - reduced_base
@@ -593,7 +628,9 @@ def _apply_turnover_cap_torch(
 
     deltas = target_weights - prev_weights
     turnovers = deltas.abs().sum(dim=1, keepdim=True)
-    cap = torch.as_tensor(max_turnover_ratio, device=turnovers.device, dtype=turnovers.dtype)
+    cap = torch.as_tensor(
+        max_turnover_ratio, device=turnovers.device, dtype=turnovers.dtype
+    )
     scale = torch.ones_like(turnovers)
     scale = torch.where(turnovers > cap, cap / turnovers.clamp_min(1e-12), scale)
     scale = scale.clamp_(0.0, 1.0)
@@ -601,7 +638,12 @@ def _apply_turnover_cap_torch(
 
 
 def _env_flag(name: str, default: str = "1") -> bool:
-    return os.environ.get(name, default).strip().lower() not in {"0", "false", "off", "no"}
+    return os.environ.get(name, default).strip().lower() not in {
+        "0",
+        "false",
+        "off",
+        "no",
+    }
 
 
 def _strict_no_fallback_enabled() -> bool:
@@ -697,7 +739,11 @@ def _prepend_cuda_toolchain_paths() -> None:
         pass
     existing = os.environ.get("PATH", "")
     existing_parts = [part for part in existing.split(os.pathsep) if part]
-    prepend = [part for part in entries if part and Path(part).exists() and part not in existing_parts]
+    prepend = [
+        part
+        for part in entries
+        if part and Path(part).exists() and part not in existing_parts
+    ]
     if prepend:
         os.environ["PATH"] = os.pathsep.join([*prepend, existing])
     os.environ.setdefault("CC", str(env_bin / "x86_64-conda-linux-gnu-gcc"))
@@ -763,7 +809,9 @@ def get_backtest_prep_compile_stats(reset: bool = False) -> dict[str, int]:
 def _add_backtest_runtime_stat(key: str, value: float = 1.0) -> None:
     if _torch_dynamo_is_compiling():
         return
-    _BACKTEST_RUNTIME_STATS[key] = float(_BACKTEST_RUNTIME_STATS.get(key, 0.0)) + float(value)
+    _BACKTEST_RUNTIME_STATS[key] = float(_BACKTEST_RUNTIME_STATS.get(key, 0.0)) + float(
+        value
+    )
 
 
 def _runtime_stat_start() -> float | None:
@@ -781,7 +829,11 @@ def _add_backtest_elapsed_stat(key: str, start: float | None) -> None:
 class _CudaRuntimeTimer:
     def __init__(self, key: str, tensor: torch.Tensor):
         self.key = key
-        self.enabled = tensor.device.type == "cuda" and torch.cuda.is_available() and not _torch_dynamo_is_compiling()
+        self.enabled = (
+            tensor.device.type == "cuda"
+            and torch.cuda.is_available()
+            and not _torch_dynamo_is_compiling()
+        )
         self.start: torch.cuda.Event | None = None
         self.end: torch.cuda.Event | None = None
 
@@ -834,7 +886,9 @@ def _configure_inductor_cudagraphs() -> None:
         pass
 
 
-def _mark_static_shape(tensor: torch.Tensor | None, dims: list[int] | None = None) -> None:
+def _mark_static_shape(
+    tensor: torch.Tensor | None, dims: list[int] | None = None
+) -> None:
     if tensor is None:
         return
     mark_static = getattr(torch._dynamo, "mark_static", None)
@@ -918,7 +972,15 @@ def _scan_runner_factory(
         force_short_cover_mask: torch.Tensor,
         force_exit_mask: torch.Tensor,
         volume_limit_weights: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
         if long_only:
             return _vectorized_backtest_torch_scan_long_only(
                 weights,
@@ -1098,7 +1160,11 @@ def _resolve_scan_runner(
     if _torch_dynamo_is_compiling():
         return base_runner
 
-    if not _compile_enabled() or weights.device.type != "cuda" or not hasattr(torch, "compile"):
+    if (
+        not _compile_enabled()
+        or weights.device.type != "cuda"
+        or not hasattr(torch, "compile")
+    ):
         return base_runner
 
     key = _scan_compile_key(
@@ -1232,10 +1298,10 @@ def _fallback_scan_runner_after_runtime_failure(
 class BacktestResult:
     """Container for a single backtest simulation run."""
 
-    strategy_returns: np.ndarray   # [T] net portfolio log returns after costs
+    strategy_returns: np.ndarray  # [T] net portfolio log returns after costs
     benchmark_returns: np.ndarray  # [T] benchmark log returns
-    turnovers: np.ndarray          # [T] total absolute weight change per day
-    weights_history: np.ndarray    # [T, S] realised portfolio weights
+    turnovers: np.ndarray  # [T] total absolute weight change per day
+    weights_history: np.ndarray  # [T, S] realised portfolio weights
     execution_mode: str = "naive"
     # ``currency`` for exact integer-share ledgers and ``nav_ratio`` for the
     # differentiable normalized training ledger.  Keeping this explicit
@@ -1288,11 +1354,15 @@ class BacktestResult:
 class BacktestResultTensor:
     """Torch tensor container for a single backtest simulation run."""
 
-    strategy_returns: torch.Tensor   # [T] net portfolio log returns after costs
+    strategy_returns: torch.Tensor  # [T] net portfolio log returns after costs
     benchmark_returns: torch.Tensor  # [T] benchmark log returns
-    turnovers: torch.Tensor          # [T]
-    weights_history: torch.Tensor    # [T, S], may be empty when caller disables history recording.
-    final_weights: torch.Tensor | None = None  # [S], realised weights after the final simulated day.
+    turnovers: torch.Tensor  # [T]
+    weights_history: (
+        torch.Tensor
+    )  # [T, S], may be empty when caller disables history recording.
+    final_weights: torch.Tensor | None = (
+        None  # [S], realised weights after the final simulated day.
+    )
     final_alive: torch.Tensor | None = None  # scalar bool; false is absorbing ruin.
     execution_mode: str = "naive"
     settlement_ledger_unit: str | None = None
@@ -1340,7 +1410,11 @@ class BacktestResultTensor:
             return None if tensor is None else as_float32(tensor)
 
         def optional_bool(tensor: torch.Tensor | None) -> np.ndarray | None:
-            return None if tensor is None else tensor.detach().to(device="cpu", dtype=torch.bool).numpy()
+            return (
+                None
+                if tensor is None
+                else tensor.detach().to(device="cpu", dtype=torch.bool).numpy()
+            )
 
         return BacktestResult(
             strategy_returns=as_float32(self.strategy_returns),
@@ -1353,9 +1427,7 @@ class BacktestResultTensor:
             event_turnovers=optional_float32(self.event_turnovers),
             executed_buy_weights=optional_float32(self.executed_buy_weights),
             executed_sell_weights=optional_float32(self.executed_sell_weights),
-            executed_long_buy_weights=optional_float32(
-                self.executed_long_buy_weights
-            ),
+            executed_long_buy_weights=optional_float32(self.executed_long_buy_weights),
             executed_long_sell_weights=optional_float32(
                 self.executed_long_sell_weights
             ),
@@ -1466,14 +1538,10 @@ def _vectorized_backtest(
     # ordinary halt/data hole executable.  ``force_exit_mask`` is the sole
     # exception and is settled separately below.
     buy_mask = (
-        tradable
-        if can_buy_mask is None
-        else can_buy_mask.astype(bool) & tradable
+        tradable if can_buy_mask is None else can_buy_mask.astype(bool) & tradable
     )
     sell_mask = (
-        tradable
-        if can_sell_mask is None
-        else can_sell_mask.astype(bool) & tradable
+        tradable if can_sell_mask is None else can_sell_mask.astype(bool) & tradable
     )
     short_open_mask = (
         sell_mask
@@ -1569,7 +1637,9 @@ def _vectorized_backtest(
             blocked_cross_short = cross_from_long & sell_t & ~short_open_mask[t]
             constrained_target[blocked_cross_short] = 0.0
 
-            open_or_increase_short = down & (prev <= 0.0) & (constrained_target < prev) & ~short_open_mask[t]
+            open_or_increase_short = (
+                down & (prev <= 0.0) & (constrained_target < prev) & ~short_open_mask[t]
+            )
             constrained_target[open_or_increase_short] = prev[open_or_increase_short]
             delta = constrained_target - prev
 
@@ -1577,11 +1647,17 @@ def _vectorized_backtest(
         if volume_limits is not None:
             volume_cap = volume_limits[t]
             abs_delta = np.abs(delta)
-            cap_safe = np.where(np.isfinite(volume_cap) & (volume_cap >= 0.0), np.maximum(volume_cap, 0.0), abs_delta)
+            cap_safe = np.where(
+                np.isfinite(volume_cap) & (volume_cap >= 0.0),
+                np.maximum(volume_cap, 0.0),
+                abs_delta,
+            )
             delta = np.sign(delta) * np.minimum(abs_delta, cap_safe)
             next_weights = prev + delta
         if max_turnover_ratio > 0.0:
-            next_weights = _apply_turnover_cap_numpy(prev[None, :], next_weights[None, :], max_turnover_ratio)[0]
+            next_weights = _apply_turnover_cap_numpy(
+                prev[None, :], next_weights[None, :], max_turnover_ratio
+            )[0]
             delta = next_weights - prev
 
         if not long_only:
@@ -1605,8 +1681,12 @@ def _vectorized_backtest(
 
         executed_weights = next_weights.astype(np.float32, copy=False)
         weights_history[t] = executed_weights
-        buy_turnovers[t] = np.clip(delta, 0.0, None).sum(dtype=np.float32) + forced_buy_turnover
-        sell_turnovers[t] = np.clip(-delta, 0.0, None).sum(dtype=np.float32) + forced_sell_turnover
+        buy_turnovers[t] = (
+            np.clip(delta, 0.0, None).sum(dtype=np.float32) + forced_buy_turnover
+        )
+        sell_turnovers[t] = (
+            np.clip(-delta, 0.0, None).sum(dtype=np.float32) + forced_sell_turnover
+        )
         gross_simple_returns[t] = np.sum(
             executed_weights * asset_simple_returns[t],
             dtype=np.float32,
@@ -1648,11 +1728,23 @@ def _vectorized_backtest_torch_scan_long_only(
     gross_budget: float = 1.0,
     scan_chunk_size: int = 256,
     record_weights_history: bool = True,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    future_returns_t = _asset_log_returns_to_simple_torch(future_returns, device=weights.device, dtype=weights.dtype)
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    future_returns_t = _asset_log_returns_to_simple_torch(
+        future_returns, device=weights.device, dtype=weights.dtype
+    )
     target_weights = weights
     tradable = tradable_mask
-    _require_side_masks_if_strict(can_buy_mask, can_sell_mask, context="torch scan backtest")
+    _require_side_masks_if_strict(
+        can_buy_mask, can_sell_mask, context="torch scan backtest"
+    )
     buy_mask = (
         tradable
         if can_buy_mask is None
@@ -1672,7 +1764,11 @@ def _vectorized_backtest_torch_scan_long_only(
     t_len, n_symbols = target_weights.shape
     dtype = target_weights.dtype
     device = target_weights.device
-    prev = prev_init.to(device=device, dtype=dtype) if prev_init is not None else torch.zeros_like(target_weights[0])
+    prev = (
+        prev_init.to(device=device, dtype=dtype)
+        if prev_init is not None
+        else torch.zeros_like(target_weights[0])
+    )
     alive = (
         alive_init.to(device=device, dtype=torch.bool).reshape(())
         if alive_init is not None
@@ -1697,16 +1793,16 @@ def _vectorized_backtest_torch_scan_long_only(
         buy_chunk = buy_mask[start:end]
         sell_chunk = sell_mask[start:end]
         terminal_chunk = terminal_exit_mask[start:end]
-        volume_chunk = None if volume_limit_weights is None else volume_limit_weights[start:end]
+        volume_chunk = (
+            None if volume_limit_weights is None else volume_limit_weights[start:end]
+        )
 
         for offset in range(end - start):
             idx = start + offset
             prev = torch.where(alive, prev, torch.zeros_like(prev))
             tradable_t = tradable_chunk[offset]
             terminal_exit_t = terminal_chunk[offset]
-            forced_exit = torch.where(
-                terminal_exit_t, prev, torch.zeros_like(prev)
-            )
+            forced_exit = torch.where(terminal_exit_t, prev, torch.zeros_like(prev))
             forced_buy_turnover = (-forced_exit).clamp_min(0.0).sum()
             forced_sell_turnover = forced_exit.clamp_min(0.0).sum()
             prev = torch.where(terminal_exit_t, torch.zeros_like(prev), prev)
@@ -1768,7 +1864,15 @@ def _vectorized_backtest_torch_scan_long_only(
             prev = torch.where(alive, prev, torch.zeros_like(prev))
 
     turnovers = buy_turnovers + sell_turnovers
-    return turnovers, buy_turnovers, sell_turnovers, gross_returns, weights_history, prev, alive
+    return (
+        turnovers,
+        buy_turnovers,
+        sell_turnovers,
+        gross_returns,
+        weights_history,
+        prev,
+        alive,
+    )
 
 
 def _vectorized_backtest_torch_scan_long_short(
@@ -1789,12 +1893,24 @@ def _vectorized_backtest_torch_scan_long_short(
     gross_budget: float = 1.0,
     scan_chunk_size: int = 256,
     record_weights_history: bool = True,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    future_returns_t = _asset_log_returns_to_simple_torch(future_returns, device=weights.device, dtype=weights.dtype)
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    future_returns_t = _asset_log_returns_to_simple_torch(
+        future_returns, device=weights.device, dtype=weights.dtype
+    )
 
     target_weights = weights
     tradable = tradable_mask
-    _require_side_masks_if_strict(can_buy_mask, can_sell_mask, context="torch scan backtest")
+    _require_side_masks_if_strict(
+        can_buy_mask, can_sell_mask, context="torch scan backtest"
+    )
     buy_mask = (
         tradable
         if can_buy_mask is None
@@ -1808,12 +1924,15 @@ def _vectorized_backtest_torch_scan_long_short(
     short_open_mask = (
         sell_mask
         if can_short_open_mask is None
-        else can_short_open_mask.to(device=weights.device, dtype=torch.bool) & sell_mask & tradable
+        else can_short_open_mask.to(device=weights.device, dtype=torch.bool)
+        & sell_mask
+        & tradable
     )
     force_cover_mask = (
         torch.zeros_like(tradable, dtype=torch.bool)
         if force_short_cover_mask is None
-        else force_short_cover_mask.to(device=weights.device, dtype=torch.bool) & tradable
+        else force_short_cover_mask.to(device=weights.device, dtype=torch.bool)
+        & tradable
     )
     terminal_exit_mask = (
         torch.zeros_like(tradable, dtype=torch.bool)
@@ -1824,7 +1943,11 @@ def _vectorized_backtest_torch_scan_long_short(
     t_len, n_symbols = target_weights.shape
     dtype = target_weights.dtype
     device = target_weights.device
-    prev = prev_init.to(device=device, dtype=dtype) if prev_init is not None else torch.zeros_like(target_weights[0])
+    prev = (
+        prev_init.to(device=device, dtype=dtype)
+        if prev_init is not None
+        else torch.zeros_like(target_weights[0])
+    )
     alive = (
         alive_init.to(device=device, dtype=torch.bool).reshape(())
         if alive_init is not None
@@ -1851,16 +1974,16 @@ def _vectorized_backtest_torch_scan_long_short(
         short_chunk = short_open_mask[start:end]
         force_chunk = force_cover_mask[start:end]
         terminal_chunk = terminal_exit_mask[start:end]
-        volume_chunk = None if volume_limit_weights is None else volume_limit_weights[start:end]
+        volume_chunk = (
+            None if volume_limit_weights is None else volume_limit_weights[start:end]
+        )
 
         for offset in range(end - start):
             idx = start + offset
             prev = torch.where(alive, prev, torch.zeros_like(prev))
             tradable_t = tradable_chunk[offset]
             terminal_exit_t = terminal_chunk[offset]
-            forced_exit = torch.where(
-                terminal_exit_t, prev, torch.zeros_like(prev)
-            )
+            forced_exit = torch.where(terminal_exit_t, prev, torch.zeros_like(prev))
             forced_buy_turnover = (-forced_exit).clamp_min(0.0).sum()
             forced_sell_turnover = forced_exit.clamp_min(0.0).sum()
             prev = torch.where(terminal_exit_t, torch.zeros_like(prev), prev)
@@ -1877,21 +2000,34 @@ def _vectorized_backtest_torch_scan_long_short(
             )
 
             delta = target_t - prev
-            constrained_target = torch.where((delta > 0.0) & ~buy_chunk[offset], prev, target_t)
+            constrained_target = torch.where(
+                (delta > 0.0) & ~buy_chunk[offset], prev, target_t
+            )
             down = constrained_target < prev
-            reduce_long = down & (prev > 0.0) & (constrained_target >= 0.0) & ~sell_chunk[offset]
+            reduce_long = (
+                down & (prev > 0.0) & (constrained_target >= 0.0) & ~sell_chunk[offset]
+            )
             constrained_target = torch.where(reduce_long, prev, constrained_target)
 
             cross_from_long = down & (prev > 0.0) & (constrained_target < 0.0)
-            constrained_target = torch.where(cross_from_long & ~sell_chunk[offset], prev, constrained_target)
+            constrained_target = torch.where(
+                cross_from_long & ~sell_chunk[offset], prev, constrained_target
+            )
             constrained_target = torch.where(
                 cross_from_long & sell_chunk[offset] & ~short_chunk[offset],
                 torch.zeros_like(constrained_target),
                 constrained_target,
             )
 
-            open_or_increase_short = down & (prev <= 0.0) & (constrained_target < prev) & ~short_chunk[offset]
-            constrained_target = torch.where(open_or_increase_short, prev, constrained_target)
+            open_or_increase_short = (
+                down
+                & (prev <= 0.0)
+                & (constrained_target < prev)
+                & ~short_chunk[offset]
+            )
+            constrained_target = torch.where(
+                open_or_increase_short, prev, constrained_target
+            )
             delta = constrained_target - prev
 
             next_weights = prev + delta
@@ -1950,7 +2086,15 @@ def _vectorized_backtest_torch_scan_long_short(
             prev = torch.where(alive, prev, torch.zeros_like(prev))
 
     turnovers = buy_turnovers + sell_turnovers
-    return turnovers, buy_turnovers, sell_turnovers, gross_returns, weights_history, prev, alive
+    return (
+        turnovers,
+        buy_turnovers,
+        sell_turnovers,
+        gross_returns,
+        weights_history,
+        prev,
+        alive,
+    )
 
 
 def _prepare_runner_factory(
@@ -2140,7 +2284,9 @@ def _prepare_scan_inputs(
     # lower-precision model outputs.
     weights = weights.to(dtype=torch.float32)
     gross_budget = _resolve_exposure_budget(gross_leverage)
-    _require_side_masks_if_strict(can_buy_mask, can_sell_mask, context="backtest input preparation")
+    _require_side_masks_if_strict(
+        can_buy_mask, can_sell_mask, context="backtest input preparation"
+    )
     buy_input = tradable_mask if can_buy_mask is None else can_buy_mask
     sell_input = tradable_mask if can_sell_mask is None else can_sell_mask
     runner = _resolve_prepare_runner(
@@ -2289,9 +2435,7 @@ def _prepare_tw_phase_actions(
         raw_open_entry = safe[:, 1]
         raw_close_entry = safe[:, 2]
         direction_logits = 0.5 * (raw_open_entry + raw_close_entry)
-        close_entry_fraction = torch.sigmoid(
-            raw_close_entry - raw_open_entry
-        )
+        close_entry_fraction = torch.sigmoid(raw_close_entry - raw_open_entry)
         entry_logits = torch.stack(
             (
                 direction_logits * (1.0 - close_entry_fraction),
@@ -2354,25 +2498,34 @@ def _vectorized_backtest_torch(
         effective_max_turnover_ratio = float(max_turnover_ratio)
         prep_start = _runtime_stat_start()
         with _CudaRuntimeTimer("prep_cuda_s", weights):
-            prepped_weights, prepped_tradable, prepped_buy, prepped_sell = _prepare_scan_inputs(
-                weights,
-                tradable_mask,
-                can_buy_mask,
-                can_sell_mask,
-                long_only,
-                gross_leverage,
-                min_trade_weight,
-                portfolio_activation,
+            prepped_weights, prepped_tradable, prepped_buy, prepped_sell = (
+                _prepare_scan_inputs(
+                    weights,
+                    tradable_mask,
+                    can_buy_mask,
+                    can_sell_mask,
+                    long_only,
+                    gross_leverage,
+                    min_trade_weight,
+                    portfolio_activation,
+                )
             )
             prepped_short_open = (
                 prepped_sell
                 if can_short_open_mask is None
-                else can_short_open_mask.to(device=prepped_weights.device, dtype=torch.bool) & prepped_sell & prepped_tradable
+                else can_short_open_mask.to(
+                    device=prepped_weights.device, dtype=torch.bool
+                )
+                & prepped_sell
+                & prepped_tradable
             )
             prepped_force_cover = (
                 torch.zeros_like(prepped_tradable, dtype=torch.bool)
                 if force_short_cover_mask is None
-                else force_short_cover_mask.to(device=prepped_weights.device, dtype=torch.bool) & prepped_tradable
+                else force_short_cover_mask.to(
+                    device=prepped_weights.device, dtype=torch.bool
+                )
+                & prepped_tradable
             )
             prepped_force_exit = (
                 torch.zeros_like(prepped_tradable, dtype=torch.bool)
@@ -2385,13 +2538,17 @@ def _vectorized_backtest_torch(
             if volume_limit_weights is None:
                 # A finite-cap tensor and an all-inf tensor share one compiled
                 # signature; inf means the execution rule is unconstrained.
-                prepped_volume_limit_weights = torch.full_like(prepped_weights, float("inf"))
+                prepped_volume_limit_weights = torch.full_like(
+                    prepped_weights, float("inf")
+                )
             else:
                 prepped_volume_limit_weights = volume_limit_weights.to(
                     device=prepped_weights.device,
                     dtype=prepped_weights.dtype,
                 )
-                if tuple(prepped_volume_limit_weights.shape) != tuple(prepped_weights.shape):
+                if tuple(prepped_volume_limit_weights.shape) != tuple(
+                    prepped_weights.shape
+                ):
                     raise ValueError(
                         "volume_limit_weights shape must match weights: "
                         f"{tuple(prepped_volume_limit_weights.shape)} != {tuple(prepped_weights.shape)}"
@@ -2401,7 +2558,9 @@ def _vectorized_backtest_torch(
         with _CudaRuntimeTimer("prev_init_cuda_s", prepped_weights):
             prev_init = (
                 torch.nan_to_num(
-                    initial_weights.detach().clone(memory_format=torch.contiguous_format).to(
+                    initial_weights.detach()
+                    .clone(memory_format=torch.contiguous_format)
+                    .to(
                         device=prepped_weights.device,
                         dtype=prepped_weights.dtype,
                     ),
@@ -2529,7 +2688,15 @@ def _vectorized_backtest_torch(
         try:
             runner_call_start = _runtime_stat_start()
             with _CudaRuntimeTimer("runner_call_cuda_s", prepped_weights):
-                turnovers, buy_turnovers, sell_turnovers, gross_returns, weights_history, final_weights, final_alive = runner(
+                (
+                    turnovers,
+                    buy_turnovers,
+                    sell_turnovers,
+                    gross_returns,
+                    weights_history,
+                    final_weights,
+                    final_alive,
+                ) = runner(
                     prepped_weights,
                     future_returns,
                     prepped_tradable,
@@ -2545,7 +2712,9 @@ def _vectorized_backtest_torch(
             _add_backtest_elapsed_stat("runner_call_s", runner_call_start)
         except Exception as e:
             if _torch_dynamo_is_compiling() or not (
-                _compile_enabled() and prepped_weights.device.type == "cuda" and hasattr(torch, "compile")
+                _compile_enabled()
+                and prepped_weights.device.type == "cuda"
+                and hasattr(torch, "compile")
             ):
                 raise
             _add_backtest_runtime_stat("runtime_fallback_calls")
@@ -2565,7 +2734,15 @@ def _vectorized_backtest_torch(
             _add_backtest_elapsed_stat("runtime_fallback_s", fallback_start)
             runner_call_start = _runtime_stat_start()
             with _CudaRuntimeTimer("runner_call_cuda_s", prepped_weights):
-                turnovers, buy_turnovers, sell_turnovers, gross_returns, weights_history, final_weights, final_alive = runner(
+                (
+                    turnovers,
+                    buy_turnovers,
+                    sell_turnovers,
+                    gross_returns,
+                    weights_history,
+                    final_weights,
+                    final_alive,
+                ) = runner(
                     prepped_weights,
                     future_returns,
                     prepped_tradable,
@@ -2636,7 +2813,9 @@ def _vectorized_backtest_torch(
             if return_weights_history:
                 weights_history = torch.cat(weights_chunks, dim=0)
             else:
-                weights_history = prepped_weights.new_empty((0, prepped_weights.size(1)))
+                weights_history = prepped_weights.new_empty(
+                    (0, prepped_weights.size(1))
+                )
             final_weights = prev
             final_alive = alive
         _add_backtest_elapsed_stat("checkpoint_s", checkpoint_start)
@@ -2718,6 +2897,7 @@ def run_backtest(
     """Simulate daily portfolio execution from model weights."""
     mode = normalize_execution_mode(execution_mode)
     if mode != "naive":
+
         def tensor(value: np.ndarray | float | bool | None) -> torch.Tensor | None:
             return None if value is None else torch.as_tensor(value)
 
@@ -2759,9 +2939,7 @@ def run_backtest(
             day_trade_eligible_mask=tensor(day_trade_eligible_mask),
             day_trade_can_buy_open_mask=tensor(day_trade_can_buy_open_mask),
             day_trade_can_sell_open_mask=tensor(day_trade_can_sell_open_mask),
-            unresolved_corporate_action_mask=tensor(
-                unresolved_corporate_action_mask
-            ),
+            unresolved_corporate_action_mask=tensor(unresolved_corporate_action_mask),
             cash_dividend_yield=tensor(cash_dividend_yield),
             cash_dividend_payment_delay_sessions=tensor(
                 cash_dividend_payment_delay_sessions
@@ -2771,9 +2949,7 @@ def run_backtest(
             initial_cash=tensor(initial_cash),
             initial_payables=tensor(initial_payables),
             initial_receivables=tensor(initial_receivables),
-            initial_commission_rebate_current=tensor(
-                initial_commission_rebate_current
-            ),
+            initial_commission_rebate_current=tensor(initial_commission_rebate_current),
             initial_commission_rebate_due=tensor(initial_commission_rebate_due),
             initial_commission_rebate_month_id=tensor(
                 initial_commission_rebate_month_id
@@ -2930,7 +3106,10 @@ def run_backtest_torch(
             settlement_ledger_unit="notional_weight",
         )
     if mode == "tw_index_derivatives_day":
-        if weights.dim() != 2 or int(weights.size(1)) != TAIFEX_INDEX_DERIVATIVE_ACTION_COUNT_V4:
+        if (
+            weights.dim() != 2
+            or int(weights.size(1)) != TAIFEX_INDEX_DERIVATIVE_ACTION_COUNT_V4
+        ):
             raise ValueError(
                 "tw_index_derivatives_day expects direct actions [T,D_derivatives]"
             )
@@ -2988,7 +3167,9 @@ def run_backtest_torch(
             ),
             turnovers=continuous.turnovers,
             weights_history=weights_history,
-            requested_weights_history=(weights.float() if return_weights_history else None),
+            requested_weights_history=(
+                weights.float() if return_weights_history else None
+            ),
             final_weights=torch.zeros(
                 symbols_count, device=weights.device, dtype=torch.float32
             ),
@@ -3010,13 +3191,9 @@ def run_backtest_torch(
                 raise ValueError("future_returns must retain stock-panel shape [T,S]")
             if tuple(tradable_mask.shape) != (rows, symbols_count):
                 raise ValueError("tradable_mask must retain stock-panel shape [T,S]")
-            execution = overnight_returns.to(
-                device=weights.device, dtype=torch.float32
-            )
+            execution = overnight_returns.to(device=weights.device, dtype=torch.float32)
             if state_advance_mask is not None:
-                advance = state_advance_mask.to(
-                    device=weights.device, dtype=torch.bool
-                )
+                advance = state_advance_mask.to(device=weights.device, dtype=torch.bool)
                 execution = torch.where(
                     advance[:, None, None],
                     execution,
@@ -3072,9 +3249,7 @@ def run_backtest_torch(
         if tradable_mask.shape != weights.shape:
             raise ValueError("tradable_mask must match futures pseudo weights [T,S]")
         selection_mask = tradable_mask.to(device=weights.device, dtype=torch.bool)
-        clean_weights = torch.nan_to_num(
-            weights, nan=0.0, posinf=0.0, neginf=0.0
-        )
+        clean_weights = torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
         clean_weights = torch.where(
             selection_mask, clean_weights, torch.zeros_like(clean_weights)
         )
@@ -3088,15 +3263,14 @@ def run_backtest_torch(
                 torch.zeros_like(requested_exposure),
             )
 
-        raw_returns = future_returns.to(
-            device=weights.device, dtype=torch.float32
-        )
+        raw_returns = future_returns.to(device=weights.device, dtype=torch.float32)
         valid_cells = selection_mask & torch.isfinite(raw_returns)
         valid_count = valid_cells.sum(dim=-1)
         reference_returns = torch.where(
             valid_count > 0,
-            torch.where(valid_cells, raw_returns, torch.zeros_like(raw_returns))
-            .sum(dim=-1)
+            torch.where(valid_cells, raw_returns, torch.zeros_like(raw_returns)).sum(
+                dim=-1
+            )
             / valid_count.clamp_min(1).to(dtype=raw_returns.dtype),
             torch.zeros_like(requested_exposure, dtype=torch.float32),
         )
@@ -3127,9 +3301,7 @@ def run_backtest_torch(
                 (
                     torch.ones((1,), device=weights.device, dtype=torch.bool),
                     torch.cumprod(
-                        (continuous.strategy_returns[:-1] > -1.0).to(
-                            dtype=torch.int64
-                        ),
+                        (continuous.strategy_returns[:-1] > -1.0).to(dtype=torch.int64),
                         dim=0,
                     ).to(dtype=torch.bool),
                 ),
@@ -3157,20 +3329,18 @@ def run_backtest_torch(
             ),
             torch.zeros_like(continuous.executed_exposure),
         )
-        executed_pseudo_weights = clean_weights.to(dtype=torch.float32) * scale.unsqueeze(-1)
+        executed_pseudo_weights = clean_weights.to(
+            dtype=torch.float32
+        ) * scale.unsqueeze(-1)
         empty_or_history = (
             executed_pseudo_weights
             if return_weights_history
             else executed_pseudo_weights.new_empty((0, int(weights.size(-1))))
         )
         requested_history = (
-            weights.to(dtype=torch.float32)
-            if return_weights_history
-            else None
+            weights.to(dtype=torch.float32) if return_weights_history else None
         )
-        survived = initial_alive_tensor & torch.all(
-            continuous.strategy_returns > -1.0
-        )
+        survived = initial_alive_tensor & torch.all(continuous.strategy_returns > -1.0)
         return BacktestResultTensor(
             strategy_returns=strategy_log_returns,
             benchmark_returns=benchmark_returns.to(
@@ -3199,7 +3369,9 @@ def run_backtest_torch(
                 dtype=torch.long,
             )
             if tuple(active_symbol_indices.shape) != (n_symbols,):
-                raise ValueError("symbol_indices must contain one index per active symbol")
+                raise ValueError(
+                    "symbol_indices must contain one index per active symbol"
+                )
             buy_fee_rates = buy_fee_rates.index_select(0, active_symbol_indices)
             active_symbol_indices_sell = symbol_indices.to(
                 device=sell_fee_rates.device,
@@ -3264,8 +3436,7 @@ def run_backtest_torch(
                 "tw_day_trade requires a point-in-time day_trade_eligible_mask"
             )
         if mode == "tw_day_trade" and (
-            day_trade_can_buy_open_mask is None
-            or day_trade_can_sell_open_mask is None
+            day_trade_can_buy_open_mask is None or day_trade_can_sell_open_mask is None
         ):
             raise ValueError(
                 "tw_day_trade requires explicit point-in-time open-side buy/sell masks"
@@ -3273,9 +3444,7 @@ def run_backtest_torch(
 
         phase_execution = mode in TW_CARRYING_EXECUTION_MODES and weights.dim() == 3
         if mode == "tw_overnight" and not phase_execution:
-            raise ValueError(
-                "tw_overnight requires actions with shape [T,3,S]"
-            )
+            raise ValueError("tw_overnight requires actions with shape [T,3,S]")
         if phase_execution:
             if overnight_returns is None:
                 raise ValueError(
@@ -3354,7 +3523,10 @@ def run_backtest_torch(
                     dim=1,
                 )
             phase_margin_rate: torch.Tensor | float | None = short_margin_rate
-            if isinstance(short_margin_rate, torch.Tensor) and short_margin_rate.dim() == 2:
+            if (
+                isinstance(short_margin_rate, torch.Tensor)
+                and short_margin_rate.dim() == 2
+            ):
                 phase_margin_rate = short_margin_rate.to(
                     device=device,
                     dtype=prepped_weights.dtype,
@@ -3378,9 +3550,7 @@ def run_backtest_torch(
                 )
             phase_runner_extra: dict[str, bool] = {}
             if compile_phase_ledger:
-                phase_runner_extra["strict_compile"] = (
-                    _strict_no_fallback_enabled()
-                )
+                phase_runner_extra["strict_compile"] = _strict_no_fallback_enabled()
             tw_result = phase_runner(
                 prepped_weights,
                 overnight_returns.to(
@@ -3429,13 +3599,9 @@ def run_backtest_torch(
                 initial_cash=initial_cash,
                 initial_payables=initial_payables,
                 initial_receivables=initial_receivables,
-                initial_commission_rebate_current=(
-                    initial_commission_rebate_current
-                ),
+                initial_commission_rebate_current=(initial_commission_rebate_current),
                 initial_commission_rebate_due=initial_commission_rebate_due,
-                initial_commission_rebate_month_id=(
-                    initial_commission_rebate_month_id
-                ),
+                initial_commission_rebate_month_id=(initial_commission_rebate_month_id),
                 initial_alive=initial_alive,
                 initial_equity_scale=initial_equity_scale,
                 initial_short_sale_collateral=initial_short_sale_collateral,
@@ -3443,16 +3609,18 @@ def run_backtest_torch(
                 **phase_runner_extra,
             )
         else:
-            prepped_weights, prepped_tradable, prepped_buy, prepped_sell = _prepare_scan_inputs(
-                weights,
-                tradable_mask,
-                can_buy_mask,
-                can_sell_mask,
-                long_only,
-                gross_leverage,
-                min_trade_weight,
-                portfolio_activation,
-                side_masks_require_tradable=(mode != "tw_cash"),
+            prepped_weights, prepped_tradable, prepped_buy, prepped_sell = (
+                _prepare_scan_inputs(
+                    weights,
+                    tradable_mask,
+                    can_buy_mask,
+                    can_sell_mask,
+                    long_only,
+                    gross_leverage,
+                    min_trade_weight,
+                    portfolio_activation,
+                    side_masks_require_tradable=(mode != "tw_cash"),
+                )
             )
         prepped_volume = (
             None
@@ -3488,9 +3656,7 @@ def run_backtest_torch(
                 commission_rebate_payment_eligible_mask=(
                     commission_rebate_payment_eligible_mask
                 ),
-                can_short_open_mask=(
-                    prepped_short_open if not long_only else None
-                ),
+                can_short_open_mask=(prepped_short_open if not long_only else None),
                 force_short_cover_mask=(
                     None
                     if long_only or force_short_cover_mask is None
@@ -3527,30 +3693,22 @@ def run_backtest_torch(
                 initial_cash=initial_cash,
                 initial_payables=initial_payables,
                 initial_receivables=initial_receivables,
-                initial_commission_rebate_current=(
-                    initial_commission_rebate_current
-                ),
+                initial_commission_rebate_current=(initial_commission_rebate_current),
                 initial_commission_rebate_due=initial_commission_rebate_due,
-                initial_commission_rebate_month_id=(
-                    initial_commission_rebate_month_id
-                ),
+                initial_commission_rebate_month_id=(initial_commission_rebate_month_id),
                 initial_alive=initial_alive,
                 initial_equity_scale=initial_equity_scale,
                 initial_short_sale_collateral=initial_short_sale_collateral,
                 initial_short_margin_collateral=initial_short_margin_collateral,
             )
         elif mode == "tw_day_trade":
-            prepped_buy_open = (
-                day_trade_can_buy_open_mask.to(
-                    device=prepped_weights.device,
-                    dtype=torch.bool,
-                )
+            prepped_buy_open = day_trade_can_buy_open_mask.to(
+                device=prepped_weights.device,
+                dtype=torch.bool,
             )
-            prepped_sell_open = (
-                day_trade_can_sell_open_mask.to(
-                    device=prepped_weights.device,
-                    dtype=torch.bool,
-                )
+            prepped_sell_open = day_trade_can_sell_open_mask.to(
+                device=prepped_weights.device,
+                dtype=torch.bool,
             )
             if can_short_open_mask is None:
                 if not long_only:
@@ -3804,13 +3962,9 @@ def run_backtest_torch(
                 initial_cash=initial_cash,
                 initial_payables=initial_payables,
                 initial_receivables=initial_receivables,
-                initial_commission_rebate_current=(
-                    initial_commission_rebate_current
-                ),
+                initial_commission_rebate_current=(initial_commission_rebate_current),
                 initial_commission_rebate_due=initial_commission_rebate_due,
-                initial_commission_rebate_month_id=(
-                    initial_commission_rebate_month_id
-                ),
+                initial_commission_rebate_month_id=(initial_commission_rebate_month_id),
                 initial_alive=initial_alive,
                 initial_equity_scale=initial_equity_scale,
             )
@@ -3929,32 +4083,36 @@ def run_backtest_torch(
             final_short_margin_collateral=tw_result.final_short_margin_collateral,
         )
 
-    strategy_returns, turnovers, weights_history, final_weights, final_alive = _vectorized_backtest_torch(
-        weights,
-        future_returns,
-        tradable_mask,
-        can_buy_mask,
-        can_sell_mask,
-        can_short_open_mask,
-        force_short_cover_mask,
-        force_exit_mask,
-        buy_fee_rate,
-        sell_fee_rate,
-        long_only=long_only,
-        max_turnover_ratio=max_turnover_ratio,
-        gross_leverage=gross_leverage,
-        min_trade_weight=min_trade_weight,
-        portfolio_activation=portfolio_activation,
-        scan_chunk_size=scan_chunk_size,
-        return_weights_history=return_weights_history,
-        initial_weights=initial_weights,
-        initial_alive=initial_alive,
-        volume_limit_weights=volume_limit_weights,
+    strategy_returns, turnovers, weights_history, final_weights, final_alive = (
+        _vectorized_backtest_torch(
+            weights,
+            future_returns,
+            tradable_mask,
+            can_buy_mask,
+            can_sell_mask,
+            can_short_open_mask,
+            force_short_cover_mask,
+            force_exit_mask,
+            buy_fee_rate,
+            sell_fee_rate,
+            long_only=long_only,
+            max_turnover_ratio=max_turnover_ratio,
+            gross_leverage=gross_leverage,
+            min_trade_weight=min_trade_weight,
+            portfolio_activation=portfolio_activation,
+            scan_chunk_size=scan_chunk_size,
+            return_weights_history=return_weights_history,
+            initial_weights=initial_weights,
+            initial_alive=initial_alive,
+            volume_limit_weights=volume_limit_weights,
+        )
     )
 
     return BacktestResultTensor(
         strategy_returns=strategy_returns,
-        benchmark_returns=benchmark_returns.to(device=strategy_returns.device, dtype=strategy_returns.dtype),
+        benchmark_returns=benchmark_returns.to(
+            device=strategy_returns.device, dtype=strategy_returns.dtype
+        ),
         turnovers=turnovers,
         weights_history=weights_history,
         requested_weights_history=(weights if return_weights_history else None),
@@ -4219,9 +4377,7 @@ def _tw_integer_holdings_records(
             + result.execution_receivable_history[t]
             - result.execution_payable_history[t]
         )
-        sale_collateral_history = getattr(
-            result, "short_sale_collateral_history", None
-        )
+        sale_collateral_history = getattr(result, "short_sale_collateral_history", None)
         margin_collateral_history = getattr(
             result, "short_margin_collateral_history", None
         )
@@ -4244,8 +4400,7 @@ def _tw_integer_holdings_records(
             # NAV and weights.  This never creates an executable price.
             execution_nav = float(result.execution_nav_history[t])
             market_values = (
-                np.asarray(result.weights[t, nonzero], dtype=np.float64)
-                * execution_nav
+                np.asarray(result.weights[t, nonzero], dtype=np.float64) * execution_nav
             )
             reconstructed_prices = np.divide(
                 market_values,
@@ -4500,10 +4655,7 @@ def run_backtest_integer_shares(
                 "precomputed_exact_backtest is valid only for canonical "
                 "tensor execution contracts"
             )
-        if (
-            normalize_execution_mode(precomputed_exact_backtest.execution_mode)
-            != mode
-        ):
+        if normalize_execution_mode(precomputed_exact_backtest.execution_mode) != mode:
             raise ValueError(
                 "precomputed exact backtest execution mode does not match request"
             )
@@ -4537,9 +4689,7 @@ def run_backtest_integer_shares(
                 "force_exit_mask"
             )
         if futures_fee_rates is None:
-            raise ValueError(
-                "tw_futures_portfolio_day requires fixed fee rates [T,S]"
-            )
+            raise ValueError("tw_futures_portfolio_day requires fixed fee rates [T,S]")
         if float(buy_fee_rate) != 0.0 or float(sell_fee_rate) != 0.0:
             raise ValueError(
                 "fixed futures commission cannot be combined with proportional fees"
@@ -4574,11 +4724,7 @@ def run_backtest_integer_shares(
         continuous = run_tw_futures_portfolio_continuous_numpy(
             target_weights,
             raw_returns,
-            (
-                raw_tradable.astype(bool, copy=False)
-                & raw_can_buy
-                & raw_can_sell
-            ),
+            (raw_tradable.astype(bool, copy=False) & raw_can_buy & raw_can_sell),
             np.asarray(force_exit_mask, dtype=bool),
             fee_rate_per_open_notional=np.asarray(
                 futures_fee_rates,
@@ -4605,7 +4751,10 @@ def run_backtest_integer_shares(
         raw_returns = np.asarray(future_returns)
         raw_tradable = np.asarray(tradable_mask)
         raw_benchmark = np.asarray(benchmark_returns, dtype=np.float32)
-        if raw_weights.ndim != 2 or raw_weights.shape[1] != TAIFEX_INDEX_DERIVATIVE_ACTION_COUNT_V4:
+        if (
+            raw_weights.ndim != 2
+            or raw_weights.shape[1] != TAIFEX_INDEX_DERIVATIVE_ACTION_COUNT_V4
+        ):
             raise ValueError(
                 "tw_index_derivatives_day weights must have direct shape [T,D_derivatives]"
             )
@@ -4613,7 +4762,10 @@ def run_backtest_integer_shares(
         symbols_count = int(raw_returns.shape[1])
         if raw_returns.shape != (rows, symbols_count):
             raise ValueError("future_returns must have shape [T,S]")
-        if raw_tradable.shape != (rows, symbols_count) or raw_tradable.dtype != np.bool_:
+        if (
+            raw_tradable.shape != (rows, symbols_count)
+            or raw_tradable.dtype != np.bool_
+        ):
             raise ValueError("tradable_mask must be boolean [T,S]")
         if raw_benchmark.shape != (rows,):
             raise ValueError("benchmark_returns must have shape [T]")
@@ -4630,35 +4782,79 @@ def run_backtest_integer_shares(
             raise ValueError("dates must contain one row per derivative decision")
         market_dates = np.asarray(futures_market.dates, dtype="datetime64[D]")
         row_indices = np.searchsorted(market_dates, requested_dates)
-        if bool(np.any(row_indices >= market_dates.size)) or not np.array_equal(market_dates[row_indices], requested_dates):
+        if bool(np.any(row_indices >= market_dates.size)) or not np.array_equal(
+            market_dates[row_indices], requested_dates
+        ):
             raise ValueError("derivative markets do not cover every requested date")
         selected_market = TaiwanIndexFuturesDaySession(
-            dates=market_dates[row_indices], products=futures_market.products,
+            dates=market_dates[row_indices],
+            products=futures_market.products,
             contract_months=futures_market.contract_months[row_indices],
-            open_prices=futures_market.open_prices[row_indices], high_prices=futures_market.high_prices[row_indices],
-            low_prices=futures_market.low_prices[row_indices], close_prices=futures_market.close_prices[row_indices],
-            volumes=futures_market.volumes[row_indices], log_returns=futures_market.log_returns[row_indices],
-            tradable_mask=futures_market.tradable_mask[row_indices], multipliers=futures_market.multipliers,
-            tenor_contract_months=(None if futures_market.tenor_contract_months is None else futures_market.tenor_contract_months[row_indices]),
-            tenor_open_prices=(None if futures_market.tenor_open_prices is None else futures_market.tenor_open_prices[row_indices]),
-            tenor_high_prices=(None if futures_market.tenor_high_prices is None else futures_market.tenor_high_prices[row_indices]),
-            tenor_low_prices=(None if futures_market.tenor_low_prices is None else futures_market.tenor_low_prices[row_indices]),
-            tenor_close_prices=(None if futures_market.tenor_close_prices is None else futures_market.tenor_close_prices[row_indices]),
-            tenor_volumes=(None if futures_market.tenor_volumes is None else futures_market.tenor_volumes[row_indices]),
-            tenor_log_returns=(None if futures_market.tenor_log_returns is None else futures_market.tenor_log_returns[row_indices]),
-            tenor_tradable_mask=(None if futures_market.tenor_tradable_mask is None else futures_market.tenor_tradable_mask[row_indices]),
+            open_prices=futures_market.open_prices[row_indices],
+            high_prices=futures_market.high_prices[row_indices],
+            low_prices=futures_market.low_prices[row_indices],
+            close_prices=futures_market.close_prices[row_indices],
+            volumes=futures_market.volumes[row_indices],
+            log_returns=futures_market.log_returns[row_indices],
+            tradable_mask=futures_market.tradable_mask[row_indices],
+            multipliers=futures_market.multipliers,
+            tenor_contract_months=(
+                None
+                if futures_market.tenor_contract_months is None
+                else futures_market.tenor_contract_months[row_indices]
+            ),
+            tenor_open_prices=(
+                None
+                if futures_market.tenor_open_prices is None
+                else futures_market.tenor_open_prices[row_indices]
+            ),
+            tenor_high_prices=(
+                None
+                if futures_market.tenor_high_prices is None
+                else futures_market.tenor_high_prices[row_indices]
+            ),
+            tenor_low_prices=(
+                None
+                if futures_market.tenor_low_prices is None
+                else futures_market.tenor_low_prices[row_indices]
+            ),
+            tenor_close_prices=(
+                None
+                if futures_market.tenor_close_prices is None
+                else futures_market.tenor_close_prices[row_indices]
+            ),
+            tenor_volumes=(
+                None
+                if futures_market.tenor_volumes is None
+                else futures_market.tenor_volumes[row_indices]
+            ),
+            tenor_log_returns=(
+                None
+                if futures_market.tenor_log_returns is None
+                else futures_market.tenor_log_returns[row_indices]
+            ),
+            tenor_tradable_mask=(
+                None
+                if futures_market.tenor_tradable_mask is None
+                else futures_market.tenor_tradable_mask[row_indices]
+            ),
         )
 
         selected_candidates = derivatives_day_candidates.select_dates(requested_dates)
         actions = np.nan_to_num(raw_weights, nan=0.0, posinf=0.0, neginf=0.0)
         integer = run_tw_index_derivatives_day_integer(
-            actions, selected_market, selected_candidates, initial_capital=initial_capital,
+            actions,
+            selected_market,
+            selected_candidates,
+            initial_capital=initial_capital,
             maximum_capital_fraction=derivatives_maximum_capital_fraction,
             futures_cost_schedule=futures_cost_schedule,
             option_cost_schedule=option_day_cost_schedule,
         )
         result = BacktestResult(
-            strategy_returns=_portfolio_simple_returns_to_log_numpy(integer.strategy_returns),
+            strategy_returns=_portfolio_simple_returns_to_log_numpy(
+                integer.strategy_returns
+            ),
             benchmark_returns=raw_benchmark,
             turnovers=integer.turnovers.astype(np.float32),
             weights_history=np.zeros((rows, symbols_count), dtype=np.float32),
@@ -4684,19 +4880,45 @@ def run_backtest_integer_shares(
                     market_tenor = month_to_tenor.get(month)
                     if market_tenor is None:
                         continue
-                    for product_index, product in enumerate(TAIFEX_INDEX_FUTURES_PRODUCTS):
+                    for product_index, product in enumerate(
+                        TAIFEX_INDEX_FUTURES_PRODUCTS
+                    ):
                         quantity = int(
                             integer.futures_contract_quantities[
                                 row, tenor_slot, product_index
                             ]
                         )
                         for record_type, signed, price in (
-                            ("entry", quantity, market_tenors[1][row, market_tenor, product_index]),
-                            ("exit", -quantity, market_tenors[4][row, market_tenor, product_index]),
+                            (
+                                "entry",
+                                quantity,
+                                market_tenors[1][row, market_tenor, product_index],
+                            ),
+                            (
+                                "exit",
+                                -quantity,
+                                market_tenors[4][row, market_tenor, product_index],
+                            ),
                         ):
                             if signed:
-                                value = signed * selected_market.multipliers[product_index] * float(price)
-                                records.append(HoldingsRecord(date=str(requested_dates[row]), symbol=f"{product}_{month}", shares=signed, price=float(price), market_value=float(value), holding_ratio=float(value / denominator), is_cash=False, record_type=record_type, side="buy" if signed > 0 else "sell"))
+                                value = (
+                                    signed
+                                    * selected_market.multipliers[product_index]
+                                    * float(price)
+                                )
+                                records.append(
+                                    HoldingsRecord(
+                                        date=str(requested_dates[row]),
+                                        symbol=f"{product}_{month}",
+                                        shares=signed,
+                                        price=float(price),
+                                        market_value=float(value),
+                                        holding_ratio=float(value / denominator),
+                                        is_cash=False,
+                                        record_type=record_type,
+                                        side="buy" if signed > 0 else "sell",
+                                    )
+                                )
                 for slot_value in np.flatnonzero(
                     integer.option_contract_quantities[row]
                 ):
@@ -4711,11 +4933,27 @@ def run_backtest_integer_shares(
                     contract_symbol = f"TXO_{series}_{strike:g}_{right}"
                     for record_type, signed, price in (
                         ("entry", quantity, selected_options.open_prices[sparse_index]),
-                        ("exit", -quantity, selected_options.close_prices[sparse_index]),
+                        (
+                            "exit",
+                            -quantity,
+                            selected_options.close_prices[sparse_index],
+                        ),
                     ):
                         if signed:
                             value = signed * 50.0 * float(price)
-                            records.append(HoldingsRecord(date=str(requested_dates[row]), symbol=contract_symbol, shares=signed, price=float(price), market_value=float(value), holding_ratio=float(value / denominator), is_cash=False, record_type=record_type, side="buy" if signed > 0 else "sell"))
+                            records.append(
+                                HoldingsRecord(
+                                    date=str(requested_dates[row]),
+                                    symbol=contract_symbol,
+                                    shares=signed,
+                                    price=float(price),
+                                    market_value=float(value),
+                                    holding_ratio=float(value / denominator),
+                                    is_cash=False,
+                                    record_type=record_type,
+                                    side="buy" if signed > 0 else "sell",
+                                )
+                            )
                 prior_equity = float(integer.equity[row])
         return result, records
     if mode == "tw_index_futures_day":
@@ -4726,7 +4964,9 @@ def run_backtest_integer_shares(
         if raw_weights.ndim != 2 or raw_weights.shape[0] <= 0:
             raise ValueError("tw_index_futures_day weights must have shape [T,D]")
         rows = int(raw_weights.shape[0])
-        direct_tenor_actions = int(raw_weights.shape[1]) == TAIFEX_INDEX_FUTURES_ACTION_COUNT
+        direct_tenor_actions = (
+            int(raw_weights.shape[1]) == TAIFEX_INDEX_FUTURES_ACTION_COUNT
+        )
         if raw_returns.ndim != 2 or int(raw_returns.shape[0]) != rows:
             raise ValueError("future_returns must retain stock-panel shape [T,S]")
         symbols_count = int(raw_returns.shape[1])
@@ -4741,9 +4981,7 @@ def run_backtest_integer_shares(
 
         market_dates = np.asarray(futures_market.dates, dtype="datetime64[D]")
         requested_dates = (
-            market_dates
-            if dates is None
-            else np.asarray(dates, dtype="datetime64[D]")
+            market_dates if dates is None else np.asarray(dates, dtype="datetime64[D]")
         )
         if requested_dates.shape != (rows,):
             raise ValueError("dates must contain one row per futures decision")
@@ -4842,15 +5080,11 @@ def run_backtest_integer_shares(
                 ),
                 benchmark_returns=raw_benchmark,
                 turnovers=integer.turnovers.astype(np.float32, copy=False),
-                weights_history=np.zeros(
-                    (rows, symbols_count), dtype=np.float32
-                ),
-                requested_weights_history=raw_weights.astype(
+                weights_history=np.zeros((rows, symbols_count), dtype=np.float32),
+                requested_weights_history=raw_weights.astype(np.float32, copy=False),
+                equity_scale_history=(integer.equity / float(initial_capital)).astype(
                     np.float32, copy=False
                 ),
-                equity_scale_history=(
-                    integer.equity / float(initial_capital)
-                ).astype(np.float32, copy=False),
                 final_weights=np.zeros(symbols_count, dtype=np.float32),
                 final_alive=np.asarray(
                     integer.alive[-1] if integer.alive.size else True,
@@ -4889,7 +5123,9 @@ def run_backtest_integer_shares(
                         quantity = int(integer.contract_quantities[row, slot])
                         if quantity == 0:
                             continue
-                        concrete_symbol = f"{action_symbol.split('_', 1)[0]}_{months[row, slot]}"
+                        concrete_symbol = (
+                            f"{action_symbol.split('_', 1)[0]}_{months[row, slot]}"
+                        )
                         for record_type, signed, price in (
                             ("entry", quantity, opens[row, slot]),
                             ("exit", -quantity, closes[row, slot]),
@@ -4910,9 +5146,7 @@ def run_backtest_integer_shares(
                             )
                     prior_equity = float(integer.equity[row])
             return result, records
-        clean_weights = np.nan_to_num(
-            raw_weights, nan=0.0, posinf=0.0, neginf=0.0
-        )
+        clean_weights = np.nan_to_num(raw_weights, nan=0.0, posinf=0.0, neginf=0.0)
         clean_weights = np.where(raw_tradable, clean_weights, 0.0)
         requested_exposure = clean_weights.sum(axis=-1)
         if long_only:
@@ -4937,17 +5171,15 @@ def run_backtest_integer_shares(
             ),
             cost_schedule=futures_cost_schedule,
         )
-        denominator = np.where(
-            requested_exposure != 0.0, requested_exposure, 1.0
-        )
+        denominator = np.where(requested_exposure != 0.0, requested_exposure, 1.0)
         scale = np.where(
             requested_exposure != 0.0,
             integer.executed_exposure / denominator,
             0.0,
         )
-        executed_pseudo_weights = (
-            clean_weights * scale[:, None]
-        ).astype(np.float32, copy=False)
+        executed_pseudo_weights = (clean_weights * scale[:, None]).astype(
+            np.float32, copy=False
+        )
         result = BacktestResult(
             strategy_returns=_portfolio_simple_returns_to_log_numpy(
                 integer.strategy_returns
@@ -4977,7 +5209,9 @@ def run_backtest_integer_shares(
                         ("entry", selected_market.open_prices[row, product_idx]),
                         ("exit", selected_market.close_prices[row, product_idx]),
                     ):
-                        signed_quantity = quantity if record_type == "entry" else -quantity
+                        signed_quantity = (
+                            quantity if record_type == "entry" else -quantity
+                        )
                         market_value = (
                             signed_quantity * multipliers[product_idx] * float(price)
                         )
@@ -4998,9 +5232,7 @@ def run_backtest_integer_shares(
         return result, records
     if mode != "naive":
         raw_weights = np.asarray(weights, dtype=np.float64)
-        phase_execution = (
-            mode in TW_CARRYING_EXECUTION_MODES and raw_weights.ndim == 3
-        )
+        phase_execution = mode in TW_CARRYING_EXECUTION_MODES and raw_weights.ndim == 3
         if phase_execution:
             expected_phases = 2 if mode == "tw_cash" else 3
             if (
@@ -5065,25 +5297,19 @@ def run_backtest_integer_shares(
             n_symbols=n_symbols_real,
             symbol_indices=symbol_indices,
         )
-        rebate_timing = normalize_commission_rebate_timing(
-            commission_rebate_timing
-        )
+        rebate_timing = normalize_commission_rebate_timing(commission_rebate_timing)
         rebate_month_ids = session_month_ids
         rebate_payment_eligible = commission_rebate_payment_eligible_mask
-        if (
-            rebate_timing == "monthly_15th"
-            and (
-                rebate_month_ids is None
-                or rebate_payment_eligible is None
-            )
+        if rebate_timing == "monthly_15th" and (
+            rebate_month_ids is None or rebate_payment_eligible is None
         ):
             if dates is None:
                 raise ValueError(
                     "monthly_15th integer commission rebates require dates or "
                     "explicit session-month/payment calendar arrays"
                 )
-            derived_month_ids, derived_payment_eligible = (
-                commission_rebate_calendar(dates)
+            derived_month_ids, derived_payment_eligible = commission_rebate_calendar(
+                dates
             )
             if rebate_month_ids is None:
                 rebate_month_ids = derived_month_ids
@@ -5181,42 +5407,31 @@ def run_backtest_integer_shares(
                     n_symbols_real,
                 )
             else:
-                activation_name = normalize_portfolio_activation(
-                    portfolio_activation
-                )
+                activation_name = normalize_portfolio_activation(portfolio_activation)
                 raw_exit = clean_weights[:, 0]
                 if activation_name == "pre_normalized":
                     exit_fraction = np.clip(raw_exit, 0.0, 1.0)
                 else:
                     positive = raw_exit >= 0.0
                     exit_fraction = np.empty_like(raw_exit)
-                    exit_fraction[positive] = 1.0 / (
-                        1.0 + np.exp(-raw_exit[positive])
-                    )
+                    exit_fraction[positive] = 1.0 / (1.0 + np.exp(-raw_exit[positive]))
                     negative_exp = np.exp(raw_exit[~positive])
-                    exit_fraction[~positive] = negative_exp / (
-                        1.0 + negative_exp
-                    )
+                    exit_fraction[~positive] = negative_exp / (1.0 + negative_exp)
                 if activation_name == "pre_normalized":
                     entry_logits = clean_weights[:, 1:]
                 else:
                     raw_open_entry = clean_weights[:, 1]
                     raw_close_entry = clean_weights[:, 2]
-                    direction_logits = 0.5 * (
-                        raw_open_entry + raw_close_entry
-                    )
+                    direction_logits = 0.5 * (raw_open_entry + raw_close_entry)
                     timing_delta = raw_close_entry - raw_open_entry
                     positive_timing = timing_delta >= 0.0
                     close_entry_fraction = np.empty_like(timing_delta)
                     close_entry_fraction[positive_timing] = 1.0 / (
                         1.0 + np.exp(-timing_delta[positive_timing])
                     )
-                    negative_timing_exp = np.exp(
-                        timing_delta[~positive_timing]
-                    )
-                    close_entry_fraction[~positive_timing] = (
-                        negative_timing_exp
-                        / (1.0 + negative_timing_exp)
+                    negative_timing_exp = np.exp(timing_delta[~positive_timing])
+                    close_entry_fraction[~positive_timing] = negative_timing_exp / (
+                        1.0 + negative_timing_exp
                     )
                     entry_logits = np.stack(
                         (
@@ -5284,9 +5499,7 @@ def run_backtest_integer_shares(
                 return
             candidate = np.asarray(value)
             if candidate.shape != daily_shape or candidate.dtype != np.bool_:
-                raise ValueError(
-                    f"{name} must be boolean with shape [T,S]"
-                )
+                raise ValueError(f"{name} must be boolean with shape [T,S]")
             if np.any(candidate):
                 raise ValueError(f"{mode} does not support active {name} entries")
 
@@ -5314,7 +5527,9 @@ def run_backtest_integer_shares(
                     )
                 indices = indices_raw.astype(np.int64, copy=False)
                 if np.any(indices < 0) or np.any(indices >= len(supplied_symbols)):
-                    raise ValueError("symbol_indices contains an out-of-range symbol index")
+                    raise ValueError(
+                        "symbol_indices contains an out-of-range symbol index"
+                    )
                 active_symbols = [supplied_symbols[index] for index in indices.tolist()]
             elif len(supplied_symbols) == n_symbols_real:
                 active_symbols = supplied_symbols
@@ -5328,7 +5543,9 @@ def run_backtest_integer_shares(
                     )
                 indices = indices_raw.astype(np.int64, copy=False)
                 if np.any(indices < 0) or np.any(indices >= len(supplied_symbols)):
-                    raise ValueError("symbol_indices contains an out-of-range symbol index")
+                    raise ValueError(
+                        "symbol_indices contains an out-of-range symbol index"
+                    )
                 active_symbols = [supplied_symbols[index] for index in indices.tolist()]
             else:
                 raise ValueError(
@@ -5493,9 +5710,7 @@ def run_backtest_integer_shares(
                 commission_rebate_rates=selected_commission_rebate_rates,
                 commission_rebate_timing=rebate_timing,
                 session_month_ids=rebate_month_ids,
-                commission_rebate_payment_eligible_mask=(
-                    rebate_payment_eligible
-                ),
+                commission_rebate_payment_eligible_mask=(rebate_payment_eligible),
                 can_short_open_mask=phase_short_open,
                 force_short_cover_mask=phase_force_cover,
                 short_margin_rate=selected_short_margin_rate,
@@ -5577,9 +5792,7 @@ def run_backtest_integer_shares(
                 commission_rebate_rates=selected_commission_rebate_rates,
                 commission_rebate_timing=rebate_timing,
                 session_month_ids=rebate_month_ids,
-                commission_rebate_payment_eligible_mask=(
-                    rebate_payment_eligible
-                ),
+                commission_rebate_payment_eligible_mask=(rebate_payment_eligible),
                 minimum_commission=minimum_commission,
                 commission_rounding=commission_rounding,
                 tax_rounding=tax_rounding,
@@ -5589,9 +5802,7 @@ def run_backtest_integer_shares(
                 can_buy_mask=can_buy_mask,
                 can_sell_mask=can_sell_mask,
                 can_short_open_mask=(None if long_only else can_short_open_mask),
-                force_short_cover_mask=(
-                    None if long_only else force_short_cover_mask
-                ),
+                force_short_cover_mask=(None if long_only else force_short_cover_mask),
                 short_margin_rate=selected_short_margin_rate,
                 short_capacity_shares=selected_short_capacity,
                 short_maintenance_ratio=short_maintenance_ratio,
@@ -5656,9 +5867,7 @@ def run_backtest_integer_shares(
                 commission_rebate_rates=selected_commission_rebate_rates,
                 commission_rebate_timing=rebate_timing,
                 session_month_ids=rebate_month_ids,
-                commission_rebate_payment_eligible_mask=(
-                    rebate_payment_eligible
-                ),
+                commission_rebate_payment_eligible_mask=(rebate_payment_eligible),
                 minimum_commission=minimum_commission,
                 commission_rounding=commission_rounding,
                 tax_rounding=tax_rounding,
@@ -5699,19 +5908,15 @@ def run_backtest_integer_shares(
         return public_result, records
 
     w = np.asarray(weights, dtype=np.float64)
-    r = np.nan_to_num(np.asarray(future_returns, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+    r = np.nan_to_num(
+        np.asarray(future_returns, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0
+    )
     m = np.asarray(tradable_mask, dtype=bool)
-    _require_side_masks_if_strict(can_buy_mask, can_sell_mask, context="integer-share backtest")
-    buy_m = (
-        m
-        if can_buy_mask is None
-        else np.asarray(can_buy_mask, dtype=bool) & m
+    _require_side_masks_if_strict(
+        can_buy_mask, can_sell_mask, context="integer-share backtest"
     )
-    sell_m = (
-        m
-        if can_sell_mask is None
-        else np.asarray(can_sell_mask, dtype=bool) & m
-    )
+    buy_m = m if can_buy_mask is None else np.asarray(can_buy_mask, dtype=bool) & m
+    sell_m = m if can_sell_mask is None else np.asarray(can_sell_mask, dtype=bool) & m
     short_m = (
         sell_m
         if can_short_open_mask is None
@@ -5727,7 +5932,9 @@ def run_backtest_integer_shares(
         if force_exit_mask is None
         else np.asarray(force_exit_mask, dtype=bool)
     )
-    b = np.nan_to_num(np.asarray(benchmark_returns, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+    b = np.nan_to_num(
+        np.asarray(benchmark_returns, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0
+    )
 
     t_len, n_symbols = w.shape
     if symbols is None:
@@ -5737,7 +5944,14 @@ def run_backtest_integer_shares(
         if dates is None:
             date_text = [f"t{idx:04d}" for idx in range(t_len)]
         else:
-            date_text = [str(np.datetime_as_string(np.asarray(d, dtype="datetime64[D]"), unit="D")) for d in dates]
+            date_text = [
+                str(
+                    np.datetime_as_string(
+                        np.asarray(d, dtype="datetime64[D]"), unit="D"
+                    )
+                )
+                for d in dates
+            ]
     else:
         date_text = []
 
@@ -5746,14 +5960,18 @@ def run_backtest_integer_shares(
     stock_weights_history = np.zeros((t_len, n_symbols), dtype=np.float32)
 
     if close_prices is not None:
-        price_matrix = np.nan_to_num(np.asarray(close_prices, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+        price_matrix = np.nan_to_num(
+            np.asarray(close_prices, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0
+        )
         if price_matrix.shape != (t_len, n_symbols):
             raise ValueError(
                 "close_prices shape must match (num_days, num_symbols): "
                 f"expected {(t_len, n_symbols)}, got {price_matrix.shape}"
             )
         if np.any(tw_symbol_mask):
-            price_matrix[:, tw_symbol_mask] = _round_half_up(price_matrix[:, tw_symbol_mask], decimals=2)
+            price_matrix[:, tw_symbol_mask] = _round_half_up(
+                price_matrix[:, tw_symbol_mask], decimals=2
+            )
         current_prices = np.where(price_matrix[0] > 1e-12, price_matrix[0], 1.0)
     else:
         price_matrix = None
@@ -5815,7 +6033,9 @@ def run_backtest_integer_shares(
             continue
 
         if price_matrix is not None:
-            current_prices = np.where(price_matrix[t] > 1e-12, price_matrix[t], current_prices)
+            current_prices = np.where(
+                price_matrix[t] > 1e-12, price_matrix[t], current_prices
+            )
 
         day_mask = m[t]
         target_w = np.nan_to_num(w[t], nan=0.0, posinf=0.0, neginf=0.0)
@@ -5861,7 +6081,11 @@ def run_backtest_integer_shares(
         desired_value = equity_before * target_w
         safe_prices = np.where(current_prices > 1e-12, current_prices, np.inf)
         raw_target_shares = desired_value / safe_prices
-        desired_shares = _floor_to_int64(raw_target_shares, non_negative=True) if long_only else _trunc_to_int64(raw_target_shares)
+        desired_shares = (
+            _floor_to_int64(raw_target_shares, non_negative=True)
+            if long_only
+            else _trunc_to_int64(raw_target_shares)
+        )
         if not long_only:
             desired_shares[force_m[t] & (desired_shares < 0)] = 0
 
@@ -5874,13 +6098,21 @@ def run_backtest_integer_shares(
         can_short_day = short_m[t]
         delta = desired_shares - shares
         if long_only:
-            desired_shares[(delta > 0) & ~can_buy_day] = shares[(delta > 0) & ~can_buy_day]
-            desired_shares[(delta < 0) & ~can_sell_day] = shares[(delta < 0) & ~can_sell_day]
+            desired_shares[(delta > 0) & ~can_buy_day] = shares[
+                (delta > 0) & ~can_buy_day
+            ]
+            desired_shares[(delta < 0) & ~can_sell_day] = shares[
+                (delta < 0) & ~can_sell_day
+            ]
         else:
-            desired_shares[(delta > 0) & ~can_buy_day] = shares[(delta > 0) & ~can_buy_day]
+            desired_shares[(delta > 0) & ~can_buy_day] = shares[
+                (delta > 0) & ~can_buy_day
+            ]
             constrained_shares = desired_shares.copy()
             down = constrained_shares < shares
-            reduce_long = down & (shares > 0) & (constrained_shares >= 0) & ~can_sell_day
+            reduce_long = (
+                down & (shares > 0) & (constrained_shares >= 0) & ~can_sell_day
+            )
             constrained_shares[reduce_long] = shares[reduce_long]
 
             cross_from_long = down & (shares > 0) & (constrained_shares < 0)
@@ -5889,7 +6121,9 @@ def run_backtest_integer_shares(
             blocked_cross_short = cross_from_long & can_sell_day & ~can_short_day
             constrained_shares[blocked_cross_short] = 0
 
-            open_or_increase_short = down & (shares <= 0) & (constrained_shares < shares) & ~can_short_day
+            open_or_increase_short = (
+                down & (shares <= 0) & (constrained_shares < shares) & ~can_short_day
+            )
             constrained_shares[open_or_increase_short] = shares[open_or_increase_short]
             desired_shares = constrained_shares
 
@@ -5903,20 +6137,31 @@ def run_backtest_integer_shares(
             valid_volume = np.isfinite(volume_day) & (volume_day >= 0.0)
             max_qty = np.full(delta.shape, np.iinfo(np.int64).max, dtype=np.int64)
             if np.any(valid_volume):
-                capped = np.floor(volume_day[valid_volume] * float(max_volume_participation))
+                capped = np.floor(
+                    volume_day[valid_volume] * float(max_volume_participation)
+                )
                 capped = np.clip(capped, 0.0, float(np.iinfo(np.int64).max))
                 max_qty[valid_volume] = capped.astype(np.int64, copy=False)
             abs_delta = np.abs(delta.astype(np.int64, copy=False))
             clipped_abs = np.minimum(abs_delta, max_qty)
-            desired_shares = shares + (np.sign(delta.astype(np.float64)) * clipped_abs.astype(np.float64)).astype(np.int64)
+            desired_shares = shares + (
+                np.sign(delta.astype(np.float64)) * clipped_abs.astype(np.float64)
+            ).astype(np.int64)
             delta = desired_shares - shares
 
         if max_turnover_ratio > 0.0:
-            traded_notional_before_cap = float(np.dot(np.abs(delta).astype(np.float64), current_prices))
+            traded_notional_before_cap = float(
+                np.dot(np.abs(delta).astype(np.float64), current_prices)
+            )
             max_traded_notional = float(equity_before * max_turnover_ratio)
-            if traded_notional_before_cap > max_traded_notional + 1e-9 and traded_notional_before_cap > 0.0:
+            if (
+                traded_notional_before_cap > max_traded_notional + 1e-9
+                and traded_notional_before_cap > 0.0
+            ):
                 scale = max(0.0, max_traded_notional / traded_notional_before_cap)
-                scaled_delta = np.sign(delta.astype(np.float64)) * np.floor(np.abs(delta.astype(np.float64)) * scale)
+                scaled_delta = np.sign(delta.astype(np.float64)) * np.floor(
+                    np.abs(delta.astype(np.float64)) * scale
+                )
                 desired_shares = shares + scaled_delta.astype(np.int64)
                 delta = desired_shares - shares
 
@@ -5963,9 +6208,7 @@ def run_backtest_integer_shares(
                 if expansion_notional > 0.0
                 else 0.0
             )
-            scaled_expansion = _trunc_to_int64(
-                expansion.astype(np.float64) * scale
-            )
+            scaled_expansion = _trunc_to_int64(expansion.astype(np.float64) * scale)
             desired_shares = reduced_base + scaled_expansion
             delta = desired_shares - shares
 
@@ -5976,7 +6219,11 @@ def run_backtest_integer_shares(
         buy_notional = float(np.dot(buy_qty.astype(np.float64), current_prices))
 
         available_cash = cash + sell_notional - sell_notional * sell_fee_rate
-        max_affordable_buy = available_cash / (1.0 + buy_fee_rate) if buy_fee_rate >= 0.0 else available_cash
+        max_affordable_buy = (
+            available_cash / (1.0 + buy_fee_rate)
+            if buy_fee_rate >= 0.0
+            else available_cash
+        )
 
         if buy_notional > max_affordable_buy + 1e-9 and buy_notional > 0.0:
             # Forced short covers are mandatory.  Execute them in full and
@@ -6022,9 +6269,19 @@ def run_backtest_integer_shares(
         # Guardrail: if this trade plan would make same-day post-trade equity
         # non-positive, skip rebalancing for the day to keep position/equity
         # ratios well-defined and bounded.
-        tentative_cash = cash + sell_notional - sell_notional * sell_fee_rate - buy_notional - buy_notional * buy_fee_rate
-        tentative_equity_after_trade = float(tentative_cash + np.dot(desired_shares.astype(np.float64), current_prices))
-        if (not np.isfinite(tentative_equity_after_trade)) or tentative_equity_after_trade <= 1e-9:
+        tentative_cash = (
+            cash
+            + sell_notional
+            - sell_notional * sell_fee_rate
+            - buy_notional
+            - buy_notional * buy_fee_rate
+        )
+        tentative_equity_after_trade = float(
+            tentative_cash + np.dot(desired_shares.astype(np.float64), current_prices)
+        )
+        if (
+            not np.isfinite(tentative_equity_after_trade)
+        ) or tentative_equity_after_trade <= 1e-9:
             desired_shares = shares.copy()
             delta = desired_shares - shares
             sell_qty = np.clip(-delta, 0, None)
@@ -6038,9 +6295,11 @@ def run_backtest_integer_shares(
             wanted_stock = bool(np.any(target_w > 0.0))
             has_any_share = bool(np.any(desired_shares > 0))
             if wanted_stock and not has_any_share:
-                tradable_target = (day_mask & (target_w > 0.0))
+                tradable_target = day_mask & (target_w > 0.0)
                 candidate_prices = current_prices[tradable_target]
-                candidate_prices = candidate_prices[np.isfinite(candidate_prices) & (candidate_prices > 1e-12)]
+                candidate_prices = candidate_prices[
+                    np.isfinite(candidate_prices) & (candidate_prices > 1e-12)
+                ]
                 if candidate_prices.size > 0:
                     min_buy_cost = float(candidate_prices.min() * (1.0 + buy_fee_rate))
                     if max_affordable_buy + 1e-12 < min_buy_cost:
@@ -6060,9 +6319,7 @@ def run_backtest_integer_shares(
                         strategy_returns[t] = np.float32(
                             np.log(equity_cash / equity_before)
                         )
-                        turnovers[t] = np.float32(
-                            traded_notional / equity_before
-                        )
+                        turnovers[t] = np.float32(traded_notional / equity_before)
                         stock_weights_history[t] = 0.0
                         cash_hold_mode = True
                         if collect_holdings:
@@ -6070,7 +6327,9 @@ def run_backtest_integer_shares(
                                 HoldingsRecord(
                                     date=date_text[t],
                                     symbol="CASH",
-                                    shares=int(_floor_to_int64(cash, non_negative=True).item()),
+                                    shares=int(
+                                        _floor_to_int64(cash, non_negative=True).item()
+                                    ),
                                     price=1.0,
                                     market_value=float(cash),
                                     holding_ratio=1.0 if cash > 0 else 0.0,
@@ -6147,9 +6406,15 @@ def run_backtest_integer_shares(
         simple_returns = np.expm1(r[t])
         simple_returns = np.where(np.isfinite(simple_returns), simple_returns, 0.0)
         next_prices = current_prices * (1.0 + simple_returns)
-        next_prices = np.where(np.isfinite(next_prices) & (next_prices > 1e-12), next_prices, current_prices)
+        next_prices = np.where(
+            np.isfinite(next_prices) & (next_prices > 1e-12),
+            next_prices,
+            current_prices,
+        )
 
-        equity_end = float(equity_after_trade + np.dot(stock_market_values, simple_returns))
+        equity_end = float(
+            equity_after_trade + np.dot(stock_market_values, simple_returns)
+        )
         net_simple_return = equity_end / equity_before - 1.0
         strategy_returns[t] = _portfolio_simple_returns_to_log_numpy(
             np.asarray([net_simple_return], dtype=np.float32)

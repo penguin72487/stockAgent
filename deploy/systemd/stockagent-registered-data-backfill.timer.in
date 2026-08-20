@@ -1,0 +1,11 @@
+[Unit]
+Description=Reconcile missing crypto history heads once per week
+
+[Timer]
+OnCalendar=Sun *-*-* 02:00:00 Asia/Taipei
+Persistent=true
+RandomizedDelaySec=30m
+Unit=stockagent-registered-data-backfill.service
+
+[Install]
+WantedBy=timers.target

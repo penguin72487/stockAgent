@@ -10,6 +10,9 @@ from zoneinfo import ZoneInfo
 TAIPEI = ZoneInfo("Asia/Taipei")
 HISTORICAL_QUERY_CUTOFF = time(7, 45)
 HISTORICAL_QUERY_RESUME = time(14, 31)
+HISTORICAL_MAX_TRAFFIC_FRACTION = 0.90
+FUTURES_HISTORY_TRAFFIC_RESERVE_MB = 128.0
+STOCK_HISTORY_TRAFFIC_RESERVE_MB = 25.0
 
 
 def _taipei_datetime(value: datetime | None) -> datetime:
@@ -42,8 +45,11 @@ def historical_query_is_protected(value: datetime | None = None) -> bool:
 
 
 __all__ = [
+    "FUTURES_HISTORY_TRAFFIC_RESERVE_MB",
+    "HISTORICAL_MAX_TRAFFIC_FRACTION",
     "HISTORICAL_QUERY_CUTOFF",
     "HISTORICAL_QUERY_RESUME",
+    "STOCK_HISTORY_TRAFFIC_RESERVE_MB",
     "historical_query_is_protected",
     "historical_query_pause_seconds",
 ]

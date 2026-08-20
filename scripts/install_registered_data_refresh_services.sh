@@ -26,6 +26,8 @@ units=(
   stockagent-registered-data-daily.timer
   stockagent-registered-data-intraday.service
   stockagent-registered-data-intraday.timer
+  stockagent-registered-data-backfill.service
+  stockagent-registered-data-backfill.timer
   stockagent-binance-public-archive.service
   stockagent-binance-public-archive.timer
   stockagent-taifex-auxiliary-daily.service
@@ -54,6 +56,7 @@ systemctl daemon-reload
 systemctl enable --now \
   stockagent-registered-data-daily.timer \
   stockagent-registered-data-intraday.timer \
+  stockagent-registered-data-backfill.timer \
   stockagent-binance-public-archive.timer \
   stockagent-taifex-auxiliary-daily.timer
 

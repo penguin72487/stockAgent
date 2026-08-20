@@ -41,7 +41,7 @@ from stockagent.research.taifex_volatility_metadata import (
 )
 
 
-DASHBOARD_SCHEMA_VERSION: Final[int] = 7
+DASHBOARD_SCHEMA_VERSION: Final[int] = 8
 DEFAULT_MAX_SOURCE_AGE_SECONDS: Final[float] = 15.0
 DEFAULT_MARK_LIMIT_PER_STRATEGY: Final[int] = 360
 HISTORY_RANGE_SECONDS: Final[dict[str, int | None]] = {
@@ -65,7 +65,10 @@ class _DailyEndpointCache:
     offset: int = 0
     file_size: int = 0
     mtime_ns: int = 0
-    endpoints: dict[str, dict[str, tuple[int, float]]] = field(default_factory=dict)
+    endpoints: dict[
+        str,
+        dict[str, tuple[int, float] | tuple[int, float, float]],
+    ] = field(default_factory=dict)
 
 
 _PERFORMANCE_LOCK = threading.Lock()
@@ -79,6 +82,8 @@ _HISTORY_POLARS_SCHEMA: Final[dict[str, Any]] = (
         "cumulative_pnl_twd": pl.Float64,
         "net_equity_twd": pl.Float64,
         "initial_capital_twd": pl.Float64,
+        "cumulative_contributed_capital_twd": pl.Float64,
+        "return_on_contributed_capital_pct": pl.Float64,
         "total_equity_twd": pl.Float64,
         "gross_cash_twd": pl.Float64,
         "open_liquidation_value_twd": pl.Float64,
@@ -95,6 +100,11 @@ _HISTORY_POLARS_SCHEMA: Final[dict[str, Any]] = (
         "replay_id": pl.String,
         "replay_contract_version": pl.Int64,
         "history_event": pl.String,
+        "capital_contribution_count": pl.Int64,
+        "recapitalization_count": pl.Int64,
+        "bankruptcy_count": pl.Int64,
+        "entry_state": pl.String,
+        "alive": pl.Boolean,
     }
     if pl is not None
     else {}
@@ -295,6 +305,10 @@ def _history_backfill_receipts(state_dir: Path) -> list[dict[str, Any]]:
                 "status": payload.get("status"),
                 "replay_id": payload.get("replay_id"),
                 "source": payload.get("source"),
+                "replay_contract_version": int(
+                    payload.get("replay_contract_version") or 0
+                ),
+                "history_authority": payload.get("history_authority"),
                 "strategy_ids": payload.get("strategy_ids") or [],
                 "requested_start_date": payload.get("requested_start_date"),
                 "requested_end_date": payload.get("requested_end_date"),
@@ -303,7 +317,43 @@ def _history_backfill_receipts(state_dir: Path) -> list[dict[str, Any]]:
                 "marks_sha256": expected_hash,
             }
         )
+    receipts.sort(
+        key=lambda row: (
+            int(row.get("replay_contract_version") or 0),
+            str(row["path"]),
+        )
+    )
     return receipts
+
+
+def _authoritative_replay_intervals(
+    state_dir: Path,
+) -> dict[str, tuple[int, int, int]]:
+    intervals: dict[str, tuple[int, int, int]] = {}
+    for receipt in _history_backfill_receipts(Path(state_dir)):
+        if receipt.get("history_authority") != (
+            "receipt_verified_replay_over_live_same_interval"
+        ):
+            continue
+        timestamps: list[int] = []
+        for row in receipt.get("source_coverage") or ():
+            if not isinstance(row, Mapping):
+                continue
+            for key in ("coverage_start_utc", "coverage_end_utc"):
+                try:
+                    timestamps.append(int(_parse_utc(str(row[key])).timestamp() * 1e9))
+                except (KeyError, TypeError, ValueError):
+                    continue
+        if not timestamps:
+            continue
+        version = int(receipt.get("replay_contract_version") or 0)
+        for strategy_id in receipt.get("strategy_ids") or ():
+            strategy_key = str(strategy_id)
+            previous = intervals.get(strategy_key)
+            candidate = (min(timestamps), max(timestamps), version)
+            if previous is None or candidate[2] >= previous[2]:
+                intervals[strategy_key] = candidate
+    return intervals
 
 
 def _history_mark_paths(state_dir: Path) -> list[Path]:
@@ -374,7 +424,10 @@ def _daily_pnl_endpoints(
     path: Path,
     *,
     strategy_ids: tuple[str, ...],
-) -> dict[str, dict[str, tuple[int, float]]]:
+) -> dict[
+    str,
+    dict[str, tuple[int, float] | tuple[int, float, float]],
+]:
     """Incrementally retain the last valid P&L mark per TAIFEX trading date."""
 
     output = {strategy_id: {} for strategy_id in strategy_ids}
@@ -427,6 +480,12 @@ def _daily_pnl_endpoints(
                 pnl = _optional_float(
                     mark.get("cumulative_pnl_twd", mark.get("net_equity_twd"))
                 )
+                contributed_capital = _optional_float(
+                    mark.get(
+                        "cumulative_contributed_capital_twd",
+                        mark.get("initial_capital_twd"),
+                    )
+                )
                 decision_ts_ns = int(mark.get("decision_ts_ns") or 0)
                 trading_date = _trading_date_from_ns(decision_ts_ns)
                 if pnl is None or trading_date is None:
@@ -434,7 +493,12 @@ def _daily_pnl_endpoints(
                 strategy_endpoints = cached.endpoints.setdefault(strategy_id, {})
                 previous = strategy_endpoints.get(trading_date)
                 if previous is None or decision_ts_ns >= previous[0]:
-                    strategy_endpoints[trading_date] = (decision_ts_ns, pnl)
+                    strategy_endpoints[trading_date] = (
+                        (decision_ts_ns, pnl, contributed_capital)
+                        if contributed_capital is not None
+                        and contributed_capital > 0.0
+                        else (decision_ts_ns, pnl)
+                    )
             cached.offset += complete_size
             cached.file_size = stat.st_size
             cached.mtime_ns = stat.st_mtime_ns
@@ -445,7 +509,7 @@ def _daily_pnl_endpoints(
 
 def _performance_metrics(
     *,
-    daily_endpoints: Mapping[str, tuple[int, float]],
+    daily_endpoints: Mapping[str, tuple[int, float] | tuple[int, float, float]],
     current_trading_date: str | None,
     current_ts_ns: int,
     current_pnl_twd: float | None,
@@ -457,7 +521,11 @@ def _performance_metrics(
     if current_trading_date and current_pnl_twd is not None:
         previous = endpoints.get(current_trading_date)
         if previous is None or current_ts_ns >= previous[0]:
-            endpoints[current_trading_date] = (current_ts_ns, current_pnl_twd)
+            endpoints[current_trading_date] = (
+                current_ts_ns,
+                current_pnl_twd,
+                reserved_capital_twd,
+            )
 
     valid_capital = math.isfinite(reserved_capital_twd) and reserved_capital_twd > 0.0
     fixed_return = (
@@ -470,10 +538,18 @@ def _performance_metrics(
     observed_days = 0
     ruined = False
     for trading_date in sorted(endpoints):
-        _timestamp, end_pnl = endpoints[trading_date]
-        if not valid_capital or not math.isfinite(end_pnl):
+        endpoint = endpoints[trading_date]
+        _timestamp, end_pnl = endpoint[:2]
+        daily_capital = (
+            float(endpoint[2]) if len(endpoint) >= 3 else reserved_capital_twd
+        )
+        if (
+            not math.isfinite(daily_capital)
+            or daily_capital <= 0.0
+            or not math.isfinite(end_pnl)
+        ):
             continue
-        daily_return = (end_pnl - previous_pnl) / reserved_capital_twd
+        daily_return = (end_pnl - previous_pnl) / daily_capital
         observed_days += 1
         previous_pnl = end_pnl
         if ruined or daily_return <= -1.0:
@@ -793,6 +869,8 @@ def _build_history_rows(
         1, mark_limit * max(1, len(strategy_ids)) * 2
     )
     raw_marks_by_key: dict[tuple[str, int], dict[str, Any]] = {}
+    authoritative_intervals = _authoritative_replay_intervals(Path(state_dir))
+    live_mark_path = Path(state_dir) / "marks.jsonl"
     # Backfills are read first.  A formal live mark at the same strategy/time
     # is authoritative and replaces the historical replay row.
     for mark_path in _history_mark_paths(Path(state_dir)):
@@ -817,6 +895,16 @@ def _build_history_rows(
         for mark in source_rows or ():
             strategy_id = str(mark.get("strategy_id") or "")
             decision_ts_ns = int(mark.get("decision_ts_ns") or 0)
+            authority = authoritative_intervals.get(strategy_id)
+            if (
+                authority is not None
+                and authority[0] <= decision_ts_ns <= authority[1]
+                and (
+                    mark_path == live_mark_path
+                    or int(mark.get("replay_contract_version") or 0) < authority[2]
+                )
+            ):
+                continue
             raw_marks_by_key[(strategy_id, decision_ts_ns)] = mark
     raw_marks = sorted(
         raw_marks_by_key.values(),
@@ -887,8 +975,13 @@ def _build_history_rows(
             if mark_initial_capital is not None and mark_initial_capital > 0.0
             else capital_by_strategy.get(strategy_id, 0.0)
         )
+        contributed_capital = _optional_float(
+            mark.get("cumulative_contributed_capital_twd")
+        )
+        if contributed_capital is None or contributed_capital <= 0.0:
+            contributed_capital = initial_capital
         if cumulative_pnl is not None and (total_equity is None or carried):
-            total_equity = initial_capital + cumulative_pnl
+            total_equity = contributed_capital + cumulative_pnl
         if not valuation_available:
             cumulative_pnl = None
             total_equity = None
@@ -904,6 +997,7 @@ def _build_history_rows(
                 "net_equity_twd": cumulative_pnl,
                 "cumulative_pnl_twd": cumulative_pnl,
                 "initial_capital_twd": initial_capital,
+                "cumulative_contributed_capital_twd": contributed_capital,
                 "total_equity_twd": total_equity,
                 "gross_cash_twd": gross_cash,
                 "open_liquidation_value_twd": open_value,
@@ -913,10 +1007,19 @@ def _build_history_rows(
                 "futures_position": futures_position,
                 "underlying_futures_position": underlying_futures_position,
                 "fixed_capital_return": (
-                    cumulative_pnl / initial_capital
-                    if cumulative_pnl is not None and initial_capital > 0.0
+                    cumulative_pnl / contributed_capital
+                    if cumulative_pnl is not None and contributed_capital > 0.0
                     else None
                 ),
+                "capital_contribution_count": int(
+                    mark.get("capital_contribution_count") or 0
+                ),
+                "recapitalization_count": int(
+                    mark.get("recapitalization_count") or 0
+                ),
+                "bankruptcy_count": int(mark.get("bankruptcy_count") or 0),
+                "entry_state": mark.get("entry_state"),
+                "alive": bool(mark.get("alive", True)),
                 "valuation_available": valuation_available,
                 "valuation_stale": carried,
                 "valuation_carried_forward": carried,
@@ -1001,7 +1104,16 @@ def build_dashboard_history_snapshot(
         ledger = state.get("strategies", {}).get(strategy_id, {})
         capital_by_strategy[strategy_id] = float(
             _optional_float(
-                mark.get("initial_capital_twd", ledger.get("initial_capital_twd"))
+                mark.get(
+                    "cumulative_contributed_capital_twd",
+                    ledger.get(
+                        "cumulative_contributed_capital_twd",
+                        mark.get(
+                            "initial_capital_twd",
+                            ledger.get("initial_capital_twd"),
+                        ),
+                    ),
+                )
             )
             or 0.0
         )
@@ -1156,9 +1268,20 @@ def build_dashboard_snapshot(
         )
         if initial_capital is None:
             initial_capital = 0.0
+        cumulative_contributed_capital = _optional_float(
+            mark.get(
+                "cumulative_contributed_capital_twd",
+                ledger.get("cumulative_contributed_capital_twd"),
+            )
+        )
+        if (
+            cumulative_contributed_capital is None
+            or cumulative_contributed_capital <= 0.0
+        ):
+            cumulative_contributed_capital = initial_capital
         total_equity = _optional_float(mark.get("total_equity_twd"))
         if total_equity is None and cumulative_pnl is not None:
-            total_equity = initial_capital + cumulative_pnl
+            total_equity = cumulative_contributed_capital + cumulative_pnl
         valuation_available = bool(
             mark.get("valuation_available", total_equity is not None)
         )
@@ -1183,6 +1306,9 @@ def build_dashboard_snapshot(
                 "net_equity_twd": cumulative_pnl,
                 "cumulative_pnl_twd": cumulative_pnl,
                 "initial_capital_twd": initial_capital,
+                "cumulative_contributed_capital_twd": (
+                    cumulative_contributed_capital
+                ),
                 "total_equity_twd": total_equity,
                 "margin_required_twd": _optional_float(mark.get("margin_required_twd")),
                 "margin_excess_twd": _optional_float(mark.get("margin_excess_twd")),
@@ -1190,6 +1316,44 @@ def build_dashboard_snapshot(
                 "margin_call_count": int(
                     mark.get("margin_call_count", ledger.get("margin_call_count", 0))
                     or 0
+                ),
+                "capital_contribution_count": int(
+                    mark.get(
+                        "capital_contribution_count",
+                        ledger.get("capital_contribution_count", 0),
+                    )
+                    or 0
+                ),
+                "recapitalization_count": int(
+                    mark.get(
+                        "recapitalization_count",
+                        ledger.get("recapitalization_count", 0),
+                    )
+                    or 0
+                ),
+                "bankruptcy_count": int(
+                    mark.get(
+                        "bankruptcy_count",
+                        ledger.get("bankruptcy_count", 0),
+                    )
+                    or 0
+                ),
+                "last_capital_contribution_twd": _optional_float(
+                    mark.get(
+                        "last_capital_contribution_twd",
+                        ledger.get("last_capital_contribution_twd"),
+                    )
+                ),
+                "last_capital_contribution_trading_date": mark.get(
+                    "last_capital_contribution_trading_date",
+                    ledger.get("last_capital_contribution_trading_date"),
+                ),
+                "last_bankruptcy_trading_date": mark.get(
+                    "last_bankruptcy_trading_date",
+                    ledger.get("last_bankruptcy_trading_date"),
+                ),
+                "recapitalization_eligible_now": bool(
+                    mark.get("recapitalization_eligible_now", False)
                 ),
                 "forced_liquidation_pending": bool(
                     mark.get(
@@ -1285,14 +1449,17 @@ def build_dashboard_snapshot(
                 current_trading_date=current_trading_date,
                 current_ts_ns=current_ts_ns,
                 current_pnl_twd=row["cumulative_pnl_twd"],
-                reserved_capital_twd=float(row["initial_capital_twd"]),
+                reserved_capital_twd=float(
+                    row["cumulative_contributed_capital_twd"]
+                ),
                 explicit_cost_twd=explicit_cost,
                 margin_required_twd=row["margin_required_twd"],
             )
         )
 
     capital_by_strategy = {
-        row["strategy_id"]: float(row["initial_capital_twd"]) for row in strategy_rows
+        row["strategy_id"]: float(row["cumulative_contributed_capital_twd"])
+        for row in strategy_rows
     }
     history = (
         _build_history_rows(
@@ -1384,6 +1551,9 @@ def build_dashboard_snapshot(
             },
         ],
         "catalog_expansion_entry_policy": status.get("catalog_expansion_entry_policy"),
+        "strategy_recapitalization_policy": status.get(
+            "strategy_recapitalization_policy"
+        ),
         "current_session": status.get("current_session"),
         "current_trading_date": current_trading_date,
         "intraday_decision_interval_seconds": status.get(
@@ -1440,6 +1610,16 @@ def build_dashboard_snapshot(
             "strategy_capital_buffer_multiple": status.get(
                 "strategy_capital_buffer_multiple"
             ),
+            "strategy_recapitalization_policy": status.get(
+                "strategy_recapitalization_policy"
+            ),
+            "strategy_cumulative_contributed_capital_twd": status.get(
+                "strategy_cumulative_contributed_capital_twd"
+            ),
+            "strategy_recapitalization_count": status.get(
+                "strategy_recapitalization_count"
+            ),
+            "strategy_bankruptcy_count": status.get("strategy_bankruptcy_count"),
             "option_contract_count": option_contract_count,
             "latest_book_count": latest_book_count,
             "expected_book_count": expected_book_count,
@@ -1487,14 +1667,18 @@ def build_dashboard_snapshot(
                 "option and futures legs."
             ),
             "reserved_capital_twd": (
-                "Fixed initial_capital_twd assigned to one independent strategy "
-                "ledger; it is the return denominator."
+                "Cumulative external capital contributed to one independent "
+                "strategy ledger. It includes the initial one-package reserve "
+                "and every post-bankruptcy restoring contribution, and is the "
+                "return denominator."
             ),
             "one_unit_net_pnl_twd": (
                 "Latest signed cumulative P&L after executable Bid/Ask liquidation, "
                 "fixed fees, transaction tax, and hedge P&L."
             ),
-            "fixed_capital_return": ("one_unit_net_pnl_twd / reserved_capital_twd"),
+            "fixed_capital_return": (
+                "one_unit_net_pnl_twd / cumulative contributed capital"
+            ),
             "compounded_return_to_live_mark": (
                 "Product over TAIFEX trading dates of "
                 "(1 + daily P&L change / fixed reserved capital) minus 1; "
@@ -1502,8 +1686,14 @@ def build_dashboard_snapshot(
             ),
             "explicit_cost_twd": "fixed_fees_twd + transaction_tax_twd",
             "capital_aggregation": (
-                "Sum of independent one-unit ledger reserves; not a claim that "
+                "Sum of independent cumulative strategy contributions; not a claim that "
                 "all strategies can share collateral or margin offsets."
+            ),
+            "recapitalization": (
+                "A bankrupt strategy is liquidated from complete executable books, "
+                "waits for a later TAIFEX trading date, then receives only the cash "
+                "needed to restore one complete strategy-package capital. P&L is "
+                "never reset and every contribution remains in the denominator."
             ),
             "exposure_classification": (
                 "Direction, volatility, and hedge labels describe the strategy "
@@ -1549,6 +1739,9 @@ def build_dashboard_snapshot(
             "ideal_trades": _line_count(state_dir / "ideal_ledger.jsonl"),
             "marks": _line_count(state_dir / "marks.jsonl"),
             "calibrations": _line_count(state_dir / "calibrations.jsonl"),
+            "capital_contributions": _line_count(
+                state_dir / "capital_contributions.jsonl"
+            ),
             "events": _line_count(state_dir / "events.jsonl"),
             "history_rows_returned": len(history),
         },
@@ -1561,6 +1754,11 @@ def build_dashboard_snapshot(
                 "name": "模型校準",
                 "path": "calibrations.jsonl",
                 "grain": "model decision",
+            },
+            {
+                "name": "外部注資",
+                "path": "capital_contributions.jsonl",
+                "grain": "capital cash flow",
             },
             {"name": "引擎事件", "path": "events.jsonl", "grain": "event"},
         ],

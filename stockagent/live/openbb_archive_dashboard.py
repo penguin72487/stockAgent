@@ -54,6 +54,7 @@ _ALERT_MESSAGES = {
     "provider_progress_stalled": "仍有待辦的供應商近期沒有新增已接受任務。",
     "provider_quota_completion_floor": "供應商配額形成完成時間下限，提高並行度無法消除。",
     "provider_quota_deferred": "部分任務正等待供應商配額或速率限制解除。",
+    "repair_queue_tasks": "部分固定資源的上游錯誤已退出主排程，保留給稍後的明確修復批次。",
     "systematic_retryable_failures": "多個可重試任務呈現相同失敗型態。",
     "unproven_terminal_unavailable": "部分不可用任務缺少可驗證的權限或能力證據。",
 }
@@ -465,6 +466,7 @@ def build_openbb_public_status(
                 snapshot.get("actionable_unresolved_tasks")
             ),
             "retryable_tasks": _integer(snapshot.get("retryable_tasks")),
+            "repair_queue_tasks": _integer(snapshot.get("repair_queue_tasks")),
             "retry_deferred_tasks": retry_deferred,
             "next_task_retry_at": (
                 parsed_retry_at.isoformat() if parsed_retry_at is not None else None
@@ -480,6 +482,7 @@ def build_openbb_public_status(
                     "pending",
                     "running",
                     "failed",
+                    "repair",
                     "unavailable",
                 )
             },

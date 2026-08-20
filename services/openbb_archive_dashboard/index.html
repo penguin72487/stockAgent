@@ -7,21 +7,13 @@
   <meta name="theme-color" content="#071019">
   <title>OpenBB 歷史封存監控｜StockAgent</title>
   <link rel="stylesheet" href="styles.css?v=2">
-  <link rel="stylesheet" href="../dashboard-core.css?v=5">
+  <link rel="stylesheet" href="../dashboard-core.css?v=6">
 </head>
 <body>
   <a class="skip-link" href="#main">跳到主要內容</a>
   <header class="site-header">
     <a class="brand" href="../">STOCKAGENT</a>
-    <nav aria-label="公開面板導覽">
-      <a href="../">總覽</a>
-      <a href="../taifex/">TAIFEX</a>
-      <a href="../tw-day-trade/">台股當沖</a>
-      <a href="../shioaji/">永豐 API</a>
-      <a href="./" aria-current="page">OpenBB</a>
-      <a href="../data-monitor/">全資料</a>
-      <a href="../traffic/">流量</a>
-    </nav>
+    <nav data-dashboard-nav="openbb" aria-label="公開面板導覽"></nav>
   </header>
 
   <main id="main">
@@ -139,7 +131,8 @@
   </main>
 
   <footer>OpenBB 歷史封存觀測 · 公開唯讀 · 頁面每 60 秒更新</footer>
+  <script src="../dashboard-core.js?v=1" defer></script>
   <script src="../time-axis.js?v=3" defer></script>
-  <script src="app.js?v=7" defer></script>
+  <script src="app.js?v=8" defer></script>
 </body>
 </html>

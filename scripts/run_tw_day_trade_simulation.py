@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 from datetime import datetime, time as datetime_time, timedelta
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -34,9 +35,11 @@ from stockagent.live.market_status import verified_tw_stock_session_day  # noqa:
 from stockagent.live.quote_provider import (  # noqa: E402
     fetch_futures_snapshot_prefer_stream,
     fetch_shioaji_stock_snapshots,
+    prepare_tw_price_limit_snapshot,
     warm_shioaji_stock_quote_client,
 )
 from stockagent.live.tw_day_trade_simulation import (  # noqa: E402
+    ENTRY_FILL_POLICY_SYNTHETIC_OPEN_TICK,
     CLOSING_AUCTION_TIME,
     FORCE_EXIT_TIME,
     ModeSpec,
@@ -74,6 +77,23 @@ def _repo_path(value: str | Path) -> Path:
     return path if path.is_absolute() else REPO_ROOT / path
 
 
+def _acquire_engine_lock(state_dir: Path):
+    """Keep exactly one writer for the in-memory simulation state."""
+
+    root = Path(state_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    handle = (root / ".engine.lock").open("a+", encoding="utf-8")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        raise RuntimeError(
+            "simulation state already has a live writer; stop the running "
+            "executor before using --rearm-flat-session"
+        ) from None
+    return handle
+
+
 def _write_preopen_readiness(
     state_dir: Path,
     *,
@@ -107,9 +127,7 @@ def _write_preopen_readiness(
         "status": str(status),
         "checked_at": observed.isoformat(timespec="milliseconds"),
         "elapsed_ms": (
-            round(max(0.0, float(elapsed_ms)), 3)
-            if elapsed_ms is not None
-            else None
+            round(max(0.0, float(elapsed_ms)), 3) if elapsed_ms is not None else None
         ),
         "details": dict(details or {}),
         "error": error,
@@ -161,13 +179,17 @@ def _fee_schedule(config: Any) -> TaiwanFeeSchedule:
 
 def _mode_specs(
     markets_dir: Path,
+    *,
+    include_disabled: bool = False,
 ) -> tuple[list[ModeSpec], dict[str, LiveMarketConfig], dict[str, str]]:
     configs = load_market_configs(markets_dir)
     specs: list[ModeSpec] = []
     selected: dict[str, LiveMarketConfig] = {}
     errors: dict[str, str] = {}
     for market, live in configs.items():
-        if not live.enabled or not live.day_trade_simulation_enabled:
+        if (
+            not live.enabled and not include_disabled
+        ) or not live.day_trade_simulation_enabled:
             continue
         selected[market] = live
         try:
@@ -196,6 +218,8 @@ def _mode_specs(
                     fee_schedule=_fee_schedule(experiment),
                     lot_size=int(experiment.trading.tw_day_trade_lot_size),
                     price_limit_offset_ticks=1,
+                    entry_fill_policy=ENTRY_FILL_POLICY_SYNTHETIC_OPEN_TICK,
+                    entry_price_offset_ticks=1,
                 )
             )
         except Exception as exc:
@@ -220,9 +244,7 @@ def _latest_signal(
         pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
         summary_path = Path(str(pointer.get("summary_path") or ""))
         weights_path = Path(str(pointer.get("weights_path") or ""))
-        execution_weights_path = Path(
-            str(pointer.get("execution_weights_path") or "")
-        )
+        execution_weights_path = Path(str(pointer.get("execution_weights_path") or ""))
         summary = json.loads(summary_path.read_text(encoding="utf-8"))
         if (
             isinstance(summary, dict)
@@ -284,10 +306,8 @@ def _latest_signal(
     for path in candidates:
         try:
             summary = json.loads(path.read_text(encoding="utf-8"))
-            if (
-                not isinstance(summary, dict)
-                or str(summary.get("market"))
-                != str(spec.signal_market or spec.market)
+            if not isinstance(summary, dict) or str(summary.get("market")) != str(
+                spec.signal_market or spec.market
             ):
                 continue
             generated = datetime.fromisoformat(str(summary.get("generated_at")))
@@ -343,9 +363,7 @@ def _entry_candidate_symbols(
             or (weight < 0.0 and not evidence.short_open)
         ):
             continue
-        sizing_price = float(
-            row.get("open_price") or row.get("current_price") or 0.0
-        )
+        sizing_price = float(row.get("open_price") or row.get("current_price") or 0.0)
         if np.isfinite(sizing_price) and sizing_price > 0.0:
             requested = int(
                 abs(weight) * float(spec.initial_capital_twd) / sizing_price
@@ -377,6 +395,35 @@ def _fetch_quotes(
         fallback,
         cache_ttl_seconds=0.0,
     )
+    upper = (
+        np.asarray(snapshot.upper_limit_prices, dtype=np.float64)
+        if snapshot.upper_limit_prices is not None
+        else np.full((len(symbols),), np.nan, dtype=np.float64)
+    )
+    lower = (
+        np.asarray(snapshot.lower_limit_prices, dtype=np.float64)
+        if snapshot.lower_limit_prices is not None
+        else np.full((len(symbols),), np.nan, dtype=np.float64)
+    )
+    missing_limits = ~np.isfinite(upper) | ~np.isfinite(lower)
+    if np.any(missing_limits):
+        # Static daily limits are normally prepared before 09:00.  If an
+        # unrelated pre-open refresh fails first, do not let otherwise valid
+        # Shioaji Bid/Ask quotes collapse every paper order to flat.  Recover
+        # the missing official reference/limits from TWSE/TPEx MIS once, then
+        # reuse the process-cached Shioaji observations so the fallback never
+        # substitutes MIS prices for the execution book.
+        prepare_tw_price_limit_snapshot(
+            symbols,
+            fallback,
+            parquet_root=parquet_root,
+            trading_date=trading_date.date().isoformat(),
+        )
+        snapshot = fetch_shioaji_stock_snapshots(
+            symbols,
+            fallback,
+            cache_ttl_seconds=60.0,
+        )
     return quote_map_from_snapshot(
         symbols,
         snapshot,
@@ -539,9 +586,7 @@ def _active_quote_due(
 ) -> bool:
     """Keep polling an open ledger through terminal flatten catch-up."""
 
-    minute_key = observed.replace(second=0, microsecond=0).isoformat(
-        timespec="minutes"
-    )
+    minute_key = observed.replace(second=0, microsecond=0).isoformat(timespec="minutes")
     wall_time = observed.timetz().replace(tzinfo=None)
     force_exit_retry = FORCE_EXIT_TIME <= wall_time < CLOSING_AUCTION_TIME
     return (
@@ -633,9 +678,7 @@ class _SignalPointerWatcher:
             time_module.sleep(timeout)
             return False
         try:
-            ready, _writable, _errors = select.select(
-                [self._fd], [], [], timeout
-            )
+            ready, _writable, _errors = select.select([self._fd], [], [], timeout)
             if not ready:
                 return False
             while True:
@@ -698,7 +741,9 @@ def main(argv: list[str] | None = None) -> int:
     if float(args.poll_seconds) <= 0.0:
         raise ValueError("poll-seconds must be positive")
     markets_dir = _repo_path(args.markets_dir)
-    engine = TwDayTradeSimulationEngine(_repo_path(args.state_dir))
+    state_dir = _repo_path(args.state_dir)
+    engine_lock = _acquire_engine_lock(state_dir)
+    engine = TwDayTradeSimulationEngine(state_dir)
     if args.rearm_flat_session:
         specs, _live_configs, errors = _mode_specs(markets_dir)
         if errors:
@@ -769,9 +814,9 @@ def main(argv: list[str] | None = None) -> int:
                 else {}
             )
             session_date_text = observed.date().isoformat()
-            eligibility_prewarm_due = (
-                observed.timetz().replace(tzinfo=None) >= datetime_time(8, 30)
-            )
+            eligibility_prewarm_due = observed.timetz().replace(
+                tzinfo=None
+            ) >= datetime_time(8, 30)
             if (
                 session_open
                 and eligibility_prewarm_due
@@ -803,9 +848,7 @@ def main(argv: list[str] | None = None) -> int:
                             elapsed_ms=float(slowest.get("elapsed_ms") or 0.0),
                             details={
                                 "proof": "exact_session_twse_tpex_coverage",
-                                "symbol_count": int(
-                                    slowest.get("symbol_count") or 0
-                                ),
+                                "symbol_count": int(slowest.get("symbol_count") or 0),
                                 "markets": {
                                     market: dict(row)
                                     for market, row in eligibility_warm.items()
@@ -945,10 +988,7 @@ def main(argv: list[str] | None = None) -> int:
                     component="shioaji_quote",
                     status="failed",
                     observed=datetime.now(TAIPEI),
-                    elapsed_ms=(
-                        time_module.perf_counter() - prewarm_started
-                    )
-                    * 1000.0,
+                    elapsed_ms=(time_module.perf_counter() - prewarm_started) * 1000.0,
                     details={
                         "proof": "simulation_client_usage_probe",
                         "retry_after_seconds": 5.0,
@@ -980,10 +1020,9 @@ def main(argv: list[str] | None = None) -> int:
         )
         for spec in specs:
             mode = engine.state.get("modes", {}).get(spec.market, {})
-            if (
-                str(mode.get("session_date") or "") == observed.date().isoformat()
-                and mode.get("entry_completed_at")
-            ):
+            if str(
+                mode.get("session_date") or ""
+            ) == observed.date().isoformat() and mode.get("entry_completed_at"):
                 continue
             latest = _latest_signal(spec, observed)
             if latest is None:

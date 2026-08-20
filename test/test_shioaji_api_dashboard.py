@@ -14,6 +14,8 @@ from stockagent.live.shioaji_api_dashboard import (
     TOP200_UNIT,
     ShioajiMonitorPaths,
     _backfill_status,
+    _capture_status,
+    _latest_capture_mtime,
     build_shioaji_public_status,
 )
 
@@ -89,6 +91,48 @@ def test_backfill_new_progress_supersedes_old_wait_without_invocation_id(
     assert status["state"] == "downloading"
     assert status["waiting_reason"] is None
     assert status["waiting_seconds_at_observation"] is None
+
+
+def test_latest_capture_mtime_uses_write_time_not_hour_name(tmp_path: Path) -> None:
+    root = tmp_path / "capture"
+    older_night = root / "ticks" / "trade_date=2026-08-19" / "hour=23"
+    newer_day = root / "ticks" / "trade_date=2026-08-19" / "hour=13"
+    older_night.mkdir(parents=True)
+    newer_day.mkdir(parents=True)
+    os.utime(older_night, (100.0, 100.0))
+    os.utime(newer_day, (200.0, 200.0))
+
+    assert _latest_capture_mtime(root) == 200.0
+
+
+def test_capture_waits_between_sessions_instead_of_reporting_stale(
+    tmp_path: Path,
+) -> None:
+    observed = datetime(2026, 8, 19, 6, 15, tzinfo=UTC)
+    capture_root = tmp_path / "capture"
+    latest_hour = capture_root / "ticks" / "trade_date=2026-08-19" / "hour=13"
+    latest_hour.mkdir(parents=True)
+    os.utime(
+        latest_hour,
+        (observed.timestamp() - 30 * 60, observed.timestamp() - 30 * 60),
+    )
+    missing = tmp_path / "missing"
+    paths = ShioajiMonitorPaths(
+        alias_inventory=missing,
+        txfr1_manifest=missing,
+        futures_history_root=missing,
+        target_end_date=missing,
+        capture_root=capture_root,
+    )
+
+    status = _capture_status(
+        paths,
+        [],
+        {"active": True, "state": "running", "restarts": 0},
+        now=observed,
+    )
+
+    assert status["state"] == "waiting"
 
 
 def test_shioaji_public_status_reconciles_quota_progress_and_capture(

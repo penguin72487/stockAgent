@@ -334,9 +334,14 @@ def test_binance_pipeline_progress_persists_measured_eta(tmp_path: Path) -> None
     assert payload["state"] == "running"
     assert payload["current"] == 1
     assert payload["total"] == total_units
-    assert payload["unit"] == "request-page-or-feature-stage"
+    assert payload["unit"] == "symbol-or-feature-stage"
     assert payload["remaining_seconds"] is not None
     assert payload["recent_errors"] == []
+
+    tracker.observe_request_page("candles")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["current"] == 1
+    assert payload["telemetry_counts"] == {"request_pages": 1}
 
     tracker.update(
         "candles",
@@ -354,5 +359,49 @@ def test_binance_pipeline_progress_persists_measured_eta(tmp_path: Path) -> None
         }
     ]
 
+    for _ in range(total_units - 2):
+        tracker.update("feature", "updated", item="BTCUSDT")
     tracker.finish(failed=False)
     assert json.loads(path.read_text(encoding="utf-8"))["state"] == "complete"
+
+
+def test_binance_pipeline_progress_preserves_previous_interruption(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "progress.json"
+    first = binance._PipelineProgress(
+        path,
+        total_units=2,
+        started_at=datetime.now(timezone.utc),
+    )
+    first.update("candles", "failed", item="BROKEN", message="fixture")
+
+    binance._PipelineProgress(
+        path,
+        total_units=3,
+        started_at=datetime.now(timezone.utc),
+    )
+    payload = json.loads(path.read_text(encoding="utf-8"))
+
+    assert payload["current"] == 0
+    assert payload["previous_run"]["current"] == 1
+    assert payload["previous_run"]["recent_errors"][0]["item"] == "BROKEN"
+
+
+def test_binance_pipeline_progress_does_not_fabricate_complete_ratio(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "progress.json"
+    tracker = binance._PipelineProgress(
+        path,
+        total_units=2,
+        started_at=datetime.now(timezone.utc),
+    )
+    tracker.update("candles", "updated", item="BTCUSDT")
+
+    tracker.finish(failed=False)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+
+    assert payload["state"] == "partial"
+    assert payload["current"] == 1
+    assert payload["ratio"] == 0.5

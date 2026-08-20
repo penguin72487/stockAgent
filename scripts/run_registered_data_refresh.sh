@@ -44,7 +44,9 @@ case "$refresh_scope" in
       RUN_FRANKFURTER=1 \
       FRANKFURTER_OUTPUT_DIR="$repo_root/data_forex_frankfurter" \
       RUN_PEPPERSTONE_GROUPS=1 \
-      RUN_CEX_PERP=0 \
+      RUN_CEX_PERP=1 \
+      CRYPTO_TAIL_ONLY=1 \
+      CRYPTO_HISTORICAL_FEATURES=1 \
       RUN_DUNE_CRYPTO_HISTORY=1 \
       RUN_CRYPTO_ETF_HISTORY=1 \
       "$repo_root/downloader/run_daily_all_markets.sh"
@@ -60,13 +62,35 @@ case "$refresh_scope" in
       RUN_FRANKFURTER=0 \
       RUN_PEPPERSTONE_GROUPS=0 \
       RUN_CEX_PERP=1 \
+      CRYPTO_TAIL_ONLY=1 \
+      CRYPTO_HISTORICAL_FEATURES=0 \
       RUN_CRYPTO_REFERENCE=1 \
       RUN_DUNE_CRYPTO_HISTORY=0 \
       RUN_CRYPTO_ETF_HISTORY=0 \
       "$repo_root/downloader/run_daily_all_markets.sh"
     ;;
+  backfill)
+    exec env "${common_env[@]}" \
+      RUN_ID="registered-backfill-$(date -u +%Y%m%dT%H%M%SZ)" \
+      LOCK_FILE="$repo_root/artifacts/daily_downloader/registered_backfill.lock" \
+      RUN_LOG_DIR="$repo_root/artifacts/daily_downloader/registered_backfill" \
+      RUN_RECORD_FILE="$repo_root/artifacts/daily_downloader/registered_backfill_runs.tsv" \
+      RUN_YAHOO=0 \
+      YAHOO_ASSETS="" \
+      RUN_FRANKFURTER=0 \
+      RUN_PEPPERSTONE_GROUPS=0 \
+      RUN_CEX_PERP=1 \
+      CRYPTO_TAIL_ONLY=0 \
+      CRYPTO_HISTORICAL_FEATURES=0 \
+      RUN_CRYPTO_REFERENCE=0 \
+      RUN_FREE_PUBLIC_CONTEXT=0 \
+      RUN_COINMETRICS_COMMUNITY=0 \
+      RUN_DUNE_CRYPTO_HISTORY=0 \
+      RUN_CRYPTO_ETF_HISTORY=0 \
+      "$repo_root/downloader/run_daily_all_markets.sh"
+    ;;
   *)
-    echo "usage: $0 {daily|intraday}" >&2
+    echo "usage: $0 {daily|intraday|backfill}" >&2
     exit 2
     ;;
 esac

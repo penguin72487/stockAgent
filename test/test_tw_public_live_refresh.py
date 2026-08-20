@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from datetime import datetime
 import json
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -80,6 +82,35 @@ def test_same_session_rule_command_targets_today_without_overwriting_parent_meta
     assert Path(command[command.index("--output-dir") + 1]) == live_root
     assert "--require-taiex-session-calendar" in command
     assert "--no-write-run-metadata" in command
+
+
+def test_same_session_rule_refresh_reuses_already_exact_local_coverage(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    coverage = {
+        "twse": {"covered": True, "target_date": "2026-08-20"},
+        "tpex": {"covered": True, "target_date": "2026-08-20"},
+    }
+    monkeypatch.setattr(
+        refresh,
+        "require_exact_session_eligibility",
+        lambda **_kwargs: coverage,
+    )
+    monkeypatch.setattr(
+        refresh.subprocess,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail("network refresh should not run"),
+    )
+
+    result = refresh._refresh_same_session_rules(
+        tmp_path,
+        observed=datetime(2026, 8, 20, 8, 30, tzinfo=ZoneInfo("Asia/Taipei")),
+    )
+
+    assert result["venues"] == coverage
+    assert result["refresh_attempted"] is False
+    assert result["source"] == "existing_exact_session_coverage"
 
 
 def test_audit_command_reads_only_the_mutable_live_tree(tmp_path: Path) -> None:

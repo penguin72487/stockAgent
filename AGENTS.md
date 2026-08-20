@@ -279,14 +279,21 @@ Guidelines:
   Exact-session short eligibility and prior-session official short capacity
   remain correctness constraints, not stress-test overlays.
 
-- After eligibility, volume, turnover, demonstrated depth, and whole-lot
-  constraints, a genuinely two-sided day-trade target must retain its requested
-  long/short gross mix by reducing only the better-filled side.  Never add lots
-  or exposure to repair the mix.  If either requested side has no executable
-  lot, fail the complete portfolio closed to flat instead of silently turning a
-  long/short signal into a one-sided directional bet.  The exact integer oracle
-  removes the lowest-absolute-weight lots first; continuous training/backtest
-  and live paper execution must enforce the same portfolio-level principle.
+- Apply eligibility, volume, turnover, demonstrated depth, legal-price, and
+  whole-lot constraints independently to each day-trade symbol.  Retain every
+  remaining executable quantity exactly as constrained; do not rebalance,
+  scale, prune, or fail the portfolio flat to preserve a requested aggregate
+  long/short ratio.  Continuous training/backtest, the exact integer oracle,
+  minute execution, and live paper execution must use this same independent
+  per-symbol contract.
+
+- Day-trade historical minute-curve repair is local-first. Search the ordered
+  receipt-backed one-minute KBar chunks, materialized `trade_date` research
+  partitions, and retained local minute cache before starting any Shioaji
+  request. Delegate only unresolved `symbol + session_date` gaps to the
+  canonical `download_shioaji_tw_minute_kbars.py` collector, and receipt both
+  pre-fetch and post-fetch source coverage. Never re-download a locally covered
+  pair or substitute an interpolated/fabricated price.
 
 - Current active low-rank baseline preference: `portfolio_mode: long_short`.
 - Keep `trading.long_only: false` when the model is intended to do long/short.

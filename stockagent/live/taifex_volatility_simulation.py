@@ -28,11 +28,10 @@ import time
 from typing import Any, Final, Iterable, Mapping
 
 import polars as pl
-import torch
 
 from stockagent.backtest.tw_index_derivatives_tick import (
-    sweep_five_level_depth,
-    txo_short_initial_margin_per_contract,
+    sweep_five_level_depth_scalar,
+    txo_short_initial_margin_per_contract_scalar,
 )
 from stockagent.data.tw_index_derivatives_tick import TAIPEI
 from stockagent.data.tw_index_futures import (
@@ -96,7 +95,7 @@ from stockagent.research.taifex_volatility_metadata import (
 
 
 SCHEMA_VERSION: Final[int] = 1
-EXECUTION_CONTRACT_VERSION: Final[int] = 10
+EXECUTION_CONTRACT_VERSION: Final[int] = 11
 OPTION_MULTIPLIER: Final[float] = 50.0
 OPTION_FEE_PER_SIDE_TWD: Final[float] = 22.0
 DEFAULT_OPTION_RISK_MARGIN_A_TWD: Final[float] = TXO_RISK_MARGIN_TWD_2026_08_13["A"]
@@ -106,6 +105,9 @@ OPTION_MARGIN_POLICY: Final[str] = (
     "single_leg_naked_a_b_conservative_no_combo_offset_c_reference_only"
 )
 DEFAULT_STRATEGY_CAPITAL_BUFFER_MULTIPLE: Final[float] = 2.0
+STRATEGY_RECAPITALIZATION_POLICY: Final[str] = (
+    "next_taifex_trading_date_restore_one_strategy_package"
+)
 FUTURES_FEE_PER_SIDE_TWD: Final[dict[str, float]] = (
     TAIFEX_INDEX_FUTURES_FEE_PER_SIDE_TWD
 )
@@ -224,6 +226,17 @@ def _new_strategy_ledger(*, entry_state: str = "pending") -> dict[str, Any]:
         "last_option_roll_atm_strike": None,
         "trade_sides": 0,
         "initial_capital_twd": 0.0,
+        "cumulative_contributed_capital_twd": 0.0,
+        "capital_contribution_count": 0,
+        "recapitalization_count": 0,
+        "bankruptcy_count": 0,
+        "episode_count": 0,
+        "last_capital_contribution_twd": None,
+        "last_capital_contribution_decision_ts_ns": None,
+        "last_capital_contribution_trading_date": None,
+        "last_bankruptcy_decision_ts_ns": None,
+        "last_bankruptcy_trading_date": None,
+        "last_bankruptcy_total_equity_twd": None,
         "last_complete_open_liquidation_value_twd": None,
         "last_complete_mark_decision_ts_ns": None,
         "last_complete_mark_cycle_id": None,
@@ -292,22 +305,14 @@ def _depth_swept_price(
     ):
         return None
     side = "ask" if delta_contracts > 0 else "bid"
-    prices = torch.tensor(
+    filled, point_notional = sweep_five_level_depth_scalar(
+        float(quantity),
         [float(row.get(f"{side}_price_{level}") or 0.0) for level in range(1, 6)],
-        dtype=torch.float32,
-    )
-    volumes = torch.tensor(
         [float(row.get(f"{side}_volume_{level}") or 0.0) for level in range(1, 6)],
-        dtype=torch.float32,
     )
-    filled, point_notional = sweep_five_level_depth(
-        torch.tensor(float(quantity)),
-        prices,
-        volumes,
-    )
-    if int(round(float(filled.item()))) != quantity:
+    if int(round(float(filled))) != quantity:
         return None
-    average = float(point_notional.item()) / quantity
+    average = float(point_notional) / quantity
     if not math.isfinite(average) or average <= 0.0:
         return None
     return average, int(row["receive_ts_ns"])
@@ -325,19 +330,15 @@ def _txo_short_margin_twd(
     right = str(option_right).upper()
     if right not in {"C", "P"}:
         raise ValueError(f"invalid option right for margin: {option_right!r}")
-    prices = torch.tensor(
-        [option_price if right == "C" else 0.0, option_price if right == "P" else 0.0],
-        dtype=torch.float32,
-    )
-    margins = txo_short_initial_margin_per_contract(
-        prices,
+    return txo_short_initial_margin_per_contract_scalar(
+        option_price,
         underlying_price,
         strike,
+        option_right=right,
         contract_multiplier=OPTION_MULTIPLIER,
         risk_margin_a_twd=risk_margin_a_twd,
         risk_margin_b_twd=risk_margin_b_twd,
     )
-    return float(margins[0 if right == "C" else 1].item())
 
 
 def _executable_book(
@@ -586,6 +587,9 @@ class TaifexVolatilitySimulation:
         self.status_path = self.state_dir / "status.json"
         self.events_path = self.state_dir / "events.jsonl"
         self.ledger_path = self.state_dir / "ideal_ledger.jsonl"
+        self.capital_contributions_path = (
+            self.state_dir / "capital_contributions.jsonl"
+        )
         self.marks_path = self.state_dir / "marks.jsonl"
         self.calibrations_path = self.state_dir / "calibrations.jsonl"
         self.final_settlement_path = Path(final_settlement_path)
@@ -851,6 +855,11 @@ class TaifexVolatilitySimulation:
             elif execution_version == 9:
                 payload["execution_contract_version"] = EXECUTION_CONTRACT_VERSION
                 migration_reasons.append("causal_rolling_straddle_migration")
+            elif execution_version == 10:
+                payload["execution_contract_version"] = EXECUTION_CONTRACT_VERSION
+                migration_reasons.append(
+                    "next_trading_date_recapitalization_ledger_migration"
+                )
             elif execution_version != EXECUTION_CONTRACT_VERSION:
                 raise RuntimeError("strategy execution contract mismatch")
 
@@ -985,6 +994,9 @@ class TaifexVolatilitySimulation:
                 TAIFEX_MARGIN_2026_08_13_ANNOUNCEMENT_URL
             )
             payload["option_margin_policy"] = OPTION_MARGIN_POLICY
+            payload["strategy_recapitalization_policy"] = (
+                STRATEGY_RECAPITALIZATION_POLICY
+            )
             payload.setdefault(
                 "strategy_capital_buffer_multiple",
                 self.strategy_capital_buffer_multiple,
@@ -995,6 +1007,10 @@ class TaifexVolatilitySimulation:
                 f"{legacy_flatten_date}:day" if legacy_flatten_date else None,
             )
             self._ensure_strategy_reporting_state(payload)
+            self._ensure_strategy_recapitalization_state(
+                payload,
+                migrated_from_execution_version=execution_version,
+            )
             if str(payload.get("strategy_mode")) != self.strategy_mode:
                 raise RuntimeError(
                     "strategy state mode mismatch: "
@@ -1109,6 +1125,7 @@ class TaifexVolatilitySimulation:
                 TAIFEX_MARGIN_2026_08_13_ANNOUNCEMENT_URL
             ),
             "option_margin_policy": OPTION_MARGIN_POLICY,
+            "strategy_recapitalization_policy": STRATEGY_RECAPITALIZATION_POLICY,
             "strategy_capital_buffer_multiple": (self.strategy_capital_buffer_multiple),
             "catalog_expansion_entry_policy": (self.catalog_expansion_entry_policy),
             "created_at_utc": _now_iso(),
@@ -1213,6 +1230,189 @@ class TaifexVolatilitySimulation:
             (option_capital + future_capital) * self.strategy_capital_buffer_multiple
         )
 
+    def _strategy_flat_equity_twd(self, strategy_id: str) -> float:
+        ledger = self.state["strategies"][strategy_id]
+        if ledger.get("option_positions") or any(
+            int(ledger.get(field) or 0) != 0
+            for field in ("futures_position", "underlying_futures_position")
+        ):
+            raise RuntimeError(
+                f"strategy recapitalization requires a flat ledger: {strategy_id}"
+            )
+        cumulative_pnl = (
+            float(ledger.get("gross_cash_twd") or 0.0)
+            - float(ledger.get("fees_twd") or 0.0)
+            - float(ledger.get("tax_twd") or 0.0)
+        )
+        return float(
+            float(ledger.get("cumulative_contributed_capital_twd") or 0.0)
+            + cumulative_pnl
+        )
+
+    def _strategy_recapitalization_is_due(
+        self,
+        strategy_id: str,
+        decision_ns: int,
+    ) -> bool:
+        ledger = self.state["strategies"][strategy_id]
+        if bool(ledger.get("alive", True)):
+            return False
+        raw_boundary = ledger.get("last_bankruptcy_trading_date")
+        if not raw_boundary:
+            return False
+        bankruptcy_trading_date = date.fromisoformat(str(raw_boundary))
+        observed_at = datetime.fromtimestamp(decision_ns / 1e9, tz=TAIPEI)
+        return taifex_trading_date(observed_at) > bankruptcy_trading_date
+
+    def _record_capital_contribution(
+        self,
+        strategy_id: str,
+        *,
+        amount_twd: float,
+        target_one_package_capital_twd: float,
+        equity_before_contribution_twd: float,
+        decision_ns: int,
+        reason: str,
+    ) -> None:
+        amount = float(amount_twd)
+        if not math.isfinite(amount) or amount <= 0.0:
+            raise ValueError("capital contribution must be finite and positive")
+        ledger = self.state["strategies"][strategy_id]
+        trading_date = taifex_trading_date(
+            datetime.fromtimestamp(decision_ns / 1e9, tz=TAIPEI)
+        )
+        ledger["cumulative_contributed_capital_twd"] = float(
+            ledger.get("cumulative_contributed_capital_twd") or 0.0
+        ) + amount
+        ledger["capital_contribution_count"] = int(
+            ledger.get("capital_contribution_count") or 0
+        ) + 1
+        if reason == "post_bankruptcy_one_package_recapitalization":
+            ledger["recapitalization_count"] = int(
+                ledger.get("recapitalization_count") or 0
+            ) + 1
+        ledger["last_capital_contribution_twd"] = amount
+        ledger["last_capital_contribution_decision_ts_ns"] = int(decision_ns)
+        ledger["last_capital_contribution_trading_date"] = trading_date.isoformat()
+        row = {
+            "schema_version": SCHEMA_VERSION,
+            "execution_contract_version": EXECUTION_CONTRACT_VERSION,
+            "event": "external_capital_contribution",
+            "recorded_at_utc": _now_iso(),
+            "decision_ts_ns": int(decision_ns),
+            "trading_date": trading_date.isoformat(),
+            "strategy_id": strategy_id,
+            "reason": reason,
+            "amount_twd": amount,
+            "target_one_package_capital_twd": float(
+                target_one_package_capital_twd
+            ),
+            "equity_before_contribution_twd": float(
+                equity_before_contribution_twd
+            ),
+            "cumulative_contributed_capital_twd": float(
+                ledger["cumulative_contributed_capital_twd"]
+            ),
+            "capital_contribution_count": int(
+                ledger["capital_contribution_count"]
+            ),
+            "recapitalization_count": int(ledger.get("recapitalization_count") or 0),
+            "last_bankruptcy_decision_ts_ns": ledger.get(
+                "last_bankruptcy_decision_ts_ns"
+            ),
+            "last_bankruptcy_trading_date": ledger.get(
+                "last_bankruptcy_trading_date"
+            ),
+            "last_bankruptcy_total_equity_twd": ledger.get(
+                "last_bankruptcy_total_equity_twd"
+            ),
+            "policy": STRATEGY_RECAPITALIZATION_POLICY,
+        }
+        _append_jsonl(self.capital_contributions_path, row)
+        _append_jsonl(self.events_path, row)
+
+    def _prepare_strategy_capital_for_entry(
+        self,
+        strategy_id: str,
+        *,
+        decision_ns: int,
+    ) -> bool:
+        """Fund one complete strategy package without resetting cumulative P&L."""
+
+        ledger = self.state["strategies"][strategy_id]
+        first_lifetime_entry = int(ledger.get("trade_sides") or 0) == 0
+        recapitalizing = not bool(ledger.get("alive", True))
+        if recapitalizing and not self._strategy_recapitalization_is_due(
+            strategy_id,
+            decision_ns,
+        ):
+            return False
+        target_capital = float(self._strategy_initial_capital_twd(strategy_id))
+        if not math.isfinite(target_capital) or target_capital <= 0.0:
+            raise RuntimeError(
+                f"strategy one-package capital is not positive: {strategy_id}"
+            )
+        contributed = float(
+            ledger.get("cumulative_contributed_capital_twd") or 0.0
+        )
+        if first_lifetime_entry and contributed <= 0.0:
+            self._record_capital_contribution(
+                strategy_id,
+                amount_twd=target_capital,
+                target_one_package_capital_twd=target_capital,
+                equity_before_contribution_twd=0.0,
+                decision_ns=decision_ns,
+                reason="initial_one_package_capital",
+            )
+            ledger["initial_capital_twd"] = target_capital
+        elif first_lifetime_entry and contributed < target_capital:
+            equity_before = self._strategy_flat_equity_twd(strategy_id)
+            self._record_capital_contribution(
+                strategy_id,
+                amount_twd=target_capital - contributed,
+                target_one_package_capital_twd=target_capital,
+                equity_before_contribution_twd=equity_before,
+                decision_ns=decision_ns,
+                reason="first_entry_one_package_capital_top_up",
+            )
+            ledger["initial_capital_twd"] = max(
+                float(ledger.get("initial_capital_twd") or 0.0),
+                target_capital,
+            )
+        elif recapitalizing:
+            equity_before = self._strategy_flat_equity_twd(strategy_id)
+            contribution = target_capital - equity_before
+            if not math.isfinite(contribution) or contribution <= 0.0:
+                raise RuntimeError(
+                    "bankrupt strategy does not require a positive restoring "
+                    f"contribution: {strategy_id} equity={equity_before} "
+                    f"target={target_capital}"
+                )
+            self._record_capital_contribution(
+                strategy_id,
+                amount_twd=contribution,
+                target_one_package_capital_twd=target_capital,
+                equity_before_contribution_twd=equity_before,
+                decision_ns=decision_ns,
+                reason="post_bankruptcy_one_package_recapitalization",
+            )
+            ledger["alive"] = True
+            ledger["forced_liquidation_pending"] = False
+        elif contributed <= 0.0:
+            self._record_capital_contribution(
+                strategy_id,
+                amount_twd=target_capital,
+                target_one_package_capital_twd=target_capital,
+                equity_before_contribution_twd=0.0,
+                decision_ns=decision_ns,
+                reason="legacy_flat_one_package_capital",
+            )
+            ledger["initial_capital_twd"] = max(
+                float(ledger.get("initial_capital_twd") or 0.0),
+                target_capital,
+            )
+        return True
+
     def _latest_complete_mark_cache(self) -> dict[str, dict[str, Any]]:
         """Recover the latest complete pre-v4 liquidation mark after restart."""
 
@@ -1282,6 +1482,132 @@ class TaifexVolatilitySimulation:
             ledger.setdefault("last_complete_mark_futures_position", None)
             ledger.setdefault("last_complete_mark_underlying_futures_position", None)
             ledger.setdefault("last_complete_mark_option_positions", None)
+
+    def _latest_strategy_bankruptcy_boundaries(self) -> dict[str, tuple[int, date]]:
+        """Recover the latest verified bankruptcy clock from the event journal."""
+
+        latest: dict[str, tuple[int, date]] = {}
+        if not self.events_path.is_file():
+            return latest
+        with self.events_path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if (
+                    row.get("event") != "strategy_forced_liquidation"
+                    or "ruin" not in str(row.get("reason") or "")
+                ):
+                    continue
+                strategy_id = str(row.get("strategy_id") or "")
+                if strategy_id not in self.strategy_ids:
+                    continue
+                try:
+                    decision_ns = int(row.get("decision_ts_ns") or 0)
+                    if decision_ns > 0:
+                        observed_at = datetime.fromtimestamp(
+                            decision_ns / 1e9,
+                            tz=TAIPEI,
+                        )
+                    else:
+                        raw_at = str(row["at_utc"])
+                        observed_at = datetime.fromisoformat(
+                            raw_at.replace("Z", "+00:00")
+                        ).astimezone(TAIPEI)
+                        decision_ns = int(observed_at.timestamp() * 1e9)
+                except (KeyError, TypeError, ValueError):
+                    continue
+                boundary = taifex_trading_date(observed_at)
+                previous = latest.get(strategy_id)
+                if previous is None or decision_ns > previous[0]:
+                    latest[strategy_id] = (decision_ns, boundary)
+        return latest
+
+    def _ensure_strategy_recapitalization_state(
+        self,
+        payload: dict[str, Any],
+        *,
+        migrated_from_execution_version: int,
+    ) -> None:
+        """Add the explicit external-capital ledger without rewriting old P&L."""
+
+        bankruptcy_boundaries = (
+            self._latest_strategy_bankruptcy_boundaries()
+            if migrated_from_execution_version < EXECUTION_CONTRACT_VERSION
+            else {}
+        )
+        current_boundary = taifex_trading_date(datetime.now(TAIPEI))
+        for strategy_id in self.strategy_ids:
+            ledger = payload["strategies"][strategy_id]
+            initial_capital = max(
+                0.0,
+                float(ledger.get("initial_capital_twd") or 0.0),
+            )
+            ledger.setdefault(
+                "cumulative_contributed_capital_twd",
+                initial_capital,
+            )
+            ledger.setdefault(
+                "capital_contribution_count",
+                1 if initial_capital > 0.0 else 0,
+            )
+            ledger.setdefault("recapitalization_count", 0)
+            ledger.setdefault("bankruptcy_count", 0)
+            ledger.setdefault(
+                "episode_count",
+                1 if int(ledger.get("trade_sides") or 0) > 0 else 0,
+            )
+            ledger.setdefault("last_capital_contribution_twd", None)
+            ledger.setdefault("last_capital_contribution_decision_ts_ns", None)
+            ledger.setdefault("last_capital_contribution_trading_date", None)
+            ledger.setdefault("last_bankruptcy_decision_ts_ns", None)
+            ledger.setdefault("last_bankruptcy_trading_date", None)
+            ledger.setdefault("last_bankruptcy_total_equity_twd", None)
+            if (
+                migrated_from_execution_version < EXECUTION_CONTRACT_VERSION
+                and float(
+                    ledger.get("cumulative_contributed_capital_twd") or 0.0
+                )
+                <= 0.0
+                and initial_capital > 0.0
+            ):
+                ledger["cumulative_contributed_capital_twd"] = initial_capital
+                ledger["capital_contribution_count"] = 1
+            if (
+                migrated_from_execution_version < EXECUTION_CONTRACT_VERSION
+                and int(ledger.get("episode_count") or 0) == 0
+                and int(ledger.get("trade_sides") or 0) > 0
+            ):
+                ledger["episode_count"] = 1
+            if migrated_from_execution_version >= EXECUTION_CONTRACT_VERSION:
+                continue
+            if bool(ledger.get("alive", True)):
+                continue
+            has_open_position = bool(ledger.get("option_positions")) or any(
+                int(ledger.get(field) or 0) != 0
+                for field in (
+                    "futures_position",
+                    "underlying_futures_position",
+                )
+            )
+            if has_open_position:
+                ledger["entry_state"] = "forced_liquidation_pending"
+                ledger["forced_liquidation_pending"] = True
+                continue
+            recovered = bankruptcy_boundaries.get(strategy_id)
+            if recovered is None:
+                recovered = (
+                    int(datetime.now(TAIPEI).timestamp() * 1e9),
+                    current_boundary,
+                )
+            ledger["last_bankruptcy_decision_ts_ns"] = int(recovered[0])
+            ledger["last_bankruptcy_trading_date"] = recovered[1].isoformat()
+            ledger["bankruptcy_count"] = max(
+                1,
+                int(ledger.get("bankruptcy_count") or 0),
+            )
+            ledger["entry_state"] = "awaiting_next_trading_date_recapitalization"
 
     def _persist_state(self) -> None:
         self.state["updated_at_utc"] = _now_iso()
@@ -1889,6 +2215,71 @@ class TaifexVolatilitySimulation:
         )
         return best, len(pairs), len(candidates)
 
+    def _put_call_parity_capital_requirement_twd(
+        self,
+        candidate: PutCallParityCandidate,
+        *,
+        execution_decision_ns: int,
+    ) -> float:
+        option_requirement = 0.0
+        for instrument, contracts, execution_price, liquidation_price in (
+            (
+                candidate.call,
+                candidate.call_contracts,
+                candidate.call_price,
+                candidate.call_liquidation_price,
+            ),
+            (
+                candidate.put,
+                candidate.put_contracts,
+                candidate.put_price,
+                candidate.put_liquidation_price,
+            ),
+        ):
+            fees = abs(contracts) * OPTION_FEE_PER_SIDE_TWD
+            taxes = abs(contracts) * option_premium_transaction_tax_twd(
+                execution_price,
+                multiplier_twd_per_point=OPTION_MULTIPLIER,
+            )
+            if contracts > 0:
+                option_requirement += (
+                    contracts * execution_price * OPTION_MULTIPLIER + fees + taxes
+                )
+            else:
+                option_requirement += (
+                    abs(contracts)
+                    * _txo_short_margin_twd(
+                        option_price=liquidation_price,
+                        underlying_price=candidate.future_price,
+                        strike=instrument.strike,
+                        option_right=instrument.right,
+                        risk_margin_a_twd=self.option_risk_margin_a_twd,
+                        risk_margin_b_twd=self.option_risk_margin_b_twd,
+                    )
+                    + abs(contracts)
+                    * (liquidation_price - execution_price)
+                    * OPTION_MULTIPLIER
+                    + fees
+                    + taxes
+                )
+        entry_date = datetime.fromtimestamp(
+            execution_decision_ns / 1e9,
+            tz=TAIPEI,
+        ).date()
+        future_tax = abs(candidate.future_contracts) * taifex_tax_per_contract_twd(
+            candidate.future_price,
+            multiplier_twd_per_point=self.underlying_multiplier,
+            tax_rate=stock_index_futures_tax_rate(entry_date),
+        )
+        return float(
+            option_requirement
+            + abs(candidate.future_contracts)
+            * taifex_initial_margin_twd(self.underlying_product, entry_date)
+            + abs(candidate.future_contracts) * self.underlying_fee_per_side_twd
+            + future_tax
+            + candidate.estimated_settlement_tax_twd
+        )
+
     def _enter_put_call_parity(
         self,
         candidate: PutCallParityCandidate,
@@ -1904,7 +2295,17 @@ class TaifexVolatilitySimulation:
             or parity_state.get("open_position") is not None
         ):
             raise RuntimeError("put-call parity entry requires a flat strategy ledger")
-        first_lifetime_entry = int(ledger.get("trade_sides") or 0) == 0
+        ledger["entry_capital_requirement_twd"] = (
+            self._put_call_parity_capital_requirement_twd(
+                candidate,
+                execution_decision_ns=execution_decision_ns,
+            )
+        )
+        if not self._prepare_strategy_capital_for_entry(
+            PUT_CALL_PARITY_TX_STRATEGY_ID,
+            decision_ns=execution_decision_ns,
+        ):
+            raise RuntimeError("put-call parity recapitalization is not yet eligible")
         for instrument, contracts, price, receive_ns in (
             (
                 candidate.call,
@@ -1956,70 +2357,8 @@ class TaifexVolatilitySimulation:
             signal_decision_ns=signal_decision_ns,
         )
 
-        option_requirement = 0.0
-        for instrument, contracts, execution_price, liquidation_price in (
-            (
-                candidate.call,
-                candidate.call_contracts,
-                candidate.call_price,
-                candidate.call_liquidation_price,
-            ),
-            (
-                candidate.put,
-                candidate.put_contracts,
-                candidate.put_price,
-                candidate.put_liquidation_price,
-            ),
-        ):
-            fees = abs(contracts) * OPTION_FEE_PER_SIDE_TWD
-            taxes = abs(contracts) * option_premium_transaction_tax_twd(
-                execution_price,
-                multiplier_twd_per_point=OPTION_MULTIPLIER,
-            )
-            if contracts > 0:
-                option_requirement += (
-                    contracts * execution_price * OPTION_MULTIPLIER + fees + taxes
-                )
-            else:
-                option_requirement += (
-                    abs(contracts)
-                    * _txo_short_margin_twd(
-                        option_price=liquidation_price,
-                        underlying_price=candidate.future_price,
-                        strike=instrument.strike,
-                        option_right=instrument.right,
-                        risk_margin_a_twd=self.option_risk_margin_a_twd,
-                        risk_margin_b_twd=self.option_risk_margin_b_twd,
-                    )
-                    + abs(contracts)
-                    * (liquidation_price - execution_price)
-                    * OPTION_MULTIPLIER
-                    + fees
-                    + taxes
-                )
-        entry_date = datetime.fromtimestamp(
-            execution_decision_ns / 1e9, tz=TAIPEI
-        ).date()
-        future_tax = abs(candidate.future_contracts) * taifex_tax_per_contract_twd(
-            candidate.future_price,
-            multiplier_twd_per_point=self.underlying_multiplier,
-            tax_rate=stock_index_futures_tax_rate(entry_date),
-        )
-        capital_requirement = (
-            option_requirement
-            + abs(candidate.future_contracts)
-            * taifex_initial_margin_twd(self.underlying_product, entry_date)
-            + abs(candidate.future_contracts) * self.underlying_fee_per_side_twd
-            + future_tax
-            + candidate.estimated_settlement_tax_twd
-        )
-        ledger["entry_capital_requirement_twd"] = float(capital_requirement)
-        if first_lifetime_entry:
-            ledger["initial_capital_twd"] = max(
-                float(ledger.get("initial_capital_twd") or 0.0),
-                float(capital_requirement * self.strategy_capital_buffer_multiple),
-            )
         ledger["entry_state"] = "entered"
+        ledger["episode_count"] = int(ledger.get("episode_count") or 0) + 1
         public = self._put_call_parity_payload(
             candidate,
             decision_ns=execution_decision_ns,
@@ -2070,8 +2409,14 @@ class TaifexVolatilitySimulation:
             ledger["entry_state"] = "entered"
             return
         if not bool(ledger.get("alive", True)):
-            ledger["entry_state"] = "ruined"
-            return
+            if not self._strategy_recapitalization_is_due(
+                PUT_CALL_PARITY_TX_STRATEGY_ID,
+                decision_ns,
+            ):
+                ledger["entry_state"] = (
+                    "awaiting_next_trading_date_recapitalization"
+                )
+                return
         expiry = self.underlying.last_trading_date
         if parity_state.get("blocked_expiry") and (
             not isinstance(expiry, date)
@@ -2290,14 +2635,18 @@ class TaifexVolatilitySimulation:
             return False
         ledger = self.state["strategies"][strategy_id]
         if not bool(ledger.get("alive", True)):
-            ledger["entry_state"] = "ruined"
-            cycle.setdefault("strategy_entries", {})[strategy_id] = "ruined"
-            return False
+            if not self._strategy_recapitalization_is_due(strategy_id, decision_ns):
+                ledger["entry_state"] = (
+                    "awaiting_next_trading_date_recapitalization"
+                )
+                cycle.setdefault("strategy_entries", {})[strategy_id] = ledger[
+                    "entry_state"
+                ]
+                return False
         if ledger.get("entry_state") in {"entered", "forced_flat"}:
             return True
         if ledger.get("entry_state") == "waiting_next_cycle":
             return False
-        first_lifetime_entry = int(ledger.get("trade_sides") or 0) == 0
         instruments = self._strategy_entry_instruments(strategy_id, cycle)
         if instruments is None:
             ledger["entry_state"] = "waiting_for_contract_ladder"
@@ -2320,26 +2669,6 @@ class TaifexVolatilitySimulation:
                 ]
                 return False
             fills.append((instrument, quantity, swept[0], swept[1]))
-        for instrument, quantity, price, receive_ns in fills:
-            self._record_ideal_trade(
-                strategy_id=strategy_id,
-                instrument_type="option",
-                product="TXO",
-                code=instrument.code,
-                delta_contracts=quantity,
-                price_points=price,
-                decision_ns=decision_ns,
-                receive_ns=receive_ns,
-                reason="strategy_catalog_cycle_entry",
-                series=instrument.series,
-                strike=instrument.strike,
-                option_right=instrument.right,
-                price_source=(
-                    "causally_received_five_level_ask_vwap"
-                    if quantity > 0
-                    else "causally_received_five_level_bid_vwap"
-                ),
-            )
         underlying_entry = float(cycle.get("entry_forward_mid") or cycle["strike"])
         option_requirement = 0.0
         for instrument, quantity, price, _receive_ns in fills:
@@ -2375,12 +2704,38 @@ class TaifexVolatilitySimulation:
                     + per_leg_tax
                 )
         ledger["entry_capital_requirement_twd"] = float(option_requirement)
-        ledger["entry_state"] = "entered"
-        cycle.setdefault("strategy_entries", {})[strategy_id] = "entered"
-        if first_lifetime_entry:
-            ledger["initial_capital_twd"] = self._strategy_initial_capital_twd(
-                strategy_id
+        if not self._prepare_strategy_capital_for_entry(
+            strategy_id,
+            decision_ns=decision_ns,
+        ):
+            ledger["entry_state"] = "awaiting_next_trading_date_recapitalization"
+            cycle.setdefault("strategy_entries", {})[strategy_id] = ledger[
+                "entry_state"
+            ]
+            return False
+        for instrument, quantity, price, receive_ns in fills:
+            self._record_ideal_trade(
+                strategy_id=strategy_id,
+                instrument_type="option",
+                product="TXO",
+                code=instrument.code,
+                delta_contracts=quantity,
+                price_points=price,
+                decision_ns=decision_ns,
+                receive_ns=receive_ns,
+                reason="strategy_catalog_cycle_entry",
+                series=instrument.series,
+                strike=instrument.strike,
+                option_right=instrument.right,
+                price_source=(
+                    "causally_received_five_level_ask_vwap"
+                    if quantity > 0
+                    else "causally_received_five_level_bid_vwap"
+                ),
             )
+        ledger["entry_state"] = "entered"
+        ledger["episode_count"] = int(ledger.get("episode_count") or 0) + 1
+        cycle.setdefault("strategy_entries", {})[strategy_id] = "entered"
         if strategy_id == CLASSIC_VARIANT_ID and not bool(
             cycle.get("broker_reference_opened")
         ):
@@ -2903,7 +3258,11 @@ class TaifexVolatilitySimulation:
             if strategy_id == PUT_CALL_PARITY_TX_STRATEGY_ID:
                 continue
             ledger = self.state["strategies"][strategy_id]
-            ledger["entry_state"] = "pending"
+            ledger["entry_state"] = (
+                "pending"
+                if bool(ledger.get("alive", True))
+                else "awaiting_next_trading_date_recapitalization"
+            )
             ledger["option_positions"] = {}
             ledger["option_position_metadata"] = {}
             ledger["pending_option_roll"] = None
@@ -3120,7 +3479,27 @@ class TaifexVolatilitySimulation:
         total_equity = closed_mark.get("total_equity_twd")
         if total_equity is None or float(total_equity) <= 0.0:
             ledger["alive"] = False
-            ledger["entry_state"] = "ruined"
+            bankruptcy_trading_date = taifex_trading_date(
+                datetime.fromtimestamp(decision_ns / 1e9, tz=TAIPEI)
+            )
+            ledger["entry_state"] = (
+                "awaiting_next_trading_date_recapitalization"
+            )
+            ledger["bankruptcy_count"] = int(
+                ledger.get("bankruptcy_count") or 0
+            ) + 1
+            ledger["last_bankruptcy_decision_ts_ns"] = int(decision_ns)
+            ledger["last_bankruptcy_trading_date"] = (
+                bankruptcy_trading_date.isoformat()
+            )
+            ledger["last_bankruptcy_total_equity_twd"] = total_equity
+            if strategy_id == PUT_CALL_PARITY_TX_STRATEGY_ID:
+                parity_state = self.state["put_call_parity_tx"]
+                parity_state["blocked_expiry"] = None
+                parity_state["monitor"] = {
+                    **(parity_state.get("monitor") or {}),
+                    "state": "awaiting_next_trading_date_recapitalization",
+                }
         _append_jsonl(
             self.events_path,
             {
@@ -3128,8 +3507,13 @@ class TaifexVolatilitySimulation:
                 "at_utc": _now_iso(),
                 "strategy_id": strategy_id,
                 "reason": reason,
+                "decision_ts_ns": int(decision_ns),
+                "bankruptcy_trading_date": ledger.get(
+                    "last_bankruptcy_trading_date"
+                ),
                 "total_equity_twd": total_equity,
                 "alive_after": bool(ledger.get("alive", True)),
+                "recapitalization_policy": STRATEGY_RECAPITALIZATION_POLICY,
             },
         )
         self._persist_state()
@@ -3158,7 +3542,7 @@ class TaifexVolatilitySimulation:
                 strategy_id,
                 decision_ns=decision_ns,
                 reason=(
-                    "absorbing_ruin_forced_flatten"
+                    "bankruptcy_recapitalizing_forced_flatten"
                     if total_equity <= 0.0
                     else "maintenance_margin_forced_flatten"
                 ),
@@ -3258,14 +3642,23 @@ class TaifexVolatilitySimulation:
         if forward_book is None or forward_row is None:
             self.state["engine_status"] = "waiting_for_calibration_forward_book"
             return
-        surface = build_bidask_iv_surface(
-            self._surface_quotes(decision_books),
-            calibration_decision_ns=decision_ns,
-            forward_bid=forward_book[0],
-            forward_ask=forward_book[1],
-            forward_receive_ts_ns=int(forward_row["receive_ts_ns"]),
-            maximum_staleness_seconds=SURFACE_BOOK_MAX_AGE_SECONDS,
-        )
+        try:
+            surface = build_bidask_iv_surface(
+                self._surface_quotes(decision_books),
+                calibration_decision_ns=decision_ns,
+                forward_bid=forward_book[0],
+                forward_ask=forward_book[1],
+                forward_receive_ts_ns=int(forward_row["receive_ts_ns"]),
+                maximum_staleness_seconds=SURFACE_BOOK_MAX_AGE_SECONDS,
+            )
+        except ValueError as exc:
+            error = str(exc)
+            if not error.startswith("live Bid/Ask IV surface is too sparse:"):
+                raise
+            self.state["engine_status"] = "waiting_for_sufficient_iv_surface"
+            self.state["last_iv_surface_error"] = error
+            return
+        self.state["last_iv_surface_error"] = None
         expiry_ns = int(
             datetime.combine(expiry, datetime_time(13, 30), tzinfo=TAIPEI).timestamp()
             * 1e9
@@ -3290,11 +3683,21 @@ class TaifexVolatilitySimulation:
             )
             fitted = fitted_models.get(model_id)
             if fitted is None:
-                fitted = fit_volatility_model(
-                    surface,
-                    model_id=model_id,
-                    held_series=str(cycle["series"]),
-                )
+                try:
+                    fitted = fit_volatility_model(
+                        surface,
+                        model_id=model_id,
+                        held_series=str(cycle["series"]),
+                    )
+                except ValueError as exc:
+                    error = str(exc)
+                    if not error.startswith("held-series IV surface is too sparse:"):
+                        raise
+                    self.state["engine_status"] = (
+                        "waiting_for_sufficient_held_series_iv_surface"
+                    )
+                    self.state["last_iv_surface_error"] = error
+                    return
                 fitted_models[model_id] = fitted
             delta = fitted.straddle_delta(
                 forward=surface.forward,
@@ -3597,7 +4000,11 @@ class TaifexVolatilitySimulation:
         for strategy_id, ledger in self.state["strategies"].items():
             if strategy_id == PUT_CALL_PARITY_TX_STRATEGY_ID:
                 continue
-            ledger["entry_state"] = "pending"
+            ledger["entry_state"] = (
+                "pending"
+                if bool(ledger.get("alive", True))
+                else "awaiting_next_trading_date_recapitalization"
+            )
             ledger["pending_option_roll"] = None
         self.state["last_settled_expiry"] = expiry.isoformat()
         self.state["blocked_reason"] = None
@@ -3889,6 +4296,10 @@ class TaifexVolatilitySimulation:
 
         cumulative_pnl: float | None = None
         total_equity: float | None = None
+        initial_capital = float(ledger.get("initial_capital_twd") or 0.0)
+        cumulative_contributed_capital = float(
+            ledger.get("cumulative_contributed_capital_twd") or initial_capital
+        )
         if open_value is not None:
             cumulative_pnl = (
                 float(ledger["gross_cash_twd"])
@@ -3896,10 +4307,7 @@ class TaifexVolatilitySimulation:
                 - float(ledger["fees_twd"])
                 - float(ledger["tax_twd"])
             )
-            initial_capital = float(ledger.get("initial_capital_twd") or 0.0)
-            total_equity = initial_capital + cumulative_pnl
-        else:
-            initial_capital = float(ledger.get("initial_capital_twd") or 0.0)
+            total_equity = cumulative_contributed_capital + cumulative_pnl
         margin_excess = (
             total_equity - margin_required if total_equity is not None else None
         )
@@ -3919,12 +4327,50 @@ class TaifexVolatilitySimulation:
             "net_equity_twd": cumulative_pnl,
             "cumulative_pnl_twd": cumulative_pnl,
             "initial_capital_twd": initial_capital,
+            "cumulative_contributed_capital_twd": (
+                cumulative_contributed_capital
+            ),
+            "return_on_contributed_capital_pct": (
+                cumulative_pnl / cumulative_contributed_capital * 100.0
+                if cumulative_pnl is not None
+                and cumulative_contributed_capital > 0.0
+                else None
+            ),
             "total_equity_twd": total_equity,
             "margin_required_twd": float(margin_required),
             "margin_excess_twd": margin_excess,
             "margin_trading_date": margin_trading_date.isoformat(),
             "futures_initial_margin_per_contract_twd": (futures_margin_per_contract),
             "alive": bool(ledger.get("alive", True)),
+            "recapitalization_policy": STRATEGY_RECAPITALIZATION_POLICY,
+            "capital_contribution_count": int(
+                ledger.get("capital_contribution_count") or 0
+            ),
+            "recapitalization_count": int(
+                ledger.get("recapitalization_count") or 0
+            ),
+            "bankruptcy_count": int(ledger.get("bankruptcy_count") or 0),
+            "episode_count": int(ledger.get("episode_count") or 0),
+            "last_capital_contribution_twd": ledger.get(
+                "last_capital_contribution_twd"
+            ),
+            "last_capital_contribution_trading_date": ledger.get(
+                "last_capital_contribution_trading_date"
+            ),
+            "last_bankruptcy_trading_date": ledger.get(
+                "last_bankruptcy_trading_date"
+            ),
+            "last_bankruptcy_total_equity_twd": ledger.get(
+                "last_bankruptcy_total_equity_twd"
+            ),
+            "recapitalization_eligible_now": (
+                self._strategy_recapitalization_is_due(
+                    strategy_id,
+                    decision_ns,
+                )
+                if not bool(ledger.get("alive", True))
+                else False
+            ),
             "margin_call_count": int(ledger.get("margin_call_count") or 0),
             "forced_liquidation_pending": bool(
                 ledger.get("forced_liquidation_pending")
@@ -4106,6 +4552,23 @@ class TaifexVolatilitySimulation:
                 )
             ),
             "strategy_capital_buffer_multiple": (self.strategy_capital_buffer_multiple),
+            "strategy_recapitalization_policy": STRATEGY_RECAPITALIZATION_POLICY,
+            "strategy_cumulative_contributed_capital_twd": sum(
+                float(
+                    mark.get("cumulative_contributed_capital_twd")
+                    or mark.get("initial_capital_twd")
+                    or 0.0
+                )
+                for mark in strategy_marks.values()
+            ),
+            "strategy_recapitalization_count": sum(
+                int(mark.get("recapitalization_count") or 0)
+                for mark in strategy_marks.values()
+            ),
+            "strategy_bankruptcy_count": sum(
+                int(mark.get("bankruptcy_count") or 0)
+                for mark in strategy_marks.values()
+            ),
             "catalog_expansion_entry_policy": (self.catalog_expansion_entry_policy),
             "option_contract_count": len(self.options),
             "latest_book_count": len(self.latest_books),
@@ -4205,6 +4668,7 @@ __all__ = [
     "EXECUTION_CONTRACT_VERSION",
     "MODEL_VARIANT_PREFIX",
     "OptionInstrument",
+    "STRATEGY_RECAPITALIZATION_POLICY",
     "STRATEGY_IDS",
     "TaifexVolatilitySimulation",
     "FuturesInstrument",

@@ -1,10 +1,16 @@
 "use strict";
 
 const PRICE_REFRESH_MS = 60000;
-const FETCH_TIMEOUT_MS = 15000;
+const TW_PUBLIC_STATUS_REFRESH_MS = 30000;
+const Dashboard = window.StockAgentDashboard;
+const fetchWithTimeout = Dashboard.createFetch({timeoutMs: 15000});
 const SIGNAL_PAGE_SIZE = 100;
 const POSITION_PAGE_SIZE = 100;
 const EVENT_PAGE_SIZE = 100;
+const DATA_MONITOR_STATUS_PATHS = [
+  "/data-monitor/api/status",
+  "../data-monitor/api/status",
+];
 const COLORS = ["#37d3ff", "#5ee0a0", "#a98cff", "#f5bd4f", "#ff7ac8", "#73e6d1", "#ff9f68"];
 const TIME_RANGE_LABELS = {"1h": "1 小時", "1d": "1 天", "1w": "1 週", "1mo": "1 月", "1q": "1 季", "1y": "1 年", all: "全部"};
 const timeAxis = window.StockAgentTimeAxis;
@@ -23,8 +29,10 @@ let historyInFlight = false;
 let lastFetchMs = null;
 let refreshInFlight = false;
 let refreshQueued = false;
+let refreshForceQueued = false;
 let lastRenderedRevision = null;
 let lastFilterRevision = null;
+let lastSourceUpdatedAt = "";
 let signalRows = [];
 let signalDirectionSummary = {};
 let signalOpeningExecutionAudit = {};
@@ -34,6 +42,9 @@ let signalRecordCount = null;
 let signalLoading = false;
 let signalLoadError = "";
 let signalRequestSequence = 0;
+let signalFeatureDrivers = {};
+let featurePanelSignalKey = "";
+let featurePanelScopeText = "";
 let signalFilterTimer = null;
 let signalAbortController = null;
 let eventRows = [];
@@ -46,7 +57,6 @@ let eventLoading = false;
 let eventLoadError = "";
 let eventRequestSequence = 0;
 let eventAbortController = null;
-let filterAnimationFrame = null;
 let positionRows = [];
 let positionTotal = 0;
 let positionHasMore = false;
@@ -55,6 +65,11 @@ let positionLoadError = "";
 let positionRequestSequence = 0;
 let positionAbortController = null;
 let availableDetailDates = [];
+let twPublicMonitorData = null;
+let twPublicMonitorRefreshInFlight = false;
+let twPublicMonitorLastFetchMs = null;
+let twPublicMonitorLastUpdated = null;
+let twPublicMonitorAbortController = null;
 
 try {
   chartRange = localStorage.getItem("tw-day-trade-equity-time-range") || "1d";
@@ -63,24 +78,8 @@ try {
 } catch (_error) { /* storage can be disabled */ }
 if (!(chartRange in TIME_RANGE_LABELS)) chartRange = "1d";
 
-const $ = (id) => document.getElementById(id);
-async function fetchWithTimeout(path, options = {}) {
-  const controller = new AbortController();
-  const upstream = options.signal;
-  const forwardAbort = () => controller.abort(upstream?.reason);
-  if (upstream?.aborted) forwardAbort();
-  else upstream?.addEventListener("abort", forwardAbort, {once: true});
-  const timer = window.setTimeout(
-    () => controller.abort(new DOMException("Request timed out", "TimeoutError")),
-    FETCH_TIMEOUT_MS,
-  );
-  try { return await fetch(path, {...options, signal: controller.signal}); }
-  finally {
-    window.clearTimeout(timer);
-    upstream?.removeEventListener("abort", forwardAbort);
-  }
-}
-const esc = (value) => String(value ?? "—").replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"})[c]);
+const $ = Dashboard.byId;
+const esc = Dashboard.escapeHtml;
 const number = (value, digits = 0) => {
   if (value == null || !Number.isFinite(Number(value))) return "—";
   const precision = Math.min(2, Math.max(0, Number(digits) || 0));
@@ -110,6 +109,75 @@ const summaryMoney = (value) => value == null || !Number.isFinite(Number(value))
 const compactMoney = (value) => value == null || !Number.isFinite(Number(value))
   ? "—"
   : `NT$ ${Number(value).toLocaleString("zh-TW", {notation: "compact", maximumFractionDigits: 2})}`;
+const signalRowKey = (row = {}) => {
+  const sessionDate = String(row.session_date || "");
+  const market = String(row.market || "");
+  const symbol = String(row.symbol || "");
+  const signalAt = String(row.signal_at || "");
+  if (!sessionDate || !market || !symbol) return "";
+  return signalAt ? `${sessionDate}|${market}|${symbol}|${signalAt}` : `${sessionDate}|${market}|${symbol}`;
+};
+const selectedSignalRow = () => signalRows.find((row) => signalRowKey(row) === featurePanelSignalKey) || null;
+const resolveSignalFeatureDrivers = (row = null, rowKey = "") => {
+  const candidates = [];
+  if (rowKey) candidates.push(rowKey);
+  if (row) candidates.push(signalRowKey(row));
+  candidates.push(featurePanelSignalKey);
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    const value = signalFeatureDrivers[candidate];
+    if (Array.isArray(value)) return value;
+    if (value && Array.isArray(value.drivers)) return value.drivers;
+  }
+  return [];
+};
+const featureDriversSummaryText = () => featurePanelScopeText
+  ? `特徵資料來源：${featurePanelScopeText}`
+  : "目前只顯示本次訊號載入頁面可對應到的特徵資料。";
+
+function sortedFeatureColumns(drivers) {
+  const featureKey = "feature";
+  const featured = new Set(["feature", "weighted_abs_value", "value", "abs_value", "importance", "score"]);
+  const ordered = [];
+  const rest = new Set();
+  for (const driver of drivers) {
+    if (!driver || typeof driver !== "object") continue;
+    for (const key of Object.keys(driver)) {
+      if (key === featureKey) continue;
+      if (featured.has(key) && !ordered.includes(key)) {
+        ordered.push(key);
+      } else {
+        rest.add(key);
+      }
+    }
+  }
+  return [
+    featureKey,
+    ...ordered,
+    ...rest,
+  ].filter((key, index, list) => list.indexOf(key) === index);
+}
+
+const formatFeatureValue = (value) => {
+  if (value == null) return "—";
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) return "—";
+    const absValue = Math.abs(value);
+    return absValue < .005 ? "0" : Number(value).toLocaleString("zh-TW", {maximumFractionDigits: 2});
+  }
+  if (typeof value === "boolean") return value ? "是" : "否";
+  if (typeof value === "string") return value || "—";
+  if (value instanceof Date) return value.toISOString();
+  if (typeof value === "object") {
+    try { return JSON.stringify(value); } catch (_error) { return "—"; }
+  }
+  return String(value);
+};
+
+function syncFeaturePanelSelection() {
+  const exists = signalRows.some((row) => signalRowKey(row) === featurePanelSignalKey);
+  if (!exists) featurePanelSignalKey = "";
+}
 const displayPct = (value) => {
   if (value == null || !Number.isFinite(Number(value))) return "—";
   const resolved = Number(value);
@@ -119,6 +187,20 @@ const displayPct = (value) => {
 const money = (value) => value == null ? "—" : `NT$ ${monetaryNumber(value)}`;
 const pct = (value) => value == null ? "—" : `${sourceNumber(Number(value) * 100)}%`;
 const shortTime = (value) => value ? String(value).replace("T", " ").slice(5, 19) : "—";
+const shortDateTime = (value) => {
+  const parsed = new Date(value || "");
+  if (Number.isNaN(parsed.getTime())) return "—";
+  return parsed.toLocaleString("zh-TW", {
+    timeZone: "Asia/Taipei",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  });
+};
 const pnlClass = (value) => Number(value || 0) > 0 ? "positive" : Number(value || 0) < 0 ? "negative" : "";
 const badge = (text, kind = "") => `<span class="badge ${kind}">${esc(text)}</span>`;
 const clampRatio = (value) => Math.min(1, Math.max(0, Number(value) || 0));
@@ -135,10 +217,152 @@ const countdown = (value) => {
   const remaining = Math.max(0, (new Date(value).getTime() - Date.now()) / 1000);
   return duration(remaining);
 };
+const progressValue = (ratio) => {
+  if (ratio == null || !Number.isFinite(Number(ratio))) return null;
+  return clampRatio(Number(ratio));
+};
 const progress = (ratio, kind = "") => {
   const bounded = clampRatio(ratio);
   const value = (bounded * 100).toFixed(2);
   return `<progress class="progress-track ${esc(kind)}" max="100" value="${value}" aria-label="${value}%"></progress>`;
+};
+const twPublicProgress = (row = {}) => {
+  const progressData = row.acquisition_progress || {};
+  const ratio = progressValue(progressData.ratio);
+  const state = String(progressData.state || "");
+  const baseKind = (state === "complete" || state === "preparing_next_date") ? "good" :
+    state === "acquiring" ? "warn" :
+    state === "streaming" ? "good" : "warn";
+  return {
+    ratio,
+    kind: baseKind,
+    label: String(progressData.label || "尚無進度資訊"),
+    current: progressData.current,
+    total: progressData.total,
+    unit: progressData.unit || "資料量",
+    state: state || "unknown",
+    dataThrough: progressData.data_through,
+    preparingForDate: progressData.preparing_for_date,
+    firstDataAt: progressData.first_data_at_utc,
+    complete: Boolean(progressData.up_to_date || progressData.coverage_complete || progressData.batch_complete),
+    firstDataObserved: Boolean(progressData.first_data_observed),
+    basis: progressData.basis,
+  };
+};
+const twPublicPublicationTime = (row = {}) => {
+  const publication = row.publication || {};
+  const value = publication.applied_at_utc || publication.detected_at_utc || publication.last_checked_at_utc || row.latest_at_utc;
+  const observedValue = publication.detected_at_utc || publication.observed_at_utc || publication.last_checked_at_utc || row.latest_at_utc;
+  const checkedValue = publication.last_checked_at_utc || publication.detected_at_utc || row.last_verified_at_utc;
+  const parsed = value ? new Date(value) : null;
+  const observedParsed = observedValue ? new Date(observedValue) : null;
+  const checkedParsed = checkedValue ? new Date(checkedValue) : null;
+  return {
+    value: value ? String(value) : "",
+    label: parsed && Number.isFinite(parsed.getTime())
+      ? shortDateTime(parsed.toISOString())
+      : "尚未確認",
+    observed: observedValue ? String(observedValue) : "",
+    observedLabel: observedParsed && Number.isFinite(observedParsed.getTime())
+      ? shortDateTime(observedParsed.toISOString())
+      : "—",
+    checked: checkedValue ? String(checkedValue) : "",
+    checkedLabel: checkedParsed && Number.isFinite(checkedParsed.getTime())
+      ? shortDateTime(checkedParsed.toISOString())
+      : "—",
+    basis: String(publication.basis || "尚無發布依據"),
+    schedule: String(publication.schedule_label || "未提供")
+      .replace(/^來源未承諾固定發布時刻；/, "")
+      .trim(),
+    exact: Boolean(publication.exact_time_declared),
+  };
+};
+const twPublicRowsSource = (payload = {}) => {
+  const rows = Array.isArray(payload.sources)
+    ? payload.sources
+    : Array.isArray(payload.rows)
+      ? payload.rows
+      : [];
+  const byId = new Map();
+  for (const row of rows) {
+    if (!row || typeof row !== "object" || !row.id) continue;
+    byId.set(String(row.id), row);
+  }
+  return [...byId.values()];
+};
+const twPublicCompletionHint = (item = {}) => {
+  const dataThrough = item.data_through || "—";
+  const preparingFor = item.preparingForDate || "—";
+  if (item.complete && item.preparingForDate) {
+    return `已完成本日，下一資料日 ${preparingFor}`;
+  }
+  if (item.complete) {
+    return "已完成本日，等待下次來源切換";
+  }
+  if (item.preparingForDate && item.firstDataObserved) {
+    return `已到第一筆，預備 ${preparingFor}`;
+  }
+  if (item.firstDataObserved) {
+    return "已收到第一筆，持續取得中";
+  }
+  return `資料截至 ${dataThrough}`;
+};
+const twPublicAvailabilityText = (value) => {
+  if (value == null) return "未提供";
+  if (Array.isArray(value)) {
+    const compact = [...new Set(value.filter(Boolean).map((entry) => String(entry).trim()).filter(Boolean))]
+      .slice(0, 5)
+      .join(", ");
+    return compact || "未提供";
+  }
+  if (typeof value === "object") {
+    const values = Object.keys(value)
+      .filter((key) => value[key])
+      .map((key) => `${key}: ${value[key]}`)
+      .slice(0, 5)
+      .join(", ");
+    return values || "未提供";
+  }
+  return String(value) || "未提供";
+};
+const twPublicCoverageText = (coverage) => {
+  if (!coverage || typeof coverage !== "object") return "未提供";
+  const current = coverage.current;
+  const total = coverage.total;
+  const ratio = coverage.ratio;
+  const unit = coverage.unit || "資料單位";
+  if (Number.isFinite(Number(current)) && Number.isFinite(Number(total))) {
+    return `${number(current)} / ${number(total)} ${unit}`;
+  }
+  if (ratio != null && Number.isFinite(Number(ratio))) {
+    return `${(Number(ratio) * 100).toFixed(ratio < 0.1 ? 2 : 1)}%`;
+  }
+  return String(coverage.label || coverage.basis || "尚未提供");
+};
+const twPublicAutomationText = (automation = {}, fallback) => {
+  const mode = automation.mode ? `模式：${automation.mode}` : "";
+  const hasScheduleText = Boolean(automation.schedule_label || automation.next_run_utc || automation.next_run_at_utc);
+  const scheduleText = automation.next_run_at_utc && !automation.schedule_label
+    ? shortDateTime(automation.next_run_at_utc)
+    : (automation.schedule_label || "未提供");
+  const schedule = hasScheduleText ? String(scheduleText || fallback || "未提供") : String(fallback || "未提供");
+  const enabled = automation.automatic_update === true ? "已自動" : automation.automatic_update === false ? "非自動" : "";
+  return [mode, enabled, schedule].filter(Boolean).join(" · ");
+};
+const twPublicExecutionLabel = (row = {}, state = {}) => {
+  const stateText = String(state.operation || state.state || row.execution_state || "unknown");
+  const opLabel = row.operation_label ? `狀態：${row.operation_label}` : `運行：${stateText}`;
+  const opReason = row.operation_reason ? `原因：${row.operation_reason}` : "";
+  return [opLabel, opReason].filter(Boolean).join(" · ");
+};
+const twPublicRowsValueText = (row = {}) => {
+  const sourceRows = row.rows;
+  if (sourceRows == null) return "—";
+  if (typeof sourceRows === "number") return `${number(sourceRows)} 筆`;
+  if (typeof sourceRows === "string") return sourceRows || "—";
+  if (Array.isArray(sourceRows)) return `${number(sourceRows.length)} 筆`;
+  if (typeof sourceRows === "object") return `欄位 ${number(Object.keys(sourceRows).length)} 個`;
+  return "—";
 };
 const directionPair = (row = {}) => `多 ${pct(row.long_gross)} / 空 ${pct(row.short_gross)} · ${number(row.long_count)} / ${number(row.short_count)} 檔`;
 
@@ -178,9 +402,20 @@ function compareByAbsoluteWeight(a, b) {
   const aMagnitude = Number.isFinite(aWeight) ? Math.abs(aWeight) : -1;
   const bMagnitude = Number.isFinite(bWeight) ? Math.abs(bWeight) : -1;
   return bMagnitude - aMagnitude
+    || String(b.session_date || "").localeCompare(String(a.session_date || ""))
     || (Number.isFinite(bWeight) ? bWeight : 0) - (Number.isFinite(aWeight) ? aWeight : 0)
     || String(a.market || "").localeCompare(String(b.market || ""), "zh-Hant")
     || String(a.symbol || "").localeCompare(String(b.symbol || ""), "zh-Hant");
+}
+
+function beginSilentTableUpdate(bodyId, loadMoreId, append) {
+  const body = $(bodyId);
+  body?.setAttribute("aria-busy", "true");
+  if (!append) return;
+  const loadMore = $(loadMoreId);
+  if (!loadMore) return;
+  loadMore.disabled = true;
+  loadMore.textContent = "載入中…";
 }
 
 function healthPresentation(value) {
@@ -189,6 +424,7 @@ function healthPresentation(value) {
     active: "資料正常",
     ready: "資料正常",
     waiting: "等待資料",
+    degraded: "資料或執行異常",
     stale: "資料逾時",
     blocked: "策略阻擋",
     critical: "需要注意",
@@ -214,7 +450,6 @@ function engineStatusShortLabel(value) {
     active: "執行正常",
     ready: "已就緒",
     critical_unflattened_after_13_24: "轉 13:25 集合競價",
-    flat_directional_mix_unexecutable: "雙向整張不足・保持空倉",
     flat_no_executable_signal: "該日無可執行訊號",
     session_flat_after_exit: "該日已平倉",
     historical_session_complete: "歷史交易日已完成",
@@ -236,6 +471,19 @@ function executionStatusPresentation(value) {
     missed: {label: "該日執行缺漏", kind: "bad"},
   };
   return presentations[status] || {label: status.replaceAll("_", " "), kind: "warn"};
+}
+
+function fillOutcomePresentation(value) {
+  const outcome = String(value || "pending");
+  const presentations = {
+    filled: {label: "目標股數已建立部位", kind: "good"},
+    partial: {label: "僅部分建立部位", kind: "warn"},
+    no_fill: {label: "零成交", kind: "bad"},
+    no_order: {label: "無合法整張委託", kind: "warn"},
+    blocked: {label: "遭守門阻擋・零成交", kind: "bad"},
+    pending: {label: "等待成交結果", kind: "warn"},
+  };
+  return presentations[outcome] || {label: outcome.replaceAll("_", " "), kind: "warn"};
 }
 
 function totalModeNetPnl(data) {
@@ -316,11 +564,12 @@ function renderHeader(data) {
   $("connection-status").dataset.state = presentation.health;
   $("freshness").textContent = `來源 ${duration(data.source_age_seconds)}前 · ${shortTime(data.source_updated_at)}`;
   const alert = $("alert");
-  const blockers = data.modes.filter((mode) => !mode.checkpoint_ready || String(mode.engine_status || "").startsWith("critical"));
+  const blockers = data.modes.filter((mode) => !mode.checkpoint_ready || String(mode.engine_status || "").startsWith("critical") || String(mode.engine_status || "").startsWith("blocked"));
   const catchUps = data.modes.filter((mode) => mode.today_execution_status === "starting");
   const missed = data.modes.filter((mode) => mode.today_execution_status === "missed");
   const hasReplay = data.modes.some((mode) => mode.counterfactual_open_replay || mode.simulation_replay);
   const hasBenchmarkReplay = (data.benchmarks || []).some((row) => row.counterfactual_open_replay);
+  const operationalIssues = Array.isArray(data.operational_issues) ? data.operational_issues : [];
   const signalMissingEligibility = new Map();
   const currentMissingEligibility = new Map();
   for (const mode of data.modes) {
@@ -333,7 +582,7 @@ function renderHeader(data) {
       if (!coverage.covered && !currentMissingEligibility.has(venue)) currentMissingEligibility.set(venue, coverage);
     }
   }
-  if (hasReplay || hasBenchmarkReplay || data.health === "stale" || blockers.length || catchUps.length || missed.length || signalMissingEligibility.size || currentMissingEligibility.size) {
+  if (operationalIssues.length || hasReplay || hasBenchmarkReplay || data.health === "stale" || blockers.length || catchUps.length || missed.length || signalMissingEligibility.size || currentMissingEligibility.size) {
     const messages = [
       hasReplay ? "所選交易日使用實際開盤價做反事實重建；原始訊號時間保留，但這不是當時可成交報價、即時執行或券商成交。" : "",
       hasBenchmarkReplay ? "0050、2330 與台指期基準已補到實際開盤起點；補登區段是明確標示的回放，後續估值才接續記錄到的可成交 bid。" : "",
@@ -342,6 +591,7 @@ function renderHeader(data) {
       !currentMissingEligibility.size && signalMissingEligibility.size ? "09:00 訊號產生時資格資料尚未到齊，因此已 fail-closed；較晚補齊的資料不會回填成假成交。" : "",
       catchUps.length ? `發現所選交易日執行缺漏，已立即啟動補跑：${catchUps.map((mode) => mode.label || mode.market).join("、")}` : "",
       missed.length ? `所選交易日進場時窗結束仍缺少執行紀錄：${missed.map((mode) => mode.label || mode.market).join("、")}` : "",
+      ...operationalIssues.map((issue) => `${issue.title || issue.code}${Number(issue.count || 1) > 1 ? `（${number(issue.count)} 筆）` : ""}：${issue.detail || "已記錄異常"}`),
       ...blockers.map((mode) => `${mode.label || mode.market}：${engineStatusLabel(mode.engine_status)}${mode.checkpoint_ready ? "" : "；checkpoint 未就緒"}`),
     ].filter(Boolean);
     const signature = messages.join("|");
@@ -392,18 +642,28 @@ function renderModes(data) {
     const returnPct = mode.return_pct == null ? null : Number(mode.return_pct);
     const status = String(mode.engine_status || "unknown");
     const execution = executionStatusPresentation(mode.today_execution_status);
+    const fillOutcome = fillOutcomePresentation(mode.today_execution_outcome || mode.entry_fill_outcome);
     const kind = status === "active" ? "good" : status.startsWith("blocked") || status.startsWith("critical") ? "bad" : "warn";
-    const mix = mode.execution_projection || {};
     const offsetTicks = Number(mode.price_limit_offset_ticks || 0);
     const bracketPolicy = offsetTicks > 0
       ? `TP／SL 漲跌停內縮 ${sourceNumber(offsetTicks)} Tick（提高成交機率，非保證）`
       : "TP／SL 使用完整漲跌停價";
+    const entryPolicy = mode.entry_fill_policy === "synthetic_open_tick"
+      ? `模擬強制成交：多單開盤 +${number(mode.entry_price_offset_ticks || 1)} Tick／空單開盤 −${number(mode.entry_price_offset_ticks || 1)} Tick（非券商成交）`
+      : "因果最佳一檔與可驗證深度";
+    const reasonCounts = Object.entries(mode.signal_reason_counts || {})
+      .filter(([, count]) => Number(count || 0) > 0)
+      .sort((left, right) => Number(right[1]) - Number(left[1]))
+      .slice(0, 4)
+      .map(([reason, count]) => `${reason.replaceAll("_", " ")} ${number(count)}`)
+      .join("、") || "無";
     return `<article class="panel mode-card">
       <header><h3>${esc(mode.label || mode.market)}</h3>${badge(engineStatusShortLabel(status), kind)}</header>
       <div class="equity ${pnlClass(returnPct)}">${returnPct == null ? "尚無估值" : `${returnPct >= 0 ? "+" : ""}${displayPct(returnPct)}`}</div>
       <div class="delta ${pnlClass(pnl)}">${pnl == null ? "尚無估值" : `總權益 ${summaryMoney(equity)} · 淨損益 ${pnl >= 0 ? "+" : ""}${summaryMoney(pnl)}`}</div>
       <div class="mode-glance">
         <div><span>該日策略執行</span><strong class="${esc(execution.kind)}">${esc(execution.label)}</strong></div>
+        <div><span>實際成交結果</span><strong class="${esc(fillOutcome.kind)}">${esc(fillOutcome.label)}</strong></div>
         <div><span>持倉／缺價</span><strong>${number(mode.open_position_count)} / ${number(mode.stale_position_count)}</strong></div>
         <div><span>已實現淨損益</span><strong class="${pnlClass(mode.cumulative_realized_net_pnl_twd)}">${summaryMoney(mode.cumulative_realized_net_pnl_twd)}</strong></div>
         <div><span>未實現淨清算損益</span><strong class="${pnlClass(mode.open_net_liquidation_pnl_twd)}">${summaryMoney(mode.open_net_liquidation_pnl_twd)}</strong></div>
@@ -412,12 +672,13 @@ function renderModes(data) {
         <div><span>報酬率資金基準</span><strong>${money(initial)}</strong></div>
         <div><span>已賺手續費退佣</span><strong>${money(mode.cumulative_commission_rebate_accrued_twd)}</strong></div>
         <div><span>訊號時間</span><strong>${shortTime(mode.signal_at)}</strong></div>
+        <div><span>要求／成交／未成交</span><strong>${number(mode.entry_requested_shares || 0)}／${number(mode.entry_filled_shares || 0)}／${number(mode.entry_unfilled_shares || 0)} 股</strong></div>
         <div><span>13:24 市價重試後殘餘</span><strong class="${Number(mode.force_exit_failures || 0) ? "negative" : ""}">${number(mode.force_exit_failures || 0)}</strong></div>
         <div><span>13:30 帳務強平</span><strong>${number(mode.terminal_flatten_count || 0)}</strong></div>
         <div><span>強平價替代值</span><strong class="${Number(mode.terminal_flatten_degraded_count || 0) ? "negative" : ""}">${number(mode.terminal_flatten_degraded_count || 0)}</strong></div>
         ${mode.counterfactual_open_replay ? `<div class="wide"><span>開盤價重建</span><strong>實際開盤 ${shortTime(mode.signal_at)} · 原始訊號 ${shortTime(mode.source_signal_at)} · 非即時成交</strong></div>` : ""}
-        <div class="wide"><span>方向總曝險：目標</span><strong>多 ${pct(mix.target_long_gross)} / 空 ${pct(mix.target_short_gross)}</strong></div>
-        <div class="wide"><span>整張／深度後 → 平衡後</span><strong>多 ${pct(mix.pre_balance_long_gross)} / 空 ${pct(mix.pre_balance_short_gross)} → 多 ${pct(mix.post_balance_long_gross)} / 空 ${pct(mix.post_balance_short_gross)}</strong></div>
+        <div class="wide"><span>進場成交契約</span><strong>${esc(entryPolicy)}</strong></div>
+        <div class="wide"><span>訊號結果原因</span><strong>${esc(reasonCounts)}</strong></div>
         <div class="wide"><span>停利停損價位</span><strong>${esc(bracketPolicy)}</strong></div>
       </div></details>
     </article>`;
@@ -514,7 +775,7 @@ function renderOperations(data) {
     ["最新瓶頸", noLatency ? "—" : latestBottleneck, noLatency ? "等待實測" : latencyValue(latency.latest_bottleneck_ms)],
   ].map(([label, value, note]) => `<div class="latency-kpi"><span>${esc(label)}</span><strong>${esc(value)}</strong><small>${esc(note)}</small></div>`).join("");
   $("operation-kpis").innerHTML = [
-    ["所選日策略執行", `${number(execution.executed_count || 0)}/${number(execution.mode_count || data.modes.length || 0)} 完成`, execution.all_executed ? "全部策略均已進入所選日執行流程" : `${number(execution.blocked_count || 0)} 個被安全阻擋；解除後立即補跑`, execution.all_executed ? "good" : "bad"],
+    ["所選日流程／成交", `${number(execution.executed_count || 0)} 已處理 · ${number(execution.filled_mode_count || 0)} 完整成交`, `${number(execution.partial_mode_count || 0)} 部分、${number(execution.zero_fill_mode_count || 0)} 零成交、${number(execution.no_order_mode_count || 0)} 無合法委託、${number(execution.failed_mode_count || 0)} 阻擋`, execution.all_modes_filled ? "good" : "bad"],
     ["盤前預熱", `${readyModes}/${totalModes || 0} 模型 READY`, `模擬執行 ${simulationWarm.status || "pending"}`, warmKind],
     ["目前階段", session.label || "—", `下一步 ${session.next_milestone_label || "—"} · ${countdown(session.next_milestone_at)}`, phaseKind],
     ["帳本心跳", `${sourceNumber(data.source_age_seconds)} 秒`, `目標每 ${number(session.decision_interval_seconds || 60)} 秒`, heartbeatKind],
@@ -548,9 +809,9 @@ function renderOperations(data) {
     const armed = row.final_arm_status === "ready" && row.final_arm_panel_cache_hit === true && row.final_arm_checkpoint_cache_hit === true && row.final_arm_model_cache_hit === true;
     const armText = armed
       ? `09:00 HOT READY ${shortTime(row.final_arm_completed_at)} · ${duration(row.final_arm_elapsed_seconds)} · ${number(row.final_arm_attempts || 1)} 次驗證`
-      : row.final_arm_error || "08:55 最後武裝待驗證";
+      : row.final_arm_public_error_message || row.final_arm_error || "08:55 最後武裝待驗證";
     const measuredDetail = `${duration(row.elapsed_seconds)} · ${speed} · ${inference} · ${limits} · ${eligibility} · ${armText}${eta == null ? "" : ` · ETA ${duration(eta)}`}`;
-    const detail = row.error || (status === "running" && row.message) || measuredDetail;
+    const detail = row.public_error_message || row.error || (status === "running" && row.message) || measuredDetail;
     return `<div class="progress-row">
       <div class="progress-title"><strong>${esc(row.label || row.market)}</strong>${badge(stepText, kind)}</div>
       ${progress(row.progress_ratio, kind)}
@@ -562,7 +823,7 @@ function renderOperations(data) {
     `當日資格 ${simulationEligibilityWarm.status || "pending"}`,
     `Shioaji usage 探測 ${simulationQuoteWarm.status || "pending"}`,
     simulationQuoteWarm.checked_at ? shortTime(simulationQuoteWarm.checked_at) : "尚未驗證",
-    simulationQuoteWarm.error || simulationEligibilityWarm.error || "執行器與模型為獨立連線，兩者都必須 READY",
+    simulationQuoteWarm.public_error_message || simulationEligibilityWarm.public_error_message || simulationQuoteWarm.error || simulationEligibilityWarm.error || "執行器與模型為獨立連線，兩者都必須 READY",
   ].join(" · ");
   const simulationHtml = `<div class="progress-row">
     <div class="progress-title"><strong>模擬執行器盤前守門</strong>${badge(String(simulationWarm.status || "pending").toUpperCase(), simulationKind)}</div>
@@ -571,6 +832,163 @@ function renderOperations(data) {
   </div>`;
   $("preopen-progress").innerHTML = modelPreopenHtml + simulationHtml;
   $("operation-source").textContent = warm.updated_at ? `預熱狀態 ${shortTime(warm.updated_at)}` : "預熱狀態尚未建立";
+}
+
+function renderTwPublicMonitor(payload) {
+  const root = $("tw-public-monitor-list");
+  const summary = $("tw-public-monitor-summary");
+  const fetchState = $("tw-public-monitor-fetch-state");
+  if (!root || !summary) return;
+
+  const rows = twPublicRowsSource(payload)
+    .filter((row) => row?.parent_id === "group:tw-public");
+  if (!rows.length) {
+    root.innerHTML = `<div class="tw-public-empty">尚未取到台股官方公開資料來源明細。請確認 /data-monitor 是否有載入完成。</div>`;
+    summary.textContent = "0 / 0 來源可顯示";
+    if (fetchState) fetchState.textContent = "無法顯示來源；請稍後重試";
+    return;
+  }
+
+  const prepared = rows
+    .map((row) => {
+      const state = twPublicProgress(row);
+      const publication = twPublicPublicationTime(row);
+      const automation = row.automation || {};
+      const nextRun = row.publication
+        ? (row.publication.next_check_at_utc || row.publication.next_acquisition_at_utc)
+        : null;
+      return {
+        row,
+        state,
+        publication,
+        automation,
+        coverageText: twPublicCoverageText(row.coverage),
+        availabilityText: twPublicAvailabilityText(row.availability),
+        rowValueText: twPublicRowsValueText(row),
+        nextRun,
+        schedule: String((row.publication && row.publication.schedule_label) || "—"),
+      };
+    })
+    .sort((left, right) => {
+      const leftStatus = String(left.row.status || "");
+      const rightStatus = String(right.row.status || "");
+      const statusWeight = {current: 0, complete: 0, streaming: 1, stale: 2, waiting: 3, degraded: 4, updating: 5, unavailable: 6, blocked: 7};
+      const weightLeft = statusWeight[leftStatus] ?? 9;
+      const weightRight = statusWeight[rightStatus] ?? 9;
+      if (weightLeft !== weightRight) return weightLeft - weightRight;
+      const leftTitle = String(left.row.title || "");
+      const rightTitle = String(right.row.title || "");
+      return leftTitle.localeCompare(rightTitle, "zh-Hant");
+    });
+
+  const completed = prepared.filter((item) => item.state.complete).length;
+  summary.textContent = `${number(completed)} / ${number(prepared.length)} 來源完成（含預備下一日）`;
+  if (fetchState) {
+    const generated = payload.generated_at_utc ? shortDateTime(payload.generated_at_utc) : "—";
+    const fetchText = twPublicMonitorLastFetchMs == null
+      ? "—"
+      : `${number(twPublicMonitorLastFetchMs, 1)} ms`;
+    fetchState.textContent = `資料鏡像 ${generated} · 輪詢 ${fetchText}`;
+  }
+
+  root.innerHTML = prepared.map((item) => {
+    const row = item.row;
+    const state = item.state;
+    const ratio = state.ratio;
+    const warnings = Array.isArray(row.warnings) ? row.warnings.filter(Boolean).map((line) => String(line)).filter(Boolean) : [];
+    const warningText = warnings.length ? `注意：${warnings.join("；")}` : "無警報";
+    const detailText = [row.detail || "—", row.category ? `類別：${row.category}` : "", row.scope ? `範疇：${row.scope}` : ""].filter(Boolean).join(" · ");
+    const progressHtml = ratio == null
+      ? `
+        <div class="tw-public-progress-meta">取得進度：分母未提供</div>
+        <progress class="progress-track ${esc(state.kind)}" max="100" value="0" aria-label="無法計算分母"></progress>
+        <small>${esc(state.label)}</small>`
+      : `
+        <div class="tw-public-progress-meta">${esc(twPublicCompletionHint(state))}</div>
+        ${progress(ratio, state.kind)}
+        <small>${(ratio * 100).toFixed(ratio < 0.1 ? 2 : 1)}% · ${number(state.current)} / ${number(state.total)} ${esc(state.unit)}</small>`;
+    const freshness = row.freshness && Number.isFinite(Number(row.freshness.age_seconds))
+      ? `${number(Number(row.freshness.age_seconds))} 秒前更新`
+      : "時效不明";
+    const completionBadge = state.complete ? badge("完成", "good") : badge("進行中", "warn");
+    const publicationTime = item.publication.label;
+    const publicationBasis = item.publication.basis;
+    const nextText = item.nextRun
+      ? `下次檢查 ${shortDateTime(item.nextRun)}`
+      : "下次檢查待定";
+    return `<article class="tw-public-source-card">
+      <header>
+        <div>
+          <h3>${esc(row.title || row.id)}</h3>
+          <small>${esc(row.provider || "—")} · ${esc(row.cadence || "—")} · ${esc(item.schedule)}</small>
+        </div>
+        ${completionBadge}
+      </header>
+      <div class="tw-public-source-status">${esc(row.status_label || row.status || "未知")}</div>
+        <div class="tw-public-meta">更新時間：${esc(publicationTime)}（${state.firstDataObserved ? "有首筆" : "未見首筆"}）${item.publication.exact ? " · 官方有明確時點" : " · 時點待測"}</div>
+        <div class="tw-public-meta">官方觀測：${esc(item.publication.observedLabel)} / 套用：${esc(item.publication.value ? shortDateTime(item.publication.value) : "—")} / last_checked：${esc(item.publication.checkedLabel)}</div>
+        <div class="tw-public-meta">證據依據：${esc(publicationBasis || "—")}；稽核：${esc(item.coverageText)}；資料筆數：${esc(item.rowValueText)}；可用：${esc(item.availabilityText)}</div>
+        <div class="tw-public-meta">排程：${esc(twPublicAutomationText(item.automation, row.cadence))}；${esc(nextText)}；${esc(twPublicExecutionLabel(row, {state: row.execution_state, operation: row.operation_state}))}</div>
+        <div class="tw-public-meta">下一資料日：${esc(state.preparingForDate || state.dataThrough || "—")} · ${esc(state.basis || "—")}</div>
+        <div class="tw-public-meta">來源描述：${esc(detailText)}；${esc(warningText)}</div>
+        <div class="tw-public-progress">${progressHtml}</div>
+        <small class="tw-public-footer">freshness：${esc(freshness)}；最後官方/系統檢核：${esc(item.row.last_verified_at_utc || row.latest_at_utc || "—")}</small>
+        <small class="tw-public-footer">資料截止：${esc(item.row.data_through || "—")}；最新快照：${shortTime(row.latest_at_utc)}</small>
+    </article>`;
+  }).join("");
+}
+
+async function loadTwPublicMonitorWithFallback(controller) {
+  const failures = [];
+  for (const candidate of DATA_MONITOR_STATUS_PATHS) {
+    try {
+      const response = await fetchWithTimeout(candidate, {
+        cache: "no-store",
+        signal: controller.signal,
+      });
+      if (!response.ok) {
+        failures.push(`${candidate}: HTTP ${response.status}`);
+        continue;
+      }
+      const payload = await response.json();
+      if (payload == null || typeof payload !== "object") {
+        failures.push(`${candidate}: 回傳資料異常`);
+        continue;
+      }
+      return payload;
+    } catch (error) {
+      if (error?.name === "AbortError") throw error;
+      failures.push(`${candidate}: ${error}`);
+      continue;
+    }
+  }
+  throw new Error(`資料監控端點全部失敗（${failures.join("；")}）`);
+}
+
+async function loadTwPublicMonitor() {
+  if (document.hidden) return;
+  if (twPublicMonitorRefreshInFlight) return;
+  twPublicMonitorRefreshInFlight = true;
+  if (twPublicMonitorAbortController) twPublicMonitorAbortController.abort();
+  const controller = new AbortController();
+  twPublicMonitorAbortController = controller;
+  const started = performance.now();
+  try {
+    const payload = await loadTwPublicMonitorWithFallback(controller);
+    twPublicMonitorData = payload;
+    twPublicMonitorLastFetchMs = performance.now() - started;
+    twPublicMonitorLastUpdated = payload.generated_at_utc || null;
+    renderTwPublicMonitor(payload);
+  } catch (error) {
+    if (error?.name === "AbortError") return;
+    const root = $("tw-public-monitor-list");
+    if (root) root.innerHTML = `<div class="tw-public-empty">台股公開資料取得狀態讀取失敗：${esc(error)}</div>`;
+    const summary = $("tw-public-monitor-summary");
+    if (summary) summary.textContent = "讀取失敗";
+  } finally {
+    if (twPublicMonitorAbortController === controller) twPublicMonitorAbortController = null;
+    twPublicMonitorRefreshInFlight = false;
+  }
 }
 
 function renderChart(data) {
@@ -650,13 +1068,19 @@ function renderChart(data) {
     const color = COLORS[item.index % COLORS.length];
     const path = item.valid.map((row, i) => `${i ? "L" : "M"}${x(row.minute).toFixed(1)},${y(row.return_pct).toFixed(1)}`).join(" ");
     html += `<path class="chart-line" stroke="${color}" d="${path}"></path>`;
-    for (const row of item.valid.filter((value) => value.valuation_stale)) html += `<circle class="stale-dot" cx="${x(row.minute)}" cy="${y(row.return_pct)}" r="3"></circle>`;
+    for (const row of item.valid.filter((value) => value.valuation_stale && (!value.historical_minute_replay || Number(value.missing_price_position_count || 0) > 0))) html += `<circle class="stale-dot" cx="${x(row.minute)}" cy="${y(row.return_pct)}" r="3"></circle>`;
   });
   svg.innerHTML = html;
   const start = new Date(times[0]).toLocaleString("zh-TW", {timeZone:"Asia/Taipei", hour12:false});
   const end = new Date(times.at(-1)).toLocaleString("zh-TW", {timeZone:"Asia/Taipei", hour12:false});
   const sampled = chartHistory?.downsampled ? `；已保留端點與區間極值縮圖（原 ${number(chartHistory.raw_points_in_range)} 點）` : "";
-  $("equity-range-note").textContent = `${chartWindowLabel()} · ${start} ～ ${end} · 顯示 ${number(points.length)} 點、${number(visibleSeries.length)}/${number(series.length)} 條線；全體無資料的時間已壓縮${sampled}`;
+  const replayPoints = Number(chartHistory?.historical_minute_replay_points || 0);
+  const replayMean = Number(chartHistory?.historical_minute_mean_fresh_trade_notional_coverage_ratio);
+  const replayMissing = Number(chartHistory?.historical_minute_missing_price_points || 0);
+  const replayQuality = replayPoints
+    ? `；歷史分鐘 ${number(replayPoints)} 點，平均新成交名目覆蓋 ${Number.isFinite(replayMean) ? `${sourceNumber(replayMean * 100)}%` : "—"}，缺價 ${number(replayMissing)} 點（其餘無成交分鐘延用上一筆）`
+    : "";
+  $("equity-range-note").textContent = `${chartWindowLabel()} · ${start} ～ ${end} · 顯示 ${number(points.length)} 點、${number(visibleSeries.length)}/${number(series.length)} 條線；全體無資料的時間已壓縮${sampled}${replayQuality}`;
 }
 
 function syncChartRangeControl() {
@@ -713,6 +1137,7 @@ async function loadChartHistory({preferCache = false} = {}) {
 
 function renderPositions(data) {
   const rows = positionRows;
+  $("position-body").setAttribute("aria-busy", String(positionLoading));
   $("position-count").textContent = positionLoadError
     ? `${rows.length} / ${positionTotal} 筆 · 等待重試`
     : `${rows.length} / ${positionTotal} 筆`;
@@ -738,6 +1163,8 @@ function renderPositions(data) {
 }
 
 function renderSignals() {
+  syncFeaturePanelSelection();
+  $("signal-body").setAttribute("aria-busy", String(signalLoading));
   $("signal-count").textContent = signalLoadError
     ? `${signalRows.length} / ${signalTotal} 筆 · 等待重試`
     : `${signalRows.length} / ${signalTotal} 筆`;
@@ -746,14 +1173,12 @@ function renderSignals() {
   loadMore.disabled = signalLoading;
   loadMore.textContent = signalLoading ? "載入中…" : "載入更多";
   const target = signalDirectionSummary.target || {};
-  const preBalance = signalDirectionSummary.pre_balance || {};
   const actual = signalDirectionSummary.actual || {};
   const positionMap = new Map(positionRows.map((row) => [`${row.session_date}\u0000${row.market}\u0000${row.symbol}`, row]));
   const modeMap = new Map((snapshot?.modes || []).map((mode) => [mode.market, mode]));
   const directionHtml = [
     ["區間訊號目標", target],
-    ["整張／深度後", preBalance],
-    ["方向平衡後", actual],
+    ["資格／整張／深度後實際成交", actual],
   ].map(([label, row]) => `<div><span>${esc(label)}</span><strong>${esc(directionPair(row))}</strong></div>`).join("");
   const openingAuditHtml = Object.entries(signalOpeningExecutionAudit).map(([market, row]) => {
     const missing = Number(row.opening_price_missing_count || 0);
@@ -786,11 +1211,12 @@ function renderSignals() {
     const eligibility = row.day_trade_eligible
       ? badge(row.sell_first_allowed ? "可雙向" : "僅買先", row.sell_first_allowed ? "good" : "warn")
       : badge("不可當沖", "bad");
-    const result = badge(row.status, row.status === "ready" ? "good" : ["partial_depth", "partial_directional_mix"].includes(row.status) ? "warn" : row.status === "hold" ? "" : "bad");
-    return `<tr>
+    const result = badge(row.status, row.status === "ready" ? "good" : row.status === "partial_depth" ? "warn" : row.status === "hold" ? "" : "bad");
+    const selected = signalRowKey(row) === featurePanelSignalKey ? " is-selected" : "";
+    return `<tr data-signal-key="${esc(signalRowKey(row))}" class="signal-row${selected}">
       <td><strong>${esc(row.market)}</strong><small>${esc(row.session_date)} · ${shortTime(row.signal_at)}</small></td>
       <td><strong>${esc(row.symbol)}</strong> ${badge(row.side, row.side === "long" ? "good" : row.side === "short" ? "bad" : "")}<small>${esc(row.name || "")}</small><small>${eligibility} ${result}</small></td>
-	    <td><strong>${sourceNumber(row.raw_score ?? row.score)}</strong><small>權重 ${pct(row.target_weight)}</small><small>${esc(row.reason || "")}</small></td>
+	    <td><strong>${sourceNumber(row.raw_score ?? row.score)}</strong><small>持倉目標 ${pct(row.target_weight)}</small><small>${esc(row.reason || "")}</small></td>
 	    <td>${hasTarget ? `<strong class="${openingPrice == null ? "negative" : ""}">開盤計價 ${money(openingPrice)}</strong>` : `<strong>零權重・不下單</strong>`}<small>${hasFill ? `市價成交 ${money(executionPrice)} · 名目 ${money(entryNotional)}` : hasTarget ? `未成交・${esc(row.reason || row.status || "受限")}` : "不需開盤計價"}</small><small>成交 ${number(row.filled_shares)}／${number(row.requested_shares)} 股 · L1 ${number(row.top_book_capacity_shares)}</small></td>
 	    <td><strong>${currentLabel} ${hasPosition ? money(currentPrice) : "—"}</strong><small>${hasPosition ? shortTime(currentAt) : `訊號時 bid／ask ${sourceNumber(row.bid)}／${sourceNumber(row.ask)}`}</small><small class="${pnlClass(positionPnl?.total)}">該檔盈虧 ${hasPosition ? money(positionPnl.total) : "不計盈虧"}</small></td>
 	    <td><strong class="${pnlClass(positionPnl?.total)}">佔該模式總權益 ${equityImpactPct == null ? "—" : `${equityImpactPct >= 0 ? "+" : ""}${displayPct(equityImpactPct)}`}</strong><small>模式總權益 ${Number.isFinite(modeTotalEquity) ? summaryMoney(modeTotalEquity) : "—"}</small><small>${hasPosition ? (position.valuation_stale ? badge("估值延用", "warn") : badge("估值新鮮", "good")) : "未成交不納入"}</small></td>
@@ -799,7 +1225,54 @@ function renderSignals() {
   $("signal-body").innerHTML = errorRow + (rowHtml || `<tr><td colspan="6">目前沒有符合篩選的訊號</td></tr>`);
 }
 
+function renderSignalFeaturePanel() {
+  const panel = $("signal-feature-panel");
+  const body = $("signal-feature-body");
+  const scope = $("signal-feature-scope");
+  const empty = $("signal-feature-empty");
+  if (!panel || !body || !scope || !empty) return;
+
+  const row = selectedSignalRow();
+  if (!row) {
+    panel.classList.add("empty");
+    body.innerHTML = "";
+    scope.textContent = featureDriversSummaryText();
+    empty.classList.remove("hidden");
+    empty.textContent = "請點選「所有訊號」中的一列，載入該筆完整 feature 資料。";
+    return;
+  }
+
+  const drivers = resolveSignalFeatureDrivers(row);
+  if (!drivers.length) {
+    panel.classList.add("empty");
+    body.innerHTML = "";
+    scope.textContent = `${featureDriversSummaryText()}（${esc(row.market)} ${esc(row.symbol)} ${esc(row.session_date)} 無可對應特徵）`;
+    empty.classList.remove("hidden");
+    empty.textContent = "本筆訊號尚未讀到 summary，請稍後重整。";
+    return;
+  }
+
+  panel.classList.remove("empty");
+  const columns = sortedFeatureColumns(drivers);
+  scope.textContent = `${row.session_date} ${row.market} ${row.symbol} · 共 ${drivers.length} 個 feature，欄位 ${columns.length} 欄`;
+  const featureRows = drivers
+    .map((driver, index) => {
+      const cells = [
+        `<td>${index + 1}</td>`,
+        ...columns.map((key) => `<td>${esc(formatFeatureValue(driver ? driver[key] : "—"))}</td>`),
+      ];
+      return `<tr>${cells.join("")}</tr>`;
+    })
+    .join("");
+  const head = ["#", ...columns].map((column) => `<th>${esc(column === "feature" ? "Feature" : column)}</th>`).join("");
+  body.innerHTML = `<div class="feature-table-scroll"><table class="compact-table feature-table">
+    <thead><tr>${head}</tr></thead>
+    <tbody>${featureRows}</tbody></table></div>`;
+  empty.classList.add("hidden");
+}
+
 function renderEvents() {
+  $("event-body").setAttribute("aria-busy", String(eventLoading));
   $("event-count").textContent = eventLoadError
     ? `${number(eventRows.length)} / ${number(eventTotal)} 筆 · 等待重試`
     : `${number(eventRows.length)} / ${number(eventTotal)} 筆（委託 ${number(eventOrderTotal)}／成交 ${number(eventFillTotal)}）`;
@@ -862,8 +1335,10 @@ function render({heavy = true} = {}) {
   renderBenchmarks(snapshot);
   renderChart(snapshot);
   renderPositions(snapshot);
+  renderSignals();
   renderEvents();
   renderAudit(snapshot);
+  renderSignalFeaturePanel();
 }
 
 function hydrateDefaultPositions(data) {
@@ -880,13 +1355,16 @@ function hydrateDefaultPositions(data) {
   return true;
 }
 
-async function loadSignals({append = false} = {}) {
+async function loadSignals({append = false, force = false} = {}) {
   if (!snapshot) return;
   if (signalAbortController) signalAbortController.abort();
   signalAbortController = new AbortController();
   const controller = signalAbortController;
   const sequence = ++signalRequestSequence;
   const requestRange = detailRangeKey();
+  if (force) {
+    signalLoadError = "";
+  }
   const params = new URLSearchParams({
     start_date: selectedDetailStartDate(),
     end_date: selectedDetailEndDate(),
@@ -897,20 +1375,28 @@ async function loadSignals({append = false} = {}) {
     limit: String(SIGNAL_PAGE_SIZE),
   });
   signalLoading = true;
-  renderSignals();
+  beginSilentTableUpdate("signal-body", "load-more-signals", append);
   try {
     const response = await fetchWithTimeout(`api/signals?${params.toString()}`, {cache: "no-store", signal: controller.signal});
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const page = await response.json();
     if (sequence !== signalRequestSequence) return;
     if (requestRange !== detailRangeKey()) return;
+    featurePanelScopeText = page.feature_drivers_scope
+      ? `訊號頁面欄位 ${String(page.feature_drivers_scope)}`
+      : "訊號頁面欄位 all_feature_drivers_if_available_else_top_feature_drivers";
     signalLoadError = "";
     signalRows = append ? signalRows.concat(page.rows || []) : (page.rows || []);
+    signalRows.sort(compareByAbsoluteWeight);
     signalTotal = Number(page.total || 0);
     signalHasMore = Boolean(page.has_more);
     signalRecordCount = Number(page.record_count || 0);
     signalDirectionSummary = page.direction_summary || {};
     signalOpeningExecutionAudit = page.opening_execution_audit || {};
+    const incomingDrivers = page.feature_drivers_by_signal || {};
+    signalFeatureDrivers = append
+      ? {...signalFeatureDrivers, ...incomingDrivers}
+      : incomingDrivers;
   } catch (error) {
     if (sequence !== signalRequestSequence) return;
     if (error?.name === "AbortError") return;
@@ -920,18 +1406,21 @@ async function loadSignals({append = false} = {}) {
     if (sequence === signalRequestSequence) {
       if (signalAbortController === controller) signalAbortController = null;
       signalLoading = false;
+      syncFeaturePanelSelection();
       renderSignals();
+      renderSignalFeaturePanel();
     }
   }
 }
 
-async function loadPositions({append = false} = {}) {
+async function loadPositions({append = false, force = false} = {}) {
   if (!snapshot) return;
   if (positionAbortController) positionAbortController.abort();
   positionAbortController = new AbortController();
   const controller = positionAbortController;
   const sequence = ++positionRequestSequence;
   const requestRange = detailRangeKey();
+  if (!append || force) positionLoadError = "";
   const params = new URLSearchParams({
     start_date: selectedDetailStartDate(),
     end_date: selectedDetailEndDate(),
@@ -942,7 +1431,7 @@ async function loadPositions({append = false} = {}) {
     limit: String(POSITION_PAGE_SIZE),
   });
   positionLoading = true;
-  renderPositions(snapshot);
+  beginSilentTableUpdate("position-body", "load-more-positions", append);
   try {
     const response = await fetchWithTimeout(`api/positions?${params.toString()}`, {cache: "no-store", signal: controller.signal});
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
@@ -963,17 +1452,19 @@ async function loadPositions({append = false} = {}) {
       positionLoading = false;
       renderPositions(snapshot);
       renderSignals();
+      renderSignalFeaturePanel();
     }
   }
 }
 
-async function loadEvents({append = false} = {}) {
+async function loadEvents({append = false, force = false} = {}) {
   if (!snapshot) return;
   if (eventAbortController) eventAbortController.abort();
   eventAbortController = new AbortController();
   const controller = eventAbortController;
   const sequence = ++eventRequestSequence;
   const requestRange = detailRangeKey();
+  if (!append || force) eventLoadError = "";
   const params = new URLSearchParams({
     start_date: selectedDetailStartDate(),
     end_date: selectedDetailEndDate(),
@@ -983,7 +1474,7 @@ async function loadEvents({append = false} = {}) {
     limit: String(EVENT_PAGE_SIZE),
   });
   eventLoading = true;
-  renderEvents();
+  beginSilentTableUpdate("event-body", "load-more-events", append);
   try {
     const response = await fetchWithTimeout(`api/events?${params.toString()}`, {cache: "no-store", signal: controller.signal});
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
@@ -1012,11 +1503,17 @@ async function loadEvents({append = false} = {}) {
   }
 }
 
-async function refresh() {
+async function refresh({force = false} = {}) {
   if (document.hidden) return;
   if (refreshInFlight) {
     refreshQueued = true;
+    refreshForceQueued = refreshForceQueued || force;
     return;
+  }
+  if (force) {
+    if (signalAbortController) signalAbortController.abort();
+    if (positionAbortController) positionAbortController.abort();
+    if (eventAbortController) eventAbortController.abort();
   }
   refreshInFlight = true;
   try {
@@ -1026,6 +1523,18 @@ async function refresh() {
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     snapshot = await response.json();
     lastFetchMs = performance.now() - started;
+    const sourceUpdatedAt = String(snapshot.source_updated_at || "");
+    const sourceHasChanged = sourceUpdatedAt && sourceUpdatedAt !== lastSourceUpdatedAt;
+    if (sourceHasChanged || force) {
+      lastSourceUpdatedAt = sourceUpdatedAt || `${String(Date.now())}`;
+      signalLoadError = "";
+      positionLoadError = "";
+      eventLoadError = "";
+      if (force) {
+        signalRecordCount = null;
+        eventRecordRevision = null;
+      }
+    }
     syncFilters(snapshot);
     const positionsHydrated = hydrateDefaultPositions(snapshot);
     const revision = revisionOf(snapshot);
@@ -1033,41 +1542,40 @@ async function refresh() {
     lastRenderedRevision = revision;
     render({heavy});
     const currentSignalCount = Number((snapshot.record_counts || {}).signals || 0);
-    const detailLoads = positionsHydrated ? [] : [loadPositions()];
-    if (signalRecordCount == null || currentSignalCount !== signalRecordCount) detailLoads.push(loadSignals());
+    const detailLoads = [];
+    const shouldReloadSignals = force || signalRecordCount == null || currentSignalCount !== signalRecordCount;
+    if (shouldReloadSignals) detailLoads.push(loadSignals({force: true}));
     const counts = snapshot.record_counts || {};
     const currentEventRevision = JSON.stringify([detailRangeKey(), Number(counts.orders || 0), Number(counts.fills || 0)]);
-    if (eventRecordRevision == null || currentEventRevision !== eventRecordRevision) detailLoads.push(loadEvents());
+    const shouldReloadEvents = force || eventRecordRevision == null || currentEventRevision !== eventRecordRevision;
+    if (shouldReloadEvents) detailLoads.push(loadEvents({force: true}));
+    const shouldReloadPositions = force || sourceHasChanged || !positionsHydrated;
+    if (shouldReloadPositions) detailLoads.push(loadPositions());
     await Promise.all(detailLoads);
   } catch (error) {
     const alert = $("alert"); alert.classList.remove("hidden"); alert.textContent = `面板讀取失敗：${error}`;
     $("health").textContent = "UNAVAILABLE"; $("health").className = "pill critical";
   } finally {
     refreshInFlight = false;
+    if (!document.hidden) void loadTwPublicMonitor();
     if (refreshQueued) {
+      const queuedForce = refreshForceQueued;
       refreshQueued = false;
-      void refresh();
+      refreshForceQueued = false;
+      void refresh({force: queuedForce});
     }
   }
 }
 
-function renderFilteredDetails({includeChart = false} = {}) {
-  if (!snapshot) return;
-  if (includeChart) renderChart(snapshot);
-  renderPositions(snapshot);
-  renderEvents();
-}
-
 function filtersChanged({debounceSignals = false, includeChart = false, reloadEvents = true} = {}) {
-  if (filterAnimationFrame != null) cancelAnimationFrame(filterAnimationFrame);
-  if (debounceSignals) {
-    filterAnimationFrame = requestAnimationFrame(() => {
-      filterAnimationFrame = null;
-      renderFilteredDetails({includeChart});
-    });
-  } else {
-    renderFilteredDetails({includeChart});
-  }
+  featurePanelSignalKey = "";
+  featurePanelScopeText = "";
+  signalFeatureDrivers = {};
+  if (includeChart && snapshot) renderChart(snapshot);
+  renderSignalFeaturePanel();
+  beginSilentTableUpdate("position-body", "load-more-positions", false);
+  beginSilentTableUpdate("signal-body", "load-more-signals", false);
+  if (reloadEvents) beginSilentTableUpdate("event-body", "load-more-events", false);
   window.clearTimeout(signalFilterTimer);
   if (debounceSignals) signalFilterTimer = window.setTimeout(() => {
     void loadPositions();
@@ -1091,12 +1599,12 @@ function detailDateChanged(event) {
   }
   lastRenderedRevision = null;
   signalRecordCount = null;
-  signalRows = [];
   eventRecordRevision = null;
-  eventRows = [];
-  positionRows = [];
-  positionTotal = 0;
-  positionHasMore = false;
+  featurePanelScopeText = "";
+  featurePanelSignalKey = "";
+  beginSilentTableUpdate("position-body", "load-more-positions", false);
+  beginSilentTableUpdate("signal-body", "load-more-signals", false);
+  beginSilentTableUpdate("event-body", "load-more-events", false);
   if (signalAbortController) signalAbortController.abort();
   if (eventAbortController) eventAbortController.abort();
   if (positionAbortController) positionAbortController.abort();
@@ -1115,6 +1623,15 @@ $("reset-filters").addEventListener("click", () => {
 $("load-more-signals").addEventListener("click", () => loadSignals({append: true}));
 $("load-more-events").addEventListener("click", () => loadEvents({append: true}));
 $("load-more-positions").addEventListener("click", () => loadPositions({append: true}));
+$("signal-body").addEventListener("click", (event) => {
+  const row = event.target.closest("tr[data-signal-key]");
+  if (!row) return;
+  const nextKey = String(row.dataset.signalKey || "");
+  if (!nextKey) return;
+  featurePanelSignalKey = featurePanelSignalKey === nextKey ? "" : nextKey;
+  renderSignals();
+  renderSignalFeaturePanel();
+});
 $("equity-time-range").addEventListener("click", (event) => {
   const button = event.target.closest("button[data-range]");
   if (!button || !(button.dataset.range in TIME_RANGE_LABELS)) return;
@@ -1139,6 +1656,10 @@ function chartDateChanged(event) {
 }
 $("equity-start-date").addEventListener("change", chartDateChanged);
 $("equity-end-date").addEventListener("change", chartDateChanged);
+const forceRefreshButton = $("force-refresh");
+if (forceRefreshButton) {
+  forceRefreshButton.addEventListener("click", () => void refresh({force: true}));
+}
 $("clear-equity-dates").addEventListener("click", () => {
   $("equity-start-date").value = "";
   $("equity-end-date").value = "";
@@ -1155,8 +1676,9 @@ $("chart-legend").addEventListener("click", (event) => {
   if (snapshot) renderChart(snapshot);
 });
 setInterval(() => { $("clock").textContent = new Date().toLocaleString("zh-TW", {timeZone:"Asia/Taipei", hour12:false}); }, 1000);
-document.addEventListener("visibilitychange", () => { if (!document.hidden) { void refresh(); void loadChartHistory(); } });
 syncChartRangeControl();
-void refresh();
-void loadChartHistory();
-window.setInterval(() => { void refresh(); void loadChartHistory(); }, PRICE_REFRESH_MS);
+Dashboard.scheduleRefresh(() => {
+  void refresh();
+  void loadChartHistory();
+}, {intervalMs: PRICE_REFRESH_MS});
+Dashboard.scheduleRefresh(loadTwPublicMonitor, {intervalMs: TW_PUBLIC_STATUS_REFRESH_MS});

@@ -1,6 +1,6 @@
 [Unit]
 Description=Deduplicate stable StockAgent artifacts by exact content
-After=local-fs.target syncthing@root.service stockagent-live-artifact-sync.service
+After=local-fs.target syncthing@root.service stockagent-hot-artifact-sync.service
 ConditionPathIsDirectory=__REPO_ROOT__/artifacts
 
 [Service]

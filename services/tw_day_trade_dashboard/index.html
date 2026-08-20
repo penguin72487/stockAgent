@@ -5,36 +5,29 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="color-scheme" content="dark">
   <meta name="theme-color" content="#071019">
-  <title>台股四模式當沖模擬</title>
-  <link rel="stylesheet" href="styles.css?v=17">
-  <link rel="stylesheet" href="../dashboard-core.css?v=5">
+  <title>台股三模式當沖模擬</title>
+  <link rel="stylesheet" href="styles.css?v=20">
+  <link rel="stylesheet" href="../dashboard-core.css?v=6">
 </head>
 <body>
   <a class="skip-link" href="#main-content">跳到主要內容</a>
   <header class="public-nav">
     <a class="public-brand" href="../">STOCKAGENT</a>
-    <nav aria-label="公開面板導覽">
-      <a href="../">總覽</a>
-      <a href="../taifex/">TAIFEX</a>
-      <a class="active" href="./" aria-current="page">台股當沖</a>
-      <a href="../shioaji/">永豐 API</a>
-      <a href="../openbb/">OpenBB</a>
-      <a href="../data-monitor/">全資料</a>
-      <a href="../traffic/">流量</a>
-    </nav>
+    <nav data-dashboard-nav="tw-day-trade" aria-label="公開面板導覽"></nav>
   </header>
 
-  <header class="topbar">
-    <div>
-      <p class="eyebrow">TW STOCKS · PUBLIC READ-ONLY SIMULATION</p>
-      <h1>台股四模式當沖模擬</h1>
-      <p class="subtitle">先看執行進度與盤前守門，再下鑽到四模式結果、訊號和成交。</p>
-    </div>
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">TW STOCKS · PUBLIC READ-ONLY SIMULATION</p>
+        <h1>台股三模式當沖模擬</h1>
+        <p class="subtitle">先看執行進度與盤前守門，再下鑽到四模式結果、訊號和成交。</p>
+      </div>
     <div id="connection-status" class="healthbox" role="status" aria-live="polite">
       <small>資料狀態</small>
       <span id="health" class="pill">載入中</span>
       <small id="freshness">—</small>
       <strong>僅模擬，絕不送正式單</strong>
+      <button id="force-refresh" class="secondary" type="button">強制重整</button>
     </div>
   </header>
 
@@ -44,6 +37,8 @@
     <a href="#performance">策略與基準</a>
     <a href="#details">持倉與訊號</a>
     <a href="#audit">資料稽核</a>
+    <a href="#tw-public-status">台股官方公開資料</a>
+    <a href="#signal-feature-panel">訊號特徵明細</a>
   </nav>
 
   <main id="main-content">
@@ -111,7 +106,7 @@
 
     <section class="grid-two">
       <article class="panel chart-panel">
-        <div class="panel-head"><div><h2>每分鐘累積報酬率比較（%）</h2><p>每條線都除以自己的資金基準；策略含成本，股票／ETF 基準含配息與分割，並以可成交 ask 進場、bid 清算。點選彩色圓點可隱藏或顯示曲線。</p></div><div id="chart-legend" class="legend" role="group" aria-label="曲線顯示開關"></div></div>
+        <div class="panel-head"><div><h2>每分鐘累積報酬率比較（%）</h2><p>每條線都除以自己的資金基準；即時點使用 bid／ask，歷史回補點使用右標一分鐘最後成交價，無成交分鐘延用上一筆並揭露覆蓋率，絕不線性插值。點選彩色圓點可隱藏或顯示曲線。</p></div><div id="chart-legend" class="legend" role="group" aria-label="曲線顯示開關"></div></div>
         <div id="equity-time-range" class="time-range-control" role="group" aria-label="權益曲線時間範圍"><span>快速區間</span><button type="button" data-range="1h">1 小時</button><button type="button" data-range="1d">1 天</button><button type="button" data-range="1w">1 週</button><button type="button" data-range="1mo">1 月</button><button type="button" data-range="1q">1 季</button><button type="button" data-range="1y">1 年</button><button type="button" data-range="all">全部</button><div class="date-range-picker" role="group" aria-label="自訂起訖日期"><label for="equity-start-date">起始日<input id="equity-start-date" type="date"></label><span aria-hidden="true">到</span><label for="equity-end-date">終止日<input id="equity-end-date" type="date"></label><button id="clear-equity-dates" class="clear-date-range" type="button">清除日期</button></div></div>
         <div id="chart-empty" class="empty hidden">目前尚無分鐘報酬率資料</div>
         <div class="chart-scroll" tabindex="0" aria-label="台股累積報酬曲線，可在窄螢幕水平捲動"><svg id="equity-chart" viewBox="0 0 960 360" role="img" aria-label="每分鐘累積報酬率百分比曲線"></svg></div>
@@ -149,10 +144,10 @@
     </section>
 
     <section class="panel table-panel">
-	      <div class="panel-head"><div><h2>所有訊號</h2><p>依 |目標權重| 由大到小；每個非零訊號都顯示開盤計價，未成交會保留整張、資格、方向平衡等原因，不會偽造成交</p></div><div class="table-actions"><span id="signal-count" class="count"></span><button id="load-more-signals" class="secondary hidden" type="button">載入更多</button></div></div>
+	      <div class="panel-head"><div><h2>所有訊號</h2><p>依 |持倉目標 %| 由大到小；每個非零訊號都顯示開盤計價，未成交會保留整張、資格、方向平衡等原因，不會偽造成交</p></div><div class="table-actions"><span id="signal-count" class="count"></span><button id="load-more-signals" class="secondary hidden" type="button">載入更多</button></div></div>
 	      <div id="signal-direction-summary" class="direction-summary"></div>
 	      <div class="scroll-hint" aria-hidden="true">窄螢幕可左右滑動查看訊號細節 →</div>
-	      <div class="table-scroll" tabindex="0" role="region" aria-label="所有訊號"><table class="compact-table signal-table"><thead><tr><th>時間／模式</th><th>股票／方向／結果</th><th>分數／權重</th><th>開盤計價／市價成交</th><th>現在市價／該檔盈虧</th><th>損益／模式總權益</th></tr></thead><tbody id="signal-body"></tbody></table></div>
+	      <div class="table-scroll" tabindex="0" role="region" aria-label="所有訊號"><table class="compact-table signal-table"><thead><tr><th>時間／模式</th><th>股票／方向／結果</th><th>分數／持倉 %</th><th>開盤計價／市價成交</th><th>現在市價／該檔盈虧</th><th>損益／模式總權益</th></tr></thead><tbody id="signal-body"></tbody></table></div>
     </section>
 
     <div id="audit" class="section-intro">
@@ -169,8 +164,29 @@
         <div id="audit-grid" class="audit-grid"></div>
       </article>
     </section>
+
+    <section id="signal-feature-panel" class="panel table-panel feature-panel">
+      <div class="panel-head">
+        <div><h2>訊號特徵資料</h2><p>點選上方訊號列，顯示該筆訊號對應的全部 feature 名單</p></div>
+        <span id="signal-feature-scope" class="count"></span>
+      </div>
+      <div class="scroll-hint" aria-hidden="true">表格可左右或上下捲動查看 feature</div>
+      <div id="signal-feature-empty" class="feature-empty">請點選「所有訊號」中的一列，載入該筆完整 feature 資料。</div>
+      <div id="signal-feature-body" class="feature-body"></div>
+    </section>
+
+    <div id="tw-public-status" class="section-intro">
+      <div><span>06</span><h2>台股官方公開資料更新進度</h2></div>
+      <p>同頁顯示所有官方公開資料來源的發布時間、進度與完成度；更新完成的資料即可加快下一交易日備料。</p>
+    </div>
+    <section class="panel tw-public-monitor-panel">
+      <div class="panel-head"><div><h2>台股所有官方公開資料來源</h2><p>只列出 tw-public 分類。發布時間與取得進度分開觀測，避免把探測時間誤當官方發布。</p></div><span id="tw-public-monitor-summary" class="count">—</span></div>
+      <div class="tw-public-monitor-kpis"><div id="tw-public-monitor-fetch-state">等待更新</div></div>
+      <div id="tw-public-monitor-list" class="tw-public-monitor-list"><div class="tw-public-empty">資料尚未載入，請稍後重整。</div></div>
+    </section>
   </main>
+  <script src="../dashboard-core.js?v=1" defer></script>
   <script src="../time-axis.js?v=4" defer></script>
-  <script src="app.js?v=30" defer></script>
+  <script src="app.js?v=38" defer></script>
 </body>
 </html>

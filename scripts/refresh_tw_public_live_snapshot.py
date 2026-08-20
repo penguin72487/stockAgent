@@ -268,6 +268,21 @@ def _refresh_same_session_rules(
     observed: datetime,
 ) -> dict[str, object]:
     trading_date = observed.astimezone(TAIPEI).date()
+    try:
+        coverage = require_exact_session_eligibility(
+            rule_data_dir=live_root,
+            parquet_root=live_root / "stocks",
+            trading_date=trading_date,
+        )
+    except RuntimeError:
+        coverage = None
+    if coverage is not None:
+        return {
+            "trading_date": trading_date.isoformat(),
+            "venues": coverage,
+            "refresh_attempted": False,
+            "source": "existing_exact_session_coverage",
+        }
     subprocess.run(
         _same_session_rule_command(
             python=sys.executable,
@@ -285,6 +300,8 @@ def _refresh_same_session_rules(
     return {
         "trading_date": trading_date.isoformat(),
         "venues": coverage,
+        "refresh_attempted": True,
+        "source": "same_session_official_refresh",
     }
 
 

@@ -2413,6 +2413,12 @@ def generate_live_signal(
         target_weights,
         top_n=min(8, max(1, int(top_n))),
     )
+    all_feature_drivers = _feature_driver_summary(
+        panel.feature_names,
+        x_np[-1],
+        target_weights,
+        top_n=max(1, int(len(panel.feature_names))),
+    )
     confidence_proxy = None
     if score_values is not None:
         valid_scores = np.asarray(score_values, dtype=np.float64)[mask_np]
@@ -2663,6 +2669,7 @@ def generate_live_signal(
             "confidence_proxy_score_std": confidence_proxy,
             "top_score_drivers": score_drivers,
             "top_feature_drivers": feature_drivers,
+            "all_feature_drivers": all_feature_drivers,
             "decision_rows": int(len(decision_rows)),
             "actionable_decision_rows": int(len(actionable_decisions)),
             "action_counts": decision_action_counts,

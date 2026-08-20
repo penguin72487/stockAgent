@@ -25,6 +25,28 @@ def _write_json(path: Path, payload: object) -> None:
     path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
 
 
+def test_history_server_projects_recapitalization_curve_fields() -> None:
+    row = dashboard_server._display_history_row(
+        {
+            "strategy_id": "fixture",
+            "decision_ts_ns": 1,
+            "cumulative_contributed_capital_twd": 250_000.0,
+            "capital_contribution_count": 3,
+            "recapitalization_count": 2,
+            "bankruptcy_count": 2,
+            "entry_state": "awaiting_next_trading_date_recapitalization",
+            "alive": False,
+        }
+    )
+
+    assert row["cumulative_contributed_capital_twd"] == 250_000.0
+    assert row["capital_contribution_count"] == 3
+    assert row["recapitalization_count"] == 2
+    assert row["bankruptcy_count"] == 2
+    assert row["entry_state"] == "awaiting_next_trading_date_recapitalization"
+    assert row["alive"] is False
+
+
 def test_history_server_returns_verified_stale_curve_while_refreshing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -249,7 +271,7 @@ def test_dashboard_snapshot_is_bounded_fresh_and_account_safe(tmp_path: Path) ->
         mark_limit_per_strategy=8,
     )
     assert payload["health"] == "active"
-    assert payload["dashboard_schema_version"] == 7
+    assert payload["dashboard_schema_version"] == 8
     assert payload["source_age_seconds"] == 2.0
     assert payload["market"]["book_coverage_ratio"] == 1.0
     assert payload["market"]["strategy_fresh_valuation_coverage_ratio"] == 1.0
@@ -745,8 +767,8 @@ def test_dashboard_html_is_local_and_refreshes_the_read_only_api() -> None:
     assert "秒後自動重試" not in javascript
     assert "const PRICE_REFRESH_MS = 60000" in javascript
     assert "function refreshMinuteSnapshot()" in javascript
-    assert "window.setInterval(refreshMinuteSnapshot, PRICE_REFRESH_MS)" in javascript
-    assert javascript.count("window.setInterval(") == 1
+    assert "Dashboard.scheduleRefresh(refreshMinuteSnapshot, {intervalMs: PRICE_REFRESH_MS})" in javascript
+    assert "window.setInterval(" not in javascript
     assert "const REFRESH_MS = 5000" not in javascript
     assert "row.total_equity_twd" in javascript
     assert "row.total_equity_twd != null" in javascript
@@ -784,7 +806,7 @@ def test_dashboard_html_is_local_and_refreshes_the_read_only_api() -> None:
     assert 'snapshot.health === "degraded"' in javascript
     assert 'href="styles.css?v=14"' in html
     assert 'src="../time-axis.js?v=4"' in html
-    assert 'src="app.js?v=20"' in html
+    assert 'src="app.js?v=22"' in html
     assert "collapseEmptyIntervals: true" in javascript
     assert "全策略皆無資料的區段已略過、不補 0" in javascript
     assert 'id="equity-time-range"' in html
