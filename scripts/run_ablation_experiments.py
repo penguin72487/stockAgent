@@ -525,6 +525,53 @@ def _experiment_rows(spec_path: Path, selected: set[str] | None = None) -> tuple
                 }
             )
 
+    # A child spec often needs to repair one inherited experiment without
+    # copying the entire dimensions list. Lists intentionally replace rather
+    # than deep-merge, so provide a narrow, fail-closed patch surface keyed by
+    # the inherited experiment name. Renaming is important when the effective
+    # config changes: it prevents checkpoints and fold artifacts produced by
+    # the old contract from being resumed under the repaired one.
+    experiment_overrides = matrix.get("experiment_overrides", {})
+    if not isinstance(experiment_overrides, dict):
+        raise ValueError("matrix.experiment_overrides must be a mapping")
+    rows_by_name = {str(row["name"]): row for row in rows}
+    unknown_overrides = sorted(set(experiment_overrides) - set(rows_by_name))
+    if unknown_overrides:
+        raise ValueError(
+            "matrix.experiment_overrides references unknown experiments: "
+            + ", ".join(unknown_overrides)
+        )
+    for inherited_name, patch in experiment_overrides.items():
+        if not isinstance(patch, dict):
+            raise ValueError(
+                "matrix.experiment_overrides entries must be mappings: "
+                f"{inherited_name}"
+            )
+        unsupported = sorted(
+            set(patch) - {"experiment_name", "description", "overrides"}
+        )
+        if unsupported:
+            raise ValueError(
+                f"matrix.experiment_overrides.{inherited_name} has unsupported "
+                f"keys: {', '.join(unsupported)}"
+            )
+        row = rows_by_name[str(inherited_name)]
+        replacement_name = str(
+            patch.get("experiment_name", inherited_name)
+        ).strip()
+        if not _SAFE_NAME.fullmatch(replacement_name):
+            raise ValueError(f"invalid experiment name: {replacement_name!r}")
+        override_patch = patch.get("overrides", {})
+        if not isinstance(override_patch, dict):
+            raise ValueError(
+                "matrix.experiment_overrides."
+                f"{inherited_name}.overrides must be a mapping"
+            )
+        row["name"] = replacement_name
+        row["overrides"] = _deep_merge(row["overrides"], override_patch)
+        if "description" in patch:
+            row["description"] = str(patch["description"]).strip()
+
     seen: set[str] = set()
     for row in rows:
         if row["name"] in seen:
@@ -981,14 +1028,27 @@ def main() -> None:
                         f"same experiment ({cuda_health_detail})",
                         flush=True,
                     )
-                ready_index = next(
-                    (
-                        index
-                        for index, candidate in enumerate(pending)
-                        if float(candidate.get("ready_at", 0.0)) <= now
-                    ),
-                    None,
-                )
+                if parallel_jobs == 1:
+                    # Sequential ablations are experiment-major. If the
+                    # current experiment is backing off before an automatic
+                    # resume, wait for it instead of skipping ahead to a
+                    # sibling experiment. This keeps folds 1..N together and
+                    # gives one experiment exclusive ownership until success
+                    # or terminal failure.
+                    ready_index = (
+                        0
+                        if float(pending[0].get("ready_at", 0.0)) <= now
+                        else None
+                    )
+                else:
+                    ready_index = next(
+                        (
+                            index
+                            for index, candidate in enumerate(pending)
+                            if float(candidate.get("ready_at", 0.0)) <= now
+                        ),
+                        None,
+                    )
                 if ready_index is None:
                     break
                 item = pending.pop(ready_index)
@@ -1159,7 +1219,7 @@ def main() -> None:
                             ),
                             "ready_at": time.monotonic() + retry_delay,
                         }
-                        if infrastructure_wait:
+                        if infrastructure_wait or parallel_jobs == 1:
                             pending.insert(0, retry_item)
                         else:
                             pending.append(retry_item)

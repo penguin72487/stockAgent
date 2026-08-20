@@ -8,7 +8,7 @@ experiment_name: tw-financial-transformer-candles-tw-day-trade-long-only-softmax
 runner:
   # Lookback is part of the sample/checkpoint contract. Keep this root separate
   # from the older lookback-128 day-trade experiment.
-  output_dir: artifacts/markets/tw_public_candles_tw_day_trade_lookback32_long_only_softmax
+  output_dir: artifacts/markets/tw_public_candles_tw_day_trade_lookback32_long_only_softmax_panel_history_v2
   resume: false
 
 data:
@@ -21,7 +21,7 @@ data:
 walk_forward:
   expected_first_year: 2014
   split_start_year: null
-  lookback_context: split_only
+  lookback_context: panel_history
 
 trading:
   execution_mode: tw_day_trade
@@ -39,7 +39,6 @@ training:
     # zero. Softmax over long actions plus an explicit cash action stays
     # differentiable while preserving non-negative holdings and optional cash.
     portfolio_output_mode: signed_softmax
-  # Every validation split owns its complete lookback. The partial 2026 split
-  # has enough rows for 32 sessions but not 128; never borrow 2025 rows merely
-  # to make the latest fold executable.
+  # Every validation/test split owns its first target and may read earlier,
+  # already-observed rows for the causal feature window.
   lookback: 32

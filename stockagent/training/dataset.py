@@ -121,7 +121,7 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
         allow_empty: bool = False,
         include_volume_notional: bool = True,
         execution_mode: str = "naive",
-        lookback_context: str = "split_only",
+        lookback_context: str = "panel_history",
         short_capacity_limit_enabled: bool = True,
         tw_corporate_action_mode: str = "avoid",
         tw_commission_rebate_timing: str = "monthly_15th",

@@ -261,6 +261,49 @@ def test_l1_projection_preserves_cash_inside_ball_and_sparsifies_outside_ball() 
     assert int((outside_projected.abs() <= 1e-7).sum().item()) >= 1
 
 
+def test_l1_projection_active_count_scale_preserves_cash_and_dense_gradient() -> None:
+    logits = torch.tensor(
+        [[0.5, -0.5, 0.5, -0.5], [0.5, -0.5, 9.0, -9.0]],
+        dtype=torch.float64,
+        requires_grad=True,
+    )
+    mask = torch.tensor(
+        [[True, True, True, True], [True, True, False, False]],
+    )
+
+    weights = masked_l1_projection_weights(
+        logits,
+        mask,
+        long_only=False,
+        scale_by_active_count=True,
+    )
+    objective_coefficients = torch.tensor(
+        [[0.2, -0.4, 0.1, 0.3], [0.6, -0.2, 0.0, 0.0]],
+        dtype=torch.float64,
+    )
+    (weights * objective_coefficients).sum().backward()
+
+    torch.testing.assert_close(
+        weights,
+        torch.tensor(
+            [[0.125, -0.125, 0.125, -0.125], [0.25, -0.25, 0.0, 0.0]],
+            dtype=torch.float64,
+        ),
+    )
+    torch.testing.assert_close(
+        weights.abs().sum(dim=1),
+        torch.tensor([0.5, 0.5], dtype=torch.float64),
+    )
+    assert logits.grad is not None
+    torch.testing.assert_close(
+        logits.grad,
+        torch.tensor(
+            [[0.05, -0.10, 0.025, 0.075], [0.30, -0.10, 0.0, 0.0]],
+            dtype=torch.float64,
+        ),
+    )
+
+
 def test_masked_tanh_l1_name_remains_explicit_tanh_l1_helper() -> None:
     logits = torch.tensor([[1.0, -2.0, 0.25]], dtype=torch.float32)
     mask = torch.tensor([[True, True, True]])

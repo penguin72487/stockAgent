@@ -116,6 +116,34 @@ def test_load_config_normalizes_panel_history_lookback_context(tmp_path: Path) -
     assert config.walk_forward.split_start_year == 2014
 
 
+def test_load_config_defaults_every_mode_to_panel_history(tmp_path: Path) -> None:
+    config_path = _write_minimal_config(tmp_path)
+    payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    payload["walk_forward"].pop("lookback_context", None)
+    config_path.write_text(yaml.safe_dump(payload), encoding="utf-8")
+
+    config = load_config(config_path)
+
+    assert config.walk_forward.lookback_context == "panel_history"
+
+
+def test_all_repository_market_and_deployment_configs_use_panel_history() -> None:
+    root = Path(__file__).resolve().parents[1]
+    config_paths = [root / "configs/experiment_baseline.yaml"]
+    config_paths.extend(sorted((root / "configs/markets").glob("*.yaml")))
+    config_paths.extend(sorted((root / "configs/deployments").glob("*.yaml")))
+
+    noncanonical = []
+    for config_path in config_paths:
+        config = load_config(config_path)
+        if config.walk_forward.lookback_context != "panel_history":
+            noncanonical.append(
+                (str(config_path.relative_to(root)), config.walk_forward.lookback_context)
+            )
+
+    assert noncanonical == []
+
+
 def test_panel_start_date_rejects_earlier_split_start_year(tmp_path: Path) -> None:
     config_path = _write_minimal_config(tmp_path)
     payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))

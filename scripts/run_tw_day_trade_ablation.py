@@ -20,8 +20,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_SPEC = REPO_ROOT / "configs/ablations/financial_transformer_tw_day_trade.yaml"
 
 # ``deployment_test_backtest.npz`` is the non-overlapping test ownership
-# interval: this model's first valid in-split lookback row through the row just
-# before the next model's first valid in-split lookback row. It is therefore
+# interval: this model's first eligible target through the row immediately
+# before the next model's first eligible target. It is therefore
 # the primary test surface. The expanding full-future artifact remains a
 # diagnostic only and must never be presented as the canonical test period.
 POSTPROCESS_PLOT_SPECS = (
@@ -29,7 +29,7 @@ POSTPROCESS_PLOT_SPECS = (
     (
         "deployment",
         "test",
-        "Owned test: current-year lookback complete through next-year pre-lookback",
+        "Owned stitched deployment test: new model starts at each year's first target",
     ),
     (
         "test",
@@ -101,6 +101,18 @@ def _single_experiment_concurrency(requested: int) -> int:
     if int(requested) <= 0:
         raise ValueError("parallel_jobs must be positive")
     return 1
+
+
+def _incomplete_fold_markers(root: Path, expected_fold_count: int) -> list[int]:
+    """Return missing durable fold-completion markers for one artifact root."""
+
+    if expected_fold_count <= 0:
+        raise ValueError("expected_fold_count must be positive")
+    return [
+        fold
+        for fold in range(1, expected_fold_count + 1)
+        if not (root / f"fold_{fold:02d}" / "fold_complete.json").is_file()
+    ]
 
 
 def _bar(percent: float, label: str, *, width: int = 36) -> str:
@@ -175,6 +187,34 @@ def _run_checked(command: list[str], *, log=None) -> None:
         raise SystemExit(result.returncode)
 
 
+def _plot_completed_experiments(
+    root: Path,
+    *,
+    baseline_root: Path | None,
+) -> None:
+    """Synchronously refresh every analysis surface before the next run."""
+
+    plotter = str(REPO_ROOT / "scripts/plot_ablation_analysis.py")
+    for split, prefix, scope_label in POSTPROCESS_PLOT_SPECS:
+        command = [
+            sys.executable,
+            plotter,
+            "--root",
+            str(root),
+            "--output-dir",
+            str(root),
+            "--split",
+            split,
+            "--prefix",
+            prefix,
+            "--scope-label",
+            scope_label,
+        ]
+        if baseline_root is not None:
+            command.extend(["--baseline-root", str(baseline_root)])
+        _run_checked(command)
+
+
 def _load_effective_spec(spec_path: Path) -> tuple[dict, list[dict]]:
     """Load the same recursively inherited spec used by the worker runner."""
 
@@ -230,6 +270,17 @@ def main() -> None:
             "baseline_artifact_root does not contain summary.json: "
             f"{baseline_root}"
         )
+    if baseline_root is not None and bool(
+        spec.get("require_complete_baseline_artifact", False)
+    ):
+        missing_baseline_folds = _incomplete_fold_markers(baseline_root, folds)
+        if missing_baseline_folds:
+            missing_text = ",".join(str(fold) for fold in missing_baseline_folds)
+            raise SystemExit(
+                "baseline_artifact_root is incomplete; refusing to launch an "
+                "unpaired ablation. Finish the formal baseline first. "
+                f"missing_fold_complete_markers={missing_text}: {baseline_root}"
+            )
 
     # Generate and validate effective configs without training.
     dry_run = [sys.executable, str(REPO_ROOT / "scripts/run_ablation_experiments.py"),
@@ -275,62 +326,120 @@ def main() -> None:
     # Fail before expensive work if non-CUDA toolchain contracts are not satisfied.
     _run_checked([sys.executable, str(REPO_ROOT / "scripts/check_environment.py"), "--require-cuda", "--strict"])
 
-    command = [sys.executable, str(REPO_ROOT / "scripts/run_ablation_experiments.py"),
-               "--spec", str(spec_path), "--output-root", str(root),
-               "--multi-gpu-strategy", args.multi_gpu_strategy,
-               "--parallel-jobs", str(parallel_jobs), "--auto-resume",
-               "--max-no-progress-retries", str(args.max_no_progress_retries),
-               "--retry-backoff-seconds", str(args.retry_backoff_seconds),
-               "--cuda-health-poll-seconds", str(args.cuda_health_poll_seconds),
-               "--stop-on-fail"]
+    worker_base = [
+        sys.executable,
+        str(REPO_ROOT / "scripts/run_ablation_experiments.py"),
+        "--spec",
+        str(spec_path),
+        "--output-root",
+        str(root),
+        "--multi-gpu-strategy",
+        args.multi_gpu_strategy,
+        "--parallel-jobs",
+        str(parallel_jobs),
+        "--auto-resume",
+        "--max-no-progress-retries",
+        str(args.max_no_progress_retries),
+        "--retry-backoff-seconds",
+        str(args.retry_backoff_seconds),
+        "--cuda-health-poll-seconds",
+        str(args.cuda_health_poll_seconds),
+        "--stop-on-fail",
+    ]
     log_path = root / "ablation_run.log"
     started = time.monotonic()
-    with log_path.open("a", encoding="utf-8", buffering=1) as log:
-        process = subprocess.Popen(command, cwd=REPO_ROOT, stdout=log, stderr=subprocess.STDOUT,
-                                   start_new_session=True, text=True)
-        try:
-            while process.poll() is None:
-                percent, label = _progress(root, names, folds, epochs)
-                elapsed = time.monotonic() - started
-                eta = elapsed * (100.0 - percent) / percent if percent > 0 else math.inf
-                eta_text = f"ETA {eta / 3600:.1f}h" if math.isfinite(eta) else "ETA warming up"
-                print("\r" + _bar(percent, f"{label} | {eta_text}"), end="", flush=True)
-                time.sleep(max(.5, args.poll_seconds))
-        except KeyboardInterrupt:
+    generated_any_plots = False
+    for experiment_index, name in enumerate(names, start=1):
+        missing_before = _incomplete_fold_markers(root / name, folds)
+        command = [*worker_base, "--only", name]
+        print(
+            f"[ablation] experiment {experiment_index}/{len(names)}: {name}",
+            flush=True,
+        )
+        with log_path.open("a", encoding="utf-8", buffering=1) as log:
+            process = subprocess.Popen(
+                command,
+                cwd=REPO_ROOT,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                text=True,
+            )
+            try:
+                while process.poll() is None:
+                    percent, label = _progress(root, names, folds, epochs)
+                    elapsed = time.monotonic() - started
+                    eta = (
+                        elapsed * (100.0 - percent) / percent
+                        if percent > 0
+                        else math.inf
+                    )
+                    eta_text = (
+                        f"ETA {eta / 3600:.1f}h"
+                        if math.isfinite(eta)
+                        else "ETA warming up"
+                    )
+                    print(
+                        "\r" + _bar(percent, f"{label} | {eta_text}"),
+                        end="",
+                        flush=True,
+                    )
+                    time.sleep(max(0.5, args.poll_seconds))
+            except KeyboardInterrupt:
+                print(
+                    "\n[ablation] interrupt received; stopping the entire DDP "
+                    "descendant tree...",
+                    flush=True,
+                )
+                _terminate_group(process)
+                raise SystemExit(130)
+            returncode = process.wait()
+        print()
+        if returncode:
+            raise SystemExit(
+                f"ablation failed with exit code {returncode}; inspect {log_path}"
+            )
+
+        missing_after = _incomplete_fold_markers(root / name, folds)
+        if missing_after:
+            missing_text = ",".join(str(fold) for fold in missing_after)
+            raise SystemExit(
+                f"ablation worker exited successfully but {name} is incomplete; "
+                f"missing_fold_complete_markers={missing_text}: {root / name}"
+            )
+        if missing_before:
+            # Plotting is deliberately synchronous: a later experiment may
+            # start only after the just-completed experiment is visible in all
+            # validation, owned-test, and diagnostic analysis surfaces.
+            _plot_completed_experiments(root, baseline_root=baseline_root)
+            generated_any_plots = True
             print(
-                "\n[ablation] interrupt received; stopping the entire DDP "
-                "descendant tree...",
+                f"[ablation] charts refreshed after completed experiment: {name}",
                 flush=True,
             )
-            _terminate_group(process)
-            raise SystemExit(130)
-        returncode = process.wait()
-    print()
-    if returncode:
-        raise SystemExit(f"ablation failed with exit code {returncode}; inspect {log_path}")
 
-    # Validation is the selection surface. The primary test calculation uses
-    # the non-overlapping handoff interval. The expanding full-future exact
-    # whole-lot result is retained under an explicit diagnostic-only prefix.
-    plotter = str(REPO_ROOT / "scripts/plot_ablation_analysis.py")
-    for split, prefix, scope_label in POSTPROCESS_PLOT_SPECS:
-        command = [
+    # Per-experiment worker invocations write a selected-run summary. Rebuild
+    # the root summary from all configured experiments without launching any
+    # training, so the final CSV/JSON retain the complete matrix.
+    _run_checked(
+        [
             sys.executable,
-            plotter,
-            "--root",
+            str(REPO_ROOT / "scripts/run_ablation_experiments.py"),
+            "--spec",
+            str(spec_path),
+            "--output-root",
             str(root),
-            "--output-dir",
-            str(root),
-            "--split",
-            split,
-            "--prefix",
-            prefix,
-            "--scope-label",
-            scope_label,
+            "--multi-gpu-strategy",
+            args.multi_gpu_strategy,
+            "--parallel-jobs",
+            str(parallel_jobs),
+            "--collect-only",
         ]
-        if baseline_root is not None:
-            command.extend(["--baseline-root", str(baseline_root)])
-        _run_checked(command)
+    )
+    if not generated_any_plots:
+        # A fully resumed suite may have no newly trained experiment in this
+        # invocation. Ensure its aggregate outputs still exist and are current.
+        _plot_completed_experiments(root, baseline_root=baseline_root)
     print(_bar(100.0, f"complete | charts and CSVs: {root}"), flush=True)
 
 

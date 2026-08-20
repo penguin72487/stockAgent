@@ -294,7 +294,7 @@ def test_save_fold_output_artifacts_survives_broken_report_pipe(
     assert (tmp_path / "fold_complete.json").is_file()
 
 
-def test_walkforward_refresh_prefers_deployment_artifact_with_legacy_fallback(
+def test_walkforward_refresh_separates_reset_test_and_stitched_deployment(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -333,22 +333,44 @@ def test_walkforward_refresh_prefers_deployment_artifact_with_legacy_fallback(
         test_ic={},
         test_metrics={},
     )
-    captured_dates: list[np.ndarray] = []
+    captured_return_calls: list[tuple[np.ndarray, dict]] = []
+    captured_metric_calls: list[tuple[tuple, dict]] = []
 
     def _capture_dates(dates, *_args, **_kwargs) -> None:
-        captured_dates.append(np.asarray(dates[0]))
+        captured_return_calls.append((np.asarray(dates[0]), dict(_kwargs)))
 
     monkeypatch.setattr(trainer_module, "plot_fold_first_year_returns", _capture_dates)
     monkeypatch.setattr(trainer_module, "plot_fold_first_year_returns_log10", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(trainer_module, "plot_first_year_fold_metric_bars", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        trainer_module,
+        "plot_first_year_fold_metric_bars",
+        lambda *args, **kwargs: captured_metric_calls.append((args, kwargs)),
+    )
     monkeypatch.setattr(trainer_module, "plot_first_year_turnover_concentration", lambda *_args, **_kwargs: None)
 
     trainer_module._refresh_walkforward_artifacts(tmp_path, [result])
-    assert captured_dates[-1][0] == np.datetime64("2025-01-02")
+    assert captured_return_calls[0][0][0] == np.datetime64("2026-01-02")
+    assert captured_return_calls[0][1]["scope_label"] == (
+        "Fold Test First Year (Reset State)"
+    )
+    assert captured_return_calls[1][0][0] == np.datetime64("2025-01-02")
+    assert captured_return_calls[1][1]["scope_label"] == (
+        "Canonical Stitched Walk-Forward Deployment"
+    )
+    assert len(captured_metric_calls) == 2
+    assert captured_metric_calls[0][1]["scope_label"] == (
+        "Fold Test First Year (Reset State)"
+    )
+    assert np.isclose(captured_metric_calls[0][0][1][0][0], 0.01)
+    assert captured_metric_calls[1][1]["scope_label"] == "Owned Stitched Deployment Segment"
+    assert np.isclose(captured_metric_calls[1][0][1][0][0], 0.02)
 
     trainer_module._deployment_backtest_path(fold_dir).unlink()
+    captured_metric_calls.clear()
+    captured_return_calls.clear()
     trainer_module._refresh_walkforward_artifacts(tmp_path, [result])
-    assert captured_dates[-1][0] == np.datetime64("2026-01-02")
+    assert captured_return_calls[-1][0][0] == np.datetime64("2026-01-02")
+    assert len(captured_metric_calls) == 1
 
     empty_deployment = BacktestResult(
         strategy_returns=np.empty((0,), dtype=np.float32),
@@ -366,6 +388,10 @@ def test_walkforward_refresh_prefers_deployment_artifact_with_legacy_fallback(
         tmp_path / "walkforward_first_year_cumulative_returns_log10.png",
         tmp_path / "walkforward_first_year_fold_metrics.png",
         tmp_path / "walkforward_first_year_turnover_concentration.png",
+        tmp_path / "walkforward_stitched_deployment_cumulative_returns.png",
+        tmp_path / "walkforward_stitched_deployment_cumulative_returns_log10.png",
+        tmp_path / "walkforward_stitched_deployment_fold_metrics.png",
+        tmp_path / "walkforward_stitched_deployment_turnover_concentration.png",
     )
     for path in stale_first_year_plots:
         path.write_bytes(b"stale")
