@@ -46,6 +46,7 @@ from stockagent.explainability import (
     write_explanation_outputs,
 )
 from stockagent.models.transformer_base_portfolio import TransformerBasePortfolioModel
+from stockagent.models.financial_transformer import FinancialTransformerModel
 
 
 class _TinyResidualBlock(torch.nn.Module):
@@ -653,6 +654,7 @@ def test_raw_temporal_basis_explainability_has_complete_family_feature_and_kerne
     )
     for filename in (
         "temporal_basis_family_diagnostics.png",
+        "temporal_basis_preference.png",
         "temporal_basis_vectors.png",
         "temporal_basis_feature_scale_heatmap.png",
         "temporal_basis_total_effective_kernel_heatmap.png",
@@ -661,6 +663,104 @@ def test_raw_temporal_basis_explainability_has_complete_family_feature_and_kerne
         assert (output_dir / "plots_paper" / filename).exists()
     assert (output_dir / "paper_tables" / "temporal_basis_family_diagnostics.csv").exists()
     assert (output_dir / "paper_tables" / "temporal_basis_completeness.csv").exists()
+    summary_json = json.loads((output_dir / "summary.json").read_text(encoding="utf-8"))
+    assert summary_json["plot_validation"]["failed"] == 0
+
+
+def test_input_feature_temporal_basis_compares_original_endpoint_with_each_family(
+    tmp_path: Path,
+) -> None:
+    torch.manual_seed(19)
+    rows, lookback, symbols, features = 2, 4, 3, 3
+    model = FinancialTransformerModel(
+        lookback=lookback,
+        num_features=features,
+        num_symbols=symbols,
+        d_model=8,
+        attention_mode="market_token",
+        temporal_layers=1,
+        temporal_heads=2,
+        temporal_ffn_mult=1,
+        cross_heads=2,
+        cross_ffn_mult=1,
+        num_market_tokens=2,
+        market_layers=1,
+        head_hidden_dim=8,
+        head_layers=1,
+        dropout=0.0,
+        input_dropout=0.0,
+        temporal_basis_families=("haar", "dct"),
+        temporal_basis_components=2,
+        temporal_basis_input="input_features",
+        portfolio_output_mode="logits",
+        return_aux=False,
+        return_aux_details=False,
+        allow_dynamic_symbols=True,
+    ).eval()
+    batch = {
+        "x": torch.randn(rows, lookback, symbols, features),
+        "future_log_returns": torch.randn(rows, symbols) * 0.01,
+        "tradable_mask": torch.tensor(
+            [[True, True, True], [True, True, False]],
+            dtype=torch.bool,
+        ),
+    }
+    settings = ExplainabilitySettings(
+        progress_enabled=False,
+        row_chunk_size=1,
+        ig_steps=0,
+        perturb=False,
+        shap_enabled=False,
+        j_lens_enabled=False,
+        regime_analysis=False,
+        umap_enabled=False,
+    )
+    kwargs = {
+        "feature_names": [f"f{index}" for index in range(features)],
+        "symbols": [f"S{index}" for index in range(symbols)],
+        "dates": ["2026-04-01", "2026-04-02"],
+        "settings": settings,
+        "device": torch.device("cpu"),
+    }
+    output = explain_batch(model, batch, **kwargs)
+
+    basis_summary = output["summary"]["temporal_basis"]
+    family = output["frames"]["temporal_basis_family_diagnostics"]
+    completeness = output["frames"]["temporal_basis_completeness"].row(
+        0, named=True
+    )
+    assert basis_summary["input"] == "input_features"
+    assert family.get_column("basis_input").unique().to_list() == ["input_features"]
+    assert family.get_column("family").to_list() == [
+        "original_data_endpoint",
+        "haar",
+        "dct",
+        "all_basis_paths",
+    ]
+    assert {
+        "fusion_marginal_abs_share",
+        "ablation_action_importance_share",
+        "ablation_score_importance_share",
+    }.issubset(family.columns)
+    assert completeness["basis_input"] == "input_features"
+    assert completeness["embedding_reconstruction_max_abs_error"] < 1e-5
+    assert completeness["full_forward_action_max_abs_error"] < 1e-5
+
+    chunked = explain_batch_row_chunked(model, batch, **kwargs)
+    assert chunked["summary"]["temporal_basis"]["chunks_aggregated"] == rows
+    assert len(chunked["frames"]["temporal_basis_family_diagnostics"]) == 4
+
+    output_dir = tmp_path / "input_feature_basis_explainability"
+    write_explanation_outputs(
+        chunked,
+        output_dir,
+        metadata={"model_name": "financial_transformer", "config_lookback": lookback},
+        plot_backend="matplotlib",
+    )
+    assert (output_dir / "plots_paper" / "temporal_basis_preference.png").exists()
+    assert (
+        output_dir / "paper_tables" / "temporal_basis_family_diagnostics.csv"
+    ).exists()
     summary_json = json.loads((output_dir / "summary.json").read_text(encoding="utf-8"))
     assert summary_json["plot_validation"]["failed"] == 0
 

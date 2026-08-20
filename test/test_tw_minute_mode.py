@@ -1975,8 +1975,9 @@ def test_dual_5090_minute_config_is_within_fold_ddp() -> None:
     assert config.training.defer_epoch_curve_plot_until_end is False
     assert (
         config.runner.output_dir
-        == "artifacts/markets/tw_minute_dual_5090_cost_aware_v10"
+        == "artifacts/markets/tw_minute_dual_5090_cost_aware_panel_history_v11"
     )
+    assert config.walk_forward.lookback_context == "panel_history"
     assert (
         config.data.minute_parquet_root
         == "data_tw_minute/research_dataset_developing_v5"

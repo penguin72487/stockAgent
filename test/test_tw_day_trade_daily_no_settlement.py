@@ -103,6 +103,38 @@ def test_daily_multi_basis_config_keeps_same_tplus3_execution_contract() -> None
     assert "multi_basis_tplus2_close_commission20" in multi.runner.output_dir
 
 
+def test_daily_multi_basis_projection_l1_is_a_fresh_formal_market_run() -> None:
+    root = Path(__file__).resolve().parents[1]
+    config = load_config(
+        root
+        / "configs/markets/tw_day_trade_daily_multi_basis_projection_l1_tplus2_close_capital10m.yaml"
+    )
+
+    assert config.training.model_name == "financial_transformer"
+    assert config.training.epochs == 1000
+    assert config.training.lookback == 32
+    assert config.training.batch_size_train == 128
+    assert config.training.batch_size_eval == 128
+    assert config.training.record_epoch_curve is True
+    assert config.training.curve_plot_interval == 1
+    assert config.training.curve_plot_async is True
+    assert config.training.defer_epoch_curve_plot_until_end is False
+    assert config.training.financial_transformer.portfolio_output_mode == "projection_l1"
+    assert config.training.loss_portfolio_activation == "pre_normalized"
+    assert config.trading.portfolio_activation == "pre_normalized"
+    assert config.trading.volume_participation_equity == 10_000_000.0
+    assert config.walk_forward.lookback_context == "panel_history"
+    assert config.runner.resume is True
+    assert config.runner.post_train_infer is False
+    assert "artifacts/markets/" in config.runner.output_dir
+    assert "projection_l1" in config.runner.output_dir
+    assert "panel_history" in config.runner.output_dir
+    basis = config.training.financial_transformer
+    assert basis.temporal_basis_input == "input_features"
+    assert len(basis.temporal_basis_families) == 18
+    assert basis.temporal_basis_components == 4
+
+
 def test_daily_normal_round_trip_uses_open_to_close_return_without_minute_data() -> None:
     result = _run(torch.tensor([[0.10]]), torch.log(torch.tensor([[1.10]])))
     assert torch.allclose(

@@ -22,7 +22,7 @@ walk_forward:
   expected_first_year: 2020
   require_contiguous_years: true
   require_future_test_year: false
-  lookback_context: split_only
+  lookback_context: panel_history
   split_start_year: null
 
 trading:

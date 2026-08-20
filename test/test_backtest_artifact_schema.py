@@ -660,7 +660,7 @@ def test_deployment_artifact_can_render_a_distinct_equity_curve(
     monkeypatch.setattr(
         trainer_module,
         "plot_equity_curve",
-        lambda _result, dates, path: captured.append(
+        lambda _result, dates, path, **_kwargs: captured.append(
             (np.asarray(dates), Path(path))
         ),
     )

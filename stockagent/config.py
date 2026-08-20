@@ -408,6 +408,7 @@ def _validate_tw_futures_portfolio_mode_contract(
     max_volume_participation: object,
     buy_fee_rate: object,
     sell_fee_rate: object,
+    lookback: object,
 ) -> None:
     if execution_mode != "tw_futures_portfolio_day":
         return
@@ -426,6 +427,16 @@ def _validate_tw_futures_portfolio_mode_contract(
         raise ValueError(
             "tw_futures_portfolio_day uses fixed per-contract commission; "
             "buy_fee_rate and sell_fee_rate must both be zero"
+        )
+    from stockagent.data.tw_futures_portfolio_daily import (
+        TAIFEX_FUTURES_PORTFOLIO_MAX_SAFE_LOOKBACK,
+    )
+
+    if int(lookback) > int(TAIFEX_FUTURES_PORTFOLIO_MAX_SAFE_LOOKBACK):
+        raise ValueError(
+            "tw_futures_portfolio_day fixed-slot data supports lookback <= "
+            f"{TAIFEX_FUTURES_PORTFOLIO_MAX_SAFE_LOOKBACK}; got {lookback}. "
+            "A longer lookback requires a new slot-capacity/cooldown contract."
         )
 
 
@@ -786,6 +797,27 @@ def _normalize_string_list(value: Any, *, field_name: str) -> list[str]:
     return items
 
 
+def _normalize_temporal_basis_component_map(
+    value: Any,
+    *,
+    field_name: str,
+) -> dict[str, int]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError(f"{field_name} must be a mapping of family to count")
+    normalized: dict[str, int] = {}
+    for raw_family, raw_count in value.items():
+        family = str(raw_family).strip().lower().replace("-", "_")
+        if not family:
+            raise ValueError(f"{field_name} contains an empty family name")
+        count = int(raw_count)
+        if count < 1:
+            raise ValueError(f"{field_name}.{family} must be positive")
+        normalized[family] = count
+    return normalized
+
+
 def _normalize_optional_positive_int(value: Any, *, field_name: str) -> int | None:
     if value is None:
         return None
@@ -914,11 +946,12 @@ class WalkForwardConfig:
     require_future_test_year: bool = True
     expected_first_year: int | None = None
     require_contiguous_years: bool = False
-    # ``split_only`` requires every feature window to begin inside its owned
-    # train/validation/test split. ``panel_history`` keeps target ownership
-    # unchanged while allowing the window to read older, already-observed panel
-    # rows. This is the causal long-lookback mode.
-    lookback_context: str = "split_only"
+    # Every split owns its targets from its first eligible date.  The default
+    # ``panel_history`` context may read older, already-observed panel rows to
+    # construct that target's causal feature window. ``split_only`` remains a
+    # legacy opt-in for reproducing historical checkpoints that discarded the
+    # first ``lookback - 1`` targets of every split.
+    lookback_context: str = "panel_history"
     # Optional first year that owns train/validation/test targets. Older panel
     # years remain available only as lookback context when requested above.
     split_start_year: int | None = None
@@ -1040,7 +1073,7 @@ class TradingConfig:
     # Physical contract identity and mandatory own-close liquidation live in
     # this receipt-backed table and are never inferred from price jumps.
     tw_futures_portfolio_data_path: str = (
-        "data_tw_futures/taifex_portfolio_daily_v3/continuous_daily.parquet"
+        "data_tw_futures/taifex_portfolio_daily_v4/continuous_daily.parquet"
     )
     # User/account-specific SinoPac network-order fixed commission, TWD per
     # contract per side. Product classification and notional multipliers are
@@ -1258,6 +1291,10 @@ class TransformerBasePortfolioModelConfig:
     temporal_query_mode: str = "full_then_last"
     temporal_basis_families: list[str] = field(default_factory=list)
     temporal_basis_components: int = 8
+    temporal_basis_components_by_family: dict[str, int] = field(
+        default_factory=dict
+    )
+    temporal_basis_novelty_threshold: float = 1e-4
     temporal_basis_input: str = "embedded"
     cross_layers: int = 1
     cross_heads: int = 4
@@ -1294,6 +1331,11 @@ class TransformerBasePortfolioModelConfig:
     # pooling head in the optimizer.
     futures_require_joint_context: bool = False
     center_long_short_logits: bool = True
+    # Optional universe-size-invariant pre-projection scale. When enabled,
+    # projection-L1 consumes score_i / active_count, so score magnitude denotes
+    # average gross conviction and rows can retain cash without depending on S.
+    # Disabled by default for historical checkpoint compatibility.
+    projection_l1_scale_by_active_count: bool = False
     max_full_tokens: int = 4096
     checkpoint_blocks: bool = False
     return_aux: bool = True
@@ -1454,7 +1496,7 @@ class XGBoostModelConfig:
 @dataclass(slots=True)
 class TrainingConfig:
     non_blocking_transfer: bool
-    model_name: str = "mlp"
+    model_name: str = "financial_transformer"
     seed: int = 42
     multi_gpu_strategy: str = "auto"
     ddp_bucket_cap_mb: int = 4
@@ -2237,6 +2279,30 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     transformer_base_portfolio["temporal_basis_components"] = max(
         1, int(transformer_base_portfolio["temporal_basis_components"])
     )
+    transformer_base_portfolio["temporal_basis_components_by_family"] = (
+        _normalize_temporal_basis_component_map(
+            transformer_base_portfolio.get(
+                "temporal_basis_components_by_family"
+            ),
+            field_name=(
+                "training.transformer_base_portfolio."
+                "temporal_basis_components_by_family"
+            ),
+        )
+    )
+    temporal_basis_novelty_threshold = float(
+        transformer_base_portfolio["temporal_basis_novelty_threshold"]
+    )
+    if not math.isfinite(temporal_basis_novelty_threshold) or not (
+        0.0 <= temporal_basis_novelty_threshold < 1.0
+    ):
+        raise ValueError(
+            "training.transformer_base_portfolio."
+            "temporal_basis_novelty_threshold must be finite and in [0, 1)"
+        )
+    transformer_base_portfolio["temporal_basis_novelty_threshold"] = (
+        temporal_basis_novelty_threshold
+    )
     transformer_base_portfolio["temporal_basis_input"] = (
         _normalize_temporal_basis_input(
             transformer_base_portfolio["temporal_basis_input"]
@@ -2271,6 +2337,28 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     )
     financial_transformer["temporal_basis_components"] = max(
         1, int(financial_transformer["temporal_basis_components"])
+    )
+    financial_transformer["temporal_basis_components_by_family"] = (
+        _normalize_temporal_basis_component_map(
+            financial_transformer.get("temporal_basis_components_by_family"),
+            field_name=(
+                "training.financial_transformer."
+                "temporal_basis_components_by_family"
+            ),
+        )
+    )
+    financial_temporal_basis_novelty_threshold = float(
+        financial_transformer["temporal_basis_novelty_threshold"]
+    )
+    if not math.isfinite(financial_temporal_basis_novelty_threshold) or not (
+        0.0 <= financial_temporal_basis_novelty_threshold < 1.0
+    ):
+        raise ValueError(
+            "training.financial_transformer.temporal_basis_novelty_threshold "
+            "must be finite and in [0, 1)"
+        )
+    financial_transformer["temporal_basis_novelty_threshold"] = (
+        financial_temporal_basis_novelty_threshold
     )
     financial_transformer["temporal_basis_input"] = _normalize_temporal_basis_input(
         financial_transformer["temporal_basis_input"]
@@ -2797,6 +2885,7 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         max_volume_participation=trading["max_volume_participation"],
         buy_fee_rate=trading["buy_fee_rate"],
         sell_fee_rate=trading["sell_fee_rate"],
+        lookback=training["lookback"],
     )
     _validate_tw_index_derivatives_day_mode_contract(
         execution_mode=trading["execution_mode"],

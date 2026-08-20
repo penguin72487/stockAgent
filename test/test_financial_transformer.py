@@ -241,14 +241,14 @@ def test_basis_coefficients_are_ordinary_candle_input_features() -> None:
 
     with torch.no_grad():
         fused, aux = encoder(raw_window, candle, collect_aux=True)
-        source = encoder._prepare_source(raw_window, candle)
+        source, basis_source = encoder._prepare_source(raw_window, candle)
         base = candle._base_joint_features(source[:, -1])
         parts = [base]
         for family in encoder.family_names:
             coefficients = torch.einsum(
                 "kl,blsf->bksf",
-                encoder._basis(family, source),
-                source,
+                encoder._basis(family, basis_source),
+                basis_source,
             )
             parts.append(coefficients.permute(0, 2, 1, 3).flatten(start_dim=2))
         explicit_features = torch.cat(parts, dim=-1)
@@ -265,6 +265,99 @@ def test_basis_coefficients_are_ordinary_candle_input_features() -> None:
     )
     assert aux["temporal_basis_input_features"].shape == (2, 7, 50)
     assert aux["temporal_basis_output"].shape == (2, 7, 24)
+
+
+def test_input_feature_basis_excludes_categorical_ids_from_numeric_bases() -> None:
+    device = _device()
+    model = _make_model(
+        lookback=8,
+        temporal_pooling="last",
+        temporal_query_mode="last_only",
+        temporal_basis_families=("haar", "dct"),
+        temporal_basis_components=2,
+        temporal_basis_input="input_features",
+        categorical_feature_indices=[2, 7],
+        categorical_embedding_dim=4,
+        return_aux=False,
+        return_aux_details=False,
+    ).eval()
+    raw_window = torch.randn(2, 8, 7, 10, device=device)
+    raw_window[..., 2] = 3.0
+    raw_window[..., 7] = 5.0
+    changed_categories = raw_window.clone()
+    changed_categories[..., 2] = 9.0
+    changed_categories[..., 7] = 11.0
+    builder = model.temporal_basis_input_feature_builder
+    candle = model.candle_encoder
+    assert builder is not None
+
+    with torch.no_grad():
+        full_source, basis_source = builder._prepare_source(raw_window, candle)
+        changed_full, changed_basis = builder._prepare_source(
+            changed_categories,
+            candle,
+        )
+        base = candle._base_joint_features(full_source[:, -1])
+        changed_base = candle._base_joint_features(changed_full[:, -1])
+        decomposition = model.temporal_basis_input_decomposition_for_explainability(
+            raw_window
+        )
+
+    assert candle.continuous_feature_indices == (0, 1, 3, 4, 5, 6, 8, 9)
+    assert builder.source_dim == 8
+    assert candle.base_joint_input_dim == 16
+    assert candle.extra_continuous_features == 32
+    torch.testing.assert_close(basis_source, changed_basis, rtol=0.0, atol=0.0)
+    assert not torch.equal(base, changed_base)
+    assert decomposition["source"].shape == (2, 8, 7, 8)
+    assert decomposition["continuous_feature_indices"] == (
+        0,
+        1,
+        3,
+        4,
+        5,
+        6,
+        8,
+        9,
+    )
+    assert decomposition["family_kernels"]["haar"].shape[-1] == 8
+
+
+def test_input_feature_basis_explainability_decomposition_reconstructs_endpoint() -> None:
+    device = _device()
+    model = _make_model(
+        lookback=8,
+        temporal_pooling="last",
+        temporal_query_mode="last_only",
+        temporal_basis_families=("haar", "dct"),
+        temporal_basis_components=2,
+        temporal_basis_input="input_features",
+        return_aux=False,
+        return_aux_details=False,
+    ).eval()
+    raw_window = torch.randn(2, 8, 7, 10, device=device)
+
+    with torch.no_grad():
+        decomposition = (
+            model.temporal_basis_input_decomposition_for_explainability(raw_window)
+        )
+
+    torch.testing.assert_close(
+        decomposition["full"],
+        decomposition["production_full"],
+        rtol=1e-5,
+        atol=1e-6,
+    )
+    assert set(decomposition["family_ablated"]) == {"haar", "dct"}
+    assert set(decomposition["family_kernels"]) == {"haar", "dct"}
+    assert decomposition["original_ablated"].shape == (2, 7, 24)
+    assert decomposition["all_basis_ablated"].shape == (2, 7, 24)
+    projection_width = model.candle_encoder.joint_projection.proj.out_features
+    assert decomposition["family_kernels"]["haar"].shape == (
+        projection_width,
+        8,
+        10,
+    )
 
 
 def test_ordinary_basis_input_features_backpropagate_through_shared_projection() -> None:

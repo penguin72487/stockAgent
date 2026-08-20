@@ -13,6 +13,8 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.cm import ScalarMappable
+from matplotlib.colors import BoundaryNorm, ListedColormap
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -65,6 +67,19 @@ RISK_SCATTER_Y_METRICS = (
     ("turnover", "turnover"),
     ("daily_hit_rate", "daily hit rate"),
 )
+
+
+def _fold_color_map(fold_ids: list[int] | tuple[int, ...]) -> dict[int, tuple]:
+    """Map chronological folds to a light-to-dark, perceptually ordered blue."""
+
+    ordered = sorted({int(fold_id) for fold_id in fold_ids})
+    if not ordered:
+        raise ValueError("fold_ids must not be empty")
+    shades = plt.get_cmap("Blues")(np.linspace(0.30, 0.90, len(ordered)))
+    return {
+        fold_id: tuple(float(channel) for channel in shade)
+        for fold_id, shade in zip(ordered, shades, strict=True)
+    }
 
 
 def _years(value: str) -> list[int]:
@@ -519,8 +534,8 @@ def main() -> None:
     }
     risk_axis_label = {
         "val": "validation",
-        "deployment": "test",
-        "test": "full-horizon test",
+        "deployment": "owned stitched deployment test",
+        "test": "full-horizon fold test (reset state)",
     }[args.split]
     all_drawdowns = np.asarray(
         [median_metrics[name]["max_drawdown"] for name in all_names],
@@ -700,6 +715,324 @@ def main() -> None:
         "CAGR",
         output_path=args.output_dir / f"{prefix}_risk_return_medians.png",
     )
+
+    # Preserve fold-level movement instead of collapsing every experiment to a
+    # single median. Each metric gets comparable one-fold views plus one
+    # connected trajectory view. Fold color and marker size both progress in
+    # chronological order so the combined chart remains interpretable without
+    # relying on color alone.
+    fold_ids = [int(row["fold_id"]) for row in baseline_rows]
+    fold_colors = _fold_color_map(fold_ids)
+    fold_sizes = {
+        fold_id: float(size)
+        for fold_id, size in zip(
+            fold_ids,
+            np.linspace(34.0, 92.0, len(fold_ids)),
+            strict=True,
+        )
+    }
+    fold_scatter_root = args.output_dir / f"{prefix}_risk_return_by_fold"
+
+    def padded_limits(
+        values: np.ndarray,
+        *,
+        lower_padding: float,
+        upper_padding: float,
+        reference: float | None = None,
+    ) -> tuple[float, float]:
+        finite = np.asarray(values, dtype=np.float64)
+        finite = finite[np.isfinite(finite)]
+        if not finite.size:
+            raise ValueError("cannot plot a metric without finite observations")
+        span = max(float(np.ptp(finite)), 1e-6)
+        lower = float(np.min(finite) - lower_padding * span)
+        upper = float(np.max(finite) + upper_padding * span)
+        if reference is not None:
+            lower = min(lower, reference)
+            upper = max(upper, reference)
+        return lower, upper
+
+    def annotate_experiment_names(
+        ax: plt.Axes,
+        point_values: dict[str, tuple[float, float]],
+        y_limits: tuple[float, float],
+    ) -> None:
+        x_ranked_names = sorted(
+            point_values,
+            key=lambda name: point_values[name][0],
+        )
+        split_at = (len(x_ranked_names) + 1) // 2
+        side_names = {
+            "left": x_ranked_names[:split_at],
+            "right": x_ranked_names[split_at:],
+        }
+        y_min, y_max = y_limits
+
+        def spread_label_positions(side: str) -> dict[str, float]:
+            side_order = sorted(
+                side_names[side],
+                key=lambda name: point_values[name][1],
+            )
+            if not side_order:
+                return {}
+            positions = np.asarray(
+                [
+                    (point_values[name][1] - y_min) / (y_max - y_min)
+                    for name in side_order
+                ],
+                dtype=np.float64,
+            )
+            low, high = .035, .965
+            positions = np.clip(positions, low, high)
+            minimum_gap = min(
+                .052,
+                (high - low) / max(len(side_order) - 1, 1),
+            )
+            for index in range(1, len(positions)):
+                positions[index] = max(
+                    positions[index],
+                    positions[index - 1] + minimum_gap,
+                )
+            if positions[-1] > high:
+                positions -= positions[-1] - high
+            for index in range(len(positions) - 2, -1, -1):
+                positions[index] = min(
+                    positions[index],
+                    positions[index + 1] - minimum_gap,
+                )
+            if positions[0] < low:
+                positions += low - positions[0]
+            return dict(zip(side_order, positions, strict=True))
+
+        for side, label_x, horizontal_alignment in (
+            ("left", -.035, "right"),
+            ("right", 1.035, "left"),
+        ):
+            positions = spread_label_positions(side)
+            for name in side_names[side]:
+                x_value, y_value = point_values[name]
+                color = ink if name == "baseline" else blue
+                ax.annotate(
+                    display_label(name),
+                    xy=(x_value, y_value),
+                    xycoords="data",
+                    xytext=(label_x, positions[name]),
+                    textcoords="axes fraction",
+                    ha=horizontal_alignment,
+                    va="center",
+                    fontsize=8.0,
+                    fontweight="bold" if name == "baseline" else "normal",
+                    color=color,
+                    annotation_clip=False,
+                    arrowprops={
+                        "arrowstyle": "-",
+                        "color": color,
+                        "alpha": .58,
+                        "linewidth": .7,
+                        "shrinkA": 2,
+                        "shrinkB": 4,
+                    },
+                    zorder=2,
+                )
+
+    drawdown_by_name = {
+        name: metric(runs[name], args.split, "max_drawdown")
+        for name in all_names
+    }
+    all_fold_drawdowns = np.concatenate(list(drawdown_by_name.values()))
+    fold_xlim = padded_limits(
+        all_fold_drawdowns,
+        lower_padding=.055,
+        upper_padding=.09,
+    )
+
+    for y_metric, y_label in RISK_SCATTER_Y_METRICS:
+        y_by_name = {
+            name: metric(runs[name], args.split, y_metric)
+            for name in all_names
+        }
+        reference_value: float | None = None
+        if y_metric in {"cagr", "sharpe", "sortino"}:
+            reference_value = 0.0
+        elif y_metric == "daily_hit_rate":
+            reference_value = 0.5
+        fold_ylim = padded_limits(
+            np.concatenate(list(y_by_name.values())),
+            lower_padding=.075,
+            upper_padding=.09,
+            reference=reference_value,
+        )
+        metric_dir = fold_scatter_root / y_metric
+        metric_dir.mkdir(parents=True, exist_ok=True)
+
+        for fold_index, fold_id in enumerate(fold_ids):
+            point_values = {
+                name: (
+                    float(drawdown_by_name[name][fold_index]),
+                    float(y_by_name[name][fold_index]),
+                )
+                for name in all_names
+            }
+            fig, ax = plt.subplots(figsize=(16, 8.6))
+            fold_color = fold_colors[fold_id]
+            for name in all_names:
+                x_value, y_value = point_values[name]
+                ax.scatter(
+                    x_value,
+                    y_value,
+                    s=104 if name == "baseline" else 74,
+                    marker="D" if name == "baseline" else "o",
+                    color=fold_color,
+                    edgecolor=ink if name == "baseline" else "white",
+                    linewidth=1.5 if name == "baseline" else .8,
+                    zorder=3,
+                )
+            ax.set_xlim(*fold_xlim)
+            ax.set_ylim(*fold_ylim)
+            annotate_experiment_names(ax, point_values, fold_ylim)
+            if reference_value is not None:
+                ax.axhline(reference_value, color=ink, lw=.8)
+            ax.set_xlabel(
+                f"Fold {fold_id} {risk_axis_label} max drawdown "
+                "(less negative is better)"
+            )
+            ax.text(
+                .012,
+                .982,
+                f"Fold {fold_id} {risk_axis_label} {y_label}",
+                transform=ax.transAxes,
+                ha="left",
+                va="top",
+                fontsize=10,
+                color=ink,
+                bbox={"facecolor": "white", "edgecolor": "none", "alpha": .84},
+                zorder=5,
+            )
+            coverage = _row_coverage(baseline_rows[fold_index], args.split)
+            coverage_text = (
+                f"{coverage[1]} to {coverage[2]}; {coverage[0]} sessions; "
+                if coverage[0] != ""
+                else ""
+            )
+            fig.suptitle(
+                f"Fold {fold_id}: {risk_axis_label} max drawdown vs {y_label}",
+                y=.985,
+                fontweight="bold",
+            )
+            fig.text(
+                .5,
+                .95,
+                f"{coverage_text}all {len(all_names)} experiments; "
+                "x/y scales are shared across folds",
+                ha="center",
+                color="#596273",
+            )
+            ax.grid(color=grid, lw=.7)
+            for spine in ("top", "right"):
+                ax.spines[spine].set_visible(False)
+            fig.subplots_adjust(left=.23, right=.77, bottom=.11, top=.89)
+            fig.savefig(
+                metric_dir / f"fold_{fold_id:02d}.png",
+                dpi=180,
+                bbox_inches="tight",
+            )
+            plt.close(fig)
+
+        # One connected path per experiment. The latest fold receives the
+        # darkest/largest point and the direct experiment-name label.
+        fig, ax = plt.subplots(figsize=(17, 9.2))
+        for name in all_names:
+            x_values = drawdown_by_name[name]
+            y_values = y_by_name[name]
+            ax.plot(
+                x_values,
+                y_values,
+                color=ink if name == "baseline" else blue,
+                linewidth=1.45 if name == "baseline" else .75,
+                alpha=.72 if name == "baseline" else .24,
+                zorder=1,
+            )
+            for fold_index, fold_id in enumerate(fold_ids):
+                ax.scatter(
+                    x_values[fold_index],
+                    y_values[fold_index],
+                    s=(
+                        fold_sizes[fold_id] * (1.18 if name == "baseline" else 1.0)
+                    ),
+                    marker="D" if name == "baseline" else "o",
+                    color=fold_colors[fold_id],
+                    edgecolor=ink if name == "baseline" else "white",
+                    linewidth=1.45 if name == "baseline" else .55,
+                    zorder=3,
+                )
+        ax.set_xlim(*fold_xlim)
+        ax.set_ylim(*fold_ylim)
+        latest_index = len(fold_ids) - 1
+        latest_points = {
+            name: (
+                float(drawdown_by_name[name][latest_index]),
+                float(y_by_name[name][latest_index]),
+            )
+            for name in all_names
+        }
+        annotate_experiment_names(ax, latest_points, fold_ylim)
+        if reference_value is not None:
+            ax.axhline(reference_value, color=ink, lw=.8)
+        ax.set_xlabel(
+            f"Per-fold {risk_axis_label} max drawdown "
+            "(less negative is better)"
+        )
+        ax.text(
+            .012,
+            .982,
+            f"Per-fold {risk_axis_label} {y_label}",
+            transform=ax.transAxes,
+            ha="left",
+            va="top",
+            fontsize=10,
+            color=ink,
+            bbox={"facecolor": "white", "edgecolor": "none", "alpha": .84},
+            zorder=5,
+        )
+        fig.suptitle(
+            f"Fold trajectories: {risk_axis_label} max drawdown vs {y_label}",
+            y=.988,
+            fontweight="bold",
+        )
+        fig.text(
+            .5,
+            .955,
+            f"Each line is one experiment; Fold {fold_ids[-1]} is darkest and "
+            "largest; labels mark latest endpoints",
+            ha="center",
+            color="#596273",
+        )
+        ordered_colors = [fold_colors[fold_id] for fold_id in fold_ids]
+        discrete_cmap = ListedColormap(ordered_colors)
+        discrete_norm = BoundaryNorm(
+            np.arange(len(fold_ids) + 1) - .5,
+            discrete_cmap.N,
+        )
+        colorbar = fig.colorbar(
+            ScalarMappable(norm=discrete_norm, cmap=discrete_cmap),
+            ax=ax,
+            orientation="horizontal",
+            fraction=.045,
+            pad=.105,
+            ticks=np.arange(len(fold_ids)),
+        )
+        colorbar.ax.set_xticklabels([f"F{fold_id}" for fold_id in fold_ids])
+        colorbar.set_label("Owned-test fold: later folds are darker and larger")
+        ax.grid(color=grid, lw=.7)
+        for spine in ("top", "right"):
+            ax.spines[spine].set_visible(False)
+        fig.subplots_adjust(left=.22, right=.78, bottom=.18, top=.89)
+        fig.savefig(
+            metric_dir / "all_folds_connected.png",
+            dpi=180,
+            bbox_inches="tight",
+        )
+        plt.close(fig)
 
     folds = np.asarray([row["fold_id"] for row in baseline_rows])
     baseline_sharpe = metric(baseline_rows, args.split, "sharpe")

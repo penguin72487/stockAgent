@@ -443,6 +443,9 @@ def _portfolio_weights_from_scores(model: nn.Module, scores: torch.Tensor, mask:
     activation = str(getattr(model, "portfolio_activation", "identity"))
     mode = str(getattr(model, "portfolio_mode", "long_short")).strip().lower()
     output_mode = str(getattr(model, "portfolio_output_mode", "activation_l1")).strip().lower().replace("-", "_")
+    scale_projection_by_active_count = bool(
+        getattr(model, "projection_l1_scale_by_active_count", False)
+    )
     if mode in {"long", "long_only", "longonly"}:
         target_logits = (scores / temp).masked_fill(~mask, 0.0)
         if output_mode == "logits":
@@ -460,10 +463,19 @@ def _portfolio_weights_from_scores(model: nn.Module, scores: torch.Tensor, mask:
                 short_mask=torch.zeros_like(mask),
             ).masked_fill(~mask, 0.0)
         if output_mode == "projection_l1":
-            return masked_l1_projection_weights(target_logits, mask, long_only=True).masked_fill(~mask, 0.0)
+            return masked_l1_projection_weights(
+                target_logits,
+                mask,
+                long_only=True,
+                scale_by_active_count=scale_projection_by_active_count,
+            ).masked_fill(~mask, 0.0)
         weight_activation = "identity" if output_mode == "l1" else activation
         return masked_softmax(scores / temp, mask, activation=weight_activation).masked_fill(~mask, 0.0)
-    centered = scores - masked_cross_sectional_mean(scores, mask)
+    centered = (
+        scores - masked_cross_sectional_mean(scores, mask)
+        if bool(getattr(model, "center_long_short_logits", True))
+        else scores
+    )
     target_logits = (centered / temp).masked_fill(~mask, 0.0)
     if output_mode == "logits":
         return target_logits
@@ -480,7 +492,12 @@ def _portfolio_weights_from_scores(model: nn.Module, scores: torch.Tensor, mask:
             short_mask=mask,
         ).masked_fill(~mask, 0.0)
     if output_mode == "projection_l1":
-        return masked_l1_projection_weights(target_logits, mask, long_only=False).masked_fill(~mask, 0.0)
+        return masked_l1_projection_weights(
+            target_logits,
+            mask,
+            long_only=False,
+            scale_by_active_count=scale_projection_by_active_count,
+        ).masked_fill(~mask, 0.0)
     weight_activation = "identity" if output_mode == "l1" else activation
     return dual_branch_softmax(centered / temp, mask, activation=weight_activation).masked_fill(~mask, 0.0)
 

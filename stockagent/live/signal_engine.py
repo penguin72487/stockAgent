@@ -39,6 +39,9 @@ from stockagent.live.report_formatter import format_signal_message, is_display_p
 from stockagent.live.market_status import cumulative_recent_returns, short_file_fingerprint
 from stockagent.live.time_display import DEFAULT_DISPLAY_TIMEZONE, display_timezone_label
 from stockagent.models.factory import build_model
+from stockagent.models.temporal_basis_fit import (
+    temporal_basis_overrides_from_state_dict,
+)
 from stockagent.training.inference_contract import (
     align_panel_to_checkpoint_universe,
     build_checkpoint_manifest,
@@ -159,6 +162,9 @@ def _cached_live_model(
             num_features=len(panel.feature_names),
             num_symbols=panel.num_symbols,
             feature_names=panel.feature_names,
+            temporal_basis_overrides=(
+                temporal_basis_overrides_from_state_dict(state_dict)
+            ),
         ).to(runtime_device)
         load_model_state_dict(
             model,

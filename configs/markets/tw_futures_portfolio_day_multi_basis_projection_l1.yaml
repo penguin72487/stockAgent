@@ -1,0 +1,134 @@
+# 唯一模型／訓練標準：使用者指定的 completed OFAT baseline 生成設定。
+# 下方只覆寫期貨產品契約、固定 1,936 槽、明確要求的 center=false，
+# 以及 1000-epoch 上限；batch 重新直接繼承指定 baseline 的 128。
+base_config: ../../artifacts/ablations/tw_day_trade_daily_multi_basis_projection_l1_tplus2_close_commission20_panel_history_v3_ofat_capital10m/baseline/generated_config_20260819_062902.yaml
+
+# 多基底模型會改變輸入 schema、模型參數與 projection-L1 輸出契約；使用
+# 全新 artifact root，絕不把單一時間表示的 v3 optimizer/checkpoint 接續進來。
+experiment_name: tw-taifex-fixed1936-multi-basis-projection-l1-no-time-encoding-attention-full-then-last-v1
+
+runner:
+  # 時間編碼與 pooling/query 圖形已改變，不能接續已完成的 v4 last-only
+  # optimizer/checkpoint；使用獨立 root 並完整保留原 18-fold 結果。
+  output_dir: artifacts/markets/tw_futures_portfolio_day_multi_basis_projection_l1_no_time_encoding_attention_full_then_last_v1
+  resume: true
+  # 每個 fold 已由訓練生命週期直接輸出 canonical backtest 與累積報告，
+  # 不做一遍語意相同的訓練後推論。
+  post_train_infer: false
+
+environment:
+  # 指定 baseline 是 128 host threads；本機雙 5090 各自直連 28 個 logical
+  # CPUs，DDP launcher 已量測並固定為合計 56，避免跨 NUMA 過度訂閱。
+  cpu_threads: 56
+
+data:
+  parquet_root: data_tw_futures/taifex_portfolio_daily_v4/symbols
+  benchmark_name: universe_average_return
+  panel_start_date: "2005-01-01"
+  security_filter: none
+  usd_only_trading_pairs: false
+  tradable_mode: tradable
+  trading_volume_policy: required
+  panel_backend: auto
+  use_tw_public_features: true
+  use_tw_public_rules: false
+  tw_public_feature_path: data_tw_futures/taifex_portfolio_daily_v4/model_features.parquet
+  tw_public_market_symbol: __MARKET__
+  feature_include: ["*"]
+  feature_exclude:
+    - twpub_tdcc_*
+    - twpub_company_*
+    - twpub_monthly_revenue_*
+    - twpub_cumulative_revenue_yoy
+    - twpub_financial_*
+    - twpub_insider_*
+    - twpub_borrow_*
+    - twpub_sbl_*
+    - twpub_short_sale_available_*
+  feature_zero_fill: ["*"]
+  day_trade_open_feature: false
+  feature_shift_next_session: []
+  allow_same_close_feature_approximation: false
+
+walk_forward:
+  min_train_years: 1
+  val_years: 1
+  require_future_test_year: true
+  expected_first_year: 2005
+  require_contiguous_years: true
+  lookback_context: panel_history
+  split_start_year: 2007
+
+trading:
+  # FinancialTransformer 已輸出 L1-ball projection 後的部位；loss/backtest
+  # 必須直接消費，避免二次 activation 或正規化。
+  portfolio_activation: pre_normalized
+  execution_mode: tw_futures_portfolio_day
+  frequency: daily
+  long_only: false
+  max_turnover_ratio: 0.0
+  max_volume_participation: 0.0
+  min_trade_weight: 0.0
+  buy_fee_rate: 0.0
+  sell_fee_rate: 0.0
+  tw_day_trade_unlimited_margin_conversion: false
+  tw_futures_portfolio_fee_large_twd: 60.0
+  tw_futures_portfolio_fee_standard_twd: 24.0
+  tw_futures_portfolio_fee_stock_twd: 40.0
+  tw_futures_portfolio_fee_micro_twd: 16.0
+  tw_futures_portfolio_data_path: data_tw_futures/taifex_portfolio_daily_v4/continuous_daily.parquet
+
+training:
+  model_name: financial_transformer
+  multi_gpu_strategy: distributed_data_parallel
+  epochs: 1000
+  # 以 1000 epochs 為上限；連續 10%（100 epochs）沒有改善時提前停止。
+  early_stopping_no_improve_ratio: 0.1
+  loss_portfolio_activation: pre_normalized
+
+  # v4 實測 T=5311/S=1936/F=116/L=32，指定 baseline 的 global batch
+  # 128（每 rank 64）已通過 compiled forward/backward、canonical loss、
+  # 實際 epoch 與完整 fold lifecycle，因此不再保留 v3 的 batch=64 例外。
+
+  # 每個 epoch 保存完整曲線；每個 fold 結束後立即更新累積 walk-forward 圖。
+  record_epoch_curve: true
+  curve_plot_interval: 1
+  curve_plot_async: true
+  defer_epoch_curve_plot_until_end: false
+  explain_after_each_fold: false
+  postprocess_benchmark_after_fold: false
+  postprocess_benchmark_after_best_val: false
+
+  # 這兩個輸出欄位同步寫入 Transformer-base 與 FinancialTransformer，
+  # 避免 inherited FinancialTransformer override 蓋回舊的去均值契約。
+  transformer_base_portfolio:
+    # 完全停用時間位置編碼：不加 learned time position，也不套 temporal RoPE。
+    use_time_pos: false
+    rope_temporal: false
+    # Attention pooling 需要保留全部時間步，再由 pooling head 聚合。
+    temporal_pooling: attention
+    temporal_query_mode: full_then_last
+    center_long_short_logits: false
+    projection_l1_scale_by_active_count: true
+    categorical_feature_names: [taifex_product_id]
+    categorical_embedding_cardinality: 1024
+
+  financial_transformer:
+    # 其他所有欄位直接繼承指定 completed OFAT baseline，不在此複製第二份。
+    # 完全停用時間位置編碼；時間順序只由因果序列運算與多基底係數表達。
+    use_time_pos: false
+    rope_temporal: false
+    temporal_pooling: attention
+    temporal_query_mode: full_then_last
+    # 不去均值：保留合法的共同多／空市場方向與 score-head bias 梯度。
+    center_long_short_logits: false
+    # score_i / 當日可交易商品數後才投影；平均 |score|<1 時保留現金，
+    # 只有超出 L1 球才投影到邊界，因此不是強制滿曝險。
+    projection_l1_scale_by_active_count: true
+    # Fixed slots are deliberately product-agnostic.  The causal row-level
+    # product ID restores product identity while delivery-month sin/cos keeps
+    # contracts such as every August expiry on the same normalized calendar.
+    categorical_feature_names: [taifex_product_id]
+    categorical_embedding_cardinality: 1024
+    return_aux: false
+    return_aux_details: false
