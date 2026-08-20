@@ -9,6 +9,7 @@ import pytest
 from stockagent.backtest.simulator import BacktestResult
 from stockagent.config import ExperimentConfig, load_config
 from stockagent.data.panel import PanelData
+from stockagent.data.tw_futures_portfolio_daily import TaiwanFuturesPortfolioDaily
 from stockagent.training import trainer as trainer_module
 
 
@@ -44,6 +45,13 @@ def _cash_config() -> ExperimentConfig:
     config.trading.long_only = True
     config.trading.tw_cash_lot_size = 1
     return config
+
+
+def _futures_portfolio_config() -> ExperimentConfig:
+    return load_config(
+        REPO_ROOT
+        / "configs/markets/tw_futures_portfolio_day_multi_basis_projection_l1.yaml"
+    )
 
 
 def _day_trade_panel(
@@ -87,6 +95,55 @@ def _day_trade_panel(
     )
 
 
+def _futures_portfolio_panel() -> PanelData:
+    rows = 4
+    symbols = ("TX_M01_L1", "MTX_M01_L1")
+    symbol_count = len(symbols)
+    mask = np.ones((rows, symbol_count), dtype=np.bool_)
+    returns = np.asarray(
+        [[0.0, 0.0], [0.10, -0.10], [0.02, 0.03], [0.0, 0.0]],
+        dtype=np.float32,
+    )
+    panel = PanelData(
+        dates=np.asarray(
+            ["2025-01-02", "2025-01-03", "2025-01-06", "2025-01-07"],
+            dtype="datetime64[D]",
+        ),
+        symbols=list(symbols),
+        feature_names=["f0"],
+        features=np.zeros((rows, symbol_count, 1), dtype=np.float32),
+        returns_1d=returns,
+        tradable_mask=mask,
+        can_buy_mask=mask.copy(),
+        can_sell_mask=mask.copy(),
+        can_short_open_mask=mask.copy(),
+        can_short_open_open_mask=mask.copy(),
+        alive_mask=mask.copy(),
+        benchmark_returns=np.zeros(rows, dtype=np.float32),
+        close_prices=np.full((rows, symbol_count), 100.0, dtype=np.float32),
+        open_prices=np.full((rows, symbol_count), 100.0, dtype=np.float32),
+        daily_volumes=np.full((rows, symbol_count), 1_000.0, dtype=np.float32),
+        force_exit_mask=np.zeros((rows, symbol_count), dtype=np.bool_),
+    )
+    panel.futures_portfolio_daily = TaiwanFuturesPortfolioDaily(
+        dates=panel.dates.copy(),
+        symbols=symbols,
+        contracts=np.full((rows, symbol_count), "contract", dtype=object),
+        holding_log_returns=returns.copy(),
+        executable_mask=mask.copy(),
+        must_liquidate_mask=np.zeros_like(mask),
+        can_hold_overnight_mask=mask.copy(),
+        contract_multipliers=np.asarray([200.0, 50.0], dtype=np.float64),
+        fee_per_contract_per_side_twd=np.asarray([60.0, 24.0], dtype=np.float64),
+        fee_rate_per_open_notional=np.full(
+            (rows, symbol_count), 0.01, dtype=np.float32
+        ),
+        source_path="unit-test",
+        manifest_path="unit-test",
+    )
+    return panel
+
+
 def _fold_result(fold_id: int) -> trainer_module.FoldResult:
     return trainer_module.FoldResult(
         fold_id=fold_id,
@@ -122,7 +179,11 @@ def _write_fold_requests(
         turnovers=np.zeros(rows, dtype=np.float64),
         weights_history=np.zeros((rows, symbol_count), dtype=np.float64),
         execution_mode=execution_mode,
-        settlement_ledger_unit="currency",
+        settlement_ledger_unit=(
+            "notional_weight"
+            if execution_mode == "tw_futures_portfolio_day"
+            else "currency"
+        ),
         requested_weights_history=values,
         cash_history=np.zeros(rows, dtype=np.float64),
         payables_history=np.zeros((rows, 2), dtype=np.float64),
@@ -321,6 +382,45 @@ def test_daily_no_default_stitched_replay_uses_same_fractional_tplus3_forward(
     )
     np.testing.assert_allclose(stitched.cash_history, [1.0, 1.0, 1.10])
     assert np.count_nonzero(stitched.weights_history) == 2
+
+
+def test_futures_portfolio_stitched_replay_uses_fixed_fee_side_channel(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _disable_stitched_plots(monkeypatch)
+    panel = _futures_portfolio_panel()
+    fold = _write_fold_requests(
+        tmp_path,
+        fold_id=1,
+        dates=panel.dates[1:],
+        symbols=("TX_M01_L1", "MTX_M01_L1"),
+        requests=np.asarray(
+            [[0.5, -0.5], [0.25, -0.25], [0.0, 0.0]],
+            dtype=np.float64,
+        ),
+        execution_mode="tw_futures_portfolio_day",
+    )
+
+    stitched = trainer_module._replay_taiwan_stitched_deployment(
+        tmp_path,
+        [fold],
+        panel=panel,
+        config=_futures_portfolio_config(),
+    )
+
+    assert stitched is not None
+    assert stitched.execution_mode == "tw_futures_portfolio_day"
+    assert stitched.settlement_ledger_unit == "notional_weight"
+    assert stitched.final_integer_state is None
+    np.testing.assert_allclose(
+        stitched.requested_weights_history,
+        [[0.5, -0.5], [0.25, -0.25], [0.0, 0.0]],
+    )
+    # The paired long/short request is profitable before costs, while the
+    # aligned fixed-fee side channel keeps its net log return below 10%.
+    assert 0.0 < float(stitched.strategy_returns[0]) < 0.10
+    assert np.count_nonzero(stitched.turnovers) >= 2
 
 
 def test_stitched_replay_keeps_ruin_absorbing_across_fold_handoff(

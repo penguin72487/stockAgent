@@ -46,10 +46,11 @@ and coverage audits remain part of the input contract, not incidental caches.
 training folds. Validation selects checkpoints; test data does not select them.
 Every target belongs to exactly the split specified by the fold.
 
-The default split-local lookback drops the first `lookback - 1` targets of each
-split. The explicit `lookback_context: panel_history` mode may read earlier panel
-rows for context while keeping only the already-owned target indices. It does
-not import earlier returns, portfolio state, or future information.
+The canonical `lookback_context: panel_history` policy owns targets from the
+first eligible date of every split and may read earlier, already-observed panel
+rows for their causal feature windows. It does not import earlier returns,
+portfolio state, or future information. `split_only` remains available only as
+a legacy reproduction mode and drops the first `lookback - 1` targets per split.
 
 If `require_future_test_year: false`, the final fold may intentionally reuse its
 validation window as its test window. Such output must be labelled latest-period

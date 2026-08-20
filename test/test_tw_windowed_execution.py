@@ -153,6 +153,7 @@ def test_panel_history_makes_split_row_zero_use_prior_causal_features() -> None:
         split_indices,
         lookback=2,
         execution_mode="tw_cash",
+        lookback_context="split_only",
     )
     contextual = CrossSectionalDataset(
         panel,
@@ -727,7 +728,9 @@ def test_trainer_windowed_rebuilders_preserve_execution_contract() -> None:
             & panel.day_trade_can_sell_open_mask
         ),
     )
-    assert lengths == [3, 3]
+    # Canonical panel-history context keeps all five targets owned by the
+    # second split; its first two windows read only already-observed rows.
+    assert lengths == [3, 5]
 
 
 def test_day_trade_windowed_split_fails_closed_without_historical_eligibility() -> None:

@@ -155,6 +155,8 @@ def _panel_array_content_fingerprint(
 _TEMPORAL_BASIS_MODEL_CONFIG_FIELDS = (
     "temporal_basis_families",
     "temporal_basis_components",
+    "temporal_basis_components_by_family",
+    "temporal_basis_novelty_threshold",
     "temporal_basis_input",
 )
 
@@ -168,10 +170,16 @@ def _project_temporal_basis_model_config(
     if not projected.get("temporal_basis_families"):
         for field_name in _TEMPORAL_BASIS_MODEL_CONFIG_FIELDS:
             projected.pop(field_name, None)
-    elif str(projected.get("temporal_basis_input", "embedded")) == "embedded":
-        # Preserve pre-option basis checkpoint fingerprints.  Embedded is the
-        # historical behavior and does not alter parameters or the forward path.
-        projected.pop("temporal_basis_input", None)
+    else:
+        if not projected.get("temporal_basis_components_by_family"):
+            # The new per-family reduction is opt-in. Keep existing multi-basis
+            # checkpoint fingerprints unchanged while the map is empty.
+            projected.pop("temporal_basis_components_by_family", None)
+            projected.pop("temporal_basis_novelty_threshold", None)
+        if str(projected.get("temporal_basis_input", "embedded")) == "embedded":
+            # Preserve pre-option basis checkpoint fingerprints.  Embedded is the
+            # historical behavior and does not alter parameters or the forward path.
+            projected.pop("temporal_basis_input", None)
     if int(projected.get("daily_context_layers", 0) or 0) == 0:
         # These controls have no parameters or forward-path effect until the
         # daily-context branch has at least one layer.  Omitting them preserves
@@ -796,6 +804,9 @@ def _trading_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
         from stockagent.data.tw_futures_portfolio_daily import (
             TAIFEX_FUTURES_PORTFOLIO_BACKTEST_CONTRACT_VERSION,
             TAIFEX_FUTURES_PORTFOLIO_DATA_CONTRACT_VERSION,
+            TAIFEX_FUTURES_PORTFOLIO_FIXED_SLOT_COUNT,
+            TAIFEX_FUTURES_PORTFOLIO_MAX_SAFE_LOOKBACK,
+            TAIFEX_FUTURES_PORTFOLIO_SLOT_REUSE_COOLDOWN_SESSIONS,
         )
 
         contract["taiwan_futures_portfolio_day"] = {
@@ -807,7 +818,16 @@ def _trading_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
             ),
             "data_path": str(trading.tw_futures_portfolio_data_path),
             "symbol_contract": (
-                "delivery_month_or_week_slot_with_lifetime_stable_overlap_lane"
+                "fixed_global_slot_with_lifetime_stable_physical_contract"
+            ),
+            "fixed_model_output_slots": int(
+                TAIFEX_FUTURES_PORTFOLIO_FIXED_SLOT_COUNT
+            ),
+            "slot_reuse_cooldown_sessions": int(
+                TAIFEX_FUTURES_PORTFOLIO_SLOT_REUSE_COOLDOWN_SESSIONS
+            ),
+            "maximum_safe_lookback_sessions": int(
+                TAIFEX_FUTURES_PORTFOLIO_MAX_SAFE_LOOKBACK
             ),
             "tenor_sort_key": (
                 "weekly_numbered_wednesday_monthly_third_wednesday_ordering_"

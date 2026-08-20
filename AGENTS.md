@@ -108,7 +108,43 @@ Rules:
 
 ## Current Main Model Recommendation
 
-The active model is `transformer_base_portfolio`.
+### Default Training Baseline And Immediate Fold Reports
+
+Unless the user explicitly selects another baseline, new strategy training
+configs must use
+`configs/markets/tw_day_trade_daily_multi_basis_projection_l1_tplus2_close_capital10m.yaml`
+and its completed OFAT control at
+`artifacts/ablations/tw_day_trade_daily_multi_basis_projection_l1_tplus2_close_commission20_panel_history_v3_ofat_capital10m/baseline`
+as the default training standard. Inherit its model, multi-basis inputs,
+projection-L1 output, TWD 10M execution capital, panel-history walk-forward,
+BF16/DDP, fee, settlement, 1000-epoch, and epoch-curve settings unless the
+strategy or the user explicitly overrides a field. Product-specific data,
+execution, eligibility, settlement, and accounting contracts remain
+authoritative and must not be replaced by Taiwan stock-day-trade semantics.
+
+Every completed fold must immediately refresh the cumulative root-level
+walk-forward report from all contract-compatible folds completed so far. Do not
+wait for the full fold suite and do not require a duplicate post-training
+inference pass. The required plot set is:
+
+- `walkforward_equity_curve.png`
+- `walkforward_first_year_cumulative_returns_log10.png`
+- `walkforward_first_year_cumulative_returns.png`
+- `walkforward_first_year_fold_metrics.png`
+- `walkforward_first_year_turnover_concentration.png`
+- `walkforward_stitched_deployment_cumulative_returns_log10.png`
+- `walkforward_stitched_deployment_cumulative_returns.png`
+- `walkforward_stitched_deployment_fold_metrics.png`
+- `walkforward_stitched_deployment_turnover_concentration.png`
+
+For isolated-fold training, the orchestration parent must reload all completed
+fold results and refresh these plots after each child succeeds; a one-fold child
+must not overwrite the cumulative report with only its local fold.
+
+The default active model is `financial_transformer`. Use another model only
+when the user or a strategy config explicitly overrides `training.model_name`.
+`transformer_base_portfolio` remains available as an explicit scalable-model
+alternative, but it is not the default baseline.
 
 The active Transformer-base lookback-32 config is:
 
@@ -456,18 +492,17 @@ Rules:
 - When `walk_forward.require_future_test_year: false`, the final experimental fold
   deliberately reuses its validation window as its test window. Keep that overlap;
   label it as latest-year experimentation rather than unbiased model selection.
-- Every split requires a complete lookback contained inside that split. Therefore a
-  lookback of 32 deliberately starts evaluation at the split's 32nd trading row
-  (drops the first 31 rows). Do not prepend rows from the preceding split to make a
-  fold appear to start on its first calendar trading day.
-- The explicit `lookback_context: panel_history` exception owns only the
-  already-computed `valid_indices` as targets while allowing their windows to
-  read earlier panel rows. Panel-slab densification and dynamic-symbol upper
-  bounds must preserve those target endpoints; do not recompute a split-only
-  start and silently drop its first `lookback-1` valid rows.
-- For stitched deployment tests, the warmup rows before the next model's first valid
-  row remain owned by the preceding model. This preserves chronological coverage
-  without changing the per-fold lookback rule.
+- Every mode uses canonical `lookback_context: panel_history`: a new split owns
+  its first eligible target and may read earlier, already-observed panel rows to
+  construct the causal feature window. A lookback of 32 therefore does not drop
+  the first 31 target dates of every validation/test year. It never imports
+  earlier returns, portfolio state, or future information.
+- `split_only` remains a legacy reproduction option for historical checkpoints,
+  not an active training default. Panel-slab densification and dynamic-symbol
+  upper bounds must preserve the panel-history target endpoints; do not recompute
+  a split-only start and silently drop the first `lookback-1` owned targets.
+- For stitched deployment tests, the next model owns its new-year first target
+  under panel history; the preceding model stops immediately before that target.
 
 ## Trainer Executor Boundaries
 

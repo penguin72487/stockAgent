@@ -18,17 +18,15 @@ required_data=(
 )
 for path in "${required_data[@]}"; do
   if [[ ! -s "$path" ]]; then
-    echo "[tw-futures-portfolio] missing required dataset artifact: $path" >&2
+    echo "[tw-futures-multi-basis] missing required dataset artifact: $path" >&2
     echo "Run: source scripts/runtime_env.sh && run_fintech_python scripts/build_taifex_futures_portfolio_daily.py" >&2
     exit 2
   fi
 done
 
 run_fintech_python train.py \
-  --config configs/markets/tw_futures_portfolio_day.yaml \
+  --config configs/markets/tw_futures_portfolio_day_multi_basis_projection_l1.yaml \
   --multi-gpu-strategy distributed_data_parallel \
   --cpu-threads 56 \
   --torch-compile-threads 16 \
-  --batch-size-train 8 \
-  --batch-size-eval 4 \
   "$@"

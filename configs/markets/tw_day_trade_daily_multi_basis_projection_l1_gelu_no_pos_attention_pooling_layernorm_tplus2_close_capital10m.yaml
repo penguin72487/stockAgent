@@ -1,0 +1,31 @@
+base_config: tw_day_trade_daily_multi_basis_projection_l1_tplus2_close_capital10m.yaml
+
+# Formal combined training run selected from the completed OFAT analysis.
+# This is not an ablation child and must not resume any baseline/OFAT weights.
+experiment_name: tw-day-trade-daily-multi-basis-projection-l1-gelu-no-pos-symbol-attention-pooling-layernorm-tplus2-close-commission20-capital10m-v1
+
+runner:
+  output_dir: artifacts/markets/tw_day_trade_daily_multi_basis_projection_l1_gelu_no_pos_symbol_attention_pooling_layernorm_tplus2_close_commission20_capital10m_v1
+  resume: true
+  post_train_infer: false
+
+trading:
+  # Canonical execution/loss capital, not reporting leverage.
+  volume_participation_equity: 10000000.0
+
+training:
+  financial_transformer:
+    # "No learned position" disables both learned positional tables. Temporal
+    # RoPE remains inherited because it is a separate ablation dimension.
+    use_time_pos: false
+    use_symbol_pos: false
+
+    ffn_type: gelu
+    temporal_pooling: attention
+    temporal_query_mode: full_then_last
+    norm_type: layernorm
+
+    # The input_features temporal basis path requires RMSNorm. LayerNorm must
+    # therefore use the same raw-feature basis input as the valid OFAT run.
+    temporal_basis_input: raw_features
+

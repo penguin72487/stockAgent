@@ -15,6 +15,7 @@ import inspect
 import csv
 import hashlib
 import random
+from copy import deepcopy
 from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass, field
 from datetime import timedelta
@@ -117,6 +118,11 @@ from stockagent.models.factory import (
     model_hidden_dim_hint,
 )
 from stockagent.models.normalization import DEFAULT_PORTFOLIO_ACTIVATION
+from stockagent.models.temporal_basis_fit import (
+    build_temporal_basis_metadata,
+    fit_training_only_pca_klt,
+    temporal_basis_overrides_from_state_dict,
+)
 from stockagent.profiling import PROFILE_RANGES_ENABLED, profile_range
 from stockagent.training.checkpoint_contract import (
     _active_model_config,
@@ -3235,6 +3241,144 @@ def _group_curve_path(output_path: Path, train_years: list[int]) -> Path:
     return layout.group_curve_path(layout.year_group_name(train_years))
 
 
+def _temporal_basis_runtime_config(config: ExperimentConfig) -> object | None:
+    active_name = str(_active_model_config(config)["config_name"])
+    model_config = getattr(config.training, active_name, None)
+    families = getattr(model_config, "temporal_basis_families", None)
+    return model_config if families else None
+
+
+def _write_temporal_basis_metadata(
+    path: Path,
+    metadata: Mapping[str, Any],
+    *,
+    fold_id: int | None = None,
+) -> None:
+    if not _distributed_should_write():
+        return
+    payload = deepcopy(dict(metadata))
+    if fold_id is not None:
+        payload["fold_id"] = int(fold_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+
+
+def _fit_group_temporal_basis(
+    *,
+    config: ExperimentConfig,
+    train_ds: CrossSectionalDataset,
+    train_years: Sequence[int],
+    group_folds: Sequence[WalkForwardFold],
+    output_path: Path,
+) -> tuple[dict[str, torch.Tensor], dict[str, Any] | None]:
+    """Fit only data-dependent bases from this group's training windows."""
+
+    model_config = _temporal_basis_runtime_config(config)
+    if model_config is None:
+        return {}, None
+    families = list(getattr(model_config, "temporal_basis_families"))
+    components = int(getattr(model_config, "temporal_basis_components"))
+    components_by_family = dict(
+        getattr(model_config, "temporal_basis_components_by_family", {}) or {}
+    )
+    novelty_threshold = float(
+        getattr(model_config, "temporal_basis_novelty_threshold", 1e-4)
+    )
+    lookback = int(config.training.lookback)
+    if group_folds:
+        reference_indices = np.asarray(group_folds[0].train_indices, dtype=np.int64)
+        for fold in group_folds[1:]:
+            if not np.array_equal(
+                np.asarray(fold.train_indices, dtype=np.int64),
+                reference_indices,
+            ):
+                raise ValueError(
+                    "Temporal basis train-group folds must share identical "
+                    "training indices"
+                )
+    uses_pca = any(
+        str(name).strip().lower().replace("-", "_") in {"pca", "klt", "pca_klt", "pca/klt"}
+        for name in families
+    )
+
+    payload: dict[str, Any] | None = None
+    if not _distributed_is_initialized() or _distributed_is_rank0():
+        overrides: dict[str, torch.Tensor] = {}
+        covariance: torch.Tensor | None = None
+        pca_metadata: dict[str, Any] | None = None
+        if uses_pca:
+            pca_fit = fit_training_only_pca_klt(
+                train_ds.features_t,
+                train_ds.valid_indices,
+                lookback=lookback,
+                feature_lag=execution_feature_lag(train_ds.execution_mode),
+                components=int(
+                    components_by_family.get("pca_klt", components)
+                ),
+            )
+            overrides["pca_klt"] = pca_fit.basis
+            covariance = pca_fit.covariance
+            pca_metadata = pca_fit.metadata
+        metadata = build_temporal_basis_metadata(
+            families,
+            lookback=lookback,
+            components=components,
+            components_by_family=components_by_family,
+            covariance=covariance,
+            basis_overrides=overrides,
+            pca_metadata=pca_metadata,
+            novelty_threshold=novelty_threshold,
+        )
+        metadata.update(
+            {
+                "train_years": [int(year) for year in train_years],
+                "fold_ids": [int(fold.fold_id) for fold in group_folds],
+                "pca_klt_training_only": bool(uses_pca),
+            }
+        )
+        metadata["selection_fingerprint"] = _stable_fingerprint(metadata)
+        payload = {
+            "overrides": {
+                name: matrix.detach().cpu().tolist()
+                for name, matrix in overrides.items()
+            },
+            "metadata": metadata,
+        }
+    if _distributed_is_initialized() and _distributed_world_size() > 1:
+        objects: list[dict[str, Any] | None] = [payload]
+        dist.broadcast_object_list(objects, src=0)
+        payload = objects[0]
+    if payload is None:
+        raise RuntimeError("Temporal basis fit did not produce a distributed payload")
+
+    overrides = {
+        name: torch.tensor(matrix, dtype=torch.float32)
+        for name, matrix in dict(payload["overrides"]).items()
+    }
+    metadata = dict(payload["metadata"])
+    if _distributed_should_write():
+        group_dir = _group_dir(output_path, list(train_years))
+        _write_temporal_basis_metadata(
+            group_dir / "temporal_basis_selection.json",
+            metadata,
+        )
+        for fold in group_folds:
+            _write_temporal_basis_metadata(
+                _fold_dir(output_path, fold.fold_id)
+                / "temporal_basis_selection.json",
+                metadata,
+                fold_id=fold.fold_id,
+            )
+    print(
+        f"[Train {list(train_years)}] temporal basis families={len(families)} "
+        f"selected={metadata['selected_total']} rank={metadata['actual_rank']} "
+        f"near_duplicates={metadata['near_duplicate_count']} "
+        f"pca_training_only={bool(uses_pca)}"
+    )
+    return overrides, metadata
+
+
 def _write_loss_contract_metadata(
     path: Path,
     *,
@@ -4822,6 +4966,15 @@ def _save_fold_checkpoint(
         "best_val_loss": best_val_loss,
         "model_state_dict": _state_dict_for_save(model),
     }
+    temporal_basis_metadata = getattr(
+        _unwrap_model(model),
+        "temporal_basis_selection_metadata",
+        None,
+    )
+    if isinstance(temporal_basis_metadata, Mapping):
+        payload["temporal_basis_selection"] = deepcopy(
+            dict(temporal_basis_metadata)
+        )
     if experiment_manifest is not None:
         payload["experiment_manifest"] = dict(experiment_manifest)
     if include_optimizer:
@@ -5269,6 +5422,15 @@ def _save_group_checkpoint(
         ),
         "early_stop_val_interval_epochs": int(max(1, early_stop_val_interval_epochs)),
     }
+    temporal_basis_metadata = getattr(
+        _unwrap_model(model),
+        "temporal_basis_selection_metadata",
+        None,
+    )
+    if isinstance(temporal_basis_metadata, Mapping):
+        payload["temporal_basis_selection"] = deepcopy(
+            dict(temporal_basis_metadata)
+        )
     if extra_payload:
         overlap = set(payload).intersection(extra_payload)
         if overlap:
@@ -6255,6 +6417,13 @@ def _realized_leverage_backtest(
     )
 
 
+def _benchmark_plot_label(config: object) -> str:
+    benchmark_name = str(
+        getattr(getattr(config, "data", None), "benchmark_name", "")
+    ).strip()
+    return f"Benchmark ({benchmark_name})" if benchmark_name else "Benchmark"
+
+
 def _write_reporting_leverage_artifacts(
     result: BacktestResult,
     future_returns: np.ndarray | torch.Tensor,
@@ -6287,20 +6456,28 @@ def _write_reporting_leverage_artifacts(
             sell_fee_rate=config.trading.sell_fee_rate,
         )
 
+    benchmark_label = _benchmark_plot_label(config)
+    scope_label = "Full-Horizon Fold Test (Reset State)"
     plot_equity_curve(
         leverage_result,
         dates,
         fold_dir / "leverage_equity_curve.png",
+        scope_label=scope_label,
+        benchmark_label=benchmark_label,
     )
     plot_equity_curve_log(
         leverage_result,
         dates,
         fold_dir / "leverage_equity_curve_log.png",
+        scope_label=scope_label,
+        benchmark_label=benchmark_label,
     )
     plot_annual_performance(
         leverage_result,
         dates,
         fold_dir / "leverage_annual_performance.png",
+        scope_label=scope_label,
+        benchmark_label=benchmark_label,
     )
     (fold_dir / "leverage_annual_report.txt").write_text(
         generate_annual_report(leverage_result, dates),
@@ -6510,6 +6687,7 @@ def _save_deployment_test_artifacts(
     symbols: Sequence[str] | None = None,
     backtest_artifact_compression: str = "none",
     write_plots: bool = False,
+    benchmark_label: str = "Benchmark",
 ) -> dict[str, float | int | str]:
     """Persist the non-overlapping deployment view separately from full test."""
     date_values = np.asarray(dates)
@@ -6581,6 +6759,8 @@ def _save_deployment_test_artifacts(
                 result,
                 date_values,
                 deployment_plot_path,
+                scope_label="Owned Stitched Deployment Segment",
+                benchmark_label=benchmark_label,
             )
         elif deployment_plot_path.exists():
             deployment_plot_path.unlink()
@@ -6785,6 +6965,22 @@ def _save_fold_output_artifacts(
         json.dump(asdict(fold_result), f, indent=2)
     save_timing["metrics_json_s"] = float(time.perf_counter() - stage_start)
 
+    temporal_basis_metadata = getattr(
+        _unwrap_model(model),
+        "temporal_basis_selection_metadata",
+        None,
+    )
+    if isinstance(temporal_basis_metadata, Mapping):
+        stage_start = time.perf_counter()
+        _write_temporal_basis_metadata(
+            fold_dir / "temporal_basis_selection.json",
+            temporal_basis_metadata,
+            fold_id=fold_result.fold_id,
+        )
+        save_timing["temporal_basis_metadata_s"] = float(
+            time.perf_counter() - stage_start
+        )
+
     stage_start = time.perf_counter()
     compression = str(
         backtest_artifact_compression
@@ -6892,9 +7088,14 @@ def _save_fold_output_artifacts(
     plot_start = time.perf_counter()
     plot_timing: dict[str, float | str] = {}
 
-    def _time_plot(name: str, fn: Callable[..., Any], *args: Any) -> None:
+    def _time_plot(
+        name: str,
+        fn: Callable[..., Any],
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
         item_start = time.perf_counter()
-        fn(*args)
+        fn(*args, **kwargs)
         plot_timing[f"{name}_s"] = float(time.perf_counter() - item_start)
 
     def _copy_plot(name: str, source: Path, target: Path) -> None:
@@ -6905,14 +7106,34 @@ def _save_fold_output_artifacts(
         plot_timing[f"{name}_copied_from"] = str(source.name)
 
     if write_plots:
-        _time_plot("equity_curve", plot_equity_curve, test_backtest, test_dates, fold_dir / "equity_curve.png")
-        _time_plot("equity_curve_log", plot_equity_curve_log, test_backtest, test_dates, fold_dir / "equity_curve_log.png")
+        benchmark_label = _benchmark_plot_label(config)
+        test_scope_label = "Full-Horizon Fold Test (Reset State)"
+        _time_plot(
+            "equity_curve",
+            plot_equity_curve,
+            test_backtest,
+            test_dates,
+            fold_dir / "equity_curve.png",
+            scope_label=test_scope_label,
+            benchmark_label=benchmark_label,
+        )
+        _time_plot(
+            "equity_curve_log",
+            plot_equity_curve_log,
+            test_backtest,
+            test_dates,
+            fold_dir / "equity_curve_log.png",
+            scope_label=test_scope_label,
+            benchmark_label=benchmark_label,
+        )
         _time_plot(
             "annual_performance",
             plot_annual_performance,
             test_backtest,
             test_dates,
             fold_dir / "annual_performance.png",
+            scope_label=test_scope_label,
+            benchmark_label=benchmark_label,
         )
         leverage_multiplier = float(getattr(config.trading, "reporting_leverage", 1.0))
         plot_timing["leverage_multiplier"] = float(leverage_multiplier)
@@ -6956,6 +7177,8 @@ def _save_fold_output_artifacts(
                 leverage_backtest,
                 test_dates,
                 fold_dir / "leverage_equity_curve.png",
+                scope_label=test_scope_label,
+                benchmark_label=benchmark_label,
             )
             _time_plot(
                 "leverage_equity_curve_log",
@@ -6963,6 +7186,8 @@ def _save_fold_output_artifacts(
                 leverage_backtest,
                 test_dates,
                 fold_dir / "leverage_equity_curve_log.png",
+                scope_label=test_scope_label,
+                benchmark_label=benchmark_label,
             )
             _time_plot(
                 "leverage_annual_performance",
@@ -6970,6 +7195,8 @@ def _save_fold_output_artifacts(
                 leverage_backtest,
                 test_dates,
                 fold_dir / "leverage_annual_performance.png",
+                scope_label=test_scope_label,
+                benchmark_label=benchmark_label,
             )
         else:
             _copy_plot("leverage_equity_curve", fold_dir / "equity_curve.png", fold_dir / "leverage_equity_curve.png")
@@ -8746,7 +8973,7 @@ def _split_valid_indices(
     date_indices: np.ndarray,
     lookback: int,
     execution_mode: str = "naive",
-    lookback_context: str = "split_only",
+    lookback_context: str = "panel_history",
 ) -> np.ndarray:
     indices = np.array(sorted(np.asarray(date_indices, dtype=np.int64).tolist()), dtype=np.int64)
     if indices.size == 0:
@@ -8811,7 +9038,7 @@ def _deployment_test_indices(
     next_fold: WalkForwardFold | None,
     lookback: int,
     execution_mode: str = "naive",
-    lookback_context: str = "split_only",
+    lookback_context: str = "panel_history",
 ) -> np.ndarray:
     """Raw test date indices owned by this fold's model.
 
@@ -8842,7 +9069,7 @@ def _deployment_test_prefix_rows(
     lookback: int,
     full_valid_indices: np.ndarray,
     execution_mode: str = "naive",
-    lookback_context: str = "split_only",
+    lookback_context: str = "panel_history",
 ) -> int:
     """Return the stitched-deployment prefix length inside a full test split.
 
@@ -9231,7 +9458,7 @@ def _upgrade_full_horizon_artifacts_without_inference(
         getattr(
             getattr(config, "walk_forward", None),
             "lookback_context",
-            "split_only",
+            "panel_history",
         ),
     )
     expected_dates = np.asarray(
@@ -9255,7 +9482,7 @@ def _upgrade_full_horizon_artifacts_without_inference(
             getattr(
                 getattr(config, "walk_forward", None),
                 "lookback_context",
-                "split_only",
+                "panel_history",
             ),
         )
         if next_valid.size > 0:
@@ -9815,7 +10042,7 @@ def _train_symbol_compaction_group_widths(
     feature_lag = execution_feature_lag(execution_mode)
     walk_forward = getattr(config, "walk_forward", None)
     lookback_context = normalize_lookback_context(
-        getattr(walk_forward, "lookback_context", "split_only")
+        getattr(walk_forward, "lookback_context", "panel_history")
     )
     group_widths: list[int] = []
     for group_folds in grouped_folds.values():
@@ -13207,20 +13434,34 @@ def _replay_taiwan_stitched_deployment(
                 state_advance_mask=torch.ones(
                     stitched_dates.size, dtype=torch.bool
                 ),
-                day_trade_eligible_mask=torch.as_tensor(
-                    selected(execution_dataset.day_trade_eligible_mask_t),
-                    dtype=torch.bool,
+                day_trade_eligible_mask=(
+                    torch.as_tensor(
+                        selected(execution_dataset.day_trade_eligible_mask_t),
+                        dtype=torch.bool,
+                    )
+                    if canonical_daily_day_trade
+                    else None
                 ),
-                day_trade_can_buy_open_mask=torch.as_tensor(
-                    selected(execution_dataset.day_trade_can_buy_open_mask_t),
-                    dtype=torch.bool,
+                day_trade_can_buy_open_mask=(
+                    torch.as_tensor(
+                        selected(execution_dataset.day_trade_can_buy_open_mask_t),
+                        dtype=torch.bool,
+                    )
+                    if canonical_daily_day_trade
+                    else None
                 ),
-                day_trade_can_sell_open_mask=torch.as_tensor(
-                    selected(execution_dataset.day_trade_can_sell_open_mask_t),
-                    dtype=torch.bool,
+                day_trade_can_sell_open_mask=(
+                    torch.as_tensor(
+                        selected(execution_dataset.day_trade_can_sell_open_mask_t),
+                        dtype=torch.bool,
+                    )
+                    if canonical_daily_day_trade
+                    else None
                 ),
-                unresolved_corporate_action_mask=torch.as_tensor(
-                    unresolved_actions, dtype=torch.bool
+                unresolved_corporate_action_mask=(
+                    torch.as_tensor(unresolved_actions, dtype=torch.bool)
+                    if canonical_daily_day_trade
+                    else None
                 ),
             )
         stitched = stitched_tensor.to_numpy()
@@ -13296,16 +13537,22 @@ def _replay_taiwan_stitched_deployment(
         stitched,
         stitched_dates,
         output_path / "walkforward_equity_curve.png",
+        scope_label="Canonical Stitched Walk-Forward Deployment",
+        benchmark_label=_benchmark_plot_label(config),
     )
     plot_equity_curve_log(
         stitched,
         stitched_dates,
         output_path / "walkforward_equity_curve_log.png",
+        scope_label="Canonical Stitched Walk-Forward Deployment",
+        benchmark_label=_benchmark_plot_label(config),
     )
     plot_annual_performance(
         stitched,
         stitched_dates,
         output_path / "walkforward_annual_performance.png",
+        scope_label="Canonical Stitched Walk-Forward Deployment",
+        benchmark_label=_benchmark_plot_label(config),
     )
 
     for segment_index, (fold_dir, start, end) in enumerate(fold_segments):
@@ -13322,6 +13569,7 @@ def _replay_taiwan_stitched_deployment(
             symbols=global_symbols,
             backtest_artifact_compression=compression,
             write_plots=True,
+            benchmark_label=_benchmark_plot_label(config),
         )
     return stitched
 
@@ -13348,6 +13596,10 @@ def _refresh_walkforward_artifacts(
         output_path / "walkforward_first_year_cumulative_returns_log10.png",
         output_path / "walkforward_first_year_fold_metrics.png",
         output_path / "walkforward_first_year_turnover_concentration.png",
+        output_path / "walkforward_stitched_deployment_cumulative_returns.png",
+        output_path / "walkforward_stitched_deployment_cumulative_returns_log10.png",
+        output_path / "walkforward_stitched_deployment_fold_metrics.png",
+        output_path / "walkforward_stitched_deployment_turnover_concentration.png",
     )
     for stale_path in first_year_plot_paths:
         if stale_path.exists():
@@ -13372,11 +13624,19 @@ def _refresh_walkforward_artifacts(
     all_first_year_baseline_log: list[np.ndarray] = []
     all_first_year_turnovers: list[np.ndarray] = []
     all_first_year_weights: list[np.ndarray] = []
+    seen_first_test_years: set[int] = set()
+    experimental_fold_ids: set[int] = set()
+    all_deployment_fold_ids: list[int] = []
+    all_deployment_dates: list[np.ndarray] = []
+    all_deployment_strategy_log: list[np.ndarray] = []
+    all_deployment_baseline_log: list[np.ndarray] = []
+    all_deployment_turnovers: list[np.ndarray] = []
+    all_deployment_weights: list[np.ndarray] = []
 
     for result in sorted(results, key=lambda item: item.fold_id):
         fold_dir = _fold_dir(output_path, result.fold_id)
         deployment_path = _deployment_backtest_path(fold_dir)
-        backtest_path = deployment_path if deployment_path.exists() else _backtest_path(fold_dir)
+        backtest_path = _backtest_path(fold_dir)
         if not backtest_path.exists():
             continue
         fold_backtest, fold_dates = _load_backtest_artifact(backtest_path)
@@ -13392,6 +13652,9 @@ def _refresh_walkforward_artifacts(
         years = np.array([d.year for d in years])
         if years.size > 0:
             first_year = int(np.min(years))
+            if first_year in seen_first_test_years:
+                experimental_fold_ids.add(int(result.fold_id))
+            seen_first_test_years.add(first_year)
             mask = years == first_year
             all_first_year_fold_ids.append(int(result.fold_id))
             all_first_year_dates.append(fold_dates[mask])
@@ -13416,33 +13679,126 @@ def _refresh_walkforward_artifacts(
                 ).astype(np.float64)
             )
 
+        # Stitched deployment is a different accounting surface: positions,
+        # cash, and settlement state continue across fold boundaries.  Never
+        # substitute it for the reset-at-fold-start test ledger above.
+        if deployment_path.exists():
+            deployment_backtest, deployment_dates = _load_backtest_artifact(
+                deployment_path
+            )
+            if int(deployment_dates.size) > 0:
+                all_deployment_fold_ids.append(int(result.fold_id))
+                all_deployment_dates.append(deployment_dates)
+                all_deployment_strategy_log.append(
+                    np.nan_to_num(
+                        deployment_backtest.strategy_returns, nan=0.0
+                    ).astype(np.float64)
+                )
+                all_deployment_baseline_log.append(
+                    np.nan_to_num(
+                        deployment_backtest.benchmark_returns, nan=0.0
+                    ).astype(np.float64)
+                )
+                all_deployment_turnovers.append(
+                    np.nan_to_num(
+                        deployment_backtest.turnovers, nan=0.0
+                    ).astype(np.float64)
+                )
+                deployment_weights = deployment_backtest.weights_history
+                if (
+                    normalize_execution_mode(deployment_backtest.execution_mode)
+                    in {"tw_index_futures_day", "tw_index_derivatives_day"}
+                    and deployment_backtest.requested_weights_history is not None
+                ):
+                    deployment_weights = (
+                        deployment_backtest.requested_weights_history
+                    )
+                all_deployment_weights.append(
+                    np.nan_to_num(
+                        deployment_weights, nan=0.0
+                    ).astype(np.float64)
+                )
+
     if not all_dates:
         return
 
     if all_first_year_dates:
+        benchmark_label = (
+            _benchmark_plot_label(config)
+            if config is not None
+            else "Benchmark"
+        )
         plot_fold_first_year_returns(
             all_first_year_dates,
             all_first_year_strategy_log,
             all_first_year_baseline_log,
             output_path / "walkforward_first_year_cumulative_returns.png",
+            scope_label="Fold Test First Year (Reset State)",
+            benchmark_label=benchmark_label,
         )
         plot_fold_first_year_returns_log10(
             all_first_year_dates,
             all_first_year_strategy_log,
             all_first_year_baseline_log,
             output_path / "walkforward_first_year_cumulative_returns_log10.png",
+            scope_label="Fold Test First Year (Reset State)",
+            benchmark_label=benchmark_label,
         )
         plot_first_year_fold_metric_bars(
             all_first_year_fold_ids,
             all_first_year_strategy_log,
             all_first_year_baseline_log,
             output_path / "walkforward_first_year_fold_metrics.png",
+            scope_label="Fold Test First Year (Reset State)",
+            benchmark_label=benchmark_label,
+            experimental_fold_ids=experimental_fold_ids,
         )
         plot_first_year_turnover_concentration(
             all_first_year_fold_ids,
             all_first_year_turnovers,
             all_first_year_weights,
             output_path / "walkforward_first_year_turnover_concentration.png",
+            scope_label="Fold Test First Year (Reset State)",
+            experimental_fold_ids=experimental_fold_ids,
+        )
+    if all_deployment_fold_ids:
+        benchmark_label = (
+            _benchmark_plot_label(config)
+            if config is not None
+            else "Benchmark"
+        )
+        plot_fold_first_year_returns(
+            all_deployment_dates,
+            all_deployment_strategy_log,
+            all_deployment_baseline_log,
+            output_path / "walkforward_stitched_deployment_cumulative_returns.png",
+            scope_label="Canonical Stitched Walk-Forward Deployment",
+            benchmark_label=benchmark_label,
+        )
+        plot_fold_first_year_returns_log10(
+            all_deployment_dates,
+            all_deployment_strategy_log,
+            all_deployment_baseline_log,
+            output_path
+            / "walkforward_stitched_deployment_cumulative_returns_log10.png",
+            scope_label="Canonical Stitched Walk-Forward Deployment",
+            benchmark_label=benchmark_label,
+        )
+        plot_first_year_fold_metric_bars(
+            all_deployment_fold_ids,
+            all_deployment_strategy_log,
+            all_deployment_baseline_log,
+            output_path / "walkforward_stitched_deployment_fold_metrics.png",
+            scope_label="Owned Stitched Deployment Segment",
+            benchmark_label=benchmark_label,
+        )
+        plot_first_year_turnover_concentration(
+            all_deployment_fold_ids,
+            all_deployment_turnovers,
+            all_deployment_weights,
+            output_path
+            / "walkforward_stitched_deployment_turnover_concentration.png",
+            scope_label="Owned Stitched Deployment Segment",
         )
 
 
@@ -16725,9 +17081,29 @@ def _run_training_tree_models(
                 ),
             )
 
-            plot_equity_curve(canonical_test_bt, test_dates, fold_dir / "equity_curve.png")
-            plot_equity_curve_log(canonical_test_bt, test_dates, fold_dir / "equity_curve_log.png")
-            plot_annual_performance(canonical_test_bt, test_dates, fold_dir / "annual_performance.png")
+            benchmark_label = _benchmark_plot_label(config)
+            test_scope_label = "Full-Horizon Fold Test (Reset State)"
+            plot_equity_curve(
+                canonical_test_bt,
+                test_dates,
+                fold_dir / "equity_curve.png",
+                scope_label=test_scope_label,
+                benchmark_label=benchmark_label,
+            )
+            plot_equity_curve_log(
+                canonical_test_bt,
+                test_dates,
+                fold_dir / "equity_curve_log.png",
+                scope_label=test_scope_label,
+                benchmark_label=benchmark_label,
+            )
+            plot_annual_performance(
+                canonical_test_bt,
+                test_dates,
+                fold_dir / "annual_performance.png",
+                scope_label=test_scope_label,
+                benchmark_label=benchmark_label,
+            )
             _write_reporting_leverage_artifacts(
                 canonical_test_bt,
                 test_returns,
@@ -17375,9 +17751,29 @@ def _run_inference_tree_models(
             ),
         )
 
-        plot_equity_curve(canonical_test_bt, test_dates, fold_dir / "equity_curve.png")
-        plot_equity_curve_log(canonical_test_bt, test_dates, fold_dir / "equity_curve_log.png")
-        plot_annual_performance(canonical_test_bt, test_dates, fold_dir / "annual_performance.png")
+        benchmark_label = _benchmark_plot_label(config)
+        test_scope_label = "Full-Horizon Fold Test (Reset State)"
+        plot_equity_curve(
+            canonical_test_bt,
+            test_dates,
+            fold_dir / "equity_curve.png",
+            scope_label=test_scope_label,
+            benchmark_label=benchmark_label,
+        )
+        plot_equity_curve_log(
+            canonical_test_bt,
+            test_dates,
+            fold_dir / "equity_curve_log.png",
+            scope_label=test_scope_label,
+            benchmark_label=benchmark_label,
+        )
+        plot_annual_performance(
+            canonical_test_bt,
+            test_dates,
+            fold_dir / "annual_performance.png",
+            scope_label=test_scope_label,
+            benchmark_label=benchmark_label,
+        )
         _write_reporting_leverage_artifacts(
             canonical_test_bt,
             test_returns,
@@ -17522,7 +17918,18 @@ def _run_inference_neural_models(
             num_features=len(fold_panel.feature_names),
             num_symbols=fold_panel.num_symbols,
             feature_names=fold_panel.feature_names,
+            temporal_basis_overrides=(
+                temporal_basis_overrides_from_state_dict(model_state_dict)
+            ),
         ).to(device)
+        if checkpoint is not None and isinstance(
+            checkpoint.get("temporal_basis_selection"), Mapping
+        ):
+            setattr(
+                model,
+                "temporal_basis_selection_metadata",
+                deepcopy(dict(checkpoint["temporal_basis_selection"])),
+            )
         _load_state_dict(model, model_state_dict)
         panel_slab_model: nn.Module | None = None
         if _model_supports_panel_slab_forward(model):
@@ -18013,9 +18420,29 @@ def _run_inference_neural_models(
             ),
         )
 
-        plot_equity_curve(canonical_test_bt, test_dates, fold_dir / "equity_curve.png")
-        plot_equity_curve_log(canonical_test_bt, test_dates, fold_dir / "equity_curve_log.png")
-        plot_annual_performance(canonical_test_bt, test_dates, fold_dir / "annual_performance.png")
+        benchmark_label = _benchmark_plot_label(config)
+        test_scope_label = "Full-Horizon Fold Test (Reset State)"
+        plot_equity_curve(
+            canonical_test_bt,
+            test_dates,
+            fold_dir / "equity_curve.png",
+            scope_label=test_scope_label,
+            benchmark_label=benchmark_label,
+        )
+        plot_equity_curve_log(
+            canonical_test_bt,
+            test_dates,
+            fold_dir / "equity_curve_log.png",
+            scope_label=test_scope_label,
+            benchmark_label=benchmark_label,
+        )
+        plot_annual_performance(
+            canonical_test_bt,
+            test_dates,
+            fold_dir / "annual_performance.png",
+            scope_label=test_scope_label,
+            benchmark_label=benchmark_label,
+        )
         _write_reporting_leverage_artifacts(
             canonical_test_bt,
             test_returns,
@@ -18647,6 +19074,15 @@ def _run_training_impl(
             tw_corporate_action_mode=config.trading.tw_corporate_action_mode,
             tw_commission_rebate_timing=config.trading.tw_commission_rebate_timing,
         )
+        temporal_basis_overrides, temporal_basis_metadata = (
+            _fit_group_temporal_basis(
+                config=config,
+                train_ds=train_ds,
+                train_years=train_years,
+                group_folds=group_folds,
+                output_path=output_path,
+            )
+        )
         min_batch_size = max(1, config.training.min_batch_size)
         train_batch_used_bytes = 0
 
@@ -18657,6 +19093,7 @@ def _run_training_impl(
                 num_features=len(panel.feature_names),
                 num_symbols=panel.num_symbols,
                 feature_names=panel.feature_names,
+                temporal_basis_overrides=temporal_basis_overrides,
             )
             train_static_bytes = _estimate_model_static_bytes(estimation_model, training_mode=True)
             model_name = str(config.training.model_name).strip().lower()
@@ -18965,7 +19402,14 @@ def _run_training_impl(
             num_features=len(panel.feature_names),
             num_symbols=panel.num_symbols,
             feature_names=panel.feature_names,
+            temporal_basis_overrides=temporal_basis_overrides,
         ).to(device)
+        if temporal_basis_metadata is not None:
+            setattr(
+                model,
+                "temporal_basis_selection_metadata",
+                deepcopy(temporal_basis_metadata),
+            )
         batch_coupled_modules = _batch_coupled_training_module_names(model)
         if _model_supports_panel_slab_forward(model):
             filtered_train_rows = len(train_windowed)
@@ -21882,21 +22326,19 @@ def _run_training_impl(
                 )
                 plot_total = float(plot_timing.get("total_s", 0.0))
 
-                # Fold-local artifacts are durable before this point. Rebuilding
-                # every global walk-forward plot after folds 1, 1..2, ...,
-                # 1..N is O(N^2) presentation work and the intermediate files
-                # are immediately overwritten. Refresh once when every selected
-                # fold is complete. A resumed fully-complete run also refreshes
-                # these artifacts in the completed-fold scan above.
-                selected_folds_complete = all(
-                    selected.fold_id in results_by_fold for selected in fold_list
-                )
-                if selected_folds_complete and isolated_fold_child:
+                # Fold-local artifacts are durable before this point. The
+                # canonical presentation contract also requires the root-level
+                # walk-forward plots to reflect every newly completed fold
+                # immediately. This intentionally accepts O(N^2) cumulative
+                # presentation work across an N-fold run. An isolated child can
+                # only see its selected fold, so its parent performs the same
+                # cumulative refresh after the child exits successfully.
+                if isolated_fold_child:
                     plot_timing["walkforward_refresh_s"] = 0.0
                     plot_timing["walkforward_refresh_status"] = (
-                        "deferred_to_isolation_parent"
+                        "deferred_to_isolation_parent_after_fold"
                     )
-                elif selected_folds_complete:
+                else:
                     refresh_start = time.perf_counter()
                     _refresh_walkforward_artifacts(
                         output_path,
@@ -21907,10 +22349,8 @@ def _run_training_impl(
                     plot_timing["walkforward_refresh_s"] = float(
                         time.perf_counter() - refresh_start
                     )
-                else:
-                    plot_timing["walkforward_refresh_s"] = 0.0
                     plot_timing["walkforward_refresh_status"] = (
-                        "deferred_until_all_selected_folds_complete"
+                        "refreshed_after_fold"
                     )
                 explain_start = time.perf_counter()
                 explain_path = _run_fold_explainability(

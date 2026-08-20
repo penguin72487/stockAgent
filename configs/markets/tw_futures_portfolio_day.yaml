@@ -1,13 +1,13 @@
 # All historical and currently listed TAIFEX stock, ETF, domestic-index, and
 # foreign-index futures available in the official archive. Physical contracts
-# use stable delivery-month/week slots such as PRODUCT_M09_L1. A far-month
-# contract never changes symbol before expiry.
+# use 1,936 fixed global slots with a 31-session reuse quarantine. A physical
+# far-month contract never changes slot before expiry.
 base_config: tw_public_lanten_market_candles.yaml
 
-experiment_name: tw-taifex-verified-notional-fixed-fee-daily-v3
+experiment_name: tw-taifex-verified-notional-fixed-fee-daily-v4
 
 runner:
-  output_dir: artifacts/markets/tw_futures_portfolio_day_v3
+  output_dir: artifacts/markets/tw_futures_portfolio_day_v4
   mode: train
   resume: true
   post_train_infer: true
@@ -22,7 +22,7 @@ environment:
   torch_compile_threads: 16
 
 data:
-  parquet_root: data_tw_futures/taifex_portfolio_daily_v3/symbols
+  parquet_root: data_tw_futures/taifex_portfolio_daily_v4/symbols
   # build_panel first uses the union calendar; attach_futures_portfolio_daily
   # then installs the no-roll-gap TX front-month benchmark from the audited
   # physical-contract table.
@@ -38,7 +38,7 @@ data:
   # do not gate a TAIFEX contract. Their public numeric fields remain features,
   # while execution uses only the futures contract data/expiry contract.
   use_tw_public_rules: false
-  tw_public_feature_path: data_tw_futures/taifex_portfolio_daily_v3/model_features.parquet
+  tw_public_feature_path: data_tw_futures/taifex_portfolio_daily_v4/model_features.parquet
   tw_public_market_symbol: __MARKET__
   feature_include: ["*"]
   feature_exclude:
@@ -86,7 +86,7 @@ trading:
   tw_futures_portfolio_fee_standard_twd: 24.0
   tw_futures_portfolio_fee_stock_twd: 40.0
   tw_futures_portfolio_fee_micro_twd: 16.0
-  tw_futures_portfolio_data_path: data_tw_futures/taifex_portfolio_daily_v3/continuous_daily.parquet
+  tw_futures_portfolio_data_path: data_tw_futures/taifex_portfolio_daily_v4/continuous_daily.parquet
 
 training:
   model_name: transformer_base_portfolio
@@ -110,6 +110,8 @@ training:
     temporal_query_mode: full_then_last
     portfolio_mode: long_short
     portfolio_output_mode: logits
+    categorical_feature_names: [taifex_product_id]
+    categorical_embedding_cardinality: 1024
     return_aux: false
     return_aux_details: false
 

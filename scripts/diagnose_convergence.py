@@ -30,6 +30,7 @@ from stockagent.models.normalization import (
     masked_signed_action_weights,
     normalize_portfolio_activation,
 )
+from stockagent.models.temporal_basis_fit import temporal_basis_overrides_from_state_dict
 from stockagent.training.dataset import CrossSectionalDataset
 from stockagent.training.loss import risk_aware_loss
 from stockagent.training.trainer import (
@@ -785,6 +786,7 @@ def _load_or_build_model(
         num_features=len(panel.feature_names),
         num_symbols=panel.num_symbols,
         feature_names=panel.feature_names,
+        temporal_basis_overrides=temporal_basis_overrides_from_state_dict(state_dict),
     ).to(device)
     if state_dict is not None:
         _load_state_dict(model, state_dict)

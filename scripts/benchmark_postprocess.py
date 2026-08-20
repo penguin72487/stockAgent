@@ -28,6 +28,7 @@ from stockagent.data.panel import build_panel
 from stockagent.data.walkforward import build_expanding_year_folds
 from stockagent.models.factory import build_model
 from stockagent.models.normalization import normalize_portfolio_activation
+from stockagent.models.temporal_basis_fit import temporal_basis_overrides_from_state_dict
 from stockagent.training.dataset import CrossSectionalDataset
 from stockagent.training.trainer import (
     _align_panel_to_state_dict_universe,
@@ -1258,6 +1259,7 @@ def main() -> None:
         num_features=len(panel.feature_names),
         num_symbols=panel.num_symbols,
         feature_names=panel.feature_names,
+        temporal_basis_overrides=temporal_basis_overrides_from_state_dict(state_dict),
     ).to(device)
     _load_state_dict(model, state_dict)
 

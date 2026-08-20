@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 
 from scripts.plot_ablation_analysis import (
+    _fold_color_map,
     display_label,
     load,
     ordered_variant_names,
@@ -74,6 +75,16 @@ def test_initial_capital_labels_are_explicit() -> None:
     assert display_label("initial_capital_1m") == "Capital TWD 1M"
     assert display_label("initial_capital_10m") == "Capital TWD 10M"
     assert display_label("initial_capital_100m") == "Capital TWD 100M"
+
+
+def test_fold_palette_gets_darker_chronologically() -> None:
+    colors = _fold_color_map(tuple(range(1, 12)))
+
+    def luminance(color: tuple) -> float:
+        red, green, blue, _ = color
+        return 0.2126 * red + 0.7152 * green + 0.0722 * blue
+
+    assert luminance(colors[1]) > luminance(colors[6]) > luminance(colors[11])
 
 
 def _write_deployment_run(
@@ -250,3 +261,6 @@ def test_deployment_plot_cli_bootstraps_repo_imports(tmp_path: Path) -> None:
         assert (
             output_dir / f"deployment_risk_return_{metric_name}_medians.png"
         ).is_file()
+        metric_dir = output_dir / "deployment_risk_return_by_fold" / metric_name
+        assert (metric_dir / "fold_01.png").is_file()
+        assert (metric_dir / "all_folds_connected.png").is_file()

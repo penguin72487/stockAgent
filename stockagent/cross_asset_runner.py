@@ -325,7 +325,7 @@ def _fold_row_weights(
     *,
     lookback: int,
     execution_mode: str = "naive",
-    lookback_context: str = "split_only",
+    lookback_context: str = "panel_history",
     short_capacity_limit_enabled: bool = True,
     tw_corporate_action_mode: str = "avoid",
 ) -> dict[int, int]:
@@ -510,7 +510,7 @@ def _run_fold(
         dataset_kwargs["lookback_context"] = getattr(
             walk_forward_config,
             "lookback_context",
-            "split_only",
+            "panel_history",
         )
     dataset = _first_test_year_dataset(
         fold_panel,

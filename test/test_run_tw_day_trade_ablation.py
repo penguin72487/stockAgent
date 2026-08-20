@@ -4,8 +4,10 @@ from pathlib import Path
 from scripts.run_tw_day_trade_ablation import (
     POSTPROCESS_PLOT_SPECS,
     _bar,
+    _incomplete_fold_markers,
     _last_json,
     _load_effective_spec,
+    _plot_completed_experiments,
     _progress,
     _single_experiment_concurrency,
 )
@@ -55,6 +57,22 @@ def test_tw_day_trade_supervisor_always_runs_one_experiment() -> None:
     assert _single_experiment_concurrency(2) == 1
 
 
+def test_external_baseline_must_have_every_fold_completion_marker(
+    tmp_path: Path,
+) -> None:
+    for fold in (1, 3):
+        fold_dir = tmp_path / f"fold_{fold:02d}"
+        fold_dir.mkdir()
+        (fold_dir / "fold_complete.json").write_text("{}")
+
+    assert _incomplete_fold_markers(tmp_path, 3) == [2]
+
+    fold_dir = tmp_path / "fold_02"
+    fold_dir.mkdir()
+    (fold_dir / "fold_complete.json").write_text("{}")
+    assert _incomplete_fold_markers(tmp_path, 3) == []
+
+
 def test_supervisor_resolves_inherited_ablation_spec(tmp_path: Path) -> None:
     base = tmp_path / "base.yaml"
     base.write_text(
@@ -94,17 +112,53 @@ def test_bar_has_exact_percentage_and_label() -> None:
     assert rendered.endswith("baseline fold 1")
 
 
-def test_primary_test_plot_uses_owned_next_lookback_handoff_interval() -> None:
+def test_primary_test_plot_uses_panel_history_owned_handoff_interval() -> None:
     assert POSTPROCESS_PLOT_SPECS == (
         ("val", "val", "Validation tensor loss contract"),
         (
             "deployment",
             "test",
-            "Owned test: current-year lookback complete through next-year pre-lookback",
+            "Owned stitched deployment test: new model starts at each year's first target",
         ),
         (
             "test",
             "full_horizon_integer_audit",
             "Diagnostic only: expanding full-future exact whole-lot horizon",
         ),
+    )
+
+
+def test_plot_completed_experiments_refreshes_each_contract_surface(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    commands: list[list[str]] = []
+
+    def capture(command: list[str], *, log=None) -> None:
+        assert log is None
+        commands.append(command)
+
+    monkeypatch.setattr(
+        "scripts.run_tw_day_trade_ablation._run_checked",
+        capture,
+    )
+    root = tmp_path / "ablation"
+    baseline = tmp_path / "baseline"
+
+    _plot_completed_experiments(root, baseline_root=baseline)
+
+    assert len(commands) == len(POSTPROCESS_PLOT_SPECS)
+    assert [command[command.index("--split") + 1] for command in commands] == [
+        "val",
+        "deployment",
+        "test",
+    ]
+    assert [command[command.index("--prefix") + 1] for command in commands] == [
+        "val",
+        "test",
+        "full_horizon_integer_audit",
+    ]
+    assert all(
+        command[command.index("--baseline-root") + 1] == str(baseline)
+        for command in commands
     )

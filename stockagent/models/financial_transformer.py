@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from copy import deepcopy
 
 import torch
@@ -8,12 +8,14 @@ import torch.nn.functional as F
 from torch import nn
 
 from stockagent.models.transformer_base_portfolio import (
+    DEFAULT_TEMPORAL_BASIS_NOVELTY_THRESHOLD,
     GatedProjection,
     PortfolioRMSNorm,
     TransformerBasePortfolioModel,
     _build_rope_cache,
     _make_norm,
     _normalize_temporal_basis_families,
+    _validated_temporal_basis_override,
     _temporal_basis_matrix,
 )
 
@@ -50,6 +52,7 @@ class CandleEncoder(nn.Module):
             idx for idx in range(self.num_features) if idx not in categorical_index_set
         )
         self.categorical_feature_indices = categorical_indices
+        self.continuous_feature_indices = continuous_indices
         self.register_buffer(
             "categorical_feature_index_tensor",
             torch.tensor(categorical_indices, dtype=torch.long),
@@ -210,6 +213,9 @@ class TemporalBasisInputFeatureBuilder(nn.Module):
         families: Sequence[str] | str,
         components: int,
         sanitize_inputs: bool,
+        components_by_family: Mapping[str, int] | None = None,
+        novelty_threshold: float = DEFAULT_TEMPORAL_BASIS_NOVELTY_THRESHOLD,
+        basis_overrides: Mapping[str, torch.Tensor] | None = None,
     ) -> None:
         super().__init__()
         self.lookback = int(lookback)
@@ -221,19 +227,56 @@ class TemporalBasisInputFeatureBuilder(nn.Module):
                 "TemporalBasisInputFeatureBuilder requires at least one family"
             )
         self.family_component_counts: dict[str, int] = {}
-        for family in self.family_names:
-            matrix = _temporal_basis_matrix(
-                family,
-                steps=self.lookback,
-                components=int(components),
+        normalized_component_limits = {
+            _normalize_temporal_basis_families((name,))[0]: int(value)
+            for name, value in dict(components_by_family or {}).items()
+        }
+        unexpected_component_limits = set(normalized_component_limits).difference(
+            self.family_names
+        )
+        if unexpected_component_limits:
+            raise ValueError(
+                "Temporal basis component limits are not enabled families: "
+                f"{sorted(unexpected_component_limits)}"
             )
+        if any(value < 1 for value in normalized_component_limits.values()):
+            raise ValueError("Per-family temporal basis components must be positive")
+        self.components_by_family = normalized_component_limits
+        self.novelty_threshold = float(novelty_threshold)
+        normalized_overrides = {
+            _normalize_temporal_basis_families((name,))[0]: matrix
+            for name, matrix in dict(basis_overrides or {}).items()
+        }
+        for family in self.family_names:
+            family_components = self.components_by_family.get(
+                family,
+                int(components),
+            )
+            if family in normalized_overrides:
+                matrix = _validated_temporal_basis_override(
+                    normalized_overrides[family],
+                    family=family,
+                    steps=self.lookback,
+                    components=family_components,
+                )
+            else:
+                matrix = _temporal_basis_matrix(
+                    family,
+                    steps=self.lookback,
+                    components=family_components,
+                    novelty_threshold=(
+                        self.novelty_threshold
+                        if family in self.components_by_family
+                        else None
+                    ),
+                )
             if family == "learned":
                 self.register_parameter(f"{family}_basis", nn.Parameter(matrix))
             else:
                 self.register_buffer(
                     f"{family}_basis",
                     matrix,
-                    persistent=False,
+                    persistent=family in normalized_overrides,
                 )
             self.family_component_counts[family] = int(matrix.size(0))
         self.total_basis_components = sum(self.family_component_counts.values())
@@ -252,7 +295,7 @@ class TemporalBasisInputFeatureBuilder(nn.Module):
         self,
         source: torch.Tensor,
         candle_encoder: CandleEncoder,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         weight = candle_encoder.joint_projection.proj.weight
         prepared = source.to(device=weight.device, dtype=weight.dtype)
         if self.sanitize_inputs:
@@ -262,7 +305,17 @@ class TemporalBasisInputFeatureBuilder(nn.Module):
                 posinf=0.0,
                 neginf=0.0,
             )
-        return prepared
+        basis_source = prepared.index_select(
+            -1,
+            candle_encoder.continuous_feature_index_tensor,
+        )
+        if int(basis_source.size(-1)) != self.source_dim:
+            raise RuntimeError(
+                "temporal basis continuous source width differs from its "
+                f"contract: actual={int(basis_source.size(-1))} "
+                f"expected={self.source_dim}"
+            )
+        return prepared, basis_source
 
     def forward(
         self,
@@ -278,9 +331,9 @@ class TemporalBasisInputFeatureBuilder(nn.Module):
                 f"expected temporal lookback={self.lookback}, "
                 f"got {int(raw_window.size(1))}"
             )
-        if int(raw_window.size(-1)) != self.source_dim:
+        if int(raw_window.size(-1)) != candle_encoder.num_features:
             raise ValueError(
-                f"expected source_dim={self.source_dim}, "
+                f"expected raw feature width={candle_encoder.num_features}, "
                 f"got {int(raw_window.size(-1))}"
             )
         if not isinstance(candle_encoder.input_norm, PortfolioRMSNorm):
@@ -293,7 +346,7 @@ class TemporalBasisInputFeatureBuilder(nn.Module):
                 "CandleEncoder extra feature width does not match temporal basis"
             )
 
-        source = self._prepare_source(raw_window, candle_encoder)
+        source, basis_source = self._prepare_source(raw_window, candle_encoder)
         base = candle_encoder._base_joint_features(source[:, -1])
         norm = candle_encoder.input_norm
         projection = candle_encoder.joint_projection.proj
@@ -311,13 +364,13 @@ class TemporalBasisInputFeatureBuilder(nn.Module):
         offset = candle_encoder.base_joint_input_dim
 
         for family in self.family_names:
-            basis = self._basis(family, source)
+            basis = self._basis(family, basis_source)
             component_count = self.family_component_counts[family]
             width = component_count * self.source_dim
             coefficients = torch.einsum(
                 "kl,blsf->bksf",
                 basis,
-                source,
+                basis_source,
             )
             squared_sum = squared_sum + coefficients.float().square().sum(
                 dim=(1, 3)
@@ -367,6 +420,138 @@ class TemporalBasisInputFeatureBuilder(nn.Module):
             )
         return embedding, aux
 
+    def explainability_decomposition(
+        self,
+        raw_window: torch.Tensor,
+        candle_encoder: CandleEncoder,
+    ) -> dict[str, object]:
+        """Build exact endpoint counterfactuals for every ordinary basis family.
+
+        The wide input uses one shared RMS denominator and a nonlinear CandleEncoder
+        activation, so family effects are not additive.  This routine retains the
+        production operation order for the full endpoint, then recomputes that same
+        path with the original endpoint columns, one basis family, or every basis
+        family removed.  It stores only projected family terms rather than every
+        ``[B,K,S,F]`` coefficient tensor.
+        """
+
+        if raw_window.ndim != 4:
+            raise ValueError("raw_window must have shape [B,L,S,F]")
+        if int(raw_window.size(1)) != self.lookback:
+            raise ValueError(
+                f"expected temporal lookback={self.lookback}, "
+                f"got {int(raw_window.size(1))}"
+            )
+        if int(raw_window.size(-1)) != candle_encoder.num_features:
+            raise ValueError(
+                f"expected raw feature width={candle_encoder.num_features}, "
+                f"got {int(raw_window.size(-1))}"
+            )
+        if not isinstance(candle_encoder.input_norm, PortfolioRMSNorm):
+            raise RuntimeError(
+                "input-feature temporal-basis explainability requires rmsnorm"
+            )
+
+        source, basis_source = self._prepare_source(raw_window, candle_encoder)
+        base = candle_encoder._base_joint_features(source[:, -1])
+        norm = candle_encoder.input_norm
+        projection = candle_encoder.joint_projection.proj
+        norm_weight = norm.weight.to(device=base.device, dtype=base.dtype)
+        base_weighted = base * norm_weight[: candle_encoder.base_joint_input_dim]
+        base_linear = F.linear(
+            base_weighted,
+            projection.weight[:, : candle_encoder.base_joint_input_dim],
+            None,
+        )
+        base_squared = base.float().square().sum(dim=-1)
+
+        family_linear: dict[str, torch.Tensor] = {}
+        family_squared: dict[str, torch.Tensor] = {}
+        family_projection_weights: dict[str, torch.Tensor] = {}
+        family_kernels: dict[str, torch.Tensor] = {}
+        offset = candle_encoder.base_joint_input_dim
+        for family in self.family_names:
+            basis = self._basis(family, basis_source)
+            component_count = self.family_component_counts[family]
+            width = component_count * self.source_dim
+            coefficients = torch.einsum("kl,blsf->bksf", basis, basis_source)
+            feature_weight = norm_weight[offset : offset + width].reshape(
+                component_count,
+                self.source_dim,
+            )
+            projection_weight = projection.weight[:, offset : offset + width].reshape(
+                projection.out_features,
+                component_count,
+                self.source_dim,
+            )
+            effective_weight = projection_weight * feature_weight.unsqueeze(0)
+            family_linear[family] = torch.einsum(
+                "okf,bksf->bso",
+                effective_weight,
+                coefficients,
+            )
+            family_squared[family] = coefficients.float().square().sum(dim=(1, 3))
+            family_projection_weights[family] = effective_weight
+            family_kernels[family] = torch.einsum(
+                "okf,kl->olf",
+                effective_weight.float(),
+                basis.float(),
+            )
+            offset += width
+            del coefficients
+
+        def encode_endpoint(
+            *,
+            include_base: bool,
+            excluded_family: str | None = None,
+        ) -> torch.Tensor:
+            linear_sum = base_linear.clone() if include_base else torch.zeros_like(base_linear)
+            squared_sum = base_squared.clone() if include_base else torch.zeros_like(base_squared)
+            for family in self.family_names:
+                if family == excluded_family:
+                    continue
+                linear_sum = linear_sum + family_linear[family]
+                squared_sum = squared_sum + family_squared[family]
+            inverse_rms = torch.rsqrt(
+                squared_sum / float(candle_encoder.joint_input_dim) + norm.eps
+            ).to(dtype=linear_sum.dtype)
+            projected = linear_sum * inverse_rms.unsqueeze(-1)
+            if projection.bias is not None:
+                projected = projected + projection.bias
+            return candle_encoder._finish_embedding(
+                candle_encoder._activate_projected(projected)
+            )
+
+        full = encode_endpoint(include_base=True)
+        family_ablated = {
+            family: encode_endpoint(include_base=True, excluded_family=family)
+            for family in self.family_names
+        }
+        original_ablated = encode_endpoint(include_base=False)
+        all_basis_ablated = candle_encoder._forward_base_with_zero_extra(base)
+        production_full, _ = self(raw_window, candle_encoder, collect_aux=False)
+        return {
+            # Basis diagnostics must keep their feature axis aligned to the
+            # continuous-only basis source.  The complete source is retained
+            # separately because the ordinary endpoint still includes learned
+            # categorical embeddings.
+            "source": basis_source,
+            "full_source": source,
+            "continuous_feature_indices": candle_encoder.continuous_feature_indices,
+            "base": base,
+            "full": full,
+            "production_full": production_full,
+            "family_ablated": family_ablated,
+            "original_ablated": original_ablated,
+            "all_basis_ablated": all_basis_ablated,
+            "family_projection_weights": family_projection_weights,
+            "family_kernels": family_kernels,
+            "original_projection_weight": (
+                projection.weight[:, : candle_encoder.base_joint_input_dim]
+                * norm_weight[: candle_encoder.base_joint_input_dim].unsqueeze(0)
+            ),
+        }
+
 
 class FinancialTransformerModel(TransformerBasePortfolioModel):
     """Transformer whose raw-feature stem is a learned joint Candle Encoder."""
@@ -388,10 +573,15 @@ class FinancialTransformerModel(TransformerBasePortfolioModel):
         self.temporal_basis_input_feature_builder = (
             TemporalBasisInputFeatureBuilder(
                 lookback=self.lookback,
-                source_dim=self.num_features,
+                source_dim=(
+                    self.num_features - len(self.categorical_feature_indices)
+                ),
                 families=self.temporal_basis_families,
                 components=self.temporal_basis_components,
+                components_by_family=self.temporal_basis_components_by_family,
+                novelty_threshold=self.temporal_basis_novelty_threshold,
                 sanitize_inputs=self.sanitize_inputs,
+                basis_overrides=self.temporal_basis_overrides,
             )
             if (
                 self.temporal_basis_families
@@ -647,6 +837,30 @@ class FinancialTransformerModel(TransformerBasePortfolioModel):
 
     def _input_basis_enabled(self) -> bool:
         return self.temporal_basis_input_feature_builder is not None
+
+    def temporal_basis_input_decomposition_for_explainability(
+        self,
+        x: torch.Tensor,
+        symbol_indices: torch.Tensor | None = None,
+    ) -> dict[str, object]:
+        """Expose exact ordinary-input basis endpoint interventions."""
+
+        if self.training:
+            raise RuntimeError("temporal-basis explainability requires model.eval()")
+        if not self._input_basis_enabled():
+            raise RuntimeError(
+                "Input temporal-basis decomposition requires "
+                "temporal_basis_input='input_features'."
+            )
+        self._check_shapes(x, None, symbol_indices)
+        builder = self.temporal_basis_input_feature_builder
+        if builder is None:
+            raise RuntimeError("input temporal basis builder is unexpectedly missing")
+        ordinary_projected, _ = self.candle_encoder(x, return_aux=False)
+        decomposition = builder.explainability_decomposition(x, self.candle_encoder)
+        decomposition["ordinary_projected"] = ordinary_projected
+        decomposition["symbol_indices"] = symbol_indices
+        return decomposition
 
     def _candle_project_window_features(
         self,

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+from datetime import date, timedelta
 from pathlib import Path
 
 import numpy as np
 import polars as pl
+import pyarrow.parquet as pq
+import pytest
 import torch
 
 from stockagent.backtest.simulator import run_backtest_torch
@@ -12,8 +15,15 @@ from stockagent.backtest.tw_futures_portfolio import (
 )
 from stockagent.config import load_config
 from stockagent.data.tw_futures_portfolio_daily import (
+    _fixed_portfolio_slot_map,
     build_continuous_daily,
     build_product_master,
+)
+from stockagent.data.panel import (
+    BASE_PANEL_FEATURE_COLUMNS,
+    DAY_TRADE_OPEN_GAP_FEATURE,
+    _load_symbol_arrays_polars_lazy,
+    _symbol_arrays_from_arrow_table,
 )
 from stockagent.models.transformer_base_portfolio import (
     action_channels_for_execution_mode,
@@ -56,6 +66,96 @@ def _write_official_codes(path: Path, rows: list[tuple[str, str]]) -> None:
     pl.DataFrame(rows, schema=["code", "product_name"], orient="row").write_csv(path)
 
 
+def test_fixed_slots_reuse_only_after_inclusive_cooldown() -> None:
+    calendar = [date(2026, 1, 1) + timedelta(days=index) for index in range(8)]
+    metadata = pl.DataFrame(
+        {
+            "product": ["AAA", "BBB", "CCC"],
+            "contract": ["202601", "202601", "202602"],
+            "first_observed_date": [calendar[0], calendar[0], calendar[4]],
+            "last_observed_date": [calendar[1], calendar[4], calendar[5]],
+        }
+    )
+    mapping = _fixed_portfolio_slot_map(
+        metadata,
+        calendar,
+        fixed_slot_count=2,
+        cooldown_sessions=2,
+    )
+    slots = {
+        (row["product"], row["contract"]): row["portfolio_slot"]
+        for row in mapping.iter_rows(named=True)
+    }
+    assert slots[("AAA", "202601")] == slots[("CCC", "202602")]
+    assert slots[("BBB", "202601")] != slots[("CCC", "202602")]
+
+    too_early = metadata.with_columns(
+        pl.when(pl.col("product") == "CCC")
+        .then(pl.lit(calendar[3]))
+        .otherwise(pl.col("first_observed_date"))
+        .alias("first_observed_date")
+    )
+    with pytest.raises(RuntimeError, match="capacity exceeded"):
+        _fixed_portfolio_slot_map(
+            too_early,
+            calendar,
+            fixed_slot_count=2,
+            cooldown_sessions=2,
+        )
+
+
+def test_reused_slot_resets_cross_contract_panel_features_for_both_backends(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "TAIFEX_SLOT_0001_features.parquet"
+    pl.DataFrame(
+        {
+            "date": [date(2026, 1, 1), date(2026, 2, 20), date(2026, 2, 23)],
+            "open": [100.0, 200.0, 202.0],
+            "max": [102.0, 203.0, 204.0],
+            "min": [99.0, 198.0, 201.0],
+            "close": [101.0, 202.0, 203.0],
+            "Trading_Volume": [10, 20, 30],
+            "adjclose": [101.0, 202.0, 203.0],
+            "lifecycle_reset": [True, True, False],
+            "return_quarantined": [True, False, True],
+        }
+    ).write_parquet(path)
+
+    arrow = _symbol_arrays_from_arrow_table(
+        pq.read_table(path),
+        path,
+        tradable_mode="tradable",
+        trading_volume_policy="required",
+    )
+    polars = _load_symbol_arrays_polars_lazy(
+        path,
+        tradable_mode="tradable",
+        trading_volume_policy="required",
+    )
+    np.testing.assert_allclose(
+        arrow.features,
+        polars.features,
+        equal_nan=True,
+        rtol=1e-6,
+        atol=1e-7,
+    )
+    for feature in (
+        "open_logret_1d",
+        "max_logret_1d",
+        "min_logret_1d",
+        "close_logret_1d",
+        "trading_volume_logret_1d",
+        "signed_vol",
+        "delta_body_ratio",
+        "delta_clv",
+    ):
+        index = BASE_PANEL_FEATURE_COLUMNS.index(feature)
+        assert np.isnan(arrow.features[1, index]), feature
+    gap_index = BASE_PANEL_FEATURE_COLUMNS.index(DAY_TRADE_OPEN_GAP_FEATURE)
+    assert np.isnan(arrow.features[0, gap_index])
+
+
 def test_expiry_month_slot_keeps_far_contract_until_its_own_expiry(tmp_path: Path) -> None:
     source = tmp_path / "all.parquet"
     products = tmp_path / "products.csv"
@@ -96,17 +196,26 @@ def test_expiry_month_slot_keeps_far_contract_until_its_own_expiry(tmp_path: Pat
 
     daily, master = build_continuous_daily(source, products, stocks, official)
     assert set(master["official_product"].to_list()) == {"TX", "CDF"}
-    tx_aug = daily.filter(pl.col("symbol") == "TX_M08_L1").sort("date")
+    tx_aug = daily.filter(
+        (pl.col("product") == "TX") & (pl.col("contract") == "202608")
+    ).sort("date")
     assert tx_aug["contract"].to_list() == ["202608", "202608"]
+    assert tx_aug["symbol"].n_unique() == 1
+    assert tx_aug["delivery_slot_symbol"].unique().to_list() == ["TX_M08_L1"]
+    assert tx_aug["delivery_month"].unique().to_list() == [8]
     assert np.isclose(tx_aug["holding_log_return"][0], np.log(110.0 / 100.0))
     assert np.isclose(tx_aug["holding_log_return"][1], np.log(120.0 / 110.0))
     assert tx_aug["must_liquidate"].to_list() == [False, True]
     assert tx_aug["liquidation_reason"][1] == "last_trade_date"
 
-    # September remains M09 on both sides of the August expiry.  It does not
-    # migrate from R2 to R1 and can therefore stay open as a far-month holding.
-    tx_sep = daily.filter(pl.col("symbol") == "TX_M09_L1").sort("date")
+    # September remains in one fixed tensor slot on both sides of the August
+    # expiry and can therefore stay open as a far-month holding.
+    tx_sep = daily.filter(
+        (pl.col("product") == "TX") & (pl.col("contract") == "202609")
+    ).sort("date")
     assert tx_sep["contract"].to_list() == ["202609", "202609", "202609"]
+    assert tx_sep["symbol"].n_unique() == 1
+    assert tx_sep["delivery_slot_symbol"].unique().to_list() == ["TX_M09_L1"]
     assert tx_sep["source_row_observed"].to_list() == [True, False, True]
     assert tx_sep["executable"].to_list() == [True, False, True]
     assert tx_sep["must_liquidate"].to_list() == [False, False, True]
@@ -153,8 +262,11 @@ def test_same_delivery_month_overlap_gets_stable_lanes(tmp_path: Path) -> None:
     daily, _ = build_continuous_daily(source, products, stocks, official)
     older = daily.filter(pl.col("contract") == "202609")
     farther = daily.filter(pl.col("contract") == "202709").sort("date")
-    assert older["symbol"].unique().to_list() == ["SPF_M09_L1"]
-    assert farther["symbol"].unique().to_list() == ["SPF_M09_L2"]
+    assert older["symbol"].n_unique() == 1
+    assert farther["symbol"].n_unique() == 1
+    assert older["symbol"][0] != farther["symbol"][0]
+    assert older["delivery_slot_symbol"].unique().to_list() == ["SPF_M09_L1"]
+    assert farther["delivery_slot_symbol"].unique().to_list() == ["SPF_M09_L2"]
     assert farther["must_liquidate"].to_list() == [False, False, True]
 
 
@@ -353,4 +465,4 @@ def test_new_training_config_uses_canonical_daily_trainer() -> None:
     assert config.trading.tw_futures_portfolio_fee_standard_twd == 24.0
     assert config.trading.tw_futures_portfolio_fee_stock_twd == 40.0
     assert config.trading.tw_futures_portfolio_fee_micro_twd == 16.0
-    assert "taifex_portfolio_daily_v3" in config.trading.tw_futures_portfolio_data_path
+    assert "taifex_portfolio_daily_v4" in config.trading.tw_futures_portfolio_data_path
