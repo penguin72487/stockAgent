@@ -1,12 +1,12 @@
 base_config: tw_public_lanten_market_candles.yaml
 
-experiment_name: tw-full-market-minute-long-short-cost-aware-v10
+experiment_name: tw-full-market-minute-long-short-cost-aware-panel-history-v11
 
 runner:
   # Training-contract v13 preserves the exact proximal candidate instead of
   # re-normalizing away its no-trade band. Preserve the still-running v9 job in
   # its own root; it is not optimizer-compatible with this allocator contract.
-  output_dir: artifacts/markets/tw_minute_dual_5090_cost_aware_v10
+  output_dir: artifacts/markets/tw_minute_dual_5090_cost_aware_panel_history_v11
   mode: train
   resume: true
   post_train_infer: false
@@ -47,13 +47,13 @@ data:
   tw_public_feature_path: data_tw_public/features/tw_public_stock_daily.parquet
 
 walk_forward:
-  # Minute partitions begin in 2020. Keep every session strictly chronological
-  # and require a complete lookback within its owned split.
+  # Minute partitions begin in 2020. Keep every session strictly chronological;
+  # the first owned target may use only already-observed prior panel rows.
   min_train_years: 2
   val_years: 1
   expected_first_year: 2020
   split_start_year: null
-  lookback_context: split_only
+  lookback_context: panel_history
   require_contiguous_years: true
   require_future_test_year: false
 

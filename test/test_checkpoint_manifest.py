@@ -355,11 +355,11 @@ def test_checkpoint_manifest_blocks_semantic_training_changes() -> None:
         ("walk_forward", lambda cfg: setattr(cfg.walk_forward, "val_years", 2)),
         (
             "walk_forward",
-            lambda cfg: setattr(
-                cfg.walk_forward,
-                "lookback_context",
-                "panel_history",
-            ),
+                lambda cfg: setattr(
+                    cfg.walk_forward,
+                    "lookback_context",
+                    "split_only",
+                ),
         ),
         (
             "walk_forward",
@@ -1330,6 +1330,7 @@ def test_schema_v4_before_lookback_context_remains_compatible_at_defaults(
 ) -> None:
     panel = _panel()
     config = _config()
+    config.walk_forward.lookback_context = "split_only"
     assert config.walk_forward.lookback_context == "split_only"
     assert config.walk_forward.split_start_year is None
     current = _checkpoint_manifest(panel, config)

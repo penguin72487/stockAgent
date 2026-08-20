@@ -12,9 +12,9 @@ source scripts/runtime_env.sh
 run_fintech_python scripts/check_environment.py --require-cuda --strict
 
 required_data=(
-  data_tw_futures/taifex_portfolio_daily_v3/manifest.json
-  data_tw_futures/taifex_portfolio_daily_v3/continuous_daily.parquet
-  data_tw_futures/taifex_portfolio_daily_v3/model_features.parquet
+  data_tw_futures/taifex_portfolio_daily_v4/manifest.json
+  data_tw_futures/taifex_portfolio_daily_v4/continuous_daily.parquet
+  data_tw_futures/taifex_portfolio_daily_v4/model_features.parquet
 )
 for path in "${required_data[@]}"; do
   if [[ ! -s "$path" ]]; then

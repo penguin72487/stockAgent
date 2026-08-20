@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 import fnmatch
 
+import torch
 from torch import nn
 
 from stockagent.config import ExperimentConfig
@@ -179,6 +180,7 @@ def build_model(
     num_symbols: int,
     feature_names: Sequence[str] | None = None,
     daily_context_feature_names: Sequence[str] | None = None,
+    temporal_basis_overrides: dict[str, torch.Tensor] | None = None,
 ) -> nn.Module:
     model_name = _normalized_model_name(config.training.model_name)
 
@@ -420,7 +422,14 @@ def build_model(
             temporal_query_mode=tbp_cfg.temporal_query_mode,
             temporal_basis_families=tbp_cfg.temporal_basis_families,
             temporal_basis_components=tbp_cfg.temporal_basis_components,
+            temporal_basis_components_by_family=(
+                tbp_cfg.temporal_basis_components_by_family
+            ),
+            temporal_basis_novelty_threshold=(
+                tbp_cfg.temporal_basis_novelty_threshold
+            ),
             temporal_basis_input=tbp_cfg.temporal_basis_input,
+            temporal_basis_overrides=temporal_basis_overrides,
             cross_layers=tbp_cfg.cross_layers,
             cross_heads=tbp_cfg.cross_heads,
             cross_ffn_mult=tbp_cfg.cross_ffn_mult,
@@ -439,6 +448,9 @@ def build_model(
             portfolio_activation=config.trading.portfolio_activation,
             portfolio_output_mode=tbp_cfg.portfolio_output_mode,
             center_long_short_logits=tbp_cfg.center_long_short_logits,
+            projection_l1_scale_by_active_count=(
+                tbp_cfg.projection_l1_scale_by_active_count
+            ),
             max_full_tokens=tbp_cfg.max_full_tokens,
             checkpoint_blocks=tbp_cfg.checkpoint_blocks,
             return_aux=tbp_cfg.return_aux,
@@ -530,7 +542,14 @@ def build_model(
             temporal_query_mode=fin_cfg.temporal_query_mode,
             temporal_basis_families=fin_cfg.temporal_basis_families,
             temporal_basis_components=fin_cfg.temporal_basis_components,
+            temporal_basis_components_by_family=(
+                fin_cfg.temporal_basis_components_by_family
+            ),
+            temporal_basis_novelty_threshold=(
+                fin_cfg.temporal_basis_novelty_threshold
+            ),
             temporal_basis_input=fin_cfg.temporal_basis_input,
+            temporal_basis_overrides=temporal_basis_overrides,
             cross_layers=fin_cfg.cross_layers,
             cross_heads=fin_cfg.cross_heads,
             cross_ffn_mult=fin_cfg.cross_ffn_mult,
@@ -549,6 +568,9 @@ def build_model(
             portfolio_activation=config.trading.portfolio_activation,
             portfolio_output_mode=fin_cfg.portfolio_output_mode,
             center_long_short_logits=fin_cfg.center_long_short_logits,
+            projection_l1_scale_by_active_count=(
+                fin_cfg.projection_l1_scale_by_active_count
+            ),
             max_full_tokens=fin_cfg.max_full_tokens,
             checkpoint_blocks=fin_cfg.checkpoint_blocks,
             return_aux=fin_cfg.return_aux,

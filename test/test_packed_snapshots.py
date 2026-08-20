@@ -140,6 +140,38 @@ def test_packed_snapshot_excludes_reproducible_subtree(tmp_path: Path) -> None:
     ]
 
 
+def test_packed_snapshot_can_select_only_small_files(tmp_path: Path) -> None:
+    source = _source_tree(tmp_path)
+    sync_root = tmp_path / "sync"
+    initialize_packed_layout(sync_root, node_id="node-a")
+
+    resolved = publish_packed_snapshot(
+        sync_root,
+        "small-prices",
+        source,
+        loose_file_threshold_bytes=1024,
+        pack_buckets=4,
+        maximum_file_bytes=1023,
+    )
+    target = fetch_packed_snapshot(sync_root, tmp_path / "materialized", resolved)
+
+    assert resolved.manifest["source"]["selection"] == {
+        "maximum_file_bytes": 1023,
+        "symlinks": "included",
+    }
+    assert resolved.manifest["source"]["files"] == 2
+    assert resolved.manifest["source"]["omitted_files_above_maximum"] == 2
+    assert all(
+        item["kind"] == "pack" for item in resolved.manifest["archive"]["objects"]
+    )
+    assert (target / "text" / "first.json").is_file()
+    assert not (target / "large-a.bin").exists()
+    assert not (target / "large-b.bin").exists()
+    assert verify_packed_snapshot(sync_root, resolved, materialized_path=target)[
+        "materialized_verified"
+    ]
+
+
 def test_unchanged_publish_reuses_identical_content_objects(tmp_path: Path) -> None:
     source = _source_tree(tmp_path)
     sync_root = tmp_path / "sync"
@@ -165,6 +197,53 @@ def test_unchanged_publish_reuses_identical_content_objects(tmp_path: Path) -> N
     )
     assert first.manifest["archive"]["objects"] == second.manifest["archive"]["objects"]
     assert first.manifest["snapshot_id"] != second.manifest["snapshot_id"]
+    assert second.manifest["archive"]["reused_files"] == 4
+    assert second.manifest["archive"]["changed_files"] == 0
+    assert second.manifest["archive"]["new_stored_bytes"] == 0
+
+
+def test_changed_small_file_uses_delta_pack_and_reuses_old_members(
+    tmp_path: Path,
+) -> None:
+    source = _source_tree(tmp_path)
+    sync_root = tmp_path / "sync"
+    initialize_packed_layout(sync_root, node_id="node-a")
+    first = publish_packed_snapshot(
+        sync_root,
+        "prices",
+        source,
+        loose_file_threshold_bytes=1024,
+        pack_buckets=1,
+    )
+    (source / "text" / "first.json").write_text(
+        '{"first": 2}\n', encoding="utf-8"
+    )
+
+    second = publish_packed_snapshot(
+        sync_root,
+        "prices",
+        source,
+        loose_file_threshold_bytes=1024,
+        pack_buckets=1,
+    )
+    archive = second.manifest["archive"]
+
+    assert archive["base_snapshot_id"] == first.manifest["snapshot_id"]
+    assert archive["reused_files"] == 3
+    assert archive["changed_files"] == 1
+    assert archive["new_stored_bytes"] < archive["stored_bytes"]
+    assert any(
+        item.get("member_selection") == "subset"
+        for item in archive["objects"]
+    )
+    target = fetch_packed_snapshot(sync_root, tmp_path / "materialized", second)
+    assert (target / "text" / "first.json").read_text(encoding="utf-8") == (
+        '{"first": 2}\n'
+    )
+    assert (target / "text" / "second.csv").is_file()
+    assert verify_packed_snapshot(sync_root, second, materialized_path=target)[
+        "materialized_verified"
+    ]
 
 
 def test_latest_packed_snapshot_uses_per_node_heads(tmp_path: Path) -> None:

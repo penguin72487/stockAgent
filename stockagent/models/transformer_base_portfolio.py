@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from copy import deepcopy
 
 import torch
@@ -87,6 +87,12 @@ _TEMPORAL_BASIS_ALIASES: dict[str, str] = {
     "learned_shapelet": "learned",
     "polynomial": "legendre",
     "taylor": "legendre",
+    "hermite": "discrete_hermite",
+    "hermite_discrete": "discrete_hermite",
+    "chirp": "chirplet",
+    "pca": "pca_klt",
+    "klt": "pca_klt",
+    "pca/klt": "pca_klt",
 }
 ONLINE_SAFE_TEMPORAL_BASIS_FAMILIES: tuple[str, ...] = (
     "haar",
@@ -108,7 +114,20 @@ ONLINE_SAFE_TEMPORAL_BASIS_FAMILIES: tuple[str, ...] = (
     "chebyshev",
     "learned",
 )
-_TEMPORAL_BASIS_FAMILIES = frozenset(ONLINE_SAFE_TEMPORAL_BASIS_FAMILIES)
+FIXED_GRID_TEMPORAL_BASIS_FAMILIES: tuple[str, ...] = (
+    "kautz",
+    "discrete_hermite",
+    "chirplet",
+)
+TRAINING_ONLY_TEMPORAL_BASIS_FAMILIES: tuple[str, ...] = ("pca_klt",)
+DEFAULT_TEMPORAL_BASIS_NOVELTY_THRESHOLD = 1e-4
+_TEMPORAL_BASIS_FAMILIES = frozenset(
+    (
+        *ONLINE_SAFE_TEMPORAL_BASIS_FAMILIES,
+        *FIXED_GRID_TEMPORAL_BASIS_FAMILIES,
+        *TRAINING_ONLY_TEMPORAL_BASIS_FAMILIES,
+    )
+)
 
 
 def action_channels_for_execution_mode(execution_mode: str) -> tuple[str, ...]:
@@ -402,6 +421,51 @@ def _orthonormalize_non_dc_rows(
     return orthonormal
 
 
+def _select_novel_temporal_basis_rows(
+    raw_rows: Sequence[torch.Tensor],
+    *,
+    steps: int,
+    novelty_threshold: float,
+) -> tuple[list[torch.Tensor], list[int], list[float]]:
+    """Keep ordered candidates whose residual adds material span."""
+
+    threshold = float(novelty_threshold)
+    if not 0.0 <= threshold < 1.0:
+        raise ValueError("temporal basis novelty threshold must be in [0, 1)")
+    constant = torch.ones(steps, dtype=torch.float64)
+    constant = constant / constant.norm()
+    selected: list[torch.Tensor] = []
+    selected_indices: list[int] = []
+    novelty_ratios: list[float] = []
+    for candidate_index, raw in enumerate(raw_rows):
+        value = raw.to(dtype=torch.float64).reshape(-1)
+        if int(value.numel()) != int(steps) or not bool(torch.isfinite(value).all()):
+            raise ValueError("Temporal basis rows must be finite and match lookback")
+        value = value - torch.dot(value, constant) * constant
+        value_norm_squared = float(value.square().sum().item())
+        if value_norm_squared <= 1e-20:
+            novelty_ratios.append(0.0)
+            continue
+        value = value / math.sqrt(value_norm_squared)
+        residual = value.clone()
+        for _ in range(2):
+            for previous in selected:
+                residual = residual - torch.dot(residual, previous) * previous
+        novelty_ratio = float(residual.square().sum().item())
+        novelty_ratios.append(novelty_ratio)
+        if novelty_ratio < threshold:
+            continue
+        residual = residual / residual.norm().clamp_min(1e-12)
+        pivot = int(residual.abs().argmax().item())
+        if float(residual[pivot].item()) < 0.0:
+            residual = -residual
+        selected.append(residual)
+        selected_indices.append(int(candidate_index))
+        if len(selected) >= int(steps) - 1:
+            break
+    return selected, selected_indices, novelty_ratios
+
+
 def _dpss_basis(steps: int) -> list[torch.Tensor]:
     """Slepian sequences ordered by finite-window spectral concentration."""
 
@@ -561,6 +625,173 @@ def _morlet_basis(steps: int, components: int) -> list[torch.Tensor]:
     return rows
 
 
+_KAUTZ_HALF_LIVES = (1.0, 2.0, 4.0, 8.0, 16.0)
+_KAUTZ_PERIODS = (4.0, 8.0, 16.0, 32.0)
+_HERMITE_CENTERS = (-0.5, 0.0, 0.5)
+_HERMITE_WIDTHS = (0.2, 0.4)
+_HERMITE_DEGREES = (0, 1, 2, 3)
+_CHIRPLET_CENTERS = (-0.5, 0.0, 0.5)
+_CHIRPLET_BASE_PERIODS = (8.0, 16.0)
+_CHIRPLET_RATE_MULTIPLIERS = (-2.0, -1.0, 1.0, 2.0)
+_CHIRPLET_WINDOW_WIDTH = 0.4
+
+
+def _kautz_basis(steps: int) -> list[torch.Tensor]:
+    """Damped sinusoidal atoms, ordered by half-life, period, then phase."""
+
+    age = torch.arange(steps - 1, -1, -1, dtype=torch.float64)
+    rows: list[torch.Tensor] = []
+    for half_life in _KAUTZ_HALF_LIVES:
+        decay = 2.0 ** (-1.0 / float(half_life))
+        envelope = decay**age
+        for period in _KAUTZ_PERIODS:
+            phase = 2.0 * math.pi * age / float(period)
+            rows.append(envelope * torch.cos(phase))
+            rows.append(envelope * torch.sin(phase))
+    return rows
+
+
+def _physicists_hermite(degree: int, x: torch.Tensor) -> torch.Tensor:
+    if degree == 0:
+        return torch.ones_like(x)
+    if degree == 1:
+        return 2.0 * x
+    previous_previous = torch.ones_like(x)
+    previous = 2.0 * x
+    for current_degree in range(2, int(degree) + 1):
+        current = (
+            2.0 * x * previous
+            - 2.0 * float(current_degree - 1) * previous_previous
+        )
+        previous_previous, previous = previous, current
+    return previous
+
+
+def _discrete_hermite_basis(steps: int) -> list[torch.Tensor]:
+    """Localized discrete Hermite atoms on normalized time ``[-1, 1]``."""
+
+    time = torch.linspace(-1.0, 1.0, steps, dtype=torch.float64)
+    rows: list[torch.Tensor] = []
+    for center in _HERMITE_CENTERS:
+        for width in _HERMITE_WIDTHS:
+            localized = (time - float(center)) / float(width)
+            envelope = torch.exp(-0.5 * localized.square())
+            for degree in _HERMITE_DEGREES:
+                rows.append(
+                    _physicists_hermite(int(degree), localized) * envelope
+                )
+    return rows
+
+
+def _chirplet_basis(steps: int) -> list[torch.Tensor]:
+    """Gaussian-windowed linear chirps with 48 deterministic grid atoms."""
+
+    time = torch.linspace(-1.0, 1.0, steps, dtype=torch.float64)
+    samples_per_time_unit = max(1.0, float(steps - 1) / 2.0)
+    rows: list[torch.Tensor] = []
+    for center in _CHIRPLET_CENTERS:
+        delta_time = time - float(center)
+        sample_offset = delta_time * samples_per_time_unit
+        window = torch.exp(
+            -0.5 * (delta_time / float(_CHIRPLET_WINDOW_WIDTH)).square()
+        )
+        for period in _CHIRPLET_BASE_PERIODS:
+            omega0 = 2.0 * math.pi / float(period)
+            base_chirp_rate = 2.0 * math.pi / (
+                float(period) * max(1.0, float(steps - 1))
+            )
+            for multiplier in _CHIRPLET_RATE_MULTIPLIERS:
+                alpha = float(multiplier) * base_chirp_rate
+                phase = (
+                    omega0 * sample_offset
+                    + 0.5 * alpha * sample_offset.square()
+                )
+                rows.append(window * torch.cos(phase))
+                rows.append(window * torch.sin(phase))
+    return rows
+
+
+def _remove_dc_and_l2_normalize_rows(
+    raw_rows: Sequence[torch.Tensor],
+    *,
+    steps: int,
+) -> list[torch.Tensor]:
+    """Apply the fixed-candidate contract before component selection."""
+
+    normalized: list[torch.Tensor] = []
+    for raw in raw_rows:
+        row = raw.to(dtype=torch.float64).reshape(-1)
+        if int(row.numel()) != int(steps) or not bool(torch.isfinite(row).all()):
+            raise ValueError("Temporal basis candidates must be finite and match lookback")
+        row = row - row.mean()
+        norm = row.norm()
+        if float(norm.item()) <= 1e-10:
+            continue
+        normalized.append(row / norm)
+    return normalized
+
+
+def temporal_basis_candidate_parameters(
+    family: str,
+    *,
+    steps: int,
+) -> list[dict[str, float | int | str]]:
+    """Return auditable grid parameters in the raw candidate order."""
+
+    family = _normalize_temporal_basis_families((family,))[0]
+    if family == "kautz":
+        return [
+            {
+                "half_life": float(half_life),
+                "period": float(period),
+                "phase": phase,
+                "decay_r": float(2.0 ** (-1.0 / float(half_life))),
+            }
+            for half_life in _KAUTZ_HALF_LIVES
+            for period in _KAUTZ_PERIODS
+            for phase in ("cos", "sin")
+        ]
+    if family == "discrete_hermite":
+        return [
+            {
+                "center": float(center),
+                "width": float(width),
+                "degree": int(degree),
+                "polynomial": "physicists_hermite",
+            }
+            for center in _HERMITE_CENTERS
+            for width in _HERMITE_WIDTHS
+            for degree in _HERMITE_DEGREES
+        ]
+    if family == "chirplet":
+        parameters: list[dict[str, float | int | str]] = []
+        for center in _CHIRPLET_CENTERS:
+            for period in _CHIRPLET_BASE_PERIODS:
+                base_chirp_rate = 2.0 * math.pi / (
+                    float(period) * max(1.0, float(steps - 1))
+                )
+                for multiplier in _CHIRPLET_RATE_MULTIPLIERS:
+                    for phase in ("cos", "sin"):
+                        parameters.append(
+                            {
+                                "center": float(center),
+                                "base_period": float(period),
+                                "chirp_rate_multiplier": float(multiplier),
+                                "base_chirp_rate": float(base_chirp_rate),
+                                "alpha": float(multiplier * base_chirp_rate),
+                                "phase": phase,
+                                "gaussian_width": float(_CHIRPLET_WINDOW_WIDTH),
+                            }
+                        )
+        return parameters
+    if family == "pca_klt":
+        return [
+            {"eigen_rank": int(index + 1), "training_only": "true"}
+            for index in range(max(0, int(steps) - 1))
+        ]
+    return []
+
+
 def _qmf_high_pass(low_pass: torch.Tensor) -> torch.Tensor:
     signs = torch.where(
         torch.arange(low_pass.numel()) % 2 == 0,
@@ -700,11 +931,73 @@ _SYM4_LOW_PASS = (
 )
 
 
+def _fixed_temporal_basis_candidates(
+    family: str,
+    *,
+    steps: int,
+    components_hint: int,
+) -> list[torch.Tensor]:
+    """Build the fixed candidate pool after DC removal and L2 normalization."""
+
+    normalized = _normalize_temporal_basis_families((family,))
+    if len(normalized) != 1:
+        raise ValueError("Exactly one temporal basis family is required")
+    family = normalized[0]
+    if family == "pca_klt":
+        raise ValueError(
+            "PCA/KLT temporal basis requires a fold-training covariance override"
+        )
+    if family == "haar":
+        rows = _haar_basis(steps)
+    elif family == "walsh":
+        rows = _walsh_basis(steps)
+    elif family == "fourier":
+        rows = _fourier_basis(steps)
+    elif family == "dct":
+        rows = _dct_basis(steps)
+    elif family == "dpss":
+        rows = _dpss_basis(steps)
+    elif family == "exponential":
+        rows = _exponential_basis(steps, components_hint)
+    elif family == "laguerre":
+        rows = _laguerre_basis(steps, components_hint)
+    elif family == "difference":
+        rows = _difference_basis(steps, components_hint)
+    elif family == "ar_innovation":
+        rows = _ar_innovation_basis(steps, components_hint)
+    elif family == "bspline":
+        rows = _bspline_basis(steps, components_hint)
+    elif family == "local_cosine":
+        rows = _local_cosine_basis(steps, components_hint)
+    elif family == "morlet":
+        rows = _morlet_basis(steps, components_hint)
+    elif family == "swt_db2":
+        rows = _stationary_wavelet_basis(steps, _DB2_LOW_PASS)
+    elif family == "swt_sym4":
+        rows = _stationary_wavelet_basis(steps, _SYM4_LOW_PASS)
+    elif family == "wavelet_packet":
+        rows = _wavelet_packet_basis(steps, components_hint)
+    elif family in {"legendre", "chebyshev"}:
+        rows = _orthonormal_polynomial_basis(steps, family)
+    elif family == "kautz":
+        rows = _kautz_basis(steps)
+    elif family == "discrete_hermite":
+        rows = _discrete_hermite_basis(steps)
+    elif family == "chirplet":
+        rows = _chirplet_basis(steps)
+    else:
+        # The learned dictionary starts from a stable non-DC DCT bank and is
+        # registered as a parameter by TemporalBasisFeatureEncoder.
+        rows = _dct_basis(steps)
+    return _remove_dc_and_l2_normalize_rows(rows, steps=steps)
+
+
 def _temporal_basis_matrix(
     family: str,
     *,
     steps: int,
     components: int,
+    novelty_threshold: float | None = None,
 ) -> torch.Tensor:
     """Build a deterministic non-DC analysis bank for one causal window."""
 
@@ -719,43 +1012,21 @@ def _temporal_basis_matrix(
     if components < 1:
         raise ValueError("temporal_basis_components must be positive")
 
-    if family == "haar":
-        rows = _haar_basis(steps)
-    elif family == "walsh":
-        rows = _walsh_basis(steps)
-    elif family == "fourier":
-        rows = _fourier_basis(steps)
-    elif family == "dct":
-        rows = _dct_basis(steps)
-    elif family == "dpss":
-        rows = _dpss_basis(steps)
-    elif family == "exponential":
-        rows = _exponential_basis(steps, components)
-    elif family == "laguerre":
-        rows = _laguerre_basis(steps, components)
-    elif family == "difference":
-        rows = _difference_basis(steps, components)
-    elif family == "ar_innovation":
-        rows = _ar_innovation_basis(steps, components)
-    elif family == "bspline":
-        rows = _bspline_basis(steps, components)
-    elif family == "local_cosine":
-        rows = _local_cosine_basis(steps, components)
-    elif family == "morlet":
-        rows = _morlet_basis(steps, components)
-    elif family == "swt_db2":
-        rows = _stationary_wavelet_basis(steps, _DB2_LOW_PASS)
-    elif family == "swt_sym4":
-        rows = _stationary_wavelet_basis(steps, _SYM4_LOW_PASS)
-    elif family == "wavelet_packet":
-        rows = _wavelet_packet_basis(steps, components)
-    elif family in {"legendre", "chebyshev"}:
-        rows = _orthonormal_polynomial_basis(steps, family)
+    rows = _fixed_temporal_basis_candidates(
+        family,
+        steps=steps,
+        components_hint=(steps - 1 if novelty_threshold is not None else components),
+    )
+    if novelty_threshold is None:
+        rows = _orthonormalize_non_dc_rows(rows, steps=steps)
     else:
-        # The learned dictionary starts from a stable non-DC DCT bank and is
-        # registered as a parameter by TemporalBasisFeatureEncoder.
-        rows = _dct_basis(steps)
-    rows = _orthonormalize_non_dc_rows(rows, steps=steps)
+        rows, _selected_indices, _novelty_ratios = (
+            _select_novel_temporal_basis_rows(
+                rows,
+                steps=steps,
+                novelty_threshold=float(novelty_threshold),
+            )
+        )
     if not rows:
         raise ValueError(
             f"Temporal basis family {family!r} has no non-constant components "
@@ -771,6 +1042,51 @@ def _temporal_basis_matrix(
     else:
         selected = rows[:keep]
     return torch.stack(selected, dim=0).to(dtype=torch.float32)
+
+
+def _validated_temporal_basis_override(
+    matrix: torch.Tensor,
+    *,
+    family: str,
+    steps: int,
+    components: int,
+) -> torch.Tensor:
+    """Validate one fold-fitted bank without changing its eigenvalue order."""
+
+    value = torch.as_tensor(matrix, dtype=torch.float64).detach().cpu()
+    if value.ndim != 2 or int(value.size(1)) != int(steps):
+        raise ValueError(
+            f"Temporal basis override {family!r} must have shape [K,{steps}]"
+        )
+    if int(value.size(0)) < 1 or int(value.size(0)) > int(steps) - 1:
+        raise ValueError(
+            f"Temporal basis override {family!r} must contain 1..{steps - 1} rows"
+        )
+    if not bool(torch.isfinite(value).all()):
+        raise ValueError(f"Temporal basis override {family!r} must be finite")
+    keep = min(int(components), int(value.size(0)))
+    value = value[:keep]
+    dc_error = float(value.sum(dim=1).abs().max().item())
+    if dc_error > 2e-6:
+        raise ValueError(
+            f"Temporal basis override {family!r} contains a DC component "
+            f"(max row sum={dc_error:.3e})"
+        )
+    gram_error = float(
+        (
+            value @ value.transpose(0, 1)
+            - torch.eye(keep, dtype=torch.float64)
+        )
+        .abs()
+        .max()
+        .item()
+    )
+    if gram_error > 2e-6:
+        raise ValueError(
+            f"Temporal basis override {family!r} must be orthonormal "
+            f"(max Gram error={gram_error:.3e})"
+        )
+    return value.to(dtype=torch.float32)
 
 
 class TemporalBasisFeatureEncoder(nn.Module):
@@ -795,8 +1111,11 @@ class TemporalBasisFeatureEncoder(nn.Module):
         source_dim: int | None = None,
         families: Sequence[str] | str,
         components: int,
+        components_by_family: Mapping[str, int] | None = None,
+        novelty_threshold: float = DEFAULT_TEMPORAL_BASIS_NOVELTY_THRESHOLD,
         sanitize_inputs: bool = True,
         fuse_projection: bool = False,
+        basis_overrides: Mapping[str, torch.Tensor] | None = None,
     ) -> None:
         super().__init__()
         self.lookback = int(lookback)
@@ -811,19 +1130,60 @@ class TemporalBasisFeatureEncoder(nn.Module):
             raise ValueError("TemporalBasisFeatureEncoder requires at least one family")
 
         self.family_component_counts: dict[str, int] = {}
-        for family in self.family_names:
-            matrix = _temporal_basis_matrix(
-                family,
-                steps=self.lookback,
-                components=int(components),
+        normalized_component_limits = {
+            _normalize_temporal_basis_families((name,))[0]: int(value)
+            for name, value in dict(components_by_family or {}).items()
+        }
+        unexpected_component_limits = set(normalized_component_limits).difference(
+            self.family_names
+        )
+        if unexpected_component_limits:
+            raise ValueError(
+                "Temporal basis component limits are not enabled families: "
+                f"{sorted(unexpected_component_limits)}"
             )
+        if any(value < 1 for value in normalized_component_limits.values()):
+            raise ValueError("Per-family temporal basis components must be positive")
+        self.components_by_family = normalized_component_limits
+        self.novelty_threshold = float(novelty_threshold)
+        normalized_overrides = {
+            _normalize_temporal_basis_families((name,))[0]: matrix
+            for name, matrix in dict(basis_overrides or {}).items()
+        }
+        for family in self.family_names:
+            family_components = self.components_by_family.get(
+                family,
+                int(components),
+            )
+            if family in normalized_overrides:
+                matrix = _validated_temporal_basis_override(
+                    normalized_overrides[family],
+                    family=family,
+                    steps=self.lookback,
+                    components=family_components,
+                )
+            else:
+                matrix = _temporal_basis_matrix(
+                    family,
+                    steps=self.lookback,
+                    components=family_components,
+                    novelty_threshold=(
+                        self.novelty_threshold
+                        if family in self.components_by_family
+                        else None
+                    ),
+                )
             if family == "learned":
                 self.register_parameter(
                     f"{family}_basis",
                     nn.Parameter(matrix),
                 )
             else:
-                self.register_buffer(f"{family}_basis", matrix, persistent=False)
+                self.register_buffer(
+                    f"{family}_basis",
+                    matrix,
+                    persistent=family in normalized_overrides,
+                )
             self.family_component_counts[family] = int(matrix.size(0))
 
         self.total_basis_components = sum(self.family_component_counts.values())
@@ -1637,7 +1997,12 @@ class TransformerBasePortfolioModel(nn.Module):
         temporal_query_mode: str = "full_then_last",
         temporal_basis_families: Sequence[str] | str | None = None,
         temporal_basis_components: int = 8,
+        temporal_basis_components_by_family: Mapping[str, int] | None = None,
+        temporal_basis_novelty_threshold: float = (
+            DEFAULT_TEMPORAL_BASIS_NOVELTY_THRESHOLD
+        ),
         temporal_basis_input: str = "embedded",
+        temporal_basis_overrides: Mapping[str, torch.Tensor] | None = None,
         cross_layers: int = 1,
         cross_heads: int = 4,
         cross_ffn_mult: int = 2,
@@ -1656,6 +2021,7 @@ class TransformerBasePortfolioModel(nn.Module):
         portfolio_activation: str = "identity",
         portfolio_output_mode: str = "activation_l1",
         center_long_short_logits: bool = True,
+        projection_l1_scale_by_active_count: bool = False,
         max_full_tokens: int = 4096,
         checkpoint_blocks: bool = False,
         return_aux: bool = True,
@@ -1700,9 +2066,49 @@ class TransformerBasePortfolioModel(nn.Module):
             temporal_basis_families
         )
         self.temporal_basis_components = int(temporal_basis_components)
+        self.temporal_basis_components_by_family = {
+            _normalize_temporal_basis_families((name,))[0]: int(value)
+            for name, value in dict(
+                temporal_basis_components_by_family or {}
+            ).items()
+        }
+        unexpected_component_limits = set(
+            self.temporal_basis_components_by_family
+        ).difference(self.temporal_basis_families)
+        if unexpected_component_limits:
+            raise ValueError(
+                "Temporal basis component limits are not enabled families: "
+                f"{sorted(unexpected_component_limits)}"
+            )
+        if any(
+            value < 1
+            for value in self.temporal_basis_components_by_family.values()
+        ):
+            raise ValueError("Per-family temporal basis components must be positive")
+        self.temporal_basis_novelty_threshold = float(
+            temporal_basis_novelty_threshold
+        )
+        if not 0.0 <= self.temporal_basis_novelty_threshold < 1.0:
+            raise ValueError(
+                "temporal_basis_novelty_threshold must be in [0, 1)"
+            )
         self.temporal_basis_input = _normalize_temporal_basis_input(
             temporal_basis_input
         )
+        self.temporal_basis_overrides = {
+            _normalize_temporal_basis_families((name,))[0]: torch.as_tensor(
+                matrix
+            ).detach().cpu()
+            for name, matrix in dict(temporal_basis_overrides or {}).items()
+        }
+        unexpected_basis_overrides = set(self.temporal_basis_overrides).difference(
+            self.temporal_basis_families
+        )
+        if unexpected_basis_overrides:
+            raise ValueError(
+                "Temporal basis overrides are not enabled in the configured "
+                f"families: {sorted(unexpected_basis_overrides)}"
+            )
         if (
             self.temporal_basis_families
             and self.temporal_basis_input == "input_features"
@@ -1723,6 +2129,9 @@ class TransformerBasePortfolioModel(nn.Module):
                 "channel; carrying-mode phase heads require a separate cash contract"
             )
         self.center_long_short_logits = bool(center_long_short_logits)
+        self.projection_l1_scale_by_active_count = bool(
+            projection_l1_scale_by_active_count
+        )
         self.max_full_tokens = int(max_full_tokens)
         self.checkpoint_blocks = bool(checkpoint_blocks)
         # Runtime executors may place a larger checkpoint around the intraday
@@ -1899,8 +2308,11 @@ class TransformerBasePortfolioModel(nn.Module):
                 ),
                 families=self.temporal_basis_families,
                 components=self.temporal_basis_components,
+                components_by_family=self.temporal_basis_components_by_family,
+                novelty_threshold=self.temporal_basis_novelty_threshold,
                 sanitize_inputs=self.sanitize_inputs,
                 fuse_projection=(self.temporal_basis_input == "raw_features"),
+                basis_overrides=self.temporal_basis_overrides,
             )
             if (
                 self.temporal_basis_families
@@ -3463,6 +3875,7 @@ class TransformerBasePortfolioModel(nn.Module):
                 target_logits,
                 mask_bool,
                 long_only=long_only,
+                scale_by_active_count=self.projection_l1_scale_by_active_count,
             )
             if return_parts:
                 output_aux = {
@@ -3952,7 +4365,14 @@ class TransformerBasePortfolioModel(nn.Module):
                 else:
                     weights = cash_output
             elif self.portfolio_output_mode == "projection_l1":
-                weights = masked_l1_projection_weights(target_logits, mask_bool, long_only=True)
+                weights = masked_l1_projection_weights(
+                    target_logits,
+                    mask_bool,
+                    long_only=True,
+                    scale_by_active_count=(
+                        self.projection_l1_scale_by_active_count
+                    ),
+                )
                 if include_action_aux:
                     output_aux = {
                         "projection_gross_exposure": weights.abs().sum(dim=1),
@@ -4047,7 +4467,14 @@ class TransformerBasePortfolioModel(nn.Module):
                 else:
                     weights = cash_output
             elif self.portfolio_output_mode == "projection_l1":
-                weights = masked_l1_projection_weights(target_logits, mask_bool, long_only=False)
+                weights = masked_l1_projection_weights(
+                    target_logits,
+                    mask_bool,
+                    long_only=False,
+                    scale_by_active_count=(
+                        self.projection_l1_scale_by_active_count
+                    ),
+                )
                 if include_action_aux:
                     output_aux = {
                         "projection_gross_exposure": weights.abs().sum(dim=1),

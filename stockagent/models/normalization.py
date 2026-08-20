@@ -392,12 +392,22 @@ def masked_l1_projection_weights(
     long_only: bool = False,
     radius: float = 1.0,
     eps: float = 1e-12,
+    scale_by_active_count: bool = False,
 ) -> torch.Tensor:
     """Project raw holdings onto the masked L1 ball ``sum(abs(w)) <= radius``.
 
     Rows already inside the legal set are preserved, so cash remains possible.
     Rows outside the set are soft-thresholded; this gives exact zeros and keeps
     the long/short ratio unconstrained apart from the gross exposure cap.
+
+    ``scale_by_active_count`` gives each raw score an average-position meaning:
+    before projection, score ``1`` on every active asset is one unit of gross
+    exposure, independent of universe width.  This is essential for large,
+    time-varying universes.  Without it, an O(1) score head produces O(S) raw
+    gross exposure, so almost every row is pinned to the L1 boundary and the
+    sparse projection active set supplies a discontinuous, mostly-zero
+    gradient.  The option is explicit and disabled by default to preserve
+    historical checkpoint semantics.
     """
     with profile_range("portfolio.projection_l1"):
         if mask is None:
@@ -408,6 +418,9 @@ def masked_l1_projection_weights(
         clean = clean.masked_fill(~mask_bool, 0.0)
         if long_only:
             clean = clean.clamp_min(0.0)
+        if scale_by_active_count:
+            active_count = mask_bool.sum(dim=1, keepdim=True).clamp_min(1)
+            clean = clean / active_count.to(dtype=clean.dtype)
 
         abs_clean = clean.abs()
         l1 = abs_clean.sum(dim=1, keepdim=True)

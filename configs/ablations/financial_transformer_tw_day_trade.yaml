@@ -2,7 +2,7 @@
 # model. Architecture variants hold projection-L1 fixed; the final dimension
 # deliberately varies the portfolio output contract.
 base_config: configs/markets/tw_public_lanten_market_candles.yaml
-output_root: artifacts/ablations/financial_transformer_tw_day_trade_long_short_candles_projection_l1_capital10m_split_only_v3
+output_root: artifacts/ablations/financial_transformer_tw_day_trade_long_short_candles_projection_l1_capital10m_panel_history_v4
 expected_fold_count: 12
 
 runtime:
@@ -14,9 +14,9 @@ matrix:
   include_baseline: true
   fixed_overrides:
     walk_forward:
-      # Test ownership is [this year's first complete in-split lookback,
-      # next year's first complete in-split lookback), not panel-history day 1.
-      lookback_context: split_only
+      # Test ownership is [this year's first target, next year's first target).
+      # Each target may use only already-observed rows as lookback context.
+      lookback_context: panel_history
     trading:
       execution_mode: tw_day_trade
       # Buy/open-long -> sell-at-close and sell-first -> cover-at-close are

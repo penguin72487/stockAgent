@@ -3,7 +3,7 @@
 # TWD 10M baseline capital. Preserved TWD 1M checkpoints are not linked into
 # this root because capital changes execution feasibility and optimizer loss.
 base_config: configs/markets/tw_public_lanten_market_candles.yaml
-output_root: artifacts/ablations/financial_transformer_tw_day_trade_output_modes_projection_l1_capital10m_split_only_v3
+output_root: artifacts/ablations/financial_transformer_tw_day_trade_output_modes_projection_l1_capital10m_panel_history_v4
 expected_fold_count: 12
 
 runtime:
@@ -15,9 +15,9 @@ matrix:
   include_baseline: true
   fixed_overrides:
     walk_forward:
-      # Keep every output-mode comparison on the same year-local lookback and
-      # next-model handoff interval.
-      lookback_context: split_only
+      # Keep every output-mode comparison on the same first-target ownership
+      # and causal panel-history lookback interval.
+      lookback_context: panel_history
     trading:
       execution_mode: tw_day_trade
       long_only: false

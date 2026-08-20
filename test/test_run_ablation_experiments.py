@@ -70,6 +70,119 @@ output_root: artifacts/ablations/multi_basis_capital10m
     assert [row["name"] for row in rows] == ["baseline", "variant"]
 
 
+def test_projection_l1_multi_basis_ablation_runs_baseline_then_every_variant(
+    tmp_path: Path,
+) -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    spec_path = (
+        repo_root
+        / "configs/ablations/tw_day_trade_daily_multi_basis_projection_l1_tplus2_close_commission20_v1.yaml"
+    )
+    spec, experiments = _experiment_rows(spec_path)
+
+    assert len(experiments) == 20
+    experiment_names = [row["name"] for row in experiments]
+    assert experiment_names[0] == "baseline"
+    assert "lookback128_batch128" in experiment_names
+    assert "lookback128_batch256" not in experiment_names
+    assert "require_complete_baseline_artifact" not in spec
+    assert "baseline_artifact_root" not in spec
+    assert "panel_history_v3" in spec["output_root"]
+    assert spec["runtime"]["parallel_jobs"] == 1
+    assert spec["pinned_panel_cache"] == {
+        "snapshot_id": "tw-public-20260818T004438951872136Z-l0-penguin-03232cac51756cb4",
+        "variant_id": "dffa1e873a46390f68a60efa5e30e8f2a5d0c3546d1a6aeed5d52215e3de2448",
+        "version": 51,
+        "generation": "a49777df44f241b29c87d36f89504406",
+        "source_hash": "7aa93ac5d97fa96bdfec042750edc28d68ab5129afa748dbf83a7df81f119464",
+    }
+
+    runs = _build_configs(spec_path, spec, experiments, tmp_path)
+    effective = {
+        run["name"]: yaml.safe_load(run["config_path"].read_text(encoding="utf-8"))
+        for run in runs
+    }
+    output_mode_variants = {
+        "output_activation_l1",
+        "output_logits",
+        "output_signed_softmax",
+        "output_signed_entmax15",
+        "output_signed_sparsemax",
+    }
+    for name, raw in effective.items():
+        assert raw["walk_forward"]["lookback_context"] == "panel_history"
+        assert raw["training"]["epochs"] == 1000
+        assert raw["training"]["record_epoch_curve"] is True
+        assert raw["training"]["curve_plot_interval"] == 1
+        assert raw["training"]["defer_epoch_curve_plot_until_end"] is False
+        expected_capital = {
+            "initial_capital_1m": 1_000_000.0,
+            "initial_capital_100m": 100_000_000.0,
+        }.get(name, 10_000_000.0)
+        assert raw["trading"]["volume_participation_equity"] == expected_capital
+        assert raw["training"]["batch_size_train"] == 128
+        if name not in output_mode_variants:
+            assert (
+                raw["training"]["financial_transformer"]["portfolio_output_mode"]
+                == "projection_l1"
+            )
+    assert effective["lookback128_batch128"]["training"]["lookback"] == 128
+
+
+def test_inherited_experiment_override_renames_and_patches_one_row(
+    tmp_path: Path,
+) -> None:
+    base = tmp_path / "base.yaml"
+    base.write_text(
+        """
+base_config: configs/markets/tw_day_trade_daily_no_default.yaml
+matrix:
+  include_baseline: false
+  dimensions:
+    - name: learning_rate
+      enabled: true
+      path: training.learning_rate
+      values:
+        - name: original
+          experiment_name: original
+          value: 0.0002
+""",
+        encoding="utf-8",
+    )
+    child = tmp_path / "child.yaml"
+    child.write_text(
+        """
+base_spec: base.yaml
+matrix:
+  experiment_overrides:
+    original:
+      experiment_name: repaired
+      description: repaired without copying the inherited matrix
+      overrides:
+        training:
+          learning_rate: 0.0003
+          batch_size_train: 128
+""",
+        encoding="utf-8",
+    )
+
+    _, rows = _experiment_rows(child)
+
+    assert rows == [
+        {
+            "name": "repaired",
+            "dimension": "learning_rate",
+            "description": "repaired without copying the inherited matrix",
+            "overrides": {
+                "training": {
+                    "learning_rate": 0.0003,
+                    "batch_size_train": 128,
+                }
+            },
+        }
+    ]
+
+
 def test_parallel_jobs_split_host_wide_thread_budgets() -> None:
     assert _per_job_thread_budget(112, 2) == 56
     assert _per_job_thread_budget(16, 2) == 8
@@ -238,6 +351,85 @@ matrix:
     )
     assert summary[0]["status"] == "succeeded"
     assert summary[0]["attempts"] == 2
+
+
+def test_sequential_scheduler_retries_current_experiment_before_next(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    spec = tmp_path / "retry_order.yaml"
+    spec.write_text(
+        """
+base_config: configs/markets/tw_day_trade_daily_no_default.yaml
+expected_fold_count: 1
+matrix:
+  include_baseline: false
+  dimensions:
+    - name: learning_rate
+      enabled: true
+      path: training.learning_rate
+      values:
+        - name: first
+          experiment_name: first
+          value: 0.0002
+        - name: second
+          experiment_name: second
+          value: 0.0003
+""",
+        encoding="utf-8",
+    )
+    output_root = tmp_path / "output"
+
+    class FailFirstAttemptProcess:
+        next_pid = 91_500
+        attempts: dict[str, int] = {}
+        launch_order: list[str] = []
+
+        def __init__(self, command, **_kwargs):
+            type(self).next_pid += 1
+            self.pid = type(self).next_pid
+            self.returncode = None
+            config_path = Path(command[command.index("-c") + 1])
+            self.name = config_path.stem
+            type(self).launch_order.append(self.name)
+            type(self).attempts[self.name] = (
+                type(self).attempts.get(self.name, 0) + 1
+            )
+            self.attempt = type(self).attempts[self.name]
+
+        def poll(self):
+            if self.returncode is None:
+                self.returncode = (
+                    1 if self.name == "first" and self.attempt == 1 else 0
+                )
+            return self.returncode
+
+    monkeypatch.setattr(
+        ablation_module.subprocess,
+        "Popen",
+        FailFirstAttemptProcess,
+    )
+    monkeypatch.setattr(
+        ablation_module.sys,
+        "argv",
+        [
+            "run_ablation_experiments.py",
+            "--spec",
+            str(spec),
+            "--output-root",
+            str(output_root),
+            "--runner",
+            "/bin/true",
+            "--max-folds",
+            "1",
+            "--retry-backoff-seconds",
+            "0",
+        ],
+    )
+
+    ablation_module.main()
+
+    assert FailFirstAttemptProcess.launch_order == ["first", "first", "second"]
 
 
 def test_scheduler_fails_closed_after_consecutive_no_progress_limit(
@@ -622,7 +814,7 @@ def test_tw_day_trade_unified_matrix_keeps_projection_control_except_output_mode
         repo_root / "configs/ablations/financial_transformer_tw_day_trade.yaml"
     )
     spec, experiments = _experiment_rows(spec_path)
-    assert spec["output_root"].endswith("capital10m_split_only_v3")
+    assert spec["output_root"].endswith("capital10m_panel_history_v4")
     expected_names = [
         "baseline",
         "lookback256_batch32",
@@ -657,7 +849,7 @@ def test_tw_day_trade_unified_matrix_keeps_projection_control_except_output_mode
         assert raw["trading"]["execution_mode"] == "tw_day_trade"
         assert raw["trading"]["long_only"] is False
         assert raw["training"]["loss_type"] == "log_utility"
-        assert raw["walk_forward"]["lookback_context"] == "split_only"
+        assert raw["walk_forward"]["lookback_context"] == "panel_history"
 
     output_modes = {
         "output_activation_l1": "activation_l1",
@@ -720,12 +912,12 @@ def test_tw_day_trade_output_mode_matrix_uses_ten_million_for_every_run(
     spec, experiments = _experiment_rows(spec_path)
     runs = _build_configs(spec_path, spec, experiments, tmp_path)
 
-    assert spec["output_root"].endswith("projection_l1_capital10m_split_only_v3")
+    assert spec["output_root"].endswith("projection_l1_capital10m_panel_history_v4")
     for run in runs:
         raw = yaml.safe_load(run["config_path"].read_text(encoding="utf-8"))
         assert raw["trading"]["execution_mode"] == "tw_day_trade"
         assert raw["trading"]["volume_participation_equity"] == 10_000_000.0
-        assert raw["walk_forward"]["lookback_context"] == "split_only"
+        assert raw["walk_forward"]["lookback_context"] == "panel_history"
 
 
 def test_tw_day_trade_mixed_batch_matrix_resolves_only_measured_oom_variants(
@@ -763,7 +955,7 @@ def test_tw_day_trade_mixed_batch_matrix_resolves_only_measured_oom_variants(
     for name, raw in effective.items():
         assert raw["trading"]["execution_mode"] == "tw_day_trade"
         assert raw["trading"]["frequency"] == "daily"
-        assert raw["walk_forward"]["lookback_context"] == "split_only"
+        assert raw["walk_forward"]["lookback_context"] == "panel_history"
         assert raw["training"]["auto_batch_size"] is False
         assert raw["training"]["epochs"] == 1000
         assert raw["training"]["record_epoch_curve"] is True
@@ -771,7 +963,9 @@ def test_tw_day_trade_mixed_batch_matrix_resolves_only_measured_oom_variants(
         assert raw["training"]["curve_plot_async"] is True
         assert raw["training"]["defer_epoch_curve_plot_until_end"] is False
     assert "baseline_artifact_root" not in spec
-    assert spec["output_root"].endswith("mixed_batch_v3_capital10m")
+    assert spec["output_root"].endswith(
+        "v4_ofat_mixed_batch_panel_history_capital10m"
+    )
     assert effective["initial_capital_1m"]["trading"]["volume_participation_equity"] == 1_000_000.0
     assert effective["initial_capital_100m"]["trading"]["volume_participation_equity"] == 100_000_000.0
     assert {

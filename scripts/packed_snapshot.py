@@ -121,6 +121,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         help="omit a reproducible or node-local relative subtree from the release",
     )
+    publish.add_argument(
+        "--maximum-file-bytes",
+        type=int,
+        help=(
+            "include only regular files at or below this size; directories and "
+            "safe symlinks remain in the inventory"
+        ),
+    )
     publish.add_argument("--metadata", action="append", default=[])
     publish.add_argument(
         "--max-clock-skew-seconds",
@@ -185,6 +193,7 @@ def main(argv: list[str] | None = None) -> int:
                 max_clock_skew_seconds=args.max_clock_skew_seconds,
                 metadata=_metadata(args.metadata),
                 excluded_subtrees=args.exclude_subtree,
+                maximum_file_bytes=args.maximum_file_bytes,
                 repo_root=REPO_ROOT,
             )
             archive = resolved.manifest["archive"]
@@ -198,6 +207,11 @@ def main(argv: list[str] | None = None) -> int:
                     "source_bytes": resolved.manifest["source"]["logical_bytes"],
                     "sync_objects": archive["object_count"] + 1,
                     "sync_bytes": archive["stored_bytes"],
+                    "base_snapshot_id": archive.get("base_snapshot_id"),
+                    "reused_files": archive.get("reused_files", 0),
+                    "changed_files": archive.get("changed_files"),
+                    "new_sync_objects": archive.get("new_object_count"),
+                    "new_sync_bytes": archive.get("new_stored_bytes"),
                 }
             )
             return 0

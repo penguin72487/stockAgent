@@ -1734,7 +1734,43 @@ def main() -> None:
                 f"fold(s); launching {len(pending_folds)} pending fold(s)",
                 flush=True,
             )
-        _run_isolated_train_fold_processes(pending_folds, argv=sys.argv[1:])
+        # Run one child at a time and publish the cumulative root-level
+        # walk-forward report immediately after each successful fold. Loading
+        # every currently complete fold is required here: an isolated child is
+        # deliberately restricted to one fold and cannot construct a stitched
+        # Fold 1..N deployment report by itself.
+        for pending_fold in pending_folds:
+            _run_isolated_train_fold_processes(
+                (pending_fold,),
+                argv=sys.argv[1:],
+            )
+            partial_results = []
+            for selected_fold in folds:
+                completed = _load_completed_fold_result(
+                    Path(output_dir),
+                    int(selected_fold.fold_id),
+                    expected_manifest=experiment_manifest,
+                    expected_fold=selected_fold,
+                )
+                if completed is not None:
+                    partial_results.append(completed)
+            if not partial_results:
+                raise RuntimeError(
+                    "isolated fold child exited successfully without any "
+                    "contract-compatible completed fold artifacts"
+                )
+            _refresh_walkforward_artifacts(
+                Path(output_dir),
+                partial_results,
+                panel=panel,
+                config=config,
+            )
+            print(
+                "[runner] cumulative walk-forward plots refreshed after "
+                f"fold={int(pending_fold.fold_id)} "
+                f"completed_folds={len(partial_results)}",
+                flush=True,
+            )
         if post_train_infer:
             _run_isolated_post_train_inference(argv=sys.argv[1:])
         results = []
@@ -1751,12 +1787,9 @@ def main() -> None:
                     f"artifacts: fold={int(fold.fold_id)}"
                 )
             results.append(completed)
-        # Each isolated child can only see its own selected fold, so its
-        # root-level walk-forward report is necessarily incomplete and the
-        # last child would otherwise overwrite it.  Rebuild the canonical
-        # stitched deployment once in the parent after every selected fold is
-        # available, preserving one chronological account across model-owner
-        # changes.
+        # Rebuild once more from the final authoritative result set before
+        # lifecycle completion. Per-fold cumulative refreshes above guarantee
+        # that the same plots are already available while training is running.
         _refresh_walkforward_artifacts(
             Path(output_dir),
             results,

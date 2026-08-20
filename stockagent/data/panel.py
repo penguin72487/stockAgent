@@ -1763,6 +1763,42 @@ def _prepare_symbol_frame(frame: Any, path: Path) -> Any:
             (pl.col("intraday_return_co").sign() * pl.col("trading_volume_logret_1d")).alias("signed_vol"),
         ]
     )
+    if "lifecycle_reset" in frame.columns:
+        reset = (
+            pl.col("lifecycle_reset")
+            .cast(pl.Boolean, strict=False)
+            .fill_null(False)
+        )
+        frame = frame.with_columns(
+            [
+                pl.when(reset)
+                .then(pl.lit(None, dtype=pl.Float64))
+                .otherwise(pl.col(name))
+                .alias(name)
+                for name in (
+                    "open_logret_1d",
+                    "max_logret_1d",
+                    "min_logret_1d",
+                    "close_logret_1d",
+                    "trading_volume_logret_1d",
+                    "signed_vol",
+                    "delta_body_ratio",
+                    "delta_clv",
+                )
+            ]
+        )
+    if "return_quarantined" in frame.columns:
+        quarantine = (
+            pl.col("return_quarantined")
+            .cast(pl.Boolean, strict=False)
+            .fill_null(False)
+        )
+        frame = frame.with_columns(
+            pl.when(quarantine)
+            .then(pl.lit(None, dtype=pl.Float64))
+            .otherwise(pl.col(DAY_TRADE_OPEN_GAP_FEATURE))
+            .alias(DAY_TRADE_OPEN_GAP_FEATURE)
+        )
     for col in BASE_PANEL_FEATURE_COLUMNS:
         if col not in frame.columns:
             frame = frame.with_columns(pl.lit(None, dtype=pl.Float64).alias(col))
@@ -2289,6 +2325,25 @@ def _symbol_arrays_from_arrow_table(
     trading_volume_logret_1d = _safe_log_ratio_array(volume, _shift_array(volume, 1))
     signed_vol = np.sign(intraday_return_co) * trading_volume_logret_1d
 
+    if "lifecycle_reset" in table.column_names:
+        raw_reset = col("lifecycle_reset")
+        lifecycle_reset = np.isfinite(raw_reset) & (raw_reset != 0.0)
+        for values in (
+            open_logret_1d,
+            max_logret_1d,
+            min_logret_1d,
+            close_logret_1d,
+            trading_volume_logret_1d,
+            signed_vol,
+            delta_body_ratio,
+            delta_clv,
+        ):
+            values[lifecycle_reset] = np.nan
+    if "return_quarantined" in table.column_names:
+        raw_quarantine = col("return_quarantined")
+        quarantine = np.isfinite(raw_quarantine) & (raw_quarantine != 0.0)
+        next_session_open_gap_logret[quarantine] = np.nan
+
     if "Trading_Volume" not in table.column_names:
         _warn_missing_trading_volume(path)
         trading_volume_logret_1d[:] = np.nan
@@ -2496,6 +2551,42 @@ def _load_symbol_arrays_polars_lazy(
             (pl.col("intraday_return_co").sign() * pl.col("trading_volume_logret_1d")).alias("signed_vol"),
         ]
     )
+    if "lifecycle_reset" in schema_names:
+        reset = (
+            pl.col("lifecycle_reset")
+            .cast(pl.Boolean, strict=False)
+            .fill_null(False)
+        )
+        lazy = lazy.with_columns(
+            [
+                pl.when(reset)
+                .then(pl.lit(None, dtype=pl.Float64))
+                .otherwise(pl.col(name))
+                .alias(name)
+                for name in (
+                    "open_logret_1d",
+                    "max_logret_1d",
+                    "min_logret_1d",
+                    "close_logret_1d",
+                    "trading_volume_logret_1d",
+                    "signed_vol",
+                    "delta_body_ratio",
+                    "delta_clv",
+                )
+            ]
+        )
+    if "return_quarantined" in schema_names:
+        quarantine = (
+            pl.col("return_quarantined")
+            .cast(pl.Boolean, strict=False)
+            .fill_null(False)
+        )
+        lazy = lazy.with_columns(
+            pl.when(quarantine)
+            .then(pl.lit(None, dtype=pl.Float64))
+            .otherwise(pl.col(DAY_TRADE_OPEN_GAP_FEATURE))
+            .alias(DAY_TRADE_OPEN_GAP_FEATURE)
+        )
     selected_columns = [
         _polars_datetime_ns_expr(frame.schema, "date"),
         pl.col("_open").alias("open_px"),

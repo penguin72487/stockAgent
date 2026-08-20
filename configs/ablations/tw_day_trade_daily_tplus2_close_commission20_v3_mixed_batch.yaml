@@ -7,7 +7,7 @@
 # owns a fresh artifact root and must never resume checkpoints from the
 # uniform-batch OFAT root.
 base_config: configs/markets/tw_day_trade_daily_no_default.yaml
-output_root: artifacts/ablations/tw_day_trade_daily_tplus2_close_commission20_v3_ofat_mixed_batch_v3_capital10m
+output_root: artifacts/ablations/tw_day_trade_daily_tplus2_close_commission20_v4_ofat_mixed_batch_panel_history_capital10m
 # This root deliberately does not reuse the historical TWD 1M market baseline.
 # Initial capital affects whole-lot feasibility, the causal volume cap, loss,
 # and the optimizer trajectory, so the TWD 10M baseline must be trained under
@@ -51,10 +51,9 @@ matrix:
       panel_start_date: '2014-01-01'
       day_trade_minute_execution_root: null
     walk_forward:
-      # A test model becomes eligible only after its own calendar-year split
-      # has accumulated a complete lookback. Until the next model reaches that
-      # boundary, its warmup rows remain owned by the preceding model.
-      lookback_context: split_only
+      # A new calendar-year model owns its first target. Its feature window may
+      # use only already-observed rows from prior panel history.
+      lookback_context: panel_history
     trading:
       execution_mode: tw_day_trade
       frequency: daily

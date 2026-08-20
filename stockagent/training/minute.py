@@ -12,6 +12,7 @@ from pathlib import Path
 import subprocess
 import sys
 import time
+import warnings
 from typing import Any, Callable, Iterable
 
 import numpy as np
@@ -313,7 +314,17 @@ def _release_minute_group_runtime(device: torch.device) -> dict[str, int]:
     if device.type == "cuda":
         allocated_before = int(torch.cuda.memory_allocated(device))
         reserved_before = int(torch.cuda.memory_reserved(device))
-    torch.compiler.reset()
+    # Importing the compiler reset path can lazily import PyTorch's deprecated
+    # internal TorchScript wrappers.  That warning is external to this cleanup
+    # operation and must not turn successful eager minute training into a
+    # failure when callers promote DeprecationWarning to an exception.
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=r"`torch\.jit\.script_method` is deprecated.*",
+            category=DeprecationWarning,
+        )
+        torch.compiler.reset()
     gc.collect()
     if device.type == "cuda":
         torch.cuda.empty_cache()

@@ -1,11 +1,11 @@
 """TAIFEX listed equity/ETF/index futures daily portfolio data contract.
 
-The official archive is stored by physical contract.  This module creates
-stable delivery-month slots (``PRODUCT_M01_L1`` ... ``PRODUCT_M12_Ln``) while
-preserving the physical contract identity on every row.  The lane is needed
-only when two years of the same delivery month are listed simultaneously.  A
-contract stays in the same slot for its entire observed life, so an arbitrary
-far-month position can remain open until that physical contract expires.
+The official archive is stored by physical contract.  Delivery month/week
+metadata remains explicit, while physical-contract intervals are colored into
+a fixed 1,936-column tensor universe.  A contract stays in one column for its
+entire observed life; after expiry, the column remains empty for 31 sessions
+before reuse so a 32-session model window never crosses physical identities.
+An arbitrary far-month position can therefore remain open until its own expiry.
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, timedelta
 import hashlib
+import heapq
 import json
 from pathlib import Path
 import re
@@ -36,9 +37,23 @@ except Exception:  # pragma: no cover - validated at the public entry points
     pq = None
 
 
-TAIFEX_FUTURES_PORTFOLIO_DATA_CONTRACT_VERSION: Final[int] = 3
-TAIFEX_FUTURES_PORTFOLIO_FEATURE_CONTRACT_VERSION: Final[int] = 2
-TAIFEX_FUTURES_PORTFOLIO_BACKTEST_CONTRACT_VERSION: Final[int] = 2
+TAIFEX_FUTURES_PORTFOLIO_DATA_CONTRACT_VERSION: Final[int] = 4
+TAIFEX_FUTURES_PORTFOLIO_FEATURE_CONTRACT_VERSION: Final[int] = 3
+TAIFEX_FUTURES_PORTFOLIO_BACKTEST_CONTRACT_VERSION: Final[int] = 3
+
+# The receipt-backed 2005-01-03..2026-08-11 archive reaches 1,280 physical
+# contracts active on the same market session.  Reusing exactly 1,280 tensor
+# columns would nevertheless contaminate a 32-session model window with the
+# expired occupant of a newly reused column.  Interval coloring after extending
+# every physical contract by LOOKBACK-1 quarantine sessions has the exact
+# historical clique number 1,936.  Fixing that capacity makes every physical
+# contract lifetime-stable, leaves 31 blank rows before a slot can be reused,
+# and deliberately fails closed if a future research snapshot exceeds it.
+TAIFEX_FUTURES_PORTFOLIO_FIXED_SLOT_COUNT: Final[int] = 1_936
+TAIFEX_FUTURES_PORTFOLIO_SLOT_REUSE_COOLDOWN_SESSIONS: Final[int] = 31
+TAIFEX_FUTURES_PORTFOLIO_MAX_SAFE_LOOKBACK: Final[int] = (
+    TAIFEX_FUTURES_PORTFOLIO_SLOT_REUSE_COOLDOWN_SESSIONS + 1
+)
 
 DEFAULT_SOURCE_PATH: Final[str] = (
     "data_tw_index_futures/all_futures_daily_sessions.parquet"
@@ -53,7 +68,7 @@ DEFAULT_STOCK_MASTER_PATH: Final[str] = "data_tw_public/stocks/symbols.csv"
 DEFAULT_PUBLIC_FEATURE_PATH: Final[str] = (
     "data_tw_public/features/tw_public_stock_daily.parquet"
 )
-DEFAULT_OUTPUT_ROOT: Final[str] = "data_tw_futures/taifex_portfolio_daily_v3"
+DEFAULT_OUTPUT_ROOT: Final[str] = "data_tw_futures/taifex_portfolio_daily_v4"
 
 # These products are listed by TAIFEX but are outside the requested
 # equity/ETF/index scope.  Keep the exclusion explicit and audited.
@@ -178,6 +193,7 @@ _UNDERLYING_OVERRIDES: Final[dict[str, str]] = {
 }
 
 FUTURES_MODEL_FEATURE_COLUMNS: Final[tuple[str, ...]] = (
+    "taifex_product_id",
     "taifex_settlement_logret_1d",
     "taifex_volume_log1p",
     "taifex_volume_logret_1d",
@@ -595,6 +611,83 @@ def _stable_expiry_slot_map(contract_meta: Any) -> Any:
     return pl.DataFrame(assigned).sort("product", "contract")
 
 
+def _fixed_portfolio_slot_map(
+    contract_meta: Any,
+    market_dates: Any,
+    *,
+    fixed_slot_count: int = TAIFEX_FUTURES_PORTFOLIO_FIXED_SLOT_COUNT,
+    cooldown_sessions: int = (
+        TAIFEX_FUTURES_PORTFOLIO_SLOT_REUSE_COOLDOWN_SESSIONS
+    ),
+) -> Any:
+    """Color physical-contract intervals into fixed lifetime-stable slots.
+
+    Intervals are inclusive.  A slot becomes reusable only after the contract's
+    last observed market session plus ``cooldown_sessions``.  For lookback 32,
+    the 31-session quarantine guarantees that a new occupant's model window
+    cannot contain any feature row from the prior physical contract.
+    """
+
+    capacity = int(fixed_slot_count)
+    cooldown = int(cooldown_sessions)
+    if capacity <= 0:
+        raise ValueError("TAIFEX fixed portfolio slot count must be positive")
+    if cooldown < 0:
+        raise ValueError("TAIFEX portfolio slot cooldown must be non-negative")
+    calendar = sorted(market_dates)
+    if not calendar:
+        raise ValueError("TAIFEX fixed portfolio slots require a market calendar")
+    calendar_index = {value: index for index, value in enumerate(calendar)}
+
+    intervals: list[tuple[int, int, str, str]] = []
+    for row in contract_meta.iter_rows(named=True):
+        first = row["first_observed_date"]
+        last = row["last_observed_date"]
+        if first not in calendar_index or last not in calendar_index:
+            raise RuntimeError("TAIFEX physical-contract interval is off calendar")
+        intervals.append(
+            (
+                int(calendar_index[first]),
+                min(int(calendar_index[last]) + cooldown, len(calendar) - 1),
+                str(row["product"]),
+                str(row["contract"]),
+            )
+        )
+    intervals.sort(key=lambda value: (value[0], value[1], value[2], value[3]))
+
+    # Active heap is ordered by inclusive release session.  Free slots use a
+    # second min-heap so a rebuild is deterministic regardless of input order.
+    active: list[tuple[int, int]] = []
+    free_slots: list[int] = []
+    next_slot = 1
+    assigned: list[dict[str, Any]] = []
+    for first_index, quarantine_end, product, contract in intervals:
+        while active and active[0][0] < first_index:
+            _, released_slot = heapq.heappop(active)
+            heapq.heappush(free_slots, released_slot)
+        if free_slots:
+            slot = heapq.heappop(free_slots)
+        else:
+            slot = next_slot
+            next_slot += 1
+        if slot > capacity:
+            raise RuntimeError(
+                "TAIFEX fixed portfolio slot capacity exceeded: "
+                f"required_at_least={slot} configured={capacity}; rebuild into "
+                "a new data/checkpoint contract with a larger audited capacity"
+            )
+        heapq.heappush(active, (quarantine_end, slot))
+        assigned.append(
+            {
+                "product": product,
+                "contract": contract,
+                "portfolio_slot": slot,
+                "symbol": f"TAIFEX_SLOT_{slot:04d}",
+            }
+        )
+    return pl.DataFrame(assigned).sort("product", "contract")
+
+
 def build_continuous_daily(
     source_path: str | Path = DEFAULT_SOURCE_PATH,
     product_master_path: str | Path = DEFAULT_PRODUCT_MASTER_PATH,
@@ -624,6 +717,15 @@ def build_continuous_daily(
     selected = product_master.filter(
         pl.col("fixed_fee_research_supported")
     )["official_product"].to_list()
+    product_id_lookup = {
+        product: index
+        for index, product in enumerate(sorted(str(value) for value in selected), start=1)
+    }
+    product_master = product_master.with_columns(
+        pl.col("official_product")
+        .replace_strict(product_id_lookup, default=None, return_dtype=pl.UInt16)
+        .alias("taifex_product_id")
+    )
     raw = (
         source
         .filter(
@@ -658,24 +760,39 @@ def build_continuous_daily(
     )
     if frame["tenor_rank"].null_count():
         raise RuntimeError("TAIFEX contract interval ranking left unmapped rows")
-    slot_map = _stable_expiry_slot_map(contract_meta)
+    # Delivery metadata remains explicit model context (for example every
+    # August contract has delivery_month=8), while the tensor symbol itself is
+    # a globally fixed, lifetime-stable capacity slot.
+    delivery_map = _stable_expiry_slot_map(contract_meta).rename(
+        {"symbol": "delivery_slot_symbol"}
+    )
     frame = frame.join(
-        slot_map,
+        delivery_map,
+        on=["product", "contract"],
+        how="left",
+        validate="m:1",
+    )
+    portfolio_slot_map = _fixed_portfolio_slot_map(
+        contract_meta,
+        observed["date"].unique().sort().to_list(),
+    )
+    frame = frame.join(
+        portfolio_slot_map,
         on=["product", "contract"],
         how="left",
         validate="m:1",
     )
     if frame["symbol"].null_count():
-        raise RuntimeError("TAIFEX delivery-month slot assignment left unmapped rows")
+        raise RuntimeError("TAIFEX fixed portfolio slot assignment left unmapped rows")
     slot_duplicates = (
-        frame.group_by("date", "product", "symbol")
+        frame.group_by("date", "symbol")
         .len()
         .filter(pl.col("len") != 1)
         .limit(1)
     )
     if slot_duplicates.height:
         raise RuntimeError(
-            "stable delivery-month lanes collide for simultaneous contracts"
+            "fixed portfolio slots collide for simultaneous physical contracts"
         )
     frame = frame.sort("symbol", "date").with_columns(
         pl.col("source_row_observed").fill_null(False),
@@ -740,9 +857,11 @@ def build_continuous_daily(
     frame = frame.join(calendar, on="date", how="left", validate="m:1")
     frame = frame.sort("symbol", "date").with_columns(
         pl.col("date").shift(-1).over("symbol").alias("next_symbol_date"),
+        pl.col("product").shift(-1).over("symbol").alias("next_product"),
         pl.col("contract").shift(-1).over("symbol").alias("next_contract"),
         pl.col("open").shift(-1).over("symbol").alias("next_open"),
         pl.col("date").shift(1).over("symbol").alias("previous_symbol_date"),
+        pl.col("product").shift(1).over("symbol").alias("previous_product"),
         pl.col("contract").shift(1).over("symbol").alias("previous_contract"),
         pl.col("settlement").shift(1).over("symbol").alias("previous_settlement"),
         pl.col("volume").shift(1).over("symbol").alias("previous_volume"),
@@ -755,12 +874,14 @@ def build_continuous_daily(
     frame = frame.join(previous_calendar, on="date", how="left", validate="m:1")
     same_next = (
         (pl.col("next_symbol_date") == pl.col("next_market_date"))
+        & (pl.col("next_product") == pl.col("product"))
         & (pl.col("next_contract") == pl.col("contract"))
         & pl.col("next_open").is_finite()
         & (pl.col("next_open") > 0.0)
     ).fill_null(False)
     same_previous = (
         (pl.col("previous_symbol_date") == pl.col("previous_market_date"))
+        & (pl.col("previous_product") == pl.col("product"))
         & (pl.col("previous_contract") == pl.col("contract"))
     ).fill_null(False)
     executable = (
@@ -795,6 +916,10 @@ def build_continuous_daily(
         .clip(lower_bound=0)
         .alias("calendar_days_to_tenor_key"),
         same_previous.alias("same_contract_as_previous_session"),
+        (~same_previous).alias("lifecycle_reset"),
+        pl.concat_str("product", "contract", separator=":").alias(
+            "physical_contract"
+        ),
     )
 
     metadata = product_master.rename({"official_product": "product"})
@@ -880,7 +1005,16 @@ def _write_symbol_parquets(frame: Any, output_dir: Path) -> int:
         symbol = str(key[0] if isinstance(key, tuple) else key)
         output_name = f"{symbol}_features.parquet"
         model_frame = (
-            group.select("date", "open", "high", "low", "close", "volume")
+            group.select(
+                "date",
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+                "lifecycle_reset",
+                pl.col("must_liquidate").alias("return_quarantined"),
+            )
             .rename(columns)
             .with_columns(pl.col("close").alias("adjclose"))
             .sort("date")
@@ -1025,6 +1159,13 @@ def build_dataset(
         dataset="taifex_futures_portfolio_product_master",
     )
     symbol_count = _write_symbol_parquets(continuous, symbols_dir)
+    if int(symbol_count) != TAIFEX_FUTURES_PORTFOLIO_FIXED_SLOT_COUNT:
+        raise RuntimeError(
+            "TAIFEX production dataset no longer fills its audited fixed-slot "
+            f"universe: generated={symbol_count} expected="
+            f"{TAIFEX_FUTURES_PORTFOLIO_FIXED_SLOT_COUNT}; create a new data and "
+            "checkpoint contract instead of silently changing model width"
+        )
     model_features = _build_model_features(continuous, public_feature_path)
     _write_parquet_with_metadata(
         model_features,
@@ -1040,6 +1181,35 @@ def build_dataset(
         row[0]: int(row[1])
         for row in continuous.group_by("liquidation_reason").len().iter_rows()
     }
+    daily_capacity = (
+        continuous.group_by("date")
+        .agg(
+            pl.len().alias("active_contracts"),
+            pl.col("executable").sum().alias("executable_contracts"),
+            pl.col("product").n_unique().alias("active_products"),
+        )
+        .with_columns(pl.col("date").dt.year().alias("year"))
+    )
+    annual_capacity = (
+        daily_capacity.group_by("year")
+        .agg(
+            pl.col("active_contracts").max().alias("maximum_active_contracts"),
+            pl.col("executable_contracts")
+            .max()
+            .alias("maximum_executable_contracts"),
+            pl.col("active_products").max().alias("maximum_active_products"),
+        )
+        .sort("year")
+    )
+    annual_capacity_records = [
+        {
+            "year": int(row[0]),
+            "maximum_active_contracts": int(row[1]),
+            "maximum_executable_contracts": int(row[2]),
+            "maximum_active_products": int(row[3]),
+        }
+        for row in annual_capacity.iter_rows()
+    ]
     manifest: dict[str, Any] = {
         "dataset": "taifex_futures_portfolio_daily",
         "contract_version": TAIFEX_FUTURES_PORTFOLIO_DATA_CONTRACT_VERSION,
@@ -1050,7 +1220,8 @@ def build_dataset(
             "positive_settlement_then_next_open_else_liquidate_own_close"
         ),
         "symbol_contract": (
-            "delivery_month_or_week_slot_with_lifetime_stable_overlap_lane"
+            "fixed_1936_global_slots_lifetime_stable_physical_contract_"
+            "31_session_reuse_quarantine"
         ),
         "session": "一般",
         "scope": (
@@ -1093,6 +1264,22 @@ def build_dataset(
             "valuation_open_times_contract_multiplier; no_tax_no_slippage"
         ),
         "logical_symbols": int(symbol_count),
+        "fixed_model_output_slots": int(
+            TAIFEX_FUTURES_PORTFOLIO_FIXED_SLOT_COUNT
+        ),
+        "slot_reuse_cooldown_sessions": int(
+            TAIFEX_FUTURES_PORTFOLIO_SLOT_REUSE_COOLDOWN_SESSIONS
+        ),
+        "maximum_safe_lookback_sessions": int(
+            TAIFEX_FUTURES_PORTFOLIO_MAX_SAFE_LOOKBACK
+        ),
+        "maximum_simultaneous_active_contracts": int(
+            daily_capacity["active_contracts"].max()
+        ),
+        "maximum_simultaneous_executable_contracts": int(
+            daily_capacity["executable_contracts"].max()
+        ),
+        "annual_capacity": annual_capacity_records,
         "maximum_tenor_rank": int(continuous["tenor_rank"].max()),
         "maximum_expiry_slot_lane": int(continuous["expiry_slot_lane"].max()),
         "mandatory_liquidation_boundary": (
@@ -1172,6 +1359,16 @@ def attach_futures_portfolio_daily(
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if int(manifest.get("contract_version", -1)) != TAIFEX_FUTURES_PORTFOLIO_DATA_CONTRACT_VERSION:
         raise ValueError("TAIFEX futures portfolio contract version mismatch")
+    if int(manifest.get("fixed_model_output_slots", -1)) != int(
+        TAIFEX_FUTURES_PORTFOLIO_FIXED_SLOT_COUNT
+    ):
+        raise ValueError("TAIFEX futures portfolio fixed-slot count mismatch")
+    if len(panel.symbols) != TAIFEX_FUTURES_PORTFOLIO_FIXED_SLOT_COUNT:
+        raise ValueError(
+            "TAIFEX futures panel symbol count differs from the fixed contract: "
+            f"panel={len(panel.symbols)} expected="
+            f"{TAIFEX_FUTURES_PORTFOLIO_FIXED_SLOT_COUNT}"
+        )
     expected = manifest.get("outputs", {}).get("continuous_daily", {}).get("sha256")
     if expected != _sha256_file(data_path):
         raise ValueError("TAIFEX futures portfolio data SHA-256 differs from manifest")
@@ -1188,6 +1385,7 @@ def attach_futures_portfolio_daily(
             "product",
             "symbol",
             "contract",
+            "physical_contract",
             "tenor_rank",
             "open",
             "close",
@@ -1263,7 +1461,7 @@ def attach_futures_portfolio_daily(
         fee_rate_per_open_notional[di, si] = fee / (
             opening_price * multiplier
         )
-        contracts[di, si] = str(row["contract"])
+        contracts[di, si] = str(row["physical_contract"])
         if str(row["product"]) == "TX" and int(row["tenor_rank"]) == 1:
             if benchmark_assigned[di]:
                 raise ValueError("TAIFEX TX front-month benchmark is not unique")
@@ -1333,6 +1531,9 @@ __all__ = [
     "TAIFEX_FUTURES_PORTFOLIO_BACKTEST_CONTRACT_VERSION",
     "TAIFEX_FUTURES_PORTFOLIO_DATA_CONTRACT_VERSION",
     "TAIFEX_FUTURES_PORTFOLIO_FEATURE_CONTRACT_VERSION",
+    "TAIFEX_FUTURES_PORTFOLIO_FIXED_SLOT_COUNT",
+    "TAIFEX_FUTURES_PORTFOLIO_MAX_SAFE_LOOKBACK",
+    "TAIFEX_FUTURES_PORTFOLIO_SLOT_REUSE_COOLDOWN_SESSIONS",
     "TaiwanFuturesPortfolioDaily",
     "attach_futures_portfolio_daily",
     "build_continuous_daily",
