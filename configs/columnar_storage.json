@@ -1,0 +1,80 @@
+{
+  "schema_version": 1,
+  "canonical_fact_format": "parquet",
+  "canonical_compression": {
+    "codec": "zstd",
+    "level": 3,
+    "cold_level": 6,
+    "statistics": true
+  },
+  "targets": {
+    "interactive_file_bytes_min": 67108864,
+    "interactive_file_bytes_max": 268435456,
+    "cold_file_bytes_max": 536870912,
+    "row_group_uncompressed_bytes_min": 67108864,
+    "row_group_uncompressed_bytes_max": 134217728,
+    "fallback_row_group_rows": 122880
+  },
+  "engine_roles": {
+    "duckdb": ["cross_file_sql", "joins", "aggregations", "compaction", "query_views"],
+    "polars_lazy": ["canonical_etl", "feature_engineering", "panel_build"],
+    "polars_streaming": ["bounded_memory_etl", "oversized_result_sink"],
+    "pyarrow": ["schema_contract", "parquet_metadata", "projection", "atomic_write_validation"],
+    "numpy_memmap": ["rebuildable_dense_training_cache"],
+    "sqlite_wal": ["transactional_download_manifest", "resume_state"]
+  },
+  "layers": {
+    "l0": "immutable provider/task shards retained for resumability and audit",
+    "l1": "append-only compact segments; no source deletion",
+    "l2": "optional final partitioned canonical release after complete parity audit"
+  },
+  "datasets": [
+    {
+      "id": "openbb",
+      "root": "data_openBB",
+      "l0": "data",
+      "l1": "compact_l1",
+      "l2": "compact",
+      "partition_contract": "endpoint/append_only_segment",
+      "query_catalog": "openbb_l1.duckdb",
+      "policy": "incremental_l1_then_final_l2"
+    },
+    {
+      "id": "tw_minute_research",
+      "root": "data_tw_minute/research_dataset_developing_v5",
+      "partition_contract": "trade_date=data.parquet",
+      "policy": "preserve_daily_partitions"
+    },
+    {
+      "id": "tw_microstructure",
+      "root": "data_tw_microstructure/captures",
+      "partition_contract": "trade_date/event_kind/append_parts",
+      "policy": "compact_closed_trade_dates"
+    },
+    {
+      "id": "tw_index_derivatives_ticks",
+      "root": "data_tw_index_derivatives_ticks/shioaji_fop_captures",
+      "partition_contract": "trade_date/event_kind/append_parts",
+      "policy": "compact_closed_trade_dates"
+    },
+    {
+      "id": "binance_public_archive",
+      "root": "data_binance_archive/partitions",
+      "partition_contract": "market/symbol/year_month",
+      "policy": "preserve_download_parts_then_compact_symbol_year"
+    },
+    {
+      "id": "yahoo_features",
+      "root": "data_yahoo",
+      "partition_contract": "market/symbol_features",
+      "policy": "canonical_symbol_files_plus_rebuildable_panel_cache"
+    }
+  ],
+  "safety": {
+    "delete_l0_after_compaction": false,
+    "atomic_publish_required": true,
+    "pyarrow_polars_duckdb_row_parity_required": true,
+    "schema_fingerprint_required": true,
+    "source_manifest_required": true
+  }
+}

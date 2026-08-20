@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from http.client import IncompleteRead, RemoteDisconnected
 import json
 import os
 import sys
@@ -452,7 +453,13 @@ class BybitClient:
                     )
                     continue
                 raise
-            except URLError as exc:
+            except (
+                URLError,
+                TimeoutError,
+                IncompleteRead,
+                RemoteDisconnected,
+                ConnectionError,
+            ) as exc:
                 last_error = exc
                 if attempt < self.max_retries:
                     self._defer_retry(attempt)

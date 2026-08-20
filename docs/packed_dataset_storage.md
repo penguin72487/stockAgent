@@ -31,7 +31,10 @@ Syncthing 發布庫（固定 hash 分桶 ZIP + 大檔 blob + manifest/head）
 
 - 單一巨檔只改一筆也要重傳整檔，且損毀半徑最大。
 - 每個小檔直接同步會消耗 Syncthing 掃描、資料庫與 inode。
-- 固定路徑雜湊分桶使同一路徑永遠落入同一 ZIP；一次變更只重做一個桶。
+- 第一版以固定路徑雜湊分桶建立 base packs。後續 manifest 逐檔比較 SHA；
+  未變檔案沿用既有 pack member，只有新增或變更檔案寫入 delta packs。
+- 每個增量 manifest 都直接列出完整可重建物件集合，不需要依序重播整條 delta chain；
+  被部分沿用的舊 pack 會標記為 subset reference，fetch 只解出目前 inventory 成員。
 - 大於門檻的 Parquet/NPY 直接成為 SHA-256 blob，不做無效二次壓縮。
 - 接收端仍可 materialize 舊目錄契約，既有訓練 reader 不必同時重寫。
 
@@ -157,6 +160,101 @@ STOCKAGENT_SYNC_NODE_ID=penguin \
 ./scripts/run_packed_snapshot.sh objects \
   --sync-root /srv/stockagent-packed
 ```
+
+## 自助式冷庫與七日工作集
+
+`/srv/stockagent-packed` 是唯一需要長期保存與同步的冷庫；
+`/srv/stockagent-packed-materialized` 只是可刪除的本機工作集。狀態機是：
+
+```text
+COLD_ONLY -- use/完整驗證 --> HOT -- 7 天未續租 --> COLD_ONLY
+                       \-- 再次 use：O(1) ready proof + 續租
+```
+
+查看每個資料集的冷庫大小、解封狀態、版本與到期時間：
+
+```bash
+./scripts/run_data_cache.sh status
+./scripts/run_data_cache.sh status tw-public
+./scripts/run_data_cache.sh status --human
+```
+
+自行解封最新版本並取得路徑：
+
+```bash
+./scripts/run_data_cache.sh use tw-public
+
+data_path="$(./scripts/run_data_cache.sh use tw-public --path-only)"
+printf 'training data: %s\n' "$data_path"
+```
+
+每次 `use` 都把七日租約重新起算。工具也會維護穩定連結：
+
+```text
+/srv/stockagent-packed-materialized/current/<dataset>
+```
+
+若既有訓練程式要求固定路徑，可在完整驗證後原子切換一個**既有 symlink**；
+工具拒絕覆蓋實體目錄：
+
+```bash
+./scripts/run_data_cache.sh use tw-public \
+  --link /root/stockAgent/data_tw_public
+```
+
+想重新做完整逐檔 SHA 驗證時加 `--verify`。平常重複 `use` 只驗 READY proof，
+不會每次重讀十萬個檔案。
+
+手動預覽或執行清理：
+
+```bash
+./scripts/run_data_cache.sh gc --dry-run
+./scripts/run_data_cache.sh gc
+./scripts/run_data_cache.sh evict tw-public --dry-run
+```
+
+自動清理只會刪除同時符合以下條件的 materialized tree：
+
+- 租約超過七天；
+- packed manifest 與全部 cold objects 仍在本機；
+- materialization READY proof 與 manifest 相符；
+- 沒有 `.pin.json` 保護；
+- `/proc` 中沒有程序的 fd、mmap、cwd、root 或 executable 指向該 tree。
+
+安裝每日 timer；有 systemd 時安裝 timer，vast.ai container 則安裝 cron fallback：
+
+```bash
+sudo ./scripts/install_data_cache_gc_service.sh
+```
+
+安裝後可在任意目錄直接使用：
+
+```bash
+stockagent-data status
+stockagent-data status --human
+stockagent-data use tw-public --path-only
+stockagent-data gc --dry-run
+stockagent-data publish-status tw-public
+stockagent-data publish tw-public
+```
+
+`publish` 仍會套用 catalog 的 active-downloader blocker、排除規則、完整來源穩定性
+檢查與原子 head 更新；它不是繞過發布門檻的捷徑。
+在 penguin 的 08:30 官方資料驗收作業中，只有主作業成功後才會透過
+`ExecStartPost` 自動執行 `publish tw-public`；下載或嚴格 audit 失敗時不會
+發布。來源 receipt 的 `end_date` 若比現有 cold manifest 舊，publish 也會
+fail closed，避免多寫者用較晚 HLC 發布舊內容。
+
+新資料的增量冷存仍使用既有發布入口。固定 hash bucket 與 content-addressed
+blob 使未改變物件直接重用，只傳輸變動 bucket/blob：
+
+```bash
+./scripts/run_downloader_with_release.sh tw-public /srv/stockagent-packed -- \
+  ./downloader/run_daily_all_markets.sh
+```
+
+冷庫 manifest、objects、heads 不受工作集 GC 影響；GC 不會刪
+`/srv/stockagent-packed` 內任何資料。
 
 垃圾回收目前刻意只有報告，沒有自動刪除。必須先確認所有節點已收到所有 manifests、
 保留版本政策已決定，才可另行加入可恢復的 GC。

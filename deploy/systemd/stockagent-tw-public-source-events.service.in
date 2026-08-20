@@ -1,0 +1,23 @@
+[Unit]
+Description=Monitor and ingest version events from every Taiwan official public dataset
+Wants=network-online.target time-sync.target
+After=network-online.target time-sync.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=@SERVICE_USER@
+Group=@SERVICE_GROUP@
+WorkingDirectory=@REPO_ROOT@
+Environment="HOME=@SERVICE_HOME@"
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=/usr/bin/bash "@REPO_ROOT@/scripts/run_tw_public_source_event_monitor.sh"
+Restart=always
+RestartSec=5s
+Nice=5
+CPUWeight=50
+IOWeight=50
+TimeoutStopSec=2min
+
+[Install]
+WantedBy=multi-user.target

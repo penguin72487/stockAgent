@@ -52,6 +52,17 @@ STATIC_ROUTES: Final[dict[str, tuple[str, str]]] = {
 }
 
 
+def _display_history_row(row: dict[str, object]) -> dict[str, object]:
+    projected = {
+        key: row.get(key)
+        for key in HISTORY_DISPLAY_FIELDS
+        if row.get(key) is not None
+    }
+    if projected.get("history_source") == "live_forward_ledger":
+        projected.pop("history_source", None)
+    return projected
+
+
 def _history_range_query(raw_query: str) -> str:
     query = parse_qs(
         raw_query,
@@ -87,7 +98,9 @@ class DashboardHTTPServer(ThreadingHTTPServer):
         self._snapshot_cache: tuple[float, dict[str, object]] | None = None
         self._snapshot_lock = threading.Lock()
         self._history_cache: dict[str, tuple[float, dict[str, object]]] = {}
-        self._history_lock = threading.Lock()
+        self._history_state_lock = threading.Lock()
+        self._history_build_lock = threading.Lock()
+        self._history_refreshing: set[str] = set()
 
     def snapshot(self) -> dict[str, object]:
         now_monotonic = time.monotonic()
@@ -113,14 +126,36 @@ class DashboardHTTPServer(ThreadingHTTPServer):
 
     def history_snapshot(self, *, range_key: str) -> dict[str, object]:
         now_monotonic = time.monotonic()
-        cached = self._history_cache.get(range_key)
-        if cached is not None and now_monotonic - cached[0] < 55.0:
-            return cached[1]
-        with self._history_lock:
-            now_monotonic = time.monotonic()
+        with self._history_state_lock:
             cached = self._history_cache.get(range_key)
             if cached is not None and now_monotonic - cached[0] < 55.0:
                 return cached[1]
+            if cached is not None:
+                if range_key not in self._history_refreshing:
+                    self._history_refreshing.add(range_key)
+                    threading.Thread(
+                        target=self._refresh_history_snapshot,
+                        kwargs={"range_key": range_key},
+                        name=f"taifex-history-{range_key}",
+                        daemon=True,
+                    ).start()
+                # Historical rows are immutable.  Return the last verified
+                # curve immediately while the append-only ledger is rebuilt.
+                return cached[1]
+
+        # Only the first request for a never-built range may wait.  The service
+        # prewarms the default 1d view at startup, so normal page loads do not
+        # pay the multi-hundred-megabyte ledger scan.
+        return self._build_history_snapshot(range_key=range_key)
+
+    def _build_history_snapshot(self, *, range_key: str) -> dict[str, object]:
+        with self._history_build_lock:
+            now_monotonic = time.monotonic()
+            with self._history_state_lock:
+                cached = self._history_cache.get(range_key)
+                if cached is not None and now_monotonic - cached[0] < 55.0:
+                    self._history_refreshing.discard(range_key)
+                    return cached[1]
             full = build_dashboard_history_snapshot(
                 state_dir=self.state_dir,
                 mark_limit_per_strategy=self.mark_limit_per_strategy,
@@ -137,14 +172,61 @@ class DashboardHTTPServer(ThreadingHTTPServer):
                 "coverage_end_utc": full["coverage_end_utc"],
                 "downsampled": full["downsampled"],
                 "backfills": full.get("backfills", []),
-                "history": [
-                    {key: row.get(key) for key in HISTORY_DISPLAY_FIELDS}
-                    for row in full["history"]
-                ],
+                "history": [_display_history_row(row) for row in full["history"]],
                 "record_counts": full["record_counts"],
             }
-            self._history_cache[range_key] = (time.monotonic(), snapshot)
+            with self._history_state_lock:
+                self._history_cache[range_key] = (time.monotonic(), snapshot)
+                self._history_refreshing.discard(range_key)
             return snapshot
+
+    def _refresh_history_snapshot(self, *, range_key: str) -> None:
+        try:
+            self._build_history_snapshot(range_key=range_key)
+        except Exception as error:
+            with self._history_state_lock:
+                self._history_refreshing.discard(range_key)
+            sys.stderr.write(
+                "taifex-dashboard history_refresh_failed "
+                f"range={range_key} error={type(error).__name__}\n"
+            )
+
+    def prewarm_default_history(self) -> None:
+        try:
+            self.history_snapshot(range_key="1d")
+        except Exception as error:
+            sys.stderr.write(
+                "taifex-dashboard history_prewarm_failed "
+                f"error={type(error).__name__}\n"
+            )
+
+    def prewarm_status(self) -> None:
+        try:
+            self.snapshot()
+        except Exception as error:
+            sys.stderr.write(
+                "taifex-dashboard status_prewarm_failed "
+                f"error={type(error).__name__}\n"
+            )
+
+    def prewarm_default_views(self) -> None:
+        # The default chart is the largest cold payload.  Build it first so an
+        # immediate browser request coalesces on the same history lock instead
+        # of competing with the status ledger scan for CPU and I/O.
+        self.prewarm_default_history()
+        self.prewarm_status()
+
+    def prewarm_default_views_after_startup(self) -> None:
+        # Let sibling public-gateway imports finish before consuming CPU on the
+        # large history projection.  Requests remain available immediately and
+        # coalesce through the same history build lock.
+        time.sleep(1.0)
+        self.prewarm_default_history()
+        # A request coalescing on the history build still needs to serialize and
+        # traverse the local gateway.  Do not start the independent status scan
+        # until that first response has left the process.
+        time.sleep(1.0)
+        self.prewarm_status()
 
 
 class DashboardRequestHandler(BaseHTTPRequestHandler):
@@ -171,7 +253,12 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self._headers(content_type=content_type, content_length=len(payload))
         self.end_headers()
-        self.wfile.write(payload)
+        try:
+            self.wfile.write(payload)
+        except (BrokenPipeError, ConnectionResetError):
+            # Browser navigation and caller-side timeouts are normal and must
+            # not turn an otherwise healthy read-only worker into a traceback.
+            return
 
     def _send_json(self, status: HTTPStatus, payload: object) -> None:
         encoded = (
@@ -280,6 +367,11 @@ def main(argv: list[str] | None = None) -> int:
         f"state_dir={args.state_dir}",
         flush=True,
     )
+    threading.Thread(
+        target=server.prewarm_default_views_after_startup,
+        name="taifex-default-views-prewarm",
+        daemon=True,
+    ).start()
     try:
         server.serve_forever(poll_interval=0.5)
     except KeyboardInterrupt:

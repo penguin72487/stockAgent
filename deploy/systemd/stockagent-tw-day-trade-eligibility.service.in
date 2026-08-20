@@ -2,6 +2,7 @@
 Description=Fetch exact-session TWSE and TPEx day-trade eligibility on publication
 Wants=network-online.target time-sync.target
 After=network-online.target time-sync.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=oneshot
@@ -15,6 +16,8 @@ Nice=5
 CPUWeight=50
 IOWeight=50
 TimeoutStartSec=2h
+Restart=on-failure
+RestartSec=5min
 
 [Install]
 WantedBy=multi-user.target

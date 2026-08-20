@@ -34,6 +34,9 @@ _SHIOAJI_STOCK_LOCK = threading.RLock()
 _SHIOAJI_STOCK_API: object | None = None
 _SHIOAJI_STOCK_CONTRACTS: dict[str, object | None] = {}
 _SHIOAJI_STOCK_CACHE: dict[str, tuple[float, dict[str, float | int | None]]] = {}
+_SHIOAJI_STOCK_LOGIN_RETRY_AFTER = 0.0
+_SHIOAJI_STOCK_LAST_LOGIN_ERROR: str | None = None
+_SHIOAJI_STOCK_LOGIN_BACKOFF_SECONDS = 60.0
 _TW_LIMIT_CACHE_LOCK = threading.Lock()
 _TW_LIMIT_CACHE_KEY: str | None = None
 _TW_LIMIT_CACHE: dict[str, tuple[float | None, float | None, float | None]] = {}
@@ -61,13 +64,39 @@ class PriceSnapshot:
     timestamps_ms: np.ndarray | None = None
 
 
+def _is_shioaji_session_failure(exc: BaseException) -> bool:
+    message = f"{type(exc).__name__}: {exc}".lower()
+    return any(
+        marker in message
+        for marker in (
+            "token is expired",
+            "sessionnotestablished",
+            "session not established",
+            "not authenticated",
+        )
+    )
+
+
 def _shioaji_stock_api() -> object:
     """Return one process-local, simulation-only Shioaji quote connection."""
 
     global _SHIOAJI_STOCK_API
+    global _SHIOAJI_STOCK_LAST_LOGIN_ERROR
+    global _SHIOAJI_STOCK_LOGIN_RETRY_AFTER
     with _SHIOAJI_STOCK_LOCK:
         if _SHIOAJI_STOCK_API is not None:
             return _SHIOAJI_STOCK_API
+        now_monotonic = time.monotonic()
+        if now_monotonic < _SHIOAJI_STOCK_LOGIN_RETRY_AFTER:
+            retry_seconds = max(
+                1,
+                int(_SHIOAJI_STOCK_LOGIN_RETRY_AFTER - now_monotonic + 0.999),
+            )
+            detail = _SHIOAJI_STOCK_LAST_LOGIN_ERROR or "previous login failed"
+            raise RuntimeError(
+                "Shioaji stock quote login cooldown is active for "
+                f"{retry_seconds}s after: {detail}"
+            )
         api_key = os.environ.get("SHIOAJI_API_KEY", "").strip()
         secret_key = os.environ.get("SHIOAJI_SECRET_KEY", "").strip()
         if not api_key or not secret_key:
@@ -80,28 +109,74 @@ def _shioaji_stock_api() -> object:
         api = sj.Shioaji(simulation=True)
         if hasattr(api, "set_event_callback"):
             api.set_event_callback(lambda *_args: None)
-        api.login(
-            api_key=api_key,
-            secret_key=secret_key,
-            subscribe_trade=False,
-        )
+        try:
+            api.login(
+                api_key=api_key,
+                secret_key=secret_key,
+                subscribe_trade=False,
+                # A long-lived service must not inherit a token with only a
+                # few hours left from Shioaji's local token pool.
+                force_refresh=True,
+            )
+        except Exception as exc:
+            _SHIOAJI_STOCK_LAST_LOGIN_ERROR = f"{type(exc).__name__}: {exc}"
+            _SHIOAJI_STOCK_LOGIN_RETRY_AFTER = (
+                time.monotonic() + _SHIOAJI_STOCK_LOGIN_BACKOFF_SECONDS
+            )
+            try:
+                api.logout()
+            except Exception:
+                pass
+            raise
         _SHIOAJI_STOCK_API = api
+        _SHIOAJI_STOCK_LAST_LOGIN_ERROR = None
+        _SHIOAJI_STOCK_LOGIN_RETRY_AFTER = 0.0
         return api
 
 
 def warm_shioaji_stock_quote_client() -> None:
-    """Login and load contracts before the opening latency-sensitive path."""
+    """Login and prove the session before the opening latency-sensitive path."""
 
-    _shioaji_stock_api()
+    api = _shioaji_stock_api()
+    try:
+        api.usage()
+    except Exception as exc:
+        if not _is_shioaji_session_failure(exc):
+            raise
+        api = _reconnect_shioaji_stock_quote_client(api)
+        api.usage()
+
+
+def _reconnect_shioaji_stock_quote_client(failed_api: object) -> object:
+    """Replace one known-broken cached session and perform one fresh login."""
+
+    global _SHIOAJI_STOCK_API
+    with _SHIOAJI_STOCK_LOCK:
+        if _SHIOAJI_STOCK_API is not failed_api:
+            if _SHIOAJI_STOCK_API is not None:
+                return _SHIOAJI_STOCK_API
+            return _shioaji_stock_api()
+        _SHIOAJI_STOCK_API = None
+        _SHIOAJI_STOCK_CONTRACTS.clear()
+        _SHIOAJI_STOCK_CACHE.clear()
+        try:
+            failed_api.logout()
+        except Exception:
+            pass
+        return _shioaji_stock_api()
 
 
 def close_shioaji_stock_quote_client() -> None:
     """Close the process-local quote connection, primarily for clean shutdowns/tests."""
 
     global _SHIOAJI_STOCK_API
+    global _SHIOAJI_STOCK_LAST_LOGIN_ERROR
+    global _SHIOAJI_STOCK_LOGIN_RETRY_AFTER
     with _SHIOAJI_STOCK_LOCK:
         api = _SHIOAJI_STOCK_API
         _SHIOAJI_STOCK_API = None
+        _SHIOAJI_STOCK_LAST_LOGIN_ERROR = None
+        _SHIOAJI_STOCK_LOGIN_RETRY_AFTER = 0.0
         _SHIOAJI_STOCK_CONTRACTS.clear()
         _SHIOAJI_STOCK_CACHE.clear()
         if api is not None:
@@ -296,9 +371,31 @@ def fetch_shioaji_stock_snapshots(
     callers doing one-minute execution marks pass a zero TTL for fresh books.
     """
 
+    for attempt in range(2):
+        api = _shioaji_stock_api()
+        try:
+            return _fetch_shioaji_stock_snapshots_once(
+                symbols,
+                fallback_prices,
+                cache_ttl_seconds=cache_ttl_seconds,
+                api=api,
+            )
+        except Exception as exc:
+            if attempt > 0 or not _is_shioaji_session_failure(exc):
+                raise
+            _reconnect_shioaji_stock_quote_client(api)
+    raise AssertionError("unreachable Shioaji stock snapshot retry state")
+
+
+def _fetch_shioaji_stock_snapshots_once(
+    symbols: list[str],
+    fallback_prices: np.ndarray,
+    *,
+    cache_ttl_seconds: float,
+    api: object,
+) -> PriceSnapshot:
     if len(symbols) != len(fallback_prices):
         raise ValueError("symbols and fallback_prices must have equal length")
-    api = _shioaji_stock_api()
     ttl = max(0.0, float(cache_ttl_seconds))
     now_monotonic = time.monotonic()
     requested = [str(symbol).strip() for symbol in symbols]

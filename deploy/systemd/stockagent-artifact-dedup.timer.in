@@ -1,0 +1,11 @@
+[Unit]
+Description=Deduplicate stable StockAgent artifacts every day
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+RandomizedDelaySec=30min
+Persistent=true
+Unit=stockagent-artifact-dedup.service
+
+[Install]
+WantedBy=timers.target

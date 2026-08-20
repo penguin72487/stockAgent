@@ -9,7 +9,9 @@ def test_watchdog_reads_atomic_scheduler_and_monitor_state(tmp_path) -> None:
     (tmp_path / "provider_scheduler.json").write_text(
         json.dumps(
             {
-                "phase": "running",
+                "phase": "waiting",
+                "wait_reason": "provider_cooldown",
+                "wait_until": "2026-07-19T20:05:00+00:00",
                 "attempted_this_run": 123,
                 "active_total": 40,
                 "completed_pending_total": 7,
@@ -44,7 +46,7 @@ def test_watchdog_reads_atomic_scheduler_and_monitor_state(tmp_path) -> None:
 
     state = build_watchdog_state(tmp_path)
 
-    assert state.scheduler_phase == "running"
+    assert state.scheduler_phase == "waiting"
     assert state.scheduler_attempted == 123
     assert state.scheduler_active == 40
     assert state.scheduler_completed_pending == 7
@@ -54,6 +56,8 @@ def test_watchdog_reads_atomic_scheduler_and_monitor_state(tmp_path) -> None:
     assert state.running_tasks == 0
     assert state.manifest_last_task_update == "2026-07-19T06:00:01+00:00"
     assert state.next_cooldown_until_epoch == 1784491500
+    assert state.scheduler_wait_reason == "provider_cooldown"
+    assert state.scheduler_wait_until_epoch == 1784491500
 
 
 def test_watchdog_corrupt_or_missing_state_fails_open_without_false_cooldown(
@@ -72,6 +76,8 @@ def test_watchdog_corrupt_or_missing_state_fails_open_without_false_cooldown(
     assert state.pending_eligible == 1
     assert state.running_tasks == 0
     assert state.next_cooldown_until_epoch == 0
+    assert state.scheduler_wait_reason == ""
+    assert state.scheduler_wait_until_epoch == 0
 
 
 def test_watchdog_requires_pending_cooldown_evidence(tmp_path) -> None:

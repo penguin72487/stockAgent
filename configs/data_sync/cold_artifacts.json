@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "artifacts": [
+    {
+      "dataset": "artifact-tw-public-feature-input-v4-small",
+      "relative_root": "markets/tw_public_candles_multi_basis_online_complete_feature_input_lookback32_v4",
+      "maximum_file_bytes": 8388607,
+      "loose_file_threshold_bytes": 8388608,
+      "pack_buckets": 32,
+      "min_stable_hours": 24,
+      "completion_contract": "training-lifecycle-v1"
+    }
+  ]
+}

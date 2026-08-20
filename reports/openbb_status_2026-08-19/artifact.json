@@ -1,0 +1,317 @@
+{
+  "surface": "report",
+  "manifest": {
+    "version": 1,
+    "surface": "report",
+    "title": "OpenBB 歷史封存狀態與修復報告",
+    "description": "2000 年後 OpenBB 歷史資料封存的線上狀態、瓶頸與修復驗收快照。",
+    "generatedAt": "2026-08-19T00:04:52+08:00",
+    "cards": [
+      {
+        "id": "accepted_rate",
+        "description": "success 與權威 empty 任務占全部規劃任務的比例；不包含 unavailable。",
+        "dataset": "summary",
+        "sourceId": "monitor",
+        "metrics": [
+          {"label": "已接受率", "field": "accepted_rate", "format": "percent"}
+        ]
+      },
+      {
+        "id": "accepted_tasks",
+        "description": "已成功寫入資料或由供應商確認為空的任務。",
+        "dataset": "summary",
+        "sourceId": "monitor",
+        "metrics": [
+          {"label": "已接受任務", "field": "accepted_tasks", "format": "compact"}
+        ]
+      },
+      {
+        "id": "success_rows",
+        "description": "目前 Parquet 封存累計成功資料列。",
+        "dataset": "summary",
+        "sourceId": "monitor",
+        "metrics": [
+          {"label": "成功資料列", "field": "success_rows", "format": "compact"}
+        ]
+      },
+      {
+        "id": "actionable_backlog",
+        "description": "仍應由排程器嘗試的任務；其中絕大多數受 FMP 每日額度限制。",
+        "dataset": "summary",
+        "sourceId": "monitor",
+        "metrics": [
+          {"label": "可行動未完成", "field": "actionable_tasks", "format": "compact"}
+        ]
+      },
+      {
+        "id": "failed_tasks",
+        "description": "目前明確失敗且尚未轉為可重試、成功或不可用的任務。",
+        "dataset": "summary",
+        "sourceId": "monitor",
+        "metrics": [
+          {"label": "失敗任務", "field": "failed_tasks", "format": "number"}
+        ]
+      }
+    ],
+    "charts": [
+      {
+        "id": "task_status_chart",
+        "title": "封存任務狀態分布",
+        "subtitle": "已接受由 success 與 empty 組成；unavailable 是有能力證據但目前取不到資料。",
+        "showDescription": true,
+        "intent": "comparison",
+        "question": "目前任務量分布在哪些終態與待處理狀態？",
+        "rationale": "單一長條圖直接比較五種互斥任務狀態的規模。",
+        "type": "bar",
+        "dataset": "task_status",
+        "sourceId": "monitor",
+        "encodings": {
+          "x": {"field": "status_label", "type": "nominal", "label": "狀態"},
+          "y": {"field": "task_count", "type": "quantitative", "format": "compact", "label": "任務數"},
+          "tooltip": [
+            {"field": "task_count", "type": "quantitative", "format": "number", "label": "任務數"},
+            {"field": "share", "type": "quantitative", "format": "percent", "label": "占比"},
+            {"field": "meaning", "type": "text", "label": "定義"}
+          ]
+        },
+        "valueFormat": "compact",
+        "layout": "full",
+        "maxRows": 10
+      }
+    ],
+    "tables": [
+      {
+        "id": "blocker_table",
+        "title": "仍在限制完成度的項目",
+        "subtitle": "區分程式待辦、供應商限制與已隔離重試。",
+        "showDescription": true,
+        "dataset": "blockers",
+        "sourceId": "archive_db",
+        "layout": "full",
+        "density": "spacious",
+        "defaultSort": {"field": "tasks", "direction": "desc"},
+        "columns": [
+          {"field": "item", "label": "項目", "type": "text"},
+          {"field": "tasks", "label": "任務數", "format": "number", "align": "right"},
+          {"field": "classification", "label": "第一性分類", "type": "text"},
+          {"field": "state", "label": "目前狀態", "type": "text"},
+          {"field": "required_action", "label": "完成所需條件", "type": "text"}
+        ]
+      },
+      {
+        "id": "repair_table",
+        "title": "本輪已部署修正與驗收",
+        "subtitle": "修正直接針對狀態機、重試語義與供應商邊界。",
+        "showDescription": true,
+        "dataset": "repairs",
+        "sourceId": "service_log",
+        "layout": "full",
+        "density": "spacious",
+        "defaultSort": {"field": "order", "direction": "asc"},
+        "columns": [
+          {"field": "order", "label": "序", "format": "number", "align": "right"},
+          {"field": "mechanism", "label": "根因／機制", "type": "text"},
+          {"field": "change", "label": "實作", "type": "text"},
+          {"field": "acceptance", "label": "線上驗收", "type": "text"}
+        ]
+      }
+    ],
+    "sources": [
+      {
+        "id": "monitor",
+        "label": "OpenBB archive monitor snapshot",
+        "path": "data_openBB/_state/monitor_latest.json",
+        "query": {
+          "engine": "DuckDB",
+          "language": "sql",
+          "sql": "SELECT checked_at, total_tasks, accepted_tasks, success_rows, unavailable_tasks, retryable_tasks, completion_percent, health, status_counts FROM read_json_auto('data_openBB/_state/monitor_latest.json')",
+          "executed_at": "2026-08-18T16:00:00.341023+00:00",
+          "description": "讀取目前 active plan 的任務、資料列、警示、類別與 provider 稽核統計。",
+          "filters": ["active plan only", "archive start date 2000-01-01", "snapshot checked at 2026-08-19 00:00:00 Asia/Taipei"],
+          "metric_definitions": [
+            "accepted_tasks = success_tasks + authoritative_empty_tasks",
+            "accepted_rate = accepted_tasks / total_tasks",
+            "actionable_tasks = pending or retryable tasks not resolved as unavailable"
+          ]
+        }
+      },
+      {
+        "id": "archive_db",
+        "label": "OpenBB archive task manifest",
+        "path": "data_openBB/_state/openbb_archive.sqlite3",
+        "query": {
+          "engine": "DuckDB SQLite scanner",
+          "language": "sql",
+          "sql": "SELECT category, endpoint, status, selected_provider, COUNT(*) AS tasks FROM sqlite_scan('data_openBB/_state/openbb_archive.sqlite3', 'tasks') WHERE active = 1 GROUP BY category, endpoint, status, selected_provider ORDER BY tasks DESC",
+          "executed_at": "2026-08-18T16:04:52+00:00",
+          "description": "依 active plan、category、endpoint、status 與 provider outcomes 聚合未完成量與 NEWS 路由狀態。",
+          "tables_used": ["tasks"],
+          "filters": ["active = 1", "current active plan", "category and endpoint aggregates only"],
+          "metric_definitions": ["tasks = count of manifest task rows in each mutually exclusive task status"]
+        }
+      },
+      {
+        "id": "scheduler",
+        "label": "OpenBB provider scheduler state",
+        "path": "data_openBB/_state/provider_scheduler.json",
+        "query": {
+          "engine": "DuckDB",
+          "language": "sql",
+          "sql": "SELECT phase, wait_reason, wait_until, attempted_this_run, active_total, buffered_total, retry_deferred_total, next_task_retry_at FROM read_json_auto('data_openBB/_state/provider_scheduler.json')",
+          "executed_at": "2026-08-18T16:04:49.189436+00:00",
+          "description": "檢查 scheduler phase、等待原因、等待截止時間、執行中任務與 durable retry deadline。"
+        }
+      },
+      {
+        "id": "service_log",
+        "label": "OpenBB archive systemd journal and test receipts",
+        "path": "journalctl:stockagent-openbb-archive.service",
+        "query": {
+          "engine": "DuckDB over verified receipts",
+          "language": "sql",
+          "sql": "SELECT * FROM (VALUES (1, 'cooldown state', 'waiting deadline', 'watchdog paused'), (2, 'transport recovery', '4 tasks requeued', '4 succeeded and 1151 rows added'), (3, 'regression suite', 'OpenBB focused tests', '326 passed')) AS receipts(step, mechanism, change, acceptance)",
+          "executed_at": "2026-08-18T16:04:52+00:00",
+          "description": "核對服務重啟次數、修復維護收據、watchdog 等待訊息與 OpenBB 相關測試結果。",
+          "filters": ["service logs since 2026-08-18 23:51:45 Asia/Taipei", "OpenBB downloader, monitor, dashboard and watchdog tests"]
+        }
+      }
+    ],
+    "blocks": [
+      {
+        "id": "title",
+        "type": "markdown",
+        "layout": "full",
+        "body": "# OpenBB 歷史封存狀態與修復報告\n\n2000 年後歷史封存的線上稽核快照；時間為 2026-08-19 00:04（Asia/Taipei）。"
+      },
+      {
+        "id": "summary_metrics",
+        "type": "metric-strip",
+        "layout": "full",
+        "cardIds": ["accepted_rate", "accepted_tasks", "success_rows", "actionable_backlog", "failed_tasks"]
+      },
+      {
+        "id": "conclusion",
+        "type": "markdown",
+        "layout": "full",
+        "sourceId": "monitor",
+        "body": "## 結論\n\n服務控制面目前正常，封存資料面仍是 **critical / incomplete**。本輪已排除會造成假卡死、重啟空轉與錯誤永久分類的程式問題；目前 408,435 筆可行動未完成中，408,410 筆只能走 FMP。FMP 帳戶每日 250 requests 的配置形成至少 1,634 個重置週期的物理下限，因此增加 worker 或把 CPU 跑滿都不會縮短這個下限。"
+      },
+      {
+        "id": "task_status_visual",
+        "type": "chart",
+        "layout": "full",
+        "chartId": "task_status_chart"
+      },
+      {
+        "id": "status_interpretation",
+        "type": "markdown",
+        "layout": "full",
+        "sourceId": "monitor",
+        "body": "## 如何解讀目前進度\n\n72.55% 是「取得資料或確認為空」的接受率，不等同於全部需求已滿足。2,441,342 筆 unavailable 已有供應商能力／路由證據，所以不應繼續無限重試；408,435 筆才是仍需處理的工作。NEWS 的 473,824 筆全部屬 unavailable：目前 Tiingo News 權限不足、FMP 方案／路由受限，且 Benzinga、Intrinio 沒有可用憑證，排程器沒有把新聞漏掉。"
+      },
+      {
+        "id": "blocker_intro",
+        "type": "markdown",
+        "layout": "full",
+        "body": "## 真正瓶頸\n\n先判斷資料是否存在與帳戶是否獲准，再談 request rate；只有可服務的請求才值得平行化。"
+      },
+      {
+        "id": "blockers",
+        "type": "table",
+        "layout": "full",
+        "tableId": "blocker_table"
+      },
+      {
+        "id": "repairs_intro",
+        "type": "markdown",
+        "layout": "full",
+        "body": "## 第一性原理修正\n\n狀態機必須區分「可執行」、「等待外部截止時間」、「永久不可用」與「成功／空資料」；watchdog 只能對第一類停滯計時，provider adapter 則必須精確遵守實際 entitlement 邊界。"
+      },
+      {
+        "id": "repairs",
+        "type": "table",
+        "layout": "full",
+        "tableId": "repair_table"
+      },
+      {
+        "id": "operations",
+        "type": "markdown",
+        "layout": "full",
+        "sourceId": "scheduler",
+        "body": "## 接下來的自動行為\n\nScheduler 現在是 `waiting / provider_cooldown`，FMP 預計於 2026-08-19 04:05（Asia/Taipei）重新開放；25 筆 Congress.gov HTTP 500 任務已隔離到 durable retry deadline，下一次為 12:02。服務保持 active，watchdog 會在合法等待期間暫停 stall timer。"
+      },
+      {
+        "id": "caveats",
+        "type": "markdown",
+        "layout": "full",
+        "body": "## 限制與決策\n\n若維持 FMP 250 requests/day 且不縮小資料範圍，完整抓取在實務上不可行；需要升級 FMP、為相關 endpoint 增加有歷史權限的替代 provider，或明確刪減需求。NEWS 也需要另行取得歷史新聞權限，不能用近期 yfinance 新聞替代 2000 年後完整歷史。"
+      }
+    ]
+  },
+  "snapshot": {
+    "version": 1,
+    "generatedAt": "2026-08-19T00:04:52+08:00",
+    "status": "ready",
+    "datasets": {
+      "summary": [
+        {
+          "accepted_rate": 0.72551929,
+          "accepted_tasks": 7532654,
+          "total_tasks": 10382431,
+          "success_rows": 493759707,
+          "actionable_tasks": 408435,
+          "fmp_exclusive_tasks": 408410,
+          "unavailable_tasks": 2441342,
+          "failed_tasks": 0
+        }
+      ],
+      "task_status": [
+        {"status": "success", "status_label": "成功", "task_count": 7464791, "share": 0.718983, "accepted": true, "resolved": true, "meaning": "資料已寫入"},
+        {"status": "empty", "status_label": "權威空資料", "task_count": 67863, "share": 0.006537, "accepted": true, "resolved": true, "meaning": "供應商確認此範圍沒有資料"},
+        {"status": "unavailable", "status_label": "供應商不可用", "task_count": 2441342, "share": 0.235142, "accepted": false, "resolved": true, "meaning": "有能力、權限或路由不可用證據"},
+        {"status": "pending", "status_label": "待處理", "task_count": 408435, "share": 0.039339, "accepted": false, "resolved": false, "meaning": "等待 quota 或 durable retry"},
+        {"status": "failed", "status_label": "失敗", "task_count": 0, "share": 0.0, "accepted": false, "resolved": false, "meaning": "未分類的終端失敗"}
+      ],
+      "blockers": [
+        {"item": "FMP 專屬待處理", "tasks": 408410, "classification": "外部帳戶配置", "state": "250 requests/day，冷卻至 04:05", "required_action": "升級方案、加入具權限備援，或縮小範圍"},
+        {"item": "NEWS 歷史資料", "tasks": 473824, "classification": "已解析的權限缺口", "state": "全部 unavailable，不是 pending", "required_action": "取得 Tiingo News、FMP、Benzinga 或 Intrinio 歷史權限"},
+        {"item": "Congress.gov HTTP 500", "tasks": 25, "classification": "外部暫時性錯誤", "state": "已隔離，12:02 後重試", "required_action": "由排程器自動重試，不需人工重啟"},
+        {"item": "歷史 entitlement 截斷", "tasks": 6, "classification": "供應商歷史深度限制", "state": "可見資料已接受，但更早資料不可得", "required_action": "提高訂閱層級才可擴充歷史"}
+      ],
+      "repairs": [
+        {"order": 1, "mechanism": "合法 provider cooldown 被誤判為 stall", "change": "Scheduler 發布 waiting、wait_reason、wait_until；watchdog 僅在截止時間後恢復停滯計時", "acceptance": "連續日誌顯示 stall watchdog paused；服務 NRestarts=0"},
+        {"order": 2, "mechanism": "暫時網路錯誤曾被永久化", "change": "啟動維護把 transport outcomes 重新排入 pending", "acceptance": "FRED 3 筆、BLS 1 筆全成功；新增 1,151 列；failed=0"},
+        {"order": 3, "mechanism": "OpenBB FMP historical EPS 隱含把 limit 加 5", "change": "直接使用精確 entitlement limit 的 provider workaround", "acceptance": "回歸測試驗證送出的 limit 不再膨脹"},
+        {"order": 4, "mechanism": "FMP peers 的浮點 mktCap 不符合 OpenBB 整數模型", "change": "有限浮點市值在模型驗證前正規化為整數", "acceptance": "5 筆舊失敗已重新排程，正規化測試通過"},
+        {"order": 5, "mechanism": "下載器與監控器對 unavailable 證據定義可能漂移", "change": "抽出共用權威證據分類函式", "acceptance": "OpenBB 相關測試共 326 passed"}
+      ]
+    },
+    "accessIssues": []
+  },
+  "sources": [
+    {
+      "id": "monitor",
+      "label": "OpenBB archive monitor snapshot",
+      "path": "data_openBB/_state/monitor_latest.json",
+      "query": {"engine": "DuckDB", "language": "sql", "sql": "SELECT checked_at, total_tasks, accepted_tasks, success_rows, unavailable_tasks, retryable_tasks, completion_percent, health, status_counts FROM read_json_auto('data_openBB/_state/monitor_latest.json')", "executed_at": "2026-08-18T16:00:00.341023+00:00", "description": "Current active-plan archive audit snapshot."}
+    },
+    {
+      "id": "archive_db",
+      "label": "OpenBB archive task manifest",
+      "path": "data_openBB/_state/openbb_archive.sqlite3",
+      "query": {"engine": "DuckDB SQLite scanner", "language": "sql", "sql": "SELECT category, endpoint, status, selected_provider, COUNT(*) AS tasks FROM sqlite_scan('data_openBB/_state/openbb_archive.sqlite3', 'tasks') WHERE active = 1 GROUP BY category, endpoint, status, selected_provider ORDER BY tasks DESC", "executed_at": "2026-08-18T16:04:52+00:00", "description": "Grouped active-plan task manifest evidence.", "tables_used": ["tasks"]}
+    },
+    {
+      "id": "scheduler",
+      "label": "OpenBB provider scheduler state",
+      "path": "data_openBB/_state/provider_scheduler.json",
+      "query": {"engine": "DuckDB", "language": "sql", "sql": "SELECT phase, wait_reason, wait_until, attempted_this_run, active_total, buffered_total, retry_deferred_total, next_task_retry_at FROM read_json_auto('data_openBB/_state/provider_scheduler.json')", "executed_at": "2026-08-18T16:04:49.189436+00:00", "description": "Scheduler wait and retry-deadline state."}
+    },
+    {
+      "id": "service_log",
+      "label": "OpenBB archive systemd journal and test receipts",
+      "path": "journalctl:stockagent-openbb-archive.service",
+      "query": {"engine": "DuckDB over verified receipts", "language": "sql", "sql": "SELECT * FROM (VALUES (1, 'cooldown state', 'waiting deadline', 'watchdog paused'), (2, 'transport recovery', '4 tasks requeued', '4 succeeded and 1151 rows added'), (3, 'regression suite', 'OpenBB focused tests', '326 passed')) AS receipts(step, mechanism, change, acceptance)", "executed_at": "2026-08-18T16:04:52+00:00", "description": "Deployment and regression-test acceptance receipts."}
+    }
+  ]
+}

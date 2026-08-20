@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 from collections import deque
+from collections.abc import Mapping
 from datetime import date as datetime_date, datetime, time as datetime_time, timezone
 import json
 import math
 from pathlib import Path
 import threading
-from typing import Any, Final, Mapping
+from typing import Any, Final
 from zoneinfo import ZoneInfo
 
 
@@ -36,13 +37,44 @@ _SESSION_TAIL_CACHE: dict[
     tuple[Path, int, str, bool], tuple[int, int, int, int, list[dict[str, Any]]]
 ] = {}
 _SESSION_TAIL_CACHE_LOCK = threading.Lock()
+_AVAILABLE_SESSION_DATES_CACHE: dict[
+    Path, tuple[tuple[Any, ...], list[str]]
+] = {}
+_AVAILABLE_SESSION_DATES_CACHE_LOCK = threading.Lock()
+_OBJECT_CACHE: dict[
+    Path, tuple[int, int, int, int, dict[str, Any]]
+] = {}
+_OBJECT_CACHE_LOCK = threading.Lock()
+_ROWS_BY_SESSION_CACHE: dict[
+    tuple[Path, int],
+    tuple[int, int, int, int, dict[str, tuple[dict[str, Any], ...]]],
+] = {}
+_ROWS_BY_SESSION_CACHE_LOCK = threading.Lock()
+_SIGNAL_PAGE_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
+_SIGNAL_PAGE_CACHE_LOCK = threading.Lock()
 
 
 def _object(path: Path) -> dict[str, Any]:
+    cache_key = path.resolve()
+    stat = path.stat()
+    signature = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+    with _OBJECT_CACHE_LOCK:
+        cached = _OBJECT_CACHE.get(cache_key)
+        if cached is not None and cached[:4] == signature:
+            return dict(cached[4])
     payload = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
         raise ValueError(f"JSON root is not an object: {path}")
-    return payload
+    final_stat = path.stat()
+    if (
+        final_stat.st_dev,
+        final_stat.st_ino,
+        final_stat.st_size,
+        final_stat.st_mtime_ns,
+    ) == signature:
+        with _OBJECT_CACHE_LOCK:
+            _OBJECT_CACHE[cache_key] = (*signature, payload)
+    return dict(payload)
 
 
 def _tail(path: Path, maximum_rows: int) -> list[dict[str, Any]]:
@@ -61,14 +93,17 @@ def _tail(path: Path, maximum_rows: int) -> list[dict[str, Any]]:
             return list(cached[4])
     rows: deque[dict[str, Any]] = deque(maxlen=maximum_rows)
     with path.open("rb") as handle:
-        size = handle.seek(0, 2)
-        cursor = size
-        encoded = b""
-        while cursor > 0 and encoded.count(b"\n") <= maximum_rows:
+        cursor = handle.seek(0, 2)
+        chunks: list[bytes] = []
+        newline_count = 0
+        while cursor > 0 and newline_count <= maximum_rows:
             chunk_size = min(1 << 20, cursor)
             cursor -= chunk_size
             handle.seek(cursor)
-            encoded = handle.read(chunk_size) + encoded
+            chunk = handle.read(chunk_size)
+            chunks.append(chunk)
+            newline_count += chunk.count(b"\n")
+    encoded = b"".join(reversed(chunks))
     for line in encoded.splitlines()[-maximum_rows:]:
         if not line.strip():
             continue
@@ -171,6 +206,40 @@ def _tail_for_session(
                 _SESSION_TAIL_CACHE.pop(next(iter(_SESSION_TAIL_CACHE)))
             _SESSION_TAIL_CACHE[cache_key] = (*signature, result)
     return list(result)
+
+
+def _rows_by_session(
+    path: Path, maximum_rows: int
+) -> dict[str, tuple[dict[str, Any], ...]]:
+    """Index a bounded append-only tail once for repeated interactive filters."""
+
+    if maximum_rows <= 0 or not path.is_file():
+        return {}
+    stat = path.stat()
+    cache_key = (path.resolve(), int(maximum_rows))
+    signature = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+    with _ROWS_BY_SESSION_CACHE_LOCK:
+        cached = _ROWS_BY_SESSION_CACHE.get(cache_key)
+        if cached is not None and cached[:4] == signature:
+            return dict(cached[4])
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in _tail(path, maximum_rows):
+        session_date = str(row.get("session_date") or "")[:10]
+        if session_date:
+            grouped.setdefault(session_date, []).append(row)
+    result = {key: tuple(value) for key, value in grouped.items()}
+    final_stat = path.stat()
+    if (
+        final_stat.st_dev,
+        final_stat.st_ino,
+        final_stat.st_size,
+        final_stat.st_mtime_ns,
+    ) == signature:
+        with _ROWS_BY_SESSION_CACHE_LOCK:
+            if len(_ROWS_BY_SESSION_CACHE) >= 8:
+                _ROWS_BY_SESSION_CACHE.pop(next(iter(_ROWS_BY_SESSION_CACHE)))
+            _ROWS_BY_SESSION_CACHE[cache_key] = (*signature, result)
+    return dict(result)
 
 
 def _percentile(values: list[float], quantile: float) -> float | None:
@@ -591,6 +660,48 @@ def _attach_execution_records(
 def _available_session_dates(
     *, root: Path, state: Mapping[str, Any], observed: datetime
 ) -> list[str]:
+    root = Path(root)
+    mode_dates = tuple(
+        sorted(
+            {
+                str(raw_mode["session_date"])[:10]
+                for raw_mode in (state.get("modes") or {}).values()
+                if isinstance(raw_mode, Mapping) and raw_mode.get("session_date")
+            }
+        )
+    )
+    tracked_filenames = (
+        "marks.jsonl",
+        "signals.jsonl",
+        "orders.jsonl",
+        "fills.jsonl",
+        "benchmark_marks.jsonl",
+        "events.jsonl",
+        BENCHMARK_HISTORY_FILENAME,
+    )
+
+    def signature(path: Path) -> tuple[int, int, int, int] | None:
+        try:
+            stat = path.stat()
+        except FileNotFoundError:
+            return None
+        return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns
+
+    position_history_dates = tuple(
+        sorted({path.parent.name for path in (root / "position_history").glob("*/*.json")})
+    )
+    cache_signature: tuple[Any, ...] = (
+        mode_dates,
+        tuple((filename, signature(root / filename)) for filename in tracked_filenames),
+        position_history_dates,
+        observed.astimezone(TAIPEI).date().isoformat(),
+    )
+    resolved_root = root.resolve()
+    with _AVAILABLE_SESSION_DATES_CACHE_LOCK:
+        cached = _AVAILABLE_SESSION_DATES_CACHE.get(resolved_root)
+        if cached is not None and cached[0] == cache_signature:
+            return list(cached[1])
+
     dates: set[str] = set()
     for raw_mode in (state.get("modes") or {}).values():
         if isinstance(raw_mode, Mapping) and raw_mode.get("session_date"):
@@ -619,16 +730,23 @@ def _available_session_dates(
     for row in benchmark_history.get("marks") or ():
         if isinstance(row, Mapping) and row.get("session_date"):
             dates.add(str(row["session_date"])[:10])
-    for path in (root / "position_history").glob("*/*.json"):
+    for raw_date in position_history_dates:
         try:
-            datetime_date.fromisoformat(path.parent.name)
+            datetime_date.fromisoformat(raw_date)
         except ValueError:
             continue
-        dates.add(path.parent.name)
+        dates.add(raw_date)
     local = observed.astimezone(TAIPEI)
     if not dates and local.weekday() < 5:
         dates.add(local.date().isoformat())
-    return sorted(dates, reverse=True)
+    result = sorted(dates, reverse=True)
+    with _AVAILABLE_SESSION_DATES_CACHE_LOCK:
+        if len(_AVAILABLE_SESSION_DATES_CACHE) >= _TAIL_CACHE_MAX_ENTRIES:
+            _AVAILABLE_SESSION_DATES_CACHE.pop(
+                next(iter(_AVAILABLE_SESSION_DATES_CACHE))
+            )
+        _AVAILABLE_SESSION_DATES_CACHE[resolved_root] = (cache_signature, result)
+    return list(result)
 
 
 def _select_session_date(requested: str | None, available: list[str]) -> str:
@@ -1100,6 +1218,55 @@ def _preopen_progress(
         ),
         "markets": rows,
         "source_path": str(path) if path is not None else None,
+    }
+
+
+def _simulation_preopen_progress(
+    *, path: Path, observed: datetime
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {}
+    if path.is_file():
+        try:
+            payload = _object(path)
+        except (OSError, ValueError, json.JSONDecodeError):
+            payload = {}
+    session_date = observed.astimezone(TAIPEI).date().isoformat()
+    if payload.get("session_date") != session_date:
+        return {
+            "status": "pending",
+            "ready": False,
+            "session_date": session_date,
+            "updated_at": None,
+            "components": {},
+            "source_path": str(path),
+        }
+    components = payload.get("components")
+    components = dict(components) if isinstance(components, Mapping) else {}
+    safe_components: dict[str, dict[str, Any]] = {}
+    for name in ("eligibility", "shioaji_quote"):
+        raw = components.get(name)
+        row = dict(raw) if isinstance(raw, Mapping) else {}
+        details = row.get("details")
+        details = dict(details) if isinstance(details, Mapping) else {}
+        safe_components[name] = {
+            "status": row.get("status") or "pending",
+            "checked_at": row.get("checked_at"),
+            "elapsed_ms": _finite_float(row.get("elapsed_ms")),
+            "proof": details.get("proof"),
+            "symbol_count": int(details.get("symbol_count") or 0) or None,
+            "error": row.get("error"),
+        }
+    ready = bool(
+        payload.get("status") == "ready"
+        and all(row.get("status") == "ready" for row in safe_components.values())
+    )
+    return {
+        "status": payload.get("status") or "pending",
+        "ready": ready,
+        "session_date": session_date,
+        "updated_at": payload.get("updated_at"),
+        "components": safe_components,
+        "source_path": str(path),
     }
 
 
@@ -1702,11 +1869,28 @@ def build_dashboard_snapshot(
             str(row.get("symbol")),
         )
     )
+    # The default dashboard is an operational view.  Before today's first
+    # signal the latest ledger session is still yesterday, but today's preopen
+    # receipts must remain visible.  Only an explicitly selected historical
+    # session should evaluate preopen state at that historical timestamp.
+    operational_view = session_date is None or current_view
+    preopen_observed = observed if operational_view else selected_observed
     preopen = _preopen_progress(
         path=preopen_readiness_path,
         modes=modes,
-        observed=selected_observed,
+        observed=preopen_observed,
     )
+    simulation_preopen = _simulation_preopen_progress(
+        path=root / "preopen_readiness.json",
+        observed=preopen_observed,
+    )
+    preopen["simulation"] = simulation_preopen
+    if operational_view and not simulation_preopen["ready"]:
+        preopen["status"] = (
+            "failed"
+            if simulation_preopen["status"] == "failed"
+            else "pending"
+        )
     session_progress = _session_progress(
         observed=selected_observed,
         mode_count=len(modes),
@@ -1828,15 +2012,35 @@ def build_dashboard_signal_page(
             available=available_session_dates,
         )
     )
-    selected_date_set = set(selected_session_dates)
     normalized_mode = str(mode or "").strip()
     normalized_symbol = str(symbol or "").strip().casefold()
     normalized_status = str(status or "all").strip().casefold()
-    rows = _tail(root / "signals.jsonl", maximum_scan_rows)
+    signal_path = root / "signals.jsonl"
+    signal_stat = signal_path.stat()
+    cache_key = (
+        root.resolve(),
+        signal_stat.st_dev,
+        signal_stat.st_ino,
+        signal_stat.st_size,
+        signal_stat.st_mtime_ns,
+        tuple(selected_session_dates),
+        normalized_mode,
+        normalized_symbol,
+        normalized_status,
+        int(offset),
+        int(limit),
+    )
+    with _SIGNAL_PAGE_CACHE_LOCK:
+        cached_page = _SIGNAL_PAGE_CACHE.get(cache_key)
+        if cached_page is not None:
+            return dict(cached_page)
+    rows_by_session = _rows_by_session(
+        signal_path, maximum_scan_rows
+    )
     current_rows = [
         row
-        for row in rows
-        if str(row.get("session_date") or "")[:10] in selected_date_set
+        for selected_date in selected_session_dates
+        for row in rows_by_session.get(selected_date, ())
     ]
 
     def included(row: Mapping[str, Any]) -> bool:
@@ -1940,8 +2144,58 @@ def build_dashboard_signal_page(
                 direction_summary[stage]["short_count"] += 1
                 direction_summary[stage]["short_gross"] += -value
 
+    opening_execution_audit: dict[str, dict[str, Any]] = {}
+    for row in summary_rows:
+        target = _finite_float(row.get("target_weight")) or 0.0
+        if target == 0.0:
+            continue
+        market = str(row.get("market") or "unknown")
+        audit = opening_execution_audit.setdefault(
+            market,
+            {
+                "nonzero_signal_count": 0,
+                "opening_price_covered_count": 0,
+                "opening_price_missing_count": 0,
+                "execution_price_covered_count": 0,
+                "requested_signal_count": 0,
+                "filled_signal_count": 0,
+                "unfilled_signal_count": 0,
+                "missing_open_symbols": [],
+                "unfilled_reason_counts": {},
+            },
+        )
+        audit["nonzero_signal_count"] += 1
+        sizing_open = _finite_float(row.get("sizing_open_price"))
+        if sizing_open is not None and sizing_open > 0.0:
+            audit["opening_price_covered_count"] += 1
+        else:
+            audit["opening_price_missing_count"] += 1
+            missing_symbols = audit["missing_open_symbols"]
+            if len(missing_symbols) < 50:
+                missing_symbols.append(str(row.get("symbol") or ""))
+        execution_price = _finite_float(row.get("execution_price"))
+        if execution_price is not None and execution_price > 0.0:
+            audit["execution_price_covered_count"] += 1
+        if int(row.get("requested_shares") or 0) > 0:
+            audit["requested_signal_count"] += 1
+        if int(row.get("filled_shares") or 0) > 0:
+            audit["filled_signal_count"] += 1
+        else:
+            audit["unfilled_signal_count"] += 1
+            reason = str(row.get("reason") or row.get("status") or "unknown")
+            reason_counts = audit["unfilled_reason_counts"]
+            reason_counts[reason] = int(reason_counts.get(reason, 0)) + 1
+
+    for audit in opening_execution_audit.values():
+        audit["unfilled_reason_counts"] = dict(
+            sorted(
+                audit["unfilled_reason_counts"].items(),
+                key=lambda item: (-int(item[1]), str(item[0])),
+            )
+        )
+
     page = filtered[offset : offset + limit]
-    return {
+    payload = {
         "schema_version": DASHBOARD_SCHEMA_VERSION,
         "simulation_only": True,
         "production_order_possible": False,
@@ -1959,8 +2213,15 @@ def build_dashboard_signal_page(
         "record_count": _line_count(root / "signals.jsonl"),
         "direction_summary_scope": "current_signal_id_per_mode",
         "direction_summary": direction_summary,
+        "opening_execution_audit_scope": "nonzero_target_rows_in_current_signal_id_per_mode",
+        "opening_execution_audit": opening_execution_audit,
         "rows": page,
     }
+    with _SIGNAL_PAGE_CACHE_LOCK:
+        if len(_SIGNAL_PAGE_CACHE) >= 128:
+            _SIGNAL_PAGE_CACHE.pop(next(iter(_SIGNAL_PAGE_CACHE)))
+        _SIGNAL_PAGE_CACHE[cache_key] = payload
+    return dict(payload)
 
 
 def build_dashboard_position_page(

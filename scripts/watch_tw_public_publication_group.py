@@ -17,8 +17,9 @@ from __future__ import annotations
 import argparse
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
+import csv
 from dataclasses import dataclass
-from datetime import datetime, time as datetime_time
+from datetime import datetime, time as datetime_time, timedelta
 import fcntl
 import hashlib
 import json
@@ -40,6 +41,7 @@ if str(REPO_ROOT) not in sys.path:
 from downloader.download_tw_public_data import (  # noqa: E402
     DEFAULT_DATASETS,
     _select_specs,
+    _validated_taiex_session_dates,
 )
 
 
@@ -335,8 +337,10 @@ def _taiex_calendar_command(*, live_root: Path, args: argparse.Namespace) -> lis
 def _download_command(
     *,
     live_root: Path,
+    metadata_dir: Path,
     phase: PublicationPhase,
     args: argparse.Namespace,
+    end_date: str = "today",
 ) -> list[str]:
     command = [
         sys.executable,
@@ -346,9 +350,11 @@ def _download_command(
         "--datasets",
         *phase.selectors,
         "--end-date",
-        "today",
+        end_date,
         "--output-dir",
         str(live_root),
+        "--run-metadata-dir",
+        str(metadata_dir),
         "--workers",
         str(args.workers),
         "--date-workers",
@@ -362,11 +368,79 @@ def _download_command(
         "--allow-daily-publication-lag",
         "--require-taiex-session-calendar",
         "--no-progress",
-        "--no-write-run-metadata",
     ]
     if phase.require_close_publication:
         command.append("--require-daily-close-publication")
     return command
+
+
+def _latest_completed_taiex_session(
+    live_root: Path,
+    *,
+    observed: datetime,
+) -> str:
+    """Resolve the latest receipt-verified completed session for pre-open work."""
+
+    summary_path = live_root / "twse_taiex_ohlc.summary.json"
+    try:
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        coverage_end = datetime.fromisoformat(
+            str(summary["effective_end_date"])[:10]
+        ).date()
+    except (OSError, UnicodeError, json.JSONDecodeError, KeyError, ValueError) as exc:
+        raise RuntimeError(
+            "preopen sweep requires a readable receipt-verified TAIEX calendar"
+        ) from exc
+    validation_end = min(coverage_end, observed.date())
+    validation_start = validation_end - timedelta(days=370)
+    sessions, _ = _validated_taiex_session_dates(
+        live_root,
+        validation_start,
+        validation_end,
+    )
+    if not sessions:
+        raise RuntimeError("TAIEX calendar has no completed session in the last year")
+    return max(sessions).isoformat()
+
+
+def _download_evidence(metadata_dir: Path) -> dict[str, object]:
+    """Load the child downloader evidence without trusting its exit code alone."""
+
+    summary_path = metadata_dir / "download_summary.json"
+    report_path = metadata_dir / "download_report.csv"
+    try:
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        summary = None
+    failures: list[dict[str, object]] = []
+    try:
+        with report_path.open(newline="", encoding="utf-8") as handle:
+            for row in csv.DictReader(handle):
+                if str(row.get("status") or "") not in {
+                    "failed",
+                    "incomplete",
+                    "unsupported",
+                }:
+                    continue
+                failures.append(
+                    {
+                        key: row.get(key)
+                        for key in (
+                            "dataset",
+                            "status",
+                            "message",
+                            "failed_dates",
+                            "missing_dates_after",
+                        )
+                    }
+                )
+    except (OSError, UnicodeError, csv.Error):
+        pass
+    return {
+        "download_metadata_dir": str(metadata_dir),
+        "download_summary": summary,
+        "failed_datasets": failures,
+    }
 
 
 def _changed_files(
@@ -430,6 +504,15 @@ def main() -> int:
         if args.receipt_root.is_absolute()
         else REPO_ROOT / args.receipt_root
     ).resolve(strict=False)
+    metadata_run_name = started.strftime("%Y%m%dT%H%M%S%f")
+    metadata_dir = (
+        receipt_root / phase.name / "download_runs" / metadata_run_name
+    )
+    download_end_date = (
+        _latest_completed_taiex_session(live_root, observed=started)
+        if phase.name == "preopen_all"
+        else "today"
+    )
     specs = _select_specs(list(phase.selectors))
     selected_names = sorted(spec.name for spec in specs)
     sources = dict(sorted(Counter(spec.source for spec in specs).items()))
@@ -445,7 +528,15 @@ def main() -> int:
         before = _file_hashes(live_root, selected_names)
         if phase.refresh_taiex_calendar:
             commands.append(_taiex_calendar_command(live_root=live_root, args=args))
-        commands.append(_download_command(live_root=live_root, phase=phase, args=args))
+        commands.append(
+            _download_command(
+                live_root=live_root,
+                metadata_dir=metadata_dir,
+                phase=phase,
+                args=args,
+                end_date=download_end_date,
+            )
+        )
         for command in commands:
             completed = subprocess.run(command, cwd=REPO_ROOT, check=False)
             return_codes.append(int(completed.returncode))
@@ -462,6 +553,7 @@ def main() -> int:
         "phase": phase.name,
         "official_basis": phase.official_basis,
         "scheduled_boundary": phase.anchor.isoformat(),
+        "download_end_date": download_end_date,
         "started_at_taipei": started.isoformat(),
         "lock_acquired_at_taipei": lock_acquired.isoformat(),
         "completed_at_taipei": completed_at.isoformat(),
@@ -477,6 +569,7 @@ def main() -> int:
         "live_root": str(live_root),
         "strict_publication_deferred_to_0830": True,
     }
+    payload.update(_download_evidence(metadata_dir))
     _write_receipts(receipt_root, payload, phase=phase, started=started)
     print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
     return 0 if status == "ok" else 1
