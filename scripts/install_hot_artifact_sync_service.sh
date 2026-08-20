@@ -26,7 +26,7 @@ sed \
 systemd-analyze verify "$temporary_dir/$service_name"
 install -d -m 0755 /srv/stockagent-artifacts-hot
 install -m 0644 \
-  "$repo_root/deploy/syncthing/stockagent-artifacts-live.stignore" \
+  "$repo_root/deploy/syncthing/stockagent-artifacts-hot.stignore" \
   /srv/stockagent-artifacts-hot/.stignore
 
 source "$repo_root/scripts/runtime_env.sh"

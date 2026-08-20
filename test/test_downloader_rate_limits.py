@@ -11,6 +11,7 @@ from downloader.common import (
     PersistentProgress,
     SharedRateLimiter,
     atomic_write_text,
+    parquet_temporal_metadata,
     parse_retry_after_seconds,
     provider_rate_limit,
     resolve_incremental_reconcile_start_ms,
@@ -115,6 +116,75 @@ def test_persistent_progress_publishes_measured_eta_atomically(tmp_path) -> None
     assert heartbeat["current"] == 1
     assert complete["state"] == "complete"
     assert complete["ratio"] == 1.0
+
+
+def test_request_telemetry_does_not_advance_logical_progress(tmp_path) -> None:
+    path = tmp_path / "progress.json"
+    progress = PersistentProgress(
+        path,
+        label="fixture",
+        total=2,
+        unit="symbol",
+        basis="logical completions",
+        started_at=datetime.now(timezone.utc),
+    )
+
+    progress.observe(
+        "candles", "request_pages", count=37, publish_interval_seconds=0
+    )
+    payload = downloader_common.json.loads(path.read_text())
+
+    assert payload["current"] == 0
+    assert payload["ratio"] == 0.0
+    assert payload["telemetry_counts"] == {"request_pages": 37}
+
+
+def test_progress_preserves_bounded_previous_run_evidence(tmp_path) -> None:
+    path = tmp_path / "progress.json"
+    first = PersistentProgress(
+        path,
+        label="fixture",
+        total=3,
+        unit="symbol",
+        basis="logical completions",
+        started_at=datetime.now(timezone.utc),
+    )
+    first.update("candles", "failed")
+
+    PersistentProgress(
+        path,
+        label="fixture",
+        total=4,
+        unit="symbol",
+        basis="new cycle",
+        started_at=datetime.now(timezone.utc),
+    )
+    payload = downloader_common.json.loads(path.read_text())
+
+    assert payload["current"] == 0
+    assert payload["previous_run"]["state"] == "running"
+    assert payload["previous_run"]["current"] == 1
+    assert payload["previous_run"]["status_counts"] == {"failed": 1}
+
+
+def test_strict_progress_finish_does_not_fabricate_completion(tmp_path) -> None:
+    path = tmp_path / "progress.json"
+    progress = PersistentProgress(
+        path,
+        label="fixture",
+        total=2,
+        unit="symbol",
+        basis="logical completions",
+        started_at=datetime.now(timezone.utc),
+    )
+    progress.update("candles", "updated")
+
+    progress.finish(require_exact=True)
+    payload = downloader_common.json.loads(path.read_text())
+
+    assert payload["state"] == "partial"
+    assert payload["current"] == 1
+    assert payload["ratio"] == 0.5
 
 
 def test_atomic_write_text_replaces_complete_artifact(tmp_path) -> None:
@@ -405,3 +475,44 @@ def test_incremental_reconcile_repairs_missing_head_before_tail_append() -> None
     assert complete_start == expected
     assert not tail_repaired
     assert tail_start == expected + 99 * interval
+
+
+def test_tail_only_reconcile_does_not_repeat_missing_head_backfill() -> None:
+    interval = 60 * 1000
+    expected = 1_700_000_000_000
+
+    start, repaired = resolve_incremental_reconcile_start_ms(
+        expected_first_ms=expected,
+        earliest_existing_ms=expected + 20 * interval,
+        latest_existing_ms=expected + 100 * interval,
+        overlap_ms=interval,
+        repair_missing_head=False,
+    )
+
+    assert repaired is False
+    assert start == expected + 99 * interval
+
+
+def test_parquet_temporal_metadata_uses_footer_bounds(tmp_path) -> None:
+    path = tmp_path / "bars.parquet"
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    base = 1_700_000_000_000
+    pq.write_table(
+        pa.table({"date": [base, base + 60_000, base + 120_000]}),
+        path,
+        write_statistics=True,
+    )
+
+    rows, earliest, latest, interval_ok = parquet_temporal_metadata(
+        pq.ParquetFile(path),
+        expected_interval_ms=60_000,
+    )
+
+    assert (rows, earliest, latest, interval_ok) == (
+        3,
+        base,
+        base + 120_000,
+        True,
+    )

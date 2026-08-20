@@ -2,7 +2,8 @@
 
 const FETCH_TIMEOUT_MS = 5000;
 const REFRESH_MS = 2000;
-const $ = (id) => document.getElementById(id);
+const Dashboard = window.StockAgentDashboard;
+const $ = Dashboard.byId;
 let activeController = null;
 let requestSequence = 0;
 
@@ -10,18 +11,13 @@ const integer = new Intl.NumberFormat("zh-TW", {maximumFractionDigits: 0});
 const decimal = new Intl.NumberFormat("zh-TW", {maximumFractionDigits: 2});
 const percent = new Intl.NumberFormat("zh-TW", {style: "percent", maximumFractionDigits: 2});
 
-function finite(value) { const number = Number(value); return Number.isFinite(number) ? number : null; }
+function finite(value) { return Dashboard.finiteNumber(value); }
 function number(value) { const n = finite(value); return n == null ? "—" : decimal.format(n); }
 function count(value) { const n = finite(value); return n == null ? "—" : integer.format(n); }
 function milliseconds(value) { const n = finite(value); return n == null ? "—" : `${decimal.format(n)} ms`; }
 function ratio(value) { const n = finite(value); return n == null ? "—" : percent.format(n); }
 function bytes(value) {
-  const n = finite(value);
-  if (n == null) return "—";
-  const units = ["B", "KB", "MB", "GB", "TB"];
-  let scaled = Math.max(0, n); let index = 0;
-  while (scaled >= 1024 && index < units.length - 1) { scaled /= 1024; index += 1; }
-  return `${decimal.format(scaled)} ${units[index]}`;
+  return Dashboard.formatBytes(value, {maximumFractionDigits: 2});
 }
 function duration(value) {
   const seconds = finite(value);
@@ -35,9 +31,7 @@ function localTime(value) {
   return Number.isNaN(date.getTime()) ? "—" : date.toLocaleString("zh-TW", {timeZone: "Asia/Taipei", hour12: false});
 }
 function svgElement(name, attributes = {}) {
-  const node = document.createElementNS("http://www.w3.org/2000/svg", name);
-  for (const [key, value] of Object.entries(attributes)) node.setAttribute(key, String(value));
-  return node;
+  return Dashboard.svgElement(name, attributes);
 }
 
 function renderChart(rows) {
@@ -151,10 +145,13 @@ async function refresh({manual = false} = {}) {
   if (activeController) activeController.abort();
   const controller = new AbortController(); activeController = controller;
   const sequence = ++requestSequence;
-  const timer = window.setTimeout(() => controller.abort(new DOMException("Request timed out", "TimeoutError")), FETCH_TIMEOUT_MS);
   const started = performance.now();
   try {
-    const response = await fetch("api/status", {cache: "no-store", signal: controller.signal});
+    const response = await Dashboard.fetchWithTimeout("api/status", {
+      cache: "no-store",
+      signal: controller.signal,
+      timeoutMs: FETCH_TIMEOUT_MS,
+    });
     const headersAt = performance.now();
     const text = await response.text();
     const downloadedAt = performance.now();
@@ -167,12 +164,10 @@ async function refresh({manual = false} = {}) {
     if (error?.name === "AbortError") return;
     $("live-dot").className = "live-dot bad"; $("live-status").textContent = `讀取失敗：${error}`;
   } finally {
-    window.clearTimeout(timer);
     if (activeController === controller) activeController = null;
   }
 }
 
 $("refresh-now").addEventListener("click", () => void refresh({manual: true}));
 document.addEventListener("visibilitychange", () => { if (!document.hidden) void refresh({manual: true}); });
-void refresh();
-window.setInterval(() => void refresh(), REFRESH_MS);
+Dashboard.scheduleRefresh(refresh, {intervalMs: REFRESH_MS, refreshOnVisible: false});

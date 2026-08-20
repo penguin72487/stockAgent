@@ -17,7 +17,10 @@ from stockagent.backtest.tw_index_derivatives_tick import (
     option_target_weights_from_logits,
     run_tw_index_derivatives_tick_bidask_continuous,
     run_tw_index_derivatives_tick_continuous,
+    sweep_five_level_depth,
+    sweep_five_level_depth_scalar,
     txo_short_initial_margin_per_contract,
+    txo_short_initial_margin_per_contract_scalar,
 )
 from stockagent.config import load_config
 from stockagent.data.tw_index_derivatives_tick import (
@@ -512,6 +515,36 @@ def test_option_naked_call_and_put_margin_uses_official_single_leg_formula() -> 
         strike_price=20_100.0,
     )
     torch.testing.assert_close(margin, torch.tensor([187_000.0, 193_000.0]))
+    assert txo_short_initial_margin_per_contract_scalar(
+        100.0,
+        20_000.0,
+        20_100.0,
+        option_right="C",
+    ) == pytest.approx(float(margin[0]))
+    assert txo_short_initial_margin_per_contract_scalar(
+        120.0,
+        20_000.0,
+        20_100.0,
+        option_right="P",
+    ) == pytest.approx(float(margin[1]))
+
+
+def test_scalar_five_level_sweep_matches_canonical_tensor_executor() -> None:
+    prices = [101.0, 102.0, 103.0, 104.0, 105.0]
+    volumes = [1.0, 2.0, 0.0, 4.0, 5.0]
+    for requested in (1.0, 3.0, 6.0, 20.0):
+        expected_filled, expected_notional = sweep_five_level_depth(
+            torch.tensor(requested),
+            torch.tensor(prices),
+            torch.tensor(volumes),
+        )
+        actual_filled, actual_notional = sweep_five_level_depth_scalar(
+            requested,
+            prices,
+            volumes,
+        )
+        assert actual_filled == pytest.approx(float(expected_filled))
+        assert actual_notional == pytest.approx(float(expected_notional))
 
 
 def test_option_executor_enforces_permission_tax_margin_and_forced_flat() -> None:

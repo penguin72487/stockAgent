@@ -94,9 +94,7 @@ def test_monitor_excludes_active_bls_bulk_route_from_api_quota_floor(
     assert status["fully_local_bypass_providers"] == ["bls"]
     assert status["provider_quota_feasibility"] == {}
     projection = next(
-        row
-        for row in status["provider_eta_projections"]
-        if row["provider"] == "bls"
+        row for row in status["provider_eta_projections"] if row["provider"] == "bls"
     )
     assert projection["local_cooldown_bypass"] is True
     assert projection["state"] == "stalled"
@@ -173,6 +171,46 @@ def test_monitor_reports_durable_task_retry_backoff_as_deferred(
     assert status["next_task_retry_at"] == deadline
     assert status["runnable_retryable_tasks"] == 0
     assert status["retryable_tasks"] == 1
+
+
+def test_monitor_keeps_repair_queue_visible_but_outside_main_scheduler(
+    tmp_path: Path,
+) -> None:
+    manifest = Manifest(tmp_path / "_state" / "openbb_archive.sqlite3")
+    task = DownloadTask(
+        task_id="congress-repair",
+        endpoint="uscongress.bill_info",
+        category="uscongress",
+        scope_key="https://api.congress.gov/v3/bill/111/s/3605?format=json",
+        kwargs={"bill_url": "https://api.congress.gov/v3/bill/111/s/3605?format=json"},
+        providers=("congress_gov",),
+        output_path=str(tmp_path / "data" / "congress-repair.parquet"),
+    )
+    try:
+        manifest.upsert_tasks([task])
+        manifest.claim([task])
+        manifest.complete(
+            TaskResult(
+                task,
+                "repair",
+                "congress_gov",
+                0,
+                None,
+                1,
+                error="congress_gov: HTTP Error 500: Internal Server Error",
+            )
+        )
+    finally:
+        manifest.close()
+
+    status = collect_status(tmp_path, min_free_gib=0, show_progress=False)
+
+    assert status["status_counts"]["repair"] == 1
+    assert status["repair_queue_tasks"] == 1
+    assert status["retryable_tasks"] == 0
+    assert status["actionable_unresolved_tasks"] == 0
+    assert status["complete"] is False
+    assert any(alert["code"] == "repair_queue_tasks" for alert in status["alerts"])
 
 
 def _task(root: Path, task_id: str) -> DownloadTask:
@@ -1214,7 +1252,7 @@ def test_monitor_surfaces_permanent_provider_outcomes(tmp_path: Path) -> None:
         manifest.close()
 
     status = collect_status(tmp_path, min_free_gib=0, show_progress=False)
-    assert status["schema_version"] == 14
+    assert status["schema_version"] == 15
     assert status["zero_accepted_categories"] == [
         {
             "category": "equity",
@@ -1825,20 +1863,13 @@ def test_monitor_classifies_any_pristine_provider_cooldown_but_not_live_fallback
     )
 
     status = collect_status(tmp_path, min_free_gib=0, show_progress=False)
-    by_endpoint = {
-        row["endpoint"]: row for row in status["zero_accepted_endpoints"]
-    }
+    by_endpoint = {row["endpoint"]: row for row in status["zero_accepted_endpoints"]}
 
     assert (
-        by_endpoint["economy.survey.bls_search"][
-            "runtime_provider_cooldown_deferred"
-        ]
+        by_endpoint["economy.survey.bls_search"]["runtime_provider_cooldown_deferred"]
         == 1
     )
-    assert (
-        by_endpoint["economy.fred_series"]["runtime_provider_cooldown_deferred"]
-        == 0
-    )
+    assert by_endpoint["economy.fred_series"]["runtime_provider_cooldown_deferred"] == 0
     summary = status["endpoint_progress_summary"]
     assert summary["zero_quota_blocked_endpoint_count"] == 1
     assert summary["zero_without_recorded_blocker_count"] == 1

@@ -13,7 +13,7 @@ from typing import Any, Final
 from zoneinfo import ZoneInfo
 
 
-DASHBOARD_SCHEMA_VERSION: Final[int] = 4
+DASHBOARD_SCHEMA_VERSION: Final[int] = 5
 DEFAULT_MAX_SOURCE_AGE_SECONDS: Final[float] = 30.0
 TAIPEI: Final[ZoneInfo] = ZoneInfo("Asia/Taipei")
 BENCHMARK_HISTORY_FILENAME: Final[str] = "benchmark_history.json"
@@ -37,13 +37,13 @@ _SESSION_TAIL_CACHE: dict[
     tuple[Path, int, str, bool], tuple[int, int, int, int, list[dict[str, Any]]]
 ] = {}
 _SESSION_TAIL_CACHE_LOCK = threading.Lock()
-_AVAILABLE_SESSION_DATES_CACHE: dict[
-    Path, tuple[tuple[Any, ...], list[str]]
+_SIGNAL_FEATURE_SUMMARY_CACHE: dict[
+    tuple[int, int, int, int], list[dict[str, Any]]
 ] = {}
+_SIGNAL_FEATURE_SUMMARY_CACHE_LOCK = threading.Lock()
+_AVAILABLE_SESSION_DATES_CACHE: dict[Path, tuple[tuple[Any, ...], list[str]]] = {}
 _AVAILABLE_SESSION_DATES_CACHE_LOCK = threading.Lock()
-_OBJECT_CACHE: dict[
-    Path, tuple[int, int, int, int, dict[str, Any]]
-] = {}
+_OBJECT_CACHE: dict[Path, tuple[int, int, int, int, dict[str, Any]]] = {}
 _OBJECT_CACHE_LOCK = threading.Lock()
 _ROWS_BY_SESSION_CACHE: dict[
     tuple[Path, int],
@@ -75,6 +75,153 @@ def _object(path: Path) -> dict[str, Any]:
         with _OBJECT_CACHE_LOCK:
             _OBJECT_CACHE[cache_key] = (*signature, payload)
     return dict(payload)
+
+
+def _as_path(path: Path, value: Any) -> Path | None:
+    if value in ("", None):
+        return None
+    candidate = Path(str(value))
+    if not candidate.is_absolute():
+        candidate = path / candidate
+    return candidate
+
+
+def _read_signal_feature_drivers(summary_path: Path) -> list[dict[str, Any]]:
+    signature = summary_path.stat()
+    cache_key = (
+        signature.st_dev,
+        signature.st_ino,
+        signature.st_size,
+        signature.st_mtime_ns,
+    )
+    with _SIGNAL_FEATURE_SUMMARY_CACHE_LOCK:
+        cached = _SIGNAL_FEATURE_SUMMARY_CACHE.get(cache_key)
+        if cached is not None:
+            return list(cached)
+    try:
+        summary = _object(summary_path)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return []
+    explanation = summary.get("model_explanation")
+    raw_drivers = (
+        explanation.get("all_feature_drivers")
+        if isinstance(explanation, Mapping)
+        else None
+    )
+    if not isinstance(raw_drivers, list):
+        raw_drivers = (
+            explanation.get("top_feature_drivers")
+            if isinstance(explanation, Mapping)
+            else None
+        )
+    if not isinstance(raw_drivers, list):
+        return []
+    drivers: list[dict[str, Any]] = []
+    for item in raw_drivers:
+        if not isinstance(item, Mapping):
+            continue
+        feature = str(item.get("feature") or "")
+        if not feature:
+            continue
+
+        driver: dict[str, Any] = {"feature": feature}
+        for field, raw_value in item.items():
+            field_key = str(field)
+            if field_key in {"feature", "_internal", "path", "source_path"}:
+                continue
+            if field_key == "weighted_abs_value":
+                value = _finite_float(raw_value)
+                driver[field_key] = value if value is not None else 0.0
+            else:
+                driver[field_key] = raw_value
+        if not any(key != "feature" for key in driver):
+            # Keep legacy fallback behavior for compatibility with older summaries.
+            driver["weighted_abs_value"] = 0.0
+        drivers.append(driver)
+    with _SIGNAL_FEATURE_SUMMARY_CACHE_LOCK:
+        if signature.st_size < 64 * 1024 * 1024:
+            _SIGNAL_FEATURE_SUMMARY_CACHE[cache_key] = list(drivers)
+    return drivers
+
+
+def _signal_row_key(row: Mapping[str, Any]) -> str:
+    session_date = str(row.get("session_date") or "")
+    market = str(row.get("market") or "")
+    symbol = str(row.get("symbol") or "")
+    signal_at = str(row.get("signal_at") or "")
+    if session_date and market and symbol:
+        if signal_at:
+            return f"{session_date}|{market}|{symbol}|{signal_at}"
+        return f"{session_date}|{market}|{symbol}"
+    return ""
+
+
+def _signal_feature_roots(
+    state: Mapping[str, Any], state_dir: Path
+) -> tuple[dict[str, list[Path]], list[Path]]:
+    mode_roots: dict[str, list[Path]] = {}
+    fallback_roots: list[Path] = []
+    for market, mode in (state.get("modes") or {}).items():
+        if not isinstance(mode, Mapping):
+            continue
+        summary_path = _as_path(state_dir, mode.get("signal_source_path"))
+        if (
+            not summary_path
+            or not summary_path.is_file()
+            or summary_path.name != "summary.json"
+        ):
+            continue
+        roots = summary_path.parent.parent.parent
+        if not roots:
+            continue
+        market_key = str(market)
+        mode_roots.setdefault(market_key, [])
+        if roots not in mode_roots[market_key]:
+            mode_roots[market_key].append(roots)
+        if roots not in fallback_roots:
+            fallback_roots.append(roots)
+    return mode_roots, fallback_roots
+
+
+def _lookup_signal_feature_drivers(
+    state_dir: Path,
+    state: Mapping[str, Any],
+    rows: list[Mapping[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    output: dict[str, dict[str, Any]] = {}
+    market_roots, fallback_roots = _signal_feature_roots(state, state_dir)
+    if not rows:
+        return output
+    for row in rows:
+        signal_id = str(row.get("signal_id") or "")
+        if not signal_id or signal_id in output:
+            continue
+        session_date = str(row.get("session_date") or "")[:10]
+        market = str(row.get("market") or "")
+        row_key = _signal_row_key(row)
+        candidates: list[Path] = []
+        direct_path = _as_path(state_dir, row.get("signal_source_path"))
+        if direct_path:
+            candidates.append(direct_path)
+        candidate_roots = []
+        candidate_roots.extend(market_roots.get(market, []))
+        candidate_roots.extend(fallback_roots)
+        for candidate_root in candidate_roots:
+            if session_date:
+                candidates.append(
+                    candidate_root / session_date / signal_id / "summary.json"
+                )
+        for candidate in candidates:
+            if not candidate.is_file() or candidate.name != "summary.json":
+                continue
+            drivers = _read_signal_feature_drivers(candidate)
+            if drivers:
+                record = {"drivers": drivers}
+                output[signal_id] = record
+                if row_key:
+                    output.setdefault(row_key, record)
+                break
+    return output
 
 
 def _tail(path: Path, maximum_rows: int) -> list[dict[str, Any]]:
@@ -264,11 +411,7 @@ def _latency_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
     ]
     latest = successful[-1] if successful else None
     stage_names = sorted(
-        {
-            str(name)
-            for row in successful
-            for name in (row.get("stages") or {})
-        }
+        {str(name) for row in successful for name in (row.get("stages") or {})}
     )
     stage_p50_ms = {
         name: _percentile(
@@ -307,9 +450,7 @@ def _latency_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "latest_ready_to_ledger_ms": latest.get("ready_to_ledger_ms")
         if latest
         else None,
-        "latest_bottleneck_stage": latest.get("bottleneck_stage")
-        if latest
-        else None,
+        "latest_bottleneck_stage": latest.get("bottleneck_stage") if latest else None,
         "latest_bottleneck_ms": latest.get("bottleneck_ms") if latest else None,
         "dominant_bottleneck_stage": dominant_bottleneck,
         "stage_p50_ms": stage_p50_ms,
@@ -470,7 +611,21 @@ def _rebase_live_benchmark(
         origin.get("corporate_action_factor_to_live_entry")
     )
     mark_price = _finite_float(row.get("last_mark_price"))
-    if (
+    explicit_net_offset = _finite_float(origin.get("live_net_pnl_offset_twd"))
+    is_continuous_future = (
+        str(row.get("instrument_type") or "") == "continuous_long_future"
+    )
+    if is_continuous_future and explicit_net_offset is not None:
+        net_pnl = raw_net + explicit_net_offset
+        canonical_fee_basis = (
+            _finite_float(origin.get("fixed_fees_twd_to_live_origin"))
+            or canonical_initial_fee
+        )
+        canonical_tax_basis = (
+            _finite_float(origin.get("transaction_tax_twd_to_live_origin"))
+            or canonical_initial_tax
+        )
+    elif (
         str(row.get("instrument_type") or "").startswith("stock")
         and live_action_factor is not None
         and prior_action_factor is not None
@@ -485,16 +640,28 @@ def _rebase_live_benchmark(
         )
         gross_offset = canonical_gross - raw_gross
         row["corporate_action_factor"] = canonical_factor
+        net_pnl = (
+            raw_net
+            + gross_offset
+            + raw_initial_fee
+            - canonical_initial_fee
+            + raw_initial_tax
+            - canonical_initial_tax
+        )
+        canonical_fee_basis = canonical_initial_fee
+        canonical_tax_basis = canonical_initial_tax
     else:
         gross_offset = (expected_price - canonical_entry) * gross_multiplier
-    net_pnl = (
-        raw_net
-        + gross_offset
-        + raw_initial_fee
-        - canonical_initial_fee
-        + raw_initial_tax
-        - canonical_initial_tax
-    )
+        net_pnl = (
+            raw_net
+            + gross_offset
+            + raw_initial_fee
+            - canonical_initial_fee
+            + raw_initial_tax
+            - canonical_initial_tax
+        )
+        canonical_fee_basis = canonical_initial_fee
+        canonical_tax_basis = canonical_initial_tax
     current_fixed_fees = _finite_float(row.get("fixed_fees_twd")) or 0.0
     current_transaction_tax = _finite_float(row.get("transaction_tax_twd")) or 0.0
     total_equity = canonical_capital + net_pnl
@@ -505,10 +672,10 @@ def _rebase_live_benchmark(
             "entry_price": canonical_entry,
             "initial_capital_twd": canonical_capital,
             "fixed_fees_twd": (
-                current_fixed_fees - raw_initial_fee + canonical_initial_fee
+                current_fixed_fees - raw_initial_fee + canonical_fee_basis
             ),
             "transaction_tax_twd": (
-                current_transaction_tax - raw_initial_tax + canonical_initial_tax
+                current_transaction_tax - raw_initial_tax + canonical_tax_basis
             ),
             "net_pnl_twd": net_pnl,
             "total_equity_twd": total_equity,
@@ -536,8 +703,7 @@ def _rebase_live_benchmark(
         ) + int(row.get("corporate_action_count") or 0)
         row.setdefault(
             "corporate_action_factor",
-            _finite_float(origin.get("corporate_action_factor_to_live_entry"))
-            or 1.0,
+            _finite_float(origin.get("corporate_action_factor_to_live_entry")) or 1.0,
         )
     return row
 
@@ -596,6 +762,7 @@ def _attach_execution_records(
     terminal_statuses = {"completed"}
     attempted_statuses = {"completed", "blocked"}
     status_counts: dict[str, int] = {}
+    outcome_counts: dict[str, int] = {}
     for mode in modes:
         market = str(mode.get("market") or "")
         event = latest_by_market.get(market)
@@ -636,7 +803,67 @@ def _attach_execution_records(
         mode["today_execution_recorded_at"] = recorded_at
         mode["today_execution_reason"] = reason
         mode["today_execution_terminal"] = status in terminal_statuses
+        event_counts = (event or {}).get("counts")
+        event_counts = dict(event_counts) if isinstance(event_counts, Mapping) else {}
+        fill_count = int(
+            (event or {}).get("entry_fill_count")
+            or mode.get("entry_fill_count")
+            or sum(
+                int(event_counts.get(key) or 0)
+                for key in (
+                    "ready",
+                    "partial_depth",
+                    "forced_synthetic_fill",
+                )
+            )
+        )
+        event_requested = (event or {}).get("entry_requested_shares")
+        requested = int(
+            mode.get("entry_requested_shares") or 0
+            if event_requested is None
+            else event_requested
+        )
+        event_unfilled = (event or {}).get("entry_unfilled_shares")
+        unfilled = int(
+            mode.get("entry_unfilled_shares") or 0
+            if event_unfilled is None
+            else event_unfilled
+        )
+        outcome = str((event or {}).get("entry_fill_outcome") or "")
+        if outcome == "no_fill" and requested == 0 and fill_count == 0:
+            outcome = "no_order"
+        if not outcome:
+            if event_name == "signal_registered":
+                outcome = (
+                    "filled"
+                    if fill_count and (not requested or not unfilled)
+                    else "partial"
+                    if fill_count
+                    else "no_order"
+                    if requested == 0
+                    else "no_fill"
+                )
+            elif event_name == "signal_blocked":
+                outcome = "blocked"
+            else:
+                outcome = "pending"
+        mode["today_execution_outcome"] = outcome
+        mode["today_entry_fill_count"] = fill_count
+        if event is not None:
+            for key in (
+                "entry_requested_shares",
+                "entry_filled_shares",
+                "entry_unfilled_shares",
+                "entry_fill_policy",
+                "entry_price_offset_ticks",
+                "entry_fill_is_synthetic",
+                "reason_counts",
+            ):
+                if event.get(key) is not None:
+                    target = "signal_reason_counts" if key == "reason_counts" else key
+                    mode[target] = event.get(key)
         status_counts[status] = status_counts.get(status, 0) + 1
+        outcome_counts[outcome] = outcome_counts.get(outcome, 0) + 1
 
     executed_count = sum(bool(mode.get("today_execution_terminal")) for mode in modes)
     attempted_count = sum(
@@ -650,11 +877,215 @@ def _attach_execution_records(
         "executed_count": executed_count,
         "attempted_count": attempted_count,
         "blocked_count": status_counts.get("blocked", 0),
+        "filled_mode_count": outcome_counts.get("filled", 0),
+        "partial_mode_count": outcome_counts.get("partial", 0),
+        "zero_fill_mode_count": outcome_counts.get("no_fill", 0),
+        "no_order_mode_count": outcome_counts.get("no_order", 0),
+        "failed_mode_count": outcome_counts.get("blocked", 0),
         "mode_count": len(modes),
         "completion_ratio": _ratio(executed_count, len(modes)),
         "all_executed": bool(modes) and executed_count == len(modes),
+        "all_modes_filled": bool(modes)
+        and outcome_counts.get("filled", 0) == len(modes),
         "status_counts": status_counts,
+        "outcome_counts": outcome_counts,
     }
+
+
+def _operational_issues(
+    *,
+    modes: list[dict[str, Any]],
+    preopen: Mapping[str, Any],
+    observed: datetime,
+) -> list[dict[str, Any]]:
+    """Build a public-safe, deduplicated list of actionable dashboard issues."""
+
+    issues: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+
+    def add(
+        *,
+        severity: str,
+        scope: str,
+        code: str,
+        title: str,
+        detail: str,
+        market: str | None = None,
+        count: int = 1,
+        observed_at: object = None,
+    ) -> None:
+        key = (scope, market or "", code)
+        if key in seen:
+            return
+        seen.add(key)
+        issues.append(
+            {
+                "severity": severity,
+                "scope": scope,
+                "market": market,
+                "code": code,
+                "title": title,
+                "detail": detail,
+                "count": max(1, int(count)),
+                "observed_at": observed_at or observed.isoformat(timespec="seconds"),
+            }
+        )
+
+    for row in preopen.get("markets") or ():
+        if not isinstance(row, Mapping) or row.get("status") != "failed":
+            continue
+        add(
+            severity="error",
+            scope="preopen_model",
+            market=str(row.get("market") or "") or None,
+            code=str(row.get("public_error_code") or "preopen_data_update_failed"),
+            title="盤前模型資料準備失敗",
+            detail=str(
+                row.get("public_error_message")
+                or "盤前資料或模型準備未完成；此模式不可視為 READY。"
+            ),
+            observed_at=row.get("completed_at") or preopen.get("updated_at"),
+        )
+    simulation = preopen.get("simulation")
+    simulation = dict(simulation) if isinstance(simulation, Mapping) else {}
+    for component, row in (simulation.get("components") or {}).items():
+        if not isinstance(row, Mapping) or row.get("status") != "failed":
+            continue
+        labels = {
+            "eligibility": "當日當沖資格驗證失敗",
+            "shioaji_quote": "行情連線驗證失敗",
+        }
+        add(
+            severity="error",
+            scope="preopen_executor",
+            code=f"preopen_{component}_failed",
+            title=labels.get(str(component), "模擬執行器盤前驗證失敗"),
+            detail=str(
+                row.get("public_error_message")
+                or "模擬執行器盤前守門未通過；不得將流程狀態當成成交。"
+            ),
+            observed_at=row.get("checked_at") or simulation.get("updated_at"),
+        )
+
+    reason_messages = {
+        "official_session_no_trade_print": (
+            "warning",
+            "官方確認本日無成交價",
+            "交易所日資料已有該證券列，但 OHLC 全空；本日沒有可用開盤成交價，已保持空倉。",
+        ),
+        "official_open_price_unavailable": (
+            "error",
+            "官方開盤價不可用",
+            "缺少有效官方開盤價，開盤價 Tick 模擬成交已停止。",
+        ),
+        "synthetic_open_tick_price_unavailable": (
+            "error",
+            "開盤價 Tick 價格不可用",
+            "無法從開盤價與合法 Tick 計算成交價，未建立持倉。",
+        ),
+        "exact_session_eligibility_missing": (
+            "error",
+            "當日當沖資格缺漏",
+            "缺少該交易日官方資格資料，已 fail-closed。",
+        ),
+        "price_limit_unavailable": (
+            "error",
+            "漲跌停價格缺漏",
+            "缺少該交易日合法價格界線，未建立持倉。",
+        ),
+        "no_executable_best_quote": (
+            "error",
+            "最佳一檔報價不可用",
+            "沒有可稽核的最佳買賣價，未建立持倉。",
+        ),
+        "quote_not_after_signal": (
+            "error",
+            "報價未晚於訊號",
+            "報價不符合因果時間邊界，未建立持倉。",
+        ),
+        "quote_after_local_observation": (
+            "error",
+            "報價時間超前本機觀測",
+            "報價時間戳不符合本機觀測邊界，未建立持倉。",
+        ),
+        "marketable_depth_unavailable": (
+            "error",
+            "可成交深度不可用",
+            "沒有足夠的可驗證深度，未宣稱成交。",
+        ),
+        "below_one_board_lot": (
+            "warning",
+            "訊號不足一張",
+            "整股當沖最小單位為一張；目標股數不足時保持空倉。",
+        ),
+    }
+    for mode in modes:
+        market = str(mode.get("market") or "") or None
+        label = str(mode.get("label") or market or "模式")
+        if mode.get("checkpoint_ready") is False:
+            add(
+                severity="error",
+                scope="mode",
+                market=market,
+                code="checkpoint_not_ready",
+                title=f"{label} 模型權重未就緒",
+                detail="checkpoint 未通過載入與契約驗證，模式不可執行。",
+                observed_at=mode.get("signal_at"),
+            )
+        engine_status = str(mode.get("engine_status") or "")
+        if engine_status.startswith(("critical", "blocked")):
+            add(
+                severity="error",
+                scope="mode",
+                market=market,
+                code=engine_status,
+                title=f"{label} 執行器已阻擋",
+                detail="執行器偵測到安全性或資料契約錯誤，未繼續建立新部位。",
+                observed_at=mode.get("signal_at"),
+            )
+        outcome = str(mode.get("today_execution_outcome") or "")
+        if outcome in {"no_fill", "partial", "blocked"}:
+            add(
+                severity="error" if outcome in {"no_fill", "blocked"} else "warning",
+                scope="entry_fill",
+                market=market,
+                code=f"entry_{outcome}",
+                title=f"{label} 未完整成交",
+                detail=(
+                    "訊號流程已處理，但沒有建立任何成交部位。"
+                    if outcome == "no_fill"
+                    else "訊號流程已處理，但僅有部分目標股數建立部位。"
+                    if outcome == "partial"
+                    else "訊號流程遭安全守門阻擋，沒有成交。"
+                ),
+                observed_at=mode.get("today_execution_recorded_at"),
+            )
+        reasons = mode.get("signal_reason_counts")
+        reasons = dict(reasons) if isinstance(reasons, Mapping) else {}
+        for reason, count in reasons.items():
+            presentation = reason_messages.get(str(reason))
+            if presentation is None or not int(count or 0):
+                continue
+            severity, title, detail = presentation
+            add(
+                severity=severity,
+                scope="entry_reason",
+                market=market,
+                code=str(reason),
+                title=f"{label}：{title}",
+                detail=detail,
+                count=int(count or 0),
+                observed_at=mode.get("today_execution_recorded_at"),
+            )
+    severity_order = {"error": 0, "warning": 1, "info": 2}
+    issues.sort(
+        key=lambda row: (
+            severity_order.get(str(row.get("severity")), 9),
+            str(row.get("market") or ""),
+            str(row.get("code") or ""),
+        )
+    )
+    return issues
 
 
 def _available_session_dates(
@@ -688,7 +1119,9 @@ def _available_session_dates(
         return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns
 
     position_history_dates = tuple(
-        sorted({path.parent.name for path in (root / "position_history").glob("*/*.json")})
+        sorted(
+            {path.parent.name for path in (root / "position_history").glob("*/*.json")}
+        )
     )
     cache_signature: tuple[Any, ...] = (
         mode_dates,
@@ -898,8 +1331,7 @@ def build_dashboard_history_snapshot(
         series_id = str(
             row.get("market")
             if series_type == "strategy"
-            else row.get("benchmark_id")
-            or ""
+            else row.get("benchmark_id") or ""
         )
         timestamp_seconds = _chart_timestamp(row)
         if not series_id or timestamp_seconds is None:
@@ -927,6 +1359,20 @@ def build_dashboard_history_snapshot(
             "return_fraction": return_fraction,
             "return_pct": return_pct,
             "valuation_stale": bool(row.get("valuation_stale", False)),
+            "historical_minute_replay": bool(
+                row.get("historical_minute_replay", False)
+            ),
+            "minute_valuation_contract": row.get("minute_valuation_contract"),
+            "valuation_source": row.get("valuation_source"),
+            "valuation_executable": row.get("valuation_executable"),
+            "fresh_trade_position_count": row.get("fresh_trade_position_count"),
+            "last_trade_carried_position_count": row.get(
+                "last_trade_carried_position_count"
+            ),
+            "missing_price_position_count": row.get("missing_price_position_count"),
+            "fresh_trade_notional_coverage_ratio": row.get(
+                "fresh_trade_notional_coverage_ratio"
+            ),
         }
 
     for row in _all_json_objects(root / "marks.jsonl") or ():
@@ -983,6 +1429,13 @@ def build_dashboard_history_snapshot(
     )
     if cutoff is not None:
         rows = [row for row in rows if float(row["timestamp_seconds"]) >= cutoff]
+    historical_rows = [row for row in rows if row["historical_minute_replay"]]
+    fresh_coverage = [
+        value
+        for row in historical_rows
+        if (value := _finite_float(row.get("fresh_trade_notional_coverage_ratio")))
+        is not None
+    ]
     grouped: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
         grouped.setdefault(str(row["series_id"]), []).append(row)
@@ -1022,6 +1475,21 @@ def build_dashboard_history_snapshot(
         "raw_points_in_range": len(rows),
         "returned_points": len(sampled),
         "downsampled": len(sampled) < len(rows),
+        "historical_minute_replay_points": len(historical_rows),
+        "historical_minute_carried_price_points": sum(
+            int(row.get("last_trade_carried_position_count") or 0) > 0
+            for row in historical_rows
+        ),
+        "historical_minute_missing_price_points": sum(
+            int(row.get("missing_price_position_count") or 0) > 0
+            for row in historical_rows
+        ),
+        "historical_minute_min_fresh_trade_notional_coverage_ratio": (
+            min(fresh_coverage) if fresh_coverage else None
+        ),
+        "historical_minute_mean_fresh_trade_notional_coverage_ratio": (
+            sum(fresh_coverage) / len(fresh_coverage) if fresh_coverage else None
+        ),
         "history": sampled,
     }
 
@@ -1085,9 +1553,7 @@ def _preopen_progress(
         final_arm = dict(final_arm) if isinstance(final_arm, Mapping) else {}
         final_arm_latency = final_arm.get("live_latency")
         final_arm_latency = (
-            dict(final_arm_latency)
-            if isinstance(final_arm_latency, Mapping)
-            else {}
+            dict(final_arm_latency) if isinstance(final_arm_latency, Mapping) else {}
         )
         inference_ms = _finite_float(latency.get("model_inference_ms"))
         price_limits = item.get("preopen_price_limits")
@@ -1147,19 +1613,23 @@ def _preopen_progress(
                     final_arm.get("elapsed_seconds")
                 ),
                 "final_arm_attempts": int(final_arm.get("attempts") or 0),
-                "final_arm_panel_cache_hit": final_arm_latency.get(
-                    "panel_cache_hit"
-                ),
+                "final_arm_panel_cache_hit": final_arm_latency.get("panel_cache_hit"),
                 "final_arm_checkpoint_cache_hit": final_arm_latency.get(
                     "checkpoint_cache_hit"
                 ),
-                "final_arm_model_cache_hit": final_arm_latency.get(
-                    "model_cache_hit"
-                ),
+                "final_arm_model_cache_hit": final_arm_latency.get("model_cache_hit"),
                 "final_arm_compute_ms": _finite_float(
                     final_arm_latency.get("compute_before_publish_ms")
                 ),
                 "final_arm_error": final_arm.get("error"),
+                "final_arm_public_error_code": (
+                    "final_arm_failed" if final_arm.get("error") else None
+                ),
+                "final_arm_public_error_message": (
+                    "08:55 最後武裝驗證失敗；快取或模型尚未達到 HOT READY。"
+                    if final_arm.get("error")
+                    else None
+                ),
                 "price_limit_prepared": prepared,
                 "price_limit_requested": requested,
                 "price_limit_coverage_ratio": _ratio(prepared, requested),
@@ -1173,6 +1643,14 @@ def _preopen_progress(
                     if isinstance(value, Mapping)
                 ),
                 "error": item.get("error"),
+                "public_error_code": (
+                    "preopen_data_update_failed" if status == "failed" else None
+                ),
+                "public_error_message": (
+                    "盤前公開資料、特徵或模型準備失敗；請查看此模式並等待重新驗證。"
+                    if status == "failed"
+                    else None
+                ),
             }
         )
 
@@ -1221,9 +1699,7 @@ def _preopen_progress(
     }
 
 
-def _simulation_preopen_progress(
-    *, path: Path, observed: datetime
-) -> dict[str, Any]:
+def _simulation_preopen_progress(*, path: Path, observed: datetime) -> dict[str, Any]:
     payload: dict[str, Any] = {}
     if path.is_file():
         try:
@@ -1255,6 +1731,14 @@ def _simulation_preopen_progress(
             "proof": details.get("proof"),
             "symbol_count": int(details.get("symbol_count") or 0) or None,
             "error": row.get("error"),
+            "public_error_code": (
+                f"preopen_{name}_failed" if row.get("status") == "failed" else None
+            ),
+            "public_error_message": (
+                "盤前執行器驗證失敗；此守門項目尚未就緒。"
+                if row.get("status") == "failed"
+                else None
+            ),
         }
     ready = bool(
         payload.get("status") == "ready"
@@ -1397,7 +1881,6 @@ def _safe_position(position: Mapping[str, Any]) -> dict[str, Any]:
         "side",
         "target_weight",
         "requested_shares",
-        "pre_balance_filled_shares",
         "filled_shares",
         "signed_shares",
         "lot_size",
@@ -1548,6 +2031,38 @@ def build_dashboard_snapshot(
             for item in (mode.get("positions") or {}).values()
             if isinstance(item, Mapping)
         ]
+        position_requested_shares = sum(
+            int(item.get("requested_shares") or item.get("filled_shares") or 0)
+            for item in mode_positions
+        )
+        position_filled_shares = sum(
+            int(item.get("filled_shares") or 0) for item in mode_positions
+        )
+        recorded_requested_shares = mode.get("entry_requested_shares")
+        recorded_filled_shares = mode.get("entry_filled_shares")
+        recorded_unfilled_shares = mode.get("entry_unfilled_shares")
+        entry_requested_shares = int(
+            position_requested_shares
+            if recorded_requested_shares is None
+            else recorded_requested_shares
+        )
+        entry_filled_shares = int(
+            position_filled_shares
+            if recorded_filled_shares is None
+            else recorded_filled_shares
+        )
+        entry_unfilled_shares = int(
+            max(0, entry_requested_shares - entry_filled_shares)
+            if recorded_unfilled_shares is None
+            else recorded_unfilled_shares
+        )
+        entry_fill_outcome = mode.get("entry_fill_outcome") or (
+            "partial"
+            if entry_filled_shares and entry_unfilled_shares
+            else "filled"
+            if entry_filled_shares
+            else "pending"
+        )
         positions.extend(mode_positions)
         modes.append(
             {
@@ -1557,6 +2072,11 @@ def build_dashboard_snapshot(
                 "price_limit_offset_ticks": mode.get("price_limit_offset_ticks", 0),
                 "bracket_price_policy": mode.get("bracket_price_policy"),
                 "fill_guaranteed": bool(mode.get("fill_guaranteed", False)),
+                "entry_fill_policy": mode.get("entry_fill_policy"),
+                "entry_price_offset_ticks": mode.get("entry_price_offset_ticks", 0),
+                "entry_fill_is_synthetic": bool(
+                    mode.get("entry_fill_is_synthetic", False)
+                ),
                 "engine_status": mode.get("engine_status"),
                 "checkpoint_ready": mode.get("checkpoint_ready"),
                 "readiness_error": mode.get("readiness_error"),
@@ -1576,7 +2096,16 @@ def build_dashboard_snapshot(
                 "source_signal_at": mode.get("source_signal_at"),
                 "feature_cutoff_date": mode.get("feature_cutoff_date"),
                 "signal_counts": mode.get("signal_counts") or {},
-                "execution_projection": mode.get("execution_projection") or {},
+                "signal_reason_counts": mode.get("signal_reason_counts") or {},
+                "entry_fill_count": int(
+                    len(mode_positions)
+                    if mode.get("entry_fill_count") is None
+                    else mode.get("entry_fill_count")
+                ),
+                "entry_requested_shares": entry_requested_shares,
+                "entry_filled_shares": entry_filled_shares,
+                "entry_unfilled_shares": entry_unfilled_shares,
+                "entry_fill_outcome": entry_fill_outcome,
                 "initial_capital_twd": mode.get("initial_capital_twd"),
                 "total_equity_twd": mode.get("total_equity_twd"),
                 "return_fraction": return_fraction,
@@ -1786,9 +2315,36 @@ def build_dashboard_snapshot(
                 else None
             )
             mode["signal_counts"] = (signal_event or {}).get("counts") or {}
-            mode["execution_projection"] = (signal_event or {}).get(
-                "execution_projection"
+            mode["signal_reason_counts"] = (signal_event or {}).get(
+                "reason_counts"
             ) or {}
+            mode["entry_fill_count"] = int(
+                (signal_event or {}).get("entry_fill_count") or 0
+            )
+            mode["entry_requested_shares"] = int(
+                (signal_event or {}).get("entry_requested_shares") or 0
+            )
+            mode["entry_filled_shares"] = int(
+                (signal_event or {}).get("entry_filled_shares") or 0
+            )
+            mode["entry_unfilled_shares"] = int(
+                (signal_event or {}).get("entry_unfilled_shares") or 0
+            )
+            mode["entry_fill_outcome"] = (signal_event or {}).get(
+                "entry_fill_outcome"
+            ) or "pending"
+            mode["entry_fill_policy"] = (signal_event or {}).get(
+                "entry_fill_policy"
+            ) or mode.get("entry_fill_policy")
+            mode["entry_price_offset_ticks"] = int(
+                (signal_event or {}).get("entry_price_offset_ticks")
+                or mode.get("entry_price_offset_ticks")
+                or 0
+            )
+            mode["entry_fill_is_synthetic"] = bool(
+                (signal_event or {}).get("entry_fill_is_synthetic")
+                or mode.get("entry_fill_is_synthetic", False)
+            )
             mode["simulation_replay"] = bool(
                 (signal_event or {}).get("simulation_replay", False)
             )
@@ -1887,10 +2443,17 @@ def build_dashboard_snapshot(
     preopen["simulation"] = simulation_preopen
     if operational_view and not simulation_preopen["ready"]:
         preopen["status"] = (
-            "failed"
-            if simulation_preopen["status"] == "failed"
-            else "pending"
+            "failed" if simulation_preopen["status"] == "failed" else "pending"
         )
+    operational_issues = _operational_issues(
+        modes=modes,
+        preopen=preopen,
+        observed=preopen_observed,
+    )
+    if health not in {"stale", "critical"} and any(
+        issue.get("severity") in {"error", "warning"} for issue in operational_issues
+    ):
+        health = "degraded"
     session_progress = _session_progress(
         observed=selected_observed,
         mode_count=len(modes),
@@ -1924,6 +2487,7 @@ def build_dashboard_snapshot(
         "available_session_dates": available_session_dates,
         "schedule": status.get("schedule") or {},
         "preopen": preopen,
+        "operational_issues": operational_issues,
         "execution_records": execution_records,
         "latency": latency,
         "today_latency": today_latency,
@@ -1953,7 +2517,7 @@ def build_dashboard_snapshot(
             "execution_record": "today's append-only signal_registered or signal_blocked event per mode; stale prior-session timestamps never count",
             "missed_start": "between 09:00 and 13:20, Linux inotify wakes the executor when the atomic latest-signal pointer is published; a 0.1-second timeout remains only as a portable catch-up fallback and the public dashboard remains read-only",
             "signal": "Discord live target_weights.parquet after observed opening quote",
-            "replay": "simulation_replay=true is a retrospective, explicitly counterfactual fill at the actual session open from official daily data or a fresh same-session Shioaji snapshot; it is not a causally executable quote or real order fill",
+            "replay": "simulation_replay=true is a retrospective, explicitly counterfactual fill at the actual session open from official daily data, a fresh same-session Shioaji snapshot, or retained provenance-bearing same-session TWSE/TPEx MIS or Shioaji live-signal evidence; it is not a causally executable quote or real order fill",
             "entry_fill": "causally later best ask for buy or best bid for sell is used immediately after the 09:00 signal-ready timestamp; submitted simulated market quantity is fully filled, while target quantity beyond fresh displayed depth is explicitly left unsubmitted",
             "latency": "measured signal input through model, atomic artifact publication, consumer discovery, fresh executable quote, and durable simulation-ledger persistence on this host; it is not an external order acknowledgement or venue round-trip measurement",
             "mark": "best bid liquidates long; best ask covers short",
@@ -1998,6 +2562,8 @@ def build_dashboard_signal_page(
         raise ValueError("limit must be between 1 and 1000")
     root = Path(state_dir)
     state = _object(root / "state.json")
+    state_path = root / "state.json"
+    state_signature = state_path.stat()
     observed = datetime.now(timezone.utc)
     available_session_dates = _available_session_dates(
         root=root,
@@ -2029,14 +2595,13 @@ def build_dashboard_signal_page(
         normalized_status,
         int(offset),
         int(limit),
+        state_signature.st_mtime_ns,
     )
     with _SIGNAL_PAGE_CACHE_LOCK:
         cached_page = _SIGNAL_PAGE_CACHE.get(cache_key)
         if cached_page is not None:
             return dict(cached_page)
-    rows_by_session = _rows_by_session(
-        signal_path, maximum_scan_rows
-    )
+    rows_by_session = _rows_by_session(signal_path, maximum_scan_rows)
     current_rows = [
         row
         for selected_date in selected_session_dates
@@ -2055,19 +2620,18 @@ def build_dashboard_signal_page(
             return str(row.get("status") or "") not in {
                 "ready",
                 "partial_depth",
-                "partial_directional_mix",
                 "hold",
             }
         return True
 
     filtered = [row for row in current_rows if included(row)]
 
-    def sort_key(row: Mapping[str, Any]) -> tuple[int, float, float, str, str]:
+    def sort_key(row: Mapping[str, Any]) -> tuple[float, int, float, str, str]:
         weight = _finite_float(row.get("target_weight"))
         resolved = weight if weight is not None else 0.0
         return (
-            -int(str(row.get("session_date") or "0000-00-00").replace("-", "")),
             -abs(resolved),
+            -int(str(row.get("session_date") or "0000-00-00").replace("-", "")),
             -resolved,
             str(row.get("market") or ""),
             str(row.get("symbol") or ""),
@@ -2093,7 +2657,7 @@ def build_dashboard_signal_page(
             "long_gross": 0.0,
             "short_gross": 0.0,
         }
-        for stage in ("target", "pre_balance", "actual")
+        for stage in ("target", "actual")
     }
     summary_rows = [
         row
@@ -2128,12 +2692,6 @@ def build_dashboard_signal_page(
 
         values = {
             "target": target,
-            "pre_balance": executed_weight(
-                "pre_balance_filled_weight",
-                "pre_balance_filled_shares"
-                if "pre_balance_filled_shares" in row
-                else "filled_shares",
-            ),
             "actual": executed_weight("filled_weight", "filled_shares"),
         }
         for stage, value in values.items():
@@ -2195,6 +2753,11 @@ def build_dashboard_signal_page(
         )
 
     page = filtered[offset : offset + limit]
+    feature_drivers_by_signal = _lookup_signal_feature_drivers(
+        state_dir=root,
+        state=state,
+        rows=page,
+    )
     payload = {
         "schema_version": DASHBOARD_SCHEMA_VERSION,
         "simulation_only": True,
@@ -2215,6 +2778,8 @@ def build_dashboard_signal_page(
         "direction_summary": direction_summary,
         "opening_execution_audit_scope": "nonzero_target_rows_in_current_signal_id_per_mode",
         "opening_execution_audit": opening_execution_audit,
+        "feature_drivers_scope": "all_feature_drivers_if_available_else_top_feature_drivers",
+        "feature_drivers_by_signal": feature_drivers_by_signal,
         "rows": page,
     }
     with _SIGNAL_PAGE_CACHE_LOCK:
@@ -2273,7 +2838,10 @@ def build_dashboard_position_page(
             if str(safe.get("session_date") or "")[:10] in selected_date_set:
                 rows.append(safe)
     deduplicated = {
-        str(row.get("position_id") or f"{row.get('session_date')}:{row.get('market')}:{row.get('symbol')}"): row
+        str(
+            row.get("position_id")
+            or f"{row.get('session_date')}:{row.get('market')}:{row.get('symbol')}"
+        ): row
         for row in rows
     }
     normalized_mode = str(mode or "").strip()
@@ -2492,6 +3060,7 @@ def build_dashboard_summary(
         "session_date",
         "available_session_dates",
         "preopen",
+        "operational_issues",
         "execution_records",
         "session_progress",
         "modes",

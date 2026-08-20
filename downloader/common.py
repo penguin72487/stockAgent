@@ -118,8 +118,34 @@ class PersistentProgress:
             self.started_at = self.started_at.replace(tzinfo=timezone.utc)
         self.current = 0
         self.status_counts: dict[str, int] = {}
+        self.telemetry_counts: dict[str, int] = {}
+        self.previous_run = self._load_previous_run()
         self._lock = threading.Lock()
+        self._last_telemetry_publish = 0.0
         self._write("running", "initializing")
+
+    def _load_previous_run(self) -> dict[str, object] | None:
+        """Retain bounded evidence from an interrupted or completed prior run."""
+
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        keys = (
+            "state",
+            "phase",
+            "current",
+            "total",
+            "unit",
+            "ratio",
+            "started_at_utc",
+            "updated_at_utc",
+            "status_counts",
+            "telemetry_counts",
+        )
+        return {key: payload.get(key) for key in keys if key in payload}
 
     def _write(self, state: str, phase: str) -> None:
         observed = datetime.now(timezone.utc)
@@ -147,6 +173,8 @@ class PersistentProgress:
                 else None
             ),
             "status_counts": dict(sorted(self.status_counts.items())),
+            "telemetry_counts": dict(sorted(self.telemetry_counts.items())),
+            "previous_run": self.previous_run,
             "basis": self.basis,
         }
         atomic_write_text(
@@ -168,9 +196,46 @@ class PersistentProgress:
         with self._lock:
             self._write("running", phase)
 
-    def finish(self, *, failed: bool = False, state: str | None = None) -> None:
+    def observe(
+        self,
+        phase: str,
+        event: str,
+        *,
+        count: int = 1,
+        publish_interval_seconds: float = 1.0,
+    ) -> None:
+        """Record high-rate telemetry without advancing logical progress.
+
+        Request pages are observations, not completion units: one symbol may
+        need one page on an incremental tail and thousands during a historical
+        rebuild.  Counting pages against a symbol/stage denominator can saturate
+        progress at 100% while work is still running.  Publishing is throttled
+        so a high-throughput downloader does not turn each HTTP response into an
+        atomic JSON filesystem write.
+        """
+
+        increment = max(0, int(count))
+        with self._lock:
+            key = str(event)
+            self.telemetry_counts[key] = self.telemetry_counts.get(key, 0) + increment
+            now = time.monotonic()
+            if now - self._last_telemetry_publish >= max(
+                0.0, float(publish_interval_seconds)
+            ):
+                self._last_telemetry_publish = now
+                self._write("running", phase)
+
+    def finish(
+        self,
+        *,
+        failed: bool = False,
+        state: str | None = None,
+        require_exact: bool = False,
+    ) -> None:
         with self._lock:
             final_state = str(state or ("failed" if failed else "complete"))
+            if require_exact and final_state == "complete" and self.current != self.total:
+                final_state = "partial"
             if final_state == "complete":
                 self.current = self.total
             self._write(final_state, "complete")
@@ -986,17 +1051,113 @@ def resolve_incremental_reconcile_start_ms(
     earliest_existing_ms: int | None,
     latest_existing_ms: int | None,
     overlap_ms: int,
+    repair_missing_head: bool = True,
 ) -> tuple[int, bool]:
     """Resolve a tail update start without preserving a truncated history head."""
     expected = int(expected_first_ms)
     overlap = max(0, int(overlap_ms))
-    if (
+    missing_head = (
         earliest_existing_ms is None
         or latest_existing_ms is None
         or int(earliest_existing_ms) > expected + overlap
-    ):
+    )
+    if missing_head and repair_missing_head:
         return expected, True
+    if latest_existing_ms is None:
+        return expected, missing_head
     return max(expected, int(latest_existing_ms) - overlap), False
+
+
+def parquet_temporal_metadata(
+    parquet_file: object,
+    *,
+    column: str = "date",
+    expected_interval_ms: int,
+) -> tuple[int, int | None, int | None, bool | None]:
+    """Read row count and timestamp bounds from Parquet footer statistics.
+
+    The return value is ``(rows, earliest_ms, latest_ms, interval_likely_ok)``.
+    ``interval_likely_ok`` is ``None`` when footer statistics are insufficient,
+    allowing callers to fall back to an exact column scan.  A positive result
+    avoids reading millions of timestamp values merely to decide where an
+    incremental request should start.
+    """
+
+    metadata = getattr(parquet_file, "metadata", None)
+    schema = getattr(parquet_file, "schema_arrow", None)
+    if metadata is None or schema is None:
+        raise TypeError("parquet_file must expose metadata and schema_arrow")
+    names = list(getattr(schema, "names", ()))
+    rows = int(metadata.num_rows)
+    if column not in names:
+        return rows, None, None, False
+    column_index = names.index(column)
+
+    def to_ms(value: object) -> int | None:
+        if value is None:
+            return None
+        if isinstance(value, bytes):
+            value = value.decode("utf-8", errors="strict")
+        if isinstance(value, datetime):
+            parsed = value
+        elif isinstance(value, date):
+            parsed = datetime.combine(value, datetime.min.time())
+        elif isinstance(value, (int, float)):
+            numeric = float(value)
+            magnitude = abs(numeric)
+            if magnitude >= 1e17:
+                return int(numeric / 1e6)  # nanoseconds
+            if magnitude >= 1e14:
+                return int(numeric / 1e3)  # microseconds
+            if magnitude >= 1e11:
+                return int(numeric)  # milliseconds
+            if magnitude >= 1e8:
+                return int(numeric * 1e3)  # seconds
+            return None
+        else:
+            text_value = str(value).strip().replace("Z", "+00:00")
+            try:
+                parsed = datetime.fromisoformat(text_value)
+            except ValueError:
+                return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        else:
+            parsed = parsed.astimezone(timezone.utc)
+        return int(parsed.timestamp() * 1000)
+
+    bounds: list[tuple[int, int, int]] = []
+    for row_group_index in range(int(metadata.num_row_groups)):
+        row_group = metadata.row_group(row_group_index)
+        chunk = row_group.column(column_index)
+        statistics = chunk.statistics
+        if statistics is None or not statistics.has_min_max:
+            continue
+        low = to_ms(statistics.min)
+        high = to_ms(statistics.max)
+        if low is None or high is None:
+            continue
+        bounds.append((low, high, int(chunk.num_values)))
+
+    if not bounds:
+        return rows, None, None, None
+    earliest = min(item[0] for item in bounds)
+    latest = max(item[1] for item in bounds)
+    if rows < 3:
+        interval_likely_ok: bool | None = True
+    else:
+        sampled_steps = [
+            (high - low) / max(1, count - 1)
+            for low, high, count in bounds
+            if count >= 3 and high >= low
+        ]
+        interval_likely_ok = (
+            sorted(sampled_steps)[len(sampled_steps) // 2]
+            <= max(1, int(expected_interval_ms)) * 4
+            if sampled_steps
+            else None
+        )
+    return rows, earliest, latest, interval_likely_ok
 
 
 def provider_rate_limit(provider: str) -> ProviderRateLimit:

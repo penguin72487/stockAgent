@@ -1020,6 +1020,30 @@ def _float_or_none(value: object) -> float | None:
     return parsed
 
 
+def _tw_mis_limit_price(value: object, *, lower: bool) -> float | None:
+    """Parse the MIS legal-order band, including its no-limit sentinel.
+
+    TWSE MIS publishes an omitted or zero lower bound together with its large
+    system upper bound for securities that have no daily price-movement limit
+    (notably eligible foreign-component ETFs). Zero is metadata, not an
+    executable price. Normalize only that lower-band sentinel to the exchange's
+    minimum positive order price; ordinary quote fields keep rejecting zero.
+    """
+
+    try:
+        text = str(value).strip()
+        if not text or text in {"-", "--", "null", "None"}:
+            return None
+        parsed = float(text.replace(",", ""))
+    except Exception:
+        return None
+    if not np.isfinite(parsed) or parsed < 0.0:
+        return None
+    if parsed == 0.0:
+        return 0.01 if lower else None
+    return parsed
+
+
 def _first_book_price(value: object) -> float | None:
     text = str(value or "").strip()
     if not text:
@@ -1195,6 +1219,17 @@ def fetch_tw_mis_last_prices(
                 timestamp_ms = int(item.get("tlong") or 0) or None
             except Exception:
                 timestamp_ms = None
+            upper_limit = _tw_mis_limit_price(item.get("u"), lower=False)
+            lower_limit = _tw_mis_limit_price(item.get("w"), lower=True)
+            if (
+                lower_limit is None
+                and upper_limit is not None
+                and upper_limit >= 9999.95
+            ):
+                # MIS omits ``w`` for the exchange's no-daily-limit band while
+                # publishing the system ceiling in ``u``. TWSE's executable
+                # range remains positive, so retain a 0.01 legal floor.
+                lower_limit = 0.01
             for idx in code_to_indices.get(code, []):
                 rows.append(
                     (
@@ -1205,8 +1240,8 @@ def fetch_tw_mis_last_prices(
                         _float_or_none(item.get("h")),
                         _float_or_none(item.get("l")),
                         _float_or_none(item.get("v")),
-                        _float_or_none(item.get("u")),
-                        _float_or_none(item.get("w")),
+                        upper_limit,
+                        lower_limit,
                         _first_book_price(item.get("b")),
                         _first_book_price(item.get("a")),
                         _first_book_price(item.get("g")),

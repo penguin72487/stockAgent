@@ -9,6 +9,7 @@ state_dir="$output_dir/_state"
 log_dir="$output_dir/logs"
 monitor_interval="${OPENBB_MONITOR_INTERVAL_SECONDS:-60}"
 full_monitor_interval="${OPENBB_FULL_MONITOR_INTERVAL_SECONDS:-900}"
+idle_full_monitor_interval="${OPENBB_IDLE_FULL_MONITOR_INTERVAL_SECONDS:-21600}"
 full_monitor_timeout="${OPENBB_FULL_MONITOR_TIMEOUT_SECONDS:-600}"
 restart_delay="${OPENBB_RESTART_DELAY_SECONDS:-60}"
 stall_timeout="${OPENBB_STALL_TIMEOUT_SECONDS:-3600}"
@@ -24,6 +25,10 @@ if [[ ! "$monitor_interval" =~ ^[1-9][0-9]*$ ]]; then
 fi
 if [[ ! "$full_monitor_interval" =~ ^[1-9][0-9]*$ ]]; then
   echo "[openbb-supervisor] OPENBB_FULL_MONITOR_INTERVAL_SECONDS must be a positive integer" >&2
+  exit 2
+fi
+if [[ ! "$idle_full_monitor_interval" =~ ^[1-9][0-9]*$ ]]; then
+  echo "[openbb-supervisor] OPENBB_IDLE_FULL_MONITOR_INTERVAL_SECONDS must be a positive integer" >&2
   exit 2
 fi
 if [[ ! "$full_monitor_timeout" =~ ^[1-9][0-9]*$ ]]; then
@@ -115,7 +120,7 @@ if ! flock -n 9; then
 fi
 echo "$$" >"$state_dir/supervisor.pid"
 echo "[openbb-supervisor] pinned archive_end_date=$archive_end_date state=$archive_end_date_path"
-echo "[openbb-supervisor] watchdog_interval=${monitor_interval}s full_monitor_interval=${full_monitor_interval}s full_monitor_timeout=${full_monitor_timeout}s stall_timeout=${stall_timeout}s terminate_grace=${terminate_grace}s min_free_bytes=$min_free_bytes"
+echo "[openbb-supervisor] watchdog_interval=${monitor_interval}s full_monitor_interval=${full_monitor_interval}s idle_full_monitor_interval=${idle_full_monitor_interval}s full_monitor_timeout=${full_monitor_timeout}s stall_timeout=${stall_timeout}s terminate_grace=${terminate_grace}s min_free_bytes=$min_free_bytes"
 
 rotate_log_if_needed() {
   ((max_log_bytes > 0)) || return 0
@@ -252,7 +257,11 @@ while true; do
   last_progress_marker=""
   last_manifest_task_update=""
   last_progress_epoch="$(date +%s)"
-  last_full_monitor_epoch=0
+  # Reusing a fresh durable snapshot prevents every harmless supervisor
+  # recycle from immediately launching another multi-million-row audit.
+  last_full_monitor_epoch="$(
+    stat -c '%Y' "$state_dir/monitor_latest.json" 2>/dev/null || echo 0
+  )"
   has_cooldown=0
   pending_eligible=1
   running_tasks=0
@@ -361,8 +370,22 @@ while true; do
       stall_seconds=$((now_epoch - last_progress_epoch))
       echo "[openbb-watchdog] phase=$scheduler_phase attempted=$scheduler_attempted active=$scheduler_active completed_pending=$scheduler_completed backpressure=$scheduler_backpressure updated_at=$scheduler_updated stall_seconds=$stall_seconds"
 
+      # A full audit scans the complete multi-million-row manifest. While the
+      # scheduler is deliberately asleep with no in-flight work, repeating
+      # that scan every 15 minutes cannot reveal download progress and only
+      # churns page cache. The public status already merges the live scheduler
+      # heartbeat with the latest complete snapshot, so audit at a much lower
+      # idle cadence and restore the normal cadence as soon as work runs.
+      effective_full_monitor_interval="$full_monitor_interval"
+      if [[ "$scheduler_phase" == "waiting" \
+        && "$scheduler_active" == "0" \
+        && "$scheduler_completed" == "0" \
+        && "$scheduler_wait_until_epoch" =~ ^[0-9]+$ \
+        && "$scheduler_wait_until_epoch" -gt "$now_epoch" ]]; then
+        effective_full_monitor_interval="$idle_full_monitor_interval"
+      fi
       if ((last_full_monitor_epoch == 0 \
-        || now_epoch - last_full_monitor_epoch >= full_monitor_interval)); then
+        || now_epoch - last_full_monitor_epoch >= effective_full_monitor_interval)); then
         monitor_ok=0
         if run_snapshot_monitor; then
           monitor_ok=1

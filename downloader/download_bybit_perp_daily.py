@@ -18,6 +18,11 @@ from urllib.request import Request, urlopen
 import polars as pl
 import pyarrow.parquet as pq
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows fallback
+    fcntl = None
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
@@ -27,6 +32,7 @@ from common import (
     SharedRateLimiter,
     atomic_write_text,
     describe_rate_limit,
+    parquet_temporal_metadata,
     resolve_end_date,
     resolve_incremental_reconcile_start_ms,
     resolve_request_interval,
@@ -166,6 +172,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--refresh", action="store_true", help="Re-download even if parquet exists"
+    )
+    parser.add_argument(
+        "--tail-only",
+        action="store_true",
+        help=(
+            "Fetch only the reconciliation tail. Missing historical heads are "
+            "left for a separate full/backfill repair."
+        ),
     )
     parser.add_argument(
         "--request-interval",
@@ -334,14 +348,31 @@ def _earliest_ms_from_date_frame(frame: pl.DataFrame) -> int | None:
 
 def _load_existing_candle_info(path: Path) -> ExistingCandleInfo:
     try:
-        row_count = _read_parquet_row_count(path)
-        schema_names = set(pq.read_schema(path).names)
-        if "date" not in schema_names:
+        parquet = pq.ParquetFile(path, memory_map=True)
+        row_count, earliest_ms, latest_ms, interval_likely_ok = (
+            parquet_temporal_metadata(
+                parquet,
+                column="date",
+                expected_interval_ms=CANDLE_INTERVAL_MS,
+            )
+        )
+        if "date" not in set(parquet.schema_arrow.names):
             return ExistingCandleInfo(
                 rows=row_count,
                 latest_ms=None,
                 interval_ok=False,
                 error="missing date column",
+            )
+        if (
+            earliest_ms is not None
+            and latest_ms is not None
+            and interval_likely_ok is True
+        ):
+            return ExistingCandleInfo(
+                rows=row_count,
+                latest_ms=latest_ms,
+                interval_ok=True,
+                earliest_ms=earliest_ms,
             )
         date_frame = _read_date_column(path)
         return ExistingCandleInfo(
@@ -576,6 +607,7 @@ def _download_symbol_1m(
     end_ms: int,
     mode: str,
     refresh: bool,
+    tail_only: bool = False,
     page_progress_callback: Any = None,
 ) -> DownloadResult:
     output_path = output_dir / f"{record.code}_features.parquet"
@@ -595,6 +627,20 @@ def _download_symbol_1m(
     if output_path.exists() and not refresh:
         existing_info = _load_existing_candle_info(output_path)
         if existing_info.error is not None or not existing_info.interval_ok:
+            if tail_only:
+                return DownloadResult(
+                    asset_class="crypto_bybit_perp",
+                    code=record.code,
+                    bybit_symbol=record.bybit_symbol,
+                    market=record.market,
+                    status="repair_required",
+                    rows=existing_info.rows,
+                    output_path=str(output_path),
+                    message=(
+                        "Existing parquet failed the 1m contract; tail-only mode "
+                        "will not overwrite historical data. Run a backfill repair."
+                    ),
+                )
             print(
                 f"[bybit] {record.bybit_symbol}: existing parquet does not look like "
                 f"{KLINE_INTERVAL_LABEL}; rebuilding from start_date"
@@ -607,6 +653,7 @@ def _download_symbol_1m(
                 earliest_existing_ms=existing_info.earliest_ms,
                 latest_existing_ms=existing_info.latest_ms,
                 overlap_ms=CANDLE_INTERVAL_MS,
+                repair_missing_head=not tail_only,
             )
             if effective_start_ms > end_ms:
                 return DownloadResult(
@@ -618,6 +665,11 @@ def _download_symbol_1m(
                     rows=existing_info.rows,
                     output_path=str(output_path),
                 )
+    elif tail_only:
+        effective_start_ms = max(
+            effective_start_ms,
+            end_ms - 24 * 60 * CANDLE_INTERVAL_MS,
+        )
 
     all_rows: list[list[str]] = []
     for window_start, window_end in _iter_windows(effective_start_ms, end_ms):
@@ -721,8 +773,15 @@ def _download_symbol_1m(
 def main() -> None:
     started_at = datetime.now(timezone.utc)
     args = parse_args()
+    if args.tail_only and (args.refresh or args.mode == "full"):
+        raise ValueError("--tail-only cannot be combined with --refresh or --mode full")
     categories = _resolve_categories(args.categories)
     output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    lock_handle = (output_dir / ".download.lock").open("a+", encoding="utf-8")
+    if fcntl is not None:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+    print(f"[bybit] acquired exclusive dataset lock: {lock_handle.name}", flush=True)
 
     start_date = args.start_date.strip()
     end_date = resolve_end_date(args.end_date)
@@ -739,7 +798,6 @@ def main() -> None:
     if not symbols:
         raise RuntimeError("No Bybit perpetual symbols found for selected categories.")
 
-    output_dir.mkdir(parents=True, exist_ok=True)
     symbols_path = output_dir / "symbols.csv"
     atomic_write_text(
         symbols_path,
@@ -747,40 +805,14 @@ def main() -> None:
     )
 
     total_symbols = len(symbols)
-    closed_end_ms = min(end_ms, _latest_closed_candle_start_ms())
-    expected_candle_pages = 0
-    for record in symbols:
-        output_path = output_dir / f"{record.code}_features.parquet"
-        if output_path.is_file() and not args.refresh:
-            expected_candle_pages += 1
-            continue
-        listing_start = start_ms
-        if record.launch_time:
-            listing_start = max(
-                listing_start,
-                int(
-                    datetime.strptime(record.launch_time, "%Y-%m-%d %H:%M:%S")
-                    .replace(tzinfo=timezone.utc)
-                    .timestamp()
-                    * 1000
-                ),
-            )
-        candle_count = max(
-            0, (closed_end_ms - listing_start) // CANDLE_INTERVAL_MS + 1
-        )
-        expected_candle_pages += max(
-            1,
-            (candle_count + BYBIT_MAX_CANDLES_PER_REQUEST - 1)
-            // BYBIT_MAX_CANDLES_PER_REQUEST,
-        )
     pipeline_progress = PersistentProgress(
         output_dir / "progress.json",
         label="Bybit 永續合約 1 分鐘 K線",
-        total=expected_candle_pages,
-        unit="request-page",
+        total=total_symbols,
+        unit="symbol",
         basis=(
-            "completed one-minute request pages divided by full elapsed time; "
-            "listing age determines the estimated total page count"
+            "completed symbols divided by full elapsed time; request pages are "
+            "separate telemetry because listing age changes endpoint depth"
         ),
         started_at=started_at,
     )
@@ -815,10 +847,12 @@ def main() -> None:
             end_ms,
             args.mode,
             args.refresh,
-            page_progress_callback=lambda _code: pipeline_progress.update(
-                "candles", "page_fetched"
+            tail_only=args.tail_only,
+            page_progress_callback=lambda _code: pipeline_progress.observe(
+                "candles", "request_pages"
             ),
         )
+        pipeline_progress.update("candles", result.status)
 
         with progress_lock:
             finished_symbols += 1
@@ -886,6 +920,7 @@ def main() -> None:
         "current_row_count": row_count,
         **stored_inventory,
         "status_counts": status_counts,
+        "tail_only": args.tail_only,
         "categories": categories,
         "start_date": start_date,
         "end_date": end_date,
@@ -897,7 +932,8 @@ def main() -> None:
         json.dumps(summary, ensure_ascii=False, indent=2) + "\n",
     )
     pipeline_progress.finish(
-        failed=any(result.status == "failed" for result in results)
+        failed=any(result.status in {"failed", "repair_required"} for result in results),
+        require_exact=True,
     )
 
     print(f"[bybit] symbols.csv -> {symbols_path}")

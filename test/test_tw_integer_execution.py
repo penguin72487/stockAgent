@@ -67,8 +67,12 @@ def test_tw_cash_manual_t_plus_two_ledger_and_pending_claims() -> None:
     np.testing.assert_allclose(
         result.settled_cash_history, [10_000.0, 10_000.0, 4_995.0, 10_977.0]
     )
-    np.testing.assert_allclose(result.nav_history, [9_995.0, 10_977.0, 10_977.0, 10_977.0])
-    np.testing.assert_allclose(np.exp(result.strategy_returns).prod(), 10_977.0 / 10_000.0)
+    np.testing.assert_allclose(
+        result.nav_history, [9_995.0, 10_977.0, 10_977.0, 10_977.0]
+    )
+    np.testing.assert_allclose(
+        np.exp(result.strategy_returns).prod(), 10_977.0 / 10_000.0
+    )
     assert result.final_state.settled_cash == pytest.approx(10_977.0)
     assert not np.any(result.final_state.payable_queue)
     assert not np.any(result.final_state.receivable_queue)
@@ -143,7 +147,9 @@ def test_tw_cash_exact_cash_dividend_rejects_truncated_claim_queue() -> None:
 
 def test_tw_cash_full_run_equals_chunked_state_continuation() -> None:
     targets = np.array([[0.6, 0.2], [0.4, 0.0], [0.0, 0.5], [0.0, 0.0], [0.2, 0.0]])
-    closes = np.array([[10.0, 20.0], [11.0, 19.0], [12.0, 18.0], [12.5, 17.0], [13.0, 16.0]])
+    closes = np.array(
+        [[10.0, 20.0], [11.0, 19.0], [12.0, 18.0], [12.5, 17.0], [13.0, 16.0]]
+    )
     kwargs = dict(
         buy_fee_rates=np.array([0.000855, 0.000855]),
         sell_fee_rates=np.array([0.003855, 0.001855]),
@@ -193,11 +199,15 @@ def test_tw_cash_full_run_equals_chunked_state_continuation() -> None:
             rtol=0.0,
             atol=1e-9,
         )
-    np.testing.assert_allclose(full.final_state.payable_queue, second.final_state.payable_queue)
+    np.testing.assert_allclose(
+        full.final_state.payable_queue, second.final_state.payable_queue
+    )
     np.testing.assert_allclose(
         full.final_state.receivable_queue, second.final_state.receivable_queue
     )
-    assert full.final_state.settled_cash == pytest.approx(second.final_state.settled_cash)
+    assert full.final_state.settled_cash == pytest.approx(
+        second.final_state.settled_cash
+    )
     assert full.final_state.last_nav == pytest.approx(second.final_state.last_nav)
     np.testing.assert_allclose(full.final_weights, second.final_weights)
     np.testing.assert_allclose(
@@ -361,9 +371,7 @@ def test_tw_cash_padding_is_quote_free_exact_state_identity() -> None:
     np.testing.assert_array_equal(result.weights, [[0.5]])
     np.testing.assert_array_equal(result.nav_history, [1_000.0])
     assert result.final_state.settled_cash == state.settled_cash
-    np.testing.assert_array_equal(
-        result.final_state.payable_queue, state.payable_queue
-    )
+    np.testing.assert_array_equal(result.final_state.payable_queue, state.payable_queue)
     np.testing.assert_array_equal(result.final_weights, state.last_weights)
 
 
@@ -419,16 +427,16 @@ def test_tw_cash_integer_nets_same_date_rotation_before_settlement(
     assert result.positions[0, 0] == 0
     assert result.positions[0, 1] == int(50 * replacement_weight)
     assert result.final_state.payable_queue.sum() == pytest.approx(0.0)
-    assert result.final_state.receivable_queue[-1] == pytest.approx(
-        expected_receivable
-    )
+    assert result.final_state.receivable_queue[-1] == pytest.approx(expected_receivable)
     assert not (
         result.final_state.payable_queue[-1] > 0.0
         and result.final_state.receivable_queue[-1] > 0.0
     )
 
 
-def test_tw_cash_integer_negative_forced_sale_proceeds_are_not_an_affordability_error() -> None:
+def test_tw_cash_integer_negative_forced_sale_proceeds_are_not_an_affordability_error() -> (
+    None
+):
     state = TaiwanIntegerState(
         mode="tw_cash",
         settled_cash=200.0,
@@ -534,9 +542,7 @@ def test_empty_lifecycle_masks_do_not_require_inactive_quotes(
         initial_cash=1_000.0,
     )
     assert cash.turnover[0] == pytest.approx(0.0)
-    np.testing.assert_array_equal(
-        cash.short_sale_collateral_history, np.zeros((1, 1))
-    )
+    np.testing.assert_array_equal(cash.short_sale_collateral_history, np.zeros((1, 1)))
     np.testing.assert_array_equal(
         cash.short_margin_collateral_history, np.zeros((1, 1))
     )
@@ -559,12 +565,8 @@ def test_empty_lifecycle_masks_do_not_require_inactive_quotes(
         initial_cash=1_000.0,
     )
     assert day.turnover[0] == pytest.approx(0.0)
-    np.testing.assert_array_equal(
-        day.short_sale_collateral_history, np.zeros((1, 1))
-    )
-    np.testing.assert_array_equal(
-        day.short_margin_collateral_history, np.zeros((1, 1))
-    )
+    np.testing.assert_array_equal(day.short_sale_collateral_history, np.zeros((1, 1)))
+    np.testing.assert_array_equal(day.short_margin_collateral_history, np.zeros((1, 1)))
 
 
 def test_tw_day_trade_integer_skips_entry_without_valid_close_mark() -> None:
@@ -664,7 +666,9 @@ def test_tw_integer_inactive_huge_target_does_not_round_or_require_quote(
     assert result.final_state.settled_cash == pytest.approx(1.0e20)
 
 
-def test_tw_cash_integer_final_weights_are_drifted_but_history_is_execution_time() -> None:
+def test_tw_cash_integer_final_weights_are_drifted_but_history_is_execution_time() -> (
+    None
+):
     targets = np.array([[0.5]])
     result = run_tw_cash_integer(
         targets,
@@ -959,7 +963,9 @@ def test_tw_day_trade_manual_long_uses_1000_share_lots_and_t_plus_two() -> None:
     assert result.positions[0, 0] == 2_000
     assert result.settlement_net_history[0] == pytest.approx(1_295.0)
     np.testing.assert_allclose(result.receivable_queue_history[0], [0.0, 1_295.0])
-    np.testing.assert_allclose(result.settled_cash_history, [250_000.0, 250_000.0, 251_295.0])
+    np.testing.assert_allclose(
+        result.settled_cash_history, [250_000.0, 250_000.0, 251_295.0]
+    )
     assert np.all(result.final_state.holdings == 0)
     assert result.turnover[0] == pytest.approx(402_000.0 / 250_000.0)
     _assert_flat_ledger_identity(result)
@@ -1043,15 +1049,15 @@ def test_tw_day_trade_short_and_per_symbol_lot_override() -> None:
         initial_cash=300_000.0,
     )
 
-    # The short side can express only one 1,000-share lot (100,000).  The
-    # better-filled long side is reduced by one 500-share lot so whole-lot
-    # rounding cannot turn a balanced request into a net-long execution.
-    np.testing.assert_array_equal(result.positions[0], [-1_000, 1_000])
+    # Each symbol retains its independently affordable whole-lot quantity.
+    np.testing.assert_array_equal(result.positions[0], [-1_000, 1_500])
     assert np.all(result.final_state.holdings == 0)
     _assert_flat_ledger_identity(result)
 
 
-def test_tw_day_trade_integer_two_sided_target_fails_flat_when_one_side_has_no_lot() -> None:
+def test_tw_day_trade_integer_keeps_executable_side_when_other_side_cannot_open() -> (
+    None
+):
     targets = np.array([[0.5, -0.5]])
     result = run_tw_day_trade_integer(
         targets,
@@ -1065,8 +1071,8 @@ def test_tw_day_trade_integer_two_sided_target_fails_flat_when_one_side_has_no_l
         initial_cash=1_000_000.0,
     )
 
-    np.testing.assert_array_equal(result.positions[0], [0, 0])
-    assert result.turnover[0] == pytest.approx(0.0)
+    np.testing.assert_array_equal(result.positions[0], [5_000, 0])
+    assert result.turnover[0] == pytest.approx(1.005)
     _assert_flat_ledger_identity(result)
 
 
@@ -1152,8 +1158,12 @@ def test_tw_day_trade_full_run_equals_chunked_with_pending_loss() -> None:
             rtol=0.0,
             atol=1e-9,
         )
-    assert full.final_state.settled_cash == pytest.approx(second.final_state.settled_cash)
-    np.testing.assert_allclose(full.final_state.payable_queue, second.final_state.payable_queue)
+    assert full.final_state.settled_cash == pytest.approx(
+        second.final_state.settled_cash
+    )
+    np.testing.assert_allclose(
+        full.final_state.payable_queue, second.final_state.payable_queue
+    )
     np.testing.assert_allclose(
         full.final_state.receivable_queue, second.final_state.receivable_queue
     )
@@ -1235,12 +1245,8 @@ def test_tw_cash_margin_short_manual_t_plus_two_collateral_ledger() -> None:
         short_capacity_shares=np.full_like(targets[:1], 1_000_000.0),
         initial_cash=100_000.0,
     )
-    np.testing.assert_allclose(
-        opened.final_state.short_sale_collateral, [49_850.0]
-    )
-    np.testing.assert_allclose(
-        opened.final_state.short_margin_collateral, [45_000.0]
-    )
+    np.testing.assert_allclose(opened.final_state.short_sale_collateral, [49_850.0])
+    np.testing.assert_allclose(opened.final_state.short_margin_collateral, [45_000.0])
     assert result.final_state.settled_cash == pytest.approx(109_810.0)
     np.testing.assert_array_equal(result.final_state.short_sale_collateral, [0.0])
     np.testing.assert_array_equal(result.final_state.short_margin_collateral, [0.0])
@@ -1542,9 +1548,7 @@ def test_tw_cash_maintenance_retention_full_run_equals_chunked_and_clears() -> N
         + first.final_state.short_margin_collateral,
         [700.0, 1_900.0],
     )
-    np.testing.assert_array_equal(
-        full.positions[1:], np.zeros((2, 2), dtype=np.int64)
-    )
+    np.testing.assert_array_equal(full.positions[1:], np.zeros((2, 2), dtype=np.int64))
     np.testing.assert_array_equal(
         full.short_sale_collateral_history[1:], np.zeros((2, 2))
     )
@@ -1628,7 +1632,9 @@ def test_tw_cash_margin_short_full_run_equals_chunked_continuation() -> None:
             rtol=0.0,
             atol=1e-9,
         )
-    np.testing.assert_array_equal(full.final_state.holdings, second.final_state.holdings)
+    np.testing.assert_array_equal(
+        full.final_state.holdings, second.final_state.holdings
+    )
     np.testing.assert_allclose(
         full.final_state.short_sale_collateral,
         second.final_state.short_sale_collateral,
@@ -1640,7 +1646,9 @@ def test_tw_cash_margin_short_full_run_equals_chunked_continuation() -> None:
     np.testing.assert_allclose(full.final_weights, second.final_weights)
 
 
-def test_tw_cash_point_in_time_margin_matrix_is_applied_daily_and_chunks_exactly() -> None:
+def test_tw_cash_point_in_time_margin_matrix_is_applied_daily_and_chunks_exactly() -> (
+    None
+):
     targets = np.array([[-0.10], [-0.20], [-0.30]])
     closes = np.full((3, 1), 1_000.0)
     margin_rates = np.array([[0.90], [1.00], [1.10]])
@@ -1748,7 +1756,9 @@ def test_tw_cash_short_handling_fee_only_reduces_new_short_sale_collateral() -> 
     )
 
 
-def test_tw_cash_short_collateral_history_preserves_padding_and_clears_default() -> None:
+def test_tw_cash_short_collateral_history_preserves_padding_and_clears_default() -> (
+    None
+):
     targets = np.array([[-1.0], [0.0], [0.0]])
     padded = run_tw_cash_integer(
         targets,

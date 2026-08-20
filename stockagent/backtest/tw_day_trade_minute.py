@@ -84,9 +84,7 @@ def _strict_no_fallback_enabled() -> bool:
     return _env_truthy("STOCKAGENT_STRICT_NO_FALLBACK", "0")
 
 
-def get_tw_day_trade_minute_compile_stats(
-    *, reset: bool = False
-) -> dict[str, int]:
+def get_tw_day_trade_minute_compile_stats(*, reset: bool = False) -> dict[str, int]:
     """Return process-local daily-kernel compile audit counters."""
 
     snapshot = dict(_COMPILE_STATS)
@@ -107,34 +105,10 @@ def _capacity(volume: torch.Tensor) -> torch.Tensor:
     clean = torch.where(
         torch.isfinite(volume) & (volume > 0.0), volume, torch.zeros_like(volume)
     )
-    return torch.floor(clean * MINUTE_VOLUME_PARTICIPATION / BOARD_LOT_SHARES) * BOARD_LOT_SHARES
-
-
-def _preserve_requested_side_mix(
-    requested_weights: torch.Tensor,
-    signed_shares: torch.Tensor,
-    prices: torch.Tensor,
-) -> torch.Tensor:
-    """Reduce only the better-filled side; never manufacture exposure."""
-
-    requested_long = requested_weights.clamp_min(0.0).sum()
-    requested_short = (-requested_weights.clamp_max(0.0)).sum()
-    executed = signed_shares * prices
-    executed_long = executed.clamp_min(0.0).sum()
-    executed_short = (-executed.clamp_max(0.0)).sum()
-    both_requested = (requested_long > 0.0) & (requested_short > 0.0)
-    either_missing = (executed_long <= 0.0) | (executed_short <= 0.0)
-    long_fill = executed_long / requested_long.clamp_min(1.0e-12)
-    short_fill = executed_short / requested_short.clamp_min(1.0e-12)
-    long_scale = torch.minimum(torch.ones_like(long_fill), short_fill / long_fill.clamp_min(1.0e-12))
-    short_scale = torch.minimum(torch.ones_like(short_fill), long_fill / short_fill.clamp_min(1.0e-12))
-    scaled = torch.where(signed_shares > 0.0, signed_shares * long_scale, signed_shares * short_scale)
-    scaled = torch.sign(scaled) * _ste_floor_lots(scaled.abs())
-    # Exact forward fail-close, but retain a useful backward signal so a broad
-    # cold-start portfolio can learn to concentrate above one board lot.
-    fail_closed_ste = signed_shares + (torch.zeros_like(signed_shares) - signed_shares).detach()
-    scaled = torch.where(both_requested & either_missing, fail_closed_ste, scaled)
-    return torch.where(both_requested, scaled, signed_shares)
+    return (
+        torch.floor(clean * MINUTE_VOLUME_PARTICIPATION / BOARD_LOT_SHARES)
+        * BOARD_LOT_SHARES
+    )
 
 
 def _run_tw_day_trade_minute_day(
@@ -206,14 +180,15 @@ def _run_tw_day_trade_minute_day(
         desired, _capacity(execution_row[:, F.ENTRY_VOLUME_0901])
     )
     signed_entry = torch.sign(request) * entry_shares
-    signed_entry = _preserve_requested_side_mix(request, signed_entry, entry_price)
     direction = torch.sign(request)
     # ``abs(0)`` has zero derivative. Multiplying by the requested direction
     # keeps the exact fail-closed forward value while retaining its STE signal.
     remaining = signed_entry * direction
     gross_pnl = torch.zeros_like(remaining)
-    fees = remaining * entry_price * torch.where(
-        direction > 0.0, buy_fee_rates, sell_fee_rates
+    fees = (
+        remaining
+        * entry_price
+        * torch.where(direction > 0.0, buy_fee_rates, sell_fee_rates)
     )
     traded_notional = remaining * entry_price
 
@@ -226,15 +201,11 @@ def _run_tw_day_trade_minute_day(
         volume = execution_row[:, int(high_field) + 2]
         # Strict penetration is intentional: equality has unknown queue
         # priority and therefore cannot be claimed as a historical fill.
-        crossed = torch.where(
-            direction > 0.0, high > limit_price, low < limit_price
-        )
+        crossed = torch.where(direction > 0.0, high > limit_price, low < limit_price)
         valid_limit = crossed & valid_limit_price
         quantity = torch.minimum(remaining, _capacity(volume))
         quantity = torch.where(valid_limit, quantity, torch.zeros_like(quantity))
-        gross_pnl = gross_pnl + direction * quantity * (
-            safe_limit_price - entry_price
-        )
+        gross_pnl = gross_pnl + direction * quantity * (safe_limit_price - entry_price)
         fees = fees + quantity * safe_limit_price * torch.where(
             direction > 0.0, sell_fee_rates, buy_fee_rates
         )
@@ -248,9 +219,7 @@ def _run_tw_day_trade_minute_day(
         price = execution_row[:, price_field]
         valid_price = torch.isfinite(price) & (price > 0.0)
         safe_price = torch.where(valid_price, price, entry_price)
-        quantity = torch.minimum(
-            remaining, _capacity(execution_row[:, volume_field])
-        )
+        quantity = torch.minimum(remaining, _capacity(execution_row[:, volume_field]))
         quantity = torch.where(valid_price, quantity, torch.zeros_like(quantity))
         gross_pnl = gross_pnl + direction * quantity * (safe_price - entry_price)
         fees = fees + quantity * safe_price * torch.where(
@@ -266,18 +235,14 @@ def _run_tw_day_trade_minute_day(
     # obtain unlimited margin financing/short inventory.  The daily stock book
     # is flattened after charging the close-side fee and margin costs; only the
     # resulting net cash difference enters the T+2 queue below.
-    marked_remaining = torch.where(
-        valid_close, remaining, torch.zeros_like(remaining)
+    marked_remaining = torch.where(valid_close, remaining, torch.zeros_like(remaining))
+    gross_pnl = gross_pnl + direction * marked_remaining * (safe_close - entry_price)
+    residual_exit_fees = (
+        marked_remaining
+        * safe_close
+        * torch.where(direction > 0.0, normal_sell_fee_rates, buy_fee_rates)
     )
-    gross_pnl = gross_pnl + direction * marked_remaining * (
-        safe_close - entry_price
-    )
-    residual_exit_fees = marked_remaining * safe_close * torch.where(
-        direction > 0.0, normal_sell_fee_rates, buy_fee_rates
-    )
-    normal_sell_tax_adjustment = (
-        normal_sell_fee_rates - sell_fee_rates
-    ).clamp_min(0.0)
+    normal_sell_tax_adjustment = (normal_sell_fee_rates - sell_fee_rates).clamp_min(0.0)
     margin_cost = torch.where(
         direction > 0.0,
         marked_remaining * safe_close * MARGIN_FINANCING_ONE_DAY_RATE,
@@ -303,9 +268,7 @@ def _run_tw_day_trade_minute_day(
         - margin_cost.sum()
         - missing_close_loss.sum()
     )
-    simple_return = (pnl / nav_twd.clamp_min(1.0e-12)).clamp_min(
-        -1.0 + 1.0e-6
-    )
+    simple_return = (pnl / nav_twd.clamp_min(1.0e-12)).clamp_min(-1.0 + 1.0e-6)
     simple_return = torch.where(
         state_advance, simple_return, torch.zeros_like(simple_return)
     )
@@ -397,25 +360,23 @@ def _run_tw_day_trade_minute_block(
             cash,
             payables,
             receivables,
-        ) = (
-            _run_tw_day_trade_minute_day(
-                target_weights[idx],
-                execution_tape[idx],
-                tradable_mask[idx],
-                can_short_open_mask[idx],
-                day_trade_eligible_mask[idx],
-                day_trade_can_buy_open_mask[idx],
-                day_trade_can_sell_open_mask[idx],
-                buy_fee_rates,
-                sell_fee_rates,
-                normal_sell_fee_rates,
-                cash,
-                payables,
-                receivables,
-                equity_scale,
-                capital0,
-                state_advance[idx],
-            )
+        ) = _run_tw_day_trade_minute_day(
+            target_weights[idx],
+            execution_tape[idx],
+            tradable_mask[idx],
+            can_short_open_mask[idx],
+            day_trade_eligible_mask[idx],
+            day_trade_can_buy_open_mask[idx],
+            day_trade_can_sell_open_mask[idx],
+            buy_fee_rates,
+            sell_fee_rates,
+            normal_sell_fee_rates,
+            cash,
+            payables,
+            receivables,
+            equity_scale,
+            capital0,
+            state_advance[idx],
         )
         log_rows.append(log_return)
         turnover_rows.append(turnover)
@@ -536,9 +497,7 @@ def run_tw_day_trade_minute_execution(
     weights = target_weights.float()
     buy_fees = buy_fee_rates.to(device=device, dtype=dtype).reshape(-1)
     sell_fees = sell_fee_rates.to(device=device, dtype=dtype).reshape(-1)
-    normal_sell_fees = normal_sell_fee_rates.to(
-        device=device, dtype=dtype
-    ).reshape(-1)
+    normal_sell_fees = normal_sell_fee_rates.to(device=device, dtype=dtype).reshape(-1)
     if (
         buy_fees.numel() != weights.size(1)
         or sell_fees.numel() != weights.size(1)
@@ -603,9 +562,7 @@ def run_tw_day_trade_minute_execution(
     for idx in range(0, total_rows, COMPILED_BLOCK_ROWS):
         valid_block_rows = min(COMPILED_BLOCK_ROWS, total_rows - idx)
         if valid_block_rows == COMPILED_BLOCK_ROWS:
-            block_selector: slice | torch.Tensor = slice(
-                idx, idx + COMPILED_BLOCK_ROWS
-            )
+            block_selector: slice | torch.Tensor = slice(idx, idx + COMPILED_BLOCK_ROWS)
             block_advance = advance[block_selector]
         else:
             # Pad the final ABI by repeating its last physical row, then mask
@@ -618,8 +575,7 @@ def run_tw_day_trade_minute_execution(
                 dtype=torch.long,
             ).clamp_max(total_rows - 1)
             block_advance = advance.index_select(0, block_selector) & (
-                torch.arange(COMPILED_BLOCK_ROWS, device=device)
-                < valid_block_rows
+                torch.arange(COMPILED_BLOCK_ROWS, device=device) < valid_block_rows
             )
         try:
             block_result = block_runner(

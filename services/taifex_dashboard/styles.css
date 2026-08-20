@@ -88,7 +88,7 @@ button:focus-visible, select:focus-visible, input:focus-visible, .table-scroll:f
 #equity-chart { display: block; width: 100%; max-width: 100%; min-height: 290px; background: #fbfcfd; border: 1px solid #edf1f3; }
 .chart-grid { stroke: var(--line); stroke-width: 1; }
 .chart-zero { stroke: #7c8994; stroke-width: 1.2; stroke-dasharray: 5 5; }
-.chart-baseline { stroke: #7c8994; stroke-width: 1.2; stroke-dasharray: 5 5; }
+.chart-baseline { fill: none; stroke: #7c8994; stroke-width: 1.2; stroke-dasharray: 5 5; }
 .chart-line { fill: none; stroke: var(--blue); stroke-width: 3; stroke-linecap: round; stroke-linejoin: round; }
 .chart-label { fill: var(--muted); font: 12px "SFMono-Regular", Consolas, monospace; }
 .chart-time-grid { stroke: var(--line); stroke-width: 1; opacity: .65; }

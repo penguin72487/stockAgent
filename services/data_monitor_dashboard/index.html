@@ -6,22 +6,14 @@
   <meta name="color-scheme" content="dark">
   <meta name="theme-color" content="#071019">
   <title>StockAgent 全資料監控</title>
-  <link rel="stylesheet" href="../dashboard-core.css?v=5">
-  <link rel="stylesheet" href="styles.css?v=4">
+  <link rel="stylesheet" href="../dashboard-core.css?v=6">
+  <link rel="stylesheet" href="styles.css?v=7">
 </head>
 <body>
   <a class="skip-link" href="#source-list">跳到資料來源</a>
   <header class="site-header topbar">
     <a class="brand" href="../">STOCKAGENT</a>
-    <nav aria-label="公開面板導覽">
-      <a href="../">總覽</a>
-      <a href="../taifex/">TAIFEX</a>
-      <a href="../tw-day-trade/">台股當沖</a>
-      <a href="../shioaji/">永豐 API</a>
-      <a href="../openbb/">OpenBB</a>
-      <a href="./" aria-current="page">全資料</a>
-      <a href="../traffic/">流量</a>
-    </nav>
+    <nav data-dashboard-nav="data-monitor" aria-label="公開面板導覽"></nav>
   </header>
 
   <main>
@@ -66,7 +58,7 @@
       <div class="section-heading">
         <div>
           <p class="eyebrow">SOURCE REGISTRY</p>
-          <h2 id="sources-title">逐端點進度、串流時窗與 ETA</h2>
+          <h2 id="sources-title">逐端點發布時間、取得進度與 ETA</h2>
         </div>
         <p><span id="result-count">—</span><br><span class="sort-contract">固定排序：未最新 → 串流 → 完成 → 無法完成</span></p>
       </div>
@@ -113,8 +105,8 @@
             <tr>
               <th>資料來源</th>
               <th>排序狀態</th>
-              <th>完整度</th>
-              <th>串流／下次更新</th>
+              <th>取得進度</th>
+              <th>發布／偵測／下次取得</th>
               <th>預估完成</th>
               <th>最近驗證／資料截至</th>
               <th>責任／證據</th>
@@ -130,13 +122,14 @@
     <aside class="boundary-note" aria-labelledby="boundary-title">
       <span>資料誠信邊界</span>
       <div>
-        <h2 id="boundary-title">新鮮，不等於完整；持續串流，也沒有「抓完」日期。</h2>
+        <h2 id="boundary-title">首筆到達就推進下一資料日，但不等於整批完整。</h2>
         <p id="boundary-copy">即時 Tick／BidAsk 只顯示實際落盤資料。歷史 Tick 無法重建從未擷取的五檔委託簿；零吞吐、休市或配額等待時不會捏造 ETA。</p>
       </div>
     </aside>
   </main>
 
   <footer>StockAgent 全資料監控 · 台北時間 · 每 10 秒讀取最新回執</footer>
-  <script src="app.js?v=7" defer></script>
+  <script src="../dashboard-core.js?v=1" defer></script>
+  <script src="app.js?v=10" defer></script>
 </body>
 </html>

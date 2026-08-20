@@ -43,31 +43,30 @@ def test_discord_tw_market_uses_canonical_official_data_layer() -> None:
     )
 
 
-def test_discord_tw_day_trade_uses_its_point_in_time_data_contract() -> None:
-    cfg = load_market_config("services/discord_bot/markets/tw_day_trade.yaml")
-    assert cfg.pre_signal_command == load_market_config(
-        "services/discord_bot/markets/tw.yaml"
-    ).pre_signal_command
-
-
-def test_discord_tw_day_trade_1m_uses_its_point_in_time_data_contract() -> None:
-    cfg = load_market_config("services/discord_bot/markets/tw_day_trade_1m.yaml")
-    assert cfg.pre_signal_command == load_market_config(
-        "services/discord_bot/markets/tw.yaml"
-    ).pre_signal_command
-
-
 def test_discord_tw_day_trade_100m_uses_its_point_in_time_data_contract() -> None:
     cfg = load_market_config("services/discord_bot/markets/tw_day_trade_100m.yaml")
-    assert cfg.pre_signal_command == load_market_config(
-        "services/discord_bot/markets/tw.yaml"
-    ).pre_signal_command
+    assert cfg.pre_signal_command == (
+        "scripts/run_data_cache.sh",
+        "use",
+        "tw-public",
+        "--link",
+        "data_tw_public",
+    )
 
 
 def test_discord_tw_day_trade_multi_basis_uses_its_point_in_time_data_contract() -> None:
     cfg = load_market_config("services/discord_bot/markets/tw_day_trade_multi_basis.yaml")
     assert cfg.pre_signal_command == load_market_config(
-        "services/discord_bot/markets/tw.yaml"
+        "services/discord_bot/markets/tw_day_trade_100m.yaml"
+    ).pre_signal_command
+
+
+def test_projection_l1_day_trade_uses_syncthing_packed_data_contract() -> None:
+    cfg = load_market_config(
+        "services/discord_bot/markets/tw_day_trade_multi_basis_projection_l1_gelu.yaml"
+    )
+    assert cfg.pre_signal_command == load_market_config(
+        "services/discord_bot/markets/tw_day_trade_100m.yaml"
     ).pre_signal_command
 
 
@@ -135,13 +134,54 @@ def test_crypto_downloaders_accept_incremental_1m_mode(monkeypatch) -> None:
     assert yahoo_args.mode == "incremental"
     assert yahoo._is_incremental_mode(yahoo_args)
 
-    monkeypatch.setattr(sys, "argv", ["download_okx_perp_daily.py", "--mode", "incremental"])
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["download_okx_perp_daily.py", "--mode", "incremental", "--tail-only"],
+    )
     okx_args = okx.parse_args()
     assert okx_args.mode == "incremental"
+    assert okx_args.tail_only is True
 
-    monkeypatch.setattr(sys, "argv", ["download_bybit_perp_daily.py", "--mode", "incremental"])
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["download_bybit_perp_daily.py", "--mode", "incremental", "--tail-only"],
+    )
     bybit_args = bybit.parse_args()
     assert bybit_args.mode == "incremental"
+    assert bybit_args.tail_only is True
+
+
+@pytest.mark.parametrize("module", [okx, bybit])
+def test_crypto_existing_info_uses_parquet_footer_without_date_scan(
+    tmp_path: Path, monkeypatch, module
+) -> None:
+    path = tmp_path / "BTCUSDT_features.parquet"
+    module.pl.DataFrame(
+        {
+            "date": [
+                "2026-08-20 00:00:00",
+                "2026-08-20 00:01:00",
+                "2026-08-20 00:02:00",
+            ],
+            "close": [1.0, 2.0, 3.0],
+        }
+    ).write_parquet(path, statistics=True)
+    monkeypatch.setattr(
+        module,
+        "_read_date_column",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("footer fast path should avoid reading the date column")
+        ),
+    )
+
+    info = module._load_existing_candle_info(path)
+
+    assert info.rows == 3
+    assert info.interval_ok is True
+    assert info.earliest_ms is not None
+    assert info.latest_ms == info.earliest_ms + 2 * 60_000
 
 
 def test_bybit_inventory_retains_delisted_files_without_hiding_rows(

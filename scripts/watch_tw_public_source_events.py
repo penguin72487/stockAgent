@@ -733,6 +733,15 @@ def _download_report(metadata_dir: Path) -> dict[str, dict[str, str]]:
     return output
 
 
+def _resilient_download_args(args: argparse.Namespace) -> argparse.Namespace:
+    """Keep fast probes while giving an observed change time to download."""
+
+    resolved = argparse.Namespace(**vars(args))
+    resolved.timeout = max(60, int(getattr(args, "timeout", 20)))
+    resolved.retries = max(4, int(getattr(args, "retries", 2)))
+    return resolved
+
+
 def _refresh_pending(
     names: list[str],
     *,
@@ -754,19 +763,80 @@ def _refresh_pending(
     historical = [
         name for name in names if specs_by_name[name].kind == "historical_json_table"
     ]
+    download_args = _resilient_download_args(args)
     if historical and started.timetz().replace(tzinfo=None) < datetime_time(13, 30):
-        end_date = _latest_completed_taiex_session(live_root, observed=started)
+        try:
+            end_date = _latest_completed_taiex_session(live_root, observed=started)
+        except Exception as exc:
+            # A transient calendar read/download failure is a dataset-level
+            # blocker, not a daemon-fatal exception.  Persist it so the public
+            # monitor can expose the failure and let the long-running process
+            # retry with backoff instead of entering a systemd restart storm.
+            completed_at = datetime.now(TAIPEI)
+            rows = state.get("datasets")
+            rows = dict(rows) if isinstance(rows, Mapping) else {}
+            failed: list[dict[str, Any]] = []
+            for name in names:
+                row = rows[name]
+                failures = int(row.get("consecutive_download_failures") or 0) + 1
+                row["last_download_status"] = "blocked_taiex_session_calendar"
+                row["last_download_error"] = str(exc)
+                row["consecutive_download_failures"] = failures
+                row["next_probe_at_taipei"] = (
+                    completed_at
+                    + timedelta(
+                        seconds=min(60.0, 5.0 * (2 ** min(failures - 1, 4)))
+                    )
+                ).isoformat(timespec="seconds")
+                failed.append(
+                    {
+                        "dataset": name,
+                        "status": "blocked_taiex_session_calendar",
+                        "message": "TAIFEX session calendar is temporarily unavailable",
+                    }
+                )
+            payload = {
+                "schema_version": SCHEMA_VERSION,
+                "event_id": run_id,
+                "status": "failed",
+                "event_kind": (
+                    "bootstrap"
+                    if not state.get("bootstrap_completed_at_taipei")
+                    else "version_change"
+                ),
+                "started_at_taipei": started.isoformat(timespec="seconds"),
+                "completed_at_taipei": completed_at.isoformat(timespec="seconds"),
+                "lock_wait_ms": 0.0,
+                "triggered_dataset_count": len(names),
+                "triggered_datasets": names,
+                "accepted_dataset_count": 0,
+                "accepted_datasets": [],
+                "failed_dataset_count": len(failed),
+                "failed_datasets": failed,
+                "content_changed_datasets": [],
+                "download_end_date": None,
+                "commands": [],
+                "return_codes": [],
+                "metadata_dir": str(metadata_dir),
+                "calendar_status": "unavailable",
+                "calendar_error": str(exc),
+            }
+            _atomic_json(state_root / "events" / "latest.json", payload)
+            _atomic_json(state_root / "events" / "runs" / f"{run_id}.json", payload)
+            return payload
     else:
         end_date = "today"
     commands: list[list[str]] = []
     if historical and started.timetz().replace(tzinfo=None) >= datetime_time(13, 30):
-        commands.append(_taiex_calendar_command(live_root=live_root, args=args))
+        commands.append(
+            _taiex_calendar_command(live_root=live_root, args=download_args)
+        )
     commands.append(
         _download_command(
             live_root=live_root,
             metadata_dir=metadata_dir,
             phase=phase,
-            args=args,
+            args=download_args,
             end_date=end_date,
         )
     )

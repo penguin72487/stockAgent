@@ -1,164 +1,712 @@
 # stockAgent
 
-Multi-asset Taiwan stock trading research workspace.
+台灣市場為主的多資產資料、研究、訓練、回測與即時訊號工作區。
 
-## Current status
+本 README 是日常操作入口。正確性契約以 [AGENTS.md](AGENTS.md) 與
+[訓練規格](docs/training_spec.md) 為準；完整文件分類見
+[文件索引](docs/README.md)。原始資料與訓練產物不進 Git，實際路徑由市場 YAML、
+資料集 catalog 與本機 storage root 決定。
 
-- Start with the [documentation index](docs/README.md) and the
-  [current training contract](docs/training_spec.md).
-- The 2026-08-10 whole-project engineering review is recorded in
-  [docs/PROJECT_REVIEW_2026-08-10.md](docs/PROJECT_REVIEW_2026-08-10.md).
-- Raw research data is kept outside Git under the configured data roots. Do not
-  assume every market uses `data_parquet/`; the resolved market YAML is the
-  authority for a run.
-- Market-specific experiment templates live under `configs/markets/`, for
-  example `configs/markets/tw.yaml`. The legacy
-  `configs/experiment_baseline.yaml` is kept for compatibility.
+## 目錄
 
-## System workflow
+- [第一性架構](#第一性架構)
+- [五分鐘開始](#五分鐘開始)
+- [資料冷庫與多機同步](#資料冷庫與多機同步)
+- [資料冷庫完整指令](#資料冷庫完整指令)
+- [發布新資料](#發布新資料)
+- [Syncthing 驗收](#syncthing-驗收)
+- [Artifacts 同步與去重](#artifacts-同步與去重)
+- [資料下載與更新](#資料下載與更新)
+- [訓練、GPU 與解釋](#訓練gpu-與解釋)
+- [即時訊號與服務](#即時訊號與服務)
+- [故障排查](#故障排查)
+- [文件分類](#文件分類)
 
-1. Normalize all symbol parquet files into a shared date x symbol panel.
-2. Build benchmark returns from each market config's `data.benchmark_name`; use `universe_average_return` only when an explicit universe-average benchmark is desired.
-3. Run yearly expanding-window walk-forward validation.
-4. Train the configured model through the canonical loss/backtest path, then
-   publish checkpointed, reproducible artifacts for evaluation or deployment.
+## 第一性架構
 
-## Dataset snapshot sync (desync + Syncthing)
+### 要解決的限制
 
-Git synchronizes the code repository. Syncthing synchronizes only the immutable
-desync store at `/srv/stockagent-sync`; do not use Syncthing to synchronize the
-Git working tree or a live dataset directory.
+1. Git 適合程式與小型設定，不適合數十 GB 資料或模型產物。
+2. Syncthing 的主要固定成本之一是路徑與小檔索引；只做 hard link 去重不會減少路徑數。
+3. 單一巨型壓縮檔雖然路徑少，但改一個檔案就可能重傳整包，損毀半徑也最大。
+4. 訓練需要可直接隨機讀取的目錄；傳輸層則需要少量、可驗證、可增量重用的大物件。
+5. 多台機器可以發布，但較晚的時鐘不能讓較舊資料覆蓋較新資料。
 
-Install the pinned desync release and initialize each machine once. Every
-machine must use a different permanent node ID. Use its stable hostname rather
-than an abstract A/B/C label:
+因此資料生命週期固定為：
+
+```text
+可續傳下載工作區
+      │ build + strict audit 成功
+      ▼
+canonical 可讀資料
+      │ publish：逐檔 SHA-256、固定 hash 分桶、重用未變 pack member
+      ▼
+/srv/stockagent-packed                 長期冷庫、Syncthing 唯一同步資料層
+      │ Syncthing watcher 在 release 發布後即時增量複寫
+      ▼
+接收端預設停在 COLD_ONLY              不自動 fetch/use/materialize
+      │ 僅在人工執行 use 時完整驗證並解封
+      ▼
+/srv/stockagent-packed-materialized    可重建的臨時熱工作集；七日安全 GC
+```
+
+核心規則：
+
+- Git 同步程式；Syncthing 不同步 Git working tree，也不直接同步可變訓練資料夾。
+- Syncthing 持續監看並同步 packed manifests、heads、packs/blobs；來源資料只有在 build 與
+  strict audit 成功、原子發布 release 後才進入同步，不同步下載中的半成品。
+- 接收節點預設只保留冷庫，沒有任何 timer、cron 或 service 自動執行 `fetch`、`use` 或
+  materialize。解封只能是使用者明確要求的本機動作。
+- 冷庫 release 不可變。各節點使用永久名稱，例如 `penguin`、`lab203`、`vastai1T`。
+- 多寫者保留各自 head，以 HLC/LWW 決定候選最新版；來源 freshness receipt 仍必須
+  不舊於現有 release，否則 fail closed。
+- 小檔依固定路徑 hash 分桶；大型或已壓縮檔使用 content-addressed blob。未變內容直接
+  重用，所以增量發布只產生並傳送真正改變的物件。
+- `use` 只有在 manifest、inventory、pack/blob 與 materialized 檔案驗證成功後才切換
+  symlink。熱工作集是快取，不是第二份權威資料。
+- 七日回收使用明確 lease，不依賴不可靠的 `atime`。GC 遇到 pin、執行中程序、缺少
+  cold object 或 READY proof 不符時會拒絕刪除。
+
+不同資料層不可混用：
+
+| 層 | 預設位置 | 是否長期保留 | 是否由 Syncthing 同步 |
+|---|---|---:|---:|
+| 程式與設定 | repository | 是，Git | 否 |
+| 下載／修復工作區 | `data_*` | 依 catalog | 否 |
+| immutable packed 冷庫 | `/srv/stockagent-packed` | 是 | 是，Folder ID `stockagent-packed` |
+| materialized 熱工作集 | `/srv/stockagent-packed-materialized` | 否 | 否 |
+| 可變 artifacts hot transport | `/srv/stockagent-artifacts-hot` | 視產物 | 是，獨立 folder |
+
+### Canonical 多機拓撲
+
+「架構一致」是指每一層有相同責任與驗收契約，不是要求每台機器盲目接受相同 folder。
+目前的標準拓撲為：
+
+| Folder ID | penguin | lab203 | vastai1T | 用途 |
+|---|---|---|---|---|
+| `stockagent-packed` | active，`/srv/stockagent-packed` | active，同一路徑 | active，同一路徑 | 所有 canonical 資料與完成 artifacts 的 immutable 冷 release |
+| `stockagent-artifacts-hot` | active，transport root | active，工作 artifacts | 不加入 | penguin/lab 的低延遲 operational artifacts |
+
+舊 `stockagent`、`stockagent-desync` 與 `stockagent-artifacts-live` Folder ID 已退役；
+penguin 與 vastai1T 的舊 store/materialization 已在 packed release 完整驗證後刪除。
+不要重新接受或建立這些 Folder ID。程式一律使用 Git，不同步 working tree。
+
+Vast 的 `artifacts` 是大量訓練／ablation 輸出，不可直接加入
+`stockagent-artifacts-hot`：這會把各節點的完整訓練工作集做聯集，增加數百 GB 流量、
+索引與其他節點磁碟需求。Vast 的完成產物應先通過 lifecycle gate，再選擇性發布成 packed
+cold release；執行中的 run 保持 node-local。
+
+平台服務管理可以不同，但資料契約不可不同：
+
+| 節點 | Syncthing 管理方式 | GUI | 備註 |
+|---|---|---|---|
+| penguin | `syncthing@root.service` | `127.0.0.1:8384` | systemd；hot artifact bridge 也由 systemd 管理 |
+| lab203 | `syncthing@root.service` | `127.0.0.1:8384` | WSL 網路另依 QUIC 驗收 |
+| vastai1T | Vast supervisor 的 `syncthing` | `127.0.0.1:18384` | 無 systemd；使用平台配置的 self-mapped TCP/UDP port |
+
+所有節點必須保留自己的 Syncthing cert/Device ID 與 packed `.local-state/node-id`；只能同步
+folder 內容，禁止複製另一台機器的 Syncthing config、cert、database 或 `.local-state`。
+
+## 五分鐘開始
+
+所有 repository Python 指令先使用同一個 runtime resolver：
 
 ```bash
 cd /path/to/stockAgent
-./scripts/install_desync.sh
-
-# This machine is penguin
-./scripts/run_desync_snapshot.sh init \
-  --sync-root /srv/stockagent-sync \
-  --node-id penguin
-
-# The other current machines use vastai1T and lab203 respectively.
+source scripts/runtime_env.sh
+run_fintech_python scripts/check_environment.py --require-cuda --strict
 ```
 
-Check which complete `tw-public` snapshot currently wins:
+沒有 GPU 的純資料節點可拿掉 `--require-cuda`；訓練設定要求 CUDA 時不可默默退回 CPU。
+若環境位置特殊，使用 `FINTECH_ENV_PATH=/path/to/fintech` 或
+`PYTHON_BIN=/path/to/python`，不要把某台機器的 Conda 絕對路徑寫進腳本。
+
+查看冷庫與同步狀態；預設不解封：
 
 ```bash
-./scripts/run_desync_snapshot.sh status tw-public \
-  --sync-root /srv/stockagent-sync
+stockagent-data status --human
 ```
 
-Fetch the latest complete snapshot into a read-only training location and save
-an exact pin:
+只有真的要訓練或查詢時，才人工執行
+`stockagent-data use DATASET [--link PATH]`；它不是部署或同步的必要步驟。
+
+開始一般訓練：
 
 ```bash
-./scripts/run_desync_snapshot.sh fetch tw-public \
-  --sync-root /srv/stockagent-sync \
-  --materialized-root /srv/stockagent-snapshots \
-  --pin /srv/stockagent-snapshots/tw-public.pin.json
+source scripts/runtime_env.sh
+run_fintech_python train.py --config configs/markets/tw.yaml
 ```
 
-The command prints the materialized directory. It has the form:
+所有入口均可用 `--help` 查目前程式實際支援的參數：
+
+```bash
+stockagent-data --help
+./scripts/run_packed_snapshot.sh --help
+source scripts/runtime_env.sh
+run_fintech_python train.py --help
+```
+
+## 資料冷庫與多機同步
+
+### 新機器一次性部署
+
+先同步程式碼，再建立該機器自己的永久 node ID。以下以 `lab203` 為例；其他機器只能
+替換名稱，不可複製另一台機器的 `.local-state/node-id`。
+
+```bash
+cd /path/to/stockAgent
+git pull --ff-only origin twRule
+
+sudo install -d -m 0755 /srv/stockagent-packed
+sudo install -d -m 0755 /srv/stockagent-packed-materialized
+
+./scripts/run_packed_snapshot.sh init \
+  --sync-root /srv/stockagent-packed \
+  --node-id lab203
+
+sudo ./scripts/install_data_cache_gc_service.sh
+```
+
+安裝器會建立 `/usr/local/bin/stockagent-data`。有 systemd 時安裝每日 timer；沒有
+systemd 的 container 會安裝 `/etc/cron.d/stockagent-data-cache-gc` fallback。
+
+Vast container 不建立假的 `syncthing@root.service`，使用平台 supervisor：
+
+```bash
+supervisorctl status syncthing
+supervisorctl restart syncthing
+tail -f /var/log/portal/syncthing.log
+```
+
+Vast recycle 會重建 container filesystem；若 `/workspace` 不是 persistent volume，
+`/opt/syncthing`、repository、冷庫與本機 node identity 都不會保留。每次新 instance 必須
+重新確認 Device ID、重新 pair、執行 `init --node-id vastai1T`，並重新安裝 cache cron；
+不可把舊機器 cert 複製到新 instance 冒充同一個 Syncthing device。
+
+Syncthing 接受：
 
 ```text
-/srv/stockagent-snapshots/tw-public/<SNAPSHOT_ID>
+Folder ID:   stockagent-packed
+Folder Path: /srv/stockagent-packed
+Folder Type: Send & Receive
 ```
 
-Inspect the saved pin and verify the materialized tree:
+等 Syncthing 通過[驗收條件](#syncthing-驗收)後，只驗證冷庫狀態，不解封：
 
 ```bash
-jq . /srv/stockagent-snapshots/tw-public.pin.json
-
-snapshot_id="$(
-  jq -r '.manifest.snapshot_id' \
-    /srv/stockagent-snapshots/tw-public.pin.json
-)"
-
-snapshot_path="$(
-  printf '/srv/stockagent-snapshots/tw-public/%s\n' \
-    "$snapshot_id"
-)"
-
-./scripts/run_desync_snapshot.sh verify tw-public \
-  --sync-root /srv/stockagent-sync \
-  --materialized "$snapshot_path"
+stockagent-data status tw-public
+./scripts/run_packed_snapshot.sh verify tw-public \
+  --sync-root /srv/stockagent-packed
 ```
 
-For resume or reproduction, fetch the pinned snapshot ID explicitly instead of
-resolving `latest` again:
+正常部署到此完成；不要建立 `data_tw_public` 等 materialized symlink。只有本機工作負載
+確實需要展開資料時，才人工執行 `stockagent-data use`。
 
-```bash
-snapshot_id="$(
-  jq -r '.manifest.snapshot_id' \
-    /srv/stockagent-snapshots/tw-public.pin.json
-)"
+### 自訂 root 與預設值
 
-./scripts/run_desync_snapshot.sh fetch tw-public \
-  --snapshot-id "$snapshot_id" \
-  --sync-root /srv/stockagent-sync \
-  --materialized-root /srv/stockagent-snapshots
+預設值：
+
+```text
+STOCKAGENT_PACKED_SYNC_ROOT=/srv/stockagent-packed
+STOCKAGENT_MATERIALIZED_ROOT=/srv/stockagent-packed-materialized
+STOCKAGENT_DATA_CACHE_TTL_DAYS=7
 ```
 
-Publish only from a frozen source directory while downloaders, repair jobs, and
-other writers are stopped:
+可用環境變數覆寫：
 
 ```bash
-./scripts/run_desync_snapshot.sh publish tw-public \
-  data_tw_public \
-  --sync-root /srv/stockagent-sync \
-  --metadata storage_frequency=daily \
+STOCKAGENT_PACKED_SYNC_ROOT=/mnt/cold/stockagent-packed \
+STOCKAGENT_MATERIALIZED_ROOT=/mnt/hot/stockagent-materialized \
+STOCKAGENT_DATA_CACHE_TTL_DAYS=14 \
+stockagent-data use tw-public
+```
+
+或把全域參數放在 subcommand 前：
+
+```bash
+stockagent-data \
+  --sync-root /mnt/cold/stockagent-packed \
+  --materialized-root /mnt/hot/stockagent-materialized \
+  status --human
+```
+
+## 資料冷庫完整指令
+
+### `status`：查冷／熱狀態
+
+語法：
+
+```text
+stockagent-data status [DATASET] [--human]
+```
+
+```bash
+# 全部資料集，機器可讀 JSON
+stockagent-data status
+
+# 單一資料集
+stockagent-data status tw-public
+
+# 適合人看的表格
+stockagent-data status --human
+```
+
+狀態含義：
+
+| `STATE` | 含義 | 動作 |
+|---|---|---|
+| `cold-only` | 冷庫完整，尚未解封或已安全回收 | 需要時執行 `use` |
+| `hot-current` | current link 指向最新且 lease 有效 | 可直接使用；`use` 可續租 |
+| `hot-outdated` | 熱資料仍完整，但冷庫有更新版本 | 重新 `use DATASET` |
+| `hot-expired` | lease 已過期，等待安全 GC | 正在使用就 `use` 續租 |
+| `hot-unmanaged` | 有目錄但沒有本工具 lease | 先查來源，不要手動刪除 |
+| `invalid-link` / `broken-link` | current link 不合法或目標不存在 | 先查磁碟與 link，再重新 `use` |
+
+`COLD_PAYLOAD_GB` 是壓縮／packed 冷庫物件大小；`HOT_LOGICAL_GB` 是解封後邏輯
+大小，兩者不可相加當成必然實際占用量，因 sparse file、hard link 與 filesystem
+allocation 可能不同。
+
+### `use`：解封、驗證、切換並續租
+
+語法：
+
+```text
+stockagent-data use DATASET
+  [--snapshot-id ID]
+  [--ttl-days DAYS]
+  [--link PATH ...]
+  [--verify]
+  [--path-only]
+```
+
+```bash
+# 解封 deterministic latest；預設 lease 七天
+stockagent-data use tw-public
+
+# 原子切換既有資料 symlink
+stockagent-data use tw-public \
+  --link /path/to/stockAgent/data_tw_public
+
+# 精確重現指定 release
+stockagent-data use tw-public \
+  --snapshot-id tw-public-YYYYMMDDTHHMMSSZ-l0-NODE-HASH
+
+# 自訂 lease
+stockagent-data use tw-public --ttl-days 14
+
+# 即使已有 READY proof，仍重新逐檔 SHA-256
+stockagent-data use tw-public --verify
+
+# 供 shell command substitution；stdout 只輸出路徑
+data_path="$(stockagent-data use tw-public --path-only)"
+printf 'dataset=%s\n' "$data_path"
+```
+
+工具永遠維護：
+
+```text
+/srv/stockagent-packed-materialized/current/<dataset>
+```
+
+`--link` 只會原子更新 symlink；若目標是實體目錄，工具會拒絕覆蓋。訓練期間不要編輯
+materialized tree；要產生新資料應在 canonical 工作區完成 audit 後重新發布。
+
+### `gc`：清除所有已到期且安全的熱快取
+
+語法：
+
+```text
+stockagent-data gc [--dry-run]
+```
+
+```bash
+stockagent-data gc --dry-run
+stockagent-data gc
+```
+
+正常 GC 只處理 lease 到期的版本。每一個候選仍須同時滿足：cold release 可完整重建、
+READY proof 相符、沒有 pin，而且 `/proc` 中沒有程序的 fd、mmap、cwd、root 或 executable
+指向該 tree。冷庫 `/srv/stockagent-packed` 不會被這個命令刪除。
+
+### `evict`：立即要求回收一個熱快取
+
+語法：
+
+```text
+stockagent-data evict DATASET [--snapshot-id ID] [--dry-run]
+```
+
+```bash
+# 一律先預覽
+stockagent-data evict tw-public --dry-run
+
+# 回收該資料集的安全、未 pin 熱版本
+stockagent-data evict tw-public
+
+# 只選指定 release
+stockagent-data evict tw-public \
+  --snapshot-id tw-public-YYYYMMDDTHHMMSSZ-l0-NODE-HASH
+```
+
+`evict` 會忽略 lease 尚未到期這一項，但不繞過 cold completeness、READY、pin 與
+process-reference 安全檢查。
+
+### `publish-status`：發布前檢查
+
+語法：
+
+```text
+stockagent-data publish-status [DATASET]
+```
+
+```bash
+stockagent-data publish-status
+stockagent-data publish-status tw-public
+```
+
+輸出會列出 catalog source、是否允許發布、active downloader blocker 與 freshness
+狀態。它不修改 head。
+
+### `publish`：發布 audited canonical 資料
+
+語法：
+
+```text
+stockagent-data publish [DATASET] [--all-ready]
+```
+
+```bash
+# 發布單一資料集
+stockagent-data publish tw-public
+
+# 發布 catalog 中所有 present、publishable、inactive 的資料集
+stockagent-data publish --all-ready
+```
+
+`DATASET` 與 `--all-ready` 必須二選一。發布者會讀取 `init` 時保存的永久 node ID；
+若尚未初始化會拒絕發布，不要用環境變數臨時冒用別台機器名稱。
+
+可發布資料集與排除子樹以
+[`configs/data_sync/packed_datasets.json`](configs/data_sync/packed_datasets.json)
+為準。`publish` 不會繞過 active writer、來源穩定性、排除規則或 freshness receipt。
+
+### packed 冷庫底層命令
+
+日常優先使用 `stockagent-data`；需要稽核、精確 pin 或 subtree fetch 時才使用底層入口：
+
+```text
+./scripts/run_packed_snapshot.sh init
+./scripts/run_packed_snapshot.sh publish DATASET SOURCE
+./scripts/run_packed_snapshot.sh resolve DATASET
+./scripts/run_packed_snapshot.sh status DATASET
+./scripts/run_packed_snapshot.sh verify DATASET
+./scripts/run_packed_snapshot.sh fetch DATASET
+./scripts/run_packed_snapshot.sh fetch-subtree DATASET SUBTREE
+./scripts/run_packed_snapshot.sh objects
+```
+
+常用完整範例：
+
+```bash
+# 初始化節點
+./scripts/run_packed_snapshot.sh init \
+  --sync-root /srv/stockagent-packed \
+  --node-id penguin
+
+# 解析 deterministic latest，並寫入精確 pin
+./scripts/run_packed_snapshot.sh resolve tw-public \
+  --sync-root /srv/stockagent-packed \
+  --pin /srv/stockagent-packed-materialized/tw-public.pin.json
+
+# 顯示 winner 與大小；--snapshot-id 可指定歷史版本
+./scripts/run_packed_snapshot.sh status tw-public \
+  --sync-root /srv/stockagent-packed
+
+# 驗 manifest、inventory 與全部 cold objects
+./scripts/run_packed_snapshot.sh verify tw-public \
+  --sync-root /srv/stockagent-packed
+
+# 原子解封整份 release
+./scripts/run_packed_snapshot.sh fetch tw-public \
+  --sync-root /srv/stockagent-packed \
+  --materialized-root /srv/stockagent-packed-materialized \
+  --pin /srv/stockagent-packed-materialized/tw-public.pin.json
+
+# 只解封 release 中一個相對子樹
+./scripts/run_packed_snapshot.sh fetch-subtree tw-public stocks \
+  --sync-root /srv/stockagent-packed \
+  --materialized-root /srv/stockagent-packed-materialized
+
+# 統計 stored、referenced、unreferenced objects；永不刪除
+./scripts/run_packed_snapshot.sh objects \
+  --sync-root /srv/stockagent-packed
+```
+
+底層 `publish` 可調 `--pack-buckets`、`--loose-threshold-mib`、
+`--compression-level`、`--exclude-subtree`、`--maximum-file-bytes`、`--metadata`
+與 `--max-clock-skew-seconds`。正式資料仍應經 catalog 入口，避免漏掉資料集專屬 audit：
+
+```bash
+./scripts/run_packed_snapshot.sh publish DATASET SOURCE \
+  --sync-root /srv/stockagent-packed \
+  --node-id penguin \
   --metadata audit=strict
 ```
 
-Before training, require the dedicated Syncthing folder
-`stockagent-desync` to be `Up to Date` with zero pending items and zero errors.
-Training and resume jobs must read the pinned materialized path, never the live
-source tree or an implicitly re-resolved latest snapshot. See
-`docs/desync_multiwriter_sync.md` for the consistency and recovery contract.
+每個 subcommand 的權威參數表：
 
-## Training
+```bash
+./scripts/run_packed_snapshot.sh init --help
+./scripts/run_packed_snapshot.sh publish --help
+./scripts/run_packed_snapshot.sh resolve --help
+./scripts/run_packed_snapshot.sh status --help
+./scripts/run_packed_snapshot.sh verify --help
+./scripts/run_packed_snapshot.sh fetch --help
+./scripts/run_packed_snapshot.sh fetch-subtree --help
+./scripts/run_packed_snapshot.sh objects --help
+```
 
-- Install dependencies from `requirements.txt` inside the `fintech` environment.
-- Source `scripts/runtime_env.sh` once per shell, then run Python entrypoints with `run_fintech_python`; it discovers the local `fintech` environment without assuming an absolute installation path.
-- Run Taiwan training with `run_fintech_python train.py --config configs/markets/tw.yaml`; outputs go to that market config's `runner.output_dir`.
-- Run the independent Taiwan public-data experiment with `run_fintech_python train.py --config configs/markets/tw_public.yaml`; outputs go to `artifacts/markets/tw_public_official_2005_v1`.
-- Taiwan carrying execution has two explicit phase-action contracts. `tw_cash`
-  emits signed opening- and closing-auction targets while retaining the T+2
-  account ledger. `tw_overnight` emits a next-session exit fraction plus signed
-  open/close entry allocations; every cohort must be closed by the next
-  session's close. Its model head shares one per-symbol entry direction and
-  learns the open/close timing split, preventing an implicit same-day reversal.
-  Both heads use completed daily features through `t-1` plus the dedicated
-  `open[t]/close[t-1]` gap channel. They never see session-`t` high/low/close
-  or full-day volume; phase fill masks and the closing price remain
-  executor-only. Training, tensor backtests, and exact integer-share audit are
-  supported; the existing single-target live preview and portfolio
-  explainability paths reject phase outputs until they have phase-labelled
-  account-state contracts.
-- Run the one-session carrying template with
-  `run_fintech_python train.py --config configs/markets/tw_public_lanten_market_candles_overnight.yaml`.
-- Reproduce the fixed-shape eager/compiled settlement benchmark with
-  `run_fintech_python scripts/benchmark_tw_dual_session_compile.py --symbols 2735 --rows 32 --repeats 7`.
-- `data.use_tw_public_rules` applies official TW execution masks independently from
-  model inputs. TW configs enable it by default and fail fast if the configured
-  public parquet is missing. `configs/markets/tw_public.yaml` additionally enables
-  `data.use_tw_public_features`, appending its `twpub_*` columns to model inputs.
-- Use `data.feature_include` and `data.feature_exclude` to manually switch panel features by exact name or glob pattern, for example `twpub_*` or `*_logret_1d`; leave both empty to keep all features.
-- Or use the project runner: `./coda_runner.sh`.
-- Runner defaults live in each experiment YAML's `runner` section; runtime discovery is centralized in `scripts/runtime_env.sh`.
-- Daily, one-minute, and TX/TXO tick neural modes share the same lifecycle,
-  progress schema, group/fold paths, checkpoints, curves, and report filenames.
-  See [`docs/training_mode_adapter_architecture.md`](docs/training_mode_adapter_architecture.md)
-  for the adapter boundary and completed-artifact contract.
+## 發布新資料
 
-### Multi-GPU market job manager
+### 手動發布
 
-Assign physical GPUs to existing market configs in `configs/gpu_jobs.yaml`, then
-manage all jobs or selected jobs without changing their market/training settings:
+```bash
+stockagent-data publish-status tw-public
+stockagent-data publish tw-public
+./scripts/run_packed_snapshot.sh verify tw-public \
+  --sync-root /srv/stockagent-packed
+```
+
+### 下載成功後才發布
+
+把完整 downloader、build、audit 放在 `--` 後；前段任何命令失敗或被中斷，都不會推進
+head：
+
+```bash
+STOCKAGENT_SYNC_NODE_ID=penguin \
+./scripts/run_downloader_with_release.sh \
+  tw-public /srv/stockagent-packed -- \
+  ./downloader/run_daily_all_markets.sh
+```
+
+penguin 的官方 TW 驗收 service 使用同一原則：主工作成功後才由 `ExecStartPost` 發布
+`tw-public`。若 receipt 的 `end_date` 比冷庫現有版本舊，即使本機 HLC 較新仍拒絕發布。
+
+冷庫物件 GC 目前只有 `objects` 報告，沒有自動刪除。熱快取 GC 不等於冷庫 GC；在所有
+節點 retention 與 manifest 引用關係未確認前，不可手動刪 cold objects。
+
+## Syncthing 驗收
+
+設定存在或 service 顯示 `active` 都不代表同步成功。每個 peer 必須同時滿足：
+
+```text
+folder state       = idle / Up to Date
+needBytes          = 0
+needTotalItems     = 0
+errors             = 0
+pullErrors         = 0
+remoteState        = valid
+```
+
+連線層另看實際 transport，而不是只看設定：
+
+- 優先 `quic-client` / `quic-server`；QUIC 與 TCP 都由 Syncthing TLS 驗證與加密。
+- 多通道必須看實際 connection count；只設 `numConnections` 不代表每條都已建立。
+- 若落到 relay，資料仍加密，但通常吞吐較低。檢查 UDP 22000、防火牆、路由器 port
+  forward；WSL NAT 的 Windows `portproxy` 只處理 TCP，UDP 要用 mirrored networking、
+  Windows 原生 Syncthing，或正確的 UDP forwarding。
+- 公網 IP 會變時保留 `addresses=["dynamic"]`；不要把短期 IP 當永久機器名稱。
+
+Syncthing 顯示完成後仍做內容層驗證：
+
+```bash
+./scripts/run_packed_snapshot.sh verify tw-public \
+  --sync-root /srv/stockagent-packed
+stockagent-data status tw-public
+```
+
+舊 desync store 與 materialized snapshots 已退役並刪除。若要重建資料，只能從
+`/srv/stockagent-packed` 的 manifest/object 驗證後 materialize；不要重新建立
+`/srv/stockagent-sync` 或 `/srv/stockagent-snapshots`。舊流程文件只保留歷史稽核用途。
+
+## Artifacts 同步與去重
+
+資料集與 artifacts 的生命週期不同：資料集是 canonical release；訓練中 artifacts 可能
+持續寫入。可變／大型 artifacts 走 hot transport，已完成 run 的穩定小檔才封成 packed
+cold release。
+
+### cold artifact 完整命令
+
+```text
+scripts/manage_cold_artifacts.py [全域路徑參數] status [DATASET]
+scripts/manage_cold_artifacts.py [全域路徑參數] publish DATASET [--node-id NODE]
+scripts/manage_cold_artifacts.py [全域路徑參數] activate DATASET
+  [--conflict-policy fail|local-wins|packed-wins]
+scripts/manage_cold_artifacts.py [全域路徑參數] rebuild-ignore
+```
+
+```bash
+source scripts/runtime_env.sh
+
+run_fintech_python scripts/manage_cold_artifacts.py status
+run_fintech_python scripts/manage_cold_artifacts.py publish \
+  ARTIFACT_DATASET --node-id penguin
+run_fintech_python scripts/manage_cold_artifacts.py activate \
+  ARTIFACT_DATASET --conflict-policy fail
+run_fintech_python scripts/manage_cold_artifacts.py rebuild-ignore
+```
+
+衝突策略：`fail` 最安全；`local-wins` 保留本機；`packed-wins` 以已驗證 release 覆蓋。
+跨機器首次啟用不可猜測衝突策略，必須依該機器的權威角色選擇。
+
+全域路徑參數為 `--registry`、`--artifact-root`、`--sync-root`、
+`--live-sync-root`、`--state-root`；用 `--help` 查實際預設：
+
+```bash
+run_fintech_python scripts/manage_cold_artifacts.py --help
+run_fintech_python scripts/manage_cold_artifacts.py activate --help
+```
+
+安裝 hot bridge 與檢查：
+
+```bash
+sudo ./scripts/install_hot_artifact_sync_service.sh
+systemctl status stockagent-hot-artifact-sync.service --no-pager
+```
+
+穩定檔案內容去重先 audit，再套用 hard link；它節省 block，不減少 Syncthing 路徑數：
+
+```bash
+source scripts/runtime_env.sh
+
+# 唯讀報告
+run_fintech_python scripts/deduplicate_artifacts.py \
+  --root artifacts \
+  --min-age-hours 24 \
+  --complete-runs-only
+
+# 套用前再次確認報告，再原子 hard-link byte-identical 檔案
+run_fintech_python scripts/deduplicate_artifacts.py \
+  --root artifacts \
+  --min-age-hours 24 \
+  --complete-runs-only \
+  --apply
+
+sudo ./scripts/install_artifact_dedup_service.sh
+```
+
+完整遷移、ignore 與 penguin 衝突權威規則見
+[即時 artifacts 同步](docs/live_artifact_sync.md)。
+
+## 資料下載與更新
+
+### 每日總入口
+
+```bash
+# 前景執行一次所有啟用市場
+bash downloader/run_daily_all_markets.sh
+
+# 背景排程；不要用無參數呼叫
+bash downloader/daily_downloader_daemon.sh start
+bash downloader/daily_downloader_daemon.sh status
+bash downloader/daily_downloader_daemon.sh restart
+bash downloader/daily_downloader_daemon.sh stop
+```
+
+常用開關：
+
+```bash
+DAILY_PARALLEL_GROUPS=0 bash downloader/run_daily_all_markets.sh
+RUN_TW_PUBLIC_DATA=0 bash downloader/run_daily_all_markets.sh
+RUN_TW_PUBLIC_FEATURES=0 bash downloader/run_daily_all_markets.sh
+RUN_FRANKFURTER=0 bash downloader/run_daily_all_markets.sh
+RUN_CEX_PERP=0 bash downloader/run_daily_all_markets.sh
+RUN_DATA_QUALITY_AUDIT=1 bash downloader/run_daily_all_markets.sh
+```
+
+### 台灣官方資料
+
+```bash
+source scripts/runtime_env.sh
+
+# 新機器建立 verified baseline
+run_fintech_python downloader/download_tw_official_data.py \
+  --mode rebuild \
+  --stage-root artifacts/data_rebuild/tw_2000_bootstrap \
+  --promote
+
+# 修復與每日增量
+run_fintech_python downloader/download_tw_official_data.py --mode repair
+run_fintech_python downloader/download_tw_official_data.py --mode daily
+
+# 顯示低階資料集 manifest
+run_fintech_python downloader/download_tw_public_data.py \
+  --mode list --datasets all
+
+# 建立訓練 feature parquet
+run_fintech_python scripts/build_tw_public_training_features.py \
+  --input-dir data_tw_public \
+  --output-path data_tw_public/features/tw_public_stock_daily.parquet \
+  --symbols-root data_tw_public/stocks
+```
+
+完整 rebuild、repair、rate limit 與 receipt 規則見
+[台灣公開資料續傳文件](docs/tw_public_download_resume_and_rate_limits.md)。
+
+### Yahoo、外匯與加密市場
+
+```bash
+source scripts/runtime_env.sh
+
+run_fintech_python downloader/download_yahoo_ohlcv.py --mode incremental --asset all
+run_fintech_python downloader/download_yahoo_ohlcv.py --mode repair --asset all
+run_fintech_python downloader/download_forex_frankfurter.py \
+  --mode daily-update --output-dir data_yahoo/forex
+
+run_fintech_python downloader/download_okx_perp_1m.py --mode incremental
+run_fintech_python downloader/download_bybit_perp_1m.py --mode incremental
+run_fintech_python downloader/download_binance_perp_1m.py --help
+```
+
+首次全量、日期範圍、worker 與 provider-specific 選項請直接看各 downloader `--help`；
+不要從其他 provider 猜相同旗標。
+
+### 一分鐘與衍生品資料
+
+```bash
+source scripts/runtime_env.sh
+run_fintech_python downloader/download_shioaji_tw_minute_kbars.py --help
+run_fintech_python scripts/build_shioaji_tw_minute_dataset.py --help
+run_fintech_python downloader/stream_shioaji_tw_microstructure.py --help
+run_fintech_python downloader/stream_shioaji_taifex_bidask.py --help
+```
+
+資料粒度、即時 Tick/BidAsk 與歷史 KBar 的邊界見
+[TW minute 研究](docs/tw_minute_kbar_research.md) 與
+[Shioaji HFT 資料](docs/shioaji_hft_dataset.md)。
+
+## 訓練、GPU 與解釋
+
+### 單一訓練
+
+```bash
+source scripts/runtime_env.sh
+run_fintech_python scripts/check_environment.py --require-cuda --strict
+
+run_fintech_python train.py --config configs/markets/tw.yaml
+run_fintech_python train.py --config configs/markets/tw_public.yaml
+
+# 帶環境檢查的 runner
+./coda_runner.sh -c configs/markets/tw.yaml
+./coda_runner.sh --help
+```
+
+市場、資料範圍、execution mode、模型、loss、checkpoint 與 output root 都以該次 YAML
+為準，不要只看 README 的範例推測實驗契約。
+
+### 多 GPU job manager
+
+先編輯 `configs/gpu_jobs.yaml`，再使用：
 
 ```bash
 source scripts/runtime_env.sh
@@ -169,453 +717,145 @@ run_fintech_python scripts/manage_gpu_jobs.py restart crypto
 run_fintech_python scripts/manage_gpu_jobs.py stop us crypto
 ```
 
-Each job is launched in its own process session with `CUDA_VISIBLE_DEVICES` set
-from its `gpus` list. A multi-GPU job can use `gpus: [2, 3]`; its referenced
-market config must also select the appropriate multi-GPU strategy. Runtime PID
-state and launcher logs are stored under `artifacts/gpu_jobs` by default.
+單一 job 直接使用多 GPU 時，可由市場 config 的
+`training.multi_gpu_strategy: auto` 配合可見 GPU 數自動選單卡或 DDP。不要另外建立第二套
+loss/backtest executor。
 
-Market configs default to `training.multi_gpu_strategy: auto`: one visible GPU
-uses the canonical single-device executor, while two or more visible GPUs
-automatically relaunch one DDP rank per GPU. The manager controls visibility, so
-`gpus: [0, 1, 2, 3]` makes the same market config use four-way DDP.
-`configs/markets/tw_parallel.yaml` inherits `tw.yaml`, and
-`configs/gpu_jobs_tw_parallel.yaml` exposes GPUs 0 and 1 to that one DDP job:
-
-```bash
-run_fintech_python scripts/manage_gpu_jobs.py validate \
-  --config configs/gpu_jobs_tw_parallel.yaml
-run_fintech_python scripts/manage_gpu_jobs.py start \
-  --config configs/gpu_jobs_tw_parallel.yaml
-```
-
-Two-GPU US DDP is preconfigured in `configs/gpu_jobs_us_ddp.yaml`. Stop any
-existing processes using GPUs 0 and 1, then validate and start the single DDP
-job:
-
-```bash
-run_fintech_python scripts/manage_gpu_jobs.py validate \
-  --config configs/gpu_jobs_us_ddp.yaml
-run_fintech_python scripts/manage_gpu_jobs.py start \
-  --config configs/gpu_jobs_us_ddp.yaml
-run_fintech_python scripts/manage_gpu_jobs.py status \
-  --config configs/gpu_jobs_us_ddp.yaml
-```
-- Outputs include one folder per walk-forward fold and a top-level `summary.json`.
-- Neural models use one lazy-window executor per process: either one device or one
-  process per GPU through torchrun DDP. Contiguous fixed-shape batches use the
-  panel-slab forward when supported; guarded in-executor window materialization
-  handles unsupported/non-contiguous/auxiliary cases. LightGBM/XGBoost keep their
-  separate CPU materialized route because they are a different algorithm family.
-- `trading.reporting_leverage` does not alter canonical train/validation/test
-  exposure or integer-share execution. It only creates separate `leverage_*`
-  reporting plots, recomputing turnover and fees after scaling weights.
-- The latest experimental fold intentionally has validation/test overlap when
-  `walk_forward.require_future_test_year: false`. With lookback 32, each split also
-  intentionally discards its first 31 trading rows so its first sample owns a full
-  in-split window. These are deliberate experiment semantics; do not normalize
-  either behavior away.
-
-## Market Data Downloads
-
-For the registered Dune on-chain and SEC/crypto-ETF issuer history pipelines,
-including `.env` placement, point-in-time rules, resumable receipts, and panel
-status, see [docs/dune_sec_crypto_etf_history.md](docs/dune_sec_crypto_etf_history.md).
-For every reserved public-data credential field, its canonical storage location,
-registration link, and secret-free audit contract, see
-[docs/data_api_credentials.md](docs/data_api_credentials.md).
-
-- Source `scripts/runtime_env.sh` first and use `run_fintech_python` for every Python entrypoint; bare `python` is not a supported runtime selector for this repository.
-- Run `run_fintech_python downloader/download_yahoo_ohlcv.py` to download four separate folders under `data_yahoo/`: `tw_stocks/`, `us_stocks/`, `crypto/`, and `forex/`.
-- The downloader defaults to `2000-01-01` through today.
-- Symbol downloads are parallelized with `--workers` (within each asset); when using `--asset all`, you can also parallelize assets via `--asset-workers`.
-- Taiwan symbols are loaded from `data_parquet/symbols.csv` when available; otherwise they are fetched from TWSE ISIN listed (`strMode=2`) and OTC (`strMode=4`) lists.
-- Taiwan delisted candidates are also included by default (`--include-tw-delisted`) and attempted with `.TW` / `.TWO` style Yahoo tickers.
-- U.S. symbols are loaded from Nasdaq Trader symbol directories (`nasdaqlisted.txt` and `otherlisted.txt`) with static fallback.
-- U.S. delisted symbols can be included from Alpha Vantage `LISTING_STATUS` when `ALPHAVANTAGE_API_KEY` (or `--alpha-vantage-api-key`) is provided.
-- Crypto symbols are loaded from CoinGecko `/coins/list` and mapped to Yahoo format `${SYMBOL}-USD`.
-- Forex symbols are loaded from Yahoo Finance currencies page tickers (with static fallback when rate-limited).
-- Pepperstone-style FX universe is available via `configs/forex_pepperstone_pairs.txt` and can be downloaded to `data_yahoo/forex_pepperstone/`.
-- Use `run_fintech_python downloader/download_yahoo_ohlcv.py --asset tw_stocks` to download only Taiwan stocks.
-- Use `run_fintech_python downloader/download_alpaca_us_ohlcv.py --mode daily-update` to refresh the expanded U.S. stock universe from Alpaca Market Data into `data_yahoo/us_stocks`. Set `APCA_API_KEY_ID` and `APCA_API_SECRET_KEY` first.
-- The Alpaca downloader batches many symbols into each paginated request. Basic accounts use the exact `200 requests/minute` limit by default; set `ALPACA_REQUESTS_PER_MINUTE=10000` for Algo Trader Plus.
-- Use `run_fintech_python downloader/download_cboe_us_ohlcv.py --mode daily-update` when Cboe delayed historical OHLCV is preferred as an alternative U.S. source.
-- The old Yahoo U.S. path remains available with `run_fintech_python downloader/download_yahoo_ohlcv.py --asset us_stocks`, but daily automation defaults to Alpaca because Yahoo often rate-limits large U.S. refreshes.
-- Yahoo crypto is a manual gap-diagnostic fallback only; registered automation uses exchange-native data and does not run a duplicate Yahoo crypto bulk archive.
-- If explicitly needed, `run_fintech_python downloader/download_yahoo_ohlcv.py --asset crypto --mode incremental` refreshes its rolling one-minute fallback under `data_yahoo/crypto/1m`; legacy daily or 15-minute files are never merged into that directory.
-
-### Canonical crypto acquisition
-
-`configs/crypto_data_acquisition.json` is the value-ranked fact registry and
-`configs/crypto_source_allocation.json` assigns exactly one canonical owner or
-fallback role to each fact. Different venues remain different markets; a
-fallback fills missing canonical keys and never creates a parallel duplicate
-archive.
-
-Put keyed-provider credentials in the repository `.env` using the names in
-`.env.example`, then run:
+### 解釋性分析
 
 ```bash
 source scripts/runtime_env.sh
-run_fintech_python downloader/download_crypto_keyed_context.py
-run_fintech_python downloader/download_free_public_context.py
-run_fintech_python downloader/download_coinmetrics_community.py
-```
-
-The keyed runner loads only its explicit allowlist and never publishes secret
-values. CoinGecko owns asset identity and aggregate market snapshots;
-CoinMarketCap is fallback/QA only. Dune requires saved query contracts in
-`configs/dune_crypto_queries.json`, and CoinGlass/Etherscan are not treated as
-usable merely because a key is present. Compact outputs live under
-`data_crypto_reference`, `data_free_public`, and `data_coinmetrics_community`.
-Binance spot and dated-futures one-minute history now use the official public
-archive and require no API key. Always plan the exact S3 object set and capacity
-before starting the resumable checksum-verified download:
-
-```bash
-source scripts/runtime_env.sh
-run_fintech_python downloader/download_binance_public_archive.py --mode plan
-run_fintech_python downloader/download_binance_public_archive.py --mode download
-```
-
-The canonical key is `(market, symbol, open_time)`. Daily objects override
-monthly objects, 2025+ Spot microsecond timestamps are normalized to
-milliseconds, and semantically invalid monthly partitions are quarantined and
-rebuilt from their complete daily object set instead of rounding timestamps.
-`scripts/install_registered_data_refresh_services.sh` installs the daily 12:30
-Asia/Taipei timer. Full trade-tick/L2/liquidation capture remains separately
-capacity-gated because its retention cost is materially larger than one-minute
-bars.
-
-### Taiwan full-market one-minute Kbar research
-
-The Shioaji minute-research pipeline covers every stock and ETF in the Taiwan
-public universe while remaining separate from the Tick/BidAsk HFT capture.
-It uses resumable `api.kbars()` chunks, causal next-bar execution labels,
-Taiwan day-trade costs, and chronological validation. The default research mode
-recomputes a stateful target after every completed one-minute Kbar, executes only
-the target-position delta at the next minute open, carries positions between
-minutes, and forces the portfolio flat before the session ends. See
-[`docs/tw_minute_kbar_research.md`](docs/tw_minute_kbar_research.md) for the
-full data contract, backfill service, audit, and strategy commands.
-
-The neural walk-forward path uses the same top-level entry point as daily
-experiments, but dispatches to a separate causal minute executor:
-
-```bash
-source scripts/runtime_env.sh
-run_fintech_python train.py --config configs/markets/tw_minute.yaml
-```
-
-On the dual-RTX-5090 host, train one fold cooperatively with both GPUs using
-`bash scripts/run_tw_minute_dual_5090.sh --start-fold 1`. This is within-fold
-DDP, not fold-parallel execution. The config inherits the FinancialTransformer
-architecture and general training policy from
-`configs/markets/tw_public_lanten_market_candles.yaml`; only the minute data and
-execution contract plus the measured dual-GPU capacity settings are overridden.
-It is a long/short contract: sell-first allocation is restricted by exact-day
-official eligibility and the preceding session's official short-capacity
-evidence, with missing evidence failing closed.
-Its trading rules otherwise match the ordinary day-trade baseline: raw signed
-scores with gross L1 exposure 1.0 and no de-meaning, NT$10 million initial
-capital, 50% KBar volume participation, normal fees/tax, zero extra slippage,
-and no outside-cash, per-order-notional, or per-name ceiling. The model sees
-ten one-minute microstructure fields plus fifteen pure OHLCV/candlestick fields
-rebuilt from the developing session candle after every completed minute. The
-remaining 84 point-in-time daily fields are projected once and fused into every
-minute token, preserving the complete inherited 99-feature contract without
-repeating wide daily tensors across all 270 bars.
-Executor eligibility and capacity masks
-run after the model allocation, so blocked or unfilled exposure also stays cash
-instead of being redistributed.
-
-- Use `run_fintech_python downloader/download_yahoo_ohlcv.py --asset forex` to download only the expanded FX universe.
-- Use `run_fintech_python downloader/download_forex_pepperstone.py` to download the Pepperstone-style FX universe.
-- Use `run_fintech_python downloader/download_forex_pepperstone.py --mode repair` to repair stale/missing Pepperstone forex files.
-- Use `run_fintech_python downloader/download_forex_pepperstone.py --mode daily-update` for daily incremental updates.
-- Use `run_fintech_python downloader/download_pepperstone.py` to download grouped Pepperstone-style data to `data_peperstone/24hTrading`, `data_peperstone/commodites`, `data_peperstone/crypto`, and `data_peperstone/fores`.
-- Use `run_fintech_python downloader/download_pepperstone.py --groups crypto fores` to download only selected groups.
-- Use `run_fintech_python downloader/download_pepperstone.py --mode daily-update --groups all` for daily incremental updates across groups.
-- Use `run_fintech_python downloader/download_okx_perp_1m.py --output-dir data_okx/1m` to download all OKX perpetual swap one-minute bars.
-- Use `run_fintech_python downloader/download_okx_perp_1m.py --start-date 2020-01-01 --workers 6` to control download range and parallelism.
-- Use `run_fintech_python downloader/download_okx_perp_1m.py --mode incremental` for incremental updates (only missing one-minute candles).
-- Use `run_fintech_python downloader/download_okx_perp_1m.py --mode full --refresh` when you need a full re-download.
-- Use `run_fintech_python downloader/download_bybit_perp_1m.py --output-dir data_bybit/1m` to download Bybit perpetual swap one-minute bars.
-- Use `run_fintech_python downloader/download_bybit_perp_1m.py --categories linear inverse --start-date 2020-01-01 --workers 6` to control Bybit categories, range, and parallelism.
-- Use `run_fintech_python downloader/download_bybit_perp_1m.py --mode incremental` for incremental updates (only missing one-minute candles).
-- Use `run_fintech_python downloader/download_forex_frankfurter.py --mode daily-update --output-dir data_yahoo/forex` for daily incremental FX updates from Frankfurter.
-- Each asset folder includes `symbols.csv`, `download_report.csv`, and `download_summary.json` alongside `*_features.parquet` files.
-- Parquet output includes at least `date`, `open`, `max`, `min`, `close`, `adjclose`, `Trading_Volume`, and also preserves extra Yahoo columns when available (for example `Dividends`, `Stock Splits`).
-- Override the default universe with `--symbols` or `--symbols-file`, for example `run_fintech_python downloader/download_yahoo_ohlcv.py --asset forex --symbols EURUSD GBPUSD USDJPY`.
-- Use `run_fintech_python downloader/download_yahoo_ohlcv.py --mode incremental --asset all` for incremental updates across Yahoo assets; crypto uses one-minute bars while stocks and FX remain daily.
-
-## Taiwan Public Data Download
-
-- Use `run_fintech_python downloader/download_tw_official_data.py --mode rebuild|repair|daily` as the canonical TWSE/TPEx-first data-layer entry point. `rebuild` stages an atomic replacement, `repair` checks and fills historical gaps, and `daily` requires a verified baseline. From 2000 onward, the default audited Yahoo archive fills only missing stock/ETF OHLCV keys; official rows always win and row-level lineage is retained. Use `--ohlcv-fallback none` to disable it.
-- The source archive retains receipt-backed rows from 2000, but the certified model panel starts at `2005-01-01` (`2005-01-03` is the first session). Official archives and terminal Yahoo receipts prove that 80 companies delisted by `2004-04-28` cannot be reconstructed without fabrication; starting with the first complete calendar year keeps that unavailable cohort outside the model horizon. `configs/markets/tw*.yaml` enforce this with `data.panel_start_date` and a 2005 walk-forward identity.
-- A promoted rebuild is training-eligible only when both the staged and post-promote strict audits report `model_safe: true`. The durable production check is `artifacts/data_rebuild/<run>/audit_post_promote/summary.json`.
-- On a new machine, run `run_fintech_python downloader/download_tw_official_data.py --mode rebuild --stage-root artifacts/data_rebuild/tw_2000_bootstrap --promote`. Reuse the same stage path after a rate-limited retry so completed symbols are skipped. To reuse existing Yahoo TW files, add `--yahoo-fallback-dir data_yahoo/tw_stocks --skip-yahoo-download`.
-- With `--ohlcv-fallback yahoo`, the canonical runner builds
-  `data_tw_public/tw_transfer_adjustment_reference.parquet` before projecting the
-  Yahoo archive. This receipt-verified artifact supplies an adjustment factor
-  only for an exact `date + symbol` match on a canonical Yahoo source's first
-  retained row when its original factor is null. Coverage, input/output
-  receipts, raw official request receipts, candidate keys, and
-  reference-to-applied row counts are fail-closed. Its official requests share
-  the `tw_public` global limiter; when `--request-interval` is omitted the core
-  default is 10 requests/second. The artifact is not built or consulted with
-  `--ohlcv-fallback none`.
-- The high-level daily update also maintains official delisted-company histories in `twse_delisted_company.parquet` and `tpex_delisted_company.parquet`. For source diagnostics only, the low-level `download_tw_public_data.py --mode repair --datasets delisted` command can restrict the request to those tables.
-- Backfill point-in-time delisting and short-sale/cover announcements separately:
-  `run_fintech_python downloader/download_tw_short_sale_restrictions.py --output-dir data_tw_public --start-year 1995 --end-year "$(date +%Y)"`.
-  The downloader writes `tw_short_sale_download_report.json` and refuses to replace
-  the parquet outputs after an incomplete request unless `--allow-partial` is
-  explicitly supplied.
-- The low-level source downloader exposes `--datasets model_useful` for diagnostics. This group archives 117 point-in-time snapshots covering financial statements and monthly revenue, ownership and institutional flows, company/lifecycle events, shorting and securities-lending inputs, corporate actions, market-state rules, calendars, and index/constituent data. It intentionally excludes intraday leaderboards, broker rankings, auction-frequency-only feeds, warrants, bonds, gold, and funds.
-- Run `repair` or `rebuild` before the first `daily` update. Daily mode never treats a few recent rows as a complete historical database.
-- Snapshot-style OpenAPI feeds that only publish the latest table are stored with a `date` batch column, so daily runs accumulate same-day-replaced snapshots instead of discarding prior days.
-- Government Data Platform datasets are resolved through `data.gov.tw` metadata at runtime, then written to parquet with raw metadata under `data_tw_public/metadata/`.
-- Use tags to limit scope, for example `--datasets price`, `--datasets twse tpex`, `--datasets macro`, `--datasets taifex tdcc`, or a concrete dataset such as `twse_daily_ohlcv`.
-- Use `--mode list --datasets all` to print the bundled dataset manifest.
-- Outputs include one parquet per dataset, raw responses under `raw/` unless `--skip-raw` is set, plus `download_report.csv`, `download_summary.json`, and `dataset_manifest.json`.
-- Historical backfills use both dataset-level concurrency (`--workers`) and date-level concurrency (`--date-workers`), and periodically flush partial parquet output with `--flush-every-dates` so long first runs can resume.
-- For a smoke run, use `--start-date 2024-06-03 --end-date 2024-06-03 --datasets twse_daily_ohlcv tpex_daily_ohlcv --skip-raw`.
-- Build the training feature parquet with `run_fintech_python scripts/build_tw_public_training_features.py --input-dir data_tw_public --output-path data_tw_public/features/tw_public_stock_daily.parquet --symbols-root data_tw_public/stocks`.
-- Run that rebuild after updating the dedicated restriction archive. The generated
-  rule columns keep `can_sell_mask` (may reduce an owned long) separate from
-  `can_short_open_mask` (may open/increase a borrowed short). Ordinary halts,
-  missing/zero-volume rows, and price-limit blocks freeze positions; only an
-  explicit official permanent-exit event sets `force_exit_mask` and settles the
-  position with the applicable buy/sell fee.
-- Venue migration is not terminal: official `櫃轉市` rows and immediate
-  same-symbol continuation do not trigger a synthetic liquidation. Sparse
-  official daily snapshots are not interpreted as halts across long coverage
-  gaps; explicit halt/resume notices remain authoritative.
-- The feature parquet is a sparse `date` x `symbol` long table. Stock-specific rows align by ticker/date; macro/TAIFEX market rows use symbol `__MARKET__` and are broadcast to all stocks during panel build.
-- Its `date` is the conservative availability date: daily market tables use trading date, TDCC uses data date plus a safety lag, monthly/quarterly macro uses period end plus lag when no explicit release date exists, and event tables use announcement/report date or downloader as-of date.
-- `downloader/run_daily_all_markets.sh` and `downloader/daily_downloader_daemon.sh` update the restriction archive and then rebuild `data_tw_public/features/tw_public_stock_daily.parquet` by default. The TW stage uses `TW_PUBLIC_OHLCV_FALLBACK=yahoo` and `TW_PUBLIC_FALLBACK_START_DATE=2000-01-01` by default. Set `RUN_TW_SHORT_RESTRICTIONS=0` to skip the dedicated rules update, `RUN_TW_PUBLIC_DATA=0` to skip raw public data, `RUN_TW_PUBLIC_FEATURES=0` to skip feature rebuild, or `TW_PUBLIC_SKIP_RAW=1` when raw response archives are not needed.
-
-### Repair Mode
-
-- Use `run_fintech_python downloader/download_yahoo_ohlcv.py --mode repair --asset all` to check all assets and repair missing/stale parquet files toward today.
-- Repair mode checks each symbol file for existence, latest date, and required schema columns (`date/open/max/min/close/adjclose`); missing/broken/stale/schema-mismatch symbols are repaired automatically.
-- Repair outputs include top-level `repair_summary.json` and per-asset `repair_report.csv`.
-- Adjust overlap with `--repair-overlap-days` (default `7`) to re-fetch a small trailing window before the local last date.
-- If Yahoo returns `possibly delisted; no timezone found`, that ticker is automatically appended to per-asset `yahoo_blacklist.txt` and skipped in later runs.
-- Successfully downloaded Yahoo tickers are persisted into per-asset `yahoo_whitelist.txt`.
-
-### Daily All-Market Update
-
-- Use `bash downloader/run_daily_all_markets.sh` to run daily updates across all configured markets.
-- Use `bash downloader/daily_downloader_daemon.sh start` for unattended market-close updates and `bash downloader/daily_downloader_daemon.sh status` to verify the scheduler. Taiwan updates start at 13:40 Asia/Taipei by default, after the 13:30 close. The TW pipeline retries the complete official-data build with `TW_PUBLIC_PIPELINE_ATTEMPTS` and `TW_PUBLIC_PIPELINE_RETRY_SECONDS`; a market date is marked complete only after the strict TW audit succeeds.
-- The script runs the configured source-of-truth feeds independently: Alpaca `us_stocks`, Taiwan TWSE/TPEx public data, Frankfurter forex, and OKX/Bybit/Binance perpetual one-minute updates. Providers without a shared quota run in parallel; each provider still obeys its own official limiter.
-- Independent provider groups run concurrently by default; set `DAILY_PARALLEL_GROUPS=0` to force the old serial order.
-- Set `RUN_TW_PUBLIC_DATA=0` to skip the Taiwan public data downloader. The first enabled run may backfill many historical official-data dates.
-- Set `RUN_TW_PUBLIC_FEATURES=0` to skip rebuilding `data_tw_public/features/tw_public_stock_daily.parquet`.
-- Set `RUN_PEPPERSTONE_GROUPS=1` to also run Pepperstone grouped fallback/research downloads.
-- Set `RUN_FRANKFURTER=0` to skip Frankfurter cross-rate updates.
-- Set `RUN_CEX_PERP=0` to skip OKX/Bybit updates.
-- Full data-quality audit is opt-in because it scans parquet roots; set `RUN_DATA_QUALITY_AUDIT=1` when you want that check after downloads.
-- Alpaca U.S. updates are capped by `ALPACA_US_STEP_TIMEOUT_SECONDS` (default `1800`). Tune throughput with `ALPACA_US_BATCH_SIZE`, `ALPACA_US_WORKERS`, `ALPACA_US_METADATA_WORKERS`, and the exact plan limit in `ALPACA_REQUESTS_PER_MINUTE`.
-- Set `WORKERS`, `ALPACA_US_WORKERS`, `ASSET_WORKERS`, `PEPPERSTONE_WORKERS`, `OKX_WORKERS`, `BYBIT_WORKERS`, and `REPAIR_OVERLAP_DAYS` via environment variables to tune speed.
-
-## Live Signal And Discord Bot
-
-- Each market has one YAML file under `services/discord_bot/markets/`, for example `services/discord_bot/markets/tw.yaml`.
-- Run a local live signal from a market config:
-  `run_fintech_python scripts/live_signal.py --market-config services/discord_bot/markets/tw.yaml --price-source panel`
-- Leave `fold_id` empty/null in the market YAML to discover the latest `fold_*/checkpoint_best.pt` under that market's `output_dir`.
-- Use `--price-source csv --prices-csv path/to/prices.csv` for current-price mark-to-market. The CSV must include `symbol`/`code`/`ticker` and `price`/`close`/`last` columns.
-- Per-market output is written under the market YAML's `live_output_dir`, for example `artifacts/live_signals/tw/YYYY-MM-DD/`:
-  `summary.json`, `discord_message.md`, `target_weights.parquet`,
-  `target_positions.md`, `rebalance.parquet`, `rebalance.md`,
-  `decision_explanations.parquet`, `decision_explanations.md`,
-  `decision_report.md`, and `model_explanation.json`.
-- The Discord bot entrypoint is `services/discord_bot/bot.py`; configure it with `DISCORD_BOT_TOKEN`, `DISCORD_CHANNEL_ID`, `STOCKAGENT_MARKETS_DIR`, and `STOCKAGENT_DEFAULT_MARKET`.
-- `services/discord_bot/bot.py` includes a reload supervisor by default: watched
-  file changes restart the child bot process 10 seconds after the last update.
-  Set `STOCKAGENT_BOT_RELOAD=0` to run without the supervisor.
-- The bot exposes `/signal_now`, `/positions`, `/rebalance`,
-  `/portfolio_history`, `/stock_history`, `/explain_signal`, `/markets`, and
-  `/health`; market-aware commands accept a `market` option. `/positions`,
-  `/rebalance`, `/portfolio_history`, `/stock_history`, and `/explain_signal`
-  use paged Discord responses so long lists are not truncated.
-  `/portfolio_history market:tw days:32 current_capital:1000000` shows recent
-  PnL, current exposure, and holding changes from fold artifacts scaled to the
-  supplied capital. Daily markets use days; crypto can set
-  `history_frequency: bar` to show one-minute bars. `/stock_history market:tw
-  symbol:2330 limit:32` shows recent per-symbol trade/adjustment records.
-  `/positions` and `/rebalance` accept `current_capital` to estimate
-  current/target/trade amounts.
-  `/set_capital` stores per-market default capital. `/explain_signal` can
-  filter by symbol/action, sort by delta/score/target/return/rank, and
-  optionally attach the full markdown decision report.
-- Crypto Discord scheduling can use `schedule_interval_minutes: 15` plus a
-  `pre_signal_command` data updater so each completed one-minute bar is fetched
-  before the bot sends the next signal. For manual testing, run
-  `/signal_now market:crypto refresh_data:true`.
-- `/signal_now` with `price_source:auto` now treats open markets as realtime:
-  it runs the configured updater when available and uses current prices; closed
-  markets use the latest panel close.
-- Set `STOCKAGENT_SCHEDULED_MARKETS=all` to schedule every configured Discord
-  market YAML.
-
-## Environment
-
-- Conda or mamba environment: `fintech`
-- Training target: CUDA with Tensor Core acceleration
-- Recommended repository command: `source scripts/runtime_env.sh`; then use `run_fintech_python <script> ...`.
-- All repository shell entrypoints use the same runtime resolver. It selects the
-  `fintech` environment and normalizes `CONDA_PREFIX`, `PATH`, and CUDA roots so
-  an IDE/CI parent environment cannot leak into the run. Use an explicit
-  `FINTECH_ENV_PATH=/path/to/fintech` or `PYTHON_BIN=/path/to/python` on machines
-  with a nonstandard layout.
-
-```bash
-source scripts/runtime_env.sh
-run_fintech_python scripts/check_environment.py --require-cuda
-run_fintech_python train.py --config configs/experiment_baseline.yaml
-```
-
-The environment checker prints the selected Python/CUDA roots, inherited values
-before normalization, tool paths, package versions, and GPU inventory. Add
-`--strict` when warnings (including a non-`fintech` prefix) should fail CI.
-
-The commands below this point are operator notes from specific machines. Treat
-them as examples, not as a reproducible environment lock or a safe unattended
-upgrade procedure. Prefer the scripts and checked-in market configs above.
-
-To recreate or update the environment:
-
-```bash
-mamba env export -n fintech --no-builds > fintech_environment.yml
-mamba create -n fintech python=3.12
-mamba env update -n fintech -f fintech_environment.yml
-
-mkdir -p "$CONDA_PREFIX/conda-meta"
-nano "$CONDA_PREFIX/conda-meta/pinned"
-```
-
-Example `conda-meta/pinned` contents:
-
-```text
-rapids>0.0.1
-cuda-version >=13,<14
-python=3.12
-pydantic >=2.13.4
-transformers >= 5.12.1
-```
-
-7z x data_tw_public.7z
-
-sudo apt update && sudo apt full-upgrade -y && sudo apt autoremove -y && sudo snap refresh
-cd /root/stockAgent
-mamba activate fintech
-mamba update --all
-
-
-
-mamba activate fintech
-scripts/run_openbb_archive_until_complete.sh
-
-
-# train
-
-cd /root/stockAgent
-mamba activate fintech
-source scripts/runtime_env.sh
-CUDA_VISIBLE_DEVICES=0,1 run_fintech_python train.py   --config configs/markets/tw_public_lanten_market_candles_select.yaml --multi-gpu-strategy distributed_data_parallel
-
-# explain 只有feature
-cd /root/stockAgent
-source scripts/runtime_env.sh
-
 run_fintech_python scripts/check_environment.py --require-cuda --strict
 
-export CUDA_VISIBLE_DEVICES=0,1
-export OMP_NUM_THREADS=16
-export MKL_NUM_THREADS=16
-export POLARS_MAX_THREADS=16
+# 先看當前完整參數，避免沿用舊機器 scratchpad
+run_fintech_python scripts/screen_explainability_features.py --help
+run_fintech_python explain_model.py --help
 
-run_fintech_python -m torch.distributed.run \
-  --standalone \
-  --nnodes=1 \
-  --nproc-per-node=2 \
-  scripts/screen_explainability_features.py \
-  --config configs/markets/tw_public_lanten_market_candles.yaml \
+# 最小入口範例
+run_fintech_python explain_model.py \
+  --config configs/markets/tw_public.yaml \
   --device cuda \
-  --cpu-threads 16 \
-  --row-chunk-size 16 \
   --amp-dtype bf16 \
-  --ig-steps 8 \
-  --ig-batch-size 2 \
-  --no-reuse-complete-explainability \
-  --progress \
-  --negligible-uniform-fraction 0.1
+  --plots
+```
 
-  # 全出
-  cd /root/stockAgent
+分散式 explainability 必須依實際 GPU、VRAM 與 config 重新決定
+`--nproc-per-node`、chunk size、IG/SHAP 參數，不把單台機器的舊數字當固定基線。
+
+## 即時訊號與服務
+
+本機產生訊號：
+
+```bash
 source scripts/runtime_env.sh
+run_fintech_python scripts/live_signal.py \
+  --market-config services/discord_bot/markets/tw.yaml \
+  --price-source panel
+```
 
-run_fintech_python scripts/check_environment.py --require-cuda --strict
+Discord bot 入口：
 
-export CUDA_VISIBLE_DEVICES=0,1
-export OMP_NUM_THREADS=16
-export MKL_NUM_THREADS=16
-export POLARS_MAX_THREADS=16
+```bash
+source scripts/runtime_env.sh
+run_fintech_python services/discord_bot/bot.py
+```
 
-run_fintech_python -m torch.distributed.run \
-  --standalone \
-  --nnodes=1 \
-  --nproc-per-node=2 \
-  explain_model.py \
-  --config configs/markets/tw_public_lanten_market_candles_day_trade_2006plus.yaml/
-  --device cuda \
-  --cpu-threads 16 \
-  --max-rows 0 \
-  --row-chunk-size 16 \
-  --amp-dtype bf16 \
-  --no-compile-model \
-  --ig-steps 8 \
-  --ig-batch-size 2 \
-  --sample-method even \
-  --perturb \
-  --perturb-batch-size 2 \
-  --perturb-max-auto-batch-size 32 \
-  --perturb-max-input-elements 536870912 \
-  --counterfactual-compile \
-  --j-lens \
-  --j-lens-vjp-batch-size 16 \
-  --shap \
-  --regime-analysis \
-  --fold-stability \
-  --umap \
-  --umap-max-points 0 \
-  --umap-max-projections 0 \
-  --umap-n-neighbors 16 \
-  --plot-backend rapids_datashader \
-  --plots \
-  --standard-plots \
-  --plot-theme paper \
-  --report-style paper \
-  --no-interactive-plots \
-  --strict-no-fallback \
-  --progress
+需要 `DISCORD_BOT_TOKEN`、`DISCORD_CHANNEL_ID`、`STOCKAGENT_MARKETS_DIR` 與
+`STOCKAGENT_DEFAULT_MARKET`。市場 YAML 決定 checkpoint discovery、資料更新器與
+`live_output_dir`。
 
+systemd 服務一律用同一組操作方式；以下以 Shioaji top-200 為例：
 
-
-# shioaji
-
-# 查看狀態
-systemctl status stockagent-shioaji-top200.service
-
-# 即時查看 log
+```bash
+systemctl status stockagent-shioaji-top200.service --no-pager
 journalctl -u stockagent-shioaji-top200.service -f
-
-# 重新啟動
 systemctl restart stockagent-shioaji-top200.service
-
-# 停止
 systemctl stop stockagent-shioaji-top200.service
-
-# 停止並取消開機啟動
 systemctl disable --now stockagent-shioaji-top200.service
+```
+
+`active` 只代表程序存在。仍須檢查 restart count、最新 receipt／status JSON、資料時間、
+錯誤 log 與實際 API/檔案輸出。
+
+## 故障排查
+
+### 收到冷庫但看不到 `data_tw_public`
+
+Syncthing 只同步冷庫，不會自動建立使用者可見資料夾：
+
+```bash
+stockagent-data status tw-public
+stockagent-data use tw-public \
+  --link /path/to/stockAgent/data_tw_public
+readlink -f /path/to/stockAgent/data_tw_public
+test -d /path/to/stockAgent/data_tw_public && echo ready
+```
+
+### `publish` 被拒絕
+
+```bash
+stockagent-data publish-status DATASET
+ps aux | rg 'download|build|repair'
+```
+
+常見原因是 active writer、來源 receipt 不完整、來源比 cold winner 舊、catalog 標示
+`publish: false`，或來源根本不存在。不要用底層 publish 繞過資料集契約。
+
+### GC 沒刪到期資料
+
+先讀 JSON 中每個候選的 `reason`：
+
+```bash
+stockagent-data gc --dry-run
+systemctl status stockagent-data-cache-gc.timer --no-pager
+journalctl -u stockagent-data-cache-gc.service --since today --no-pager
+```
+
+正常阻擋包括 active lease、pin、程序仍引用、cold release 不完整或 READY proof 不符。
+
+### Syncthing 完成但 verify 失敗
+
+```bash
+./scripts/run_packed_snapshot.sh status DATASET \
+  --sync-root /srv/stockagent-packed
+./scripts/run_packed_snapshot.sh verify DATASET \
+  --sync-root /srv/stockagent-packed
+./scripts/run_packed_snapshot.sh objects \
+  --sync-root /srv/stockagent-packed
+```
+
+先讓 Syncthing 回到 `needBytes=0`、`needTotalItems=0`；不要在 object 尚未收齊時手動改
+head 或複製 manifest。
+
+### 取得精確版本以重現訓練
+
+```bash
+./scripts/run_packed_snapshot.sh resolve DATASET \
+  --sync-root /srv/stockagent-packed \
+  --pin /path/to/run/data.pin.json
+
+stockagent-data use DATASET --snapshot-id SNAPSHOT_ID
+```
+
+把 pin 與實驗 artifacts 一起保存；不要在 resume 時重新解析 `latest`。
+
+## 文件分類
+
+| 類別 | 入口 | 用途 |
+|---|---|---|
+| 現行正確性契約 | [AGENTS.md](AGENTS.md) | point-in-time、backtest、checkpoint、reproducibility |
+| 文件總索引 | [docs/README.md](docs/README.md) | 區分現行契約、runbook、研究與歷史文件 |
+| 訓練架構 | [training_spec.md](docs/training_spec.md) | 訓練、評估、artifact 驗收 |
+| packed 冷庫 | [packed_dataset_storage.md](docs/packed_dataset_storage.md) | pack/blob、manifest、lease 與 smoke 證據 |
+| 舊 desync | [desync_multiwriter_sync.md](docs/desync_multiwriter_sync.md) | 舊版本遷移與救援 |
+| artifacts | [live_artifact_sync.md](docs/live_artifact_sync.md) | hot/cold artifact 分層、衝突與去重 |
+| 台灣資料 | [tw_public_download_resume_and_rate_limits.md](docs/tw_public_download_resume_and_rate_limits.md) | rebuild、repair、daily、receipt |
+| 執行模式 | [tw_execution_modes.md](docs/tw_execution_modes.md) | day/cash/overnight 與交易語意 |
+| 分鐘資料 | [tw_minute_kbar_research.md](docs/tw_minute_kbar_research.md) | causal minute dataset 與訓練 |
+| TX/TXO | [tw_index_derivatives_tick_strategy.md](docs/tw_index_derivatives_tick_strategy.md) | 期貨選擇權 tick 策略 |
+| OpenBB | [openbb_archive_downloader.md](docs/openbb_archive_downloader.md) | archive ingestion 與 compaction |
+| 操作補充 | [RUN_GUIDE.md](docs/RUN_GUIDE.md) | 特定 operator 工作流；執行前核對當前 config/path |
+
+README 只保留可重現、跨機器成立的入口。套件全面升級、文字編輯器操作、單台機器 GPU
+數字與臨時修復命令不屬於標準部署流程；需要時先用 `--help`、現行 config 與對應 runbook
+確認，再執行可回復的變更。

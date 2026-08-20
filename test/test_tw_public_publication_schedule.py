@@ -194,6 +194,17 @@ def test_source_event_registry_covers_all_official_datasets() -> None:
     assert {row["interval_seconds"] for row in rows} == {60.0, 300.0, 900.0}
 
 
+def test_source_event_download_retries_are_more_resilient_than_fast_probes() -> None:
+    args = type("Args", (), {"timeout": 20, "retries": 2})()
+
+    resolved = source_events._resilient_download_args(args)
+
+    assert resolved.timeout == 60
+    assert resolved.retries == 4
+    assert args.timeout == 20
+    assert args.retries == 2
+
+
 def test_source_event_json_fingerprint_ignores_row_order() -> None:
     left = b'[{"symbol":"2330","value":1},{"symbol":"2317","value":2}]'
     right = b'[{"value":2,"symbol":"2317"},{"value":1,"symbol":"2330"}]'
@@ -270,6 +281,59 @@ def test_source_event_is_unacknowledged_until_download_accepts_it() -> None:
     source_events._summarize_state(state, specs=[spec], changed=changed)
     assert state["status"] == "degraded"
     assert state["unapplied_event_count"] == 1
+
+
+def test_source_event_calendar_failure_is_persisted_without_crashing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    spec = next(
+        item
+        for item in DEFAULT_DATASETS.values()
+        if item.kind == "historical_json_table"
+    )
+    state = {
+        "datasets": {
+            spec.name: {
+                "observed_version": "new",
+                "applied_version": "old",
+            }
+        }
+    }
+    args = type("Args", (), {})()
+    class MorningDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):  # type: ignore[no-untyped-def]
+            return cls(2026, 8, 20, 9, 30, tzinfo=tz)
+
+    monkeypatch.setattr(source_events, "datetime", MorningDatetime)
+    monkeypatch.setattr(
+        source_events,
+        "_latest_completed_taiex_session",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("timeout")),
+    )
+    monkeypatch.setattr(
+        source_events,
+        "TAIPEI",
+        ZoneInfo("Asia/Taipei"),
+    )
+
+    result = source_events._refresh_pending(
+        [spec.name],
+        state=state,
+        live_root=tmp_path / "live",
+        state_root=tmp_path / "state",
+        specs_by_name={spec.name: spec},
+        args=args,
+    )
+
+    assert result["status"] == "failed"
+    assert result["calendar_status"] == "unavailable"
+    assert result["failed_dataset_count"] == 1
+    assert state["datasets"][spec.name]["last_download_status"] == (
+        "blocked_taiex_session_calendar"
+    )
+    assert (tmp_path / "state" / "events" / "latest.json").is_file()
 
 
 def test_source_event_service_is_persistent_and_restarting() -> None:

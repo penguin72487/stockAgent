@@ -62,9 +62,7 @@ def _active_local_cooldown_bypass_endpoints(
         command = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
     except (OSError, ValueError):
         return set()
-    arguments = {
-        item.decode("utf-8", errors="replace") for item in command if item
-    }
+    arguments = {item.decode("utf-8", errors="replace") for item in command if item}
     if not any(
         item.endswith("downloader/download_openbb_archive.py") for item in arguments
     ):
@@ -1497,9 +1495,7 @@ def collect_status(
     now = _utc_now()
     now_iso = now.isoformat()
     if retry_tracking_available:
-        retry_eligible_expression = (
-            "(retry_not_before IS NULL OR retry_not_before<=?)"
-        )
+        retry_eligible_expression = "(retry_not_before IS NULL OR retry_not_before<=?)"
         retry_deferred_expression = (
             "CASE WHEN status='pending' AND retry_not_before>? THEN 1 ELSE 0 END"
         )
@@ -2066,9 +2062,10 @@ def collect_status(
             status_counts.get(status, 0) for status in ACCEPTED_STATUSES
         )
         unavailable_tasks = status_counts.get("unavailable", 0)
+        repair_queue_tasks = status_counts.get("repair", 0)
         resolved_tasks = accepted_tasks + unavailable_tasks
         unresolved_tasks = total_tasks - accepted_tasks
-        actionable_unresolved_tasks = total_tasks - resolved_tasks
+        actionable_unresolved_tasks = total_tasks - resolved_tasks - repair_queue_tasks
         runnable_retryable_tasks = (
             pending_eligible + failed_retryable + status_counts.get("running", 0)
         )
@@ -2231,8 +2228,8 @@ def collect_status(
         )
         provider_runtime_limits = _provider_runtime_limits(state_dir)
         provider_scheduler = _provider_scheduler_state(state_dir)
-        local_cooldown_bypass_endpoints = (
-            _active_local_cooldown_bypass_endpoints(state_dir)
+        local_cooldown_bypass_endpoints = _active_local_cooldown_bypass_endpoints(
+            state_dir
         )
         scheduler_invariant_violations: list[dict[str, Any]] = []
         for provider, pool in provider_scheduler.get("providers", {}).items():
@@ -2624,14 +2621,9 @@ def collect_status(
                         daily_remaining if daily_cap else None
                     ),
                     "optimistic_daily_quota_windows_for_exclusive_backlog": (
-                        (
-                            estimated_exclusive_http_requests
-                            + quota_daily_cap
-                            - 1
-                        )
+                        (estimated_exclusive_http_requests + quota_daily_cap - 1)
                         // quota_daily_cap
-                        if estimated_exclusive_http_requests > 0
-                        and quota_daily_cap > 0
+                        if estimated_exclusive_http_requests > 0 and quota_daily_cap > 0
                         else None
                     ),
                     "optimistic_additional_daily_resets_required": (
@@ -2818,7 +2810,7 @@ def collect_status(
         status_progress.update(1)
         status_progress.set_postfix(stage="build status and audit", refresh=False)
         status: dict[str, Any] = {
-            "schema_version": 14,
+            "schema_version": 15,
             "checked_at": now.isoformat(),
             "output_dir": str(output_dir.resolve()),
             "active_plan_token": plan_token,
@@ -2831,6 +2823,7 @@ def collect_status(
             "resolved_tasks": resolved_tasks,
             "unresolved_tasks": unresolved_tasks,
             "actionable_unresolved_tasks": actionable_unresolved_tasks,
+            "repair_queue_tasks": repair_queue_tasks,
             "completion_percent": round(
                 (accepted_tasks / total_tasks * 100.0) if total_tasks else 0.0, 6
             ),
@@ -3072,6 +3065,13 @@ def collect_status(
                 "exhausted_tasks",
                 f"{exhausted:,} tasks exhausted their attempt budget.",
             )
+        if repair_queue_tasks:
+            add_alert(
+                "warning",
+                "repair_queue_tasks",
+                f"{repair_queue_tasks:,} task-local upstream failures are parked "
+                "outside the main scheduler for a later explicit repair pass.",
+            )
         if high_attempt:
             add_alert(
                 "warning",
@@ -3307,6 +3307,7 @@ def collect_status(
         )
         complete = (
             actionable_unresolved_tasks == 0
+            and repair_queue_tasks == 0
             and exhausted == 0
             and active_other_plan_tasks == 0
             and pagination_gaps == 0
@@ -3809,6 +3810,7 @@ def _print_human(status: dict[str, Any]) -> None:
         f"({status['completion_percent']:.4f}%) rows={status['success_rows']:,} "
         f"unavailable={status['unavailable_tasks']:,} "
         f"status={counts} retryable={status['retryable_tasks']:,} exhausted={status['exhausted_tasks']:,} "
+        f"repair_queue={status.get('repair_queue_tasks', 0):,} "
         f"retry_deferred={status.get('pending_retry_deferred', 0):,} "
         f"next_retry={status.get('next_task_retry_at') or '-'} "
         f"pending_error={status['pending_with_error']:,} "

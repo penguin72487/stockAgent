@@ -21,10 +21,11 @@ day_trade_quote_interval_seconds: 60
 # This model shares the canonical TW public data layer with the other modes.
 # 09:00 is a gate; entry uses a causally later executable best quote.
 pre_signal_command:
-  - "{python}"
-  - scripts/refresh_tw_public_live_snapshot.py
-  - --config
-  - configs/markets/tw_day_trade_10m.yaml
+  - scripts/run_data_cache.sh
+  - use
+  - tw-public
+  - --link
+  - data_tw_public
 pre_signal_timeout_seconds: 14400
 previous_signal_backfill_limit: 512
 

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, time, timedelta, timezone
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -653,7 +653,7 @@ def test_engine_does_not_open_from_stale_books(tmp_path: Path) -> None:
     engine.close()
 
 
-def test_short_straddle_uses_bid_entry_ask_liquidation_and_absorbing_ruin(
+def test_short_straddle_recapitalizes_next_trading_date_and_accumulates_capital(
     tmp_path: Path,
 ) -> None:
     engine = _engine(
@@ -696,8 +696,12 @@ def test_short_straddle_uses_bid_entry_ask_liquidation_and_absorbing_ruin(
     ledger = engine.state["strategies"][strategy_id]
     assert ledger["option_positions"] == {}
     assert ledger["alive"] is False
-    assert ledger["entry_state"] == "ruined"
+    assert ledger["entry_state"] == "awaiting_next_trading_date_recapitalization"
     assert ledger["margin_call_count"] == 1
+    assert ledger["bankruptcy_count"] == 1
+    contributed_before_recap = float(
+        ledger["cumulative_contributed_capital_twd"]
+    )
     forced_rows = [
         json.loads(line)
         for line in (tmp_path / "ideal_ledger.jsonl").read_text().splitlines()
@@ -708,6 +712,94 @@ def test_short_straddle_uses_bid_entry_ask_liquidation_and_absorbing_ruin(
     assert {row["price_source"] for row in forced_rows} == {
         "forced_liquidation_five_level_depth_vwap"
     }
+
+    same_day_receive_ns = loss_receive_ns + 2_000_000_000
+    _seed_surface_books(
+        engine,
+        observed_at=datetime.fromtimestamp(same_day_receive_ns / 1e9, tz=TAIPEI),
+        receive_ns=same_day_receive_ns,
+    )
+    assert not engine._enter_strategy_for_cycle(
+        strategy_id,
+        decision_ns=same_day_receive_ns + 1_000_000_000,
+    )
+    assert not ledger["alive"]
+    assert (
+        float(ledger["cumulative_contributed_capital_twd"])
+        == contributed_before_recap
+    )
+
+    next_day_receive_ns = same_day_receive_ns + int(timedelta(days=1).total_seconds() * 1e9)
+    _seed_surface_books(
+        engine,
+        observed_at=datetime.fromtimestamp(next_day_receive_ns / 1e9, tz=TAIPEI),
+        receive_ns=next_day_receive_ns,
+    )
+    assert engine._enter_strategy_for_cycle(
+        strategy_id,
+        decision_ns=next_day_receive_ns + 1_000_000_000,
+    )
+    assert ledger["alive"]
+    assert ledger["entry_state"] == "entered"
+    assert ledger["recapitalization_count"] == 1
+    first_recapitalized_total = float(
+        ledger["cumulative_contributed_capital_twd"]
+    )
+    assert first_recapitalized_total > contributed_before_recap
+
+    second_loss_receive_ns = next_day_receive_ns + 2_000_000_000
+    for code in list(ledger["option_positions"]):
+        engine.on_book(
+            _book(code, bid=9_999.0, ask=10_000.0, receive_ns=second_loss_receive_ns)
+        )
+    engine._maybe_enforce_strategy_margin(second_loss_receive_ns + 1_000_000_000)
+    assert not ledger["alive"]
+    assert ledger["bankruptcy_count"] == 2
+
+    second_recap_receive_ns = second_loss_receive_ns + int(
+        timedelta(days=1).total_seconds() * 1e9
+    )
+    _seed_surface_books(
+        engine,
+        observed_at=datetime.fromtimestamp(second_recap_receive_ns / 1e9, tz=TAIPEI),
+        receive_ns=second_recap_receive_ns,
+    )
+    ledger["entry_state"] = "waiting_for_contract_ladder"
+    assert engine._strategy_recapitalization_is_due(
+        strategy_id,
+        second_recap_receive_ns + 1_000_000_000,
+    )
+    assert engine._enter_strategy_for_cycle(
+        strategy_id,
+        decision_ns=second_recap_receive_ns + 1_000_000_000,
+    )
+    assert ledger["recapitalization_count"] == 2
+    assert (
+        float(ledger["cumulative_contributed_capital_twd"])
+        > first_recapitalized_total
+    )
+    contribution_rows = [
+        json.loads(line)
+        for line in (tmp_path / "capital_contributions.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if json.loads(line)["strategy_id"] == strategy_id
+    ]
+    assert [row["reason"] for row in contribution_rows].count(
+        "post_bankruptcy_one_package_recapitalization"
+    ) == 2
+    recapitalizations = [
+        row
+        for row in contribution_rows
+        if row["reason"] == "post_bankruptcy_one_package_recapitalization"
+    ]
+    assert all(
+        str(row["last_bankruptcy_trading_date"]) < str(row["trading_date"])
+        for row in recapitalizations
+    )
+    assert recapitalizations[0]["last_bankruptcy_trading_date"] < (
+        recapitalizations[1]["last_bankruptcy_trading_date"]
+    )
     engine.close()
 
 
@@ -777,6 +869,7 @@ def test_positive_equity_future_margin_deficit_does_not_churn_or_reenter(
     strategy_id = "underlying_hedge_future_long"
     ledger = engine.state["strategies"][strategy_id]
     ledger["initial_capital_twd"] = 10_000.0
+    ledger["cumulative_contributed_capital_twd"] = 10_000.0
     mark = engine._strategy_mark(strategy_id, receive_ns + 1_000_000_000)
     assert 0.0 < mark["total_equity_twd"] < mark["margin_required_twd"]
     engine._maybe_enforce_strategy_margin(receive_ns + 1_000_000_000)
@@ -1189,6 +1282,86 @@ def test_intraday_mode_late_starts_and_calibrates_once_per_minute(
     engine.step(now=observed_at.replace(second=30))
     duplicate_rows = (tmp_path / "calibrations.jsonl").read_text().splitlines()
     assert len(duplicate_rows) == len(expected_dynamic)
+    engine.close()
+
+
+def test_intraday_sparse_iv_surface_waits_without_blocking_engine(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    engine = _engine(
+        tmp_path,
+        bootstrap_after=date(2026, 8, 12),
+        strategy_mode=STRATEGY_MODE_INTRADAY_FUTURES,
+    )
+    observed_at = datetime(2026, 8, 12, 10, 0, tzinfo=TAIPEI)
+    receive_ns = int(observed_at.timestamp() * 1e9)
+    monkeypatch.setattr(
+        "stockagent.live.taifex_volatility_simulation.time.time_ns",
+        lambda: receive_ns + 1_000_000,
+    )
+    _seed_surface_books(
+        engine,
+        observed_at=observed_at,
+        receive_ns=receive_ns,
+    )
+
+    def sparse_surface(*_args, **_kwargs):
+        raise ValueError("live Bid/Ask IV surface is too sparse: 0 points")
+
+    monkeypatch.setattr(
+        "stockagent.live.taifex_volatility_simulation.build_bidask_iv_surface",
+        sparse_surface,
+    )
+    engine.step(now=observed_at)
+
+    assert engine.state["engine_status"] == "waiting_for_sufficient_iv_surface"
+    assert engine.state["last_iv_surface_error"] == (
+        "live Bid/Ask IV surface is too sparse: 0 points"
+    )
+    assert engine.state.get("last_engine_step_error") is None
+    engine.close()
+
+
+def test_intraday_sparse_held_series_waits_without_blocking_engine(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    engine = _engine(
+        tmp_path,
+        bootstrap_after=date(2026, 8, 12),
+        strategy_mode=STRATEGY_MODE_INTRADAY_FUTURES,
+    )
+    observed_at = datetime(2026, 8, 12, 10, 0, tzinfo=TAIPEI)
+    receive_ns = int(observed_at.timestamp() * 1e9)
+    monkeypatch.setattr(
+        "stockagent.live.taifex_volatility_simulation.time.time_ns",
+        lambda: receive_ns + 1_000_000,
+    )
+    _seed_surface_books(
+        engine,
+        observed_at=observed_at,
+        receive_ns=receive_ns,
+    )
+
+    def sparse_held_series(*_args, **_kwargs):
+        raise ValueError(
+            "held-series IV surface is too sparse: series=test points=7"
+        )
+
+    monkeypatch.setattr(
+        "stockagent.live.taifex_volatility_simulation.fit_volatility_model",
+        sparse_held_series,
+    )
+    engine.step(now=observed_at)
+
+    assert engine.state["engine_status"] == (
+        "waiting_for_sufficient_held_series_iv_surface"
+    )
+    assert engine.state["last_iv_surface_error"] == (
+        "held-series IV surface is too sparse: series=test points=7"
+    )
+    assert engine.state.get("last_engine_step_error") is None
     engine.close()
 
 

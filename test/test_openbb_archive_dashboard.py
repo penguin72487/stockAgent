@@ -26,12 +26,19 @@ def _snapshot(checked_at: datetime) -> dict[str, object]:
         "completion_percent": 72.0,
         "success_rows": 123456,
         "retryable_tasks": 8,
+        "repair_queue_tasks": 1,
         "pending_retry_deferred": 3,
         "next_task_retry_at": (checked_at + timedelta(hours=2)).isoformat(),
         "unavailable_tasks": 18,
         "endpoint_count": 4,
         "min_free_bytes": 1,
-        "status_counts": {"success": 70, "empty": 2, "pending": 8, "failed": 2},
+        "status_counts": {
+            "success": 70,
+            "empty": 2,
+            "pending": 8,
+            "failed": 1,
+            "repair": 1,
+        },
         "category_progress": [
             {
                 "category": "equity",
@@ -130,9 +137,12 @@ def test_public_status_separates_live_process_truth_from_stale_audit(
     assert public["archive"]["completion_percent"] == 72.0
     assert public["archive"]["actionable_unresolved_tasks"] == 9
     assert public["archive"]["retry_deferred_tasks"] == 3
-    assert public["archive"]["next_task_retry_at"] == (
-        now - timedelta(days=2) + timedelta(hours=2)
-    ).isoformat()
+    assert public["archive"]["repair_queue_tasks"] == 1
+    assert public["archive"]["status_counts"]["repair"] == 1
+    assert (
+        public["archive"]["next_task_retry_at"]
+        == (now - timedelta(days=2) + timedelta(hours=2)).isoformat()
+    )
     assert public["categories"][0]["missing_tasks"] == 5
     assert public["categories"][0]["unavailable_tasks"] == 2
     assert public["providers"][0]["requests_per_second"] == 4.0
@@ -153,7 +163,9 @@ def test_public_status_separates_live_process_truth_from_stale_audit(
         assert forbidden not in encoded
 
 
-def test_openbb_page_uses_actionable_backlog_without_double_counting_unavailable() -> None:
+def test_openbb_page_uses_actionable_backlog_without_double_counting_unavailable() -> (
+    None
+):
     root = Path(__file__).resolve().parents[1] / "services/openbb_archive_dashboard"
     html = (root / "index.html").read_text(encoding="utf-8")
     javascript = (root / "app.js").read_text(encoding="utf-8")
@@ -163,6 +175,7 @@ def test_openbb_page_uses_actionable_backlog_without_double_counting_unavailable
     assert 'label: "尚未接受"' in javascript
     assert 'let range = "1d"' in javascript
     assert 'data-range="1d" class="active" aria-pressed="true"' in html
+    assert "archive.repair_queue_tasks" in javascript
 
 
 def test_public_status_fails_closed_when_incomplete_processes_are_dead(
@@ -199,7 +212,9 @@ def test_compact_history_projection_and_range_filter(tmp_path: Path) -> None:
     appended = dashboard.project_openbb_history_row(
         _snapshot(now - timedelta(minutes=5))
     )
-    with (state / "monitor_dashboard_history.jsonl").open("a", encoding="utf-8") as handle:
+    with (state / "monitor_dashboard_history.jsonl").open(
+        "a", encoding="utf-8"
+    ) as handle:
         handle.write(json.dumps(appended) + "\n")
     refreshed = dashboard.build_openbb_public_history(tmp_path, "1h", now=now)
     assert len(refreshed["history"]) == 2

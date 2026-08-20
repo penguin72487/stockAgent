@@ -107,10 +107,16 @@ FOLLOWUP_UPSERT_CHUNK_SIZE = 8192
 # failed catalog URLs from becoming eligible in the same second.
 TASK_RETRY_BASE_SECONDS = 5 * 60.0
 TASK_RETRY_MAX_SECONDS = 24 * 60 * 60.0
+REPAIR_QUEUE_STATUS = "repair"
+CONGRESS_REPAIR_QUEUE_ENDPOINTS = frozenset(
+    {"uscongress.bill_info", "uscongress.amendment_info"}
+)
 SEC_STATEMENT_VALIDATION_RECOVERY_REVISION = 1
 SEC_STATEMENT_WRAPPER_SHARD_RECOVERY_REVISION = 1
 PROVIDER_PARSER_SHAPE_RECOVERY_REVISION = 1
 PROVIDER_TRANSIENT_OUTCOME_RECOVERY_REVISION = 1
+UNPROVEN_PROVIDER_OUTCOME_RECOVERY_REVISION = 1
+UNPROVEN_PERMANENT_OUTCOME_RECOVERY_REVISION = 1
 FMP_ADAPTER_BOUNDARY_RECOVERY_REVISION = 1
 HETEROGENEOUS_PARQUET_SCHEMA_RECOVERY_REVISION = 1
 SEC_ALL_COMPANY_FACTS = "__all__"
@@ -202,9 +208,7 @@ class FairCpuSlotBudget:
         with self._condition:
             self._waiters.append((token, count))
             try:
-                while (
-                    self._waiters[0][0] is not token or self._available < count
-                ):
+                while self._waiters[0][0] is not token or self._available < count:
                     self._condition.wait()
             except BaseException:
                 self._waiters = deque(
@@ -1235,6 +1239,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--retry-failed", action=argparse.BooleanOptionalAction, default=True
+    )
+    parser.add_argument(
+        "--retry-repair-queue",
+        action="store_true",
+        help=(
+            "Requeue task-local upstream failures that were parked outside the "
+            "main scheduler. A repeated Congress.gov HTTP 500 is attempted once "
+            "and parked again, so this is intended for a later repair pass."
+        ),
     )
     parser.add_argument(
         "--retry-permanent",
@@ -3979,9 +3992,7 @@ class Manifest:
                 retry_updates.append(
                     (
                         streak,
-                        _task_retry_deadline(
-                            str(row["task_id"]), streak, now=now_dt
-                        ),
+                        _task_retry_deadline(str(row["task_id"]), streak, now=now_dt),
                         str(row["task_id"]),
                     )
                 )
@@ -4043,9 +4054,7 @@ class Manifest:
                 retry_updates.append(
                     (
                         streak,
-                        _task_retry_deadline(
-                            str(row["task_id"]), streak, now=now_dt
-                        ),
+                        _task_retry_deadline(str(row["task_id"]), streak, now=now_dt),
                         str(row["task_id"]),
                     )
                 )
@@ -4066,6 +4075,49 @@ class Manifest:
                     congress_cooldown_retry_migration,
                     str(len(retry_updates)),
                     now_dt.isoformat(),
+                ),
+            )
+        congress_repair_queue_migration = "congress_http_500_repair_queue_v1"
+        if (
+            self.connection.execute(
+                "SELECT 1 FROM archive_meta WHERE key=?",
+                (congress_repair_queue_migration,),
+            ).fetchone()
+            is None
+        ):
+            now = datetime.now(timezone.utc).isoformat()
+            cursor = self.connection.execute(
+                """
+                UPDATE tasks SET status=?, retry_not_before=NULL,
+                    execution_started_at=NULL, updated_at=?
+                WHERE active=1
+                  AND status IN ('pending','running','failed')
+                  AND endpoint IN (
+                      'uscongress.bill_info','uscongress.amendment_info'
+                  )
+                  AND EXISTS (
+                      SELECT 1 FROM json_each(tasks.providers_json)
+                      WHERE value='congress_gov'
+                  )
+                  AND (
+                      LOWER(COALESCE(error,'')) LIKE '%http error 500%'
+                      OR LOWER(COALESCE(error,'')) LIKE '%http 500%'
+                      OR LOWER(COALESCE(error,'')) LIKE '%-> 500%'
+                      OR LOWER(COALESCE(error,'')) LIKE '%status 500%'
+                  )
+                """,
+                (REPAIR_QUEUE_STATUS, now),
+            )
+            self.connection.execute(
+                """
+                INSERT INTO archive_meta(key,value,updated_at) VALUES (?,?,?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value=excluded.value, updated_at=excluded.updated_at
+                """,
+                (
+                    congress_repair_queue_migration,
+                    str(max(0, int(cursor.rowcount))),
+                    now,
                 ),
             )
         etf_name_migration = "yfinance_etf_info_missing_name_v1"
@@ -4717,6 +4769,16 @@ class Manifest:
             (plan_token,),
         ).fetchone()
         return int(row[0])
+
+    def has_active_tasks_outside_plan(self, plan_token: str) -> bool:
+        """Cheaply detect an interrupted replacement plan before fast resume."""
+        return (
+            self.connection.execute(
+                "SELECT 1 FROM tasks WHERE active=1 AND plan_token!=? LIMIT 1",
+                (plan_token,),
+            ).fetchone()
+            is not None
+        )
 
     def upsert_tasks(
         self,
@@ -5735,10 +5797,12 @@ class Manifest:
         self,
         *,
         retry_failed: bool,
+        retry_repair_queue: bool = False,
         retry_permanent: bool = True,
         retry_empty: bool,
         refresh: bool,
         repair_legacy: bool = True,
+        verify_successful_shards: bool = True,
         plan_token: str | None = None,
         show_progress: bool = False,
     ) -> None:
@@ -5746,9 +5810,10 @@ class Manifest:
         plan_clause = "" if plan_token is None else " AND plan_token=?"
         plan_args: tuple[Any, ...] = () if plan_token is None else (plan_token,)
         stages = (
-            7
+            (7 if verify_successful_shards else 4)
             + 3 * int(repair_legacy)
             + int(retry_failed)
+            + int(retry_repair_queue)
             + int(retry_empty)
             + int(refresh)
         )
@@ -5830,6 +5895,14 @@ class Manifest:
                 ),
                 (now, *plan_args),
             )
+        if retry_repair_queue:
+            execute_stage(
+                "retry repair queue",
+                f"UPDATE tasks SET status='pending', retry_not_before=NULL, "
+                f"transient_failures=0, updated_at='0001-01-01T00:00:00+00:00' "
+                f"WHERE active=1 AND status='{REPAIR_QUEUE_STATUS}'{plan_clause}",
+                plan_args,
+            )
         if retry_empty:
             execute_stage(
                 "retry empty",
@@ -5888,49 +5961,54 @@ class Manifest:
                 f"WHERE active=1 AND status='success'{plan_clause}",
                 (now, *plan_args),
             )
-        # A manifest entry cannot remain complete if its parquet disappeared.
-        progress.set_postfix(stage="load successful shards", refresh=False)
-        with _sqlite_progress(
-            self.connection,
-            "prepare:load successful shards",
-            enabled=show_progress,
-        ):
-            complete_rows = self.connection.execute(
-                f"SELECT task_id, output_path FROM tasks WHERE active=1 AND status='success'{plan_clause}",
-                plan_args,
-            ).fetchall()
-        progress.update(1)
-        missing: list[tuple[str, str]] = []
-        file_progress = tqdm(
-            complete_rows,
-            total=len(complete_rows),
-            desc="prepare:verify successful shards",
-            unit="file",
-            position=1,
-            leave=False,
-            disable=not show_progress,
-        )
-        try:
-            for row in file_progress:
-                if not Path(row["output_path"]).is_file():
-                    missing.append((now, row["task_id"]))
-                if file_progress.n % 1000 == 0:
-                    file_progress.set_postfix(missing=len(missing), refresh=False)
-        finally:
-            file_progress.close()
-        progress.update(1)
-        progress.set_postfix(stage="requeue missing shards", refresh=False)
-        with _sqlite_progress(
-            self.connection,
-            "prepare:requeue missing shards",
-            enabled=show_progress,
-        ):
-            self.connection.executemany(
-                "UPDATE tasks SET status='pending', retry_not_before=NULL, "
-                "transient_failures=0, updated_at=? WHERE task_id=?",
-                missing,
+        if verify_successful_shards:
+            # This is an explicit integrity audit, not crash recovery. A worker
+            # atomically publishes Parquet before its SQLite success commit, so
+            # verified resume only needs to adopt/recover interrupted `running`
+            # rows. Re-statting millions of immutable successes on every
+            # supervisor recycle consumes gigabytes and delays useful HTTP work.
+            progress.set_postfix(stage="load successful shards", refresh=False)
+            with _sqlite_progress(
+                self.connection,
+                "prepare:load successful shards",
+                enabled=show_progress,
+            ):
+                complete_rows = self.connection.execute(
+                    f"SELECT task_id, output_path FROM tasks WHERE active=1 AND status='success'{plan_clause}",
+                    plan_args,
+                ).fetchall()
+            progress.update(1)
+            missing: list[tuple[str, str]] = []
+            file_progress = tqdm(
+                complete_rows,
+                total=len(complete_rows),
+                desc="prepare:verify successful shards",
+                unit="file",
+                position=1,
+                leave=False,
+                disable=not show_progress,
             )
-        progress.update(1)
+            try:
+                for row in file_progress:
+                    if not Path(row["output_path"]).is_file():
+                        missing.append((now, row["task_id"]))
+                    if file_progress.n % 1000 == 0:
+                        file_progress.set_postfix(missing=len(missing), refresh=False)
+            finally:
+                file_progress.close()
+            progress.update(1)
+            progress.set_postfix(stage="requeue missing shards", refresh=False)
+            with _sqlite_progress(
+                self.connection,
+                "prepare:requeue missing shards",
+                enabled=show_progress,
+            ):
+                self.connection.executemany(
+                    "UPDATE tasks SET status='pending', retry_not_before=NULL, "
+                    "transient_failures=0, updated_at=? WHERE task_id=?",
+                    missing,
+                )
+            progress.update(1)
         progress.set_postfix(stage="commit", refresh=False)
         with _sqlite_progress(
             self.connection,
@@ -6585,7 +6663,12 @@ class Manifest:
                 result.task.task_id,
             ),
         )
-        terminal = result.status in {"empty", "unavailable", "failed"}
+        terminal = result.status in {
+            "empty",
+            "unavailable",
+            "failed",
+            REPAIR_QUEUE_STATUS,
+        }
         if self._completion_batch_depth:
             if terminal:
                 self._completion_batch_quarantines.append(result.task)
@@ -6618,6 +6701,11 @@ class Manifest:
             (str(provider), str(endpoint), str(domain))
             for provider, endpoint, domain in unavailable_domains
         )
+        recovery_key = "unproven_provider_outcome_recovery_revision:" + str(plan_token)
+        if self.meta_value(recovery_key) == str(
+            UNPROVEN_PROVIDER_OUTCOME_RECOVERY_REVISION
+        ):
+            return 0
 
         def capability_proven(
             provider: object, endpoint: object, kwargs_json: object
@@ -6698,6 +6786,9 @@ class Manifest:
                 """,
                 (plan_token,),
             )
+        self.set_meta_value(
+            recovery_key, str(UNPROVEN_PROVIDER_OUTCOME_RECOVERY_REVISION)
+        )
         self.connection.commit()
         return max(0, int(cursor.rowcount))
 
@@ -6711,6 +6802,11 @@ class Manifest:
         unproven provider markers, and let the primary provider run once under
         the current adapter.
         """
+        recovery_key = "unproven_permanent_outcome_recovery_revision:" + str(plan_token)
+        if self.meta_value(recovery_key) == str(
+            UNPROVEN_PERMANENT_OUTCOME_RECOVERY_REVISION
+        ):
+            return 0
         unproven = """
             outcome.value='permanent'
             AND NOT EXISTS (
@@ -6750,6 +6846,9 @@ class Manifest:
                 """,
                 (plan_token,),
             )
+        self.set_meta_value(
+            recovery_key, str(UNPROVEN_PERMANENT_OUTCOME_RECOVERY_REVISION)
+        )
         self.connection.commit()
         return max(0, int(cursor.rowcount))
 
@@ -6850,13 +6949,9 @@ class Manifest:
         self.connection.commit()
         return repaired
 
-    def repair_provider_transient_permanent_outcomes(
-        self, *, plan_token: str
-    ) -> int:
+    def repair_provider_transient_permanent_outcomes(self, *, plan_token: str) -> int:
         """Requeue historical permanent labels that current rules prove transient."""
-        revision_key = "provider_transient_outcome_recovery_revision:" + str(
-            plan_token
-        )
+        revision_key = "provider_transient_outcome_recovery_revision:" + str(plan_token)
         if self.meta_value(revision_key) == str(
             PROVIDER_TRANSIENT_OUTCOME_RECOVERY_REVISION
         ):
@@ -6940,9 +7035,7 @@ class Manifest:
     ) -> tuple[int, int]:
         """Requeue rows fixed by narrow FMP response/query normalization."""
         revision_key = "fmp_adapter_boundary_recovery_revision:" + str(plan_token)
-        if self.meta_value(revision_key) == str(
-            FMP_ADAPTER_BOUNDARY_RECOVERY_REVISION
-        ):
+        if self.meta_value(revision_key) == str(FMP_ADAPTER_BOUNDARY_RECOVERY_REVISION):
             return 0, 0
         with self.connection:
             eps = self.connection.execute(
@@ -8008,8 +8101,8 @@ class ProviderRuntime:
                         # semantic provider boundary: keeping the maximum can
                         # oversleep past midnight when the archive restarts in
                         # the final hour of the provider day.
-                        self._blocked_until[provider_name] = (
-                            self._quota_reset_deadline(provider_name, reason, now)
+                        self._blocked_until[provider_name] = self._quota_reset_deadline(
+                            provider_name, reason, now
                         )
             unavailable = payload.get("unavailable_providers", {})
             if isinstance(unavailable, Mapping):
@@ -10629,10 +10722,7 @@ def _fetch_fmp_historical_eps_workaround(
             reverse=True,
         )
         if str(row.get("date") or "") <= today
-        and (
-            row.get("epsActual") is not None
-            or row.get("revenueActual") is not None
-        )
+        and (row.get("epsActual") is not None or row.get("revenueActual") is not None)
     ][:limit]
     if not filtered:
         raise EmptyDataError(f"No data found for symbol: {query.symbol}")
@@ -13113,7 +13203,9 @@ def _sec_companyfacts_ciks_for_symbol(
         cik_values = [mapped] if mapped else []
     normalized = tuple(
         dict.fromkeys(
-            str(cik).lstrip("0").zfill(10) for cik in cik_values if str(cik or "").strip()
+            str(cik).lstrip("0").zfill(10)
+            for cik in cik_values
+            if str(cik or "").strip()
         )
     )
     if not normalized:
@@ -15421,9 +15513,7 @@ def _download_bls_labstat_file(
         status = int(getattr(response, "status", 200) or 200)
         content_range = str(response.headers.get("Content-Range") or "")
         appending = bool(
-            offset
-            and status == 206
-            and content_range.startswith(f"bytes {offset}-")
+            offset and status == 206 and content_range.startswith(f"bytes {offset}-")
         )
         if not appending:
             offset = 0
@@ -15726,9 +15816,7 @@ def _ensure_bls_labstat_database(
                     "ON observations(series_id, year)"
                 )
                 import_progress.update(1)
-                _create_bls_labstat_series_table(
-                    connection, raw_paths[series_name]
-                )
+                _create_bls_labstat_series_table(connection, raw_paths[series_name])
                 connection.execute("CREATE INDEX series_id_idx ON series(series_id)")
                 import_progress.update(1)
                 if footnote_name is not None:
@@ -15752,9 +15840,9 @@ def _ensure_bls_labstat_database(
                     )
                 import_progress.update(1)
                 observation_rows = int(
-                    connection.execute(
-                        "SELECT COUNT(*) FROM observations"
-                    ).fetchone()[0]
+                    connection.execute("SELECT COUNT(*) FROM observations").fetchone()[
+                        0
+                    ]
                 )
                 if observation_rows <= 0:
                     raise BlsLabstatUnsupportedError(
@@ -15818,9 +15906,7 @@ def _fetch_bls_series_labstat_table(
             )
         by_prefix.setdefault(symbol[:2].lower(), []).append(symbol)
 
-    start = date.fromisoformat(
-        str(kwargs.get("start_date") or DEFAULT_START_DATE)[:10]
-    )
+    start = date.fromisoformat(str(kwargs.get("start_date") or DEFAULT_START_DATE)[:10])
     end = date.fromisoformat(
         str(kwargs.get("end_date") or date.today().isoformat())[:10]
     )
@@ -16236,9 +16322,7 @@ def _task_retry_deadline(
     current = now or datetime.now(timezone.utc)
     return (
         current
-        + timedelta(
-            seconds=_task_retry_delay_seconds(task_id, transient_failures)
-        )
+        + timedelta(seconds=_task_retry_delay_seconds(task_id, transient_failures))
     ).isoformat()
 
 
@@ -16253,6 +16337,21 @@ def _is_http_server_error(exc: Exception) -> bool:
             text,
         )
         or re.search(r"(?<!\d)5\d{2}(?!\d)\s*,\s*message\s*=", text)
+    )
+
+
+def _is_http_status_500(exc: Exception) -> bool:
+    """Return whether an exception preserves an explicit HTTP 500 response."""
+    status_code = getattr(exc, "code", None) or getattr(exc, "status", None)
+    if status_code == 500:
+        return True
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return bool(
+        re.search(
+            r"(?:http(?:error| error)?|status(?: code)?)\s*[:=]?\s*500(?!\d)",
+            text,
+        )
+        or re.search(r"(?<!\d)500(?!\d)\s*,\s*message\s*=", text)
     )
 
 
@@ -16664,6 +16763,7 @@ class OpenBBWorker:
         }
         saw_retryable = False
         saw_task_transient = False
+        repair_queue_providers: set[str] = set()
         last_provider: str | None = None
         for provider in provider_execution_order(task.providers):
             if provider in provider_outcomes:
@@ -17107,8 +17207,7 @@ class OpenBBWorker:
                                         raise ProviderDeferredError(
                                             "__archive_provider_deferred__: BLS "
                                             + str(
-                                                api_reason
-                                                or "BLS API is unavailable"
+                                                api_reason or "BLS API is unavailable"
                                             )
                                         )
                                     # The bulk route made no API claim. Claim
@@ -17449,6 +17548,18 @@ class OpenBBWorker:
                         break
                     saw_retryable = True
                     saw_task_transient = True
+                    if (
+                        provider == "congress_gov"
+                        and task.endpoint in CONGRESS_REPAIR_QUEUE_ENDPOINTS
+                        and _is_http_status_500(exc)
+                    ):
+                        # A 500 tied to one concrete Congress.gov resource is
+                        # neither authoritative absence nor a useful main-pass
+                        # retry. Park it as an explicit data gap. A later
+                        # --retry-repair-queue pass gets exactly one fresh
+                        # attempt and parks it again if upstream is unchanged.
+                        repair_queue_providers.add(provider)
+                        break
                     # A server response for this concrete URL is task-local
                     # evidence.  Repeating it immediately only consumes the
                     # upstream request budget; persist a task deadline below
@@ -17471,11 +17582,17 @@ class OpenBBWorker:
         unresolved_provider = any(
             provider not in provider_outcomes for provider in task.providers
         )
+        unresolved_providers = {
+            provider for provider in task.providers if provider not in provider_outcomes
+        }
         terminal_empty = "empty" in outcome_values
         terminal_unavailable = "unavailable" in outcome_values
         terminal_permanent = "permanent" in outcome_values
         status = (
-            "pending"
+            REPAIR_QUEUE_STATUS
+            if unresolved_providers
+            and unresolved_providers.issubset(repair_queue_providers)
+            else "pending"
             if saw_retryable and unresolved_provider
             # An empty primary plus an unavailable fallback is not proof of
             # absence. Record capability-unavailable instead of publishing a
@@ -17967,19 +18084,22 @@ def write_catalogs(
     context: PlannerContext,
     coverage: Sequence[CoverageDecision],
     credential_names: set[str],
+    *,
+    write_universes: bool = True,
 ) -> None:
     catalog_dir = context.output_dir / "catalog"
     _write_rows_parquet(
         [asdict(item) for item in coverage], catalog_dir / "coverage.parquet"
     )
-    _write_rows_parquet(
-        [asdict(item) for item in context.assets],
-        catalog_dir / "equity_universe.parquet",
-    )
-    _write_rows_parquet(
-        [{"symbol": item} for item in context.currencies],
-        catalog_dir / "currency_universe.parquet",
-    )
+    if write_universes:
+        _write_rows_parquet(
+            [asdict(item) for item in context.assets],
+            catalog_dir / "equity_universe.parquet",
+        )
+        _write_rows_parquet(
+            [{"symbol": item} for item in context.currencies],
+            catalog_dir / "currency_universe.parquet",
+        )
     _write_rows_parquet(
         [
             {"credential_field": name, "configured": True}
@@ -18021,9 +18141,9 @@ def _print_plan_summary(
     )
 
 
-def _load_openbb(env_file: str | Path = Path(".env")) -> tuple[
-    Any, Mapping[str, Mapping[str, Any]], Mapping[str, Sequence[str]]
-]:
+def _load_openbb(
+    env_file: str | Path = Path(".env"),
+) -> tuple[Any, Mapping[str, Mapping[str, Any]], Mapping[str, Sequence[str]]]:
     from openbb import obb
 
     applied_fields = apply_openbb_environment_credentials(obb, env_file=env_file)
@@ -18240,6 +18360,80 @@ def _load_resumable_plan(
     return initial_task_count, coverage, dict(summary)
 
 
+def _select_resumable_plan(
+    output_dir: Path,
+    manifest: Manifest,
+    *,
+    candidate_plan_token: str,
+    plan_scope_fingerprint: str,
+    command_fingerprint: str,
+    start_date: str,
+    end_date: str,
+    credential_names: set[str],
+) -> (
+    tuple[
+        str,
+        tuple[int, list[CoverageDecision], dict[str, Any]],
+        str,
+    ]
+    | None
+):
+    """Select an exact or scope-compatible durable plan without regenerating it.
+
+    The live symbol CSVs are refreshed independently of a pinned historical
+    archive.  Their fingerprint therefore must not turn a normal supervisor
+    recycle into millions of redundant SQLite UPSERTs.  Scope, planner version,
+    OpenBB command/schema surface, credentials, and the persisted completeness
+    contract remain fail-closed boundaries.
+    """
+
+    active_plan_token = manifest.meta_value("active_plan_token")
+    candidates: list[tuple[str, str]] = [(candidate_plan_token, "exact")]
+    if active_plan_token and active_plan_token != candidate_plan_token:
+        candidates.append((active_plan_token, "compatible_scope"))
+
+    for plan_token, resume_mode in candidates:
+        saved_scope = manifest.meta_value(f"plan_scope_fingerprint:{plan_token}")
+        if saved_scope not in {None, plan_scope_fingerprint}:
+            continue
+        if resume_mode == "compatible_scope" and saved_scope is None:
+            # Cross-token adoption is deliberately stricter than exact legacy
+            # adoption: without a scope receipt we cannot prove equivalence.
+            continue
+
+        saved_version = manifest.meta_value(f"planner_state_version:{plan_token}")
+        if resume_mode == "compatible_scope" and saved_version != str(
+            PLANNER_STATE_VERSION
+        ):
+            continue
+
+        command_key = f"plan_command_fingerprint:{plan_token}"
+        saved_command = manifest.meta_value(command_key)
+        if saved_command not in {None, command_fingerprint}:
+            continue
+
+        resumed = _load_resumable_plan(
+            output_dir,
+            manifest,
+            plan_token=plan_token,
+            start_date=start_date,
+            end_date=end_date,
+            credential_names=credential_names,
+        )
+        if resumed is None:
+            continue
+
+        # Planner-state version 10 predates these per-plan receipts.  Persisting
+        # the current command fingerprint is a one-time migration; a future
+        # OpenBB schema change then fails closed instead of silently adopting.
+        manifest.set_meta_value(
+            f"plan_scope_fingerprint:{plan_token}", plan_scope_fingerprint
+        )
+        manifest.set_meta_value(command_key, command_fingerprint)
+        return plan_token, resumed, resume_mode
+    return None
+
+
 def _task_execution_affinity(task: DownloadTask) -> str | None:
     """Return a shared-expensive-artifact key for cache-local scheduling."""
     if task.endpoint not in SEC_COMPANYFACTS_STATEMENT_ENDPOINTS:
@@ -18252,9 +18446,7 @@ def _task_execution_affinity(task: DownloadTask) -> str | None:
             "symbol": str(task.kwargs.get("symbol") or "").upper(),
             "period": str(task.kwargs.get("period") or ""),
             "pit_mode": bool(task.kwargs.get("pit_mode", True)),
-            "include_preliminary": bool(
-                task.kwargs.get("include_preliminary", True)
-            ),
+            "include_preliminary": bool(task.kwargs.get("include_preliminary", True)),
         }
     )
 
@@ -18290,8 +18482,7 @@ def _pop_fairest_endpoint_task(
                 0
                 if (
                     preferred_affinities
-                    and _task_execution_affinity(tasks[index])
-                    in preferred_affinities
+                    and _task_execution_affinity(tasks[index]) in preferred_affinities
                 )
                 else 1
             ),
@@ -18505,9 +18696,35 @@ def execute_download_tasks(
         method = getattr(runtime, "next_cooldown_delay", None)
         return method() if callable(method) else None
 
-    def next_task_retry_delay() -> float | None:
-        method = getattr(manifest, "next_retry_delay", None)
-        return method(plan_token) if callable(method) else None
+    def task_retry_wait_state() -> tuple[int, str | None, float | None]:
+        """Read the durable retry frontier once before a scheduler sleep.
+
+        The manifest contains millions of rows. Re-running COUNT/MIN over it
+        every 30 seconds merely to keep the scheduler heartbeat fresh turns a
+        quota wait into continuous page-cache traffic. No other process owns
+        task retry deadlines, so this frontier cannot move until this executor
+        wakes and attempts work again.
+        """
+        state_method = getattr(manifest, "retry_deferred_state", None)
+        if callable(state_method):
+            deferred, deadline = state_method(plan_token)
+            if deadline is None:
+                return int(deferred), None, None
+            try:
+                due = datetime.fromisoformat(str(deadline))
+                if due.tzinfo is None:
+                    due = due.replace(tzinfo=timezone.utc)
+                delay = max(
+                    0.0,
+                    (due - datetime.now(timezone.utc)).total_seconds(),
+                )
+            except ValueError:
+                delay = 0.0
+            return int(deferred), str(deadline), delay
+
+        delay_method = getattr(manifest, "next_retry_delay", None)
+        delay = delay_method(plan_token) if callable(delay_method) else None
+        return 0, None, delay
 
     def scheduling_provider(task: DownloadTask) -> str | None:
         """Predict the first provider that can actually consume this task.
@@ -18528,9 +18745,7 @@ def execute_download_tasks(
             available, reason = availability(provider, task.endpoint)
             if available:
                 return provider
-            local_bypass = getattr(
-                worker, "can_run_during_provider_cooldown", None
-            )
+            local_bypass = getattr(worker, "can_run_during_provider_cooldown", None)
             if (
                 callable(local_bypass)
                 and str(reason or "").startswith("cooldown until")
@@ -18689,6 +18904,7 @@ def execute_download_tasks(
         phase: str = "running",
         wait_reason: str | None = None,
         wait_delay: float | None = None,
+        retry_state: tuple[int, str | None] | None = None,
         force: bool = False,
     ) -> None:
         """Publish each provider's independent live queue and execution pool."""
@@ -18718,12 +18934,15 @@ def execute_download_tasks(
             if callable(unavailable_method)
             else set()
         )
-        retry_state_method = getattr(manifest, "retry_deferred_state", None)
-        retry_deferred_total, next_task_retry_at = (
-            retry_state_method(plan_token)
-            if callable(retry_state_method)
-            else (0, None)
-        )
+        if retry_state is None:
+            retry_state_method = getattr(manifest, "retry_deferred_state", None)
+            retry_deferred_total, next_task_retry_at = (
+                retry_state_method(plan_token)
+                if callable(retry_state_method)
+                else (0, None)
+            )
+        else:
+            retry_deferred_total, next_task_retry_at = retry_state
 
         def provider_key(provider: str | None) -> str:
             return "__unassigned__" if provider is None else str(provider)
@@ -19431,7 +19650,11 @@ def execute_download_tasks(
                         if refill(executor) > 0:
                             continue
                         provider_delay = next_cooldown_delay()
-                        task_retry_delay = next_task_retry_delay()
+                        (
+                            retry_deferred_total,
+                            next_task_retry_at,
+                            task_retry_delay,
+                        ) = task_retry_wait_state()
                         wait_candidates = [
                             (reason, delay)
                             for reason, delay in (
@@ -19445,19 +19668,37 @@ def execute_download_tasks(
                         wait_reason, delay = min(
                             wait_candidates, key=lambda item: float(item[1])
                         )
-                        scheduler_progress.set_postfix(
-                            status=wait_reason,
-                            waiting_s=max(0, int(delay)),
-                            refresh=False,
-                        )
-                        scheduler_progress.refresh()
-                        publish_scheduler_state(
-                            phase="waiting",
-                            wait_reason=wait_reason.replace(" ", "_"),
-                            wait_delay=delay,
-                            force=True,
-                        )
-                        time.sleep(min(30.0, max(0.05, delay)))
+                        # Keep the observable heartbeat fresh while sleeping,
+                        # but do not rescan the multi-million-row manifest at
+                        # every 30-second heartbeat. The executor is the sole
+                        # owner of retry deadlines and provider cooldowns.
+                        # Wall-clock deadlines are converted to a monotonic
+                        # sleep. Wake just after, not exactly on, the boundary:
+                        # an early wake by even a millisecond makes SQLite find
+                        # no eligible row and can defer that task until the next
+                        # unrelated retry deadline after an expensive empty scan.
+                        wait_deadline = time.monotonic() + max(0.05, delay + 0.1)
+                        while True:
+                            remaining = max(0.0, wait_deadline - time.monotonic())
+                            if remaining <= 0:
+                                break
+                            scheduler_progress.set_postfix(
+                                status=wait_reason,
+                                waiting_s=max(0, int(remaining)),
+                                refresh=False,
+                            )
+                            scheduler_progress.refresh()
+                            publish_scheduler_state(
+                                phase="waiting",
+                                wait_reason=wait_reason.replace(" ", "_"),
+                                wait_delay=remaining,
+                                retry_state=(
+                                    retry_deferred_total,
+                                    next_task_retry_at,
+                                ),
+                                force=True,
+                            )
+                            time.sleep(min(30.0, remaining))
                         continue
                     completed, _ = wait(
                         tuple(futures), timeout=1.0, return_when=FIRST_COMPLETED
@@ -19774,6 +20015,16 @@ def run(argv: Sequence[str] | None = None) -> int:
     start_date = args.start_date.strip()
     end_date = _resolve_end_date(args.end_date)
     _validate_dates(start_date, end_date)
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    phase_path = args.output_dir / "_state" / "downloader_phase.json"
+    _write_json_atomic(
+        phase_path,
+        {
+            "phase": "bootstrap",
+            "stage": "load_openbb_and_planner_fingerprints",
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
     quarantined_stale_temps = quarantine_stale_atomic_parquet_temps(args.output_dir)
     if quarantined_stale_temps:
         print(
@@ -19859,7 +20110,7 @@ def run(argv: Sequence[str] | None = None) -> int:
         end_date=end_date,
         excluded_literal_values=("crypto",),
     )
-    plan_token = _plan_token(
+    candidate_plan_token = _plan_token(
         start_date=start_date,
         end_date=end_date,
         markets=markets,
@@ -19884,17 +20135,18 @@ def run(argv: Sequence[str] | None = None) -> int:
     bootstrap_progress.update(1)
     bootstrap_progress.close()
 
-    args.output_dir.mkdir(parents=True, exist_ok=True)
     manifest = Manifest(
         args.output_dir / "_state" / "openbb_archive.sqlite3",
         show_progress=not args.no_progress,
     )
     try:
-        resumed_plan = (
-            _load_resumable_plan(
+        selected_plan = (
+            _select_resumable_plan(
                 args.output_dir,
                 manifest,
-                plan_token=plan_token,
+                candidate_plan_token=candidate_plan_token,
+                plan_scope_fingerprint=plan_scope_fingerprint,
+                command_fingerprint=command_fingerprint,
                 start_date=start_date,
                 end_date=end_date,
                 credential_names=credential_names,
@@ -19902,6 +20154,12 @@ def run(argv: Sequence[str] | None = None) -> int:
             if args.resume_existing_plan
             else None
         )
+        if selected_plan is None:
+            plan_token = candidate_plan_token
+            resumed_plan = None
+            resume_mode = "regenerated"
+        else:
+            plan_token, resumed_plan, resume_mode = selected_plan
         contract_rows = []
         if resumed_plan is None:
             plan_generation = datetime.now(timezone.utc).isoformat()
@@ -19916,7 +20174,6 @@ def run(argv: Sequence[str] | None = None) -> int:
             contract_rows, contract_summary = contract_auditor.finalize(coverage)
         else:
             task_count, coverage, contract_summary = resumed_plan
-        phase_path = args.output_dir / "_state" / "downloader_phase.json"
         _write_json_atomic(
             phase_path,
             {
@@ -19957,32 +20214,25 @@ def run(argv: Sequence[str] | None = None) -> int:
             stage="reconcile active plan membership", refresh=False
         )
         scope_key = f"plan_scope_fingerprint:{plan_token}"
-        compatible_plan_tokens = {
-            str(row[0])
-            for row in manifest.connection.execute(
-                """
-                SELECT DISTINCT plan_token FROM tasks
-                WHERE active=1 AND plan_token!=?
-                """,
-                (plan_token,),
-            ).fetchall()
-            if manifest.meta_value(f"plan_scope_fingerprint:{row[0]}")
-            == plan_scope_fingerprint
-        }
-        # Planner state predating scope fingerprints exists only for the
-        # default full archive entrypoint.  Adopt its catalog follow-ups once
-        # when the current run is that same pinned default scope; future
-        # transitions use the explicit fingerprint above.
-        legacy_scope_compatible = (
-            markets == {"us", "tw"}
-            and categories is None
-            and not endpoint_filters
-            and allowed_providers is None
-            and not disabled_providers
-            and args.limit_symbols is None
+        has_foreign_active_tasks = manifest.has_active_tasks_outside_plan(plan_token)
+        _write_json_atomic(
+            phase_path,
+            {
+                "phase": "manifest_maintenance",
+                "stage": "reconcile_active_plan_membership",
+                "plan_token": plan_token,
+                "foreign_active_tasks_present": has_foreign_active_tasks,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
         )
-        if legacy_scope_compatible:
-            compatible_plan_tokens.update(
+        if maintenance_current and not has_foreign_active_tasks:
+            # This plan already owns the fully reconciled active membership.
+            # Avoid a redundant DISTINCT scan and multi-million-row UPDATE on
+            # every supervisor recycle.
+            migrated_plan_followups = 0
+            retired_other_plan_tasks = 0
+        else:
+            compatible_plan_tokens = {
                 str(row[0])
                 for row in manifest.connection.execute(
                     """
@@ -19991,22 +20241,54 @@ def run(argv: Sequence[str] | None = None) -> int:
                     """,
                     (plan_token,),
                 ).fetchall()
-                if manifest.meta_value(f"plan_scope_fingerprint:{row[0]}") is None
+                if manifest.meta_value(f"plan_scope_fingerprint:{row[0]}")
+                == plan_scope_fingerprint
+            }
+            # Planner state predating scope fingerprints exists only for the
+            # default full archive entrypoint.  Adopt its catalog follow-ups once
+            # when the current run is that same pinned default scope; future
+            # transitions use the explicit fingerprint above.
+            legacy_scope_compatible = (
+                markets == {"us", "tw"}
+                and categories is None
+                and not endpoint_filters
+                and allowed_providers is None
+                and not disabled_providers
+                and args.limit_symbols is None
             )
-        followup_endpoints = {
-            item.endpoint
-            for item in coverage
-            if item.decision in {"included", "deferred"}
-        }
-        migrated_plan_followups, retired_other_plan_tasks = (
-            manifest.reconcile_active_plan_membership(
-                plan_token,
-                compatible_plan_tokens=compatible_plan_tokens,
-                followup_endpoints=followup_endpoints,
-                show_progress=not args.no_progress,
+            if legacy_scope_compatible:
+                compatible_plan_tokens.update(
+                    str(row[0])
+                    for row in manifest.connection.execute(
+                        """
+                        SELECT DISTINCT plan_token FROM tasks
+                        WHERE active=1 AND plan_token!=?
+                        """,
+                        (plan_token,),
+                    ).fetchall()
+                    if manifest.meta_value(f"plan_scope_fingerprint:{row[0]}") is None
+                )
+            followup_endpoints = {
+                item.endpoint
+                for item in coverage
+                if item.decision in {"included", "deferred"}
+            }
+            migrated_plan_followups, retired_other_plan_tasks = (
+                manifest.reconcile_active_plan_membership(
+                    plan_token,
+                    compatible_plan_tokens=compatible_plan_tokens,
+                    followup_endpoints=followup_endpoints,
+                    show_progress=not args.no_progress,
+                )
             )
-        )
         manifest.set_meta_value(scope_key, plan_scope_fingerprint)
+        manifest.set_meta_value(
+            f"plan_command_fingerprint:{plan_token}", command_fingerprint
+        )
+        if resume_mode != "compatible_scope":
+            manifest.set_meta_value(
+                f"plan_universe_fingerprint:{plan_token}", universe_fingerprint
+            )
         maintenance_progress.update(1)
         maintenance_progress.set_postfix(stage="retire legacy CFTC", refresh=False)
         deactivated_legacy_cftc = (
@@ -20064,11 +20346,15 @@ def run(argv: Sequence[str] | None = None) -> int:
         )
         maintenance_progress.update(1)
         maintenance_progress.set_postfix(stage="write catalogs", refresh=False)
-        # Coverage/universe rows are deterministic for the pinned plan, while
-        # provider pacing policy can improve between resumptions.  Rewrite the
-        # small atomic catalogs on every run so the auditable policy never
-        # lags the RPS values actually loaded by ProviderRuntime.
-        write_catalogs(context, coverage, credential_names)
+        # Provider pacing policy can improve between resumptions. Rewrite the
+        # small atomic runtime catalogs on every run, but retain the persisted
+        # universe when compatible resume deliberately ignores live CSV drift.
+        write_catalogs(
+            context,
+            coverage,
+            credential_names,
+            write_universes=resume_mode != "compatible_scope",
+        )
         maintenance_progress.update(1)
         maintenance_progress.set_postfix(
             stage="write completeness contracts", refresh=False
@@ -20079,57 +20365,87 @@ def run(argv: Sequence[str] | None = None) -> int:
         maintenance_progress.set_postfix(
             stage="repair SEC filing shards", refresh=False
         )
-        repaired_sec_filing_tasks = manifest.repair_sec_filings_columnar_shard_bug(
-            plan_token=plan_token
+        repaired_sec_filing_tasks = (
+            0
+            if maintenance_current
+            else manifest.repair_sec_filings_columnar_shard_bug(plan_token=plan_token)
         )
         maintenance_progress.update(1)
         maintenance_progress.set_postfix(
             stage="repair SEC filing headers", refresh=False
         )
-        repaired_sec_header_tasks = manifest.repair_sec_filing_headers_index_page_bug(
-            plan_token=plan_token
+        repaired_sec_header_tasks = (
+            0
+            if maintenance_current
+            else manifest.repair_sec_filing_headers_index_page_bug(
+                plan_token=plan_token
+            )
         )
         maintenance_progress.update(1)
         maintenance_progress.set_postfix(stage="repair country filters", refresh=False)
-        repaired_country_all_tasks = manifest.repair_invalid_country_all_filters(
-            plan_token=plan_token
+        repaired_country_all_tasks = (
+            0
+            if maintenance_current
+            else manifest.repair_invalid_country_all_filters(plan_token=plan_token)
         )
         maintenance_progress.update(1)
         maintenance_progress.set_postfix(
             stage="repair error classifications", refresh=False
         )
         repaired_transient_errors, repaired_entitlement_errors = (
-            manifest.repair_provider_error_classification(plan_token=plan_token)
+            (0, 0)
+            if maintenance_current
+            else manifest.repair_provider_error_classification(plan_token=plan_token)
         )
         maintenance_progress.update(1)
         maintenance_progress.set_postfix(
             stage="repair BLS nullable titles", refresh=False
         )
-        repaired_bls_title_tasks = manifest.repair_bls_missing_series_title_bug(
-            plan_token=plan_token
+        repaired_bls_title_tasks = (
+            0
+            if maintenance_current
+            else manifest.repair_bls_missing_series_title_bug(plan_token=plan_token)
         )
         maintenance_progress.update(1)
         maintenance_progress.set_postfix(
             stage="finalize provider outcomes", refresh=False
         )
         finalized_provider_outcomes = (
-            manifest.finalize_resolved_provider_outcome_pending(plan_token=plan_token)
+            0
+            if maintenance_current
+            else manifest.finalize_resolved_provider_outcome_pending(
+                plan_token=plan_token
+            )
         )
         maintenance_progress.update(1)
         maintenance_progress.set_postfix(
             stage="repair N-PORT containers", refresh=False
         )
-        repaired_sec_nport_containers = manifest.repair_sec_nport_list_container_bug(
-            plan_token=plan_token
+        repaired_sec_nport_containers = (
+            0
+            if maintenance_current
+            else manifest.repair_sec_nport_list_container_bug(plan_token=plan_token)
         )
         maintenance_progress.update(1)
         maintenance_progress.set_postfix(stage="prepare resumable run", refresh=False)
+        _write_json_atomic(
+            phase_path,
+            {
+                "phase": "manifest_maintenance",
+                "stage": "prepare_run",
+                "plan_token": plan_token,
+                "full_success_shard_audit": not maintenance_current,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
         manifest.prepare_run(
             retry_failed=args.retry_failed,
+            retry_repair_queue=args.retry_repair_queue,
             retry_permanent=args.retry_permanent,
             retry_empty=args.retry_empty,
             refresh=args.refresh,
             repair_legacy=not maintenance_current,
+            verify_successful_shards=not maintenance_current,
             plan_token=plan_token,
             show_progress=not args.no_progress,
         )
@@ -20139,10 +20455,23 @@ def run(argv: Sequence[str] | None = None) -> int:
         )
         maintenance_progress.update(1)
         maintenance_progress.close()
+        _write_json_atomic(
+            phase_path,
+            {
+                "phase": "runtime_reconciliation",
+                "stage": "provider_state",
+                "plan_token": plan_token,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
         if resumed_plan is not None:
             print(
                 "[openbb-plan] resumed_existing_plan="
-                f"{plan_token} active_tasks={manifest.active_task_count(plan_token):,}",
+                f"{plan_token} resume_mode={resume_mode} "
+                f"candidate_plan={candidate_plan_token} "
+                f"live_universe_drift_ignored="
+                f"{str(resume_mode == 'compatible_scope').lower()} "
+                f"active_tasks={manifest.active_task_count(plan_token):,}",
                 flush=True,
             )
         _print_plan_summary(context, task_count, coverage)
@@ -20394,9 +20723,7 @@ def run(argv: Sequence[str] | None = None) -> int:
                 flush=True,
             )
         repaired_transient_outcomes = (
-            manifest.repair_provider_transient_permanent_outcomes(
-                plan_token=plan_token
-            )
+            manifest.repair_provider_transient_permanent_outcomes(plan_token=plan_token)
         )
         if repaired_transient_outcomes:
             print(
@@ -20453,11 +20780,20 @@ def run(argv: Sequence[str] | None = None) -> int:
                 f"{restored_bulk_unavailable:,}",
                 flush=True,
             )
-        inferred_tiingo_tw_routes = manifest.empty_only_provider_domain_routes(
-            "tiingo",
-            "tw",
-            plan_token=plan_token,
-            minimum_distinct_scopes=25,
+        persisted_tiingo_tw_routes = {
+            endpoint
+            for provider, endpoint, domain in runtime.unavailable_domains()
+            if provider == "tiingo" and domain == "tw"
+        }
+        inferred_tiingo_tw_routes = (
+            {}
+            if persisted_tiingo_tw_routes
+            else manifest.empty_only_provider_domain_routes(
+                "tiingo",
+                "tw",
+                plan_token=plan_token,
+                minimum_distinct_scopes=25,
+            )
         )
         inferred_tiingo_tw_unavailable = 0
         for endpoint, empty_scopes in inferred_tiingo_tw_routes.items():
@@ -20484,14 +20820,31 @@ def run(argv: Sequence[str] | None = None) -> int:
                 f"fully_disabled_tasks={inferred_tiingo_tw_unavailable:,}",
                 flush=True,
             )
-        reconciled_shards, quarantined_shards = (
-            manifest.quarantine_terminal_output_shards(plan_token=plan_token)
-        )
-        print(
-            "[openbb-quarantine] reconciled_active_shards="
-            f"{reconciled_shards:,} quarantined={quarantined_shards:,}",
-            flush=True,
-        )
+        if maintenance_current:
+            reconciled_shards, quarantined_shards = 0, 0
+            print(
+                "[openbb-quarantine] full_filesystem_reconciliation="
+                "deferred_verified_resume",
+                flush=True,
+            )
+        else:
+            _write_json_atomic(
+                phase_path,
+                {
+                    "phase": "runtime_reconciliation",
+                    "stage": "parquet_ownership_audit",
+                    "plan_token": plan_token,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+            reconciled_shards, quarantined_shards = (
+                manifest.quarantine_terminal_output_shards(plan_token=plan_token)
+            )
+            print(
+                "[openbb-quarantine] reconciled_active_shards="
+                f"{reconciled_shards:,} quarantined={quarantined_shards:,}",
+                flush=True,
+            )
         entitlement_probe_task_ids = manifest.prioritize_fmp_entitlement_probes(
             plan_token,
             end_date,

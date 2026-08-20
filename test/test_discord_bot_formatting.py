@@ -1738,9 +1738,9 @@ def test_signal_sanity_blocks_implausible_latest_return() -> None:
 
 def test_zero_turnover_cap_is_disabled_in_signal_sanity() -> None:
     cfg = SimpleNamespace(
-        market="tw_day_trade_1m",
-        label="台股當沖 1m",
-        config_path="configs/markets/tw_day_trade_1m.yaml",
+        market="tw_day_trade_100m",
+        label="台股當沖 100m",
+        config_path="configs/deployments/tw_day_trade_100m_fold11.yaml",
     )
     gross_limit, turnover_limit = _config_trading_limits(cfg)
     summary = {

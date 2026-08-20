@@ -62,7 +62,6 @@ CONTINUOUS_WEIGHT_EXECUTION_MODES: Final[tuple[str, ...]] = (
     *TW_FUTURES_PORTFOLIO_EXECUTION_MODES,
 )
 FEE_ROUNDING_MODES: Final[tuple[str, ...]] = ("none", "floor", "half_up")
-_DIRECTIONAL_GROSS_EPS: Final[float] = 1.0e-12
 
 # These are market-wide statutory floors, not per-security margin schedules.
 # End dates are exclusive so each interval explicitly records the first 90%
@@ -297,7 +296,9 @@ def official_tw_short_initial_margin_rates(dates: object) -> np.ndarray:
     if raw_dates.dtype.kind == "O":
         for value in raw_dates.flat:
             if isinstance(value, (bool, Real)):
-                raise ValueError("dates must contain date-like values, not numeric offsets")
+                raise ValueError(
+                    "dates must contain date-like values, not numeric offsets"
+                )
     try:
         normalized_dates = np.asarray(dates, dtype="datetime64[D]")
     except (TypeError, ValueError, OverflowError) as exc:
@@ -343,7 +344,9 @@ class TaiwanMarginShortSchedule:
                 minimum=1.0,
             ),
         )
-        object.__setattr__(self, "lot_size", _positive_integer("lot_size", self.lot_size))
+        object.__setattr__(
+            self, "lot_size", _positive_integer("lot_size", self.lot_size)
+        )
         object.__setattr__(
             self,
             "handling_fee_rate",
@@ -406,7 +409,9 @@ class TaiwanFeeSchedule:
             "minimum_commission",
         )
         for name in rate_names:
-            object.__setattr__(self, name, _finite_nonnegative_rate(name, getattr(self, name)))
+            object.__setattr__(
+                self, name, _finite_nonnegative_rate(name, getattr(self, name))
+            )
 
         if self.commission_discount > 1.0:
             raise ValueError("commission_discount must be between 0 and 1 inclusive")
@@ -455,189 +460,6 @@ class TaiwanFeeSchedule:
 DEFAULT_TAIWAN_FEE_SCHEDULE: Final[TaiwanFeeSchedule] = TaiwanFeeSchedule()
 
 
-@dataclass(frozen=True, slots=True)
-class DirectionalLotMixAudit:
-    """Portfolio-level audit for conservative whole-lot direction matching.
-
-    A continuous long/short target can lose one side after whole-lot rounding,
-    eligibility, or demonstrated-liquidity caps.  The executor may reduce the
-    side with the higher fill rate, but it must never increase either side or
-    silently turn a two-sided model request into a one-sided portfolio.
-    """
-
-    target_long_gross: float
-    target_short_gross: float
-    pre_balance_long_gross: float
-    pre_balance_short_gross: float
-    post_balance_long_gross: float
-    post_balance_short_gross: float
-    common_fill_rate: float
-    adjusted: bool
-    collapsed_to_flat: bool
-
-
-def preserve_directional_lot_mix(
-    target_weights: object,
-    executable_shares: object,
-    entry_prices: object,
-    lot_sizes: object,
-    *,
-    capital: float,
-) -> tuple[np.ndarray, DirectionalLotMixAudit]:
-    """Reduce whole-lot fills so they preserve the requested long/short mix.
-
-    The function is deliberately one-way: it can remove already-admissible
-    lots but never add a lot, exceed a per-name model request, or invent market
-    depth.  If a genuinely two-sided target cannot retain both sides after
-    discrete sizing, the complete portfolio fails closed to flat.
-    """
-
-    weights = np.asarray(target_weights, dtype=np.float64)
-    raw_shares = np.asarray(executable_shares)
-    prices = np.asarray(entry_prices, dtype=np.float64)
-    raw_lots = np.asarray(lot_sizes)
-    if weights.ndim != 1:
-        raise ValueError("target_weights must be one-dimensional")
-    shape = weights.shape
-    if raw_shares.shape != shape or prices.shape != shape or raw_lots.shape != shape:
-        raise ValueError(
-            "executable_shares, entry_prices, and lot_sizes must match target_weights"
-        )
-    if not np.all(np.isfinite(weights)):
-        raise ValueError("target_weights must be finite")
-    if isinstance(capital, bool):
-        raise ValueError("capital must be finite and positive")
-    resolved_capital = float(capital)
-    if not math.isfinite(resolved_capital) or resolved_capital <= 0.0:
-        raise ValueError("capital must be finite and positive")
-
-    shares_float = np.asarray(raw_shares, dtype=np.float64)
-    lots_float = np.asarray(raw_lots, dtype=np.float64)
-    if not np.all(np.isfinite(shares_float)) or np.any(shares_float < 0.0):
-        raise ValueError("executable_shares must be finite and non-negative")
-    if not np.all(shares_float == np.floor(shares_float)):
-        raise ValueError("executable_shares must contain integer share counts")
-    if not np.all(np.isfinite(lots_float)) or np.any(lots_float <= 0.0):
-        raise ValueError("lot_sizes must contain positive integers")
-    if not np.all(lots_float == np.floor(lots_float)):
-        raise ValueError("lot_sizes must contain positive integers")
-    shares = shares_float.astype(np.int64)
-    lots = lots_float.astype(np.int64)
-    if np.any(shares % lots != 0):
-        raise ValueError("executable_shares must align with lot_sizes")
-    active = shares > 0
-    if np.any(active & (~np.isfinite(prices) | (prices <= 0.0))):
-        raise ValueError("positive executable_shares require finite positive prices")
-    if np.any(active & (weights == 0.0)):
-        raise ValueError("positive executable_shares require non-zero target weights")
-
-    long_target = weights > 0.0
-    short_target = weights < 0.0
-    target_long = float(np.sum(weights[long_target]))
-    target_short = float(np.sum(-weights[short_target]))
-
-    notionals = np.zeros(shape, dtype=np.float64)
-    notionals[active] = shares[active].astype(np.float64) * prices[active]
-    pre_long = float(np.sum(notionals[long_target]) / resolved_capital)
-    pre_short = float(np.sum(notionals[short_target]) / resolved_capital)
-    two_sided = (
-        target_long > _DIRECTIONAL_GROSS_EPS
-        and target_short > _DIRECTIONAL_GROSS_EPS
-    )
-    long_fill_rate = pre_long / target_long if target_long > 0.0 else 0.0
-    short_fill_rate = pre_short / target_short if target_short > 0.0 else 0.0
-    common_fill_rate = min(long_fill_rate, short_fill_rate) if two_sided else 0.0
-    adjusted = shares.copy()
-
-    def prune_side(side_mask: np.ndarray, desired_gross: float) -> None:
-        current_notional = float(
-            np.sum(adjusted[side_mask].astype(np.float64) * prices[side_mask])
-        )
-        desired_notional = max(0.0, desired_gross * resolved_capital)
-        tolerance = max(1.0e-9, desired_notional * 1.0e-12)
-        if current_notional <= desired_notional + tolerance:
-            return
-        # Rebuild the admissible side from highest to lowest conviction.  This
-        # is equivalent to removing low-conviction lots first, but unlike a
-        # one-name boundary rule it can skip an unaffordably coarse lot and
-        # continue into smaller lots without leaving a material side mismatch.
-        candidates = np.flatnonzero(side_mask & (adjusted > 0))
-        candidates = candidates[
-            np.argsort(-np.abs(weights[candidates]), kind="stable")
-        ]
-        available = adjusted.copy()
-        adjusted[candidates] = 0
-        remaining = desired_notional
-        for index in candidates:
-            lot_notional = float(prices[index] * lots[index])
-            available_lots = int(available[index] // lots[index])
-            take_lots = min(
-                available_lots,
-                max(0, int(math.floor((remaining + tolerance) / lot_notional))),
-            )
-            if take_lots:
-                adjusted[index] = take_lots * lots[index]
-                remaining -= take_lots * lot_notional
-
-        # At most one additional lot can improve the residual error.  Prefer
-        # staying below the desired gross on an exact tie, because the repair
-        # is conservative and must never create avoidable excess exposure.
-        underfill_error = max(0.0, remaining)
-        best_index: int | None = None
-        best_error = underfill_error
-        for index in candidates:
-            if adjusted[index] >= available[index]:
-                continue
-            candidate_error = abs(
-                remaining - float(prices[index] * lots[index])
-            )
-            if candidate_error + tolerance < best_error:
-                best_index = int(index)
-                best_error = candidate_error
-        if best_index is not None:
-            adjusted[best_index] += lots[best_index]
-
-    if two_sided:
-        prune_side(long_target, target_long * common_fill_rate)
-        prune_side(short_target, target_short * common_fill_rate)
-
-    post_active = adjusted > 0
-    post_notionals = np.zeros(shape, dtype=np.float64)
-    post_notionals[post_active] = (
-        adjusted[post_active].astype(np.float64) * prices[post_active]
-    )
-    post_long = float(np.sum(post_notionals[long_target]) / resolved_capital)
-    post_short = float(np.sum(post_notionals[short_target]) / resolved_capital)
-    one_sided_after_balance = bool(
-        two_sided
-        and (
-            (post_long > _DIRECTIONAL_GROSS_EPS)
-            != (post_short > _DIRECTIONAL_GROSS_EPS)
-        )
-    )
-    collapsed = bool(
-        one_sided_after_balance
-        or (two_sided and common_fill_rate <= _DIRECTIONAL_GROSS_EPS)
-    )
-    if collapsed:
-        adjusted.fill(0)
-        post_long = 0.0
-        post_short = 0.0
-
-    audit = DirectionalLotMixAudit(
-        target_long_gross=target_long,
-        target_short_gross=target_short,
-        pre_balance_long_gross=pre_long,
-        pre_balance_short_gross=pre_short,
-        post_balance_long_gross=post_long,
-        post_balance_short_gross=post_short,
-        common_fill_rate=common_fill_rate,
-        adjusted=bool(np.any(adjusted != shares)),
-        collapsed_to_flat=collapsed,
-    )
-    return adjusted, audit
-
-
 def _coerce_fee_schedule(value: TaiwanFeeSchedule | None) -> TaiwanFeeSchedule:
     if value is None:
         return DEFAULT_TAIWAN_FEE_SCHEDULE
@@ -684,12 +506,16 @@ def _security_type_overrides(
             )
             previous = by_symbol.get(symbol)
             if previous is not None and previous != security_type:
-                raise ValueError(f"conflicting security type overrides for symbol {symbol!r}")
+                raise ValueError(
+                    f"conflicting security type overrides for symbol {symbol!r}"
+                )
             by_symbol[symbol] = security_type
         return tuple(by_symbol.get(symbol) for symbol in symbols)
 
     if isinstance(security_types, (str, bytes)):
-        raise ValueError("security_types must be a mapping or a sequence aligned with symbols")
+        raise ValueError(
+            "security_types must be a mapping or a sequence aligned with symbols"
+        )
     try:
         raw_types = tuple(security_types)
     except TypeError as exc:
@@ -769,7 +595,9 @@ def effective_fee_rate_vectors(
         raise AssertionError(f"unhandled Taiwan execution mode: {mode}")
 
     for index, security_type in enumerate(resolved_types):
-        sell_fees[index] = commission + (stock_tax if security_type == "stock" else etf_tax)
+        sell_fees[index] = commission + (
+            stock_tax if security_type == "stock" else etf_tax
+        )
     return buy_fees, sell_fees
 
 
@@ -896,9 +724,7 @@ def lot_size_vector(
 
     if mode in TW_CARRYING_EXECUTION_MODES:
         if per_symbol_lot_sizes is not None:
-            raise ValueError(
-                "per_symbol_lot_sizes is supported only for tw_day_trade"
-            )
+            raise ValueError("per_symbol_lot_sizes is supported only for tw_day_trade")
         return np.full(len(normalized_symbols), schedule.cash_lot_size, dtype=np.int64)
 
     if mode != "tw_day_trade":
@@ -970,7 +796,6 @@ __all__ = [
     "TW_MINUTE_EXECUTION_MODES",
     "TW_FUTURES_PORTFOLIO_EXECUTION_MODES",
     "FEE_ROUNDING_MODES",
-    "DirectionalLotMixAudit",
     "TaiwanFeeSchedule",
     "TaiwanMarginShortSchedule",
     "build_commission_rebate_rate_vector",
@@ -984,7 +809,6 @@ __all__ = [
     "normalize_execution_mode",
     "normalize_fee_rounding",
     "official_tw_short_initial_margin_rates",
-    "preserve_directional_lot_mix",
     "require_naive_execution_for_tool",
     "settlement_session_indices",
 ]

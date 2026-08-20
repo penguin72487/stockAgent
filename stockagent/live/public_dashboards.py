@@ -52,9 +52,14 @@ def _scrub_public_value(value: Any) -> Any:
         output: dict[str, Any] = {}
         for raw_key, item in value.items():
             key = str(raw_key)
-            if key in dropped_keys or key.endswith("_path") or key.endswith("_dir"):
+            if (
+                key in dropped_keys
+                or key.endswith("_path")
+                or key.endswith("_dir")
+                or key.endswith("_file")
+            ):
                 continue
-            if key in {"error", "readiness_error"}:
+            if key == "error" or key.endswith("_error"):
                 output[key] = "unavailable" if item else None
                 continue
             output[key] = _scrub_public_value(item)
@@ -153,8 +158,14 @@ def sanitize_taifex_history(payload: Mapping[str, Any]) -> dict[str, Any]:
             "decision_ts_ns",
             "fixed_capital_return",
             "initial_capital_twd",
+            "cumulative_contributed_capital_twd",
             "strategy_id",
             "total_equity_twd",
+            "capital_contribution_count",
+            "recapitalization_count",
+            "bankruptcy_count",
+            "entry_state",
+            "alive",
             "valuation_carried_forward",
             "history_source",
             "replay_id",
@@ -173,6 +184,7 @@ def sanitize_taifex_history(payload: Mapping[str, Any]) -> dict[str, Any]:
             for field in (
                 "cumulative_pnl_twd",
                 "initial_capital_twd",
+                "cumulative_contributed_capital_twd",
                 "total_equity_twd",
             ):
                 if isinstance(row.get(field), float):
@@ -331,6 +343,11 @@ def sanitize_tw_history(payload: Mapping[str, Any]) -> dict[str, Any]:
         "raw_points_in_range",
         "returned_points",
         "downsampled",
+        "historical_minute_replay_points",
+        "historical_minute_carried_price_points",
+        "historical_minute_missing_price_points",
+        "historical_minute_min_fresh_trade_notional_coverage_ratio",
+        "historical_minute_mean_fresh_trade_notional_coverage_ratio",
         "history",
     }
     output = {
@@ -350,6 +367,14 @@ def sanitize_tw_history(payload: Mapping[str, Any]) -> dict[str, Any]:
             "return_fraction",
             "return_pct",
             "valuation_stale",
+            "historical_minute_replay",
+            "minute_valuation_contract",
+            "valuation_source",
+            "valuation_executable",
+            "fresh_trade_position_count",
+            "last_trade_carried_position_count",
+            "missing_price_position_count",
+            "fresh_trade_notional_coverage_ratio",
         },
     )
     return output
@@ -379,6 +404,8 @@ def sanitize_tw_signals(payload: Mapping[str, Any]) -> dict[str, Any]:
         "direction_summary",
         "opening_execution_audit_scope",
         "opening_execution_audit",
+        "feature_drivers_scope",
+        "feature_drivers_by_signal",
         "rows",
     }
     output = _scrub_public_value(

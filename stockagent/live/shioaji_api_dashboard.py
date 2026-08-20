@@ -19,6 +19,8 @@ import threading
 import time
 from typing import Any, Callable, Final, Iterable, Sequence
 
+from stockagent.data.taifex_sessions import taifex_session_kind
+
 
 HISTORY_UNIT: Final[str] = "stockagent-shioaji-tx-history-backfill.service"
 CAPTURE_UNIT: Final[str] = "stockagent-shioaji-taifex-bidask.service"
@@ -1033,8 +1035,13 @@ def _latest_capture_mtime(root: Path) -> float:
             if not trade_dates:
                 continue
             hours = sorted(trade_dates[-1].glob("hour=*"))
-            target = hours[-1] if hours else trade_dates[-1]
-            latest = max(latest, target.stat().st_mtime)
+            # A TAIFEX trading date contains the preceding night session as
+            # well as the current day session.  ``hour=23`` is therefore not
+            # necessarily newer than ``hour=13`` on disk.  Compare the small
+            # fixed set of hour directories by mtime instead of assuming their
+            # lexical order is chronological for filesystem writes.
+            targets = hours or [trade_dates[-1]]
+            latest = max(latest, *(target.stat().st_mtime for target in targets))
         except OSError:
             continue
     return latest
@@ -1244,12 +1251,15 @@ def _capture_status(
             workers[worker_index] = (contracts, subscriptions)
     latest_epoch = _latest_capture_mtime(paths.capture_root)
     age = max(0.0, now.timestamp() - latest_epoch) if latest_epoch else None
+    market_session = taifex_session_kind(now, include_preopen=True)
     if not service.get("active"):
         state = "stopped"
     elif age is None:
         state = "starting"
     elif age <= 120:
         state = "capturing"
+    elif market_session == "closed":
+        state = "waiting"
     else:
         state = "quiet"
     return {
@@ -2145,6 +2155,8 @@ def build_shioaji_public_status(
         health = "waiting"
     elif capture.get("state") == "capturing":
         health = "active"
+    elif capture.get("state") == "waiting":
+        health = "waiting"
     else:
         health = "stale"
 

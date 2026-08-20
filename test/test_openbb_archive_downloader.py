@@ -115,6 +115,7 @@ from downloader.download_openbb_archive import (
     _is_intrinio_large_page_or_bulk_url,
     _is_yahoo_http_url,
     _load_resumable_plan,
+    _select_resumable_plan,
     _pop_fairest_endpoint_task,
     _task_execution_affinity,
     _task_retry_delay_seconds,
@@ -2499,9 +2500,7 @@ def test_manifest_requeues_transport_outcome_misclassified_permanent(
         manifest.connection.commit()
 
         assert (
-            manifest.repair_provider_transient_permanent_outcomes(
-                plan_token="plan"
-            )
+            manifest.repair_provider_transient_permanent_outcomes(plan_token="plan")
             == 1
         )
         row = manifest.connection.execute(
@@ -2620,6 +2619,10 @@ def test_manifest_requeues_unavailable_outcome_without_durable_evidence(
         )
 
         assert repaired == 1
+        assert (
+            manifest.repair_unproven_provider_outcomes({}, {}, {}, plan_token="plan")
+            == 0
+        )
         rows = {
             row["scope_key"]: row
             for row in manifest.connection.execute(
@@ -2681,6 +2684,7 @@ def test_manifest_requeues_only_permanent_outcome_without_error_evidence(
         repaired = manifest.repair_unproven_permanent_outcomes(plan_token="plan")
 
         assert repaired == 1
+        assert manifest.repair_unproven_permanent_outcomes(plan_token="plan") == 0
         rows = {
             row["scope_key"]: row
             for row in manifest.connection.execute(
@@ -4626,9 +4630,7 @@ def test_fmp_historical_eps_workaround_sends_exact_entitlement_limit(
         user=SimpleNamespace(credentials=SimpleNamespace(fmp_api_key="secret"))
     )
 
-    rows = _fetch_fmp_historical_eps_workaround(
-        {"symbol": "AAPL", "limit": 5}, obb
-    )
+    rows = _fetch_fmp_historical_eps_workaround({"symbol": "AAPL", "limit": 5}, obb)
 
     assert len(rows) == 5
     assert observed == [("earnings", {"symbol": "AAPL", "limit": 5}, "secret")]
@@ -7215,9 +7217,7 @@ def test_bls_labstat_reads_indexed_bulk_and_computes_changes(
     assert all(row["_bls_labstat_prefix"] == "ws" for row in records)
 
 
-def test_worker_uses_bls_bulk_during_api_cooldown(
-    monkeypatch, tmp_path: Path
-) -> None:
+def test_worker_uses_bls_bulk_during_api_cooldown(monkeypatch, tmp_path: Path) -> None:
     runtime = ProviderRuntime(
         {"bls": 5.0},
         {"bls": 2},
@@ -7273,9 +7273,7 @@ def test_worker_uses_bls_bulk_during_api_cooldown(
     table = pq.read_table(tmp_path / "bls.parquet")
     assert table.num_rows == 1
     assert table.column("_provider").to_pylist() == ["bls"]
-    assert table.column("_openbb_endpoint").to_pylist() == [
-        "economy.survey.bls_series"
-    ]
+    assert table.column("_openbb_endpoint").to_pylist() == ["economy.survey.bls_series"]
 
 
 def test_bls_resilient_fetch_splits_only_timed_out_payloads(monkeypatch) -> None:
@@ -7620,6 +7618,13 @@ def test_manifest_resume_skips_success_and_recovers_missing_output(
         manifest.prepare_run(retry_failed=True, retry_empty=False, refresh=False)
         assert manifest.pending_batch(10, 20) == []
         output.unlink()
+        manifest.prepare_run(
+            retry_failed=True,
+            retry_empty=False,
+            refresh=False,
+            verify_successful_shards=False,
+        )
+        assert manifest.pending_batch(10, 20) == []
         manifest.prepare_run(retry_failed=True, retry_empty=False, refresh=False)
         assert [item.task_id for item in manifest.pending_batch(10, 20)] == [
             task.task_id
@@ -8426,6 +8431,57 @@ def test_verified_existing_plan_resume_is_fail_closed(tmp_path: Path) -> None:
             PLANNER_STATE_VERSION
         )
 
+        scope_fingerprint = "same-pinned-archive-scope"
+        manifest.set_meta_value(
+            f"plan_scope_fingerprint:{plan_token}", scope_fingerprint
+        )
+        selected = _select_resumable_plan(
+            tmp_path,
+            manifest,
+            candidate_plan_token="changed-live-universe-token",
+            plan_scope_fingerprint=scope_fingerprint,
+            command_fingerprint="openbb-command-v1",
+            start_date="2000-01-01",
+            end_date="2026-07-18",
+            credential_names={"fmp_api_key"},
+        )
+        assert selected is not None
+        assert selected[0] == plan_token
+        assert selected[1][0] == 1
+        assert selected[2] == "compatible_scope"
+        assert (
+            manifest.meta_value(f"plan_command_fingerprint:{plan_token}")
+            == "openbb-command-v1"
+        )
+
+        # A real OpenBB command/schema or user-scope change still fails closed.
+        assert (
+            _select_resumable_plan(
+                tmp_path,
+                manifest,
+                candidate_plan_token="changed-command-token",
+                plan_scope_fingerprint=scope_fingerprint,
+                command_fingerprint="openbb-command-v2",
+                start_date="2000-01-01",
+                end_date="2026-07-18",
+                credential_names={"fmp_api_key"},
+            )
+            is None
+        )
+        assert (
+            _select_resumable_plan(
+                tmp_path,
+                manifest,
+                candidate_plan_token="changed-scope-token",
+                plan_scope_fingerprint="different-scope",
+                command_fingerprint="openbb-command-v1",
+                start_date="2000-01-01",
+                end_date="2026-07-18",
+                credential_names={"fmp_api_key"},
+            )
+            is None
+        )
+
         assert (
             _load_resumable_plan(
                 tmp_path,
@@ -8883,12 +8939,14 @@ def test_manifest_plan_transition_adopts_compatible_followups_and_retires_old_pl
             plan_token="new-plan",
             plan_generation="new",
         )
+        assert manifest.has_active_tasks_outside_plan("new-plan") is True
         migrated, retired = manifest.reconcile_active_plan_membership(
             "new-plan",
             compatible_plan_tokens={"old-plan"},
             followup_endpoints={"economy.fred_series"},
         )
         assert (migrated, retired) == (1, 2)
+        assert manifest.has_active_tasks_outside_plan("new-plan") is False
         active = manifest.connection.execute(
             "SELECT scope_key,plan_token,task_source FROM tasks "
             "WHERE active=1 ORDER BY scope_key"
@@ -9758,8 +9816,9 @@ def test_worker_defers_transient_failure_and_counts_attempt(tmp_path: Path) -> N
     assert result.retry_not_before is not None
 
 
-def test_worker_http_500_uses_task_backoff_without_immediate_or_global_retry(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+def test_worker_congress_http_500_parks_for_later_repair_without_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     context = _context(tmp_path)
     task = make_task(
@@ -9796,14 +9855,113 @@ def test_worker_http_500_uses_task_backoff_without_immediate_or_global_retry(
     result = worker(task)
 
     assert calls == 1
-    assert result.status == "pending"
+    assert result.status == "repair"
     assert result.attempts == 1
-    assert result.transient_failures == 1
-    assert result.retry_not_before is not None
+    assert result.transient_failures == 0
+    assert result.retry_not_before is None
     assert runtime.cooldown_providers() == set()
-    delay = datetime.fromisoformat(result.retry_not_before) - datetime.now(timezone.utc)
-    assert TASK_RETRY_BASE_SECONDS * 0.79 < delay.total_seconds()
-    assert delay.total_seconds() <= TASK_RETRY_BASE_SECONDS
+
+
+def test_manifest_repair_queue_is_opt_in_and_reparks_after_same_failure(
+    tmp_path: Path,
+) -> None:
+    context = _context(tmp_path)
+    task = make_task(
+        context,
+        "uscongress.bill_info",
+        "118/hr/1",
+        {"congress": 118, "bill_type": "hr", "bill_number": 1},
+        ("congress_gov",),
+    )
+    manifest = Manifest(tmp_path / "_state" / "openbb_archive.sqlite3")
+    try:
+        manifest.upsert_tasks([task], plan_token="repair-pass")
+        manifest.claim([task])
+        manifest.complete(
+            TaskResult(
+                task,
+                "repair",
+                "congress_gov",
+                0,
+                None,
+                1,
+                error="congress_gov: HTTP Error 500: Internal Server Error",
+            )
+        )
+
+        manifest.prepare_run(
+            retry_failed=True,
+            retry_repair_queue=False,
+            retry_empty=False,
+            refresh=False,
+            repair_legacy=False,
+            verify_successful_shards=False,
+            plan_token="repair-pass",
+        )
+        assert manifest.pending_count(20, "repair-pass") == 0
+        assert manifest.counts("repair-pass") == {"repair": 1}
+
+        manifest.prepare_run(
+            retry_failed=True,
+            retry_repair_queue=True,
+            retry_empty=False,
+            refresh=False,
+            repair_legacy=False,
+            verify_successful_shards=False,
+            plan_token="repair-pass",
+        )
+        assert [
+            item.task_id for item in manifest.pending_batch(1, 20, "repair-pass")
+        ] == [task.task_id]
+    finally:
+        manifest.close()
+
+
+def test_manifest_migrates_legacy_congress_http_500_into_repair_queue(
+    tmp_path: Path,
+) -> None:
+    context = _context(tmp_path)
+    task = make_task(
+        context,
+        "uscongress.amendment_info",
+        "112/samdt/3339",
+        {"amendment_url": "https://api.congress.gov/v3/amendment/112/samdt/3339"},
+        ("congress_gov",),
+    )
+    path = tmp_path / "_state" / "openbb_archive.sqlite3"
+    manifest = Manifest(path)
+    try:
+        manifest.upsert_tasks([task], plan_token="legacy-congress-500")
+        manifest.connection.execute(
+            "UPDATE tasks SET attempts=42704, transient_failures=21, "
+            "retry_not_before=?, error=? WHERE task_id=?",
+            (
+                (datetime.now(timezone.utc) + timedelta(days=1)).isoformat(),
+                "congress_gov: HTTPError: HTTP Error 500: Internal Server Error",
+                task.task_id,
+            ),
+        )
+        manifest.connection.execute(
+            "DELETE FROM archive_meta WHERE key='congress_http_500_repair_queue_v1'"
+        )
+        manifest.connection.commit()
+    finally:
+        manifest.close()
+
+    migrated = Manifest(path)
+    try:
+        row = migrated.connection.execute(
+            "SELECT status,retry_not_before,attempts FROM tasks WHERE task_id=?",
+            (task.task_id,),
+        ).fetchone()
+        assert dict(row) == {
+            "status": "repair",
+            "retry_not_before": None,
+            "attempts": 42704,
+        }
+        assert migrated.pending_count(20, "legacy-congress-500") == 0
+    finally:
+        migrated.close()
 
 
 def test_task_retry_delay_is_exponential_bounded_and_deterministic() -> None:
@@ -10654,10 +10812,10 @@ def test_manifest_task_retry_deadline_survives_restart_and_gates_claim(
     task = replace(
         make_task(
             context,
-            "uscongress.bill_info",
-            "118/hr/1",
-            {"congress": 118, "bill_type": "hr", "bill_number": 1},
-            ("congress_gov",),
+            "equity.price.historical",
+            "AAPL",
+            {"symbol": "AAPL"},
+            ("yfinance",),
         ),
         task_id="congress-http-500",
     )
@@ -10671,11 +10829,11 @@ def test_manifest_task_retry_deadline_survives_restart_and_gates_claim(
             TaskResult(
                 task,
                 "pending",
-                "congress_gov",
+                "yfinance",
                 0,
                 None,
                 1,
-                error="congress_gov: HTTP Error 500",
+                error="yfinance: HTTP Error 500",
                 retry_not_before=deadline,
                 transient_failures=7,
             )
@@ -11085,9 +11243,7 @@ def test_hot_provider_refill_keeps_local_bulk_path_alive_during_api_cooldown(
 
     monkeypatch.setattr(manifest, "pending_batch", one_full_scan_only)
     try:
-        manifest.upsert_tasks(
-            [*bls_tasks, yahoo_task], plan_token="bls-local-refill"
-        )
+        manifest.upsert_tasks([*bls_tasks, yahoo_task], plan_token="bls-local-refill")
         attempted, totals = execute_download_tasks(
             context,
             manifest,

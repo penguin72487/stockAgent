@@ -111,9 +111,7 @@ def _assert_tensor_condition(condition: torch.Tensor, message: str) -> None:
         raise ValueError(message)
 
 
-def get_tw_day_trade_daily_compile_stats(
-    *, reset: bool = False
-) -> dict[str, int]:
+def get_tw_day_trade_daily_compile_stats(*, reset: bool = False) -> dict[str, int]:
     """Return process-local compile audit counters for the daily executor."""
 
     snapshot = dict(_COMPILE_STATS)
@@ -133,38 +131,6 @@ def _cap_from_reference_notional(
     safe_scale = torch.where(binds, equity_scale, torch.ones_like(equity_scale))
     capped = torch.where(binds, reference_cap / safe_scale, requested)
     return torch.where(valid, capped, torch.zeros_like(capped))
-
-
-def _preserve_requested_side_mix(
-    requested: torch.Tensor,
-    executable: torch.Tensor,
-) -> torch.Tensor:
-    """Reduce only the better-filled side of a two-sided request."""
-
-    eps = requested.new_tensor(1.0e-12)
-    requested_long = requested.clamp_min(0.0).sum()
-    requested_short = (-requested.clamp_max(0.0)).sum()
-    executable_long = executable.clamp_min(0.0).sum()
-    executable_short = (-executable.clamp_max(0.0)).sum()
-    both_requested = (requested_long > eps) & (requested_short > eps)
-    either_missing = (executable_long <= eps) | (executable_short <= eps)
-    long_fill = executable_long / requested_long.clamp_min(eps)
-    short_fill = executable_short / requested_short.clamp_min(eps)
-    common_fill = torch.minimum(long_fill, short_fill)
-    long_scale = torch.minimum(
-        torch.ones_like(common_fill), common_fill / long_fill.clamp_min(eps)
-    )
-    short_scale = torch.minimum(
-        torch.ones_like(common_fill), common_fill / short_fill.clamp_min(eps)
-    )
-    scaled = torch.where(
-        executable > 0.0,
-        executable * long_scale,
-        executable * short_scale,
-    )
-    fail_closed = executable + (torch.zeros_like(executable) - executable).detach()
-    scaled = torch.where(both_requested & either_missing, fail_closed, scaled)
-    return torch.where(both_requested, scaled, executable)
 
 
 def _run_day(
@@ -250,8 +216,6 @@ def _run_day(
         torch.ones_like(raw_turnover),
     )
     executed = executed * turnover_scale
-    executed = _preserve_requested_side_mix(request, executed)
-
     close_available = torch.where(
         executed < 0.0,
         can_buy_close_mask.bool(),
@@ -259,17 +223,14 @@ def _run_day(
     )
     residual = (executed != 0.0) & ~close_available
     long_notional = executed.clamp_min(0.0)
-    short_notional = (-executed.clamp_max(0.0))
+    short_notional = -executed.clamp_max(0.0)
     close_factor = (1.0 + simple_asset_return).clamp_min(0.0)
     buy_notional = long_notional + short_notional * close_factor
     sell_notional = long_notional * close_factor + short_notional
     effective_sell_fee = torch.where(
         residual, normal_sell_fee_rates, day_trade_sell_fee_rates
     )
-    fees = (
-        buy_notional * buy_fee_rates
-        + sell_notional * effective_sell_fee
-    )
+    fees = buy_notional * buy_fee_rates + sell_notional * effective_sell_fee
     rebates = (buy_notional + sell_notional) * commission_rebate_rates
     one_day_financing_rate = (
         margin_financing_ratio * margin_financing_annual_rate / 365.0
@@ -285,9 +246,7 @@ def _run_day(
             torch.zeros_like(executed),
         ),
     )
-    pnl_ratio = (
-        executed * simple_asset_return - fees + rebates - margin_cost
-    ).sum()
+    pnl_ratio = (executed * simple_asset_return - fees + rebates - margin_cost).sum()
     pnl_ratio = torch.where(
         state_advance,
         pnl_ratio.clamp_min(-1.0 + 1.0e-6),
@@ -590,8 +549,7 @@ def run_tw_day_trade_daily_execution(
         torch.isfinite(equity)
         & torch.isfinite(accounting_equity)
         & ((accounting_equity - equity).abs() <= tolerance),
-        "initial daily T+2 cash/claim state does not reconcile to "
-        "initial_equity_scale",
+        "initial daily T+2 cash/claim state does not reconcile to initial_equity_scale",
     )
     scalar_args = [
         weights.new_tensor(float(value))

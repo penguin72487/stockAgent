@@ -18,6 +18,7 @@ import math
 import os
 from pathlib import Path
 import sys
+import tempfile
 from typing import Any, Mapping
 from zoneinfo import ZoneInfo
 
@@ -32,6 +33,7 @@ from stockagent.live.tw_day_trade_dashboard import (  # noqa: E402
     BENCHMARK_HISTORY_FILENAME,
 )
 from stockagent.live.tw_day_trade_simulation import (  # noqa: E402
+    DEFAULT_TAIFEX_INDEX_FINAL_SETTLEMENT_PATH,
     STOCK_BENCHMARKS,
     TX_CONTINUOUS_BENCHMARK_ID,
     TwDayTradeSimulationEngine,
@@ -50,6 +52,12 @@ from stockagent.research.taifex_transaction_tax import (  # noqa: E402
 
 TAIPEI = ZoneInfo("Asia/Taipei")
 TX_FEE_PER_SIDE_TWD = 60.0
+DEFAULT_TWSE_DAILY_OHLCV_PATH = Path(
+    "/srv/stockagent-live/data_tw_public/twse_daily_ohlcv.parquet"
+)
+DEFAULT_TPEX_DAILY_OHLCV_PATH = Path(
+    "/srv/stockagent-live/data_tw_public/tpex_daily_ohlcv.parquet"
+)
 
 
 def _sha256(path: Path) -> str:
@@ -104,14 +112,66 @@ def _mark_base(
     }
 
 
-def _stock_daily_row(path: Path, trading_date: date) -> dict[str, Any] | None:
-    frame = (
-        pl.scan_parquet(path)
-        .filter(pl.col("date") == trading_date)
-        .select("date", "open", "close")
-        .collect()
+def _stock_daily_row(
+    path: Path,
+    trading_date: date,
+    *,
+    symbol: str,
+    twse_daily_ohlcv_path: Path,
+    tpex_daily_ohlcv_path: Path,
+) -> dict[str, Any] | None:
+    if path.is_file():
+        frame = (
+            pl.scan_parquet(path)
+            .filter(pl.col("date") == trading_date)
+            .select("date", "open", "close")
+            .collect()
+        )
+        if frame.height > 1:
+            raise ValueError(
+                f"duplicate per-symbol daily row for {symbol} on {trading_date}"
+            )
+        if frame.height == 1:
+            return frame.row(0, named=True)
+
+    def _price(column: str, alias: str) -> pl.Expr:
+        return (
+            pl.col(column)
+            .cast(pl.String)
+            .str.strip_chars()
+            .str.replace_all(",", "")
+            .cast(pl.Float64, strict=False)
+            .alias(alias)
+        )
+
+    venue_specs = (
+        (twse_daily_ohlcv_path, "證券代號", "開盤價", "收盤價"),
+        (tpex_daily_ohlcv_path, "代號", "開盤", "收盤"),
     )
-    return frame.row(0, named=True) if frame.height == 1 else None
+    matches: list[dict[str, Any]] = []
+    for aggregate_path, symbol_column, open_column, close_column in venue_specs:
+        if not aggregate_path.is_file():
+            continue
+        frame = (
+            pl.scan_parquet(aggregate_path)
+            .filter(
+                (pl.col("date").cast(pl.String) == trading_date.isoformat())
+                & (pl.col(symbol_column).cast(pl.String).str.strip_chars() == symbol)
+            )
+            .select(
+                _price(open_column, "open"),
+                _price(close_column, "close"),
+            )
+            .collect(engine="streaming")
+        )
+        matches.extend(frame.to_dicts())
+    if len(matches) > 1:
+        raise ValueError(
+            f"duplicate official aggregate row for {symbol} on {trading_date}"
+        )
+    if matches:
+        return {"date": trading_date, **matches[0]}
+    return None
 
 
 def _current_open_rows(path: Path, trading_date: date) -> dict[str, float]:
@@ -246,6 +306,85 @@ def _tx_day_books(
     return frame
 
 
+def _tx_front_contract_metadata(
+    *,
+    capture_root: Path,
+    trading_date: date,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    manifest_root = (
+        capture_root / "manifests" / f"trade_date={trading_date.isoformat()}"
+    )
+    manifest_paths = sorted(manifest_root.glob("worker=*.json"))
+    if not manifest_paths:
+        raise FileNotFoundError(manifest_root)
+    matches: list[dict[str, Any]] = []
+    receipts: list[dict[str, Any]] = []
+    for path in manifest_paths:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if str(payload.get("status") or "") != "complete":
+            raise ValueError(f"incomplete FOP capture manifest: {path}")
+        receipts.append({"path": str(path.resolve()), "sha256": _sha256(path)})
+        matches.extend(
+            dict(row)
+            for row in payload.get("contract_metadata") or ()
+            if str(row.get("logical_code") or "").strip().upper() == "TXFR1"
+        )
+    identities = {
+        (
+            str(row.get("code") or "").strip().upper(),
+            str(row.get("delivery_month") or "").strip(),
+            str(row.get("last_trading_date") or "").strip(),
+        )
+        for row in matches
+    }
+    if len(identities) != 1:
+        raise ValueError(
+            f"ambiguous TXFR1 capture metadata on {trading_date}: {sorted(identities)}"
+        )
+    code, delivery_month, last_trading_date = next(iter(identities))
+    if not code or len(delivery_month) != 6 or not last_trading_date:
+        raise ValueError(
+            f"incomplete TXFR1 capture metadata on {trading_date}: {identities}"
+        )
+    return {
+        "code": code,
+        "delivery_month": delivery_month,
+        "last_trading_date": last_trading_date,
+    }, receipts
+
+
+def _tx_engine_history_mark(
+    engine: TwDayTradeSimulationEngine,
+    *,
+    observed: datetime,
+) -> dict[str, Any]:
+    source = dict(engine.state["benchmarks"][TX_CONTINUOUS_BENCHMARK_ID])
+    row = _mark_base(
+        benchmark_id=TX_CONTINUOUS_BENCHMARK_ID,
+        label="台指期無限轉倉（大台一口）",
+        instrument_type="continuous_long_future",
+        observed=observed,
+    )
+    row.update(source)
+    entry_at = datetime.fromisoformat(str(source["origin_entry_at"])).astimezone(
+        TAIPEI
+    )
+    row.update(
+        {
+            "recorded_at": observed.isoformat(timespec="seconds"),
+            "minute": _minute(observed),
+            "session_date": observed.date().isoformat(),
+            "benchmark_origin_rebased": True,
+            "benchmark_origin_session_date": entry_at.date().isoformat(),
+            "counterfactual_open_replay": True,
+            "replay_basis": (
+                "retained_executable_front_month_books_with_official_expiry_settlement"
+            ),
+        }
+    )
+    return row
+
+
 def _tx_mark(
     *,
     entry_price: float,
@@ -353,11 +492,26 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--twse-daily-ohlcv-path",
+        type=Path,
+        default=DEFAULT_TWSE_DAILY_OHLCV_PATH,
+    )
+    parser.add_argument(
+        "--tpex-daily-ohlcv-path",
+        type=Path,
+        default=DEFAULT_TPEX_DAILY_OHLCV_PATH,
+    )
+    parser.add_argument(
         "--fop-capture-root",
         type=Path,
         default=Path(
             "data_tw_index_derivatives_ticks/shioaji_fop_captures"
         ),
+    )
+    parser.add_argument(
+        "--final-settlement-path",
+        type=Path,
+        default=DEFAULT_TAIFEX_INDEX_FINAL_SETTLEMENT_PATH,
     )
     return parser
 
@@ -369,11 +523,19 @@ def main() -> None:
     end = date.fromisoformat(args.end_date)
     if start > end:
         raise ValueError("--start-date must not be after --end-date")
-    if any(day.weekday() >= 5 for day in _iter_dates(start, end)):
-        raise ValueError("benchmark history cannot synthesize weekend sessions")
-
     state_path = state_dir / "state.json"
     state = json.loads(state_path.read_text(encoding="utf-8"))
+    replay_receipt_path = state_dir / "rebuild_receipt.json"
+    replay_receipt = json.loads(replay_receipt_path.read_text(encoding="utf-8"))
+    session_dates = [
+        date.fromisoformat(str(session["session_date"]))
+        for session in replay_receipt.get("sessions") or ()
+        if start <= date.fromisoformat(str(session["session_date"])) <= end
+    ]
+    if not session_dates or session_dates[0] != start or session_dates[-1] != end:
+        raise ValueError(
+            "benchmark range must exactly match the replayed session boundary"
+        )
     live_benchmarks = state.get("benchmarks") or {}
     required_ids = {
         *(benchmark_id for benchmark_id, *_rest in STOCK_BENCHMARKS),
@@ -397,17 +559,37 @@ def main() -> None:
             f"{adjustment_engine._corporate_action_load_error}"
         )
     now = datetime.now(TAIPEI)
+    current_session_unclosed = (
+        end == now.date() and now.timetz().replace(tzinfo=None) < time(13, 30)
+    )
     current_open_path = state_dir / "replay_open_data" / f"{end.isoformat()}.parquet"
-    current_opens = _current_open_rows(current_open_path, end)
+    current_opens = (
+        _current_open_rows(current_open_path, end) if current_session_unclosed else {}
+    )
+    twse_daily_ohlcv_path = args.twse_daily_ohlcv_path.resolve()
+    tpex_daily_ohlcv_path = args.tpex_daily_ohlcv_path.resolve()
+    for official_path in (twse_daily_ohlcv_path, tpex_daily_ohlcv_path):
+        if not official_path.is_file():
+            raise FileNotFoundError(official_path)
 
     origins: dict[str, dict[str, Any]] = {}
     marks: list[dict[str, Any]] = []
     provenance: dict[str, Any] = {
         "state_path": str(state_path),
         "state_sha256": _sha256(state_path),
+        "replay_receipt_path": str(replay_receipt_path),
+        "replay_receipt_sha256": _sha256(replay_receipt_path),
         "stock_files": {},
-        "current_open_path": str(current_open_path),
-        "current_open_sha256": _sha256(current_open_path),
+        "current_open_path": (
+            str(current_open_path) if current_session_unclosed else None
+        ),
+        "current_open_sha256": (
+            _sha256(current_open_path) if current_session_unclosed else None
+        ),
+        "twse_daily_ohlcv_path": str(twse_daily_ohlcv_path),
+        "twse_daily_ohlcv_sha256": _sha256(twse_daily_ohlcv_path),
+        "tpex_daily_ohlcv_path": str(tpex_daily_ohlcv_path),
+        "tpex_daily_ohlcv_sha256": _sha256(tpex_daily_ohlcv_path),
         "fop_capture_root": str(args.fop_capture_root.resolve()),
         "corporate_action_reference_path": str(corporate_action_path),
         "corporate_action_reference_sha256": _sha256(corporate_action_path),
@@ -421,7 +603,13 @@ def main() -> None:
 
     for benchmark_id, symbol, label, security_type in STOCK_BENCHMARKS:
         daily_path = (args.stock_parquet_root / f"{symbol}_features.parquet").resolve()
-        first_daily = _stock_daily_row(daily_path, start)
+        first_daily = _stock_daily_row(
+            daily_path,
+            start,
+            symbol=symbol,
+            twse_daily_ohlcv_path=twse_daily_ohlcv_path,
+            tpex_daily_ohlcv_path=tpex_daily_ohlcv_path,
+        )
         entry_price = _finite((first_daily or {}).get("open"))
         if entry_price is None or entry_price <= 0.0:
             raise ValueError(f"official {symbol} open is unavailable for {start}")
@@ -461,9 +649,15 @@ def main() -> None:
             "path": str(daily_path),
             "sha256": _sha256(daily_path),
         }
-        for trading_date in _iter_dates(start, end):
-            daily = _stock_daily_row(daily_path, trading_date)
-            if trading_date == end and trading_date >= now.date():
+        for trading_date in session_dates:
+            daily = _stock_daily_row(
+                daily_path,
+                trading_date,
+                symbol=symbol,
+                twse_daily_ohlcv_path=twse_daily_ohlcv_path,
+                tpex_daily_ohlcv_path=tpex_daily_ohlcv_path,
+            )
+            if trading_date == end and current_session_unclosed:
                 opening = current_opens.get(symbol)
                 if opening is None:
                     raise ValueError(
@@ -558,84 +752,129 @@ def main() -> None:
         )
 
     live_tx = live_benchmarks[TX_CONTINUOUS_BENCHMARK_ID]
-    contract_code = str(live_tx.get("contract_code") or "").strip().upper()
-    if not contract_code:
-        raise ValueError("live TX front-month contract code is unavailable")
-    start_close = datetime.combine(start, time(13, 45), tzinfo=TAIPEI)
-    start_books = _tx_day_books(
-        capture_root=args.fop_capture_root,
-        trading_date=start,
-        contract_code=contract_code,
-        end_at=start_close,
+    final_settlement_path = args.final_settlement_path.resolve()
+    if not final_settlement_path.is_file():
+        raise FileNotFoundError(final_settlement_path)
+    provenance["tx_final_settlement_path"] = str(final_settlement_path)
+    provenance["tx_final_settlement_sha256"] = _sha256(final_settlement_path)
+    provenance["tx_capture_manifests"] = {}
+    tx_rows = 0
+    with tempfile.TemporaryDirectory(prefix="stockagent-tx-benchmark-replay-") as temp:
+        tx_engine = TwDayTradeSimulationEngine(
+            Path(temp),
+            final_settlement_path=final_settlement_path,
+        )
+        for trading_date in session_dates:
+            metadata, manifest_receipts = _tx_front_contract_metadata(
+                capture_root=args.fop_capture_root,
+                trading_date=trading_date,
+            )
+            provenance["tx_capture_manifests"][trading_date.isoformat()] = {
+                "contract": metadata,
+                "receipts": manifest_receipts,
+            }
+            end_at = datetime.combine(trading_date, time(13, 45), tzinfo=TAIPEI)
+            if trading_date == now.date() and current_session_unclosed:
+                end_at = now
+            books = _tx_day_books(
+                capture_root=args.fop_capture_root,
+                trading_date=trading_date,
+                contract_code=str(metadata["code"]),
+                end_at=end_at,
+            )
+            by_minute: dict[str, dict[str, Any]] = {}
+            for book in books.iter_rows(named=True):
+                observed = datetime.fromtimestamp(
+                    int(book["snapshot_ts_ns"]) / 1e9, tz=timezone.utc
+                ).astimezone(TAIPEI)
+                by_minute[_minute(observed)] = book
+            for minute_key, book in sorted(by_minute.items()):
+                observed = datetime.fromisoformat(minute_key)
+                quote = {
+                    "bid": float(book["bid_price_1"]),
+                    "ask": float(book["ask_price_1"]),
+                    "quote_at": observed.isoformat(timespec="seconds"),
+                    "source": "retained_shioaji_fop_book_1s",
+                    "delivery_month": metadata["delivery_month"],
+                    "last_trading_date": metadata["last_trading_date"],
+                }
+                tx_engine._mark_tx_continuous_benchmark(
+                    current_contract_code=str(metadata["code"]),
+                    current_quote=quote,
+                    previous_contract_quote={},
+                    now=observed,
+                )
+                tx_mark = _tx_engine_history_mark(tx_engine, observed=observed)
+                if bool(tx_mark.get("valuation_stale")):
+                    raise RuntimeError(
+                        "TX benchmark replay became stale at "
+                        f"{observed.isoformat()}: {tx_mark.get('valuation_source')}"
+                    )
+                marks.append(tx_mark)
+                tx_rows += 1
+        tx_replayed = dict(
+            tx_engine.state["benchmarks"][TX_CONTINUOUS_BENCHMARK_ID]
+        )
+
+    entry_at = datetime.fromisoformat(str(tx_replayed["origin_entry_at"])).astimezone(
+        TAIPEI
     )
-    first_book = start_books.row(0, named=True)
-    entry_price = float(first_book["ask_price_1"])
-    entry_at = datetime.fromtimestamp(
-        int(first_book["snapshot_ts_ns"]) / 1e9, tz=timezone.utc
-    ).astimezone(TAIPEI)
-    initial_capital = taifex_initial_margin_twd("TX", start)
-    initial_tax = _tx_tax(entry_price, start)
+    entry_price = float(tx_replayed["origin_entry_price"])
     live_tx_entry_at = datetime.fromisoformat(str(live_tx["entry_at"])).astimezone(
         TAIPEI
     )
     live_tx_entry_price = float(live_tx["entry_price"])
+    tx_multiplier = TAIFEX_INDEX_FUTURES_MULTIPLIERS["TX"]
+    live_initial_tax = _tx_tax(live_tx_entry_price, live_tx_entry_at.date())
+    canonical_fixed_fees = float(tx_replayed.get("fixed_fees_twd") or 0.0)
+    canonical_transaction_tax = float(
+        tx_replayed.get("transaction_tax_twd") or 0.0
+    )
+    live_net_pnl_offset = (
+        float(tx_replayed.get("realized_gross_pnl_twd") or 0.0)
+        + (
+            live_tx_entry_price
+            - float(tx_replayed["current_contract_entry_price"])
+        )
+        * tx_multiplier
+        - canonical_fixed_fees
+        - canonical_transaction_tax
+        + TX_FEE_PER_SIDE_TWD
+        + live_initial_tax
+    )
     origins[TX_CONTINUOUS_BENCHMARK_ID] = {
         "benchmark_id": TX_CONTINUOUS_BENCHMARK_ID,
         "session_date": start.isoformat(),
         "entry_at": entry_at.isoformat(timespec="seconds"),
         "entry_price": entry_price,
-        "initial_capital_twd": initial_capital,
+        "initial_capital_twd": float(tx_replayed["initial_capital_twd"]),
         "initial_fixed_fees_twd": TX_FEE_PER_SIDE_TWD,
-        "initial_transaction_tax_twd": initial_tax,
-        "gross_pnl_multiplier": TAIFEX_INDEX_FUTURES_MULTIPLIERS["TX"],
+        "initial_transaction_tax_twd": _tx_tax(entry_price, start),
+        "gross_pnl_multiplier": tx_multiplier,
         "source": "retained_shioaji_front_month_book_at_day_open",
-        "contract_code": contract_code,
+        "contract_code": provenance["tx_capture_manifests"][start.isoformat()][
+            "contract"
+        ]["code"],
+        "roll_contract": (
+            "official final settlement after expiry; new front-month ask; "
+            "calendar spread never booked as return"
+        ),
+        "live_net_pnl_offset_twd": live_net_pnl_offset,
+        "fixed_fees_twd_to_live_origin": canonical_fixed_fees,
+        "transaction_tax_twd_to_live_origin": canonical_transaction_tax,
+        "current_contract_entry_price_at_live_origin": float(
+            tx_replayed["current_contract_entry_price"]
+        ),
+        "realized_gross_pnl_twd_to_live_origin": float(
+            tx_replayed.get("realized_gross_pnl_twd") or 0.0
+        ),
         "live_origin": {
             "entry_at": live_tx.get("entry_at"),
             "entry_price": live_tx.get("entry_price"),
             "initial_fixed_fees_twd": TX_FEE_PER_SIDE_TWD,
-            "initial_transaction_tax_twd": _tx_tax(
-                live_tx_entry_price, live_tx_entry_at.date()
-            ),
+            "initial_transaction_tax_twd": live_initial_tax,
         },
     }
-
-    live_tx_entry = live_tx_entry_at
-    tx_rows = 0
-    for trading_date in _iter_dates(start, end):
-        end_at = datetime.combine(trading_date, time(13, 45), tzinfo=TAIPEI)
-        if trading_date == now.date():
-            end_at = min(
-                now,
-                live_tx_entry.replace(second=0, microsecond=0)
-                - timedelta(seconds=1),
-            )
-        books = _tx_day_books(
-            capture_root=args.fop_capture_root,
-            trading_date=trading_date,
-            contract_code=contract_code,
-            end_at=end_at,
-        )
-        by_minute: dict[str, dict[str, Any]] = {}
-        for book in books.iter_rows(named=True):
-            observed = datetime.fromtimestamp(
-                int(book["snapshot_ts_ns"]) / 1e9, tz=timezone.utc
-            ).astimezone(TAIPEI)
-            by_minute[_minute(observed)] = book
-        for minute_key, book in sorted(by_minute.items()):
-            observed = datetime.fromisoformat(minute_key)
-            marks.append(
-                _tx_mark(
-                    entry_price=entry_price,
-                    entry_at=entry_at,
-                    initial_capital=initial_capital,
-                    initial_tax=initial_tax,
-                    mark_price=float(book["bid_price_1"]),
-                    observed=observed,
-                    contract_code=contract_code,
-                )
-            )
-            tx_rows += 1
 
     marks.sort(key=lambda row: (str(row["recorded_at"]), str(row["benchmark_id"])))
     output = {
@@ -653,8 +892,8 @@ def main() -> None:
             ),
             "tx": (
                 "one real front-month TX entered at the first valid retained "
-                "08:45 ask; later marks use retained bids; forward live rolls "
-                "require simultaneous old bid and new ask"
+                "08:45 ask; later marks use retained bids; an expired old month "
+                "uses official final settlement before the new month opens at ask"
             ),
             "calendar_spread_return": "never booked as investment return",
             "missing_data": "fail closed; no synthetic price",
@@ -662,7 +901,7 @@ def main() -> None:
         },
         "origins": origins,
         "marks": marks,
-        "roll_history": list(live_tx.get("roll_history") or ()),
+        "roll_history": list(tx_replayed.get("roll_history") or ()),
         "counts": {
             "marks": len(marks),
             "tx_minute_marks": tx_rows,
@@ -679,7 +918,12 @@ def main() -> None:
                 "sha256": _sha256(destination),
                 "start_date": start.isoformat(),
                 "end_date": end.isoformat(),
-                "contract_code": contract_code,
+                "contract_codes": sorted(
+                    {
+                        item["contract"]["code"]
+                        for item in provenance["tx_capture_manifests"].values()
+                    }
+                ),
                 **output["counts"],
                 "additional_shioaji_requests": 0,
             },

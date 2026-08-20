@@ -3,7 +3,8 @@
 const REFRESH_MS = 10000;
 const FULL_REFRESH_TICKS = 6;
 const SOURCE_PAGE_SIZE = 100;
-const FETCH_TIMEOUT_MS = 15000;
+const Dashboard = window.StockAgentDashboard;
+const fetchJson = Dashboard.createJsonFetcher({timeoutMs: 15000, cache: "no-store"});
 const state = {
   data: null,
   refreshInFlight: false,
@@ -11,7 +12,7 @@ const state = {
   visibleRows: SOURCE_PAGE_SIZE,
   heavyRevision: "",
 };
-const $ = (id) => document.getElementById(id);
+const $ = Dashboard.byId;
 const DETAIL_LINKS = new Set(["../shioaji/", "../openbb/"]);
 
 const STATUS_LABELS = {
@@ -50,12 +51,7 @@ function compact(value) {
 }
 
 function ageLabel(seconds) {
-  const value = number(seconds);
-  if (value === null) return "無更新時間";
-  if (value < 60) return `${Math.max(0, Math.round(value))} 秒前`;
-  if (value < 3600) return `${Math.round(value / 60)} 分鐘前`;
-  if (value < 86400) return `${Math.round(value / 3600)} 小時前`;
-  return `${Math.round(value / 86400)} 天前`;
+  return Dashboard.formatAge(seconds, {emptyLabel: "無更新時間", hourDigits: 0, dayDigits: 0});
 }
 
 function durationLabel(seconds) {
@@ -162,20 +158,47 @@ function make(tag, className, text) {
   return node;
 }
 
-function progressBlock(coverage, className = "mini-progress") {
+function progressBlock(progress, className = "mini-progress") {
   const wrap = make("div", className);
-  if (!coverage || number(coverage.ratio) === null) {
-    wrap.append(make("span", "", "尚無可加總的完整度單位"));
+  if (!progress) {
+    wrap.append(make("span", "", "尚無取得進度證據"));
     return wrap;
   }
-  const ratio = Math.min(1, Math.max(0, Number(coverage.ratio)));
+  const ratioValue = number(progress.ratio);
   const bar = document.createElement("progress");
   bar.max = 1;
-  bar.value = ratio;
-  bar.setAttribute("aria-label", String(coverage.label || "完整度"));
+  bar.setAttribute("aria-label", String(progress.label || "取得進度"));
+  if (ratioValue !== null) bar.value = Math.min(1, Math.max(0, ratioValue));
+  else bar.className = "indeterminate";
   wrap.append(bar);
-  wrap.append(make("span", "", `${(ratio * 100).toFixed(ratio < .1 ? 2 : 1)}% · ${formatInteger(coverage.current)}/${formatInteger(coverage.total)} ${coverage.unit || ""}`));
+  if (ratioValue === null) {
+    wrap.append(make("span", "", `${progress.label || "取得狀態未知"} · 分母未知`));
+  } else {
+    const ratio = Math.min(1, Math.max(0, ratioValue));
+    wrap.append(make("span", "", `${(ratio * 100).toFixed(ratio < .1 ? 2 : 1)}% · ${formatInteger(progress.current)}/${formatInteger(progress.total)} ${progress.unit || ""}`));
+    wrap.append(make("span", `progress-state ${progress.state || "unknown"}`, progress.label || "取得狀態未提供"));
+  }
+  if (progress.basis) wrap.append(make("span", "progress-basis", progress.basis));
   return wrap;
+}
+
+function publicationLines(row) {
+  const publication = row?.publication || {};
+  const detected = timeLabel(publication.detected_at_utc);
+  const observed = timeLabel(publication.observed_at_utc);
+  const applied = timeLabel(publication.applied_at_utc);
+  const acquisition = scheduleLines(row);
+  const evidence = detected
+    ? `實測版本變更：${detected}`
+    : observed
+      ? `最近觀測：${observed}（非官方發布證明）`
+      : "尚無實際發布／觀測時間";
+  return {
+    primary: publication.schedule_label || "來源未提供發布時間",
+    evidence,
+    applied: applied ? `完成套用：${applied}` : null,
+    acquisition: `下次取得：${acquisition.primary}`,
+  };
 }
 
 function renderSummary(data) {
@@ -214,19 +237,23 @@ function groupCard(row) {
   card.append(head);
   card.append(make("p", "detail", row.detail));
   const meta = make("div", "group-meta");
+  const publication = publicationLines(row);
+  const acquisition = row.acquisition_progress || {};
   for (const [label, value] of [
     ["資料截至", row.data_through || "連續／未提供"],
+    ["下一資料日", acquisition.preparing_for_date || "連續／未判定"],
+    ["發布時間", publication.primary],
     ["預估完成", etaLabel(row.eta)],
-    ["下次更新", scheduleLines(row).primary],
+    ["下次取得", scheduleLines(row).primary],
   ]) {
     const item = make("div");
     item.append(make("span", "", label), make("strong", "", value));
     meta.append(item);
   }
   card.append(meta);
-  const progress = progressBlock(row.coverage, "group-progress");
+  const progress = progressBlock(row.acquisition_progress, "group-progress");
   const progressHead = make("div");
-  progressHead.append(make("span", "", row.coverage?.label || "完整度"), make("span", "", ageLabel(row.freshness?.age_seconds)));
+  progressHead.append(make("span", "", row.acquisition_progress?.label || "取得進度"), make("span", "", ageLabel(row.freshness?.age_seconds)));
   progress.prepend(progressHead);
   card.append(progress);
   if (DETAIL_LINKS.has(String(row.detail_link || ""))) {
@@ -292,14 +319,19 @@ function tableRow(row) {
   }
 
   const coverage = document.createElement("td");
-  coverage.dataset.label = "完整度";
-  coverage.append(progressBlock(row.coverage));
+  coverage.dataset.label = "取得進度";
+  coverage.append(progressBlock(row.acquisition_progress));
+  if (row.acquisition_progress?.preparing_for_date) {
+    coverage.append(make("span", "next-data-date", `下一資料日：${row.acquisition_progress.preparing_for_date}`));
+  }
 
   const schedule = document.createElement("td");
-  schedule.dataset.label = "串流／下次更新";
-  const timing = scheduleLines(row);
-  schedule.append(make("span", "source-name", timing.primary));
-  schedule.append(make("span", "cell-note", timing.secondary));
+  schedule.dataset.label = "發布／偵測／下次取得";
+  const publication = publicationLines(row);
+  schedule.append(make("span", "source-name publication-schedule", publication.primary));
+  schedule.append(make("span", "cell-note", publication.evidence));
+  if (publication.applied) schedule.append(make("span", "cell-note", publication.applied));
+  schedule.append(make("span", "cell-note acquisition-schedule", publication.acquisition));
 
   const eta = document.createElement("td");
   eta.dataset.label = "預估完成";
@@ -314,6 +346,7 @@ function tableRow(row) {
   through.dataset.label = "最近驗證／資料截至";
   through.append(make("span", "source-name", timeLabel(row.last_verified_at_utc) || "無可驗證時間"));
   through.append(make("span", "cell-note", `資料截至：${row.data_through || "連續／未提供"} · ${ageLabel(row.freshness?.age_seconds)}`));
+  if (row.acquisition_progress?.first_data_observed) through.append(make("span", "cell-note first-data", `首筆已收到${row.acquisition_progress?.first_data_at_utc ? `：${timeLabel(row.acquisition_progress.first_data_at_utc)}` : ""}`));
   if (number(row.rows) !== null) through.append(make("span", "cell-note", `${formatInteger(row.rows)} 列`));
 
   const owner = document.createElement("td");
@@ -383,22 +416,10 @@ function heavyRevision(data) {
     (data.sources || []).map((row) => [
       row.endpoint_id, row.id, row.status, row.operation_state,
       row.execution_state, row.coverage, row.eta, row.data_through,
-      row.rows, row.last_verified_at_utc, row.automation, row.warnings,
+      row.rows, row.last_verified_at_utc, row.automation, row.publication,
+      row.acquisition_progress, row.warnings,
     ]),
   ]);
-}
-
-async function fetchJson(path) {
-  const controller = new AbortController();
-  const timer = window.setTimeout(
-    () => controller.abort(new DOMException("Request timed out", "TimeoutError")),
-    FETCH_TIMEOUT_MS,
-  );
-  let response;
-  try { response = await fetch(path, {cache: "no-store", signal: controller.signal}); }
-  finally { window.clearTimeout(timer); }
-  if (!response.ok) throw new Error(`HTTP ${response.status}`);
-  return response.json();
 }
 
 async function refresh({details = false} = {}) {
@@ -434,7 +455,7 @@ $("load-more").addEventListener("click", () => {
 $("filters").addEventListener("submit", (event) => event.preventDefault());
 document.addEventListener("visibilitychange", () => { if (!document.hidden) void refresh({details: true}); });
 void refresh({details: true});
-window.setInterval(() => {
+Dashboard.scheduleRefresh(() => {
   state.refreshTick += 1;
-  void refresh({details: state.refreshTick % FULL_REFRESH_TICKS === 0});
-}, REFRESH_MS);
+  return refresh({details: state.refreshTick % FULL_REFRESH_TICKS === 0});
+}, {intervalMs: REFRESH_MS, immediate: false, refreshOnVisible: false});

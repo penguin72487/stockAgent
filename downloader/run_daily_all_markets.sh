@@ -51,6 +51,8 @@ RUN_FRANKFURTER="${RUN_FRANKFURTER:-1}"
 RUN_PEPPERSTONE_GROUPS="${RUN_PEPPERSTONE_GROUPS:-0}"
 PEPPERSTONE_WORKERS="${PEPPERSTONE_WORKERS:-8}"
 RUN_CEX_PERP="${RUN_CEX_PERP:-1}"
+CRYPTO_TAIL_ONLY="${CRYPTO_TAIL_ONLY:-0}"
+CRYPTO_HISTORICAL_FEATURES="${CRYPTO_HISTORICAL_FEATURES:-1}"
 OKX_WORKERS="${OKX_WORKERS:-16}"
 OKX_REQUEST_INTERVAL="${OKX_REQUEST_INTERVAL:-}"
 OKX_MAX_RETRIES="${OKX_MAX_RETRIES:-8}"
@@ -527,6 +529,12 @@ run_okx_perp_incremental() {
   if [[ -n "$OKX_REQUEST_INTERVAL" ]]; then
     cmd+=(--request-interval "$OKX_REQUEST_INTERVAL")
   fi
+  if [[ "$CRYPTO_TAIL_ONLY" == "1" ]]; then
+    cmd+=(--tail-only)
+  fi
+  if [[ "$CRYPTO_HISTORICAL_FEATURES" != "1" ]]; then
+    cmd+=(--skip-historical-features)
+  fi
   run_step okx_perp_1m_update "${cmd[@]}" || return $?
   run_step okx_perp_daily_materialize \
     "$PYTHON_BIN" downloader/materialize_ohlcv_daily.py \
@@ -556,6 +564,9 @@ run_bybit_perp_incremental() {
   if [[ -n "$BYBIT_REQUEST_INTERVAL" ]]; then
     cmd+=(--request-interval "$BYBIT_REQUEST_INTERVAL")
   fi
+  if [[ "$CRYPTO_TAIL_ONLY" == "1" ]]; then
+    cmd+=(--tail-only)
+  fi
   run_step bybit_perp_1m_update "${cmd[@]}" || return $?
   run_step bybit_perp_daily_materialize \
     "$PYTHON_BIN" downloader/materialize_ohlcv_daily.py \
@@ -582,6 +593,12 @@ run_binance_perp_incremental() {
   )
   if [[ -n "$BINANCE_REQUEST_WEIGHT_PER_MINUTE" ]]; then
     cmd+=(--request-weight-per-minute "$BINANCE_REQUEST_WEIGHT_PER_MINUTE")
+  fi
+  if [[ "$CRYPTO_TAIL_ONLY" == "1" ]]; then
+    cmd+=(--tail-only)
+  fi
+  if [[ "$CRYPTO_HISTORICAL_FEATURES" != "1" ]]; then
+    cmd+=(--skip-historical-features)
   fi
   run_step binance_perp_1m_update "${cmd[@]}" || return $?
   run_step binance_perp_daily_materialize \
@@ -919,6 +936,14 @@ validate_settings() {
   fi
   if [[ "$CRYPTO_ACTIVE_INTRADAY_GRAIN" != "1m" ]]; then
     echo "[daily] CRYPTO_ACTIVE_INTRADAY_GRAIN must be 1m while the active crypto scope is candle-only" >&2
+    exit 2
+  fi
+  if [[ "$CRYPTO_TAIL_ONLY" != "0" && "$CRYPTO_TAIL_ONLY" != "1" ]]; then
+    echo "[daily] CRYPTO_TAIL_ONLY must be 0 or 1" >&2
+    exit 2
+  fi
+  if [[ "$CRYPTO_HISTORICAL_FEATURES" != "0" && "$CRYPTO_HISTORICAL_FEATURES" != "1" ]]; then
+    echo "[daily] CRYPTO_HISTORICAL_FEATURES must be 0 or 1" >&2
     exit 2
   fi
   if [[ "$RUN_CRYPTO_TRADE_TICKS" != "0" || "$RUN_CRYPTO_ORDER_BOOK" != "0" || "$RUN_CRYPTO_LIQUIDATIONS" != "0" ]]; then

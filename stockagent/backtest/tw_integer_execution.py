@@ -31,7 +31,6 @@ from stockagent.backtest.tw_commission_rebate import (
 )
 from stockagent.backtest.tw_execution import (
     normalize_fee_rounding,
-    preserve_directional_lot_mix,
 )
 
 
@@ -173,7 +172,9 @@ def _safe_execution_price_row(
 
     row = prices[index]
     valid = np.isfinite(row) & (row > 0.0)
-    invalid_required = np.flatnonzero(np.asarray(required_mask, dtype=np.bool_) & ~valid)
+    invalid_required = np.flatnonzero(
+        np.asarray(required_mask, dtype=np.bool_) & ~valid
+    )
     if invalid_required.size:
         preview = invalid_required[:8].tolist()
         suffix = "" if invalid_required.size <= 8 else "..."
@@ -291,9 +292,7 @@ def _as_commission_rebate_rates(
             shape,
         )
     elif len(shape) == 2 and result.shape != shape:
-        raise ValueError(
-            "commission_rebate_rates must be scalar, [S], or [T,S]"
-        )
+        raise ValueError("commission_rebate_rates must be scalar, [S], or [T,S]")
     elif len(shape) == 3:
         time, phases, symbols = shape
         if result.shape == (phases, symbols):
@@ -302,13 +301,10 @@ def _as_commission_rebate_rates(
             result = np.broadcast_to(result[:, None, :], shape)
         elif result.shape != shape:
             raise ValueError(
-                "commission_rebate_rates must be scalar, [S], [2,S], "
-                "[T,S], or [T,2,S]"
+                "commission_rebate_rates must be scalar, [S], [2,S], [T,S], or [T,2,S]"
             )
     if result.shape != shape:
-        raise ValueError(
-            f"commission_rebate_rates must broadcast to shape {shape}"
-        )
+        raise ValueError(f"commission_rebate_rates must broadcast to shape {shape}")
     if not np.all(np.isfinite(result)) or np.any(result < 0.0):
         raise ValueError(
             "commission_rebate_rates must contain finite non-negative rates"
@@ -316,9 +312,7 @@ def _as_commission_rebate_rates(
     gross = np.asarray(gross_commission_rates, dtype=np.float64)
     tolerance = np.maximum(1.0, np.abs(gross)) * 1e-15
     if np.any(result > gross + tolerance):
-        raise ValueError(
-            "commission_rebate_rates cannot exceed gross commission rates"
-        )
+        raise ValueError("commission_rebate_rates cannot exceed gross commission rates")
     return np.minimum(result, gross)
 
 
@@ -351,16 +345,12 @@ def _as_commission_rebate_calendar(
         raise ValueError("session_month_ids must contain integers")
     if not np.issubdtype(raw_month_ids.dtype, np.integer):
         numeric = np.asarray(raw_month_ids, dtype=np.float64)
-        if not np.all(np.isfinite(numeric)) or not np.all(
-            numeric == np.floor(numeric)
-        ):
+        if not np.all(np.isfinite(numeric)) or not np.all(numeric == np.floor(numeric)):
             raise ValueError("session_month_ids must contain integers")
         raw_month_ids = numeric.astype(np.int64)
     month_ids = raw_month_ids.astype(np.int64, copy=False)
     if np.any(month_ids[state_advance_mask] <= 0):
-        raise ValueError(
-            "active session_month_ids must contain positive integers"
-        )
+        raise ValueError("active session_month_ids must contain positive integers")
     if np.any(month_ids[~state_advance_mask] < 0):
         raise ValueError(
             "inactive session_month_ids must contain non-negative integers"
@@ -368,8 +358,7 @@ def _as_commission_rebate_calendar(
     payment = np.asarray(payment_eligible_mask)
     if payment.shape != (time,):
         raise ValueError(
-            "commission_rebate_payment_eligible_mask must have "
-            f"shape [{time}]"
+            f"commission_rebate_payment_eligible_mask must have shape [{time}]"
         )
     if payment.dtype != np.bool_:
         raise ValueError(
@@ -426,9 +415,7 @@ def _apply_commission_rebate_at_close(
     if timing != "monthly_15th":
         raise RuntimeError(f"unsupported commission rebate timing: {timing}")
 
-    month_changed = (
-        accrual_month_id > 0 and int(session_month_id) != accrual_month_id
-    )
+    month_changed = accrual_month_id > 0 and int(session_month_id) != accrual_month_id
     rolled_due = due + current if month_changed else due
     rolled_current = 0.0 if month_changed else current
     paid = rolled_due if bool(payment_eligible) else 0.0
@@ -486,21 +473,13 @@ def _round_currency_fees(values: np.ndarray, rule: str) -> np.ndarray:
     raw = np.asarray(values, dtype=np.float64)
     if rule == "floor":
         boundary = np.rint(raw)
-        tolerance = (
-            8.0
-            * np.finfo(np.float64).eps
-            * np.maximum(1.0, np.abs(raw))
-        )
+        tolerance = 8.0 * np.finfo(np.float64).eps * np.maximum(1.0, np.abs(raw))
         stable = np.where(np.abs(raw - boundary) <= tolerance, boundary, raw)
         return np.floor(stable)
     if rule == "half_up":
         # Fee amounts are non-negative, so floor(x + 0.5) is decimal half-up.
         half_boundary = np.rint(raw * 2.0) * 0.5
-        tolerance = (
-            8.0
-            * np.finfo(np.float64).eps
-            * np.maximum(1.0, np.abs(raw))
-        )
+        tolerance = 8.0 * np.finfo(np.float64).eps * np.maximum(1.0, np.abs(raw))
         stable = np.where(
             np.abs(raw - half_boundary) <= tolerance,
             half_boundary,
@@ -527,11 +506,7 @@ def _round_short_margin_up_to_hundreds(
     active = np.asarray(active_orders, dtype=np.bool_)
     quotients = raw / 100.0
     nearest = np.rint(quotients)
-    tolerance = (
-        8.0
-        * np.finfo(np.float64).eps
-        * np.maximum(1.0, np.abs(quotients))
-    )
+    tolerance = 8.0 * np.finfo(np.float64).eps * np.maximum(1.0, np.abs(quotients))
     stable_quotients = np.where(
         np.abs(quotients - nearest) <= tolerance,
         nearest,
@@ -703,7 +678,9 @@ def _as_lot_vector(value: object, symbols: int, *, default: int) -> np.ndarray:
     return raw
 
 
-def _as_bool_matrix(name: str, value: object | None, shape: tuple[int, int]) -> np.ndarray:
+def _as_bool_matrix(
+    name: str, value: object | None, shape: tuple[int, int]
+) -> np.ndarray:
     if value is None:
         return np.ones(shape, dtype=np.bool_)
     result = np.asarray(value)
@@ -744,14 +721,10 @@ def _as_short_maintenance_ratio(value: object) -> float:
 
     raw = np.asarray(value)
     if raw.ndim != 0 or np.issubdtype(raw.dtype, np.bool_):
-        raise ValueError(
-            "short_maintenance_ratio must be a finite scalar at least 1.0"
-        )
+        raise ValueError("short_maintenance_ratio must be a finite scalar at least 1.0")
     result = _as_nonnegative_ratio("short_maintenance_ratio", value)
     if result < 1.0:
-        raise ValueError(
-            "short_maintenance_ratio must be a finite scalar at least 1.0"
-        )
+        raise ValueError("short_maintenance_ratio must be a finite scalar at least 1.0")
     return result
 
 
@@ -821,15 +794,11 @@ def _limit_signed_transition_by_quantity(
                 remaining -= cover
             if result[symbol] == 0 and desired > 0 and remaining > 0:
                 buy = min(desired, remaining)
-                buy = (buy // int(long_lot_sizes[symbol])) * int(
-                    long_lot_sizes[symbol]
-                )
+                buy = (buy // int(long_lot_sizes[symbol])) * int(long_lot_sizes[symbol])
                 result[symbol] = buy
             elif result[symbol] >= 0:
                 buy = min(desired - int(result[symbol]), remaining)
-                buy = (buy // int(long_lot_sizes[symbol])) * int(
-                    long_lot_sizes[symbol]
-                )
+                buy = (buy // int(long_lot_sizes[symbol])) * int(long_lot_sizes[symbol])
                 result[symbol] += buy
         else:
             if old > 0:
@@ -874,9 +843,7 @@ def _separate_reductions_and_openings(
     reduced[add_long] = old[add_long]
     opening[add_short] = proposed[add_short] - old[add_short]
     reduced[add_short] = old[add_short]
-    opening[cross_to_long | cross_to_short] = proposed[
-        cross_to_long | cross_to_short
-    ]
+    opening[cross_to_long | cross_to_short] = proposed[cross_to_long | cross_to_short]
     reduced[cross_to_long | cross_to_short] = 0
     return reduced, opening
 
@@ -975,9 +942,7 @@ def _cash_dividend_inputs(
             "cash-dividend payment delay exceeds the configured claim queue"
         )
     if np.any((~events) & (delays != 0)):
-        raise ValueError(
-            "cash-dividend payment delay must be zero when yield is zero"
-        )
+        raise ValueError("cash-dividend payment delay must be zero when yield is zero")
     return yields, delays, queue_sessions
 
 
@@ -1031,7 +996,9 @@ def _copy_validate_state(
         raise ValueError(f"initial_state mode must be {mode!r}")
 
     holdings_raw = np.asarray(state.holdings)
-    if holdings_raw.shape != (symbols,) or not np.issubdtype(holdings_raw.dtype, np.integer):
+    if holdings_raw.shape != (symbols,) or not np.issubdtype(
+        holdings_raw.dtype, np.integer
+    ):
         raise ValueError(f"initial_state.holdings must be integer shape [{symbols}]")
     holdings = holdings_raw.astype(np.int64, copy=True)
     if mode == "tw_day_trade" and np.any(holdings != 0):
@@ -1096,7 +1063,9 @@ def _copy_validate_state(
         or np.any(payable < 0.0)
         or np.any(receivable < 0.0)
     ):
-        raise ValueError("initial_state settlement queues must be finite and non-negative")
+        raise ValueError(
+            "initial_state settlement queues must be finite and non-negative"
+        )
     if not np.isfinite(state.settled_cash) or state.settled_cash < 0.0:
         raise ValueError("initial_state.settled_cash must be finite and non-negative")
     if not np.isfinite(state.last_nav) or (state.alive and state.last_nav <= 0.0):
@@ -1110,7 +1079,9 @@ def _copy_validate_state(
         or np.any(short_sale_collateral)
         or np.any(short_margin_collateral)
     ):
-        raise ValueError("an absorbing dead initial_state must have a cleared zero ledger")
+        raise ValueError(
+            "an absorbing dead initial_state must have a cleared zero ledger"
+        )
 
     state_rebate_current = _as_initial_rebate_amount(
         "initial_state.commission_rebate_current",
@@ -1164,9 +1135,7 @@ def _copy_validate_state(
         else explicit_rebate_current
     )
     rebate_due = (
-        state_rebate_due
-        if explicit_rebate_due is None
-        else explicit_rebate_due
+        state_rebate_due if explicit_rebate_due is None else explicit_rebate_due
     )
     rebate_month_id = (
         state_rebate_month_id
@@ -1174,13 +1143,9 @@ def _copy_validate_state(
         else explicit_rebate_month_id
     )
     if rebate_current > 0.0 and rebate_month_id == 0:
-        raise ValueError(
-            "a non-zero current commission rebate requires its month id"
-        )
+        raise ValueError("a non-zero current commission rebate requires its month id")
     if not state.alive and (
-        rebate_current != 0.0
-        or rebate_due != 0.0
-        or rebate_month_id != 0
+        rebate_current != 0.0 or rebate_due != 0.0 or rebate_month_id != 0
     ):
         raise ValueError(
             "an absorbing dead initial_state cannot retain commission rebates"
@@ -1195,9 +1160,7 @@ def _copy_validate_state(
     else:
         last_weights = np.asarray(state.last_weights, dtype=np.float64)
         if last_weights.shape != (symbols,):
-            raise ValueError(
-                f"initial_state.last_weights must have shape [{symbols}]"
-            )
+            raise ValueError(f"initial_state.last_weights must have shape [{symbols}]")
         if not np.all(np.isfinite(last_weights)):
             raise ValueError("initial_state.last_weights must be finite")
         if mode == "tw_cash" and np.any(last_weights[holdings == 0] != 0.0):
@@ -1275,9 +1238,7 @@ def _empty_result_arrays(
         "payable_history": np.zeros(time, dtype=np.float64),
         "receivable_history": np.zeros(time, dtype=np.float64),
         "payable_queue_history": np.zeros((time, lag), dtype=np.float64),
-        "receivable_queue_history": np.zeros(
-            (time, receivable_lag), dtype=np.float64
-        ),
+        "receivable_queue_history": np.zeros((time, receivable_lag), dtype=np.float64),
         "execution_payable_history": np.zeros(time, dtype=np.float64),
         "execution_receivable_history": np.zeros(time, dtype=np.float64),
         "execution_nav_history": np.zeros(time, dtype=np.float64),
@@ -1301,12 +1262,8 @@ def _empty_result_arrays(
             dtype=np.float64,
         ),
         "default_mask": np.zeros(time, dtype=np.bool_),
-        "short_sale_collateral_history": np.zeros(
-            (time, symbols), dtype=np.float64
-        ),
-        "short_margin_collateral_history": np.zeros(
-            (time, symbols), dtype=np.float64
-        ),
+        "short_sale_collateral_history": np.zeros((time, symbols), dtype=np.float64),
+        "short_margin_collateral_history": np.zeros((time, symbols), dtype=np.float64),
     }
 
 
@@ -1349,9 +1306,7 @@ def _record_state(
         float(nav) if execution_nav is None else float(execution_nav)
     )
     arrays["nav_history"][index] = nav
-    arrays["commission_rebate_current_history"][index] = (
-        commission_rebate_current
-    )
+    arrays["commission_rebate_current_history"][index] = commission_rebate_current
     arrays["commission_rebate_due_history"][index] = commission_rebate_due
     if short_sale_collateral is not None:
         arrays["short_sale_collateral_history"][index] = short_sale_collateral
@@ -1428,8 +1383,10 @@ def _enqueue_net_claim(
     if abs(settlement_net) <= 1e-12:
         return
     if settlement_net > 0.0:
-        lag = payable.size if settlement_lag_sessions is None else int(
-            settlement_lag_sessions
+        lag = (
+            payable.size
+            if settlement_lag_sessions is None
+            else int(settlement_lag_sessions)
         )
         if lag <= 0 or lag > receivable.size:
             raise ValueError(
@@ -1605,9 +1562,7 @@ def _run_tw_cash_integer_long_only(
     dividend_yields, dividend_delays, claim_queue = _cash_dividend_inputs(
         targets.shape,
         cash_dividend_yield=cash_dividend_yield,
-        cash_dividend_payment_delay_sessions=(
-            cash_dividend_payment_delay_sessions
-        ),
+        cash_dividend_payment_delay_sessions=(cash_dividend_payment_delay_sessions),
         settlement_lag_sessions=lag,
         claim_queue_sessions=claim_queue_sessions,
     )
@@ -1662,9 +1617,7 @@ def _run_tw_cash_integer_long_only(
             time=time,
             timing=commission_rebate_timing,
             session_month_ids=session_month_ids,
-            payment_eligible_mask=(
-                commission_rebate_payment_eligible_mask
-            ),
+            payment_eligible_mask=(commission_rebate_payment_eligible_mask),
             state_advance_mask=advance,
         )
     )
@@ -1675,13 +1628,9 @@ def _run_tw_cash_integer_long_only(
         settlement_lag_sessions=lag,
         claim_queue_sessions=claim_queue,
         initial_cash=initial_cash,
-        initial_commission_rebate_current=(
-            initial_commission_rebate_current
-        ),
+        initial_commission_rebate_current=(initial_commission_rebate_current),
         initial_commission_rebate_due=initial_commission_rebate_due,
-        initial_commission_rebate_month_id=(
-            initial_commission_rebate_month_id
-        ),
+        initial_commission_rebate_month_id=(initial_commission_rebate_month_id),
     )
 
     cash = state.settled_cash
@@ -1692,9 +1641,7 @@ def _run_tw_cash_integer_long_only(
     rebate_due = float(state.commission_rebate_due)
     rebate_month_id = int(state.commission_rebate_month_id)
     if rebate_timing == "daily_close" and (
-        rebate_current != 0.0
-        or rebate_due != 0.0
-        or rebate_month_id != 0
+        rebate_current != 0.0 or rebate_due != 0.0 or rebate_month_id != 0
     ):
         raise ValueError(
             "daily_close commission rebates cannot start with monthly pending "
@@ -1795,8 +1742,7 @@ def _run_tw_cash_integer_long_only(
         # close into a false ledger error.  Existing halted holdings are valued
         # separately below from recurrent state.
         target_enabled = ~mandatory_exit & (
-            (held & side_available)
-            | (~held & (targets[t] > 0.0) & can_buy[t])
+            (held & side_available) | (~held & (targets[t] > 0.0) & can_buy[t])
         )
         required_execution_price = target_enabled | exiting_holdings
         execution_price_row = _safe_execution_price_row(
@@ -1896,9 +1842,7 @@ def _run_tw_cash_integer_long_only(
             - float(np.dot(holdings_after_sells, valuation_price_row)),
             0.0,
         )
-        desired_buy_notional = float(
-            np.dot(desired_buys, execution_price_row)
-        )
+        desired_buy_notional = float(np.dot(desired_buys, execution_price_row))
         if desired_buy_notional > gross_buy_budget + 1e-9:
             desired_buys = _round_quantity_down_to_lots(
                 desired_buys
@@ -1993,8 +1937,7 @@ def _run_tw_cash_integer_long_only(
             gross_commissions=buy_fees_by_symbol,
         )
         rebate_accrued = float(
-            np.sum(sell_rebate_by_symbol)
-            + np.sum(buy_rebate_by_symbol)
+            np.sum(sell_rebate_by_symbol) + np.sum(buy_rebate_by_symbol)
         )
         sell_notional = float(np.sum(sell_notional_by_symbol))
         fees = float(np.sum(sell_fees_by_symbol) + np.sum(buy_fees_by_symbol))
@@ -2005,9 +1948,7 @@ def _run_tw_cash_integer_long_only(
         # unavoidable net payable and may default when due; it must not be
         # erased or mislabeled as an internal affordability error on trade date.
         admitted_buy_budget = max(free_settled_cash + sell_net, 0.0)
-        if buy_cost > admitted_buy_budget + max(
-            1e-8, abs(admitted_buy_budget) * 1e-12
-        ):
+        if buy_cost > admitted_buy_budget + max(1e-8, abs(admitted_buy_budget) * 1e-12):
             raise RuntimeError("internal cash affordability invariant violated")
 
         holdings = holdings - sells + buys
@@ -2084,9 +2025,7 @@ def _run_tw_cash_integer_long_only(
         active_return = holdings != 0
         with np.errstate(over="ignore", invalid="ignore"):
             growth = np.exp(forward_returns[t])
-        invalid_active_return = active_return & (
-            ~np.isfinite(growth) | (growth <= 0.0)
-        )
+        invalid_active_return = active_return & (~np.isfinite(growth) | (growth <= 0.0))
         if np.any(invalid_active_return):
             raise ValueError(
                 "future_log_returns produces a non-finite/non-positive "
@@ -2104,12 +2043,12 @@ def _run_tw_cash_integer_long_only(
         )
         for delay in np.unique(dividend_delays[t][dividend_claim_by_symbol > 0.0]):
             due = dividend_delays[t] == delay
-            receivable[int(delay) - 1] += float(
-                np.sum(dividend_claim_by_symbol[due])
-            )
+            receivable[int(delay) - 1] += float(np.sum(dividend_claim_by_symbol[due]))
         dividend_claim = float(np.sum(dividend_claim_by_symbol))
-        nav = nav_after_rebate + dividend_claim + float(
-            np.dot(holdings, next_valuation_prices - valuation_price_row)
+        nav = (
+            nav_after_rebate
+            + dividend_claim
+            + float(np.dot(holdings, next_valuation_prices - valuation_price_row))
         )
         if nav <= 0.0:
             alive = False
@@ -2243,9 +2182,7 @@ def _run_tw_cash_integer_signed(
     dividend_yields, dividend_delays, claim_queue = _cash_dividend_inputs(
         targets.shape,
         cash_dividend_yield=cash_dividend_yield,
-        cash_dividend_payment_delay_sessions=(
-            cash_dividend_payment_delay_sessions
-        ),
+        cash_dividend_payment_delay_sessions=(cash_dividend_payment_delay_sessions),
         settlement_lag_sessions=lag,
         claim_queue_sessions=claim_queue_sessions,
     )
@@ -2286,9 +2223,7 @@ def _run_tw_cash_integer_signed(
         can_short_open = np.zeros(targets.shape, dtype=np.bool_)
     else:
         can_short_open = (
-            _as_bool_matrix(
-                "can_short_open_mask", can_short_open_mask, targets.shape
-            )
+            _as_bool_matrix("can_short_open_mask", can_short_open_mask, targets.shape)
             & can_sell
         )
     force_exit = (
@@ -2325,9 +2260,7 @@ def _run_tw_cash_integer_signed(
             time=time,
             timing=commission_rebate_timing,
             session_month_ids=session_month_ids,
-            payment_eligible_mask=(
-                commission_rebate_payment_eligible_mask
-            ),
+            payment_eligible_mask=(commission_rebate_payment_eligible_mask),
             state_advance_mask=advance,
         )
     )
@@ -2338,13 +2271,9 @@ def _run_tw_cash_integer_signed(
         settlement_lag_sessions=lag,
         claim_queue_sessions=claim_queue,
         initial_cash=initial_cash,
-        initial_commission_rebate_current=(
-            initial_commission_rebate_current
-        ),
+        initial_commission_rebate_current=(initial_commission_rebate_current),
         initial_commission_rebate_due=initial_commission_rebate_due,
-        initial_commission_rebate_month_id=(
-            initial_commission_rebate_month_id
-        ),
+        initial_commission_rebate_month_id=(initial_commission_rebate_month_id),
     )
     if can_short_open_mask is None and np.any(targets < 0.0):
         raise ValueError("negative tw_cash targets require can_short_open_mask")
@@ -2357,9 +2286,7 @@ def _run_tw_cash_integer_signed(
     rebate_due = float(state.commission_rebate_due)
     rebate_month_id = int(state.commission_rebate_month_id)
     if rebate_timing == "daily_close" and (
-        rebate_current != 0.0
-        or rebate_due != 0.0
-        or rebate_month_id != 0
+        rebate_current != 0.0 or rebate_due != 0.0 or rebate_month_id != 0
     ):
         raise ValueError(
             "daily_close commission rebates cannot start with monthly pending "
@@ -2550,9 +2477,7 @@ def _run_tw_cash_integer_signed(
             )
         # A forced cover may cross zero into a discretionary long, but may not
         # re-establish a short on the same session.
-        desired_holdings[forced_cover] = np.maximum(
-            desired_holdings[forced_cover], 0
-        )
+        desired_holdings[forced_cover] = np.maximum(desired_holdings[forced_cover], 0)
 
         increasing = desired_holdings > base_holdings
         desired_holdings[increasing & ~can_buy[t]] = base_holdings[
@@ -2640,9 +2565,7 @@ def _run_tw_cash_integer_signed(
             demonstrated = np.where(
                 np.isfinite(short_capacity[t]), short_capacity[t], 0.0
             )
-            capacity_lots = _round_quantity_down_to_lots(
-                demonstrated, short_lots
-            )
+            capacity_lots = _round_quantity_down_to_lots(demonstrated, short_lots)
             admitted_open = np.minimum(requested_open, capacity_lots)
             capped_short = old_short + admitted_open
             needs_cap = requested_open > admitted_open
@@ -2701,9 +2624,7 @@ def _run_tw_cash_integer_signed(
             added_sale_collateral = np.maximum(short_sale_net, 0.0)
             short_sale_fee_deficit = np.minimum(short_sale_net, 0.0)
             added_margin = _round_short_margin_up_to_hundreds(
-                short_open.astype(np.float64)
-                * execution_price_row
-                * margin_rates[t],
+                short_open.astype(np.float64) * execution_price_row * margin_rates[t],
                 short_open > 0,
             )
 
@@ -2784,9 +2705,7 @@ def _run_tw_cash_integer_signed(
             margin_collateral_after = (
                 short_margin_collateral - released_margin + added_margin
             )
-            release_total = float(
-                np.sum(released_sale) + np.sum(released_margin)
-            )
+            release_total = float(np.sum(released_sale) + np.sum(released_margin))
             if (
                 required_collateral is not None
                 and release_total > 0.0
@@ -2800,8 +2719,7 @@ def _run_tw_cash_integer_signed(
                 # a binding release by only a few float64 ulps.
                 for _ in range(8):
                     represented_collateral = float(
-                        np.sum(sale_collateral_after)
-                        + np.sum(margin_collateral_after)
+                        np.sum(sale_collateral_after) + np.sum(margin_collateral_after)
                     )
                     if represented_collateral >= required_collateral:
                         break
@@ -2819,9 +2737,7 @@ def _run_tw_cash_integer_signed(
                     released_sale *= correction_scale
                     released_margin *= correction_scale
                     sale_collateral_after = (
-                        short_sale_collateral
-                        - released_sale
-                        + added_sale_collateral
+                        short_sale_collateral - released_sale + added_sale_collateral
                     )
                     margin_collateral_after = (
                         short_margin_collateral - released_margin + added_margin
@@ -2834,20 +2750,15 @@ def _run_tw_cash_integer_signed(
                     sale_collateral_after = (
                         short_sale_collateral + added_sale_collateral
                     )
-                    margin_collateral_after = (
-                        short_margin_collateral + added_margin
-                    )
+                    margin_collateral_after = short_margin_collateral + added_margin
 
             long_sell_net = (
-                long_sell.astype(np.float64) * execution_price_row
-                - long_sell_fees
+                long_sell.astype(np.float64) * execution_price_row - long_sell_fees
             )
             long_buy_cost = (
                 long_buy.astype(np.float64) * execution_price_row + long_buy_fees
             )
-            cover_cost = (
-                cover.astype(np.float64) * execution_price_row + cover_fees
-            )
+            cover_cost = cover.astype(np.float64) * execution_price_row + cover_fees
             settlement_net = float(
                 np.sum(long_sell_net)
                 - np.sum(long_buy_cost)
@@ -2863,13 +2774,9 @@ def _run_tw_cash_integer_signed(
                 "buy_notional": buy_notional,
                 "sell_notional": sell_notional,
                 "fees": float(
-                    np.sum(buy_fees)
-                    + np.sum(sell_fees)
-                    + np.sum(short_handling_fees)
+                    np.sum(buy_fees) + np.sum(sell_fees) + np.sum(short_handling_fees)
                 ),
-                "commission_rebate": float(
-                    np.sum(buy_rebate) + np.sum(sell_rebate)
-                ),
+                "commission_rebate": float(np.sum(buy_rebate) + np.sum(sell_rebate)),
                 "settlement_net": settlement_net,
                 "sale_collateral": sale_collateral_after,
                 "margin_collateral": margin_collateral_after,
@@ -2923,9 +2830,7 @@ def _run_tw_cash_integer_signed(
                 details = best_details
 
         holdings = proposed_holdings
-        short_sale_collateral = np.asarray(
-            details["sale_collateral"], dtype=np.float64
-        )
+        short_sale_collateral = np.asarray(details["sale_collateral"], dtype=np.float64)
         short_margin_collateral = np.asarray(
             details["margin_collateral"], dtype=np.float64
         )
@@ -3010,9 +2915,7 @@ def _run_tw_cash_integer_signed(
         active_return = holdings != 0
         with np.errstate(over="ignore", invalid="ignore"):
             growth = np.exp(forward_returns[t])
-        invalid_active_return = active_return & (
-            ~np.isfinite(growth) | (growth <= 0.0)
-        )
+        invalid_active_return = active_return & (~np.isfinite(growth) | (growth <= 0.0))
         if np.any(invalid_active_return):
             raise ValueError(
                 "future_log_returns produces a non-finite/non-positive "
@@ -3029,12 +2932,12 @@ def _run_tw_cash_integer_signed(
         )
         for delay in np.unique(dividend_delays[t][dividend_claim_by_symbol > 0.0]):
             due = dividend_delays[t] == delay
-            receivable[int(delay) - 1] += float(
-                np.sum(dividend_claim_by_symbol[due])
-            )
+            receivable[int(delay) - 1] += float(np.sum(dividend_claim_by_symbol[due]))
         dividend_claim = float(np.sum(dividend_claim_by_symbol))
-        nav = nav_after_rebate + dividend_claim + float(
-            np.dot(holdings, next_valuation_prices - valuation_price_row)
+        nav = (
+            nav_after_rebate
+            + dividend_claim
+            + float(np.dot(holdings, next_valuation_prices - valuation_price_row))
         )
         if nav <= 0.0:
             alive = False
@@ -3156,13 +3059,11 @@ def run_tw_cash_integer(
     """
 
     targets = _as_matrix("target_weights", target_weights)
-    state_has_short = (
-        isinstance(initial_state, TaiwanIntegerState)
-        and np.any(np.asarray(initial_state.holdings, dtype=np.int64) < 0)
+    state_has_short = isinstance(initial_state, TaiwanIntegerState) and np.any(
+        np.asarray(initial_state.holdings, dtype=np.int64) < 0
     )
-    force_cover_active = (
-        force_short_cover_mask is not None
-        and np.any(np.asarray(force_short_cover_mask, dtype=np.bool_))
+    force_cover_active = force_short_cover_mask is not None and np.any(
+        np.asarray(force_short_cover_mask, dtype=np.bool_)
     )
     # An explicit borrow-availability mask selects the signed contract even if
     # this particular chunk happens to contain only positive targets.  Without
@@ -3182,9 +3083,7 @@ def run_tw_cash_integer(
             future_log_returns=future_log_returns,
             unresolved_corporate_action_mask=unresolved_corporate_action_mask,
             cash_dividend_yield=cash_dividend_yield,
-            cash_dividend_payment_delay_sessions=(
-                cash_dividend_payment_delay_sessions
-            ),
+            cash_dividend_payment_delay_sessions=(cash_dividend_payment_delay_sessions),
             claim_queue_sessions=claim_queue_sessions,
             buy_fee_rates=buy_fee_rates,
             sell_fee_rates=sell_fee_rates,
@@ -3210,13 +3109,9 @@ def run_tw_cash_integer(
             settlement_lag_sessions=settlement_lag_sessions,
             initial_cash=initial_cash,
             initial_state=initial_state,
-            initial_commission_rebate_current=(
-                initial_commission_rebate_current
-            ),
+            initial_commission_rebate_current=(initial_commission_rebate_current),
             initial_commission_rebate_due=initial_commission_rebate_due,
-            initial_commission_rebate_month_id=(
-                initial_commission_rebate_month_id
-            ),
+            initial_commission_rebate_month_id=(initial_commission_rebate_month_id),
         )
 
     if short_margin_rate is None:
@@ -3225,8 +3120,7 @@ def run_tw_cash_integer(
         )
     if short_capacity_shares is None:
         raise ValueError(
-            "signed tw_cash requires short_capacity_shares to be supplied "
-            "explicitly"
+            "signed tw_cash requires short_capacity_shares to be supplied explicitly"
         )
     resolved_margin_rate: object = short_margin_rate
     if short_margin_ratio is not None:
@@ -3248,9 +3142,7 @@ def run_tw_cash_integer(
         future_log_returns=future_log_returns,
         unresolved_corporate_action_mask=unresolved_corporate_action_mask,
         cash_dividend_yield=cash_dividend_yield,
-        cash_dividend_payment_delay_sessions=(
-            cash_dividend_payment_delay_sessions
-        ),
+        cash_dividend_payment_delay_sessions=(cash_dividend_payment_delay_sessions),
         claim_queue_sessions=claim_queue_sessions,
         buy_fee_rates=buy_fee_rates,
         sell_fee_rates=sell_fee_rates,
@@ -3283,13 +3175,9 @@ def run_tw_cash_integer(
         settlement_lag_sessions=settlement_lag_sessions,
         initial_cash=initial_cash,
         initial_state=initial_state,
-        initial_commission_rebate_current=(
-            initial_commission_rebate_current
-        ),
+        initial_commission_rebate_current=(initial_commission_rebate_current),
         initial_commission_rebate_due=initial_commission_rebate_due,
-        initial_commission_rebate_month_id=(
-            initial_commission_rebate_month_id
-        ),
+        initial_commission_rebate_month_id=(initial_commission_rebate_month_id),
     )
 
 
@@ -3402,9 +3290,7 @@ def run_tw_day_trade_integer(
     can_short_open = (
         can_sell_open
         if can_short_open_mask is None
-        else _as_bool_matrix(
-            "can_short_open_mask", can_short_open_mask, targets.shape
-        )
+        else _as_bool_matrix("can_short_open_mask", can_short_open_mask, targets.shape)
         & can_sell_open
     )
     force_short_cover = (
@@ -3434,9 +3320,7 @@ def run_tw_day_trade_integer(
             time=time,
             timing=commission_rebate_timing,
             session_month_ids=session_month_ids,
-            payment_eligible_mask=(
-                commission_rebate_payment_eligible_mask
-            ),
+            payment_eligible_mask=(commission_rebate_payment_eligible_mask),
             state_advance_mask=advance,
         )
     )
@@ -3447,13 +3331,9 @@ def run_tw_day_trade_integer(
         settlement_lag_sessions=lag,
         claim_queue_sessions=lag,
         initial_cash=initial_cash,
-        initial_commission_rebate_current=(
-            initial_commission_rebate_current
-        ),
+        initial_commission_rebate_current=(initial_commission_rebate_current),
         initial_commission_rebate_due=initial_commission_rebate_due,
-        initial_commission_rebate_month_id=(
-            initial_commission_rebate_month_id
-        ),
+        initial_commission_rebate_month_id=(initial_commission_rebate_month_id),
     )
 
     cash = state.settled_cash
@@ -3464,9 +3344,7 @@ def run_tw_day_trade_integer(
     rebate_due = float(state.commission_rebate_due)
     rebate_month_id = int(state.commission_rebate_month_id)
     if rebate_timing == "daily_close" and (
-        rebate_current != 0.0
-        or rebate_due != 0.0
-        or rebate_month_id != 0
+        rebate_current != 0.0 or rebate_due != 0.0 or rebate_month_id != 0
     ):
         raise ValueError(
             "daily_close commission rebates cannot start with monthly pending "
@@ -3549,10 +3427,7 @@ def run_tw_day_trade_integer(
         entry_enabled = eligible[t] & ~force_exit[t]
         close_price_available = np.isfinite(raw_closes[t]) & (raw_closes[t] > 0.0)
         long_enabled = (
-            entry_enabled
-            & can_buy_open[t]
-            & can_sell[t]
-            & close_price_available
+            entry_enabled & can_buy_open[t] & can_sell[t] & close_price_available
         )
         short_enabled = (
             entry_enabled
@@ -3568,9 +3443,7 @@ def run_tw_day_trade_integer(
         # unquoted symbol observable. Opening quantity remains invariant to the
         # later close value.
         open_required = enabled & (targets[t] != 0.0)
-        open_row = _safe_execution_price_row(
-            "open_prices", raw_opens, t, open_required
-        )
+        open_row = _safe_execution_price_row("open_prices", raw_opens, t, open_required)
         # As with the cash oracle, never convert a masked-out request through an
         # inactive quote sentinel.  Only a direction that can really submit a
         # nonzero opening order participates in share rounding and overflow
@@ -3618,17 +3491,6 @@ def run_tw_day_trade_integer(
                     * (turnover_budget / opening_round_trip_notional),
                     lots,
                 )
-        # Whole-lot rounding and point-in-time side masks may otherwise turn a
-        # two-sided model target into a materially different one-sided trade.
-        # Preserve the model's requested long/short mix by reducing only the
-        # better-filled side; never manufacture a missing lot on the weak side.
-        quantities, _directional_mix_audit = preserve_directional_lot_mix(
-            targets[t],
-            quantities,
-            open_row,
-            lots,
-            capital=nav_before_trade,
-        )
         signed_positions = np.sign(targets[t]).astype(np.int64) * quantities
 
         long_mask = signed_positions > 0
@@ -3683,8 +3545,7 @@ def run_tw_day_trade_integer(
             gross_commissions=sell_commissions_by_symbol,
         )
         rebate_accrued = float(
-            np.sum(buy_rebate_by_symbol)
-            + np.sum(sell_rebate_by_symbol)
+            np.sum(buy_rebate_by_symbol) + np.sum(sell_rebate_by_symbol)
         )
         buy_cost = float(np.sum(buy_notional_by_symbol + buy_fees_by_symbol))
         sell_net = float(np.sum(sell_notional_by_symbol - sell_fees_by_symbol))

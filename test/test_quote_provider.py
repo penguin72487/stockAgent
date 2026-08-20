@@ -127,6 +127,43 @@ def test_fetch_tw_mis_retries_empty_chunks_without_using_last_as_open(monkeypatc
     assert all(count == 2 for count in attempts.values())
 
 
+def test_fetch_tw_mis_preserves_official_no_limit_band(monkeypatch, tmp_path) -> None:
+    class FakeSession:
+        def __init__(self) -> None:
+            self.headers: dict[str, str] = {}
+
+        def get(self, url: str, *, timeout: int, params=None, **kwargs):
+            if params is None:
+                return _FakeMisResponse([])
+            return _FakeMisResponse(
+                [
+                    {
+                        "c": "00656R",
+                        "z": "5.89",
+                        "o": "5.84",
+                        "u": "9999.9500",
+                        "w": None,
+                        "y": "5.87",
+                        "tlong": "1800000000000",
+                    }
+                ]
+            )
+
+    monkeypatch.setenv("STOCKAGENT_TW_MIS_PARALLEL_REQUESTS", "1")
+    monkeypatch.setattr("stockagent.live.quote_provider.requests.Session", FakeSession)
+
+    snapshot = fetch_tw_mis_last_prices(
+        ["00656R"],
+        np.array([5.87]),
+        parquet_root=tmp_path,
+        chunk_size=1,
+    )
+
+    np.testing.assert_allclose(snapshot.upper_limit_prices, [9999.95])
+    np.testing.assert_allclose(snapshot.lower_limit_prices, [0.01])
+    np.testing.assert_allclose(snapshot.open_prices, [5.84])
+
+
 def test_load_prices_csv_preserves_explicit_open_snapshot(tmp_path) -> None:
     path = tmp_path / "session_open.csv"
     path.write_text(

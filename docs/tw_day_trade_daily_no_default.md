@@ -25,10 +25,10 @@ closed，不用 stale mark。
 
 `economic_equity = cash + receivables - payables`。
 
-多空組合先套權限與容量，再只縮減成交較好的那一側以保存模型要求的 long/
-short gross mix；任一要求方向完全沒有可執行量時，整個雙邊組合 fail closed
-為空倉。forward 的日損益、費稅、cash/claim queue 與 equity recurrence
-就是 `log_utility` loss 使用的值，沒有額外代理報酬公式。跨 batch 會傳遞
+每檔標的獨立套用權限與容量；通過限制後的可執行部位不再因其他標的或整體
+long/short gross mix 被二次縮減，也不會因其中一側沒有可執行量而把整個組合
+歸零。forward 的日損益、費稅、cash/claim queue 與 equity recurrence就是
+`log_utility` loss 使用的值，沒有額外代理報酬公式。跨 batch 會傳遞
 `final_cash`、`final_payables`、`final_receivables` 與
 `final_equity_scale`，不會在每個 batch 重設交割。
 

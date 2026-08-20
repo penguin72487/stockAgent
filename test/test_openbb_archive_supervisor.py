@@ -48,6 +48,16 @@ def test_supervisor_rejects_invalid_monitor_timeout_before_download() -> None:
     assert "OPENBB_FULL_MONITOR_TIMEOUT_SECONDS" in result.stderr
 
 
+def test_supervisor_rejects_invalid_idle_monitor_interval_before_download() -> None:
+    result = _run(
+        SUPERVISOR,
+        env={"OPENBB_IDLE_FULL_MONITOR_INTERVAL_SECONDS": "0"},
+    )
+
+    assert result.returncode == 2
+    assert "OPENBB_IDLE_FULL_MONITOR_INTERVAL_SECONDS" in result.stderr
+
+
 def test_user_entry_rejects_start_date_override() -> None:
     result = _run(USER_ENTRY, "--start-date", "2001-01-01")
 

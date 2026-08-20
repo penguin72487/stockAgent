@@ -27,6 +27,10 @@ try:
 except ModuleNotFoundError:  # direct script execution
     from common import SharedRateLimiter, describe_rate_limit, resolve_request_interval
 from stockagent.live.shioaji_traffic_ledger import shioaji_query
+from stockagent.live.shioaji_schedule import (
+    FUTURES_HISTORY_TRAFFIC_RESERVE_MB,
+    HISTORICAL_MAX_TRAFFIC_FRACTION,
+)
 
 from downloader.download_shioaji_tw_kbars import (
     TrafficBudgetReached,
@@ -71,8 +75,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--timeout-ms", type=int, default=120_000)
-    parser.add_argument("--max-traffic-fraction", type=float, default=0.75)
-    parser.add_argument("--traffic-reserve-mb", type=float, default=512.0)
+    parser.add_argument(
+        "--max-traffic-fraction",
+        type=float,
+        default=HISTORICAL_MAX_TRAFFIC_FRACTION,
+    )
+    parser.add_argument(
+        "--traffic-reserve-mb",
+        type=float,
+        default=FUTURES_HISTORY_TRAFFIC_RESERVE_MB,
+    )
     parser.add_argument("--simulation", action="store_true")
     parser.add_argument("--allow-market-hours", action="store_true")
     parser.add_argument("--max-dates", type=int, default=0)
@@ -258,6 +270,25 @@ def main() -> int:
             f"range={expected[0]}..{expected[-1]} output={args.output_dir}"
         )
         return 0
+    if not pending:
+        manifest = _write_manifest(
+            args.output_dir,
+            contract=str(args.contract),
+            expected=expected,
+            stopped_for_traffic=False,
+            stopped_for_market_hours=False,
+            usage=None,
+        )
+        print(
+            "[shioaji-futures-history] "
+            f"contract={args.contract} status={manifest['status']} "
+            f"resolved={manifest['resolved_trading_dates']}"
+            f"/{manifest['expected_trading_dates']} rows={manifest['rows']:,} "
+            f"bytes={manifest['bytes']:,} local_receipts_only=true "
+            "api_login=false",
+            flush=True,
+        )
+        return 0
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     lock_handle = (args.output_dir / "download.lock").open("a+b")
@@ -274,12 +305,14 @@ def main() -> int:
     if not api_key or not secret_key:
         raise RuntimeError("SHIOAJI_API_KEY and SHIOAJI_SECRET_KEY are required")
     api = sj.Shioaji(simulation=bool(args.simulation))
+    logged_in = False
     stopped_for_traffic = False
     stopped_for_market_hours = False
     usage: tuple[int, int] | None = None
     try:
         api.set_event_callback(lambda *_args: None)
         api.login(api_key=api_key, secret_key=secret_key, subscribe_trade=False)
+        logged_in = True
         contract = api.contracts.get(str(args.contract))
         if contract is None:
             raise LookupError(f"future contract not found: {args.contract}")
@@ -372,7 +405,8 @@ def main() -> int:
             usage = int(current.bytes), int(current.limit_bytes)
     finally:
         try:
-            api.logout()
+            if logged_in:
+                api.logout()
         finally:
             lock_handle.close()
     manifest = _write_manifest(

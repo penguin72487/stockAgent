@@ -24,7 +24,7 @@ from stockagent.live.openbb_archive_dashboard import build_openbb_public_status
 from stockagent.live.shioaji_api_dashboard import build_shioaji_public_status
 
 
-DATA_MONITOR_SCHEMA_VERSION: Final[int] = 3
+DATA_MONITOR_SCHEMA_VERSION: Final[int] = 4
 TAIPEI: Final[ZoneInfo] = ZoneInfo("Asia/Taipei")
 
 _GROUP_META: Final[dict[str, dict[str, Any]]] = {
@@ -248,6 +248,10 @@ _REFRESH_UNITS: Final[dict[str, dict[str, str | None]]] = {
         "service": "stockagent-registered-data-intraday.service",
         "timer": "stockagent-registered-data-intraday.timer",
     },
+    "registered_backfill": {
+        "service": "stockagent-registered-data-backfill.service",
+        "timer": "stockagent-registered-data-backfill.timer",
+    },
     "taifex_futures": {
         "service": "stockagent-taifex-futures-daily.service",
         "timer": "stockagent-taifex-futures-daily.timer",
@@ -373,18 +377,22 @@ _AUTOMATION_PROFILES: Final[dict[str, dict[str, Any]]] = {
     },
     "group:okx": {
         "mode": "interval_after_completion",
-        "service_keys": ("registered_intraday",),
-        "schedule_label": "本輪完成後 1 分鐘",
+        "service_keys": ("registered_intraday", "registered_backfill"),
+        "schedule_label": "尾端本輪完成後 1 分鐘；每週日 02:00 完整 head/backfill",
     },
     "group:bybit": {
         "mode": "interval_after_completion",
-        "service_keys": ("registered_intraday",),
-        "schedule_label": "本輪完成後 1 分鐘",
+        "service_keys": ("registered_intraday", "registered_backfill"),
+        "schedule_label": "尾端本輪完成後 1 分鐘；每週日 02:00 完整 head/backfill",
     },
     "group:binance": {
         "mode": "interval_after_completion",
-        "service_keys": ("registered_intraday", "binance_backfill"),
-        "schedule_label": "本輪完成後 1 分鐘；全量回補另有常駐工作",
+        "service_keys": (
+            "registered_intraday",
+            "registered_backfill",
+            "binance_backfill",
+        ),
+        "schedule_label": "尾端本輪完成後 1 分鐘；每週日 02:00 完整 head/backfill",
     },
     "group:binance-public-archive": {
         "mode": "daily_archive",
@@ -1075,10 +1083,23 @@ def _generic_group(
     failure = sum(
         count
         for status, count in counts.items()
-        if any(token in status.lower() for token in ("fail", "error", "mismatch"))
+        if any(
+            token in status.lower()
+            for token in (
+                "fail",
+                "error",
+                "partial",
+                "mismatch",
+                "repair",
+                "quarantine",
+                "invalid",
+                "blocked",
+            )
+        )
     )
-    failure += sum(
-        str(payload.get("state") or "").lower() in {"failed", "error", "blocked"}
+    batch_incomplete = any(
+        str(payload.get("state") or "").lower()
+        in {"failed", "error", "blocked", "partial"}
         for payload in payloads
         if isinstance(payload, Mapping)
     )
@@ -1091,9 +1112,13 @@ def _generic_group(
     elif dataset == "legacy-parquet":
         status = "legacy"
         status_label = "凍結封存"
-    elif failure:
+    elif failure or batch_incomplete:
         status = "degraded"
-        status_label = f"最近批次有 {failure:,} 個失敗"
+        status_label = (
+            f"最近批次有 {failure:,} 個失敗"
+            if failure
+            else "最近批次未完整收斂"
+        )
     elif fresh["state"] == "stale":
         status = "stale"
         status_label = "需要補到最新"
@@ -1104,7 +1129,11 @@ def _generic_group(
         status = "current"
         status_label = "在新鮮度範圍內"
 
-    if status in {"current", "legacy"} and (coverage is None or failure == 0):
+    if (
+        status in {"current", "legacy"}
+        and (coverage is None or failure == 0)
+        and not batch_incomplete
+    ):
         eta = _complete_eta("最近可驗證批次沒有待處理失敗。")
     elif status == "unavailable":
         eta = _unknown_eta("blocked", "資料根目錄不存在，無法開始估算。")
@@ -1129,19 +1158,39 @@ def _generic_group(
         )
         if progress_live:
             progress_phase = str(progress_payload.get("phase") or "")
+            raw_progress_counts = progress_payload.get("status_counts")
+            raw_current = _integer(progress_payload.get("current"))
+            raw_total = _integer(progress_payload.get("total"))
+            legacy_page_denominator_saturated = bool(
+                isinstance(raw_progress_counts, Mapping)
+                and (_integer(raw_progress_counts.get("page_fetched")) or 0) > 0
+                and raw_current is not None
+                and raw_total is not None
+                and raw_total > 0
+                and raw_current >= raw_total
+                and progress_phase != "complete"
+            )
             status = "updating"
             status_label = (
                 "正在建立精確容量計畫"
                 if progress_phase == "discover"
                 else str(progress_payload.get("label") or "資料更新正在執行")
             )
-            coverage = _coverage(
-                progress_payload.get("current"),
-                progress_payload.get("total"),
-                unit=str(progress_payload.get("unit") or "項"),
-                label="目前批次",
+            coverage = (
+                None
+                if legacy_page_denominator_saturated
+                else _coverage(
+                    progress_payload.get("current"),
+                    progress_payload.get("total"),
+                    unit=str(progress_payload.get("unit") or "項"),
+                    label="目前批次",
+                )
             )
-            remaining = _integer(progress_payload.get("remaining_seconds"))
+            remaining = (
+                None
+                if legacy_page_denominator_saturated
+                else _integer(progress_payload.get("remaining_seconds"))
+            )
             eta = {
                 "state": "estimating" if remaining is not None else "warming_up",
                 "remaining_seconds": remaining,
@@ -1150,6 +1199,10 @@ def _generic_group(
                 ),
                 "confidence": "low" if remaining is not None else "not_available",
                 "basis": (
+                    "舊版進度把可變長度 request page 混入固定分母，分母已飽和但工作仍在執行；"
+                    "本輪 ETA 保持未知，下一輪改用 symbol／feature-stage 邏輯單位。"
+                    if legacy_page_denominator_saturated
+                    else
                     "僅為官方目錄規劃階段 ETA；全量下載會在物件傳輸開始後"
                     "依實測吞吐重新估算。"
                     if progress_phase == "discover"
@@ -1161,15 +1214,19 @@ def _generic_group(
                 "phase": progress_phase or None,
             }
             latest = progress_updated
-        elif progress_state == "failed" and (
+        elif progress_state in {"failed", "partial"} and (
             progress_age is None or progress_age <= 7 * 86400
         ):
             status = "degraded"
-            status_label = "最近更新批次失敗"
+            status_label = (
+                "最近更新批次未完整收斂"
+                if progress_state == "partial"
+                else "最近更新批次失敗"
+            )
             eta = _unknown_eta("waiting_schedule", "等待下一輪重試與新回執。")
 
     warning = []
-    if failure:
+    if failure or batch_incomplete:
         warning.append("最近一次摘要含失敗項目；成功檔案不代表整批完整。")
     if isinstance(progress_payload, Mapping):
         live_counts = progress_payload.get("status_counts")
@@ -1180,13 +1237,34 @@ def _generic_group(
                 for item_status, count in live_counts.items()
                 if any(
                     token in str(item_status).lower()
-                    for token in ("fail", "error", "partial", "mismatch")
+                    for token in (
+                        "fail",
+                        "error",
+                        "partial",
+                        "mismatch",
+                        "repair",
+                        "quarantine",
+                        "invalid",
+                        "blocked",
+                    )
                 )
             )
         if live_failures:
             warning.append(
                 f"目前批次已有 {live_failures:,} 個失敗／部分完成項；"
                 "更新器仍會完成其餘工作並保留錯誤明細。"
+            )
+        if (
+            str(progress_payload.get("state") or "").lower() == "running"
+            and isinstance(live_counts, Mapping)
+            and (_integer(live_counts.get("page_fetched")) or 0) > 0
+            and (_integer(progress_payload.get("total")) or 0) > 0
+            and (_integer(progress_payload.get("current")) or 0)
+            >= (_integer(progress_payload.get("total")) or 0)
+            and str(progress_payload.get("phase") or "") != "complete"
+        ):
+            warning.append(
+                "舊版 request-page 計數已塞滿分母但工作尚未結束；不顯示假 100% 或假 ETA。"
             )
     if not payloads and source_root.exists():
         warning.append("已登錄資料根，但尚未找到可驗證的摘要或 manifest。")
@@ -1215,6 +1293,64 @@ def _generic_group(
     }
 
 
+def _tw_public_publication_index(root: Path) -> dict[str, list[dict[str, Any]]]:
+    """Index source-specific publication sweeps without inventing release SLAs.
+
+    A phase receipt proves when our detector ran and which official product
+    boundary motivated it.  It does not prove that every selected endpoint was
+    published at that clock time, so callers must keep ``probe_boundary`` and
+    actual content-change timestamps separate.
+    """
+
+    receipt_root = root / "artifacts/data_refresh/tw_public/publications"
+    output: dict[str, list[dict[str, Any]]] = {}
+    try:
+        receipt_paths = sorted(receipt_root.glob("*/latest.json"))
+    except OSError:
+        receipt_paths = []
+    for receipt_path in receipt_paths:
+        payload = _read_json(receipt_path, {})
+        if not isinstance(payload, Mapping):
+            continue
+        phase = str(payload.get("phase") or receipt_path.parent.name)
+        boundary = str(payload.get("scheduled_boundary") or "").strip()
+        selected = payload.get("selected_datasets")
+        if not isinstance(selected, list):
+            continue
+        changed = {
+            str(item.get("dataset") or "")
+            for item in payload.get("changed_datasets", [])
+            if isinstance(item, Mapping)
+        }
+        receipt = {
+            "phase": phase,
+            "scheduled_boundary": boundary or None,
+            "official_basis": str(payload.get("official_basis") or "") or None,
+            "last_started_at_utc": _iso(
+                _parse_time(payload.get("started_at_taipei"))
+            ),
+            "last_completed_at_utc": _iso(
+                _parse_time(payload.get("completed_at_taipei"))
+            ),
+            "last_status": str(payload.get("status") or "unknown"),
+        }
+        for raw_name in selected:
+            name = str(raw_name or "").strip()
+            if not name:
+                continue
+            output.setdefault(name, []).append(
+                {**receipt, "content_change_observed": name in changed}
+            )
+    for rows in output.values():
+        rows.sort(
+            key=lambda item: (
+                str(item.get("scheduled_boundary") or "99:99:99"),
+                str(item.get("phase") or ""),
+            )
+        )
+    return output
+
+
 def _tw_public_sources(root: Path, *, now: datetime) -> list[dict[str, Any]]:
     base = root / "data_tw_public"
     manifest = _read_json(base / "dataset_manifest.json", [])
@@ -1229,6 +1365,7 @@ def _tw_public_sources(root: Path, *, now: datetime) -> list[dict[str, Any]]:
         else {}
     )
     event_rows = event_rows if isinstance(event_rows, Mapping) else {}
+    publication_rows = _tw_public_publication_index(root)
     if not isinstance(manifest, list):
         return []
     report: dict[str, dict[str, str]] = {}
@@ -1272,6 +1409,7 @@ def _tw_public_sources(root: Path, *, now: datetime) -> list[dict[str, Any]]:
         )
         event_row = event_rows.get(name, {})
         event_row = event_row if isinstance(event_row, Mapping) else {}
+        publication_receipts = publication_rows.get(name, [])
         event_applied = bool(
             event_row.get("last_probe_status") == "ok"
             and event_row.get("observed_version")
@@ -1354,6 +1492,43 @@ def _tw_public_sources(root: Path, *, now: datetime) -> list[dict[str, Any]]:
                 ),
                 "warnings": warnings,
                 "detail_link": None,
+                "_publication_hint": {
+                    "schedule_kind": "probe_boundary",
+                    "schedule_label": (
+                        "來源版本持續探測；另於 "
+                        + " / ".join(
+                            str(item.get("scheduled_boundary") or "")[:5]
+                            for item in publication_receipts
+                            if item.get("scheduled_boundary")
+                        )
+                        + "（Asia/Taipei）執行公布邊界掃描"
+                        if publication_receipts
+                        else "來源版本持續探測；來源未承諾固定發布時刻"
+                    ),
+                    "exact_time_declared": False,
+                    "probe_boundaries_taipei": [
+                        str(item.get("scheduled_boundary") or "")
+                        for item in publication_receipts
+                        if item.get("scheduled_boundary")
+                    ],
+                    "detected_at_utc": _iso(
+                        _parse_time(event_row.get("last_changed_at_taipei"))
+                    ),
+                    "last_checked_at_utc": _iso(
+                        _parse_time(event_row.get("last_checked_at_taipei"))
+                    ),
+                    "applied_at_utc": _iso(
+                        _parse_time(event_row.get("last_applied_at_taipei"))
+                    ),
+                    "next_check_at_utc": _iso(
+                        _parse_time(event_row.get("next_probe_at_taipei"))
+                    ),
+                    "basis": (
+                        "固定時刻是具名產品的掃描邊界；同批相關端點以實際內容版本變更時間為準，"
+                        "不把掃描時間冒充成每個來源的官方發布 SLA。"
+                    ),
+                    "receipt_phases": publication_receipts,
+                },
             }
         )
     return rows
@@ -3507,6 +3682,178 @@ def _operation_state(
     return "unable", "unknown", "缺少足夠狀態證據，無法判定會自動完成"
 
 
+def _next_data_date(value: Any) -> str | None:
+    """Return the next calendar data date for a source-backed date value."""
+
+    text = str(value or "").strip()
+    match = re.match(r"^(\d{4}-\d{2}-\d{2})(?:$|T)", text)
+    if match is None:
+        return None
+    try:
+        parsed = date.fromisoformat(match.group(1))
+    except ValueError:
+        return None
+    return (parsed + timedelta(days=1)).isoformat()
+
+
+def _publication_for_row(
+    row: Mapping[str, Any],
+    *,
+    automation: Mapping[str, Any],
+    hint: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Describe upstream publication separately from our acquisition timer."""
+
+    explicit = dict(hint) if isinstance(hint, Mapping) else {}
+    mode = str(automation.get("mode") or "not_configured")
+    cadence = str(row.get("cadence") or "依來源更新")
+    scope = str(row.get("scope") or "")
+    if scope == "credential_gate":
+        schedule_kind = "not_applicable"
+        schedule_label = "憑證狀態，不是公開資料發布端點"
+        basis = "此列只驗證憑證是否已設定，不代表任何上游資料發布。"
+    elif explicit:
+        schedule_kind = str(explicit.get("schedule_kind") or "source_contract")
+        schedule_label = str(
+            explicit.get("schedule_label")
+            or "來源未承諾固定發布時刻；以實際偵測為準"
+        )
+        basis = str(
+            explicit.get("basis")
+            or "發布時間來自來源契約或版本偵測收據。"
+        )
+    elif mode == "stream":
+        schedule_kind = "continuous"
+        schedule_label = f"連續發布；{cadence}"
+        basis = "串流資料沒有單一發布時刻；最近落盤心跳代表實際觀測。"
+    elif mode == "on_demand":
+        schedule_kind = "on_demand"
+        schedule_label = "按需產生，沒有固定發布時刻"
+        basis = "只有呼叫端點時才產生資料。"
+    elif mode == "frozen":
+        schedule_kind = "not_applicable"
+        schedule_label = "凍結封存，不再發布"
+        basis = "封存資料不再追蹤下一次發布。"
+    else:
+        schedule_kind = "cadence_only"
+        schedule_label = f"來源未承諾固定時刻；發布頻率：{cadence}"
+        basis = (
+            "目前只有來源 cadence 或我方取得契約；最近觀測時間不冒充上游官方發布時間。"
+        )
+    return {
+        "schedule_kind": schedule_kind,
+        "schedule_label": schedule_label,
+        "exact_time_declared": explicit.get("exact_time_declared") is True,
+        "probe_boundaries_taipei": list(
+            explicit.get("probe_boundaries_taipei") or []
+        ),
+        "detected_at_utc": explicit.get("detected_at_utc"),
+        "last_checked_at_utc": explicit.get("last_checked_at_utc"),
+        "applied_at_utc": explicit.get("applied_at_utc"),
+        "next_check_at_utc": explicit.get("next_check_at_utc"),
+        "observed_at_utc": row.get("latest_at_utc"),
+        "basis": basis,
+        "receipt_phases": list(explicit.get("receipt_phases") or []),
+        "acquisition_schedule_label": automation.get("schedule_label"),
+        "next_acquisition_at_utc": automation.get("next_run_at_utc"),
+    }
+
+
+def _acquisition_progress(
+    row: Mapping[str, Any],
+    *,
+    operation: str,
+    execution: str,
+    publication: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Normalize per-source progress while preserving unknown denominators."""
+
+    coverage = row.get("coverage")
+    coverage = coverage if isinstance(coverage, Mapping) else {}
+    ratio = _number(coverage.get("ratio"))
+    if ratio is not None:
+        ratio = min(1.0, max(0.0, ratio))
+    current = _integer(coverage.get("current"))
+    total = _integer(coverage.get("total"))
+    data_through = str(row.get("data_through") or "").strip() or None
+    preparing_for_date = _next_data_date(data_through)
+    first_data_observed = bool(
+        data_through
+        or (current is not None and current > 0)
+        or ((_integer(row.get("rows")) or 0) > 0)
+        or operation == "streaming"
+    )
+    up_to_date = operation in {"complete", "streaming"} and execution != "deferred"
+    coverage_complete = ratio >= 1.0 if ratio is not None else False
+    batch_complete = operation == "complete" or (
+        coverage_complete and execution not in {"running", "streaming"}
+    )
+    if operation == "streaming":
+        state = "streaming"
+        label = "持續取得中；串流沒有總完工日"
+    elif execution == "deferred":
+        state = "deferred"
+        label = "已延後；不列入主動取得範圍"
+    elif up_to_date:
+        state = "complete"
+        label = "取得完成且已到最新"
+    elif operation == "unable":
+        state = "blocked"
+        label = "取得未完成；目前受阻"
+    elif batch_complete and preparing_for_date:
+        state = "preparing_next_date"
+        label = f"本批完成；準備下一資料日 {preparing_for_date}"
+    elif first_data_observed and preparing_for_date:
+        state = "acquiring"
+        label = f"首筆已到；取得中並準備下一資料日 {preparing_for_date}"
+    elif first_data_observed:
+        state = "acquiring"
+        label = "已收到資料；取得中"
+    else:
+        state = "waiting"
+        label = "尚未收到首筆資料"
+
+    progress_basis = str(coverage.get("label") or "").strip()
+    eta = row.get("eta")
+    eta = eta if isinstance(eta, Mapping) else {}
+    completed_receipt = bool(row.get("latest_at_utc")) and str(
+        eta.get("state") or ""
+    ) == "complete"
+    if ratio is None and up_to_date and completed_receipt:
+        # A timestamped, high-confidence completed receipt is a valid binary
+        # denominator.  An on-demand contract alone is not.
+        ratio = 1.0
+        current = 1
+        total = 1
+        unit = "完成收據"
+        progress_basis = "最新完成收據"
+    else:
+        unit = str(coverage.get("unit") or "").strip() or None
+        if ratio is None:
+            progress_basis = (
+                "已收到首筆，但來源未提供可靠總量"
+                if first_data_observed
+                else "來源未提供可靠分子／分母"
+            )
+    first_data_at = publication.get("applied_at_utc") or None
+    return {
+        "state": state,
+        "label": label,
+        "current": current,
+        "total": total,
+        "ratio": ratio,
+        "unit": unit,
+        "basis": progress_basis,
+        "first_data_observed": first_data_observed,
+        "first_data_at_utc": first_data_at,
+        "data_through": data_through,
+        "preparing_for_date": preparing_for_date,
+        "coverage_complete": coverage_complete,
+        "batch_complete": batch_complete,
+        "up_to_date": up_to_date,
+    }
+
+
 def _row_sort_key(row: Mapping[str, Any]) -> tuple[Any, ...]:
     operation = str(row.get("operation_state") or "unable")
     execution_order = {
@@ -3547,10 +3894,20 @@ def _enrich_and_sort_rows(
     enriched: list[dict[str, Any]] = []
     for original in rows:
         row = dict(original)
+        publication_hint = row.pop("_publication_hint", None)
         automation = _automation_for_row(
             row, now=now, refresh_services=refresh_services
         )
         operation, execution, reason = _operation_state(row, automation)
+        publication = _publication_for_row(
+            row,
+            automation=automation,
+            hint=(
+                publication_hint
+                if isinstance(publication_hint, Mapping)
+                else None
+            ),
+        )
         row["endpoint_id"] = str(row.get("id") or "")
         row["operation_state"] = operation
         row["operation_label"] = _OPERATION_LABELS[operation]
@@ -3563,6 +3920,13 @@ def _enrich_and_sort_rows(
         )
         row["last_verified_at_utc"] = row.get("latest_at_utc")
         row["automation"] = automation
+        row["publication"] = publication
+        row["acquisition_progress"] = _acquisition_progress(
+            row,
+            operation=operation,
+            execution=execution,
+            publication=publication,
+        )
         enriched.append(row)
     enriched.sort(key=_row_sort_key)
     for index, row in enumerate(enriched, start=1):
@@ -3707,6 +4071,25 @@ def build_data_monitor_public_status(
         (row.get("automation") or {}).get("next_run_basis") == "systemd_timer"
         for row in rows
     )
+    publication_detected = sum(
+        bool((row.get("publication") or {}).get("detected_at_utc")) for row in rows
+    )
+    publication_exact = sum(
+        (row.get("publication") or {}).get("exact_time_declared") is True
+        for row in rows
+    )
+    progress_denominator_known = sum(
+        _number((row.get("acquisition_progress") or {}).get("ratio")) is not None
+        for row in rows
+    )
+    first_data_observed = sum(
+        (row.get("acquisition_progress") or {}).get("first_data_observed") is True
+        for row in rows
+    )
+    preparing_next_date = sum(
+        bool((row.get("acquisition_progress") or {}).get("preparing_for_date"))
+        for row in rows
+    )
     deferred_count = sum(row.get("execution_state") == "deferred" for row in rows)
     active_scope_count = len(rows) - deferred_count
     completed_in_scope = operation_counts["complete"] - deferred_count
@@ -3765,6 +4148,12 @@ def build_data_monitor_public_status(
             "declared_calendar_next_run_known": (
                 next_run_known - systemd_next_run_known
             ),
+            "publication_detected": publication_detected,
+            "publication_exact_time_declared": publication_exact,
+            "publication_cadence_or_boundary_only": len(rows) - publication_exact,
+            "progress_denominator_known": progress_denominator_known,
+            "first_data_observed": first_data_observed,
+            "preparing_next_data_date": preparing_next_date,
             "sort_contract": (
                 "operation_rank, execution_state, measured_eta, next_run, "
                 "provider, title, endpoint_id"
@@ -3789,6 +4178,14 @@ def build_data_monitor_public_status(
             "schedule": (
                 "next_run_at_utc 取自 systemd timer；完成後間隔、配額回補、"
                 "盤別與按需端點則明示其排程契約，不捏造精確時間。"
+            ),
+            "publication": (
+                "發布時間與我方取得排程分開；只有來源明示或版本變更收據才標為發布證據，"
+                "掃描邊界與 cadence 不冒充每個端點的官方 SLA。"
+            ),
+            "acquisition_progress": (
+                "進度優先取完整度 receipt/manifest 的分子分母；分母未知時保持未知。"
+                "首筆資料到達即顯示下一個日曆資料日，但完整性未通過前不標示完成。"
             ),
             "source_level_progress": "面板監控項目的狀態比例，不是資料列數完成率。",
             "realtime_boundary": "即時 Tick／BidAsk 是連續流，沒有總完工日；歷史 Tick 不能重建未曾擷取的五檔委託簿。",

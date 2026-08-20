@@ -1,5 +1,0 @@
-# This directory is a Syncthing folder marker.
-# Do not delete.
-
-folderID: stockagent
-created: 2026-07-20T06:09:41Z

@@ -16,10 +16,9 @@ def test_guide_lists_all_tw_execution_modes() -> None:
 
     assert "`tw` 舊版 Naive" in guide
     assert "`tw_cash` 現股/T+2" in guide
-    assert "`tw_day_trade_1m` 現股當沖（初始 100 萬）" in guide
-    assert "`tw_day_trade` 現股當沖（初始 1,000 萬）" in guide
     assert "`tw_day_trade_multi_basis` Multi-Basis 現股當沖（初始 1,000 萬）" in guide
     assert "`tw_day_trade_100m` 現股當沖（初始 1 億）" in guide
+    assert "`tw_day_trade_multi_basis_projection_l1_gelu`" in guide
 
 
 def test_multi_basis_day_trade_is_available_in_market_autocomplete() -> None:
@@ -28,13 +27,12 @@ def test_multi_basis_day_trade_is_available_in_market_autocomplete() -> None:
     assert any(choice.value == "tw_day_trade_multi_basis" for choice in choices)
 
 
-def test_all_four_day_trade_modes_share_the_0900_paper_execution_contract() -> None:
+def test_all_three_day_trade_modes_share_the_0900_paper_execution_contract() -> None:
     configs = discord_bot._market_configs()
     markets = (
-        "tw_day_trade_1m",
-        "tw_day_trade",
         "tw_day_trade_multi_basis",
         "tw_day_trade_100m",
+        "tw_day_trade_multi_basis_projection_l1_gelu",
     )
 
     for market in markets:

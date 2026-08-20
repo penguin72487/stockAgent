@@ -1,0 +1,31 @@
+base_config: ../markets/tw_day_trade_daily_multi_basis_tplus2_close_capital10m.yaml
+
+# Immutable inference contract reconstructed from the completed artifact's
+# authoritative run_manifest.json.  Do not infer these settings from the long
+# artifact directory name: they are the exact fold-11 checkpoint semantics.
+experiment_name: tw-day-trade-multi-basis-projection-l1-gelu-fold11-deployment
+
+runner:
+  output_dir: artifacts/markets/tw_day_trade_daily_multi_basis_projection_l1_gelu_no_pos_attention_pooling_layernorm_tplus2_close_commission20_capital10m_v1
+  resume: false
+  post_train_infer: false
+
+walk_forward:
+  lookback_context: panel_history
+
+trading:
+  portfolio_activation: pre_normalized
+  volume_participation_equity: 10000000.0
+
+training:
+  defer_epoch_curve_plot_until_end: false
+  loss_portfolio_activation: pre_normalized
+  financial_transformer:
+    portfolio_output_mode: projection_l1
+    use_time_pos: false
+    use_symbol_pos: false
+    ffn_type: gelu
+    temporal_pooling: attention
+    temporal_query_mode: full_then_last
+    norm_type: layernorm
+    temporal_basis_input: raw_features

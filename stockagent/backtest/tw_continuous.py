@@ -44,7 +44,9 @@ from stockagent.backtest.tw_commission_rebate import (
 
 _MIN_WEALTH_FACTOR = 1.0e-6
 
-_TW_CASH_COMPILED_CHUNK_CACHE: dict[tuple[object, ...], Callable[..., tuple[torch.Tensor, ...]]] = {}
+_TW_CASH_COMPILED_CHUNK_CACHE: dict[
+    tuple[object, ...], Callable[..., tuple[torch.Tensor, ...]]
+] = {}
 _TW_CASH_FAILED_COMPILE_KEYS: set[tuple[object, ...]] = set()
 _TW_CASH_COMPILE_STATS: dict[str, int] = {
     "compile_constructors": 0,
@@ -252,40 +254,6 @@ def _split_signed(value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return negative, positive
 
 
-def _preserve_directional_gross_mix(
-    requested: torch.Tensor,
-    executable: torch.Tensor,
-) -> torch.Tensor:
-    """Scale down the better-filled side of a two-sided portfolio request.
-
-    Eligibility, volume, and close-leg evidence are execution constraints, not
-    permission to reinterpret a requested long/short portfolio as a one-sided
-    directional bet.  This continuous counterpart of
-    ``preserve_directional_lot_mix`` never increases executable exposure.
-    """
-
-    eps = requested.new_tensor(1.0e-12)
-    requested_long = requested.clamp_min(0.0).sum()
-    requested_short = (-requested.clamp_max(0.0)).sum()
-    executable_long = executable.clamp_min(0.0).sum()
-    executable_short = (-executable.clamp_max(0.0)).sum()
-    has_both = (requested_long > eps) & (requested_short > eps)
-    long_fill_rate = executable_long / requested_long.clamp_min(eps)
-    short_fill_rate = executable_short / requested_short.clamp_min(eps)
-    common_fill_rate = torch.minimum(long_fill_rate, short_fill_rate)
-    long_scale = torch.minimum(
-        torch.ones_like(common_fill_rate),
-        common_fill_rate / long_fill_rate.clamp_min(eps),
-    )
-    short_scale = torch.minimum(
-        torch.ones_like(common_fill_rate),
-        common_fill_rate / short_fill_rate.clamp_min(eps),
-    )
-    negative, positive = _split_signed(executable)
-    balanced = positive * long_scale + negative * short_scale
-    return torch.where(has_both, balanced, executable)
-
-
 def _as_fee_vector(
     value: torch.Tensor,
     *,
@@ -339,9 +307,7 @@ def _validate_commission_rebate_rates_eager(
 
     if torch.compiler.is_compiling():
         return
-    exceeds_gross = (rebate_rates > buy_fee_rates) | (
-        rebate_rates > sell_fee_rates
-    )
+    exceeds_gross = (rebate_rates > buy_fee_rates) | (rebate_rates > sell_fee_rates)
     if bool(exceeds_gross.any().item()):
         raise ValueError(
             "commission_rebate_rates cannot exceed either gross buy_fee_rates "
@@ -369,8 +335,7 @@ def _initial_scalar(
     if source.dim() != 0:
         raise ValueError(f"{name} must be a scalar tensor, got {tuple(source.shape)}")
     return (
-        source
-        .clone(memory_format=torch.contiguous_format)
+        source.clone(memory_format=torch.contiguous_format)
         .to(
             device=reference.device,
             dtype=dtype if dtype is not None else reference.dtype,
@@ -394,7 +359,9 @@ def _initial_vector(
         .to(device=reference.device, dtype=reference.dtype)
     )
     if result.dim() != 1 or int(result.numel()) != size:
-        raise ValueError(f"settlement state must have shape ({size},), got {tuple(result.shape)}")
+        raise ValueError(
+            f"settlement state must have shape ({size},), got {tuple(result.shape)}"
+        )
     _validate_finite_nonnegative_eager(result, "settlement state")
     return result
 
@@ -423,7 +390,10 @@ def _prepare_common_state(
 ]:
     if target_weights.dim() != 2 or int(target_weights.size(0)) <= 0:
         raise ValueError("target_weights must be non-empty with shape [T, S]")
-    if isinstance(settlement_lag_sessions, bool) or int(settlement_lag_sessions) != settlement_lag_sessions:
+    if (
+        isinstance(settlement_lag_sessions, bool)
+        or int(settlement_lag_sessions) != settlement_lag_sessions
+    ):
         raise ValueError("settlement_lag_sessions must be a positive integer")
     lag = int(settlement_lag_sessions)
     if lag <= 0:
@@ -498,7 +468,9 @@ def _prepare_common_state(
         if not bool(torch.isfinite(risky).all().item()):
             raise ValueError("initial_weights must be finite")
         if not bool((risky >= 0.0).all().item()):
-            raise ValueError("initial_weights must be non-negative for Taiwan cash state")
+            raise ValueError(
+                "initial_weights must be non-negative for Taiwan cash state"
+            )
     _validate_normalized_state_eager(
         risky=risky,
         cash=cash,
@@ -594,7 +566,9 @@ def _prepare_cash_short_state(
                 "initial_weights must contain one value per symbol: "
                 f"expected ({symbols},), got {tuple(risky.shape)}"
             )
-    if not torch.compiler.is_compiling() and not bool(torch.isfinite(risky).all().item()):
+    if not torch.compiler.is_compiling() and not bool(
+        torch.isfinite(risky).all().item()
+    ):
         raise ValueError("initial_weights must be finite")
 
     payables = _initial_vector(
@@ -788,9 +762,13 @@ def _prepare_equity_scale(
         alive_value = bool(alive.detach().item())
         scale_value = float(equity_scale.detach().item())
         if alive_value and scale_value <= 0.0:
-            raise ValueError("a live Taiwan settlement state requires positive equity scale")
+            raise ValueError(
+                "a live Taiwan settlement state requires positive equity scale"
+            )
         if not alive_value and scale_value != 0.0:
-            raise ValueError("an absorbing dead Taiwan settlement state requires zero equity scale")
+            raise ValueError(
+                "an absorbing dead Taiwan settlement state requires zero equity scale"
+            )
     return equity_scale
 
 
@@ -898,8 +876,10 @@ def _enqueue_net_claim(
     new_receivable = positive
     new_payable = -negative
     payables = torch.cat((payables[:-1], new_payable.unsqueeze(0)), dim=0)
-    lag = int(payables.numel()) if settlement_lag_sessions is None else int(
-        settlement_lag_sessions
+    lag = (
+        int(payables.numel())
+        if settlement_lag_sessions is None
+        else int(settlement_lag_sessions)
     )
     if lag <= 0 or lag > int(receivables.numel()):
         raise ValueError(
@@ -1148,9 +1128,7 @@ def _run_tw_cash_continuous_impl(
                 "can_short_open_mask requires explicit point-in-time "
                 "short_capacity_weights"
             )
-    maintenance_ratio_value = _resolve_short_maintenance_ratio(
-        short_maintenance_ratio
-    )
+    maintenance_ratio_value = _resolve_short_maintenance_ratio(short_maintenance_ratio)
 
     if unresolved_corporate_action_mask is None:
         raise ValueError(
@@ -1186,8 +1164,12 @@ def _run_tw_cash_continuous_impl(
     ):
         if tuple(value.shape) != tuple(target_weights.shape):
             raise ValueError(f"{name} shape must match target_weights")
-    buy_fees = _as_fee_vector(buy_fee_rates, reference=target_weights, name="buy_fee_rates")
-    sell_fees = _as_fee_vector(sell_fee_rates, reference=target_weights, name="sell_fee_rates")
+    buy_fees = _as_fee_vector(
+        buy_fee_rates, reference=target_weights, name="buy_fee_rates"
+    )
+    sell_fees = _as_fee_vector(
+        sell_fee_rates, reference=target_weights, name="sell_fee_rates"
+    )
     rebate_rates = _as_commission_rebate_vector(
         commission_rebate_rates,
         reference=target_weights,
@@ -1247,9 +1229,13 @@ def _run_tw_cash_continuous_impl(
         if force_exit_mask is None
         else force_exit_mask.to(device=target_weights.device, dtype=torch.bool)
     )
-    if volume_limit_weights is not None and tuple(volume_limit_weights.shape) != tuple(target_weights.shape):
+    if volume_limit_weights is not None and tuple(volume_limit_weights.shape) != tuple(
+        target_weights.shape
+    ):
         raise ValueError("volume_limit_weights shape must match target_weights")
-    if short_capacity_weights is not None and tuple(short_capacity_weights.shape) != tuple(target_weights.shape):
+    if short_capacity_weights is not None and tuple(
+        short_capacity_weights.shape
+    ) != tuple(target_weights.shape):
         raise ValueError("short_capacity_weights shape must match target_weights")
     if tuple(unresolved_corporate_action_mask.shape) != tuple(target_weights.shape):
         raise ValueError(
@@ -1266,8 +1252,7 @@ def _run_tw_cash_continuous_impl(
             target_weights.shape
         ):
             raise ValueError(
-                "cash_dividend_payment_delay_sessions shape must match "
-                "target_weights"
+                "cash_dividend_payment_delay_sessions shape must match target_weights"
             )
         dividend_yields = cash_dividend_yield.to(
             device=target_weights.device,
@@ -1341,9 +1326,7 @@ def _run_tw_cash_continuous_impl(
         and not torch.compiler.is_compiling()
         and bool(
             (
-                (rebate_current != 0.0)
-                | (rebate_due != 0.0)
-                | (rebate_month_id != 0)
+                (rebate_current != 0.0) | (rebate_due != 0.0) | (rebate_month_id != 0)
             ).item()
         )
     ):
@@ -1458,22 +1441,24 @@ def _run_tw_cash_continuous_impl(
             )
         advance = advance_mask[idx]
         risky_before = risky
-        cash, payables, receivables, alive_after_settlement, default_now = _settle_open_phase(
-            cash,
-            payables,
-            receivables,
-            alive,
-            advance,
-        )
-        rebate_current, rebate_due, rebate_month_id = (
-            mask_commission_rebate_state(
-                rebate_current,
-                rebate_due,
-                rebate_month_id,
-                alive_after_settlement,
+        cash, payables, receivables, alive_after_settlement, default_now = (
+            _settle_open_phase(
+                cash,
+                payables,
+                receivables,
+                alive,
+                advance,
             )
         )
-        risky_before = torch.where(alive_after_settlement, risky_before, torch.zeros_like(risky_before))
+        rebate_current, rebate_due, rebate_month_id = mask_commission_rebate_state(
+            rebate_current,
+            rebate_due,
+            rebate_month_id,
+            alive_after_settlement,
+        )
+        risky_before = torch.where(
+            alive_after_settlement, risky_before, torch.zeros_like(risky_before)
+        )
         short_sale_collateral = torch.where(
             alive_after_settlement,
             short_sale_collateral,
@@ -1529,9 +1514,7 @@ def _run_tw_cash_continuous_impl(
             advance & alive_after_settlement & execution_contract_default
         )
         default_now = default_now | execution_contract_default
-        alive_after_settlement = (
-            alive_after_settlement & ~execution_contract_default
-        )
+        alive_after_settlement = alive_after_settlement & ~execution_contract_default
         cash = torch.where(alive_after_settlement, cash, torch.zeros_like(cash))
         payables = torch.where(
             alive_after_settlement, payables, torch.zeros_like(payables)
@@ -1552,13 +1535,11 @@ def _run_tw_cash_continuous_impl(
             short_margin_collateral,
             torch.zeros_like(short_margin_collateral),
         )
-        rebate_current, rebate_due, rebate_month_id = (
-            mask_commission_rebate_state(
-                rebate_current,
-                rebate_due,
-                rebate_month_id,
-                alive_after_settlement,
-            )
+        rebate_current, rebate_due, rebate_month_id = mask_commission_rebate_state(
+            rebate_current,
+            rebate_due,
+            rebate_month_id,
+            alive_after_settlement,
         )
         action_avoidance = action_avoidance & alive_after_settlement
         mandatory_exit = terminal[idx] | action_avoidance
@@ -1596,10 +1577,16 @@ def _run_tw_cash_continuous_impl(
         voluntary_short_cover = (base_short - desired_short).clamp_min(0.0)
         voluntary_short_open = (desired_short - base_short).clamp_min(0.0)
 
-        voluntary_long_sell = voluntary_long_sell * sell_mask[idx].to(target_weights.dtype)
+        voluntary_long_sell = voluntary_long_sell * sell_mask[idx].to(
+            target_weights.dtype
+        )
         voluntary_long_buy = voluntary_long_buy * buy_mask[idx].to(target_weights.dtype)
-        voluntary_short_cover = voluntary_short_cover * buy_mask[idx].to(target_weights.dtype)
-        voluntary_short_open = voluntary_short_open * short_open_mask[idx].to(target_weights.dtype)
+        voluntary_short_cover = voluntary_short_cover * buy_mask[idx].to(
+            target_weights.dtype
+        )
+        voluntary_short_open = voluntary_short_open * short_open_mask[idx].to(
+            target_weights.dtype
+        )
 
         if short_capacity_weights is not None:
             raw_short_cap = short_capacity_weights[idx].to(
@@ -1629,9 +1616,7 @@ def _run_tw_cash_continuous_impl(
                 equity_scale,
             )
             cap_is_valid = torch.isfinite(volume_cap) & (volume_cap >= 0.0)
-            cap_binds = cap_is_valid & (
-                volume_cap < voluntary_notional * equity_scale
-            )
+            cap_binds = cap_is_valid & (volume_cap < voluntary_notional * equity_scale)
             safe_requested = torch.where(
                 cap_binds,
                 voluntary_notional,
@@ -1692,9 +1677,7 @@ def _run_tw_cash_continuous_impl(
             torch.zeros_like(current_short),
         )
         cover_net_per_unit = (
-            release_sale_per_cover
-            + release_margin_per_cover
-            - (1.0 + buy_fees)
+            release_sale_per_cover + release_margin_per_cover - (1.0 + buy_fees)
         )
         mandatory_net_claim = (
             mandatory_long_sell * (1.0 - sell_fees)
@@ -1760,9 +1743,7 @@ def _run_tw_cash_continuous_impl(
             + opened_sale_collateral.sum()
             + opened_margin_collateral.sum()
         )
-        required_remaining_collateral = (
-            maintenance_ratio * remaining_short_total
-        )
+        required_remaining_collateral = maintenance_ratio * remaining_short_total
         maintenance_tolerance = target_weights.new_tensor(
             torch.finfo(target_weights.dtype).eps * 16.0
         ) * torch.maximum(
@@ -1781,8 +1762,7 @@ def _run_tw_cash_continuous_impl(
         ).clamp_min(0.0)
         release_scale = torch.minimum(
             torch.ones_like(candidate_release_total),
-            max_maintenance_release
-            / candidate_release_total.clamp_min(1.0e-12),
+            max_maintenance_release / candidate_release_total.clamp_min(1.0e-12),
         )
         all_shorts_covered = remaining_short_total <= 1.0e-12
         release_scale = torch.where(
@@ -1809,17 +1789,12 @@ def _run_tw_cash_continuous_impl(
         remaining_allocation = remaining_short / remaining_short_total.clamp_min(
             1.0e-12
         )
-        allocated_sale = (
-            remaining_allocation * raw_next_short_sale_collateral.sum()
-        )
-        allocated_margin = (
-            remaining_allocation * raw_next_short_margin_collateral.sum()
-        )
+        allocated_sale = remaining_allocation * raw_next_short_sale_collateral.sum()
+        allocated_margin = remaining_allocation * raw_next_short_margin_collateral.sum()
         orphaned_collateral = (
             (remaining_short <= 1.0e-12)
             & (
-                raw_next_short_sale_collateral
-                + raw_next_short_margin_collateral
+                raw_next_short_sale_collateral + raw_next_short_margin_collateral
                 > 1.0e-12
             )
         ).any()
@@ -1847,8 +1822,12 @@ def _run_tw_cash_continuous_impl(
             net_claim,
             settlement_lag_sessions=settlement_lag_sessions,
         )
-        payables = torch.where(advance & alive_after_settlement, next_payables, payables)
-        receivables = torch.where(advance & alive_after_settlement, next_receivables, receivables)
+        payables = torch.where(
+            advance & alive_after_settlement, next_payables, payables
+        )
+        receivables = torch.where(
+            advance & alive_after_settlement, next_receivables, receivables
+        )
         executed = torch.where(advance & alive_after_settlement, executed, risky_before)
         short_sale_collateral = torch.where(
             advance & alive_after_settlement,
@@ -1860,9 +1839,7 @@ def _run_tw_cash_continuous_impl(
             next_short_margin_collateral,
             short_margin_collateral,
         )
-        executed_gross_notional = (
-            long_sell + long_buy + short_cover + short_open
-        )
+        executed_gross_notional = long_sell + long_buy + short_cover + short_open
         rebate_accrued = torch.where(
             advance & alive_after_settlement,
             (executed_gross_notional * rebate_rates).sum(),
@@ -1913,11 +1890,7 @@ def _run_tw_cash_continuous_impl(
         )
 
         residual_action_position = (executed.abs() > 1.0e-12) & action_avoidance
-        active_return = (
-            advance
-            & alive_after_settlement
-            & (executed.abs() > 1.0e-12)
-        )
+        active_return = advance & alive_after_settlement & (executed.abs() > 1.0e-12)
         invalid_active_return = active_return & ~valid_asset_return[idx]
         post_trade_contract_default = (
             residual_action_position.any() | invalid_active_return.any()
@@ -1926,9 +1899,7 @@ def _run_tw_cash_continuous_impl(
             advance & alive_after_settlement & post_trade_contract_default
         )
         default_now = default_now | post_trade_contract_default
-        alive_after_settlement = (
-            alive_after_settlement & ~post_trade_contract_default
-        )
+        alive_after_settlement = alive_after_settlement & ~post_trade_contract_default
         cash = torch.where(alive_after_settlement, cash, torch.zeros_like(cash))
         payables = torch.where(
             alive_after_settlement, payables, torch.zeros_like(payables)
@@ -1949,13 +1920,11 @@ def _run_tw_cash_continuous_impl(
             short_margin_collateral,
             torch.zeros_like(short_margin_collateral),
         )
-        rebate_current, rebate_due, rebate_month_id = (
-            mask_commission_rebate_state(
-                rebate_current,
-                rebate_due,
-                rebate_month_id,
-                alive_after_settlement,
-            )
+        rebate_current, rebate_due, rebate_month_id = mask_commission_rebate_state(
+            rebate_current,
+            rebate_due,
+            rebate_month_id,
+            alive_after_settlement,
         )
         turnover = torch.where(
             alive_after_settlement, turnover, torch.zeros_like(turnover)
@@ -2015,15 +1984,13 @@ def _run_tw_cash_continuous_impl(
             advance=advance,
             default_now=default_now,
         )
-        rebate_current, rebate_due, rebate_month_id = (
-            normalize_commission_rebate_state(
-                current=rebate_current,
-                due=rebate_due,
-                month_id=rebate_month_id,
-                nav_end=nav_end,
-                advance=advance,
-                alive=alive,
-            )
+        rebate_current, rebate_due, rebate_month_id = normalize_commission_rebate_state(
+            current=rebate_current,
+            due=rebate_due,
+            month_id=rebate_month_id,
+            nav_end=nav_end,
+            advance=advance,
+            alive=alive,
         )
         equity_scale = _advance_equity_scale(
             equity_scale,
@@ -2036,7 +2003,9 @@ def _run_tw_cash_continuous_impl(
             execution_weights,
             torch.zeros_like(execution_weights),
         )
-        strategy_rows.append(torch.log1p(simple_return.clamp_min(-1.0 + _MIN_WEALTH_FACTOR)))
+        strategy_rows.append(
+            torch.log1p(simple_return.clamp_min(-1.0 + _MIN_WEALTH_FACTOR))
+        )
         turnover_rows.append(turnover)
         if return_weights_history:
             weight_rows.append(execution_weights)
@@ -2139,9 +2108,7 @@ def _mark_tw_cash_chunk_symbol_axes(
         return
     mark_dynamic = getattr(getattr(torch, "_dynamo", None), "mark_dynamic", None)
     if mark_dynamic is None:
-        raise RuntimeError(
-            "compiled Taiwan chunks require torch._dynamo.mark_dynamic"
-        )
+        raise RuntimeError("compiled Taiwan chunks require torch._dynamo.mark_dynamic")
     seen: set[int] = set()
     for value in values_2d:
         if id(value) in seen:
@@ -2338,13 +2305,9 @@ def _tw_cash_compiled_chunk_runner(
                 chunk_can_short_open_mask if has_short_open_mask else None
             ),
             force_short_cover_mask=(
-                chunk_force_short_cover_mask
-                if has_force_short_cover_mask
-                else None
+                chunk_force_short_cover_mask if has_force_short_cover_mask else None
             ),
-            short_margin_rate=(
-                chunk_short_margin_rate if has_short_contract else None
-            ),
+            short_margin_rate=(chunk_short_margin_rate if has_short_contract else None),
             short_capacity_weights=(
                 chunk_short_capacity_weights if has_short_capacity else None
             ),
@@ -2352,9 +2315,7 @@ def _tw_cash_compiled_chunk_runner(
                 chunk_short_handling_fee_rate if has_short_contract else 0.0
             ),
             short_maintenance_ratio=short_maintenance_ratio,
-            unresolved_corporate_action_mask=(
-                chunk_unresolved_corporate_action_mask
-            ),
+            unresolved_corporate_action_mask=(chunk_unresolved_corporate_action_mask),
             cash_dividend_yield=(
                 chunk_cash_dividend_yield if has_cash_dividends else None
             ),
@@ -2381,13 +2342,9 @@ def _tw_cash_compiled_chunk_runner(
             initial_cash=initial_cash,
             initial_payables=initial_payables,
             initial_receivables=initial_receivables,
-            initial_commission_rebate_current=(
-                initial_commission_rebate_current
-            ),
+            initial_commission_rebate_current=(initial_commission_rebate_current),
             initial_commission_rebate_due=initial_commission_rebate_due,
-            initial_commission_rebate_month_id=(
-                initial_commission_rebate_month_id
-            ),
+            initial_commission_rebate_month_id=(initial_commission_rebate_month_id),
             initial_short_sale_collateral=initial_short_sale_collateral,
             initial_short_margin_collateral=initial_short_margin_collateral,
             initial_alive=initial_alive,
@@ -2475,9 +2432,7 @@ def run_tw_cash_continuous(
                 "can_short_open_mask requires explicit point-in-time "
                 "short_capacity_weights"
             )
-    maintenance_ratio_value = _resolve_short_maintenance_ratio(
-        short_maintenance_ratio
-    )
+    maintenance_ratio_value = _resolve_short_maintenance_ratio(short_maintenance_ratio)
     has_cash_dividends = cash_dividend_yield is not None
     if has_cash_dividends != (cash_dividend_payment_delay_sessions is not None):
         raise ValueError(
@@ -2557,9 +2512,7 @@ def run_tw_cash_continuous(
             short_maintenance_ratio=maintenance_ratio_value,
             unresolved_corporate_action_mask=unresolved_corporate_action_mask,
             cash_dividend_yield=cash_dividend_yield,
-            cash_dividend_payment_delay_sessions=(
-                cash_dividend_payment_delay_sessions
-            ),
+            cash_dividend_payment_delay_sessions=(cash_dividend_payment_delay_sessions),
             claim_queue_sessions=claim_queue_sessions,
             settlement_lag_sessions=settlement_lag_sessions,
             gross_budget=gross_budget,
@@ -2572,13 +2525,9 @@ def run_tw_cash_continuous(
             initial_cash=initial_cash,
             initial_payables=initial_payables,
             initial_receivables=initial_receivables,
-            initial_commission_rebate_current=(
-                initial_commission_rebate_current
-            ),
+            initial_commission_rebate_current=(initial_commission_rebate_current),
             initial_commission_rebate_due=initial_commission_rebate_due,
-            initial_commission_rebate_month_id=(
-                initial_commission_rebate_month_id
-            ),
+            initial_commission_rebate_month_id=(initial_commission_rebate_month_id),
             initial_alive=initial_alive,
             initial_equity_scale=initial_equity_scale,
             initial_short_sale_collateral=initial_short_sale_collateral,
@@ -2601,21 +2550,32 @@ def run_tw_cash_continuous(
             raise ValueError(f"{name} shape must match target_weights")
     if force_exit_mask is not None and tuple(force_exit_mask.shape) != expected_shape:
         raise ValueError("force_exit_mask shape must match target_weights")
-    if volume_limit_weights is not None and tuple(volume_limit_weights.shape) != expected_shape:
+    if (
+        volume_limit_weights is not None
+        and tuple(volume_limit_weights.shape) != expected_shape
+    ):
         raise ValueError("volume_limit_weights shape must match target_weights")
-    if can_short_open_mask is not None and tuple(can_short_open_mask.shape) != expected_shape:
+    if (
+        can_short_open_mask is not None
+        and tuple(can_short_open_mask.shape) != expected_shape
+    ):
         raise ValueError("can_short_open_mask shape must match target_weights")
-    if force_short_cover_mask is not None and tuple(force_short_cover_mask.shape) != expected_shape:
+    if (
+        force_short_cover_mask is not None
+        and tuple(force_short_cover_mask.shape) != expected_shape
+    ):
         raise ValueError("force_short_cover_mask shape must match target_weights")
-    if short_capacity_weights is not None and tuple(short_capacity_weights.shape) != expected_shape:
+    if (
+        short_capacity_weights is not None
+        and tuple(short_capacity_weights.shape) != expected_shape
+    ):
         raise ValueError("short_capacity_weights shape must match target_weights")
     if has_cash_dividends:
         if tuple(cash_dividend_yield.shape) != expected_shape:
             raise ValueError("cash_dividend_yield shape must match target_weights")
         if tuple(cash_dividend_payment_delay_sessions.shape) != expected_shape:
             raise ValueError(
-                "cash_dividend_payment_delay_sessions shape must match "
-                "target_weights"
+                "cash_dividend_payment_delay_sessions shape must match target_weights"
             )
         dividend_yields = cash_dividend_yield.to(
             device=target_weights.device,
@@ -2631,8 +2591,7 @@ def run_tw_cash_continuous(
             raise ValueError("cash_dividend_yield must be finite and non-negative")
         event_cells = dividend_yields > 0.0
         invalid_delay = event_cells & (
-            (dividend_delays < 1)
-            | (dividend_delays > resolved_claim_queue_sessions)
+            (dividend_delays < 1) | (dividend_delays > resolved_claim_queue_sessions)
         )
         if bool(invalid_delay.any().item()):
             raise ValueError(
@@ -2686,22 +2645,16 @@ def run_tw_cash_continuous(
         dtype=torch.bool,
         detach=True,
     )
-    rebate_current, rebate_due, rebate_month_id = (
-        prepare_commission_rebate_state(
-            reference=target_weights,
-            initial_current=initial_commission_rebate_current,
-            initial_due=initial_commission_rebate_due,
-            initial_month_id=initial_commission_rebate_month_id,
-            alive=rebate_alive_seed,
-            detach=True,
-        )
+    rebate_current, rebate_due, rebate_month_id = prepare_commission_rebate_state(
+        reference=target_weights,
+        initial_current=initial_commission_rebate_current,
+        initial_due=initial_commission_rebate_due,
+        initial_month_id=initial_commission_rebate_month_id,
+        alive=rebate_alive_seed,
+        detach=True,
     )
     if rebate_timing == "daily_close" and bool(
-        (
-            (rebate_current != 0.0)
-            | (rebate_due != 0.0)
-            | (rebate_month_id != 0)
-        ).item()
+        ((rebate_current != 0.0) | (rebate_due != 0.0) | (rebate_month_id != 0)).item()
     ):
         raise ValueError(
             "daily_close commission rebates cannot start with monthly pending "
@@ -2772,15 +2725,9 @@ def run_tw_cash_continuous(
         default=0.0,
         name="short_handling_fee_rate",
     )
-    margin_rates = (
-        validated_margin_rates
-        if has_short_contract
-        else target_weights
-    )
+    margin_rates = validated_margin_rates if has_short_contract else target_weights
     short_handling_rates = (
-        validated_short_handling_rates
-        if has_short_contract
-        else target_weights
+        validated_short_handling_rates if has_short_contract else target_weights
     )
     short_capacities = (
         target_weights
@@ -2937,9 +2884,7 @@ def run_tw_cash_continuous(
             short_maintenance_ratio=maintenance_ratio_value,
             unresolved_corporate_action_mask=unresolved_corporate_action_mask,
             cash_dividend_yield=cash_dividend_yield,
-            cash_dividend_payment_delay_sessions=(
-                cash_dividend_payment_delay_sessions
-            ),
+            cash_dividend_payment_delay_sessions=(cash_dividend_payment_delay_sessions),
             claim_queue_sessions=claim_queue_sessions,
             settlement_lag_sessions=settlement_lag_sessions,
             gross_budget=gross_budget,
@@ -2952,13 +2897,9 @@ def run_tw_cash_continuous(
             initial_cash=initial_cash,
             initial_payables=initial_payables,
             initial_receivables=initial_receivables,
-            initial_commission_rebate_current=(
-                initial_commission_rebate_current
-            ),
+            initial_commission_rebate_current=(initial_commission_rebate_current),
             initial_commission_rebate_due=initial_commission_rebate_due,
-            initial_commission_rebate_month_id=(
-                initial_commission_rebate_month_id
-            ),
+            initial_commission_rebate_month_id=(initial_commission_rebate_month_id),
             initial_alive=initial_alive,
             initial_equity_scale=initial_equity_scale,
             initial_short_sale_collateral=initial_short_sale_collateral,
@@ -2993,9 +2934,7 @@ def run_tw_cash_continuous(
             short_maintenance_ratio=maintenance_ratio_value,
             unresolved_corporate_action_mask=unresolved_corporate_action_mask,
             cash_dividend_yield=cash_dividend_yield,
-            cash_dividend_payment_delay_sessions=(
-                cash_dividend_payment_delay_sessions
-            ),
+            cash_dividend_payment_delay_sessions=(cash_dividend_payment_delay_sessions),
             claim_queue_sessions=claim_queue_sessions,
             settlement_lag_sessions=settlement_lag_sessions,
             gross_budget=gross_budget,
@@ -3008,13 +2947,9 @@ def run_tw_cash_continuous(
             initial_cash=initial_cash,
             initial_payables=initial_payables,
             initial_receivables=initial_receivables,
-            initial_commission_rebate_current=(
-                initial_commission_rebate_current
-            ),
+            initial_commission_rebate_current=(initial_commission_rebate_current),
             initial_commission_rebate_due=initial_commission_rebate_due,
-            initial_commission_rebate_month_id=(
-                initial_commission_rebate_month_id
-            ),
+            initial_commission_rebate_month_id=(initial_commission_rebate_month_id),
             initial_alive=initial_alive,
             initial_equity_scale=initial_equity_scale,
             initial_short_sale_collateral=initial_short_sale_collateral,
@@ -3027,11 +2962,7 @@ def run_tw_cash_continuous(
         full_stop = total_rows - total_rows % chunk_rows
         gradient_horizon = _settlement_gradient_horizon_rows()
         for start in range(0, full_stop, chunk_rows):
-            if (
-                gradient_horizon > 0
-                and start > 0
-                and start % gradient_horizon == 0
-            ):
+            if gradient_horizon > 0 and start > 0 and start % gradient_horizon == 0:
                 risky = _restart_recurrent_gradient(
                     risky,
                     requires_grad=requires_state_grad,
@@ -3201,9 +3132,7 @@ def run_tw_cash_continuous(
                     short_open_mask[full_stop:] if has_short_open_mask else None
                 ),
                 force_short_cover_mask=(
-                    forced_cover[full_stop:]
-                    if has_force_short_cover_mask
-                    else None
+                    forced_cover[full_stop:] if has_force_short_cover_mask else None
                 ),
                 short_margin_rate=(
                     margin_rates[full_stop:] if has_short_contract else None
@@ -3212,9 +3141,7 @@ def run_tw_cash_continuous(
                     short_capacities[full_stop:] if has_short_capacity else None
                 ),
                 short_handling_fee_rate=(
-                    short_handling_rates[full_stop:]
-                    if has_short_contract
-                    else 0.0
+                    short_handling_rates[full_stop:] if has_short_contract else 0.0
                 ),
                 short_maintenance_ratio=maintenance_ratio_value,
                 unresolved_corporate_action_mask=unresolved_actions[full_stop:],
@@ -3282,9 +3209,7 @@ def run_tw_cash_continuous(
             short_maintenance_ratio=maintenance_ratio_value,
             unresolved_corporate_action_mask=unresolved_corporate_action_mask,
             cash_dividend_yield=cash_dividend_yield,
-            cash_dividend_payment_delay_sessions=(
-                cash_dividend_payment_delay_sessions
-            ),
+            cash_dividend_payment_delay_sessions=(cash_dividend_payment_delay_sessions),
             claim_queue_sessions=claim_queue_sessions,
             settlement_lag_sessions=settlement_lag_sessions,
             gross_budget=gross_budget,
@@ -3297,13 +3222,9 @@ def run_tw_cash_continuous(
             initial_cash=initial_cash,
             initial_payables=initial_payables,
             initial_receivables=initial_receivables,
-            initial_commission_rebate_current=(
-                initial_commission_rebate_current
-            ),
+            initial_commission_rebate_current=(initial_commission_rebate_current),
             initial_commission_rebate_due=initial_commission_rebate_due,
-            initial_commission_rebate_month_id=(
-                initial_commission_rebate_month_id
-            ),
+            initial_commission_rebate_month_id=(initial_commission_rebate_month_id),
             initial_alive=initial_alive,
             initial_equity_scale=initial_equity_scale,
             initial_short_sale_collateral=initial_short_sale_collateral,
@@ -3317,12 +3238,8 @@ def run_tw_cash_continuous(
         weights_history=torch.cat([chunk.weights_history for chunk in chunks]),
         cash_history=torch.cat([chunk.cash_history for chunk in chunks]),
         payables_history=torch.cat([chunk.payables_history for chunk in chunks]),
-        receivables_history=torch.cat(
-            [chunk.receivables_history for chunk in chunks]
-        ),
-        settlement_default=torch.cat(
-            [chunk.settlement_default for chunk in chunks]
-        ),
+        receivables_history=torch.cat([chunk.receivables_history for chunk in chunks]),
+        settlement_default=torch.cat([chunk.settlement_default for chunk in chunks]),
         equity_scale_history=torch.cat(
             [chunk.equity_scale_history for chunk in chunks]
         ),
@@ -3350,13 +3267,9 @@ def run_tw_cash_continuous(
         final_receivables=final.final_receivables,
         final_alive=final.final_alive,
         final_equity_scale=final.final_equity_scale,
-        final_commission_rebate_current=(
-            final.final_commission_rebate_current
-        ),
+        final_commission_rebate_current=(final.final_commission_rebate_current),
         final_commission_rebate_due=final.final_commission_rebate_due,
-        final_commission_rebate_month_id=(
-            final.final_commission_rebate_month_id
-        ),
+        final_commission_rebate_month_id=(final.final_commission_rebate_month_id),
         final_short_sale_collateral=final.final_short_sale_collateral,
         final_short_margin_collateral=final.final_short_margin_collateral,
     )
@@ -3426,8 +3339,12 @@ def _run_tw_day_trade_continuous_impl(
             raise ValueError(f"{name} shape must match target_weights")
     if volume_limit_weights is not None and tuple(volume_limit_weights.shape) != shape:
         raise ValueError("volume_limit_weights shape must match target_weights")
-    buy_fees = _as_fee_vector(buy_fee_rates, reference=target_weights, name="buy_fee_rates")
-    sell_fees = _as_fee_vector(sell_fee_rates, reference=target_weights, name="sell_fee_rates")
+    buy_fees = _as_fee_vector(
+        buy_fee_rates, reference=target_weights, name="buy_fee_rates"
+    )
+    sell_fees = _as_fee_vector(
+        sell_fee_rates, reference=target_weights, name="sell_fee_rates"
+    )
     rebate_rates = _as_commission_rebate_vector(
         commission_rebate_rates,
         reference=target_weights,
@@ -3456,24 +3373,20 @@ def _run_tw_day_trade_continuous_impl(
         dtype=torch.bool,
         detach=_detach_initial_state,
     )
-    rebate_current, rebate_due, rebate_month_id = (
-        prepare_commission_rebate_state(
-            reference=target_weights,
-            initial_current=initial_commission_rebate_current,
-            initial_due=initial_commission_rebate_due,
-            initial_month_id=initial_commission_rebate_month_id,
-            alive=rebate_alive_seed,
-            detach=_detach_initial_state,
-        )
+    rebate_current, rebate_due, rebate_month_id = prepare_commission_rebate_state(
+        reference=target_weights,
+        initial_current=initial_commission_rebate_current,
+        initial_due=initial_commission_rebate_due,
+        initial_month_id=initial_commission_rebate_month_id,
+        alive=rebate_alive_seed,
+        detach=_detach_initial_state,
     )
     if (
         rebate_timing == "daily_close"
         and not torch.compiler.is_compiling()
         and bool(
             (
-                (rebate_current != 0.0)
-                | (rebate_due != 0.0)
-                | (rebate_month_id != 0)
+                (rebate_current != 0.0) | (rebate_due != 0.0) | (rebate_month_id != 0)
             ).item()
         )
     ):
@@ -3524,15 +3437,11 @@ def _run_tw_day_trade_continuous_impl(
     tradable = tradable_mask.to(device=target_weights.device, dtype=torch.bool)
     buy = can_buy_mask.to(device=target_weights.device, dtype=torch.bool) & tradable
     sell = can_sell_mask.to(device=target_weights.device, dtype=torch.bool) & tradable
-    buy_open = (
-        day_trade_can_buy_open_mask.to(
-            device=target_weights.device, dtype=torch.bool
-        )
+    buy_open = day_trade_can_buy_open_mask.to(
+        device=target_weights.device, dtype=torch.bool
     )
-    sell_open = (
-        day_trade_can_sell_open_mask.to(
-            device=target_weights.device, dtype=torch.bool
-        )
+    sell_open = day_trade_can_sell_open_mask.to(
+        device=target_weights.device, dtype=torch.bool
     )
     short_open = (
         can_short_open_mask.to(device=target_weights.device, dtype=torch.bool)
@@ -3596,36 +3505,27 @@ def _run_tw_day_trade_continuous_impl(
                 requires_grad=False,
             )
         advance = advance_mask[idx]
-        cash, payables, receivables, alive_after_settlement, default_now = _settle_open_phase(
-            cash,
-            payables,
-            receivables,
-            alive,
-            advance,
-        )
-        rebate_current, rebate_due, rebate_month_id = (
-            mask_commission_rebate_state(
-                rebate_current,
-                rebate_due,
-                rebate_month_id,
-                alive_after_settlement,
+        cash, payables, receivables, alive_after_settlement, default_now = (
+            _settle_open_phase(
+                cash,
+                payables,
+                receivables,
+                alive,
+                advance,
             )
         )
+        rebate_current, rebate_due, rebate_month_id = mask_commission_rebate_state(
+            rebate_current,
+            rebate_due,
+            rebate_month_id,
+            alive_after_settlement,
+        )
         nav_start = (
-            cash
-            + receivables.sum()
-            + rebate_current
-            + rebate_due
-            - payables.sum()
+            cash + receivables.sum() + rebate_current + rebate_due - payables.sum()
         )
         # A day-trade account begins and ends flat.  A terminal exit therefore
         # means no new round trip may be opened, while a mandatory short-cover
         # event blocks only a new sell-first trade and still permits buy-first.
-        requested_target = torch.where(
-            advance & alive_after_settlement,
-            target_weights[idx],
-            torch.zeros_like(target_weights[idx]),
-        )
         entry_eligible = eligible[idx] & ~force_exit[idx]
         direction_open = torch.where(
             target_weights[idx] < 0.0,
@@ -3685,11 +3585,6 @@ def _run_tw_day_trade_continuous_impl(
             signed_target,
             torch.zeros_like(signed_target),
         )
-        signed_target = _preserve_directional_gross_mix(
-            requested_target,
-            signed_target,
-        )
-
         short_signed, long_entry = _split_signed(signed_target)
         short_entry = -short_signed
         buy_notional = long_entry + short_entry * (1.0 + ret)
@@ -3703,8 +3598,12 @@ def _run_tw_day_trade_continuous_impl(
             receivables,
             sell_proceeds - buy_cost,
         )
-        payables = torch.where(advance & alive_after_settlement, next_payables, payables)
-        receivables = torch.where(advance & alive_after_settlement, next_receivables, receivables)
+        payables = torch.where(
+            advance & alive_after_settlement, next_payables, payables
+        )
+        receivables = torch.where(
+            advance & alive_after_settlement, next_receivables, receivables
+        )
         rebate_accrued = torch.where(
             advance & alive_after_settlement,
             (round_trip_notional * rebate_rates).sum(),
@@ -3734,11 +3633,7 @@ def _run_tw_day_trade_continuous_impl(
             torch.zeros_like(nav_start),
         )
         nav_end = (
-            cash
-            + receivables.sum()
-            + rebate_current
-            + rebate_due
-            - payables.sum()
+            cash + receivables.sum() + rebate_current + rebate_due - payables.sum()
         )
         zero_risky = torch.zeros_like(risky)
         (
@@ -3760,15 +3655,13 @@ def _run_tw_day_trade_continuous_impl(
             advance=advance,
             default_now=default_now,
         )
-        rebate_current, rebate_due, rebate_month_id = (
-            normalize_commission_rebate_state(
-                current=rebate_current,
-                due=rebate_due,
-                month_id=rebate_month_id,
-                nav_end=nav_end,
-                advance=advance,
-                alive=alive,
-            )
+        rebate_current, rebate_due, rebate_month_id = normalize_commission_rebate_state(
+            current=rebate_current,
+            due=rebate_due,
+            month_id=rebate_month_id,
+            nav_end=nav_end,
+            advance=advance,
+            alive=alive,
         )
         equity_scale = _advance_equity_scale(
             equity_scale,
@@ -3776,7 +3669,9 @@ def _run_tw_day_trade_continuous_impl(
             advance=advance,
             alive=alive,
         )
-        strategy_rows.append(torch.log1p(simple_return.clamp_min(-1.0 + _MIN_WEALTH_FACTOR)))
+        strategy_rows.append(
+            torch.log1p(simple_return.clamp_min(-1.0 + _MIN_WEALTH_FACTOR))
+        )
         turnover_rows.append(turnover)
         if return_weights_history:
             weight_rows.append(signed_target)
@@ -3973,13 +3868,9 @@ def _tw_day_trade_compiled_chunk_runner(
             initial_cash=initial_cash,
             initial_payables=initial_payables,
             initial_receivables=initial_receivables,
-            initial_commission_rebate_current=(
-                initial_commission_rebate_current
-            ),
+            initial_commission_rebate_current=(initial_commission_rebate_current),
             initial_commission_rebate_due=initial_commission_rebate_due,
-            initial_commission_rebate_month_id=(
-                initial_commission_rebate_month_id
-            ),
+            initial_commission_rebate_month_id=(initial_commission_rebate_month_id),
             initial_alive=initial_alive,
             initial_equity_scale=initial_equity_scale,
             _detach_initial_state=False,
@@ -4066,13 +3957,9 @@ def run_tw_day_trade_continuous(
             initial_cash=initial_cash,
             initial_payables=initial_payables,
             initial_receivables=initial_receivables,
-            initial_commission_rebate_current=(
-                initial_commission_rebate_current
-            ),
+            initial_commission_rebate_current=(initial_commission_rebate_current),
             initial_commission_rebate_due=initial_commission_rebate_due,
-            initial_commission_rebate_month_id=(
-                initial_commission_rebate_month_id
-            ),
+            initial_commission_rebate_month_id=(initial_commission_rebate_month_id),
             initial_alive=initial_alive,
             initial_equity_scale=initial_equity_scale,
         )
@@ -4084,11 +3971,15 @@ def run_tw_day_trade_continuous(
     except ValueError:
         chunk_rows = 0
     gradient_horizon = _settlement_gradient_horizon_rows()
-    gradient_boundaries_align = bool(
-        gradient_horizon <= 0
-        or chunk_rows % gradient_horizon == 0
-        or gradient_horizon % chunk_rows == 0
-    ) if chunk_rows > 0 else False
+    gradient_boundaries_align = (
+        bool(
+            gradient_horizon <= 0
+            or chunk_rows % gradient_horizon == 0
+            or gradient_horizon % chunk_rows == 0
+        )
+        if chunk_rows > 0
+        else False
+    )
     compile_chunks = bool(
         chunk_rows > 0
         and gradient_boundaries_align
@@ -4162,22 +4053,16 @@ def run_tw_day_trade_continuous(
         dtype=torch.bool,
         detach=True,
     )
-    rebate_current, rebate_due, rebate_month_id = (
-        prepare_commission_rebate_state(
-            reference=target_weights,
-            initial_current=initial_commission_rebate_current,
-            initial_due=initial_commission_rebate_due,
-            initial_month_id=initial_commission_rebate_month_id,
-            alive=rebate_alive_seed,
-            detach=True,
-        )
+    rebate_current, rebate_due, rebate_month_id = prepare_commission_rebate_state(
+        reference=target_weights,
+        initial_current=initial_commission_rebate_current,
+        initial_due=initial_commission_rebate_due,
+        initial_month_id=initial_commission_rebate_month_id,
+        alive=rebate_alive_seed,
+        detach=True,
     )
     if rebate_timing == "daily_close" and bool(
-        (
-            (rebate_current != 0.0)
-            | (rebate_due != 0.0)
-            | (rebate_month_id != 0)
-        ).item()
+        ((rebate_current != 0.0) | (rebate_due != 0.0) | (rebate_month_id != 0)).item()
     ):
         raise ValueError(
             "daily_close commission rebates cannot start with monthly pending "
@@ -4307,11 +4192,7 @@ def run_tw_day_trade_continuous(
         total_rows = int(target_weights.size(0))
         full_stop = total_rows - total_rows % chunk_rows
         for start in range(0, full_stop, chunk_rows):
-            if (
-                gradient_horizon > 0
-                and start > 0
-                and start % gradient_horizon == 0
-            ):
+            if gradient_horizon > 0 and start > 0 and start % gradient_horizon == 0:
                 cash = _restart_recurrent_gradient(
                     cash,
                     requires_grad=requires_state_grad,
@@ -4471,8 +4352,7 @@ def run_tw_day_trade_continuous(
         _TW_CASH_FAILED_COMPILE_KEYS.add(key)
         if _tw_env_truthy("STOCKAGENT_STRICT_NO_FALLBACK", "0"):
             raise RuntimeError(
-                "compiled Taiwan day-trade chunk failed and strict fallback "
-                "is enabled"
+                "compiled Taiwan day-trade chunk failed and strict fallback is enabled"
             ) from exc
         _TW_CASH_COMPILE_STATS["eager_fallback_calls"] += 1
         print(
@@ -4489,12 +4369,8 @@ def run_tw_day_trade_continuous(
         weights_history=torch.cat([chunk.weights_history for chunk in chunks]),
         cash_history=torch.cat([chunk.cash_history for chunk in chunks]),
         payables_history=torch.cat([chunk.payables_history for chunk in chunks]),
-        receivables_history=torch.cat(
-            [chunk.receivables_history for chunk in chunks]
-        ),
-        settlement_default=torch.cat(
-            [chunk.settlement_default for chunk in chunks]
-        ),
+        receivables_history=torch.cat([chunk.receivables_history for chunk in chunks]),
+        settlement_default=torch.cat([chunk.settlement_default for chunk in chunks]),
         equity_scale_history=torch.cat(
             [chunk.equity_scale_history for chunk in chunks]
         ),
@@ -4516,13 +4392,9 @@ def run_tw_day_trade_continuous(
         final_receivables=final.final_receivables,
         final_alive=final.final_alive,
         final_equity_scale=final.final_equity_scale,
-        final_commission_rebate_current=(
-            final.final_commission_rebate_current
-        ),
+        final_commission_rebate_current=(final.final_commission_rebate_current),
         final_commission_rebate_due=final.final_commission_rebate_due,
-        final_commission_rebate_month_id=(
-            final.final_commission_rebate_month_id
-        ),
+        final_commission_rebate_month_id=(final.final_commission_rebate_month_id),
     )
 
 

@@ -1,5 +1,5 @@
 [Unit]
-Description=StockAgent four-mode Taiwan stock day-trade paper execution and dashboard
+Description=StockAgent three-mode Taiwan stock day-trade paper execution and dashboard
 Wants=network-online.target time-sync.target stockagent-discord-bot.service
 After=network-online.target time-sync.target stockagent-discord-bot.service
 StartLimitIntervalSec=300

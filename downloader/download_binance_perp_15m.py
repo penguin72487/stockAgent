@@ -25,6 +25,7 @@ if str(SCRIPT_DIR) not in sys.path:
 
 from common import (  # noqa: E402
     SharedRateLimiter,
+    parquet_temporal_metadata,
     provider_rate_limit,
     resolve_end_date,
     resolve_incremental_reconcile_start_ms,
@@ -118,9 +119,34 @@ class _PipelineProgress:
         self.total = max(0, int(total_units))
         self.current = 0
         self.status_counts: dict[str, int] = {}
+        self.telemetry_counts: dict[str, int] = {}
         self.recent_errors: list[dict[str, str]] = []
+        self.previous_run = self._load_previous_run()
         self._lock = threading.Lock()
+        self._last_telemetry_publish = 0.0
         self._write("running", "initializing")
+
+    def _load_previous_run(self) -> dict[str, object] | None:
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        keys = (
+            "state",
+            "phase",
+            "current",
+            "total",
+            "unit",
+            "ratio",
+            "started_at_utc",
+            "updated_at_utc",
+            "status_counts",
+            "telemetry_counts",
+            "recent_errors",
+        )
+        return {key: payload.get(key) for key in keys if key in payload}
 
     def _write(self, state: str, phase: str) -> None:
         observed = datetime.now(timezone.utc)
@@ -135,7 +161,7 @@ class _PipelineProgress:
             "phase": phase,
             "current": self.current,
             "total": self.total,
-            "unit": "request-page-or-feature-stage",
+            "unit": "symbol-or-feature-stage",
             "ratio": self.current / self.total if self.total else 1.0,
             "started_at_utc": self.started_at.isoformat(),
             "updated_at_utc": observed.isoformat(),
@@ -148,10 +174,12 @@ class _PipelineProgress:
                 else None
             ),
             "status_counts": dict(sorted(self.status_counts.items())),
+            "telemetry_counts": dict(sorted(self.telemetry_counts.items())),
             "recent_errors": list(self.recent_errors),
+            "previous_run": self.previous_run,
             "basis": (
-                "completed one-minute request pages and feature stages divided by "
-                "full elapsed time; archive and endpoint depth can change the estimate"
+                "completed symbols and feature stages divided by full elapsed time; "
+                "request pages are separate telemetry because endpoint depth varies"
             ),
         }
         _write_text_atomic(
@@ -182,11 +210,25 @@ class _PipelineProgress:
                 self.recent_errors = self.recent_errors[-20:]
             self._write("running", phase)
 
+    def observe_request_page(self, phase: str) -> None:
+        """Track HTTP pages without falsely advancing logical completion."""
+
+        with self._lock:
+            self.telemetry_counts["request_pages"] = (
+                self.telemetry_counts.get("request_pages", 0) + 1
+            )
+            observed = datetime.now(timezone.utc).timestamp()
+            if observed - self._last_telemetry_publish >= 1.0:
+                self._last_telemetry_publish = observed
+                self._write("running", phase)
+
     def finish(self, *, failed: bool) -> None:
         with self._lock:
-            if not failed:
+            incomplete = self.current != self.total
+            if not failed and not incomplete:
                 self.current = self.total
-            self._write("failed" if failed else "complete", "complete")
+            state = "failed" if failed else "partial" if incomplete else "complete"
+            self._write(state, "complete")
 
 
 def parse_args() -> argparse.Namespace:
@@ -216,6 +258,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--refresh", action="store_true")
+    parser.add_argument(
+        "--tail-only",
+        action="store_true",
+        help=(
+            "Fetch only the missing/reconciliation tail. Do not restart from the "
+            "requested historical start merely because the local head is shorter; "
+            "use a separate full/backfill run to repair historical heads."
+        ),
+    )
     parser.add_argument(
         "--request-weight-per-minute",
         type=float,
@@ -321,13 +372,28 @@ def _frame_matches_1m_interval(frame: pl.DataFrame) -> bool:
 def _load_existing_info(path: Path) -> ExistingCandleInfo:
     try:
         parquet = pq.ParquetFile(path, memory_map=True)
-        rows = int(parquet.metadata.num_rows)
+        rows, earliest_ms, latest_ms, interval_likely_ok = parquet_temporal_metadata(
+            parquet,
+            column="date",
+            expected_interval_ms=CANDLE_INTERVAL_MS,
+        )
         if "date" not in set(parquet.schema_arrow.names):
             return ExistingCandleInfo(
                 rows=rows,
                 latest_ms=None,
                 interval_ok=False,
                 error="missing date column",
+            )
+        if (
+            earliest_ms is not None
+            and latest_ms is not None
+            and interval_likely_ok is True
+        ):
+            return ExistingCandleInfo(
+                rows=rows,
+                latest_ms=latest_ms,
+                interval_ok=True,
+                earliest_ms=earliest_ms,
             )
         dates = pl.from_arrow(pq.read_table(path, columns=["date"], memory_map=True))
         return ExistingCandleInfo(
@@ -716,6 +782,7 @@ def _download_symbol(
     end_ms: int,
     mode: str,
     refresh: bool,
+    tail_only: bool = False,
     page_progress_callback: Any = None,
 ) -> DownloadResult:
     output_path = output_dir / f"{record.code}_features.parquet"
@@ -735,6 +802,20 @@ def _download_symbol(
     if output_path.exists() and not refresh:
         existing = _load_existing_info(output_path)
         if existing.error is not None or not existing.interval_ok:
+            if tail_only:
+                return DownloadResult(
+                    "crypto_binance_usdm_perp",
+                    record.code,
+                    record.binance_symbol,
+                    record.market,
+                    "repair_required",
+                    existing.rows,
+                    str(output_path),
+                    message=(
+                        "Existing parquet failed the 1m contract; tail-only mode "
+                        "will not overwrite historical data. Run a backfill repair."
+                    ),
+                )
             print(
                 f"[binance] {record.binance_symbol}: invalid existing parquet; "
                 "rebuilding from requested start",
@@ -747,7 +828,13 @@ def _download_symbol(
                 earliest_existing_ms=existing.earliest_ms,
                 latest_existing_ms=existing.latest_ms,
                 overlap_ms=CANDLE_INTERVAL_MS,
+                repair_missing_head=not tail_only,
             )
+    elif tail_only:
+        effective_start = max(
+            effective_start,
+            end_ms - 24 * 60 * CANDLE_INTERVAL_MS,
+        )
 
     closed_end = min(end_ms, _latest_closed_candle_start_ms())
     if effective_start > closed_end:
@@ -873,6 +960,8 @@ def _sha256(path: Path) -> str:
 
 def main() -> None:
     args = parse_args()
+    if args.tail_only and (args.refresh or args.mode == "full"):
+        raise ValueError("--tail-only cannot be combined with --refresh or --mode full")
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     lock_path = output_dir / ".download.lock"
@@ -904,33 +993,9 @@ def main() -> None:
     if not symbols:
         raise RuntimeError("No Binance USD-M perpetual symbols found")
     _write_csv_atomic(pl.DataFrame([asdict(row) for row in symbols]), symbols_path)
-    closed_end_ms = min(end_ms, _latest_closed_candle_start_ms())
-    expected_candle_pages = 0
-    for record in symbols:
-        output_path = output_dir / f"{record.code}_features.parquet"
-        if output_path.is_file() and not args.refresh:
-            expected_candle_pages += 1
-            continue
-        listing_start = start_ms
-        if record.onboard_time:
-            listing_start = max(
-                listing_start,
-                int(
-                    datetime.strptime(record.onboard_time, "%Y-%m-%d %H:%M:%S")
-                    .replace(tzinfo=timezone.utc)
-                    .timestamp()
-                    * 1000
-                ),
-            )
-        candle_count = max(
-            0, (closed_end_ms - listing_start) // CANDLE_INTERVAL_MS + 1
-        )
-        expected_candle_pages += max(
-            1, (candle_count + KLINE_LIMIT - 1) // KLINE_LIMIT
-        )
     pipeline_progress = _PipelineProgress(
         progress_path,
-        total_units=expected_candle_pages
+        total_units=len(symbols)
         + len(symbols)
         * (0 if args.skip_historical_features else len(FEATURE_STAGE_IDS)),
         started_at=started_at,
@@ -953,9 +1018,13 @@ def main() -> None:
             end_ms=end_ms,
             mode=args.mode,
             refresh=args.refresh,
-            page_progress_callback=lambda code: pipeline_progress.update(
-                "candles", "page_fetched", item=code
+            tail_only=args.tail_only,
+            page_progress_callback=lambda _code: (
+                pipeline_progress.observe_request_page("candles")
             ),
+        )
+        pipeline_progress.update(
+            "candles", result.status, item=record.code, message=result.message
         )
         return result
 
@@ -1071,6 +1140,7 @@ def main() -> None:
         "status_counts": status_counts,
         "row_count": sum(int(result.rows) for result in results),
         "historical_features_enabled": not args.skip_historical_features,
+        "tail_only": args.tail_only,
         "historical_feature_status_counts": historical_status_counts,
         "historical_feature_report": str(historical_feature_report_path),
         "historical_feature_catalog": str(feature_catalog_path),
@@ -1112,13 +1182,14 @@ def main() -> None:
             )
         },
         "status_counts": status_counts,
+        "tail_only": args.tail_only,
         "generated_at_utc": ended_at.isoformat(),
     }
     _write_text_atomic(
         receipt_path,
         json.dumps(receipt, ensure_ascii=False, indent=2) + "\n",
     )
-    failed = status_counts.get("failed", 0)
+    failed = status_counts.get("failed", 0) + status_counts.get("repair_required", 0)
     feature_incomplete = historical_status_counts.get(
         "failed", 0
     ) + historical_status_counts.get("partial", 0)
