@@ -62,6 +62,7 @@ KLINE_COLUMNS = (
 )
 OBJECT_NAME = re.compile(r"-(\d{4}-\d{2}(?:-\d{2})?)\.zip$")
 DELIVERY_SUFFIX = re.compile(r"_(\d{6})$")
+_STATE_DB_LOCK = threading.RLock()
 
 
 @dataclass(frozen=True, slots=True)
@@ -398,21 +399,23 @@ def discover_plan(
 
 def _open_state(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(path) as connection:
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS archive_objects (
-                object_key TEXT PRIMARY KEY,
-                etag TEXT NOT NULL,
-                status TEXT NOT NULL,
-                sha256 TEXT,
-                row_count INTEGER,
-                output_path TEXT,
-                downloaded_at_utc TEXT,
-                error TEXT
+    with _STATE_DB_LOCK:
+        with sqlite3.connect(path, timeout=60) as connection:
+            connection.execute("PRAGMA busy_timeout = 60000")
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS archive_objects (
+                    object_key TEXT PRIMARY KEY,
+                    etag TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    sha256 TEXT,
+                    row_count INTEGER,
+                    output_path TEXT,
+                    downloaded_at_utc TEXT,
+                    error TEXT
+                )
+                """
             )
-            """
-        )
 
 
 def _completed_etags(path: Path) -> dict[str, str]:
@@ -422,7 +425,11 @@ def _completed_etags(path: Path) -> dict[str, str]:
             str(key): str(etag)
             for key, etag in connection.execute(
                 """SELECT object_key, etag FROM archive_objects
-                   WHERE status IN ('complete', 'quarantined_repair_required')"""
+                   WHERE status IN (
+                       'complete',
+                       'quarantined_repair_required',
+                       'quarantined_source_invalid'
+                   )"""
             )
         }
 
@@ -473,30 +480,35 @@ def _record_state(
     output_path: str | None = None,
     error: str | None = None,
 ) -> None:
-    _open_state(path)
-    with sqlite3.connect(path, timeout=60) as connection:
-        connection.execute(
-            """
-            INSERT INTO archive_objects (
-                object_key, etag, status, sha256, row_count, output_path,
-                downloaded_at_utc, error
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(object_key) DO UPDATE SET
-                etag=excluded.etag, status=excluded.status, sha256=excluded.sha256,
-                row_count=excluded.row_count, output_path=excluded.output_path,
-                downloaded_at_utc=excluded.downloaded_at_utc, error=excluded.error
-            """,
-            (
-                item.key,
-                item.etag,
-                status,
-                digest,
-                row_count,
-                output_path,
-                _utc_now().isoformat(),
-                error,
-            ),
-        )
+    # SQLite only has one writer. Archive downloads are parallel, but state
+    # publication is tiny and must be serialized so a successful multi-hour
+    # download cannot fail at the final receipt write with ``database is locked``.
+    with _STATE_DB_LOCK:
+        _open_state(path)
+        with sqlite3.connect(path, timeout=60) as connection:
+            connection.execute("PRAGMA busy_timeout = 60000")
+            connection.execute(
+                """
+                INSERT INTO archive_objects (
+                    object_key, etag, status, sha256, row_count, output_path,
+                    downloaded_at_utc, error
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(object_key) DO UPDATE SET
+                    etag=excluded.etag, status=excluded.status, sha256=excluded.sha256,
+                    row_count=excluded.row_count, output_path=excluded.output_path,
+                    downloaded_at_utc=excluded.downloaded_at_utc, error=excluded.error
+                """,
+                (
+                    item.key,
+                    item.etag,
+                    status,
+                    digest,
+                    row_count,
+                    output_path,
+                    _utc_now().isoformat(),
+                    error,
+                ),
+            )
 
 
 def _checksum_from_payload(payload: bytes, filename: str) -> str:
@@ -527,7 +539,8 @@ def _parse_kline_zip(payload: bytes, item: ArchiveObject) -> pl.DataFrame:
     rows = list(reader)
     if rows and rows[0] and not rows[0][0].lstrip("-").isdigit():
         rows = rows[1:]
-    normalized: list[tuple[object, ...]] = []
+    normalized_by_open: dict[int, tuple[object, ...]] = {}
+    exact_duplicate_rows = 0
     units: set[str] = set()
     for row_number, row in enumerate(rows, start=1):
         if len(row) != len(KLINE_COLUMNS):
@@ -537,23 +550,34 @@ def _parse_kline_zip(payload: bytes, item: ArchiveObject) -> pl.DataFrame:
         open_ms, open_unit = _timestamp_ms(row[0])
         close_ms, close_unit = _timestamp_ms(row[6])
         units.update((open_unit, close_unit))
-        normalized.append(
-            (
-                open_ms,
-                float(row[1]),
-                float(row[2]),
-                float(row[3]),
-                float(row[4]),
-                float(row[5]),
-                close_ms,
-                float(row[7]),
-                int(row[8]),
-                float(row[9]),
-                float(row[10]),
-                row[11],
-            )
+        normalized = (
+            open_ms,
+            float(row[1]),
+            float(row[2]),
+            float(row[3]),
+            float(row[4]),
+            float(row[5]),
+            close_ms,
+            float(row[7]),
+            int(row[8]),
+            float(row[9]),
+            float(row[10]),
+            row[11],
         )
-    frame = pl.DataFrame(normalized, schema=KLINE_COLUMNS, orient="row")
+        previous = normalized_by_open.get(open_ms)
+        if previous is not None:
+            if previous != normalized:
+                raise ValueError(
+                    f"{item.key}: conflicting duplicate open timestamp {open_ms}"
+                )
+            exact_duplicate_rows += 1
+            continue
+        normalized_by_open[open_ms] = normalized
+    frame = pl.DataFrame(
+        list(normalized_by_open.values()),
+        schema=KLINE_COLUMNS,
+        orient="row",
+    )
     if frame.is_empty():
         raise ValueError(f"empty archive: {item.key}")
     frame = frame.with_columns(
@@ -565,6 +589,9 @@ def _parse_kline_zip(payload: bytes, item: ArchiveObject) -> pl.DataFrame:
         pl.lit(item.etag).alias("archive_etag"),
         pl.lit(item.archive_last_modified_utc).alias("available_at_utc"),
         pl.lit(item.source_priority).cast(pl.Int8).alias("source_priority"),
+        pl.lit(exact_duplicate_rows)
+        .cast(pl.Int32)
+        .alias("source_exact_duplicate_rows_removed"),
         pl.lit("mixed" if len(units) > 1 else next(iter(units))).alias(
             "source_timestamp_unit"
         ),
@@ -580,8 +607,6 @@ def _parse_kline_zip(payload: bytes, item: ArchiveObject) -> pl.DataFrame:
     )
     if invalid.height:
         raise ValueError(f"{item.key}: {invalid.height} invalid OHLCV rows")
-    if frame["open_time"].n_unique() != frame.height:
-        raise ValueError(f"{item.key}: duplicate open timestamps")
     return frame.sort("open_time")
 
 
@@ -680,11 +705,33 @@ def execute_download(
                 successes.append((item, digest, frame.height))
                 progress.update("download_and_validate", "downloaded")
             except Exception as exc:
-                _record_state(state_path, item, status="failed", error=str(exc)[:2000])
+                error = str(exc)[:2000]
+                semantic_failure = (
+                    "invalid OHLCV rows" in error
+                    or "conflicting duplicate open timestamp" in error
+                )
+                if semantic_failure and item.archive_granularity == "monthly":
+                    object_status = "quarantined_repair_required"
+                elif semantic_failure:
+                    object_status = "quarantined_source_invalid"
+                else:
+                    object_status = "failed"
+                _record_state(
+                    state_path,
+                    item,
+                    status=object_status,
+                    error=error,
+                )
                 with result_lock:
-                    counts["failed"] += 1
-                    error_rows.append({"archive_key": item.key, "error": str(exc)})
-                progress.update("download_and_validate", "failed")
+                    counts[object_status] += 1
+                    error_rows.append(
+                        {
+                            "archive_key": item.key,
+                            "status": object_status,
+                            "error": str(exc),
+                        }
+                    )
+                progress.update("download_and_validate", object_status)
         if not frames:
             return
         merged = _canonical_merge(existing, frames)
@@ -719,14 +766,24 @@ def execute_download(
                 "SELECT status, COUNT(*) FROM archive_objects GROUP BY status"
             )
         }
+    source_invalid_objects = durable_counts.get("quarantined_source_invalid", 0)
+    new_repair_objects = counts["quarantined_repair_required"]
     return {
         "generated_at_utc": _utc_now().isoformat(),
-        "state": "complete" if not counts["failed"] else "partial",
+        "state": (
+            "complete"
+            if not counts["failed"]
+            and not source_invalid_objects
+            and not new_repair_objects
+            else "partial"
+        ),
         "planned_objects": len(objects),
         "already_complete_objects": len(objects) - len(pending),
         "attempted_objects": len(pending),
         "completed_objects": counts["complete"],
         "failed_objects": counts["failed"],
+        "source_invalid_objects": source_invalid_objects,
+        "new_quarantined_repair_objects": new_repair_objects,
         "durable_object_status_counts": durable_counts,
         "quarantined_monthly_objects": durable_counts.get(
             "quarantined_repair_required", 0

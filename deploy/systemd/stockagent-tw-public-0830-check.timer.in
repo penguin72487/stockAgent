@@ -2,6 +2,7 @@
 Description=Check and publish all Taiwan official data at 08:30
 
 [Timer]
+OnCalendar=Mon..Fri *-*-* 08:20:00 Asia/Taipei
 OnCalendar=Mon..Fri *-*-* 08:30:00 Asia/Taipei
 AccuracySec=1s
 RandomizedDelaySec=0

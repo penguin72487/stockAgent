@@ -168,11 +168,12 @@ class PersistentProgress:
         with self._lock:
             self._write("running", phase)
 
-    def finish(self, *, failed: bool = False) -> None:
+    def finish(self, *, failed: bool = False, state: str | None = None) -> None:
         with self._lock:
-            if not failed:
+            final_state = str(state or ("failed" if failed else "complete"))
+            if final_state == "complete":
                 self.current = self.total
-            self._write("failed" if failed else "complete", "complete")
+            self._write(final_state, "complete")
 
 
 _SYSTEM_GETADDRINFO = socket.getaddrinfo

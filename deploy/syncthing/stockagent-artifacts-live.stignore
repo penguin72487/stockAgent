@@ -1,0 +1,11 @@
+// Syncthing and node-local runtime controls never leave a machine.
+#include .stignore-cold-local
+(?d).stignore-cold-local
+(?d).stversions
+(?d).stversions/**
+(?d)data_locks
+(?d)data_locks/**
+(?d)**/*.lock
+(?d)**/*.pid
+(?d)**/.syncthing.*
+(?d)**.sync-conflict-*

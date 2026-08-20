@@ -8,6 +8,7 @@ facts: live process/activity evidence and the latest complete manifest scan.
 from __future__ import annotations
 
 from collections import deque
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 import json
 import math
@@ -15,6 +16,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import threading
 from typing import Any, Mapping
 
 
@@ -24,6 +26,22 @@ PROCESS_ACTIVITY_STALE_SECONDS = 10 * 60
 MAX_JSON_BYTES = 8 * 1024 * 1024
 MAX_HISTORY_ROWS = 50_000
 _SAFE_NAME = re.compile(r"^[a-z0-9_][a-z0-9_.-]{0,63}$")
+
+
+@dataclass
+class _HistoryFileCache:
+    device: int
+    inode: int
+    offset: int = 0
+    size: int = 0
+    mtime_ns: int = 0
+    rows: deque[dict[str, Any]] = field(
+        default_factory=lambda: deque(maxlen=MAX_HISTORY_ROWS)
+    )
+
+
+_HISTORY_CACHE_LOCK = threading.Lock()
+_HISTORY_FILE_CACHE: dict[Path, _HistoryFileCache] = {}
 
 _ALERT_MESSAGES = {
     "accepted_progress_stalled": "近期沒有新增已接受任務，下載可能正受配額或上游限制。",
@@ -314,6 +332,7 @@ def build_openbb_public_status(
     snapshot = _read_json_object(state_dir / "monitor_latest.json")
     scheduler = _read_json_object(state_dir / "provider_scheduler.json")
     downloader_phase = _read_json_object(state_dir / "downloader_phase.json")
+    l1_compaction = _read_json_object(state_dir / "l1_compaction_latest.json")
     snapshot_age = _age_seconds(snapshot.get("checked_at"), current)
     scheduler_age = _age_seconds(scheduler.get("updated_at"), current)
     phase_age = _age_seconds(downloader_phase.get("updated_at"), current)
@@ -483,6 +502,30 @@ def build_openbb_public_status(
             "minimum_free_bytes": min_free,
             "above_safety_floor": disk_free is not None and disk_free >= min_free,
         },
+        "l1_compaction": {
+            "generated_at_utc": (
+                parsed.isoformat()
+                if (parsed := _datetime(l1_compaction.get("generated_at_utc")))
+                is not None
+                else None
+            ),
+            "source_age_seconds": _age_seconds(
+                l1_compaction.get("generated_at_utc"), current
+            ),
+            "endpoints": _integer(l1_compaction.get("endpoints")),
+            "success_files": _integer(l1_compaction.get("success_files")),
+            "success_rows": _integer(l1_compaction.get("success_rows")),
+            "compacted_files": _integer(l1_compaction.get("compacted_files")),
+            "compacted_rows": _integer(l1_compaction.get("compacted_rows")),
+            "pending_files": _integer(l1_compaction.get("pending_files")),
+            "pending_rows": _integer(l1_compaction.get("pending_rows")),
+            "active_segments": _integer(l1_compaction.get("active_segments")),
+            "source_bytes": _integer(l1_compaction.get("source_bytes")),
+            "output_bytes": _integer(l1_compaction.get("output_bytes")),
+            "new_segments": _integer(l1_compaction.get("new_segments")),
+            "stale_segments": _integer(l1_compaction.get("stale_segments")),
+            "l0_deleted": bool(l1_compaction.get("l0_deleted")),
+        },
         "categories": _category_rows(snapshot),
         "providers": _provider_rows(
             snapshot, scheduler if scheduler_current else {}, current
@@ -511,31 +554,46 @@ def build_openbb_public_history(
     current = (now or datetime.now(UTC)).astimezone(UTC)
     cutoff = current - _RANGE_DELTAS[range_key] if range_key != "all" else None
     state_dir = Path(repo_root) / "data_openBB" / "_state"
-    rows: deque[dict[str, Any]] = deque(maxlen=MAX_HISTORY_ROWS)
     history_path = state_dir / "monitor_dashboard_history.jsonl"
+    projected_rows: list[dict[str, Any]] = []
     try:
-        handle = history_path.open("r", encoding="utf-8")
+        cache_key = history_path.resolve()
+        with _HISTORY_CACHE_LOCK, history_path.open("rb") as handle:
+            stat = os.fstat(handle.fileno())
+            cached = _HISTORY_FILE_CACHE.get(cache_key)
+            if (
+                cached is None
+                or (cached.device, cached.inode) != (stat.st_dev, stat.st_ino)
+                or stat.st_size < cached.offset
+            ):
+                cached = _HistoryFileCache(device=stat.st_dev, inode=stat.st_ino)
+                _HISTORY_FILE_CACHE[cache_key] = cached
+            if cached.size != stat.st_size or cached.mtime_ns != stat.st_mtime_ns:
+                handle.seek(cached.offset)
+                appended = handle.read(stat.st_size - cached.offset)
+                complete_size = appended.rfind(b"\n") + 1
+                for line in appended[:complete_size].splitlines():
+                    if not line.strip() or len(line) > 32_768:
+                        continue
+                    try:
+                        raw = json.loads(line)
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        continue
+                    if isinstance(raw, Mapping):
+                        row = project_openbb_history_row(raw)
+                        if row:
+                            cached.rows.append(row)
+                cached.offset += complete_size
+                cached.size = stat.st_size
+                cached.mtime_ns = stat.st_mtime_ns
+            projected_rows = list(cached.rows)
     except OSError:
-        handle = None
-    if handle is not None:
-        with handle:
-            for line in handle:
-                if len(line) > 32_768:
-                    continue
-                try:
-                    raw = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if not isinstance(raw, Mapping):
-                    continue
-                row = project_openbb_history_row(raw)
-                checked_at = _datetime(row.get("checked_at"))
-                if (
-                    row
-                    and checked_at is not None
-                    and (cutoff is None or checked_at >= cutoff)
-                ):
-                    rows.append(row)
+        projected_rows = []
+    rows: deque[dict[str, Any]] = deque(maxlen=MAX_HISTORY_ROWS)
+    for row in projected_rows:
+        checked_at = _datetime(row.get("checked_at"))
+        if checked_at is not None and (cutoff is None or checked_at >= cutoff):
+            rows.append(row)
     if not rows:
         latest = project_openbb_history_row(
             _read_json_object(state_dir / "monitor_latest.json")

@@ -15,6 +15,8 @@ import math
 from pathlib import Path
 import re
 import subprocess
+import threading
+import time
 from typing import Any, Callable, Final, Iterable, Sequence
 
 
@@ -44,6 +46,16 @@ _HISTORY_PROGRESS_PATTERN = re.compile(
 )
 HISTORY_RATE_SAMPLE_LIMIT: Final[int] = 120
 QUOTA_WINDOW_SCENARIO_SECONDS: Final[int] = 24 * 60 * 60
+JOURNAL_CACHE_SECONDS: Final[float] = 30.0
+
+_FILE_CACHE_LOCK = threading.Lock()
+_JSON_FILE_CACHE: dict[
+    Path, tuple[int, int, int, int, dict[str, Any] | None]
+] = {}
+_JOURNAL_CACHE_LOCK = threading.Lock()
+_JOURNAL_CACHE: dict[
+    tuple[str, int, str], tuple[float, list[dict[str, Any]]]
+] = {}
 
 
 CommandRunner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
@@ -356,10 +368,21 @@ def _default_command_runner(args: Sequence[str]) -> subprocess.CompletedProcess[
 
 def _read_json(path: Path) -> dict[str, Any] | None:
     try:
+        cache_key = path.resolve()
+        stat = path.stat()
+        signature = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+        with _FILE_CACHE_LOCK:
+            cached = _JSON_FILE_CACHE.get(cache_key)
+            if cached is not None and cached[:4] == signature:
+                payload = cached[4]
+                return dict(payload) if isinstance(payload, dict) else None
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
-    return payload if isinstance(payload, dict) else None
+    selected = payload if isinstance(payload, dict) else None
+    with _FILE_CACHE_LOCK:
+        _JSON_FILE_CACHE[cache_key] = (*signature, selected)
+    return dict(selected) if selected is not None else None
 
 
 def _parse_datetime(value: Any) -> datetime | None:
@@ -769,6 +792,12 @@ def _journal_entries(
     lines: int = 5_000,
     since: str = "-24hours",
 ) -> list[dict[str, Any]]:
+    cache_key = (str(unit), int(lines), str(since))
+    if runner is _default_command_runner:
+        with _JOURNAL_CACHE_LOCK:
+            cached = _JOURNAL_CACHE.get(cache_key)
+            if cached is not None and time.monotonic() - cached[0] < JOURNAL_CACHE_SECONDS:
+                return [dict(item) for item in cached[1]]
     try:
         result = runner(
             (
@@ -794,6 +823,9 @@ def _journal_entries(
             continue
         if isinstance(item, dict) and isinstance(item.get("MESSAGE"), str):
             entries.append(item)
+    if runner is _default_command_runner:
+        with _JOURNAL_CACHE_LOCK:
+            _JOURNAL_CACHE[cache_key] = (time.monotonic(), entries)
     return entries
 
 
@@ -838,6 +870,66 @@ def _service_state(unit: str, *, runner: CommandRunner) -> dict[str, Any]:
         ),
         "invocation_id": fields.get("InvocationID") or None,
     }
+
+
+def _service_states(
+    units: Sequence[str], *, runner: CommandRunner
+) -> dict[str, dict[str, Any]]:
+    """Read fixed service states in one systemctl process when possible."""
+
+    unique_units = tuple(dict.fromkeys(str(unit) for unit in units if unit))
+    if runner is not _default_command_runner:
+        return {unit: _service_state(unit, runner=runner) for unit in unique_units}
+    try:
+        result = runner(
+            (
+                "systemctl",
+                "show",
+                *unique_units,
+                "--property=Id,ActiveState,SubState,NRestarts,InvocationID",
+                "--no-pager",
+            )
+        )
+    except (OSError, subprocess.SubprocessError):
+        result = None
+    property_sets: dict[str, dict[str, str]] = {}
+    if result is not None and result.returncode == 0:
+        fields: dict[str, str] = {}
+        for line in [*result.stdout.splitlines(), ""]:
+            if line:
+                key, separator, value = line.partition("=")
+                if separator:
+                    fields[key] = value
+                continue
+            unit_id = str(fields.get("Id") or "")
+            if unit_id:
+                property_sets[unit_id] = fields
+            fields = {}
+    output: dict[str, dict[str, Any]] = {}
+    for unit in unique_units:
+        fields = property_sets.get(unit, {})
+        active = fields.get("ActiveState") == "active"
+        if not fields:
+            cgroup = Path("/sys/fs/cgroup/system.slice") / unit / "cgroup.procs"
+            try:
+                active = bool(cgroup.read_text(encoding="utf-8").strip())
+            except OSError:
+                active = False
+            if active:
+                fields = {"ActiveState": "active", "SubState": "running"}
+        output[unit] = {
+            "active": active,
+            "state": fields.get("SubState")
+            or fields.get("ActiveState")
+            or "unknown",
+            "restarts": (
+                int(fields["NRestarts"])
+                if str(fields.get("NRestarts") or "").isdigit()
+                else None
+            ),
+            "invocation_id": fields.get("InvocationID") or None,
+        }
+    return output
 
 
 def _inventory_count(path: Path) -> int:
@@ -1865,22 +1957,30 @@ def build_shioaji_public_status(
         observed = observed.replace(tzinfo=UTC)
     observed = observed.astimezone(UTC)
     selected_paths = paths or ShioajiMonitorPaths.from_repo(Path(repo_root))
-    history_service = _service_state(HISTORY_UNIT, runner=runner)
-    capture_service = _service_state(CAPTURE_UNIT, runner=runner)
+    service_units = [HISTORY_UNIT, CAPTURE_UNIT]
+    if selected_paths.minute_summary is not None:
+        service_units.append(MINUTE_UNIT)
+    if selected_paths.top200_capture_root is not None:
+        service_units.append(TOP200_UNIT)
+    if selected_paths.snapshot_state is not None:
+        service_units.append(SNAPSHOT_UNIT)
+    service_states = _service_states(service_units, runner=runner)
+    history_service = service_states[HISTORY_UNIT]
+    capture_service = service_states[CAPTURE_UNIT]
     history_entries = _journal_entries(HISTORY_UNIT, runner=runner)
     capture_entries = _journal_entries(CAPTURE_UNIT, runner=runner)
     minute_service = (
-        _service_state(MINUTE_UNIT, runner=runner)
+        service_states[MINUTE_UNIT]
         if selected_paths.minute_summary is not None
         else {"active": False, "state": "unavailable", "restarts": None}
     )
     top200_service = (
-        _service_state(TOP200_UNIT, runner=runner)
+        service_states[TOP200_UNIT]
         if selected_paths.top200_capture_root is not None
         else {"active": False, "state": "unavailable", "restarts": None}
     )
     snapshot_service = (
-        _service_state(SNAPSHOT_UNIT, runner=runner)
+        service_states[SNAPSHOT_UNIT]
         if selected_paths.snapshot_state is not None
         else {"active": False, "state": "unavailable", "restarts": None}
     )

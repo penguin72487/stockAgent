@@ -1,0 +1,41 @@
+[Unit]
+Description=StockAgent bounded OpenBB shadow L1 Parquet compaction
+After=local-fs.target
+ConditionPathExists=__REPO_ROOT__/data_openBB/_state/openbb_archive.sqlite3
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+WorkingDirectory=__REPO_ROOT__
+Environment="HOME=/root"
+Environment="PYTHONUNBUFFERED=1"
+Environment="OPENBB_OUTPUT_DIR=data_openBB"
+ExecStart=/usr/bin/bash "__REPO_ROOT__/scripts/run_openbb_l1_compaction.sh" --max-source-files 20000 --max-files-per-segment 2000 --max-source-bytes-per-segment 268435456 --max-uncompressed-bytes-per-segment 536870912 --max-source-rows-per-segment 10000000 --min-files-per-segment 128 --threads 4 --memory-limit 4GB --no-progress
+UMask=0077
+Nice=15
+CPUWeight=10
+IOWeight=10
+IOSchedulingClass=idle
+MemoryHigh=6G
+MemoryMax=8G
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=full
+ProtectHome=no
+InaccessiblePaths=-/root/.ssh -/root/.codex -__REPO_ROOT__/.env -__REPO_ROOT__/.env.trade -__REPO_ROOT__/.env.futures
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectKernelLogs=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictAddressFamilies=AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=~@clock @cpu-emulation @debug @module @mount @obsolete @privileged @raw-io @reboot @swap
+SystemCallErrorNumber=EPERM

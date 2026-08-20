@@ -85,8 +85,10 @@ from downloader.download_openbb_archive import (
     _fetch_congress_info_workaround,
     _fetch_cftc_cot_catalog_workaround,
     _fetch_fmp_discovery_filings_workaround,
+    _fetch_fmp_equity_peers_workaround,
     _fetch_fmp_fundamental_ratio_workaround,
     _fetch_fmp_government_trades_workaround,
+    _fetch_fmp_historical_eps_workaround,
     _fetch_fmp_insider_trading_workaround,
     _fetch_fmp_price_targets_workaround,
     _fetch_fmp_world_articles_workaround,
@@ -2406,6 +2408,113 @@ def test_manifest_requeues_market_cap_for_undated_query_shape(
         manifest.close()
 
 
+def test_manifest_requeues_fmp_adapter_boundary_failures(tmp_path: Path) -> None:
+    context = _context(tmp_path)
+    eps = make_task(
+        context,
+        "equity.fundamental.historical_eps",
+        "AAPL",
+        {"symbol": "AAPL", "limit": 5},
+        ("fmp",),
+    )
+    peers = make_task(
+        context,
+        "equity.compare.peers",
+        "RCT",
+        {"symbol": "RCT"},
+        ("fmp",),
+    )
+    manifest = Manifest(tmp_path / "state.sqlite3")
+    try:
+        manifest.upsert_tasks([eps, peers], plan_token="plan")
+        manifest.connection.execute(
+            """
+            UPDATE tasks SET status='unavailable',provider_outcomes_json=?,error=?
+            WHERE task_id=?
+            """,
+            (
+                '{"fmp":"unavailable"}',
+                "FMP limit values must be between 0 and 5",
+                eps.task_id,
+            ),
+        )
+        manifest.connection.execute(
+            """
+            UPDATE tasks SET status='failed',provider_outcomes_json=?,error=?
+            WHERE task_id=?
+            """,
+            (
+                '{"fmp":"permanent"}',
+                "market_cap input has a fractional part",
+                peers.task_id,
+            ),
+        )
+        manifest.connection.commit()
+
+        assert manifest.repair_fmp_adapter_boundary_failures(plan_token="plan") == (
+            1,
+            1,
+        )
+        rows = manifest.connection.execute(
+            "SELECT status,provider_outcomes_json FROM tasks ORDER BY task_id"
+        ).fetchall()
+        assert {row["status"] for row in rows} == {"pending"}
+        assert {row["provider_outcomes_json"] for row in rows} == {"{}"}
+        assert manifest.repair_fmp_adapter_boundary_failures(plan_token="plan") == (
+            0,
+            0,
+        )
+    finally:
+        manifest.close()
+
+
+def test_manifest_requeues_transport_outcome_misclassified_permanent(
+    tmp_path: Path,
+) -> None:
+    context = _context(tmp_path)
+    task = make_task(
+        context,
+        "economy.fred_series",
+        "series",
+        {"symbol": "SERIES"},
+        ("fred",),
+    )
+    manifest = Manifest(tmp_path / "state.sqlite3")
+    try:
+        manifest.upsert_tasks([task], plan_token="plan")
+        evidence = "fred: ClientConnectorError: Cannot connect to host api.test"
+        manifest.connection.execute(
+            """
+            UPDATE tasks SET status='failed',attempts=1,
+                provider_outcomes_json=?,provider_evidence_json=?,error=?
+            WHERE task_id=?
+            """,
+            (
+                '{"fred":"permanent"}',
+                json.dumps({"fred": evidence}),
+                evidence,
+                task.task_id,
+            ),
+        )
+        manifest.connection.commit()
+
+        assert (
+            manifest.repair_provider_transient_permanent_outcomes(
+                plan_token="plan"
+            )
+            == 1
+        )
+        row = manifest.connection.execute(
+            "SELECT status,attempts,provider_outcomes_json FROM tasks WHERE task_id=?",
+            (task.task_id,),
+        ).fetchone()
+        assert row["status"] == "pending"
+        assert row["attempts"] == 0
+        assert row["provider_outcomes_json"] == "{}"
+    finally:
+        manifest.close()
+
+
 def test_manifest_finalizes_pending_when_all_provider_outcomes_are_terminal(
     tmp_path: Path,
 ) -> None:
@@ -4492,6 +4601,68 @@ def test_fmp_fundamental_workaround_avoids_discarded_http_requests(
         historical_url = next(url for url in urls if f"/{route}-ttm?" not in url)
         assert "period=annual" in historical_url
         assert "limit=5" in historical_url
+
+
+def test_fmp_historical_eps_workaround_sends_exact_entitlement_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import downloader.download_openbb_archive as archive
+
+    observed: list[tuple[str, dict[str, object], str]] = []
+
+    def fake_page(endpoint, params, credential):
+        observed.append((endpoint, dict(params), credential))
+        return [
+            {
+                "symbol": "AAPL",
+                "date": f"2025-0{month}-01",
+                "epsActual": float(month),
+            }
+            for month in range(1, 6)
+        ]
+
+    monkeypatch.setattr(archive, "_fmp_page_json", fake_page)
+    obb = SimpleNamespace(
+        user=SimpleNamespace(credentials=SimpleNamespace(fmp_api_key="secret"))
+    )
+
+    rows = _fetch_fmp_historical_eps_workaround(
+        {"symbol": "AAPL", "limit": 5}, obb
+    )
+
+    assert len(rows) == 5
+    assert observed == [("earnings", {"symbol": "AAPL", "limit": 5}, "secret")]
+
+
+def test_fmp_equity_peers_workaround_normalizes_fractional_market_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import downloader.download_openbb_archive as archive
+
+    def fake_page(endpoint, params, credential):
+        assert (endpoint, params, credential) == (
+            "stock-peers",
+            {"symbol": "RCT"},
+            "secret",
+        )
+        return [
+            {
+                "symbol": "PEER",
+                "companyName": "Peer Inc.",
+                "price": 1.25,
+                "mktCap": 1_476_923.6,
+            }
+        ]
+
+    monkeypatch.setattr(archive, "_fmp_page_json", fake_page)
+    obb = SimpleNamespace(
+        user=SimpleNamespace(credentials=SimpleNamespace(fmp_api_key="secret"))
+    )
+
+    rows = _fetch_fmp_equity_peers_workaround({"symbol": "RCT"}, obb)
+
+    assert len(rows) == 1
+    assert rows[0].market_cap == 1_476_924
 
 
 def test_date_grid_tables_enumerate_every_native_category(tmp_path: Path) -> None:

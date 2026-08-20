@@ -1084,6 +1084,61 @@ def test_monitor_proves_mixed_fallback_from_unavailable_provider_evidence(
     assert status["unproven_unavailable_clusters"] == []
 
 
+def test_monitor_accepts_explicit_legacy_route_entitlement_evidence(
+    tmp_path: Path,
+) -> None:
+    manifest = Manifest(tmp_path / "_state" / "openbb_archive.sqlite3")
+    task = DownloadTask(
+        task_id="legacy-calendar-route",
+        endpoint="equity.calendar.events",
+        category="equity",
+        scope_key="year=2025",
+        kwargs={"start_date": "2025-01-01", "end_date": "2025-12-31"},
+        providers=("fmp",),
+        output_path=str(tmp_path / "data" / "legacy-calendar-route.parquet"),
+    )
+    reason = (
+        "FMP 403 Legacy Endpoint: only available for legacy users with valid "
+        "subscriptions prior August 31, 2025"
+    )
+    try:
+        manifest.upsert_tasks([task])
+        manifest.complete(
+            TaskResult(
+                task,
+                "unavailable",
+                "fmp",
+                0,
+                None,
+                1,
+                error=reason,
+                provider_outcomes={"fmp": "unavailable"},
+                provider_evidence={"fmp": reason},
+            )
+        )
+    finally:
+        manifest.close()
+    (tmp_path / "_state" / "provider_cooldowns.json").write_text(
+        json.dumps(
+            {
+                "unavailable_routes": [
+                    {
+                        "provider": "fmp",
+                        "endpoint": "equity.calendar.events",
+                        "reason": reason,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    status = collect_status(tmp_path, min_free_gib=0, show_progress=False)
+
+    assert status["unproven_unavailable_tasks"] == 0
+    assert status["unproven_provider_capability_constraints"] == []
+
+
 def test_monitor_rejects_transient_provider_capability_constraint(
     tmp_path: Path,
 ) -> None:

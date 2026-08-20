@@ -47,20 +47,24 @@ from tqdm import tqdm
 
 try:
     from downloader.common import SharedRateLimiter
+    from downloader.openbb_credentials import apply_openbb_environment_credentials
     from downloader.openbb_archive_contracts import (
         ARCHIVE_TIME_SHARD_PROVIDER_ALLOWLIST,
         FMP_MANIFEST_PAGINATED_ENDPOINTS,
         LOCAL_ONLY_ARCHIVE_DATE_FILTERS,
         PlanContractAuditor,
+        is_authoritative_unavailable_evidence,
         write_contract_audit,
     )
 except ModuleNotFoundError:  # Direct execution from downloader/.
     from common import SharedRateLimiter
+    from openbb_credentials import apply_openbb_environment_credentials
     from openbb_archive_contracts import (
         ARCHIVE_TIME_SHARD_PROVIDER_ALLOWLIST,
         FMP_MANIFEST_PAGINATED_ENDPOINTS,
         LOCAL_ONLY_ARCHIVE_DATE_FILTERS,
         PlanContractAuditor,
+        is_authoritative_unavailable_evidence,
         write_contract_audit,
     )
 
@@ -106,6 +110,8 @@ TASK_RETRY_MAX_SECONDS = 24 * 60 * 60.0
 SEC_STATEMENT_VALIDATION_RECOVERY_REVISION = 1
 SEC_STATEMENT_WRAPPER_SHARD_RECOVERY_REVISION = 1
 PROVIDER_PARSER_SHAPE_RECOVERY_REVISION = 1
+PROVIDER_TRANSIENT_OUTCOME_RECOVERY_REVISION = 1
+FMP_ADAPTER_BOUNDARY_RECOVERY_REVISION = 1
 HETEROGENEOUS_PARQUET_SCHEMA_RECOVERY_REVISION = 1
 SEC_ALL_COMPANY_FACTS = "__all__"
 BLS_SERIES_BATCH_SIZE = 50
@@ -931,7 +937,9 @@ STRONG_RATE_ERROR_MARKERS = (
     "too many requests",
 )
 TRANSIENT_ERROR_MARKERS = (
+    "cannot connect",
     "cannot operate on a closed database",
+    "connect call failed",
     "connection",
     "could not resolve host",
     "database is locked",
@@ -1118,6 +1126,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         )
     )
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument(
+        "--env-file",
+        type=Path,
+        default=Path(".env"),
+        help="Canonical OpenBB credential dotenv file (default: repository .env)",
+    )
     parser.add_argument("--start-date", default=DEFAULT_START_DATE)
     parser.add_argument("--end-date", default="today")
     parser.add_argument(
@@ -6836,6 +6850,159 @@ class Manifest:
         self.connection.commit()
         return repaired
 
+    def repair_provider_transient_permanent_outcomes(
+        self, *, plan_token: str
+    ) -> int:
+        """Requeue historical permanent labels that current rules prove transient."""
+        revision_key = "provider_transient_outcome_recovery_revision:" + str(
+            plan_token
+        )
+        if self.meta_value(revision_key) == str(
+            PROVIDER_TRANSIENT_OUTCOME_RECOVERY_REVISION
+        ):
+            return 0
+        self.connection.create_function(
+            "openbb_provider_retryable_error",
+            1,
+            lambda value: int(
+                classify_error(RuntimeError(str(value or "")))
+                in {"deferred", "rate", "transient"}
+            ),
+            deterministic=True,
+        )
+        recoverable = """
+            outcome.value='permanent'
+            AND EXISTS (
+                SELECT 1
+                FROM json_each(tasks.provider_evidence_json) AS evidence
+                WHERE evidence.key=outcome.key
+                  AND openbb_provider_retryable_error(evidence.value)=1
+            )
+        """
+        with _sqlite_progress(
+            self.connection,
+            "manifest:repair transient permanent outcomes",
+            enabled=self.show_progress,
+        ):
+            cursor = self.connection.execute(
+                f"""
+                UPDATE tasks SET
+                    provider_outcomes_json=COALESCE(
+                        (
+                            SELECT json_group_object(outcome.key,outcome.value)
+                            FROM json_each(tasks.provider_outcomes_json) AS outcome
+                            WHERE NOT ({recoverable})
+                        ),
+                        '{{}}'
+                    ),
+                    provider_evidence_json=COALESCE(
+                        (
+                            SELECT json_group_object(evidence.key,evidence.value)
+                            FROM json_each(tasks.provider_evidence_json) AS evidence
+                            WHERE openbb_provider_retryable_error(evidence.value)=0
+                               OR NOT EXISTS (
+                                   SELECT 1
+                                   FROM json_each(
+                                       tasks.provider_outcomes_json
+                                   ) AS failed_outcome
+                                   WHERE failed_outcome.key=evidence.key
+                                     AND failed_outcome.value='permanent'
+                               )
+                        ),
+                        '{{}}'
+                    ),
+                    status='pending', selected_provider=NULL,
+                    attempts=MAX(0,attempts-1), rows=0,
+                    error='requeued: provider outcome is retryable transport evidence',
+                    execution_started_at=NULL, retry_not_before=NULL,
+                    transient_failures=0,
+                    updated_at='1970-01-01T00:00:00+00:00'
+                WHERE active=1 AND plan_token=? AND status!='success'
+                  AND provider_outcomes_json LIKE '%:"permanent"%'
+                  AND EXISTS (
+                      SELECT 1
+                      FROM json_each(tasks.provider_outcomes_json) AS outcome
+                      WHERE {recoverable}
+                  )
+                """,
+                (plan_token,),
+            )
+        repaired = max(0, int(cursor.rowcount))
+        self.set_meta_value(
+            revision_key,
+            str(PROVIDER_TRANSIENT_OUTCOME_RECOVERY_REVISION),
+        )
+        self.connection.commit()
+        return repaired
+
+    def repair_fmp_adapter_boundary_failures(
+        self, *, plan_token: str
+    ) -> tuple[int, int]:
+        """Requeue rows fixed by narrow FMP response/query normalization."""
+        revision_key = "fmp_adapter_boundary_recovery_revision:" + str(plan_token)
+        if self.meta_value(revision_key) == str(
+            FMP_ADAPTER_BOUNDARY_RECOVERY_REVISION
+        ):
+            return 0, 0
+        with self.connection:
+            eps = self.connection.execute(
+                """
+                UPDATE tasks SET
+                    status='pending', selected_provider=NULL, attempts=0, rows=0,
+                    error='requeued: bypass OpenBB historical EPS hidden limit offset',
+                    provider_outcomes_json='{}', provider_evidence_json='{}',
+                    execution_started_at=NULL, retry_not_before=NULL,
+                    transient_failures=0,
+                    updated_at='1970-01-01T00:00:00+00:00'
+                WHERE active=1 AND plan_token=?
+                  AND endpoint='equity.fundamental.historical_eps'
+                  AND status='unavailable'
+                  AND LOWER(COALESCE(error,'')) LIKE '%limit%must be between%'
+                  AND CAST(
+                      COALESCE(json_extract(kwargs_json,'$.limit'),0) AS INTEGER
+                  )<=5
+                  AND EXISTS (
+                      SELECT 1 FROM json_each(tasks.providers_json)
+                      WHERE value='fmp'
+                  )
+                """,
+                (plan_token,),
+            ).rowcount
+            peers = self.connection.execute(
+                """
+                UPDATE tasks SET
+                    status='pending', selected_provider=NULL, attempts=0, rows=0,
+                    error='requeued: normalize fractional FMP peer market cap',
+                    provider_outcomes_json='{}', provider_evidence_json='{}',
+                    execution_started_at=NULL, retry_not_before=NULL,
+                    transient_failures=0,
+                    updated_at='1970-01-01T00:00:00+00:00'
+                WHERE active=1 AND plan_token=?
+                  AND endpoint='equity.compare.peers'
+                  AND status='failed'
+                  AND LOWER(COALESCE(error,'')) LIKE '%market_cap%'
+                  AND LOWER(COALESCE(error,'')) LIKE '%fractional part%'
+                  AND EXISTS (
+                      SELECT 1 FROM json_each(tasks.providers_json)
+                      WHERE value='fmp'
+                  )
+                """,
+                (plan_token,),
+            ).rowcount
+            self.connection.execute(
+                """
+                INSERT INTO archive_meta(key,value,updated_at) VALUES(?,?,?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value=excluded.value, updated_at=excluded.updated_at
+                """,
+                (
+                    revision_key,
+                    str(FMP_ADAPTER_BOUNDARY_RECOVERY_REVISION),
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+        return max(0, int(eps)), max(0, int(peers))
+
     def repair_heterogeneous_parquet_schema_shards(self, *, plan_token: str) -> int:
         """Rebuild old shards whose later-row fields Arrow could omit.
 
@@ -10419,6 +10586,78 @@ def _fetch_fmp_fundamental_ratio_workaround(
 
     raw = asyncio.run(_extract())
     return _provider_result_rows(fetcher.transform_data(query, raw))
+
+
+def _fmp_api_key(obb: Any, purpose: str) -> str:
+    """Read the configured FMP secret without ever returning it in errors."""
+    credential = getattr(obb.user.credentials, "fmp_api_key", None)
+    if hasattr(credential, "get_secret_value"):
+        credential = credential.get_secret_value()
+    if not credential:
+        raise RuntimeError(f"FMP API key is required for {purpose}")
+    return str(credential)
+
+
+def _fetch_fmp_historical_eps_workaround(
+    kwargs: Mapping[str, Any], obb: Any
+) -> list[Any]:
+    """Honor FMP's learned API cap without OpenBB's hidden ``limit + 5``.
+
+    The installed OpenBB FMP adapter adds five rows to the requested limit
+    before sending the HTTP query.  On an entitlement capped at five, a legal
+    archive query therefore becomes an illegal request for ten.  Query the
+    same official route once with the actual cap, then use OpenBB's canonical
+    model transformer so the persisted schema remains unchanged.
+    """
+    from openbb_core.provider.utils.errors import EmptyDataError
+    from openbb_fmp.models.historical_eps import FMPHistoricalEpsFetcher
+
+    credential = _fmp_api_key(obb, "historical EPS")
+    query = FMPHistoricalEpsFetcher.transform_query(dict(kwargs))
+    limit = max(1, int(query.limit or 5))
+    raw = _fmp_page_json(
+        "earnings",
+        {"symbol": query.symbol, "limit": limit},
+        credential,
+    )
+    today = date.today().isoformat()
+    filtered = [
+        row
+        for row in sorted(
+            raw,
+            key=lambda item: str(item.get("date") or ""),
+            reverse=True,
+        )
+        if str(row.get("date") or "") <= today
+        and (
+            row.get("epsActual") is not None
+            or row.get("revenueActual") is not None
+        )
+    ][:limit]
+    if not filtered:
+        raise EmptyDataError(f"No data found for symbol: {query.symbol}")
+    return _provider_result_rows(
+        FMPHistoricalEpsFetcher.transform_data(query, filtered)
+    )
+
+
+def _fetch_fmp_equity_peers_workaround(
+    kwargs: Mapping[str, Any], obb: Any
+) -> list[Any]:
+    """Normalize fractional upstream market caps before strict model parsing."""
+    from openbb_core.provider.utils.errors import EmptyDataError
+    from openbb_fmp.models.equity_peers import FMPEquityPeersFetcher
+
+    credential = _fmp_api_key(obb, "equity peers")
+    query = FMPEquityPeersFetcher.transform_query(dict(kwargs))
+    raw = _fmp_page_json("stock-peers", {"symbol": query.symbol}, credential)
+    if not raw:
+        raise EmptyDataError(f"No peer data found for symbol: {query.symbol}")
+    for row in raw:
+        value = row.get("mktCap")
+        if isinstance(value, float) and math.isfinite(value):
+            row["mktCap"] = int(round(value))
+    return _provider_result_rows(FMPEquityPeersFetcher.transform_data(query, raw))
 
 
 def _fmp_page_json(
@@ -16147,27 +16386,7 @@ def _redact_sensitive_error(text: str, obb: Any) -> str:
 
 def _is_authoritative_unavailable_evidence(value: object) -> bool:
     """Require positive credential/subscription evidence for unavailability."""
-    text = str(value or "").lower()
-    if not text:
-        return False
-    return any(
-        marker in text
-        for marker in (
-            "restricted endpoint",
-            "not available under your current subscription",
-            "not available under current subscription",
-            "premium query parameter",
-            "http 402",
-            "-> 402",
-            "payment required",
-            "permission to access the news api",
-            "missing credential",
-            "missing api key",
-            "api key is required",
-            "invalid api key",
-            "invalid registration key",
-        )
-    ) or ("observed " in text and " distinct " in text and "zero successful" in text)
+    return is_authoritative_unavailable_evidence(value)
 
 
 def _is_endpoint_specific_auth_failure(
@@ -16744,6 +16963,30 @@ class OpenBBWorker:
                         ):
                             result = _fetch_fmp_fundamental_ratio_workaround(
                                 task.endpoint,
+                                provider_kwargs,
+                                self.obb,
+                            )
+                        elif (
+                            task.endpoint == "equity.fundamental.historical_eps"
+                            and provider == "fmp"
+                            and provider_kwargs.get("limit") is not None
+                            and int(provider_kwargs["limit"]) <= 5
+                        ):
+                            result = _fetch_fmp_historical_eps_workaround(
+                                provider_kwargs,
+                                self.obb,
+                            )
+                        elif (
+                            task.endpoint == "equity.compare.peers"
+                            and provider == "fmp"
+                            and getattr(
+                                getattr(self.obb, "user", None),
+                                "credentials",
+                                None,
+                            )
+                            is not None
+                        ):
+                            result = _fetch_fmp_equity_peers_workaround(
                                 provider_kwargs,
                                 self.obb,
                             )
@@ -17778,10 +18021,18 @@ def _print_plan_summary(
     )
 
 
-def _load_openbb() -> tuple[
+def _load_openbb(env_file: str | Path = Path(".env")) -> tuple[
     Any, Mapping[str, Mapping[str, Any]], Mapping[str, Sequence[str]]
 ]:
     from openbb import obb
+
+    applied_fields = apply_openbb_environment_credentials(obb, env_file=env_file)
+    if applied_fields:
+        print(
+            "[openbb-credentials] source=environment configured_fields="
+            + ",".join(sorted(applied_fields)),
+            flush=True,
+        )
 
     # CFTC's Public Reporting API works anonymously.  Clearing a stale/invalid
     # app token only affects this process and prevents it from breaking valid
@@ -18433,7 +18684,13 @@ def execute_download_tasks(
                 counts[provider] = counts.get(provider, 0) + len(tasks)
         return counts
 
-    def publish_scheduler_state(*, phase: str = "running", force: bool = False) -> None:
+    def publish_scheduler_state(
+        *,
+        phase: str = "running",
+        wait_reason: str | None = None,
+        wait_delay: float | None = None,
+        force: bool = False,
+    ) -> None:
         """Publish each provider's independent live queue and execution pool."""
         nonlocal last_scheduler_state_monotonic
         now_monotonic = time.monotonic()
@@ -18496,11 +18753,19 @@ def execute_download_tasks(
                 "cooldown": bool(provider in cooldown),
                 "unavailable": bool(provider in unavailable),
             }
+        wait_until = None
+        if phase == "waiting" and wait_delay is not None:
+            wait_until = (
+                datetime.now(timezone.utc)
+                + timedelta(seconds=max(0.0, float(wait_delay)))
+            ).isoformat()
         _write_json_atomic(
             scheduler_state_path,
             {
-                "schema_version": 3,
+                "schema_version": 4,
                 "phase": phase,
+                "wait_reason": wait_reason if phase == "waiting" else None,
+                "wait_until": wait_until,
                 "pid": os.getpid(),
                 "plan_token": plan_token,
                 "wave": wave_number,
@@ -19186,7 +19451,12 @@ def execute_download_tasks(
                             refresh=False,
                         )
                         scheduler_progress.refresh()
-                        publish_scheduler_state()
+                        publish_scheduler_state(
+                            phase="waiting",
+                            wait_reason=wait_reason.replace(" ", "_"),
+                            wait_delay=delay,
+                            force=True,
+                        )
                         time.sleep(min(30.0, max(0.05, delay)))
                         continue
                     completed, _ = wait(
@@ -19532,7 +19802,7 @@ def run(argv: Sequence[str] | None = None) -> int:
         disable=args.no_progress,
     )
     bootstrap_progress.set_postfix(stage="load OpenBB coverage", refresh=False)
-    obb, schemas, commands = _load_openbb()
+    obb, schemas, commands = _load_openbb(args.env_file)
     for command_providers in commands.values():
         for provider in command_providers:
             configured_rps.setdefault(
@@ -20121,6 +20391,27 @@ def run(argv: Sequence[str] | None = None) -> int:
             print(
                 "[openbb-provider] requeued_provider_parser_shapes="
                 f"{repaired_parser_shapes:,}",
+                flush=True,
+            )
+        repaired_transient_outcomes = (
+            manifest.repair_provider_transient_permanent_outcomes(
+                plan_token=plan_token
+            )
+        )
+        if repaired_transient_outcomes:
+            print(
+                "[openbb-provider] requeued_transient_provider_outcomes="
+                f"{repaired_transient_outcomes:,}",
+                flush=True,
+            )
+        repaired_fmp_eps, repaired_fmp_peers = (
+            manifest.repair_fmp_adapter_boundary_failures(plan_token=plan_token)
+        )
+        if repaired_fmp_eps or repaired_fmp_peers:
+            print(
+                "[openbb-provider] requeued_fmp_adapter_boundaries="
+                f"historical_eps:{repaired_fmp_eps:,},"
+                f"equity_peers:{repaired_fmp_peers:,}",
                 flush=True,
             )
         repaired_sec_statement_validation = (

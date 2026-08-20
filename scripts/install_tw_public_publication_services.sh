@@ -24,6 +24,7 @@ escape_replacement() {
 temporary_dir="$(mktemp -d)"
 trap 'rm -rf "$temporary_dir"' EXIT
 units=(
+  stockagent-tw-public-source-events.service
   stockagent-tw-day-trade-eligibility.service
   stockagent-tw-day-trade-eligibility.timer
   stockagent-tw-public-publication-sweep.service
@@ -47,10 +48,13 @@ chmod 0755 \
   "$repo_root/scripts/run_tw_day_trade_eligibility_watcher.sh" \
   "$repo_root/scripts/watch_tw_public_publication_group.py" \
   "$repo_root/scripts/run_tw_public_publication_sweep.sh" \
+  "$repo_root/scripts/watch_tw_public_source_events.py" \
+  "$repo_root/scripts/run_tw_public_source_event_monitor.sh" \
   "$repo_root/scripts/run_tw_public_0830_check.py" \
   "$repo_root/scripts/run_tw_public_0830_check.sh"
 systemctl daemon-reload
 systemctl enable --now \
+  stockagent-tw-public-source-events.service \
   stockagent-tw-day-trade-eligibility.timer \
   stockagent-tw-public-publication-sweep.timer \
   stockagent-tw-public-0830-check.timer

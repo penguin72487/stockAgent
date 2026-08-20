@@ -30,6 +30,11 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=Path("artifacts/data_refresh/tw_public/0830/latest.json"),
     )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="force a full refresh even when today's accepted snapshot is reusable",
+    )
     return parser.parse_args()
 
 
@@ -51,14 +56,16 @@ def _json_or_none(path: Path) -> dict[str, object] | None:
     return value if isinstance(value, dict) else None
 
 
-def refresh_command(config: Path) -> list[str]:
-    return [
+def refresh_command(config: Path, *, force: bool = False) -> list[str]:
+    command = [
         sys.executable,
         str(REPO_ROOT / "scripts" / "refresh_tw_public_live_snapshot.py"),
         "--config",
         str(config),
-        "--force",
     ]
+    if force:
+        command.append("--force")
+    return command
 
 
 def _same_session_accepted(
@@ -94,7 +101,7 @@ def main() -> int:
     ).resolve(strict=False)
     snapshot_receipt = REPO_ROOT / "artifacts/data_refresh/tw_public/latest.json"
     started = datetime.now(TAIPEI)
-    command = refresh_command(config)
+    command = refresh_command(config, force=bool(args.force))
     completed = subprocess.run(command, cwd=REPO_ROOT, check=False)
     finished = datetime.now(TAIPEI)
     snapshot = _json_or_none(snapshot_receipt)
