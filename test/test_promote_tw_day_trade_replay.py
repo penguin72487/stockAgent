@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -68,3 +70,70 @@ def test_validate_rebuild_rejects_blocked_registration(tmp_path: Path) -> None:
             _candidate(tmp_path, register_result="blocked"),
             expected_markets=MARKETS,
         )
+
+
+def test_validate_rebuild_accepts_explicit_current_open_counterfactual(
+    tmp_path: Path,
+) -> None:
+    candidate = _candidate(tmp_path)
+    current_date = datetime.now(ZoneInfo("Asia/Taipei")).date().isoformat()
+    state_path = candidate / "state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    for mode in state["modes"].values():
+        mode.update(
+            {
+                "session_date": current_date,
+                "engine_status": "active",
+                "counterfactual_open_replay": True,
+                "entry_fill_contract": (
+                    "retrospective_actual_session_open_price_counterfactual"
+                ),
+                "entry_fill_is_synthetic": True,
+                "positions": {
+                    "2330": {
+                        "signed_shares": 1000,
+                        "entry_price": 1005.0,
+                        "sizing_open_price": 1000.0,
+                        "counterfactual_open_replay": True,
+                        "entry_fill_is_synthetic": True,
+                    }
+                },
+            }
+        )
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    receipt_path = candidate / "rebuild_receipt.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["sessions"][0]["session_date"] = current_date
+    receipt["sessions"][0]["close"] = {
+        "status": "current_session_left_open_for_live_service"
+    }
+    for row in receipt["sessions"][0]["modes"]:
+        row.pop("after_close")
+        row["entry"] = {"engine_status": "active", "open_position_rows": 1}
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+
+    result = promotion._validate_rebuild(
+        candidate,
+        expected_markets=MARKETS,
+        allow_current_open_session=True,
+    )
+
+    assert result["current_open_session"] == current_date
+    assert result["final_open_positions"] == {
+        market: 1 for market in sorted(MARKETS)
+    }
+
+
+def test_validate_rebuild_rejects_current_open_without_explicit_flag(
+    tmp_path: Path,
+) -> None:
+    candidate = _candidate(tmp_path)
+    receipt_path = candidate / "rebuild_receipt.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["sessions"][0]["close"] = {
+        "status": "current_session_left_open_for_live_service"
+    }
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="not settled at official close"):
+        promotion._validate_rebuild(candidate, expected_markets=MARKETS)

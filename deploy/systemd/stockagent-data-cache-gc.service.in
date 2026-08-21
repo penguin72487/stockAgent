@@ -1,5 +1,5 @@
 [Unit]
-Description=Evict expired StockAgent materialized dataset caches
+Description=Renew active and evict expired StockAgent materialized dataset caches
 After=local-fs.target
 ConditionPathIsDirectory=/srv/stockagent-packed
 ConditionPathIsDirectory=/srv/stockagent-packed-materialized

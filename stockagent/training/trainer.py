@@ -1174,14 +1174,15 @@ def _tensor_day_trade_is_whole_lot_exact(
     """Whether a tensor result may stand in for the separate integer audit.
 
     The minute event executor rounds its forward to exact board lots.  The
-    futures portfolio explicitly has no integer-execution research layer, so
-    its canonical continuous fractional-contract result is also the only
-    reportable result.  The daily cash executor deliberately permits
-    fractional weights and therefore cannot be reused under an integer label.
+    futures portfolio and crypto perpetual modes explicitly have no separate
+    integer-execution research layer, so their canonical continuous-notional
+    results are also the only reportable results.  The daily cash executor
+    deliberately permits fractional weights but does have a distinct integer
+    oracle and therefore cannot be reused under an integer label.
     """
 
     return bool(
-        runtime.mode == "tw_futures_portfolio_day"
+        runtime.mode in {"tw_futures_portfolio_day", "crypto_perpetual"}
         or (
             runtime.mode == "tw_day_trade"
             and config.data.day_trade_minute_execution_root is not None
@@ -3616,6 +3617,12 @@ def _epoch_curve_plot_command(curve_path: Path, interval: int, *, write_parquet_
         str(output_path),
         "--timing-output",
         str(timing_output_path),
+        # The standalone plotting CLI also supports a deliberately broad
+        # report-table CSV export and historically enabled it by default.
+        # An epoch callback must remain scoped to its one curve; otherwise it
+        # scans every market artifact and can spend hours converting unrelated
+        # holdings tables before the training process can flush the child.
+        "--no-export-report-csvs",
     ]
     if not write_parquet_cache:
         command.append("--no-write-parquet-cache")
@@ -6653,6 +6660,12 @@ def _save_best_val_backtest_snapshot(
         val_backtest.strategy_returns[row_start:row_end],
         val_backtest.benchmark_returns[row_start:row_end],
         val_backtest.turnovers[row_start:row_end],
+        periods_per_year=(
+            365.0
+            if normalize_execution_mode(val_backtest.execution_mode)
+            == "crypto_perpetual"
+            else 252.0
+        ),
     )
     metadata = {
         "fold_id": int(fold.fold_id),
@@ -10859,6 +10872,7 @@ def _finalize_ic_summary_from_series(
     device: torch.device,
     profile_timing: bool,
     timing: TimingBreakdown,
+    periods_per_year: float = 252.0,
 ) -> dict[str, float]:
     ic_finite = torch.isfinite(ic_series)
     ic_clean64 = torch.nan_to_num(ic_series, nan=0.0, posinf=0.0, neginf=0.0).to(torch.float64)
@@ -10888,7 +10902,11 @@ def _finalize_ic_summary_from_series(
     return {
         "ic_mean": ic_mean,
         "ic_std": ic_std,
-        "ic_ir": float(ic_mean / ic_std * np.sqrt(252.0)),
+        "ic_ir": float(
+            ic_mean
+            / ic_std
+            * np.sqrt(max(float(periods_per_year), 1.0e-12))
+        ),
         "ic_positive_ratio": ic_pos / ic_n,
     }
 
@@ -10906,6 +10924,8 @@ def _compute_eval_metrics_like_legacy_online(
     strategy_returns: torch.Tensor,
     benchmark_returns: torch.Tensor,
     turnovers: torch.Tensor,
+    *,
+    periods_per_year: float = 252.0,
 ) -> dict[str, float]:
     r = torch.nan_to_num(strategy_returns.float(), nan=0.0, posinf=0.0, neginf=0.0).to(torch.float64)
     b = torch.nan_to_num(benchmark_returns.float(), nan=0.0, posinf=0.0, neginf=0.0).to(torch.float64)
@@ -10940,7 +10960,9 @@ def _compute_eval_metrics_like_legacy_online(
     std_b = var_b ** 0.5
     cum_r = _safe_expm1(sum_r)
     cum_b = _safe_expm1(sum_b)
-    ann_r = _safe_expm1(mean_r * 252.0)
+    periods = max(float(periods_per_year), 1.0e-12)
+    annualizer = np.sqrt(periods)
+    ann_r = _safe_expm1(mean_r * periods)
     downside_dev = float((torch.minimum(r, torch.zeros_like(r)).pow(2).sum().item() / n) ** 0.5)
     downside_dev_b = float((torch.minimum(b, torch.zeros_like(b)).pow(2).sum().item() / n) ** 0.5)
     cum_log = torch.cumsum(r, dim=0)
@@ -10951,10 +10973,10 @@ def _compute_eval_metrics_like_legacy_online(
         "cumulative_return": cum_r,
         "annualized_return": ann_r,
         "cagr": ann_r,
-        "sharpe": float(mean_r / std_r * np.sqrt(252.0)) if std_r > 0 else 0.0,
-        "benchmark_sharpe": float(mean_b / std_b * np.sqrt(252.0)) if std_b > 0 else 0.0,
-        "sortino": float(mean_r / downside_dev * np.sqrt(252.0)) if downside_dev > 0 else 0.0,
-        "benchmark_sortino": float(mean_b / downside_dev_b * np.sqrt(252.0)) if downside_dev_b > 0 else 0.0,
+        "sharpe": float(mean_r / std_r * annualizer) if std_r > 0 else 0.0,
+        "benchmark_sharpe": float(mean_b / std_b * annualizer) if std_b > 0 else 0.0,
+        "sortino": float(mean_r / downside_dev * annualizer) if downside_dev > 0 else 0.0,
+        "benchmark_sortino": float(mean_b / downside_dev_b * annualizer) if downside_dev_b > 0 else 0.0,
         "max_drawdown": max_dd,
         "calmar": ann_r / abs(max_dd) if max_dd < 0.0 else 0.0,
         "turnover": float(t.sum().item()) / n,
@@ -11823,7 +11845,12 @@ def _run_eval_backtest_from_weight_buffers(
     )
     metrics_start = time.perf_counter()
     metrics = (
-        _compute_eval_metrics_like_legacy_online(strategy_returns_out, benchmark_returns_out, turnovers_out)
+        _compute_eval_metrics_like_legacy_online(
+            strategy_returns_out,
+            benchmark_returns_out,
+            turnovers_out,
+            periods_per_year=(365.0 if execution_mode == "crypto_perpetual" else 252.0),
+        )
         if compute_metrics_summary
         else {}
     )
@@ -12170,7 +12197,15 @@ def _evaluate_tensor_batch_decoupled(
         ):
             ic_series = compute_ic_series_torch(weights_all, future_returns_all, tradable_mask_all)
             _maybe_sync_cuda(device, profile_timing)
-            ic = _finalize_ic_summary_from_series(ic_series, device=device, profile_timing=profile_timing, timing=timing)
+            ic = _finalize_ic_summary_from_series(
+                ic_series,
+                device=device,
+                profile_timing=profile_timing,
+                timing=timing,
+                periods_per_year=(
+                    365.0 if execution_mode == "crypto_perpetual" else 252.0
+                ),
+            )
         else:
             ic = {}
         timing.ic_s += time.perf_counter() - ic_start
@@ -13169,10 +13204,13 @@ def _replay_taiwan_stitched_deployment(
     requests are therefore expanded into the immutable full-panel symbol order
     and sent through one O(T*S) ledger pass.  Taiwan cash modes use the exact
     integer/T+2 oracle; ``tw_futures_portfolio_day`` deliberately uses its
-    continuous-notional, cross-session futures ledger.  A daily no-default day-trade
-    experiment must reuse its differentiable daily forward here; replacing it
-    with the separate whole-lot audit changes the declared loss contract and can
-    round a diversified portfolio to an artificial all-cash deployment.
+    continuous-notional, cross-session futures ledger.  ``crypto_perpetual``
+    likewise reuses its funding-aware continuous-notional ledger so positions,
+    funding cash flow, fees, and absorbing ruin remain connected across model
+    ownership changes.  A daily no-default day-trade experiment must reuse its
+    differentiable daily forward here; replacing it with the separate whole-lot
+    audit changes the declared loss contract and can round a diversified
+    portfolio to an artificial all-cash deployment.
     """
 
     mode = normalize_execution_mode(config.trading.execution_mode)
@@ -13297,13 +13335,17 @@ def _replay_taiwan_stitched_deployment(
         and config.data.day_trade_minute_execution_root is None
         and config.trading.tw_day_trade_unlimited_margin_conversion
     )
+    continuous_stitched_replay = bool(
+        canonical_daily_day_trade
+        or mode in {"tw_futures_portfolio_day", "crypto_perpetual"}
+    )
     execution_dataset = CrossSectionalDataset(
         panel,
         np.arange(panel.num_dates, dtype=np.int64),
         lookback=1,
         allow_empty=True,
         include_volume_notional=(
-            canonical_daily_day_trade
+            continuous_stitched_replay
             and _volume_participation_enabled(
                 config.trading.max_volume_participation,
                 config.trading.volume_participation_equity,
@@ -13342,7 +13384,7 @@ def _replay_taiwan_stitched_deployment(
         # Their exact integer continuation remains close[t] -> close[t+1];
         # the phase dataset's intraday leg is not that legacy forward label.
         stitched_future_returns = np.asarray(panel.returns_1d)[panel_rows]
-    if canonical_daily_day_trade or mode == "tw_futures_portfolio_day":
+    if continuous_stitched_replay:
         request_tensor = torch.as_tensor(full_requests, dtype=torch.float32)
         volume_limit_weights = _volume_limit_weights_from_notional(
             (
@@ -16440,6 +16482,8 @@ def _compute_metrics_from_tensors(
     strategy_returns: torch.Tensor,
     benchmark_returns: torch.Tensor,
     turnovers: torch.Tensor,
+    *,
+    periods_per_year: float = 252.0,
 ) -> dict[str, float]:
     """Compute performance metrics directly from tensors to avoid repeated numpy conversions."""
     r = torch.nan_to_num(strategy_returns.float(), nan=0.0, posinf=0.0, neginf=0.0).to(torch.float64)
@@ -16472,15 +16516,17 @@ def _compute_metrics_from_tensors(
     std = r.std(unbiased=False)
     avg_b = b.mean()
     std_b = b.std(unbiased=False)
-    ann_r = float(torch.expm1(avg * 252.0).item())
-    sharpe = float((avg / std * np.sqrt(252.0)).item()) if float(std.item()) > 0 else 0.0
-    benchmark_sharpe = float((avg_b / std_b * np.sqrt(252.0)).item()) if float(std_b.item()) > 0 else 0.0
+    periods = max(float(periods_per_year), 1.0e-12)
+    annualizer = np.sqrt(periods)
+    ann_r = float(torch.expm1(avg * periods).item())
+    sharpe = float((avg / std * annualizer).item()) if float(std.item()) > 0 else 0.0
+    benchmark_sharpe = float((avg_b / std_b * annualizer).item()) if float(std_b.item()) > 0 else 0.0
     downside = torch.minimum(r, torch.zeros_like(r))
     downside_b = torch.minimum(b, torch.zeros_like(b))
     downside_dev = torch.sqrt((downside.pow(2)).mean())
     downside_dev_b = torch.sqrt((downside_b.pow(2)).mean())
-    sortino = float((avg / downside_dev * np.sqrt(252.0)).item()) if float(downside_dev.item()) > 0 else 0.0
-    benchmark_sortino = float((avg_b / downside_dev_b * np.sqrt(252.0)).item()) if float(downside_dev_b.item()) > 0 else 0.0
+    sortino = float((avg / downside_dev * annualizer).item()) if float(downside_dev.item()) > 0 else 0.0
+    benchmark_sortino = float((avg_b / downside_dev_b * annualizer).item()) if float(downside_dev_b.item()) > 0 else 0.0
 
     cumulative_log = torch.cumsum(r, dim=0)
     cumulative_with_initial = torch.cat(
@@ -16800,6 +16846,7 @@ def _run_training_tree_models(
                 val_bt_t.strategy_returns,
                 val_bt_t.benchmark_returns,
                 val_bt_t.turnovers,
+                periods_per_year=config.evaluation.eval_log_utility_periods_per_year,
             )
 
             test_x, test_returns, test_masks, test_buy_masks, test_sell_masks, test_bench = _dataset_to_tensors(
@@ -17499,6 +17546,7 @@ def _run_inference_tree_models(
             val_bt_t.strategy_returns,
             val_bt_t.benchmark_returns,
             val_bt_t.turnovers,
+            periods_per_year=config.evaluation.eval_log_utility_periods_per_year,
         )
 
         test_x, test_returns, test_masks, test_buy_masks, test_sell_masks, test_bench = _dataset_to_tensors(
@@ -18160,6 +18208,7 @@ def _run_inference_neural_models(
             val_bt_t.strategy_returns,
             val_bt_t.benchmark_returns,
             val_bt_t.turnovers,
+            periods_per_year=config.evaluation.eval_log_utility_periods_per_year,
         )
 
         test_windowed = _prepare_windowed_split(
@@ -20975,7 +21024,8 @@ def _run_training_impl(
                         val_backtest_epoch.weights_history[val_row_start:val_row_end],
                         val_returns_device[val_row_start:val_row_end],
                         val_masks_device[val_row_start:val_row_end],
-                    ).to(device="cpu", dtype=torch.float32).numpy()
+                    ).to(device="cpu", dtype=torch.float32).numpy(),
+                    periods_per_year=config.evaluation.eval_log_utility_periods_per_year,
                 )
             else:
                 val_ic = ic_summary(np.asarray([], dtype=np.float32))
@@ -20983,6 +21033,7 @@ def _run_training_impl(
                 val_backtest_epoch.strategy_returns[val_row_start:val_row_end],
                 val_backtest_epoch.benchmark_returns[val_row_start:val_row_end],
                 val_backtest_epoch.turnovers[val_row_start:val_row_end],
+                periods_per_year=config.evaluation.eval_log_utility_periods_per_year,
             )
 
             test_symbol_indices = (

@@ -51,6 +51,7 @@ def _validate_rebuild(
     candidate: Path,
     *,
     expected_markets: set[str],
+    allow_current_open_session: bool = False,
 ) -> dict[str, Any]:
     receipt_path = candidate / "rebuild_receipt.json"
     state_path = candidate / "state.json"
@@ -76,14 +77,25 @@ def _validate_rebuild(
         sessions = []
     session_dates: list[str] = []
     registrations = 0
-    for session in sessions:
+    current_date = datetime.now(TAIPEI).date().isoformat()
+    current_open_session: str | None = None
+    for session_index, session in enumerate(sessions):
         if not isinstance(session, dict):
             failures.append("malformed session receipt")
             continue
         session_date = str(session.get("session_date") or "")
         session_dates.append(session_date)
         close = session.get("close")
-        if not isinstance(close, dict) or close.get("status") != "settled_official_close":
+        close_status = close.get("status") if isinstance(close, dict) else None
+        is_allowed_current_open = bool(
+            allow_current_open_session
+            and session_index == len(sessions) - 1
+            and session_date == current_date
+            and close_status == "current_session_left_open_for_live_service"
+        )
+        if is_allowed_current_open:
+            current_open_session = session_date
+        elif close_status != "settled_official_close":
             failures.append(f"{session_date}: session is not settled at official close")
         mode_rows = session.get("modes")
         if not isinstance(mode_rows, list):
@@ -110,11 +122,21 @@ def _validate_rebuild(
                 )
             else:
                 registrations += 1
-            after_close = row.get("after_close")
-            if not isinstance(after_close, dict) or int(
-                after_close.get("open_position_rows") or 0
-            ) != 0:
-                failures.append(f"{session_date}/{market}: not flat after close")
+            if is_allowed_current_open:
+                entry = row.get("entry")
+                if not isinstance(entry, dict) or entry.get("engine_status") != "active":
+                    failures.append(
+                        f"{session_date}/{market}: current entry is not active"
+                    )
+            else:
+                after_close = row.get("after_close")
+                if not isinstance(after_close, dict) or int(
+                    after_close.get("open_position_rows") or 0
+                ) != 0:
+                    failures.append(f"{session_date}/{market}: not flat after close")
+
+    if session_dates != sorted(set(session_dates)):
+        failures.append("session dates are duplicated or not strictly increasing")
 
     final_open_positions: dict[str, int] = {}
     ending_equity: dict[str, float] = {}
@@ -129,8 +151,44 @@ def _validate_rebuild(
             if isinstance(position, dict)
         )
         final_open_positions[str(market)] = open_count
-        if open_count:
+        if current_open_session is None and open_count:
             failures.append(f"{market}: final open positions={open_count}")
+        if current_open_session is not None:
+            if str(mode.get("session_date") or "") != current_open_session:
+                failures.append(
+                    f"{market}: final session_date is not {current_open_session}"
+                )
+            if mode.get("engine_status") != "active":
+                failures.append(f"{market}: final current-session engine is not active")
+            if mode.get("counterfactual_open_replay") is not True:
+                failures.append(f"{market}: current session is not counterfactual replay")
+            if mode.get("entry_fill_contract") != (
+                "retrospective_actual_session_open_price_counterfactual"
+            ):
+                failures.append(f"{market}: current entry fill contract is invalid")
+            if mode.get("entry_fill_is_synthetic") is not True:
+                failures.append(f"{market}: current entries are not marked synthetic")
+            for symbol, position_value in positions.items():
+                position = position_value if isinstance(position_value, dict) else {}
+                if int(position.get("signed_shares") or 0) == 0:
+                    continue
+                for price_key in ("entry_price", "sizing_open_price"):
+                    try:
+                        value = float(position.get(price_key))
+                    except (TypeError, ValueError):
+                        value = float("nan")
+                    if not (value > 0.0 and value < float("inf")):
+                        failures.append(
+                            f"{market}/{symbol}: invalid {price_key}={value!r}"
+                        )
+                if position.get("counterfactual_open_replay") is not True:
+                    failures.append(
+                        f"{market}/{symbol}: position is not counterfactual replay"
+                    )
+                if position.get("entry_fill_is_synthetic") is not True:
+                    failures.append(
+                        f"{market}/{symbol}: position is not marked synthetic"
+                    )
         ending_equity[str(market)] = float(mode.get("total_equity_twd") or 0.0)
 
     if failures:
@@ -142,6 +200,8 @@ def _validate_rebuild(
         "mode_set": sorted(expected_markets),
         "final_open_positions": final_open_positions,
         "ending_equity_twd": ending_equity,
+        "allow_current_open_session": bool(allow_current_open_session),
+        "current_open_session": current_open_session,
         "rebuild_receipt_sha256": _sha256(receipt_path),
         "state_sha256": _sha256(state_path),
     }
@@ -192,6 +252,14 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help="Repeat once for every and only intended active paper mode.",
     )
+    parser.add_argument(
+        "--allow-current-open-session",
+        action="store_true",
+        help=(
+            "Permit only the final Taipei-today session to remain open after "
+            "validating its counterfactual and synthetic fill contract."
+        ),
+    )
     return parser
 
 
@@ -206,7 +274,11 @@ def main() -> None:
     expected_markets = {str(value).strip() for value in args.expected_market}
     if not expected_markets or "" in expected_markets:
         raise ValueError("--expected-market values must be non-empty")
-    acceptance = _validate_rebuild(candidate, expected_markets=expected_markets)
+    acceptance = _validate_rebuild(
+        candidate,
+        expected_markets=expected_markets,
+        allow_current_open_session=bool(args.allow_current_open_session),
+    )
 
     live_lock = _acquire_engine_lock(live)
     candidate_lock = _acquire_engine_lock(candidate)

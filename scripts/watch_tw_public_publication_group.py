@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Refresh official Taiwan public-data groups at their release boundaries.
 
-This is the low-latency, mutable download layer.  It deliberately does not
-publish an inference snapshot: the independent 08:30 job performs the full
-download, strict model-safety audit, immutable snapshot publication, and
-atomic pin/symlink switch.
+This is the low-latency, mutable download layer.  The 07:50 full sweep commits
+its metadata beside the live tree only after all 156 sources have zero failure,
+zero publication lag, and complete historical coverage.  The independent
+08:00 acceptance job then performs the strict model-safety audit, immutable
+packed publication, full materialization verification, and atomic symlink
+switch.
 
 For every run we hash the selected parquet files before and after the refresh.
 The receipt therefore distinguishes a successful HTTP sweep from an actually
@@ -62,7 +64,7 @@ class PublicationPhase:
 # selected endpoint.  Fixed times come from the named TWSE data products.  A
 # phase may include related TPEx/TAIFEX feeds so their first observed change is
 # measured under the same receipt.  Feeds without a fixed publisher SLA are
-# swept in preopen_all and conclusively checked by the 08:30 strict job.
+# swept in preopen_all and conclusively checked by the pre-08:30 strict job.
 PUBLICATION_PHASES: dict[str, PublicationPhase] = {
     "preopen_all": PublicationPhase(
         name="preopen_all",
@@ -204,6 +206,17 @@ def _atomic_json(path: Path, payload: dict[str, object]) -> None:
         encoding="utf-8",
     )
     os.replace(temporary, path)
+
+
+def _atomic_copy(source: Path, destination: Path) -> None:
+    """Publish one downloader receipt without exposing a partial file."""
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_suffix(
+        destination.suffix + f".tmp.{uuid.uuid4().hex}"
+    )
+    temporary.write_bytes(source.read_bytes())
+    os.replace(temporary, destination)
 
 
 def _sha256(path: Path) -> str:
@@ -443,6 +456,50 @@ def _download_evidence(metadata_dir: Path) -> dict[str, object]:
     }
 
 
+def _preopen_acceptance_errors(
+    summary: object,
+    *,
+    expected_end_date: str,
+    expected_dataset_count: int,
+) -> list[str]:
+    """Return every reason a full pre-open download cannot be promoted."""
+
+    if not isinstance(summary, dict):
+        return ["download_summary is missing or malformed"]
+    expected = {
+        "end_date": expected_end_date,
+        "dataset_count": expected_dataset_count,
+        "failed_count": 0,
+        "blocking_failed_count": 0,
+        "publication_lag_count": 0,
+        "incomplete_count": 0,
+        "missing_dates_after": 0,
+    }
+    failures = [
+        f"{key}={summary.get(key)!r} expected={value!r}"
+        for key, value in expected.items()
+        if summary.get(key) != value
+    ]
+    if summary.get("coverage_complete") is not True:
+        failures.append("coverage_complete is not true")
+    if summary.get("daily_close_ready") is not True:
+        failures.append("daily_close_ready is not true")
+    return failures
+
+
+def _promote_preopen_metadata(metadata_dir: Path, live_root: Path) -> list[str]:
+    """Commit the accepted 156-dataset receipt beside the exact source tree."""
+
+    promoted: list[str] = []
+    for name in ("dataset_manifest.json", "download_report.csv", "download_summary.json"):
+        source = metadata_dir / name
+        if not source.is_file():
+            raise RuntimeError(f"preopen metadata is missing: {source}")
+        _atomic_copy(source, live_root / name)
+        promoted.append(str(live_root / name))
+    return promoted
+
+
 def _changed_files(
     before: dict[str, dict[str, object]],
     after: dict[str, dict[str, object]],
@@ -543,10 +600,25 @@ def main() -> int:
             if completed.returncode != 0:
                 break
         after = _file_hashes(live_root, selected_names)
+        preopen_evidence = _download_evidence(metadata_dir)
+        preopen_acceptance_errors: list[str] = []
+        promoted_metadata: list[str] = []
+        if phase.name == "preopen_all" and all(code == 0 for code in return_codes):
+            preopen_acceptance_errors = _preopen_acceptance_errors(
+                preopen_evidence.get("download_summary"),
+                expected_end_date=download_end_date,
+                expected_dataset_count=len(selected_names),
+            )
+            if not preopen_acceptance_errors:
+                promoted_metadata = _promote_preopen_metadata(metadata_dir, live_root)
 
     completed_at = datetime.now(TAIPEI)
     changed = _changed_files(before, after)
-    status = "ok" if all(code == 0 for code in return_codes) else "failed"
+    status = (
+        "ok"
+        if all(code == 0 for code in return_codes) and not preopen_acceptance_errors
+        else "failed"
+    )
     payload: dict[str, object] = {
         "schema_version": 1,
         "status": status,
@@ -567,9 +639,12 @@ def main() -> int:
         "commands": commands,
         "return_codes": return_codes,
         "live_root": str(live_root),
-        "strict_publication_deferred_to_0830": True,
+        "strict_publication_deferred_to_0830": False,
+        "strict_packed_publication_deferred_to_0800": True,
+        "preopen_acceptance_errors": preopen_acceptance_errors,
+        "promoted_live_metadata": promoted_metadata,
     }
-    payload.update(_download_evidence(metadata_dir))
+    payload.update(preopen_evidence)
     _write_receipts(receipt_root, payload, phase=phase, started=started)
     print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
     return 0 if status == "ok" else 1

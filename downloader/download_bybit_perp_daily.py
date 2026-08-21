@@ -118,6 +118,17 @@ class SymbolRecord:
     contract_type: str | None
     status: str | None
     launch_time: str | None
+    symbol_type: str | None
+    funding_interval_minutes: int | None
+    is_pre_listing: bool
+    price_tick_size: float | None
+    minimum_order_quantity: float | None
+    quantity_step: float | None
+    minimum_notional_value: float | None
+    maximum_order_quantity: float | None
+    maximum_market_order_quantity: float | None
+    maximum_leverage: float | None
+    unified_margin_trade: bool
 
 
 @dataclass(slots=True)
@@ -169,6 +180,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--limit", type=int, default=None, help="Optional symbol limit for quick tests"
+    )
+    parser.add_argument(
+        "--symbols",
+        nargs="*",
+        default=None,
+        help="Optional exact Bybit symbols; useful for product-specific updates.",
     )
     parser.add_argument(
         "--refresh", action="store_true", help="Re-download even if parquet exists"
@@ -288,38 +305,30 @@ def _frame_matches_1m_interval(frame: pl.DataFrame) -> bool:
         .select(pl.col("date").str.to_datetime(strict=False).alias("date"))
         .drop_nulls("date")
     )
-    if parsed.height < 3:
+    if parsed.height == 0:
+        return True
+    if parsed.select(
+        (
+            (pl.col("date").dt.second() != 0)
+            | (pl.col("date").dt.microsecond() != 0)
+        ).any()
+    ).item():
+        return False
+    if parsed.height < 2:
         return True
 
     deltas = (
         parsed.sort("date")
         .select(pl.col("date").diff().dt.total_seconds().alias("delta"))
         .drop_nulls("delta")
-        .filter(pl.col("delta") > 0)
     )
     if deltas.is_empty():
         return True
-
-    median_delta = float(deltas.select(pl.col("delta").median()).item())
-    large_gap_share = float(
-        deltas.select(pl.col("delta").ge(12 * 60 * 60).mean()).item()
-    )
-    if large_gap_share > 0.05:
-        return False
-    midnight_share = float(
-        parsed.select(
-            (
-                pl.col("date").dt.hour().eq(0)
-                & pl.col("date").dt.minute().eq(0)
-                & pl.col("date").dt.second().eq(0)
-            )
-            .mean()
-            .alias("midnight_share")
+    return bool(
+        deltas.select(
+            pl.col("delta").eq(CANDLE_INTERVAL_MS // 1000).all()
         ).item()
     )
-    if midnight_share > 0.95 and median_delta >= 12 * 60 * 60:
-        return False
-    return median_delta <= (CANDLE_INTERVAL_MS / 1000) * 4
 
 
 def _latest_ms_from_date_frame(frame: pl.DataFrame) -> int | None:
@@ -367,6 +376,10 @@ def _load_existing_candle_info(path: Path) -> ExistingCandleInfo:
             earliest_ms is not None
             and latest_ms is not None
             and interval_likely_ok is True
+            and latest_ms >= earliest_ms
+            and (latest_ms - earliest_ms) % CANDLE_INTERVAL_MS == 0
+            and row_count
+            == (latest_ms - earliest_ms) // CANDLE_INTERVAL_MS + 1
         ):
             return ExistingCandleInfo(
                 rows=row_count,
@@ -391,13 +404,23 @@ def _load_existing_candle_info(path: Path) -> ExistingCandleInfo:
 
 
 def _iter_windows(start_ms: int, end_ms: int) -> list[tuple[int, int]]:
+    """Return inclusive API windows with one boundary candle of overlap.
+
+    Bybit returns at most 1,000 reverse-sorted rows.  Retaining the previous
+    window's last candle as the next window's first candle makes the traversal
+    robust to either endpoint being omitted transiently; normalization removes
+    the deliberate duplicate.  Never advance by ``chunk_end + interval`` here.
+    """
+
     windows: list[tuple[int, int]] = []
     cursor = start_ms
 
     while cursor <= end_ms:
         chunk_end = min(cursor + BYBIT_WINDOW_SPAN_MS, end_ms)
         windows.append((cursor, chunk_end))
-        cursor = chunk_end + CANDLE_INTERVAL_MS
+        if chunk_end >= end_ms:
+            break
+        cursor = chunk_end
 
     return windows
 
@@ -535,6 +558,17 @@ def _fetch_perp_symbols(
                     continue
 
                 market = f"bybit_{category}_perp"
+                price_filter = item.get("priceFilter") or {}
+                lot_filter = item.get("lotSizeFilter") or {}
+                leverage_filter = item.get("leverageFilter") or {}
+
+                def optional_float(value: object) -> float | None:
+                    return (
+                        float(value)
+                        if value not in {None, ""}
+                        else None
+                    )
+
                 records.append(
                     SymbolRecord(
                         code=symbol,
@@ -550,6 +584,33 @@ def _fetch_perp_symbols(
                         launch_time=_ms_to_date_string(int(item["launchTime"]))
                         if item.get("launchTime")
                         else None,
+                        symbol_type=str(item.get("symbolType") or "").strip(),
+                        funding_interval_minutes=(
+                            int(item["fundingInterval"])
+                            if item.get("fundingInterval") not in {None, ""}
+                            else None
+                        ),
+                        is_pre_listing=bool(item.get("isPreListing", False)),
+                        price_tick_size=optional_float(price_filter.get("tickSize")),
+                        minimum_order_quantity=optional_float(
+                            lot_filter.get("minOrderQty")
+                        ),
+                        quantity_step=optional_float(lot_filter.get("qtyStep")),
+                        minimum_notional_value=optional_float(
+                            lot_filter.get("minNotionalValue")
+                        ),
+                        maximum_order_quantity=optional_float(
+                            lot_filter.get("maxOrderQty")
+                        ),
+                        maximum_market_order_quantity=optional_float(
+                            lot_filter.get("maxMktOrderQty")
+                        ),
+                        maximum_leverage=optional_float(
+                            leverage_filter.get("maxLeverage")
+                        ),
+                        unified_margin_trade=bool(
+                            item.get("unifiedMarginTrade", False)
+                        ),
                     )
                 )
 
@@ -794,7 +855,25 @@ def main() -> None:
         retry_base=args.retry_base,
     )
 
-    symbols = _fetch_perp_symbols(client, categories=categories, limit=args.limit)
+    symbols = _fetch_perp_symbols(client, categories=categories)
+    requested_symbols = {
+        str(value).strip().upper()
+        for value in (args.symbols or [])
+        if str(value).strip()
+    }
+    if requested_symbols:
+        symbols = [
+            item for item in symbols if item.bybit_symbol.upper() in requested_symbols
+        ]
+        missing_symbols = requested_symbols - {
+            item.bybit_symbol.upper() for item in symbols
+        }
+        if missing_symbols:
+            raise ValueError(
+                f"requested Bybit perpetual symbols unavailable: {sorted(missing_symbols)}"
+            )
+    if args.limit is not None:
+        symbols = symbols[: max(0, int(args.limit))]
     if not symbols:
         raise RuntimeError("No Bybit perpetual symbols found for selected categories.")
 

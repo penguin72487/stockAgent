@@ -22,6 +22,12 @@ _PLOT_ASPECT_RATIO = 17.0 / 6.0
 _DEFAULT_PLOT_HEIGHT = 6.0
 
 
+def _periods_per_year(result: BacktestResult) -> float:
+    """Resolve the calendar implied by the product's daily decision tape."""
+
+    return 365.0 if str(result.execution_mode).strip().lower() == "crypto_perpetual" else 252.0
+
+
 def _figsize_17_6(height: float = _DEFAULT_PLOT_HEIGHT) -> tuple[float, float]:
     height = max(1.0, float(height))
     return height * _PLOT_ASPECT_RATIO, height
@@ -337,15 +343,17 @@ def compute_metrics(result: BacktestResult) -> dict[str, float]:
     std = float(r.std(ddof=0))
     avg_b = float(b.mean())
     std_b = float(b.std(ddof=0))
-    ann_r = _safe_expm1(float(avg * 252.0))
-    sharpe = float(avg / std * math.sqrt(252.0)) if std > 0 else 0.0
-    benchmark_sharpe = float(avg_b / std_b * math.sqrt(252.0)) if std_b > 0 else 0.0
+    periods = _periods_per_year(result)
+    annualizer = math.sqrt(periods)
+    ann_r = _safe_expm1(float(avg * periods))
+    sharpe = float(avg / std * annualizer) if std > 0 else 0.0
+    benchmark_sharpe = float(avg_b / std_b * annualizer) if std_b > 0 else 0.0
     downside = np.minimum(r, 0.0)
     downside_b = np.minimum(b, 0.0)
     downside_dev = float(np.sqrt(np.mean(np.square(downside))))
     downside_dev_b = float(np.sqrt(np.mean(np.square(downside_b))))
-    sortino = float(avg / downside_dev * math.sqrt(252.0)) if downside_dev > 0 else 0.0
-    benchmark_sortino = float(avg_b / downside_dev_b * math.sqrt(252.0)) if downside_dev_b > 0 else 0.0
+    sortino = float(avg / downside_dev * annualizer) if downside_dev > 0 else 0.0
+    benchmark_sortino = float(avg_b / downside_dev_b * annualizer) if downside_dev_b > 0 else 0.0
 
     max_dd = _max_drawdown_from_log_returns(r)
     calmar = ann_r / abs(max_dd) if max_dd < 0.0 else 0.0
@@ -419,6 +427,8 @@ def compute_metrics_by_year(
     years = date_values.astype("datetime64[Y]").astype(np.int64) + 1970
 
     annual_metrics = {}
+    periods = _periods_per_year(result)
+    annualizer = math.sqrt(periods)
     for year in np.unique(years):
         mask = years == year
         r_year = r[mask]
@@ -431,15 +441,15 @@ def compute_metrics_by_year(
         std = float(r_year.std(ddof=0)) + 1e-8
         avg_b = float(b_year.mean())
         std_b = float(b_year.std(ddof=0)) + 1e-8
-        ann_r = _safe_expm1(float(avg * 252.0))
-        sharpe = float(avg / std * math.sqrt(252.0))
-        benchmark_sharpe = float(avg_b / std_b * math.sqrt(252.0))
+        ann_r = _safe_expm1(float(avg * periods))
+        sharpe = float(avg / std * annualizer)
+        benchmark_sharpe = float(avg_b / std_b * annualizer)
         downside = np.minimum(r_year, 0.0)
         downside_b = np.minimum(b_year, 0.0)
         downside_dev = float(np.sqrt(np.mean(np.square(downside))))
         downside_dev_b = float(np.sqrt(np.mean(np.square(downside_b))))
-        sortino = float(avg / downside_dev * math.sqrt(252.0)) if downside_dev > 0 else 0.0
-        benchmark_sortino = float(avg_b / downside_dev_b * math.sqrt(252.0)) if downside_dev_b > 0 else 0.0
+        sortino = float(avg / downside_dev * annualizer) if downside_dev > 0 else 0.0
+        benchmark_sortino = float(avg_b / downside_dev_b * annualizer) if downside_dev_b > 0 else 0.0
 
         max_dd = _max_drawdown_from_log_returns(r_year)
         calmar = ann_r / abs(max_dd) if max_dd < 0.0 else 0.0
@@ -508,14 +518,15 @@ def generate_annual_report(
     std = float(r_all.std(ddof=0)) + 1e-8
     avg_b = float(b_all.mean())
     std_b = float(b_all.std(ddof=0)) + 1e-8
-    sharpe_total = float(avg / std * math.sqrt(252.0))
-    benchmark_sharpe_total = float(avg_b / std_b * math.sqrt(252.0))
+    annualizer = math.sqrt(_periods_per_year(result))
+    sharpe_total = float(avg / std * annualizer)
+    benchmark_sharpe_total = float(avg_b / std_b * annualizer)
     downside_total = np.minimum(r_all, 0.0)
     downside_total_b = np.minimum(b_all, 0.0)
     downside_total_dev = float(np.sqrt(np.mean(np.square(downside_total))))
     downside_total_dev_b = float(np.sqrt(np.mean(np.square(downside_total_b))))
-    sortino_total = float(avg / downside_total_dev * math.sqrt(252.0)) if downside_total_dev > 0 else 0.0
-    benchmark_sortino_total = float(avg_b / downside_total_dev_b * math.sqrt(252.0)) if downside_total_dev_b > 0 else 0.0
+    sortino_total = float(avg / downside_total_dev * annualizer) if downside_total_dev > 0 else 0.0
+    benchmark_sortino_total = float(avg_b / downside_total_dev_b * annualizer) if downside_total_dev_b > 0 else 0.0
     max_dd_total = _max_drawdown_from_log_returns(r_all)
     turnover_total = float(turnover_all.mean()) if turnover_all.size else 0.0
 

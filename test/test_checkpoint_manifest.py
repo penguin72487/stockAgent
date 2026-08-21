@@ -1375,6 +1375,75 @@ def test_schema_v4_before_lookback_context_cannot_resume_panel_history(
         )
 
 
+def test_schema_v4_added_inactive_external_and_projection_fields_remain_compatible(
+    tmp_path: Path,
+) -> None:
+    panel = _panel()
+    config = _config()
+    config.training.model_name = "financial_transformer"
+    config.data.use_external_features = False
+    active = (
+        config.training.financial_transformer
+        if config.training.model_name == "financial_transformer"
+        else config.training.transformer_base_portfolio
+    )
+    active.projection_l1_scale_by_active_count = False
+    current = _checkpoint_manifest(panel, config)
+    historical = copy.deepcopy(current)
+    preprocessing = historical["contracts"]["data"]["preprocessing"]
+    for name in (
+        "use_external_features",
+        "external_feature_path",
+        "external_market_symbol",
+    ):
+        preprocessing.pop(name)
+    historical["contracts"]["model"]["model"].pop(
+        "projection_l1_scale_by_active_count"
+    )
+    historical["fingerprints"]["data_schema"] = trainer_module._stable_fingerprint(
+        {
+            "symbols": historical["contracts"]["data"]["symbols"],
+            "feature_names": historical["contracts"]["data"]["feature_names"],
+            "preprocessing": preprocessing,
+        }
+    )
+    historical["fingerprints"]["model"] = trainer_module._stable_fingerprint(
+        historical["contracts"]["model"]
+    )
+
+    _validate_checkpoint_manifest(
+        {"experiment_manifest": historical},
+        current,
+        checkpoint_path=tmp_path / "schema_v4_before_inactive_fields.pt",
+        scope="model",
+    )
+
+    external_enabled = copy.deepcopy(config)
+    external_enabled.data.use_external_features = True
+    with pytest.raises(RuntimeError, match="data_schema"):
+        _validate_checkpoint_manifest(
+            {"experiment_manifest": historical},
+            _checkpoint_manifest(panel, external_enabled),
+            checkpoint_path=tmp_path / "external_enabled.pt",
+            scope="model",
+        )
+
+    scaled_projection = copy.deepcopy(config)
+    scaled_active = (
+        scaled_projection.training.financial_transformer
+        if scaled_projection.training.model_name == "financial_transformer"
+        else scaled_projection.training.transformer_base_portfolio
+    )
+    scaled_active.projection_l1_scale_by_active_count = True
+    with pytest.raises(RuntimeError, match="model"):
+        _validate_checkpoint_manifest(
+            {"experiment_manifest": historical},
+            _checkpoint_manifest(panel, scaled_projection),
+            checkpoint_path=tmp_path / "projection_scaled.pt",
+            scope="model",
+        )
+
+
 def test_schema_v1_removed_scheduler_interval_spellings_remain_loadable(tmp_path: Path) -> None:
     manifest = _checkpoint_manifest(_panel(), _config())
     for settings_fingerprint in manifest[

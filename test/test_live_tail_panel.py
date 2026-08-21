@@ -39,3 +39,44 @@ def test_build_tail_panel_reads_only_recent_rows(tmp_path) -> None:
     assert str(panel.dates[0]).startswith("2026-01-01T03:30:00")
     assert str(panel.dates[-1]).startswith("2026-01-01T04:45:00")
     assert np.isfinite(panel.features[-1]).all()
+
+
+def test_build_tail_panel_filters_return_valuation_with_sparse_symbol_dates(
+    tmp_path,
+) -> None:
+    dense_dates = [datetime(2026, 1, 1) + timedelta(days=i) for i in range(10)]
+    sparse_dates = [
+        datetime(2025, 12, 1) + timedelta(days=i) for i in range(4)
+    ] + dense_dates[-2:]
+
+    def write(path, dates, base_price: float) -> None:
+        close = np.arange(len(dates), dtype=np.float64) + base_price
+        pq.write_table(
+            pa.table(
+                {
+                    "date": dates,
+                    "open": close,
+                    "max": close + 0.2,
+                    "min": close - 0.2,
+                    "close": close,
+                    "adjclose": close,
+                    "Trading_Volume": np.full(len(dates), 1000.0),
+                }
+            ),
+            path,
+        )
+
+    write(tmp_path / "DENSE_features.parquet", dense_dates, 100.0)
+    write(tmp_path / "SPARSE_features.parquet", sparse_dates, 50.0)
+
+    panel = build_tail_panel(
+        tmp_path,
+        tail_rows=6,
+        panel_load_workers=0,
+        benchmark_name="DENSE",
+    )
+
+    sparse_idx = panel.symbols.index("SPARSE")
+    assert panel.features.shape[0] == 6
+    assert int(panel.tradable_mask[:, sparse_idx].sum()) == 2
+    assert np.isfinite(panel.returns_1d[:, sparse_idx]).sum() <= 1

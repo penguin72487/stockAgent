@@ -1,10 +1,11 @@
 [Unit]
-Description=Evict expired StockAgent materialized dataset caches daily
+Description=Monitor StockAgent materialized dataset leases every five minutes
 
 [Timer]
-OnCalendar=*-*-* 04:20:00
-RandomizedDelaySec=30min
-Persistent=true
+OnActiveSec=2min
+OnUnitActiveSec=5min
+RandomizedDelaySec=30s
+AccuracySec=30s
 Unit=stockagent-data-cache-gc.service
 
 [Install]

@@ -117,6 +117,47 @@ _TW_OPTION_TICK_MODEL_NAMES = frozenset(
 )
 
 
+def _validate_crypto_perpetual_mode_contract(
+    *,
+    execution_mode: str,
+    frequency: object,
+    loss_type: object,
+    buy_fee_rate: object,
+    sell_fee_rate: object,
+    use_tw_public_rules: object,
+    portfolio_output_mode: object,
+) -> None:
+    """Keep the daily Bybit carrying account on one explicit contract."""
+
+    if execution_mode != "crypto_perpetual":
+        return
+    if _normalized_contract_name(frequency) not in {"daily", "1d", "day"}:
+        raise ValueError(
+            "crypto_perpetual requires trading.frequency='daily' for the "
+            "00:00 decision / 00:05 UTC execution carrying ledger"
+        )
+    if _normalized_contract_name(loss_type) not in _TW_PHASE_RETURN_OBJECTIVES:
+        raise ValueError(
+            "crypto_perpetual currently requires canonical path-dependent log utility"
+        )
+    official_vip0_taker_fee = 0.00055
+    if any(
+        abs(float(value) - official_vip0_taker_fee) > 1.0e-12
+        for value in (buy_fee_rate, sell_fee_rate)
+    ):
+        raise ValueError(
+            "crypto_perpetual Bybit baseline requires buy_fee_rate and "
+            "sell_fee_rate = 0.00055 (0.055% taker per executed side)"
+        )
+    if bool(use_tw_public_rules):
+        raise ValueError("crypto_perpetual cannot consume Taiwan execution rules")
+    output_mode = normalize_portfolio_output_mode(str(portfolio_output_mode))
+    if output_mode not in {"logits", "l1", "cash_l1", "projection_l1"}:
+        raise ValueError(
+            "crypto_perpetual requires a signed target-weight compatible model output"
+        )
+
+
 def _validate_tw_minute_mode_contract(
     *,
     execution_mode: str,
@@ -869,6 +910,11 @@ class DataConfig:
     panel_backend: str = "auto"
     panel_load_workers: int = 4
     live_tail_panel_rows: int = 0
+    # Product-neutral point-in-time feature table.  It uses the same canonical
+    # panel join as TW public data, but cannot carry Taiwan execution rules.
+    use_external_features: bool = False
+    external_feature_path: str = ""
+    external_market_symbol: str = "__MARKET__"
     use_tw_public_features: bool = False
     use_tw_public_rules: bool = False
     tw_public_feature_path: str = (
@@ -937,6 +983,32 @@ class DataConfig:
     index_derivatives_tick_min_train_days: int = 20
     index_derivatives_tick_val_days: int = 5
     index_derivatives_tick_test_days: int = 5
+
+
+def external_panel_data_kwargs(data: DataConfig) -> dict[str, object]:
+    """Resolve the one product-neutral external panel source without aliases."""
+
+    generic = bool(data.use_external_features)
+    tw_features = bool(data.use_tw_public_features)
+    tw_rules = bool(data.use_tw_public_rules)
+    tw_data = tw_features or tw_rules
+    if generic and tw_data:
+        raise ValueError(
+            "generic external features and TW public data cannot be enabled together"
+        )
+    return {
+        "external_feature_path": (
+            data.external_feature_path
+            if generic
+            else data.tw_public_feature_path if tw_data else None
+        ),
+        "external_market_symbol": (
+            data.external_market_symbol if generic else data.tw_public_market_symbol
+        ),
+        "external_include_features": generic or tw_features,
+        "external_include_rules": tw_rules,
+        "external_data_required": generic or tw_data,
+    }
 
 
 @dataclass(slots=True)
@@ -2621,6 +2693,15 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
                 "walk_forward.split_start_year cannot precede the panel start year; "
                 f"got {split_start_year!r} and {data['panel_start_date']!r}"
             )
+    data["use_external_features"] = bool(data["use_external_features"])
+    data["external_feature_path"] = str(data["external_feature_path"] or "").strip()
+    external_market_symbol_default = _dataclass_default_values(DataConfig)[
+        "external_market_symbol"
+    ]
+    data["external_market_symbol"] = (
+        str(data["external_market_symbol"] or external_market_symbol_default).strip()
+        or external_market_symbol_default
+    )
     data["use_tw_public_features"] = bool(data["use_tw_public_features"])
     data["use_tw_public_rules"] = bool(data["use_tw_public_rules"])
     data["tw_public_feature_path"] = str(data["tw_public_feature_path"] or "").strip()
@@ -2631,6 +2712,17 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         str(data["tw_public_market_symbol"] or tw_public_market_symbol_default).strip()
         or tw_public_market_symbol_default
     )
+    if data["use_external_features"] and (
+        data["use_tw_public_features"] or data["use_tw_public_rules"]
+    ):
+        raise ValueError(
+            "data.use_external_features cannot share one panel join with TW public "
+            "features/rules; materialize a single point-in-time external table"
+        )
+    if data["use_external_features"] and not data["external_feature_path"]:
+        raise ValueError(
+            "data.use_external_features=true requires data.external_feature_path"
+        )
     data["feature_include"] = _normalize_string_list(
         data["feature_include"], field_name="data.feature_include"
     )
@@ -3434,6 +3526,15 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
 
     # Legacy key is accepted as input but removed from the normalized config payload.
     trading.pop("fee_per_side", None)
+    _validate_crypto_perpetual_mode_contract(
+        execution_mode=trading["execution_mode"],
+        frequency=trading["frequency"],
+        loss_type=training["loss_type"],
+        buy_fee_rate=trading["buy_fee_rate"],
+        sell_fee_rate=trading["sell_fee_rate"],
+        use_tw_public_rules=data["use_tw_public_rules"],
+        portfolio_output_mode=phase_model_config["portfolio_output_mode"],
+    )
     return raw
 
 

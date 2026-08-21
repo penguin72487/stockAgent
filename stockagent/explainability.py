@@ -22,7 +22,11 @@ import torch
 from torch import nn
 from tqdm.auto import tqdm
 
-from stockagent.config import ExperimentConfig, load_config
+from stockagent.config import (
+    ExperimentConfig,
+    external_panel_data_kwargs,
+    load_config,
+)
 from stockagent.backtest.gpu_plot import (
     rapids_datashader_available,
     run_cuml_umap,
@@ -11483,17 +11487,7 @@ def load_explanation_context(
         strict_no_fallback=config.training.strict_no_fallback,
         panel_backend=config.data.panel_backend,
         panel_load_workers=config.data.panel_load_workers,
-        external_feature_path=(
-            config.data.tw_public_feature_path
-            if config.data.use_tw_public_features or config.data.use_tw_public_rules
-            else None
-        ),
-        external_market_symbol=config.data.tw_public_market_symbol,
-        external_include_features=config.data.use_tw_public_features,
-        external_include_rules=config.data.use_tw_public_rules,
-        external_data_required=(
-            config.data.use_tw_public_features or config.data.use_tw_public_rules
-        ),
+        **external_panel_data_kwargs(config.data),
         feature_include=config.data.feature_include,
         feature_exclude=config.data.feature_exclude,
         feature_zero_fill=config.data.feature_zero_fill,
@@ -12010,17 +12004,7 @@ def _run_explainability_for_config(
             strict_no_fallback=config.training.strict_no_fallback,
             panel_backend=config.data.panel_backend,
             panel_load_workers=config.data.panel_load_workers,
-            external_feature_path=(
-                config.data.tw_public_feature_path
-                if config.data.use_tw_public_features or config.data.use_tw_public_rules
-                else None
-            ),
-            external_market_symbol=config.data.tw_public_market_symbol,
-            external_include_features=config.data.use_tw_public_features,
-            external_include_rules=config.data.use_tw_public_rules,
-            external_data_required=(
-                config.data.use_tw_public_features or config.data.use_tw_public_rules
-            ),
+            **external_panel_data_kwargs(config.data),
             feature_include=config.data.feature_include,
             feature_exclude=config.data.feature_exclude,
             feature_zero_fill=config.data.feature_zero_fill,

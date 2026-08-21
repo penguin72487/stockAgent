@@ -328,7 +328,7 @@ _AUTOMATION_PROFILES: Final[dict[str, dict[str, Any]]] = {
             "tw_public_eligibility",
             "tw_day_trade_preopen_gate",
         ),
-        "schedule_label": "156 項來源版本事件持續監測、公布邊界掃描、08:20/08:30 嚴格快照與 08:59:30 最終守門",
+        "schedule_label": "156 項來源版本事件持續監測、07:50 全量掃描、08:00/08:20/08:29 嚴格發布與 08:59:30 最終守門",
         "active_means_running": False,
     },
     "group:tw-minute-train": {
@@ -3188,7 +3188,7 @@ def _specialize_groups(
             if isinstance(tw_events, Mapping)
             else None,
         }
-        tw["cadence"] = "來源事件每 60–300 秒；08:20/08:30 全量驗收"
+        tw["cadence"] = "來源事件每 60–300 秒；08:00/08:20/08:29 全量驗收"
         tw["update_owner"] = "來源事件監測器＋不可變快照更新器"
         if event_healthy and tw.get("status") == "current":
             tw["status_label"] = "156/156 來源事件健康，快照完整最新"

@@ -314,6 +314,7 @@ def main(argv: list[str] | None = None) -> int:
                 {
                     "dataset": entry["dataset"],
                     "snapshot_id": resolved.manifest["snapshot_id"],
+                    "inventory_sha256": resolved.manifest["archive"]["inventory"]["sha256"],
                     "source_files": resolved.manifest["source"]["files"],
                     "source_bytes": resolved.manifest["source"]["logical_bytes"],
                     "sync_objects": resolved.manifest["archive"]["object_count"] + 1,

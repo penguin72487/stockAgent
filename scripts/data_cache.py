@@ -79,7 +79,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="print only the materialized path for shell command substitution",
     )
 
-    gc = subparsers.add_parser("gc", help="evict every expired safe hot lease")
+    gc = subparsers.add_parser(
+        "gc", help="auto-renew active leases and evict expired safe hot leases"
+    )
     gc.add_argument("--dry-run", action="store_true")
 
     evict = subparsers.add_parser(

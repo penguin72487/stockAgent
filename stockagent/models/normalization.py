@@ -436,6 +436,14 @@ def masked_l1_projection_weights(
         projected = clean.sign() * (abs_clean - theta).clamp_min(0.0)
         projected = torch.where(inside, clean, projected)
         projected = projected.masked_fill(~mask_bool, 0.0)
+        # Portfolio weights feed recurrent fee, funding, turnover, and NAV
+        # accounting.  Keep that public boundary in FP32 under FP16/BF16 AMP;
+        # casting the already-FP32 projection back to an autocast dtype loses
+        # small holdings before the ledger sees them.  Preserve the caller's
+        # dtype for ordinary FP32/FP64 use so non-AMP numerical contracts do
+        # not change.
+        if logits.dtype in {torch.float16, torch.bfloat16}:
+            return projected
         return projected.to(dtype=logits.dtype)
 
 

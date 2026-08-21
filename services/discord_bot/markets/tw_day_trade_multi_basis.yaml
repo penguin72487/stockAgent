@@ -6,7 +6,7 @@ timezone: Asia/Taipei
 open_time: "09:00"
 close_time: "13:30"
 schedule_time: "09:00"
-preopen_prepare_time: "08:30"
+preopen_prepare_time: "08:15"
 summary_time: "14:00"
 data_ready_time: "13:40"
 freshness_max_lag_days: 3
@@ -21,12 +21,10 @@ day_trade_quote_interval_seconds: 60
 # This model shares the canonical TW public data layer with the other modes.
 # 09:00 is a gate; entry uses a causally later executable best quote.
 pre_signal_command:
-  - scripts/run_data_cache.sh
-  - use
-  - tw-public
+  - scripts/activate_tw_public_opening_data.py
   - --link
   - data_tw_public
-pre_signal_timeout_seconds: 14400
+pre_signal_timeout_seconds: 120
 previous_signal_backfill_limit: 512
 
 model_selection_path: ../models/tw_day_trade_multi_basis.yaml

@@ -23,7 +23,7 @@ if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
 os.environ.setdefault("PYTORCH_ALLOC_CONF", os.environ["PYTORCH_CUDA_ALLOC_CONF"])
 import torch
 
-from stockagent.config import load_config
+from stockagent.config import external_panel_data_kwargs, load_config
 from stockagent.runtime_env import normalize_cuda_env
 
 
@@ -522,9 +522,6 @@ def _maybe_init_distributed_for_panel(active_strategy: str, config) -> None:
 
 
 def _build_panel_kwargs(config) -> dict:
-    use_tw_public_features = bool(config.data.use_tw_public_features)
-    use_tw_public_rules = bool(config.data.use_tw_public_rules)
-    use_tw_public_data = use_tw_public_features or use_tw_public_rules
     return {
         "benchmark_name": config.data.benchmark_name,
         "usd_only_trading_pairs": config.data.usd_only_trading_pairs,
@@ -534,13 +531,7 @@ def _build_panel_kwargs(config) -> dict:
         "strict_no_fallback": config.training.strict_no_fallback,
         "panel_backend": config.data.panel_backend,
         "panel_load_workers": config.data.panel_load_workers,
-        "external_feature_path": (
-            config.data.tw_public_feature_path if use_tw_public_data else None
-        ),
-        "external_market_symbol": config.data.tw_public_market_symbol,
-        "external_include_features": use_tw_public_features,
-        "external_include_rules": use_tw_public_rules,
-        "external_data_required": use_tw_public_data,
+        **external_panel_data_kwargs(config.data),
         "feature_include": config.data.feature_include,
         "feature_exclude": config.data.feature_exclude,
         "feature_zero_fill": config.data.feature_zero_fill,

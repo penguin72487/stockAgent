@@ -179,6 +179,7 @@ STOCKAGENT_SYNC_NODE_ID=penguin \
 ```text
 COLD_ONLY -- use/完整驗證 --> HOT -- 7 天未續租 --> COLD_ONLY
                        \-- 再次 use：O(1) ready proof + 續租
+                       \-- 程序引用：GC monitor 自動從當下續租
 ```
 
 查看每個資料集的冷庫大小、解封狀態、版本與到期時間：
@@ -223,15 +224,20 @@ printf 'training data: %s\n' "$data_path"
 ./scripts/run_data_cache.sh evict tw-public --dry-run
 ```
 
+每五分鐘的 GC monitor 會先掃描 `/proc`。若程序的 fd、mmap、cwd、root 或 executable
+仍指向 managed materialized tree，就依該 lease 原本的 TTL 從當下自動延長；不遍歷
+資料樹，也不依賴 `noatime/relatime` 下不可靠的 access time。短於五分鐘的單次讀取仍應
+先執行 `use`，讓 lease 立即續期。
+
 自動清理只會刪除同時符合以下條件的 materialized tree：
 
 - 租約超過七天；
 - packed manifest 與全部 cold objects 仍在本機；
 - materialization READY proof 與 manifest 相符；
 - 沒有 `.pin.json` 保護；
-- `/proc` 中沒有程序的 fd、mmap、cwd、root 或 executable 指向該 tree。
+- `/proc` 中沒有程序引用；若有，改為續租而不是刪除。
 
-安裝每日 timer；有 systemd 時安裝 timer，vast.ai container 則安裝 cron fallback：
+安裝每五分鐘 monitor；有 systemd 時安裝 timer，vast.ai container 則安裝 cron fallback：
 
 ```bash
 sudo ./scripts/install_data_cache_gc_service.sh
@@ -250,10 +256,11 @@ stockagent-data publish tw-public
 
 `publish` 仍會套用 catalog 的 active-downloader blocker、排除規則、完整來源穩定性
 檢查與原子 head 更新；它不是繞過發布門檻的捷徑。
-在 penguin 的 08:30 官方資料驗收作業中，只有主作業成功後才會透過
-`ExecStartPost` 自動執行 `publish tw-public`；下載或嚴格 audit 失敗時不會
-發布。來源 receipt 的 `end_date` 若比現有 cold manifest 舊，publish 也會
-fail closed，避免多寫者用較晚 HLC 發布舊內容。
+在 penguin 的 08:30 前官方資料驗收作業中，07:50 全量掃描先要求 156 項來源
+零失敗、零 publication lag 並原子提交 live receipt；08:00/08:20/08:29 作業再依序
+執行嚴格 audit、`publish tw-public`、完整 materialize 驗證與 symlink 切換。
+任何階段失敗都不會切換推論資料。來源 receipt 的 `end_date` 若比現有 cold
+manifest 舊，publish 也會 fail closed，避免多寫者用較晚 HLC 發布舊內容。
 
 新資料的增量冷存仍使用既有發布入口。固定 hash bucket 與 content-addressed
 blob 使未改變物件直接重用，只傳輸變動 bucket/blob：

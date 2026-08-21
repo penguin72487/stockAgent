@@ -575,6 +575,17 @@ def _reuse_current_open_map(
     }
     if not resolved:
         raise ValueError(f"{source_path} has no valid session-open prices")
+    source_values = sorted(
+        {
+            str(value or "").strip()
+            for value in frame.get_column("source").to_list()
+            if str(value or "").strip()
+        }
+    )
+    if source_values and all("official" in value.lower() for value in source_values):
+        canonical_source = "retained_same_session_official_open_snapshot"
+    else:
+        canonical_source = "retained_same_session_shioaji_snapshot_session_open"
     destination = state_dir / "replay_open_data" / f"{trading_date.isoformat()}.parquet"
     destination.parent.mkdir(parents=True, exist_ok=True)
     frame.write_parquet(destination)
@@ -588,7 +599,9 @@ def _reuse_current_open_map(
             frame.select(pl.col("snapshot_available").sum()).item()
         ),
         "valid_open_symbols": len(resolved),
-        "source": "retained_same_session_shioaji_snapshot",
+        "source": canonical_source,
+        "source_values": source_values,
+        "canonical_source": canonical_source,
         "additional_shioaji_requests": 0,
     }
 
@@ -663,7 +676,11 @@ def _reuse_retained_signal_open_map(
         official = [
             item
             for item in available
-            if str(item["price_source"]).lower().startswith("twse_tpex:mis")
+            if (
+                str(item["price_source"]).lower().startswith("twse_tpex:mis")
+                or "official_mis_session_open"
+                in str(item["price_source"]).lower()
+            )
         ]
         preferred = official or available
         if not preferred:
@@ -1083,9 +1100,7 @@ def main() -> None:
                     state_dir=state_dir,
                     trading_date=day,
                 )
-                canonical_open_source = (
-                    "retained_same_session_shioaji_snapshot_session_open"
-                )
+                canonical_open_source = str(open_provenance["canonical_source"])
             elif args.reuse_retained_signal_open:
                 canonical_open_by_symbol, open_provenance = (
                     _reuse_retained_signal_open_map(
