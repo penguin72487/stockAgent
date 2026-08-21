@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 import math
 from pathlib import Path
 import sys
@@ -46,6 +46,10 @@ from download_bybit_perp_daily import (  # noqa: E402
     _iter_windows,
     _load_existing_candle_info,
 )
+from download_fred_crypto_macro_vintages import (  # noqa: E402
+    _realtime_windows,
+    parse_initial_release_rows,
+)
 from repair_bybit_1m_gaps import (  # noqa: E402
     _missing_timestamp_ms,
     _request_windows,
@@ -55,6 +59,13 @@ from scripts.build_bybit_crypto_public_daily_features import (  # noqa: E402
     _bybit_funding_features,
     _okx_daily,
     _resolve_okx_mapping,
+)
+from stockagent.data.crypto_public_web import (  # noqa: E402
+    coingecko_snapshot_rows,
+    coinmetrics_vintage_rows,
+    etf_issuer_snapshot_rows,
+    fred_macro_rows,
+    sec_etf_filing_rows,
 )
 
 
@@ -105,7 +116,9 @@ def test_positive_funding_is_received_by_a_short() -> None:
     assert result.final_weights.item() == pytest.approx(-1.0 / (1.0 + 0.01 - 0.00055))
 
 
-def test_crypto_reporting_reuses_canonical_continuous_result_without_share_oracle() -> None:
+def test_crypto_reporting_reuses_canonical_continuous_result_without_share_oracle() -> (
+    None
+):
     canonical = BacktestResult(
         strategy_returns=np.asarray([0.01], dtype=np.float32),
         benchmark_returns=np.asarray([0.0], dtype=np.float32),
@@ -731,6 +744,161 @@ def test_okx_mapping_handles_only_explicit_contract_denomination_prefixes() -> N
     assert _resolve_okx_mapping("2Z", mapping) == (None, None)
 
 
+def test_fred_macro_uses_only_values_available_before_midnight(tmp_path: Path) -> None:
+    path = tmp_path / "observations.parquet"
+    pl.DataFrame(
+        {
+            "series_id": ["DFF", "DFF"],
+            "observation_date": ["2024-01-01", "2024-01-02"],
+            "value": [5.25, 5.50],
+            "available_at_utc": [
+                "2024-01-02T00:00:00+00:00",
+                "2024-01-03T00:00:01+00:00",
+            ],
+        }
+    ).write_parquet(path)
+    output, receipt = fred_macro_rows(
+        path, ["2024-01-01", "2024-01-02", "2024-01-03", "2024-01-04"]
+    )
+    assert output[0, "crypto_public_macro_fed_funds_rate"] is None
+    assert output[1, "crypto_public_macro_fed_funds_rate"] == pytest.approx(0.0525)
+    assert output[2, "crypto_public_macro_fed_funds_rate"] == pytest.approx(0.0525)
+    assert output[3, "crypto_public_macro_fed_funds_rate"] == pytest.approx(0.055)
+    assert receipt["revision_backprojection"] is False
+
+
+def test_fred_initial_release_parser_waits_until_next_utc_day() -> None:
+    payload = (
+        b'{"observations":[{"realtime_start":"2024-01-02",'
+        b'"realtime_end":"2024-02-01","date":"2023-12-01","value":"3.5"}]}'
+    )
+    rows = parse_initial_release_rows(
+        "NFCI",
+        payload,
+        retrieved_at_utc=datetime(2024, 2, 2, tzinfo=timezone.utc),
+    )
+    assert rows[0]["available_at_utc"] == "2024-01-03T00:00:00+00:00"
+    windows = _realtime_windows("2000-01-01", "2010-01-01")
+    assert all(
+        (date.fromisoformat(end) - date.fromisoformat(start)).days <= 1824
+        for start, end in windows
+    )
+
+
+def test_sec_etf_filings_wait_until_next_midnight(tmp_path: Path) -> None:
+    sec = tmp_path / "sec" / "0001"
+    sec.mkdir(parents=True)
+    pl.DataFrame(
+        {
+            "accession_number": ["0001-24-000001"],
+            "registered_assets": ["BTC"],
+            "form": ["S-1"],
+            "available_at_utc": ["2024-01-01T15:30:00+00:00"],
+        }
+    ).write_parquet(sec / "filings.parquet")
+    output, receipt = sec_etf_filing_rows(
+        tmp_path / "sec",
+        ["2024-01-01", "2024-01-02"],
+        {"BTCUSDT": "BTC"},
+    )
+    market = output.filter(pl.col("symbol") == "__MARKET__").sort("date")
+    btc = output.filter(pl.col("symbol") == "BTCUSDT").sort("date")
+    assert market[0, "crypto_public_sec_etf_filings_1d_log1p"] == 0.0
+    assert market[1, "crypto_public_sec_etf_filings_1d_log1p"] == pytest.approx(
+        math.log(2.0)
+    )
+    assert btc[0, "crypto_public_sec_asset_available"] == 0.0
+    assert btc[1, "crypto_public_sec_asset_registration_30d_log1p"] == pytest.approx(
+        math.log(2.0)
+    )
+    assert receipt["availability_contract"] == (
+        "sec_acceptance_datetime_le_decision_cutoff"
+    )
+
+
+def test_coinmetrics_latest_view_never_precedes_retrieval_vintage(
+    tmp_path: Path,
+) -> None:
+    vintages = tmp_path / "vintages"
+    vintages.mkdir()
+    pl.DataFrame(
+        {
+            "date": ["2024-01-01", "2024-01-01"],
+            "metric": ["AdrActCnt", "TxCnt"],
+            "value": [99.0, 50.0],
+            "available_at_utc": [
+                "2024-01-02T00:00:01+00:00",
+                "2024-01-02T00:00:01+00:00",
+            ],
+        }
+    ).write_parquet(vintages / "btc_vintages.parquet")
+    output, receipt = coinmetrics_vintage_rows(
+        vintages,
+        ["2024-01-02", "2024-01-03"],
+        {"BTCUSDT": "BTC"},
+    )
+    assert output["date"].to_list() == ["2024-01-03"]
+    assert output[0, "crypto_public_onchain_active_addresses_log1p"] == pytest.approx(
+        math.log(100.0)
+    )
+    assert receipt["latest_view_history_backprojected"] is False
+
+
+def test_coingecko_snapshot_rejects_ambiguous_symbol_mapping(tmp_path: Path) -> None:
+    snapshot_dir = (
+        tmp_path / "snapshots" / "coingecko_market_snapshot" / "2024" / "01" / "01"
+    )
+    snapshot_dir.mkdir(parents=True)
+    pl.DataFrame(
+        {
+            "symbol": ["btc", "pepe", "pepe"],
+            "market_cap": [100.0, 80.0, 20.0],
+            "fully_diluted_valuation": [110.0, 90.0, 30.0],
+            "total_volume": [10.0, 8.0, 2.0],
+            "market_cap_rank": [1.0, 10.0, 500.0],
+            "circulating_supply": [20.0, 1000.0, 200.0],
+            "available_at_utc": [
+                "2024-01-01T12:00:00+00:00",
+                "2024-01-01T12:00:00+00:00",
+                "2024-01-01T12:00:00+00:00",
+            ],
+        }
+    ).write_parquet(snapshot_dir / "snapshot.parquet")
+    output, receipt = coingecko_snapshot_rows(
+        tmp_path,
+        ["2024-01-01", "2024-01-02"],
+        {"BTCUSDT": "BTC", "1000PEPEUSDT": "1000PEPE"},
+    )
+    assets = output.filter(pl.col("symbol") != "__MARKET__")
+    assert assets.select("date", "symbol").to_dicts() == [
+        {"date": "2024-01-02", "symbol": "BTCUSDT"}
+    ]
+    assert receipt["asset_mapping"].endswith("share_ge_0.90")
+
+
+def test_etf_issuer_snapshot_is_prospective_only(tmp_path: Path) -> None:
+    normalized = tmp_path / "normalized"
+    normalized.mkdir()
+    pl.DataFrame(
+        {
+            "source_id": ["issuer_btc"],
+            "asset": ["BTC"],
+            "available_at_utc": ["2024-01-01T12:00:00+00:00"],
+            "holding_ticker": ["BTC"],
+            "market_value_usd": [1_000_000.0],
+            "quantity": [20.0],
+        }
+    ).write_parquet(normalized / "issuer_holdings_snapshots.parquet")
+    output, receipt = etf_issuer_snapshot_rows(
+        tmp_path,
+        ["2024-01-01", "2024-01-02"],
+        {"BTCUSDT": "BTC"},
+    )
+    assert output["date"].to_list() == ["2024-01-02"]
+    assert output[0, "crypto_public_etf_issuer_available"] == 1.0
+    assert receipt["historical_snapshot_backprojection"] is False
+
+
 def test_binance_public_daily_delays_bars_and_requires_complete_positioning(
     tmp_path: Path,
 ) -> None:
@@ -800,10 +968,13 @@ def test_bybit_strategy_config_keeps_multi_basis_fee_and_external_contract() -> 
     assert len(model.temporal_basis_families) == 18
     assert model.portfolio_output_mode == "projection_l1"
     assert model.projection_l1_scale_by_active_count is True
-    assert len(config.data.feature_include) == 80
+    assert len(config.data.feature_include) == 141
     assert "crypto_bybit_funding_available" in config.data.feature_include
     assert "crypto_bybit_*" in config.data.feature_zero_fill
     assert "crypto_binance_*" in config.data.feature_zero_fill
+    assert "crypto_public_macro_available_fraction" in config.data.feature_include
+    assert "crypto_public_onchain_available_fraction" in config.data.feature_include
+    assert "crypto_public_coingecko_asset_available" in config.data.feature_include
     external = external_panel_data_kwargs(config.data)
     assert external["external_include_features"] is True
     assert external["external_include_rules"] is False

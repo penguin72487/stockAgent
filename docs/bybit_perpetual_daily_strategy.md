@@ -69,16 +69,31 @@ Funding history 逐事件抓取；event mark 以 Bybit 官方 hourly mark-price 
   現金係數、最後費率、資料年齡與事件數在下一個決策日才成為模型特徵；
   當期尚未發生的 funding 只屬 executor label，不會回灌模型。
 - `data_free_public/observations.parquet` 的 fear/greed、DefiLlama、Bitcoin
-  mempool、Hyperliquid 等資料同時要求 `available_at_utc <= decision cutoff`，
+  mempool、Blockscout、Hyperliquid 等資料同時要求
+  `available_at_utc <= decision cutoff`，
   且 event timestamp 不晚於 cutoff。即使檔案含 2018 年事件，首次在本機觀測
   到的 2026-08-16 以前一律不回填。
+- DefiLlama 額外提供跨鏈 TVL、stablecoin circulating supply 與 yield-pool
+  TVL；Blockscout 提供 Ethereum gas 與 network utilization；mempool.space
+  提供 Bitcoin fee、mempool、difficulty 與 hashrate。這些都是網站／鏈上公開
+  資料，不是 Bybit、Binance 或 OKX 交易所欄位，但目前本機資料多為 2026-08
+  才開始保存的 snapshot，所以只具有 prospective 意義。
+- FRED 只下載 `output_type=4` 的 initial-release vintage，包含政策利率、SOFR、
+  2Y/10Y、公債曲線、廣義美元、VIX、高收益利差、Fed 資產負債表、reverse repo
+  與 NFCI。API 只給 release date、不給日內發布時間，因此一律等到隔日
+  `00:00 UTC` 才可用；later revision 不會覆蓋舊決策。
+- SEC crypto-ETF filings 使用 EDGAR `acceptance_datetime`；盤中受理的申報到
+  下一個 UTC 午夜才進入 1/7/30 日 filing intensity。SEC 實體集合來自目前的
+  crypto-ETF registry，summary 會明列 survivorship-selection risk。
+- Coin Metrics 只讀 per-asset canonical retrieval vintage，並限制到明確的原生
+  asset-id 白名單；2009 年起的 latest-view history 不會倒填。CoinGecko global
+  與 market snapshots、ETF 發行商 holdings／reserve 也只在首次
+  `available_at` 後使用。CoinGecko 同代號若最大市值資產占比低於 90%，映射
+  直接失敗而不猜測。
 - 每個稀疏資料族都有 availability feature；缺值才可 zero-fill，不把真正的
   零和未觀測混為一談。
-- Coin Metrics 的 latest-view 雖有 2009 年起的事件日期，canonical vintage
-  是到 2026-08 才首次在本機觀測；ETF/SEC/issuer 與 crypto-reference 也需要
-  各自的發布時間模型，Dune 最新 receipt 則是 credits exhausted、零個到期
-  partition 完成。這些來源目前明確列在 public summary 的 excluded 決策中，
-  不會為了增加欄位數而倒灌歷史。
+- Dune 留存結果的歷史 event date 早於 2026-08 retrieval completion，最新抓取
+  又受 credits 阻擋；依它自己的因果契約仍排除，不會為了增加欄位數而倒灌。
 
 ## 多基底模型
 
@@ -90,11 +105,10 @@ difference、AR innovation、B-spline、Legendre、Chebyshev、learned。
 
 所有係數與普通特徵串接後只通過同一個 RMSNorm/feature projection；沒有另設
 gate、fusion 或殘差能量捷徑。輸出使用 `projection_l1`，並按 active symbol
-count 縮放，保留共同多空方向與合法現金。目前輸入契約共 80 欄：15 個完整
+count 縮放，保留共同多空方向與合法現金。目前輸入契約共 141 欄：15 個完整
 Bybit session K 線特徵、7 個 Bybit funding 特徵、21 個 Binance、20 個 OKX
-（包含 funding／positioning／taker 可用旗標）與 17 個
-prospective/free-public 特徵；來源時間戳保留在 parquet 供稽核但不餵入
-模型。
+（包含 funding／positioning／taker 可用旗標）與 78 個交易所外公開資料特徵；
+來源時間戳與來源風險保留在 summary／quality receipt 供稽核，不餵入模型。
 
 ## 重建命令
 
@@ -104,10 +118,15 @@ run_fintech_python downloader/repair_bybit_1m_gaps.py --workers 96
 run_fintech_python downloader/download_bybit_funding_history.py \
   --workers 16 --start-date 2019-01-01
 run_fintech_python downloader/materialize_bybit_perpetual_daily.py --workers 12
+run_fintech_python downloader/download_fred_crypto_macro_vintages.py \
+  --start-date 2000-01-01 --end-date today
 run_fintech_python scripts/build_bybit_crypto_public_daily_features.py
 run_fintech_python train.py \
   --config configs/markets/bybit_perpetual_daily_multi_basis_projection_l1.yaml
 ```
+
+設定保留標準 DDP。若主機實際只看得到一張 CUDA GPU，啟動命令需追加
+`--multi-gpu-strategy none`；不要把單 GPU smoke 的覆寫寫回正式多 GPU設定。
 
 權威驗收檔為 `funding_coverage.csv`、`funding_summary.json`、
 `materialize_report.csv`、`materialize_summary.json`、public feature coverage/summary

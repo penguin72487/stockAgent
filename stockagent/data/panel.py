@@ -127,8 +127,9 @@ BASE_PANEL_FEATURE_COLUMNS = [
 # official inventory headroom independent of later close-side execution facts.
 # v52 reads product-supplied policy and execution masks independently. v53
 # keeps forward valuation returns across rows that have a real execution mark
-# even when their feature window is policy-ineligible.
-PANEL_CACHE_VERSION = 53
+# even when their feature window is policy-ineligible. v54 invalidates cached
+# feature tensors after the Bybit public-web input schema expansion.
+PANEL_CACHE_VERSION = 54
 # v2 distinguishes the cumulative corporate-action archive coverage from the
 # latest incremental downloader request.  Keep this in the backend contract so
 # panels built with the old requested_start_year interpretation are never

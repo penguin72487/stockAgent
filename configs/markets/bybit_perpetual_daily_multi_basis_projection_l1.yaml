@@ -3,10 +3,10 @@
 # crypto data, 24x7 execution, funding, fees, and public features differ.
 base_config: tw_day_trade_daily_multi_basis_projection_l1_tplus2_close_capital10m.yaml
 
-experiment_name: bybit-standard-usdt-perpetual-daily-multi-basis-projection-l1-funding-v3-execution-mask
+experiment_name: bybit-standard-usdt-perpetual-daily-multi-basis-projection-l1-public-web-v1
 
 runner:
-  output_dir: artifacts/markets/bybit_perpetual_daily_multi_basis_projection_l1_funding_v3_execution_mask
+  output_dir: artifacts/markets/bybit_perpetual_daily_multi_basis_projection_l1_public_web_v1
   resume: true
   post_train_infer: false
 
@@ -103,6 +103,12 @@ data:
     - crypto_public_dex_volume_log1p
     - crypto_public_protocol_fees_log1p
     - crypto_public_protocol_revenue_log1p
+    - crypto_public_defi_tvl_log1p
+    - crypto_public_stablecoin_supply_log1p
+    - crypto_public_yield_tvl_log1p
+    - crypto_public_eth_gas_fast_gwei_log1p
+    - crypto_public_eth_network_utilization
+    - crypto_public_btc_hashrate_log1p
     - crypto_public_btc_fastest_fee_log1p
     - crypto_public_btc_hour_fee_log1p
     - crypto_public_btc_mempool_vsize_log1p
@@ -114,6 +120,61 @@ data:
     - crypto_public_hyperliquid_open_interest_log1p
     - crypto_public_hyperliquid_day_volume_log1p
     - crypto_public_hyperliquid_available
+    - crypto_public_macro_fed_funds_rate
+    - crypto_public_macro_sofr
+    - crypto_public_macro_treasury_2y
+    - crypto_public_macro_treasury_10y
+    - crypto_public_macro_treasury_10y_2y_spread
+    - crypto_public_macro_dollar_index_log
+    - crypto_public_macro_vix_log1p
+    - crypto_public_macro_high_yield_spread
+    - crypto_public_macro_fed_balance_sheet_log1p
+    - crypto_public_macro_reverse_repo_log1p
+    - crypto_public_macro_financial_conditions
+    - crypto_public_macro_available_fraction
+    - crypto_public_macro_max_age_days
+    - crypto_public_sec_etf_filings_1d_log1p
+    - crypto_public_sec_etf_filings_7d_log1p
+    - crypto_public_sec_etf_filings_30d_log1p
+    - crypto_public_sec_etf_registration_30d_log1p
+    - crypto_public_sec_etf_periodic_30d_log1p
+    - crypto_public_sec_etf_available
+    - crypto_public_sec_asset_filings_7d_log1p
+    - crypto_public_sec_asset_filings_30d_log1p
+    - crypto_public_sec_asset_registration_30d_log1p
+    - crypto_public_sec_asset_periodic_30d_log1p
+    - crypto_public_sec_asset_available
+    - crypto_public_onchain_active_addresses_log1p
+    - crypto_public_onchain_balance_addresses_log1p
+    - crypto_public_onchain_tx_count_log1p
+    - crypto_public_onchain_transfer_count_log1p
+    - crypto_public_onchain_fees_native_log1p
+    - crypto_public_onchain_issuance_native_log1p
+    - crypto_public_onchain_supply_log1p
+    - crypto_public_onchain_mvrv_log
+    - crypto_public_onchain_hashrate_log1p
+    - crypto_public_onchain_exchange_netflow_usd_signed_log1p
+    - crypto_public_onchain_age_days
+    - crypto_public_onchain_available_fraction
+    - crypto_public_coingecko_total_market_cap_log1p
+    - crypto_public_coingecko_total_volume_log1p
+    - crypto_public_coingecko_btc_dominance
+    - crypto_public_coingecko_eth_dominance
+    - crypto_public_coingecko_market_cap_change_24h
+    - crypto_public_coingecko_active_assets_log1p
+    - crypto_public_coingecko_markets_log1p
+    - crypto_public_coingecko_market_available
+    - crypto_public_coingecko_market_cap_log1p
+    - crypto_public_coingecko_fdv_to_market_cap_log
+    - crypto_public_coingecko_volume_to_market_cap_log
+    - crypto_public_coingecko_market_cap_rank_log1p
+    - crypto_public_coingecko_circulating_supply_log1p
+    - crypto_public_coingecko_symbol_match_share
+    - crypto_public_coingecko_asset_available
+    - crypto_public_etf_holdings_value_usd_log1p
+    - crypto_public_etf_holdings_units_log1p
+    - crypto_public_etf_reserve_coverage_log
+    - crypto_public_etf_issuer_available
   feature_exclude: []
   # Sparse public families are zero only together with explicit availability
   # flags; a missing observation is never confused with an observed zero.

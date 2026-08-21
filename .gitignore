@@ -229,3 +229,4 @@ data_tw_index_derivatives_ticks/*
 artifacts_benchmark/*
 .build/
 data_tw_futures/*
+data_fred_crypto_macro/*
