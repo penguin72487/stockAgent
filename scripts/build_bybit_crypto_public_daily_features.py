@@ -9,10 +9,30 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import sys
 
 import numpy as np
 import polars as pl
 import pyarrow.parquet as pq
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from stockagent.data.crypto_public_web import (
+    COINGECKO_ASSET_FEATURES,
+    COINGECKO_MARKET_FEATURES,
+    COINMETRICS_FEATURES,
+    ETF_ISSUER_FEATURES,
+    FRED_FEATURES,
+    SEC_ASSET_FEATURES,
+    SEC_MARKET_FEATURES,
+    coingecko_snapshot_rows,
+    coinmetrics_vintage_rows,
+    etf_issuer_snapshot_rows,
+    fred_macro_rows,
+    sec_etf_filing_rows,
+)
 
 
 BOUNDARY_MINUTES_UTC = 0
@@ -148,6 +168,51 @@ FREE_SNAPSHOT_SERIES = (
     ),
 )
 
+FREE_SUM_SNAPSHOT_SERIES = (
+    (
+        "crypto_public_defi_tvl_log1p",
+        "defillama_chains",
+        "tvl_usd",
+        True,
+    ),
+    (
+        "crypto_public_stablecoin_supply_log1p",
+        "defillama_stablecoins",
+        "circulating",
+        True,
+    ),
+    (
+        "crypto_public_yield_tvl_log1p",
+        "defillama_yields",
+        "tvl_usd",
+        True,
+    ),
+)
+
+FREE_LAST_SNAPSHOT_SERIES = (
+    (
+        "crypto_public_eth_gas_fast_gwei_log1p",
+        "blockscout_ethereum_gas",
+        "gas_price_fast_gwei",
+        True,
+        1.0,
+    ),
+    (
+        "crypto_public_eth_network_utilization",
+        "blockscout_ethereum_gas",
+        "network_utilization_pct",
+        False,
+        0.01,
+    ),
+    (
+        "crypto_public_btc_hashrate_log1p",
+        "bitcoin_hashrate_history",
+        "hashrate",
+        True,
+        1.0,
+    ),
+)
+
 HYPERLIQUID_METRICS = {
     "funding_rate": "crypto_public_hyperliquid_funding_rate",
     "premium": "crypto_public_hyperliquid_premium",
@@ -183,6 +248,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--free-public-path", default="data_free_public/observations.parquet"
     )
+    parser.add_argument(
+        "--fred-macro-path", default="data_fred_crypto_macro/observations.parquet"
+    )
+    parser.add_argument(
+        "--coinmetrics-vintage-dir", default="data_coinmetrics_community/vintages"
+    )
+    parser.add_argument("--crypto-etf-dir", default="data_crypto_etf")
+    parser.add_argument("--crypto-reference-dir", default="data_crypto_reference")
     parser.add_argument(
         "--output-path",
         default="data_bybit/public_features/bybit_crypto_public_daily.parquet",
@@ -922,9 +995,12 @@ def _free_public_rows(
     dates: list[str],
     symbol_bases: dict[str, str],
 ) -> tuple[pl.DataFrame, dict[str, object]]:
-    feature_names = [item[0] for item in FREE_MARKET_SERIES] + [
-        item[0] for item in FREE_SNAPSHOT_SERIES
-    ]
+    feature_names = (
+        [item[0] for item in FREE_MARKET_SERIES]
+        + [item[0] for item in FREE_SNAPSHOT_SERIES]
+        + [item[0] for item in FREE_SUM_SNAPSHOT_SERIES]
+        + [item[0] for item in FREE_LAST_SNAPSHOT_SERIES]
+    )
     market_rows = [
         {
             "date": date,
@@ -950,6 +1026,8 @@ def _free_public_rows(
     selected_datasets = (
         {item[1] for item in FREE_MARKET_SERIES}
         | {item[1] for item in FREE_SNAPSHOT_SERIES}
+        | {item[1] for item in FREE_SUM_SNAPSHOT_SERIES}
+        | {item[1] for item in FREE_LAST_SNAPSHOT_SERIES}
         | {"hyperliquid_perp_context"}
     )
     raw = (
@@ -988,6 +1066,23 @@ def _free_public_rows(
             ).sort("__available")
             if values.height:
                 row[name] = _log1p(values["value_float"][-1], log_value)
+        for name, dataset, metric, log_value in FREE_SUM_SNAPSHOT_SERIES:
+            values = (
+                eligible.filter(
+                    (pl.col("dataset") == dataset) & (pl.col("metric") == metric)
+                )
+                .sort(["entity", "__event", "__available"])
+                .group_by("entity", maintain_order=True)
+                .agg(pl.col("value_float").last())
+            )
+            value = float(values["value_float"].sum()) if values.height else None
+            row[name] = _log1p(value, log_value)
+        for name, dataset, metric, log_value, scale in FREE_LAST_SNAPSHOT_SERIES:
+            values = eligible.filter(
+                (pl.col("dataset") == dataset) & (pl.col("metric") == metric)
+            ).sort(["__event", "__available"])
+            value = float(values["value_float"][-1]) * scale if values.height else None
+            row[name] = _log1p(value, log_value)
         row["crypto_public_market_available"] = 1.0
 
         hyper = eligible.filter(pl.col("dataset") == "hyperliquid_perp_context")
@@ -1045,22 +1140,97 @@ def _source_decisions() -> dict[str, dict[str, object]]:
             "reason": "requires event_ts and first local available_at no later than the decision cutoff",
         },
         "coinmetrics_community": {
-            "decision": "excluded_from_historical_training",
-            "reason": "canonical vintages were first locally observed in August 2026; latest-view history cannot be backprojected",
+            "decision": "included_prospective_vintages_only",
+            "reason": "only canonical retrieval vintages available before each decision are used; latest-view history is never backprojected",
         },
         "crypto_etf": {
-            "decision": "excluded_from_historical_training",
-            "reason": "issuer documents and snapshots require publication/observation-time modeling and do not cover the full product universe",
+            "decision": "included_with_two_clocks",
+            "reason": "SEC filings use acceptance timestamps; issuer holdings and reserves start only at first local available_at",
         },
         "dune_crypto": {
             "decision": "excluded",
-            "reason": "latest receipt is blocked with zero completed due partitions because credits were exhausted",
+            "reason": "retained query results were first available in August 2026 and cannot be backprojected to their historical event dates; latest refresh is credit-blocked",
         },
         "crypto_reference": {
-            "decision": "excluded_from_historical_training",
-            "reason": "current snapshots are prospective observations, not historical point-in-time series",
+            "decision": "included_prospective_snapshots_only",
+            "reason": "CoinGecko snapshots are usable only after their observed available_at and ambiguous ticker matches fail closed",
+        },
+        "fred_macro": {
+            "decision": "included_initial_release_only",
+            "reason": "FRED output_type=4 initial releases are delayed to the next UTC midnight; later revisions are excluded",
         },
     }
+
+
+def _feature_source_contract(feature: str) -> tuple[str, str]:
+    if feature.startswith("crypto_bybit_"):
+        return "bybit_funding", "historical_event_time_aligned"
+    if feature.startswith("crypto_binance_"):
+        return "binance_futures", "historical_completed_bar"
+    if feature.startswith("crypto_okx_"):
+        return "okx_futures", "historical_completed_bar"
+    if feature.startswith("crypto_public_macro_"):
+        return "fred_macro", "historical_initial_release_next_utc_day"
+    if feature.startswith("crypto_public_sec_"):
+        return "sec_edgar", "historical_acceptance_time_with_registry_selection_risk"
+    if feature.startswith("crypto_public_onchain_"):
+        return "coinmetrics_community", "prospective_retrieval_vintage"
+    if feature.startswith("crypto_public_coingecko_"):
+        return "coingecko", "prospective_snapshot"
+    if feature.startswith("crypto_public_etf_"):
+        return "crypto_etf_issuers", "prospective_snapshot_issuer_asserted"
+    return "free_public_web", "prospective_first_observed"
+
+
+def _feature_quality_rows(frame: pl.DataFrame) -> pl.DataFrame:
+    features = sorted(
+        column
+        for column in frame.columns
+        if column.startswith("crypto_")
+        and not column.endswith("source_available_at_utc")
+    )
+    rows: list[dict[str, object]] = []
+    for feature in features:
+        finite = (
+            pl.col(feature).cast(pl.Float64, strict=False).is_finite().fill_null(False)
+        )
+        stats = frame.select(
+            finite.sum().alias("finite_rows"),
+            pl.when(finite)
+            .then(pl.col("date"))
+            .otherwise(None)
+            .min()
+            .alias("first_date"),
+            pl.when(finite)
+            .then(pl.col("date"))
+            .otherwise(None)
+            .max()
+            .alias("last_date"),
+            pl.when(finite)
+            .then(pl.col("symbol"))
+            .otherwise(None)
+            .drop_nulls()
+            .n_unique()
+            .alias("symbols"),
+        ).row(0, named=True)
+        source, contract = _feature_source_contract(feature)
+        finite_rows = int(stats["finite_rows"] or 0)
+        rows.append(
+            {
+                "feature": feature,
+                "source_family": source,
+                "point_in_time_contract": contract,
+                "finite_rows": finite_rows,
+                "finite_fraction": finite_rows / max(1, frame.height),
+                "symbols": int(stats["symbols"] or 0),
+                "first_date": stats["first_date"],
+                "last_date": stats["last_date"],
+                "status": "covered"
+                if finite_rows
+                else "waiting_no_eligible_observation",
+            }
+        )
+    return pl.from_dicts(rows, infer_schema_length=None)
 
 
 def _input_receipts(
@@ -1078,6 +1248,9 @@ def _input_receipts(
         "crypto_etf_summary": Path("data_crypto_etf/download_summary.json"),
         "dune_crypto_summary": Path("data_dune_crypto/download_summary.json"),
         "crypto_reference_summary": Path("data_crypto_reference/download_summary.json"),
+        "fred_crypto_macro_summary": Path(
+            "data_fred_crypto_macro/download_summary.json"
+        ),
     }
     return {
         name: {
@@ -1189,6 +1362,43 @@ def main() -> None:
     )
     if free_frame.height:
         frames.append(free_frame)
+    source_receipts: dict[str, dict[str, object]] = {"free_public": free_receipt}
+    web_builders = (
+        (
+            "fred_macro",
+            fred_macro_rows,
+            (Path(args.fred_macro_path), sorted(all_dates)),
+        ),
+        (
+            "sec_etf_filings",
+            sec_etf_filing_rows,
+            (
+                Path(args.crypto_etf_dir) / "normalized" / "sec",
+                sorted(all_dates),
+                symbol_bases,
+            ),
+        ),
+        (
+            "coinmetrics_vintages",
+            coinmetrics_vintage_rows,
+            (Path(args.coinmetrics_vintage_dir), sorted(all_dates), symbol_bases),
+        ),
+        (
+            "coingecko_snapshots",
+            coingecko_snapshot_rows,
+            (Path(args.crypto_reference_dir), sorted(all_dates), symbol_bases),
+        ),
+        (
+            "etf_issuer_snapshots",
+            etf_issuer_snapshot_rows,
+            (Path(args.crypto_etf_dir), sorted(all_dates), symbol_bases),
+        ),
+    )
+    for source_name, builder, builder_args in web_builders:
+        frame, receipt = builder(*builder_args)
+        source_receipts[source_name] = receipt
+        if frame.height:
+            frames.append(frame)
     if not frames:
         raise RuntimeError("no causal public feature rows materialized")
     output = (
@@ -1197,7 +1407,22 @@ def main() -> None:
         .agg(pl.exclude("date", "symbol").drop_nulls().last())
         .sort(["date", "symbol"])
     )
+    numeric_columns = [
+        name for name, dtype in output.schema.items() if dtype.is_numeric()
+    ]
+    output = output.with_columns(
+        *[
+            pl.when(pl.col(name).is_finite())
+            .then(pl.col(name))
+            .otherwise(None)
+            .alias(name)
+            for name in numeric_columns
+        ]
+    )
     _write_parquet_atomic(output, output_path)
+    quality_path = output_path.with_name(f"{output_path.stem}_quality.csv")
+    quality = _feature_quality_rows(output)
+    _write_text_atomic(quality.write_csv(), quality_path)
     coverage_path = output_path.with_name(f"{output_path.stem}_coverage.csv")
     _write_text_atomic(
         pl.DataFrame(
@@ -1207,13 +1432,14 @@ def main() -> None:
     )
     failed = [item for item in coverage if item.status == "failed"]
     summary = {
-        "contract_version": 4,
+        "contract_version": 5,
         "decision_boundary_utc": "00:00",
         "execution_boundary_utc": "00:05",
         "decision_to_execution_lag_minutes": 5,
         "okx_bar_availability": "bar_open_plus_inferred_interval_le_decision_cutoff",
         "free_public_availability": "available_at_utc_le_decision_cutoff",
         "historical_event_backprojection": False,
+        "non_finite_output_policy": "normalize_nan_and_inf_to_null_before_write",
         "requested_symbols": len(instruments),
         "okx_mapped_symbols": sum(item.okx_status == "mapped" for item in coverage),
         "binance_bar_availability": "bar_open_plus_inferred_interval_le_decision_cutoff",
@@ -1237,7 +1463,19 @@ def main() -> None:
         "output_columns": output.columns,
         "output_path": str(output_path),
         "output_sha256": _sha256(output_path),
-        "free_public": free_receipt,
+        "quality_path": str(quality_path),
+        "quality_sha256": _sha256(quality_path),
+        "quality_feature_status_counts": quality["status"].value_counts().to_dicts(),
+        "public_web_sources": source_receipts,
+        "public_web_feature_families": {
+            "fred_macro": list(FRED_FEATURES),
+            "sec_market": list(SEC_MARKET_FEATURES),
+            "sec_asset": list(SEC_ASSET_FEATURES),
+            "coinmetrics_onchain": list(COINMETRICS_FEATURES),
+            "coingecko_market": list(COINGECKO_MARKET_FEATURES),
+            "coingecko_asset": list(COINGECKO_ASSET_FEATURES),
+            "etf_issuer": list(ETF_ISSUER_FEATURES),
+        },
         "source_decisions": _source_decisions(),
         "input_receipts": _input_receipts(bybit_dir, binance_dir, okx_dir),
         "started_at_utc": started.isoformat(),

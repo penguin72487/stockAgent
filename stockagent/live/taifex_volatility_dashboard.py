@@ -1300,6 +1300,8 @@ def build_dashboard_snapshot(
                 "exit_rule": spec.exit_rule if spec else "",
                 "risk_note": spec.risk_note if spec else "",
                 "broker_monitoring": (spec.broker_monitoring if spec else "unknown"),
+                "hedge_policy": spec.hedge_policy if spec else "none",
+                "hedge_parameter": spec.hedge_parameter if spec else None,
                 **(spec.exposure_payload() if spec else {}),
                 "entry_state": mark.get("entry_state", ledger.get("entry_state")),
                 "option_position_count": len(mark.get("option_positions") or {}),
@@ -1368,6 +1370,24 @@ def build_dashboard_snapshot(
                 "fixed_fees_twd": float(mark.get("fixed_fees_twd", 0.0)),
                 "transaction_tax_twd": float(mark.get("transaction_tax_twd", 0.0)),
                 "futures_position": int(mark.get("futures_position", 0)),
+                "last_dynamic_hedge_cycle_id": mark.get(
+                    "last_dynamic_hedge_cycle_id",
+                    ledger.get("last_dynamic_hedge_cycle_id"),
+                ),
+                "last_dynamic_hedge_session_id": mark.get(
+                    "last_dynamic_hedge_session_id",
+                    ledger.get("last_dynamic_hedge_session_id"),
+                ),
+                "last_dynamic_hedge_decision_ts_ns": mark.get(
+                    "last_dynamic_hedge_decision_ts_ns",
+                    ledger.get("last_dynamic_hedge_decision_ts_ns"),
+                ),
+                "last_dynamic_hedge_forward_mid": _optional_float(
+                    mark.get(
+                        "last_dynamic_hedge_forward_mid",
+                        ledger.get("last_dynamic_hedge_forward_mid"),
+                    )
+                ),
                 "underlying_futures_position": int(
                     mark.get(
                         "underlying_futures_position",
