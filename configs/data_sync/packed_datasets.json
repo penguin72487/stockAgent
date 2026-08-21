@@ -3,7 +3,7 @@
   "datasets": [
     {
       "dataset": "tw-public",
-      "source": "data_tw_public",
+      "source": "/srv/stockagent-live/data_tw_public",
       "role": "training-and-audit",
       "publish": true,
       "pack_buckets": 64,

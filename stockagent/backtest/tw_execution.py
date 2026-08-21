@@ -24,6 +24,7 @@ from stockagent.data.tw_security import classify_tw_stock_or_etf
 
 EXECUTION_MODES: Final[tuple[str, ...]] = (
     "naive",
+    "crypto_perpetual",
     "tw_cash",
     "tw_day_trade",
     "tw_minute",
@@ -53,12 +54,17 @@ TW_DERIVATIVES_TICK_EXECUTION_MODES: Final[tuple[str, ...]] = (
 TW_FUTURES_PORTFOLIO_EXECUTION_MODES: Final[tuple[str, ...]] = (
     "tw_futures_portfolio_day",
 )
+CRYPTO_PERPETUAL_EXECUTION_MODES: Final[tuple[str, ...]] = (
+    "crypto_perpetual",
+)
 # These modes use the shared continuous target-weight portfolio ledger as
-# their canonical research accounting.  The TAIFEX portfolio mode deliberately
-# remains notional until a complete point-in-time multiplier/margin/fee master
-# exists for every listed product.
+# their canonical research accounting.  Crypto requires a separate funding
+# cash-flow path; the TAIFEX portfolio mode deliberately remains notional until
+# a complete point-in-time multiplier/margin/fee master exists for every listed
+# product.
 CONTINUOUS_WEIGHT_EXECUTION_MODES: Final[tuple[str, ...]] = (
     "naive",
+    *CRYPTO_PERPETUAL_EXECUTION_MODES,
     *TW_FUTURES_PORTFOLIO_EXECUTION_MODES,
 )
 FEE_ROUNDING_MODES: Final[tuple[str, ...]] = ("none", "floor", "half_up")
@@ -81,6 +87,13 @@ _EXECUTION_MODE_ALIASES: Final[dict[str, str]] = {
     "legacy": "naive",
     "legacy_naive": "naive",
     "default": "naive",
+    # Daily target-weight linear perpetuals with carried positions and explicit
+    # funding cash flows.  This is distinct from ``naive``, whose asset return
+    # and risky-weight drift cannot separate price PnL from funding settlement.
+    "crypto_perpetual": "crypto_perpetual",
+    "crypto_perp": "crypto_perpetual",
+    "bybit_perpetual": "crypto_perpetual",
+    "bybit_perp": "crypto_perpetual",
     # Taiwan cash-market execution.
     "tw_cash": "tw_cash",
     "taiwan_cash": "tw_cash",
@@ -168,7 +181,8 @@ def normalize_execution_mode(mode: object) -> str:
     if not isinstance(mode, str):
         raise ValueError(
             "execution_mode must be one of "
-            "'naive', 'tw_cash', 'tw_day_trade', 'tw_minute', 'tw_overnight', or "
+            "'naive', 'crypto_perpetual', 'tw_cash', 'tw_day_trade', "
+            "'tw_minute', 'tw_overnight', or "
             "'tw_futures_portfolio_day', 'tw_index_futures_day', 'tw_index_derivatives_day', "
             "'tw_index_derivatives_tick', "
             "'tw_index_options_tick_long', or 'tw_index_options_tick_short'"
@@ -178,7 +192,8 @@ def normalize_execution_mode(mode: object) -> str:
     if canonical is None:
         raise ValueError(
             "execution_mode must be one of "
-            "'naive', 'tw_cash', 'tw_day_trade', 'tw_minute', 'tw_overnight', or "
+            "'naive', 'crypto_perpetual', 'tw_cash', 'tw_day_trade', "
+            "'tw_minute', 'tw_overnight', or "
             "'tw_futures_portfolio_day', 'tw_index_futures_day', 'tw_index_derivatives_day', "
             "'tw_index_derivatives_tick', "
             "'tw_index_options_tick_long', or 'tw_index_options_tick_short'"
@@ -791,6 +806,7 @@ __all__ = [
     "DEFAULT_TAIWAN_MARGIN_SHORT_SCHEDULE",
     "EXECUTION_MODES",
     "CONTINUOUS_WEIGHT_EXECUTION_MODES",
+    "CRYPTO_PERPETUAL_EXECUTION_MODES",
     "TW_CARRYING_EXECUTION_MODES",
     "TW_DERIVATIVES_TICK_EXECUTION_MODES",
     "TW_MINUTE_EXECUTION_MODES",

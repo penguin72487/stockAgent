@@ -34,6 +34,7 @@ from services.discord_bot.bot import (
     _latest_signal_message,
     _market_notice,
     _market_artifact_backfill_time,
+    _opening_critical_work_pending,
     _market_has_live_signal_for_date,
     _market_has_generated_signal_for_session,
     _day_trade_schedule_state,
@@ -350,6 +351,42 @@ def test_artifact_backfill_key_uses_backfill_time_and_skips_interval_markets(mon
     )
     assert _artifact_backfill_key(daily_cfg, now.replace(hour=17, minute=59)) is None
     assert _artifact_backfill_key(interval_cfg, now) is None
+
+
+def test_artifact_backfill_defers_for_opening_critical_day_trade(monkeypatch) -> None:
+    cfg = SimpleNamespace(
+        market="tw_day_trade",
+        timezone="Asia/Taipei",
+        preopen_prepare_time="08:15",
+        open_time="09:00",
+        day_trade_simulation_enabled=True,
+    )
+    monkeypatch.setattr(
+        "services.discord_bot.bot._market_configs", lambda: {cfg.market: cfg}
+    )
+    monkeypatch.setattr(
+        "services.discord_bot.bot._scheduled_market_session_day",
+        lambda _cfg, _now: (True, "fixture session"),
+    )
+    monkeypatch.setattr(
+        "services.discord_bot.bot._day_trade_schedule_state",
+        lambda _cfg, _date: "retry",
+    )
+
+    assert _opening_critical_work_pending(
+        datetime(2026, 7, 6, 8, 15, tzinfo=ZoneInfo("Asia/Taipei"))
+    )
+    assert _opening_critical_work_pending(
+        datetime(2026, 7, 6, 9, 20, tzinfo=ZoneInfo("Asia/Taipei"))
+    )
+
+    monkeypatch.setattr(
+        "services.discord_bot.bot._day_trade_schedule_state",
+        lambda _cfg, _date: "completed",
+    )
+    assert not _opening_critical_work_pending(
+        datetime(2026, 7, 6, 9, 20, tzinfo=ZoneInfo("Asia/Taipei"))
+    )
 
 
 def test_preopen_prepare_key_catches_up_missing_day_trade_readiness(

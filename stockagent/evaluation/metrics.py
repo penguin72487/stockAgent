@@ -79,7 +79,11 @@ def compute_ic_series_torch(
     return ic.float()
 
 
-def ic_summary(ic_series: np.ndarray) -> dict[str, float]:
+def ic_summary(
+    ic_series: np.ndarray,
+    *,
+    periods_per_year: float = 252.0,
+) -> dict[str, float]:
     clean = ic_series[np.isfinite(ic_series)]
     if clean.size == 0:
         return {"ic_mean": 0.0, "ic_std": 0.0, "ic_ir": 0.0, "ic_positive_ratio": 0.0}
@@ -88,7 +92,7 @@ def ic_summary(ic_series: np.ndarray) -> dict[str, float]:
     return {
         "ic_mean": mean,
         "ic_std": std,
-        "ic_ir": float(mean / std * math.sqrt(252.0)),
+        "ic_ir": float(mean / std * math.sqrt(max(float(periods_per_year), 1.0e-12))),
         "ic_positive_ratio": float((clean > 0).mean()),
     }
 

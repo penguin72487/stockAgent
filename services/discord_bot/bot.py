@@ -1016,6 +1016,38 @@ def _artifact_backfill_key(cfg: LiveMarketConfig, now: datetime) -> str | None:
     return f"{target_date}:{cfg.market}:artifact_backfill"
 
 
+def _opening_critical_work_pending(observed: datetime | None = None) -> bool:
+    """Keep non-opening history jobs off the critical preopen/signal path."""
+
+    for cfg in _market_configs().values():
+        if not bool(getattr(cfg, "day_trade_simulation_enabled", False)):
+            continue
+        tz = ZoneInfo(cfg.timezone or bot.tz.key)
+        now = observed.astimezone(tz) if observed is not None else datetime.now(tz)
+        session_open, _session_reason = _scheduled_market_session_day(cfg, now)
+        if not session_open:
+            continue
+        prepare_minutes = _hhmm_minutes(
+            getattr(cfg, "preopen_prepare_time", None) or "08:15"
+        )
+        open_minutes = _hhmm_minutes(getattr(cfg, "open_time", None) or "09:00")
+        now_minutes = now.hour * 60 + now.minute
+        if prepare_minutes is None or open_minutes is None:
+            continue
+        # Reserve the entire final preopen window and the first five minutes,
+        # even if readiness completed early.  This preserves hot model/data
+        # caches and prevents formal-history inference from racing 09:00.
+        if prepare_minutes <= now_minutes < open_minutes + 5:
+            return True
+        exit_minutes = EXIT_LIMIT_TIME.hour * 60 + EXIT_LIMIT_TIME.minute
+        if (
+            open_minutes + 5 <= now_minutes < exit_minutes
+            and _day_trade_schedule_state(cfg, now.date().isoformat()) == "retry"
+        ):
+            return True
+    return False
+
+
 def _scheduled_retry_delay_seconds() -> int:
     return max(1, _env_int("STOCKAGENT_SCHEDULED_RETRY_DELAY_SECONDS", 60) or 60)
 
@@ -7208,6 +7240,12 @@ async def daily_summary() -> None:
 
 @tasks.loop(minutes=1)
 async def artifact_backfill() -> None:
+    if _opening_critical_work_pending():
+        print(
+            "[artifact-backfill] deferred: opening-critical day-trade work pending",
+            flush=True,
+        )
+        return
     channel = None
     if bot.channel_id is not None and _public_broadcasts_enabled():
         try:

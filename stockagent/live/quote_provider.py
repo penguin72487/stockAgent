@@ -1090,6 +1090,8 @@ def fetch_tw_mis_last_prices(
     *,
     parquet_root: str | Path,
     chunk_size: int = 80,
+    empty_chunk_retry_attempts: int | None = None,
+    empty_chunk_retry_delay_seconds: float | None = None,
 ) -> PriceSnapshot:
     """Fetch Taiwan intraday prices from TWSE MIS and align them to panel symbols."""
     yahoo_map = load_symbol_yahoo_map(parquet_root)
@@ -1125,11 +1127,17 @@ def fetch_tw_mis_last_prices(
     workers = max(1, min(len(chunks) or 1, max_parallel))
     retry_attempts = max(
         0,
-        int(os.getenv("STOCKAGENT_TW_MIS_RETRY_ATTEMPTS", "3") or "3"),
+        int(empty_chunk_retry_attempts)
+        if empty_chunk_retry_attempts is not None
+        else int(os.getenv("STOCKAGENT_TW_MIS_RETRY_ATTEMPTS", "3") or "3"),
     )
     retry_delay_seconds = max(
         0.0,
-        float(os.getenv("STOCKAGENT_TW_MIS_RETRY_DELAY_SECONDS", "0.35") or "0.35"),
+        float(empty_chunk_retry_delay_seconds)
+        if empty_chunk_retry_delay_seconds is not None
+        else float(
+            os.getenv("STOCKAGENT_TW_MIS_RETRY_DELAY_SECONDS", "0.35") or "0.35"
+        ),
     )
     session_local = threading.local()
 

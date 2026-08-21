@@ -1,14 +1,15 @@
 """Lease-based hot cache for immutable packed dataset releases.
 
 The packed Syncthing tree is the durable cold copy.  Materialized trees are
-verified, replaceable caches: ``use`` renews a lease and ``gc`` removes only
-expired, manifest-backed trees that are not pinned or referenced by a running
-process.
+verified, replaceable caches: ``use`` renews a lease, while periodic ``gc``
+automatically renews leases referenced by a running process and removes only
+expired, manifest-backed trees that are not pinned or in use.
 """
 
 from __future__ import annotations
 
 import json
+import math
 import os
 import shutil
 import time
@@ -105,6 +106,35 @@ def _ready_matches(
     )
 
 
+def _equivalent_ready_snapshot(
+    sync_root: Path,
+    materialized_root: Path,
+    resolved: ResolvedSnapshot,
+) -> ResolvedSnapshot | None:
+    """Find a fully verified local tree with the same immutable inventory."""
+
+    dataset = validate_slug(str(resolved.manifest["dataset"]), "dataset")
+    inventory_sha256 = str(
+        resolved.manifest["archive"]["inventory"]["sha256"]
+    )
+    dataset_root = materialized_root / dataset
+    for ready_path in sorted(dataset_root.glob(".*.READY.json"), reverse=True):
+        try:
+            ready = _read_json(ready_path)
+            if ready.get("inventory_sha256") != inventory_sha256:
+                continue
+            candidate = resolve_packed_snapshot_id(
+                sync_root,
+                dataset,
+                str(ready.get("snapshot_id") or ""),
+            )
+        except (OSError, SnapshotError, ValueError):
+            continue
+        if _ready_matches(materialized_root, candidate):
+            return candidate
+    return None
+
+
 def _atomic_symlink(link: Path, target: Path) -> None:
     link = _absolute_link_path(link)
     target = target.resolve()
@@ -122,6 +152,34 @@ def _atomic_symlink(link: Path, target: Path) -> None:
 def _link_points_to(link: Path, target: Path) -> bool:
     if not link.is_symlink():
         return False
+
+
+def _quarantine_corrupt_materialization(
+    materialized_root: Path,
+    dataset: str,
+    snapshot_id: str,
+) -> dict[str, str]:
+    """Atomically isolate a corrupt hot cache before reconstructing it."""
+
+    target = _target_path(materialized_root, dataset, snapshot_id)
+    ready = _ready_path(materialized_root, dataset, snapshot_id)
+    quarantine = (
+        _state_root(materialized_root)
+        / "quarantine"
+        / dataset
+        / f"{snapshot_id}.{time.time_ns()}.{uuid.uuid4().hex}"
+    )
+    quarantine.mkdir(parents=True, exist_ok=False)
+    result: dict[str, str] = {"quarantine_root": str(quarantine)}
+    if target.exists():
+        destination = quarantine / "tree"
+        os.replace(target, destination)
+        result["tree"] = str(destination)
+    if ready.exists():
+        destination = quarantine / "READY.json"
+        os.replace(ready, destination)
+        result["ready"] = str(destination)
+    return result
     try:
         return link.resolve(strict=False) == target.resolve(strict=False)
     except OSError:
@@ -141,7 +199,7 @@ def use_materialized_snapshot(
 ) -> dict[str, Any]:
     """Materialize a packed release and renew its local hot-cache lease."""
 
-    if ttl_days <= 0:
+    if not math.isfinite(ttl_days) or ttl_days <= 0:
         raise SnapshotError("cache ttl_days must be positive")
     sync_root = sync_root.resolve()
     materialized_root = materialized_root.resolve()
@@ -149,11 +207,20 @@ def use_materialized_snapshot(
         raise SnapshotError("materialized root must be outside the packed sync root")
     dataset = validate_slug(dataset, "dataset")
     current_ns = time.time_ns() if now_ns is None else int(now_ns)
+    requested_snapshot_id = snapshot_id
     resolved = (
         resolve_packed_snapshot_id(sync_root, dataset, snapshot_id)
         if snapshot_id
         else resolve_latest_packed(sync_root, dataset, now_ns=current_ns)
     )
+    if requested_snapshot_id is None and not _ready_matches(
+        materialized_root, resolved
+    ):
+        equivalent = _equivalent_ready_snapshot(
+            sync_root, materialized_root, resolved
+        )
+        if equivalent is not None:
+            resolved = equivalent
     snapshot_id = validate_slug(
         str(resolved.manifest["snapshot_id"]), "snapshot_id"
     )
@@ -163,10 +230,19 @@ def use_materialized_snapshot(
 
     with _exclusive_lock(_lock_path(materialized_root, dataset)):
         ready_reused = _ready_matches(materialized_root, resolved)
+        recovered_corruption: dict[str, str] | None = None
         if verify_existing and ready_reused:
-            verify_packed_snapshot(
-                sync_root, resolved, materialized_path=target
-            )
+            try:
+                verify_packed_snapshot(
+                    sync_root, resolved, materialized_path=target
+                )
+            except SnapshotError:
+                recovered_corruption = _quarantine_corrupt_materialization(
+                    materialized_root, dataset, snapshot_id
+                )
+                target = fetch_packed_snapshot(
+                    sync_root, materialized_root, resolved
+                )
             verification = "full"
         elif ready_reused:
             verification = "ready-marker"
@@ -200,6 +276,7 @@ def use_materialized_snapshot(
             "dataset": dataset,
             "snapshot_id": snapshot_id,
             "manifest_sha256": resolved.manifest_sha256,
+            "inventory_sha256": resolved.manifest["archive"]["inventory"]["sha256"],
             "sync_root": str(sync_root),
             "materialized_root": str(materialized_root),
             "target": str(target),
@@ -218,6 +295,8 @@ def use_materialized_snapshot(
             ),
             "verification": verification,
         }
+        if recovered_corruption is not None:
+            lease["recovered_corrupt_materialization"] = recovered_corruption
         atomic_write_json(lease_path, lease)
         return lease
 
@@ -338,6 +417,59 @@ def _unlink_registered_links(lease: Mapping[str, Any], target: Path) -> list[str
     return removed
 
 
+def _auto_renew_active_lease(
+    lease_path: Path,
+    lease: dict[str, Any],
+    *,
+    now_ns: int,
+    dry_run: bool,
+    references: list[str],
+) -> dict[str, Any]:
+    """Extend a managed hot lease after observing a live process reference."""
+
+    try:
+        ttl_days = float(lease.get("ttl_days", DEFAULT_CACHE_TTL_DAYS))
+    except (TypeError, ValueError):
+        ttl_days = 0.0
+    if not math.isfinite(ttl_days) or ttl_days <= 0:
+        return {
+            "action": "keep",
+            "reason": "in-use-invalid-lease-ttl",
+            "process_references": references,
+        }
+
+    previous_expires_ns = int(lease.get("expires_ns", 0))
+    renewed_expires_ns = max(
+        previous_expires_ns,
+        now_ns + int(ttl_days * 86_400 * 1_000_000_000),
+    )
+    result: dict[str, Any] = {
+        "action": "would-renew" if dry_run else "renewed",
+        "reason": "in-use-auto-renewed",
+        "process_references": references,
+        "previous_expires_at": lease.get("expires_at"),
+        "expires_at": _utc_iso_from_ns(renewed_expires_ns),
+    }
+    if dry_run:
+        return result
+
+    lease.update(
+        {
+            "state": "hot",
+            "last_used_ns": now_ns,
+            "last_used_at": _utc_iso_from_ns(now_ns),
+            "expires_ns": renewed_expires_ns,
+            "expires_at": _utc_iso_from_ns(renewed_expires_ns),
+            "auto_renewed_ns": now_ns,
+            "auto_renewed_at": _utc_iso_from_ns(now_ns),
+            "auto_renewal_count": int(lease.get("auto_renewal_count", 0)) + 1,
+            "auto_renewal_evidence": references,
+        }
+    )
+    atomic_write_json(lease_path, lease)
+    return result
+
+
 def _evict_one(
     sync_root: Path,
     materialized_root: Path,
@@ -360,8 +492,6 @@ def _evict_one(
         "reason": "lease-active",
         "expires_at": lease.get("expires_at"),
     }
-    if not force and int(lease.get("expires_ns", 0)) > now_ns:
-        return result
     if snapshot_id in pinned:
         result["reason"] = "pinned"
         return result
@@ -409,8 +539,21 @@ def _evict_one(
         return result
     references = process_references(target)
     if references:
-        result["reason"] = "in-use"
-        result["process_references"] = references
+        if not force:
+            result.update(
+                _auto_renew_active_lease(
+                    lease_path,
+                    lease,
+                    now_ns=now_ns,
+                    dry_run=dry_run,
+                    references=references,
+                )
+            )
+        else:
+            result["reason"] = "in-use"
+            result["process_references"] = references
+        return result
+    if not force and int(lease.get("expires_ns", 0)) > now_ns:
         return result
     result["action"] = "would-evict" if dry_run else "evicted"
     result["reason"] = "forced" if force else "lease-expired"
@@ -492,6 +635,10 @@ def evict_materialized_snapshots(
         "checked": len(results),
         "evicted": sum(item["action"] == "evicted" for item in results),
         "would_evict": sum(item["action"] == "would-evict" for item in results),
+        "renewed": sum(item["action"] == "renewed" for item in results),
+        "would_renew": sum(
+            item["action"] == "would-renew" for item in results
+        ),
         "kept": sum(item["action"] == "keep" for item in results),
         "results": results,
     }

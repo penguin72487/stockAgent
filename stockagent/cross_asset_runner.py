@@ -15,7 +15,11 @@ import numpy as np
 import torch
 from tqdm.auto import tqdm
 
-from stockagent.config import ExperimentConfig, load_config
+from stockagent.config import (
+    ExperimentConfig,
+    external_panel_data_kwargs,
+    load_config,
+)
 from stockagent.data.panel import PanelData, build_panel
 from stockagent.data.walkforward import WalkForwardFold, build_expanding_year_folds
 from stockagent.explainability import (
@@ -83,15 +87,7 @@ def _build_panel(config: ExperimentConfig) -> PanelData:
         strict_no_fallback=config.training.strict_no_fallback,
         panel_backend=config.data.panel_backend,
         panel_load_workers=config.data.panel_load_workers,
-        external_feature_path=(
-            config.data.tw_public_feature_path
-            if config.data.use_tw_public_features or config.data.use_tw_public_rules
-            else None
-        ),
-        external_market_symbol=config.data.tw_public_market_symbol,
-        external_include_features=config.data.use_tw_public_features,
-        external_include_rules=config.data.use_tw_public_rules,
-        external_data_required=(config.data.use_tw_public_features or config.data.use_tw_public_rules),
+        **external_panel_data_kwargs(config.data),
         feature_include=config.data.feature_include,
         feature_exclude=config.data.feature_exclude,
         feature_zero_fill=config.data.feature_zero_fill,

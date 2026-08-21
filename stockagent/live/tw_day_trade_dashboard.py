@@ -1767,7 +1767,7 @@ def _session_progress(
     def at(hour: int, minute: int) -> datetime:
         return datetime.combine(day, datetime_time(hour, minute), tzinfo=TAIPEI)
 
-    preopen_at = at(8, 30)
+    preopen_at = at(8, 15)
     signal_at = at(9, 0)
     exit_limit_at = at(13, 20)
     force_exit_at = at(13, 24)
@@ -1775,7 +1775,7 @@ def _session_progress(
     session_end_at = at(13, 30)
     if local < preopen_at:
         phase = "waiting_prewarm"
-        label = "等待 08:30 預熱"
+        label = "等待 08:15 預熱"
         phase_start, phase_end = at(0, 0), preopen_at
         next_label, next_at = "開始預熱", preopen_at
     elif local < signal_at:

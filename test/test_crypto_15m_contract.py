@@ -152,6 +152,21 @@ def test_crypto_downloaders_accept_incremental_1m_mode(monkeypatch) -> None:
     assert bybit_args.mode == "incremental"
     assert bybit_args.tail_only is True
 
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "download_bybit_perp_daily.py",
+            "--categories",
+            "linear",
+            "--symbols",
+            "BTCUSDT",
+            "ETHUSDT",
+        ],
+    )
+    bybit_symbol_args = bybit.parse_args()
+    assert bybit_symbol_args.symbols == ["BTCUSDT", "ETHUSDT"]
+
 
 @pytest.mark.parametrize("module", [okx, bybit])
 def test_crypto_existing_info_uses_parquet_footer_without_date_scan(
