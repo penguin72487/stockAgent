@@ -620,6 +620,8 @@ class _ExecutionRuntime:
     sell_fee_rates: torch.Tensor | None
     lot_sizes: np.ndarray | None
     settlement_lag_sessions: int
+    crypto_stateful_proximal_allocator: bool = False
+    crypto_proximal_cost_multiplier: float = 1.0
     normal_sell_fee_rates: torch.Tensor | None = None
     day_trade_unlimited_margin_conversion: bool = False
     day_trade_margin_financing_ratio: float = 0.60
@@ -674,6 +676,14 @@ def _build_execution_runtime(
             ),
             lot_sizes=None,
             settlement_lag_sessions=lag,
+            crypto_stateful_proximal_allocator=(
+                bool(config.trading.crypto_stateful_proximal_allocator)
+                if mode == "crypto_perpetual"
+                else False
+            ),
+            crypto_proximal_cost_multiplier=float(
+                config.trading.crypto_proximal_cost_multiplier
+            ),
         )
     if mode in {"tw_index_futures_day", "tw_index_derivatives_day"}:
         market = getattr(panel, "index_futures_day_session", None)
@@ -2427,6 +2437,12 @@ def _evaluated_backtest_loss(
         buy_fee_rate=config.trading.buy_fee_rate,
         sell_fee_rate=config.trading.sell_fee_rate,
         max_turnover_ratio=config.trading.max_turnover_ratio,
+        crypto_stateful_proximal_allocator=(
+            config.trading.crypto_stateful_proximal_allocator
+        ),
+        crypto_proximal_cost_multiplier=(
+            config.trading.crypto_proximal_cost_multiplier
+        ),
         gross_leverage=1.0,
         min_trade_weight=config.trading.min_trade_weight,
         portfolio_activation=config.trading.portfolio_activation,
@@ -2446,6 +2462,9 @@ def _evaluated_backtest_loss(
         gamma_drawdown_budget=config.evaluation.gamma_drawdown_budget,
         gamma_turnover_budget=config.evaluation.gamma_turnover_budget,
         objective=objective,
+        log_utility_periods_per_year=(
+            config.evaluation.eval_log_utility_periods_per_year
+        ),
     )
 
 
@@ -9086,12 +9105,14 @@ def _deployment_test_prefix_rows(
 ) -> int:
     """Return the stitched-deployment prefix length inside a full test split.
 
-    The deployment interval and the full fold test interval have the same
-    starting row.  Therefore, after applying the same in-split lookback and
-    executable-row filters, deployment rows must be an exact prefix of the
-    full test rows.  Keeping this as an asserted invariant lets final
-    evaluation run once over the full horizon and derive the non-overlapping
-    deployment artifact without a second model/backtest pass.
+    ``full_valid_indices`` is the authoritative row set selected by
+    ``CrossSectionalDataset``.  The deployment interval only assigns ownership
+    within that evaluated set; it must not reimplement mode-specific dataset
+    filtering (for example, crypto's unfinished trailing-period removal).
+    Because deployment ownership starts with the full test interval, the owned
+    rows must be an exact prefix.  This lets final evaluation run once over the
+    full horizon and derive the non-overlapping deployment artifact without a
+    second model/backtest pass.
     """
     deployment_indices = _deployment_test_indices(
         panel,
@@ -9101,18 +9122,12 @@ def _deployment_test_prefix_rows(
         execution_mode,
         lookback_context,
     )
-    deployment_valid = _split_valid_indices(
-        panel,
-        deployment_indices,
-        lookback,
-        execution_mode,
-        lookback_context,
-    )
     full_valid = np.asarray(full_valid_indices, dtype=np.int64)
-    deployment_rows = int(deployment_valid.size)
-    if deployment_rows > int(full_valid.size) or not np.array_equal(
-        deployment_valid,
-        full_valid[:deployment_rows],
+    deployment_mask = np.isin(full_valid, deployment_indices)
+    deployment_rows = int(np.count_nonzero(deployment_mask))
+    if not (
+        bool(deployment_mask[:deployment_rows].all())
+        and not bool(deployment_mask[deployment_rows:].any())
     ):
         raise RuntimeError(
             "Stitched deployment rows are not a prefix of the full fold test split: "
@@ -11519,6 +11534,16 @@ def _run_eval_backtest_from_weight_buffers(
                     sell_fee_rate,
                     long_only=long_only,
                     max_turnover_ratio=max_turnover_ratio,
+                    crypto_stateful_proximal_allocator=(
+                        False
+                        if execution_runtime is None
+                        else execution_runtime.crypto_stateful_proximal_allocator
+                    ),
+                    crypto_proximal_cost_multiplier=(
+                        1.0
+                        if execution_runtime is None
+                        else execution_runtime.crypto_proximal_cost_multiplier
+                    ),
                     gross_leverage=gross_leverage,
                     min_trade_weight=min_trade_weight,
                     portfolio_activation=portfolio_activation,
@@ -13413,6 +13438,12 @@ def _replay_taiwan_stitched_deployment(
                 config.trading.sell_fee_rate,
                 long_only=config.trading.long_only,
                 max_turnover_ratio=config.trading.max_turnover_ratio,
+                crypto_stateful_proximal_allocator=(
+                    config.trading.crypto_stateful_proximal_allocator
+                ),
+                crypto_proximal_cost_multiplier=(
+                    config.trading.crypto_proximal_cost_multiplier
+                ),
                 gross_leverage=1.0,
                 min_trade_weight=config.trading.min_trade_weight,
                 portfolio_activation=config.trading.portfolio_activation,
@@ -18752,6 +18783,9 @@ def _run_training_impl(
         else config.trading.volume_participation_equity
     )
     risk_loss_kwargs["net_exposure_weight"] = config.training.multitask_loss.net_exposure_weight
+    risk_loss_kwargs["log_utility_periods_per_year"] = (
+        config.evaluation.eval_log_utility_periods_per_year
+    )
     factor_aug_kwargs = _factor_augmentation_kwargs(config, loss_objective)
     if factor_aug_kwargs and _distributed_is_rank0():
         print(
@@ -18822,6 +18856,12 @@ def _run_training_impl(
             "short_maintenance_ratio": execution_runtime.short_maintenance_ratio,
             "short_handling_fee_rate": execution_runtime.short_handling_fee_rate,
             "claim_queue_sessions": execution_runtime.claim_queue_sessions,
+            "crypto_stateful_proximal_allocator": (
+                execution_runtime.crypto_stateful_proximal_allocator
+            ),
+            "crypto_proximal_cost_multiplier": (
+                execution_runtime.crypto_proximal_cost_multiplier
+            ),
         }
     )
     if config.environment.use_tensor_cores and device.type == "cuda":

@@ -126,7 +126,6 @@ while true; do
     --workers "${SHIOAJI_MINUTE_WORKERS:-5}" \
     --requests-per-second "${SHIOAJI_MINUTE_REQUESTS_PER_SECOND:-10}" \
     --max-traffic-fraction "${SHIOAJI_MINUTE_MAX_TRAFFIC_FRACTION:-0.90}" \
-    --traffic-reserve-mb "${SHIOAJI_MINUTE_TRAFFIC_RESERVE_MB:-25}" \
     --start-date 2020-03-02 \
     --end-date "$BACKFILL_END_DATE"
   download_rc=$?

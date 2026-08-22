@@ -91,7 +91,7 @@
 
     <div id="details" class="section-intro">
       <div><span>04</span><h2>持倉與訊號下鑽</h2></div>
-      <p>篩選只影響比較圖與下方明細，不會改變原始帳本。</p>
+      <p>日期篩選會同步重算上方報酬率、比較曲線與下方明細，不會改變原始帳本。</p>
     </div>
     <section class="controls panel" aria-label="明細篩選">
       <div class="controls-title"><strong>明細篩選</strong><span>模式、股票與狀態</span></div>
@@ -107,7 +107,7 @@
     <section class="grid-two">
       <article class="panel chart-panel">
         <div class="panel-head"><div><h2>每分鐘累積報酬率比較（%）</h2><p>每條線都除以自己的資金基準；即時點使用 bid／ask，歷史回補點使用右標一分鐘最後成交價，無成交分鐘延用上一筆並揭露覆蓋率，絕不線性插值。點選彩色圓點可隱藏或顯示曲線。</p></div><div id="chart-legend" class="legend" role="group" aria-label="曲線顯示開關"></div></div>
-        <div id="equity-time-range" class="time-range-control" role="group" aria-label="權益曲線時間範圍"><span>快速區間</span><button type="button" data-range="1h">1 小時</button><button type="button" data-range="1d">1 天</button><button type="button" data-range="1w">1 週</button><button type="button" data-range="1mo">1 月</button><button type="button" data-range="1q">1 季</button><button type="button" data-range="1y">1 年</button><button type="button" data-range="all">全部</button><div class="date-range-picker" role="group" aria-label="自訂起訖日期"><label for="equity-start-date">起始日<input id="equity-start-date" type="date"></label><span aria-hidden="true">到</span><label for="equity-end-date">終止日<input id="equity-end-date" type="date"></label><button id="clear-equity-dates" class="clear-date-range" type="button">清除日期</button></div></div>
+        <div class="time-range-control" aria-label="權益曲線日期來源"><span>日期範圍跟隨上方「明細篩選」；起始日前最後一筆權益為 0% 基準。</span></div>
         <div id="chart-empty" class="empty hidden">目前尚無分鐘報酬率資料</div>
         <div class="chart-scroll" tabindex="0" aria-label="台股累積報酬曲線，可在窄螢幕水平捲動"><svg id="equity-chart" viewBox="0 0 960 360" role="img" aria-label="每分鐘累積報酬率百分比曲線"></svg></div>
         <p id="equity-range-note" class="time-range-note" aria-live="polite"></p>
@@ -187,6 +187,6 @@
   </main>
   <script src="../dashboard-core.js?v=1" defer></script>
   <script src="../time-axis.js?v=4" defer></script>
-  <script src="app.js?v=38" defer></script>
+  <script src="app.js?v=39" defer></script>
 </body>
 </html>

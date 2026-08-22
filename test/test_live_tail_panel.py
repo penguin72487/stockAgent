@@ -7,6 +7,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from stockagent.data.panel import LOG_RETURN_FEATURE_COLUMNS, build_tail_panel
+from downloader.ohlcv_hot_tail import hot_tail_path
 
 
 def _write_symbol(path, start_price: float) -> None:
@@ -39,6 +40,36 @@ def test_build_tail_panel_reads_only_recent_rows(tmp_path) -> None:
     assert str(panel.dates[0]).startswith("2026-01-01T03:30:00")
     assert str(panel.dates[-1]).startswith("2026-01-01T04:45:00")
     assert np.isfinite(panel.features[-1]).all()
+
+
+def test_build_tail_panel_includes_hot_tail_without_duplicate_timestamp(
+    tmp_path,
+) -> None:
+    source = tmp_path / "AAA_features.parquet"
+    _write_symbol(source, 10.0)
+    tail = hot_tail_path(source)
+    tail.parent.mkdir(parents=True)
+    base = datetime(2026, 1, 1, 0, 0)
+    pq.write_table(
+        pa.table(
+            {
+                "date": [base + timedelta(minutes=15 * 19), base + timedelta(minutes=15 * 20)],
+                "open": [28.9, 29.9],
+                "max": [29.2, 30.2],
+                "min": [28.7, 29.7],
+                "close": [29.5, 30.0],
+                "adjclose": [29.5, 30.0],
+                "Trading_Volume": [1019.0, 1020.0],
+            }
+        ),
+        tail,
+    )
+
+    panel = build_tail_panel(tmp_path, tail_rows=6, panel_load_workers=0)
+
+    assert panel.features.shape[0] == 6
+    assert str(panel.dates[-1]).startswith("2026-01-01T05:00:00")
+    assert panel.close_prices[-1, 0] == 30.0
 
 
 def test_build_tail_panel_filters_return_valuation_with_sparse_symbol_dates(

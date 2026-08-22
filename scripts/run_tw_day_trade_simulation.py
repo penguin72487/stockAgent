@@ -39,7 +39,7 @@ from stockagent.live.quote_provider import (  # noqa: E402
     warm_shioaji_stock_quote_client,
 )
 from stockagent.live.tw_day_trade_simulation import (  # noqa: E402
-    ENTRY_FILL_POLICY_SYNTHETIC_OPEN_TICK,
+    ENTRY_FILL_POLICY_CAUSAL_BOOK,
     CLOSING_AUCTION_TIME,
     FORCE_EXIT_TIME,
     ModeSpec,
@@ -218,8 +218,8 @@ def _mode_specs(
                     fee_schedule=_fee_schedule(experiment),
                     lot_size=int(experiment.trading.tw_day_trade_lot_size),
                     price_limit_offset_ticks=1,
-                    entry_fill_policy=ENTRY_FILL_POLICY_SYNTHETIC_OPEN_TICK,
-                    entry_price_offset_ticks=1,
+                    entry_fill_policy=ENTRY_FILL_POLICY_CAUSAL_BOOK,
+                    entry_price_offset_ticks=0,
                 )
             )
         except Exception as exc:

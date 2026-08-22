@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
-"""Rebuild selected day-trade paper sessions from actual session opens.
+"""Rebuild day-trade paper sessions from historical opening books.
 
-This is an explicitly counterfactual recovery utility.  It never submits a
-broker order. Entries use the official daily open for completed sessions and a
-fresh or retained, provenance-bearing same-session open for the current
-session, with synthetic unbounded paper liquidity. Completed sessions settle
-at the official daily close. Current sessions remain open for the ordinary live
-quote service to mark and manage after the rebuilt ledger is installed.
+This is an explicitly counterfactual, simulation-only recovery utility.  With
+``--allow-adverse-tick-fallback`` it queries each actionable symbol's first
+historical Shioaji level-one quote during the 09:00 minute.  Buys and covers use
+the best ask; sells and shorts use the best bid and consume only that displayed
+depth.  If the required side is unavailable, the row is separately labelled
+and filled at the official session open moved one adverse legal tick.  The
+fallback is never represented as a received book or a broker fill.
 """
 
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 from datetime import date, datetime, time, timedelta
 from functools import lru_cache
 import hashlib
@@ -35,11 +37,16 @@ from downloader.download_tw_public_data import (  # noqa: E402
     _parse_historical_response_content,
 )
 from stockagent.live.tw_day_trade_simulation import (  # noqa: E402
+    ENTRY_FILL_POLICY_CAUSAL_BOOK,
+    ENTRY_FILL_POLICY_CAUSAL_BOOK_ELSE_OPEN_TICK,
     ModeSpec,
     TwDayTradeSimulationEngine,
     load_live_eligibility,
 )
-from stockagent.live.quote_provider import fetch_shioaji_stock_snapshots  # noqa: E402
+from stockagent.live.quote_provider import (  # noqa: E402
+    fetch_shioaji_historical_stock_entry_books,
+    fetch_shioaji_stock_snapshots,
+)
 
 
 TAIPEI = ZoneInfo("Asia/Taipei")
@@ -86,9 +93,25 @@ def _is_weekend(day: date) -> bool:
     return day.weekday() >= 5
 
 
+def _require_received_entry_book(specs: list[ModeSpec]) -> None:
+    causal_markets = sorted(
+        spec.market
+        for spec in specs
+        if spec.entry_fill_policy == ENTRY_FILL_POLICY_CAUSAL_BOOK
+    )
+    if causal_markets:
+        raise RuntimeError(
+            "open-only replay is retired for causal best-quote execution; "
+            "official open data has no received best bid/ask or displayed depth "
+            f"for markets={causal_markets}"
+        )
+
+
 def _latest_valid_signal(
     spec: ModeSpec,
     trading_date: date,
+    *,
+    preferred_signal_id: str | None = None,
 ) -> tuple[datetime, Path, Path, dict[str, Any], list[dict[str, Any]]]:
     ranked: list[tuple[datetime, Path, Path, dict[str, Any]]] = []
     day = trading_date.isoformat()
@@ -101,9 +124,7 @@ def _latest_valid_signal(
         if generated_at.tzinfo is None:
             generated_at = generated_at.replace(tzinfo=TAIPEI)
         generated_at = generated_at.astimezone(TAIPEI)
-        is_counterfactual = bool(
-            summary.get("counterfactual_signal_regeneration")
-        )
+        is_counterfactual = bool(summary.get("counterfactual_signal_regeneration"))
         if is_counterfactual:
             try:
                 replay_effective_at = datetime.fromisoformat(
@@ -120,8 +141,7 @@ def _latest_valid_signal(
                 and bool(summary.get("simulation_only"))
                 and summary.get("production_order_possible") is False
                 and isinstance(provenance, dict)
-                and str(provenance.get("source") or "")
-                == "official_daily_session_open"
+                and str(provenance.get("source") or "") == "official_daily_session_open"
                 and bool(provenance.get("input_path"))
                 and bool(provenance.get("input_sha256"))
             )
@@ -129,20 +149,22 @@ def _latest_valid_signal(
             counterfactual_contract_valid = False
         weights_path = summary_path.with_name("target_weights.parquet")
         if (
-            str(summary.get("market") or "") != str(spec.signal_market or spec.market)
+            (preferred_signal_id and summary.get("signal_id") != preferred_signal_id)
+            or str(summary.get("market") or "")
+            != str(spec.signal_market or spec.market)
             or str(summary.get("execution_mode") or "") != "tw_day_trade"
             or not bool(summary.get("live_session_open_feature_applied"))
             or not (
-                generated_at.date() == trading_date
-                or counterfactual_contract_valid
+                generated_at.date() == trading_date or counterfactual_contract_valid
             )
             or not weights_path.is_file()
         ):
             continue
         ranked.append((generated_at, summary_path, weights_path, summary))
     if not ranked:
+        preferred = f" signal_id={preferred_signal_id!r}" if preferred_signal_id else ""
         raise FileNotFoundError(
-            f"{spec.market}: no open-feature-applied live signal for {day}"
+            f"{spec.market}: no open-feature-applied live signal for {day}{preferred}"
         )
     generated_at, summary_path, weights_path, summary = max(
         ranked, key=lambda item: item[0]
@@ -151,6 +173,71 @@ def _latest_valid_signal(
     if not rows:
         raise ValueError(f"{weights_path} contains no target rows")
     return generated_at, summary_path, weights_path, summary, rows
+
+
+def _source_ledger_signal_ids(
+    source_ledger_dir: Path,
+    *,
+    start_date: date,
+    end_date: date,
+) -> tuple[dict[tuple[str, str], str], dict[str, Any]]:
+    path = source_ledger_dir / "events.jsonl"
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    resolved: dict[tuple[str, str], str] = {}
+    with path.open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            try:
+                row = json.loads(line)
+                recorded_at = datetime.fromisoformat(str(row.get("recorded_at") or ""))
+            except (json.JSONDecodeError, ValueError) as exc:
+                raise ValueError(f"{path}:{line_number}: invalid event row") from exc
+            if row.get("event") != "signal_registered":
+                continue
+            session_date = recorded_at.date()
+            if session_date < start_date or session_date > end_date:
+                continue
+            market = str(row.get("market") or "")
+            signal_id = str(row.get("signal_id") or "")
+            if not market or not signal_id:
+                raise ValueError(f"{path}:{line_number}: signal identity is incomplete")
+            key = (session_date.isoformat(), market)
+            previous = resolved.get(key)
+            if previous is not None and previous != signal_id:
+                raise ValueError(
+                    f"{path}:{line_number}: conflicting source signal ids for {key}"
+                )
+            resolved[key] = signal_id
+    return resolved, {
+        "path": str(path.resolve()),
+        "sha256": _sha256(path),
+        "signal_registrations": len(resolved),
+    }
+
+
+def _load_retained_historical_entry_books(
+    *,
+    historical_book_root: Path,
+    trading_date: date,
+) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+    path = historical_book_root / f"{trading_date.isoformat()}.parquet"
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    frame = pl.read_parquet(path)
+    if "symbol" not in frame.columns:
+        raise ValueError(f"{path} missing symbol column")
+    books = {
+        str(row["symbol"]): row
+        for row in frame.to_dicts()
+        if str(row.get("symbol") or "")
+    }
+    return books, {
+        "source": "retained_historical_entry_book",
+        "source_path": str(path.resolve()),
+        "source_sha256": _sha256(path),
+        "source_rows": frame.height,
+        "additional_shioaji_requests": 0,
+    }
 
 
 def _load_price_limits(path: Path) -> dict[str, dict[str, Any]]:
@@ -215,11 +302,22 @@ def _entry_quotes(
     spec: ModeSpec,
     canonical_open_by_symbol: Mapping[str, float],
     canonical_open_source: str,
+    historical_books: Mapping[str, Mapping[str, Any]] | None = None,
     official_no_trade_symbols: set[str] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+    if spec.entry_fill_policy == ENTRY_FILL_POLICY_CAUSAL_BOOK:
+        raise RuntimeError(
+            "open-only replay has no received best bid/ask or displayed depth; "
+            "refusing to fabricate an execution book for causal_best_quote"
+        )
+    historical_books = historical_books or {}
     quotes: dict[str, dict[str, Any]] = {}
     potential_whole_lot_rows = 0
     official_open_covered_rows = 0
+    exact_best_quote_rows = 0
+    adverse_tick_fallback_rows = 0
+    exact_best_quote_symbols: list[str] = []
+    adverse_tick_fallback_symbols: list[str] = []
     missing_official_open_symbols: list[str] = []
     official_open_mismatches: list[dict[str, Any]] = []
     for row in rows:
@@ -235,10 +333,17 @@ def _entry_quotes(
         except (TypeError, ValueError):
             opening_price = math.nan
         target_weight = abs(float(row.get("target_weight") or 0.0))
+        side = (
+            "long"
+            if float(row.get("target_weight") or 0.0) > 0.0
+            else "short"
+            if float(row.get("target_weight") or 0.0) < 0.0
+            else "flat"
+        )
         potentially_executable = (
-            math.isfinite(recorded_signal_open)
-            and recorded_signal_open > 0.0
-            and target_weight * float(spec.initial_capital_twd) / recorded_signal_open
+            math.isfinite(opening_price)
+            and opening_price > 0.0
+            and target_weight * float(spec.initial_capital_twd) / opening_price
             >= int(spec.lot_size)
         )
         if potentially_executable:
@@ -267,15 +372,51 @@ def _entry_quotes(
             if math.isfinite(opening_price) and opening_price > 0.0
             else None
         )
+        book = historical_books.get(symbol) or {}
+        transaction_price_key = "ask" if side == "long" else "bid"
+        transaction_volume_key = "ask_volume" if side == "long" else "bid_volume"
+        source_quote_at_key = "ask_quote_at" if side == "long" else "bid_quote_at"
+        try:
+            transaction_price = float(book.get(transaction_price_key))
+            transaction_volume = float(book.get(transaction_volume_key))
+        except (TypeError, ValueError):
+            transaction_price = math.nan
+            transaction_volume = math.nan
+        has_required_best_quote = bool(
+            potentially_executable
+            and math.isfinite(transaction_price)
+            and transaction_price > 0.0
+            and math.isfinite(transaction_volume)
+            and transaction_volume > 0.0
+        )
+        use_adverse_tick_fallback = bool(
+            potentially_executable
+            and spec.entry_fill_policy == ENTRY_FILL_POLICY_CAUSAL_BOOK_ELSE_OPEN_TICK
+            and not has_required_best_quote
+        )
+        if has_required_best_quote:
+            exact_best_quote_rows += 1
+            exact_best_quote_symbols.append(symbol)
+        elif use_adverse_tick_fallback:
+            adverse_tick_fallback_rows += 1
+            adverse_tick_fallback_symbols.append(symbol)
+        source_quote_at = book.get(source_quote_at_key) or book.get("quote_at")
+        entry_price_source = (
+            f"shioaji:historical_stock_tick_best_{transaction_price_key}"
+            if has_required_best_quote
+            else "official_daily_session_open:adverse_one_legal_tick_fallback"
+            if use_adverse_tick_fallback
+            else canonical_open_source
+        )
         quotes[symbol] = {
             "symbol": symbol,
             "open": serialized_open,
-            "last": serialized_open,
-            "bid": serialized_open,
-            "ask": serialized_open,
-            "bid_volume": PAPER_LIQUIDITY_LOTS,
-            "ask_volume": PAPER_LIQUIDITY_LOTS,
-            "minute_volume_lots": PAPER_LIQUIDITY_LOTS,
+            "last": book.get("last") or serialized_open,
+            "bid": book.get("bid") if has_required_best_quote else None,
+            "ask": book.get("ask") if has_required_best_quote else None,
+            "bid_volume": (book.get("bid_volume") if has_required_best_quote else None),
+            "ask_volume": (book.get("ask_volume") if has_required_best_quote else None),
+            "minute_volume_lots": None,
             "upper_limit": evidence.get("upper_limit_price"),
             "lower_limit": evidence.get("lower_limit_price"),
             "reference_price": evidence.get("reference_price"),
@@ -283,7 +424,16 @@ def _entry_quotes(
                 official_no_trade_symbols and symbol in official_no_trade_symbols
             ),
             "quote_at": quote_at.isoformat(timespec="seconds"),
-            "source": canonical_open_source,
+            "historical_source_quote_at": source_quote_at,
+            "source": (
+                "shioaji:historical_stock_tick_best_quote"
+                if has_required_best_quote
+                else "synthetic:adverse_open_tick_fallback"
+                if use_adverse_tick_fallback
+                else canonical_open_source
+            ),
+            "entry_price_source": entry_price_source,
+            "entry_price_is_synthetic_fallback": use_adverse_tick_fallback,
         }
     return quotes, {
         "potential_whole_lot_rows": potential_whole_lot_rows,
@@ -291,6 +441,10 @@ def _entry_quotes(
         "missing_official_open_symbols": sorted(missing_official_open_symbols),
         "official_open_mismatches": official_open_mismatches,
         "canonical_open_source": canonical_open_source,
+        "exact_best_quote_rows": exact_best_quote_rows,
+        "exact_best_quote_symbols": sorted(set(exact_best_quote_symbols)),
+        "adverse_tick_fallback_rows": adverse_tick_fallback_rows,
+        "adverse_tick_fallback_symbols": sorted(set(adverse_tick_fallback_symbols)),
     }
 
 
@@ -315,6 +469,105 @@ def _canonicalize_signal_rows_for_replay(
         )
         canonicalized.append(row)
     return canonicalized
+
+
+def _historical_book_request_symbols(
+    prepared_modes: list[
+        tuple[
+            ModeSpec,
+            datetime,
+            Path,
+            Path,
+            dict[str, Any],
+            list[dict[str, Any]],
+            Mapping[str, Any],
+            Mapping[str, Any],
+        ]
+    ],
+    canonical_open_by_symbol: Mapping[str, float],
+) -> list[str]:
+    """Return only rows that can reach an opening whole-lot order."""
+
+    symbols: set[str] = set()
+    for (
+        spec,
+        _generated,
+        _summary_path,
+        _weights_path,
+        _summary,
+        rows,
+        eligibility,
+        _coverage,
+    ) in prepared_modes:
+        for row in rows:
+            symbol = str(row.get("symbol") or "")
+            if not symbol:
+                continue
+            try:
+                weight = float(row.get("target_weight") or 0.0)
+                opening_price = float(canonical_open_by_symbol.get(symbol, math.nan))
+            except (TypeError, ValueError):
+                continue
+            evidence = eligibility.get(symbol)
+            if (
+                weight == 0.0
+                or not bool(row.get("tradable"))
+                or (weight > 0.0 and not bool(row.get("can_buy")))
+                or (weight < 0.0 and not bool(row.get("can_sell")))
+                or evidence is None
+                or not bool(evidence.covered)
+                or not bool(evidence.eligible)
+                or (weight < 0.0 and not bool(evidence.short_open))
+                or not math.isfinite(opening_price)
+                or opening_price <= 0.0
+            ):
+                continue
+            requested_shares = int(
+                math.floor(
+                    abs(weight)
+                    * float(spec.initial_capital_twd)
+                    / opening_price
+                    / int(spec.lot_size)
+                )
+            ) * int(spec.lot_size)
+            if requested_shares > 0:
+                symbols.add(symbol)
+    return sorted(symbols)
+
+
+def _persist_historical_entry_books(
+    *,
+    state_dir: Path,
+    trading_date: date,
+    books: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    path = state_dir / "replay_entry_books" / f"{trading_date.isoformat()}.parquet"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    schema = {
+        "symbol": pl.String,
+        "bid": pl.Float64,
+        "ask": pl.Float64,
+        "bid_volume": pl.Float64,
+        "ask_volume": pl.Float64,
+        "bid_quote_at": pl.String,
+        "ask_quote_at": pl.String,
+        "bid_timestamp_ns": pl.Int64,
+        "ask_timestamp_ns": pl.Int64,
+        "bid_source_row_index": pl.Int64,
+        "ask_source_row_index": pl.Int64,
+        "last": pl.Float64,
+        "source": pl.String,
+    }
+    normalized = [
+        {column: row.get(column) for column in schema}
+        for _symbol, row in sorted(books.items())
+    ]
+    pl.DataFrame(normalized, schema=schema).write_parquet(path)
+    return {
+        "path": str(path),
+        "sha256": _sha256(path),
+        "rows": len(normalized),
+    }
 
 
 @lru_cache(maxsize=None)
@@ -457,9 +710,7 @@ def _official_open_map(
                 source = str(daily.get("_official_source") or "unknown")
                 source_counts[source] = source_counts.get(source, 0) + 1
             elif not any(
-                value is not None
-                and math.isfinite(float(value))
-                and float(value) > 0.0
+                value is not None and math.isfinite(float(value)) and float(value) > 0.0
                 for value in (
                     daily.get("open"),
                     daily.get("max"),
@@ -678,8 +929,7 @@ def _reuse_retained_signal_open_map(
             for item in available
             if (
                 str(item["price_source"]).lower().startswith("twse_tpex:mis")
-                or "official_mis_session_open"
-                in str(item["price_source"]).lower()
+                or "official_mis_session_open" in str(item["price_source"]).lower()
             )
         ]
         preferred = official or available
@@ -875,7 +1125,20 @@ def _position_stats(mode: Mapping[str, Any]) -> dict[str, Any]:
             max(-int(row.get("signed_shares") or 0), 0) for row in positions
         ),
         "engine_status": mode.get("engine_status"),
+        "entry_fill_policy": mode.get("entry_fill_policy"),
+        "entry_fill_contract": mode.get("entry_fill_contract"),
+        "entry_fill_is_synthetic": bool(mode.get("entry_fill_is_synthetic", False)),
         "signal_counts": mode.get("signal_counts") or {},
+        "entry_fill_count": int(mode.get("entry_fill_count") or 0),
+        "entry_best_quote_fill_count": int(
+            mode.get("entry_best_quote_fill_count") or 0
+        ),
+        "entry_synthetic_fallback_fill_count": int(
+            mode.get("entry_synthetic_fallback_fill_count") or 0
+        ),
+        "entry_requested_shares": int(mode.get("entry_requested_shares") or 0),
+        "entry_filled_shares": int(mode.get("entry_filled_shares") or 0),
+        "entry_unfilled_shares": int(mode.get("entry_unfilled_shares") or 0),
     }
 
 
@@ -911,11 +1174,45 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--source-ledger-dir",
+        type=Path,
+        help=(
+            "Pin every replayed date/mode to the signal_id recorded in this source "
+            "ledger, so an execution-only rebuild cannot silently switch signals."
+        ),
+    )
+    parser.add_argument(
+        "--historical-book-root",
+        type=Path,
+        help=(
+            "Reuse retained per-date historical entry-book parquet files instead of "
+            "starting any new Shioaji historical Tick requests."
+        ),
+    )
+    parser.add_argument(
         "--include-disabled",
         action="store_true",
         help=(
             "Include disabled day-trade modes for an explicit forensic rebuild. "
             "The default rebuilds enabled modes only."
+        ),
+    )
+    parser.add_argument(
+        "--allow-adverse-tick-fallback",
+        action="store_true",
+        help=(
+            "Explicitly authorize the historical hybrid contract: use the first "
+            "Shioaji best ask/bid in the 09:00 minute when present, otherwise "
+            "fill at the official open moved one adverse legal tick."
+        ),
+    )
+    parser.add_argument(
+        "--max-shioaji-traffic-fraction",
+        type=float,
+        default=0.90,
+        help=(
+            "Stop historical Tick queries when Shioaji usage reaches this fraction; "
+            "remaining actionable rows use the explicitly authorized fallback."
         ),
     )
     current_open = parser.add_mutually_exclusive_group()
@@ -964,6 +1261,17 @@ def main() -> None:
         raise RuntimeError(f"mode configuration errors: {errors}")
     if not specs:
         raise RuntimeError("no enabled day-trade simulation modes")
+    if args.allow_adverse_tick_fallback:
+        specs = [
+            replace(
+                spec,
+                entry_fill_policy=ENTRY_FILL_POLICY_CAUSAL_BOOK_ELSE_OPEN_TICK,
+                entry_price_offset_ticks=1,
+            )
+            for spec in specs
+        ]
+    else:
+        _require_received_entry_book(specs)
     specs_by_market = {spec.market: spec for spec in specs}
     twse_daily_ohlcv_path = args.twse_daily_ohlcv_path.resolve()
     tpex_daily_ohlcv_path = args.tpex_daily_ohlcv_path.resolve()
@@ -971,6 +1279,29 @@ def main() -> None:
         if not official_path.is_file():
             raise FileNotFoundError(official_path)
     engine = TwDayTradeSimulationEngine(state_dir)
+    source_signal_ids: dict[tuple[str, str], str] = {}
+    source_ledger_provenance: dict[str, Any] | None = None
+    if args.source_ledger_dir is not None:
+        source_signal_ids, source_ledger_provenance = _source_ledger_signal_ids(
+            args.source_ledger_dir.resolve(),
+            start_date=start,
+            end_date=end,
+        )
+        expected_signal_keys = {
+            (day.isoformat(), spec.market)
+            for day in (
+                start + timedelta(days=offset)
+                for offset in range((end - start).days + 1)
+            )
+            if not _is_weekend(day)
+            for spec in specs
+        }
+        missing_signal_keys = sorted(expected_signal_keys - set(source_signal_ids))
+        if missing_signal_keys:
+            raise ValueError(
+                "source ledger is missing replay signal identities: "
+                f"{missing_signal_keys[:20]}"
+            )
     benchmark_state_provenance: dict[str, Any] | None = None
     if args.benchmark_state_source is not None:
         benchmark_state_path = args.benchmark_state_source.resolve()
@@ -996,17 +1327,24 @@ def main() -> None:
         }
     current = datetime.now(TAIPEI)
     receipt: dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "created_at": current.isoformat(timespec="seconds"),
         "simulation_only": True,
         "production_order_possible": False,
         "replay_contract": {
             "entry": (
-                "official daily open for completed sessions; fresh Shioaji "
-                "snapshot open or retained provenance-bearing live-signal "
-                "session open for the current session"
+                "retrospective_historical_best_quote_else_adverse_open_tick_counterfactual"
             ),
-            "entry_liquidity": "counterfactual_unbounded; no broker fill claim",
+            "entry_price": (
+                "market buy/cover uses first historical best ask in the 09:00 minute; "
+                "market sell/short uses first historical best bid; missing required "
+                "side uses official session open moved one adverse legal tick"
+            ),
+            "entry_liquidity": (
+                "historical best quote consumes only its recorded level-one displayed "
+                "lots; adverse one-tick fallback is counterfactual unbounded and makes "
+                "no exchange or broker fill claim"
+            ),
             "whole_lot_execution": (
                 "each symbol is executed independently after eligibility, legal-price, "
                 "whole-lot, and available-liquidity constraints; no cross-symbol "
@@ -1016,9 +1354,11 @@ def main() -> None:
             "intraday_path": "not reconstructed; daily-limit bracket ordering is not inferred from OHLC",
             "current_session": "left open for ordinary live quote service",
             "recorded_entry_time": "09:00:00 Asia/Taipei for every replayed session",
+            "historical_quote_window": "09:00:00-09:00:59 Asia/Taipei",
             "source_signal_time": "retained separately for provenance",
         },
         "state_dir": str(state_dir),
+        "source_signal_ledger": source_ledger_provenance,
         "retained_benchmark_state": benchmark_state_provenance,
         "official_daily_aggregate_sources": {
             "twse": {
@@ -1056,7 +1396,16 @@ def main() -> None:
             "price_limit_rows": len(limits),
             "modes": [],
         }
-        selected = {spec.market: _latest_valid_signal(spec, day) for spec in specs}
+        selected = {
+            spec.market: _latest_valid_signal(
+                spec,
+                day,
+                preferred_signal_id=source_signal_ids.get(
+                    (day.isoformat(), spec.market)
+                ),
+            )
+            for spec in specs
+        }
         official_no_trade_symbols: set[str] = set()
         should_close = day < current.date() or (
             day == current.date()
@@ -1080,9 +1429,7 @@ def main() -> None:
                 "valid_open_symbols": len(canonical_open_by_symbol),
                 "official_source_counts": official_open_source_counts,
                 "official_no_trade_print_count": len(official_no_trade_symbols),
-                "official_no_trade_print_symbols": sorted(
-                    official_no_trade_symbols
-                ),
+                "official_no_trade_print_symbols": sorted(official_no_trade_symbols),
             }
         else:
             if day != current.date() or not (
@@ -1138,11 +1485,11 @@ def main() -> None:
             destination_root=replay_rule_root,
             trading_date=day,
         )
+        prepared_modes = []
         for spec in specs:
             generated_at, summary_path, weights_path, summary, rows = selected[
                 spec.market
             ]
-            observed = datetime.combine(day, time(9, 0), tzinfo=TAIPEI)
             symbols = [str(row.get("symbol") or "") for row in rows]
             eligibility, coverage = load_live_eligibility(
                 rule_data_dir=replay_rule_root,
@@ -1150,6 +1497,77 @@ def main() -> None:
                 symbols=symbols,
                 trading_date=day,
             )
+            prepared_modes.append(
+                (
+                    spec,
+                    generated_at,
+                    summary_path,
+                    weights_path,
+                    summary,
+                    rows,
+                    eligibility,
+                    coverage,
+                )
+            )
+        requested_book_symbols = _historical_book_request_symbols(
+            prepared_modes,
+            canonical_open_by_symbol,
+        )
+        if args.historical_book_root is not None:
+            historical_books, historical_book_query = (
+                _load_retained_historical_entry_books(
+                    historical_book_root=args.historical_book_root.resolve(),
+                    trading_date=day,
+                )
+            )
+            historical_book_query.update(
+                {
+                    "trading_date": day.isoformat(),
+                    "requested_symbols": len(requested_book_symbols),
+                    "resolved_book_symbols": len(
+                        set(requested_book_symbols) & set(historical_books)
+                    ),
+                }
+            )
+        else:
+            try:
+                historical_books, historical_book_query = (
+                    fetch_shioaji_historical_stock_entry_books(
+                        requested_book_symbols,
+                        trading_date=day,
+                        max_traffic_fraction=float(args.max_shioaji_traffic_fraction),
+                    )
+                )
+            except Exception as exc:
+                historical_books = {}
+                historical_book_query = {
+                    "source": "shioaji:historical_stock_tick_best_quote",
+                    "trading_date": day.isoformat(),
+                    "requested_symbols": len(requested_book_symbols),
+                    "resolved_book_symbols": 0,
+                    "query_failed": True,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                }
+        session_receipt["historical_entry_books"] = {
+            **historical_book_query,
+            **_persist_historical_entry_books(
+                state_dir=state_dir,
+                trading_date=day,
+                books=historical_books,
+            ),
+        }
+        for (
+            spec,
+            generated_at,
+            summary_path,
+            weights_path,
+            summary,
+            rows,
+            eligibility,
+            coverage,
+        ) in prepared_modes:
+            observed = datetime.combine(day, time(9, 0), tzinfo=TAIPEI)
             replay_summary = dict(summary)
             replay_summary.update(
                 {
@@ -1164,16 +1582,19 @@ def main() -> None:
                     "weights_path": str(weights_path.resolve()),
                     "simulation_replay": True,
                     "replay_basis": (
-                        "actual_session_open_to_official_close"
+                        "historical_best_quote_else_adverse_open_tick_to_official_close"
                         if should_close
-                        else "actual_session_open_to_live_quotes"
+                        else "historical_best_quote_else_adverse_open_tick_to_live_quotes"
                     ),
-                    "replay_source": "immutable_live_signal_and_official_market_data",
+                    "replay_source": (
+                        "immutable_live_signal_shioaji_historical_tick_and_official_market_data"
+                    ),
                     "entry_fill_contract": (
-                        "retrospective_actual_session_open_price_counterfactual"
+                        "retrospective_historical_best_quote_else_adverse_open_tick_counterfactual"
                     ),
                     "entry_liquidity_assumption": (
-                        "counterfactual_unbounded_open_liquidity_requested_for_rebuild"
+                        "historical_tick_level_one_depth_else_counterfactual_unbounded_"
+                        "adverse_open_tick_fallback"
                     ),
                     "replay_effective_signal_at": observed.isoformat(
                         timespec="seconds"
@@ -1192,6 +1613,7 @@ def main() -> None:
                 spec=spec,
                 canonical_open_by_symbol=canonical_open_by_symbol,
                 canonical_open_source=canonical_open_source,
+                historical_books=historical_books,
                 official_no_trade_symbols=official_no_trade_symbols,
             )
             replay_rows = _canonicalize_signal_rows_for_replay(

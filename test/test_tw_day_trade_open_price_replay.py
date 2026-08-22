@@ -11,9 +11,103 @@ import pytest
 from scripts import rebuild_tw_day_trade_open_price_replay as replay
 from scripts import rebuild_tw_day_trade_benchmark_history as benchmark_replay
 from scripts import backfill_tw_day_trade_open_signals as signal_backfill
+from stockagent.live.tw_day_trade_simulation import (
+    ENTRY_FILL_POLICY_CAUSAL_BOOK,
+    ENTRY_FILL_POLICY_CAUSAL_BOOK_ELSE_OPEN_TICK,
+)
 
 
 TAIPEI = ZoneInfo("Asia/Taipei")
+
+
+def test_open_only_replay_cannot_fabricate_best_bid_ask() -> None:
+    spec = type(
+        "Spec",
+        (),
+        {
+            "market": "tw_day_trade",
+            "entry_fill_policy": ENTRY_FILL_POLICY_CAUSAL_BOOK,
+            "initial_capital_twd": 10_000_000.0,
+            "lot_size": 1_000,
+        },
+    )()
+
+    with pytest.raises(RuntimeError, match="no received best bid/ask"):
+        replay._entry_quotes(
+            [{"symbol": "2330", "target_weight": 0.1, "open_price": 1_000.0}],
+            {
+                "2330": {
+                    "upper_limit_price": 1_100.0,
+                    "lower_limit_price": 900.0,
+                    "reference_price": 1_000.0,
+                }
+            },
+            quote_at=datetime(2026, 8, 13, 9, 0, tzinfo=TAIPEI),
+            spec=spec,
+            canonical_open_by_symbol={"2330": 1_000.0},
+            canonical_open_source="official_daily_session_open",
+        )
+
+    with pytest.raises(RuntimeError, match="open-only replay is retired"):
+        replay._require_received_entry_book([spec])
+
+
+def test_hybrid_entry_quotes_use_required_book_side_and_label_missing_side() -> None:
+    spec = type(
+        "Spec",
+        (),
+        {
+            "market": "tw_day_trade",
+            "entry_fill_policy": ENTRY_FILL_POLICY_CAUSAL_BOOK_ELSE_OPEN_TICK,
+            "initial_capital_twd": 10_000_000.0,
+            "lot_size": 1_000,
+        },
+    )()
+    rows = [
+        {"symbol": "2330", "target_weight": 0.5, "open_price": 1_000.0},
+        {"symbol": "2317", "target_weight": -0.5, "open_price": 200.0},
+    ]
+    limits = {
+        symbol: {
+            "upper_limit_price": 1_100.0,
+            "lower_limit_price": 900.0,
+            "reference_price": 1_000.0,
+        }
+        for symbol in ("2330", "2317")
+    }
+    quotes, quality = replay._entry_quotes(
+        rows,
+        limits,
+        quote_at=datetime(2026, 8, 13, 9, 0, tzinfo=TAIPEI),
+        spec=spec,
+        canonical_open_by_symbol={"2330": 1_000.0, "2317": 200.0},
+        canonical_open_source="official_daily_session_open",
+        historical_books={
+            "2330": {
+                "ask": 1_005.0,
+                "ask_volume": 7.0,
+                "ask_quote_at": "2026-08-13T09:00:07+08:00",
+                "source": "shioaji:historical_stock_tick_best_quote",
+            },
+            "2317": {
+                "ask": 201.0,
+                "ask_volume": 10.0,
+                "ask_quote_at": "2026-08-13T09:00:02+08:00",
+                "source": "shioaji:historical_stock_tick_best_quote",
+            },
+        },
+    )
+
+    assert quotes["2330"]["ask"] == 1_005.0
+    assert quotes["2330"]["ask_volume"] == 7.0
+    assert quotes["2330"]["entry_price_is_synthetic_fallback"] is False
+    assert quotes["2330"]["historical_source_quote_at"].startswith(
+        "2026-08-13T09:00:07"
+    )
+    assert quotes["2317"]["bid"] is None
+    assert quotes["2317"]["entry_price_is_synthetic_fallback"] is True
+    assert quality["exact_best_quote_symbols"] == ["2330"]
+    assert quality["adverse_tick_fallback_symbols"] == ["2317"]
 
 
 def _write_signal_candidate(
@@ -47,9 +141,7 @@ def _write_signal_candidate(
             "input_sha256": "fixture-sha256",
         },
     }
-    (signal_root / "summary.json").write_text(
-        json.dumps(summary), encoding="utf-8"
-    )
+    (signal_root / "summary.json").write_text(json.dumps(summary), encoding="utf-8")
     pl.DataFrame(
         {"symbol": ["2330"], "target_weight": [0.5], "open_price": [1000.0]}
     ).write_parquet(signal_root / "target_weights.parquet")
@@ -110,18 +202,58 @@ def test_retained_twse_openapi_rule_receipt_uses_exact_parser() -> None:
         ensure_ascii=False,
     ).encode("utf-8")
 
-    assert replay._retained_rule_response_kind(
-        "twse_day_trade_eligibility", raw
-    ) == "twse_day_trade_openapi_json"
-    assert replay._retained_rule_response_kind(
-        "tpex_day_trade_eligibility", raw
-    ) == "json"
+    assert (
+        replay._retained_rule_response_kind("twse_day_trade_eligibility", raw)
+        == "twse_day_trade_openapi_json"
+    )
+    assert (
+        replay._retained_rule_response_kind("tpex_day_trade_eligibility", raw) == "json"
+    )
 
 
 def test_replay_range_can_skip_weekend_non_sessions() -> None:
     assert replay._is_weekend(date(2026, 8, 15))
     assert replay._is_weekend(date(2026, 8, 16))
     assert not replay._is_weekend(date(2026, 8, 17))
+
+
+def test_source_ledger_pins_each_date_mode_signal_identity(tmp_path: Path) -> None:
+    events = [
+        {
+            "event": "signal_registered",
+            "recorded_at": "2026-08-13T09:00:00+08:00",
+            "market": "mode_a",
+            "signal_id": "original-a",
+        },
+        {
+            "event": "signal_registered",
+            "recorded_at": "2026-08-13T09:00:00+08:00",
+            "market": "mode_b",
+            "signal_id": "original-b",
+        },
+        {
+            "event": "mark",
+            "recorded_at": "2026-08-13T09:01:00+08:00",
+            "market": "mode_a",
+        },
+    ]
+    (tmp_path / "events.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in events),
+        encoding="utf-8",
+    )
+
+    identities, provenance = replay._source_ledger_signal_ids(
+        tmp_path,
+        start_date=date(2026, 8, 13),
+        end_date=date(2026, 8, 13),
+    )
+
+    assert identities == {
+        ("2026-08-13", "mode_a"): "original-a",
+        ("2026-08-13", "mode_b"): "original-b",
+    }
+    assert provenance["signal_registrations"] == 2
+    assert len(provenance["sha256"]) == 64
 
 
 def test_counterfactual_open_input_excludes_intraday_high_low_close() -> None:
@@ -162,12 +294,8 @@ def test_previous_counterfactual_panel_date_uses_exchange_sessions(
 ) -> None:
     twse_path = tmp_path / "twse.parquet"
     tpex_path = tmp_path / "tpex.parquet"
-    pl.DataFrame({"date": ["2026-08-13", "2026-08-14"]}).write_parquet(
-        twse_path
-    )
-    pl.DataFrame({"date": ["2026-08-13", "2026-08-14"]}).write_parquet(
-        tpex_path
-    )
+    pl.DataFrame({"date": ["2026-08-13", "2026-08-14"]}).write_parquet(twse_path)
+    pl.DataFrame({"date": ["2026-08-13", "2026-08-14"]}).write_parquet(tpex_path)
 
     assert signal_backfill._previous_official_session_date(
         twse_path, tpex_path, date(2026, 8, 17)
@@ -372,9 +500,7 @@ def test_replay_rows_cannot_fall_back_to_noncanonical_signal_open() -> None:
 def test_tx_front_contract_comes_from_each_sessions_capture_manifest(
     tmp_path: Path,
 ) -> None:
-    manifest_root = (
-        tmp_path / "manifests" / "trade_date=2026-08-20"
-    )
+    manifest_root = tmp_path / "manifests" / "trade_date=2026-08-20"
     manifest_root.mkdir(parents=True)
     (manifest_root / "worker=00.json").write_text(
         json.dumps(

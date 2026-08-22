@@ -9,6 +9,10 @@ from typing import Callable
 
 import torch
 
+from stockagent.backtest.portfolio_allocator import (
+    stateful_proximal_target_weights,
+)
+
 
 _MIN_WEALTH_FACTOR = 1.0e-6
 _DAY_KERNEL_CACHE: dict[
@@ -77,6 +81,8 @@ def _day_kernel_factory(
     long_only: bool,
     maximum_gross: float,
     max_turnover_ratio: float,
+    stateful_proximal_allocator: bool,
+    proximal_cost_multiplier: float,
 ) -> Callable[..., tuple[torch.Tensor, ...]]:
     def day(
         previous: torch.Tensor,
@@ -105,6 +111,15 @@ def _day_kernel_factory(
         )
         if long_only:
             requested = requested.clamp_min(0.0)
+        if stateful_proximal_allocator:
+            requested = stateful_proximal_target_weights(
+                requested,
+                base,
+                buy_fee_rates=buy_fee_rate,
+                sell_fee_rates=sell_fee_rate,
+                cost_multiplier=proximal_cost_multiplier,
+                long_only=long_only,
+            )
         delta = requested - base
         constrained = torch.where((delta > 0.0) & ~can_buy, base, requested)
         down = constrained < base
@@ -248,6 +263,8 @@ def _resolve_block_kernel(
     long_only: bool,
     maximum_gross: float,
     max_turnover_ratio: float,
+    stateful_proximal_allocator: bool,
+    proximal_cost_multiplier: float,
 ) -> tuple[
     Callable[..., tuple[torch.Tensor, ...]],
     Callable[..., tuple[torch.Tensor, ...]],
@@ -258,6 +275,8 @@ def _resolve_block_kernel(
         long_only=long_only,
         maximum_gross=maximum_gross,
         max_turnover_ratio=max_turnover_ratio,
+        stateful_proximal_allocator=stateful_proximal_allocator,
+        proximal_cost_multiplier=proximal_cost_multiplier,
     )
     eager_block = _block_kernel_factory(eager_day, block_rows)
     compiler = getattr(torch, "compiler", None)
@@ -286,6 +305,8 @@ def _resolve_block_kernel(
         bool(long_only),
         float(maximum_gross),
         float(max_turnover_ratio),
+        bool(stateful_proximal_allocator),
+        float(proximal_cost_multiplier),
     )
     with _DAY_KERNEL_LOCK:
         cached = _DAY_KERNEL_CACHE.get(key)
@@ -315,6 +336,8 @@ def run_crypto_perpetual_torch(
     long_only: bool,
     maximum_gross: float,
     max_turnover_ratio: float = 0.0,
+    stateful_proximal_allocator: bool = False,
+    proximal_cost_multiplier: float = 1.0,
     volume_limit_weights: torch.Tensor | None = None,
     state_advance_mask: torch.Tensor | None = None,
     initial_weights: torch.Tensor | None = None,
@@ -347,6 +370,10 @@ def run_crypto_perpetual_torch(
         raise ValueError("crypto perpetual fee rates must be non-negative")
     if maximum_gross < 0.0 or maximum_gross > 1.0:
         raise ValueError("maximum_gross must be within [0,1]")
+    if not torch.compiler.is_compiling() and (
+        not isinstance(stateful_proximal_allocator, bool)
+    ):
+        raise TypeError("stateful_proximal_allocator must be bool")
 
     target = torch.nan_to_num(
         target_weights.to(dtype=torch.float32), nan=0.0, posinf=0.0, neginf=0.0
@@ -415,6 +442,8 @@ def run_crypto_perpetual_torch(
         long_only=long_only,
         maximum_gross=maximum_gross,
         max_turnover_ratio=max_turnover_ratio,
+        stateful_proximal_allocator=stateful_proximal_allocator,
+        proximal_cost_multiplier=proximal_cost_multiplier,
     )
 
     for start in range(0, shape[0], block_rows):

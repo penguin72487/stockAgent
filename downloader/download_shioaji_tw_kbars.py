@@ -30,7 +30,6 @@ except ModuleNotFoundError:  # direct script execution
 from stockagent.live.shioaji_traffic_ledger import record_avoided_query, shioaji_query
 from stockagent.live.shioaji_schedule import (
     HISTORICAL_MAX_TRAFFIC_FRACTION,
-    STOCK_HISTORY_TRAFFIC_RESERVE_MB,
     historical_query_is_protected,
 )
 
@@ -124,12 +123,6 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=HISTORICAL_MAX_TRAFFIC_FRACTION,
         help="Stop cleanly after this fraction of the Shioaji daily traffic quota.",
-    )
-    parser.add_argument(
-        "--traffic-reserve-mb",
-        type=float,
-        default=STOCK_HISTORY_TRAFFIC_RESERVE_MB,
-        help="Always leave at least this much daily traffic unused.",
     )
     parser.add_argument(
         "--symbols",
@@ -621,14 +614,12 @@ def _taiwan_market_hours_now() -> bool:
     return historical_query_is_protected()
 
 
-def _check_traffic_budget(
-    api: Any, *, max_fraction: float, reserve_bytes: int
-) -> tuple[int, int]:
+def _check_traffic_budget(api: Any, *, max_fraction: float) -> tuple[int, int]:
     used, limit = _usage_values(api)
-    ceiling = min(int(limit * max_fraction), limit - reserve_bytes)
-    if used >= max(0, ceiling):
+    ceiling = int(limit * max_fraction)
+    if used >= ceiling:
         raise TrafficBudgetReached(
-            f"Shioaji daily traffic reserve reached: used={used} limit={limit} "
+            f"Shioaji daily traffic fraction reached: used={used} limit={limit} "
             f"ceiling={ceiling}"
         )
     return used, limit
@@ -1399,10 +1390,6 @@ def main() -> None:
         raise ValueError("--start-date must not be after --end-date")
     if not 0.0 < float(args.max_traffic_fraction) < 1.0:
         raise ValueError("--max-traffic-fraction must be between 0 and 1")
-    if not math.isfinite(float(args.traffic_reserve_mb)) or float(
-        args.traffic_reserve_mb
-    ) < 0.0:
-        raise ValueError("--traffic-reserve-mb must be finite and nonnegative")
     if args.request_interval is not None and float(args.request_interval) < 0.0:
         raise ValueError("--request-interval must be >= 0")
     request_interval = resolve_request_interval(
@@ -1558,12 +1545,10 @@ def main() -> None:
                 flush=True,
             )
 
-    reserve_bytes = int(float(args.traffic_reserve_mb) * 1024 * 1024)
     try:
         traffic = _check_traffic_budget(
             api,
             max_fraction=float(args.max_traffic_fraction),
-            reserve_bytes=reserve_bytes,
         )
     except TrafficBudgetReached as exc:
         stopped_for_traffic = True
@@ -1683,7 +1668,6 @@ def main() -> None:
                         traffic = _check_traffic_budget(
                             api,
                             max_fraction=float(args.max_traffic_fraction),
-                            reserve_bytes=reserve_bytes,
                         )
                         minute_frame = _query_chunk(
                             api,
@@ -1752,7 +1736,6 @@ def main() -> None:
                         traffic = _check_traffic_budget(
                             api,
                             max_fraction=float(args.max_traffic_fraction),
-                            reserve_bytes=reserve_bytes,
                         )
                     persist_progress(
                         state="running",

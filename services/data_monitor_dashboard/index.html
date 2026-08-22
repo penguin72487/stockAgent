@@ -7,7 +7,7 @@
   <meta name="theme-color" content="#071019">
   <title>StockAgent 全資料監控</title>
   <link rel="stylesheet" href="../dashboard-core.css?v=6">
-  <link rel="stylesheet" href="styles.css?v=7">
+  <link rel="stylesheet" href="styles.css?v=9">
 </head>
 <body>
   <a class="skip-link" href="#source-list">跳到資料來源</a>
@@ -30,7 +30,7 @@
         </div>
         <strong id="overall-percent">—</strong>
         <progress id="overall-progress" max="1" aria-label="來源層級健康或進行中比例"></progress>
-        <p>已完成或正在有效串流的端點比例；不同來源的日期、標的、任務與列數不混加。</p>
+        <p id="overall-denominator">只計主動資料端點；群組彙總、憑證與已延後項目不進入分母。</p>
       </div>
     </section>
 
@@ -40,6 +40,8 @@
       <article class="streaming"><span>正在串流</span><strong id="streaming-items">—</strong><small>交易時窗內且有新落盤心跳</small></article>
       <article class="complete"><span>已完成／已最新</span><strong id="completed-items">—</strong><small>最近完整度與新鮮度證據通過</small></article>
       <article class="unable"><span>無法完成</span><strong id="unable-items">—</strong><small>缺管線、阻擋或完整性失敗</small></article>
+      <article class="deferred"><span>已延後／未啟用</span><strong id="deferred-items">—</strong><small>保留登錄，但不冒充已完成</small></article>
+      <article class="control"><span>設定／憑證閘門</span><strong id="control-items">—</strong><small id="control-detail">不進入資料完成率</small></article>
       <article><span>已知資料列</span><strong id="known-rows">—</strong><small>只加總不重複的群組回執</small></article>
     </section>
 
@@ -60,7 +62,7 @@
           <p class="eyebrow">SOURCE REGISTRY</p>
           <h2 id="sources-title">逐端點發布時間、取得進度與 ETA</h2>
         </div>
-        <p><span id="result-count">—</span><br><span class="sort-contract">固定排序：未最新 → 串流 → 完成 → 無法完成</span></p>
+        <p><span id="result-count">—</span><br><span class="sort-contract">固定排序：未最新 → 串流 → 完成 → 無法完成 → 延後 → 設定 → 清冊參照</span></p>
       </div>
 
       <form id="filters" class="filters" role="search">
@@ -77,6 +79,9 @@
             <option value="streaming">正在串流</option>
             <option value="complete">已完成／已到最新</option>
             <option value="unable">無法完成</option>
+            <option value="deferred">已延後／未啟用</option>
+            <option value="control">設定／憑證閘門</option>
+            <option value="reference">清冊參照／不重複計算</option>
           </select>
         </label>
         <label>粒度
@@ -130,6 +135,6 @@
 
   <footer>StockAgent 全資料監控 · 台北時間 · 每 10 秒讀取最新回執</footer>
   <script src="../dashboard-core.js?v=1" defer></script>
-  <script src="app.js?v=10" defer></script>
+  <script src="app.js?v=13" defer></script>
 </body>
 </html>

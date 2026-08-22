@@ -12,7 +12,6 @@ const DATA_MONITOR_STATUS_PATHS = [
   "../data-monitor/api/status",
 ];
 const COLORS = ["#37d3ff", "#5ee0a0", "#a98cff", "#f5bd4f", "#ff7ac8", "#73e6d1", "#ff9f68"];
-const TIME_RANGE_LABELS = {"1h": "1 小時", "1d": "1 天", "1w": "1 週", "1mo": "1 月", "1q": "1 季", "1y": "1 年", all: "全部"};
 const timeAxis = window.StockAgentTimeAxis;
 const TW_STOCK_SESSIONS = [
   {label: "開", minute: 9 * 60},
@@ -22,7 +21,6 @@ const HIDDEN_EQUITY_SERIES_STORAGE_KEY = "tw-day-trade-hidden-equity-series";
 const HISTORY_CLIENT_CACHE_MS = 45000;
 let snapshot = null;
 let chartHistory = null;
-let chartRange = "1d";
 let hiddenEquitySeries = new Set();
 let chartHistoryCache = new Map();
 let historyInFlight = false;
@@ -72,11 +70,9 @@ let twPublicMonitorLastUpdated = null;
 let twPublicMonitorAbortController = null;
 
 try {
-  chartRange = localStorage.getItem("tw-day-trade-equity-time-range") || "1d";
   const storedHiddenSeries = JSON.parse(localStorage.getItem(HIDDEN_EQUITY_SERIES_STORAGE_KEY) || "[]");
   if (Array.isArray(storedHiddenSeries)) hiddenEquitySeries = new Set(storedHiddenSeries.map(String));
 } catch (_error) { /* storage can be disabled */ }
-if (!(chartRange in TIME_RANGE_LABELS)) chartRange = "1d";
 
 const $ = Dashboard.byId;
 const esc = Dashboard.escapeHtml;
@@ -374,21 +370,18 @@ function selectedDate() {
   return availableDetailDates.find((value) => value <= boundary) || boundary;
 }
 function detailRangeKey() { return `${selectedDetailStartDate()}|${selectedDetailEndDate()}`; }
-function selectedChartStartDate() { return $("equity-start-date").value || ""; }
-function selectedChartEndDate() { return $("equity-end-date").value || ""; }
-function hasCustomChartDates() { return Boolean(selectedChartStartDate() || selectedChartEndDate()); }
 function chartWindowLabel() {
-  const start = selectedChartStartDate();
-  const end = selectedChartEndDate();
-  if (!start && !end) return TIME_RANGE_LABELS[chartRange];
+  const start = selectedDetailStartDate();
+  const end = selectedDetailEndDate();
   return `${start || "最早資料"} ～ ${end || "最新資料"}`;
 }
 function chartRequestKey() {
-  return JSON.stringify([
-    hasCustomChartDates() ? "all" : chartRange,
-    selectedChartStartDate(),
-    selectedChartEndDate(),
-  ]);
+  return JSON.stringify(["all", selectedDetailStartDate(), selectedDetailEndDate()]);
+}
+function rangeSummaryFor(seriesId) {
+  if (!chartHistory || chartHistory.start_date !== (selectedDetailStartDate() || null)
+    || chartHistory.end_date !== (selectedDetailEndDate() || null)) return null;
+  return (chartHistory.range_summary || []).find((row) => row.series_id === seriesId) || null;
 }
 function textFilter() { return $("symbol-filter").value.trim().toLowerCase(); }
 function matchesMode(row) { return selectedMode() === "all" || row.market === selectedMode(); }
@@ -538,7 +531,10 @@ function renderOverview(data) {
     ? totalPnl - realizedPnl - unrealizedPnl
     : null;
   const reconciled = reconciliationDifference != null && Math.abs(reconciliationDifference) <= .01;
-  const returns = modes.map((mode) => Number(mode.return_pct)).filter(Number.isFinite);
+  const returns = modes
+    .map((mode) => rangeSummaryFor(mode.market)?.return_pct)
+    .map(Number)
+    .filter(Number.isFinite);
   const best = returns.length ? Math.max(...returns) : null;
   const worst = returns.length ? Math.min(...returns) : null;
   const healthKind = healthyModes === modes.length ? "good" : healthyModes ? "warn" : "bad";
@@ -548,7 +544,7 @@ function renderOverview(data) {
     ["四模式已實現", realizedPnl == null ? "—" : `${realizedPnl >= 0 ? "+" : ""}${compactMoney(realizedPnl)}`, "已出場部分，已扣分攤後交易成本", pnlClass(realizedPnl)],
     ["四模式未實現", unrealizedPnl == null ? "—" : `${unrealizedPnl >= 0 ? "+" : ""}${compactMoney(unrealizedPnl)}`, stalePositions ? `含 ${number(stalePositions)} 個延用估值` : "以可清算 bid／ask 並扣剩餘成本", stalePositions ? "warn" : pnlClass(unrealizedPnl)],
     ["四模式總淨損益", totalPnl == null ? "—" : `${totalPnl >= 0 ? "+" : ""}${compactMoney(totalPnl)}`, reconciled ? "已實現＋未實現，已與總權益對帳" : reconciliationDifference == null ? "等待完整損益來源" : `對帳差異 ${summaryMoney(reconciliationDifference)}`, reconciled ? pnlClass(totalPnl) : "bad"],
-    ["報酬範圍", best == null ? "—" : `${best >= 0 ? "+" : ""}${displayPct(best)} ～ ${worst >= 0 ? "+" : ""}${displayPct(worst)}`, "各模式以自己的初始資金為分母", best != null && worst < 0 ? "warn" : pnlClass(best)],
+    ["篩選區間報酬", best == null ? "—" : `${best >= 0 ? "+" : ""}${displayPct(best)} ～ ${worst >= 0 ? "+" : ""}${displayPct(worst)}`, `${chartWindowLabel()}；各模式以上一交易日最後權益為基準`, best != null && worst < 0 ? "warn" : pnlClass(best)],
   ];
   $("overview-kpis").innerHTML = cards.map(([label, value, note, kind]) => `<div class="overview-kpi">
     <span>${esc(label)}</span><strong class="${esc(kind)}">${esc(value)}</strong><small class="${esc(kind)}">${esc(note)}</small>
@@ -636,10 +632,11 @@ function syncFilters(data) {
 
 function renderModes(data) {
   $("mode-cards").innerHTML = data.modes.map((mode) => {
-    const initial = Number(mode.initial_capital_twd || 0);
-    const equity = mode.total_equity_twd == null ? null : Number(mode.total_equity_twd);
-    const pnl = equity == null ? null : equity - initial;
-    const returnPct = mode.return_pct == null ? null : Number(mode.return_pct);
+    const rangeSummary = rangeSummaryFor(mode.market);
+    const initial = rangeSummary?.baseline_equity_twd == null ? null : Number(rangeSummary.baseline_equity_twd);
+    const equity = rangeSummary?.end_equity_twd == null ? null : Number(rangeSummary.end_equity_twd);
+    const pnl = rangeSummary?.range_net_pnl_twd == null ? null : Number(rangeSummary.range_net_pnl_twd);
+    const returnPct = rangeSummary?.return_pct == null ? null : Number(rangeSummary.return_pct);
     const status = String(mode.engine_status || "unknown");
     const execution = executionStatusPresentation(mode.today_execution_status);
     const fillOutcome = fillOutcomePresentation(mode.today_execution_outcome || mode.entry_fill_outcome);
@@ -648,9 +645,19 @@ function renderModes(data) {
     const bracketPolicy = offsetTicks > 0
       ? `TP／SL 漲跌停內縮 ${sourceNumber(offsetTicks)} Tick（提高成交機率，非保證）`
       : "TP／SL 使用完整漲跌停價";
-    const entryPolicy = mode.entry_fill_policy === "synthetic_open_tick"
-      ? `模擬強制成交：多單開盤 +${number(mode.entry_price_offset_ticks || 1)} Tick／空單開盤 −${number(mode.entry_price_offset_ticks || 1)} Tick（非券商成交）`
-      : "因果最佳一檔與可驗證深度";
+    const configuredEntryPolicy = mode.configured_entry_fill_policy || mode.entry_fill_policy;
+    const configuredEntryOffset = Number(mode.configured_entry_price_offset_ticks || 0);
+    const activeEntryPolicy = configuredEntryPolicy === "synthetic_open_tick"
+      ? `目前規則：開盤價不利 ${number(configuredEntryOffset || 1)} Tick 合成成交`
+      : "目前規則：市價買進／回補取收到的最佳 Ask；市價賣出／放空取收到的最佳 Bid，且只吃可驗證一檔量";
+    const recordedEntryPolicy = mode.entry_fill_policy === "synthetic_open_tick"
+      ? `所選交易日紀錄：開盤價不利 ${number(mode.entry_price_offset_ticks || 1)} Tick 合成成交（不回寫成最佳報價）`
+      : mode.entry_fill_policy === "causal_best_quote_else_adverse_open_tick"
+      ? `所選交易日紀錄：歷史最佳 Bid／Ask ${number(mode.entry_best_quote_fill_count || 0)} 筆；缺報價才用開盤價不利 ${number(mode.entry_price_offset_ticks || 1)} Tick ${number(mode.entry_synthetic_fallback_fill_count || 0)} 筆`
+      : "所選交易日紀錄：因果最佳 Bid／Ask 與可驗證一檔量";
+    const entryPolicy = configuredEntryPolicy === mode.entry_fill_policy
+      ? activeEntryPolicy
+      : `${activeEntryPolicy}；${recordedEntryPolicy}`;
     const reasonCounts = Object.entries(mode.signal_reason_counts || {})
       .filter(([, count]) => Number(count || 0) > 0)
       .sort((left, right) => Number(right[1]) - Number(left[1]))
@@ -660,7 +667,7 @@ function renderModes(data) {
     return `<article class="panel mode-card">
       <header><h3>${esc(mode.label || mode.market)}</h3>${badge(engineStatusShortLabel(status), kind)}</header>
       <div class="equity ${pnlClass(returnPct)}">${returnPct == null ? "尚無估值" : `${returnPct >= 0 ? "+" : ""}${displayPct(returnPct)}`}</div>
-      <div class="delta ${pnlClass(pnl)}">${pnl == null ? "尚無估值" : `總權益 ${summaryMoney(equity)} · 淨損益 ${pnl >= 0 ? "+" : ""}${summaryMoney(pnl)}`}</div>
+      <div class="delta ${pnlClass(pnl)}">${pnl == null ? "篩選區間尚無估值" : `期末權益 ${summaryMoney(equity)} · 區間淨損益 ${pnl >= 0 ? "+" : ""}${summaryMoney(pnl)}`}</div>
       <div class="mode-glance">
         <div><span>該日策略執行</span><strong class="${esc(execution.kind)}">${esc(execution.label)}</strong></div>
         <div><span>實際成交結果</span><strong class="${esc(fillOutcome.kind)}">${esc(fillOutcome.label)}</strong></div>
@@ -669,7 +676,7 @@ function renderModes(data) {
         <div><span>未實現淨清算損益</span><strong class="${pnlClass(mode.open_net_liquidation_pnl_twd)}">${summaryMoney(mode.open_net_liquidation_pnl_twd)}</strong></div>
       </div>
       <details><summary>查看資金、訊號與曝險細節</summary><div class="metrics">
-        <div><span>報酬率資金基準</span><strong>${money(initial)}</strong></div>
+        <div><span>篩選區間報酬基準</span><strong>${money(initial)}</strong></div>
         <div><span>已賺手續費退佣</span><strong>${money(mode.cumulative_commission_rebate_accrued_twd)}</strong></div>
         <div><span>訊號時間</span><strong>${shortTime(mode.signal_at)}</strong></div>
         <div><span>要求／成交／未成交</span><strong>${number(mode.entry_requested_shares || 0)}／${number(mode.entry_filled_shares || 0)}／${number(mode.entry_unfilled_shares || 0)} 股</strong></div>
@@ -688,9 +695,10 @@ function renderModes(data) {
 function renderBenchmarks(data) {
   const rows = Array.isArray(data.benchmarks) ? data.benchmarks : [];
   $("benchmark-cards").innerHTML = rows.map((row) => {
-    const returnPct = row.return_pct == null ? null : Number(row.return_pct);
-    const equity = row.total_equity_twd == null ? null : Number(row.total_equity_twd);
-    const netPnl = row.net_pnl_twd == null ? null : Number(row.net_pnl_twd);
+    const rangeSummary = rangeSummaryFor(row.benchmark_id);
+    const returnPct = rangeSummary?.return_pct == null ? null : Number(rangeSummary.return_pct);
+    const equity = rangeSummary?.end_equity_twd == null ? null : Number(rangeSummary.end_equity_twd);
+    const netPnl = rangeSummary?.range_net_pnl_twd == null ? null : Number(rangeSummary.range_net_pnl_twd);
     const isTx = row.instrument_type === "continuous_long_future";
     const waitingRoll = String(row.valuation_source || "").includes("roll_waiting");
     const actionBlocked = !isTx && String(row.valuation_source || "").includes("corporate_action_reference_unavailable");
@@ -719,10 +727,10 @@ function renderBenchmarks(data) {
     return `<article class="panel benchmark-card">
       <header><h3>${esc(row.label || row.benchmark_id)}</h3>${badge(status.label, status.kind)}</header>
       <div class="equity ${pnlClass(returnPct)}">${returnPct == null ? "尚無估值" : `${returnPct >= 0 ? "+" : ""}${displayPct(returnPct)}`}</div>
-      <div class="delta ${pnlClass(netPnl)}">${equity == null ? "等待完整來源" : `權益 ${summaryMoney(equity)} · 淨損益 ${netPnl >= 0 ? "+" : ""}${summaryMoney(netPnl)}`}</div>
+      <div class="delta ${pnlClass(netPnl)}">${equity == null ? "篩選區間等待完整來源" : `期末權益 ${summaryMoney(equity)} · 區間淨損益 ${netPnl >= 0 ? "+" : ""}${summaryMoney(netPnl)}`}</div>
       <div class="benchmark-facts">
         <div><span>持有標的</span><strong class="benchmark-contract">${esc(holding)}</strong></div>
-        <div><span>報酬資金基準</span><strong>${money(row.initial_capital_twd)}</strong></div>
+        <div><span>篩選區間報酬基準</span><strong>${money(rangeSummary?.baseline_equity_twd)}</strong></div>
         <div><span>起算開盤</span><strong>${sourceNumber(row.entry_price)}<small>${shortTime(row.entry_at)}</small></strong></div>
         <div><span>目前可清算價</span><strong>${sourceNumber(row.last_mark_price)}<small>${shortTime(row.last_quote_at || row.last_mark_at)}</small></strong></div>
         <div><span>${isTx ? "自動換月" : "持有契約"}</span><strong>${esc(rollText)}</strong></div>
@@ -1038,7 +1046,7 @@ function renderChart(data) {
   const width = 960, height = 360, left = 76, right = 22, top = 24, bottom = 70;
   const times = [...new Set(allPoints.map((row) => String(row.minute)))].sort();
   const axis = timeAxis.buildTimeAxis({
-    range: hasCustomChartDates() ? "all" : chartRange,
+    range: "all",
     timestamps: times.map((value) => new Date(value).getTime()),
     sessions: TW_STOCK_SESSIONS,
     collapseEmptyIntervals: true,
@@ -1080,31 +1088,19 @@ function renderChart(data) {
   const replayQuality = replayPoints
     ? `；歷史分鐘 ${number(replayPoints)} 點，平均新成交名目覆蓋 ${Number.isFinite(replayMean) ? `${sourceNumber(replayMean * 100)}%` : "—"}，缺價 ${number(replayMissing)} 點（其餘無成交分鐘延用上一筆）`
     : "";
-  $("equity-range-note").textContent = `${chartWindowLabel()} · ${start} ～ ${end} · 顯示 ${number(points.length)} 點、${number(visibleSeries.length)}/${number(series.length)} 條線；全體無資料的時間已壓縮${sampled}${replayQuality}`;
-}
-
-function syncChartRangeControl() {
-  $("equity-time-range").querySelectorAll("button[data-range]").forEach((button) => {
-    button.setAttribute("aria-pressed", String(!hasCustomChartDates() && button.dataset.range === chartRange));
-  });
+  $("equity-range-note").textContent = `${chartWindowLabel()} · 一分鐘曲線 · 報酬基準為起始日前最後一筆權益 · ${start} ～ ${end} · 顯示 ${number(points.length)} 點、${number(visibleSeries.length)}/${number(series.length)} 條線；全體無資料的時間已壓縮${sampled}${replayQuality}`;
 }
 
 function applyChartHistory(payload) {
   chartHistory = payload;
-  const startInput = $("equity-start-date");
-  const endInput = $("equity-end-date");
-  startInput.min = payload.available_start_date || "";
-  startInput.max = payload.available_end_date || "";
-  endInput.min = payload.available_start_date || "";
-  endInput.max = payload.available_end_date || "";
   if (snapshot) renderChart(snapshot);
 }
 
 async function loadChartHistory({preferCache = false} = {}) {
   if (document.hidden) return;
-  const requestedRange = hasCustomChartDates() ? "all" : chartRange;
-  const requestedStart = selectedChartStartDate();
-  const requestedEnd = selectedChartEndDate();
+  const requestedRange = "all";
+  const requestedStart = selectedDetailStartDate();
+  const requestedEnd = selectedDetailEndDate();
   const requestedKey = chartRequestKey();
   const cached = chartHistoryCache.get(requestedKey);
   if (preferCache) {
@@ -1536,6 +1532,7 @@ async function refresh({force = false} = {}) {
       }
     }
     syncFilters(snapshot);
+    await loadChartHistory({preferCache: !force});
     const positionsHydrated = hydrateDefaultPositions(snapshot);
     const revision = revisionOf(snapshot);
     const heavy = revision !== lastRenderedRevision;
@@ -1608,6 +1605,7 @@ function detailDateChanged(event) {
   if (signalAbortController) signalAbortController.abort();
   if (eventAbortController) eventAbortController.abort();
   if (positionAbortController) positionAbortController.abort();
+  chartHistory = null;
   void refresh();
 }
 $("detail-start-date").addEventListener("change", detailDateChanged);
@@ -1632,40 +1630,10 @@ $("signal-body").addEventListener("click", (event) => {
   renderSignals();
   renderSignalFeaturePanel();
 });
-$("equity-time-range").addEventListener("click", (event) => {
-  const button = event.target.closest("button[data-range]");
-  if (!button || !(button.dataset.range in TIME_RANGE_LABELS)) return;
-  chartRange = button.dataset.range;
-  $("equity-start-date").value = "";
-  $("equity-end-date").value = "";
-  try { localStorage.setItem("tw-day-trade-equity-time-range", chartRange); } catch (_error) { /* optional */ }
-  syncChartRangeControl();
-  void loadChartHistory({preferCache: true});
-});
-function chartDateChanged(event) {
-  const startInput = $("equity-start-date");
-  const endInput = $("equity-end-date");
-  if (startInput.value && endInput.value && startInput.value > endInput.value) {
-    if (event.target === startInput) endInput.value = startInput.value;
-    else startInput.value = endInput.value;
-  }
-  syncChartRangeControl();
-  chartHistory = null;
-  if (snapshot) renderChart(snapshot);
-  void loadChartHistory({preferCache: true});
-}
-$("equity-start-date").addEventListener("change", chartDateChanged);
-$("equity-end-date").addEventListener("change", chartDateChanged);
 const forceRefreshButton = $("force-refresh");
 if (forceRefreshButton) {
   forceRefreshButton.addEventListener("click", () => void refresh({force: true}));
 }
-$("clear-equity-dates").addEventListener("click", () => {
-  $("equity-start-date").value = "";
-  $("equity-end-date").value = "";
-  syncChartRangeControl();
-  void loadChartHistory({preferCache: true});
-});
 $("chart-legend").addEventListener("click", (event) => {
   const button = event.target.closest("button[data-series-id]");
   if (!button) return;
@@ -1676,9 +1644,7 @@ $("chart-legend").addEventListener("click", (event) => {
   if (snapshot) renderChart(snapshot);
 });
 setInterval(() => { $("clock").textContent = new Date().toLocaleString("zh-TW", {timeZone:"Asia/Taipei", hour12:false}); }, 1000);
-syncChartRangeControl();
 Dashboard.scheduleRefresh(() => {
   void refresh();
-  void loadChartHistory();
 }, {intervalMs: PRICE_REFRESH_MS});
 Dashboard.scheduleRefresh(loadTwPublicMonitor, {intervalMs: TW_PUBLIC_STATUS_REFRESH_MS});

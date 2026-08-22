@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 import hashlib
 import json
 import math
@@ -27,6 +27,7 @@ except ImportError:  # pragma: no cover - the fintech runtime includes Polars.
 
     class PolarsError(Exception):
         """Compatibility exception used when the optional fast reader is absent."""
+
 
 from stockagent.data.taifex_sessions import (
     TAIPEI,
@@ -56,6 +57,12 @@ HISTORY_RANGE_SECONDS: Final[dict[str, int | None]] = {
 
 _LINE_COUNT_LOCK = threading.Lock()
 _LINE_COUNT_CACHE: dict[Path, tuple[int, int, int, int, int]] = {}
+
+_VERIFIED_HASH_LOCK = threading.Lock()
+_VERIFIED_HASH_CACHE: dict[
+    tuple[Path, str],
+    tuple[int, int, int, int, bool],
+] = {}
 
 
 @dataclass
@@ -96,6 +103,7 @@ _HISTORY_POLARS_SCHEMA: Final[dict[str, Any]] = (
         "future_book_valid": pl.Boolean,
         "valuation_available": pl.Boolean,
         "valuation_carried_forward": pl.Boolean,
+        "valuation_age_seconds": pl.Float64,
         "history_source": pl.String,
         "replay_id": pl.String,
         "replay_contract_version": pl.Int64,
@@ -218,61 +226,269 @@ def _filtered_history_rows_polars(
     path: Path,
     *,
     minimum_decision_ts_ns: int,
+    excluded_intervals: Mapping[str, tuple[int, int]] | None = None,
+    bucket_width_ns: int | None = None,
+    capital_by_strategy: Mapping[str, float] | None = None,
 ) -> list[dict[str, Any]] | None:
     """Read a modern bounded history window without materializing the raw ledger.
 
     Polars parses NDJSON and projects only public-curve inputs in native code.
-    Modern marks persist explicit valuation availability, so rows before the
-    requested window cannot affect their valuation.  A selected legacy row
-    without that field returns ``None`` and deliberately falls back to the
-    complete Python scan, preserving its historical carry-forward semantics.
+    The lazy reader projects only curve columns and applies the time/authority
+    predicates before materializing Python rows.  Modern rows retain their
+    recorded valuation age; a bounded legacy carry that needs a pre-window seed
+    deliberately falls back to the canonical complete scan.
     """
 
     if pl is None or not path.is_file():
         return None
     try:
-        frame = pl.read_ndjson(
+        frame = pl.scan_ndjson(
             path,
             schema=_HISTORY_POLARS_SCHEMA,
-            low_memory=False,
+            low_memory=True,
         )
+        allowed = pl.lit(True)
+        grouped_exclusions: dict[tuple[int, int], list[str]] = {}
+        for strategy_id, interval in (excluded_intervals or {}).items():
+            grouped_exclusions.setdefault(
+                (int(interval[0]), int(interval[1])), []
+            ).append(str(strategy_id))
+        for (start_ns, end_ns), strategy_ids in grouped_exclusions.items():
+            allowed &= ~(
+                pl.col("strategy_id").is_in(strategy_ids)
+                & pl.col("decision_ts_ns")
+                .fill_null(0)
+                .is_between(
+                    start_ns,
+                    end_ns,
+                    closed="both",
+                )
+            )
+        frame = frame.filter(allowed)
         selected = frame.filter(
-            pl.col("decision_ts_ns").fill_null(0)
-            >= int(minimum_decision_ts_ns)
+            pl.col("decision_ts_ns").fill_null(0) >= int(minimum_decision_ts_ns)
         )
+        if bucket_width_ns is not None:
+            capital_fallback = pl.col("strategy_id").replace_strict(
+                {
+                    str(strategy_id): float(capital)
+                    for strategy_id, capital in (capital_by_strategy or {}).items()
+                },
+                default=0.0,
+                return_dtype=pl.Float64,
+            )
+            initial_capital = (
+                pl.when(pl.col("initial_capital_twd").fill_null(0.0) > 0.0)
+                .then(pl.col("initial_capital_twd"))
+                .otherwise(capital_fallback)
+            )
+            contributed_capital = (
+                pl.when(
+                    pl.col("cumulative_contributed_capital_twd").fill_null(0.0) > 0.0
+                )
+                .then(pl.col("cumulative_contributed_capital_twd"))
+                .otherwise(initial_capital)
+            )
+            cumulative_pnl = (
+                pl.when(
+                    pl.col("valuation_carried_forward").fill_null(False)
+                    & pl.col("open_liquidation_value_twd").is_not_null()
+                )
+                .then(
+                    pl.col("gross_cash_twd").fill_null(0.0)
+                    + pl.col("open_liquidation_value_twd")
+                    - pl.col("fixed_fees_twd").fill_null(0.0)
+                    - pl.col("transaction_tax_twd").fill_null(0.0)
+                )
+                .otherwise(pl.coalesce(("cumulative_pnl_twd", "net_equity_twd")))
+            )
+            selection_return = (
+                pl.when(
+                    pl.col("valuation_available").fill_null(False)
+                    & (contributed_capital > 0.0)
+                )
+                .then(cumulative_pnl / contributed_capital)
+                .otherwise(None)
+                .alias("__selection_return")
+            )
+            selected = selected.with_columns(
+                selection_return,
+                (
+                    pl.col("decision_ts_ns").fill_null(0)
+                    // max(1, int(bucket_width_ns))
+                ).alias("__bucket"),
+            )
+            group_columns = ["strategy_id", "__bucket"]
+            selected = selected.with_columns(
+                pl.col("__selection_return")
+                .min()
+                .over(group_columns)
+                .alias("__minimum_return"),
+                pl.col("__selection_return")
+                .max()
+                .over(group_columns)
+                .alias("__maximum_return"),
+            )
+            selected = selected.with_columns(
+                pl.when(pl.col("__selection_return") == pl.col("__minimum_return"))
+                .then(pl.col("decision_ts_ns"))
+                .otherwise(None)
+                .min()
+                .over(group_columns)
+                .alias("__minimum_ts"),
+                pl.when(pl.col("__selection_return") == pl.col("__maximum_return"))
+                .then(pl.col("decision_ts_ns"))
+                .otherwise(None)
+                .min()
+                .over(group_columns)
+                .alias("__maximum_ts"),
+            )
+            selected = selected.with_columns(
+                pl.when(pl.col("__selection_return").is_not_null())
+                .then(pl.col("decision_ts_ns"))
+                .otherwise(None)
+                .min()
+                .over("strategy_id")
+                .alias("__first_strategy_ts"),
+                pl.when(pl.col("__selection_return").is_not_null())
+                .then(pl.col("decision_ts_ns"))
+                .otherwise(None)
+                .max()
+                .over("strategy_id")
+                .alias("__last_strategy_ts"),
+            )
+            selected = selected.filter(
+                pl.col("valuation_available").is_null()
+                | (
+                    pl.col("valuation_carried_forward").fill_null(False)
+                    & pl.col("valuation_age_seconds").is_null()
+                )
+                | (pl.col("decision_ts_ns") == pl.col("__minimum_ts"))
+                | (pl.col("decision_ts_ns") == pl.col("__maximum_ts"))
+                | (pl.col("decision_ts_ns") == pl.col("__first_strategy_ts"))
+                | (pl.col("decision_ts_ns") == pl.col("__last_strategy_ts"))
+            ).drop(
+                (
+                    "__selection_return",
+                    "__bucket",
+                    "__minimum_return",
+                    "__maximum_return",
+                    "__minimum_ts",
+                    "__maximum_ts",
+                    "__first_strategy_ts",
+                    "__last_strategy_ts",
+                )
+            )
     except (OSError, PolarsError):
         return None
-    if selected.is_empty():
-        return []
-    if selected.get_column("valuation_available").null_count() > 0:
+    try:
+        materialized = selected.collect(engine="streaming")
+    except (OSError, PolarsError):
         return None
-    has_validity_flags = pl.col("option_books_valid").is_not_null() | pl.col(
-        "future_book_valid"
-    ).is_not_null()
-    fresh_complete = (~has_validity_flags) | (
-        pl.col("option_books_valid").fill_null(False)
-        & pl.col("future_book_valid").fill_null(False)
+    if materialized.is_empty():
+        return []
+    first_timestamp = _first_mark_timestamp_ns(path)
+    needs_legacy_seed = bool(
+        first_timestamp is not None
+        and int(minimum_decision_ts_ns) > first_timestamp
+        and materialized.filter(
+            pl.col("valuation_available").is_null()
+            | (
+                pl.col("valuation_carried_forward").fill_null(False)
+                & pl.col("valuation_age_seconds").is_null()
+            )
+        ).height
     )
-    seeds = (
-        frame.filter(
-            (pl.col("decision_ts_ns").fill_null(0) < int(minimum_decision_ts_ns))
-            & pl.col("open_liquidation_value_twd").is_not_null()
-            & fresh_complete
-        )
-        .sort("decision_ts_ns")
-        .unique(subset=["strategy_id"], keep="last", maintain_order=True)
-    )
-    frame = pl.concat((seeds, selected), how="vertical")
+    if needs_legacy_seed:
+        return None
     # Missing JSON keys become null under an explicit projection.  Removing
     # null keys preserves dict.get(default) behavior in the canonical projector.
     return [
         {key: value for key, value in row.items() if value is not None}
-        for row in frame.to_dicts()
+        for row in materialized.to_dicts()
     ]
 
 
+def _verified_marks_hash(path: Path, *, expected_hash: str) -> bool:
+    """Verify an immutable marks file once per unchanged process generation."""
+
+    cache_key = (path.resolve(), str(expected_hash))
+    try:
+        with path.open("rb") as handle:
+            before = os.fstat(handle.fileno())
+            fingerprint = (
+                before.st_dev,
+                before.st_ino,
+                before.st_size,
+                before.st_mtime_ns,
+            )
+            with _VERIFIED_HASH_LOCK:
+                cached = _VERIFIED_HASH_CACHE.get(cache_key)
+                if cached is not None and cached[:4] == fingerprint:
+                    return bool(cached[4])
+            digest = hashlib.sha256()
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+            after = os.fstat(handle.fileno())
+    except OSError:
+        return False
+    unchanged = fingerprint == (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+    )
+    verified = unchanged and digest.hexdigest() == expected_hash
+    with _VERIFIED_HASH_LOCK:
+        _VERIFIED_HASH_CACHE[cache_key] = (*fingerprint, verified)
+    return verified
+
+
+def _receipt_date(value: object) -> date | None:
+    try:
+        return date.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _receipt_supersedes(
+    newer: Mapping[str, Any],
+    older: Mapping[str, Any],
+) -> bool:
+    """Return whether a verified receipt explicitly replaces an older one."""
+
+    older_version = int(older.get("replay_contract_version") or 0)
+    declared_versions = {
+        int(version)
+        for version in newer.get("supersedes_replay_contract_versions") or ()
+        if str(version).strip().lstrip("-").isdigit()
+    }
+    if older_version not in declared_versions:
+        return False
+    if newer.get("history_authority") != (
+        "receipt_verified_replay_over_live_same_interval"
+    ):
+        return False
+    newer_ids = {str(value) for value in newer.get("strategy_ids") or ()}
+    older_ids = {str(value) for value in older.get("strategy_ids") or ()}
+    if not older_ids or not older_ids.issubset(newer_ids):
+        return False
+    newer_start = _receipt_date(newer.get("requested_start_date"))
+    newer_end = _receipt_date(newer.get("requested_end_date"))
+    older_start = _receipt_date(older.get("requested_start_date"))
+    older_end = _receipt_date(older.get("requested_end_date"))
+    return bool(
+        newer_start is not None
+        and newer_end is not None
+        and older_start is not None
+        and older_end is not None
+        and newer_start <= older_start
+        and newer_end >= older_end
+    )
+
+
 def _history_backfill_receipts(state_dir: Path) -> list[dict[str, Any]]:
-    receipts: list[dict[str, Any]] = []
+    candidates: list[dict[str, Any]] = []
     for path in sorted((Path(state_dir) / "backfills").glob("*/receipt.json")):
         try:
             payload = _load_object(path)
@@ -286,19 +502,7 @@ def _history_backfill_receipts(state_dir: Path) -> list[dict[str, Any]]:
         )
         if not expected_hash:
             continue
-        digest = hashlib.sha256()
-        try:
-            with mark_path.open("rb") as handle:
-                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                    digest.update(chunk)
-        except OSError:
-            continue
-        if digest.hexdigest() != expected_hash:
-            # The producer commits receipt.json last.  During a refresh, readers
-            # see either the old verified generation or no backfill, never a
-            # partially replaced curve.
-            continue
-        receipts.append(
+        candidates.append(
             {
                 "path": path,
                 "mark_path": mark_path,
@@ -314,9 +518,33 @@ def _history_backfill_receipts(state_dir: Path) -> list[dict[str, Any]]:
                 "requested_end_date": payload.get("requested_end_date"),
                 "source_coverage": payload.get("source_coverage") or [],
                 "record_counts": payload.get("record_counts") or {},
+                "supersedes_replay_contract_versions": payload.get(
+                    "supersedes_replay_contract_versions"
+                )
+                or [],
                 "marks_sha256": expected_hash,
             }
         )
+    candidates.sort(
+        key=lambda row: (
+            int(row.get("replay_contract_version") or 0),
+            str(row["path"]),
+        ),
+        reverse=True,
+    )
+    receipts: list[dict[str, Any]] = []
+    for candidate in candidates:
+        if any(_receipt_supersedes(receipt, candidate) for receipt in receipts):
+            continue
+        if not _verified_marks_hash(
+            Path(candidate["mark_path"]),
+            expected_hash=str(candidate["marks_sha256"]),
+        ):
+            # The producer commits receipt.json last.  During a refresh, readers
+            # see either a verified generation or no backfill, never a partial
+            # replacement.  An invalid newer receipt cannot hide an older one.
+            continue
+        receipts.append(candidate)
     receipts.sort(
         key=lambda row: (
             int(row.get("replay_contract_version") or 0),
@@ -328,9 +556,16 @@ def _history_backfill_receipts(state_dir: Path) -> list[dict[str, Any]]:
 
 def _authoritative_replay_intervals(
     state_dir: Path,
+    *,
+    receipts: list[dict[str, Any]] | None = None,
 ) -> dict[str, tuple[int, int, int]]:
     intervals: dict[str, tuple[int, int, int]] = {}
-    for receipt in _history_backfill_receipts(Path(state_dir)):
+    selected_receipts = (
+        receipts
+        if receipts is not None
+        else _history_backfill_receipts(Path(state_dir))
+    )
+    for receipt in selected_receipts:
         if receipt.get("history_authority") != (
             "receipt_verified_replay_over_live_same_interval"
         ):
@@ -356,10 +591,17 @@ def _authoritative_replay_intervals(
     return intervals
 
 
-def _history_mark_paths(state_dir: Path) -> list[Path]:
-    paths = [
-        row["mark_path"] for row in _history_backfill_receipts(Path(state_dir))
-    ]
+def _history_mark_paths(
+    state_dir: Path,
+    *,
+    receipts: list[dict[str, Any]] | None = None,
+) -> list[Path]:
+    selected_receipts = (
+        receipts
+        if receipts is not None
+        else _history_backfill_receipts(Path(state_dir))
+    )
+    paths = [row["mark_path"] for row in selected_receipts]
     paths.append(Path(state_dir) / "marks.jsonl")
     return paths
 
@@ -399,14 +641,14 @@ def _downsample_history_rows(
         )
         output.extend(
             sorted(
-                {int(row["decision_ts_ns"]): row for row in (minimum, maximum)}.values(),
+                {
+                    int(row["decision_ts_ns"]): row for row in (minimum, maximum)
+                }.values(),
                 key=lambda row: int(row["decision_ts_ns"]),
             )
         )
     output.append(rows[-1])
-    output = list(
-        {int(row["decision_ts_ns"]): row for row in output}.values()
-    )
+    output = list({int(row["decision_ts_ns"]): row for row in output}.values())
     output.sort(key=lambda row: int(row["decision_ts_ns"]))
     if len(output) <= maximum_rows:
         return output
@@ -418,6 +660,99 @@ def _trading_date_from_ns(decision_ts_ns: int) -> str | None:
         return None
     observed_at = datetime.fromtimestamp(decision_ts_ns / 1e9, tz=TAIPEI)
     return taifex_trading_date(observed_at).isoformat()
+
+
+def _cold_daily_pnl_endpoints_polars(
+    path: Path,
+    *,
+    strategy_ids: tuple[str, ...],
+) -> (
+    dict[
+        str,
+        dict[str, tuple[int, float] | tuple[int, float, float]],
+    ]
+    | None
+):
+    """Project one endpoint per TAIFEX-shaped day before exact date folding."""
+
+    if pl is None or not path.is_file():
+        return None
+    try:
+        frame = pl.scan_ndjson(
+            path,
+            schema=_HISTORY_POLARS_SCHEMA,
+            low_memory=True,
+        ).filter(pl.col("strategy_id").is_in(strategy_ids))
+        has_validity_flags = (
+            pl.col("option_books_valid").is_not_null()
+            | pl.col("future_book_valid").is_not_null()
+        )
+        valid_legacy_book = (~has_validity_flags) | (
+            pl.col("option_books_valid").fill_null(False)
+            & pl.col("future_book_valid").fill_null(False)
+        )
+        valuation_valid = (
+            pl.when(pl.col("valuation_available").is_not_null())
+            .then(pl.col("valuation_available"))
+            .otherwise(valid_legacy_book)
+        )
+        frame = (
+            frame.with_columns(
+                pl.coalesce(("cumulative_pnl_twd", "net_equity_twd")).alias("__pnl"),
+                pl.coalesce(
+                    (
+                        "cumulative_contributed_capital_twd",
+                        "initial_capital_twd",
+                    )
+                ).alias("__capital"),
+                (
+                    (pl.col("decision_ts_ns").fill_null(0) - 24_600_000_000_000)
+                    // 86_400_000_000_000
+                ).alias("__nominal_trading_day"),
+            )
+            .filter(
+                valuation_valid
+                & pl.col("decision_ts_ns").fill_null(0).gt(0)
+                & pl.col("__pnl").is_not_null()
+                & pl.col("__pnl").is_finite()
+            )
+            .sort(("strategy_id", "decision_ts_ns"))
+            .group_by(
+                ("strategy_id", "__nominal_trading_day"),
+                maintain_order=True,
+            )
+            .agg(
+                pl.col("decision_ts_ns").last(),
+                pl.col("__pnl").last(),
+                pl.col("__capital").last(),
+            )
+        )
+        rows = frame.collect(engine="streaming").to_dicts()
+    except (OSError, PolarsError):
+        return None
+
+    output: dict[
+        str,
+        dict[str, tuple[int, float] | tuple[int, float, float]],
+    ] = {strategy_id: {} for strategy_id in strategy_ids}
+    for row in rows:
+        strategy_id = str(row.get("strategy_id") or "")
+        if strategy_id not in output:
+            continue
+        decision_ts_ns = int(row.get("decision_ts_ns") or 0)
+        trading_date = _trading_date_from_ns(decision_ts_ns)
+        pnl = _optional_float(row.get("__pnl"))
+        if trading_date is None or pnl is None:
+            continue
+        capital = _optional_float(row.get("__capital"))
+        previous = output[strategy_id].get(trading_date)
+        if previous is None or decision_ts_ns >= previous[0]:
+            output[strategy_id][trading_date] = (
+                (decision_ts_ns, pnl, capital)
+                if capital is not None and capital > 0.0
+                else (decision_ts_ns, pnl)
+            )
+    return output
 
 
 def _daily_pnl_endpoints(
@@ -447,6 +782,19 @@ def _daily_pnl_endpoints(
                 inode=stat.st_ino,
             )
             _PERFORMANCE_CACHE[cache_key] = cached
+        if cached.offset == 0 and stat.st_size > 0:
+            handle.seek(stat.st_size - 1)
+            ends_with_newline = handle.read(1) == b"\n"
+            if ends_with_newline:
+                cold_endpoints = _cold_daily_pnl_endpoints_polars(
+                    path,
+                    strategy_ids=strategy_ids,
+                )
+                if cold_endpoints is not None:
+                    cached.endpoints = cold_endpoints
+                    cached.offset = stat.st_size
+                    cached.file_size = stat.st_size
+                    cached.mtime_ns = stat.st_mtime_ns
         if cached.file_size != stat.st_size or cached.mtime_ns != stat.st_mtime_ns:
             handle.seek(cached.offset)
             appended = handle.read(stat.st_size - cached.offset)
@@ -495,8 +843,7 @@ def _daily_pnl_endpoints(
                 if previous is None or decision_ts_ns >= previous[0]:
                     strategy_endpoints[trading_date] = (
                         (decision_ts_ns, pnl, contributed_capital)
-                        if contributed_capital is not None
-                        and contributed_capital > 0.0
+                        if contributed_capital is not None and contributed_capital > 0.0
                         else (decision_ts_ns, pnl)
                     )
             cached.offset += complete_size
@@ -861,23 +1208,43 @@ def _build_history_rows(
     minimum_decision_ts_ns: int | None = None,
     bucket_width_ns: int | None = None,
     scan_all: bool = False,
+    backfill_receipts: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """Build only the bounded public curve from the tail of the marks ledger."""
 
     mark_limit = max(1, min(int(mark_limit_per_strategy), 1_440))
-    maximum_source_rows = max(
-        1, mark_limit * max(1, len(strategy_ids)) * 2
-    )
+    maximum_source_rows = max(1, mark_limit * max(1, len(strategy_ids)) * 2)
     raw_marks_by_key: dict[tuple[str, int], dict[str, Any]] = {}
-    authoritative_intervals = _authoritative_replay_intervals(Path(state_dir))
+    selected_receipts = (
+        backfill_receipts
+        if backfill_receipts is not None
+        else _history_backfill_receipts(Path(state_dir))
+    )
+    authoritative_intervals = _authoritative_replay_intervals(
+        Path(state_dir), receipts=selected_receipts
+    )
     live_mark_path = Path(state_dir) / "marks.jsonl"
     # Backfills are read first.  A formal live mark at the same strategy/time
     # is authoritative and replaces the historical replay row.
-    for mark_path in _history_mark_paths(Path(state_dir)):
+    backfill_versions = {
+        Path(receipt["mark_path"]): int(receipt.get("replay_contract_version") or 0)
+        for receipt in selected_receipts
+    }
+    for mark_path in _history_mark_paths(Path(state_dir), receipts=selected_receipts):
+        source_version = backfill_versions.get(mark_path)
+        excluded_intervals = {
+            strategy_id: (interval[0], interval[1])
+            for strategy_id, interval in authoritative_intervals.items()
+            if mark_path == live_mark_path
+            or (source_version is not None and source_version < interval[2])
+        }
         fast_rows = (
             _filtered_history_rows_polars(
                 mark_path,
                 minimum_decision_ts_ns=int(minimum_decision_ts_ns),
+                excluded_intervals=excluded_intervals,
+                bucket_width_ns=bucket_width_ns,
+                capital_by_strategy=capital_by_strategy,
             )
             if scan_all and minimum_decision_ts_ns is not None
             else None
@@ -918,6 +1285,9 @@ def _build_history_rows(
     }
     grouped_buckets: dict[str, dict[int, list[dict[str, Any]]]] = {
         str(strategy_id): {} for strategy_id in strategy_ids
+    }
+    series_boundaries: dict[str, list[dict[str, Any]]] = {
+        str(strategy_id): [] for strategy_id in strategy_ids
     }
     last_complete_open_value: dict[str, tuple[object, int, int, float, int]] = {}
     for mark in raw_marks:
@@ -990,51 +1360,52 @@ def _build_history_rows(
             if carried
             else decision_ts_ns
         )
+        stored_valuation_age = _optional_float(mark.get("valuation_age_seconds"))
         public_row = {
-                "recorded_at_utc": mark.get("recorded_at_utc"),
-                "decision_ts_ns": decision_ts_ns,
-                "strategy_id": strategy_id,
-                "net_equity_twd": cumulative_pnl,
-                "cumulative_pnl_twd": cumulative_pnl,
-                "initial_capital_twd": initial_capital,
-                "cumulative_contributed_capital_twd": contributed_capital,
-                "total_equity_twd": total_equity,
-                "gross_cash_twd": gross_cash,
-                "open_liquidation_value_twd": open_value,
-                "fixed_fees_twd": fixed_fees,
-                "transaction_tax_twd": transaction_tax,
-                "explicit_cost_twd": fixed_fees + transaction_tax,
-                "futures_position": futures_position,
-                "underlying_futures_position": underlying_futures_position,
-                "fixed_capital_return": (
-                    cumulative_pnl / contributed_capital
-                    if cumulative_pnl is not None and contributed_capital > 0.0
-                    else None
-                ),
-                "capital_contribution_count": int(
-                    mark.get("capital_contribution_count") or 0
-                ),
-                "recapitalization_count": int(
-                    mark.get("recapitalization_count") or 0
-                ),
-                "bankruptcy_count": int(mark.get("bankruptcy_count") or 0),
-                "entry_state": mark.get("entry_state"),
-                "alive": bool(mark.get("alive", True)),
-                "valuation_available": valuation_available,
-                "valuation_stale": carried,
-                "valuation_carried_forward": carried,
-                "valuation_age_seconds": (
-                    max(0.0, (decision_ts_ns - cached_ts) / 1e9)
-                    if carried and cached_ts
-                    else 0.0
-                    if valuation_available
-                    else None
-                ),
-                "history_source": mark.get("history_source", "live_forward_ledger"),
-                "replay_id": mark.get("replay_id"),
-                "replay_contract_version": mark.get("replay_contract_version"),
-                "history_event": mark.get("history_event"),
-            }
+            "recorded_at_utc": mark.get("recorded_at_utc"),
+            "decision_ts_ns": decision_ts_ns,
+            "strategy_id": strategy_id,
+            "net_equity_twd": cumulative_pnl,
+            "cumulative_pnl_twd": cumulative_pnl,
+            "initial_capital_twd": initial_capital,
+            "cumulative_contributed_capital_twd": contributed_capital,
+            "total_equity_twd": total_equity,
+            "gross_cash_twd": gross_cash,
+            "open_liquidation_value_twd": open_value,
+            "fixed_fees_twd": fixed_fees,
+            "transaction_tax_twd": transaction_tax,
+            "explicit_cost_twd": fixed_fees + transaction_tax,
+            "futures_position": futures_position,
+            "underlying_futures_position": underlying_futures_position,
+            "fixed_capital_return": (
+                cumulative_pnl / contributed_capital
+                if cumulative_pnl is not None and contributed_capital > 0.0
+                else None
+            ),
+            "capital_contribution_count": int(
+                mark.get("capital_contribution_count") or 0
+            ),
+            "recapitalization_count": int(mark.get("recapitalization_count") or 0),
+            "bankruptcy_count": int(mark.get("bankruptcy_count") or 0),
+            "entry_state": mark.get("entry_state"),
+            "alive": bool(mark.get("alive", True)),
+            "valuation_available": valuation_available,
+            "valuation_stale": carried,
+            "valuation_carried_forward": carried,
+            "valuation_age_seconds": (
+                stored_valuation_age
+                if carried and stored_valuation_age is not None
+                else max(0.0, (decision_ts_ns - cached_ts) / 1e9)
+                if carried and cached_ts
+                else 0.0
+                if valuation_available
+                else None
+            ),
+            "history_source": mark.get("history_source", "live_forward_ledger"),
+            "replay_id": mark.get("replay_id"),
+            "replay_contract_version": mark.get("replay_contract_version"),
+            "history_event": mark.get("history_event"),
+        }
         if minimum_decision_ts_ns is not None and decision_ts_ns < int(
             minimum_decision_ts_ns
         ):
@@ -1045,6 +1416,13 @@ def _build_history_rows(
             value = _optional_float(public_row.get("fixed_capital_return"))
             if value is None:
                 continue
+            boundaries = series_boundaries[strategy_id]
+            if not boundaries:
+                boundaries.append(public_row)
+            elif len(boundaries) == 1:
+                boundaries.append(public_row)
+            else:
+                boundaries[-1] = public_row
             candidates = [*bucket, public_row]
             minimum = min(
                 candidates,
@@ -1055,7 +1433,9 @@ def _build_history_rows(
                 key=lambda row: float(row.get("fixed_capital_return") or 0.0),
             )
             bucket[:] = sorted(
-                {int(row["decision_ts_ns"]): row for row in (minimum, maximum)}.values(),
+                {
+                    int(row["decision_ts_ns"]): row for row in (minimum, maximum)
+                }.values(),
                 key=lambda row: int(row["decision_ts_ns"]),
             )
         else:
@@ -1068,6 +1448,10 @@ def _build_history_rows(
                 for bucket in grouped_buckets[str(strategy_id)].values()
                 for row in bucket
             ]
+            series_rows.extend(series_boundaries[str(strategy_id)])
+            series_rows = list(
+                {int(row["decision_ts_ns"]): row for row in series_rows}.values()
+            )
             history.extend(
                 _downsample_history_rows(series_rows, maximum_rows=mark_limit)
             )
@@ -1121,12 +1505,14 @@ def build_dashboard_history_snapshot(
     if normalized_range not in HISTORY_RANGE_SECONDS:
         raise ValueError(f"unsupported dashboard history range: {range_key}")
     mark_path = selected_state_dir / "marks.jsonl"
+    backfill_receipts = _history_backfill_receipts(selected_state_dir)
+    history_mark_paths = _history_mark_paths(
+        selected_state_dir,
+        receipts=backfill_receipts,
+    )
     earliest_candidates = [
         timestamp
-        for timestamp in (
-            _first_mark_timestamp_ns(path)
-            for path in _history_mark_paths(selected_state_dir)
-        )
+        for timestamp in (_first_mark_timestamp_ns(path) for path in history_mark_paths)
         if timestamp is not None
     ]
     earliest_ns = min(earliest_candidates) if earliest_candidates else None
@@ -1154,9 +1540,9 @@ def build_dashboard_history_snapshot(
         minimum_decision_ts_ns=cutoff_ns,
         bucket_width_ns=bucket_width_ns,
         scan_all=True,
+        backfill_receipts=backfill_receipts,
     )
     source_updated = _parse_utc(status.get("updated_at_utc"))
-    backfill_receipts = _history_backfill_receipts(selected_state_dir)
     return {
         "dashboard_schema_version": DASHBOARD_SCHEMA_VERSION,
         "generated_at_utc": observed_now.isoformat(),
@@ -1308,9 +1694,7 @@ def build_dashboard_snapshot(
                 "net_equity_twd": cumulative_pnl,
                 "cumulative_pnl_twd": cumulative_pnl,
                 "initial_capital_twd": initial_capital,
-                "cumulative_contributed_capital_twd": (
-                    cumulative_contributed_capital
-                ),
+                "cumulative_contributed_capital_twd": (cumulative_contributed_capital),
                 "total_equity_twd": total_equity,
                 "margin_required_twd": _optional_float(mark.get("margin_required_twd")),
                 "margin_excess_twd": _optional_float(mark.get("margin_excess_twd")),
@@ -1469,9 +1853,7 @@ def build_dashboard_snapshot(
                 current_trading_date=current_trading_date,
                 current_ts_ns=current_ts_ns,
                 current_pnl_twd=row["cumulative_pnl_twd"],
-                reserved_capital_twd=float(
-                    row["cumulative_contributed_capital_twd"]
-                ),
+                reserved_capital_twd=float(row["cumulative_contributed_capital_twd"]),
                 explicit_cost_twd=explicit_cost,
                 margin_required_twd=row["margin_required_twd"],
             )

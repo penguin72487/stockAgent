@@ -995,9 +995,21 @@ def _artifact_backfill_key(cfg: LiveMarketConfig, now: datetime) -> str | None:
     backfill_time = _market_artifact_backfill_time(cfg)
     if not backfill_time:
         return None
+    session_open, _session_reason = _scheduled_market_session_day(cfg, now)
+    if not session_open:
+        # Daily market work follows a weekly exchange-session schedule.  In
+        # particular, a Friday target must not turn into a Saturday/Sunday
+        # retry loop merely because its date is older than the wall clock.
+        return None
     target_date = now.date().isoformat()
     try:
         status = _runtime_status_for_display(cfg)
+        if not bool(getattr(status.data, "fresh", False)):
+            # The pre-signal hook activates an already accepted data release;
+            # it is not a downloader.  Wait for the independent data monitor
+            # and acceptance pipeline instead of retrying a validation command
+            # that cannot make stale data current.
+            return None
         target_date = (
             _date_key(status.data.expected_latest_date)
             or _date_key(status.data.last_data_date)
@@ -4363,9 +4375,10 @@ def _signal_now_background_key(
 
 async def _send_signal_now_background_failure(user_ids: set[int], cfg: LiveMarketConfig, exc: Exception) -> None:
     _log_exception(f"signal_now_background:{cfg.market}", exc)
+    detail = f"\n原因：{str(exc)[:1200]}" if isinstance(exc, BotUserError) else ""
     text = (
         f"`{cfg.market}` 背景資料更新/推論失敗: `{type(exc).__name__}`。\n"
-        f"詳細 traceback 已寫入 `{ERROR_LOG_PATH}`。"
+        f"詳細 traceback 已寫入 `{ERROR_LOG_PATH}`。{detail}"
     )
     for user_id in sorted(user_ids):
         try:
@@ -4431,6 +4444,36 @@ async def _run_signal_now_background_refresh(
                         _log_exception(f"signal_now_preview_dm:{cfg.market}:{user_id}", send_exc)
             except Exception as preview_exc:
                 _log_exception(f"signal_now_preview:{cfg.market}", preview_exc)
+
+        now = datetime.now(ZoneInfo(cfg.timezone or bot.tz.key))
+        session_open, session_reason = await asyncio.to_thread(
+            _scheduled_market_session_day,
+            cfg,
+            now,
+        )
+        if (
+            _market_schedule_interval_minutes(cfg) is None
+            and not session_open
+        ):
+            # A manual query on a weekend/holiday may still inspect the latest
+            # completed panel (the preview above), but opening-data activation,
+            # realtime quotes, and formal inference remain bound to the next
+            # weekly exchange session.
+            waiters = set(bot._signal_now_background_waiters.get(key, set()))
+            notice = (
+                f"`{cfg.market}` 目前為休市時段，依週交易排程不啟動開盤資料更新或即時推論。\n"
+                f"calendar=`{session_reason}`；最新已完成資料若可用，已由快速預覽傳送。"
+            )
+            for user_id in sorted(waiters):
+                try:
+                    user = await bot.fetch_user(int(user_id))
+                    await user.send(notice[:1900])
+                except Exception as send_exc:
+                    _log_exception(
+                        f"signal_now_closed_session_dm:{cfg.market}:{user_id}",
+                        send_exc,
+                    )
+            return
 
         resolved_price_source, status, auto_refreshed = await asyncio.to_thread(
             _prepare_realtime_signal_sync,
@@ -7215,6 +7258,9 @@ async def daily_summary() -> None:
         if not summary_time:
             continue
         now = datetime.now(ZoneInfo(cfg.timezone or bot.tz.key))
+        session_open, _session_reason = _scheduled_market_session_day(cfg, now)
+        if not session_open:
+            continue
         if now.strftime("%H:%M") != summary_time:
             continue
         today = now.strftime("%Y-%m-%d")

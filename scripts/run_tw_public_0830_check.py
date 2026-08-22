@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -238,6 +239,308 @@ def _audit_command(
     ]
 
 
+def _derived_data_commands(
+    *, live_root: Path, expected_latest: str, workers: int = 8
+) -> list[list[str]]:
+    """Build every dated derived layer consumed by live model inference."""
+
+    stock_root = live_root / "stocks"
+    public_feature_path = live_root / "features" / "tw_public_stock_daily.parquet"
+    return [
+        [
+            sys.executable,
+            str(
+                REPO_ROOT
+                / "downloader"
+                / "download_tw_corporate_action_reference.py"
+            ),
+            "--output-dir",
+            str(live_root),
+            "--mode",
+            "daily",
+            "--start-year",
+            "2000",
+            "--end-date",
+            expected_latest,
+            "--workers",
+            str(max(1, int(workers))),
+            "--timeout",
+            "20",
+            "--retries",
+            "2",
+        ],
+        [
+            sys.executable,
+            str(REPO_ROOT / "scripts" / "build_tw_official_symbol_parquets.py"),
+            "--input-dir",
+            str(live_root),
+            "--output-dir",
+            str(stock_root),
+            "--end-date",
+            expected_latest,
+            "--workers",
+            str(max(1, int(workers))),
+            "--allow-daily-publication-lag",
+        ],
+        [
+            sys.executable,
+            str(
+                REPO_ROOT
+                / "downloader"
+                / "download_tw_corporate_action_entitlements.py"
+            ),
+            "--output-dir",
+            str(live_root),
+            "--reference",
+            str(live_root / "tw_corporate_action_reference.parquet"),
+            "--universe-report",
+            str(stock_root / "official_symbol_build_report.csv"),
+            "--start-date",
+            "2014-01-01",
+            "--end-date",
+            expected_latest,
+            "--mode",
+            "daily",
+            "--timeout",
+            "20",
+            "--retries",
+            "2",
+            "--workers",
+            str(max(1, int(workers))),
+        ],
+        [
+            sys.executable,
+            str(REPO_ROOT / "scripts" / "build_tw_public_training_features.py"),
+            "--input-dir",
+            str(live_root),
+            "--output-path",
+            str(public_feature_path),
+            "--symbols-root",
+            str(stock_root),
+            "--end-date",
+            expected_latest,
+            "--allow-daily-publication-lag",
+        ],
+    ]
+
+
+def _derived_data_dates(live_root: Path) -> dict[str, str | None]:
+    """Read effective dates without trusting file mtimes or old receipts."""
+
+    try:
+        import polars as pl
+    except ImportError:
+        return {
+            "corporate_action_reference": None,
+            "corporate_action_entitlements": None,
+            "stock_panel": None,
+            "public_features": None,
+        }
+
+    reference_summary = _json(live_root / "tw_corporate_action_reference.summary.json")
+    entitlement_summary = _json(
+        live_root / "tw_corporate_action_entitlements.summary.json"
+    )
+    dates: dict[str, str | None] = {
+        "corporate_action_reference": str(reference_summary.get("end_date") or "")
+        or None,
+        "corporate_action_entitlements": str(
+            entitlement_summary.get("coverage_end") or ""
+        )
+        or None,
+    }
+    for label, path in (
+        ("stock_panel", live_root / "stocks" / "2330_features.parquet"),
+        (
+            "public_features",
+            live_root / "features" / "tw_public_stock_daily.parquet",
+        ),
+    ):
+        try:
+            value = (
+                pl.scan_parquet(path)
+                .select(pl.col("date").cast(pl.Date, strict=False).max())
+                .collect()
+                .item()
+            )
+        except Exception:
+            value = None
+        dates[label] = value.isoformat() if value is not None else None
+    return dates
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _receipt_dependency_errors(
+    summary_path: Path,
+    *,
+    live_root: Path,
+    keys: tuple[str, ...],
+) -> list[str]:
+    """Verify recorded inputs, including same-date upstream revisions."""
+
+    summary = _json(summary_path)
+    if not summary:
+        return [f"missing summary: {summary_path}"]
+    errors: list[str] = []
+    checked: set[Path] = set()
+    for key in keys:
+        payload = summary.get(key)
+        if isinstance(payload, Mapping):
+            receipts = [payload]
+        elif isinstance(payload, list):
+            receipts = [row for row in payload if isinstance(row, Mapping)]
+        else:
+            continue
+        for receipt in receipts:
+            raw_path = receipt.get("path") or receipt.get("name")
+            expected_sha256 = str(receipt.get("sha256") or "")
+            expected_size = receipt.get("size")
+            if not raw_path or (not expected_sha256 and expected_size is None):
+                continue
+            path = Path(str(raw_path)).expanduser()
+            if not path.is_absolute():
+                path = live_root / path
+            path = path.resolve(strict=False)
+            if path in checked:
+                continue
+            checked.add(path)
+            try:
+                actual_size = path.stat().st_size
+            except OSError:
+                errors.append(f"{key}: missing dependency {path}")
+                continue
+            if expected_size is not None and actual_size != int(expected_size):
+                errors.append(
+                    f"{key}: size mismatch {path.name}: "
+                    f"receipt={expected_size} current={actual_size}"
+                )
+                continue
+            if expected_sha256:
+                try:
+                    actual_sha256 = _sha256_file(path)
+                except OSError as exc:
+                    errors.append(f"{key}: unreadable dependency {path}: {exc}")
+                    continue
+                if actual_sha256 != expected_sha256:
+                    errors.append(f"{key}: sha256 mismatch {path.name}")
+    return errors
+
+
+def _taipei_receipt_date(value: Any) -> str | None:
+    try:
+        timestamp = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=TAIPEI)
+    return timestamp.astimezone(TAIPEI).date().isoformat()
+
+
+def _derived_data_status(
+    live_root: Path,
+    *,
+    expected_latest: str,
+    session_date: str,
+) -> dict[str, Any]:
+    """Resolve derived readiness from dates plus immutable input receipts."""
+
+    dates = _derived_data_dates(live_root)
+    reference_summary_path = live_root / "tw_corporate_action_reference.summary.json"
+    entitlement_summary_path = (
+        live_root / "tw_corporate_action_entitlements.summary.json"
+    )
+    stock_summary_path = live_root / "stocks" / "official_symbol_build_summary.json"
+    feature_summary_path = (
+        live_root / "features" / "tw_public_stock_daily.summary.json"
+    )
+    reference_summary = _json(reference_summary_path)
+    entitlement_summary = _json(entitlement_summary_path)
+    errors: dict[str, list[str]] = {
+        "corporate_action_reference": [],
+        "stock_panel": [],
+        "corporate_action_entitlements": [],
+        "public_features": [],
+    }
+    for label in errors:
+        if dates.get(label) != expected_latest:
+            errors[label].append(
+                f"effective date {dates.get(label)!r} != {expected_latest}"
+            )
+    if (
+        _taipei_receipt_date(reference_summary.get("generated_at_utc"))
+        != session_date
+    ):
+        errors["corporate_action_reference"].append(
+            "reference endpoint was not refreshed in this weekly session"
+        )
+    if reference_summary.get("coverage_complete") is not True or int(
+        reference_summary.get("failure_count") or 0
+    ):
+        errors["corporate_action_reference"].append(
+            "reference coverage receipt is incomplete"
+        )
+    errors["corporate_action_reference"].extend(
+        _receipt_dependency_errors(
+            reference_summary_path,
+            live_root=live_root,
+            keys=("source_receipts",),
+        )
+    )
+    errors["stock_panel"].extend(
+        _receipt_dependency_errors(
+            stock_summary_path,
+            live_root=live_root,
+            keys=(
+                "source_receipts",
+                "fallback_source_receipts",
+                "legacy_source_receipts",
+                "lifecycle_source_receipts",
+                "session_calendar_receipt",
+                "session_calendar_summary_receipt",
+            ),
+        )
+    )
+    if (
+        _taipei_receipt_date(entitlement_summary.get("generated_at_utc"))
+        != session_date
+    ):
+        errors["corporate_action_entitlements"].append(
+            "entitlement endpoints were not refreshed in this weekly session"
+        )
+    if entitlement_summary.get("coverage_complete") is not True or int(
+        entitlement_summary.get("failure_count") or 0
+    ):
+        errors["corporate_action_entitlements"].append(
+            "entitlement coverage receipt is incomplete"
+        )
+    errors["corporate_action_entitlements"].extend(
+        _receipt_dependency_errors(
+            entitlement_summary_path,
+            live_root=live_root,
+            keys=("reference_receipt", "universe_receipt", "raw_receipt_manifest"),
+        )
+    )
+    errors["public_features"].extend(
+        _receipt_dependency_errors(
+            feature_summary_path,
+            live_root=live_root,
+            keys=("source_receipts",),
+        )
+    )
+    return {
+        "dates": dates,
+        "errors": errors,
+        "current": all(not rows for rows in errors.values()),
+    }
+
+
 def main() -> int:
     args = parse_args()
     started = datetime.now(TAIPEI)
@@ -306,29 +609,98 @@ def main() -> int:
     publish: dict[str, Any] = {}
     materialized: dict[str, Any] = {}
     audit: dict[str, Any] = {}
+    derived_status_before: dict[str, Any] = {}
+    derived_status_after: dict[str, Any] = {}
     lock_path = live_root.parent / ".locks" / "tw-public-refresh.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     if not failures:
         with lock_path.open("a+", encoding="utf-8") as lock_handle:
             fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
-            audit_started = time.perf_counter()
-            completed = subprocess.run(
-                _audit_command(config=config, live_root=live_root, output_dir=audit_dir),
-                cwd=REPO_ROOT,
-                check=False,
+            derived_status_before = _derived_data_status(
+                live_root,
+                expected_latest=expected_latest,
+                session_date=session_date,
             )
-            audit = _json(audit_dir / "summary.json")
-            steps.append(
-                {
-                    "step": "strict_model_safety_audit",
-                    "return_code": completed.returncode,
-                    "elapsed_seconds": round(time.perf_counter() - audit_started, 3),
-                    "summary": str(audit_dir / "summary.json"),
-                }
+            step_names = (
+                "refresh_corporate_action_reference",
+                "build_official_symbol_panel",
+                "refresh_corporate_action_entitlements",
+                "build_public_feature_panel",
             )
-            if completed.returncode != 0 or audit.get("model_safe") is not True:
-                failures.append("audit:strict model-safety audit did not pass")
-            else:
+            status_labels = (
+                "corporate_action_reference",
+                "stock_panel",
+                "corporate_action_entitlements",
+                "public_features",
+            )
+            commands = _derived_data_commands(
+                live_root=live_root,
+                expected_latest=expected_latest,
+            )
+            for step_name, status_label, command in zip(
+                step_names, status_labels, commands, strict=True
+            ):
+                current_status = _derived_data_status(
+                    live_root,
+                    expected_latest=expected_latest,
+                    session_date=session_date,
+                )
+                if not current_status["errors"][status_label]:
+                    continue
+                derived_started = time.perf_counter()
+                completed = subprocess.run(command, cwd=REPO_ROOT, check=False)
+                steps.append(
+                    {
+                        "step": step_name,
+                        "return_code": completed.returncode,
+                        "elapsed_seconds": round(
+                            time.perf_counter() - derived_started, 3
+                        ),
+                        "trigger_errors": current_status["errors"][status_label],
+                    }
+                )
+                if completed.returncode != 0:
+                    failures.append(
+                        f"derived_data:{step_name} failed rc={completed.returncode}"
+                    )
+                    break
+            derived_status_after = _derived_data_status(
+                live_root,
+                expected_latest=expected_latest,
+                session_date=session_date,
+            )
+            if not derived_status_after["current"]:
+                failures.append(
+                    "derived_data:effective dates or source receipts are stale: "
+                    f"{derived_status_after['errors']}"
+                )
+
+            if not failures:
+                audit_started = time.perf_counter()
+                completed = subprocess.run(
+                    _audit_command(
+                        config=config,
+                        live_root=live_root,
+                        output_dir=audit_dir,
+                    ),
+                    cwd=REPO_ROOT,
+                    check=False,
+                )
+                audit = _json(audit_dir / "summary.json")
+                steps.append(
+                    {
+                        "step": "strict_model_safety_audit",
+                        "return_code": completed.returncode,
+                        "elapsed_seconds": round(
+                            time.perf_counter() - audit_started, 3
+                        ),
+                        "summary": str(audit_dir / "summary.json"),
+                    }
+                )
+                if completed.returncode != 0 or audit.get("model_safe") is not True:
+                    failures.append("audit:strict model-safety audit did not pass")
+
+            if not failures:
                 publish = _run_json(
                     [
                         str(REPO_ROOT / "scripts" / "run_data_cache.sh"),
@@ -424,6 +796,9 @@ def main() -> int:
         "event_monitor": event_receipt,
         "eligibility_receipt": eligibility_receipt,
         "audit": audit,
+        "derived_data_status_before": derived_status_before,
+        "derived_data_status_after": derived_status_after,
+        "derived_data_dates": _derived_data_dates(live_root),
         "packed_publish": publish,
         "materialized": materialized,
         "snapshot": snapshot,

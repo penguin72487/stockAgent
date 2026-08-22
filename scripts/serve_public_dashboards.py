@@ -61,9 +61,7 @@ PUBLIC_EVENT_LIMIT: Final[int] = 250
 MAX_CACHE_ENTRIES: Final[int] = 512
 MONITOR_STATUS_STALE_GRACE_SECONDS: Final[float] = 30.0
 OVERVIEW_STALE_GRACE_SECONDS: Final[float] = 90.0
-IMMUTABLE_ASSET_CACHE_CONTROL: Final[str] = (
-    "public, max-age=31536000, immutable"
-)
+IMMUTABLE_ASSET_CACHE_CONTROL: Final[str] = "public, max-age=31536000, immutable"
 _OPENER = build_opener(ProxyHandler({}))
 _LATENCY_BUCKETS_MS: Final[tuple[float, ...]] = (
     0.25,
@@ -1055,6 +1053,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
                     "summary",
                     "endpoint_inventory",
                     "provider_summaries",
+                    "integrity_checks",
                     "definitions",
                 )
                 if key in payload
@@ -1140,6 +1139,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
                 stale_grace_seconds=180.0,
                 sanitizer=sanitize_taifex_history,
             )
+
         # Build the largest default payload first.  An immediate request joins
         # this cache key's single flight, while unrelated prewarm work waits
         # instead of competing for CPU and disk bandwidth.
@@ -1664,9 +1664,7 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                         symbol=str(query.get("symbol", [""])[0]),
                         status=str(query.get("status", ["all"])[0]),
                         offset=int(query.get("offset", ["0"])[0]),
-                        limit=int(
-                            query.get("limit", [str(PUBLIC_SIGNAL_LIMIT)])[0]
-                        ),
+                        limit=int(query.get("limit", [str(PUBLIC_SIGNAL_LIMIT)])[0]),
                     )
                 ),
             )

@@ -3,10 +3,10 @@
 # crypto data, 24x7 execution, funding, fees, and public features differ.
 base_config: tw_day_trade_daily_multi_basis_projection_l1_tplus2_close_capital10m.yaml
 
-experiment_name: bybit-standard-usdt-perpetual-daily-multi-basis-projection-l1-public-web-v1
+experiment_name: bybit-endogenous-usdt-perpetual-daily-multi-basis-projection-l1-public-web-v1
 
 runner:
-  output_dir: artifacts/markets/bybit_perpetual_daily_multi_basis_projection_l1_public_web_v1
+  output_dir: artifacts/markets/bybit_perpetual_daily_multi_basis_projection_l1_endogenous_policy_1w_v1
   resume: true
   post_train_infer: false
 
@@ -200,6 +200,12 @@ trading:
   # VIP0 taker fee, charged on each actually executed buy/sell notional.
   buy_fee_rate: 0.00055
   sell_fee_rate: 0.00055
+  # No human turnover budget or forced rebalance rate.  The recurrent executor
+  # derives its no-trade region from the exact applicable fee and the previous
+  # executed holdings; the model learns the proposal, direction, gross, cash,
+  # concentration, and persistence from canonical net log utility.
+  crypto_stateful_proximal_allocator: true
+  crypto_proximal_cost_multiplier: 1.0
   max_turnover_ratio: 0.0
   # Causal capacity uses the prior complete UTC day's official USDT turnover,
   # represented
@@ -217,7 +223,7 @@ training:
   # Hard product contract: one daily target from the preceding 32 completed
   # daily sessions. Intraday source bars are aggregation inputs only.
   lookback: 32
-  epochs: 1000
+  epochs: 10000
   loss_type: log_utility
   # The recurrent executor compiles one fixed four-day block and reuses it. An
   # outer compiled loss would unroll the whole horizon and repeat codegen.
@@ -245,3 +251,9 @@ training:
 
 evaluation:
   eval_log_utility_periods_per_year: 365.0
+  # log_utility already consumes the fee/funding-adjusted canonical ledger.
+  # Keep every human-shaped turnover target disabled; the cost-aware recurrent
+  # allocator and actual fee determine whether a rebalance survives.
+  gamma_turnover: 0.0
+  turnover_budget: 0.0
+  gamma_turnover_budget: 0.0
