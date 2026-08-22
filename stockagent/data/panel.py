@@ -139,6 +139,7 @@ CORPORATE_ACTION_COVERAGE_CONTRACT_VERSION = 2
 # unresolved-only interval used when exact cash entitlements are enabled.
 CORPORATE_ACTION_AVOIDANCE_CONTRACT_VERSION = 2
 FEATURE_FILE_SUFFIX = "_features.parquet"
+HOT_TAIL_DIRNAME = "_hot_tail"
 DEFAULT_EXTERNAL_MARKET_SYMBOL = "__MARKET__"
 EPSILON = 1e-8
 # Treat single-day price ratios beyond 5x or below 1/5x as unusable labels and
@@ -1824,7 +1825,9 @@ def _prepare_symbol_frame(frame: Any, path: Path) -> Any:
 def _load_symbol_frame(path: Path) -> Any:
     if pq is None:
         raise RuntimeError("PyArrow is not available")
-    return _prepare_symbol_frame(pq.read_table(path), path)
+    from downloader.ohlcv_hot_tail import read_logical_parquet
+
+    return _prepare_symbol_frame(read_logical_parquet(path), path)
 
 
 def _coerce_arrow_numeric_column(table, name: str, rows: int) -> np.ndarray:
@@ -2194,7 +2197,9 @@ def _load_symbol_arrays_pyarrow(
     if pq is None:
         raise RuntimeError("PyArrow is not available")
 
-    table = pq.read_table(path)
+    from downloader.ohlcv_hot_tail import read_logical_parquet
+
+    table = read_logical_parquet(path).to_arrow()
     return _symbol_arrays_from_arrow_table(
         table,
         path,
@@ -2233,7 +2238,9 @@ def _load_symbol_arrays_pyarrow_tail(
     tradable_mode: str = "tradable",
     trading_volume_policy: str | bool | None = "auto",
 ) -> _SymbolPanelArrays:
-    table = _read_parquet_tail_table(path, tail_rows)
+    from downloader.ohlcv_hot_tail import read_logical_parquet
+
+    table = read_logical_parquet(path, tail_rows=tail_rows).to_arrow()
     return _symbol_arrays_from_arrow_table(
         table,
         path,
@@ -2517,7 +2524,9 @@ def _load_symbol_arrays_polars_lazy(
     if pq is None:
         raise RuntimeError("PyArrow is not available")
 
-    frame = pl.from_arrow(pq.read_table(path, memory_map=True))
+    from downloader.ohlcv_hot_tail import read_logical_parquet
+
+    frame = read_logical_parquet(path)
     lazy = frame.lazy().sort("date")
     schema_names = set(frame.columns)
     _require_trading_volume_column(path, schema_names, trading_volume_policy)
@@ -3893,7 +3902,14 @@ def load_cached_panel(
         f"{feature_shift_key}"
         f"panel_start_date={normalized_panel_start_date}"
     )
-    source_paths = [*parquet_paths, *security_metadata_paths]
+    hot_tail_paths = [
+        path.parent / HOT_TAIL_DIRNAME / path.name for path in parquet_paths
+    ]
+    source_paths = [
+        *parquet_paths,
+        *(path for path in hot_tail_paths if path.is_file()),
+        *security_metadata_paths,
+    ]
     if external_feature_path is not None:
         source_paths.append(external_feature_path)
     if corporate_action_paths is not None:
@@ -5264,7 +5280,14 @@ def build_panel(
         f"{feature_shift_key}"
         f"panel_start_date={normalized_panel_start_date}"
     )
-    source_paths = [*parquet_paths, *security_metadata_paths]
+    hot_tail_paths = [
+        path.parent / HOT_TAIL_DIRNAME / path.name for path in parquet_paths
+    ]
+    source_paths = [
+        *parquet_paths,
+        *(path for path in hot_tail_paths if path.is_file()),
+        *security_metadata_paths,
+    ]
     if external_feature_path is not None:
         source_paths.append(external_feature_path)
     if corporate_action_paths is not None:

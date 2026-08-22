@@ -25,12 +25,15 @@ const OPERATION_LABELS = {
   streaming: "正在串流",
   complete: "已完成／已到最新",
   unable: "無法完成",
+  deferred: "已延後／未啟用",
+  control: "設定／憑證閘門",
+  reference: "清冊參照／不重複計算",
 };
-const OPERATION_ORDER = {catching_up: 0, streaming: 1, complete: 2, unable: 3};
+const OPERATION_ORDER = {catching_up: 0, streaming: 1, complete: 2, unable: 3, deferred: 4, control: 5, reference: 6};
 const EXECUTION_ORDER = {
   running: 0, streaming: 0, waiting_stream_window: 1, scheduled: 2,
   waiting_quota: 3, waiting: 4, idle_current: 5, on_demand: 6,
-  deferred: 7, not_applicable: 8, not_configured: 9, failed: 10, blocked: 11, unknown: 12,
+  deferred: 7, control: 8, registry_alias: 9, not_applicable: 10, not_configured: 11, failed: 12, blocked: 13, unknown: 14,
 };
 
 function number(value) {
@@ -57,7 +60,7 @@ function ageLabel(seconds) {
 function durationLabel(seconds) {
   const value = number(seconds);
   if (value === null) return null;
-  if (value <= 0) return "已完成";
+  if (value <= 0) return "不到 1 分鐘";
   if (value < 3600) return `約 ${Math.max(1, Math.round(value / 60))} 分鐘`;
   if (value < 86400) return `約 ${(value / 3600).toFixed(value < 36000 ? 1 : 0)} 小時`;
   if (value < 31557600) return `約 ${(value / 86400).toFixed(value < 864000 ? 1 : 0)} 天`;
@@ -83,19 +86,25 @@ function futureLabel(value) {
 }
 
 function etaLabel(eta) {
-  const duration = durationLabel(eta?.remaining_seconds);
-  if (duration) return duration;
+  const stateName = String(eta?.state || "unknown");
+  if (stateName === "complete") return "已完成／已到最新";
+  if (stateName === "deferred") return "未啟用，無完工倒數";
+  if (stateName === "not_applicable") return "不適用";
+  if (stateName === "reference") return "請見專用端點";
+  const remaining = number(eta?.remaining_seconds);
+  if (remaining !== null && remaining > 0) return durationLabel(remaining);
   const labels = {
     continuous: "持續串流，無完工日",
     on_demand: "按需查詢",
     waiting_quota: "等待配額，暫無 ETA",
     waiting_schedule: "待排程，暫無 ETA",
     running_unmeasured: "執行中，正在累積速率",
+    warming_up: "執行中，重新量測 ETA",
     phase_estimate: "執行階段 ETA",
     blocked: "阻擋中",
     unknown: "尚無有效速率",
   };
-  return labels[String(eta?.state || "unknown")] || "暫無可靠 ETA";
+  return labels[stateName] || "暫無可靠 ETA";
 }
 
 function statusLabel(status) {
@@ -164,6 +173,17 @@ function progressBlock(progress, className = "mini-progress") {
     wrap.append(make("span", "", "尚無取得進度證據"));
     return wrap;
   }
+  const progressState = String(progress.state || "");
+  if (["deferred", "not_applicable", "reference", "blocked", "stale_complete_receipt"].includes(progressState)) {
+    wrap.append(make("span", `progress-state ${progress.state}`, progress.label || "進度不適用"));
+    if (progress.basis) wrap.append(make("span", "progress-basis", progress.basis));
+    const evidence = progress.evidence_coverage;
+    const evidenceRatio = number(evidence?.ratio);
+    if (evidenceRatio !== null) {
+      wrap.append(make("span", "progress-evidence", `舊收據證據：${(Math.min(1, Math.max(0, evidenceRatio)) * 100).toFixed(1)}% · ${formatInteger(evidence.current)}/${formatInteger(evidence.total)} ${evidence.unit || ""}`));
+    }
+    return wrap;
+  }
   const ratioValue = number(progress.ratio);
   const bar = document.createElement("progress");
   bar.max = 1;
@@ -179,6 +199,11 @@ function progressBlock(progress, className = "mini-progress") {
     wrap.append(make("span", `progress-state ${progress.state || "unknown"}`, progress.label || "取得狀態未提供"));
   }
   if (progress.basis) wrap.append(make("span", "progress-basis", progress.basis));
+  const evidence = progress.evidence_coverage;
+  const evidenceRatio = number(evidence?.ratio);
+  if (evidenceRatio !== null) {
+    wrap.append(make("span", "progress-evidence", `舊收據證據：${(Math.min(1, Math.max(0, evidenceRatio)) * 100).toFixed(1)}% · ${formatInteger(evidence.current)}/${formatInteger(evidence.total)} ${evidence.unit || ""}`));
+  }
   return wrap;
 }
 
@@ -214,14 +239,19 @@ function renderSummary(data) {
     ? "無更新時間"
     : generated.toLocaleString("zh-TW", {timeZone: "Asia/Taipei", hour12: false});
   const ratio = Math.min(1, Math.max(0, number(summary.source_level_ratio) || 0));
+  const integrity = data.integrity_checks || {};
   $("overall-percent").textContent = `${(ratio * 100).toFixed(1)}% 已完成或串流中`;
   $("overall-progress").value = ratio;
+  $("overall-denominator").textContent = `${formatInteger(summary.completed)} 完成 + ${formatInteger(summary.streaming)} 串流／${formatInteger(summary.active_data_endpoints)} 個主動資料端點；${formatInteger(summary.group_rollups)} 群組、${formatInteger(summary.deferred)} 延後、${formatInteger(summary.control_items)} 設定項、${formatInteger(summary.reference_items)} 清冊參照不進入分母。面板契約矛盾：${formatInteger(integrity.violations)}。`;
   $("registered-items").textContent = formatInteger(summary.registered_items);
-  $("registered-detail").textContent = `${formatInteger(summary.storage_groups)} 群組 · ${formatInteger(summary.product_granularities)} 產品粒度 · ${formatInteger(summary.crypto_fact_families)} 加密事實 · ${formatInteger(summary.credential_gates)} 憑證閘門 · ${formatInteger(summary.logical_sources)} 逐來源`;
+  $("registered-detail").textContent = `${formatInteger(summary.storage_groups)} 群組 · ${formatInteger(summary.product_granularities)} 產品粒度 · ${formatInteger(summary.crypto_fact_families)} 加密事實 · ${formatInteger(summary.credential_gates)} 憑證閘門 · ${formatInteger(summary.reference_items)} 清冊參照 · ${formatInteger(summary.logical_sources)} 逐來源`;
   $("catching-up-items").textContent = formatInteger(summary.catching_up);
   $("streaming-items").textContent = formatInteger(summary.streaming);
   $("completed-items").textContent = formatInteger(summary.completed);
   $("unable-items").textContent = formatInteger(summary.unable);
+  $("deferred-items").textContent = formatInteger(summary.deferred);
+  $("control-items").textContent = formatInteger(summary.control_items);
+  $("control-detail").textContent = `${formatInteger(summary.credential_ready)} 憑證就緒 · ${formatInteger(summary.credential_attention)} 待處理`;
   $("known-rows").textContent = compact(summary.known_group_rows);
   if (data.definitions?.realtime_boundary) $("boundary-copy").textContent = data.definitions.realtime_boundary;
 }
@@ -251,6 +281,13 @@ function groupCard(row) {
     meta.append(item);
   }
   card.append(meta);
+  if (row.active_child_operation_counts) {
+    const counts = Object.entries(row.active_child_operation_counts)
+      .filter(([, count]) => Number(count) > 0)
+      .map(([stateName, count]) => `${OPERATION_LABELS[stateName] || stateName} ${formatInteger(count)}`)
+      .join(" · ");
+    if (counts) card.append(make("p", "child-rollup", `必要子端點：${counts}`));
+  }
   const progress = progressBlock(row.acquisition_progress, "group-progress");
   const progressHead = make("div");
   progressHead.append(make("span", "", row.acquisition_progress?.label || "取得進度"), make("span", "", ageLabel(row.freshness?.age_seconds)));
@@ -339,8 +376,11 @@ function tableRow(row) {
   if (row.eta?.basis) etaText.title = String(row.eta.basis);
   eta.append(etaText);
   if (row.eta?.confidence) eta.append(make("span", "cell-note", `信心：${row.eta.confidence}`));
+  const completionDate = new Date(row.eta?.estimated_complete_at_utc || "");
   const completionTime = timeLabel(row.eta?.estimated_complete_at_utc);
-  if (completionTime) eta.append(make("span", "cell-note", `估計完成：${completionTime}`));
+  if (completionTime && completionDate.getTime() > Date.now()) {
+    eta.append(make("span", "cell-note", `估計完成：${completionTime}`));
+  }
 
   const through = document.createElement("td");
   through.dataset.label = "最近驗證／資料截至";

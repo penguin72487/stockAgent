@@ -317,11 +317,16 @@ def test_replace_user_watch_symbol_updates_or_adds(monkeypatch, tmp_path) -> Non
 def test_artifact_backfill_key_uses_backfill_time_and_skips_interval_markets(monkeypatch) -> None:
     monkeypatch.setattr("services.discord_bot.bot._market_state", lambda market: {})
     monkeypatch.setattr(
+        "services.discord_bot.bot._scheduled_market_session_day",
+        lambda _cfg, _now: (True, "fixture session"),
+    )
+    monkeypatch.setattr(
         "services.discord_bot.bot._runtime_status_for_display",
         lambda cfg: SimpleNamespace(
             data=SimpleNamespace(
                 expected_latest_date="2026-07-06",
                 last_data_date="2026-07-06",
+                fresh=True,
             )
         ),
     )
@@ -351,6 +356,54 @@ def test_artifact_backfill_key_uses_backfill_time_and_skips_interval_markets(mon
     )
     assert _artifact_backfill_key(daily_cfg, now.replace(hour=17, minute=59)) is None
     assert _artifact_backfill_key(interval_cfg, now) is None
+
+
+def test_artifact_backfill_uses_weekly_session_and_freshness_gates(monkeypatch) -> None:
+    cfg = SimpleNamespace(
+        market="tw_day_trade",
+        data_ready_time="13:40",
+        close_time="13:30",
+        summary_time="14:00",
+        schedule_time=None,
+        schedule_interval_minutes=None,
+    )
+    saturday = datetime(2026, 8, 22, 14, 0, tzinfo=ZoneInfo("Asia/Taipei"))
+    monkeypatch.setattr(
+        "services.discord_bot.bot._scheduled_market_session_day",
+        lambda _cfg, _now: (False, "weekend"),
+    )
+    assert _artifact_backfill_key(cfg, saturday) is None
+
+    monday = saturday.replace(day=24)
+    monkeypatch.setattr(
+        "services.discord_bot.bot._scheduled_market_session_day",
+        lambda _cfg, _now: (True, "fixture session"),
+    )
+    monkeypatch.setattr(
+        "services.discord_bot.bot._runtime_status_for_display",
+        lambda _cfg: SimpleNamespace(
+            data=SimpleNamespace(
+                expected_latest_date="2026-08-21",
+                last_data_date="2026-08-20",
+                fresh=False,
+            )
+        ),
+    )
+    assert _artifact_backfill_key(cfg, monday) is None
+
+    monkeypatch.setattr(
+        "services.discord_bot.bot._runtime_status_for_display",
+        lambda _cfg: SimpleNamespace(
+            data=SimpleNamespace(
+                expected_latest_date="2026-08-21",
+                last_data_date="2026-08-21",
+                fresh=True,
+            )
+        ),
+    )
+    assert _artifact_backfill_key(cfg, monday) == (
+        "2026-08-21:tw_day_trade:artifact_backfill"
+    )
 
 
 def test_artifact_backfill_defers_for_opening_critical_day_trade(monkeypatch) -> None:
@@ -651,11 +704,16 @@ def test_artifact_backfill_key_catches_up_previous_session_after_midnight(
 ) -> None:
     monkeypatch.setattr("services.discord_bot.bot._market_state", lambda market: {})
     monkeypatch.setattr(
+        "services.discord_bot.bot._scheduled_market_session_day",
+        lambda _cfg, _now: (True, "fixture session"),
+    )
+    monkeypatch.setattr(
         "services.discord_bot.bot._runtime_status_for_display",
         lambda cfg: SimpleNamespace(
             data=SimpleNamespace(
                 expected_latest_date="2026-07-27",
                 last_data_date="2026-07-27",
+                fresh=True,
             )
         ),
     )

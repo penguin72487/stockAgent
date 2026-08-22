@@ -66,17 +66,12 @@ if [[ ! "$QUOTA_RECHECK_SECONDS" =~ ^[0-9]+$ ]] || \
   exit 2
 fi
 MAX_TRAFFIC_FRACTION="${SHIOAJI_FUTURES_HISTORY_MAX_TRAFFIC_FRACTION:-0.90}"
-TRAFFIC_RESERVE_MB="${SHIOAJI_FUTURES_HISTORY_TRAFFIC_RESERVE_MB:-128}"
-run_fintech_python - "$MAX_TRAFFIC_FRACTION" "$TRAFFIC_RESERVE_MB" <<'PY'
-import math
+run_fintech_python - "$MAX_TRAFFIC_FRACTION" <<'PY'
 import sys
 
 fraction = float(sys.argv[1])
-reserve_mb = float(sys.argv[2])
 if not 0.0 < fraction < 1.0:
     raise SystemExit("SHIOAJI_FUTURES_HISTORY_MAX_TRAFFIC_FRACTION must be within 0..1")
-if not math.isfinite(reserve_mb) or reserve_mb < 0.0:
-    raise SystemExit("SHIOAJI_FUTURES_HISTORY_TRAFFIC_RESERVE_MB must be finite and >= 0")
 PY
 
 if [[ ! -f "$ALIAS_FILE" ]]; then
@@ -94,7 +89,7 @@ print("\n".join(codes))
 PY
 )
 
-echo "[shioaji-futures-history-runner] started=$(TZ=Asia/Taipei date --iso-8601=seconds) end_date=$END_DATE contracts=${#CONTRACTS[@]} max_traffic_fraction=$MAX_TRAFFIC_FRACTION traffic_reserve_mb=$TRAFFIC_RESERVE_MB cutoff=07:45 resume=14:31"
+echo "[shioaji-futures-history-runner] started=$(TZ=Asia/Taipei date --iso-8601=seconds) end_date=$END_DATE contracts=${#CONTRACTS[@]} max_traffic_fraction=$MAX_TRAFFIC_FRACTION cutoff=07:45 resume=14:31"
 for contract in "${CONTRACTS[@]}"; do
   if [[ "$contract" == "TXFR1" ]]; then
     output_dir="data_tw_index_futures/shioaji_history/TXFR1"
@@ -115,8 +110,7 @@ for contract in "${CONTRACTS[@]}"; do
       --contract "$contract" \
       --output-dir "$output_dir" \
       --end-date "$END_DATE" \
-      --max-traffic-fraction "$MAX_TRAFFIC_FRACTION" \
-      --traffic-reserve-mb "$TRAFFIC_RESERVE_MB"
+      --max-traffic-fraction "$MAX_TRAFFIC_FRACTION"
     rc=$?
     set -e
     if (( rc == 0 )); then

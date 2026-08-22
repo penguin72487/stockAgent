@@ -641,6 +641,50 @@ def test_query_drops_one_sided_corrections_and_pre_lifecycle_rows() -> None:
     assert query_audit["source_gap_dates"] == []
 
 
+def test_query_retains_authorized_publication_tail_session() -> None:
+    provisional_date = TRADE_DATE + timedelta(days=3)
+
+    class FakeAPI:
+        def kbars(self, **_: object) -> dict[str, list[object]]:
+            return {
+                "ts": [
+                    datetime.combine(TRADE_DATE, datetime.min.time()).replace(
+                        hour=9, minute=1
+                    ),
+                    datetime.combine(provisional_date, datetime.min.time()).replace(
+                        hour=9, minute=1
+                    ),
+                ],
+                "Open": [100.0, 101.0],
+                "High": [100.0, 101.0],
+                "Low": [100.0, 101.0],
+                "Close": [100.0, 101.0],
+                "Volume": [10, 20],
+                "Amount": [1_000_000.0, 2_020_000.0],
+            }
+
+    row = UniverseRow(
+        "0051", "元大中型100", "twse", "etf", Path("0051_features.parquet")
+    )
+    frame, query_audit = query_minute_chunk(
+        FakeAPI(),
+        object(),
+        row,
+        contract_unit=1_000.0,
+        start=TRADE_DATE,
+        end=provisional_date,
+        timeout_ms=30_000,
+        retries=0,
+        retry_backoff=0.0,
+        expected_dates={TRADE_DATE},
+        provisional_dates={provisional_date},
+    )
+
+    assert frame["date"].to_list() == [TRADE_DATE, provisional_date]
+    assert query_audit["outside_reference_date_rows_dropped"] == 0
+    assert query_audit["source_gap_dates"] == []
+
+
 def test_query_single_day_fallback_records_persistent_source_gap() -> None:
     missing_date = TRADE_DATE - timedelta(days=1)
 

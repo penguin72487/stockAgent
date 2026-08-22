@@ -126,6 +126,8 @@ def _validate_crypto_perpetual_mode_contract(
     sell_fee_rate: object,
     use_tw_public_rules: object,
     portfolio_output_mode: object,
+    stateful_proximal_allocator: object,
+    proximal_cost_multiplier: object,
 ) -> None:
     """Keep the daily Bybit carrying account on one explicit contract."""
 
@@ -155,6 +157,11 @@ def _validate_crypto_perpetual_mode_contract(
     if output_mode not in {"logits", "l1", "cash_l1", "projection_l1"}:
         raise ValueError(
             "crypto_perpetual requires a signed target-weight compatible model output"
+        )
+    if bool(stateful_proximal_allocator) and float(proximal_cost_multiplier) <= 0.0:
+        raise ValueError(
+            "crypto_perpetual stateful proximal allocation requires a positive "
+            "crypto_proximal_cost_multiplier"
         )
 
 
@@ -1036,6 +1043,13 @@ class TradingConfig:
     sell_fee_rate: float
     long_only: bool
     max_turnover_ratio: float = 0.0
+    # Optional recurrent allocation for the daily crypto carrying account.
+    # It derives a no-trade region from the actual one-way fee and the prior
+    # executed portfolio instead of imposing a human-selected turnover cap.
+    crypto_stateful_proximal_allocator: bool = False
+    # 1.0 means the exact configured one-way fee.  Keep this explicit in the
+    # configuration fingerprint even when it is not tuned.
+    crypto_proximal_cost_multiplier: float = 1.0
     max_volume_participation: float = 0.0
     volume_participation_equity: float = 1_000_000.0
     # Reporting/post-processing multiplier only. Canonical train/eval exposure is 1.0.
@@ -3524,6 +3538,20 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
             sell_fee_raw if sell_fee_raw is not None else fee_per_side_raw or 0.0
         )
 
+    trading["crypto_stateful_proximal_allocator"] = bool(
+        trading["crypto_stateful_proximal_allocator"]
+    )
+    trading["crypto_proximal_cost_multiplier"] = float(
+        trading["crypto_proximal_cost_multiplier"]
+    )
+    if (
+        not math.isfinite(trading["crypto_proximal_cost_multiplier"])
+        or trading["crypto_proximal_cost_multiplier"] < 0.0
+    ):
+        raise ValueError(
+            "trading.crypto_proximal_cost_multiplier must be finite and nonnegative"
+        )
+
     # Legacy key is accepted as input but removed from the normalized config payload.
     trading.pop("fee_per_side", None)
     _validate_crypto_perpetual_mode_contract(
@@ -3534,6 +3562,12 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         sell_fee_rate=trading["sell_fee_rate"],
         use_tw_public_rules=data["use_tw_public_rules"],
         portfolio_output_mode=phase_model_config["portfolio_output_mode"],
+        stateful_proximal_allocator=trading[
+            "crypto_stateful_proximal_allocator"
+        ],
+        proximal_cost_multiplier=trading[
+            "crypto_proximal_cost_multiplier"
+        ],
     )
     return raw
 

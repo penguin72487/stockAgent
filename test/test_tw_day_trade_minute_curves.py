@@ -163,8 +163,7 @@ def test_fetch_missing_kbars_never_starts_collector_when_local_data_exists(
         simulation=True,
         workers=1,
         requests_per_second=5.0,
-        max_traffic_fraction=0.75,
-        traffic_reserve_mb=256.0,
+        max_traffic_fraction=0.90,
     )
 
     assert result == {
@@ -218,8 +217,7 @@ def test_fetch_missing_kbars_delegates_only_true_gap_to_canonical_collector(
         simulation=True,
         workers=1,
         requests_per_second=5.0,
-        max_traffic_fraction=0.75,
-        traffic_reserve_mb=256.0,
+        max_traffic_fraction=0.90,
     )
 
     assert result["api_process_started"] is True

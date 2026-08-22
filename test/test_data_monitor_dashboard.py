@@ -56,6 +56,7 @@ def test_data_monitor_registers_catalog_and_marks_stale_receipt(tmp_path: Path) 
 
     assert payload["read_only"] is True
     assert payload["production_control_possible"] is False
+    assert "integrity_checks" in payload
     assert payload["summary"]["storage_groups"] == 1
     assert payload["groups"][0]["id"] == "group:okx"
     assert payload["groups"][0]["status"] == "stale"
@@ -119,6 +120,63 @@ def test_data_monitor_uses_fresh_progress_receipt_for_eta(tmp_path: Path) -> Non
         "目前批次已有 1 個失敗／部分完成項；更新器仍會完成其餘工作並保留錯誤明細。"
         in group["warnings"]
     )
+
+
+def test_structured_progress_receipt_beats_transient_tqdm_log(
+    tmp_path: Path,
+) -> None:
+    registry = tmp_path / "configs/data_sync"
+    registry.mkdir(parents=True)
+    (registry / "packed_datasets.json").write_text(
+        json.dumps(
+            {
+                "datasets": [
+                    {
+                        "dataset": "bybit",
+                        "source": "data_bybit",
+                        "role": "training",
+                        "publish": True,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    data = tmp_path / "data_bybit/1m"
+    data.mkdir(parents=True)
+    (data / "progress.json").write_text(
+        json.dumps(
+            {
+                "state": "running",
+                "phase": "candles",
+                "current": 600,
+                "total": 815,
+                "unit": "symbol",
+                "remaining_seconds": 200,
+                "updated_at_utc": "2026-08-20T01:00:00Z",
+            }
+        ),
+        encoding="utf-8",
+    )
+    logs = tmp_path / "artifacts/daily_downloader/registered_intraday"
+    logs.mkdir(parents=True)
+    (logs / "fixture.log").write_text(
+        "download:bybit: 1%|#| 16/815 [00:10<08:00, 1.0it/s]\n",
+        encoding="utf-8",
+    )
+
+    payload = build_data_monitor_public_status(
+        tmp_path,
+        now=datetime(2026, 8, 20, 1, 1, tzinfo=UTC),
+        refresh_services={"registered_intraday": {"active": True}},
+        shioaji_status={"pipelines": []},
+        openbb_status={},
+    )
+    group = payload["groups"][0]
+
+    assert group["coverage"]["current"] == 600
+    assert group["coverage"]["total"] == 815
+    assert group["eta"]["remaining_seconds"] == 200
 
 
 def test_running_legacy_page_progress_cannot_claim_false_hundred_percent(
@@ -326,13 +384,21 @@ def test_data_monitor_page_is_local_read_only_and_exposes_progress() -> None:
     assert "row.acquisition_progress" in javascript
     assert "發布／偵測／下次取得" in html
     assert "首筆到達就推進下一資料日" in html
-    assert "min-width:1440px" not in (root / "styles.css").read_text(
-        encoding="utf-8"
-    )
+    assert "min-width:1440px" not in (root / "styles.css").read_text(encoding="utf-8")
     assert "正在抓／還沒到最新" in html
     assert "正在串流" in html
     assert "已完成／已到最新" in html
     assert "無法完成" in html
+    assert "已延後／未啟用" in html
+    assert "設定／憑證閘門" in html
+    assert "清冊參照／不重複計算" in html
+    assert "styles.css?v=9" in html
+    assert "app.js?v=13" in html
+    assert 'id="overall-denominator"' in html
+    assert 'id="deferred-items"' in html
+    assert 'id="control-items"' in html
+    assert 'stateName === "complete"' in javascript
+    assert "completionDate.getTime() > Date.now()" in javascript
     assert 'value == null || value === ""' in javascript
 
 
@@ -759,20 +825,379 @@ def test_product_granularity_and_credential_contracts_are_public_but_secret_free
     assert {row["granularity"] for row in product_rows} == {"daily", "1m", "tick"}
     deferred_tick = next(row for row in product_rows if row["granularity"] == "tick")
     assert deferred_tick["status"] == "deferred"
-    assert deferred_tick["operation_state"] == "complete"
+    assert deferred_tick["operation_state"] == "deferred"
     assert deferred_tick["execution_state"] == "deferred"
     assert deferred_tick["in_active_scope"] is False
     assert deferred_tick["is_latest"] is False
+    assert deferred_tick["coverage"] is None
+    assert deferred_tick["acquisition_progress"]["ratio"] is None
+    assert deferred_tick["eta"]["state"] == "deferred"
     assert payload["summary"]["deferred"] == 1
-    assert payload["endpoint_inventory"]["active_scope_total"] == (
-        payload["endpoint_inventory"]["total"] - 1
+    assert payload["endpoint_inventory"]["active_scope_total"] == sum(
+        row["scope"] != "storage_group"
+        and row["operation_state"] not in {"deferred", "control", "reference"}
+        for row in payload["sources"]
     )
     credential = next(
         row for row in payload["sources"] if row["scope"] == "credential_gate"
     )
-    assert credential["operation_state"] == "complete"
+    assert credential["operation_state"] == "control"
+    assert credential["in_active_scope"] is False
+    assert credential["acquisition_progress"]["ratio"] is None
+    assert payload["summary"]["control_items"] == 1
+    assert payload["summary"]["credential_ready"] == 1
     serialized = json.dumps(payload, ensure_ascii=False)
     assert "API key、secret、token 值永不進入公開 payload" in serialized
+
+
+def test_running_saturated_progress_and_expired_eta_are_not_published() -> None:
+    row = {
+        "id": "fixture:phase-transition",
+        "parent_id": "group:yahoo-market",
+        "scope": "logical_source",
+        "title": "phase transition",
+        "provider": "fixture",
+        "status": "updating",
+        "status_label": "still running",
+        "latest_at_utc": "2026-08-20T01:00:00Z",
+        "coverage": {
+            "current": 10,
+            "total": 10,
+            "ratio": 1.0,
+            "unit": "階段",
+            "label": "目前階段",
+        },
+        "freshness": {"state": "current", "age_seconds": 60},
+        "eta": {
+            "state": "estimating",
+            "remaining_seconds": 90,
+            "estimated_complete_at_utc": "2026-08-20T01:00:30Z",
+        },
+        "automation_eligible": True,
+    }
+
+    enriched = dashboard._enrich_and_sort_rows(
+        [row],
+        now=datetime(2026, 8, 20, 1, 2, tzinfo=UTC),
+        refresh_services={"registered_daily": {"active": True}},
+    )[0]
+
+    assert enriched["operation_state"] == "catching_up"
+    assert enriched["execution_state"] == "running"
+    assert enriched["eta"]["state"] == "warming_up"
+    assert enriched["eta"]["remaining_seconds"] is None
+    assert enriched["eta"]["estimated_complete_at_utc"] is None
+    assert enriched["acquisition_progress"]["ratio"] is None
+    assert any("ETA 已過期" in warning for warning in enriched["warnings"])
+
+
+def test_stale_complete_receipt_cannot_claim_current_completion() -> None:
+    row = {
+        "id": "fixture:stale-complete",
+        "parent_id": "group:fixture",
+        "scope": "logical_source",
+        "title": "stale complete",
+        "provider": "fixture",
+        "status": "complete",
+        "status_label": "old batch complete",
+        "latest_at_utc": "2026-08-01T00:00:00Z",
+        "coverage": dashboard._coverage(10, 10, unit="資料集", label="舊收據"),
+        "freshness": {"state": "stale", "age_seconds": 1_000_000},
+        "eta": dashboard._complete_eta(),
+        "automation_eligible": True,
+    }
+
+    enriched = dashboard._enrich_and_sort_rows(
+        [row],
+        now=datetime(2026, 8, 20, tzinfo=UTC),
+        refresh_services={},
+    )[0]
+
+    assert enriched["operation_state"] == "catching_up"
+    assert enriched["is_latest"] is False
+    assert enriched["eta"]["state"] == "waiting_schedule"
+    assert enriched["acquisition_progress"]["ratio"] is None
+    assert enriched["acquisition_progress"]["state"] == "stale_complete_receipt"
+    assert enriched["acquisition_progress"]["evidence_coverage"]["ratio"] == 1.0
+
+
+def test_incomplete_coverage_cannot_be_overridden_by_current_status() -> None:
+    row = {
+        "id": "fixture:incomplete-current",
+        "parent_id": "group:fixture",
+        "scope": "logical_source",
+        "title": "incomplete current",
+        "provider": "fixture",
+        "status": "current",
+        "status_label": "reported current",
+        "coverage": dashboard._coverage(9, 10, unit="任務", label="完整稽核"),
+        "freshness": {"state": "current", "age_seconds": 60},
+        "eta": dashboard._complete_eta(),
+        "automation_eligible": True,
+    }
+
+    enriched = dashboard._enrich_and_sort_rows(
+        [row],
+        now=datetime(2026, 8, 20, tzinfo=UTC),
+        refresh_services={},
+    )[0]
+
+    assert enriched["operation_state"] == "catching_up"
+    assert enriched["acquisition_progress"]["ratio"] == 0.9
+    assert enriched["eta"]["state"] == "waiting_schedule"
+
+
+def test_blocked_endpoint_keeps_full_receipt_as_evidence_not_progress() -> None:
+    row = {
+        "id": "fixture:blocked-full-receipt",
+        "parent_id": "group:fixture",
+        "scope": "logical_source",
+        "title": "blocked full receipt",
+        "provider": "fixture",
+        "status": "blocked",
+        "status_label": "upstream unavailable",
+        "coverage": dashboard._coverage(4, 4, unit="端點", label="舊批次"),
+        "freshness": {"state": "stale", "age_seconds": 1_000_000},
+        "eta": dashboard._complete_eta(),
+        "automation_eligible": True,
+    }
+
+    enriched = dashboard._enrich_and_sort_rows(
+        [row],
+        now=datetime(2026, 8, 20, tzinfo=UTC),
+        refresh_services={},
+    )[0]
+
+    assert enriched["operation_state"] == "unable"
+    assert enriched["eta"]["state"] == "blocked"
+    assert enriched["acquisition_progress"]["ratio"] is None
+    assert enriched["acquisition_progress"]["state"] == "blocked"
+    assert enriched["acquisition_progress"]["evidence_coverage"]["ratio"] == 1.0
+
+
+def test_registry_alias_is_reference_and_excluded_from_denominator() -> None:
+    row = {
+        "id": "fixture:registry-alias",
+        "parent_id": "group:fixture",
+        "scope": "source_registry",
+        "title": "registry alias",
+        "provider": "fixture",
+        "status": "current",
+        "status_label": "owned elsewhere",
+        "freshness": {"state": "unknown", "age_seconds": None},
+        "coverage": None,
+        "eta": dashboard._not_applicable_eta("reference", "owned elsewhere"),
+        "registry_alias": True,
+        "automation_eligible": False,
+    }
+
+    enriched = dashboard._enrich_and_sort_rows(
+        [row],
+        now=datetime(2026, 8, 20, tzinfo=UTC),
+        refresh_services={},
+    )[0]
+
+    assert enriched["operation_state"] == "reference"
+    assert enriched["execution_state"] == "registry_alias"
+    assert enriched["in_active_scope"] is False
+    assert enriched["eta"]["state"] == "reference"
+    assert enriched["acquisition_progress"]["state"] == "reference"
+    assert enriched["acquisition_progress"]["ratio"] is None
+
+
+def test_monitor_integrity_checks_recompute_final_public_dto_contracts() -> None:
+    group = {
+        "id": "group:fixture",
+        "scope": "storage_group",
+        "operation_state": "complete",
+        "in_active_scope": True,
+        "freshness": {"state": "current"},
+        "eta": {"state": "complete"},
+        "coverage": {"ratio": 1.0},
+        "acquisition_progress": {"ratio": 1.0},
+    }
+    endpoint = {
+        "id": "fixture:endpoint",
+        "parent_id": "group:fixture",
+        "scope": "logical_source",
+        "operation_state": "complete",
+        "in_active_scope": True,
+        "freshness": {"state": "current"},
+        "eta": {"state": "complete"},
+        "coverage": {"ratio": 1.0},
+        "acquisition_progress": {"ratio": 1.0},
+    }
+
+    passed = dashboard._monitor_integrity_checks(
+        [group, endpoint], active_data_endpoints=1
+    )
+    failed = dashboard._monitor_integrity_checks(
+        [group, {**endpoint, "freshness": {"state": "stale"}}],
+        active_data_endpoints=1,
+    )
+
+    assert passed["state"] == "pass"
+    assert passed["violations"] == 0
+    assert failed["state"] == "fail"
+    assert failed["checks"]["complete_with_stale_freshness"] == 1
+
+
+def test_crypto_feature_catalog_separates_reference_from_deferred_scope(
+    tmp_path: Path,
+) -> None:
+    catalog_dir = tmp_path / "data_okx/1m"
+    catalog_dir.mkdir(parents=True)
+    (catalog_dir / "okx_historical_feature_catalog.json").write_text(
+        json.dumps(
+            {
+                "catalog": [
+                    {
+                        "id": "one_minute_candle_archive",
+                        "download_status": "excluded_duplicate",
+                    },
+                    {
+                        "id": "orderbook_400_5000_archive",
+                        "download_status": "separate_extreme_archive",
+                    },
+                    {
+                        "id": "current_open_interest",
+                        "download_status": "excluded_snapshot",
+                    },
+                    {
+                        "id": "liquidation_orders",
+                        "download_status": "excluded_unreconstructable",
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    raw_rows = dashboard._crypto_feature_sources(tmp_path, now=datetime.now(UTC))
+    rows = dashboard._enrich_and_sort_rows(
+        raw_rows,
+        now=datetime.now(UTC),
+        refresh_services={},
+    )
+    by_id = {row["id"]: row for row in rows}
+
+    assert by_id["okx-feature:one_minute_candle_archive"]["operation_state"] == (
+        "reference"
+    )
+    assert (
+        by_id["okx-feature:orderbook_400_5000_archive"]["operation_state"] == "deferred"
+    )
+    assert by_id["okx-feature:current_open_interest"]["operation_state"] == ("deferred")
+    assert by_id["okx-feature:liquidation_orders"]["operation_state"] == "deferred"
+
+
+def test_product_storage_presence_is_not_a_completion_denominator(
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "configs"
+    config.mkdir()
+    storage = tmp_path / "data_fixture"
+    storage.mkdir()
+    (config / "data_product_granularities.json").write_text(
+        json.dumps(
+            {
+                "products": [
+                    {
+                        "id": "fixture",
+                        "title": "Fixture",
+                        "provider": "fixture",
+                        "granularities": [
+                            {
+                                "granularity": "daily",
+                                "implementation": "implemented",
+                                "storage_path": "data_fixture",
+                            }
+                        ],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    row = dashboard._product_granularity_sources(
+        tmp_path, now=datetime(2026, 8, 20, tzinfo=UTC)
+    )[0]
+
+    assert row["storage_present"] is True
+    assert row["completion_receipt_present"] is False
+    assert row["coverage"] is None
+    assert row["status"] == "waiting"
+
+
+def test_storage_group_rollup_cannot_hide_unable_child() -> None:
+    group = {
+        "id": "group:fixture",
+        "status": "current",
+        "status_label": "current",
+        "eta": dashboard._complete_eta(),
+        "warnings": [],
+    }
+    children = [
+        {"parent_id": "group:fixture", "operation_state": "complete"},
+        {"parent_id": "group:fixture", "operation_state": "unable"},
+        {"parent_id": "group:fixture", "operation_state": "deferred"},
+    ]
+
+    dashboard._rollup_storage_groups([group], children)
+
+    assert group["status"] == "blocked"
+    assert group["child_operation_counts"]["deferred"] == 1
+    assert group["active_child_endpoint_count"] == 2
+    assert group["eta"]["state"] == "blocked"
+
+
+def test_cex_group_uses_same_canonical_1m_progress_as_product_row() -> None:
+    group = {
+        "id": "group:bybit",
+        "status": "updating",
+        "status_label": "running",
+        "coverage": dashboard._coverage(16, 815, unit="項", label="tqdm"),
+        "eta": {"state": "estimating", "remaining_seconds": 200},
+        "warnings": [],
+    }
+    children = [
+        {
+            "id": "product:bybit_perpetuals:1m",
+            "parent_id": "group:bybit",
+            "scope": "product_granularity",
+            "granularity": "1m",
+            "operation_state": "catching_up",
+            "execution_state": "running",
+            "coverage": dashboard._coverage(600, 815, unit="symbol", label="目前批次"),
+            "eta": {"state": "estimating", "remaining_seconds": 200},
+        }
+    ]
+
+    dashboard._rollup_storage_groups([group], children)
+
+    assert group["coverage"]["current"] == 600
+    assert group["coverage_source_endpoint_id"] == children[0]["id"]
+
+
+def test_fred_crypto_macro_is_registered_and_daily_scheduled() -> None:
+    root = Path(__file__).resolve().parents[1]
+    packed = json.loads(
+        (root / "configs/data_sync/packed_datasets.json").read_text(encoding="utf-8")
+    )
+    free_sources = json.loads(
+        (root / "configs/free_public_data_sources.json").read_text(encoding="utf-8")
+    )
+
+    assert any(item["dataset"] == "fred-crypto-macro" for item in packed["datasets"])
+    assert any(
+        item["id"] == "fred_crypto_macro_initial_releases"
+        and item["dataset_group"] == "fred-crypto-macro"
+        for item in free_sources["sources"]
+    )
+    assert dashboard._AUTOMATION_PROFILES["group:fred-crypto-macro"][
+        "service_keys"
+    ] == ("registered_daily",)
 
 
 def test_real_product_registry_has_exact_three_granularities_per_product() -> None:
@@ -836,10 +1261,15 @@ def test_registered_refresh_reuses_downloaders_and_preserves_tw_snapshot_owner()
     assert "registered-backfill" in runner
     assert "CRYPTO_TAIL_ONLY=0" in runner
     assert "registered_backfill" in dashboard._REFRESH_UNITS
-    assert "registered_backfill" in dashboard._AUTOMATION_PROFILES[
-        "group:okx"
-    ]["service_keys"]
+    assert (
+        "registered_backfill"
+        in dashboard._AUTOMATION_PROFILES["group:okx"]["service_keys"]
+    )
     assert "RUN_CRYPTO_REFERENCE=1" in runner
+    assert "RUN_FREE_PUBLIC_CONTEXT=0" in runner
+    assert "RUN_COINMETRICS_COMMUNITY=0" in runner
+    assert "RUN_CRYPTO_DAILY_MATERIALIZE=0" in runner
+    assert "RUN_FRED_CRYPTO_MACRO=1" in runner
     assert "CRYPTO_ACTIVE_INTRADAY_GRAIN=1m" in runner
     assert "RUN_CRYPTO_TRADE_TICKS=0" in runner
     assert "RUN_CRYPTO_ORDER_BOOK=0" in runner
@@ -854,7 +1284,13 @@ def test_registered_refresh_reuses_downloaders_and_preserves_tw_snapshot_owner()
     assert "run_free_public_context_incremental" in daily_runner
     assert "run_coinmetrics_community_incremental" in daily_runner
     assert "run_crypto_reference_incremental" in daily_runner
-    assert 'CRYPTO_ACTIVE_INTRADAY_GRAIN="${CRYPTO_ACTIVE_INTRADAY_GRAIN:-1m}"' in daily_runner
+    assert "run_fred_crypto_macro_daily" in daily_runner
+    assert 'CRYPTO_COLUMNAR_THREADS="${CRYPTO_COLUMNAR_THREADS:-2}"' in daily_runner
+    assert "download_fred_crypto_macro_vintages.py" in daily_runner
+    assert (
+        'CRYPTO_ACTIVE_INTRADAY_GRAIN="${CRYPTO_ACTIVE_INTRADAY_GRAIN:-1m}"'
+        in daily_runner
+    )
     assert "crypto event acquisition is deferred" in daily_runner
     assert "okx_perpetuals run_okx_perp_incremental" in daily_runner
     assert "bybit_perpetuals run_bybit_perp_incremental" in daily_runner

@@ -23,6 +23,7 @@ common_env=(
   RUN_TW_PUBLIC_DATA=0
   RUN_ALPACA_US=0
   RUN_DATA_QUALITY_AUDIT=0
+  RUN_FRED_CRYPTO_MACRO=0
   CRYPTO_ACTIVE_INTRADAY_GRAIN=1m
   RUN_CRYPTO_TRADE_TICKS=0
   RUN_CRYPTO_ORDER_BOOK=0
@@ -49,6 +50,7 @@ case "$refresh_scope" in
       CRYPTO_HISTORICAL_FEATURES=1 \
       RUN_DUNE_CRYPTO_HISTORY=1 \
       RUN_CRYPTO_ETF_HISTORY=1 \
+      RUN_FRED_CRYPTO_MACRO=1 \
       "$repo_root/downloader/run_daily_all_markets.sh"
     ;;
   intraday)
@@ -64,7 +66,10 @@ case "$refresh_scope" in
       RUN_CEX_PERP=1 \
       CRYPTO_TAIL_ONLY=1 \
       CRYPTO_HISTORICAL_FEATURES=0 \
+      RUN_CRYPTO_DAILY_MATERIALIZE=0 \
       RUN_CRYPTO_REFERENCE=1 \
+      RUN_FREE_PUBLIC_CONTEXT=0 \
+      RUN_COINMETRICS_COMMUNITY=0 \
       RUN_DUNE_CRYPTO_HISTORY=0 \
       RUN_CRYPTO_ETF_HISTORY=0 \
       "$repo_root/downloader/run_daily_all_markets.sh"

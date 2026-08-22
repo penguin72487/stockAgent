@@ -216,6 +216,18 @@
       "note": "SEC filing/company-fact history plus content-addressed official issuer NAV, holdings, asset-per-share and reserve snapshots with conservative availability timestamps."
     },
     {
+      "dataset": "fred-crypto-macro",
+      "source": "data_fred_crypto_macro",
+      "role": "local-analytics-and-point-in-time-macro",
+      "publish": false,
+      "pack_buckets": 0,
+      "loose_threshold_mib": 0,
+      "active_process_substrings": [
+        "download_fred_crypto_macro_vintages.py"
+      ],
+      "note": "FRED output_type=4 initial-release macro series with conservative next-UTC-day availability, immutable raw receipts and a normalized Parquet panel."
+    },
+    {
       "dataset": "tw-index-futures",
       "source": "data_tw_index_futures",
       "role": "training",

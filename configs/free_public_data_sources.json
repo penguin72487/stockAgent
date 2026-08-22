@@ -248,6 +248,19 @@
       "documentation": "https://fred.stlouisfed.org/docs/api/fred/"
     },
     {
+      "id": "fred_crypto_macro_initial_releases",
+      "provider": "FRED",
+      "dataset_group": "fred-crypto-macro",
+      "category": "crypto_macro_point_in_time",
+      "access": "configured_free_key",
+      "implementation_status": "implemented",
+      "summary_path": "data_fred_crypto_macro/download_summary.json",
+      "cadence": "daily_and_release_event",
+      "history_contract": "output_type=4 initial-release observations; usable at the next UTC midnight because the daily API does not supply an intraday release timestamp",
+      "feature_status": "enabled only through conservative point-in-time availability",
+      "documentation": "https://fred.stlouisfed.org/docs/api/fred/series_observations.html"
+    },
+    {
       "id": "international_official_macro",
       "provider": "IMF / OECD / UN Comtrade / World Bank / ECB",
       "dataset_group": "openbb-compact",

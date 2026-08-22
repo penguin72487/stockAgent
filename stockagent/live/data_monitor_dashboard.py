@@ -24,7 +24,7 @@ from stockagent.live.openbb_archive_dashboard import build_openbb_public_status
 from stockagent.live.shioaji_api_dashboard import build_shioaji_public_status
 
 
-DATA_MONITOR_SCHEMA_VERSION: Final[int] = 4
+DATA_MONITOR_SCHEMA_VERSION: Final[int] = 6
 TAIPEI: Final[ZoneInfo] = ZoneInfo("Asia/Taipei")
 
 _GROUP_META: Final[dict[str, dict[str, Any]]] = {
@@ -147,6 +147,13 @@ _GROUP_META: Final[dict[str, dict[str, Any]]] = {
         "owner": "Crypto ETF 歷史回補器",
         "window": 72 * 3600,
     },
+    "fred-crypto-macro": {
+        "title": "FRED 加密總體初始發布值",
+        "provider": "FRED",
+        "cadence": "每日與官方發布事件",
+        "owner": "FRED point-in-time 更新器",
+        "window": 72 * 3600,
+    },
     "tw-index-futures": {
         "title": "TAIFEX 全期貨日資料",
         "provider": "TAIFEX",
@@ -205,15 +212,32 @@ _SUMMARY_CANDIDATES: Final[dict[str, tuple[str, ...]]] = {
         "daily_update_summary.json",
         "incremental_update_summary.json",
     ),
-    "okx": ("1m/download_summary.json", "daily/download_summary.json", "download_summary.json"),
-    "bybit": ("1m/download_summary.json", "daily/download_summary.json", "download_summary.json"),
-    "binance": ("1m/download_summary.json", "daily/download_summary.json", "download_summary.json"),
-    "binance-public-archive": ("download_summary.json", "plan_summary.json", "capacity_receipt.json"),
+    "okx": (
+        "1m/download_summary.json",
+        "daily/download_summary.json",
+        "download_summary.json",
+    ),
+    "bybit": (
+        "1m/download_summary.json",
+        "daily/download_summary.json",
+        "download_summary.json",
+    ),
+    "binance": (
+        "1m/download_summary.json",
+        "daily/download_summary.json",
+        "download_summary.json",
+    ),
+    "binance-public-archive": (
+        "download_summary.json",
+        "plan_summary.json",
+        "capacity_receipt.json",
+    ),
     "crypto-reference": ("download_summary.json", "source_status.json"),
     "free-public-context": ("download_summary.json",),
     "coinmetrics-community": ("download_summary.json",),
     "dune-crypto": ("download_summary.json",),
     "crypto-etf-history": ("download_summary.json",),
+    "fred-crypto-macro": ("download_summary.json",),
     "tw-index-futures": ("manifest.json",),
     "tw-index-derivatives-ticks": ("manifest.json",),
     "tw-index-options-daily": (
@@ -430,6 +454,13 @@ _AUTOMATION_PROFILES: Final[dict[str, dict[str, Any]]] = {
         "calendar_weekdays": False,
         "calendar_time": "06:30",
     },
+    "group:fred-crypto-macro": {
+        "mode": "timer",
+        "service_keys": ("registered_daily",),
+        "schedule_label": "每日 06:30（Asia/Taipei）",
+        "calendar_weekdays": False,
+        "calendar_time": "06:30",
+    },
     "group:tw-index-futures": {
         "mode": "timer",
         "service_keys": ("taifex_futures",),
@@ -483,12 +514,18 @@ _OPERATION_ORDER: Final[dict[str, int]] = {
     "streaming": 1,
     "complete": 2,
     "unable": 3,
+    "deferred": 4,
+    "control": 5,
+    "reference": 6,
 }
 _OPERATION_LABELS: Final[dict[str, str]] = {
     "catching_up": "正在抓／還沒到最新",
     "streaming": "正在串流",
     "complete": "已完成／已到最新",
     "unable": "無法完成",
+    "deferred": "已延後／未啟用",
+    "control": "設定／憑證閘門",
+    "reference": "清冊參照／不重複計算",
 }
 _ANSI_RE: Final[re.Pattern[str]] = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 _TQDM_RE: Final[re.Pattern[str]] = re.compile(
@@ -937,6 +974,93 @@ def _unknown_eta(state: str, basis: str) -> dict[str, Any]:
     }
 
 
+def _not_applicable_eta(state: str, basis: str) -> dict[str, Any]:
+    """Return an explicit non-work ETA without pretending the work completed."""
+
+    return {
+        "state": state,
+        "remaining_seconds": None,
+        "estimated_complete_at_utc": None,
+        "confidence": "not_applicable",
+        "basis": basis,
+    }
+
+
+def _normalize_eta(
+    row: dict[str, Any],
+    *,
+    operation: str,
+    execution: str,
+    now: datetime,
+) -> None:
+    """Reject expired or phase-saturated ETA evidence before publication."""
+
+    eta = row.get("eta")
+    eta = (
+        dict(eta)
+        if isinstance(eta, Mapping)
+        else _unknown_eta("unknown", "來源尚未提供可驗證 ETA。")
+    )
+    if operation == "deferred":
+        row["eta"] = _not_applicable_eta(
+            "deferred", "此端點依目前取得範圍未啟用，不存在完工倒數。"
+        )
+        return
+    if operation == "control":
+        row["eta"] = _not_applicable_eta(
+            "not_applicable", "這是設定／憑證就緒狀態，不是資料下載工作。"
+        )
+        return
+    if operation == "reference":
+        row["eta"] = _not_applicable_eta(
+            "reference", "這是清冊責任映射，不建立重複下載工作或完工倒數。"
+        )
+        return
+    if operation == "complete" and execution == "idle_current":
+        eta["state"] = "complete"
+        eta["remaining_seconds"] = 0
+        eta["estimated_complete_at_utc"] = None
+        eta["confidence"] = "high"
+        row["eta"] = eta
+        return
+
+    if str(eta.get("state") or "") == "complete":
+        if operation == "unable":
+            state = "blocked"
+            basis = "歷史批次可能完成，但目前端點受阻；舊完成 ETA 不代表現在可完成。"
+        elif execution == "running":
+            state = "warming_up"
+            basis = "舊批次已完成，但目前工作仍在執行；等待新吞吐樣本後重估。"
+        else:
+            state = "waiting_schedule"
+            basis = "舊批次已完成，但端點尚未到最新；等待下一次有效取得排程。"
+        row["eta"] = _unknown_eta(state, basis)
+        return
+
+    remaining = _integer(eta.get("remaining_seconds"))
+    estimated_complete = _parse_time(eta.get("estimated_complete_at_utc"))
+    expired = estimated_complete is not None and estimated_complete <= now
+    phase_saturated = (
+        operation == "catching_up" and execution == "running" and remaining == 0
+    )
+    if expired or phase_saturated:
+        warnings = list(row.get("warnings") or [])
+        warning = (
+            "原 ETA 已過期但工作仍未完成；已清除倒數並等待下一個有效吞吐樣本。"
+            if expired
+            else "目前階段分母已完成但整體工作仍在執行；已清除假 100% 與假完工時間。"
+        )
+        if warning not in warnings:
+            warnings.append(warning)
+        row["warnings"] = warnings
+        row["eta"] = _unknown_eta(
+            "warming_up",
+            "階段切換或舊 ETA 已失效；等待下一個完整邏輯單位後重新估算。",
+        )
+        return
+    row["eta"] = eta
+
+
 def _freshness(
     latest: datetime | None,
     *,
@@ -1115,9 +1239,7 @@ def _generic_group(
     elif failure or batch_incomplete:
         status = "degraded"
         status_label = (
-            f"最近批次有 {failure:,} 個失敗"
-            if failure
-            else "最近批次未完整收斂"
+            f"最近批次有 {failure:,} 個失敗" if failure else "最近批次未完整收斂"
         )
     elif fresh["state"] == "stale":
         status = "stale"
@@ -1202,8 +1324,7 @@ def _generic_group(
                     "舊版進度把可變長度 request page 混入固定分母，分母已飽和但工作仍在執行；"
                     "本輪 ETA 保持未知，下一輪改用 symbol／feature-stage 邏輯單位。"
                     if legacy_page_denominator_saturated
-                    else
-                    "僅為官方目錄規劃階段 ETA；全量下載會在物件傳輸開始後"
+                    else "僅為官方目錄規劃階段 ETA；全量下載會在物件傳輸開始後"
                     "依實測吞吐重新估算。"
                     if progress_phase == "discover"
                     else str(
@@ -1326,9 +1447,7 @@ def _tw_public_publication_index(root: Path) -> dict[str, list[dict[str, Any]]]:
             "phase": phase,
             "scheduled_boundary": boundary or None,
             "official_basis": str(payload.get("official_basis") or "") or None,
-            "last_started_at_utc": _iso(
-                _parse_time(payload.get("started_at_taipei"))
-            ),
+            "last_started_at_utc": _iso(_parse_time(payload.get("started_at_taipei"))),
             "last_completed_at_utc": _iso(
                 _parse_time(payload.get("completed_at_taipei"))
             ),
@@ -1360,9 +1479,7 @@ def _tw_public_sources(root: Path, *, now: datetime) -> list[dict[str, Any]]:
         root / "artifacts/data_refresh/tw_public/events/latest.json", {}
     )
     event_rows = (
-        event_receipt.get("datasets", {})
-        if isinstance(event_receipt, Mapping)
-        else {}
+        event_receipt.get("datasets", {}) if isinstance(event_receipt, Mapping) else {}
     )
     event_rows = event_rows if isinstance(event_rows, Mapping) else {}
     publication_rows = _tw_public_publication_index(root)
@@ -1474,8 +1591,7 @@ def _tw_public_sources(root: Path, *, now: datetime) -> list[dict[str, Any]]:
                 ),
                 "update_owner": "來源事件監測器＋不可變快照更新器",
                 "latest_at_utc": _iso(
-                    _parse_time(event_row.get("last_checked_at_taipei"))
-                    or generated
+                    _parse_time(event_row.get("last_checked_at_taipei")) or generated
                 ),
                 "data_through": str(summary.get("end_date") or "") or None,
                 "freshness": dict(fresh),
@@ -1715,9 +1831,7 @@ def _openbb_sources(
             }
         source_bytes = _integer(l1.get("source_bytes")) or 0
         output_bytes = _integer(l1.get("output_bytes")) or 0
-        reduction = (
-            100.0 * (1.0 - output_bytes / source_bytes) if source_bytes else 0.0
-        )
+        reduction = 100.0 * (1.0 - output_bytes / source_bytes) if source_bytes else 0.0
         output.append(
             {
                 "id": "openbb:l1-compaction",
@@ -1747,9 +1861,7 @@ def _openbb_sources(
                     f"active segments {_integer(l1.get('active_segments')) or 0:,}；"
                     f"待壓實 {pending_files:,} shards；已壓實來源空間縮減 {reduction:.2f}%。"
                 ),
-                "warnings": [
-                    "L1 是 shadow query layer；L0 原始 shard 保留且未刪除。"
-                ],
+                "warnings": ["L1 是 shadow query layer；L0 原始 shard 保留且未刪除。"],
                 "detail_link": "../openbb/",
             }
         )
@@ -1885,9 +1997,14 @@ def _crypto_feature_sources(root: Path, *, now: datetime) -> list[dict[str, Any]
             failures = sum(status == "failed" for status in statuses)
             total = len(statuses)
             scheduled = download_status.startswith("included")
-            deferred = download_status.startswith(
-                "separate"
-            ) or download_status.startswith("excluded")
+            registry_alias = download_status in {
+                "excluded_redundant",
+                "excluded_duplicate",
+            }
+            deferred = not registry_alias and (
+                download_status.startswith("separate")
+                or download_status.startswith("excluded")
+            )
             if failures:
                 status = "degraded"
                 label = f"{failures:,} 個商品階段失敗"
@@ -1904,12 +2021,18 @@ def _crypto_feature_sources(root: Path, *, now: datetime) -> list[dict[str, Any]
                 status = "current" if fresh["state"] == "current" else "stale"
                 label = "由主 OHLCV 更新器維護"
                 eta = _complete_eta("主價格資料由同一交易所批次維護。")
+            elif registry_alias:
+                status = "current"
+                label = "與專用端點重複；只保留清冊參照"
+                eta = _not_applicable_eta(
+                    "reference", "相同事實由既有專用端點唯一維護。"
+                )
             elif deferred:
-                status = "waiting"
-                label = "已登錄，需獨立容量／時序管線"
-                eta = _unknown_eta(
-                    "waiting_schedule",
-                    "來源免費但不是緊湊歷史端點；尚未有可量測中的工作批次。",
+                status = "deferred"
+                label = "已登錄，但不在目前 1m-only 取得範圍"
+                eta = _not_applicable_eta(
+                    "deferred",
+                    "逐筆、委託簿、快照或非永續商品資料依使用者決策暫不排程。",
                 )
             else:
                 status = "waiting"
@@ -1941,8 +2064,13 @@ def _crypto_feature_sources(root: Path, *, now: datetime) -> list[dict[str, Any]
                     "eta": eta,
                     "rows": stage_coverage.get(stage or ""),
                     "publishable": True,
-                    "automation_eligible": bool(scheduled)
-                    or source_id == "trade_candles_1m",
+                    "automation_eligible": (
+                        bool(scheduled) or source_id == "trade_candles_1m"
+                    )
+                    and not deferred
+                    and not registry_alias,
+                    "acquisition_enabled": not deferred and not registry_alias,
+                    "registry_alias": registry_alias,
                     "detail": str(
                         item.get("model_role")
                         or item.get("reason")
@@ -1950,8 +2078,10 @@ def _crypto_feature_sources(root: Path, *, now: datetime) -> list[dict[str, Any]
                         or "交易所公開資料。"
                     ),
                     "warnings": (
-                        ["目前快照不得倒填歷史；只能從 observed_at 之後使用。"]
+                        ["目前快照不得倒填歷史；只有重新啟用後的觀測值可使用。"]
                         if "snapshot" in download_status
+                        else ["此端點與既有資料重複，不建立第二份下載進度。"]
+                        if registry_alias
                         else []
                     ),
                     "detail_link": None,
@@ -1970,9 +2100,7 @@ def _credential_states(root: Path) -> dict[str, dict[str, Any]]:
     }
 
 
-def _credential_registry_sources(
-    root: Path, *, now: datetime
-) -> list[dict[str, Any]]:
+def _credential_registry_sources(root: Path, *, now: datetime) -> list[dict[str, Any]]:
     """Expose credential readiness without ever exposing credential values."""
 
     payload = _read_json(root / "artifacts/data_credentials/status.json", {})
@@ -2044,9 +2172,7 @@ def _credential_registry_sources(
     return rows
 
 
-def _product_granularity_sources(
-    root: Path, *, now: datetime
-) -> list[dict[str, Any]]:
+def _product_granularity_sources(root: Path, *, now: datetime) -> list[dict[str, Any]]:
     """Flatten the canonical daily/1m/tick contract into auditable rows."""
 
     registry = _read_json(root / "configs/data_product_granularities.json", {})
@@ -2081,8 +2207,16 @@ def _product_granularity_sources(
             summary = _read_json(summary_path, {}) if summary_path else {}
             progress = _read_json(progress_path, {}) if progress_path else {}
             latest = _latest_time(
-                [path for path in (summary_path, storage_path) if path is not None],
-                [summary] if isinstance(summary, Mapping) else [],
+                [
+                    path
+                    for path in (summary_path, progress_path)
+                    if path is not None and path.exists()
+                ],
+                [
+                    payload
+                    for payload in (summary, progress)
+                    if isinstance(payload, Mapping) and payload
+                ],
             )
             data_through = (
                 _extract_data_through([summary])
@@ -2108,12 +2242,14 @@ def _product_granularity_sources(
                 )
             )
             completed = max(0, total - failures)
+            storage_present = storage_path is not None and storage_path.exists()
+            # A directory proves only that storage exists.  It says nothing
+            # about date/symbol completeness, so it must never create a 1/1
+            # progress denominator.
             coverage = (
                 _coverage(completed, total, unit="項", label="最近批次")
                 if total
-                else _coverage(1, 1, unit="契約", label="資料路徑")
-                if storage_path is not None and storage_path.exists()
-                else _coverage(0, 1, unit="契約", label="資料路徑")
+                else None
             )
             credential_id = str(spec.get("credential_id") or "")
             credential = credentials.get(credential_id) if credential_id else None
@@ -2124,14 +2260,15 @@ def _product_granularity_sources(
                 if credential_id
                 else "not_required"
             )
-            implemented = implementation.startswith("implemented") or implementation.startswith(
-                "reused_existing"
-            )
+            implemented = implementation.startswith(
+                "implemented"
+            ) or implementation.startswith("reused_existing")
             registered_only = implementation.startswith("registered")
             unsupported = implementation == "not_available"
-            deferred = implementation.startswith("deferred") or spec.get(
-                "acquisition_enabled"
-            ) is False
+            deferred = (
+                implementation.startswith("deferred")
+                or spec.get("acquisition_enabled") is False
+            )
             warnings: list[str] = []
             if deferred:
                 status = "deferred"
@@ -2141,13 +2278,14 @@ def _product_granularity_sources(
                     if exchange_scope
                     else "依目前 1m-only 範圍延後"
                 )
-                eta = _complete_eta(
+                eta = _not_applicable_eta(
+                    "deferred",
                     "目前只啟用 Binance、OKX、Bybit；此交易所不會消耗流量或容量。"
                     if exchange_scope
-                    else "逐筆／委託簿資料未排程；不會消耗流量或容量。"
+                    else "逐筆／委託簿資料未排程；不會消耗流量或容量。",
                 )
                 automation_eligible = False
-                coverage = _coverage(1, 1, unit="範圍契約", label="延後狀態")
+                coverage = None
                 warnings.append(
                     "既有資料保留；只有使用者明確擴大交易所範圍後才可續抓。"
                     if exchange_scope
@@ -2219,15 +2357,18 @@ def _product_granularity_sources(
                     )
                     remaining = _integer(progress.get("remaining_seconds"))
                     eta = {
-                        "state": "estimating" if remaining is not None else "warming_up",
+                        "state": "estimating"
+                        if remaining is not None
+                        else "warming_up",
                         "remaining_seconds": remaining,
                         "estimated_complete_at_utc": progress.get(
                             "estimated_complete_at_utc"
                         ),
-                        "confidence": "low" if remaining is not None else "not_available",
+                        "confidence": "low"
+                        if remaining is not None
+                        else "not_available",
                         "basis": str(
-                            progress.get("basis")
-                            or "依完整批次的實測吞吐率線性外推。"
+                            progress.get("basis") or "依完整批次的實測吞吐率線性外推。"
                         ),
                     }
                     latest = progress_updated
@@ -2264,6 +2405,13 @@ def _product_granularity_sources(
                     "automation_eligible": automation_eligible,
                     "acquisition_enabled": not deferred,
                     "stream_contract": bool(spec.get("stream")),
+                    "storage_present": storage_present,
+                    "completion_receipt_present": bool(
+                        summary_path is not None
+                        and summary_path.exists()
+                        and isinstance(summary, Mapping)
+                        and summary
+                    ),
                     "detail": (
                         f"availability={availability}; implementation={implementation}; "
                         f"storage={storage_relative or 'none'}"
@@ -2275,29 +2423,21 @@ def _product_granularity_sources(
     return rows
 
 
-def _crypto_acquisition_sources(
-    root: Path, *, now: datetime
-) -> list[dict[str, Any]]:
+def _crypto_acquisition_sources(root: Path, *, now: datetime) -> list[dict[str, Any]]:
     """Expose the first-principles crypto fact registry and its unique owner."""
 
     registry = _read_json(root / "configs/crypto_data_acquisition.json", {})
     facts = registry.get("datasets", []) if isinstance(registry, Mapping) else []
     source_status = _read_json(root / "data_crypto_reference/source_status.json", {})
     provider_rows = (
-        source_status.get("providers", [])
-        if isinstance(source_status, Mapping)
-        else []
+        source_status.get("providers", []) if isinstance(source_status, Mapping) else []
     )
     dataset_rows = (
-        source_status.get("datasets", [])
-        if isinstance(source_status, Mapping)
-        else []
+        source_status.get("datasets", []) if isinstance(source_status, Mapping) else []
     )
     free_manifest = _read_json(root / "data_free_public/download_manifest.json", {})
     free_dataset_rows = (
-        free_manifest.get("results", [])
-        if isinstance(free_manifest, Mapping)
-        else []
+        free_manifest.get("results", []) if isinstance(free_manifest, Mapping) else []
     )
     providers = {
         str(item.get("credential_id")): item
@@ -2343,8 +2483,7 @@ def _crypto_acquisition_sources(
     fact_progress_paths = {
         "venue_instrument_lifecycle": root / "data_binance_archive/progress.json",
         "venue_spot_ohlcv_1m": root / "data_binance_archive/progress.json",
-        "venue_dated_futures_ohlcv_1m": root
-        / "data_binance_archive/progress.json",
+        "venue_dated_futures_ohlcv_1m": root / "data_binance_archive/progress.json",
     }
     provider_paths = {
         "Binance": [
@@ -2387,9 +2526,7 @@ def _crypto_acquisition_sources(
         priority = str(fact.get("priority") or "P2")
         score = _integer(fact.get("score")) or 0
         owners = [
-            str(item)
-            for item in fact.get("canonical_owners", [])
-            if str(item).strip()
+            str(item) for item in fact.get("canonical_owners", []) if str(item).strip()
         ]
         fallbacks = [
             str(item) for item in fact.get("fallbacks", []) if str(item).strip()
@@ -2425,7 +2562,11 @@ def _crypto_acquisition_sources(
         direct_times = [value for value in direct_times if value is not None]
         if direct_times:
             latest = max(direct_times)
-        window = 26 * 3600 if "snapshot" in str(fact.get("native_granularity")) else 72 * 3600
+        window = (
+            26 * 3600
+            if "snapshot" in str(fact.get("native_granularity"))
+            else 72 * 3600
+        )
         fresh = _freshness(latest, now=now, window_seconds=window)
         coverage = (
             _coverage(
@@ -2438,7 +2579,10 @@ def _crypto_acquisition_sources(
             else None
         )
         rows = (
-            sum(_integer(item.get("rows") or item.get("observations_added")) or 0 for item in direct_items)
+            sum(
+                _integer(item.get("rows") or item.get("observations_added")) or 0
+                for item in direct_items
+            )
             if direct_items
             else None
         )
@@ -2460,24 +2604,33 @@ def _crypto_acquisition_sources(
         evidence_complete = bool(expected_evidence_ids) and evidence_current == len(
             expected_evidence_ids
         )
-        deferred = implementation.startswith("deferred") or fact.get(
-            "acquisition_enabled"
-        ) is False
+        deferred = (
+            implementation.startswith("deferred")
+            or fact.get("acquisition_enabled") is False
+        )
         if deferred:
             status = "deferred"
             status_label = "依目前 1m-only 範圍延後"
             eta = _complete_eta("不啟動逐筆、報價簿、L2/L3 或強平事件取得。")
             automation_eligible = False
-        elif evidence_complete and implementation.startswith("implemented") and not any(
-            token in implementation
-            for token in ("partial", "only", "pending", "requires", "blocked")
+        elif (
+            evidence_complete
+            and implementation.startswith("implemented")
+            and not any(
+                token in implementation
+                for token in ("partial", "only", "pending", "requires", "blocked")
+            )
         ):
             status = "current" if fresh["state"] == "current" else "stale"
-            status_label = "唯一主來源已落盤" if status == "current" else "唯一主來源需要更新"
+            status_label = (
+                "唯一主來源已落盤" if status == "current" else "唯一主來源需要更新"
+            )
             eta = (
                 _complete_eta("最近唯一主來源回執已成功。")
                 if status == "current"
-                else _unknown_eta("waiting_schedule", "等待 cadence receipt 到期後補到最新。")
+                else _unknown_eta(
+                    "waiting_schedule", "等待 cadence receipt 到期後補到最新。"
+                )
             )
             automation_eligible = True
         elif (
@@ -2494,7 +2647,9 @@ def _crypto_acquisition_sources(
             eta = _unknown_eta("blocked", "必須先修復金鑰或取得免費可用替代來源。")
         elif implementation.startswith("reused_existing"):
             status = "current" if latest is not None else "waiting"
-            status_label = "沿用既有可稽核管線" if latest is not None else "等待既有管線回執"
+            status_label = (
+                "沿用既有可稽核管線" if latest is not None else "等待既有管線回執"
+            )
             eta = (
                 _complete_eta("既有專用資料管線負責更新。")
                 if latest is not None
@@ -2516,7 +2671,9 @@ def _crypto_acquisition_sources(
                 eta = _unknown_eta("waiting_schedule", "不同場館與歷史邊界需分別完成。")
             else:
                 status = "current" if fresh["state"] == "current" else "stale"
-                status_label = "已由唯一主來源維護" if status == "current" else "需要補到最新"
+                status_label = (
+                    "已由唯一主來源維護" if status == "current" else "需要補到最新"
+                )
                 eta = (
                     _complete_eta("最近來源回執在允許的新鮮度內。")
                     if status == "current"
@@ -2532,13 +2689,13 @@ def _crypto_acquisition_sources(
             )
         fact_progress_path = fact_progress_paths.get(fact_id)
         fact_progress = (
-            _read_json(fact_progress_path, {})
-            if fact_progress_path is not None
-            else {}
+            _read_json(fact_progress_path, {}) if fact_progress_path is not None else {}
         )
-        if not deferred and isinstance(fact_progress, Mapping) and str(
-            fact_progress.get("state") or ""
-        ).lower() == "running":
+        if (
+            not deferred
+            and isinstance(fact_progress, Mapping)
+            and str(fact_progress.get("state") or "").lower() == "running"
+        ):
             progress_updated = _parse_time(fact_progress.get("updated_at_utc"))
             progress_age = (
                 max(0.0, (now - progress_updated).total_seconds())
@@ -2564,10 +2721,7 @@ def _crypto_acquisition_sources(
                     "basis": (
                         "僅為官方目錄規劃階段 ETA；完整下載 ETA 尚未可量測。"
                         if progress_phase == "discover"
-                        else str(
-                            fact_progress.get("basis")
-                            or "依目前完成吞吐率估計。"
-                        )
+                        else str(fact_progress.get("basis") or "依目前完成吞吐率估計。")
                     ),
                     "phase": progress_phase or None,
                 }
@@ -2674,7 +2828,7 @@ def _free_public_registry_sources(root: Path, *, now: datetime) -> list[dict[str
                 if isinstance(external_summary, Mapping)
                 else {}
             )
-            external_rows = _integer(external_summary.get("row_count"))
+            external_rows = _extract_rows([external_summary])
             if external_rows is not None and external_rows > 0:
                 external_failed = sum(
                     _integer(external_status_counts.get(key)) or 0
@@ -2685,7 +2839,10 @@ def _free_public_registry_sources(root: Path, *, now: datetime) -> list[dict[str
                         "dataset": source_id,
                         "status": "failed" if external_failed else "updated",
                         "observations_added": external_rows,
-                        "observed_at_utc": external_summary.get("ended_at_utc"),
+                        "observed_at_utc": (
+                            external_summary.get("ended_at_utc")
+                            or external_summary.get("completed_at_utc")
+                        ),
                     }
                 ]
                 result_ids = (source_id,)
@@ -2702,12 +2859,20 @@ def _free_public_registry_sources(root: Path, *, now: datetime) -> list[dict[str
         )
         fresh = _freshness(latest, now=now, window_seconds=26 * 3600)
         explicitly_deferred = implementation.startswith("deferred_by_user")
+        registry_alias = implementation.startswith("reused_existing")
         if explicitly_deferred:
             status = "deferred"
             label = "依目前交易所範圍暫停"
             eta = _unknown_eta(
                 "waiting_schedule",
                 "目前只啟用 Binance、OKX、Bybit；既有檔案保留但不再自動抓取。",
+            )
+        elif registry_alias:
+            status = "current"
+            label = "清冊參照；由既有專用端點維護"
+            eta = _not_applicable_eta(
+                "reference",
+                "此列只保留來源清冊與責任映射，不建立第二份下載工作或進度。",
             )
         elif failures:
             status = "degraded"
@@ -2719,10 +2884,6 @@ def _free_public_registry_sources(root: Path, *, now: datetime) -> list[dict[str
                 "已取得且保留觀測版本" if status == "current" else "已取得但需要新快照"
             )
             eta = _complete_eta("最近已登錄的緊湊資料集皆成功落盤。")
-        elif implementation.startswith("reused_existing"):
-            status = "current"
-            label = "由既有專用下載器維護"
-            eta = _complete_eta("狀態與完整度由對應專用面板呈現。")
         elif any(
             token in implementation for token in ("pending", "gate", "next_backfill")
         ):
@@ -2757,11 +2918,15 @@ def _free_public_registry_sources(root: Path, *, now: datetime) -> list[dict[str
                 "latest_at_utc": _iso(latest),
                 "data_through": None,
                 "freshness": fresh,
-                "coverage": _coverage(
-                    completed,
-                    expected,
-                    unit="資料集",
-                    label="最近匿名捕捉",
+                "coverage": (
+                    None
+                    if registry_alias
+                    else _coverage(
+                        completed,
+                        expected,
+                        unit="資料集",
+                        label="最近匿名捕捉",
+                    )
                 ),
                 "eta": eta,
                 "rows": sum(
@@ -2769,11 +2934,14 @@ def _free_public_registry_sources(root: Path, *, now: datetime) -> list[dict[str
                 )
                 or None,
                 "publishable": True,
-                "automation_eligible": not explicitly_deferred and not any(
+                "automation_eligible": not registry_alias
+                and not explicitly_deferred
+                and not any(
                     token in implementation
                     for token in ("pending", "gate", "next_backfill")
                 ),
-                "acquisition_enabled": not explicitly_deferred,
+                "acquisition_enabled": not registry_alias and not explicitly_deferred,
+                "registry_alias": registry_alias,
                 "detail": str(
                     source.get("history_contract")
                     or source.get("feature_status")
@@ -2817,25 +2985,30 @@ def _crypto_history_sources(root: Path, *, now: datetime) -> list[dict[str, Any]
             if not isinstance(item, Mapping):
                 continue
             dune_results.setdefault(str(item.get("query_id")), []).append(item)
-    dune_run_blocked = (
-        isinstance(dune_summary, Mapping)
-        and (
-            str(dune_summary.get("state") or "") == "blocked"
-            or (_integer(dune_summary.get("blocked_credit_partitions")) or 0) > 0
-        )
+    dune_run_blocked = isinstance(dune_summary, Mapping) and (
+        str(dune_summary.get("state") or "") == "blocked"
+        or (_integer(dune_summary.get("blocked_credit_partitions")) or 0) > 0
     )
-    progress_updated = _parse_time(dune_progress.get("updated_at_utc")) if isinstance(dune_progress, Mapping) else None
+    progress_updated = (
+        _parse_time(dune_progress.get("updated_at_utc"))
+        if isinstance(dune_progress, Mapping)
+        else None
+    )
     progress_live = (
         isinstance(dune_progress, Mapping)
         and str(dune_progress.get("state") or "") == "running"
         and progress_updated is not None
         and (now - progress_updated).total_seconds() <= 15 * 60
     )
-    for query in dune_config.get("queries", []) if isinstance(dune_config, Mapping) else []:
+    for query in (
+        dune_config.get("queries", []) if isinstance(dune_config, Mapping) else []
+    ):
         if not isinstance(query, Mapping) or not query.get("enabled"):
             continue
         query_id = str(query.get("id") or "")
-        receipts = sorted((root / "data_dune_crypto/receipts" / query_id).glob("*.json"))
+        receipts = sorted(
+            (root / "data_dune_crypto/receipts" / query_id).glob("*.json")
+        )
         receipt_payloads = [_read_json(path, {}) for path in receipts]
         completed = sum(
             isinstance(item, Mapping) and item.get("status") == "complete"
@@ -2865,7 +3038,9 @@ def _crypto_history_sources(root: Path, *, now: datetime) -> list[dict[str, Any]
         fresh = _freshness(latest, now=now, window_seconds=72 * 3600)
         if result_status == "blocked_credits":
             status, label = "blocked", "Dune credits 不足，已停止新增執行"
-            eta = _unknown_eta("waiting_quota", "HTTP 402 後 fail-closed；等待 credits 恢復。")
+            eta = _unknown_eta(
+                "waiting_quota", "HTTP 402 後 fail-closed；等待 credits 恢復。"
+            )
         elif result_status in {"failed", "not_started"}:
             status, label = "degraded", "最近分區失敗／尚未啟動"
             eta = _unknown_eta("waiting_schedule", "完成分區保留，下一輪只重試缺口。")
@@ -2875,7 +3050,9 @@ def _crypto_history_sources(root: Path, *, now: datetime) -> list[dict[str, Any]
             eta = {
                 "state": "estimating" if remaining is not None else "warming_up",
                 "remaining_seconds": remaining,
-                "estimated_complete_at_utc": dune_progress.get("estimated_complete_at_utc"),
+                "estimated_complete_at_utc": dune_progress.get(
+                    "estimated_complete_at_utc"
+                ),
                 "confidence": "low" if remaining is not None else "not_available",
                 "basis": str(dune_progress.get("basis") or "依已完成分區吞吐外推。"),
             }
@@ -2884,7 +3061,9 @@ def _crypto_history_sources(root: Path, *, now: datetime) -> list[dict[str, Any]
             eta = _complete_eta("每個非重疊日曆分區都有完整回執。")
         elif completed:
             status, label = "waiting", f"已完成 {completed:,}/{expected:,} 個分區"
-            eta = _unknown_eta("waiting_schedule", "等待每日回補器續跑；未執行時不捏造 ETA。")
+            eta = _unknown_eta(
+                "waiting_schedule", "等待每日回補器續跑；未執行時不捏造 ETA。"
+            )
         else:
             status, label = "waiting", "已註冊，等待第一個完整分區"
             eta = _unknown_eta("waiting_schedule", "尚無完整分區吞吐率。")
@@ -2898,17 +3077,31 @@ def _crypto_history_sources(root: Path, *, now: datetime) -> list[dict[str, Any]
                 "category": str(query.get("fact_family") or "onchain"),
                 "status": status,
                 "status_label": label,
-                "cadence": "每日；每批 " + str(query.get("chunk_months") or 3) + " 個月",
+                "cadence": "每日；每批 "
+                + str(query.get("chunk_months") or 3)
+                + " 個月",
                 "update_owner": "Dune 版本化 SQL 回補器",
                 "latest_at_utc": _iso(latest),
                 "data_through": max(
-                    (str(item.get("window_end_exclusive")) for item in receipt_payloads if isinstance(item, Mapping)),
+                    (
+                        str(item.get("window_end_exclusive"))
+                        for item in receipt_payloads
+                        if isinstance(item, Mapping)
+                    ),
                     default=None,
                 ),
                 "freshness": fresh,
-                "coverage": _coverage(completed, expected, unit="分區", label="歷史分區") if expected else None,
+                "coverage": _coverage(
+                    completed, expected, unit="分區", label="歷史分區"
+                )
+                if expected
+                else None,
                 "eta": eta,
-                "rows": sum(_integer(item.get("rows")) or 0 for item in receipt_payloads if isinstance(item, Mapping)),
+                "rows": sum(
+                    _integer(item.get("rows")) or 0
+                    for item in receipt_payloads
+                    if isinstance(item, Mapping)
+                ),
                 "publishable": False,
                 "automation_eligible": True,
                 "acquisition_enabled": True,
@@ -2923,17 +3116,23 @@ def _crypto_history_sources(root: Path, *, now: datetime) -> list[dict[str, Any]
 
     etf_config = _read_json(root / "configs/crypto_etf_sources.json", {})
     etf_summary = _read_json(root / "data_crypto_etf/download_summary.json", {})
-    etf_results = {
-        str(item.get("source_id")): item
-        for item in etf_summary.get("results", [])
-        if isinstance(item, Mapping)
-    } if isinstance(etf_summary, Mapping) else {}
-    etf_latest = _parse_time(etf_summary.get("generated_at_utc")) if isinstance(etf_summary, Mapping) else None
+    etf_results = (
+        {
+            str(item.get("source_id")): item
+            for item in etf_summary.get("results", [])
+            if isinstance(item, Mapping)
+        }
+        if isinstance(etf_summary, Mapping)
+        else {}
+    )
+    etf_latest = (
+        _parse_time(etf_summary.get("generated_at_utc"))
+        if isinstance(etf_summary, Mapping)
+        else None
+    )
     etf_fresh = _freshness(etf_latest, now=now, window_seconds=72 * 3600)
     sec_results = [
-        item
-        for key, item in etf_results.items()
-        if key.startswith("sec_cik_")
+        item for key, item in etf_results.items() if key.startswith("sec_cik_")
     ]
     sec_missing = [
         item
@@ -2951,17 +3150,34 @@ def _crypto_history_sources(root: Path, *, now: datetime) -> list[dict[str, Any]
     sec_complete = sum(str(item.get("status")) == "complete" for item in sec_results)
     if isinstance(blocked_sec, Mapping):
         sec_status, sec_label = "blocked", "SEC_USER_AGENT 尚未設定"
-        sec_eta = _unknown_eta("blocked", str(blocked_sec.get("message") or "SEC fair-access identification is required."))
+        sec_eta = _unknown_eta(
+            "blocked",
+            str(
+                blocked_sec.get("message")
+                or "SEC fair-access identification is required."
+            ),
+        )
     elif sec_missing:
-        sec_status, sec_label = "degraded", f"{len(sec_missing):,} 個 ticker 缺少目前 SEC CIK 映射"
-        sec_eta = _unknown_eta("waiting_schedule", "保留缺口，不以錯誤 CIK 或同名公司替代。")
+        sec_status, sec_label = (
+            "degraded",
+            f"{len(sec_missing):,} 個 ticker 缺少目前 SEC CIK 映射",
+        )
+        sec_eta = _unknown_eta(
+            "waiting_schedule", "保留缺口，不以錯誤 CIK 或同名公司替代。"
+        )
     elif any(str(item.get("status")) in {"failed", "degraded"} for item in sec_results):
         sec_status, sec_label = "degraded", "部分 SEC 實體或原始申報文件失敗"
         sec_eta = _unknown_eta("waiting_schedule", "下一輪會沿用已完成檔案並只補缺口。")
     elif sec_results and sec_complete >= sec_total:
         sec_status = "current" if etf_fresh["state"] == "current" else "stale"
-        sec_label = "所有已解析 CIK 已完成" if sec_status == "current" else "歷史完整但需要增量更新"
-        sec_eta = _complete_eta("SEC submissions、companyfacts 與選定 primary documents 已落盤。")
+        sec_label = (
+            "所有已解析 CIK 已完成"
+            if sec_status == "current"
+            else "歷史完整但需要增量更新"
+        )
+        sec_eta = _complete_eta(
+            "SEC submissions、companyfacts 與選定 primary documents 已落盤。"
+        )
     else:
         sec_status, sec_label = "waiting", "已註冊，等待 SEC 回填"
         sec_eta = _unknown_eta("waiting_schedule", "尚無完整 SEC 實體吞吐率。")
@@ -2980,32 +3196,56 @@ def _crypto_history_sources(root: Path, *, now: datetime) -> list[dict[str, Any]
             "latest_at_utc": _iso(etf_latest),
             "data_through": None,
             "freshness": etf_fresh,
-            "coverage": _coverage(sec_complete, sec_total, unit="CIK", label="SEC 實體") if sec_total else None,
+            "coverage": _coverage(sec_complete, sec_total, unit="CIK", label="SEC 實體")
+            if sec_total
+            else None,
             "eta": sec_eta,
             "rows": sum(_integer(item.get("rows")) or 0 for item in sec_results),
             "publishable": False,
             "automation_eligible": not isinstance(blocked_sec, Mapping),
             "acquisition_enabled": True,
             "detail": "每次以 SEC company_tickers.json 重新解析 ticker 到 CIK，再抓 submissions 全歷史分片、companyfacts 與選定原始申報文件。",
-            "warnings": ["SEC 不需 API key，但公平存取政策要求可識別的 SEC_USER_AGENT。"],
+            "warnings": [
+                "SEC 不需 API key，但公平存取政策要求可識別的 SEC_USER_AGENT。"
+            ],
             "detail_link": None,
         }
     )
-    for spec in etf_config.get("issuer_sources", []) if isinstance(etf_config, Mapping) else []:
+    for spec in (
+        etf_config.get("issuer_sources", []) if isinstance(etf_config, Mapping) else []
+    ):
         if not isinstance(spec, Mapping):
             continue
         source_id = str(spec.get("id") or "")
         result = etf_results.get(source_id)
-        receipt = _read_json(root / "data_crypto_etf/receipts/issuers" / f"{source_id}.json", {})
-        latest = _parse_time(receipt.get("observed_at_utc")) if isinstance(receipt, Mapping) else None
-        fresh = _freshness(latest, now=now, window_seconds=None if spec.get("immutable") else 72 * 3600)
-        raw_status = str(result.get("status") or "") if isinstance(result, Mapping) else ""
+        receipt = _read_json(
+            root / "data_crypto_etf/receipts/issuers" / f"{source_id}.json", {}
+        )
+        latest = (
+            _parse_time(receipt.get("observed_at_utc"))
+            if isinstance(receipt, Mapping)
+            else None
+        )
+        fresh = _freshness(
+            latest, now=now, window_seconds=None if spec.get("immutable") else 72 * 3600
+        )
+        raw_status = (
+            str(result.get("status") or "") if isinstance(result, Mapping) else ""
+        )
         if raw_status == "failed":
             status, label = "degraded", "最近擷取或正規化失敗"
             eta = _unknown_eta("waiting_schedule", "等待每日排程重試。")
         elif receipt:
-            status = "current" if spec.get("immutable") or fresh["state"] == "current" else "stale"
-            label = "官方歷史檔已版本化" if spec.get("immutable") else ("官方日檔已更新" if status == "current" else "需要新日檔")
+            status = (
+                "current"
+                if spec.get("immutable") or fresh["state"] == "current"
+                else "stale"
+            )
+            label = (
+                "官方歷史檔已版本化"
+                if spec.get("immutable")
+                else ("官方日檔已更新" if status == "current" else "需要新日檔")
+            )
             eta = _complete_eta("原始 bytes、SHA-256 與正規化結果均已落盤。")
         else:
             status, label = "waiting", "已註冊，等待第一份官方檔案"
@@ -3025,9 +3265,13 @@ def _crypto_history_sources(root: Path, *, now: datetime) -> list[dict[str, Any]
                 "latest_at_utc": _iso(latest),
                 "data_through": None,
                 "freshness": fresh,
-                "coverage": _coverage(1 if receipt else 0, 1, unit="端點", label="官方來源回執"),
+                "coverage": _coverage(
+                    1 if receipt else 0, 1, unit="端點", label="官方來源回執"
+                ),
                 "eta": eta,
-                "rows": _integer(result.get("rows")) if isinstance(result, Mapping) else None,
+                "rows": _integer(result.get("rows"))
+                if isinstance(result, Mapping)
+                else None,
                 "publishable": False,
                 "automation_eligible": True,
                 "acquisition_enabled": True,
@@ -3039,79 +3283,120 @@ def _crypto_history_sources(root: Path, *, now: datetime) -> list[dict[str, Any]
     return output
 
 
-def _rollup_crypto_history_groups(
-    groups: list[dict[str, Any]], logical: list[dict[str, Any]]
+def _rollup_storage_groups(
+    groups: list[dict[str, Any]], logical: Iterable[Mapping[str, Any]]
 ) -> None:
-    """Keep storage-group cards no more optimistic than their endpoint rows."""
+    """Reconcile every group against active child endpoint operations.
 
-    for group_id in ("group:dune-crypto", "group:crypto-etf-history"):
-        group = next((item for item in groups if item.get("id") == group_id), None)
-        children = [item for item in logical if item.get("parent_id") == group_id]
-        if group is None or not children:
+    Physical receipts and logical endpoints answer different questions.  The
+    group keeps its own row count and coverage, but cannot claim current when a
+    required active child is catching up or unable to complete.
+    """
+
+    by_parent: dict[str, list[Mapping[str, Any]]] = {}
+    for child in logical:
+        by_parent.setdefault(str(child.get("parent_id") or ""), []).append(child)
+    for group in groups:
+        group_id = str(group.get("id") or "")
+        children = by_parent.get(group_id, [])
+        if not children:
             continue
-        statuses = [str(item.get("status") or "unavailable") for item in children]
-        if "blocked" in statuses or "unavailable" in statuses:
-            group["status"] = "blocked"
-            group["status_label"] = "至少一個必要端點無法完成"
-        elif "degraded" in statuses:
-            group["status"] = "degraded"
-            group["status_label"] = "至少一個端點最近失敗"
-        elif "updating" in statuses:
-            group["status"] = "updating"
-            group["status_label"] = "歷史端點正在回補"
-        elif any(value in {"waiting", "stale"} for value in statuses):
-            group["status"] = "waiting"
-            group["status_label"] = "仍有歷史端點尚未補到最新"
-        else:
-            group["status"] = "current"
-            group["status_label"] = "所有必要端點已到最新"
-        latest_values = [
-            parsed
-            for item in children
-            if (parsed := _parse_time(item.get("latest_at_utc"))) is not None
+        active_children = [
+            child
+            for child in children
+            if str(child.get("operation_state") or "")
+            not in {"deferred", "control", "reference"}
         ]
-        if latest_values:
-            group["latest_at_utc"] = _iso(max(latest_values))
-        group["rows"] = sum(_integer(item.get("rows")) or 0 for item in children) or None
-        if group_id == "group:dune-crypto":
-            coverages = [
-                item.get("coverage")
-                for item in children
-                if isinstance(item.get("coverage"), Mapping)
-            ]
-            current = sum(_integer(item.get("current")) or 0 for item in coverages)
-            total = sum(_integer(item.get("total")) or 0 for item in coverages)
-            group["coverage"] = _coverage(
-                current, total, unit="分區", label="全部 Dune 歷史分區"
+        counts = {state: 0 for state in _OPERATION_ORDER}
+        for child in children:
+            state = str(child.get("operation_state") or "unable")
+            counts[state] = counts.get(state, 0) + 1
+        group["child_operation_counts"] = counts
+        group["child_endpoint_count"] = len(children)
+        group["active_child_endpoint_count"] = len(active_children)
+        if group_id in {"group:okx", "group:bybit", "group:binance"}:
+            canonical_1m = next(
+                (
+                    child
+                    for child in children
+                    if child.get("scope") == "product_granularity"
+                    and child.get("granularity") == "1m"
+                    and isinstance(child.get("coverage"), Mapping)
+                ),
+                None,
             )
-        if group["status"] == "current":
-            group["eta"] = _complete_eta("所有必要端點皆有完整且最新的回執。")
-        elif group["status"] == "blocked":
+            if canonical_1m is not None:
+                group["coverage"] = dict(canonical_1m["coverage"])
+                group["coverage_source_endpoint_id"] = canonical_1m.get("id")
+        if not active_children:
+            continue
+
+        active_counts = {state: 0 for state in _OPERATION_ORDER}
+        for child in active_children:
+            state = str(child.get("operation_state") or "unable")
+            active_counts[state] = active_counts.get(state, 0) + 1
+        group["active_child_operation_counts"] = active_counts
+        warning = (
+            "子端點狀態："
+            + "、".join(
+                f"{_OPERATION_LABELS[state]} {count}"
+                for state, count in active_counts.items()
+                if count
+            )
+            + "。群組狀態採最保守必要端點，不以目錄存在或部分成功冒充完成。"
+        )
+        warnings = list(group.get("warnings") or [])
+        if warning not in warnings:
+            warnings.append(warning)
+        group["warnings"] = warnings
+
+        if active_counts["unable"]:
+            group["status"] = "blocked"
+            group["status_label"] = f"{active_counts['unable']:,} 個必要子端點無法完成"
             group["eta"] = _unknown_eta(
-                "blocked", "至少一個必要端點仍被設定或來源條件阻擋。"
+                "blocked", "至少一個必要子端點受阻；其餘端點完成不能使群組完成。"
             )
-        else:
+        elif active_counts["catching_up"]:
+            running = any(
+                child.get("execution_state") == "running"
+                for child in active_children
+                if child.get("operation_state") == "catching_up"
+            )
+            group["status"] = "updating" if running else "waiting"
+            group["status_label"] = (
+                f"{active_counts['catching_up']:,} 個必要子端點尚未到最新"
+            )
             active_etas = [
-                item.get("eta")
-                for item in children
-                if isinstance(item.get("eta"), Mapping)
-                and str(item["eta"].get("state") or "")
-                in {"estimating", "warming_up", "running_unmeasured"}
+                child.get("eta")
+                for child in active_children
+                if child.get("operation_state") == "catching_up"
+                and isinstance(child.get("eta"), Mapping)
             ]
             measured = [
-                item
-                for item in active_etas
-                if _integer(item.get("remaining_seconds")) is not None
+                eta
+                for eta in active_etas
+                if _integer(eta.get("remaining_seconds")) is not None
             ]
             group["eta"] = (
-                max(measured, key=lambda item: _integer(item.get("remaining_seconds")) or 0)
-                if measured
-                else dict(active_etas[0])
-                if active_etas
-                else _unknown_eta(
-                    "blocked" if group["status"] == "blocked" else "waiting_schedule",
-                    "等待必要端點解除阻擋或下一輪產生有效吞吐率。",
+                dict(
+                    max(
+                        measured,
+                        key=lambda eta: _integer(eta.get("remaining_seconds")) or 0,
+                    )
                 )
+                if measured
+                else _unknown_eta(
+                    "warming_up" if running else "waiting_schedule",
+                    "子端點尚未到最新，但目前沒有可合併的有效吞吐 ETA。",
+                )
+            )
+        elif active_counts["streaming"]:
+            group["status"] = "updating"
+            group["status_label"] = (
+                f"{active_counts['streaming']:,} 個子端點正在有效串流"
+            )
+            group["eta"] = _unknown_eta(
+                "continuous", "串流沒有總完工日；以交易時窗與落盤心跳驗證。"
             )
 
 
@@ -3356,6 +3641,24 @@ def _specialize_groups(
             for name in progress_services[group_id]
         ):
             continue
+        structured_progress_at = _parse_time(group.get("latest_at_utc"))
+        structured_progress_age = (
+            max(0.0, (now - structured_progress_at).total_seconds())
+            if structured_progress_at is not None
+            else None
+        )
+        structured_eta_state = str((group.get("eta") or {}).get("state") or "")
+        if (
+            group.get("status") == "updating"
+            and structured_progress_age is not None
+            and structured_progress_age <= 15 * 60
+            and structured_eta_state
+            in {"estimating", "warming_up", "running_unmeasured"}
+        ):
+            # Structured progress.json is the canonical logical-unit receipt.
+            # Tqdm log scraping observes only one transient phase and must be a
+            # fallback, never an override of source-backed progress.
+            continue
         progress = _select_runtime_progress(runtime_progress, tokens=tokens)
         if progress is None:
             continue
@@ -3385,9 +3688,7 @@ def _stock_stream_window(now: datetime) -> dict[str, Any]:
         session_date = local.date() + timedelta(days=offset)
         if session_date.weekday() >= 5:
             continue
-        starts = datetime.combine(
-            session_date, datetime_time(8, 45), tzinfo=TAIPEI
-        )
+        starts = datetime.combine(session_date, datetime_time(8, 45), tzinfo=TAIPEI)
         ends = datetime.combine(session_date, datetime_time(13, 30), tzinfo=TAIPEI)
         if ends > local:
             candidates.append((starts, ends))
@@ -3456,9 +3757,7 @@ def _profile_for_row(row: Mapping[str, Any]) -> dict[str, Any]:
             "service_keys": ("shioaji_stock_stream",),
             "stream_kind": "tw_stock",
         },
-        "shioaji:hft_dataset": _AUTOMATION_PROFILES[
-            "group:tw-microstructure-train"
-        ],
+        "shioaji:hft_dataset": _AUTOMATION_PROFILES["group:tw-microstructure-train"],
         "shioaji:stock_minute": _AUTOMATION_PROFILES["group:tw-minute-source-cold"],
         "shioaji:minute_research": _AUTOMATION_PROFILES["group:tw-minute-train"],
         "shioaji:stock_daily": _AUTOMATION_PROFILES["group:tw-minute-train"],
@@ -3554,8 +3853,7 @@ def _automation_for_row(
             **selected,
             "kind": "mixed_tw",
             "schedule_label": (
-                "台股 08:45–13:30；TAIFEX 08:30–13:45、"
-                "14:50–次日 05:00（正常週曆）"
+                "台股 08:45–13:30；TAIFEX 08:30–13:45、14:50–次日 05:00（正常週曆）"
             ),
         }
     eligible = row.get("automation_eligible", True) is True
@@ -3622,27 +3920,53 @@ def _operation_state(
     row: Mapping[str, Any], automation: Mapping[str, Any]
 ) -> tuple[str, str, str]:
     raw_status = str(row.get("status") or "unavailable")
+    scope = str(row.get("scope") or "")
     eta_state = str((row.get("eta") or {}).get("state") or "unknown")
     mode = str(automation.get("mode") or "not_configured")
     stream_window = automation.get("stream_window")
     freshness_age = _number((row.get("freshness") or {}).get("age_seconds"))
+    freshness_state = str((row.get("freshness") or {}).get("state") or "unknown")
+    coverage_ratio = _number((row.get("coverage") or {}).get("ratio"))
     recent_stream_heartbeat = freshness_age is not None and freshness_age <= 10 * 60
 
+    if scope == "credential_gate":
+        return (
+            "control",
+            "control",
+            str(row.get("status_label") or "API 憑證存在性稽核"),
+        )
+
+    if row.get("registry_alias") is True:
+        return (
+            "reference",
+            "registry_alias",
+            str(row.get("status_label") or "由既有專用端點維護"),
+        )
+
     if raw_status == "deferred":
-        return "complete", "deferred", str(
-            row.get("status_label") or "依目前資料取得範圍延後"
+        return (
+            "deferred",
+            "deferred",
+            str(row.get("status_label") or "依目前資料取得範圍延後"),
         )
 
     if mode == "stream":
         window_open = (
-            isinstance(stream_window, Mapping)
-            and stream_window.get("state") == "open"
+            isinstance(stream_window, Mapping) and stream_window.get("state") == "open"
         )
         if raw_status in {"blocked", "unavailable", "degraded"}:
             return "unable", "blocked", "串流來源缺少可用的服務或落盤證據"
-        if window_open and raw_status in {"updating", "current"} and recent_stream_heartbeat:
+        if (
+            window_open
+            and raw_status in {"updating", "current"}
+            and recent_stream_heartbeat
+        ):
             return "streaming", "streaming", "交易時窗內且最近十分鐘有落盤心跳"
-        return "catching_up", "waiting_stream_window", "目前未觀測到有效串流；等待下一個時窗或新心跳"
+        return (
+            "catching_up",
+            "waiting_stream_window",
+            "目前未觀測到有效串流；等待下一個時窗或新心跳",
+        )
 
     actively_working = automation.get("job_running") is True or eta_state in {
         "estimating",
@@ -3650,6 +3974,15 @@ def _operation_state(
         "running_unmeasured",
         "phase_estimate",
     }
+    schedule_state = str(automation.get("schedule_state") or "")
+    scheduled_execution = (
+        "scheduled"
+        if schedule_state
+        in {"scheduled", "after_previous_completion", "schedule_declared"}
+        else "waiting_quota"
+        if eta_state == "waiting_quota"
+        else "waiting"
+    )
     if raw_status in {"blocked", "unavailable"}:
         return "unable", "blocked", str(row.get("status_label") or "來源不可用")
     if raw_status == "degraded":
@@ -3658,25 +3991,46 @@ def _operation_state(
         return "unable", "failed", str(row.get("status_label") or "完整性稽核未通過")
     if mode == "on_demand":
         return "complete", "on_demand", "端點按需逐次完成，沒有常駐下載佇列"
+    if (
+        raw_status in {"current", "complete"}
+        and mode != "frozen"
+        and freshness_state == "stale"
+    ):
+        if row.get("automation_eligible", True) is not True:
+            return "unable", "not_configured", "最近批次已過時，且尚無自動更新管線"
+        return (
+            "catching_up",
+            "running" if actively_working else scheduled_execution,
+            "最近批次已過新鮮度時窗；歷史完成不等於目前已到最新",
+        )
+    if (
+        raw_status in {"current", "complete"}
+        and coverage_ratio is not None
+        and coverage_ratio < 1.0
+    ):
+        if row.get("automation_eligible", True) is not True:
+            return "unable", "not_configured", "完整度尚有缺口，且尚無自動補齊管線"
+        return (
+            "catching_up",
+            "running" if actively_working else scheduled_execution,
+            "完整度分子小於分母；不得以成功狀態覆蓋尚存缺口",
+        )
     if row.get("automation_eligible", True) is not True:
         if raw_status in {"current", "complete", "legacy"}:
             return "complete", "not_applicable", "封存或按契約不需要持續更新"
         return "unable", "not_configured", "來源已登錄，但尚未具備可執行的自動更新管線"
+
     if raw_status == "updating" or actively_working:
         return "catching_up", "running", "更新工作執行中，尚未到最新"
     if raw_status in {"waiting", "stale"} or eta_state in {
         "waiting_quota",
         "waiting_schedule",
     }:
-        execution = (
-            "scheduled"
-            if automation.get("schedule_state")
-            in {"scheduled", "after_previous_completion", "schedule_declared"}
-            else "waiting_quota"
-            if eta_state == "waiting_quota"
-            else "waiting"
+        return (
+            "catching_up",
+            scheduled_execution,
+            str(row.get("status_label") or "等待更新"),
         )
-        return "catching_up", execution, str(row.get("status_label") or "等待更新")
     if raw_status in {"current", "complete", "legacy"}:
         return "complete", "idle_current", "最新可驗證批次已完成"
     return "unable", "unknown", "缺少足夠狀態證據，無法判定會自動完成"
@@ -3712,16 +4066,16 @@ def _publication_for_row(
         schedule_kind = "not_applicable"
         schedule_label = "憑證狀態，不是公開資料發布端點"
         basis = "此列只驗證憑證是否已設定，不代表任何上游資料發布。"
+    elif row.get("registry_alias") is True:
+        schedule_kind = "reference"
+        schedule_label = "清冊參照；發布與取得時間請見對應專用端點"
+        basis = "此列只保留來源責任映射，不建立第二份發布或排程事實。"
     elif explicit:
         schedule_kind = str(explicit.get("schedule_kind") or "source_contract")
         schedule_label = str(
-            explicit.get("schedule_label")
-            or "來源未承諾固定發布時刻；以實際偵測為準"
+            explicit.get("schedule_label") or "來源未承諾固定發布時刻；以實際偵測為準"
         )
-        basis = str(
-            explicit.get("basis")
-            or "發布時間來自來源契約或版本偵測收據。"
-        )
+        basis = str(explicit.get("basis") or "發布時間來自來源契約或版本偵測收據。")
     elif mode == "stream":
         schedule_kind = "continuous"
         schedule_label = f"連續發布；{cadence}"
@@ -3744,9 +4098,7 @@ def _publication_for_row(
         "schedule_kind": schedule_kind,
         "schedule_label": schedule_label,
         "exact_time_declared": explicit.get("exact_time_declared") is True,
-        "probe_boundaries_taipei": list(
-            explicit.get("probe_boundaries_taipei") or []
-        ),
+        "probe_boundaries_taipei": list(explicit.get("probe_boundaries_taipei") or []),
         "detected_at_utc": explicit.get("detected_at_utc"),
         "last_checked_at_utc": explicit.get("last_checked_at_utc"),
         "applied_at_utc": explicit.get("applied_at_utc"),
@@ -3775,6 +4127,56 @@ def _acquisition_progress(
         ratio = min(1.0, max(0.0, ratio))
     current = _integer(coverage.get("current"))
     total = _integer(coverage.get("total"))
+    if operation in {"deferred", "control", "reference"}:
+        state = {
+            "deferred": "deferred",
+            "control": "not_applicable",
+            "reference": "reference",
+        }[operation]
+        label = {
+            "deferred": "已延後；不列入主動取得範圍",
+            "control": "設定／憑證就緒狀態，不是資料下載進度",
+            "reference": "清冊參照；進度由既有專用端點唯一計算",
+        }[operation]
+        basis = {
+            "deferred": "使用者範圍決策，不是完整度分子／分母",
+            "control": "控制面狀態與資料面完整度分開計算",
+            "reference": "只保留來源與專用端點責任映射，避免同一資料重複進入分母",
+        }[operation]
+        return {
+            "state": state,
+            "label": label,
+            "current": None,
+            "total": None,
+            "ratio": None,
+            "unit": None,
+            "basis": basis,
+            "first_data_observed": False,
+            "first_data_at_utc": None,
+            "data_through": None,
+            "preparing_for_date": None,
+            "coverage_complete": False,
+            "batch_complete": False,
+            "up_to_date": False,
+            "evidence_coverage": None,
+        }
+    evidence_coverage = None
+    stale_full_receipt = (
+        operation in {"catching_up", "unable"} and ratio is not None and ratio >= 1.0
+    )
+    if stale_full_receipt:
+        # A historical or phase-local 100% receipt is evidence, not proof that
+        # an endpoint which is stale or blocked has presently completed.
+        evidence_coverage = {
+            "current": current,
+            "total": total,
+            "ratio": ratio,
+            "unit": str(coverage.get("unit") or "").strip() or None,
+            "label": str(coverage.get("label") or "").strip() or "既有完整度收據",
+        }
+        ratio = None
+        current = None
+        total = None
     data_through = str(row.get("data_through") or "").strip() or None
     preparing_for_date = _next_data_date(data_through)
     first_data_observed = bool(
@@ -3783,7 +4185,7 @@ def _acquisition_progress(
         or ((_integer(row.get("rows")) or 0) > 0)
         or operation == "streaming"
     )
-    up_to_date = operation in {"complete", "streaming"} and execution != "deferred"
+    up_to_date = operation in {"complete", "streaming"}
     coverage_complete = ratio >= 1.0 if ratio is not None else False
     batch_complete = operation == "complete" or (
         coverage_complete and execution not in {"running", "streaming"}
@@ -3791,15 +4193,23 @@ def _acquisition_progress(
     if operation == "streaming":
         state = "streaming"
         label = "持續取得中；串流沒有總完工日"
-    elif execution == "deferred":
-        state = "deferred"
-        label = "已延後；不列入主動取得範圍"
     elif up_to_date:
         state = "complete"
         label = "取得完成且已到最新"
     elif operation == "unable":
         state = "blocked"
-        label = "取得未完成；目前受阻"
+        label = (
+            "目前受阻；既有完整度收據不代表現在可完成"
+            if stale_full_receipt
+            else "取得未完成；目前受阻"
+        )
+    elif stale_full_receipt:
+        state = "recalibrating" if execution == "running" else "stale_complete_receipt"
+        label = (
+            "舊批次或目前階段已完成；仍在重新量測全域進度"
+            if execution == "running"
+            else "舊批次已完成但資料已過時；等待新一輪取得"
+        )
     elif batch_complete and preparing_for_date:
         state = "preparing_next_date"
         label = f"本批完成；準備下一資料日 {preparing_for_date}"
@@ -3816,9 +4226,11 @@ def _acquisition_progress(
     progress_basis = str(coverage.get("label") or "").strip()
     eta = row.get("eta")
     eta = eta if isinstance(eta, Mapping) else {}
-    completed_receipt = bool(row.get("latest_at_utc")) and str(
-        eta.get("state") or ""
-    ) == "complete"
+    completed_receipt = (
+        row.get("completion_receipt_present", True) is True
+        and bool(row.get("latest_at_utc"))
+        and str(eta.get("state") or "") == "complete"
+    )
     if ratio is None and up_to_date and completed_receipt:
         # A timestamped, high-confidence completed receipt is a valid binary
         # denominator.  An on-demand contract alone is not.
@@ -3829,12 +4241,14 @@ def _acquisition_progress(
         progress_basis = "最新完成收據"
     else:
         unit = str(coverage.get("unit") or "").strip() or None
-        if ratio is None:
+        if ratio is None and not stale_full_receipt:
             progress_basis = (
                 "已收到首筆，但來源未提供可靠總量"
                 if first_data_observed
                 else "來源未提供可靠分子／分母"
             )
+        elif stale_full_receipt:
+            progress_basis = "既有收據另列為證據，不作目前工作完成率"
     first_data_at = publication.get("applied_at_utc") or None
     return {
         "state": state,
@@ -3851,6 +4265,7 @@ def _acquisition_progress(
         "coverage_complete": coverage_complete,
         "batch_complete": batch_complete,
         "up_to_date": up_to_date,
+        "evidence_coverage": evidence_coverage,
     }
 
 
@@ -3866,11 +4281,13 @@ def _row_sort_key(row: Mapping[str, Any]) -> tuple[Any, ...]:
         "idle_current": 5,
         "on_demand": 6,
         "deferred": 7,
-        "not_applicable": 8,
-        "not_configured": 9,
-        "failed": 10,
-        "blocked": 11,
-        "unknown": 12,
+        "control": 8,
+        "registry_alias": 9,
+        "not_applicable": 10,
+        "not_configured": 11,
+        "failed": 12,
+        "blocked": 13,
+        "unknown": 14,
     }
     eta = _number((row.get("eta") or {}).get("remaining_seconds"))
     next_run = _parse_time((row.get("automation") or {}).get("next_run_at_utc"))
@@ -3902,11 +4319,7 @@ def _enrich_and_sort_rows(
         publication = _publication_for_row(
             row,
             automation=automation,
-            hint=(
-                publication_hint
-                if isinstance(publication_hint, Mapping)
-                else None
-            ),
+            hint=(publication_hint if isinstance(publication_hint, Mapping) else None),
         )
         row["endpoint_id"] = str(row.get("id") or "")
         row["operation_state"] = operation
@@ -3914,13 +4327,21 @@ def _enrich_and_sort_rows(
         row["operation_rank"] = _OPERATION_ORDER[operation]
         row["execution_state"] = execution
         row["operation_reason"] = reason
-        row["in_active_scope"] = execution != "deferred"
-        row["is_latest"] = operation == "streaming" or (
-            operation == "complete" and execution != "deferred"
-        )
+        row["in_active_scope"] = operation not in {
+            "deferred",
+            "control",
+            "reference",
+        }
+        row["is_latest"] = operation == "streaming" or (operation == "complete")
         row["last_verified_at_utc"] = row.get("latest_at_utc")
         row["automation"] = automation
         row["publication"] = publication
+        _normalize_eta(
+            row,
+            operation=operation,
+            execution=execution,
+            now=now,
+        )
         row["acquisition_progress"] = _acquisition_progress(
             row,
             operation=operation,
@@ -3960,6 +4381,75 @@ def _provider_summaries(rows: Iterable[Mapping[str, Any]]) -> list[dict[str, Any
     return sorted(output, key=lambda row: (-row["registered"], row["provider"].lower()))
 
 
+def _monitor_integrity_checks(
+    rows: list[Mapping[str, Any]],
+    *,
+    active_data_endpoints: int,
+) -> dict[str, Any]:
+    """Publish executable cross-field invariants for the monitor itself."""
+
+    endpoint_ids = [str(row.get("id") or "") for row in rows]
+    group_ids = {
+        str(row.get("id") or "") for row in rows if row.get("scope") == "storage_group"
+    }
+    logical = [row for row in rows if row.get("scope") != "storage_group"]
+
+    def ratio(row: Mapping[str, Any], key: str) -> float | None:
+        payload = row.get(key)
+        return _number(payload.get("ratio")) if isinstance(payload, Mapping) else None
+
+    counts = {
+        "duplicate_endpoint_ids": len(endpoint_ids) - len(set(endpoint_ids)),
+        "orphan_parent_ids": sum(
+            bool(parent := str(row.get("parent_id") or "")) and parent not in group_ids
+            for row in logical
+        ),
+        "complete_with_stale_freshness": sum(
+            row.get("operation_state") == "complete"
+            and (row.get("freshness") or {}).get("state") == "stale"
+            for row in rows
+        ),
+        "complete_with_incomplete_coverage": sum(
+            row.get("operation_state") == "complete"
+            and ratio(row, "coverage") is not None
+            and (ratio(row, "coverage") or 0.0) < 1.0
+            for row in rows
+        ),
+        "noncomplete_with_complete_eta": sum(
+            row.get("operation_state") != "complete"
+            and (row.get("eta") or {}).get("state") == "complete"
+            for row in rows
+        ),
+        "blocked_or_catching_with_full_progress_bar": sum(
+            row.get("operation_state") in {"unable", "catching_up"}
+            and ratio(row, "acquisition_progress") is not None
+            and (ratio(row, "acquisition_progress") or 0.0) >= 1.0
+            for row in rows
+        ),
+        "registry_alias_not_reference": sum(
+            row.get("registry_alias") is True
+            and row.get("operation_state") != "reference"
+            for row in rows
+        ),
+        "inactive_state_marked_active": sum(
+            row.get("operation_state") in {"deferred", "control", "reference"}
+            and row.get("in_active_scope") is not False
+            for row in rows
+        ),
+        "active_denominator_mismatch": abs(
+            sum(row.get("in_active_scope") is True for row in logical)
+            - active_data_endpoints
+        ),
+    }
+    violations = sum(counts.values())
+    return {
+        "state": "pass" if violations == 0 else "fail",
+        "violations": violations,
+        "checks": counts,
+        "basis": "由最終公開 DTO 逐列重算；零代表狀態、時效、完整度、ETA 與分母契約沒有已知矛盾。",
+    }
+
+
 def build_data_monitor_public_status(
     repo_root: Path,
     *,
@@ -3991,9 +4481,7 @@ def build_data_monitor_public_status(
     )
     service_states = (
         _refresh_service_states(
-            snapshot_path=(
-                root / "artifacts/live/data_monitor/refresh_services.json"
-            ),
+            snapshot_path=(root / "artifacts/live/data_monitor/refresh_services.json"),
             now=observed,
             prefer_snapshot=True,
         )
@@ -4022,7 +4510,12 @@ def build_data_monitor_public_status(
         + _free_public_registry_sources(root, now=observed)
         + history_logical
     )
-    _rollup_crypto_history_groups(groups, history_logical)
+    logical_for_rollup = _enrich_and_sort_rows(
+        logical,
+        now=observed,
+        refresh_services=service_states,
+    )
+    _rollup_storage_groups(groups, logical_for_rollup)
     rows = _enrich_and_sort_rows(
         groups + logical,
         now=observed,
@@ -4037,10 +4530,23 @@ def build_data_monitor_public_status(
         status_counts[status] = status_counts.get(status, 0) + 1
         operation = str(row.get("operation_state") or "unable")
         operation_counts[operation] = operation_counts.get(operation, 0) + 1
-    attention = operation_counts["unable"]
-    healthy = len(rows) - attention
+    active_data_rows = [
+        row
+        for row in logical
+        if row.get("operation_state") not in {"deferred", "control", "reference"}
+    ]
+    data_operation_counts = {state: 0 for state in _OPERATION_ORDER}
+    for row in active_data_rows:
+        operation = str(row.get("operation_state") or "unable")
+        data_operation_counts[operation] = data_operation_counts.get(operation, 0) + 1
+    group_operation_counts = {state: 0 for state in _OPERATION_ORDER}
+    for row in groups:
+        operation = str(row.get("operation_state") or "unable")
+        group_operation_counts[operation] = group_operation_counts.get(operation, 0) + 1
+    attention = data_operation_counts["unable"]
+    healthy = len(active_data_rows) - attention
     worst_status = max(
-        (str(row.get("status") or "unavailable") for row in rows),
+        (str(row.get("status") or "unavailable") for row in active_data_rows),
         key=lambda value: _STATUS_PRIORITY.get(value, 99),
         default="unavailable",
     )
@@ -4048,7 +4554,7 @@ def build_data_monitor_public_status(
         health = (
             "critical" if worst_status in {"blocked", "unavailable"} else "degraded"
         )
-    elif operation_counts["catching_up"]:
+    elif data_operation_counts["catching_up"]:
         health = "updating"
     else:
         health = "active"
@@ -4090,9 +4596,19 @@ def build_data_monitor_public_status(
         bool((row.get("acquisition_progress") or {}).get("preparing_for_date"))
         for row in rows
     )
-    deferred_count = sum(row.get("execution_state") == "deferred" for row in rows)
-    active_scope_count = len(rows) - deferred_count
-    completed_in_scope = operation_counts["complete"] - deferred_count
+    deferred_count = sum(row.get("operation_state") == "deferred" for row in logical)
+    control_count = sum(row.get("operation_state") == "control" for row in logical)
+    reference_count = sum(row.get("operation_state") == "reference" for row in logical)
+    credential_rows = [row for row in logical if row.get("scope") == "credential_gate"]
+    credential_ready = sum(
+        row.get("credential_state") == "configured" for row in credential_rows
+    )
+    active_scope_count = len(active_data_rows)
+    completed_in_scope = data_operation_counts["complete"]
+    integrity_checks = _monitor_integrity_checks(
+        rows,
+        active_data_endpoints=active_scope_count,
+    )
     return {
         "schema_version": DATA_MONITOR_SCHEMA_VERSION,
         "generated_at_utc": _iso(observed),
@@ -4114,17 +4630,26 @@ def build_data_monitor_public_status(
             ),
             "healthy_or_progressing": healthy,
             "attention_required": attention,
-            "catching_up": operation_counts["catching_up"],
-            "streaming": operation_counts["streaming"],
+            "catching_up": data_operation_counts["catching_up"],
+            "streaming": data_operation_counts["streaming"],
             "completed": completed_in_scope,
             "deferred": deferred_count,
+            "control_items": control_count,
+            "reference_items": reference_count,
+            "contract_violations": integrity_checks["violations"],
+            "credential_ready": credential_ready,
+            "credential_attention": len(credential_rows) - credential_ready,
             "active_scope_items": active_scope_count,
-            "unable": operation_counts["unable"],
+            "active_data_endpoints": active_scope_count,
+            "group_rollups": len(groups),
+            "unable": data_operation_counts["unable"],
             "known_group_rows": known_rows,
             "status_counts": status_counts,
             "operation_state_counts": operation_counts,
+            "data_endpoint_state_counts": data_operation_counts,
+            "group_state_counts": group_operation_counts,
             "source_level_ratio": (
-                (completed_in_scope + operation_counts["streaming"])
+                (completed_in_scope + data_operation_counts["streaming"])
                 / active_scope_count
                 if active_scope_count
                 else 0.0
@@ -4134,6 +4659,9 @@ def build_data_monitor_public_status(
             "total": len(rows),
             "active_scope_total": active_scope_count,
             "deferred": deferred_count,
+            "control": control_count,
+            "reference": reference_count,
+            "group_rollups": len(groups),
             "ordered_states": [
                 {"state": state, "label": _OPERATION_LABELS[state], "rank": rank}
                 for state, rank in _OPERATION_ORDER.items()
@@ -4160,6 +4688,7 @@ def build_data_monitor_public_status(
             ),
         },
         "provider_summaries": _provider_summaries(rows),
+        "integrity_checks": integrity_checks,
         "refresh_services": service_states,
         "active_progress": runtime_progress,
         "groups": groups,
@@ -4170,7 +4699,7 @@ def build_data_monitor_public_status(
             "eta": "只有執行中且存在有效吞吐率時才估算；配額、休市或零速率會明示未知。",
             "operation_state": (
                 "固定排序為：正在抓／還沒到最新、正在串流、已完成／已到最新、"
-                "無法完成；原始下載器狀態仍保留供稽核。"
+                "無法完成、已延後、設定／憑證閘門、清冊參照；後三者不進入資料完成率。"
             ),
             "streaming": (
                 "服務常駐不等於正在串流；必須同時位於交易時窗且最近十分鐘有落盤心跳。"
@@ -4187,7 +4716,10 @@ def build_data_monitor_public_status(
                 "進度優先取完整度 receipt/manifest 的分子分母；分母未知時保持未知。"
                 "首筆資料到達即顯示下一個日曆資料日，但完整性未通過前不標示完成。"
             ),
-            "source_level_progress": "面板監控項目的狀態比例，不是資料列數完成率。",
+            "source_level_progress": (
+                "只計算非群組、非憑證、非延後、非清冊別名的主動資料端點；"
+                "這是端點狀態比例，不是資料列數完成率。"
+            ),
             "realtime_boundary": "即時 Tick／BidAsk 是連續流，沒有總完工日；歷史 Tick 不能重建未曾擷取的五檔委託簿。",
             "tw_public_boundary": "臺灣官方資料只透過完整稽核後的不可變快照切換，不直接修改已發佈版本。",
         },

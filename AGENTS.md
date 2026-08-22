@@ -32,6 +32,173 @@ changes, and follow the user's latest explicit experiment settings.
 - Do not revert user changes or unrelated dirty files.
 - Do not use destructive git commands such as `git reset --hard` or `git checkout --` unless the user explicitly asks.
 
+## Data Storage And Syncthing Contract
+
+This section is a correctness contract for every agent and machine, not a
+description of one deployment snapshot.  Its purpose is to preserve data while
+keeping synchronization incremental, cold storage compact, and local training
+fast.  Daily commands live in `README.md`; the detailed runbook is
+`docs/packed_dataset_storage.md`.  Historical sizes, snapshot IDs, IP addresses,
+connection counts, and service states are evidence from one observation and must
+be measured again.  If an example conflicts with the current catalog or tool
+output, do not copy the example blindly.  Changing any boundary below requires a
+coordinated code, config, test, and documentation change.
+
+### First-principles invariants
+
+- Preservation, synchronization, and usability are different claims.  A source
+  is preserved only after its release passes source/freshness audit and every
+  referenced packed object can reconstruct it.  A peer is synchronized only
+  after Syncthing convergence and cold verification.  A dataset is locally
+  usable only after the selected release is materialized and its `READY` proof
+  verifies.
+- Mutable work and immutable distribution must be separate.  Downloaders write
+  resumable local workspaces; only an audited atomic release enters the shared
+  cold store.  Receiving cold objects must never directly overwrite a running
+  dataset or training directory.
+- Deduplication is content-addressed.  File names, sizes, mtimes, and apparent
+  similarity are not deletion proof.  Preserve one verified object per digest
+  and let manifests retain logical paths.  Never delete a source merely because
+  another path looks duplicated.
+- Small-file query layout and transport layout solve different problems.  Keep
+  canonical Parquet/receipt grains needed by readers, but publish them through
+  deterministic fixed hash buckets plus large-file blobs.  Do not replace this
+  with raw small-file Syncthing or a single giant archive whose smallest change
+  retransmits the entire dataset.
+- "Real-time synchronization" means that the Syncthing watcher starts copying
+  an atomic release immediately after all publication gates pass.  It never
+  means syncing half-written downloader output.  Scheduled and continuous
+  downloaders must use the canonical publish wrapper after each successful,
+  auditable batch.
+
+### Layer ownership
+
+| Layer | Current authority | Mutable | Syncthing |
+|---|---|---:|---:|
+| Code, configs, contracts | Git working tree | yes, through Git | no data folder |
+| Canonical producer workspace | catalog-resolved `source`, including `/srv/stockagent-live/data_tw_public` for `tw-public` | yes | no |
+| Durable fleet cold store | `/srv/stockagent-packed` | immutable releases only | yes, Folder ID `stockagent-packed` |
+| Replaceable local hot cache | `/srv/stockagent-packed-materialized` | only lifecycle metadata; materialized data is immutable | no |
+| In-progress training artifacts | node-local `artifacts` workspace | yes | no |
+| Optional operational artifact transport | `/srv/stockagent-artifacts-hot` | yes | separate, explicitly scoped folder only |
+
+- `configs/data_sync/packed_datasets.json` is the dataset publication catalog.
+  Its `source`, `publish`, `excluded_subtrees`, writer-process, freshness, role,
+  and redistribution restrictions are authoritative.  A dataset with
+  `publish: false` stays local.  Do not create an unregistered alias or bypass a
+  catalog restriction to make synchronization convenient.
+- Packed and materialized trees are never downloader destinations.  A consumer
+  that writes panel caches, metadata, checkpoints, logs, or temporary files must
+  use a separate writable live/cache/artifact root.  In particular,
+  `stocks/panel_cache_v2` is reproducible node-local state and is excluded from
+  the `tw-public` release.
+- Runtime `data_*` paths may be local directories or atomic symlinks, but the
+  target's role must remain explicit.  A writable service must target its
+  catalog-resolved live workspace, not a packed materialization.  Never infer
+  authority from the convenient `data_*` link name.
+
+### Syncthing topology and identity
+
+- The only shared canonical data folder is `stockagent-packed` at
+  `/srv/stockagent-packed`, configured Send & Receive, filesystem watcher on,
+  and not paused.  It contains only release manifests, per-node heads, packs,
+  blobs, and their proofs.  Repositories, mutable `data_*` trees, materialized
+  caches, downloader shards, and active training directories do not belong in
+  this folder.
+- `stockagent`, `stockagent-desync`, and `stockagent-artifacts-live` are retired
+  Folder IDs.  Never recreate or accept them.  `stockagent-artifacts-hot` is a
+  non-canonical low-latency channel for an explicitly bounded penguin/lab203
+  artifact set; vastai1T must not join it with its complete `artifacts` tree.
+- Each machine owns one permanent release node ID and one unique Syncthing
+  identity, currently named `penguin`, `lab203`, and `vastai1T`.  Never copy
+  Syncthing certificates, keys, device IDs, databases, or
+  `.local-state/node-id` between machines.  `.local-state` remains ignored by
+  Syncthing.
+- QUIC and multiple connections are preferred throughput mechanisms, not data
+  correctness proofs.  Syncthing's authenticated encrypted transport remains
+  mandatory; TCP is a valid fallback.  Report QUIC, relay, TLS suite, or channel
+  count as active only when the current connection record actually observes it.
+- Platform supervision may differ: penguin/lab203 normally use systemd, while a
+  Vast container may use a user supervisor and cron.  This does not change the
+  storage contract.  Before calling a Vast cold store durable, verify that its
+  path is on persistent storage that survives instance recreation.
+
+### Multi-writer publication and conflict resolution
+
+- There is no single publisher.  Every node publishes immutable releases under
+  its own permanent node ID.  Per-node heads plus the deterministic HLC/LWW
+  resolver choose the newest *valid* release; catalog freshness and
+  non-regression checks outrank wall-clock recency.
+- "Newest wins" applies only to validated release heads.  It does not authorize
+  agents to compare mtimes, hand-edit a shared head, copy another node's head,
+  impersonate its node ID, or accept a Syncthing conflict file.  A conflict file
+  is a failed publication/synchronization condition that must be audited.
+- Publish only through the catalog-backed entry points such as
+  `stockagent-data publish`, `scripts/run_data_release.sh`, or
+  `scripts/run_downloader_with_release.sh`.  Publication must fail closed while
+  a declared writer is active or when build, strict audit, inventory hash,
+  freshness receipt, coverage, rights, or atomic-head update is incomplete.
+- Partial downloads, task shards, locks, PIDs, quarantine data, reproducible
+  caches, and incomplete training runs remain node-local.  Completed artifacts
+  may enter cold storage only after their lifecycle/completion contract and
+  final hashes pass; an active service or named file is not completion evidence.
+- Training, backtest, resume, and audit jobs must resolve and record one exact
+  release ID before starting.  They may not re-resolve `latest` during a run or
+  silently resume against a different release.
+
+### Cold receive, materialization, and leases
+
+- A receiving node's default steady state is `COLD_ONLY`.  Syncthing services,
+  timers, cron jobs, and downloader hooks must not automatically run `fetch`,
+  `use`, materialize a release, or create a repository `data_*` symlink.
+- `stockagent-data use DATASET` is the explicit local transition from cold to
+  hot.  It must verify the complete selected release before atomically changing
+  the managed current link.  Treat the resulting materialized tree as immutable;
+  writable consumers use another root.
+- The default hot-cache lease is seven days.  The cache monitor runs every five
+  minutes and inspects `/proc` file descriptors, maps, cwd, root, and executable
+  references.  An observed reference renews `last_used_at` and extends the same
+  lease TTL; recursive `atime` scanning is not a substitute.  A short job that
+  can open and close between monitor scans must call `stockagent-data use` first.
+- `stockagent-data gc --dry-run` must expose would-renew and would-evict actions.
+  Automatic or manual eviction must refuse an active reference, pin, incomplete
+  cold release, missing object, or mismatched `READY` proof.  `evict` may bypass
+  lease age only; it may not bypass those safety proofs.
+- Cache GC may delete only managed materialized versions.  It must never delete
+  `/srv/stockagent-packed`, a canonical producer source, an active artifact, or
+  an unmanaged directory.  Cold-object GC stays report-only unless the user has
+  explicitly approved a retention policy and fleet-wide reachability proof.
+
+### Acceptance and reporting
+
+- Do not call a node synchronized merely because the service is active or a
+  device is connected.  For every intended peer require the canonical folder to
+  be idle/up to date, `needBytes == 0`, all needed item/delete counts zero,
+  folder/system errors zero, `pullErrors == 0`, empty `watchError`, peer
+  completion 100%, and `remoteState == valid`.
+- Syncthing convergence proves byte delivery, not release validity.  Afterwards
+  run packed manifest/object verification for the selected release.  If the
+  requested outcome is local usability, also verify materialization, `READY`,
+  the exact release ID, and the resolved runtime link.
+- Keep evidence boundaries explicit.  If an agent has only local or Syncthing
+  API access, it may report observed transport and cold convergence but must not
+  claim an inaccessible peer's materialized cache, service, disk persistence,
+  or training readiness was verified.
+
+### Destructive migration and retirement
+
+- Never delete a legacy store, source tree, release, or duplicate-looking file
+  until a current packed release independently reconstructs and verifies, every
+  intended peer has converged, the replacement path is in use, and the exact
+  deletion target and filesystem scope have been resolved.
+- Start every cleanup with a read-only inventory/reachability report and dry run.
+  Preserve receipts, pins, active process references, quarantine evidence, and
+  any object reachable from a retained manifest.  Use explicit paths; never a
+  broad root, unresolved variable, or unchecked glob.
+- After an approved cleanup, report exactly what was removed, bytes recovered,
+  what remains authoritative, whether recovery is possible, and fresh
+  post-cleanup Syncthing plus release-verification evidence.
+
 ## Current Baseline Precision Recommendation
 
 The baseline should use BF16 AMP, not FP16.
@@ -503,6 +670,11 @@ Rules:
   a split-only start and silently drop the first `lookback-1` owned targets.
 - For stitched deployment tests, the next model owns its new-year first target
   under panel history; the preceding model stops immediately before that target.
+- Derive stitched deployment prefix ownership from the authoritative
+  `CrossSectionalDataset.valid_indices` of the full fold test. Do not recompute
+  mode-specific row eligibility inside the report helper: in particular, the
+  crypto dataset removes a globally unfinished trailing research period, and
+  that removed row must not reappear in deployment artifacts.
 
 ## Trainer Executor Boundaries
 

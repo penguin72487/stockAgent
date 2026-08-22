@@ -1344,8 +1344,23 @@ def build_dashboard_history_snapshot(
             return_fraction = _finite_float(row.get("return_fraction"))
         if return_pct is None:
             return
+        if return_fraction is None:
+            return_fraction = float(return_pct) / 100.0
+        initial_capital = _finite_float(row.get("initial_capital_twd"))
+        total_equity = _finite_float(row.get("total_equity_twd"))
+        wealth_index = 1.0 + float(return_fraction)
+        if not math.isfinite(wealth_index) or wealth_index <= 0.0:
+            return
+        if total_equity is None and initial_capital is not None:
+            total_equity = initial_capital * wealth_index
         minute = datetime.fromtimestamp(timestamp_seconds, tz=timezone.utc).isoformat(
             timespec="minutes"
+        )
+        session_date = (
+            datetime.fromtimestamp(timestamp_seconds, tz=timezone.utc)
+            .astimezone(TAIPEI)
+            .date()
+            .isoformat()
         )
         deduplicated[(series_id, minute)] = {
             "series_id": series_id,
@@ -1355,9 +1370,15 @@ def build_dashboard_history_snapshot(
                 row.get("benchmark_id") if series_type == "benchmark" else None
             ),
             "minute": minute,
+            "session_date": session_date,
             "timestamp_seconds": timestamp_seconds,
             "return_fraction": return_fraction,
             "return_pct": return_pct,
+            "cumulative_return_fraction": return_fraction,
+            "cumulative_return_pct": return_pct,
+            "_initial_capital_twd": initial_capital,
+            "_total_equity_twd": total_equity,
+            "_wealth_index": wealth_index,
             "valuation_stale": bool(row.get("valuation_stale", False)),
             "historical_minute_replay": bool(
                 row.get("historical_minute_replay", False)
@@ -1387,7 +1408,11 @@ def build_dashboard_history_snapshot(
             series_type="benchmark",
         )
 
-    rows = list(deduplicated.values())
+    all_rows = sorted(
+        deduplicated.values(),
+        key=lambda row: (float(row["timestamp_seconds"]), str(row["series_id"])),
+    )
+    rows = list(all_rows)
     available_dates = [
         datetime.fromtimestamp(float(row["timestamp_seconds"]), tz=timezone.utc)
         .astimezone(TAIPEI)
@@ -1429,6 +1454,28 @@ def build_dashboard_history_snapshot(
     )
     if cutoff is not None:
         rows = [row for row in rows if float(row["timestamp_seconds"]) >= cutoff]
+
+    # A detail-date selection is a period-return question.  Rebase every series
+    # to its last retained equity before the selected start date; if the ledger
+    # begins inside the requested range, its explicit initial capital is the
+    # only valid fallback.  This keeps cards, legend values, and chart points on
+    # exactly the same denominator without manufacturing an opening zero point.
+    baseline_by_series: dict[str, dict[str, Any]] = {}
+    if selected_start is not None:
+        for row in all_rows:
+            if datetime_date.fromisoformat(str(row["session_date"])) >= selected_start:
+                continue
+            baseline_by_series[str(row["series_id"])] = row
+        for row in rows:
+            baseline = baseline_by_series.get(str(row["series_id"]))
+            baseline_wealth = (
+                float(baseline["_wealth_index"]) if baseline is not None else 1.0
+            )
+            row_wealth = float(row["_wealth_index"])
+            range_return = row_wealth / baseline_wealth - 1.0
+            row["return_fraction"] = range_return
+            row["return_pct"] = range_return * 100.0
+
     historical_rows = [row for row in rows if row["historical_minute_replay"]]
     fresh_coverage = [
         value
@@ -1439,6 +1486,70 @@ def build_dashboard_history_snapshot(
     grouped: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
         grouped.setdefault(str(row["series_id"]), []).append(row)
+    range_summary: list[dict[str, Any]] = []
+    for series_id, series_rows in sorted(grouped.items()):
+        series_rows.sort(key=lambda row: float(row["timestamp_seconds"]))
+        first = series_rows[0]
+        last = series_rows[-1]
+        baseline = baseline_by_series.get(series_id)
+        baseline_wealth = (
+            float(baseline["_wealth_index"])
+            if selected_start is not None and baseline is not None
+            else 1.0
+        )
+        initial_capital = _finite_float(first.get("_initial_capital_twd"))
+        baseline_equity = (
+            _finite_float(baseline.get("_total_equity_twd"))
+            if baseline is not None
+            else initial_capital
+        )
+        end_equity = _finite_float(last.get("_total_equity_twd"))
+        if baseline_equity is None and initial_capital is not None:
+            baseline_equity = initial_capital * baseline_wealth
+        if end_equity is None and initial_capital is not None:
+            end_equity = initial_capital * float(last["_wealth_index"])
+        session_point_counts: dict[str, int] = {}
+        for row in series_rows:
+            session = str(row["session_date"])
+            session_point_counts[session] = session_point_counts.get(session, 0) + 1
+        # Right-labelled historical KBars cover 09:01..13:30 (270 points).
+        # Strategy ledgers additionally retain the accepted 09:00 execution
+        # endpoint, so their full-session curve has 271 observations.
+        points_per_session = 271 if first["series_type"] == "strategy" else 270
+        expected_minute_points = points_per_session * len(session_point_counts)
+        range_summary.append(
+            {
+                "series_id": series_id,
+                "series_type": first["series_type"],
+                "baseline_kind": (
+                    "previous_retained_mark"
+                    if selected_start is not None and baseline is not None
+                    else "initial_capital"
+                ),
+                "baseline_at_utc": baseline.get("minute") if baseline else None,
+                "baseline_equity_twd": baseline_equity,
+                "start_at_utc": first["minute"],
+                "end_at_utc": last["minute"],
+                "start_equity_twd": _finite_float(first.get("_total_equity_twd")),
+                "end_equity_twd": end_equity,
+                "range_net_pnl_twd": (
+                    end_equity - baseline_equity
+                    if end_equity is not None and baseline_equity is not None
+                    else None
+                ),
+                "return_fraction": last["return_fraction"],
+                "return_pct": last["return_pct"],
+                "point_count": len(series_rows),
+                "session_point_counts": session_point_counts,
+                "expected_minute_points": expected_minute_points,
+                "expected_points_per_session": points_per_session,
+                "minute_coverage_ratio": (
+                    len(series_rows) / expected_minute_points
+                    if expected_minute_points
+                    else None
+                ),
+            }
+        )
     sampled = [
         row
         for series_rows in grouped.values()
@@ -1448,7 +1559,13 @@ def build_dashboard_history_snapshot(
     ]
     sampled.sort(key=lambda row: (float(row["timestamp_seconds"]), row["series_id"]))
     for row in sampled:
-        row.pop("timestamp_seconds", None)
+        for internal_key in (
+            "timestamp_seconds",
+            "_initial_capital_twd",
+            "_total_equity_twd",
+            "_wealth_index",
+        ):
+            row.pop(internal_key, None)
     coverage_start = sampled[0]["minute"] if sampled else None
     coverage_end = sampled[-1]["minute"] if sampled else None
     return {
@@ -1475,6 +1592,11 @@ def build_dashboard_history_snapshot(
         "raw_points_in_range": len(rows),
         "returned_points": len(sampled),
         "downsampled": len(sampled) < len(rows),
+        "curve_granularity": "1m",
+        "expected_right_labelled_session_minute_points": 270,
+        "expected_strategy_session_points_including_09_00": 271,
+        "return_basis": "previous_retained_mark_before_start_else_initial_capital",
+        "range_summary": range_summary,
         "historical_minute_replay_points": len(historical_rows),
         "historical_minute_carried_price_points": sum(
             int(row.get("last_trade_carried_position_count") or 0) > 0
@@ -2072,10 +2194,29 @@ def build_dashboard_snapshot(
                 "price_limit_offset_ticks": mode.get("price_limit_offset_ticks", 0),
                 "bracket_price_policy": mode.get("bracket_price_policy"),
                 "fill_guaranteed": bool(mode.get("fill_guaranteed", False)),
+                # Preserve the currently deployed execution contract before a
+                # historical session view below restores the contract recorded
+                # by that session's immutable signal event.  The dashboard must
+                # show both facts instead of making a legacy replay look like
+                # the active policy (or rewriting it as though it had used the
+                # active policy).
+                "configured_entry_fill_policy": mode.get("entry_fill_policy"),
+                "configured_entry_price_offset_ticks": mode.get(
+                    "entry_price_offset_ticks", 0
+                ),
+                "configured_entry_fill_is_synthetic": bool(
+                    mode.get("entry_fill_is_synthetic", False)
+                ),
                 "entry_fill_policy": mode.get("entry_fill_policy"),
                 "entry_price_offset_ticks": mode.get("entry_price_offset_ticks", 0),
                 "entry_fill_is_synthetic": bool(
                     mode.get("entry_fill_is_synthetic", False)
+                ),
+                "entry_best_quote_fill_count": int(
+                    mode.get("entry_best_quote_fill_count") or 0
+                ),
+                "entry_synthetic_fallback_fill_count": int(
+                    mode.get("entry_synthetic_fallback_fill_count") or 0
                 ),
                 "engine_status": mode.get("engine_status"),
                 "checkpoint_ready": mode.get("checkpoint_ready"),
@@ -2344,6 +2485,12 @@ def build_dashboard_snapshot(
             mode["entry_fill_is_synthetic"] = bool(
                 (signal_event or {}).get("entry_fill_is_synthetic")
                 or mode.get("entry_fill_is_synthetic", False)
+            )
+            mode["entry_best_quote_fill_count"] = int(
+                (signal_event or {}).get("entry_best_quote_fill_count") or 0
+            )
+            mode["entry_synthetic_fallback_fill_count"] = int(
+                (signal_event or {}).get("entry_synthetic_fallback_fill_count") or 0
             )
             mode["simulation_replay"] = bool(
                 (signal_event or {}).get("simulation_replay", False)

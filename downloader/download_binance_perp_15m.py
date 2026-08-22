@@ -38,6 +38,11 @@ from binance_historical_features import (  # noqa: E402
     result_rows as historical_feature_result_rows,
     run_historical_feature_downloads,
 )
+from ohlcv_hot_tail import (  # noqa: E402
+    hot_tail_path,
+    read_logical_parquet,
+    remove_hot_tail,
+)
 
 
 BASE_URL = "https://fapi.binance.com"
@@ -409,6 +414,50 @@ def _load_existing_info(path: Path) -> ExistingCandleInfo:
             interval_ok=False,
             error=f"{type(exc).__name__}: {exc}",
         )
+
+
+def _load_logical_existing_info(path: Path) -> ExistingCandleInfo:
+    """Return coverage for the immutable base plus its bounded hot tail."""
+
+    base = _load_existing_info(path)
+    tail_path = hot_tail_path(path)
+    if not tail_path.is_file() or base.error is not None:
+        return base
+    tail = _load_existing_info(tail_path)
+    if tail.error is not None:
+        return ExistingCandleInfo(
+            rows=base.rows,
+            latest_ms=base.latest_ms,
+            interval_ok=False,
+            earliest_ms=base.earliest_ms,
+            error=f"hot tail: {tail.error}",
+        )
+    if base.latest_ms is None:
+        return tail
+
+    dates = _normalize_date_frame(
+        pl.from_arrow(pq.read_table(tail_path, columns=["date"], memory_map=True))
+    ).select(pl.col("date").str.to_datetime(strict=False).alias("__ts"))
+    base_latest = datetime.fromtimestamp(base.latest_ms / 1000, tz=timezone.utc).replace(
+        tzinfo=None
+    )
+    newer = dates.filter(pl.col("__ts") > base_latest)
+    first_new = newer.select(pl.col("__ts").min()).item() if newer.height else None
+    contiguous = first_new is None or int(
+        first_new.replace(tzinfo=timezone.utc).timestamp() * 1000
+    ) <= base.latest_ms + CANDLE_INTERVAL_MS
+    return ExistingCandleInfo(
+        rows=base.rows + newer.height,
+        latest_ms=max(
+            value for value in (base.latest_ms, tail.latest_ms) if value is not None
+        ),
+        interval_ok=bool(base.interval_ok and tail.interval_ok and contiguous),
+        earliest_ms=min(
+            value
+            for value in (base.earliest_ms, tail.earliest_ms)
+            if value is not None
+        ),
+    )
 
 
 def _read_parquet(path: Path) -> pl.DataFrame:
@@ -800,7 +849,7 @@ def _download_symbol(
         )
 
     if output_path.exists() and not refresh:
-        existing = _load_existing_info(output_path)
+        existing = _load_logical_existing_info(output_path)
         if existing.error is not None or not existing.interval_ok:
             if tail_only:
                 return DownloadResult(
@@ -920,23 +969,87 @@ def _download_symbol(
 
     frame = fresh
     if existing is not None and existing.rows:
-        frame, changed = _merge_existing_with_fresh(
-            _read_parquet(output_path),
-            fresh,
-            effective_start,
-        )
-        if not changed:
+        if tail_only:
+            tail_path = hot_tail_path(output_path)
+            fresh_latest = _latest_ms(fresh)
+            if (
+                not tail_path.is_file()
+                and fresh_latest is not None
+                and existing.latest_ms is not None
+                and fresh_latest <= existing.latest_ms
+            ):
+                return DownloadResult(
+                    "crypto_binance_usdm_perp",
+                    record.code,
+                    record.binance_symbol,
+                    record.market,
+                    "skipped_up_to_date",
+                    existing.rows,
+                    str(output_path),
+                    _ms_to_date_string(existing.earliest_ms)
+                    if existing.earliest_ms is not None
+                    else None,
+                    _ms_to_date_string(existing.latest_ms)
+                    if existing.latest_ms is not None
+                    else None,
+                )
+            if tail_path.is_file():
+                frame, changed = _merge_existing_with_fresh(
+                    _read_parquet(tail_path), fresh, effective_start
+                )
+            else:
+                changed = True
+            if not changed:
+                return DownloadResult(
+                    "crypto_binance_usdm_perp",
+                    record.code,
+                    record.binance_symbol,
+                    record.market,
+                    "skipped_up_to_date",
+                    existing.rows,
+                    str(output_path),
+                    _ms_to_date_string(existing.earliest_ms)
+                    if existing.earliest_ms is not None
+                    else None,
+                    _ms_to_date_string(existing.latest_ms)
+                    if existing.latest_ms is not None
+                    else None,
+                )
+            _validate_candles(frame)
+            _write_parquet_atomic(frame, tail_path)
+            logical = _load_logical_existing_info(output_path)
             return DownloadResult(
                 "crypto_binance_usdm_perp",
                 record.code,
                 record.binance_symbol,
                 record.market,
-                "skipped_up_to_date",
-                existing.rows,
+                "updated",
+                logical.rows,
                 str(output_path),
+                _ms_to_date_string(logical.earliest_ms)
+                if logical.earliest_ms is not None
+                else None,
+                _ms_to_date_string(logical.latest_ms)
+                if logical.latest_ms is not None
+                else None,
             )
+        frame, changed = _merge_existing_with_fresh(
+            read_logical_parquet(output_path), fresh, effective_start
+        )
+        if not changed:
+            if not hot_tail_path(output_path).is_file():
+                return DownloadResult(
+                    "crypto_binance_usdm_perp",
+                    record.code,
+                    record.binance_symbol,
+                    record.market,
+                    "skipped_up_to_date",
+                    existing.rows,
+                    str(output_path),
+                )
     _validate_candles(frame)
     _write_parquet_atomic(frame, output_path)
+    remove_hot_tail(output_path)
     return DownloadResult(
         "crypto_binance_usdm_perp",
         record.code,

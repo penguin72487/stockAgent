@@ -2760,11 +2760,38 @@ def test_deployment_test_indices_assign_next_year_warmup_to_previous_model() -> 
     )
     assert [fold.test_years[0] for fold in folds] == [2022, 2023]
 
-    first_indices = _deployment_test_indices(panel, folds[0], folds[1], lookback)
-    second_indices = _deployment_test_indices(panel, folds[1], None, lookback)
-    first_ds = CrossSectionalDataset(panel, first_indices, lookback)
-    second_ds = CrossSectionalDataset(panel, second_indices, lookback)
-    first_full_ds = CrossSectionalDataset(panel, folds[0].test_indices, lookback)
+    first_indices = _deployment_test_indices(
+        panel,
+        folds[0],
+        folds[1],
+        lookback,
+        lookback_context="split_only",
+    )
+    second_indices = _deployment_test_indices(
+        panel,
+        folds[1],
+        None,
+        lookback,
+        lookback_context="split_only",
+    )
+    first_ds = CrossSectionalDataset(
+        panel,
+        first_indices,
+        lookback,
+        lookback_context="split_only",
+    )
+    second_ds = CrossSectionalDataset(
+        panel,
+        second_indices,
+        lookback,
+        lookback_context="split_only",
+    )
+    first_full_ds = CrossSectionalDataset(
+        panel,
+        folds[0].test_indices,
+        lookback,
+        lookback_context="split_only",
+    )
 
     assert panel.dates[first_ds.valid_indices[0]] == np.datetime64("2022-01-04")
     assert panel.dates[first_ds.valid_indices[-1]] == np.datetime64("2023-01-03")
@@ -2776,6 +2803,7 @@ def test_deployment_test_indices_assign_next_year_warmup_to_previous_model() -> 
         folds[1],
         lookback,
         first_full_ds.valid_indices,
+        lookback_context="split_only",
     ) == len(first_ds)
     assert np.array_equal(
         first_ds.valid_indices,
@@ -2967,6 +2995,61 @@ def test_same_year_experimental_fold_does_not_steal_prior_test_ownership() -> No
         lookback,
         experimental_ds.valid_indices,
     ) == 0
+
+
+def test_crypto_deployment_prefix_uses_dataset_trimmed_test_rows() -> None:
+    dates = np.concatenate(
+        [
+            np.arange(f"{year}-01-01", f"{year}-01-04", dtype="datetime64[D]")
+            for year in range(2020, 2027)
+        ]
+    )
+    rows = int(dates.size)
+    mask = np.ones((rows, 1), dtype=bool)
+    returns = np.full((rows, 1), 0.01, dtype=np.float32)
+    returns[-1, 0] = np.nan
+    panel = PanelData(
+        dates=dates,
+        symbols=["BTCUSDT"],
+        feature_names=["f0"],
+        features=np.ones((rows, 1, 1), dtype=np.float32),
+        returns_1d=returns,
+        tradable_mask=mask,
+        can_buy_mask=mask.copy(),
+        can_sell_mask=mask.copy(),
+        alive_mask=mask.copy(),
+        benchmark_returns=returns[:, 0].copy(),
+        close_prices=np.arange(100.0, 100.0 + rows, dtype=np.float32)[:, None],
+    )
+    folds = build_expanding_year_folds(
+        dates,
+        min_train_years=1,
+        val_years=1,
+        require_future_test_year=False,
+    )
+    penultimate = folds[-2]
+    experimental = folds[-1]
+    assert penultimate.test_years == experimental.test_years == [2026]
+
+    full_ds = CrossSectionalDataset(
+        panel,
+        penultimate.test_indices,
+        lookback=1,
+        execution_mode="crypto_perpetual",
+    )
+    assert len(penultimate.test_indices) == 3
+    assert full_ds.valid_indices.size == 2
+
+    successors = _next_fold_by_id(folds)
+    assert successors[penultimate.fold_id] is None
+    assert _deployment_test_prefix_rows(
+        panel,
+        penultimate,
+        successors[penultimate.fold_id],
+        lookback=1,
+        full_valid_indices=full_ds.valid_indices,
+        execution_mode="crypto_perpetual",
+    ) == len(full_ds)
 
 
 def test_tensor_metrics_max_drawdown_includes_initial_nav() -> None:

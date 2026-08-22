@@ -334,6 +334,24 @@ def test_tw_history_projection_and_range_query_are_bounded() -> None:
             "end_date": "2026-08-14",
             "available_start_date": "2026-08-13",
             "available_end_date": "2026-08-17",
+            "curve_granularity": "1m",
+            "return_basis": (
+                "previous_retained_mark_before_start_else_initial_capital"
+            ),
+            "range_summary": [
+                {
+                    "series_id": "benchmark_0050",
+                    "series_type": "benchmark",
+                    "baseline_equity_twd": 100.0,
+                    "end_equity_twd": 101.25,
+                    "range_net_pnl_twd": 1.25,
+                    "return_pct": 1.25,
+                    "point_count": 270,
+                    "expected_points_per_session": 270,
+                    "minute_coverage_ratio": 1.0,
+                    "source_path": "/private/reference.parquet",
+                }
+            ],
             "history": [
                 {
                     "series_id": "benchmark_0050",
@@ -351,6 +369,20 @@ def test_tw_history_projection_and_range_query_are_bounded() -> None:
     assert public["end_date"] == "2026-08-14"
     assert public["available_start_date"] == "2026-08-13"
     assert public["available_end_date"] == "2026-08-17"
+    assert public["curve_granularity"] == "1m"
+    assert public["range_summary"] == [
+        {
+            "series_id": "benchmark_0050",
+            "series_type": "benchmark",
+            "baseline_equity_twd": 100.0,
+            "end_equity_twd": 101.25,
+            "range_net_pnl_twd": 1.25,
+            "return_pct": 1.25,
+            "point_count": 270,
+            "expected_points_per_session": 270,
+            "minute_coverage_ratio": 1.0,
+        }
+    ]
     assert public["history"] == [
         {
             "series_id": "benchmark_0050",
@@ -602,8 +634,10 @@ def test_public_pages_share_visual_tokens() -> None:
     assert "timeAxis.buildTimeAxis" in tw_javascript
     assert "collapseEmptyIntervals: true" in tw_javascript
     assert "TW_STOCK_SESSIONS" in tw_javascript
-    assert 'id="equity-start-date" type="date"' in tw_html
-    assert 'id="equity-end-date" type="date"' in tw_html
+    assert 'id="detail-start-date" type="date"' in tw_html
+    assert 'id="detail-end-date" type="date"' in tw_html
+    assert 'id="equity-start-date"' not in tw_html
+    assert "rangeSummaryFor" in tw_javascript
     assert "舊約 bid 與新約 ask 必須同時存在" in tw_javascript
     assert ".benchmark-grid" in tw_styles
     assert ".compact-table{table-layout:fixed;white-space:normal}" in tw_styles

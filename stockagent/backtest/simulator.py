@@ -97,6 +97,9 @@ except Exception:  # pragma: no cover - Numba is an acceleration dependency
 INT64_MIN_FLOAT_SAFE = np.nextafter(float(np.iinfo(np.int64).min), 0.0)
 INT64_MAX_FLOAT_SAFE = np.nextafter(float(np.iinfo(np.int64).max + 1), 0.0)
 SCAN_CHUNK_CANDIDATES = (64, 128, 256, 512)
+# v20 adds the optional crypto carrying-account proximal allocation contract:
+# the previous executed portfolio and the actual asymmetric one-way fees derive
+# the recurrent no-trade region before exchange permissions/capacity execute.
 # v17 applies the same T+2-close net-claim ledger to the daily open-to-close
 # day-trade executor.  Daily sizing now uses deployable cash rather than
 # economic NAV, so T claims affect NAV immediately but first fund T+3 orders.
@@ -113,7 +116,7 @@ SCAN_CHUNK_CANDIDATES = (64, 128, 256, 512)
 # v11 added the former direction-balancing behavior.  v10 separated gross
 # commission collection from the economically earned
 # broker rebate and added recurrent pending-rebate state.
-CANONICAL_BACKTEST_CONTRACT_VERSION = 19
+CANONICAL_BACKTEST_CONTRACT_VERSION = 20
 
 _SCAN_CHUNK_CACHE: dict[tuple, int] = {}
 _SCAN_COMPILED_CACHE: dict[
@@ -2851,6 +2854,8 @@ def run_backtest(
     sell_fee_rate: float,
     long_only: bool = True,
     max_turnover_ratio: float = 0.0,
+    crypto_stateful_proximal_allocator: bool = False,
+    crypto_proximal_cost_multiplier: float = 1.0,
     gross_leverage: float = 1.0,
     min_trade_weight: float = 0.0,
     portfolio_activation: str = DEFAULT_PORTFOLIO_ACTIVATION,
@@ -2911,6 +2916,10 @@ def run_backtest(
             sell_fee_rate,
             long_only=long_only,
             max_turnover_ratio=max_turnover_ratio,
+            crypto_stateful_proximal_allocator=(
+                crypto_stateful_proximal_allocator
+            ),
+            crypto_proximal_cost_multiplier=crypto_proximal_cost_multiplier,
             gross_leverage=gross_leverage,
             min_trade_weight=min_trade_weight,
             portfolio_activation=portfolio_activation,
@@ -2999,6 +3008,8 @@ def run_backtest_torch(
     sell_fee_rate: float,
     long_only: bool = True,
     max_turnover_ratio: float = 0.0,
+    crypto_stateful_proximal_allocator: bool = False,
+    crypto_proximal_cost_multiplier: float = 1.0,
     gross_leverage: float = 1.0,
     min_trade_weight: float = 0.0,
     portfolio_activation: str = DEFAULT_PORTFOLIO_ACTIVATION,
@@ -3097,6 +3108,10 @@ def run_backtest_torch(
             long_only=long_only,
             maximum_gross=_resolve_exposure_budget(gross_leverage),
             max_turnover_ratio=float(max_turnover_ratio),
+            stateful_proximal_allocator=bool(
+                crypto_stateful_proximal_allocator
+            ),
+            proximal_cost_multiplier=float(crypto_proximal_cost_multiplier),
             volume_limit_weights=volume_limit_weights,
             state_advance_mask=state_advance_mask,
             initial_weights=initial_weights,

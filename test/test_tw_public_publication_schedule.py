@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import hashlib
 import json
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -138,6 +139,68 @@ def test_0830_command_refreshes_the_live_preopen_source_not_legacy_snapshot(
         tmp_path / "tw.yaml", force=True
     )
     assert "--auto-window-minutes" in forced
+
+
+def test_0830_builds_canonical_derived_layers_from_accepted_source_date(
+    tmp_path: Path,
+) -> None:
+    commands = run_tw_public_0830_check._derived_data_commands(
+        live_root=tmp_path,
+        expected_latest="2026-08-21",
+        workers=4,
+    )
+
+    assert [Path(command[1]).name for command in commands] == [
+        "download_tw_corporate_action_reference.py",
+        "build_tw_official_symbol_parquets.py",
+        "download_tw_corporate_action_entitlements.py",
+        "build_tw_public_training_features.py",
+    ]
+    assert all(command[command.index("--end-date") + 1] == "2026-08-21" for command in commands)
+    assert commands[1][commands[1].index("--output-dir") + 1] == str(
+        tmp_path / "stocks"
+    )
+    assert commands[3][commands[3].index("--output-path") + 1] == str(
+        tmp_path / "features" / "tw_public_stock_daily.parquet"
+    )
+    assert "--allow-daily-publication-lag" in commands[1]
+    assert "--allow-daily-publication-lag" in commands[3]
+
+
+def test_0830_detects_same_date_source_content_revision(tmp_path: Path) -> None:
+    source = tmp_path / "tdcc_shareholding_distribution.parquet"
+    source.write_bytes(b"old")
+    summary = tmp_path / "tw_public_stock_daily.summary.json"
+    summary.write_text(
+        json.dumps(
+            {
+                "source_receipts": [
+                    {
+                        "name": source.name,
+                        "size": source.stat().st_size,
+                        "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert (
+        run_tw_public_0830_check._receipt_dependency_errors(
+            summary,
+            live_root=tmp_path,
+            keys=("source_receipts",),
+        )
+        == []
+    )
+
+    source.write_bytes(b"new")
+    errors = run_tw_public_0830_check._receipt_dependency_errors(
+        summary,
+        live_root=tmp_path,
+        keys=("source_receipts",),
+    )
+    assert errors == ["source_receipts: sha256 mismatch tdcc_shareholding_distribution.parquet"]
 
 
 def test_preopen_full_sweep_requires_zero_lag_before_live_metadata_promotion() -> None:

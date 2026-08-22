@@ -16,6 +16,7 @@ import polars as pl
 import pyarrow.parquet as pq
 
 from common import PersistentProgress, atomic_write_text
+from ohlcv_hot_tail import logical_mtime_ns, read_logical_parquet
 
 
 CONTRACT_VERSION = 6
@@ -146,7 +147,7 @@ def _daily_bars(source_path: Path) -> tuple[pl.DataFrame, int, int]:
         )
         if name in schema.names
     ]
-    raw = pl.from_arrow(pq.read_table(source_path, columns=columns, memory_map=True))
+    raw = read_logical_parquet(source_path, columns=columns)
     timestamp = _parse_utc("date", raw.schema)
     normalized = (
         raw.with_columns(timestamp.alias("__ts"))
@@ -572,7 +573,7 @@ def main() -> None:
             not args.refresh
             and target.is_file()
             and target.stat().st_mtime_ns
-            >= max(source.stat().st_mtime_ns, funding_path.stat().st_mtime_ns)
+            >= max(logical_mtime_ns(source), funding_path.stat().st_mtime_ns)
             and "bybit_perpetual_contract_version" in pq.read_schema(target).names
             and "execution_volume_equivalent" in pq.read_schema(target).names
             and int(

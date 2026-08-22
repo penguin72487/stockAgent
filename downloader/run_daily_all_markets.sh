@@ -56,7 +56,10 @@ CRYPTO_HISTORICAL_FEATURES="${CRYPTO_HISTORICAL_FEATURES:-1}"
 OKX_WORKERS="${OKX_WORKERS:-16}"
 OKX_REQUEST_INTERVAL="${OKX_REQUEST_INTERVAL:-}"
 OKX_MAX_RETRIES="${OKX_MAX_RETRIES:-8}"
-BYBIT_WORKERS="${BYBIT_WORKERS:-16}"
+# Bybit permits 600 public HTTP requests per five seconds.  Use enough
+# in-flight requests to finish before the slower official OKX 10 req/s bucket,
+# without retaining workers that cannot shorten the end-to-end CEX cycle.
+BYBIT_WORKERS="${BYBIT_WORKERS:-24}"
 BYBIT_REQUEST_INTERVAL="${BYBIT_REQUEST_INTERVAL:-}"
 BYBIT_MAX_RETRIES="${BYBIT_MAX_RETRIES:-8}"
 BYBIT_CATEGORIES="${BYBIT_CATEGORIES:-linear inverse}"
@@ -66,6 +69,11 @@ BINANCE_REQUEST_WEIGHT_PER_MINUTE="${BINANCE_REQUEST_WEIGHT_PER_MINUTE:-}"
 BINANCE_MAX_RETRIES="${BINANCE_MAX_RETRIES:-8}"
 BINANCE_FEATURE_WORKERS="${BINANCE_FEATURE_WORKERS:-$BINANCE_WORKERS}"
 CRYPTO_DAILY_MATERIALIZE_WORKERS="${CRYPTO_DAILY_MATERIALIZE_WORKERS:-8}"
+RUN_CRYPTO_DAILY_MATERIALIZE="${RUN_CRYPTO_DAILY_MATERIALIZE:-1}"
+# Each provider already has Python network concurrency.  Bound native
+# columnar pools per process so three parallel CEX jobs do not each create a
+# machine-sized CPU pool and lower aggregate throughput through contention.
+CRYPTO_COLUMNAR_THREADS="${CRYPTO_COLUMNAR_THREADS:-2}"
 RUN_FREE_PUBLIC_CONTEXT="${RUN_FREE_PUBLIC_CONTEXT:-1}"
 FREE_PUBLIC_CONTEXT_OUTPUT_DIR="${FREE_PUBLIC_CONTEXT_OUTPUT_DIR:-data_free_public}"
 RUN_COINMETRICS_COMMUNITY="${RUN_COINMETRICS_COMMUNITY:-1}"
@@ -82,6 +90,9 @@ CRYPTO_ETF_OUTPUT_DIR="${CRYPTO_ETF_OUTPUT_DIR:-data_crypto_etf}"
 CRYPTO_ETF_SEC_WORKERS="${CRYPTO_ETF_SEC_WORKERS:-10}"
 CRYPTO_ETF_ISSUER_WORKERS="${CRYPTO_ETF_ISSUER_WORKERS:-4}"
 CRYPTO_ETF_PRIMARY_DOCUMENTS="${CRYPTO_ETF_PRIMARY_DOCUMENTS:-1}"
+RUN_FRED_CRYPTO_MACRO="${RUN_FRED_CRYPTO_MACRO:-0}"
+FRED_CRYPTO_MACRO_OUTPUT_DIR="${FRED_CRYPTO_MACRO_OUTPUT_DIR:-data_fred_crypto_macro}"
+FRED_CRYPTO_MACRO_START_DATE="${FRED_CRYPTO_MACRO_START_DATE:-2000-01-01}"
 CRYPTO_ACTIVE_INTRADAY_GRAIN="${CRYPTO_ACTIVE_INTRADAY_GRAIN:-1m}"
 RUN_CRYPTO_TRADE_TICKS="${RUN_CRYPTO_TRADE_TICKS:-0}"
 RUN_CRYPTO_ORDER_BOOK="${RUN_CRYPTO_ORDER_BOOK:-0}"
@@ -520,6 +531,10 @@ run_okx_perp_incremental() {
     return 0
   fi
   cmd=(
+    env
+    POLARS_MAX_THREADS="$CRYPTO_COLUMNAR_THREADS"
+    OMP_NUM_THREADS="$CRYPTO_COLUMNAR_THREADS"
+    OMP_THREAD_LIMIT="$CRYPTO_COLUMNAR_THREADS"
     "$PYTHON_BIN" downloader/download_okx_perp_1m.py
     --mode incremental
     --end-date "$today"
@@ -536,10 +551,17 @@ run_okx_perp_incremental() {
     cmd+=(--skip-historical-features)
   fi
   run_step okx_perp_1m_update "${cmd[@]}" || return $?
-  run_step okx_perp_daily_materialize \
-    "$PYTHON_BIN" downloader/materialize_ohlcv_daily.py \
-    --input-dir data_okx/1m --output-dir data_okx/daily \
-    --provider OKX --workers "$CRYPTO_DAILY_MATERIALIZE_WORKERS"
+  if [[ "$RUN_CRYPTO_DAILY_MATERIALIZE" == "1" ]]; then
+    run_step okx_perp_daily_materialize \
+      env POLARS_MAX_THREADS="$CRYPTO_COLUMNAR_THREADS" \
+      OMP_NUM_THREADS="$CRYPTO_COLUMNAR_THREADS" \
+      OMP_THREAD_LIMIT="$CRYPTO_COLUMNAR_THREADS" \
+      "$PYTHON_BIN" downloader/materialize_ohlcv_daily.py \
+      --input-dir data_okx/1m --output-dir data_okx/daily \
+      --provider OKX --workers "$CRYPTO_DAILY_MATERIALIZE_WORKERS"
+  else
+    log "skip=okx_perp_daily_materialize reason=RUN_CRYPTO_DAILY_MATERIALIZE=${RUN_CRYPTO_DAILY_MATERIALIZE}"
+  fi
 }
 
 run_bybit_perp_incremental() {
@@ -554,6 +576,10 @@ run_bybit_perp_incremental() {
   fi
   read -r -a categories <<< "$BYBIT_CATEGORIES"
   cmd=(
+    env
+    POLARS_MAX_THREADS="$CRYPTO_COLUMNAR_THREADS"
+    OMP_NUM_THREADS="$CRYPTO_COLUMNAR_THREADS"
+    OMP_THREAD_LIMIT="$CRYPTO_COLUMNAR_THREADS"
     "$PYTHON_BIN" downloader/download_bybit_perp_1m.py
     --mode incremental
     --end-date "$today"
@@ -568,10 +594,17 @@ run_bybit_perp_incremental() {
     cmd+=(--tail-only)
   fi
   run_step bybit_perp_1m_update "${cmd[@]}" || return $?
-  run_step bybit_perp_daily_materialize \
-    "$PYTHON_BIN" downloader/materialize_ohlcv_daily.py \
-    --input-dir data_bybit/1m --output-dir data_bybit/daily \
-    --provider Bybit --workers "$CRYPTO_DAILY_MATERIALIZE_WORKERS"
+  if [[ "$RUN_CRYPTO_DAILY_MATERIALIZE" == "1" ]]; then
+    run_step bybit_perp_daily_materialize \
+      env POLARS_MAX_THREADS="$CRYPTO_COLUMNAR_THREADS" \
+      OMP_NUM_THREADS="$CRYPTO_COLUMNAR_THREADS" \
+      OMP_THREAD_LIMIT="$CRYPTO_COLUMNAR_THREADS" \
+      "$PYTHON_BIN" downloader/materialize_ohlcv_daily.py \
+      --input-dir data_bybit/1m --output-dir data_bybit/daily \
+      --provider Bybit --workers "$CRYPTO_DAILY_MATERIALIZE_WORKERS"
+  else
+    log "skip=bybit_perp_daily_materialize reason=RUN_CRYPTO_DAILY_MATERIALIZE=${RUN_CRYPTO_DAILY_MATERIALIZE}"
+  fi
 }
 
 run_binance_perp_incremental() {
@@ -584,6 +617,10 @@ run_binance_perp_incremental() {
     return 0
   fi
   cmd=(
+    env
+    POLARS_MAX_THREADS="$CRYPTO_COLUMNAR_THREADS"
+    OMP_NUM_THREADS="$CRYPTO_COLUMNAR_THREADS"
+    OMP_THREAD_LIMIT="$CRYPTO_COLUMNAR_THREADS"
     "$PYTHON_BIN" downloader/download_binance_perp_1m.py
     --mode incremental
     --end-date "$today"
@@ -601,10 +638,17 @@ run_binance_perp_incremental() {
     cmd+=(--skip-historical-features)
   fi
   run_step binance_perp_1m_update "${cmd[@]}" || return $?
-  run_step binance_perp_daily_materialize \
-    "$PYTHON_BIN" downloader/materialize_ohlcv_daily.py \
-    --input-dir data_binance/1m --output-dir data_binance/daily \
-    --provider Binance --workers "$CRYPTO_DAILY_MATERIALIZE_WORKERS"
+  if [[ "$RUN_CRYPTO_DAILY_MATERIALIZE" == "1" ]]; then
+    run_step binance_perp_daily_materialize \
+      env POLARS_MAX_THREADS="$CRYPTO_COLUMNAR_THREADS" \
+      OMP_NUM_THREADS="$CRYPTO_COLUMNAR_THREADS" \
+      OMP_THREAD_LIMIT="$CRYPTO_COLUMNAR_THREADS" \
+      "$PYTHON_BIN" downloader/materialize_ohlcv_daily.py \
+      --input-dir data_binance/1m --output-dir data_binance/daily \
+      --provider Binance --workers "$CRYPTO_DAILY_MATERIALIZE_WORKERS"
+  else
+    log "skip=binance_perp_daily_materialize reason=RUN_CRYPTO_DAILY_MATERIALIZE=${RUN_CRYPTO_DAILY_MATERIALIZE}"
+  fi
 }
 
 run_free_public_context_incremental() {
@@ -672,6 +716,18 @@ run_crypto_etf_history_incremental() {
     cmd+=(--no-primary-documents)
   fi
   run_step crypto_etf_history_update "${cmd[@]}"
+}
+
+run_fred_crypto_macro_daily() {
+  if [[ "$RUN_FRED_CRYPTO_MACRO" == "1" ]]; then
+    run_step fred_crypto_macro_update \
+      "$PYTHON_BIN" downloader/download_fred_crypto_macro_vintages.py \
+      --output-dir "$FRED_CRYPTO_MACRO_OUTPUT_DIR" \
+      --start-date "$FRED_CRYPTO_MACRO_START_DATE" \
+      --end-date today
+    return
+  fi
+  log "skip=fred_crypto_macro_update reason=RUN_FRED_CRYPTO_MACRO=${RUN_FRED_CRYPTO_MACRO}"
 }
 
 run_tw_public_data_update() {
@@ -835,6 +891,7 @@ run_market_close_cycle() {
       crypto_reference run_crypto_reference_incremental \
       dune_crypto_history run_dune_crypto_history_incremental \
       crypto_etf_history run_crypto_etf_history_incremental \
+      fred_crypto_macro run_fred_crypto_macro_daily \
       free_public_context run_free_public_context_incremental \
       coinmetrics_community run_coinmetrics_community_incremental
     did_run=1
@@ -885,6 +942,7 @@ run_once_cycle() {
     crypto_reference run_crypto_reference_incremental \
     dune_crypto_history run_dune_crypto_history_incremental \
     crypto_etf_history run_crypto_etf_history_incremental \
+    fred_crypto_macro run_fred_crypto_macro_daily \
     free_public_context run_free_public_context_incremental \
     coinmetrics_community run_coinmetrics_community_incremental
 
@@ -980,6 +1038,14 @@ validate_settings() {
   fi
   if [[ "$RUN_CRYPTO_ETF_HISTORY" != "0" && "$RUN_CRYPTO_ETF_HISTORY" != "1" ]]; then
     echo "[daily] RUN_CRYPTO_ETF_HISTORY must be 0 or 1" >&2
+    exit 2
+  fi
+  if [[ "$RUN_FRED_CRYPTO_MACRO" != "0" && "$RUN_FRED_CRYPTO_MACRO" != "1" ]]; then
+    echo "[daily] RUN_FRED_CRYPTO_MACRO must be 0 or 1" >&2
+    exit 2
+  fi
+  if [[ "$RUN_CRYPTO_DAILY_MATERIALIZE" != "0" && "$RUN_CRYPTO_DAILY_MATERIALIZE" != "1" ]]; then
+    echo "[daily] RUN_CRYPTO_DAILY_MATERIALIZE must be 0 or 1" >&2
     exit 2
   fi
   if [[ "$CRYPTO_ETF_PRIMARY_DOCUMENTS" != "0" && "$CRYPTO_ETF_PRIMARY_DOCUMENTS" != "1" ]]; then

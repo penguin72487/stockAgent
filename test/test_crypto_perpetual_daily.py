@@ -194,6 +194,48 @@ def test_sign_flip_charges_the_full_close_plus_open_turnover() -> None:
     assert result.strategy_simple_returns.item() == pytest.approx(-0.00055)
 
 
+def test_crypto_proximal_allocator_derives_no_trade_region_from_exact_fee() -> None:
+    previous = torch.tensor([0.5, -0.5])
+    target = torch.tensor([[0.5004, -0.4996]], requires_grad=True)
+    result = _ledger(
+        target,
+        torch.zeros((1, 2)),
+        torch.zeros((1, 2)),
+        initial_weights=previous,
+        stateful_proximal_allocator=True,
+        proximal_cost_multiplier=1.0,
+    )
+
+    torch.testing.assert_close(result.executed_weights[0], previous)
+    assert result.turnovers.item() == pytest.approx(0.0)
+    assert result.strategy_simple_returns.item() == pytest.approx(0.0)
+    loss = result.executed_weights.square().sum()
+    loss.backward()
+    assert target.grad is not None
+    torch.testing.assert_close(target.grad, torch.zeros_like(target.grad))
+
+
+def test_crypto_proximal_allocator_keeps_model_freedom_outside_fee_band() -> None:
+    previous = torch.tensor([0.5, -0.5])
+    target = torch.tensor([[0.6, -0.4]], requires_grad=True)
+    result = _ledger(
+        target,
+        torch.zeros((1, 2)),
+        torch.zeros((1, 2)),
+        initial_weights=previous,
+        stateful_proximal_allocator=True,
+        proximal_cost_multiplier=1.0,
+    )
+
+    expected = torch.tensor([0.59945, -0.40055])
+    torch.testing.assert_close(result.executed_weights[0], expected)
+    assert result.turnovers.item() == pytest.approx(0.1989)
+    (-result.strategy_simple_returns.sum()).backward()
+    assert target.grad is not None
+    assert torch.isfinite(target.grad).all()
+    assert float(target.grad.abs().sum()) > 0.0
+
+
 def test_chunk_boundary_carries_marked_position_and_alive_state_exactly() -> None:
     target = torch.tensor(
         [[0.4, -0.2], [0.3, -0.3], [0.1, 0.2], [-0.2, 0.4], [0.0, 0.3], [0.2, -0.1]]
@@ -327,6 +369,53 @@ def test_log_utility_loss_uses_the_crypto_funding_and_price_paths() -> None:
     assert torch.isfinite(loss)
     assert weights.grad is not None
     assert torch.isfinite(weights.grad).all()
+
+
+def test_crypto_training_log_utility_uses_configured_365_day_scale() -> None:
+    weights = torch.tensor([[0.5]], requires_grad=True)
+    effective = torch.log1p(torch.tensor([[0.01]]))
+    mask = torch.ones_like(weights, dtype=torch.bool)
+    loss_365 = risk_aware_loss(
+        weights,
+        effective,
+        mask,
+        benchmark_returns=torch.zeros(1),
+        can_buy_mask=mask,
+        can_sell_mask=mask,
+        can_short_open_mask=mask,
+        long_only=False,
+        buy_fee_rate=0.0,
+        sell_fee_rate=0.0,
+        gross_leverage=1.0,
+        portfolio_activation="pre_normalized",
+        execution_mode="crypto_perpetual",
+        objective="log_utility",
+        overnight_log_returns=effective,
+        log_utility_periods_per_year=365.0,
+        gamma_turnover=0.0,
+        concentration_weight=0.0,
+    )
+    loss_252 = risk_aware_loss(
+        weights,
+        effective,
+        mask,
+        benchmark_returns=torch.zeros(1),
+        can_buy_mask=mask,
+        can_sell_mask=mask,
+        can_short_open_mask=mask,
+        long_only=False,
+        buy_fee_rate=0.0,
+        sell_fee_rate=0.0,
+        gross_leverage=1.0,
+        portfolio_activation="pre_normalized",
+        execution_mode="crypto_perpetual",
+        objective="log_utility",
+        overnight_log_returns=effective,
+        log_utility_periods_per_year=252.0,
+        gamma_turnover=0.0,
+        concentration_weight=0.0,
+    )
+    assert loss_365.item() == pytest.approx(loss_252.item() * 365.0 / 252.0)
 
 
 def test_funding_materialization_matches_event_level_cash_identity(
@@ -959,7 +1048,12 @@ def test_bybit_strategy_config_keeps_multi_basis_fee_and_external_contract() -> 
     assert config.trading.execution_mode == "crypto_perpetual"
     assert config.trading.buy_fee_rate == pytest.approx(0.00055)
     assert config.trading.sell_fee_rate == pytest.approx(0.00055)
+    assert config.trading.crypto_stateful_proximal_allocator is True
+    assert config.trading.crypto_proximal_cost_multiplier == pytest.approx(1.0)
+    assert config.trading.max_turnover_ratio == pytest.approx(0.0)
     assert config.evaluation.eval_log_utility_periods_per_year == 365.0
+    assert config.evaluation.gamma_turnover == pytest.approx(0.0)
+    assert config.evaluation.gamma_turnover_budget == pytest.approx(0.0)
     assert config.training.model_name == "financial_transformer"
     assert config.training.lookback == 32
     assert action_channels_for_execution_mode("crypto_perpetual") == ("target",)

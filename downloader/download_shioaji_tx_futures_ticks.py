@@ -28,7 +28,6 @@ except ModuleNotFoundError:  # direct script execution
     from common import SharedRateLimiter, describe_rate_limit, resolve_request_interval
 from stockagent.live.shioaji_traffic_ledger import shioaji_query
 from stockagent.live.shioaji_schedule import (
-    FUTURES_HISTORY_TRAFFIC_RESERVE_MB,
     HISTORICAL_MAX_TRAFFIC_FRACTION,
 )
 
@@ -79,11 +78,6 @@ def parse_args() -> argparse.Namespace:
         "--max-traffic-fraction",
         type=float,
         default=HISTORICAL_MAX_TRAFFIC_FRACTION,
-    )
-    parser.add_argument(
-        "--traffic-reserve-mb",
-        type=float,
-        default=FUTURES_HISTORY_TRAFFIC_RESERVE_MB,
     )
     parser.add_argument("--simulation", action="store_true")
     parser.add_argument("--allow-market-hours", action="store_true")
@@ -245,8 +239,6 @@ def main() -> int:
         raise ValueError("start date must not be after end date")
     if not 0.0 < args.max_traffic_fraction < 1.0:
         raise ValueError("max traffic fraction must be between zero and one")
-    if not 0.0 <= args.traffic_reserve_mb < float("inf"):
-        raise ValueError("traffic reserve must be finite and nonnegative")
     if args.timeout_ms < 1 or args.max_dates < 0:
         raise ValueError("timeout and max dates must be valid")
     if _taiwan_market_hours_now() and not args.allow_market_hours:
@@ -316,7 +308,6 @@ def main() -> int:
         contract = api.contracts.get(str(args.contract))
         if contract is None:
             raise LookupError(f"future contract not found: {args.contract}")
-        reserve_bytes = int(args.traffic_reserve_mb * 1024 * 1024)
         for index, trading_date in enumerate(pending, start=1):
             if _taiwan_market_hours_now() and not args.allow_market_hours:
                 stopped_for_market_hours = True
@@ -325,7 +316,6 @@ def main() -> int:
                 usage = _check_traffic_budget(
                     api,
                     max_fraction=float(args.max_traffic_fraction),
-                    reserve_bytes=reserve_bytes,
                 )
             except TrafficBudgetReached:
                 stopped_for_traffic = True
@@ -357,7 +347,6 @@ def main() -> int:
                     _check_traffic_budget(
                         api,
                         max_fraction=float(args.max_traffic_fraction),
-                        reserve_bytes=reserve_bytes,
                     )
                 except TrafficBudgetReached:
                     stopped_for_traffic = True

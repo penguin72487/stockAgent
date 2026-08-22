@@ -28,7 +28,6 @@ MINUTE_UNIT: Final[str] = "stockagent-shioaji-minute-backfill.service"
 TOP200_UNIT: Final[str] = "stockagent-shioaji-top200.service"
 SNAPSHOT_UNIT: Final[str] = "stockagent-tw-day-trade-simulation.service"
 TRAFFIC_FRACTION_GUARD: Final[float] = 0.90
-TRAFFIC_RESERVE_BYTES: Final[int] = 128 * 1024 * 1024
 MAX_TRAFFIC_SAMPLES: Final[int] = 240
 _TRAFFIC_PATTERN = re.compile(r"traffic=([\d,]+)/([\d,]+)")
 _CONTRACT_PATTERN = re.compile(r"\bcontract=([A-Z0-9]+)")
@@ -2047,11 +2046,7 @@ def build_shioaji_public_status(
     latest_traffic = traffic_history[-1] if traffic_history else {}
     used = int(latest_traffic.get("used_bytes") or 0)
     limit = int(latest_traffic.get("limit_bytes") or 0)
-    guard_limit = (
-        min(int(limit * TRAFFIC_FRACTION_GUARD), limit - TRAFFIC_RESERVE_BYTES)
-        if limit > 0
-        else 0
-    )
+    guard_limit = int(limit * TRAFFIC_FRACTION_GUARD) if limit > 0 else 0
     latest_reset = (ledger_payload or {}).get("latest_reset")
     reset_observed_at = (
         latest_reset.get("observed_at_utc")
@@ -2072,7 +2067,6 @@ def build_shioaji_public_status(
         "remaining_bytes": max(0, limit - used) if limit > 0 else None,
         "used_ratio": used / limit if limit > 0 else None,
         "guard_fraction": TRAFFIC_FRACTION_GUARD,
-        "guard_reserve_bytes": TRAFFIC_RESERVE_BYTES,
         "guard_limit_bytes": guard_limit if limit > 0 else None,
         "safe_remaining_bytes": max(0, guard_limit - used) if limit > 0 else None,
         "reset_policy": reset_policy,

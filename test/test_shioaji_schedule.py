@@ -1,13 +1,18 @@
 from datetime import date, datetime
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
+import pytest
+
 from downloader import download_shioaji_tx_futures_ticks
+from downloader.download_shioaji_tw_kbars import (
+    TrafficBudgetReached,
+    _check_traffic_budget,
+)
 from stockagent.live.shioaji_schedule import (
-    FUTURES_HISTORY_TRAFFIC_RESERVE_MB,
     HISTORICAL_MAX_TRAFFIC_FRACTION,
-    STOCK_HISTORY_TRAFFIC_RESERVE_MB,
     historical_query_is_protected,
     historical_query_pause_seconds,
 )
@@ -48,22 +53,32 @@ def test_history_downloaders_default_to_the_ninety_percent_safety_limit(
     monkeypatch,
 ) -> None:
     assert HISTORICAL_MAX_TRAFFIC_FRACTION == 0.90
-    for module, expected_reserve_mb in (
-        (download_shioaji_tw_kbars, STOCK_HISTORY_TRAFFIC_RESERVE_MB),
-        (download_shioaji_tw_minute_kbars, STOCK_HISTORY_TRAFFIC_RESERVE_MB),
-        (download_shioaji_tx_futures_ticks, FUTURES_HISTORY_TRAFFIC_RESERVE_MB),
+    for module in (
+        download_shioaji_tw_kbars,
+        download_shioaji_tw_minute_kbars,
+        download_shioaji_tx_futures_ticks,
     ):
         monkeypatch.setattr(sys, "argv", [module.__name__])
         args = module.parse_args()
         assert args.max_traffic_fraction == 0.90
-        assert args.traffic_reserve_mb == expected_reserve_mb
 
     limit_bytes = 2 * 1024**3
-    futures_ceiling = min(
-        int(limit_bytes * HISTORICAL_MAX_TRAFFIC_FRACTION),
-        limit_bytes - int(FUTURES_HISTORY_TRAFFIC_RESERVE_MB * 1024**2),
-    )
+    futures_ceiling = int(limit_bytes * HISTORICAL_MAX_TRAFFIC_FRACTION)
     assert futures_ceiling == int(limit_bytes * 0.90)
+
+
+def test_history_budget_has_only_the_ninety_percent_ceiling() -> None:
+    class UsageApi:
+        used = 89
+
+        def usage(self) -> SimpleNamespace:
+            return SimpleNamespace(bytes=self.used, limit_bytes=100)
+
+    api = UsageApi()
+    assert _check_traffic_budget(api, max_fraction=0.90) == (89, 100)
+    api.used = 90
+    with pytest.raises(TrafficBudgetReached, match="ceiling=90"):
+        _check_traffic_budget(api, max_fraction=0.90)
 
 
 def test_service_runners_do_not_override_the_shared_ninety_percent_policy() -> None:
@@ -71,9 +86,7 @@ def test_service_runners_do_not_override_the_shared_ninety_percent_policy() -> N
     futures_runner = (root / "scripts/run_shioaji_tx_history_backfill.sh").read_text()
     minute_runner = (root / "scripts/run_shioaji_minute_full_backfill.sh").read_text()
     assert "SHIOAJI_FUTURES_HISTORY_MAX_TRAFFIC_FRACTION:-0.90" in futures_runner
-    assert "SHIOAJI_FUTURES_HISTORY_TRAFFIC_RESERVE_MB:-128" in futures_runner
     assert "SHIOAJI_MINUTE_MAX_TRAFFIC_FRACTION:-0.90" in minute_runner
-    assert "SHIOAJI_MINUTE_TRAFFIC_RESERVE_MB:-25" in minute_runner
 
 
 def test_completed_futures_contract_does_not_login_again(monkeypatch, tmp_path) -> None:
