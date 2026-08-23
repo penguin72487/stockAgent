@@ -1,7 +1,7 @@
 [Unit]
 Description=StockAgent Discord bot and private scheduled simulation artifacts
-Wants=network-online.target time-sync.target
-After=network-online.target time-sync.target
+Wants=network-online.target time-sync.target stockagent-tw-day-trade-simulation.service
+After=network-online.target time-sync.target stockagent-tw-day-trade-simulation.service
 StartLimitIntervalSec=300
 StartLimitBurst=5
 

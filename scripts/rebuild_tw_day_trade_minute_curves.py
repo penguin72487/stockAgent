@@ -33,6 +33,7 @@ from stockagent.live.tw_day_trade_simulation import (
     TAIPEI,
     position_net_liquidation_pnl,
 )
+from stockagent.live.shioaji_schedule import HISTORICAL_MAX_TRAFFIC_FRACTION
 
 
 SESSION_OPEN = datetime_time(9, 0)
@@ -517,7 +518,6 @@ def fetch_missing_kbars(
     workers: int,
     requests_per_second: float,
     max_traffic_fraction: float,
-    traffic_reserve_mb: float,
 ) -> dict[str, Any]:
     """Delegate true local misses to the canonical receipt-backed collector."""
 
@@ -553,8 +553,6 @@ def fetch_missing_kbars(
         str(requests_per_second),
         "--max-traffic-fraction",
         str(max_traffic_fraction),
-        "--traffic-reserve-mb",
-        str(traffic_reserve_mb),
     ]
     if simulation:
         command.append("--simulation")
@@ -931,8 +929,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--simulation", action="store_true")
     parser.add_argument("--fetch-workers", type=int, default=1)
     parser.add_argument("--requests-per-second", type=float, default=5.0)
-    parser.add_argument("--max-traffic-fraction", type=float, default=0.75)
-    parser.add_argument("--traffic-reserve-mb", type=float, default=256.0)
+    parser.add_argument(
+        "--max-traffic-fraction",
+        type=float,
+        default=HISTORICAL_MAX_TRAFFIC_FRACTION,
+    )
     parser.add_argument("--publish", action="store_true")
     return parser.parse_args()
 
@@ -992,7 +993,6 @@ def main() -> None:
             workers=int(args.fetch_workers),
             requests_per_second=float(args.requests_per_second),
             max_traffic_fraction=float(args.max_traffic_fraction),
-            traffic_reserve_mb=float(args.traffic_reserve_mb),
         )
     coverage_after = store.coverage(required)
     missing = store.missing_pairs(required)

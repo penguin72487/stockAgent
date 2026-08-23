@@ -15,6 +15,3 @@ Nice=10
 CPUWeight=25
 IOWeight=25
 TimeoutStartSec=30min
-
-[Install]
-WantedBy=multi-user.target

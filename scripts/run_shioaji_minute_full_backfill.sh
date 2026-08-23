@@ -29,7 +29,14 @@ exec > >(tee -a "$LOG_FILE") 2>&1
 if [[ -n "${SHIOAJI_MINUTE_END_DATE:-}" ]]; then
   BACKFILL_END_DATE="$SHIOAJI_MINUTE_END_DATE"
 else
-  BACKFILL_END_DATE="$(TZ=Asia/Taipei date -d yesterday +%F)"
+  BACKFILL_END_DATE="$(run_fintech_python - <<'PY'
+from pathlib import Path
+
+from stockagent.live.shioaji_schedule import previous_tw_stock_session
+
+print(previous_tw_stock_session(parquet_root=Path("data_tw_public")).isoformat())
+PY
+)"
 fi
 printf '%s\n' "$BACKFILL_END_DATE" > "$TARGET_FILE"
 
@@ -119,14 +126,17 @@ while true; do
   fi
 
   echo "[shioaji-minute-runner] download_start=$(TZ=Asia/Taipei date --iso-8601=seconds)"
+  # The account-wide ceiling is five concurrent Shioaji sessions. Futures
+  # history owns one hard-priority session in this off-hours window, so four
+  # minute workers maximize usable concurrency without making the entire
+  # batch fail login with code 451 (Too Many Connections).
   set +e
   run_fintech_python -m downloader.download_shioaji_tw_minute_kbars \
     --simulation \
     --all-symbols \
-    --workers "${SHIOAJI_MINUTE_WORKERS:-5}" \
+    --workers "${SHIOAJI_MINUTE_WORKERS:-4}" \
     --requests-per-second "${SHIOAJI_MINUTE_REQUESTS_PER_SECOND:-10}" \
     --max-traffic-fraction "${SHIOAJI_MINUTE_MAX_TRAFFIC_FRACTION:-0.90}" \
-    --traffic-reserve-mb "${SHIOAJI_MINUTE_TRAFFIC_RESERVE_MB:-25}" \
     --start-date 2020-03-02 \
     --end-date "$BACKFILL_END_DATE"
   download_rc=$?
@@ -150,16 +160,31 @@ else:
         if run_path.is_file()
         else payload
     )
+    run_selected = int(run_payload.get("selected_symbols", 0))
+    run_reported = int(run_payload.get("reported_symbols", 0))
+    run_failed = int(run_payload.get("failed_symbols", 0))
+    run_partial = int(run_payload.get("partial_symbols", 0))
+    current_run_ready = (
+        bool(run_payload.get("resumable_collection_complete"))
+        and run_selected > 0
+        and run_reported == run_selected
+        and run_failed == 0
+        and run_partial == 0
+        and run_payload.get("end_date") == target_end
+        and not bool(run_payload.get("stopped_for_traffic"))
+        and not bool(run_payload.get("stopped_for_market_hours"))
+    )
     print(
-        "complete=" + str(bool(payload.get("selected_coverage_complete"))).lower()
+        "ready=" + str(current_run_ready).lower()
+        + " complete=" + str(bool(payload.get("selected_coverage_complete"))).lower()
         + " collected=" + str(bool(payload.get("resumable_collection_complete"))).lower()
-        + " selected=" + str(run_payload.get("selected_symbols", 0))
-        + " reported=" + str(run_payload.get("reported_symbols", 0))
+        + " selected=" + str(run_selected)
+        + " reported=" + str(run_reported)
         + " done=" + str(payload.get("complete_symbols", 0))
         + " gap_symbols=" + str(payload.get("complete_with_source_gap_symbols", 0))
         + " unavailable=" + str(payload.get("contract_unavailable_symbols", 0))
-        + " failed=" + str(run_payload.get("failed_symbols", 0))
-        + " partial=" + str(run_payload.get("partial_symbols", 0))
+        + " failed=" + str(run_failed)
+        + " partial=" + str(run_partial)
         + " end_date=" + str(payload.get("end_date"))
         + " target_match=" + str(payload.get("end_date") == target_end).lower()
         + " traffic_stop=" + str(bool(run_payload.get("stopped_for_traffic"))).lower()
@@ -172,8 +197,7 @@ PY
   echo "[shioaji-minute-runner] summary $summary_state"
 
   if (( download_rc == 0 )) \
-    && [[ "$summary_state" == *"collected=true"* ]] \
-    && [[ "$summary_state" == *"target_match=true"* ]]; then
+    && [[ "$summary_state" == "ready=true "* ]]; then
     echo "[shioaji-minute-runner] building audited available-source research dataset"
     run_fintech_python scripts/build_shioaji_tw_minute_dataset.py
     latest_date="$(

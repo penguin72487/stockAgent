@@ -11,6 +11,7 @@ import numpy as np
 import polars as pl
 import pytest
 
+import stockagent.live.tw_day_trade_dashboard as dashboard_module
 from stockagent.backtest.tw_execution import TaiwanFeeSchedule
 from stockagent.live.quote_provider import PriceSnapshot
 from stockagent.live.tw_day_trade_dashboard import (
@@ -22,11 +23,14 @@ from stockagent.live.tw_day_trade_dashboard import (
     build_dashboard_event_page,
     build_dashboard_history_snapshot,
     build_dashboard_position_page,
+    build_dashboard_revision,
     build_dashboard_signal_page,
     build_dashboard_snapshot,
     build_dashboard_summary,
 )
 from stockagent.live.tw_day_trade_simulation import (
+    ENTRY_FILL_POLICY_CAUSAL_BOOK,
+    ENTRY_FILL_POLICY_CAUSAL_BOOK_ELSE_OPEN_TICK,
     ENTRY_FILL_POLICY_SYNTHETIC_OPEN_TICK,
     LiveEligibility,
     ModeSpec,
@@ -35,6 +39,7 @@ from stockagent.live.tw_day_trade_simulation import (
     quote_map_from_snapshot,
     require_exact_session_eligibility,
 )
+from stockagent.live.tw_day_trade_service_sync import load_service_sync
 
 
 TAIPEI = ZoneInfo("Asia/Taipei")
@@ -93,6 +98,76 @@ def test_dashboard_session_progress_exposes_market_retry_and_closing_auction() -
     assert retry["next_milestone_label"] == "13:25 收盤集合競價"
     assert auction["phase"] == "closing_auction"
     assert auction["next_milestone_label"] == "13:30 撮合／帳務完成"
+
+
+def test_engine_publishes_one_compact_revision_after_related_state_files(
+    tmp_path: Path,
+) -> None:
+    spec = _spec(tmp_path)
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+
+    engine.update_readiness([spec], now=_now(8, 59))
+
+    receipt = load_service_sync(engine.state_dir)
+    assert receipt is not None
+    revision = receipt["state_revision"]
+    content_revision = receipt["content_revision"]
+    assert receipt["enabled_markets"] == [spec.market]
+    assert receipt["modes"][spec.market]["checkpoint_ready"] is True
+    for filename in ("state.json", "status.json", "positions.json"):
+        payload = json.loads((engine.state_dir / filename).read_text(encoding="utf-8"))
+        assert payload["state_revision"] == revision
+
+    engine.update_readiness([spec], now=_now(8, 59, 30))
+    heartbeat = load_service_sync(engine.state_dir)
+    assert heartbeat is not None
+    assert heartbeat["state_revision"] == revision + 1
+    assert heartbeat["content_revision"] == content_revision
+
+
+def test_dashboard_revision_proves_discord_ack_and_hides_disabled_mode(
+    tmp_path: Path,
+) -> None:
+    spec = _spec(tmp_path)
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+    engine.state.setdefault("modes", {})["retired_mode"] = {
+        "market": "retired_mode",
+        "label": "retired",
+        "initial_capital_twd": 1_000_000.0,
+        "total_equity_twd": 1_000_000.0,
+        "positions": {},
+    }
+    engine.update_readiness([spec], now=_now(8, 59))
+    receipt = load_service_sync(engine.state_dir)
+    assert receipt is not None
+    bot_status = tmp_path / "service_status.json"
+    bot_status.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "updated_at": _now(8, 59).isoformat(),
+                "discord_connected": True,
+                "engine_state_revision": receipt["state_revision"],
+                "day_trade_markets": [spec.market],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    sync = build_dashboard_revision(
+        state_dir=engine.state_dir,
+        discord_service_status_path=bot_status,
+        now=_now(8, 59).astimezone(ZoneInfo("UTC")),
+    )
+    snapshot = build_dashboard_snapshot(
+        state_dir=engine.state_dir,
+        now=_now(8, 59).astimezone(ZoneInfo("UTC")),
+    )
+
+    assert sync["synchronized"] is True
+    assert sync["status"] == "synchronized"
+    assert sync["revision_lag"] == 0
+    assert [row["market"] for row in snapshot["modes"]] == [spec.market]
 
 
 def test_dashboard_reports_measured_input_to_ledger_latency(tmp_path: Path) -> None:
@@ -288,7 +363,7 @@ def _row(weight: float = 0.1) -> dict[str, object]:
     }
 
 
-def test_runner_keeps_retired_modes_available_only_for_historical_rebuild() -> None:
+def test_runner_loads_all_three_configured_day_trade_modes() -> None:
     from scripts.run_tw_day_trade_simulation import _mode_specs
 
     repo_root = Path(__file__).resolve().parents[1]
@@ -297,29 +372,33 @@ def test_runner_keeps_retired_modes_available_only_for_historical_rebuild() -> N
     )
     by_market = {spec.market: spec for spec in specs}
     active_expected = {
-        "tw_day_trade_multi_basis",
         "tw_day_trade_100m",
+        "tw_day_trade_multi_basis",
         "tw_day_trade_multi_basis_projection_l1_gelu",
     }
-    historical_expected = set(active_expected)
 
     assert errors == {}
     assert set(by_market) == active_expected
     assert set(live_configs) == active_expected
+    assert by_market["tw_day_trade_100m"].initial_capital_twd == 100_000_000.0
+    assert by_market["tw_day_trade_multi_basis"].initial_capital_twd == 10_000_000.0
+    assert (
+        by_market["tw_day_trade_multi_basis_projection_l1_gelu"].initial_capital_twd
+        == 10_000_000.0
+    )
     specs, live_configs, errors = _mode_specs(
         repo_root / "services/discord_bot/markets",
         include_disabled=True,
     )
     assert errors == {}
-    assert {spec.market for spec in specs} == historical_expected
-    assert set(live_configs) == historical_expected
+    assert {spec.market for spec in specs} == active_expected
+    assert set(live_configs) == active_expected
     assert all(spec.signal_market is None for spec in specs)
     assert all(spec.price_limit_offset_ticks == 1 for spec in specs)
     assert all(
-        spec.entry_fill_policy == ENTRY_FILL_POLICY_SYNTHETIC_OPEN_TICK
-        for spec in specs
+        spec.entry_fill_policy == ENTRY_FILL_POLICY_CAUSAL_BOOK for spec in specs
     )
-    assert all(spec.entry_price_offset_ticks == 1 for spec in specs)
+    assert all(spec.entry_price_offset_ticks == 0 for spec in specs)
 
 
 def test_runner_blocks_weekend_before_quote_or_eligibility_work(tmp_path: Path) -> None:
@@ -634,14 +713,27 @@ def test_late_entry_waits_for_adjacent_completed_minute_after_restart(
     assert next(iter(mode["positions"].values()))["filled_shares"] == 1_000
 
 
-def test_market_entry_uses_best_ask_and_records_board_lot(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("weight", "expected_entry", "expected_take_profit", "expected_stop"),
+    (
+        (0.1, 1_000.0, 1_100.0, 900.0),
+        (-0.1, 998.0, 900.0, 1_100.0),
+    ),
+)
+def test_market_entry_uses_causal_best_quote_and_records_board_lot(
+    tmp_path: Path,
+    weight: float,
+    expected_entry: float,
+    expected_take_profit: float,
+    expected_stop: float,
+) -> None:
     spec = _spec(tmp_path)
     engine = TwDayTradeSimulationEngine(tmp_path / "state")
 
     result = engine.register_signal(
         spec=spec,
         summary=_summary(),
-        signal_rows=[_row(0.1)],
+        signal_rows=[_row(weight)],
         quotes={"2330": _quote()},
         eligibility=_eligibility(),
         eligibility_coverage={},
@@ -650,7 +742,7 @@ def test_market_entry_uses_best_ask_and_records_board_lot(tmp_path: Path) -> Non
 
     assert result == "registered"
     position = next(iter(engine.state["modes"][spec.market]["positions"].values()))
-    assert position["entry_price"] == 1_000.0
+    assert position["entry_price"] == expected_entry
     assert position["filled_shares"] == 1_000
     order = next(
         json.loads(line)
@@ -662,8 +754,10 @@ def test_market_entry_uses_best_ask_and_records_board_lot(tmp_path: Path) -> Non
     assert order["unfilled_quantity"] == 0
     assert order["model_requested_quantity"] == 1_000
     assert order["target_unsubmitted_quantity"] == 0
-    assert position["take_profit_price"] == 1_100.0
-    assert position["stop_trigger_price"] == 900.0
+    assert order["order_type"] == "MKT"
+    assert order["synthetic_fill"] is False
+    assert position["take_profit_price"] == expected_take_profit
+    assert position["stop_trigger_price"] == expected_stop
 
 
 @pytest.mark.parametrize(
@@ -719,6 +813,68 @@ def test_synthetic_open_tick_policy_fills_all_legal_board_lots_at_adverse_tick(
     )
     assert entry_order["order_type"] == "SYNTHETIC_OPEN_TICK"
     assert entry_order["synthetic_fill"] is True
+
+
+@pytest.mark.parametrize(
+    ("with_best_ask", "expected_entry", "expected_exact", "expected_fallback"),
+    ((True, 1_000.0, 1, 0), (False, 1_005.0, 0, 1)),
+)
+def test_historical_hybrid_entry_records_exact_quote_or_adverse_tick_fallback(
+    tmp_path: Path,
+    with_best_ask: bool,
+    expected_entry: float,
+    expected_exact: int,
+    expected_fallback: int,
+) -> None:
+    spec = replace(
+        _spec(tmp_path),
+        entry_fill_policy=ENTRY_FILL_POLICY_CAUSAL_BOOK_ELSE_OPEN_TICK,
+        entry_price_offset_ticks=1,
+    )
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+    replay = _summary()
+    replay.update(
+        {
+            "simulation_replay": True,
+            "entry_fill_contract": (
+                "retrospective_historical_best_quote_else_adverse_open_tick_counterfactual"
+            ),
+        }
+    )
+    quote = _quote(open_price=1_000.0, ask=1_000.0, ask_volume=1.0)
+    quote["quote_at"] = _now(9, 0).isoformat()
+    quote["historical_source_quote_at"] = _now(9, 0, 7).isoformat()
+    quote["entry_price_source"] = "shioaji:historical_stock_tick_best_ask"
+    if not with_best_ask:
+        quote["ask"] = None
+        quote["ask_volume"] = None
+        quote["entry_price_is_synthetic_fallback"] = True
+        quote["entry_price_source"] = (
+            "official_daily_session_open:adverse_one_legal_tick_fallback"
+        )
+
+    assert (
+        engine.register_signal(
+            spec=spec,
+            summary=replay,
+            signal_rows=[_row(0.5)],
+            quotes={"2330": quote},
+            eligibility=_eligibility(),
+            eligibility_coverage={},
+            now=_now(9, 0),
+            counterfactual_open_replay=True,
+        )
+        == "registered"
+    )
+
+    mode = engine.state["modes"][spec.market]
+    position = next(iter(mode["positions"].values()))
+    assert position["entry_price"] == expected_entry
+    assert position["historical_entry_quote_at"] == _now(9, 0, 7).isoformat()
+    assert position["entry_fill_is_synthetic"] is (not with_best_ask)
+    assert mode["entry_best_quote_fill_count"] == expected_exact
+    assert mode["entry_synthetic_fallback_fill_count"] == expected_fallback
+    assert mode["entry_fill_is_synthetic"] is (not with_best_ask)
 
 
 def test_sub_board_lot_signal_finishes_without_requesting_a_quote(
@@ -2476,6 +2632,22 @@ def test_dashboard_history_ranges_anchor_to_latest_retained_mark(
     assert selected_day["available_start_date"] == "2026-08-13"
     assert selected_day["available_end_date"] == "2026-08-14"
     assert selected_day["raw_points_in_range"] == 2
+    assert [row["return_pct"] for row in selected_day["history"]] == pytest.approx(
+        [102.0 / 101.0 * 100.0 - 100.0, 103.0 / 101.0 * 100.0 - 100.0]
+    )
+    assert selected_day["curve_granularity"] == "1m"
+    assert selected_day["return_basis"] == (
+        "previous_retained_mark_before_start_else_initial_capital"
+    )
+    assert len(selected_day["range_summary"]) == 1
+    summary = selected_day["range_summary"][0]
+    assert summary["series_id"] == "tw_day_trade"
+    assert summary["baseline_kind"] == "previous_retained_mark"
+    assert summary["baseline_equity_twd"] == 101.0
+    assert summary["end_equity_twd"] == 103.0
+    assert summary["range_net_pnl_twd"] == 2.0
+    assert summary["point_count"] == 2
+    assert summary["expected_minute_points"] == 271
 
 
 def test_dashboard_merges_actual_open_benchmark_history_and_rebases_live_marks(
@@ -2823,6 +2995,10 @@ def test_dashboard_html_is_local_and_refreshes_api() -> None:
     assert 'id="workflow-progress"' in html
     assert 'id="preopen-progress"' in html
     assert "fetchWithTimeout(`api/status" in javascript
+    assert 'fetchWithTimeout("api/revision"' in javascript
+    assert "const SERVICE_REVISION_REFRESH_MS = 1000" in javascript
+    assert "Dashboard.scheduleRefresh(refreshServiceRevision" in javascript
+    assert "服務同步" in javascript
     assert "fetchWithTimeout(`api/signals?${params.toString()}`" in javascript
     assert "fetchWithTimeout(`api/positions?${params.toString()}`" in javascript
     assert "fetchWithTimeout(`api/events?${params.toString()}`" in javascript
@@ -2870,6 +3046,10 @@ def test_dashboard_html_is_local_and_refreshes_api() -> None:
     assert 'id="signal-direction-summary"' in html
     assert "signalOpeningExecutionAudit" in javascript
     assert "開盤計價 ${money(openingPrice)}" in javascript
+    assert "configured_entry_fill_policy" in javascript
+    assert "市價買進／回補取收到的最佳 Ask" in javascript
+    assert "市價賣出／放空取收到的最佳 Bid" in javascript
+    assert "不回寫成最佳報價" in javascript
     assert 'class="compact-table position-table"' in html
     assert 'class="compact-table signal-table"' in html
     assert "<th>損益拆分／估值</th>" in html
@@ -2887,8 +3067,8 @@ def test_dashboard_html_is_local_and_refreshes_api() -> None:
     assert "資格／整張／深度後實際成交" in javascript
     assert "方向平衡後" not in javascript
     assert "雙向整張不足・保持空倉" not in javascript
-    assert "四模式已實現" in javascript
-    assert "四模式未實現" in javascript
+    assert "各模式已實現" in javascript
+    assert "各模式未實現" in javascript
     assert "已實現＋未實現，已與總權益對帳" in javascript
     assert "未實現淨清算損益" in javascript
     assert "已實現 ${money(realizedNet)}" in javascript
@@ -2923,16 +3103,21 @@ def test_dashboard_html_is_local_and_refreshes_api() -> None:
         '$("detail-end-date").addEventListener("change", detailDateChanged)'
         in javascript
     )
-    assert "四模式盤前預熱測速（不等同該日執行完成）" in html
+    assert "啟用模式盤前預熱測速（不等同該日執行完成）" in html
     assert "依 |持倉目標 %| 由大到小" in html
     assert "const PRICE_REFRESH_MS = 60000" in javascript
     assert "Dashboard.scheduleRefresh(() => {" in javascript
     assert "}, {intervalMs: PRICE_REFRESH_MS});" in javascript
-    assert 'id="equity-time-range"' in html
+    assert 'aria-label="權益曲線日期來源"' in html
+    assert 'id="equity-time-range"' not in html
+    assert 'id="equity-start-date"' not in html
+    assert "rangeSummaryFor" in javascript
+    assert "selectedDetailStartDate()" in javascript
+    assert "起始日前最後一筆權益" in html
     assert 'id="chart-legend"' in html
     assert 'aria-label="曲線顯示開關"' in html
-    assert 'data-range="1y"' in html
-    assert 'data-range="all"' in html
+    assert 'data-range="1y"' not in html
+    assert 'data-range="all"' not in html
     assert "HIDDEN_EQUITY_SERIES_STORAGE_KEY" in javascript
     assert "HISTORY_CLIENT_CACHE_MS" in javascript
     assert "chartHistoryCache" in javascript
@@ -3042,6 +3227,9 @@ def test_dashboard_date_filter_switches_all_session_ledgers(tmp_path: Path) -> N
             "market": spec.market,
             "signal_id": "day-13",
             "recorded_at": "2026-08-13T09:01:00+08:00",
+            "entry_fill_policy": ENTRY_FILL_POLICY_SYNTHETIC_OPEN_TICK,
+            "entry_price_offset_ticks": 1,
+            "entry_fill_is_synthetic": True,
         },
         {
             "event": "signal_blocked",
@@ -3092,6 +3280,17 @@ def test_dashboard_date_filter_switches_all_session_ledgers(tmp_path: Path) -> N
     assert day_13["execution_records"]["executed_count"] == 1
     assert day_13["marks"][0]["total_equity_twd"] == 10_010_000.0
     assert {event["signal_id"] for event in day_13["events"]} == {"day-13"}
+    historical_mode = day_13["modes"][0]
+    assert historical_mode["configured_entry_fill_policy"] == (
+        ENTRY_FILL_POLICY_CAUSAL_BOOK
+    )
+    assert historical_mode["configured_entry_price_offset_ticks"] == 0
+    assert historical_mode["configured_entry_fill_is_synthetic"] is False
+    assert historical_mode["entry_fill_policy"] == (
+        ENTRY_FILL_POLICY_SYNTHETIC_OPEN_TICK
+    )
+    assert historical_mode["entry_price_offset_ticks"] == 1
+    assert historical_mode["entry_fill_is_synthetic"] is True
 
     day_14 = build_dashboard_snapshot(
         state_dir=engine.state_dir,
@@ -3184,7 +3383,7 @@ def test_next_session_archives_closed_positions_for_dashboard_history(
     assert registered[0]["recorded_at"] == _now(9, 1, 7).isoformat()
 
 
-def test_counterfactual_open_replay_records_every_entry_at_session_open(
+def test_counterfactual_best_quote_replay_records_every_entry_at_session_open(
     tmp_path: Path,
 ) -> None:
     spec = _spec(tmp_path)
@@ -3196,10 +3395,8 @@ def test_counterfactual_open_replay_records_every_entry_at_session_open(
             "simulation_replay": True,
             "replay_basis": "actual_session_open_to_official_close",
             "replay_source": "fixture",
-            "entry_fill_contract": (
-                "retrospective_actual_session_open_price_counterfactual"
-            ),
-            "entry_liquidity_assumption": "counterfactual_unbounded",
+            "entry_fill_contract": "retrospective_observed_best_quote_counterfactual",
+            "entry_liquidity_assumption": "recorded_level_one_displayed_depth",
         }
     )
     open_at = _now(9, 0)
@@ -3359,6 +3556,52 @@ def test_available_session_date_cache_invalidates_when_ledger_grows(
     )
     assert second["available_session_dates"] == ["2026-08-14", "2026-08-13"]
     assert second["total"] == 2
+
+
+def test_signal_page_cache_ignores_unrelated_live_state_marks(
+    tmp_path: Path, monkeypatch
+) -> None:
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    state_path = state_dir / "state.json"
+    state = {
+        "modes": {
+            "mode_a": {
+                "session_date": "2026-08-13",
+                "initial_capital_twd": 10_000_000,
+                "last_mark_at": "2026-08-13T09:01:00+08:00",
+            }
+        }
+    }
+    state_path.write_text(json.dumps(state) + "\n", encoding="utf-8")
+    (state_dir / "signals.jsonl").write_text(
+        json.dumps(
+            {
+                "session_date": "2026-08-13",
+                "market": "mode_a",
+                "symbol": "2330",
+                "target_weight": 0.1,
+                "status": "ready",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    first = build_dashboard_signal_page(state_dir=state_dir, limit=10)
+    assert first["total"] == 1
+
+    state["modes"]["mode_a"]["last_mark_at"] = "2026-08-13T09:02:00+08:00"
+    state_path.write_text(json.dumps(state) + "\n", encoding="utf-8")
+    monkeypatch.setattr(
+        dashboard_module,
+        "_rows_for_sessions",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("unrelated mark update must not reparse signal rows")
+        ),
+    )
+
+    second = build_dashboard_signal_page(state_dir=state_dir, limit=10)
+    assert second["rows"] == first["rows"]
 
 
 def test_dashboard_signal_page_filters_sorts_and_bounds_payload(tmp_path: Path) -> None:

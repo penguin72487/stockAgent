@@ -20,7 +20,7 @@
       <div>
         <p class="eyebrow">TW STOCKS · PUBLIC READ-ONLY SIMULATION</p>
         <h1>台股三模式當沖模擬</h1>
-        <p class="subtitle">先看執行進度與盤前守門，再下鑽到四模式結果、訊號和成交。</p>
+        <p class="subtitle">先看執行進度與盤前守門，再下鑽到啟用模式結果、訊號和成交。</p>
       </div>
     <div id="connection-status" class="healthbox" role="status" aria-live="polite">
       <small>資料狀態</small>
@@ -61,7 +61,7 @@
           <div id="workflow-progress" class="progress-list"></div>
         </div>
         <div>
-          <h3>四模式盤前預熱測速（不等同該日執行完成）</h3>
+          <h3>啟用模式盤前預熱測速（不等同該日執行完成）</h3>
           <div id="preopen-progress" class="progress-list"></div>
         </div>
       </div>
@@ -74,15 +74,15 @@
     <section id="overview-kpis" class="overview-kpis" aria-label="所選交易日核心摘要" aria-busy="true">
       <div class="overview-kpi loading"><span>模式狀態</span><strong>讀取中</strong><small>—</small></div>
       <div class="overview-kpi loading"><span>所選日持倉</span><strong>—</strong><small>—</small></div>
-      <div class="overview-kpi loading"><span>四模式淨損益</span><strong>—</strong><small>—</small></div>
+      <div class="overview-kpi loading"><span>各模式淨損益</span><strong>—</strong><small>—</small></div>
       <div class="overview-kpi loading"><span>報酬範圍</span><strong>—</strong><small>—</small></div>
     </section>
 
     <div id="performance" class="section-intro">
-      <div><span>03</span><h2>四模式與市場基準</h2></div>
+      <div><span>03</span><h2>啟用模式與市場基準</h2></div>
       <p>先分開看策略與市場；每條線都用自己的資金基準。</p>
     </div>
-    <section id="mode-cards" class="mode-grid" aria-label="四模式績效卡片"></section>
+    <section id="mode-cards" class="mode-grid" aria-label="啟用模式績效卡片"></section>
     <div id="baselines" class="subsection-head">
       <div><h3>市場基準</h3><span>0050、2330、台指期前月連續持有</span></div>
       <p>實際開盤起算；台指期換月不把合約價差灌入報酬。</p>
@@ -91,7 +91,7 @@
 
     <div id="details" class="section-intro">
       <div><span>04</span><h2>持倉與訊號下鑽</h2></div>
-      <p>篩選只影響比較圖與下方明細，不會改變原始帳本。</p>
+      <p>日期篩選會同步重算上方報酬率、比較曲線與下方明細，不會改變原始帳本。</p>
     </div>
     <section class="controls panel" aria-label="明細篩選">
       <div class="controls-title"><strong>明細篩選</strong><span>模式、股票與狀態</span></div>
@@ -107,7 +107,7 @@
     <section class="grid-two">
       <article class="panel chart-panel">
         <div class="panel-head"><div><h2>每分鐘累積報酬率比較（%）</h2><p>每條線都除以自己的資金基準；即時點使用 bid／ask，歷史回補點使用右標一分鐘最後成交價，無成交分鐘延用上一筆並揭露覆蓋率，絕不線性插值。點選彩色圓點可隱藏或顯示曲線。</p></div><div id="chart-legend" class="legend" role="group" aria-label="曲線顯示開關"></div></div>
-        <div id="equity-time-range" class="time-range-control" role="group" aria-label="權益曲線時間範圍"><span>快速區間</span><button type="button" data-range="1h">1 小時</button><button type="button" data-range="1d">1 天</button><button type="button" data-range="1w">1 週</button><button type="button" data-range="1mo">1 月</button><button type="button" data-range="1q">1 季</button><button type="button" data-range="1y">1 年</button><button type="button" data-range="all">全部</button><div class="date-range-picker" role="group" aria-label="自訂起訖日期"><label for="equity-start-date">起始日<input id="equity-start-date" type="date"></label><span aria-hidden="true">到</span><label for="equity-end-date">終止日<input id="equity-end-date" type="date"></label><button id="clear-equity-dates" class="clear-date-range" type="button">清除日期</button></div></div>
+        <div class="time-range-control" aria-label="權益曲線日期來源"><span>日期範圍跟隨上方「明細篩選」；起始日前最後一筆權益為 0% 基準。</span></div>
         <div id="chart-empty" class="empty hidden">目前尚無分鐘報酬率資料</div>
         <div class="chart-scroll" tabindex="0" aria-label="台股累積報酬曲線，可在窄螢幕水平捲動"><svg id="equity-chart" viewBox="0 0 960 360" role="img" aria-label="每分鐘累積報酬率百分比曲線"></svg></div>
         <p id="equity-range-note" class="time-range-note" aria-live="polite"></p>
@@ -117,7 +117,7 @@
         <ol class="timeline">
           <li><time>09:00</time><div><strong>訊號完成立即市價執行</strong><span>盤前已預熱模型、契約與資格；訊號可用後只等因果上較晚的 opening quote，不再等待第一根分鐘 K。</span></div></li>
 	          <li><time>進場</time><div><strong>可成交委託全數成交</strong><span>買入取 best ask、賣空取 best bid；送出的模擬市價量不超過新鮮一檔可見量，因此送單量全成，模型原始目標超出深度的部分另列為未送出，不捏造流動性。</span></div></li>
-          <li><time>盤中</time><div><strong>四模式 TP/SL 皆內縮一 Tick</strong><span>四個策略都從漲跌停價向內縮一個日期有效的合法 Tick。TP 是限價，SL 是本地觸價後市價；內縮只能提高成交機率，不能保證有對手量。</span></div></li>
+          <li><time>盤中</time><div><strong>啟用模式 TP/SL 皆內縮一 Tick</strong><span>每個啟用策略都從漲跌停價向內縮一個日期有效的合法 Tick。TP 是限價，SL 是本地觸價後市價；內縮只能提高成交機率，不能保證有對手量。</span></div></li>
           <li><time>13:20</time><div><strong>被動限價退出</strong><span>多單掛 ask、空單掛 bid；保留成交與未成交狀態。</span></div></li>
 	          <li><time>13:24</time><div><strong>撤單後市價強平重試</strong><span>多單賣 bid、空單補 ask，持續到 13:25；缺價或一檔量不足時保留殘餘持倉，不假造成交。</span></div></li>
 	          <li><time>13:25</time><div><strong>收盤集合競價強平</strong><span>仍有多單就掛跌停賣出，仍有空單就掛漲停回補，直接參與 13:30 收盤撮合。</span></div></li>
@@ -187,6 +187,6 @@
   </main>
   <script src="../dashboard-core.js?v=1" defer></script>
   <script src="../time-axis.js?v=4" defer></script>
-  <script src="app.js?v=38" defer></script>
+  <script src="app.js?v=40" defer></script>
 </body>
 </html>

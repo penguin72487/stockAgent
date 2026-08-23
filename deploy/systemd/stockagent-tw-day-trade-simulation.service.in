@@ -1,7 +1,8 @@
 [Unit]
-Description=StockAgent three-mode Taiwan stock day-trade paper execution and dashboard
-Wants=network-online.target time-sync.target stockagent-discord-bot.service
-After=network-online.target time-sync.target stockagent-discord-bot.service
+Description=StockAgent Taiwan stock day-trade paper execution and dashboard
+Wants=network-online.target time-sync.target
+After=network-online.target time-sync.target
+Before=stockagent-discord-bot.service stockagent-public-dashboards.service
 StartLimitIntervalSec=300
 StartLimitBurst=5
 

@@ -885,6 +885,17 @@ def publish_packed_snapshot(
                 "snapshot or under the downloader's dataset lock"
             )
 
+        # The immutable inventory is the semantic dataset identity.  Reusing
+        # the previous release when it is identical prevents a no-op publish
+        # from advancing the head and forcing every consumer to materialize the
+        # same 100k+ files under a fresh timestamp-only snapshot ID.
+        if (
+            previous is not None
+            and str(previous.manifest["archive"]["inventory"]["sha256"])
+            == inventory_sha
+        ):
+            return previous
+
         wall_time_ns = time.time_ns()
         stamp = next_hlc(
             _observed_stamps(

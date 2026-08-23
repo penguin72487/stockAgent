@@ -43,7 +43,7 @@ from stockagent.research.taifex_volatility_metadata import (  # noqa: E402
 )
 
 
-REPLAY_CONTRACT_VERSION = 2
+REPLAY_CONTRACT_VERSION = 3
 REPLAY_SOURCE = "shioaji_worker0_completed_second_bidask_recapitalizing"
 BOOK_COLUMNS = [
     "snapshot_ts_ns",
@@ -320,7 +320,7 @@ def main() -> int:
     if end_date < args.start_date:
         raise ValueError("end date is before start date")
     output_dir = args.output_dir or (
-        args.state_dir / "backfills" / "all_strategies_bidask_recapitalizing_v2"
+        args.state_dir / "backfills" / "all_strategies_bidask_recapitalizing_v3"
     )
     output_dir.mkdir(parents=True, exist_ok=True)
     lock_path = output_dir / "backfill.lock"
@@ -711,7 +711,7 @@ def main() -> int:
         "replay_contract_version": REPLAY_CONTRACT_VERSION,
         "source": REPLAY_SOURCE,
         "history_authority": "receipt_verified_replay_over_live_same_interval",
-        "supersedes_replay_contract_versions": [1],
+        "supersedes_replay_contract_versions": [1, 2],
         "causal_clock": {
             "decision": "completed local-receive second on worker 0",
             "entry": "first complete fresh five-level Call/Put and TX books",
@@ -721,6 +721,7 @@ def main() -> int:
             "settlement": "official TAIFEX final settlement; never zero or synthetic",
             "bankruptcy": "force-liquidate only from complete five-level books",
             "recapitalization": "strictly later TAIFEX trading date; contribute enough to restore one complete strategy-package capital; cumulative P&L never resets",
+            "gamma_scalping_trigger": "completed-second BS Delta using only then-visible books; point/time grids compare against the same strategy's last successful causal anchor",
         },
         "manifest_receipts": manifest_receipts,
         "source_coverage": source_coverage,

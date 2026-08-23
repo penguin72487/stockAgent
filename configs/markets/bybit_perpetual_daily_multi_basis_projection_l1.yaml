@@ -1,0 +1,259 @@
+# Bybit product adapter over the canonical completed TW multi-basis training
+# standard.  Model/lifecycle/BF16/DDP/1000-epoch behavior is inherited; only
+# crypto data, 24x7 execution, funding, fees, and public features differ.
+base_config: tw_day_trade_daily_multi_basis_projection_l1_tplus2_close_capital10m.yaml
+
+experiment_name: bybit-endogenous-usdt-perpetual-daily-multi-basis-projection-l1-public-web-v1
+
+runner:
+  output_dir: artifacts/markets/bybit_perpetual_daily_multi_basis_projection_l1_endogenous_policy_1w_v1
+  resume: true
+  post_train_infer: false
+
+data:
+  # Generated from complete local 1m grids. A date D row contains the complete
+  # prior UTC calendar day through D 00:00; after a five-minute decision/order
+  # lag, executor valuation uses the unseen D 00:05 1m Kline open.
+  # Its adjclose embeds every official funding event in (D,D+1].
+  parquet_root: data_bybit/perpetual_daily
+  benchmark_name: BTCUSDT
+  panel_start_date: "2020-03-27"
+  security_filter: none
+  usd_only_trading_pairs: false
+  tradable_mode: tradable
+  trading_volume_policy: required
+  panel_backend: auto
+
+  use_external_features: true
+  external_feature_path: data_bybit/public_features/bybit_crypto_public_daily.parquet
+  external_market_symbol: __MARKET__
+  use_tw_public_features: false
+  use_tw_public_rules: false
+  day_trade_open_feature: false
+  feature_shift_next_session: []
+  allow_same_close_feature_approximation: false
+
+  feature_include:
+    - open_logret_1d
+    - max_logret_1d
+    - min_logret_1d
+    - close_logret_1d
+    - trading_volume_logret_1d
+    - signed_vol
+    - body_ratio
+    - signed_body_ratio
+    - delta_body_ratio
+    - clv
+    - clv_centered
+    - delta_clv
+    - upper_shadow
+    - lower_shadow
+    - shadow_imbalance
+    - crypto_bybit_funding_rate_sum_1d
+    - crypto_bybit_funding_realized_annualized
+    - crypto_bybit_funding_cashflow_coefficient_1d
+    - crypto_bybit_funding_last_rate
+    - crypto_bybit_funding_age_hours
+    - crypto_bybit_funding_event_count_1d
+    - crypto_bybit_funding_available
+    - crypto_binance_mark_return_1d
+    - crypto_binance_index_return_1d
+    - crypto_binance_mark_range_log_1d
+    - crypto_binance_index_range_log_1d
+    - crypto_binance_contract_mark_basis_log
+    - crypto_binance_mark_index_basis_log
+    - crypto_binance_funding_realized_rate
+    - crypto_binance_funding_realized_annualized
+    - crypto_binance_funding_age_hours
+    - crypto_binance_funding_available
+    - crypto_binance_open_interest_usd_log_change_1d
+    - crypto_binance_open_interest_usd_to_volume_log
+    - crypto_binance_taker_imbalance_1d
+    - crypto_binance_global_long_short_account_ratio_log
+    - crypto_binance_top_trader_account_ratio_log
+    - crypto_binance_top_trader_position_ratio_log
+    - crypto_binance_quote_volume_log1p
+    - crypto_binance_trade_count_log1p
+    - crypto_binance_core_available
+    - crypto_binance_positioning_available
+    - crypto_binance_session_coverage
+    - crypto_okx_mark_return_1d
+    - crypto_okx_index_return_1d
+    - crypto_okx_mark_range_log_1d
+    - crypto_okx_index_range_log_1d
+    - crypto_okx_contract_mark_basis_log
+    - crypto_okx_mark_index_basis_log
+    - crypto_okx_funding_realized_rate
+    - crypto_okx_funding_realized_annualized
+    - crypto_okx_funding_age_hours
+    - crypto_okx_funding_available
+    - crypto_okx_open_interest_usd_log_change_1d
+    - crypto_okx_open_interest_usd_to_volume_log
+    - crypto_okx_taker_imbalance_1d
+    - crypto_okx_long_short_account_ratio_log
+    - crypto_okx_top_trader_account_ratio_log
+    - crypto_okx_top_trader_position_ratio_log
+    - crypto_okx_available
+    - crypto_okx_positioning_available
+    - crypto_okx_taker_available
+    - crypto_okx_session_coverage
+    - crypto_public_fear_greed_index
+    - crypto_public_defi_open_interest_log1p
+    - crypto_public_options_notional_volume_log1p
+    - crypto_public_dex_volume_log1p
+    - crypto_public_protocol_fees_log1p
+    - crypto_public_protocol_revenue_log1p
+    - crypto_public_defi_tvl_log1p
+    - crypto_public_stablecoin_supply_log1p
+    - crypto_public_yield_tvl_log1p
+    - crypto_public_eth_gas_fast_gwei_log1p
+    - crypto_public_eth_network_utilization
+    - crypto_public_btc_hashrate_log1p
+    - crypto_public_btc_fastest_fee_log1p
+    - crypto_public_btc_hour_fee_log1p
+    - crypto_public_btc_mempool_vsize_log1p
+    - crypto_public_btc_unconfirmed_txs_log1p
+    - crypto_public_btc_difficulty_change_pct
+    - crypto_public_market_available
+    - crypto_public_hyperliquid_funding_rate
+    - crypto_public_hyperliquid_premium
+    - crypto_public_hyperliquid_open_interest_log1p
+    - crypto_public_hyperliquid_day_volume_log1p
+    - crypto_public_hyperliquid_available
+    - crypto_public_macro_fed_funds_rate
+    - crypto_public_macro_sofr
+    - crypto_public_macro_treasury_2y
+    - crypto_public_macro_treasury_10y
+    - crypto_public_macro_treasury_10y_2y_spread
+    - crypto_public_macro_dollar_index_log
+    - crypto_public_macro_vix_log1p
+    - crypto_public_macro_high_yield_spread
+    - crypto_public_macro_fed_balance_sheet_log1p
+    - crypto_public_macro_reverse_repo_log1p
+    - crypto_public_macro_financial_conditions
+    - crypto_public_macro_available_fraction
+    - crypto_public_macro_max_age_days
+    - crypto_public_sec_etf_filings_1d_log1p
+    - crypto_public_sec_etf_filings_7d_log1p
+    - crypto_public_sec_etf_filings_30d_log1p
+    - crypto_public_sec_etf_registration_30d_log1p
+    - crypto_public_sec_etf_periodic_30d_log1p
+    - crypto_public_sec_etf_available
+    - crypto_public_sec_asset_filings_7d_log1p
+    - crypto_public_sec_asset_filings_30d_log1p
+    - crypto_public_sec_asset_registration_30d_log1p
+    - crypto_public_sec_asset_periodic_30d_log1p
+    - crypto_public_sec_asset_available
+    - crypto_public_onchain_active_addresses_log1p
+    - crypto_public_onchain_balance_addresses_log1p
+    - crypto_public_onchain_tx_count_log1p
+    - crypto_public_onchain_transfer_count_log1p
+    - crypto_public_onchain_fees_native_log1p
+    - crypto_public_onchain_issuance_native_log1p
+    - crypto_public_onchain_supply_log1p
+    - crypto_public_onchain_mvrv_log
+    - crypto_public_onchain_hashrate_log1p
+    - crypto_public_onchain_exchange_netflow_usd_signed_log1p
+    - crypto_public_onchain_age_days
+    - crypto_public_onchain_available_fraction
+    - crypto_public_coingecko_total_market_cap_log1p
+    - crypto_public_coingecko_total_volume_log1p
+    - crypto_public_coingecko_btc_dominance
+    - crypto_public_coingecko_eth_dominance
+    - crypto_public_coingecko_market_cap_change_24h
+    - crypto_public_coingecko_active_assets_log1p
+    - crypto_public_coingecko_markets_log1p
+    - crypto_public_coingecko_market_available
+    - crypto_public_coingecko_market_cap_log1p
+    - crypto_public_coingecko_fdv_to_market_cap_log
+    - crypto_public_coingecko_volume_to_market_cap_log
+    - crypto_public_coingecko_market_cap_rank_log1p
+    - crypto_public_coingecko_circulating_supply_log1p
+    - crypto_public_coingecko_symbol_match_share
+    - crypto_public_coingecko_asset_available
+    - crypto_public_etf_holdings_value_usd_log1p
+    - crypto_public_etf_holdings_units_log1p
+    - crypto_public_etf_reserve_coverage_log
+    - crypto_public_etf_issuer_available
+  feature_exclude: []
+  # Sparse public families are zero only together with explicit availability
+  # flags; a missing observation is never confused with an observed zero.
+  feature_zero_fill:
+    - crypto_bybit_*
+    - crypto_binance_*
+    - crypto_okx_*
+    - crypto_public_*
+
+walk_forward:
+  min_train_years: 1
+  val_years: 1
+  require_future_test_year: false
+  expected_first_year: 2020
+  require_contiguous_years: true
+  lookback_context: panel_history
+  split_start_year: null
+
+trading:
+  execution_mode: crypto_perpetual
+  frequency: daily
+  long_only: false
+  # VIP0 taker fee, charged on each actually executed buy/sell notional.
+  buy_fee_rate: 0.00055
+  sell_fee_rate: 0.00055
+  # No human turnover budget or forced rebalance rate.  The recurrent executor
+  # derives its no-trade region from the exact applicable fee and the previous
+  # executed holdings; the model learns the proposal, direction, gross, cash,
+  # concentration, and persistence from canonical net log utility.
+  crypto_stateful_proximal_allocator: true
+  crypto_proximal_cost_multiplier: 1.0
+  max_turnover_ratio: 0.0
+  # Causal capacity uses the prior complete UTC day's official USDT turnover,
+  # represented
+  # as turnover / 00:05 execution price so the shared volume ledger recovers
+  # the exact notional when it multiplies by execution price.
+  max_volume_participation: 0.01
+  volume_participation_equity: 1000000.0
+  min_trade_weight: 0.0
+  portfolio_activation: pre_normalized
+  reporting_leverage: 1.0
+  tw_day_trade_unlimited_margin_conversion: false
+
+training:
+  model_name: financial_transformer
+  # Hard product contract: one daily target from the preceding 32 completed
+  # daily sessions. Intraday source bars are aggregation inputs only.
+  lookback: 32
+  epochs: 1000
+  loss_type: log_utility
+  # The recurrent executor compiles one fixed four-day block and reuses it. An
+  # outer compiled loss would unroll the whole horizon and repeat codegen.
+  compile_loss: false
+  loss_portfolio_activation: pre_normalized
+  record_epoch_curve: true
+  curve_plot_interval: 1
+  curve_plot_async: true
+  defer_epoch_curve_plot_until_end: false
+  # Keep the shared encoder/head contract aligned even though Financial
+  # Transformer is the active model. Crypto has no first-principles reason to
+  # force net-zero exposure by de-meaning every cross section.
+  transformer_base_portfolio:
+    center_long_short_logits: false
+    projection_l1_scale_by_active_count: true
+  financial_transformer:
+    # The inherited 18 fixed/learned causal bases are concatenated with the
+    # ordinary lookback features before one shared RMSNorm/projection.
+    temporal_basis_input: input_features
+    center_long_short_logits: false
+    portfolio_output_mode: projection_l1
+    projection_l1_scale_by_active_count: true
+    return_aux: false
+    return_aux_details: false
+
+evaluation:
+  eval_log_utility_periods_per_year: 365.0
+  # log_utility already consumes the fee/funding-adjusted canonical ledger.
+  # Keep every human-shaped turnover target disabled; the cost-aware recurrent
+  # allocator and actual fee determine whether a rebalance survives.
+  gamma_turnover: 0.0
+  turnover_budget: 0.0
+  gamma_turnover_budget: 0.0

@@ -48,6 +48,3 @@ RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 SystemCallArchitectures=native
 SystemCallFilter=~@clock @cpu-emulation @debug @module @mount @obsolete @privileged @raw-io @reboot @swap
 SystemCallErrorNumber=EPERM
-
-[Install]
-WantedBy=multi-user.target

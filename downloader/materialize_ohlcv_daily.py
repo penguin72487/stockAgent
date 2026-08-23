@@ -19,6 +19,7 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from common import PersistentProgress, atomic_write_text  # noqa: E402
+from ohlcv_hot_tail import logical_mtime_ns, read_logical_parquet  # noqa: E402
 
 
 @dataclass(slots=True)
@@ -94,13 +95,10 @@ def _daily_frame(path: Path, *, start_day: date | None = None) -> pl.DataFrame:
         else:
             filter_value = start_day.isoformat()
         filters = [("date", ">=", filter_value)]
-    frame = pl.from_arrow(
-        pq.read_table(
-            path,
-            columns=selected,
-            filters=filters,
-            memory_map=True,
-        )
+    frame = read_logical_parquet(
+        path,
+        columns=selected,
+        filters=filters,
     )
     if frame.is_empty():
         return pl.DataFrame()
@@ -195,7 +193,7 @@ def main() -> None:
         if (
             not args.refresh
             and target.is_file()
-            and target.stat().st_mtime_ns >= source.stat().st_mtime_ns
+            and target.stat().st_mtime_ns >= logical_mtime_ns(source)
             and "minute_grid_complete" in pq.read_schema(target).names
         ):
             rows = int(pq.ParquetFile(target, memory_map=True).metadata.num_rows)

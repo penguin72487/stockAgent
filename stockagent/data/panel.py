@@ -125,7 +125,11 @@ BASE_PANEL_FEATURE_COLUMNS = [
 # known, and stores immutable logical-array fingerprints in the panel cache.
 # v51 separates opening- and closing-auction short-open masks and keeps the
 # official inventory headroom independent of later close-side execution facts.
-PANEL_CACHE_VERSION = 51
+# v52 reads product-supplied policy and execution masks independently. v53
+# keeps forward valuation returns across rows that have a real execution mark
+# even when their feature window is policy-ineligible. v54 invalidates cached
+# feature tensors after the Bybit public-web input schema expansion.
+PANEL_CACHE_VERSION = 54
 # v2 distinguishes the cumulative corporate-action archive coverage from the
 # latest incremental downloader request.  Keep this in the backend contract so
 # panels built with the old requested_start_year interpretation are never
@@ -135,6 +139,7 @@ CORPORATE_ACTION_COVERAGE_CONTRACT_VERSION = 2
 # unresolved-only interval used when exact cash entitlements are enabled.
 CORPORATE_ACTION_AVOIDANCE_CONTRACT_VERSION = 2
 FEATURE_FILE_SUFFIX = "_features.parquet"
+HOT_TAIL_DIRNAME = "_hot_tail"
 DEFAULT_EXTERNAL_MARKET_SYMBOL = "__MARKET__"
 EPSILON = 1e-8
 # Treat single-day price ratios beyond 5x or below 1/5x as unusable labels and
@@ -251,6 +256,9 @@ def _price_decimals_for_path(path: Path) -> int:
 
 
 def _adjclose_decimals_for_path(path: Path) -> int:
+    parts = {part.lower() for part in path.parts}
+    if "data_bybit" in parts and "perpetual_daily" in parts:
+        return 16
     return 8 if _is_tw_official_path(path) else _price_decimals_for_path(path)
 
 
@@ -459,6 +467,12 @@ class _SymbolPanelArrays:
     intraday_returns: np.ndarray
     daily_volumes: np.ndarray
     tradable_mask: np.ndarray
+    # Whether the row's execution mark is sufficient to value a position into
+    # that row. This normally matches tradable_mask, but products with an
+    # explicit policy/execution split (for example crypto perpetuals with an
+    # incomplete feature session) may remain valuably executable while being
+    # ineligible for a new model target.
+    return_valuation_mask: np.ndarray
     can_buy_mask: np.ndarray
     can_sell_mask: np.ndarray
     day_trade_can_buy_open_mask: np.ndarray
@@ -505,6 +519,7 @@ def _slice_symbol_arrays_start(
         intraday_returns=arrays.intraday_returns[slc],
         daily_volumes=arrays.daily_volumes[slc],
         tradable_mask=arrays.tradable_mask[slc],
+        return_valuation_mask=arrays.return_valuation_mask[slc],
         can_buy_mask=arrays.can_buy_mask[slc],
         can_sell_mask=arrays.can_sell_mask[slc],
         day_trade_can_buy_open_mask=arrays.day_trade_can_buy_open_mask[slc],
@@ -1683,6 +1698,8 @@ def _prepare_symbol_frame(frame: Any, path: Path) -> Any:
     price_decimals = _price_decimals_for_path(path)
     adjclose_decimals = _adjclose_decimals_for_path(path)
     max_abs_price_log_return = _max_abs_daily_price_log_return_for_path(path)
+    if "bybit_perpetual_contract_version" in frame.columns:
+        max_abs_price_log_return = float("inf")
 
     def num(name: str):
         if name in frame.columns:
@@ -1808,7 +1825,9 @@ def _prepare_symbol_frame(frame: Any, path: Path) -> Any:
 def _load_symbol_frame(path: Path) -> Any:
     if pq is None:
         raise RuntimeError("PyArrow is not available")
-    return _prepare_symbol_frame(pq.read_table(path), path)
+    from downloader.ohlcv_hot_tail import read_logical_parquet
+
+    return _prepare_symbol_frame(read_logical_parquet(path), path)
 
 
 def _coerce_arrow_numeric_column(table, name: str, rows: int) -> np.ndarray:
@@ -2178,7 +2197,9 @@ def _load_symbol_arrays_pyarrow(
     if pq is None:
         raise RuntimeError("PyArrow is not available")
 
-    table = pq.read_table(path)
+    from downloader.ohlcv_hot_tail import read_logical_parquet
+
+    table = read_logical_parquet(path).to_arrow()
     return _symbol_arrays_from_arrow_table(
         table,
         path,
@@ -2217,7 +2238,9 @@ def _load_symbol_arrays_pyarrow_tail(
     tradable_mode: str = "tradable",
     trading_volume_policy: str | bool | None = "auto",
 ) -> _SymbolPanelArrays:
-    table = _read_parquet_tail_table(path, tail_rows)
+    from downloader.ohlcv_hot_tail import read_logical_parquet
+
+    table = read_logical_parquet(path, tail_rows=tail_rows).to_arrow()
     return _symbol_arrays_from_arrow_table(
         table,
         path,
@@ -2248,6 +2271,7 @@ def _symbol_arrays_from_arrow_table(
             intraday_returns=empty_1d,
             daily_volumes=empty_1d,
             tradable_mask=empty_mask,
+            return_valuation_mask=empty_mask,
             can_buy_mask=empty_mask,
             can_sell_mask=empty_mask,
             day_trade_can_buy_open_mask=empty_mask,
@@ -2265,12 +2289,32 @@ def _symbol_arrays_from_arrow_table(
     price_decimals = _price_decimals_for_path(path)
     adjclose_decimals = _adjclose_decimals_for_path(path)
     max_abs_price_log_return = _max_abs_daily_price_log_return_for_path(path)
+    if "bybit_perpetual_contract_version" in table.column_names:
+        max_abs_price_log_return = float("inf")
     open_px = _round_half_up(col("open"), decimals=price_decimals)
     high_px = _round_half_up(col("max"), decimals=price_decimals)
     low_px = _round_half_up(col("min"), decimals=price_decimals)
     close_px = _round_half_up(col("close"), decimals=price_decimals)
+    execution_px = (
+        _round_half_up(col("execution_price"), decimals=price_decimals)
+        if "execution_price" in table.column_names
+        else close_px
+    )
     adjclose = _round_half_up(col("adjclose"), decimals=adjclose_decimals)
     volume = col("Trading_Volume") if "Trading_Volume" in table.column_names else np.full((rows,), np.nan, dtype=np.float64)
+    capacity_volume = (
+        col("execution_volume_equivalent")
+        if "execution_volume_equivalent" in table.column_names
+        else volume
+    )
+    raw_policy_tradable = (
+        col("policy_tradable") if "policy_tradable" in table.column_names else None
+    )
+    raw_execution_available = (
+        col("execution_available")
+        if "execution_available" in table.column_names
+        else None
+    )
     eligibility_column = next(
         (name for name in DAY_TRADE_ELIGIBILITY_COLUMNS if name in table.column_names),
         None,
@@ -2371,12 +2415,21 @@ def _symbol_arrays_from_arrow_table(
         [feature_map[name] for name in BASE_PANEL_FEATURE_COLUMNS]
     ).astype(np.float32, copy=False)
 
-    close_notna = ~np.isnan(close_px)
+    close_notna = np.isfinite(execution_px) & (execution_px > 0.0)
     if "Trading_Volume" in table.column_names:
         volume_missing = np.isnan(volume)
         tradable = close_notna & ((np.nan_to_num(volume, nan=0.0) > 0.0) | volume_missing)
     else:
         tradable = close_notna
+    if raw_policy_tradable is not None:
+        tradable &= np.isfinite(raw_policy_tradable) & (
+            raw_policy_tradable != 0.0
+        )
+    execution_available = close_notna.copy()
+    if raw_execution_available is not None:
+        execution_available &= np.isfinite(raw_execution_available) & (
+            raw_execution_available != 0.0
+        )
 
     valid_dates = ~np.isnat(dates)
     if not bool(valid_dates.all()):
@@ -2386,8 +2439,11 @@ def _symbol_arrays_from_arrow_table(
         open_px = open_px[valid_dates]
         intraday_return_co = intraday_return_co[valid_dates]
         close_px = close_px[valid_dates]
+        execution_px = execution_px[valid_dates]
         volume = volume[valid_dates]
+        capacity_volume = capacity_volume[valid_dates]
         tradable = tradable[valid_dates]
+        execution_available = execution_available[valid_dates]
         close_notna = close_notna[valid_dates]
         if day_trade_eligible is not None:
             day_trade_eligible = day_trade_eligible[valid_dates]
@@ -2417,8 +2473,8 @@ def _symbol_arrays_from_arrow_table(
             )
         )
     elif tradable_mode == "tradable":
-        can_buy_mask = tradable.copy()
-        can_sell_mask = tradable.copy()
+        can_buy_mask = execution_available.copy()
+        can_sell_mask = execution_available.copy()
         open_tradable = np.isfinite(open_px) & (open_px > 0.0)
         day_trade_can_buy_open_mask = open_tradable.copy()
         day_trade_can_sell_open_mask = open_tradable.copy()
@@ -2429,11 +2485,16 @@ def _symbol_arrays_from_arrow_table(
         dates=dates,
         features=features,
         returns_1d=return_1d.astype(np.float32, copy=False),
-        close_prices=close_px.astype(np.float32, copy=False),
+        close_prices=execution_px.astype(np.float32, copy=False),
         open_prices=open_px.astype(np.float32, copy=False),
         intraday_returns=intraday_return_co.astype(np.float32, copy=False),
-        daily_volumes=volume.astype(np.float32, copy=False),
+        daily_volumes=capacity_volume.astype(np.float32, copy=False),
         tradable_mask=tradable,
+        return_valuation_mask=(
+            execution_available.copy()
+            if raw_execution_available is not None
+            else tradable.copy()
+        ),
         can_buy_mask=np.asarray(can_buy_mask, dtype=bool),
         can_sell_mask=np.asarray(can_sell_mask, dtype=bool),
         day_trade_can_buy_open_mask=np.asarray(
@@ -2463,13 +2524,17 @@ def _load_symbol_arrays_polars_lazy(
     if pq is None:
         raise RuntimeError("PyArrow is not available")
 
-    frame = pl.from_arrow(pq.read_table(path, memory_map=True))
+    from downloader.ohlcv_hot_tail import read_logical_parquet
+
+    frame = read_logical_parquet(path)
     lazy = frame.lazy().sort("date")
     schema_names = set(frame.columns)
     _require_trading_volume_column(path, schema_names, trading_volume_policy)
     price_decimals = _price_decimals_for_path(path)
     adjclose_decimals = _adjclose_decimals_for_path(path)
     max_abs_price_log_return = _max_abs_daily_price_log_return_for_path(path)
+    if "bybit_perpetual_contract_version" in schema_names:
+        max_abs_price_log_return = float("inf")
 
     def num(name: str):
         if name in schema_names:
@@ -2487,7 +2552,18 @@ def _load_symbol_arrays_polars_lazy(
         _polars_round_half_up(num("min"), price_decimals).alias("_min"),
         _polars_round_half_up(num("close"), price_decimals).alias("_close"),
         _polars_round_half_up(num("adjclose"), adjclose_decimals).alias("_adjclose"),
+        _polars_round_half_up(
+            num("execution_price") if "execution_price" in schema_names else num("close"),
+            price_decimals,
+        ).alias("_execution_price"),
         num("Trading_Volume").alias("_volume"),
+        (
+            num("execution_volume_equivalent")
+            if "execution_volume_equivalent" in schema_names
+            else num("Trading_Volume")
+        ).alias("_capacity_volume"),
+        num("policy_tradable").alias("_policy_tradable"),
+        num("execution_available").alias("_execution_available"),
     ]
     if tradable_mode == "tw_limit_guard":
         price_columns.extend(
@@ -2513,7 +2589,11 @@ def _load_symbol_arrays_polars_lazy(
             .then(pl.lit(None, dtype=pl.Float64))
             .otherwise(return_1d)
         )
-    close_valid = _polars_not_nan_or_null(pl.col("_close"))
+    close_valid = (
+        _polars_not_nan_or_null(pl.col("_close"))
+        & _polars_not_nan_or_null(pl.col("_execution_price"))
+        & (pl.col("_execution_price") > 0.0)
+    )
     if "Trading_Volume" in schema_names:
         volume_missing = pl.col("_volume").is_null() | pl.col("_volume").is_nan().fill_null(False)
         tradable_expr = close_valid & (
@@ -2521,6 +2601,17 @@ def _load_symbol_arrays_polars_lazy(
         )
     else:
         tradable_expr = close_valid
+    if "policy_tradable" in schema_names:
+        tradable_expr = tradable_expr & (
+            pl.col("_policy_tradable").is_finite()
+            & (pl.col("_policy_tradable") != 0.0)
+        )
+    execution_available_expr = close_valid
+    if "execution_available" in schema_names:
+        execution_available_expr = execution_available_expr & (
+            pl.col("_execution_available").is_finite()
+            & (pl.col("_execution_available") != 0.0)
+        )
 
     lazy = lazy.with_columns(
         [
@@ -2590,11 +2681,12 @@ def _load_symbol_arrays_polars_lazy(
     selected_columns = [
         _polars_datetime_ns_expr(frame.schema, "date"),
         pl.col("_open").alias("open_px"),
-        pl.col("_close").alias("close_px"),
-        pl.col("_volume").alias("daily_volume"),
+        pl.col("_execution_price").alias("close_px"),
+        pl.col("_capacity_volume").alias("daily_volume"),
         pl.col("return_1d"),
         pl.col("intraday_return_co"),
         pl.col("tradable"),
+        execution_available_expr.alias("execution_available"),
         *[pl.col(name) for name in BASE_PANEL_FEATURE_COLUMNS],
     ]
     if eligibility_column is not None:
@@ -2622,6 +2714,7 @@ def _load_symbol_arrays_polars_lazy(
             intraday_returns=empty_1d,
             daily_volumes=empty_1d,
             tradable_mask=empty_mask,
+            return_valuation_mask=empty_mask,
             can_buy_mask=empty_mask,
             can_sell_mask=empty_mask,
             day_trade_can_buy_open_mask=empty_mask,
@@ -2648,6 +2741,9 @@ def _load_symbol_arrays_polars_lazy(
         else np.isfinite(raw_day_trade_eligible) & (raw_day_trade_eligible != 0.0)
     )
     tradable = out["tradable"].to_numpy().astype(bool, copy=False)
+    execution_available = out["execution_available"].to_numpy().astype(
+        bool, copy=False
+    )
     features = np.column_stack(
         [
             out[name].to_numpy().astype(np.float64, copy=False)
@@ -2666,6 +2762,7 @@ def _load_symbol_arrays_polars_lazy(
         close_px = close_px[valid_dates]
         daily_volume = daily_volume[valid_dates]
         tradable = tradable[valid_dates]
+        execution_available = execution_available[valid_dates]
         close_notna = close_notna[valid_dates]
         if day_trade_eligible is not None:
             day_trade_eligible = day_trade_eligible[valid_dates]
@@ -2694,8 +2791,8 @@ def _load_symbol_arrays_polars_lazy(
             )
         )
     elif tradable_mode == "tradable":
-        can_buy_mask = tradable.copy()
-        can_sell_mask = tradable.copy()
+        can_buy_mask = execution_available.copy()
+        can_sell_mask = execution_available.copy()
         open_tradable = np.isfinite(open_px) & (open_px > 0.0)
         day_trade_can_buy_open_mask = open_tradable.copy()
         day_trade_can_sell_open_mask = open_tradable.copy()
@@ -2712,6 +2809,12 @@ def _load_symbol_arrays_polars_lazy(
         intraday_returns=intraday_return_co.astype(np.float32, copy=False),
         daily_volumes=daily_volume.astype(np.float32, copy=False),
         tradable_mask=np.asarray(tradable, dtype=bool),
+        return_valuation_mask=np.asarray(
+            execution_available
+            if "execution_available" in schema_names
+            else tradable,
+            dtype=bool,
+        ),
         can_buy_mask=np.asarray(can_buy_mask, dtype=bool),
         can_sell_mask=np.asarray(can_sell_mask, dtype=bool),
         day_trade_can_buy_open_mask=np.asarray(
@@ -2872,6 +2975,11 @@ def _build_panel_from_symbol_arrays(
         item_features = item.features if all_valid else item.features[valid]
         item_dates = item.dates if all_valid else item.dates[valid]
         item_returns = item.returns_1d if all_valid else item.returns_1d[valid]
+        item_return_valuation = (
+            item.return_valuation_mask
+            if all_valid
+            else item.return_valuation_mask[valid]
+        )
         item_tradable = item.tradable_mask if all_valid else item.tradable_mask[valid]
         symbol_features = features[:, sym_idx, :]
         if num_base_features:
@@ -2913,7 +3021,7 @@ def _build_panel_from_symbol_arrays(
             valid_forward[:-1] = (
                 on_session[:-1]
                 & on_session[1:]
-                & item_tradable[1:]
+                & np.asarray(item_return_valuation, dtype=bool)[1:]
                 & (session_idx[1:] == session_idx[:-1] + 1)
             )
         masked_non_session_returns += int(
@@ -3794,7 +3902,14 @@ def load_cached_panel(
         f"{feature_shift_key}"
         f"panel_start_date={normalized_panel_start_date}"
     )
-    source_paths = [*parquet_paths, *security_metadata_paths]
+    hot_tail_paths = [
+        path.parent / HOT_TAIL_DIRNAME / path.name for path in parquet_paths
+    ]
+    source_paths = [
+        *parquet_paths,
+        *(path for path in hot_tail_paths if path.is_file()),
+        *security_metadata_paths,
+    ]
     if external_feature_path is not None:
         source_paths.append(external_feature_path)
     if corporate_action_paths is not None:
@@ -5165,7 +5280,14 @@ def build_panel(
         f"{feature_shift_key}"
         f"panel_start_date={normalized_panel_start_date}"
     )
-    source_paths = [*parquet_paths, *security_metadata_paths]
+    hot_tail_paths = [
+        path.parent / HOT_TAIL_DIRNAME / path.name for path in parquet_paths
+    ]
+    source_paths = [
+        *parquet_paths,
+        *(path for path in hot_tail_paths if path.is_file()),
+        *security_metadata_paths,
+    ]
     if external_feature_path is not None:
         source_paths.append(external_feature_path)
     if corporate_action_paths is not None:

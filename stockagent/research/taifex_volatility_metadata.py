@@ -88,6 +88,31 @@ def _expand_exposure_groups(
 _MODEL_STRATEGY_IDS: Final[tuple[str, ...]] = tuple(
     f"{MODEL_VARIANT_PREFIX}{model_id}" for model_id in VOLATILITY_MODEL_IDS
 )
+BS_DELTA_BAND_STRATEGY_IDS: Final[tuple[str, ...]] = (
+    "bs_delta_band_10",
+    "bs_delta_band_20",
+    "bs_delta_band_30",
+    "bs_delta_band_50",
+)
+BS_PARTIAL_DELTA_STRATEGY_IDS: Final[tuple[str, ...]] = (
+    "bs_partial_hedge_25",
+    "bs_partial_hedge_50",
+    "bs_partial_hedge_75",
+)
+BS_OVER_DELTA_STRATEGY_IDS: Final[tuple[str, ...]] = (
+    "bs_overhedge_125",
+    "bs_overhedge_150",
+)
+BS_GAMMA_PRICE_GRID_STRATEGY_IDS: Final[tuple[str, ...]] = (
+    "bs_gamma_price_grid_25",
+    "bs_gamma_price_grid_50",
+    "bs_gamma_price_grid_100",
+)
+BS_GAMMA_TIME_GRID_STRATEGY_IDS: Final[tuple[str, ...]] = (
+    "bs_gamma_time_grid_5m",
+    "bs_gamma_time_grid_15m",
+    "bs_gamma_time_grid_30m",
+)
 
 _DIRECTIONAL_EXPOSURE_BY_ID: Final[dict[str, str]] = _expand_exposure_groups(
     (
@@ -152,10 +177,11 @@ _DIRECTIONAL_EXPOSURE_BY_ID: Final[dict[str, str]] = _expand_exposure_groups(
             "hedged_neutral",
             (
                 *_MODEL_STRATEGY_IDS,
-                "bs_delta_band_20",
-                "bs_delta_band_30",
-                "bs_partial_hedge_50",
-                "bs_overhedge_125",
+                *BS_DELTA_BAND_STRATEGY_IDS,
+                *BS_PARTIAL_DELTA_STRATEGY_IDS,
+                *BS_OVER_DELTA_STRATEGY_IDS,
+                *BS_GAMMA_PRICE_GRID_STRATEGY_IDS,
+                *BS_GAMMA_TIME_GRID_STRATEGY_IDS,
                 "conversion",
                 "reversal",
                 PUT_CALL_PARITY_TX_STRATEGY_ID,
@@ -203,10 +229,11 @@ _VOLATILITY_EXPOSURE_BY_ID: Final[dict[str, str]] = _expand_exposure_groups(
                 "long_put_fan",
                 "long_wide_wings",
                 *_MODEL_STRATEGY_IDS,
-                "bs_delta_band_20",
-                "bs_delta_band_30",
-                "bs_partial_hedge_50",
-                "bs_overhedge_125",
+                *BS_DELTA_BAND_STRATEGY_IDS,
+                *BS_PARTIAL_DELTA_STRATEGY_IDS,
+                *BS_OVER_DELTA_STRATEGY_IDS,
+                *BS_GAMMA_PRICE_GRID_STRATEGY_IDS,
+                *BS_GAMMA_TIME_GRID_STRATEGY_IDS,
                 "protective_put_with_future",
                 "protective_call_with_future",
                 "call_ratio_backspread",
@@ -310,9 +337,11 @@ _HEDGE_TYPE_BY_ID: Final[dict[str, str]] = _expand_exposure_groups(
             ),
         ),
         ("dynamic_delta", _MODEL_STRATEGY_IDS),
-        ("delta_band", ("bs_delta_band_20", "bs_delta_band_30")),
-        ("partial_delta", ("bs_partial_hedge_50",)),
-        ("over_delta", ("bs_overhedge_125",)),
+        ("delta_band", BS_DELTA_BAND_STRATEGY_IDS),
+        ("partial_delta", BS_PARTIAL_DELTA_STRATEGY_IDS),
+        ("over_delta", BS_OVER_DELTA_STRATEGY_IDS),
+        ("price_grid_delta", BS_GAMMA_PRICE_GRID_STRATEGY_IDS),
+        ("time_grid_delta", BS_GAMMA_TIME_GRID_STRATEGY_IDS),
         (
             "directional_linear",
             ("underlying_hedge_future_long", "underlying_hedge_future_short"),
@@ -443,6 +472,14 @@ EXPOSURE_TAXONOMY: Final[dict[str, dict[str, dict[str, str]]]] = {
         "over_delta": {
             "label": "過度 Delta 避險",
             "definition": "執行超過完整 Delta 中性目標的期貨量。",
+        },
+        "price_grid_delta": {
+            "label": "點數網格 Gamma Scalping",
+            "definition": "標的自上次成功重平衡移動指定點數後，才重新計算並交易 Delta 中性期貨量。",
+        },
+        "time_grid_delta": {
+            "label": "時間網格 Gamma Scalping",
+            "definition": "按固定分鐘間隔重新計算並交易 Delta 中性期貨量。",
         },
         "directional_linear": {
             "label": "未避險線性部位",
@@ -811,13 +848,13 @@ _ROLLING_STRADDLE_LIVE_SPECS: Final[tuple[StrategySpec, ...]] = (
 _MODEL_LIVE_SPECS: Final[tuple[StrategySpec, ...]] = tuple(
     _live(
         f"{MODEL_VARIANT_PREFIX}{model_id}",
-        f"{VOLATILITY_MODEL_LABELS[model_id]} Delta Hedge",
+        f"{VOLATILITY_MODEL_LABELS[model_id]} Gamma Scalping",
         "model_gamma_scalping",
-        "模型避險",
-        "持有 ATM Straddle，使用即時 Bid/Ask IV 曲面估計 Delta，再以避險期貨調整。",
+        "Gamma Scalping／模型避險",
+        "持有正 Gamma 的 ATM Long Straddle，使用即時 Bid/Ask IV 曲面估計 Delta，再以避險期貨反向調整。",
         "ATM Straddle 以 best ask 建倉；曲面只讀決策時間以前已收到的 book。",
         "期貨每個日／夜盤在截止前平倉；選擇權持有至官方週結算。",
-        "模型名稱不等於完整隨機過程校準；代理模型的誤差與 hedge churn 都會反映在帳本。",
+        "Gamma scalping 只有已實現波動足以覆蓋 Theta、價差、稅費與模型誤差時才可能有利；模型名稱不等於完整隨機過程校準。",
         VOLATILITY_MODEL_IMPLEMENTATION[model_id],
         option_legs=_ATM_STRADDLE,
         hedge_policy=f"vol_model:{model_id}",
@@ -828,6 +865,20 @@ _MODEL_LIVE_SPECS: Final[tuple[StrategySpec, ...]] = tuple(
 
 
 _POLICY_LIVE_SPECS: Final[tuple[StrategySpec, ...]] = (
+    _live(
+        "bs_delta_band_10",
+        "BS Delta-band 0.10",
+        "delta_band_gamma_scalping",
+        "交易成本控制",
+        "只有淨 Delta 絕對值超過 0.10 才把 ATM Straddle 拉回 BS Delta-neutral。",
+        "ATM Straddle 建倉後，以因果 Bid/Ask 曲面計算 BS Delta。",
+        "期貨盤末歸零；選擇權週結算。",
+        "較緊的 band 對方向漂移反應快，但通常會增加價差、稅費與 hedge churn。",
+        "black_scholes_delta_band",
+        option_legs=_ATM_STRADDLE,
+        hedge_policy="bs_delta_band",
+        hedge_parameter=0.10,
+    ),
     _live(
         "bs_delta_band_20",
         "BS Delta-band 0.20",
@@ -857,6 +908,34 @@ _POLICY_LIVE_SPECS: Final[tuple[StrategySpec, ...]] = (
         hedge_parameter=0.30,
     ),
     _live(
+        "bs_delta_band_50",
+        "BS Delta-band 0.50",
+        "delta_band_gamma_scalping",
+        "交易成本控制",
+        "只有淨 Delta 絕對值超過 0.50 才避險，作為低換手的寬 no-trade zone。",
+        "ATM Straddle 建倉後，以因果 Bid/Ask 曲面計算 BS Delta。",
+        "期貨盤末歸零；選擇權週結算。",
+        "換手最低但允許較大的方向曝險，跳空時可能明顯偏離 Delta-neutral。",
+        "black_scholes_delta_band",
+        option_legs=_ATM_STRADDLE,
+        hedge_policy="bs_delta_band",
+        hedge_parameter=0.50,
+    ),
+    _live(
+        "bs_partial_hedge_25",
+        "BS 25% Partial Hedge",
+        "partial_delta_hedge",
+        "避險比例",
+        "只執行 BS 完整 Delta-neutral 目標的四分之一，保留較多方向曝險。",
+        "ATM Straddle 與因果 BS Delta；期貨目標乘 0.25 後才整數化。",
+        "期貨盤末歸零；選擇權週結算。",
+        "換手較少，但多數 Delta 風險仍留在帳本內。",
+        "black_scholes_scaled_delta",
+        option_legs=_ATM_STRADDLE,
+        hedge_policy="bs_delta_scale",
+        hedge_parameter=0.25,
+    ),
+    _live(
         "bs_partial_hedge_50",
         "BS 50% Partial Hedge",
         "partial_delta_hedge",
@@ -871,6 +950,20 @@ _POLICY_LIVE_SPECS: Final[tuple[StrategySpec, ...]] = (
         hedge_parameter=0.50,
     ),
     _live(
+        "bs_partial_hedge_75",
+        "BS 75% Partial Hedge",
+        "partial_delta_hedge",
+        "避險比例",
+        "執行 BS 完整 Delta-neutral 目標的四分之三，在換手與方向風險間取折衷。",
+        "ATM Straddle 與因果 BS Delta；期貨目標乘 0.75 後才整數化。",
+        "期貨盤末歸零；選擇權週結算。",
+        "仍有未避險 Delta，且整數口數會令實際比例偏離 75%。",
+        "black_scholes_scaled_delta",
+        option_legs=_ATM_STRADDLE,
+        hedge_policy="bs_delta_scale",
+        hedge_parameter=0.75,
+    ),
+    _live(
         "bs_overhedge_125",
         "BS 125% Over-hedge",
         "over_delta_hedge",
@@ -883,6 +976,20 @@ _POLICY_LIVE_SPECS: Final[tuple[StrategySpec, ...]] = (
         option_legs=_ATM_STRADDLE,
         hedge_policy="bs_delta_scale",
         hedge_parameter=1.25,
+    ),
+    _live(
+        "bs_overhedge_150",
+        "BS 150% Over-hedge",
+        "over_delta_hedge",
+        "避險比例",
+        "把 BS Delta-neutral 目標放大到 150%，刻意形成更大的反向 Delta 曝險。",
+        "ATM Straddle 與因果 BS Delta；期貨目標乘 1.50 後才整數化。",
+        "期貨盤末歸零；選擇權週結算。",
+        "會放大模型誤差、反向部位與換手成本，只適合作為壓力比較策略。",
+        "black_scholes_scaled_delta",
+        option_legs=_ATM_STRADDLE,
+        hedge_policy="bs_delta_scale",
+        hedge_parameter=1.50,
     ),
     _live(
         "underlying_hedge_future_long",
@@ -937,6 +1044,44 @@ _POLICY_LIVE_SPECS: Final[tuple[StrategySpec, ...]] = (
         option_legs=(("C", 0, 1),),
         hedge_policy="fixed_index_equivalent",
         hedge_parameter=-1.0,
+    ),
+)
+
+
+_GAMMA_TRIGGER_LIVE_SPECS: Final[tuple[StrategySpec, ...]] = (
+    *(
+        _live(
+            f"bs_gamma_price_grid_{points}",
+            f"BS Gamma Scalping {points} 點網格",
+            "price_grid_gamma_scalping",
+            "Gamma Scalping／點數觸發",
+            f"持有 ATM Long Straddle；TX forward 自同週期上次成功重平衡移動至少 {points} 點時，才重算 BS Delta 並調整期貨。",
+            "首次可計算時先建立 Delta 避險錨點；其後只使用決策前已收到的完整 Bid/Ask book 比較點數門檻。",
+            "期貨盤末歸零；選擇權持有至官方週結算；新週期重新建立錨點。",
+            "網格太小會增加換手，太大會留下方向風險；已實現波動仍須覆蓋 Theta、價差、稅費與模型誤差。",
+            "black_scholes_price_grid_gamma_scalping",
+            option_legs=_ATM_STRADDLE,
+            hedge_policy="bs_gamma_price_grid",
+            hedge_parameter=float(points),
+        )
+        for points in (25, 50, 100)
+    ),
+    *(
+        _live(
+            f"bs_gamma_time_grid_{minutes}m",
+            f"BS Gamma Scalping {minutes} 分鐘網格",
+            "time_grid_gamma_scalping",
+            "Gamma Scalping／時間觸發",
+            f"持有 ATM Long Straddle；同週期每滿 {minutes} 分鐘才重算 BS Delta 並調整期貨。",
+            "首次可計算時先建立 Delta 避險錨點；之後以每次成功重平衡的決策時間計算下一個因果觸發。",
+            "期貨盤末歸零；選擇權持有至官方週結算；新週期重新建立錨點。",
+            "固定時間間隔不會因跳空提前避險；短間隔通常增加成交成本，長間隔則增加方向漂移。",
+            "black_scholes_time_grid_gamma_scalping",
+            option_legs=_ATM_STRADDLE,
+            hedge_policy="bs_gamma_time_grid",
+            hedge_parameter=float(minutes),
+        )
+        for minutes in (5, 15, 30)
     ),
 )
 
@@ -1207,6 +1352,7 @@ LIVE_STRATEGY_SPECS: Final[tuple[StrategySpec, ...]] = (
     *_ROLLING_STRADDLE_LIVE_SPECS,
     *_MODEL_LIVE_SPECS,
     *_POLICY_LIVE_SPECS,
+    *_GAMMA_TRIGGER_LIVE_SPECS,
     *_MULTI_LEG_LIVE_SPECS,
 )
 STRATEGY_IDS: Final[tuple[str, ...]] = tuple(
@@ -1366,6 +1512,11 @@ for _classification_name, _classification in (
 
 
 __all__ = [
+    "BS_DELTA_BAND_STRATEGY_IDS",
+    "BS_GAMMA_PRICE_GRID_STRATEGY_IDS",
+    "BS_GAMMA_TIME_GRID_STRATEGY_IDS",
+    "BS_OVER_DELTA_STRATEGY_IDS",
+    "BS_PARTIAL_DELTA_STRATEGY_IDS",
     "CATALOG_EXPANSION_ENTRY_IMMEDIATE_LIVE",
     "CATALOG_EXPANSION_ENTRY_NEXT_CYCLE",
     "CATALOG_EXPANSION_ENTRY_POLICIES",

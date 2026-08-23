@@ -12,13 +12,10 @@ WorkingDirectory=@REPO_ROOT@
 Environment="HOME=@SERVICE_HOME@"
 Environment="PYTHONUNBUFFERED=1"
 ExecStart=/usr/bin/bash "@REPO_ROOT@/scripts/run_tw_public_0830_check.sh"
-ExecStartPost=/usr/bin/bash "@REPO_ROOT@/scripts/run_data_cache.sh" publish tw-public
 Nice=0
 CPUWeight=100
 IOWeight=100
 TimeoutStartSec=4h
-Restart=on-failure
-RestartSec=1min
 
 [Install]
 WantedBy=multi-user.target

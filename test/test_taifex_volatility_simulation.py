@@ -16,6 +16,8 @@ from stockagent.live.taifex_volatility_simulation import (
     TaifexVolatilitySimulation,
 )
 from stockagent.research.taifex_volatility_metadata import (
+    BS_GAMMA_PRICE_GRID_STRATEGY_IDS,
+    BS_GAMMA_TIME_GRID_STRATEGY_IDS,
     CLASSIC_VARIANT_ID,
     DYNAMIC_HEDGE_STRATEGY_IDS,
     MODEL_VARIANT_PREFIX,
@@ -655,6 +657,7 @@ def test_engine_does_not_open_from_stale_books(tmp_path: Path) -> None:
 
 def test_short_straddle_recapitalizes_next_trading_date_and_accumulates_capital(
     tmp_path: Path,
+    monkeypatch,
 ) -> None:
     engine = _engine(
         tmp_path,
@@ -662,7 +665,11 @@ def test_short_straddle_recapitalizes_next_trading_date_and_accumulates_capital(
         strategy_mode=STRATEGY_MODE_INTRADAY_FUTURES,
     )
     observed_at = datetime(2026, 8, 12, 10, 0, tzinfo=TAIPEI)
-    receive_ns = int(datetime.now(timezone.utc).timestamp() * 1e9)
+    receive_ns = int(observed_at.timestamp() * 1e9)
+    monkeypatch.setattr(
+        "stockagent.live.taifex_volatility_simulation.time.time_ns",
+        lambda: receive_ns + 1_000_000,
+    )
     _seed_surface_books(engine, observed_at=observed_at, receive_ns=receive_ns)
     engine.step(now=observed_at)
 
@@ -816,7 +823,7 @@ def test_complete_books_start_all_live_catalog_curves_without_margin_failure(
     _seed_surface_books(engine, observed_at=observed_at, receive_ns=receive_ns)
     engine.step(now=observed_at)
 
-    assert len(engine.state["strategies"]) == len(STRATEGY_IDS) == 58
+    assert len(engine.state["strategies"]) == len(STRATEGY_IDS) == 69
     for strategy_id in ("naked_short_call", "naked_short_put"):
         ledger = engine.state["strategies"][strategy_id]
         assert len(ledger["option_positions"]) == 1
@@ -1285,6 +1292,105 @@ def test_intraday_mode_late_starts_and_calibrates_once_per_minute(
     engine.close()
 
 
+@pytest.mark.parametrize(
+    (
+        "strategy_id",
+        "middle_offset_seconds",
+        "middle_forward",
+        "final_offset_seconds",
+        "final_forward",
+        "trigger_kind",
+    ),
+    (
+        (
+            BS_GAMMA_PRICE_GRID_STRATEGY_IDS[0],
+            60,
+            45_010.0,
+            120,
+            45_030.0,
+            "forward_point_grid",
+        ),
+        (
+            BS_GAMMA_TIME_GRID_STRATEGY_IDS[0],
+            240,
+            45_030.0,
+            300,
+            45_030.0,
+            "elapsed_minute_grid",
+        ),
+    ),
+)
+def test_gamma_scalping_grids_wait_for_causal_trigger_before_rehedging(
+    tmp_path: Path,
+    monkeypatch,
+    strategy_id: str,
+    middle_offset_seconds: int,
+    middle_forward: float,
+    final_offset_seconds: int,
+    final_forward: float,
+    trigger_kind: str,
+) -> None:
+    class ForwardSensitiveFit:
+        def straddle_delta(self, *, forward: float, **_kwargs) -> float:
+            return 0.8 if forward < 45_025.0 else -0.8
+
+        def diagnostics(self) -> dict[str, object]:
+            return {"test_forward_sensitive_delta": True}
+
+    monkeypatch.setattr(
+        "stockagent.live.taifex_volatility_simulation.fit_volatility_model",
+        lambda *_args, **_kwargs: ForwardSensitiveFit(),
+    )
+    engine = _engine(
+        tmp_path,
+        bootstrap_after=date(2026, 8, 12),
+        strategy_mode=STRATEGY_MODE_INTRADAY_FUTURES,
+        active_strategy_ids=(strategy_id,),
+    )
+    opened_at = datetime(2026, 8, 12, 10, 0, tzinfo=TAIPEI)
+
+    def calibrate(offset_seconds: int, forward: float) -> None:
+        observed_at = opened_at + timedelta(seconds=offset_seconds)
+        receive_ns = int(observed_at.timestamp() * 1e9)
+        _seed_surface_books(
+            engine,
+            observed_at=observed_at,
+            receive_ns=receive_ns,
+            forward=forward,
+        )
+        decision_ns = receive_ns + 1_000_000
+        if engine.state.get("active_cycle") is None:
+            engine._maybe_open_cycle(observed_at, decision_ns)
+        engine._maybe_calibrate(observed_at, decision_ns)
+
+    calibrate(0, 45_000.0)
+    ledger = engine.state["strategies"][strategy_id]
+    assert ledger["futures_position"] == -1
+    assert ledger["last_dynamic_hedge_forward_mid"] == 45_000.0
+
+    calibrate(middle_offset_seconds, middle_forward)
+    assert ledger["futures_position"] == -1
+    assert ledger["last_dynamic_hedge_forward_mid"] == 45_000.0
+
+    calibrate(final_offset_seconds, final_forward)
+    assert ledger["futures_position"] == 1
+    assert ledger["last_dynamic_hedge_forward_mid"] == final_forward
+
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "calibrations.jsonl").read_text().splitlines()
+    ]
+    assert [row["hedge_trigger_due"] for row in rows] == [True, False, True]
+    assert {row["hedge_trigger_kind"] for row in rows} == {trigger_kind}
+    trades = [
+        json.loads(line)
+        for line in (tmp_path / "ideal_ledger.jsonl").read_text().splitlines()
+        if json.loads(line)["instrument_type"] == "future"
+    ]
+    assert [row["delta_contracts"] for row in trades] == [-1, 2]
+    engine.close()
+
+
 def test_intraday_sparse_iv_surface_waits_without_blocking_engine(
     tmp_path: Path,
     monkeypatch,
@@ -1607,7 +1713,10 @@ def test_intraday_one_lot_uses_tmf_granularity_and_user_fee(
     assert {row["book_receive_ts_ns"] for row in dynamic_futures} == {receive_ns}
     assert {row["product"] for row in dynamic_futures} == {"TMF"}
     assert {row["multiplier_twd_per_point"] for row in dynamic_futures} == {10.0}
-    assert {row["fixed_fee_twd"] for row in dynamic_futures} == {16.0}
+    assert all(
+        row["fixed_fee_twd"] == abs(row["delta_contracts"]) * 16.0
+        for row in dynamic_futures
+    )
     assert any(
         engine.state["strategies"][f"{MODEL_VARIANT_PREFIX}{model_id}"][
             "futures_position"
@@ -1672,6 +1781,48 @@ def test_flat_legacy_state_migrates_to_intraday_execution_contract(
     ]
     assert events[-1]["event"] == "execution_contract_migrated"
     assert events[-1]["reason"] == "flat_state_safe_migration"
+    migrated.close()
+
+
+def test_v11_state_migrates_gamma_scalping_trigger_anchors(
+    tmp_path: Path,
+) -> None:
+    original = _engine(
+        tmp_path,
+        bootstrap_after=date(2026, 8, 12),
+        strategy_mode=STRATEGY_MODE_INTRADAY_FUTURES,
+    )
+    original.close()
+    state_path = tmp_path / "state.json"
+    payload = json.loads(state_path.read_text(encoding="utf-8"))
+    payload["execution_contract_version"] = 11
+    for ledger in payload["strategies"].values():
+        for key in (
+            "last_dynamic_hedge_cycle_id",
+            "last_dynamic_hedge_session_id",
+            "last_dynamic_hedge_decision_ts_ns",
+            "last_dynamic_hedge_forward_mid",
+        ):
+            ledger.pop(key, None)
+    state_path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+
+    migrated = _engine(
+        tmp_path,
+        bootstrap_after=date(2026, 8, 12),
+        strategy_mode=STRATEGY_MODE_INTRADAY_FUTURES,
+    )
+    assert migrated.state["execution_contract_version"] == EXECUTION_CONTRACT_VERSION
+    for ledger in migrated.state["strategies"].values():
+        assert ledger["last_dynamic_hedge_cycle_id"] is None
+        assert ledger["last_dynamic_hedge_session_id"] is None
+        assert ledger["last_dynamic_hedge_decision_ts_ns"] is None
+        assert ledger["last_dynamic_hedge_forward_mid"] is None
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "events.jsonl").read_text().splitlines()
+    ]
+    assert events[-1]["event"] == "execution_contract_migrated"
+    assert events[-1]["reason"] == "gamma_scalping_trigger_state_migration"
     migrated.close()
 
 

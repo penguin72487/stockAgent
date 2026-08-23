@@ -365,6 +365,17 @@ DEFAULT_UNSPECIFIED_REQUESTS_PER_SECOND = 10.0
 
 
 PROVIDER_RATE_LIMITS: dict[str, ProviderRateLimit] = {
+    "fred_api": ProviderRateLimit(
+        provider="fred_api",
+        requests=2,
+        seconds=1,
+        basis=(
+            "OpenBB FRED provider safety ceiling; FRED documents HTTP 429 "
+            "throttling but no public numeric limit"
+        ),
+        source_url="https://fred.stlouisfed.org/docs/api/fred/errors.html",
+        note="Direct FRED API v2 requests share this process-wide limiter.",
+    ),
     "okx_history_candles": ProviderRateLimit(
         provider="okx_history_candles",
         requests=20,

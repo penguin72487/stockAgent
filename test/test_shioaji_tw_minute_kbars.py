@@ -18,6 +18,7 @@ from downloader.download_shioaji_tw_minute_kbars import (
     completed_symbol_manifest_result,
     contract_for_stock_symbol,
     minute_chunk_paths,
+    minute_receipt_valid,
     query_minute_chunk,
     restore_extended_tail_from_archived_manifest,
     select_universe,
@@ -27,6 +28,7 @@ from downloader.download_shioaji_tw_minute_kbars import (
 from scripts.audit_shioaji_tw_minute_dataset import audit_frame
 from scripts.build_shioaji_tw_minute_dataset import (
     MODEL_FEATURE_COLUMNS,
+    _available_collection_symbols,
     _feature_statistics,
     _validate_collection_gate,
     build_research_frame,
@@ -301,9 +303,28 @@ def test_research_gate_allows_audited_source_gaps_but_rejects_failures(
     )
     path.write_text(json.dumps(base), encoding="utf-8")
     with pytest.raises(RuntimeError, match="not research-ready"):
-        _validate_collection_gate(
-            path, selected_symbols=[], subset_requested=False
-        )
+        _validate_collection_gate(path, selected_symbols=[], subset_requested=False)
+
+
+def test_research_build_uses_terminal_report_instead_of_stale_manifests(
+    tmp_path: Path,
+) -> None:
+    report = tmp_path / "download_report.csv"
+    report.write_text(
+        "symbol,status\n0050,complete\n2330,complete_with_source_gaps\n"
+        "4130,contract_unavailable\n",
+        encoding="utf-8",
+    )
+    summary_path = tmp_path / "download_summary.json"
+    payload = {
+        "report_path": str(report),
+        "selected_symbols": 3,
+        "complete_symbols": 1,
+        "complete_with_source_gap_symbols": 1,
+        "contract_unavailable_symbols": 1,
+    }
+
+    assert _available_collection_symbols(summary_path, payload) == {"0050", "2330"}
 
 
 def test_account_wide_rate_limiter_is_shared_across_processes() -> None:
@@ -457,6 +478,98 @@ def test_sealed_manifest_is_a_fast_restart_checkpoint(tmp_path: Path) -> None:
             simulation=True,
         )
         is None
+    )
+
+
+def test_sealed_manifest_reopens_when_official_session_advances(tmp_path: Path) -> None:
+    row = UniverseRow("2330", "台積電", "twse", "stock", Path("2330_features.parquet"))
+    chunks = [(date(2026, 7, 1), date(2026, 7, 25))]
+    data_path, receipt_path = minute_chunk_paths(tmp_path, row.symbol, *chunks[0])
+    data_path.parent.mkdir(parents=True)
+    data_path.write_bytes(b"sealed parquet placeholder")
+    receipt_path.write_text("{}\n", encoding="utf-8")
+    manifest_path = tmp_path / "symbols" / "2330.manifest.json"
+    manifest_path.parent.mkdir(parents=True)
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "source": "shioaji_kbars_1m",
+                "storage_frequency": "minute",
+                "simulation": True,
+                "symbol": "2330",
+                "requested_start": "2026-07-01",
+                "requested_end": "2026-07-25",
+                "minute_rows": 100,
+                "sessions": 1,
+                "first_date": "2026-07-24",
+                "last_date": "2026-07-24",
+                "terminal_coverage_dates": ["2026-07-24"],
+                "chunks": [
+                    {
+                        "start_date": "2026-07-01",
+                        "end_date": "2026-07-25",
+                        "status": "ok",
+                        "rows": 100,
+                        "data_path": str(data_path),
+                        "data_sha256": "already-verified",
+                        "receipt_path": str(receipt_path),
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert (
+        completed_symbol_manifest_result(
+            tmp_path,
+            row,
+            chunks,
+            requested_start=date(2026, 7, 1),
+            requested_end=date(2026, 7, 25),
+            simulation=True,
+            expected_dates={date(2026, 7, 24), date(2026, 7, 25)},
+        )
+        is None
+    )
+
+
+def test_minute_receipt_must_cover_newly_official_dates(tmp_path: Path) -> None:
+    receipt_path = tmp_path / "2330.receipt.json"
+    receipt_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "source": "shioaji_kbars_1m",
+                "storage_frequency": "minute",
+                "simulation": True,
+                "symbol": "2330",
+                "start_date": "2026-07-24",
+                "end_date": "2026-07-25",
+                "status": "empty",
+                "rows": 0,
+                "returned_dates": [],
+                "source_gap_dates": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert minute_receipt_valid(
+        receipt_path,
+        symbol="2330",
+        start=date(2026, 7, 24),
+        end=date(2026, 7, 25),
+        simulation=True,
+    )
+    assert not minute_receipt_valid(
+        receipt_path,
+        symbol="2330",
+        start=date(2026, 7, 24),
+        end=date(2026, 7, 25),
+        simulation=True,
+        required_dates={date(2026, 7, 25)},
     )
 
 
@@ -619,9 +732,7 @@ def test_query_drops_one_sided_corrections_and_pre_lifecycle_rows() -> None:
                 "Amount": [37_080_000.0, 18_100_000.0, -10.0, 0.0, 1_010_000.0],
             }
 
-    row = UniverseRow(
-        "3597", "映興", "tpex", "stock", Path("3597_features.parquet")
-    )
+    row = UniverseRow("3597", "映興", "tpex", "stock", Path("3597_features.parquet"))
     frame, query_audit = query_minute_chunk(
         FakeAPI(),
         object(),
@@ -638,6 +749,50 @@ def test_query_drops_one_sided_corrections_and_pre_lifecycle_rows() -> None:
     assert frame["ts"].to_list() == [datetime(2026, 7, 24, 9, 3)]
     assert query_audit["outside_reference_date_rows_dropped"] == 2
     assert query_audit["negative_correction_rows_dropped"] == 2
+    assert query_audit["source_gap_dates"] == []
+
+
+def test_query_retains_authorized_publication_tail_session() -> None:
+    provisional_date = TRADE_DATE + timedelta(days=3)
+
+    class FakeAPI:
+        def kbars(self, **_: object) -> dict[str, list[object]]:
+            return {
+                "ts": [
+                    datetime.combine(TRADE_DATE, datetime.min.time()).replace(
+                        hour=9, minute=1
+                    ),
+                    datetime.combine(provisional_date, datetime.min.time()).replace(
+                        hour=9, minute=1
+                    ),
+                ],
+                "Open": [100.0, 101.0],
+                "High": [100.0, 101.0],
+                "Low": [100.0, 101.0],
+                "Close": [100.0, 101.0],
+                "Volume": [10, 20],
+                "Amount": [1_000_000.0, 2_020_000.0],
+            }
+
+    row = UniverseRow(
+        "0051", "元大中型100", "twse", "etf", Path("0051_features.parquet")
+    )
+    frame, query_audit = query_minute_chunk(
+        FakeAPI(),
+        object(),
+        row,
+        contract_unit=1_000.0,
+        start=TRADE_DATE,
+        end=provisional_date,
+        timeout_ms=30_000,
+        retries=0,
+        retry_backoff=0.0,
+        expected_dates={TRADE_DATE},
+        provisional_dates={provisional_date},
+    )
+
+    assert frame["date"].to_list() == [TRADE_DATE, provisional_date]
+    assert query_audit["outside_reference_date_rows_dropped"] == 0
     assert query_audit["source_gap_dates"] == []
 
 
@@ -704,9 +859,7 @@ def test_query_single_day_fallback_records_persistent_source_gap() -> None:
 def test_delisted_contract_extension_repacks_covered_archived_tail(
     tmp_path: Path,
 ) -> None:
-    row = UniverseRow(
-        "4130", "健亞", "tpex", "stock", Path("4130_features.parquet")
-    )
+    row = UniverseRow("4130", "健亞", "tpex", "stock", Path("4130_features.parquet"))
     root = tmp_path / "minute"
     old_start = date(2026, 7, 9)
     old_end = date(2026, 7, 27)
@@ -733,7 +886,9 @@ def test_delisted_contract_extension_repacks_covered_archived_tail(
                         "end_date": old_end.isoformat(),
                         "status": "ok",
                         "data_path": str(old_path),
-                        "data_sha256": hashlib.sha256(old_path.read_bytes()).hexdigest(),
+                        "data_sha256": hashlib.sha256(
+                            old_path.read_bytes()
+                        ).hexdigest(),
                         "source_gap_dates": [],
                     }
                 ],

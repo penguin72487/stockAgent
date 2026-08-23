@@ -15,11 +15,13 @@ from __future__ import annotations
 import csv
 from dataclasses import dataclass
 from datetime import date, datetime, time, timezone
+import hashlib
 import json
 import math
 import os
 from pathlib import Path
 from typing import Any, Final, Mapping, Sequence
+import uuid
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -40,6 +42,10 @@ from stockagent.data.tw_index_futures import (
 )
 from stockagent.data.tw_price_rules import limit_price_numpy, move_price_ticks_numpy
 from stockagent.live.quote_provider import PriceSnapshot
+from stockagent.live.tw_day_trade_service_sync import (
+    SERVICE_SYNC_FILENAME,
+    SERVICE_SYNC_SCHEMA_VERSION,
+)
 from stockagent.research.taifex_capital_returns import taifex_initial_margin_twd
 from stockagent.research.taifex_transaction_tax import (
     stock_index_futures_tax_rate,
@@ -59,9 +65,13 @@ SESSION_CLOSE: Final[time] = time(13, 30)
 MINUTE_VOLUME_PARTICIPATION: Final[float] = 0.50
 ENTRY_FILL_POLICY_CAUSAL_BOOK: Final[str] = "causal_best_quote"
 ENTRY_FILL_POLICY_SYNTHETIC_OPEN_TICK: Final[str] = "synthetic_open_tick"
+ENTRY_FILL_POLICY_CAUSAL_BOOK_ELSE_OPEN_TICK: Final[str] = (
+    "causal_best_quote_else_adverse_open_tick"
+)
 ENTRY_FILL_POLICIES: Final[frozenset[str]] = frozenset(
     {
         ENTRY_FILL_POLICY_CAUSAL_BOOK,
+        ENTRY_FILL_POLICY_CAUSAL_BOOK_ELSE_OPEN_TICK,
         ENTRY_FILL_POLICY_SYNTHETIC_OPEN_TICK,
     }
 )
@@ -356,11 +366,16 @@ def _prepare_entry_plan(
     synthetic_open_fill = (
         spec.entry_fill_policy == ENTRY_FILL_POLICY_SYNTHETIC_OPEN_TICK
     )
+    synthetic_fallback_fill = bool(
+        spec.entry_fill_policy == ENTRY_FILL_POLICY_CAUSAL_BOOK_ELSE_OPEN_TICK
+        and quote_values.get("entry_price_is_synthetic_fallback") is True
+    )
+    synthetic_entry_fill = synthetic_open_fill or synthetic_fallback_fill
     entry_price = _finite(quote_values.get("ask" if side == "long" else "bid"))
     quote_at = _parse_timestamp(quote_values.get("quote_at"))
     upper = _finite(quote_values.get("upper_limit"))
     lower = _finite(quote_values.get("lower_limit"))
-    if synthetic_open_fill:
+    if synthetic_entry_fill:
         entry_price = _synthetic_open_tick_entry_price(
             sizing_price,
             side=side,
@@ -409,17 +424,24 @@ def _prepare_entry_plan(
         if entry_price is None:
             status, reason = (
                 ("blocked", "synthetic_open_tick_price_unavailable")
-                if synthetic_open_fill
+                if synthetic_entry_fill
                 else ("blocked", "no_executable_best_quote")
             )
         elif upper is None or lower is None:
             status, reason = "blocked", "price_limit_unavailable"
-        elif synthetic_open_fill:
-            # User-selected paper convention: every otherwise legal whole-lot
-            # request is filled at the observed session open moved one adverse
-            # tick.  Market depth is intentionally not claimed or inferred.
+        elif synthetic_entry_fill:
+            # Explicit paper fallback: every otherwise legal whole-lot request
+            # is filled at the observed session open moved one adverse tick.
+            # Market depth is intentionally not claimed or inferred.  The
+            # hybrid policy is restricted to a separately labelled historical
+            # counterfactual rebuild; the active runner never enables it.
             filled_shares = requested_shares
-            status, reason = "forced_synthetic_fill", "synthetic_open_tick_fill"
+            status = "forced_synthetic_fill"
+            reason = (
+                "synthetic_adverse_open_tick_fallback_fill"
+                if synthetic_fallback_fill
+                else "synthetic_open_tick_fill"
+            )
         elif quote_at is None or (
             quote_at < signal_at if allow_quote_at_signal else quote_at <= signal_at
         ):
@@ -477,7 +499,10 @@ def _prepare_entry_plan(
         "minute_kbar_capacity_shares": minute_kbar_capacity_shares,
         "entry_fill_policy": spec.entry_fill_policy,
         "entry_price_offset_ticks": int(spec.entry_price_offset_ticks),
-        "synthetic_fill": synthetic_open_fill and filled_shares > 0,
+        "entry_price_source": quote_values.get("entry_price_source")
+        or quote_values.get("source"),
+        "synthetic_fill": synthetic_entry_fill and filled_shares > 0,
+        "synthetic_fallback_fill": synthetic_fallback_fill and filled_shares > 0,
     }
 
 
@@ -809,6 +834,7 @@ class TwDayTradeSimulationEngine:
         self.state_dir = Path(state_dir)
         self.state_path = self.state_dir / "state.json"
         self.status_path = self.state_dir / "status.json"
+        self.service_sync_path = self.state_dir / SERVICE_SYNC_FILENAME
         self.positions_path = self.state_dir / "positions.json"
         self.position_history_dir = self.state_dir / "position_history"
         self.signals_path = self.state_dir / "signals.jsonl"
@@ -825,6 +851,7 @@ class TwDayTradeSimulationEngine:
         self._corporate_actions_by_symbol: dict[str, list[dict[str, Any]]] = {}
         self._corporate_action_load_error: str | None = None
         self._corporate_action_coverage_end: date | None = None
+        self._engine_run_id = uuid.uuid4().hex
         self.state = self._load_state()
         tx_benchmark_migrated = self._migrate_tx_continuous_benchmark_contract()
         self._reconcile_daily_duplicate_signal_ids()
@@ -1880,8 +1907,15 @@ class TwDayTradeSimulationEngine:
         current_eligibility_coverage: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> None:
         observed = _now_taipei(now)
+        enabled_markets = [str(spec.market) for spec in specs]
+        self.state["enabled_markets"] = enabled_markets
+        enabled = set(enabled_markets)
+        for market, existing in (self.state.get("modes") or {}).items():
+            if isinstance(existing, dict):
+                existing["configured_enabled"] = str(market) in enabled
         for spec in specs:
             mode = self._mode(spec)
+            mode["configured_enabled"] = True
             checkpoint = Path(spec.checkpoint_path) if spec.checkpoint_path else None
             checkpoint_ready = bool(checkpoint and checkpoint.is_file())
             mode["checkpoint_ready"] = checkpoint_ready
@@ -2317,12 +2351,23 @@ class TwDayTradeSimulationEngine:
                 raise ValueError(
                     "counterfactual open replay requires simulation_replay=true"
                 )
-            if str(summary.get("entry_fill_contract") or "") != (
+            replay_fill_contract = str(summary.get("entry_fill_contract") or "")
+            required_replay_fill_contract = (
                 "retrospective_actual_session_open_price_counterfactual"
-            ):
+                if spec.entry_fill_policy == ENTRY_FILL_POLICY_SYNTHETIC_OPEN_TICK
+                else (
+                    "retrospective_historical_best_quote_else_adverse_open_tick_counterfactual"
+                    if spec.entry_fill_policy
+                    == ENTRY_FILL_POLICY_CAUSAL_BOOK_ELSE_OPEN_TICK
+                    else "retrospective_observed_best_quote_counterfactual"
+                )
+            )
+            if replay_fill_contract != required_replay_fill_contract:
                 raise ValueError(
-                    "counterfactual open replay requires the retrospective "
-                    "session-open fill contract"
+                    "counterfactual replay entry contract mismatch: "
+                    f"policy={spec.entry_fill_policy!r} requires "
+                    f"{required_replay_fill_contract!r}, got "
+                    f"{replay_fill_contract!r}"
                 )
             if wall_time != ENTRY_GATE:
                 raise ValueError(
@@ -2497,6 +2542,7 @@ class TwDayTradeSimulationEngine:
         mode["entry_fill_policy"] = spec.entry_fill_policy
         mode["entry_price_offset_ticks"] = int(spec.entry_price_offset_ticks)
         mode["entry_fill_is_synthetic"] = bool(synthetic_open_fill)
+        mode["entry_fill_has_synthetic_fallback"] = False
         mode.pop("execution_projection", None)
         mode["positions"] = {}
         mode["entry_completed_at"] = observed.isoformat(timespec="seconds")
@@ -2544,6 +2590,7 @@ class TwDayTradeSimulationEngine:
             filled_shares = int(plan["filled_shares"])
             top_book_capacity_shares = int(plan["top_book_capacity_shares"])
             minute_kbar_capacity_shares = int(plan["minute_kbar_capacity_shares"])
+            entry_price_source = plan["entry_price_source"]
             offset_ticks = int(spec.price_limit_offset_ticks)
             filled_weight = (
                 (1.0 if side == "long" else -1.0)
@@ -2584,6 +2631,7 @@ class TwDayTradeSimulationEngine:
                 "status": status,
                 "reason": reason,
                 "quote_at": quote.get("quote_at"),
+                "historical_source_quote_at": quote.get("historical_source_quote_at"),
                 "bid": quote.get("bid"),
                 "ask": quote.get("ask"),
                 "bid_volume_lots": quote.get("bid_volume"),
@@ -2599,7 +2647,9 @@ class TwDayTradeSimulationEngine:
                 "counterfactual_open_replay": bool(counterfactual_open_replay),
                 "entry_fill_policy": plan["entry_fill_policy"],
                 "entry_price_offset_ticks": plan["entry_price_offset_ticks"],
+                "entry_price_source": entry_price_source,
                 "synthetic_fill": bool(plan["synthetic_fill"]),
+                "synthetic_fallback_fill": bool(plan["synthetic_fallback_fill"]),
             }
             signal_records.append(signal_record)
             counts[status] = counts.get(status, 0) + 1
@@ -2660,6 +2710,7 @@ class TwDayTradeSimulationEngine:
                 "entry_order_id": entry_order_id,
                 "entry_at": observed.isoformat(timespec="seconds"),
                 "entry_quote_at": quote.get("quote_at"),
+                "historical_entry_quote_at": quote.get("historical_source_quote_at"),
                 "entry_price": entry_price,
                 "sizing_open_price": sizing_price,
                 "entry_fee_twd": entry_fee,
@@ -2706,6 +2757,8 @@ class TwDayTradeSimulationEngine:
                 "entry_fill_policy": plan["entry_fill_policy"],
                 "entry_price_offset_ticks": plan["entry_price_offset_ticks"],
                 "entry_fill_is_synthetic": bool(plan["synthetic_fill"]),
+                "entry_price_source": entry_price_source,
+                "synthetic_fallback_fill": bool(plan["synthetic_fallback_fill"]),
             }
             mode["positions"][position_id] = position
             mode["cumulative_commission_rebate_accrued_twd"] = (
@@ -2740,6 +2793,11 @@ class TwDayTradeSimulationEngine:
                         0, requested_shares - filled_shares
                     ),
                     "synthetic_fill": bool(plan["synthetic_fill"]),
+                    "synthetic_fallback_fill": bool(plan["synthetic_fallback_fill"]),
+                    "entry_price_source": entry_price_source,
+                    "historical_source_quote_at": quote.get(
+                        "historical_source_quote_at"
+                    ),
                 }
             )
             fill_records.append(
@@ -2749,6 +2807,9 @@ class TwDayTradeSimulationEngine:
                     "purpose": "entry",
                     "fill_at": observed.isoformat(timespec="seconds"),
                     "quote_at": quote.get("quote_at"),
+                    "historical_source_quote_at": quote.get(
+                        "historical_source_quote_at"
+                    ),
                     "quantity": filled_shares,
                     "price": entry_price,
                     "fee_and_tax_twd": entry_fee,
@@ -2759,6 +2820,8 @@ class TwDayTradeSimulationEngine:
                     "simulation_replay": bool(mode.get("simulation_replay")),
                     "replay_basis": mode.get("replay_basis"),
                     "synthetic_fill": bool(plan["synthetic_fill"]),
+                    "synthetic_fallback_fill": bool(plan["synthetic_fallback_fill"]),
+                    "entry_price_source": entry_price_source,
                 }
             )
             for purpose, order_type, price, order_status in (
@@ -2793,6 +2856,14 @@ class TwDayTradeSimulationEngine:
         entry_filled_shares = sum(int(plan.get("filled_shares") or 0) for plan in plans)
         entry_unfilled_shares = max(0, entry_requested_shares - entry_filled_shares)
         entry_fill_count = len(fill_records)
+        entry_best_quote_fill_count = sum(
+            int(plan.get("filled_shares") or 0) > 0
+            and not bool(plan.get("synthetic_fill"))
+            for plan in plans
+        )
+        entry_synthetic_fallback_fill_count = sum(
+            bool(plan.get("synthetic_fallback_fill")) for plan in plans
+        )
         entry_fill_outcome = (
             "filled"
             if entry_fill_count and entry_unfilled_shares == 0
@@ -2808,6 +2879,14 @@ class TwDayTradeSimulationEngine:
         mode["entry_filled_shares"] = entry_filled_shares
         mode["entry_unfilled_shares"] = entry_unfilled_shares
         mode["entry_fill_outcome"] = entry_fill_outcome
+        mode["entry_best_quote_fill_count"] = entry_best_quote_fill_count
+        mode["entry_synthetic_fallback_fill_count"] = (
+            entry_synthetic_fallback_fill_count
+        )
+        mode["entry_fill_has_synthetic_fallback"] = bool(
+            entry_synthetic_fallback_fill_count
+        )
+        mode["entry_fill_is_synthetic"] = bool(entry_synthetic_fallback_fill_count)
 
         # One signal is one logical append transaction per ledger. This keeps
         # every row durable before state.json points at the accepted signal,
@@ -2843,7 +2922,9 @@ class TwDayTradeSimulationEngine:
             entry_fill_outcome=entry_fill_outcome,
             entry_fill_policy=spec.entry_fill_policy,
             entry_price_offset_ticks=int(spec.entry_price_offset_ticks),
-            entry_fill_is_synthetic=bool(synthetic_open_fill),
+            entry_fill_is_synthetic=bool(entry_synthetic_fallback_fill_count),
+            entry_best_quote_fill_count=entry_best_quote_fill_count,
+            entry_synthetic_fallback_fill_count=(entry_synthetic_fallback_fill_count),
             simulation_replay=bool(mode.get("simulation_replay")),
             replay_basis=mode.get("replay_basis"),
             source_signal_at=source_signal_at.isoformat(timespec="seconds"),
@@ -3699,13 +3780,62 @@ class TwDayTradeSimulationEngine:
 
     def _persist(self, now: datetime | None = None) -> None:
         observed = _now_taipei(now)
+        revision = int(self.state.get("state_revision") or 0) + 1
+        configured_markets = self.state.get("enabled_markets")
+        active_markets = [
+            str(market)
+            for market in (
+                configured_markets
+                if isinstance(configured_markets, list)
+                else sorted((self.state.get("modes") or {}).keys())
+            )
+        ]
+        material_projection = {
+            "enabled_markets": active_markets,
+            "modes": {
+                market: {
+                    key: value
+                    for key, value in (
+                        self.state.get("modes", {}).get(market) or {}
+                    ).items()
+                    if key not in {"positions", "processed_signal_ids"}
+                }
+                for market in active_markets
+            },
+            "benchmarks": self.state.get("benchmarks") or {},
+        }
+        material_fingerprint = hashlib.sha256(
+            json.dumps(
+                material_projection,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
+        content_revision = int(self.state.get("dashboard_content_revision") or 0)
+        if material_fingerprint != self.state.get("dashboard_content_fingerprint"):
+            content_revision += 1
+        self.state["dashboard_content_revision"] = content_revision
+        self.state["dashboard_content_fingerprint"] = material_fingerprint
+        self.state["state_revision"] = revision
+        self.state["engine_run_id"] = self._engine_run_id
         self.state["updated_at"] = observed.isoformat(timespec="seconds")
         _atomic_json(self.state_path, self.state)
-        mode_rows = list(self.state.get("modes", {}).values())
+        enabled_markets = active_markets
+        all_modes = self.state.get("modes") or {}
+        mode_rows = [
+            all_modes[market]
+            for market in enabled_markets
+            if isinstance(all_modes.get(market), Mapping)
+        ]
         _atomic_json(
             self.positions_path,
             {
                 "schema_version": 1,
+                "state_revision": revision,
+                "content_revision": content_revision,
+                "engine_run_id": self._engine_run_id,
                 "generated_at": observed.isoformat(timespec="seconds"),
                 "simulation_only": True,
                 "production_order_possible": False,
@@ -3772,6 +3902,9 @@ class TwDayTradeSimulationEngine:
             self.status_path,
             {
                 "schema_version": SIMULATION_SCHEMA_VERSION,
+                "state_revision": revision,
+                "content_revision": content_revision,
+                "engine_run_id": self._engine_run_id,
                 "updated_at": observed.isoformat(timespec="seconds"),
                 "health": health,
                 "simulation_only": True,
@@ -3821,6 +3954,9 @@ class TwDayTradeSimulationEngine:
                             "entry_fill_policy",
                             "entry_price_offset_ticks",
                             "entry_fill_is_synthetic",
+                            "entry_fill_has_synthetic_fallback",
+                            "entry_best_quote_fill_count",
+                            "entry_synthetic_fallback_fill_count",
                             "entry_fill_contract",
                             "entry_liquidity_assumption",
                             "engine_status",
@@ -3857,11 +3993,42 @@ class TwDayTradeSimulationEngine:
                 },
             },
         )
+        _atomic_json(
+            self.service_sync_path,
+            {
+                "schema_version": SERVICE_SYNC_SCHEMA_VERSION,
+                "state_revision": revision,
+                "content_revision": content_revision,
+                "engine_run_id": self._engine_run_id,
+                "published_at": observed.isoformat(timespec="milliseconds"),
+                "simulation_only": True,
+                "production_order_possible": False,
+                "enabled_markets": enabled_markets,
+                "mode_count": len(mode_rows),
+                "modes": {
+                    str(item.get("market")): {
+                        key: item.get(key)
+                        for key in (
+                            "market",
+                            "session_date",
+                            "signal_id",
+                            "signal_at",
+                            "entry_completed_at",
+                            "engine_status",
+                            "checkpoint_ready",
+                            "open_position_count",
+                        )
+                    }
+                    for item in mode_rows
+                },
+            },
+        )
 
 
 __all__ = [
     "CLOSING_AUCTION_TIME",
     "ENTRY_FILL_POLICY_CAUSAL_BOOK",
+    "ENTRY_FILL_POLICY_CAUSAL_BOOK_ELSE_OPEN_TICK",
     "ENTRY_FILL_POLICY_SYNTHETIC_OPEN_TICK",
     "ENTRY_GATE",
     "EXIT_LIMIT_TIME",

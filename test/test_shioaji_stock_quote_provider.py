@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
+from datetime import date
 import sys
 from types import SimpleNamespace
 
@@ -50,6 +52,61 @@ def _reset_shioaji_connection_state(monkeypatch):
     monkeypatch.setattr(quote_provider, "_SHIOAJI_STOCK_CACHE", {})
     monkeypatch.setattr(quote_provider, "_SHIOAJI_STOCK_LOGIN_RETRY_AFTER", 0.0)
     monkeypatch.setattr(quote_provider, "_SHIOAJI_STOCK_LAST_LOGIN_ERROR", None)
+
+
+def test_historical_stock_entry_books_preserve_taipei_wall_clock_and_each_side(
+    monkeypatch,
+) -> None:
+    contract = SimpleNamespace(code="2330")
+    bid_ts = int(np.datetime64("2026-08-13T09:00:07", "ns").astype(np.int64))
+    ask_ts = int(np.datetime64("2026-08-13T09:00:09", "ns").astype(np.int64))
+
+    class HistoricalApi:
+        contracts = _Contracts({"2330": contract})
+
+        def usage(self):
+            return SimpleNamespace(bytes=100, limit_bytes=1_000)
+
+        def ticks(self, **kwargs):
+            assert kwargs["contract"] is contract
+            assert kwargs["date"] == "2026-08-13"
+            assert kwargs["time_start"] == "09:00:00"
+            assert kwargs["time_end"] == "09:00:59"
+            return SimpleNamespace(
+                ts=np.asarray([bid_ts, ask_ts], dtype=np.int64),
+                close=np.asarray([1_000.0, 1_005.0]),
+                bid_price=np.asarray([999.0, 1_000.0]),
+                bid_volume=np.asarray([3.0, 4.0]),
+                ask_price=np.asarray([0.0, 1_005.0]),
+                ask_volume=np.asarray([0.0, 7.0]),
+            )
+
+    @contextmanager
+    def fake_query(*_args, **_kwargs):
+        yield lambda _result: None
+
+    api = HistoricalApi()
+    _reset_shioaji_connection_state(monkeypatch)
+    monkeypatch.setattr(quote_provider, "_shioaji_stock_api", lambda: api)
+    monkeypatch.setattr(quote_provider, "shioaji_query", fake_query)
+    monkeypatch.setitem(
+        sys.modules,
+        "shioaji",
+        SimpleNamespace(TicksQueryType=SimpleNamespace(RangeTime="range")),
+    )
+
+    books, receipt = quote_provider.fetch_shioaji_historical_stock_entry_books(
+        ["2330"],
+        trading_date=date(2026, 8, 13),
+    )
+
+    assert books["2330"]["bid"] == 999.0
+    assert books["2330"]["ask"] == 1_005.0
+    assert books["2330"]["bid_quote_at"].startswith("2026-08-13T09:00:07")
+    assert books["2330"]["ask_quote_at"].startswith("2026-08-13T09:00:09")
+    assert "+08:00" in str(books["2330"]["ask_quote_at"])
+    assert receipt["resolved_book_symbols"] == 1
+    assert receipt["stopped_for_traffic"] is False
 
 
 def test_shioaji_warm_client_validates_and_replaces_expired_session(monkeypatch):

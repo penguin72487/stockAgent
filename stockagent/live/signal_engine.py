@@ -18,7 +18,12 @@ import torch
 
 from stockagent.backtest.simulator import run_backtest_torch
 from stockagent.backtest.tw_execution import normalize_execution_mode
-from stockagent.config import DAY_TRADE_OPEN_GAP_FEATURE, ExperimentConfig, load_config
+from stockagent.config import (
+    DAY_TRADE_OPEN_GAP_FEATURE,
+    ExperimentConfig,
+    external_panel_data_kwargs,
+    load_config,
+)
 from stockagent.data.panel import PanelData, build_panel, build_tail_panel
 from stockagent.live.portfolio_state import (
     build_rebalance_rows,
@@ -335,9 +340,7 @@ def _build_panel(
     live_tail: bool = False,
 ) -> tuple[PanelData, bool]:
     live_tail_rows = int(getattr(config.data, "live_tail_panel_rows", 0) or 0)
-    use_tw_public_features = bool(config.data.use_tw_public_features)
-    use_tw_public_rules = bool(config.data.use_tw_public_rules)
-    use_tw_public_data = use_tw_public_features or use_tw_public_rules
+    external_kwargs = external_panel_data_kwargs(config.data)
     panel_kwargs = {
         "benchmark_name": config.data.benchmark_name,
         "usd_only_trading_pairs": config.data.usd_only_trading_pairs,
@@ -347,13 +350,7 @@ def _build_panel(
         "strict_no_fallback": config.training.strict_no_fallback,
         "panel_backend": config.data.panel_backend,
         "panel_load_workers": config.data.panel_load_workers,
-        "external_feature_path": (
-            config.data.tw_public_feature_path if use_tw_public_data else None
-        ),
-        "external_market_symbol": config.data.tw_public_market_symbol,
-        "external_include_features": use_tw_public_features,
-        "external_include_rules": use_tw_public_rules,
-        "external_data_required": use_tw_public_data,
+        **external_kwargs,
         "feature_include": config.data.feature_include,
         "feature_exclude": config.data.feature_exclude,
         "feature_zero_fill": config.data.feature_zero_fill,
@@ -385,13 +382,7 @@ def _build_panel(
             security_filter=config.data.security_filter,
             strict_no_fallback=config.training.strict_no_fallback,
             panel_load_workers=config.data.panel_load_workers,
-            external_feature_path=(
-                config.data.tw_public_feature_path if use_tw_public_data else None
-            ),
-            external_market_symbol=config.data.tw_public_market_symbol,
-            external_include_features=use_tw_public_features,
-            external_include_rules=use_tw_public_rules,
-            external_data_required=use_tw_public_data,
+            **external_kwargs,
             feature_include=config.data.feature_include,
             feature_exclude=config.data.feature_exclude,
             feature_zero_fill=config.data.feature_zero_fill,
@@ -818,6 +809,7 @@ def _price_snapshot(
     prices_csv: str | Path | None,
     yahoo_chunk_size: int,
     request_mask: np.ndarray | None = None,
+    require_official_tw_session_open: bool = False,
 ) -> PriceSnapshot:
     source_norm = str(source).strip().lower()
     if source_norm == "panel":
@@ -863,6 +855,86 @@ def _price_snapshot(
                 ),
             ),
         )
+        if require_official_tw_session_open:
+            # Snapshot.open has proven process/time dependent in production for
+            # the same symbol and session.  Bid/Ask and last still come from
+            # Shioaji, but the model's observed-open feature and paper sizing
+            # must have one canonical exchange value.  TWSE/TPEx MIS publishes
+            # that value in ``o`` together with an exchange timestamp.  Keep
+            # only rows whose timestamp belongs to today's Taipei session so a
+            # pre-open request can never reuse yesterday's open.
+            today = datetime.now(ZoneInfo("Asia/Taipei")).date()
+
+            def accepted_opens(snapshot: PriceSnapshot) -> np.ndarray:
+                values = (
+                    np.asarray(snapshot.open_prices, dtype=np.float64).copy()
+                    if snapshot.open_prices is not None
+                    else np.full((len(snapshot.prices),), np.nan, dtype=np.float64)
+                )
+                timestamps = (
+                    np.asarray(snapshot.timestamps_ms, dtype=np.int64)
+                    if snapshot.timestamps_ms is not None
+                    else np.zeros((len(values),), dtype=np.int64)
+                )
+                same_session = np.asarray(
+                    [
+                        timestamp_ms > 0
+                        and datetime.fromtimestamp(
+                            int(timestamp_ms) / 1000.0,
+                            tz=timezone.utc,
+                        )
+                        .astimezone(ZoneInfo("Asia/Taipei"))
+                        .date()
+                        == today
+                        for timestamp_ms in timestamps
+                    ],
+                    dtype=bool,
+                )
+                values[~same_session] = np.nan
+                return values
+
+            shioaji_available = (
+                np.asarray(partial.available_mask, dtype=bool)
+                if partial.available_mask is not None
+                else np.isfinite(np.asarray(partial.prices, dtype=np.float64))
+            )
+            available_indices = np.flatnonzero(shioaji_available)
+            official_opens = np.full((indices.size,), np.nan, dtype=np.float64)
+            if available_indices.size:
+                official = fetch_tw_mis_last_prices(
+                    [requested_symbols[int(idx)] for idx in available_indices],
+                    np.asarray(partial.prices, dtype=np.float64)[available_indices],
+                    parquet_root=parquet_root,
+                    chunk_size=yahoo_chunk_size,
+                    empty_chunk_retry_attempts=0,
+                )
+                first_opens = accepted_opens(official)
+                valid_first = np.isfinite(first_opens) & (first_opens > 0.0)
+                official_opens[available_indices[valid_first]] = first_opens[
+                    valid_first
+                ]
+            # MIS occasionally returns a non-empty but partial large batch.
+            # Retry only unresolved Shioaji-covered symbols in compact batches;
+            # a non-empty response is not proof of complete coverage.
+            for _attempt in range(2):
+                missing = np.flatnonzero(
+                    shioaji_available
+                    & ~(np.isfinite(official_opens) & (official_opens > 0.0))
+                )
+                if missing.size <= 0:
+                    break
+                retry = fetch_tw_mis_last_prices(
+                    [requested_symbols[int(idx)] for idx in missing],
+                    np.asarray(partial.prices, dtype=np.float64)[missing],
+                    parquet_root=parquet_root,
+                    chunk_size=yahoo_chunk_size,
+                    empty_chunk_retry_attempts=0,
+                )
+                retry_opens = accepted_opens(retry)
+                valid_retry = np.isfinite(retry_opens) & (retry_opens > 0.0)
+                official_opens[missing[valid_retry]] = retry_opens[valid_retry]
+            partial.open_prices = official_opens
+            partial.source = f"{partial.source}+official_mis_session_open"
         if indices.size == len(symbols):
             return partial
 
@@ -1941,6 +2013,7 @@ def generate_live_signal(
             if execution_mode == "tw_day_trade"
             else None
         ),
+        require_official_tw_session_open=execution_mode == "tw_day_trade",
     )
     quote_finished = time.perf_counter()
     quote_latency_ms = (quote_finished - quote_started) * 1000.0
@@ -2332,10 +2405,17 @@ def generate_live_signal(
     _emit_progress(progress_callback, label=progress_name, step=13, total=progress_total, message="trading constraints applied")
 
     if execution_preview_only:
-        preview_notice = (
-            f"{execution_mode} 目前顯示模型目標配置；尚未接入券商的即時可用現金、"
-            "T+2 待交割款與成交回報，因此不代表已成交持倉。"
-        )
+        if execution_mode == "crypto_perpetual":
+            preview_notice = (
+                "crypto_perpetual 目前只顯示模型目標配置；尚未接入 Bybit 帳戶的"
+                "即時保證金、既有合約數量、risk tier、未結資金費與成交回報，"
+                "因此不代表可直接送出或已成交的委託。"
+            )
+        else:
+            preview_notice = (
+                f"{execution_mode} 目前顯示模型目標配置；尚未接入券商的即時可用現金、"
+                "T+2 待交割款與成交回報，因此不代表已成交持倉。"
+            )
         if execution_mode == "tw_day_trade":
             preview_notice += " 當沖配置僅限本交易時段，收盤前必須平倉，不會留作隔夜持倉。"
         market_notice = (
@@ -2569,9 +2649,7 @@ def generate_live_signal(
             if day_trade_feature_cutoff
             else None
         ),
-        "live_session_open_feature_applied": bool(
-            execution_mode == "tw_day_trade" and day_trade_live_session
-        ),
+        "live_session_open_feature_applied": session_open_signal,
         "weights_date": weights_timestamp,
         "trading_frequency": trading_frequency,
         "execution_mode": execution_mode,

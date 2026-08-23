@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from collections import defaultdict
+import csv
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -367,7 +368,7 @@ def discover_chunk_groups(
 def _validate_collection_gate(
     path: Path,
     *,
-    selected_symbols: list[str],
+    selected_symbols: list[str] | None,
     subset_requested: bool,
 ) -> dict[str, Any]:
     if not path.is_file():
@@ -409,12 +410,90 @@ def _validate_collection_gate(
         raise RuntimeError(
             f"minute collection still has failed={failed} partial={partial}"
         )
-    if not subset_requested and len(selected_symbols) != available:
+    if (
+        selected_symbols is not None
+        and not subset_requested
+        and len(selected_symbols) != available
+    ):
         raise RuntimeError(
             "completed minute manifests do not match available-source count: "
             f"manifests={len(selected_symbols)} available={available}"
         )
     return payload
+
+
+def _available_collection_symbols(
+    summary_path: Path,
+    payload: dict[str, Any],
+) -> set[str]:
+    """Resolve the exact terminal available-source symbol set.
+
+    Old per-symbol manifests are retained for provenance even when a contract
+    later disappears from Shioaji. The terminal download report, not directory
+    membership, is the authority for the current research build.
+    """
+
+    raw_report_path = str(payload.get("report_path") or "").strip()
+    if not raw_report_path:
+        raise RuntimeError("minute download summary has no terminal report path")
+    report_path = Path(raw_report_path)
+    if not report_path.is_absolute() and not report_path.is_file():
+        report_path = Path(summary_path).parent / report_path.name
+    if not report_path.is_file():
+        raise RuntimeError(f"minute terminal report is missing: {report_path}")
+
+    allowed_statuses = {
+        "complete",
+        "complete_with_source_gaps",
+        "contract_unavailable",
+    }
+    rows: list[dict[str, str]] = []
+    with report_path.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        if not {"symbol", "status"}.issubset(reader.fieldnames or ()):
+            raise RuntimeError(
+                f"minute terminal report schema is invalid: {report_path}"
+            )
+        for row in reader:
+            symbol = str(row.get("symbol") or "").strip().upper()
+            status = str(row.get("status") or "").strip()
+            if not symbol or status not in allowed_statuses:
+                raise RuntimeError(
+                    f"minute terminal report row is invalid: symbol={symbol!r} "
+                    f"status={status!r}"
+                )
+            rows.append({"symbol": symbol, "status": status})
+
+    symbols = [row["symbol"] for row in rows]
+    if len(set(symbols)) != len(symbols):
+        raise RuntimeError("minute terminal report has duplicate symbols")
+    expected_selected = int(payload.get("selected_symbols") or 0)
+    if len(rows) != expected_selected:
+        raise RuntimeError(
+            "minute terminal report count mismatch: "
+            f"rows={len(rows)} selected={expected_selected}"
+        )
+    expected_counts = {
+        "complete": int(payload.get("complete_symbols") or 0),
+        "complete_with_source_gaps": int(
+            payload.get("complete_with_source_gap_symbols") or 0
+        ),
+        "contract_unavailable": int(payload.get("contract_unavailable_symbols") or 0),
+    }
+    observed_counts = {
+        status: sum(row["status"] == status for row in rows)
+        for status in allowed_statuses
+    }
+    if observed_counts != expected_counts:
+        raise RuntimeError(
+            "minute terminal report status counts mismatch: "
+            f"observed={observed_counts} expected={expected_counts}"
+        )
+    return {
+        row["symbol"]
+        for row in rows
+        if row["status"] in {"complete", "complete_with_source_gaps"}
+    }
 
 
 def _feature_statistics(day_frame: pl.DataFrame) -> dict[str, Any]:
@@ -434,10 +513,7 @@ def _feature_statistics(day_frame: pl.DataFrame) -> dict[str, Any]:
                 for name in MODEL_FEATURE_COLUMNS
             ],
             *[
-                (
-                    pl.col(name).cast(pl.Float64)
-                    * pl.col(name).cast(pl.Float64)
-                )
+                (pl.col(name).cast(pl.Float64) * pl.col(name).cast(pl.Float64))
                 .sum()
                 .alias(f"{name}__sum_square")
                 for name in MODEL_FEATURE_COLUMNS
@@ -465,16 +541,31 @@ def main() -> None:
     requested = {
         item.strip().upper() for item in str(args.symbols).split(",") if item.strip()
     }
-    groups, symbols = discover_chunk_groups(
-        args.input_root,
-        requested if requested else None,
-    )
     download_summary_path = (
         args.download_summary
         if args.download_summary is not None
         else args.input_root / "download_summary.json"
     )
     collection = _validate_collection_gate(
+        download_summary_path,
+        selected_symbols=None,
+        subset_requested=bool(requested),
+    )
+    available_symbols = _available_collection_symbols(
+        download_summary_path,
+        collection,
+    )
+    unavailable_requested = requested - available_symbols
+    if unavailable_requested:
+        raise RuntimeError(
+            "requested minute symbols are not terminal available sources: "
+            f"{sorted(unavailable_requested)}"
+        )
+    groups, symbols = discover_chunk_groups(
+        args.input_root,
+        requested if requested else available_symbols,
+    )
+    _validate_collection_gate(
         download_summary_path,
         selected_symbols=symbols,
         subset_requested=bool(requested),
@@ -541,9 +632,7 @@ def main() -> None:
             "download_summary": str(download_summary_path),
             "download_start_date": collection.get("start_date"),
             "download_end_date": collection.get("end_date"),
-            "full_market_selected_symbols": int(
-                collection.get("selected_symbols", 0)
-            ),
+            "full_market_selected_symbols": int(collection.get("selected_symbols", 0)),
             "available_source_symbols": int(collection.get("complete_symbols", 0))
             + int(collection.get("complete_with_source_gap_symbols", 0)),
             "source_gap_symbols": int(

@@ -3,9 +3,10 @@ from __future__ import annotations
 import os
 import threading
 import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, time as datetime_time, timezone
 import json
 from pathlib import Path
 from typing import Any
@@ -184,6 +185,235 @@ def close_shioaji_stock_quote_client() -> None:
                 api.logout()
             except Exception:
                 pass
+
+
+def fetch_shioaji_historical_stock_entry_books(
+    symbols: list[str],
+    *,
+    trading_date: date,
+    time_start: datetime_time = datetime_time(9, 0),
+    time_end: datetime_time = datetime_time(9, 0, 59),
+    max_traffic_fraction: float = 0.90,
+    timeout_ms: int = 30_000,
+    progress_every: int = 50,
+) -> tuple[dict[str, dict[str, float | int | str | None]], dict[str, Any]]:
+    """Fetch the first historical executable stock book for each symbol.
+
+    Shioaji's historical stock Tick payload carries one bid, ask, and displayed
+    quantity on every trade event.  Its nanosecond timestamps encode Taiwan
+    wall-clock values without timezone metadata, so they are decoded as a
+    naive datetime and then labelled Asia/Taipei; adding another eight hours
+    would be incorrect.
+
+    This helper is deliberately sequential and quota-aware.  It stops at the
+    requested traffic fraction and leaves unresolved symbols absent so callers
+    can make an explicit, separately labelled fallback decision.
+    """
+
+    if not 0.0 < float(max_traffic_fraction) <= 1.0:
+        raise ValueError("max_traffic_fraction must be in (0, 1]")
+    if time_start > time_end:
+        raise ValueError("time_start must not be after time_end")
+    requested = list(dict.fromkeys(str(symbol).strip() for symbol in symbols))
+    requested = [symbol for symbol in requested if symbol]
+    api = _shioaji_stock_api()
+    import shioaji as sj
+
+    def usage() -> dict[str, int | float] | None:
+        try:
+            current = api.usage()
+            used = int(current.bytes)
+            limit = int(current.limit_bytes)
+        except Exception:
+            return None
+        if used < 0 or limit <= 0:
+            return None
+        return {
+            "used_bytes": used,
+            "limit_bytes": limit,
+            "fraction": used / limit,
+        }
+
+    usage_before = usage()
+    books: dict[str, dict[str, float | int | str | None]] = {}
+    error_counts: dict[str, int] = {}
+    source_empty = 0
+    contract_missing = 0
+    queried = 0
+    stopped_for_traffic = False
+    request_times: deque[float] = deque()
+
+    for index, symbol in enumerate(requested, start=1):
+        current_usage = usage()
+        if current_usage is not None and float(current_usage["fraction"]) >= float(
+            max_traffic_fraction
+        ):
+            stopped_for_traffic = True
+            break
+        with _SHIOAJI_STOCK_LOCK:
+            if symbol not in _SHIOAJI_STOCK_CONTRACTS:
+                _SHIOAJI_STOCK_CONTRACTS[symbol] = api.contracts.get(symbol)
+            contract = _SHIOAJI_STOCK_CONTRACTS[symbol]
+        if contract is None:
+            contract_missing += 1
+            continue
+
+        now_monotonic = time.monotonic()
+        while request_times and now_monotonic - request_times[0] >= 5.0:
+            request_times.popleft()
+        if len(request_times) >= 50:
+            time.sleep(max(0.0, 5.01 - (now_monotonic - request_times[0])))
+            now_monotonic = time.monotonic()
+            while request_times and now_monotonic - request_times[0] >= 5.0:
+                request_times.popleft()
+        request_times.append(time.monotonic())
+        try:
+            with shioaji_query(
+                api,
+                consumer="tw_day_trade_historical_entry_replay",
+                method="ticks",
+                asset_class="stock",
+                details={
+                    "contract": symbol,
+                    "date": trading_date.isoformat(),
+                    "start": time_start.isoformat(),
+                    "end": time_end.isoformat(),
+                },
+            ) as set_ledger_result:
+                ticks = api.ticks(
+                    contract=contract,
+                    date=trading_date.isoformat(),
+                    query_type=sj.TicksQueryType.RangeTime,
+                    time_start=time_start.isoformat(),
+                    time_end=time_end.isoformat(),
+                    timeout=int(timeout_ms),
+                )
+                set_ledger_result(ticks)
+            queried += 1
+            fields = {
+                name: list(getattr(ticks, name, ()))
+                for name in (
+                    "ts",
+                    "close",
+                    "bid_price",
+                    "bid_volume",
+                    "ask_price",
+                    "ask_volume",
+                )
+            }
+            lengths = {name: len(values) for name, values in fields.items()}
+            if len(set(lengths.values())) != 1:
+                raise ValueError(f"inconsistent historical Tick fields: {lengths}")
+            selected: dict[str, float | int | str | None] = {
+                "symbol": symbol,
+                "bid": None,
+                "ask": None,
+                "bid_volume": None,
+                "ask_volume": None,
+                "bid_quote_at": None,
+                "ask_quote_at": None,
+                "bid_timestamp_ns": None,
+                "ask_timestamp_ns": None,
+                "bid_source_row_index": None,
+                "ask_source_row_index": None,
+                "last": None,
+                "source": "shioaji:historical_stock_tick_best_quote",
+            }
+            ordered_indices = sorted(
+                range(len(fields["ts"])),
+                key=lambda position: (int(fields["ts"][position]), position),
+            )
+            for position in ordered_indices:
+                timestamp_ns = int(fields["ts"][position])
+                wall_clock = (
+                    np.datetime64(timestamp_ns, "ns")
+                    .astype("datetime64[us]")
+                    .astype(datetime)
+                    .replace(tzinfo=ZoneInfo("Asia/Taipei"))
+                )
+                bid = _float_or_none(fields["bid_price"][position])
+                ask = _float_or_none(fields["ask_price"][position])
+                bid_volume = _float_or_none(fields["bid_volume"][position])
+                ask_volume = _float_or_none(fields["ask_volume"][position])
+                valid_bid = (
+                    bid is not None and bid_volume is not None and bid_volume > 0
+                )
+                valid_ask = (
+                    ask is not None and ask_volume is not None and ask_volume > 0
+                )
+                if not (valid_bid or valid_ask):
+                    continue
+                if valid_bid and valid_ask and float(bid) > float(ask):
+                    continue
+                quote_at = wall_clock.isoformat(timespec="microseconds")
+                if valid_bid and selected["bid"] is None:
+                    selected.update(
+                        {
+                            "bid": bid,
+                            "bid_volume": bid_volume,
+                            "bid_quote_at": quote_at,
+                            "bid_timestamp_ns": timestamp_ns,
+                            "bid_source_row_index": position,
+                        }
+                    )
+                if valid_ask and selected["ask"] is None:
+                    selected.update(
+                        {
+                            "ask": ask,
+                            "ask_volume": ask_volume,
+                            "ask_quote_at": quote_at,
+                            "ask_timestamp_ns": timestamp_ns,
+                            "ask_source_row_index": position,
+                        }
+                    )
+                if selected["last"] is None:
+                    selected["last"] = _float_or_none(fields["close"][position])
+                if selected["bid"] is not None and selected["ask"] is not None:
+                    break
+            if selected["bid"] is None and selected["ask"] is None:
+                source_empty += 1
+            else:
+                quote_times = [
+                    str(value)
+                    for value in (
+                        selected["bid_quote_at"],
+                        selected["ask_quote_at"],
+                    )
+                    if value
+                ]
+                selected["quote_at"] = min(quote_times) if quote_times else None
+                books[symbol] = selected
+        except Exception as exc:
+            key = type(exc).__name__
+            error_counts[key] = error_counts.get(key, 0) + 1
+        if progress_every > 0 and (
+            index % progress_every == 0 or index == len(requested)
+        ):
+            print(
+                "[tw-day-trade-entry-book] "
+                f"date={trading_date.isoformat()} progress={index}/{len(requested)} "
+                f"queried={queried} books={len(books)} fallback={index - len(books)}",
+                flush=True,
+            )
+
+    usage_after = usage()
+    return books, {
+        "source": "shioaji:historical_stock_tick_best_quote",
+        "trading_date": trading_date.isoformat(),
+        "time_start": time_start.isoformat(),
+        "time_end": time_end.isoformat(),
+        "requested_symbols": len(requested),
+        "queried_symbols": queried,
+        "resolved_book_symbols": len(books),
+        "source_empty_symbols": source_empty,
+        "contract_missing_symbols": contract_missing,
+        "unqueried_symbols": max(0, len(requested) - queried - contract_missing),
+        "error_counts": error_counts,
+        "stopped_for_traffic": stopped_for_traffic,
+        "max_traffic_fraction": float(max_traffic_fraction),
+        "usage_before": usage_before,
+        "usage_after": usage_after,
+    }
 
 
 def _contract_positive(contract: object, *names: str) -> float | None:
@@ -714,9 +944,7 @@ def fetch_shioaji_futures_snapshot(
                 .isoformat(timespec="milliseconds"),
                 "source": "shioaji:futures_snapshot",
                 "logical_code": normalized_logical if code == current_code else None,
-                "delivery_month": str(
-                    getattr(contract, "delivery_month", "") or ""
-                ),
+                "delivery_month": str(getattr(contract, "delivery_month", "") or ""),
                 "delivery_date": (
                     delivery_date.isoformat()
                     if hasattr(delivery_date, "isoformat")
@@ -778,7 +1006,10 @@ def fetch_futures_snapshot_prefer_stream(
                 contract_metadata[str(code).strip().upper()] = row
     current_codes = sorted(code for code in books if code.startswith(logical_root))
     current_code = current_codes[0] if len(current_codes) == 1 else ""
-    required = {current_code, *(str(code).strip().upper() for code in additional_contract_codes)} - {""}
+    required = {
+        current_code,
+        *(str(code).strip().upper() for code in additional_contract_codes),
+    } - {""}
     quotes: dict[str, dict[str, float | int | str | None]] = {}
     for code in required:
         row = books.get(code)
@@ -803,9 +1034,11 @@ def fetch_futures_snapshot_prefer_stream(
             or bid > ask
         ):
             break
-        quote_at = datetime.fromtimestamp(receive_ns / 1e9, tz=timezone.utc).astimezone(
-            ZoneInfo("Asia/Taipei")
-        ).isoformat(timespec="milliseconds")
+        quote_at = (
+            datetime.fromtimestamp(receive_ns / 1e9, tz=timezone.utc)
+            .astimezone(ZoneInfo("Asia/Taipei"))
+            .isoformat(timespec="milliseconds")
+        )
         quotes[code] = {
             "contract_code": code,
             "last": None,
@@ -815,15 +1048,9 @@ def fetch_futures_snapshot_prefer_stream(
             "ask_volume": int(row.get("ask_volume_1") or 0),
             "quote_at": quote_at,
             "source": "shioaji:fop_stream_local_book",
-            "logical_code": (contract_metadata.get(code) or {}).get(
-                "logical_code"
-            ),
-            "delivery_month": (contract_metadata.get(code) or {}).get(
-                "delivery_month"
-            ),
-            "delivery_date": (contract_metadata.get(code) or {}).get(
-                "delivery_date"
-            ),
+            "logical_code": (contract_metadata.get(code) or {}).get("logical_code"),
+            "delivery_month": (contract_metadata.get(code) or {}).get("delivery_month"),
+            "delivery_date": (contract_metadata.get(code) or {}).get("delivery_date"),
             "last_trading_date": (contract_metadata.get(code) or {}).get(
                 "last_trading_date"
             ),
@@ -1090,6 +1317,8 @@ def fetch_tw_mis_last_prices(
     *,
     parquet_root: str | Path,
     chunk_size: int = 80,
+    empty_chunk_retry_attempts: int | None = None,
+    empty_chunk_retry_delay_seconds: float | None = None,
 ) -> PriceSnapshot:
     """Fetch Taiwan intraday prices from TWSE MIS and align them to panel symbols."""
     yahoo_map = load_symbol_yahoo_map(parquet_root)
@@ -1125,11 +1354,17 @@ def fetch_tw_mis_last_prices(
     workers = max(1, min(len(chunks) or 1, max_parallel))
     retry_attempts = max(
         0,
-        int(os.getenv("STOCKAGENT_TW_MIS_RETRY_ATTEMPTS", "3") or "3"),
+        int(empty_chunk_retry_attempts)
+        if empty_chunk_retry_attempts is not None
+        else int(os.getenv("STOCKAGENT_TW_MIS_RETRY_ATTEMPTS", "3") or "3"),
     )
     retry_delay_seconds = max(
         0.0,
-        float(os.getenv("STOCKAGENT_TW_MIS_RETRY_DELAY_SECONDS", "0.35") or "0.35"),
+        float(empty_chunk_retry_delay_seconds)
+        if empty_chunk_retry_delay_seconds is not None
+        else float(
+            os.getenv("STOCKAGENT_TW_MIS_RETRY_DELAY_SECONDS", "0.35") or "0.35"
+        ),
     )
     session_local = threading.local()
 
