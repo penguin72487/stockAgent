@@ -1,5 +1,6 @@
 import math
 
+import pytest
 import torch
 
 from stockagent.backtest.simulator import run_backtest_torch
@@ -259,6 +260,25 @@ def test_l1_projection_preserves_cash_inside_ball_and_sparsifies_outside_ball() 
     assert torch.allclose(inside_projected, inside, atol=1e-7, rtol=1e-6)
     assert torch.all(outside_projected.abs().sum(dim=1) <= 1.0 + 1e-6)
     assert int((outside_projected.abs() <= 1e-7).sum().item()) >= 1
+
+
+@pytest.mark.parametrize("input_dtype", [torch.float16, torch.bfloat16])
+def test_l1_projection_keeps_portfolio_weights_float32_under_amp_dtypes(
+    input_dtype: torch.dtype,
+) -> None:
+    logits = torch.tensor(
+        [[0.2, -0.3, 0.1]], dtype=input_dtype, requires_grad=True
+    )
+    weights = masked_l1_projection_weights(
+        logits,
+        torch.ones_like(logits, dtype=torch.bool),
+        long_only=False,
+    )
+
+    assert weights.dtype == torch.float32
+    weights.sum().backward()
+    assert logits.grad is not None
+    assert torch.isfinite(logits.grad).all()
 
 
 def test_l1_projection_active_count_scale_preserves_cash_and_dense_gradient() -> None:

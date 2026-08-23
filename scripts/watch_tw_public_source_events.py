@@ -63,6 +63,7 @@ from scripts.watch_tw_public_publication_group import (  # noqa: E402
 
 TAIPEI = ZoneInfo("Asia/Taipei")
 SCHEMA_VERSION = 1
+VERSION_CONTRACT = "canonical_body_sha256_v2"
 USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "Chrome/124.0 Safari/537.36 stockAgent-tw-public-event-monitor/1"
@@ -292,17 +293,88 @@ def _version(
     content_length: str | None,
     content_disposition: str | None,
 ) -> str:
-    payload = {
-        "url": url,
-        "body_sha256": body_sha256,
-        "etag": etag,
-        "last_modified": last_modified,
-        "content_length": content_length,
-        "content_disposition": content_disposition,
-    }
-    return hashlib.sha256(
-        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
+    """Return the semantic representation identity.
+
+    HTTP validators and attachment filenames are transport metadata, not data.
+    Some official endpoints generate a new timestamped Content-Disposition on
+    every request while returning byte-identical content.  Including those
+    headers caused an endless false publication/download loop.  The caller has
+    already canonicalized structured bodies, so that digest is the correct
+    first-principles identity boundary.
+    """
+
+    del url, etag, last_modified, content_length, content_disposition
+    return str(body_sha256)
+
+
+def _migrate_version_contract(state: dict[str, Any]) -> None:
+    """Migrate acknowledged versions without inventing acceptance.
+
+    Rows whose old observed/applied versions matched were already accepted and
+    can be translated atomically.  A row that was pending stays pending because
+    its prior applied content digest is not available in the monitor state.
+    """
+
+    if state.get("version_contract") == VERSION_CONTRACT:
+        return
+    rows = state.get("datasets")
+    if not isinstance(rows, Mapping):
+        state["version_contract"] = VERSION_CONTRACT
+        return
+    for value in rows.values():
+        if not isinstance(value, dict):
+            continue
+        old_observed = value.get("observed_version")
+        old_applied = value.get("applied_version")
+        acknowledged = bool(old_observed) and old_applied == old_observed
+        metadata = value.get("metadata")
+        resources = value.get("resources")
+        new_version: str | None = None
+        if isinstance(metadata, Mapping) and isinstance(resources, Mapping):
+            metadata_row = dict(metadata)
+            metadata_body = str(metadata_row.get("body_sha256") or "")
+            resource_rows: dict[str, dict[str, Any]] = {}
+            if metadata_body:
+                metadata_row["version"] = metadata_body
+                valid = True
+                for resource_url, resource in resources.items():
+                    if not isinstance(resource, Mapping):
+                        valid = False
+                        break
+                    resource_row = dict(resource)
+                    body_sha256 = str(resource_row.get("body_sha256") or "")
+                    if not body_sha256:
+                        valid = False
+                        break
+                    resource_row["version"] = body_sha256
+                    resource_rows[str(resource_url)] = resource_row
+                if valid:
+                    value["metadata"] = metadata_row
+                    value["resources"] = resource_rows
+                    combined = {
+                        "metadata_version": metadata_body,
+                        "resources": {
+                            key: resource_rows[key]["version"]
+                            for key in sorted(resource_rows)
+                        },
+                    }
+                    new_version = hashlib.sha256(
+                        json.dumps(
+                            combined,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ).encode()
+                    ).hexdigest()
+        else:
+            body_sha256 = str(value.get("body_sha256") or "")
+            if body_sha256:
+                new_version = body_sha256
+        if new_version:
+            value["observed_version"] = new_version
+            if acknowledged:
+                value["applied_version"] = new_version
+            value["version_contract"] = VERSION_CONTRACT
+    state["version_contract"] = VERSION_CONTRACT
 
 
 def _request(
@@ -613,6 +685,7 @@ def _new_state(specs: list[DatasetSpec], args: argparse.Namespace) -> dict[str, 
     registry_sha256, registry = _registry(specs, args)
     return {
         "schema_version": SCHEMA_VERSION,
+        "version_contract": VERSION_CONTRACT,
         "status": "warming",
         "registry_sha256": registry_sha256,
         "registered_dataset_count": len(specs),
@@ -640,6 +713,7 @@ def _load_state(path: Path, specs: list[DatasetSpec], args: argparse.Namespace) 
         for spec in specs
         if isinstance(prior_rows.get(spec.name, {}), Mapping)
     }
+    _migrate_version_contract(state)
     if registry_changed:
         for row in state["datasets"].values():
             row.pop("next_probe_at_taipei", None)

@@ -17,7 +17,6 @@ try:
 except Exception:  # pragma: no cover - optional fast metadata reader
     pq = None
 
-from stockagent.config import load_config
 from stockagent.live.market_config import LiveMarketConfig
 
 
@@ -609,6 +608,11 @@ def data_freshness(
     root: Path | None = None,
     now: datetime | None = None,
 ) -> DataFreshness:
+    # Loading the training config pulls in the tensor backtest stack.  Keep that
+    # dependency out of lightweight market-calendar/scheduler imports; boot and
+    # historical collectors only pay the cost when freshness is actually read.
+    from stockagent.config import load_config
+
     config_path = resolve_repo_path(cfg.config_path, root=root)
     parquet_root: Path | None = None
     benchmark_name: str | None = None

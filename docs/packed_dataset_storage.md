@@ -256,10 +256,11 @@ stockagent-data publish tw-public
 
 `publish` 仍會套用 catalog 的 active-downloader blocker、排除規則、完整來源穩定性
 檢查與原子 head 更新；它不是繞過發布門檻的捷徑。
-在 penguin 的 08:30 官方資料驗收作業中，只有主作業成功後才會透過
-`ExecStartPost` 自動執行 `publish tw-public`；下載或嚴格 audit 失敗時不會
-發布。來源 receipt 的 `end_date` 若比現有 cold manifest 舊，publish 也會
-fail closed，避免多寫者用較晚 HLC 發布舊內容。
+在 penguin 的 08:30 前官方資料驗收作業中，07:50 全量掃描先要求 156 項來源
+零失敗、零 publication lag 並原子提交 live receipt；08:00/08:20/08:29 作業再依序
+執行嚴格 audit、`publish tw-public`、完整 materialize 驗證與 symlink 切換。
+任何階段失敗都不會切換推論資料。來源 receipt 的 `end_date` 若比現有 cold
+manifest 舊，publish 也會 fail closed，避免多寫者用較晚 HLC 發布舊內容。
 
 新資料的增量冷存仍使用既有發布入口。固定 hash bucket 與 content-addressed
 blob 使未改變物件直接重用，只傳輸變動 bucket/blob：

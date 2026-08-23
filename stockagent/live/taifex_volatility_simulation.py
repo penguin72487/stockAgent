@@ -95,7 +95,7 @@ from stockagent.research.taifex_volatility_metadata import (
 
 
 SCHEMA_VERSION: Final[int] = 1
-EXECUTION_CONTRACT_VERSION: Final[int] = 11
+EXECUTION_CONTRACT_VERSION: Final[int] = 12
 OPTION_MULTIPLIER: Final[float] = 50.0
 OPTION_FEE_PER_SIDE_TWD: Final[float] = 22.0
 DEFAULT_OPTION_RISK_MARGIN_A_TWD: Final[float] = TXO_RISK_MARGIN_TWD_2026_08_13["A"]
@@ -224,6 +224,10 @@ def _new_strategy_ledger(*, entry_state: str = "pending") -> dict[str, Any]:
         "last_option_roll_signal_ts_ns": None,
         "last_option_roll_forward_mid": None,
         "last_option_roll_atm_strike": None,
+        "last_dynamic_hedge_cycle_id": None,
+        "last_dynamic_hedge_session_id": None,
+        "last_dynamic_hedge_decision_ts_ns": None,
+        "last_dynamic_hedge_forward_mid": None,
         "trade_sides": 0,
         "initial_capital_twd": 0.0,
         "cumulative_contributed_capital_twd": 0.0,
@@ -860,6 +864,9 @@ class TaifexVolatilitySimulation:
                 migration_reasons.append(
                     "next_trading_date_recapitalization_ledger_migration"
                 )
+            elif execution_version == 11:
+                payload["execution_contract_version"] = EXECUTION_CONTRACT_VERSION
+                migration_reasons.append("gamma_scalping_trigger_state_migration")
             elif execution_version != EXECUTION_CONTRACT_VERSION:
                 raise RuntimeError("strategy execution contract mismatch")
 
@@ -893,6 +900,10 @@ class TaifexVolatilitySimulation:
                         "entry_state",
                         "entered" if active_cycle_mapping else "pending",
                     )
+                ledger.setdefault("last_dynamic_hedge_cycle_id", None)
+                ledger.setdefault("last_dynamic_hedge_session_id", None)
+                ledger.setdefault("last_dynamic_hedge_decision_ts_ns", None)
+                ledger.setdefault("last_dynamic_hedge_forward_mid", None)
             if execution_version == 8 and active_cycle_mapping:
                 repaired_v8_restart_strategy_ids = (
                     self._repair_v8_restart_fabricated_active_cycle_pairs(
@@ -3569,6 +3580,20 @@ class TaifexVolatilitySimulation:
                 decision_ns=decision_ns,
                 reason="prior_close_model_delta_target_at_next_open",
             ):
+                if bool(signal.get("hedge_trigger_due", True)):
+                    ledger = self.state["strategies"][strategy_id]
+                    ledger["last_dynamic_hedge_cycle_id"] = str(
+                        signal["cycle_id"]
+                    )
+                    ledger["last_dynamic_hedge_session_id"] = signal.get(
+                        "decision_session_id"
+                    )
+                    ledger["last_dynamic_hedge_decision_ts_ns"] = int(
+                        signal["decision_ts_ns"]
+                    )
+                    ledger["last_dynamic_hedge_forward_mid"] = float(
+                        signal["surface_forward_mid"]
+                    )
                 self.state["pending_targets"].pop(strategy_id, None)
                 changed = True
         if changed:
@@ -3708,17 +3733,61 @@ class TaifexVolatilitySimulation:
             if spec.hedge_policy == "bs_delta_scale":
                 raw_target *= float(spec.hedge_parameter or 0.0)
             target = _round_nearest_contract(raw_target)
+            ledger = self.state["strategies"][strategy_id]
+            current = int(ledger["futures_position"])
+            hedge_trigger_due = True
+            hedge_trigger_kind = "every_decision"
+            hedge_trigger_distance: float | None = None
+            previous_hedge_forward = ledger.get("last_dynamic_hedge_forward_mid")
+            previous_hedge_decision_ns = ledger.get(
+                "last_dynamic_hedge_decision_ts_ns"
+            )
+            same_cycle = str(ledger.get("last_dynamic_hedge_cycle_id") or "") == str(
+                cycle["cycle_id"]
+            )
+            same_session = str(
+                ledger.get("last_dynamic_hedge_session_id") or ""
+            ) == str(session_state["session_id"])
+            if spec.hedge_policy == "bs_gamma_price_grid":
+                hedge_trigger_kind = "forward_point_grid"
+                threshold_points = float(spec.hedge_parameter or 0.0)
+                if same_cycle and previous_hedge_forward is not None:
+                    hedge_trigger_distance = abs(
+                        float(surface.forward) - float(previous_hedge_forward)
+                    )
+                    hedge_trigger_due = hedge_trigger_distance >= threshold_points
+                    if intraday and not same_session:
+                        hedge_trigger_due = True
+                if not hedge_trigger_due:
+                    target = current
+            elif spec.hedge_policy == "bs_gamma_time_grid":
+                hedge_trigger_kind = "elapsed_minute_grid"
+                threshold_seconds = float(spec.hedge_parameter or 0.0) * 60.0
+                if same_cycle and previous_hedge_decision_ns is not None:
+                    hedge_trigger_distance = max(
+                        0.0,
+                        (decision_ns - int(previous_hedge_decision_ns)) / 1e9,
+                    )
+                    hedge_trigger_due = hedge_trigger_distance >= threshold_seconds
+                    if intraday and not same_session:
+                        hedge_trigger_due = True
+                if not hedge_trigger_due:
+                    target = current
             if spec.hedge_policy == "bs_delta_band":
-                current = int(self.state["strategies"][strategy_id]["futures_position"])
                 net_delta = delta + current * self.hedge_multiplier / OPTION_MULTIPLIER
                 if abs(net_delta) <= float(spec.hedge_parameter or 0.0):
                     target = current
             signal = {
                 "cycle_id": cycle["cycle_id"],
                 "decision_date": decision_trade_date.isoformat(),
+                "decision_session_id": session_state["session_id"],
                 "decision_ts_ns": decision_ns,
                 "target_contracts": target,
                 "straddle_delta": delta,
+                "surface_forward_mid": float(surface.forward),
+                "hedge_trigger_due": hedge_trigger_due,
+                "hedge_trigger_kind": hedge_trigger_kind,
+                "hedge_trigger_distance": hedge_trigger_distance,
             }
             if intraday:
                 executed = self._execute_future_target(
@@ -3729,6 +3798,15 @@ class TaifexVolatilitySimulation:
                     execution_snapshot=(hedge_book, hedge_row),
                 )
                 all_targets_executed = all_targets_executed and executed
+                if executed and hedge_trigger_due:
+                    ledger["last_dynamic_hedge_cycle_id"] = str(cycle["cycle_id"])
+                    ledger["last_dynamic_hedge_session_id"] = str(
+                        session_state["session_id"]
+                    )
+                    ledger["last_dynamic_hedge_decision_ts_ns"] = int(decision_ns)
+                    ledger["last_dynamic_hedge_forward_mid"] = float(
+                        surface.forward
+                    )
             else:
                 self.state["pending_targets"][strategy_id] = signal
             _append_jsonl(
@@ -3757,6 +3835,11 @@ class TaifexVolatilitySimulation:
                     "surface_maturities": surface.maturity_count,
                     "target_contracts": target,
                     "straddle_delta": delta,
+                    "hedge_trigger_due": hedge_trigger_due,
+                    "hedge_trigger_kind": hedge_trigger_kind,
+                    "hedge_trigger_distance": hedge_trigger_distance,
+                    "previous_hedge_decision_ts_ns": previous_hedge_decision_ns,
+                    "previous_hedge_forward_mid": previous_hedge_forward,
                     "execution_timing": (
                         "same_decision_executable_bidask"
                         if intraday
@@ -4388,6 +4471,18 @@ class TaifexVolatilitySimulation:
             ),
             "last_option_roll_forward_mid": ledger.get("last_option_roll_forward_mid"),
             "last_option_roll_atm_strike": ledger.get("last_option_roll_atm_strike"),
+            "last_dynamic_hedge_cycle_id": ledger.get(
+                "last_dynamic_hedge_cycle_id"
+            ),
+            "last_dynamic_hedge_session_id": ledger.get(
+                "last_dynamic_hedge_session_id"
+            ),
+            "last_dynamic_hedge_decision_ts_ns": ledger.get(
+                "last_dynamic_hedge_decision_ts_ns"
+            ),
+            "last_dynamic_hedge_forward_mid": ledger.get(
+                "last_dynamic_hedge_forward_mid"
+            ),
             "futures_position": future_position,
             "underlying_futures_position": underlying_future_position,
             "option_positions": option_positions,

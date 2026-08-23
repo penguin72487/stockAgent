@@ -25,7 +25,6 @@ except ModuleNotFoundError:  # direct script execution
 from stockagent.live.shioaji_traffic_ledger import shioaji_query
 from stockagent.live.shioaji_schedule import (
     HISTORICAL_MAX_TRAFFIC_FRACTION,
-    STOCK_HISTORY_TRAFFIC_RESERVE_MB,
 )
 
 from downloader.download_shioaji_tw_kbars import (  # noqa: E402
@@ -219,11 +218,9 @@ class SharedTrafficBudgetGuard:
         context: Any,
         *,
         max_fraction: float,
-        reserve_bytes: int,
         check_interval_seconds: float,
     ) -> None:
         self.max_fraction = float(max_fraction)
-        self.reserve_bytes = int(reserve_bytes)
         self.check_interval_seconds = float(check_interval_seconds)
         self._lock = context.Lock()
         self._last_check = context.Value("d", 0.0, lock=False)
@@ -241,7 +238,6 @@ class SharedTrafficBudgetGuard:
             used, limit = _check_traffic_budget(
                 api,
                 max_fraction=self.max_fraction,
-                reserve_bytes=self.reserve_bytes,
             )
             self._used.value = used
             self._limit.value = limit
@@ -280,6 +276,7 @@ def query_minute_chunk(
     retries: int,
     retry_backoff: float,
     expected_dates: set[date],
+    provisional_dates: set[date] | None = None,
     request_started: Callable[[], None] | None = None,
 ) -> tuple[pl.DataFrame, dict[str, Any]]:
     """Query one chunk and retain only causal regular-session minute bars.
@@ -320,10 +317,14 @@ def query_minute_chunk(
                 for name in ("Open", "High", "Low", "Close", "Volume", "Amount")
             ],
         )
-        reference_dates = sorted(expected_dates)
+        # The daily public panel can publish after Shioaji's minute history.
+        # A caller may therefore authorize only the unconfirmed tail dates
+        # after the newest reference session.  Never let a lagging reference
+        # calendar delete a valid newly published minute session.
+        accepted_dates = sorted(expected_dates | set(provisional_dates or ()))
         outside_reference_date = (
             pl.col("ts").is_not_null()
-            & ~pl.col("ts").cast(pl.Date).is_in(reference_dates)
+            & ~pl.col("ts").cast(pl.Date).is_in(accepted_dates)
         ).fill_null(True)
         all_zero_placeholder = pl.all_horizontal(
             *[(pl.col(name) == 0.0) for name in required[1:]]
@@ -453,6 +454,40 @@ def query_minute_chunk(
     raise last_error
 
 
+def provisional_publication_tail_dates(
+    base_path: Path,
+    *,
+    start: date,
+    end: date,
+    expected_dates: set[date],
+) -> set[date]:
+    """Return weekday tail dates newer than the latest daily reference row.
+
+    This is deliberately not a general trading-calendar substitute.  It only
+    opens the publication-lag tail after a recently observed positive-volume
+    session; Shioaji must still return valid regular-session KBars before any
+    date becomes stored evidence.
+    """
+
+    recent_dates = set(expected_dates)
+    if not recent_dates:
+        recent_dates = _positive_volume_dates(
+            base_path,
+            max(SHIOAJI_STOCK_HISTORY_START, start - timedelta(days=14)),
+            end,
+        )
+    if not recent_dates:
+        return set()
+    latest_reference = max(recent_dates)
+    cursor = max(start, latest_reference + timedelta(days=1))
+    provisional: set[date] = set()
+    while cursor <= end:
+        if cursor.weekday() < 5:
+            provisional.add(cursor)
+        cursor += timedelta(days=1)
+    return provisional
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -524,11 +559,6 @@ def parse_args() -> argparse.Namespace:
         "--max-traffic-fraction",
         type=float,
         default=HISTORICAL_MAX_TRAFFIC_FRACTION,
-    )
-    parser.add_argument(
-        "--traffic-reserve-mb",
-        type=float,
-        default=STOCK_HISTORY_TRAFFIC_RESERVE_MB,
     )
     parser.add_argument("--simulation", action="store_true")
     parser.add_argument("--allow-market-hours", action="store_true")
@@ -628,6 +658,7 @@ def minute_receipt_valid(
     start: date,
     end: date,
     simulation: bool | None = None,
+    required_dates: set[date] | None = None,
 ) -> bool:
     payload = _read_json(path)
     if payload is None or not (
@@ -641,6 +672,17 @@ def minute_receipt_valid(
         and (simulation is None or payload.get("simulation") is bool(simulation))
     ):
         return False
+    if required_dates:
+        try:
+            terminal_dates = {
+                date.fromisoformat(str(value))
+                for field in ("returned_dates", "source_gap_dates")
+                for value in payload.get(field, [])
+            }
+        except (TypeError, ValueError):
+            return False
+        if not required_dates.issubset(terminal_dates):
+            return False
     if payload["status"] == "empty":
         return int(payload.get("rows", -1)) == 0
     if payload["status"] == "source_gap" and not payload.get("source_gap_dates"):
@@ -833,6 +875,9 @@ def _write_symbol_manifest(
             "source_gap_dates": [
                 value.isoformat() for value in sorted(source_gap_dates)
             ],
+            "terminal_coverage_dates": [
+                value.isoformat() for value in sorted(dates | source_gap_dates)
+            ],
             "first_date": min(dates).isoformat() if dates else None,
             "last_date": max(dates).isoformat() if dates else None,
             "written_at_utc": datetime.now(timezone.utc)
@@ -864,6 +909,7 @@ def completed_symbol_manifest_result(
     requested_start: date,
     requested_end: date,
     simulation: bool,
+    expected_dates: set[date] | None = None,
 ) -> SymbolResult | None:
     """Fast restart path for an already sealed symbol.
 
@@ -888,6 +934,39 @@ def completed_symbol_manifest_result(
     entries = payload.get("chunks")
     if not isinstance(entries, list) or len(entries) != len(chunks):
         return None
+    if expected_dates:
+        raw_coverage = payload.get("terminal_coverage_dates")
+        if isinstance(raw_coverage, list):
+            try:
+                terminal_coverage = {
+                    date.fromisoformat(str(value)) for value in raw_coverage
+                }
+            except ValueError:
+                return None
+            if not expected_dates.issubset(terminal_coverage):
+                return None
+        else:
+            # Legacy manifests predate exact coverage dates. Preserve their
+            # O(1) restart path only while the current official positive-volume
+            # calendar has not advanced beyond their sealed evidence.
+            legacy_dates = [
+                date.fromisoformat(str(value))
+                for value in payload.get("source_gap_dates", [])
+            ]
+            if payload.get("last_date"):
+                try:
+                    legacy_dates.append(date.fromisoformat(str(payload["last_date"])))
+                except ValueError:
+                    return None
+            covered_count = int(payload.get("sessions", 0)) + int(
+                payload.get("source_gap_sessions", 0)
+            )
+            if (
+                not legacy_dates
+                or max(expected_dates) > max(legacy_dates)
+                or len(expected_dates) > covered_count
+            ):
+                return None
     for entry, (chunk_start, chunk_end) in zip(entries, chunks, strict=True):
         if not isinstance(entry, dict) or not (
             entry.get("start_date") == chunk_start.isoformat()
@@ -1186,6 +1265,13 @@ def _download_symbol(
 ) -> SymbolResult:
     completed = 0
     try:
+        expected_all = _positive_volume_dates(row.base_path, start, end)
+        provisional_all = provisional_publication_tail_dates(
+            row.base_path,
+            start=start,
+            end=end,
+            expected_dates=expected_all,
+        )
         sealed_result = completed_symbol_manifest_result(
             args.output_dir,
             row,
@@ -1193,6 +1279,7 @@ def _download_symbol(
             requested_start=start,
             requested_end=end,
             simulation=bool(args.simulation),
+            expected_dates=expected_all,
         )
         if sealed_result is not None:
             return sealed_result
@@ -1203,6 +1290,7 @@ def _download_symbol(
                 start=a,
                 end=b,
                 simulation=bool(args.simulation),
+                required_dates={value for value in expected_all if a <= value <= b},
             )
             for a, b in chunks
         )
@@ -1215,15 +1303,15 @@ def _download_symbol(
                 requested_end=end,
                 simulation=bool(args.simulation),
             )
-        expected_all = _positive_volume_dates(row.base_path, start, end)
+        query_candidate_dates = expected_all | provisional_all
         contract: Any | None = None
         unit = 0.0
         contract_message = ""
-        if expected_all:
+        if query_candidate_dates:
             contract, unit, contract_message = contract_for_stock_symbol(
                 api, row, contracts_by_code
             )
-        if expected_all and contract is None:
+        if query_candidate_dates and contract is None:
             restored = restore_extended_tail_from_archived_manifest(
                 args.output_dir,
                 row,
@@ -1273,12 +1361,19 @@ def _download_symbol(
             data_path, receipt_path = minute_chunk_paths(
                 args.output_dir, row.symbol, chunk_start, chunk_end
             )
+            expected_dates = {
+                value for value in expected_all if chunk_start <= value <= chunk_end
+            }
+            provisional_dates = {
+                value for value in provisional_all if chunk_start <= value <= chunk_end
+            }
             if minute_receipt_valid(
                 receipt_path,
                 symbol=row.symbol,
                 start=chunk_start,
                 end=chunk_end,
                 simulation=bool(args.simulation),
+                required_dates=expected_dates,
             ):
                 continue
             if stop_event.is_set():
@@ -1288,10 +1383,7 @@ def _download_symbol(
                     "Taiwan market-hours safety window reached; "
                     "resume after 14:30 Asia/Taipei"
                 )
-            expected_dates = {
-                value for value in expected_all if chunk_start <= value <= chunk_end
-            }
-            query_performed = bool(expected_dates)
+            query_performed = bool(expected_dates or provisional_dates)
             if query_performed:
                 traffic_guard.check(api)
                 assert contract is not None
@@ -1306,6 +1398,7 @@ def _download_symbol(
                     retries=int(args.retries),
                     retry_backoff=float(args.retry_backoff),
                     expected_dates=expected_dates,
+                    provisional_dates=provisional_dates,
                     request_started=acquire_request_slot,
                 )
             else:
@@ -1360,6 +1453,13 @@ def _download_symbol(
                     "first_ts": audit["first_ts"],
                     "last_ts": audit["last_ts"],
                     "expected_positive_volume_sessions": len(expected_dates),
+                    "provisional_publication_tail_dates": [
+                        value.isoformat() for value in sorted(provisional_dates)
+                    ],
+                    "discovered_provisional_dates": sorted(
+                        set(returned_dates)
+                        & {value.isoformat() for value in provisional_dates}
+                    ),
                     "returned_dates": returned_dates,
                     "query_performed": query_performed,
                     "query_skipped_reason": (
@@ -1574,10 +1674,6 @@ def main() -> None:
         raise ValueError("--traffic-check-interval must be positive")
     if not 0 < float(args.max_traffic_fraction) < 1:
         raise ValueError("--max-traffic-fraction must be between 0 and 1")
-    if not math.isfinite(float(args.traffic_reserve_mb)) or float(
-        args.traffic_reserve_mb
-    ) < 0.0:
-        raise ValueError("--traffic-reserve-mb must be finite and nonnegative")
 
     universe = _load_universe(args.base_stock_root)
     selected = select_universe(
@@ -1644,11 +1740,9 @@ def main() -> None:
         requests_per_second=float(args.requests_per_second),
     )
     counters = SharedDownloadCounters(context)
-    reserve_bytes = int(float(args.traffic_reserve_mb) * 1024 * 1024)
     traffic_guard = SharedTrafficBudgetGuard(
         context,
         max_fraction=float(args.max_traffic_fraction),
-        reserve_bytes=reserve_bytes,
         check_interval_seconds=float(args.traffic_check_interval),
     )
     processes = [

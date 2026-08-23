@@ -7,6 +7,7 @@ import polars as pl
 import pytest
 
 from downloader.materialize_ohlcv_daily import _daily_frame
+from downloader.ohlcv_hot_tail import hot_tail_path
 
 
 def _minute_frame(timestamps: list[datetime]) -> pl.DataFrame:
@@ -67,3 +68,29 @@ def test_daily_materializer_rejects_off_grid_timestamp(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="not aligned"):
         _daily_frame(source)
+
+
+def test_daily_materializer_includes_deduplicated_hot_tail(tmp_path: Path) -> None:
+    source = tmp_path / "BTC_USDT_features.parquet"
+    base = _minute_frame(
+        [
+            datetime(2026, 8, 13, 0, 0, tzinfo=timezone.utc),
+            datetime(2026, 8, 13, 0, 1, tzinfo=timezone.utc),
+        ]
+    )
+    base.write_parquet(source)
+    tail = hot_tail_path(source)
+    tail.parent.mkdir(parents=True)
+    _minute_frame(
+        [
+            datetime(2026, 8, 13, 0, 1, tzinfo=timezone.utc),
+            datetime(2026, 8, 13, 0, 2, tzinfo=timezone.utc),
+        ]
+    ).with_columns(
+        pl.Series("Trading_Volume", [2.0, 3.0])
+    ).write_parquet(tail)
+
+    result = _daily_frame(source)
+
+    assert result["source_minute_rows"].item() == 3
+    assert result["Trading_Volume"].item() == 6.0

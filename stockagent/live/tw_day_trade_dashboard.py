@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import deque
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import date as datetime_date, datetime, time as datetime_time, timezone
 import json
 import math
@@ -11,6 +12,13 @@ from pathlib import Path
 import threading
 from typing import Any, Final
 from zoneinfo import ZoneInfo
+
+from stockagent.live.tw_day_trade_service_sync import (
+    DISCORD_SERVICE_STATUS_FILENAME,
+    age_seconds,
+    load_service_sync,
+    read_json_object,
+)
 
 
 DASHBOARD_SCHEMA_VERSION: Final[int] = 5
@@ -45,13 +53,126 @@ _AVAILABLE_SESSION_DATES_CACHE: dict[Path, tuple[tuple[Any, ...], list[str]]] = 
 _AVAILABLE_SESSION_DATES_CACHE_LOCK = threading.Lock()
 _OBJECT_CACHE: dict[Path, tuple[int, int, int, int, dict[str, Any]]] = {}
 _OBJECT_CACHE_LOCK = threading.Lock()
-_ROWS_BY_SESSION_CACHE: dict[
-    tuple[Path, int],
-    tuple[int, int, int, int, dict[str, tuple[dict[str, Any], ...]]],
-] = {}
-_ROWS_BY_SESSION_CACHE_LOCK = threading.Lock()
 _SIGNAL_PAGE_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
 _SIGNAL_PAGE_CACHE_LOCK = threading.Lock()
+_MAX_LEDGER_LINE_BYTES: Final[int] = 8 * 1024 * 1024
+
+
+@dataclass
+class _LedgerSessionIndex:
+    device: int
+    inode: int
+    observed_size: int
+    modified_ns: int
+    scanned_offset: int
+    spans: dict[str, list[tuple[int, int]]]
+
+
+_LEDGER_SESSION_INDEX_CACHE: dict[tuple[Path, bool], _LedgerSessionIndex] = {}
+_LEDGER_SESSION_INDEX_LOCK = threading.Lock()
+
+
+def build_dashboard_revision(
+    *,
+    state_dir: Path,
+    discord_service_status_path: Path | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Return the tiny cross-service commit/ack state used for fast polling."""
+
+    observed = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    root = Path(state_dir)
+    engine = load_service_sync(root)
+    if engine is None:
+        try:
+            status = _object(root / "status.json")
+        except (OSError, ValueError, json.JSONDecodeError):
+            status = {}
+        engine = {
+            "state_revision": status.get("state_revision"),
+            "content_revision": status.get("content_revision"),
+            "engine_run_id": status.get("engine_run_id"),
+            "published_at": status.get("updated_at"),
+            "enabled_markets": sorted((status.get("modes") or {}).keys()),
+            "modes": status.get("modes") or {},
+        }
+
+    bot_path = (
+        Path(discord_service_status_path)
+        if discord_service_status_path is not None
+        else None
+    )
+    try:
+        bot = read_json_object(bot_path) if bot_path is not None else None
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        bot = None
+
+    engine_revision = int(engine.get("state_revision") or 0)
+    content_revision = int(engine.get("content_revision") or engine_revision)
+    bot_revision = int((bot or {}).get("engine_state_revision") or 0)
+    engine_markets = sorted(str(item) for item in engine.get("enabled_markets") or ())
+    bot_markets = sorted(
+        str(item) for item in (bot or {}).get("day_trade_markets") or ()
+    )
+    engine_age = age_seconds(engine.get("published_at"), now=observed)
+    bot_age = age_seconds((bot or {}).get("updated_at"), now=observed)
+    bot_fresh = bot_age is not None and bot_age <= 5.0
+    bot_connected = bool((bot or {}).get("discord_connected", False))
+    synchronized = bool(
+        bot is not None
+        and bot_fresh
+        and bot_connected
+        and engine_revision > 0
+        and bot_revision == engine_revision
+        and bot_markets == engine_markets
+    )
+    if bot_path is None:
+        status_text = "engine_committed"
+    elif bot is None or not bot_fresh:
+        status_text = "discord_stale"
+    elif not bot_connected:
+        status_text = "discord_connecting"
+    elif bot_revision != engine_revision or bot_markets != engine_markets:
+        status_text = "catching_up"
+    else:
+        status_text = "synchronized"
+
+    preopen_revision = "none"
+    if bot_path is not None:
+        preopen_path = bot_path.with_name("preopen_readiness.json")
+        try:
+            preopen_stat = preopen_path.stat()
+            preopen_revision = f"{preopen_stat.st_size}:{preopen_stat.st_mtime_ns}"
+        except OSError:
+            preopen_revision = "missing"
+
+    return {
+        "schema_version": 1,
+        "generated_at_utc": observed.isoformat(timespec="milliseconds"),
+        "revision_token": f"{content_revision}:{preopen_revision}",
+        "state_revision": engine_revision,
+        "content_revision": content_revision,
+        "engine_published_at": engine.get("published_at"),
+        "engine_age_seconds": (
+            round(engine_age, 3) if engine_age is not None else None
+        ),
+        "enabled_markets": engine_markets,
+        "discord": {
+            "available": bot is not None,
+            "connected": bot_connected,
+            "updated_at": (bot or {}).get("updated_at"),
+            "age_seconds": round(bot_age, 3) if bot_age is not None else None,
+            "engine_state_revision": bot_revision,
+            "day_trade_markets": bot_markets,
+        },
+        "status": status_text,
+        "synchronized": synchronized,
+        "revision_lag": max(0, engine_revision - bot_revision),
+        "contract": (
+            "Discord publishes immutable signals; the paper engine owns the ledger "
+            "and publishes this commit revision last; the dashboard is read-only."
+        ),
+    }
 
 
 def _object(path: Path) -> dict[str, Any]:
@@ -278,6 +399,182 @@ def _tail(path: Path, maximum_rows: int) -> list[dict[str, Any]]:
     return list(result)
 
 
+def _ledger_row_session_date(
+    row: Mapping[str, Any], *, recorded_at_fallback: bool
+) -> str:
+    explicit = str(row.get("session_date") or "")[:10]
+    if explicit:
+        try:
+            datetime_date.fromisoformat(explicit)
+        except ValueError:
+            return ""
+        return explicit
+    if not recorded_at_fallback or not row.get("recorded_at"):
+        return ""
+    try:
+        return _timestamp(row["recorded_at"]).astimezone(TAIPEI).date().isoformat()
+    except (TypeError, ValueError):
+        return ""
+
+
+def _ledger_session_index(
+    path: Path, *, recorded_at_fallback: bool = True
+) -> _LedgerSessionIndex | None:
+    """Incrementally index append-only ledger byte spans by session date.
+
+    Dashboard date discovery needs only a few dates and byte offsets. Keeping
+    tens of thousands of decoded signal dictionaries merely to learn those
+    dates amplified a 105 MiB ledger into hundreds of MiB of resident Python
+    objects. This index parses each complete line once, retains only compact
+    contiguous byte spans, and scans only appended bytes on later calls.
+    """
+
+    source = Path(path)
+    if not source.is_file():
+        return None
+    cache_key = (source.resolve(), bool(recorded_at_fallback))
+    with _LEDGER_SESSION_INDEX_LOCK:
+        for _attempt in range(3):
+            stat = source.stat()
+            cached = _LEDGER_SESSION_INDEX_CACHE.get(cache_key)
+            can_extend = bool(
+                cached is not None
+                and (cached.device, cached.inode) == (stat.st_dev, stat.st_ino)
+                and stat.st_size >= cached.observed_size
+                and not (
+                    stat.st_size == cached.observed_size
+                    and stat.st_mtime_ns != cached.modified_ns
+                )
+            )
+            if (
+                can_extend
+                and cached is not None
+                and stat.st_size == cached.observed_size
+                and stat.st_mtime_ns == cached.modified_ns
+            ):
+                return cached
+
+            if can_extend and cached is not None:
+                scanned_offset = cached.scanned_offset
+                spans = {key: list(value) for key, value in cached.spans.items()}
+            else:
+                scanned_offset = 0
+                spans = {}
+
+            with source.open("rb") as handle:
+                handle.seek(scanned_offset)
+                cursor = scanned_offset
+                while cursor < stat.st_size:
+                    line_start = cursor
+                    remaining = stat.st_size - cursor
+                    line = handle.readline(min(_MAX_LEDGER_LINE_BYTES + 1, remaining))
+                    cursor = handle.tell()
+                    if not line.endswith(b"\n"):
+                        if len(line) > _MAX_LEDGER_LINE_BYTES:
+                            raise ValueError(
+                                f"dashboard ledger line is too large: {source}"
+                            )
+                        cursor = line_start
+                        break
+                    if len(line) > _MAX_LEDGER_LINE_BYTES:
+                        raise ValueError(
+                            f"dashboard ledger line is too large: {source}"
+                        )
+                    if not line.strip():
+                        scanned_offset = cursor
+                        continue
+                    payload = json.loads(line)
+                    if not isinstance(payload, dict):
+                        scanned_offset = cursor
+                        continue
+                    session_date = _ledger_row_session_date(
+                        payload,
+                        recorded_at_fallback=recorded_at_fallback,
+                    )
+                    if session_date:
+                        date_spans = spans.setdefault(session_date, [])
+                        if date_spans and date_spans[-1][1] == line_start:
+                            date_spans[-1] = (date_spans[-1][0], cursor)
+                        else:
+                            date_spans.append((line_start, cursor))
+                    scanned_offset = cursor
+
+            final_stat = source.stat()
+            if (
+                final_stat.st_dev,
+                final_stat.st_ino,
+                final_stat.st_size,
+                final_stat.st_mtime_ns,
+            ) != (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns):
+                continue
+            result = _LedgerSessionIndex(
+                device=stat.st_dev,
+                inode=stat.st_ino,
+                observed_size=stat.st_size,
+                modified_ns=stat.st_mtime_ns,
+                scanned_offset=scanned_offset,
+                spans=spans,
+            )
+            _LEDGER_SESSION_INDEX_CACHE[cache_key] = result
+            return result
+    raise OSError(f"dashboard ledger changed repeatedly while indexing: {source}")
+
+
+def _rows_for_sessions(
+    path: Path,
+    session_dates: list[str] | tuple[str, ...],
+    maximum_rows: int,
+    *,
+    recorded_at_fallback: bool = False,
+) -> dict[str, tuple[dict[str, Any], ...]]:
+    """Read only byte spans belonging to the requested retained sessions."""
+
+    selected_dates = tuple(
+        dict.fromkeys(str(value) for value in session_dates if value)
+    )
+    if maximum_rows <= 0 or not selected_dates:
+        return {}
+    index = _ledger_session_index(
+        path,
+        recorded_at_fallback=recorded_at_fallback,
+    )
+    if index is None:
+        return {}
+    selected_spans = sorted(
+        (start, end, session_date)
+        for session_date in selected_dates
+        for start, end in index.spans.get(session_date, ())
+    )
+    retained: deque[tuple[str, dict[str, Any]]] = deque(maxlen=maximum_rows)
+    source = Path(path)
+    stat = source.stat()
+    if (stat.st_dev, stat.st_ino) != (index.device, index.inode):
+        raise OSError(f"dashboard ledger changed before indexed read: {source}")
+    with source.open("rb") as handle:
+        for start, end, indexed_date in selected_spans:
+            handle.seek(start)
+            while handle.tell() < end:
+                remaining = end - handle.tell()
+                line = handle.readline(min(_MAX_LEDGER_LINE_BYTES + 1, remaining))
+                if not line.endswith(b"\n") or len(line) > _MAX_LEDGER_LINE_BYTES:
+                    raise ValueError(f"dashboard ledger span is invalid: {source}")
+                if not line.strip():
+                    continue
+                payload = json.loads(line)
+                if not isinstance(payload, dict):
+                    continue
+                session_date = _ledger_row_session_date(
+                    payload,
+                    recorded_at_fallback=recorded_at_fallback,
+                )
+                if session_date == indexed_date:
+                    retained.append((session_date, payload))
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for session_date, row in retained:
+        grouped.setdefault(session_date, []).append(row)
+    return {key: tuple(value) for key, value in grouped.items()}
+
+
 def _tail_for_session(
     path: Path,
     maximum_rows: int,
@@ -353,40 +650,6 @@ def _tail_for_session(
                 _SESSION_TAIL_CACHE.pop(next(iter(_SESSION_TAIL_CACHE)))
             _SESSION_TAIL_CACHE[cache_key] = (*signature, result)
     return list(result)
-
-
-def _rows_by_session(
-    path: Path, maximum_rows: int
-) -> dict[str, tuple[dict[str, Any], ...]]:
-    """Index a bounded append-only tail once for repeated interactive filters."""
-
-    if maximum_rows <= 0 or not path.is_file():
-        return {}
-    stat = path.stat()
-    cache_key = (path.resolve(), int(maximum_rows))
-    signature = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
-    with _ROWS_BY_SESSION_CACHE_LOCK:
-        cached = _ROWS_BY_SESSION_CACHE.get(cache_key)
-        if cached is not None and cached[:4] == signature:
-            return dict(cached[4])
-    grouped: dict[str, list[dict[str, Any]]] = {}
-    for row in _tail(path, maximum_rows):
-        session_date = str(row.get("session_date") or "")[:10]
-        if session_date:
-            grouped.setdefault(session_date, []).append(row)
-    result = {key: tuple(value) for key, value in grouped.items()}
-    final_stat = path.stat()
-    if (
-        final_stat.st_dev,
-        final_stat.st_ino,
-        final_stat.st_size,
-        final_stat.st_mtime_ns,
-    ) == signature:
-        with _ROWS_BY_SESSION_CACHE_LOCK:
-            if len(_ROWS_BY_SESSION_CACHE) >= 8:
-                _ROWS_BY_SESSION_CACHE.pop(next(iter(_ROWS_BY_SESSION_CACHE)))
-            _ROWS_BY_SESSION_CACHE[cache_key] = (*signature, result)
-    return dict(result)
 
 
 def _percentile(values: list[float], quantile: float) -> float | None:
@@ -1139,26 +1402,25 @@ def _available_session_dates(
     for raw_mode in (state.get("modes") or {}).values():
         if isinstance(raw_mode, Mapping) and raw_mode.get("session_date"):
             dates.add(str(raw_mode["session_date"])[:10])
-    for filename, maximum_rows in (
-        ("marks.jsonl", 100_000),
-        ("signals.jsonl", 100_000),
-        ("orders.jsonl", 100_000),
-        ("fills.jsonl", 100_000),
-        ("benchmark_marks.jsonl", 100_000),
-        ("events.jsonl", 20_000),
+    for filename in (
+        "marks.jsonl",
+        "signals.jsonl",
+        "orders.jsonl",
+        "fills.jsonl",
+        "benchmark_marks.jsonl",
+        "events.jsonl",
     ):
-        for row in _tail(root / filename, maximum_rows):
-            session_date = str(row.get("session_date") or "")[:10]
-            if session_date:
-                dates.add(session_date)
-            recorded_at = row.get("recorded_at")
-            if recorded_at:
-                try:
-                    dates.add(
-                        _timestamp(recorded_at).astimezone(TAIPEI).date().isoformat()
-                    )
-                except (TypeError, ValueError):
-                    continue
+        # Core execution ledgers carry an explicit session_date and their
+        # detail readers use that exact contract. Reuse the same compact index
+        # instead of building a duplicate fallback index over every row.
+        # events.jsonl is the sole retained legacy stream whose date is derived
+        # from recorded_at in Taipei time.
+        index = _ledger_session_index(
+            root / filename,
+            recorded_at_fallback=filename == "events.jsonl",
+        )
+        if index is not None:
+            dates.update(index.spans)
     benchmark_history = _load_benchmark_history(root)
     for row in benchmark_history.get("marks") or ():
         if isinstance(row, Mapping) and row.get("session_date"):
@@ -1344,8 +1606,23 @@ def build_dashboard_history_snapshot(
             return_fraction = _finite_float(row.get("return_fraction"))
         if return_pct is None:
             return
+        if return_fraction is None:
+            return_fraction = float(return_pct) / 100.0
+        initial_capital = _finite_float(row.get("initial_capital_twd"))
+        total_equity = _finite_float(row.get("total_equity_twd"))
+        wealth_index = 1.0 + float(return_fraction)
+        if not math.isfinite(wealth_index) or wealth_index <= 0.0:
+            return
+        if total_equity is None and initial_capital is not None:
+            total_equity = initial_capital * wealth_index
         minute = datetime.fromtimestamp(timestamp_seconds, tz=timezone.utc).isoformat(
             timespec="minutes"
+        )
+        session_date = (
+            datetime.fromtimestamp(timestamp_seconds, tz=timezone.utc)
+            .astimezone(TAIPEI)
+            .date()
+            .isoformat()
         )
         deduplicated[(series_id, minute)] = {
             "series_id": series_id,
@@ -1355,9 +1632,15 @@ def build_dashboard_history_snapshot(
                 row.get("benchmark_id") if series_type == "benchmark" else None
             ),
             "minute": minute,
+            "session_date": session_date,
             "timestamp_seconds": timestamp_seconds,
             "return_fraction": return_fraction,
             "return_pct": return_pct,
+            "cumulative_return_fraction": return_fraction,
+            "cumulative_return_pct": return_pct,
+            "_initial_capital_twd": initial_capital,
+            "_total_equity_twd": total_equity,
+            "_wealth_index": wealth_index,
             "valuation_stale": bool(row.get("valuation_stale", False)),
             "historical_minute_replay": bool(
                 row.get("historical_minute_replay", False)
@@ -1387,7 +1670,11 @@ def build_dashboard_history_snapshot(
             series_type="benchmark",
         )
 
-    rows = list(deduplicated.values())
+    all_rows = sorted(
+        deduplicated.values(),
+        key=lambda row: (float(row["timestamp_seconds"]), str(row["series_id"])),
+    )
+    rows = list(all_rows)
     available_dates = [
         datetime.fromtimestamp(float(row["timestamp_seconds"]), tz=timezone.utc)
         .astimezone(TAIPEI)
@@ -1429,6 +1716,28 @@ def build_dashboard_history_snapshot(
     )
     if cutoff is not None:
         rows = [row for row in rows if float(row["timestamp_seconds"]) >= cutoff]
+
+    # A detail-date selection is a period-return question.  Rebase every series
+    # to its last retained equity before the selected start date; if the ledger
+    # begins inside the requested range, its explicit initial capital is the
+    # only valid fallback.  This keeps cards, legend values, and chart points on
+    # exactly the same denominator without manufacturing an opening zero point.
+    baseline_by_series: dict[str, dict[str, Any]] = {}
+    if selected_start is not None:
+        for row in all_rows:
+            if datetime_date.fromisoformat(str(row["session_date"])) >= selected_start:
+                continue
+            baseline_by_series[str(row["series_id"])] = row
+        for row in rows:
+            baseline = baseline_by_series.get(str(row["series_id"]))
+            baseline_wealth = (
+                float(baseline["_wealth_index"]) if baseline is not None else 1.0
+            )
+            row_wealth = float(row["_wealth_index"])
+            range_return = row_wealth / baseline_wealth - 1.0
+            row["return_fraction"] = range_return
+            row["return_pct"] = range_return * 100.0
+
     historical_rows = [row for row in rows if row["historical_minute_replay"]]
     fresh_coverage = [
         value
@@ -1439,6 +1748,70 @@ def build_dashboard_history_snapshot(
     grouped: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
         grouped.setdefault(str(row["series_id"]), []).append(row)
+    range_summary: list[dict[str, Any]] = []
+    for series_id, series_rows in sorted(grouped.items()):
+        series_rows.sort(key=lambda row: float(row["timestamp_seconds"]))
+        first = series_rows[0]
+        last = series_rows[-1]
+        baseline = baseline_by_series.get(series_id)
+        baseline_wealth = (
+            float(baseline["_wealth_index"])
+            if selected_start is not None and baseline is not None
+            else 1.0
+        )
+        initial_capital = _finite_float(first.get("_initial_capital_twd"))
+        baseline_equity = (
+            _finite_float(baseline.get("_total_equity_twd"))
+            if baseline is not None
+            else initial_capital
+        )
+        end_equity = _finite_float(last.get("_total_equity_twd"))
+        if baseline_equity is None and initial_capital is not None:
+            baseline_equity = initial_capital * baseline_wealth
+        if end_equity is None and initial_capital is not None:
+            end_equity = initial_capital * float(last["_wealth_index"])
+        session_point_counts: dict[str, int] = {}
+        for row in series_rows:
+            session = str(row["session_date"])
+            session_point_counts[session] = session_point_counts.get(session, 0) + 1
+        # Right-labelled historical KBars cover 09:01..13:30 (270 points).
+        # Strategy ledgers additionally retain the accepted 09:00 execution
+        # endpoint, so their full-session curve has 271 observations.
+        points_per_session = 271 if first["series_type"] == "strategy" else 270
+        expected_minute_points = points_per_session * len(session_point_counts)
+        range_summary.append(
+            {
+                "series_id": series_id,
+                "series_type": first["series_type"],
+                "baseline_kind": (
+                    "previous_retained_mark"
+                    if selected_start is not None and baseline is not None
+                    else "initial_capital"
+                ),
+                "baseline_at_utc": baseline.get("minute") if baseline else None,
+                "baseline_equity_twd": baseline_equity,
+                "start_at_utc": first["minute"],
+                "end_at_utc": last["minute"],
+                "start_equity_twd": _finite_float(first.get("_total_equity_twd")),
+                "end_equity_twd": end_equity,
+                "range_net_pnl_twd": (
+                    end_equity - baseline_equity
+                    if end_equity is not None and baseline_equity is not None
+                    else None
+                ),
+                "return_fraction": last["return_fraction"],
+                "return_pct": last["return_pct"],
+                "point_count": len(series_rows),
+                "session_point_counts": session_point_counts,
+                "expected_minute_points": expected_minute_points,
+                "expected_points_per_session": points_per_session,
+                "minute_coverage_ratio": (
+                    len(series_rows) / expected_minute_points
+                    if expected_minute_points
+                    else None
+                ),
+            }
+        )
     sampled = [
         row
         for series_rows in grouped.values()
@@ -1448,7 +1821,13 @@ def build_dashboard_history_snapshot(
     ]
     sampled.sort(key=lambda row: (float(row["timestamp_seconds"]), row["series_id"]))
     for row in sampled:
-        row.pop("timestamp_seconds", None)
+        for internal_key in (
+            "timestamp_seconds",
+            "_initial_capital_twd",
+            "_total_equity_twd",
+            "_wealth_index",
+        ):
+            row.pop(internal_key, None)
     coverage_start = sampled[0]["minute"] if sampled else None
     coverage_end = sampled[-1]["minute"] if sampled else None
     return {
@@ -1475,6 +1854,11 @@ def build_dashboard_history_snapshot(
         "raw_points_in_range": len(rows),
         "returned_points": len(sampled),
         "downsampled": len(sampled) < len(rows),
+        "curve_granularity": "1m",
+        "expected_right_labelled_session_minute_points": 270,
+        "expected_strategy_session_points_including_09_00": 271,
+        "return_basis": "previous_retained_mark_before_start_else_initial_capital",
+        "range_summary": range_summary,
         "historical_minute_replay_points": len(historical_rows),
         "historical_minute_carried_price_points": sum(
             int(row.get("last_trade_carried_position_count") or 0) > 0
@@ -1767,7 +2151,7 @@ def _session_progress(
     def at(hour: int, minute: int) -> datetime:
         return datetime.combine(day, datetime_time(hour, minute), tzinfo=TAIPEI)
 
-    preopen_at = at(8, 30)
+    preopen_at = at(8, 15)
     signal_at = at(9, 0)
     exit_limit_at = at(13, 20)
     force_exit_at = at(13, 24)
@@ -1775,7 +2159,7 @@ def _session_progress(
     session_end_at = at(13, 30)
     if local < preopen_at:
         phase = "waiting_prewarm"
-        label = "等待 08:30 預熱"
+        label = "等待 08:15 預熱"
         phase_start, phase_end = at(0, 0), preopen_at
         next_label, next_at = "開始預熱", preopen_at
     elif local < signal_at:
@@ -1980,11 +2364,22 @@ def build_dashboard_snapshot(
     maximum_signal_rows: int = 0,
     maximum_event_rows: int = 2_000,
     maximum_mark_rows: int = 4_000,
+    include_position_rows: bool = True,
 ) -> dict[str, Any]:
     root = Path(state_dir)
     state = _object(root / "state.json")
     status = _object(root / "status.json")
     observed = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    discord_service_status_path = (
+        Path(preopen_readiness_path).with_name(DISCORD_SERVICE_STATUS_FILENAME)
+        if preopen_readiness_path is not None
+        else None
+    )
+    service_sync = build_dashboard_revision(
+        state_dir=root,
+        discord_service_status_path=discord_service_status_path,
+        now=observed,
+    )
     available_session_dates = _available_session_dates(
         root=root,
         state=state,
@@ -2021,7 +2416,12 @@ def build_dashboard_snapshot(
 
     modes: list[dict[str, Any]] = []
     positions: list[dict[str, Any]] = []
+    configured_markets = state.get("enabled_markets")
+    has_enabled_market_contract = isinstance(configured_markets, list)
+    enabled_markets = {str(market) for market in (configured_markets or ())}
     for market, raw_mode in (state.get("modes") or {}).items():
+        if has_enabled_market_contract and str(market) not in enabled_markets:
+            continue
         mode = dict(raw_mode) if isinstance(raw_mode, Mapping) else {}
         return_fraction, return_pct = _capital_return(
             mode.get("initial_capital_twd"), mode.get("total_equity_twd")
@@ -2072,10 +2472,29 @@ def build_dashboard_snapshot(
                 "price_limit_offset_ticks": mode.get("price_limit_offset_ticks", 0),
                 "bracket_price_policy": mode.get("bracket_price_policy"),
                 "fill_guaranteed": bool(mode.get("fill_guaranteed", False)),
+                # Preserve the currently deployed execution contract before a
+                # historical session view below restores the contract recorded
+                # by that session's immutable signal event.  The dashboard must
+                # show both facts instead of making a legacy replay look like
+                # the active policy (or rewriting it as though it had used the
+                # active policy).
+                "configured_entry_fill_policy": mode.get("entry_fill_policy"),
+                "configured_entry_price_offset_ticks": mode.get(
+                    "entry_price_offset_ticks", 0
+                ),
+                "configured_entry_fill_is_synthetic": bool(
+                    mode.get("entry_fill_is_synthetic", False)
+                ),
                 "entry_fill_policy": mode.get("entry_fill_policy"),
                 "entry_price_offset_ticks": mode.get("entry_price_offset_ticks", 0),
                 "entry_fill_is_synthetic": bool(
                     mode.get("entry_fill_is_synthetic", False)
+                ),
+                "entry_best_quote_fill_count": int(
+                    mode.get("entry_best_quote_fill_count") or 0
+                ),
+                "entry_synthetic_fallback_fill_count": int(
+                    mode.get("entry_synthetic_fallback_fill_count") or 0
                 ),
                 "engine_status": mode.get("engine_status"),
                 "checkpoint_ready": mode.get("checkpoint_ready"),
@@ -2345,6 +2764,12 @@ def build_dashboard_snapshot(
                 (signal_event or {}).get("entry_fill_is_synthetic")
                 or mode.get("entry_fill_is_synthetic", False)
             )
+            mode["entry_best_quote_fill_count"] = int(
+                (signal_event or {}).get("entry_best_quote_fill_count") or 0
+            )
+            mode["entry_synthetic_fallback_fill_count"] = int(
+                (signal_event or {}).get("entry_synthetic_fallback_fill_count") or 0
+            )
             mode["simulation_replay"] = bool(
                 (signal_event or {}).get("simulation_replay", False)
             )
@@ -2481,6 +2906,7 @@ def build_dashboard_snapshot(
         "health": health,
         "source_updated_at": status.get("updated_at"),
         "source_age_seconds": round(source_age, 3),
+        "service_sync": service_sync,
         "simulation_only": True,
         "production_order_possible": False,
         "session_date": selected_session_date,
@@ -2494,7 +2920,7 @@ def build_dashboard_snapshot(
         "session_progress": session_progress,
         "modes": modes,
         "benchmarks": benchmarks,
-        "positions": positions,
+        "positions": positions if include_position_rows else [],
         "signals": signals,
         "orders": orders,
         "fills": fills,
@@ -2503,7 +2929,7 @@ def build_dashboard_snapshot(
         "events": events,
         "record_counts": record_counts,
         "payload_window": {
-            "positions": len(positions),
+            "positions": len(positions) if include_position_rows else 0,
             "signals": len(signals),
             "orders": len(orders),
             "fills": len(fills),
@@ -2520,6 +2946,7 @@ def build_dashboard_snapshot(
             "replay": "simulation_replay=true is a retrospective, explicitly counterfactual fill at the actual session open from official daily data, a fresh same-session Shioaji snapshot, or retained provenance-bearing same-session TWSE/TPEx MIS or Shioaji live-signal evidence; it is not a causally executable quote or real order fill",
             "entry_fill": "causally later best ask for buy or best bid for sell is used immediately after the 09:00 signal-ready timestamp; submitted simulated market quantity is fully filled, while target quantity beyond fresh displayed depth is explicitly left unsubmitted",
             "latency": "measured signal input through model, atomic artifact publication, consumer discovery, fresh executable quote, and durable simulation-ledger persistence on this host; it is not an external order acknowledgement or venue round-trip measurement",
+            "service_sync": "Discord, the paper engine, and the dashboard share one compact engine commit revision; Discord acknowledges that revision without reparsing the full ledger and the dashboard fetches heavy state only when the revision changes",
             "mark": "best bid liquidates long; best ask covers short",
             "missing_mark": "carry only the same open position's last complete liquidation value and flag stale",
             "eligibility": "exact-session TWSE and TPEx official day-trade membership; missing venue/date blocks",
@@ -2562,8 +2989,18 @@ def build_dashboard_signal_page(
         raise ValueError("limit must be between 1 and 1000")
     root = Path(state_dir)
     state = _object(root / "state.json")
-    state_path = root / "state.json"
-    state_signature = state_path.stat()
+    state_signal_signature = tuple(
+        sorted(
+            (
+                str(market),
+                str(raw_mode.get("session_date") or ""),
+                str(raw_mode.get("initial_capital_twd") or ""),
+                str(raw_mode.get("signal_source_path") or ""),
+            )
+            for market, raw_mode in (state.get("modes") or {}).items()
+            if isinstance(raw_mode, Mapping)
+        )
+    )
     observed = datetime.now(timezone.utc)
     available_session_dates = _available_session_dates(
         root=root,
@@ -2595,13 +3032,17 @@ def build_dashboard_signal_page(
         normalized_status,
         int(offset),
         int(limit),
-        state_signature.st_mtime_ns,
+        state_signal_signature,
     )
     with _SIGNAL_PAGE_CACHE_LOCK:
         cached_page = _SIGNAL_PAGE_CACHE.get(cache_key)
         if cached_page is not None:
             return dict(cached_page)
-    rows_by_session = _rows_by_session(signal_path, maximum_scan_rows)
+    rows_by_session = _rows_for_sessions(
+        signal_path,
+        selected_session_dates,
+        maximum_scan_rows,
+    )
     current_rows = [
         row
         for selected_date in selected_session_dates
@@ -2980,20 +3421,26 @@ def build_dashboard_event_page(
                 return False
         return True
 
+    order_rows = _rows_for_sessions(
+        root / "orders.jsonl",
+        selected_session_dates,
+        maximum_scan_rows,
+    )
+    fill_rows = _rows_for_sessions(
+        root / "fills.jsonl",
+        selected_session_dates,
+        maximum_scan_rows,
+    )
     orders = [
         safe_event(row, "order")
         for selected_date in selected_session_dates
-        for row in _tail_for_session(
-            root / "orders.jsonl", maximum_scan_rows, selected_date
-        )
+        for row in order_rows.get(selected_date, ())
         if included(row)
     ]
     fills = [
         safe_event(row, "fill")
         for selected_date in selected_session_dates
-        for row in _tail_for_session(
-            root / "fills.jsonl", maximum_scan_rows, selected_date
-        )
+        for row in fill_rows.get(selected_date, ())
         if included(row)
     ]
     rows = orders + fills
@@ -3050,6 +3497,7 @@ def build_dashboard_summary(
         maximum_signal_rows=0,
         maximum_event_rows=500,
         maximum_mark_rows=4_000,
+        include_position_rows=False,
     )
     keys = (
         "schema_version",
@@ -3057,6 +3505,7 @@ def build_dashboard_summary(
         "health",
         "source_updated_at",
         "source_age_seconds",
+        "service_sync",
         "session_date",
         "available_session_dates",
         "preopen",
@@ -3073,6 +3522,7 @@ __all__ = [
     "build_dashboard_event_page",
     "build_dashboard_history_snapshot",
     "build_dashboard_position_page",
+    "build_dashboard_revision",
     "build_dashboard_signal_page",
     "build_dashboard_snapshot",
     "build_dashboard_summary",

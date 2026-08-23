@@ -8,14 +8,17 @@ service_template="$repo_root/deploy/systemd/$service_name.in"
 timer_template="$repo_root/deploy/systemd/$timer_name.in"
 service_target="/etc/systemd/system/$service_name"
 timer_target="/etc/systemd/system/$timer_name"
-start_now=true
+start_now=false
 
 usage() {
-  echo "Usage: sudo bash scripts/install_taifex_futures_daily_service.sh [--no-start]" >&2
+  echo "Usage: sudo bash scripts/install_taifex_futures_daily_service.sh [--run-now|--no-start]" >&2
 }
 
 for argument in "$@"; do
   case "$argument" in
+    --run-now)
+      start_now=true
+      ;;
     --no-start)
       start_now=false
       ;;
@@ -71,11 +74,13 @@ install -m 0644 "$rendered_service" "$service_target"
 install -m 0644 "$rendered_timer" "$timer_target"
 chmod 0755 "$repo_root/scripts/run_taifex_all_futures_daily.sh"
 systemctl daemon-reload
-systemctl enable "$service_name"
+# This two-minute-plus batch is scheduled work, not a boot prerequisite. Remove
+# legacy multi-user.target symlinks without stopping an already running refresh.
+systemctl disable "$service_name" >/dev/null 2>&1 || true
 systemctl enable --now "$timer_name"
 if [[ "$start_now" == true ]]; then
   systemctl restart "$service_name"
 fi
 
-echo "[taifex-futures-daily] service=$service_target enabled=$(systemctl is-enabled "$service_name")"
+echo "[taifex-futures-daily] service=$service_target trigger=$(systemctl is-enabled "$service_name" 2>/dev/null || true)"
 echo "[taifex-futures-daily] timer=$timer_target enabled=$(systemctl is-enabled "$timer_name")"

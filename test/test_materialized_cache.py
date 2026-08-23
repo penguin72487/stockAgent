@@ -77,6 +77,33 @@ def test_reuse_renews_lease_without_rewriting_materialized_file(
     assert file_path.stat().st_ino == inode
 
 
+def test_noop_publish_reuses_inventory_snapshot_id(tmp_path: Path) -> None:
+    sync_root, first_id = _release(tmp_path, content="unchanged")
+
+    _, second_id = _release(tmp_path, content="unchanged")
+
+    assert second_id == first_id
+
+
+def test_verify_quarantines_and_recovers_mutated_hot_tree(tmp_path: Path) -> None:
+    sync_root, _ = _release(tmp_path, content="authoritative")
+    hot_root = tmp_path / "hot"
+    first = use_materialized_snapshot(sync_root, hot_root, "prices")
+    target = Path(first["target"])
+    (target / "prices.csv").write_text("mutated", encoding="utf-8")
+
+    recovered = use_materialized_snapshot(
+        sync_root,
+        hot_root,
+        "prices",
+        verify_existing=True,
+    )
+
+    assert (Path(recovered["target"]) / "prices.csv").read_text() == "authoritative"
+    quarantine = recovered["recovered_corrupt_materialization"]
+    assert (Path(quarantine["tree"]) / "prices.csv").read_text() == "mutated"
+
+
 def test_expired_gc_removes_only_hot_copy_and_can_refetch(tmp_path: Path) -> None:
     sync_root, snapshot_id = _release(tmp_path)
     hot_root = tmp_path / "hot"

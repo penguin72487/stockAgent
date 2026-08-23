@@ -39,6 +39,11 @@ from common import (
     retry_delay_seconds,
     run_parallel_tasks,
 )
+from ohlcv_hot_tail import (
+    hot_tail_path,
+    read_logical_parquet,
+    remove_hot_tail,
+)
 
 
 BASE_URL = "https://api.bybit.com"
@@ -74,7 +79,9 @@ def _stored_parquet_inventory(
     paths = sorted(output_dir.glob("*_features.parquet"))
     for path in paths:
         code = path.name.removesuffix("_features.parquet")
-        rows = _read_parquet_row_count(path)
+        rows = _load_logical_existing_candle_info(
+            path, require_contiguous=False
+        ).rows
         stored_rows += rows
         if code not in current_codes:
             retained_symbols.append(code)
@@ -118,6 +125,17 @@ class SymbolRecord:
     contract_type: str | None
     status: str | None
     launch_time: str | None
+    symbol_type: str | None
+    funding_interval_minutes: int | None
+    is_pre_listing: bool
+    price_tick_size: float | None
+    minimum_order_quantity: float | None
+    quantity_step: float | None
+    minimum_notional_value: float | None
+    maximum_order_quantity: float | None
+    maximum_market_order_quantity: float | None
+    maximum_leverage: float | None
+    unified_margin_trade: bool
 
 
 @dataclass(slots=True)
@@ -169,6 +187,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--limit", type=int, default=None, help="Optional symbol limit for quick tests"
+    )
+    parser.add_argument(
+        "--symbols",
+        nargs="*",
+        default=None,
+        help="Optional exact Bybit symbols; useful for product-specific updates.",
     )
     parser.add_argument(
         "--refresh", action="store_true", help="Re-download even if parquet exists"
@@ -288,38 +312,30 @@ def _frame_matches_1m_interval(frame: pl.DataFrame) -> bool:
         .select(pl.col("date").str.to_datetime(strict=False).alias("date"))
         .drop_nulls("date")
     )
-    if parsed.height < 3:
+    if parsed.height == 0:
+        return True
+    if parsed.select(
+        (
+            (pl.col("date").dt.second() != 0)
+            | (pl.col("date").dt.microsecond() != 0)
+        ).any()
+    ).item():
+        return False
+    if parsed.height < 2:
         return True
 
     deltas = (
         parsed.sort("date")
         .select(pl.col("date").diff().dt.total_seconds().alias("delta"))
         .drop_nulls("delta")
-        .filter(pl.col("delta") > 0)
     )
     if deltas.is_empty():
         return True
-
-    median_delta = float(deltas.select(pl.col("delta").median()).item())
-    large_gap_share = float(
-        deltas.select(pl.col("delta").ge(12 * 60 * 60).mean()).item()
-    )
-    if large_gap_share > 0.05:
-        return False
-    midnight_share = float(
-        parsed.select(
-            (
-                pl.col("date").dt.hour().eq(0)
-                & pl.col("date").dt.minute().eq(0)
-                & pl.col("date").dt.second().eq(0)
-            )
-            .mean()
-            .alias("midnight_share")
+    return bool(
+        deltas.select(
+            pl.col("delta").eq(CANDLE_INTERVAL_MS // 1000).all()
         ).item()
     )
-    if midnight_share > 0.95 and median_delta >= 12 * 60 * 60:
-        return False
-    return median_delta <= (CANDLE_INTERVAL_MS / 1000) * 4
 
 
 def _latest_ms_from_date_frame(frame: pl.DataFrame) -> int | None:
@@ -346,7 +362,11 @@ def _earliest_ms_from_date_frame(frame: pl.DataFrame) -> int | None:
     return int(earliest.replace(tzinfo=timezone.utc).timestamp() * 1000)
 
 
-def _load_existing_candle_info(path: Path) -> ExistingCandleInfo:
+def _load_existing_candle_info(
+    path: Path,
+    *,
+    require_contiguous: bool = True,
+) -> ExistingCandleInfo:
     try:
         parquet = pq.ParquetFile(path, memory_map=True)
         row_count, earliest_ms, latest_ms, interval_likely_ok = (
@@ -367,6 +387,13 @@ def _load_existing_candle_info(path: Path) -> ExistingCandleInfo:
             earliest_ms is not None
             and latest_ms is not None
             and interval_likely_ok is True
+            and latest_ms >= earliest_ms
+            and (latest_ms - earliest_ms) % CANDLE_INTERVAL_MS == 0
+            and (
+                not require_contiguous
+                or row_count
+                == (latest_ms - earliest_ms) // CANDLE_INTERVAL_MS + 1
+            )
         ):
             return ExistingCandleInfo(
                 rows=row_count,
@@ -390,14 +417,70 @@ def _load_existing_candle_info(path: Path) -> ExistingCandleInfo:
         )
 
 
+def _load_logical_existing_candle_info(
+    path: Path,
+    *,
+    require_contiguous: bool = True,
+) -> ExistingCandleInfo:
+    base = _load_existing_candle_info(path, require_contiguous=require_contiguous)
+    tail_path = hot_tail_path(path)
+    if not tail_path.is_file() or base.error is not None:
+        return base
+    tail = _load_existing_candle_info(tail_path)
+    if tail.error is not None:
+        return ExistingCandleInfo(
+            rows=base.rows,
+            latest_ms=base.latest_ms,
+            interval_ok=False,
+            earliest_ms=base.earliest_ms,
+            error=f"hot tail: {tail.error}",
+        )
+    if base.latest_ms is None:
+        return tail
+
+    dates = _normalize_date_frame(_read_date_column(tail_path)).select(
+        pl.col("date").str.to_datetime(strict=False).alias("__ts")
+    )
+    base_latest = datetime.fromtimestamp(base.latest_ms / 1000, tz=timezone.utc).replace(
+        tzinfo=None
+    )
+    newer = dates.filter(pl.col("__ts") > base_latest)
+    first_new = newer.select(pl.col("__ts").min()).item() if newer.height else None
+    contiguous = first_new is None or int(
+        first_new.replace(tzinfo=timezone.utc).timestamp() * 1000
+    ) <= base.latest_ms + CANDLE_INTERVAL_MS
+    earliest_values = [
+        value for value in (base.earliest_ms, tail.earliest_ms) if value is not None
+    ]
+    latest_values = [
+        value for value in (base.latest_ms, tail.latest_ms) if value is not None
+    ]
+    return ExistingCandleInfo(
+        rows=base.rows + newer.height,
+        latest_ms=max(latest_values) if latest_values else None,
+        interval_ok=bool(base.interval_ok and tail.interval_ok and contiguous),
+        earliest_ms=min(earliest_values) if earliest_values else None,
+    )
+
+
 def _iter_windows(start_ms: int, end_ms: int) -> list[tuple[int, int]]:
+    """Return inclusive API windows with one boundary candle of overlap.
+
+    Bybit returns at most 1,000 reverse-sorted rows.  Retaining the previous
+    window's last candle as the next window's first candle makes the traversal
+    robust to either endpoint being omitted transiently; normalization removes
+    the deliberate duplicate.  Never advance by ``chunk_end + interval`` here.
+    """
+
     windows: list[tuple[int, int]] = []
     cursor = start_ms
 
     while cursor <= end_ms:
         chunk_end = min(cursor + BYBIT_WINDOW_SPAN_MS, end_ms)
         windows.append((cursor, chunk_end))
-        cursor = chunk_end + CANDLE_INTERVAL_MS
+        if chunk_end >= end_ms:
+            break
+        cursor = chunk_end
 
     return windows
 
@@ -535,6 +618,17 @@ def _fetch_perp_symbols(
                     continue
 
                 market = f"bybit_{category}_perp"
+                price_filter = item.get("priceFilter") or {}
+                lot_filter = item.get("lotSizeFilter") or {}
+                leverage_filter = item.get("leverageFilter") or {}
+
+                def optional_float(value: object) -> float | None:
+                    return (
+                        float(value)
+                        if value not in {None, ""}
+                        else None
+                    )
+
                 records.append(
                     SymbolRecord(
                         code=symbol,
@@ -550,6 +644,33 @@ def _fetch_perp_symbols(
                         launch_time=_ms_to_date_string(int(item["launchTime"]))
                         if item.get("launchTime")
                         else None,
+                        symbol_type=str(item.get("symbolType") or "").strip(),
+                        funding_interval_minutes=(
+                            int(item["fundingInterval"])
+                            if item.get("fundingInterval") not in {None, ""}
+                            else None
+                        ),
+                        is_pre_listing=bool(item.get("isPreListing", False)),
+                        price_tick_size=optional_float(price_filter.get("tickSize")),
+                        minimum_order_quantity=optional_float(
+                            lot_filter.get("minOrderQty")
+                        ),
+                        quantity_step=optional_float(lot_filter.get("qtyStep")),
+                        minimum_notional_value=optional_float(
+                            lot_filter.get("minNotionalValue")
+                        ),
+                        maximum_order_quantity=optional_float(
+                            lot_filter.get("maxOrderQty")
+                        ),
+                        maximum_market_order_quantity=optional_float(
+                            lot_filter.get("maxMktOrderQty")
+                        ),
+                        maximum_leverage=optional_float(
+                            leverage_filter.get("maxLeverage")
+                        ),
+                        unified_margin_trade=bool(
+                            item.get("unifiedMarginTrade", False)
+                        ),
                     )
                 )
 
@@ -625,7 +746,10 @@ def _download_symbol_1m(
         )
 
     if output_path.exists() and not refresh:
-        existing_info = _load_existing_candle_info(output_path)
+        existing_info = _load_logical_existing_candle_info(
+            output_path,
+            require_contiguous=not tail_only,
+        )
         if existing_info.error is not None or not existing_info.interval_ok:
             if tail_only:
                 return DownloadResult(
@@ -740,24 +864,72 @@ def _download_symbol_1m(
         )
 
     if existing_info is not None and existing_info.rows > 0:
-        existing_df = _read_parquet(output_path)
-        combined, changed = _merge_existing_with_fresh(
-            existing_df, df, effective_start_ms
-        )
-        if not changed:
+        if tail_only:
+            tail_path = hot_tail_path(output_path)
+            fresh_latest = _latest_ms_from_date_frame(df)
+            if (
+                not tail_path.is_file()
+                and fresh_latest is not None
+                and existing_info.latest_ms is not None
+                and fresh_latest <= existing_info.latest_ms
+            ):
+                return DownloadResult(
+                    asset_class="crypto_bybit_perp",
+                    code=record.code,
+                    bybit_symbol=record.bybit_symbol,
+                    market=record.market,
+                    status="skipped_up_to_date",
+                    rows=existing_info.rows,
+                    output_path=str(output_path),
+                )
+            if tail_path.is_file():
+                df, changed = _merge_existing_with_fresh(
+                    _read_parquet(tail_path), df, effective_start_ms
+                )
+            else:
+                changed = True
+            if not changed:
+                return DownloadResult(
+                    asset_class="crypto_bybit_perp",
+                    code=record.code,
+                    bybit_symbol=record.bybit_symbol,
+                    market=record.market,
+                    status="skipped_up_to_date",
+                    rows=existing_info.rows,
+                    output_path=str(output_path),
+                )
+            _write_parquet(df, tail_path)
+            logical = _load_logical_existing_candle_info(
+                output_path, require_contiguous=False
+            )
             return DownloadResult(
                 asset_class="crypto_bybit_perp",
                 code=record.code,
                 bybit_symbol=record.bybit_symbol,
                 market=record.market,
-                status="skipped_up_to_date",
-                rows=existing_info.rows,
+                status="updated",
+                rows=logical.rows,
                 output_path=str(output_path),
             )
+        combined, changed = _merge_existing_with_fresh(
+            read_logical_parquet(output_path), df, effective_start_ms
+        )
+        if not changed:
+            if not hot_tail_path(output_path).is_file():
+                return DownloadResult(
+                    asset_class="crypto_bybit_perp",
+                    code=record.code,
+                    bybit_symbol=record.bybit_symbol,
+                    market=record.market,
+                    status="skipped_up_to_date",
+                    rows=existing_info.rows,
+                    output_path=str(output_path),
+                )
         df = combined
 
     output_dir.mkdir(parents=True, exist_ok=True)
     _write_parquet(df, output_path)
+    remove_hot_tail(output_path)
 
     return DownloadResult(
         asset_class="crypto_bybit_perp",
@@ -794,7 +966,25 @@ def main() -> None:
         retry_base=args.retry_base,
     )
 
-    symbols = _fetch_perp_symbols(client, categories=categories, limit=args.limit)
+    symbols = _fetch_perp_symbols(client, categories=categories)
+    requested_symbols = {
+        str(value).strip().upper()
+        for value in (args.symbols or [])
+        if str(value).strip()
+    }
+    if requested_symbols:
+        symbols = [
+            item for item in symbols if item.bybit_symbol.upper() in requested_symbols
+        ]
+        missing_symbols = requested_symbols - {
+            item.bybit_symbol.upper() for item in symbols
+        }
+        if missing_symbols:
+            raise ValueError(
+                f"requested Bybit perpetual symbols unavailable: {sorted(missing_symbols)}"
+            )
+    if args.limit is not None:
+        symbols = symbols[: max(0, int(args.limit))]
     if not symbols:
         raise RuntimeError("No Bybit perpetual symbols found for selected categories.")
 

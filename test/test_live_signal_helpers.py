@@ -438,6 +438,97 @@ def test_day_trade_shioaji_snapshot_queries_only_active_universe(monkeypatch) ->
     assert np.isnan(snapshot.open_prices[1])
 
 
+def test_day_trade_shioaji_uses_same_session_official_mis_open(monkeypatch) -> None:
+    fallback = np.array([10.0, 20.0, 30.0])
+    now_ms = int(
+        __import__("datetime").datetime.now(
+            __import__("zoneinfo").ZoneInfo("Asia/Taipei")
+        ).timestamp()
+        * 1000
+    )
+
+    monkeypatch.setattr(
+        "stockagent.live.signal_engine.fetch_shioaji_stock_snapshots",
+        lambda symbols, fallback_prices, *, cache_ttl_seconds: PriceSnapshot(
+            prices=np.asarray(fallback_prices, dtype=np.float64) + 1.0,
+            source="shioaji:fixture",
+            timestamp="2026-08-21T09:00:01+08:00",
+            available_count=len(symbols),
+            requested_count=len(symbols),
+            available_mask=np.ones((len(symbols),), dtype=bool),
+            open_prices=np.array([999.0, 888.0]),
+        ),
+    )
+    monkeypatch.setattr(
+        "stockagent.live.signal_engine.fetch_tw_mis_last_prices",
+        lambda symbols, fallback_prices, **kwargs: PriceSnapshot(
+            prices=np.asarray(fallback_prices, dtype=np.float64),
+            source="twse_tpex:mis",
+            available_count=len(symbols),
+            open_prices=np.array([10.5, 30.5]),
+            timestamps_ms=np.array([now_ms, now_ms]),
+        ),
+    )
+
+    snapshot = _price_snapshot(
+        source="shioaji",
+        symbols=["A", "B", "C"],
+        fallback_prices=fallback,
+        parquet_root="unused",
+        prices_csv=None,
+        yahoo_chunk_size=80,
+        request_mask=np.array([True, False, True]),
+        require_official_tw_session_open=True,
+    )
+
+    assert snapshot.source.endswith("+official_mis_session_open+active_universe_subset")
+    np.testing.assert_allclose(snapshot.open_prices[[0, 2]], [10.5, 30.5])
+    assert np.isnan(snapshot.open_prices[1])
+
+
+def test_day_trade_shioaji_rejects_prior_session_mis_open(monkeypatch) -> None:
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+
+    prior_ms = int(
+        (datetime.now(ZoneInfo("Asia/Taipei")) - timedelta(days=1)).timestamp()
+        * 1000
+    )
+    monkeypatch.setattr(
+        "stockagent.live.signal_engine.fetch_shioaji_stock_snapshots",
+        lambda symbols, fallback_prices, *, cache_ttl_seconds: PriceSnapshot(
+            prices=np.asarray(fallback_prices, dtype=np.float64),
+            source="shioaji:fixture",
+            available_count=1,
+            requested_count=1,
+            available_mask=np.ones((1,), dtype=bool),
+            open_prices=np.array([999.0]),
+        ),
+    )
+    monkeypatch.setattr(
+        "stockagent.live.signal_engine.fetch_tw_mis_last_prices",
+        lambda symbols, fallback_prices, **kwargs: PriceSnapshot(
+            prices=np.asarray(fallback_prices, dtype=np.float64),
+            source="twse_tpex:mis",
+            available_count=1,
+            open_prices=np.array([10.5]),
+            timestamps_ms=np.array([prior_ms]),
+        ),
+    )
+
+    snapshot = _price_snapshot(
+        source="shioaji",
+        symbols=["A"],
+        fallback_prices=np.array([10.0]),
+        parquet_root="unused",
+        prices_csv=None,
+        yahoo_chunk_size=80,
+        require_official_tw_session_open=True,
+    )
+
+    assert np.isnan(snapshot.open_prices[0])
+
+
 def test_live_market_config_passes_close_time_as_daily_bar_time() -> None:
     cfg = LiveMarketConfig(
         market="tw",

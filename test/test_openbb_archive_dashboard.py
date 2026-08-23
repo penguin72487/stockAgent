@@ -119,6 +119,12 @@ def test_public_status_separates_live_process_truth_from_stale_audit(
             "output_bytes": 4000,
             "new_segments": 1,
             "stale_segments": 0,
+            "deferred_query_views": {
+                "economy.fred_series": (
+                    "schema_variants=5000 exceeds limit=4096; "
+                    "long_form_normalization_required"
+                )
+            },
             "l0_deleted": False,
             "query_database": "/private/path/openbb_l1.duckdb",
         },
@@ -148,6 +154,8 @@ def test_public_status_separates_live_process_truth_from_stale_audit(
     assert public["providers"][0]["requests_per_second"] == 4.0
     assert public["l1_compaction"]["compacted_files"] == 80
     assert public["l1_compaction"]["pending_files"] == 20
+    assert public["l1_compaction"]["deferred_query_view_count"] == 1
+    assert "economy.fred_series" in public["l1_compaction"]["deferred_query_views"]
     assert public["l1_compaction"]["l0_deleted"] is False
     assert public["alerts"][0]["message"].startswith("供應商配額形成")
     encoded = json.dumps(public, ensure_ascii=False)

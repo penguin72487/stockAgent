@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import hashlib
 import json
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -127,14 +128,104 @@ def test_content_change_comparison_ignores_parquet_serialization_size() -> None:
     assert publication._changed_files(before, after) == []
 
 
-def test_0830_command_reuses_accepted_snapshot_unless_forced(tmp_path: Path) -> None:
+def test_0830_command_refreshes_the_live_preopen_source_not_legacy_snapshot(
+    tmp_path: Path,
+) -> None:
     command = run_tw_public_0830_check.refresh_command(tmp_path / "tw.yaml")
-    assert Path(command[1]).name == "refresh_tw_public_live_snapshot.py"
-    assert "--force" not in command
+    assert Path(command[1]).name == "watch_tw_public_publication_group.py"
+    assert command[-2:] == ["--phase", "preopen_all"]
+    assert "refresh_tw_public_live_snapshot.py" not in command
     forced = run_tw_public_0830_check.refresh_command(
         tmp_path / "tw.yaml", force=True
     )
-    assert "--force" in forced
+    assert "--auto-window-minutes" in forced
+
+
+def test_0830_builds_canonical_derived_layers_from_accepted_source_date(
+    tmp_path: Path,
+) -> None:
+    commands = run_tw_public_0830_check._derived_data_commands(
+        live_root=tmp_path,
+        expected_latest="2026-08-21",
+        workers=4,
+    )
+
+    assert [Path(command[1]).name for command in commands] == [
+        "download_tw_corporate_action_reference.py",
+        "build_tw_official_symbol_parquets.py",
+        "download_tw_corporate_action_entitlements.py",
+        "build_tw_public_training_features.py",
+    ]
+    assert all(command[command.index("--end-date") + 1] == "2026-08-21" for command in commands)
+    assert commands[1][commands[1].index("--output-dir") + 1] == str(
+        tmp_path / "stocks"
+    )
+    assert commands[3][commands[3].index("--output-path") + 1] == str(
+        tmp_path / "features" / "tw_public_stock_daily.parquet"
+    )
+    assert "--allow-daily-publication-lag" in commands[1]
+    assert "--allow-daily-publication-lag" in commands[3]
+
+
+def test_0830_detects_same_date_source_content_revision(tmp_path: Path) -> None:
+    source = tmp_path / "tdcc_shareholding_distribution.parquet"
+    source.write_bytes(b"old")
+    summary = tmp_path / "tw_public_stock_daily.summary.json"
+    summary.write_text(
+        json.dumps(
+            {
+                "source_receipts": [
+                    {
+                        "name": source.name,
+                        "size": source.stat().st_size,
+                        "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert (
+        run_tw_public_0830_check._receipt_dependency_errors(
+            summary,
+            live_root=tmp_path,
+            keys=("source_receipts",),
+        )
+        == []
+    )
+
+    source.write_bytes(b"new")
+    errors = run_tw_public_0830_check._receipt_dependency_errors(
+        summary,
+        live_root=tmp_path,
+        keys=("source_receipts",),
+    )
+    assert errors == ["source_receipts: sha256 mismatch tdcc_shareholding_distribution.parquet"]
+
+
+def test_preopen_full_sweep_requires_zero_lag_before_live_metadata_promotion() -> None:
+    accepted = {
+        "end_date": "2026-08-20",
+        "dataset_count": len(DEFAULT_DATASETS),
+        "failed_count": 0,
+        "blocking_failed_count": 0,
+        "publication_lag_count": 0,
+        "incomplete_count": 0,
+        "missing_dates_after": 0,
+        "coverage_complete": True,
+        "daily_close_ready": True,
+    }
+    assert publication._preopen_acceptance_errors(
+        accepted,
+        expected_end_date="2026-08-20",
+        expected_dataset_count=len(DEFAULT_DATASETS),
+    ) == []
+    accepted["publication_lag_count"] = 1
+    assert publication._preopen_acceptance_errors(
+        accepted,
+        expected_end_date="2026-08-20",
+        expected_dataset_count=len(DEFAULT_DATASETS),
+    )
 
 
 def test_0830_requires_both_exact_session_venues() -> None:
@@ -172,8 +263,11 @@ def test_systemd_timers_have_no_random_delay() -> None:
     assert "21:01:00 Asia/Taipei" in publication_timer
     assert "21:02:00 Asia/Taipei" in publication_timer
     assert "RandomizedDelaySec=0" in publication_timer
-    assert "08:30:00 Asia/Taipei" in acceptance_timer
-    assert "08:20:00 Asia/Taipei" in acceptance_timer
+    assert "08:00:00 Asia/Taipei" in acceptance_timer
+    assert "08:15:00 Asia/Taipei" in acceptance_timer
+    assert "08:24:00 Asia/Taipei" in acceptance_timer
+    assert "08:29:00 Asia/Taipei" not in acceptance_timer
+    assert "08:30:00 Asia/Taipei" not in acceptance_timer
     assert "RandomizedDelaySec=0" in acceptance_timer
 
 
@@ -238,6 +332,48 @@ def test_source_event_accepts_taifex_csv_representation_but_rejects_html() -> No
             content_type="text/html",
             content_disposition=None,
         )
+
+
+def test_source_event_version_uses_content_not_dynamic_attachment_name() -> None:
+    common = {
+        "url": "https://official.example/data.csv",
+        "body_sha256": "canonical-content",
+        "etag": None,
+        "last_modified": None,
+        "content_length": "42",
+    }
+    first = source_events._version(
+        **common,
+        content_disposition='attachment; filename="report_100001.csv"',
+    )
+    second = source_events._version(
+        **common,
+        content_disposition='attachment; filename="report_100002.csv"',
+    )
+    assert first == second == "canonical-content"
+
+
+def test_source_event_version_migration_preserves_pending_state() -> None:
+    state = {
+        "datasets": {
+            "accepted": {
+                "body_sha256": "accepted-body",
+                "observed_version": "old-accepted",
+                "applied_version": "old-accepted",
+            },
+            "pending": {
+                "body_sha256": "pending-body",
+                "observed_version": "old-observed",
+                "applied_version": "older-applied",
+            },
+        }
+    }
+    source_events._migrate_version_contract(state)
+    assert state["version_contract"] == source_events.VERSION_CONTRACT
+    assert state["datasets"]["accepted"]["observed_version"] == "accepted-body"
+    assert state["datasets"]["accepted"]["applied_version"] == "accepted-body"
+    assert state["datasets"]["pending"]["observed_version"] == "pending-body"
+    assert state["datasets"]["pending"]["applied_version"] == "older-applied"
 
 
 def test_source_event_is_unacknowledged_until_download_accepts_it() -> None:
@@ -346,14 +482,21 @@ def test_source_event_service_is_persistent_and_restarting() -> None:
     assert "run_tw_public_source_event_monitor.sh" in service
 
 
-def test_0830_acceptance_service_retries_transient_failure() -> None:
+def test_0830_acceptance_uses_bounded_timer_retries() -> None:
     service = (
         Path("deploy/systemd/stockagent-tw-public-0830-check.service.in")
         .read_text(encoding="utf-8")
     )
-    assert "Restart=on-failure" in service
-    assert "RestartSec=1min" in service
-    assert "StartLimitIntervalSec=0" in service
+    timer = (
+        Path("deploy/systemd/stockagent-tw-public-0830-check.timer.in")
+        .read_text(encoding="utf-8")
+    )
+    assert "Restart=" not in service
+    assert "08:00:00 Asia/Taipei" in timer
+    assert "08:15:00 Asia/Taipei" in timer
+    assert "08:24:00 Asia/Taipei" in timer
+    assert "08:29:00 Asia/Taipei" not in timer
+    assert "ExecStartPost" not in service
 
 
 def test_final_preopen_gate_requires_public_model_and_executor_proofs() -> None:

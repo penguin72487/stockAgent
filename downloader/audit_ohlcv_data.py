@@ -11,8 +11,10 @@ import polars as pl
 
 try:
     from downloader.common import resolve_end_date, run_parallel_tasks
+    from downloader.ohlcv_hot_tail import read_logical_parquet
 except ModuleNotFoundError:  # direct script execution
     from common import resolve_end_date, run_parallel_tasks
+    from ohlcv_hot_tail import read_logical_parquet
 
 try:
     import pyarrow.parquet as pq
@@ -164,9 +166,9 @@ def _read_audit_frame(path: Path) -> tuple[pl.DataFrame, set[str]]:
         columns = [column for column in READ_COLUMNS if column in schema_columns]
         if not columns:
             return pl.DataFrame(), schema_columns
-        return pl.from_arrow(pq.read_table(path, columns=columns)), schema_columns
+        return read_logical_parquet(path, columns=columns), schema_columns
 
-    frame = pl.from_arrow(pq.read_table(path))
+    frame = read_logical_parquet(path)
     return frame.select(
         [column for column in READ_COLUMNS if column in frame.columns]
     ), set(frame.columns)

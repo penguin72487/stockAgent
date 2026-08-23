@@ -37,6 +37,9 @@ from stockagent.backtest.tw_minute import (
 )
 from stockagent.backtest.report import compute_metrics
 from stockagent.backtest.holdings import save_realized_holdings_artifacts
+from stockagent.backtest.portfolio_allocator import (
+    stateful_proximal_target_weights as _stateful_proximal_target_weights,
+)
 from stockagent.backtest.simulator import BacktestResult
 from stockagent.config import ExperimentConfig
 from stockagent.data.tw_minute import (
@@ -651,74 +654,6 @@ def _batched_slab_targets(
             "tw_minute batched panel-slab model must return [D*C,S] targets"
         )
     return output
-
-
-def _stateful_proximal_target_weights(
-    requested_weights: torch.Tensor,
-    previous_executed_weights: torch.Tensor,
-    *,
-    buy_fee_rates: torch.Tensor,
-    sell_fee_rates: torch.Tensor,
-    cost_multiplier: float,
-    long_only: bool,
-) -> torch.Tensor:
-    """Cost-aware target update around the actual pre-trade portfolio.
-
-    This is the proximal map for a quadratic pull toward the model proposal and
-    an asymmetric L1 switching cost.  The threshold uses the exact applicable
-    one-way fee: buys (including short covers) pay ``buy_fee_rates`` and sells
-    (including short opens) pay ``sell_fee_rates``.  If every proposed change
-    lies inside the no-trade region, the previous portfolio is returned exactly.
-    """
-
-    if requested_weights.shape != previous_executed_weights.shape:
-        raise ValueError("requested and previous minute weights must have one shape")
-    if requested_weights.dim() != 2:
-        raise ValueError("stateful minute allocator expects [B,S] weights")
-    if buy_fee_rates.shape != (requested_weights.size(1),) or sell_fee_rates.shape != (
-        requested_weights.size(1),
-    ):
-        raise ValueError("stateful minute allocator fee vectors must have shape [S]")
-    multiplier = float(cost_multiplier)
-    if not math.isfinite(multiplier) or multiplier < 0.0:
-        raise ValueError(
-            "minute proximal cost multiplier must be finite and nonnegative"
-        )
-
-    requested = requested_weights.float()
-    previous = previous_executed_weights.float()
-    if long_only:
-        requested = requested.clamp_min(0.0)
-        previous = previous.clamp_min(0.0)
-    delta = requested - previous
-    fee_threshold = (
-        torch.where(
-            delta >= 0.0,
-            buy_fee_rates.float().view(1, -1),
-            sell_fee_rates.float().view(1, -1),
-        )
-        * multiplier
-    )
-    shrunk_delta = torch.sign(delta) * torch.relu(delta.abs() - fee_threshold)
-    changed = shrunk_delta.abs().sum(dim=-1, keepdim=True) > 0.0
-    candidate = previous + shrunk_delta
-    if long_only:
-        candidate = candidate.clamp_min(0.0)
-
-    previous_gross = previous.abs().sum(dim=-1, keepdim=True)
-    # Do not L1-normalize this candidate.  Every coordinate lies between the
-    # previous and requested endpoint, so the convexity of the L1 ball already
-    # guarantees feasibility.  Normalizing to either endpoint gross would
-    # re-introduce the turnover removed by the proximal threshold and would
-    # prevent a deliberate reduction of risky gross in favour of cash.
-    # The first allocation has no previous inventory to preserve; charge its
-    # real entry fee in the ledger without sparsifying the model proposal.
-    initial_entry = previous_gross <= 1e-12
-    return torch.where(
-        initial_entry,
-        requested,
-        torch.where(changed, candidate, previous),
-    )
 
 
 def _execute_minute_chunk(

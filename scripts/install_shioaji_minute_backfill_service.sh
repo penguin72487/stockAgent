@@ -8,14 +8,17 @@ TEMPLATE="$REPO_ROOT/deploy/systemd/$SERVICE_NAME.in"
 TIMER_TEMPLATE="$REPO_ROOT/deploy/systemd/$TIMER_NAME.in"
 UNIT_PATH="/etc/systemd/system/$SERVICE_NAME"
 TIMER_PATH="/etc/systemd/system/$TIMER_NAME"
-START_NOW=true
+START_NOW=false
 
 usage() {
-  echo "Usage: sudo bash scripts/install_shioaji_minute_backfill_service.sh [--no-start]" >&2
+  echo "Usage: sudo bash scripts/install_shioaji_minute_backfill_service.sh [--run-now|--no-start]" >&2
 }
 
 for argument in "$@"; do
   case "$argument" in
+    --run-now)
+      START_NOW=true
+      ;;
     --no-start)
       START_NOW=false
       ;;
@@ -76,13 +79,15 @@ install -m 0644 "$rendered_timer" "$TIMER_PATH"
 chmod 0755 "$REPO_ROOT/scripts/run_shioaji_minute_full_backfill.sh"
 chmod go-rwx "$REPO_ROOT/.env"
 systemctl daemon-reload
-systemctl enable "$SERVICE_NAME"
+# The full-market repair has reached an 8+ GiB working set in production. It
+# must remain resumable background work, never part of the boot target.
+systemctl disable "$SERVICE_NAME" >/dev/null 2>&1 || true
 systemctl enable --now "$TIMER_NAME"
 if [[ "$START_NOW" == true ]]; then
   systemctl restart "$SERVICE_NAME"
 fi
 
-echo "[shioaji-minute-service] installed=$UNIT_PATH enabled=$(systemctl is-enabled "$SERVICE_NAME")"
+echo "[shioaji-minute-service] installed=$UNIT_PATH trigger=$(systemctl is-enabled "$SERVICE_NAME" 2>/dev/null || true)"
 echo "[shioaji-minute-service] timer=$TIMER_PATH enabled=$(systemctl is-enabled "$TIMER_NAME")"
 if [[ "$START_NOW" == true ]]; then
   echo "[shioaji-minute-service] active=$(systemctl is-active "$SERVICE_NAME")"

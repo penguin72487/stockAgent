@@ -14,6 +14,7 @@ import numpy as np
 import torch
 
 from stockagent.backtest.distributed_reduction import global_symbol_tensor_sum
+from stockagent.backtest.crypto_perpetual import run_crypto_perpetual_torch
 from stockagent.backtest.tw_continuous import (
     run_tw_cash_continuous,
     run_tw_day_trade_continuous,
@@ -94,6 +95,9 @@ except Exception:  # pragma: no cover - Numba is an acceleration dependency
 INT64_MIN_FLOAT_SAFE = np.nextafter(float(np.iinfo(np.int64).min), 0.0)
 INT64_MAX_FLOAT_SAFE = np.nextafter(float(np.iinfo(np.int64).max + 1), 0.0)
 SCAN_CHUNK_CANDIDATES = (64, 128, 256, 512)
+# v20 adds the optional crypto carrying-account proximal allocation contract:
+# the previous executed portfolio and the actual asymmetric one-way fees derive
+# the recurrent no-trade region before exchange permissions/capacity execute.
 # v17 applies the same T+2-close net-claim ledger to the daily open-to-close
 # day-trade executor.  Daily sizing now uses deployable cash rather than
 # economic NAV, so T claims affect NAV immediately but first fund T+3 orders.
@@ -2905,6 +2909,8 @@ def run_backtest(
     sell_fee_rate: float,
     long_only: bool = True,
     max_turnover_ratio: float = 0.0,
+    crypto_stateful_proximal_allocator: bool = False,
+    crypto_proximal_cost_multiplier: float = 1.0,
     gross_leverage: float = 1.0,
     min_trade_weight: float = 0.0,
     portfolio_activation: str = DEFAULT_PORTFOLIO_ACTIVATION,
@@ -2966,6 +2972,10 @@ def run_backtest(
             sell_fee_rate,
             long_only=long_only,
             max_turnover_ratio=max_turnover_ratio,
+            crypto_stateful_proximal_allocator=(
+                crypto_stateful_proximal_allocator
+            ),
+            crypto_proximal_cost_multiplier=crypto_proximal_cost_multiplier,
             gross_leverage=gross_leverage,
             min_trade_weight=min_trade_weight,
             portfolio_activation=portfolio_activation,
@@ -3055,6 +3065,8 @@ def run_backtest_torch(
     sell_fee_rate: float,
     long_only: bool = True,
     max_turnover_ratio: float = 0.0,
+    crypto_stateful_proximal_allocator: bool = False,
+    crypto_proximal_cost_multiplier: float = 1.0,
     gross_leverage: float = 1.0,
     min_trade_weight: float = 0.0,
     portfolio_activation: str = DEFAULT_PORTFOLIO_ACTIVATION,
@@ -3112,6 +3124,76 @@ def run_backtest_torch(
 ) -> BacktestResultTensor:
     """Simulate daily portfolio execution from model weights in torch."""
     mode = normalize_execution_mode(execution_mode)
+    if mode == "crypto_perpetual":
+        if overnight_returns is None:
+            raise ValueError(
+                "crypto_perpetual requires raw price log returns separately "
+                "from funding-adjusted total returns"
+            )
+        prepped_weights, prepped_tradable, prepped_buy, prepped_sell = (
+            _prepare_scan_inputs(
+                weights,
+                tradable_mask,
+                can_buy_mask,
+                can_sell_mask,
+                long_only,
+                gross_leverage,
+                min_trade_weight,
+                portfolio_activation,
+            )
+        )
+        prepped_short = (
+            prepped_sell
+            if can_short_open_mask is None
+            else can_short_open_mask.to(device=weights.device, dtype=torch.bool)
+            & prepped_sell
+            & prepped_tradable
+        )
+        crypto = run_crypto_perpetual_torch(
+            prepped_weights,
+            future_returns,
+            overnight_returns,
+            prepped_tradable,
+            prepped_buy,
+            prepped_sell,
+            prepped_short,
+            (
+                torch.zeros_like(prepped_tradable, dtype=torch.bool)
+                if force_exit_mask is None
+                else force_exit_mask.to(device=weights.device, dtype=torch.bool)
+            ),
+            buy_fee_rate=float(buy_fee_rate),
+            sell_fee_rate=float(sell_fee_rate),
+            long_only=long_only,
+            maximum_gross=_resolve_exposure_budget(gross_leverage),
+            max_turnover_ratio=float(max_turnover_ratio),
+            stateful_proximal_allocator=bool(
+                crypto_stateful_proximal_allocator
+            ),
+            proximal_cost_multiplier=float(crypto_proximal_cost_multiplier),
+            volume_limit_weights=volume_limit_weights,
+            state_advance_mask=state_advance_mask,
+            initial_weights=initial_weights,
+            initial_alive=initial_alive,
+            return_weights_history=return_weights_history,
+        )
+        return BacktestResultTensor(
+            strategy_returns=_portfolio_simple_returns_to_log_torch(
+                crypto.strategy_simple_returns
+            ),
+            benchmark_returns=benchmark_returns.to(
+                device=weights.device, dtype=torch.float32
+            ),
+            turnovers=crypto.turnovers,
+            weights_history=crypto.executed_weights,
+            requested_weights_history=(
+                weights.to(dtype=torch.float32) if return_weights_history else None
+            ),
+            final_weights=crypto.final_weights,
+            final_alive=crypto.final_alive,
+            execution_mode=mode,
+            settlement_ledger_unit="notional_weight",
+        )
     if mode == "tw_futures_portfolio_day":
         if force_exit_mask is None:
             raise ValueError(
@@ -4805,14 +4887,19 @@ def run_backtest_integer_shares(
     flag removes an otherwise unresolvable ambiguity when both lengths happen
     to equal the active symbol count but their orders differ.
 
-    ``precomputed_exact_backtest`` is reserved for an executor whose tensor
-    forward already uses exact integer lots and the experiment's canonical
-    event tape. It prevents reporting from replacing that result with a
-    lower-fidelity open-to-close integer audit.
+    ``precomputed_exact_backtest`` is reserved for either an executor whose
+    tensor forward already uses exact integer lots and the experiment's
+    canonical event tape, or a declared continuous-notional product that has
+    no separate integer research oracle. It prevents reporting from replacing
+    either canonical result with a lower-fidelity Taiwan share audit.
     """
     mode = normalize_execution_mode(execution_mode)
     if precomputed_exact_backtest is not None:
-        if mode not in {"tw_day_trade", "tw_futures_portfolio_day"}:
+        if mode not in {
+            "tw_day_trade",
+            "tw_futures_portfolio_day",
+            "crypto_perpetual",
+        }:
             raise ValueError(
                 "precomputed_exact_backtest is valid only for canonical "
                 "tensor execution contracts"

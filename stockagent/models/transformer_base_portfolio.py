@@ -28,6 +28,7 @@ from stockagent.profiling import PROFILE_RANGES_ENABLED, _torch_is_compiling, pr
 
 _ACTION_CHANNEL_NAMES_BY_EXECUTION_MODE: dict[str, tuple[str, ...]] = {
     "naive": ("target",),
+    "crypto_perpetual": ("target",),
     "tw_day_trade": ("target",),
     "tw_minute": ("target",),
     "tw_futures_portfolio_day": ("target",),
@@ -43,6 +44,7 @@ _ACTION_CHANNEL_NAMES_BY_EXECUTION_MODE: dict[str, tuple[str, ...]] = {
 
 _ACTION_SCHEMA_BY_EXECUTION_MODE: dict[str, str] = {
     "naive": "single_target_v1",
+    "crypto_perpetual": "single_target_v1",
     "tw_day_trade": "single_target_v1",
     "tw_minute": "single_minute_target_v1",
     "tw_futures_portfolio_day": "single_target_v1",

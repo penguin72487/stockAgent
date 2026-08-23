@@ -106,6 +106,35 @@ def _ready_matches(
     )
 
 
+def _equivalent_ready_snapshot(
+    sync_root: Path,
+    materialized_root: Path,
+    resolved: ResolvedSnapshot,
+) -> ResolvedSnapshot | None:
+    """Find a fully verified local tree with the same immutable inventory."""
+
+    dataset = validate_slug(str(resolved.manifest["dataset"]), "dataset")
+    inventory_sha256 = str(
+        resolved.manifest["archive"]["inventory"]["sha256"]
+    )
+    dataset_root = materialized_root / dataset
+    for ready_path in sorted(dataset_root.glob(".*.READY.json"), reverse=True):
+        try:
+            ready = _read_json(ready_path)
+            if ready.get("inventory_sha256") != inventory_sha256:
+                continue
+            candidate = resolve_packed_snapshot_id(
+                sync_root,
+                dataset,
+                str(ready.get("snapshot_id") or ""),
+            )
+        except (OSError, SnapshotError, ValueError):
+            continue
+        if _ready_matches(materialized_root, candidate):
+            return candidate
+    return None
+
+
 def _atomic_symlink(link: Path, target: Path) -> None:
     link = _absolute_link_path(link)
     target = target.resolve()
@@ -123,6 +152,34 @@ def _atomic_symlink(link: Path, target: Path) -> None:
 def _link_points_to(link: Path, target: Path) -> bool:
     if not link.is_symlink():
         return False
+
+
+def _quarantine_corrupt_materialization(
+    materialized_root: Path,
+    dataset: str,
+    snapshot_id: str,
+) -> dict[str, str]:
+    """Atomically isolate a corrupt hot cache before reconstructing it."""
+
+    target = _target_path(materialized_root, dataset, snapshot_id)
+    ready = _ready_path(materialized_root, dataset, snapshot_id)
+    quarantine = (
+        _state_root(materialized_root)
+        / "quarantine"
+        / dataset
+        / f"{snapshot_id}.{time.time_ns()}.{uuid.uuid4().hex}"
+    )
+    quarantine.mkdir(parents=True, exist_ok=False)
+    result: dict[str, str] = {"quarantine_root": str(quarantine)}
+    if target.exists():
+        destination = quarantine / "tree"
+        os.replace(target, destination)
+        result["tree"] = str(destination)
+    if ready.exists():
+        destination = quarantine / "READY.json"
+        os.replace(ready, destination)
+        result["ready"] = str(destination)
+    return result
     try:
         return link.resolve(strict=False) == target.resolve(strict=False)
     except OSError:
@@ -150,11 +207,20 @@ def use_materialized_snapshot(
         raise SnapshotError("materialized root must be outside the packed sync root")
     dataset = validate_slug(dataset, "dataset")
     current_ns = time.time_ns() if now_ns is None else int(now_ns)
+    requested_snapshot_id = snapshot_id
     resolved = (
         resolve_packed_snapshot_id(sync_root, dataset, snapshot_id)
         if snapshot_id
         else resolve_latest_packed(sync_root, dataset, now_ns=current_ns)
     )
+    if requested_snapshot_id is None and not _ready_matches(
+        materialized_root, resolved
+    ):
+        equivalent = _equivalent_ready_snapshot(
+            sync_root, materialized_root, resolved
+        )
+        if equivalent is not None:
+            resolved = equivalent
     snapshot_id = validate_slug(
         str(resolved.manifest["snapshot_id"]), "snapshot_id"
     )
@@ -164,10 +230,19 @@ def use_materialized_snapshot(
 
     with _exclusive_lock(_lock_path(materialized_root, dataset)):
         ready_reused = _ready_matches(materialized_root, resolved)
+        recovered_corruption: dict[str, str] | None = None
         if verify_existing and ready_reused:
-            verify_packed_snapshot(
-                sync_root, resolved, materialized_path=target
-            )
+            try:
+                verify_packed_snapshot(
+                    sync_root, resolved, materialized_path=target
+                )
+            except SnapshotError:
+                recovered_corruption = _quarantine_corrupt_materialization(
+                    materialized_root, dataset, snapshot_id
+                )
+                target = fetch_packed_snapshot(
+                    sync_root, materialized_root, resolved
+                )
             verification = "full"
         elif ready_reused:
             verification = "ready-marker"
@@ -201,6 +276,7 @@ def use_materialized_snapshot(
             "dataset": dataset,
             "snapshot_id": snapshot_id,
             "manifest_sha256": resolved.manifest_sha256,
+            "inventory_sha256": resolved.manifest["archive"]["inventory"]["sha256"],
             "sync_root": str(sync_root),
             "materialized_root": str(materialized_root),
             "target": str(target),
@@ -219,6 +295,8 @@ def use_materialized_snapshot(
             ),
             "verification": verification,
         }
+        if recovered_corruption is not None:
+            lease["recovered_corrupt_materialization"] = recovered_corruption
         atomic_write_json(lease_path, lease)
         return lease
 

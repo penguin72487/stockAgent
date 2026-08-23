@@ -36,19 +36,18 @@ def test_discord_crypto_market_uses_1m_incremental_updater() -> None:
 def test_discord_tw_market_uses_canonical_official_data_layer() -> None:
     cfg = load_market_config("services/discord_bot/markets/tw.yaml")
     assert cfg.pre_signal_command == (
-        "{python}",
-        "scripts/refresh_tw_public_live_snapshot.py",
-        "--config",
-        "configs/markets/tw_day_trade_10m.yaml",
+        "scripts/run_data_cache.sh",
+        "use",
+        "tw-public",
+        "--link",
+        "data_tw_public",
     )
 
 
 def test_discord_tw_day_trade_100m_uses_its_point_in_time_data_contract() -> None:
     cfg = load_market_config("services/discord_bot/markets/tw_day_trade_100m.yaml")
     assert cfg.pre_signal_command == (
-        "scripts/run_data_cache.sh",
-        "use",
-        "tw-public",
+        "scripts/activate_tw_public_opening_data.py",
         "--link",
         "data_tw_public",
     )
@@ -151,6 +150,21 @@ def test_crypto_downloaders_accept_incremental_1m_mode(monkeypatch) -> None:
     bybit_args = bybit.parse_args()
     assert bybit_args.mode == "incremental"
     assert bybit_args.tail_only is True
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "download_bybit_perp_daily.py",
+            "--categories",
+            "linear",
+            "--symbols",
+            "BTCUSDT",
+            "ETHUSDT",
+        ],
+    )
+    bybit_symbol_args = bybit.parse_args()
+    assert bybit_symbol_args.symbols == ["BTCUSDT", "ETHUSDT"]
 
 
 @pytest.mark.parametrize("module", [okx, bybit])

@@ -3,6 +3,7 @@ from pathlib import Path
 
 from stockagent.training.trainer import (
     _EpochCurveLifecycle,
+    _epoch_curve_plot_command,
     _infer_no_improve_epochs_from_curve,
     _resume_no_improve_epochs_from_checkpoint,
     _trim_group_curve,
@@ -173,6 +174,19 @@ def test_epoch_curve_lifecycle_honors_synchronous_incremental_plot(
     lifecycle.flush()
 
     assert calls == [(curve_path, 2, False)]
+
+
+def test_async_epoch_curve_command_never_exports_unrelated_report_tables(
+    tmp_path: Path,
+) -> None:
+    command = _epoch_curve_plot_command(
+        tmp_path / "epoch_curve.jsonl",
+        1,
+        write_parquet_cache=False,
+    )
+
+    assert "--no-export-report-csvs" in command
+    assert "--no-write-parquet-cache" in command
 
 
 def test_progress_bar_is_one_rank_aware_canonical_implementation(

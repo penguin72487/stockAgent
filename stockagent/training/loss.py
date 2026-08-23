@@ -1196,6 +1196,8 @@ def risk_aware_loss(
     buy_fee_rate: float = 0.0,
     sell_fee_rate: float = 0.0,
     max_turnover_ratio: float = 0.0,
+    crypto_stateful_proximal_allocator: bool = False,
+    crypto_proximal_cost_multiplier: float = 1.0,
     volume_limit_weights: Tensor | None = None,
     short_margin_rate: Tensor | float | None = None,
     short_capacity_weights: Tensor | None = None,
@@ -1243,6 +1245,7 @@ def risk_aware_loss(
     gamma_drawdown_budget: float = 1.0,
     gamma_turnover_budget: float = 0.0,
     objective: str = "sharpe",
+    log_utility_periods_per_year: float = 252.0,
     aux_outputs: dict[str, Tensor] | None = None,
     rank_ic_weight: float = 1.0,
     return_rank_ic_weight: float = 0.0,
@@ -1685,6 +1688,10 @@ def risk_aware_loss(
         sell_fee_rate,
         long_only=long_only,
         max_turnover_ratio=max_turnover_ratio,
+        crypto_stateful_proximal_allocator=(
+            crypto_stateful_proximal_allocator
+        ),
+        crypto_proximal_cost_multiplier=crypto_proximal_cost_multiplier,
         volume_limit_weights=volume_limit_weights,
         short_margin_rate=short_margin_rate,
         short_capacity_weights=short_capacity_weights,
@@ -1881,7 +1888,16 @@ def risk_aware_loss(
 
         reduce_start = _loss_timer_start()
         mean_return = masked_returns.sum() / valid_count.clamp_min(1.0)
-        annualizer = torch.as_tensor(252.0, device=clean_returns.device, dtype=clean_returns.dtype)
+        periods_per_year = float(log_utility_periods_per_year)
+        if not (periods_per_year > 0.0 and periods_per_year < float("inf")):
+            raise ValueError(
+                "log_utility_periods_per_year must be positive and finite"
+            )
+        annualizer = torch.as_tensor(
+            periods_per_year,
+            device=clean_returns.device,
+            dtype=clean_returns.dtype,
+        )
         _loss_timer_stop("reduce", reduce_start)
 
         log_utility_start = _loss_timer_start()

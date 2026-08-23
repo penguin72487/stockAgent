@@ -1515,6 +1515,9 @@ def _checkpoint_manifest(
         "usd_only_trading_pairs": bool(config.data.usd_only_trading_pairs),
         "tradable_mode": str(config.data.tradable_mode),
         "trading_volume_policy": str(config.data.trading_volume_policy),
+        "use_external_features": bool(config.data.use_external_features),
+        "external_feature_path": str(config.data.external_feature_path),
+        "external_market_symbol": str(config.data.external_market_symbol),
         "use_tw_public_features": bool(config.data.use_tw_public_features),
         "use_tw_public_rules": bool(config.data.use_tw_public_rules),
         "tw_public_market_symbol": str(config.data.tw_public_market_symbol),
@@ -1570,6 +1573,39 @@ def _checkpoint_manifest(
         "symbols": symbols,
         "feature_names": feature_names,
     }
+    schema_4_pre_external_source_fingerprints: dict[str, str] = {}
+    if not bool(config.data.use_external_features):
+        # These fields were added to schema 4 after TW-public checkpoints had
+        # already been emitted.  When the generic external-feature channel is
+        # disabled they cannot affect tensors, so preserve exact compatibility
+        # with those checkpoints without weakening the enabled-channel gate.
+        historical_preprocessing = dict(preprocessing_contract)
+        for name in (
+            "use_external_features",
+            "external_feature_path",
+            "external_market_symbol",
+        ):
+            historical_preprocessing.pop(name, None)
+        historical_data_schema = {
+            **data_schema_contract,
+            "preprocessing": historical_preprocessing,
+        }
+        schema_4_pre_external_source_fingerprints["data_schema"] = (
+            _stable_fingerprint(historical_data_schema)
+        )
+    schema_4_pre_projection_scale_fingerprints: dict[str, str] = {}
+    if not bool(model_contract["model"].get("projection_l1_scale_by_active_count")):
+        # False is the historical model behavior.  A checkpoint written before
+        # the explicit field existed is compatible only with that default.
+        historical_model_values = dict(model_contract["model"])
+        historical_model_values.pop("projection_l1_scale_by_active_count", None)
+        historical_model_contract = {
+            **model_contract,
+            "model": historical_model_values,
+        }
+        schema_4_pre_projection_scale_fingerprints["model"] = (
+            _stable_fingerprint(historical_model_contract)
+        )
     schema_3_model_contract = {
         "model_name": active_model.get("contract_name", active_model["config_name"]),
         "model": _schema_3_checkpoint_model_values(active_model),
@@ -1617,6 +1653,7 @@ def _checkpoint_manifest(
         "tradable_mode": str(config.data.tradable_mode),
         "feature_include": list(config.data.feature_include),
         "feature_exclude": list(config.data.feature_exclude),
+        "use_external_features": bool(config.data.use_external_features),
         "use_tw_public_features": bool(config.data.use_tw_public_features),
     }
     legacy_intervals = ("epoch", "step", "batch")
@@ -1714,6 +1751,12 @@ def _checkpoint_manifest(
         "configuration_fingerprint": _stable_fingerprint(configuration_snapshot),
         "compatibility_fingerprints": {
             "schema_4_pre_lookback_context": schema_4_pre_lookback_context_fingerprints,
+            "schema_4_pre_external_feature_source": (
+                schema_4_pre_external_source_fingerprints
+            ),
+            "schema_4_pre_projection_l1_active_count_scale": (
+                schema_4_pre_projection_scale_fingerprints
+            ),
             "schema_3": schema_3_fingerprints,
             "schema_3_without_force_exit": schema_3_without_force_exit_fingerprints,
             "schema_3_lr_interval_step": schema_3_interval_fingerprints["step"],
@@ -2025,7 +2068,7 @@ def _validate_checkpoint_manifest(
                     expected_fingerprints["training"] = candidate["training"]
                     break
         else:
-            expected_fingerprints = expected.get("fingerprints", {})
+            expected_fingerprints = dict(expected.get("fingerprints", {}))
             compatibility = expected.get("compatibility_fingerprints", {})
             pre_context = compatibility.get(
                 "schema_4_pre_lookback_context",
@@ -2036,6 +2079,13 @@ def _validate_checkpoint_manifest(
             ):
                 expected_fingerprints = dict(expected_fingerprints)
                 expected_fingerprints["walk_forward"] = pre_context["walk_forward"]
+            for layer, compatibility_key in (
+                ("data_schema", "schema_4_pre_external_feature_source"),
+                ("model", "schema_4_pre_projection_l1_active_count_scale"),
+            ):
+                candidate = compatibility.get(compatibility_key, {})
+                if actual_fingerprints.get(layer) == candidate.get(layer):
+                    expected_fingerprints[layer] = candidate[layer]
         expected_for_validation = {"fingerprints": expected_fingerprints}
         mismatches = [
             name

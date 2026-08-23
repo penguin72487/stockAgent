@@ -34,6 +34,7 @@ from services.discord_bot.bot import (
     _latest_signal_message,
     _market_notice,
     _market_artifact_backfill_time,
+    _opening_critical_work_pending,
     _market_has_live_signal_for_date,
     _market_has_generated_signal_for_session,
     _day_trade_schedule_state,
@@ -154,7 +155,9 @@ def test_paginated_senders_attach_view_for_multiple_pages() -> None:
     assert isinstance(followup.calls[0]["view"], discord.ui.View)
 
 
-def test_portfolio_history_renders_exactly_one_day_per_page(monkeypatch, tmp_path) -> None:
+def test_portfolio_history_renders_exactly_one_day_per_page(
+    monkeypatch, tmp_path
+) -> None:
     monkeypatch.setattr(
         "services.discord_bot.bot._market_execution_mode",
         lambda cfg: "tw_day_trade",
@@ -247,7 +250,9 @@ def test_portfolio_history_renders_exactly_one_day_per_page(monkeypatch, tmp_pat
 
 
 def test_pre_signal_python_sentinel_uses_running_interpreter() -> None:
-    command = _resolve_pre_signal_command(("{python}", "downloader/example.py", "--mode", "incremental"))
+    command = _resolve_pre_signal_command(
+        ("{python}", "downloader/example.py", "--mode", "incremental")
+    )
 
     assert command == [sys.executable, "downloader/example.py", "--mode", "incremental"]
 
@@ -274,7 +279,9 @@ def test_scheduled_markets_respects_explicit_env(monkeypatch) -> None:
     assert _scheduled_markets() == ["tw", "crypto"]
 
 
-def test_scheduled_markets_excludes_disabled_market_even_when_explicit(monkeypatch) -> None:
+def test_scheduled_markets_excludes_disabled_market_even_when_explicit(
+    monkeypatch,
+) -> None:
     configs = {"tw": object(), "crypto": object(), "us": object()}
     monkeypatch.setenv("STOCKAGENT_SCHEDULED_MARKETS", "all")
     monkeypatch.setattr("services.discord_bot.bot._market_configs", lambda: configs)
@@ -313,14 +320,21 @@ def test_replace_user_watch_symbol_updates_or_adds(monkeypatch, tmp_path) -> Non
     assert items == ["2317", "0050"]
 
 
-def test_artifact_backfill_key_uses_backfill_time_and_skips_interval_markets(monkeypatch) -> None:
+def test_artifact_backfill_key_uses_backfill_time_and_skips_interval_markets(
+    monkeypatch,
+) -> None:
     monkeypatch.setattr("services.discord_bot.bot._market_state", lambda market: {})
+    monkeypatch.setattr(
+        "services.discord_bot.bot._scheduled_market_session_day",
+        lambda _cfg, _now: (True, "fixture session"),
+    )
     monkeypatch.setattr(
         "services.discord_bot.bot._runtime_status_for_display",
         lambda cfg: SimpleNamespace(
             data=SimpleNamespace(
                 expected_latest_date="2026-07-06",
                 last_data_date="2026-07-06",
+                fresh=True,
             )
         ),
     )
@@ -352,6 +366,90 @@ def test_artifact_backfill_key_uses_backfill_time_and_skips_interval_markets(mon
     assert _artifact_backfill_key(interval_cfg, now) is None
 
 
+def test_artifact_backfill_uses_weekly_session_and_freshness_gates(monkeypatch) -> None:
+    cfg = SimpleNamespace(
+        market="tw_day_trade",
+        data_ready_time="13:40",
+        close_time="13:30",
+        summary_time="14:00",
+        schedule_time=None,
+        schedule_interval_minutes=None,
+    )
+    saturday = datetime(2026, 8, 22, 14, 0, tzinfo=ZoneInfo("Asia/Taipei"))
+    monkeypatch.setattr(
+        "services.discord_bot.bot._scheduled_market_session_day",
+        lambda _cfg, _now: (False, "weekend"),
+    )
+    assert _artifact_backfill_key(cfg, saturday) is None
+
+    monday = saturday.replace(day=24)
+    monkeypatch.setattr(
+        "services.discord_bot.bot._scheduled_market_session_day",
+        lambda _cfg, _now: (True, "fixture session"),
+    )
+    monkeypatch.setattr(
+        "services.discord_bot.bot._runtime_status_for_display",
+        lambda _cfg: SimpleNamespace(
+            data=SimpleNamespace(
+                expected_latest_date="2026-08-21",
+                last_data_date="2026-08-20",
+                fresh=False,
+            )
+        ),
+    )
+    assert _artifact_backfill_key(cfg, monday) is None
+
+    monkeypatch.setattr(
+        "services.discord_bot.bot._runtime_status_for_display",
+        lambda _cfg: SimpleNamespace(
+            data=SimpleNamespace(
+                expected_latest_date="2026-08-21",
+                last_data_date="2026-08-21",
+                fresh=True,
+            )
+        ),
+    )
+    assert _artifact_backfill_key(cfg, monday) == (
+        "2026-08-21:tw_day_trade:artifact_backfill"
+    )
+
+
+def test_artifact_backfill_defers_for_opening_critical_day_trade(monkeypatch) -> None:
+    cfg = SimpleNamespace(
+        market="tw_day_trade",
+        timezone="Asia/Taipei",
+        preopen_prepare_time="08:15",
+        open_time="09:00",
+        day_trade_simulation_enabled=True,
+    )
+    monkeypatch.setattr(
+        "services.discord_bot.bot._market_configs", lambda: {cfg.market: cfg}
+    )
+    monkeypatch.setattr(
+        "services.discord_bot.bot._scheduled_market_session_day",
+        lambda _cfg, _now: (True, "fixture session"),
+    )
+    monkeypatch.setattr(
+        "services.discord_bot.bot._day_trade_schedule_state",
+        lambda _cfg, _date: "retry",
+    )
+
+    assert _opening_critical_work_pending(
+        datetime(2026, 7, 6, 8, 15, tzinfo=ZoneInfo("Asia/Taipei"))
+    )
+    assert _opening_critical_work_pending(
+        datetime(2026, 7, 6, 9, 20, tzinfo=ZoneInfo("Asia/Taipei"))
+    )
+
+    monkeypatch.setattr(
+        "services.discord_bot.bot._day_trade_schedule_state",
+        lambda _cfg, _date: "completed",
+    )
+    assert not _opening_critical_work_pending(
+        datetime(2026, 7, 6, 9, 20, tzinfo=ZoneInfo("Asia/Taipei"))
+    )
+
+
 def test_preopen_prepare_key_catches_up_missing_day_trade_readiness(
     monkeypatch,
 ) -> None:
@@ -377,9 +475,7 @@ def test_preopen_prepare_key_catches_up_missing_day_trade_readiness(
         holidays=(),
     )
 
-    assert _preopen_prepare_key(configured, now) == (
-        "2026-07-06:tw_day_trade:preopen"
-    )
+    assert _preopen_prepare_key(configured, now) == ("2026-07-06:tw_day_trade:preopen")
     monkeypatch.setattr(
         "services.discord_bot.bot._preopen_market_ready_for_session",
         lambda cfg, session_date: True,
@@ -493,9 +589,7 @@ def test_day_trade_schedule_catches_up_after_service_restart(
             "_source": ["TWSE OpenAPI"],
             "_as_of_date": ["2026-08-14"],
         }
-    ).write_parquet(
-        public_root / "twse_api_holidayschedule_holidayschedule.parquet"
-    )
+    ).write_parquet(public_root / "twse_api_holidayschedule_holidayschedule.parquet")
     cfg = SimpleNamespace(
         market="tw_day_trade_1m",
         market_type="tw",
@@ -592,21 +686,16 @@ def test_day_trade_scheduler_waits_for_engine_execution_record(
     state["modes"]["tw_day_trade"].update(
         {
             "session_date": "2026-08-14",
-            "signal_id": "first-consumed-signal",
+            "signal_id": signal_id,
             "entry_completed_at": "2026-08-14T09:23:01+08:00",
         }
     )
     (state_dir / "state.json").write_text(json.dumps(state), encoding="utf-8")
     assert _day_trade_schedule_state(cfg, "2026-08-14") == "completed"
 
-    state["modes"]["tw_day_trade"]["positions"] = {
-        "legacy": {"signed_shares": -1_000}
-    }
+    state["modes"]["tw_day_trade"]["positions"] = {"legacy": {"signed_shares": -1_000}}
     (state_dir / "state.json").write_text(json.dumps(state), encoding="utf-8")
-    assert (
-        _day_trade_schedule_state(cfg, "2026-08-14")
-        == "blocked_open_position"
-    )
+    assert _day_trade_schedule_state(cfg, "2026-08-14") == "blocked_open_position"
 
 
 def test_artifact_backfill_key_catches_up_previous_session_after_midnight(
@@ -614,11 +703,16 @@ def test_artifact_backfill_key_catches_up_previous_session_after_midnight(
 ) -> None:
     monkeypatch.setattr("services.discord_bot.bot._market_state", lambda market: {})
     monkeypatch.setattr(
+        "services.discord_bot.bot._scheduled_market_session_day",
+        lambda _cfg, _now: (True, "fixture session"),
+    )
+    monkeypatch.setattr(
         "services.discord_bot.bot._runtime_status_for_display",
         lambda cfg: SimpleNamespace(
             data=SimpleNamespace(
                 expected_latest_date="2026-07-27",
                 last_data_date="2026-07-27",
+                fresh=True,
             )
         ),
     )
@@ -644,7 +738,9 @@ def test_artifact_backfill_key_catches_up_previous_session_after_midnight(
     )
 
 
-def test_formal_history_latest_date_reads_settled_returns(monkeypatch, tmp_path) -> None:
+def test_formal_history_latest_date_reads_settled_returns(
+    monkeypatch, tmp_path
+) -> None:
     fold_dir = tmp_path / "fold_11"
     fold_dir.mkdir()
     pl.DataFrame(
@@ -653,7 +749,9 @@ def test_formal_history_latest_date_reads_settled_returns(monkeypatch, tmp_path)
             "portfolio_return": [0.01, -0.02],
         }
     ).write_parquet(fold_dir / "daily_portfolio_returns.parquet")
-    monkeypatch.setattr("services.discord_bot.bot._market_fold_dir", lambda cfg: fold_dir)
+    monkeypatch.setattr(
+        "services.discord_bot.bot._market_fold_dir", lambda cfg: fold_dir
+    )
 
     assert _formal_history_latest_date(SimpleNamespace()) == "2026-07-21"
 
@@ -680,7 +778,9 @@ def test_day_trade_settlement_backfill_skips_current_history(monkeypatch) -> Non
     assert not _run_day_trade_settlement_backfill(cfg, status)
 
 
-def test_day_trade_settlement_backfill_runs_formal_fold_inference(monkeypatch, tmp_path) -> None:
+def test_day_trade_settlement_backfill_runs_formal_fold_inference(
+    monkeypatch, tmp_path
+) -> None:
     cfg = SimpleNamespace(
         market="tw_day_trade",
         fold_id=11,
@@ -717,7 +817,9 @@ def test_day_trade_settlement_backfill_runs_formal_fold_inference(monkeypatch, t
     assert kwargs["timeout"] == 123
 
 
-def test_formal_history_backfill_discovers_fold_from_checkpoint(monkeypatch, tmp_path) -> None:
+def test_formal_history_backfill_discovers_fold_from_checkpoint(
+    monkeypatch, tmp_path
+) -> None:
     cfg = SimpleNamespace(
         market="forex",
         fold_id=None,
@@ -769,15 +871,25 @@ def test_naive_artifact_backfill_runs_formal_history_inference(monkeypatch) -> N
         )
     )
     calls = []
-    monkeypatch.setattr("services.discord_bot.bot._effective_market_config", lambda value: value)
-    monkeypatch.setattr("services.discord_bot.bot._ensure_signal_ready", lambda value: status)
-    monkeypatch.setattr("services.discord_bot.bot._market_execution_mode", lambda value: "naive")
+    monkeypatch.setattr(
+        "services.discord_bot.bot._effective_market_config", lambda value: value
+    )
+    monkeypatch.setattr(
+        "services.discord_bot.bot._ensure_signal_ready", lambda value: status
+    )
+    monkeypatch.setattr(
+        "services.discord_bot.bot._market_execution_mode", lambda value: "naive"
+    )
     monkeypatch.setattr(
         "services.discord_bot.bot._run_pre_signal_command",
         lambda value: calls.append("download"),
     )
-    monkeypatch.setattr("services.discord_bot.bot._clear_runtime_status_cache", lambda: None)
-    monkeypatch.setattr("services.discord_bot.bot._runtime_status", lambda value: status)
+    monkeypatch.setattr(
+        "services.discord_bot.bot._clear_runtime_status_cache", lambda: None
+    )
+    monkeypatch.setattr(
+        "services.discord_bot.bot._runtime_status", lambda value: status
+    )
     monkeypatch.setattr("services.discord_bot.bot._market_notice", lambda runtime: None)
     monkeypatch.setattr(
         "services.discord_bot.bot._require_fresh_data_for_artifact_generation",
@@ -857,7 +969,9 @@ def test_market_has_live_signal_for_date_uses_summary_data_fields(monkeypatch) -
     assert not _market_has_live_signal_for_date(cfg, "2026-07-07")
 
 
-def test_validate_pre_signal_download_artifacts_rejects_all_failed_download(tmp_path) -> None:
+def test_validate_pre_signal_download_artifacts_rejects_all_failed_download(
+    tmp_path,
+) -> None:
     output_dir = tmp_path / "tw_stocks"
     output_dir.mkdir()
     (output_dir / "download_summary.json").write_text(
@@ -865,10 +979,19 @@ def test_validate_pre_signal_download_artifacts_rejects_all_failed_download(tmp_
         encoding="utf-8",
     )
     cfg = SimpleNamespace(market="tw", market_type="tw")
-    command = ["python", "downloader/download_yahoo_ohlcv.py", "--output-dir", str(output_dir), "--mode", "daily-update"]
+    command = [
+        "python",
+        "downloader/download_yahoo_ohlcv.py",
+        "--output-dir",
+        str(output_dir),
+        "--mode",
+        "daily-update",
+    ]
 
     try:
-        _validate_pre_signal_download_artifacts(cfg, command, tmp_path / "pre_signal.log")
+        _validate_pre_signal_download_artifacts(
+            cfg, command, tmp_path / "pre_signal.log"
+        )
     except BotUserError as exc:
         assert "did not produce usable data" in str(exc)
     else:
@@ -901,8 +1024,13 @@ def test_prepare_realtime_signal_does_not_refresh_disabled_market(monkeypatch) -
     def fake_ensure_signal_ready(cfg):
         raise RuntimeError("disabled")
 
-    monkeypatch.setattr("services.discord_bot.bot._ensure_signal_ready", fake_ensure_signal_ready)
-    monkeypatch.setattr("services.discord_bot.bot._run_pre_signal_command", lambda cfg: calls.append(cfg))
+    monkeypatch.setattr(
+        "services.discord_bot.bot._ensure_signal_ready", fake_ensure_signal_ready
+    )
+    monkeypatch.setattr(
+        "services.discord_bot.bot._run_pre_signal_command",
+        lambda cfg: calls.append(cfg),
+    )
 
     try:
         _prepare_realtime_signal_sync(cfg, force_refresh=True)
@@ -912,16 +1040,30 @@ def test_prepare_realtime_signal_does_not_refresh_disabled_market(monkeypatch) -
     assert calls == []
 
 
-def test_prepare_realtime_signal_does_not_run_daily_updater_just_because_market_is_open(monkeypatch) -> None:
-    cfg = SimpleNamespace(market="tw", market_type="tw", history_frequency="daily", schedule_interval_minutes=None)
+def test_prepare_realtime_signal_does_not_run_daily_updater_just_because_market_is_open(
+    monkeypatch,
+) -> None:
+    cfg = SimpleNamespace(
+        market="tw",
+        market_type="tw",
+        history_frequency="daily",
+        schedule_interval_minutes=None,
+    )
     status = SimpleNamespace(market_open=True, data=SimpleNamespace(fresh=True))
     calls = []
 
-    monkeypatch.setattr("services.discord_bot.bot._ensure_signal_ready", lambda cfg: status)
-    monkeypatch.setattr("services.discord_bot.bot._run_pre_signal_command", lambda cfg: calls.append(cfg))
+    monkeypatch.setattr(
+        "services.discord_bot.bot._ensure_signal_ready", lambda cfg: status
+    )
+    monkeypatch.setattr(
+        "services.discord_bot.bot._run_pre_signal_command",
+        lambda cfg: calls.append(cfg),
+    )
     monkeypatch.setattr("services.discord_bot.bot._runtime_status", lambda cfg: status)
 
-    source, resolved_status, refreshed = _prepare_realtime_signal_sync(cfg, requested_price_source="auto", force_refresh=False)
+    source, resolved_status, refreshed = _prepare_realtime_signal_sync(
+        cfg, requested_price_source="auto", force_refresh=False
+    )
 
     assert source == "shioaji"
     assert resolved_status is status
@@ -930,15 +1072,27 @@ def test_prepare_realtime_signal_does_not_run_daily_updater_just_because_market_
 
 
 def test_prepare_realtime_signal_refreshes_interval_market(monkeypatch) -> None:
-    cfg = SimpleNamespace(market="crypto", market_type="crypto", history_frequency="bar", schedule_interval_minutes=15)
+    cfg = SimpleNamespace(
+        market="crypto",
+        market_type="crypto",
+        history_frequency="bar",
+        schedule_interval_minutes=15,
+    )
     status = SimpleNamespace(market_open=True, data=SimpleNamespace(fresh=True))
     calls = []
 
-    monkeypatch.setattr("services.discord_bot.bot._ensure_signal_ready", lambda cfg: status)
-    monkeypatch.setattr("services.discord_bot.bot._run_pre_signal_command", lambda cfg: calls.append(cfg))
+    monkeypatch.setattr(
+        "services.discord_bot.bot._ensure_signal_ready", lambda cfg: status
+    )
+    monkeypatch.setattr(
+        "services.discord_bot.bot._run_pre_signal_command",
+        lambda cfg: calls.append(cfg),
+    )
     monkeypatch.setattr("services.discord_bot.bot._runtime_status", lambda cfg: status)
 
-    source, resolved_status, refreshed = _prepare_realtime_signal_sync(cfg, requested_price_source="auto", force_refresh=False)
+    source, resolved_status, refreshed = _prepare_realtime_signal_sync(
+        cfg, requested_price_source="auto", force_refresh=False
+    )
 
     assert source == "panel"
     assert resolved_status is status
@@ -1012,11 +1166,15 @@ def test_can_reuse_latest_signal_now_for_closed_fresh_panel_close() -> None:
     cfg = SimpleNamespace(market="tw")
     status = SimpleNamespace(
         market_open=False,
-        data=SimpleNamespace(fresh=True, last_data_date="2026-07-06", panel_date="2026-07-06"),
+        data=SimpleNamespace(
+            fresh=True, last_data_date="2026-07-06", panel_date="2026-07-06"
+        ),
     )
     summary = {"panel_date": "2026-07-06 13:30:00", "price_source": "panel_close"}
 
-    reusable, reason = _can_reuse_latest_signal_now(cfg, status, summary, requested_price_source="auto")
+    reusable, reason = _can_reuse_latest_signal_now(
+        cfg, status, summary, requested_price_source="auto"
+    )
 
     assert reusable
     assert reason == "cached_latest_close"
@@ -1024,7 +1182,9 @@ def test_can_reuse_latest_signal_now_for_closed_fresh_panel_close() -> None:
 
 def test_signal_now_cache_requires_raw_score_contract() -> None:
     assert not _summary_has_raw_score_contract({})
-    assert not _summary_has_raw_score_contract({"score_contract": {"schema_version": 0}})
+    assert not _summary_has_raw_score_contract(
+        {"score_contract": {"schema_version": 0}}
+    )
     assert _summary_has_raw_score_contract(
         {
             "score_contract": {
@@ -1080,11 +1240,15 @@ def test_can_reuse_latest_signal_now_rejects_stale_closed_panel() -> None:
     cfg = SimpleNamespace(market="tw")
     status = SimpleNamespace(
         market_open=False,
-        data=SimpleNamespace(fresh=False, last_data_date="2026-07-02", panel_date="2026-07-02"),
+        data=SimpleNamespace(
+            fresh=False, last_data_date="2026-07-02", panel_date="2026-07-02"
+        ),
     )
     summary = {"panel_date": "2026-07-02 13:30:00", "price_source": "panel_close"}
 
-    reusable, _ = _can_reuse_latest_signal_now(cfg, status, summary, requested_price_source="auto")
+    reusable, _ = _can_reuse_latest_signal_now(
+        cfg, status, summary, requested_price_source="auto"
+    )
 
     assert not reusable
 
@@ -1095,7 +1259,9 @@ def test_can_reuse_latest_signal_now_rejects_another_model_deployment() -> None:
         market_open=False,
         checkpoint=SimpleNamespace(fingerprint="new-checkpoint"),
         config_fingerprint="new-config",
-        data=SimpleNamespace(fresh=True, last_data_date="2026-07-14", panel_date="2026-07-14"),
+        data=SimpleNamespace(
+            fresh=True, last_data_date="2026-07-14", panel_date="2026-07-14"
+        ),
     )
     summary = {
         "fold_id": 25,
@@ -1105,13 +1271,17 @@ def test_can_reuse_latest_signal_now_rejects_another_model_deployment() -> None:
         "price_source": "panel_close",
     }
 
-    reusable, reason = _can_reuse_latest_signal_now(cfg, status, summary, requested_price_source="auto")
+    reusable, reason = _can_reuse_latest_signal_now(
+        cfg, status, summary, requested_price_source="auto"
+    )
 
     assert not reusable
     assert reason == "deployment_fold_changed"
 
 
-def test_can_reuse_latest_signal_now_rejects_closed_tw_panel_when_today_panel_missing(monkeypatch) -> None:
+def test_can_reuse_latest_signal_now_rejects_closed_tw_panel_when_today_panel_missing(
+    monkeypatch,
+) -> None:
     cfg = SimpleNamespace(
         market="tw",
         market_type="tw",
@@ -1122,11 +1292,19 @@ def test_can_reuse_latest_signal_now_rejects_closed_tw_panel_when_today_panel_mi
     )
     status = SimpleNamespace(
         market_open=False,
-        data=SimpleNamespace(fresh=True, last_data_date="2000-01-01", panel_date="2000-01-01"),
+        data=SimpleNamespace(
+            fresh=True, last_data_date="2000-01-01", panel_date="2000-01-01"
+        ),
     )
 
-    panel_summary = {"asof_date": "2026-07-09 14:35:00", "panel_date": "2000-01-01", "price_source": "panel_close"}
-    reusable, _ = _can_reuse_latest_signal_now(cfg, status, panel_summary, requested_price_source="auto")
+    panel_summary = {
+        "asof_date": "2026-07-09 14:35:00",
+        "panel_date": "2000-01-01",
+        "price_source": "panel_close",
+    }
+    reusable, _ = _can_reuse_latest_signal_now(
+        cfg, status, panel_summary, requested_price_source="auto"
+    )
     assert not reusable
 
     shioaji_summary = {
@@ -1135,10 +1313,14 @@ def test_can_reuse_latest_signal_now_rejects_closed_tw_panel_when_today_panel_mi
         "price_source": "shioaji:stock_snapshot",
         "price_available_count": 2000,
     }
-    monkeypatch.setattr("services.discord_bot.bot._summary_age_seconds", lambda summary, cfg: 30.0)
+    monkeypatch.setattr(
+        "services.discord_bot.bot._summary_age_seconds", lambda summary, cfg: 30.0
+    )
     monkeypatch.setenv("STOCKAGENT_SIGNAL_NOW_OPEN_CACHE_SECONDS", "60")
 
-    reusable, reason = _can_reuse_latest_signal_now(cfg, status, shioaji_summary, requested_price_source="auto")
+    reusable, reason = _can_reuse_latest_signal_now(
+        cfg, status, shioaji_summary, requested_price_source="auto"
+    )
 
     assert reusable
     assert reason == "cached_shioaji_after_close_age=30s"
@@ -1154,7 +1336,11 @@ def test_can_reuse_latest_signal_now_for_recent_open_panel_market(monkeypatch) -
     )
     status = SimpleNamespace(
         market_open=True,
-        data=SimpleNamespace(fresh=True, last_data_date="2026-07-08 14:00:00", panel_date="2026-07-08 14:00:00"),
+        data=SimpleNamespace(
+            fresh=True,
+            last_data_date="2026-07-08 14:00:00",
+            panel_date="2026-07-08 14:00:00",
+        ),
     )
     summary = {
         "asof_date": "2026-07-08 22:00:30",
@@ -1162,10 +1348,16 @@ def test_can_reuse_latest_signal_now_for_recent_open_panel_market(monkeypatch) -
         "price_source": "panel_close",
     }
 
-    monkeypatch.setattr("services.discord_bot.bot._signal_now_open_cache_seconds", lambda: 120.0)
-    monkeypatch.setattr("services.discord_bot.bot._summary_age_seconds", lambda summary, cfg: 30.0)
+    monkeypatch.setattr(
+        "services.discord_bot.bot._signal_now_open_cache_seconds", lambda: 120.0
+    )
+    monkeypatch.setattr(
+        "services.discord_bot.bot._summary_age_seconds", lambda summary, cfg: 30.0
+    )
 
-    reusable, reason = _can_reuse_latest_signal_now(cfg, status, summary, requested_price_source="auto")
+    reusable, reason = _can_reuse_latest_signal_now(
+        cfg, status, summary, requested_price_source="auto"
+    )
 
     assert reusable
     assert reason == "cached_open_panel_age=30s"
@@ -1192,7 +1384,9 @@ def test_summary_age_seconds_handles_timezone_aware_generated_at(monkeypatch) ->
 
 
 def test_can_reuse_latest_signal_now_for_recent_open_yahoo(monkeypatch) -> None:
-    cfg = SimpleNamespace(market="tw", display_timezone="Asia/Taipei", timezone="Asia/Taipei")
+    cfg = SimpleNamespace(
+        market="tw", display_timezone="Asia/Taipei", timezone="Asia/Taipei"
+    )
     status = SimpleNamespace(market_open=True, data=SimpleNamespace(fresh=True))
     summary = {"asof_date": "2026-07-07 09:30:00", "price_source": "yahoo:quote"}
 
@@ -1204,7 +1398,9 @@ def test_can_reuse_latest_signal_now_for_recent_open_yahoo(monkeypatch) -> None:
     monkeypatch.setattr("services.discord_bot.bot.datetime", FixedDateTime)
     monkeypatch.setenv("STOCKAGENT_SIGNAL_NOW_OPEN_CACHE_SECONDS", "60")
 
-    reusable, reason = _can_reuse_latest_signal_now(cfg, status, summary, requested_price_source="auto")
+    reusable, reason = _can_reuse_latest_signal_now(
+        cfg, status, summary, requested_price_source="auto"
+    )
 
     assert reusable
     assert reason == "cached_open_yahoo_age=30s"
@@ -1228,7 +1424,9 @@ def test_open_day_trade_cache_requires_current_decision_panel(monkeypatch) -> No
         "execution_mode": "tw_day_trade",
         "live_session_open_feature_applied": False,
     }
-    monkeypatch.setattr("services.discord_bot.bot._summary_age_seconds", lambda summary, cfg: 10.0)
+    monkeypatch.setattr(
+        "services.discord_bot.bot._summary_age_seconds", lambda summary, cfg: 10.0
+    )
 
     reusable, reason = _can_reuse_latest_signal_now(
         cfg,
@@ -1265,7 +1463,9 @@ def test_signal_now_refreshes_automatically_when_data_is_stale() -> None:
 
 def test_auto_signal_price_source_uses_shioaji_for_open_taiwan_market() -> None:
     status = SimpleNamespace(market_open=True)
-    cfg = SimpleNamespace(market_type="tw", history_frequency="daily", pre_signal_command=["download"])
+    cfg = SimpleNamespace(
+        market_type="tw", history_frequency="daily", pre_signal_command=["download"]
+    )
 
     assert _auto_signal_price_source(cfg, status, "auto") == "shioaji"
     assert _auto_signal_price_source(cfg, status, None) == "shioaji"
@@ -1273,19 +1473,25 @@ def test_auto_signal_price_source_uses_shioaji_for_open_taiwan_market() -> None:
 
 def test_auto_signal_price_source_uses_yahoo_for_other_open_stock_markets() -> None:
     status = SimpleNamespace(market_open=True)
-    cfg = SimpleNamespace(market_type="us", history_frequency="daily", pre_signal_command=["download"])
+    cfg = SimpleNamespace(
+        market_type="us", history_frequency="daily", pre_signal_command=["download"]
+    )
 
     assert _auto_signal_price_source(cfg, status, "auto") == "yahoo"
 
 
 def test_auto_signal_price_source_keeps_bar_markets_on_latest_panel_bar() -> None:
     status = SimpleNamespace(market_open=True)
-    cfg = SimpleNamespace(market_type="crypto", history_frequency="bar", pre_signal_command=["download"])
+    cfg = SimpleNamespace(
+        market_type="crypto", history_frequency="bar", pre_signal_command=["download"]
+    )
 
     assert _auto_signal_price_source(cfg, status, "auto") == "panel"
 
 
-def test_auto_signal_price_source_respects_explicit_and_closed_market_defaults() -> None:
+def test_auto_signal_price_source_respects_explicit_and_closed_market_defaults() -> (
+    None
+):
     open_status = SimpleNamespace(market_open=True)
     today = datetime.now().date().isoformat()
     closed_fresh_status = SimpleNamespace(
@@ -1307,7 +1513,10 @@ def test_auto_signal_price_source_respects_explicit_and_closed_market_defaults()
     assert _auto_signal_price_source(cfg, open_status, "panel") == "panel"
     assert _auto_signal_price_source(cfg, open_status, "yahoo") == "yahoo"
     assert _auto_signal_price_source(cfg, closed_fresh_status, "auto") is None
-    assert _auto_signal_price_source(cfg, closed_lagging_after_open_status, "auto") == "shioaji"
+    assert (
+        _auto_signal_price_source(cfg, closed_lagging_after_open_status, "auto")
+        == "shioaji"
+    )
 
 
 def test_console_progress_prints_backend_progress_bar(capsys) -> None:
@@ -1331,11 +1540,18 @@ def test_signal_kwargs_forwards_progress_fields(monkeypatch) -> None:
     cfg = SimpleNamespace(market="unit", signal_kwargs=fake_signal_kwargs)
     status = SimpleNamespace()
     monkeypatch.setattr("services.discord_bot.bot._resolve_market", lambda market: cfg)
-    monkeypatch.setattr("services.discord_bot.bot._ensure_signal_ready", lambda cfg, scheduled=False: status)
-    monkeypatch.setattr("services.discord_bot.bot._market_notice", lambda status: "notice")
+    monkeypatch.setattr(
+        "services.discord_bot.bot._ensure_signal_ready",
+        lambda cfg, scheduled=False: status,
+    )
+    monkeypatch.setattr(
+        "services.discord_bot.bot._market_notice", lambda status: "notice"
+    )
 
     callback = object()
-    result = _signal_kwargs(market="unit", progress_callback=callback, progress_label="unit-progress")
+    result = _signal_kwargs(
+        market="unit", progress_callback=callback, progress_label="unit-progress"
+    )
 
     assert result["progress_callback"] is callback
     assert result["progress_label"] == "unit-progress"
@@ -1427,7 +1643,9 @@ def test_scheduled_detail_pages_include_positions_and_rebalances() -> None:
         result,
         max_rows=1,
     )
-    debug_position_pages, debug_rebalance_pages = _scheduled_detail_page_groups(cfg, result, debug=True)
+    debug_position_pages, debug_rebalance_pages = _scheduled_detail_page_groups(
+        cfg, result, debug=True
+    )
 
     assert len(position_pages) == 1
     assert len(rebalance_pages) == 1
@@ -1817,7 +2035,9 @@ def test_sanity_block_still_includes_full_latest_signal(tmp_path) -> None:
         "portfolio_simple_return": 0.01,
         "benchmark_simple_return": 0.00,
         "target_risk": {"gross": 1.0, "top_abs_weight": 0.9851},
-        "top_positions": [{"symbol": "AAA", "name": "Alpha", "weight": 0.9851, "current_price": 10.0}],
+        "top_positions": [
+            {"symbol": "AAA", "name": "Alpha", "weight": 0.9851, "current_price": 10.0}
+        ],
     }
 
     message = _latest_signal_message(cfg, tmp_path / "summary.json", summary, top_n=1)
@@ -1852,12 +2072,28 @@ def test_latest_signal_message_uses_saved_summary_without_debug_paths(tmp_path) 
         "turnover": 0.1,
         "weights_path": str(tmp_path / "weights.parquet"),
         "rebalance_path": str(tmp_path / "rebalance.parquet"),
-        "top_positions": [{"symbol": "AAA", "name": "Alpha", "weight": 0.1, "current_price": 10.0}],
-        "rebalance": [{"symbol": "AAA", "name": "Alpha", "action": "BUY", "delta_weight": 0.02, "current_weight": 0.0, "target_weight": 0.02, "trade_price": 10.0}],
+        "top_positions": [
+            {"symbol": "AAA", "name": "Alpha", "weight": 0.1, "current_price": 10.0}
+        ],
+        "rebalance": [
+            {
+                "symbol": "AAA",
+                "name": "Alpha",
+                "action": "BUY",
+                "delta_weight": 0.02,
+                "current_weight": 0.0,
+                "target_weight": 0.02,
+                "trade_price": 10.0,
+            }
+        ],
     }
 
-    normal = _latest_signal_message(cfg, tmp_path / "summary.json", summary, top_n=1, debug=False)
-    debug = _latest_signal_message(cfg, tmp_path / "summary.json", summary, top_n=1, debug=True)
+    normal = _latest_signal_message(
+        cfg, tmp_path / "summary.json", summary, top_n=1, debug=False
+    )
+    debug = _latest_signal_message(
+        cfg, tmp_path / "summary.json", summary, top_n=1, debug=True
+    )
 
     assert "stockAgent live signal" in normal
     assert "`AAA` Alpha" in normal
@@ -1882,8 +2118,24 @@ def test_latest_changes_pages_can_filter_to_watchlist(tmp_path) -> None:
         "asof_date": "2026-06-24 13:30:00",
         "panel_date": "2026-06-24 13:30:00",
         "rebalance": [
-            {"symbol": "AAA", "name": "Alpha", "action": "BUY", "delta_weight": 0.04, "current_weight": 0.0, "target_weight": 0.04, "trade_price": 10.0},
-            {"symbol": "BBB", "name": "Beta", "action": "SELL", "delta_weight": -0.03, "current_weight": 0.03, "target_weight": 0.0, "trade_price": 20.0},
+            {
+                "symbol": "AAA",
+                "name": "Alpha",
+                "action": "BUY",
+                "delta_weight": 0.04,
+                "current_weight": 0.0,
+                "target_weight": 0.04,
+                "trade_price": 10.0,
+            },
+            {
+                "symbol": "BBB",
+                "name": "Beta",
+                "action": "SELL",
+                "delta_weight": -0.03,
+                "current_weight": 0.03,
+                "target_weight": 0.0,
+                "trade_price": 20.0,
+            },
         ],
     }
 
@@ -1934,7 +2186,9 @@ def test_performance_and_risk_messages_are_investor_facing(tmp_path) -> None:
             "top_abs_weight": 0.12,
             "hhi": 0.08,
         },
-        "top_positions": [{"symbol": "AAA", "name": "Alpha", "weight": 0.12, "current_price": 10.0}],
+        "top_positions": [
+            {"symbol": "AAA", "name": "Alpha", "weight": 0.12, "current_price": 10.0}
+        ],
     }
 
     performance = _performance_message(cfg, tmp_path / "summary.json", summary, days=0)
@@ -1949,7 +2203,12 @@ def test_performance_and_risk_messages_are_investor_facing(tmp_path) -> None:
 
 
 def test_summary_recent_performance_uses_live_portfolio_history(monkeypatch) -> None:
-    cfg = SimpleNamespace(market="tw", benchmark_window_days=32, current_capital=None, initial_capital=None)
+    cfg = SimpleNamespace(
+        market="tw",
+        benchmark_window_days=32,
+        current_capital=None,
+        initial_capital=None,
+    )
     history = SimpleNamespace(
         days=4,
         period_return=0.12,
@@ -1959,7 +2218,9 @@ def test_summary_recent_performance_uses_live_portfolio_history(monkeypatch) -> 
     )
     monkeypatch.setattr(
         "services.discord_bot.bot._load_portfolio_history_for_market",
-        lambda cfg, days, top_changes, min_abs_change, initial_capital, current_capital: history,
+        lambda cfg, days, top_changes, min_abs_change, initial_capital, current_capital: (
+            history
+        ),
     )
 
     summary = _summary_with_capital_context(
@@ -2093,7 +2354,10 @@ def test_user_subscriptions_are_per_user_and_per_market(monkeypatch, tmp_path) -
 
     assert subscriptions == {"tw": {"enabled": True, "watchlist_only": True}}
     assert _user_subscriptions(123)["crypto"]["watchlist_only"] is False
-    assert sorted(user_id for user_id, _ in _subscribed_users_for_market("tw")) == ["123", "456"]
+    assert sorted(user_id for user_id, _ in _subscribed_users_for_market("tw")) == [
+        "123",
+        "456",
+    ]
     lines = "\n".join(_subscription_summary_lines(123))
     assert "`tw` mode=`watchlist_only`" in lines
     assert "`crypto` mode=`all_changes`" in lines
@@ -2101,10 +2365,14 @@ def test_user_subscriptions_are_per_user_and_per_market(monkeypatch, tmp_path) -
     _remove_user_subscription(123, "tw")
 
     assert "tw" not in _user_subscriptions(123)
-    assert sorted(user_id for user_id, _ in _subscribed_users_for_market("tw")) == ["456"]
+    assert sorted(user_id for user_id, _ in _subscribed_users_for_market("tw")) == [
+        "456"
+    ]
 
 
-def test_subscription_alert_pages_only_include_watchlist_matches(monkeypatch, tmp_path) -> None:
+def test_subscription_alert_pages_only_include_watchlist_matches(
+    monkeypatch, tmp_path
+) -> None:
     monkeypatch.setattr("services.discord_bot.bot.STATE_PATH", tmp_path / "state.json")
     _add_user_watch_symbol(123, "tw", "2330")
     cfg = SimpleNamespace(market="tw", label="台股", config_path="missing.yaml")
@@ -2116,8 +2384,24 @@ def test_subscription_alert_pages_only_include_watchlist_matches(monkeypatch, tm
         "benchmark_simple_return": 0.0,
     }
     rows = [
-        {"symbol": "2330", "name": "台積電", "action": "BUY", "delta_weight": 0.05, "current_weight": 0.0, "target_weight": 0.05, "trade_price": 1000.0},
-        {"symbol": "6669", "name": "緯穎", "action": "SELL", "delta_weight": -0.04, "current_weight": 0.04, "target_weight": 0.0, "trade_price": 4500.0},
+        {
+            "symbol": "2330",
+            "name": "台積電",
+            "action": "BUY",
+            "delta_weight": 0.05,
+            "current_weight": 0.0,
+            "target_weight": 0.05,
+            "trade_price": 1000.0,
+        },
+        {
+            "symbol": "6669",
+            "name": "緯穎",
+            "action": "SELL",
+            "delta_weight": -0.04,
+            "current_weight": 0.04,
+            "target_weight": 0.0,
+            "trade_price": 4500.0,
+        },
     ]
 
     pages = _subscription_alert_pages(
@@ -2202,7 +2486,12 @@ def test_portfolio_history_can_prepend_latest_signal_day(tmp_path) -> None:
         "benchmark_simple_return": 0.01,
         "turnover": 0.20,
         "display_capital": 1_000.0,
-        "target_risk": {"gross": 0.30, "net": -0.10, "long_gross": 0.10, "short_gross": 0.20},
+        "target_risk": {
+            "gross": 0.30,
+            "net": -0.10,
+            "long_gross": 0.10,
+            "short_gross": 0.20,
+        },
         "weights_path": str(weights_path),
         "rebalance_path": str(rebalance_path),
     }
@@ -2235,7 +2524,9 @@ def test_portfolio_history_can_prepend_latest_signal_day(tmp_path) -> None:
     assert summary_path in result.source_paths
 
 
-def test_portfolio_history_uses_complete_weights_when_rebalance_is_empty(tmp_path) -> None:
+def test_portfolio_history_uses_complete_weights_when_rebalance_is_empty(
+    tmp_path,
+) -> None:
     weights_path = tmp_path / "target_weights.parquet"
     rebalance_path = tmp_path / "rebalance.parquet"
     pl.DataFrame(
@@ -2254,7 +2545,14 @@ def test_portfolio_history_uses_complete_weights_when_rebalance_is_empty(tmp_pat
     summary_path = tmp_path / "summary.json"
     summary_path.write_text("{}", encoding="utf-8")
     result = SimpleNamespace(
-        rows=[{"date": "2026-07-28", "portfolio_return": 0.0, "benchmark_return": 0.0, "profit_value": 0.0}],
+        rows=[
+            {
+                "date": "2026-07-28",
+                "portfolio_return": 0.0,
+                "benchmark_return": 0.0,
+                "profit_value": 0.0,
+            }
+        ],
         source_paths=(),
         days=1,
         top_changes=5,
@@ -2287,7 +2585,9 @@ def test_portfolio_history_uses_complete_weights_when_rebalance_is_empty(tmp_pat
     assert [row["symbol"] for row in result.rows[0]["changes"]] == ["AAA", "BBB"]
 
 
-def test_portfolio_history_prepend_uses_weights_date_before_panel_date(tmp_path) -> None:
+def test_portfolio_history_prepend_uses_weights_date_before_panel_date(
+    tmp_path,
+) -> None:
     result = SimpleNamespace(
         rows=[
             {
@@ -2329,7 +2629,9 @@ def test_portfolio_history_prepend_uses_weights_date_before_panel_date(tmp_path)
     ]
 
 
-def test_portfolio_history_excludes_day_trade_preview_without_observed_open(tmp_path) -> None:
+def test_portfolio_history_excludes_day_trade_preview_without_observed_open(
+    tmp_path,
+) -> None:
     result = SimpleNamespace(rows=[{"date": "2026-07-17"}], end_date="2026-07-17")
     summary = {
         "asof_date": "2026-07-22 10:30:00",
@@ -2349,7 +2651,9 @@ def test_portfolio_history_excludes_day_trade_preview_without_observed_open(tmp_
     assert result.rows == [{"date": "2026-07-17"}]
 
 
-def test_portfolio_history_excludes_old_nonpreview_day_trade_without_open_contract(tmp_path) -> None:
+def test_portfolio_history_excludes_old_nonpreview_day_trade_without_open_contract(
+    tmp_path,
+) -> None:
     result = SimpleNamespace(rows=[{"date": "2026-07-17"}], end_date="2026-07-17")
     summary = {
         "asof_date": "2026-07-22 10:30:00",
@@ -2555,7 +2859,14 @@ def test_portfolio_history_keeps_one_open_price_signal_not_later_intraday_snapsh
 
 def test_portfolio_history_prepend_keeps_panel_display_time(tmp_path) -> None:
     result = SimpleNamespace(
-        rows=[{"date": "2026-06-23", "portfolio_return": 0.0, "benchmark_return": 0.0, "profit_value": 0.0}],
+        rows=[
+            {
+                "date": "2026-06-23",
+                "portfolio_return": 0.0,
+                "benchmark_return": 0.0,
+                "profit_value": 0.0,
+            }
+        ],
         source_paths=(),
         days=1,
         top_changes=1,
@@ -2572,7 +2883,12 @@ def test_portfolio_history_prepend_keeps_panel_display_time(tmp_path) -> None:
         "panel_data_date": "2026-06-24 00:00:00",
         "data_timezone": "Asia/Taipei",
         "display_timezone": "Asia/Taipei",
-        "target_risk": {"gross": 0.0, "net": 0.0, "long_gross": 0.0, "short_gross": 0.0},
+        "target_risk": {
+            "gross": 0.0,
+            "net": 0.0,
+            "long_gross": 0.0,
+            "short_gross": 0.0,
+        },
     }
 
     inserted = _prepend_latest_signal_row_to_portfolio_history(
@@ -2587,9 +2903,18 @@ def test_portfolio_history_prepend_keeps_panel_display_time(tmp_path) -> None:
     assert result.rows[0]["display_date"] == "2026-06-24 13:30:00"
 
 
-def test_portfolio_history_includes_all_newer_live_signals(monkeypatch, tmp_path) -> None:
+def test_portfolio_history_includes_all_newer_live_signals(
+    monkeypatch, tmp_path
+) -> None:
     result = SimpleNamespace(
-        rows=[{"date": "2026-06-25", "portfolio_return": 0.01, "benchmark_return": 0.0, "profit_value": 10.0}],
+        rows=[
+            {
+                "date": "2026-06-25",
+                "portfolio_return": 0.01,
+                "benchmark_return": 0.0,
+                "profit_value": 10.0,
+            }
+        ],
         source_paths=(),
         days=3,
         top_changes=1,
@@ -2609,7 +2934,9 @@ def test_portfolio_history_includes_all_newer_live_signals(monkeypatch, tmp_path
         summary_path = signal_dir / "summary.json"
         weights_path = signal_dir / "target_weights.parquet"
         rebalance_path = signal_dir / "rebalance.parquet"
-        pl.DataFrame({"symbol": ["AAA"], "target_weight": [0.1]}).write_parquet(weights_path)
+        pl.DataFrame({"symbol": ["AAA"], "target_weight": [0.1]}).write_parquet(
+            weights_path
+        )
         pl.DataFrame(
             {
                 "symbol": ["AAA"],
@@ -2628,7 +2955,12 @@ def test_portfolio_history_includes_all_newer_live_signals(monkeypatch, tmp_path
             "portfolio_simple_return": ret,
             "benchmark_simple_return": 0.0,
             "display_capital": 1_000.0,
-            "target_risk": {"gross": 0.1, "net": 0.1, "long_gross": 0.1, "short_gross": 0.0},
+            "target_risk": {
+                "gross": 0.1,
+                "net": 0.1,
+                "long_gross": 0.1,
+                "short_gross": 0.0,
+            },
             "weights_path": str(weights_path),
             "rebalance_path": str(rebalance_path),
         }
@@ -2636,7 +2968,9 @@ def test_portfolio_history_includes_all_newer_live_signals(monkeypatch, tmp_path
         summaries.append((summary_path, summary))
         previous_date = date_text
 
-    monkeypatch.setattr("services.discord_bot.bot._market_signals", lambda cfg: summaries)
+    monkeypatch.setattr(
+        "services.discord_bot.bot._market_signals", lambda cfg: summaries
+    )
 
     _include_live_signals_in_portfolio_history(cfg, result, max_rows=3)
 
@@ -2694,9 +3028,9 @@ def test_portfolio_history_excludes_signal_after_canonical_live_weights(
 ) -> None:
     fold_dir = tmp_path / "fold_20"
     fold_dir.mkdir()
-    pl.DataFrame(
-        {"date": ["2026-07-15 00:00:00"], "AAA": [0.5]}
-    ).write_parquet(fold_dir / "live_signal_weights.parquet")
+    pl.DataFrame({"date": ["2026-07-15 00:00:00"], "AAA": [0.5]}).write_parquet(
+        fold_dir / "live_signal_weights.parquet"
+    )
     result = SimpleNamespace(
         rows=[{"date": "2026-07-14", "portfolio_return": 0.0}],
         source_paths=(),
@@ -2920,7 +3254,9 @@ def test_history_headers_hide_internal_details_until_debug(tmp_path) -> None:
         timezone="Asia/Taipei",
         display_timezone="Asia/Taipei",
     )
-    capital = SimpleNamespace(mode="artifact", capital=None, reference_date="2026-06-24")
+    capital = SimpleNamespace(
+        mode="artifact", capital=None, reference_date="2026-06-24"
+    )
     stock_result = SimpleNamespace(
         symbol="6924",
         name="榮惠-KY創",
@@ -2950,10 +3286,16 @@ def test_history_headers_hide_internal_details_until_debug(tmp_path) -> None:
         capital=capital,
     )
 
-    stock_normal = "\n".join(_stock_history_header_lines(cfg, stock_result, debug=False))
-    portfolio_normal = "\n".join(_portfolio_history_header_lines(cfg, portfolio_result, debug=False))
+    stock_normal = "\n".join(
+        _stock_history_header_lines(cfg, stock_result, debug=False)
+    )
+    portfolio_normal = "\n".join(
+        _portfolio_history_header_lines(cfg, portfolio_result, debug=False)
+    )
     stock_debug = "\n".join(_stock_history_header_lines(cfg, stock_result, debug=True))
-    portfolio_debug = "\n".join(_portfolio_history_header_lines(cfg, portfolio_result, debug=True))
+    portfolio_debug = "\n".join(
+        _portfolio_history_header_lines(cfg, portfolio_result, debug=True)
+    )
 
     for text in (stock_normal, portfolio_normal):
         assert "sources:" not in text
@@ -2988,8 +3330,12 @@ def test_decision_overview_hides_artifact_details_until_debug(tmp_path) -> None:
         "model_explanation": {
             "confidence_proxy_score_std": 0.1234,
             "source": "internal score/weight decision table",
-            "top_score_drivers": [{"symbol": "AAA", "name": "Alpha", "score": 1.0, "target_weight": 0.1}],
-            "top_feature_drivers": [{"feature": "close_logret_1d", "weighted_abs_value": 0.5}],
+            "top_score_drivers": [
+                {"symbol": "AAA", "name": "Alpha", "score": 1.0, "target_weight": 0.1}
+            ],
+            "top_feature_drivers": [
+                {"feature": "close_logret_1d", "weighted_abs_value": 0.5}
+            ],
         },
     }
     rows_all = [
@@ -3033,7 +3379,9 @@ def test_decision_overview_hides_artifact_details_until_debug(tmp_path) -> None:
     assert "**files**" in debug
 
 
-def test_daily_summary_hides_artifact_details_until_debug(monkeypatch, tmp_path) -> None:
+def test_daily_summary_hides_artifact_details_until_debug(
+    monkeypatch, tmp_path
+) -> None:
     cfg = SimpleNamespace(
         market="tw",
         label="台股",
@@ -3064,7 +3412,10 @@ def test_daily_summary_hides_artifact_details_until_debug(monkeypatch, tmp_path)
     }
 
     monkeypatch.setattr("services.discord_bot.bot._runtime_status", lambda cfg: status)
-    monkeypatch.setattr("services.discord_bot.bot._latest_market_signal", lambda cfg: (summary_path, summary))
+    monkeypatch.setattr(
+        "services.discord_bot.bot._latest_market_signal",
+        lambda cfg: (summary_path, summary),
+    )
 
     normal = _daily_summary_message(cfg, debug=False)
     debug = _daily_summary_message(cfg, debug=True)

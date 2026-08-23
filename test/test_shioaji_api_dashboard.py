@@ -284,8 +284,7 @@ def test_shioaji_public_status_reconciles_quota_progress_and_capture(
     ]
     assert journal_commands
     assert all(
-        "--output-fields=MESSAGE,__REALTIME_TIMESTAMP,_SYSTEMD_INVOCATION_ID"
-        in command
+        "--output-fields=MESSAGE,__REALTIME_TIMESTAMP,_SYSTEMD_INVOCATION_ID" in command
         for command in journal_commands
     )
     assert {item["id"] for item in payload["pipelines"]} == {
@@ -372,7 +371,11 @@ def test_shioaji_dashboard_labels_only_observed_counter_drop_as_reset(
 
     def runner(args):
         command = list(args)
-        stdout = "ActiveState=inactive\nSubState=dead\nNRestarts=0\nInvocationID=\n" if command[0] == "systemctl" else ""
+        stdout = (
+            "ActiveState=inactive\nSubState=dead\nNRestarts=0\nInvocationID=\n"
+            if command[0] == "systemctl"
+            else ""
+        )
         return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
 
     missing = tmp_path / "missing"
@@ -394,6 +397,45 @@ def test_shioaji_dashboard_labels_only_observed_counter_drop_as_reset(
     assert payload["traffic"]["reset_observed_at_utc"] == "2026-08-15T01:00:00Z"
     assert "計數器下降才認定重置" in payload["traffic"]["reset_policy"]
     assert payload["traffic_ledger"]["quota_epoch"]["reset_observed"] is True
+
+
+def test_inactive_timer_driven_history_job_is_scheduled_not_failed(
+    tmp_path: Path,
+) -> None:
+    inventory = tmp_path / "contracts.csv"
+    inventory.write_text("contract,priority\nTXFR1,0\n", encoding="utf-8")
+    target = tmp_path / "target.txt"
+    target.write_text("2026-08-21\n", encoding="utf-8")
+
+    def runner(args):
+        command = list(args)
+        stdout = (
+            "ActiveState=inactive\nSubState=dead\nNRestarts=0\nInvocationID=\n"
+            if command[0] == "systemctl"
+            else ""
+        )
+        return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
+
+    missing = tmp_path / "missing"
+    payload = build_shioaji_public_status(
+        tmp_path,
+        now=datetime(2026, 8, 23, 2, 0, tzinfo=UTC),
+        runner=runner,
+        paths=ShioajiMonitorPaths(
+            alias_inventory=inventory,
+            txfr1_manifest=missing,
+            futures_history_root=missing,
+            target_end_date=target,
+            capture_root=missing,
+        ),
+    )
+
+    history = next(
+        item for item in payload["pipelines"] if item["id"] == "futures_history"
+    )
+    assert payload["backfill"]["state"] == "scheduled"
+    assert history["status"] == "waiting"
+    assert history["status_label"] == "等待排程／上次成功"
 
 
 def test_shioaji_dashboard_is_local_read_only_and_source_backed() -> None:
@@ -422,7 +464,7 @@ def test_shioaji_dashboard_is_local_read_only_and_source_backed() -> None:
     assert "renderTrafficBreakdown" in javascript
     assert "renderStorage" in javascript
     assert "HIDDEN_TRAFFIC_SERIES_STORAGE_KEY" in javascript
-    assert 'button[data-series]' in javascript
+    assert "button[data-series]" in javascript
     assert "syncTrafficLegend" in javascript
     assert "API Key、Secret" in html
     assert "http://" not in html and "https://" not in html
@@ -500,6 +542,87 @@ def test_daily_pipeline_is_zero_quota_only_after_local_lineage_audit(
     assert daily["quota"] == "none"
     assert daily["metrics"][-1]["value"] == 0
     assert daily["coverage"]["current"] == 2746
+
+
+def test_minute_pipeline_separates_research_usability_from_latest_freshness(
+    tmp_path: Path,
+) -> None:
+    minute_summary = tmp_path / "download_summary.json"
+    minute_run_summary = tmp_path / "latest_run_summary.json"
+    minute_manifest = tmp_path / "research_manifest.json"
+    minute_audit = tmp_path / "full_audit.json"
+    minute_summary.write_text(
+        json.dumps({"selected_symbols": 2746, "reported_symbols": 2746}),
+        encoding="utf-8",
+    )
+    minute_run_summary.write_text(
+        json.dumps(
+            {
+                "selected_symbols": 2747,
+                "reported_symbols": 4,
+                "end_date": "2026-08-21",
+                "resumable_collection_complete": False,
+                "selected_coverage_complete": False,
+                "stopped_for_traffic": True,
+                "written_at_utc": "2026-08-22T19:35:46Z",
+            }
+        ),
+        encoding="utf-8",
+    )
+    minute_manifest.write_text(json.dumps({"research_ready": True}), encoding="utf-8")
+    minute_audit.write_text(
+        json.dumps(
+            {
+                "status": "research_ready",
+                "last_date": "2026-08-20",
+                "available_source_symbols": 2621,
+                "source_gap_symbols": 89,
+                "contract_unavailable_symbols": 125,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def runner(args):
+        command = list(args)
+        stdout = (
+            "ActiveState=inactive\nSubState=dead\nNRestarts=0\nInvocationID=\n"
+            if command[0] == "systemctl"
+            else ""
+        )
+        return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
+
+    missing = tmp_path / "missing"
+    payload = build_shioaji_public_status(
+        tmp_path,
+        now=datetime(2026, 8, 22, 20, 0, tzinfo=UTC),
+        runner=runner,
+        paths=ShioajiMonitorPaths(
+            alias_inventory=missing,
+            txfr1_manifest=missing,
+            futures_history_root=missing,
+            target_end_date=missing,
+            capture_root=missing,
+            minute_summary=minute_summary,
+            minute_run_summary=minute_run_summary,
+            minute_manifest=minute_manifest,
+            minute_audit=minute_audit,
+        ),
+    )
+
+    stock = next(item for item in payload["pipelines"] if item["id"] == "stock_minute")
+    research = next(
+        item for item in payload["pipelines"] if item["id"] == "minute_research"
+    )
+    assert stock["status"] == "waiting"
+    assert stock["status_label"] == "流量保護暫停"
+    assert stock["data_through"] == "2026-08-20"
+    assert stock["target_date"] == "2026-08-21"
+    assert stock["eta"]["state"] == "waiting_quota"
+    assert "89 檔" in stock["warnings"][0]
+    assert "125 檔" in stock["warnings"][0]
+    assert research["status"] == "partial"
+    assert research["data_through"] == "2026-08-20"
 
 
 def test_shioaji_public_status_allowlists_storage_snapshot(tmp_path: Path) -> None:

@@ -54,6 +54,17 @@ def _futures_portfolio_config() -> ExperimentConfig:
     )
 
 
+def _crypto_perpetual_config() -> ExperimentConfig:
+    config = load_config(
+        REPO_ROOT
+        / "configs/markets/bybit_perpetual_daily_multi_basis_projection_l1.yaml"
+    )
+    config.training.backtest_artifact_compression = "none"
+    config.trading.max_volume_participation = 0.01
+    config.trading.volume_participation_equity = 1_000_000.0
+    return config
+
+
 def _day_trade_panel(
     close_prices: np.ndarray,
     *,
@@ -144,6 +155,47 @@ def _futures_portfolio_panel() -> PanelData:
     return panel
 
 
+def _crypto_perpetual_panel() -> PanelData:
+    # The final panel row supplies the next 00:05 execution price for the last
+    # deployable target. It is not itself a deployment target.
+    rows = 4
+    symbols = ("BTCUSDT", "ETHUSDT")
+    symbol_count = len(symbols)
+    mask = np.ones((rows, symbol_count), dtype=np.bool_)
+    # Price is flat, while a positive funding rate costs every carried long 1%
+    # of notional per row.  The two return surfaces must remain distinct.
+    effective_log_returns = np.log1p(
+        np.full((rows, symbol_count), -0.01, dtype=np.float64)
+    ).astype(np.float32)
+    raw_price_log_returns = np.zeros((rows, symbol_count), dtype=np.float32)
+    return PanelData(
+        dates=np.asarray(
+            ["2025-01-02", "2025-01-03", "2025-01-04", "2025-01-05"],
+            dtype="datetime64[D]",
+        ),
+        symbols=list(symbols),
+        feature_names=["f0"],
+        features=np.zeros((rows, symbol_count, 1), dtype=np.float32),
+        returns_1d=effective_log_returns,
+        tradable_mask=mask,
+        can_buy_mask=mask.copy(),
+        can_sell_mask=mask.copy(),
+        can_short_open_mask=mask.copy(),
+        can_short_open_open_mask=mask.copy(),
+        alive_mask=mask.copy(),
+        benchmark_returns=np.zeros(rows, dtype=np.float32),
+        close_prices=np.full((rows, symbol_count), 100.0, dtype=np.float32),
+        open_prices=None,
+        # Equivalent contract quantity. At 100 USDT, 1% of the completed
+        # session's 10M USDT turnover is 0.1 of the configured 1M NAV.
+        daily_volumes=np.full(
+            (rows, symbol_count), 100_000.0, dtype=np.float32
+        ),
+        raw_close_returns_1d=raw_price_log_returns,
+        force_exit_mask=np.zeros((rows, symbol_count), dtype=np.bool_),
+    )
+
+
 def _fold_result(fold_id: int) -> trainer_module.FoldResult:
     return trainer_module.FoldResult(
         fold_id=fold_id,
@@ -181,7 +233,10 @@ def _write_fold_requests(
         execution_mode=execution_mode,
         settlement_ledger_unit=(
             "notional_weight"
-            if execution_mode == "tw_futures_portfolio_day"
+            if execution_mode in {
+                "tw_futures_portfolio_day",
+                "crypto_perpetual",
+            }
             else "currency"
         ),
         requested_weights_history=values,
@@ -437,6 +492,55 @@ def test_futures_portfolio_stitched_replay_uses_fixed_fee_side_channel(
     # aligned fixed-fee side channel keeps its net log return below 10%.
     assert 0.0 < float(stitched.strategy_returns[0]) < 0.10
     assert np.count_nonzero(stitched.turnovers) >= 2
+
+
+def test_crypto_stitched_replay_preserves_funding_state_and_volume_cap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _disable_stitched_plots(monkeypatch)
+    panel = _crypto_perpetual_panel()
+    fold_one = _write_fold_requests(
+        tmp_path,
+        fold_id=1,
+        dates=panel.dates[:1],
+        symbols=("BTCUSDT",),
+        requests=np.asarray([[1.0]], dtype=np.float64),
+        execution_mode="crypto_perpetual",
+    )
+    fold_two = _write_fold_requests(
+        tmp_path,
+        fold_id=2,
+        dates=panel.dates[1:3],
+        symbols=("BTCUSDT", "ETHUSDT"),
+        requests=np.asarray([[1.0, 0.0], [0.0, 0.0]], dtype=np.float64),
+        execution_mode="crypto_perpetual",
+    )
+
+    stitched = trainer_module._replay_taiwan_stitched_deployment(
+        tmp_path,
+        [fold_two, fold_one],
+        panel=panel,
+        config=_crypto_perpetual_config(),
+    )
+
+    assert stitched is not None
+    assert stitched.execution_mode == "crypto_perpetual"
+    assert stitched.settlement_ledger_unit == "notional_weight"
+    assert stitched.final_integer_state is None
+    np.testing.assert_allclose(
+        stitched.requested_weights_history,
+        [[1.0, 0.0], [1.0, 0.0], [0.0, 0.0]],
+    )
+    # The first entry is limited to 1% of the completed session's 10M USDT
+    # turnover divided by the configured 1M NAV: at most 0.1 weight.
+    assert stitched.turnovers[0] == pytest.approx(0.1, abs=1.0e-7)
+    # Flat price plus a positive funding payment must still reduce NAV, and
+    # the carried position must survive the fold-1 -> fold-2 model handoff.
+    assert stitched.strategy_returns[0] < 0.0
+    assert stitched.weights_history[1, 0] > 0.0
+    assert stitched.final_alive is not None
+    assert bool(np.asarray(stitched.final_alive).item())
 
 
 def test_stitched_replay_keeps_ruin_absorbing_across_fold_handoff(

@@ -73,6 +73,11 @@ from stockagent.live.tw_day_trade_simulation import (
     require_exact_session_eligibility,
     resolve_day_trade_rule_data_dir,
 )
+from stockagent.live.tw_day_trade_service_sync import (
+    DISCORD_SERVICE_STATUS_FILENAME,
+    load_service_sync,
+    mode_from_service_sync,
+)
 from stockagent.live.model_deployment import (
     ModelDeployment,
     attempt_model_deployment,
@@ -110,10 +115,23 @@ PYTHON_EXECUTABLE_SENTINEL = "{python}"
 _MODEL_INFERENCE_LOCK = threading.Lock()
 _PRE_SIGNAL_SUCCESS_LOCK = threading.Lock()
 _PREOPEN_READINESS_LOCK = threading.Lock()
+_SERVICE_STATUS_LOCK = threading.Lock()
 _PRE_SIGNAL_SUCCESS_AT: dict[tuple[str, ...], float] = {}
 _PRE_SIGNAL_FAILURE_AT: dict[tuple[str, ...], tuple[float, str]] = {}
 _BOT_RUN_STARTED_AT = datetime.now().astimezone().isoformat(timespec="seconds")
 _BOT_RUN_ID = f"{os.getpid()}-{time.time_ns()}"
+
+
+def _day_trade_state_dir() -> Path:
+    configured = _env(
+        "TW_DAY_TRADE_STATE_DIR",
+        "artifacts/live/tw_day_trade_simulation",
+    )
+    return _resolve_repo_path(configured) or Path(str(configured))
+
+
+def _discord_service_status_path() -> Path:
+    return ROOT / "artifacts" / "discord_bot" / DISCORD_SERVICE_STATUS_FILENAME
 
 
 class BotUserError(RuntimeError):
@@ -995,9 +1013,21 @@ def _artifact_backfill_key(cfg: LiveMarketConfig, now: datetime) -> str | None:
     backfill_time = _market_artifact_backfill_time(cfg)
     if not backfill_time:
         return None
+    session_open, _session_reason = _scheduled_market_session_day(cfg, now)
+    if not session_open:
+        # Daily market work follows a weekly exchange-session schedule.  In
+        # particular, a Friday target must not turn into a Saturday/Sunday
+        # retry loop merely because its date is older than the wall clock.
+        return None
     target_date = now.date().isoformat()
     try:
         status = _runtime_status_for_display(cfg)
+        if not bool(getattr(status.data, "fresh", False)):
+            # The pre-signal hook activates an already accepted data release;
+            # it is not a downloader.  Wait for the independent data monitor
+            # and acceptance pipeline instead of retrying a validation command
+            # that cannot make stale data current.
+            return None
         target_date = (
             _date_key(status.data.expected_latest_date)
             or _date_key(status.data.last_data_date)
@@ -1016,14 +1046,46 @@ def _artifact_backfill_key(cfg: LiveMarketConfig, now: datetime) -> str | None:
     return f"{target_date}:{cfg.market}:artifact_backfill"
 
 
+def _opening_critical_work_pending(observed: datetime | None = None) -> bool:
+    """Keep non-opening history jobs off the critical preopen/signal path."""
+
+    for cfg in _market_configs().values():
+        if not bool(getattr(cfg, "day_trade_simulation_enabled", False)):
+            continue
+        tz = ZoneInfo(cfg.timezone or bot.tz.key)
+        now = observed.astimezone(tz) if observed is not None else datetime.now(tz)
+        session_open, _session_reason = _scheduled_market_session_day(cfg, now)
+        if not session_open:
+            continue
+        prepare_minutes = _hhmm_minutes(
+            getattr(cfg, "preopen_prepare_time", None) or "08:15"
+        )
+        open_minutes = _hhmm_minutes(getattr(cfg, "open_time", None) or "09:00")
+        now_minutes = now.hour * 60 + now.minute
+        if prepare_minutes is None or open_minutes is None:
+            continue
+        # Reserve the entire final preopen window and the first five minutes,
+        # even if readiness completed early.  This preserves hot model/data
+        # caches and prevents formal-history inference from racing 09:00.
+        if prepare_minutes <= now_minutes < open_minutes + 5:
+            return True
+        exit_minutes = EXIT_LIMIT_TIME.hour * 60 + EXIT_LIMIT_TIME.minute
+        if (
+            open_minutes + 5 <= now_minutes < exit_minutes
+            and _day_trade_schedule_state(cfg, now.date().isoformat()) == "retry"
+        ):
+            return True
+    return False
+
+
 def _scheduled_retry_delay_seconds() -> int:
     return max(1, _env_int("STOCKAGENT_SCHEDULED_RETRY_DELAY_SECONDS", 60) or 60)
 
 
 def _day_trade_confirmation_delay_seconds() -> int:
     return max(
-        5,
-        _env_int("STOCKAGENT_DAY_TRADE_CONFIRMATION_DELAY_SECONDS", 15) or 15,
+        1,
+        _env_int("STOCKAGENT_DAY_TRADE_CONFIRMATION_DELAY_SECONDS", 2) or 2,
     )
 
 
@@ -1536,6 +1598,7 @@ class StockAgentBot(discord.Client):
         # Start its catch-up loop before Discord command synchronization so a
         # missed market schedule is recovered immediately after login.
         scheduled_signal.start()
+        service_heartbeat.start()
         synced = await self.tree.sync()
         print(
             f"synced {len(synced)} global app commands "
@@ -3183,6 +3246,22 @@ def _latest_market_signal(cfg: LiveMarketConfig) -> tuple[Path, dict[str, Any]] 
     root = _resolve_repo_path(cfg.live_output_dir)
     if root is None or not root.exists():
         return None
+    pointer_path = root / "latest_signal.json"
+    try:
+        pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+        if not isinstance(pointer, dict):
+            raise ValueError("latest signal pointer is not an object")
+        summary_path = _resolve_repo_path(pointer.get("summary_path"))
+        if (
+            pointer.get("artifact_complete") is not False
+            and summary_path is not None
+            and summary_path.is_file()
+        ):
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            if isinstance(summary, dict):
+                return summary_path, summary
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        pass
     for path in sorted(root.glob("**/summary.json"), key=lambda item: item.stat().st_mtime, reverse=True):
         try:
             summary = json.loads(path.read_text(encoding="utf-8"))
@@ -3214,24 +3293,27 @@ def _day_trade_schedule_state(
     _summary_path, summary = latest
     if not _summary_date_matches(summary.get("generated_at"), session_date):
         return "retry"
-    configured = _env(
-        "TW_DAY_TRADE_STATE_DIR",
-        "artifacts/live/tw_day_trade_simulation",
-    )
-    state_dir = _resolve_repo_path(configured) or Path(str(configured))
-    try:
-        state = json.loads((state_dir / "state.json").read_text(encoding="utf-8"))
-    except (OSError, ValueError, TypeError):
-        return "retry"
-    raw_mode = (state.get("modes") or {}).get(str(cfg.market))
+    receipt = load_service_sync(_day_trade_state_dir())
+    raw_mode = mode_from_service_sync(receipt, str(cfg.market))
+    if raw_mode is None:
+        # Backward-compatible bootstrap while an older engine is being
+        # replaced.  The normal hot path reads only the compact commit receipt.
+        try:
+            state = json.loads(
+                (_day_trade_state_dir() / "state.json").read_text(encoding="utf-8")
+            )
+        except (OSError, ValueError, TypeError):
+            return "retry"
+        raw_mode = (state.get("modes") or {}).get(str(cfg.market))
     if not isinstance(raw_mode, dict):
         return "retry"
     positions = raw_mode.get("positions") or {}
-    if isinstance(positions, dict) and any(
+    legacy_open = isinstance(positions, dict) and any(
         int(position.get("signed_shares") or 0) != 0
         for position in positions.values()
         if isinstance(position, dict)
-    ):
+    )
+    if int(raw_mode.get("open_position_count") or 0) > 0 or legacy_open:
         return "blocked_open_position"
     if (
         str(raw_mode.get("session_date") or "") == session_date
@@ -3241,6 +3323,49 @@ def _day_trade_schedule_state(
     ):
         return "completed"
     return "retry"
+
+
+def _write_discord_service_status() -> dict[str, Any]:
+    """Publish the bot's acknowledgement of the engine commit revision."""
+
+    configs = _market_configs()
+    day_trade_markets = sorted(
+        market
+        for market, cfg in configs.items()
+        if _market_enabled(cfg)
+        and bool(getattr(cfg, "day_trade_simulation_enabled", False))
+    )
+    engine = load_service_sync(_day_trade_state_dir()) or {}
+    modes = engine.get("modes") or {}
+    payload = {
+        "schema_version": 1,
+        "service": "stockagent-discord-bot",
+        "run_id": _BOT_RUN_ID,
+        "run_started_at": _BOT_RUN_STARTED_AT,
+        "updated_at": datetime.now().astimezone().isoformat(timespec="milliseconds"),
+        "discord_connected": bool(bot.is_ready()),
+        "day_trade_markets": day_trade_markets,
+        "engine_run_id": engine.get("engine_run_id"),
+        "engine_state_revision": int(engine.get("state_revision") or 0),
+        "engine_published_at": engine.get("published_at"),
+        "mode_signal_ids": {
+            market: (modes.get(market) or {}).get("signal_id")
+            for market in day_trade_markets
+            if isinstance(modes.get(market), dict)
+        },
+        "simulation_only": True,
+        "production_order_possible": False,
+    }
+    path = _discord_service_status_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(f".json.tmp.{os.getpid()}")
+    with _SERVICE_STATUS_LOCK:
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
+    return payload
 
 
 def _summary_date_matches(left: str | None, right: str | None) -> bool:
@@ -4331,9 +4456,10 @@ def _signal_now_background_key(
 
 async def _send_signal_now_background_failure(user_ids: set[int], cfg: LiveMarketConfig, exc: Exception) -> None:
     _log_exception(f"signal_now_background:{cfg.market}", exc)
+    detail = f"\n原因：{str(exc)[:1200]}" if isinstance(exc, BotUserError) else ""
     text = (
         f"`{cfg.market}` 背景資料更新/推論失敗: `{type(exc).__name__}`。\n"
-        f"詳細 traceback 已寫入 `{ERROR_LOG_PATH}`。"
+        f"詳細 traceback 已寫入 `{ERROR_LOG_PATH}`。{detail}"
     )
     for user_id in sorted(user_ids):
         try:
@@ -4399,6 +4525,36 @@ async def _run_signal_now_background_refresh(
                         _log_exception(f"signal_now_preview_dm:{cfg.market}:{user_id}", send_exc)
             except Exception as preview_exc:
                 _log_exception(f"signal_now_preview:{cfg.market}", preview_exc)
+
+        now = datetime.now(ZoneInfo(cfg.timezone or bot.tz.key))
+        session_open, session_reason = await asyncio.to_thread(
+            _scheduled_market_session_day,
+            cfg,
+            now,
+        )
+        if (
+            _market_schedule_interval_minutes(cfg) is None
+            and not session_open
+        ):
+            # A manual query on a weekend/holiday may still inspect the latest
+            # completed panel (the preview above), but opening-data activation,
+            # realtime quotes, and formal inference remain bound to the next
+            # weekly exchange session.
+            waiters = set(bot._signal_now_background_waiters.get(key, set()))
+            notice = (
+                f"`{cfg.market}` 目前為休市時段，依週交易排程不啟動開盤資料更新或即時推論。\n"
+                f"calendar=`{session_reason}`；最新已完成資料若可用，已由快速預覽傳送。"
+            )
+            for user_id in sorted(waiters):
+                try:
+                    user = await bot.fetch_user(int(user_id))
+                    await user.send(notice[:1900])
+                except Exception as send_exc:
+                    _log_exception(
+                        f"signal_now_closed_session_dm:{cfg.market}:{user_id}",
+                        send_exc,
+                    )
+            return
 
         resolved_price_source, status, auto_refreshed = await asyncio.to_thread(
             _prepare_realtime_signal_sync,
@@ -7029,6 +7185,16 @@ async def model_auto_deployment() -> None:
             )
 
 
+@tasks.loop(seconds=1)
+async def service_heartbeat() -> None:
+    """Keep a compact, source-backed Discord/engine synchronization receipt."""
+
+    try:
+        await asyncio.to_thread(_write_discord_service_status)
+    except Exception as exc:
+        _log_exception("service_heartbeat", exc)
+
+
 @tasks.loop(seconds=10)
 async def preopen_prepare() -> None:
     for market in _scheduled_markets():
@@ -7183,6 +7349,9 @@ async def daily_summary() -> None:
         if not summary_time:
             continue
         now = datetime.now(ZoneInfo(cfg.timezone or bot.tz.key))
+        session_open, _session_reason = _scheduled_market_session_day(cfg, now)
+        if not session_open:
+            continue
         if now.strftime("%H:%M") != summary_time:
             continue
         today = now.strftime("%Y-%m-%d")
@@ -7208,6 +7377,12 @@ async def daily_summary() -> None:
 
 @tasks.loop(minutes=1)
 async def artifact_backfill() -> None:
+    if _opening_critical_work_pending():
+        print(
+            "[artifact-backfill] deferred: opening-critical day-trade work pending",
+            flush=True,
+        )
+        return
     channel = None
     if bot.channel_id is not None and _public_broadcasts_enabled():
         try:

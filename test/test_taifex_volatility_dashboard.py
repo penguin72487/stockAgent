@@ -279,7 +279,7 @@ def test_dashboard_snapshot_is_bounded_fresh_and_account_safe(tmp_path: Path) ->
     assert payload["market"]["strategy_fresh_valuation_count"] == 2
     assert payload["market"]["held_option_subscription_coverage_ratio"] == 1.0
     assert len(payload["strategies"]) == 2
-    assert payload["strategy_counts"]["live_ideal"] == 58
+    assert payload["strategy_counts"]["live_ideal"] == 69
     assert payload["strategy_counts"]["blocked_contract"] >= 1
     assert (
         len(payload["strategy_catalog"]) == payload["strategy_counts"]["catalog_total"]
@@ -298,6 +298,18 @@ def test_dashboard_snapshot_is_bounded_fresh_and_account_safe(tmp_path: Path) ->
         and row["volatility_exposure"] == "volatility_neutral"
         and row["hedge_type"] == "parity_locked"
         and row["design_option_long_ratio"] == 0.5
+        for row in payload["strategy_catalog"]
+    )
+    assert any(
+        row["strategy_id"] == "bs_gamma_price_grid_25"
+        and row["hedge_type"] == "price_grid_delta"
+        and row["hedge_parameter"] == 25.0
+        for row in payload["strategy_catalog"]
+    )
+    assert any(
+        row["strategy_id"] == "bs_gamma_time_grid_5m"
+        and row["hedge_type"] == "time_grid_delta"
+        and row["hedge_parameter"] == 5.0
         for row in payload["strategy_catalog"]
     )
     assert len(payload["history"]) == 16
@@ -420,20 +432,172 @@ def test_modern_bounded_history_fast_reader_matches_canonical_fallback(
     assert fast == fallback
 
 
-def test_fast_reader_defers_legacy_valuation_carry_to_canonical_path(
+def test_native_bucket_extrema_match_canonical_dense_history(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if taifex_dashboard.pl is None:
+        pytest.skip("Polars fast reader is unavailable")
+    state_dir, _receipts = _fixture(tmp_path)
+    now = datetime(2026, 8, 12, 1, 30, tzinfo=timezone.utc)
+    strategy_ids = (
+        "classic_opening_straddle",
+        "daily_vol_model_gamma__black_scholes",
+    )
+    rows = []
+    for minute in range(600):
+        for strategy_index, strategy_id in enumerate(strategy_ids):
+            pnl = float(((minute * 37 + strategy_index * 11) % 101) - 50)
+            rows.append(
+                {
+                    "decision_ts_ns": int(
+                        (now - timedelta(minutes=599 - minute)).timestamp() * 1e9
+                    ),
+                    "strategy_id": strategy_id,
+                    "cumulative_pnl_twd": pnl,
+                    "initial_capital_twd": 1_000.0,
+                    "cumulative_contributed_capital_twd": 1_000.0,
+                    "total_equity_twd": 1_000.0 + pnl,
+                    "gross_cash_twd": 0.0,
+                    "open_liquidation_value_twd": pnl,
+                    "fixed_fees_twd": 0.0,
+                    "transaction_tax_twd": 0.0,
+                    "futures_position": 0,
+                    "underlying_futures_position": 0,
+                    "option_books_valid": True,
+                    "future_book_valid": True,
+                    "valuation_available": True,
+                    "valuation_carried_forward": False,
+                    "valuation_age_seconds": 0.0,
+                }
+            )
+    (state_dir / "marks.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+    fast = build_dashboard_history_snapshot(
+        state_dir=state_dir,
+        now=now,
+        mark_limit_per_strategy=40,
+        range_key="all",
+    )
+    monkeypatch.setattr(taifex_dashboard, "pl", None)
+    fallback = build_dashboard_history_snapshot(
+        state_dir=state_dir,
+        now=now,
+        mark_limit_per_strategy=40,
+        range_key="all",
+    )
+    assert fast == fallback
+    assert fast["coverage_end_utc"] == now.isoformat()
+    for strategy_id in strategy_ids:
+        assert max(
+            row["decision_ts_ns"]
+            for row in fast["history"]
+            if row["strategy_id"] == strategy_id
+        ) == int(now.timestamp() * 1e9)
+
+
+def test_fast_reader_keeps_legacy_rows_for_canonical_carry_projection(
     tmp_path: Path,
 ) -> None:
     if taifex_dashboard.pl is None:
         pytest.skip("Polars fast reader is unavailable")
     state_dir, _receipts = _fixture(tmp_path)
     mark_path = state_dir / "marks.jsonl"
-    assert (
-        taifex_dashboard._filtered_history_rows_polars(
-            mark_path,
-            minimum_decision_ts_ns=0,
-        )
-        is None
+    selected = taifex_dashboard._filtered_history_rows_polars(
+        mark_path,
+        minimum_decision_ts_ns=0,
     )
+    assert selected is not None
+    assert len(selected) == 24
+
+
+def test_history_receipt_supersession_skips_covered_older_generation(
+    tmp_path: Path,
+) -> None:
+    state_dir, _receipts = _fixture(tmp_path)
+    strategy_id = "classic_opening_straddle"
+    backfill_root = state_dir / "backfills"
+
+    for version, supersedes, pnl in ((1, [], 10.0), (3, [1], 30.0)):
+        generation = backfill_root / f"generation_v{version}"
+        generation.mkdir(parents=True)
+        mark_path = generation / "marks.jsonl"
+        mark_path.write_text(
+            json.dumps(
+                {
+                    "decision_ts_ns": version,
+                    "strategy_id": strategy_id,
+                    "cumulative_pnl_twd": pnl,
+                    "initial_capital_twd": 1_000.0,
+                    "valuation_available": True,
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        _write_json(
+            generation / "receipt.json",
+            {
+                "status": "partial_receipt_backfill",
+                "replay_id": f"generation-v{version}",
+                "replay_contract_version": version,
+                "history_authority": (
+                    "receipt_verified_replay_over_live_same_interval"
+                ),
+                "strategy_ids": [strategy_id],
+                "requested_start_date": "2026-08-10",
+                "requested_end_date": "2026-08-12",
+                "supersedes_replay_contract_versions": supersedes,
+                "source_coverage": [],
+                "record_counts": {"marks": 1},
+                "output_sha256": {
+                    "marks.jsonl": hashlib.sha256(mark_path.read_bytes()).hexdigest()
+                },
+            },
+        )
+
+    active = taifex_dashboard._history_backfill_receipts(state_dir)
+    assert [row["replay_contract_version"] for row in active] == [3]
+    assert [Path(row["mark_path"]).parent.name for row in active] == ["generation_v3"]
+
+    with (backfill_root / "generation_v3" / "marks.jsonl").open(
+        "a", encoding="utf-8"
+    ) as handle:
+        handle.write("{}\n")
+    fallback = taifex_dashboard._history_backfill_receipts(state_dir)
+    assert [row["replay_contract_version"] for row in fallback] == [1]
+
+
+def test_fast_reader_removes_authoritative_live_interval_before_materializing(
+    tmp_path: Path,
+) -> None:
+    if taifex_dashboard.pl is None:
+        pytest.skip("Polars fast reader is unavailable")
+    path = tmp_path / "marks.jsonl"
+    rows = [
+        {
+            "decision_ts_ns": decision_ts_ns,
+            "strategy_id": "fixture",
+            "cumulative_pnl_twd": float(decision_ts_ns),
+            "valuation_available": True,
+        }
+        for decision_ts_ns in (10, 20, 30, 40)
+    ]
+    path.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+    selected = taifex_dashboard._filtered_history_rows_polars(
+        path,
+        minimum_decision_ts_ns=0,
+        excluded_intervals={"fixture": (20, 30)},
+    )
+    assert selected is not None
+    assert [row["decision_ts_ns"] for row in selected] == [10, 40]
 
 
 def test_bounded_fast_reader_preserves_pre_window_valuation_seed(
@@ -558,9 +722,7 @@ def test_history_snapshot_merges_receipted_backfill_and_prefers_live_on_collisio
         mark_limit_per_strategy=100,
         range_key="all",
     )
-    older = next(
-        row for row in history["history"] if row["decision_ts_ns"] == older_ns
-    )
+    older = next(row for row in history["history"] if row["decision_ts_ns"] == older_ns)
     collision = next(
         row
         for row in history["history"]
@@ -746,6 +908,33 @@ def test_dashboard_compounds_daily_pnl_changes_not_minute_marks() -> None:
     assert metrics["compound_includes_partial_trading_day"] is True
 
 
+def test_native_cold_daily_endpoints_match_incremental_canonical_reader(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if taifex_dashboard.pl is None:
+        pytest.skip("Polars fast reader is unavailable")
+    state_dir, _receipts = _fixture(tmp_path)
+    mark_path = state_dir / "marks.jsonl"
+    strategy_ids = (
+        "classic_opening_straddle",
+        "daily_vol_model_gamma__black_scholes",
+    )
+    taifex_dashboard._PERFORMANCE_CACHE.pop(mark_path.resolve(), None)
+    native = taifex_dashboard._daily_pnl_endpoints(
+        mark_path,
+        strategy_ids=strategy_ids,
+    )
+
+    taifex_dashboard._PERFORMANCE_CACHE.pop(mark_path.resolve(), None)
+    monkeypatch.setattr(taifex_dashboard, "pl", None)
+    canonical = taifex_dashboard._daily_pnl_endpoints(
+        mark_path,
+        strategy_ids=strategy_ids,
+    )
+    assert native == canonical
+
+
 def test_dashboard_html_is_local_and_refreshes_the_read_only_api() -> None:
     root = Path(__file__).resolve().parents[1] / "services" / "taifex_dashboard"
     html = (root / "index.html").read_text(encoding="utf-8")
@@ -767,7 +956,10 @@ def test_dashboard_html_is_local_and_refreshes_the_read_only_api() -> None:
     assert "秒後自動重試" not in javascript
     assert "const PRICE_REFRESH_MS = 60000" in javascript
     assert "function refreshMinuteSnapshot()" in javascript
-    assert "Dashboard.scheduleRefresh(refreshMinuteSnapshot, {intervalMs: PRICE_REFRESH_MS})" in javascript
+    assert (
+        "Dashboard.scheduleRefresh(refreshMinuteSnapshot, {intervalMs: PRICE_REFRESH_MS})"
+        in javascript
+    )
     assert "window.setInterval(" not in javascript
     assert "const REFRESH_MS = 5000" not in javascript
     assert "row.total_equity_twd" in javascript

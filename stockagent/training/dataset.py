@@ -28,7 +28,8 @@ def execution_feature_lag(execution_mode: str) -> int:
     or full-session volume enters the feature window.
     """
 
-    return 0 if normalize_execution_mode(execution_mode) == "naive" else 1
+    mode = normalize_execution_mode(execution_mode)
+    return 0 if mode in {"naive", "crypto_perpetual"} else 1
 
 
 def _dual_session_return_components(
@@ -50,8 +51,7 @@ def _dual_session_return_components(
 
     if panel.raw_close_returns_1d is None:
         raise ValueError(
-            "dual-session Taiwan execution requires "
-            "PanelData.raw_close_returns_1d"
+            "dual-session Taiwan execution requires PanelData.raw_close_returns_1d"
         )
     if panel.open_prices is None or panel.intraday_returns is None:
         raise ValueError(
@@ -145,9 +145,7 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
             "tw_index_futures_day",
             "tw_index_derivatives_day",
         }
-        futures_portfolio_execution = (
-            self.execution_mode == "tw_futures_portfolio_day"
-        )
+        futures_portfolio_execution = self.execution_mode == "tw_futures_portfolio_day"
         derivatives_day_execution = self.execution_mode == "tw_index_derivatives_day"
         self.lookback_context = normalize_lookback_context(lookback_context)
         self.short_capacity_limit_enabled = bool(short_capacity_limit_enabled)
@@ -157,7 +155,9 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
         self.tw_corporate_action_mode = str(tw_corporate_action_mode).strip().lower()
         if self.tw_corporate_action_mode not in {"avoid", "exact"}:
             raise ValueError("tw_corporate_action_mode must be 'avoid' or 'exact'")
-        self.date_indices = np.array(sorted(np.asarray(date_indices, dtype=np.int64).tolist()), dtype=np.int64)
+        self.date_indices = np.array(
+            sorted(np.asarray(date_indices, dtype=np.int64).tolist()), dtype=np.int64
+        )
         futures_benchmark_valid: np.ndarray | None = None
         day_trade_eligible: np.ndarray | None = None
         day_trade_short_open: np.ndarray | None = None
@@ -243,9 +243,7 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
         derivative_candidate_mask: np.ndarray | None = None
         if futures_execution:
             market = getattr(panel, "index_futures_day_session", None)
-            reference_product = getattr(
-                panel, "index_futures_reference_product", None
-            )
+            reference_product = getattr(panel, "index_futures_reference_product", None)
             if market is None or not reference_product:
                 raise ValueError(
                     f"{self.execution_mode} requires train.py to attach aligned "
@@ -265,9 +263,7 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
                 dtype=bool,
             )
             futures_benchmark_valid = np.asarray(
-                market.reference_rolling_buy_hold_tradable_mask(
-                    reference_product
-                ),
+                market.reference_rolling_buy_hold_tradable_mask(reference_product),
                 dtype=bool,
             )
             target_returns = np.broadcast_to(
@@ -334,9 +330,7 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
                         "tw_index_derivatives_day requires aligned causal "
                         "relative-tenor candidates"
                     )
-                derivative_returns = np.asarray(
-                    derivative_returns, dtype=np.float32
-                )
+                derivative_returns = np.asarray(derivative_returns, dtype=np.float32)
                 derivative_candidate_features = np.asarray(
                     derivative_candidate_features, dtype=np.float32
                 )
@@ -346,8 +340,7 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
                 if (
                     derivative_returns.ndim not in {2, 3}
                     or derivative_returns.shape[0] != panel.num_dates
-                    or derivative_candidate_mask.shape
-                    != derivative_returns.shape[:2]
+                    or derivative_candidate_mask.shape != derivative_returns.shape[:2]
                     or (
                         derivative_returns.ndim == 3
                         and derivative_returns.shape[2] != 2
@@ -372,9 +365,7 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
                 dtype=np.float32,
             )
             if fixed_fee_rates.shape != panel.tradable_mask.shape:
-                raise ValueError(
-                    "futures fee-rate matrix must match the panel [T,S]"
-                )
+                raise ValueError("futures fee-rate matrix must match the panel [T,S]")
             active = (
                 np.asarray(panel.tradable_mask, dtype=bool)
                 | np.asarray(panel.force_exit_mask, dtype=bool)
@@ -384,8 +375,7 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
                 )
             )
             if np.any(
-                active
-                & (~np.isfinite(fixed_fee_rates) | (fixed_fee_rates < 0.0))
+                active & (~np.isfinite(fixed_fee_rates) | (fixed_fee_rates < 0.0))
             ):
                 raise ValueError(
                     "active futures rows require finite non-negative fixed fee rates"
@@ -394,6 +384,34 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
             # never a model feature.  For this mode it carries per-contract
             # fixed commission divided by the row's opening contract notional.
             overnight_returns = fixed_fee_rates
+        elif self.execution_mode == "crypto_perpetual":
+            target_returns = np.asarray(panel.returns_1d, dtype=np.float32)
+            closes = np.asarray(panel.close_prices, dtype=np.float64)
+            if closes.shape != panel.tradable_mask.shape:
+                raise ValueError(
+                    "crypto_perpetual close prices must match tradable_mask [T,S]"
+                )
+            raw_price_returns = np.full(closes.shape, np.nan, dtype=np.float64)
+            if panel.num_dates > 1:
+                current = closes[:-1]
+                following = closes[1:]
+                consecutive = (
+                    np.diff(np.asarray(panel.dates, dtype="datetime64[D]"))
+                    == np.timedelta64(1, "D")
+                )[:, None]
+                valid_price = (
+                    consecutive
+                    & np.isfinite(current)
+                    & (current > 0.0)
+                    & np.isfinite(following)
+                    & (following > 0.0)
+                )
+                raw_price_returns[:-1] = np.where(
+                    valid_price,
+                    np.log(following / current),
+                    np.nan,
+                )
+            overnight_returns = raw_price_returns.astype(np.float32, copy=False)
         elif self.execution_mode == "tw_day_trade":
             if panel.intraday_returns is None:
                 raise ValueError(
@@ -477,9 +495,7 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
                     "tradable_mask shape"
                 )
         elif carrying_execution:
-            overnight_returns, target_returns = _dual_session_return_components(
-                panel
-            )
+            overnight_returns, target_returns = _dual_session_return_components(panel)
             if target_returns.shape != panel.tradable_mask.shape:
                 raise ValueError(
                     "dual-session return components must match tradable_mask shape"
@@ -510,8 +526,7 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
             prior_alive[1:] = np.asarray(panel.alive_mask[:-1], dtype=bool)
             tradable = prior_alive
             close_tradable = (
-                prior_alive
-                & np.asarray(reference_valid, dtype=bool)[:, None]
+                prior_alive & np.asarray(reference_valid, dtype=bool)[:, None]
             )
         elif futures_portfolio_execution:
             # The open[t] order is selected from rows completed through t-1.
@@ -521,6 +536,21 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
             prior_alive[1:] = np.asarray(panel.alive_mask[:-1], dtype=bool)
             tradable = prior_alive
             close_tradable = np.asarray(panel.tradable_mask, dtype=bool) & finite_target
+        elif self.execution_mode == "crypto_perpetual":
+            # Row t contains the prior UTC calendar day completed at 00:00;
+            # its executor-only close_prices entry is the next-trade 00:05
+            # Kline open after a five-minute decision/order lag. The prior
+            # day's completed volume is observable at decision;
+            # whether t->t+1 has a complete label is future information and
+            # must never suppress one symbol from the policy/execution masks.
+            tradable = np.asarray(panel.tradable_mask, dtype=bool).copy()
+            # Policy eligibility and execution availability are distinct. A
+            # feature-session gap can make a symbol ineligible for a new model
+            # target while a real 00:05 mark still lets the recurrent account
+            # reduce or close an existing position. The explicit side masks
+            # remain authoritative below; alive only prevents orders without
+            # a current valuation mark.
+            close_tradable = np.asarray(panel.alive_mask, dtype=bool).copy()
         elif day_trade_eligible is not None:
             close_tradable = close_tradable & day_trade_eligible
             # The model target is committed before the opening auction.  Even
@@ -549,9 +579,7 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
             tradable = close_tradable
         if futures_execution:
             benchmark_values = np.asarray(
-                market.reference_rolling_buy_hold_log_returns(
-                    reference_product
-                ),
+                market.reference_rolling_buy_hold_log_returns(reference_product),
                 dtype=np.float32,
             )
         elif self.execution_mode == "tw_day_trade" or carrying_execution:
@@ -570,9 +598,7 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
                     neginf=0.0,
                 )
         else:
-            benchmark_values = panel.benchmark_returns.astype(
-                np.float32, copy=False
-            )
+            benchmark_values = panel.benchmark_returns.astype(np.float32, copy=False)
         force_exit = (
             panel.force_exit_mask
             if panel.force_exit_mask is not None
@@ -606,16 +632,29 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
                 )
                 valid_indices = valid_indices[executable]
             elif valid_indices.size > 0 and self.execution_mode == "naive":
-                executable_or_terminal = (
-                    tradable[valid_indices].any(axis=1)
-                    | force_exit[valid_indices].any(axis=1)
-                )
+                executable_or_terminal = tradable[valid_indices].any(
+                    axis=1
+                ) | force_exit[valid_indices].any(axis=1)
                 valid_indices = valid_indices[executable_or_terminal]
+            elif valid_indices.size > 0 and self.execution_mode == "crypto_perpetual":
+                # Remove only a globally unfinished trailing research period.
+                # An all-symbol gap inside the owned timeline must remain: an
+                # active account cannot jump over an unvalued day, so the
+                # recurrent ledger must see the missing marks and fail closed.
+                measurable_period = finite_target[valid_indices].any(axis=1)
+                force_terminal = force_exit[valid_indices].any(axis=1)
+                retained_rows = valid_indices.size
+                while (
+                    retained_rows > 0
+                    and not measurable_period[retained_rows - 1]
+                    and not force_terminal[retained_rows - 1]
+                ):
+                    retained_rows -= 1
+                valid_indices = valid_indices[:retained_rows]
             elif valid_indices.size > 0 and futures_portfolio_execution:
-                executable_or_terminal = (
-                    close_tradable[valid_indices].any(axis=1)
-                    | force_exit[valid_indices].any(axis=1)
-                )
+                executable_or_terminal = close_tradable[valid_indices].any(
+                    axis=1
+                ) | force_exit[valid_indices].any(axis=1)
                 valid_indices = valid_indices[executable_or_terminal]
         self.valid_indices = valid_indices
 
@@ -635,8 +674,7 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
                 ]
                 if invalid_benchmark.size > 0:
                     examples = ", ".join(
-                        str(panel.dates[int(index)])
-                        for index in invalid_benchmark[:5]
+                        str(panel.dates[int(index)]) for index in invalid_benchmark[:5]
                     )
                     raise ValueError(
                         f"{self.execution_mode} requires a finite rolling TX "
@@ -723,15 +761,12 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
                         "PanelData.short_capacity_shares must be numeric"
                     ) from exc
                 finite_capacity = np.isfinite(capacity_values)
-                invalid_capacity = (
-                    np.isinf(capacity_values)
-                    | (
-                        finite_capacity
-                        & (
-                            (capacity_values < 0.0)
-                            | (capacity_values != np.floor(capacity_values))
-                            | (capacity_values >= float(2**63))
-                        )
+                invalid_capacity = np.isinf(capacity_values) | (
+                    finite_capacity
+                    & (
+                        (capacity_values < 0.0)
+                        | (capacity_values != np.floor(capacity_values))
+                        | (capacity_values >= float(2**63))
                     )
                 )
                 if bool(invalid_capacity.any()):
@@ -815,8 +850,7 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
             )
         if can_short_open_open.shape != panel.tradable_mask.shape:
             raise ValueError(
-                "PanelData.can_short_open_open_mask must match "
-                "tradable_mask shape"
+                "PanelData.can_short_open_open_mask must match tradable_mask shape"
             )
         if carrying_execution:
             assert day_trade_can_sell_open is not None
@@ -824,9 +858,7 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
             # In particular, never use can_sell (which may include close[t]'s
             # realized limit state) to decide whether an open[t] short fills.
             can_short_open = can_short_open & can_sell
-            can_short_open_open = (
-                can_short_open_open & day_trade_can_sell_open
-            )
+            can_short_open_open = can_short_open_open & day_trade_can_sell_open
             # Eligibility and demonstrated broker inventory are distinct.
             # The default contract requires both; an explicit no-capacity-limit
             # counterfactual keeps the receipt-backed eligibility mask while a
@@ -844,9 +876,7 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
             else:
                 capacity_available = short_capacity_shares > 0
                 can_short_open = can_short_open & capacity_available
-                can_short_open_open = (
-                    can_short_open_open & capacity_available
-                )
+                can_short_open_open = can_short_open_open & capacity_available
         short_capacity_notional: np.ndarray | None = None
         if short_capacity_shares is not None:
             close_prices = np.asarray(panel.close_prices, dtype=np.float64)
@@ -963,7 +993,7 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
                 )
             else:
                 daily_volumes_arr = np.asarray(daily_volumes, dtype=np.float32)
-                if self.execution_mode != "naive":
+                if execution_feature_lag(self.execution_mode) > 0:
                     # A fill at today's open or close cannot be sized from the
                     # eventual full-session volume (which includes the closing
                     # auction). Use the last completed session's shares as the
@@ -994,7 +1024,7 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
                         else panel.close_prices
                     )
                 prices_arr = np.asarray(price_source, dtype=np.float32)
-                if self.execution_mode == "naive":
+                if self.execution_mode in {"naive", "crypto_perpetual"}:
                     volume_notional = (daily_volumes_arr * prices_arr).astype(
                         np.float32,
                         copy=False,
@@ -1026,9 +1056,7 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
         self.can_buy_mask_t = torch.from_numpy(can_buy)
         self.can_sell_mask_t = torch.from_numpy(can_sell)
         self.can_short_open_mask_t = torch.from_numpy(can_short_open)
-        self.can_short_open_open_mask_t = torch.from_numpy(
-            can_short_open_open
-        )
+        self.can_short_open_open_mask_t = torch.from_numpy(can_short_open_open)
         self.short_capacity_shares_t = (
             torch.zeros((), dtype=torch.int64).expand(panel.tradable_mask.shape)
             if short_capacity_shares is None
@@ -1058,9 +1086,7 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
             rebate_payment_eligible
         )
         self.day_trade_eligible_mask_t = (
-            None
-            if day_trade_eligible is None
-            else torch.from_numpy(day_trade_eligible)
+            None if day_trade_eligible is None else torch.from_numpy(day_trade_eligible)
         )
         self.day_trade_can_buy_open_mask_t = (
             None
@@ -1115,9 +1141,7 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
             "can_buy_mask": self.can_buy_mask_t[date_idx],
             "can_sell_mask": self.can_sell_mask_t[date_idx],
             "can_short_open_mask": self.can_short_open_mask_t[date_idx],
-            "can_short_open_open_mask": self.can_short_open_open_mask_t[
-                date_idx
-            ],
+            "can_short_open_open_mask": self.can_short_open_open_mask_t[date_idx],
             "short_capacity_shares": self.short_capacity_shares_t[date_idx],
             "short_capacity_notional": self.short_capacity_notional_t[date_idx],
             "short_margin_rate": self.short_margin_rate_t[date_idx],
@@ -1135,9 +1159,13 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
         if self.day_trade_eligible_mask_t is not None:
             sample["day_trade_eligible_mask"] = self.day_trade_eligible_mask_t[date_idx]
         if self.day_trade_can_buy_open_mask_t is not None:
-            sample["day_trade_can_buy_open_mask"] = self.day_trade_can_buy_open_mask_t[date_idx]
+            sample["day_trade_can_buy_open_mask"] = self.day_trade_can_buy_open_mask_t[
+                date_idx
+            ]
         if self.day_trade_can_sell_open_mask_t is not None:
-            sample["day_trade_can_sell_open_mask"] = self.day_trade_can_sell_open_mask_t[date_idx]
+            sample["day_trade_can_sell_open_mask"] = (
+                self.day_trade_can_sell_open_mask_t[date_idx]
+            )
         if self.unresolved_corporate_action_mask_t is not None:
             sample["unresolved_corporate_action_mask"] = (
                 self.unresolved_corporate_action_mask_t[date_idx]
@@ -1157,14 +1185,18 @@ def collate_batch(
     if batch_size is None or len(samples) >= batch_size:
         batch = {
             "x": torch.stack([s["x"] for s in samples]),
-            "future_log_returns": torch.stack([s["future_log_returns"] for s in samples]),
+            "future_log_returns": torch.stack(
+                [s["future_log_returns"] for s in samples]
+            ),
             "overnight_log_returns": torch.stack(
                 [s["overnight_log_returns"] for s in samples]
             ),
             "tradable_mask": torch.stack([s["tradable_mask"] for s in samples]),
             "can_buy_mask": torch.stack([s["can_buy_mask"] for s in samples]),
             "can_sell_mask": torch.stack([s["can_sell_mask"] for s in samples]),
-            "can_short_open_mask": torch.stack([s["can_short_open_mask"] for s in samples]),
+            "can_short_open_mask": torch.stack(
+                [s["can_short_open_mask"] for s in samples]
+            ),
             "can_short_open_open_mask": torch.stack(
                 [s["can_short_open_open_mask"] for s in samples]
             ),
@@ -1174,28 +1206,25 @@ def collate_batch(
             "short_capacity_notional": torch.stack(
                 [s["short_capacity_notional"] for s in samples]
             ),
-            "short_margin_rate": torch.stack(
-                [s["short_margin_rate"] for s in samples]
+            "short_margin_rate": torch.stack([s["short_margin_rate"] for s in samples]),
+            "force_short_cover_mask": torch.stack(
+                [s["force_short_cover_mask"] for s in samples]
             ),
-            "force_short_cover_mask": torch.stack([s["force_short_cover_mask"] for s in samples]),
             "force_exit_mask": torch.stack([s["force_exit_mask"] for s in samples]),
             "benchmark": torch.stack([s["benchmark"] for s in samples]),
             "session_advance_mask": torch.stack(
                 [s["session_advance_mask"] for s in samples]
             ),
-            "session_month_ids": torch.stack(
-                [s["session_month_ids"] for s in samples]
-            ),
+            "session_month_ids": torch.stack([s["session_month_ids"] for s in samples]),
             "commission_rebate_payment_eligible_mask": torch.stack(
-                [
-                    s["commission_rebate_payment_eligible_mask"]
-                    for s in samples
-                ]
+                [s["commission_rebate_payment_eligible_mask"] for s in samples]
             ),
             "sample_mask": torch.ones(len(samples), dtype=torch.bool),
         }
         if "volume_notional" in samples[0]:
-            batch["volume_notional"] = torch.stack([s["volume_notional"] for s in samples])
+            batch["volume_notional"] = torch.stack(
+                [s["volume_notional"] for s in samples]
+            )
         if "derivative_candidate_features" in samples[0]:
             batch["derivative_candidate_features"] = torch.stack(
                 [s["derivative_candidate_features"] for s in samples]
@@ -1244,9 +1273,7 @@ def collate_batch(
         "can_buy_mask": _pad_tensor_list("can_buy_mask"),
         "can_sell_mask": _pad_tensor_list("can_sell_mask"),
         "can_short_open_mask": _pad_tensor_list("can_short_open_mask"),
-        "can_short_open_open_mask": _pad_tensor_list(
-            "can_short_open_open_mask"
-        ),
+        "can_short_open_open_mask": _pad_tensor_list("can_short_open_open_mask"),
         "short_capacity_shares": _pad_tensor_list("short_capacity_shares"),
         "short_capacity_notional": _pad_tensor_list("short_capacity_notional"),
         "short_margin_rate": torch.stack(
@@ -1264,7 +1291,9 @@ def collate_batch(
         "commission_rebate_payment_eligible_mask": _pad_tensor_list(
             "commission_rebate_payment_eligible_mask"
         ),
-        "sample_mask": torch.tensor([True] * len(samples) + [False] * pad_count, dtype=torch.bool),
+        "sample_mask": torch.tensor(
+            [True] * len(samples) + [False] * pad_count, dtype=torch.bool
+        ),
     }
     if "volume_notional" in template:
         batch["volume_notional"] = _pad_tensor_list("volume_notional")
@@ -1276,9 +1305,7 @@ def collate_batch(
             "derivative_candidate_mask"
         ).to(dtype=torch.bool)
     if "day_trade_eligible_mask" in template:
-        batch["day_trade_eligible_mask"] = _pad_tensor_list(
-            "day_trade_eligible_mask"
-        )
+        batch["day_trade_eligible_mask"] = _pad_tensor_list("day_trade_eligible_mask")
     if "day_trade_can_buy_open_mask" in template:
         batch["day_trade_can_buy_open_mask"] = _pad_tensor_list(
             "day_trade_can_buy_open_mask"
