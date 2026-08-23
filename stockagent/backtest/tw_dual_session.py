@@ -1143,6 +1143,33 @@ def _execute_signed_event(
     short_open = voluntary_short_open
     executed = risky_before - long_sell + long_buy + short_cover - short_open
 
+    # A margin loan is secured by the physical long inventory.  Once an event
+    # leaves no representable long position, any remaining principal must be
+    # repaid from that event's sale claim; carrying the liability into the
+    # next batch would be both economically impossible and numerically
+    # unstable.  Close the pair as one accounting operation instead of merely
+    # snapping the debt to zero: subtracting the same amount from the pending
+    # claim preserves NAV exactly.
+    #
+    # The proportional repayment path above normally consumes the complete
+    # principal.  This endpoint projection covers FP32 association differences
+    # between the physical-leg calculation and the same-day inventory pairing.
+    # It does not round model targets or tradable quantities.  Exact share,
+    # lot, price-tick, commission, and tax precision remains the responsibility
+    # of the integer execution oracle.
+    provisional_long_margin_debt = (
+        long_margin_debt - long_margin_repayment
+    ).clamp_min(0.0)
+    endpoint_long_margin_repayment = torch.where(
+        (executed <= _POSITION_TOLERANCE)
+        & (provisional_long_margin_debt > 0.0),
+        provisional_long_margin_debt,
+        torch.zeros_like(provisional_long_margin_debt),
+    )
+    next_long_margin_debt = (
+        provisional_long_margin_debt - endpoint_long_margin_repayment
+    ).clamp_min(0.0)
+
     voluntary_volume_used = (
         voluntary_long_sell
         + voluntary_long_buy
@@ -1184,6 +1211,7 @@ def _execute_signed_event(
             (short_cover * (1.0 + buy_fees)).sum(),
             (long_sell + long_buy + short_cover + short_open).sum(),
             voluntary_volume_used.sum(),
+            endpoint_long_margin_repayment.sum(),
         ),
         symbol_sharded=symbol_sharded,
     )
@@ -1284,6 +1312,7 @@ def _execute_signed_event(
             + released_margin_total
             - post_execution_totals[9]
             - post_execution_totals[6]
+            - post_execution_totals[12]
         )
         event_turnover = post_execution_totals[10]
         next_turnover = (
@@ -1300,6 +1329,7 @@ def _execute_signed_event(
             + released_margin.sum()
             - (short_cover * (1.0 + buy_fees)).sum()
             - opened_margin_collateral.sum()
+            - post_execution_totals[12]
         )
         event_turnover = (long_sell + long_buy + short_cover + short_open).sum()
         next_turnover = (
@@ -1308,9 +1338,6 @@ def _execute_signed_event(
             else (starting_turnover - voluntary_volume_used.sum()).clamp_min(0.0)
         )
     next_pending = pending_net_claim + event_net_claim
-    next_long_margin_debt = (
-        long_margin_debt - long_margin_repayment
-    ).clamp_min(0.0)
 
     active_float = active.to(dtype=risky_before.dtype)
     executed = torch.where(active, executed, risky_before)

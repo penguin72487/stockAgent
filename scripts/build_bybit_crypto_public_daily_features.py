@@ -220,6 +220,34 @@ HYPERLIQUID_METRICS = {
     "day_notional_volume": "crypto_public_hyperliquid_day_volume_log1p",
 }
 
+FREE_FEATURES = (
+    *(spec[0] for spec in FREE_MARKET_SERIES),
+    *(spec[0] for spec in FREE_SNAPSHOT_SERIES),
+    *(spec[0] for spec in FREE_SUM_SNAPSHOT_SERIES),
+    *(spec[0] for spec in FREE_LAST_SNAPSHOT_SERIES),
+    *HYPERLIQUID_METRICS.values(),
+    "crypto_public_market_available",
+    "crypto_public_hyperliquid_available",
+)
+
+OUTPUT_FEATURES = tuple(
+    dict.fromkeys(
+        (
+            *BYBIT_FEATURES,
+            *BINANCE_FEATURES,
+            *OKX_FEATURES,
+            *FREE_FEATURES,
+            *FRED_FEATURES,
+            *SEC_MARKET_FEATURES,
+            *SEC_ASSET_FEATURES,
+            *COINMETRICS_FEATURES,
+            *COINGECKO_MARKET_FEATURES,
+            *COINGECKO_ASSET_FEATURES,
+            *ETF_ISSUER_FEATURES,
+        )
+    )
+)
+
 
 @dataclass(slots=True)
 class SymbolCoverage:
@@ -243,8 +271,8 @@ class SymbolCoverage:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--bybit-daily-dir", default="data_bybit/perpetual_daily")
-    parser.add_argument("--okx-dir", default="data_okx")
-    parser.add_argument("--binance-dir", default="data_binance")
+    parser.add_argument("--okx-dir", default="data_okx/1m")
+    parser.add_argument("--binance-dir", default="data_binance/1m")
     parser.add_argument(
         "--free-public-path", default="data_free_public/observations.parquet"
     )
@@ -282,6 +310,15 @@ def _write_parquet_atomic(frame: pl.DataFrame, path: Path) -> None:
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _ensure_output_feature_schema(frame: pl.DataFrame) -> pl.DataFrame:
+    missing = [name for name in OUTPUT_FEATURES if name not in frame.columns]
+    if missing:
+        frame = frame.with_columns(
+            *(pl.lit(None, dtype=pl.Float64).alias(name) for name in missing)
+        )
+    return frame.select("date", "symbol", *OUTPUT_FEATURES)
 
 
 def _write_text_atomic(text: str, path: Path) -> None:
@@ -322,15 +359,24 @@ def _instrument_rows(
 def _okx_base_map(okx_dir: Path) -> dict[str, str]:
     path = okx_dir / "symbols.csv"
     if not path.is_file():
-        raise FileNotFoundError(f"missing OKX symbol receipt: {path}")
+        return {}
     frame = pl.read_csv(path, infer_schema_length=10_000).filter(
         (pl.col("settle_ccy") == "USDT")
         & (pl.col("ct_type") == "linear")
         & (pl.col("state") == "live")
     )
+    family_column = "inst_family" if "inst_family" in frame.columns else None
+    symbol_column = next(
+        (name for name in ("okx_symbol", "name") if name in frame.columns), None
+    )
+    if family_column is None and symbol_column is None:
+        return {}
     mapping: dict[str, str] = {}
-    for row in frame.select("code", "inst_family").to_dicts():
-        family = str(row["inst_family"] or "")
+    columns = ["code", family_column or symbol_column]
+    for row in frame.select(*columns).to_dicts():
+        family = str(row[family_column or symbol_column] or "")
+        if family_column is None and family.endswith("-SWAP"):
+            family = family.removesuffix("-SWAP")
         if not family.endswith("-USDT"):
             continue
         base = family.removesuffix("-USDT").upper()
@@ -343,7 +389,7 @@ def _okx_base_map(okx_dir: Path) -> dict[str, str]:
 def _binance_base_map(binance_dir: Path) -> dict[str, str]:
     path = binance_dir / "symbols.csv"
     if not path.is_file():
-        raise FileNotFoundError(f"missing Binance symbol receipt: {path}")
+        return {}
     frame = pl.read_csv(path, infer_schema_length=10_000).filter(
         (pl.col("quote_asset") == "USDT")
         & (pl.col("margin_asset") == "USDT")
@@ -1407,6 +1453,7 @@ def main() -> None:
         .agg(pl.exclude("date", "symbol").drop_nulls().last())
         .sort(["date", "symbol"])
     )
+    output = _ensure_output_feature_schema(output)
     numeric_columns = [
         name for name, dtype in output.schema.items() if dtype.is_numeric()
     ]

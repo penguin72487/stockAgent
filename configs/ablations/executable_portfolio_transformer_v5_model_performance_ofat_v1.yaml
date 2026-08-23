@@ -12,7 +12,10 @@ pinned_panel_cache:
   snapshot_id: tw-public-20260820T015018219623218Z-l0-penguin-6716296ea30636ba
   variant_id: c8b02a7a891549c4108c0307a8db47cdc34f17e9b17aa75afbdd79089c1748ac
   version: 51
-  generation: 67458178ae924a0188d98841e9b17229
+  # Re-materialized byte-identically from the same v51 source contract after
+  # hot-cache recovery. Checkpoint panel-array SHA-256 fingerprints are
+  # unchanged; only the storage-generation identifier changed.
+  generation: b992483327f948fb8507c1d20ec98be2
   source_hash: 31f3e4f1e31338bb9c0fd52494cc0d840a5081ffeab00a1fceddfa3412258fe0
 
 runtime:
