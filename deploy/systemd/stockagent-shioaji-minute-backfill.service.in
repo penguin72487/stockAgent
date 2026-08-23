@@ -17,6 +17,8 @@ Restart=on-failure
 RestartSec=60s
 TimeoutStopSec=120s
 KillMode=control-group
-
-[Install]
-WantedBy=multi-user.target
+Nice=10
+CPUWeight=25
+IOWeight=25
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7

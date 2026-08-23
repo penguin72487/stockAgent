@@ -90,6 +90,8 @@ PY
 )
 
 echo "[shioaji-futures-history-runner] started=$(TZ=Asia/Taipei date --iso-8601=seconds) end_date=$END_DATE contracts=${#CONTRACTS[@]} max_traffic_fraction=$MAX_TRAFFIC_FRACTION cutoff=07:45 resume=14:31"
+completed_contracts=0
+unavailable_contracts=0
 for contract in "${CONTRACTS[@]}"; do
   if [[ "$contract" == "TXFR1" ]]; then
     output_dir="data_tw_index_futures/shioaji_history/TXFR1"
@@ -115,6 +117,12 @@ for contract in "${CONTRACTS[@]}"; do
     set -e
     if (( rc == 0 )); then
       echo "[shioaji-futures-history-runner] contract_complete=$contract"
+      completed_contracts=$((completed_contracts + 1))
+      break
+    fi
+    if (( rc == 78 )); then
+      echo "[shioaji-futures-history-runner] contract_terminal=$contract status=contract_unavailable no_data_fabricated=true"
+      unavailable_contracts=$((unavailable_contracts + 1))
       break
     fi
     if (( rc != 75 && rc != 76 )); then
@@ -132,4 +140,4 @@ for contract in "${CONTRACTS[@]}"; do
     sleep "$delay"
   done
 done
-echo "[shioaji-futures-history-runner] all_contracts_complete=$(TZ=Asia/Taipei date --iso-8601=seconds)"
+echo "[shioaji-futures-history-runner] run_complete=$(TZ=Asia/Taipei date --iso-8601=seconds) completed_contracts=$completed_contracts unavailable_contracts=$unavailable_contracts total_contracts=${#CONTRACTS[@]}"

@@ -334,6 +334,16 @@ def build_openbb_public_status(
     scheduler = _read_json_object(state_dir / "provider_scheduler.json")
     downloader_phase = _read_json_object(state_dir / "downloader_phase.json")
     l1_compaction = _read_json_object(state_dir / "l1_compaction_latest.json")
+    raw_deferred_query_views = l1_compaction.get("deferred_query_views")
+    deferred_query_views = (
+        {
+            str(endpoint): str(reason)
+            for endpoint, reason in raw_deferred_query_views.items()
+            if _SAFE_NAME.fullmatch(str(endpoint))
+        }
+        if isinstance(raw_deferred_query_views, Mapping)
+        else {}
+    )
     snapshot_age = _age_seconds(snapshot.get("checked_at"), current)
     scheduler_age = _age_seconds(scheduler.get("updated_at"), current)
     phase_age = _age_seconds(downloader_phase.get("updated_at"), current)
@@ -527,6 +537,8 @@ def build_openbb_public_status(
             "output_bytes": _integer(l1_compaction.get("output_bytes")),
             "new_segments": _integer(l1_compaction.get("new_segments")),
             "stale_segments": _integer(l1_compaction.get("stale_segments")),
+            "deferred_query_view_count": len(deferred_query_views),
+            "deferred_query_views": deferred_query_views,
             "l0_deleted": bool(l1_compaction.get("l0_deleted")),
         },
         "categories": _category_rows(snapshot),

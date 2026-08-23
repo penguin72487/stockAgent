@@ -15,6 +15,7 @@ from stockagent.live.shioaji_schedule import (
     HISTORICAL_MAX_TRAFFIC_FRACTION,
     historical_query_is_protected,
     historical_query_pause_seconds,
+    previous_tw_stock_session,
 )
 from downloader import download_shioaji_tw_kbars, download_shioaji_tw_minute_kbars
 
@@ -34,10 +35,17 @@ def test_history_queries_stop_before_observed_quota_reset() -> None:
     assert historical_query_pause_seconds(_local(8, 2)) == 23_340
 
 
-def test_history_queries_resume_only_after_close_and_weekends_remain_available() -> None:
+def test_history_queries_resume_only_after_close_and_weekends_remain_available() -> (
+    None
+):
     assert historical_query_is_protected(_local(14, 30))
     assert not historical_query_is_protected(_local(14, 31))
     assert not historical_query_is_protected(_local(8, 2, day=16))
+
+
+def test_previous_tw_stock_session_skips_weekend_targets() -> None:
+    observed = datetime(2026, 8, 23, 3, 0, tzinfo=TAIPEI)
+    assert previous_tw_stock_session(observed) == date(2026, 8, 21)
 
 
 def test_existing_downloaders_share_the_schedule_guard(monkeypatch) -> None:
@@ -87,6 +95,31 @@ def test_service_runners_do_not_override_the_shared_ninety_percent_policy() -> N
     minute_runner = (root / "scripts/run_shioaji_minute_full_backfill.sh").read_text()
     assert "SHIOAJI_FUTURES_HISTORY_MAX_TRAFFIC_FRACTION:-0.90" in futures_runner
     assert "SHIOAJI_MINUTE_MAX_TRAFFIC_FRACTION:-0.90" in minute_runner
+    assert "rc == 78" in futures_runner
+    assert "status=contract_unavailable" in futures_runner
+
+
+def test_market_schedule_import_does_not_load_training_config() -> None:
+    root = Path(__file__).resolve().parents[1]
+    market_status = (root / "stockagent/live/market_status.py").read_text()
+    prefix = market_status.split("def data_freshness", maxsplit=1)[0]
+    assert "from stockagent.config import load_config" not in prefix
+
+
+def test_minute_runner_reserves_one_account_connection_for_futures_history() -> None:
+    root = Path(__file__).resolve().parents[1]
+    minute_runner = (root / "scripts/run_shioaji_minute_full_backfill.sh").read_text()
+    assert "SHIOAJI_MINUTE_WORKERS:-4" in minute_runner
+    assert "SHIOAJI_MINUTE_WORKERS:-5" not in minute_runner
+
+
+def test_minute_runner_builds_only_from_the_complete_current_run() -> None:
+    root = Path(__file__).resolve().parents[1]
+    minute_runner = (root / "scripts/run_shioaji_minute_full_backfill.sh").read_text()
+    assert '[[ "$summary_state" == "ready=true "* ]]' in minute_runner
+    assert '[[ "$summary_state" == *"collected=true"* ]]' not in minute_runner
+    assert "run_reported == run_selected" in minute_runner
+    assert 'not bool(run_payload.get("stopped_for_traffic"))' in minute_runner
 
 
 def test_completed_futures_contract_does_not_login_again(monkeypatch, tmp_path) -> None:
@@ -130,3 +163,70 @@ def test_completed_futures_contract_does_not_login_again(monkeypatch, tmp_path) 
     monkeypatch.setitem(sys.modules, "shioaji", None)
 
     assert download_shioaji_tx_futures_ticks.main() == 0
+
+
+def test_missing_futures_contract_is_a_truthful_terminal_gap(
+    monkeypatch, tmp_path
+) -> None:
+    trading_date = date(2026, 8, 19)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            download_shioaji_tx_futures_ticks.__name__,
+            "--contract",
+            "KAFR1",
+            "--output-dir",
+            str(tmp_path),
+            "--start-date",
+            trading_date.isoformat(),
+            "--end-date",
+            trading_date.isoformat(),
+        ],
+    )
+    monkeypatch.setattr(
+        download_shioaji_tx_futures_ticks,
+        "_calendar",
+        lambda *_args: [trading_date],
+    )
+
+    class Contracts:
+        @staticmethod
+        def get(_code):
+            return None
+
+    class Api:
+        contracts = Contracts()
+        logged_out = False
+
+        def __init__(self, *, simulation):
+            assert simulation is False
+
+        def set_event_callback(self, _callback):
+            return None
+
+        def login(self, **_kwargs):
+            return None
+
+        def logout(self):
+            self.logged_out = True
+
+    fake_shioaji = SimpleNamespace(Shioaji=Api)
+    monkeypatch.setitem(sys.modules, "shioaji", fake_shioaji)
+    monkeypatch.setenv("SHIOAJI_API_KEY", "test-key")
+    monkeypatch.setenv("SHIOAJI_SECRET_KEY", "test-secret")
+
+    assert (
+        download_shioaji_tx_futures_ticks.main()
+        == download_shioaji_tx_futures_ticks.CONTRACT_UNAVAILABLE_EXIT
+    )
+    manifest = __import__("json").loads(
+        (tmp_path / "manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["schema_version"] == 2
+    assert manifest["status"] == "contract_unavailable"
+    assert manifest["unavailable_reason"] == "shioaji_contract_catalog_missing"
+    assert manifest["no_data_fabricated"] is True
+    assert manifest["resolved_trading_dates"] == 0
+    assert not (tmp_path / "receipts").exists()
+    assert not (tmp_path / "ticks").exists()

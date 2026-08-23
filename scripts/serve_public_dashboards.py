@@ -49,6 +49,7 @@ from stockagent.live.tw_day_trade_dashboard import (  # noqa: E402
     build_dashboard_event_page,
     build_dashboard_history_snapshot,
     build_dashboard_position_page,
+    build_dashboard_revision,
     build_dashboard_signal_page,
     build_dashboard_snapshot,
 )
@@ -60,7 +61,8 @@ PUBLIC_SIGNAL_LIMIT: Final[int] = 250
 PUBLIC_EVENT_LIMIT: Final[int] = 250
 MAX_CACHE_ENTRIES: Final[int] = 512
 MONITOR_STATUS_STALE_GRACE_SECONDS: Final[float] = 30.0
-OVERVIEW_STALE_GRACE_SECONDS: Final[float] = 90.0
+OVERVIEW_STALE_GRACE_SECONDS: Final[float] = 5 * 60.0
+HISTORY_STALE_GRACE_SECONDS: Final[float] = 15 * 60.0
 IMMUTABLE_ASSET_CACHE_CONTROL: Final[str] = "public, max-age=31536000, immutable"
 _OPENER = build_opener(ProxyHandler({}))
 _LATENCY_BUCKETS_MS: Final[tuple[float, ...]] = (
@@ -90,6 +92,7 @@ _PUBLIC_API_ROUTES: Final[frozenset[str]] = frozenset(
         "/tw-day-trade/api/status",
         "/tw-day-trade/api/history",
         "/tw-day-trade/api/positions",
+        "/tw-day-trade/api/revision",
         "/tw-day-trade/api/summary",
         "/tw-day-trade/api/signals",
         "/tw-day-trade/api/events",
@@ -512,14 +515,19 @@ def _open_position_summary(payload: Mapping[str, Any]) -> tuple[int, int]:
     open_count = 0
     stale_count = 0
     positions = payload.get("positions")
-    if not isinstance(positions, list):
-        return open_count, stale_count
-    for row in positions:
-        if not isinstance(row, Mapping) or not row.get("signed_shares"):
-            continue
-        open_count += 1
-        if row.get("valuation_stale"):
-            stale_count += 1
+    if isinstance(positions, list) and positions:
+        for row in positions:
+            if not isinstance(row, Mapping) or not row.get("signed_shares"):
+                continue
+            open_count += 1
+            if row.get("valuation_stale"):
+                stale_count += 1
+    else:
+        for row in payload.get("modes") or ():
+            if not isinstance(row, Mapping):
+                continue
+            open_count += int(row.get("open_position_count") or 0)
+            stale_count += int(row.get("stale_position_count") or 0)
     return open_count, stale_count
 
 
@@ -534,6 +542,7 @@ def summarize_tw_status(payload: Mapping[str, Any]) -> dict[str, Any]:
         "health",
         "source_age_seconds",
         "source_updated_at",
+        "service_sync",
         "session_date",
         "available_session_dates",
         "simulation_only",
@@ -964,7 +973,23 @@ class PublicDashboardServer(ThreadingHTTPServer):
                     preopen_readiness_path=self.repo_root
                     / "artifacts/discord_bot/preopen_readiness.json",
                     session_date=normalized_date or None,
+                    maximum_event_rows=500,
+                    maximum_mark_rows=32,
+                    include_position_rows=False,
                 )
+            ),
+        )
+
+    def tw_revision(self) -> PreparedResponse:
+        return self.cached_local_json(
+            cache_key="tw-revision",
+            ttl_seconds=0.25,
+            cache_control="no-store",
+            stale_grace_seconds=0.0,
+            builder=lambda: build_dashboard_revision(
+                state_dir=self.repo_root / "artifacts/live/tw_day_trade_simulation",
+                discord_service_status_path=self.repo_root
+                / "artifacts/discord_bot/service_status.json",
             ),
         )
 
@@ -980,7 +1005,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
             cache_key=f"tw-history:{range_key}:{date_key}",
             ttl_seconds=55.0,
             cache_control="no-cache",
-            stale_grace_seconds=180.0,
+            stale_grace_seconds=HISTORY_STALE_GRACE_SECONDS,
             builder=lambda: sanitize_tw_history(
                 build_dashboard_history_snapshot(
                     state_dir=self.repo_root / "artifacts/live/tw_day_trade_simulation",
@@ -1005,7 +1030,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
             cache_key=f"openbb-history:{range_key}",
             ttl_seconds=55.0,
             cache_control="no-cache",
-            stale_grace_seconds=180.0,
+            stale_grace_seconds=HISTORY_STALE_GRACE_SECONDS,
             builder=lambda: build_openbb_public_history(self.repo_root, range_key),
         )
 
@@ -1136,7 +1161,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
                 upstream_url=f"{self.taifex_upstream}/api/history?range=1d",
                 ttl_seconds=55.0,
                 cache_control="no-cache",
-                stale_grace_seconds=180.0,
+                stale_grace_seconds=HISTORY_STALE_GRACE_SECONDS,
                 sanitizer=sanitize_taifex_history,
             )
 
@@ -1150,22 +1175,20 @@ class PublicDashboardServer(ThreadingHTTPServer):
                 "public-dashboard critical_view_prewarm_failed "
                 f"error={type(error).__name__}\n"
             )
+        # The overview already indexes the TW ledger dates. Prebuilding raw
+        # position and event pages here used to decode and retain every ledger
+        # row without storing a public response, inflating a fresh gateway to
+        # multiple GiB. The default signal page now retains only its bounded
+        # 100-row result, so it is safe and useful to warm the laptop's first
+        # visible detail table after the compact date index exists.
         builders: tuple[Callable[[], object], ...] = (
             self.prewarm_overview,
             lambda: self.tw_history("1d"),
             lambda: self.openbb_history("1d"),
             lambda: build_dashboard_signal_page(
                 state_dir=self.repo_root / "artifacts/live/tw_day_trade_simulation",
+                mode="all",
                 status="all",
-                limit=100,
-            ),
-            lambda: build_dashboard_position_page(
-                state_dir=self.repo_root / "artifacts/live/tw_day_trade_simulation",
-                status="all",
-                limit=100,
-            ),
-            lambda: build_dashboard_event_page(
-                state_dir=self.repo_root / "artifacts/live/tw_day_trade_simulation",
                 limit=100,
             ),
         )
@@ -1622,11 +1645,15 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                 ),
                 ttl_seconds=55.0,
                 cache_control="no-cache",
-                stale_grace_seconds=180.0,
+                stale_grace_seconds=HISTORY_STALE_GRACE_SECONDS,
                 sanitizer=sanitize_taifex_history,
             )
         if path == "/tw-day-trade/api/status":
             return self.server.tw_status(self._date_query(raw_query))
+        if path == "/tw-day-trade/api/revision":
+            if raw_query:
+                raise InvalidPublicRequest("revision does not accept query fields")
+            return self.server.tw_revision()
         if path == "/tw-day-trade/api/history":
             history_query = self._tw_history_query(raw_query)
             return self.server.tw_history(

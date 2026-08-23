@@ -13,14 +13,36 @@ import pyarrow.parquet as pq
 
 from downloader.download_openbb_archive import DownloadTask, Manifest, TaskResult
 from scripts.compact_openbb_l1 import (
+    MAX_QUERY_VIEW_SCHEMA_VARIANTS,
     TaskShard,
     _archive_compaction_allowed,
+    _lexical_absolute_path,
+    _query_view_deferred_reason,
     _segment_batches,
     run,
 )
 
 
 ENDPOINT = "equity.price.historical"
+
+
+def test_query_view_deferral_has_an_explicit_schema_complexity_boundary() -> None:
+    assert _query_view_deferred_reason(MAX_QUERY_VIEW_SCHEMA_VARIANTS) is None
+    reason = _query_view_deferred_reason(MAX_QUERY_VIEW_SCHEMA_VARIANTS + 1)
+    assert reason is not None
+    assert "long_form_normalization_required" in reason
+
+
+def test_manifest_path_normalization_is_lexical_and_absolute(
+    tmp_path: Path, monkeypatch
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(target, target_is_directory=True)
+    monkeypatch.chdir(tmp_path)
+
+    assert _lexical_absolute_path("link/source.parquet") == str(link / "source.parquet")
 
 
 def test_segment_batches_enforce_rows_and_uncompressed_bytes_before_file_minimum() -> (

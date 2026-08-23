@@ -1,10 +1,10 @@
 [Unit]
-Description=Incrementally compact completed OpenBB shards every 30 minutes
+Description=Compact OpenBB shards after boot recovery and each completed cycle
 
 [Timer]
-OnCalendar=*-*-* *:00,30:00
+OnActiveSec=20min
+OnUnitInactiveSec=30min
 RandomizedDelaySec=2min
-Persistent=true
 Unit=stockagent-openbb-l1-compaction.service
 
 [Install]

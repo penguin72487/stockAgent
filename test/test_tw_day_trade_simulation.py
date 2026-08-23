@@ -11,6 +11,7 @@ import numpy as np
 import polars as pl
 import pytest
 
+import stockagent.live.tw_day_trade_dashboard as dashboard_module
 from stockagent.backtest.tw_execution import TaiwanFeeSchedule
 from stockagent.live.quote_provider import PriceSnapshot
 from stockagent.live.tw_day_trade_dashboard import (
@@ -22,6 +23,7 @@ from stockagent.live.tw_day_trade_dashboard import (
     build_dashboard_event_page,
     build_dashboard_history_snapshot,
     build_dashboard_position_page,
+    build_dashboard_revision,
     build_dashboard_signal_page,
     build_dashboard_snapshot,
     build_dashboard_summary,
@@ -37,6 +39,7 @@ from stockagent.live.tw_day_trade_simulation import (
     quote_map_from_snapshot,
     require_exact_session_eligibility,
 )
+from stockagent.live.tw_day_trade_service_sync import load_service_sync
 
 
 TAIPEI = ZoneInfo("Asia/Taipei")
@@ -95,6 +98,76 @@ def test_dashboard_session_progress_exposes_market_retry_and_closing_auction() -
     assert retry["next_milestone_label"] == "13:25 收盤集合競價"
     assert auction["phase"] == "closing_auction"
     assert auction["next_milestone_label"] == "13:30 撮合／帳務完成"
+
+
+def test_engine_publishes_one_compact_revision_after_related_state_files(
+    tmp_path: Path,
+) -> None:
+    spec = _spec(tmp_path)
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+
+    engine.update_readiness([spec], now=_now(8, 59))
+
+    receipt = load_service_sync(engine.state_dir)
+    assert receipt is not None
+    revision = receipt["state_revision"]
+    content_revision = receipt["content_revision"]
+    assert receipt["enabled_markets"] == [spec.market]
+    assert receipt["modes"][spec.market]["checkpoint_ready"] is True
+    for filename in ("state.json", "status.json", "positions.json"):
+        payload = json.loads((engine.state_dir / filename).read_text(encoding="utf-8"))
+        assert payload["state_revision"] == revision
+
+    engine.update_readiness([spec], now=_now(8, 59, 30))
+    heartbeat = load_service_sync(engine.state_dir)
+    assert heartbeat is not None
+    assert heartbeat["state_revision"] == revision + 1
+    assert heartbeat["content_revision"] == content_revision
+
+
+def test_dashboard_revision_proves_discord_ack_and_hides_disabled_mode(
+    tmp_path: Path,
+) -> None:
+    spec = _spec(tmp_path)
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+    engine.state.setdefault("modes", {})["retired_mode"] = {
+        "market": "retired_mode",
+        "label": "retired",
+        "initial_capital_twd": 1_000_000.0,
+        "total_equity_twd": 1_000_000.0,
+        "positions": {},
+    }
+    engine.update_readiness([spec], now=_now(8, 59))
+    receipt = load_service_sync(engine.state_dir)
+    assert receipt is not None
+    bot_status = tmp_path / "service_status.json"
+    bot_status.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "updated_at": _now(8, 59).isoformat(),
+                "discord_connected": True,
+                "engine_state_revision": receipt["state_revision"],
+                "day_trade_markets": [spec.market],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    sync = build_dashboard_revision(
+        state_dir=engine.state_dir,
+        discord_service_status_path=bot_status,
+        now=_now(8, 59).astimezone(ZoneInfo("UTC")),
+    )
+    snapshot = build_dashboard_snapshot(
+        state_dir=engine.state_dir,
+        now=_now(8, 59).astimezone(ZoneInfo("UTC")),
+    )
+
+    assert sync["synchronized"] is True
+    assert sync["status"] == "synchronized"
+    assert sync["revision_lag"] == 0
+    assert [row["market"] for row in snapshot["modes"]] == [spec.market]
 
 
 def test_dashboard_reports_measured_input_to_ledger_latency(tmp_path: Path) -> None:
@@ -290,7 +363,7 @@ def _row(weight: float = 0.1) -> dict[str, object]:
     }
 
 
-def test_runner_keeps_retired_modes_available_only_for_historical_rebuild() -> None:
+def test_runner_loads_all_three_configured_day_trade_modes() -> None:
     from scripts.run_tw_day_trade_simulation import _mode_specs
 
     repo_root = Path(__file__).resolve().parents[1]
@@ -299,22 +372,27 @@ def test_runner_keeps_retired_modes_available_only_for_historical_rebuild() -> N
     )
     by_market = {spec.market: spec for spec in specs}
     active_expected = {
-        "tw_day_trade_multi_basis",
         "tw_day_trade_100m",
+        "tw_day_trade_multi_basis",
         "tw_day_trade_multi_basis_projection_l1_gelu",
     }
-    historical_expected = set(active_expected)
 
     assert errors == {}
     assert set(by_market) == active_expected
     assert set(live_configs) == active_expected
+    assert by_market["tw_day_trade_100m"].initial_capital_twd == 100_000_000.0
+    assert by_market["tw_day_trade_multi_basis"].initial_capital_twd == 10_000_000.0
+    assert (
+        by_market["tw_day_trade_multi_basis_projection_l1_gelu"].initial_capital_twd
+        == 10_000_000.0
+    )
     specs, live_configs, errors = _mode_specs(
         repo_root / "services/discord_bot/markets",
         include_disabled=True,
     )
     assert errors == {}
-    assert {spec.market for spec in specs} == historical_expected
-    assert set(live_configs) == historical_expected
+    assert {spec.market for spec in specs} == active_expected
+    assert set(live_configs) == active_expected
     assert all(spec.signal_market is None for spec in specs)
     assert all(spec.price_limit_offset_ticks == 1 for spec in specs)
     assert all(
@@ -2917,6 +2995,10 @@ def test_dashboard_html_is_local_and_refreshes_api() -> None:
     assert 'id="workflow-progress"' in html
     assert 'id="preopen-progress"' in html
     assert "fetchWithTimeout(`api/status" in javascript
+    assert 'fetchWithTimeout("api/revision"' in javascript
+    assert "const SERVICE_REVISION_REFRESH_MS = 1000" in javascript
+    assert "Dashboard.scheduleRefresh(refreshServiceRevision" in javascript
+    assert "服務同步" in javascript
     assert "fetchWithTimeout(`api/signals?${params.toString()}`" in javascript
     assert "fetchWithTimeout(`api/positions?${params.toString()}`" in javascript
     assert "fetchWithTimeout(`api/events?${params.toString()}`" in javascript
@@ -2985,8 +3067,8 @@ def test_dashboard_html_is_local_and_refreshes_api() -> None:
     assert "資格／整張／深度後實際成交" in javascript
     assert "方向平衡後" not in javascript
     assert "雙向整張不足・保持空倉" not in javascript
-    assert "四模式已實現" in javascript
-    assert "四模式未實現" in javascript
+    assert "各模式已實現" in javascript
+    assert "各模式未實現" in javascript
     assert "已實現＋未實現，已與總權益對帳" in javascript
     assert "未實現淨清算損益" in javascript
     assert "已實現 ${money(realizedNet)}" in javascript
@@ -3021,7 +3103,7 @@ def test_dashboard_html_is_local_and_refreshes_api() -> None:
         '$("detail-end-date").addEventListener("change", detailDateChanged)'
         in javascript
     )
-    assert "四模式盤前預熱測速（不等同該日執行完成）" in html
+    assert "啟用模式盤前預熱測速（不等同該日執行完成）" in html
     assert "依 |持倉目標 %| 由大到小" in html
     assert "const PRICE_REFRESH_MS = 60000" in javascript
     assert "Dashboard.scheduleRefresh(() => {" in javascript
@@ -3474,6 +3556,52 @@ def test_available_session_date_cache_invalidates_when_ledger_grows(
     )
     assert second["available_session_dates"] == ["2026-08-14", "2026-08-13"]
     assert second["total"] == 2
+
+
+def test_signal_page_cache_ignores_unrelated_live_state_marks(
+    tmp_path: Path, monkeypatch
+) -> None:
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    state_path = state_dir / "state.json"
+    state = {
+        "modes": {
+            "mode_a": {
+                "session_date": "2026-08-13",
+                "initial_capital_twd": 10_000_000,
+                "last_mark_at": "2026-08-13T09:01:00+08:00",
+            }
+        }
+    }
+    state_path.write_text(json.dumps(state) + "\n", encoding="utf-8")
+    (state_dir / "signals.jsonl").write_text(
+        json.dumps(
+            {
+                "session_date": "2026-08-13",
+                "market": "mode_a",
+                "symbol": "2330",
+                "target_weight": 0.1,
+                "status": "ready",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    first = build_dashboard_signal_page(state_dir=state_dir, limit=10)
+    assert first["total"] == 1
+
+    state["modes"]["mode_a"]["last_mark_at"] = "2026-08-13T09:02:00+08:00"
+    state_path.write_text(json.dumps(state) + "\n", encoding="utf-8")
+    monkeypatch.setattr(
+        dashboard_module,
+        "_rows_for_sessions",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("unrelated mark update must not reparse signal rows")
+        ),
+    )
+
+    second = build_dashboard_signal_page(state_dir=state_dir, limit=10)
+    assert second["rows"] == first["rows"]
 
 
 def test_dashboard_signal_page_filters_sorts_and_bounds_payload(tmp_path: Path) -> None:

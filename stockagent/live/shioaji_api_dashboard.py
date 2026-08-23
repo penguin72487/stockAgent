@@ -50,13 +50,9 @@ QUOTA_WINDOW_SCENARIO_SECONDS: Final[int] = 24 * 60 * 60
 JOURNAL_CACHE_SECONDS: Final[float] = 30.0
 
 _FILE_CACHE_LOCK = threading.Lock()
-_JSON_FILE_CACHE: dict[
-    Path, tuple[int, int, int, int, dict[str, Any] | None]
-] = {}
+_JSON_FILE_CACHE: dict[Path, tuple[int, int, int, int, dict[str, Any] | None]] = {}
 _JOURNAL_CACHE_LOCK = threading.Lock()
-_JOURNAL_CACHE: dict[
-    tuple[str, int, str], tuple[float, list[dict[str, Any]]]
-] = {}
+_JOURNAL_CACHE: dict[tuple[str, int, str], tuple[float, list[dict[str, Any]]]] = {}
 
 
 CommandRunner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
@@ -76,6 +72,7 @@ class ShioajiMonitorPaths:
     daily_dataset_summary: Path | None = None
     daily_audit: Path | None = None
     minute_summary: Path | None = None
+    minute_run_summary: Path | None = None
     minute_manifest: Path | None = None
     minute_audit: Path | None = None
     top200_universe_summary: Path | None = None
@@ -105,6 +102,8 @@ class ShioajiMonitorPaths:
             / "data_tw_public/shioaji/stocks/shioaji_dataset_summary.json",
             daily_audit=root / "artifacts/data_quality/tw_shioaji_audit.json",
             minute_summary=root / "data_tw_minute/shioaji_1m/download_summary.json",
+            minute_run_summary=root
+            / "data_tw_minute/shioaji_1m/latest_run_summary.json",
             minute_manifest=root / "data_tw_minute/research_dataset/manifest.json",
             minute_audit=root / "data_tw_minute/audits/full_latest.json",
             top200_universe_summary=root
@@ -149,12 +148,8 @@ def _traffic_ledger_view(payload: dict[str, Any] | None) -> dict[str, Any]:
         "updated_at_utc": source.get("updated_at_utc"),
         "quota_epoch": {
             "id": (source.get("quota_epoch") or {}).get("id"),
-            "started_at_utc": (source.get("quota_epoch") or {}).get(
-                "started_at_utc"
-            ),
-            "boundary_kind": (source.get("quota_epoch") or {}).get(
-                "boundary_kind"
-            ),
+            "started_at_utc": (source.get("quota_epoch") or {}).get("started_at_utc"),
+            "boundary_kind": (source.get("quota_epoch") or {}).get("boundary_kind"),
             "reset_observed": bool(
                 (source.get("quota_epoch") or {}).get("reset_observed")
             ),
@@ -509,8 +504,7 @@ def _eta(
         ),
         "quota_windows_remaining": (
             quota_windows_remaining
-            if isinstance(quota_windows_remaining, int)
-            and quota_windows_remaining >= 0
+            if isinstance(quota_windows_remaining, int) and quota_windows_remaining >= 0
             else None
         ),
         "assumption": assumption,
@@ -603,9 +597,7 @@ def _history_progress_sample(
         "units_per_second": rate,
         "units_per_hour": rate * 3600,
         "bytes_per_unit": (
-            positive_usage_delta / completed_units
-            if positive_usage_delta > 0
-            else None
+            positive_usage_delta / completed_units if positive_usage_delta > 0 else None
         ),
         "observed_at_utc": _iso_from_epoch(run[-1][0]),
     }
@@ -642,9 +634,7 @@ def _history_eta(
         )
     rate = float(sample["units_per_second"])
     if rate <= 0 or not math.isfinite(rate):
-        return _eta(
-            "unknown", confidence="none", basis="最近樣本沒有正的完成速度。"
-        )
+        return _eta("unknown", confidence="none", basis="最近樣本沒有正的完成速度。")
 
     processing_seconds = remaining_units / rate
     remaining_seconds = processing_seconds
@@ -676,9 +666,9 @@ def _history_eta(
             else 0
         )
         if quota_windows > 0:
-            final_window_units = units_after_current_window - (
-                quota_windows - 1
-            ) * full_window_units
+            final_window_units = (
+                units_after_current_window - (quota_windows - 1) * full_window_units
+            )
             quota_scenario_seconds = (
                 quota_windows * QUOTA_WINDOW_SCENARIO_SECONDS
                 + final_window_units / rate
@@ -717,9 +707,7 @@ def _history_eta(
         else "paused"
     )
     completion = (
-        (now + timedelta(seconds=remaining_seconds))
-        .isoformat()
-        .replace("+00:00", "Z")
+        (now + timedelta(seconds=remaining_seconds)).isoformat().replace("+00:00", "Z")
         if service_active
         else None
     )
@@ -797,7 +785,10 @@ def _journal_entries(
     if runner is _default_command_runner:
         with _JOURNAL_CACHE_LOCK:
             cached = _JOURNAL_CACHE.get(cache_key)
-            if cached is not None and time.monotonic() - cached[0] < JOURNAL_CACHE_SECONDS:
+            if (
+                cached is not None
+                and time.monotonic() - cached[0] < JOURNAL_CACHE_SECONDS
+            ):
                 return [dict(item) for item in cached[1]]
     try:
         result = runner(
@@ -837,7 +828,7 @@ def _service_state(unit: str, *, runner: CommandRunner) -> dict[str, Any]:
                 "systemctl",
                 "show",
                 unit,
-                "--property=ActiveState,SubState,NRestarts,InvocationID",
+                "--property=ActiveState,SubState,NRestarts,InvocationID,Result,ExecMainStatus",
                 "--no-pager",
             )
         )
@@ -870,6 +861,16 @@ def _service_state(unit: str, *, runner: CommandRunner) -> dict[str, Any]:
             else None
         ),
         "invocation_id": fields.get("InvocationID") or None,
+        "result": fields.get("Result") or None,
+        "exit_status": (
+            int(fields["ExecMainStatus"])
+            if str(fields.get("ExecMainStatus") or "").lstrip("-").isdigit()
+            else None
+        ),
+        "last_successful": (
+            fields.get("Result") == "success"
+            and str(fields.get("ExecMainStatus") or "0") == "0"
+        ),
     }
 
 
@@ -887,7 +888,7 @@ def _service_states(
                 "systemctl",
                 "show",
                 *unique_units,
-                "--property=Id,ActiveState,SubState,NRestarts,InvocationID",
+                "--property=Id,ActiveState,SubState,NRestarts,InvocationID,Result,ExecMainStatus",
                 "--no-pager",
             )
         )
@@ -920,15 +921,23 @@ def _service_states(
                 fields = {"ActiveState": "active", "SubState": "running"}
         output[unit] = {
             "active": active,
-            "state": fields.get("SubState")
-            or fields.get("ActiveState")
-            or "unknown",
+            "state": fields.get("SubState") or fields.get("ActiveState") or "unknown",
             "restarts": (
                 int(fields["NRestarts"])
                 if str(fields.get("NRestarts") or "").isdigit()
                 else None
             ),
             "invocation_id": fields.get("InvocationID") or None,
+            "result": fields.get("Result") or None,
+            "exit_status": (
+                int(fields["ExecMainStatus"])
+                if str(fields.get("ExecMainStatus") or "").lstrip("-").isdigit()
+                else None
+            ),
+            "last_successful": (
+                fields.get("Result") == "success"
+                and str(fields.get("ExecMainStatus") or "0") == "0"
+            ),
         }
     return output
 
@@ -1301,14 +1310,19 @@ def _backfill_status(
     resolved = sum(int(item.get("resolved_trading_dates") or 0) for item in manifests)
     expected = alias_count * expected_per_contract
     completed = sum(item.get("status") == "complete" for item in manifests)
+    unavailable = sum(
+        item.get("status") == "contract_unavailable" for item in manifests
+    )
     current_contract = None
     waiting_reason = None
     waiting_seconds = None
     waiting_observed_at = None
+    run_failed = False
     for entry in entries:
         message = str(entry.get("MESSAGE") or "")
         if (
             "runner_started=" in message
+            or "[shioaji-futures-history-runner] started=" in message
             or "contract_start=" in message
             or message.startswith("[shioaji-futures-history]")
         ):
@@ -1319,6 +1333,12 @@ def _backfill_status(
             waiting_reason = None
             waiting_seconds = None
             waiting_observed_at = None
+        if "[shioaji-futures-history-runner] started=" in message:
+            run_failed = False
+        elif "[shioaji-futures-history-runner] failed contract=" in message:
+            run_failed = True
+        elif "[shioaji-futures-history-runner] run_complete=" in message:
+            run_failed = False
         contract_match = _CONTRACT_PATTERN.search(message)
         if contract_match:
             current_contract = contract_match.group(1)
@@ -1331,10 +1351,16 @@ def _backfill_status(
     current = next(
         (item for item in manifests if item.get("contract") == current_contract), None
     )
-    if not service.get("active"):
-        state = "stopped"
-    elif completed >= alias_count > 0:
+    if completed >= alias_count > 0:
         state = "complete"
+    elif completed + unavailable >= alias_count > 0:
+        state = "complete_with_unavailable"
+    elif not service.get("active"):
+        state = (
+            "failed"
+            if run_failed or service.get("result") == "exit-code"
+            else "scheduled"
+        )
     elif waiting_reason == "next_quota_window":
         state = "waiting_quota"
     elif waiting_reason == "market_hours_priority_gate":
@@ -1365,6 +1391,7 @@ def _backfill_status(
         "inventory_contracts": alias_count,
         "started_contracts": len(manifests),
         "completed_contracts": completed,
+        "unavailable_contracts": unavailable,
         "expected_dates_per_contract": expected_per_contract,
         "resolved_contract_dates": resolved,
         "expected_contract_dates": expected,
@@ -1409,19 +1436,42 @@ def _build_pipelines(
     traffic: dict[str, Any],
 ) -> list[dict[str, Any]]:
     minute_summary = _read_json(paths.minute_summary) if paths.minute_summary else None
+    minute_run_summary = (
+        _read_json(paths.minute_run_summary) if paths.minute_run_summary else None
+    )
     minute_manifest = (
         _read_json(paths.minute_manifest) if paths.minute_manifest else None
     )
     minute_audit = _read_json(paths.minute_audit) if paths.minute_audit else None
-    minute_ready = bool(
+    minute_research_ready = bool(
         (minute_manifest or {}).get("research_ready")
         and (minute_audit or {}).get("status") == "research_ready"
     )
-    minute_total = int((minute_summary or {}).get("selected_symbols") or 0)
+    minute_target_date = str((minute_run_summary or {}).get("end_date") or "")
+    minute_data_through = str((minute_audit or {}).get("last_date") or "")
+    minute_run_complete = bool(
+        (minute_run_summary or {}).get("resumable_collection_complete")
+        and (minute_run_summary or {}).get("selected_coverage_complete")
+        and not (minute_run_summary or {}).get("stopped_for_traffic")
+        and not (minute_run_summary or {}).get("stopped_for_market_hours")
+        and int((minute_run_summary or {}).get("selected_symbols") or 0)
+        == int((minute_run_summary or {}).get("reported_symbols") or -1)
+    )
+    minute_current = bool(
+        minute_research_ready
+        and minute_run_complete
+        and minute_target_date
+        and minute_data_through >= minute_target_date
+    )
+    minute_total = int(
+        (minute_run_summary or {}).get("selected_symbols")
+        or (minute_summary or {}).get("selected_symbols")
+        or 0
+    )
     minute_available = int((minute_audit or {}).get("available_source_symbols") or 0)
     minute_latest = _payload_time(
-        minute_manifest,
-        paths.minute_manifest,
+        minute_run_summary or minute_manifest,
+        paths.minute_run_summary or paths.minute_manifest,
         "written_at_utc",
     )
 
@@ -1435,14 +1485,12 @@ def _build_pipelines(
     daily_reported = int((daily_summary or {}).get("reported_symbols") or 0)
     daily_ready = bool(
         (daily_summary or {}).get("universe_coverage_complete")
-        and (daily_summary or {}).get("materialization_mode")
-        == "verified_local_minute"
+        and (daily_summary or {}).get("materialization_mode") == "verified_local_minute"
         and int((daily_summary or {}).get("api_requests_started", -1)) == 0
         and (daily_dataset_summary or {}).get("source")
         == "tw_public_before_shioaji_after"
         and (daily_audit or {}).get("status") == "ok"
-        and (daily_audit or {}).get("materialization_mode")
-        == "verified_local_minute"
+        and (daily_audit or {}).get("materialization_mode") == "verified_local_minute"
         and int((daily_audit or {}).get("api_requests_started", -1)) == 0
         and (daily_audit or {}).get("source_minute_summary_receipt_verified") is True
     )
@@ -1540,24 +1588,54 @@ def _build_pipelines(
         "waiting_quota": ("waiting", "等待流量重置"),
         "waiting_market": ("waiting", "即時行情優先"),
         "complete": ("complete", "全部完成"),
+        "complete_with_unavailable": ("partial", "可查契約完成；來源不可用明列"),
+        "scheduled": ("waiting", "等待排程／上次成功"),
+        "failed": ("failed", "最近執行失敗"),
         "stopped": ("stopped", "服務停止"),
     }.get(backfill_state, ("unavailable", "狀態未知"))
     history_eta = _history_eta(backfill, traffic, now=now)
-    minute_eta = (
-        _complete_eta("分鐘來源完成，且 research_ready 全量稽核已通過。")
-        if minute_ready
-        else _progress_eta(
-            current=int((minute_summary or {}).get("reported_symbols") or 0),
+    if minute_current:
+        minute_state, minute_label = "ready", "已追到最新交易日"
+        minute_eta = _complete_eta("分鐘來源與 research_ready 稽核皆已追到目標交易日。")
+    elif (minute_run_summary or {}).get("stopped_for_traffic"):
+        minute_state, minute_label = "waiting", "流量保護暫停"
+        minute_eta = _eta(
+            "waiting_quota",
+            confidence="none",
+            basis="最新交易日仍有缺口；歷史流量安全閘門解除後才會續抓。",
+        )
+    else:
+        minute_state = "partial"
+        minute_label = (
+            "研究資料可用但尚未追到最新" if minute_research_ready else "尚未完成稽核"
+        )
+        minute_eta = _progress_eta(
+            current=int((minute_run_summary or {}).get("reported_symbols") or 0),
             total=minute_total,
-            elapsed_seconds=(minute_summary or {}).get("elapsed_seconds"),
+            elapsed_seconds=(minute_run_summary or {}).get("elapsed_seconds"),
             active=bool(minute_service.get("active")),
             complete=False,
-            complete_basis="分鐘來源與研究稽核皆已完成。",
+            complete_basis="分鐘來源與研究稽核皆已追到目標交易日。",
             running_basis="本次分鐘下載的已處理標的與經過時間。",
-            paused_basis="最近一次分鐘下載的已處理標的與經過時間；目前未執行。",
+            paused_basis="最近一次分鐘下載尚未完成；目前未執行。",
             now=now,
         )
+    minute_gap_symbols = int((minute_audit or {}).get("source_gap_symbols") or 0)
+    minute_unavailable_symbols = int(
+        (minute_audit or {}).get("contract_unavailable_symbols") or 0
     )
+    minute_warnings = []
+    if minute_gap_symbols or minute_unavailable_symbols:
+        minute_warnings.append(
+            f"{minute_gap_symbols:,} 檔有來源缺口、"
+            f"{minute_unavailable_symbols:,} 檔合約不可用；"
+            "研究資料以遮罩保留可用範圍。"
+        )
+    if minute_target_date and minute_data_through < minute_target_date:
+        minute_warnings.append(
+            f"研究資料目前截至 {minute_data_through or '未知'}；"
+            f"最新下載目標為 {minute_target_date}，不得視為已到最新。"
+        )
     daily_eta = (
         _complete_eta("既有分鐘物件已本機彙總，混合資料與來源血緣稽核皆通過。")
         if daily_ready
@@ -1602,6 +1680,7 @@ def _build_pipelines(
             "fields": ["成交時間", "價格", "數量", "買賣方向", "附帶一檔 Bid/Ask"],
             "metrics": [
                 _metric("已完成合約", backfill.get("completed_contracts")),
+                _metric("來源不可用", backfill.get("unavailable_contracts")),
                 _metric("已開始合約", backfill.get("started_contracts")),
                 _metric("Tick", backfill.get("rows"), value_format="compact"),
                 _metric("落盤", backfill.get("stored_bytes"), value_format="bytes"),
@@ -1613,6 +1692,13 @@ def _build_pipelines(
                     if backfill_state == "waiting_quota"
                     else []
                 )
+                + (
+                    [
+                        f"{int(backfill.get('unavailable_contracts') or 0):,} 個契約代號不在永豐目前契約目錄；未偽造 Tick，後續目錄更新會再檢查。"
+                    ]
+                    if backfill.get("unavailable_contracts")
+                    else []
+                )
             ),
             "service": _service_view(history_service),
         },
@@ -1622,9 +1708,11 @@ def _build_pipelines(
             "category": "historical",
             "api_surface": "api.kbars",
             "quota": "historical",
-            "status": "ready" if minute_ready else "partial",
-            "status_label": "研究資料可用" if minute_ready else "尚未完成稽核",
-            "detail": "逐檔 29 日切片回補，已產生因果 1 分鐘研究資料與全量稽核。",
+            "status": minute_state,
+            "status_label": minute_label,
+            "detail": ("逐檔 29 日切片回補；資料可用性與是否追到最新交易日分開稽核。"),
+            "data_through": minute_data_through or None,
+            "target_date": minute_target_date or None,
             "coverage": _coverage(
                 minute_available,
                 minute_total,
@@ -1653,11 +1741,7 @@ def _build_pipelines(
                     "研究列數", (minute_audit or {}).get("rows"), value_format="compact"
                 ),
             ],
-            "warnings": [
-                "88 檔有來源缺口、124 檔合約不可用；研究資料以遮罩保留可用範圍。"
-            ]
-            if minute_ready and minute_total
-            else [],
+            "warnings": minute_warnings,
             "service": _service_view(minute_service),
         },
         {
@@ -1666,8 +1750,14 @@ def _build_pipelines(
             "category": "derived",
             "api_surface": "由全市場 1 分 K 棒產生",
             "quota": "none",
-            "status": "ready" if minute_ready else "partial",
-            "status_label": "研究稽核通過" if minute_ready else "等待完整稽核",
+            "status": "ready" if minute_current else "partial",
+            "status_label": (
+                "研究稽核已追到最新"
+                if minute_current
+                else "既有研究資料可用；等待最新來源"
+                if minute_research_ready
+                else "等待完整稽核"
+            ),
             "detail": "將已落盤分鐘 K 棒轉成時間因果特徵、標籤與可交易遮罩。",
             "coverage": _coverage(
                 (minute_audit or {}).get("available_source_symbols"),
@@ -1678,13 +1768,18 @@ def _build_pipelines(
             "latest_at_utc": minute_latest,
             "eta": (
                 _complete_eta("本機分鐘研究資料的全量稽核已通過。")
-                if minute_ready
+                if minute_current
                 else _eta(
                     "waiting_upstream",
                     confidence="none",
-                    basis="等待上游分鐘來源完成後才能執行最終稽核。",
+                    basis=(
+                        f"既有研究資料截至 {minute_data_through or '未知'}；"
+                        f"等待上游分鐘來源完成 {minute_target_date or '目前目標'} 後重新稽核。"
+                    ),
                 )
             ),
+            "data_through": minute_data_through or None,
+            "target_date": minute_target_date or None,
             "fields": ["因果特徵", "報酬標籤", "可交易遮罩", "交易日分區"],
             "metrics": [
                 _metric("交易日分區", (minute_audit or {}).get("partitions")),
@@ -1742,7 +1837,9 @@ def _build_pipelines(
                         )
                     ),
                 ),
-                _metric("新增 API 請求", (daily_summary or {}).get("api_requests_started")),
+                _metric(
+                    "新增 API 請求", (daily_summary or {}).get("api_requests_started")
+                ),
             ],
             "warnings": (
                 ["來源缺日回退只允許出現在分鐘 manifest 已列出的缺口日期。"]
@@ -2141,8 +2238,8 @@ def build_shioaji_public_status(
     )
     if (
         failed_pipelines
-        or not history_service.get("active")
         or not capture_service.get("active")
+        or backfill.get("state") == "failed"
     ):
         health = "degraded"
     elif backfill.get("state") in {"waiting_quota", "waiting_market"}:

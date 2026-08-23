@@ -658,6 +658,7 @@ def minute_receipt_valid(
     start: date,
     end: date,
     simulation: bool | None = None,
+    required_dates: set[date] | None = None,
 ) -> bool:
     payload = _read_json(path)
     if payload is None or not (
@@ -671,6 +672,17 @@ def minute_receipt_valid(
         and (simulation is None or payload.get("simulation") is bool(simulation))
     ):
         return False
+    if required_dates:
+        try:
+            terminal_dates = {
+                date.fromisoformat(str(value))
+                for field in ("returned_dates", "source_gap_dates")
+                for value in payload.get(field, [])
+            }
+        except (TypeError, ValueError):
+            return False
+        if not required_dates.issubset(terminal_dates):
+            return False
     if payload["status"] == "empty":
         return int(payload.get("rows", -1)) == 0
     if payload["status"] == "source_gap" and not payload.get("source_gap_dates"):
@@ -863,6 +875,9 @@ def _write_symbol_manifest(
             "source_gap_dates": [
                 value.isoformat() for value in sorted(source_gap_dates)
             ],
+            "terminal_coverage_dates": [
+                value.isoformat() for value in sorted(dates | source_gap_dates)
+            ],
             "first_date": min(dates).isoformat() if dates else None,
             "last_date": max(dates).isoformat() if dates else None,
             "written_at_utc": datetime.now(timezone.utc)
@@ -894,6 +909,7 @@ def completed_symbol_manifest_result(
     requested_start: date,
     requested_end: date,
     simulation: bool,
+    expected_dates: set[date] | None = None,
 ) -> SymbolResult | None:
     """Fast restart path for an already sealed symbol.
 
@@ -918,6 +934,39 @@ def completed_symbol_manifest_result(
     entries = payload.get("chunks")
     if not isinstance(entries, list) or len(entries) != len(chunks):
         return None
+    if expected_dates:
+        raw_coverage = payload.get("terminal_coverage_dates")
+        if isinstance(raw_coverage, list):
+            try:
+                terminal_coverage = {
+                    date.fromisoformat(str(value)) for value in raw_coverage
+                }
+            except ValueError:
+                return None
+            if not expected_dates.issubset(terminal_coverage):
+                return None
+        else:
+            # Legacy manifests predate exact coverage dates. Preserve their
+            # O(1) restart path only while the current official positive-volume
+            # calendar has not advanced beyond their sealed evidence.
+            legacy_dates = [
+                date.fromisoformat(str(value))
+                for value in payload.get("source_gap_dates", [])
+            ]
+            if payload.get("last_date"):
+                try:
+                    legacy_dates.append(date.fromisoformat(str(payload["last_date"])))
+                except ValueError:
+                    return None
+            covered_count = int(payload.get("sessions", 0)) + int(
+                payload.get("source_gap_sessions", 0)
+            )
+            if (
+                not legacy_dates
+                or max(expected_dates) > max(legacy_dates)
+                or len(expected_dates) > covered_count
+            ):
+                return None
     for entry, (chunk_start, chunk_end) in zip(entries, chunks, strict=True):
         if not isinstance(entry, dict) or not (
             entry.get("start_date") == chunk_start.isoformat()
@@ -1216,6 +1265,13 @@ def _download_symbol(
 ) -> SymbolResult:
     completed = 0
     try:
+        expected_all = _positive_volume_dates(row.base_path, start, end)
+        provisional_all = provisional_publication_tail_dates(
+            row.base_path,
+            start=start,
+            end=end,
+            expected_dates=expected_all,
+        )
         sealed_result = completed_symbol_manifest_result(
             args.output_dir,
             row,
@@ -1223,6 +1279,7 @@ def _download_symbol(
             requested_start=start,
             requested_end=end,
             simulation=bool(args.simulation),
+            expected_dates=expected_all,
         )
         if sealed_result is not None:
             return sealed_result
@@ -1233,6 +1290,7 @@ def _download_symbol(
                 start=a,
                 end=b,
                 simulation=bool(args.simulation),
+                required_dates={value for value in expected_all if a <= value <= b},
             )
             for a, b in chunks
         )
@@ -1245,13 +1303,6 @@ def _download_symbol(
                 requested_end=end,
                 simulation=bool(args.simulation),
             )
-        expected_all = _positive_volume_dates(row.base_path, start, end)
-        provisional_all = provisional_publication_tail_dates(
-            row.base_path,
-            start=start,
-            end=end,
-            expected_dates=expected_all,
-        )
         query_candidate_dates = expected_all | provisional_all
         contract: Any | None = None
         unit = 0.0
@@ -1310,12 +1361,19 @@ def _download_symbol(
             data_path, receipt_path = minute_chunk_paths(
                 args.output_dir, row.symbol, chunk_start, chunk_end
             )
+            expected_dates = {
+                value for value in expected_all if chunk_start <= value <= chunk_end
+            }
+            provisional_dates = {
+                value for value in provisional_all if chunk_start <= value <= chunk_end
+            }
             if minute_receipt_valid(
                 receipt_path,
                 symbol=row.symbol,
                 start=chunk_start,
                 end=chunk_end,
                 simulation=bool(args.simulation),
+                required_dates=expected_dates,
             ):
                 continue
             if stop_event.is_set():
@@ -1325,14 +1383,6 @@ def _download_symbol(
                     "Taiwan market-hours safety window reached; "
                     "resume after 14:30 Asia/Taipei"
                 )
-            expected_dates = {
-                value for value in expected_all if chunk_start <= value <= chunk_end
-            }
-            provisional_dates = {
-                value
-                for value in provisional_all
-                if chunk_start <= value <= chunk_end
-            }
             query_performed = bool(expected_dates or provisional_dates)
             if query_performed:
                 traffic_guard.check(api)

@@ -624,6 +624,40 @@ def test_data_monitor_reuses_prebuilt_dependency_snapshots(
     assert payload["read_only"] is True
 
 
+def test_data_monitor_preserves_shioaji_partial_freshness_evidence(
+    tmp_path: Path,
+) -> None:
+    registry = tmp_path / "configs/data_sync/packed_datasets.json"
+    registry.parent.mkdir(parents=True)
+    registry.write_text(json.dumps({"datasets": []}), encoding="utf-8")
+    payload = dashboard.build_data_monitor_public_status(
+        tmp_path,
+        now=datetime(2026, 8, 22, 20, 0, tzinfo=UTC),
+        refresh_services={},
+        shioaji_status={
+            "pipelines": [
+                {
+                    "id": "minute_research",
+                    "title": "股票分鐘因果研究資料",
+                    "status": "partial",
+                    "status_label": "既有研究資料可用；等待最新來源",
+                    "data_through": "2026-08-20",
+                    "coverage": {"current": 2621, "total": 2747},
+                    "eta": {"state": "waiting_upstream"},
+                    "warnings": ["目標為 2026-08-21。"],
+                }
+            ]
+        },
+        openbb_status={},
+    )
+    row = next(
+        item for item in payload["sources"] if item["id"] == "shioaji:minute_research"
+    )
+    assert row["status"] == "degraded"
+    assert row["data_through"] == "2026-08-20"
+    assert row["eta"]["state"] == "waiting_upstream"
+
+
 def test_data_monitor_registers_openbb_l1_compaction_progress(tmp_path: Path) -> None:
     now = datetime(2026, 8, 18, 2, 0, tzinfo=UTC)
     registry = tmp_path / "configs/data_sync/packed_datasets.json"
@@ -656,8 +690,58 @@ def test_data_monitor_registers_openbb_l1_compaction_progress(tmp_path: Path) ->
     assert row["status"] == "waiting"
     assert row["coverage"]["current"] == 10_000
     assert row["coverage"]["total"] == 50_000
-    assert row["eta"]["remaining_seconds"] == 3600
+    assert row["eta"]["remaining_seconds"] == 24_000
+    assert "2,048 shard" in row["eta"]["basis"]
+    assert "小於 32 檔" in row["eta"]["basis"]
     assert "75.00%" in row["detail"]
+
+    service = (
+        Path(__file__).resolve().parents[1]
+        / "deploy/systemd/stockagent-openbb-l1-compaction.service.in"
+    ).read_text(encoding="utf-8")
+    assert (
+        f"--max-source-files {dashboard.OPENBB_L1_MAX_SOURCE_FILES_PER_RUN}" in service
+    )
+    assert (
+        f"--min-files-per-segment {dashboard.OPENBB_L1_MIN_FILES_PER_SEGMENT}"
+        in service
+    )
+
+
+def test_data_monitor_does_not_report_complete_when_query_view_is_deferred(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 8, 18, 2, 0, tzinfo=UTC)
+    registry = tmp_path / "configs/data_sync/packed_datasets.json"
+    registry.parent.mkdir(parents=True)
+    registry.write_text(json.dumps({"datasets": []}), encoding="utf-8")
+    payload = dashboard.build_data_monitor_public_status(
+        tmp_path,
+        now=now,
+        refresh_services={},
+        shioaji_status={"pipelines": []},
+        openbb_status={
+            "providers": [],
+            "l1_compaction": {
+                "generated_at_utc": now.isoformat(),
+                "source_age_seconds": 0,
+                "success_files": 10,
+                "compacted_files": 10,
+                "pending_files": 0,
+                "source_bytes": 100,
+                "output_bytes": 50,
+                "deferred_query_views": {
+                    "economy.fred_series": "long_form_normalization_required"
+                },
+            },
+        },
+    )
+    row = next(
+        item for item in payload["sources"] if item["id"] == "openbb:l1-compaction"
+    )
+    assert row["status"] == "partial"
+    assert row["eta"]["state"] == "query_normalization_required"
+    assert "economy.fred_series" in " ".join(row["warnings"])
 
 
 def test_free_public_registry_maps_one_source_to_multiple_datasets(
