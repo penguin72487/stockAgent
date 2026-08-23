@@ -1590,8 +1590,15 @@ def _checkpoint_manifest(
             **data_schema_contract,
             "preprocessing": historical_preprocessing,
         }
-        schema_4_pre_external_source_fingerprints["data_schema"] = (
-            _stable_fingerprint(historical_data_schema)
+        historical_data_contract = {
+            **historical_data_schema,
+            "panel_arrays": panel_arrays,
+        }
+        schema_4_pre_external_source_fingerprints.update(
+            {
+                "data": _stable_fingerprint(historical_data_contract),
+                "data_schema": _stable_fingerprint(historical_data_schema),
+            }
         )
     schema_4_pre_projection_scale_fingerprints: dict[str, str] = {}
     if not bool(model_contract["model"].get("projection_l1_scale_by_active_count")):
@@ -2080,6 +2087,7 @@ def _validate_checkpoint_manifest(
                 expected_fingerprints = dict(expected_fingerprints)
                 expected_fingerprints["walk_forward"] = pre_context["walk_forward"]
             for layer, compatibility_key in (
+                ("data", "schema_4_pre_external_feature_source"),
                 ("data_schema", "schema_4_pre_external_feature_source"),
                 ("model", "schema_4_pre_projection_l1_active_count_scale"),
             ):

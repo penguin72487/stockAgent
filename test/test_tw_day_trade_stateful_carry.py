@@ -5,10 +5,15 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pytest
 import torch
 from torch import nn
 
 from stockagent.backtest.simulator import run_backtest_torch
+from stockagent.backtest.tw_dual_session import (
+    _execute_signed_event,
+    run_tw_cash_dual_session,
+)
 from stockagent.config import load_config
 from stockagent.training.trainer import (
     FoldResult,
@@ -213,6 +218,84 @@ def test_partial_then_full_sale_leaves_no_margin_debt_rounding_residue() -> None
 
     assert torch.count_nonzero(result.final_long_margin_debt).item() == 0
     assert torch.count_nonzero(result.final_weights).item() == 0
+
+
+def test_full_liquidation_settles_endpoint_margin_principal_and_preserves_nav() -> None:
+    # Model the close-auction pairing edge that triggered the formal ablation:
+    # the marked same-day inventory can be one FP32 step above the physical
+    # endpoint.  That association difference must not allow secured principal
+    # to outlive a completely liquidated long position.
+    risky = torch.tensor([0.5], dtype=torch.float32)
+    repayment_exempt = torch.nextafter(
+        risky,
+        torch.full_like(risky, float("inf")),
+    )
+    result = _execute_signed_event(
+        risky_before=risky,
+        desired_risky=torch.zeros_like(risky),
+        mandatory_long_sell=torch.zeros_like(risky),
+        mandatory_short_cover=torch.zeros_like(risky),
+        can_buy=torch.ones_like(risky, dtype=torch.bool),
+        can_sell=torch.ones_like(risky, dtype=torch.bool),
+        can_short_open=torch.ones_like(risky, dtype=torch.bool),
+        buy_fees=torch.zeros_like(risky),
+        sell_fees=torch.zeros_like(risky),
+        margin_rates=torch.full_like(risky, 0.9),
+        short_handling_rates=torch.zeros_like(risky),
+        long_margin_debt=torch.tensor([0.3]),
+        long_margin_repayment_exempt=repayment_exempt,
+        short_sale_collateral=torch.zeros_like(risky),
+        short_margin_collateral=torch.zeros_like(risky),
+        cash=torch.tensor(0.8),
+        payables=torch.zeros(2),
+        receivables=torch.zeros(2),
+        pending_net_claim=torch.zeros(()),
+        remaining_volume=None,
+        remaining_turnover=None,
+        remaining_short_capacity=None,
+        event_nav=torch.ones(()),
+        gross_budget=1.0,
+        maintenance_ratio=torch.tensor(1.3),
+        alive=torch.ones((), dtype=torch.bool),
+        advance=torch.ones((), dtype=torch.bool),
+    )
+
+    torch.testing.assert_close(result.risky, torch.zeros_like(risky))
+    torch.testing.assert_close(
+        result.long_margin_debt,
+        torch.zeros_like(risky),
+    )
+    # The 0.5 sale repays 0.3 principal, leaving a 0.2 T+2 claim.  Clearing
+    # only the debt would incorrectly create 0.3 of NAV.
+    torch.testing.assert_close(result.pending_net_claim, torch.tensor(0.2))
+
+
+def test_material_orphaned_margin_debt_still_fails_closed() -> None:
+    rows = 1
+    masks = torch.ones((rows, 2, 1), dtype=torch.bool)
+    with pytest.raises(
+        ValueError,
+        match="requires matching positive long inventory",
+    ):
+        run_tw_cash_dual_session(
+            torch.zeros((rows, 2, 1)),
+            torch.zeros((rows, 1)),
+            torch.zeros((rows, 1)),
+            masks,
+            masks,
+            masks,
+            0.0,
+            0.0,
+            can_short_open_mask=masks,
+            short_margin_rate=0.9,
+            short_capacity_weights=torch.full((rows, 1), float("inf")),
+            unresolved_corporate_action_mask=torch.zeros_like(masks),
+            day_trade_carry_normal_sell_fee_rates=0.0,
+            day_trade_margin_financing_ratio=0.6,
+            initial_weights=torch.zeros(1),
+            initial_cash=torch.tensor(1.0 + 1.0e-4),
+            initial_long_margin_debt=torch.tensor([1.0e-4]),
+        )
 
 
 def test_margin_debt_history_never_outlives_physical_long_inventory() -> None:

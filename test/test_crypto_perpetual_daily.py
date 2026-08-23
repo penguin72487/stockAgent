@@ -56,6 +56,8 @@ from repair_bybit_1m_gaps import (  # noqa: E402
 )
 from scripts.build_bybit_crypto_public_daily_features import (  # noqa: E402
     _binance_daily,
+    _ensure_output_feature_schema,
+    _okx_base_map,
     _bybit_funding_features,
     _okx_daily,
     _resolve_okx_mapping,
@@ -831,6 +833,38 @@ def test_okx_mapping_handles_only_explicit_contract_denomination_prefixes() -> N
         "exact_base_coin",
     )
     assert _resolve_okx_mapping("2Z", mapping) == (None, None)
+
+
+def test_okx_base_map_accepts_legacy_symbol_receipt(tmp_path: Path) -> None:
+    pl.DataFrame(
+        {
+            "code": ["BTCUSDTSWAP"],
+            "okx_symbol": ["BTC-USDT-SWAP"],
+            "settle_ccy": ["USDT"],
+            "ct_type": ["linear"],
+            "state": ["live"],
+        }
+    ).write_csv(tmp_path / "symbols.csv")
+    (tmp_path / "BTCUSDTSWAP_features.parquet").touch()
+
+    assert _okx_base_map(tmp_path) == {"BTC": "BTCUSDTSWAP"}
+
+
+def test_public_feature_schema_retains_missing_optional_families() -> None:
+    output = _ensure_output_feature_schema(
+        pl.DataFrame(
+            {
+                "date": ["2024-01-02"],
+                "symbol": ["BTCUSDT"],
+                "crypto_bybit_funding_available": [1.0],
+            }
+        )
+    )
+
+    assert "crypto_binance_core_available" in output.columns
+    assert "crypto_okx_available" in output.columns
+    assert "crypto_public_macro_available_fraction" in output.columns
+    assert output[0, "crypto_binance_core_available"] is None
 
 
 def test_fred_macro_uses_only_values_available_before_midnight(tmp_path: Path) -> None:

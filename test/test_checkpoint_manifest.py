@@ -1407,6 +1407,9 @@ def test_schema_v4_added_inactive_external_and_projection_fields_remain_compatib
             "preprocessing": preprocessing,
         }
     )
+    historical["fingerprints"]["data"] = trainer_module._stable_fingerprint(
+        historical["contracts"]["data"]
+    )
     historical["fingerprints"]["model"] = trainer_module._stable_fingerprint(
         historical["contracts"]["model"]
     )
@@ -1416,6 +1419,12 @@ def test_schema_v4_added_inactive_external_and_projection_fields_remain_compatib
         current,
         checkpoint_path=tmp_path / "schema_v4_before_inactive_fields.pt",
         scope="model",
+    )
+    _validate_checkpoint_manifest(
+        {"experiment_manifest": historical},
+        current,
+        checkpoint_path=tmp_path / "schema_v4_before_inactive_fields.pt",
+        scope="resume",
     )
 
     external_enabled = copy.deepcopy(config)

@@ -39,6 +39,7 @@ from stockagent.backtest.tw_continuous import (
 )
 from stockagent.backtest.tw_dual_session import (
     TaiwanDualSessionResult,
+    _POSITION_TOLERANCE,
     _as_daily_nonnegative,
     _as_phase_mask,
     _as_phase_rate,
@@ -691,8 +692,8 @@ def _prepare_inputs(
                 "initial_long_margin_debt must be finite and non-negative"
             )
     orphaned_long_margin_debt = (
-        (long_margin_debt > 1.0e-10)
-        & (risky <= 1.0e-10)
+        (long_margin_debt > _POSITION_TOLERANCE)
+        & (risky <= _POSITION_TOLERANCE)
     )
     if bool(orphaned_long_margin_debt.any().item()):
         orphaned_indices = torch.nonzero(
@@ -710,7 +711,7 @@ def _prepare_inputs(
             f"{risky.index_select(0, sample_indices).detach().cpu().tolist()}"
         )
     if not has_day_trade_carry and bool(
-        (long_margin_debt > 1.0e-10).any().item()
+        (long_margin_debt > _POSITION_TOLERANCE).any().item()
     ):
         raise ValueError(
             "initial_long_margin_debt is valid only for day-trade carry"

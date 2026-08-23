@@ -230,3 +230,5 @@ artifacts_benchmark/*
 .build/
 data_tw_futures/*
 data_fred_crypto_macro/*
+data_bybit_daily_training_20260823/*
+data_bybit_daily_synced
