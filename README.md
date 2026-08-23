@@ -64,8 +64,9 @@ canonical 可讀資料
   重用，所以增量發布只產生並傳送真正改變的物件。
 - `use` 只有在 manifest、inventory、pack/blob 與 materialized 檔案驗證成功後才切換
   symlink。熱工作集是快取，不是第二份權威資料。
-- 七日回收使用明確 lease，不依賴不可靠的 `atime`。GC 遇到 pin、執行中程序、缺少
-  cold object 或 READY proof 不符時會拒絕刪除。
+- 七日回收使用明確 lease，不依賴不可靠的 `atime`。每五分鐘的 GC monitor 會透過
+  `/proc` 偵測 fd、mmap、cwd 等程序引用並自動從當下續租；遇到 pin、缺少 cold object
+  或 READY proof 不符時也會拒絕刪除。
 
 不同資料層不可混用：
 
@@ -167,7 +168,7 @@ sudo install -d -m 0755 /srv/stockagent-packed-materialized
 sudo ./scripts/install_data_cache_gc_service.sh
 ```
 
-安裝器會建立 `/usr/local/bin/stockagent-data`。有 systemd 時安裝每日 timer；沒有
+安裝器會建立 `/usr/local/bin/stockagent-data`。有 systemd 時安裝每五分鐘 timer；沒有
 systemd 的 container 會安裝 `/etc/cron.d/stockagent-data-cache-gc` fallback。
 
 Vast container 不建立假的 `syncthing@root.service`，使用平台 supervisor：
@@ -324,9 +325,14 @@ stockagent-data gc --dry-run
 stockagent-data gc
 ```
 
-正常 GC 只處理 lease 到期的版本。每一個候選仍須同時滿足：cold release 可完整重建、
-READY proof 相符、沒有 pin，而且 `/proc` 中沒有程序的 fd、mmap、cwd、root 或 executable
-指向該 tree。冷庫 `/srv/stockagent-packed` 不會被這個命令刪除。
+GC 每次都檢查 managed hot lease。若 `/proc` 顯示程序的 fd、mmap、cwd、root 或
+executable 指向資料樹，就把 `last_used_at` 更新為當下，並依原 lease TTL 自動延長；沒有
+程序引用時才處理已到期版本。刪除候選仍須 cold release 可完整重建、READY proof 相符且
+沒有 pin。冷庫 `/srv/stockagent-packed` 不會被這個命令刪除。
+
+這個偵測不掃描每個資料檔，也不使用可能被 `noatime/relatime` 關閉或延遲的 access time。
+每五分鐘取樣適合長時間訓練、mmap 與持續讀取；短於取樣間隔的單次工具仍應先執行
+`stockagent-data use DATASET`，該命令會立即續租。
 
 ### `evict`：立即要求回收一個熱快取
 

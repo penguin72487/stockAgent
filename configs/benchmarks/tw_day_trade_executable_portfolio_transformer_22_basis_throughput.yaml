@@ -1,0 +1,22 @@
+base_config: ../markets/tw_day_trade_daily_executable_portfolio_transformer_22_basis_tplus2_close_capital10m.yaml
+
+# Production-path throughput benchmark.  Batch size is supplied by the CLI;
+# the long patience guarantees enough zero-new-graph epochs for a steady-state
+# comparison without changing the model, objective, data, or executor.
+experiment_name: benchmark-tw-day-trade-executable-portfolio-transformer-22-basis-causal-stateful-carry-throughput
+
+runner:
+  output_dir: artifacts/benchmarks/executable_portfolio_transformer_22_basis_causal_stateful_carry_v4_throughput
+  resume: false
+  post_train_infer: false
+  isolate_train_folds: true
+
+training:
+  epochs: 4
+  early_stopping_no_improve_ratio: 1.0
+  record_epoch_curve: true
+  curve_plot_interval: 1
+  curve_test_interval: 1
+  curve_plot_async: true
+  epoch_test_curve: true
+  defer_epoch_curve_plot_until_end: false

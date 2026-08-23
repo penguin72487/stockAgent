@@ -179,6 +179,7 @@ STOCKAGENT_SYNC_NODE_ID=penguin \
 ```text
 COLD_ONLY -- use/完整驗證 --> HOT -- 7 天未續租 --> COLD_ONLY
                        \-- 再次 use：O(1) ready proof + 續租
+                       \-- 程序引用：GC monitor 自動從當下續租
 ```
 
 查看每個資料集的冷庫大小、解封狀態、版本與到期時間：
@@ -223,15 +224,20 @@ printf 'training data: %s\n' "$data_path"
 ./scripts/run_data_cache.sh evict tw-public --dry-run
 ```
 
+每五分鐘的 GC monitor 會先掃描 `/proc`。若程序的 fd、mmap、cwd、root 或 executable
+仍指向 managed materialized tree，就依該 lease 原本的 TTL 從當下自動延長；不遍歷
+資料樹，也不依賴 `noatime/relatime` 下不可靠的 access time。短於五分鐘的單次讀取仍應
+先執行 `use`，讓 lease 立即續期。
+
 自動清理只會刪除同時符合以下條件的 materialized tree：
 
 - 租約超過七天；
 - packed manifest 與全部 cold objects 仍在本機；
 - materialization READY proof 與 manifest 相符；
 - 沒有 `.pin.json` 保護；
-- `/proc` 中沒有程序的 fd、mmap、cwd、root 或 executable 指向該 tree。
+- `/proc` 中沒有程序引用；若有，改為續租而不是刪除。
 
-安裝每日 timer；有 systemd 時安裝 timer，vast.ai container 則安裝 cron fallback：
+安裝每五分鐘 monitor；有 systemd 時安裝 timer，vast.ai container 則安裝 cron fallback：
 
 ```bash
 sudo ./scripts/install_data_cache_gc_service.sh

@@ -12,11 +12,37 @@ from stockagent.backtest.tw_dual_session import (
     run_tw_overnight_dual_session,
 )
 from stockagent.backtest.tw_dual_session_compiled import (
+    _has_effective_short_capacity_limit,
     clear_tw_dual_session_compile_cache,
     get_tw_dual_session_compile_stats,
     run_tw_cash_dual_session_compiled,
     run_tw_overnight_dual_session_compiled,
 )
+
+
+def test_unbounded_short_capacity_specializes_only_exact_no_op() -> None:
+    unbounded = torch.full((3, 2), float("inf"))
+    assert not _has_effective_short_capacity_limit(
+        unbounded,
+        was_explicit=True,
+    )
+    assert not _has_effective_short_capacity_limit(
+        torch.zeros_like(unbounded),
+        was_explicit=False,
+    )
+
+    finite = unbounded.clone()
+    finite[1, 0] = 0.25
+    assert _has_effective_short_capacity_limit(
+        finite,
+        was_explicit=True,
+    )
+
+    differentiable = unbounded.clone().requires_grad_(True)
+    assert _has_effective_short_capacity_limit(
+        differentiable,
+        was_explicit=True,
+    )
 
 
 def _case(
@@ -282,6 +308,9 @@ def test_fixed_block_and_eager_tail_match_and_preserve_gradient(
         "compiled_day_calls": 32,
         "eager_tail_calls": 1,
         "eager_fallback_calls": 0,
+        "cuda_graph_constructors": 0,
+        "cuda_graph_calls": 0,
+        "cuda_graph_fallback_calls": 0,
     }
 
     torch._dynamo.reset()
@@ -387,6 +416,134 @@ def test_compiled_finds_global_producer_first_cover_and_matches_gradient() -> No
     assert stats["compiled_block_calls"] == 1
     assert stats["compiled_day_calls"] == 32
     assert stats["eager_fallback_calls"] == 0
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="autograd-aware whole-horizon CUDA Graph contract",
+)
+def test_whole_horizon_cuda_graph_matches_regional_outputs_and_gradients(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("STOCKAGENT_TW_DUAL_SESSION_CUDA_GRAPH", "1")
+    clear_tw_dual_session_compile_cache()
+    get_tw_dual_session_compile_stats(reset=True)
+
+    eager_kwargs = _case(
+        mode="tw_cash",
+        rows=32,
+        symbols=5,
+        device="cuda",
+        requires_grad=True,
+    )
+    eager = run_tw_cash_dual_session(
+        **eager_kwargs,
+        return_weights_history=False,
+    )
+    eager_objective = (
+        eager.strategy_returns.sum()
+        + 0.03 * eager.turnovers.sum()
+        + 0.01 * eager.final_weights.square().sum()
+    )
+    eager_objective.backward()
+    eager_gradient = eager_kwargs["actions"].grad.detach().clone()
+
+    graph_kwargs = _case(
+        mode="tw_cash",
+        rows=32,
+        symbols=5,
+        device="cuda",
+        requires_grad=True,
+    )
+    # Production enters this call through the trainer's BF16 autocast context,
+    # whose default weight cache is intentionally enabled.
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        graphed = run_tw_cash_dual_session_compiled(
+            **graph_kwargs,
+            return_weights_history=False,
+            strict_compile=True,
+        )
+    _assert_result_close(graphed, eager)
+    graph_objective = (
+        graphed.strategy_returns.sum()
+        + 0.03 * graphed.turnovers.sum()
+        + 0.01 * graphed.final_weights.square().sum()
+    )
+    graph_objective.backward()
+    torch.testing.assert_close(
+        graph_kwargs["actions"].grad,
+        eager_gradient,
+        rtol=3.0e-5,
+        atol=3.0e-6,
+    )
+
+    # A second action surface must reuse the capture while copying new values
+    # into its static input buffers.  This catches accidental binding to the
+    # first batch's addresses or values.
+    second_kwargs = _case(
+        mode="tw_cash",
+        rows=32,
+        symbols=5,
+        device="cuda",
+        requires_grad=True,
+    )
+    second_actions = (
+        second_kwargs["actions"].detach().clone() * 0.91
+    ).requires_grad_(True)
+    second_kwargs["actions"] = second_actions
+    state_fields = (
+        ("initial_weights", "final_weights"),
+        ("initial_cash", "final_cash"),
+        ("initial_payables", "final_payables"),
+        ("initial_receivables", "final_receivables"),
+        ("initial_alive", "final_alive"),
+        ("initial_equity_scale", "final_equity_scale"),
+        ("initial_short_sale_collateral", "final_short_sale_collateral"),
+        ("initial_short_margin_collateral", "final_short_margin_collateral"),
+        ("initial_long_margin_debt", "final_long_margin_debt"),
+        (
+            "initial_commission_rebate_current",
+            "final_commission_rebate_current",
+        ),
+        ("initial_commission_rebate_due", "final_commission_rebate_due"),
+        (
+            "initial_commission_rebate_month_id",
+            "final_commission_rebate_month_id",
+        ),
+    )
+    for initial_name, final_name in state_fields:
+        second_kwargs[initial_name] = getattr(graphed, final_name).detach().clone()
+    second_eager_actions = second_actions.detach().clone().requires_grad_(True)
+    second_eager_kwargs = dict(second_kwargs)
+    second_eager_kwargs["actions"] = second_eager_actions
+    for initial_name, final_name in state_fields:
+        second_eager_kwargs[initial_name] = (
+            getattr(eager, final_name).detach().clone()
+        )
+    second_eager = run_tw_cash_dual_session(
+        **second_eager_kwargs,
+        return_weights_history=False,
+    )
+    second_eager.strategy_returns.sum().backward()
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        second_graph = run_tw_cash_dual_session_compiled(
+            **second_kwargs,
+            return_weights_history=False,
+            strict_compile=True,
+        )
+    _assert_result_close(second_graph, second_eager)
+    second_graph.strategy_returns.sum().backward()
+    torch.testing.assert_close(
+        second_actions.grad,
+        second_eager_actions.grad,
+        rtol=3.0e-5,
+        atol=3.0e-6,
+    )
+
+    stats = get_tw_dual_session_compile_stats()
+    assert stats["cuda_graph_constructors"] == 1
+    assert stats["cuda_graph_calls"] == 2
+    assert stats["cuda_graph_fallback_calls"] == 0
     clear_tw_dual_session_compile_cache()
 
 
@@ -629,9 +786,7 @@ def test_canonical_dispatcher_uses_fixed_block_without_fallback(
         sell_fee_rates=torch.full((5,), 0.004425, device="cuda"),
         day_trade_can_buy_open_mask=phase_mask[:, 0],
         day_trade_can_sell_open_mask=phase_mask[:, 0],
-        unresolved_corporate_action_mask=torch.zeros_like(
-            phase_mask[:, 1]
-        ),
+        unresolved_corporate_action_mask=torch.zeros_like(phase_mask[:, 1]),
         overnight_returns=overnight,
         return_weights_history=False,
     )
@@ -646,4 +801,83 @@ def test_canonical_dispatcher_uses_fixed_block_without_fallback(
     assert stats["eager_fallback_calls"] == 0
     assert actions.grad is not None
     assert torch.isfinite(actions.grad).all()
+    clear_tw_dual_session_compile_cache()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="CUDA day-trade carry debt parity",
+)
+def test_compiled_day_trade_carry_matches_margin_debt_and_gradient() -> None:
+    def carry_case(*, requires_grad: bool) -> dict[str, object]:
+        rows, symbols = 32, 3
+        actions = torch.zeros((rows, 2, symbols), device="cuda")
+        actions[:, 0, 0] = 0.55
+        actions[:, 0, 1] = 0.20
+        actions.requires_grad_(requires_grad)
+        returns = torch.zeros((rows, symbols), device="cuda")
+        phase_mask = torch.ones(
+            (rows, 2, symbols), device="cuda", dtype=torch.bool
+        )
+        phase_sell = phase_mask.clone()
+        phase_sell[:, 1] = False
+        return {
+            "actions": actions,
+            "overnight_log_returns": returns,
+            "intraday_log_returns": returns,
+            "tradable_mask": phase_mask,
+            "can_buy_mask": phase_mask,
+            "can_sell_mask": phase_sell,
+            "buy_fee_rates": 0.000285,
+            "sell_fee_rates": 0.001785,
+            "can_short_open_mask": phase_mask,
+            "short_margin_rate": 0.9,
+            "short_capacity_weights": torch.full(
+                (rows, symbols), float("inf"), device="cuda"
+            ),
+            "day_trade_carry_normal_sell_fee_rates": 0.003285,
+            "day_trade_margin_financing_ratio": 0.6,
+            "day_trade_margin_financing_annual_rate": 0.06,
+            "unresolved_corporate_action_mask": torch.zeros_like(phase_mask),
+        }
+
+    eager_kwargs = carry_case(requires_grad=True)
+    eager = run_tw_cash_dual_session(
+        **eager_kwargs,
+        return_weights_history=True,
+    )
+    eager_objective = (
+        eager.strategy_returns.sum()
+        + 0.01 * eager.final_weights.square().sum()
+        + 0.01 * eager.final_long_margin_debt.square().sum()
+    )
+    eager_objective.backward()
+    eager_grad = torch.as_tensor(eager_kwargs["actions"]).grad.detach().clone()
+
+    compiled_kwargs = carry_case(requires_grad=True)
+    clear_tw_dual_session_compile_cache()
+    get_tw_dual_session_compile_stats(reset=True)
+    compiled = run_tw_cash_dual_session_compiled(
+        **compiled_kwargs,
+        return_weights_history=True,
+        strict_compile=True,
+    )
+    compiled_objective = (
+        compiled.strategy_returns.sum()
+        + 0.01 * compiled.final_weights.square().sum()
+        + 0.01 * compiled.final_long_margin_debt.square().sum()
+    )
+    compiled_objective.backward()
+
+    _assert_result_close(compiled, eager)
+    torch.testing.assert_close(
+        torch.as_tensor(compiled_kwargs["actions"]).grad,
+        eager_grad,
+        rtol=3.0e-5,
+        atol=3.0e-6,
+    )
+    assert compiled.final_long_margin_debt.sum() > 0.0
+    stats = get_tw_dual_session_compile_stats()
+    assert stats["compiled_block_calls"] == 1
+    assert stats["eager_fallback_calls"] == 0
     clear_tw_dual_session_compile_cache()

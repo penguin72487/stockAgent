@@ -1,0 +1,125 @@
+# Complete Fold-11 systems OFAT for the V5 extreme-throughput executor.
+# Strategy/model/data semantics and all curve artifacts remain fixed.
+base_config: configs/markets/tw_day_trade_daily_executable_portfolio_transformer_22_basis_tplus2_close_capital10m_v5_extreme.yaml
+output_root: artifacts/ablations/executable_portfolio_transformer_v5_extreme_fold11_v1
+expected_fold_count: 12
+
+pinned_panel_cache:
+  snapshot_id: tw-public-20260820T015018219623218Z-l0-penguin-6716296ea30636ba
+  variant_id: c8b02a7a891549c4108c0307a8db47cdc34f17e9b17aa75afbdd79089c1748ac
+  version: 51
+  generation: 67458178ae924a0188d98841e9b17229
+  source_hash: 31f3e4f1e31338bb9c0fd52494cc0d840a5081ffeab00a1fceddfa3412258fe0
+
+runtime:
+  parallel_jobs: 1
+  cpu_threads: 112
+  torch_compile_threads: 16
+
+matrix:
+  mode: one_factor_at_a_time
+  include_baseline: true
+
+  base_overrides:
+    runner:
+      resume: true
+      post_train_infer: false
+    training:
+      epochs: 3
+      early_stopping_no_improve_ratio: 0.0
+      batch_size_train: 128
+      batch_size_eval: 16
+      auto_batch_size: false
+      distributed_symbol_sharded_ledger: false
+      distributed_replicated_ledger_local_metadata: true
+      tw_dual_session_cuda_graph: true
+      strict_no_fallback: true
+
+  fixed_overrides:
+    training:
+      record_epoch_curve: true
+      curve_plot_interval: 1
+      curve_test_interval: 1
+      curve_plot_async: true
+      epoch_test_curve: true
+      defer_epoch_curve_plot_until_end: false
+      debug_timing_sync: false
+
+  dimensions:
+  - name: whole_horizon_cuda_graph
+    enabled: true
+    path: training.tw_dual_session_cuda_graph
+    baseline: true
+    values:
+    - name: disabled
+      experiment_name: regional_replay
+      value: false
+      description: Historical V5 Python replay of the same compiled one-day region.
+
+  - name: execution_metadata_source
+    enabled: true
+    path: training.distributed_replicated_ledger_local_metadata
+    baseline: true
+    values:
+    - name: nccl_collectives
+      experiment_name: metadata_collectives
+      value: false
+      description: AllGather deterministic execution tensors instead of local panel slicing.
+
+  - name: ledger_layout
+    enabled: true
+    path: training.distributed_symbol_sharded_ledger
+    baseline: false
+    values:
+    - name: symbol_sharded
+      experiment_name: symbol_sharded_ledger
+      value: true
+      description: V6 symbol split with recurrent cross-GPU collectives.
+      overrides:
+        training:
+          distributed_replicated_ledger_local_metadata: false
+          tw_dual_session_cuda_graph: false
+
+  - name: model_compilation
+    enabled: true
+    variants:
+    - name: eager
+      experiment_name: eager_model
+      description: Disable only train/eval model torch.compile.
+      overrides:
+        training:
+          enable_torch_compile: false
+          compile_eval_model: false
+
+  - name: ledger_compilation
+    enabled: true
+    variants:
+    - name: eager
+      experiment_name: eager_ledger
+      description: Disable compiled regional ledger and therefore CUDA Graph capture.
+      overrides:
+        training:
+          tw_dual_session_cuda_graph: false
+          backtest_compile: false
+          backtest_compile_stateful: false
+          eval_backtest_compile: false
+
+  - name: global_batch
+    enabled: true
+    path: training.batch_size_train
+    baseline: 128
+    values:
+    - name: batch64
+      experiment_name: batch64
+      value: 64
+      description: Power-of-two global batch 64 and local model batch 32 per rank.
+
+  - name: gpu_panel_cache
+    enabled: true
+    variants:
+    - name: disabled
+      experiment_name: host_panel
+      description: Host-resident panel counterfactual for transfer-cost attribution.
+      overrides:
+        training:
+          cache_train_tensors_on_gpu: false

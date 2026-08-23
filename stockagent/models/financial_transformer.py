@@ -216,11 +216,13 @@ class TemporalBasisInputFeatureBuilder(nn.Module):
         components_by_family: Mapping[str, int] | None = None,
         novelty_threshold: float = DEFAULT_TEMPORAL_BASIS_NOVELTY_THRESHOLD,
         basis_overrides: Mapping[str, torch.Tensor] | None = None,
+        algebraic_contraction: bool = False,
     ) -> None:
         super().__init__()
         self.lookback = int(lookback)
         self.source_dim = int(source_dim)
         self.sanitize_inputs = bool(sanitize_inputs)
+        self.algebraic_contraction = bool(algebraic_contraction)
         self.family_names = _normalize_temporal_basis_families(families)
         if not self.family_names:
             raise ValueError(
@@ -317,6 +319,103 @@ class TemporalBasisInputFeatureBuilder(nn.Module):
             )
         return prepared, basis_source
 
+    def _combined_basis(self, source: torch.Tensor) -> torch.Tensor:
+        """Return all enabled basis rows in their checkpoint column order."""
+
+        return torch.cat(
+            [self._basis(family, source) for family in self.family_names],
+            dim=0,
+        )
+
+    def _forward_algebraic_no_aux(
+        self,
+        *,
+        basis_source: torch.Tensor,
+        base: torch.Tensor,
+        candle_encoder: CandleEncoder,
+        norm_weight: torch.Tensor,
+    ) -> torch.Tensor:
+        """Contract the wide basis map through its rank-``lookback`` axis.
+
+        The ordinary wide formulation first builds ``K`` coefficients for
+        every source feature and then applies the learned projection.  Both
+        operations are linear, so their exact real-valued contraction is::
+
+            W[o,k,f] (B[k,l] x[b,l,s,f])
+              == (W[o,k,f] B[k,l]) x[b,l,s,f]
+
+        The RMS denominator has the matching quadratic contraction
+        ``||B x||^2 == x' (B' B) x``.  This keeps every basis row and every
+        learned wide-projection parameter, including gradients through the
+        learned basis, while making production cost depend on lookback rather
+        than on the much larger total component count.  Explainability keeps
+        the explicit family path because it owns the coefficient tensors.
+        """
+
+        norm = candle_encoder.input_norm
+        if not isinstance(norm, PortfolioRMSNorm):
+            raise RuntimeError(
+                "algebraic temporal-basis contraction requires rmsnorm"
+            )
+        projection = candle_encoder.joint_projection.proj
+        base_width = candle_encoder.base_joint_input_dim
+        source_dim = self.source_dim
+        components = self.total_basis_components
+
+        base_weighted = base * norm_weight[:base_width]
+        linear_sum = F.linear(
+            base_weighted,
+            projection.weight[:, :base_width],
+            None,
+        )
+
+        combined_basis = self._combined_basis(basis_source)
+        feature_weight = norm_weight[base_width:].reshape(
+            components,
+            source_dim,
+        )
+        projection_weight = projection.weight[:, base_width:].reshape(
+            projection.out_features,
+            components,
+            source_dim,
+        )
+        # [O,K,F] -> [O,F,K] @ [K,L] -> [O,L,F].  F.linear then uses a
+        # tensor-core-friendly [B*S,L*F] x [O,L*F] contraction instead of
+        # materializing or retaining [B,K,S,F] coefficients.
+        temporal_kernel = torch.matmul(
+            (projection_weight * feature_weight.unsqueeze(0)).permute(0, 2, 1),
+            combined_basis,
+        ).permute(0, 2, 1)
+        source_by_symbol = basis_source.permute(0, 2, 1, 3).flatten(start_dim=2)
+        linear_sum = linear_sum + F.linear(
+            source_by_symbol,
+            temporal_kernel.flatten(start_dim=1),
+            None,
+        )
+
+        # Compute all basis coefficient energy without constructing the K
+        # coefficient rows.  Keeping the final reduction in FP32 matches the
+        # numerical contract used by the explicit path's RMS accumulation.
+        basis_gram = combined_basis.transpose(0, 1).matmul(combined_basis)
+        source_by_feature = basis_source.permute(0, 2, 3, 1)
+        basis_squared_sum = (
+            F.linear(source_by_feature, basis_gram) * source_by_feature
+        ).float().sum(dim=(2, 3))
+        squared_sum = (
+            base.float().square().sum(dim=-1)
+            + basis_squared_sum.clamp_min(0.0)
+        )
+
+        inverse_rms = torch.rsqrt(
+            squared_sum / float(candle_encoder.joint_input_dim) + norm.eps
+        ).to(dtype=linear_sum.dtype)
+        projected = linear_sum * inverse_rms.unsqueeze(-1)
+        if projection.bias is not None:
+            projected = projected + projection.bias
+        return candle_encoder._finish_embedding(
+            candle_encoder._activate_projected(projected)
+        )
+
     def forward(
         self,
         raw_window: torch.Tensor,
@@ -351,6 +450,17 @@ class TemporalBasisInputFeatureBuilder(nn.Module):
         norm = candle_encoder.input_norm
         projection = candle_encoder.joint_projection.proj
         norm_weight = norm.weight.to(device=base.device, dtype=base.dtype)
+
+        if not collect_aux and self.algebraic_contraction:
+            return (
+                self._forward_algebraic_no_aux(
+                    basis_source=basis_source,
+                    base=base,
+                    candle_encoder=candle_encoder,
+                    norm_weight=norm_weight,
+                ),
+                {},
+            )
 
         base_weighted = base * norm_weight[: candle_encoder.base_joint_input_dim]
         linear_sum = F.linear(
@@ -562,6 +672,7 @@ class FinancialTransformerModel(TransformerBasePortfolioModel):
         self,
         *args,
         candle_dropout: float = 0.0,
+        temporal_basis_algebraic_contraction: bool = False,
         daily_context_num_features: int = 0,
         daily_context_categorical_feature_indices: Sequence[int] | None = None,
         daily_context_lookback: int = 1,
@@ -582,6 +693,7 @@ class FinancialTransformerModel(TransformerBasePortfolioModel):
                 novelty_threshold=self.temporal_basis_novelty_threshold,
                 sanitize_inputs=self.sanitize_inputs,
                 basis_overrides=self.temporal_basis_overrides,
+                algebraic_contraction=temporal_basis_algebraic_contraction,
             )
             if (
                 self.temporal_basis_families

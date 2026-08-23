@@ -1,0 +1,232 @@
+# Formal investment-performance OFAT for the fastest V5 executor.
+#
+# Every row keeps the same immutable data, execution rules, canonical net-log
+# utility, T+2/margin ledger, BF16/DDP runtime, batch size, 1000 epochs, and
+# 12-fold walk-forward ownership.  Only one model factor changes at a time.
+# This is intentionally separate from the Fold-11 systems-throughput suite.
+base_config: configs/markets/tw_day_trade_daily_executable_portfolio_transformer_22_basis_tplus2_close_capital10m_v5_extreme.yaml
+output_root: artifacts/ablations/executable_portfolio_transformer_v5_model_performance_ofat_v1
+expected_fold_count: 12
+
+pinned_panel_cache:
+  snapshot_id: tw-public-20260820T015018219623218Z-l0-penguin-6716296ea30636ba
+  variant_id: c8b02a7a891549c4108c0307a8db47cdc34f17e9b17aa75afbdd79089c1748ac
+  version: 51
+  generation: 67458178ae924a0188d98841e9b17229
+  source_hash: 31f3e4f1e31338bb9c0fd52494cc0d840a5081ffeab00a1fceddfa3412258fe0
+
+runtime:
+  parallel_jobs: 1
+  cpu_threads: 112
+  torch_compile_threads: 16
+
+matrix:
+  mode: one_factor_at_a_time
+  include_baseline: true
+
+  fixed_overrides:
+    runner:
+      resume: true
+      post_train_infer: false
+    training:
+      epochs: 1000
+      batch_size_train: 128
+      batch_size_eval: 16
+      auto_batch_size: false
+      distributed_symbol_sharded_ledger: false
+      distributed_replicated_ledger_local_metadata: true
+      tw_dual_session_cuda_graph: true
+      strict_no_fallback: true
+      record_epoch_curve: true
+      curve_plot_interval: 1
+      curve_test_interval: 1
+      curve_plot_async: true
+      epoch_test_curve: true
+      defer_epoch_curve_plot_until_end: false
+
+  dimensions:
+  - name: learned_execution_context
+    enabled: true
+    path: training.executable_portfolio_transformer.use_execution_context_features
+    baseline: true
+    values:
+    - name: disabled
+      experiment_name: no_learned_execution_context
+      value: false
+      description: Remove learned context conditioning while retaining causal context validation and exact legal direction gates.
+
+  - name: execution_context_width
+    enabled: true
+    path: training.executable_portfolio_transformer.execution_context_hidden_dim
+    baseline: 32
+    values:
+    - name: width16
+      experiment_name: execution_context_width16
+      value: 16
+    - name: width64
+      experiment_name: execution_context_width64
+      value: 64
+
+  - name: information_bottleneck
+    enabled: true
+    baseline: factor_and_market
+    variants:
+    - name: latent_only
+      experiment_name: latent_only
+      overrides:
+        training:
+          executable_portfolio_transformer:
+            use_latent_factors: true
+            use_market_tokens: false
+    - name: market_only
+      experiment_name: market_only
+      overrides:
+        training:
+          executable_portfolio_transformer:
+            use_latent_factors: false
+            use_market_tokens: true
+    - name: temporal_only
+      experiment_name: temporal_only
+      overrides:
+        training:
+          executable_portfolio_transformer:
+            use_latent_factors: false
+            use_market_tokens: false
+
+  - name: latent_factor_count
+    enabled: true
+    path: training.executable_portfolio_transformer.num_latent_factors
+    baseline: 16
+    values:
+    - name: factors8
+      experiment_name: latent_factors8
+      value: 8
+
+  - name: market_token_count
+    enabled: true
+    path: training.executable_portfolio_transformer.num_market_tokens
+    baseline: 16
+    values:
+    - name: tokens8
+      experiment_name: market_tokens8
+      value: 8
+
+  - name: temporal_rope
+    enabled: true
+    path: training.executable_portfolio_transformer.rope_temporal
+    baseline: true
+    values:
+    - name: disabled
+      experiment_name: no_rope_temporal
+      value: false
+
+  - name: learned_time_position
+    enabled: true
+    path: training.executable_portfolio_transformer.use_time_pos
+    baseline: false
+    values:
+    - name: enabled
+      experiment_name: with_time_position
+      value: true
+
+  - name: learned_symbol_position
+    enabled: true
+    baseline: false
+    variants:
+    - name: enabled
+      experiment_name: with_symbol_position
+      overrides:
+        training:
+          executable_portfolio_transformer:
+            use_symbol_pos: true
+            symbol_position_capacity: 4096
+
+  - name: qk_normalization
+    enabled: true
+    path: training.executable_portfolio_transformer.qk_norm
+    baseline: true
+    values:
+    - name: disabled
+      experiment_name: no_qk_norm
+      value: false
+
+  - name: temporal_pooling
+    enabled: true
+    baseline: attention
+    variants:
+    - name: last
+      experiment_name: last_pooling
+      overrides:
+        training:
+          executable_portfolio_transformer:
+            temporal_pooling: last
+            temporal_query_mode: last_only
+
+  - name: normalization
+    enabled: true
+    baseline: rmsnorm
+    variants:
+    - name: layernorm
+      experiment_name: layernorm
+      overrides:
+        training:
+          executable_portfolio_transformer:
+            norm_type: layernorm
+            temporal_basis_input: raw_features
+
+  - name: feed_forward
+    enabled: true
+    path: training.executable_portfolio_transformer.ffn_type
+    baseline: swiglu
+    values:
+    - name: gelu
+      experiment_name: gelu_ffn
+      value: gelu
+
+  - name: residual_dropout
+    enabled: true
+    path: training.executable_portfolio_transformer.dropout
+    baseline: 0.0
+    values:
+    - name: dropout01
+      experiment_name: dropout01
+      value: 0.1
+
+  - name: input_dropout
+    enabled: true
+    path: training.executable_portfolio_transformer.input_dropout
+    baseline: 0.0
+    values:
+    - name: input_dropout01
+      experiment_name: input_dropout01
+      value: 0.1
+
+  - name: temporal_depth
+    enabled: true
+    path: training.executable_portfolio_transformer.temporal_layers
+    baseline: 2
+    values:
+    - name: one_layer
+      experiment_name: temporal_layers1
+      value: 1
+
+  - name: temporal_basis_bank
+    enabled: true
+    baseline: all_22_effective_rank
+    variants:
+    - name: disabled
+      experiment_name: no_temporal_basis
+      overrides:
+        training:
+          executable_portfolio_transformer:
+            temporal_basis_families: []
+            temporal_basis_components_by_family: {}
+    - name: learned_only
+      experiment_name: learned_basis_only
+      overrides:
+        training:
+          executable_portfolio_transformer:
+            temporal_basis_families: [learned]
+            temporal_basis_components: 31
+            temporal_basis_components_by_family:
+              learned: 31

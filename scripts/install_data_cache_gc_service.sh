@@ -43,7 +43,7 @@ escaped_command="${repo_root}/scripts/run_data_cache.sh gc"
 printf '%s\n' \
   'SHELL=/bin/bash' \
   'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' \
-  "20 4 * * * root ${escaped_command} >>/var/log/stockagent-data-cache-gc.log 2>&1" \
+  "*/5 * * * * root ${escaped_command} >>/var/log/stockagent-data-cache-gc.log 2>&1" \
   >"$temporary_dir/stockagent-data-cache-gc.cron"
 install -m 0644 "$temporary_dir/stockagent-data-cache-gc.cron" "$cron_path"
 printf 'Installed cron fallback: %s\n' "$cron_path"

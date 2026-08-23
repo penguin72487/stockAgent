@@ -346,6 +346,7 @@ def test_daily_no_default_stitched_replay_uses_same_fractional_tplus3_forward(
     )
     config = _day_trade_config()
     config.trading.tw_day_trade_unlimited_margin_conversion = True
+    config.trading.tw_short_capacity_limit_enabled = False
     # This contract deliberately has no whole-lot rounding.  A 1,000-share
     # audit with only TWD 100 would be identically flat and is not allowed to
     # replace the canonical differentiable daily loss during stitched replay.
@@ -377,11 +378,26 @@ def test_daily_no_default_stitched_replay_uses_same_fractional_tplus3_forward(
     )
     np.testing.assert_allclose(
         stitched.receivables_history,
-        np.asarray([[0.0, 0.10], [0.10, 0.0], [0.0, 0.0]]),
+        np.asarray(
+            [
+                [0.0, 1.0 / 11.0],
+                [1.0 / 11.0, 0.0],
+                [0.0, 0.0],
+            ]
+        ),
         atol=1.0e-7,
     )
-    np.testing.assert_allclose(stitched.cash_history, [1.0, 1.0, 1.10])
-    assert np.count_nonzero(stitched.weights_history) == 2
+    # The public ledger is normalized by current NAV while equity_scale keeps
+    # the absolute 10% gain.  Both positions closed successfully, so recurrent
+    # close holdings are flat and the OPEN audit retains the two executions.
+    np.testing.assert_allclose(
+        stitched.cash_history,
+        [10.0 / 11.0, 10.0 / 11.0, 1.0],
+        atol=1.0e-7,
+    )
+    np.testing.assert_allclose(stitched.final_equity_scale, 1.10)
+    assert np.count_nonzero(stitched.weights_history) == 0
+    assert np.count_nonzero(stitched.open_weights_history) == 2
 
 
 def test_futures_portfolio_stitched_replay_uses_fixed_fee_side_channel(

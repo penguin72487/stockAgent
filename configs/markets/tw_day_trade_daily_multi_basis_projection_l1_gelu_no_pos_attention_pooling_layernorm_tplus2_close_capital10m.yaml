@@ -14,6 +14,14 @@ trading:
   volume_participation_equity: 10000000.0
 
 training:
+  transformer_base_portfolio:
+    use_time_pos: false
+    use_symbol_pos: false
+    ffn_type: gelu
+    temporal_pooling: attention
+    temporal_query_mode: full_then_last
+    norm_type: layernorm
+    temporal_basis_input: raw_features
   financial_transformer:
     # "No learned position" disables both learned positional tables. Temporal
     # RoPE remains inherited because it is a separate ablation dimension.
@@ -28,4 +36,3 @@ training:
     # The input_features temporal basis path requires RMSNorm. LayerNorm must
     # therefore use the same raw-feature basis input as the valid OFAT run.
     temporal_basis_input: raw_features
-

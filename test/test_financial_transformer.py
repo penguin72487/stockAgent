@@ -226,6 +226,7 @@ def test_basis_coefficients_are_ordinary_candle_input_features() -> None:
         temporal_basis_families=("haar", "learned"),
         temporal_basis_components=2,
         temporal_basis_input="input_features",
+        temporal_basis_algebraic_contraction=True,
         return_aux=False,
         return_aux_details=False,
     ).eval()
@@ -240,6 +241,11 @@ def test_basis_coefficients_are_ordinary_candle_input_features() -> None:
     assert model.supports_embedded_explainability_reuse() is False
 
     with torch.no_grad():
+        production, production_aux = encoder(
+            raw_window,
+            candle,
+            collect_aux=False,
+        )
         fused, aux = encoder(raw_window, candle, collect_aux=True)
         source, basis_source = encoder._prepare_source(raw_window, candle)
         base = candle._base_joint_features(source[:, -1])
@@ -257,6 +263,8 @@ def test_basis_coefficients_are_ordinary_candle_input_features() -> None:
         )
 
     torch.testing.assert_close(fused, explicit, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(production, explicit, rtol=1e-5, atol=1e-6)
+    assert production_aux == {}
     torch.testing.assert_close(
         aux["temporal_basis_input_features"],
         explicit_features,
@@ -394,6 +402,68 @@ def test_ordinary_basis_input_features_backpropagate_through_shared_projection()
     assert projection_grad[:, 10:].abs().sum().item() > 0.0
     assert learned_grad is not None and torch.isfinite(learned_grad).all()
     assert learned_grad.abs().sum().item() > 0.0
+
+
+def test_algebraic_basis_hotpath_matches_explicit_gradients() -> None:
+    device = _device()
+    fast_model = _make_model(
+        lookback=8,
+        temporal_basis_families=("haar", "dct", "learned"),
+        temporal_basis_components=3,
+        temporal_basis_input="input_features",
+        temporal_basis_algebraic_contraction=True,
+        return_aux=False,
+        return_aux_details=False,
+    ).train()
+    reference_model = _make_model(
+        lookback=8,
+        temporal_basis_families=("haar", "dct", "learned"),
+        temporal_basis_components=3,
+        temporal_basis_input="input_features",
+        return_aux=False,
+        return_aux_details=False,
+    ).train()
+    reference_model.load_state_dict(fast_model.state_dict())
+    fast_input = torch.randn(
+        2, 8, 7, 10, device=device, requires_grad=True
+    )
+    reference_input = fast_input.detach().clone().requires_grad_(True)
+    fast_builder = fast_model.temporal_basis_input_feature_builder
+    reference_builder = reference_model.temporal_basis_input_feature_builder
+    assert fast_builder is not None and reference_builder is not None
+
+    fast, _ = fast_builder(
+        fast_input,
+        fast_model.candle_encoder,
+        collect_aux=False,
+    )
+    reference, _ = reference_builder(
+        reference_input,
+        reference_model.candle_encoder,
+        collect_aux=True,
+    )
+    fast.square().mean().backward()
+    reference.square().mean().backward()
+
+    torch.testing.assert_close(fast, reference, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(
+        fast_input.grad,
+        reference_input.grad,
+        rtol=2e-4,
+        atol=2e-6,
+    )
+    torch.testing.assert_close(
+        fast_builder.learned_basis.grad,
+        reference_builder.learned_basis.grad,
+        rtol=2e-4,
+        atol=2e-6,
+    )
+    torch.testing.assert_close(
+        fast_model.candle_encoder.joint_projection.proj.weight.grad,
+        reference_model.candle_encoder.joint_projection.proj.weight.grad,
+        rtol=2e-4,
+        atol=2e-6,
+    )
 
 
 def test_ordinary_basis_input_panel_paths_match_materialized_windows() -> None:

@@ -4,6 +4,7 @@ import json
 import time
 from pathlib import Path
 
+from stockagent.data_sync import materialized_cache as materialized_cache_module
 from stockagent.data_sync.materialized_cache import (
     evict_materialized_snapshots,
     materialized_cache_status,
@@ -106,6 +107,164 @@ def test_expired_gc_removes_only_hot_copy_and_can_refetch(tmp_path: Path) -> Non
         sync_root, hot_root, "prices", now_ns=BASE_NS + 19 * DAY_NS
     )
     assert Path(renewed["target"]).is_dir()
+
+
+def test_gc_auto_renews_a_hot_lease_referenced_by_a_process(
+    tmp_path: Path, monkeypatch
+) -> None:
+    sync_root, snapshot_id = _release(tmp_path)
+    hot_root = tmp_path / "hot"
+    original = use_materialized_snapshot(
+        sync_root,
+        hot_root,
+        "prices",
+        ttl_days=7,
+        now_ns=BASE_NS + 10 * DAY_NS,
+    )
+    evidence = ["pid=123:fd=7:/hot/prices/prices.csv"]
+    monkeypatch.setattr(
+        materialized_cache_module,
+        "process_references",
+        lambda target: evidence,
+    )
+
+    result = evict_materialized_snapshots(
+        sync_root, hot_root, now_ns=BASE_NS + 12 * DAY_NS
+    )
+
+    assert result["renewed"] == 1
+    assert result["evicted"] == 0
+    assert result["results"][0]["reason"] == "in-use-auto-renewed"
+    lease_path = (
+        hot_root
+        / ".cache-state"
+        / "leases"
+        / "prices"
+        / f"{snapshot_id}.json"
+    )
+    renewed = json.loads(lease_path.read_text(encoding="utf-8"))
+    assert renewed["last_used_ns"] == BASE_NS + 12 * DAY_NS
+    assert renewed["expires_ns"] == BASE_NS + 19 * DAY_NS
+    assert renewed["expires_ns"] > original["expires_ns"]
+    assert renewed["auto_renewal_count"] == 1
+    assert renewed["auto_renewal_evidence"] == evidence
+
+
+def test_gc_auto_renew_dry_run_does_not_mutate_the_lease(
+    tmp_path: Path, monkeypatch
+) -> None:
+    sync_root, snapshot_id = _release(tmp_path)
+    hot_root = tmp_path / "hot"
+    original = use_materialized_snapshot(
+        sync_root,
+        hot_root,
+        "prices",
+        ttl_days=7,
+        now_ns=BASE_NS + 10 * DAY_NS,
+    )
+    monkeypatch.setattr(
+        materialized_cache_module,
+        "process_references",
+        lambda target: ["pid=123:maps:/hot/prices"],
+    )
+
+    result = evict_materialized_snapshots(
+        sync_root,
+        hot_root,
+        dry_run=True,
+        now_ns=BASE_NS + 18 * DAY_NS,
+    )
+
+    assert result["would_renew"] == 1
+    assert result["would_evict"] == 0
+    lease_path = (
+        hot_root
+        / ".cache-state"
+        / "leases"
+        / "prices"
+        / f"{snapshot_id}.json"
+    )
+    unchanged = json.loads(lease_path.read_text(encoding="utf-8"))
+    assert unchanged["expires_ns"] == original["expires_ns"]
+    assert "auto_renewed_ns" not in unchanged
+
+
+def test_forced_evict_keeps_but_does_not_renew_an_in_use_tree(
+    tmp_path: Path, monkeypatch
+) -> None:
+    sync_root, snapshot_id = _release(tmp_path)
+    hot_root = tmp_path / "hot"
+    original = use_materialized_snapshot(
+        sync_root,
+        hot_root,
+        "prices",
+        ttl_days=7,
+        now_ns=BASE_NS + 10 * DAY_NS,
+    )
+    monkeypatch.setattr(
+        materialized_cache_module,
+        "process_references",
+        lambda target: ["pid=123:fd=7:/hot/prices/prices.csv"],
+    )
+
+    result = evict_materialized_snapshots(
+        sync_root,
+        hot_root,
+        dataset="prices",
+        force=True,
+        now_ns=BASE_NS + 18 * DAY_NS,
+    )
+
+    assert result["renewed"] == 0
+    assert result["kept"] == 1
+    assert result["results"][0]["reason"] == "in-use"
+    lease_path = (
+        hot_root
+        / ".cache-state"
+        / "leases"
+        / "prices"
+        / f"{snapshot_id}.json"
+    )
+    unchanged = json.loads(lease_path.read_text(encoding="utf-8"))
+    assert unchanged["expires_ns"] == original["expires_ns"]
+
+
+def test_gc_keeps_an_in_use_tree_with_an_invalid_ttl(
+    tmp_path: Path, monkeypatch
+) -> None:
+    sync_root, snapshot_id = _release(tmp_path)
+    hot_root = tmp_path / "hot"
+    use_materialized_snapshot(
+        sync_root,
+        hot_root,
+        "prices",
+        ttl_days=7,
+        now_ns=BASE_NS + 10 * DAY_NS,
+    )
+    lease_path = (
+        hot_root
+        / ".cache-state"
+        / "leases"
+        / "prices"
+        / f"{snapshot_id}.json"
+    )
+    lease = json.loads(lease_path.read_text(encoding="utf-8"))
+    lease["ttl_days"] = "nan"
+    lease_path.write_text(json.dumps(lease), encoding="utf-8")
+    monkeypatch.setattr(
+        materialized_cache_module,
+        "process_references",
+        lambda target: ["pid=123:fd=7:/hot/prices/prices.csv"],
+    )
+
+    result = evict_materialized_snapshots(
+        sync_root, hot_root, now_ns=BASE_NS + 18 * DAY_NS
+    )
+
+    assert result["renewed"] == 0
+    assert result["kept"] == 1
+    assert result["results"][0]["reason"] == "in-use-invalid-lease-ttl"
+    assert Path(lease["target"]).is_dir()
 
 
 def test_pin_blocks_expired_gc(tmp_path: Path) -> None:
