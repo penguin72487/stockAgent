@@ -1,0 +1,37 @@
+base_config: tw_day_trade_daily_multi_basis_22_effective_rank_projection_l1_no_time_attention_pooling_tplus2_close_capital10m.yaml
+
+# Frozen compatibility config for the pre-algebraic run.  Keep this file for
+# loading or resuming its existing checkpoints; new training uses the v2 config.
+experiment_name: tw-day-trade-daily-executable-portfolio-transformer-22-basis-tplus2-close-commission20-capital10m-v1
+
+runner:
+  output_dir: artifacts/markets/tw_day_trade_daily_executable_portfolio_transformer_22_basis_tplus2_close_commission20_capital10m_v1
+  resume: true
+  post_train_infer: false
+
+trading:
+  long_only: false
+  min_trade_weight: 0.0
+  max_turnover_ratio: 0.0
+  portfolio_activation: pre_normalized
+
+training:
+  model_name: executable_portfolio_transformer
+  loss_type: log_utility
+  loss_portfolio_activation: pre_normalized
+
+  executable_portfolio_transformer:
+    portfolio_mode: long_short
+    portfolio_output_mode: projection_l1
+    center_long_short_logits: false
+    projection_l1_scale_by_active_count: true
+    execution_context_hidden_dim: 32
+    temporal_basis_algebraic_contraction: false
+
+  multitask_loss:
+    rank_ic_weight: 0.0
+    return_rank_ic_weight: 0.0
+    direction_weight: 0.0
+    volatility_regime_weight: 0.0
+    concentration_weight: 0.0
+    net_exposure_weight: 0.0

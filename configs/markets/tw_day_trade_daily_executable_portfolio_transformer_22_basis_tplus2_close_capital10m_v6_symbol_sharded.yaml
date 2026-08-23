@@ -1,0 +1,27 @@
+base_config: tw_day_trade_daily_executable_portfolio_transformer_22_basis_tplus2_close_capital10m_v5_throughput.yaml
+
+# Fresh distributed-ledger contract.  The policy remains ordinary time-sharded
+# DDP; only the model/executor boundary is transposed to equal symbol shards.
+# PyTorch functional collectives own forward and backward.  No handwritten VJP
+# is part of this architecture.
+experiment_name: tw-day-trade-daily-executable-portfolio-transformer-22-basis-symbol-sharded-ledger-v6
+
+runner:
+  output_dir: artifacts/markets/tw_day_trade_daily_executable_portfolio_transformer_22_basis_causal_stateful_carry_commission20_capital10m_v6_symbol_sharded
+  resume: false
+
+training:
+  distributed_symbol_sharded_ledger: true
+
+  # Both the global optimizer batch and evaluation chunk are powers of two.
+  batch_size_train: 128
+  batch_size_eval: 16
+  auto_batch_size: false
+
+  # Keep the full observability contract unchanged.
+  record_epoch_curve: true
+  curve_plot_interval: 1
+  curve_test_interval: 1
+  curve_plot_async: true
+  epoch_test_curve: true
+  defer_epoch_curve_plot_until_end: false

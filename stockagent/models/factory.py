@@ -18,6 +18,9 @@ from stockagent.models.cross_sectional_index_derivatives_day import (
 from stockagent.models.efficient_tcn_tabular_set_portfolio import EfficientTCNTabularSetPortfolioModel
 from stockagent.models.ft_transformer import CrossSectionalFTTransformer
 from stockagent.models.financial_transformer import FinancialTransformerModel
+from stockagent.models.executable_portfolio_transformer import (
+    ExecutablePortfolioTransformerModel,
+)
 from stockagent.models.gradient_boosted_portfolio_transformer import GradientBoostedPortfolioTransformer
 from stockagent.models.latent_factor_market_token_portfolio import LatentFactorMarketTokenPortfolioModel
 from stockagent.models.low_rank_market_transformer_portfolio import LowRankMarketTransformerPortfolioModel
@@ -117,6 +120,12 @@ _FINANCIAL_TRANSFORMER_NAMES = {
     "financial_tokenized_transformer",
 }
 
+_EXECUTABLE_PORTFOLIO_TRANSFORMER_NAMES = {
+    "executable_portfolio_transformer",
+    "executable_portfolio_transformer_model",
+    "execution_aware_portfolio_transformer",
+}
+
 _GRADIENT_BOOSTED_PORTFOLIO_TRANSFORMER_NAMES = {
     "gradient_boosted_portfolio_transformer",
     "gradient_boosted_portfolio_transformer_model",
@@ -151,9 +160,15 @@ def model_hidden_dim_hint(config: ExperimentConfig) -> int:
         return int(config.training.transformer_base_portfolio.d_model)
     if model_name in (
         _FINANCIAL_TRANSFORMER_NAMES
+        | _EXECUTABLE_PORTFOLIO_TRANSFORMER_NAMES
         | _CROSS_SECTIONAL_INDEX_DERIVATIVES_DAY_NAMES
     ):
-        return int(config.training.financial_transformer.d_model)
+        model_config = (
+            config.training.executable_portfolio_transformer
+            if model_name in _EXECUTABLE_PORTFOLIO_TRANSFORMER_NAMES
+            else config.training.financial_transformer
+        )
+        return int(model_config.d_model)
     if model_name in _GRADIENT_BOOSTED_PORTFOLIO_TRANSFORMER_NAMES:
         return int(config.training.gradient_boosted_portfolio_transformer.d_model)
     if model_name in _BOTTLENECK_PORTFOLIO_AUTOENCODER_NAMES:
@@ -469,17 +484,24 @@ def build_model(
 
     if model_name in (
         _FINANCIAL_TRANSFORMER_NAMES
+        | _EXECUTABLE_PORTFOLIO_TRANSFORMER_NAMES
         | _CROSS_SECTIONAL_INDEX_DERIVATIVES_DAY_NAMES
     ):
-        fin_cfg = config.training.financial_transformer
+        executable_policy = model_name in _EXECUTABLE_PORTFOLIO_TRANSFORMER_NAMES
+        fin_cfg = (
+            config.training.executable_portfolio_transformer
+            if executable_policy
+            else config.training.financial_transformer
+        )
         portfolio_mode = str(fin_cfg.portfolio_mode).strip().lower().replace("-", "_")
         if portfolio_mode in {"", "auto"}:
             portfolio_mode = "long_only" if config.trading.long_only else "long_short"
-        model_type = (
-            CrossSectionalIndexDerivativesDayModel
-            if model_name in _CROSS_SECTIONAL_INDEX_DERIVATIVES_DAY_NAMES
-            else FinancialTransformerModel
-        )
+        if model_name in _CROSS_SECTIONAL_INDEX_DERIVATIVES_DAY_NAMES:
+            model_type = CrossSectionalIndexDerivativesDayModel
+        elif executable_policy:
+            model_type = ExecutablePortfolioTransformerModel
+        else:
+            model_type = FinancialTransformerModel
         derivative_kwargs = (
             {
                 "maximum_capital_fraction": getattr(
@@ -510,6 +532,30 @@ def build_model(
                 ),
             }
             if model_name in _CROSS_SECTIONAL_INDEX_DERIVATIVES_DAY_NAMES
+            else {}
+        )
+        executable_kwargs = (
+            {
+                "use_execution_context_features": (
+                    fin_cfg.use_execution_context_features
+                ),
+                "execution_context_hidden_dim": (
+                    fin_cfg.execution_context_hidden_dim
+                ),
+                "execution_context_schema_version": (
+                    fin_cfg.execution_context_schema_version
+                ),
+                "max_volume_participation": (
+                    config.trading.max_volume_participation
+                ),
+                "volume_participation_equity": (
+                    config.trading.volume_participation_equity
+                ),
+                "short_capacity_limit_enabled": (
+                    config.trading.tw_short_capacity_limit_enabled
+                ),
+            }
+            if executable_policy
             else {}
         )
         return model_type(
@@ -584,6 +630,9 @@ def build_model(
             categorical_embedding_dim=fin_cfg.categorical_embedding_dim,
             categorical_embedding_cardinality=fin_cfg.categorical_embedding_cardinality,
             candle_dropout=fin_cfg.candle_dropout,
+            temporal_basis_algebraic_contraction=(
+                fin_cfg.temporal_basis_algebraic_contraction
+            ),
             daily_context_num_features=len(daily_context_feature_names or ()),
             daily_context_categorical_feature_indices=(
                 _feature_indices_from_patterns(
@@ -596,6 +645,7 @@ def build_model(
             daily_context_pooling=fin_cfg.daily_context_pooling,
             execution_mode=getattr(config.trading, "execution_mode", "naive"),
             **derivative_kwargs,
+            **executable_kwargs,
         )
 
     if model_name in _GRADIENT_BOOSTED_PORTFOLIO_TRANSFORMER_NAMES:
@@ -769,7 +819,8 @@ def build_model(
         "Supported values: mlp, ft_transformer, tabular_resnet, multi_stock_tcn, "
         "efficient_tcn_tabular_set_portfolio, tcn_hybrid_tabular_resnet, "
         "latent_factor_market_token_portfolio, low_rank_market_transformer_portfolio, "
-        "transformer_base_portfolio, financial_transformer, gradient_boosted_portfolio_transformer, "
+        "transformer_base_portfolio, financial_transformer, executable_portfolio_transformer, "
+        "gradient_boosted_portfolio_transformer, "
         "bottleneck_portfolio_autoencoder, temporal_tabular_resnet, "
         "cross_sectional_temporal_portfolio_model, lightgbm, xgboost"
     )

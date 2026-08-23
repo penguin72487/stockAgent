@@ -1,0 +1,31 @@
+base_config: tw_day_trade_daily_executable_portfolio_transformer_22_basis_tplus2_close_capital10m_v5_throughput.yaml
+
+# V5 keeps the full-symbol recurrent ledger replicated on both DDP ranks.  The
+# only changed computation layout is the source of deterministic execution
+# metadata: each rank slices the complete chronological batch from its own
+# identical GPU-resident panel, while NCCL carries only differentiable model
+# actions.  Trading mathematics, information timing, fees, state, and plots are
+# inherited unchanged from V5.
+experiment_name: tw-day-trade-daily-executable-portfolio-transformer-22-basis-v5-local-metadata
+
+runner:
+  # A communication-layout change is a fresh reproducibility contract.  Never
+  # resume the V5 optimizer trajectory into this root.
+  output_dir: artifacts/markets/tw_day_trade_daily_executable_portfolio_transformer_22_basis_causal_stateful_carry_commission20_capital10m_v5_local_metadata_batch128
+  resume: true
+  post_train_infer: false
+
+training:
+  batch_size_train: 128
+  batch_size_eval: 16
+  auto_batch_size: false
+  distributed_symbol_sharded_ledger: false
+  distributed_replicated_ledger_local_metadata: true
+
+  # Full observability remains part of the experiment contract.
+  record_epoch_curve: true
+  curve_plot_interval: 1
+  curve_test_interval: 1
+  curve_plot_async: true
+  epoch_test_curve: true
+  defer_epoch_curve_plot_until_end: false

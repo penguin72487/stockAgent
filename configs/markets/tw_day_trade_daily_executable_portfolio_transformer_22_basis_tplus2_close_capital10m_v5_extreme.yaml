@@ -1,0 +1,35 @@
+base_config: tw_day_trade_daily_executable_portfolio_transformer_22_basis_tplus2_close_capital10m_v5_local_metadata.yaml
+
+# V5 extreme-throughput layout.  The canonical one-day transition remains one
+# fullgraph Inductor region and the same eager ledger remains its semantic
+# oracle.  CUDA Graph records the fixed 128-day sequence of those already-
+# compiled kernels, so replay removes Python/kernel-launch overhead without
+# creating a pathological 128-day FX/codegen graph.
+experiment_name: tw-day-trade-daily-executable-portfolio-transformer-22-basis-v5-extreme
+
+runner:
+  output_dir: artifacts/markets/tw_day_trade_daily_executable_portfolio_transformer_22_basis_causal_stateful_carry_commission20_capital10m_v5_extreme_batch128
+  # This is a fresh runtime/checkpoint contract.  Resume applies only to
+  # interrupted runs created under this exact config and artifact root.
+  resume: true
+  post_train_infer: false
+
+training:
+  batch_size_train: 128
+  batch_size_eval: 16
+  auto_batch_size: false
+  distributed_symbol_sharded_ledger: false
+  distributed_replicated_ledger_local_metadata: true
+  tw_dual_session_cuda_graph: true
+
+  # Correctness and observability are not throughput ablations.
+  backtest_compile: true
+  backtest_compile_stateful: true
+  backtest_compile_dynamic: false
+  strict_no_fallback: true
+  record_epoch_curve: true
+  curve_plot_interval: 1
+  curve_test_interval: 1
+  curve_plot_async: true
+  epoch_test_curve: true
+  defer_epoch_curve_plot_until_end: false

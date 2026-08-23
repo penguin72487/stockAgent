@@ -139,6 +139,20 @@ def _configure_backtest_runtime_from_config(config: ExperimentConfig) -> None:
     os.environ["STOCKAGENT_BACKTEST_COMPILE_STATEFUL"] = (
         "1" if bool(training.backtest_compile_stateful) else "0"
     )
+    os.environ["STOCKAGENT_TW_DUAL_SESSION_CUDA_GRAPH"] = (
+        "1" if bool(training.tw_dual_session_cuda_graph) else "0"
+    )
+    os.environ["STOCKAGENT_SYMBOL_SHARDED_PACK_METADATA"] = (
+        "1" if bool(training.distributed_symbol_sharded_pack_metadata) else "0"
+    )
+    os.environ["STOCKAGENT_SYMBOL_SHARDED_PACK_SCALARS"] = (
+        "1" if bool(training.distributed_symbol_sharded_pack_scalars) else "0"
+    )
+    os.environ["STOCKAGENT_SYMBOL_SHARDED_SKIP_NOOP_COLLECTIVES"] = (
+        "1"
+        if bool(training.distributed_symbol_sharded_skip_noop_collectives)
+        else "0"
+    )
     os.environ["STOCKAGENT_BACKTEST_COMPILE_DYNAMIC"] = (
         "1" if bool(getattr(training, "backtest_compile_dynamic", False)) else "0"
     )

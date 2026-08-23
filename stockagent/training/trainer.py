@@ -80,10 +80,6 @@ from stockagent.backtest.tw_index_futures import (
 )
 from stockagent.backtest.tw_index_derivatives_day import OptionDayCostSchedule
 from stockagent.backtest.tw_continuous import get_tw_continuous_compile_stats
-from stockagent.backtest.tw_day_trade_daily import (
-    compiled_block_rows as tw_day_trade_daily_compiled_block_rows,
-    get_tw_day_trade_daily_compile_stats,
-)
 from stockagent.backtest.tw_day_trade_minute import (
     COMPILED_BLOCK_ROWS as TW_DAY_TRADE_MINUTE_COMPILED_BLOCK_ROWS,
     get_tw_day_trade_minute_compile_stats,
@@ -567,11 +563,381 @@ def _all_gather_autograd(x: torch.Tensor) -> torch.Tensor:
 
 
 def _all_gather_no_grad(x: torch.Tensor) -> torch.Tensor:
-    if _distributed_world_size() <= 1:
+    world_size = _distributed_world_size()
+    if world_size <= 1:
         return x
-    parts = [torch.empty_like(x) for _ in range(_distributed_world_size())]
+    if hasattr(dist, "all_gather_into_tensor") and x.dim() > 0:
+        # DDP training uses equal fixed-shape shards.  Gather directly into the
+        # final dim-0-concatenated buffer instead of allocating one buffer per
+        # rank and launching a second device-side cat for every execution
+        # tensor.  Values and global rank ordering are identical.
+        gathered = torch.empty(
+            (world_size * int(x.size(0)), *tuple(x.shape[1:])),
+            device=x.device,
+            dtype=x.dtype,
+        )
+        dist.all_gather_into_tensor(gathered, x)
+        return gathered
+    parts = [torch.empty_like(x) for _ in range(world_size)]
     dist.all_gather(parts, x)
     return torch.cat(parts, dim=0)
+
+
+def _time_to_symbol_all_to_all_autograd(x: torch.Tensor) -> torch.Tensor:
+    """Transpose equal DDP time shards into equal contiguous symbol shards.
+
+    Input rank ``r`` owns ``[b, ..., S]`` for one contiguous time range.  The
+    returned rank ``r`` owns ``[G*b, ..., S/G]`` for one contiguous symbol
+    range and every time row.  Backward is provided by PyTorch's functional
+    collective; this executor intentionally has no custom autograd Function.
+    """
+
+    world_size = _distributed_world_size()
+    if world_size <= 1:
+        return x
+    if x.dim() < 2:
+        raise ValueError("time-to-symbol All-to-All requires shape [time,...,symbol]")
+    symbols = int(x.size(-1))
+    local_rows = int(x.size(0))
+    if symbols % world_size != 0:
+        raise ValueError(
+            "symbol count must be divisible by world_size for equal symbol shards; "
+            f"symbols={symbols}, world_size={world_size}"
+        )
+    if dist_fc is None or not hasattr(dist_fc, "all_to_all_single_autograd"):
+        raise RuntimeError(
+            "this PyTorch build lacks functional autograd All-to-All required "
+            "by distributed_symbol_sharded_ledger"
+        )
+    send = torch.cat(tuple(x.chunk(world_size, dim=-1)), dim=0).contiguous()
+    split_rows = [local_rows] * world_size
+    routed = dist_fc.all_to_all_single_autograd(
+        send,
+        split_rows,
+        split_rows,
+        dist.group.WORLD,
+    )
+    if hasattr(dist_fc, "wait_tensor"):
+        routed = dist_fc.wait_tensor(routed)
+    return routed
+
+
+def _time_to_symbol_all_to_all_no_grad(x: torch.Tensor) -> torch.Tensor:
+    """Non-autograd twin of :func:`_time_to_symbol_all_to_all_autograd`."""
+
+    world_size = _distributed_world_size()
+    if world_size <= 1:
+        return x
+    if x.dim() < 2:
+        raise ValueError("time-to-symbol All-to-All requires shape [time,...,symbol]")
+    symbols = int(x.size(-1))
+    local_rows = int(x.size(0))
+    if symbols % world_size != 0:
+        raise ValueError(
+            "symbol count must be divisible by world_size for equal symbol shards; "
+            f"symbols={symbols}, world_size={world_size}"
+        )
+    send = torch.cat(tuple(x.chunk(world_size, dim=-1)), dim=0).contiguous()
+    output = torch.empty_like(send)
+    split_rows = [local_rows] * world_size
+    dist.all_to_all_single(
+        output,
+        send,
+        output_split_sizes=split_rows,
+        input_split_sizes=split_rows,
+    )
+    return output
+
+
+def _time_to_symbol_all_to_all_no_grad_many(
+    tensors: Sequence[torch.Tensor],
+) -> tuple[torch.Tensor, ...]:
+    """Pack same-dtype execution tensors into one time-to-symbol collective."""
+
+    values = tuple(tensors)
+    if not values:
+        return ()
+    reference = values[0]
+    if reference.dim() < 2:
+        raise ValueError("packed time-to-symbol inputs require a symbol axis")
+    rows = int(reference.size(0))
+    symbols = int(reference.size(-1))
+    widths: list[int] = []
+    shapes: list[tuple[int, ...]] = []
+    flattened: list[torch.Tensor] = []
+    for value in values:
+        if (
+            int(value.size(0)) != rows
+            or int(value.size(-1)) != symbols
+            or value.dtype != reference.dtype
+            or value.device != reference.device
+        ):
+            raise ValueError(
+                "packed time-to-symbol tensors must share time, symbol, dtype, and device"
+            )
+        middle_shape = tuple(int(item) for item in value.shape[1:-1])
+        width = math.prod(middle_shape) if middle_shape else 1
+        widths.append(width)
+        shapes.append(middle_shape)
+        flattened.append(value.reshape(rows, width, symbols))
+    packed = torch.cat(flattened, dim=1).contiguous()
+    routed = _time_to_symbol_all_to_all_no_grad(packed)
+    local_symbols = int(routed.size(-1))
+    outputs: list[torch.Tensor] = []
+    offset = 0
+    for width, middle_shape in zip(widths, shapes, strict=True):
+        outputs.append(
+            routed[:, offset : offset + width].reshape(
+                int(routed.size(0)),
+                *middle_shape,
+                local_symbols,
+            )
+        )
+        offset += width
+    return tuple(outputs)
+
+
+def _symbol_sharded_pack_metadata_enabled() -> bool:
+    """Return the process-local metadata-coalescing ablation switch."""
+
+    return os.environ.get("STOCKAGENT_SYMBOL_SHARDED_PACK_METADATA", "1") != "0"
+
+
+def _route_ddp_batch_to_symbol_shards(
+    local_weights: torch.Tensor,
+    batch: Mapping[str, torch.Tensor],
+    *,
+    include_volume_notional: bool,
+    include_short_capacity_notional: bool,
+) -> dict[str, torch.Tensor | None]:
+    """Route one fixed-shape DDP time batch to the recurrent ledger layout.
+
+    Tensor packing bounds the transpose to one collective per metadata dtype,
+    plus the autograd action collective. Account-wide time-only fields remain
+    replicated through packed All-Gather operations.
+    """
+
+    world_size = _distributed_world_size()
+    rank = _distributed_rank()
+    if world_size <= 1:
+        raise RuntimeError("symbol-sharded routing requires world_size greater than one")
+    global_symbols = int(local_weights.size(-1))
+    if global_symbols % world_size != 0:
+        raise RuntimeError(
+            "symbol-sharded routing requires an equal symbol partition; "
+            f"symbols={global_symbols}, world_size={world_size}"
+        )
+
+    routed: dict[str, torch.Tensor | None] = {
+        "weights": _time_to_symbol_all_to_all_autograd(local_weights.contiguous())
+    }
+    symbol_keys = [
+        "future_log_returns",
+        "overnight_log_returns",
+        "tradable_mask",
+        "can_buy_mask",
+        "can_sell_mask",
+        "can_short_open_mask",
+        "force_short_cover_mask",
+        "force_exit_mask",
+        "day_trade_eligible_mask",
+        "day_trade_can_buy_open_mask",
+        "day_trade_can_sell_open_mask",
+        "can_short_open_open_mask",
+        "unresolved_corporate_action_mask",
+        "cash_dividend_yield",
+        "cash_dividend_payment_delay_sessions",
+    ]
+    if include_volume_notional:
+        symbol_keys.append("volume_notional")
+    if include_short_capacity_notional:
+        symbol_keys.append("short_capacity_notional")
+    if "short_margin_rate" in batch:
+        symbol_keys.append("short_margin_rate")
+
+    present = [(key, batch[key].contiguous()) for key in symbol_keys if key in batch]
+    dtype_groups: dict[torch.dtype, list[tuple[str, torch.Tensor]]] = {}
+    for key, value in present:
+        dtype_groups.setdefault(value.dtype, []).append((key, value))
+    for dtype, items in dtype_groups.items():
+        route_values = tuple(value for _, value in items)
+        restore_bool = dtype == torch.bool
+        if restore_bool:
+            route_values = tuple(value.to(dtype=torch.uint8) for value in route_values)
+        outputs = (
+            _time_to_symbol_all_to_all_no_grad_many(route_values)
+            if _symbol_sharded_pack_metadata_enabled()
+            else tuple(
+                _time_to_symbol_all_to_all_no_grad_many((value,))[0]
+                for value in route_values
+            )
+        )
+        for (key, _), output in zip(items, outputs, strict=True):
+            routed[key] = output.to(dtype=torch.bool) if restore_bool else output
+
+    time_keys = [
+        "sample_mask",
+        "session_advance_mask",
+        "session_month_ids",
+        "commission_rebate_payment_eligible_mask",
+        "benchmark",
+    ]
+    time_groups: dict[torch.dtype, list[tuple[str, torch.Tensor]]] = {}
+    for key in time_keys:
+        value = batch[key].contiguous()
+        time_groups.setdefault(value.dtype, []).append((key, value))
+    for dtype, items in time_groups.items():
+        restore_bool = dtype == torch.bool
+        columns = tuple(
+            (value.to(dtype=torch.uint8) if restore_bool else value).reshape(
+                int(value.size(0)), -1
+            )
+            for _, value in items
+        )
+        widths = [int(value.size(1)) for value in columns]
+        if _symbol_sharded_pack_metadata_enabled():
+            gathered = _all_gather_no_grad(torch.cat(columns, dim=1).contiguous())
+            offset = 0
+            for (key, original), width in zip(items, widths, strict=True):
+                value = gathered[:, offset : offset + width].reshape(
+                    _distributed_world_size() * int(original.size(0)),
+                    *tuple(int(item) for item in original.shape[1:]),
+                )
+                routed[key] = value.to(dtype=torch.bool) if restore_bool else value
+                offset += width
+        else:
+            for (key, original), column in zip(items, columns, strict=True):
+                value = _all_gather_no_grad(column.contiguous()).reshape(
+                    _distributed_world_size() * int(original.size(0)),
+                    *tuple(int(item) for item in original.shape[1:]),
+                )
+                routed[key] = value.to(dtype=torch.bool) if restore_bool else value
+
+    local_symbols = global_symbols // world_size
+    symbol_start = rank * local_symbols
+    symbol_stop = symbol_start + local_symbols
+    source_symbol_indices = batch.get("symbol_indices")
+    if source_symbol_indices is None:
+        routed["symbol_indices"] = torch.arange(
+            symbol_start,
+            symbol_stop,
+            device=local_weights.device,
+            dtype=torch.long,
+        )
+    else:
+        if int(source_symbol_indices.numel()) != global_symbols:
+            raise RuntimeError(
+                "DDP symbol index contract differs from model output: "
+                f"indices={int(source_symbol_indices.numel())}, symbols={global_symbols}"
+            )
+        routed["symbol_indices"] = source_symbol_indices[
+            symbol_start:symbol_stop
+        ].to(device=local_weights.device, dtype=torch.long).contiguous()
+    for optional_key in (
+        "can_short_open_open_mask",
+        "day_trade_eligible_mask",
+        "day_trade_can_buy_open_mask",
+        "day_trade_can_sell_open_mask",
+        "unresolved_corporate_action_mask",
+        "cash_dividend_yield",
+        "cash_dividend_payment_delay_sessions",
+        "volume_notional",
+        "short_capacity_notional",
+        "short_margin_rate",
+    ):
+        routed.setdefault(optional_key, None)
+    return routed
+
+
+def _route_ddp_batch_replicated(
+    local_weights: torch.Tensor,
+    batch: Mapping[str, torch.Tensor],
+    *,
+    include_volume_notional: bool,
+    include_short_capacity_notional: bool,
+    global_metadata: Mapping[str, torch.Tensor] | None = None,
+) -> dict[str, torch.Tensor | None]:
+    """Gather actions while keeping the full-symbol ledger replicated.
+
+    ``global_metadata`` is an exact communication-elision path.  DDP ranks
+    hold identical immutable execution panels, so only model-produced actions
+    need an autograd collective.  Passing the locally sliced global rows avoids
+    retransmitting deterministic returns, masks, capacities, and calendars.
+    ``None`` preserves the historical all-gather oracle.
+    """
+
+    routed: dict[str, torch.Tensor | None] = {
+        "weights": _all_gather_autograd(local_weights.contiguous()),
+    }
+    source = batch if global_metadata is None else global_metadata
+    if global_metadata is not None:
+        expected_rows = int(local_weights.size(0)) * _distributed_world_size()
+        sample_mask = source.get("sample_mask")
+        if sample_mask is None or int(sample_mask.size(0)) != expected_rows:
+            raise RuntimeError(
+                "replicated-ledger local metadata must contain the complete "
+                f"global time batch; expected rows={expected_rows}"
+            )
+    symbol_keys = (
+        "future_log_returns",
+        "overnight_log_returns",
+        "tradable_mask",
+        "can_buy_mask",
+        "can_sell_mask",
+        "can_short_open_mask",
+        "can_short_open_open_mask",
+        "force_short_cover_mask",
+        "force_exit_mask",
+        "day_trade_eligible_mask",
+        "day_trade_can_buy_open_mask",
+        "day_trade_can_sell_open_mask",
+        "unresolved_corporate_action_mask",
+        "cash_dividend_yield",
+        "cash_dividend_payment_delay_sessions",
+        "short_margin_rate",
+    )
+    for key in symbol_keys:
+        value = source.get(key)
+        routed[key] = (
+            None
+            if value is None
+            else value
+            if global_metadata is not None
+            else _all_gather_no_grad(value.contiguous())
+        )
+    for key in (
+        "sample_mask",
+        "session_advance_mask",
+        "session_month_ids",
+        "commission_rebate_payment_eligible_mask",
+        "benchmark",
+    ):
+        value = source[key]
+        routed[key] = (
+            value
+            if global_metadata is not None
+            else _all_gather_no_grad(value.contiguous())
+        )
+    routed["volume_notional"] = (
+        source["volume_notional"]
+        if global_metadata is not None
+        and include_volume_notional
+        and "volume_notional" in source
+        else _all_gather_no_grad(source["volume_notional"].contiguous())
+        if include_volume_notional and "volume_notional" in source
+        else None
+    )
+    routed["short_capacity_notional"] = (
+        source["short_capacity_notional"]
+        if global_metadata is not None
+        and include_short_capacity_notional
+        and "short_capacity_notional" in source
+        else _all_gather_no_grad(source["short_capacity_notional"].contiguous())
+        if include_short_capacity_notional and "short_capacity_notional" in source
+        else None
+    )
+    routed["symbol_indices"] = source.get("symbol_indices")
+    return routed
 
 
 @contextmanager
@@ -652,6 +1018,46 @@ class _ExecutionRuntime:
     derivatives_day_candidates: TaiwanIndexDerivativeDayCandidates | None = None
     option_day_cost_schedule: OptionDayCostSchedule | None = None
     derivatives_maximum_capital_fraction: float = 0.98
+
+
+def _is_stateful_security_carry(
+    execution_mode: str,
+    runtime: _ExecutionRuntime | None,
+) -> bool:
+    mode = normalize_execution_mode(execution_mode)
+    return bool(
+        mode in TW_CARRYING_EXECUTION_MODES
+        or (
+            mode == "tw_day_trade"
+            and runtime is not None
+            and runtime.day_trade_unlimited_margin_conversion
+        )
+    )
+
+
+def _tw_settlement_compile_backend(
+    execution_runtime: _ExecutionRuntime,
+    *,
+    day_trade_minute_compile: bool,
+) -> str:
+    """Return the bounded executor whose compile counters are authoritative.
+
+    Stateful day-trade carry is implemented by the same dual-session ledger as
+    ``tw_cash``/``tw_overnight``. Keeping this selection in one place prevents
+    strict preflight from checking counters for a different executor than the
+    one that actually ran.
+    """
+
+    if day_trade_minute_compile:
+        return "day_trade_minute"
+    if _is_stateful_security_carry(
+        execution_runtime.mode,
+        execution_runtime,
+    ):
+        return "dual_session"
+    if execution_runtime.mode == "tw_index_futures_day":
+        return "index_futures"
+    return "continuous"
 
 
 def _build_execution_runtime(
@@ -751,7 +1157,14 @@ def _build_execution_runtime(
                 config.trading.tw_index_derivatives_day_maximum_capital_fraction
             ),
         )
-    if mode in TW_CARRYING_EXECUTION_MODES and not bool(config.trading.long_only):
+    stateful_security_carry = bool(
+        mode in TW_CARRYING_EXECUTION_MODES
+        or (
+            mode == "tw_day_trade"
+            and config.trading.tw_day_trade_unlimited_margin_conversion
+        )
+    )
+    if stateful_security_carry and not bool(config.trading.long_only):
         if (
             panel.can_short_open_mask is None
             or getattr(panel, "can_short_open_open_mask", None) is None
@@ -770,7 +1183,7 @@ def _build_execution_runtime(
                 "point-in-time demonstrated short capacity"
             )
     corporate_action_mode = str(config.trading.tw_corporate_action_mode)
-    if mode in TW_CARRYING_EXECUTION_MODES:
+    if stateful_security_carry:
         if corporate_action_mode == "avoid":
             execution_action_mask = getattr(
                 panel, "corporate_action_avoidance_mask", None
@@ -795,7 +1208,7 @@ def _build_execution_runtime(
         if corporate_action_mode == "exact"
         else lag
     )
-    if mode in TW_CARRYING_EXECUTION_MODES and corporate_action_mode == "exact":
+    if stateful_security_carry and corporate_action_mode == "exact":
         if (
             panel.cash_dividend_yield is None
             or panel.cash_dividend_payment_delay_sessions is None
@@ -1189,6 +1602,28 @@ def _tensor_day_trade_is_whole_lot_exact(
     )
 
 
+def _run_integer_share_audit_if_supported(
+    runtime: _ExecutionRuntime,
+    **kwargs: Any,
+) -> tuple[BacktestResult | None, list[HoldingsRecord]]:
+    """Run the exact oracle only when it implements the declared state ABI.
+
+    The legacy TW day-trade integer oracle closes every position within the
+    session.  It therefore cannot audit the unlimited-margin research contract,
+    whose residual long/short inventory, financing debt, and segregated short
+    collateral are recurrent state.  Returning no audit is safer than
+    publishing an internally inconsistent result under an ``integer`` label.
+    """
+
+    if (
+        runtime.mode == "tw_day_trade"
+        and runtime.day_trade_unlimited_margin_conversion
+    ):
+        return None, []
+    result, holdings = run_backtest_integer_shares(**kwargs)
+    return result, holdings
+
+
 def _active_panel_execution_rows(
     panel: PanelData,
     date_indices: np.ndarray,
@@ -1437,6 +1872,11 @@ class TimingBreakdown:
     gradient_norm_before_clip_sum: float = 0.0
     gradient_norm_zero_batches: int = 0
     gradient_norm_observations: int = 0
+    gradient_norm_first_zero_batch: int = -1
+    portfolio_first_dead_batch: int = -1
+    portfolio_first_default_row: int = -1
+    portfolio_first_default_reason: int = 0
+    portfolio_final_alive: int = 1
     clip_s: float = 0.0
     clip_cuda_s: float = 0.0
     finite_check_s: float = 0.0
@@ -1525,6 +1965,11 @@ def _broadcast_epoch_eval_timing(
                 "batches",
                 "gradient_norm_zero_batches",
                 "gradient_norm_observations",
+                "gradient_norm_first_zero_batch",
+                "portfolio_first_dead_batch",
+                "portfolio_first_default_row",
+                "portfolio_first_default_reason",
+                "portfolio_final_alive",
             }
             else float(raw),
         )
@@ -2219,7 +2664,10 @@ def _effective_short_margin_rate(
 ) -> torch.Tensor | float | None:
     if (
         execution_runtime is None
-        or execution_runtime.mode not in TW_CARRYING_EXECUTION_MODES
+        or not _is_stateful_security_carry(
+            execution_runtime.mode,
+            execution_runtime,
+        )
     ):
         return None
     floor = float(execution_runtime.short_initial_margin_rate)
@@ -2707,7 +3155,11 @@ def _evaluate_windowed_aux_objective_loss(
                         mask_chunk,
                         return_aux=model_return_aux,
                         symbol_indices=batch.get("symbol_indices"),
-                        portfolio_context=_derivative_portfolio_context(batch),
+                        portfolio_context=_portfolio_context_for_model(
+                            model,
+                            batch,
+                            target_rows=int(mask_chunk.size(0)),
+                        ),
                     )
                 weights_chunk, aux_outputs = _extract_weights_and_aux(model_output)
                 _require_training_aux_outputs(
@@ -3816,6 +4268,7 @@ def _timing_curve_payload(
     timing_synchronized: bool = False,
     backtest_compile_stats: dict[str, int] | None = None,
     backtest_prep_compile_stats: dict[str, int] | None = None,
+    tw_dual_session_compile_stats: dict[str, int] | None = None,
     backtest_runtime_stats: dict[str, float] | None = None,
     train_backtest_runtime_stats: dict[str, float] | None = None,
     loss_runtime_stats: dict[str, float] | None = None,
@@ -3829,6 +4282,7 @@ def _timing_curve_payload(
     test_curve_timing = test_curve_timing or TimingBreakdown()
     backtest_compile_stats = backtest_compile_stats or {}
     backtest_prep_compile_stats = backtest_prep_compile_stats or {}
+    tw_dual_session_compile_stats = tw_dual_session_compile_stats or {}
     backtest_runtime_stats = backtest_runtime_stats or {}
     train_backtest_runtime_stats = train_backtest_runtime_stats or backtest_runtime_stats
     loss_runtime_stats = loss_runtime_stats or {}
@@ -3984,6 +4438,21 @@ def _timing_curve_payload(
             train_timing.gradient_norm_zero_batches
         ),
         "train_grad_norm_observations": gradient_norm_observations,
+        "train_first_zero_grad_batch": int(
+            train_timing.gradient_norm_first_zero_batch
+        ),
+        "train_first_dead_portfolio_batch": int(
+            train_timing.portfolio_first_dead_batch
+        ),
+        "train_first_settlement_default_row": int(
+            train_timing.portfolio_first_default_row
+        ),
+        "train_first_settlement_default_reason": int(
+            train_timing.portfolio_first_default_reason
+        ),
+        "train_portfolio_final_alive": int(
+            train_timing.portfolio_final_alive
+        ),
         "train_clip_ms_per_batch": _avg_ms(train_timing.clip_s),
         "train_clip_cuda_ms_per_batch": _avg_ms(train_timing.clip_cuda_s),
         "train_finite_check_ms_per_batch": _avg_ms(train_timing.finite_check_s),
@@ -4084,6 +4553,27 @@ def _timing_curve_payload(
             backtest_prep_compile_stats.get("misses", 0)
             + backtest_prep_compile_stats.get("failures", 0)
             + backtest_prep_compile_stats.get("disabled", 0)
+        ),
+        "tw_dual_compiled_block_calls": int(
+            tw_dual_session_compile_stats.get("compiled_block_calls", 0)
+        ),
+        "tw_dual_compiled_day_calls": int(
+            tw_dual_session_compile_stats.get("compiled_day_calls", 0)
+        ),
+        "tw_dual_eager_tail_calls": int(
+            tw_dual_session_compile_stats.get("eager_tail_calls", 0)
+        ),
+        "tw_dual_eager_fallback_calls": int(
+            tw_dual_session_compile_stats.get("eager_fallback_calls", 0)
+        ),
+        "tw_dual_cuda_graph_constructors": int(
+            tw_dual_session_compile_stats.get("cuda_graph_constructors", 0)
+        ),
+        "tw_dual_cuda_graph_calls": int(
+            tw_dual_session_compile_stats.get("cuda_graph_calls", 0)
+        ),
+        "tw_dual_cuda_graph_fallback_calls": int(
+            tw_dual_session_compile_stats.get("cuda_graph_fallback_calls", 0)
         ),
         "bt_runtime_calls": int(backtest_runtime_stats.get("calls", 0.0)),
         "bt_runtime_ms_per_call": _bt_avg_ms("total_s"),
@@ -4380,6 +4870,8 @@ def _accumulate_gradient_norm_diagnostic_(
     norm_sum: torch.Tensor,
     zero_count: torch.Tensor,
     observation_count: torch.Tensor,
+    first_zero_batch: torch.Tensor | None = None,
+    batch_index: int | None = None,
 ) -> None:
     """Accumulate pre-clip norm diagnostics without a per-batch GPU sync."""
 
@@ -4392,8 +4884,17 @@ def _accumulate_gradient_norm_diagnostic_(
         neginf=0.0,
     )
     norm_sum.add_(finite_norm)
-    zero_count.add_((finite_norm == 0.0).to(dtype=zero_count.dtype))
+    is_zero = finite_norm == 0.0
+    zero_count.add_(is_zero.to(dtype=zero_count.dtype))
     observation_count.add_(1.0)
+    if first_zero_batch is not None and batch_index is not None:
+        first_zero_batch.copy_(
+            torch.where(
+                (first_zero_batch < 0.0) & is_zero,
+                first_zero_batch.new_tensor(float(batch_index)),
+                first_zero_batch,
+            )
+        )
 
 
 def _panel_forward_module(model: nn.Module) -> nn.Module | None:
@@ -4446,6 +4947,7 @@ class _PanelSlabForwardWrapper(nn.Module):
         symbol_indices: torch.Tensor | None = None,
         derivative_candidate_features: torch.Tensor | None = None,
         derivative_candidate_mask: torch.Tensor | None = None,
+        execution_context: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # A fixed slab can contain sample-masked dates that were absent from
         # CrossSectionalDataset because every symbol was non-tradable.  The
@@ -4459,13 +4961,20 @@ class _PanelSlabForwardWrapper(nn.Module):
             if not self._accepts_symbol_indices:
                 raise ValueError("compact symbol batches require forward_from_panel_slab(..., symbol_indices=...)")
             kwargs["symbol_indices"] = symbol_indices
+        portfolio_context: dict[str, torch.Tensor] = {}
         if derivative_candidate_features is not None or derivative_candidate_mask is not None:
             if derivative_candidate_features is None or derivative_candidate_mask is None:
                 raise ValueError("derivative candidate context must be present as a pair")
-            kwargs["portfolio_context"] = {
-                "candidate_features": derivative_candidate_features,
-                "candidate_mask": derivative_candidate_mask,
-            }
+            portfolio_context.update(
+                {
+                    "candidate_features": derivative_candidate_features,
+                    "candidate_mask": derivative_candidate_mask,
+                }
+            )
+        if execution_context is not None:
+            portfolio_context["execution_context"] = execution_context
+        if portfolio_context:
+            kwargs["portfolio_context"] = portfolio_context
         return self.model.forward_from_panel_slab(feature_slab, mask, **kwargs)
 
 
@@ -4532,6 +5041,7 @@ class _DynamicSymbolPanelSlabWrapper(nn.Module):
         symbol_indices: torch.Tensor | None = None,
         derivative_candidate_features: torch.Tensor | None = None,
         derivative_candidate_mask: torch.Tensor | None = None,
+        execution_context: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if feature_slab.dim() != 3:
             raise ValueError(
@@ -4551,6 +5061,13 @@ class _DynamicSymbolPanelSlabWrapper(nn.Module):
         ):
             raise ValueError(
                 "compile_model_dynamic_symbols requires symbol_indices [S]"
+            )
+        if execution_context is not None and tuple(execution_context.shape[:2]) != (
+            int(mask.size(0)),
+            symbols,
+        ):
+            raise ValueError(
+                "compile_model_dynamic_symbols requires execution_context [B,S,C]"
             )
         if symbols < self.min_symbols or symbols > self.max_symbols:
             raise ValueError(
@@ -4574,6 +5091,9 @@ class _DynamicSymbolPanelSlabWrapper(nn.Module):
         symbol_indices_for_compile = (
             None if symbol_indices is None else symbol_indices[:]
         )
+        execution_context_for_compile = (
+            None if execution_context is None else execution_context[:]
+        )
         mark_dynamic(
             feature_slab_for_compile,
             1,
@@ -4593,12 +5113,20 @@ class _DynamicSymbolPanelSlabWrapper(nn.Module):
                 min=self.min_symbols,
                 max=self.max_symbols,
             )
+        if execution_context_for_compile is not None:
+            mark_dynamic(
+                execution_context_for_compile,
+                1,
+                min=self.min_symbols,
+                max=self.max_symbols,
+            )
         return self.model(
             feature_slab_for_compile,
             mask_for_compile,
             symbol_indices_for_compile,
             derivative_candidate_features,
             derivative_candidate_mask,
+            execution_context_for_compile,
         )
 
 
@@ -4685,6 +5213,79 @@ def _derivative_portfolio_context(
     return {"candidate_features": features, "candidate_mask": mask}
 
 
+_EXECUTION_CONTEXT_BATCH_KEYS = (
+    "can_short_open_open_mask",
+    "day_trade_eligible_mask",
+    "day_trade_can_buy_open_mask",
+    "day_trade_can_sell_open_mask",
+    "volume_notional",
+    "short_capacity_notional",
+)
+
+
+def _model_requires_execution_context(model: nn.Module) -> bool:
+    return bool(
+        getattr(
+            _unwrap_model(model),
+            "_stockagent_requires_execution_context",
+            False,
+        )
+    )
+
+
+def _execution_context_from_batch(
+    batch: Mapping[str, torch.Tensor],
+    *,
+    target_rows: int | None = None,
+) -> torch.Tensor:
+    missing = [name for name in _EXECUTION_CONTEXT_BATCH_KEYS if name not in batch]
+    if missing:
+        raise ValueError(
+            "execution-conditioned model batch is missing causal fields: "
+            + ", ".join(missing)
+        )
+    raw_tensors = [batch[name] for name in _EXECUTION_CONTEXT_BATCH_KEYS]
+    base_shape = tuple(raw_tensors[0].shape)
+    if len(base_shape) != 2:
+        raise ValueError(
+            "execution-conditioned model fields must have shape [B,S]"
+        )
+    for name, tensor in zip(_EXECUTION_CONTEXT_BATCH_KEYS, raw_tensors):
+        if tuple(tensor.shape) != base_shape:
+            raise ValueError(
+                f"execution context field {name!r} has shape {tuple(tensor.shape)}; "
+                f"expected {base_shape}"
+            )
+    rows = int(base_shape[0])
+    requested_rows = rows if target_rows is None else int(target_rows)
+    if requested_rows < rows:
+        raise ValueError(
+            "execution context target_rows cannot truncate a model batch"
+        )
+    prepared: list[torch.Tensor] = []
+    for tensor in raw_tensors:
+        value = tensor.to(dtype=torch.float32)
+        if requested_rows > rows:
+            value = _pad_rows(value, requested_rows, fill_value=0.0)
+        prepared.append(value)
+    return torch.stack(prepared, dim=-1)
+
+
+def _portfolio_context_for_model(
+    model: nn.Module,
+    batch: Mapping[str, torch.Tensor],
+    *,
+    target_rows: int | None = None,
+) -> dict[str, torch.Tensor] | None:
+    context = dict(_derivative_portfolio_context(batch) or {})
+    if _model_requires_execution_context(model):
+        context["execution_context"] = _execution_context_from_batch(
+            batch,
+            target_rows=target_rows,
+        )
+    return context or None
+
+
 def _call_panel_forward_for_batch(
     *,
     panel_forward_model: nn.Module,
@@ -4714,6 +5315,14 @@ def _call_panel_forward_for_batch(
                 batch.get("symbol_indices"),
                 batch.get("derivative_candidate_features"),
                 batch.get("derivative_candidate_mask"),
+                (
+                    _execution_context_from_batch(
+                        batch,
+                        target_rows=int(model_mask.size(0)),
+                    )
+                    if _model_requires_execution_context(panel_slab_model)
+                    else None
+                ),
             )
     kwargs: dict[str, Any] = {"return_aux": return_aux}
     symbol_indices = batch.get("symbol_indices")
@@ -4721,7 +5330,11 @@ def _call_panel_forward_for_batch(
         if not _callable_accepts_parameter(panel_forward_model.forward_from_panel, "symbol_indices"):
             raise ValueError("compact symbol batches require forward_from_panel(..., symbol_indices=...)")
         kwargs["symbol_indices"] = symbol_indices
-    portfolio_context = _derivative_portfolio_context(batch)
+    portfolio_context = _portfolio_context_for_model(
+        panel_forward_model,
+        batch,
+        target_rows=int(model_mask.size(0)),
+    )
     if portfolio_context is not None:
         if not _callable_accepts_parameter(
             panel_forward_model.forward_from_panel, "portfolio_context"
@@ -5598,12 +6211,24 @@ def _save_backtest_artifact(
     short_margin_collateral_history = result.short_margin_collateral_history
     final_short_sale_collateral = result.final_short_sale_collateral
     final_short_margin_collateral = result.final_short_margin_collateral
+    long_margin_debt_history = result.long_margin_debt_history
+    final_long_margin_debt = result.final_long_margin_debt
+    stateful_carry_artifact = bool(
+        mode in TW_CARRYING_EXECUTION_MODES
+        or (
+            mode == "tw_day_trade"
+            and long_margin_debt_history is not None
+        )
+    )
+    day_trade_margin_carry_artifact = bool(
+        mode == "tw_day_trade" and long_margin_debt_history is not None
+    )
     # Schema 3 makes the two segregated margin-short asset vectors explicit.
     # Some stitched/request-only tw_cash artifacts never execute a short and
     # historically omitted them.  Canonicalize that unambiguous long-only
     # state to exact zeros instead of rejecting an otherwise replayable
     # artifact.  A partially supplied pair remains an error below.
-    if mode in TW_CARRYING_EXECUTION_MODES:
+    if stateful_carry_artifact:
         if (
             short_sale_collateral_history is None
             and short_margin_collateral_history is None
@@ -5715,6 +6340,11 @@ def _save_backtest_artifact(
         short_margin_collateral_history,
         ndim=2,
     )
+    require_row_history(
+        "long_margin_debt_history",
+        long_margin_debt_history,
+        ndim=2,
+    )
     for name, value, ndim in (
         ("open_weights_history", result.open_weights_history, 2),
         ("close_weights_history", result.close_weights_history, 2),
@@ -5740,6 +6370,7 @@ def _save_backtest_artifact(
         ("shares_history", result.shares_history),
         ("short_sale_collateral_history", short_sale_collateral_history),
         ("short_margin_collateral_history", short_margin_collateral_history),
+        ("long_margin_debt_history", long_margin_debt_history),
     ):
         if value is not None and int(np.asarray(value).shape[1]) != symbol_count:
             raise ValueError(
@@ -5781,6 +6412,7 @@ def _save_backtest_artifact(
     for name, value in (
         ("short_sale_collateral_history", short_sale_collateral_history),
         ("short_margin_collateral_history", short_margin_collateral_history),
+        ("long_margin_debt_history", long_margin_debt_history),
         (
             "commission_rebate_accrued_history",
             result.commission_rebate_accrued_history,
@@ -5823,6 +6455,7 @@ def _save_backtest_artifact(
     for name, value in (
         ("final_short_sale_collateral", final_short_sale_collateral),
         ("final_short_margin_collateral", final_short_margin_collateral),
+        ("final_long_margin_debt", final_long_margin_debt),
     ):
         if value is not None:
             array = np.asarray(value)
@@ -5935,7 +6568,7 @@ def _save_backtest_artifact(
             "backtest artifact short collateral terminal state requires the complete "
             "account terminal state"
         )
-    if mode in TW_CARRYING_EXECUTION_MODES:
+    if stateful_carry_artifact:
         if collateral_history_count != len(collateral_histories):
             raise ValueError(
                 f"{mode} schema-5 artifact requires both short collateral histories"
@@ -5947,12 +6580,27 @@ def _save_backtest_artifact(
             raise ValueError(
                 f"{mode} schema-5 artifact requires complete final short collateral state"
             )
+        if day_trade_margin_carry_artifact and long_margin_debt_history is None:
+            raise ValueError(
+                f"{mode} stateful-carry artifact requires long margin debt history"
+            )
+        if (
+            day_trade_margin_carry_artifact
+            and
+            terminal_field_count == len(terminal_fields)
+            and final_long_margin_debt is None
+        ):
+            raise ValueError(
+                f"{mode} stateful-carry artifact requires final long margin debt"
+            )
     else:
         for name, value in (
             ("short_sale_collateral_history", short_sale_collateral_history),
             ("short_margin_collateral_history", short_margin_collateral_history),
             ("final_short_sale_collateral", final_short_sale_collateral),
             ("final_short_margin_collateral", final_short_margin_collateral),
+            ("long_margin_debt_history", long_margin_debt_history),
+            ("final_long_margin_debt", final_long_margin_debt),
         ):
             if value is not None and np.any(np.asarray(value) != 0.0):
                 raise ValueError(
@@ -6188,11 +6836,16 @@ def _save_backtest_artifact(
         and mode != "tw_index_derivatives_day"
     )
     has_phase_audit = phase_audit_count == len(phase_audit_fields)
+    has_daily_day_trade_request = bool(
+        mode == "tw_day_trade"
+        and requested_weights_history is not None
+        and np.asarray(requested_weights_history).ndim == 2
+    )
     if has_phase_requests and not has_phase_audit:
         raise ValueError(
             f"{mode} phase artifact requires complete OPEN/CLOSE execution audit histories"
         )
-    if has_phase_audit and not has_phase_requests:
+    if has_phase_audit and not (has_phase_requests or has_daily_day_trade_request):
         raise ValueError(
             f"{mode} phase audit requires requested_weights_history with shape "
             "[rows,phases,symbols]"
@@ -6219,7 +6872,13 @@ def _save_backtest_artifact(
     writer = np.savez_compressed if str(compression).strip().lower() == "compressed" else np.savez
     payload: dict[str, np.ndarray] = {
         "artifact_schema_version": np.asarray(
-            6 if rebate_history_count else 5,
+            (
+                7
+                if day_trade_margin_carry_artifact
+                else 6
+                if rebate_history_count
+                else 5
+            ),
             dtype=np.int64,
         ),
         "execution_mode": np.asarray(mode, dtype="U32"),
@@ -6313,6 +6972,8 @@ def _save_backtest_artifact(
     add_optional(
         "final_short_margin_collateral", final_short_margin_collateral
     )
+    add_optional("long_margin_debt_history", long_margin_debt_history)
+    add_optional("final_long_margin_debt", final_long_margin_debt)
     if integer_state is not None:
         payload.update(
             integer_state_mode=np.asarray(integer_state.mode, dtype="U32"),
@@ -6609,6 +7270,9 @@ def _save_best_val_backtest_snapshot(
         short_margin_collateral_history=sliced_optional_float32(
             val_backtest.short_margin_collateral_history
         ),
+        long_margin_debt_history=sliced_optional_float32(
+            val_backtest.long_margin_debt_history
+        ),
         final_weights=terminal_optional_float32(val_backtest.final_weights),
         final_due_weights=terminal_optional_float32(
             val_backtest.final_due_weights
@@ -6641,6 +7305,9 @@ def _save_best_val_backtest_snapshot(
         ),
         final_short_margin_collateral=terminal_optional_float32(
             val_backtest.final_short_margin_collateral
+        ),
+        final_long_margin_debt=terminal_optional_float32(
+            val_backtest.final_long_margin_debt
         ),
     )
     _save_backtest_artifact(
@@ -6890,6 +7557,10 @@ def _save_fold_output_artifacts(
             or config.trading.tw_day_trade_unlimited_margin_conversion
         )
     )
+    stateful_continuous_day_trade = bool(
+        requested_mode == "tw_day_trade"
+        and config.trading.tw_day_trade_unlimited_margin_conversion
+    )
     if requested_mode in {
         *TW_MINUTE_EXECUTION_MODES,
         *TW_DERIVATIVES_TICK_EXECUTION_MODES,
@@ -6903,6 +7574,24 @@ def _save_fold_output_artifacts(
             raise RuntimeError(
                 "specialized intraday artifacts come from their native event "
                 "ledger and must not attach a daily integer-share oracle"
+            )
+    elif stateful_continuous_day_trade:
+        if test_integer_backtest is not None:
+            raise RuntimeError(
+                "stateful unlimited-margin tw_day_trade has no contract-compatible "
+                "integer oracle and must not publish a legacy flat-day audit"
+            )
+        if normalize_execution_mode(test_backtest.execution_mode) != requested_mode:
+            raise RuntimeError(
+                "stateful tensor artifact mode differs from configuration"
+            )
+        fold_result.test_metrics = compute_metrics(test_backtest)
+        fold_result.test_integer_metrics = None
+        fold_result.test_continuous_surrogate_metrics = None
+        if deployment_dates is not None:
+            deployment_backtest = _prefix_backtest_result(
+                test_backtest,
+                int(np.asarray(deployment_dates).size),
             )
     elif canonical_tensor_day_trade:
         if test_integer_backtest is None:
@@ -7446,13 +8135,28 @@ def _save_settlement_audit_artifacts(
             commission_rebate_current_receivable=rebate_current,
             commission_rebate_due_receivable=rebate_due,
         )
-    if execution_mode in TW_CARRYING_EXECUTION_MODES:
+    stateful_carry_audit = bool(
+        execution_mode in TW_CARRYING_EXECUTION_MODES
+        or (
+            execution_mode == "tw_day_trade"
+            and result.long_margin_debt_history is not None
+        )
+    )
+    if stateful_carry_audit:
         if (
             result.short_sale_collateral_history is None
             or result.short_margin_collateral_history is None
         ):
             raise RuntimeError(
-                "tw_cash settlement audit requires both short collateral histories"
+                f"{execution_mode} stateful settlement audit requires short "
+                "collateral histories"
+            )
+        if (
+            execution_mode == "tw_day_trade"
+            and result.long_margin_debt_history is None
+        ):
+            raise RuntimeError(
+                "stateful tw_day_trade settlement audit requires long margin debt history"
             )
         short_sale_collateral = np.asarray(
             result.short_sale_collateral_history, dtype=np.float64
@@ -7460,27 +8164,46 @@ def _save_settlement_audit_artifacts(
         short_margin_collateral = np.asarray(
             result.short_margin_collateral_history, dtype=np.float64
         )
+        long_margin_debt = (
+            None
+            if result.long_margin_debt_history is None
+            else np.asarray(result.long_margin_debt_history, dtype=np.float64)
+        )
         if (
             short_sale_collateral.ndim != 2
             or short_margin_collateral.shape != short_sale_collateral.shape
+            or (
+                long_margin_debt is not None
+                and long_margin_debt.shape != short_sale_collateral.shape
+            )
             or int(short_sale_collateral.shape[0]) != rows
         ):
             raise ValueError(
-                "tw_cash settlement audit collateral histories must be matching "
+                f"{execution_mode} settlement financing histories must be matching "
                 "[date, symbol] matrices"
             )
         if (
             not np.all(np.isfinite(short_sale_collateral))
             or not np.all(np.isfinite(short_margin_collateral))
+            or (
+                long_margin_debt is not None
+                and not np.all(np.isfinite(long_margin_debt))
+            )
             or np.any(short_sale_collateral < 0.0)
             or np.any(short_margin_collateral < 0.0)
+            or (
+                long_margin_debt is not None
+                and np.any(long_margin_debt < 0.0)
+            )
         ):
             raise ValueError(
-                "tw_cash settlement audit collateral histories must be finite "
+                f"{execution_mode} settlement financing histories must be finite "
                 "and non-negative"
             )
         data["short_sale_collateral_total"] = short_sale_collateral.sum(axis=1)
         data["short_margin_collateral_total"] = short_margin_collateral.sum(axis=1)
+        if long_margin_debt is not None:
+            data["long_margin_debt_total"] = long_margin_debt.sum(axis=1)
     if result.settlement_ledger_unit == "nav_ratio":
         if result.equity_scale_history is None:
             raise RuntimeError(
@@ -7576,7 +8299,7 @@ def _save_settlement_audit_artifacts(
             else float(np.asarray(result.final_equity_scale).item())
         ),
     }
-    if execution_mode in TW_CARRYING_EXECUTION_MODES:
+    if stateful_carry_audit:
         def collateral_total(value: np.ndarray | None) -> float | None:
             if value is None:
                 return None
@@ -7594,6 +8317,10 @@ def _save_settlement_audit_artifacts(
         summary["final_short_margin_collateral_total"] = collateral_total(
             result.final_short_margin_collateral
         )
+        if result.long_margin_debt_history is not None:
+            summary["final_long_margin_debt_total"] = collateral_total(
+                result.final_long_margin_debt
+            )
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
 
@@ -7781,7 +8508,7 @@ def _load_backtest_artifact(output_path: Path) -> tuple[BacktestResult, np.ndarr
             if "artifact_schema_version" in keys
             else 1
         )
-        if schema_version < 1 or schema_version > 6:
+        if schema_version < 1 or schema_version > 7:
             raise ValueError(
                 f"unsupported backtest artifact schema version {schema_version}"
             )
@@ -8081,6 +8808,8 @@ def _load_backtest_artifact(output_path: Path) -> tuple[BacktestResult, np.ndarr
             final_short_margin_collateral=optional(
                 "final_short_margin_collateral"
             ),
+            long_margin_debt_history=optional("long_margin_debt_history"),
+            final_long_margin_debt=optional("final_long_margin_debt"),
             final_integer_state=integer_state,
         )
         dates = copied("dates")
@@ -8140,6 +8869,7 @@ def _load_backtest_artifact(output_path: Path) -> tuple[BacktestResult, np.ndarr
             result.short_margin_collateral_history,
             2,
         ),
+        ("long_margin_debt_history", result.long_margin_debt_history, 2),
         ("open_weights_history", result.open_weights_history, 2),
         ("close_weights_history", result.close_weights_history, 2),
         ("event_turnovers", result.event_turnovers, 2),
@@ -8202,6 +8932,7 @@ def _load_backtest_artifact(output_path: Path) -> tuple[BacktestResult, np.ndarr
         ("shares_history", result.shares_history),
         ("short_sale_collateral_history", result.short_sale_collateral_history),
         ("short_margin_collateral_history", result.short_margin_collateral_history),
+        ("long_margin_debt_history", result.long_margin_debt_history),
     ):
         if value is not None and int(np.asarray(value).shape[1]) != symbol_count:
             raise ValueError(
@@ -8244,6 +8975,7 @@ def _load_backtest_artifact(output_path: Path) -> tuple[BacktestResult, np.ndarr
     for name, value in (
         ("short_sale_collateral_history", result.short_sale_collateral_history),
         ("short_margin_collateral_history", result.short_margin_collateral_history),
+        ("long_margin_debt_history", result.long_margin_debt_history),
         (
             "commission_rebate_accrued_history",
             result.commission_rebate_accrued_history,
@@ -8299,7 +9031,14 @@ def _load_backtest_artifact(output_path: Path) -> tuple[BacktestResult, np.ndarr
         raise ValueError(
             "backtest artifact final_due_weights differs from the symbol dimension"
         )
-    if schema_version >= 5 and execution_mode in TW_CARRYING_EXECUTION_MODES:
+    if schema_version >= 5 and (
+        execution_mode in TW_CARRYING_EXECUTION_MODES
+        or (
+            schema_version >= 7
+            and execution_mode == "tw_day_trade"
+            and result.long_margin_debt_history is not None
+        )
+    ):
         requested = result.requested_weights_history
         phase_fields = (
             result.open_weights_history,
@@ -8321,12 +9060,19 @@ def _load_backtest_artifact(output_path: Path) -> tuple[BacktestResult, np.ndarr
         has_phase_requests = (
             requested is not None and np.asarray(requested).ndim == 3
         )
+        has_daily_day_trade_request = bool(
+            execution_mode == "tw_day_trade"
+            and requested is not None
+            and np.asarray(requested).ndim == 2
+        )
         phase_contract = (
             execution_mode == "tw_overnight"
             or has_phase_requests
             or has_phase_audit
         )
-        if phase_contract and not has_phase_requests:
+        if phase_contract and not (
+            has_phase_requests or has_daily_day_trade_request
+        ):
             raise ValueError(
                 "schema-5 dual-session artifact is missing "
                 "requested_weights_history [T,P,S]"
@@ -8356,6 +9102,7 @@ def _load_backtest_artifact(output_path: Path) -> tuple[BacktestResult, np.ndarr
     for name, value in (
         ("final_short_sale_collateral", result.final_short_sale_collateral),
         ("final_short_margin_collateral", result.final_short_margin_collateral),
+        ("final_long_margin_debt", result.final_long_margin_debt),
     ):
         if value is not None:
             array = np.asarray(value)
@@ -8490,10 +9237,38 @@ def _load_backtest_artifact(output_path: Path) -> tuple[BacktestResult, np.ndarr
             "backtest artifact short collateral terminal state lacks the complete "
             "account terminal state"
         )
+    if (
+        result.final_long_margin_debt is not None
+        and result.long_margin_debt_history is None
+    ):
+        raise ValueError(
+            "backtest artifact final long margin debt requires its row history"
+        )
+    if (
+        result.final_long_margin_debt is not None
+        and terminal_field_count != len(terminal_fields)
+    ):
+        raise ValueError(
+            "backtest artifact final long margin debt requires the complete "
+            "account terminal state"
+        )
+    if (
+        result.long_margin_debt_history is not None
+        and terminal_field_count == len(terminal_fields)
+        and result.final_long_margin_debt is None
+    ):
+        raise ValueError(
+            "backtest artifact complete account terminal state requires final "
+            "long margin debt when its row history is present"
+        )
     requires_short_collateral = (
         execution_mode == "tw_cash" and schema_version >= 3
     ) or (
         execution_mode == "tw_overnight" and schema_version >= 5
+    ) or (
+        execution_mode == "tw_day_trade"
+        and schema_version >= 7
+        and result.long_margin_debt_history is not None
     )
     if requires_short_collateral:
         if collateral_history_count != len(collateral_histories):
@@ -8509,7 +9284,10 @@ def _load_backtest_artifact(output_path: Path) -> tuple[BacktestResult, np.ndarr
                 f"schema-{schema_version} {execution_mode} artifact is missing "
                 "final short collateral state"
             )
-    elif execution_mode not in TW_CARRYING_EXECUTION_MODES:
+    elif (
+        execution_mode not in TW_CARRYING_EXECUTION_MODES
+        and result.long_margin_debt_history is None
+    ):
         for name, value in (
             (
                 "short_sale_collateral_history",
@@ -8527,6 +9305,8 @@ def _load_backtest_artifact(output_path: Path) -> tuple[BacktestResult, np.ndarr
                 "final_short_margin_collateral",
                 result.final_short_margin_collateral,
             ),
+            ("long_margin_debt_history", result.long_margin_debt_history),
+            ("final_long_margin_debt", result.final_long_margin_debt),
         ):
             if value is not None and np.any(np.asarray(value) != 0.0):
                 raise ValueError(
@@ -9354,6 +10134,11 @@ def _prefix_backtest_result(result: BacktestResult, rows: int) -> BacktestResult
             if result.short_margin_collateral_history is None
             else np.asarray(result.short_margin_collateral_history[:rows]).copy()
         ),
+        long_margin_debt_history=(
+            None
+            if result.long_margin_debt_history is None
+            else np.asarray(result.long_margin_debt_history[:rows]).copy()
+        ),
         final_weights=prefix_final_weights,
         final_due_weights=(
             None
@@ -9406,6 +10191,12 @@ def _prefix_backtest_result(result: BacktestResult, rows: int) -> BacktestResult
             if not preserves_terminal_state
             or result.final_short_margin_collateral is None
             else np.asarray(result.final_short_margin_collateral).copy()
+        ),
+        final_long_margin_debt=(
+            None
+            if not preserves_terminal_state
+            or result.final_long_margin_debt is None
+            else np.asarray(result.final_long_margin_debt).copy()
         ),
         final_integer_state=prefixed_integer_state,
     )
@@ -11064,6 +11855,7 @@ def _run_eval_backtest_from_weight_buffers(
     equity_scale_history_out: torch.Tensor | None = None
     short_sale_collateral_history_out: torch.Tensor | None = None
     short_margin_collateral_history_out: torch.Tensor | None = None
+    long_margin_debt_history_out: torch.Tensor | None = None
     open_weights_history_out: torch.Tensor | None = None
     close_weights_history_out: torch.Tensor | None = None
     event_turnovers_out: torch.Tensor | None = None
@@ -11082,6 +11874,10 @@ def _run_eval_backtest_from_weight_buffers(
         execution_mode in TW_STOCK_EXECUTION_MODES
         or execution_mode == "tw_index_futures_day"
     )
+    stateful_carry_execution = _is_stateful_security_carry(
+        execution_mode,
+        execution_runtime,
+    )
     if equity_scaled_execution:
         equity_scale_history_out = torch.empty(
             (total_rows,), device=device, dtype=output_dtype
@@ -11092,7 +11888,7 @@ def _run_eval_backtest_from_weight_buffers(
         payables_history_out = torch.empty((total_rows, lag), device=device, dtype=output_dtype)
         receivable_rows = (
             int(execution_runtime.claim_queue_sessions)
-            if execution_mode in TW_CARRYING_EXECUTION_MODES
+            if stateful_carry_execution
             and execution_runtime is not None
             else lag
         )
@@ -11112,14 +11908,17 @@ def _run_eval_backtest_from_weight_buffers(
         commission_rebate_due_history_out = torch.empty_like(
             commission_rebate_accrued_history_out
         )
-        if execution_mode in TW_CARRYING_EXECUTION_MODES:
+        if stateful_carry_execution:
             short_sale_collateral_history_out = torch.empty(
                 (total_rows, num_symbols), device=device, dtype=output_dtype
             )
             short_margin_collateral_history_out = torch.empty(
                 (total_rows, num_symbols), device=device, dtype=output_dtype
             )
-            if return_weights_history and weights_all.dim() == 3:
+            long_margin_debt_history_out = torch.empty(
+                (total_rows, num_symbols), device=device, dtype=output_dtype
+            )
+            if return_weights_history:
                 open_weights_history_out = torch.empty(
                     (total_rows, num_symbols), device=device, dtype=output_dtype
                 )
@@ -11167,6 +11966,7 @@ def _run_eval_backtest_from_weight_buffers(
     prev_equity_scale: torch.Tensor | None = None
     prev_short_sale_collateral: torch.Tensor | None = None
     prev_short_margin_collateral: torch.Tensor | None = None
+    prev_long_margin_debt: torch.Tensor | None = None
     for chunk_idx, (start, end, reset_state) in enumerate(backtest_ranges, start=1):
         if reset_state:
             prev_weights = None
@@ -11180,6 +11980,7 @@ def _run_eval_backtest_from_weight_buffers(
             prev_equity_scale = None
             prev_short_sale_collateral = None
             prev_short_margin_collateral = None
+            prev_long_margin_debt = None
         log_chunk_progress = bool(progress_label) and _should_log_eval_chunk(chunk_idx, total_backtest_chunks)
         if log_chunk_progress:
             _progress(f"{progress_label}: backtest chunk {chunk_idx}/{total_backtest_chunks} rows=[{start},{end})")
@@ -11602,6 +12403,7 @@ def _run_eval_backtest_from_weight_buffers(
                     initial_equity_scale=prev_equity_scale,
                     initial_short_sale_collateral=prev_short_sale_collateral,
                     initial_short_margin_collateral=prev_short_margin_collateral,
+                    initial_long_margin_debt=prev_long_margin_debt,
                     symbol_indices=symbol_indices,
                     day_trade_execution_initial_capital=(
                         float(execution_runtime.futures_initial_capital)
@@ -11640,6 +12442,9 @@ def _run_eval_backtest_from_weight_buffers(
         )
         prev_short_margin_collateral = _detach_portfolio_state(
             backtest_chunk.final_short_margin_collateral
+        )
+        prev_long_margin_debt = _detach_portfolio_state(
+            backtest_chunk.final_long_margin_debt
         )
         strategy_returns_out[start:end].copy_(backtest_chunk.strategy_returns[:valid_rows])
         benchmark_returns_out[start:end].copy_(backtest_chunk.benchmark_returns[:valid_rows])
@@ -11744,12 +12549,14 @@ def _run_eval_backtest_from_weight_buffers(
             commission_rebate_due_history_out[start:end].copy_(
                 backtest_chunk.commission_rebate_due_history[:valid_rows]
             )
-            if execution_mode in TW_CARRYING_EXECUTION_MODES:
+            if stateful_carry_execution:
                 if (
                     short_sale_collateral_history_out is None
                     or short_margin_collateral_history_out is None
+                    or long_margin_debt_history_out is None
                     or backtest_chunk.short_sale_collateral_history is None
                     or backtest_chunk.short_margin_collateral_history is None
+                    or backtest_chunk.long_margin_debt_history is None
                 ):
                     raise RuntimeError(
                         "tw_cash backtest omitted required margin-short collateral tensors"
@@ -11759,6 +12566,9 @@ def _run_eval_backtest_from_weight_buffers(
                 )
                 short_margin_collateral_history_out[start:end].copy_(
                     backtest_chunk.short_margin_collateral_history[:valid_rows]
+                )
+                long_margin_debt_history_out[start:end].copy_(
+                    backtest_chunk.long_margin_debt_history[:valid_rows]
                 )
         _maybe_sync_cuda(device, profile_timing)
         timing.backtest_finalize_s += time.perf_counter() - backtest_finalize_start
@@ -11820,6 +12630,8 @@ def _run_eval_backtest_from_weight_buffers(
         short_margin_collateral_history=short_margin_collateral_history_out,
         final_short_sale_collateral=prev_short_sale_collateral,
         final_short_margin_collateral=prev_short_margin_collateral,
+        long_margin_debt_history=long_margin_debt_history_out,
+        final_long_margin_debt=prev_long_margin_debt,
     )
     metrics_start = time.perf_counter()
     metrics = (
@@ -12553,6 +13365,14 @@ def _evaluate_windowed_tensor_batch_decoupled(
                             batch_for_forward.get("symbol_indices"),
                             batch_for_forward.get("derivative_candidate_features"),
                             batch_for_forward.get("derivative_candidate_mask"),
+                            (
+                                _execution_context_from_batch(
+                                    batch_for_forward,
+                                    target_rows=int(mask_chunk_padded.size(0)),
+                                )
+                                if _model_requires_execution_context(panel_slab_model)
+                                else None
+                            ),
                         )
                     else:
                         model_output_chunk = _call_panel_forward_for_batch(
@@ -12573,7 +13393,11 @@ def _evaluate_windowed_tensor_batch_decoupled(
                         x_chunk,
                         mask_chunk_padded,
                         return_aux=False,
-                        portfolio_context=_derivative_portfolio_context(batch_for_forward),
+                        portfolio_context=_portfolio_context_for_model(
+                            model,
+                            batch_for_forward,
+                            target_rows=int(mask_chunk_padded.size(0)),
+                        ),
                     )
                 weights_chunk, _ = _extract_weights_and_aux(model_output_chunk)
             _maybe_sync_cuda(device, profile_timing)
@@ -12900,6 +13724,7 @@ def _auto_chunk_rows(
     measured_free_bytes: int | None = None,
     max_rows: int | None = None,
     max_chunk_rows: int | None = None,
+    portfolio_context: Mapping[str, torch.Tensor] | None = None,
 ) -> int:
     total_rows = int(x.size(0)) if max_rows is None else int(max_rows)
     if device.type != "cuda":
@@ -12941,8 +13766,25 @@ def _auto_chunk_rows(
         with torch.random.fork_rng(devices=[rng_device], enabled=True), torch.inference_mode():
             x_probe = x[:probe_rows].to(device=device, non_blocking=True)
             mask_probe = tradable_mask[:probe_rows].to(device=device, non_blocking=True)
+            probe_context = (
+                None
+                if portfolio_context is None
+                else {
+                    name: value[:probe_rows].to(
+                        device=device,
+                        non_blocking=True,
+                    )
+                    for name, value in portfolio_context.items()
+                }
+            )
             with _autocast_context(device, amp_dtype):
-                probe_output = model(x_probe, mask_probe)
+                probe_output = _call_model(
+                    model,
+                    x_probe,
+                    mask_probe,
+                    return_aux=False,
+                    portfolio_context=probe_context,
+                )
                 _, _ = _extract_weights_and_aux(probe_output)
     finally:
         for module, training in module_modes:
@@ -13106,6 +13948,7 @@ def _slice_backtest_rows(
         short_margin_collateral_history=rows(
             result.short_margin_collateral_history
         ),
+        long_margin_debt_history=rows(result.long_margin_debt_history),
         final_weights=slice_final_weights,
         final_due_weights=terminal(result.final_due_weights),
         final_cash=terminal(result.final_cash),
@@ -13128,6 +13971,7 @@ def _slice_backtest_rows(
         final_short_margin_collateral=terminal(
             result.final_short_margin_collateral
         ),
+        final_long_margin_debt=terminal(result.final_long_margin_debt),
         final_integer_state=integer_state,
     )
 
@@ -13311,6 +14155,7 @@ def _replay_taiwan_stitched_deployment(
         ),
         execution_mode=mode,
         short_capacity_limit_enabled=config.trading.tw_short_capacity_limit_enabled,
+        day_trade_unlimited_margin_conversion=config.trading.tw_day_trade_unlimited_margin_conversion,
         tw_corporate_action_mode=config.trading.tw_corporate_action_mode,
         tw_commission_rebate_timing=config.trading.tw_commission_rebate_timing,
     )
@@ -13357,6 +14202,26 @@ def _replay_taiwan_stitched_deployment(
             device=torch.device("cpu"),
             dtype=request_tensor.dtype,
         )
+        short_capacity_weights = _short_capacity_weights_from_notional(
+            execution_dataset.short_capacity_notional_t[
+                torch.from_numpy(panel_rows)
+            ],
+            volume_participation_equity=(
+                config.trading.volume_participation_equity
+            ),
+            device=torch.device("cpu"),
+            dtype=request_tensor.dtype,
+            capacity_limit_enabled=runtime.short_capacity_limit_enabled,
+            reference=request_tensor,
+        )
+        effective_short_margin_rate = _effective_short_margin_rate(
+            execution_dataset.short_margin_rate_t[
+                torch.from_numpy(panel_rows)
+            ],
+            execution_runtime=runtime,
+            device=torch.device("cpu"),
+            dtype=request_tensor.dtype,
+        )
         with _temporary_env("STOCKAGENT_BACKTEST_COMPILE", "0"):
             stitched_tensor = run_backtest_torch(
                 request_tensor,
@@ -13392,6 +14257,8 @@ def _replay_taiwan_stitched_deployment(
                     selected(execution_dataset.force_short_cover_mask_t),
                     dtype=torch.bool,
                 ),
+                short_margin_rate=effective_short_margin_rate,
+                short_capacity_weights=short_capacity_weights,
                 force_exit_mask=torch.as_tensor(
                     selected(execution_dataset.force_exit_mask_t), dtype=torch.bool
                 ),
@@ -14177,6 +15044,14 @@ def _probe_compiled_train_forward(
                         batch.get("symbol_indices"),
                         batch.get("derivative_candidate_features"),
                         batch.get("derivative_candidate_mask"),
+                        (
+                            _execution_context_from_batch(
+                                batch,
+                                target_rows=int(batch["tradable_mask"].size(0)),
+                            )
+                            if _model_requires_execution_context(model)
+                            else None
+                        ),
                     )
                 else:
                     output = _call_model(
@@ -14185,7 +15060,11 @@ def _probe_compiled_train_forward(
                         batch["tradable_mask"],
                         return_aux=return_aux,
                         symbol_indices=batch.get("symbol_indices"),
-                        portfolio_context=_derivative_portfolio_context(batch),
+                        portfolio_context=_portfolio_context_for_model(
+                            model,
+                            batch,
+                            target_rows=int(batch["tradable_mask"].size(0)),
+                        ),
                     )
                 weights, aux_outputs = _extract_weights_and_aux(output)
                 if observed_output_dtypes is not None:
@@ -14256,6 +15135,7 @@ def _probe_compiled_loss_forward_backward(
     weights_dtype: torch.dtype | None = None,
     settlement_lag_sessions: int = 2,
     execution_runtime: _ExecutionRuntime | None = None,
+    symbol_sharded_ledger: bool = False,
 ) -> tuple[bool, str | None]:
     """Materialize the exact canonical-loss input path before epoch 1.
 
@@ -14321,7 +15201,63 @@ def _probe_compiled_loss_forward_backward(
             dtype=probe_weights_dtype,
             requires_grad=True,
         )
-        if distributed_probe:
+        if distributed_probe and symbol_sharded_ledger:
+            short_capacity_limit_enabled = (
+                True
+                if execution_runtime is None
+                else execution_runtime.short_capacity_limit_enabled
+            )
+            routed = _route_ddp_batch_to_symbol_shards(
+                local_weights,
+                batch,
+                include_volume_notional=bool(
+                    _volume_participation_enabled(
+                        max_volume_participation,
+                        volume_participation_equity,
+                    )
+                    and "volume_notional" in batch
+                ),
+                include_short_capacity_notional=bool(
+                    short_capacity_limit_enabled
+                    and "short_capacity_notional" in batch
+                ),
+            )
+            weights = routed["weights"]
+            future_log_returns = routed["future_log_returns"]
+            overnight_log_returns = routed["overnight_log_returns"]
+            tradable_mask = routed["tradable_mask"]
+            can_buy_mask = routed["can_buy_mask"]
+            can_sell_mask = routed["can_sell_mask"]
+            can_short_open_mask = routed["can_short_open_mask"]
+            can_short_open_open_mask = routed["can_short_open_open_mask"]
+            force_short_cover_mask = routed["force_short_cover_mask"]
+            force_exit_mask = routed["force_exit_mask"]
+            sample_mask = routed["sample_mask"]
+            state_advance_mask = routed["session_advance_mask"]
+            session_month_ids = routed["session_month_ids"]
+            commission_rebate_payment_eligible_mask = routed[
+                "commission_rebate_payment_eligible_mask"
+            ]
+            day_trade_eligible_mask = routed["day_trade_eligible_mask"]
+            day_trade_can_buy_open_mask = routed[
+                "day_trade_can_buy_open_mask"
+            ]
+            day_trade_can_sell_open_mask = routed[
+                "day_trade_can_sell_open_mask"
+            ]
+            unresolved_corporate_action_mask = routed[
+                "unresolved_corporate_action_mask"
+            ]
+            cash_dividend_yield = routed["cash_dividend_yield"]
+            cash_dividend_delay = routed[
+                "cash_dividend_payment_delay_sessions"
+            ]
+            benchmark = routed["benchmark"]
+            volume_notional = routed["volume_notional"]
+            short_capacity_notional = routed["short_capacity_notional"]
+            short_margin_rate = routed["short_margin_rate"]
+            active_symbol_indices = routed["symbol_indices"]
+        elif distributed_probe:
             weights = _all_gather_autograd(local_weights.contiguous())
             future_log_returns = _all_gather_no_grad(
                 batch["future_log_returns"].contiguous()
@@ -14404,11 +15340,17 @@ def _probe_compiled_loss_forward_backward(
                 and "volume_notional" in batch
                 else None
             )
+            short_capacity_limit_enabled = (
+                True
+                if execution_runtime is None
+                else execution_runtime.short_capacity_limit_enabled
+            )
             short_capacity_notional = (
                 _all_gather_no_grad(
                     batch["short_capacity_notional"].contiguous()
                 )
-                if "short_capacity_notional" in batch
+                if short_capacity_limit_enabled
+                and "short_capacity_notional" in batch
                 else None
             )
             short_margin_rate = (
@@ -14416,6 +15358,7 @@ def _probe_compiled_loss_forward_backward(
                 if "short_margin_rate" in batch
                 else None
             )
+            active_symbol_indices = batch.get("symbol_indices")
         else:
             weights = local_weights
             future_log_returns = batch["future_log_returns"]
@@ -14453,6 +15396,7 @@ def _probe_compiled_loss_forward_backward(
             volume_notional = batch.get("volume_notional")
             short_capacity_notional = batch.get("short_capacity_notional")
             short_margin_rate = batch.get("short_margin_rate")
+            active_symbol_indices = batch.get("symbol_indices")
         volume_limit_weights = _volume_limit_weights_from_notional(
             volume_notional,
             max_volume_participation=max_volume_participation,
@@ -14478,9 +15422,10 @@ def _probe_compiled_loss_forward_backward(
             device=device,
             dtype=weights.dtype,
         )
+        recurrent_symbols = int(weights.size(-1))
         aux_outputs = {
             "initial_weights": torch.zeros(
-                (split.num_symbols,),
+                (recurrent_symbols,),
                 device=device,
                 dtype=torch.float32,
             ),
@@ -14500,7 +15445,10 @@ def _probe_compiled_loss_forward_backward(
             aux_outputs["initial_receivables"] = torch.zeros(
                 (
                     int(execution_runtime.claim_queue_sessions)
-                    if split.execution_mode in TW_CARRYING_EXECUTION_MODES
+                    if _is_stateful_security_carry(
+                        split.execution_mode,
+                        execution_runtime,
+                    )
                     and execution_runtime is not None
                     else int(settlement_lag_sessions)
                 ,
@@ -14520,11 +15468,17 @@ def _probe_compiled_loss_forward_backward(
             aux_outputs["initial_equity_scale"] = torch.ones(
                 (), device=device, dtype=torch.float32
             )
-            if split.execution_mode in TW_CARRYING_EXECUTION_MODES:
+            if _is_stateful_security_carry(
+                split.execution_mode,
+                execution_runtime,
+            ):
                 aux_outputs["initial_short_sale_collateral"] = torch.zeros(
-                    (split.num_symbols,), device=device, dtype=torch.float32
+                    (recurrent_symbols,), device=device, dtype=torch.float32
                 )
                 aux_outputs["initial_short_margin_collateral"] = torch.zeros_like(
+                    aux_outputs["initial_short_sale_collateral"]
+                )
+                aux_outputs["initial_long_margin_debt"] = torch.zeros_like(
                     aux_outputs["initial_short_sale_collateral"]
                 )
         with torch.enable_grad(), _autocast_context(device, amp_dtype):
@@ -14557,7 +15511,7 @@ def _probe_compiled_loss_forward_backward(
                     if execution_runtime is None
                     else execution_runtime.claim_queue_sessions
                 ),
-                symbol_indices=batch.get("symbol_indices"),
+                symbol_indices=active_symbol_indices,
                 volume_limit_weights=volume_limit_weights,
                 short_capacity_weights=short_capacity_weights,
                 short_margin_rate=effective_short_margin_rate,
@@ -14572,6 +15526,7 @@ def _probe_compiled_loss_forward_backward(
                     else execution_runtime.short_handling_fee_rate
                 ),
                 aux_outputs=aux_outputs,
+                symbol_sharded_ledger=symbol_sharded_ledger,
                 **dict(loss_kwargs),
             )
             if loss.numel() != 1 or not bool(torch.isfinite(loss).all().item()):
@@ -15109,11 +16064,17 @@ def _split_batch_size(dataset_size: int, cap: int) -> int:
     return max(1, min(cap, dataset_size))
 
 
+def _is_power_of_two(value: int) -> bool:
+    number = int(value)
+    return number > 0 and (number & (number - 1)) == 0
+
+
 def _normalize_ddp_global_batch_size(
     batch_size: int,
     world_size: int,
     *,
     auto_selected: bool,
+    require_power_of_two: bool = False,
 ) -> int:
     """Resolve one fixed global batch divisible across all DDP ranks.
 
@@ -15125,6 +16086,19 @@ def _normalize_ddp_global_batch_size(
     ranks = int(world_size)
     if requested <= 0:
         raise ValueError(f"DDP global batch size must be positive; got {requested}")
+    if require_power_of_two:
+        if not _is_power_of_two(ranks):
+            raise ValueError(
+                "a power-of-two global batch cannot be evenly divided by a "
+                f"non-power-of-two world_size; world_size={ranks}"
+            )
+        if not _is_power_of_two(requested):
+            if not auto_selected:
+                raise ValueError(
+                    "distributed symbol-sharded ledger requires power-of-two "
+                    f"batch sizes; selected_batch_size={requested}"
+                )
+            requested = 1 << (requested.bit_length() - 1)
     if ranks <= 1:
         return requested
     if requested % ranks == 0:
@@ -15261,8 +16235,13 @@ def _train_epoch_windowed_tensor(
     portfolio_prev_short_margin_collateral = torch.zeros_like(
         portfolio_prev_weights
     )
+    portfolio_prev_long_margin_debt = torch.zeros_like(portfolio_prev_weights)
     total_loss_t = torch.zeros((), device=device, dtype=torch.float32)
-    gradient_norm_stats = torch.zeros((3,), device=device, dtype=torch.float32)
+    gradient_norm_stats = torch.tensor(
+        [0.0, 0.0, 0.0, -1.0, -1.0, 1.0, -1.0, 0.0],
+        device=device,
+        dtype=torch.float32,
+    )
     steps = 0
     timing = TimingBreakdown()
     total_start = time.perf_counter()
@@ -15370,6 +16349,16 @@ def _train_epoch_windowed_tensor(
                                     batch.get("symbol_indices"),
                                     batch.get("derivative_candidate_features"),
                                     batch.get("derivative_candidate_mask"),
+                                    (
+                                        _execution_context_from_batch(
+                                            batch,
+                                            target_rows=int(batch_mask.size(0)),
+                                        )
+                                        if _model_requires_execution_context(
+                                            panel_slab_model
+                                        )
+                                        else None
+                                    ),
                                 )
                             else:
                                 model_output = _call_panel_forward_for_batch(
@@ -15391,7 +16380,11 @@ def _train_epoch_windowed_tensor(
                                 batch_mask,
                                 return_aux=model_return_aux,
                                 symbol_indices=batch.get("symbol_indices"),
-                                portfolio_context=_derivative_portfolio_context(batch),
+                                portfolio_context=_portfolio_context_for_model(
+                                    model,
+                                    batch,
+                                    target_rows=int(batch_mask.size(0)),
+                                ),
                             )
                 elif use_panel_forward:
                     if panel_forward_model is None:
@@ -15405,6 +16398,14 @@ def _train_epoch_windowed_tensor(
                             batch.get("symbol_indices"),
                             batch.get("derivative_candidate_features"),
                             batch.get("derivative_candidate_mask"),
+                            (
+                                _execution_context_from_batch(
+                                    batch,
+                                    target_rows=int(batch_mask.size(0)),
+                                )
+                                if _model_requires_execution_context(panel_slab_model)
+                                else None
+                            ),
                         )
                     else:
                         model_output = _call_panel_forward_for_batch(
@@ -15426,7 +16427,11 @@ def _train_epoch_windowed_tensor(
                         batch_mask,
                         return_aux=model_return_aux,
                         symbol_indices=batch.get("symbol_indices"),
-                        portfolio_context=_derivative_portfolio_context(batch),
+                        portfolio_context=_portfolio_context_for_model(
+                            model,
+                            batch,
+                            target_rows=int(batch_mask.size(0)),
+                        ),
                     )
                 weights, aux_outputs = _extract_weights_and_aux(model_output)
             batch_volume_limit_weights = _volume_limit_weights_from_notional(
@@ -15441,11 +16446,7 @@ def _train_epoch_windowed_tensor(
                 volume_participation_equity=volume_participation_equity,
                 device=device,
                 dtype=weights.dtype,
-                capacity_limit_enabled=(
-                    True
-                    if execution_runtime is None
-                    else execution_runtime.short_capacity_limit_enabled
-                ),
+                capacity_limit_enabled=short_capacity_limit_enabled,
                 reference=weights,
             )
             batch_short_margin_rate = _effective_short_margin_rate(
@@ -15511,6 +16512,9 @@ def _train_epoch_windowed_tensor(
                     )
                     aux_outputs["initial_short_margin_collateral"] = (
                         portfolio_prev_short_margin_collateral
+                    )
+                    aux_outputs["initial_long_margin_debt"] = (
+                        portfolio_prev_long_margin_debt
                     )
 
             _record_debug_cuda_sync(timing, "after_forward_sync_s", device, debug_timing_sync)
@@ -15634,6 +16638,7 @@ def _train_epoch_windowed_tensor(
             next_short_margin_collateral = aux_outputs.get(
                 "_final_short_margin_collateral"
             )
+            next_long_margin_debt = aux_outputs.get("_final_long_margin_debt")
         else:
             next_prev = None
             next_alive = None
@@ -15646,6 +16651,7 @@ def _train_epoch_windowed_tensor(
             next_equity_scale = None
             next_short_sale_collateral = None
             next_short_margin_collateral = None
+            next_long_margin_debt = None
         if next_prev is not None:
             state_start = time.perf_counter()
             portfolio_prev_weights = _detach_portfolio_state(next_prev)
@@ -15681,8 +16687,52 @@ def _train_epoch_windowed_tensor(
                 portfolio_prev_short_margin_collateral = _detach_portfolio_state(
                     next_short_margin_collateral
                 )
+            if next_long_margin_debt is not None:
+                portfolio_prev_long_margin_debt = _detach_portfolio_state(
+                    next_long_margin_debt
+                )
+            gradient_norm_stats[4].copy_(
+                torch.where(
+                    (gradient_norm_stats[4] < 0.0) & ~portfolio_prev_alive,
+                    gradient_norm_stats.new_tensor(float(step_idx)),
+                    gradient_norm_stats[4],
+                )
+            )
             _maybe_sync_cuda(device, profile_timing)
             timing.portfolio_state_s += time.perf_counter() - state_start
+        first_default_row = (aux_outputs or {}).get(
+            "_first_settlement_default_row"
+        )
+        if first_default_row is not None:
+            absolute_default_row = first_default_row.to(
+                device=device,
+                dtype=torch.float32,
+            ) + float(start)
+            capture_default = (
+                (gradient_norm_stats[6] < 0.0)
+                & (first_default_row >= 0)
+            )
+            gradient_norm_stats[6].copy_(
+                torch.where(
+                    capture_default,
+                    absolute_default_row,
+                    gradient_norm_stats[6],
+                )
+            )
+            first_default_reason = (aux_outputs or {}).get(
+                "_first_settlement_default_reason"
+            )
+            if first_default_reason is not None:
+                gradient_norm_stats[7].copy_(
+                    torch.where(
+                        capture_default,
+                        first_default_reason.to(
+                            device=device,
+                            dtype=torch.float32,
+                        ),
+                        gradient_norm_stats[7],
+                    )
+                )
         _maybe_sync_cuda(device, profile_timing)
         timing.forward_s += time.perf_counter() - forward_start
 
@@ -15710,6 +16760,8 @@ def _train_epoch_windowed_tensor(
                 norm_sum=gradient_norm_stats[0],
                 zero_count=gradient_norm_stats[1],
                 observation_count=gradient_norm_stats[2],
+                first_zero_batch=gradient_norm_stats[3],
+                batch_index=step_idx,
             )
             if should_check_finite:
                 finite_start = time.perf_counter()
@@ -15756,6 +16808,8 @@ def _train_epoch_windowed_tensor(
                 norm_sum=gradient_norm_stats[0],
                 zero_count=gradient_norm_stats[1],
                 observation_count=gradient_norm_stats[2],
+                first_zero_batch=gradient_norm_stats[3],
+                batch_index=step_idx,
             )
             if should_check_finite:
                 finite_start = time.perf_counter()
@@ -15796,10 +16850,16 @@ def _train_epoch_windowed_tensor(
                 f"loss={float(loss.detach().cpu()):.8f} elapsed={time.perf_counter() - batch_start:.1f}s"
             )
 
+    gradient_norm_stats[5].copy_(portfolio_prev_alive.to(dtype=torch.float32))
     gradient_norm_values = gradient_norm_stats.detach().cpu().tolist()
     timing.gradient_norm_before_clip_sum = float(gradient_norm_values[0])
     timing.gradient_norm_zero_batches = int(gradient_norm_values[1])
     timing.gradient_norm_observations = int(gradient_norm_values[2])
+    timing.gradient_norm_first_zero_batch = int(gradient_norm_values[3])
+    timing.portfolio_first_dead_batch = int(gradient_norm_values[4])
+    timing.portfolio_first_default_row = int(gradient_norm_values[6])
+    timing.portfolio_first_default_reason = int(gradient_norm_values[7])
+    timing.portfolio_final_alive = int(gradient_norm_values[5])
     timing.total_s = time.perf_counter() - total_start
     timing.batches = steps
     if steps == 0:
@@ -15857,6 +16917,8 @@ def _train_epoch_windowed_tensor_ddp(
     settlement_lag_sessions: int = 2,
     use_panel_slab: bool = False,
     execution_runtime: _ExecutionRuntime | None = None,
+    symbol_sharded_ledger: bool = False,
+    replicated_ledger_local_metadata: bool = False,
 ) -> tuple[torch.Tensor, TimingBreakdown]:
     if _training_needs_aux(
         objective,
@@ -15879,6 +16941,30 @@ def _train_epoch_windowed_tensor_ddp(
     local_batch_size = int(batch_size) // world_size
     if local_batch_size <= 0:
         raise RuntimeError(f"DDP local batch size must be positive; got {local_batch_size}")
+    if symbol_sharded_ledger and replicated_ledger_local_metadata:
+        raise RuntimeError(
+            "replicated_ledger_local_metadata applies only to the replicated "
+            "full-symbol ledger"
+        )
+    if symbol_sharded_ledger:
+        supports_stateful_day_trade = bool(
+            split.execution_mode == "tw_day_trade"
+            and execution_runtime is not None
+            and execution_runtime.day_trade_unlimited_margin_conversion
+        )
+        if (
+            split.execution_mode not in TW_CARRYING_EXECUTION_MODES
+            and not supports_stateful_day_trade
+        ):
+            raise RuntimeError(
+                "symbol-sharded DDP ledger supports Taiwan carrying modes or "
+                "stateful residual-carry tw_day_trade only"
+            )
+        if split.num_symbols % world_size != 0:
+            raise RuntimeError(
+                "symbol-sharded DDP ledger requires symbols divisible by world_size; "
+                f"symbols={split.num_symbols}, world_size={world_size}"
+            )
 
     model.train()
     total_rows = len(split)
@@ -15890,8 +16976,13 @@ def _train_epoch_windowed_tensor_ddp(
         )
 
     num_batches = total_rows // int(batch_size)
+    ledger_symbol_count = (
+        split.num_symbols // world_size
+        if symbol_sharded_ledger
+        else split.num_symbols
+    )
     portfolio_prev_weights = torch.zeros(
-        (split.num_symbols,),
+        (ledger_symbol_count,),
         device=device,
         dtype=torch.float32,
     )
@@ -15927,8 +17018,13 @@ def _train_epoch_windowed_tensor_ddp(
     portfolio_prev_short_margin_collateral = torch.zeros_like(
         portfolio_prev_weights
     )
+    portfolio_prev_long_margin_debt = torch.zeros_like(portfolio_prev_weights)
     total_loss_t = torch.zeros((), device=device, dtype=torch.float32)
-    gradient_norm_stats = torch.zeros((3,), device=device, dtype=torch.float32)
+    gradient_norm_stats = torch.tensor(
+        [0.0, 0.0, 0.0, -1.0, -1.0, 1.0, -1.0, 0.0],
+        device=device,
+        dtype=torch.float32,
+    )
     steps = 0
     timing = TimingBreakdown()
     total_start = time.perf_counter()
@@ -15936,7 +17032,10 @@ def _train_epoch_windowed_tensor_ddp(
         _progress(
             f"{progress_label}: train epoch start mode=windowed_ddp rows={total_rows} "
             f"global_batch_size={batch_size} local_batch_size={local_batch_size} "
-            f"batches={num_batches} world_size={world_size} objective={objective}"
+            f"batches={num_batches} world_size={world_size} objective={objective} "
+            f"ledger_layout={'symbol_sharded' if symbol_sharded_ledger else 'replicated'} "
+            "execution_metadata="
+            f"{'local_global_slice' if replicated_ledger_local_metadata else 'collective'}"
         )
 
     prepare_device = _windowed_prepare_device(split, device)
@@ -16015,6 +17114,14 @@ def _train_epoch_windowed_tensor_ddp(
                         batch.get("symbol_indices"),
                         batch.get("derivative_candidate_features"),
                         batch.get("derivative_candidate_mask"),
+                        (
+                            _execution_context_from_batch(
+                                batch,
+                                target_rows=int(batch_mask.size(0)),
+                            )
+                            if _model_requires_execution_context(model)
+                            else None
+                        ),
                     )
                 else:
                     if batch_x is None:
@@ -16025,86 +17132,98 @@ def _train_epoch_windowed_tensor_ddp(
                         batch_mask,
                         return_aux=False,
                         symbol_indices=batch.get("symbol_indices"),
-                        portfolio_context=_derivative_portfolio_context(batch),
+                        portfolio_context=_portfolio_context_for_model(
+                            model,
+                            batch,
+                            target_rows=int(batch_mask.size(0)),
+                        ),
                     )
                 local_weights, _ = _extract_weights_and_aux(model_output)
             _maybe_sync_cuda(device, profile_timing)
             timing.model_forward_s += time.perf_counter() - model_forward_start
 
             gather_start = time.perf_counter()
-            weights = _all_gather_autograd(local_weights.contiguous())
-            future_returns = _all_gather_no_grad(batch["future_log_returns"].contiguous())
-            overnight_returns = _all_gather_no_grad(
-                batch["overnight_log_returns"].contiguous()
-            )
-            tradable_mask = _all_gather_no_grad(batch["tradable_mask"].contiguous())
-            can_buy_mask = _all_gather_no_grad(batch["can_buy_mask"].contiguous())
-            can_sell_mask = _all_gather_no_grad(batch["can_sell_mask"].contiguous())
-            can_short_open_mask = _all_gather_no_grad(batch["can_short_open_mask"].contiguous())
-            can_short_open_open_mask = (
-                _all_gather_no_grad(
-                    batch["can_short_open_open_mask"].contiguous()
+            global_metadata: Mapping[str, torch.Tensor] | None = None
+            if replicated_ledger_local_metadata:
+                metadata_start = time.perf_counter()
+                global_metadata = split.batch_metadata_by_rows(
+                    global_start,
+                    global_start + int(batch_size),
+                    device=prepare_device,
+                    non_blocking=False,
+                    prepare_timing=timing,
                 )
-                if "can_short_open_open_mask" in batch
-                else None
-            )
-            force_short_cover_mask = _all_gather_no_grad(batch["force_short_cover_mask"].contiguous())
-            force_exit_mask = _all_gather_no_grad(batch["force_exit_mask"].contiguous())
-            sample_mask = _all_gather_no_grad(batch["sample_mask"].contiguous())
-            state_advance_mask = _all_gather_no_grad(
-                batch["session_advance_mask"].contiguous()
-            )
-            session_month_ids = _all_gather_no_grad(
-                batch["session_month_ids"].contiguous()
-            )
-            commission_rebate_payment_eligible_mask = _all_gather_no_grad(
-                batch["commission_rebate_payment_eligible_mask"].contiguous()
-            )
-            day_trade_eligible_mask = (
-                _all_gather_no_grad(batch["day_trade_eligible_mask"].contiguous())
-                if "day_trade_eligible_mask" in batch
-                else None
-            )
-            day_trade_can_buy_open_mask = (
-                _all_gather_no_grad(
-                    batch["day_trade_can_buy_open_mask"].contiguous()
+                global_metadata = _move_windowed_batch_to_device(
+                    global_metadata,
+                    device,
+                    non_blocking,
                 )
-                if "day_trade_can_buy_open_mask" in batch
-                else None
-            )
-            day_trade_can_sell_open_mask = (
-                _all_gather_no_grad(
-                    batch["day_trade_can_sell_open_mask"].contiguous()
+                timing.prepare_metadata_batch_s += (
+                    time.perf_counter() - metadata_start
                 )
-                if "day_trade_can_sell_open_mask" in batch
-                else None
-            )
-            unresolved_corporate_action_mask = (
-                _all_gather_no_grad(
-                    batch["unresolved_corporate_action_mask"].contiguous()
+            include_volume_notional = bool(
+                _volume_participation_enabled(
+                    max_volume_participation,
+                    volume_participation_equity,
                 )
-                if "unresolved_corporate_action_mask" in batch
-                else None
-            )
-            cash_dividend_yield = (
-                _all_gather_no_grad(batch["cash_dividend_yield"].contiguous())
-                if "cash_dividend_yield" in batch
-                else None
-            )
-            cash_dividend_delay = (
-                _all_gather_no_grad(
-                    batch["cash_dividend_payment_delay_sessions"].contiguous()
-                )
-                if "cash_dividend_payment_delay_sessions" in batch
-                else None
-            )
-            benchmark = _all_gather_no_grad(batch["benchmark"].contiguous())
-            volume_notional = (
-                _all_gather_no_grad(batch["volume_notional"].contiguous())
-                if _volume_participation_enabled(max_volume_participation, volume_participation_equity)
                 and "volume_notional" in batch
-                else None
             )
+            short_capacity_limit_enabled = (
+                True
+                if execution_runtime is None
+                else execution_runtime.short_capacity_limit_enabled
+            )
+            route_batch = (
+                _route_ddp_batch_to_symbol_shards
+                if symbol_sharded_ledger
+                else _route_ddp_batch_replicated
+            )
+            routed = route_batch(
+                local_weights,
+                batch,
+                include_volume_notional=include_volume_notional,
+                include_short_capacity_notional=bool(
+                    short_capacity_limit_enabled
+                    and "short_capacity_notional" in batch
+                ),
+                **(
+                    {"global_metadata": global_metadata}
+                    if not symbol_sharded_ledger
+                    else {}
+                ),
+            )
+            weights = routed["weights"]
+            future_returns = routed["future_log_returns"]
+            overnight_returns = routed["overnight_log_returns"]
+            tradable_mask = routed["tradable_mask"]
+            can_buy_mask = routed["can_buy_mask"]
+            can_sell_mask = routed["can_sell_mask"]
+            can_short_open_mask = routed["can_short_open_mask"]
+            can_short_open_open_mask = routed["can_short_open_open_mask"]
+            force_short_cover_mask = routed["force_short_cover_mask"]
+            force_exit_mask = routed["force_exit_mask"]
+            sample_mask = routed["sample_mask"]
+            state_advance_mask = routed["session_advance_mask"]
+            session_month_ids = routed["session_month_ids"]
+            commission_rebate_payment_eligible_mask = routed[
+                "commission_rebate_payment_eligible_mask"
+            ]
+            day_trade_eligible_mask = routed["day_trade_eligible_mask"]
+            day_trade_can_buy_open_mask = routed[
+                "day_trade_can_buy_open_mask"
+            ]
+            day_trade_can_sell_open_mask = routed[
+                "day_trade_can_sell_open_mask"
+            ]
+            unresolved_corporate_action_mask = routed[
+                "unresolved_corporate_action_mask"
+            ]
+            cash_dividend_yield = routed["cash_dividend_yield"]
+            cash_dividend_delay = routed[
+                "cash_dividend_payment_delay_sessions"
+            ]
+            benchmark = routed["benchmark"]
+            volume_notional = routed["volume_notional"]
             volume_limit_weights = _volume_limit_weights_from_notional(
                 volume_notional,
                 max_volume_participation=max_volume_participation,
@@ -16112,28 +17231,14 @@ def _train_epoch_windowed_tensor_ddp(
                 device=device,
                 dtype=weights.dtype,
             )
-            short_capacity_notional = (
-                _all_gather_no_grad(
-                    batch["short_capacity_notional"].contiguous()
-                )
-                if "short_capacity_notional" in batch
-                else None
-            )
-            short_margin_rate = (
-                _all_gather_no_grad(batch["short_margin_rate"].contiguous())
-                if "short_margin_rate" in batch
-                else None
-            )
+            short_capacity_notional = routed["short_capacity_notional"]
+            short_margin_rate = routed["short_margin_rate"]
             short_capacity_weights = _short_capacity_weights_from_notional(
                 short_capacity_notional,
                 volume_participation_equity=volume_participation_equity,
                 device=device,
                 dtype=weights.dtype,
-                capacity_limit_enabled=(
-                    True
-                    if execution_runtime is None
-                    else execution_runtime.short_capacity_limit_enabled
-                ),
+                capacity_limit_enabled=short_capacity_limit_enabled,
                 reference=weights,
             )
             effective_short_margin_rate = _effective_short_margin_rate(
@@ -16179,6 +17284,9 @@ def _train_epoch_windowed_tensor_ddp(
                     aux_outputs["initial_short_margin_collateral"] = (
                         portfolio_prev_short_margin_collateral
                     )
+                    aux_outputs["initial_long_margin_debt"] = (
+                        portfolio_prev_long_margin_debt
+                    )
                 loss = loss_fn(
                     weights,
                     future_returns,
@@ -16203,7 +17311,7 @@ def _train_epoch_windowed_tensor_ddp(
                     unresolved_corporate_action_mask=unresolved_corporate_action_mask,
                     cash_dividend_yield=cash_dividend_yield,
                     cash_dividend_payment_delay_sessions=cash_dividend_delay,
-                    symbol_indices=batch.get("symbol_indices"),
+                    symbol_indices=routed["symbol_indices"],
                     long_only=long_only,
                     buy_fee_rate=buy_fee_rate,
                     sell_fee_rate=sell_fee_rate,
@@ -16241,6 +17349,7 @@ def _train_epoch_windowed_tensor_ddp(
                     concentration_weight=concentration_weight,
                     regime_up_threshold=regime_up_threshold,
                     regime_down_threshold=regime_down_threshold,
+                    symbol_sharded_ledger=symbol_sharded_ledger,
                 )
             _maybe_sync_cuda(device, profile_timing)
             timing.loss_s += time.perf_counter() - loss_start
@@ -16280,6 +17389,9 @@ def _train_epoch_windowed_tensor_ddp(
         next_short_margin_collateral = (aux_outputs or {}).get(
             "_final_short_margin_collateral"
         )
+        next_long_margin_debt = (aux_outputs or {}).get(
+            "_final_long_margin_debt"
+        )
         if next_prev is not None:
             state_start = time.perf_counter()
             portfolio_prev_weights = _detach_portfolio_state(next_prev)
@@ -16315,8 +17427,52 @@ def _train_epoch_windowed_tensor_ddp(
                 portfolio_prev_short_margin_collateral = _detach_portfolio_state(
                     next_short_margin_collateral
                 )
+            if next_long_margin_debt is not None:
+                portfolio_prev_long_margin_debt = _detach_portfolio_state(
+                    next_long_margin_debt
+                )
+            gradient_norm_stats[4].copy_(
+                torch.where(
+                    (gradient_norm_stats[4] < 0.0) & ~portfolio_prev_alive,
+                    gradient_norm_stats.new_tensor(float(step_idx)),
+                    gradient_norm_stats[4],
+                )
+            )
             _maybe_sync_cuda(device, profile_timing)
             timing.portfolio_state_s += time.perf_counter() - state_start
+        first_default_row = (aux_outputs or {}).get(
+            "_first_settlement_default_row"
+        )
+        if first_default_row is not None:
+            absolute_default_row = first_default_row.to(
+                device=device,
+                dtype=torch.float32,
+            ) + float(global_start)
+            capture_default = (
+                (gradient_norm_stats[6] < 0.0)
+                & (first_default_row >= 0)
+            )
+            gradient_norm_stats[6].copy_(
+                torch.where(
+                    capture_default,
+                    absolute_default_row,
+                    gradient_norm_stats[6],
+                )
+            )
+            first_default_reason = (aux_outputs or {}).get(
+                "_first_settlement_default_reason"
+            )
+            if first_default_reason is not None:
+                gradient_norm_stats[7].copy_(
+                    torch.where(
+                        capture_default,
+                        first_default_reason.to(
+                            device=device,
+                            dtype=torch.float32,
+                        ),
+                        gradient_norm_stats[7],
+                    )
+                )
         timing.forward_s += time.perf_counter() - forward_start
 
         backward_start = time.perf_counter()
@@ -16343,6 +17499,8 @@ def _train_epoch_windowed_tensor_ddp(
                 norm_sum=gradient_norm_stats[0],
                 zero_count=gradient_norm_stats[1],
                 observation_count=gradient_norm_stats[2],
+                first_zero_batch=gradient_norm_stats[3],
+                batch_index=step_idx,
             )
             if should_check_finite:
                 finite_start = time.perf_counter()
@@ -16386,6 +17544,8 @@ def _train_epoch_windowed_tensor_ddp(
                 norm_sum=gradient_norm_stats[0],
                 zero_count=gradient_norm_stats[1],
                 observation_count=gradient_norm_stats[2],
+                first_zero_batch=gradient_norm_stats[3],
+                batch_index=step_idx,
             )
             if should_check_finite:
                 finite_start = time.perf_counter()
@@ -16425,10 +17585,16 @@ def _train_epoch_windowed_tensor_ddp(
                 f"loss={float(loss.detach().cpu()):.8f} elapsed={time.perf_counter() - batch_start:.1f}s"
             )
 
+    gradient_norm_stats[5].copy_(portfolio_prev_alive.to(dtype=torch.float32))
     gradient_norm_values = gradient_norm_stats.detach().cpu().tolist()
     timing.gradient_norm_before_clip_sum = float(gradient_norm_values[0])
     timing.gradient_norm_zero_batches = int(gradient_norm_values[1])
     timing.gradient_norm_observations = int(gradient_norm_values[2])
+    timing.gradient_norm_first_zero_batch = int(gradient_norm_values[3])
+    timing.portfolio_first_dead_batch = int(gradient_norm_values[4])
+    timing.portfolio_first_default_row = int(gradient_norm_values[6])
+    timing.portfolio_first_default_reason = int(gradient_norm_values[7])
+    timing.portfolio_final_alive = int(gradient_norm_values[5])
     timing.total_s = time.perf_counter() - total_start
     timing.batches = steps
     if steps == 0:
@@ -16645,6 +17811,7 @@ def _run_training_tree_models(
             execution_mode=config.trading.execution_mode,
             lookback_context=config.walk_forward.lookback_context,
             short_capacity_limit_enabled=config.trading.tw_short_capacity_limit_enabled,
+            day_trade_unlimited_margin_conversion=config.trading.tw_day_trade_unlimited_margin_conversion,
             tw_corporate_action_mode=config.trading.tw_corporate_action_mode,
             tw_commission_rebate_timing=config.trading.tw_commission_rebate_timing,
         )
@@ -16672,6 +17839,7 @@ def _run_training_tree_models(
                 execution_mode=config.trading.execution_mode,
                 lookback_context=config.walk_forward.lookback_context,
                 short_capacity_limit_enabled=config.trading.tw_short_capacity_limit_enabled,
+                day_trade_unlimited_margin_conversion=config.trading.tw_day_trade_unlimited_margin_conversion,
                 tw_corporate_action_mode=config.trading.tw_corporate_action_mode,
                 tw_commission_rebate_timing=config.trading.tw_commission_rebate_timing,
             )
@@ -16683,6 +17851,7 @@ def _run_training_tree_models(
                 execution_mode=config.trading.execution_mode,
                 lookback_context=config.walk_forward.lookback_context,
                 short_capacity_limit_enabled=config.trading.tw_short_capacity_limit_enabled,
+                day_trade_unlimited_margin_conversion=config.trading.tw_day_trade_unlimited_margin_conversion,
                 tw_corporate_action_mode=config.trading.tw_corporate_action_mode,
                 tw_commission_rebate_timing=config.trading.tw_commission_rebate_timing,
             )
@@ -16900,7 +18069,8 @@ def _run_training_tree_models(
             deployment_test_bt = _prefix_backtest_result(test_bt, deployment_test_rows)
             deployment_test_dates = test_dates[:deployment_test_rows]
             write_integer_holdings_table = _save_integer_share_holdings_table_enabled(config)
-            test_integer_bt, holdings_records = run_backtest_integer_shares(
+            test_integer_bt, holdings_records = _run_integer_share_audit_if_supported(
+                execution_runtime,
                 weights=_integer_audit_requested_weights(test_bt, execution_runtime),
                 future_returns=test_returns.detach().cpu().numpy(),
                 tradable_mask=test_masks.detach().cpu().numpy(),
@@ -16962,7 +18132,11 @@ def _run_training_tree_models(
                     short_margin_rate=test_integer_short_margin_rate,
                 ),
             )
-            test_integer_met = compute_metrics(test_integer_bt)
+            test_integer_met = (
+                None
+                if test_integer_bt is None
+                else compute_metrics(test_integer_bt)
+            )
             canonical_tensor_day_trade = _canonical_tensor_day_trade_enabled(
                 config, execution_runtime
             )
@@ -17111,7 +18285,7 @@ def _run_training_tree_models(
                 fold_dir,
                 config,
             )
-            if execution_runtime.mode not in CONTINUOUS_WEIGHT_EXECUTION_MODES:
+            if test_integer_bt is not None:
                 _save_integer_share_audit_artifacts(
                     fold_dir,
                     test_integer_bt,
@@ -17373,6 +18547,7 @@ def _run_inference_tree_models(
             execution_mode=config.trading.execution_mode,
             lookback_context=config.walk_forward.lookback_context,
             short_capacity_limit_enabled=config.trading.tw_short_capacity_limit_enabled,
+            day_trade_unlimited_margin_conversion=config.trading.tw_day_trade_unlimited_margin_conversion,
             tw_corporate_action_mode=config.trading.tw_corporate_action_mode,
             tw_commission_rebate_timing=config.trading.tw_commission_rebate_timing,
         )
@@ -17384,6 +18559,7 @@ def _run_inference_tree_models(
             execution_mode=config.trading.execution_mode,
             lookback_context=config.walk_forward.lookback_context,
             short_capacity_limit_enabled=config.trading.tw_short_capacity_limit_enabled,
+            day_trade_unlimited_margin_conversion=config.trading.tw_day_trade_unlimited_margin_conversion,
             tw_corporate_action_mode=config.trading.tw_corporate_action_mode,
             tw_commission_rebate_timing=config.trading.tw_commission_rebate_timing,
         )
@@ -17600,7 +18776,8 @@ def _run_inference_tree_models(
         deployment_test_bt = _prefix_backtest_result(test_bt, deployment_test_rows)
         deployment_test_dates = test_dates[:deployment_test_rows]
         write_integer_holdings_table = bool(config.training.save_integer_share_holdings_table)
-        test_integer_bt, holdings_records = run_backtest_integer_shares(
+        test_integer_bt, holdings_records = _run_integer_share_audit_if_supported(
+            execution_runtime,
             weights=_integer_audit_requested_weights(test_bt, execution_runtime),
             future_returns=test_returns.detach().cpu().numpy(),
             tradable_mask=test_masks.detach().cpu().numpy(),
@@ -17662,7 +18839,11 @@ def _run_inference_tree_models(
                 short_margin_rate=test_integer_short_margin_rate,
             ),
         )
-        test_integer_met = compute_metrics(test_integer_bt)
+        test_integer_met = (
+            None
+            if test_integer_bt is None
+            else compute_metrics(test_integer_bt)
+        )
         canonical_tensor_day_trade = _canonical_tensor_day_trade_enabled(
             config, execution_runtime
         )
@@ -17781,7 +18962,7 @@ def _run_inference_tree_models(
             fold_dir,
             config,
         )
-        if execution_runtime.mode not in CONTINUOUS_WEIGHT_EXECUTION_MODES:
+        if test_integer_bt is not None:
             _save_integer_share_audit_artifacts(
                 fold_dir,
                 test_integer_bt,
@@ -18001,6 +19182,7 @@ def _run_inference_neural_models(
             execution_mode=config.trading.execution_mode,
             lookback_context=config.walk_forward.lookback_context,
             short_capacity_limit_enabled=config.trading.tw_short_capacity_limit_enabled,
+            day_trade_unlimited_margin_conversion=config.trading.tw_day_trade_unlimited_margin_conversion,
             tw_corporate_action_mode=config.trading.tw_corporate_action_mode,
             tw_commission_rebate_timing=config.trading.tw_commission_rebate_timing,
         )
@@ -18013,6 +19195,7 @@ def _run_inference_neural_models(
             execution_mode=config.trading.execution_mode,
             lookback_context=config.walk_forward.lookback_context,
             short_capacity_limit_enabled=config.trading.tw_short_capacity_limit_enabled,
+            day_trade_unlimited_margin_conversion=config.trading.tw_day_trade_unlimited_margin_conversion,
             tw_corporate_action_mode=config.trading.tw_corporate_action_mode,
             tw_commission_rebate_timing=config.trading.tw_commission_rebate_timing,
         )
@@ -18263,7 +19446,8 @@ def _run_inference_neural_models(
         deployment_test_bt = _prefix_backtest_result(test_bt, deployment_test_rows)
         deployment_test_dates = test_dates[:deployment_test_rows]
         write_integer_holdings_table = bool(config.training.save_integer_share_holdings_table)
-        test_integer_bt, holdings_records = run_backtest_integer_shares(
+        test_integer_bt, holdings_records = _run_integer_share_audit_if_supported(
+            fold_execution_runtime,
             weights=_integer_audit_requested_weights(test_bt, fold_execution_runtime),
             future_returns=test_returns.detach().cpu().numpy(),
             tradable_mask=test_masks.detach().cpu().numpy(),
@@ -18331,7 +19515,11 @@ def _run_inference_neural_models(
                 symbol_indices=test_symbol_indices,
             ),
         )
-        test_integer_met = compute_metrics(test_integer_bt)
+        test_integer_met = (
+            None
+            if test_integer_bt is None
+            else compute_metrics(test_integer_bt)
+        )
         canonical_tensor_exact = _canonical_tensor_day_trade_enabled(
             config, fold_execution_runtime
         )
@@ -18450,7 +19638,7 @@ def _run_inference_neural_models(
             fold_dir,
             config,
         )
-        if fold_execution_runtime.mode not in CONTINUOUS_WEIGHT_EXECUTION_MODES:
+        if test_integer_bt is not None:
             _save_integer_share_audit_artifacts(
                 fold_dir,
                 test_integer_bt,
@@ -18743,6 +19931,63 @@ def _run_training_impl(
     amp_dtype = _resolve_amp_dtype(config.environment.amp_dtype)
     _configure_backtest_runtime_from_config(config)
     execution_runtime = _build_execution_runtime(panel, config, device)
+    symbol_sharded_ledger_enabled = bool(
+        config.training.distributed_symbol_sharded_ledger
+    )
+    if symbol_sharded_ledger_enabled:
+        if not distributed_data_parallel_enabled:
+            raise ValueError(
+                "training.distributed_symbol_sharded_ledger requires "
+                "multi_gpu_strategy=distributed_data_parallel"
+            )
+        supports_stateful_day_trade = bool(
+            execution_runtime.mode == "tw_day_trade"
+            and execution_runtime.day_trade_unlimited_margin_conversion
+        )
+        if (
+            execution_runtime.mode not in TW_CARRYING_EXECUTION_MODES
+            and not supports_stateful_day_trade
+        ):
+            raise ValueError(
+                "training.distributed_symbol_sharded_ledger supports tw_cash, "
+                "tw_overnight, or stateful residual-carry tw_day_trade only"
+            )
+        if str(config.training.train_symbol_compaction).strip().lower() not in {
+            "none",
+            "off",
+            "false",
+            "0",
+        }:
+            raise ValueError(
+                "distributed symbol-sharded ledger requires a fixed full symbol "
+                "axis; train_symbol_compaction must be none"
+            )
+        world_size = _distributed_world_size()
+        if not _is_power_of_two(world_size):
+            raise ValueError(
+                "distributed symbol-sharded ledger requires a power-of-two GPU "
+                f"count; world_size={world_size}"
+            )
+        if panel.num_symbols % world_size != 0:
+            raise ValueError(
+                "distributed symbol-sharded ledger requires the full symbol count "
+                "to divide evenly across ranks; "
+                f"symbols={panel.num_symbols}, world_size={world_size}"
+            )
+        for field_name, value in (
+            ("batch_size_train", config.training.batch_size_train),
+            ("batch_size_eval", config.training.batch_size_eval),
+        ):
+            if not _is_power_of_two(int(value)):
+                raise ValueError(
+                    "distributed symbol-sharded ledger requires every configured "
+                    f"batch size to be a power of two; {field_name}={value}"
+                )
+        if bool(config.training.compile_loss_dynamic_symbols):
+            raise ValueError(
+                "distributed symbol-sharded ledger uses fixed equal symbol shards; "
+                "compile_loss_dynamic_symbols must be false"
+            )
     risk_loss_kwargs.update(
         {
             "execution_mode": execution_runtime.mode,
@@ -19071,6 +20316,7 @@ def _run_training_impl(
             execution_mode=config.trading.execution_mode,
             lookback_context=config.walk_forward.lookback_context,
             short_capacity_limit_enabled=config.trading.tw_short_capacity_limit_enabled,
+            day_trade_unlimited_margin_conversion=config.trading.tw_day_trade_unlimited_margin_conversion,
             tw_corporate_action_mode=config.trading.tw_corporate_action_mode,
             tw_commission_rebate_timing=config.trading.tw_commission_rebate_timing,
         )
@@ -19156,6 +20402,9 @@ def _run_training_impl(
                 train_batch_size,
                 _distributed_world_size(),
                 auto_selected=auto_selected_batch,
+                require_power_of_two=bool(
+                    config.training.distributed_symbol_sharded_ledger
+                ),
             )
             if train_batch_size != pre_ddp_batch_size:
                 if auto_selected_batch:
@@ -19212,6 +20461,7 @@ def _run_training_impl(
                 execution_mode=config.trading.execution_mode,
                 lookback_context=config.walk_forward.lookback_context,
                 short_capacity_limit_enabled=config.trading.tw_short_capacity_limit_enabled,
+                day_trade_unlimited_margin_conversion=config.trading.tw_day_trade_unlimited_margin_conversion,
                 tw_corporate_action_mode=config.trading.tw_corporate_action_mode,
                 tw_commission_rebate_timing=config.trading.tw_commission_rebate_timing,
             )
@@ -19224,6 +20474,7 @@ def _run_training_impl(
                 execution_mode=config.trading.execution_mode,
                 lookback_context=config.walk_forward.lookback_context,
                 short_capacity_limit_enabled=config.trading.tw_short_capacity_limit_enabled,
+                day_trade_unlimited_margin_conversion=config.trading.tw_day_trade_unlimited_margin_conversion,
                 tw_corporate_action_mode=config.trading.tw_corporate_action_mode,
                 tw_commission_rebate_timing=config.trading.tw_commission_rebate_timing,
             )
@@ -19352,6 +20603,7 @@ def _run_training_impl(
             execution_mode=config.trading.execution_mode,
             lookback_context=config.walk_forward.lookback_context,
             short_capacity_limit_enabled=config.trading.tw_short_capacity_limit_enabled,
+            day_trade_unlimited_margin_conversion=config.trading.tw_day_trade_unlimited_margin_conversion,
             tw_corporate_action_mode=config.trading.tw_corporate_action_mode,
             tw_commission_rebate_timing=config.trading.tw_commission_rebate_timing,
         )
@@ -19695,6 +20947,11 @@ def _run_training_impl(
                 measured_free_bytes=measured_free_bytes,
                 max_rows=combined_val_rows,
                 max_chunk_rows=eval_auto_chunk_rows_cap,
+                portfolio_context=_portfolio_context_for_model(
+                    model,
+                    probe_batch,
+                    target_rows=int(probe_batch["tradable_mask"].size(0)),
+                ),
             )
             eval_chunk_rows = max(1, min(eval_chunk_rows, combined_val_rows))
             del probe_batch
@@ -19753,21 +21010,18 @@ def _run_training_impl(
             and train_windowed.overnight_log_returns is not None
             and train_windowed.overnight_log_returns.dim() == 3
         )
-        tw_day_trade_daily_compile = bool(
-            execution_runtime.mode == "tw_day_trade"
-            and execution_runtime.day_trade_unlimited_margin_conversion
-            and not tw_day_trade_minute_compile
+        tw_settlement_compile_backend = _tw_settlement_compile_backend(
+            execution_runtime,
+            day_trade_minute_compile=tw_day_trade_minute_compile,
         )
         tw_index_futures_compile = bool(
             execution_runtime.mode == "tw_index_futures_day"
         )
         tw_settlement_compiled_rows = (
             int(TW_DAY_TRADE_MINUTE_COMPILED_BLOCK_ROWS)
-            if tw_day_trade_minute_compile
-            else int(tw_day_trade_daily_compiled_block_rows())
-            if tw_day_trade_daily_compile
+            if tw_settlement_compile_backend == "day_trade_minute"
             else int(TW_DUAL_SESSION_COMPILED_BLOCK_ROWS)
-            if execution_runtime.mode in TW_CARRYING_EXECUTION_MODES
+            if tw_settlement_compile_backend == "dual_session"
             else int(
                 getattr(
                     config.training,
@@ -20374,8 +21628,6 @@ def _run_training_impl(
         tw_compile_stats_after = dict(tw_compile_stats_before)
         tw_minute_stats_before = get_tw_day_trade_minute_compile_stats()
         tw_minute_stats_after = dict(tw_minute_stats_before)
-        tw_daily_stats_before = get_tw_day_trade_daily_compile_stats()
-        tw_daily_stats_after = dict(tw_daily_stats_before)
         tw_dual_stats_before = get_tw_dual_session_compile_stats()
         tw_dual_stats_after = dict(tw_dual_stats_before)
         tw_futures_stats_before = get_tw_index_futures_compile_stats()
@@ -20436,6 +21688,7 @@ def _run_training_impl(
                     ),
                     settlement_lag_sessions=execution_runtime.settlement_lag_sessions,
                     execution_runtime=execution_runtime,
+                    symbol_sharded_ledger=symbol_sharded_ledger_enabled,
                 ),
                 device=device,
                 rank_ordered=loss_probe_rank_ordered,
@@ -20446,11 +21699,10 @@ def _run_training_impl(
             )
             tw_compile_stats_after = get_tw_continuous_compile_stats()
             tw_minute_stats_after = get_tw_day_trade_minute_compile_stats()
-            tw_daily_stats_after = get_tw_day_trade_daily_compile_stats()
             tw_dual_stats_after = get_tw_dual_session_compile_stats()
             tw_futures_stats_after = get_tw_index_futures_compile_stats()
             if tw_settlement_chunk_compile:
-                if tw_day_trade_minute_compile:
+                if tw_settlement_compile_backend == "day_trade_minute":
                     chunk_calls = int(
                         tw_minute_stats_after["compiled_day_calls"]
                         - tw_minute_stats_before["compiled_day_calls"]
@@ -20460,20 +21712,7 @@ def _run_training_impl(
                         tw_minute_stats_after["eager_fallback_calls"]
                         - tw_minute_stats_before["eager_fallback_calls"]
                     )
-                elif tw_day_trade_daily_compile:
-                    chunk_calls = int(
-                        tw_daily_stats_after["compiled_block_calls"]
-                        - tw_daily_stats_before["compiled_block_calls"]
-                    )
-                    tw_compiled_day_calls_delta = int(
-                        tw_daily_stats_after["compiled_day_calls"]
-                        - tw_daily_stats_before["compiled_day_calls"]
-                    )
-                    chunk_fallbacks = int(
-                        tw_daily_stats_after["eager_fallback_calls"]
-                        - tw_daily_stats_before["eager_fallback_calls"]
-                    )
-                elif execution_runtime.mode in TW_CARRYING_EXECUTION_MODES:
+                elif tw_settlement_compile_backend == "dual_session":
                     chunk_calls = int(
                         tw_dual_stats_after["compiled_block_calls"]
                         - tw_dual_stats_before["compiled_block_calls"]
@@ -20486,7 +21725,7 @@ def _run_training_impl(
                         tw_dual_stats_after["eager_fallback_calls"]
                         - tw_dual_stats_before["eager_fallback_calls"]
                     )
-                elif tw_index_futures_compile:
+                elif tw_settlement_compile_backend == "index_futures":
                     chunk_calls = int(
                         tw_futures_stats_after["compiled_block_calls"]
                         - tw_futures_stats_before["compiled_block_calls"]
@@ -20650,6 +21889,7 @@ def _run_training_impl(
             f"tw_settlement_compile_chunk_rows={int(tw_settlement_compiled_rows)}; "
             f"backtest_compile={bool(config.training.backtest_compile)}; "
             f"backtest_stateful_compile={bool(config.training.backtest_compile_stateful)}; "
+            f"tw_dual_session_cuda_graph={bool(config.training.tw_dual_session_cuda_graph)}; "
             f"backtest_compile_dynamic={bool(getattr(config.training, 'backtest_compile_dynamic', False))}; "
             f"backtest_prep_compile={_env_truthy('STOCKAGENT_BACKTEST_COMPILE_PREP', '1')}; "
             f"cache_train_gpu={bool(config.training.cache_train_tensors_on_gpu)}; "
@@ -20832,6 +22072,12 @@ def _run_training_impl(
                         settlement_lag_sessions=execution_runtime.settlement_lag_sessions,
                         use_panel_slab=ddp_panel_slab_enabled,
                         execution_runtime=execution_runtime,
+                        symbol_sharded_ledger=bool(
+                            config.training.distributed_symbol_sharded_ledger
+                        ),
+                        replicated_ledger_local_metadata=bool(
+                            config.training.distributed_replicated_ledger_local_metadata
+                        ),
                     )
                 return _train_epoch_windowed_tensor(
                     train_model,
@@ -21024,7 +22270,8 @@ def _run_training_impl(
             deployment_test_bt = _prefix_backtest_result(test_bt, deployment_test_rows)
             deployment_test_dates = test_dates[:deployment_test_rows]
             write_integer_holdings_table = _save_integer_share_holdings_table_enabled(config)
-            test_integer_bt, holdings_records = run_backtest_integer_shares(
+            test_integer_bt, holdings_records = _run_integer_share_audit_if_supported(
+                execution_runtime,
                 weights=_integer_audit_requested_weights(test_bt, execution_runtime),
                 future_returns=test_returns.detach().cpu().numpy(),
                 tradable_mask=test_masks.detach().cpu().numpy(),
@@ -21092,7 +22339,11 @@ def _run_training_impl(
                     symbol_indices=test_symbol_indices,
                 ),
             )
-            test_integer_met = compute_metrics(test_integer_bt)
+            test_integer_met = (
+                None
+                if test_integer_bt is None
+                else compute_metrics(test_integer_bt)
+            )
             fold_result = FoldResult(
                 fold_id=fold.fold_id,
                 train_years=fold.train_years,
@@ -21286,6 +22537,9 @@ def _run_training_impl(
                             ),
                             backtest_compile_stats=bt_stats_after,
                             backtest_prep_compile_stats=bt_prep_stats_after,
+                            tw_dual_session_compile_stats=(
+                                get_tw_dual_session_compile_stats()
+                            ),
                             backtest_runtime_stats=bt_runtime_after,
                             train_backtest_runtime_stats=train_bt_runtime_after,
                             loss_runtime_stats=train_loss_runtime_after,
@@ -21929,6 +23183,9 @@ def _run_training_impl(
                             ),
                             backtest_compile_stats=bt_stats_after,
                             backtest_prep_compile_stats=bt_prep_stats_after,
+                            tw_dual_session_compile_stats=(
+                                get_tw_dual_session_compile_stats()
+                            ),
                             backtest_runtime_stats=bt_runtime_after,
                             train_backtest_runtime_stats=train_bt_runtime_after,
                             loss_runtime_stats=train_loss_runtime_after,
@@ -22183,7 +23440,8 @@ def _run_training_impl(
                 deployment_test_bt = _prefix_backtest_result(test_bt, deployment_test_rows)
                 deployment_test_dates = test_dates[:deployment_test_rows]
                 write_integer_holdings_table = _save_integer_share_holdings_table_enabled(config)
-                test_integer_bt, holdings_records = run_backtest_integer_shares(
+                test_integer_bt, holdings_records = _run_integer_share_audit_if_supported(
+                    execution_runtime,
                     weights=_integer_audit_requested_weights(test_bt, execution_runtime),
                     future_returns=test_returns.detach().cpu().numpy(),
                     tradable_mask=test_masks.detach().cpu().numpy(),
@@ -22251,7 +23509,11 @@ def _run_training_impl(
                         symbol_indices=test_symbol_indices,
                     ),
                 )
-                test_integer_met = compute_metrics(test_integer_bt)
+                test_integer_met = (
+                    None
+                    if test_integer_bt is None
+                    else compute_metrics(test_integer_bt)
+                )
                 test_report_total = time.perf_counter() - test_report_start
 
                 print(

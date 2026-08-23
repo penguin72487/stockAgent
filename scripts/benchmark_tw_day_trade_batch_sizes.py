@@ -22,6 +22,7 @@ import sys
 import threading
 import time
 from copy import deepcopy
+from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -30,6 +31,12 @@ import yaml
 
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from stockagent.config import load_config
+
+
 DEFAULT_CONFIG = (
     ROOT
     / "artifacts/ablations/tw_day_trade_daily_tplus2_close_commission20_v3_ofat"
@@ -57,7 +64,12 @@ def _is_power_of_two(value: int) -> bool:
     return value > 0 and value & (value - 1) == 0
 
 
-def _parse_batch_sizes(raw: str, *, world_size: int) -> list[int]:
+def _parse_batch_sizes(
+    raw: str,
+    *,
+    world_size: int,
+    require_power_of_two: bool = True,
+) -> list[int]:
     values: list[int] = []
     for part in str(raw).split(","):
         part = part.strip()
@@ -67,14 +79,16 @@ def _parse_batch_sizes(raw: str, *, world_size: int) -> list[int]:
             value = int(part)
         except ValueError as exc:
             raise ValueError(f"invalid batch size {part!r}") from exc
-        if not _is_power_of_two(value):
+        if value <= 0:
+            raise ValueError(f"batch size must be positive, got {value}")
+        if require_power_of_two and not _is_power_of_two(value):
             raise ValueError(f"batch size must be a power of two, got {value}")
         if value % world_size != 0:
             raise ValueError(
                 f"global batch size {value} must be divisible by DDP world size {world_size}"
             )
         local_batch = value // world_size
-        if not _is_power_of_two(local_batch):
+        if require_power_of_two and not _is_power_of_two(local_batch):
             raise ValueError(
                 f"per-rank batch size must be a power of two, got {local_batch} "
                 f"from global={value}, world_size={world_size}"
@@ -417,6 +431,18 @@ def _write_candidate_config(
     path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
 
 
+def _plain_config_value(value: Any) -> Any:
+    """Convert the resolved dataclass tree to portable safe-YAML values."""
+
+    if isinstance(value, dict):
+        return {str(key): _plain_config_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain_config_value(item) for item in value]
+    if isinstance(value, Path):
+        return str(value)
+    return value
+
+
 def _validate_source_contract(config: dict[str, Any]) -> dict[str, Any]:
     training = config.get("training")
     trading = config.get("trading")
@@ -425,13 +451,11 @@ def _validate_source_contract(config: dict[str, Any]) -> dict[str, Any]:
     expected = {
         "trading.execution_mode": "tw_day_trade",
         "trading.frequency": "daily",
-        "training.model_name": "financial_transformer",
         "training.loss_type": "log_utility",
     }
     actual = {
         "trading.execution_mode": trading.get("execution_mode"),
         "trading.frequency": trading.get("frequency"),
-        "training.model_name": training.get("model_name"),
         "training.loss_type": training.get("loss_type"),
     }
     disagreements = [
@@ -441,6 +465,25 @@ def _validate_source_contract(config: dict[str, Any]) -> dict[str, Any]:
     ]
     if disagreements:
         raise ValueError("source config is not the requested daily day-trade contract: " + "; ".join(disagreements))
+    model_name = str(training.get("model_name", "")).strip().lower()
+    if model_name not in {
+        "financial_transformer",
+        "executable_portfolio_transformer",
+    }:
+        raise ValueError(
+            "batch benchmark supports financial_transformer or "
+            f"executable_portfolio_transformer, got {model_name!r}"
+        )
+    actual["training.model_name"] = model_name
+    if model_name == "executable_portfolio_transformer":
+        if not bool(trading.get("tw_day_trade_unlimited_margin_conversion")):
+            raise ValueError(
+                "executable portfolio benchmark requires stateful margin conversion"
+            )
+        if bool(trading.get("tw_short_capacity_limit_enabled")):
+            raise ValueError(
+                "executable portfolio benchmark requires unbounded short capacity"
+            )
     return actual
 
 
@@ -647,6 +690,14 @@ def main() -> None:
         "--batch-sizes",
         default=",".join(str(value) for value in DEFAULT_BATCH_SIZES),
     )
+    parser.add_argument(
+        "--allow-non-power-of-two",
+        action="store_true",
+        help=(
+            "allow fixed global/local batches outside the default power-of-two "
+            "frontier (useful for bounded searches between a winner and OOM)"
+        ),
+    )
     parser.add_argument("--batch-size-eval", type=int, default=128)
     parser.add_argument("--start-fold", type=int, default=12)
     parser.add_argument("--epochs", type=int, default=8)
@@ -679,7 +730,11 @@ def main() -> None:
     if args.world_size < 2:
         raise SystemExit("this production benchmark requires at least two DDP GPUs")
     try:
-        batch_sizes = _parse_batch_sizes(args.batch_sizes, world_size=args.world_size)
+        batch_sizes = _parse_batch_sizes(
+            args.batch_sizes,
+            world_size=args.world_size,
+            require_power_of_two=not args.allow_non_power_of_two,
+        )
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
     if not _is_power_of_two(args.batch_size_eval):
@@ -699,10 +754,10 @@ def main() -> None:
     except RuntimeError as exc:
         raise SystemExit(str(exc)) from exc
     args.output_root.mkdir(parents=True, exist_ok=True)
-    base = yaml.safe_load(args.config.read_text(encoding="utf-8"))
-    if not isinstance(base, dict):
-        raise SystemExit(f"config root must be a mapping: {args.config}")
     try:
+        base = _plain_config_value(asdict(load_config(args.config)))
+        if not isinstance(base, dict):
+            raise ValueError(f"resolved config root must be a mapping: {args.config}")
         source_contract = _validate_source_contract(base)
         _run_environment_preflight(
             args.python,

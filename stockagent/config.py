@@ -74,6 +74,13 @@ _TW_FINANCIAL_PHASE_HEAD_MODEL_NAMES = frozenset(
         "financial_tokenized_transformer",
     }
 )
+_EXECUTABLE_PORTFOLIO_TRANSFORMER_NAMES = frozenset(
+    {
+        "executable_portfolio_transformer",
+        "executable_portfolio_transformer_model",
+        "execution_aware_portfolio_transformer",
+    }
+)
 
 # Keep this synchronized with the canonical phase-action boundary in
 # stockagent.training.loss.risk_aware_loss.  Rank/factor/autoencoder objectives
@@ -247,6 +254,132 @@ def _normalize_temporal_basis_input(value: object) -> str:
             "'input_features'"
         )
     return normalized
+
+
+def _validate_executable_portfolio_transformer_contract(
+    *,
+    model_name: object,
+    execution_mode: object,
+    frequency: object,
+    loss_type: object,
+    long_only: object,
+    min_trade_weight: object,
+    max_turnover_ratio: object,
+    max_volume_participation: object,
+    volume_participation_equity: object,
+    day_trade_unlimited_margin_conversion: object,
+    short_capacity_limit_enabled: object,
+    day_trade_minute_execution_root: object,
+    trading_portfolio_activation: object,
+    loss_portfolio_activation: object,
+    model_config: dict[str, Any],
+    multitask_config: dict[str, Any],
+) -> None:
+    """Validate the rule-only contract of the execution-conditioned policy."""
+
+    if _normalized_contract_name(model_name) not in (
+        _EXECUTABLE_PORTFOLIO_TRANSFORMER_NAMES
+    ):
+        return
+    if normalize_execution_mode(str(execution_mode)) != "tw_day_trade":
+        raise ValueError(
+            "executable_portfolio_transformer currently requires "
+            "trading.execution_mode='tw_day_trade'"
+        )
+    if _normalized_contract_name(frequency) != "daily":
+        raise ValueError(
+            "executable_portfolio_transformer currently requires daily decisions"
+        )
+    if day_trade_minute_execution_root is not None:
+        raise ValueError(
+            "executable_portfolio_transformer uses the causal daily stateful "
+            "OPEN/CLOSE ledger; the legacy minute tape cannot preserve residual "
+            "financed or borrowed inventory"
+        )
+    if not bool(day_trade_unlimited_margin_conversion):
+        raise ValueError(
+            "executable_portfolio_transformer requires "
+            "tw_day_trade_unlimited_margin_conversion=true"
+        )
+    if bool(short_capacity_limit_enabled):
+        raise ValueError(
+            "this executable_portfolio_transformer contract defines margin-short "
+            "capacity as unbounded; set tw_short_capacity_limit_enabled=false"
+        )
+    if _normalized_contract_name(loss_type) not in _TW_PHASE_RETURN_OBJECTIVES:
+        raise ValueError(
+            "executable_portfolio_transformer requires canonical net log utility"
+        )
+    if bool(long_only):
+        raise ValueError(
+            "executable_portfolio_transformer requires long/short actions"
+        )
+    if float(min_trade_weight) != 0.0:
+        raise ValueError(
+            "executable_portfolio_transformer forbids a model-side minimum weight"
+        )
+    if float(max_turnover_ratio) != 0.0:
+        raise ValueError(
+            "executable_portfolio_transformer leaves turnover to execution costs; "
+            "trading.max_turnover_ratio must be 0"
+        )
+    max_participation = float(max_volume_participation)
+    if not math.isfinite(max_participation) or not 0.0 < max_participation <= 1.0:
+        raise ValueError(
+            "executable_portfolio_transformer requires finite "
+            "max_volume_participation in (0, 1]"
+        )
+    reference_equity = float(volume_participation_equity)
+    if not math.isfinite(reference_equity) or reference_equity <= 0.0:
+        raise ValueError(
+            "executable_portfolio_transformer requires positive finite "
+            "volume_participation_equity"
+        )
+    if normalize_portfolio_output_mode(
+        str(model_config.get("portfolio_output_mode"))
+    ) != "projection_l1":
+        raise ValueError(
+            "executable_portfolio_transformer requires portfolio_output_mode="
+            "'projection_l1' so cash is an unforced L1-ball residual"
+        )
+    if bool(model_config.get("center_long_short_logits", True)):
+        raise ValueError(
+            "executable_portfolio_transformer forbids forced cross-sectional "
+            "logit centering"
+        )
+    if not bool(model_config.get("projection_l1_scale_by_active_count", False)):
+        raise ValueError(
+            "executable_portfolio_transformer requires "
+            "projection_l1_scale_by_active_count=true"
+        )
+    for field_name, raw_value in {
+        "trading.portfolio_activation": trading_portfolio_activation,
+        "training.loss_portfolio_activation": loss_portfolio_activation,
+    }.items():
+        if normalize_portfolio_activation(str(raw_value)) != "pre_normalized":
+            raise ValueError(
+                f"{field_name} must be 'pre_normalized' because the model "
+                "already emits an L1-ball action"
+            )
+    preference_fields = (
+        "rank_ic_weight",
+        "return_rank_ic_weight",
+        "direction_weight",
+        "volatility_regime_weight",
+        "concentration_weight",
+        "net_exposure_weight",
+    )
+    enabled_preferences = [
+        name
+        for name in preference_fields
+        if float(multitask_config.get(name, 0.0)) != 0.0
+    ]
+    if enabled_preferences:
+        raise ValueError(
+            "executable_portfolio_transformer accepts only realized net log "
+            "utility plus execution rules; set these preference losses to 0: "
+            + ", ".join(enabled_preferences)
+        )
 
 
 def _validate_tw_phase_mode_contract(
@@ -1354,12 +1487,31 @@ class TransformerBasePortfolioModelConfig:
 @dataclass(slots=True)
 class FinancialTransformerModelConfig(TransformerBasePortfolioModelConfig):
     candle_dropout: float = 0.0
+    # Disabled by default so historical checkpoints retain their original AMP
+    # operation order. New experiments may opt into the algebraically
+    # equivalent rank-lookback contraction explicitly.
+    temporal_basis_algebraic_contraction: bool = False
     # The minute path may fuse a separately encoded causal history of completed
     # daily features.  A value of one preserves the historical broadcast-only
     # checkpoint schema; values greater than one create a new model contract.
     daily_context_lookback: int = 1
     daily_context_layers: int = 0
     daily_context_pooling: str = "last"
+
+
+@dataclass(slots=True)
+class ExecutablePortfolioTransformerModelConfig(FinancialTransformerModelConfig):
+    # Ablation-safe switch for the learned execution-context conditioning
+    # branch.  Point-in-time context is still required and the exact hard
+    # direction gate still applies when this is false; only the learned
+    # context encoder/fusion is removed.
+    use_execution_context_features: bool = True
+    # Width of the learned adapter that conditions the stock representation on
+    # point-in-time execution permissions and reference-notional capacities.
+    execution_context_hidden_dim: int = 32
+    # v2 contains only opening-time permissions plus prior-session capacities;
+    # v1 also exposed close outcomes and is not checkpoint-compatible.
+    execution_context_schema_version: int = 2
 
 
 @dataclass(slots=True)
@@ -1500,6 +1652,21 @@ class TrainingConfig:
     seed: int = 42
     multi_gpu_strategy: str = "auto"
     ddp_bucket_cap_mb: int = 4
+    # Keep the policy model time-sharded under DDP, then transpose the action
+    # and execution tensors to contiguous symbol shards for the recurrent
+    # carrying ledger. PyTorch functional collectives own autograd; there is no
+    # handwritten distributed VJP.
+    distributed_symbol_sharded_ledger: bool = False
+    # Replicated-ledger DDP needs global chronological execution metadata, but
+    # every rank already owns the same immutable panel.  When enabled, gather
+    # only differentiable model actions and slice returns/masks/capacities from
+    # the rank-local panel instead of retransmitting them over NCCL.
+    distributed_replicated_ledger_local_metadata: bool = False
+    # Measurement-preserving ablation switches for the symbol-sharded executor.
+    # They change only collective launch structure, never ledger mathematics.
+    distributed_symbol_sharded_pack_metadata: bool = True
+    distributed_symbol_sharded_pack_scalars: bool = True
+    distributed_symbol_sharded_skip_noop_collectives: bool = True
     enable_torch_compile: bool = True
     auto_torch_compile_sharpe: bool = False
     torch_compile_mode: str = "reduce-overhead"
@@ -1534,6 +1701,10 @@ class TrainingConfig:
     backtest_compile: bool = True
     backtest_compile_stateful: bool = True
     backtest_compile_dynamic: bool = False
+    # Capture the already-compiled one-day Taiwan transition replays as one
+    # autograd-aware CUDA Graph.  This avoids launch overhead without asking
+    # Inductor to unroll and code-generate a pathological full-horizon FX graph.
+    tw_dual_session_cuda_graph: bool = False
     # Compile Taiwan's sequential settlement ledger in bounded time chunks.
     # Zero disables chunk compilation; eight avoids full-horizon graph blowup.
     tw_continuous_compile_chunk_rows: int = 8
@@ -1711,6 +1882,9 @@ class TrainingConfig:
     financial_transformer: FinancialTransformerModelConfig = field(
         default_factory=FinancialTransformerModelConfig
     )
+    executable_portfolio_transformer: ExecutablePortfolioTransformerModelConfig = field(
+        default_factory=ExecutablePortfolioTransformerModelConfig
+    )
     gradient_boosted_portfolio_transformer: GradientBoostedPortfolioTransformerConfig = field(
         default_factory=GradientBoostedPortfolioTransformerConfig
     )
@@ -1782,6 +1956,7 @@ def _nested_training_schemas() -> dict[str, type[Any]]:
         "low_rank_market_transformer_portfolio": LowRankMarketTransformerPortfolioModelConfig,
         "transformer_base_portfolio": TransformerBasePortfolioModelConfig,
         "financial_transformer": FinancialTransformerModelConfig,
+        "executable_portfolio_transformer": ExecutablePortfolioTransformerModelConfig,
         "gradient_boosted_portfolio_transformer": GradientBoostedPortfolioTransformerConfig,
         "bottleneck_portfolio_autoencoder": BottleneckPortfolioAutoencoderConfig,
         "tcn_hybrid_tabular_resnet": TCNHybridTabularResNetModelConfig,
@@ -2205,6 +2380,9 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     financial_transformer_overrides = deepcopy(
         training.get("financial_transformer", {})
     )
+    executable_portfolio_transformer_overrides = deepcopy(
+        training.get("executable_portfolio_transformer", {})
+    )
 
     transformer_base_portfolio = training.setdefault("transformer_base_portfolio", {})
     _set_legacy_alias_defaults(transformer_base_portfolio, {"dropout": legacy_dropout})
@@ -2363,6 +2541,9 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     financial_transformer["temporal_basis_input"] = _normalize_temporal_basis_input(
         financial_transformer["temporal_basis_input"]
     )
+    financial_transformer["temporal_basis_algebraic_contraction"] = bool(
+        financial_transformer["temporal_basis_algebraic_contraction"]
+    )
     financial_transformer["categorical_embedding_dim"] = max(
         1, int(financial_transformer["categorical_embedding_dim"])
     )
@@ -2387,6 +2568,129 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
             "one of: last, mean, attention"
         )
     financial_transformer["daily_context_pooling"] = daily_context_pooling
+
+    # The executable policy inherits the complete Financial Transformer
+    # contract, then adds only its execution-context adapter.  Keeping this as
+    # a separate section gives it an independent checkpoint fingerprint and
+    # prevents an old Financial Transformer optimizer from being resumed.
+    executable_portfolio_transformer = _deep_merge_config(
+        deepcopy(financial_transformer),
+        executable_portfolio_transformer_overrides,
+    )
+    training["executable_portfolio_transformer"] = (
+        executable_portfolio_transformer
+    )
+    _set_dataclass_defaults(
+        executable_portfolio_transformer,
+        ExecutablePortfolioTransformerModelConfig,
+    )
+    executable_portfolio_transformer["portfolio_output_mode"] = (
+        normalize_portfolio_output_mode(
+            executable_portfolio_transformer.get("portfolio_output_mode")
+        )
+    )
+    executable_portfolio_transformer["categorical_feature_names"] = (
+        _normalize_string_list(
+            executable_portfolio_transformer.get("categorical_feature_names"),
+            field_name=(
+                "training.executable_portfolio_transformer."
+                "categorical_feature_names"
+            ),
+        )
+    )
+    executable_portfolio_transformer["temporal_basis_families"] = (
+        _normalize_string_list(
+            executable_portfolio_transformer.get("temporal_basis_families"),
+            field_name=(
+                "training.executable_portfolio_transformer."
+                "temporal_basis_families"
+            ),
+        )
+    )
+    executable_portfolio_transformer["temporal_basis_components"] = max(
+        1,
+        int(executable_portfolio_transformer["temporal_basis_components"]),
+    )
+    executable_portfolio_transformer["temporal_basis_components_by_family"] = (
+        _normalize_temporal_basis_component_map(
+            executable_portfolio_transformer.get(
+                "temporal_basis_components_by_family"
+            ),
+            field_name=(
+                "training.executable_portfolio_transformer."
+                "temporal_basis_components_by_family"
+            ),
+        )
+    )
+    executable_novelty_threshold = float(
+        executable_portfolio_transformer["temporal_basis_novelty_threshold"]
+    )
+    if not math.isfinite(executable_novelty_threshold) or not (
+        0.0 <= executable_novelty_threshold < 1.0
+    ):
+        raise ValueError(
+            "training.executable_portfolio_transformer."
+            "temporal_basis_novelty_threshold must be finite and in [0, 1)"
+        )
+    executable_portfolio_transformer["temporal_basis_novelty_threshold"] = (
+        executable_novelty_threshold
+    )
+    executable_portfolio_transformer["temporal_basis_input"] = (
+        _normalize_temporal_basis_input(
+            executable_portfolio_transformer["temporal_basis_input"]
+        )
+    )
+    executable_portfolio_transformer["temporal_basis_algebraic_contraction"] = bool(
+        executable_portfolio_transformer[
+            "temporal_basis_algebraic_contraction"
+        ]
+    )
+    executable_portfolio_transformer["categorical_embedding_dim"] = max(
+        1,
+        int(executable_portfolio_transformer["categorical_embedding_dim"]),
+    )
+    executable_portfolio_transformer["categorical_embedding_cardinality"] = max(
+        2,
+        int(
+            executable_portfolio_transformer[
+                "categorical_embedding_cardinality"
+            ]
+        ),
+    )
+    executable_portfolio_transformer["daily_context_lookback"] = max(
+        1,
+        int(executable_portfolio_transformer["daily_context_lookback"]),
+    )
+    executable_portfolio_transformer["daily_context_layers"] = max(
+        0,
+        int(executable_portfolio_transformer["daily_context_layers"]),
+    )
+    executable_daily_pooling = (
+        str(executable_portfolio_transformer["daily_context_pooling"])
+        .strip()
+        .lower()
+        .replace("-", "_")
+    )
+    if executable_daily_pooling not in {"last", "mean", "attention"}:
+        raise ValueError(
+            "training.executable_portfolio_transformer.daily_context_pooling "
+            "must be one of: last, mean, attention"
+        )
+    executable_portfolio_transformer["daily_context_pooling"] = (
+        executable_daily_pooling
+    )
+    executable_portfolio_transformer["execution_context_hidden_dim"] = max(
+        1,
+        int(executable_portfolio_transformer["execution_context_hidden_dim"]),
+    )
+    executable_portfolio_transformer["execution_context_schema_version"] = int(
+        executable_portfolio_transformer["execution_context_schema_version"]
+    )
+    if executable_portfolio_transformer["execution_context_schema_version"] != 2:
+        raise ValueError(
+            "training.executable_portfolio_transformer."
+            "execution_context_schema_version must be 2"
+        )
 
     gradient_boosted_portfolio_transformer = training.setdefault(
         "gradient_boosted_portfolio_transformer", {}
@@ -2834,10 +3138,35 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     _set_dataclass_defaults(trading, TradingConfig)
     trading["execution_mode"] = normalize_execution_mode(trading["execution_mode"])
     normalized_phase_model = _normalized_contract_name(training["model_name"])
-    phase_model_config = (
-        training["financial_transformer"]
-        if normalized_phase_model in _TW_FINANCIAL_PHASE_HEAD_MODEL_NAMES
-        else training["transformer_base_portfolio"]
+    if normalized_phase_model in _EXECUTABLE_PORTFOLIO_TRANSFORMER_NAMES:
+        phase_model_config = training["executable_portfolio_transformer"]
+    elif normalized_phase_model in _TW_FINANCIAL_PHASE_HEAD_MODEL_NAMES:
+        phase_model_config = training["financial_transformer"]
+    else:
+        phase_model_config = training["transformer_base_portfolio"]
+    _validate_executable_portfolio_transformer_contract(
+        model_name=training["model_name"],
+        execution_mode=trading["execution_mode"],
+        frequency=trading["frequency"],
+        loss_type=training["loss_type"],
+        long_only=trading["long_only"],
+        min_trade_weight=trading["min_trade_weight"],
+        max_turnover_ratio=trading["max_turnover_ratio"],
+        max_volume_participation=trading["max_volume_participation"],
+        volume_participation_equity=trading["volume_participation_equity"],
+        day_trade_unlimited_margin_conversion=trading[
+            "tw_day_trade_unlimited_margin_conversion"
+        ],
+        short_capacity_limit_enabled=trading[
+            "tw_short_capacity_limit_enabled"
+        ],
+        day_trade_minute_execution_root=data[
+            "day_trade_minute_execution_root"
+        ],
+        trading_portfolio_activation=trading["portfolio_activation"],
+        loss_portfolio_activation=training["loss_portfolio_activation"],
+        model_config=training["executable_portfolio_transformer"],
+        multitask_config=training["multitask_loss"],
     )
     _validate_tw_phase_mode_contract(
         execution_mode=trading["execution_mode"],
@@ -3472,6 +3801,21 @@ def load_config(path: str | Path) -> ExperimentConfig:
             seed=training_raw["seed"],
             multi_gpu_strategy=training_raw["multi_gpu_strategy"],
             ddp_bucket_cap_mb=training_raw["ddp_bucket_cap_mb"],
+            distributed_symbol_sharded_ledger=training_raw[
+                "distributed_symbol_sharded_ledger"
+            ],
+            distributed_replicated_ledger_local_metadata=training_raw[
+                "distributed_replicated_ledger_local_metadata"
+            ],
+            distributed_symbol_sharded_pack_metadata=training_raw[
+                "distributed_symbol_sharded_pack_metadata"
+            ],
+            distributed_symbol_sharded_pack_scalars=training_raw[
+                "distributed_symbol_sharded_pack_scalars"
+            ],
+            distributed_symbol_sharded_skip_noop_collectives=training_raw[
+                "distributed_symbol_sharded_skip_noop_collectives"
+            ],
             enable_torch_compile=training_raw["enable_torch_compile"],
             auto_torch_compile_sharpe=training_raw["auto_torch_compile_sharpe"],
             torch_compile_mode=training_raw["torch_compile_mode"],
@@ -3499,6 +3843,9 @@ def load_config(path: str | Path) -> ExperimentConfig:
             backtest_compile=training_raw["backtest_compile"],
             backtest_compile_stateful=training_raw["backtest_compile_stateful"],
             backtest_compile_dynamic=training_raw["backtest_compile_dynamic"],
+            tw_dual_session_cuda_graph=training_raw[
+                "tw_dual_session_cuda_graph"
+            ],
             tw_continuous_compile_chunk_rows=training_raw[
                 "tw_continuous_compile_chunk_rows"
             ],
@@ -3718,6 +4065,9 @@ def load_config(path: str | Path) -> ExperimentConfig:
             ),
             financial_transformer=FinancialTransformerModelConfig(
                 **training_raw["financial_transformer"]
+            ),
+            executable_portfolio_transformer=ExecutablePortfolioTransformerModelConfig(
+                **training_raw["executable_portfolio_transformer"]
             ),
             gradient_boosted_portfolio_transformer=GradientBoostedPortfolioTransformerConfig(
                 **training_raw["gradient_boosted_portfolio_transformer"]

@@ -1,14 +1,15 @@
 """Lease-based hot cache for immutable packed dataset releases.
 
 The packed Syncthing tree is the durable cold copy.  Materialized trees are
-verified, replaceable caches: ``use`` renews a lease and ``gc`` removes only
-expired, manifest-backed trees that are not pinned or referenced by a running
-process.
+verified, replaceable caches: ``use`` renews a lease, while periodic ``gc``
+automatically renews leases referenced by a running process and removes only
+expired, manifest-backed trees that are not pinned or in use.
 """
 
 from __future__ import annotations
 
 import json
+import math
 import os
 import shutil
 import time
@@ -141,7 +142,7 @@ def use_materialized_snapshot(
 ) -> dict[str, Any]:
     """Materialize a packed release and renew its local hot-cache lease."""
 
-    if ttl_days <= 0:
+    if not math.isfinite(ttl_days) or ttl_days <= 0:
         raise SnapshotError("cache ttl_days must be positive")
     sync_root = sync_root.resolve()
     materialized_root = materialized_root.resolve()
@@ -338,6 +339,59 @@ def _unlink_registered_links(lease: Mapping[str, Any], target: Path) -> list[str
     return removed
 
 
+def _auto_renew_active_lease(
+    lease_path: Path,
+    lease: dict[str, Any],
+    *,
+    now_ns: int,
+    dry_run: bool,
+    references: list[str],
+) -> dict[str, Any]:
+    """Extend a managed hot lease after observing a live process reference."""
+
+    try:
+        ttl_days = float(lease.get("ttl_days", DEFAULT_CACHE_TTL_DAYS))
+    except (TypeError, ValueError):
+        ttl_days = 0.0
+    if not math.isfinite(ttl_days) or ttl_days <= 0:
+        return {
+            "action": "keep",
+            "reason": "in-use-invalid-lease-ttl",
+            "process_references": references,
+        }
+
+    previous_expires_ns = int(lease.get("expires_ns", 0))
+    renewed_expires_ns = max(
+        previous_expires_ns,
+        now_ns + int(ttl_days * 86_400 * 1_000_000_000),
+    )
+    result: dict[str, Any] = {
+        "action": "would-renew" if dry_run else "renewed",
+        "reason": "in-use-auto-renewed",
+        "process_references": references,
+        "previous_expires_at": lease.get("expires_at"),
+        "expires_at": _utc_iso_from_ns(renewed_expires_ns),
+    }
+    if dry_run:
+        return result
+
+    lease.update(
+        {
+            "state": "hot",
+            "last_used_ns": now_ns,
+            "last_used_at": _utc_iso_from_ns(now_ns),
+            "expires_ns": renewed_expires_ns,
+            "expires_at": _utc_iso_from_ns(renewed_expires_ns),
+            "auto_renewed_ns": now_ns,
+            "auto_renewed_at": _utc_iso_from_ns(now_ns),
+            "auto_renewal_count": int(lease.get("auto_renewal_count", 0)) + 1,
+            "auto_renewal_evidence": references,
+        }
+    )
+    atomic_write_json(lease_path, lease)
+    return result
+
+
 def _evict_one(
     sync_root: Path,
     materialized_root: Path,
@@ -360,8 +414,6 @@ def _evict_one(
         "reason": "lease-active",
         "expires_at": lease.get("expires_at"),
     }
-    if not force and int(lease.get("expires_ns", 0)) > now_ns:
-        return result
     if snapshot_id in pinned:
         result["reason"] = "pinned"
         return result
@@ -409,8 +461,21 @@ def _evict_one(
         return result
     references = process_references(target)
     if references:
-        result["reason"] = "in-use"
-        result["process_references"] = references
+        if not force:
+            result.update(
+                _auto_renew_active_lease(
+                    lease_path,
+                    lease,
+                    now_ns=now_ns,
+                    dry_run=dry_run,
+                    references=references,
+                )
+            )
+        else:
+            result["reason"] = "in-use"
+            result["process_references"] = references
+        return result
+    if not force and int(lease.get("expires_ns", 0)) > now_ns:
         return result
     result["action"] = "would-evict" if dry_run else "evicted"
     result["reason"] = "forced" if force else "lease-expired"
@@ -492,6 +557,10 @@ def evict_materialized_snapshots(
         "checked": len(results),
         "evicted": sum(item["action"] == "evicted" for item in results),
         "would_evict": sum(item["action"] == "would-evict" for item in results),
+        "renewed": sum(item["action"] == "renewed" for item in results),
+        "would_renew": sum(
+            item["action"] == "would-renew" for item in results
+        ),
         "kept": sum(item["action"] == "keep" for item in results),
         "results": results,
     }

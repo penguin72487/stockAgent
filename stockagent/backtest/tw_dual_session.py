@@ -26,9 +26,18 @@ Lower-precision model actions are promoted before entering the ledger.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Literal
 
 import torch
+
+from stockagent.backtest.distributed_reduction import (
+    global_symbol_any,
+    global_symbol_scalar_pack,
+    global_symbol_sum,
+    global_symbol_tensor_sum,
+    symbol_sharded_skip_noop_collectives_enabled,
+)
 
 from stockagent.backtest.tw_commission_rebate import (
     apply_commission_rebate_at_close,
@@ -86,6 +95,7 @@ class TaiwanDualSessionResult:
     equity_scale_history: torch.Tensor
     short_sale_collateral_history: torch.Tensor
     short_margin_collateral_history: torch.Tensor
+    long_margin_debt_history: torch.Tensor
     final_weights: torch.Tensor
     final_cash: torch.Tensor
     final_payables: torch.Tensor
@@ -94,6 +104,7 @@ class TaiwanDualSessionResult:
     final_equity_scale: torch.Tensor
     final_short_sale_collateral: torch.Tensor
     final_short_margin_collateral: torch.Tensor
+    final_long_margin_debt: torch.Tensor
     commission_rebate_accrued_history: torch.Tensor
     commission_rebate_paid_history: torch.Tensor
     commission_rebate_current_history: torch.Tensor
@@ -104,11 +115,13 @@ class TaiwanDualSessionResult:
     final_commission_rebate_month_id: torch.Tensor
     due_weights_history: torch.Tensor | None = None
     final_due_weights: torch.Tensor | None = None
+    default_reason_history: torch.Tensor | None = None
 
 
 @dataclass(slots=True)
 class _EventResult:
     risky: torch.Tensor
+    long_margin_debt: torch.Tensor
     short_sale_collateral: torch.Tensor
     short_margin_collateral: torch.Tensor
     pending_net_claim: torch.Tensor
@@ -274,13 +287,27 @@ def _cash_margin_nav(
     receivables: torch.Tensor,
     short_sale_collateral: torch.Tensor,
     short_margin_collateral: torch.Tensor,
+    long_margin_debt: torch.Tensor,
     pending_net_claim: torch.Tensor,
+    symbol_sharded: bool = False,
 ) -> torch.Tensor:
+    risky_total, short_sale_total, short_margin_total, long_debt_total = (
+        global_symbol_scalar_pack(
+            (
+                risky.sum(),
+                short_sale_collateral.sum(),
+                short_margin_collateral.sum(),
+                long_margin_debt.sum(),
+            ),
+            symbol_sharded=symbol_sharded,
+        )
+    )
     return (
         cash
-        + risky.sum()
-        + short_sale_collateral.sum()
-        + short_margin_collateral.sum()
+        + risky_total
+        + short_sale_total
+        + short_margin_total
+        - long_debt_total
         + receivables.sum()
         - payables.sum()
         + pending_net_claim
@@ -297,8 +324,10 @@ def _kill_finance_state(
     receivables: torch.Tensor,
     short_sale_collateral: torch.Tensor,
     short_margin_collateral: torch.Tensor,
+    long_margin_debt: torch.Tensor,
     pending_net_claim: torch.Tensor,
 ) -> tuple[
+    torch.Tensor,
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
@@ -323,6 +352,11 @@ def _kill_finance_state(
         short_margin_collateral,
         torch.zeros_like(short_margin_collateral),
     )
+    long_margin_debt = torch.where(
+        survived,
+        long_margin_debt,
+        torch.zeros_like(long_margin_debt),
+    )
     pending_net_claim = torch.where(
         survived,
         pending_net_claim,
@@ -336,6 +370,7 @@ def _kill_finance_state(
         receivables,
         short_sale_collateral,
         short_margin_collateral,
+        long_margin_debt,
         pending_net_claim,
     )
 
@@ -406,20 +441,24 @@ def _cap_group_by_vector(
 def _cap_group_by_scalar(
     values: tuple[torch.Tensor, ...],
     remaining: torch.Tensor | None,
+    *,
+    symbol_sharded: bool = False,
 ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor | None]:
     if remaining is None:
         return values, None
-    total = torch.zeros_like(remaining)
-    for value in values:
-        total = total + value.sum()
+    total = global_symbol_sum(
+        torch.stack(tuple(value.sum() for value in values)),
+        symbol_sharded=symbol_sharded,
+    )
     scale = torch.minimum(
         torch.ones_like(total),
         remaining / total.clamp_min(1.0e-12),
     )
     capped = tuple(value * scale for value in values)
-    used = torch.zeros_like(total)
-    for value in capped:
-        used = used + value.sum()
+    used = global_symbol_sum(
+        torch.stack(tuple(value.sum() for value in capped)),
+        symbol_sharded=symbol_sharded,
+    )
     return capped, (remaining - used).clamp_min(0.0)
 
 
@@ -602,27 +641,55 @@ def _max_feasible_cover_on_ray(
     collateral_total: torch.Tensor,
     maintenance_ratio: torch.Tensor,
     fixed_funding_margin: torch.Tensor,
+    symbol_sharded: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Reduce one cover ray to affine coefficients and solve it globally."""
+
+    coefficients = global_symbol_scalar_pack(
+        _cover_ray_local_coefficients(
+            short_after_mandatory=short_after_mandatory,
+            anchor_cover=anchor_cover,
+            scalable_cover=scalable_cover,
+            collateral_per_short=collateral_per_short,
+            cover_cost_rates=cover_cost_rates,
+            mandatory_release=mandatory_release,
+        ),
+        symbol_sharded=symbol_sharded,
+    )
+    return _max_feasible_cover_scale(
+        remaining_intercept=coefficients[0],
+        remaining_slope=coefficients[1],
+        proportional_intercept=coefficients[2],
+        proportional_slope=coefficients[3],
+        cost_intercept=coefficients[4],
+        cost_slope=coefficients[5],
+        collateral_total=collateral_total,
+        maintenance_ratio=maintenance_ratio,
+        fixed_funding_margin=fixed_funding_margin,
+    )
+
+
+def _cover_ray_local_coefficients(
+    *,
+    short_after_mandatory: torch.Tensor,
+    anchor_cover: torch.Tensor,
+    scalable_cover: torch.Tensor,
+    collateral_per_short: torch.Tensor,
+    cover_cost_rates: torch.Tensor,
+    mandatory_release: torch.Tensor,
+) -> tuple[torch.Tensor, ...]:
+    """Return one shard's six affine cover-ray contributions."""
 
     remaining_after_anchor = (
         short_after_mandatory - anchor_cover
     ).clamp_min(0.0)
-    return _max_feasible_cover_scale(
-        remaining_intercept=remaining_after_anchor.sum(),
-        remaining_slope=scalable_cover.sum(),
-        proportional_intercept=(
-            mandatory_release
-            + (anchor_cover * collateral_per_short).sum()
-        ),
-        proportional_slope=(
-            scalable_cover * collateral_per_short
-        ).sum(),
-        cost_intercept=(anchor_cover * cover_cost_rates).sum(),
-        cost_slope=(scalable_cover * cover_cost_rates).sum(),
-        collateral_total=collateral_total,
-        maintenance_ratio=maintenance_ratio,
-        fixed_funding_margin=fixed_funding_margin,
+    return (
+        remaining_after_anchor.sum(),
+        scalable_cover.sum(),
+        mandatory_release + (anchor_cover * collateral_per_short).sum(),
+        (scalable_cover * collateral_per_short).sum(),
+        (anchor_cover * cover_cost_rates).sum(),
+        (scalable_cover * cover_cost_rates).sum(),
     )
 
 
@@ -639,6 +706,8 @@ def _execute_signed_event(
     sell_fees: torch.Tensor,
     margin_rates: torch.Tensor,
     short_handling_rates: torch.Tensor,
+    long_margin_debt: torch.Tensor,
+    long_margin_repayment_exempt: torch.Tensor,
     short_sale_collateral: torch.Tensor,
     short_margin_collateral: torch.Tensor,
     cash: torch.Tensor,
@@ -653,6 +722,8 @@ def _execute_signed_event(
     maintenance_ratio: torch.Tensor,
     alive: torch.Tensor,
     advance: torch.Tensor,
+    blocked_mandatory_defaults: bool = True,
+    symbol_sharded: bool = False,
 ) -> _EventResult:
     """Execute one signed target transition without aging or enqueueing T+2."""
 
@@ -673,10 +744,34 @@ def _execute_signed_event(
     blocked_mandatory = (
         ((mandatory_long_sell > _POSITION_TOLERANCE) & ~can_sell)
         | ((mandatory_short_cover > _POSITION_TOLERANCE) & ~can_buy)
-    ).any()
-    event_default = active & blocked_mandatory
+    )
+    skip_noop_collectives = symbol_sharded_skip_noop_collectives_enabled()
+    if blocked_mandatory_defaults or (symbol_sharded and not skip_noop_collectives):
+        blocked_any = global_symbol_any(
+            blocked_mandatory,
+            symbol_sharded=symbol_sharded,
+        )
+        event_default = (
+            active & blocked_any
+            if blocked_mandatory_defaults
+            else torch.zeros_like(active)
+        )
+    else:
+        event_default = torch.zeros_like(active)
     event_alive = alive & ~event_default
     active = event_alive & advance
+
+    if not blocked_mandatory_defaults:
+        mandatory_long_sell = torch.where(
+            can_sell,
+            mandatory_long_sell,
+            torch.zeros_like(mandatory_long_sell),
+        )
+        mandatory_short_cover = torch.where(
+            can_buy,
+            mandatory_short_cover,
+            torch.zeros_like(mandatory_short_cover),
+        )
 
     mandatory_long_sell = torch.where(
         active,
@@ -718,6 +813,7 @@ def _execute_signed_event(
     (capped_magnitude,), _ = _cap_group_by_scalar(
         (capped_magnitude,),
         remaining_turnover,
+        symbol_sharded=symbol_sharded,
     )
     liquidity_target = base + requested_delta.sign() * capped_magnitude
 
@@ -731,30 +827,67 @@ def _execute_signed_event(
     voluntary_short_cover = (base_short - desired_short).clamp_min(0.0)
     voluntary_short_open = (desired_short - base_short).clamp_min(0.0)
 
+    # A carried margin loan is a nominal liability attached to the current
+    # long inventory.  Selling that inventory releases only the sale proceeds
+    # net of the proportional principal repayment.  Keeping the debt inside
+    # the event funding calculation is essential: otherwise one could use the
+    # broker-financed principal a second time to fund a new position.
+    margin_backed_long = (
+        current_long - long_margin_repayment_exempt.clamp_min(0.0)
+    ).clamp_min(0.0)
+    repayable_long_sell = (
+        mandatory_long_sell
+        + voluntary_long_sell
+        - long_margin_repayment_exempt.clamp_min(0.0)
+    ).clamp_min(0.0)
+    long_debt_per_notional = torch.where(
+        margin_backed_long > _POSITION_TOLERANCE,
+        long_margin_debt / margin_backed_long.clamp_min(1.0e-12),
+        torch.zeros_like(margin_backed_long),
+    )
+    long_margin_repayment = torch.minimum(
+        long_margin_debt,
+        repayable_long_sell * long_debt_per_notional,
+    )
+    # Proportional FP32 arithmetic can leave a one-ulp loan residue when the
+    # final margin-backed inventory is sold.  Principal is indivisible at that
+    # endpoint: if no economically meaningful backed long remains, repay the
+    # exact outstanding nominal debt.  This preserves both the cash claim and
+    # the debt-to-inventory invariant across recurrent batch boundaries.
+    remaining_margin_backed_long = (
+        margin_backed_long - repayable_long_sell
+    ).clamp_min(0.0)
+    fully_liquidated_margin_backed_long = (
+        (long_margin_debt > 0.0)
+        & (margin_backed_long > 0.0)
+        & (remaining_margin_backed_long <= _POSITION_TOLERANCE)
+    )
+    long_margin_repayment = torch.where(
+        fully_liquidated_margin_backed_long,
+        long_margin_debt,
+        long_margin_repayment,
+    )
     free_cash_at_new_due = _capacity_for_new_payable(
         cash,
         payables,
         receivables,
     )
-    collateral_total = (
-        short_sale_collateral + short_margin_collateral
-    ).sum()
     collateral_per_short = torch.where(
         current_short > _POSITION_TOLERANCE,
         (short_sale_collateral + short_margin_collateral)
         / current_short.clamp_min(1.0e-12),
         torch.zeros_like(current_short),
     )
-    mandatory_release = (
+    mandatory_release_local = (
         mandatory_short_cover * collateral_per_short
     ).sum()
     short_after_mandatory = (
         current_short - mandatory_short_cover
     ).clamp_min(0.0)
-    mandatory_cover_cost = (
+    mandatory_cover_cost_local = (
         mandatory_short_cover * (1.0 + buy_fees)
     ).sum()
-    long_sale_claim = (
+    long_sale_claim_local = (
         (mandatory_long_sell + voluntary_long_sell) * (1.0 - sell_fees)
     ).sum()
 
@@ -776,40 +909,113 @@ def _execute_signed_event(
         requested_short_cover - producer_cover
     ).clamp_min(0.0)
     cover_cost_rates = 1.0 + buy_fees
-    fixed_funding_margin = (
-        free_cash_at_new_due
-        + pending_net_claim
-        + long_sale_claim
-        - mandatory_cover_cost
+    finance_local = (
+        long_margin_repayment.sum(),
+        (short_sale_collateral + short_margin_collateral).sum(),
+        mandatory_release_local,
+        mandatory_cover_cost_local,
+        long_sale_claim_local,
     )
-    producer_first_scale, producer_first_feasible, _ = (
-        _max_feasible_cover_on_ray(
+    if symbol_sharded:
+        producer_coefficients_local = _cover_ray_local_coefficients(
             short_after_mandatory=short_after_mandatory,
             anchor_cover=producer_cover,
             scalable_cover=consuming_cover,
             collateral_per_short=collateral_per_short,
             cover_cost_rates=cover_cost_rates,
-            mandatory_release=mandatory_release,
+            mandatory_release=mandatory_release_local,
+        )
+        proportional_coefficients_local = _cover_ray_local_coefficients(
+            short_after_mandatory=short_after_mandatory,
+            anchor_cover=torch.zeros_like(requested_short_cover),
+            scalable_cover=requested_short_cover,
+            collateral_per_short=collateral_per_short,
+            cover_cost_rates=cover_cost_rates,
+            mandatory_release=mandatory_release_local,
+        )
+        combined_finance = global_symbol_scalar_pack(
+            finance_local
+            + producer_coefficients_local
+            + proportional_coefficients_local,
+            symbol_sharded=True,
+        )
+        finance_totals = combined_finance[:5]
+        producer_coefficients = combined_finance[5:11]
+        proportional_coefficients = combined_finance[11:17]
+    else:
+        finance_totals = global_symbol_scalar_pack(
+            finance_local,
+            symbol_sharded=False,
+        )
+        producer_coefficients = None
+        proportional_coefficients = None
+    long_margin_repayment_total = finance_totals[0]
+    collateral_total = finance_totals[1]
+    mandatory_release = finance_totals[2]
+    mandatory_cover_cost = finance_totals[3]
+    long_sale_claim = finance_totals[4]
+    fixed_funding_margin = (
+        free_cash_at_new_due
+        + pending_net_claim
+        + long_sale_claim
+        - long_margin_repayment_total
+        - mandatory_cover_cost
+    )
+    if symbol_sharded:
+        assert producer_coefficients is not None
+        assert proportional_coefficients is not None
+        producer_first_scale, producer_first_feasible, _ = (
+            _max_feasible_cover_scale(
+                remaining_intercept=producer_coefficients[0],
+                remaining_slope=producer_coefficients[1],
+                proportional_intercept=producer_coefficients[2],
+                proportional_slope=producer_coefficients[3],
+                cost_intercept=producer_coefficients[4],
+                cost_slope=producer_coefficients[5],
+                collateral_total=collateral_total,
+                maintenance_ratio=maintenance_ratio,
+                fixed_funding_margin=fixed_funding_margin,
+            )
+        )
+        proportional_scale, _, _ = _max_feasible_cover_scale(
+            remaining_intercept=proportional_coefficients[0],
+            remaining_slope=proportional_coefficients[1],
+            proportional_intercept=proportional_coefficients[2],
+            proportional_slope=proportional_coefficients[3],
+            cost_intercept=proportional_coefficients[4],
+            cost_slope=proportional_coefficients[5],
             collateral_total=collateral_total,
             maintenance_ratio=maintenance_ratio,
             fixed_funding_margin=fixed_funding_margin,
         )
-    )
-    # A raw producer can itself be maintenance-locked.  Preserve the historical
-    # proportional fallback only when no point on the producer-first ray is
-    # affordable; otherwise a consumer may legitimately unlock the producer's
-    # trapped collateral and fund a larger cover basket.
-    proportional_scale, _, _ = _max_feasible_cover_on_ray(
-        short_after_mandatory=short_after_mandatory,
-        anchor_cover=torch.zeros_like(requested_short_cover),
-        scalable_cover=requested_short_cover,
-        collateral_per_short=collateral_per_short,
-        cover_cost_rates=cover_cost_rates,
-        mandatory_release=mandatory_release,
-        collateral_total=collateral_total,
-        maintenance_ratio=maintenance_ratio,
-        fixed_funding_margin=fixed_funding_margin,
-    )
+    else:
+        producer_first_scale, producer_first_feasible, _ = _max_feasible_cover_on_ray(
+            short_after_mandatory=short_after_mandatory,
+            anchor_cover=producer_cover,
+            scalable_cover=consuming_cover,
+            collateral_per_short=collateral_per_short,
+            cover_cost_rates=cover_cost_rates,
+            mandatory_release=mandatory_release_local,
+            collateral_total=collateral_total,
+            maintenance_ratio=maintenance_ratio,
+            fixed_funding_margin=fixed_funding_margin,
+            symbol_sharded=symbol_sharded,
+        )
+        # A raw producer can itself be maintenance-locked. Preserve the
+        # historical proportional fallback only when no point on the
+        # producer-first ray is affordable.
+        proportional_scale, _, _ = _max_feasible_cover_on_ray(
+            short_after_mandatory=short_after_mandatory,
+            anchor_cover=torch.zeros_like(requested_short_cover),
+            scalable_cover=requested_short_cover,
+            collateral_per_short=collateral_per_short,
+            cover_cost_rates=cover_cost_rates,
+            mandatory_release=mandatory_release_local,
+            collateral_total=collateral_total,
+            maintenance_ratio=maintenance_ratio,
+            fixed_funding_margin=fixed_funding_margin,
+            symbol_sharded=False,
+        )
     producer_first_cover = (
         producer_cover + producer_first_scale * consuming_cover
     )
@@ -829,9 +1035,41 @@ def _execute_signed_event(
     remaining_short_after_reduction = (
         short_after_mandatory - voluntary_short_cover
     ).clamp_min(0.0)
-    remaining_short_after_reduction_total = (
-        remaining_short_after_reduction.sum()
+    # If funding cannot finish a short cover, the same symbol cannot cross
+    # through zero into a synthetic long.  Resolve this local branch before the
+    # packed global post-cover reduction.
+    remaining_short_after_cover = (
+        base_short - voluntary_short_cover
+    ).clamp_min(0.0)
+    voluntary_long_buy = torch.where(
+        remaining_short_after_cover <= _POSITION_TOLERANCE,
+        voluntary_long_buy,
+        torch.zeros_like(voluntary_long_buy),
     )
+    exposure_after_reductions_local = (
+        (base_long - voluntary_long_sell).clamp_min(0.0)
+        + (base_short - voluntary_short_cover).clamp_min(0.0)
+    ).sum()
+    requested_increases_local = (
+        voluntary_long_buy + voluntary_short_open
+    ).sum()
+    raw_opening_cost_local = (
+        (voluntary_long_buy * (1.0 + buy_fees)).sum()
+        + (voluntary_short_open * margin_rates).sum()
+    )
+    post_cover_totals = global_symbol_scalar_pack(
+        (
+            remaining_short_after_reduction.sum(),
+            mandatory_release_local
+            + (voluntary_short_cover * collateral_per_short).sum(),
+            (voluntary_short_cover * cover_cost_rates).sum(),
+            exposure_after_reductions_local,
+            requested_increases_local,
+            raw_opening_cost_local,
+        ),
+        symbol_sharded=symbol_sharded,
+    )
+    remaining_short_after_reduction_total = post_cover_totals[0]
     required_after_reduction = (
         maintenance_ratio * remaining_short_after_reduction_total
     )
@@ -846,9 +1084,7 @@ def _execute_signed_event(
         - required_after_reduction
         - reduction_release_tolerance
     ).clamp_min(0.0)
-    proportional_reduction_release = mandatory_release + (
-        voluntary_short_cover * collateral_per_short
-    ).sum()
+    proportional_reduction_release = post_cover_totals[1]
     released_for_reduction = torch.minimum(
         proportional_reduction_release,
         maximum_reduction_release,
@@ -861,29 +1097,14 @@ def _execute_signed_event(
     funded_reduction_claim = (
         pending_net_claim
         + long_sale_claim
+        - long_margin_repayment_total
         + released_for_reduction
         - mandatory_cover_cost
-        - (voluntary_short_cover * cover_cost_rates).sum()
+        - post_cover_totals[2]
     )
 
-    # If funding cannot finish a short cover, the same symbol cannot cross
-    # through zero into a synthetic long.  Liquidity caps have already been
-    # allocated to the signed transition, so unused capacity is deliberately
-    # not reassigned to a different requested endpoint.
-    remaining_short_after_cover = (
-        base_short - voluntary_short_cover
-    ).clamp_min(0.0)
-    voluntary_long_buy = torch.where(
-        remaining_short_after_cover <= _POSITION_TOLERANCE,
-        voluntary_long_buy,
-        torch.zeros_like(voluntary_long_buy),
-    )
-
-    exposure_after_reductions = (
-        (base_long - voluntary_long_sell).clamp_min(0.0)
-        + (base_short - voluntary_short_cover).clamp_min(0.0)
-    ).sum()
-    requested_increases = (voluntary_long_buy + voluntary_short_open).sum()
+    exposure_after_reductions = post_cover_totals[3]
+    requested_increases = post_cover_totals[4]
     gross_limit = event_nav.clamp_min(0.0) * float(max(0.0, gross_budget))
     gross_scale = torch.minimum(
         torch.ones_like(requested_increases),
@@ -898,10 +1119,14 @@ def _execute_signed_event(
         remaining_short_capacity,
     )
 
-    opening_cost = (
-        (voluntary_long_buy * (1.0 + buy_fees)).sum()
-        + (voluntary_short_open * margin_rates).sum()
-    )
+    if remaining_short_capacity is None:
+        opening_cost = post_cover_totals[5] * gross_scale
+    else:
+        opening_cost = global_symbol_sum(
+            voluntary_long_buy * (1.0 + buy_fees)
+            + voluntary_short_open * margin_rates,
+            symbol_sharded=symbol_sharded,
+        )
     opening_capacity = (
         free_cash_at_new_due + funded_reduction_claim
     ).clamp_min(0.0)
@@ -929,11 +1154,6 @@ def _execute_signed_event(
         if starting_volume is None
         else (starting_volume - voluntary_volume_used).clamp_min(0.0)
     )
-    next_turnover = (
-        None
-        if starting_turnover is None
-        else (starting_turnover - voluntary_volume_used.sum()).clamp_min(0.0)
-    )
     next_short_capacity = (
         None
         if starting_short_capacity is None
@@ -950,15 +1170,32 @@ def _execute_signed_event(
     opened_sale_collateral = short_open * (1.0 - sell_fees - short_handling_rates)
     opened_margin_collateral = short_open * margin_rates
     remaining_short = (-executed).clamp_min(0.0)
-    remaining_short_total = remaining_short.sum()
+    post_execution_totals = global_symbol_scalar_pack(
+        (
+            remaining_short.sum(),
+            candidate_released_sale.sum(),
+            candidate_released_margin.sum(),
+            short_sale_collateral.sum(),
+            short_margin_collateral.sum(),
+            opened_sale_collateral.sum(),
+            opened_margin_collateral.sum(),
+            (long_sell * (1.0 - sell_fees)).sum(),
+            (long_buy * (1.0 + buy_fees)).sum(),
+            (short_cover * (1.0 + buy_fees)).sum(),
+            (long_sell + long_buy + short_cover + short_open).sum(),
+            voluntary_volume_used.sum(),
+        ),
+        symbol_sharded=symbol_sharded,
+    )
+    remaining_short_total = post_execution_totals[0]
     candidate_release_total = (
-        candidate_released_sale.sum() + candidate_released_margin.sum()
+        post_execution_totals[1] + post_execution_totals[2]
     )
     collateral_before_release = (
-        short_sale_collateral.sum()
-        + short_margin_collateral.sum()
-        + opened_sale_collateral.sum()
-        + opened_margin_collateral.sum()
+        post_execution_totals[3]
+        + post_execution_totals[4]
+        + post_execution_totals[5]
+        + post_execution_totals[6]
     )
     required_remaining_collateral = maintenance_ratio * remaining_short_total
     maintenance_tolerance = risky_before.new_tensor(
@@ -997,12 +1234,26 @@ def _execute_signed_event(
         short_margin_collateral - released_margin + opened_margin_collateral
     )
     remaining_allocation = remaining_short / remaining_short_total.clamp_min(1.0e-12)
-    allocated_sale = remaining_allocation * raw_next_short_sale.sum()
-    allocated_margin = remaining_allocation * raw_next_short_margin.sum()
-    orphaned_collateral = (
+    local_orphaned_collateral = (
         (remaining_short <= _POSITION_TOLERANCE)
         & ((raw_next_short_sale + raw_next_short_margin) > _POSITION_TOLERANCE)
     ).any()
+    if symbol_sharded:
+        redistribution_totals = global_symbol_scalar_pack(
+            (
+                raw_next_short_sale.sum(),
+                raw_next_short_margin.sum(),
+                local_orphaned_collateral.to(dtype=risky_before.dtype),
+            ),
+            symbol_sharded=True,
+        )
+        allocated_sale = remaining_allocation * redistribution_totals[0]
+        allocated_margin = remaining_allocation * redistribution_totals[1]
+        orphaned_collateral = redistribution_totals[2] > 0.0
+    else:
+        allocated_sale = remaining_allocation * raw_next_short_sale.sum()
+        allocated_margin = remaining_allocation * raw_next_short_margin.sum()
+        orphaned_collateral = local_orphaned_collateral
     next_short_sale = torch.where(
         orphaned_collateral,
         allocated_sale,
@@ -1014,16 +1265,52 @@ def _execute_signed_event(
         raw_next_short_margin,
     )
 
-    event_net_claim = (
-        (long_sell * (1.0 - sell_fees)).sum()
-        - (long_buy * (1.0 + buy_fees)).sum()
-        + released_sale.sum()
-        + released_margin.sum()
-        - (short_cover * (1.0 + buy_fees)).sum()
-        - opened_margin_collateral.sum()
-    )
+    if symbol_sharded:
+        released_sale_total = torch.where(
+            all_shorts_covered,
+            post_execution_totals[3],
+            post_execution_totals[1] * release_scale,
+        )
+        released_margin_total = torch.where(
+            all_shorts_covered,
+            post_execution_totals[4],
+            post_execution_totals[2] * release_scale,
+        )
+        event_net_claim = (
+            post_execution_totals[7]
+            - post_execution_totals[8]
+            - long_margin_repayment_total
+            + released_sale_total
+            + released_margin_total
+            - post_execution_totals[9]
+            - post_execution_totals[6]
+        )
+        event_turnover = post_execution_totals[10]
+        next_turnover = (
+            None
+            if starting_turnover is None
+            else (starting_turnover - post_execution_totals[11]).clamp_min(0.0)
+        )
+    else:
+        event_net_claim = (
+            (long_sell * (1.0 - sell_fees)).sum()
+            - (long_buy * (1.0 + buy_fees)).sum()
+            - long_margin_repayment_total
+            + released_sale.sum()
+            + released_margin.sum()
+            - (short_cover * (1.0 + buy_fees)).sum()
+            - opened_margin_collateral.sum()
+        )
+        event_turnover = (long_sell + long_buy + short_cover + short_open).sum()
+        next_turnover = (
+            None
+            if starting_turnover is None
+            else (starting_turnover - voluntary_volume_used.sum()).clamp_min(0.0)
+        )
     next_pending = pending_net_claim + event_net_claim
-    event_turnover = (long_sell + long_buy + short_cover + short_open).sum()
+    next_long_margin_debt = (
+        long_margin_debt - long_margin_repayment
+    ).clamp_min(0.0)
 
     active_float = active.to(dtype=risky_before.dtype)
     executed = torch.where(active, executed, risky_before)
@@ -1031,6 +1318,11 @@ def _execute_signed_event(
         active,
         next_short_sale,
         short_sale_collateral,
+    )
+    next_long_margin_debt = torch.where(
+        active,
+        next_long_margin_debt,
+        long_margin_debt,
     )
     next_short_margin = torch.where(
         active,
@@ -1060,6 +1352,11 @@ def _execute_signed_event(
         next_short_sale,
         torch.zeros_like(next_short_sale),
     )
+    next_long_margin_debt = torch.where(
+        event_alive,
+        next_long_margin_debt,
+        torch.zeros_like(next_long_margin_debt),
+    )
     next_short_margin = torch.where(
         event_alive,
         next_short_margin,
@@ -1072,6 +1369,7 @@ def _execute_signed_event(
     )
     return _EventResult(
         risky=executed,
+        long_margin_debt=next_long_margin_debt,
         short_sale_collateral=next_short_sale,
         short_margin_collateral=next_short_margin,
         pending_net_claim=next_pending,
@@ -1222,6 +1520,11 @@ def _run_dual_session(
     short_margin_rate: torch.Tensor | float | None,
     short_capacity_weights: torch.Tensor | float | None,
     short_handling_fee_rate: torch.Tensor | float,
+    day_trade_carry_normal_sell_fee_rates: torch.Tensor | float | None,
+    day_trade_margin_financing_ratio: float,
+    day_trade_margin_financing_annual_rate: float,
+    day_trade_margin_short_handling_fee_rate: float,
+    day_trade_margin_short_annual_borrow_rate: float,
     short_maintenance_ratio: float,
     unresolved_corporate_action_mask: torch.Tensor | None,
     cash_dividend_yield: torch.Tensor | None,
@@ -1245,10 +1548,14 @@ def _run_dual_session(
     initial_equity_scale: torch.Tensor | None,
     initial_short_sale_collateral: torch.Tensor | None,
     initial_short_margin_collateral: torch.Tensor | None,
+    initial_long_margin_debt: torch.Tensor | None,
     detach_initial_state: bool,
+    _apply_short_capacity_limit: bool = True,
+    _symbol_sharded: bool = False,
 ) -> TaiwanDualSessionResult:
     phases = 2 if mode == "tw_cash" else 3
     action_values = _validate_actions(actions, phases=phases, name="actions")
+    cash_dividends_enabled = cash_dividend_yield is not None
     t_len, _, symbols = action_values.shape
     phase_reference = action_values.new_zeros((t_len, 2, symbols))
     daily_reference = action_values[:, 0]
@@ -1342,6 +1649,43 @@ def _run_dual_session(
         reference=phase_reference,
         name="sell_fee_rates",
     )
+    day_trade_carry = day_trade_carry_normal_sell_fee_rates is not None
+    normal_sell_fees = _as_phase_rate(
+        (
+            sell_fee_rates
+            if day_trade_carry_normal_sell_fee_rates is None
+            else day_trade_carry_normal_sell_fee_rates
+        ),
+        reference=phase_reference,
+        name="day_trade_carry_normal_sell_fee_rates",
+    )
+    if day_trade_carry and mode != "tw_cash":
+        raise ValueError("day-trade residual carry is supported only by tw_cash")
+    if not torch.compiler.is_compiling() and day_trade_carry and bool(
+        (normal_sell_fees < sell_fees).any().item()
+    ):
+        raise ValueError(
+            "normal sell fees must not be below day-trade sell fees"
+        )
+    for name, value in (
+        ("day_trade_margin_financing_ratio", day_trade_margin_financing_ratio),
+        (
+            "day_trade_margin_financing_annual_rate",
+            day_trade_margin_financing_annual_rate,
+        ),
+        (
+            "day_trade_margin_short_handling_fee_rate",
+            day_trade_margin_short_handling_fee_rate,
+        ),
+        (
+            "day_trade_margin_short_annual_borrow_rate",
+            day_trade_margin_short_annual_borrow_rate,
+        ),
+    ):
+        if not math.isfinite(float(value)) or float(value) < 0.0:
+            raise ValueError(f"{name} must be finite and non-negative")
+    if float(day_trade_margin_financing_ratio) > 1.0:
+        raise ValueError("day_trade_margin_financing_ratio must be at most 1")
     rebate_rates = _as_phase_rate(
         commission_rebate_rates,
         reference=phase_reference,
@@ -1424,6 +1768,11 @@ def _run_dual_session(
         name="short_capacity_weights",
         allow_positive_inf=True,
     )
+    if not _apply_short_capacity_limit:
+        # A compiled caller may already have proved that this required public
+        # input is identically +inf.  Retain validation above, then remove the
+        # exact ``min(request, +inf)`` no-op from the recurrent hot path.
+        daily_short_cap = None
 
     if (
         isinstance(settlement_lag_sessions, bool)
@@ -1583,11 +1932,59 @@ def _run_dual_session(
         initial_alive=initial_alive,
         initial_short_sale_collateral=initial_short_sale_collateral,
         initial_short_margin_collateral=initial_short_margin_collateral,
+        initial_long_margin_debt=initial_long_margin_debt,
         commission_rebate_current=commission_rebate_current,
         commission_rebate_due=commission_rebate_due,
         state_advance_mask=state_advance_mask,
         detach_initial_state=detach_initial_state,
+        symbol_sharded=_symbol_sharded,
     )
+    if initial_long_margin_debt is None:
+        long_margin_debt = torch.zeros_like(risky)
+    else:
+        debt_source = (
+            initial_long_margin_debt.detach()
+            if detach_initial_state
+            else initial_long_margin_debt
+        )
+        if tuple(debt_source.shape) != (symbols,):
+            raise ValueError("initial_long_margin_debt must have shape [S]")
+        long_margin_debt = debt_source.clone(
+            memory_format=torch.contiguous_format
+        ).to(device=action_values.device, dtype=action_values.dtype)
+        if not torch.compiler.is_compiling() and (
+            not bool(torch.isfinite(long_margin_debt).all().item())
+            or bool((long_margin_debt < 0.0).any().item())
+        ):
+            raise ValueError(
+                "initial_long_margin_debt must be finite and non-negative"
+            )
+    if not torch.compiler.is_compiling():
+        orphaned_debt = (
+            (long_margin_debt > _POSITION_TOLERANCE)
+            & (risky <= _POSITION_TOLERANCE)
+        )
+        if bool(orphaned_debt.any().item()):
+            orphaned_indices = torch.nonzero(
+                orphaned_debt,
+                as_tuple=False,
+            ).flatten()
+            sample_indices = orphaned_indices[:8]
+            raise ValueError(
+                "initial_long_margin_debt requires matching positive long inventory; "
+                f"count={int(orphaned_indices.numel())}, "
+                f"indices={sample_indices.detach().cpu().tolist()}, "
+                "debt="
+                f"{long_margin_debt.index_select(0, sample_indices).detach().cpu().tolist()}, "
+                "inventory="
+                f"{risky.index_select(0, sample_indices).detach().cpu().tolist()}"
+            )
+        if not day_trade_carry and bool(
+            (long_margin_debt > _POSITION_TOLERANCE).any().item()
+        ):
+            raise ValueError(
+                "initial_long_margin_debt is valid only for day-trade carry"
+            )
     (
         commission_rebate_current,
         commission_rebate_due,
@@ -1619,9 +2016,11 @@ def _run_dual_session(
     payable_rows: list[torch.Tensor] = []
     receivable_rows: list[torch.Tensor] = []
     default_rows: list[torch.Tensor] = []
+    default_reason_rows: list[torch.Tensor] = []
     equity_scale_rows: list[torch.Tensor] = []
     short_sale_rows: list[torch.Tensor] = []
     short_margin_rows: list[torch.Tensor] = []
+    long_margin_debt_rows: list[torch.Tensor] = []
     rebate_accrued_rows: list[torch.Tensor] = []
     rebate_paid_rows: list[torch.Tensor] = []
     rebate_current_rows: list[torch.Tensor] = []
@@ -1632,6 +2031,9 @@ def _run_dual_session(
     for idx in range(int(t_len)):
         advance = advance_mask[idx]
         default_now = torch.zeros_like(alive)
+        default_reason = torch.zeros(
+            (), device=action_values.device, dtype=torch.int64
+        )
         pending_net_claim = torch.zeros_like(cash)
         (
             cash,
@@ -1647,6 +2049,11 @@ def _run_dual_session(
             advance,
         )
         default_now = default_now | settlement_default
+        default_reason = torch.where(
+            settlement_default,
+            default_reason.new_tensor(1),
+            default_reason,
+        )
         risky = torch.where(
             alive_after_settlement,
             risky,
@@ -1679,7 +2086,9 @@ def _run_dual_session(
             receivables=receivables,
             short_sale_collateral=short_sale_collateral,
             short_margin_collateral=short_margin_collateral,
+            long_margin_debt=long_margin_debt,
             pending_net_claim=pending_net_claim,
+            symbol_sharded=_symbol_sharded,
         )
         nav_start = (
             base_nav_start
@@ -1692,9 +2101,24 @@ def _run_dual_session(
         active_gap = (
             advance & alive_after_settlement & (risky.abs() > _POSITION_TOLERANCE)
         )
-        gap_default = (active_gap & ~overnight_return_valid[idx]).any()
+        gap_mark_required = (
+            selection[idx, OPEN]
+            if day_trade_carry
+            else torch.ones_like(overnight_return_valid[idx])
+        )
+        gap_default = global_symbol_any(
+            active_gap
+            & gap_mark_required
+            & ~overnight_return_valid[idx],
+            symbol_sharded=_symbol_sharded,
+        )
         gap_default = advance & alive_after_settlement & gap_default
         default_now = default_now | gap_default
+        default_reason = torch.where(
+            (default_reason == 0) & gap_default,
+            default_reason.new_tensor(2),
+            default_reason,
+        )
         (
             alive_after_gap,
             risky,
@@ -1703,6 +2127,7 @@ def _run_dual_session(
             receivables,
             short_sale_collateral,
             short_margin_collateral,
+            long_margin_debt,
             pending_net_claim,
         ) = _kill_finance_state(
             default_now=gap_default,
@@ -1713,6 +2138,7 @@ def _run_dual_session(
             receivables=receivables,
             short_sale_collateral=short_sale_collateral,
             short_margin_collateral=short_margin_collateral,
+            long_margin_debt=long_margin_debt,
             pending_net_claim=pending_net_claim,
         )
         (
@@ -1743,7 +2169,9 @@ def _run_dual_session(
             receivables=receivables,
             short_sale_collateral=short_sale_collateral,
             short_margin_collateral=short_margin_collateral,
+            long_margin_debt=long_margin_debt,
             pending_net_claim=pending_net_claim,
+            symbol_sharded=_symbol_sharded,
         )
         nav_open = (
             base_nav_open
@@ -1756,6 +2184,11 @@ def _run_dual_session(
             & (~torch.isfinite(nav_open) | (nav_open <= _MIN_WEALTH_FACTOR))
         )
         default_now = default_now | open_nav_default
+        default_reason = torch.where(
+            (default_reason == 0) & open_nav_default,
+            default_reason.new_tensor(3),
+            default_reason,
+        )
         (
             alive_phase,
             risky,
@@ -1764,6 +2197,7 @@ def _run_dual_session(
             receivables,
             short_sale_collateral,
             short_margin_collateral,
+            long_margin_debt,
             pending_net_claim,
         ) = _kill_finance_state(
             default_now=open_nav_default,
@@ -1774,6 +2208,7 @@ def _run_dual_session(
             receivables=receivables,
             short_sale_collateral=short_sale_collateral,
             short_margin_collateral=short_margin_collateral,
+            long_margin_debt=long_margin_debt,
             pending_net_claim=pending_net_claim,
         )
         (
@@ -1902,6 +2337,8 @@ def _run_dual_session(
             sell_fees=sell_fees[idx, OPEN],
             margin_rates=margin_rates[idx, OPEN],
             short_handling_rates=handling_rates[idx, OPEN],
+            long_margin_debt=long_margin_debt,
+            long_margin_repayment_exempt=torch.zeros_like(risky),
             short_sale_collateral=short_sale_collateral,
             short_margin_collateral=short_margin_collateral,
             cash=cash,
@@ -1916,8 +2353,11 @@ def _run_dual_session(
             maintenance_ratio=maintenance_ratio,
             alive=alive_phase,
             advance=advance,
+            blocked_mandatory_defaults=not day_trade_carry,
+            symbol_sharded=_symbol_sharded,
         )
         risky = open_event.risky
+        long_margin_debt = open_event.long_margin_debt
         short_sale_collateral = open_event.short_sale_collateral
         short_margin_collateral = open_event.short_margin_collateral
         pending_net_claim = open_event.pending_net_claim
@@ -1930,6 +2370,11 @@ def _run_dual_session(
         event_short_open[OPEN] = event_short_open[OPEN] + open_event.short_open
         event_short_cover[OPEN] = event_short_cover[OPEN] + open_event.short_cover
         default_now = default_now | open_event.default_now
+        default_reason = torch.where(
+            (default_reason == 0) & open_event.default_now,
+            default_reason.new_tensor(4),
+            default_reason,
+        )
         (
             alive_phase,
             risky,
@@ -1938,6 +2383,7 @@ def _run_dual_session(
             receivables,
             short_sale_collateral,
             short_margin_collateral,
+            long_margin_debt,
             pending_net_claim,
         ) = _kill_finance_state(
             default_now=open_event.default_now,
@@ -1948,6 +2394,7 @@ def _run_dual_session(
             receivables=receivables,
             short_sale_collateral=short_sale_collateral,
             short_margin_collateral=short_margin_collateral,
+            long_margin_debt=long_margin_debt,
             pending_net_claim=pending_net_claim,
         )
         (
@@ -1997,6 +2444,8 @@ def _run_dual_session(
                 sell_fees=sell_fees[idx, OPEN],
                 margin_rates=margin_rates[idx, OPEN],
                 short_handling_rates=handling_rates[idx, OPEN],
+                long_margin_debt=long_margin_debt,
+                long_margin_repayment_exempt=torch.zeros_like(risky),
                 short_sale_collateral=short_sale_collateral,
                 short_margin_collateral=short_margin_collateral,
                 cash=cash,
@@ -2011,8 +2460,11 @@ def _run_dual_session(
                 maintenance_ratio=maintenance_ratio,
                 alive=alive_phase,
                 advance=advance,
+                blocked_mandatory_defaults=not day_trade_carry,
+                symbol_sharded=_symbol_sharded,
             )
             risky = entry_event.risky
+            long_margin_debt = entry_event.long_margin_debt
             new_cohort = risky - before_entry
             short_sale_collateral = entry_event.short_sale_collateral
             short_margin_collateral = entry_event.short_margin_collateral
@@ -2026,15 +2478,21 @@ def _run_dual_session(
             event_short_open[OPEN] = event_short_open[OPEN] + entry_event.short_open
             event_short_cover[OPEN] = event_short_cover[OPEN] + entry_event.short_cover
             default_now = default_now | entry_event.default_now
+            default_reason = torch.where(
+                (default_reason == 0) & entry_event.default_now,
+                default_reason.new_tensor(5),
+                default_reason,
+            )
             (
                 alive_phase,
                 risky,
                 cash,
                 payables,
                 receivables,
-                short_sale_collateral,
-                short_margin_collateral,
-                pending_net_claim,
+            short_sale_collateral,
+            short_margin_collateral,
+            long_margin_debt,
+            pending_net_claim,
             ) = _kill_finance_state(
                 default_now=entry_event.default_now,
                 alive=alive_phase,
@@ -2044,6 +2502,7 @@ def _run_dual_session(
                 receivables=receivables,
                 short_sale_collateral=short_sale_collateral,
                 short_margin_collateral=short_margin_collateral,
+                long_margin_debt=long_margin_debt,
                 pending_net_claim=pending_net_claim,
             )
             (
@@ -2081,7 +2540,9 @@ def _run_dual_session(
                 receivables=receivables,
                 short_sale_collateral=short_sale_collateral,
                 short_margin_collateral=short_margin_collateral,
+                long_margin_debt=long_margin_debt,
                 pending_net_claim=pending_net_claim,
+                symbol_sharded=_symbol_sharded,
             )
             open_execution_weights = _event_weight(
                 risky,
@@ -2090,9 +2551,24 @@ def _run_dual_session(
             )
 
         active_intraday = advance & alive_phase & (risky.abs() > _POSITION_TOLERANCE)
-        intraday_default = (active_intraday & ~intraday_return_valid[idx]).any()
+        intraday_mark_required = (
+            selection[idx, CLOSE]
+            if day_trade_carry
+            else torch.ones_like(intraday_return_valid[idx])
+        )
+        intraday_default = global_symbol_any(
+            active_intraday
+            & intraday_mark_required
+            & ~intraday_return_valid[idx],
+            symbol_sharded=_symbol_sharded,
+        )
         intraday_default = advance & alive_phase & intraday_default
         default_now = default_now | intraday_default
+        default_reason = torch.where(
+            (default_reason == 0) & intraday_default,
+            default_reason.new_tensor(6),
+            default_reason,
+        )
         (
             alive_phase,
             risky,
@@ -2101,6 +2577,7 @@ def _run_dual_session(
             receivables,
             short_sale_collateral,
             short_margin_collateral,
+            long_margin_debt,
             pending_net_claim,
         ) = _kill_finance_state(
             default_now=intraday_default,
@@ -2111,6 +2588,7 @@ def _run_dual_session(
             receivables=receivables,
             short_sale_collateral=short_sale_collateral,
             short_margin_collateral=short_margin_collateral,
+            long_margin_debt=long_margin_debt,
             pending_net_claim=pending_net_claim,
         )
         (
@@ -2129,6 +2607,9 @@ def _run_dual_session(
             torch.zeros_like(intraday_returns[idx]),
         )
         risky = risky * (1.0 + effective_intraday)
+        intraday_price_factor = 1.0 + effective_intraday
+        same_day_long_at_close = event_long_buy[OPEN] * intraday_price_factor
+        same_day_short_at_close = event_short_open[OPEN] * intraday_price_factor
         if mode == "tw_overnight":
             due = due * (1.0 + effective_intraday)
             new_cohort = new_cohort * (1.0 + effective_intraday)
@@ -2146,7 +2627,9 @@ def _run_dual_session(
             receivables=receivables,
             short_sale_collateral=short_sale_collateral,
             short_margin_collateral=short_margin_collateral,
+            long_margin_debt=long_margin_debt,
             pending_net_claim=pending_net_claim,
+            symbol_sharded=_symbol_sharded,
         )
         nav_close = (
             base_nav_close
@@ -2159,6 +2642,11 @@ def _run_dual_session(
             & (~torch.isfinite(nav_close) | (nav_close <= _MIN_WEALTH_FACTOR))
         )
         default_now = default_now | close_nav_default
+        default_reason = torch.where(
+            (default_reason == 0) & close_nav_default,
+            default_reason.new_tensor(7),
+            default_reason,
+        )
         (
             alive_phase,
             risky,
@@ -2167,6 +2655,7 @@ def _run_dual_session(
             receivables,
             short_sale_collateral,
             short_margin_collateral,
+            long_margin_debt,
             pending_net_claim,
         ) = _kill_finance_state(
             default_now=close_nav_default,
@@ -2177,6 +2666,7 @@ def _run_dual_session(
             receivables=receivables,
             short_sale_collateral=short_sale_collateral,
             short_margin_collateral=short_margin_collateral,
+            long_margin_debt=long_margin_debt,
             pending_net_claim=pending_net_claim,
         )
         (
@@ -2288,6 +2778,8 @@ def _run_dual_session(
             sell_fees=sell_fees[idx, CLOSE],
             margin_rates=margin_rates[idx, CLOSE],
             short_handling_rates=handling_rates[idx, CLOSE],
+            long_margin_debt=long_margin_debt,
+            long_margin_repayment_exempt=same_day_long_at_close,
             short_sale_collateral=short_sale_collateral,
             short_margin_collateral=short_margin_collateral,
             cash=cash,
@@ -2302,8 +2794,11 @@ def _run_dual_session(
             maintenance_ratio=maintenance_ratio,
             alive=alive_phase,
             advance=advance,
+            blocked_mandatory_defaults=not day_trade_carry,
+            symbol_sharded=_symbol_sharded,
         )
         risky = close_event.risky
+        long_margin_debt = close_event.long_margin_debt
         short_sale_collateral = close_event.short_sale_collateral
         short_margin_collateral = close_event.short_margin_collateral
         pending_net_claim = close_event.pending_net_claim
@@ -2313,6 +2808,11 @@ def _run_dual_session(
         event_short_open[CLOSE] = close_event.short_open
         event_short_cover[CLOSE] = close_event.short_cover
         default_now = default_now | close_event.default_now
+        default_reason = torch.where(
+            (default_reason == 0) & close_event.default_now,
+            default_reason.new_tensor(8),
+            default_reason,
+        )
         (
             alive_phase,
             risky,
@@ -2321,6 +2821,7 @@ def _run_dual_session(
             receivables,
             short_sale_collateral,
             short_margin_collateral,
+            long_margin_debt,
             pending_net_claim,
         ) = _kill_finance_state(
             default_now=close_event.default_now,
@@ -2331,6 +2832,7 @@ def _run_dual_session(
             receivables=receivables,
             short_sale_collateral=short_sale_collateral,
             short_margin_collateral=short_margin_collateral,
+            long_margin_debt=long_margin_debt,
             pending_net_claim=pending_net_claim,
         )
         (
@@ -2349,6 +2851,110 @@ def _run_dual_session(
             # event either executed them in full or already entered absorbing
             # default when a physical side was unavailable.
             due = torch.zeros_like(due)
+
+        if day_trade_carry:
+            # The base executor initially charges the reduced day-trade sell
+            # rate. Reclassify only unmatched physical sell legs after the
+            # close result is known, without ever exposing that outcome to the
+            # policy. OPEN long sales are necessarily carried inventory. At
+            # CLOSE, today's OPEN long buys are paired first; any excess sale
+            # is a prior-day holding. Today's short opens are likewise paired
+            # with CLOSE covers first, and only the unpaired remainder loses
+            # day-trade tax treatment.
+            fee_delta = (normal_sell_fees[idx] - sell_fees[idx]).clamp_min(0.0)
+            carried_long_sold_at_close = (
+                close_event.long_sell - same_day_long_at_close
+            ).clamp_min(0.0)
+            # Pairing subtraction can retain a one-ulp positive remainder
+            # even when the signed endpoint is exactly flat.  A same-day
+            # residual is a subset of the physical closing inventory, so cap
+            # it by that canonical endpoint before creating debt/collateral.
+            residual_new_long_close = torch.minimum(
+                (
+                    same_day_long_at_close - close_event.long_sell
+                ).clamp_min(0.0),
+                risky.clamp_min(0.0),
+            )
+            residual_new_short_close = torch.minimum(
+                (
+                    same_day_short_at_close - close_event.short_cover
+                ).clamp_min(0.0),
+                (-risky).clamp_min(0.0),
+            )
+            new_long_fraction = torch.where(
+                same_day_long_at_close > _POSITION_TOLERANCE,
+                residual_new_long_close
+                / same_day_long_at_close.clamp_min(1.0e-12),
+                torch.zeros_like(residual_new_long_close),
+            ).clamp(0.0, 1.0)
+            new_short_fraction = torch.where(
+                same_day_short_at_close > _POSITION_TOLERANCE,
+                residual_new_short_close
+                / same_day_short_at_close.clamp_min(1.0e-12),
+                torch.zeros_like(residual_new_short_close),
+            ).clamp(0.0, 1.0)
+            residual_new_long_open_notional = (
+                event_long_buy[OPEN] * new_long_fraction
+            )
+            residual_new_short_open_notional = (
+                event_short_open[OPEN] * new_short_fraction
+            )
+            long_tax_adjustment = global_symbol_sum(
+                event_long_sell[OPEN] * fee_delta[OPEN]
+                + carried_long_sold_at_close * fee_delta[CLOSE],
+                symbol_sharded=_symbol_sharded,
+            )
+            short_tax_adjustment = (
+                residual_new_short_open_notional * fee_delta[OPEN]
+            )
+            active_float = (advance & alive_phase).to(dtype=action_values.dtype)
+            pending_net_claim = (
+                pending_net_claim - active_float * long_tax_adjustment
+            )
+            short_sale_collateral = torch.where(
+                advance & alive_phase,
+                (short_sale_collateral - short_tax_adjustment).clamp_min(0.0),
+                short_sale_collateral,
+            )
+
+            # Convert only the unclosed fraction of today's long purchase to
+            # broker financing.  The broker-funded principal reduces the T+2
+            # purchase payable and creates an equal nominal liability, so NAV
+            # is unchanged at conversion.  Subsequent physical sales repay the
+            # liability proportionally inside `_execute_signed_event`.
+            new_long_margin_debt = (
+                residual_new_long_open_notional
+                * float(day_trade_margin_financing_ratio)
+            )
+            active_float = (advance & alive_phase).to(dtype=action_values.dtype)
+            long_margin_debt = long_margin_debt + (
+                active_float * new_long_margin_debt
+            )
+
+            # Every end-of-day residual is a financed/borrowed position. Costs
+            # accrue on the actual close notional every carried session; the
+            # one-time short handling charge applies only when a same-day
+            # short open first becomes residual inventory.
+            long_financing_rate = (
+                float(day_trade_margin_financing_annual_rate) / 365.0
+            )
+            short_borrow_rate = (
+                float(day_trade_margin_short_annual_borrow_rate) / 365.0
+            )
+            new_debt_total, carry_cost = global_symbol_scalar_pack(
+                (
+                    new_long_margin_debt.sum(),
+                    (
+                        long_margin_debt * long_financing_rate
+                        + (-risky).clamp_min(0.0) * short_borrow_rate
+                        + residual_new_short_open_notional
+                        * float(day_trade_margin_short_handling_fee_rate)
+                    ).sum(),
+                ),
+                symbol_sharded=_symbol_sharded,
+            )
+            pending_net_claim = pending_net_claim + active_float * new_debt_total
+            pending_net_claim = pending_net_claim - active_float * carry_cost
 
         next_payables, next_receivables = _enqueue_net_claim(
             payables,
@@ -2375,10 +2981,12 @@ def _run_dual_session(
             receivables=receivables,
             short_sale_collateral=short_sale_collateral,
             short_margin_collateral=short_margin_collateral,
+            long_margin_debt=long_margin_debt,
             pending_net_claim=pending_net_claim,
+            symbol_sharded=_symbol_sharded,
         )
-        event_commission_rebate_accrued = torch.stack(
-            [
+        event_commission_rebate_accrued = global_symbol_scalar_pack(
+            (
                 (
                     (
                         event_long_buy[phase]
@@ -2389,7 +2997,8 @@ def _run_dual_session(
                     * rebate_rates[idx, phase]
                 ).sum()
                 for phase in (OPEN, CLOSE)
-            ]
+            ),
+            symbol_sharded=_symbol_sharded,
         )
         commission_rebate_accrued = event_commission_rebate_accrued.sum()
         (
@@ -2424,13 +3033,21 @@ def _run_dual_session(
             dividend_indices,
             dividend_claims,
         )
+        if cash_dividends_enabled or (
+            _symbol_sharded and not symbol_sharded_skip_noop_collectives_enabled()
+        ):
+            scheduled_dividends = global_symbol_tensor_sum(
+                scheduled_dividends,
+                symbol_sharded=_symbol_sharded,
+            )
         receivables = receivables + scheduled_dividends
+        scheduled_dividend_total = scheduled_dividends.sum()
         nav_end = (
             close_execution_nav
             + commission_rebate_paid
             + commission_rebate_current
             + commission_rebate_due
-            + scheduled_dividends.sum()
+            + scheduled_dividend_total
         )
         if return_weights_history:
             # Phase histories are execution-boundary audits.  The just-created
@@ -2463,6 +3080,38 @@ def _run_dual_session(
             alive=alive_phase,
             advance=advance,
             default_now=default_now,
+        )
+        default_reason = torch.where(
+            (default_reason == 0) & default_event,
+            default_reason.new_tensor(9),
+            default_reason,
+        )
+        # ``_finalize_cash_day`` rebases every recurrent ledger component by
+        # ``nav_end`` so that the next session/batch starts from unit NAV.
+        # Long financing debt was added after that helper's ABI and must be
+        # rebased by the exact same denominator.  Leaving it in pre-rebase
+        # notional mixes two accounting scales as soon as a financed position
+        # changes price and makes the next chunk fail the unit-NAV identity.
+        live_advance = advance & alive
+        debt_denominator = torch.where(
+            live_advance,
+            nav_end,
+            torch.ones_like(nav_end),
+        )
+        normalized_long_margin_debt = torch.where(
+            live_advance,
+            long_margin_debt / debt_denominator,
+            torch.zeros_like(long_margin_debt),
+        )
+        normalized_long_margin_debt = torch.where(
+            alive,
+            normalized_long_margin_debt,
+            torch.zeros_like(normalized_long_margin_debt),
+        )
+        long_margin_debt = torch.where(
+            advance,
+            normalized_long_margin_debt,
+            long_margin_debt,
         )
         (
             commission_rebate_current,
@@ -2537,9 +3186,11 @@ def _run_dual_session(
         payable_rows.append(payables)
         receivable_rows.append(receivables)
         default_rows.append(default_event)
+        default_reason_rows.append(default_reason)
         equity_scale_rows.append(equity_scale)
         short_sale_rows.append(short_sale_collateral)
         short_margin_rows.append(short_margin_collateral)
+        long_margin_debt_rows.append(long_margin_debt)
         rebate_accrued_rows.append(commission_rebate_accrued)
         rebate_paid_rows.append(commission_rebate_paid)
         rebate_current_rows.append(commission_rebate_current)
@@ -2611,6 +3262,7 @@ def _run_dual_session(
         equity_scale_history=torch.stack(equity_scale_rows),
         short_sale_collateral_history=torch.stack(short_sale_rows),
         short_margin_collateral_history=torch.stack(short_margin_rows),
+        long_margin_debt_history=torch.stack(long_margin_debt_rows),
         final_weights=risky,
         final_cash=cash,
         final_payables=payables,
@@ -2619,6 +3271,7 @@ def _run_dual_session(
         final_equity_scale=equity_scale,
         final_short_sale_collateral=short_sale_collateral,
         final_short_margin_collateral=short_margin_collateral,
+        final_long_margin_debt=long_margin_debt,
         commission_rebate_accrued_history=torch.stack(rebate_accrued_rows),
         commission_rebate_paid_history=torch.stack(rebate_paid_rows),
         commission_rebate_current_history=torch.stack(rebate_current_rows),
@@ -2631,6 +3284,7 @@ def _run_dual_session(
         final_commission_rebate_month_id=commission_rebate_month_id,
         due_weights_history=due_history,
         final_due_weights=(risky if mode == "tw_overnight" else None),
+        default_reason_history=torch.stack(default_reason_rows),
     )
 
 
@@ -2653,6 +3307,11 @@ def run_tw_cash_dual_session(
     short_margin_rate: torch.Tensor | float | None = None,
     short_capacity_weights: torch.Tensor | float | None = None,
     short_handling_fee_rate: torch.Tensor | float = 0.0,
+    day_trade_carry_normal_sell_fee_rates: torch.Tensor | float | None = None,
+    day_trade_margin_financing_ratio: float = 0.0,
+    day_trade_margin_financing_annual_rate: float = 0.0,
+    day_trade_margin_short_handling_fee_rate: float = 0.0,
+    day_trade_margin_short_annual_borrow_rate: float = 0.0,
     short_maintenance_ratio: float = 1.30,
     unresolved_corporate_action_mask: torch.Tensor | None = None,
     cash_dividend_yield: torch.Tensor | None = None,
@@ -2676,7 +3335,9 @@ def run_tw_cash_dual_session(
     initial_equity_scale: torch.Tensor | None = None,
     initial_short_sale_collateral: torch.Tensor | None = None,
     initial_short_margin_collateral: torch.Tensor | None = None,
+    initial_long_margin_debt: torch.Tensor | None = None,
     _detach_initial_state: bool = True,
+    _symbol_sharded: bool = False,
 ) -> TaiwanDualSessionResult:
     """Run signed OPEN/CLOSE post-event targets with one daily T+2 ledger."""
 
@@ -2701,6 +3362,19 @@ def run_tw_cash_dual_session(
         short_margin_rate=short_margin_rate,
         short_capacity_weights=short_capacity_weights,
         short_handling_fee_rate=short_handling_fee_rate,
+        day_trade_carry_normal_sell_fee_rates=(
+            day_trade_carry_normal_sell_fee_rates
+        ),
+        day_trade_margin_financing_ratio=day_trade_margin_financing_ratio,
+        day_trade_margin_financing_annual_rate=(
+            day_trade_margin_financing_annual_rate
+        ),
+        day_trade_margin_short_handling_fee_rate=(
+            day_trade_margin_short_handling_fee_rate
+        ),
+        day_trade_margin_short_annual_borrow_rate=(
+            day_trade_margin_short_annual_borrow_rate
+        ),
         short_maintenance_ratio=short_maintenance_ratio,
         unresolved_corporate_action_mask=unresolved_corporate_action_mask,
         cash_dividend_yield=cash_dividend_yield,
@@ -2724,7 +3398,9 @@ def run_tw_cash_dual_session(
         initial_equity_scale=initial_equity_scale,
         initial_short_sale_collateral=initial_short_sale_collateral,
         initial_short_margin_collateral=initial_short_margin_collateral,
+        initial_long_margin_debt=initial_long_margin_debt,
         detach_initial_state=_detach_initial_state,
+        _symbol_sharded=_symbol_sharded,
     )
 
 
@@ -2770,7 +3446,9 @@ def run_tw_overnight_dual_session(
     initial_equity_scale: torch.Tensor | None = None,
     initial_short_sale_collateral: torch.Tensor | None = None,
     initial_short_margin_collateral: torch.Tensor | None = None,
+    initial_long_margin_debt: torch.Tensor | None = None,
     _detach_initial_state: bool = True,
+    _symbol_sharded: bool = False,
 ) -> TaiwanDualSessionResult:
     """Run strict one-session cohorts with open/close entry and exit timing.
 
@@ -2800,6 +3478,11 @@ def run_tw_overnight_dual_session(
         short_margin_rate=short_margin_rate,
         short_capacity_weights=short_capacity_weights,
         short_handling_fee_rate=short_handling_fee_rate,
+        day_trade_carry_normal_sell_fee_rates=None,
+        day_trade_margin_financing_ratio=0.0,
+        day_trade_margin_financing_annual_rate=0.0,
+        day_trade_margin_short_handling_fee_rate=0.0,
+        day_trade_margin_short_annual_borrow_rate=0.0,
         short_maintenance_ratio=short_maintenance_ratio,
         unresolved_corporate_action_mask=unresolved_corporate_action_mask,
         cash_dividend_yield=cash_dividend_yield,
@@ -2823,7 +3506,9 @@ def run_tw_overnight_dual_session(
         initial_equity_scale=initial_equity_scale,
         initial_short_sale_collateral=initial_short_sale_collateral,
         initial_short_margin_collateral=initial_short_margin_collateral,
+        initial_long_margin_debt=initial_long_margin_debt,
         detach_initial_state=_detach_initial_state,
+        _symbol_sharded=_symbol_sharded,
     )
 
 

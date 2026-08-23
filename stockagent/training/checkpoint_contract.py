@@ -167,6 +167,12 @@ def _project_temporal_basis_model_config(
     """Keep disabled model branches compatible with pre-feature checkpoints."""
 
     projected = dict(values)
+    if bool(projected.get("use_execution_context_features", True)):
+        # Learned execution-context conditioning predates its ablation switch.
+        # Omit the enabled/default value so existing executable-transformer
+        # checkpoints keep their exact semantic fingerprint; only the disabled
+        # architecture is a new explicit contract.
+        projected.pop("use_execution_context_features", None)
     if not projected.get("temporal_basis_families"):
         for field_name in _TEMPORAL_BASIS_MODEL_CONFIG_FIELDS:
             projected.pop(field_name, None)
@@ -180,6 +186,11 @@ def _project_temporal_basis_model_config(
             # Preserve pre-option basis checkpoint fingerprints.  Embedded is the
             # historical behavior and does not alter parameters or the forward path.
             projected.pop("temporal_basis_input", None)
+    if not bool(projected.get("temporal_basis_algebraic_contraction", False)):
+        # The disabled value is the historical AMP operation order. Omit the
+        # post-feature field so old checkpoints keep their fingerprint; an
+        # enabled contraction remains explicit and owns a fresh trajectory.
+        projected.pop("temporal_basis_algebraic_contraction", None)
     if int(projected.get("daily_context_layers", 0) or 0) == 0:
         # These controls have no parameters or forward-path effect until the
         # daily-context branch has at least one layer.  Omitting them preserves
@@ -220,18 +231,40 @@ def _configuration_fingerprint_snapshot(config: ExperimentConfig) -> dict[str, A
     snapshot = asdict(config)
     training = snapshot.get("training")
     if isinstance(training, dict):
+        active_model_name = _normalized_model_name(config.training.model_name)
         for config_name in (
             "transformer_base_portfolio",
             "financial_transformer",
+            "executable_portfolio_transformer",
         ):
             values = training.get(config_name)
             if isinstance(values, Mapping):
                 training[config_name] = _project_temporal_basis_model_config(values)
+        if active_model_name not in {
+            "executable_portfolio_transformer",
+            "executable_portfolio_transformer_model",
+            "execution_aware_portfolio_transformer",
+        }:
+            # This model family did not exist in historical checkpoints.  Its
+            # inactive default section must not perturb existing experiments.
+            training.pop("executable_portfolio_transformer", None)
     return snapshot
 
 
 def _active_model_config(config: ExperimentConfig) -> dict[str, Any]:
     normalized = _normalized_model_name(config.training.model_name)
+    if normalized in {
+        "executable_portfolio_transformer",
+        "executable_portfolio_transformer_model",
+        "execution_aware_portfolio_transformer",
+    }:
+        return {
+            "config_name": "executable_portfolio_transformer",
+            "contract_name": "executable_portfolio_transformer",
+            "values": _project_temporal_basis_model_config(
+                asdict(config.training.executable_portfolio_transformer)
+            ),
+        }
     if normalized in {
         "cross_sectional_index_derivatives_day",
         "cross_sectional_index_derivatives_day_model",
@@ -600,10 +633,15 @@ def _training_checkpoint_contract_schema_3(
 ) -> dict[str, Any]:
     """Exact training contract written by schema 3 before semantic layering."""
     contract = asdict(config.training)
-    for config_name in ("transformer_base_portfolio", "financial_transformer"):
+    for config_name in (
+        "transformer_base_portfolio",
+        "financial_transformer",
+    ):
         model_values = contract.get(config_name)
         if isinstance(model_values, Mapping):
             contract[config_name] = _project_temporal_basis_model_config(model_values)
+    # Schema 3 predates the executable-policy family entirely.
+    contract.pop("executable_portfolio_transformer", None)
     transformer_values = contract.get("transformer_base_portfolio")
     if isinstance(transformer_values, Mapping):
         projected_transformer_values = dict(transformer_values)
