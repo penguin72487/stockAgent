@@ -17,8 +17,16 @@ Nice=15
 CPUWeight=10
 IOWeight=10
 IOSchedulingClass=idle
-MemoryHigh=2G
+# DuckDB's 1 GB execution budget still coexists with Arrow/Python metadata and
+# the cgroup's file cache. A 2 GB soft limit caused sustained reclaim pressure
+# while the host retained tens of GiB available; keep the 3 GB hard stop and
+# allow a bounded 2.5 GB working set.
+MemoryHigh=2560M
 MemoryMax=3G
+# After removing filesystem resolution from the manifest scan and deferring the
+# pathological 103k-schema FRED view, a live 2,048-shard batch publishes in
+# 7m17s. Keep roughly 2.7x measured wall-time headroom without allowing a stuck
+# shadow compaction to overlap multiple timer windows.
 TimeoutStartSec=20min
 NoNewPrivileges=true
 PrivateTmp=true

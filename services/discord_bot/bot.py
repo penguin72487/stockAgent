@@ -73,6 +73,11 @@ from stockagent.live.tw_day_trade_simulation import (
     require_exact_session_eligibility,
     resolve_day_trade_rule_data_dir,
 )
+from stockagent.live.tw_day_trade_service_sync import (
+    DISCORD_SERVICE_STATUS_FILENAME,
+    load_service_sync,
+    mode_from_service_sync,
+)
 from stockagent.live.model_deployment import (
     ModelDeployment,
     attempt_model_deployment,
@@ -110,10 +115,23 @@ PYTHON_EXECUTABLE_SENTINEL = "{python}"
 _MODEL_INFERENCE_LOCK = threading.Lock()
 _PRE_SIGNAL_SUCCESS_LOCK = threading.Lock()
 _PREOPEN_READINESS_LOCK = threading.Lock()
+_SERVICE_STATUS_LOCK = threading.Lock()
 _PRE_SIGNAL_SUCCESS_AT: dict[tuple[str, ...], float] = {}
 _PRE_SIGNAL_FAILURE_AT: dict[tuple[str, ...], tuple[float, str]] = {}
 _BOT_RUN_STARTED_AT = datetime.now().astimezone().isoformat(timespec="seconds")
 _BOT_RUN_ID = f"{os.getpid()}-{time.time_ns()}"
+
+
+def _day_trade_state_dir() -> Path:
+    configured = _env(
+        "TW_DAY_TRADE_STATE_DIR",
+        "artifacts/live/tw_day_trade_simulation",
+    )
+    return _resolve_repo_path(configured) or Path(str(configured))
+
+
+def _discord_service_status_path() -> Path:
+    return ROOT / "artifacts" / "discord_bot" / DISCORD_SERVICE_STATUS_FILENAME
 
 
 class BotUserError(RuntimeError):
@@ -1066,8 +1084,8 @@ def _scheduled_retry_delay_seconds() -> int:
 
 def _day_trade_confirmation_delay_seconds() -> int:
     return max(
-        5,
-        _env_int("STOCKAGENT_DAY_TRADE_CONFIRMATION_DELAY_SECONDS", 15) or 15,
+        1,
+        _env_int("STOCKAGENT_DAY_TRADE_CONFIRMATION_DELAY_SECONDS", 2) or 2,
     )
 
 
@@ -1580,6 +1598,7 @@ class StockAgentBot(discord.Client):
         # Start its catch-up loop before Discord command synchronization so a
         # missed market schedule is recovered immediately after login.
         scheduled_signal.start()
+        service_heartbeat.start()
         synced = await self.tree.sync()
         print(
             f"synced {len(synced)} global app commands "
@@ -3227,6 +3246,22 @@ def _latest_market_signal(cfg: LiveMarketConfig) -> tuple[Path, dict[str, Any]] 
     root = _resolve_repo_path(cfg.live_output_dir)
     if root is None or not root.exists():
         return None
+    pointer_path = root / "latest_signal.json"
+    try:
+        pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+        if not isinstance(pointer, dict):
+            raise ValueError("latest signal pointer is not an object")
+        summary_path = _resolve_repo_path(pointer.get("summary_path"))
+        if (
+            pointer.get("artifact_complete") is not False
+            and summary_path is not None
+            and summary_path.is_file()
+        ):
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            if isinstance(summary, dict):
+                return summary_path, summary
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        pass
     for path in sorted(root.glob("**/summary.json"), key=lambda item: item.stat().st_mtime, reverse=True):
         try:
             summary = json.loads(path.read_text(encoding="utf-8"))
@@ -3258,24 +3293,27 @@ def _day_trade_schedule_state(
     _summary_path, summary = latest
     if not _summary_date_matches(summary.get("generated_at"), session_date):
         return "retry"
-    configured = _env(
-        "TW_DAY_TRADE_STATE_DIR",
-        "artifacts/live/tw_day_trade_simulation",
-    )
-    state_dir = _resolve_repo_path(configured) or Path(str(configured))
-    try:
-        state = json.loads((state_dir / "state.json").read_text(encoding="utf-8"))
-    except (OSError, ValueError, TypeError):
-        return "retry"
-    raw_mode = (state.get("modes") or {}).get(str(cfg.market))
+    receipt = load_service_sync(_day_trade_state_dir())
+    raw_mode = mode_from_service_sync(receipt, str(cfg.market))
+    if raw_mode is None:
+        # Backward-compatible bootstrap while an older engine is being
+        # replaced.  The normal hot path reads only the compact commit receipt.
+        try:
+            state = json.loads(
+                (_day_trade_state_dir() / "state.json").read_text(encoding="utf-8")
+            )
+        except (OSError, ValueError, TypeError):
+            return "retry"
+        raw_mode = (state.get("modes") or {}).get(str(cfg.market))
     if not isinstance(raw_mode, dict):
         return "retry"
     positions = raw_mode.get("positions") or {}
-    if isinstance(positions, dict) and any(
+    legacy_open = isinstance(positions, dict) and any(
         int(position.get("signed_shares") or 0) != 0
         for position in positions.values()
         if isinstance(position, dict)
-    ):
+    )
+    if int(raw_mode.get("open_position_count") or 0) > 0 or legacy_open:
         return "blocked_open_position"
     if (
         str(raw_mode.get("session_date") or "") == session_date
@@ -3285,6 +3323,49 @@ def _day_trade_schedule_state(
     ):
         return "completed"
     return "retry"
+
+
+def _write_discord_service_status() -> dict[str, Any]:
+    """Publish the bot's acknowledgement of the engine commit revision."""
+
+    configs = _market_configs()
+    day_trade_markets = sorted(
+        market
+        for market, cfg in configs.items()
+        if _market_enabled(cfg)
+        and bool(getattr(cfg, "day_trade_simulation_enabled", False))
+    )
+    engine = load_service_sync(_day_trade_state_dir()) or {}
+    modes = engine.get("modes") or {}
+    payload = {
+        "schema_version": 1,
+        "service": "stockagent-discord-bot",
+        "run_id": _BOT_RUN_ID,
+        "run_started_at": _BOT_RUN_STARTED_AT,
+        "updated_at": datetime.now().astimezone().isoformat(timespec="milliseconds"),
+        "discord_connected": bool(bot.is_ready()),
+        "day_trade_markets": day_trade_markets,
+        "engine_run_id": engine.get("engine_run_id"),
+        "engine_state_revision": int(engine.get("state_revision") or 0),
+        "engine_published_at": engine.get("published_at"),
+        "mode_signal_ids": {
+            market: (modes.get(market) or {}).get("signal_id")
+            for market in day_trade_markets
+            if isinstance(modes.get(market), dict)
+        },
+        "simulation_only": True,
+        "production_order_possible": False,
+    }
+    path = _discord_service_status_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(f".json.tmp.{os.getpid()}")
+    with _SERVICE_STATUS_LOCK:
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
+    return payload
 
 
 def _summary_date_matches(left: str | None, right: str | None) -> bool:
@@ -7102,6 +7183,16 @@ async def model_auto_deployment() -> None:
                 f"error={type(exc).__name__}: {exc}",
                 flush=True,
             )
+
+
+@tasks.loop(seconds=1)
+async def service_heartbeat() -> None:
+    """Keep a compact, source-backed Discord/engine synchronization receipt."""
+
+    try:
+        await asyncio.to_thread(_write_discord_service_status)
+    except Exception as exc:
+        _log_exception("service_heartbeat", exc)
 
 
 @tasks.loop(seconds=10)

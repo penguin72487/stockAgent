@@ -1,10 +1,9 @@
 market: tw_day_trade_multi_basis
 label: 台股・Multi-Basis 當沖（初始 1,000 萬）
-# Retain this legacy artifact for reproducibility/manual audit only.  Its
-# 99-feature checkpoint fails the strict publication-time lineage contract, so
-# it must not enter automatic preopen/signal/simulation schedules.  Use the
-# projection-L1 GELU deployment until this legacy mode is causally retrained.
-enabled: false
+# Keep this as an independent TWD 10 million deployment alongside the TWD
+# 100 million and Projection-L1 GELU modes.  The checkpoint, immutable
+# deployment config, model-scoped live output, and paper ledger are separate.
+enabled: true
 market_type: tw
 timezone: Asia/Taipei
 open_time: "09:00"

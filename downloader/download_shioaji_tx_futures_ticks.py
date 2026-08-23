@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import argparse
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 import fcntl
 import json
 import os
@@ -43,7 +43,9 @@ from downloader.download_shioaji_tw_kbars import (
 
 SOURCE = "shioaji_continuous_futures_historical_ticks_v1"
 LEGACY_TX_SOURCE = "shioaji_txfr1_historical_ticks_v1"
-SCHEMA_VERSION = 1
+RECEIPT_SCHEMA_VERSION = 1
+MANIFEST_SCHEMA_VERSION = 2
+CONTRACT_UNAVAILABLE_EXIT = 78
 HISTORY_START = date(2020, 3, 22)
 
 
@@ -121,7 +123,7 @@ def _valid_receipt(root: Path, trading_date: date) -> dict[str, Any] | None:
     if root.name == "TXFR1":
         allowed_sources.add(LEGACY_TX_SOURCE)
     if not isinstance(payload, dict) or not (
-        payload.get("schema_version") == SCHEMA_VERSION
+        payload.get("schema_version") == RECEIPT_SCHEMA_VERSION
         and payload.get("source") in allowed_sources
         and payload.get("contract") == root.name
         and payload.get("trading_date") == trading_date.isoformat()
@@ -190,7 +192,7 @@ def _write_manifest(
     source_empty = [item for item in resolved if item.get("status") == "source_empty"]
     missing = [value.isoformat() for value in expected if value.isoformat() not in resolved_dates]
     manifest = {
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": MANIFEST_SCHEMA_VERSION,
         "dataset": SOURCE,
         "status": "complete" if not missing else "partial",
         "contract": contract,
@@ -214,6 +216,49 @@ def _write_manifest(
         "quote_contract": (
             "bid/ask fields are the one-level values attached to each historical trade; "
             "they are not historical five-level order books"
+        ),
+    }
+    _atomic_write_json(root / "manifest.json", manifest)
+    return manifest
+
+
+def _write_contract_unavailable_manifest(
+    root: Path,
+    *,
+    contract: str,
+    expected: list[date],
+) -> dict[str, Any]:
+    """Persist a truthful terminal provider-catalog gap without fabricating data."""
+
+    manifest = {
+        "schema_version": MANIFEST_SCHEMA_VERSION,
+        "dataset": SOURCE,
+        "status": "contract_unavailable",
+        "contract": contract,
+        "history_start": expected[0].isoformat() if expected else None,
+        "history_end": expected[-1].isoformat() if expected else None,
+        "expected_trading_dates": len(expected),
+        "resolved_trading_dates": 0,
+        "complete_trading_dates": 0,
+        "source_empty_trading_dates": 0,
+        "missing_trading_dates": [value.isoformat() for value in expected],
+        "rows": 0,
+        "bytes": 0,
+        "provider": "shioaji",
+        "unavailable_reason": "shioaji_contract_catalog_missing",
+        "checked_at_utc": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        "no_data_fabricated": True,
+        "stopped_for_traffic": False,
+        "stopped_for_market_hours": False,
+        "traffic_used_bytes": None,
+        "traffic_limit_bytes": None,
+        "timestamp_contract": (
+            "no timestamps are available because the requested continuous alias "
+            "was absent from the provider contract catalog"
+        ),
+        "quote_contract": (
+            "no quote rows were synthesized; a future catalog refresh may make "
+            "the alias queryable"
         ),
     }
     _atomic_write_json(root / "manifest.json", manifest)
@@ -307,7 +352,20 @@ def main() -> int:
         logged_in = True
         contract = api.contracts.get(str(args.contract))
         if contract is None:
-            raise LookupError(f"future contract not found: {args.contract}")
+            manifest = _write_contract_unavailable_manifest(
+                args.output_dir,
+                contract=str(args.contract),
+                expected=expected,
+            )
+            print(
+                "[shioaji-futures-history] "
+                f"contract={args.contract} status={manifest['status']} "
+                "reason=shioaji_contract_catalog_missing "
+                "resolved=0/"
+                f"{manifest['expected_trading_dates']} no_data_fabricated=true",
+                flush=True,
+            )
+            return CONTRACT_UNAVAILABLE_EXIT
         for index, trading_date in enumerate(pending, start=1):
             if _taiwan_market_hours_now() and not args.allow_market_hours:
                 stopped_for_market_hours = True
@@ -354,7 +412,7 @@ def main() -> int:
                 _atomic_write_json(
                     _receipt_path(args.output_dir, trading_date),
                     {
-                        "schema_version": SCHEMA_VERSION,
+                        "schema_version": RECEIPT_SCHEMA_VERSION,
                         "source": SOURCE,
                         "status": "source_empty",
                         "contract": str(args.contract),
@@ -371,7 +429,7 @@ def main() -> int:
                 continue
             output = _write_parquet_atomic(frame, _data_path(args.output_dir, trading_date))
             receipt = {
-                "schema_version": SCHEMA_VERSION,
+                "schema_version": RECEIPT_SCHEMA_VERSION,
                 "source": SOURCE,
                 "status": "complete",
                 "contract": str(args.contract),

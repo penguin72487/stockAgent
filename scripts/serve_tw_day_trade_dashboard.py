@@ -21,6 +21,7 @@ from stockagent.live.tw_day_trade_dashboard import (  # noqa: E402
     build_dashboard_event_page,
     build_dashboard_history_snapshot,
     build_dashboard_position_page,
+    build_dashboard_revision,
     build_dashboard_signal_page,
     build_dashboard_snapshot,
     build_dashboard_summary,
@@ -94,6 +95,9 @@ class DashboardServer(ThreadingHTTPServer):
             state_dir=self.state_dir,
             preopen_readiness_path=self.preopen_readiness_path,
             session_date=session_date,
+            maximum_event_rows=500,
+            maximum_mark_rows=32,
+            include_position_rows=False,
         )
 
     def signal_page(self, **kwargs: object) -> dict[str, object]:
@@ -124,6 +128,17 @@ class DashboardServer(ThreadingHTTPServer):
             state_dir=self.state_dir,
             preopen_readiness_path=self.preopen_readiness_path,
             session_date=session_date,
+        )
+
+    def revision(self) -> dict[str, object]:
+        discord_status_path = (
+            self.preopen_readiness_path.with_name("service_status.json")
+            if self.preopen_readiness_path is not None
+            else None
+        )
+        return build_dashboard_revision(
+            state_dir=self.state_dir,
+            discord_service_status_path=discord_status_path,
         )
 
 
@@ -190,10 +205,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
             try:
                 self._json(
                     HTTPStatus.OK,
-                    self.server.summary(
-                        session_date=_session_date_query(parsed.query)
-                    ),
+                    self.server.summary(session_date=_session_date_query(parsed.query)),
                 )
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                self._json(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    {"health": "unavailable", "error": f"{type(exc).__name__}: {exc}"},
+                )
+            return
+        if path == "/api/revision":
+            try:
+                self._json(HTTPStatus.OK, self.server.revision())
             except (OSError, ValueError, json.JSONDecodeError) as exc:
                 self._json(
                     HTTPStatus.SERVICE_UNAVAILABLE,

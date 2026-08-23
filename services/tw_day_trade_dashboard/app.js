@@ -1,6 +1,7 @@
 "use strict";
 
 const PRICE_REFRESH_MS = 60000;
+const SERVICE_REVISION_REFRESH_MS = 1000;
 const TW_PUBLIC_STATUS_REFRESH_MS = 30000;
 const Dashboard = window.StockAgentDashboard;
 const fetchWithTimeout = Dashboard.createFetch({timeoutMs: 15000});
@@ -31,6 +32,8 @@ let refreshForceQueued = false;
 let lastRenderedRevision = null;
 let lastFilterRevision = null;
 let lastSourceUpdatedAt = "";
+let lastServiceRevision = "";
+let revisionRefreshInFlight = false;
 let signalRows = [];
 let signalDirectionSummary = {};
 let signalOpeningExecutionAudit = {};
@@ -541,9 +544,9 @@ function renderOverview(data) {
   const cards = [
     ["模式狀態", `${healthyModes}/${modes.length} 可解讀`, healthyModes === modes.length ? "所有 checkpoint 與執行狀態正常" : "有模式需要查看上方警示", healthKind],
     ["所選日持倉", `${number(openPositionCount)} 個`, stalePositions ? `${number(stalePositions)} 個估值延用` : "目前估值皆有新鮮報價", stalePositions ? "warn" : "good"],
-    ["四模式已實現", realizedPnl == null ? "—" : `${realizedPnl >= 0 ? "+" : ""}${compactMoney(realizedPnl)}`, "已出場部分，已扣分攤後交易成本", pnlClass(realizedPnl)],
-    ["四模式未實現", unrealizedPnl == null ? "—" : `${unrealizedPnl >= 0 ? "+" : ""}${compactMoney(unrealizedPnl)}`, stalePositions ? `含 ${number(stalePositions)} 個延用估值` : "以可清算 bid／ask 並扣剩餘成本", stalePositions ? "warn" : pnlClass(unrealizedPnl)],
-    ["四模式總淨損益", totalPnl == null ? "—" : `${totalPnl >= 0 ? "+" : ""}${compactMoney(totalPnl)}`, reconciled ? "已實現＋未實現，已與總權益對帳" : reconciliationDifference == null ? "等待完整損益來源" : `對帳差異 ${summaryMoney(reconciliationDifference)}`, reconciled ? pnlClass(totalPnl) : "bad"],
+    ["各模式已實現", realizedPnl == null ? "—" : `${realizedPnl >= 0 ? "+" : ""}${compactMoney(realizedPnl)}`, "已出場部分，已扣分攤後交易成本", pnlClass(realizedPnl)],
+    ["各模式未實現", unrealizedPnl == null ? "—" : `${unrealizedPnl >= 0 ? "+" : ""}${compactMoney(unrealizedPnl)}`, stalePositions ? `含 ${number(stalePositions)} 個延用估值` : "以可清算 bid／ask 並扣剩餘成本", stalePositions ? "warn" : pnlClass(unrealizedPnl)],
+    ["各模式總淨損益", totalPnl == null ? "—" : `${totalPnl >= 0 ? "+" : ""}${compactMoney(totalPnl)}`, reconciled ? "已實現＋未實現，已與總權益對帳" : reconciliationDifference == null ? "等待完整損益來源" : `對帳差異 ${summaryMoney(reconciliationDifference)}`, reconciled ? pnlClass(totalPnl) : "bad"],
     ["篩選區間報酬", best == null ? "—" : `${best >= 0 ? "+" : ""}${displayPct(best)} ～ ${worst >= 0 ? "+" : ""}${displayPct(worst)}`, `${chartWindowLabel()}；各模式以上一交易日最後權益為基準`, best != null && worst < 0 ? "warn" : pnlClass(best)],
   ];
   $("overview-kpis").innerHTML = cards.map(([label, value, note, kind]) => `<div class="overview-kpi">
@@ -775,6 +778,19 @@ function renderOperations(data) {
   const noLatency = !Number(latency.sample_count || 0);
   const latencyEmptyLabel = "今日尚無開盤樣本";
   const latestBottleneck = latencyStageLabels[latency.latest_bottleneck_stage] || latency.latest_bottleneck_stage || "—";
+  const serviceSync = data.service_sync || {};
+  const discordSync = serviceSync.discord || {};
+  const syncKind = serviceSync.synchronized ? "good" : serviceSync.status === "catching_up" ? "warn" : "bad";
+  const syncLabel = serviceSync.synchronized
+    ? `rev ${number(serviceSync.state_revision)} 已同步`
+    : serviceSync.status === "catching_up"
+      ? `追趕中 · 差 ${number(serviceSync.revision_lag)} 版`
+      : serviceSync.status === "discord_connecting"
+        ? "Discord 連線中"
+      : serviceSync.status === "engine_committed"
+        ? `rev ${number(serviceSync.state_revision)} 已提交`
+        : "Discord 狀態逾時";
+  const syncNote = `engine ${duration(serviceSync.engine_age_seconds)}前 · Discord ${duration(discordSync.age_seconds)}前 · 版本探測每 ${number(SERVICE_REVISION_REFRESH_MS / 1000)} 秒`;
   $("latency-kpis").innerHTML = [
     ["最新輸入→落盤", noLatency ? latencyEmptyLabel : latencyValue(latency.latest_ms), noLatency ? "不以舊日或估計值冒充今日速度" : `${esc(latency.latest_market || "—")} · ${shortTime(latency.latest_recorded_at)}`],
     ["P50", latencyValue(latency.p50_ms), `${number(latency.sample_count || 0)} 個成功模式樣本`],
@@ -788,10 +804,11 @@ function renderOperations(data) {
     ["目前階段", session.label || "—", `下一步 ${session.next_milestone_label || "—"} · ${countdown(session.next_milestone_at)}`, phaseKind],
     ["帳本心跳", `${sourceNumber(data.source_age_seconds)} 秒`, `目標每 ${number(session.decision_interval_seconds || 60)} 秒`, heartbeatKind],
     ["面板 API", lastFetchMs == null ? "—" : `${number(lastFetchMs, 1)} ms`, `行情與權益每 ${number(PRICE_REFRESH_MS / 1000)} 秒刷新`, lastFetchMs != null && lastFetchMs > 1000 ? "warn" : "good"],
+    ["服務同步", syncLabel, syncNote, syncKind],
   ].map(([label, value, note, kind]) => `<div class="operation-kpi"><span>${esc(label)}</span><strong>${esc(value)}</strong><small class="${esc(kind)}">${esc(note)}</small></div>`).join("");
 
   const workflowRows = [
-    {label:"四模式預熱", value:warmRatio, count:`${number(warm.completed_count || 0)} / ${number(totalModes)} · ${number(warmRatio * 100, 1)}%`, note:`牆鐘 ${duration(warm.wall_elapsed_seconds)} · ${warm.modes_per_minute == null ? "—" : `${sourceNumber(warm.modes_per_minute)} 模式/分`}`, kind:warmKind},
+    {label:"啟用模式預熱", value:warmRatio, count:`${number(warm.completed_count || 0)} / ${number(totalModes)} · ${number(warmRatio * 100, 1)}%`, note:`牆鐘 ${duration(warm.wall_elapsed_seconds)} · ${warm.modes_per_minute == null ? "—" : `${sourceNumber(warm.modes_per_minute)} 模式/分`}`, kind:warmKind},
     {label:"所選日策略執行", value:session.signal_progress_ratio, count:`${number(session.signal_completed_modes || 0)} / ${number(session.mode_count || 0)}`, note:"原子指標由 inotify 事件即時喚醒；0.1 秒只作備援，阻擋不算完成", kind:"good"},
     {label:"進場處理終態", value:session.entry_progress_ratio, count:`${number(session.entry_completed_modes || 0)} / ${number(session.mode_count || 0)}`, note:"完成後可能有成交或依真實限制保持空倉", kind:"good"},
     {label:"每分鐘權益紀錄", value:session.mark_progress_ratio, count:`${number(session.observed_mode_minutes || 0)} / ${number(session.expected_mode_minutes || 0)}`, note:`目前 ${sourceNumber(session.mark_rows_per_minute || 0)} 模式紀錄/分`, kind:""},
@@ -1518,6 +1535,7 @@ async function refresh({force = false} = {}) {
     const response = await fetchWithTimeout(`api/status${date ? `?date=${encodeURIComponent(date)}` : ""}`, {cache: "no-store"});
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     snapshot = await response.json();
+    lastServiceRevision = String(snapshot.service_sync?.revision_token || lastServiceRevision || "");
     lastFetchMs = performance.now() - started;
     const sourceUpdatedAt = String(snapshot.source_updated_at || "");
     const sourceHasChanged = sourceUpdatedAt && sourceUpdatedAt !== lastSourceUpdatedAt;
@@ -1561,6 +1579,29 @@ async function refresh({force = false} = {}) {
       refreshForceQueued = false;
       void refresh({force: queuedForce});
     }
+  }
+}
+
+async function refreshServiceRevision() {
+  if (document.hidden || revisionRefreshInFlight) return;
+  revisionRefreshInFlight = true;
+  try {
+    const response = await fetchWithTimeout("api/revision", {cache: "no-store"});
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const serviceSync = await response.json();
+    const revision = String(serviceSync.revision_token || "");
+    const changed = Boolean(lastServiceRevision && revision && revision !== lastServiceRevision);
+    if (revision) lastServiceRevision = revision;
+    if (snapshot) {
+      snapshot.service_sync = serviceSync;
+      renderOperations(snapshot);
+    }
+    if (changed) void refresh();
+  } catch (_error) {
+    // The ordinary full refresh remains the fail-safe.  Do not replace the
+    // last source-backed service state with an inferred client-side status.
+  } finally {
+    revisionRefreshInFlight = false;
   }
 }
 
@@ -1647,4 +1688,5 @@ setInterval(() => { $("clock").textContent = new Date().toLocaleString("zh-TW", 
 Dashboard.scheduleRefresh(() => {
   void refresh();
 }, {intervalMs: PRICE_REFRESH_MS});
+Dashboard.scheduleRefresh(refreshServiceRevision, {intervalMs: SERVICE_REVISION_REFRESH_MS});
 Dashboard.scheduleRefresh(loadTwPublicMonitor, {intervalMs: TW_PUBLIC_STATUS_REFRESH_MS});

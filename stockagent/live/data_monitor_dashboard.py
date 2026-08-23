@@ -26,6 +26,9 @@ from stockagent.live.shioaji_api_dashboard import build_shioaji_public_status
 
 DATA_MONITOR_SCHEMA_VERSION: Final[int] = 6
 TAIPEI: Final[ZoneInfo] = ZoneInfo("Asia/Taipei")
+OPENBB_L1_MAX_SOURCE_FILES_PER_RUN: Final[int] = 2_048
+OPENBB_L1_MIN_FILES_PER_SEGMENT: Final[int] = 32
+OPENBB_L1_WORST_CASE_RUN_SECONDS: Final[int] = 20 * 60
 
 _GROUP_META: Final[dict[str, dict[str, Any]]] = {
     "tw-public": {
@@ -1661,6 +1664,7 @@ def _shioaji_sources(
         "active": "updating",
         "ready": "current",
         "waiting": "waiting",
+        "partial": "degraded",
         "attention": "degraded",
         "blocked": "blocked",
     }
@@ -1689,7 +1693,7 @@ def _shioaji_sources(
                 else "配額允許時持續回補",
                 "update_owner": "Shioaji 資料服務",
                 "latest_at_utc": _iso(latest),
-                "data_through": None,
+                "data_through": str(pipeline.get("data_through") or "") or None,
                 "freshness": _freshness(
                     latest,
                     now=now,
@@ -1804,7 +1808,18 @@ def _openbb_sources(
         )
         source_age = _number(l1.get("source_age_seconds"))
         latest = now - timedelta(seconds=source_age) if source_age is not None else None
-        if pending_files == 0:
+        deferred_query_views = l1.get("deferred_query_views")
+        deferred_query_views = (
+            deferred_query_views if isinstance(deferred_query_views, Mapping) else {}
+        )
+        if pending_files == 0 and deferred_query_views:
+            row_status = "partial"
+            status_label = "壓實完成；部分查詢檢視待正規化"
+            eta = _unknown_eta(
+                "query_normalization_required",
+                "超寬端點已保留 L1 Parquet，但需轉為 long-form 後才能發布查詢檢視。",
+            )
+        elif pending_files == 0:
             row_status = "complete"
             status_label = "目前成功 shard 已全部壓實"
             eta = _complete_eta("目前沒有待壓實的成功 shard。")
@@ -1817,17 +1832,21 @@ def _openbb_sources(
         else:
             row_status = "waiting"
             status_label = "等待下一輪增量壓實"
-            # The installed timer starts at most 20,000 new shards per run and
-            # is scheduled every 30 minutes. This is a low-confidence
-            # no-new-arrivals capacity projection, not a completion promise.
-            runs = math.ceil(pending_files / 20_000)
-            seconds = runs * 30 * 60
+            # Keep this capacity contract synchronized with the installed
+            # systemd unit. It is a low-confidence no-new-arrivals projection,
+            # not a completion promise.
+            runs = math.ceil(pending_files / OPENBB_L1_MAX_SOURCE_FILES_PER_RUN)
+            seconds = runs * OPENBB_L1_WORST_CASE_RUN_SECONDS
             eta = {
                 "state": "estimating",
                 "remaining_seconds": seconds,
                 "estimated_complete_at_utc": _iso(now + timedelta(seconds=seconds)),
                 "confidence": "low",
-                "basis": "依每半小時最多 20,000 shard 且沒有新資料的容量估計；小於 128 檔的 endpoint tail 會等待累積。",
+                "basis": (
+                    "依每輪最多 "
+                    f"{OPENBB_L1_MAX_SOURCE_FILES_PER_RUN:,} shard 且沒有新資料的容量估計；"
+                    f"小於 {OPENBB_L1_MIN_FILES_PER_SEGMENT} 檔的 endpoint tail 會等待累積。"
+                ),
             }
         source_bytes = _integer(l1.get("source_bytes")) or 0
         output_bytes = _integer(l1.get("output_bytes")) or 0
@@ -1861,7 +1880,19 @@ def _openbb_sources(
                     f"active segments {_integer(l1.get('active_segments')) or 0:,}；"
                     f"待壓實 {pending_files:,} shards；已壓實來源空間縮減 {reduction:.2f}%。"
                 ),
-                "warnings": ["L1 是 shadow query layer；L0 原始 shard 保留且未刪除。"],
+                "warnings": [
+                    "L1 是 shadow query layer；L0 原始 shard 保留且未刪除。",
+                    *(
+                        [
+                            "待正規化查詢檢視："
+                            + "、".join(
+                                sorted(str(key) for key in deferred_query_views)
+                            )
+                        ]
+                        if deferred_query_views
+                        else []
+                    ),
+                ],
                 "detail_link": "../openbb/",
             }
         )
@@ -3505,6 +3536,7 @@ def _specialize_groups(
             "active": "updating",
             "ready": "current",
             "waiting": "waiting",
+            "partial": "degraded",
             "attention": "degraded",
         }.get(raw_status, "unavailable")
         group["status_label"] = str(pipeline.get("status_label") or raw_status)
@@ -3519,6 +3551,7 @@ def _specialize_groups(
             else group["eta"]
         )
         group["latest_at_utc"] = pipeline.get("latest_at_utc")
+        group["data_through"] = pipeline.get("data_through")
         group["warnings"] = [str(value) for value in pipeline.get("warnings", [])]
         group["detail_link"] = "../shioaji/"
 

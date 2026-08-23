@@ -1,0 +1,10 @@
+[Unit]
+Description=Start the resumable OpenBB archive after interactive services recover
+
+[Timer]
+OnBootSec=5min
+AccuracySec=10s
+Unit=stockagent-openbb-archive.service
+
+[Install]
+WantedBy=timers.target

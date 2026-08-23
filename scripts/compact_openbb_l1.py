@@ -42,6 +42,7 @@ SCHEMA_VERSION = 1
 SEGMENT_TABLE = "l1_compaction_segments"
 MEMBER_TABLE = "l1_compaction_members"
 FAILURE_TABLE = "l1_compaction_failures"
+MAX_QUERY_VIEW_SCHEMA_VARIANTS = 4_096
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,6 +163,19 @@ def _read_json_object(path: Path) -> dict[str, object]:
     return value if isinstance(value, dict) else {}
 
 
+def _lexical_absolute_path(value: object) -> str:
+    """Normalize a manifest path without issuing filesystem lookups.
+
+    This function runs inside a SQLite join for every compacted source member.
+    ``Path.resolve()`` turned that set comparison into millions of unnecessary
+    filesystem calls. A lexical absolute path is sufficient here: members are
+    recorded from canonical absolute task paths, and a later symlink spelling
+    change is conservatively treated as a changed source contract.
+    """
+
+    return os.path.abspath(os.path.normpath(str(value)))
+
+
 def _live_pid(path: Path) -> int | None:
     try:
         pid = int(path.read_text(encoding="utf-8").strip())
@@ -274,7 +288,7 @@ def _open_manifest(path: Path) -> sqlite3.Connection:
     connection.create_function(
         "stockagent_resolve_path",
         1,
-        lambda value: str(Path(str(value)).resolve()),
+        _lexical_absolute_path,
         deterministic=True,
     )
     connection.execute("PRAGMA journal_mode=WAL")
@@ -809,8 +823,19 @@ def _record_segment(
         raise
 
 
+def _query_view_deferred_reason(schema_variants: int) -> str | None:
+    if int(schema_variants) <= MAX_QUERY_VIEW_SCHEMA_VARIANTS:
+        return None
+    return (
+        f"schema_variants={int(schema_variants)} exceeds "
+        f"limit={MAX_QUERY_VIEW_SCHEMA_VARIANTS}; long_form_normalization_required"
+    )
+
+
 def _active_segment_paths(
     connection: sqlite3.Connection,
+    *,
+    included_endpoints: set[str],
 ) -> dict[str, list[Path]]:
     grouped: dict[str, list[Path]] = defaultdict(list)
     for row in connection.execute(
@@ -819,12 +844,40 @@ def _active_segment_paths(
         WHERE status='success' ORDER BY endpoint, segment_id
         """
     ):
-        grouped[str(row["endpoint"])].append(Path(str(row["output_path"])).resolve())
+        endpoint = str(row["endpoint"])
+        if endpoint not in included_endpoints:
+            continue
+        grouped[endpoint].append(Path(_lexical_absolute_path(row["output_path"])))
     return dict(grouped)
 
 
-def _publish_views(connection: sqlite3.Connection, database_path: Path) -> int:
-    grouped = _active_segment_paths(connection)
+def _publish_views(
+    connection: sqlite3.Connection, database_path: Path
+) -> tuple[int, dict[str, str]]:
+    endpoint_statistics = {
+        str(row["endpoint"]): row
+        for row in connection.execute(
+            f"""
+            SELECT endpoint, COUNT(*) AS segment_count,
+                   COUNT(DISTINCT schema_fingerprint) AS schema_variants,
+                   SUM(source_files) AS source_files, SUM(output_rows) AS rows,
+                   SUM(source_bytes) AS input_bytes,
+                   SUM(output_bytes) AS output_bytes, MAX(updated_at) AS updated_at
+            FROM {SEGMENT_TABLE}
+            WHERE status='success'
+            GROUP BY endpoint
+            ORDER BY endpoint
+            """
+        )
+    }
+    deferred = {
+        endpoint: reason
+        for endpoint, row in endpoint_statistics.items()
+        if (reason := _query_view_deferred_reason(int(row["schema_variants"] or 0)))
+        is not None
+    }
+    included = set(endpoint_statistics) - set(deferred)
+    grouped = _active_segment_paths(connection, included_endpoints=included)
     names: dict[str, str] = {}
     for endpoint in grouped:
         name = _view_name(endpoint)
@@ -840,49 +893,48 @@ def _publish_views(connection: sqlite3.Connection, database_path: Path) -> int:
     try:
         database.execute(
             "CREATE TABLE l1_catalog ("
-            "endpoint VARCHAR, view_name VARCHAR, segment_count BIGINT, "
+            "endpoint VARCHAR, view_name VARCHAR, query_state VARCHAR, "
+            "query_reason VARCHAR, schema_variants BIGINT, segment_count BIGINT, "
             "source_files BIGINT, rows BIGINT, input_bytes BIGINT, "
             "output_bytes BIGINT, updated_at_utc VARCHAR)"
         )
-        for endpoint, paths in grouped.items():
-            missing = [str(path) for path in paths if not path.is_file()]
-            if missing:
-                raise FileNotFoundError(
-                    f"active L1 segment files are missing: {missing[:5]}"
+        for endpoint, totals in endpoint_statistics.items():
+            paths = grouped.get(endpoint, [])
+            reason = deferred.get(endpoint)
+            view_name: str | None = None
+            if reason is None:
+                missing = [str(path) for path in paths if not path.is_file()]
+                if missing:
+                    raise FileNotFoundError(
+                        f"active L1 segment files are missing: {missing[:5]}"
+                    )
+                path_sql = "[" + ",".join(_sql_string(path) for path in paths) + "]"
+                view_name = _view_name(endpoint)
+                database.execute(
+                    f"CREATE VIEW {view_name} AS "
+                    f"SELECT * FROM read_parquet({path_sql}, union_by_name=true)"
                 )
-            path_sql = "[" + ",".join(_sql_string(path) for path in paths) + "]"
-            view_name = _view_name(endpoint)
             database.execute(
-                f"CREATE VIEW {view_name} AS "
-                f"SELECT * FROM read_parquet({path_sql}, union_by_name=true)"
-            )
-            totals = connection.execute(
-                f"""
-                SELECT COUNT(*), SUM(source_files), SUM(output_rows),
-                       SUM(source_bytes), SUM(output_bytes), MAX(updated_at)
-                FROM {SEGMENT_TABLE}
-                WHERE endpoint=? AND status='success'
-                """,
-                (endpoint,),
-            ).fetchone()
-            database.execute(
-                "INSERT INTO l1_catalog VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO l1_catalog VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     endpoint,
                     view_name,
-                    int(totals[0] or 0),
-                    int(totals[1] or 0),
-                    int(totals[2] or 0),
-                    int(totals[3] or 0),
-                    int(totals[4] or 0),
-                    str(totals[5] or ""),
+                    "deferred" if reason is not None else "published",
+                    reason,
+                    int(totals["schema_variants"] or 0),
+                    int(totals["segment_count"] or 0),
+                    int(totals["source_files"] or 0),
+                    int(totals["rows"] or 0),
+                    int(totals["input_bytes"] or 0),
+                    int(totals["output_bytes"] or 0),
+                    str(totals["updated_at"] or ""),
                 ),
             )
         database.execute("CHECKPOINT")
     finally:
         database.close()
     os.replace(temporary, database_path)
-    return len(grouped)
+    return len(grouped), deferred
 
 
 def _atomic_json(path: Path, payload: Mapping[str, object]) -> None:
@@ -922,6 +974,7 @@ def _write_status(
     *,
     stale_segments: int,
     new_segments: int,
+    deferred_query_views: Mapping[str, str],
 ) -> dict[str, object]:
     plan_token = _active_plan_token(connection)
     token_clause = "" if plan_token is None else " AND t.plan_token=?"
@@ -986,7 +1039,19 @@ def _write_status(
         endpoint_rows.append(
             {
                 "endpoint": endpoint,
-                "view_name": _view_name(endpoint) if segment is not None else None,
+                "view_name": (
+                    _view_name(endpoint)
+                    if segment is not None and endpoint not in deferred_query_views
+                    else None
+                ),
+                "query_view_state": (
+                    "deferred"
+                    if endpoint in deferred_query_views
+                    else "published"
+                    if segment is not None
+                    else "unavailable"
+                ),
+                "query_view_reason": deferred_query_views.get(endpoint),
                 "success_files": success_files,
                 "success_rows": success_rows,
                 "compacted_files": compacted_files,
@@ -1016,6 +1081,8 @@ def _write_status(
             schema={
                 "endpoint": pl.String,
                 "view_name": pl.String,
+                "query_view_state": pl.String,
+                "query_view_reason": pl.String,
                 "success_files": pl.Int64,
                 "success_rows": pl.Int64,
                 "compacted_files": pl.Int64,
@@ -1057,6 +1124,7 @@ def _write_status(
         "output_bytes": sum(int(row["output_bytes"]) for row in endpoint_rows),
         "new_segments": int(new_segments),
         "stale_segments": int(stale_segments),
+        "deferred_query_views": dict(sorted(deferred_query_views.items())),
         "l0_deleted": False,
         "query_database": str((output_dir / "openbb_l1.duckdb").resolve()),
         "status_parquet": str(status_path.resolve()),
@@ -1088,6 +1156,19 @@ def _audit_segments(
         if database_path.is_file()
         else None
     )
+    query_states: dict[str, str] = {}
+    if database is not None:
+        try:
+            query_states = {
+                str(endpoint): str(query_state)
+                for endpoint, query_state in database.execute(
+                    "SELECT endpoint, query_state FROM l1_catalog"
+                ).fetchall()
+            }
+        except duckdb.Error:
+            # Legacy catalogs have no query_state column. Treat their endpoint
+            # views as published so the existing audit contract is preserved.
+            query_states = {}
     view_rows: dict[str, int] = {}
     audits: list[SegmentAudit] = []
     progress = tqdm(
@@ -1217,7 +1298,12 @@ def _audit_segments(
                     raise RuntimeError("output schema fingerprint mismatch")
                 if database is None:
                     raise RuntimeError("openbb_l1.duckdb is missing")
-                if endpoint not in view_rows:
+                query_state = query_states.get(endpoint, "published")
+                if query_state not in {"published", "deferred"}:
+                    raise RuntimeError(
+                        f"unexpected DuckDB query state: {query_state!r}"
+                    )
+                if query_state == "published" and endpoint not in view_rows:
                     view_rows[endpoint] = int(
                         database.execute(
                             f"SELECT COUNT(*) FROM {_view_name(endpoint)}"
@@ -1451,7 +1537,9 @@ def run(argv: Sequence[str] | None = None) -> int:
                 )
                 return 0
 
-            view_count = _publish_views(manifest, output_dir / "openbb_l1.duckdb")
+            view_count, deferred_query_views = _publish_views(
+                manifest, output_dir / "openbb_l1.duckdb"
+            )
             quarantined_segments = _quarantine_stale_outputs(
                 manifest, output_dir, args.endpoint
             )
@@ -1461,6 +1549,7 @@ def run(argv: Sequence[str] | None = None) -> int:
                 (),
                 stale_segments=stale_segments,
                 new_segments=new_segments,
+                deferred_query_views=deferred_query_views,
             )
             print(
                 "[openbb-l1] "
@@ -1470,6 +1559,7 @@ def run(argv: Sequence[str] | None = None) -> int:
                 f"cleaned_temp_files={cleaned_temp_files} "
                 f"quarantined_segments={quarantined_segments} "
                 f"views={view_count} compacted_files={status['compacted_files']} "
+                f"deferred_query_views={len(deferred_query_views)} "
                 f"pending_files={status['pending_files']} l0_deleted=false",
                 flush=True,
             )

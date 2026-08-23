@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
-from datetime import datetime, time
+from datetime import date, datetime, time, timedelta
 import math
+from pathlib import Path
 from zoneinfo import ZoneInfo
+
+from stockagent.live.market_status import is_trading_day
 
 
 TAIPEI = ZoneInfo("Asia/Taipei")
@@ -42,10 +45,32 @@ def historical_query_is_protected(value: datetime | None = None) -> bool:
     return historical_query_pause_seconds(value) > 0
 
 
+def previous_tw_stock_session(
+    value: datetime | None = None,
+    *,
+    parquet_root: Path | None = None,
+) -> date:
+    """Return the latest completed prior TW stock session.
+
+    Historical minute downloads intentionally exclude the current calendar
+    day. Weekend and official-holiday calendar days are not valid completion
+    targets and would otherwise leave a truthful Friday dataset mislabeled as
+    incomplete throughout the weekend.
+    """
+
+    candidate = _taipei_datetime(value).date() - timedelta(days=1)
+    for _ in range(32):
+        if is_trading_day("tw", candidate, parquet_root=parquet_root):
+            return candidate
+        candidate -= timedelta(days=1)
+    raise RuntimeError("cannot resolve the previous Taiwan stock session")
+
+
 __all__ = [
     "HISTORICAL_MAX_TRAFFIC_FRACTION",
     "HISTORICAL_QUERY_CUTOFF",
     "HISTORICAL_QUERY_RESUME",
     "historical_query_is_protected",
     "historical_query_pause_seconds",
+    "previous_tw_stock_session",
 ]

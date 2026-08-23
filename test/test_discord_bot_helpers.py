@@ -21,10 +21,14 @@ def test_guide_lists_all_tw_execution_modes() -> None:
     assert "`tw_day_trade_multi_basis_projection_l1_gelu`" in guide
 
 
-def test_multi_basis_day_trade_is_available_in_market_autocomplete() -> None:
+def test_only_enabled_multi_basis_day_trade_is_available_in_market_autocomplete() -> (
+    None
+):
     choices = asyncio.run(discord_bot.market_autocomplete(None, "multi_basis"))
 
-    assert any(choice.value == "tw_day_trade_multi_basis" for choice in choices)
+    values = {choice.value for choice in choices}
+    assert "tw_day_trade_multi_basis_projection_l1_gelu" in values
+    assert "tw_day_trade_multi_basis" not in values
 
 
 def test_all_three_day_trade_modes_share_the_0900_paper_execution_contract() -> None:
@@ -136,9 +140,14 @@ def test_setup_hook_syncs_only_global_commands(monkeypatch: pytest.MonkeyPatch) 
     assert sync_guilds == [None]
     assert set(started_loops) == {
         "scheduled_signal",
+        "service_heartbeat",
         "preopen_prepare",
         "daily_summary",
         "artifact_backfill",
         "model_auto_deployment",
     }
-    assert startup_events[:2] == ["start:scheduled_signal", "sync"]
+    assert startup_events[:3] == [
+        "start:scheduled_signal",
+        "start:service_heartbeat",
+        "sync",
+    ]

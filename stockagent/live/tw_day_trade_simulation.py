@@ -15,11 +15,13 @@ from __future__ import annotations
 import csv
 from dataclasses import dataclass
 from datetime import date, datetime, time, timezone
+import hashlib
 import json
 import math
 import os
 from pathlib import Path
 from typing import Any, Final, Mapping, Sequence
+import uuid
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -40,6 +42,10 @@ from stockagent.data.tw_index_futures import (
 )
 from stockagent.data.tw_price_rules import limit_price_numpy, move_price_ticks_numpy
 from stockagent.live.quote_provider import PriceSnapshot
+from stockagent.live.tw_day_trade_service_sync import (
+    SERVICE_SYNC_FILENAME,
+    SERVICE_SYNC_SCHEMA_VERSION,
+)
 from stockagent.research.taifex_capital_returns import taifex_initial_margin_twd
 from stockagent.research.taifex_transaction_tax import (
     stock_index_futures_tax_rate,
@@ -828,6 +834,7 @@ class TwDayTradeSimulationEngine:
         self.state_dir = Path(state_dir)
         self.state_path = self.state_dir / "state.json"
         self.status_path = self.state_dir / "status.json"
+        self.service_sync_path = self.state_dir / SERVICE_SYNC_FILENAME
         self.positions_path = self.state_dir / "positions.json"
         self.position_history_dir = self.state_dir / "position_history"
         self.signals_path = self.state_dir / "signals.jsonl"
@@ -844,6 +851,7 @@ class TwDayTradeSimulationEngine:
         self._corporate_actions_by_symbol: dict[str, list[dict[str, Any]]] = {}
         self._corporate_action_load_error: str | None = None
         self._corporate_action_coverage_end: date | None = None
+        self._engine_run_id = uuid.uuid4().hex
         self.state = self._load_state()
         tx_benchmark_migrated = self._migrate_tx_continuous_benchmark_contract()
         self._reconcile_daily_duplicate_signal_ids()
@@ -1899,8 +1907,15 @@ class TwDayTradeSimulationEngine:
         current_eligibility_coverage: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> None:
         observed = _now_taipei(now)
+        enabled_markets = [str(spec.market) for spec in specs]
+        self.state["enabled_markets"] = enabled_markets
+        enabled = set(enabled_markets)
+        for market, existing in (self.state.get("modes") or {}).items():
+            if isinstance(existing, dict):
+                existing["configured_enabled"] = str(market) in enabled
         for spec in specs:
             mode = self._mode(spec)
+            mode["configured_enabled"] = True
             checkpoint = Path(spec.checkpoint_path) if spec.checkpoint_path else None
             checkpoint_ready = bool(checkpoint and checkpoint.is_file())
             mode["checkpoint_ready"] = checkpoint_ready
@@ -3765,13 +3780,62 @@ class TwDayTradeSimulationEngine:
 
     def _persist(self, now: datetime | None = None) -> None:
         observed = _now_taipei(now)
+        revision = int(self.state.get("state_revision") or 0) + 1
+        configured_markets = self.state.get("enabled_markets")
+        active_markets = [
+            str(market)
+            for market in (
+                configured_markets
+                if isinstance(configured_markets, list)
+                else sorted((self.state.get("modes") or {}).keys())
+            )
+        ]
+        material_projection = {
+            "enabled_markets": active_markets,
+            "modes": {
+                market: {
+                    key: value
+                    for key, value in (
+                        self.state.get("modes", {}).get(market) or {}
+                    ).items()
+                    if key not in {"positions", "processed_signal_ids"}
+                }
+                for market in active_markets
+            },
+            "benchmarks": self.state.get("benchmarks") or {},
+        }
+        material_fingerprint = hashlib.sha256(
+            json.dumps(
+                material_projection,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
+        content_revision = int(self.state.get("dashboard_content_revision") or 0)
+        if material_fingerprint != self.state.get("dashboard_content_fingerprint"):
+            content_revision += 1
+        self.state["dashboard_content_revision"] = content_revision
+        self.state["dashboard_content_fingerprint"] = material_fingerprint
+        self.state["state_revision"] = revision
+        self.state["engine_run_id"] = self._engine_run_id
         self.state["updated_at"] = observed.isoformat(timespec="seconds")
         _atomic_json(self.state_path, self.state)
-        mode_rows = list(self.state.get("modes", {}).values())
+        enabled_markets = active_markets
+        all_modes = self.state.get("modes") or {}
+        mode_rows = [
+            all_modes[market]
+            for market in enabled_markets
+            if isinstance(all_modes.get(market), Mapping)
+        ]
         _atomic_json(
             self.positions_path,
             {
                 "schema_version": 1,
+                "state_revision": revision,
+                "content_revision": content_revision,
+                "engine_run_id": self._engine_run_id,
                 "generated_at": observed.isoformat(timespec="seconds"),
                 "simulation_only": True,
                 "production_order_possible": False,
@@ -3838,6 +3902,9 @@ class TwDayTradeSimulationEngine:
             self.status_path,
             {
                 "schema_version": SIMULATION_SCHEMA_VERSION,
+                "state_revision": revision,
+                "content_revision": content_revision,
+                "engine_run_id": self._engine_run_id,
                 "updated_at": observed.isoformat(timespec="seconds"),
                 "health": health,
                 "simulation_only": True,
@@ -3920,6 +3987,36 @@ class TwDayTradeSimulationEngine:
                             "terminal_flatten_count",
                             "terminal_flatten_degraded_count",
                             "cumulative_carry_cost_twd",
+                        )
+                    }
+                    for item in mode_rows
+                },
+            },
+        )
+        _atomic_json(
+            self.service_sync_path,
+            {
+                "schema_version": SERVICE_SYNC_SCHEMA_VERSION,
+                "state_revision": revision,
+                "content_revision": content_revision,
+                "engine_run_id": self._engine_run_id,
+                "published_at": observed.isoformat(timespec="milliseconds"),
+                "simulation_only": True,
+                "production_order_possible": False,
+                "enabled_markets": enabled_markets,
+                "mode_count": len(mode_rows),
+                "modes": {
+                    str(item.get("market")): {
+                        key: item.get(key)
+                        for key in (
+                            "market",
+                            "session_date",
+                            "signal_id",
+                            "signal_at",
+                            "entry_completed_at",
+                            "engine_status",
+                            "checkpoint_ready",
+                            "open_position_count",
                         )
                     }
                     for item in mode_rows

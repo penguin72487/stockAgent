@@ -865,3 +865,10 @@ stockagent-data use DATASET --snapshot-id SNAPSHOT_ID
 README 只保留可重現、跨機器成立的入口。套件全面升級、文字編輯器操作、單台機器 GPU
 數字與臨時修復命令不屬於標準部署流程；需要時先用 `--help`、現行 config 與對應 runbook
 確認，再執行可回復的變更。
+
+
+
+sudo apt update && sudo apt full-upgrade -y && sudo apt autoremove -y && sudo snap refresh
+mamba activate fintech
+mamba update --all
+

@@ -1,26 +1,26 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-service_name="stockagent-taifex-futures-daily.service"
-timer_name="stockagent-taifex-futures-daily.timer"
+service_name="stockagent-shioaji-tx-history-backfill.service"
+timer_name="stockagent-shioaji-tx-history-backfill.timer"
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 service_template="$repo_root/deploy/systemd/$service_name.in"
 timer_template="$repo_root/deploy/systemd/$timer_name.in"
 service_target="/etc/systemd/system/$service_name"
 timer_target="/etc/systemd/system/$timer_name"
-start_now=false
+run_now=false
 
 usage() {
-  echo "Usage: sudo bash scripts/install_taifex_futures_daily_service.sh [--run-now|--no-start]" >&2
+  echo "Usage: sudo bash scripts/install_shioaji_tx_history_backfill_service.sh [--run-now|--no-start]" >&2
 }
 
 for argument in "$@"; do
   case "$argument" in
     --run-now)
-      start_now=true
+      run_now=true
       ;;
     --no-start)
-      start_now=false
+      run_now=false
       ;;
     -h|--help)
       usage
@@ -34,23 +34,27 @@ for argument in "$@"; do
 done
 
 if (( EUID != 0 )); then
-  echo "[taifex-futures-daily] root privileges are required" >&2
+  echo "[shioaji-tx-history] root privileges are required" >&2
   exit 2
 fi
-if [[ ! -f "$service_template" || ! -f "$timer_template" ]]; then
-  echo "[taifex-futures-daily] service or timer template is missing" >&2
+if [[ ! -f "$service_template" || ! -f "$timer_template" || ! -f "$repo_root/.env.futures" ]]; then
+  echo "[shioaji-tx-history] service/timer template or .env.futures is missing" >&2
   exit 2
 fi
 
-service_user="${TAIFEX_SERVICE_USER:-$(stat -c '%U' "$repo_root")}"
+service_user="${SHIOAJI_SERVICE_USER:-$(stat -c '%U' "$repo_root")}" 
 if ! id "$service_user" >/dev/null 2>&1; then
-  echo "[taifex-futures-daily] unknown service user: $service_user" >&2
+  echo "[shioaji-tx-history] unknown service user: $service_user" >&2
   exit 2
 fi
 service_group="$(id -gn "$service_user")"
 service_home="$(getent passwd "$service_user" | cut -d: -f6)"
 if [[ -z "$service_home" ]]; then
-  echo "[taifex-futures-daily] cannot resolve home for $service_user" >&2
+  echo "[shioaji-tx-history] cannot resolve home for $service_user" >&2
+  exit 2
+fi
+if ! runuser -u "$service_user" -- test -r "$repo_root/.env.futures"; then
+  echo "[shioaji-tx-history] $service_user cannot read .env.futures" >&2
   exit 2
 fi
 
@@ -72,15 +76,16 @@ cp "$timer_template" "$rendered_timer"
 systemd-analyze verify "$rendered_service" "$rendered_timer"
 install -m 0644 "$rendered_service" "$service_target"
 install -m 0644 "$rendered_timer" "$timer_target"
-chmod 0755 "$repo_root/scripts/run_taifex_all_futures_daily.sh"
+chmod 0755 "$repo_root/scripts/run_shioaji_tx_history_backfill.sh"
+chmod go-rwx "$repo_root/.env.futures"
 systemctl daemon-reload
-# This two-minute-plus batch is scheduled work, not a boot prerequisite. Remove
-# legacy multi-user.target symlinks without stopping an already running refresh.
+# Historical recovery is resumable background work. Keep the live quote and
+# dashboard path out of its CPU, memory, disk, and API-login startup contention.
 systemctl disable "$service_name" >/dev/null 2>&1 || true
 systemctl enable --now "$timer_name"
-if [[ "$start_now" == true ]]; then
+if [[ "$run_now" == "true" ]]; then
   systemctl restart "$service_name"
 fi
 
-echo "[taifex-futures-daily] service=$service_target trigger=$(systemctl is-enabled "$service_name" 2>/dev/null || true)"
-echo "[taifex-futures-daily] timer=$timer_target enabled=$(systemctl is-enabled "$timer_name")"
+echo "[shioaji-tx-history] service=$service_target trigger=$(systemctl is-enabled "$service_name" 2>/dev/null || true) active=$(systemctl is-active "$service_name" 2>/dev/null || true)"
+echo "[shioaji-tx-history] timer=$timer_target enabled=$(systemctl is-enabled "$timer_name")"
