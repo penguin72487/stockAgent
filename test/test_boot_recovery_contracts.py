@@ -98,6 +98,8 @@ def test_cold_boot_probe_requires_new_boot_and_all_public_surfaces() -> None:
     assert '--distribution $DistroName --exec' in probe
     assert '$output = $output -replace "`0", ""' in probe
     assert "$DistroName -notin $runningDistributions" in probe
+    assert "wsl_restart_observed_at" in probe
+    assert "Read boot_id only after" in probe
     assert "target_distribution = $DistroName" in probe
     assert "$postBootId -ne $preBootId" in probe
     assert "systemctl --failed" in probe
