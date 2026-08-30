@@ -4,14 +4,13 @@
 This is the low-latency, mutable download layer.  The 07:50 full sweep commits
 its metadata beside the live tree only after all 156 sources have zero failure,
 zero publication lag, and complete historical coverage.  The independent
-08:00 acceptance job then performs the strict model-safety audit, immutable
-packed publication, full materialization verification, and atomic symlink
-switch.
-
-For every run we hash the selected parquet files before and after the refresh.
-The receipt therefore distinguishes a successful HTTP sweep from an actually
-observed content change and builds empirical publication-time evidence for
-feeds whose publishers do not promise an exact release time.
+08:00 acceptance job then performs the strict model-safety audit and selects
+this same live root directly; it never packs or materializes data on the
+opening path.  For every run we hash the selected parquet files before and
+after the refresh.  The receipt therefore
+distinguishes a successful HTTP sweep from an actually observed content change
+and builds empirical publication-time evidence for feeds whose publishers do
+not promise an exact release time.
 """
 
 from __future__ import annotations
@@ -48,6 +47,11 @@ from downloader.download_tw_public_data import (  # noqa: E402
 
 
 TAIPEI = ZoneInfo("Asia/Taipei")
+COMPLETED_SESSION_FINALIZE_PHASES = {
+    "close_initial",
+    "close_revision",
+    "close_final",
+}
 
 
 @dataclass(frozen=True)
@@ -206,6 +210,14 @@ def _atomic_json(path: Path, payload: dict[str, object]) -> None:
         encoding="utf-8",
     )
     os.replace(temporary, path)
+
+
+def _json(path: Path) -> dict[str, object]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
 
 
 def _atomic_copy(source: Path, destination: Path) -> None:
@@ -540,6 +552,27 @@ def _write_receipts(
     _atomic_json(phase_root / "runs" / run_name, payload)
 
 
+def _completed_session_finalize_command(
+    *,
+    live_root: Path,
+    receipt_root: Path,
+    phase: PublicationPhase,
+    expected_date: str,
+) -> list[str]:
+    return [
+        sys.executable,
+        str(REPO_ROOT / "scripts" / "finalize_tw_public_completed_session.py"),
+        "--live-root",
+        str(live_root),
+        "--publication-root",
+        str(receipt_root),
+        "--publication-phase",
+        phase.name,
+        "--expected-date",
+        expected_date,
+    ]
+
+
 def main() -> int:
     args = parse_args()
     if args.workers <= 0 or args.date_workers <= 0:
@@ -639,15 +672,49 @@ def main() -> int:
         "commands": commands,
         "return_codes": return_codes,
         "live_root": str(live_root),
-        "strict_publication_deferred_to_0830": False,
-        "strict_packed_publication_deferred_to_0800": True,
+        "opening_live_acceptance_deferred_to_0800": True,
+        "cold_packed_publication_deferred_to_2350": True,
+        "opening_materialization_required": False,
         "preopen_acceptance_errors": preopen_acceptance_errors,
         "promoted_live_metadata": promoted_metadata,
     }
     payload.update(preopen_evidence)
     _write_receipts(receipt_root, payload, phase=phase, started=started)
+    finalize_return_code: int | None = None
+    if status == "ok" and phase.name in COMPLETED_SESSION_FINALIZE_PHASES:
+        expected_date = str(
+            (preopen_evidence.get("download_summary") or {}).get("end_date")
+            or ""
+        )[:10]
+        completed_receipt = _json(
+            receipt_root.parent / "completed_session" / "latest.json"
+        )
+        finalize_needed = bool(
+            changed
+            or completed_receipt.get("status") != "ok"
+            or completed_receipt.get("expected_date") != expected_date
+        )
+        if expected_date and finalize_needed:
+            finalize_started = time.perf_counter()
+            finalize_command = _completed_session_finalize_command(
+                live_root=live_root,
+                receipt_root=receipt_root,
+                phase=phase,
+                expected_date=expected_date,
+            )
+            completed = subprocess.run(finalize_command, cwd=REPO_ROOT, check=False)
+            finalize_return_code = int(completed.returncode)
+            payload["completed_session_finalize"] = {
+                "command": finalize_command,
+                "return_code": finalize_return_code,
+                "elapsed_seconds": round(time.perf_counter() - finalize_started, 3),
+                "receipt": str(
+                    receipt_root.parent / "completed_session" / "latest.json"
+                ),
+            }
+            _write_receipts(receipt_root, payload, phase=phase, started=started)
     print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
-    return 0 if status == "ok" else 1
+    return 0 if status == "ok" and finalize_return_code in {None, 0} else 1
 
 
 if __name__ == "__main__":

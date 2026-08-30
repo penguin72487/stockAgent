@@ -38,8 +38,10 @@ from stockagent.live.quote_provider import (  # noqa: E402
     prepare_tw_price_limit_snapshot,
     warm_shioaji_stock_quote_client,
 )
+from stockagent.live.service_notify import notify_systemd  # noqa: E402
 from stockagent.live.tw_day_trade_simulation import (  # noqa: E402
-    ENTRY_FILL_POLICY_CAUSAL_BOOK,
+    ENTRY_FILL_POLICY_OFFICIAL_OPEN_AT_0901,
+    ENTRY_GATE,
     CLOSING_AUCTION_TIME,
     FORCE_EXIT_TIME,
     ModeSpec,
@@ -62,6 +64,9 @@ _ELIGIBILITY_CACHE: dict[
 ] = {}
 _LEGACY_SIGNAL_SCAN_CACHE: dict[
     str, tuple[float, tuple[dict[str, Any], list[dict[str, Any]]] | None]
+] = {}
+_BENCHMARK_PREVIOUS_CLOSE_CACHE: dict[
+    tuple[str, str, str], dict[str, Any]
 ] = {}
 
 
@@ -218,7 +223,7 @@ def _mode_specs(
                     fee_schedule=_fee_schedule(experiment),
                     lot_size=int(experiment.trading.tw_day_trade_lot_size),
                     price_limit_offset_ticks=1,
-                    entry_fill_policy=ENTRY_FILL_POLICY_CAUSAL_BOOK,
+                    entry_fill_policy=ENTRY_FILL_POLICY_OFFICIAL_OPEN_AT_0901,
                     entry_price_offset_ticks=0,
                 )
             )
@@ -429,6 +434,76 @@ def _fetch_quotes(
         snapshot,
         trading_date=trading_date.date(),
     )
+
+
+def _attach_benchmark_previous_close_context(
+    quotes: dict[str, dict[str, Any]],
+    *,
+    symbols: set[str],
+    parquet_root: Path,
+    trading_date: datetime,
+) -> None:
+    """Attach the last completed official close needed for live total return.
+
+    The corporate-action archive is intentionally complete only through the
+    preceding session before the open.  Pairing that boundary with today's
+    official Shioaji/MIS reference price proves today's adjustment factor
+    without waiting for an after-close archive rebuild or issuing another API
+    request.
+    """
+
+    day = trading_date.date()
+    root = Path(parquet_root).resolve()
+    for symbol in sorted(symbols):
+        quote = quotes.get(symbol)
+        if not isinstance(quote, dict):
+            continue
+        key = (str(root), day.isoformat(), symbol)
+        context = _BENCHMARK_PREVIOUS_CLOSE_CACHE.get(key)
+        if context is None:
+            path = root / f"{symbol}_features.parquet"
+            if not path.is_file():
+                continue
+            try:
+                lazy = pl.scan_parquet(path)
+                schema = lazy.collect_schema()
+                expressions: list[pl.Expr] = [
+                    pl.col("date").cast(pl.Date),
+                    pl.col("close").cast(pl.Float64),
+                ]
+                if "data_source" in schema.names():
+                    expressions.append(pl.col("data_source").cast(pl.String))
+                frame = (
+                    lazy.filter(pl.col("date").cast(pl.Date) < day)
+                    .select(expressions)
+                    .sort("date")
+                    .tail(1)
+                    .collect()
+                )
+                if frame.height != 1:
+                    continue
+                source_row = frame.row(0, named=True)
+                previous_close = float(source_row["close"])
+                previous_date = source_row["date"]
+                source = str(source_row.get("data_source") or "")
+                if (
+                    not np.isfinite(previous_close)
+                    or previous_close <= 0.0
+                    or not source.endswith("_official")
+                ):
+                    continue
+                context = {
+                    "previous_close": previous_close,
+                    "previous_close_date": previous_date.isoformat(),
+                    "previous_close_source": f"{source}:{path}",
+                }
+                _BENCHMARK_PREVIOUS_CLOSE_CACHE[key] = context
+            except (OSError, TypeError, ValueError):
+                continue
+        quote.update(context)
+        quote["reference_price_source"] = str(
+            quote.get("source") or "official_shioaji_or_mis_reference"
+        )
 
 
 def _rule_data_dir(live: LiveMarketConfig, spec: ModeSpec) -> Path:
@@ -789,11 +864,13 @@ def main(argv: list[str] | None = None) -> int:
     signal_watcher = _SignalPointerWatcher()
     last_session_gate_log: tuple[str, tuple[tuple[str, str], ...]] | None = None
     non_session_invalidation_attempts: set[tuple[str, str]] = set()
+    ready_notified = False
     print(
         f"[tw-day-trade-sim] state_dir={engine.state_dir} simulation_only=true",
         flush=True,
     )
     while True:
+        notify_systemd("WATCHDOG=1")
         monotonic_now = time_module.monotonic()
         observed = datetime.now(TAIPEI)
         if monotonic_now - last_reload >= 30.0 or not specs:
@@ -889,6 +966,11 @@ def main(argv: list[str] | None = None) -> int:
             )
             last_reload = monotonic_now
             last_readiness = monotonic_now
+            if not ready_notified:
+                notify_systemd(
+                    "READY=1\nSTATUS=TW day-trade executor ready; waiting for 09:01 official-open execution"
+                )
+                ready_notified = True
         session_open, session_errors = _verified_stock_session(
             specs,
             live_configs,
@@ -1019,7 +1101,16 @@ def main(argv: list[str] | None = None) -> int:
             timespec="minutes"
         )
         for spec in specs:
+            if observed.timetz().replace(tzinfo=None) < ENTRY_GATE:
+                # Signals may be published after 09:00, but the configured
+                # official-open paper contract must not consume them before
+                # the 09:01 execution boundary.
+                continue
             mode = engine.state.get("modes", {}).get(spec.market, {})
+            if str(mode.get("engine_status") or "") == (
+                "critical_ledger_state_divergence"
+            ):
+                continue
             if str(
                 mode.get("session_date") or ""
             ) == observed.date().isoformat() and mode.get("entry_completed_at"):
@@ -1125,6 +1216,13 @@ def main(argv: list[str] | None = None) -> int:
                     parquet_root=specs[0].parquet_root,
                     trading_date=observed,
                 )
+                if benchmark_due:
+                    _attach_benchmark_previous_close_context(
+                        quotes,
+                        symbols=benchmark_symbols,
+                        parquet_root=specs[0].parquet_root,
+                        trading_date=observed,
+                    )
                 quotes = engine.prepare_minute_quotes(quotes, now=observed)
                 quote_fetch_ms = (time_module.perf_counter() - quote_started) * 1000.0
             except Exception as exc:
@@ -1209,6 +1307,11 @@ def main(argv: list[str] | None = None) -> int:
                     f"signal_error={type(exc).__name__}: {exc}",
                     flush=True,
                 )
+                current_mode = engine.state.get("modes", {}).get(spec.market, {})
+                if str(current_mode.get("engine_status") or "") == (
+                    "critical_ledger_state_divergence"
+                ):
+                    raise
 
         if quote_due:
             engine.process_quotes(

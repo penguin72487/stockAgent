@@ -32,6 +32,39 @@ changes, and follow the user's latest explicit experiment settings.
 - Do not revert user changes or unrelated dirty files.
 - Do not use destructive git commands such as `git reset --hard` or `git checkout --` unless the user explicitly asks.
 
+## Discord Service Reliability Contract
+
+- Treat Discord/Gateway liveness and private artifact maintenance as separate
+  health domains. A stale or failed formal-history job must remain visible as
+  degraded maintenance, but it must not disconnect commands or stop the
+  independent day-trade execution engine.
+- Keep `pre_signal_timeout_seconds` for bounded data activation and
+  `formal_history_timeout_seconds` for full fold inference. Never shorten the
+  latter to the former; measure full-universe inference before changing either.
+- Artifact-maintenance attempts must persist a structured status receipt across
+  restarts, use bounded exponential retry, suppress duplicate channel alerts,
+  and become `ready` only after the requested history or signal artifact exists.
+- A stale manual `/signal_now` must persist `waiting_source` keyed by target
+  date/config/user before returning. It must not run a stale preview or call an
+  activation command as though activation downloaded official data. The
+  canonical source-event/acceptance pipeline owns downloads; after it reports
+  fresh, resume one serialized inference and DM, including after a bot restart.
+  Defer interactive jobs during the protected opening window.
+- Closed-market TW day-trade inference has a separate completed-session gate.
+  Once an official TWSE/TPEx close receipt is accepted, atomically rebuild the
+  canonical stock panel and public feature table through that close and value
+  manual signals from the official close. Do not require the next session's
+  eligibility, MIS opening quote, or opening activation for this calculation;
+  those remain mandatory only for executable 09:00 paper orders. Never relabel
+  an after-close calculation as a fill at that already-completed close.
+- Set the outer systemd watchdog above measured legitimate event-loop stalls.
+  Keep the tighter opening path protected by its progress-aware hot/cold
+  watchdog so relaxing the outer process watchdog does not relax 09:00 recovery.
+- Bound and rotate traceback logs. Service acceptance requires the Gateway to
+  be connected, command sync to succeed or be explicitly deferred, the three
+  intended TW modes to acknowledge the engine revision with zero lag, and logs
+  since the current restart to contain no watchdog or fatal error.
+
 ## Data Storage And Syncthing Contract
 
 This section is a correctness contract for every agent and machine, not a
@@ -473,6 +506,15 @@ the latest explicit user intent and keep model, loss, and backtest settings
 aligned.
 
 Guidelines:
+
+- The active `tw_day_trade_*` daily paper modes wait until 09:01 and value every
+  independently constrained submitted whole-lot buy, sell, short, or cover at
+  the observed official session open. Missing official open prices fail closed;
+  never substitute Bid/Ask, last price, or an adverse `+1 tick`. Because a
+  09:01 order cannot causally obtain the already completed opening price, label
+  this as counterfactual paper valuation and never as an exchange fill, queue
+  acknowledgement, or guaranteed real fill. Historical replay uses the same
+  official-open/09:01 contract.
 
 - The active dual-RTX-5090 `tw_minute` long/short contract copies the ordinary
   TW day-trade trading rules and changes only decision frequency: L1 gross

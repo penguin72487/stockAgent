@@ -26,19 +26,26 @@ if ! flock -n 9; then
 fi
 exec > >(tee -a "$LOG_FILE") 2>&1
 
-if [[ -n "${SHIOAJI_MINUTE_END_DATE:-}" ]]; then
-  BACKFILL_END_DATE="$SHIOAJI_MINUTE_END_DATE"
-else
-  BACKFILL_END_DATE="$(run_fintech_python - <<'PY'
+resolve_backfill_end_date() {
+  if [[ -n "${SHIOAJI_MINUTE_END_DATE:-}" ]]; then
+    printf '%s\n' "$SHIOAJI_MINUTE_END_DATE"
+    return
+  fi
+  run_fintech_python - <<'PY'
 from pathlib import Path
 
 from stockagent.live.shioaji_schedule import previous_tw_stock_session
 
 print(previous_tw_stock_session(parquet_root=Path("data_tw_public")).isoformat())
 PY
-)"
-fi
-printf '%s\n' "$BACKFILL_END_DATE" > "$TARGET_FILE"
+}
+
+publish_target() {
+  local target="$1"
+  local temporary="$TARGET_FILE.tmp"
+  printf '%s\n' "$target" > "$temporary"
+  mv "$temporary" "$TARGET_FILE"
+}
 
 seconds_until_after_close() {
   run_fintech_python - <<'PY'
@@ -76,10 +83,14 @@ def audit_ok(path: Path) -> bool:
     )
 
 
-# Historical KBar backfill remains outside the conservative 07:45-14:31
-# live-priority window even if the Top-200 capture finishes a little earlier.
+# Before 07:45 no stock live capture owns the quote connections or traffic, so
+# historical work may run.  From 07:45 onward the live capture and its audits
+# own the window through 14:31.
+priority_start = datetime.combine(now.date(), time(7, 45), tzinfo=tz)
 after_close = datetime.combine(now.date(), time(14, 31), tzinfo=tz)
-if now < after_close:
+if now < priority_start:
+    print("0 preopen_offhours")
+elif now < after_close:
     print(f"{max(60, int((after_close - now).total_seconds()))} top200_then_market_close")
 elif audit_ok(Path(f"data_tw_microstructure/audits/{trade_date}.json")) and audit_ok(
     Path(f"data_tw_microstructure/audits/hft_{trade_date}.json")
@@ -97,9 +108,12 @@ from zoneinfo import ZoneInfo
 
 tz = ZoneInfo("Asia/Taipei")
 now = datetime.now(tz)
-# Shioaji historical-data traffic resets at 08:00 on trading days. Top-200
-# Tick/BidAsk capture owns the session first, so the next KBar window starts
-# only after its capture/audit window and the market-hours safety buffer.
+# A reset is accepted only after api.usage() actually drops; this function does
+# not manufacture an 08:00 reset.  On weekdays the next eligible retry remains
+# after the protected live window.  Weekends periodically recheck observed use.
+if now.weekday() >= 5:
+    print(300)
+    raise SystemExit
 target_date = now.date() + timedelta(days=1)
 while target_date.weekday() >= 5:
     target_date += timedelta(days=1)
@@ -108,9 +122,70 @@ print(max(60, int((target - now).total_seconds())))
 PY
 }
 
-echo "[shioaji-minute-runner] started_at=$(TZ=Asia/Taipei date --iso-8601=seconds) end_date=$BACKFILL_END_DATE"
+futures_priority_state() {
+  run_fintech_python - <<'PY'
+import json
+from pathlib import Path
+import polars as pl
+
+calendar = Path("data_tw_index_futures/day_session_contracts.parquet")
+receipt_path = Path("artifacts/data_repair/shioaji_futures_history/latest_batch.json")
+try:
+    latest = (
+        pl.scan_parquet(calendar)
+        .filter(pl.col("product") == "TX")
+        .select(pl.col("date").max())
+        .collect()
+        .item()
+    )
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+except (OSError, json.JSONDecodeError):
+    print("60 futures_history_receipt_missing")
+    raise SystemExit
+ready = (
+    latest is not None
+    and receipt.get("status") == "complete"
+    and receipt.get("target_end_date") == latest.isoformat()
+    and int(receipt.get("terminal_contracts", -1))
+        == int(receipt.get("total_contracts", -2))
+)
+print("0 futures_history_current" if ready else "60 futures_history_priority")
+PY
+}
+
+resolve_worker_count() {
+  local configured="${SHIOAJI_MINUTE_WORKERS:-4}"
+  if [[ ! "$configured" =~ ^[0-9]+$ ]] || (( configured < 1 || configured > 4 )); then
+    echo "[shioaji-minute-runner] SHIOAJI_MINUTE_WORKERS must be an integer within 1..4" >&2
+    return 2
+  fi
+  local fop_workers history_workers available
+  fop_workers="$(pgrep -fc 'python .*downloader\.stream_shioaji_taifex_bidask' || true)"
+  history_workers="$(pgrep -fc 'python .*(downloader\.download_shioaji_tx_futures_ticks|downloader\.download_shioaji_historical_market_data)' || true)"
+  available=$((5 - fop_workers - history_workers))
+  if (( available < 1 )); then
+    printf '0 %s %s\n' "$fop_workers" "$history_workers"
+  elif (( configured < available )); then
+    printf '%s %s %s\n' "$configured" "$fop_workers" "$history_workers"
+  else
+    printf '%s %s %s\n' "$available" "$fop_workers" "$history_workers"
+  fi
+}
+
+echo "[shioaji-minute-runner] started_at=$(TZ=Asia/Taipei date --iso-8601=seconds) rolling_target=true"
 
 while true; do
+  BACKFILL_END_DATE="$(resolve_backfill_end_date)"
+  publish_target "$BACKFILL_END_DATE"
+  echo "[shioaji-minute-runner] target_end_date=$BACKFILL_END_DATE boundary=previous_completed_tw_stock_session"
+
+  read -r futures_delay futures_reason <<< "$(futures_priority_state)"
+  if (( futures_delay > 0 )); then
+    echo "[shioaji-minute-runner] waiting_seconds=$futures_delay reason=$futures_reason"
+    sleep "$futures_delay"
+    continue
+  fi
+
   read -r top200_delay top200_reason <<< "$(top200_priority_state)"
   if (( top200_delay > 0 )); then
     echo "[shioaji-minute-runner] waiting_seconds=$top200_delay reason=$top200_reason"
@@ -125,16 +200,20 @@ while true; do
     sleep "$market_delay"
   fi
 
+  read -r minute_workers fop_workers history_workers <<< "$(resolve_worker_count)"
+  if (( minute_workers < 1 )); then
+    echo "[shioaji-minute-runner] waiting_seconds=60 reason=shioaji_connection_capacity fop_workers=$fop_workers history_workers=$history_workers account_limit=5"
+    sleep 60
+    continue
+  fi
+
   echo "[shioaji-minute-runner] download_start=$(TZ=Asia/Taipei date --iso-8601=seconds)"
-  # The account-wide ceiling is five concurrent Shioaji sessions. Futures
-  # history owns one hard-priority session in this off-hours window, so four
-  # minute workers maximize usable concurrency without making the entire
-  # batch fail login with code 451 (Too Many Connections).
+  echo "[shioaji-minute-runner] connection_plan minute_workers=$minute_workers fop_workers=$fop_workers history_workers=$history_workers account_limit=5"
   set +e
   run_fintech_python -m downloader.download_shioaji_tw_minute_kbars \
     --simulation \
     --all-symbols \
-    --workers "${SHIOAJI_MINUTE_WORKERS:-4}" \
+    --workers "$minute_workers" \
     --requests-per-second "${SHIOAJI_MINUTE_REQUESTS_PER_SECOND:-10}" \
     --max-traffic-fraction "${SHIOAJI_MINUTE_MAX_TRAFFIC_FRACTION:-0.90}" \
     --start-date 2020-03-02 \
@@ -150,20 +229,15 @@ from pathlib import Path
 
 target_end = sys.argv[1]
 path = Path("data_tw_minute/shioaji_1m/download_summary.json")
-run_path = Path("data_tw_minute/shioaji_1m/latest_run_summary.json")
 if not path.is_file():
     print("missing")
 else:
     payload = json.loads(path.read_text(encoding="utf-8"))
-    run_payload = (
-        json.loads(run_path.read_text(encoding="utf-8"))
-        if run_path.is_file()
-        else payload
-    )
-    run_selected = int(run_payload.get("selected_symbols", 0))
-    run_reported = int(run_payload.get("reported_symbols", 0))
-    run_failed = int(run_payload.get("failed_symbols", 0))
-    run_partial = int(run_payload.get("partial_symbols", 0))
+    run_payload = payload
+    run_selected = int(payload.get("selected_symbols", 0))
+    run_reported = int(payload.get("reported_symbols", 0))
+    run_failed = int(payload.get("failed_symbols", 0))
+    run_partial = int(payload.get("partial_symbols", 0))
     current_run_ready = (
         bool(run_payload.get("resumable_collection_complete"))
         and run_selected > 0

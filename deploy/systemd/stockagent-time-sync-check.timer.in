@@ -1,0 +1,19 @@
+[Unit]
+Description=Verify the StockAgent schedule clock at weekday market checkpoints
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 05:30:00 Asia/Taipei
+OnCalendar=Mon..Fri *-*-* 07:30:00 Asia/Taipei
+OnCalendar=Mon..Fri *-*-* 08:15:00 Asia/Taipei
+OnCalendar=Mon..Fri *-*-* 08:45:00 Asia/Taipei
+OnCalendar=Mon..Fri *-*-* 08:55:00 Asia/Taipei
+OnCalendar=Mon..Fri *-*-* 09:05:00 Asia/Taipei
+OnCalendar=Mon..Fri *-*-* 13:20:00 Asia/Taipei
+OnCalendar=Mon..Fri *-*-* 13:30:00 Asia/Taipei
+AccuracySec=1s
+RandomizedDelaySec=0
+Persistent=true
+Unit=stockagent-time-sync-check.service
+
+[Install]
+WantedBy=timers.target

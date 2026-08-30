@@ -18,13 +18,18 @@ day_trade_simulation_state_dir: artifacts/live/tw_day_trade_simulation
 day_trade_rule_data_dir: /srv/stockagent-live/data_tw_public
 day_trade_quote_interval_seconds: 60
 
-# 09:00 is a gate: inference starts only after a real opening quote exists;
-# paper entry then uses a causally later executable best quote.
+# 09:00 publishes the opening-informed signal. Paper execution waits until
+# 09:01 and uses the observed official session open for both directions;
+# missing opens fail closed and never use Bid/Ask, last price, or +1 Tick.
 pre_signal_command:
   - scripts/activate_tw_public_opening_data.py
   - --link
   - data_tw_public
 pre_signal_timeout_seconds: 120
+completed_session_command:
+  - scripts/finalize_tw_public_completed_session.py
+completed_session_timeout_seconds: 600
+formal_history_timeout_seconds: 1800
 previous_signal_backfill_limit: 512
 
 model_selection_path: ../models/tw_day_trade_100m.yaml

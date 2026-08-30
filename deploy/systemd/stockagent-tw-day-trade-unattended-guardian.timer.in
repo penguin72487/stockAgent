@@ -1,0 +1,12 @@
+[Unit]
+Description=Continuously verify the unattended Taiwan day-trade contract on weekdays
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* *:*:00 Asia/Taipei
+AccuracySec=1s
+RandomizedDelaySec=0
+Persistent=true
+Unit=stockagent-tw-day-trade-unattended-guardian.service
+
+[Install]
+WantedBy=timers.target

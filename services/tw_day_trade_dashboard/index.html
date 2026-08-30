@@ -115,7 +115,7 @@
       <article class="panel timeline-panel">
         <div class="panel-head"><div><h2>執行時鐘與資料契約</h2><p>畫面直接讀取同一份 append-only 模擬帳本</p></div></div>
         <ol class="timeline">
-          <li><time>09:00</time><div><strong>訊號完成立即市價執行</strong><span>盤前已預熱模型、契約與資格；訊號可用後只等因果上較晚的 opening quote，不再等待第一根分鐘 K。</span></div></li>
+          <li><time>09:00</time><div><strong>產生並鎖定當日訊號</strong><span>盤前已預熱模型、契約與資格；09:01 取得官方開盤價後，以該價做反事實紙上買賣，不使用 bid/ask、last 或 +1 tick。</span></div></li>
 	          <li><time>進場</time><div><strong>可成交委託全數成交</strong><span>買入取 best ask、賣空取 best bid；送出的模擬市價量不超過新鮮一檔可見量，因此送單量全成，模型原始目標超出深度的部分另列為未送出，不捏造流動性。</span></div></li>
           <li><time>盤中</time><div><strong>啟用模式 TP/SL 皆內縮一 Tick</strong><span>每個啟用策略都從漲跌停價向內縮一個日期有效的合法 Tick。TP 是限價，SL 是本地觸價後市價；內縮只能提高成交機率，不能保證有對手量。</span></div></li>
           <li><time>13:20</time><div><strong>被動限價退出</strong><span>多單掛 ask、空單掛 bid；保留成交與未成交狀態。</span></div></li>
@@ -187,6 +187,6 @@
   </main>
   <script src="../dashboard-core.js?v=1" defer></script>
   <script src="../time-axis.js?v=4" defer></script>
-  <script src="app.js?v=40" defer></script>
+  <script src="app.js?v=43" defer></script>
 </body>
 </html>

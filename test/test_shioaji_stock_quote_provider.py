@@ -22,12 +22,21 @@ class _FakeApi:
     def __init__(self, contracts):
         self.contracts = _Contracts(contracts)
         self.batch_sizes: list[int] = []
+        self.snapshot_timeouts: list[int] = []
         self.logged_out = False
 
-    def snapshots(self, contracts):
+    def snapshots(self, contracts, timeout=30000):
         self.batch_sizes.append(len(contracts))
+        self.snapshot_timeouts.append(int(timeout))
+        now_ns = int(
+            np.datetime64(
+                __import__("datetime").datetime.now().replace(tzinfo=None),
+                "ns",
+            ).astype(np.int64)
+        )
         return [
             SimpleNamespace(
+                ts=now_ns,
                 code=contract.code,
                 open=100.0,
                 high=102.0,
@@ -51,7 +60,42 @@ def _reset_shioaji_connection_state(monkeypatch):
     monkeypatch.setattr(quote_provider, "_SHIOAJI_STOCK_CONTRACTS", {})
     monkeypatch.setattr(quote_provider, "_SHIOAJI_STOCK_CACHE", {})
     monkeypatch.setattr(quote_provider, "_SHIOAJI_STOCK_LOGIN_RETRY_AFTER", 0.0)
+    monkeypatch.setattr(quote_provider, "_SHIOAJI_STOCK_LOGIN_FAILURES", 0)
     monkeypatch.setattr(quote_provider, "_SHIOAJI_STOCK_LAST_LOGIN_ERROR", None)
+
+
+def test_shioaji_login_failure_uses_fast_bounded_adaptive_retry(monkeypatch):
+    class BrokenApi:
+        def __init__(self, *, simulation):
+            assert simulation is True
+
+        def set_event_callback(self, _callback):
+            return None
+
+        def login(self, **_kwargs):
+            raise RuntimeError("temporary login failure")
+
+        def logout(self):
+            return None
+
+    clock = [100.0]
+    _reset_shioaji_connection_state(monkeypatch)
+    monkeypatch.setattr(quote_provider.time, "monotonic", lambda: clock[0])
+    monkeypatch.setitem(sys.modules, "shioaji", SimpleNamespace(Shioaji=BrokenApi))
+    monkeypatch.setenv("SHIOAJI_API_KEY", "test-key")
+    monkeypatch.setenv("SHIOAJI_SECRET_KEY", "test-secret")
+
+    for expected_delay in (2.0, 4.0, 8.0, 16.0, 30.0, 30.0):
+        try:
+            quote_provider._shioaji_stock_api()
+        except RuntimeError as exc:
+            assert "temporary login failure" in str(exc)
+        else:
+            raise AssertionError("broken login must fail")
+        assert quote_provider._SHIOAJI_STOCK_LOGIN_RETRY_AFTER == (
+            clock[0] + expected_delay
+        )
+        clock[0] = quote_provider._SHIOAJI_STOCK_LOGIN_RETRY_AFTER
 
 
 def test_historical_stock_entry_books_preserve_taipei_wall_clock_and_each_side(
@@ -167,6 +211,63 @@ def test_shioaji_warm_client_validates_and_replaces_expired_session(monkeypatch)
     assert quote_provider._SHIOAJI_STOCK_API is fresh_instances[0]
 
 
+def test_shioaji_warm_client_primes_contracts_without_prefetching_snapshots(
+    monkeypatch,
+):
+    contracts = {
+        "2330": SimpleNamespace(code="2330"),
+        "2317": SimpleNamespace(code="2317"),
+    }
+
+    class WarmApi:
+        def __init__(self):
+            self.contracts = _Contracts(contracts)
+            self.usage_calls = 0
+            self.snapshot_calls = 0
+
+        def usage(self):
+            self.usage_calls += 1
+            return 0
+
+        def snapshots(self, _contracts):
+            self.snapshot_calls += 1
+            raise AssertionError("preopen contract priming must not fetch quotes")
+
+    api = WarmApi()
+    _reset_shioaji_connection_state(monkeypatch)
+    monkeypatch.setattr(quote_provider, "_SHIOAJI_STOCK_API", api)
+
+    receipt = quote_provider.warm_shioaji_stock_quote_client(
+        ["2330", "2317", "2330", "missing"]
+    )
+
+    assert receipt == {
+        "ready": False,
+        "connection_scope": "process",
+        "requested_count": 3,
+        "primed_count": 2,
+        "resolved_count": 2,
+        "missing_count": 1,
+        "snapshot_prefetched": False,
+    }
+    assert api.usage_calls == 1
+    assert api.snapshot_calls == 0
+    assert set(quote_provider._SHIOAJI_STOCK_CONTRACTS) == {
+        "2330",
+        "2317",
+        "missing",
+    }
+
+    contracts["missing"] = SimpleNamespace(code="missing")
+    healed = quote_provider.warm_shioaji_stock_quote_client(
+        ["2330", "2317", "missing"]
+    )
+    assert healed["ready"] is True
+    assert healed["primed_count"] == 3
+    assert healed["resolved_count"] == 3
+    assert healed["missing_count"] == 0
+
+
 def test_shioaji_stock_snapshot_reconnects_once_after_session_failure(
     monkeypatch, tmp_path
 ):
@@ -178,7 +279,8 @@ def test_shioaji_stock_snapshot_reconnects_once_after_session_failure(
     )
 
     class ExpiredApi(_FakeApi):
-        def snapshots(self, contracts):
+        def snapshots(self, contracts, timeout=30000):
+            del contracts, timeout
             raise RuntimeError("SessionNotEstablished")
 
     class FreshApi(_FakeApi):
@@ -253,6 +355,7 @@ def test_shioaji_stock_snapshots_batch_and_reuse_cache(monkeypatch, tmp_path):
     )
 
     assert api.batch_sizes == [500, 1]
+    assert api.snapshot_timeouts == [3_000, 3_000]
     assert first.source.startswith("shioaji:stock_snapshot")
     assert first.available_count == 501
     assert np.all(first.open_prices == 100.0)
@@ -261,6 +364,7 @@ def test_shioaji_stock_snapshots_batch_and_reuse_cache(monkeypatch, tmp_path):
     assert np.all(first.upper_limit_prices == 107.5)
     assert np.all(first.lower_limit_prices == 88.5)
     assert np.all(first.timestamps_ms > 0)
+    assert np.all(first.exchange_timestamps_ms > 0)
     assert np.array_equal(second.prices, first.prices)
 
 
@@ -279,6 +383,54 @@ def test_shioaji_stock_snapshots_fail_closed_without_usable_rows(monkeypatch):
         assert "no usable stock snapshots" in str(exc)
     else:
         raise AssertionError("missing Shioaji quotes must fail closed")
+
+
+def test_shioaji_stock_snapshots_never_revive_expired_rows_after_partial_reply(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("STOCKAGENT_TW_PRICE_LIMIT_ROOT", str(tmp_path))
+    monkeypatch.setattr(quote_provider, "_TW_LIMIT_CACHE_KEY", None)
+    monkeypatch.setattr(quote_provider, "_TW_LIMIT_CACHE", {})
+    contracts = {
+        code: SimpleNamespace(
+            code=code,
+            reference=100.0,
+            limit_up=110.0,
+            limit_down=90.0,
+        )
+        for code in ("2330", "2317")
+    }
+
+    class PartialReplyApi(_FakeApi):
+        def __init__(self):
+            super().__init__(contracts)
+            self.calls = 0
+
+        def snapshots(self, requested, timeout=30000):
+            self.calls += 1
+            rows = super().snapshots(requested, timeout=timeout)
+            return rows if self.calls == 1 else rows[:1]
+
+    api = PartialReplyApi()
+    monkeypatch.setattr(quote_provider, "_SHIOAJI_STOCK_API", api)
+    monkeypatch.setattr(quote_provider, "_SHIOAJI_STOCK_CONTRACTS", {})
+    monkeypatch.setattr(quote_provider, "_SHIOAJI_STOCK_CACHE", {})
+    fallback = np.asarray([90.0, 80.0], dtype=np.float64)
+
+    first = quote_provider.fetch_shioaji_stock_snapshots(
+        ["2330", "2317"], fallback, cache_ttl_seconds=15.0
+    )
+    second = quote_provider.fetch_shioaji_stock_snapshots(
+        ["2330", "2317"], fallback, cache_ttl_seconds=0.0
+    )
+
+    assert first.available_count == 2
+    assert second.available_count == 1
+    assert second.available_mask.tolist() == [True, False]
+    assert second.prices.tolist() == [101.0, 80.0]
+    assert np.isnan(second.bid_prices[1])
+    assert second.timestamps_ms[1] == 0
+    assert second.exchange_timestamps_ms[1] == 0
 
 
 def test_shioaji_limits_never_derive_from_panel_close_without_official_reference(
@@ -359,7 +511,8 @@ def test_shioaji_stock_snapshots_restore_only_executable_locked_limit_side(
     }
 
     class LockedLimitApi(_FakeApi):
-        def snapshots(self, requested_contracts):
+        def snapshots(self, requested_contracts, timeout=30000):
+            assert 250 <= int(timeout) <= 5_000
             self.batch_sizes.append(len(requested_contracts))
             rows = {
                 "LIMIT_UP": SimpleNamespace(

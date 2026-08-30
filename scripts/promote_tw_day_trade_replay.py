@@ -33,6 +33,14 @@ HYBRID_ENTRY_POLICY = "causal_best_quote_else_adverse_open_tick"
 HYBRID_REPLAY_CONTRACT = (
     "retrospective_historical_best_quote_else_adverse_open_tick_counterfactual"
 )
+PAPER_MARKET_ENTRY_POLICY = "market_at_best_quote_else_adverse_open_tick"
+PAPER_MARKET_REPLAY_CONTRACT = (
+    "retrospective_historical_best_quote_market_else_adverse_open_tick_counterfactual"
+)
+OFFICIAL_OPEN_ENTRY_POLICY = "official_open_at_09_01"
+OFFICIAL_OPEN_REPLAY_CONTRACT = (
+    "retrospective_official_session_open_at_09_01_counterfactual"
+)
 
 
 def _sha256(path: Path) -> str:
@@ -80,7 +88,8 @@ def _validate_hybrid_signal_ledger(
             except json.JSONDecodeError:
                 failures.append(f"signals.jsonl:{line_number}: invalid JSON")
                 continue
-            if row.get("entry_fill_policy") != HYBRID_ENTRY_POLICY:
+            policy = str(row.get("entry_fill_policy") or "")
+            if policy not in {HYBRID_ENTRY_POLICY, PAPER_MARKET_ENTRY_POLICY}:
                 continue
             filled_shares = int(row.get("filled_shares") or 0)
             if filled_shares <= 0:
@@ -101,6 +110,13 @@ def _validate_hybrid_signal_ledger(
                         f"signals.jsonl:{line_number}: malformed adverse-tick fallback"
                     )
                     continue
+                if (
+                    policy == PAPER_MARKET_ENTRY_POLICY
+                    and row.get("paper_market_fill") is not True
+                ):
+                    failures.append(
+                        f"signals.jsonl:{line_number}: paper fallback is not labelled"
+                    )
                 sizing_price = float(row.get("sizing_open_price") or math.nan)
                 session_date = str(row.get("session_date") or "")
                 direction = 1 if side == "long" else -1 if side == "short" else 0
@@ -137,19 +153,30 @@ def _validate_hybrid_signal_ledger(
                     source_time = datetime.fromisoformat(source_quote_at)
                 except ValueError:
                     source_time = None
-                if (
+                common_invalid = bool(
                     row.get("synthetic_fill") is not False
                     or row.get("status") not in {"ready", "partial_depth"}
                     or not math.isclose(
                         execution_price, quote_price, rel_tol=0.0, abs_tol=1e-9
                     )
-                    or int(row.get("top_book_capacity_shares") or 0) < filled_shares
                     or source_time is None
                     or source_time.date().isoformat()
                     != str(row.get("session_date") or "")
                     or source_time.hour != 9
                     or source_time.minute != 0
-                ):
+                )
+                depth_invalid = bool(
+                    policy == HYBRID_ENTRY_POLICY
+                    and int(row.get("top_book_capacity_shares") or 0) < filled_shares
+                )
+                paper_market_invalid = bool(
+                    policy == PAPER_MARKET_ENTRY_POLICY
+                    and (
+                        row.get("paper_market_fill") is not True
+                        or filled_shares != int(row.get("requested_shares") or 0)
+                    )
+                )
+                if common_invalid or depth_invalid or paper_market_invalid:
                     failures.append(
                         f"signals.jsonl:{line_number}: malformed historical best-quote fill"
                     )
@@ -166,6 +193,117 @@ def _validate_hybrid_signal_ledger(
         "best_quote_fills": exact_count,
         "synthetic_fallback_fills": fallback_count,
     }
+
+
+def _validate_official_open_signal_ledger(
+    candidate: Path,
+    *,
+    expected_fills: int,
+    failures: list[str],
+) -> dict[str, int]:
+    path = candidate / "signals.jsonl"
+    if not path.is_file():
+        failures.append("official-open replay has no signals.jsonl audit ledger")
+        return {"official_open_fills": 0}
+    fill_count = 0
+    with path.open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                failures.append(f"signals.jsonl:{line_number}: invalid JSON")
+                continue
+            if str(row.get("entry_fill_policy") or "") != OFFICIAL_OPEN_ENTRY_POLICY:
+                continue
+            filled_shares = int(row.get("filled_shares") or 0)
+            if filled_shares <= 0:
+                continue
+            fill_count += 1
+            try:
+                execution_price = float(row.get("execution_price"))
+                sizing_open = float(row.get("sizing_open_price"))
+                recorded_at = datetime.fromisoformat(str(row.get("recorded_at")))
+            except (TypeError, ValueError):
+                failures.append(
+                    f"signals.jsonl:{line_number}: malformed official-open fill"
+                )
+                continue
+            if (
+                row.get("counterfactual_open_price_fill") is not True
+                or row.get("synthetic_fill") is not False
+                or row.get("synthetic_fallback_fill") is not False
+                or row.get("paper_market_fill") is not False
+                or int(row.get("entry_price_offset_ticks") or 0) != 0
+                or not math.isclose(
+                    execution_price, sizing_open, rel_tol=0.0, abs_tol=1e-9
+                )
+                or recorded_at.hour != 9
+                or recorded_at.minute != 1
+            ):
+                failures.append(
+                    f"signals.jsonl:{line_number}: official-open/09:01 contract mismatch"
+                )
+    if fill_count != expected_fills:
+        failures.append(
+            f"signals ledger official-open fills={fill_count} receipt={expected_fills}"
+        )
+    return {"official_open_fills": fill_count}
+
+
+def _validate_official_open_fill_ledger(
+    candidate: Path,
+    *,
+    expected_fills: int,
+    failures: list[str],
+) -> dict[str, int]:
+    path = candidate / "fills.jsonl"
+    if not path.is_file():
+        failures.append("official-open replay has no fills.jsonl audit ledger")
+        return {"fill_ledger_official_open_fills": 0}
+    fill_count = 0
+    with path.open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                failures.append(f"fills.jsonl:{line_number}: invalid JSON")
+                continue
+            if (
+                str(row.get("purpose") or "") != "entry"
+                or str(row.get("fill_contract") or "")
+                != OFFICIAL_OPEN_REPLAY_CONTRACT
+            ):
+                continue
+            fill_count += 1
+            try:
+                price = float(row.get("price"))
+                fill_at = datetime.fromisoformat(str(row.get("fill_at")))
+            except (TypeError, ValueError):
+                failures.append(
+                    f"fills.jsonl:{line_number}: malformed official-open fill"
+                )
+                continue
+            if (
+                str(row.get("entry_fill_policy") or "")
+                != OFFICIAL_OPEN_ENTRY_POLICY
+                or int(row.get("entry_price_offset_ticks") or 0) != 0
+                or row.get("counterfactual_open_price_fill") is not True
+                or row.get("synthetic_fill") is not False
+                or row.get("synthetic_fallback_fill") is not False
+                or row.get("paper_market_fill") is not False
+                or not math.isfinite(price)
+                or price <= 0.0
+                or fill_at.hour != 9
+                or fill_at.minute != 1
+            ):
+                failures.append(
+                    f"fills.jsonl:{line_number}: official-open/09:01 contract mismatch"
+                )
+    if fill_count != expected_fills:
+        failures.append(
+            f"fills ledger official-open fills={fill_count} receipt={expected_fills}"
+        )
+    return {"fill_ledger_official_open_fills": fill_count}
 
 
 def _validate_rebuild(
@@ -204,6 +342,7 @@ def _validate_rebuild(
     registrations = 0
     best_quote_fills = 0
     synthetic_fallback_fills = 0
+    official_open_fills = 0
     current_date = datetime.now(TAIPEI).date().isoformat()
     current_open_session: str | None = None
     for session_index, session in enumerate(sessions):
@@ -255,12 +394,34 @@ def _validate_rebuild(
                 fallback_count = int(
                     entry.get("entry_synthetic_fallback_fill_count") or 0
                 )
+                official_open_count = int(
+                    entry.get("entry_official_open_fill_count") or 0
+                )
                 best_quote_fills += exact_count
                 synthetic_fallback_fills += fallback_count
-                if policy == HYBRID_ENTRY_POLICY:
-                    if receipt_entry_contract != HYBRID_REPLAY_CONTRACT:
+                official_open_fills += official_open_count
+                if policy == OFFICIAL_OPEN_ENTRY_POLICY:
+                    if receipt_entry_contract != OFFICIAL_OPEN_REPLAY_CONTRACT:
                         failures.append(
-                            f"{session_date}/{market}: hybrid replay contract is not explicit"
+                            f"{session_date}/{market}: official-open replay contract is not explicit"
+                        )
+                    if official_open_count != fill_count:
+                        failures.append(
+                            f"{session_date}/{market}: official-open fill counts do not reconcile"
+                        )
+                    if entry.get("entry_fill_is_synthetic") is True or fallback_count:
+                        failures.append(
+                            f"{session_date}/{market}: official-open fill uses a synthetic tick"
+                        )
+                if policy in {HYBRID_ENTRY_POLICY, PAPER_MARKET_ENTRY_POLICY}:
+                    required_contract = (
+                        PAPER_MARKET_REPLAY_CONTRACT
+                        if policy == PAPER_MARKET_ENTRY_POLICY
+                        else HYBRID_REPLAY_CONTRACT
+                    )
+                    if receipt_entry_contract != required_contract:
+                        failures.append(
+                            f"{session_date}/{market}: replay contract is not explicit"
                         )
                     if exact_count + fallback_count != fill_count:
                         failures.append(
@@ -295,14 +456,31 @@ def _validate_rebuild(
         mode = mode_value if isinstance(mode_value, dict) else {}
         mode_policy = str(mode.get("entry_fill_policy") or "")
         mode_is_hybrid = mode_policy == HYBRID_ENTRY_POLICY
+        mode_is_paper_market = mode_policy == PAPER_MARKET_ENTRY_POLICY
+        mode_is_official_open = mode_policy == OFFICIAL_OPEN_ENTRY_POLICY
         if mode_policy == "synthetic_open_tick" or (
-            mode.get("entry_fill_is_synthetic") is True and not mode_is_hybrid
+            mode.get("entry_fill_is_synthetic") is True
+            and not (mode_is_hybrid or mode_is_paper_market)
         ):
             failures.append(
                 f"{market}: legacy synthetic open-tick replay cannot be promoted"
             )
         if mode_is_hybrid and receipt_entry_contract != HYBRID_REPLAY_CONTRACT:
             failures.append(f"{market}: hybrid final state has no matching receipt")
+        if (
+            mode_is_paper_market
+            and receipt_entry_contract != PAPER_MARKET_REPLAY_CONTRACT
+        ):
+            failures.append(
+                f"{market}: paper-market final state has no matching receipt"
+            )
+        if (
+            mode_is_official_open
+            and receipt_entry_contract != OFFICIAL_OPEN_REPLAY_CONTRACT
+        ):
+            failures.append(
+                f"{market}: official-open final state has no matching receipt"
+            )
         positions = mode.get("positions")
         if not isinstance(positions, dict):
             positions = {}
@@ -328,9 +506,15 @@ def _validate_rebuild(
             allowed_contracts = {"retrospective_observed_best_quote_counterfactual"}
             if mode_is_hybrid:
                 allowed_contracts.add(HYBRID_REPLAY_CONTRACT)
+            if mode_is_paper_market:
+                allowed_contracts.add(PAPER_MARKET_REPLAY_CONTRACT)
+            if mode_is_official_open:
+                allowed_contracts.add(OFFICIAL_OPEN_REPLAY_CONTRACT)
             if mode.get("entry_fill_contract") not in allowed_contracts:
                 failures.append(f"{market}: current entry fill contract is invalid")
-            if mode.get("entry_fill_is_synthetic") is not False and not mode_is_hybrid:
+            if mode.get("entry_fill_is_synthetic") is not False and not (
+                mode_is_hybrid or mode_is_paper_market
+            ):
                 failures.append(
                     f"{market}: current entries are not received-book fills"
                 )
@@ -353,7 +537,7 @@ def _validate_rebuild(
                     )
                 if (
                     position.get("entry_fill_is_synthetic") is not False
-                    and not mode_is_hybrid
+                    and not (mode_is_hybrid or mode_is_paper_market)
                 ):
                     failures.append(
                         f"{market}/{symbol}: position is not a received-book fill"
@@ -364,12 +548,28 @@ def _validate_rebuild(
         "best_quote_fills": best_quote_fills,
         "synthetic_fallback_fills": synthetic_fallback_fills,
     }
-    if receipt_entry_contract == HYBRID_REPLAY_CONTRACT:
+    if receipt_entry_contract in {
+        HYBRID_REPLAY_CONTRACT,
+        PAPER_MARKET_REPLAY_CONTRACT,
+    }:
         signal_ledger_validation = _validate_hybrid_signal_ledger(
             candidate,
             expected_best_quote_fills=best_quote_fills,
             expected_synthetic_fallback_fills=synthetic_fallback_fills,
             failures=failures,
+        )
+    elif receipt_entry_contract == OFFICIAL_OPEN_REPLAY_CONTRACT:
+        signal_ledger_validation = _validate_official_open_signal_ledger(
+            candidate,
+            expected_fills=official_open_fills,
+            failures=failures,
+        )
+        signal_ledger_validation.update(
+            _validate_official_open_fill_ledger(
+                candidate,
+                expected_fills=official_open_fills,
+                failures=failures,
+            )
         )
 
     if failures:
@@ -380,6 +580,7 @@ def _validate_rebuild(
         "registrations": registrations,
         "best_quote_fills": best_quote_fills,
         "synthetic_fallback_fills": synthetic_fallback_fills,
+        "official_open_fills": official_open_fills,
         "signal_ledger_validation": signal_ledger_validation,
         "mode_set": sorted(expected_markets),
         "final_open_positions": final_open_positions,

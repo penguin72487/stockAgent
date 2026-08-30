@@ -142,7 +142,20 @@ def select_capture_part_paths(
     selected: list[Path] = []
     counts = {worker: 0 for worker in by_worker}
     partition = capture_root / kind / f"trade_date={trade_date}"
-    for path in sorted(partition.rglob("*.parquet")):
+    capture_has_explicit_trade_date = bool(
+        capture_id is not None
+        and all(str(item.get("trade_date") or "") == trade_date for item in manifest_list)
+    )
+    candidate_paths = (
+        sorted(
+            (capture_root / kind).glob(
+                f"trade_date=*/hour=*/capture={capture_id}-worker=*-part=*.parquet"
+            )
+        )
+        if capture_has_explicit_trade_date
+        else sorted(partition.rglob("*.parquet"))
+    )
+    for path in candidate_paths:
         match = _PART_RE.fullmatch(path.name)
         if match is None:
             continue
@@ -157,8 +170,9 @@ def select_capture_part_paths(
             stamp_ns = int(match.group("stamp_ns"))
             belongs = file_capture_id is None and start_ns <= stamp_ns < end_ns
         if belongs:
-            selected.append(path)
             counts[worker] += 1
+            if f"trade_date={trade_date}" in path.parts:
+                selected.append(path)
     if verify_part_counts:
         part_key = _PART_COUNT_KEYS[kind]
         for worker, manifest in by_worker.items():
