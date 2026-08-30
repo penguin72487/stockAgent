@@ -1,0 +1,27 @@
+base_config: tw_day_trade_daily_executable_portfolio_transformer_22_basis_tplus2_close_capital10m.yaml
+
+# Fresh throughput contract.  The v4 artifact root contains checkpoints trained
+# with global batch 32, so changing the effective optimizer batch must not
+# silently resume that trajectory.  Fold-11 dual-RTX-5090 measurement selected
+# global 128 (64/rank): 160 was slower and exceeded the VRAM safety gate, while
+# 192 failed in Flash-Attention backward with CUDA OOM.
+experiment_name: tw-day-trade-daily-executable-portfolio-transformer-22-basis-causal-stateful-carry-capital10m-v5-throughput
+
+runner:
+  output_dir: artifacts/markets/tw_day_trade_daily_executable_portfolio_transformer_22_basis_causal_stateful_carry_commission20_capital10m_v5_batch128
+  resume: true
+  post_train_infer: false
+
+training:
+  batch_size_train: 128
+  batch_size_eval: 16
+  auto_batch_size: false
+
+  # Preserve the complete per-epoch observability contract.  Throughput
+  # optimization does not disable loss curves, sampled test curves, or plots.
+  record_epoch_curve: true
+  curve_plot_interval: 1
+  curve_test_interval: 1
+  curve_plot_async: true
+  epoch_test_curve: true
+  defer_epoch_curve_plot_until_end: false

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 import torch
 
 from stockagent.backtest.simulator import (
@@ -192,6 +193,42 @@ def test_canonical_result_has_no_settlement_or_cross_day_position_state() -> Non
     assert not bool(result.settlement_default.any())
     assert result.cash_history is not None
     assert torch.equal(result.cash_history, torch.ones_like(result.cash_history))
+
+
+def test_stateful_carry_rejects_legacy_minute_executor_that_drops_residuals() -> None:
+    weights = torch.tensor([[0.10]])
+    mask = torch.ones_like(weights, dtype=torch.bool)
+    zeros_mask = torch.zeros_like(mask)
+    zeros = torch.zeros(1)
+    with pytest.raises(ValueError, match="discards per-symbol residual holdings"):
+        run_backtest_torch(
+            weights,
+            torch.zeros_like(weights),
+            mask,
+            torch.zeros(1),
+            0.0,
+            0.0,
+            long_only=False,
+            portfolio_activation="pre_normalized",
+            can_buy_mask=mask,
+            can_sell_mask=mask,
+            can_short_open_mask=mask,
+            can_short_open_open_mask=mask,
+            force_short_cover_mask=zeros_mask,
+            force_exit_mask=zeros_mask,
+            short_margin_rate=torch.full_like(weights, 0.9),
+            short_capacity_weights=torch.full_like(weights, float("inf")),
+            unresolved_corporate_action_mask=zeros_mask,
+            execution_mode="tw_day_trade",
+            buy_fee_rates=zeros,
+            sell_fee_rates=zeros,
+            normal_sell_fee_rates=zeros,
+            day_trade_eligible_mask=mask,
+            day_trade_can_buy_open_mask=mask,
+            day_trade_can_sell_open_mask=mask,
+            day_trade_unlimited_margin_conversion=True,
+            overnight_returns=_tape(days=1),
+        )
 
 
 def test_t_profit_settles_after_t_plus_2_close_and_sizes_only_t_plus_3() -> None:

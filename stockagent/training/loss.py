@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from stockagent.backtest.distributed_reduction import global_symbol_tensor_sum
 from stockagent.backtest.simulator import (
     _apply_min_trade_weight_torch,
     _normalize_target_weights_torch,
@@ -460,6 +461,9 @@ def factor_generalization_loss(
     initial_short_margin_collateral = (
         aux_outputs.get("initial_short_margin_collateral") if aux_outputs else None
     )
+    initial_long_margin_debt = (
+        aux_outputs.get("initial_long_margin_debt") if aux_outputs else None
+    )
     factor_backtest = run_backtest_torch(
         factor_scores,
         execution_returns,
@@ -545,6 +549,7 @@ def factor_generalization_loss(
         initial_equity_scale=initial_equity_scale,
         initial_short_sale_collateral=initial_short_sale_collateral,
         initial_short_margin_collateral=initial_short_margin_collateral,
+        initial_long_margin_debt=initial_long_margin_debt,
         symbol_indices=symbol_indices,
     )
     if aux_outputs is not None and factor_backtest.final_weights is not None:
@@ -591,6 +596,11 @@ def factor_generalization_loss(
                 "short_margin_collateral",
                 "_final_short_margin_collateral",
                 factor_backtest.final_short_margin_collateral,
+            ),
+            (
+                "long_margin_debt",
+                "_final_long_margin_debt",
+                factor_backtest.final_long_margin_debt,
             ),
         ):
             if value is not None:
@@ -1047,6 +1057,7 @@ def _canonical_target_weights_for_loss(
     gross_leverage: float,
     min_trade_weight: float,
     portfolio_activation: str,
+    symbol_sharded: bool = False,
 ) -> Tensor:
     """Apply the same target-weight transform used by the canonical backtest."""
     gross_budget = float(_resolve_exposure_budget(gross_leverage))
@@ -1055,8 +1066,13 @@ def _canonical_target_weights_for_loss(
         long_only=long_only,
         gross_budget=gross_budget,
         portfolio_activation=portfolio_activation,
+        symbol_sharded=symbol_sharded,
     )
-    return _apply_min_trade_weight_torch(target, min_trade_weight)
+    return _apply_min_trade_weight_torch(
+        target,
+        min_trade_weight,
+        symbol_sharded=symbol_sharded,
+    )
 
 
 def _resolved_penalty_weights(
@@ -1067,6 +1083,7 @@ def _resolved_penalty_weights(
     gross_leverage: float,
     min_trade_weight: float,
     portfolio_activation: str,
+    symbol_sharded: bool = False,
 ) -> Tensor:
     if isinstance(backtest_weights_history, torch.Tensor) and backtest_weights_history.numel() > 0:
         return torch.nan_to_num(backtest_weights_history, nan=0.0, posinf=0.0, neginf=0.0)
@@ -1076,22 +1093,44 @@ def _resolved_penalty_weights(
         gross_leverage=gross_leverage,
         min_trade_weight=min_trade_weight,
         portfolio_activation=portfolio_activation,
+        symbol_sharded=symbol_sharded,
     )
 
 
-def _portfolio_concentration_penalty(weights: Tensor, tradable: Tensor, valid_mask: Tensor) -> Tensor:
+def _portfolio_concentration_penalty(
+    weights: Tensor,
+    tradable: Tensor,
+    valid_mask: Tensor,
+    *,
+    symbol_sharded: bool = False,
+) -> Tensor:
     weights_safe = torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
     tradable_f = tradable.to(device=weights_safe.device, dtype=weights_safe.dtype)
     valid_f = valid_mask.to(device=weights_safe.device, dtype=weights_safe.dtype)
-    active_count = tradable_f.sum(dim=1).clamp_min(1.0)
-    concentration = (weights_safe.pow(2) * tradable_f).sum(dim=1) * active_count
+    active_count = global_symbol_tensor_sum(
+        tradable_f.sum(dim=1),
+        symbol_sharded=symbol_sharded,
+    ).clamp_min(1.0)
+    squared_weight = global_symbol_tensor_sum(
+        (weights_safe.pow(2) * tradable_f).sum(dim=1),
+        symbol_sharded=symbol_sharded,
+    )
+    concentration = squared_weight * active_count
     return (concentration * valid_f).sum() / valid_f.sum().clamp_min(1.0)
 
 
-def _portfolio_net_exposure_penalty(weights: Tensor, valid_mask: Tensor) -> Tensor:
+def _portfolio_net_exposure_penalty(
+    weights: Tensor,
+    valid_mask: Tensor,
+    *,
+    symbol_sharded: bool = False,
+) -> Tensor:
     weights_safe = torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
     valid_f = valid_mask.to(device=weights_safe.device, dtype=weights_safe.dtype)
-    net_exposure = weights_safe.sum(dim=1).pow(2)
+    net_exposure = global_symbol_tensor_sum(
+        weights_safe.sum(dim=1),
+        symbol_sharded=symbol_sharded,
+    ).pow(2)
     return (net_exposure * valid_f).sum() / valid_f.sum().clamp_min(1.0)
 
 
@@ -1236,6 +1275,7 @@ def risk_aware_loss(
     overnight_log_returns: Tensor | None = None,
     can_short_open_open_mask: Tensor | None = None,
     day_trade_execution_initial_capital: float = 1_000_000.0,
+    symbol_sharded_ledger: bool = False,
 ) -> Tensor:
     """Risk-aware loss with configurable objective, including excess-CVaR-drawdown."""
     normalize_start = _loss_timer_start()
@@ -1325,6 +1365,22 @@ def risk_aware_loss(
         if phase_actions and overnight_log_returns is None:
             raise ValueError(
                 f"{mode} requires prior-close-to-open overnight_log_returns"
+            )
+    if symbol_sharded_ledger:
+        phase_carry = mode in TW_CARRYING_EXECUTION_MODES and weights.dim() == 3
+        day_trade_carry = bool(
+            mode == "tw_day_trade"
+            and day_trade_unlimited_margin_conversion
+            and weights.dim() == 2
+        )
+        if not (phase_carry or day_trade_carry):
+            raise ValueError(
+                "symbol_sharded_ledger supports phase-action Taiwan carrying "
+                "modes or stateful residual-carry tw_day_trade only"
+            )
+        if float(return_rank_ic_weight) > 0.0:
+            raise ValueError(
+                "symbol_sharded_ledger does not support return-rank auxiliary loss"
             )
     _loss_timer_stop("prepare_inputs", prepare_start)
 
@@ -1532,6 +1588,7 @@ def risk_aware_loss(
     initial_equity_scale = None
     initial_short_sale_collateral = None
     initial_short_margin_collateral = None
+    initial_long_margin_debt = None
     if aux_outputs:
         initial_weights = aux_outputs.get("initial_weights")
         if isinstance(initial_weights, torch.Tensor):
@@ -1612,6 +1669,12 @@ def risk_aware_loss(
             initial_short_margin_collateral = _clone_portfolio_state_for_loss(
                 initial_short_margin_collateral,
                 stat_prefix="initial_short_margin_collateral_clone",
+            )
+        initial_long_margin_debt = aux_outputs.get("initial_long_margin_debt")
+        if isinstance(initial_long_margin_debt, torch.Tensor):
+            initial_long_margin_debt = _clone_portfolio_state_for_loss(
+                initial_long_margin_debt,
+                stat_prefix="initial_long_margin_debt_clone",
             )
 
     backtest_start = _loss_timer_start()
@@ -1705,9 +1768,11 @@ def risk_aware_loss(
         initial_equity_scale=initial_equity_scale,
         initial_short_sale_collateral=initial_short_sale_collateral,
         initial_short_margin_collateral=initial_short_margin_collateral,
+        initial_long_margin_debt=initial_long_margin_debt,
         symbol_indices=symbol_indices,
         overnight_returns=overnight_log_returns,
         day_trade_execution_initial_capital=day_trade_execution_initial_capital,
+        symbol_sharded_ledger=symbol_sharded_ledger,
     )
     _loss_timer_stop("backtest", backtest_start)
 
@@ -1753,11 +1818,51 @@ def risk_aware_loss(
                 "_final_short_margin_collateral",
                 backtest.final_short_margin_collateral,
             ),
+            (
+                "long_margin_debt",
+                "_final_long_margin_debt",
+                backtest.final_long_margin_debt,
+            ),
         ):
             if value is not None:
                 aux_outputs[private_name] = _clone_portfolio_state_for_loss(
                     value,
                     stat_prefix=f"final_{public_name}_clone",
+                )
+        if backtest.settlement_default is not None:
+            default_rows = backtest.settlement_default.to(dtype=torch.bool)
+            first_default_row = torch.where(
+                default_rows.any(),
+                torch.argmax(default_rows.to(dtype=torch.int64)),
+                torch.full(
+                    (),
+                    -1,
+                    device=default_rows.device,
+                    dtype=torch.int64,
+                ),
+            )
+            aux_outputs["_first_settlement_default_row"] = (
+                first_default_row.detach().clone()
+            )
+            if backtest.default_reason_history is not None:
+                reason_rows = backtest.default_reason_history.to(
+                    device=default_rows.device,
+                    dtype=torch.int64,
+                )
+                first_default_reason = torch.where(
+                    first_default_row >= 0,
+                    reason_rows.index_select(
+                        0,
+                        first_default_row.clamp_min(0).reshape(1),
+                    )[0],
+                    torch.zeros(
+                        (),
+                        device=default_rows.device,
+                        dtype=torch.int64,
+                    ),
+                )
+                aux_outputs["_first_settlement_default_reason"] = (
+                    first_default_reason.detach().clone()
                 )
         _loss_timer_stop("state_update", state_update_start)
 
@@ -1819,11 +1924,13 @@ def risk_aware_loss(
                 gross_leverage=gross_leverage,
                 min_trade_weight=min_trade_weight,
                 portfolio_activation=portfolio_activation,
+                symbol_sharded=symbol_sharded_ledger,
             )
             total_loss = total_loss + float(concentration_weight) * _portfolio_concentration_penalty(
                 penalty_weights,
                 tradable,
                 valid_mask,
+                symbol_sharded=symbol_sharded_ledger,
             )
         if net_exposure_weight > 0.0:
             penalty_weights = _resolved_penalty_weights(
@@ -1833,10 +1940,12 @@ def risk_aware_loss(
                 gross_leverage=gross_leverage,
                 min_trade_weight=min_trade_weight,
                 portfolio_activation=portfolio_activation,
+                symbol_sharded=symbol_sharded_ledger,
             )
             total_loss = total_loss + float(net_exposure_weight) * _portfolio_net_exposure_penalty(
                 penalty_weights,
                 valid_mask,
+                symbol_sharded=symbol_sharded_ledger,
             )
         if float(return_rank_ic_weight) > 0.0:
             rank_logits = _resolve_rank_scores(weights, aux_outputs)

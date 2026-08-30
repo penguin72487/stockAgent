@@ -42,7 +42,7 @@ if [[ ! -f "$service_template" || ! -f "$timer_template" || ! -f "$repo_root/.en
   exit 2
 fi
 
-service_user="${SHIOAJI_SERVICE_USER:-$(stat -c '%U' "$repo_root")}" 
+service_user="${SHIOAJI_SERVICE_USER:-$(stat -c '%U' "$repo_root")}"
 if ! id "$service_user" >/dev/null 2>&1; then
   echo "[shioaji-tx-history] unknown service user: $service_user" >&2
   exit 2

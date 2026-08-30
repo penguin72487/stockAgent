@@ -854,6 +854,48 @@ def _slice_batch_rows(batch: dict[str, torch.Tensor], start: int, end: int) -> d
     return sliced
 
 
+_EXECUTION_CONTEXT_EXPLAIN_KEYS = (
+    "can_short_open_open_mask",
+    "day_trade_eligible_mask",
+    "day_trade_can_buy_open_mask",
+    "day_trade_can_sell_open_mask",
+    "volume_notional",
+    "short_capacity_notional",
+)
+
+
+def _bind_execution_context_for_explainability(
+    model: nn.Module,
+    batch: dict[str, torch.Tensor],
+) -> nn.Module | None:
+    subject = _basis_subject_model(model)
+    bind = getattr(subject, "bind_execution_context_for_explainability", None)
+    if not callable(bind):
+        return None
+    missing = [name for name in _EXECUTION_CONTEXT_EXPLAIN_KEYS if name not in batch]
+    if missing:
+        raise ValueError(
+            "execution-conditioned explainability batch is missing: "
+            + ", ".join(missing)
+        )
+    tensors = [batch[name] for name in _EXECUTION_CONTEXT_EXPLAIN_KEYS]
+    expected = tuple(tensors[0].shape)
+    if len(expected) != 2 or any(tuple(value.shape) != expected for value in tensors):
+        raise ValueError(
+            "execution-conditioned explainability fields must share shape [B,S]"
+        )
+    bind(torch.stack([value.to(dtype=torch.float32) for value in tensors], dim=-1))
+    return subject
+
+
+def _clear_bound_execution_context(subject: nn.Module | None) -> None:
+    if subject is None:
+        return
+    clear = getattr(subject, "clear_execution_context_for_explainability", None)
+    if callable(clear):
+        clear()
+
+
 def _surrogate_input_summary(x: torch.Tensor) -> torch.Tensor:
     """Keep the exact first/last/mean surrogate inputs without the full window."""
     value = x.detach().float()
@@ -4965,6 +5007,10 @@ def explain_batch(
     stage_progress.set_postfix(stage="prepare_batch", refresh=True)
     stage_start = time.perf_counter()
     batch = _move_batch(batch, device)
+    execution_context_subject = _bind_execution_context_for_explainability(
+        model,
+        batch,
+    )
     x = torch.nan_to_num(batch["x"].float(), nan=0.0, posinf=0.0, neginf=0.0)
     returns = torch.nan_to_num(batch["future_log_returns"].float(), nan=0.0, posinf=0.0, neginf=0.0)
     mask = batch["tradable_mask"].to(device=device, dtype=torch.bool)
@@ -5261,7 +5307,7 @@ def explain_batch(
     mask_cpu = mask.detach().cpu()
     selected_cpu = selected.detach().cpu()
 
-    return {
+    result = {
         "summary": {
             "portfolio": portfolio,
             "rows": len(dates),
@@ -5347,6 +5393,8 @@ def explain_batch(
             "aux_aliases": aux_aliases,
         },
     }
+    _clear_bound_execution_context(execution_context_subject)
+    return result
 
 
 def _weighted_feature_time_from_chunks(
@@ -11398,6 +11446,7 @@ def _first_test_year_dataset(
     lookback_context: str = "panel_history",
     short_capacity_limit_enabled: bool = True,
     tw_corporate_action_mode: str = "avoid",
+    day_trade_unlimited_margin_conversion: bool = False,
 ) -> CrossSectionalDataset:
     # Explainability has one fixed comparison window: the first calendar year
     # of every fold's test split. There is intentionally no split argument or
@@ -11413,6 +11462,9 @@ def _first_test_year_dataset(
         lookback_context=lookback_context,
         short_capacity_limit_enabled=short_capacity_limit_enabled,
         tw_corporate_action_mode=tw_corporate_action_mode,
+        day_trade_unlimited_margin_conversion=(
+            day_trade_unlimited_margin_conversion
+        ),
     )
 
 
@@ -11609,6 +11661,13 @@ def run_loaded_model_explanation(
                 getattr(config, "trading", None),
                 "tw_corporate_action_mode",
                 "avoid",
+            )
+        ),
+        day_trade_unlimited_margin_conversion=bool(
+            getattr(
+                getattr(config, "trading", None),
+                "tw_day_trade_unlimited_margin_conversion",
+                False,
             )
         ),
     )

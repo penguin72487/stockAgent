@@ -347,7 +347,7 @@ def _attach_funding_total_return(
     funding_rate_sums = np.full(row_count, np.nan, dtype=np.float64)
     funding_last_rates = np.full(row_count, np.nan, dtype=np.float64)
     funding_last_event_times = np.full(
-        row_count, np.datetime64("NaT"), dtype="datetime64[us]"
+        row_count, np.datetime64("NaT", "us"), dtype="datetime64[us]"
     )
     price_returns = np.full(row_count, np.nan, dtype=np.float64)
     effective_returns = np.full(row_count, np.nan, dtype=np.float64)
@@ -371,7 +371,7 @@ def _attach_funding_total_return(
         coefficient = 0.0
         rate_sum = 0.0
         last_rate = np.nan
-        last_event_time = np.datetime64("NaT")
+        last_event_time = np.datetime64("NaT", "us")
         for cursor in range(left, right):
             coefficient += (
                 float(event_marks[cursor]) / float(execution_prices[row])
@@ -403,7 +403,7 @@ def _attach_funding_total_return(
     previous_rate_sums = np.full(row_count, np.nan, dtype=np.float64)
     previous_last_rates = np.full(row_count, np.nan, dtype=np.float64)
     previous_last_event_times = np.full(
-        row_count, np.datetime64("NaT"), dtype="datetime64[us]"
+        row_count, np.datetime64("NaT", "us"), dtype="datetime64[us]"
     )
     # Model-side funding features end at the midnight decision cutoff, while
     # realized PnL above is cut on the 00:05 execution interval. Keeping these

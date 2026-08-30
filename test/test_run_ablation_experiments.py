@@ -4,6 +4,7 @@ import pytest
 import yaml
 
 import scripts.run_ablation_experiments as ablation_module
+from stockagent.config import load_config
 from scripts.run_ablation_experiments import (
     _build_configs,
     _deep_merge,
@@ -127,6 +128,156 @@ def test_projection_l1_multi_basis_ablation_runs_baseline_then_every_variant(
                 == "projection_l1"
             )
     assert effective["lookback128_batch128"]["training"]["lookback"] == 128
+
+
+def test_22_basis_no_time_attention_pooling_ofat_rebases_true_control(
+    tmp_path: Path,
+) -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    spec_path = (
+        repo_root
+        / "configs/ablations/"
+        "tw_day_trade_daily_multi_basis_22_effective_rank_projection_l1_"
+        "no_time_attention_pooling_tplus2_close_commission20_capital10m_v1.yaml"
+    )
+    spec, experiments = _experiment_rows(spec_path)
+
+    names = [row["name"] for row in experiments]
+    assert len(names) == 20
+    assert names[0] == "baseline"
+    assert "with_time_position" in names
+    assert "no_time_position" not in names
+    assert "last_pooling" in names
+    assert "attention_pooling" not in names
+    assert "mean_pooling" in names
+    assert "lookback128_batch4" in names
+    assert "lookback128_batch128" not in names
+    assert spec["runtime"]["parallel_jobs"] == 1
+    assert spec["pinned_panel_cache"] == {
+        "snapshot_id": (
+            "tw-public-20260820T015018219623218Z-l0-penguin-6716296ea30636ba"
+        ),
+        "variant_id": (
+            "c8b02a7a891549c4108c0307a8db47cdc34f17e9b17aa75afbdd79089c1748ac"
+        ),
+        "version": 51,
+        "generation": "67458178ae924a0188d98841e9b17229",
+        "source_hash": (
+            "31f3e4f1e31338bb9c0fd52494cc0d840a5081ffeab00a1fceddfa3412258fe0"
+        ),
+    }
+
+    runs = _build_configs(spec_path, spec, experiments, tmp_path)
+    effective = {
+        run["name"]: yaml.safe_load(run["config_path"].read_text(encoding="utf-8"))
+        for run in runs
+    }
+    loaded = {
+        run["name"]: load_config(run["config_path"])
+        for run in runs
+    }
+    baseline = effective["baseline"]
+    baseline_model = loaded["baseline"].training.financial_transformer
+    assert len(baseline_model.temporal_basis_families) == 22
+    assert sum(baseline_model.temporal_basis_components_by_family.values()) == 524
+    assert baseline_model.use_time_pos is False
+    assert baseline_model.rope_temporal is True
+    assert baseline_model.temporal_pooling == "attention"
+    assert baseline_model.temporal_query_mode == "full_then_last"
+    assert baseline_model.portfolio_output_mode == "projection_l1"
+    assert baseline["training"]["batch_size_train"] == 16
+    assert baseline["training"]["batch_size_eval"] == 16
+    assert baseline["training"]["epochs"] == 1000
+    assert baseline["trading"]["tw_commission_discount"] == 0.2
+    assert baseline["trading"]["volume_participation_equity"] == 10_000_000.0
+    assert baseline["walk_forward"]["lookback_context"] == "panel_history"
+
+    with_time = loaded["with_time_position"].training.financial_transformer
+    assert with_time.use_time_pos is True
+    assert with_time.temporal_pooling == "attention"
+
+    mean_pooling = effective["mean_pooling"]
+    assert mean_pooling["training"]["batch_size_train"] == 16
+    assert (
+        loaded["mean_pooling"].training.financial_transformer.temporal_pooling
+        == "mean"
+    )
+
+    last_pooling = effective["last_pooling"]
+    assert last_pooling["training"]["batch_size_train"] == 16
+    assert (
+        loaded["last_pooling"].training.financial_transformer.temporal_pooling
+        == "last"
+    )
+    assert (
+        loaded["last_pooling"].training.financial_transformer.temporal_query_mode
+        == "last_only"
+    )
+
+    lookback = effective["lookback128_batch4"]
+    assert lookback["training"]["lookback"] == 128
+    assert lookback["training"]["batch_size_train"] == 4
+    assert lookback["training"]["batch_size_eval"] == 4
+
+
+def test_executable_v5_model_performance_ofat_is_formal_and_semantic(
+    tmp_path: Path,
+) -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    spec_path = (
+        repo_root
+        / "configs/ablations/"
+        "executable_portfolio_transformer_v5_model_performance_ofat_v1.yaml"
+    )
+    spec, experiments = _experiment_rows(spec_path)
+    names = [row["name"] for row in experiments]
+
+    assert len(names) == 21
+    assert names[0] == "baseline"
+    assert "no_learned_execution_context" in names
+    assert "no_temporal_basis" in names
+    assert "learned_basis_only" in names
+    assert "eager_model" not in names
+    assert "eager_ledger" not in names
+    assert "symbol_sharded_ledger" not in names
+    assert spec["expected_fold_count"] == 12
+    assert spec["runtime"]["parallel_jobs"] == 1
+
+    runs = _build_configs(spec_path, spec, experiments, tmp_path)
+    loaded = {run["name"]: load_config(run["config_path"]) for run in runs}
+    for config in loaded.values():
+        training = config.training
+        assert training.model_name == "executable_portfolio_transformer"
+        assert training.epochs == 1000
+        assert training.batch_size_train == 128
+        assert training.batch_size_eval == 16
+        assert training.distributed_symbol_sharded_ledger is False
+        assert training.distributed_replicated_ledger_local_metadata is True
+        assert training.tw_dual_session_cuda_graph is True
+        assert training.record_epoch_curve is True
+        assert training.epoch_test_curve is True
+        assert config.trading.tw_day_trade_unlimited_margin_conversion is True
+        assert config.trading.tw_short_capacity_limit_enabled is False
+
+    assert (
+        loaded["baseline"]
+        .training.executable_portfolio_transformer.use_execution_context_features
+        is True
+    )
+    assert (
+        loaded["no_learned_execution_context"]
+        .training.executable_portfolio_transformer.use_execution_context_features
+        is False
+    )
+    assert (
+        loaded["layernorm"]
+        .training.executable_portfolio_transformer.temporal_basis_input
+        == "raw_features"
+    )
+    assert not (
+        loaded["no_temporal_basis"]
+        .training.executable_portfolio_transformer.temporal_basis_families
+    )
 
 
 def test_inherited_experiment_override_renames_and_patches_one_row(

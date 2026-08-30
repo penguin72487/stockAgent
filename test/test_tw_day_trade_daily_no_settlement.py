@@ -29,6 +29,14 @@ def _run(
     initial_payables: torch.Tensor | None = None,
     initial_receivables: torch.Tensor | None = None,
     initial_equity_scale: torch.Tensor | None = None,
+    initial_weights: torch.Tensor | None = None,
+    initial_short_sale_collateral: torch.Tensor | None = None,
+    initial_short_margin_collateral: torch.Tensor | None = None,
+    initial_long_margin_debt: torch.Tensor | None = None,
+    initial_alive: torch.Tensor | None = None,
+    initial_commission_rebate_current: torch.Tensor | None = None,
+    initial_commission_rebate_due: torch.Tensor | None = None,
+    initial_commission_rebate_month_id: torch.Tensor | None = None,
 ):
     mask = torch.ones_like(weights, dtype=torch.bool)
     symbols = weights.size(1)
@@ -44,6 +52,12 @@ def _run(
         can_buy_mask=mask if can_buy_close is None else can_buy_close,
         can_sell_mask=mask if can_sell_close is None else can_sell_close,
         can_short_open_mask=mask,
+        can_short_open_open_mask=mask,
+        force_short_cover_mask=torch.zeros_like(mask),
+        force_exit_mask=torch.zeros_like(mask),
+        short_margin_rate=torch.full_like(weights, 0.9),
+        short_capacity_weights=torch.full_like(weights, float("inf")),
+        unresolved_corporate_action_mask=torch.zeros_like(mask),
         execution_mode="tw_day_trade",
         buy_fee_rates=torch.full((symbols,), buy_fee),
         sell_fee_rates=torch.full((symbols,), day_sell_fee),
@@ -57,10 +71,19 @@ def _run(
         day_trade_margin_financing_annual_rate=financing_rate,
         day_trade_margin_short_handling_fee_rate=short_handling,
         day_trade_margin_short_annual_borrow_rate=short_borrow_rate,
+        overnight_returns=torch.zeros_like(weights),
+        initial_weights=initial_weights,
         initial_cash=initial_cash,
         initial_payables=initial_payables,
         initial_receivables=initial_receivables,
         initial_equity_scale=initial_equity_scale,
+        initial_short_sale_collateral=initial_short_sale_collateral,
+        initial_short_margin_collateral=initial_short_margin_collateral,
+        initial_long_margin_debt=initial_long_margin_debt,
+        initial_alive=initial_alive,
+        initial_commission_rebate_current=initial_commission_rebate_current,
+        initial_commission_rebate_due=initial_commission_rebate_due,
+        initial_commission_rebate_month_id=initial_commission_rebate_month_id,
     )
 
 
@@ -145,7 +168,7 @@ def test_daily_normal_round_trip_uses_open_to_close_return_without_minute_data()
     assert torch.allclose(result.turnovers, torch.tensor([0.21]))
 
 
-def test_blocked_long_close_gets_unlimited_financing_cost_and_stays_flat() -> None:
+def test_blocked_long_close_becomes_financed_inventory_and_stays_open() -> None:
     weights = torch.tensor([[0.10], [0.10]])
     returns = torch.zeros_like(weights)
     blocked = torch.zeros_like(weights, dtype=torch.bool)
@@ -157,23 +180,27 @@ def test_blocked_long_close_gets_unlimited_financing_cost_and_stays_flat() -> No
         day_sell_fee=0.002,
         normal_sell_fee=0.004,
     )
-    expected = -0.10 * (
-        0.001 + 0.004 + 0.60 * 0.16 / 365.0
-    )
+    first_day_cost = 0.10 * (0.001 + 0.60 * 0.16 / 365.0)
     assert torch.allclose(
-        result.strategy_returns.exp() - 1.0,
-        torch.tensor([expected, expected / (1.0 + expected)]),
+        result.strategy_returns[0].exp() - 1.0,
+        torch.tensor(-first_day_cost),
         atol=1.0e-7,
     )
-    assert torch.equal(result.final_weights, torch.zeros_like(result.final_weights))
+    assert result.final_weights is not None
+    assert result.final_weights[0] > 0.099
+    assert result.final_long_margin_debt is not None
+    assert result.final_long_margin_debt[0] > 0.059
+    assert result.event_turnovers is not None
+    # Day two observes the carried mark and trades only the tiny NAV-adjusted
+    # target delta; the blocked close does not fabricate another 0.10 buy.
+    assert result.event_turnovers[1, 0] < 2.0e-5
+    assert result.event_turnovers[:, 1].eq(0.0).all()
     assert result.settlement_default is not None
     assert not bool(result.settlement_default.any())
     assert result.payables_history is not None
-    assert torch.allclose(
-        result.payables_history,
-        torch.tensor([[0.0, -expected], [-expected, -expected]]),
-        atol=1.0e-7,
-    )
+    # Only the 40% investor contribution plus costs remains in T+2 payables;
+    # the 60% broker-funded principal is carried separately as margin debt.
+    assert 0.040 < float(result.payables_history[0, -1]) < 0.041
 
 
 def test_blocked_short_close_uses_normal_tax_short_fee_and_one_day_borrow() -> None:
@@ -190,18 +217,20 @@ def test_blocked_short_close_uses_normal_tax_short_fee_and_one_day_borrow() -> N
         short_handling=0.001,
         short_borrow_rate=0.20,
     )
-    expected = -0.10 * (0.001 + 0.004 + 0.001 + 0.20 / 365.0)
-    assert torch.allclose(
-        result.strategy_returns.exp() - 1.0,
-        torch.tensor([expected]),
-        atol=1.0e-7,
-    )
+    assert result.strategy_returns[0] < 0.0
+    assert result.final_weights is not None and result.final_weights[0] < -0.099
+    assert result.short_sale_collateral_history is not None
+    assert result.short_margin_collateral_history is not None
+    assert result.short_sale_collateral_history[0, 0] > 0.0
+    assert result.short_margin_collateral_history[0, 0] > 0.0
 
 
-def test_missing_close_mark_fails_trade_closed_without_nan_gradient() -> None:
+def test_missing_close_mark_causes_absorbing_default_without_nan_gradient() -> None:
     weights = torch.tensor([[0.10]], requires_grad=True)
     result = _run(weights, torch.full_like(weights, float("nan")))
-    assert torch.equal(result.strategy_returns, torch.zeros_like(result.strategy_returns))
+    assert torch.isfinite(result.strategy_returns).all()
+    assert result.final_alive is not None and not bool(result.final_alive)
+    assert result.strategy_returns[0] < -10.0
     (-result.strategy_returns.sum()).backward()
     assert weights.grad is not None
     assert torch.isfinite(weights.grad).all()
@@ -219,24 +248,32 @@ def test_t_profit_settles_after_t_plus_2_close_and_sizes_only_t_plus_3() -> None
         torch.tensor([0.01, 0.0, 0.0, 0.0]),
         atol=1.0e-7,
     )
-    # It remains a receivable through T+1. T+2 orders still use cash=1.0;
-    # settlement happens after those orders, so T+3 is the first resized day.
+    # State arrays are normalized by each day's own NAV. Absolute wealth is
+    # carried separately in equity_scale_history, so cash temporarily reads
+    # 1/1.01 and the receivable 0.01/1.01 rather than absolute dollars.
     assert result.cash_history is not None
     assert result.receivables_history is not None
     assert result.equity_scale_history is not None
     assert torch.allclose(
         result.cash_history,
-        torch.tensor([1.0, 1.0, 1.01, 1.01]),
+        torch.tensor([1.0 / 1.01, 1.0 / 1.01, 1.0, 1.0]),
         atol=1.0e-7,
     )
     assert torch.allclose(
         result.receivables_history,
-        torch.tensor([[0.0, 0.01], [0.01, 0.0], [0.0, 0.0], [0.0, 0.0]]),
+        torch.tensor(
+            [
+                [0.0, 0.01 / 1.01],
+                [0.01 / 1.01, 0.0],
+                [0.0, 0.0],
+                [0.0, 0.0],
+            ]
+        ),
         atol=1.0e-7,
     )
     assert torch.allclose(
         result.weights_history[:, 0],
-        torch.tensor([0.10, 0.10 / 1.01, 0.10 / 1.01, 0.10]),
+        torch.zeros(4),
         atol=1.0e-7,
     )
     assert torch.allclose(
@@ -261,6 +298,11 @@ def test_daily_log_utility_loss_carries_same_net_claim_state_and_gradient() -> N
         can_buy_mask=mask,
         can_sell_mask=mask,
         can_short_open_mask=mask,
+        can_short_open_open_mask=mask,
+        force_short_cover_mask=torch.zeros_like(mask),
+        force_exit_mask=torch.zeros_like(mask),
+        short_margin_rate=torch.full_like(weights, 0.9),
+        short_capacity_weights=torch.full_like(weights, float("inf")),
         long_only=False,
         portfolio_activation="pre_normalized",
         execution_mode="tw_day_trade",
@@ -271,7 +313,9 @@ def test_daily_log_utility_loss_carries_same_net_claim_state_and_gradient() -> N
         day_trade_eligible_mask=mask,
         day_trade_can_buy_open_mask=mask,
         day_trade_can_sell_open_mask=mask,
+        unresolved_corporate_action_mask=torch.zeros_like(mask),
         day_trade_unlimited_margin_conversion=True,
+        overnight_log_returns=torch.zeros_like(weights),
         settlement_lag_sessions=2,
         objective="log_utility",
         gamma_turnover=0.0,
@@ -286,7 +330,10 @@ def test_daily_log_utility_loss_carries_same_net_claim_state_and_gradient() -> N
     assert torch.isfinite(loss)
     assert weights.grad is not None
     assert torch.isfinite(weights.grad).all()
-    assert torch.allclose(aux["_final_cash"], torch.tensor(1.01), atol=1.0e-7)
+    assert torch.allclose(aux["_final_cash"], torch.tensor(1.0), atol=1.0e-7)
+    assert torch.allclose(
+        aux["_final_equity_scale"], torch.tensor(1.01), atol=1.0e-7
+    )
     assert torch.equal(
         aux["_final_payables"], torch.zeros_like(aux["_final_payables"])
     )
@@ -308,6 +355,18 @@ def test_daily_tplus2_state_is_identical_across_batch_boundary() -> None:
         initial_payables=first.final_payables,
         initial_receivables=first.final_receivables,
         initial_equity_scale=first.final_equity_scale,
+        initial_weights=first.final_weights,
+        initial_short_sale_collateral=first.final_short_sale_collateral,
+        initial_short_margin_collateral=first.final_short_margin_collateral,
+        initial_long_margin_debt=first.final_long_margin_debt,
+        initial_alive=first.final_alive,
+        initial_commission_rebate_current=(
+            first.final_commission_rebate_current
+        ),
+        initial_commission_rebate_due=first.final_commission_rebate_due,
+        initial_commission_rebate_month_id=(
+            first.final_commission_rebate_month_id
+        ),
     )
     assert torch.allclose(
         torch.cat((first.strategy_returns, second.strategy_returns)),

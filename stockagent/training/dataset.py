@@ -123,6 +123,7 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
         execution_mode: str = "naive",
         lookback_context: str = "panel_history",
         short_capacity_limit_enabled: bool = True,
+        day_trade_unlimited_margin_conversion: bool = False,
         tw_corporate_action_mode: str = "avoid",
         tw_commission_rebate_timing: str = "monthly_15th",
     ) -> None:
@@ -130,7 +131,16 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
         if self.lookback <= 0:
             raise ValueError(f"lookback must be positive, got {lookback!r}")
         self.execution_mode = normalize_execution_mode(execution_mode)
-        carrying_execution = self.execution_mode in TW_CARRYING_EXECUTION_MODES
+        self.day_trade_unlimited_margin_conversion = bool(
+            day_trade_unlimited_margin_conversion
+        )
+        carrying_execution = (
+            self.execution_mode in TW_CARRYING_EXECUTION_MODES
+            or (
+                self.execution_mode == "tw_day_trade"
+                and self.day_trade_unlimited_margin_conversion
+            )
+        )
         futures_execution = self.execution_mode in {
             "tw_index_futures_day",
             "tw_index_derivatives_day",
@@ -439,7 +449,17 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
                 # existing windowed tensor path keeps the daily model ABI and
                 # avoids copying a 3-D label through a second loader stack.
                 overnight_returns = minute_execution
-            day_trade_eligible = np.asarray(panel.day_trade_eligible_mask, dtype=bool)
+            elif self.day_trade_unlimited_margin_conversion:
+                # Residual positions are real recurrent holdings.  Their next
+                # decision starts after close[t-1] -> open[t] mark-to-market,
+                # so the executor needs the causal gap component even though
+                # the policy never receives this realised outcome tensor.
+                overnight_returns, target_returns = (
+                    _dual_session_return_components(panel)
+                )
+            day_trade_eligible = np.asarray(
+                panel.day_trade_eligible_mask, dtype=bool
+            )
             day_trade_short_open = (
                 np.asarray(panel.day_trade_can_short_open_mask, dtype=bool)
                 if panel.day_trade_can_short_open_mask is not None
@@ -893,14 +913,23 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
                         where=valid_reference,
                     )
             else:
+                # The observed-open policy values point-in-time inventory at
+                # open[t].  close[t] is an outcome and must never size the
+                # opening short-capacity feature.
+                decision_prices = (
+                    np.asarray(panel.open_prices, dtype=np.float64)
+                    if self.execution_mode == "tw_day_trade"
+                    and panel.open_prices is not None
+                    else close_prices
+                )
                 valid_capacity_price = (
                     (short_capacity_shares > 0)
-                    & np.isfinite(close_prices)
-                    & (close_prices > 0.0)
+                    & np.isfinite(decision_prices)
+                    & (decision_prices > 0.0)
                 )
                 np.multiply(
                     short_capacity_shares,
-                    close_prices,
+                    decision_prices,
                     out=capacity_notional_f64,
                     where=valid_capacity_price,
                 )

@@ -30,6 +30,7 @@ from stockagent.data.panel import (
 )
 from stockagent.data.panel_cache import load_panel_cache_v2, save_panel_cache_v2
 from stockagent.training.dataset import CrossSectionalDataset, collate_batch
+from stockagent.training.trainer import _execution_context_from_batch
 
 
 def _write_corporate_action_reference(
@@ -486,6 +487,87 @@ def test_day_trade_open_inputs_do_not_leak_close_label_or_full_day_volume() -> N
     )
     assert dataset.benchmark_t[2].item() != pytest.approx(
         float(panel.intraday_returns[2, 1])
+    )
+
+
+def test_stateful_day_trade_carry_uses_causal_gap_and_policy_context() -> None:
+    baseline_panel = _make_panel()
+    perturbed_panel = _make_panel()
+    target = 5
+
+    # These facts are learned only during/after session t. They may change the
+    # executor result but must be incapable of changing the open-time policy
+    # context used to choose target[t].
+    perturbed_panel.can_buy_mask[target] = False
+    perturbed_panel.can_sell_mask[target] = False
+    perturbed_panel.can_short_open_mask[target] = False
+    perturbed_panel.daily_volumes[target] = np.float32(9_999_999.0)
+
+    baseline = CrossSectionalDataset(
+        baseline_panel,
+        np.arange(baseline_panel.num_dates),
+        lookback=2,
+        execution_mode="tw_day_trade",
+        day_trade_unlimited_margin_conversion=True,
+    )
+    perturbed = CrossSectionalDataset(
+        perturbed_panel,
+        np.arange(perturbed_panel.num_dates),
+        lookback=2,
+        execution_mode="tw_day_trade",
+        day_trade_unlimited_margin_conversion=True,
+    )
+    row = int(np.flatnonzero(baseline.valid_indices == target)[0])
+    baseline_sample = baseline[row]
+    perturbed_sample = perturbed[row]
+    baseline_batch = collate_batch([baseline_sample])
+    perturbed_batch = collate_batch([perturbed_sample])
+
+    torch.testing.assert_close(
+        _execution_context_from_batch(baseline_batch),
+        _execution_context_from_batch(perturbed_batch),
+    )
+    assert baseline_sample["can_buy_mask"].all()
+    assert not perturbed_sample["can_buy_mask"].any()
+    assert baseline_sample["can_sell_mask"].all()
+    assert not perturbed_sample["can_sell_mask"].any()
+
+    expected_gap = torch.full(
+        (baseline_panel.num_symbols,),
+        float(np.log(90.0 / 100.0)),
+        dtype=torch.float32,
+    )
+    torch.testing.assert_close(
+        baseline_sample["overnight_log_returns"],
+        expected_gap,
+    )
+    torch.testing.assert_close(
+        baseline_sample["overnight_log_returns"]
+        + baseline_sample["future_log_returns"],
+        torch.from_numpy(baseline_panel.raw_close_returns_1d[target - 1]),
+    )
+    # Capacity is prior-session shares valued at close[t-1], not today's full
+    # volume and not close[t].
+    torch.testing.assert_close(
+        baseline_sample["volume_notional"],
+        torch.full((2,), 1000.0 * 100.0),
+    )
+
+    # In contrast, a fact observable at the opening auction is deliberately a
+    # policy input and therefore must alter the context.
+    open_changed_panel = _make_panel()
+    open_changed_panel.day_trade_can_buy_open_mask[target, 0] = False
+    open_changed = CrossSectionalDataset(
+        open_changed_panel,
+        np.arange(open_changed_panel.num_dates),
+        lookback=2,
+        execution_mode="tw_day_trade",
+        day_trade_unlimited_margin_conversion=True,
+    )
+    open_changed_batch = collate_batch([open_changed[row]])
+    assert not torch.equal(
+        _execution_context_from_batch(baseline_batch),
+        _execution_context_from_batch(open_changed_batch),
     )
 
 
