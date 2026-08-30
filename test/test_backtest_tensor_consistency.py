@@ -76,6 +76,38 @@ class _EchoWeightModel(nn.Module):
         return x[:, -1, :, 0]
 
 
+def test_no_grad_all_gather_writes_rank_order_directly_into_output(
+    monkeypatch,
+) -> None:
+    local = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    calls = {"count": 0}
+
+    monkeypatch.setattr(trainer_module, "_distributed_world_size", lambda: 2)
+
+    def fake_all_gather_into_tensor(
+        output: torch.Tensor,
+        value: torch.Tensor,
+    ) -> None:
+        calls["count"] += 1
+        output[: value.size(0)].copy_(value)
+        output[value.size(0) :].copy_(value + 100.0)
+
+    monkeypatch.setattr(
+        trainer_module.dist,
+        "all_gather_into_tensor",
+        fake_all_gather_into_tensor,
+    )
+
+    gathered = trainer_module._all_gather_no_grad(local.contiguous())
+
+    assert calls["count"] == 1
+    assert gathered.is_contiguous()
+    torch.testing.assert_close(
+        gathered,
+        torch.cat((local, local + 100.0), dim=0),
+    )
+
+
 class _EchoAuxWeightModel(nn.Module):
     def forward(
         self,
@@ -2346,6 +2378,108 @@ def test_compiled_loss_probe_reproduces_ddp_gathered_inputs(monkeypatch) -> None
     assert captured["tradable"].shape == captured["weights"].shape
 
 
+def test_replicated_ledger_local_metadata_matches_collective_oracle(
+    monkeypatch,
+) -> None:
+    rows = 2
+    symbols = 3
+    local_weights = torch.arange(rows * symbols, dtype=torch.float32).reshape(
+        rows, symbols
+    )
+    symbol_keys = (
+        "future_log_returns",
+        "overnight_log_returns",
+        "tradable_mask",
+        "can_buy_mask",
+        "can_sell_mask",
+        "can_short_open_mask",
+        "can_short_open_open_mask",
+        "force_short_cover_mask",
+        "force_exit_mask",
+        "day_trade_eligible_mask",
+        "day_trade_can_buy_open_mask",
+        "day_trade_can_sell_open_mask",
+        "unresolved_corporate_action_mask",
+        "cash_dividend_yield",
+        "cash_dividend_payment_delay_sessions",
+        "short_margin_rate",
+        "volume_notional",
+    )
+    time_keys = (
+        "sample_mask",
+        "session_advance_mask",
+        "session_month_ids",
+        "commission_rebate_payment_eligible_mask",
+        "benchmark",
+    )
+    local: dict[str, torch.Tensor] = {}
+    remote: dict[str, torch.Tensor] = {}
+    for index, key in enumerate(symbol_keys):
+        dtype = torch.bool if "mask" in key or "eligible" in key else torch.float32
+        value = torch.full((rows, symbols), index + 1, dtype=torch.float32)
+        local[key] = value.to(dtype=dtype)
+        remote[key] = (value + 100).to(dtype=dtype)
+    for index, key in enumerate(time_keys):
+        dtype = (
+            torch.bool
+            if "mask" in key or "eligible" in key
+            else torch.int64
+            if key == "session_month_ids"
+            else torch.float32
+        )
+        value = torch.full((rows,), index + 1, dtype=torch.float32)
+        local[key] = value.to(dtype=dtype)
+        remote[key] = (value + 100).to(dtype=dtype)
+    local["symbol_indices"] = torch.arange(symbols)
+    global_metadata = {
+        key: torch.cat((value, remote[key]), dim=0)
+        for key, value in local.items()
+        if key != "symbol_indices"
+    }
+    global_metadata["symbol_indices"] = local["symbol_indices"]
+
+    monkeypatch.setattr(trainer_module, "_distributed_world_size", lambda: 2)
+    monkeypatch.setattr(
+        trainer_module,
+        "_all_gather_autograd",
+        lambda value: torch.cat((value, value + 10), dim=0),
+    )
+    gathered_by_identity = {
+        id(value): torch.cat((value, remote[key]), dim=0)
+        for key, value in local.items()
+        if key != "symbol_indices"
+    }
+    no_grad_calls = {"count": 0}
+
+    def gather_no_grad(value: torch.Tensor) -> torch.Tensor:
+        no_grad_calls["count"] += 1
+        return gathered_by_identity[id(value)]
+
+    monkeypatch.setattr(trainer_module, "_all_gather_no_grad", gather_no_grad)
+    oracle = trainer_module._route_ddp_batch_replicated(
+        local_weights,
+        local,
+        include_volume_notional=True,
+        include_short_capacity_notional=False,
+    )
+    assert no_grad_calls["count"] > 0
+    no_grad_calls["count"] = 0
+    optimized = trainer_module._route_ddp_batch_replicated(
+        local_weights,
+        local,
+        include_volume_notional=True,
+        include_short_capacity_notional=False,
+        global_metadata=global_metadata,
+    )
+    assert no_grad_calls["count"] == 0
+    assert oracle.keys() == optimized.keys()
+    for key in oracle:
+        if oracle[key] is None:
+            assert optimized[key] is None
+        else:
+            torch.testing.assert_close(optimized[key], oracle[key])
+
+
 def test_portfolio_autoencoder_aux_contract_fails_without_latent() -> None:
     with pytest.raises(RuntimeError, match="latent_z"):
         _require_training_aux_outputs(
@@ -3843,6 +3977,41 @@ def test_ddp_batch_size_contract_only_rounds_automatic_candidates() -> None:
         _normalize_ddp_global_batch_size(31, 2, auto_selected=False)
     with pytest.raises(ValueError, match="at least world_size"):
         _normalize_ddp_global_batch_size(1, 2, auto_selected=True)
+
+
+def test_symbol_sharded_ddp_batch_size_contract_requires_powers_of_two() -> None:
+    assert (
+        _normalize_ddp_global_batch_size(
+            128,
+            2,
+            auto_selected=False,
+            require_power_of_two=True,
+        )
+        == 128
+    )
+    assert (
+        _normalize_ddp_global_batch_size(
+            126,
+            2,
+            auto_selected=True,
+            require_power_of_two=True,
+        )
+        == 64
+    )
+    with pytest.raises(ValueError, match="requires power-of-two"):
+        _normalize_ddp_global_batch_size(
+            96,
+            2,
+            auto_selected=False,
+            require_power_of_two=True,
+        )
+    with pytest.raises(ValueError, match="non-power-of-two world_size"):
+        _normalize_ddp_global_batch_size(
+            128,
+            3,
+            auto_selected=False,
+            require_power_of_two=True,
+        )
 
 
 def test_distributed_compile_and_auto_batch_consensus_observe_remote_minimum(monkeypatch) -> None:

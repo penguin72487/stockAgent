@@ -28,11 +28,16 @@ from __future__ import annotations
 
 import math
 import os
+import warnings
 from dataclasses import dataclass
 from typing import Callable
 
 import torch
 
+from stockagent.backtest.distributed_reduction import (
+    global_symbol_any,
+    global_symbol_scalar_pack,
+)
 from stockagent.backtest.tw_commission_rebate import (
     apply_commission_rebate_at_close,
     mask_commission_rebate_state,
@@ -55,6 +60,21 @@ _TW_CASH_COMPILE_STATS: dict[str, int] = {
     "tw_cash_compiled_chunk_calls": 0,
     "tw_day_trade_compiled_chunk_calls": 0,
 }
+
+
+def _call_compiled_with_internal_warning_guard(
+    compiled: Callable[..., tuple[torch.Tensor, ...]],
+    *args: torch.Tensor,
+) -> tuple[torch.Tensor, ...]:
+    """Ignore only PyTorch's fake-tensor non-leaf ``.grad`` probe warning."""
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=r"The \.grad attribute of a Tensor that is not a leaf Tensor.*",
+            category=UserWarning,
+        )
+        return compiled(*args)
 
 
 def _settlement_gradient_horizon_rows() -> int:
@@ -127,8 +147,10 @@ def _validate_normalized_state_eager(
     alive: torch.Tensor,
     short_sale_collateral: torch.Tensor | None = None,
     short_margin_collateral: torch.Tensor | None = None,
+    long_margin_debt: torch.Tensor | None = None,
     commission_rebate_current: torch.Tensor | None = None,
     commission_rebate_due: torch.Tensor | None = None,
+    symbol_sharded: bool = False,
 ) -> None:
     """Reject external recurrent state that violates capital conservation.
 
@@ -159,6 +181,11 @@ def _validate_normalized_state_eager(
         if short_margin_collateral is None
         else short_margin_collateral.detach().to(dtype=torch.float64).sum()
     )
+    long_margin_debt64 = (
+        torch.zeros((), device=risky.device, dtype=torch.float64)
+        if long_margin_debt is None
+        else long_margin_debt.detach().to(dtype=torch.float64).sum()
+    )
     rebate_current64 = (
         torch.zeros((), device=risky.device, dtype=torch.float64)
         if commission_rebate_current is None
@@ -170,11 +197,34 @@ def _validate_normalized_state_eager(
         else commission_rebate_due.detach().to(dtype=torch.float64)
     )
     alive_value = bool(alive.detach().item())
+    (
+        risky_total,
+        short_sale_total,
+        short_margin_total,
+        long_margin_debt_total,
+        risky_magnitude,
+        short_sale_magnitude,
+        short_margin_magnitude,
+        long_margin_debt_magnitude,
+    ) = global_symbol_scalar_pack(
+        (
+            risky64.sum(),
+            short_sale64,
+            short_margin64,
+            long_margin_debt64,
+            risky64.abs().sum(),
+            short_sale64.abs(),
+            short_margin64.abs(),
+            long_margin_debt64.abs(),
+        ),
+        symbol_sharded=symbol_sharded,
+    )
     ledger = (
         cash64
-        + risky64.sum()
-        + short_sale64
-        + short_margin64
+        + risky_total
+        + short_sale_total
+        + short_margin_total
+        - long_margin_debt_total
         + receivables64.sum()
         + rebate_current64
         + rebate_due64
@@ -182,9 +232,10 @@ def _validate_normalized_state_eager(
     )
     magnitude = (
         cash64.abs()
-        + risky64.abs().sum()
-        + short_sale64.abs()
-        + short_margin64.abs()
+        + risky_magnitude
+        + short_sale_magnitude
+        + short_margin_magnitude
+        + long_margin_debt_magnitude
         + receivables64.abs().sum()
         + rebate_current64.abs()
         + rebate_due64.abs()
@@ -197,11 +248,17 @@ def _validate_normalized_state_eager(
     tolerance = relative_tolerance * max(1.0, float(magnitude.item()))
     if alive_value:
         if abs(float(ledger.item()) - 1.0) > tolerance:
+            ledger_value = float(ledger.item())
             raise ValueError(
                 "initial Taiwan settlement state violates the normalized "
                 "accounting identity: cash + risky + short-sale collateral + "
                 "short-margin collateral + receivables + pending commission "
-                "rebates - payables must equal 1"
+                "rebates - payables - long-margin debt must equal 1 "
+                f"(ledger={ledger_value:.9g}, "
+                f"difference={ledger_value - 1.0:.9g}, "
+                f"magnitude={float(magnitude.item()):.9g}, "
+                f"tolerance={tolerance:.9g}, "
+                f"long_margin_debt={float(long_margin_debt_total.item()):.9g})"
             )
     elif float(magnitude.item()) > tolerance:
         raise ValueError(
@@ -508,10 +565,12 @@ def _prepare_cash_short_state(
     initial_alive: torch.Tensor | None,
     initial_short_sale_collateral: torch.Tensor | None,
     initial_short_margin_collateral: torch.Tensor | None,
+    initial_long_margin_debt: torch.Tensor | None = None,
     commission_rebate_current: torch.Tensor | None,
     commission_rebate_due: torch.Tensor | None,
     state_advance_mask: torch.Tensor | None,
     detach_initial_state: bool,
+    symbol_sharded: bool = False,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -595,6 +654,12 @@ def _prepare_cash_short_state(
         size=symbols,
         detach=detach_initial_state,
     )
+    long_margin_debt = _initial_vector(
+        initial_long_margin_debt,
+        reference=target_weights,
+        size=symbols,
+        detach=detach_initial_state,
+    )
     alive = _initial_scalar(
         initial_alive,
         reference=target_weights,
@@ -612,7 +677,10 @@ def _prepare_cash_short_state(
         # FP32 maintenance buffer while keeping float64 callers strict.
         short_position_tolerance = _state_materiality_tolerance(risky.dtype)
         raw_short_positions = risky < 0.0
-        total_short_notional = (-risky).clamp_min(0.0).sum()
+        total_short_notional = global_symbol_scalar_pack(
+            ((-risky).clamp_min(0.0).sum(),),
+            symbol_sharded=symbol_sharded,
+        )[0]
         complete_collateral = (short_sale > 1.0e-12) & (short_margin > 1.0e-12)
         supplied_collateral = (short_sale > 1.0e-12) | (short_margin > 1.0e-12)
         uncollateralized_short_notional = torch.where(
@@ -620,7 +688,10 @@ def _prepare_cash_short_state(
             (-risky).clamp_min(0.0),
             torch.zeros_like(risky),
         )
-        total_uncollateralized_short = uncollateralized_short_notional.sum()
+        total_uncollateralized_short = global_symbol_scalar_pack(
+            (uncollateralized_short_notional.sum(),),
+            symbol_sharded=symbol_sharded,
+        )[0]
         if bool((total_uncollateralized_short > short_position_tolerance).item()):
             invalid_carried_shorts = uncollateralized_short_notional > 0.0
             invalid_count = int(invalid_carried_shorts.sum().item())
@@ -635,7 +706,15 @@ def _prepare_cash_short_state(
                 f"total_invalid_short={total_invalid_short:.9g}, "
                 f"materiality_tolerance={short_position_tolerance:.9g})"
             )
-        if bool((~raw_short_positions.any() & supplied_collateral.any()).item()):
+        any_raw_short = global_symbol_any(
+            raw_short_positions,
+            symbol_sharded=symbol_sharded,
+        )
+        any_supplied_collateral = global_symbol_any(
+            supplied_collateral,
+            symbol_sharded=symbol_sharded,
+        )
+        if bool((~any_raw_short & any_supplied_collateral).item()):
             max_short_sale = float(short_sale.amax().item())
             total_short_sale = float(short_sale.sum().item())
             max_short_margin = float(short_margin.amax().item())
@@ -651,11 +730,26 @@ def _prepare_cash_short_state(
             )
 
     if initial_cash is None:
+        (
+            risky_total,
+            short_sale_total,
+            short_margin_total,
+            long_margin_debt_total,
+        ) = global_symbol_scalar_pack(
+            (
+                risky.sum(),
+                short_sale.sum(),
+                short_margin.sum(),
+                long_margin_debt.sum(),
+            ),
+            symbol_sharded=symbol_sharded,
+        )
         cash = (
             1.0
-            - risky.sum()
-            - short_sale.sum()
-            - short_margin.sum()
+            - risky_total
+            - short_sale_total
+            - short_margin_total
+            + long_margin_debt_total
             - receivables.sum()
             - (
                 torch.zeros_like(risky.sum())
@@ -687,8 +781,10 @@ def _prepare_cash_short_state(
         alive=alive,
         short_sale_collateral=short_sale,
         short_margin_collateral=short_margin,
+        long_margin_debt=long_margin_debt,
         commission_rebate_current=commission_rebate_current,
         commission_rebate_due=commission_rebate_due,
+        symbol_sharded=symbol_sharded,
     )
 
     if state_advance_mask is None:
@@ -3039,7 +3135,8 @@ def run_tw_cash_continuous(
                 min_symbols=min_symbols,
                 max_symbols=max_symbols,
             )
-            values = compiled_chunk(
+            values = _call_compiled_with_internal_warning_guard(
+                compiled_chunk,
                 *chunk_tensors_2d[:12],
                 buy_fees,
                 sell_fees,
@@ -4244,7 +4341,8 @@ def run_tw_day_trade_continuous(
                 min_symbols=min_symbols,
                 max_symbols=max_symbols,
             )
-            values = compiled_chunk(
+            values = _call_compiled_with_internal_warning_guard(
+                compiled_chunk,
                 *chunk_tensors_2d[:9],
                 buy_fees,
                 sell_fees,

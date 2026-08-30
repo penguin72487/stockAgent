@@ -51,6 +51,20 @@ def test_parse_batch_sizes_requires_power_of_two_globally_and_per_rank() -> None
         benchmark._parse_batch_sizes("64", world_size=3)
 
 
+def test_parse_batch_sizes_can_search_between_power_of_two_frontiers() -> None:
+    assert benchmark._parse_batch_sizes(
+        "192,160,160",
+        world_size=2,
+        require_power_of_two=False,
+    ) == [160, 192]
+    with pytest.raises(ValueError, match="positive"):
+        benchmark._parse_batch_sizes(
+            "0",
+            world_size=2,
+            require_power_of_two=False,
+        )
+
+
 def test_source_contract_fails_closed_on_another_executor() -> None:
     config = {
         "trading": {"execution_mode": "tw_day_trade", "frequency": "daily"},

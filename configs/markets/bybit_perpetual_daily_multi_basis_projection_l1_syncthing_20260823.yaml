@@ -1,0 +1,19 @@
+# Exact immutable data release:
+# bybit-20260823T231136167753198Z-l0-penguin-11bd8ef89f0f3e9d
+#
+# data_bybit_daily_training_20260823 contains only symlinks to the immutable
+# daily Parquet files, leaving panel_cache_v2 as writable node-local state.
+# data_bybit_daily_synced points to the verified release for read-only side
+# inputs. Downloaders must continue writing to their catalog-owned producer
+# workspaces and must never target either path.
+base_config: bybit_perpetual_daily_multi_basis_projection_l1.yaml
+
+experiment_name: bybit-perpetual-daily-multi-basis-projection-l1-syncthing-20260823
+
+runner:
+  output_dir: artifacts/markets/bybit_perpetual_daily_multi_basis_projection_l1_syncthing_20260823
+  resume: true
+
+data:
+  parquet_root: data_bybit_daily_training_20260823
+  external_feature_path: data_bybit_daily_synced/public_features/bybit_crypto_public_daily.parquet

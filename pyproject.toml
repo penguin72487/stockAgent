@@ -9,6 +9,10 @@ filterwarnings = [
   "error",
   "ignore:Inheritance class ClientSession from ClientSession is discouraged:DeprecationWarning:openbb_core\\.provider\\.utils\\.client",
   "ignore:Using `@model_validator` with mode='after' on a classmethod is deprecated.*:DeprecationWarning:openbb_core\\.app\\.model\\.system_settings",
+  # PyTorch 2.x still imports an internal MKLDNN ScriptModule while resetting
+  # Dynamo, even for CUDA-only tests. This exact upstream deprecation is not a
+  # stockAgent execution warning and occurs before our compiled runner starts.
+  "ignore:`torch\\.jit\\.script_method` is deprecated\\. Please switch to `torch\\.compile` or `torch\\.export`\\.:DeprecationWarning:torch\\.jit\\._script",
 ]
 
 [tool.ruff]

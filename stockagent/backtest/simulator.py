@@ -13,6 +13,7 @@ from typing import Callable
 import numpy as np
 import torch
 
+from stockagent.backtest.distributed_reduction import global_symbol_tensor_sum
 from stockagent.backtest.crypto_perpetual import run_crypto_perpetual_torch
 from stockagent.backtest.tw_continuous import (
     run_tw_cash_continuous,
@@ -20,9 +21,6 @@ from stockagent.backtest.tw_continuous import (
 )
 from stockagent.backtest.tw_day_trade_minute import (
     run_tw_day_trade_minute_execution,
-)
-from stockagent.backtest.tw_day_trade_daily import (
-    run_tw_day_trade_daily_execution,
 )
 from stockagent.backtest.tw_commission_rebate import (
     commission_rebate_calendar,
@@ -113,10 +111,15 @@ SCAN_CHUNK_CANDIDATES = (64, 128, 256, 512)
 # v19 removes portfolio-level long/short fill balancing.  After each symbol is
 # independently constrained by permissions, capacity, turnover, and whole lots,
 # its remaining executable quantity is retained without cross-symbol reduction.
+# v20 makes unlimited day-trade conversion stateful and causal: a blocked close
+# leaves signed recurrent inventory, the next OPEN trades only the target delta
+# after the overnight mark, and unclosed long purchases create an explicit
+# broker-financed principal liability rather than a fictitious all-cash T+2
+# payable. Close masks and same-day full volume remain executor-only outcomes.
 # v11 added the former direction-balancing behavior.  v10 separated gross
 # commission collection from the economically earned
 # broker rebate and added recurrent pending-rebate state.
-CANONICAL_BACKTEST_CONTRACT_VERSION = 20
+CANONICAL_BACKTEST_CONTRACT_VERSION = 21
 
 _SCAN_CHUNK_CACHE: dict[tuple, int] = {}
 _SCAN_COMPILED_CACHE: dict[
@@ -466,6 +469,7 @@ def _normalize_target_weights_torch(
     long_only: bool,
     gross_budget: float,
     portfolio_activation: str | None = None,
+    symbol_sharded: bool = False,
 ) -> torch.Tensor:
     """Torch normalization via bounded activation + L1 and gross budget scaling."""
     activation_name = normalize_portfolio_activation(portfolio_activation)
@@ -478,19 +482,27 @@ def _normalize_target_weights_torch(
             device=out.device,
             dtype=out.dtype,
         )
-        l1 = out.abs().sum(dim=1, keepdim=True)
+        l1 = global_symbol_tensor_sum(
+            out.abs().sum(dim=1, keepdim=True),
+            symbol_sharded=symbol_sharded,
+        )
         scale = torch.where(
             l1 > leverage,
             leverage / l1.clamp_min(PORTFOLIO_L1_EPS),
             torch.ones_like(l1),
         )
         return out * scale
-    normalized = masked_activation_l1_weights(
-        weights,
-        None,
-        long_only=long_only,
-        activation=activation_name,
-        eps=PORTFOLIO_L1_EPS,
+    out = apply_portfolio_activation(weights, activation_name)
+    if long_only:
+        out = out.clamp_min(0.0)
+    l1 = global_symbol_tensor_sum(
+        out.abs().sum(dim=1, keepdim=True),
+        symbol_sharded=symbol_sharded,
+    )
+    normalized = torch.where(
+        l1 > 0.0,
+        out / l1.clamp_min(PORTFOLIO_L1_EPS),
+        torch.zeros_like(out),
     )
     leverage = torch.as_tensor(
         gross_budget,
@@ -537,14 +549,23 @@ def _apply_min_trade_weight_row_numpy(
 
 
 def _apply_min_trade_weight_torch(
-    weights: torch.Tensor, min_trade_weight: float
+    weights: torch.Tensor,
+    min_trade_weight: float,
+    *,
+    symbol_sharded: bool = False,
 ) -> torch.Tensor:
     threshold = float(min_trade_weight)
     if threshold <= 0.0:
         return weights
-    gross_before = weights.abs().sum(dim=1, keepdim=True)
+    gross_before = global_symbol_tensor_sum(
+        weights.abs().sum(dim=1, keepdim=True),
+        symbol_sharded=symbol_sharded,
+    )
     out = torch.where(weights.abs() >= threshold, weights, torch.zeros_like(weights))
-    gross_after = out.abs().sum(dim=1, keepdim=True)
+    gross_after = global_symbol_tensor_sum(
+        out.abs().sum(dim=1, keepdim=True),
+        symbol_sharded=symbol_sharded,
+    )
     scale = torch.where(
         gross_after > 1e-12,
         gross_before / gross_after.clamp_min(1e-12),
@@ -1332,6 +1353,8 @@ class BacktestResult:
     short_margin_collateral_history: np.ndarray | None = None
     final_short_sale_collateral: np.ndarray | None = None
     final_short_margin_collateral: np.ndarray | None = None
+    long_margin_debt_history: np.ndarray | None = None
+    final_long_margin_debt: np.ndarray | None = None
     final_alive: np.ndarray | None = None
     final_weights: np.ndarray | None = None
     shares_history: np.ndarray | None = None
@@ -1374,6 +1397,7 @@ class BacktestResultTensor:
     payables_history: torch.Tensor | None = None
     receivables_history: torch.Tensor | None = None
     settlement_default: torch.Tensor | None = None
+    default_reason_history: torch.Tensor | None = None
     equity_scale_history: torch.Tensor | None = None
     final_cash: torch.Tensor | None = None
     final_payables: torch.Tensor | None = None
@@ -1390,6 +1414,8 @@ class BacktestResultTensor:
     short_margin_collateral_history: torch.Tensor | None = None
     final_short_sale_collateral: torch.Tensor | None = None
     final_short_margin_collateral: torch.Tensor | None = None
+    long_margin_debt_history: torch.Tensor | None = None
+    final_long_margin_debt: torch.Tensor | None = None
     requested_weights_history: torch.Tensor | None = None
     # Dual-session audit fields.  Event axes are ordered [OPEN, CLOSE].
     open_weights_history: torch.Tensor | None = None
@@ -1491,6 +1517,12 @@ class BacktestResultTensor:
             ),
             final_short_margin_collateral=optional_float32(
                 self.final_short_margin_collateral
+            ),
+            long_margin_debt_history=optional_float32(
+                self.long_margin_debt_history
+            ),
+            final_long_margin_debt=optional_float32(
+                self.final_long_margin_debt
             ),
             final_alive=optional_bool(self.final_alive),
         )
@@ -2108,6 +2140,7 @@ def _prepare_runner_factory(
     min_trade_weight: float,
     portfolio_activation: str,
     side_masks_require_tradable: bool,
+    symbol_sharded: bool = False,
 ):
     activation_name = normalize_portfolio_activation(portfolio_activation)
 
@@ -2144,8 +2177,13 @@ def _prepare_runner_factory(
             long_only=long_only,
             gross_budget=gross_budget,
             portfolio_activation=activation_name,
+            symbol_sharded=symbol_sharded,
         )
-        target_weights = _apply_min_trade_weight_torch(target_weights, min_trade_weight)
+        target_weights = _apply_min_trade_weight_torch(
+            target_weights,
+            min_trade_weight,
+            symbol_sharded=symbol_sharded,
+        )
         return target_weights, tradable, buy_mask, sell_mask
 
     return _runner
@@ -2161,6 +2199,7 @@ def _prepare_compile_key(
     min_trade_weight: float,
     portfolio_activation: str,
     side_masks_require_tradable: bool,
+    symbol_sharded: bool = False,
 ) -> tuple:
     return (
         str(weights.device),
@@ -2175,6 +2214,7 @@ def _prepare_compile_key(
         float(min_trade_weight),
         normalize_portfolio_activation(portfolio_activation),
         bool(side_masks_require_tradable),
+        bool(symbol_sharded),
         bool(_compile_dynamic_enabled()),
     )
 
@@ -2190,6 +2230,7 @@ def _resolve_prepare_runner(
     min_trade_weight: float,
     portfolio_activation: str,
     side_masks_require_tradable: bool,
+    symbol_sharded: bool = False,
 ):
     base_runner = _prepare_runner_factory(
         long_only=long_only,
@@ -2197,6 +2238,7 @@ def _resolve_prepare_runner(
         min_trade_weight=min_trade_weight,
         portfolio_activation=portfolio_activation,
         side_masks_require_tradable=side_masks_require_tradable,
+        symbol_sharded=symbol_sharded,
     )
     # When an outer torch.compile is tracing risk_aware_loss, do not create a
     # nested compiled prepare runner and do not mutate compile stats. Stats dict
@@ -2223,6 +2265,7 @@ def _resolve_prepare_runner(
         min_trade_weight,
         portfolio_activation,
         side_masks_require_tradable,
+        symbol_sharded,
     )
     if key in _PREP_COMPILE_FAILED:
         if _strict_no_fallback_enabled():
@@ -2281,6 +2324,7 @@ def _prepare_scan_inputs(
     min_trade_weight: float,
     portfolio_activation: str = DEFAULT_PORTFOLIO_ACTIVATION,
     side_masks_require_tradable: bool = True,
+    symbol_sharded: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     # Model forward stays under BF16/FP16 AMP, but portfolio state, fee-adjusted
     # returns, turnover, and finance reductions are numerically sensitive. Keep
@@ -2303,6 +2347,7 @@ def _prepare_scan_inputs(
         min_trade_weight=min_trade_weight,
         portfolio_activation=portfolio_activation,
         side_masks_require_tradable=side_masks_require_tradable,
+        symbol_sharded=symbol_sharded,
     )
     try:
         return runner(weights, tradable_mask, buy_input, sell_input)
@@ -2324,6 +2369,7 @@ def _prepare_scan_inputs(
             min_trade_weight,
             portfolio_activation,
             side_masks_require_tradable,
+            symbol_sharded,
         )
         _PREP_COMPILE_FAILED.add(key)
         _PREP_COMPILED_CACHE.pop(key, None)
@@ -2346,6 +2392,7 @@ def _prepare_scan_inputs(
             min_trade_weight=min_trade_weight,
             portfolio_activation=portfolio_activation,
             side_masks_require_tradable=side_masks_require_tradable,
+            symbol_sharded=symbol_sharded,
         )
         return eager_runner(weights, tradable_mask, buy_input, sell_input)
 
@@ -2359,6 +2406,7 @@ def _prepare_tw_phase_actions(
     gross_leverage: float,
     min_trade_weight: float,
     portfolio_activation: str,
+    symbol_sharded: bool = False,
 ) -> torch.Tensor:
     """Resolve raw phase logits/requests into the canonical action ABI.
 
@@ -2405,8 +2453,13 @@ def _prepare_tw_phase_actions(
             long_only=long_only,
             gross_budget=gross_budget,
             portfolio_activation=portfolio_activation,
+            symbol_sharded=symbol_sharded,
         )
-        flat = _apply_min_trade_weight_torch(flat, min_trade_weight)
+        flat = _apply_min_trade_weight_torch(
+            flat,
+            min_trade_weight,
+            symbol_sharded=symbol_sharded,
+        )
         return flat.reshape(int(rows), int(phases), int(symbols)).masked_fill(
             ~signal_mask[:, None, :],
             0.0,
@@ -2453,10 +2506,12 @@ def _prepare_tw_phase_actions(
         long_only=long_only,
         gross_budget=gross_budget,
         portfolio_activation=portfolio_activation,
+        symbol_sharded=symbol_sharded,
     )
     flat_entries = _apply_min_trade_weight_torch(
         flat_entries,
         min_trade_weight,
+        symbol_sharded=symbol_sharded,
     )
     entries = flat_entries.reshape(int(rows), 2, int(symbols)).masked_fill(
         ~signal_mask[:, None, :],
@@ -2897,6 +2952,7 @@ def run_backtest(
     initial_equity_scale: np.ndarray | float | None = None,
     initial_short_sale_collateral: np.ndarray | None = None,
     initial_short_margin_collateral: np.ndarray | None = None,
+    initial_long_margin_debt: np.ndarray | None = None,
     overnight_returns: np.ndarray | None = None,
     can_short_open_open_mask: np.ndarray | None = None,
 ) -> BacktestResult:
@@ -2968,6 +3024,7 @@ def run_backtest(
             initial_equity_scale=tensor(initial_equity_scale),
             initial_short_sale_collateral=tensor(initial_short_sale_collateral),
             initial_short_margin_collateral=tensor(initial_short_margin_collateral),
+            initial_long_margin_debt=tensor(initial_long_margin_debt),
             symbol_indices=tensor(symbol_indices),
         )
         return result.to_numpy()
@@ -3059,9 +3116,11 @@ def run_backtest_torch(
     initial_equity_scale: torch.Tensor | None = None,
     initial_short_sale_collateral: torch.Tensor | None = None,
     initial_short_margin_collateral: torch.Tensor | None = None,
+    initial_long_margin_debt: torch.Tensor | None = None,
     overnight_returns: torch.Tensor | None = None,
     can_short_open_open_mask: torch.Tensor | None = None,
     day_trade_execution_initial_capital: float = 1_000_000.0,
+    symbol_sharded_ledger: bool = False,
 ) -> BacktestResultTensor:
     """Simulate daily portfolio execution from model weights in torch."""
     mode = normalize_execution_mode(execution_mode)
@@ -3554,6 +3613,7 @@ def run_backtest_torch(
                 gross_leverage=gross_leverage,
                 min_trade_weight=min_trade_weight,
                 portfolio_activation=portfolio_activation,
+                symbol_sharded=symbol_sharded_ledger,
             )
             device = prepped_weights.device
             daily_tradable = tradable_mask.to(device=device, dtype=torch.bool)
@@ -3633,6 +3693,7 @@ def run_backtest_torch(
             phase_runner_extra: dict[str, bool] = {}
             if compile_phase_ledger:
                 phase_runner_extra["strict_compile"] = _strict_no_fallback_enabled()
+            phase_runner_extra["_symbol_sharded"] = symbol_sharded_ledger
             tw_result = phase_runner(
                 prepped_weights,
                 overnight_returns.to(
@@ -3702,6 +3763,7 @@ def run_backtest_torch(
                     min_trade_weight,
                     portfolio_activation,
                     side_masks_require_tradable=(mode != "tw_cash"),
+                    symbol_sharded=symbol_sharded_ledger,
                 )
             )
         prepped_volume = (
@@ -3807,6 +3869,13 @@ def run_backtest_torch(
                     & prepped_sell_open
                 )
             if overnight_returns is not None and overnight_returns.dim() == 3:
+                if day_trade_unlimited_margin_conversion:
+                    raise ValueError(
+                        "stateful carry tw_day_trade cannot use the legacy "
+                        "minute tape executor because it discards per-symbol "
+                        "residual holdings; use the causal daily OPEN/CLOSE "
+                        "ledger until a stateful minute ledger is available"
+                    )
                 if normal_sell_fee_rates is None:
                     raise ValueError(
                         "exact-minute tw_day_trade requires explicit normal "
@@ -3905,8 +3974,8 @@ def run_backtest_torch(
             if day_trade_unlimited_margin_conversion:
                 if normal_sell_fee_rates is None:
                     raise ValueError(
-                        "daily T+2-close tw_day_trade requires normal sell "
-                        "fee rates for residual margin conversion"
+                        "stateful carry tw_day_trade requires normal sell fee "
+                        "rates for residual position accounting"
                     )
                 active_normal_sell_fees = normal_sell_fee_rates
                 if symbol_indices is not None:
@@ -3922,7 +3991,176 @@ def run_backtest_torch(
                         "normal_sell_fee_rates length differs from the active "
                         "symbol dimension; symbol_indices is required"
                     )
-                daily_result = run_tw_day_trade_daily_execution(
+                if overnight_returns is None or overnight_returns.dim() != 2:
+                    raise ValueError(
+                        "stateful carry tw_day_trade requires causal "
+                        "prior-close-to-open returns [T,S]; the legacy minute "
+                        "residual-conversion tape cannot represent recurrent holdings"
+                    )
+                if short_margin_rate is None or short_capacity_weights is None:
+                    raise ValueError(
+                        "long/short stateful carry tw_day_trade requires explicit "
+                        "margin rates and an infinity-valued disabled-capacity tensor"
+                    )
+                if unresolved_corporate_action_mask is None:
+                    raise ValueError(
+                        "stateful carry tw_day_trade requires a receipt-verified "
+                        "corporate-action avoidance mask"
+                    )
+
+                # OPEN is the learned post-event target. CLOSE always requests
+                # zero. A blocked close leg therefore remains in the recurrent
+                # ledger; after the next overnight mark the following OPEN
+                # transition executes only target[t] - holdings[t-1].
+                carry_actions = torch.stack(
+                    (prepped_weights, torch.zeros_like(prepped_weights)),
+                    dim=1,
+                )
+                phase_tradable = prepped_tradable[:, None, :].expand(-1, 2, -1)
+                phase_buy = torch.stack((prepped_buy_open, prepped_buy), dim=1)
+                phase_sell = torch.stack((prepped_sell_open, prepped_sell), dim=1)
+                open_short = (
+                    prepped_short_open
+                    if can_short_open_open_mask is None
+                    else can_short_open_open_mask.to(
+                        device=prepped_weights.device,
+                        dtype=torch.bool,
+                    )
+                    & prepped_sell_open
+                )
+                phase_short_open = torch.stack(
+                    (open_short, torch.zeros_like(open_short)),
+                    dim=1,
+                )
+                repeated_corporate_action = (
+                    unresolved_corporate_action_mask.to(
+                        device=prepped_weights.device,
+                        dtype=torch.bool,
+                    )[:, None, :].expand(-1, 2, -1)
+                )
+                phase_force_exit = None
+                if force_exit_mask is not None:
+                    close_force_exit = force_exit_mask.to(
+                        device=prepped_weights.device,
+                        dtype=torch.bool,
+                    )
+                    phase_force_exit = torch.stack(
+                        (torch.zeros_like(close_force_exit), close_force_exit),
+                        dim=1,
+                    )
+                phase_force_cover = None
+                if force_short_cover_mask is not None:
+                    force_cover = force_short_cover_mask.to(
+                        device=prepped_weights.device,
+                        dtype=torch.bool,
+                    )
+                    phase_force_cover = force_cover[:, None, :].expand(-1, 2, -1)
+                phase_margin_rate: torch.Tensor | float = short_margin_rate
+                if (
+                    isinstance(short_margin_rate, torch.Tensor)
+                    and short_margin_rate.dim() == 2
+                ):
+                    phase_margin_rate = short_margin_rate.to(
+                        device=prepped_weights.device,
+                        dtype=torch.float32,
+                    )[:, None, :].expand(-1, 2, -1)
+                compile_carry_ledger = bool(
+                    prepped_weights.device.type == "cuda"
+                    and _compile_stateful_enabled()
+                    and _compile_enabled()
+                )
+                carry_runner = (
+                    run_tw_cash_dual_session_compiled
+                    if compile_carry_ledger
+                    else run_tw_cash_dual_session
+                )
+                carry_extra: dict[str, bool] = {}
+                if compile_carry_ledger:
+                    carry_extra["strict_compile"] = _strict_no_fallback_enabled()
+                carry_extra["_symbol_sharded"] = symbol_sharded_ledger
+                tw_result = carry_runner(
+                    carry_actions,
+                    overnight_returns.to(
+                        device=prepped_weights.device,
+                        dtype=torch.float32,
+                    ),
+                    future_returns.to(
+                        device=prepped_weights.device,
+                        dtype=torch.float32,
+                    ),
+                    phase_tradable,
+                    phase_buy,
+                    phase_sell,
+                    buy_fee_rates,
+                    sell_fee_rates,
+                    commission_rebate_rates=commission_rebate_rates,
+                    commission_rebate_timing=commission_rebate_timing,
+                    session_month_ids=session_month_ids,
+                    commission_rebate_payment_eligible_mask=(
+                        commission_rebate_payment_eligible_mask
+                    ),
+                    can_short_open_mask=phase_short_open,
+                    force_short_cover_mask=phase_force_cover,
+                    short_margin_rate=phase_margin_rate,
+                    short_capacity_weights=short_capacity_weights,
+                    short_handling_fee_rate=0.0,
+                    day_trade_carry_normal_sell_fee_rates=(
+                        active_normal_sell_fees
+                    ),
+                    day_trade_margin_financing_ratio=(
+                        day_trade_margin_financing_ratio
+                    ),
+                    day_trade_margin_financing_annual_rate=(
+                        day_trade_margin_financing_annual_rate
+                    ),
+                    day_trade_margin_short_handling_fee_rate=(
+                        day_trade_margin_short_handling_fee_rate
+                    ),
+                    day_trade_margin_short_annual_borrow_rate=(
+                        day_trade_margin_short_annual_borrow_rate
+                    ),
+                    short_maintenance_ratio=short_maintenance_ratio,
+                    unresolved_corporate_action_mask=(
+                        repeated_corporate_action
+                    ),
+                    cash_dividend_yield=cash_dividend_yield,
+                    cash_dividend_payment_delay_sessions=(
+                        cash_dividend_payment_delay_sessions
+                    ),
+                    claim_queue_sessions=claim_queue_sessions,
+                    force_exit_mask=phase_force_exit,
+                    settlement_lag_sessions=settlement_lag_sessions,
+                    gross_budget=_resolve_exposure_budget(gross_leverage),
+                    max_turnover_ratio=max_turnover_ratio,
+                    volume_limit_weights=prepped_volume,
+                    state_advance_mask=state_advance_mask,
+                    return_weights_history=return_weights_history,
+                    initial_weights=initial_weights,
+                    initial_cash=initial_cash,
+                    initial_payables=initial_payables,
+                    initial_receivables=initial_receivables,
+                    initial_commission_rebate_current=(
+                        initial_commission_rebate_current
+                    ),
+                    initial_commission_rebate_due=initial_commission_rebate_due,
+                    initial_commission_rebate_month_id=(
+                        initial_commission_rebate_month_id
+                    ),
+                    initial_alive=initial_alive,
+                    initial_equity_scale=initial_equity_scale,
+                    initial_short_sale_collateral=(
+                        initial_short_sale_collateral
+                    ),
+                    initial_short_margin_collateral=(
+                        initial_short_margin_collateral
+                    ),
+                    initial_long_margin_debt=initial_long_margin_debt,
+                    **carry_extra,
+                )
+                # Continue through the shared BacktestResultTensor adapter so
+                # train/eval/chunk state propagation uses the same final state.
+            else:
+                tw_result = run_tw_day_trade_continuous(
                     prepped_weights,
                     future_returns,
                     prepped_tradable,
@@ -3933,123 +4171,32 @@ def run_backtest_torch(
                         device=prepped_weights.device,
                         dtype=torch.bool,
                     ),
-                    prepped_buy_open,
-                    prepped_sell_open,
                     buy_fee_rates,
                     sell_fee_rates,
-                    active_normal_sell_fees,
-                    commission_rebate_rates,
-                    prepped_volume,
-                    max_turnover_ratio=max_turnover_ratio,
-                    margin_financing_ratio=day_trade_margin_financing_ratio,
-                    margin_financing_annual_rate=(
-                        day_trade_margin_financing_annual_rate
+                    commission_rebate_rates=commission_rebate_rates,
+                    commission_rebate_timing=commission_rebate_timing,
+                    session_month_ids=session_month_ids,
+                    commission_rebate_payment_eligible_mask=(
+                        commission_rebate_payment_eligible_mask
                     ),
-                    margin_short_handling_fee_rate=(
-                        day_trade_margin_short_handling_fee_rate
-                    ),
-                    margin_short_annual_borrow_rate=(
-                        day_trade_margin_short_annual_borrow_rate
-                    ),
+                    day_trade_can_buy_open_mask=prepped_buy_open,
+                    day_trade_can_sell_open_mask=prepped_sell_open,
                     settlement_lag_sessions=settlement_lag_sessions,
+                    max_turnover_ratio=max_turnover_ratio,
+                    volume_limit_weights=prepped_volume,
+                    force_short_cover_mask=force_short_cover_mask,
+                    force_exit_mask=force_exit_mask,
                     state_advance_mask=state_advance_mask,
+                    return_weights_history=return_weights_history,
                     initial_cash=initial_cash,
                     initial_payables=initial_payables,
                     initial_receivables=initial_receivables,
+                    initial_commission_rebate_current=(initial_commission_rebate_current),
+                    initial_commission_rebate_due=initial_commission_rebate_due,
+                    initial_commission_rebate_month_id=(initial_commission_rebate_month_id),
+                    initial_alive=initial_alive,
                     initial_equity_scale=initial_equity_scale,
                 )
-                symbols = int(prepped_weights.size(1))
-                rows = int(prepped_weights.size(0))
-                zero_rows = torch.zeros(
-                    rows,
-                    device=daily_result.strategy_returns.device,
-                    dtype=torch.float32,
-                )
-                return BacktestResultTensor(
-                    strategy_returns=daily_result.strategy_returns,
-                    benchmark_returns=benchmark_returns.to(
-                        device=daily_result.strategy_returns.device,
-                        dtype=daily_result.strategy_returns.dtype,
-                    ),
-                    turnovers=daily_result.turnovers,
-                    weights_history=(
-                        daily_result.weights_history
-                        if return_weights_history
-                        else daily_result.weights_history.new_empty((0, symbols))
-                    ),
-                    requested_weights_history=(
-                        weights if return_weights_history else None
-                    ),
-                    final_weights=torch.zeros(
-                        symbols,
-                        device=daily_result.strategy_returns.device,
-                        dtype=torch.float32,
-                    ),
-                    final_alive=daily_result.final_equity_scale > 0.0,
-                    execution_mode=mode,
-                    settlement_ledger_unit="nav_ratio",
-                    cash_history=daily_result.cash_history,
-                    payables_history=daily_result.payables_history,
-                    receivables_history=daily_result.receivables_history,
-                    settlement_default=torch.zeros(
-                        rows,
-                        device=daily_result.strategy_returns.device,
-                        dtype=torch.bool,
-                    ),
-                    equity_scale_history=daily_result.equity_scale_history,
-                    final_cash=daily_result.final_cash,
-                    final_payables=daily_result.final_payables,
-                    final_receivables=daily_result.final_receivables,
-                    commission_rebate_accrued_history=zero_rows,
-                    commission_rebate_paid_history=zero_rows.clone(),
-                    commission_rebate_current_history=zero_rows.clone(),
-                    commission_rebate_due_history=zero_rows.clone(),
-                    final_commission_rebate_current=zero_rows.new_zeros(()),
-                    final_commission_rebate_due=zero_rows.new_zeros(()),
-                    final_commission_rebate_month_id=torch.zeros(
-                        (),
-                        device=daily_result.strategy_returns.device,
-                        dtype=torch.long,
-                    ),
-                    final_equity_scale=daily_result.final_equity_scale,
-                )
-            tw_result = run_tw_day_trade_continuous(
-                prepped_weights,
-                future_returns,
-                prepped_tradable,
-                prepped_buy,
-                prepped_sell,
-                prepped_short_open,
-                day_trade_eligible_mask.to(
-                    device=prepped_weights.device,
-                    dtype=torch.bool,
-                ),
-                buy_fee_rates,
-                sell_fee_rates,
-                commission_rebate_rates=commission_rebate_rates,
-                commission_rebate_timing=commission_rebate_timing,
-                session_month_ids=session_month_ids,
-                commission_rebate_payment_eligible_mask=(
-                    commission_rebate_payment_eligible_mask
-                ),
-                day_trade_can_buy_open_mask=prepped_buy_open,
-                day_trade_can_sell_open_mask=prepped_sell_open,
-                settlement_lag_sessions=settlement_lag_sessions,
-                max_turnover_ratio=max_turnover_ratio,
-                volume_limit_weights=prepped_volume,
-                force_short_cover_mask=force_short_cover_mask,
-                force_exit_mask=force_exit_mask,
-                state_advance_mask=state_advance_mask,
-                return_weights_history=return_weights_history,
-                initial_cash=initial_cash,
-                initial_payables=initial_payables,
-                initial_receivables=initial_receivables,
-                initial_commission_rebate_current=(initial_commission_rebate_current),
-                initial_commission_rebate_due=initial_commission_rebate_due,
-                initial_commission_rebate_month_id=(initial_commission_rebate_month_id),
-                initial_alive=initial_alive,
-                initial_equity_scale=initial_equity_scale,
-            )
         else:
             raise AssertionError(f"unhandled execution mode {mode!r}")
         return BacktestResultTensor(
@@ -4119,6 +4266,11 @@ def run_backtest_torch(
             payables_history=tw_result.payables_history,
             receivables_history=tw_result.receivables_history,
             settlement_default=tw_result.settlement_default,
+            default_reason_history=getattr(
+                tw_result,
+                "default_reason_history",
+                None,
+            ),
             equity_scale_history=tw_result.equity_scale_history,
             final_cash=tw_result.final_cash,
             final_payables=tw_result.final_payables,
@@ -4163,6 +4315,16 @@ def run_backtest_torch(
             short_margin_collateral_history=tw_result.short_margin_collateral_history,
             final_short_sale_collateral=tw_result.final_short_sale_collateral,
             final_short_margin_collateral=tw_result.final_short_margin_collateral,
+            long_margin_debt_history=getattr(
+                tw_result,
+                "long_margin_debt_history",
+                None,
+            ),
+            final_long_margin_debt=getattr(
+                tw_result,
+                "final_long_margin_debt",
+                None,
+            ),
         )
 
     strategy_returns, turnovers, weights_history, final_weights, final_alive = (

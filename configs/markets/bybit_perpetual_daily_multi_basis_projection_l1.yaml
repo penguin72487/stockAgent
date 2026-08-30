@@ -223,7 +223,7 @@ training:
   # Hard product contract: one daily target from the preceding 32 completed
   # daily sessions. Intraday source bars are aggregation inputs only.
   lookback: 32
-  epochs: 10000
+  epochs: 1000
   loss_type: log_utility
   # The recurrent executor compiles one fixed four-day block and reuses it. An
   # outer compiled loss would unroll the whole horizon and repeat codegen.

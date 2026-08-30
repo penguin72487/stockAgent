@@ -871,4 +871,3 @@ README 只保留可重現、跨機器成立的入口。套件全面升級、文�
 sudo apt update && sudo apt full-upgrade -y && sudo apt autoremove -y && sudo snap refresh
 mamba activate fintech
 mamba update --all
-

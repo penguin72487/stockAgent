@@ -112,18 +112,46 @@ Bybit session K 線特徵、7 個 Bybit funding 特徵、21 個 Binance、20 個
 
 ## 重建命令
 
+正式資料至少需保留約 32 日的 panel 前置期，因此從 `2020-02-24` 開始抓取，
+而策略樣本仍由設定的 `panel_start_date: 2020-03-27` 起算。三個交易所的 1m
+資料量很大；先確認資料根位於有足夠空間的 canonical producer workspace，且不要
+寫入 packed store 或 materialized cache。
+
 ```bash
 source scripts/runtime_env.sh
-run_fintech_python downloader/repair_bybit_1m_gaps.py --workers 96
+
+run_fintech_python scripts/check_environment.py --require-cuda --strict
+
+run_fintech_python downloader/download_bybit_perp_1m.py \
+  --output-dir data_bybit/1m --mode full \
+  --start-date 2020-02-24 --end-date today \
+  --categories linear --workers 16
+run_fintech_python downloader/download_okx_perp_1m.py \
+  --output-dir data_okx/1m --mode full \
+  --start-date 2020-02-24 --end-date today \
+  --workers 16 --feature-workers 16
+run_fintech_python downloader/download_binance_perp_1m.py \
+  --output-dir data_binance/1m --mode full \
+  --start-date 2020-02-24 --end-date today \
+  --workers 16 --feature-workers 16
+
 run_fintech_python downloader/download_bybit_funding_history.py \
-  --workers 16 --start-date 2019-01-01
-run_fintech_python downloader/materialize_bybit_perpetual_daily.py --workers 12
+  --output-dir data_bybit/funding --workers 16 --start-date 2019-01-01
+run_fintech_python downloader/repair_bybit_1m_gaps.py --workers 96
+run_fintech_python downloader/materialize_bybit_perpetual_daily.py \
+  --input-dir data_bybit/1m --funding-dir data_bybit/funding \
+  --output-dir data_bybit/perpetual_daily --workers 12
+
 run_fintech_python downloader/download_fred_crypto_macro_vintages.py \
   --start-date 2000-01-01 --end-date today
 run_fintech_python scripts/build_bybit_crypto_public_daily_features.py
+
 run_fintech_python train.py \
   --config configs/markets/bybit_perpetual_daily_multi_basis_projection_l1.yaml
 ```
+
+下載器與 materializer 都會留下 summary/report receipt。任何一步失敗時先修復該步
+並原命令續跑，不要加 `--refresh` 重抓已驗證的歷史資料。
 
 設定保留標準 DDP。若主機實際只看得到一張 CUDA GPU，啟動命令需追加
 `--multi-gpu-strategy none`；不要把單 GPU smoke 的覆寫寫回正式多 GPU設定。

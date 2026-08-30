@@ -7,15 +7,24 @@ exchange-session transition and reuses that fullgraph kernel for every row in
 a fixed 32-row block.  The recurrent state and autograd graph remain connected
 across calls; only a final non-aligned tail runs through the eager oracle.
 
-CUDA graphs are deliberately disabled.  The stateful finance ABI includes
-cash, T+2 queues, signed risky holdings, both restricted short-collateral
-pools, alive state, and absolute equity scale.
+Inductor's per-day kernels deliberately keep their internal CUDA graphs
+disabled.  Training may optionally wrap the complete fixed-shape regional
+replay in one autograd-aware CUDA Graph.  That removes the 32/128 repeated
+Python and kernel-launch gaps without asking Inductor to code-generate a
+pathological fully-unrolled multi-day FX graph.  The regional replay remains
+the semantic oracle and the stateful finance ABI still includes cash, T+2
+queues, signed risky holdings, both restricted short-collateral pools, alive
+state, and absolute equity scale.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, replace
+import gc
+import math
+import os
 from typing import Callable
+import warnings
 
 import torch
 
@@ -30,11 +39,16 @@ from stockagent.backtest.tw_continuous import (
 )
 from stockagent.backtest.tw_dual_session import (
     TaiwanDualSessionResult,
+    _POSITION_TOLERANCE,
     _as_daily_nonnegative,
     _as_phase_mask,
     _as_phase_rate,
     _run_dual_session,
     _validate_actions,
+)
+from stockagent.backtest.distributed_reduction import (
+    symbol_sharded_pack_scalars_enabled,
+    symbol_sharded_skip_noop_collectives_enabled,
 )
 
 
@@ -45,13 +59,28 @@ _COMPILED_DAY_CACHE: dict[
     Callable[..., tuple[torch.Tensor, ...]],
 ] = {}
 _FAILED_COMPILE_KEYS: set[tuple[object, ...]] = set()
+_FAILED_CUDA_GRAPH_KEYS: set[tuple[object, ...]] = set()
 _COMPILE_STATS: dict[str, int] = {
     "compile_constructors": 0,
     "compiled_block_calls": 0,
     "compiled_day_calls": 0,
     "eager_tail_calls": 0,
     "eager_fallback_calls": 0,
+    "cuda_graph_constructors": 0,
+    "cuda_graph_calls": 0,
+    "cuda_graph_fallback_calls": 0,
 }
+
+
+@dataclass(slots=True)
+class _GraphedRunner:
+    callable: Callable[..., tuple[torch.Tensor, ...]]
+    input_names: tuple[str, ...]
+    output_names: tuple[str, ...]
+    mode: str
+
+
+_CUDA_GRAPH_CACHE: dict[tuple[object, ...], _GraphedRunner] = {}
 
 
 @dataclass(slots=True)
@@ -74,6 +103,7 @@ class _PreparedInputs:
     short_margin_rate: torch.Tensor
     short_capacity_weights: torch.Tensor
     short_handling_fee_rate: torch.Tensor
+    day_trade_carry_normal_sell_fee_rates: torch.Tensor
     unresolved_corporate_action_mask: torch.Tensor
     cash_dividend_yield: torch.Tensor
     cash_dividend_payment_delay_sessions: torch.Tensor
@@ -89,6 +119,7 @@ class _PreparedInputs:
     initial_commission_rebate_month_id: torch.Tensor
     initial_short_sale_collateral: torch.Tensor
     initial_short_margin_collateral: torch.Tensor
+    initial_long_margin_debt: torch.Tensor
     initial_alive: torch.Tensor
     initial_equity_scale: torch.Tensor
     settlement_lag_sessions: int
@@ -96,6 +127,10 @@ class _PreparedInputs:
     gross_budget: float
     max_turnover_ratio: float
     short_maintenance_ratio: float
+    day_trade_margin_financing_ratio: float
+    day_trade_margin_financing_annual_rate: float
+    day_trade_margin_short_handling_fee_rate: float
+    day_trade_margin_short_annual_borrow_rate: float
     return_weights_history: bool
     has_short_contract: bool
     has_short_open_mask: bool
@@ -103,6 +138,8 @@ class _PreparedInputs:
     has_short_capacity: bool
     has_volume_limit: bool
     has_cash_dividends: bool
+    has_day_trade_carry: bool
+    symbol_sharded: bool
     requires_state_grad: bool
 
 
@@ -122,6 +159,37 @@ def clear_tw_dual_session_compile_cache() -> None:
 
     _COMPILED_DAY_CACHE.clear()
     _FAILED_COMPILE_KEYS.clear()
+    _CUDA_GRAPH_CACHE.clear()
+    _FAILED_CUDA_GRAPH_KEYS.clear()
+
+
+def _cuda_graph_enabled() -> bool:
+    return os.environ.get(
+        "STOCKAGENT_TW_DUAL_SESSION_CUDA_GRAPH", "0"
+    ).strip().lower() in {"1", "true", "on", "yes"}
+
+
+def _has_effective_short_capacity_limit(
+    short_capacity_weights: torch.Tensor,
+    *,
+    was_explicit: bool,
+) -> bool:
+    """Return whether the compiled kernel must enforce a finite short cap.
+
+    The public execution contract represents a disabled short-capacity ceiling
+    with an explicit positive-infinity tensor.  Once that tensor has passed the
+    normal validation path, applying ``minimum(request, +inf)`` on every symbol
+    and session is an exact no-op.  Specialize that case out of the compiled
+    day kernel while retaining the original tensor for receipts and compile-key
+    reproducibility.  A differentiable capacity input is never specialized
+    away, even if its current values happen to be infinite.
+    """
+
+    if not was_explicit:
+        return False
+    if short_capacity_weights.requires_grad:
+        return True
+    return not bool(torch.isposinf(short_capacity_weights).all().item())
 
 
 def _as_matrix(
@@ -241,6 +309,11 @@ def _prepare_inputs(
     short_margin_rate: torch.Tensor | float | None,
     short_capacity_weights: torch.Tensor | float | None,
     short_handling_fee_rate: torch.Tensor | float,
+    day_trade_carry_normal_sell_fee_rates: torch.Tensor | float | None,
+    day_trade_margin_financing_ratio: float,
+    day_trade_margin_financing_annual_rate: float,
+    day_trade_margin_short_handling_fee_rate: float,
+    day_trade_margin_short_annual_borrow_rate: float,
     short_maintenance_ratio: float,
     unresolved_corporate_action_mask: torch.Tensor | None,
     cash_dividend_yield: torch.Tensor | None,
@@ -264,6 +337,8 @@ def _prepare_inputs(
     initial_equity_scale: torch.Tensor | None,
     initial_short_sale_collateral: torch.Tensor | None,
     initial_short_margin_collateral: torch.Tensor | None,
+    initial_long_margin_debt: torch.Tensor | None,
+    symbol_sharded: bool,
 ) -> _PreparedInputs:
     phases = 2 if mode == "tw_cash" else 3
     action_values = _validate_actions(
@@ -339,6 +414,43 @@ def _prepare_inputs(
         reference=phase_reference,
         name="sell_fee_rates",
     ).contiguous()
+    has_day_trade_carry = day_trade_carry_normal_sell_fee_rates is not None
+    normal_sell_fees = _as_phase_rate(
+        (
+            sell_fee_rates
+            if day_trade_carry_normal_sell_fee_rates is None
+            else day_trade_carry_normal_sell_fee_rates
+        ),
+        reference=phase_reference,
+        name="day_trade_carry_normal_sell_fee_rates",
+    ).contiguous()
+    if has_day_trade_carry and mode != "tw_cash":
+        raise ValueError("day-trade residual carry is supported only by tw_cash")
+    if has_day_trade_carry and bool(
+        (normal_sell_fees < sell_fees).any().item()
+    ):
+        raise ValueError(
+            "normal sell fees must not be below day-trade sell fees"
+        )
+    for name, value in (
+        ("day_trade_margin_financing_ratio", day_trade_margin_financing_ratio),
+        (
+            "day_trade_margin_financing_annual_rate",
+            day_trade_margin_financing_annual_rate,
+        ),
+        (
+            "day_trade_margin_short_handling_fee_rate",
+            day_trade_margin_short_handling_fee_rate,
+        ),
+        (
+            "day_trade_margin_short_annual_borrow_rate",
+            day_trade_margin_short_annual_borrow_rate,
+        ),
+    ):
+        if not math.isfinite(float(value)) or float(value) < 0.0:
+            raise ValueError(f"{name} must be finite and non-negative")
+    if float(day_trade_margin_financing_ratio) > 1.0:
+        raise ValueError("day_trade_margin_financing_ratio must be at most 1")
     rebate_rates = _as_phase_rate(
         commission_rebate_rates,
         reference=phase_reference,
@@ -368,7 +480,7 @@ def _prepare_inputs(
 
     has_short_open_mask = can_short_open_mask is not None
     has_force_short_cover_mask = force_short_cover_mask is not None
-    has_short_capacity = short_capacity_weights is not None
+    has_explicit_short_capacity = short_capacity_weights is not None
     has_explicit_short_handling = (
         bool(short_handling_fee_rate.numel())
         if isinstance(short_handling_fee_rate, torch.Tensor)
@@ -421,6 +533,10 @@ def _prepare_inputs(
         short_cap = torch.zeros_like(daily_reference)
     else:
         short_cap = short_cap.contiguous()
+    has_short_capacity = _has_effective_short_capacity_limit(
+        short_cap,
+        was_explicit=has_explicit_short_capacity,
+    )
     volume_cap = _as_daily_nonnegative(
         volume_limit_weights,
         reference=daily_reference,
@@ -553,11 +669,53 @@ def _prepare_inputs(
         initial_alive=initial_alive,
         initial_short_sale_collateral=initial_short_sale_collateral,
         initial_short_margin_collateral=initial_short_margin_collateral,
+        initial_long_margin_debt=initial_long_margin_debt,
         commission_rebate_current=rebate_current,
         commission_rebate_due=rebate_due,
         state_advance_mask=advance,
         detach_initial_state=True,
+        symbol_sharded=symbol_sharded,
     )
+    if initial_long_margin_debt is None:
+        long_margin_debt = torch.zeros_like(risky)
+    else:
+        if tuple(initial_long_margin_debt.shape) != (symbols,):
+            raise ValueError("initial_long_margin_debt must have shape [S]")
+        long_margin_debt = initial_long_margin_debt.detach().clone(
+            memory_format=torch.contiguous_format
+        ).to(device=action_values.device, dtype=action_values.dtype)
+        if (
+            not bool(torch.isfinite(long_margin_debt).all().item())
+            or bool((long_margin_debt < 0.0).any().item())
+        ):
+            raise ValueError(
+                "initial_long_margin_debt must be finite and non-negative"
+            )
+    orphaned_long_margin_debt = (
+        (long_margin_debt > _POSITION_TOLERANCE)
+        & (risky <= _POSITION_TOLERANCE)
+    )
+    if bool(orphaned_long_margin_debt.any().item()):
+        orphaned_indices = torch.nonzero(
+            orphaned_long_margin_debt,
+            as_tuple=False,
+        ).flatten()
+        sample_indices = orphaned_indices[:8]
+        raise ValueError(
+            "initial_long_margin_debt requires matching positive long inventory; "
+            f"count={int(orphaned_indices.numel())}, "
+            f"indices={sample_indices.detach().cpu().tolist()}, "
+            "debt="
+            f"{long_margin_debt.index_select(0, sample_indices).detach().cpu().tolist()}, "
+            "inventory="
+            f"{risky.index_select(0, sample_indices).detach().cpu().tolist()}"
+        )
+    if not has_day_trade_carry and bool(
+        (long_margin_debt > _POSITION_TOLERANCE).any().item()
+    ):
+        raise ValueError(
+            "initial_long_margin_debt is valid only for day-trade carry"
+        )
     equity_scale = _prepare_equity_scale(
         daily_reference,
         initial_equity_scale=initial_equity_scale,
@@ -570,6 +728,7 @@ def _prepare_inputs(
         intraday,
         buy_fees,
         sell_fees,
+        normal_sell_fees,
         rebate_rates,
         margin_rates,
         short_cap,
@@ -602,6 +761,9 @@ def _prepare_inputs(
         short_margin_collateral = (
             short_margin_collateral.detach().clone().requires_grad_(True)
         )
+        long_margin_debt = (
+            long_margin_debt.detach().clone().requires_grad_(True)
+        )
         equity_scale = equity_scale.detach().clone().requires_grad_(True)
         rebate_current = rebate_current.detach().clone().requires_grad_(True)
         rebate_due = rebate_due.detach().clone().requires_grad_(True)
@@ -616,6 +778,7 @@ def _prepare_inputs(
         can_sell_mask=sell_mask,
         buy_fee_rates=buy_fees,
         sell_fee_rates=sell_fees,
+        day_trade_carry_normal_sell_fee_rates=normal_sell_fees,
         commission_rebate_rates=rebate_rates,
         commission_rebate_timing=rebate_timing,
         session_month_ids=rebate_month_ids,
@@ -640,6 +803,7 @@ def _prepare_inputs(
         initial_commission_rebate_month_id=rebate_month_id,
         initial_short_sale_collateral=short_sale_collateral,
         initial_short_margin_collateral=short_margin_collateral,
+        initial_long_margin_debt=long_margin_debt,
         initial_alive=alive,
         initial_equity_scale=equity_scale,
         settlement_lag_sessions=lag,
@@ -649,6 +813,18 @@ def _prepare_inputs(
         short_maintenance_ratio=_resolve_short_maintenance_ratio(
             short_maintenance_ratio
         ),
+        day_trade_margin_financing_ratio=float(
+            day_trade_margin_financing_ratio
+        ),
+        day_trade_margin_financing_annual_rate=float(
+            day_trade_margin_financing_annual_rate
+        ),
+        day_trade_margin_short_handling_fee_rate=float(
+            day_trade_margin_short_handling_fee_rate
+        ),
+        day_trade_margin_short_annual_borrow_rate=float(
+            day_trade_margin_short_annual_borrow_rate
+        ),
         return_weights_history=bool(return_weights_history),
         has_short_contract=has_short_contract,
         has_short_open_mask=has_short_open_mask,
@@ -656,6 +832,8 @@ def _prepare_inputs(
         has_short_capacity=has_short_capacity,
         has_volume_limit=has_volume_limit,
         has_cash_dividends=has_dividends,
+        has_day_trade_carry=has_day_trade_carry,
+        symbol_sharded=bool(symbol_sharded),
         requires_state_grad=requires_state_grad,
     )
 
@@ -674,6 +852,7 @@ def _compile_key(prepared: _PreparedInputs) -> tuple[object, ...]:
             prepared.intraday_log_returns,
             prepared.buy_fee_rates,
             prepared.sell_fee_rates,
+            prepared.day_trade_carry_normal_sell_fee_rates,
             prepared.commission_rebate_rates,
             prepared.short_margin_rate,
             prepared.short_capacity_weights,
@@ -688,6 +867,7 @@ def _compile_key(prepared: _PreparedInputs) -> tuple[object, ...]:
             prepared.initial_commission_rebate_due,
             prepared.initial_short_sale_collateral,
             prepared.initial_short_margin_collateral,
+            prepared.initial_long_margin_debt,
             prepared.initial_equity_scale,
         )
     )
@@ -710,6 +890,14 @@ def _compile_key(prepared: _PreparedInputs) -> tuple[object, ...]:
         prepared.has_short_capacity,
         prepared.has_volume_limit,
         prepared.has_cash_dividends,
+        prepared.has_day_trade_carry,
+        prepared.symbol_sharded,
+        symbol_sharded_pack_scalars_enabled(),
+        symbol_sharded_skip_noop_collectives_enabled(),
+        prepared.day_trade_margin_financing_ratio,
+        prepared.day_trade_margin_financing_annual_rate,
+        prepared.day_trade_margin_short_handling_fee_rate,
+        prepared.day_trade_margin_short_annual_borrow_rate,
         bool(torch.is_grad_enabled()),
         requires_grad_bitmap,
         prepared.requires_state_grad,
@@ -732,6 +920,8 @@ def _compiled_day_runner(
     has_short_capacity = prepared.has_short_capacity
     has_volume_limit = prepared.has_volume_limit
     has_cash_dividends = prepared.has_cash_dividends
+    has_day_trade_carry = prepared.has_day_trade_carry
+    symbol_sharded = prepared.symbol_sharded
     return_history = prepared.return_weights_history
     lag = prepared.settlement_lag_sessions
     claim_queue = prepared.claim_queue_sessions
@@ -739,6 +929,16 @@ def _compiled_day_runner(
     max_turnover = prepared.max_turnover_ratio
     maintenance = prepared.short_maintenance_ratio
     rebate_timing = prepared.commission_rebate_timing
+    day_trade_financing_ratio = prepared.day_trade_margin_financing_ratio
+    day_trade_financing_rate = (
+        prepared.day_trade_margin_financing_annual_rate
+    )
+    day_trade_short_handling = (
+        prepared.day_trade_margin_short_handling_fee_rate
+    )
+    day_trade_short_borrow = (
+        prepared.day_trade_margin_short_annual_borrow_rate
+    )
 
     def run_day(
         day_actions: torch.Tensor,
@@ -749,6 +949,7 @@ def _compiled_day_runner(
         day_can_sell_mask: torch.Tensor,
         day_buy_fee_rates: torch.Tensor,
         day_sell_fee_rates: torch.Tensor,
+        day_normal_sell_fee_rates: torch.Tensor,
         day_commission_rebate_rates: torch.Tensor,
         day_session_month_ids: torch.Tensor,
         day_commission_rebate_payment_eligible_mask: torch.Tensor,
@@ -769,6 +970,7 @@ def _compiled_day_runner(
         initial_receivables: torch.Tensor,
         initial_short_sale_collateral: torch.Tensor,
         initial_short_margin_collateral: torch.Tensor,
+        initial_long_margin_debt: torch.Tensor,
         initial_alive: torch.Tensor,
         initial_equity_scale: torch.Tensor,
         initial_commission_rebate_current: torch.Tensor,
@@ -798,11 +1000,24 @@ def _compiled_day_runner(
                 day_force_short_cover_mask if has_force_short_cover_mask else None
             ),
             short_margin_rate=(day_short_margin_rate if has_short_contract else None),
-            short_capacity_weights=(
-                day_short_capacity_weights if has_short_capacity else None
-            ),
+            short_capacity_weights=day_short_capacity_weights,
             short_handling_fee_rate=(
                 day_short_handling_fee_rate if has_short_contract else 0.0
+            ),
+            day_trade_carry_normal_sell_fee_rates=(
+                day_normal_sell_fee_rates if has_day_trade_carry else None
+            ),
+            day_trade_margin_financing_ratio=(
+                day_trade_financing_ratio
+            ),
+            day_trade_margin_financing_annual_rate=(
+                day_trade_financing_rate
+            ),
+            day_trade_margin_short_handling_fee_rate=(
+                day_trade_short_handling
+            ),
+            day_trade_margin_short_annual_borrow_rate=(
+                day_trade_short_borrow
             ),
             short_maintenance_ratio=maintenance,
             unresolved_corporate_action_mask=(day_unresolved_corporate_action_mask),
@@ -837,7 +1052,10 @@ def _compiled_day_runner(
             initial_equity_scale=initial_equity_scale,
             initial_short_sale_collateral=initial_short_sale_collateral,
             initial_short_margin_collateral=initial_short_margin_collateral,
+            initial_long_margin_debt=initial_long_margin_debt,
             detach_initial_state=False,
+            _apply_short_capacity_limit=has_short_capacity,
+            _symbol_sharded=symbol_sharded,
         )
         empty_symbol = result.final_weights.new_empty((0,))
         empty_phase = result.final_weights.new_empty((0, 2))
@@ -889,6 +1107,7 @@ def _compiled_day_runner(
             result.final_receivables,
             result.final_short_sale_collateral,
             result.final_short_margin_collateral,
+            result.final_long_margin_debt,
             result.final_alive,
             result.final_equity_scale,
             result.commission_rebate_accrued_history[0],
@@ -899,6 +1118,7 @@ def _compiled_day_runner(
             result.final_commission_rebate_current,
             result.final_commission_rebate_due,
             result.final_commission_rebate_month_id,
+            result.default_reason_history[0],
         )
 
     compiled = torch.compile(
@@ -917,8 +1137,9 @@ def _day_inputs(
     index: int,
 ) -> tuple[torch.Tensor, ...]:
     sl = slice(index, index + 1)
+    day_actions = prepared.actions[sl]
     return (
-        prepared.actions[sl],
+        day_actions,
         prepared.overnight_log_returns[sl],
         prepared.intraday_log_returns[sl],
         prepared.tradable_mask[sl],
@@ -926,6 +1147,7 @@ def _day_inputs(
         prepared.can_sell_mask[sl],
         prepared.buy_fee_rates[sl],
         prepared.sell_fee_rates[sl],
+        prepared.day_trade_carry_normal_sell_fee_rates[sl],
         prepared.commission_rebate_rates[sl],
         prepared.session_month_ids[sl],
         prepared.commission_rebate_payment_eligible_mask[sl],
@@ -951,6 +1173,7 @@ def _state_tuple(prepared: _PreparedInputs) -> tuple[torch.Tensor, ...]:
         prepared.initial_receivables,
         prepared.initial_short_sale_collateral,
         prepared.initial_short_margin_collateral,
+        prepared.initial_long_margin_debt,
         prepared.initial_alive,
         prepared.initial_equity_scale,
         prepared.initial_commission_rebate_current,
@@ -969,9 +1192,10 @@ def _next_state(values: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
         values[19],
         values[20],
         values[21],
-        values[27],
+        values[22],
         values[28],
         values[29],
+        values[30],
     )
 
 
@@ -1032,19 +1256,20 @@ def _prefix_result(
         receivables_history=torch.stack([row[17] for row in rows]),
         short_sale_collateral_history=torch.stack([row[18] for row in rows]),
         short_margin_collateral_history=torch.stack([row[19] for row in rows]),
-        equity_scale_history=torch.stack([row[21] for row in rows]),
+        long_margin_debt_history=torch.stack([row[20] for row in rows]),
+        equity_scale_history=torch.stack([row[22] for row in rows]),
         commission_rebate_accrued_history=torch.stack(
-            [row[22] for row in rows]
+            [row[23] for row in rows]
         ),
-        commission_rebate_paid_history=torch.stack([row[23] for row in rows]),
+        commission_rebate_paid_history=torch.stack([row[24] for row in rows]),
         event_commission_rebate_accrued=torch.stack(
-            [row[24] for row in rows]
-        ),
-        commission_rebate_current_history=torch.stack(
             [row[25] for row in rows]
         ),
-        commission_rebate_due_history=torch.stack(
+        commission_rebate_current_history=torch.stack(
             [row[26] for row in rows]
+        ),
+        commission_rebate_due_history=torch.stack(
+            [row[27] for row in rows]
         ),
         final_weights=final[14],
         final_cash=final[15],
@@ -1052,12 +1277,14 @@ def _prefix_result(
         final_receivables=final[17],
         final_short_sale_collateral=final[18],
         final_short_margin_collateral=final[19],
-        final_alive=final[20],
-        final_equity_scale=final[21],
-        final_commission_rebate_current=final[27],
-        final_commission_rebate_due=final[28],
-        final_commission_rebate_month_id=final[29],
+        final_long_margin_debt=final[20],
+        final_alive=final[21],
+        final_equity_scale=final[22],
+        final_commission_rebate_current=final[28],
+        final_commission_rebate_due=final[29],
+        final_commission_rebate_month_id=final[30],
         final_due_weights=(final[14] if prepared.mode == "tw_overnight" else None),
+        default_reason_history=torch.stack([row[31] for row in rows]),
     )
 
 
@@ -1105,9 +1332,11 @@ def _concat_results(
         payables_history=cat("payables_history"),
         receivables_history=cat("receivables_history"),
         settlement_default=cat("settlement_default"),
+        default_reason_history=cat("default_reason_history"),
         equity_scale_history=cat("equity_scale_history"),
         short_sale_collateral_history=cat("short_sale_collateral_history"),
         short_margin_collateral_history=cat("short_margin_collateral_history"),
+        long_margin_debt_history=cat("long_margin_debt_history"),
         commission_rebate_accrued_history=cat(
             "commission_rebate_accrued_history"
         ),
@@ -1129,6 +1358,7 @@ def _concat_results(
         final_equity_scale=final.final_equity_scale,
         final_short_sale_collateral=final.final_short_sale_collateral,
         final_short_margin_collateral=final.final_short_margin_collateral,
+        final_long_margin_debt=final.final_long_margin_debt,
         final_commission_rebate_current=(
             final.final_commission_rebate_current
         ),
@@ -1186,11 +1416,26 @@ def _eager_tail(
         short_margin_rate=(
             prepared.short_margin_rate[sl] if prepared.has_short_contract else None
         ),
-        short_capacity_weights=(
-            prepared.short_capacity_weights[sl] if prepared.has_short_capacity else None
-        ),
+        short_capacity_weights=prepared.short_capacity_weights[sl],
         short_handling_fee_rate=(
             prepared.short_handling_fee_rate[sl] if prepared.has_short_contract else 0.0
+        ),
+        day_trade_carry_normal_sell_fee_rates=(
+            prepared.day_trade_carry_normal_sell_fee_rates[sl]
+            if prepared.has_day_trade_carry
+            else None
+        ),
+        day_trade_margin_financing_ratio=(
+            prepared.day_trade_margin_financing_ratio
+        ),
+        day_trade_margin_financing_annual_rate=(
+            prepared.day_trade_margin_financing_annual_rate
+        ),
+        day_trade_margin_short_handling_fee_rate=(
+            prepared.day_trade_margin_short_handling_fee_rate
+        ),
+        day_trade_margin_short_annual_borrow_rate=(
+            prepared.day_trade_margin_short_annual_borrow_rate
         ),
         short_maintenance_ratio=prepared.short_maintenance_ratio,
         unresolved_corporate_action_mask=(
@@ -1220,16 +1465,19 @@ def _eager_tail(
         initial_receivables=state[3],
         initial_short_sale_collateral=state[4],
         initial_short_margin_collateral=state[5],
-        initial_alive=state[6],
-        initial_equity_scale=state[7],
-        initial_commission_rebate_current=state[8],
-        initial_commission_rebate_due=state[9],
-        initial_commission_rebate_month_id=state[10],
+        initial_long_margin_debt=state[6],
+        initial_alive=state[7],
+        initial_equity_scale=state[8],
+        initial_commission_rebate_current=state[9],
+        initial_commission_rebate_due=state[10],
+        initial_commission_rebate_month_id=state[11],
         detach_initial_state=False,
+        _apply_short_capacity_limit=prepared.has_short_capacity,
+        _symbol_sharded=prepared.symbol_sharded,
     )
 
 
-def _run_prepared_compiled(
+def _run_prepared_regional(
     prepared: _PreparedInputs,
     *,
     strict_compile: bool,
@@ -1279,10 +1527,32 @@ def _run_prepared_compiled(
                 block_start,
                 block_start + COMPILED_BLOCK_ROWS,
             ):
-                values = compiled_day(
-                    *_day_inputs(prepared, index),
-                    *state,
-                )
+                if not rows:
+                    # Current PyTorch probes ``.grad`` on non-leaf graph
+                    # inputs while creating fake tensors. The project treats
+                    # warnings as errors, so narrowly suppress this internal
+                    # probe only during the first lazy trace. Autograd edges
+                    # and the compiled graph remain unchanged.
+                    with warnings.catch_warnings():
+                        warnings.filterwarnings(
+                            "ignore",
+                            message=r"The \.grad attribute of a Tensor that is not a leaf Tensor.*",
+                            category=UserWarning,
+                        )
+                        warnings.filterwarnings(
+                            "ignore",
+                            message=r"`torch\.jit\.script_method` is deprecated.*",
+                            category=DeprecationWarning,
+                        )
+                        values = compiled_day(
+                            *_day_inputs(prepared, index),
+                            *state,
+                        )
+                else:
+                    values = compiled_day(
+                        *_day_inputs(prepared, index),
+                        *state,
+                    )
                 rows.append(values)
                 state = _next_state(values)
                 _COMPILE_STATS["compiled_day_calls"] += 1
@@ -1311,6 +1581,205 @@ def _run_prepared_compiled(
     return _concat_results(results) if len(results) > 1 else results[0]
 
 
+def _tensor_field_names(prepared: _PreparedInputs) -> tuple[str, ...]:
+    return tuple(
+        field.name
+        for field in fields(prepared)
+        if isinstance(getattr(prepared, field.name), torch.Tensor)
+    )
+
+
+def _result_tensor_field_names(
+    result: TaiwanDualSessionResult,
+) -> tuple[str, ...]:
+    return tuple(
+        field.name
+        for field in fields(result)
+        if field.name != "mode"
+        and isinstance(getattr(result, field.name), torch.Tensor)
+    )
+
+
+def _clone_prepared_tensors(
+    prepared: _PreparedInputs,
+    names: tuple[str, ...],
+) -> _PreparedInputs:
+    replacements: dict[str, torch.Tensor] = {}
+    for name in names:
+        source = getattr(prepared, name)
+        clone = source.detach().clone(memory_format=torch.preserve_format)
+        if source.requires_grad:
+            clone.requires_grad_(True)
+        replacements[name] = clone
+    return replace(prepared, **replacements)
+
+
+class _PreparedRegionalModule(torch.nn.Module):
+    """Tensor-only regional runner for autograd-aware CUDA Graph capture."""
+
+    def __init__(
+        self,
+        template: _PreparedInputs,
+        input_names: tuple[str, ...],
+        output_names: tuple[str, ...],
+    ) -> None:
+        super().__init__()
+        self.template = template
+        self.input_names = input_names
+        self.output_names = output_names
+
+    def forward(self, *values: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        prepared = replace(
+            self.template,
+            **dict(zip(self.input_names, values, strict=True)),
+        )
+        result = _run_prepared_regional(prepared, strict_compile=True)
+        return tuple(getattr(result, name) for name in self.output_names)
+
+
+def _cuda_graph_eligible(prepared: _PreparedInputs) -> bool:
+    rows = int(prepared.actions.size(0))
+    return bool(
+        _cuda_graph_enabled()
+        and prepared.mode == "tw_cash"
+        and prepared.actions.device.type == "cuda"
+        and torch.is_grad_enabled()
+        and prepared.actions.requires_grad
+        and not prepared.return_weights_history
+        and not prepared.symbol_sharded
+        and rows >= COMPILED_BLOCK_ROWS
+        and rows % COMPILED_BLOCK_ROWS == 0
+        and rows & (rows - 1) == 0
+        and hasattr(torch.cuda, "make_graphed_callables")
+        and not torch.compiler.is_compiling()
+    )
+
+
+def _cuda_graph_key(prepared: _PreparedInputs) -> tuple[object, ...]:
+    return (
+        "whole_horizon_cuda_graph_v1",
+        *_compile_key(prepared),
+        int(prepared.actions.size(0)),
+    )
+
+
+def _build_graphed_runner(
+    prepared: _PreparedInputs,
+) -> _GraphedRunner:
+    input_names = _tensor_field_names(prepared)
+
+    # Compile and warm the reusable one-day forward/backward using storage that
+    # is deliberately distinct from both capture and live-call inputs.  Keeping
+    # the old autograd leaves out of capture avoids binding AccumulateGrad to
+    # the default stream before make_graphed_callables creates its side stream.
+    warm_prepared = _clone_prepared_tensors(prepared, input_names)
+    warm_result = _run_prepared_regional(warm_prepared, strict_compile=True)
+    output_names = _result_tensor_field_names(warm_result)
+    differentiable_inputs = tuple(
+        getattr(warm_prepared, name)
+        for name in input_names
+        if getattr(warm_prepared, name).requires_grad
+    )
+    if not differentiable_inputs:
+        raise RuntimeError("CUDA-graph ledger requires a differentiable action input")
+    torch.autograd.grad(
+        warm_result.strategy_returns.sum(),
+        differentiable_inputs,
+        allow_unused=True,
+    )
+    del warm_result, warm_prepared, differentiable_inputs
+    gc.collect()
+    torch.cuda.synchronize(prepared.actions.device)
+
+    sample_prepared = _clone_prepared_tensors(prepared, input_names)
+    module = _PreparedRegionalModule(
+        sample_prepared,
+        input_names,
+        output_names,
+    )
+    sample_args = tuple(getattr(sample_prepared, name) for name in input_names)
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=r"The AccumulateGrad node's stream does not match.*",
+            category=UserWarning,
+        )
+        # The trainer deliberately invokes the ledger under BF16 autocast.
+        # PyTorch's graph helper rejects the autocast weight cache because its
+        # pointers are not a stable part of the captured ABI.  Keep the exact
+        # active autocast dtype but disable only that cache during capture.
+        with torch.autocast(
+            device_type="cuda",
+            dtype=torch.get_autocast_dtype("cuda"),
+            enabled=torch.is_autocast_enabled("cuda"),
+            cache_enabled=False,
+        ):
+            graphed = torch.cuda.make_graphed_callables(
+                module,
+                sample_args,
+                num_warmup_iters=3,
+                allow_unused_input=True,
+            )
+    _COMPILE_STATS["cuda_graph_constructors"] += 1
+    return _GraphedRunner(
+        callable=graphed,
+        input_names=input_names,
+        output_names=output_names,
+        mode=prepared.mode,
+    )
+
+
+def _run_prepared_cuda_graph(
+    prepared: _PreparedInputs,
+) -> TaiwanDualSessionResult:
+    key = _cuda_graph_key(prepared)
+    runner = _CUDA_GRAPH_CACHE.get(key)
+    if runner is None:
+        runner = _build_graphed_runner(prepared)
+        _CUDA_GRAPH_CACHE[key] = runner
+    inputs = tuple(getattr(prepared, name) for name in runner.input_names)
+    outputs = runner.callable(*inputs)
+    if not isinstance(outputs, tuple):
+        outputs = (outputs,)
+    mapped = dict(zip(runner.output_names, outputs, strict=True))
+    kwargs: dict[str, object] = {}
+    for field in fields(TaiwanDualSessionResult):
+        if field.name == "mode":
+            continue
+        kwargs[field.name] = mapped.get(field.name)
+    _COMPILE_STATS["cuda_graph_calls"] += 1
+    return TaiwanDualSessionResult(mode=runner.mode, **kwargs)
+
+
+def _run_prepared_compiled(
+    prepared: _PreparedInputs,
+    *,
+    strict_compile: bool,
+) -> TaiwanDualSessionResult:
+    if not _cuda_graph_eligible(prepared):
+        return _run_prepared_regional(
+            prepared,
+            strict_compile=strict_compile,
+        )
+    key = _cuda_graph_key(prepared)
+    if key in _FAILED_CUDA_GRAPH_KEYS:
+        if strict_compile:
+            raise RuntimeError("whole-horizon ledger CUDA Graph previously failed")
+        _COMPILE_STATS["cuda_graph_fallback_calls"] += 1
+        return _run_prepared_regional(prepared, strict_compile=False)
+    try:
+        return _run_prepared_cuda_graph(prepared)
+    except Exception as exc:
+        _FAILED_CUDA_GRAPH_KEYS.add(key)
+        if strict_compile:
+            raise RuntimeError(
+                "whole-horizon ledger CUDA Graph capture or replay failed: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+        _COMPILE_STATS["cuda_graph_fallback_calls"] += 1
+        return _run_prepared_regional(prepared, strict_compile=False)
+
+
 def _run_compiled_public(
     *,
     mode: str,
@@ -1331,6 +1800,11 @@ def _run_compiled_public(
     short_margin_rate: torch.Tensor | float | None,
     short_capacity_weights: torch.Tensor | float | None,
     short_handling_fee_rate: torch.Tensor | float,
+    day_trade_carry_normal_sell_fee_rates: torch.Tensor | float | None,
+    day_trade_margin_financing_ratio: float,
+    day_trade_margin_financing_annual_rate: float,
+    day_trade_margin_short_handling_fee_rate: float,
+    day_trade_margin_short_annual_borrow_rate: float,
     short_maintenance_ratio: float,
     unresolved_corporate_action_mask: torch.Tensor | None,
     cash_dividend_yield: torch.Tensor | None,
@@ -1354,7 +1828,9 @@ def _run_compiled_public(
     initial_equity_scale: torch.Tensor | None,
     initial_short_sale_collateral: torch.Tensor | None,
     initial_short_margin_collateral: torch.Tensor | None,
+    initial_long_margin_debt: torch.Tensor | None,
     strict_compile: bool,
+    symbol_sharded: bool,
 ) -> TaiwanDualSessionResult:
     prepared = _prepare_inputs(
         mode=mode,
@@ -1377,6 +1853,19 @@ def _run_compiled_public(
         short_margin_rate=short_margin_rate,
         short_capacity_weights=short_capacity_weights,
         short_handling_fee_rate=short_handling_fee_rate,
+        day_trade_carry_normal_sell_fee_rates=(
+            day_trade_carry_normal_sell_fee_rates
+        ),
+        day_trade_margin_financing_ratio=day_trade_margin_financing_ratio,
+        day_trade_margin_financing_annual_rate=(
+            day_trade_margin_financing_annual_rate
+        ),
+        day_trade_margin_short_handling_fee_rate=(
+            day_trade_margin_short_handling_fee_rate
+        ),
+        day_trade_margin_short_annual_borrow_rate=(
+            day_trade_margin_short_annual_borrow_rate
+        ),
         short_maintenance_ratio=short_maintenance_ratio,
         unresolved_corporate_action_mask=(unresolved_corporate_action_mask),
         cash_dividend_yield=cash_dividend_yield,
@@ -1400,6 +1889,8 @@ def _run_compiled_public(
         initial_equity_scale=initial_equity_scale,
         initial_short_sale_collateral=initial_short_sale_collateral,
         initial_short_margin_collateral=initial_short_margin_collateral,
+        initial_long_margin_debt=initial_long_margin_debt,
+        symbol_sharded=symbol_sharded,
     )
     return _run_prepared_compiled(
         prepared,
@@ -1426,6 +1917,11 @@ def run_tw_cash_dual_session_compiled(
     short_margin_rate: torch.Tensor | float | None = None,
     short_capacity_weights: torch.Tensor | float | None = None,
     short_handling_fee_rate: torch.Tensor | float = 0.0,
+    day_trade_carry_normal_sell_fee_rates: torch.Tensor | float | None = None,
+    day_trade_margin_financing_ratio: float = 0.0,
+    day_trade_margin_financing_annual_rate: float = 0.0,
+    day_trade_margin_short_handling_fee_rate: float = 0.0,
+    day_trade_margin_short_annual_borrow_rate: float = 0.0,
     short_maintenance_ratio: float = 1.30,
     unresolved_corporate_action_mask: torch.Tensor | None = None,
     cash_dividend_yield: torch.Tensor | None = None,
@@ -1449,7 +1945,9 @@ def run_tw_cash_dual_session_compiled(
     initial_equity_scale: torch.Tensor | None = None,
     initial_short_sale_collateral: torch.Tensor | None = None,
     initial_short_margin_collateral: torch.Tensor | None = None,
+    initial_long_margin_debt: torch.Tensor | None = None,
     strict_compile: bool = False,
+    _symbol_sharded: bool = False,
 ) -> TaiwanDualSessionResult:
     return _run_compiled_public(
         mode="tw_cash",
@@ -1472,6 +1970,19 @@ def run_tw_cash_dual_session_compiled(
         short_margin_rate=short_margin_rate,
         short_capacity_weights=short_capacity_weights,
         short_handling_fee_rate=short_handling_fee_rate,
+        day_trade_carry_normal_sell_fee_rates=(
+            day_trade_carry_normal_sell_fee_rates
+        ),
+        day_trade_margin_financing_ratio=day_trade_margin_financing_ratio,
+        day_trade_margin_financing_annual_rate=(
+            day_trade_margin_financing_annual_rate
+        ),
+        day_trade_margin_short_handling_fee_rate=(
+            day_trade_margin_short_handling_fee_rate
+        ),
+        day_trade_margin_short_annual_borrow_rate=(
+            day_trade_margin_short_annual_borrow_rate
+        ),
         short_maintenance_ratio=short_maintenance_ratio,
         unresolved_corporate_action_mask=(unresolved_corporate_action_mask),
         cash_dividend_yield=cash_dividend_yield,
@@ -1495,7 +2006,9 @@ def run_tw_cash_dual_session_compiled(
         initial_equity_scale=initial_equity_scale,
         initial_short_sale_collateral=initial_short_sale_collateral,
         initial_short_margin_collateral=initial_short_margin_collateral,
+        initial_long_margin_debt=initial_long_margin_debt,
         strict_compile=strict_compile,
+        symbol_sharded=_symbol_sharded,
     )
 
 
@@ -1541,7 +2054,9 @@ def run_tw_overnight_dual_session_compiled(
     initial_equity_scale: torch.Tensor | None = None,
     initial_short_sale_collateral: torch.Tensor | None = None,
     initial_short_margin_collateral: torch.Tensor | None = None,
+    initial_long_margin_debt: torch.Tensor | None = None,
     strict_compile: bool = False,
+    _symbol_sharded: bool = False,
 ) -> TaiwanDualSessionResult:
     return _run_compiled_public(
         mode="tw_overnight",
@@ -1564,6 +2079,11 @@ def run_tw_overnight_dual_session_compiled(
         short_margin_rate=short_margin_rate,
         short_capacity_weights=short_capacity_weights,
         short_handling_fee_rate=short_handling_fee_rate,
+        day_trade_carry_normal_sell_fee_rates=None,
+        day_trade_margin_financing_ratio=0.0,
+        day_trade_margin_financing_annual_rate=0.0,
+        day_trade_margin_short_handling_fee_rate=0.0,
+        day_trade_margin_short_annual_borrow_rate=0.0,
         short_maintenance_ratio=short_maintenance_ratio,
         unresolved_corporate_action_mask=(unresolved_corporate_action_mask),
         cash_dividend_yield=cash_dividend_yield,
@@ -1587,7 +2107,9 @@ def run_tw_overnight_dual_session_compiled(
         initial_equity_scale=initial_equity_scale,
         initial_short_sale_collateral=initial_short_sale_collateral,
         initial_short_margin_collateral=initial_short_margin_collateral,
+        initial_long_margin_debt=initial_long_margin_debt,
         strict_compile=strict_compile,
+        symbol_sharded=_symbol_sharded,
     )
 
 
