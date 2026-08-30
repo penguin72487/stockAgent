@@ -121,6 +121,18 @@ Get-CaddyProcesses | ForEach-Object {
     Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
 }
 $caddyStoppedProbe = Get-PublicProbe "/healthz"
+$caddyStopDeadline = (Get-Date).AddSeconds(10)
+while (
+    ($caddyStoppedProbe.status_code -eq 200 -or
+        @(Get-CaddyProcesses).Count -gt 0) -and
+    (Get-Date) -lt $caddyStopDeadline
+) {
+    Get-CaddyProcesses | ForEach-Object {
+        Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+    }
+    Start-Sleep -Milliseconds 100
+    $caddyStoppedProbe = Get-PublicProbe "/healthz"
+}
 Start-ScheduledTask -TaskName $TaskName
 $caddyReadyAt = $null
 $newCaddyPids = @()
@@ -139,19 +151,38 @@ do {
 $shutdownAt = Get-Date
 & $wsl --shutdown
 $stoppedAt = $null
+$restartObservedAt = $null
 $runningDistributionsAtStop = @()
+$postBootId = ""
 $stopDeadline = (Get-Date).AddSeconds($TimeoutSeconds)
 do {
     $runningDistributions = @(Get-RunningWslDistributions)
     if ($DistroName -notin $runningDistributions) {
-        $runningDistributionsAtStop = $runningDistributions
-        $stoppedAt = Get-Date
+        if (-not $stoppedAt) {
+            $runningDistributionsAtStop = $runningDistributions
+            $stoppedAt = Get-Date
+        }
+    } else {
+        # Querying a stopped distribution with `wsl --distribution ... --exec`
+        # starts it and invalidates the recovery proof. Read boot_id only after
+        # `wsl --list --running` independently observes the target running.
+        $candidateBootId = Get-WslBootId
+        if ($candidateBootId -and $candidateBootId -ne $preBootId) {
+            $postBootId = $candidateBootId
+            $restartObservedAt = Get-Date
+            break
+        }
+    }
+    if ($stoppedAt -and $DistroName -notin $runningDistributions) {
+        Start-Sleep -Milliseconds 250
+        continue
+    }
+    if ($restartObservedAt) {
         break
     }
     Start-Sleep -Milliseconds 250
 } while ((Get-Date) -lt $stopDeadline)
 
-$postBootId = ""
 $serviceStates = @()
 $timerStates = @()
 $failedUnits = ""
@@ -161,10 +192,20 @@ $readyAt = $null
 $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
 
 do {
-    if (-not $stoppedAt) {
-        break
+    if (-not $restartObservedAt) {
+        $runningDistributions = @(Get-RunningWslDistributions)
+        if ($DistroName -notin $runningDistributions) {
+            Start-Sleep -Milliseconds 250
+            continue
+        }
+        $candidateBootId = Get-WslBootId
+        if (-not $candidateBootId -or $candidateBootId -eq $preBootId) {
+            Start-Sleep -Milliseconds 250
+            continue
+        }
+        $postBootId = $candidateBootId
+        $restartObservedAt = Get-Date
     }
-    $postBootId = Get-WslBootId
     if (-not $postBootId -or $postBootId -eq $preBootId) {
         Start-Sleep -Milliseconds 250
         continue
@@ -207,7 +248,7 @@ do {
 $success = (
     $caddyReadyAt -and
     $caddyStoppedProbe.status_code -ne 200 -and
-    $stoppedAt -and
+    $restartObservedAt -and
     $readyAt -and
     $postBootId -and
     $postBootId -ne $preBootId
@@ -227,6 +268,9 @@ $report = [ordered]@{
     target_distribution = $DistroName
     wsl_stopped_at = if ($stoppedAt) { $stoppedAt.ToString("o") } else { $null }
     wsl_stopped_observed = [bool]$stoppedAt
+    wsl_restart_observed_at = if ($restartObservedAt) {
+        $restartObservedAt.ToString("o")
+    } else { $null }
     running_distributions_at_stop = $runningDistributionsAtStop
     wsl_shutdown_seconds = if ($stoppedAt) {
         [math]::Round(($stoppedAt - $shutdownAt).TotalSeconds, 3)
