@@ -1,0 +1,18 @@
+[Unit]
+Description=Persist and self-repair the unattended Taiwan day-trade contract
+Wants=network-online.target time-sync.target
+After=network-online.target time-sync.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+WorkingDirectory=@REPO_ROOT@
+Environment="HOME=/root"
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=/usr/bin/bash "@REPO_ROOT@/scripts/run_tw_day_trade_unattended_guardian.sh"
+TimeoutStartSec=60s
+Nice=0
+CPUWeight=100
+IOWeight=100
+PrivateTmp=true

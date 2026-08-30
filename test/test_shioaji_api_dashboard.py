@@ -625,6 +625,87 @@ def test_minute_pipeline_separates_research_usability_from_latest_freshness(
     assert research["data_through"] == "2026-08-20"
 
 
+def test_minute_pipeline_uses_rolling_target_and_ignores_stale_partial_run(
+    tmp_path: Path,
+) -> None:
+    minute_summary = tmp_path / "download_summary.json"
+    stale_run = tmp_path / "latest_run_summary.json"
+    target = tmp_path / "target.txt"
+    minute_manifest = tmp_path / "research_manifest.json"
+    minute_audit = tmp_path / "full_audit.json"
+    minute_summary.write_text(
+        json.dumps(
+            {
+                "selected_symbols": 2747,
+                "reported_symbols": 2747,
+                "end_date": "2026-08-26",
+                "resumable_collection_complete": True,
+                "selected_coverage_complete": True,
+                "stopped_for_traffic": False,
+                "stopped_for_market_hours": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+    stale_run.write_text(
+        json.dumps(
+            {
+                "selected_symbols": 4,
+                "reported_symbols": 4,
+                "end_date": "2026-08-21",
+                "resumable_collection_complete": False,
+                "stopped_for_traffic": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    target.write_text("2026-08-26\n", encoding="utf-8")
+    minute_manifest.write_text(json.dumps({"research_ready": True}), encoding="utf-8")
+    minute_audit.write_text(
+        json.dumps(
+            {
+                "status": "research_ready",
+                "last_date": "2026-08-26",
+                "available_source_symbols": 2622,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def runner(args):
+        command = list(args)
+        stdout = (
+            "ActiveState=inactive\nSubState=dead\nNRestarts=0\nInvocationID=\n"
+            if command[0] == "systemctl"
+            else ""
+        )
+        return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
+
+    missing = tmp_path / "missing"
+    payload = build_shioaji_public_status(
+        tmp_path,
+        now=datetime(2026, 8, 27, 1, 0, tzinfo=UTC),
+        runner=runner,
+        paths=ShioajiMonitorPaths(
+            alias_inventory=missing,
+            txfr1_manifest=missing,
+            futures_history_root=missing,
+            target_end_date=missing,
+            capture_root=missing,
+            minute_summary=minute_summary,
+            minute_run_summary=stale_run,
+            minute_manifest=minute_manifest,
+            minute_audit=minute_audit,
+            minute_target_end_date=target,
+        ),
+    )
+
+    stock = next(item for item in payload["pipelines"] if item["id"] == "stock_minute")
+    assert stock["status"] == "ready"
+    assert stock["target_date"] == "2026-08-26"
+    assert stock["data_through"] == "2026-08-26"
+
+
 def test_shioaji_public_status_allowlists_storage_snapshot(tmp_path: Path) -> None:
     observed = datetime(2026, 8, 14, 8, 0, tzinfo=UTC)
     inventory = tmp_path / "contracts.csv"
@@ -757,3 +838,53 @@ def test_top200_connection_budget_is_intentional_wait_not_failure(
     assert top200["status"] == "waiting"
     assert top200["status_label"] == "期權優先暫停"
     assert not any(item["status"] == "failed" for item in payload["pipelines"])
+
+
+def test_active_top200_wrapper_does_not_hide_connection_budget_wait(
+    tmp_path: Path,
+) -> None:
+    inventory = tmp_path / "contracts.csv"
+    inventory.write_text("contract,priority\n", encoding="utf-8")
+
+    def runner(args: list[str] | tuple[str, ...]) -> subprocess.CompletedProcess[str]:
+        command = list(args)
+        if command[0] == "systemctl":
+            stdout = (
+                "ActiveState=active\nSubState=running\nNRestarts=0\n"
+                "InvocationID=test\n"
+            )
+        else:
+            unit = command[command.index("--unit") + 1]
+            stdout = (
+                _journal_line(
+                    "capture_skipped reason=connection_budget",
+                    datetime(2026, 8, 26, 1, 0, tzinfo=UTC),
+                    "test",
+                )
+                if unit == TOP200_UNIT
+                else ""
+            )
+        return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
+
+    missing = tmp_path / "missing"
+    payload = build_shioaji_public_status(
+        tmp_path,
+        now=datetime(2026, 8, 26, 1, 1, tzinfo=UTC),
+        runner=runner,
+        paths=ShioajiMonitorPaths(
+            alias_inventory=inventory,
+            txfr1_manifest=missing,
+            futures_history_root=missing,
+            target_end_date=missing,
+            capture_root=missing,
+            top200_capture_root=tmp_path / "top200",
+            hft_dataset_root=tmp_path / "hft",
+            hft_audit_root=tmp_path / "audits",
+        ),
+    )
+
+    top200 = next(item for item in payload["pipelines"] if item["id"] == "top200_stream")
+    hft = next(item for item in payload["pipelines"] if item["id"] == "hft_dataset")
+    assert top200["status"] == "waiting"
+    assert top200["status_label"] == "期權優先暫停"
+    assert hft["status"] == "partial"

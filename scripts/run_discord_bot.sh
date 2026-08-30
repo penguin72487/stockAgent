@@ -10,22 +10,20 @@ if [[ ! -f "$BOT_ENV_FILE" ]]; then
   echo "[discord-bot] missing environment file: $BOT_ENV_FILE" >&2
   exit 2
 fi
-if [[ ! -f "$SHIOAJI_ENV_FILE" ]]; then
-  echo "[discord-bot] missing Shioaji quote environment file: $SHIOAJI_ENV_FILE" >&2
-  exit 2
-fi
 set -a
-source "$SHIOAJI_ENV_FILE"
+if [[ -f "$SHIOAJI_ENV_FILE" ]]; then
+  source "$SHIOAJI_ENV_FILE"
+fi
 source "$BOT_ENV_FILE"
 set +a
 if [[ -z "${DISCORD_BOT_TOKEN:-}" || -z "${DISCORD_CHANNEL_ID:-}" ]]; then
   echo "[discord-bot] DISCORD_BOT_TOKEN and DISCORD_CHANNEL_ID are required" >&2
   exit 2
 fi
-if [[ -z "${SHIOAJI_API_KEY:-}" || -z "${SHIOAJI_SECRET_KEY:-}" ]]; then
-  echo "[discord-bot] SHIOAJI_API_KEY and SHIOAJI_SECRET_KEY are required for TW opening quotes" >&2
-  exit 2
-fi
+# Scheduled TW day-trade model inputs use the official MIS opening snapshot.
+# Shioaji credentials belong to the independent simulation executor that reads
+# actual candidate-only best Bid/Ask. Keep them optional here so Discord
+# connectivity cannot become an execution-start dependency.
 
 source scripts/runtime_env.sh
 run_fintech_python services/discord_bot/bot.py

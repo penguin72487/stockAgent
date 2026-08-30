@@ -65,6 +65,7 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--poll-interval-seconds", type=float, default=2.0)
+    parser.add_argument("--heartbeat-seconds", type=float, default=30.0)
     parser.add_argument("--max-wait-seconds", type=float, default=5400.0)
     parser.add_argument("--request-timeout-seconds", type=int, default=10)
     parser.add_argument(
@@ -232,10 +233,48 @@ def _write_run_receipts(
     _atomic_json(run_path, payload)
 
 
+def _write_waiting_receipt(
+    receipt_path: Path,
+    *,
+    started: datetime,
+    scheduled_at: datetime,
+    minimum_date: date,
+    attempt_count: int,
+    poll_interval_seconds: float,
+    first_twse_observed_at: str | None,
+    first_tpex_observed_at: str | None,
+    both_sources_observed_at: str | None,
+    last_error: str,
+    live_root: Path,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "schema_version": 1,
+        "status": "waiting_source",
+        "started_at": started.isoformat(),
+        "updated_at": datetime.now(TAIPEI).isoformat(),
+        "scheduled_publication_at": scheduled_at.isoformat(),
+        "minimum_acceptable_rule_date": minimum_date.isoformat(),
+        "attempt_count": attempt_count,
+        "poll_interval_seconds": poll_interval_seconds,
+        "first_twse_observed_at": first_twse_observed_at,
+        "first_tpex_observed_at": first_tpex_observed_at,
+        "both_sources_observed_at": both_sources_observed_at,
+        "last_error": last_error,
+        "live_root": str(live_root),
+    }
+    # ``latest`` is mutable liveness telemetry. Immutable run receipts remain
+    # reserved for terminal success/timeout so waiting does not create one file
+    # every heartbeat.
+    _atomic_json(receipt_path, payload)
+    return payload
+
+
 def main() -> int:
     args = parse_args()
     if args.poll_interval_seconds <= 0:
         raise ValueError("--poll-interval-seconds must be positive")
+    if args.heartbeat_seconds <= 0:
+        raise ValueError("--heartbeat-seconds must be positive")
     if args.max_wait_seconds < 0:
         raise ValueError("--max-wait-seconds must be non-negative")
     if args.request_timeout_seconds <= 0:
@@ -256,6 +295,22 @@ def main() -> int:
     first_tpex_observed_at: str | None = None
     both_sources_observed_at: str | None = None
     last_error = "publication not observed"
+    last_heartbeat = float("-inf")
+
+    _write_waiting_receipt(
+        receipt_path,
+        started=started,
+        scheduled_at=scheduled_at,
+        minimum_date=minimum_date,
+        attempt_count=attempt_count,
+        poll_interval_seconds=float(args.poll_interval_seconds),
+        first_twse_observed_at=first_twse_observed_at,
+        first_tpex_observed_at=first_tpex_observed_at,
+        both_sources_observed_at=both_sources_observed_at,
+        last_error=last_error,
+        live_root=live_root,
+    )
+    last_heartbeat = time.monotonic()
 
     while True:
         attempt_count += 1
@@ -348,6 +403,21 @@ def main() -> int:
                 _write_run_receipts(receipt_path, payload, started=started)
                 print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
                 return 75
+            if time.monotonic() - last_heartbeat >= float(args.heartbeat_seconds):
+                _write_waiting_receipt(
+                    receipt_path,
+                    started=started,
+                    scheduled_at=scheduled_at,
+                    minimum_date=minimum_date,
+                    attempt_count=attempt_count,
+                    poll_interval_seconds=float(args.poll_interval_seconds),
+                    first_twse_observed_at=first_twse_observed_at,
+                    first_tpex_observed_at=first_tpex_observed_at,
+                    both_sources_observed_at=both_sources_observed_at,
+                    last_error=last_error,
+                    live_root=live_root,
+                )
+                last_heartbeat = time.monotonic()
             time.sleep(float(args.poll_interval_seconds))
 
 

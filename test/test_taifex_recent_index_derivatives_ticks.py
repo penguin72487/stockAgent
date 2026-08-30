@@ -85,6 +85,39 @@ def test_futures_convert_b_plus_s_quantity_to_matched_contracts() -> None:
     assert frame["session"].to_list() == ["day"]
 
 
+def test_futures_preserve_zero_and_negative_calendar_spread_prices() -> None:
+    source = io.StringIO(
+        "成交日期,商品代號,到期月份(週別),成交時間,成交價格,成交數量(B+S),近月價格,遠月價格,開盤集合競價\n"
+        "20260819,TX,202608/202609,102057,0,20,44577,44577,\n"
+        "20260819,TX,202608/202609,102058,-1,8,44580,44579,\n"
+    )
+
+    frame = MODULE._parse_futures_rows(
+        source,
+        trading_date=date(2026, 8, 19),
+        source_file="Daily_2026_08_19.zip",
+        source_sha256="b" * 64,
+    )
+
+    assert frame["price"].to_list() == [0.0, -1.0]
+    assert frame["matched_quantity"].to_list() == [10, 4]
+
+
+def test_futures_still_reject_non_positive_outright_price() -> None:
+    source = io.StringIO(
+        "成交日期,商品代號,到期月份(週別),成交時間,成交價格,成交數量(B+S),近月價格,遠月價格,開盤集合競價\n"
+        "20260819,TX,202608,102057,0,20,-,-,\n"
+    )
+
+    with pytest.raises(ValueError, match="non-positive price"):
+        MODULE._parse_futures_rows(
+            source,
+            trading_date=date(2026, 8, 19),
+            source_file="Daily_2026_08_19.zip",
+            source_sha256="b" * 64,
+        )
+
+
 def test_options_fail_closed_on_unpaired_side_quantity() -> None:
     source = io.StringIO(
         "成交日期,商品代號,履約價格,到期月份(週別),買賣權別,成交時間,成交價格,成交數量(B or S),開盤集合競價\n"

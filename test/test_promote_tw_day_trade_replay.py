@@ -60,6 +60,78 @@ def test_validate_rebuild_accepts_exact_flat_mode_set(tmp_path: Path) -> None:
     assert result["final_open_positions"] == {market: 0 for market in sorted(MARKETS)}
 
 
+def test_validate_rebuild_accepts_0901_official_open_contract(tmp_path: Path) -> None:
+    candidate = _candidate(tmp_path)
+    state_path = candidate / "state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    for mode in state["modes"].values():
+        mode["entry_fill_policy"] = promotion.OFFICIAL_OPEN_ENTRY_POLICY
+        mode["entry_fill_contract"] = promotion.OFFICIAL_OPEN_REPLAY_CONTRACT
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    receipt_path = candidate / "rebuild_receipt.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["replay_contract"] = {"entry": promotion.OFFICIAL_OPEN_REPLAY_CONTRACT}
+    for row in receipt["sessions"][0]["modes"]:
+        row["entry"] = {
+            "entry_fill_policy": promotion.OFFICIAL_OPEN_ENTRY_POLICY,
+            "entry_fill_count": 1,
+            "entry_official_open_fill_count": 1,
+            "entry_fill_is_synthetic": False,
+        }
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+    (candidate / "signals.jsonl").write_text(
+        "".join(
+            json.dumps(
+                {
+                    "market": market,
+                    "recorded_at": "2026-08-13T09:01:00+08:00",
+                    "entry_fill_policy": promotion.OFFICIAL_OPEN_ENTRY_POLICY,
+                    "entry_price_offset_ticks": 0,
+                    "filled_shares": 1_000,
+                    "execution_price": 100.0,
+                    "sizing_open_price": 100.0,
+                    "counterfactual_open_price_fill": True,
+                    "synthetic_fill": False,
+                    "synthetic_fallback_fill": False,
+                    "paper_market_fill": False,
+                }
+            )
+            + "\n"
+            for market in sorted(MARKETS)
+        ),
+        encoding="utf-8",
+    )
+    (candidate / "fills.jsonl").write_text(
+        "".join(
+            json.dumps(
+                {
+                    "market": market,
+                    "purpose": "entry",
+                    "fill_at": "2026-08-13T09:01:00+08:00",
+                    "fill_contract": promotion.OFFICIAL_OPEN_REPLAY_CONTRACT,
+                    "entry_fill_policy": promotion.OFFICIAL_OPEN_ENTRY_POLICY,
+                    "entry_price_offset_ticks": 0,
+                    "price": 100.0,
+                    "counterfactual_open_price_fill": True,
+                    "synthetic_fill": False,
+                    "synthetic_fallback_fill": False,
+                    "paper_market_fill": False,
+                }
+            )
+            + "\n"
+            for market in sorted(MARKETS)
+        ),
+        encoding="utf-8",
+    )
+
+    result = promotion._validate_rebuild(candidate, expected_markets=MARKETS)
+
+    assert result["official_open_fills"] == 3
+    assert result["signal_ledger_validation"]["fill_ledger_official_open_fills"] == 3
+    assert result["synthetic_fallback_fills"] == 0
+
+
 def test_validate_rebuild_rejects_blocked_registration(tmp_path: Path) -> None:
     with pytest.raises(RuntimeError, match="register_result='blocked'"):
         promotion._validate_rebuild(
@@ -199,6 +271,93 @@ def test_validate_rebuild_accepts_explicit_current_open_counterfactual(
     )
 
     assert result["current_open_session"] == current_date
+    assert result["final_open_positions"] == {market: 1 for market in sorted(MARKETS)}
+
+
+def test_validate_rebuild_accepts_current_paper_market_tick_fallback(
+    tmp_path: Path,
+) -> None:
+    candidate = _candidate(tmp_path)
+    current_date = datetime.now(ZoneInfo("Asia/Taipei")).date().isoformat()
+    state_path = candidate / "state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    for mode in state["modes"].values():
+        mode.update(
+            {
+                "session_date": current_date,
+                "engine_status": "active",
+                "counterfactual_open_replay": True,
+                "entry_fill_policy": promotion.PAPER_MARKET_ENTRY_POLICY,
+                "entry_fill_contract": promotion.PAPER_MARKET_REPLAY_CONTRACT,
+                "entry_fill_is_synthetic": True,
+                "positions": {
+                    "2330": {
+                        "signed_shares": 1_000,
+                        "entry_price": 100.5,
+                        "sizing_open_price": 100.0,
+                        "counterfactual_open_replay": True,
+                        "entry_fill_is_synthetic": True,
+                    }
+                },
+            }
+        )
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    receipt_path = candidate / "rebuild_receipt.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["replay_contract"] = {"entry": promotion.PAPER_MARKET_REPLAY_CONTRACT}
+    receipt["sessions"][0]["session_date"] = current_date
+    receipt["sessions"][0]["close"] = {
+        "status": "current_session_left_open_for_live_service"
+    }
+    for row in receipt["sessions"][0]["modes"]:
+        row.pop("after_close")
+        row["entry"] = {
+            "engine_status": "active",
+            "open_position_rows": 1,
+            "entry_fill_policy": promotion.PAPER_MARKET_ENTRY_POLICY,
+            "entry_fill_count": 1,
+            "entry_best_quote_fill_count": 0,
+            "entry_synthetic_fallback_fill_count": 1,
+            "entry_fill_is_synthetic": True,
+        }
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+
+    signal_rows = [
+        {
+            "market": market,
+            "session_date": current_date,
+            "entry_fill_policy": promotion.PAPER_MARKET_ENTRY_POLICY,
+            "requested_shares": 1_000,
+            "filled_shares": 1_000,
+            "side": "long",
+            "execution_price": 100.5,
+            "sizing_open_price": 100.0,
+            "upper_limit": 110.0,
+            "lower_limit": 90.0,
+            "status": "forced_synthetic_fill",
+            "entry_price_offset_ticks": 1,
+            "entry_price_source": (
+                "official_daily_session_open:adverse_one_legal_tick_fallback"
+            ),
+            "synthetic_fill": True,
+            "synthetic_fallback_fill": True,
+            "paper_market_fill": True,
+        }
+        for market in sorted(MARKETS)
+    ]
+    (candidate / "signals.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in signal_rows),
+        encoding="utf-8",
+    )
+
+    result = promotion._validate_rebuild(
+        candidate,
+        expected_markets=MARKETS,
+        allow_current_open_session=True,
+    )
+
+    assert result["synthetic_fallback_fills"] == 3
     assert result["final_open_positions"] == {market: 1 for market in sorted(MARKETS)}
 
 

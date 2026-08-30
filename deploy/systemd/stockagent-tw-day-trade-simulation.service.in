@@ -3,22 +3,25 @@ Description=StockAgent Taiwan stock day-trade paper execution and dashboard
 Wants=network-online.target time-sync.target
 After=network-online.target time-sync.target
 Before=stockagent-discord-bot.service stockagent-public-dashboards.service
-StartLimitIntervalSec=300
-StartLimitBurst=5
+StartLimitIntervalSec=60
+StartLimitBurst=20
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=all
 User=@SERVICE_USER@
 Group=@SERVICE_GROUP@
 WorkingDirectory=@REPO_ROOT@
 Environment="HOME=@SERVICE_HOME@"
 Environment="PYTHONUNBUFFERED=1"
 ExecStart=/usr/bin/bash "@REPO_ROOT@/scripts/run_tw_day_trade_services.sh"
-Nice=5
-CPUWeight=25
-IOWeight=25
-Restart=on-failure
-RestartSec=5s
+Nice=-5
+CPUWeight=100
+IOWeight=100
+Restart=always
+RestartSec=1s
+WatchdogSec=20s
+TimeoutStartSec=60s
 SuccessExitStatus=143 SIGTERM
 TimeoutStopSec=20s
 KillMode=control-group

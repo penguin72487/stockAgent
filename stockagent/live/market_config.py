@@ -51,6 +51,9 @@ class LiveMarketConfig:
     history_frequency: str = "daily"
     pre_signal_command: tuple[str, ...] = ()
     pre_signal_timeout_seconds: int = 900
+    completed_session_command: tuple[str, ...] = ()
+    completed_session_timeout_seconds: int = 900
+    formal_history_timeout_seconds: int = 1800
     previous_signal_backfill_limit: int = 32
     holidays: tuple[str, ...] = ()
     benchmark_window_days: int = 20
@@ -295,6 +298,15 @@ def load_market_config(path: str | Path) -> LiveMarketConfig:
         history_frequency=str(raw.get("history_frequency") or "daily"),
         pre_signal_command=_command_tuple(raw.get("pre_signal_command")),
         pre_signal_timeout_seconds=int(raw.get("pre_signal_timeout_seconds") or 900),
+        completed_session_command=_command_tuple(
+            raw.get("completed_session_command")
+        ),
+        completed_session_timeout_seconds=int(
+            raw.get("completed_session_timeout_seconds") or 900
+        ),
+        formal_history_timeout_seconds=max(
+            60, int(raw.get("formal_history_timeout_seconds") or 1800)
+        ),
         previous_signal_backfill_limit=max(
             0, int(raw.get("previous_signal_backfill_limit") or 32)
         ),

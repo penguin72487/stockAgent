@@ -91,6 +91,10 @@ Market configs:
   show recent bars instead of collapsing artifacts to daily rows.
 - `pre_signal_command` can run a data updater before scheduled signals. Crypto
   uses `downloader/download_okx_perp_1m.py --mode incremental` before alerting.
+- `completed_session_command` is independent from `pre_signal_command`. The TW
+  day-trade modes use it outside market hours to accept and atomically rebuild
+  the latest official close without requesting next-session eligibility or MIS
+  opening quotes.
 - `freshness_max_lag_days` is mainly for 24/7 crypto data; daily markets compare
   the latest parquet/benchmark date against the expected latest trading day.
   For one-minute crypto, prefer `freshness_max_lag_minutes`.
@@ -162,6 +166,14 @@ Operational files:
 - Runtime overrides: `artifacts/discord_bot/state.json`
 - Button/action audit trail: `artifacts/discord_bot/audit_events.jsonl`
 - Detailed command tracebacks: `artifacts/discord_bot/errors.log`
+  - The active log is capped at 4 MiB and keeps three rotated generations by
+    default. Startup also rotates an oversized inherited log so old failures do
+    not masquerade as errors from the current process.
+- Durable artifact-maintenance receipt:
+  `artifacts/discord_bot/artifact_backfill_status.json`
+  - Interactive `/signal_now` jobs share this receipt under
+    `signal_now_jobs`. A stale job is persisted as `waiting_source`, survives
+    bot restarts, and resumes only after canonical source acceptance is fresh.
 - Live signal artifacts: each configured `live_output_dir`, usually
   `artifacts/live_signals/<market>/<asof_date>/<signal_id>/`
   - `summary.json`
@@ -182,8 +194,24 @@ Public scheduled broadcasts are disabled by default
 and personal `/watch` DM alerts. Set `STOCKAGENT_PUBLIC_BROADCASTS=1` only when
 you want the bot to post automatic summaries/details to the shared channel.
 For daily markets, the private artifact backfill loop runs independently from
-public broadcasts and retries failed runs after
-`STOCKAGENT_SCHEDULED_RETRY_DELAY_SECONDS` seconds, default `60`.
+public broadcasts. Full fold inference uses
+`formal_history_timeout_seconds` (default `1800`) independently from the short
+data-activation `pre_signal_timeout_seconds`; do not reuse the activation limit
+for full-universe inference. Failed maintenance is recorded across restarts and
+retried with bounded exponential backoff, from 15 minutes up to 6 hours by
+default. Only the first failed attempt is broadcast, while `/health` and
+`service_status.json` keep the degraded maintenance state visible.
+Manual `/signal_now` follows the same ownership boundary: the source-event
+monitor downloads official data; the activation command only validates or
+switches an accepted release. Stale requests do not recompute an old preview.
+For a closed TW day-trade market, the persisted job instead runs the completed-
+session finalizer and calculates from `official_session_close`; this is an
+after-close calculation, not a claim that an order filled at the completed
+close. Formal-history maintenance is deferred while interactive signal work is
+pending.
+Requests for the same target/config share one persisted job, unexpected errors
+retry from 1 minute up to 15 minutes, and the 08:15–09:05 opening window defers
+interactive work to protect the execution engine.
 If the updater is rate-limited or otherwise produces mostly failed rows, the
 backfill is treated as failed and no live signal artifact is written from stale
 data.

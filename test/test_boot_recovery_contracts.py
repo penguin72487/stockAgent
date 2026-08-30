@@ -10,13 +10,29 @@ def _read(relative_path: str) -> str:
 
 def test_windows_public_gateway_does_not_block_or_kill_wsl_bootstrap() -> None:
     launcher = _read("scripts/start_windows_public_caddy.ps1")
+    installer = _read("scripts/install_windows_public_caddy.ps1")
 
     assert "systemctl start --no-block stockagent-public-dashboards.service" in launcher
+    assert 'Request-WslGateway "backend_unhealthy"' in launcher
+    assert "Test-GatewayBackend" in launcher
+    assert "WSL gateway dispatch failed" in launcher
+    assert "$wslBootstrapProcess.HasExited" in launcher
+    assert "Get-CaddyProcesses" in launcher
     assert "WaitForExit" not in launcher
     assert ".Kill(" not in launcher
-    assert launcher.index("[System.Diagnostics.Process]::Start") < launcher.index(
-        "& $caddy run"
-    )
+    assert "while ($true)" in launcher
+    assert "Start-CaddyIfNeeded" in launcher
+    assert "-DistroName" in installer
+    assert "-CaddyPath" in installer
+    assert "New-ScheduledTaskTrigger -AtStartup" in installer
+    assert '-LogonType S4U' in installer
+    assert '-Principal $principal' in installer
+    assert "pre_login_recovery=$preLoginRecovery" in installer
+    assert "at-logon self-healing fallback" in installer
+    assert "-User $currentUser" in installer
+    assert "-RepetitionInterval (New-TimeSpan -Minutes 1)" in installer
+    assert "-MultipleInstances IgnoreNew" in installer
+    assert "-StartWhenAvailable" in installer
 
 
 def test_expensive_recovery_jobs_are_timer_only_and_staggered() -> None:

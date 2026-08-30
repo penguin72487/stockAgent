@@ -230,3 +230,5 @@ artifacts_benchmark/*
 .build/
 data_tw_futures/*
 data_fred_crypto_macro/*
+data_tw_shioaji_history/*
+

@@ -37,10 +37,30 @@ _SHIOAJI_STOCK_CONTRACTS: dict[str, object | None] = {}
 _SHIOAJI_STOCK_CACHE: dict[str, tuple[float, dict[str, float | int | None]]] = {}
 _SHIOAJI_STOCK_LOGIN_RETRY_AFTER = 0.0
 _SHIOAJI_STOCK_LAST_LOGIN_ERROR: str | None = None
-_SHIOAJI_STOCK_LOGIN_BACKOFF_SECONDS = 60.0
+_SHIOAJI_STOCK_LOGIN_FAILURES = 0
 _TW_LIMIT_CACHE_LOCK = threading.Lock()
 _TW_LIMIT_CACHE_KEY: str | None = None
 _TW_LIMIT_CACHE: dict[str, tuple[float | None, float | None, float | None]] = {}
+_TW_MIS_BOOTSTRAP_LOCK = threading.Lock()
+_TW_MIS_BOOTSTRAP_COOKIES: dict[str, str] = {}
+_TW_MIS_BOOTSTRAP_AT = 0.0
+_TW_MIS_OPENING_LOCK = threading.Lock()
+_TW_MIS_OPENING_CACHE_KEY: tuple[str, str] | None = None
+_TW_MIS_OPENING_CACHE: dict[str, tuple[float, dict[str, float | int | bool | None]]] = {}
+
+_PRICE_SNAPSHOT_ARRAY_FIELDS = (
+    "open_prices",
+    "high_prices",
+    "low_prices",
+    "volumes",
+    "upper_limit_prices",
+    "lower_limit_prices",
+    "bid_prices",
+    "ask_prices",
+    "bid_volumes",
+    "ask_volumes",
+    "reference_prices",
+)
 
 
 @dataclass(slots=True)
@@ -63,6 +83,11 @@ class PriceSnapshot:
     ask_volumes: np.ndarray | None = None
     reference_prices: np.ndarray | None = None
     timestamps_ms: np.ndarray | None = None
+    # Exchange market-wall-clock time is separate from the local causal
+    # observation time.  Shioaji Snapshot.ts is encoded so direct datetime
+    # decoding yields Taiwan wall time; it is not a UTC epoch to shift by +8h.
+    # timestamps_ms remains the true local response receipt time.
+    exchange_timestamps_ms: np.ndarray | None = None
 
 
 def _is_shioaji_session_failure(exc: BaseException) -> bool:
@@ -82,6 +107,7 @@ def _shioaji_stock_api() -> object:
     """Return one process-local, simulation-only Shioaji quote connection."""
 
     global _SHIOAJI_STOCK_API
+    global _SHIOAJI_STOCK_LOGIN_FAILURES
     global _SHIOAJI_STOCK_LAST_LOGIN_ERROR
     global _SHIOAJI_STOCK_LOGIN_RETRY_AFTER
     with _SHIOAJI_STOCK_LOCK:
@@ -120,23 +146,54 @@ def _shioaji_stock_api() -> object:
                 force_refresh=True,
             )
         except Exception as exc:
-            _SHIOAJI_STOCK_LAST_LOGIN_ERROR = f"{type(exc).__name__}: {exc}"
-            _SHIOAJI_STOCK_LOGIN_RETRY_AFTER = (
-                time.monotonic() + _SHIOAJI_STOCK_LOGIN_BACKOFF_SECONDS
+            _SHIOAJI_STOCK_LOGIN_FAILURES += 1
+            retry_base = max(
+                0.25,
+                float(
+                    os.environ.get(
+                        "STOCKAGENT_SHIOAJI_LOGIN_RETRY_BASE_SECONDS",
+                        "2",
+                    )
+                ),
             )
+            retry_cap = max(
+                retry_base,
+                float(
+                    os.environ.get(
+                        "STOCKAGENT_SHIOAJI_LOGIN_RETRY_MAX_SECONDS",
+                        "30",
+                    )
+                ),
+            )
+            retry_delay = min(
+                retry_cap,
+                retry_base * (2 ** min(_SHIOAJI_STOCK_LOGIN_FAILURES - 1, 10)),
+            )
+            _SHIOAJI_STOCK_LAST_LOGIN_ERROR = f"{type(exc).__name__}: {exc}"
+            _SHIOAJI_STOCK_LOGIN_RETRY_AFTER = time.monotonic() + retry_delay
             try:
                 api.logout()
             except Exception:
                 pass
             raise
         _SHIOAJI_STOCK_API = api
+        _SHIOAJI_STOCK_LOGIN_FAILURES = 0
         _SHIOAJI_STOCK_LAST_LOGIN_ERROR = None
         _SHIOAJI_STOCK_LOGIN_RETRY_AFTER = 0.0
         return api
 
 
-def warm_shioaji_stock_quote_client() -> None:
-    """Login and prove the session before the opening latency-sensitive path."""
+def warm_shioaji_stock_quote_client(
+    symbols: list[str] | tuple[str, ...] | None = None,
+) -> dict[str, int | bool | str]:
+    """Prove one process-local session and prime requested stock contracts.
+
+    Shioaji clients and their contract objects are process-local.  A warm
+    connection owned by the paper engine therefore says nothing about the
+    Discord scheduler's 09:00 process.  Resolve the scheduler's active
+    universe before the open, but deliberately do not request a Snapshot here:
+    a pre-open Snapshot would be stale evidence for the opening auction.
+    """
 
     api = _shioaji_stock_api()
     try:
@@ -146,6 +203,34 @@ def warm_shioaji_stock_quote_client() -> None:
             raise
         api = _reconnect_shioaji_stock_quote_client(api)
         api.usage()
+
+    requested = list(
+        dict.fromkeys(str(symbol).strip() for symbol in (symbols or ()))
+    )
+    requested = [symbol for symbol in requested if symbol]
+    resolved = 0
+    with _SHIOAJI_STOCK_LOCK:
+        for symbol in requested:
+            # A Contract V2 lookup can transiently return ``None`` while the
+            # process-local contract cache is still updating.  ``None`` is not
+            # a durable negative result: retry it on every explicit prewarm so
+            # the 08:55 final arm can self-heal without restarting the bot.
+            if _SHIOAJI_STOCK_CONTRACTS.get(symbol) is None:
+                _SHIOAJI_STOCK_CONTRACTS[symbol] = api.contracts.get(symbol)
+            if _SHIOAJI_STOCK_CONTRACTS[symbol] is not None:
+                resolved += 1
+    missing = len(requested) - resolved
+    return {
+        "ready": not requested or missing == 0,
+        "connection_scope": "process",
+        "requested_count": len(requested),
+        # "primed" is an evidence claim, not an attempt count.  Only a
+        # process-local contract object that can be passed to snapshots counts.
+        "primed_count": resolved,
+        "resolved_count": resolved,
+        "missing_count": missing,
+        "snapshot_prefetched": False,
+    }
 
 
 def _reconnect_shioaji_stock_quote_client(failed_api: object) -> object:
@@ -171,11 +256,13 @@ def close_shioaji_stock_quote_client() -> None:
     """Close the process-local quote connection, primarily for clean shutdowns/tests."""
 
     global _SHIOAJI_STOCK_API
+    global _SHIOAJI_STOCK_LOGIN_FAILURES
     global _SHIOAJI_STOCK_LAST_LOGIN_ERROR
     global _SHIOAJI_STOCK_LOGIN_RETRY_AFTER
     with _SHIOAJI_STOCK_LOCK:
         api = _SHIOAJI_STOCK_API
         _SHIOAJI_STOCK_API = None
+        _SHIOAJI_STOCK_LOGIN_FAILURES = 0
         _SHIOAJI_STOCK_LAST_LOGIN_ERROR = None
         _SHIOAJI_STOCK_LOGIN_RETRY_AFTER = 0.0
         _SHIOAJI_STOCK_CONTRACTS.clear()
@@ -440,6 +527,27 @@ def _shioaji_snapshot_values(
     if price is None and bid is not None and ask is not None:
         price = (bid + ask) / 2.0
     price = price or bid or ask or reference
+
+    def exchange_timestamp_ms(value: object) -> int | None:
+        try:
+            raw = int(value)
+        except Exception:
+            return None
+        if raw <= 0:
+            return None
+        # Shioaji Snapshot.ts is nanoseconds in the current Python binding.
+        # Retain compatibility with microsecond/millisecond/second fixtures and
+        # older wrappers without changing the local receipt-time boundary.
+        if raw >= 100_000_000_000_000_000:
+            return raw // 1_000_000
+        if raw >= 100_000_000_000_000:
+            return raw // 1_000
+        if raw >= 100_000_000_000:
+            return raw
+        if raw >= 1_000_000_000:
+            return raw * 1_000
+        return None
+
     return {
         "price": price,
         "open": _float_or_none(getattr(row, "open", None)),
@@ -459,6 +567,7 @@ def _shioaji_snapshot_values(
         "bid_volume": _float_or_none(getattr(row, "buy_volume", None)),
         "ask_volume": _float_or_none(getattr(row, "sell_volume", None)),
         "reference": reference,
+        "exchange_ms": exchange_timestamp_ms(getattr(row, "ts", None)),
         # Causal execution uses the local observation time.  Snapshot ``ts`` is
         # exchange metadata and can predate the request when a symbol is idle.
         "received_ms": int(received_ms),
@@ -636,9 +745,16 @@ def _fetch_shioaji_stock_snapshots_once(
             cached = _SHIOAJI_STOCK_CACHE.get(code)
             if ttl > 0.0 and cached is not None and now_monotonic - cached[0] <= ttl:
                 continue
-            if code not in _SHIOAJI_STOCK_CONTRACTS:
+            # Retry transient Contract V2 misses instead of pinning ``None``
+            # until a process restart.
+            if _SHIOAJI_STOCK_CONTRACTS.get(code) is None:
                 _SHIOAJI_STOCK_CONTRACTS[code] = api.contracts.get(code)
             if _SHIOAJI_STOCK_CONTRACTS[code] is not None:
+                # Once a row exceeds its caller-approved TTL it is no longer
+                # evidence for this request.  Evict it before querying so an
+                # empty or partial provider response cannot silently revive an
+                # older Bid/Ask as a fresh executable quote.
+                _SHIOAJI_STOCK_CACHE.pop(code, None)
                 missing_codes.append(code)
 
         available_contracts = sum(
@@ -661,6 +777,19 @@ def _fetch_shioaji_stock_snapshots_once(
                 },
             )
 
+        try:
+            configured_snapshot_timeout_ms = int(
+                os.environ.get(
+                    "STOCKAGENT_SHIOAJI_SNAPSHOT_TIMEOUT_MS",
+                    "3000",
+                )
+            )
+        except (TypeError, ValueError):
+            configured_snapshot_timeout_ms = 3_000
+        snapshot_timeout_ms = max(
+            250,
+            min(5_000, configured_snapshot_timeout_ms),
+        )
         for start in range(0, len(missing_codes), 500):
             batch_codes = missing_codes[start : start + 500]
             contracts = [
@@ -670,14 +799,23 @@ def _fetch_shioaji_stock_snapshots_once(
             ]
             if not contracts:
                 continue
+            # Shioaji defaults Snapshot requests to 30 seconds.  One Taiwan
+            # universe needs up to six batches, so inheriting that default can
+            # exceed the opening SLO and trigger a destructive watchdog
+            # restart.  Bound every batch and let the scheduler retry quickly.
             with shioaji_query(
                 api,
                 consumer="stock_quote_provider",
                 method="snapshots",
                 asset_class="stock",
-                details={"contract_count": len(contracts)},
+                details={
+                    "contract_count": len(contracts),
+                    "timeout_ms": snapshot_timeout_ms,
+                },
             ) as set_ledger_result:
-                rows = list(api.snapshots(contracts))
+                rows = list(
+                    api.snapshots(contracts, timeout=snapshot_timeout_ms)
+                )
                 set_ledger_result(rows)
             # The causal observation boundary is when the complete response is
             # locally available, never when the request was sent.
@@ -716,6 +854,7 @@ def _fetch_shioaji_stock_snapshots_once(
             )
         }
         timestamps_ms = np.zeros((size,), dtype=np.int64)
+        exchange_timestamps_ms = np.zeros((size,), dtype=np.int64)
         for idx, code in enumerate(requested):
             cached = _SHIOAJI_STOCK_CACHE.get(code)
             if cached is None:
@@ -730,6 +869,7 @@ def _fetch_shioaji_stock_snapshots_once(
                 if value is not None:
                     target[idx] = float(value)
             timestamps_ms[idx] = int(values.get("received_ms") or 0)
+            exchange_timestamps_ms[idx] = int(values.get("exchange_ms") or 0)
 
     prepared_limits, _limit_path = _load_prepared_tw_price_limits()
     prepared_count = 0
@@ -853,6 +993,7 @@ def _fetch_shioaji_stock_snapshots_once(
         ask_volumes=arrays["ask_volume"],
         reference_prices=arrays["reference"],
         timestamps_ms=timestamps_ms,
+        exchange_timestamps_ms=exchange_timestamps_ms,
     )
 
 
@@ -1311,6 +1452,220 @@ def _tw_mis_price(row: dict) -> float | None:
     return bid or ask or _float_or_none(row.get("y"))
 
 
+def _tw_mis_opening_receipt_path(session_date: str) -> Path:
+    configured = str(
+        os.getenv("STOCKAGENT_TW_OPENING_SNAPSHOT_ROOT", "") or ""
+    ).strip()
+    root = Path(configured) if configured else Path("artifacts/live/tw_opening_snapshots")
+    return root / f"{session_date}.json"
+
+
+def _same_taipei_session_timestamp(timestamp_ms: int, session_date: str) -> bool:
+    if timestamp_ms <= 0:
+        return False
+    try:
+        observed = datetime.fromtimestamp(
+            timestamp_ms / 1000.0,
+            tz=timezone.utc,
+        ).astimezone(ZoneInfo("Asia/Taipei"))
+    except (OSError, OverflowError, ValueError):
+        return False
+    return observed.date().isoformat() == session_date
+
+
+def _load_tw_mis_opening_receipt(
+    *, parquet_root: str, session_date: str
+) -> dict[str, tuple[float, dict[str, float | int | bool | None]]]:
+    path = _tw_mis_opening_receipt_path(session_date)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError):
+        return {}
+    if (
+        not isinstance(payload, dict)
+        or payload.get("session_date") != session_date
+        or payload.get("parquet_root") != parquet_root
+    ):
+        return {}
+    rows = payload.get("rows")
+    if not isinstance(rows, dict):
+        return {}
+    stored_at = time.monotonic()
+    accepted: dict[
+        str, tuple[float, dict[str, float | int | bool | None]]
+    ] = {}
+    for symbol, raw in rows.items():
+        if not isinstance(raw, dict):
+            continue
+        open_price = _float_or_none(raw.get("open_prices"))
+        try:
+            timestamp_ms = int(raw.get("timestamp_ms") or 0)
+        except (TypeError, ValueError):
+            continue
+        if open_price is None or not _same_taipei_session_timestamp(
+            timestamp_ms, session_date
+        ):
+            continue
+        row: dict[str, float | int | bool | None] = {
+            "available": bool(raw.get("available")),
+            "price": _float_or_none(raw.get("price")),
+            "timestamp_ms": timestamp_ms,
+        }
+        for field in _PRICE_SNAPSHOT_ARRAY_FIELDS:
+            row[field] = _float_or_none(raw.get(field))
+        accepted[str(symbol)] = (stored_at, row)
+    return accepted
+
+
+def tw_mis_opening_receipt_status(
+    *, parquet_root: str | Path, session_date: str
+) -> dict[str, str | int | bool | None]:
+    """Report whether a receipt-backed same-session opening cache is usable."""
+
+    resolved_root = str(Path(parquet_root).resolve())
+    path = _tw_mis_opening_receipt_path(session_date)
+    rows = _load_tw_mis_opening_receipt(
+        parquet_root=resolved_root,
+        session_date=session_date,
+    )
+    return {
+        "ready": bool(rows),
+        "session_date": session_date,
+        "parquet_root": resolved_root,
+        "path": str(path.resolve()),
+        "row_count": len(rows),
+    }
+
+
+def _persist_tw_mis_opening_receipt(
+    *,
+    parquet_root: str,
+    session_date: str,
+    rows: dict[str, tuple[float, dict[str, float | int | bool | None]]],
+    source_artifact: str | None = None,
+) -> Path | None:
+    accepted: dict[str, dict[str, float | int | bool | None]] = {}
+    for symbol, (_stored_at, raw) in rows.items():
+        open_price = _float_or_none(raw.get("open_prices"))
+        try:
+            timestamp_ms = int(raw.get("timestamp_ms") or 0)
+        except (TypeError, ValueError):
+            continue
+        if open_price is None or not _same_taipei_session_timestamp(
+            timestamp_ms, session_date
+        ):
+            continue
+        accepted[str(symbol)] = {
+            "available": bool(raw.get("available")),
+            "price": _float_or_none(raw.get("price")),
+            "timestamp_ms": timestamp_ms,
+            **{
+                field: _float_or_none(raw.get(field))
+                for field in _PRICE_SNAPSHOT_ARRAY_FIELDS
+            },
+        }
+    if not accepted:
+        return None
+    path = _tw_mis_opening_receipt_path(session_date)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema_version": 1,
+        "session_date": session_date,
+        "parquet_root": parquet_root,
+        "captured_at_taipei": datetime.now(ZoneInfo("Asia/Taipei")).isoformat(
+            timespec="seconds"
+        ),
+        "source": "twse_tpex:mis_opening_snapshot",
+        "source_artifact": source_artifact,
+        "row_count": len(accepted),
+        "rows": accepted,
+    }
+    temporary = path.with_suffix(
+        path.suffix + f".tmp.{os.getpid()}.{threading.get_ident()}"
+    )
+    try:
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return path
+
+
+def warm_tw_mis_quote_client(
+    *, force: bool = False
+) -> dict[str, float | int | bool | None]:
+    """Warm and prove the actual TWSE MIS quote API before the critical path.
+
+    ``stock/index.jsp`` is only a browser front end.  It has returned 404/502
+    while ``api/getStockInfo.jsp`` remained healthy, so its status must not be
+    the readiness authority for market data.  Visiting it remains a best-effort
+    cookie bootstrap; the small API request below is the fail-closed proof.
+    """
+
+    global _TW_MIS_BOOTSTRAP_AT
+    global _TW_MIS_BOOTSTRAP_COOKIES
+    started = time.perf_counter()
+    now_monotonic = time.monotonic()
+    with _TW_MIS_BOOTSTRAP_LOCK:
+        cache_hit = bool(
+            not force
+            and _TW_MIS_BOOTSTRAP_AT > 0.0
+            and now_monotonic - _TW_MIS_BOOTSTRAP_AT <= 7200.0
+        )
+        if not cache_hit:
+            session = requests.Session()
+            session.headers.update(_YAHOO_HEADERS)
+            frontend_http_status: int | None = None
+            try:
+                frontend = session.get(
+                    "https://mis.twse.com.tw/stock/index.jsp",
+                    timeout=8,
+                )
+                frontend_http_status = int(frontend.status_code)
+                frontend.raise_for_status()
+            except Exception:
+                # The browser page is not the data plane.  Preserve its status
+                # for diagnostics and continue to the authoritative API probe.
+                pass
+            response = session.get(
+                "https://mis.twse.com.tw/stock/api/getStockInfo.jsp",
+                params={
+                    "ex_ch": "tse_2330.tw",
+                    "json": "1",
+                    "delay": "0",
+                    "_": str(int(datetime.now().timestamp() * 1000)),
+                },
+                headers={
+                    "Referer": "https://mis.twse.com.tw/stock/index.jsp",
+                    **_YAHOO_HEADERS,
+                },
+                timeout=8,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            if not isinstance(payload, dict) or not isinstance(
+                payload.get("msgArray"), list
+            ):
+                raise RuntimeError("TWSE MIS quote API returned an invalid payload")
+            _TW_MIS_BOOTSTRAP_COOKIES = requests.utils.dict_from_cookiejar(
+                session.cookies
+            )
+            _TW_MIS_BOOTSTRAP_AT = time.monotonic()
+        else:
+            frontend_http_status = None
+        cookie_count = len(_TW_MIS_BOOTSTRAP_COOKIES)
+    return {
+        "ready": True,
+        "cache_hit": cache_hit,
+        "cookie_count": cookie_count,
+        "frontend_http_status": frontend_http_status,
+        "elapsed_ms": round((time.perf_counter() - started) * 1000.0, 3),
+    }
+
+
 def fetch_tw_mis_last_prices(
     symbols: list[str],
     fallback_prices: np.ndarray,
@@ -1319,6 +1674,7 @@ def fetch_tw_mis_last_prices(
     chunk_size: int = 80,
     empty_chunk_retry_attempts: int | None = None,
     empty_chunk_retry_delay_seconds: float | None = None,
+    max_parallel_requests: int | None = None,
 ) -> PriceSnapshot:
     """Fetch Taiwan intraday prices from TWSE MIS and align them to panel symbols."""
     yahoo_map = load_symbol_yahoo_map(parquet_root)
@@ -1350,7 +1706,11 @@ def fetch_tw_mis_last_prices(
         ex_channels[start : start + chunk_len]
         for start in range(0, len(ex_channels), chunk_len)
     ]
-    max_parallel = int(os.getenv("STOCKAGENT_TW_MIS_PARALLEL_REQUESTS", "4") or "4")
+    max_parallel = (
+        int(max_parallel_requests)
+        if max_parallel_requests is not None
+        else int(os.getenv("STOCKAGENT_TW_MIS_PARALLEL_REQUESTS", "4") or "4")
+    )
     workers = max(1, min(len(chunks) or 1, max_parallel))
     retry_attempts = max(
         0,
@@ -1367,16 +1727,25 @@ def fetch_tw_mis_last_prices(
         ),
     )
     session_local = threading.local()
+    try:
+        bootstrap = warm_tw_mis_quote_client()
+    except Exception:
+        bootstrap = {"ready": False}
 
     def session() -> requests.Session:
         sess = getattr(session_local, "session", None)
         if sess is None:
             sess = requests.Session()
             sess.headers.update(_YAHOO_HEADERS)
-            try:
-                sess.get("https://mis.twse.com.tw/stock/index.jsp", timeout=8)
-            except Exception:
-                pass
+            with _TW_MIS_BOOTSTRAP_LOCK:
+                cookies = dict(_TW_MIS_BOOTSTRAP_COOKIES)
+            if cookies:
+                sess.cookies.update(cookies)
+            elif not bootstrap.get("ready"):
+                try:
+                    sess.get("https://mis.twse.com.tw/stock/index.jsp", timeout=8)
+                except Exception:
+                    pass
             session_local.session = sess
         return sess
 
@@ -1594,6 +1963,163 @@ def fetch_tw_mis_last_prices(
         bid_volumes=bid_volumes,
         ask_volumes=ask_volumes,
         reference_prices=reference_prices,
+        timestamps_ms=timestamps_ms,
+    )
+
+
+def fetch_tw_mis_opening_snapshot(
+    symbols: list[str],
+    fallback_prices: np.ndarray,
+    *,
+    parquet_root: str | Path,
+    chunk_size: int = 80,
+    cache_ttl_seconds: float = 15.0,
+    max_parallel_requests: int = 16,
+) -> PriceSnapshot:
+    """Fetch one shared causal opening observation for all TW day-trade models.
+
+    This short-lived cache is only for model opening inputs. Execution must call
+    Shioaji again for the causally later best Bid/Ask of actual order candidates.
+    A complete market observation is shared so three models do not independently
+    pay the same full-universe HTTP fan-out at 09:00.
+    """
+
+    global _TW_MIS_OPENING_CACHE_KEY
+    requested = [str(symbol).strip() for symbol in symbols]
+    fallback = np.asarray(fallback_prices, dtype=np.float64)
+    if len(requested) != len(fallback):
+        raise ValueError("symbols and fallback_prices must have equal length")
+    session_date = datetime.now(ZoneInfo("Asia/Taipei")).date().isoformat()
+    cache_key = (str(Path(parquet_root).resolve()), session_date)
+    ttl = max(0.0, float(cache_ttl_seconds))
+
+    with _TW_MIS_OPENING_LOCK:
+        if _TW_MIS_OPENING_CACHE_KEY != cache_key:
+            _TW_MIS_OPENING_CACHE.clear()
+            _TW_MIS_OPENING_CACHE_KEY = cache_key
+            _TW_MIS_OPENING_CACHE.update(
+                _load_tw_mis_opening_receipt(
+                    parquet_root=cache_key[0],
+                    session_date=session_date,
+                )
+            )
+        now_monotonic = time.monotonic()
+        missing_indices = [
+            idx
+            for idx, symbol in enumerate(requested)
+            if symbol not in _TW_MIS_OPENING_CACHE
+            or now_monotonic - _TW_MIS_OPENING_CACHE[symbol][0] > ttl
+        ]
+        cache_hits = len(requested) - len(missing_indices)
+        if missing_indices:
+            missing_symbols = [requested[idx] for idx in missing_indices]
+            fresh = fetch_tw_mis_last_prices(
+                missing_symbols,
+                fallback[np.asarray(missing_indices, dtype=np.int64)],
+                parquet_root=parquet_root,
+                chunk_size=chunk_size,
+                empty_chunk_retry_attempts=0,
+                max_parallel_requests=max_parallel_requests,
+            )
+            fresh_opens = (
+                np.asarray(fresh.open_prices, dtype=np.float64)
+                if fresh.open_prices is not None
+                else np.full((len(missing_symbols),), np.nan, dtype=np.float64)
+            )
+            # An all-empty opening response is a transient pre-open observation,
+            # not a cacheable negative result. Let the 10 Hz scheduler retry it.
+            cache_fresh = bool(
+                np.any(np.isfinite(fresh_opens) & (fresh_opens > 0.0))
+            )
+            if cache_fresh:
+                stored_at = time.monotonic()
+                fresh_available = (
+                    np.asarray(fresh.available_mask, dtype=bool)
+                    if fresh.available_mask is not None
+                    else np.zeros((len(missing_symbols),), dtype=bool)
+                )
+                fresh_timestamps = (
+                    np.asarray(fresh.timestamps_ms, dtype=np.int64)
+                    if fresh.timestamps_ms is not None
+                    else np.zeros((len(missing_symbols),), dtype=np.int64)
+                )
+                for local_idx, symbol in enumerate(missing_symbols):
+                    row: dict[str, float | int | bool | None] = {
+                        "available": bool(fresh_available[local_idx]),
+                        "price": (
+                            float(fresh.prices[local_idx])
+                            if fresh_available[local_idx]
+                            and np.isfinite(fresh.prices[local_idx])
+                            else None
+                        ),
+                        "timestamp_ms": int(fresh_timestamps[local_idx]),
+                    }
+                    for field in _PRICE_SNAPSHOT_ARRAY_FIELDS:
+                        values = getattr(fresh, field)
+                        value = (
+                            float(np.asarray(values)[local_idx])
+                            if values is not None
+                            else float("nan")
+                        )
+                        row[field] = value if np.isfinite(value) else None
+                    _TW_MIS_OPENING_CACHE[symbol] = (stored_at, row)
+                _persist_tw_mis_opening_receipt(
+                    parquet_root=cache_key[0],
+                    session_date=session_date,
+                    rows=_TW_MIS_OPENING_CACHE,
+                )
+
+        size = len(requested)
+        prices = fallback.copy()
+        available = np.zeros((size,), dtype=bool)
+        timestamps_ms = np.zeros((size,), dtype=np.int64)
+        arrays = {
+            field: np.full((size,), np.nan, dtype=np.float64)
+            for field in _PRICE_SNAPSHOT_ARRAY_FIELDS
+        }
+        assembled_at = time.monotonic()
+        for idx, symbol in enumerate(requested):
+            cached = _TW_MIS_OPENING_CACHE.get(symbol)
+            if cached is None or assembled_at - cached[0] > ttl:
+                continue
+            row = cached[1]
+            available[idx] = bool(row.get("available"))
+            price = row.get("price")
+            if price is not None:
+                prices[idx] = float(price)
+            timestamps_ms[idx] = int(row.get("timestamp_ms") or 0)
+            for field, target in arrays.items():
+                value = row.get(field)
+                if value is not None:
+                    target[idx] = float(value)
+
+    latest_ms = int(timestamps_ms.max(initial=0))
+    timestamp = (
+        datetime.fromtimestamp(latest_ms / 1000.0, tz=timezone.utc).isoformat()
+        if latest_ms > 0
+        else None
+    )
+    source = "twse_tpex:mis+shared_opening_snapshot"
+    if cache_hits:
+        source += "+cache_hit"
+    return PriceSnapshot(
+        prices=prices,
+        source=source,
+        timestamp=timestamp,
+        available_count=int(available.sum()),
+        requested_count=size,
+        available_mask=available,
+        open_prices=arrays["open_prices"],
+        high_prices=arrays["high_prices"],
+        low_prices=arrays["low_prices"],
+        volumes=arrays["volumes"],
+        upper_limit_prices=arrays["upper_limit_prices"],
+        lower_limit_prices=arrays["lower_limit_prices"],
+        bid_prices=arrays["bid_prices"],
+        ask_prices=arrays["ask_prices"],
+        bid_volumes=arrays["bid_volumes"],
+        ask_volumes=arrays["ask_volumes"],
+        reference_prices=arrays["reference_prices"],
         timestamps_ms=timestamps_ms,
     )
 

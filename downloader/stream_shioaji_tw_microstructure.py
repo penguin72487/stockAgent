@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
-from datetime import datetime, time as datetime_time, timezone
+from datetime import date, datetime, time as datetime_time, timezone
 import hashlib
 import itertools
 import json
@@ -435,6 +435,7 @@ class CaptureStats:
     dropped_events: int = 0
     queue_high_watermark: int = 0
     missed_snapshot_seconds: int = 0
+    out_of_scope_events: int = 0
 
 
 class EventSink:
@@ -448,6 +449,7 @@ class EventSink:
         flush_rows: int,
         flush_seconds: float,
         stale_ms: float,
+        accepted_trade_date: date | None = None,
     ) -> None:
         self.worker_index = worker_index
         self.queue: queue.Queue[tuple[str, dict[str, Any]]] = queue.Queue(queue_size)
@@ -457,6 +459,7 @@ class EventSink:
         self.stats_lock = threading.Lock()
         self.latest_books: dict[str, dict[str, Any]] = {}
         self.stale_ms = stale_ms
+        self.accepted_trade_date = accepted_trade_date
         self.live_book_codes: set[str] = set()
         self.live_book_metadata: dict[str, dict[str, Any]] = {}
         self.live_books_path = output_dir / "runtime" / f"worker_{worker_index:02d}.json"
@@ -479,6 +482,17 @@ class EventSink:
         self.thread.start()
 
     def enqueue(self, kind: str, row: dict[str, Any]) -> None:
+        if (
+            self.accepted_trade_date is not None
+            and row.get("trade_date") != self.accepted_trade_date
+        ):
+            # Shioaji may emit one cached quote from the preceding session as a
+            # subscription is established.  It is useful provider behaviour,
+            # but it is not an event from this capture's trading date and must
+            # not leak into this capture's part counts or causal book stream.
+            with self.stats_lock:
+                self.stats.out_of_scope_events += 1
+            return
         try:
             self.queue.put_nowait((kind, row))
             size = self.queue.qsize()

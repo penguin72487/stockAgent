@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter, defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, wait
 import csv
 from dataclasses import dataclass
 from datetime import datetime, time as datetime_time, timedelta
@@ -48,8 +48,11 @@ from downloader.common import (  # noqa: E402
 )
 from downloader.download_tw_public_data import (  # noqa: E402
     DATA_GOV_DATASET_API,
+    DAILY_SUPERSEDED_DATASETS,
     DEFAULT_DATASETS,
     DatasetSpec,
+    TPEX_OFFICIAL_CALENDAR_DATASET,
+    TPEX_SESSION_DEPENDENT_DATASETS,
 )
 from scripts.watch_tw_public_publication_group import (  # noqa: E402
     PublicationPhase,
@@ -58,6 +61,11 @@ from scripts.watch_tw_public_publication_group import (  # noqa: E402
     _file_hashes,
     _latest_completed_taiex_session,
     _taiex_calendar_command,
+)
+from stockagent.live.service_notify import notify_systemd  # noqa: E402
+from stockagent.live.tw_public_opening_revision import (  # noqa: E402
+    active_opening_revision_freeze,
+    opening_revision_gate_path,
 )
 
 
@@ -655,9 +663,24 @@ def _probe_specs(
     with ThreadPoolExecutor(
         max_workers=min(int(args.probe_workers), max(1, len(groups)))
     ) as executor:
-        futures = [executor.submit(run_group, group) for group in groups.values()]
-        for future in as_completed(futures):
-            results.extend(future.result())
+        pending = {
+            executor.submit(run_group, group) for group in groups.values()
+        }
+        completed_count = 0
+        while pending:
+            done, pending = wait(
+                pending,
+                timeout=max(1.0, min(10.0, float(args.heartbeat_seconds) / 2.0)),
+            )
+            for future in done:
+                group_results = future.result()
+                completed_count += len(group_results)
+                results.extend(group_results)
+            notify_systemd(
+                "WATCHDOG=1\n"
+                f"STATUS=probing TW public sources completed={completed_count}/"
+                f"{len(specs)} pending_hosts={len(pending)}"
+            )
     return sorted(results, key=lambda row: row.dataset)
 
 
@@ -816,7 +839,85 @@ def _resilient_download_args(args: argparse.Namespace) -> argparse.Namespace:
     return resolved
 
 
+def _refresh_selector_names(names: list[str]) -> list[str]:
+    """Include the TPEx calendar baseline before any dependent refresh."""
+
+    selected = set(names)
+    if selected & TPEX_SESSION_DEPENDENT_DATASETS:
+        selected.add(TPEX_OFFICIAL_CALENDAR_DATASET)
+    return sorted(selected)
+
+
+def _download_retry_due(row: Mapping[str, Any], observed: datetime) -> bool:
+    retry_at = _parse_timestamp(row.get("next_download_retry_at_taipei"))
+    return retry_at is None or retry_at <= observed
+
+
+def _deferred_opening_refresh(
+    names: list[str],
+    *,
+    state_root: Path,
+    freeze: Mapping[str, Any],
+) -> dict[str, Any]:
+    observed = datetime.now(TAIPEI)
+    run_id = observed.strftime("%Y%m%dT%H%M%S%f")
+    payload = {
+        "schema_version": SCHEMA_VERSION,
+        "event_id": run_id,
+        "status": "deferred_opening_revision",
+        "event_kind": "version_change",
+        "started_at_taipei": observed.isoformat(timespec="seconds"),
+        "completed_at_taipei": observed.isoformat(timespec="seconds"),
+        "triggered_dataset_count": len(names),
+        "triggered_datasets": sorted(names),
+        "accepted_dataset_count": 0,
+        "accepted_datasets": [],
+        "failed_dataset_count": 0,
+        "failed_datasets": [],
+        "deferred_apply_until_taipei": freeze.get(
+            "defer_apply_until_taipei"
+        ),
+        "opening_revision_frozen_at_taipei": freeze.get("frozen_at_taipei"),
+        "message": "official versions observed; canonical apply deferred by opening revision lease",
+    }
+    _atomic_json(state_root / "events" / "latest.json", payload)
+    _atomic_json(state_root / "events" / "runs" / f"{run_id}.json", payload)
+    return payload
+
+
 def _refresh_pending(
+    names: list[str],
+    *,
+    state: dict[str, Any],
+    live_root: Path,
+    state_root: Path,
+    specs_by_name: Mapping[str, DatasetSpec],
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    gate_path = opening_revision_gate_path(live_root)
+    gate_path.parent.mkdir(parents=True, exist_ok=True)
+    with gate_path.open("a+", encoding="utf-8") as gate_handle:
+        fcntl.flock(gate_handle.fileno(), fcntl.LOCK_EX)
+        freeze = active_opening_revision_freeze(
+            live_root, observed=datetime.now(TAIPEI)
+        )
+        if freeze:
+            return _deferred_opening_refresh(
+                names,
+                state_root=state_root,
+                freeze=freeze,
+            )
+        return _refresh_pending_serialized(
+            names,
+            state=state,
+            live_root=live_root,
+            state_root=state_root,
+            specs_by_name=specs_by_name,
+            args=args,
+        )
+
+
+def _refresh_pending_serialized(
     names: list[str],
     *,
     state: dict[str, Any],
@@ -828,14 +929,17 @@ def _refresh_pending(
     started = datetime.now(TAIPEI)
     run_id = started.strftime("%Y%m%dT%H%M%S%f")
     metadata_dir = state_root / "download_runs" / run_id
+    selector_names = _refresh_selector_names(names)
     phase = PublicationPhase(
         name="source_event",
         anchor=datetime_time(0, 0),
-        selectors=tuple(names),
+        selectors=tuple(selector_names),
         official_basis="observed official HTTP representation version change",
     )
     historical = [
-        name for name in names if specs_by_name[name].kind == "historical_json_table"
+        name
+        for name in selector_names
+        if specs_by_name[name].kind == "historical_json_table"
     ]
     download_args = _resilient_download_args(args)
     if historical and started.timetz().replace(tzinfo=None) < datetime_time(13, 30):
@@ -856,7 +960,7 @@ def _refresh_pending(
                 row["last_download_status"] = "blocked_taiex_session_calendar"
                 row["last_download_error"] = str(exc)
                 row["consecutive_download_failures"] = failures
-                row["next_probe_at_taipei"] = (
+                row["next_download_retry_at_taipei"] = (
                     completed_at
                     + timedelta(
                         seconds=min(60.0, 5.0 * (2 ** min(failures - 1, 4)))
@@ -921,12 +1025,40 @@ def _refresh_pending(
     return_codes: list[int] = []
     lock_started = time.perf_counter()
     with lock_path.open("a+", encoding="utf-8") as lock_handle:
-        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        while True:
+            try:
+                fcntl.flock(
+                    lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB
+                )
+                break
+            except BlockingIOError:
+                notify_systemd(
+                    "WATCHDOG=1\nSTATUS=waiting for canonical TW public refresh lock"
+                )
+                if _STOP.wait(5.0):
+                    raise RuntimeError("source-event monitor stopped while waiting for refresh lock")
         lock_wait_ms = (time.perf_counter() - lock_started) * 1000.0
         before = _file_hashes(live_root, names)
         for command in commands:
-            completed = subprocess.run(command, cwd=REPO_ROOT, check=False)
-            return_codes.append(int(completed.returncode))
+            process = subprocess.Popen(command, cwd=REPO_ROOT)
+            command_started = time.monotonic()
+            while process.poll() is None:
+                notify_systemd(
+                    "WATCHDOG=1\n"
+                    f"STATUS=applying TW public source event pid={process.pid} "
+                    f"elapsed={time.monotonic() - command_started:.1f}s"
+                )
+                if _STOP.wait(
+                    max(1.0, min(10.0, float(args.heartbeat_seconds) / 2.0))
+                ):
+                    process.terminate()
+                    try:
+                        process.wait(timeout=30)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+                    raise RuntimeError("source-event monitor stopped during refresh")
+            return_codes.append(int(process.returncode))
             # Calendar refresh failure must not suppress unrelated source-event
             # downloads; the downloader remains the semantic authority.
         after = _file_hashes(live_root, names)
@@ -949,13 +1081,14 @@ def _refresh_pending(
             row["last_download_error"] = None
             row["consecutive_download_failures"] = 0
             row["pending_since_taipei"] = None
+            row["next_download_retry_at_taipei"] = None
         else:
             row = rows[name]
             row["last_download_status"] = status
             row["last_download_error"] = (result or {}).get("message")
             download_failures = int(row.get("consecutive_download_failures") or 0) + 1
             row["consecutive_download_failures"] = download_failures
-            row["next_probe_at_taipei"] = (
+            row["next_download_retry_at_taipei"] = (
                 datetime.now(TAIPEI)
                 + timedelta(seconds=min(60.0, 5.0 * (2 ** min(download_failures - 1, 4))))
             ).isoformat(timespec="seconds")
@@ -997,12 +1130,34 @@ def _summarize_state(
     *,
     specs: list[DatasetSpec],
     changed: list[str],
+    observed: datetime | None = None,
 ) -> None:
+    current = (observed or datetime.now(TAIPEI)).astimezone(TAIPEI)
     rows = state.get("datasets")
     rows = dict(rows) if isinstance(rows, Mapping) else {}
-    observed = [name for name, row in rows.items() if row.get("observed_version")]
-    failed_probes = [
+    observed_datasets = [
+        name for name, row in rows.items() if row.get("observed_version")
+    ]
+    raw_failed_probes = [
         name for name, row in rows.items() if row.get("last_probe_status") == "failed"
+    ]
+    accepted_fallbacks: dict[str, str] = {}
+    for shadow_name, replacement_name in DAILY_SUPERSEDED_DATASETS.items():
+        if shadow_name not in raw_failed_probes:
+            continue
+        replacement = rows.get(replacement_name)
+        replacement = dict(replacement) if isinstance(replacement, Mapping) else {}
+        observed_version = replacement.get("observed_version")
+        if (
+            replacement.get("last_probe_status") == "ok"
+            and observed_version
+            and replacement.get("applied_version") == observed_version
+            and replacement.get("last_download_status")
+            not in BLOCKING_DOWNLOAD_STATUSES
+        ):
+            accepted_fallbacks[shadow_name] = replacement_name
+    failed_probes = [
+        name for name in raw_failed_probes if name not in accepted_fallbacks
     ]
     pending = [
         name
@@ -1010,12 +1165,25 @@ def _summarize_state(
         if row.get("observed_version")
         and row.get("applied_version") != row.get("observed_version")
     ]
-    coverage = len(rows) == len(specs) and len(observed) == len(specs)
+    deferred_until = _parse_timestamp(
+        state.get("opening_apply_deferred_until_taipei")
+    )
+    configured_deferred = {
+        str(name)
+        for name in state.get("opening_apply_deferred_datasets", [])
+    }
+    deferred = (
+        sorted(set(pending) & configured_deferred)
+        if deferred_until is not None and current < deferred_until
+        else []
+    )
+    blocking_pending = sorted(set(pending) - set(deferred))
+    coverage = len(rows) == len(specs) and len(observed_datasets) == len(specs)
     state.update(
         {
             "status": (
                 "ok"
-                if coverage and not failed_probes and not pending
+                if coverage and not failed_probes and not blocking_pending
                 else "warming"
                 if not coverage
                 else "degraded"
@@ -1023,19 +1191,31 @@ def _summarize_state(
             "coverage_complete": coverage,
             "registered_dataset_count": len(specs),
             "monitored_dataset_count": len(rows),
-            "observed_dataset_count": len(observed),
+            "observed_dataset_count": len(observed_datasets),
             "failed_probe_count": len(failed_probes),
             "failed_probe_datasets": sorted(failed_probes),
+            # Preserve the physical endpoint failure as audit evidence while
+            # keeping a verified canonical replacement from blocking the full
+            # pre-open acceptance gate.  If the replacement is stale, pending,
+            # or failed, the shadow endpoint immediately becomes blocking again.
+            "raw_failed_probe_count": len(raw_failed_probes),
+            "raw_failed_probe_datasets": sorted(raw_failed_probes),
+            "nonblocking_shadow_failed_probe_count": len(accepted_fallbacks),
+            "nonblocking_shadow_failed_probe_datasets": sorted(accepted_fallbacks),
+            "accepted_source_fallbacks": dict(sorted(accepted_fallbacks.items())),
             "unapplied_event_count": len(pending),
             "unapplied_event_datasets": sorted(pending),
+            "blocking_unapplied_event_count": len(blocking_pending),
+            "blocking_unapplied_event_datasets": blocking_pending,
+            "opening_apply_deferred": bool(deferred),
+            "opening_apply_deferred_count": len(deferred),
+            "opening_apply_deferred_datasets": deferred,
             "last_cycle_changed_count": len(changed),
             "last_cycle_changed_datasets": sorted(changed),
             "source_counts": dict(
                 sorted(Counter(spec.source for spec in specs).items())
             ),
-            "updated_at_taipei": datetime.now(TAIPEI).isoformat(
-                timespec="seconds"
-            ),
+            "updated_at_taipei": current.isoformat(timespec="seconds"),
         }
     )
 
@@ -1093,9 +1273,17 @@ def main() -> int:
     )
     last_heartbeat = 0.0
     cycles = 0
+    notify_systemd(
+        "READY=1\nWATCHDOG=1\n"
+        f"STATUS=monitoring {len(specs)} registered TW public datasets"
+    )
     while not _STOP.is_set():
         observed = datetime.now(TAIPEI)
         due = _due_specs(specs, state, observed)
+        notify_systemd(
+            "WATCHDOG=1\n"
+            f"STATUS=cycle due={len(due)} status={state.get('status', 'warming')}"
+        )
         changed: list[str] = []
         if due:
             state["cycle_started_at_taipei"] = observed.isoformat(timespec="seconds")
@@ -1140,20 +1328,72 @@ def main() -> int:
                         datetime.now(TAIPEI).isoformat(timespec="seconds"),
                     )
                 pending = [name for name in pending if name not in baseline_names]
-            if pending and not args.probe_only:
-                state["refresh_in_progress"] = True
-                _summarize_state(state, specs=specs, changed=changed)
-                _atomic_json(state_path, state)
-                refresh = _refresh_pending(
-                    pending,
-                    state=state,
-                    live_root=live_root,
-                    state_root=state_root,
-                    specs_by_name=specs_by_name,
-                    args=args,
+            refreshable_pending = [
+                name
+                for name in pending
+                if name in changed
+                or _download_retry_due(rows[name], datetime.now(TAIPEI))
+            ]
+            if refreshable_pending and not args.probe_only:
+                refresh_observed = datetime.now(TAIPEI)
+                freeze = active_opening_revision_freeze(
+                    live_root, observed=refresh_observed
                 )
+                if freeze:
+                    deferred_until = str(
+                        freeze["defer_apply_until_taipei"]
+                    )
+                    state["refresh_in_progress"] = False
+                    state["opening_apply_deferred_until_taipei"] = deferred_until
+                    state["opening_revision_frozen_at_taipei"] = freeze.get(
+                        "frozen_at_taipei"
+                    )
+                    state["opening_apply_deferred_datasets"] = sorted(
+                        refreshable_pending
+                    )
+                    # Force a prompt retry at lease expiry even for datasets
+                    # whose normal probe interval is several minutes.
+                    for name in refreshable_pending:
+                        current_next = _parse_timestamp(
+                            rows[name].get("next_probe_at_taipei")
+                        )
+                        freeze_until = _parse_timestamp(deferred_until)
+                        if freeze_until is not None and (
+                            current_next is None or current_next > freeze_until
+                        ):
+                            rows[name]["next_probe_at_taipei"] = deferred_until
+                    refresh = _deferred_opening_refresh(
+                        refreshable_pending,
+                        state_root=state_root,
+                        freeze=freeze,
+                    )
+                else:
+                    state["refresh_in_progress"] = True
+                    state["opening_apply_deferred_datasets"] = []
+                    state["opening_apply_deferred_until_taipei"] = None
+                    state["opening_revision_frozen_at_taipei"] = None
+                    _summarize_state(state, specs=specs, changed=changed)
+                    _atomic_json(state_path, state)
+                    refresh = _refresh_pending(
+                        refreshable_pending,
+                        state=state,
+                        live_root=live_root,
+                        state_root=state_root,
+                        specs_by_name=specs_by_name,
+                        args=args,
+                    )
                 state["last_refresh"] = refresh
-                if refresh["failed_dataset_count"] == 0:
+                if refresh["status"] == "deferred_opening_revision":
+                    state["opening_apply_deferred_until_taipei"] = (
+                        refresh.get("deferred_apply_until_taipei")
+                    )
+                    state["opening_revision_frozen_at_taipei"] = refresh.get(
+                        "opening_revision_frozen_at_taipei"
+                    )
+                    state["opening_apply_deferred_datasets"] = sorted(
+                        refreshable_pending
+                    )
+                elif refresh["failed_dataset_count"] == 0:
                     state.setdefault(
                         "bootstrap_completed_at_taipei",
                         refresh["completed_at_taipei"],
@@ -1190,6 +1430,13 @@ def main() -> int:
                 ),
                 flush=True,
             )
+            notify_systemd(
+                "WATCHDOG=1\n"
+                f"STATUS=status={state.get('status')} "
+                f"observed={state.get('observed_dataset_count', 0)}/"
+                f"{state.get('registered_dataset_count', len(specs))} "
+                f"pending={state.get('unapplied_event_count', 0)}"
+            )
             last_heartbeat = time.monotonic()
         if args.once and cycles >= 1:
             break
@@ -1199,6 +1446,7 @@ def main() -> int:
         timespec="seconds"
     )
     _atomic_json(state_path, state)
+    notify_systemd("STOPPING=1\nSTATUS=source event monitor stopping")
     return 0 if state.get("status") == "ok" or args.probe_only else 1
 
 

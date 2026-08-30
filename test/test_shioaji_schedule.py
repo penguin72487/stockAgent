@@ -70,6 +70,12 @@ def test_history_downloaders_default_to_the_ninety_percent_safety_limit(
         args = module.parse_args()
         assert args.max_traffic_fraction == 0.90
 
+    monkeypatch.setattr(sys, "argv", [download_shioaji_tx_futures_ticks.__name__])
+    futures_args = download_shioaji_tx_futures_ticks.parse_args()
+    assert futures_args.calendar_path == Path(
+        "data_tw_index_futures/day_session_contracts.parquet"
+    )
+
     limit_bytes = 2 * 1024**3
     futures_ceiling = int(limit_bytes * HISTORICAL_MAX_TRAFFIC_FRACTION)
     assert futures_ceiling == int(limit_bytes * 0.90)
@@ -97,6 +103,12 @@ def test_service_runners_do_not_override_the_shared_ninety_percent_policy() -> N
     assert "SHIOAJI_MINUTE_MAX_TRAFFIC_FRACTION:-0.90" in minute_runner
     assert "rc == 78" in futures_runner
     assert "status=contract_unavailable" in futures_runner
+    assert "rc == 79" in futures_runner
+    assert "reason=connection_capacity" in futures_runner
+    assert "target_advanced=true" in futures_runner
+    assert "action=restart_batch" in futures_runner
+    assert "evidence=terminal_manifest" in futures_runner
+    assert "evidence=provider_unavailable_manifest" in futures_runner
 
 
 def test_market_schedule_import_does_not_load_training_config() -> None:
@@ -111,6 +123,7 @@ def test_minute_runner_reserves_one_account_connection_for_futures_history() -> 
     minute_runner = (root / "scripts/run_shioaji_minute_full_backfill.sh").read_text()
     assert "SHIOAJI_MINUTE_WORKERS:-4" in minute_runner
     assert "SHIOAJI_MINUTE_WORKERS:-5" not in minute_runner
+    assert "available=$((5 - fop_workers - history_workers))" in minute_runner
 
 
 def test_minute_runner_builds_only_from_the_complete_current_run() -> None:
@@ -120,10 +133,20 @@ def test_minute_runner_builds_only_from_the_complete_current_run() -> None:
     assert '[[ "$summary_state" == *"collected=true"* ]]' not in minute_runner
     assert "run_reported == run_selected" in minute_runner
     assert 'not bool(run_payload.get("stopped_for_traffic"))' in minute_runner
+    assert "run_payload = payload" in minute_runner
+    assert "latest_run_summary.json" not in minute_runner
 
 
 def test_completed_futures_contract_does_not_login_again(monkeypatch, tmp_path) -> None:
     trading_date = date(2026, 8, 19)
+    # This test verifies receipt short-circuiting, not the production market-hour
+    # guard.  Pin the clock seam so the result cannot change between a Sunday CI
+    # run and a weekday 07:45-14:31 run.
+    monkeypatch.setattr(
+        download_shioaji_tx_futures_ticks,
+        "_taiwan_market_hours_now",
+        lambda: False,
+    )
     monkeypatch.setattr(
         sys,
         "argv",
@@ -169,6 +192,13 @@ def test_missing_futures_contract_is_a_truthful_terminal_gap(
     monkeypatch, tmp_path
 ) -> None:
     trading_date = date(2026, 8, 19)
+    # Contract-catalog behavior must be deterministic regardless of the wall
+    # clock.  The production schedule guard has its own focused assertion.
+    monkeypatch.setattr(
+        download_shioaji_tx_futures_ticks,
+        "_taiwan_market_hours_now",
+        lambda: False,
+    )
     monkeypatch.setattr(
         sys,
         "argv",
@@ -230,3 +260,91 @@ def test_missing_futures_contract_is_a_truthful_terminal_gap(
     assert manifest["resolved_trading_dates"] == 0
     assert not (tmp_path / "receipts").exists()
     assert not (tmp_path / "ticks").exists()
+
+
+def test_futures_history_connection_capacity_is_retryable(
+    monkeypatch, tmp_path
+) -> None:
+    trading_date = date(2026, 8, 19)
+    monkeypatch.setattr(
+        download_shioaji_tx_futures_ticks,
+        "_taiwan_market_hours_now",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        download_shioaji_tx_futures_ticks,
+        "_calendar",
+        lambda *_args: [trading_date],
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            download_shioaji_tx_futures_ticks.__name__,
+            "--contract",
+            "TXFR1",
+            "--output-dir",
+            str(tmp_path),
+            "--start-date",
+            trading_date.isoformat(),
+            "--end-date",
+            trading_date.isoformat(),
+        ],
+    )
+
+    class CapacityError(Exception):
+        code = 451
+
+    class Api:
+        def __init__(self, *, simulation):
+            assert simulation is False
+
+        def set_event_callback(self, _callback):
+            return None
+
+        def login(self, **_kwargs):
+            raise CapacityError("Too Many Connections")
+
+    monkeypatch.setitem(sys.modules, "shioaji", SimpleNamespace(Shioaji=Api))
+    monkeypatch.setenv("SHIOAJI_API_KEY", "test-key")
+    monkeypatch.setenv("SHIOAJI_SECRET_KEY", "test-secret")
+
+    assert (
+        download_shioaji_tx_futures_ticks.main()
+        == download_shioaji_tx_futures_ticks.CONNECTION_CAPACITY_EXIT
+    )
+
+
+def test_futures_history_market_hour_guard_stops_before_calendar_or_login(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setattr(
+        download_shioaji_tx_futures_ticks,
+        "_taiwan_market_hours_now",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            download_shioaji_tx_futures_ticks.__name__,
+            "--output-dir",
+            str(tmp_path),
+            "--start-date",
+            "2026-08-19",
+            "--end-date",
+            "2026-08-19",
+        ],
+    )
+    calendar_called = False
+
+    def calendar(*_args):
+        nonlocal calendar_called
+        calendar_called = True
+        raise AssertionError("market-hour guard must run before calendar work")
+
+    monkeypatch.setattr(download_shioaji_tx_futures_ticks, "_calendar", calendar)
+    monkeypatch.setitem(sys.modules, "shioaji", None)
+
+    assert download_shioaji_tx_futures_ticks.main() == 76
+    assert calendar_called is False
