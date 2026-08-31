@@ -2,7 +2,7 @@
 """Rebuild audited one-minute day-trade and stock-benchmark curves.
 
 The script never changes orders, fills, positions, or final PnL.  It preserves
-the accepted 09:00 and 13:30 ledger marks byte-for-byte at the JSON-object
+the accepted 09:01 strategy-entry and 13:30 ledger marks byte-for-byte at the JSON-object
 level and inserts right-labelled historical one-minute last-trade valuations
 between them.  Missing trade minutes carry the latest observed trade/open
 price and are explicitly counted; prices are never linearly interpolated.
@@ -37,6 +37,7 @@ from stockagent.live.shioaji_schedule import HISTORICAL_MAX_TRAFFIC_FRACTION
 
 
 SESSION_OPEN = datetime_time(9, 0)
+STRATEGY_ENTRY = datetime_time(9, 1)
 SESSION_CLOSE = datetime_time(13, 30)
 MINUTE_CONTRACT = "right_labelled_historical_last_trade_mark_v1"
 DEFAULT_LOCAL_MINUTE_ROOTS = (
@@ -610,7 +611,7 @@ def rebuild_strategy_marks(
     endpoints = {
         (str(row["session_date"]), str(row["market"]), str(row["minute"])[11:16]): row
         for row in selected
-        if str(row.get("minute") or "")[11:16] in {"09:00", "13:30"}
+        if str(row.get("minute") or "")[11:16] in {"09:01", "13:30"}
     }
     session_dates = sorted({key[0] for key in endpoints})
     markets = sorted({key[1] for key in endpoints})
@@ -620,7 +621,7 @@ def rebuild_strategy_marks(
     for session_date in session_dates:
         day = date.fromisoformat(session_date)
         for market in markets:
-            opening = endpoints.get((session_date, market, "09:00"))
+            opening = endpoints.get((session_date, market, "09:01"))
             closing = endpoints.get((session_date, market, "13:30"))
             if opening is None or closing is None:
                 raise RuntimeError(
@@ -652,6 +653,10 @@ def rebuild_strategy_marks(
             for minute in _session_minutes(day):
                 clock = minute.strftime("%H:%M")
                 if clock == "09:00":
+                    # The strategy has no position before its 09:01 paper entry.
+                    # Do not fabricate a pre-entry equity point from the later fill.
+                    continue
+                if minute.time() == STRATEGY_ENTRY:
                     generated.append(dict(opening))
                     continue
                 if clock == "13:30":
@@ -723,7 +728,7 @@ def rebuild_strategy_marks(
     rows.sort(
         key=lambda row: (str(row.get("minute") or ""), str(row.get("market") or ""))
     )
-    expected = len(session_dates) * len(markets) * 271
+    expected = len(session_dates) * len(markets) * 270
     if len(generated) != expected:
         raise RuntimeError(
             f"strategy minute cardinality mismatch: {len(generated)} != {expected}"
@@ -1035,7 +1040,7 @@ def main() -> None:
         "end_date": end.isoformat(),
         "minute_contract": MINUTE_CONTRACT,
         "linear_interpolation_used": False,
-        "accepted_09_00_and_13_30_endpoints_preserved": True,
+        "accepted_09_01_strategy_and_13_30_endpoints_preserved": True,
         "historical_minute_marks_are_executable_quotes": False,
         "local_first_contract": (
             "ordered local KBar and research partitions first; canonical "

@@ -243,6 +243,7 @@ def _stock_mark(
             "total_equity_twd": total_equity,
             "return_fraction": net_pnl / initial_capital,
             "return_pct": net_pnl / initial_capital * 100.0,
+            "return_type": "total_return",
             "total_return_contract": "official_ex_date_reference_reinvestment_v1",
             "corporate_action_factor": corporate_action_factor,
             "corporate_action_count": len(corporate_actions),
@@ -451,6 +452,53 @@ def _iter_dates(start: date, end: date):
         current += timedelta(days=1)
 
 
+def _completed_stock_benchmark_sessions(
+    *,
+    start: date,
+    end: date,
+    stock_parquet_root: Path,
+    twse_daily_ohlcv_path: Path,
+    tpex_daily_ohlcv_path: Path,
+) -> list[date]:
+    """Resolve completed sessions from each benchmark's official price source.
+
+    Benchmark history is independently reproducible and must not be capped by
+    the strategy replay receipt.  A date is admitted only when both stock
+    benchmarks have valid official OHLC endpoints; partial coverage fails
+    closed instead of silently dropping one benchmark.
+    """
+
+    sessions: list[date] = []
+    for trading_date in _iter_dates(start, end):
+        rows: dict[str, dict[str, Any] | None] = {}
+        for _benchmark_id, symbol, _label, _security_type in STOCK_BENCHMARKS:
+            rows[symbol] = _stock_daily_row(
+                stock_parquet_root / f"{symbol}_features.parquet",
+                trading_date,
+                symbol=symbol,
+                twse_daily_ohlcv_path=twse_daily_ohlcv_path,
+                tpex_daily_ohlcv_path=tpex_daily_ohlcv_path,
+            )
+        available = {symbol: row is not None for symbol, row in rows.items()}
+        if not any(available.values()):
+            continue
+        if not all(available.values()):
+            raise RuntimeError(
+                "partial official stock benchmark session coverage on "
+                f"{trading_date}: {available}"
+            )
+        for symbol, row in rows.items():
+            assert row is not None
+            for column in ("open", "close"):
+                value = _finite(row.get(column))
+                if value is None or value <= 0.0:
+                    raise RuntimeError(
+                        f"invalid official {symbol} {column} on {trading_date}"
+                    )
+        sessions.append(trading_date)
+    return sessions
+
+
 def _required_stock_adjustment(
     engine: TwDayTradeSimulationEngine,
     *,
@@ -527,15 +575,11 @@ def main() -> None:
     state = json.loads(state_path.read_text(encoding="utf-8"))
     replay_receipt_path = state_dir / "rebuild_receipt.json"
     replay_receipt = json.loads(replay_receipt_path.read_text(encoding="utf-8"))
-    session_dates = [
+    replay_session_dates = [
         date.fromisoformat(str(session["session_date"]))
         for session in replay_receipt.get("sessions") or ()
         if start <= date.fromisoformat(str(session["session_date"])) <= end
     ]
-    if not session_dates or session_dates[0] != start or session_dates[-1] != end:
-        raise ValueError(
-            "benchmark range must exactly match the replayed session boundary"
-        )
     live_benchmarks = state.get("benchmarks") or {}
     required_ids = {
         *(benchmark_id for benchmark_id, *_rest in STOCK_BENCHMARKS),
@@ -571,6 +615,34 @@ def main() -> None:
     for official_path in (twse_daily_ohlcv_path, tpex_daily_ohlcv_path):
         if not official_path.is_file():
             raise FileNotFoundError(official_path)
+    completed_end = end - timedelta(days=1) if current_session_unclosed else end
+    session_dates = (
+        _completed_stock_benchmark_sessions(
+            start=start,
+            end=completed_end,
+            stock_parquet_root=args.stock_parquet_root.resolve(),
+            twse_daily_ohlcv_path=twse_daily_ohlcv_path,
+            tpex_daily_ohlcv_path=tpex_daily_ohlcv_path,
+        )
+        if completed_end >= start
+        else []
+    )
+    if current_session_unclosed:
+        if end not in replay_session_dates or not current_opens:
+            raise ValueError(
+                "unclosed benchmark session requires retained replay receipt and opens"
+            )
+        session_dates.append(end)
+    if not session_dates or session_dates[0] != start or session_dates[-1] != end:
+        raise ValueError(
+            "benchmark range must exactly match official benchmark session boundaries"
+        )
+    unknown_replay_sessions = sorted(set(replay_session_dates) - set(session_dates))
+    if unknown_replay_sessions:
+        raise ValueError(
+            "strategy replay receipt contains sessions absent from official benchmark "
+            f"sources: {[day.isoformat() for day in unknown_replay_sessions]}"
+        )
 
     origins: dict[str, dict[str, Any]] = {}
     marks: list[dict[str, Any]] = []
@@ -599,6 +671,18 @@ def main() -> None:
         "corporate_action_reference_summary_sha256": _sha256(
             corporate_action_path.with_suffix(".summary.json")
         ),
+        "benchmark_session_authority": (
+            "official 0050 and 2330 daily endpoints plus complete retained TXFR1 "
+            "capture manifests; strategy replay receipt does not cap benchmark dates"
+        ),
+        "strategy_replay_sessions": [
+            trading_date.isoformat() for trading_date in replay_session_dates
+        ],
+        "benchmark_only_sessions": [
+            trading_date.isoformat()
+            for trading_date in session_dates
+            if trading_date not in set(replay_session_dates)
+        ],
     }
 
     for benchmark_id, symbol, label, security_type in STOCK_BENCHMARKS:
@@ -636,6 +720,7 @@ def main() -> None:
             "initial_fixed_fees_twd": entry_fee,
             "initial_transaction_tax_twd": 0.0,
             "gross_pnl_multiplier": quantity,
+            "return_type": "total_return",
             "total_return_contract": "official_ex_date_reference_reinvestment_v1",
             "source": "official_daily_session_open",
             "live_origin": {

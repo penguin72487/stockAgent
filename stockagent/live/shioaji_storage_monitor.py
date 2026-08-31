@@ -61,6 +61,14 @@ def default_storage_datasets(repo_root: Path) -> tuple[StorageDatasetSpec, ...]:
             "逐檔 29 日切片的 Shioaji KBar 原始回補。",
         ),
         StorageDatasetSpec(
+            "historical_market_data",
+            "週選／月選／實際月份期貨／指數歷史",
+            "source",
+            "historical",
+            (root / "data_tw_shioaji_history",),
+            "Contract V2 聯集、逐合約 1 分 K、歷史 Tick 與雜湊 receipt。",
+        ),
+        StorageDatasetSpec(
             "stock_daily",
             "台股日 K 混合來源",
             "source",
@@ -119,6 +127,7 @@ def default_storage_datasets(repo_root: Path) -> tuple[StorageDatasetSpec, ...]:
                 root / "artifacts/data_repair/shioaji_full",
                 root / "artifacts/data_repair/shioaji_futures_history",
                 root / "artifacts/data_repair/shioaji_minute_full",
+                root / "artifacts/data_repair/shioaji_historical_market_data",
                 root / "artifacts/data_repair/shioaji_tx_history",
                 root / "artifacts/live/shioaji_taifex_volatility_simulation",
                 root / "artifacts/live/shioaji_traffic",

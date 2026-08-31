@@ -17,6 +17,7 @@ from downloader.shioaji_capture_parts import (
 )
 from downloader.stream_shioaji_tw_microstructure import (
     BOOK_SCHEMA,
+    EventSink,
     PartWriter,
     normalize_book,
     normalize_fop_book,
@@ -493,6 +494,30 @@ def test_part_writer_uses_atomic_partitioned_parquet(tmp_path: Path) -> None:
     assert not list(tmp_path.rglob("*.tmp"))
 
 
+def test_event_sink_rejects_cached_event_from_another_trade_date(
+    tmp_path: Path,
+) -> None:
+    sink = EventSink(
+        tmp_path,
+        worker_index=0,
+        capture_id="capture_scoped",
+        queue_size=10,
+        flush_rows=1,
+        flush_seconds=60.0,
+        stale_ms=2_000.0,
+        accepted_trade_date=date(2026, 8, 27),
+    )
+    sink.enqueue(
+        "book",
+        {
+            "trade_date": date(2026, 8, 26),
+        },
+    )
+
+    assert sink.queue.empty()
+    assert sink.stats.out_of_scope_events == 1
+
+
 def test_capture_part_selection_excludes_same_day_previous_run(tmp_path: Path) -> None:
     partition = tmp_path / "ticks" / "trade_date=2026-07-22" / "hour=09"
     partition.mkdir(parents=True)
@@ -512,6 +537,43 @@ def test_capture_part_selection_excludes_same_day_previous_run(tmp_path: Path) -
     selected = select_capture_part_paths(
         capture_root=tmp_path,
         kind="ticks",
+        trade_date="2026-07-22",
+        manifests=manifests,
+    )
+
+    assert selected == [current]
+
+
+def test_capture_part_count_includes_cross_date_cached_initial_part(
+    tmp_path: Path,
+) -> None:
+    previous_partition = tmp_path / "book_events" / "trade_date=2026-07-21" / "hour=13"
+    target_partition = tmp_path / "book_events" / "trade_date=2026-07-22" / "hour=15"
+    previous_partition.mkdir(parents=True)
+    target_partition.mkdir(parents=True)
+    cached = (
+        previous_partition
+        / "capture=current-worker=00-part=000001-1.parquet"
+    )
+    current = (
+        target_partition
+        / "capture=current-worker=00-part=000002-2.parquet"
+    )
+    cached.touch()
+    current.touch()
+    manifests = [
+        {
+            "schema_version": 3,
+            "capture_id": "current",
+            "worker_index": 0,
+            "trade_date": "2026-07-22",
+            "book_parts": 2,
+        }
+    ]
+
+    selected = select_capture_part_paths(
+        capture_root=tmp_path,
+        kind="book_events",
         trade_date="2026-07-22",
         manifests=manifests,
     )

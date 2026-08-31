@@ -191,15 +191,17 @@ def test_repo_tw_modes_have_independent_market_and_artifact_routes() -> None:
         == "artifacts/live_signals"
     )
     shared_refresh = (
-        "scripts/run_data_cache.sh",
-        "use",
-        "tw-public",
+        "scripts/activate_tw_public_opening_data.py",
         "--link",
         "data_tw_public",
     )
     assert multi_basis.pre_signal_command == shared_refresh
     assert day_trade_100m.pre_signal_command == shared_refresh
     assert projection.pre_signal_command == shared_refresh
+    completed_close = ("scripts/finalize_tw_public_completed_session.py",)
+    assert multi_basis.completed_session_command == completed_close
+    assert day_trade_100m.completed_session_command == completed_close
+    assert projection.completed_session_command == completed_close
 
 
 def test_repo_multi_basis_fold11_deployment_keeps_checkpoint_model_contract() -> None:

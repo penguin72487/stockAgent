@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import weakref
+
 import numpy as np
 import polars as pl
 import pytest
@@ -20,6 +22,7 @@ from stockagent.live.signal_engine import (
     _decision_weights_timestamp,
     _live_weights_has_date,
     _load_previous_weights,
+    _live_panel_cache_key,
     _previous_usable_panel_date,
     _price_snapshot,
     _require_supported_live_execution,
@@ -30,6 +33,7 @@ from stockagent.live.signal_engine import (
 )
 from stockagent.live.portfolio_history import load_portfolio_history
 from stockagent.live.stock_history import load_stock_history
+import stockagent.live.signal_engine as signal_engine
 
 
 def test_realtime_daily_decision_uses_quote_time_for_weights_history() -> None:
@@ -81,6 +85,89 @@ def test_day_trade_live_window_uses_current_open_without_incomplete_daily_bar() 
     assert np.isclose(window[-1, 0, 1], np.log(102.0 / 100.0))
     assert window[-1, 1, 1] == 0.0
     assert np.array_equal(window[:, :, 0], panel.features[:, :, 0])
+
+
+def test_normalized_window_cache_rejects_reused_identity_from_other_schema() -> None:
+    panel = PanelData(
+        dates=np.array(["2026-07-16", "2026-07-17"], dtype="datetime64[D]"),
+        symbols=["2330"],
+        feature_names=["base", "next_session_open_gap_logret"],
+        features=np.ones((2, 1, 2), dtype=np.float32),
+        returns_1d=np.zeros((2, 1), dtype=np.float32),
+        tradable_mask=np.ones((2, 1), dtype=bool),
+        alive_mask=np.ones((2, 1), dtype=bool),
+        benchmark_returns=np.zeros((2,), dtype=np.float32),
+        close_prices=np.ones((2, 1), dtype=np.float32),
+    )
+    foreign_features = np.zeros((2, 1, 1), dtype=np.float32)
+    key = f"{id(panel.features)}:1:2"
+    with signal_engine._LIVE_MODEL_INPUT_CACHE_LOCK:
+        signal_engine._LIVE_MODEL_INPUT_CACHE.clear()
+        signal_engine._LIVE_MODEL_INPUT_CACHE[key] = (
+            weakref.ref(foreign_features),
+            foreign_features,
+        )
+
+    value = signal_engine._cached_normalized_model_window(
+        panel,
+        panel_idx=1,
+        lookback=2,
+    )
+
+    assert value.shape == (2, 1, 2)
+    np.testing.assert_array_equal(value, panel.features)
+    signal_engine.clear_live_panel_memory_cache()
+
+
+def test_live_panel_cache_identity_ignores_worker_count(tmp_path) -> None:
+    config = type(
+        "ConfigStub",
+        (),
+        {"data": type("DataStub", (), {"parquet_root": str(tmp_path)})()},
+    )()
+    first = _live_panel_cache_key(
+        config,
+        live_tail_rows=48,
+        panel_kwargs={"feature_include": ["base"], "panel_load_workers": 14},
+    )
+    second = _live_panel_cache_key(
+        config,
+        live_tail_rows=48,
+        panel_kwargs={"feature_include": ["base"], "panel_load_workers": 112},
+    )
+
+    assert first == second
+
+
+def test_day_trade_live_window_rejects_foreign_feature_schema() -> None:
+    panel = PanelData(
+        dates=np.array(["2026-07-16", "2026-07-17"], dtype="datetime64[D]"),
+        symbols=["2330"],
+        feature_names=["base", "next_session_open_gap_logret"],
+        features=np.zeros((2, 1, 2), dtype=np.float32),
+        returns_1d=np.zeros((2, 1), dtype=np.float32),
+        tradable_mask=np.ones((2, 1), dtype=bool),
+        alive_mask=np.ones((2, 1), dtype=bool),
+        benchmark_returns=np.zeros((2,), dtype=np.float32),
+        close_prices=np.ones((2, 1), dtype=np.float32),
+    )
+
+    with pytest.raises(ValueError, match="model input contract mismatch"):
+        _day_trade_live_model_window(
+            panel,
+            panel_idx=1,
+            lookback=2,
+            price_snapshot=PriceSnapshot(
+                prices=np.array([1.0]),
+                source="twse_tpex:mis",
+                timestamp="2026-07-21T01:00:01+00:00",
+                available_count=1,
+                open_prices=np.array([1.0]),
+            ),
+            resolved_asof="2026-07-21 09:00:01",
+            source_timezone="Asia/Taipei",
+            base_model_window=np.zeros((2, 1, 1), dtype=np.float32),
+        )
 
 
 def test_top_positions_hide_weights_below_one_basis_point() -> None:
@@ -438,7 +525,54 @@ def test_day_trade_shioaji_snapshot_queries_only_active_universe(monkeypatch) ->
     assert np.isnan(snapshot.open_prices[1])
 
 
-def test_day_trade_shioaji_uses_same_session_official_mis_open(monkeypatch) -> None:
+def test_day_trade_shared_mis_snapshot_queries_only_active_universe(
+    monkeypatch,
+) -> None:
+    requested: list[str] = []
+
+    def fake_snapshot(symbols, fallback_prices, **kwargs):
+        del kwargs
+        requested.extend(symbols)
+        size = len(symbols)
+        values = np.asarray(fallback_prices, dtype=np.float64) + 1.0
+        return PriceSnapshot(
+            prices=values,
+            source="twse_tpex:mis+shared_opening_snapshot",
+            timestamp="2026-08-17T01:00:01+00:00",
+            available_count=size,
+            requested_count=size,
+            available_mask=np.ones((size,), dtype=bool),
+            open_prices=values.copy(),
+            timestamps_ms=np.arange(1, size + 1, dtype=np.int64),
+        )
+
+    monkeypatch.setattr(
+        "stockagent.live.signal_engine.fetch_tw_mis_opening_snapshot",
+        fake_snapshot,
+    )
+    fallback = np.array([10.0, 20.0, 30.0])
+    snapshot = _price_snapshot(
+        source="tw",
+        symbols=["A", "B", "C"],
+        fallback_prices=fallback,
+        parquet_root="unused",
+        prices_csv=None,
+        yahoo_chunk_size=80,
+        request_mask=np.array([True, False, True]),
+        require_official_tw_session_open=True,
+    )
+
+    assert requested == ["A", "C"]
+    assert snapshot.requested_count == 2
+    assert snapshot.available_count == 2
+    np.testing.assert_array_equal(snapshot.available_mask, [True, False, True])
+    np.testing.assert_allclose(snapshot.prices, [11.0, 20.0, 31.0])
+    assert np.isnan(snapshot.open_prices[1])
+
+
+def test_day_trade_shioaji_does_not_block_on_duplicate_mis_when_open_is_proven(
+    monkeypatch,
+) -> None:
     fallback = np.array([10.0, 20.0, 30.0])
     now_ms = int(
         __import__("datetime").datetime.now(
@@ -457,6 +591,56 @@ def test_day_trade_shioaji_uses_same_session_official_mis_open(monkeypatch) -> N
             requested_count=len(symbols),
             available_mask=np.ones((len(symbols),), dtype=bool),
             open_prices=np.array([999.0, 888.0]),
+            exchange_timestamps_ms=np.array([now_ms, now_ms]),
+        ),
+    )
+    def unexpected_mis(*args, **kwargs):
+        raise AssertionError("proven Shioaji open must bypass duplicate MIS I/O")
+
+    monkeypatch.setattr(
+        "stockagent.live.signal_engine.fetch_tw_mis_last_prices",
+        unexpected_mis,
+    )
+
+    snapshot = _price_snapshot(
+        source="shioaji",
+        symbols=["A", "B", "C"],
+        fallback_prices=fallback,
+        parquet_root="unused",
+        prices_csv=None,
+        yahoo_chunk_size=80,
+        request_mask=np.array([True, False, True]),
+        require_official_tw_session_open=True,
+    )
+
+    assert snapshot.source.endswith("+shioaji_session_open+active_universe_subset")
+    np.testing.assert_allclose(snapshot.open_prices[[0, 2]], [999.0, 888.0])
+    assert np.isnan(snapshot.open_prices[1])
+
+
+def test_day_trade_shioaji_keeps_same_session_open_when_mis_is_unavailable(
+    monkeypatch,
+) -> None:
+    fallback = np.array([10.0, 20.0, 30.0])
+    now_ms = int(
+        np.datetime64(
+            __import__("datetime")
+            .datetime.now(__import__("zoneinfo").ZoneInfo("Asia/Taipei"))
+            .replace(tzinfo=None),
+            "ms",
+        ).astype(np.int64)
+    )
+
+    monkeypatch.setattr(
+        "stockagent.live.signal_engine.fetch_shioaji_stock_snapshots",
+        lambda symbols, fallback_prices, *, cache_ttl_seconds: PriceSnapshot(
+            prices=np.asarray(fallback_prices, dtype=np.float64) + 1.0,
+            source="shioaji:fixture",
+            available_count=len(symbols),
+            requested_count=len(symbols),
+            available_mask=np.ones((len(symbols),), dtype=bool),
+            open_prices=np.array([10.5, 30.5]),
+            exchange_timestamps_ms=np.array([now_ms, now_ms]),
         ),
     )
     monkeypatch.setattr(
@@ -464,9 +648,9 @@ def test_day_trade_shioaji_uses_same_session_official_mis_open(monkeypatch) -> N
         lambda symbols, fallback_prices, **kwargs: PriceSnapshot(
             prices=np.asarray(fallback_prices, dtype=np.float64),
             source="twse_tpex:mis",
-            available_count=len(symbols),
-            open_prices=np.array([10.5, 30.5]),
-            timestamps_ms=np.array([now_ms, now_ms]),
+            available_count=0,
+            open_prices=np.full((len(symbols),), np.nan),
+            timestamps_ms=np.zeros((len(symbols),), dtype=np.int64),
         ),
     )
 
@@ -481,9 +665,70 @@ def test_day_trade_shioaji_uses_same_session_official_mis_open(monkeypatch) -> N
         require_official_tw_session_open=True,
     )
 
-    assert snapshot.source.endswith("+official_mis_session_open+active_universe_subset")
+    assert "+shioaji_session_open" in snapshot.source
+    assert "official_mis_session_open" not in snapshot.source
     np.testing.assert_allclose(snapshot.open_prices[[0, 2]], [10.5, 30.5])
     assert np.isnan(snapshot.open_prices[1])
+
+
+def test_day_trade_partial_shioaji_open_uses_mis_for_only_missing_symbols(
+    monkeypatch,
+) -> None:
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    fallback = np.array([10.0, 20.0])
+    shioaji_now_ms = int(
+        np.datetime64(
+            datetime.now(ZoneInfo("Asia/Taipei")).replace(tzinfo=None), "ms"
+        ).astype(np.int64)
+    )
+    mis_now_ms = int(datetime.now(ZoneInfo("Asia/Taipei")).timestamp() * 1000)
+    mis_requests: list[list[str]] = []
+
+    monkeypatch.setattr(
+        "stockagent.live.signal_engine.fetch_shioaji_stock_snapshots",
+        lambda symbols, fallback_prices, *, cache_ttl_seconds: PriceSnapshot(
+            prices=np.asarray(fallback_prices, dtype=np.float64),
+            source="shioaji:fixture",
+            available_count=1,
+            requested_count=2,
+            available_mask=np.array([True, False]),
+            open_prices=np.array([10.5, np.nan]),
+            exchange_timestamps_ms=np.array([shioaji_now_ms, 0]),
+        ),
+    )
+
+    def fake_mis(symbols, fallback_prices, **kwargs):
+        del kwargs
+        mis_requests.append(list(symbols))
+        return PriceSnapshot(
+            prices=np.asarray(fallback_prices, dtype=np.float64),
+            source="twse_tpex:mis",
+            available_count=1,
+            requested_count=1,
+            open_prices=np.array([20.5]),
+            timestamps_ms=np.array([mis_now_ms]),
+        )
+
+    monkeypatch.setattr(
+        "stockagent.live.signal_engine.fetch_tw_mis_last_prices", fake_mis
+    )
+
+    snapshot = _price_snapshot(
+        source="shioaji",
+        symbols=["A", "B"],
+        fallback_prices=fallback,
+        parquet_root="unused",
+        prices_csv=None,
+        yahoo_chunk_size=80,
+        require_official_tw_session_open=True,
+    )
+
+    assert mis_requests == [["B"]]
+    np.testing.assert_allclose(snapshot.open_prices, [10.5, 20.5])
+    assert "+shioaji_session_open" in snapshot.source
+    assert "+official_mis_session_open" in snapshot.source
 
 
 def test_day_trade_shioaji_rejects_prior_session_mis_open(monkeypatch) -> None:

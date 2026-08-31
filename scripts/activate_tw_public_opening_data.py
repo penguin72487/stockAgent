@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Atomically activate accepted live TW public data for opening workflows.
 
-The local opening path must not wait for a full packed-snapshot materialization.
-Packed publication remains the Syncthing delivery contract; this command only
-selects the already accepted live source tree after rechecking freshness,
+The local opening path never reads or materializes a packed snapshot.  Packed
+publication remains an independent Syncthing cold-backup contract; this command
+only selects the already accepted live source tree after rechecking freshness,
 source-monitor health, and exact-session day-trade eligibility.
 """
 

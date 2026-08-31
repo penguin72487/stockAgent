@@ -1,12 +1,22 @@
 [Unit]
-Description=Accept and publish all Taiwan official data before 08:30
+Description=Accept the mutable Taiwan official-data live root before 08:30
 
 [Timer]
 OnCalendar=Mon..Fri *-*-* 08:00:00 Asia/Taipei
 OnCalendar=Mon..Fri *-*-* 08:15:00 Asia/Taipei
-# The measured full audit plus 104,749-file verification takes about 184s.
-# Start the final bounded attempt with six minutes of deadline budget.
+OnCalendar=Mon..Fri *-*-* 08:20:00 Asia/Taipei
+# The final attempt audits the live root only.  It never packs or unpacks data.
 OnCalendar=Mon..Fri *-*-* 08:24:00 Asia/Taipei
+OnCalendar=Mon..Fri *-*-* 08:27:00 Asia/Taipei
+OnCalendar=Mon..Fri *-*-* 08:29:00 Asia/Taipei
+# Keep bounded weekday catch-up points after the deadline so a late official
+# source or reboot repairs the same session instead of waiting until Monday.
+OnCalendar=Mon..Fri *-*-* 08:35:00 Asia/Taipei
+OnCalendar=Mon..Fri *-*-* 08:45:00 Asia/Taipei
+OnCalendar=Mon..Fri *-*-* 08:55:00 Asia/Taipei
+OnCalendar=Mon..Fri *-*-* 09:00:05 Asia/Taipei
+OnCalendar=Mon..Fri *-*-* 09:05:00 Asia/Taipei
+OnCalendar=Mon..Fri *-*-* 09:15:00 Asia/Taipei
 AccuracySec=1s
 RandomizedDelaySec=0
 Persistent=true

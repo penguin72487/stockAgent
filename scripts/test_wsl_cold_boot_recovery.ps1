@@ -8,6 +8,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 $wsl = Join-Path $env:WINDIR "System32\wsl.exe"
+$caddy = (Get-Command caddy.exe -ErrorAction Stop).Source
 if (-not $DistroName) {
     $lxssRoot = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Lxss"
     $defaultDistributionId = [string](Get-ItemProperty $lxssRoot).DefaultDistribution
@@ -110,17 +111,62 @@ $caddyConfig = Join-Path $installRoot "Caddyfile"
 $escapedCaddyConfig = [Regex]::Escape($caddyConfig)
 
 function Get-CaddyProcesses {
+    # Processes started by an S4U task hide CommandLine/ExecutablePath from a
+    # non-elevated interactive token.  Include the process that owns the public
+    # HTTP(S) listeners so the probe can still exercise that isolated instance.
+    $listenerPids = @(Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
+        Where-Object { $_.LocalPort -in 80, 443 } |
+        ForEach-Object { [int]$_.OwningProcess } |
+        Sort-Object -Unique)
     return @(Get-CimInstance Win32_Process -Filter "Name = 'caddy.exe'" |
-        Where-Object { $_.CommandLine -match $escapedCaddyConfig })
+        Where-Object {
+            $_.CommandLine -match $escapedCaddyConfig -or
+            [int]$_.ProcessId -in $listenerPids
+        })
+}
+
+function Stop-CaddyViaAdmin {
+    # Windows PowerShell 5 wraps native stderr as an ErrorRecord. Caddy emits
+    # informational logs there even on success, so judge only its exit code.
+    $savedErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "SilentlyContinue"
+        & $caddy stop --address 127.0.0.1:2019 2>$null | Out-Null
+        $exitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $savedErrorActionPreference
+    }
+    return [int]$exitCode
 }
 
 # Exercise the Windows reverse proxy's own recovery path before removing WSL.
 $oldCaddyPids = @(Get-CaddyProcesses | ForEach-Object { [int]$_.ProcessId })
 Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-Get-CaddyProcesses | ForEach-Object {
-    Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+# An S4U-launched process cannot always be terminated from the caller's
+# interactive logon session. Use Caddy's loopback admin API first; retain a
+# process fallback for older interactive-task deployments.
+$caddyStopExitCode = Stop-CaddyViaAdmin
+if ($caddyStopExitCode -ne 0) {
+    Get-CaddyProcesses | ForEach-Object {
+        Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+    }
 }
 $caddyStoppedProbe = Get-PublicProbe "/healthz"
+$caddyStopDeadline = (Get-Date).AddSeconds(10)
+while (
+    ($caddyStoppedProbe.status_code -eq 200 -or
+        @(Get-CaddyProcesses).Count -gt 0) -and
+    (Get-Date) -lt $caddyStopDeadline
+) {
+    $caddyStopExitCode = Stop-CaddyViaAdmin
+    if ($caddyStopExitCode -ne 0) {
+        Get-CaddyProcesses | ForEach-Object {
+            Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+        }
+    }
+    Start-Sleep -Milliseconds 100
+    $caddyStoppedProbe = Get-PublicProbe "/healthz"
+}
 Start-ScheduledTask -TaskName $TaskName
 $caddyReadyAt = $null
 $newCaddyPids = @()
@@ -139,19 +185,38 @@ do {
 $shutdownAt = Get-Date
 & $wsl --shutdown
 $stoppedAt = $null
+$restartObservedAt = $null
 $runningDistributionsAtStop = @()
+$postBootId = ""
 $stopDeadline = (Get-Date).AddSeconds($TimeoutSeconds)
 do {
     $runningDistributions = @(Get-RunningWslDistributions)
     if ($DistroName -notin $runningDistributions) {
-        $runningDistributionsAtStop = $runningDistributions
-        $stoppedAt = Get-Date
+        if (-not $stoppedAt) {
+            $runningDistributionsAtStop = $runningDistributions
+            $stoppedAt = Get-Date
+        }
+    } else {
+        # Querying a stopped distribution with `wsl --distribution ... --exec`
+        # starts it and invalidates the recovery proof. Read boot_id only after
+        # `wsl --list --running` independently observes the target running.
+        $candidateBootId = Get-WslBootId
+        if ($candidateBootId -and $candidateBootId -ne $preBootId) {
+            $postBootId = $candidateBootId
+            $restartObservedAt = Get-Date
+            break
+        }
+    }
+    if ($stoppedAt -and $DistroName -notin $runningDistributions) {
+        Start-Sleep -Milliseconds 250
+        continue
+    }
+    if ($restartObservedAt) {
         break
     }
     Start-Sleep -Milliseconds 250
 } while ((Get-Date) -lt $stopDeadline)
 
-$postBootId = ""
 $serviceStates = @()
 $timerStates = @()
 $failedUnits = ""
@@ -161,10 +226,20 @@ $readyAt = $null
 $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
 
 do {
-    if (-not $stoppedAt) {
-        break
+    if (-not $restartObservedAt) {
+        $runningDistributions = @(Get-RunningWslDistributions)
+        if ($DistroName -notin $runningDistributions) {
+            Start-Sleep -Milliseconds 250
+            continue
+        }
+        $candidateBootId = Get-WslBootId
+        if (-not $candidateBootId -or $candidateBootId -eq $preBootId) {
+            Start-Sleep -Milliseconds 250
+            continue
+        }
+        $postBootId = $candidateBootId
+        $restartObservedAt = Get-Date
     }
-    $postBootId = Get-WslBootId
     if (-not $postBootId -or $postBootId -eq $preBootId) {
         Start-Sleep -Milliseconds 250
         continue
@@ -207,7 +282,7 @@ do {
 $success = (
     $caddyReadyAt -and
     $caddyStoppedProbe.status_code -ne 200 -and
-    $stoppedAt -and
+    $restartObservedAt -and
     $readyAt -and
     $postBootId -and
     $postBootId -ne $preBootId
@@ -227,6 +302,9 @@ $report = [ordered]@{
     target_distribution = $DistroName
     wsl_stopped_at = if ($stoppedAt) { $stoppedAt.ToString("o") } else { $null }
     wsl_stopped_observed = [bool]$stoppedAt
+    wsl_restart_observed_at = if ($restartObservedAt) {
+        $restartObservedAt.ToString("o")
+    } else { $null }
     running_distributions_at_stop = $runningDistributionsAtStop
     wsl_shutdown_seconds = if ($stoppedAt) {
         [math]::Round(($stoppedAt - $shutdownAt).TotalSeconds, 3)

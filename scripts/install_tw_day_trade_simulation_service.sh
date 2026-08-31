@@ -4,6 +4,8 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SERVICE_NAME="stockagent-tw-day-trade-simulation.service"
 PREOPEN_TIMER="stockagent-tw-day-trade-preopen-gate.timer"
+TIME_SYNC_TIMER="stockagent-time-sync-check.timer"
+GUARDIAN_TIMER="stockagent-tw-day-trade-unattended-guardian.timer"
 
 if (( EUID != 0 )); then
   echo "[tw-day-trade-service] root privileges are required" >&2
@@ -22,6 +24,10 @@ units=(
   "$SERVICE_NAME"
   stockagent-tw-day-trade-preopen-gate.service
   "$PREOPEN_TIMER"
+  stockagent-time-sync-check.service
+  "$TIME_SYNC_TIMER"
+  stockagent-tw-day-trade-unattended-guardian.service
+  "$GUARDIAN_TIMER"
 )
 for unit in "${units[@]}"; do
   sed \
@@ -36,8 +42,14 @@ systemd-analyze verify "$temporary_dir"/*.service "$temporary_dir"/*.timer
 install -m 0644 "$temporary_dir"/* /etc/systemd/system/
 chmod 0755 \
   "$REPO_ROOT/scripts/check_tw_day_trade_preopen_readiness.py" \
-  "$REPO_ROOT/scripts/run_tw_day_trade_preopen_gate.sh"
+  "$REPO_ROOT/scripts/run_tw_day_trade_preopen_gate.sh" \
+  "$REPO_ROOT/scripts/check_stockagent_time_sync.py" \
+  "$REPO_ROOT/scripts/run_stockagent_time_sync_check.sh" \
+  "$REPO_ROOT/scripts/check_tw_day_trade_unattended_health.py" \
+  "$REPO_ROOT/scripts/run_tw_day_trade_unattended_guardian.sh"
 systemctl daemon-reload
 systemctl enable --now "$SERVICE_NAME"
 systemctl enable --now "$PREOPEN_TIMER"
-echo "[tw-day-trade-service] service_active=$(systemctl is-active "$SERVICE_NAME") preopen_timer_active=$(systemctl is-active "$PREOPEN_TIMER")"
+systemctl enable --now "$TIME_SYNC_TIMER"
+systemctl enable --now "$GUARDIAN_TIMER"
+echo "[tw-day-trade-service] service_active=$(systemctl is-active "$SERVICE_NAME") preopen_timer_active=$(systemctl is-active "$PREOPEN_TIMER") time_sync_timer_active=$(systemctl is-active "$TIME_SYNC_TIMER") guardian_timer_active=$(systemctl is-active "$GUARDIAN_TIMER")"

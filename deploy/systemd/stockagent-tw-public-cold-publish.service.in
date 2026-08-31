@@ -1,0 +1,23 @@
+[Unit]
+Description=Publish Taiwan public data to packed cold storage after market workflows
+Wants=network-online.target time-sync.target
+After=network-online.target time-sync.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+User=@SERVICE_USER@
+Group=@SERVICE_GROUP@
+WorkingDirectory=@REPO_ROOT@
+Environment="HOME=@SERVICE_HOME@"
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=/usr/bin/bash "@REPO_ROOT@/scripts/run_tw_public_cold_publish.sh"
+Restart=on-failure
+RestartSec=5min
+Nice=10
+CPUWeight=20
+IOWeight=20
+TimeoutStartSec=3h
+
+[Install]
+WantedBy=multi-user.target

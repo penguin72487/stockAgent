@@ -1,0 +1,11 @@
+[Unit]
+Description=Start Shioaji option, exact-future, and index backfill after boot
+
+[Timer]
+OnBootSec=12min
+AccuracySec=30s
+Unit=stockagent-shioaji-historical-market-data.service
+
+[Install]
+WantedBy=timers.target
+

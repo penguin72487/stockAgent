@@ -4,7 +4,7 @@ import asyncio
 import json
 import sys
 from types import SimpleNamespace
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -12,14 +12,19 @@ import polars as pl
 import discord
 
 from services.discord_bot.bot import (
+    _BOT_RUN_ID,
     bot as stockagent_bot,
     _add_user_watch_symbol,
     _annotate_history_rows_with_display_time,
     _auto_signal_price_source,
     _artifact_backfill_is_current,
     _artifact_backfill_key,
+    _artifact_backfill_retry_allowed,
+    _artifact_backfill_health_summary,
+    _begin_artifact_backfill,
     _can_reuse_latest_signal_now,
     _config_trading_limits,
+    _completed_session_receipt_ready,
     _ConsoleProgress,
     _decision_overview_page,
     _daily_summary_message,
@@ -29,7 +34,10 @@ from services.discord_bot.bot import (
     _ensure_signal_ready,
     _filter_watchlist_rows,
     _formal_history_latest_date,
+    _formal_history_timeout_seconds,
+    _finish_artifact_backfill,
     _guide_message,
+    _handle_signal_now_command,
     _latest_changes_pages,
     _latest_signal_message,
     _market_notice,
@@ -50,11 +58,13 @@ from services.discord_bot.bot import (
     _preopen_prepare_key,
     _preopen_market_final_armed_for_session,
     _preopen_market_ready_for_session,
+    _rotate_error_log_if_needed,
     _write_preopen_final_arm,
     _write_preopen_readiness,
     _validate_day_trade_portfolio_history_result,
     _prepare_realtime_signal_sync,
     _include_live_signals_in_portfolio_history,
+    _interactive_signal_work_pending,
     _prepend_latest_signal_row_to_portfolio_history,
     _public_broadcasts_enabled,
     _raw_score_pages,
@@ -64,10 +74,12 @@ from services.discord_bot.bot import (
     _recent_pre_signal_failure,
     _remember_pre_signal_failure,
     _remember_pre_signal_success,
+    _register_signal_now_job,
     _remove_user_subscription,
     _replace_user_watch_symbol,
     _recent_performance_from_returns,
     _risk_adjusted_metrics_from_simple_returns,
+    _resume_signal_now_jobs_once,
     _run_artifact_backfill_sync,
     _run_day_trade_settlement_backfill,
     _risk_message,
@@ -77,6 +89,10 @@ from services.discord_bot.bot import (
     _scheduled_market_session_day,
     _scheduled_markets,
     _scheduled_retry_allowed,
+    _signal_now_background_key,
+    _signal_now_job_health_summary,
+    _signal_now_resumable_jobs,
+    _run_signal_now_background_refresh,
     _mark_scheduled_retry,
     _clear_scheduled_retry,
     _set_user_subscription,
@@ -484,19 +500,26 @@ def test_preopen_prepare_key_catches_up_missing_day_trade_readiness(
         "services.discord_bot.bot._preopen_market_final_armed_for_session",
         lambda cfg, session_date: False,
     )
-    assert _preopen_prepare_key(configured, now.replace(minute=55)) == (
+    assert _preopen_prepare_key(configured, now.replace(minute=44)) == (
+        "2026-07-06:tw_day_trade:preopen"
+    )
+    assert _preopen_prepare_key(configured, now.replace(minute=45)) == (
         "2026-07-06:tw_day_trade:preopen-final-arm"
     )
     monkeypatch.setattr(
         "services.discord_bot.bot._preopen_market_final_armed_for_session",
         lambda cfg, session_date: True,
     )
-    assert _preopen_prepare_key(configured, now.replace(minute=55)) == (
+    assert _preopen_prepare_key(configured, now.replace(minute=45)) == (
         "2026-07-06:tw_day_trade:preopen"
     )
     monkeypatch.setattr(
         "services.discord_bot.bot._preopen_market_ready_for_session",
         lambda cfg, session_date: False,
+    )
+    monkeypatch.setattr(
+        "services.discord_bot.bot._day_trade_schedule_state",
+        lambda cfg, session_date: "retry",
     )
     assert _preopen_prepare_key(configured, now.replace(hour=9)) == (
         "2026-07-06:tw_day_trade:preopen-catch-up"
@@ -569,7 +592,12 @@ def test_preopen_readiness_preserves_same_day_ready_rows_across_restart(
                 "panel_cache_hit": True,
                 "checkpoint_cache_hit": True,
                 "model_cache_hit": True,
-            }
+            },
+            "opening_source_prewarm": {
+                "ready": True,
+                "run_id": _BOT_RUN_ID,
+                "source": "twse_tpex:mis",
+            },
         },
     )
     assert _preopen_market_final_armed_for_session(armed_cfg, today) is True
@@ -738,6 +766,438 @@ def test_artifact_backfill_key_catches_up_previous_session_after_midnight(
     )
 
 
+def test_artifact_backfill_failure_uses_durable_bounded_retry(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    status_path = tmp_path / "artifact_backfill_status.json"
+    monkeypatch.setenv(
+        "STOCKAGENT_ARTIFACT_BACKFILL_STATUS_PATH",
+        str(status_path),
+    )
+    monkeypatch.setenv("STOCKAGENT_ARTIFACT_BACKFILL_RETRY_BASE_SECONDS", "60")
+    monkeypatch.setenv("STOCKAGENT_ARTIFACT_BACKFILL_RETRY_MAX_SECONDS", "120")
+    key = "2026-07-27:tw_day_trade:artifact_backfill"
+
+    started = _begin_artifact_backfill(key, "tw_day_trade")
+    assert started["attempt"] == 1
+    assert not _artifact_backfill_retry_allowed(key)
+
+    failed = _finish_artifact_backfill(
+        key,
+        "tw_day_trade",
+        status="failed",
+        exc=BotUserError("fixture timeout"),
+    )
+    assert failed["retry_delay_seconds"] == 60.0
+    assert not _artifact_backfill_retry_allowed(key)
+    assert _artifact_backfill_health_summary()["status"] == "degraded"
+
+    payload = json.loads(status_path.read_text(encoding="utf-8"))
+    payload["jobs"][key]["next_retry_at"] = (
+        datetime.now().astimezone() - timedelta(seconds=1)
+    ).isoformat(timespec="seconds")
+    status_path.write_text(json.dumps(payload), encoding="utf-8")
+    assert _artifact_backfill_retry_allowed(key)
+
+    retried = _begin_artifact_backfill(key, "tw_day_trade")
+    assert retried["attempt"] == 2
+    ready = _finish_artifact_backfill(
+        key,
+        "tw_day_trade",
+        status="ready",
+    )
+    assert ready["next_retry_at"] is None
+    assert "retry_delay_seconds" not in ready
+    assert not _artifact_backfill_retry_allowed(key)
+    assert _artifact_backfill_health_summary()["status"] == "ready"
+
+
+def test_error_log_rotates_at_startup_and_leaves_fresh_current_path(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    error_log = tmp_path / "errors.log"
+    error_log.write_bytes(b"x" * (1024 * 1024))
+    monkeypatch.setattr("services.discord_bot.bot.ERROR_LOG_PATH", error_log)
+    monkeypatch.setenv("STOCKAGENT_DISCORD_ERROR_LOG_MAX_BYTES", str(1024 * 1024))
+    monkeypatch.setenv("STOCKAGENT_DISCORD_ERROR_LOG_GENERATIONS", "3")
+
+    assert _rotate_error_log_if_needed()
+    assert error_log.read_bytes() == b""
+    assert error_log.with_name("errors.log.1").stat().st_size == 1024 * 1024
+    assert not _rotate_error_log_if_needed()
+
+
+def test_signal_now_stale_job_is_durable_and_waits_for_source(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    status_path = tmp_path / "artifact_backfill_status.json"
+    monkeypatch.setenv(
+        "STOCKAGENT_ARTIFACT_BACKFILL_STATUS_PATH",
+        str(status_path),
+    )
+    cfg = SimpleNamespace(market="tw_day_trade_multi_basis")
+    stale = SimpleNamespace(
+        data=SimpleNamespace(
+            fresh=False,
+            expected_latest_date="2026-08-26",
+            last_data_date="2026-08-25",
+            panel_date="2026-08-25",
+            reason="latest data 2026-08-25 older than expected 2026-08-26",
+        )
+    )
+    key = _signal_now_background_key(
+        cfg,
+        target_date="2026-08-26",
+        requested_price_source="auto",
+        top_n=20,
+        min_abs_delta=0.001,
+        debug=False,
+        force_refresh=False,
+        mode="signal",
+    )
+    first = _register_signal_now_job(
+        key,
+        user_id=101,
+        cfg=cfg,
+        runtime_status=stale,
+        requested_price_source="auto",
+        top_n=20,
+        min_abs_delta=0.001,
+        debug=False,
+        force_refresh=False,
+        mode="signal",
+    )
+    second = _register_signal_now_job(
+        key,
+        user_id=202,
+        cfg=cfg,
+        runtime_status=stale,
+        requested_price_source="auto",
+        top_n=20,
+        min_abs_delta=0.001,
+        debug=False,
+        force_refresh=False,
+        mode="signal",
+    )
+
+    assert first["status"] == "waiting_source"
+    assert second["user_ids"] == [101, 202]
+    assert second["actual_data_date"] == "2026-08-25"
+    assert second["target_date"] == "2026-08-26"
+    assert _signal_now_resumable_jobs()[0]["key"] == key
+    health = _signal_now_job_health_summary()
+    assert health["status"] == "waiting_source"
+    assert health["waiting_source_count"] == 1
+    payload = json.loads(status_path.read_text(encoding="utf-8"))
+    assert payload["schema_version"] == 2
+
+
+def test_interactive_signal_work_preempts_formal_history(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "services.discord_bot.bot._signal_now_resumable_jobs",
+        lambda: [{"status": "waiting_source"}],
+    )
+    stockagent_bot._signal_now_background_tasks.clear()
+
+    assert _interactive_signal_work_pending()
+
+    monkeypatch.setattr(
+        "services.discord_bot.bot._signal_now_resumable_jobs",
+        lambda: [],
+    )
+    assert not _interactive_signal_work_pending()
+
+
+def test_signal_now_stale_job_does_not_run_preview_or_activation(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    status_path = tmp_path / "artifact_backfill_status.json"
+    monkeypatch.setenv(
+        "STOCKAGENT_ARTIFACT_BACKFILL_STATUS_PATH",
+        str(status_path),
+    )
+    cfg = SimpleNamespace(
+        market="tw_day_trade_multi_basis",
+        timezone="Asia/Taipei",
+    )
+    stale = SimpleNamespace(
+        data=SimpleNamespace(
+            fresh=False,
+            expected_latest_date="2026-08-26",
+            last_data_date="2026-08-25",
+            panel_date="2026-08-25",
+            reason="source not accepted",
+        )
+    )
+    key = _signal_now_background_key(
+        cfg,
+        target_date="2026-08-26",
+        requested_price_source="auto",
+        top_n=20,
+        min_abs_delta=0.001,
+        debug=False,
+        force_refresh=False,
+        mode="signal",
+    )
+    _register_signal_now_job(
+        key,
+        user_id=101,
+        cfg=cfg,
+        runtime_status=stale,
+        requested_price_source="auto",
+        top_n=20,
+        min_abs_delta=0.001,
+        debug=False,
+        force_refresh=False,
+        mode="signal",
+    )
+    calls = {"signal": 0, "activate": 0}
+
+    async def fail_signal(**kwargs):
+        del kwargs
+        calls["signal"] += 1
+        raise AssertionError("stale job must not infer")
+
+    def fail_activation(*args, **kwargs):
+        del args, kwargs
+        calls["activate"] += 1
+        raise AssertionError("stale job must not activate")
+
+    monkeypatch.setattr("services.discord_bot.bot._resolve_market", lambda market: cfg)
+    monkeypatch.setattr(
+        "services.discord_bot.bot._ensure_signal_ready_cached",
+        lambda resolved: stale,
+    )
+    monkeypatch.setattr("services.discord_bot.bot._run_market_signal", fail_signal)
+    monkeypatch.setattr(
+        "services.discord_bot.bot._prepare_realtime_signal_sync",
+        fail_activation,
+    )
+    stockagent_bot._signal_now_background_waiters[key] = {101}
+
+    asyncio.run(
+        _run_signal_now_background_refresh(
+            key,
+            market=cfg.market,
+            requested_price_source="auto",
+            top_n=20,
+            min_abs_delta=0.001,
+            debug=False,
+            force_refresh=False,
+            mode="signal",
+        )
+    )
+
+    assert calls == {"signal": 0, "activate": 0}
+    assert _signal_now_resumable_jobs()[0]["status"] == "waiting_source"
+
+
+def test_signal_now_waiting_job_resumes_after_source_becomes_fresh(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    status_path = tmp_path / "artifact_backfill_status.json"
+    monkeypatch.setenv(
+        "STOCKAGENT_ARTIFACT_BACKFILL_STATUS_PATH",
+        str(status_path),
+    )
+    cfg = SimpleNamespace(market="tw_day_trade_multi_basis")
+    stale = SimpleNamespace(
+        data=SimpleNamespace(
+            fresh=False,
+            expected_latest_date="2026-08-26",
+            last_data_date="2026-08-25",
+            panel_date="2026-08-25",
+            reason="source not accepted",
+        )
+    )
+    fresh = SimpleNamespace(
+        data=SimpleNamespace(
+            fresh=True,
+            expected_latest_date="2026-08-26",
+            last_data_date="2026-08-26",
+            panel_date="2026-08-26",
+            reason=None,
+        )
+    )
+    key = _signal_now_background_key(
+        cfg,
+        target_date="2026-08-26",
+        requested_price_source="auto",
+        top_n=20,
+        min_abs_delta=0.001,
+        debug=False,
+        force_refresh=False,
+        mode="signal",
+    )
+    _register_signal_now_job(
+        key,
+        user_id=101,
+        cfg=cfg,
+        runtime_status=stale,
+        requested_price_source="auto",
+        top_n=20,
+        min_abs_delta=0.001,
+        debug=False,
+        force_refresh=False,
+        mode="signal",
+    )
+    resumed: list[str] = []
+
+    async def fake_run(job_key, **kwargs):
+        del kwargs
+        resumed.append(job_key)
+
+    monkeypatch.setattr("services.discord_bot.bot._opening_critical_work_pending", lambda: False)
+    monkeypatch.setattr("services.discord_bot.bot._resolve_market", lambda market: cfg)
+    monkeypatch.setattr(
+        "services.discord_bot.bot._ensure_signal_ready_cached",
+        lambda resolved: fresh,
+    )
+    monkeypatch.setattr(
+        "services.discord_bot.bot._run_signal_now_background_refresh",
+        fake_run,
+    )
+    stockagent_bot._signal_now_background_tasks.clear()
+    stockagent_bot._signal_now_background_waiters.clear()
+
+    async def exercise() -> None:
+        await _resume_signal_now_jobs_once()
+        await stockagent_bot._signal_now_background_tasks[key]
+
+    asyncio.run(exercise())
+
+    assert resumed == [key]
+    stockagent_bot._signal_now_background_tasks.clear()
+    stockagent_bot._signal_now_background_waiters.clear()
+
+
+def test_signal_now_stale_closed_market_rebuilds_completed_close(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    status_path = tmp_path / "artifact_backfill_status.json"
+    monkeypatch.setenv(
+        "STOCKAGENT_ARTIFACT_BACKFILL_STATUS_PATH",
+        str(status_path),
+    )
+    cfg = SimpleNamespace(
+        market="tw_day_trade_multi_basis",
+        timezone="Asia/Taipei",
+        day_trade_simulation_enabled=True,
+        completed_session_command=("finalize",),
+        schedule_interval_minutes=None,
+    )
+    stale = SimpleNamespace(
+        market_open=False,
+        data=SimpleNamespace(
+            fresh=False,
+            expected_latest_date="2026-08-26",
+            last_data_date="2026-08-25",
+            panel_date="2026-08-25",
+            reason="model close layer is stale",
+        ),
+    )
+    fresh = SimpleNamespace(
+        market_open=False,
+        data=SimpleNamespace(
+            fresh=True,
+            expected_latest_date="2026-08-26",
+            last_data_date="2026-08-26",
+            panel_date="2026-08-26",
+            reason=None,
+        ),
+    )
+    key = _signal_now_background_key(
+        cfg,
+        target_date="2026-08-26",
+        requested_price_source="auto",
+        top_n=20,
+        min_abs_delta=0.001,
+        debug=False,
+        force_refresh=False,
+        mode="signal",
+    )
+    _register_signal_now_job(
+        key,
+        user_id=0,
+        cfg=cfg,
+        runtime_status=stale,
+        requested_price_source="auto",
+        top_n=20,
+        min_abs_delta=0.001,
+        debug=False,
+        force_refresh=False,
+        mode="signal",
+    )
+    prepared: list[dict[str, object]] = []
+
+    def prepare(_cfg, **kwargs):
+        prepared.append(dict(kwargs))
+        return None, fresh, True
+
+    async def run_signal(**kwargs):
+        del kwargs
+        return SimpleNamespace(summary={"signal_id": "close-signal"}, message="ok")
+
+    monkeypatch.setattr("services.discord_bot.bot._resolve_market", lambda market: cfg)
+    monkeypatch.setattr(
+        "services.discord_bot.bot._ensure_signal_ready_cached",
+        lambda resolved: stale,
+    )
+    monkeypatch.setattr(
+        "services.discord_bot.bot._scheduled_market_session_day",
+        lambda *_args: (False, "market closed"),
+    )
+    monkeypatch.setattr(
+        "services.discord_bot.bot._signal_now_cached_result",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "services.discord_bot.bot._prepare_realtime_signal_sync",
+        prepare,
+    )
+    monkeypatch.setattr(
+        "services.discord_bot.bot._sync_latest_live_weights_to_market_artifact",
+        lambda _cfg: None,
+    )
+    monkeypatch.setattr("services.discord_bot.bot._run_market_signal", run_signal)
+    monkeypatch.setattr(
+        "services.discord_bot.bot._enrich_signal_performance_for_discord",
+        lambda _cfg, result, **kwargs: result,
+    )
+    monkeypatch.setattr(
+        "services.discord_bot.bot._signal_sanity_issues",
+        lambda *_args: [],
+    )
+
+    asyncio.run(
+        _run_signal_now_background_refresh(
+            key,
+            market=cfg.market,
+            requested_price_source="auto",
+            top_n=20,
+            min_abs_delta=0.001,
+            debug=False,
+            force_refresh=False,
+            mode="signal",
+        )
+    )
+
+    assert prepared == [
+        {
+            "requested_price_source": "auto",
+            "force_refresh": True,
+            "completed_session": True,
+        }
+    ]
+    assert _signal_now_resumable_jobs() == []
+
+
 def test_formal_history_latest_date_reads_settled_returns(
     monkeypatch, tmp_path
 ) -> None:
@@ -787,6 +1247,7 @@ def test_day_trade_settlement_backfill_runs_formal_fold_inference(
         config_path=tmp_path / "tw_day_trade.yaml",
         output_dir=tmp_path / "artifacts",
         pre_signal_timeout_seconds=123,
+        formal_history_timeout_seconds=456,
     )
     status = SimpleNamespace(
         data=SimpleNamespace(
@@ -814,7 +1275,8 @@ def test_day_trade_settlement_backfill_runs_formal_fold_inference(
     assert command[command.index("--mode") + 1] == "infer"
     assert command[command.index("--start-fold") + 1] == "11"
     assert command[command.index("--multi-gpu-strategy") + 1] == "none"
-    assert kwargs["timeout"] == 123
+    assert kwargs["timeout"] == 456
+    assert _formal_history_timeout_seconds(cfg) == 456
 
 
 def test_formal_history_backfill_discovers_fold_from_checkpoint(
@@ -826,6 +1288,7 @@ def test_formal_history_backfill_discovers_fold_from_checkpoint(
         config_path=tmp_path / "forex.yaml",
         output_dir=tmp_path / "artifacts",
         pre_signal_timeout_seconds=123,
+        formal_history_timeout_seconds=456,
     )
     status = SimpleNamespace(
         data=SimpleNamespace(
@@ -1162,6 +1625,75 @@ def test_pre_signal_failure_cache_is_shared_and_success_clears_it(monkeypatch) -
     assert _recent_pre_signal_failure(command) is None
 
 
+def test_pre_signal_command_is_single_flight_per_shared_command(monkeypatch) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+    import threading
+    import time
+
+    from services.discord_bot import bot as discord_bot
+
+    state = {"active": 0, "maximum": 0, "calls": 0}
+    state_lock = threading.Lock()
+
+    def fake_serialized(_cfg, *, bypass_cache=False):
+        assert not bypass_cache
+        with state_lock:
+            state["active"] += 1
+            state["maximum"] = max(state["maximum"], state["active"])
+            state["calls"] += 1
+        time.sleep(0.03)
+        with state_lock:
+            state["active"] -= 1
+
+    monkeypatch.setattr(
+        discord_bot, "_run_pre_signal_command_serialized", fake_serialized
+    )
+    cfg = SimpleNamespace(pre_signal_command=("python", "shared.py"))
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(discord_bot._run_pre_signal_command, cfg)
+            for _ in range(2)
+        ]
+        for future in futures:
+            future.result()
+
+    assert state == {"active": 0, "maximum": 1, "calls": 2}
+
+
+def test_prewarm_is_single_flight_per_market_session(monkeypatch) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+    import threading
+    import time
+
+    from services.discord_bot import bot as discord_bot
+
+    calls = {"count": 0}
+    calls_lock = threading.Lock()
+    result = SimpleNamespace(summary={"panel_date": "2026-08-27 13:30:00"})
+
+    def fake_serialized(_cfg):
+        with calls_lock:
+            calls["count"] += 1
+        time.sleep(0.03)
+        return result
+
+    monkeypatch.setattr(
+        discord_bot, "_prewarm_market_signal_serialized", fake_serialized
+    )
+    discord_bot._PREWARM_RUN_LOCKS.clear()
+    discord_bot._PREWARM_RESULTS.clear()
+    cfg = SimpleNamespace(market="tw_day_trade_test", timezone="Asia/Taipei")
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(discord_bot._prewarm_market_signal_sync, cfg)
+            for _ in range(2)
+        ]
+        observed = [future.result() for future in futures]
+
+    assert observed == [result, result]
+    assert calls["count"] == 1
+
+
 def test_can_reuse_latest_signal_now_for_closed_fresh_panel_close() -> None:
     cfg = SimpleNamespace(market="tw")
     status = SimpleNamespace(
@@ -1461,6 +1993,137 @@ def test_signal_now_refreshes_automatically_when_data_is_stale() -> None:
     assert _signal_now_should_refresh_data(stale, refresh_data=False)
 
 
+def test_completed_session_receipt_must_ack_latest_close_phase(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    receipt_path = tmp_path / "completed.json"
+    publication_root = tmp_path / "publications"
+    phase_root = publication_root / "close_final"
+    phase_root.mkdir(parents=True)
+    publication = {
+        "status": "ok",
+        "phase": "close_final",
+        "started_at_taipei": "2026-08-26T17:30:00+08:00",
+        "completed_at_taipei": "2026-08-26T17:31:00+08:00",
+        "download_summary": {
+            "end_date": "2026-08-26",
+            "daily_close_ready": True,
+            "blocking_failed_count": 0,
+        },
+    }
+    (phase_root / "latest.json").write_text(
+        json.dumps(publication),
+        encoding="utf-8",
+    )
+    receipt_path.write_text(
+        json.dumps(
+            {
+                "status": "ok",
+                "expected_date": "2026-08-26",
+                "source_publication_phase": "close_final",
+                "source_publication_completed_at_taipei": (
+                    "2026-08-26T17:31:00+08:00"
+                ),
+                "after": {
+                    "current": True,
+                    "dates": {
+                        "stock_panel": "2026-08-26",
+                        "public_features": "2026-08-26",
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(
+        "STOCKAGENT_TW_COMPLETED_SESSION_RECEIPT",
+        str(receipt_path),
+    )
+    monkeypatch.setenv(
+        "STOCKAGENT_TW_PUBLICATION_RECEIPT_ROOT",
+        str(publication_root),
+    )
+    status = SimpleNamespace(
+        data=SimpleNamespace(
+            expected_latest_date="2026-08-26",
+            last_data_date="2026-08-26",
+        )
+    )
+
+    assert _completed_session_receipt_ready(status)
+
+    publication["completed_at_taipei"] = "2026-08-26T17:32:00+08:00"
+    (phase_root / "latest.json").write_text(
+        json.dumps(publication),
+        encoding="utf-8",
+    )
+    assert not _completed_session_receipt_ready(status)
+
+
+def test_signal_now_stale_response_says_waiting_source_not_background_update(
+    monkeypatch,
+) -> None:
+    messages: list[str] = []
+
+    class Response:
+        async def defer(self, **kwargs):
+            del kwargs
+
+    class Followup:
+        async def send(self, content, **kwargs):
+            del kwargs
+            messages.append(str(content))
+
+    interaction = SimpleNamespace(
+        response=Response(),
+        followup=Followup(),
+        user=SimpleNamespace(id=101),
+    )
+    cfg = SimpleNamespace(market="tw_day_trade_multi_basis")
+    stale = SimpleNamespace(
+        market_open=False,
+        data=SimpleNamespace(
+            fresh=False,
+            expected_latest_date="2026-08-26",
+            last_data_date="2026-08-25",
+            panel_date="2026-08-25",
+            reason="source not accepted",
+        ),
+    )
+    monkeypatch.setattr("services.discord_bot.bot._resolve_market", lambda market: cfg)
+    monkeypatch.setattr(
+        "services.discord_bot.bot._ensure_signal_ready_cached",
+        lambda resolved: stale,
+    )
+    monkeypatch.setattr(
+        "services.discord_bot.bot._signal_now_cached_result",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "services.discord_bot.bot._enqueue_signal_now_background_refresh",
+        lambda **kwargs: ("2026-08-26:tw_day_trade_multi_basis:auto", True),
+    )
+
+    asyncio.run(
+        _handle_signal_now_command(
+            interaction,
+            market=cfg.market,
+            mode="signal",
+            price_source="auto",
+            top_n=20,
+            min_abs_delta=0.001,
+            refresh_data=False,
+            debug=False,
+        )
+    )
+
+    assert len(messages) == 1
+    assert "status=`waiting_source`" in messages[0]
+    assert "不會重算舊資料" in messages[0]
+    assert "背景更新與推論" not in messages[0]
+
+
 def test_auto_signal_price_source_uses_shioaji_for_open_taiwan_market() -> None:
     status = SimpleNamespace(market_open=True)
     cfg = SimpleNamespace(
@@ -1469,6 +2132,17 @@ def test_auto_signal_price_source_uses_shioaji_for_open_taiwan_market() -> None:
 
     assert _auto_signal_price_source(cfg, status, "auto") == "shioaji"
     assert _auto_signal_price_source(cfg, status, None) == "shioaji"
+
+
+def test_auto_day_trade_signal_uses_shared_mis_opening_snapshot() -> None:
+    status = SimpleNamespace(market_open=True)
+    cfg = SimpleNamespace(
+        market_type="tw",
+        history_frequency="daily",
+        day_trade_simulation_enabled=True,
+    )
+
+    assert _auto_signal_price_source(cfg, status, "auto") == "tw"
 
 
 def test_auto_signal_price_source_uses_yahoo_for_other_open_stock_markets() -> None:

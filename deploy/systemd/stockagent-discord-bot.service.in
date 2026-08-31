@@ -1,12 +1,13 @@
 [Unit]
-Description=StockAgent Discord bot and private scheduled simulation artifacts
+Description=StockAgent Discord Gateway and live scheduled signal service
 Wants=network-online.target time-sync.target stockagent-tw-day-trade-simulation.service
 After=network-online.target time-sync.target stockagent-tw-day-trade-simulation.service
-StartLimitIntervalSec=300
-StartLimitBurst=5
+StartLimitIntervalSec=60
+StartLimitBurst=20
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=all
 User=@SERVICE_USER@
 Group=@SERVICE_GROUP@
 WorkingDirectory=@REPO_ROOT@
@@ -14,9 +15,17 @@ Environment="HOME=@SERVICE_HOME@"
 Environment="PYTHONUNBUFFERED=1"
 ExecStart=/usr/bin/bash "@REPO_ROOT@/scripts/run_discord_bot.sh"
 Restart=always
-RestartSec=10s
+RestartSec=1s
+# Full-universe panel/model native calls can hold the Python event-loop thread
+# for tens of seconds even though their bounded worker is progressing.  Keep
+# this outer process watchdog above that observed stall; the opening scheduler
+# retains its tighter progress-aware 30s/180s watchdogs.
+WatchdogSec=90s
+TimeoutStartSec=60s
 TimeoutStopSec=30s
 KillMode=control-group
+# The Gateway and live command plane must survive best-effort maintenance OOM.
+OOMScoreAdjust=-500
 
 [Install]
 WantedBy=multi-user.target

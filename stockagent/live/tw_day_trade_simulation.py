@@ -1,9 +1,11 @@
 """Durable multi-mode Taiwan stock day-trade paper execution.
 
-The signal producer and this executor deliberately remain separate.  A signal
-artifact is an immutable model decision; this module observes a causally later
-TWSE/TPEx best quote, converts target weights to board lots, and owns the only
-paper order/fill/position ledger used by the dashboard.
+The signal producer and this executor deliberately remain separate.  A live
+signal artifact is an immutable model decision; once it is published at or
+after 09:00, this module waits for a strictly later executable best Ask/Bid,
+converts target weights to board lots, and owns the only paper order/fill/
+position ledger used by the dashboard.  Historical backfills remain a distinct
+counterfactual contract recorded at 09:01 with the official session open.
 
 This module never calls a broker order API.  ``simulation_only`` and
 ``production_order_possible`` are persisted in every status snapshot so a
@@ -56,7 +58,11 @@ from stockagent.research.taifex_transaction_tax import (
 TAIPEI: Final[ZoneInfo] = ZoneInfo("Asia/Taipei")
 SIMULATION_SCHEMA_VERSION: Final[int] = 4
 TX_CONTINUOUS_ROLL_CONTRACT_VERSION: Final[int] = 2
-ENTRY_GATE: Final[time] = time(9, 0)
+# The live path starts at the exchange open and must consume only a quote that
+# is strictly later than the immutable signal publication.  ENTRY_GATE remains
+# the historical-replay boundary for compatibility with existing replay tools.
+LIVE_ENTRY_GATE: Final[time] = time(9, 0)
+ENTRY_GATE: Final[time] = time(9, 1)
 FIRST_MINUTE_EXECUTION_TIME: Final[time] = time(9, 1)
 EXIT_LIMIT_TIME: Final[time] = time(13, 20)
 FORCE_EXIT_TIME: Final[time] = time(13, 24)
@@ -68,10 +74,16 @@ ENTRY_FILL_POLICY_SYNTHETIC_OPEN_TICK: Final[str] = "synthetic_open_tick"
 ENTRY_FILL_POLICY_CAUSAL_BOOK_ELSE_OPEN_TICK: Final[str] = (
     "causal_best_quote_else_adverse_open_tick"
 )
+ENTRY_FILL_POLICY_MARKET_AT_BEST_ELSE_OPEN_TICK: Final[str] = (
+    "market_at_best_quote_else_adverse_open_tick"
+)
+ENTRY_FILL_POLICY_OFFICIAL_OPEN_AT_0901: Final[str] = "official_open_at_09_01"
 ENTRY_FILL_POLICIES: Final[frozenset[str]] = frozenset(
     {
         ENTRY_FILL_POLICY_CAUSAL_BOOK,
         ENTRY_FILL_POLICY_CAUSAL_BOOK_ELSE_OPEN_TICK,
+        ENTRY_FILL_POLICY_MARKET_AT_BEST_ELSE_OPEN_TICK,
+        ENTRY_FILL_POLICY_OFFICIAL_OPEN_AT_0901,
         ENTRY_FILL_POLICY_SYNTHETIC_OPEN_TICK,
     }
 )
@@ -87,8 +99,8 @@ MARGIN_FINANCING_RATIO: Final[float] = 0.60
 MARGIN_SHORT_INITIAL_MARGIN_RATE: Final[float] = 0.90
 DEFAULT_LIVE_RULE_DATA_DIR: Final[Path] = Path("/srv/stockagent-live/data_tw_public")
 STOCK_BENCHMARKS: Final[tuple[tuple[str, str, str, str], ...]] = (
-    ("benchmark_0050", "0050", "0050 元大台灣50", "etf"),
-    ("benchmark_2330", "2330", "2330 台積電", "stock"),
+    ("benchmark_0050", "0050", "0050 元大台灣50（含息）", "etf"),
+    ("benchmark_2330", "2330", "2330 台積電（含息）", "stock"),
 )
 TX_CONTINUOUS_BENCHMARK_ID: Final[str] = "benchmark_tx_continuous"
 TX_CONTINUOUS_LOGICAL_CODE: Final[str] = "TXFR1"
@@ -366,12 +378,22 @@ def _prepare_entry_plan(
     synthetic_open_fill = (
         spec.entry_fill_policy == ENTRY_FILL_POLICY_SYNTHETIC_OPEN_TICK
     )
+    market_at_best_else_tick = (
+        spec.entry_fill_policy == ENTRY_FILL_POLICY_MARKET_AT_BEST_ELSE_OPEN_TICK
+    )
+    official_open_at_0901 = (
+        spec.entry_fill_policy == ENTRY_FILL_POLICY_OFFICIAL_OPEN_AT_0901
+    )
     synthetic_fallback_fill = bool(
         spec.entry_fill_policy == ENTRY_FILL_POLICY_CAUSAL_BOOK_ELSE_OPEN_TICK
         and quote_values.get("entry_price_is_synthetic_fallback") is True
     )
     synthetic_entry_fill = synthetic_open_fill or synthetic_fallback_fill
-    entry_price = _finite(quote_values.get("ask" if side == "long" else "bid"))
+    entry_price = (
+        sizing_price
+        if official_open_at_0901
+        else _finite(quote_values.get("ask" if side == "long" else "bid"))
+    )
     quote_at = _parse_timestamp(quote_values.get("quote_at"))
     upper = _finite(quote_values.get("upper_limit"))
     lower = _finite(quote_values.get("lower_limit"))
@@ -421,6 +443,25 @@ def _prepare_entry_plan(
         if requested_shares <= 0:
             status, reason = "skipped", "below_one_board_lot"
     if status == "ready":
+        quote_is_causal = bool(
+            entry_price is not None
+            and quote_at is not None
+            and (
+                quote_at >= signal_at if allow_quote_at_signal else quote_at > signal_at
+            )
+            and quote_at <= observation_at
+        )
+        if market_at_best_else_tick and not quote_is_causal:
+            synthetic_fallback_fill = True
+            synthetic_entry_fill = True
+            entry_price = _synthetic_open_tick_entry_price(
+                sizing_price,
+                side=side,
+                trading_date=observation_at.date(),
+                offset_ticks=max(1, int(spec.entry_price_offset_ticks)),
+                lower_limit=lower,
+                upper_limit=upper,
+            )
         if entry_price is None:
             status, reason = (
                 ("blocked", "synthetic_open_tick_price_unavailable")
@@ -429,6 +470,13 @@ def _prepare_entry_plan(
             )
         elif upper is None or lower is None:
             status, reason = "blocked", "price_limit_unavailable"
+        elif official_open_at_0901:
+            # User-selected paper convention: at 09:01 use the already observed
+            # official session open for both directions.  This is deterministic
+            # counterfactual valuation, not a claim that a 09:01 exchange order
+            # could receive the earlier auction/opening price.
+            filled_shares = requested_shares
+            reason = "counterfactual_official_open_price_fill_at_09_01"
         elif synthetic_entry_fill:
             # Explicit paper fallback: every otherwise legal whole-lot request
             # is filled at the observed session open moved one adverse tick.
@@ -442,6 +490,22 @@ def _prepare_entry_plan(
                 if synthetic_fallback_fill
                 else "synthetic_open_tick_fill"
             )
+        elif market_at_best_else_tick:
+            # The configured paper-market-order contract consumes the complete
+            # requested whole-lot quantity at the causally observed best Ask
+            # for buys/covers or best Bid for sells/shorts. Displayed L1 size
+            # remains audit evidence, not a quantity ceiling. This never claims
+            # an exchange fill or queue position.
+            top_book_capacity_shares = _top_book_capacity_shares(
+                quote_values,
+                transaction_side="buy" if side == "long" else "sell",
+                lot_size=spec.lot_size,
+            )
+            minute_kbar_capacity_shares = _minute_kbar_capacity_shares(
+                quote_values,
+                lot_size=spec.lot_size,
+            )
+            filled_shares = requested_shares
         elif quote_at is None or (
             quote_at < signal_at if allow_quote_at_signal else quote_at <= signal_at
         ):
@@ -500,21 +564,48 @@ def _prepare_entry_plan(
         "entry_fill_policy": spec.entry_fill_policy,
         "entry_price_offset_ticks": int(spec.entry_price_offset_ticks),
         "entry_price_source": quote_values.get("entry_price_source")
-        or quote_values.get("source"),
+        or (
+            "official_session_open_observed_by_09_01"
+            if official_open_at_0901
+            else quote_values.get("source")
+        ),
         "synthetic_fill": synthetic_entry_fill and filled_shares > 0,
         "synthetic_fallback_fill": synthetic_fallback_fill and filled_shares > 0,
+        "paper_market_fill": market_at_best_else_tick and filled_shares > 0,
+        "counterfactual_open_price_fill": (official_open_at_0901 and filled_shares > 0),
     }
 
 
 def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True, default=str)
-        + "\n",
-        encoding="utf-8",
-    )
-    os.replace(temporary, path)
+    temporary = path.with_suffix(path.suffix + f".tmp.{uuid.uuid4().hex}")
+    try:
+        with temporary.open("w", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                    default=str,
+                )
+                + "\n"
+            )
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        # The rename is only crash-durable after the containing directory is
+        # synced.  This state is the exactly-once boundary for the append-only
+        # paper ledgers, so a merely atomic-but-not-durable replace is not
+        # sufficient.
+        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        directory_fd = os.open(path.parent, directory_flags)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _append_jsonl(path: Path, payload: Mapping[str, Any]) -> None:
@@ -853,11 +944,114 @@ class TwDayTradeSimulationEngine:
         self._corporate_action_coverage_end: date | None = None
         self._engine_run_id = uuid.uuid4().hex
         self.state = self._load_state()
+        stock_benchmarks_migrated = self._migrate_stock_benchmark_contract()
         tx_benchmark_migrated = self._migrate_tx_continuous_benchmark_contract()
         self._reconcile_daily_duplicate_signal_ids()
+        self._audit_signal_commit_state()
         self._restore_position_artifact_paths()
-        if tx_benchmark_migrated:
+        if stock_benchmarks_migrated or tx_benchmark_migrated:
             _atomic_json(self.state_path, self.state)
+
+    def _audit_signal_commit_state(self) -> None:
+        """Fail closed when an interrupted ledger commit and state disagree.
+
+        Ledger batches are fsynced before state.json is advanced.  A process or
+        host failure inside that small window must never make the same signal
+        executable twice after restart.  The compact event ledger records the
+        start and completion of every new commit; any unmatched start, or a
+        completed event absent from state, is quarantined for explicit repair.
+        """
+
+        if not self.events_path.is_file():
+            return
+        latest_started: dict[str, tuple[str, str]] = {}
+        latest_registered: dict[str, tuple[str, str]] = {}
+        with self.events_path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    event = json.loads(line)
+                except (TypeError, ValueError):
+                    continue
+                market = str(event.get("market") or "").strip()
+                signal_id = str(event.get("signal_id") or "").strip()
+                event_name = str(event.get("event") or "").strip()
+                if not market or not signal_id:
+                    continue
+                session_date = str(event.get("session_date") or "").strip()
+                if not session_date:
+                    recorded_at = _parse_timestamp(event.get("recorded_at"))
+                    session_date = (
+                        recorded_at.date().isoformat()
+                        if recorded_at is not None
+                        else ""
+                    )
+                if event_name == "signal_commit_started":
+                    latest_started[market] = (signal_id, session_date)
+                elif event_name == "signal_registered":
+                    latest_registered[market] = (signal_id, session_date)
+
+        markets = set(latest_started) | set(latest_registered)
+        for market in markets:
+            started = latest_started.get(market)
+            registered = latest_registered.get(market)
+            divergence_kind: str | None = None
+            signal_id = ""
+            session_date = ""
+            if started is not None and started != registered:
+                divergence_kind = "signal_commit_started_without_registration"
+                signal_id, session_date = started
+            elif registered is not None:
+                signal_id, session_date = registered
+                mode = (self.state.get("modes") or {}).get(market)
+                processed = (
+                    set(mode.get("processed_signal_ids") or ())
+                    if isinstance(mode, Mapping)
+                    else set()
+                )
+                state_accepts_signal = bool(
+                    isinstance(mode, Mapping)
+                    and (
+                        signal_id in processed
+                        or (
+                            str(mode.get("signal_id") or "") == signal_id
+                            and bool(mode.get("entry_completed_at"))
+                        )
+                    )
+                )
+                if not state_accepts_signal:
+                    divergence_kind = "registered_ledger_missing_from_state"
+            if divergence_kind is None:
+                continue
+            mode = self.state.setdefault("modes", {}).setdefault(market, {})
+            mode["market"] = market
+            mode["ledger_state_divergence"] = {
+                "kind": divergence_kind,
+                "signal_id": signal_id,
+                "session_date": session_date,
+                "detected_at": _iso(),
+            }
+            mode["engine_status"] = "critical_ledger_state_divergence"
+            mode["readiness_error"] = (
+                f"ledger_state_divergence:{divergence_kind}:{signal_id}"
+            )
+
+    def _migrate_stock_benchmark_contract(self) -> bool:
+        benchmarks = self.state.get("benchmarks") or {}
+        changed = False
+        for benchmark_id, _symbol, label, _security_type in STOCK_BENCHMARKS:
+            row = benchmarks.get(benchmark_id)
+            if not isinstance(row, dict):
+                continue
+            updates = {
+                "label": label,
+                "return_type": "total_return",
+                "total_return_contract": ("official_ex_date_reference_reinvestment_v1"),
+            }
+            for key, value in updates.items():
+                if row.get(key) != value:
+                    row[key] = value
+                    changed = True
+        return changed
 
     def _migrate_tx_continuous_benchmark_contract(self) -> bool:
         row = (self.state.get("benchmarks") or {}).get(TX_CONTINUOUS_BENCHMARK_ID)
@@ -1305,6 +1499,12 @@ class TwDayTradeSimulationEngine:
                         "corporate_action_coverage",
                         "corporate_action_status",
                         "corporate_action_coverage_end",
+                        "current_session_reference_price",
+                        "current_session_reference_source",
+                        "previous_official_close",
+                        "previous_official_close_date",
+                        "previous_official_close_source",
+                        "return_type",
                     )
                 },
             },
@@ -1375,6 +1575,11 @@ class TwDayTradeSimulationEngine:
         symbol: str,
         entry_at: object,
         mark_date: date,
+        current_reference_price: object = None,
+        current_reference_source: object = None,
+        previous_close: object = None,
+        previous_close_date: object = None,
+        previous_close_source: object = None,
     ) -> tuple[float | None, list[dict[str, Any]], str]:
         """Return the reinvested-unit factor implied by official reference prices.
 
@@ -1384,10 +1589,6 @@ class TwDayTradeSimulationEngine:
         reverse splits, and mixed capital actions without guessing their type.
         """
 
-        if self._corporate_action_reference_path is None:
-            return 1.0, [], "not_configured"
-        if self._corporate_action_load_error is not None:
-            return None, [], "reference_unavailable"
         parsed_entry = _parse_timestamp(entry_at)
         if parsed_entry is None:
             return None, [], "entry_timestamp_invalid"
@@ -1399,10 +1600,11 @@ class TwDayTradeSimulationEngine:
         # continue to fail closed until the reference covers the mark date.
         if parsed_entry.date() == mark_date:
             return 1.0, [], "same_session_no_action_boundary"
-        if (
-            self._corporate_action_coverage_end is None
-            or self._corporate_action_coverage_end < mark_date
-        ):
+        if self._corporate_action_reference_path is None:
+            return None, [], "reference_not_configured"
+        if self._corporate_action_load_error is not None:
+            return None, [], "reference_unavailable"
+        if self._corporate_action_coverage_end is None:
             return None, [], "reference_coverage_incomplete"
         factor = 1.0
         applied: list[dict[str, Any]] = []
@@ -1414,29 +1616,68 @@ class TwDayTradeSimulationEngine:
             # actions crossed while holding the benchmark belong in return.
             if not (parsed_entry.date() < action_date <= mark_date):
                 continue
-            previous_close = _finite(item.get("previous_close"))
-            reference_price = _finite(item.get("reference_price"))
+            action_previous_close = _finite(item.get("previous_close"))
+            action_reference_price = _finite(item.get("reference_price"))
             if (
-                previous_close is None
-                or reference_price is None
-                or previous_close <= 0.0
-                or reference_price <= 0.0
+                action_previous_close is None
+                or action_reference_price is None
+                or action_previous_close <= 0.0
+                or action_reference_price <= 0.0
             ):
                 return None, [], "reference_factor_invalid"
-            action_factor = previous_close / reference_price
+            action_factor = action_previous_close / action_reference_price
             factor *= action_factor
             applied.append(
                 {
                     "date": action_date.isoformat(),
                     "event_type": item.get("event_type"),
-                    "previous_close": previous_close,
-                    "reference_price": reference_price,
+                    "previous_close": action_previous_close,
+                    "reference_price": action_reference_price,
                     "factor": action_factor,
                 }
             )
+
+        status = "official_reference_complete"
+        if self._corporate_action_coverage_end < mark_date:
+            try:
+                parsed_previous_close_date = (
+                    previous_close_date
+                    if isinstance(previous_close_date, date)
+                    else date.fromisoformat(str(previous_close_date or ""))
+                )
+            except (TypeError, ValueError):
+                return None, [], "current_session_previous_close_date_invalid"
+            official_previous_close = _finite(previous_close)
+            official_current_reference = _finite(current_reference_price)
+            if self._corporate_action_coverage_end != parsed_previous_close_date:
+                return None, [], "current_session_previous_close_not_contiguous"
+            if parsed_previous_close_date >= mark_date:
+                return None, [], "current_session_previous_close_date_invalid"
+            if (
+                official_previous_close is None
+                or official_previous_close <= 0.0
+                or official_current_reference is None
+                or official_current_reference <= 0.0
+            ):
+                return None, [], "current_session_reference_invalid"
+            current_factor = official_previous_close / official_current_reference
+            factor *= current_factor
+            if not math.isclose(current_factor, 1.0, rel_tol=0.0, abs_tol=1e-12):
+                applied.append(
+                    {
+                        "date": mark_date.isoformat(),
+                        "event_type": "current_session_reference_transition",
+                        "previous_close": official_previous_close,
+                        "reference_price": official_current_reference,
+                        "factor": current_factor,
+                        "reference_source": str(current_reference_source or ""),
+                        "previous_close_source": str(previous_close_source or ""),
+                    }
+                )
+            status = "official_reference_complete_with_current_session_reference"
         if not math.isfinite(factor) or factor <= 0.0:
             return None, [], "cumulative_factor_invalid"
-        return factor, applied, "official_reference_complete"
+        return factor, applied, status
 
     def _mark_stock_benchmark(
         self,
@@ -1463,6 +1704,8 @@ class TwDayTradeSimulationEngine:
                 "valuation_stale": True,
             },
         )
+        row["label"] = label
+        row["return_type"] = "total_return"
         buy_rate, sell_rate = self._stock_benchmark_fee_rates(
             symbol=symbol,
             security_type=security_type,
@@ -1494,19 +1737,43 @@ class TwDayTradeSimulationEngine:
                 symbol=symbol,
                 entry_at=row.get("entry_at"),
                 mark_date=now.date(),
+                current_reference_price=quote.get("reference_price"),
+                current_reference_source=quote.get("reference_price_source")
+                or quote.get("source"),
+                previous_close=quote.get("previous_close"),
+                previous_close_date=quote.get("previous_close_date"),
+                previous_close_source=quote.get("previous_close_source"),
             )
+        )
+        action_coverage_complete = action_status in {
+            "official_reference_complete",
+            "official_reference_complete_with_current_session_reference",
+            "same_session_no_action_boundary",
+        }
+        effective_coverage_end = (
+            now.date()
+            if action_status
+            == "official_reference_complete_with_current_session_reference"
+            else self._corporate_action_coverage_end
         )
         row.update(
             {
                 "total_return_contract": ("official_ex_date_reference_reinvestment_v1"),
-                "corporate_action_coverage": action_status
-                == "official_reference_complete",
+                "corporate_action_coverage": action_coverage_complete,
                 "corporate_action_status": action_status,
                 "corporate_action_coverage_end": (
-                    self._corporate_action_coverage_end.isoformat()
-                    if self._corporate_action_coverage_end is not None
+                    effective_coverage_end.isoformat()
+                    if effective_coverage_end is not None
                     else None
                 ),
+                "current_session_reference_price": _finite(
+                    quote.get("reference_price")
+                ),
+                "current_session_reference_source": quote.get("reference_price_source")
+                or quote.get("source"),
+                "previous_official_close": _finite(quote.get("previous_close")),
+                "previous_official_close_date": quote.get("previous_close_date"),
+                "previous_official_close_source": quote.get("previous_close_source"),
             }
         )
         if entry is not None and bid is not None and adjustment_factor is not None:
@@ -1895,7 +2162,14 @@ class TwDayTradeSimulationEngine:
         mode["entry_fill_is_synthetic"] = (
             spec.entry_fill_policy == ENTRY_FILL_POLICY_SYNTHETIC_OPEN_TICK
         )
-        mode["fill_guaranteed"] = bool(mode["entry_fill_is_synthetic"])
+        mode["paper_fill_deterministic"] = spec.entry_fill_policy in {
+            ENTRY_FILL_POLICY_MARKET_AT_BEST_ELSE_OPEN_TICK,
+            ENTRY_FILL_POLICY_OFFICIAL_OPEN_AT_0901,
+        }
+        mode["fill_guaranteed"] = bool(
+            mode["entry_fill_is_synthetic"] or mode["paper_fill_deterministic"]
+        )
+        mode["exchange_fill_guaranteed"] = False
         return mode
 
     def update_readiness(
@@ -1919,7 +2193,13 @@ class TwDayTradeSimulationEngine:
             checkpoint = Path(spec.checkpoint_path) if spec.checkpoint_path else None
             checkpoint_ready = bool(checkpoint and checkpoint.is_file())
             mode["checkpoint_ready"] = checkpoint_ready
-            mode["readiness_error"] = (errors or {}).get(spec.market)
+            divergence = mode.get("ledger_state_divergence")
+            mode["readiness_error"] = (
+                "ledger_state_divergence:"
+                f"{divergence.get('kind')}:{divergence.get('signal_id')}"
+                if isinstance(divergence, Mapping)
+                else (errors or {}).get(spec.market)
+            )
             if current_eligibility_coverage is not None:
                 mode["current_eligibility_coverage"] = dict(
                     current_eligibility_coverage.get(spec.market) or {}
@@ -1928,7 +2208,9 @@ class TwDayTradeSimulationEngine:
                 int(item.get("signed_shares") or 0) != 0
                 for item in mode["positions"].values()
             )
-            if bool(mode.get("legacy_execution_contract")) and has_open_position:
+            if isinstance(divergence, Mapping):
+                mode["engine_status"] = "critical_ledger_state_divergence"
+            elif bool(mode.get("legacy_execution_contract")) and has_open_position:
                 mode["engine_status"] = (
                     "critical_legacy_position_requires_reconciliation"
                 )
@@ -1955,7 +2237,7 @@ class TwDayTradeSimulationEngine:
                     mode["engine_status"] = "flat_no_executable_signal"
             elif observed.weekday() >= 5:
                 mode["engine_status"] = "waiting_trading_day"
-            elif observed.timetz().replace(tzinfo=None) < ENTRY_GATE:
+            elif observed.timetz().replace(tzinfo=None) < LIVE_ENTRY_GATE:
                 mode["engine_status"] = "waiting_09_00_signal"
             elif observed.timetz().replace(tzinfo=None) >= SESSION_CLOSE:
                 mode["engine_status"] = "session_complete"
@@ -1981,7 +2263,7 @@ class TwDayTradeSimulationEngine:
 
         observed = _now_taipei(now)
         wall_time = observed.timetz().replace(tzinfo=None)
-        if wall_time < ENTRY_GATE or wall_time >= EXIT_LIMIT_TIME:
+        if wall_time < LIVE_ENTRY_GATE or wall_time >= EXIT_LIMIT_TIME:
             raise RuntimeError("flat-session rearm is outside the entry window")
         normalized_reason = str(reason or "").strip()
         if not normalized_reason:
@@ -2173,6 +2455,10 @@ class TwDayTradeSimulationEngine:
         executor_quote_fetch_ms: float,
         eligibility_load_ms: float,
         ledger_compute_persist_ms: float,
+        opening_signal_batch_wait_ms: float = 0.0,
+        opening_signal_batch_mode_count: int = 1,
+        opening_signal_batch_expected_mode_count: int = 1,
+        opening_signal_batch_complete: bool = True,
     ) -> None:
         """Persist one measured input-to-ledger sample for the public panel."""
 
@@ -2219,6 +2505,20 @@ class TwDayTradeSimulationEngine:
                 return None
             return round(max(0.0, (end - start).total_seconds() * 1000.0), 3)
 
+        opening_gate = ledger_persisted_at.astimezone(TAIPEI).replace(
+            hour=9,
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+        opening_delay_seconds = (ledger_persisted_at - opening_gate).total_seconds()
+        opening_gate_to_ledger_ms = (
+            round(opening_delay_seconds * 1000.0, 3)
+            if opening_delay_seconds >= 0.0
+            else None
+        )
+        opening_commit_slo_ms = 15_000.0
+
         stages = {
             **detailed_signal_stages,
             "signal_quote_fetch_ms": signal_quote_ms,
@@ -2226,6 +2526,9 @@ class TwDayTradeSimulationEngine:
             "signal_other_compute_ms": signal_other_ms,
             "artifact_publish_ms": _finite(live_latency.get("artifact_publish_ms")),
             "artifact_discovery_ms": elapsed_ms(published_at, consumer_detected_at),
+            "opening_signal_batch_wait_ms": round(
+                max(0.0, opening_signal_batch_wait_ms), 3
+            ),
             "eligibility_load_ms": round(max(0.0, eligibility_load_ms), 3),
             "executor_quote_fetch_ms": round(max(0.0, executor_quote_fetch_ms), 3),
             "ledger_compute_persist_ms": round(max(0.0, ledger_compute_persist_ms), 3),
@@ -2268,7 +2571,24 @@ class TwDayTradeSimulationEngine:
                 ),
                 "input_to_ledger_ms": elapsed_ms(started_at, ledger_persisted_at),
                 "ready_to_ledger_ms": elapsed_ms(ready_at, ledger_persisted_at),
+                "opening_gate_to_ledger_ms": opening_gate_to_ledger_ms,
+                "opening_commit_slo_ms": opening_commit_slo_ms,
+                "opening_commit_slo_met": (
+                    opening_gate_to_ledger_ms is not None
+                    and opening_gate_to_ledger_ms <= opening_commit_slo_ms
+                ),
                 "signal_compute_total_ms": signal_total_ms,
+                "opening_signal_batch": {
+                    "observed_mode_count": max(0, int(opening_signal_batch_mode_count)),
+                    "expected_mode_count": max(
+                        0, int(opening_signal_batch_expected_mode_count)
+                    ),
+                    "complete": bool(opening_signal_batch_complete),
+                    "single_causal_quote_request": bool(
+                        opening_signal_batch_complete
+                        and int(opening_signal_batch_mode_count) > 1
+                    ),
+                },
                 "stages": stages,
                 "bottleneck_stage": bottleneck,
                 "bottleneck_ms": finite_stages.get(bottleneck) if bottleneck else None,
@@ -2328,6 +2648,11 @@ class TwDayTradeSimulationEngine:
         signal_id = str(summary.get("signal_id") or "").strip()
         if not signal_id:
             raise ValueError("signal summary has no signal_id")
+        if isinstance(mode.get("ledger_state_divergence"), Mapping):
+            mode["pending_signal_id"] = signal_id
+            mode["engine_status"] = "critical_ledger_state_divergence"
+            self._persist(observed)
+            return "blocked_ledger_state_divergence"
         if signal_id in set(mode.get("processed_signal_ids") or ()):
             return "already_processed"
         if str(summary.get("execution_mode") or "") != "tw_day_trade":
@@ -2356,10 +2681,17 @@ class TwDayTradeSimulationEngine:
                 "retrospective_actual_session_open_price_counterfactual"
                 if spec.entry_fill_policy == ENTRY_FILL_POLICY_SYNTHETIC_OPEN_TICK
                 else (
-                    "retrospective_historical_best_quote_else_adverse_open_tick_counterfactual"
+                    "retrospective_official_session_open_at_09_01_counterfactual"
+                    if spec.entry_fill_policy == ENTRY_FILL_POLICY_OFFICIAL_OPEN_AT_0901
+                    else "retrospective_historical_best_quote_else_adverse_open_tick_counterfactual"
                     if spec.entry_fill_policy
                     == ENTRY_FILL_POLICY_CAUSAL_BOOK_ELSE_OPEN_TICK
-                    else "retrospective_observed_best_quote_counterfactual"
+                    else (
+                        "retrospective_historical_best_quote_market_else_adverse_open_tick_counterfactual"
+                        if spec.entry_fill_policy
+                        == ENTRY_FILL_POLICY_MARKET_AT_BEST_ELSE_OPEN_TICK
+                        else "retrospective_observed_best_quote_counterfactual"
+                    )
                 )
             )
             if replay_fill_contract != required_replay_fill_contract:
@@ -2371,7 +2703,7 @@ class TwDayTradeSimulationEngine:
                 )
             if wall_time != ENTRY_GATE:
                 raise ValueError(
-                    "counterfactual open replay must be recorded exactly at 09:00"
+                    "counterfactual open replay must be recorded exactly at 09:01"
                 )
             signal_at = observed
         else:
@@ -2384,7 +2716,13 @@ class TwDayTradeSimulationEngine:
                 return self._block_signal(
                     mode, signal_id, "invalid_signal_ready_timestamp", observed
                 )
-        if wall_time < ENTRY_GATE or wall_time >= EXIT_LIMIT_TIME:
+        entry_gate = (
+            ENTRY_GATE
+            if counterfactual_open_replay
+            or spec.entry_fill_policy == ENTRY_FILL_POLICY_OFFICIAL_OPEN_AT_0901
+            else LIVE_ENTRY_GATE
+        )
+        if wall_time < entry_gate or wall_time >= EXIT_LIMIT_TIME:
             return self._block_signal(mode, signal_id, "outside_entry_window", observed)
         if not bool(summary.get("live_session_open_feature_applied")):
             return self._block_signal(
@@ -2455,7 +2793,19 @@ class TwDayTradeSimulationEngine:
         synthetic_open_fill = (
             spec.entry_fill_policy == ENTRY_FILL_POLICY_SYNTHETIC_OPEN_TICK
         )
-        if actionable_symbols and not later_quote_found and not synthetic_open_fill:
+        deterministic_paper_market_fill = (
+            spec.entry_fill_policy == ENTRY_FILL_POLICY_MARKET_AT_BEST_ELSE_OPEN_TICK
+        )
+        deterministic_official_open_fill = (
+            spec.entry_fill_policy == ENTRY_FILL_POLICY_OFFICIAL_OPEN_AT_0901
+        )
+        if (
+            actionable_symbols
+            and not later_quote_found
+            and not synthetic_open_fill
+            and not deterministic_paper_market_fill
+            and not deterministic_official_open_fill
+        ):
             mode["pending_signal_id"] = signal_id
             mode["pending_signal_at"] = signal_at.isoformat(timespec="seconds")
             mode["engine_status"] = "waiting_causally_later_quote"
@@ -2464,6 +2814,8 @@ class TwDayTradeSimulationEngine:
         if (
             actionable_symbols
             and not synthetic_open_fill
+            and not deterministic_paper_market_fill
+            and not deterministic_official_open_fill
             and wall_time >= FIRST_MINUTE_EXECUTION_TIME
             and all(
                 _finite(quotes.get(symbol, {}).get("minute_volume_lots")) is None
@@ -2530,6 +2882,10 @@ class TwDayTradeSimulationEngine:
         mode["entry_fill_contract"] = summary.get("entry_fill_contract") or (
             "synthetic_observed_session_open_adverse_tick"
             if synthetic_open_fill
+            else "counterfactual_official_session_open_at_09_01"
+            if deterministic_official_open_fill
+            else "paper_market_order_at_best_quote_else_adverse_open_tick"
+            if deterministic_paper_market_fill
             else "best_ask_for_buy_best_bid_for_sell"
         )
         mode["entry_liquidity_assumption"] = summary.get(
@@ -2537,11 +2893,16 @@ class TwDayTradeSimulationEngine:
         ) or (
             "counterfactual_unbounded_no_exchange_fill_claim"
             if synthetic_open_fill
+            else "official_open_price_full_requested_paper_quantity_no_exchange_fill_claim"
+            if deterministic_official_open_fill
+            else "full_requested_quantity_at_observed_best_quote_else_adverse_open_tick_no_exchange_depth_claim"
+            if deterministic_paper_market_fill
             else "09:00_fresh_level_one_depth_then_minimum_with_50pct_completed_minute_volume"
         )
         mode["entry_fill_policy"] = spec.entry_fill_policy
         mode["entry_price_offset_ticks"] = int(spec.entry_price_offset_ticks)
         mode["entry_fill_is_synthetic"] = bool(synthetic_open_fill)
+        mode["counterfactual_open_price_fill"] = bool(deterministic_official_open_fill)
         mode["entry_fill_has_synthetic_fallback"] = False
         mode.pop("execution_projection", None)
         mode["positions"] = {}
@@ -2650,6 +3011,10 @@ class TwDayTradeSimulationEngine:
                 "entry_price_source": entry_price_source,
                 "synthetic_fill": bool(plan["synthetic_fill"]),
                 "synthetic_fallback_fill": bool(plan["synthetic_fallback_fill"]),
+                "paper_market_fill": bool(plan["paper_market_fill"]),
+                "counterfactual_open_price_fill": bool(
+                    plan["counterfactual_open_price_fill"]
+                ),
             }
             signal_records.append(signal_record)
             counts[status] = counts.get(status, 0) + 1
@@ -2739,7 +3104,9 @@ class TwDayTradeSimulationEngine:
                     if offset_ticks > 0
                     else "full_daily_limits"
                 ),
-                "fill_guaranteed": bool(plan["synthetic_fill"]),
+                "fill_guaranteed": bool(
+                    plan["synthetic_fill"] or plan["counterfactual_open_price_fill"]
+                ),
                 "take_profit_order_status": "working",
                 "stop_order_status": "armed_local_trigger",
                 "eod_limit_order_status": None,
@@ -2759,6 +3126,10 @@ class TwDayTradeSimulationEngine:
                 "entry_fill_is_synthetic": bool(plan["synthetic_fill"]),
                 "entry_price_source": entry_price_source,
                 "synthetic_fallback_fill": bool(plan["synthetic_fallback_fill"]),
+                "paper_market_fill": bool(plan["paper_market_fill"]),
+                "counterfactual_open_price_fill": bool(
+                    plan["counterfactual_open_price_fill"]
+                ),
             }
             mode["positions"][position_id] = position
             mode["cumulative_commission_rebate_accrued_twd"] = (
@@ -2770,7 +3141,10 @@ class TwDayTradeSimulationEngine:
                 "session_date": observed.date().isoformat(),
                 "market": spec.market,
                 "signal_market": spec.signal_market or spec.market,
+                "entry_fill_policy": plan["entry_fill_policy"],
+                "entry_price_offset_ticks": plan["entry_price_offset_ticks"],
                 "price_limit_offset_ticks": offset_ticks,
+                "bracket_price_offset_ticks": offset_ticks,
                 "position_id": position_id,
                 "symbol": symbol,
                 "quantity": filled_shares,
@@ -2783,7 +3157,11 @@ class TwDayTradeSimulationEngine:
                     "purpose": "entry",
                     "side": "buy" if side == "long" else "sell_short",
                     "order_type": (
-                        "SYNTHETIC_OPEN_TICK" if bool(plan["synthetic_fill"]) else "MKT"
+                        "PAPER_OPEN_PRICE_0901"
+                        if bool(plan["counterfactual_open_price_fill"])
+                        else "SYNTHETIC_OPEN_TICK"
+                        if bool(plan["synthetic_fill"])
+                        else "MKT"
                     ),
                     "status": "filled",
                     "filled_quantity": filled_shares,
@@ -2794,6 +3172,10 @@ class TwDayTradeSimulationEngine:
                     ),
                     "synthetic_fill": bool(plan["synthetic_fill"]),
                     "synthetic_fallback_fill": bool(plan["synthetic_fallback_fill"]),
+                    "paper_market_fill": bool(plan["paper_market_fill"]),
+                    "counterfactual_open_price_fill": bool(
+                        plan["counterfactual_open_price_fill"]
+                    ),
                     "entry_price_source": entry_price_source,
                     "historical_source_quote_at": quote.get(
                         "historical_source_quote_at"
@@ -2821,6 +3203,10 @@ class TwDayTradeSimulationEngine:
                     "replay_basis": mode.get("replay_basis"),
                     "synthetic_fill": bool(plan["synthetic_fill"]),
                     "synthetic_fallback_fill": bool(plan["synthetic_fallback_fill"]),
+                    "paper_market_fill": bool(plan["paper_market_fill"]),
+                    "counterfactual_open_price_fill": bool(
+                        plan["counterfactual_open_price_fill"]
+                    ),
                     "entry_price_source": entry_price_source,
                 }
             )
@@ -2859,10 +3245,20 @@ class TwDayTradeSimulationEngine:
         entry_best_quote_fill_count = sum(
             int(plan.get("filled_shares") or 0) > 0
             and not bool(plan.get("synthetic_fill"))
+            and not bool(plan.get("counterfactual_open_price_fill"))
             for plan in plans
         )
         entry_synthetic_fallback_fill_count = sum(
             bool(plan.get("synthetic_fallback_fill")) for plan in plans
+        )
+        entry_synthetic_fill_count = sum(
+            bool(plan.get("synthetic_fill")) for plan in plans
+        )
+        entry_paper_market_fill_count = sum(
+            bool(plan.get("paper_market_fill")) for plan in plans
+        )
+        entry_official_open_fill_count = sum(
+            bool(plan.get("counterfactual_open_price_fill")) for plan in plans
         )
         entry_fill_outcome = (
             "filled"
@@ -2883,17 +3279,44 @@ class TwDayTradeSimulationEngine:
         mode["entry_synthetic_fallback_fill_count"] = (
             entry_synthetic_fallback_fill_count
         )
+        mode["entry_paper_market_fill_count"] = entry_paper_market_fill_count
+        mode["entry_official_open_fill_count"] = entry_official_open_fill_count
         mode["entry_fill_has_synthetic_fallback"] = bool(
             entry_synthetic_fallback_fill_count
         )
-        mode["entry_fill_is_synthetic"] = bool(entry_synthetic_fallback_fill_count)
+        mode["entry_fill_is_synthetic"] = bool(entry_synthetic_fill_count)
+        mode["paper_fill_deterministic"] = bool(deterministic_paper_market_fill)
+        mode["counterfactual_open_price_fill"] = bool(deterministic_official_open_fill)
+        mode["exchange_fill_guaranteed"] = False
 
-        # One signal is one logical append transaction per ledger. This keeps
-        # every row durable before state.json points at the accepted signal,
-        # while avoiding thousands of per-row fsync calls on the 09:00 path.
-        _append_jsonl_many(self.signals_path, signal_records)
-        _append_jsonl_many(self.orders_path, order_records)
-        _append_jsonl_many(self.fills_path, fill_records)
+        # One signal is one logical append transaction per ledger.  The compact
+        # start marker is fsynced first so an interrupted transaction can never
+        # be mistaken for a never-seen signal and executed twice after restart.
+        self._event(
+            "signal_commit_started",
+            recorded_at=observed,
+            market=spec.market,
+            session_date=observed.date().isoformat(),
+            signal_id=signal_id,
+        )
+        try:
+            _append_jsonl_many(self.signals_path, signal_records)
+            _append_jsonl_many(self.orders_path, order_records)
+            _append_jsonl_many(self.fills_path, fill_records)
+        except Exception as exc:
+            mode["ledger_state_divergence"] = {
+                "kind": "signal_ledger_append_failed",
+                "signal_id": signal_id,
+                "session_date": observed.date().isoformat(),
+                "detected_at": observed.isoformat(timespec="seconds"),
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+            mode["engine_status"] = "critical_ledger_state_divergence"
+            mode["readiness_error"] = (
+                f"ledger_state_divergence:signal_ledger_append_failed:{signal_id}"
+            )
+            self._persist(observed)
+            raise
 
         processed = list(mode.get("processed_signal_ids") or ())
         processed.append(signal_id)
@@ -2908,30 +3331,47 @@ class TwDayTradeSimulationEngine:
             )
             else "flat_no_executable_signal"
         )
-        self._event(
-            "signal_registered",
-            recorded_at=observed,
-            market=spec.market,
-            signal_id=signal_id,
-            counts=counts,
-            reason_counts=reason_counts,
-            entry_fill_count=entry_fill_count,
-            entry_requested_shares=entry_requested_shares,
-            entry_filled_shares=entry_filled_shares,
-            entry_unfilled_shares=entry_unfilled_shares,
-            entry_fill_outcome=entry_fill_outcome,
-            entry_fill_policy=spec.entry_fill_policy,
-            entry_price_offset_ticks=int(spec.entry_price_offset_ticks),
-            entry_fill_is_synthetic=bool(entry_synthetic_fallback_fill_count),
-            entry_best_quote_fill_count=entry_best_quote_fill_count,
-            entry_synthetic_fallback_fill_count=(entry_synthetic_fallback_fill_count),
-            simulation_replay=bool(mode.get("simulation_replay")),
-            replay_basis=mode.get("replay_basis"),
-            source_signal_at=source_signal_at.isoformat(timespec="seconds"),
-            counterfactual_open_replay=bool(counterfactual_open_replay),
-        )
-        self._mark_mode(spec.market, observed, quotes)
-        self._persist(observed)
+        try:
+            self._event(
+                "signal_registered",
+                recorded_at=observed,
+                market=spec.market,
+                session_date=observed.date().isoformat(),
+                signal_id=signal_id,
+                counts=counts,
+                reason_counts=reason_counts,
+                entry_fill_count=entry_fill_count,
+                entry_requested_shares=entry_requested_shares,
+                entry_filled_shares=entry_filled_shares,
+                entry_unfilled_shares=entry_unfilled_shares,
+                entry_fill_outcome=entry_fill_outcome,
+                entry_fill_policy=spec.entry_fill_policy,
+                entry_price_offset_ticks=int(spec.entry_price_offset_ticks),
+                entry_fill_is_synthetic=bool(entry_synthetic_fallback_fill_count),
+                entry_best_quote_fill_count=entry_best_quote_fill_count,
+                entry_synthetic_fallback_fill_count=(
+                    entry_synthetic_fallback_fill_count
+                ),
+                simulation_replay=bool(mode.get("simulation_replay")),
+                replay_basis=mode.get("replay_basis"),
+                source_signal_at=source_signal_at.isoformat(timespec="seconds"),
+                counterfactual_open_replay=bool(counterfactual_open_replay),
+            )
+            self._mark_mode(spec.market, observed, quotes)
+            self._persist(observed)
+        except Exception as exc:
+            mode["ledger_state_divergence"] = {
+                "kind": "signal_state_commit_failed",
+                "signal_id": signal_id,
+                "session_date": observed.date().isoformat(),
+                "detected_at": observed.isoformat(timespec="seconds"),
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+            mode["engine_status"] = "critical_ledger_state_divergence"
+            mode["readiness_error"] = (
+                f"ledger_state_divergence:signal_state_commit_failed:{signal_id}"
+            )
+            raise
         return "registered"
 
     def _block_signal(
@@ -3879,6 +4319,11 @@ class TwDayTradeSimulationEngine:
             str(item.get("engine_status") or "").startswith("critical")
             for item in mode_rows
         )
+        divergence_rows = {
+            str(item.get("market")): dict(item.get("ledger_state_divergence") or {})
+            for item in mode_rows
+            if isinstance(item.get("ledger_state_divergence"), Mapping)
+        }
         blocked = any(
             str(item.get("engine_status") or "").startswith("blocked")
             for item in mode_rows
@@ -3887,6 +4332,11 @@ class TwDayTradeSimulationEngine:
         synthetic_open_tick = bool(mode_rows) and all(
             str(item.get("entry_fill_policy") or "")
             == ENTRY_FILL_POLICY_SYNTHETIC_OPEN_TICK
+            for item in mode_rows
+        )
+        paper_market_at_best = bool(mode_rows) and all(
+            str(item.get("entry_fill_policy") or "")
+            == ENTRY_FILL_POLICY_MARKET_AT_BEST_ELSE_OPEN_TICK
             for item in mode_rows
         )
         health = (
@@ -3909,24 +4359,36 @@ class TwDayTradeSimulationEngine:
                 "health": health,
                 "simulation_only": True,
                 "production_order_possible": False,
+                "ledger_integrity": {
+                    "ready": not divergence_rows,
+                    "divergence_count": len(divergence_rows),
+                    "modes": divergence_rows,
+                    "commit_protocol": "fsynced_start_then_ledgers_then_registered_then_state",
+                },
                 "schedule": {
                     "signal_gate": "09:00",
                     "entry": (
                         "synthetic_fill_at_observed_session_open_plus_one_adverse_tick"
                         if synthetic_open_tick
+                        else "paper_market_order_at_causal_best_ask_bid_else_open_plus_one_adverse_tick"
+                        if paper_market_at_best
                         else "size_at_official_open_then_execute_at_a_causally_later_best_ask_bid"
                     ),
                     "liquidity": (
                         "counterfactual_unbounded_paper_fill_no_exchange_claim"
                         if synthetic_open_tick
+                        else "full_requested_quantity_at_observed_best_quote_no_exchange_depth_claim"
+                        if paper_market_at_best
                         else "min(level_one_depth, 50pct_completed_minute_kbar_volume)"
                     ),
                     "take_profit": "mode-specific daily-limit LMT: full limit or configured ticks inside",
                     "stop_loss": "mode-specific local trigger: full limit or configured ticks inside, then market",
-                    "fill_guarantee": bool(synthetic_open_tick),
+                    "fill_guarantee": bool(synthetic_open_tick or paper_market_at_best),
                     "fill_caveat": (
                         "guaranteed only inside the synthetic paper ledger; not a broker or exchange fill"
                         if synthetic_open_tick
+                        else "deterministic only inside the paper ledger; displayed depth and queue position do not guarantee an exchange fill"
+                        if paper_market_at_best
                         else "inside-limit prices improve fill probability but cannot guarantee a fill without executable counterparty volume"
                     ),
                     "exit_limit": "13:20 passive top-of-book limit",
@@ -3951,12 +4413,15 @@ class TwDayTradeSimulationEngine:
                             "price_limit_offset_ticks",
                             "bracket_price_policy",
                             "fill_guaranteed",
+                            "paper_fill_deterministic",
+                            "exchange_fill_guaranteed",
                             "entry_fill_policy",
                             "entry_price_offset_ticks",
                             "entry_fill_is_synthetic",
                             "entry_fill_has_synthetic_fallback",
                             "entry_best_quote_fill_count",
                             "entry_synthetic_fallback_fill_count",
+                            "entry_paper_market_fill_count",
                             "entry_fill_contract",
                             "entry_liquidity_assumption",
                             "engine_status",
@@ -3987,6 +4452,7 @@ class TwDayTradeSimulationEngine:
                             "terminal_flatten_count",
                             "terminal_flatten_degraded_count",
                             "cumulative_carry_cost_twd",
+                            "ledger_state_divergence",
                         )
                     }
                     for item in mode_rows
@@ -4003,6 +4469,7 @@ class TwDayTradeSimulationEngine:
                 "published_at": observed.isoformat(timespec="milliseconds"),
                 "simulation_only": True,
                 "production_order_possible": False,
+                "ledger_integrity_ready": not divergence_rows,
                 "enabled_markets": enabled_markets,
                 "mode_count": len(mode_rows),
                 "modes": {
@@ -4014,6 +4481,8 @@ class TwDayTradeSimulationEngine:
                             "signal_id",
                             "signal_at",
                             "entry_completed_at",
+                            "entry_fill_policy",
+                            "entry_price_offset_ticks",
                             "engine_status",
                             "checkpoint_ready",
                             "open_position_count",
@@ -4029,8 +4498,11 @@ __all__ = [
     "CLOSING_AUCTION_TIME",
     "ENTRY_FILL_POLICY_CAUSAL_BOOK",
     "ENTRY_FILL_POLICY_CAUSAL_BOOK_ELSE_OPEN_TICK",
+    "ENTRY_FILL_POLICY_MARKET_AT_BEST_ELSE_OPEN_TICK",
+    "ENTRY_FILL_POLICY_OFFICIAL_OPEN_AT_0901",
     "ENTRY_FILL_POLICY_SYNTHETIC_OPEN_TICK",
     "ENTRY_GATE",
+    "LIVE_ENTRY_GATE",
     "EXIT_LIMIT_TIME",
     "FIRST_MINUTE_EXECUTION_TIME",
     "FORCE_EXIT_TIME",

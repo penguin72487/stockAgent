@@ -27,6 +27,12 @@ NODE_LOCAL_SUFFIXES = {".lock", ".pid"}
 COLD_IGNORE_INCLUDE = ".stignore-cold-local"
 
 
+def _is_temporary_name(name: str) -> bool:
+    """Recognize atomic-write work files before they enter hot transport."""
+
+    return name.endswith(".tmp") or ".tmp." in name
+
+
 @dataclasses.dataclass
 class ReconcileResult:
     incoming_added: int = 0
@@ -62,6 +68,8 @@ def is_ignored_artifact(relative: str | Path) -> bool:
     parts = relative_path.parts
     name = parts[-1]
     if any(part in CONTROL_NAMES for part in parts):
+        return True
+    if any(_is_temporary_name(part) for part in parts):
         return True
     if parts[0] == "data_locks":
         return True
