@@ -436,6 +436,17 @@ def masked_l1_projection_weights(
         projected = clean.sign() * (abs_clean - theta).clamp_min(0.0)
         projected = torch.where(inside, clean, projected)
         projected = projected.masked_fill(~mask_bool, 0.0)
+        # The sort/threshold projection is evaluated in FP32 for the recurrent
+        # finance boundary.  With extremely large but finite logits, subtracting
+        # two O(1e15) values can leave an O(1e7) cancellation residual.  Enforce
+        # the public L1-ball invariant after projection so one pathological row
+        # can never create an unbounded order request or misleading artifact.
+        projected_l1 = projected.abs().sum(dim=1, keepdim=True)
+        legal_scale = torch.minimum(
+            torch.ones_like(projected_l1),
+            radius_t / projected_l1.clamp_min(float(eps)),
+        )
+        projected = projected * legal_scale
         # Portfolio weights feed recurrent fee, funding, turnover, and NAV
         # accounting.  Keep that public boundary in FP32 under FP16/BF16 AMP;
         # casting the already-FP32 projection back to an autocast dtype loses

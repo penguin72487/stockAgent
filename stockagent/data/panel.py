@@ -371,6 +371,15 @@ class PanelData:
     # The generic feature tensor remains owned by this PanelData;
     # physical contract codes and liquidation labels are never model inputs.
     futures_portfolio_daily: Any | None = None
+    # Full cash-stock model context with a separate fixed all-TAIFEX action
+    # axis. Prior-session futures tokens may enter the policy; current prices,
+    # returns, fill gates, fees, and expiry liquidation remain executor-only.
+    stock_context_futures_portfolio_daily: Any | None = None
+    # Executor-only front-month single-stock-futures day-trade labels aligned
+    # to the complete cash-stock universe.  The model still observes every
+    # stock feature column; this attachment owns the causal futures mapping,
+    # execution mask, return, capacity, and round-trip cost side channels.
+    stock_futures_day_trade_daily: Any | None = None
 
     @property
     def num_dates(self) -> int:

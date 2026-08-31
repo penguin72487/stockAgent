@@ -289,6 +289,18 @@ strategy or the user explicitly overrides a field. Product-specific data,
 execution, eligibility, settlement, and accounting contracts remain
 authoritative and must not be replaced by Taiwan stock-day-trade semantics.
 
+For full-stock-context nearby single-stock-futures day trade, the product-
+specific default is
+`configs/markets/tw_stock_futures_day_trade_0900_full_features_multi_basis_projection_l1_cash_capital10m.yaml`.
+It inherits the complete feature ABI and common 1000-epoch/BF16/DDP/walk-forward
+standard, but its 09:00 information clock, daily futures OPEN-to-CLOSE research
+proxy, futures costs/capacity, causal futures mask, and learned residual-cash
+exposure contract override the generic cash-stock execution semantics. TAIFEX
+OPEN is 08:45, so this proxy is explicitly counterfactual and is not a live
+09:00 fill claim. The legacy 08:45-decision v1/v2 and post-09:00-sidecar v3
+contracts remain reproducibility controls; their checkpoints are incompatible
+with this baseline.
+
 Every completed fold must immediately refresh the cumulative root-level
 walk-forward report from all contract-compatible folds completed so far. Do not
 wait for the full fold suite and do not require a duplicate post-training
@@ -514,13 +526,61 @@ Guidelines:
 - Keep model output mode, loss assumptions, backtest assumptions, and report wording aligned. If they disagree, flag it explicitly.
 - `trading.reporting_leverage` is a reporting/post-processing multiplier only.
   Canonical training, validation/test metrics, and integer-share execution keep
-  gross exposure at `1.0`; the multiplier produces separate `leverage_*` plots with
-  turnover and fees recomputed from scaled weights. It remains part of the
-  checkpoint configuration fingerprint so resumed reporting is reproducible.
+  the model's unscaled base exposure: `1.0` for forced-normalization modes and
+  at most `1.0` for explicit L1-ball residual-cash modes. The multiplier
+  produces separate `leverage_*` plots with turnover and fees recomputed from
+  scaled weights. It remains part of the checkpoint configuration fingerprint
+  so resumed reporting is reproducible.
 - Rank-only loss can over-concentrate positions. If using rank objectives, keep turnover/concentration/backtest regularization in mind.
 - If the user switches back to only-long behavior, change both the model direction mode and the loss/backtest direction assumptions deliberately and report the change.
 
 ## Canonical Tensor Backtest And Loss
+
+### Full-stock-context single-stock-futures day trade
+
+- `tw_stock_futures_day_trade_0900` is the default baseline. It keeps the
+  complete ordered Taiwan cash-stock feature panel and may use data complete
+  through `t-1` plus the dedicated observed
+  `log(OPEN[t] / CLOSE[t-1])` channel at 09:00. No session-`t` high, low, close,
+  full-session volume, futures return, or post-09:00 execution result may enter
+  the model input. `tw_stock_futures_day_trade` remains the legacy 08:45
+  OPEN-to-CLOSE control and must keep the current stock OPEN gap disabled.
+- Map at most one nearby single-stock future to each `date + underlying` using
+  source `tenor_rank=1`, preceding-session contract existence, nearest tenor,
+  then preceding-session volume/open interest and stable product codes.  Never
+  use session-t volume or return to choose the product.
+- Apply the causally known futures mask before portfolio normalization.  Apply
+  current observed entry/CLOSE/positive-volume execution gates afterwards and
+  set each failed request to zero independently; never redistribute its unused
+  weight or capacity to another name. A stock without a known future has zero
+  effective output and cannot trade. The 09:00 mode must not use the execution
+  mask in its policy normalization or model inputs.
+- By the user's explicit daily-data choice, the default 09:00 research ledger
+  computes the selected physical future's immutable TAIFEX day-session
+  OPEN-to-CLOSE return. The OPEN is stamped 08:45 and precedes the 09:00 model
+  decision, so this is a counterfactual label, not a causally executable fill
+  or live-performance claim. Daily OPEN/CLOSE/positive-volume evidence still
+  fails closed independently per contract. The receipt-backed first public
+  trade strictly after 09:00 remains an opt-in sidecar source, not the default.
+- The canonical continuous ledger uses two fixed per-contract commissions,
+  date-versioned per-side futures transaction tax rounded to whole TWD, and a
+  capacity ceiling based on the selected contract's completed preceding-
+  session volume valued at the actual declared entry price. Cash-stock fees,
+  price limits, and short inventory do not govern this futures execution path.
+- The default 09:00 model uses raw long/short scores with no cross-sectional
+  de-meaning, divides by the active causal-futures count, and projects onto the
+  unit L1 ball. Therefore gross exposure is learned in `[0,1]` and residual
+  capital may remain cash; do not add top-K, fixed long/short ratios, an outside-
+  cash heuristic, or forced full investment. Current execution failures remain
+  unfilled and their unused risk is not redistributed.
+- The default 09:00 entry/return source is the immutable aligned daily table
+  `data_tw_futures/taifex_portfolio_daily_v4/continuous_daily.parquet` with
+  `tw_stock_futures_day_trade_0900_entry_source: daily_session_open_proxy`.
+  `post_0900_trade_sidecar` may opt into
+  `data_tw_futures/taifex_stock_futures_0900_v1/entry_0900.parquet` only when
+  its complete manifest and source hashes exist. A new source, mapping rule,
+  capital, fee, tax, feature timing, exposure transform, or accounting basis
+  requires a new artifact root and must not resume incompatible checkpoints.
 
 The project goal is to keep train, validation, test, and inference return logic consistent and tensor-friendly.
 

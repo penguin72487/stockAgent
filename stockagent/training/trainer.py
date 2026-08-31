@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import time
+import warnings
 import gc
 import inspect
 import csv
@@ -65,6 +66,8 @@ from stockagent.backtest.tw_execution import (
     TW_CARRYING_EXECUTION_MODES,
     TW_DERIVATIVES_TICK_EXECUTION_MODES,
     TW_MINUTE_EXECUTION_MODES,
+    TW_STOCK_FUTURES_DAY_TRADE_EXECUTION_MODES,
+    TW_STOCK_FUTURES_INTEGER_DAY_TRADE_EXECUTION_MODES,
     TW_STOCK_EXECUTION_MODES,
     TaiwanFeeSchedule,
     TaiwanMarginShortSchedule,
@@ -1037,6 +1040,32 @@ def _is_stateful_security_carry(
     )
 
 
+def _split_uses_recurrent_futures_equity_scale(split: object) -> bool:
+    """Return whether sequential batches must carry the futures equity state.
+
+    The stock-context execution mode historically used a continuous 7-channel
+    tensor without a cash-denominated account.  Its exact whole-contract
+    variant deliberately keeps the same public execution-mode name, but is
+    identified by the 11-channel execution ABI.  Carrying contract quantities
+    without carrying the associated equity scale resets the account between
+    training batches and changes both affordability and the surrogate gradient.
+    """
+
+    mode = normalize_execution_mode(str(getattr(split, "execution_mode", "naive")))
+    if (
+        mode == "tw_index_futures_day"
+        or mode in TW_STOCK_FUTURES_INTEGER_DAY_TRADE_EXECUTION_MODES
+    ):
+        return True
+    execution = getattr(split, "overnight_log_returns", None)
+    shape = getattr(execution, "shape", ())
+    return bool(
+        mode == "tw_stock_context_futures_portfolio"
+        and len(shape) == 3
+        and int(shape[-1]) == 11
+    )
+
+
 def _tw_settlement_compile_backend(
     execution_runtime: _ExecutionRuntime,
     *,
@@ -1071,6 +1100,17 @@ def _build_execution_runtime(
 
     mode = normalize_execution_mode(config.trading.execution_mode)
     lag = int(config.trading.tw_settlement_lag_sessions)
+    if mode in TW_STOCK_FUTURES_INTEGER_DAY_TRADE_EXECUTION_MODES:
+        return _ExecutionRuntime(
+            mode=mode,
+            buy_fee_rates=None,
+            sell_fee_rates=None,
+            lot_sizes=None,
+            settlement_lag_sessions=0,
+            futures_initial_capital=float(
+                config.trading.tw_stock_futures_day_trade_initial_capital
+            ),
+        )
     if mode in CONTINUOUS_WEIGHT_EXECUTION_MODES:
         return _ExecutionRuntime(
             mode=mode,
@@ -1082,6 +1122,12 @@ def _build_execution_runtime(
             ),
             lot_sizes=None,
             settlement_lag_sessions=lag,
+            futures_initial_capital=(
+                float(config.trading.tw_futures_portfolio_integer_initial_capital)
+                if mode == "tw_stock_context_futures_portfolio"
+                and config.trading.tw_futures_portfolio_integer_contracts
+                else 100_000_000.0
+            ),
             crypto_stateful_proximal_allocator=(
                 bool(config.trading.crypto_stateful_proximal_allocator)
                 if mode == "crypto_perpetual"
@@ -1379,6 +1425,8 @@ def _integer_execution_runtime_kwargs(
     kwargs: dict[str, Any] = {"execution_mode": runtime.mode}
     if runtime.mode in CONTINUOUS_WEIGHT_EXECUTION_MODES:
         return kwargs
+    if runtime.mode in TW_STOCK_FUTURES_INTEGER_DAY_TRADE_EXECUTION_MODES:
+        return kwargs
     if runtime.mode in {"tw_index_futures_day", "tw_index_derivatives_day"}:
         if runtime.futures_market is None or runtime.futures_cost_schedule is None:
             raise RuntimeError("futures integer audit runtime is incomplete")
@@ -1501,6 +1549,8 @@ def _integer_audit_initial_capital(
 
     if runtime.mode in CONTINUOUS_WEIGHT_EXECUTION_MODES:
         return 1_000_000.0
+    if runtime.mode in TW_STOCK_FUTURES_INTEGER_DAY_TRADE_EXECUTION_MODES:
+        return float(runtime.futures_initial_capital)
     if runtime.mode in {"tw_index_futures_day", "tw_index_derivatives_day"}:
         return float(runtime.futures_initial_capital)
     capital = float(config.trading.volume_participation_equity)
@@ -1605,7 +1655,12 @@ def _tensor_day_trade_is_whole_lot_exact(
     """
 
     return bool(
-        runtime.mode in {"tw_futures_portfolio_day", "crypto_perpetual"}
+        runtime.mode in {
+            "tw_futures_portfolio_day",
+            "tw_stock_context_futures_portfolio",
+            "crypto_perpetual",
+        }
+        or runtime.mode in TW_STOCK_FUTURES_DAY_TRADE_EXECUTION_MODES
         or (
             runtime.mode == "tw_day_trade"
             and config.data.day_trade_minute_execution_root is not None
@@ -1659,6 +1714,31 @@ def _active_panel_execution_rows(
 
     rows = np.asarray(date_indices, dtype=np.int64)
     local_symbols = None if symbol_indices is None else np.asarray(symbol_indices, dtype=np.int64)
+
+    if normalize_execution_mode(execution_mode) == (
+        "tw_stock_context_futures_portfolio"
+    ):
+        if local_symbols is not None:
+            raise ValueError(
+                "stock-context all-futures reporting does not permit stock-axis "
+                "symbol compaction"
+            )
+        daily = getattr(panel, "stock_context_futures_portfolio_daily", None)
+        if daily is None:
+            raise ValueError("all-futures reporting sidecar is missing")
+        return (
+            np.asarray(daily.close_prices)[rows],
+            np.asarray(daily.open_prices)[rows],
+            np.asarray(daily.volumes)[rows],
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            list(daily.symbols),
+        )
 
     def select(values: np.ndarray | None) -> np.ndarray | None:
         if values is None:
@@ -3456,6 +3536,19 @@ def _evaluate_windowed_aux_objective_loss(
         **{
             key: value
             for key, value in (factor_loss_kwargs or {}).items()
+            if key
+            not in {
+                "execution_mode",
+                "buy_fee_rates",
+                "sell_fee_rates",
+                "commission_rebate_rates",
+                "commission_rebate_timing",
+                "settlement_lag_sessions",
+                "short_margin_rate",
+                "short_maintenance_ratio",
+                "short_handling_fee_rate",
+                "claim_queue_sessions",
+            }
         },
     )
     timing.loss_s += time.perf_counter() - loss_start
@@ -3463,8 +3556,30 @@ def _evaluate_windowed_aux_objective_loss(
     reduce_start = time.perf_counter()
     mean_loss = float(loss_t.detach().float().cpu())
     rank_scores = _resolve_rank_scores(weights_all, aux_all)
-    rank_tradable = tradable_all & torch.cat(sample_chunks, dim=0).to(dtype=torch.bool).unsqueeze(1)
-    ic_series = compute_ic_series_torch(rank_scores, returns_all, rank_tradable)
+    sample_all = torch.cat(sample_chunks, dim=0).to(dtype=torch.bool)
+    if execution_mode == "tw_stock_context_futures_portfolio":
+        futures_holding_log_returns = overnight_returns_all[..., 0]
+        rank_targets = torch.expm1(
+            torch.nan_to_num(
+                futures_holding_log_returns,
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            )
+        )
+        rank_tradable = (
+            torch.isfinite(futures_holding_log_returns)
+            & (overnight_returns_all[..., 1] > 0.5)
+            & sample_all.unsqueeze(1)
+        )
+    else:
+        rank_targets = returns_all
+        rank_tradable = tradable_all & sample_all.unsqueeze(1)
+    ic_series = compute_ic_series_torch(
+        rank_scores,
+        rank_targets,
+        rank_tradable,
+    )
     ic_clean = ic_series[torch.isfinite(ic_series)]
     mean_ic = None if ic_clean.numel() == 0 else float(ic_clean.float().mean().cpu())
     timing.metrics_s += time.perf_counter() - reduce_start
@@ -3775,7 +3890,9 @@ def _fit_group_temporal_basis(
     )
 
     payload: dict[str, Any] | None = None
-    if not _distributed_is_initialized() or _distributed_is_rank0():
+
+    def _fit_on_rank0() -> None:
+        nonlocal payload
         overrides: dict[str, torch.Tensor] = {}
         covariance: torch.Tensor | None = None
         pca_metadata: dict[str, Any] | None = None
@@ -3817,6 +3934,13 @@ def _fit_group_temporal_basis(
             },
             "metadata": metadata,
         }
+
+    # Rank 0 may spend substantial time fitting a training-only PCA basis, or
+    # it may fail validation before producing a payload.  Keep nonzero ranks on
+    # the process store during that work so no NCCL object collective is held
+    # open until timeout.  The helper also propagates a rank-0 exception to all
+    # ranks before the payload broadcast is entered.
+    _run_rank0_store_synchronized_phase("temporal_basis_fit", _fit_on_rank0)
     if _distributed_is_initialized() and _distributed_world_size() > 1:
         objects: list[dict[str, Any] | None] = [payload]
         dist.broadcast_object_list(objects, src=0)
@@ -5146,14 +5270,25 @@ class _DynamicSymbolPanelSlabWrapper(nn.Module):
                 min=self.min_symbols,
                 max=self.max_symbols,
             )
-        return self.model(
-            feature_slab_for_compile,
-            mask_for_compile,
-            symbol_indices_for_compile,
-            derivative_candidate_features,
-            derivative_candidate_mask,
-            execution_context_for_compile,
-        )
+        # PyTorch's FakeTensor metadata converter reads ``.grad`` from this
+        # intentional non-leaf alias and emits a warning even though the
+        # autograd edge is correct.  Some strict test/runtime environments turn
+        # that upstream warning into an exception, so suppress only this exact
+        # diagnostic around the compiled entrypoint.
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message=r"The \.grad attribute of a Tensor that is not a leaf Tensor.*",
+                category=UserWarning,
+            )
+            return self.model(
+                feature_slab_for_compile,
+                mask_for_compile,
+                symbol_indices_for_compile,
+                derivative_candidate_features,
+                derivative_candidate_mask,
+                execution_context_for_compile,
+            )
 
 
 def _metadata_rows_are_contiguous(batch: Mapping[str, torch.Tensor]) -> bool:
@@ -6646,10 +6781,15 @@ def _save_backtest_artifact(
         )
     ledger_unit = result.settlement_ledger_unit
     if mode in CONTINUOUS_WEIGHT_EXECUTION_MODES and mode != "naive":
-        if ledger_unit != "notional_weight":
+        valid_units = (
+            {"notional_weight", "contract_quantity"}
+            if mode == "tw_stock_context_futures_portfolio"
+            else {"notional_weight"}
+        )
+        if ledger_unit not in valid_units:
             raise ValueError(
                 f"{mode} backtest artifact requires "
-                "settlement_ledger_unit='notional_weight'"
+                f"settlement_ledger_unit in {sorted(valid_units)}"
             )
     elif mode not in TW_STOCK_EXECUTION_MODES:
         if ledger_unit not in {None, "none"}:
@@ -6663,7 +6803,10 @@ def _save_backtest_artifact(
             "'currency' or 'nav_ratio'"
         )
     has_equity_scale_contract = (
-        ledger_unit == "nav_ratio" or mode == "tw_index_futures_day"
+        ledger_unit == "nav_ratio"
+        or ledger_unit == "contract_quantity"
+        or mode == "tw_index_futures_day"
+        or mode in TW_STOCK_FUTURES_INTEGER_DAY_TRADE_EXECUTION_MODES
     )
     if has_equity_scale_contract:
         if result.equity_scale_history is None:
@@ -6672,6 +6815,7 @@ def _save_backtest_artifact(
             )
         if (
             mode == "tw_index_futures_day"
+            or mode in TW_STOCK_FUTURES_INTEGER_DAY_TRADE_EXECUTION_MODES
             or terminal_field_count == len(terminal_fields)
         ) and result.final_equity_scale is None:
             raise ValueError(
@@ -6907,8 +7051,12 @@ def _save_backtest_artifact(
             ),
             dtype=np.int64,
         ),
-        "execution_mode": np.asarray(mode, dtype="U32"),
-        "settlement_ledger_unit": np.asarray(ledger_unit, dtype="U16"),
+        # Do not cap execution-mode metadata at U32.  The canonical
+        # ``tw_stock_context_futures_portfolio`` name is 34 characters; U32
+        # silently truncated it and made completed fold artifacts impossible
+        # to reload for stitched walk-forward reporting.
+        "execution_mode": np.asarray(mode, dtype=f"U{max(1, len(mode))}"),
+        "settlement_ledger_unit": np.asarray(ledger_unit, dtype="U32"),
         "strategy_returns": strategy_returns,
         "benchmark_returns": benchmark_returns,
         "turnovers": turnovers,
@@ -7002,7 +7150,10 @@ def _save_backtest_artifact(
     add_optional("final_long_margin_debt", final_long_margin_debt)
     if integer_state is not None:
         payload.update(
-            integer_state_mode=np.asarray(integer_state.mode, dtype="U32"),
+            integer_state_mode=np.asarray(
+                integer_state.mode,
+                dtype=f"U{max(1, len(str(integer_state.mode)))}",
+            ),
             integer_state_settled_cash=np.asarray(
                 integer_state.settled_cash, dtype=np.float64
             ),
@@ -8117,9 +8268,13 @@ def _save_settlement_audit_artifacts(
         )
     data: dict[str, np.ndarray] = {
         "date": np.asarray(dates),
-        "execution_mode": np.full(rows, result.execution_mode, dtype="U32"),
+        "execution_mode": np.full(
+            rows,
+            result.execution_mode,
+            dtype=f"U{max(1, len(str(result.execution_mode)))}",
+        ),
         "settlement_ledger_unit": np.full(
-            rows, result.settlement_ledger_unit, dtype="U16"
+            rows, result.settlement_ledger_unit, dtype="U32"
         ),
         "settled_cash": cash,
         "payables_total": payables.sum(axis=1),
@@ -8557,11 +8712,17 @@ def _load_backtest_artifact(output_path: Path) -> tuple[BacktestResult, np.ndarr
             value = copied(name)
             return value if dtype is None else value.astype(dtype, copy=False)
 
-        execution_mode = normalize_execution_mode(
+        stored_execution_mode = (
             str(np.asarray(data["execution_mode"]).item())
             if "execution_mode" in keys
             else "naive"
         )
+        # Schema <=7 used a fixed U32 scalar.  Salvage the one canonical mode
+        # whose 34-character name was silently truncated by NumPy so completed
+        # folds can be resumed and stitched without destructive artifact edits.
+        if stored_execution_mode == "tw_stock_context_futures_portfol":
+            stored_execution_mode = "tw_stock_context_futures_portfolio"
+        execution_mode = normalize_execution_mode(stored_execution_mode)
         ledger_unit = (
             str(np.asarray(data["settlement_ledger_unit"]).item())
             if "settlement_ledger_unit" in keys
@@ -9366,11 +9527,16 @@ def _load_backtest_artifact(output_path: Path) -> tuple[BacktestResult, np.ndarr
     if (
         execution_mode in CONTINUOUS_WEIGHT_EXECUTION_MODES
         and execution_mode != "naive"
-        and ledger_unit != "notional_weight"
+        and ledger_unit
+        not in (
+            {"notional_weight", "contract_quantity"}
+            if execution_mode == "tw_stock_context_futures_portfolio"
+            else {"notional_weight"}
+        )
     ):
         raise ValueError(
             f"{execution_mode} backtest artifact requires "
-            "settlement_ledger_unit='notional_weight'"
+            "a compatible notional or integer-contract ledger unit"
         )
     if (
         execution_mode not in TW_STOCK_EXECUTION_MODES
@@ -9381,7 +9547,10 @@ def _load_backtest_artifact(output_path: Path) -> tuple[BacktestResult, np.ndarr
             f"{execution_mode} backtest artifact cannot contain a settlement ledger"
         )
     has_equity_scale_contract = (
-        ledger_unit == "nav_ratio" or execution_mode == "tw_index_futures_day"
+        ledger_unit == "nav_ratio"
+        or ledger_unit == "contract_quantity"
+        or execution_mode == "tw_index_futures_day"
+        or execution_mode in TW_STOCK_FUTURES_INTEGER_DAY_TRADE_EXECUTION_MODES
     )
     if has_equity_scale_contract:
         has_scale_history = result.equity_scale_history is not None
@@ -9392,6 +9561,7 @@ def _load_backtest_artifact(output_path: Path) -> tuple[BacktestResult, np.ndarr
             )
         if (
             execution_mode == "tw_index_futures_day"
+            or execution_mode in TW_STOCK_FUTURES_INTEGER_DAY_TRADE_EXECUTION_MODES
             or terminal_field_count == len(terminal_fields)
         ) and not has_final_scale:
             raise ValueError(
@@ -9921,28 +10091,31 @@ def _index_futures_flat_terminal_state_at_row(
     result: BacktestResult,
     end_row: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Reconstruct exact daily-flat futures state after ``end_row`` rows."""
+    """Reconstruct an exact daily-flat futures state after ``end_row`` rows."""
 
-    if normalize_execution_mode(result.execution_mode) != "tw_index_futures_day":
+    mode = normalize_execution_mode(result.execution_mode)
+    if mode != "tw_index_futures_day" and (
+        mode not in TW_STOCK_FUTURES_INTEGER_DAY_TRADE_EXECUTION_MODES
+    ):
         raise ValueError(
             "flat futures terminal reconstruction requires "
-            "tw_index_futures_day"
+            "an exact daily-flat futures execution mode"
         )
     total_rows = int(result.strategy_returns.shape[0])
     endpoint = int(end_row)
     if endpoint < 0 or endpoint > total_rows:
         raise ValueError(
-            "tw_index_futures_day terminal endpoint is outside the result"
+            "daily-flat futures terminal endpoint is outside the result"
         )
     if result.equity_scale_history is None:
         raise ValueError(
-            "tw_index_futures_day terminal reconstruction requires "
+            "daily-flat futures terminal reconstruction requires "
             "equity_scale_history"
         )
     equity_scale_history = np.asarray(result.equity_scale_history)
     if equity_scale_history.shape != (total_rows,):
         raise ValueError(
-            "tw_index_futures_day equity_scale_history must have one value "
+            "daily-flat futures equity_scale_history must have one value "
             "per strategy-return row"
         )
     # Full-horizon futures evaluations start at normalized equity 1.0.  All
@@ -9975,8 +10148,8 @@ def _prefix_backtest_result(result: BacktestResult, rows: int) -> BacktestResult
 
     # A partial carrying-ledger prefix cannot inherit the source result's
     # terminal state: unsettled cash and inventory depend on the exact prefix
-    # endpoint.  Index futures are flat after every session, so their endpoint
-    # state is exactly reconstructible from the already-computed equity path.
+    # endpoint.  Exact daily-flat futures modes are flat after every session,
+    # so their endpoint is reconstructible from the computed equity path.
     prefix_final_weights: np.ndarray | None = None
     prefix_final_alive: np.ndarray | None = None
     prefix_final_equity_scale: np.ndarray | None = None
@@ -9989,7 +10162,9 @@ def _prefix_backtest_result(result: BacktestResult, rows: int) -> BacktestResult
             prefix_final_equity_scale = np.asarray(
                 result.final_equity_scale
             ).copy()
-    elif mode == "tw_index_futures_day":
+    elif mode == "tw_index_futures_day" or (
+        mode in TW_STOCK_FUTURES_INTEGER_DAY_TRADE_EXECUTION_MODES
+    ):
         (
             prefix_final_weights,
             prefix_final_alive,
@@ -11849,6 +12024,12 @@ def _run_eval_backtest_from_weight_buffers(
 ) -> tuple[BacktestResultTensor, dict[str, float]]:
     total_rows = int(weights_all.size(0))
     execution_mode = "naive" if execution_runtime is None else execution_runtime.mode
+    integer_stock_context_execution = bool(
+        execution_mode == "tw_stock_context_futures_portfolio"
+        and overnight_log_returns_all is not None
+        and overnight_log_returns_all.dim() == 3
+        and int(overnight_log_returns_all.size(-1)) == 11
+    )
     num_symbols = int(
         future_log_returns_all.size(-1)
         if execution_mode in {"tw_index_futures_day", "tw_index_derivatives_day"}
@@ -11910,6 +12091,8 @@ def _run_eval_backtest_from_weight_buffers(
     equity_scaled_execution = bool(
         execution_mode in TW_STOCK_EXECUTION_MODES
         or execution_mode == "tw_index_futures_day"
+        or execution_mode in TW_STOCK_FUTURES_INTEGER_DAY_TRADE_EXECUTION_MODES
+        or integer_stock_context_execution
     )
     stateful_carry_execution = _is_stateful_security_carry(
         execution_mode,
@@ -12455,7 +12638,13 @@ def _run_eval_backtest_from_weight_buffers(
                     day_trade_execution_initial_capital=(
                         float(execution_runtime.futures_initial_capital)
                         if execution_runtime is not None
-                        and execution_runtime.mode == "tw_index_futures_day"
+                        and (
+                            execution_runtime.mode == "tw_index_futures_day"
+                            or execution_runtime.mode
+                            == "tw_stock_context_futures_portfolio"
+                            or execution_runtime.mode
+                            in TW_STOCK_FUTURES_INTEGER_DAY_TRADE_EXECUTION_MODES
+                        )
                         else float(volume_participation_equity)
                     ),
                 )
@@ -12646,6 +12835,8 @@ def _run_eval_backtest_from_weight_buffers(
         settlement_ledger_unit=(
             "nav_ratio"
             if execution_mode in TW_STOCK_EXECUTION_MODES
+            else "contract_quantity"
+            if integer_stock_context_execution
             else (
                 "notional_weight"
                 if execution_mode in CONTINUOUS_WEIGHT_EXECUTION_MODES
@@ -13030,6 +13221,7 @@ def _evaluate_tensor_batch_decoupled(
             and execution_mode not in {
                 "tw_index_futures_day",
                 "tw_index_derivatives_day",
+                "tw_stock_context_futures_portfolio",
             }
         ):
             ic_series = compute_ic_series_torch(weights_all, future_returns_all, tradable_mask_all)
@@ -13166,6 +13358,19 @@ def _evaluate_tensor_batch(
     )
 
 
+def _split_recurrent_symbol_count(split: WindowedSplitTensors) -> int:
+    """Return the executor state width, which may differ from stock input S."""
+
+    if split.execution_mode == "tw_stock_context_futures_portfolio":
+        execution = split.overnight_log_returns
+        if execution is None or execution.dim() != 3:
+            raise ValueError(
+                "stock-context futures split requires packed execution [T,1936,4]"
+            )
+        return int(execution.size(1))
+    return int(split.num_symbols)
+
+
 def _evaluate_windowed_tensor_batch_decoupled(
     model: nn.Module,
     panel_slab_model: nn.Module | None,
@@ -13209,7 +13414,11 @@ def _evaluate_windowed_tensor_batch_decoupled(
     total_rows = len(split)
     if total_rows <= 0:
         empty_returns = torch.empty((0,), device=device, dtype=torch.float32)
-        empty_weights = torch.empty((0, split.num_symbols), device=device, dtype=torch.float32)
+        empty_weights = torch.empty(
+            (0, _split_recurrent_symbol_count(split)),
+            device=device,
+            dtype=torch.float32,
+        )
         backtest = BacktestResultTensor(
             strategy_returns=empty_returns,
             benchmark_returns=empty_returns.clone(),
@@ -13697,6 +13906,7 @@ def _evaluate_windowed_tensor_batch_decoupled(
             and split.execution_mode not in {
                 "tw_index_futures_day",
                 "tw_index_derivatives_day",
+                "tw_stock_context_futures_portfolio",
             }
         ):
             ic_series = compute_ic_series_torch(weights_all, returns_all, mask_all)
@@ -13910,10 +14120,10 @@ def _slice_backtest_rows(
     slice_final_weights = terminal(result.final_weights)
     slice_final_alive = terminal(result.final_alive)
     slice_final_equity_scale = terminal(result.final_equity_scale)
-    if (
-        not keep_terminal
-        and normalize_execution_mode(result.execution_mode)
-        == "tw_index_futures_day"
+    sliced_mode = normalize_execution_mode(result.execution_mode)
+    if not keep_terminal and (
+        sliced_mode == "tw_index_futures_day"
+        or sliced_mode in TW_STOCK_FUTURES_INTEGER_DAY_TRADE_EXECUTION_MODES
     ):
         (
             slice_final_weights,
@@ -14086,7 +14296,19 @@ def _replay_taiwan_stitched_deployment(
     if mode == "naive":
         return None
 
-    global_symbols = [str(symbol) for symbol in panel.symbols]
+    if mode == "tw_stock_context_futures_portfolio":
+        stock_context_futures_daily = getattr(
+            panel, "stock_context_futures_portfolio_daily", None
+        )
+        if stock_context_futures_daily is None:
+            raise RuntimeError(
+                "stitched stock-context futures replay requires its sidecar"
+            )
+        global_symbols = [
+            str(symbol) for symbol in stock_context_futures_daily.symbols
+        ]
+    else:
+        global_symbols = [str(symbol) for symbol in panel.symbols]
     if len(set(global_symbols)) != len(global_symbols):
         raise RuntimeError("panel symbols must be unique for stitched deployment")
     global_index = {symbol: index for index, symbol in enumerate(global_symbols)}
@@ -14125,10 +14347,16 @@ def _replay_taiwan_stitched_deployment(
         requests_array = np.asarray(requests, dtype=np.float64)
         if requests_array.ndim not in {2, 3} or requests_array.shape[0] != rows:
             raise RuntimeError("deployment requested-weight history has invalid shape")
-        if mode in {"tw_index_futures_day", "tw_index_derivatives_day"}:
+        if mode in {
+            "tw_index_futures_day",
+            "tw_index_derivatives_day",
+            "tw_stock_context_futures_portfolio",
+        }:
             expected_width = (
                 TAIFEX_INDEX_FUTURES_ACTION_COUNT
                 if mode == "tw_index_futures_day"
+                else len(global_symbols)
+                if mode == "tw_stock_context_futures_portfolio"
                 else TAIFEX_INDEX_DERIVATIVE_ACTION_COUNT_V4
             )
             if requests_array.shape != (
@@ -14206,7 +14434,14 @@ def _replay_taiwan_stitched_deployment(
     )
     continuous_stitched_replay = bool(
         canonical_daily_day_trade
-        or mode in {"tw_futures_portfolio_day", "crypto_perpetual"}
+        or mode in {
+            "tw_futures_portfolio_day",
+            "tw_stock_context_futures_portfolio",
+            "tw_stock_futures_day_trade",
+            "tw_stock_futures_day_trade_0900",
+            "tw_stock_futures_day_trade_0900_integer",
+            "crypto_perpetual",
+        }
     )
     execution_dataset = CrossSectionalDataset(
         panel,
@@ -14269,26 +14504,30 @@ def _replay_taiwan_stitched_deployment(
             device=torch.device("cpu"),
             dtype=request_tensor.dtype,
         )
-        short_capacity_weights = _short_capacity_weights_from_notional(
-            execution_dataset.short_capacity_notional_t[
-                torch.from_numpy(panel_rows)
-            ],
-            volume_participation_equity=(
-                config.trading.volume_participation_equity
-            ),
-            device=torch.device("cpu"),
-            dtype=request_tensor.dtype,
-            capacity_limit_enabled=runtime.short_capacity_limit_enabled,
-            reference=request_tensor,
-        )
-        effective_short_margin_rate = _effective_short_margin_rate(
-            execution_dataset.short_margin_rate_t[
-                torch.from_numpy(panel_rows)
-            ],
-            execution_runtime=runtime,
-            device=torch.device("cpu"),
-            dtype=request_tensor.dtype,
-        )
+        if mode == "tw_stock_context_futures_portfolio":
+            short_capacity_weights = None
+            effective_short_margin_rate = None
+        else:
+            short_capacity_weights = _short_capacity_weights_from_notional(
+                execution_dataset.short_capacity_notional_t[
+                    torch.from_numpy(panel_rows)
+                ],
+                volume_participation_equity=(
+                    config.trading.volume_participation_equity
+                ),
+                device=torch.device("cpu"),
+                dtype=request_tensor.dtype,
+                capacity_limit_enabled=runtime.short_capacity_limit_enabled,
+                reference=request_tensor,
+            )
+            effective_short_margin_rate = _effective_short_margin_rate(
+                execution_dataset.short_margin_rate_t[
+                    torch.from_numpy(panel_rows)
+                ],
+                execution_runtime=runtime,
+                device=torch.device("cpu"),
+                dtype=request_tensor.dtype,
+            )
         with _temporary_env("STOCKAGENT_BACKTEST_COMPILE", "0"):
             stitched_tensor = run_backtest_torch(
                 request_tensor,
@@ -14402,6 +14641,15 @@ def _replay_taiwan_stitched_deployment(
                     torch.as_tensor(unresolved_actions, dtype=torch.bool)
                     if canonical_daily_day_trade
                     else None
+                ),
+                day_trade_execution_initial_capital=(
+                    runtime.futures_initial_capital
+                    if mode in TW_STOCK_FUTURES_INTEGER_DAY_TRADE_EXECUTION_MODES
+                    or (
+                        mode == "tw_stock_context_futures_portfolio"
+                        and config.trading.tw_futures_portfolio_integer_contracts
+                    )
+                    else config.trading.volume_participation_equity
                 ),
             )
         stitched = stitched_tensor.to_numpy()
@@ -15262,6 +15510,11 @@ def _probe_compiled_loss_forward_backward(
                 if split.execution_mode == "tw_index_futures_day"
                 else TAIFEX_INDEX_DERIVATIVE_ACTION_COUNT_V4,
             )
+        elif split.execution_mode == "tw_stock_context_futures_portfolio":
+            action_shape = (
+                int(action_shape[0]),
+                int(batch["overnight_log_returns"].size(1)),
+            )
         elif action_channels > 1:
             action_shape = (
                 int(action_shape[0]),
@@ -15504,7 +15757,7 @@ def _probe_compiled_loss_forward_backward(
             ),
             "initial_alive": torch.ones((), device=device, dtype=torch.bool),
         }
-        if split.execution_mode == "tw_index_futures_day":
+        if _split_uses_recurrent_futures_equity_scale(split):
             aux_outputs["initial_equity_scale"] = torch.ones(
                 (), device=device, dtype=torch.float32
             )
@@ -16272,7 +16525,7 @@ def _train_epoch_windowed_tensor(
     # keeping the value a Tensor from batch 1 avoids separate non-stateful and
     # stateful torch.compile graphs.
     portfolio_prev_weights = torch.zeros(
-        (split.num_symbols,),
+        (_split_recurrent_symbol_count(split),),
         device=device,
         dtype=torch.float32,
     )
@@ -16565,7 +16818,7 @@ def _train_epoch_windowed_tensor(
                 aux_outputs = dict(aux_outputs or {})
                 aux_outputs["initial_weights"] = portfolio_prev_weights
                 aux_outputs["initial_alive"] = portfolio_prev_alive
-                if split.execution_mode == "tw_index_futures_day":
+                if _split_uses_recurrent_futures_equity_scale(split):
                     aux_outputs["initial_equity_scale"] = (
                         portfolio_prev_equity_scale
                     )
@@ -17024,6 +17277,7 @@ def _train_epoch_windowed_tensor_ddp(
             "replicated_ledger_local_metadata applies only to the replicated "
             "full-symbol ledger"
         )
+    recurrent_symbol_count = _split_recurrent_symbol_count(split)
     if symbol_sharded_ledger:
         supports_stateful_day_trade = bool(
             split.execution_mode == "tw_day_trade"
@@ -17038,10 +17292,10 @@ def _train_epoch_windowed_tensor_ddp(
                 "symbol-sharded DDP ledger supports Taiwan carrying modes or "
                 "stateful residual-carry tw_day_trade only"
             )
-        if split.num_symbols % world_size != 0:
+        if recurrent_symbol_count % world_size != 0:
             raise RuntimeError(
                 "symbol-sharded DDP ledger requires symbols divisible by world_size; "
-                f"symbols={split.num_symbols}, world_size={world_size}"
+                f"symbols={recurrent_symbol_count}, world_size={world_size}"
             )
 
     model.train()
@@ -17055,9 +17309,9 @@ def _train_epoch_windowed_tensor_ddp(
 
     num_batches = total_rows // int(batch_size)
     ledger_symbol_count = (
-        split.num_symbols // world_size
+        recurrent_symbol_count // world_size
         if symbol_sharded_ledger
-        else split.num_symbols
+        else recurrent_symbol_count
     )
     portfolio_prev_weights = torch.zeros(
         (ledger_symbol_count,),
@@ -17336,7 +17590,7 @@ def _train_epoch_windowed_tensor_ddp(
                     "initial_weights": portfolio_prev_weights,
                     "initial_alive": portfolio_prev_alive,
                 }
-                if split.execution_mode == "tw_index_futures_day":
+                if _split_uses_recurrent_futures_equity_scale(split):
                     aux_outputs["initial_equity_scale"] = (
                         portfolio_prev_equity_scale
                     )
@@ -19973,11 +20227,21 @@ def _run_training_impl(
         config.trading.tw_index_futures_initial_capital
         if normalize_execution_mode(config.trading.execution_mode)
         == "tw_index_futures_day"
+        else config.trading.tw_futures_portfolio_integer_initial_capital
+        if normalize_execution_mode(config.trading.execution_mode)
+        == "tw_stock_context_futures_portfolio"
+        and config.trading.tw_futures_portfolio_integer_contracts
         else config.trading.volume_participation_equity
     )
     risk_loss_kwargs["net_exposure_weight"] = config.training.multitask_loss.net_exposure_weight
     risk_loss_kwargs["log_utility_periods_per_year"] = (
         config.evaluation.eval_log_utility_periods_per_year
+    )
+    risk_loss_kwargs["futures_portfolio_training_surrogate_only"] = bool(
+        config.training.futures_portfolio_training_surrogate_only
+        and normalize_execution_mode(config.trading.execution_mode)
+        == "tw_stock_context_futures_portfolio"
+        and config.trading.tw_futures_portfolio_integer_contracts
     )
     factor_aug_kwargs = _factor_augmentation_kwargs(config, loss_objective)
     if factor_aug_kwargs and _distributed_is_rank0():
@@ -21111,6 +21375,11 @@ def _run_training_impl(
         tw_index_futures_compile = bool(
             execution_runtime.mode == "tw_index_futures_day"
         )
+        tw_stock_context_integer_loss = bool(
+            train_windowed is not None
+            and _split_uses_recurrent_futures_equity_scale(train_windowed)
+            and execution_runtime.mode == "tw_stock_context_futures_portfolio"
+        )
         tw_settlement_compiled_rows = (
             int(TW_DAY_TRADE_MINUTE_COMPILED_BLOCK_ROWS)
             if tw_settlement_compile_backend == "day_trade_minute"
@@ -21154,6 +21423,11 @@ def _run_training_impl(
             and execution_runtime.mode not in TW_CARRYING_EXECUTION_MODES
             and execution_runtime.mode != "tw_day_trade"
             and not tw_index_futures_compile
+            # The exact integer basket and its grouped continuous backward
+            # relaxation are deliberately eager.  Compiling the outer loss
+            # unrolls the full account horizon and was substantially slower
+            # than the bounded eager recurrence on the full TAIFEX slot axis.
+            and not tw_stock_context_integer_loss
         )
         # Bucketed compaction already bounds expanding groups to a small set of
         # fixed widths. Compile one loss graph per bucket instead of reusing the
@@ -21177,6 +21451,12 @@ def _run_training_impl(
             volatility_regime_weight=config.training.multitask_loss.volatility_regime_weight,
         )
         eval_risk_loss_kwargs = dict(risk_loss_kwargs)
+        # Model selection and reported curves remain authoritative exact
+        # integer execution even when training uses the differentiable
+        # quantization-aware relaxation.
+        eval_risk_loss_kwargs[
+            "futures_portfolio_training_surrogate_only"
+        ] = False
         if factor_aug_kwargs:
             # Input augmentation is stochastic regularization.  Validation and
             # test report the deterministic factor objective and explicitly
@@ -21422,6 +21702,7 @@ def _run_training_impl(
                                     in TW_CARRYING_EXECUTION_MODES
                                     or execution_runtime.mode == "tw_day_trade"
                                     or tw_index_futures_compile
+                                    or tw_stock_context_integer_loss
                                 )
                                 else "off:eager"
                             )
@@ -21476,6 +21757,7 @@ def _run_training_impl(
             execution_runtime.mode in TW_CARRYING_EXECUTION_MODES
             or execution_runtime.mode == "tw_day_trade"
             or tw_index_futures_compile
+            or tw_stock_context_integer_loss
         ):
             loss_compile_status = "off:tw_outer_compile_guard:eager"
         else:
@@ -22297,6 +22579,8 @@ def _run_training_impl(
             if (
                 val_backtest_epoch.weights_history.numel()
                 and int(val_backtest_epoch.weights_history.size(0)) >= val_row_end
+                and execution_runtime.mode
+                != "tw_stock_context_futures_portfolio"
             ):
                 val_date_idx = combined_val_windowed.valid_indices.to(
                     device=combined_val_windowed.future_log_returns.device,

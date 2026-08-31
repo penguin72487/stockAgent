@@ -1,0 +1,138 @@
+# Complete Taiwan cash-stock market context -> every fixed TAIFEX futures slot.
+#
+# This is not day trading. A filled physical futures contract may remain open
+# across sessions. The ledger forces it flat only at its own last observable
+# contract session (or at an unavoidable research-fold terminal), never by
+# substituting a new contract or recognizing an artificial roll-gap return.
+base_config: tw_stock_futures_day_trade_multi_basis_projection_l1_capital10m.yaml
+
+experiment_name: tw-stock-context-all-futures-carry-multi-basis-projection-l1-v3-full1000-batch96-chunk64
+
+runner:
+  # Input axis, output axis, holding period, and accounting all differ from the
+  # stock-futures day-trade experiment. Never resume its checkpoints.
+  # Batch size, early-stop lifecycle, and eval recurrence graph changed after
+  # the v2 Fold 1 run. Keep that completed checkpoint/artifact tree intact.
+  output_dir: artifacts/markets/tw_stock_context_all_futures_carry_multi_basis_projection_l1_v3_full1000_batch96_chunk64
+  resume: true
+  post_train_infer: false
+
+data:
+  # Keep the full ordered cash-stock panel. Session-t stock OPEN is later than
+  # TAIFEX's 08:45 open, so only rows complete through t-1 enter the encoder.
+  day_trade_open_feature: false
+  # This mode inherits the complete canonical stock feature_include ABI.  The
+  # day-trade parent excludes many point-in-time feature families for its own
+  # control experiment, but those exclusions must not narrow this all-market
+  # context model.  The sole exception is the next-session opening gap: row
+  # t-1 contains OPEN[t], which is not known at the TAIFEX 08:45 decision.
+  feature_exclude:
+    - next_session_open_gap_logret
+  benchmark_name: universe_average_return
+
+trading:
+  execution_mode: tw_stock_context_futures_portfolio
+  frequency: daily
+  long_only: false
+  # Zero means no voluntary turnover cap. Expiry liquidation remains mandatory.
+  max_turnover_ratio: 0.0
+  # The public daily source does not prove causal opening-book depth. Do not
+  # fabricate capacity from completed session-t volume.
+  max_volume_participation: 0.0
+  min_trade_weight: 0.0
+  # The model masks unavailable futures before projection and emits an L1-ball
+  # target directly. The executor may reject one slot without redistribution.
+  portfolio_activation: pre_normalized
+  buy_fee_rate: 0.0
+  sell_fee_rate: 0.0
+  tw_futures_portfolio_data_path: data_tw_futures/taifex_portfolio_daily_v4/continuous_daily.parquet
+  tw_futures_portfolio_fee_large_twd: 60.0
+  tw_futures_portfolio_fee_standard_twd: 24.0
+  tw_futures_portfolio_fee_stock_twd: 40.0
+  tw_futures_portfolio_fee_micro_twd: 16.0
+
+training:
+  model_name: cross_sectional_all_futures
+  multi_gpu_strategy: distributed_data_parallel
+  # The stock feature axis and futures action axis are different ABIs; symbol
+  # sharding/compaction cannot reinterpret one as the other.
+  distributed_symbol_sharded_ledger: false
+  train_symbol_compaction: false
+  epochs: 1000
+  # Formal runs must execute every requested epoch. A ratio of zero disables
+  # patience-based termination while preserving per-epoch validation/tests.
+  early_stopping_no_improve_ratio: 0.0
+  # Measured on Fold 11 with two RTX 5090s: global 96/local 48 is the fastest
+  # stable compiled shape. Global 128/local 64 currently fails inside the
+  # PyTorch 2.11 Inductor scheduler (CantSplit), before DDP construction.
+  batch_size_train: 96
+  batch_size_eval: 16
+  # The 64-session stateful graph carries final positions/alive state into the
+  # next chunk. It preserves the exact recurrence while cutting first-epoch
+  # graph build from about 185s (256 rows) to about 50s in the measured DDP run.
+  eval_backtest_chunk_rows: 64
+  eval_backtest_chunk_rows_auto: false
+  eval_backtest_compile: true
+  loss_type: log_utility
+  loss_portfolio_activation: pre_normalized
+  record_epoch_curve: true
+  curve_plot_interval: 1
+  curve_plot_async: true
+  defer_epoch_curve_plot_until_end: false
+  explain_after_each_fold: false
+  postprocess_benchmark_after_fold: false
+  postprocess_benchmark_after_best_val: false
+
+  multitask_loss:
+    # Stock-return cross-sectional labels do not share the 1,936-slot futures
+    # action axis. Net log utility is the only optimization target.
+    return_rank_ic_weight: 0.0
+    direction_weight: 0.0
+    volatility_regime_weight: 0.0
+    concentration_weight: 0.0
+
+  transformer_base_portfolio:
+    d_model: 32
+    attention_mode: market_token
+    use_latent_factors: false
+    use_market_tokens: true
+    use_flash_attention: true
+    use_time_pos: true
+    use_symbol_pos: true
+    input_dropout: 0.0
+    sdpa_batch_limit: 16384
+    norm_type: rmsnorm
+    ffn_type: swiglu
+    qk_norm: false
+    rope_temporal: true
+    rope_base: 10000.0
+    temporal_layers: 2
+    temporal_heads: 4
+    temporal_ffn_mult: 2
+    temporal_pooling: attention
+    temporal_query_mode: full_then_last
+    temporal_basis_input: embedded
+    cross_layers: 1
+    cross_heads: 4
+    cross_ffn_mult: 2
+    joint_layers: 2
+    joint_heads: 4
+    joint_ffn_mult: 2
+    latent_layers: 1
+    num_latent_factors: 16
+    num_market_tokens: 4
+    market_layers: 1
+    head_hidden_dim: 32
+    head_layers: 1
+    dropout: 0.1
+    default_temperature: 1.0
+    portfolio_mode: long_short
+    portfolio_output_mode: projection_l1
+    center_long_short_logits: false
+    # score_i / active_count enters an L1-ball projection, so the policy can
+    # retain cash and is not forced to fill the entire gross budget.
+    projection_l1_scale_by_active_count: true
+    max_full_tokens: 16384
+    checkpoint_blocks: false
+    return_aux: false
+    return_aux_details: false

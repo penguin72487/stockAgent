@@ -8,6 +8,7 @@ import torch
 
 from stockagent.backtest.tw_execution import (
     TW_CARRYING_EXECUTION_MODES,
+    TW_STOCK_FUTURES_INTEGER_DAY_TRADE_EXECUTION_MODES,
     normalize_execution_mode,
 )
 from stockagent.training.dataset import CrossSectionalDataset, execution_feature_lag
@@ -19,6 +20,12 @@ from stockagent.data.tw_index_derivatives_day import (
 from stockagent.data.tw_index_futures import (
     TAIFEX_INDEX_FUTURES_ACTION_COUNT,
     TAIFEX_INDEX_FUTURES_CONTEXT_FEATURE_DIM,
+)
+from stockagent.data.tw_futures_portfolio_daily import (
+    TAIFEX_FUTURES_PORTFOLIO_FIXED_SLOT_COUNT,
+)
+from stockagent.data.tw_stock_context_futures_portfolio import (
+    TW_STOCK_CONTEXT_FUTURES_MODEL_FEATURE_COLUMNS,
 )
 
 
@@ -110,7 +117,26 @@ class WindowedSplitTensors:
                 "tw_index_futures_day execution tensor must have shape [T,18,3]"
             )
         elif (
-            self.execution_mode not in {"tw_index_derivatives_day", "tw_day_trade"}
+            self.execution_mode
+            in TW_STOCK_FUTURES_INTEGER_DAY_TRADE_EXECUTION_MODES
+            and tuple(self.overnight_log_returns.shape)
+            != (
+                int(self.features.size(0)),
+                int(self.features.size(1)),
+                2,
+                5,
+            )
+        ):
+            raise ValueError(
+                "integer stock-futures execution tensor must have shape [T,S,2,5]"
+            )
+        elif (
+            self.execution_mode not in {
+                "tw_index_derivatives_day",
+                "tw_day_trade",
+                "tw_stock_context_futures_portfolio",
+                *TW_STOCK_FUTURES_INTEGER_DAY_TRADE_EXECUTION_MODES,
+            }
             and self.execution_mode != "tw_index_futures_day"
             and tuple(self.overnight_log_returns.shape) != expected_symbol_shape
         ):
@@ -125,6 +151,25 @@ class WindowedSplitTensors:
         ):
             raise ValueError(
                 "tw_day_trade overnight/execution tensor must have shape [T,S] or [T,S,C]"
+            )
+        elif self.execution_mode == "tw_stock_context_futures_portfolio" and (
+            tuple(self.overnight_log_returns.shape)
+            not in {
+                (
+                    int(self.features.size(0)),
+                    TAIFEX_FUTURES_PORTFOLIO_FIXED_SLOT_COUNT,
+                    4,
+                ),
+                (
+                    int(self.features.size(0)),
+                    TAIFEX_FUTURES_PORTFOLIO_FIXED_SLOT_COUNT,
+                    11,
+                ),
+            }
+        ):
+            raise ValueError(
+                "tw_stock_context_futures_portfolio execution tensor must have "
+                "shape [T,1936,4] or exact-integer [T,1936,11]"
             )
         if self.execution_mode == "tw_index_derivatives_day":
             expected_rows = int(self.features.size(0))
@@ -185,6 +230,30 @@ class WindowedSplitTensors:
             ) != tuple(self.derivative_candidate_features.shape[:2]):
                 raise ValueError(
                     "tw_index_futures_day context mask must match [T,K]"
+                )
+            self.derivative_candidate_mask = self.derivative_candidate_mask.to(
+                dtype=torch.bool
+            )
+        elif self.execution_mode == "tw_stock_context_futures_portfolio":
+            expected_rows = int(self.features.size(0))
+            expected_context_shape = (
+                expected_rows,
+                TAIFEX_FUTURES_PORTFOLIO_FIXED_SLOT_COUNT,
+                len(TW_STOCK_CONTEXT_FUTURES_MODEL_FEATURE_COLUMNS),
+            )
+            if self.derivative_candidate_features is None or tuple(
+                self.derivative_candidate_features.shape
+            ) != expected_context_shape:
+                raise ValueError(
+                    "tw_stock_context_futures_portfolio model context must have "
+                    f"shape {expected_context_shape}"
+                )
+            if self.derivative_candidate_mask is None or tuple(
+                self.derivative_candidate_mask.shape
+            ) != expected_context_shape[:2]:
+                raise ValueError(
+                    "tw_stock_context_futures_portfolio context mask must match "
+                    "[T,1936]"
                 )
             self.derivative_candidate_mask = self.derivative_candidate_mask.to(
                 dtype=torch.bool

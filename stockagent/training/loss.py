@@ -15,6 +15,7 @@ from stockagent.backtest.simulator import (
 )
 from stockagent.backtest.tw_execution import (
     TW_CARRYING_EXECUTION_MODES,
+    TW_STOCK_FUTURES_INTEGER_DAY_TRADE_EXECUTION_MODES,
     normalize_execution_mode,
 )
 from stockagent.data.tw_index_derivatives_day import (
@@ -1276,6 +1277,7 @@ def risk_aware_loss(
     can_short_open_open_mask: Tensor | None = None,
     day_trade_execution_initial_capital: float = 1_000_000.0,
     symbol_sharded_ledger: bool = False,
+    futures_portfolio_training_surrogate_only: bool = False,
 ) -> Tensor:
     """Risk-aware loss with configurable objective, including excess-CVaR-drawdown."""
     normalize_start = _loss_timer_start()
@@ -1335,6 +1337,51 @@ def risk_aware_loss(
         ):
             raise ValueError(
                 "tw_index_futures_day requires exact execution tensor [T,18,3]"
+            )
+    if mode in TW_STOCK_FUTURES_INTEGER_DAY_TRADE_EXECUTION_MODES:
+        if objective_norm not in {
+            "log_utility",
+            "log_util",
+            "kelly",
+            "growth",
+            "mean_log_return",
+        }:
+            raise ValueError(
+                f"{mode} supports only canonical log utility"
+            )
+        if overnight_log_returns is None or tuple(
+            overnight_log_returns.shape
+        ) != (int(weights.size(0)), int(weights.size(1)), 2, 5):
+            raise ValueError(
+                f"{mode} requires integer candidate execution tensor [T,S,2,5]"
+            )
+    if mode == "tw_stock_context_futures_portfolio":
+        if weights.dim() != 2 or int(weights.size(1)) != 1936:
+            raise ValueError(
+                "tw_stock_context_futures_portfolio requires direct model "
+                f"actions [T,1936], got {tuple(weights.shape)}"
+            )
+        if objective_norm not in {
+            "log_utility",
+            "log_util",
+            "kelly",
+            "growth",
+            "mean_log_return",
+        }:
+            raise ValueError(
+                "tw_stock_context_futures_portfolio supports only canonical "
+                "log utility"
+            )
+        valid_execution_shapes = {
+            (int(weights.size(0)), 1936, 4),
+            (int(weights.size(0)), 1936, 11),
+        }
+        if overnight_log_returns is None or tuple(
+            overnight_log_returns.shape
+        ) not in valid_execution_shapes:
+            raise ValueError(
+                "tw_stock_context_futures_portfolio requires packed execution "
+                "tensor [T,1936,4] or exact-integer [T,1936,11]"
             )
     if mode in TW_CARRYING_EXECUTION_MODES:
         phase_actions = mode == "tw_overnight" or weights.dim() == 3
@@ -1510,13 +1557,17 @@ def risk_aware_loss(
 
     if objective_norm in {"pure_rank", "rank_only", "score_rank"}:
         rank_logits = _resolve_rank_scores(weights, aux_outputs)
-        return float(rank_ic_weight) * masked_ic_loss(rank_logits, returns, rank_tradable)
+        return float(rank_ic_weight) * masked_ic_loss(
+            rank_logits, returns, rank_tradable
+        )
 
     if objective_norm in {"rank", "rank_ic", "ic", "multitask_rank_ic"}:
         total_loss = returns.new_zeros(())
 
         rank_logits = _resolve_rank_scores(weights, aux_outputs)
-        total_loss = total_loss + float(rank_ic_weight) * masked_ic_loss(rank_logits, returns, rank_tradable)
+        total_loss = total_loss + float(rank_ic_weight) * masked_ic_loss(
+            rank_logits, returns, rank_tradable
+        )
 
         if aux_outputs:
             score_logits = aux_outputs.get("score_logits")
@@ -1773,6 +1824,9 @@ def risk_aware_loss(
         overnight_returns=overnight_log_returns,
         day_trade_execution_initial_capital=day_trade_execution_initial_capital,
         symbol_sharded_ledger=symbol_sharded_ledger,
+        futures_portfolio_training_surrogate_only=(
+            futures_portfolio_training_surrogate_only
+        ),
     )
     _loss_timer_stop("backtest", backtest_start)
 
