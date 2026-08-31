@@ -18,9 +18,10 @@ day_trade_simulation_state_dir: artifacts/live/tw_day_trade_simulation
 day_trade_rule_data_dir: /srv/stockagent-live/data_tw_public
 day_trade_quote_interval_seconds: 60
 
-# 09:00 publishes the opening-informed signal. Paper execution waits until
-# 09:01 and uses the observed official session open for both directions;
-# missing opens fail closed and never use Bid/Ask, last price, or +1 Tick.
+# 09:00 starts the opening-informed live signal. Once its immutable pointer is
+# published, paper execution uses the first strictly later best Ask for
+# buy/cover or best Bid for sell/short. Missing causal quotes fail closed; only
+# historical replay uses the 09:01 observed official session open.
 pre_signal_command:
   - scripts/activate_tw_public_opening_data.py
   - --link

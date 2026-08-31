@@ -56,7 +56,7 @@ def test_two_phase_cold_start_repairs_then_executes_all_modes(
     assert all(row["passed"] for row in report["checks"])
 
 
-def test_two_phase_cold_start_uses_0901_official_open_and_never_touches_live_state(
+def test_two_phase_cold_start_separates_live_best_quote_from_0901_replay(
     tmp_path: Path,
 ) -> None:
     output_root = tmp_path / "cold-test"
@@ -68,20 +68,31 @@ def test_two_phase_cold_start_uses_0901_official_open_and_never_touches_live_sta
 
     modes = report["phases"]["opening_executed"]["modes"]
     assert modes["tw_day_trade_100m"]["side"] == "long"
-    assert modes["tw_day_trade_100m"]["entry_price"] == 999.0
+    assert modes["tw_day_trade_100m"]["entry_price"] == 1_000.0
     assert modes["tw_day_trade_multi_basis"]["side"] == "short"
-    assert modes["tw_day_trade_multi_basis"]["entry_price"] == 999.0
+    assert modes["tw_day_trade_multi_basis"]["entry_price"] == 998.0
     assert modes["tw_day_trade_multi_basis_projection_l1_gelu"]["side"] == "long"
-    assert modes["tw_day_trade_multi_basis_projection_l1_gelu"]["entry_price"] == 999.0
+    assert modes["tw_day_trade_multi_basis_projection_l1_gelu"]["entry_price"] == 1_000.0
     assert all(row["filled_shares"] == 1_000 for row in modes.values())
     assert all(row["requested_shares"] == 1_000 for row in modes.values())
     assert all(row["entry_unfilled_shares"] == 0 for row in modes.values())
-    assert all(row["displayed_best_volume_shares"] == 1 for row in modes.values())
+    assert all(row["displayed_best_volume_shares"] == 1_000 for row in modes.values())
     assert all(row["paper_market_fill"] is False for row in modes.values())
     assert all(
-        row["counterfactual_open_price_fill"] is True for row in modes.values()
+        row["counterfactual_open_price_fill"] is False for row in modes.values()
     )
     assert all(row["synthetic_fill"] is False for row in modes.values())
+
+    replay = report["phases"]["historical_replay"]["modes"]
+    assert all(row["entry_price"] == 999.0 for row in replay.values())
+    assert all(row["entry_at"].endswith("T09:01:00+08:00") for row in replay.values())
+    assert all(
+        row["entry_fill_policy"] == "official_open_at_09_01"
+        for row in replay.values()
+    )
+    assert all(
+        row["counterfactual_open_price_fill"] is True for row in replay.values()
+    )
 
     isolation = report["isolation"]
     assert isolation == {

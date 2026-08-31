@@ -51,6 +51,7 @@ REQUIRED_TIMERS = (
     "stockagent-tw-public-publication-sweep.timer",
     "stockagent-tw-public-0830-check.timer",
     "stockagent-tw-day-trade-preopen-gate.timer",
+    "stockagent-discord-artifact-maintenance.timer",
     "stockagent-tw-day-trade-unattended-guardian.timer",
 )
 
@@ -552,8 +553,19 @@ def main() -> int:
         )
         if not runtime_ready:
             failures.append("paper engine and Discord revisions are not synchronized")
+        maintenance = discord_status.get("background_maintenance")
+        maintenance = dict(maintenance) if isinstance(maintenance, dict) else {}
+        maintenance_degraded = bool(
+            maintenance.get("status") == "degraded"
+            or int(maintenance.get("failed_count") or 0) > 0
+        )
+        if maintenance_degraded:
+            # Formal-history maintenance is intentionally a separate health
+            # domain: make failure visible without declaring the Gateway or
+            # the independent opening execution engine disconnected.
+            warnings.append("post-close Discord artifact maintenance is degraded")
 
-        if weekday and wall >= datetime_time(9, 1, 15):
+        if weekday and wall >= datetime_time(9, 0, 15):
             missing_signals = [
                 market
                 for market in EXPECTED_MARKETS
@@ -561,7 +573,7 @@ def main() -> int:
                 or not (modes.get(market) or {}).get("signal_id")
                 or not (modes.get(market) or {}).get("entry_completed_at")
                 or (modes.get(market) or {}).get("entry_fill_policy")
-                != "official_open_at_09_01"
+                != "causal_best_quote"
                 or int(
                     (modes.get(market) or {}).get("entry_price_offset_ticks") or 0
                 )
@@ -676,6 +688,10 @@ def main() -> int:
                     "revision_lag": revision_lag,
                     "engine_run_id": engine_sync.get("engine_run_id"),
                     "enabled_markets": engine_sync.get("enabled_markets"),
+                },
+                "post_close_artifact_maintenance": {
+                    "ready": not maintenance_degraded,
+                    **maintenance,
                 },
                 "session_signals": {
                     "ready": not missing_signals,

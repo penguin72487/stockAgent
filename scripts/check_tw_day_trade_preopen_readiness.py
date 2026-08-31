@@ -170,7 +170,7 @@ def evaluate_readiness(
     engine_status_receipt: Mapping[str, Any] | None = None,
     engine_sync_receipt: Mapping[str, Any] | None = None,
     discord_status_receipt: Mapping[str, Any] | None = None,
-    opening_check_after: datetime_time = datetime_time(9, 1, 15),
+    opening_check_after: datetime_time = datetime_time(9, 0, 15),
     opening_commit_slo_seconds: float = 15.0,
 ) -> dict[str, Any]:
     session_date = observed.astimezone(TAIPEI).date().isoformat()
@@ -251,9 +251,11 @@ def evaluate_readiness(
         final_arm = dict(final_arm) if isinstance(final_arm, Mapping) else {}
         latency = final_arm.get("live_latency")
         latency = dict(latency) if isinstance(latency, Mapping) else {}
-        quote_prewarm = final_arm.get("quote_prewarm")
-        quote_prewarm = (
-            dict(quote_prewarm) if isinstance(quote_prewarm, Mapping) else {}
+        opening_prewarm = final_arm.get("opening_source_prewarm")
+        opening_prewarm = (
+            dict(opening_prewarm)
+            if isinstance(opening_prewarm, Mapping)
+            else {}
         )
         ready = bool(
             row.get("status") == "ready"
@@ -265,15 +267,9 @@ def evaluate_readiness(
             and latency.get("panel_cache_hit") is True
             and latency.get("checkpoint_cache_hit") is True
             and latency.get("model_cache_hit") is True
-            and quote_prewarm.get("ready") is True
-            and quote_prewarm.get("run_id") == model_run_id
-            and quote_prewarm.get("connection_scope") == "process"
-            and int(quote_prewarm.get("requested_count") or 0) > 0
-            and int(quote_prewarm.get("primed_count") or 0)
-            == int(quote_prewarm.get("requested_count") or 0)
-            and int(quote_prewarm.get("resolved_count") or 0)
-            == int(quote_prewarm.get("requested_count") or 0)
-            and int(quote_prewarm.get("missing_count") or 0) == 0
+            and opening_prewarm.get("ready") is True
+            and opening_prewarm.get("run_id") == model_run_id
+            and opening_prewarm.get("source") == "twse_tpex:mis"
         )
         model_results[market] = {
             "ready": ready,
@@ -291,15 +287,12 @@ def evaluate_readiness(
                     "model_cache_hit",
                 )
             },
-            "quote_prewarm": {
-                "ready": quote_prewarm.get("ready"),
-                "run_id": quote_prewarm.get("run_id"),
-                "connection_scope": quote_prewarm.get("connection_scope"),
-                "requested_count": quote_prewarm.get("requested_count"),
-                "primed_count": quote_prewarm.get("primed_count"),
-                "resolved_count": quote_prewarm.get("resolved_count"),
-                "missing_count": quote_prewarm.get("missing_count"),
-                "snapshot_prefetched": quote_prewarm.get("snapshot_prefetched"),
+            "opening_source_prewarm": {
+                "ready": opening_prewarm.get("ready"),
+                "run_id": opening_prewarm.get("run_id"),
+                "source": opening_prewarm.get("source"),
+                "cache_hit": opening_prewarm.get("cache_hit"),
+                "proof": opening_prewarm.get("proof"),
             },
             "tw_mis_fallback_prewarm": final_arm.get(
                 "tw_mis_fallback_prewarm"
@@ -450,7 +443,7 @@ def evaluate_readiness(
     if opening_check_due:
         execution_boundary = datetime.combine(
             observed.astimezone(TAIPEI).date(),
-            datetime_time(9, 1),
+            datetime_time(9, 0),
             tzinfo=TAIPEI,
         )
         engine_sync = dict(engine_sync_receipt or {})
@@ -481,6 +474,8 @@ def evaluate_readiness(
                 and _same_session(row.get("signal_at"), session_date)
                 and _same_session(row.get("entry_completed_at"), session_date)
                 and row.get("checkpoint_ready") is True
+                and row.get("entry_fill_policy") == "causal_best_quote"
+                and int(row.get("entry_price_offset_ticks") or 0) == 0
                 and slo_met
                 and not str(row.get("engine_status") or "").startswith(
                     ("blocked", "critical", "waiting")
@@ -494,6 +489,8 @@ def evaluate_readiness(
                 "entry_completed_at": row.get("entry_completed_at"),
                 "engine_status": row.get("engine_status"),
                 "checkpoint_ready": row.get("checkpoint_ready"),
+                "entry_fill_policy": row.get("entry_fill_policy"),
+                "entry_price_offset_ticks": row.get("entry_price_offset_ticks"),
                 "entry_commit_delay_ms": entry_commit_delay_ms,
                 "commit_slo_seconds": opening_commit_slo_seconds,
                 "commit_slo_met": slo_met,
@@ -509,7 +506,7 @@ def evaluate_readiness(
         }
         if not opening_ready:
             failures.append(
-                "09:01 official-open fills were not durably committed for every paper mode by 09:01:15"
+                "09:00 live signals were not durably committed with causal best-quote execution for every paper mode by 09:00:15"
             )
 
     required_services = (

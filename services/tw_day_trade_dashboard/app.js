@@ -462,7 +462,7 @@ function executionStatusPresentation(value) {
     completed: {label: "該日已執行", kind: "good"},
     blocked: {label: "該日未執行・安全阻擋", kind: "bad"},
     starting: {label: "錯過後立即補跑中", kind: "warn"},
-    waiting_09_01: {label: "等待 09:01 開盤價計價", kind: ""},
+    waiting_09_00: {label: "等待 09:00 即時訊號", kind: ""},
     waiting_trading_day: {label: "等待交易日", kind: ""},
     missed: {label: "該日執行缺漏", kind: "bad"},
   };
@@ -656,7 +656,7 @@ function renderModes(data) {
       ? `目前規則：開盤價不利 ${number(configuredEntryOffset || 1)} Tick 合成成交`
       : configuredEntryPolicy === "market_at_best_quote_else_adverse_open_tick"
       ? `目前規則：紙上市價買進／回補取最佳 Ask、賣出／放空取最佳 Bid，完整模擬委託；缺報價才用開盤價不利 ${number(configuredEntryOffset || 1)} Tick`
-      : "目前規則：市價買進／回補取收到的最佳 Ask；市價賣出／放空取收到的最佳 Bid，且只吃可驗證一檔量";
+      : "目前規則：09:00 訊號原子發布後，市價買進／回補取第一筆較晚最佳 Ask；市價賣出／放空取第一筆較晚最佳 Bid，且只吃可驗證一檔量；歷史回補另用 09:01 官方開盤價";
     const recordedEntryPolicy = mode.entry_fill_policy === "official_open_at_09_01"
       ? `所選交易日紀錄：09:01 官方開盤價計價 ${number(mode.entry_official_open_fill_count || mode.entry_fill_count || 0)} 筆（反事實紙上估值，非交易所成交）`
       : mode.entry_fill_policy === "synthetic_open_tick"
@@ -874,7 +874,7 @@ function renderOperations(data) {
       : "Discord Shioaji 連線／契約待預熱";
     const armText = armed
       ? `09:00 HOT READY ${shortTime(row.final_arm_completed_at)} · ${duration(row.final_arm_elapsed_seconds)} · ${number(row.final_arm_attempts || 1)} 次驗證 · ${quoteArm}`
-      : row.final_arm_public_error_message || row.final_arm_error || `08:55 最後武裝待驗證 · ${quoteArm}`;
+      : row.final_arm_public_error_message || row.final_arm_error || `08:45 起最後武裝待驗證 · ${quoteArm}`;
     const measuredDetail = `${duration(row.elapsed_seconds)} · ${speed} · ${inference} · ${limits} · ${eligibility} · ${armText}${eta == null ? "" : ` · ETA ${duration(eta)}`}`;
     const detail = row.public_error_message || row.error || (status === "running" && row.message) || measuredDetail;
     return `<div class="progress-row">

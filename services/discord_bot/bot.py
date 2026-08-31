@@ -13,6 +13,7 @@ import sys
 import threading
 import time
 import traceback
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import datetime, timedelta
 from functools import lru_cache
@@ -89,7 +90,6 @@ from stockagent.live.quote_provider import (
     load_symbol_name_map,
     prepare_tw_price_limit_snapshot,
     tw_mis_opening_receipt_status,
-    warm_shioaji_stock_quote_client,
     warm_tw_mis_quote_client,
 )
 from stockagent.live.portfolio_history import PortfolioHistoryResult, load_portfolio_history
@@ -1016,12 +1016,10 @@ def _preopen_market_final_armed_for_session(
         return False
     latency = final_arm.get("live_latency")
     latency = latency if isinstance(latency, dict) else {}
-    quote_prewarm = final_arm.get("quote_prewarm")
-    quote_prewarm = quote_prewarm if isinstance(quote_prewarm, dict) else {}
-    quote_requested = int(quote_prewarm.get("requested_count") or 0)
-    quote_primed = int(quote_prewarm.get("primed_count") or 0)
-    quote_resolved = int(quote_prewarm.get("resolved_count") or 0)
-    quote_missing = int(quote_prewarm.get("missing_count") or 0)
+    opening_prewarm = final_arm.get("opening_source_prewarm")
+    opening_prewarm = (
+        opening_prewarm if isinstance(opening_prewarm, dict) else {}
+    )
     return bool(
         final_arm.get("status") == "ready"
         and final_arm.get("run_id") == _BOT_RUN_ID
@@ -1029,13 +1027,9 @@ def _preopen_market_final_armed_for_session(
         and latency.get("panel_cache_hit") is True
         and latency.get("checkpoint_cache_hit") is True
         and latency.get("model_cache_hit") is True
-        and quote_prewarm.get("ready") is True
-        and quote_prewarm.get("run_id") == _BOT_RUN_ID
-        and quote_prewarm.get("connection_scope") == "process"
-        and quote_requested > 0
-        and quote_primed == quote_requested
-        and quote_resolved == quote_requested
-        and quote_missing == 0
+        and opening_prewarm.get("ready") is True
+        and opening_prewarm.get("run_id") == _BOT_RUN_ID
+        and opening_prewarm.get("source") == "twse_tpex:mis"
     )
 
 
@@ -1081,35 +1075,19 @@ def _day_trade_opening_fallback_prices(
     )
 
 
-def _require_complete_quote_prewarm(receipt: dict[str, Any]) -> None:
-    """Fail closed unless this bot process owns every required contract object."""
-
-    requested = int(receipt.get("requested_count") or 0)
-    primed = int(receipt.get("primed_count") or 0)
-    resolved = int(receipt.get("resolved_count") or 0)
-    missing = int(receipt.get("missing_count") or 0)
-    if not (
-        receipt.get("ready") is True
-        and receipt.get("connection_scope") == "process"
-        and requested > 0
-        and primed == requested
-        and resolved == requested
-        and missing == 0
-    ):
-        raise RuntimeError(
-            "Shioaji process-local quote prewarm incomplete: "
-            f"scope={receipt.get('connection_scope')} requested={requested} "
-            f"primed={primed} resolved={resolved} missing={missing}"
-        )
-
-
 def _warm_or_reuse_tw_mis_opening_receipt(
-    *, parquet_root: str | Path, session_date: str
+    *,
+    parquet_root: str | Path,
+    session_date: str,
+    force_probe: bool = False,
 ) -> dict[str, Any]:
-    """Fail over only to a receipt-proven opening observation for this session."""
+    """Prove MIS now, or reuse only a receipt-proven same-session opening."""
 
     try:
-        return dict(warm_tw_mis_quote_client())
+        return {
+            **dict(warm_tw_mis_quote_client(force=force_probe)),
+            "source": "twse_tpex:mis",
+        }
     except Exception:
         receipt = tw_mis_opening_receipt_status(
             parquet_root=parquet_root,
@@ -1124,7 +1102,8 @@ def _warm_or_reuse_tw_mis_opening_receipt(
         )
         return {
             "ready": True,
-            "source": "receipt_backed_same_session_opening",
+            "source": "twse_tpex:mis",
+            "proof": "receipt_backed_same_session_opening",
             **receipt,
         }
 
@@ -1156,7 +1135,7 @@ def _preopen_prepare_key(cfg: LiveMarketConfig, now: datetime) -> str | None:
             1,
             min(
                 15,
-                _env_int("STOCKAGENT_PREOPEN_FINAL_ARM_LEAD_MINUTES", 5) or 5,
+                _env_int("STOCKAGENT_PREOPEN_FINAL_ARM_LEAD_MINUTES", 15) or 15,
             ),
         )
         if (
@@ -1317,6 +1296,22 @@ def _artifact_backfill_status_path() -> Path:
     return _resolve_repo_path(configured) or Path(str(configured))
 
 
+@contextmanager
+def _artifact_backfill_status_guard() -> Any:
+    """Serialize receipt read/modify/write across bot and maintenance workers."""
+
+    path = _artifact_backfill_status_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_name(f"{path.name}.lock")
+    with _ARTIFACT_BACKFILL_STATUS_LOCK:
+        with lock_path.open("a+", encoding="utf-8") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 def _load_artifact_backfill_status() -> dict[str, Any]:
     path = _artifact_backfill_status_path()
     try:
@@ -1361,7 +1356,7 @@ def _artifact_backfill_retry_allowed(
     now: datetime | None = None,
 ) -> bool:
     observed = now or datetime.now().astimezone()
-    with _ARTIFACT_BACKFILL_STATUS_LOCK:
+    with _artifact_backfill_status_guard():
         payload = _load_artifact_backfill_status()
         job = (payload.get("jobs") or {}).get(str(key))
     if not isinstance(job, dict):
@@ -1384,7 +1379,7 @@ def _artifact_backfill_retry_allowed(
 
 def _begin_artifact_backfill(key: str, market: str) -> dict[str, Any]:
     observed = datetime.now().astimezone()
-    with _ARTIFACT_BACKFILL_STATUS_LOCK:
+    with _artifact_backfill_status_guard():
         payload = _load_artifact_backfill_status()
         jobs = payload.setdefault("jobs", {})
         previous = jobs.get(str(key))
@@ -1418,7 +1413,7 @@ def _finish_artifact_backfill(
     exc: Exception | None = None,
 ) -> dict[str, Any]:
     observed = datetime.now().astimezone()
-    with _ARTIFACT_BACKFILL_STATUS_LOCK:
+    with _artifact_backfill_status_guard():
         payload = _load_artifact_backfill_status()
         jobs = payload.setdefault("jobs", {})
         previous = jobs.get(str(key))
@@ -1463,7 +1458,7 @@ def _finish_artifact_backfill(
 
 
 def _artifact_backfill_health_summary() -> dict[str, Any]:
-    with _ARTIFACT_BACKFILL_STATUS_LOCK:
+    with _artifact_backfill_status_guard():
         payload = _load_artifact_backfill_status()
     jobs = payload.get("jobs") or {}
     latest_by_market: dict[str, dict[str, Any]] = {}
@@ -1532,7 +1527,7 @@ def _register_signal_now_job(
     observed = datetime.now().astimezone()
     expected, actual = _signal_now_job_data_dates(runtime_status)
     waiting_source = not bool(getattr(runtime_status.data, "fresh", False))
-    with _ARTIFACT_BACKFILL_STATUS_LOCK:
+    with _artifact_backfill_status_guard():
         payload = _load_artifact_backfill_status()
         jobs = payload.setdefault("signal_now_jobs", {})
         previous = jobs.get(str(key))
@@ -1599,7 +1594,7 @@ def _update_signal_now_job(
     delivered_user_ids: set[int] | None = None,
 ) -> dict[str, Any]:
     observed = datetime.now().astimezone()
-    with _ARTIFACT_BACKFILL_STATUS_LOCK:
+    with _artifact_backfill_status_guard():
         payload = _load_artifact_backfill_status()
         jobs = payload.setdefault("signal_now_jobs", {})
         previous = jobs.get(str(key))
@@ -1684,7 +1679,7 @@ def _update_signal_now_job(
 
 def _signal_now_job_waiters(key: str) -> set[int]:
     waiters = set(bot._signal_now_background_waiters.get(str(key), set()))
-    with _ARTIFACT_BACKFILL_STATUS_LOCK:
+    with _artifact_backfill_status_guard():
         payload = _load_artifact_backfill_status()
         row = (payload.get("signal_now_jobs") or {}).get(str(key))
     if isinstance(row, dict):
@@ -1698,7 +1693,7 @@ def _signal_now_job_waiters(key: str) -> set[int]:
 
 def _signal_now_resumable_jobs(*, now: datetime | None = None) -> list[dict[str, Any]]:
     observed = now or datetime.now().astimezone()
-    with _ARTIFACT_BACKFILL_STATUS_LOCK:
+    with _artifact_backfill_status_guard():
         payload = _load_artifact_backfill_status()
         rows = list((payload.get("signal_now_jobs") or {}).values())
     pending: list[dict[str, Any]] = []
@@ -1726,7 +1721,7 @@ def _signal_now_resumable_jobs(*, now: datetime | None = None) -> list[dict[str,
 
 
 def _signal_now_job_health_summary() -> dict[str, Any]:
-    with _ARTIFACT_BACKFILL_STATUS_LOCK:
+    with _artifact_backfill_status_guard():
         payload = _load_artifact_backfill_status()
         rows = [
             row
@@ -2326,12 +2321,13 @@ def _auto_signal_price_source(cfg: LiveMarketConfig, status: MarketRuntimeStatus
         return "panel"
     if market_type in {"tw", "taiwan"}:
         if bool(getattr(cfg, "day_trade_simulation_enabled", False)):
-            # The model needs a same-session opening observation at 09:00. Use
-            # the reserved, process-cached Shioaji quote connection so an
-            # unavailable public MIS endpoint cannot block every strategy.
-            # Execution remains a separate, causally later best-Bid/Ask fetch
-            # owned by the paper engine for actual order candidates only.
-            return "shioaji" if (
+            # The model needs one official same-session opening observation,
+            # not a full-universe executable book.  The ``tw`` provider owns a
+            # receipt-backed single-flight MIS snapshot shared by all models.
+            # The independent paper engine remains the sole Shioaji client on
+            # the execution path and observes a causally later best Bid/Ask for
+            # the union of actual order candidates.
+            return "tw" if (
                 bool(getattr(status, "market_open", False))
                 or _should_use_realtime_quote_after_open(cfg, status)
             ) else None
@@ -2507,7 +2503,9 @@ class StockAgentBot(discord.Client):
         signal_now_job_resumer.start()
         preopen_prepare.start()
         daily_summary.start()
-        artifact_backfill.start()
+        # Full-history maintenance runs in a separate systemd oneshot/cgroup.
+        # Keeping it out of this process protects Gateway heartbeats and
+        # interactive commands from post-close CPU, memory, and OOM failures.
         model_auto_deployment.start()
 
     async def on_ready(self) -> None:
@@ -2667,7 +2665,9 @@ def _write_preopen_readiness(
             "same_session_eligibility": (summary or {}).get(
                 "same_session_eligibility"
             ),
-            "quote_prewarm": (summary or {}).get("quote_prewarm"),
+            "opening_source_prewarm": (summary or {}).get(
+                "opening_source_prewarm"
+            ),
             "tw_mis_fallback_prewarm": (summary or {}).get(
                 "tw_mis_fallback_prewarm"
             ),
@@ -2728,7 +2728,9 @@ def _write_preopen_final_arm(
             "elapsed_seconds": round(float(elapsed_seconds), 3),
             "attempts": max(1, int(attempts)),
             "live_latency": (summary or {}).get("live_latency"),
-            "quote_prewarm": (summary or {}).get("quote_prewarm"),
+            "opening_source_prewarm": (summary or {}).get(
+                "opening_source_prewarm"
+            ),
             "tw_mis_fallback_prewarm": (summary or {}).get(
                 "tw_mis_fallback_prewarm"
             ),
@@ -2831,21 +2833,14 @@ def _prewarm_market_signal_serialized(cfg: LiveMarketConfig) -> LiveSignalResult
         }
         update_progress(4, "same-session eligibility ready")
         # Prime the official whole-market opening source here. The independent
-        # execution process separately prewarms its simulation-only Shioaji
-        # connection for the later candidate-only best Bid/Ask observation.
-        try:
-            mis_fallback_prewarm = _warm_or_reuse_tw_mis_opening_receipt(
-                parquet_root=experiment.data.parquet_root,
-                session_date=observed.date().isoformat(),
-            )
-        except Exception as exc:
-            # MIS is the secondary opening source.  A failure is observable,
-            # but cannot veto a proven process-local Shioaji primary path.
-            mis_fallback_prewarm = {
-                "ready": False,
-                "error": f"{type(exc).__name__}: {exc}",
-            }
-        update_progress(5, "TW opening fallback checked")
+        # execution process separately owns and prewarms the sole Shioaji
+        # session used for the later candidate-only best Bid/Ask observation.
+        opening_source_prewarm = _warm_or_reuse_tw_mis_opening_receipt(
+            parquet_root=experiment.data.parquet_root,
+            session_date=observed.date().isoformat(),
+        )
+        opening_source_prewarm["run_id"] = _BOT_RUN_ID
+        update_progress(5, "TW opening source checked")
 
         def signal_progress(event: dict[str, Any]) -> None:
             raw_step = max(0, int(event.get("step") or 0))
@@ -2872,12 +2867,12 @@ def _prewarm_market_signal_serialized(cfg: LiveMarketConfig) -> LiveSignalResult
         with _MODEL_INFERENCE_LOCK:
             result = generate_live_signal(**kwargs)
         symbols = _day_trade_opening_quote_symbols(result.weights_rows)
-        quote_prewarm = dict(warm_shioaji_stock_quote_client(symbols))
-        quote_prewarm["run_id"] = _BOT_RUN_ID
-        _require_complete_quote_prewarm(quote_prewarm)
-        result.summary["quote_prewarm"] = quote_prewarm
-        result.summary["tw_mis_fallback_prewarm"] = mis_fallback_prewarm
-        update_progress(23, "Shioaji session and stock contracts ready")
+        result.summary["opening_source_prewarm"] = opening_source_prewarm
+        # Compatibility alias for readers deployed before MIS became the
+        # primary model-observation source.  It carries identical truthful
+        # evidence and can be removed after all readers migrate.
+        result.summary["tw_mis_fallback_prewarm"] = opening_source_prewarm
+        update_progress(23, "opening source and model cache ready")
         fallback = _day_trade_opening_fallback_prices(
             result.weights_rows, symbols
         )
@@ -2929,16 +2924,12 @@ def _final_arm_market_signal_sync(cfg: LiveMarketConfig) -> LiveSignalResult:
     attempts = 0
     try:
         experiment = load_config(cfg.config_path)
-        try:
-            mis_fallback_prewarm = _warm_or_reuse_tw_mis_opening_receipt(
-                parquet_root=experiment.data.parquet_root,
-                session_date=session_date,
-            )
-        except Exception as exc:
-            mis_fallback_prewarm = {
-                "ready": False,
-                "error": f"{type(exc).__name__}: {exc}",
-            }
+        opening_source_prewarm = _warm_or_reuse_tw_mis_opening_receipt(
+            parquet_root=experiment.data.parquet_root,
+            session_date=session_date,
+            force_probe=True,
+        )
+        opening_source_prewarm["run_id"] = _BOT_RUN_ID
         _sync_latest_live_weights_to_market_artifact(cfg)
 
         def run_once() -> LiveSignalResult:
@@ -2973,12 +2964,8 @@ def _final_arm_market_signal_sync(cfg: LiveMarketConfig) -> LiveSignalResult:
         missing = [key for key in cache_keys if latency.get(key) is not True]
         if missing:
             raise RuntimeError(f"preopen final arm cache proof failed: {missing}")
-        symbols = _day_trade_opening_quote_symbols(result.weights_rows)
-        quote_prewarm = dict(warm_shioaji_stock_quote_client(symbols))
-        quote_prewarm["run_id"] = _BOT_RUN_ID
-        _require_complete_quote_prewarm(quote_prewarm)
-        result.summary["quote_prewarm"] = quote_prewarm
-        result.summary["tw_mis_fallback_prewarm"] = mis_fallback_prewarm
+        result.summary["opening_source_prewarm"] = opening_source_prewarm
+        result.summary["tw_mis_fallback_prewarm"] = opening_source_prewarm
         _write_preopen_final_arm(
             cfg,
             status="ready",
@@ -8455,9 +8442,20 @@ async def service_heartbeat() -> None:
             )
             os._exit(70)
     try:
-        await asyncio.to_thread(_write_discord_service_status)
+        payload = await asyncio.to_thread(_write_discord_service_status)
     except Exception as exc:
         _log_exception("service_heartbeat", exc)
+        return
+    if attempt_started is None:
+        interactive = payload.get("interactive_signal_jobs") or {}
+        maintenance = payload.get("background_maintenance") or {}
+        notify_systemd(
+            "STATUS=Discord Gateway "
+            f"{payload.get('core_health', 'unknown')}; "
+            f"interactive={interactive.get('status', 'unknown')}; "
+            f"maintenance={maintenance.get('status', 'unknown')}; "
+            f"engine_revision={payload.get('engine_state_revision', 0)}"
+        )
 
 
 @tasks.loop(seconds=1)

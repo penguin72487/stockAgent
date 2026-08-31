@@ -1,0 +1,21 @@
+[Unit]
+Description=StockAgent weekday post-close artifact maintenance schedule
+
+[Timer]
+# Explicit weekday calendar events keep this schedule weekly/session scoped.
+# Repeated post-close probes are cheap when current and recover source delays.
+OnCalendar=Mon..Fri *-*-* 13:40:00 Asia/Taipei
+OnCalendar=Mon..Fri *-*-* 14:00:00 Asia/Taipei
+OnCalendar=Mon..Fri *-*-* 14:15:00 Asia/Taipei
+OnCalendar=Mon..Fri *-*-* 14:30:00 Asia/Taipei
+OnCalendar=Mon..Fri *-*-* 15:00:00 Asia/Taipei
+OnCalendar=Mon..Fri *-*-* 16:00:00 Asia/Taipei
+OnCalendar=Mon..Fri *-*-* 18:00:00 Asia/Taipei
+OnCalendar=Mon..Fri *-*-* 20:00:00 Asia/Taipei
+OnCalendar=Mon..Fri *-*-* 23:00:00 Asia/Taipei
+Persistent=true
+RandomizedDelaySec=0
+Unit=stockagent-discord-artifact-maintenance.service
+
+[Install]
+WantedBy=timers.target

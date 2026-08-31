@@ -8,6 +8,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 $wsl = Join-Path $env:WINDIR "System32\wsl.exe"
+$caddy = (Get-Command caddy.exe -ErrorAction Stop).Source
 if (-not $DistroName) {
     $lxssRoot = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Lxss"
     $defaultDistributionId = [string](Get-ItemProperty $lxssRoot).DefaultDistribution
@@ -110,15 +111,45 @@ $caddyConfig = Join-Path $installRoot "Caddyfile"
 $escapedCaddyConfig = [Regex]::Escape($caddyConfig)
 
 function Get-CaddyProcesses {
+    # Processes started by an S4U task hide CommandLine/ExecutablePath from a
+    # non-elevated interactive token.  Include the process that owns the public
+    # HTTP(S) listeners so the probe can still exercise that isolated instance.
+    $listenerPids = @(Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
+        Where-Object { $_.LocalPort -in 80, 443 } |
+        ForEach-Object { [int]$_.OwningProcess } |
+        Sort-Object -Unique)
     return @(Get-CimInstance Win32_Process -Filter "Name = 'caddy.exe'" |
-        Where-Object { $_.CommandLine -match $escapedCaddyConfig })
+        Where-Object {
+            $_.CommandLine -match $escapedCaddyConfig -or
+            [int]$_.ProcessId -in $listenerPids
+        })
+}
+
+function Stop-CaddyViaAdmin {
+    # Windows PowerShell 5 wraps native stderr as an ErrorRecord. Caddy emits
+    # informational logs there even on success, so judge only its exit code.
+    $savedErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "SilentlyContinue"
+        & $caddy stop --address 127.0.0.1:2019 2>$null | Out-Null
+        $exitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $savedErrorActionPreference
+    }
+    return [int]$exitCode
 }
 
 # Exercise the Windows reverse proxy's own recovery path before removing WSL.
 $oldCaddyPids = @(Get-CaddyProcesses | ForEach-Object { [int]$_.ProcessId })
 Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-Get-CaddyProcesses | ForEach-Object {
-    Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+# An S4U-launched process cannot always be terminated from the caller's
+# interactive logon session. Use Caddy's loopback admin API first; retain a
+# process fallback for older interactive-task deployments.
+$caddyStopExitCode = Stop-CaddyViaAdmin
+if ($caddyStopExitCode -ne 0) {
+    Get-CaddyProcesses | ForEach-Object {
+        Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+    }
 }
 $caddyStoppedProbe = Get-PublicProbe "/healthz"
 $caddyStopDeadline = (Get-Date).AddSeconds(10)
@@ -127,8 +158,11 @@ while (
         @(Get-CaddyProcesses).Count -gt 0) -and
     (Get-Date) -lt $caddyStopDeadline
 ) {
-    Get-CaddyProcesses | ForEach-Object {
-        Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+    $caddyStopExitCode = Stop-CaddyViaAdmin
+    if ($caddyStopExitCode -ne 0) {
+        Get-CaddyProcesses | ForEach-Object {
+            Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+        }
     }
     Start-Sleep -Milliseconds 100
     $caddyStoppedProbe = Get-PublicProbe "/healthz"

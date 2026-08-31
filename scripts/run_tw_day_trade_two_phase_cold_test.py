@@ -6,7 +6,9 @@ no same-session opening observation, no signal pointer, and an unsynchronised
 Discord receipt.  It then atomically applies repaired source receipts and
 executes the same production pre-open readiness gate.  Only after that gate is
 ready does it inject an opening observation, publish three atomic signal
-pointers, and execute them at 09:01 using the observed official session open.
+pointers, and execute them immediately after 09:00 using a strictly later best
+Ask/Bid.  A separate isolated phase proves that historical replay alone is
+recorded at 09:01 using the observed official session open.
 
 The final phase advances that same durable engine through intraday marking,
 13:20 passive exits, 13:24 market-at-best force exits, the 13:30 close, and two
@@ -15,9 +17,9 @@ addition to the original two opening phases.
 
 No network request, Shioaji login, broker order, systemd mutation, live-root
 write, or production-ledger write is performed.  External source and quote
-delivery are fixtures; readiness, signal-pointer consumption, integer sizing,
-09:01 official-open execution, ledger durability, and post-open acceptance use the
-production implementations.
+delivery are fixtures; readiness, signal-pointer consumption, live causal
+best-quote execution, historical 09:01 replay, ledger durability, and post-open
+acceptance use the production implementations.
 """
 
 from __future__ import annotations
@@ -54,6 +56,7 @@ from scripts.run_tw_day_trade_simulation import (  # noqa: E402
 )
 from stockagent.live.tw_day_trade_service_sync import load_service_sync  # noqa: E402
 from stockagent.live.tw_day_trade_simulation import (  # noqa: E402
+    ENTRY_FILL_POLICY_CAUSAL_BOOK,
     ENTRY_FILL_POLICY_OFFICIAL_OPEN_AT_0901,
     LiveEligibility,
     ModeSpec,
@@ -107,6 +110,15 @@ def _default_session_date() -> date:
     session = datetime.now(TAIPEI).date()
     while session.weekday() >= 5:
         session -= timedelta(days=1)
+    return session
+
+
+def _default_future_session_date() -> date:
+    """Choose a synthetic session strictly after every completed daily panel."""
+
+    session = datetime.now(TAIPEI).date() + timedelta(days=1)
+    while session.weekday() >= 5:
+        session += timedelta(days=1)
     return session
 
 
@@ -171,7 +183,7 @@ def _enabled_specs(sandbox: Path) -> list[ModeSpec]:
             replace(
                 spec,
                 live_output_dir=sandbox / "signals" / market,
-                entry_fill_policy=ENTRY_FILL_POLICY_OFFICIAL_OPEN_AT_0901,
+                entry_fill_policy=ENTRY_FILL_POLICY_CAUSAL_BOOK,
                 entry_price_offset_ticks=0,
             )
         )
@@ -265,17 +277,11 @@ def _model_receipt(
                     "checkpoint_cache_hit": ready,
                     "model_cache_hit": ready,
                 },
-                "quote_prewarm": {
+                "opening_source_prewarm": {
                     "ready": ready,
                     "run_id": run_id,
-                    # The transport is a fixture, but the ownership proof is
-                    # intentionally identical to the production bot process.
-                    "connection_scope": "process",
-                    "requested_count": 10,
-                    "primed_count": 10 if ready else 0,
-                    "resolved_count": 10 if ready else 0,
-                    "missing_count": 0,
-                    "snapshot_prefetched": False,
+                    "source": "twse_tpex:mis",
+                    "proof": "fixture_same_session_opening_source",
                 },
             },
         }
@@ -462,11 +468,10 @@ def _best_book_quote(session: date, observed_at: datetime) -> dict[str, Any]:
         "last": 999.0,
         "bid": 998.0,
         "ask": 1_000.0,
-        # Deliberately much smaller than one board lot.  The active deterministic
-        # paper-market convention must fill the complete submitted whole-lot
-        # quantity at the observed best price without claiming exchange depth.
-        "bid_volume": 0.001,
-        "ask_volume": 0.001,
+        # One displayed board lot proves that the live causal path respects the
+        # executable top-of-book quantity instead of fabricating liquidity.
+        "bid_volume": 1.0,
+        "ask_volume": 1.0,
         "minute_volume_lots": 0.0,
         "upper_limit": 1_095.0,
         "lower_limit": 900.0,
@@ -844,8 +849,8 @@ def run_two_phase_cold_test(
     )
 
     # Phase 2B: the first opening observation unlocks atomic signal publication.
-    # Merely publishing the pointers does not mutate the paper ledger; execution
-    # starts only at 09:01 using the observed official session open.
+    # Merely publishing the pointers does not mutate the paper ledger; live
+    # execution uses only a strictly later best Ask/Bid after 09:00.
     opening_at = _at(session_date, 9, 0, 0, 300_000)
     signal_at = _at(session_date, 9, 0, 0, 600_000)
     for spec in specs:
@@ -868,8 +873,8 @@ def run_two_phase_cold_test(
         evidence=pointer_results,
     )
 
-    book_at = _at(session_date, 9, 1, 0, 100_000)
-    commit_at = _at(session_date, 9, 1, 0, 200_000)
+    book_at = _at(session_date, 9, 0, 0, 700_000)
+    commit_at = _at(session_date, 9, 0, 0, 800_000)
     executable_book = {"2330": _best_book_quote(session_date, book_at)}
     registered_results: dict[str, str] = {}
     for spec in specs:
@@ -892,7 +897,7 @@ def run_two_phase_cold_test(
         mode = (engine.state.get("modes") or {}).get(spec.market) or {}
         positions = list((mode.get("positions") or {}).values())
         position = positions[0] if positions else {}
-        expected_price = 999.0
+        expected_price = 1_000.0 if position.get("side") == "long" else 998.0
         mode_evidence[spec.market] = {
             "result": registered_results.get(spec.market),
             "side": position.get("side"),
@@ -905,7 +910,7 @@ def run_two_phase_cold_test(
             "counterfactual_open_price_fill": position.get(
                 "counterfactual_open_price_fill"
             ),
-            "displayed_best_volume_shares": 1,
+            "displayed_best_volume_shares": 1_000,
             "entry_price_source": position.get("entry_price_source"),
             "synthetic_fill": position.get("entry_fill_is_synthetic"),
             "entry_completed_at": mode.get("entry_completed_at"),
@@ -919,14 +924,14 @@ def run_two_phase_cold_test(
     )
     _assert_check(
         checks,
-        "phase2_full_paper_quantity_at_0901_official_open",
+        "phase2_live_0900_uses_causally_later_best_quote",
         all(
             row["entry_price"] == row["expected_entry_price"]
             and int(row["filled_shares"] or 0) == 1_000
             and int(row["requested_shares"] or 0) == 1_000
             and int(row["entry_unfilled_shares"] or 0) == 0
             and row["paper_market_fill"] is False
-            and row["counterfactual_open_price_fill"] is True
+            and row["counterfactual_open_price_fill"] is False
             and row["synthetic_fill"] is False
             for row in mode_evidence.values()
         ),
@@ -936,15 +941,15 @@ def run_two_phase_cold_test(
     post_sync = load_service_sync(engine.state_dir) or {}
     post_event_receipt = dict(event_receipt)
     post_event_receipt["updated_at_taipei"] = _at(
-        session_date, 9, 1, 14
+        session_date, 9, 0, 14
     ).isoformat(timespec="milliseconds")
     post_discord = _discord_receipt(
         post_sync,
         specs,
-        updated_at=_at(session_date, 9, 1, 14),
+        updated_at=_at(session_date, 9, 0, 14),
     )
     post_open = evaluate_readiness(
-        observed=_at(session_date, 9, 1, 15),
+        observed=_at(session_date, 9, 0, 15),
         strict_after=strict_after,
         market_names=markets,
         public_receipt=public_receipt,
@@ -982,11 +987,80 @@ def run_two_phase_cold_test(
             "opening_observed_at": opening_at.isoformat(timespec="microseconds"),
             "signal_ready_at": signal_at.isoformat(timespec="microseconds"),
             "signal_pointer_results": pointer_results,
-            "official_open_observed_at": book_at.isoformat(timespec="microseconds"),
+            "causal_best_quote_observed_at": book_at.isoformat(timespec="microseconds"),
             "registered_results": registered_results,
             "modes": mode_evidence,
             "post_open_gate": post_open,
         },
+    )
+
+    # Phase 2C: replay is isolated from live state and remains fixed to the
+    # official-open-at-09:01 counterfactual contract.
+    replay_engine = TwDayTradeSimulationEngine(sandbox / "replay_engine")
+    replay_at = _at(session_date, 9, 1)
+    replay_results: dict[str, str] = {}
+    replay_evidence: dict[str, Any] = {}
+    for spec in specs:
+        replay_spec = replace(
+            spec,
+            entry_fill_policy=ENTRY_FILL_POLICY_OFFICIAL_OPEN_AT_0901,
+            entry_price_offset_ticks=0,
+        )
+        loaded = _latest_signal(spec, commit_at)
+        if loaded is None:
+            raise ColdTestFailure(f"published signal disappeared: {spec.market}")
+        source_summary, rows = loaded
+        replay_summary = {
+            **source_summary,
+            "signal_id": f"replay-{session_date.isoformat()}-{spec.market}",
+            "simulation_replay": True,
+            "replay_basis": "official_session_open_at_09_01_to_official_close",
+            "entry_fill_contract": (
+                "retrospective_official_session_open_at_09_01_counterfactual"
+            ),
+        }
+        replay_results[spec.market] = replay_engine.register_signal(
+            spec=replay_spec,
+            summary=replay_summary,
+            signal_rows=rows,
+            quotes={"2330": _opening_quote(session_date, replay_at)},
+            eligibility=_eligibility(session_date),
+            eligibility_coverage=eligibility_coverage[spec.market],
+            now=replay_at,
+            counterfactual_open_replay=True,
+        )
+        replay_mode = (replay_engine.state.get("modes") or {}).get(spec.market) or {}
+        replay_position = next(iter((replay_mode.get("positions") or {}).values()), {})
+        replay_evidence[spec.market] = {
+            "result": replay_results[spec.market],
+            "entry_price": replay_position.get("entry_price"),
+            "entry_at": replay_position.get("entry_at"),
+            "entry_fill_policy": replay_position.get("entry_fill_policy"),
+            "counterfactual_open_price_fill": replay_position.get(
+                "counterfactual_open_price_fill"
+            ),
+            "synthetic_fallback_fill": replay_position.get(
+                "synthetic_fallback_fill"
+            ),
+        }
+    _assert_check(
+        checks,
+        "phase2_historical_replay_only_uses_0901_official_open",
+        set(replay_results.values()) == {"registered"}
+        and all(
+            row["entry_price"] == 999.0
+            and row["entry_at"] == replay_at.isoformat(timespec="seconds")
+            and row["entry_fill_policy"]
+            == ENTRY_FILL_POLICY_OFFICIAL_OPEN_AT_0901
+            and row["counterfactual_open_price_fill"] is True
+            and row["synthetic_fallback_fill"] is False
+            for row in replay_evidence.values()
+        ),
+        evidence=replay_evidence,
+    )
+    _atomic_json(
+        run_dir / "phase2_historical_replay.json",
+        {"recorded_at": replay_at.isoformat(), "modes": replay_evidence},
     )
 
     # Phase 3: advance the production paper engine through the full session and
@@ -1268,7 +1342,8 @@ def run_two_phase_cold_test(
             "production_readiness_gate": True,
             "production_atomic_signal_pointer_consumer": True,
             "production_integer_paper_execution_engine": True,
-            "production_0901_official_open_fill_contract": True,
+            "production_0900_live_causal_best_quote_contract": True,
+            "historical_0901_official_open_replay_contract": True,
             "production_intraday_mark_and_exit_state_machine": True,
             "production_restart_recovery_and_idempotency": True,
             "external_publication_delivery": "deterministic_fixture",
@@ -1307,6 +1382,11 @@ def run_two_phase_cold_test(
                 "post_open_gate_ready": post_open.get("ready"),
                 "opening_execution": post_open.get("opening_execution"),
             },
+            "historical_replay": {
+                "recorded_at": replay_at.isoformat(timespec="seconds"),
+                "results": replay_results,
+                "modes": replay_evidence,
+            },
             "intraday_postclose": phase3,
         },
         "checks": checks,
@@ -1316,6 +1396,9 @@ def run_two_phase_cold_test(
             "phase1_model_shadow": str(run_dir / "phase1_model_shadow.json"),
             "phase2_before_opening": str(run_dir / "phase2_before_opening.json"),
             "phase2_after_signal": str(run_dir / "phase2_after_signal.json"),
+            "phase2_historical_replay": str(
+                run_dir / "phase2_historical_replay.json"
+            ),
             "phase3_intraday_postclose": str(
                 run_dir / "phase3_intraday_postclose.json"
             ),
@@ -1347,8 +1430,15 @@ def run_two_phase_cold_test(
 
 def main() -> None:
     args = parse_args()
+    session_date = args.session_date
+    if session_date is None:
+        session_date = (
+            _default_future_session_date()
+            if args.real_model_inference
+            else _default_session_date()
+        )
     report = run_two_phase_cold_test(
-        session_date=args.session_date or _default_session_date(),
+        session_date=session_date,
         output_root=args.output_root,
         run_id=args.run_id,
         real_model_inference=bool(args.real_model_inference),

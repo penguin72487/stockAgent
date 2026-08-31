@@ -105,6 +105,13 @@ def test_cold_boot_probe_requires_new_boot_and_all_public_surfaces() -> None:
     assert "systemctl --failed" in probe
     assert "systemctl is-system-running" in probe
     assert "Stop-Process -Id $_.ProcessId" in probe
+    assert "Get-Command caddy.exe" in probe
+    assert "function Stop-CaddyViaAdmin" in probe
+    assert "& $caddy stop --address 127.0.0.1:2019" in probe
+    assert '$ErrorActionPreference = "SilentlyContinue"' in probe
+    assert "Get-NetTCPConnection -State Listen" in probe
+    assert "$_.LocalPort -in 80, 443" in probe
+    assert "[int]$_.ProcessId -in $listenerPids" in probe
     assert "ForEach-Object { $_.Trim() }" in probe
     assert "--list --running --quiet" in probe
     assert "wsl_stopped_observed" in probe

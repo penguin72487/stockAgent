@@ -30,6 +30,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from scripts.run_tw_public_0830_check import (  # noqa: E402
     _derived_data_commands,
+    _derived_data_status,
     _receipt_dependency_errors,
 )
 from scripts.watch_tw_public_publication_group import (  # noqa: E402
@@ -162,22 +163,30 @@ def _max_date(path: Path) -> str | None:
     return value.isoformat() if value is not None else None
 
 
-def _derived_state(live_root: Path, *, expected_date: str) -> dict[str, Any]:
-    paths = {
-        "twse_close": live_root / "twse_daily_ohlcv.parquet",
-        "tpex_close": live_root / "tpex_daily_ohlcv.parquet",
-        "stock_panel": live_root / "stocks" / "2330_features.parquet",
-        "public_features": (
-            live_root / "features" / "tw_public_stock_daily.parquet"
-        ),
+def _derived_state(
+    live_root: Path,
+    *,
+    expected_date: str,
+    session_date: str | None = None,
+) -> dict[str, Any]:
+    close_dates = {
+        "twse_close": _max_date(live_root / "twse_daily_ohlcv.parquet"),
+        "tpex_close": _max_date(live_root / "tpex_daily_ohlcv.parquet"),
     }
-    dates = {name: _max_date(path) for name, path in paths.items()}
     errors: list[str] = [
         f"{name}: effective date {value!r} != {expected_date}"
-        for name, value in dates.items()
+        for name, value in close_dates.items()
         if value != expected_date
     ]
-    if dates["stock_panel"] == expected_date:
+    derived = _derived_data_status(
+        live_root,
+        expected_latest=expected_date,
+        session_date=session_date or datetime.now(TAIPEI).date().isoformat(),
+    )
+    for name, rows in (derived.get("errors") or {}).items():
+        errors.extend(f"{name}: {row}" for row in rows)
+    dates = {**close_dates, **dict(derived.get("dates") or {})}
+    if dates.get("stock_panel") == expected_date:
         errors.extend(
             _receipt_dependency_errors(
                 live_root / "stocks" / "official_symbol_build_summary.json",
@@ -192,7 +201,7 @@ def _derived_state(live_root: Path, *, expected_date: str) -> dict[str, Any]:
                 ),
             )
         )
-    if dates["public_features"] == expected_date:
+    if dates.get("public_features") == expected_date:
         errors.extend(
             _receipt_dependency_errors(
                 live_root
@@ -202,21 +211,22 @@ def _derived_state(live_root: Path, *, expected_date: str) -> dict[str, Any]:
                 keys=("source_receipts",),
             )
         )
-    return {"dates": dates, "errors": errors, "current": not errors}
+    return {
+        "dates": dates,
+        "derived_errors": dict(derived.get("errors") or {}),
+        "errors": errors,
+        "current": not errors,
+    }
 
 
 def _build_commands(
     *, live_root: Path, expected_date: str, workers: int
 ) -> list[list[str]]:
-    commands = _derived_data_commands(
+    return _derived_data_commands(
         live_root=live_root,
         expected_latest=expected_date,
         workers=workers,
     )
-    # Closing inference needs the two canonical dated layers.  Corporate-action
-    # downloads remain independently monitored sources; the builders validate
-    # their existing coverage receipts and exact bytes.
-    return [commands[1], commands[3]]
 
 
 def main() -> int:
@@ -259,10 +269,25 @@ def main() -> int:
     with lock_path.open("a+", encoding="utf-8") as lock_handle:
         fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
         lock_wait_ms = (time.perf_counter() - lock_started) * 1000.0
-        before = _derived_state(live_root, expected_date=expected_date)
+        before = _derived_state(
+            live_root,
+            expected_date=expected_date,
+            session_date=started.date().isoformat(),
+        )
         if args.force or not before["current"]:
-            for name, command in zip(
-                ("build_official_symbol_panel", "build_public_feature_panel"),
+            for name, status_label, command in zip(
+                (
+                    "refresh_corporate_action_reference",
+                    "build_official_symbol_panel",
+                    "refresh_corporate_action_entitlements",
+                    "build_public_feature_panel",
+                ),
+                (
+                    "corporate_action_reference",
+                    "stock_panel",
+                    "corporate_action_entitlements",
+                    "public_features",
+                ),
                 _build_commands(
                     live_root=live_root,
                     expected_date=expected_date,
@@ -270,6 +295,14 @@ def main() -> int:
                 ),
                 strict=True,
             ):
+                current = _derived_state(
+                    live_root,
+                    expected_date=expected_date,
+                    session_date=started.date().isoformat(),
+                )
+                current_errors = current.get("derived_errors") or {}
+                if not args.force and not current_errors.get(status_label):
+                    continue
                 step_started = time.perf_counter()
                 completed = subprocess.run(command, cwd=REPO_ROOT, check=False)
                 steps.append(
@@ -283,7 +316,11 @@ def main() -> int:
                 )
                 if completed.returncode != 0:
                     break
-        after = _derived_state(live_root, expected_date=expected_date)
+        after = _derived_state(
+            live_root,
+            expected_date=expected_date,
+            session_date=started.date().isoformat(),
+        )
 
     status = "ok" if after["current"] and all(
         int(row["return_code"]) == 0 for row in steps

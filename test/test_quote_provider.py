@@ -14,9 +14,24 @@ from stockagent.live.quote_provider import (
     PriceSnapshot,
     fetch_tw_mis_last_prices,
     fetch_tw_mis_opening_snapshot,
+    load_symbol_yahoo_map,
     fetch_yahoo_last_prices,
     load_prices_csv,
 )
+
+
+def test_symbol_yahoo_map_derives_suffix_from_official_venue(tmp_path) -> None:
+    (tmp_path / "symbols.csv").write_text(
+        "code,name,market,security_type,source\n"
+        "2330,台積電,twse,stock,official\n"
+        "6547,高端疫苗,tpex,stock,official\n",
+        encoding="utf-8",
+    )
+
+    assert load_symbol_yahoo_map(tmp_path) == {
+        "2330": "2330.TW",
+        "6547": "6547.TWO",
+    }
 
 
 class _FakeResponse:
@@ -350,6 +365,58 @@ def test_tw_opening_snapshot_does_not_cache_all_empty_preopen_observation(
         assert result.available_count == 0
 
     assert call_count == 2
+
+
+def test_tw_opening_snapshot_retries_only_symbols_whose_open_is_still_missing(
+    monkeypatch, tmp_path
+) -> None:
+    calls: list[list[str]] = []
+    now_ms = int(time.time() * 1000)
+
+    def fake_fetch(symbols, fallback_prices, **kwargs):
+        calls.append(list(symbols))
+        assert kwargs["request_timeout_seconds"] == 1.5
+        size = len(symbols)
+        opens = np.full((size,), np.nan, dtype=np.float64)
+        timestamps = np.zeros((size,), dtype=np.int64)
+        for idx, symbol in enumerate(symbols):
+            if symbol == "2330" or len(calls) > 1:
+                opens[idx] = float(fallback_prices[idx]) + 1.0
+                timestamps[idx] = now_ms
+        return PriceSnapshot(
+            prices=np.asarray(fallback_prices, dtype=np.float64) + 1.0,
+            source="twse_tpex:mis",
+            available_count=size,
+            requested_count=size,
+            available_mask=np.ones((size,), dtype=bool),
+            open_prices=opens,
+            timestamps_ms=timestamps,
+        )
+
+    monkeypatch.setattr(quote_provider, "fetch_tw_mis_last_prices", fake_fetch)
+    monkeypatch.setenv(
+        "STOCKAGENT_TW_OPENING_SNAPSHOT_ROOT", str(tmp_path / "receipts")
+    )
+    monkeypatch.setattr(quote_provider, "_TW_MIS_OPENING_CACHE_KEY", None)
+    quote_provider._TW_MIS_OPENING_CACHE.clear()
+
+    first = fetch_tw_mis_opening_snapshot(
+        ["2330", "2317"],
+        np.array([100.0, 200.0]),
+        parquet_root=tmp_path,
+        cache_ttl_seconds=21600,
+    )
+    second = fetch_tw_mis_opening_snapshot(
+        ["2330", "2317"],
+        np.array([100.0, 200.0]),
+        parquet_root=tmp_path,
+        cache_ttl_seconds=21600,
+    )
+
+    assert calls == [["2330", "2317"], ["2317"]]
+    assert np.isfinite(first.open_prices[0])
+    assert np.isnan(first.open_prices[1])
+    np.testing.assert_allclose(second.open_prices, [101.0, 201.0])
 
 
 def test_load_prices_csv_preserves_explicit_open_snapshot(tmp_path) -> None:

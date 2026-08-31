@@ -1,11 +1,11 @@
 """Durable multi-mode Taiwan stock day-trade paper execution.
 
-The signal producer and this executor deliberately remain separate.  A signal
-artifact is an immutable model decision; this module waits until 09:01, values
-the paper entry at the observed official session open, converts target weights
-to board lots, and owns the only paper order/fill/position ledger used by the
-dashboard.  The 09:01/open-price fill is explicitly counterfactual and never
-presented as an exchange fill.
+The signal producer and this executor deliberately remain separate.  A live
+signal artifact is an immutable model decision; once it is published at or
+after 09:00, this module waits for a strictly later executable best Ask/Bid,
+converts target weights to board lots, and owns the only paper order/fill/
+position ledger used by the dashboard.  Historical backfills remain a distinct
+counterfactual contract recorded at 09:01 with the official session open.
 
 This module never calls a broker order API.  ``simulation_only`` and
 ``production_order_possible`` are persisted in every status snapshot so a
@@ -58,6 +58,10 @@ from stockagent.research.taifex_transaction_tax import (
 TAIPEI: Final[ZoneInfo] = ZoneInfo("Asia/Taipei")
 SIMULATION_SCHEMA_VERSION: Final[int] = 4
 TX_CONTINUOUS_ROLL_CONTRACT_VERSION: Final[int] = 2
+# The live path starts at the exchange open and must consume only a quote that
+# is strictly later than the immutable signal publication.  ENTRY_GATE remains
+# the historical-replay boundary for compatibility with existing replay tools.
+LIVE_ENTRY_GATE: Final[time] = time(9, 0)
 ENTRY_GATE: Final[time] = time(9, 1)
 FIRST_MINUTE_EXECUTION_TIME: Final[time] = time(9, 1)
 EXIT_LIMIT_TIME: Final[time] = time(13, 20)
@@ -375,8 +379,7 @@ def _prepare_entry_plan(
         spec.entry_fill_policy == ENTRY_FILL_POLICY_SYNTHETIC_OPEN_TICK
     )
     market_at_best_else_tick = (
-        spec.entry_fill_policy
-        == ENTRY_FILL_POLICY_MARKET_AT_BEST_ELSE_OPEN_TICK
+        spec.entry_fill_policy == ENTRY_FILL_POLICY_MARKET_AT_BEST_ELSE_OPEN_TICK
     )
     official_open_at_0901 = (
         spec.entry_fill_policy == ENTRY_FILL_POLICY_OFFICIAL_OPEN_AT_0901
@@ -569,9 +572,7 @@ def _prepare_entry_plan(
         "synthetic_fill": synthetic_entry_fill and filled_shares > 0,
         "synthetic_fallback_fill": synthetic_fallback_fill and filled_shares > 0,
         "paper_market_fill": market_at_best_else_tick and filled_shares > 0,
-        "counterfactual_open_price_fill": (
-            official_open_at_0901 and filled_shares > 0
-        ),
+        "counterfactual_open_price_fill": (official_open_at_0901 and filled_shares > 0),
     }
 
 
@@ -980,7 +981,9 @@ class TwDayTradeSimulationEngine:
                 if not session_date:
                     recorded_at = _parse_timestamp(event.get("recorded_at"))
                     session_date = (
-                        recorded_at.date().isoformat() if recorded_at is not None else ""
+                        recorded_at.date().isoformat()
+                        if recorded_at is not None
+                        else ""
                     )
                 if event_name == "signal_commit_started":
                     latest_started[market] = (signal_id, session_date)
@@ -1042,9 +1045,7 @@ class TwDayTradeSimulationEngine:
             updates = {
                 "label": label,
                 "return_type": "total_return",
-                "total_return_contract": (
-                    "official_ex_date_reference_reinvestment_v1"
-                ),
+                "total_return_contract": ("official_ex_date_reference_reinvestment_v1"),
             }
             for key, value in updates.items():
                 if row.get(key) != value:
@@ -1768,15 +1769,11 @@ class TwDayTradeSimulationEngine:
                 "current_session_reference_price": _finite(
                     quote.get("reference_price")
                 ),
-                "current_session_reference_source": quote.get(
-                    "reference_price_source"
-                )
+                "current_session_reference_source": quote.get("reference_price_source")
                 or quote.get("source"),
                 "previous_official_close": _finite(quote.get("previous_close")),
                 "previous_official_close_date": quote.get("previous_close_date"),
-                "previous_official_close_source": quote.get(
-                    "previous_close_source"
-                ),
+                "previous_official_close_source": quote.get("previous_close_source"),
             }
         )
         if entry is not None and bid is not None and adjustment_factor is not None:
@@ -2165,13 +2162,10 @@ class TwDayTradeSimulationEngine:
         mode["entry_fill_is_synthetic"] = (
             spec.entry_fill_policy == ENTRY_FILL_POLICY_SYNTHETIC_OPEN_TICK
         )
-        mode["paper_fill_deterministic"] = (
-            spec.entry_fill_policy
-            in {
-                ENTRY_FILL_POLICY_MARKET_AT_BEST_ELSE_OPEN_TICK,
-                ENTRY_FILL_POLICY_OFFICIAL_OPEN_AT_0901,
-            }
-        )
+        mode["paper_fill_deterministic"] = spec.entry_fill_policy in {
+            ENTRY_FILL_POLICY_MARKET_AT_BEST_ELSE_OPEN_TICK,
+            ENTRY_FILL_POLICY_OFFICIAL_OPEN_AT_0901,
+        }
         mode["fill_guaranteed"] = bool(
             mode["entry_fill_is_synthetic"] or mode["paper_fill_deterministic"]
         )
@@ -2243,8 +2237,8 @@ class TwDayTradeSimulationEngine:
                     mode["engine_status"] = "flat_no_executable_signal"
             elif observed.weekday() >= 5:
                 mode["engine_status"] = "waiting_trading_day"
-            elif observed.timetz().replace(tzinfo=None) < ENTRY_GATE:
-                mode["engine_status"] = "waiting_09_01_execution"
+            elif observed.timetz().replace(tzinfo=None) < LIVE_ENTRY_GATE:
+                mode["engine_status"] = "waiting_09_00_signal"
             elif observed.timetz().replace(tzinfo=None) >= SESSION_CLOSE:
                 mode["engine_status"] = "session_complete"
             else:
@@ -2269,7 +2263,7 @@ class TwDayTradeSimulationEngine:
 
         observed = _now_taipei(now)
         wall_time = observed.timetz().replace(tzinfo=None)
-        if wall_time < ENTRY_GATE or wall_time >= EXIT_LIMIT_TIME:
+        if wall_time < LIVE_ENTRY_GATE or wall_time >= EXIT_LIMIT_TIME:
             raise RuntimeError("flat-session rearm is outside the entry window")
         normalized_reason = str(reason or "").strip()
         if not normalized_reason:
@@ -2461,6 +2455,10 @@ class TwDayTradeSimulationEngine:
         executor_quote_fetch_ms: float,
         eligibility_load_ms: float,
         ledger_compute_persist_ms: float,
+        opening_signal_batch_wait_ms: float = 0.0,
+        opening_signal_batch_mode_count: int = 1,
+        opening_signal_batch_expected_mode_count: int = 1,
+        opening_signal_batch_complete: bool = True,
     ) -> None:
         """Persist one measured input-to-ledger sample for the public panel."""
 
@@ -2528,6 +2526,9 @@ class TwDayTradeSimulationEngine:
             "signal_other_compute_ms": signal_other_ms,
             "artifact_publish_ms": _finite(live_latency.get("artifact_publish_ms")),
             "artifact_discovery_ms": elapsed_ms(published_at, consumer_detected_at),
+            "opening_signal_batch_wait_ms": round(
+                max(0.0, opening_signal_batch_wait_ms), 3
+            ),
             "eligibility_load_ms": round(max(0.0, eligibility_load_ms), 3),
             "executor_quote_fetch_ms": round(max(0.0, executor_quote_fetch_ms), 3),
             "ledger_compute_persist_ms": round(max(0.0, ledger_compute_persist_ms), 3),
@@ -2577,6 +2578,17 @@ class TwDayTradeSimulationEngine:
                     and opening_gate_to_ledger_ms <= opening_commit_slo_ms
                 ),
                 "signal_compute_total_ms": signal_total_ms,
+                "opening_signal_batch": {
+                    "observed_mode_count": max(0, int(opening_signal_batch_mode_count)),
+                    "expected_mode_count": max(
+                        0, int(opening_signal_batch_expected_mode_count)
+                    ),
+                    "complete": bool(opening_signal_batch_complete),
+                    "single_causal_quote_request": bool(
+                        opening_signal_batch_complete
+                        and int(opening_signal_batch_mode_count) > 1
+                    ),
+                },
                 "stages": stages,
                 "bottleneck_stage": bottleneck,
                 "bottleneck_ms": finite_stages.get(bottleneck) if bottleneck else None,
@@ -2670,8 +2682,7 @@ class TwDayTradeSimulationEngine:
                 if spec.entry_fill_policy == ENTRY_FILL_POLICY_SYNTHETIC_OPEN_TICK
                 else (
                     "retrospective_official_session_open_at_09_01_counterfactual"
-                    if spec.entry_fill_policy
-                    == ENTRY_FILL_POLICY_OFFICIAL_OPEN_AT_0901
+                    if spec.entry_fill_policy == ENTRY_FILL_POLICY_OFFICIAL_OPEN_AT_0901
                     else "retrospective_historical_best_quote_else_adverse_open_tick_counterfactual"
                     if spec.entry_fill_policy
                     == ENTRY_FILL_POLICY_CAUSAL_BOOK_ELSE_OPEN_TICK
@@ -2705,7 +2716,13 @@ class TwDayTradeSimulationEngine:
                 return self._block_signal(
                     mode, signal_id, "invalid_signal_ready_timestamp", observed
                 )
-        if wall_time < ENTRY_GATE or wall_time >= EXIT_LIMIT_TIME:
+        entry_gate = (
+            ENTRY_GATE
+            if counterfactual_open_replay
+            or spec.entry_fill_policy == ENTRY_FILL_POLICY_OFFICIAL_OPEN_AT_0901
+            else LIVE_ENTRY_GATE
+        )
+        if wall_time < entry_gate or wall_time >= EXIT_LIMIT_TIME:
             return self._block_signal(mode, signal_id, "outside_entry_window", observed)
         if not bool(summary.get("live_session_open_feature_applied")):
             return self._block_signal(
@@ -2777,8 +2794,7 @@ class TwDayTradeSimulationEngine:
             spec.entry_fill_policy == ENTRY_FILL_POLICY_SYNTHETIC_OPEN_TICK
         )
         deterministic_paper_market_fill = (
-            spec.entry_fill_policy
-            == ENTRY_FILL_POLICY_MARKET_AT_BEST_ELSE_OPEN_TICK
+            spec.entry_fill_policy == ENTRY_FILL_POLICY_MARKET_AT_BEST_ELSE_OPEN_TICK
         )
         deterministic_official_open_fill = (
             spec.entry_fill_policy == ENTRY_FILL_POLICY_OFFICIAL_OPEN_AT_0901
@@ -2886,9 +2902,7 @@ class TwDayTradeSimulationEngine:
         mode["entry_fill_policy"] = spec.entry_fill_policy
         mode["entry_price_offset_ticks"] = int(spec.entry_price_offset_ticks)
         mode["entry_fill_is_synthetic"] = bool(synthetic_open_fill)
-        mode["counterfactual_open_price_fill"] = bool(
-            deterministic_official_open_fill
-        )
+        mode["counterfactual_open_price_fill"] = bool(deterministic_official_open_fill)
         mode["entry_fill_has_synthetic_fallback"] = False
         mode.pop("execution_projection", None)
         mode["positions"] = {}
@@ -3091,8 +3105,7 @@ class TwDayTradeSimulationEngine:
                     else "full_daily_limits"
                 ),
                 "fill_guaranteed": bool(
-                    plan["synthetic_fill"]
-                    or plan["counterfactual_open_price_fill"]
+                    plan["synthetic_fill"] or plan["counterfactual_open_price_fill"]
                 ),
                 "take_profit_order_status": "working",
                 "stop_order_status": "armed_local_trigger",
@@ -3273,9 +3286,7 @@ class TwDayTradeSimulationEngine:
         )
         mode["entry_fill_is_synthetic"] = bool(entry_synthetic_fill_count)
         mode["paper_fill_deterministic"] = bool(deterministic_paper_market_fill)
-        mode["counterfactual_open_price_fill"] = bool(
-            deterministic_official_open_fill
-        )
+        mode["counterfactual_open_price_fill"] = bool(deterministic_official_open_fill)
         mode["exchange_fill_guaranteed"] = False
 
         # One signal is one logical append transaction per ledger.  The compact
@@ -4491,6 +4502,7 @@ __all__ = [
     "ENTRY_FILL_POLICY_OFFICIAL_OPEN_AT_0901",
     "ENTRY_FILL_POLICY_SYNTHETIC_OPEN_TICK",
     "ENTRY_GATE",
+    "LIVE_ENTRY_GATE",
     "EXIT_LIMIT_TIME",
     "FIRST_MINUTE_EXECUTION_TIME",
     "FORCE_EXIT_TIME",

@@ -1081,10 +1081,20 @@ def _price_snapshot(
             ),
         )
     if source_norm in {"tw", "twse", "tpex", "mis", "tw_mis"}:
+        indices = np.arange(len(symbols), dtype=np.int64)
+        if require_official_tw_session_open and request_mask is not None:
+            normalized_mask = np.asarray(request_mask, dtype=bool)
+            if normalized_mask.shape != (len(symbols),):
+                raise ValueError("TW opening request_mask must have shape [symbols]")
+            indices = np.flatnonzero(normalized_mask)
+        if indices.size <= 0:
+            raise RuntimeError("TW opening active-universe request is empty")
+        requested_symbols = [symbols[int(idx)] for idx in indices]
+        requested_fallback = np.asarray(fallback_prices, dtype=np.float64)[indices]
         snapshot = (
             fetch_tw_mis_opening_snapshot(
-                symbols,
-                fallback_prices,
+                requested_symbols,
+                requested_fallback,
                 parquet_root=parquet_root,
                 chunk_size=yahoo_chunk_size,
                 cache_ttl_seconds=max(
@@ -1114,8 +1124,8 @@ def _price_snapshot(
             )
             if require_official_tw_session_open
             else fetch_tw_mis_last_prices(
-                symbols,
-                fallback_prices,
+                requested_symbols,
+                requested_fallback,
                 parquet_root=parquet_root,
                 chunk_size=yahoo_chunk_size,
             )
@@ -1128,6 +1138,48 @@ def _price_snapshot(
                 source="panel_close:fallback_tw_mis_unavailable",
                 available_count=0,
                 available_mask=np.zeros((len(symbols),), dtype=bool),
+            )
+        if indices.size != len(symbols):
+            size = len(symbols)
+
+            def expanded(values: np.ndarray | None, *, integer: bool = False):
+                if values is None:
+                    return None
+                fill = 0 if integer else np.nan
+                dtype = np.int64 if integer else np.float64
+                output = np.full((size,), fill, dtype=dtype)
+                output[indices] = np.asarray(values, dtype=dtype)
+                return output
+
+            prices = np.asarray(fallback_prices, dtype=np.float64).copy()
+            prices[indices] = np.asarray(snapshot.prices, dtype=np.float64)
+            available_mask = np.zeros((size,), dtype=bool)
+            if snapshot.available_mask is not None:
+                available_mask[indices] = np.asarray(
+                    snapshot.available_mask, dtype=bool
+                )
+            snapshot = PriceSnapshot(
+                prices=prices,
+                source=f"{snapshot.source}+active_universe_subset",
+                timestamp=snapshot.timestamp,
+                available_count=int(snapshot.available_count),
+                requested_count=int(indices.size),
+                available_mask=available_mask,
+                open_prices=expanded(snapshot.open_prices),
+                high_prices=expanded(snapshot.high_prices),
+                low_prices=expanded(snapshot.low_prices),
+                volumes=expanded(snapshot.volumes),
+                upper_limit_prices=expanded(snapshot.upper_limit_prices),
+                lower_limit_prices=expanded(snapshot.lower_limit_prices),
+                bid_prices=expanded(snapshot.bid_prices),
+                ask_prices=expanded(snapshot.ask_prices),
+                bid_volumes=expanded(snapshot.bid_volumes),
+                ask_volumes=expanded(snapshot.ask_volumes),
+                reference_prices=expanded(snapshot.reference_prices),
+                timestamps_ms=expanded(snapshot.timestamps_ms, integer=True),
+                exchange_timestamps_ms=expanded(
+                    snapshot.exchange_timestamps_ms, integer=True
+                ),
             )
         return snapshot
     raise ValueError(
@@ -2229,6 +2281,10 @@ def generate_live_signal(
     day_trade_feature_cutoff: str | None = None
     day_trade_live_session = False
     day_trade_observed_open = np.zeros((panel.num_symbols,), dtype=bool)
+    day_trade_active_symbol_count = 0
+    day_trade_active_open_count = 0
+    day_trade_required_open_count = 0
+    day_trade_open_coverage: float | None = None
     if execution_mode == "tw_day_trade":
         base_model_window = _cached_normalized_model_window(
             panel,
@@ -2250,12 +2306,45 @@ def generate_live_signal(
             source_timezone=source_timezone,
             base_model_window=base_model_window,
         )
-        if not str(price_snapshot.source).startswith("panel") and (
-            not day_trade_live_session or not bool(np.any(day_trade_observed_open))
-        ):
-            raise RuntimeError(
-                "same-session TW opening prices are not observable yet; retry immediately"
+        if not str(price_snapshot.source).startswith("panel"):
+            active_mask = np.asarray(panel.alive_mask[panel_idx], dtype=bool)
+            day_trade_active_symbol_count = int(np.count_nonzero(active_mask))
+            day_trade_active_open_count = int(
+                np.count_nonzero(active_mask & day_trade_observed_open)
             )
+            minimum_coverage = min(
+                1.0,
+                max(
+                    0.0,
+                    float(
+                        os.getenv(
+                            "STOCKAGENT_TW_OPENING_MIN_COVERAGE",
+                            "0.95",
+                        )
+                        or "0.95"
+                    ),
+                ),
+            )
+            day_trade_required_open_count = max(
+                1,
+                int(np.ceil(day_trade_active_symbol_count * minimum_coverage)),
+            )
+            day_trade_open_coverage = (
+                day_trade_active_open_count / day_trade_active_symbol_count
+                if day_trade_active_symbol_count > 0
+                else 0.0
+            )
+            if (
+                not day_trade_live_session
+                or day_trade_active_open_count < day_trade_required_open_count
+            ):
+                raise RuntimeError(
+                    "same-session TW opening coverage is not ready; retry immediately: "
+                    f"observed={day_trade_active_open_count} "
+                    f"required={day_trade_required_open_count} "
+                    f"active={day_trade_active_symbol_count} "
+                    f"coverage={day_trade_open_coverage:.4f}"
+                )
         if day_trade_live_session:
             panel_date_str = day_trade_decision_time[:10]
             panel_display_date = day_trade_decision_time
@@ -2874,6 +2963,10 @@ def generate_live_signal(
             price_snapshot.requested_count or panel.num_symbols
         ),
         "opening_price_available_count": opening_price_available_count,
+        "opening_price_active_count": day_trade_active_open_count,
+        "opening_price_required_count": day_trade_required_open_count,
+        "opening_price_active_symbol_count": day_trade_active_symbol_count,
+        "opening_price_active_coverage": day_trade_open_coverage,
         "live_latency": {
             "schema_version": 2,
             "panel_cache_hit": bool(panel_cache_hit),

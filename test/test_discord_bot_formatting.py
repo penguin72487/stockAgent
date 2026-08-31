@@ -500,14 +500,17 @@ def test_preopen_prepare_key_catches_up_missing_day_trade_readiness(
         "services.discord_bot.bot._preopen_market_final_armed_for_session",
         lambda cfg, session_date: False,
     )
-    assert _preopen_prepare_key(configured, now.replace(minute=55)) == (
+    assert _preopen_prepare_key(configured, now.replace(minute=44)) == (
+        "2026-07-06:tw_day_trade:preopen"
+    )
+    assert _preopen_prepare_key(configured, now.replace(minute=45)) == (
         "2026-07-06:tw_day_trade:preopen-final-arm"
     )
     monkeypatch.setattr(
         "services.discord_bot.bot._preopen_market_final_armed_for_session",
         lambda cfg, session_date: True,
     )
-    assert _preopen_prepare_key(configured, now.replace(minute=55)) == (
+    assert _preopen_prepare_key(configured, now.replace(minute=45)) == (
         "2026-07-06:tw_day_trade:preopen"
     )
     monkeypatch.setattr(
@@ -590,14 +593,10 @@ def test_preopen_readiness_preserves_same_day_ready_rows_across_restart(
                 "checkpoint_cache_hit": True,
                 "model_cache_hit": True,
             },
-            "quote_prewarm": {
+            "opening_source_prewarm": {
                 "ready": True,
                 "run_id": _BOT_RUN_ID,
-                "connection_scope": "process",
-                "requested_count": 2303,
-                "primed_count": 2303,
-                "resolved_count": 2303,
-                "missing_count": 0,
+                "source": "twse_tpex:mis",
             },
         },
     )
@@ -2135,7 +2134,7 @@ def test_auto_signal_price_source_uses_shioaji_for_open_taiwan_market() -> None:
     assert _auto_signal_price_source(cfg, status, None) == "shioaji"
 
 
-def test_auto_day_trade_signal_uses_reserved_shioaji_when_mis_is_down() -> None:
+def test_auto_day_trade_signal_uses_shared_mis_opening_snapshot() -> None:
     status = SimpleNamespace(market_open=True)
     cfg = SimpleNamespace(
         market_type="tw",
@@ -2143,7 +2142,7 @@ def test_auto_day_trade_signal_uses_reserved_shioaji_when_mis_is_down() -> None:
         day_trade_simulation_enabled=True,
     )
 
-    assert _auto_signal_price_source(cfg, status, "auto") == "shioaji"
+    assert _auto_signal_price_source(cfg, status, "auto") == "tw"
 
 
 def test_auto_signal_price_source_uses_yahoo_for_other_open_stock_markets() -> None:
