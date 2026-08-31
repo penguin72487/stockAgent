@@ -258,6 +258,10 @@ def test_dashboard_reports_measured_input_to_ledger_latency(tmp_path: Path) -> N
             executor_quote_fetch_ms=50.0,
             eligibility_load_ms=10.0,
             ledger_compute_persist_ms=15.0,
+            opening_signal_batch_wait_ms=40.0,
+            opening_signal_batch_mode_count=3,
+            opening_signal_batch_expected_mode_count=3,
+            opening_signal_batch_complete=True,
         )
 
     payload = build_dashboard_snapshot(
@@ -272,6 +276,18 @@ def test_dashboard_reports_measured_input_to_ledger_latency(tmp_path: Path) -> N
     assert latency["max_ms"] == pytest.approx(300.0)
     assert latency["latest_bottleneck_stage"] == "executor_quote_fetch_ms"
     assert latency["not_external_order_or_venue_rtt"] is True
+    latest_receipt = json.loads(
+        (engine.state_dir / "latency.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()[-1]
+    )
+    assert latest_receipt["opening_signal_batch"] == {
+        "observed_mode_count": 3,
+        "expected_mode_count": 3,
+        "complete": True,
+        "single_causal_quote_request": True,
+    }
+    assert latest_receipt["stages"]["opening_signal_batch_wait_ms"] == 40.0
 
 
 def test_runner_reads_atomic_latest_signal_pointer(tmp_path: Path) -> None:
@@ -310,6 +326,140 @@ def test_runner_reads_atomic_latest_signal_pointer(tmp_path: Path) -> None:
     assert summary["signal_id"] == "signal-fast"
     assert rows[0]["symbol"] == "2330"
     assert _LATEST_SIGNAL_CACHE
+
+
+def test_opening_signal_batch_waits_for_all_modes_then_returns_once(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from scripts import run_tw_day_trade_simulation as runner
+
+    base = _spec(tmp_path)
+    specs = [
+        replace(
+            base,
+            market=f"mode-{index}",
+            live_output_dir=tmp_path / f"signals-{index}",
+        )
+        for index in range(3)
+    ]
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+    engine.state["modes"] = {
+        spec.market: {"market": spec.market, "processed_signal_ids": []}
+        for spec in specs
+    }
+    available_at = {"mode-0": 0.0, "mode-1": 0.25, "mode-2": 0.5}
+
+    class ClockWatcher:
+        def __init__(self) -> None:
+            self.elapsed = 0.0
+            self.wait_calls = 0
+
+        def monotonic(self) -> float:
+            return self.elapsed
+
+        def now(self) -> datetime:
+            return _now(9, 0) + runner.timedelta(seconds=self.elapsed)
+
+        def wait(self, seconds: float) -> bool:
+            self.elapsed += seconds
+            self.wait_calls += 1
+            return True
+
+    clock = ClockWatcher()
+
+    def fake_latest(spec: ModeSpec, _observed: datetime):
+        if clock.elapsed + 1e-9 < available_at[spec.market]:
+            return None
+        return ({"signal_id": f"signal-{spec.market}"}, [{"symbol": "2330"}])
+
+    monkeypatch.setattr(runner, "_latest_signal", fake_latest)
+
+    found, metadata = runner._collect_opening_signal_batch(
+        specs,
+        engine,
+        _now(9, 0),
+        signal_watcher=clock,
+        max_wait_seconds=2.0,
+        cutoff_seconds=12.0,
+        poll_seconds=0.25,
+        now_fn=clock.now,
+        monotonic_fn=clock.monotonic,
+    )
+
+    assert set(found) == {spec.market for spec in specs}
+    assert metadata["complete"] is True
+    assert metadata["timed_out"] is False
+    assert metadata["observed_mode_count"] == 3
+    assert metadata["expected_mode_count"] == 3
+    assert metadata["wait_ms"] == pytest.approx(500.0)
+    assert metadata["wait_by_market_ms"]["mode-0"] == pytest.approx(500.0)
+    assert metadata["wait_by_market_ms"]["mode-2"] == pytest.approx(0.0)
+    assert clock.wait_calls == 2
+
+
+def test_opening_signal_batch_times_out_without_blocking_ready_mode(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from scripts import run_tw_day_trade_simulation as runner
+
+    base = _spec(tmp_path)
+    specs = [
+        replace(
+            base,
+            market=f"mode-{index}",
+            live_output_dir=tmp_path / f"signals-{index}",
+        )
+        for index in range(2)
+    ]
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+    engine.state["modes"] = {
+        spec.market: {"market": spec.market, "processed_signal_ids": []}
+        for spec in specs
+    }
+
+    class ClockWatcher:
+        def __init__(self) -> None:
+            self.elapsed = 0.0
+
+        def monotonic(self) -> float:
+            return self.elapsed
+
+        def now(self) -> datetime:
+            return _now(9, 0) + runner.timedelta(seconds=self.elapsed)
+
+        def wait(self, seconds: float) -> bool:
+            self.elapsed += seconds
+            return False
+
+    clock = ClockWatcher()
+    monkeypatch.setattr(
+        runner,
+        "_latest_signal",
+        lambda spec, _observed: (
+            ({"signal_id": "signal-mode-0"}, [{"symbol": "2330"}])
+            if spec.market == "mode-0"
+            else None
+        ),
+    )
+
+    found, metadata = runner._collect_opening_signal_batch(
+        specs,
+        engine,
+        _now(9, 0),
+        signal_watcher=clock,
+        max_wait_seconds=0.5,
+        cutoff_seconds=12.0,
+        poll_seconds=0.25,
+        now_fn=clock.now,
+        monotonic_fn=clock.monotonic,
+    )
+
+    assert set(found) == {"mode-0"}
+    assert metadata["complete"] is False
+    assert metadata["timed_out"] is True
+    assert metadata["wait_ms"] == pytest.approx(500.0)
 
 
 def test_runner_engine_lock_rejects_a_second_state_writer(tmp_path: Path) -> None:
@@ -458,8 +608,7 @@ def test_runner_loads_all_three_configured_day_trade_modes() -> None:
     assert all(spec.signal_market is None for spec in specs)
     assert all(spec.price_limit_offset_ticks == 1 for spec in specs)
     assert all(
-        spec.entry_fill_policy == ENTRY_FILL_POLICY_OFFICIAL_OPEN_AT_0901
-        for spec in specs
+        spec.entry_fill_policy == ENTRY_FILL_POLICY_CAUSAL_BOOK for spec in specs
     )
     assert all(spec.entry_price_offset_ticks == 0 for spec in specs)
 
@@ -741,6 +890,45 @@ def test_entry_waits_for_quote_strictly_after_signal(tmp_path: Path) -> None:
 
     assert result == "waiting_quote"
     assert not engine.state["modes"][spec.market]["positions"]
+
+
+@pytest.mark.parametrize(
+    ("weight", "expected_entry"),
+    ((0.1, 1_000.0), (-0.1, 998.0)),
+)
+def test_live_entry_starts_at_0900_and_uses_first_causally_later_best_quote(
+    tmp_path: Path,
+    weight: float,
+    expected_entry: float,
+) -> None:
+    spec = _spec(tmp_path)
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+    quote = _quote()
+    quote["quote_at"] = _now(9, 0, 6).isoformat()
+
+    assert (
+        engine.register_signal(
+            spec=spec,
+            summary=_summary(),
+            signal_rows=[_row(weight)],
+            quotes={"2330": quote},
+            eligibility=_eligibility(),
+            eligibility_coverage={},
+            now=_now(9, 0, 7),
+        )
+        == "registered"
+    )
+
+    mode = engine.state["modes"][spec.market]
+    position = next(iter(mode["positions"].values()))
+    assert mode["entry_fill_policy"] == ENTRY_FILL_POLICY_CAUSAL_BOOK
+    assert mode["entry_price_offset_ticks"] == 0
+    assert mode["counterfactual_open_replay"] is False
+    assert position["entry_price"] == expected_entry
+    assert position["entry_quote_at"] == _now(9, 0, 6).isoformat()
+    assert position["entry_at"] == _now(9, 0, 7).isoformat()
+    assert position["synthetic_fallback_fill"] is False
+    assert position["counterfactual_open_price_fill"] is False
 
 
 def test_legacy_causal_entry_executes_after_0901_with_completed_kbar(
@@ -2705,9 +2893,7 @@ def test_stock_benchmark_rebase_hides_incomplete_total_return_marks() -> None:
             "benchmark_id": "benchmark_0050",
             "instrument_type": "stock_buy_and_hold",
             "total_return_contract": "official_ex_date_reference_reinvestment_v1",
-            "valuation_source": (
-                "corporate_action_reference_unavailable_fail_closed"
-            ),
+            "valuation_source": ("corporate_action_reference_unavailable_fail_closed"),
             "valuation_stale": True,
             "initial_capital_twd": 100_000.0,
             "total_equity_twd": 101_000.0,
@@ -3206,12 +3392,16 @@ def test_dashboard_contains_all_sources_without_broker_secrets(tmp_path: Path) -
     )
     assert payload["simulation_only"] is True
     assert payload["production_order_possible"] is False
-    assert "paper execution waits until 09:01" in payload["source_contract"][
-        "entry_fill"
-    ]
-    assert "does not infer or consume displayed depth" in payload[
-        "source_contract"
-    ]["depth_limit"]
+    assert "live execution starts at 09:00" in payload["source_contract"]["entry_fill"]
+    assert (
+        "Historical replay alone uses the 09:01 official open"
+        in payload["source_contract"]["entry_fill"]
+    )
+    assert "live entry quantity is bounded" in payload["source_contract"]["depth_limit"]
+    assert (
+        "historical 09:01 official-open replay"
+        in payload["source_contract"]["depth_limit"]
+    )
     assert payload["signals"] == []
     assert payload["payload_window"]["signals"] == 0
     assert "account" not in json.dumps(payload).casefold()
@@ -3359,9 +3549,7 @@ def test_dashboard_projects_unattended_guardian_without_internal_actions(
                 "production_order_possible": False,
                 "failures": [],
                 "warnings": [],
-                "actions": [
-                    {"command": ["systemctl", "enable", "secret.service"]}
-                ],
+                "actions": [{"command": ["systemctl", "enable", "secret.service"]}],
                 "components": {
                     "time_sync": {"ready": True},
                     "source_events": {"ready": True},
@@ -3585,8 +3773,8 @@ def test_dashboard_html_is_local_and_refreshes_api() -> None:
     assert "signalOpeningExecutionAudit" in javascript
     assert "開盤計價 ${money(openingPrice)}" in javascript
     assert "configured_entry_fill_policy" in javascript
-    assert "市價買進／回補取收到的最佳 Ask" in javascript
-    assert "市價賣出／放空取收到的最佳 Bid" in javascript
+    assert "市價買進／回補取第一筆較晚最佳 Ask" in javascript
+    assert "市價賣出／放空取第一筆較晚最佳 Bid" in javascript
     assert "不回寫成最佳報價" in javascript
     assert 'class="compact-table position-table"' in html
     assert 'class="compact-table signal-table"' in html

@@ -525,6 +525,51 @@ def test_day_trade_shioaji_snapshot_queries_only_active_universe(monkeypatch) ->
     assert np.isnan(snapshot.open_prices[1])
 
 
+def test_day_trade_shared_mis_snapshot_queries_only_active_universe(
+    monkeypatch,
+) -> None:
+    requested: list[str] = []
+
+    def fake_snapshot(symbols, fallback_prices, **kwargs):
+        del kwargs
+        requested.extend(symbols)
+        size = len(symbols)
+        values = np.asarray(fallback_prices, dtype=np.float64) + 1.0
+        return PriceSnapshot(
+            prices=values,
+            source="twse_tpex:mis+shared_opening_snapshot",
+            timestamp="2026-08-17T01:00:01+00:00",
+            available_count=size,
+            requested_count=size,
+            available_mask=np.ones((size,), dtype=bool),
+            open_prices=values.copy(),
+            timestamps_ms=np.arange(1, size + 1, dtype=np.int64),
+        )
+
+    monkeypatch.setattr(
+        "stockagent.live.signal_engine.fetch_tw_mis_opening_snapshot",
+        fake_snapshot,
+    )
+    fallback = np.array([10.0, 20.0, 30.0])
+    snapshot = _price_snapshot(
+        source="tw",
+        symbols=["A", "B", "C"],
+        fallback_prices=fallback,
+        parquet_root="unused",
+        prices_csv=None,
+        yahoo_chunk_size=80,
+        request_mask=np.array([True, False, True]),
+        require_official_tw_session_open=True,
+    )
+
+    assert requested == ["A", "C"]
+    assert snapshot.requested_count == 2
+    assert snapshot.available_count == 2
+    np.testing.assert_array_equal(snapshot.available_mask, [True, False, True])
+    np.testing.assert_allclose(snapshot.prices, [11.0, 20.0, 31.0])
+    assert np.isnan(snapshot.open_prices[1])
+
+
 def test_day_trade_shioaji_does_not_block_on_duplicate_mis_when_open_is_proven(
     monkeypatch,
 ) -> None:

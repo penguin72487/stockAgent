@@ -4,6 +4,7 @@ import asyncio
 from datetime import datetime, timedelta
 import inspect
 import json
+from pathlib import Path
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
@@ -58,7 +59,7 @@ def test_all_three_day_trade_modes_share_the_0900_paper_execution_contract() -> 
         assert config.completed_session_timeout_seconds == 600
 
 
-def test_day_trade_model_uses_reserved_shioaji_when_public_mis_is_unavailable() -> None:
+def test_day_trade_model_uses_shared_official_opening_snapshot() -> None:
     cfg = discord_bot._market_configs()["tw_day_trade_100m"]
 
     source = discord_bot._auto_signal_price_source(
@@ -67,7 +68,7 @@ def test_day_trade_model_uses_reserved_shioaji_when_public_mis_is_unavailable() 
         "auto",
     )
 
-    assert source == "shioaji"
+    assert source == "tw"
 
 
 def test_day_trade_failure_retry_ignores_slow_batch_retry_setting(monkeypatch) -> None:
@@ -167,7 +168,9 @@ def test_mis_warm_failure_reuses_only_ready_same_session_receipt(
     monkeypatch.setattr(
         discord_bot,
         "warm_tw_mis_quote_client",
-        lambda: (_ for _ in ()).throw(ConnectionError("MIS unavailable")),
+        lambda **_kwargs: (_ for _ in ()).throw(
+            ConnectionError("MIS unavailable")
+        ),
     )
     monkeypatch.setattr(
         discord_bot,
@@ -186,7 +189,8 @@ def test_mis_warm_failure_reuses_only_ready_same_session_receipt(
 
     assert result["ready"] is True
     assert result["row_count"] == 12
-    assert result["source"] == "receipt_backed_same_session_opening"
+    assert result["source"] == "twse_tpex:mis"
+    assert result["proof"] == "receipt_backed_same_session_opening"
 
 
 def test_mis_warm_failure_without_receipt_fails_closed(
@@ -196,7 +200,9 @@ def test_mis_warm_failure_without_receipt_fails_closed(
     monkeypatch.setattr(
         discord_bot,
         "warm_tw_mis_quote_client",
-        lambda: (_ for _ in ()).throw(ConnectionError("MIS unavailable")),
+        lambda **_kwargs: (_ for _ in ()).throw(
+            ConnectionError("MIS unavailable")
+        ),
     )
     monkeypatch.setattr(
         discord_bot,
@@ -364,14 +370,40 @@ def test_setup_hook_syncs_only_global_commands(monkeypatch: pytest.MonkeyPatch) 
         "signal_now_job_resumer",
         "preopen_prepare",
         "daily_summary",
-        "artifact_backfill",
         "model_auto_deployment",
     }
+    assert "artifact_backfill" not in started_loops
     assert startup_events[:3] == [
         "start:scheduled_signal",
         "start:service_heartbeat",
         "sync",
     ]
+
+
+def test_postclose_artifact_maintenance_isolated_from_discord_cgroup() -> None:
+    service = Path(
+        "deploy/systemd/stockagent-discord-artifact-maintenance.service.in"
+    ).read_text(encoding="utf-8")
+    timer = Path(
+        "deploy/systemd/stockagent-discord-artifact-maintenance.timer.in"
+    ).read_text(encoding="utf-8")
+    installer = Path("scripts/install_discord_bot_service.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert "Type=oneshot" in service
+    assert "CPUWeight=10" in service
+    assert "IOWeight=10" in service
+    assert "OOMScoreAdjust=500" in service
+    assert "run_discord_artifact_maintenance.sh" in service
+    assert "OnCalendar=Mon..Fri" in timer
+    assert "RandomizedDelaySec=0" in timer
+    assert "stockagent-discord-artifact-maintenance.timer" in installer
+
+    gateway = Path(
+        "deploy/systemd/stockagent-discord-bot.service.in"
+    ).read_text(encoding="utf-8")
+    assert "OOMScoreAdjust=-500" in gateway
 
 
 def test_opening_watchdog_cannot_undercut_bounded_quote_io(
@@ -387,7 +419,7 @@ def test_opening_watchdog_cannot_undercut_bounded_quote_io(
     assert discord_bot._opening_attempt_timeout_seconds(hot=True) == 90.0
 
 
-def test_final_arm_is_process_scoped_and_requires_shioaji_contract_prewarm(
+def test_final_arm_is_process_scoped_and_requires_opening_source_prewarm(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
 ) -> None:
@@ -406,14 +438,10 @@ def test_final_arm_is_process_scoped_and_requires_shioaji_contract_prewarm(
                         "checkpoint_cache_hit": True,
                         "model_cache_hit": True,
                     },
-                    "quote_prewarm": {
+                    "opening_source_prewarm": {
                         "ready": True,
                         "run_id": discord_bot._BOT_RUN_ID,
-                        "connection_scope": "process",
-                        "requested_count": 2303,
-                        "primed_count": 2303,
-                        "resolved_count": 2303,
-                        "missing_count": 0,
+                        "source": "twse_tpex:mis",
                     },
                 }
             }
@@ -434,7 +462,9 @@ def test_final_arm_is_process_scoped_and_requires_shioaji_contract_prewarm(
     payload["markets"][cfg.market]["final_arm"]["run_id"] = (
         discord_bot._BOT_RUN_ID
     )
-    payload["markets"][cfg.market]["final_arm"].pop("quote_prewarm")
+    payload["markets"][cfg.market]["final_arm"].pop(
+        "opening_source_prewarm"
+    )
     path.write_text(json.dumps(payload), encoding="utf-8")
     assert not discord_bot._preopen_market_final_armed_for_session(
         cfg, "2026-08-27"
@@ -463,17 +493,3 @@ def test_day_trade_opening_fallback_prices_align_to_alive_symbols() -> None:
 
     assert symbols == ["2330", "2454"]
     assert fallback.tolist() == [100.0, 800.0]
-
-
-def test_quote_prewarm_contract_rejects_unresolved_symbols() -> None:
-    with pytest.raises(RuntimeError, match="resolved=1 missing=1"):
-        discord_bot._require_complete_quote_prewarm(
-            {
-                "ready": False,
-                "connection_scope": "process",
-                "requested_count": 2,
-                "primed_count": 1,
-                "resolved_count": 1,
-                "missing_count": 1,
-            }
-        )

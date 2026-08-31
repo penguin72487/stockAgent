@@ -1146,8 +1146,8 @@ def _attach_execution_records(
             reason = "historical_session_has_no_execution_record"
         elif local.weekday() >= 5:
             status = "waiting_trading_day"
-        elif local.timetz().replace(tzinfo=None) < datetime_time(9, 1):
-            status = "waiting_09_01"
+        elif local.timetz().replace(tzinfo=None) < datetime_time(9, 0):
+            status = "waiting_09_00"
         elif local.timetz().replace(tzinfo=None) < datetime_time(13, 20):
             status = "starting"
             reason = "missed_schedule_immediate_catch_up"
@@ -1332,7 +1332,7 @@ def _operational_issues(
         "official_open_price_unavailable": (
             "error",
             "官方開盤價不可用",
-            "缺少有效官方開盤價，09:01 紙上成交已停止；不使用 Bid/Ask、最後價或 +1 Tick 替代。",
+            "歷史回補缺少有效官方開盤價，09:01 反事實計價已停止；不使用 Bid/Ask、最後價或 +1 Tick 替代。",
         ),
         "synthetic_open_tick_price_unavailable": (
             "error",
@@ -3228,9 +3228,9 @@ def build_dashboard_snapshot(
             "execution_record": "today's append-only signal_registered or signal_blocked event per mode; stale prior-session timestamps never count",
             "missed_start": "between 09:00 and 13:20, Linux inotify wakes the executor when the atomic latest-signal pointer is published; a 0.1-second timeout remains only as a portable catch-up fallback and the public dashboard remains read-only",
             "signal": "Discord live target_weights.parquet after observed opening quote",
-            "replay": "simulation_replay=true is a retrospective, explicitly counterfactual fill at the actual session open from official daily data, a fresh same-session Shioaji snapshot, or retained provenance-bearing same-session TWSE/TPEx MIS or Shioaji live-signal evidence; it is not a causally executable quote or real order fill",
-            "entry_fill": "the signal may be prepared after 09:00, but paper execution waits until 09:01 and values every eligible whole-lot buy, sell, short, or cover at the observed official session open; a missing official open is blocked and no bid/ask, last-price, or adverse-tick substitute is allowed; this is counterfactual paper valuation, not an exchange-fill claim",
-            "latency": "measured signal input through model, atomic artifact publication, consumer discovery, 09:01 official-open observation, and durable simulation-ledger persistence on this host; it is not an external order acknowledgement or venue round-trip measurement",
+            "replay": "simulation_replay=true is recorded at 09:01 and retrospectively values the historical order at the observed official session open; it is explicitly counterfactual and is not a causally executable quote or real order fill",
+            "entry_fill": "live execution starts at 09:00: after the immutable signal pointer is published, buy/cover consumes the first strictly later best Ask and sell/short consumes the first strictly later best Bid; missing causal quotes are blocked without last-price, 09:01, or adverse-tick substitution. Historical replay alone uses the 09:01 official open",
+            "latency": "measured 09:00 trigger through model, atomic artifact publication, consumer discovery, first causally later best quote, and durable simulation-ledger persistence on this host; it is not an external order acknowledgement or venue round-trip measurement",
             "service_sync": "Discord, the paper engine, and the dashboard share one compact engine commit revision; Discord acknowledges that revision without reparsing the full ledger and the dashboard fetches heavy state only when the revision changes",
             "unattended_guardian": "the weekday guardian verifies the schedule clock, all 156 source events, exact-session eligibility, 08:30 acceptance, the three engine/Discord revisions, post-close flatness, public endpoints, and disk headroom; it re-arms existing systemd units but never invents data, signals, or fills",
             "mark": "best bid liquidates long; best ask covers short",
@@ -3246,7 +3246,7 @@ def build_dashboard_snapshot(
                 else benchmark_history.get("load_error")
                 or "live benchmark marks only; no historical origin file"
             ),
-            "depth_limit": "09:01 official-open paper valuation does not infer or consume displayed depth; it is a counterfactual simulation convention only and never claims exchange depth, queue priority, execution acknowledgement, or guaranteed real-market fill",
+            "depth_limit": "live entry quantity is bounded by independently verified eligibility, whole lots, price limits, displayed level-one depth, and after 09:01 completed-minute participation; historical 09:01 official-open replay is a separate counterfactual convention and never claims exchange depth, queue priority, or a guaranteed real-market fill",
             "bracket_fill": "each mode moves TP and the local SL trigger one legal dated TW tick inward; this improves fill probability but does not guarantee a fill without a trigger and executable counterparty volume",
             "exit_schedule": "from 13:20 through 13:23 each unfilled exit is checked for a real cross and otherwise cancel-repriced once per new minute to the current passive best ask for a sell or best bid for a buy-to-cover; at 13:24 it is replaced by a marketable exit attempt",
             "terminal_flatten": "after the 13:30 auction simulation, every residual is closed in a simulation-only terminal ledger pass so a day-trade mode never carries overnight; this is explicitly tagged and is not claimed as an exchange fill",

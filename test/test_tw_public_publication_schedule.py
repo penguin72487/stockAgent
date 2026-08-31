@@ -98,7 +98,7 @@ def test_completed_session_gate_accepts_official_close_without_next_opening(
     assert failures == {}
 
 
-def test_completed_session_builds_only_canonical_close_layers(tmp_path: Path) -> None:
+def test_completed_session_refreshes_all_causal_close_layers(tmp_path: Path) -> None:
     commands = completed_session._build_commands(
         live_root=tmp_path,
         expected_date="2026-08-26",
@@ -106,7 +106,9 @@ def test_completed_session_builds_only_canonical_close_layers(tmp_path: Path) ->
     )
 
     assert [Path(command[1]).name for command in commands] == [
+        "download_tw_corporate_action_reference.py",
         "build_tw_official_symbol_parquets.py",
+        "download_tw_corporate_action_entitlements.py",
         "build_tw_public_training_features.py",
     ]
     assert all(
@@ -983,15 +985,10 @@ def test_final_preopen_gate_requires_public_model_and_executor_proofs() -> None:
                         "checkpoint_cache_hit": True,
                         "model_cache_hit": True,
                     },
-                    "quote_prewarm": {
+                    "opening_source_prewarm": {
                         "ready": True,
                         "run_id": "discord-process-1",
-                        "connection_scope": "process",
-                        "requested_count": 2303,
-                        "primed_count": 2303,
-                        "resolved_count": 2303,
-                        "missing_count": 0,
-                        "snapshot_prefetched": False,
+                        "source": "twse_tpex:mis",
                     },
                 },
             }
@@ -1203,17 +1200,19 @@ def test_final_preopen_gate_requires_durable_engine_and_exact_discord_revision()
 
 
 def test_post_open_gate_requires_same_session_signal_commit_for_every_mode() -> None:
-    observed = datetime(2026, 8, 17, 9, 1, 15, tzinfo=TAIPEI)
+    observed = datetime(2026, 8, 17, 9, 0, 15, tzinfo=TAIPEI)
     market = "tw_day_trade"
     engine_sync = {
         "modes": {
             market: {
                 "session_date": "2026-08-17",
                 "signal_id": "signal-1",
-                "signal_at": "2026-08-17T09:00:01+08:00",
-                "entry_completed_at": "2026-08-17T09:01:02+08:00",
+                "signal_at": "2026-08-17T09:00:00.100+08:00",
+                "entry_completed_at": "2026-08-17T09:00:02+08:00",
                 "engine_status": "active",
                 "checkpoint_ready": True,
+                "entry_fill_policy": "causal_best_quote",
+                "entry_price_offset_ticks": 0,
             }
         }
     }
@@ -1243,12 +1242,12 @@ def test_post_open_gate_requires_same_session_signal_commit_for_every_mode() -> 
     )
     assert failed["opening_execution"]["ready"] is False
     assert (
-        "09:01 official-open fills were not durably committed for every paper mode by 09:01:15"
+        "09:00 live signals were not durably committed with causal best-quote execution for every paper mode by 09:00:15"
         in failed["failures"]
     )
 
     engine_sync["modes"][market]["entry_completed_at"] = (
-        "2026-08-17T09:01:16+08:00"
+        "2026-08-17T09:00:16+08:00"
     )
     late = evaluate_readiness(
         observed=observed,

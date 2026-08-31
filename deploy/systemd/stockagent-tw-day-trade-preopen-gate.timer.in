@@ -1,5 +1,5 @@
 [Unit]
-Description=Verify Taiwan stock paper simulation before and after the 09:01 execution gate
+Description=Verify Taiwan stock paper simulation before and after the 09:00 live-signal gate
 
 [Timer]
 OnCalendar=Mon..Fri *-*-* 08:50:00 Asia/Taipei

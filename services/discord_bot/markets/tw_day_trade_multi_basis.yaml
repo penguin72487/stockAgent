@@ -22,8 +22,9 @@ day_trade_rule_data_dir: /srv/stockagent-live/data_tw_public
 day_trade_quote_interval_seconds: 60
 
 # This model shares the canonical TW public data layer with the other modes.
-# 09:00 is an opening-data gate. Paper execution waits until 09:01 and uses
-# the observed official session open; missing opens fail closed without +1 Tick.
+# 09:00 starts the live signal; execution uses the first strictly later best
+# Ask/Bid. Missing causal quotes fail closed without +1 Tick. Historical replay
+# alone is recorded at 09:01 with the observed official session open.
 pre_signal_command:
   - scripts/activate_tw_public_opening_data.py
   - --link

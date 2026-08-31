@@ -507,14 +507,14 @@ aligned.
 
 Guidelines:
 
-- The active `tw_day_trade_*` daily paper modes wait until 09:01 and value every
-  independently constrained submitted whole-lot buy, sell, short, or cover at
-  the observed official session open. Missing official open prices fail closed;
-  never substitute Bid/Ask, last price, or an adverse `+1 tick`. Because a
-  09:01 order cannot causally obtain the already completed opening price, label
-  this as counterfactual paper valuation and never as an exchange fill, queue
-  acknowledgement, or guaranteed real fill. Historical replay uses the same
-  official-open/09:01 contract.
+- The active `tw_day_trade_*` live paper modes start signal generation at 09:00.
+  Once the immutable signal is published, value each independently constrained
+  submitted whole-lot buy/cover at the first strictly later best Ask and each
+  sell/short at the first strictly later best Bid. Missing causal quotes fail
+  closed; never substitute the 09:01 price, last price, or an adverse `+1 tick`.
+  Historical replay is a separate counterfactual contract recorded at 09:01
+  using the observed official session open; never relabel it as live execution,
+  an exchange fill, queue acknowledgement, or guaranteed real fill.
 
 - The active dual-RTX-5090 `tw_minute` long/short contract copies the ordinary
   TW day-trade trading rules and changes only decision frequency: L1 gross

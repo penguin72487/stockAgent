@@ -40,8 +40,8 @@ from stockagent.live.quote_provider import (  # noqa: E402
 )
 from stockagent.live.service_notify import notify_systemd  # noqa: E402
 from stockagent.live.tw_day_trade_simulation import (  # noqa: E402
-    ENTRY_FILL_POLICY_OFFICIAL_OPEN_AT_0901,
-    ENTRY_GATE,
+    ENTRY_FILL_POLICY_CAUSAL_BOOK,
+    LIVE_ENTRY_GATE,
     CLOSING_AUCTION_TIME,
     FORCE_EXIT_TIME,
     ModeSpec,
@@ -65,9 +65,29 @@ _ELIGIBILITY_CACHE: dict[
 _LEGACY_SIGNAL_SCAN_CACHE: dict[
     str, tuple[float, tuple[dict[str, Any], list[dict[str, Any]]] | None]
 ] = {}
-_BENCHMARK_PREVIOUS_CLOSE_CACHE: dict[
-    tuple[str, str, str], dict[str, Any]
-] = {}
+_BENCHMARK_PREVIOUS_CLOSE_CACHE: dict[tuple[str, str, str], dict[str, Any]] = {}
+
+
+def _opening_batch_max_wait_seconds() -> float:
+    return max(
+        0.0,
+        float(os.getenv("STOCKAGENT_OPENING_SIGNAL_BATCH_WAIT_SECONDS", "2.0") or 2.0),
+    )
+
+
+def _opening_batch_cutoff_seconds() -> float:
+    # Preserve three seconds of the 09:00:15 acceptance window for one causal
+    # quote request plus the durable per-mode ledger commits.
+    return min(
+        12.0,
+        max(
+            0.0,
+            float(
+                os.getenv("STOCKAGENT_OPENING_SIGNAL_BATCH_CUTOFF_SECONDS", "12.0")
+                or 12.0
+            ),
+        ),
+    )
 
 
 def _pending_signal_retry_delay_seconds(result: str, observed: datetime) -> float:
@@ -223,7 +243,12 @@ def _mode_specs(
                     fee_schedule=_fee_schedule(experiment),
                     lot_size=int(experiment.trading.tw_day_trade_lot_size),
                     price_limit_offset_ticks=1,
-                    entry_fill_policy=ENTRY_FILL_POLICY_OFFICIAL_OPEN_AT_0901,
+                    # Live execution is causal: after the 09:00 signal is
+                    # atomically published, buy/cover uses the first later best
+                    # Ask and sell/short uses the first later best Bid. Replay
+                    # tools explicitly replace this with the 09:01 official-open
+                    # counterfactual policy.
+                    entry_fill_policy=ENTRY_FILL_POLICY_CAUSAL_BOOK,
                     entry_price_offset_ticks=0,
                 )
             )
@@ -613,6 +638,47 @@ def _prewarm_live_eligibility(
     return warmed
 
 
+def _eligible_execution_quote_symbols(
+    specs: list[ModeSpec],
+    live_configs: dict[str, LiveMarketConfig],
+    *,
+    trading_date: datetime,
+) -> list[str]:
+    """Resolve every symbol that can legally become an opening candidate.
+
+    Contract V2 lookup is deterministic process-local work.  Moving it to the
+    08:55 prewarm leaves only the actual post-signal Snapshot request on the
+    causal 09:00 path.
+    """
+
+    symbols: set[str] = set()
+    grouped: set[tuple[str, str]] = set()
+    for spec in specs:
+        live = live_configs[spec.market]
+        rule_data_dir = _rule_data_dir(live, spec)
+        key = (str(rule_data_dir.resolve()), str(spec.parquet_root.resolve()))
+        if key in grouped:
+            continue
+        grouped.add(key)
+        universe = sorted(load_symbol_metadata(spec.parquet_root))
+        resolved, coverage = _cached_live_eligibility(
+            rule_data_dir=rule_data_dir,
+            parquet_root=spec.parquet_root,
+            symbols=universe,
+            trading_date=trading_date,
+        )
+        if not all(bool(row.get("covered")) for row in coverage.values()):
+            raise RuntimeError(
+                "cannot prewarm quotes without exact-session eligibility"
+            )
+        symbols.update(
+            symbol
+            for symbol, evidence in resolved.items()
+            if bool(evidence.covered and evidence.eligible)
+        )
+    return sorted(symbols)
+
+
 def _verified_stock_session(
     specs: list[ModeSpec],
     live_configs: dict[str, LiveMarketConfig],
@@ -778,6 +844,128 @@ class _SignalPointerWatcher:
 
     def __del__(self) -> None:
         self.close()
+
+
+def _mode_needs_opening_signal(
+    engine: TwDayTradeSimulationEngine,
+    spec: ModeSpec,
+    *,
+    session_date: str,
+) -> bool:
+    mode = engine.state.get("modes", {}).get(spec.market, {})
+    if str(mode.get("engine_status") or "") == "critical_ledger_state_divergence":
+        return False
+    return not (
+        str(mode.get("session_date") or "") == session_date
+        and bool(mode.get("entry_completed_at"))
+    )
+
+
+def _collect_opening_signal_batch(
+    specs: list[ModeSpec],
+    engine: TwDayTradeSimulationEngine,
+    observed: datetime,
+    *,
+    signal_watcher: _SignalPointerWatcher,
+    max_wait_seconds: float,
+    cutoff_seconds: float,
+    poll_seconds: float = 0.02,
+    now_fn: Any | None = None,
+    monotonic_fn: Any | None = None,
+) -> tuple[
+    dict[
+        str,
+        tuple[dict[str, Any], list[dict[str, Any]], datetime],
+    ],
+    dict[str, Any],
+]:
+    """Collect due opening signals before requesting one causal quote batch.
+
+    Waiting begins only after the first atomic signal pointer exists.  It ends
+    immediately when every uncommitted mode is visible and is capped before
+    the 09:00:15 commit SLO.  If one model fails, already-ready modes continue
+    after the bound rather than being held indefinitely.
+    """
+
+    clock_now = now_fn or (lambda: datetime.now(TAIPEI))
+    monotonic = monotonic_fn or time_module.monotonic
+    session_date = observed.date().isoformat()
+    expected = [
+        spec
+        for spec in specs
+        if _mode_needs_opening_signal(
+            engine,
+            spec,
+            session_date=session_date,
+        )
+    ]
+    found: dict[
+        str,
+        tuple[dict[str, Any], list[dict[str, Any]], datetime],
+    ] = {}
+
+    def scan(current: datetime) -> None:
+        for spec in expected:
+            if spec.market in found:
+                continue
+            latest = _latest_signal(spec, current)
+            if latest is None:
+                continue
+            summary, rows = latest
+            mode = engine.state.get("modes", {}).get(spec.market, {})
+            signal_id = str(summary.get("signal_id") or "")
+            if not signal_id or signal_id in set(
+                mode.get("processed_signal_ids") or ()
+            ):
+                continue
+            found[spec.market] = (summary, rows, current)
+
+    scan(observed)
+    started = monotonic()
+    opening_gate = observed.replace(hour=9, minute=0, second=0, microsecond=0)
+    cutoff_at = opening_gate + timedelta(seconds=max(0.0, float(cutoff_seconds)))
+    wait_budget = min(
+        max(0.0, float(max_wait_seconds)),
+        max(0.0, (cutoff_at - observed).total_seconds()),
+    )
+    should_wait = (
+        len(expected) > 1
+        and 0 < len(found) < len(expected)
+        and wait_budget > 0.0
+        and LIVE_ENTRY_GATE
+        <= observed.timetz().replace(tzinfo=None)
+        < datetime_time(9, 0, 15)
+    )
+    deadline = started + wait_budget
+    current = observed
+    while should_wait and len(found) < len(expected):
+        remaining = deadline - monotonic()
+        if remaining <= 0.0:
+            break
+        signal_watcher.wait(min(max(0.005, float(poll_seconds)), remaining))
+        current = clock_now()
+        scan(current)
+
+    completed = clock_now() if should_wait else observed
+    wait_by_market_ms = {
+        market: round(
+            max(0.0, (completed - detected_at).total_seconds() * 1000.0),
+            3,
+        )
+        for market, (_summary, _rows, detected_at) in found.items()
+    }
+    metadata = {
+        "expected_markets": [spec.market for spec in expected],
+        "observed_markets": list(found),
+        "expected_mode_count": len(expected),
+        "observed_mode_count": len(found),
+        "complete": bool(expected) and len(found) == len(expected),
+        "timed_out": bool(should_wait and len(found) < len(expected)),
+        "wait_ms": round(max(0.0, (monotonic() - started) * 1000.0), 3),
+        "wait_by_market_ms": wait_by_market_ms,
+        "cutoff_seconds_after_open": max(0.0, float(cutoff_seconds)),
+    }
+    return found, metadata
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -968,7 +1156,7 @@ def main(argv: list[str] | None = None) -> int:
             last_readiness = monotonic_now
             if not ready_notified:
                 notify_systemd(
-                    "READY=1\nSTATUS=TW day-trade executor ready; waiting for 09:01 official-open execution"
+                    "READY=1\nSTATUS=TW day-trade executor ready; waiting for 09:00 live signal and causal best quote"
                 )
                 ready_notified = True
         session_open, session_errors = _verified_stock_session(
@@ -1040,7 +1228,18 @@ def main(argv: list[str] | None = None) -> int:
         ):
             prewarm_started = time_module.perf_counter()
             try:
-                warm_shioaji_stock_quote_client()
+                quote_symbols = _eligible_execution_quote_symbols(
+                    specs,
+                    live_configs,
+                    trading_date=observed,
+                )
+                quote_warm = warm_shioaji_stock_quote_client(quote_symbols)
+                if not bool(quote_warm.get("ready")):
+                    raise RuntimeError(
+                        "Shioaji Contract V2 prewarm incomplete: "
+                        f"resolved={quote_warm.get('resolved_count')} "
+                        f"requested={quote_warm.get('requested_count')}"
+                    )
                 prewarm_elapsed_ms = (
                     time_module.perf_counter() - prewarm_started
                 ) * 1000.0
@@ -1054,11 +1253,15 @@ def main(argv: list[str] | None = None) -> int:
                     elapsed_ms=prewarm_elapsed_ms,
                     details={
                         "proof": "simulation_client_usage_probe",
+                        "candidate_contract_probe": True,
                         "fresh_login_required_on_new_client": True,
+                        **quote_warm,
                     },
                 )
                 print(
                     "[tw-day-trade-sim] shioaji_prewarm=ready "
+                    f"contracts={quote_warm.get('resolved_count')}/"
+                    f"{quote_warm.get('requested_count')} "
                     f"elapsed_ms={prewarm_elapsed_ms:.3f}",
                     flush=True,
                 )
@@ -1073,6 +1276,7 @@ def main(argv: list[str] | None = None) -> int:
                     elapsed_ms=(time_module.perf_counter() - prewarm_started) * 1000.0,
                     details={
                         "proof": "simulation_client_usage_probe",
+                        "candidate_contract_probe": True,
                         "retry_after_seconds": 5.0,
                     },
                     error=f"{type(exc).__name__}: {exc}",
@@ -1080,6 +1284,44 @@ def main(argv: list[str] | None = None) -> int:
                 print(
                     f"[tw-day-trade-sim] shioaji_prewarm=failed "
                     f"error={type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+
+        opening_wall_time = observed.timetz().replace(tzinfo=None)
+        opening_batch_active = (
+            LIVE_ENTRY_GATE <= opening_wall_time < datetime_time(9, 0, 15)
+        )
+        opening_signals: dict[
+            str,
+            tuple[dict[str, Any], list[dict[str, Any]], datetime],
+        ] = {}
+        opening_batch: dict[str, Any] = {
+            "expected_mode_count": 0,
+            "observed_mode_count": 0,
+            "complete": False,
+            "timed_out": False,
+            "wait_ms": 0.0,
+            "wait_by_market_ms": {},
+        }
+        if opening_batch_active:
+            opening_signals, opening_batch = _collect_opening_signal_batch(
+                specs,
+                engine,
+                observed,
+                signal_watcher=signal_watcher,
+                max_wait_seconds=_opening_batch_max_wait_seconds(),
+                cutoff_seconds=_opening_batch_cutoff_seconds(),
+                poll_seconds=min(0.02, float(args.poll_seconds)),
+            )
+            if opening_signals:
+                observed = datetime.now(TAIPEI)
+                monotonic_now = time_module.monotonic()
+                print(
+                    "[tw-day-trade-sim] opening_signal_batch "
+                    f"observed={opening_batch.get('observed_mode_count')}/"
+                    f"{opening_batch.get('expected_mode_count')} "
+                    f"wait_ms={opening_batch.get('wait_ms')} "
+                    f"complete={opening_batch.get('complete')}",
                     flush=True,
                 )
 
@@ -1093,6 +1335,10 @@ def main(argv: list[str] | None = None) -> int:
                 dict[str, Any],
                 float,
                 datetime,
+                float,
+                int,
+                int,
+                bool,
             ]
         ] = []
         pending_symbols: set[str] = set()
@@ -1101,10 +1347,10 @@ def main(argv: list[str] | None = None) -> int:
             timespec="minutes"
         )
         for spec in specs:
-            if observed.timetz().replace(tzinfo=None) < ENTRY_GATE:
-                # Signals may be published after 09:00, but the configured
-                # official-open paper contract must not consume them before
-                # the 09:01 execution boundary.
+            if observed.timetz().replace(tzinfo=None) < LIVE_ENTRY_GATE:
+                # Live signals start at 09:00. The engine separately enforces
+                # that every execution quote is strictly later than the atomic
+                # signal publication timestamp.
                 continue
             mode = engine.state.get("modes", {}).get(spec.market, {})
             if str(mode.get("engine_status") or "") == (
@@ -1115,11 +1361,17 @@ def main(argv: list[str] | None = None) -> int:
                 mode.get("session_date") or ""
             ) == observed.date().isoformat() and mode.get("entry_completed_at"):
                 continue
-            latest = _latest_signal(spec, observed)
-            if latest is None:
-                continue
-            summary, rows = latest
-            detected_at = datetime.now(TAIPEI)
+            if opening_batch_active:
+                batched = opening_signals.get(spec.market)
+                if batched is None:
+                    continue
+                summary, rows, detected_at = batched
+            else:
+                latest = _latest_signal(spec, observed)
+                if latest is None:
+                    continue
+                summary, rows = latest
+                detected_at = datetime.now(TAIPEI)
             signal_id = str(summary.get("signal_id") or "")
             if signal_id in set(mode.get("processed_signal_ids") or ()):
                 continue
@@ -1159,6 +1411,15 @@ def main(argv: list[str] | None = None) -> int:
                     coverage,
                     eligibility_ms,
                     detected_at,
+                    float(
+                        (opening_batch.get("wait_by_market_ms") or {}).get(
+                            spec.market,
+                            0.0,
+                        )
+                    ),
+                    int(opening_batch.get("observed_mode_count") or 1),
+                    int(opening_batch.get("expected_mode_count") or 1),
+                    bool(opening_batch.get("complete", True)),
                 )
             )
             pending_symbols.update(candidate_symbols)
@@ -1259,6 +1520,10 @@ def main(argv: list[str] | None = None) -> int:
             coverage,
             eligibility_ms,
             detected_at,
+            opening_batch_wait_ms,
+            opening_batch_mode_count,
+            opening_batch_expected_mode_count,
+            opening_batch_complete,
         ) in pending:
             try:
                 ledger_started = time_module.perf_counter()
@@ -1291,6 +1556,12 @@ def main(argv: list[str] | None = None) -> int:
                         executor_quote_fetch_ms=quote_fetch_ms,
                         eligibility_load_ms=eligibility_ms,
                         ledger_compute_persist_ms=ledger_ms,
+                        opening_signal_batch_wait_ms=opening_batch_wait_ms,
+                        opening_signal_batch_mode_count=opening_batch_mode_count,
+                        opening_signal_batch_expected_mode_count=(
+                            opening_batch_expected_mode_count
+                        ),
+                        opening_signal_batch_complete=opening_batch_complete,
                     )
                 if result == "registered":
                     # register_signal already persisted this minute's complete

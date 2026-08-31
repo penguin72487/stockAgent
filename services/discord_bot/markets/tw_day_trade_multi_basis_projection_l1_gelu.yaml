@@ -20,8 +20,9 @@ day_trade_simulation_state_dir: artifacts/live/tw_day_trade_simulation
 day_trade_rule_data_dir: /srv/stockagent-live/data_tw_public
 day_trade_quote_interval_seconds: 60
 
-# Signal preparation may begin after 09:00. Paper execution waits until 09:01
-# and uses only the observed official session open, with no +1 Tick fallback.
+# 09:00 starts the live signal. Once published, paper execution uses the first
+# strictly later best Ask/Bid with no +1 Tick fallback. Historical replay alone
+# uses the 09:01 observed official session open.
 
 pre_signal_command:
   - scripts/activate_tw_public_opening_data.py

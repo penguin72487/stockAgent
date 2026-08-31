@@ -1230,14 +1230,25 @@ def load_symbol_yahoo_map(parquet_root: str | Path) -> dict[str, str]:
 
         with path.open("r", encoding="utf-8", newline="") as handle:
             rows = csv.DictReader(handle)
-            return {
-                str(row.get("code", "")).strip(): str(
-                    row.get("yahoo_symbol", "")
-                ).strip()
-                for row in rows
-                if str(row.get("code", "")).strip()
-                and str(row.get("yahoo_symbol", "")).strip()
-            }
+            output: dict[str, str] = {}
+            for row in rows:
+                code = str(row.get("code", "")).strip()
+                if not code:
+                    continue
+                yahoo_symbol = str(row.get("yahoo_symbol", "")).strip()
+                if not yahoo_symbol:
+                    # The canonical official symbol builder records venue, not
+                    # a provider-specific ticker.  Derive the unambiguous Yahoo
+                    # suffix so MIS can issue exactly one exchange channel per
+                    # security instead of probing both TWSE and TPEx.
+                    venue = str(row.get("market", "")).strip().casefold()
+                    if venue == "twse":
+                        yahoo_symbol = f"{code}.TW"
+                    elif venue == "tpex":
+                        yahoo_symbol = f"{code}.TWO"
+                if yahoo_symbol:
+                    output[code] = yahoo_symbol
+            return output
     except Exception:
         return {}
 
@@ -1675,6 +1686,7 @@ def fetch_tw_mis_last_prices(
     empty_chunk_retry_attempts: int | None = None,
     empty_chunk_retry_delay_seconds: float | None = None,
     max_parallel_requests: int | None = None,
+    request_timeout_seconds: float | None = None,
 ) -> PriceSnapshot:
     """Fetch Taiwan intraday prices from TWSE MIS and align them to panel symbols."""
     yahoo_map = load_symbol_yahoo_map(parquet_root)
@@ -1712,6 +1724,12 @@ def fetch_tw_mis_last_prices(
         else int(os.getenv("STOCKAGENT_TW_MIS_PARALLEL_REQUESTS", "4") or "4")
     )
     workers = max(1, min(len(chunks) or 1, max_parallel))
+    request_timeout = max(
+        0.25,
+        float(request_timeout_seconds)
+        if request_timeout_seconds is not None
+        else float(os.getenv("STOCKAGENT_TW_MIS_REQUEST_TIMEOUT_SECONDS", "8") or "8"),
+    )
     retry_attempts = max(
         0,
         int(empty_chunk_retry_attempts)
@@ -1788,7 +1806,7 @@ def fetch_tw_mis_last_prices(
                     "Referer": "https://mis.twse.com.tw/stock/index.jsp",
                     **_YAHOO_HEADERS,
                 },
-                timeout=8,
+                timeout=request_timeout,
             )
             response.raise_for_status()
             payload = response.json()
@@ -2013,6 +2031,11 @@ def fetch_tw_mis_opening_snapshot(
         cache_hits = len(requested) - len(missing_indices)
         if missing_indices:
             missing_symbols = [requested[idx] for idx in missing_indices]
+            # Once a row is expired it is no longer causal evidence for this
+            # request.  Remove it before I/O so a partial response cannot
+            # silently revive an older opening observation.
+            for symbol in missing_symbols:
+                _TW_MIS_OPENING_CACHE.pop(symbol, None)
             fresh = fetch_tw_mis_last_prices(
                 missing_symbols,
                 fallback[np.asarray(missing_indices, dtype=np.int64)],
@@ -2020,49 +2043,72 @@ def fetch_tw_mis_opening_snapshot(
                 chunk_size=chunk_size,
                 empty_chunk_retry_attempts=0,
                 max_parallel_requests=max_parallel_requests,
+                # The full-market opening fan-out is on the 09:00 critical
+                # path.  Bound every HTTP request tightly; failed chunks stay
+                # missing and are retried by the scheduler instead of holding
+                # every model behind a long request/reply stall.
+                request_timeout_seconds=max(
+                    0.25,
+                    float(
+                        os.getenv(
+                            "STOCKAGENT_TW_OPENING_REQUEST_TIMEOUT_SECONDS",
+                            "1.5",
+                        )
+                        or "1.5"
+                    ),
+                ),
             )
             fresh_opens = (
                 np.asarray(fresh.open_prices, dtype=np.float64)
                 if fresh.open_prices is not None
                 else np.full((len(missing_symbols),), np.nan, dtype=np.float64)
             )
-            # An all-empty opening response is a transient pre-open observation,
-            # not a cacheable negative result. Let the 10 Hz scheduler retry it.
-            cache_fresh = bool(
-                np.any(np.isfinite(fresh_opens) & (fresh_opens > 0.0))
+            stored_at = time.monotonic()
+            fresh_available = (
+                np.asarray(fresh.available_mask, dtype=bool)
+                if fresh.available_mask is not None
+                else np.zeros((len(missing_symbols),), dtype=bool)
             )
-            if cache_fresh:
-                stored_at = time.monotonic()
-                fresh_available = (
-                    np.asarray(fresh.available_mask, dtype=bool)
-                    if fresh.available_mask is not None
-                    else np.zeros((len(missing_symbols),), dtype=bool)
-                )
-                fresh_timestamps = (
-                    np.asarray(fresh.timestamps_ms, dtype=np.int64)
-                    if fresh.timestamps_ms is not None
-                    else np.zeros((len(missing_symbols),), dtype=np.int64)
-                )
-                for local_idx, symbol in enumerate(missing_symbols):
-                    row: dict[str, float | int | bool | None] = {
-                        "available": bool(fresh_available[local_idx]),
-                        "price": (
-                            float(fresh.prices[local_idx])
-                            if fresh_available[local_idx]
-                            and np.isfinite(fresh.prices[local_idx])
-                            else None
-                        ),
-                        "timestamp_ms": int(fresh_timestamps[local_idx]),
-                    }
-                    for field in _PRICE_SNAPSHOT_ARRAY_FIELDS:
-                        values = getattr(fresh, field)
-                        value = (
-                            float(np.asarray(values)[local_idx])
-                            if values is not None
-                            else float("nan")
-                        )
-                        row[field] = value if np.isfinite(value) else None
-                    _TW_MIS_OPENING_CACHE[symbol] = (stored_at, row)
+            fresh_timestamps = (
+                np.asarray(fresh.timestamps_ms, dtype=np.int64)
+                if fresh.timestamps_ms is not None
+                else np.zeros((len(missing_symbols),), dtype=np.int64)
+            )
+            accepted_count = 0
+            for local_idx, symbol in enumerate(missing_symbols):
+                # Cache only a positive, receipt-timestamped opening price from
+                # this Taipei session.  A symbol can begin trading a few
+                # seconds after 09:00; caching its initial blank for six hours
+                # would permanently suppress the self-healing retry.
+                open_price = float(fresh_opens[local_idx])
+                timestamp_ms = int(fresh_timestamps[local_idx])
+                if not (
+                    np.isfinite(open_price)
+                    and open_price > 0.0
+                    and _same_taipei_session_timestamp(timestamp_ms, session_date)
+                ):
+                    continue
+                accepted_count += 1
+                row: dict[str, float | int | bool | None] = {
+                    "available": bool(fresh_available[local_idx]),
+                    "price": (
+                        float(fresh.prices[local_idx])
+                        if fresh_available[local_idx]
+                        and np.isfinite(fresh.prices[local_idx])
+                        else None
+                    ),
+                    "timestamp_ms": timestamp_ms,
+                }
+                for field in _PRICE_SNAPSHOT_ARRAY_FIELDS:
+                    values = getattr(fresh, field)
+                    value = (
+                        float(np.asarray(values)[local_idx])
+                        if values is not None
+                        else float("nan")
+                    )
+                    row[field] = value if np.isfinite(value) else None
+                _TW_MIS_OPENING_CACHE[symbol] = (stored_at, row)
+            if accepted_count:
                 _persist_tw_mis_opening_receipt(
                     parquet_root=cache_key[0],
                     session_date=session_date,

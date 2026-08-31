@@ -1358,7 +1358,18 @@ def main() -> None:
             for spec in specs
         ]
     else:
-        _require_received_entry_book(specs)
+        # Historical reconstruction is deliberately different from the live
+        # runner.  It is recorded at 09:01 and values every eligible order at
+        # the already observed official session open.  Never inherit the live
+        # causal best-quote policy merely because both paths share ModeSpec.
+        specs = [
+            replace(
+                spec,
+                entry_fill_policy=ENTRY_FILL_POLICY_OFFICIAL_OPEN_AT_0901,
+                entry_price_offset_ticks=0,
+            )
+            for spec in specs
+        ]
     specs_by_market = {spec.market: spec for spec in specs}
     twse_daily_ohlcv_path = args.twse_daily_ohlcv_path.resolve()
     tpex_daily_ohlcv_path = args.tpex_daily_ohlcv_path.resolve()

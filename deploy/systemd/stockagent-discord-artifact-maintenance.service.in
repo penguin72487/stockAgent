@@ -1,0 +1,24 @@
+[Unit]
+Description=StockAgent isolated Discord artifact maintenance
+Wants=network-online.target time-sync.target
+After=network-online.target time-sync.target
+
+[Service]
+Type=oneshot
+User=@SERVICE_USER@
+Group=@SERVICE_GROUP@
+WorkingDirectory=@REPO_ROOT@
+Environment="HOME=@SERVICE_HOME@"
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=/usr/bin/bash "@REPO_ROOT@/scripts/run_discord_artifact_maintenance.sh"
+TimeoutStartSec=2h
+KillMode=control-group
+# Historical full-universe inference is best effort.  Keep the Discord Gateway
+# and the independent opening engine ahead of it under CPU, I/O, or OOM stress.
+Nice=15
+CPUWeight=10
+IOWeight=10
+OOMScoreAdjust=500
+
+[Install]
+WantedBy=multi-user.target
