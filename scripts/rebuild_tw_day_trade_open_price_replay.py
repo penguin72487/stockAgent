@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
-"""Rebuild day-trade paper sessions from historical opening books.
+"""Rebuild day-trade paper sessions from official session opens.
 
-This is an explicitly counterfactual, simulation-only recovery utility.  With
-``--allow-adverse-tick-fallback`` it queries each actionable symbol's first
+The active contract records paper execution at 09:01 using the official session
+open for both directions. Missing official opens fail closed; no Bid/Ask, last
+price, or adverse-tick substitute is allowed. This is explicitly counterfactual
+because a 09:01 order cannot receive the already completed opening price.
+
+Legacy forensic modes remain available. With
+``--paper-market-at-best`` it queries each actionable symbol's first
 historical Shioaji level-one quote during the 09:00 minute.  Buys and covers use
-the best ask; sells and shorts use the best bid and consume only that displayed
-depth.  If the required side is unavailable, the row is separately labelled
-and filled at the official session open moved one adverse legal tick.  The
-fallback is never represented as a received book or a broker fill.
+the best ask; sells and shorts use the best bid, and the complete requested
+paper quantity is filled at that observed price without claiming exchange
+depth or queue priority. If the required side is unavailable, the row is
+separately labelled and filled at the official session open moved one adverse
+legal tick. The fallback is never represented as a received book or broker fill.
 """
 
 from __future__ import annotations
@@ -39,6 +45,8 @@ from downloader.download_tw_public_data import (  # noqa: E402
 from stockagent.live.tw_day_trade_simulation import (  # noqa: E402
     ENTRY_FILL_POLICY_CAUSAL_BOOK,
     ENTRY_FILL_POLICY_CAUSAL_BOOK_ELSE_OPEN_TICK,
+    ENTRY_FILL_POLICY_MARKET_AT_BEST_ELSE_OPEN_TICK,
+    ENTRY_FILL_POLICY_OFFICIAL_OPEN_AT_0901,
     ModeSpec,
     TwDayTradeSimulationEngine,
     load_live_eligibility,
@@ -75,6 +83,39 @@ def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
         encoding="utf-8",
     )
     temporary.replace(path)
+
+
+def _retain_benchmark_history(source_path: Path, state_dir: Path) -> dict[str, Any]:
+    """Carry the read-only dashboard benchmark ledger into a replay candidate."""
+
+    source_path = source_path.resolve()
+    raw = source_path.read_bytes()
+    payload = json.loads(raw)
+    if not isinstance(payload, dict) or not isinstance(payload.get("marks"), list):
+        raise ValueError(f"invalid benchmark history ledger: {source_path}")
+    required_origins = {
+        "benchmark_0050",
+        "benchmark_2330",
+        "benchmark_tx_continuous",
+    }
+    origins = payload.get("origins") or {}
+    if not isinstance(origins, Mapping) or not required_origins.issubset(origins):
+        raise ValueError(
+            "benchmark history source is incomplete: "
+            f"{sorted(required_origins - set(origins))}"
+        )
+    destination = state_dir / "benchmark_history.json"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_suffix(destination.suffix + ".tmp")
+    temporary.write_bytes(raw)
+    temporary.replace(destination)
+    return {
+        "path": str(source_path),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "marks": len(payload["marks"]),
+        "origins": sorted(origins),
+        "destination": str(destination),
+    }
 
 
 def _retained_rule_response_kind(dataset: str, raw: bytes) -> str:
@@ -219,9 +260,19 @@ def _load_retained_historical_entry_books(
     *,
     historical_book_root: Path,
     trading_date: date,
+    allow_missing: bool = False,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
     path = historical_book_root / f"{trading_date.isoformat()}.parquet"
     if not path.is_file():
+        if allow_missing:
+            return {}, {
+                "source": "retained_historical_entry_book_missing",
+                "source_path": str(path.resolve()),
+                "source_rows": 0,
+                "source_missing": True,
+                "additional_shioaji_requests": 0,
+                "fallback_authorized": True,
+            }
         raise FileNotFoundError(path)
     frame = pl.read_parquet(path)
     if "symbol" not in frame.columns:
@@ -391,7 +442,11 @@ def _entry_quotes(
         )
         use_adverse_tick_fallback = bool(
             potentially_executable
-            and spec.entry_fill_policy == ENTRY_FILL_POLICY_CAUSAL_BOOK_ELSE_OPEN_TICK
+            and spec.entry_fill_policy
+            in {
+                ENTRY_FILL_POLICY_CAUSAL_BOOK_ELSE_OPEN_TICK,
+                ENTRY_FILL_POLICY_MARKET_AT_BEST_ELSE_OPEN_TICK,
+            }
             and not has_required_best_quote
         )
         if has_required_best_quote:
@@ -1136,6 +1191,9 @@ def _position_stats(mode: Mapping[str, Any]) -> dict[str, Any]:
         "entry_synthetic_fallback_fill_count": int(
             mode.get("entry_synthetic_fallback_fill_count") or 0
         ),
+        "entry_official_open_fill_count": int(
+            mode.get("entry_official_open_fill_count") or 0
+        ),
         "entry_requested_shares": int(mode.get("entry_requested_shares") or 0),
         "entry_filled_shares": int(mode.get("entry_filled_shares") or 0),
         "entry_unfilled_shares": int(mode.get("entry_unfilled_shares") or 0),
@@ -1182,6 +1240,14 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--benchmark-history-source",
+        type=Path,
+        help=(
+            "Read-only benchmark_history.json to retain in the replay candidate. "
+            "Defaults to SOURCE_LEDGER_DIR/benchmark_history.json when present."
+        ),
+    )
+    parser.add_argument(
         "--historical-book-root",
         type=Path,
         help=(
@@ -1197,13 +1263,25 @@ def build_parser() -> argparse.ArgumentParser:
             "The default rebuilds enabled modes only."
         ),
     )
-    parser.add_argument(
+    entry_policy = parser.add_mutually_exclusive_group()
+    entry_policy.add_argument(
         "--allow-adverse-tick-fallback",
         action="store_true",
         help=(
             "Explicitly authorize the historical hybrid contract: use the first "
             "Shioaji best ask/bid in the 09:00 minute when present, otherwise "
             "fill at the official open moved one adverse legal tick."
+        ),
+    )
+    entry_policy.add_argument(
+        "--paper-market-at-best",
+        action="store_true",
+        help=(
+            "Use the active paper-market-order contract: fill every legal whole-lot "
+            "request at the first retained 09:00 best ask/bid, ignoring displayed "
+            "depth as a quantity cap; use one adverse open tick only when that side "
+            "has no retained best quote. This is simulation-only and makes no "
+            "exchange-fill claim."
         ),
     )
     parser.add_argument(
@@ -1261,7 +1339,16 @@ def main() -> None:
         raise RuntimeError(f"mode configuration errors: {errors}")
     if not specs:
         raise RuntimeError("no enabled day-trade simulation modes")
-    if args.allow_adverse_tick_fallback:
+    if args.paper_market_at_best:
+        specs = [
+            replace(
+                spec,
+                entry_fill_policy=ENTRY_FILL_POLICY_MARKET_AT_BEST_ELSE_OPEN_TICK,
+                entry_price_offset_ticks=1,
+            )
+            for spec in specs
+        ]
+    elif args.allow_adverse_tick_fallback:
         specs = [
             replace(
                 spec,
@@ -1271,7 +1358,18 @@ def main() -> None:
             for spec in specs
         ]
     else:
-        _require_received_entry_book(specs)
+        # Historical reconstruction is deliberately different from the live
+        # runner.  It is recorded at 09:01 and values every eligible order at
+        # the already observed official session open.  Never inherit the live
+        # causal best-quote policy merely because both paths share ModeSpec.
+        specs = [
+            replace(
+                spec,
+                entry_fill_policy=ENTRY_FILL_POLICY_OFFICIAL_OPEN_AT_0901,
+                entry_price_offset_ticks=0,
+            )
+            for spec in specs
+        ]
     specs_by_market = {spec.market: spec for spec in specs}
     twse_daily_ohlcv_path = args.twse_daily_ohlcv_path.resolve()
     tpex_daily_ohlcv_path = args.tpex_daily_ohlcv_path.resolve()
@@ -1325,25 +1423,57 @@ def main() -> None:
             "benchmark_ids": sorted(benchmarks),
             "source_updated_at": benchmark_state_payload.get("updated_at"),
         }
+    benchmark_history_path = args.benchmark_history_source
+    if benchmark_history_path is None and args.source_ledger_dir is not None:
+        inferred_history = args.source_ledger_dir.resolve() / "benchmark_history.json"
+        if inferred_history.is_file():
+            benchmark_history_path = inferred_history
+    benchmark_history_provenance = (
+        _retain_benchmark_history(benchmark_history_path, state_dir)
+        if benchmark_history_path is not None
+        else None
+    )
     current = datetime.now(TAIPEI)
+    paper_market_at_best = bool(args.paper_market_at_best)
+    official_open_at_0901 = bool(specs) and all(
+        spec.entry_fill_policy == ENTRY_FILL_POLICY_OFFICIAL_OPEN_AT_0901
+        for spec in specs
+    )
+    replay_entry_contract = (
+        "retrospective_official_session_open_at_09_01_counterfactual"
+        if official_open_at_0901
+        else "retrospective_historical_best_quote_market_else_adverse_open_tick_counterfactual"
+        if paper_market_at_best
+        else "retrospective_historical_best_quote_else_adverse_open_tick_counterfactual"
+        if bool(args.allow_adverse_tick_fallback)
+        else "retrospective_observed_best_quote_counterfactual"
+    )
     receipt: dict[str, Any] = {
         "schema_version": 2,
         "created_at": current.isoformat(timespec="seconds"),
         "simulation_only": True,
         "production_order_possible": False,
         "replay_contract": {
-            "entry": (
-                "retrospective_historical_best_quote_else_adverse_open_tick_counterfactual"
-            ),
+            "entry": replay_entry_contract,
             "entry_price": (
-                "market buy/cover uses first historical best ask in the 09:00 minute; "
+                "every direction uses the official session open and missing opens "
+                "fail closed without Bid/Ask, last-price, or adverse-tick substitution"
+                if official_open_at_0901
+                else "market buy/cover uses first historical best ask in the 09:00 minute; "
                 "market sell/short uses first historical best bid; missing required "
                 "side uses official session open moved one adverse legal tick"
             ),
             "entry_liquidity": (
-                "historical best quote consumes only its recorded level-one displayed "
-                "lots; adverse one-tick fallback is counterfactual unbounded and makes "
-                "no exchange or broker fill claim"
+                "complete independently legal whole-lot paper quantity at the official "
+                "open without any exchange-fill or queue claim"
+                if official_open_at_0901
+                else "complete requested paper quantity at the observed historical best "
+                "quote without an exchange-depth claim; adverse one-tick fallback "
+                "when that side is absent"
+                if paper_market_at_best
+                else "historical best quote consumes only its recorded level-one "
+                "displayed lots; adverse one-tick fallback is counterfactual "
+                "unbounded and makes no exchange or broker fill claim"
             ),
             "whole_lot_execution": (
                 "each symbol is executed independently after eligibility, legal-price, "
@@ -1353,13 +1483,18 @@ def main() -> None:
             "completed_session_exit": "official daily close",
             "intraday_path": "not reconstructed; daily-limit bracket ordering is not inferred from OHLC",
             "current_session": "left open for ordinary live quote service",
-            "recorded_entry_time": "09:00:00 Asia/Taipei for every replayed session",
-            "historical_quote_window": "09:00:00-09:00:59 Asia/Taipei",
+            "recorded_entry_time": "09:01:00 Asia/Taipei for every replayed session",
+            "historical_quote_window": (
+                "not used by official-open execution"
+                if official_open_at_0901
+                else "09:00:00-09:00:59 Asia/Taipei"
+            ),
             "source_signal_time": "retained separately for provenance",
         },
         "state_dir": str(state_dir),
         "source_signal_ledger": source_ledger_provenance,
         "retained_benchmark_state": benchmark_state_provenance,
+        "retained_benchmark_history": benchmark_history_provenance,
         "official_daily_aggregate_sources": {
             "twse": {
                 "path": str(twse_daily_ohlcv_path),
@@ -1509,15 +1644,32 @@ def main() -> None:
                     coverage,
                 )
             )
-        requested_book_symbols = _historical_book_request_symbols(
-            prepared_modes,
-            canonical_open_by_symbol,
+        requested_book_symbols = (
+            []
+            if official_open_at_0901
+            else _historical_book_request_symbols(
+                prepared_modes,
+                canonical_open_by_symbol,
+            )
         )
-        if args.historical_book_root is not None:
+        if official_open_at_0901:
+            historical_books = {}
+            historical_book_query = {
+                "source": "not_required_for_official_open_at_09_01",
+                "trading_date": day.isoformat(),
+                "requested_symbols": 0,
+                "resolved_book_symbols": 0,
+                "additional_shioaji_requests": 0,
+            }
+        elif args.historical_book_root is not None:
             historical_books, historical_book_query = (
                 _load_retained_historical_entry_books(
                     historical_book_root=args.historical_book_root.resolve(),
                     trading_date=day,
+                    allow_missing=bool(
+                        args.allow_adverse_tick_fallback
+                        or args.paper_market_at_best
+                    ),
                 )
             )
             historical_book_query.update(
@@ -1567,7 +1719,7 @@ def main() -> None:
             eligibility,
             coverage,
         ) in prepared_modes:
-            observed = datetime.combine(day, time(9, 0), tzinfo=TAIPEI)
+            observed = datetime.combine(day, time(9, 1), tzinfo=TAIPEI)
             replay_summary = dict(summary)
             replay_summary.update(
                 {
@@ -1582,19 +1734,28 @@ def main() -> None:
                     "weights_path": str(weights_path.resolve()),
                     "simulation_replay": True,
                     "replay_basis": (
-                        "historical_best_quote_else_adverse_open_tick_to_official_close"
+                        "official_session_open_at_09_01_to_official_close"
+                        if official_open_at_0901 and should_close
+                        else "official_session_open_at_09_01_to_live_quotes"
+                        if official_open_at_0901
+                        else "historical_best_quote_else_adverse_open_tick_to_official_close"
                         if should_close
                         else "historical_best_quote_else_adverse_open_tick_to_live_quotes"
                     ),
                     "replay_source": (
-                        "immutable_live_signal_shioaji_historical_tick_and_official_market_data"
+                        "immutable_live_signal_and_official_daily_session_open"
+                        if official_open_at_0901
+                        else "immutable_live_signal_shioaji_historical_tick_and_official_market_data"
                     ),
-                    "entry_fill_contract": (
-                        "retrospective_historical_best_quote_else_adverse_open_tick_counterfactual"
-                    ),
+                    "entry_fill_contract": replay_entry_contract,
                     "entry_liquidity_assumption": (
-                        "historical_tick_level_one_depth_else_counterfactual_unbounded_"
-                        "adverse_open_tick_fallback"
+                        "official_open_full_requested_paper_quantity_no_exchange_fill_claim"
+                        if official_open_at_0901
+                        else "historical_best_quote_full_requested_paper_quantity_else_"
+                        "adverse_open_tick_no_exchange_depth_claim"
+                        if paper_market_at_best
+                        else "historical_tick_level_one_depth_else_counterfactual_"
+                        "unbounded_adverse_open_tick_fallback"
                     ),
                     "replay_effective_signal_at": observed.isoformat(
                         timespec="seconds"

@@ -46,6 +46,7 @@ LEGACY_TX_SOURCE = "shioaji_txfr1_historical_ticks_v1"
 RECEIPT_SCHEMA_VERSION = 1
 MANIFEST_SCHEMA_VERSION = 2
 CONTRACT_UNAVAILABLE_EXIT = 78
+CONNECTION_CAPACITY_EXIT = 79
 HISTORY_START = date(2020, 3, 22)
 
 
@@ -55,7 +56,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--calendar-path",
         type=Path,
-        default=Path("data_tw_index_futures/day_session_front_month.parquet"),
+        default=Path("data_tw_index_futures/day_session_contracts.parquet"),
     )
     parser.add_argument(
         "--output-dir",
@@ -348,7 +349,18 @@ def main() -> int:
     usage: tuple[int, int] | None = None
     try:
         api.set_event_callback(lambda *_args: None)
-        api.login(api_key=api_key, secret_key=secret_key, subscribe_trade=False)
+        try:
+            api.login(api_key=api_key, secret_key=secret_key, subscribe_trade=False)
+        except Exception as exc:  # noqa: BLE001 - normalize broker exception surface.
+            if getattr(exc, "code", None) == 451 or "Too Many Connections" in str(exc):
+                print(
+                    "[shioaji-futures-history] "
+                    f"contract={args.contract} status=waiting_connection_capacity "
+                    "broker_code=451 retryable=true",
+                    flush=True,
+                )
+                return CONNECTION_CAPACITY_EXIT
+            raise
         logged_in = True
         contract = api.contracts.get(str(args.contract))
         if contract is None:

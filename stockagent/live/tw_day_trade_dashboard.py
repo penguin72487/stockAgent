@@ -25,6 +25,14 @@ DASHBOARD_SCHEMA_VERSION: Final[int] = 5
 DEFAULT_MAX_SOURCE_AGE_SECONDS: Final[float] = 30.0
 TAIPEI: Final[ZoneInfo] = ZoneInfo("Asia/Taipei")
 BENCHMARK_HISTORY_FILENAME: Final[str] = "benchmark_history.json"
+DEFAULT_OPENING_GATE_PATH: Final[Path] = (
+    Path(__file__).resolve().parents[2]
+    / "artifacts/data_refresh/tw_public/preopen_gate/latest.json"
+)
+DEFAULT_UNATTENDED_GUARDIAN_PATH: Final[Path] = (
+    Path(__file__).resolve().parents[2]
+    / "artifacts/operations/tw_day_trade_guardian/latest.json"
+)
 CHART_RANGE_SECONDS: Final[dict[str, int | None]] = {
     "1h": 60 * 60,
     "1d": 24 * 60 * 60,
@@ -196,6 +204,74 @@ def _object(path: Path) -> dict[str, Any]:
         with _OBJECT_CACHE_LOCK:
             _OBJECT_CACHE[cache_key] = (*signature, payload)
     return dict(payload)
+
+
+def _unattended_guardian_status(
+    *, path: Path, observed: datetime
+) -> dict[str, Any]:
+    try:
+        receipt = _object(path)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {
+            "status": "missing",
+            "ready": False,
+            "age_seconds": None,
+            "failure_count": 1,
+            "warning_count": 0,
+            "action_count": 0,
+            "components": {},
+        }
+    receipt_age = age_seconds(receipt.get("observed_at_taipei"), now=observed)
+    components = receipt.get("components")
+    components = dict(components) if isinstance(components, Mapping) else {}
+    time_sync = components.get("time_sync")
+    source_events = components.get("source_events")
+    runtime_sync = components.get("runtime_sync")
+    public_dashboard = components.get("public_dashboard")
+    post_close = components.get("post_close_flat")
+    disks = components.get("disks")
+    disk_rows = dict(disks) if isinstance(disks, Mapping) else {}
+    return {
+        "status": str(receipt.get("status") or "unknown"),
+        "ready": bool(receipt.get("ready") is True),
+        "observed_at_taipei": receipt.get("observed_at_taipei"),
+        "age_seconds": round(receipt_age, 3) if receipt_age is not None else None,
+        "failure_count": len(receipt.get("failures") or ()),
+        "warning_count": len(receipt.get("warnings") or ()),
+        "action_count": len(receipt.get("actions") or ()),
+        "simulation_only": receipt.get("simulation_only") is True,
+        "production_order_possible": bool(
+            receipt.get("production_order_possible", True)
+        ),
+        "components": {
+            "time_sync": bool(
+                isinstance(time_sync, Mapping) and time_sync.get("ready") is True
+            ),
+            "source_events": bool(
+                isinstance(source_events, Mapping)
+                and source_events.get("ready") is True
+            ),
+            "runtime_sync": bool(
+                isinstance(runtime_sync, Mapping)
+                and runtime_sync.get("ready") is True
+            ),
+            "public_dashboard": bool(
+                isinstance(public_dashboard, Mapping)
+                and public_dashboard.get("ready") is True
+            ),
+            "post_close_flat": bool(
+                isinstance(post_close, Mapping)
+                and post_close.get("ready") is True
+            ),
+            "disk": bool(
+                disk_rows
+                and all(
+                    isinstance(row, Mapping) and row.get("ready") is True
+                    for row in disk_rows.values()
+                )
+            ),
+        },
+    }
 
 
 def _as_path(path: Path, value: Any) -> Path | None:
@@ -803,6 +879,23 @@ def _rebase_live_benchmark(
     """
 
     row = dict(source)
+    if (
+        str(row.get("instrument_type") or "").startswith("stock")
+        and str(row.get("valuation_source") or "").startswith(
+            "corporate_action_reference_unavailable"
+        )
+    ):
+        row.update(
+            {
+                "total_equity_twd": None,
+                "net_pnl_twd": None,
+                "return_fraction": None,
+                "return_pct": None,
+                "valuation_stale": True,
+                "benchmark_origin_error": "total_return_source_incomplete",
+            }
+        )
+        return row
     if not origin or bool(row.get("benchmark_origin_rebased")):
         return row
     expected = origin.get("live_origin") or {}
@@ -1239,7 +1332,7 @@ def _operational_issues(
         "official_open_price_unavailable": (
             "error",
             "官方開盤價不可用",
-            "缺少有效官方開盤價，開盤價 Tick 模擬成交已停止。",
+            "歷史回補缺少有效官方開盤價，09:01 反事實計價已停止；不使用 Bid/Ask、最後價或 +1 Tick 替代。",
         ),
         "synthetic_open_tick_price_unavailable": (
             "error",
@@ -1774,10 +1867,16 @@ def build_dashboard_history_snapshot(
         for row in series_rows:
             session = str(row["session_date"])
             session_point_counts[session] = session_point_counts.get(session, 0) + 1
-        # Right-labelled historical KBars cover 09:01..13:30 (270 points).
-        # Strategy ledgers additionally retain the accepted 09:00 execution
-        # endpoint, so their full-session curve has 271 observations.
-        points_per_session = 271 if first["series_type"] == "strategy" else 270
+        # The strategy is 09:01..13:30 because there is deliberately no
+        # fabricated 09:00 position. Cash benchmarks retain the 09:00 official
+        # open, while the right-labelled TX day session covers 08:46..13:45.
+        points_per_session = (
+            270
+            if first["series_type"] == "strategy"
+            else 300
+            if series_id == "benchmark_tx_continuous"
+            else 271
+        )
         expected_minute_points = points_per_session * len(session_point_counts)
         range_summary.append(
             {
@@ -1856,7 +1955,9 @@ def build_dashboard_history_snapshot(
         "downsampled": len(sampled) < len(rows),
         "curve_granularity": "1m",
         "expected_right_labelled_session_minute_points": 270,
-        "expected_strategy_session_points_including_09_00": 271,
+        "expected_strategy_session_points_from_09_01": 270,
+        "expected_stock_benchmark_session_points_including_09_00": 271,
+        "expected_tx_day_session_points": 300,
         "return_basis": "previous_retained_mark_before_start_else_initial_capital",
         "range_summary": range_summary,
         "historical_minute_replay_points": len(historical_rows),
@@ -1907,6 +2008,12 @@ def _preopen_progress(
     if not isinstance(raw_markets, Mapping):
         raw_markets = {}
     rows: list[dict[str, Any]] = []
+    session_date = observed.astimezone(TAIPEI).date().isoformat()
+    local_time = observed.astimezone(TAIPEI).time()
+    final_arm_current_process_required = (
+        datetime_time(8, 55) <= local_time < datetime_time(9, 0)
+    )
+    process_run_id = str(payload.get("run_id") or "")
     for mode in modes:
         market = str(mode.get("market") or "")
         signal_market = str(mode.get("signal_market") or market)
@@ -1939,6 +2046,62 @@ def _preopen_progress(
         final_arm_latency = (
             dict(final_arm_latency) if isinstance(final_arm_latency, Mapping) else {}
         )
+        final_arm_quote_prewarm = final_arm.get("quote_prewarm")
+        final_arm_quote_prewarm = (
+            dict(final_arm_quote_prewarm)
+            if isinstance(final_arm_quote_prewarm, Mapping)
+            else {}
+        )
+        final_arm_requested = int(
+            final_arm_quote_prewarm.get("requested_count") or 0
+        )
+        final_arm_run_id = str(final_arm.get("run_id") or "")
+        final_arm_contract_ready = bool(
+            final_arm.get("status") == "ready"
+            and final_arm_run_id
+            and _is_taipei_session_date(
+                final_arm.get("completed_at"), session_date
+            )
+            and final_arm_latency.get("panel_cache_hit") is True
+            and final_arm_latency.get("checkpoint_cache_hit") is True
+            and final_arm_latency.get("model_cache_hit") is True
+            and final_arm_quote_prewarm.get("ready") is True
+            and final_arm_quote_prewarm.get("run_id") == final_arm_run_id
+            and final_arm_quote_prewarm.get("connection_scope") == "process"
+            and final_arm_requested > 0
+            and int(final_arm_quote_prewarm.get("primed_count") or 0)
+            == final_arm_requested
+            and int(final_arm_quote_prewarm.get("resolved_count") or 0)
+            == final_arm_requested
+            and int(final_arm_quote_prewarm.get("missing_count") or 0) == 0
+        )
+        final_arm_hot_ready = bool(
+            final_arm_contract_ready
+            and process_run_id
+            and final_arm_run_id == process_run_id
+        )
+        preparation_status = status
+        recovered_signal_id = str(mode.get("signal_id") or "")
+        recovered_at = mode.get("entry_completed_at")
+        recovered_late = bool(
+            status == "failed"
+            and str(mode.get("engine_status") or "") in {"active", "completed"}
+            and str(mode.get("session_date") or "") == session_date
+            and recovered_signal_id
+            and _is_taipei_session_date(recovered_at, session_date)
+        )
+        if recovered_late:
+            # Preserve the failed preparation stage while reflecting the newer
+            # durable engine fact.  The separate opening gate still records a
+            # missed 09:00 SLO, so this never rewrites a late recovery as an
+            # on-time preopen success.
+            status = "recovered_late"
+        if (
+            final_arm_current_process_required
+            and status == "ready"
+            and not final_arm_hot_ready
+        ):
+            status = "pending"
         inference_ms = _finite_float(latency.get("model_inference_ms"))
         price_limits = item.get("preopen_price_limits")
         price_limits = dict(price_limits) if isinstance(price_limits, Mapping) else {}
@@ -1965,6 +2128,12 @@ def _preopen_progress(
                 "signal_market": signal_market,
                 "reuses_signal": reuses_signal,
                 "status": status,
+                "preparation_status": preparation_status,
+                "recovered_late": recovered_late,
+                "recovered_signal_id": (
+                    recovered_signal_id if recovered_late else None
+                ),
+                "recovered_at": recovered_at if recovered_late else None,
                 "progress_ratio": round(progress_ratio, 6),
                 "step": step or None,
                 "total": total or None,
@@ -1992,6 +2161,11 @@ def _preopen_progress(
                 "model_cache_hit": latency.get("model_cache_hit"),
                 "panel_cache_hit": latency.get("panel_cache_hit"),
                 "final_arm_status": final_arm.get("status"),
+                "final_arm_contract_ready": final_arm_contract_ready,
+                "final_arm_current_process_required": (
+                    final_arm_current_process_required
+                ),
+                "final_arm_hot_ready": final_arm_hot_ready,
                 "final_arm_completed_at": final_arm.get("completed_at"),
                 "final_arm_elapsed_seconds": _finite_float(
                     final_arm.get("elapsed_seconds")
@@ -2002,6 +2176,34 @@ def _preopen_progress(
                     "checkpoint_cache_hit"
                 ),
                 "final_arm_model_cache_hit": final_arm_latency.get("model_cache_hit"),
+                "final_arm_quote_ready": final_arm_quote_prewarm.get("ready"),
+                "final_arm_quote_connection_scope": final_arm_quote_prewarm.get(
+                    "connection_scope"
+                ),
+                "final_arm_quote_requested": int(
+                    final_arm_quote_prewarm.get("requested_count") or 0
+                ),
+                "final_arm_quote_primed": int(
+                    final_arm_quote_prewarm.get("primed_count") or 0
+                ),
+                "final_arm_quote_resolved": int(
+                    final_arm_quote_prewarm.get("resolved_count") or 0
+                ),
+                "final_arm_quote_missing": int(
+                    final_arm_quote_prewarm.get("missing_count") or 0
+                ),
+                "final_arm_quote_snapshot_prefetched": final_arm_quote_prewarm.get(
+                    "snapshot_prefetched"
+                ),
+                "final_arm_mis_fallback_ready": (
+                    dict(final_arm.get("tw_mis_fallback_prewarm") or {}).get(
+                        "ready"
+                    )
+                    if isinstance(
+                        final_arm.get("tw_mis_fallback_prewarm"), Mapping
+                    )
+                    else None
+                ),
                 "final_arm_compute_ms": _finite_float(
                     final_arm_latency.get("compute_before_publish_ms")
                 ),
@@ -2026,11 +2228,20 @@ def _preopen_progress(
                     for value in rule_venues.values()
                     if isinstance(value, Mapping)
                 ),
-                "error": item.get("error"),
+                "preparation_error": item.get("error"),
+                "error": None if recovered_late else item.get("error"),
                 "public_error_code": (
-                    "preopen_data_update_failed" if status == "failed" else None
+                    "preopen_recovered_late"
+                    if recovered_late
+                    else "preopen_data_update_failed"
+                    if status == "failed"
+                    else None
                 ),
                 "public_error_message": (
+                    "盤前準備曾失敗，但今日訊號與模擬帳本已耐久提交；"
+                    "09:00 準時性事故仍保留於 opening gate。"
+                    if recovered_late
+                    else
                     "盤前公開資料、特徵或模型準備失敗；請查看此模式並等待重新驗證。"
                     if status == "failed"
                     else None
@@ -2038,7 +2249,10 @@ def _preopen_progress(
             }
         )
 
-    ready_count = sum(row["status"] == "ready" for row in rows)
+    ready_count = sum(
+        row["status"] in {"ready", "recovered_late"} for row in rows
+    )
+    recovered_count = sum(row["status"] == "recovered_late" for row in rows)
     failed_count = sum(row["status"] == "failed" for row in rows)
     terminal_count = ready_count + failed_count
     running_count = sum(row["status"] == "running" for row in rows)
@@ -2050,6 +2264,8 @@ def _preopen_progress(
     overall_status = (
         "failed"
         if failed_count
+        else "recovered_late"
+        if recovered_count
         else "ready"
         if rows and ready_count == len(rows)
         else "running"
@@ -2065,6 +2281,7 @@ def _preopen_progress(
             else None
         ),
         "ready_count": ready_count,
+        "recovered_count": recovered_count,
         "failed_count": failed_count,
         "running_count": running_count,
         "completed_count": terminal_count,
@@ -2218,6 +2435,24 @@ def _session_progress(
             ),
         )
     expected_mode_marks = elapsed_active_minutes * max(0, mode_count)
+    mark_tracking_completed_modes = sum(
+        str(mode.get("session_date") or "") == day.isoformat()
+        and int(mode.get("open_position_count") or 0) == 0
+        and _is_taipei_session_date(
+            mode.get("residual_conversion_completed_at"), day.isoformat()
+        )
+        for mode in modes
+    )
+    mark_tracking_complete = bool(
+        local >= session_end_at
+        and mode_count > 0
+        and mark_tracking_completed_modes == mode_count
+    )
+    # Once every mode is durably flat, later flat-forward rows carry no new
+    # valuation information.  Do not compare the observed curve against a
+    # fictitious 265-minute requirement after an earlier valid exit.
+    if mark_tracking_complete:
+        expected_mode_marks = len(unique_mode_minutes)
     return {
         "phase": phase,
         "label": label,
@@ -2242,6 +2477,8 @@ def _session_progress(
         "exit_progress_ratio": _ratio(exit_started, mode_count),
         "observed_mode_minutes": len(unique_mode_minutes),
         "expected_mode_minutes": expected_mode_marks,
+        "mark_tracking_completed_modes": mark_tracking_completed_modes,
+        "mark_tracking_complete": mark_tracking_complete,
         "mark_progress_ratio": _ratio(len(unique_mode_minutes), expected_mode_marks),
         "mark_rows_per_minute": (
             round(len(unique_mode_minutes) / elapsed_active_minutes, 3)
@@ -2365,6 +2602,7 @@ def build_dashboard_snapshot(
     maximum_event_rows: int = 2_000,
     maximum_mark_rows: int = 4_000,
     include_position_rows: bool = True,
+    unattended_guardian_path: Path = DEFAULT_UNATTENDED_GUARDIAN_PATH,
 ) -> dict[str, Any]:
     root = Path(state_dir)
     state = _object(root / "state.json")
@@ -2379,6 +2617,9 @@ def build_dashboard_snapshot(
         state_dir=root,
         discord_service_status_path=discord_service_status_path,
         now=observed,
+    )
+    unattended_guardian = _unattended_guardian_status(
+        path=Path(unattended_guardian_path), observed=observed
     )
     available_session_dates = _available_session_dates(
         root=root,
@@ -2547,6 +2788,9 @@ def build_dashboard_snapshot(
                     "closing_auction_submitted_at"
                 ),
                 "closing_auction_settled_at": mode.get("closing_auction_settled_at"),
+                "residual_conversion_completed_at": mode.get(
+                    "residual_conversion_completed_at"
+                ),
                 "force_exit_failures": mode.get("force_exit_failures", 0),
                 "terminal_flatten_count": mode.get("terminal_flatten_count", 0),
                 "terminal_flatten_degraded_count": mode.get(
@@ -2875,6 +3119,44 @@ def build_dashboard_snapshot(
         preopen=preopen,
         observed=preopen_observed,
     )
+    raw_opening_gate = _object(DEFAULT_OPENING_GATE_PATH) if operational_view else {}
+    opening_gate = (
+        {
+            key: raw_opening_gate.get(key)
+            for key in (
+                "schema_version",
+                "status",
+                "ready",
+                "strict",
+                "session_date",
+                "observed_at_taipei",
+                "deadline_taipei",
+                "failures",
+                "engine_runtime",
+                "runtime_sync",
+                "opening_execution",
+            )
+        }
+        if str(raw_opening_gate.get("session_date") or "")
+        == local_observed.date().isoformat()
+        else {}
+    )
+    if opening_gate.get("status") == "failed":
+        operational_issues.append(
+            {
+                "severity": "error",
+                "scope": "opening_gate",
+                "market": None,
+                "code": "opening_acceptance_failed",
+                "title": "09:00 啟動驗收失敗",
+                "detail": "；".join(
+                    str(value) for value in (opening_gate.get("failures") or ())
+                )
+                or "三個模式尚未完成同日訊號與 ledger 提交。",
+                "count": 1,
+                "observed_at": opening_gate.get("observed_at_taipei"),
+            }
+        )
     if health not in {"stale", "critical"} and any(
         issue.get("severity") in {"error", "warning"} for issue in operational_issues
     ):
@@ -2907,12 +3189,15 @@ def build_dashboard_snapshot(
         "source_updated_at": status.get("updated_at"),
         "source_age_seconds": round(source_age, 3),
         "service_sync": service_sync,
+        "unattended_guardian": unattended_guardian,
+        "ledger_integrity": status.get("ledger_integrity") or {},
         "simulation_only": True,
         "production_order_possible": False,
         "session_date": selected_session_date,
         "available_session_dates": available_session_dates,
         "schedule": status.get("schedule") or {},
         "preopen": preopen,
+        "opening_gate": opening_gate,
         "operational_issues": operational_issues,
         "execution_records": execution_records,
         "latency": latency,
@@ -2943,25 +3228,26 @@ def build_dashboard_snapshot(
             "execution_record": "today's append-only signal_registered or signal_blocked event per mode; stale prior-session timestamps never count",
             "missed_start": "between 09:00 and 13:20, Linux inotify wakes the executor when the atomic latest-signal pointer is published; a 0.1-second timeout remains only as a portable catch-up fallback and the public dashboard remains read-only",
             "signal": "Discord live target_weights.parquet after observed opening quote",
-            "replay": "simulation_replay=true is a retrospective, explicitly counterfactual fill at the actual session open from official daily data, a fresh same-session Shioaji snapshot, or retained provenance-bearing same-session TWSE/TPEx MIS or Shioaji live-signal evidence; it is not a causally executable quote or real order fill",
-            "entry_fill": "causally later best ask for buy or best bid for sell is used immediately after the 09:00 signal-ready timestamp; submitted simulated market quantity is fully filled, while target quantity beyond fresh displayed depth is explicitly left unsubmitted",
-            "latency": "measured signal input through model, atomic artifact publication, consumer discovery, fresh executable quote, and durable simulation-ledger persistence on this host; it is not an external order acknowledgement or venue round-trip measurement",
+            "replay": "simulation_replay=true is recorded at 09:01 and retrospectively values the historical order at the observed official session open; it is explicitly counterfactual and is not a causally executable quote or real order fill",
+            "entry_fill": "live execution starts at 09:00: after the immutable signal pointer is published, buy/cover consumes the first strictly later best Ask and sell/short consumes the first strictly later best Bid; missing causal quotes are blocked without last-price, 09:01, or adverse-tick substitution. Historical replay alone uses the 09:01 official open",
+            "latency": "measured 09:00 trigger through model, atomic artifact publication, consumer discovery, first causally later best quote, and durable simulation-ledger persistence on this host; it is not an external order acknowledgement or venue round-trip measurement",
             "service_sync": "Discord, the paper engine, and the dashboard share one compact engine commit revision; Discord acknowledges that revision without reparsing the full ledger and the dashboard fetches heavy state only when the revision changes",
+            "unattended_guardian": "the weekday guardian verifies the schedule clock, all 156 source events, exact-session eligibility, 08:30 acceptance, the three engine/Discord revisions, post-close flatness, public endpoints, and disk headroom; it re-arms existing systemd units but never invents data, signals, or fills",
             "mark": "best bid liquidates long; best ask covers short",
             "missing_mark": "carry only the same open position's last complete liquidation value and flag stale",
             "eligibility": "exact-session TWSE and TPEx official day-trade membership; missing venue/date blocks",
             "fees": "gross commission and sell tax are charged first; earned commission rebate is recorded separately in economic NAV",
             "pnl_split": "realized net PnL uses simulated executable exits plus any explicitly tagged 13:30 terminal ledger flatten, with allocated entry and exit costs; unrealized net liquidation PnL values remaining shares at executable bid or ask after remaining costs; total net PnL is their reconciled sum",
             "comparison": "all strategies and benchmarks are compared as cumulative net return divided by their own capital basis; TX uses one-contract official initial margin, while 0050/2330 use one-board-lot entry notional",
-            "benchmarks": "0050/2330 are total-return benchmarks anchored to the retained actual session open: official ex-date previous-close/reference-price factors reinvest cash dividends and ETF distributions and adjust stock dividends or splits exactly once, then adjusted units are marked at executable bid after tw_cash costs. TXFR1 has no cash distribution; it holds one real TX front-month contract across sessions. Before expiry it rolls only when the old bid and new ask coexist; after expiry it cash-settles the old month only at the official TAIFEX final settlement price and opens the new month at ask. The two bases stay separate, so the calendar spread is never booked as return; fees and statutory futures tax remain explicit",
+            "benchmarks": "0050/2330 are total-return benchmarks anchored to the retained actual session open: the completed-session official corporate-action archive is combined with the current session's official previous close and Shioaji/MIS reference price, so cash dividends and ETF distributions are reinvested and stock dividends or splits are adjusted exactly once without waiting until after close. Adjusted units are then marked at executable bid after tw_cash costs. TXFR1 has no cash distribution; it holds one real TX front-month contract across sessions. Before expiry it rolls only when the old bid and new ask coexist; after expiry it cash-settles the old month only at the official TAIFEX final settlement price and opens the new month at ask. The two bases stay separate, so the calendar spread is never booked as return; fees and statutory futures tax remain explicit",
             "benchmark_history": (
                 "audited actual-open benchmark history is merged read-only with later live executable marks"
                 if benchmark_history.get("origins")
                 else benchmark_history.get("load_error")
                 or "live benchmark marks only; no historical origin file"
             ),
-            "depth_limit": "each mode is an independent counterfactual; only fresh displayed Shioaji level-one volume is fillable (lots x 1,000 shares), while queue and deeper book are unknown; completed-minute participation is additionally required after the opening minute",
-            "bracket_fill": "all four modes move TP and the local SL trigger one legal dated TW tick inward; this improves fill probability but does not guarantee a fill without a trigger and executable counterparty volume",
+            "depth_limit": "live entry quantity is bounded by independently verified eligibility, whole lots, price limits, displayed level-one depth, and after 09:01 completed-minute participation; historical 09:01 official-open replay is a separate counterfactual convention and never claims exchange depth, queue priority, or a guaranteed real-market fill",
+            "bracket_fill": "each mode moves TP and the local SL trigger one legal dated TW tick inward; this improves fill probability but does not guarantee a fill without a trigger and executable counterparty volume",
             "exit_schedule": "from 13:20 through 13:23 each unfilled exit is checked for a real cross and otherwise cancel-repriced once per new minute to the current passive best ask for a sell or best bid for a buy-to-cover; at 13:24 it is replaced by a marketable exit attempt",
             "terminal_flatten": "after the 13:30 auction simulation, every residual is closed in a simulation-only terminal ledger pass so a day-trade mode never carries overnight; this is explicitly tagged and is not claimed as an exchange fill",
         },
@@ -3506,6 +3792,7 @@ def build_dashboard_summary(
         "source_updated_at",
         "source_age_seconds",
         "service_sync",
+        "unattended_guardian",
         "session_date",
         "available_session_dates",
         "preopen",

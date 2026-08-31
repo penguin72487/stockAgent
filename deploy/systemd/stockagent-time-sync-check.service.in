@@ -1,0 +1,19 @@
+[Unit]
+Description=Verify and bounded-repair the clock used by StockAgent schedules
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+WorkingDirectory=@REPO_ROOT@
+Environment="HOME=/root"
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=/usr/bin/bash "@REPO_ROOT@/scripts/run_stockagent_time_sync_check.sh"
+TimeoutStartSec=30s
+Nice=-5
+CPUWeight=100
+IOWeight=100
+NoNewPrivileges=false
+PrivateTmp=true

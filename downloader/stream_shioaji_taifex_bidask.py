@@ -757,6 +757,7 @@ def main() -> int:
         flush_rows=int(args.flush_rows),
         flush_seconds=float(args.flush_seconds),
         stale_ms=float(args.stale_ms),
+        accepted_trade_date=capture_trade_date,
     )
     selected_contract_codes = {
         str(getattr(contract, "code", "") or "") for contract in contracts
@@ -971,6 +972,7 @@ def main() -> int:
             "dropped_events": stats.dropped_events,
             "queue_high_watermark": stats.queue_high_watermark,
             "missed_snapshot_seconds": stats.missed_snapshot_seconds,
+            "out_of_scope_events": stats.out_of_scope_events,
             "tick_rows_written": sink.tick_writer.total_rows,
             "book_rows_written": sink.book_writer.total_rows,
             "book_1s_rows_written": sink.snapshot_writer.total_rows,

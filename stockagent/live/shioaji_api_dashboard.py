@@ -23,6 +23,9 @@ from stockagent.data.taifex_sessions import taifex_session_kind
 
 
 HISTORY_UNIT: Final[str] = "stockagent-shioaji-tx-history-backfill.service"
+HISTORICAL_MARKET_UNIT: Final[str] = (
+    "stockagent-shioaji-historical-market-data.service"
+)
 CAPTURE_UNIT: Final[str] = "stockagent-shioaji-taifex-bidask.service"
 MINUTE_UNIT: Final[str] = "stockagent-shioaji-minute-backfill.service"
 TOP200_UNIT: Final[str] = "stockagent-shioaji-top200.service"
@@ -33,6 +36,10 @@ _TRAFFIC_PATTERN = re.compile(r"traffic=([\d,]+)/([\d,]+)")
 _CONTRACT_PATTERN = re.compile(r"\bcontract=([A-Z0-9]+)")
 _WAIT_PATTERN = re.compile(
     r"waiting_seconds=(\d+)\s+reason=([a-z_]+)\s+contract=([A-Z0-9]+)"
+)
+_CALENDAR_LAG_PATTERN = re.compile(
+    r"calendar_lag=true\s+target_end_date=([^ ]+)\s+"
+    r"expected_latest_completed_session=([^ ]+)"
 )
 _CAPTURE_START_PATTERN = re.compile(
     r"capture_start=([^ ]+)\s+capture_id=[^ ]+\s+session=([^ ]+)\s+"
@@ -83,6 +90,10 @@ class ShioajiMonitorPaths:
     snapshot_state: Path | None = None
     traffic_ledger_summary: Path | None = None
     storage_summary: Path | None = None
+    minute_target_end_date: Path | None = None
+    historical_market_summary: Path | None = None
+    historical_market_progress: Path | None = None
+    historical_market_inventory: Path | None = None
 
     @classmethod
     def from_repo(cls, repo_root: Path) -> ShioajiMonitorPaths:
@@ -116,6 +127,12 @@ class ShioajiMonitorPaths:
             snapshot_state=root / "artifacts/live/tw_day_trade_simulation/state.json",
             traffic_ledger_summary=root / "artifacts/live/shioaji_traffic/summary.json",
             storage_summary=root / "artifacts/live/shioaji_storage/summary.json",
+            minute_target_end_date=root
+            / "artifacts/data_repair/shioaji_minute_full/target_end_date.txt",
+            historical_market_summary=root / "data_tw_shioaji_history/summary.json",
+            historical_market_progress=root / "data_tw_shioaji_history/progress.json",
+            historical_market_inventory=root
+            / "data_tw_shioaji_history/inventory/manifest.json",
         )
 
 
@@ -289,6 +306,7 @@ def _storage_view(payload: dict[str, Any] | None, *, now: datetime) -> dict[str,
 
 _PIPELINE_CONSUMERS: Final[dict[str, tuple[str, ...]]] = {
     "futures_history": ("futures_history_backfill",),
+    "historical_market_data": ("historical_market_data_backfill",),
     "stock_minute": ("stock_minute_backfill", "stock_minute_gap_recovery"),
     "stock_daily": ("stock_daily_legacy_backfill", "stock_daily_materializer"),
     "fop_stream": ("taifex_fop_stream",),
@@ -1303,21 +1321,43 @@ def _backfill_status(
         if current_entries:
             entries = current_entries
     alias_count = _inventory_count(paths.alias_inventory)
+    try:
+        target_end_date = paths.target_end_date.read_text(encoding="utf-8").strip()
+    except OSError:
+        target_end_date = None
+    manifests_have_target = any(item.get("history_end") for item in manifests)
+
+    def at_current_target(item: dict[str, Any]) -> bool:
+        return bool(
+            not target_end_date
+            or not manifests_have_target
+            or item.get("history_end") == target_end_date
+        )
+
+    target_manifests = [item for item in manifests if at_current_target(item)]
     expected_per_contract = max(
         (int(item.get("expected_trading_dates") or 0) for item in manifests),
         default=0,
     )
-    resolved = sum(int(item.get("resolved_trading_dates") or 0) for item in manifests)
-    expected = alias_count * expected_per_contract
-    completed = sum(item.get("status") == "complete" for item in manifests)
     unavailable = sum(
-        item.get("status") == "contract_unavailable" for item in manifests
+        item.get("status") == "contract_unavailable" for item in target_manifests
+    )
+    queryable_contracts = max(0, alias_count - unavailable)
+    resolved = sum(
+        int(item.get("resolved_trading_dates") or 0)
+        for item in manifests
+        if item.get("status") != "contract_unavailable"
+    )
+    expected = queryable_contracts * expected_per_contract
+    completed = sum(
+        item.get("status") == "complete" for item in target_manifests
     )
     current_contract = None
     waiting_reason = None
     waiting_seconds = None
     waiting_observed_at = None
     run_failed = False
+    expected_latest_completed_session = None
     for entry in entries:
         message = str(entry.get("MESSAGE") or "")
         if (
@@ -1337,8 +1377,11 @@ def _backfill_status(
             run_failed = False
         elif "[shioaji-futures-history-runner] failed contract=" in message:
             run_failed = True
-        elif "[shioaji-futures-history-runner] run_complete=" in message:
+        elif "[shioaji-futures-history-runner] batch_complete=" in message:
             run_failed = False
+        lag_match = _CALENDAR_LAG_PATTERN.search(message)
+        if lag_match:
+            _calendar_target, expected_latest_completed_session = lag_match.groups()
         contract_match = _CONTRACT_PATTERN.search(message)
         if contract_match:
             current_contract = contract_match.group(1)
@@ -1351,9 +1394,10 @@ def _backfill_status(
     current = next(
         (item for item in manifests if item.get("contract") == current_contract), None
     )
+    terminal = completed + unavailable
     if completed >= alias_count > 0:
         state = "complete"
-    elif completed + unavailable >= alias_count > 0:
+    elif terminal >= alias_count > 0:
         state = "complete_with_unavailable"
     elif not service.get("active"):
         state = (
@@ -1375,10 +1419,6 @@ def _backfill_status(
             str(item.get("contract") or ""),
         ),
     )[:12]
-    try:
-        target_end_date = paths.target_end_date.read_text(encoding="utf-8").strip()
-    except OSError:
-        target_end_date = None
     return {
         "service_active": bool(service.get("active")),
         "service_state": str(service.get("state") or "unknown"),
@@ -1388,10 +1428,18 @@ def _backfill_status(
         "waiting_seconds_at_observation": waiting_seconds,
         "waiting_observed_at_utc": waiting_observed_at,
         "target_end_date": target_end_date or None,
+        "expected_latest_completed_session": expected_latest_completed_session,
+        "calendar_lag": bool(
+            expected_latest_completed_session
+            and target_end_date
+            and target_end_date != expected_latest_completed_session
+        ),
         "inventory_contracts": alias_count,
-        "started_contracts": len(manifests),
+        "started_contracts": len(target_manifests),
         "completed_contracts": completed,
         "unavailable_contracts": unavailable,
+        "terminal_contracts": terminal,
+        "queryable_contracts": queryable_contracts,
         "expected_dates_per_contract": expected_per_contract,
         "resolved_contract_dates": resolved,
         "expected_contract_dates": expected,
@@ -1432,11 +1480,27 @@ def _build_pipelines(
     minute_service: dict[str, Any],
     top200_service: dict[str, Any],
     snapshot_service: dict[str, Any],
+    historical_market_service: dict[str, Any],
     top200_entries: list[dict[str, Any]],
     traffic: dict[str, Any],
 ) -> list[dict[str, Any]]:
+    historical_market_summary = (
+        _read_json(paths.historical_market_summary)
+        if paths.historical_market_summary is not None
+        else None
+    )
+    historical_market_progress = (
+        _read_json(paths.historical_market_progress)
+        if paths.historical_market_progress is not None
+        else None
+    )
+    historical_market_inventory = (
+        _read_json(paths.historical_market_inventory)
+        if paths.historical_market_inventory is not None
+        else None
+    )
     minute_summary = _read_json(paths.minute_summary) if paths.minute_summary else None
-    minute_run_summary = (
+    minute_progress_summary = (
         _read_json(paths.minute_run_summary) if paths.minute_run_summary else None
     )
     minute_manifest = (
@@ -1447,7 +1511,34 @@ def _build_pipelines(
         (minute_manifest or {}).get("research_ready")
         and (minute_audit or {}).get("status") == "research_ready"
     )
-    minute_target_date = str((minute_run_summary or {}).get("end_date") or "")
+    try:
+        minute_target_date = (
+            paths.minute_target_end_date.read_text(encoding="utf-8").strip()
+            if paths.minute_target_end_date
+            else ""
+        )
+    except OSError:
+        minute_target_date = ""
+    if not minute_target_date:
+        minute_target_date = str(
+            (minute_progress_summary or {}).get("end_date")
+            or (minute_summary or {}).get("end_date")
+            or ""
+        )
+    canonical_matches_target = bool(
+        minute_summary and (minute_summary or {}).get("end_date") == minute_target_date
+    )
+    progress_matches_target = bool(
+        minute_progress_summary
+        and (minute_progress_summary or {}).get("end_date") == minute_target_date
+    )
+    minute_run_summary = (
+        minute_summary
+        if canonical_matches_target
+        else minute_progress_summary
+        if progress_matches_target
+        else None
+    )
     minute_data_through = str((minute_audit or {}).get("last_date") or "")
     minute_run_complete = bool(
         (minute_run_summary or {}).get("resumable_collection_complete")
@@ -1470,8 +1561,14 @@ def _build_pipelines(
     )
     minute_available = int((minute_audit or {}).get("available_source_symbols") or 0)
     minute_latest = _payload_time(
-        minute_run_summary or minute_manifest,
-        paths.minute_run_summary or paths.minute_manifest,
+        minute_run_summary or minute_summary or minute_manifest,
+        (
+            paths.minute_summary
+            if minute_run_summary is minute_summary
+            else paths.minute_run_summary
+            if minute_run_summary is minute_progress_summary
+            else paths.minute_manifest
+        ),
         "written_at_utc",
     )
 
@@ -1543,19 +1640,24 @@ def _build_pipelines(
     top_receipt = _latest_capture_receipt(paths.top200_capture_root)
     top_failure = _top200_failure(top200_entries)
     top_wait = _top200_priority_wait(top200_entries)
-    if top200_service.get("active"):
-        top_state, top_label = "active", "服務運行"
-    elif top_failure:
+    if top_failure:
         top_state, top_label = "failed", "最近執行失敗"
     elif top_wait:
         top_state, top_label = "waiting", "期權優先暫停"
+    elif top200_service.get("active"):
+        top_state, top_label = "active", "服務運行"
     else:
         top_state, top_label = "stopped", "服務停止"
     top_latest = top_receipt.get("finished_at_utc")
 
     hft_totals = _hft_partition_totals(paths.hft_dataset_root)
     hft_audit = _latest_audit(paths.hft_audit_root, "hft_*.json")
-    hft_ready = hft_totals.get("dates", 0) > 0 and hft_audit.get("status") == "ok"
+    hft_ready = (
+        hft_totals.get("dates", 0) > 0
+        and hft_audit.get("status") == "ok"
+        and not top_wait
+        and not top_failure
+    )
     hft_latest = hft_totals.get("latest_at_utc") or hft_audit.get("_observed_at")
 
     snapshot_state = _read_json(paths.snapshot_state) if paths.snapshot_state else None
@@ -1697,6 +1799,14 @@ def _build_pipelines(
                         f"{int(backfill.get('unavailable_contracts') or 0):,} 個契約代號不在永豐目前契約目錄；未偽造 Tick，後續目錄更新會再檢查。"
                     ]
                     if backfill.get("unavailable_contracts")
+                    else []
+                )
+                + (
+                    [
+                        f"官方 TX 日曆目前截至 {backfill.get('target_end_date')}；"
+                        f"已完成市場交易日應到 {backfill.get('expected_latest_completed_session')}，等待官方日檔刷新。"
+                    ]
+                    if backfill.get("calendar_lag")
                     else []
                 )
             ),
@@ -2042,6 +2152,142 @@ def _build_pipelines(
             "service": _service_view(snapshot_service),
         },
     ]
+    if paths.historical_market_summary is not None:
+        market_state = str((historical_market_summary or {}).get("state") or "")
+        market_complete = bool(
+            market_state == "complete"
+            and int((historical_market_summary or {}).get("pending_queries") or 0)
+            == 0
+        )
+        if market_complete:
+            market_status, market_label = "complete", "Receipt 全部完成"
+        elif market_state == "waiting_traffic":
+            market_status, market_label = "waiting", "等待歷史流量"
+        elif market_state == "waiting_market":
+            market_status, market_label = "waiting", "即時行情優先"
+        elif historical_market_service.get("active"):
+            market_status, market_label = "active", "持續下載"
+        elif historical_market_summary:
+            market_status, market_label = "partial", "部分完成"
+        else:
+            market_status, market_label = "unavailable", "尚無下載摘要"
+        progress_current = int((historical_market_progress or {}).get("current") or 0)
+        pending_queries = int(
+            (historical_market_summary or {}).get("pending_queries") or 0
+        )
+        tick_targets_finalized = bool(
+            (historical_market_summary or {}).get("tick_target_universe_finalized")
+        )
+        market_eta = (
+            _complete_eta("所有 KBar 切片與由其推導的 Tick 交易日都有有效 receipt。")
+            if market_complete
+            else _eta(
+                "estimating_targets",
+                confidence="none",
+                basis=(
+                    "KBar 尚未全部完成，Tick 交易日母數仍會隨 receipt 展開；"
+                    "目前進度只能量測速度，不能把現有待查詢數當作最終完工 ETA。"
+                ),
+                sample_units=progress_current,
+                sample_seconds=(historical_market_progress or {}).get(
+                    "elapsed_seconds"
+                ),
+            )
+            if not tick_targets_finalized
+            else _progress_eta(
+                current=progress_current,
+                total=progress_current + pending_queries,
+                elapsed_seconds=(historical_market_progress or {}).get(
+                    "elapsed_seconds"
+                ),
+                active=bool(historical_market_service.get("active")),
+                complete=False,
+                complete_basis="所有歷史查詢 receipt 已完成。",
+                running_basis=(
+                    "以目前批次實測 API receipt 速度外推現有佇列；新到期契約與"
+                    "永豐流量窗口會改變日曆時間。"
+                ),
+                paused_basis="以最近批次速度外推，服務目前未執行。",
+                now=now,
+            )
+        )
+        collection_counts = (historical_market_inventory or {}).get("by_collection")
+        safe_counts = collection_counts if isinstance(collection_counts, dict) else {}
+        resolved_queries = sum(
+            int((historical_market_summary or {}).get(key) or 0)
+            for key in ("resolved_kbar_chunks", "resolved_tick_dates")
+        )
+        total_queries = sum(
+            int((historical_market_summary or {}).get(key) or 0)
+            for key in ("kbar_chunks", "tick_dates")
+        )
+        pipelines.insert(
+            1,
+            {
+                "id": "historical_market_data",
+                "title": "週選／月選／實際月份期貨／指數歷史",
+                "category": "historical",
+                "api_surface": "api.kbars + api.ticks",
+                "quota": "historical",
+                "status": market_status,
+                "status_label": market_label,
+                "detail": (
+                    "最新週選與月選全履約價優先，其次實際到期月份期貨與 R3+，"
+                    "最後加權、櫃買及產業指數；29 日 KBar 切片與逐交易日 Tick "
+                    "皆用雜湊 receipt 續傳。"
+                ),
+                "coverage": _coverage(
+                    resolved_queries,
+                    total_queries,
+                    unit="API 查詢 receipt",
+                    label="可驗證覆蓋率",
+                ),
+                "latest_at_utc": _payload_time(
+                    historical_market_summary
+                    or historical_market_progress
+                    or historical_market_inventory,
+                    paths.historical_market_summary
+                    or paths.historical_market_progress
+                    or paths.historical_market_inventory,
+                    "written_at_utc",
+                    "updated_at_utc",
+                    "generated_at_utc",
+                ),
+                "eta": market_eta,
+                "fields": [
+                    "Tick 成交",
+                    "附帶一檔 Bid/Ask",
+                    "1 分 K OHLC",
+                    "Volume",
+                    "Amount",
+                ],
+                "metrics": [
+                    _metric("最新週選", safe_counts.get("latest_weekly_option")),
+                    _metric("最新月選", safe_counts.get("latest_monthly_option")),
+                    _metric("實際月份期貨", safe_counts.get("exact_futures")),
+                    _metric("指數", safe_counts.get("indices")),
+                    _metric(
+                        "待查詢",
+                        (historical_market_summary or {}).get("pending_queries"),
+                    ),
+                    _metric(
+                        "已落盤",
+                        (historical_market_summary or {}).get("stored_bytes"),
+                        value_format="bytes",
+                    ),
+                ],
+                "warnings": [
+                    "歷史 Tick 只有成交附帶最佳一檔，不宣稱可回補歷史五檔。",
+                    "Contract V2 已下架的舊契約無法倒推出未曾保存的合約代號；每次刷新會保留已觀測目錄聯集。",
+                    *(
+                        ["KBar 尚未全部完成，Tick 目標母數仍在展開；目前不顯示假精確完工時間。"]
+                        if not tick_targets_finalized
+                        else []
+                    ),
+                ],
+                "service": _service_view(historical_market_service),
+            },
+        )
     for pipeline in pipelines:
         pipeline["latest_age_seconds"] = _age_seconds(
             pipeline.get("latest_at_utc"), now=now
@@ -2064,6 +2310,8 @@ def build_shioaji_public_status(
     observed = observed.astimezone(UTC)
     selected_paths = paths or ShioajiMonitorPaths.from_repo(Path(repo_root))
     service_units = [HISTORY_UNIT, CAPTURE_UNIT]
+    if selected_paths.historical_market_summary is not None:
+        service_units.append(HISTORICAL_MARKET_UNIT)
     if selected_paths.minute_summary is not None:
         service_units.append(MINUTE_UNIT)
     if selected_paths.top200_capture_root is not None:
@@ -2088,6 +2336,11 @@ def build_shioaji_public_status(
     snapshot_service = (
         service_states[SNAPSHOT_UNIT]
         if selected_paths.snapshot_state is not None
+        else {"active": False, "state": "unavailable", "restarts": None}
+    )
+    historical_market_service = (
+        service_states[HISTORICAL_MARKET_UNIT]
+        if selected_paths.historical_market_summary is not None
         else {"active": False, "state": "unavailable", "restarts": None}
     )
     top200_entries = (
@@ -2203,6 +2456,7 @@ def build_shioaji_public_status(
         minute_service=minute_service,
         top200_service=top200_service,
         snapshot_service=snapshot_service,
+        historical_market_service=historical_market_service,
         top200_entries=top200_entries,
         traffic=traffic,
     )
@@ -2282,10 +2536,10 @@ def build_shioaji_public_status(
         "definitions": {
             "traffic": ("Shioaji api.usage() 的歷史行情用量；即時訂閱不消耗此額度"),
             "safe_remaining": (
-                "90% 用量上限與保留 128 MiB 兩個條件中較嚴格者，扣除已用量"
+                "90% 用量上限扣除 api.usage() 已用量；不另設固定保留額"
             ),
             "backfill_progress": (
-                "已產生有效 receipt 的合約交易日數，除以 743 個連續合約的目標交易日總數"
+                "已產生有效 receipt 的可查合約交易日數，除以目前清單中可查合約的目標交易日總數；來源不可用契約另列"
             ),
             "pipeline_status": (
                 "完成看最終稽核，執行中看服務與新鮮落盤；服務停止不會抹掉已完成資料"

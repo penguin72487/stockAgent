@@ -1981,43 +1981,62 @@ def _build_institutional_features(input_dir: Path) -> pl.DataFrame:
 
 
 def _build_tdcc_features(input_dir: Path) -> pl.DataFrame:
-    frames = [
-        frame
-        for frame in (
-            _read_optional(input_dir, "tdcc_shareholding_distribution"),
-            _read_optional(input_dir, "data_gov_tdcc_shareholding_distribution"),
+    normalized: list[pl.DataFrame] = []
+    # data.gov.tw resolves to TDCC's maintained opendata resource and is the
+    # canonical daily source.  The direct openapi-t snapshot remains useful for
+    # older rows that the current snapshot no longer carries.
+    for priority, name in enumerate(
+        (
+            "tdcc_shareholding_distribution",
+            "data_gov_tdcc_shareholding_distribution",
         )
-        if not frame.is_empty()
-    ]
-    if not frames:
+    ):
+        frame = _read_optional(input_dir, name)
+        if frame.is_empty():
+            continue
+        columns = set(frame.columns)
+        date_columns = [
+            candidate
+            for candidate in ("資料日期", "\ufeff資料日期")
+            if candidate in columns
+        ]
+        if not date_columns:
+            continue
+        source_date = pl.coalesce(
+            [_yyyymmdd_expr(candidate) for candidate in date_columns]
+        )
+        availability_date = source_date.dt.offset_by("7d")
+        if "_as_of_date" in columns:
+            availability_date = pl.max_horizontal(
+                availability_date,
+                _date_column_expr("_as_of_date"),
+            )
+        normalized.append(
+            frame.select(
+                [
+                    source_date.alias("_source_date"),
+                    availability_date.alias("date"),
+                    _symbol_expr("證券代號").alias("symbol"),
+                    _num_expr("持股分級").alias("_tier"),
+                    (_num_expr("占集保庫存數比例%") / 100.0).alias("_ratio"),
+                    _num_expr("人數").alias("_holders"),
+                    pl.lit(priority, dtype=pl.Int8).alias("_source_priority"),
+                ]
+            )
+        )
+    if not normalized:
         return pl.DataFrame()
-    frame = pl.concat(frames, how="diagonal_relaxed")
+    frame = pl.concat(normalized, how="vertical_relaxed")
     if frame.is_empty():
         return pl.DataFrame()
-    columns = set(frame.columns)
-    date_col = "\ufeff資料日期" if "\ufeff資料日期" in columns else "資料日期"
-    if date_col not in columns:
-        return pl.DataFrame()
-    tier = _num_expr("持股分級")
-    ratio = _num_expr("占集保庫存數比例%") / 100.0
-    holder_count = _num_expr("人數")
-    availability_date = _yyyymmdd_expr(date_col).dt.offset_by("7d")
-    if "_as_of_date" in columns:
-        availability_date = pl.max_horizontal(
-            availability_date,
-            _date_column_expr("_as_of_date"),
-        )
     return (
-        frame.select(
-            [
-                availability_date.alias("date"),
-                _symbol_expr("證券代號").alias("symbol"),
-                tier.alias("_tier"),
-                ratio.alias("_ratio"),
-                holder_count.alias("_holders"),
-            ]
+        frame.drop_nulls(["_source_date", "date", "symbol", "_tier"])
+        .sort(["_source_date", "symbol", "_tier", "_source_priority"])
+        .unique(
+            subset=["_source_date", "symbol", "_tier"],
+            keep="last",
+            maintain_order=True,
         )
-        .drop_nulls(["date", "symbol", "_tier"])
         .group_by(["date", "symbol"])
         .agg(
             [

@@ -5,7 +5,8 @@ After=network-online.target time-sync.target
 StartLimitIntervalSec=0
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=main
 User=@SERVICE_USER@
 Group=@SERVICE_GROUP@
 WorkingDirectory=@REPO_ROOT@
@@ -14,6 +15,8 @@ Environment="PYTHONUNBUFFERED=1"
 ExecStart=/usr/bin/bash "@REPO_ROOT@/scripts/run_tw_public_source_event_monitor.sh"
 Restart=always
 RestartSec=5s
+WatchdogSec=5min
+TimeoutStartSec=1min
 Nice=5
 CPUWeight=50
 IOWeight=50

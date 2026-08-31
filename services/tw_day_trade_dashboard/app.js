@@ -462,7 +462,7 @@ function executionStatusPresentation(value) {
     completed: {label: "該日已執行", kind: "good"},
     blocked: {label: "該日未執行・安全阻擋", kind: "bad"},
     starting: {label: "錯過後立即補跑中", kind: "warn"},
-    waiting_09_00: {label: "等待 09:00", kind: ""},
+    waiting_09_00: {label: "等待 09:00 即時訊號", kind: ""},
     waiting_trading_day: {label: "等待交易日", kind: ""},
     missed: {label: "該日執行缺漏", kind: "bad"},
   };
@@ -650,13 +650,21 @@ function renderModes(data) {
       : "TP／SL 使用完整漲跌停價";
     const configuredEntryPolicy = mode.configured_entry_fill_policy || mode.entry_fill_policy;
     const configuredEntryOffset = Number(mode.configured_entry_price_offset_ticks || 0);
-    const activeEntryPolicy = configuredEntryPolicy === "synthetic_open_tick"
+    const activeEntryPolicy = configuredEntryPolicy === "official_open_at_09_01"
+      ? "目前規則：09:01 以官方開盤價計算全部紙上買賣；缺價即阻擋，不使用 +1 Tick"
+      : configuredEntryPolicy === "synthetic_open_tick"
       ? `目前規則：開盤價不利 ${number(configuredEntryOffset || 1)} Tick 合成成交`
-      : "目前規則：市價買進／回補取收到的最佳 Ask；市價賣出／放空取收到的最佳 Bid，且只吃可驗證一檔量";
-    const recordedEntryPolicy = mode.entry_fill_policy === "synthetic_open_tick"
+      : configuredEntryPolicy === "market_at_best_quote_else_adverse_open_tick"
+      ? `目前規則：紙上市價買進／回補取最佳 Ask、賣出／放空取最佳 Bid，完整模擬委託；缺報價才用開盤價不利 ${number(configuredEntryOffset || 1)} Tick`
+      : "目前規則：09:00 訊號原子發布後，市價買進／回補取第一筆較晚最佳 Ask；市價賣出／放空取第一筆較晚最佳 Bid，且只吃可驗證一檔量；歷史回補另用 09:01 官方開盤價";
+    const recordedEntryPolicy = mode.entry_fill_policy === "official_open_at_09_01"
+      ? `所選交易日紀錄：09:01 官方開盤價計價 ${number(mode.entry_official_open_fill_count || mode.entry_fill_count || 0)} 筆（反事實紙上估值，非交易所成交）`
+      : mode.entry_fill_policy === "synthetic_open_tick"
       ? `所選交易日紀錄：開盤價不利 ${number(mode.entry_price_offset_ticks || 1)} Tick 合成成交（不回寫成最佳報價）`
       : mode.entry_fill_policy === "causal_best_quote_else_adverse_open_tick"
       ? `所選交易日紀錄：歷史最佳 Bid／Ask ${number(mode.entry_best_quote_fill_count || 0)} 筆；缺報價才用開盤價不利 ${number(mode.entry_price_offset_ticks || 1)} Tick ${number(mode.entry_synthetic_fallback_fill_count || 0)} 筆`
+      : mode.entry_fill_policy === "market_at_best_quote_else_adverse_open_tick"
+      ? `所選交易日紀錄：紙上市價完整成交 ${number(mode.entry_paper_market_fill_count || mode.entry_fill_count || 0)} 筆；不宣稱交易所深度或排隊成交`
       : "所選交易日紀錄：因果最佳 Bid／Ask 與可驗證一檔量";
     const entryPolicy = configuredEntryPolicy === mode.entry_fill_policy
       ? activeEntryPolicy
@@ -791,6 +799,19 @@ function renderOperations(data) {
         ? `rev ${number(serviceSync.state_revision)} 已提交`
         : "Discord 狀態逾時";
   const syncNote = `engine ${duration(serviceSync.engine_age_seconds)}前 · Discord ${duration(discordSync.age_seconds)}前 · 版本探測每 ${number(SERVICE_REVISION_REFRESH_MS / 1000)} 秒`;
+  const guardian = data.unattended_guardian || {};
+  const guardianComponents = guardian.components || {};
+  const guardianKind = guardian.status === "repairing"
+    ? "warn"
+    : guardian.ready
+      ? "good"
+      : "bad";
+  const guardianLabel = guardian.status === "repairing"
+    ? "自我修復中"
+    : guardian.ready
+      ? "長期守護 READY"
+      : `長期守護 ${String(guardian.status || "MISSING").toUpperCase()}`;
+  const guardianNote = `時間 ${guardianComponents.time_sync ? "OK" : "FAIL"} · 156來源 ${guardianComponents.source_events ? "OK" : "FAIL"} · 服務同步 ${guardianComponents.runtime_sync ? "OK" : "FAIL"} · 磁碟 ${guardianComponents.disk ? "OK" : "FAIL"} · ${duration(guardian.age_seconds)}前`;
   $("latency-kpis").innerHTML = [
     ["最新輸入→落盤", noLatency ? latencyEmptyLabel : latencyValue(latency.latest_ms), noLatency ? "不以舊日或估計值冒充今日速度" : `${esc(latency.latest_market || "—")} · ${shortTime(latency.latest_recorded_at)}`],
     ["P50", latencyValue(latency.p50_ms), `${number(latency.sample_count || 0)} 個成功模式樣本`],
@@ -805,13 +826,14 @@ function renderOperations(data) {
     ["帳本心跳", `${sourceNumber(data.source_age_seconds)} 秒`, `目標每 ${number(session.decision_interval_seconds || 60)} 秒`, heartbeatKind],
     ["面板 API", lastFetchMs == null ? "—" : `${number(lastFetchMs, 1)} ms`, `行情與權益每 ${number(PRICE_REFRESH_MS / 1000)} 秒刷新`, lastFetchMs != null && lastFetchMs > 1000 ? "warn" : "good"],
     ["服務同步", syncLabel, syncNote, syncKind],
+    ["無人維護守護", guardianLabel, guardianNote, guardianKind],
   ].map(([label, value, note, kind]) => `<div class="operation-kpi"><span>${esc(label)}</span><strong>${esc(value)}</strong><small class="${esc(kind)}">${esc(note)}</small></div>`).join("");
 
   const workflowRows = [
     {label:"啟用模式預熱", value:warmRatio, count:`${number(warm.completed_count || 0)} / ${number(totalModes)} · ${number(warmRatio * 100, 1)}%`, note:`牆鐘 ${duration(warm.wall_elapsed_seconds)} · ${warm.modes_per_minute == null ? "—" : `${sourceNumber(warm.modes_per_minute)} 模式/分`}`, kind:warmKind},
     {label:"所選日策略執行", value:session.signal_progress_ratio, count:`${number(session.signal_completed_modes || 0)} / ${number(session.mode_count || 0)}`, note:"原子指標由 inotify 事件即時喚醒；0.1 秒只作備援，阻擋不算完成", kind:"good"},
     {label:"進場處理終態", value:session.entry_progress_ratio, count:`${number(session.entry_completed_modes || 0)} / ${number(session.mode_count || 0)}`, note:"完成後可能有成交或依真實限制保持空倉", kind:"good"},
-    {label:"每分鐘權益紀錄", value:session.mark_progress_ratio, count:`${number(session.observed_mode_minutes || 0)} / ${number(session.expected_mode_minutes || 0)}`, note:`目前 ${sourceNumber(session.mark_rows_per_minute || 0)} 模式紀錄/分`, kind:""},
+    {label:"每分鐘權益紀錄", value:session.mark_progress_ratio, count:`${number(session.observed_mode_minutes || 0)} / ${number(session.expected_mode_minutes || 0)}`, note:session.mark_tracking_complete ? "全部模式已平倉，估值追蹤完成" : `目前 ${sourceNumber(session.mark_rows_per_minute || 0)} 模式紀錄/分`, kind:""},
     {label:"13:20/13:24/13:25 退出", value:session.exit_progress_ratio, count:`${number(session.exit_started_modes || 0)} / ${number(session.mode_count || 0)}`, note:"先限價、再市價重試；殘餘於 13:25 以漲跌停價參與收盤集合競價", kind:"warn"},
   ];
   $("workflow-progress").innerHTML = workflowRows.map((row) => `<div class="progress-row">
@@ -824,17 +846,35 @@ function renderOperations(data) {
   const modelPreopenHtml = preopenRows.map((row) => {
     const status = String(row.status || "pending");
     const kind = status === "ready" ? "good" : status === "failed" ? "bad" : "warn";
-    const stepText = row.step && row.total ? `${number(row.step)}/${number(row.total)} · ${number(row.progress_ratio * 100, 1)}%` : status.toUpperCase();
+    const statusLabel = status === "recovered_late" ? "延遲恢復" : status.toUpperCase();
+    const stepText = status === "recovered_late"
+      ? statusLabel
+      : row.step && row.total ? `${number(row.step)}/${number(row.total)} · ${number(row.progress_ratio * 100, 1)}%` : statusLabel;
     const stepRate = row.step && row.elapsed_seconds ? Number(row.step) / Number(row.elapsed_seconds) : null;
     const eta = row.step && row.total && row.step < row.total && stepRate ? (Number(row.total) - Number(row.step)) / stepRate : null;
     const speed = row.symbols_per_second == null ? "—" : `${sourceNumber(row.symbols_per_second)} 股票/秒`;
     const inference = row.model_inference_ms == null ? "—" : `${duration(Number(row.model_inference_ms) / 1000)} 模型`;
     const limits = row.price_limit_requested ? `${number(row.price_limit_prepared)}/${number(row.price_limit_requested)} 漲跌停` : "漲跌停待準備";
     const eligibility = row.eligibility_ready ? `${row.eligibility_target_date || data.session_date || "所選日"} TWSE/TPEx 資格 READY` : "所選日資格待確認";
-    const armed = row.final_arm_status === "ready" && row.final_arm_panel_cache_hit === true && row.final_arm_checkpoint_cache_hit === true && row.final_arm_model_cache_hit === true;
+    const quoteRequested = Number(row.final_arm_quote_requested || 0);
+    const quotePrimed = quoteRequested > 0
+      && row.final_arm_quote_connection_scope === "process"
+      && Number(row.final_arm_quote_primed || 0) === quoteRequested
+      && Number(row.final_arm_quote_resolved || 0) === quoteRequested
+      && Number(row.final_arm_quote_missing || 0) === 0;
+    const armed = row.final_arm_contract_ready === true
+      && (row.final_arm_current_process_required !== true || row.final_arm_hot_ready === true)
+      && row.final_arm_panel_cache_hit === true
+      && row.final_arm_checkpoint_cache_hit === true
+      && row.final_arm_model_cache_hit === true
+      && row.final_arm_quote_ready === true
+      && quotePrimed;
+    const quoteArm = row.final_arm_quote_ready === true
+      ? `Shioaji 契約快取 ${number(row.final_arm_quote_primed)}/${number(row.final_arm_quote_requested)}（可解析 ${number(row.final_arm_quote_resolved)}）`
+      : "Discord Shioaji 連線／契約待預熱";
     const armText = armed
-      ? `09:00 HOT READY ${shortTime(row.final_arm_completed_at)} · ${duration(row.final_arm_elapsed_seconds)} · ${number(row.final_arm_attempts || 1)} 次驗證`
-      : row.final_arm_public_error_message || row.final_arm_error || "08:55 最後武裝待驗證";
+      ? `09:00 HOT READY ${shortTime(row.final_arm_completed_at)} · ${duration(row.final_arm_elapsed_seconds)} · ${number(row.final_arm_attempts || 1)} 次驗證 · ${quoteArm}`
+      : row.final_arm_public_error_message || row.final_arm_error || `08:45 起最後武裝待驗證 · ${quoteArm}`;
     const measuredDetail = `${duration(row.elapsed_seconds)} · ${speed} · ${inference} · ${limits} · ${eligibility} · ${armText}${eta == null ? "" : ` · ETA ${duration(eta)}`}`;
     const detail = row.public_error_message || row.error || (status === "running" && row.message) || measuredDetail;
     return `<div class="progress-row">
@@ -1304,6 +1344,7 @@ function renderAudit(data) {
   const counts = data.record_counts || {};
   const items = [
     ["交易日", data.session_date], ["模擬模式", data.simulation_only ? "是，正式下單不可能" : "否"],
+    ["無人維護守護", `${data.unattended_guardian?.status || "missing"} · ${duration(data.unattended_guardian?.age_seconds)}前`],
     ["完整帳本累積訊號／委託／成交", `${number(counts.signals)} / ${number(counts.orders)} / ${number(counts.fills)}`], ["策略／即時基準／補登基準 mark", `${number(counts.marks)} / ${number(counts.benchmark_marks)} / ${number(counts.benchmark_history_marks)}`],
     ["狀態 API 視窗", Object.entries(data.payload_window || {}).map(([key, value]) => `${key}:${number(value)}`).join(" · ") || "—"],
     ...data.modes.map((mode) => [`${mode.market} checkpoint`, mode.checkpoint_ready ? `READY · ${mode.checkpoint_fingerprint || "fingerprint pending"}` : "MISSING"]),
@@ -1328,6 +1369,7 @@ function revisionOf(data) {
     counts.orders, counts.fills, counts.marks, counts.benchmark_marks, counts.events,
     data.session_progress,
     data.preopen?.updated_at,
+    data.unattended_guardian?.observed_at_taipei,
     data.modes.map((row) => [
       row.market, row.total_equity_twd, row.open_position_count,
       row.stale_position_count, row.force_exit_failures,

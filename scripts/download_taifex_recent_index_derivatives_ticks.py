@@ -24,6 +24,7 @@ import hashlib
 import html
 import io
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -45,7 +46,7 @@ OPTIONS_LISTING_URL: Final[str] = (
     "https://www.taifex.com.tw/cht/3/optPrevious30DaysSalesData"
 )
 USER_AGENT: Final[str] = "stockAgent/taifex-index-derivatives-ticks"
-PARSER_CONTRACT_VERSION: Final[int] = 1
+PARSER_CONTRACT_VERSION: Final[int] = 2
 TAIPEI: Final[ZoneInfo] = ZoneInfo("Asia/Taipei")
 
 FUTURES_URL_RE: Final[re.Pattern[str]] = re.compile(
@@ -285,6 +286,18 @@ def _parse_float(value: str, *, row_number: int, field: str) -> float:
     return parsed
 
 
+def _parse_finite_float(value: str, *, row_number: int, field: str) -> float:
+    """Parse a finite value whose sign is meaningful to the official source."""
+
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise ValueError(f"row {row_number}: invalid {field} {value!r}") from exc
+    if not math.isfinite(parsed):
+        raise ValueError(f"row {row_number}: non-finite {field} {value!r}")
+    return parsed
+
+
 def _optional_float(value: str, *, row_number: int, field: str) -> float | None:
     if value in {"", "-"}:
         return None
@@ -478,8 +491,11 @@ def _parse_futures_rows(
         raw["session"].append(_session_for_time(event_time, row_number=row_number))
         raw["product"].append(cells[1])
         raw["delivery_month_week"].append(cells[2])
+        is_spread = "/" in cells[2]
         raw["price"].append(
-            _parse_float(cells[4], row_number=row_number, field="price")
+            _parse_finite_float(cells[4], row_number=row_number, field="spread price")
+            if is_spread
+            else _parse_float(cells[4], row_number=row_number, field="price")
         )
         raw["reported_b_plus_s_quantity"].append(reported_quantity)
         raw["matched_quantity"].append(reported_quantity // 2)
@@ -644,6 +660,12 @@ def _build_partition(
         "output_path": str(parquet_path),
         "output_bytes": parquet_path.stat().st_size,
         "output_sha256": _sha256_path(parquet_path),
+        "price_contract": (
+            "outright TX prices are positive; calendar-spread transaction prices "
+            "are finite signed differentials and may be zero or negative"
+            if kind == "futures"
+            else "TXO transaction and strike prices are positive"
+        ),
         **stats,
     }
     _atomic_write_text(
@@ -860,6 +882,13 @@ def main() -> int:
                     "into additive matched_quantity_equivalent; every second-price "
                     "bucket verified to have an even reported total"
                 ),
+            },
+            "price_contract": {
+                "TX": (
+                    "outright prices are positive; calendar-spread prices are "
+                    "finite signed differentials and may be zero or negative"
+                ),
+                "TXO": "transaction and strike prices are positive",
             },
             "listing_page_dates": {
                 "futures": sorted(value.isoformat() for value in futures_urls),

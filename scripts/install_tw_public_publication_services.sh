@@ -31,6 +31,8 @@ units=(
   stockagent-tw-public-publication-sweep.timer
   stockagent-tw-public-0830-check.service
   stockagent-tw-public-0830-check.timer
+  stockagent-tw-public-cold-publish.service
+  stockagent-tw-public-cold-publish.timer
 )
 for unit in "${units[@]}"; do
   sed \
@@ -51,13 +53,17 @@ chmod 0755 \
   "$repo_root/scripts/watch_tw_public_source_events.py" \
   "$repo_root/scripts/run_tw_public_source_event_monitor.sh" \
   "$repo_root/scripts/run_tw_public_0830_check.py" \
-  "$repo_root/scripts/run_tw_public_0830_check.sh"
+  "$repo_root/scripts/run_tw_public_0830_check.sh" \
+  "$repo_root/scripts/finalize_tw_public_completed_session.py" \
+  "$repo_root/scripts/publish_tw_public_cold_release.py" \
+  "$repo_root/scripts/run_tw_public_cold_publish.sh"
 systemctl daemon-reload
 systemctl enable --now \
   stockagent-tw-public-source-events.service \
   stockagent-tw-day-trade-eligibility.timer \
   stockagent-tw-public-publication-sweep.timer \
-  stockagent-tw-public-0830-check.timer
+  stockagent-tw-public-0830-check.timer \
+  stockagent-tw-public-cold-publish.timer
 
 if [[ "${START_ELIGIBILITY_FETCH_NOW:-0}" == "1" ]]; then
   systemctl start stockagent-tw-day-trade-eligibility.service

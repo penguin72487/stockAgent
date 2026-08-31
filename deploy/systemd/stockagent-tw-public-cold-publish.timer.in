@@ -1,0 +1,13 @@
+[Unit]
+Description=Back up the mutable Taiwan public-data root after daily publications
+
+[Timer]
+# Runs only after the final 23:30 publication probe and never on the 09:00 path.
+OnCalendar=Mon..Fri *-*-* 23:50:00 Asia/Taipei
+AccuracySec=1s
+RandomizedDelaySec=0
+Persistent=true
+Unit=stockagent-tw-public-cold-publish.service
+
+[Install]
+WantedBy=timers.target

@@ -14,10 +14,53 @@ from scripts import backfill_tw_day_trade_open_signals as signal_backfill
 from stockagent.live.tw_day_trade_simulation import (
     ENTRY_FILL_POLICY_CAUSAL_BOOK,
     ENTRY_FILL_POLICY_CAUSAL_BOOK_ELSE_OPEN_TICK,
+    ENTRY_FILL_POLICY_OFFICIAL_OPEN_AT_0901,
 )
 
 
 TAIPEI = ZoneInfo("Asia/Taipei")
+
+
+def test_replay_candidate_retains_complete_benchmark_history(tmp_path: Path) -> None:
+    source = tmp_path / "source" / "benchmark_history.json"
+    source.parent.mkdir()
+    payload = {
+        "marks": [{"benchmark_id": "benchmark_0050"}],
+        "origins": {
+            "benchmark_0050": {},
+            "benchmark_2330": {},
+            "benchmark_tx_continuous": {},
+        },
+    }
+    source.write_text(json.dumps(payload), encoding="utf-8")
+
+    receipt = replay._retain_benchmark_history(source, tmp_path / "candidate")
+
+    retained = tmp_path / "candidate" / "benchmark_history.json"
+    assert retained.read_bytes() == source.read_bytes()
+    assert receipt["marks"] == 1
+    assert receipt["origins"] == sorted(payload["origins"])
+
+
+def test_missing_retained_book_is_explicit_only_when_fallback_is_authorized(
+    tmp_path: Path,
+) -> None:
+    day = date(2026, 8, 24)
+    with pytest.raises(FileNotFoundError):
+        replay._load_retained_historical_entry_books(
+            historical_book_root=tmp_path,
+            trading_date=day,
+        )
+
+    books, receipt = replay._load_retained_historical_entry_books(
+        historical_book_root=tmp_path,
+        trading_date=day,
+        allow_missing=True,
+    )
+    assert books == {}
+    assert receipt["source_missing"] is True
+    assert receipt["fallback_authorized"] is True
+    assert receipt["additional_shioaji_requests"] == 0
 
 
 def test_open_only_replay_cannot_fabricate_best_bid_ask() -> None:
@@ -108,6 +151,39 @@ def test_hybrid_entry_quotes_use_required_book_side_and_label_missing_side() -> 
     assert quotes["2317"]["entry_price_is_synthetic_fallback"] is True
     assert quality["exact_best_quote_symbols"] == ["2330"]
     assert quality["adverse_tick_fallback_symbols"] == ["2317"]
+
+
+def test_official_open_entry_quotes_do_not_require_or_fabricate_book() -> None:
+    spec = type(
+        "Spec",
+        (),
+        {
+            "market": "tw_day_trade",
+            "entry_fill_policy": ENTRY_FILL_POLICY_OFFICIAL_OPEN_AT_0901,
+            "initial_capital_twd": 10_000_000.0,
+            "lot_size": 1_000,
+        },
+    )()
+    quotes, quality = replay._entry_quotes(
+        [{"symbol": "2330", "target_weight": 0.1, "open_price": 1_000.0}],
+        {
+            "2330": {
+                "upper_limit_price": 1_100.0,
+                "lower_limit_price": 900.0,
+                "reference_price": 1_000.0,
+            }
+        },
+        quote_at=datetime(2026, 8, 13, 9, 1, tzinfo=TAIPEI),
+        spec=spec,
+        canonical_open_by_symbol={"2330": 1_000.0},
+        canonical_open_source="official_daily_session_open",
+    )
+
+    assert quotes["2330"]["open"] == 1_000.0
+    assert quotes["2330"]["bid"] is None
+    assert quotes["2330"]["ask"] is None
+    assert quotes["2330"]["entry_price_is_synthetic_fallback"] is False
+    assert quality["adverse_tick_fallback_rows"] == 0
 
 
 def _write_signal_candidate(
@@ -477,6 +553,31 @@ def test_benchmark_stock_row_uses_same_official_aggregate_fallback(
         "open": 1_200.0,
         "close": 1_210.0,
     }
+
+
+def test_benchmark_sessions_follow_own_official_sources_not_strategy_receipt(
+    tmp_path: Path,
+) -> None:
+    stock_root = tmp_path / "stocks"
+    stock_root.mkdir()
+    for symbol in ("0050", "2330"):
+        pl.DataFrame(
+            {
+                "date": [date(2026, 8, 26), date(2026, 8, 27)],
+                "open": [100.0, 101.0],
+                "close": [101.0, 102.0],
+            }
+        ).write_parquet(stock_root / f"{symbol}_features.parquet")
+
+    sessions = benchmark_replay._completed_stock_benchmark_sessions(
+        start=date(2026, 8, 26),
+        end=date(2026, 8, 27),
+        stock_parquet_root=stock_root,
+        twse_daily_ohlcv_path=tmp_path / "unused_twse.parquet",
+        tpex_daily_ohlcv_path=tmp_path / "unused_tpex.parquet",
+    )
+
+    assert sessions == [date(2026, 8, 26), date(2026, 8, 27)]
 
 
 def test_replay_rows_cannot_fall_back_to_noncanonical_signal_open() -> None:

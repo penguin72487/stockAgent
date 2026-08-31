@@ -541,6 +541,91 @@ def test_tw_publication_receipt_keeps_probe_boundary_and_detection_separate(
     assert index["fixture"][0]["last_completed_at_utc"] == "2026-08-19T06:00:03Z"
 
 
+def test_tw_public_source_rollup_accepts_only_verified_official_fallback(
+    tmp_path: Path,
+) -> None:
+    data = tmp_path / "data_tw_public"
+    events = tmp_path / "artifacts/data_refresh/tw_public/events"
+    data.mkdir(parents=True)
+    events.mkdir(parents=True)
+    (data / "dataset_manifest.json").write_text(
+        json.dumps(
+            [
+                {
+                    "name": "tdcc_shareholding_distribution",
+                    "source": "TDCC OpenAPI",
+                    "tags": ["tdcc", "ownership"],
+                },
+                {
+                    "name": "data_gov_tdcc_shareholding_distribution",
+                    "source": "data.gov.tw",
+                    "tags": ["tdcc", "ownership"],
+                },
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (data / "download_summary.json").write_text(
+        json.dumps({"end_date": "2026-08-24", "coverage_complete": True}),
+        encoding="utf-8",
+    )
+    (data / "download_report.csv").write_text(
+        "dataset,status,rows,failed_dates,missing_dates_after,coverage_complete\n"
+        "tdcc_shareholding_distribution,up_to_date,136629,0,0,\n"
+        "data_gov_tdcc_shareholding_distribution,ok,68578,0,0,\n",
+        encoding="utf-8",
+    )
+    (events / "latest.json").write_text(
+        json.dumps(
+            {
+                "status": "ok",
+                "accepted_source_fallbacks": {
+                    "tdcc_shareholding_distribution": (
+                        "data_gov_tdcc_shareholding_distribution"
+                    )
+                },
+                "datasets": {
+                    "tdcc_shareholding_distribution": {
+                        "last_probe_status": "failed",
+                        "last_checked_at_taipei": "2026-08-25T09:00:00+08:00",
+                    },
+                    "data_gov_tdcc_shareholding_distribution": {
+                        "last_probe_status": "ok",
+                        "observed_version": "v2",
+                        "applied_version": "v2",
+                        "last_download_status": "ok",
+                        "last_checked_at_taipei": "2026-08-25T09:00:00+08:00",
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    rows = dashboard._tw_public_sources(
+        tmp_path,
+        now=datetime(2026, 8, 25, 1, 5, tzinfo=UTC),
+    )
+    enriched = dashboard._enrich_and_sort_rows(
+        rows,
+        now=datetime(2026, 8, 25, 1, 5, tzinfo=UTC),
+        refresh_services={},
+    )
+    direct = next(
+        row
+        for row in enriched
+        if row["title"] == "tdcc_shareholding_distribution"
+    )
+
+    assert direct["operation_state"] == "complete"
+    assert direct["is_latest"] is True
+    assert direct["source_fallback"]["accepted"] is True
+    assert direct["source_fallback"]["replacement_dataset"] == (
+        "data_gov_tdcc_shareholding_distribution"
+    )
+    assert any("原端點探測失敗" in warning for warning in direct["warnings"])
+
+
 def test_streaming_requires_open_window_and_recent_endpoint_heartbeat() -> None:
     base = {
         "id": "shioaji:fop_stream",

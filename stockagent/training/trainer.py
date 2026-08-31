@@ -14638,9 +14638,9 @@ def _replay_taiwan_stitched_deployment(
                     else None
                 ),
                 unresolved_corporate_action_mask=(
-                    torch.as_tensor(unresolved_actions, dtype=torch.bool)
-                    if canonical_daily_day_trade
-                    else None
+                    None
+                    if not canonical_daily_day_trade or unresolved_actions is None
+                    else torch.as_tensor(unresolved_actions, dtype=torch.bool)
                 ),
                 day_trade_execution_initial_capital=(
                     runtime.futures_initial_capital

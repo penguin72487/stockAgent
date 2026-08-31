@@ -234,12 +234,12 @@ def test_strategy_minute_rebuild_preserves_endpoints_and_discloses_carry(
     _minute_file(
         kbar_root,
         "2330",
-        [(datetime(2026, 8, 13, 9, 1), 102.0)],
+        [(datetime(2026, 8, 13, 9, 2), 102.0)],
     )
     store = MinutePriceStore(kbar_root, tmp_path / "ticks")
     opening = {
-        "minute": "2026-08-13T09:00+08:00",
-        "recorded_at": "2026-08-13T09:00:00+08:00",
+        "minute": "2026-08-13T09:01+08:00",
+        "recorded_at": "2026-08-13T09:01:00+08:00",
         "session_date": "2026-08-13",
         "market": "tw_day_trade",
         "initial_capital_twd": 10_000_000.0,
@@ -266,11 +266,11 @@ def test_strategy_minute_rebuild_preserves_endpoints_and_discloses_carry(
         start=date(2026, 8, 13),
         end=date(2026, 8, 13),
     )
-    assert len(rows) == 271
+    assert len(rows) == 270
     assert rows[0] == opening
     assert rows[-1] == closing
-    minute_0901 = rows[1]
-    assert minute_0901["open_net_liquidation_pnl_twd"] == pytest.approx(
+    minute_0902 = rows[1]
+    assert minute_0902["open_net_liquidation_pnl_twd"] == pytest.approx(
         position_net_liquidation_pnl(
             _position(),
             102.0,
@@ -278,10 +278,10 @@ def test_strategy_minute_rebuild_preserves_endpoints_and_discloses_carry(
             remaining_entry_fee_twd=30.0,
         )
     )
-    assert minute_0901["fresh_trade_notional_coverage_ratio"] == 1.0
+    assert minute_0902["fresh_trade_notional_coverage_ratio"] == 1.0
     assert rows[2]["last_trade_carried_position_count"] == 1
     assert rows[2]["valuation_stale"] is True
-    assert stats["generated_rows"] == 271
+    assert stats["generated_rows"] == 270
 
 
 def test_stock_benchmark_minute_rebuild_preserves_tx_marks(tmp_path: Path) -> None:

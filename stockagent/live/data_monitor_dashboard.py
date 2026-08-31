@@ -335,6 +335,10 @@ _REFRESH_UNITS: Final[dict[str, dict[str, str | None]]] = {
         "service": "stockagent-tw-public-0830-check.service",
         "timer": "stockagent-tw-public-0830-check.timer",
     },
+    "tw_public_cold_publish": {
+        "service": "stockagent-tw-public-cold-publish.service",
+        "timer": "stockagent-tw-public-cold-publish.timer",
+    },
     "tw_public_eligibility": {
         "service": "stockagent-tw-day-trade-eligibility.service",
         "timer": "stockagent-tw-day-trade-eligibility.timer",
@@ -352,10 +356,11 @@ _AUTOMATION_PROFILES: Final[dict[str, dict[str, Any]]] = {
             "tw_public_source_events",
             "tw_public_publication",
             "tw_public_0830",
+            "tw_public_cold_publish",
             "tw_public_eligibility",
             "tw_day_trade_preopen_gate",
         ),
-        "schedule_label": "156 項來源版本事件持續監測、07:50 全量掃描、08:00/08:20/08:29 嚴格發布與 08:59:30 最終守門",
+        "schedule_label": "156 項來源版本事件持續監測、07:50 全量掃描、08:00/08:15/08:24 live root 驗收、08:59:30 最終守門；23:50 背景冷備份",
         "active_means_running": False,
     },
     "group:tw-minute-train": {
@@ -1485,6 +1490,14 @@ def _tw_public_sources(root: Path, *, now: datetime) -> list[dict[str, Any]]:
         event_receipt.get("datasets", {}) if isinstance(event_receipt, Mapping) else {}
     )
     event_rows = event_rows if isinstance(event_rows, Mapping) else {}
+    accepted_fallbacks = (
+        event_receipt.get("accepted_source_fallbacks", {})
+        if isinstance(event_receipt, Mapping)
+        else {}
+    )
+    accepted_fallbacks = (
+        accepted_fallbacks if isinstance(accepted_fallbacks, Mapping) else {}
+    )
     publication_rows = _tw_public_publication_index(root)
     if not isinstance(manifest, list):
         return []
@@ -1529,11 +1542,28 @@ def _tw_public_sources(root: Path, *, now: datetime) -> list[dict[str, Any]]:
         )
         event_row = event_rows.get(name, {})
         event_row = event_row if isinstance(event_row, Mapping) else {}
+        fallback_name = str(accepted_fallbacks.get(name) or "").strip()
+        fallback_row = event_rows.get(fallback_name, {}) if fallback_name else {}
+        fallback_row = fallback_row if isinstance(fallback_row, Mapping) else {}
+        fallback_version = fallback_row.get("observed_version")
+        fallback_applied = bool(
+            fallback_name
+            and event_receipt.get("status") == "ok"
+            and fallback_row.get("last_probe_status") == "ok"
+            and fallback_version
+            and fallback_row.get("applied_version") == fallback_version
+            and fallback_row.get("last_download_status")
+            not in {"failed", "error", "incomplete", "pending", "running"}
+        )
         publication_receipts = publication_rows.get(name, [])
         event_applied = bool(
-            event_row.get("last_probe_status") == "ok"
-            and event_row.get("observed_version")
-            and event_row.get("observed_version") == event_row.get("applied_version")
+            fallback_applied
+            or (
+                event_row.get("last_probe_status") == "ok"
+                and event_row.get("observed_version")
+                and event_row.get("observed_version")
+                == event_row.get("applied_version")
+            )
         )
         if event_row and not event_applied:
             status = "degraded"
@@ -1569,6 +1599,10 @@ def _tw_public_sources(root: Path, *, now: datetime) -> list[dict[str, Any]]:
             label = "缺少完整度證據"
             eta = _unknown_eta("unknown", "缺少逐資料集完整度回執。")
         warnings = []
+        if fallback_applied:
+            warnings.append(
+                f"原端點探測失敗仍保留為診斷；目前由已驗證且已套用的官方替代來源 {fallback_name} 提供最新資料。"
+            )
         if not event_row:
             warnings.append("尚未取得此資料集的來源版本事件監測證據。")
         if isinstance(source_unavailable, Mapping) and name in source_unavailable:
@@ -1608,6 +1642,16 @@ def _tw_public_sources(root: Path, *, now: datetime) -> list[dict[str, Any]]:
                 "detail": (
                     str(item.get("description") or "官方公開資料集。")
                     + " 來源變更只有在定向下載、解析與驗證成功後才會確認套用。"
+                ),
+                "source_fallback": (
+                    {
+                        "accepted": True,
+                        "replacement_dataset": fallback_name,
+                        "replacement_observed_version": fallback_version,
+                        "direct_probe_status": event_row.get("last_probe_status"),
+                    }
+                    if fallback_applied
+                    else None
                 ),
                 "warnings": warnings,
                 "detail_link": None,
@@ -3477,6 +3521,14 @@ def _specialize_groups(
             if isinstance(tw_events, Mapping)
             else None
         )
+        event_blocking_unapplied = (
+            _integer(tw_events.get("blocking_unapplied_event_count"))
+            if isinstance(tw_events, Mapping)
+            and "blocking_unapplied_event_count" in tw_events
+            else _integer(tw_events.get("unapplied_event_count"))
+            if isinstance(tw_events, Mapping)
+            else None
+        )
         event_healthy = bool(
             isinstance(tw_events, Mapping)
             and tw_events.get("status") == "ok"
@@ -3485,7 +3537,7 @@ def _specialize_groups(
             and event_registered > 0
             and event_observed == event_registered
             and _integer(tw_events.get("failed_probe_count")) == 0
-            and _integer(tw_events.get("unapplied_event_count")) == 0
+            and event_blocking_unapplied == 0
         )
         tw["event_monitor"] = {
             "healthy": event_healthy,
@@ -3500,11 +3552,20 @@ def _specialize_groups(
             "unapplied_events": _integer(tw_events.get("unapplied_event_count"))
             if isinstance(tw_events, Mapping)
             else None,
+            "blocking_unapplied_events": event_blocking_unapplied,
+            "opening_apply_deferred": tw_events.get("opening_apply_deferred")
+            if isinstance(tw_events, Mapping)
+            else None,
+            "opening_apply_deferred_count": _integer(
+                tw_events.get("opening_apply_deferred_count")
+            )
+            if isinstance(tw_events, Mapping)
+            else None,
             "updated_at": tw_events.get("updated_at_taipei")
             if isinstance(tw_events, Mapping)
             else None,
         }
-        tw["cadence"] = "來源事件每 60–300 秒；08:00/08:20/08:29 全量驗收"
+        tw["cadence"] = "來源事件每 60–300 秒；08:00/08:15/08:24 live root 驗收；23:50 背景冷備份"
         tw["update_owner"] = "來源事件監測器＋不可變快照更新器"
         if event_healthy and tw.get("status") == "current":
             tw["status_label"] = "156/156 來源事件健康，快照完整最新"

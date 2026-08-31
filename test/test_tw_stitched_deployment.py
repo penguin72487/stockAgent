@@ -455,6 +455,43 @@ def test_daily_no_default_stitched_replay_uses_same_fractional_tplus3_forward(
     assert np.count_nonzero(stitched.open_weights_history) == 2
 
 
+def test_daily_no_default_stitched_replay_requires_action_mask_for_stateful_carry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _disable_stitched_plots(monkeypatch)
+    panel = _day_trade_panel(
+        np.asarray(
+            [
+                [10.0, 11.0, 10.0],
+                [10.0, 10.0, 10.0],
+            ]
+        )
+    )
+    panel.unresolved_corporate_action_mask = None
+    panel.corporate_action_avoidance_mask = None
+    fold = _write_fold_requests(
+        tmp_path,
+        fold_id=1,
+        dates=panel.dates[:1],
+        symbols=("2330",),
+        requests=np.asarray([[1.0]]),
+    )
+    config = _day_trade_config()
+    config.trading.tw_day_trade_unlimited_margin_conversion = True
+
+    with pytest.raises(
+        ValueError,
+        match="requires PanelData.unresolved_corporate_action_mask",
+    ):
+        trainer_module._replay_taiwan_stitched_deployment(
+            tmp_path,
+            [fold],
+            panel=panel,
+            config=config,
+        )
+
+
 def test_futures_portfolio_stitched_replay_uses_fixed_fee_side_channel(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

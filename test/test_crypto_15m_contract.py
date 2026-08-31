@@ -51,6 +51,9 @@ def test_discord_tw_day_trade_100m_uses_its_point_in_time_data_contract() -> Non
         "--link",
         "data_tw_public",
     )
+    assert cfg.completed_session_command == (
+        "scripts/finalize_tw_public_completed_session.py",
+    )
 
 
 def test_discord_tw_day_trade_multi_basis_uses_its_point_in_time_data_contract() -> None:
@@ -60,7 +63,7 @@ def test_discord_tw_day_trade_multi_basis_uses_its_point_in_time_data_contract()
     ).pre_signal_command
 
 
-def test_projection_l1_day_trade_uses_syncthing_packed_data_contract() -> None:
+def test_projection_l1_day_trade_uses_shared_live_opening_data_contract() -> None:
     cfg = load_market_config(
         "services/discord_bot/markets/tw_day_trade_multi_basis_projection_l1_gelu.yaml"
     )

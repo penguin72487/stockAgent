@@ -20,10 +20,43 @@ from stockagent.data.tw_public_features import (
     _build_institutional_features,
     _build_margin_features,
     _build_official_ohlcv_features,
+    _build_tdcc_features,
     _build_twse_market_index_features,
     _snapshot_date_expr,
     build_tw_public_training_features,
 )
+
+
+def test_tdcc_canonical_mirror_supersedes_overlap_and_direct_keeps_history(
+    tmp_path: Path,
+) -> None:
+    pl.DataFrame(
+        {
+            "\ufeff資料日期": ["20240101", "20240108"],
+            "證券代號": ["2330", "2330"],
+            "持股分級": ["1", "1"],
+            "人數": ["5", "10"],
+            "占集保庫存數比例%": ["5.0", "10.0"],
+        }
+    ).write_parquet(tmp_path / "tdcc_shareholding_distribution.parquet")
+    pl.DataFrame(
+        {
+            "資料日期": ["20240108"],
+            "證券代號": ["2330"],
+            "持股分級": ["1"],
+            "人數": ["20"],
+            "占集保庫存數比例%": ["20.0"],
+        }
+    ).write_parquet(tmp_path / "data_gov_tdcc_shareholding_distribution.parquet")
+
+    result = _build_tdcc_features(tmp_path).sort("date")
+
+    assert result.height == 2
+    assert result.get_column("date").to_list() == [date(2024, 1, 8), date(2024, 1, 15)]
+    assert result.get_column("twpub_tdcc_retail_holder_ratio").to_list() == [0.05, 0.2]
+    assert result.get_column("twpub_tdcc_holder_count_log").to_list() == pytest.approx(
+        [np.log1p(5), np.log1p(20)]
+    )
 
 
 def test_margin_short_rules_convert_official_lots_to_exact_shares_and_fail_closed(
@@ -753,6 +786,40 @@ def test_market_point_in_time_state_is_forward_filled_after_release(tmp_path: Pa
     feature_idx = panel.feature_names.index("twpub_dgbas_cpi_log")
     date_0103 = int(np.flatnonzero(panel.dates == np.datetime64("2024-01-03"))[0])
     assert np.allclose(panel.features[date_0103, :, feature_idx], 4.5)
+
+
+@pytest.mark.parametrize("benchmark_symbol", ["2330", "0050"])
+def test_equity_and_etf_benchmarks_use_total_return_adjusted_close(
+    tmp_path: Path,
+    benchmark_symbol: str,
+) -> None:
+    pl.DataFrame(
+        {
+            "date": [date(2024, 1, 2), date(2024, 1, 3), date(2024, 1, 4)],
+            "open": [100.0, 90.0, 91.0],
+            "max": [100.0, 90.0, 91.0],
+            "min": [100.0, 90.0, 91.0],
+            "close": [100.0, 90.0, 91.0],
+            # The raw 10% price drop is an ex-distribution boundary.  Total
+            # return is flat across it, then gains 1% on the next session.
+            "adjclose": [50.0, 50.0, 50.5],
+            "Trading_Volume": [1_000.0, 1_000.0, 1_000.0],
+        }
+    ).write_parquet(tmp_path / f"{benchmark_symbol}_features.parquet")
+
+    panel = build_panel(
+        tmp_path,
+        benchmark_name=benchmark_symbol,
+        tradable_mode="tradable",
+        trading_volume_policy="required",
+        panel_backend="pyarrow",
+        panel_load_workers=0,
+    )
+
+    assert panel.benchmark_returns.tolist() == pytest.approx(
+        [0.0, np.log(50.5 / 50.0), 0.0]
+    )
+    assert panel.benchmark_returns[0] != pytest.approx(np.log(90.0 / 100.0))
 
 
 def test_external_tpex_limit_rule_columns_update_masks_without_becoming_features(tmp_path: Path) -> None:

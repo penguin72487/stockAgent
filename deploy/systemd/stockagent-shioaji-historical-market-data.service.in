@@ -1,0 +1,21 @@
+[Unit]
+Description=StockAgent Shioaji option, exact-future, and index historical backfill
+Wants=network-online.target time-sync.target
+After=network-online.target time-sync.target stockagent-shioaji-taifex-bidask.service stockagent-shioaji-top200.service
+
+[Service]
+Type=simple
+User=@SERVICE_USER@
+Group=@SERVICE_GROUP@
+WorkingDirectory=@REPO_ROOT@
+Environment="HOME=@SERVICE_HOME@"
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=/usr/bin/bash "@REPO_ROOT@/scripts/run_shioaji_historical_market_data.sh"
+Nice=10
+CPUWeight=25
+IOWeight=25
+Restart=on-failure
+RestartSec=120s
+TimeoutStopSec=90s
+KillMode=control-group
+

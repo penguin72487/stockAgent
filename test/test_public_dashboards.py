@@ -335,6 +335,9 @@ def test_tw_history_projection_and_range_query_are_bounded() -> None:
             "available_start_date": "2026-08-13",
             "available_end_date": "2026-08-17",
             "curve_granularity": "1m",
+            "expected_strategy_session_points_from_09_01": 270,
+            "expected_stock_benchmark_session_points_including_09_00": 271,
+            "expected_tx_day_session_points": 300,
             "return_basis": (
                 "previous_retained_mark_before_start_else_initial_capital"
             ),
@@ -364,6 +367,9 @@ def test_tw_history_projection_and_range_query_are_bounded() -> None:
             "private": "drop",
         }
     )
+    assert public["expected_strategy_session_points_from_09_01"] == 270
+    assert public["expected_stock_benchmark_session_points_including_09_00"] == 271
+    assert public["expected_tx_day_session_points"] == 300
     assert public["range"] == "1y"
     assert public["start_date"] == "2026-08-13"
     assert public["end_date"] == "2026-08-14"
