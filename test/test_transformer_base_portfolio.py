@@ -1345,6 +1345,37 @@ def test_fixed_symbol_position_capacity_supports_full_runtime_universe() -> None
     assert torch.isfinite(weights).all()
 
 
+def test_fixed_symbol_position_capacity_preserves_ddp_gradient_layout() -> None:
+    model = _make_model(
+        num_symbols=19,
+        symbol_position_capacity=13,
+        attention_mode="temporal_only",
+        allow_dynamic_symbols=False,
+        return_aux=False,
+        return_aux_details=False,
+    ).cpu()
+    expanded = model._symbol_position(model.num_symbols)
+    expected = torch.cat(
+        (
+            model.symbol_position,
+            model.symbol_position.new_zeros(
+                1,
+                1,
+                model.num_symbols - model.symbol_position_capacity,
+                model.d_model,
+            ),
+        ),
+        dim=2,
+    )
+    torch.testing.assert_close(expanded, expected)
+    expanded.square().sum().backward()
+
+    gradient = model.symbol_position.grad
+    assert gradient is not None
+    assert gradient.stride() == model.symbol_position.stride()
+    assert "symbol_position_prefix_indices" not in model.state_dict()
+
+
 def test_dynamic_symbol_upper_bound_uses_train_groups_not_future_panel_symbols() -> None:
     dates = 10
     symbols = 8

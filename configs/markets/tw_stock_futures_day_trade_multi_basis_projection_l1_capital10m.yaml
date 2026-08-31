@@ -1,0 +1,82 @@
+# Full-stock-context / single-stock-futures-execution day-trade model.
+#
+# The model keeps the canonical Taiwan stock feature panel (more than two
+# thousand ordered symbols).  The executor hard-masks symbols without a
+# causally known nearby single-stock future.  A selected future must then have
+# an observed positive-volume OPEN/CLOSE round trip or that requested name is
+# left unfilled without reallocating its risk to other names.
+base_config: tw_day_trade_daily_multi_basis_projection_l1_tplus2_close_capital10m.yaml
+
+experiment_name: tw-stock-futures-day-trade-full-stock-context-multi-basis-projection-l1-capital10m-v1
+
+runner:
+  output_dir: artifacts/markets/tw_stock_futures_day_trade_full_stock_context_multi_basis_projection_l1_capital10m_v1
+  resume: true
+  post_train_infer: false
+
+data:
+  # Stock OPEN is observed at 09:00, after the TAIFEX 08:45 day-session open.
+  # Exclude it so every model input is complete before futures execution.
+  day_trade_open_feature: false
+  benchmark_name: universe_average_return
+  feature_exclude:
+    - next_session_open_gap_logret
+    - twpub_pe_log
+    - twpub_pb_log
+    - twpub_dividend_yield
+    - twpub_margin_*
+    - twpub_short_*
+    - twpub_foreign_net_buy_flow
+    - twpub_investment_trust_net_buy_flow
+    - twpub_dealer_net_buy_flow
+    - twpub_institutional_net_buy_flow
+    - twpub_dividend_*
+    - twpub_exdiv_*
+    - twpub_material_*
+    - twpub_attention_*
+    - twpub_disposal_*
+    - twpub_twse_taiex_*
+    - twpub_usdtwd_*
+    - twpub_cbc_*
+    - twpub_dgbas_*
+    - twpub_mof_*
+    - twpub_taifex_*
+
+trading:
+  execution_mode: tw_stock_futures_day_trade
+  frequency: daily
+  long_only: false
+  # Every position starts and ends in the same TAIFEX day session.
+  max_turnover_ratio: 0.0
+  # Causal capacity: at most 50% of the selected physical contract's completed
+  # preceding-session volume, valued at the current executable opening price.
+  max_volume_participation: 0.5
+  volume_participation_equity: 10000000.0
+  min_trade_weight: 0.0
+  portfolio_activation: pre_normalized
+  # Fixed fees and date-versioned statutory futures tax are embedded per
+  # physical contract; cash-stock proportional fee/tax fields must stay zero.
+  buy_fee_rate: 0.0
+  sell_fee_rate: 0.0
+  tw_day_trade_unlimited_margin_conversion: false
+  tw_stock_futures_day_trade_data_path: data_tw_futures/taifex_portfolio_daily_v4/continuous_daily.parquet
+  tw_stock_futures_day_trade_fee_twd: 40.0
+  tw_stock_futures_day_trade_initial_capital: 10000000.0
+
+training:
+  model_name: financial_transformer
+  multi_gpu_strategy: distributed_data_parallel
+  epochs: 1000
+  loss_type: log_utility
+  loss_portfolio_activation: pre_normalized
+  record_epoch_curve: true
+  curve_plot_interval: 1
+  curve_plot_async: true
+  defer_epoch_curve_plot_until_end: false
+  explain_after_each_fold: false
+  financial_transformer:
+    portfolio_mode: long_short
+    portfolio_output_mode: projection_l1
+    return_aux: false
+    return_aux_details: false
+

@@ -306,6 +306,11 @@ def _load_ablation_spec(
 
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
     merged = deepcopy(base)
+    # These two fields are a coupled contract.  Once an ablation replaces the
+    # enabled family set, limits belonging to disabled families must not leak
+    # through recursive mapping merge.
+    if "temporal_basis_families" in override:
+        merged["temporal_basis_components_by_family"] = {}
     for key, value in override.items():
         if isinstance(value, dict) and isinstance(merged.get(key), dict):
             merged[key] = _deep_merge(merged[key], value)

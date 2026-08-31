@@ -102,6 +102,13 @@ _TW_INDEX_FUTURES_MODEL_NAMES = frozenset(
         "tw_index_futures",
     }
 )
+_TW_STOCK_CONTEXT_ALL_FUTURES_MODEL_NAMES = frozenset(
+    {
+        "cross_sectional_all_futures",
+        "cross_sectional_all_futures_model",
+        "tw_stock_context_futures_portfolio",
+    }
+)
 _TW_INDEX_DERIVATIVES_DAY_MODEL_NAMES = frozenset(
     {
         "cross_sectional_index_derivatives_day",
@@ -590,23 +597,51 @@ def _validate_tw_futures_portfolio_mode_contract(
     buy_fee_rate: object,
     sell_fee_rate: object,
     lookback: object,
+    integer_contracts: object,
+    integer_initial_capital: object,
+    max_turnover_ratio: object,
 ) -> None:
-    if execution_mode != "tw_futures_portfolio_day":
+    if execution_mode not in {
+        "tw_futures_portfolio_day",
+        "tw_stock_context_futures_portfolio",
+    }:
         return
+    mode_label = execution_mode
     if _normalized_contract_name(frequency) not in {"daily", "day", "1d"}:
-        raise ValueError("tw_futures_portfolio_day requires trading.frequency='daily'")
+        raise ValueError(f"{mode_label} requires trading.frequency='daily'")
     if _normalized_contract_name(loss_type) not in _TW_PHASE_RETURN_OBJECTIVES:
         raise ValueError(
-            "tw_futures_portfolio_day supports only canonical log-utility objectives"
+            f"{mode_label} supports only canonical log-utility objectives"
         )
-    if float(max_volume_participation) != 0.0:
+    integer_mode = bool(integer_contracts) and (
+        execution_mode == "tw_stock_context_futures_portfolio"
+    )
+    participation = float(max_volume_participation)
+    if integer_mode:
+        if not math.isfinite(participation) or not (0.0 < participation <= 1.0):
+            raise ValueError(
+                f"{mode_label} integer execution requires causal prior-session "
+                "max_volume_participation in (0,1]"
+            )
+        capital = float(integer_initial_capital)
+        if not math.isfinite(capital) or capital <= 0.0:
+            raise ValueError(
+                "tw_futures_portfolio_integer_initial_capital must be finite "
+                "and positive"
+            )
+        if float(max_turnover_ratio) != 0.0:
+            raise ValueError(
+                f"{mode_label} integer execution requires max_turnover_ratio=0; "
+                "integer per-contract capacity is applied independently"
+            )
+    elif participation != 0.0:
         raise ValueError(
-            "tw_futures_portfolio_day requires max_volume_participation=0; "
+            f"{mode_label} continuous execution requires max_volume_participation=0; "
             "the public daily report has no causal opening depth"
         )
     if float(buy_fee_rate) != 0.0 or float(sell_fee_rate) != 0.0:
         raise ValueError(
-            "tw_futures_portfolio_day uses fixed per-contract commission; "
+            f"{mode_label} uses fixed per-contract commission; "
             "buy_fee_rate and sell_fee_rate must both be zero"
         )
     from stockagent.data.tw_futures_portfolio_daily import (
@@ -615,9 +650,221 @@ def _validate_tw_futures_portfolio_mode_contract(
 
     if int(lookback) > int(TAIFEX_FUTURES_PORTFOLIO_MAX_SAFE_LOOKBACK):
         raise ValueError(
-            "tw_futures_portfolio_day fixed-slot data supports lookback <= "
+            f"{mode_label} fixed-slot data supports lookback <= "
             f"{TAIFEX_FUTURES_PORTFOLIO_MAX_SAFE_LOOKBACK}; got {lookback}. "
             "A longer lookback requires a new slot-capacity/cooldown contract."
+        )
+
+
+def _validate_tw_stock_context_futures_portfolio_mode_contract(
+    *,
+    execution_mode: str,
+    model_name: object,
+    train_symbol_compaction: object,
+    model_portfolio_output_mode: object,
+    trading_portfolio_activation: object,
+    loss_portfolio_activation: object,
+    return_rank_ic_weight: object,
+    direction_weight: object,
+    volatility_regime_weight: object,
+    concentration_weight: object,
+) -> None:
+    if execution_mode != "tw_stock_context_futures_portfolio":
+        return
+    if _normalized_contract_name(model_name) not in (
+        _TW_STOCK_CONTEXT_ALL_FUTURES_MODEL_NAMES
+    ):
+        raise ValueError(
+            "tw_stock_context_futures_portfolio requires "
+            "training.model_name='cross_sectional_all_futures'"
+        )
+    if bool(train_symbol_compaction):
+        raise ValueError(
+            "tw_stock_context_futures_portfolio requires "
+            "training.train_symbol_compaction=false; the input stock axis and "
+            "fixed futures action axis have different identities"
+        )
+    if normalize_portfolio_output_mode(str(model_portfolio_output_mode)) != (
+        "projection_l1"
+    ):
+        raise ValueError(
+            "tw_stock_context_futures_portfolio requires model "
+            "portfolio_output_mode='projection_l1'"
+        )
+    activations = {
+        "trading.portfolio_activation": normalize_portfolio_activation(
+            str(trading_portfolio_activation)
+        ),
+        "training.loss_portfolio_activation": normalize_portfolio_activation(
+            str(loss_portfolio_activation)
+        ),
+    }
+    invalid = [name for name, value in activations.items() if value != "pre_normalized"]
+    if invalid:
+        raise ValueError(
+            "tw_stock_context_futures_portfolio model already emits projection-L1 "
+            "actions; " + ", ".join(invalid) + " must be 'pre_normalized'"
+        )
+    unsupported = {
+        "return_rank_ic_weight": float(return_rank_ic_weight),
+        "direction_weight": float(direction_weight),
+        "volatility_regime_weight": float(volatility_regime_weight),
+        "concentration_weight": float(concentration_weight),
+    }
+    enabled = [name for name, value in unsupported.items() if value != 0.0]
+    if enabled:
+        raise ValueError(
+            "tw_stock_context_futures_portfolio does not define these "
+            "futures-action auxiliary targets: " + ", ".join(enabled)
+        )
+
+
+def _validate_tw_stock_futures_day_trade_mode_contract(
+    *,
+    execution_mode: str,
+    frequency: object,
+    loss_type: object,
+    max_turnover_ratio: object,
+    max_volume_participation: object,
+    volume_participation_equity: object,
+    buy_fee_rate: object,
+    sell_fee_rate: object,
+    fixed_fee_per_side_twd: object,
+    initial_capital: object,
+    entry_0900_source: object,
+    entry_0900_data_path: object,
+    day_trade_open_feature: object,
+    long_only: object,
+    model_portfolio_output_mode: object,
+    center_long_short_logits: object,
+    projection_l1_scale_by_active_count: object,
+    trading_portfolio_activation: object,
+    loss_portfolio_activation: object,
+) -> None:
+    modes = {
+        "tw_stock_futures_day_trade",
+        "tw_stock_futures_day_trade_0900",
+        "tw_stock_futures_day_trade_0900_integer",
+    }
+    if execution_mode not in modes:
+        return
+    label = execution_mode
+    if _normalized_contract_name(frequency) not in {"daily", "day", "1d"}:
+        raise ValueError(
+            f"{label} requires trading.frequency='daily'"
+        )
+    if _normalized_contract_name(loss_type) not in _TW_PHASE_RETURN_OBJECTIVES:
+        raise ValueError(
+            f"{label} supports only canonical log utility"
+        )
+    if float(max_turnover_ratio) != 0.0:
+        raise ValueError(
+            f"{label} requires max_turnover_ratio=0; every "
+            "executed position is independently closed in the same session"
+        )
+    participation = float(max_volume_participation)
+    if not math.isfinite(participation) or not (0.0 < participation <= 1.0):
+        raise ValueError(
+            f"{label} requires 0 < "
+            "max_volume_participation <= 1 using prior-contract volume"
+        )
+    equity = float(volume_participation_equity)
+    capital = float(initial_capital)
+    if not math.isfinite(equity) or equity <= 0.0:
+        raise ValueError(
+            f"{label} volume_participation_equity must be positive"
+        )
+    if not math.isfinite(capital) or capital <= 0.0:
+        raise ValueError(
+            f"{label} initial capital must be positive"
+        )
+    if abs(equity - capital) > max(1.0e-6, 1.0e-12 * capital):
+        raise ValueError(
+            f"{label} requires volume_participation_equity "
+            "to equal tw_stock_futures_day_trade_initial_capital"
+        )
+    if float(buy_fee_rate) != 0.0 or float(sell_fee_rate) != 0.0:
+        raise ValueError(
+            f"{label} embeds fixed per-contract commission "
+            "and statutory tax; buy_fee_rate and sell_fee_rate must be zero"
+        )
+    fee = float(fixed_fee_per_side_twd)
+    if not math.isfinite(fee) or fee < 0.0:
+        raise ValueError(
+            f"{label} fixed fee must be finite and non-negative"
+        )
+    integer_contracts = execution_mode == "tw_stock_futures_day_trade_0900_integer"
+    if integer_contracts and abs(fee - 40.0) > 1.0e-9:
+        raise ValueError(
+            "tw_stock_futures_day_trade_0900_integer requires the declared "
+            "network-order fee of exactly TWD 40 per contract per side"
+        )
+    if execution_mode not in {
+        "tw_stock_futures_day_trade_0900",
+        "tw_stock_futures_day_trade_0900_integer",
+    }:
+        return
+    entry_source = _normalized_contract_name(entry_0900_source)
+    valid_entry_sources = {
+        "daily_session_open_proxy",
+        "post_0900_trade_sidecar",
+    }
+    if entry_source not in valid_entry_sources:
+        raise ValueError(
+            f"{label} requires "
+            "tw_stock_futures_day_trade_0900_entry_source to be one of: "
+            + ", ".join(sorted(valid_entry_sources))
+        )
+    if (
+        entry_source == "post_0900_trade_sidecar"
+        and not str(entry_0900_data_path or "").strip()
+    ):
+        raise ValueError(
+            "tw_stock_futures_day_trade_0900 with post_0900_trade_sidecar "
+            "requires a receipt-backed tw_stock_futures_day_trade_0900_data_path"
+        )
+    if integer_contracts and entry_source != "daily_session_open_proxy":
+        raise ValueError(
+            "tw_stock_futures_day_trade_0900_integer requires "
+            "entry_source='daily_session_open_proxy' until the receipt-backed "
+            "sidecar contains both standard and mini candidates"
+        )
+    if not bool(day_trade_open_feature):
+        raise ValueError(
+            f"{label} requires day_trade_open_feature=true"
+        )
+    if bool(long_only):
+        raise ValueError(
+            f"{label} baseline requires long_only=false"
+        )
+    if _normalized_contract_name(model_portfolio_output_mode) != "projection_l1":
+        raise ValueError(
+            f"{label} requires portfolio_output_mode="
+            "'projection_l1'"
+        )
+    if bool(center_long_short_logits):
+        raise ValueError(
+            f"{label} must not de-mean logits; the model "
+            "must be able to express a zero-risk cash decision"
+        )
+    if not bool(projection_l1_scale_by_active_count):
+        raise ValueError(
+            f"{label} requires "
+            "projection_l1_scale_by_active_count=true so a large universe does "
+            "not mechanically pin every row to full gross exposure"
+        )
+    invalid_activations = [
+        name
+        for name, value in (
+            ("trading.portfolio_activation", trading_portfolio_activation),
+            ("training.loss_portfolio_activation", loss_portfolio_activation),
+        )
+        if _normalized_contract_name(value) != "pre_normalized"
+    ]
+    if invalid_activations:
+        raise ValueError(
+            f"{label} model already emits an L1-ball "
+            "portfolio; " + ", ".join(invalid_activations) + " must be pre_normalized"
         )
 
 
@@ -909,6 +1156,14 @@ def _set_legacy_alias_defaults(
 def _deep_merge_config(base: Any, override: Any) -> Any:
     if isinstance(base, dict) and isinstance(override, dict):
         merged = dict(base)
+        # The enabled temporal-basis families and their per-family component
+        # limits form one semantic value.  Keeping limits inherited from a
+        # family that a child config disabled produces an internally invalid
+        # model contract.  A family-set override therefore starts a fresh
+        # limit map; callers may either provide the new map or intentionally
+        # fall back to the shared temporal_basis_components count.
+        if "temporal_basis_families" in override:
+            merged["temporal_basis_components_by_family"] = {}
         for key, value in override.items():
             merged[key] = (
                 _deep_merge_config(merged[key], value) if key in merged else value
@@ -1301,6 +1556,31 @@ class TradingConfig:
     tw_futures_portfolio_fee_standard_twd: float = 24.0
     tw_futures_portfolio_fee_stock_twd: float = 40.0
     tw_futures_portfolio_fee_micro_twd: float = 16.0
+    # Exact carrying-account opt-in.  It changes the recurrent state from
+    # continuous notional weights to signed integer contract quantities and is
+    # therefore checkpoint-incompatible with the legacy surrogate.
+    tw_futures_portfolio_integer_contracts: bool = False
+    tw_futures_portfolio_integer_initial_capital: float = 10_000_000.0
+    tw_futures_portfolio_integer_fee_per_contract_per_side_twd: float = 40.0
+    # Full cash-stock feature universe, but only causally known nearby
+    # single-stock futures may receive a target. The aligned source owns
+    # physical contract selection, multiplier, prices, and statutory tax.
+    tw_stock_futures_day_trade_data_path: str = (
+        "data_tw_futures/taifex_portfolio_daily_v4/continuous_daily.parquet"
+    )
+    # The default 09:00 research baseline computes from the daily TAIFEX
+    # session OPEN-to-CLOSE label.  Since the daily OPEN is 08:45, this is an
+    # explicit counterfactual proxy rather than an executable 09:00 fill.
+    # ``post_0900_trade_sidecar`` remains an opt-in receipt-backed alternative.
+    tw_stock_futures_day_trade_0900_entry_source: str = (
+        "daily_session_open_proxy"
+    )
+    # Used only when the entry source is ``post_0900_trade_sidecar``.
+    tw_stock_futures_day_trade_0900_data_path: str = (
+        "data_tw_futures/taifex_stock_futures_0900_v1/entry_0900.parquet"
+    )
+    tw_stock_futures_day_trade_fee_twd: float = 40.0
+    tw_stock_futures_day_trade_initial_capital: float = 10_000_000.0
     tw_index_options_monthly_data_path: str = (
         "data_tw_index_options_daily/monthly_full_chain.parquet"
     )
@@ -1760,6 +2040,11 @@ class TrainingConfig:
     triton_cache_dir: str = "~/.cache/triton"
     cuda_cache_path: str = "~/.cache/nv_cuda"
     compile_loss: bool | None = None
+    # Whole-contract selection is nondifferentiable.  When enabled for the
+    # all-futures integer mode, train on the grouped, quantization-aware cash
+    # relaxation and reserve the exact integer ledger for validation/test.
+    # This avoids carrying a stale discrete account across optimizer steps.
+    futures_portfolio_training_surrogate_only: bool = False
     # Executor-only optimization: compile the panel-slab model with a symbolic
     # stock axis so expanding walk-forward folds can reuse one Inductor graph.
     # Batch/time/feature axes remain static and assets are never padded.
@@ -3321,6 +3606,58 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         buy_fee_rate=trading["buy_fee_rate"],
         sell_fee_rate=trading["sell_fee_rate"],
         lookback=training["lookback"],
+        integer_contracts=trading[
+            "tw_futures_portfolio_integer_contracts"
+        ],
+        integer_initial_capital=trading[
+            "tw_futures_portfolio_integer_initial_capital"
+        ],
+        max_turnover_ratio=trading["max_turnover_ratio"],
+    )
+    _validate_tw_stock_context_futures_portfolio_mode_contract(
+        execution_mode=trading["execution_mode"],
+        model_name=training["model_name"],
+        train_symbol_compaction=training["train_symbol_compaction"],
+        model_portfolio_output_mode=phase_model_config["portfolio_output_mode"],
+        trading_portfolio_activation=trading["portfolio_activation"],
+        loss_portfolio_activation=training["loss_portfolio_activation"],
+        return_rank_ic_weight=training["multitask_loss"]["return_rank_ic_weight"],
+        direction_weight=training["multitask_loss"]["direction_weight"],
+        volatility_regime_weight=training["multitask_loss"]["volatility_regime_weight"],
+        concentration_weight=training["multitask_loss"]["concentration_weight"],
+    )
+    _validate_tw_stock_futures_day_trade_mode_contract(
+        execution_mode=trading["execution_mode"],
+        frequency=trading["frequency"],
+        loss_type=training["loss_type"],
+        max_turnover_ratio=trading["max_turnover_ratio"],
+        max_volume_participation=trading["max_volume_participation"],
+        volume_participation_equity=trading["volume_participation_equity"],
+        buy_fee_rate=trading["buy_fee_rate"],
+        sell_fee_rate=trading["sell_fee_rate"],
+        fixed_fee_per_side_twd=trading[
+            "tw_stock_futures_day_trade_fee_twd"
+        ],
+        initial_capital=trading[
+            "tw_stock_futures_day_trade_initial_capital"
+        ],
+        entry_0900_source=trading[
+            "tw_stock_futures_day_trade_0900_entry_source"
+        ],
+        entry_0900_data_path=trading[
+            "tw_stock_futures_day_trade_0900_data_path"
+        ],
+        day_trade_open_feature=data["day_trade_open_feature"],
+        long_only=trading["long_only"],
+        model_portfolio_output_mode=phase_model_config["portfolio_output_mode"],
+        center_long_short_logits=phase_model_config[
+            "center_long_short_logits"
+        ],
+        projection_l1_scale_by_active_count=phase_model_config[
+            "projection_l1_scale_by_active_count"
+        ],
+        trading_portfolio_activation=trading["portfolio_activation"],
+        loss_portfolio_activation=training["loss_portfolio_activation"],
     )
     _validate_tw_index_derivatives_day_mode_contract(
         execution_mode=trading["execution_mode"],
@@ -3347,10 +3684,23 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         volatility_regime_weight=training["multitask_loss"]["volatility_regime_weight"],
         concentration_weight=training["multitask_loss"]["concentration_weight"],
     )
-    if (
+    open_gap_selected = (
         DAY_TRADE_OPEN_GAP_FEATURE in data["feature_include"]
+        and not any(
+            fnmatch.fnmatchcase(DAY_TRADE_OPEN_GAP_FEATURE, pattern)
+            for pattern in data["feature_exclude"]
+        )
+    )
+    if (
+        open_gap_selected
         and trading["execution_mode"] != "tw_day_trade"
         and trading["execution_mode"] != "tw_minute"
+        and trading["execution_mode"] != "tw_stock_futures_day_trade_0900"
+        and trading["execution_mode"] != "tw_stock_futures_day_trade_0900_integer"
+        and not (
+            trading["execution_mode"] == "tw_stock_context_futures_portfolio"
+            and trading["tw_futures_portfolio_integer_contracts"]
+        )
         and trading["execution_mode"] not in TW_CARRYING_EXECUTION_MODES
     ):
         raise ValueError(
@@ -3515,6 +3865,26 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         if not math.isfinite(fee_value) or fee_value < 0.0:
             raise ValueError(f"trading.{fee_key} must be finite and non-negative")
         trading[fee_key] = fee_value
+    integer_portfolio_fee = float(
+        trading["tw_futures_portfolio_integer_fee_per_contract_per_side_twd"]
+    )
+    if not math.isfinite(integer_portfolio_fee) or integer_portfolio_fee < 0.0:
+        raise ValueError(
+            "trading.tw_futures_portfolio_integer_fee_per_contract_per_side_twd "
+            "must be finite and non-negative"
+        )
+    trading[
+        "tw_futures_portfolio_integer_fee_per_contract_per_side_twd"
+    ] = integer_portfolio_fee
+    integer_portfolio_capital = float(
+        trading["tw_futures_portfolio_integer_initial_capital"]
+    )
+    if not math.isfinite(integer_portfolio_capital) or integer_portfolio_capital <= 0.0:
+        raise ValueError(
+            "trading.tw_futures_portfolio_integer_initial_capital must be finite "
+            "and positive"
+        )
+    trading["tw_futures_portfolio_integer_initial_capital"] = integer_portfolio_capital
     all_futures_context_path = str(
         trading["tw_index_futures_all_products_context_path"]
     ).strip()
@@ -3958,6 +4328,9 @@ def load_config(path: str | Path) -> ExperimentConfig:
             triton_cache_dir=training_raw["triton_cache_dir"],
             cuda_cache_path=training_raw["cuda_cache_path"],
             compile_loss=training_raw["compile_loss"],
+            futures_portfolio_training_surrogate_only=training_raw[
+                "futures_portfolio_training_surrogate_only"
+            ],
             compile_model_dynamic_symbols=training_raw["compile_model_dynamic_symbols"],
             compile_loss_dynamic_symbols=training_raw["compile_loss_dynamic_symbols"],
             compile_eval_model=training_raw["compile_eval_model"],

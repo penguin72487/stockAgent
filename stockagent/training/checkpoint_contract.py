@@ -30,6 +30,9 @@ from stockagent.backtest.tw_index_futures import (
 from stockagent.backtest.tw_index_derivatives_day import (
     TW_INDEX_DERIVATIVES_DAY_BACKTEST_CONTRACT_VERSION,
 )
+from stockagent.backtest.tw_futures_portfolio import (
+    TW_FUTURES_PORTFOLIO_INTEGER_TRAINING_SURROGATE,
+)
 from stockagent.config import ExperimentConfig
 from stockagent.data.panel import PanelData
 from stockagent.data.tw_index_derivatives_day import (
@@ -285,6 +288,25 @@ def _active_model_config(config: ExperimentConfig) -> dict[str, Any]:
         return {
             "config_name": "transformer_base_portfolio",
             "contract_name": "cross_sectional_index_futures",
+            "values": _project_temporal_basis_model_config(
+                asdict(config.training.transformer_base_portfolio)
+            ),
+        }
+    if normalized in {
+        "cross_sectional_all_futures",
+        "cross_sectional_all_futures_model",
+        "tw_stock_context_futures_portfolio",
+    }:
+        from stockagent.models.cross_sectional_all_futures import (
+            CROSS_SECTIONAL_ALL_FUTURES_MODEL_CONTRACT_VERSION,
+        )
+
+        return {
+            "config_name": "transformer_base_portfolio",
+            "contract_name": "cross_sectional_all_futures",
+            "contract_version": int(
+                CROSS_SECTIONAL_ALL_FUTURES_MODEL_CONTRACT_VERSION
+            ),
             "values": _project_temporal_basis_model_config(
                 asdict(config.training.transformer_base_portfolio)
             ),
@@ -874,6 +896,242 @@ def _trading_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
             "roll_gap_treatment": "mandatory_old_contract_own_close_no_gap_return",
             "accounting": "continuous_notional_research_surrogate",
         }
+    if execution_mode == "tw_stock_context_futures_portfolio":
+        from stockagent.data.tw_futures_portfolio_daily import (
+            FUTURES_MODEL_FEATURE_COLUMNS,
+            TAIFEX_FUTURES_PORTFOLIO_BACKTEST_CONTRACT_VERSION,
+            TAIFEX_FUTURES_PORTFOLIO_DATA_CONTRACT_VERSION,
+            TAIFEX_FUTURES_PORTFOLIO_FEATURE_CONTRACT_VERSION,
+            TAIFEX_FUTURES_PORTFOLIO_FIXED_SLOT_COUNT,
+            TAIFEX_FUTURES_PORTFOLIO_MAX_SAFE_LOOKBACK,
+            TAIFEX_FUTURES_PORTFOLIO_SLOT_REUSE_COOLDOWN_SESSIONS,
+        )
+        from stockagent.data.tw_stock_context_futures_portfolio import (
+            TW_STOCK_CONTEXT_FUTURES_MODEL_FEATURE_COLUMNS,
+            TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_CONTRACT_VERSION,
+        )
+
+        contract["taiwan_stock_context_futures_portfolio"] = {
+            "cross_domain_contract_version": int(
+                TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_CONTRACT_VERSION
+            ),
+            "data_contract_version": int(
+                TAIFEX_FUTURES_PORTFOLIO_DATA_CONTRACT_VERSION
+            ),
+            "feature_contract_version": int(
+                TAIFEX_FUTURES_PORTFOLIO_FEATURE_CONTRACT_VERSION
+            ),
+            "backtest_contract_version": int(
+                TAIFEX_FUTURES_PORTFOLIO_BACKTEST_CONTRACT_VERSION
+            ),
+            "data_path": str(trading.tw_futures_portfolio_data_path),
+            "input_universe": "full_ordered_cash_stock_feature_panel",
+            "action_universe": "fixed_all_taifex_futures_slots",
+            "fixed_model_output_slots": int(
+                TAIFEX_FUTURES_PORTFOLIO_FIXED_SLOT_COUNT
+            ),
+            "candidate_feature_columns": list(
+                TW_STOCK_CONTEXT_FUTURES_MODEL_FEATURE_COLUMNS
+            ),
+            "candidate_clock": "completed_futures_session_t_minus_1_only",
+            "policy_mask": (
+                "prior_slot_context_and_same_physical_contract_at_session_t"
+            ),
+            "execution_mask": "current_observed_open_close_quote_executor_only",
+            "slot_reuse_cooldown_sessions": int(
+                TAIFEX_FUTURES_PORTFOLIO_SLOT_REUSE_COOLDOWN_SESSIONS
+            ),
+            "maximum_safe_lookback_sessions": int(
+                TAIFEX_FUTURES_PORTFOLIO_MAX_SAFE_LOOKBACK
+            ),
+            "holding": "same_physical_contract_cross_session_until_own_expiry",
+            "roll_gap_treatment": "mandatory_old_contract_own_close_no_gap_return",
+            "accounting": (
+                "signed_integer_contracts_full_absolute_notional_recurrent_equity"
+                if trading.tw_futures_portfolio_integer_contracts
+                else "continuous_notional_research_surrogate"
+            ),
+            "integer_contracts": bool(
+                trading.tw_futures_portfolio_integer_contracts
+            ),
+            "integer_initial_capital_twd": float(
+                trading.tw_futures_portfolio_integer_initial_capital
+            ),
+            "integer_fixed_fee_per_contract_per_side_twd": float(
+                trading.tw_futures_portfolio_integer_fee_per_contract_per_side_twd
+            ),
+            "integer_pairing": (
+                "same_underlying_same_delivery_standard_plus_mini_joint_basket"
+            ),
+            "integer_transaction_tax": (
+                "date_versioned_statutory_rate_rounded_per_contract_per_side"
+            ),
+            "integer_capacity": (
+                "floor_prior_session_volume_times_max_volume_participation"
+            ),
+            "integer_training_surrogate": (
+                TW_FUTURES_PORTFOLIO_INTEGER_TRAINING_SURROGATE
+                if trading.tw_futures_portfolio_integer_contracts
+                else None
+            ),
+            "unfilled_notional": "same_group_cash_no_cross_group_redistribution",
+        }
+    if execution_mode in {
+        "tw_stock_futures_day_trade",
+        "tw_stock_futures_day_trade_0900",
+        "tw_stock_futures_day_trade_0900_integer",
+    }:
+        from stockagent.data.tw_stock_futures_day_trade import (
+            ENTRY_PRICE_SOURCE_DAILY_SESSION_OPEN_0900_PROXY,
+            ENTRY_PRICE_SOURCE_POST_0900_TRADE_SIDECAR,
+            TAIFEX_STOCK_FUTURES_DAY_TRADE_BACKTEST_CONTRACT_VERSION,
+            TAIFEX_STOCK_FUTURES_DAY_TRADE_0900_BACKTEST_CONTRACT_VERSION,
+            TAIFEX_STOCK_FUTURES_DAY_TRADE_DATA_CONTRACT_VERSION,
+            TAIFEX_STOCK_FUTURES_0900_ENTRY_DATA_CONTRACT_VERSION,
+            TAIFEX_STOCK_FUTURES_INTEGER_BACKTEST_CONTRACT_VERSION,
+            TAIFEX_STOCK_FUTURES_INTEGER_DATA_CONTRACT_VERSION,
+            STOCK_FUTURES_INTEGER_CANDIDATE_MULTIPLIERS,
+            STOCK_FUTURES_INTEGER_EXECUTION_CHANNELS,
+        )
+
+        is_integer = execution_mode == "tw_stock_futures_day_trade_0900_integer"
+        is_0900 = execution_mode in {
+            "tw_stock_futures_day_trade_0900",
+            "tw_stock_futures_day_trade_0900_integer",
+        }
+        entry_source = str(
+            trading.tw_stock_futures_day_trade_0900_entry_source
+        ).strip().lower()
+        contract["taiwan_stock_futures_day_trade"] = {
+            "data_contract_version": int(
+                TAIFEX_STOCK_FUTURES_DAY_TRADE_DATA_CONTRACT_VERSION
+            ),
+            "backtest_contract_version": int(
+                TAIFEX_STOCK_FUTURES_INTEGER_BACKTEST_CONTRACT_VERSION
+                if is_integer
+                else TAIFEX_STOCK_FUTURES_DAY_TRADE_0900_BACKTEST_CONTRACT_VERSION
+                if is_0900
+                else TAIFEX_STOCK_FUTURES_DAY_TRADE_BACKTEST_CONTRACT_VERSION
+            ),
+            "data_path": str(
+                trading.tw_stock_futures_day_trade_data_path
+            ),
+            "policy_universe": "full_ordered_cash_stock_feature_panel",
+            "execution_universe": (
+                (
+                    "causal_nearby_standard_and_mini_single_stock_futures"
+                    if is_integer
+                    else "causal_unique_front_month_single_stock_future_only"
+                )
+            ),
+            "selection": (
+                "nearest_tenor_per_multiplier_then_prior_volume_prior_open_"
+                "interest_product_physical_contract"
+                if is_integer
+                else "nearest_tenor_then_prior_volume_prior_open_interest_"
+                "product_physical_contract"
+            ),
+            "decision_clock": (
+                "observed_cash_open_at_090000_asia_taipei"
+                if is_0900
+                else "features_complete_through_t_minus_1"
+            ),
+            "execution_clock": (
+                (
+                    "taifex_day_session_open_0845_to_close_daily_proxy_for_"
+                    "0900_decision"
+                    if entry_source
+                    == ENTRY_PRICE_SOURCE_DAILY_SESSION_OPEN_0900_PROXY
+                    else "first_strictly_later_public_futures_trade_"
+                    "through_090059_to_close"
+                )
+                if is_0900
+                else "taifex_day_session_open_to_close"
+            ),
+            "round_trip_fee_per_contract_per_side_twd": float(
+                trading.tw_stock_futures_day_trade_fee_twd
+            ),
+            "transaction_tax": (
+                "date_versioned_stock_price_futures_per_contract_half_up_twd"
+            ),
+            "initial_capital": float(
+                trading.tw_stock_futures_day_trade_initial_capital
+            ),
+            "capacity": (
+                "floor_prior_physical_contract_volume_times_participation"
+                if is_integer
+                else "prior_selected_contract_volume_notional"
+            ),
+            "accounting": (
+                "exact_forward_integer_contract_fully_collateralized_recurrent_equity"
+                if is_integer
+                else "continuous_notional_training_surrogate"
+            ),
+        }
+        if is_integer:
+            contract["taiwan_stock_futures_day_trade"].update(
+                data_contract_version=int(
+                    TAIFEX_STOCK_FUTURES_INTEGER_DATA_CONTRACT_VERSION
+                ),
+                candidate_multipliers=list(
+                    STOCK_FUTURES_INTEGER_CANDIDATE_MULTIPLIERS
+                ),
+                execution_tensor_channels=list(
+                    STOCK_FUTURES_INTEGER_EXECUTION_CHANNELS
+                ),
+                quantity_contract="signed_q_j_int64_whole_contracts_only",
+                basket_contract=(
+                    "standard_first_residual_mini_compare_one_fewer_standard_"
+                    "and_mini_only_no_target_overshoot"
+                ),
+                collateral_contract=(
+                    "long_and_short_reserve_full_absolute_open_notional_plus_"
+                    "causal_round_trip_cost_reserve"
+                ),
+                cash_contract=(
+                    "per_underlying_model_cash_sleeve_unfilled_residual_stays_cash_"
+                    "no_cross_stock_redistribution"
+                ),
+                capital_recurrence=(
+                    "next_day_equity_equals_prior_equity_plus_actual_gross_pnl_"
+                    "minus_fixed_fees_minus_rounded_tax"
+                ),
+                gradient_contract="exact_forward_straight_through_quantity_v1",
+            )
+        if is_0900:
+            contract["taiwan_stock_futures_day_trade"].update(
+                entry_price_source=entry_source,
+                current_session_stock_open_feature=True,
+                entry_fallback="none_declared_source_is_primary",
+                exposure_contract=(
+                    "model_projection_to_l1_ball_with_residual_cash_not_forced_full"
+                ),
+            )
+            if entry_source == ENTRY_PRICE_SOURCE_DAILY_SESSION_OPEN_0900_PROXY:
+                contract["taiwan_stock_futures_day_trade"].update(
+                    entry_data_contract_version=int(
+                        TAIFEX_STOCK_FUTURES_DAY_TRADE_DATA_CONTRACT_VERSION
+                    ),
+                    entry_data_path=str(
+                        trading.tw_stock_futures_day_trade_data_path
+                    ),
+                    execution_causality=(
+                        "counterfactual_daily_open_proxy_entry_precedes_"
+                        "decision_by_15_minutes_not_live_executable"
+                    ),
+                )
+            elif entry_source == ENTRY_PRICE_SOURCE_POST_0900_TRADE_SIDECAR:
+                contract["taiwan_stock_futures_day_trade"].update(
+                    entry_data_contract_version=int(
+                        TAIFEX_STOCK_FUTURES_0900_ENTRY_DATA_CONTRACT_VERSION
+                    ),
+                    entry_data_path=str(
+                        trading.tw_stock_futures_day_trade_0900_data_path
+                    ),
+                    execution_causality=(
+                        "post_decision_public_trade_price_proxy"
+                    ),
+                )
     if execution_mode == "tw_index_derivatives_day":
         allow_option_short = bool(
             trading.tw_index_derivatives_day_allow_option_short
@@ -1395,7 +1653,50 @@ def _checkpoint_manifest(
                             ),
                         }
                     )
-            if execution_mode == "tw_index_derivatives_day":
+        if execution_mode == "tw_stock_context_futures_portfolio":
+            daily = getattr(
+                panel, "stock_context_futures_portfolio_daily", None
+            )
+            if daily is None:
+                raise ValueError(
+                    "stock-context futures checkpoint manifest requires its "
+                    "causal sidecar"
+                )
+            panel_arrays.update(
+                {
+                    "stock_context_futures_symbols": _array_content_fingerprint(
+                        np.asarray(daily.symbols, dtype="U24")
+                    ),
+                    "stock_context_futures_candidate_features": (
+                        _array_content_fingerprint(daily.candidate_features)
+                    ),
+                    "stock_context_futures_candidate_mask": (
+                        _array_content_fingerprint(daily.candidate_mask)
+                    ),
+                    "stock_context_futures_holding_log_returns": (
+                        _array_content_fingerprint(daily.holding_log_returns)
+                    ),
+                    "stock_context_futures_executable_mask": (
+                        _array_content_fingerprint(daily.executable_mask)
+                    ),
+                    "stock_context_futures_must_liquidate_mask": (
+                        _array_content_fingerprint(daily.must_liquidate_mask)
+                    ),
+                    "stock_context_futures_fee_rates": (
+                        _array_content_fingerprint(
+                            daily.fee_rate_per_open_notional
+                        )
+                    ),
+                    "stock_context_futures_benchmark": (
+                        _array_content_fingerprint(daily.benchmark_log_returns)
+                    ),
+                }
+            )
+            if daily.integer_execution is not None:
+                panel_arrays["stock_context_futures_integer_execution"] = (
+                    _array_content_fingerprint(daily.integer_execution)
+                )
+        if execution_mode == "tw_index_derivatives_day":
                 option_chain = panel.index_options_chain_day_session
                 candidates = panel.index_derivatives_day_candidates
                 if option_chain is None or candidates is None:
@@ -1573,6 +1874,8 @@ def _checkpoint_manifest(
         "symbols": symbols,
         "feature_names": feature_names,
     }
+    if "contract_version" in active_model:
+        model_contract["contract_version"] = int(active_model["contract_version"])
     schema_4_pre_external_source_fingerprints: dict[str, str] = {}
     if not bool(config.data.use_external_features):
         # These fields were added to schema 4 after TW-public checkpoints had
