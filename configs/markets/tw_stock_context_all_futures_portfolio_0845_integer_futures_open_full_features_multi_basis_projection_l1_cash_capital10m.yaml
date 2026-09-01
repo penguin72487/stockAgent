@@ -1,0 +1,32 @@
+# 08:45 all-TAIFEX carrying baseline.  Cash-stock context is complete only
+# through t-1.  Session-t TAIFEX OPEN replaces the unavailable cash-stock OPEN
+# channel and is also the entry-price proxy.  This is a same-print,
+# counterfactual research contract; it is not evidence of a causal live fill.
+base_config: tw_stock_context_all_futures_portfolio_0900_integer_full_features_multi_basis_projection_l1_cash_capital10m.yaml
+
+experiment_name: tw-stock-context-all-futures-carry-0845-integer-futures-open-exact-ste-stock-tminus1-capital10m-v1
+
+runner:
+  # Information clock, sidecar width, model parameters, and checkpoint ABI all
+  # differ from 09:00 v6. Never resume that experiment into this fresh root.
+  output_dir: artifacts/markets/tw_stock_context_all_futures_carry_0845_integer_futures_open_exact_ste_stock_tminus1_cash_capital10m_v1
+  resume: true
+
+data:
+  # Preserve the complete 99-feature cash-stock ABI. The derived OPEN-gap is
+  # shifted one panel session, so cash OPEN[t] first enters decision t+1.
+  day_trade_open_feature: true
+  feature_exclude: []
+  feature_shift_next_session:
+    - next_session_open_gap_logret
+  # Adds current_futures_open_gap_logret = log(OPEN[t] / previous_settlement[t])
+  # to every valid TAIFEX candidate and fails that candidate closed when either
+  # value is unavailable.
+  tw_futures_current_open_feature: true
+
+training:
+  # Inherited: 1000 maximum epochs, stop after 100 non-improving validations,
+  # exact integer forward account, grouped STE backward, BF16 and DDP.
+  transformer_base_portfolio:
+    futures_denomination_aware_output: true
+    futures_current_open_feature: true

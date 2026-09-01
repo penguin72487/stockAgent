@@ -30,8 +30,12 @@ _ACTION_CHANNEL_NAMES_BY_EXECUTION_MODE: dict[str, tuple[str, ...]] = {
     "naive": ("target",),
     "crypto_perpetual": ("target",),
     "tw_day_trade": ("target",),
+    "tw_stock_futures_day_trade": ("target",),
+    "tw_stock_futures_day_trade_0900": ("target",),
+    "tw_stock_futures_day_trade_0900_integer": ("target",),
     "tw_minute": ("target",),
     "tw_futures_portfolio_day": ("target",),
+    "tw_stock_context_futures_portfolio": ("target",),
     "tw_index_options_tick_long": ("target",),
     "tw_index_options_tick_short": ("target",),
     "tw_cash": ("open_target", "close_target"),
@@ -46,8 +50,12 @@ _ACTION_SCHEMA_BY_EXECUTION_MODE: dict[str, str] = {
     "naive": "single_target_v1",
     "crypto_perpetual": "single_target_v1",
     "tw_day_trade": "single_target_v1",
+    "tw_stock_futures_day_trade": "single_target_v1",
+    "tw_stock_futures_day_trade_0900": "single_target_v1",
+    "tw_stock_futures_day_trade_0900_integer": "single_target_v1",
     "tw_minute": "single_minute_target_v1",
     "tw_futures_portfolio_day": "single_target_v1",
+    "tw_stock_context_futures_portfolio": "fixed_all_futures_target_v1",
     "tw_index_options_tick_long": "single_option_pair_target_v1",
     "tw_index_options_tick_short": "single_option_pair_target_v1",
     "tw_cash": "open_close_targets_v1",
@@ -2205,6 +2213,11 @@ class TransformerBasePortfolioModel(nn.Module):
             torch.randn(1, 1, self.symbol_position_capacity, self.d_model) * 0.02
         )
         self.register_buffer(
+            "symbol_position_prefix_indices",
+            torch.arange(self.symbol_position_capacity, dtype=torch.long),
+            persistent=False,
+        )
+        self.register_buffer(
             "temporal_rope_positions",
             torch.arange(self.lookback, dtype=torch.float32),
             persistent=False,
@@ -2726,13 +2739,24 @@ class TransformerBasePortfolioModel(nn.Module):
             return positions * valid.view(1, 1, -1, 1).to(dtype=positions.dtype)
         if n_symbols <= int(self.symbol_position.size(2)):
             return self.symbol_position[:, :, :n_symbols, :]
-        extra = self.symbol_position.new_zeros(
+        # ``cat([parameter, zeros])`` returns the correct forward value, but its
+        # backward slices the larger runtime-universe gradient.  That gives the
+        # fixed-capacity parameter a leading stride based on ``n_symbols`` and
+        # violates DDP's gradient-layout contract whenever the runtime universe
+        # exceeds ``symbol_position_capacity``.  Indexed copy has the same
+        # value/checkpoint ABI and produces a gradient whose strides exactly
+        # match the parameter and its DDP bucket view.
+        expanded = self.symbol_position.new_zeros(
             1,
             1,
-            n_symbols - int(self.symbol_position.size(2)),
+            n_symbols,
             self.d_model,
         )
-        return torch.cat([self.symbol_position, extra], dim=2)
+        return expanded.index_copy(
+            2,
+            self.symbol_position_prefix_indices,
+            self.symbol_position,
+        )
 
     def _project_features(self, x: torch.Tensor) -> torch.Tensor:
         model_device = self.feature_proj.weight.device

@@ -14,6 +14,7 @@ import pytest
 import torch
 
 import train as train_entry
+from stockagent.config import load_config
 
 
 def test_startup_timing_buffers_until_output_path_is_known(
@@ -86,6 +87,18 @@ def test_training_cli_accepts_minute_chunk_capacity_override(
     assert args.transformer_temporal_pooling == "last"
     assert args.transformer_d_model == 16
     assert args.transformer_temporal_query_mode == "last_only"
+
+
+def test_training_panel_kwargs_preserve_next_session_feature_clock() -> None:
+    config = load_config(
+        "configs/markets/"
+        "tw_stock_context_all_futures_portfolio_0845_integer_futures_open_"
+        "full_features_multi_basis_projection_l1_cash_capital10m.yaml"
+    )
+    kwargs = train_entry._build_panel_kwargs(config)
+    assert kwargs["feature_shift_next_session"] == [
+        "next_session_open_gap_logret"
+    ]
 
 
 def test_process_thread_budget_prefers_config_then_inherited_then_affinity(

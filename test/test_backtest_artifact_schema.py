@@ -118,6 +118,26 @@ def _index_futures_result() -> BacktestResult:
     )
 
 
+def _stock_futures_integer_result() -> BacktestResult:
+    return BacktestResult(
+        strategy_returns=np.asarray([0.01, -0.02], dtype=np.float32),
+        benchmark_returns=np.asarray([0.005, -0.01], dtype=np.float32),
+        turnovers=np.asarray([0.8, 0.6], dtype=np.float32),
+        weights_history=np.asarray(
+            [[0.20, -0.30], [0.10, -0.15]], dtype=np.float32
+        ),
+        execution_mode="tw_stock_futures_day_trade_0900_integer",
+        settlement_ledger_unit=None,
+        requested_weights_history=np.asarray(
+            [[0.25, -0.35], [0.15, -0.20]], dtype=np.float32
+        ),
+        equity_scale_history=np.asarray([1.01, 0.9898], dtype=np.float32),
+        final_weights=np.zeros(2, dtype=np.float32),
+        final_alive=np.asarray(True, dtype=np.bool_),
+        final_equity_scale=np.asarray(0.9898, dtype=np.float32),
+    )
+
+
 _COMMISSION_REBATE_HISTORY_FIELDS = (
     "commission_rebate_accrued_history",
     "commission_rebate_paid_history",
@@ -649,6 +669,54 @@ def test_index_futures_nonterminal_stitched_slice_has_exact_terminal_state(
     np.testing.assert_array_equal(
         loaded.final_equity_scale,
         segment.final_equity_scale,
+    )
+
+
+def test_integer_stock_futures_partial_deployment_reconstructs_flat_terminal_state(
+    tmp_path: Path,
+) -> None:
+    result = _stock_futures_integer_result()
+    for segment in (
+        _prefix_backtest_result(result, 1),
+        _slice_backtest_rows(
+            result,
+            0,
+            1,
+            preserve_terminal_state=False,
+        ),
+    ):
+        np.testing.assert_array_equal(
+            segment.equity_scale_history,
+            np.asarray([1.01], dtype=np.float32),
+        )
+        np.testing.assert_array_equal(
+            segment.final_equity_scale,
+            np.asarray(1.01, dtype=np.float32),
+        )
+        np.testing.assert_array_equal(
+            segment.final_alive,
+            np.asarray(True, dtype=np.bool_),
+        )
+        np.testing.assert_array_equal(
+            segment.final_weights,
+            np.zeros(2, dtype=np.float32),
+        )
+
+    dates = np.asarray(["2026-01-02"], dtype="datetime64[D]")
+    deployment = _prefix_backtest_result(result, 1)
+    _save_deployment_test_artifacts(
+        tmp_path,
+        deployment,
+        dates,
+        symbols=["A", "B"],
+    )
+    loaded, loaded_dates = _load_backtest_artifact(
+        tmp_path / "deployment_test_backtest.npz"
+    )
+    np.testing.assert_array_equal(loaded_dates, dates)
+    np.testing.assert_array_equal(
+        loaded.final_equity_scale,
+        deployment.final_equity_scale,
     )
 
 
@@ -1454,6 +1522,89 @@ def test_taiwan_artifact_requires_explicit_ledger_units(tmp_path: Path) -> None:
             result,
             np.asarray(["2026-01-02", "2026-01-05"], dtype="datetime64[D]"),
         )
+
+
+def test_long_execution_mode_round_trips_without_u32_truncation(
+    tmp_path: Path,
+) -> None:
+    mode = "tw_stock_context_futures_portfolio"
+    result = BacktestResult(
+        strategy_returns=np.asarray([0.01, -0.02], dtype=np.float32),
+        benchmark_returns=np.zeros(2, dtype=np.float32),
+        turnovers=np.asarray([0.2, 0.1], dtype=np.float32),
+        weights_history=np.asarray([[0.5, 0.0], [0.4, 0.0]], dtype=np.float32),
+        execution_mode=mode,
+        settlement_ledger_unit="notional_weight",
+        requested_weights_history=np.asarray(
+            [[0.5, 0.0], [0.4, 0.0]], dtype=np.float32
+        ),
+        final_weights=np.asarray([0.4, 0.0], dtype=np.float32),
+        final_alive=np.asarray(True, dtype=np.bool_),
+    )
+    path = tmp_path / "long_mode.npz"
+    dates = np.asarray(["2026-01-02", "2026-01-05"], dtype="datetime64[D]")
+    _save_backtest_artifact(path, result, dates)
+
+    loaded, loaded_dates = _load_backtest_artifact(path)
+    assert loaded.execution_mode == mode
+    np.testing.assert_array_equal(loaded_dates, dates)
+    with np.load(path, allow_pickle=False) as archive:
+        assert archive["execution_mode"].item() == mode
+        assert archive["execution_mode"].dtype.itemsize >= len(mode) * 4
+
+
+def test_stock_context_integer_contract_ledger_unit_and_equity_round_trip(
+    tmp_path: Path,
+) -> None:
+    result = BacktestResult(
+        strategy_returns=np.asarray([0.01, -0.02], dtype=np.float32),
+        benchmark_returns=np.zeros(2, dtype=np.float32),
+        turnovers=np.asarray([0.2, 0.1], dtype=np.float32),
+        weights_history=np.asarray([[0.5, 0.0], [0.4, 0.0]], dtype=np.float32),
+        execution_mode="tw_stock_context_futures_portfolio",
+        settlement_ledger_unit="contract_quantity",
+        requested_weights_history=np.asarray(
+            [[0.5, 0.0], [0.4, 0.0]], dtype=np.float32
+        ),
+        equity_scale_history=np.asarray([1.01, 0.9898], dtype=np.float32),
+        final_weights=np.asarray([3.0, 0.0], dtype=np.float32),
+        final_alive=np.asarray(True, dtype=np.bool_),
+        final_equity_scale=np.asarray(0.9898, dtype=np.float32),
+    )
+    path = tmp_path / "integer_contract_quantity.npz"
+    dates = np.asarray(["2026-01-02", "2026-01-05"], dtype="datetime64[D]")
+    _save_backtest_artifact(path, result, dates)
+    loaded, loaded_dates = _load_backtest_artifact(path)
+    assert loaded.settlement_ledger_unit == "contract_quantity"
+    np.testing.assert_array_equal(loaded_dates, dates)
+    np.testing.assert_allclose(
+        loaded.equity_scale_history, result.equity_scale_history
+    )
+    with np.load(path, allow_pickle=False) as archive:
+        assert archive["settlement_ledger_unit"].item() == "contract_quantity"
+        assert archive["settlement_ledger_unit"].dtype.itemsize >= 17 * 4
+
+
+def test_legacy_u32_truncated_long_execution_mode_is_salvaged(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "legacy_truncated_mode.npz"
+    np.savez(
+        path,
+        artifact_schema_version=np.asarray(1, dtype=np.int64),
+        execution_mode=np.asarray(
+            "tw_stock_context_futures_portfolio", dtype="U32"
+        ),
+        settlement_ledger_unit=np.asarray("notional_weight", dtype="U16"),
+        strategy_returns=np.zeros(1, dtype=np.float32),
+        benchmark_returns=np.zeros(1, dtype=np.float32),
+        turnovers=np.zeros(1, dtype=np.float32),
+        weights_history=np.zeros((1, 2), dtype=np.float32),
+        dates=np.asarray(["2026-01-02"], dtype="datetime64[D]"),
+    )
+
+    loaded, _ = _load_backtest_artifact(path)
+    assert loaded.execution_mode == "tw_stock_context_futures_portfolio"
 
 
 def test_integer_artifact_rejects_inconsistent_or_partial_terminal_state(

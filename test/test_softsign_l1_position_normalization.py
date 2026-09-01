@@ -262,6 +262,23 @@ def test_l1_projection_preserves_cash_inside_ball_and_sparsifies_outside_ball() 
     assert int((outside_projected.abs() <= 1e-7).sum().item()) >= 1
 
 
+def test_l1_projection_enforces_radius_after_extreme_float32_cancellation() -> None:
+    logits = torch.linspace(
+        -1.0e15,
+        1.0e15,
+        1936,
+        dtype=torch.float32,
+    ).reshape(1, -1)
+    projected = masked_l1_projection_weights(
+        logits,
+        torch.ones_like(logits, dtype=torch.bool),
+        long_only=False,
+    )
+
+    assert torch.isfinite(projected).all()
+    assert projected.abs().sum().item() <= 1.0 + 1.0e-6
+
+
 @pytest.mark.parametrize("input_dtype", [torch.float16, torch.bfloat16])
 def test_l1_projection_keeps_portfolio_weights_float32_under_amp_dtypes(
     input_dtype: torch.dtype,

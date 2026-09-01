@@ -1,0 +1,39 @@
+# Default full-context nearby-stock-futures day-trade baseline.
+#
+# Incompatible with the legacy 08:45 decision v1/v2 and the former post-09:00
+# sidecar v3 contract.  This policy observes the cash-stock OPEN at 09:00 but,
+# by explicit user choice, computes the futures label from immutable daily
+# session OPEN-to-CLOSE data.  TAIFEX OPEN is 08:45, so this is a transparent
+# counterfactual research proxy and must not be reported as an executable 09:00
+# fill.  The model projects onto an L1 ball and may leave residual capital in
+# cash instead of being forced to one unit of gross exposure every day.
+base_config: tw_stock_futures_day_trade_full_features_multi_basis_projection_l1_capital10m.yaml
+
+experiment_name: tw-stock-futures-day-trade-0900-daily-open-proxy-full-context-full-features-multi-basis-projection-l1-cash-capital10m-v4
+
+runner:
+  output_dir: artifacts/markets/tw_stock_futures_day_trade_0900_daily_open_proxy_full_stock_context_full_features_multi_basis_projection_l1_cash_capital10m_v4
+  resume: true
+  post_train_infer: false
+
+data:
+  # OPEN[t]/CLOSE[t-1] is known at the 09:00 decision.  All other session-t
+  # close/high/low/volume aggregates remain excluded by the point-in-time panel
+  # contract and model windows still use completed history through t-1.
+  day_trade_open_feature: true
+  feature_exclude: []
+
+trading:
+  execution_mode: tw_stock_futures_day_trade_0900
+  tw_stock_futures_day_trade_0900_entry_source: daily_session_open_proxy
+  # Empty by design: the daily proxy is the primary source, not a fallback.
+  tw_stock_futures_day_trade_0900_data_path: ""
+
+training:
+  financial_transformer:
+    # Do not force net neutrality: zero scores must be able to represent cash.
+    center_long_short_logits: false
+    # Give each score an average-position interpretation before projection.
+    # This keeps O(1) logits in a 2,000+ name universe from mechanically landing
+    # on the L1 boundary; gross exposure is learned and only capped at 1.0.
+    projection_l1_scale_by_active_count: true
