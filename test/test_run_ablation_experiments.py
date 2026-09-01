@@ -28,6 +28,37 @@ def test_deep_merge_preserves_unmodified_nested_values() -> None:
     assert base["training"]["model"]["dropout"] == 0.1
 
 
+def test_deep_merge_replaces_basis_limits_when_family_set_changes() -> None:
+    base = {
+        "training": {
+            "model": {
+                "temporal_basis_families": ["haar", "learned"],
+                "temporal_basis_components_by_family": {
+                    "haar": 8,
+                    "learned": 4,
+                },
+            }
+        }
+    }
+
+    result = _deep_merge(
+        base,
+        {
+            "training": {
+                "model": {
+                    "temporal_basis_families": ["learned"],
+                    "temporal_basis_components_by_family": {"learned": 7},
+                }
+            }
+        },
+    )
+
+    assert result["training"]["model"] == {
+        "temporal_basis_families": ["learned"],
+        "temporal_basis_components_by_family": {"learned": 7},
+    }
+
+
 def test_ablation_spec_inheritance_reuses_matrix_and_overrides_contract(
     tmp_path: Path,
 ) -> None:
@@ -277,6 +308,21 @@ def test_executable_v5_model_performance_ofat_is_formal_and_semantic(
     assert not (
         loaded["no_temporal_basis"]
         .training.executable_portfolio_transformer.temporal_basis_families
+    )
+    assert (
+        loaded["no_temporal_basis"]
+        .training.executable_portfolio_transformer.temporal_basis_components_by_family
+        == {}
+    )
+    assert (
+        loaded["learned_basis_only"]
+        .training.executable_portfolio_transformer.temporal_basis_families
+        == ["learned"]
+    )
+    assert (
+        loaded["learned_basis_only"]
+        .training.executable_portfolio_transformer.temporal_basis_components_by_family
+        == {"learned": 31}
     )
 
 

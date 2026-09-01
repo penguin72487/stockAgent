@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 import torch
 
+import stockagent.training.trainer as trainer_module
 from stockagent.config import load_config
 from stockagent.models.factory import build_model
 from stockagent.models.temporal_basis_fit import (
@@ -277,6 +278,7 @@ def test_metadata_reports_rank_novelty_variance_and_candidate_counts() -> None:
 
 def test_fold_training_fit_writes_metadata_and_builds_checkpointable_model(
     tmp_path,
+    monkeypatch,
 ) -> None:
     config = load_config("configs/markets/tw_public_multi_basis.yaml")
     config.training.financial_transformer.temporal_basis_families = [
@@ -294,6 +296,18 @@ def test_fold_training_fit_writes_metadata_and_builds_checkpointable_model(
         valid_indices=np.arange(32, 56, dtype=np.int64),
         execution_mode="naive",
     )
+    synchronized_phases: list[str] = []
+    original_phase_runner = trainer_module._run_rank0_store_synchronized_phase
+
+    def _record_phase(phase, operation, **kwargs):
+        synchronized_phases.append(phase)
+        return original_phase_runner(phase, operation, **kwargs)
+
+    monkeypatch.setattr(
+        trainer_module,
+        "_run_rank0_store_synchronized_phase",
+        _record_phase,
+    )
 
     overrides, metadata = _fit_group_temporal_basis(
         config=config,
@@ -309,6 +323,7 @@ def test_fold_training_fit_writes_metadata_and_builds_checkpointable_model(
     )
 
     assert metadata is not None
+    assert synchronized_phases == ["temporal_basis_fit"]
     assert metadata["selection_policy"] == "legacy_per_family_component_count"
     assert metadata["pca_klt_training_only"] is True
     assert metadata["training_covariance"]["validation_rows_used"] == 0

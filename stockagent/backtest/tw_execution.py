@@ -27,9 +27,13 @@ EXECUTION_MODES: Final[tuple[str, ...]] = (
     "crypto_perpetual",
     "tw_cash",
     "tw_day_trade",
+    "tw_stock_futures_day_trade",
+    "tw_stock_futures_day_trade_0900",
+    "tw_stock_futures_day_trade_0900_integer",
     "tw_minute",
     "tw_overnight",
     "tw_futures_portfolio_day",
+    "tw_stock_context_futures_portfolio",
     "tw_index_futures_day",
     "tw_index_derivatives_day",
     "tw_index_derivatives_tick",
@@ -53,6 +57,15 @@ TW_DERIVATIVES_TICK_EXECUTION_MODES: Final[tuple[str, ...]] = (
 )
 TW_FUTURES_PORTFOLIO_EXECUTION_MODES: Final[tuple[str, ...]] = (
     "tw_futures_portfolio_day",
+    "tw_stock_context_futures_portfolio",
+)
+TW_STOCK_FUTURES_DAY_TRADE_EXECUTION_MODES: Final[tuple[str, ...]] = (
+    "tw_stock_futures_day_trade",
+    "tw_stock_futures_day_trade_0900",
+    "tw_stock_futures_day_trade_0900_integer",
+)
+TW_STOCK_FUTURES_INTEGER_DAY_TRADE_EXECUTION_MODES: Final[tuple[str, ...]] = (
+    "tw_stock_futures_day_trade_0900_integer",
 )
 CRYPTO_PERPETUAL_EXECUTION_MODES: Final[tuple[str, ...]] = (
     "crypto_perpetual",
@@ -66,6 +79,8 @@ CONTINUOUS_WEIGHT_EXECUTION_MODES: Final[tuple[str, ...]] = (
     "naive",
     *CRYPTO_PERPETUAL_EXECUTION_MODES,
     *TW_FUTURES_PORTFOLIO_EXECUTION_MODES,
+    "tw_stock_futures_day_trade",
+    "tw_stock_futures_day_trade_0900",
 )
 FEE_ROUNDING_MODES: Final[tuple[str, ...]] = ("none", "floor", "half_up")
 
@@ -125,6 +140,38 @@ _EXECUTION_MODE_ALIASES: Final[dict[str, str]] = {
     "tw_intraday": "tw_day_trade",
     "當沖": "tw_day_trade",
     "台股當沖": "tw_day_trade",
+    # Full cash-stock feature universe with one causally selected nearby
+    # single-stock future per underlying and a same-session OPEN/CLOSE round trip.
+    "tw_stock_futures_day_trade": "tw_stock_futures_day_trade",
+    "tw_stock_future_day_trade": "tw_stock_futures_day_trade",
+    "taiwan_stock_futures_day_trade": "tw_stock_futures_day_trade",
+    "single_stock_futures_day_trade": "tw_stock_futures_day_trade",
+    "個股期貨當沖": "tw_stock_futures_day_trade",
+    "股票期貨當沖": "tw_stock_futures_day_trade",
+    # 09:00 cash-open-aware successor.  It is a separate canonical mode so an
+    # old 08:45-open checkpoint can never resume under the new information and
+    # execution clocks.
+    "tw_stock_futures_day_trade_0900": "tw_stock_futures_day_trade_0900",
+    "tw_stock_future_day_trade_0900": "tw_stock_futures_day_trade_0900",
+    "taiwan_stock_futures_day_trade_0900": "tw_stock_futures_day_trade_0900",
+    "single_stock_futures_day_trade_0900": "tw_stock_futures_day_trade_0900",
+    "個股期貨0900當沖": "tw_stock_futures_day_trade_0900",
+    "個股期貨9點當沖": "tw_stock_futures_day_trade_0900",
+    # Exact-forward, whole-contract successor.  The policy still emits one
+    # signed target per stock; the executor jointly packs the causally known
+    # standard and mini nearby contracts under a fully collateralized cash
+    # budget and carries only account equity (all positions close daily).
+    "tw_stock_futures_day_trade_0900_integer": (
+        "tw_stock_futures_day_trade_0900_integer"
+    ),
+    "tw_stock_future_day_trade_0900_integer": (
+        "tw_stock_futures_day_trade_0900_integer"
+    ),
+    "single_stock_futures_day_trade_0900_integer": (
+        "tw_stock_futures_day_trade_0900_integer"
+    ),
+    "個股期貨0900整數口當沖": "tw_stock_futures_day_trade_0900_integer",
+    "個股期貨9點整數口當沖": "tw_stock_futures_day_trade_0900_integer",
     # Right-labelled one-minute KBar decisions with next-minute execution.
     # This is intentionally not an alias of the daily open-to-close contract.
     "tw_minute": "tw_minute",
@@ -145,6 +192,12 @@ _EXECUTION_MODE_ALIASES: Final[dict[str, str]] = {
     "tw_all_futures_day": "tw_futures_portfolio_day",
     "taifex_futures_portfolio_day": "tw_futures_portfolio_day",
     "全期貨日線": "tw_futures_portfolio_day",
+    # Complete cash-stock context with the same fixed all-futures holding
+    # ledger. This is deliberately not an alias of the futures-input mode.
+    "tw_stock_context_futures_portfolio": "tw_stock_context_futures_portfolio",
+    "tw_all_stock_context_futures_portfolio": "tw_stock_context_futures_portfolio",
+    "stock_context_all_futures": "tw_stock_context_futures_portfolio",
+    "全市場股票全期貨留倉": "tw_stock_context_futures_portfolio",
     # Daily-flat joint TX/MTX/TMF plus full-chain monthly/weekly TXO.
     "tw_index_derivatives_day": "tw_index_derivatives_day",
     "tw_futures_options_day": "tw_index_derivatives_day",
@@ -182,8 +235,12 @@ def normalize_execution_mode(mode: object) -> str:
         raise ValueError(
             "execution_mode must be one of "
             "'naive', 'crypto_perpetual', 'tw_cash', 'tw_day_trade', "
+            "'tw_stock_futures_day_trade', "
+            "'tw_stock_futures_day_trade_0900', "
+            "'tw_stock_futures_day_trade_0900_integer', "
             "'tw_minute', 'tw_overnight', or "
-            "'tw_futures_portfolio_day', 'tw_index_futures_day', 'tw_index_derivatives_day', "
+            "'tw_futures_portfolio_day', 'tw_stock_context_futures_portfolio', "
+            "'tw_index_futures_day', 'tw_index_derivatives_day', "
             "'tw_index_derivatives_tick', "
             "'tw_index_options_tick_long', or 'tw_index_options_tick_short'"
         )
@@ -193,8 +250,12 @@ def normalize_execution_mode(mode: object) -> str:
         raise ValueError(
             "execution_mode must be one of "
             "'naive', 'crypto_perpetual', 'tw_cash', 'tw_day_trade', "
+            "'tw_stock_futures_day_trade', "
+            "'tw_stock_futures_day_trade_0900', "
+            "'tw_stock_futures_day_trade_0900_integer', "
             "'tw_minute', 'tw_overnight', or "
-            "'tw_futures_portfolio_day', 'tw_index_futures_day', 'tw_index_derivatives_day', "
+            "'tw_futures_portfolio_day', 'tw_stock_context_futures_portfolio', "
+            "'tw_index_futures_day', 'tw_index_derivatives_day', "
             "'tw_index_derivatives_tick', "
             "'tw_index_options_tick_long', or 'tw_index_options_tick_short'"
         )
@@ -811,6 +872,8 @@ __all__ = [
     "TW_DERIVATIVES_TICK_EXECUTION_MODES",
     "TW_MINUTE_EXECUTION_MODES",
     "TW_FUTURES_PORTFOLIO_EXECUTION_MODES",
+    "TW_STOCK_FUTURES_DAY_TRADE_EXECUTION_MODES",
+    "TW_STOCK_FUTURES_INTEGER_DAY_TRADE_EXECUTION_MODES",
     "FEE_ROUNDING_MODES",
     "TaiwanFeeSchedule",
     "TaiwanMarginShortSchedule",

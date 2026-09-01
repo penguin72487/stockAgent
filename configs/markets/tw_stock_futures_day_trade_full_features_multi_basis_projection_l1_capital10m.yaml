@@ -1,0 +1,21 @@
+# Full-feature successor to the historical reduced-feature nearby-stock-futures
+# day-trade experiment.  Preserve the v1 config/artifacts for reproducibility:
+# changing the input feature ABI makes its checkpoints incompatible.
+base_config: tw_stock_futures_day_trade_multi_basis_projection_l1_capital10m.yaml
+
+experiment_name: tw-stock-futures-day-trade-full-stock-context-full-features-multi-basis-projection-l1-capital10m-v2
+
+runner:
+  output_dir: artifacts/markets/tw_stock_futures_day_trade_full_stock_context_full_features_multi_basis_projection_l1_capital10m_v2
+  # The fresh v2 root starts empty, then remains resumable after an interruption.
+  resume: true
+  post_train_infer: false
+
+data:
+  # Match the complete stock-context feature ABI used by the all-futures carry
+  # mode.  The sole exclusion is OPEN[t]: TAIFEX opens at 08:45, before the
+  # cash-stock opening print is observed at 09:00.
+  day_trade_open_feature: false
+  feature_exclude:
+    - next_session_open_gap_logret
+

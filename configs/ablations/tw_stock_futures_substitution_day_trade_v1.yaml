@@ -1,0 +1,123 @@
+# Fair execution-instrument substitution ablation.
+#
+# Both arms see the same complete Taiwan cash-stock context and make each
+# session-t decision only from information complete by t-1.  The current cash
+# OPEN gap is deliberately excluded from the stock control too: the nearby
+# futures arm must decide before the 09:00 cash OPEN is observed.
+#
+# This is one semantic intervention rather than a one-scalar fee sweep.  A
+# physical futures replacement necessarily brings its own return label, legal
+# mask, fees/tax, and prior-session-volume capacity contract.
+base_config: configs/markets/tw_stock_futures_day_trade_multi_basis_projection_l1_capital10m.yaml
+output_root: artifacts/ablations/tw_stock_futures_substitution_day_trade_v1
+expected_fold_count: 12
+
+# Freeze the exact 3081 x 2746 x 23 close-complete stock panel validated for
+# the nearby-futures mode.  The TAIFEX attachment has its own immutable
+# manifest and is checked by the launcher before either arm starts.
+pinned_panel_cache:
+  snapshot_id: tw-public-20260820T015018219623218Z-l0-penguin-6716296ea30636ba
+  variant_id: 94e53e8113f5f84106cbe1bdc7891ba4c5e4002370773bcee2c4005420375571
+  version: 54
+  generation: 49debfd5ee0449d087eebcdc3f325d85
+  source_hash: 31f3e4f1e31338bb9c0fd52494cc0d840a5081ffeab00a1fceddfa3412258fe0
+
+runtime:
+  cpu_threads: 112
+  torch_compile_threads: 16
+  parallel_jobs: 1
+
+matrix:
+  mode: one_factor_at_a_time
+  include_baseline: false
+
+  # These fields are experimental controls and are applied after each arm's
+  # overrides so the execution variant cannot change them accidentally.
+  fixed_overrides:
+    data:
+      day_trade_open_feature: false
+      benchmark_name: universe_average_return
+      feature_exclude:
+        - next_session_open_gap_logret
+        - twpub_pe_log
+        - twpub_pb_log
+        - twpub_dividend_yield
+        - twpub_margin_*
+        - twpub_short_*
+        - twpub_foreign_net_buy_flow
+        - twpub_investment_trust_net_buy_flow
+        - twpub_dealer_net_buy_flow
+        - twpub_institutional_net_buy_flow
+        - twpub_dividend_*
+        - twpub_exdiv_*
+        - twpub_material_*
+        - twpub_attention_*
+        - twpub_disposal_*
+        - twpub_twse_taiex_*
+        - twpub_usdtwd_*
+        - twpub_cbc_*
+        - twpub_dgbas_*
+        - twpub_mof_*
+        - twpub_taifex_*
+    walk_forward:
+      lookback_context: panel_history
+    runner:
+      resume: true
+      post_train_infer: false
+    trading:
+      frequency: daily
+      long_only: false
+      max_turnover_ratio: 0.0
+      max_volume_participation: 0.5
+      volume_participation_equity: 10000000.0
+      min_trade_weight: 0.0
+      portfolio_activation: pre_normalized
+    training:
+      model_name: financial_transformer
+      multi_gpu_strategy: distributed_data_parallel
+      epochs: 1000
+      loss_type: log_utility
+      loss_portfolio_activation: pre_normalized
+      record_epoch_curve: true
+      curve_plot_interval: 1
+      curve_plot_async: true
+      defer_epoch_curve_plot_until_end: false
+      explain_after_each_fold: false
+      financial_transformer:
+        portfolio_mode: long_short
+        portfolio_output_mode: projection_l1
+        return_aux: false
+        return_aux_details: false
+
+  dimensions:
+    - name: execution_instrument
+      enabled: true
+      variants:
+        - name: cash_stock_day_trade_no_open_control
+          experiment_name: cash_stock_day_trade_no_open_control
+          description: >-
+            Control: submit the pre-open decision to the cash stock and close
+            it in the same stock session under stock eligibility, fees, tax,
+            T+2 settlement, and short-inventory rules.
+          overrides:
+            trading:
+              execution_mode: tw_day_trade
+              buy_fee_rate: 0.000855
+              sell_fee_rate: 0.003855
+              tw_day_trade_unlimited_margin_conversion: true
+
+        - name: nearby_stock_futures_day_trade
+          experiment_name: nearby_stock_futures_day_trade
+          description: >-
+            Treatment: execute only a causally known nearby single-stock
+            future, with physical-futures OPEN-to-CLOSE returns, fixed fees,
+            statutory tax, and prior-session contract-volume capacity.
+          overrides:
+            trading:
+              execution_mode: tw_stock_futures_day_trade
+              buy_fee_rate: 0.0
+              sell_fee_rate: 0.0
+              tw_day_trade_unlimited_margin_conversion: false
+              tw_stock_futures_day_trade_data_path: data_tw_futures/taifex_portfolio_daily_v4/continuous_daily.parquet
+              tw_stock_futures_day_trade_fee_twd: 40.0
+              tw_stock_futures_day_trade_initial_capital: 10000000.0

@@ -535,6 +535,7 @@ def _build_panel_kwargs(config) -> dict:
         "feature_include": config.data.feature_include,
         "feature_exclude": config.data.feature_exclude,
         "feature_zero_fill": config.data.feature_zero_fill,
+        "feature_shift_next_session": config.data.feature_shift_next_session,
         "panel_start_date": config.data.panel_start_date,
     }
 
@@ -818,6 +819,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-folds", type=int, default=None, help="Run at most this many folds after --start-fold filtering.")
     parser.add_argument("--epochs", type=int, default=None, help="Override training.epochs for benchmark/smoke runs.")
+    parser.add_argument(
+        "--early-stopping-no-improve-ratio",
+        type=float,
+        default=None,
+        help=(
+            "Override training.early_stopping_no_improve_ratio; use 0 for a "
+            "bounded benchmark or a formal run that must execute every epoch."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=None, help="Override training.seed for PyTorch/NumPy/Python RNGs.")
     parser.add_argument(
         "--cpu-threads",
@@ -1155,6 +1165,15 @@ def main() -> None:
         if args.epochs < 1:
             raise ValueError(f"--epochs must be >= 1, got {args.epochs}")
         config.training.epochs = int(args.epochs)
+    if args.early_stopping_no_improve_ratio is not None:
+        if args.early_stopping_no_improve_ratio < 0.0:
+            raise ValueError(
+                "--early-stopping-no-improve-ratio must be >= 0, got "
+                f"{args.early_stopping_no_improve_ratio}"
+            )
+        config.training.early_stopping_no_improve_ratio = float(
+            args.early_stopping_no_improve_ratio
+        )
     if args.debug_timing_sync is not None:
         config.training.debug_timing_sync = bool(args.debug_timing_sync)
     if args.explain_after_each_fold is not None:
@@ -1319,6 +1338,78 @@ def main() -> None:
                 "stock": config.trading.tw_futures_portfolio_fee_stock_twd,
                 "micro": config.trading.tw_futures_portfolio_fee_micro_twd,
             },
+        )
+    if str(config.trading.execution_mode) == "tw_stock_context_futures_portfolio":
+        from stockagent.data.tw_stock_context_futures_portfolio import (
+            attach_stock_context_futures_portfolio_daily,
+        )
+
+        panel = attach_stock_context_futures_portfolio_daily(
+            panel,
+            config.trading.tw_futures_portfolio_data_path,
+            fee_per_side_twd_by_group={
+                "large": config.trading.tw_futures_portfolio_fee_large_twd,
+                "standard": config.trading.tw_futures_portfolio_fee_standard_twd,
+                "stock": config.trading.tw_futures_portfolio_fee_stock_twd,
+                "micro": config.trading.tw_futures_portfolio_fee_micro_twd,
+            },
+            integer_contracts=bool(
+                config.trading.tw_futures_portfolio_integer_contracts
+            ),
+            current_open_feature=bool(
+                config.data.tw_futures_current_open_feature
+            ),
+            carry_valuation_max_abs_simple_return=float(
+                config.data.tw_futures_carry_valuation_max_abs_simple_return
+            ),
+            integer_fee_per_contract_per_side_twd=float(
+                config.trading.tw_futures_portfolio_integer_fee_per_contract_per_side_twd
+            ),
+            max_volume_participation=float(
+                config.trading.max_volume_participation
+            ),
+        )
+    if str(config.trading.execution_mode) in {
+        "tw_stock_futures_day_trade",
+        "tw_stock_futures_day_trade_0900",
+        "tw_stock_futures_day_trade_0900_integer",
+    }:
+        from stockagent.data.tw_stock_futures_day_trade import (
+            attach_stock_futures_day_trade_daily,
+        )
+
+        panel = attach_stock_futures_day_trade_daily(
+            panel,
+            config.trading.tw_stock_futures_day_trade_data_path,
+            fee_per_contract_per_side_twd=(
+                config.trading.tw_stock_futures_day_trade_fee_twd
+            ),
+            entry_price_source=(
+                config.trading.tw_stock_futures_day_trade_0900_entry_source
+                if str(config.trading.execution_mode)
+                in {
+                    "tw_stock_futures_day_trade_0900",
+                    "tw_stock_futures_day_trade_0900_integer",
+                }
+                else "daily_session_open"
+            ),
+            entry_0900_data_path=(
+                config.trading.tw_stock_futures_day_trade_0900_data_path
+                if str(config.trading.execution_mode)
+                == "tw_stock_futures_day_trade_0900"
+                and str(
+                    config.trading.tw_stock_futures_day_trade_0900_entry_source
+                ).strip().lower()
+                == "post_0900_trade_sidecar"
+                else None
+            ),
+            integer_contracts=(
+                str(config.trading.execution_mode)
+                == "tw_stock_futures_day_trade_0900_integer"
+            ),
+            max_volume_participation=(
+                config.trading.max_volume_participation
+            ),
         )
     if (
         str(config.trading.execution_mode) == "tw_day_trade"

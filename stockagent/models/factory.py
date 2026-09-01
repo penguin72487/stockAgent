@@ -12,6 +12,9 @@ from stockagent.models.cross_sectional_temporal_portfolio_model import CrossSect
 from stockagent.models.cross_sectional_index_futures import (
     CrossSectionalIndexFuturesModel,
 )
+from stockagent.models.cross_sectional_all_futures import (
+    CrossSectionalAllFuturesModel,
+)
 from stockagent.models.cross_sectional_index_derivatives_day import (
     CrossSectionalIndexDerivativesDayModel,
 )
@@ -107,6 +110,12 @@ _CROSS_SECTIONAL_INDEX_FUTURES_NAMES = {
     "tw_index_futures",
 }
 
+_CROSS_SECTIONAL_ALL_FUTURES_NAMES = {
+    "cross_sectional_all_futures",
+    "cross_sectional_all_futures_model",
+    "tw_stock_context_futures_portfolio",
+}
+
 _CROSS_SECTIONAL_INDEX_DERIVATIVES_DAY_NAMES = {
     "cross_sectional_index_derivatives_day",
     "cross_sectional_index_derivatives_day_model",
@@ -156,6 +165,7 @@ def model_hidden_dim_hint(config: ExperimentConfig) -> int:
     if model_name in (
         _TRANSFORMER_BASE_PORTFOLIO_NAMES
         | _CROSS_SECTIONAL_INDEX_FUTURES_NAMES
+        | _CROSS_SECTIONAL_ALL_FUTURES_NAMES
     ):
         return int(config.training.transformer_base_portfolio.d_model)
     if model_name in (
@@ -375,6 +385,7 @@ def build_model(
     if model_name in (
         _TRANSFORMER_BASE_PORTFOLIO_NAMES
         | _CROSS_SECTIONAL_INDEX_FUTURES_NAMES
+        | _CROSS_SECTIONAL_ALL_FUTURES_NAMES
     ):
         tbp_cfg = config.training.transformer_base_portfolio
         portfolio_mode = str(tbp_cfg.portfolio_mode).strip().lower().replace("-", "_")
@@ -383,6 +394,8 @@ def build_model(
         model_class = (
             CrossSectionalIndexFuturesModel
             if model_name in _CROSS_SECTIONAL_INDEX_FUTURES_NAMES
+            else CrossSectionalAllFuturesModel
+            if model_name in _CROSS_SECTIONAL_ALL_FUTURES_NAMES
             else TransformerBasePortfolioModel
         )
         futures_kwargs = (
@@ -405,6 +418,18 @@ def build_model(
                 ),
             }
             if model_name in _CROSS_SECTIONAL_INDEX_FUTURES_NAMES
+            else {
+                "futures_denomination_aware_output": (
+                    tbp_cfg.futures_denomination_aware_output
+                ),
+                "futures_current_open_feature": (
+                    tbp_cfg.futures_current_open_feature
+                ),
+                "futures_denomination_reference_capital": (
+                    config.trading.tw_futures_portfolio_integer_initial_capital
+                ),
+            }
+            if model_name in _CROSS_SECTIONAL_ALL_FUTURES_NAMES
             else {}
         )
         return model_class(

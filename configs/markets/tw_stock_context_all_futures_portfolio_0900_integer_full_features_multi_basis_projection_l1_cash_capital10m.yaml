@@ -1,0 +1,57 @@
+# Full Taiwan cash-stock context -> every TAIFEX futures slot, with exact
+# whole-contract carrying execution.  This is checkpoint-incompatible with the
+# legacy continuous-notional all-futures mode and therefore owns a fresh root.
+base_config: tw_stock_context_all_futures_portfolio_multi_basis_projection_l1.yaml
+
+experiment_name: tw-stock-context-all-futures-carry-0900-integer-denomination-exact-ste-full-features-capital10m-v6
+
+runner:
+  output_dir: artifacts/markets/tw_stock_context_all_futures_carry_0900_integer_denomination_exact_ste_full_features_cash_capital10m_v6
+  resume: true
+  post_train_infer: false
+
+data:
+  # The complete canonical stock feature ABI is inherited.  At 09:00 the
+  # observed cash-stock OPEN gap is available, so restore the channel excluded
+  # by the legacy 08:45 decision contract.
+  day_trade_open_feature: true
+  feature_exclude: []
+
+trading:
+  execution_mode: tw_stock_context_futures_portfolio
+  frequency: daily
+  long_only: false
+  max_turnover_ratio: 0.0
+  # There is no opening-book archive.  Exact quantity changes use only the
+  # preceding session's completed volume as a causal 50% capacity ceiling.
+  max_volume_participation: 0.5
+  min_trade_weight: 0.0
+  portfolio_activation: pre_normalized
+  buy_fee_rate: 0.0
+  sell_fee_rate: 0.0
+  tw_futures_portfolio_integer_contracts: true
+  tw_futures_portfolio_integer_initial_capital: 10000000.0
+  tw_futures_portfolio_integer_fee_per_contract_per_side_twd: 40.0
+
+training:
+  epochs: 1000
+  # The exact integer account plus its grouped differentiable relaxation is a
+  # short bounded eager recurrence.  Outer torch.compile unrolled the entire
+  # batch, added a multi-minute cold compile, and made steady-state loss slower.
+  compile_loss: false
+  # Exact signed integer quantities, cash, fees, tax, P&L, and expiry state own
+  # the training forward pass.  Only backward uses the explicit grouped STE;
+  # validation/test/deployment therefore inhabit the same account world.
+  futures_portfolio_training_surrogate_only: false
+  # Keep the four global market tokens, while also routing each stock/ETF
+  # future directly to the full-context embedding of its own cash underlying.
+  # This is a learned gated link, not a hand-written sizing or selection rule.
+  # Keep 1000 as the hard maximum, but stop after ceil(1000 * 0.1) = 100
+  # consecutive validation checks without improvement.
+  early_stopping_no_improve_ratio: 0.1
+  record_epoch_curve: true
+  transformer_base_portfolio:
+    # Projection-L1 remains the unconstrained learned request.  The model then
+    # nets standard+mini by economic group and floors each group to current
+    # whole-contract cash denominations without top-K or reallocation.
+    futures_denomination_aware_output: true

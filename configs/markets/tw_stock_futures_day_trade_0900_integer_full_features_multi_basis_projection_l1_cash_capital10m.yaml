@@ -1,0 +1,28 @@
+# Whole-contract, fully-collateralized successor to the v4 continuous-notional
+# 09:00 stock-futures day-trade research proxy.  The model and complete stock
+# feature ABI are unchanged.  Only the execution/accounting contract changes:
+# one causal nearby standard candidate (multiplier 2,000) and one mini candidate
+# (multiplier 100) may jointly fill each stock target with signed integer q_j.
+#
+# TAIFEX daily OPEN remains an explicit 08:45 proxy observed before the 09:00
+# decision.  This config is therefore counterfactual research, not a live 09:00
+# fill claim.  Its checkpoints/artifacts are incompatible with v4.
+base_config: tw_stock_futures_day_trade_0900_full_features_multi_basis_projection_l1_cash_capital10m.yaml
+
+experiment_name: tw-stock-futures-day-trade-0900-integer-full-context-full-features-multi-basis-projection-l1-cash-capital10m-v5
+
+runner:
+  output_dir: artifacts/markets/tw_stock_futures_day_trade_0900_integer_full_stock_context_full_features_multi_basis_projection_l1_cash_capital10m_v5
+  resume: true
+  post_train_infer: false
+
+trading:
+  execution_mode: tw_stock_futures_day_trade_0900_integer
+  tw_stock_futures_day_trade_0900_entry_source: daily_session_open_proxy
+  tw_stock_futures_day_trade_0900_data_path: ""
+  # Network order: TWD 40 for every contract on every side, for both standard
+  # and mini stock futures.  The exact tensor also includes rounded tax.
+  tw_stock_futures_day_trade_fee_twd: 40.0
+  tw_stock_futures_day_trade_initial_capital: 10000000.0
+  volume_participation_equity: 10000000.0
+  max_volume_participation: 0.5

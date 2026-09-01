@@ -10,6 +10,8 @@ from stockagent.backtest.tw_commission_rebate import (
 )
 from stockagent.backtest.tw_execution import (
     TW_CARRYING_EXECUTION_MODES,
+    TW_STOCK_FUTURES_DAY_TRADE_EXECUTION_MODES,
+    TW_STOCK_FUTURES_INTEGER_DAY_TRADE_EXECUTION_MODES,
     normalize_execution_mode,
     official_tw_short_initial_margin_rates,
 )
@@ -146,6 +148,16 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
             "tw_index_derivatives_day",
         }
         futures_portfolio_execution = self.execution_mode == "tw_futures_portfolio_day"
+        stock_context_futures_portfolio_execution = (
+            self.execution_mode == "tw_stock_context_futures_portfolio"
+        )
+        stock_futures_day_trade_execution = (
+            self.execution_mode in TW_STOCK_FUTURES_DAY_TRADE_EXECUTION_MODES
+        )
+        stock_futures_integer_execution = (
+            self.execution_mode
+            in TW_STOCK_FUTURES_INTEGER_DAY_TRADE_EXECUTION_MODES
+        )
         derivatives_day_execution = self.execution_mode == "tw_index_derivatives_day"
         self.lookback_context = normalize_lookback_context(lookback_context)
         self.short_capacity_limit_enabled = bool(short_capacity_limit_enabled)
@@ -241,6 +253,9 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
         overnight_returns = np.zeros(panel.tradable_mask.shape, dtype=np.float32)
         derivative_candidate_features: np.ndarray | None = None
         derivative_candidate_mask: np.ndarray | None = None
+        stock_futures_daily: object | None = None
+        stock_context_futures_daily: object | None = None
+        stock_context_futures_liquidation: np.ndarray | None = None
         if futures_execution:
             market = getattr(panel, "index_futures_day_session", None)
             reference_product = getattr(panel, "index_futures_reference_product", None)
@@ -352,6 +367,90 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
                         "relative-tenor returns/mask/features have invalid shapes"
                     )
                 overnight_returns = derivative_returns
+        elif stock_futures_day_trade_execution:
+            stock_futures_daily = getattr(
+                panel, "stock_futures_day_trade_daily", None
+            )
+            if stock_futures_daily is None:
+                raise ValueError(
+                    f"{self.execution_mode} requires the attached causal "
+                    "front-month stock-futures data contract"
+                )
+            if not np.array_equal(
+                np.asarray(panel.dates, dtype="datetime64[D]"),
+                np.asarray(stock_futures_daily.dates, dtype="datetime64[D]"),
+            ) or tuple(str(value) for value in panel.symbols) != tuple(
+                str(value) for value in stock_futures_daily.symbols
+            ):
+                raise ValueError(
+                    "stock panel and stock-futures execution contract must share "
+                    "the exact ordered date/symbol axes"
+                )
+            target_returns = np.asarray(
+                stock_futures_daily.intraday_log_returns,
+                dtype=np.float32,
+            )
+            policy_eligible = np.asarray(
+                stock_futures_daily.policy_eligible_mask,
+                dtype=bool,
+            )
+            futures_executable = np.asarray(
+                stock_futures_daily.executable_mask,
+                dtype=bool,
+            )
+            fixed_round_trip_cost = np.asarray(
+                stock_futures_daily.round_trip_cost_rate_per_open_notional,
+                dtype=np.float32,
+            )
+            expected_shape = panel.tradable_mask.shape
+            if any(
+                values.shape != expected_shape
+                for values in (
+                    target_returns,
+                    policy_eligible,
+                    futures_executable,
+                    fixed_round_trip_cost,
+                )
+            ):
+                raise ValueError(
+                    "stock-futures execution arrays must match the stock panel [T,S]"
+                )
+            active = futures_executable
+            if np.any(
+                active
+                & (
+                    ~np.isfinite(target_returns)
+                    | ~np.isfinite(fixed_round_trip_cost)
+                    | (fixed_round_trip_cost < 0.0)
+                )
+            ):
+                raise ValueError(
+                    "executable stock-futures rows require finite returns and "
+                    "non-negative round-trip costs"
+                )
+            # Executor-only auxiliary side channel; never a model feature.
+            if stock_futures_integer_execution:
+                integer_execution = getattr(
+                    stock_futures_daily, "integer_candidate_execution", None
+                )
+                expected_integer_shape = (
+                    panel.num_dates,
+                    panel.tradable_mask.shape[1],
+                    2,
+                    5,
+                )
+                if integer_execution is None or tuple(
+                    np.asarray(integer_execution).shape
+                ) != expected_integer_shape:
+                    raise ValueError(
+                        "integer stock-futures execution requires candidate "
+                        "tensor [T,S,2,5]"
+                    )
+                overnight_returns = np.asarray(
+                    integer_execution, dtype=np.float32
+                )
+            else:
+                overnight_returns = fixed_round_trip_cost
         elif futures_portfolio_execution:
             target_returns = np.asarray(panel.returns_1d, dtype=np.float32)
             futures_daily = getattr(panel, "futures_portfolio_daily", None)
@@ -384,6 +483,49 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
             # never a model feature.  For this mode it carries per-contract
             # fixed commission divided by the row's opening contract notional.
             overnight_returns = fixed_fee_rates
+        elif stock_context_futures_portfolio_execution:
+            stock_context_futures_daily = getattr(
+                panel, "stock_context_futures_portfolio_daily", None
+            )
+            if stock_context_futures_daily is None:
+                raise ValueError(
+                    "tw_stock_context_futures_portfolio requires the attached "
+                    "full-stock-context/all-futures data contract"
+                )
+            if not np.array_equal(
+                np.asarray(panel.dates, dtype="datetime64[D]"),
+                np.asarray(stock_context_futures_daily.dates, dtype="datetime64[D]"),
+            ):
+                raise ValueError("stock panel and all-futures sidecar dates must align")
+            derivative_candidate_features = np.asarray(
+                stock_context_futures_daily.candidate_features,
+                dtype=np.float32,
+            )
+            derivative_candidate_mask = np.asarray(
+                stock_context_futures_daily.candidate_mask,
+                dtype=bool,
+            )
+            stock_context_futures_liquidation = np.asarray(
+                stock_context_futures_daily.must_liquidate_mask,
+                dtype=bool,
+            ).copy()
+            if (
+                derivative_candidate_features.ndim != 3
+                or derivative_candidate_features.shape[:2]
+                != derivative_candidate_mask.shape
+                or derivative_candidate_features.shape[0] != panel.num_dates
+                or derivative_candidate_mask.shape[1] != 1936
+                or stock_context_futures_liquidation.shape
+                != derivative_candidate_mask.shape
+            ):
+                raise ValueError(
+                    "stock-context futures sidecar requires context [T,1936,F], "
+                    "mask [T,1936], and liquidation [T,1936]"
+                )
+            # Stock returns remain a shape-compatible placeholder for generic
+            # dataset/report plumbing. The dedicated executor consumes only
+            # the packed futures sidecar built after fold-terminal handling.
+            target_returns = np.asarray(panel.returns_1d, dtype=np.float32)
         elif self.execution_mode == "crypto_perpetual":
             target_returns = np.asarray(panel.returns_1d, dtype=np.float32)
             closes = np.asarray(panel.close_prices, dtype=np.float64)
@@ -537,6 +679,23 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
             prior_alive[1:] = np.asarray(panel.alive_mask[:-1], dtype=bool)
             tradable = prior_alive
             close_tradable = np.asarray(panel.tradable_mask, dtype=bool) & finite_target
+        elif stock_context_futures_portfolio_execution:
+            # The stock encoder receives only the complete t-1 cash universe.
+            # Its mask must never be replaced by current futures availability,
+            # which lives on a distinct 1,936-column executor axis.
+            prior_alive = np.zeros_like(panel.alive_mask, dtype=bool)
+            prior_alive[1:] = np.asarray(panel.alive_mask[:-1], dtype=bool)
+            tradable = prior_alive
+            close_tradable = np.asarray(panel.tradable_mask, dtype=bool) & finite_target
+        elif stock_futures_day_trade_execution:
+            # Contract existence is known from the preceding TAIFEX session and
+            # is the only futures gate visible to the model. The declared
+            # current entry price (08:45 OPEN for the legacy mode or the first
+            # strictly post-09:00 trade for the successor), CLOSE, and volume
+            # support remain executor-only and may reduce a requested name to
+            # zero without reallocating it.
+            tradable = policy_eligible.copy()
+            close_tradable = futures_executable & finite_target
         elif self.execution_mode == "crypto_perpetual":
             # Row t contains the prior UTC calendar day completed at 00:00;
             # its executor-only close_prices entry is the next-trade 00:05
@@ -583,6 +742,26 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
                 market.reference_rolling_buy_hold_log_returns(reference_product),
                 dtype=np.float32,
             )
+        elif stock_futures_day_trade_execution:
+            assert stock_futures_daily is not None
+            benchmark_values = np.asarray(
+                stock_futures_daily.benchmark_log_returns,
+                dtype=np.float32,
+            )
+            if benchmark_values.shape != (panel.num_dates,):
+                raise ValueError(
+                    "stock-futures benchmark must contain one value per panel date"
+                )
+        elif stock_context_futures_portfolio_execution:
+            assert stock_context_futures_daily is not None
+            benchmark_values = np.asarray(
+                stock_context_futures_daily.benchmark_log_returns,
+                dtype=np.float32,
+            )
+            if benchmark_values.shape != (panel.num_dates,):
+                raise ValueError(
+                    "all-futures benchmark must contain one value per stock date"
+                )
         elif self.execution_mode == "tw_day_trade" or carrying_execution:
             # A session-t day trade is held from open[t] to close[t].  Its
             # buy-and-hold comparator must cover the same wall-clock session:
@@ -606,6 +785,8 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
             else np.zeros_like(tradable, dtype=bool)
         )
         if futures_execution:
+            force_exit = np.zeros_like(tradable, dtype=bool)
+        elif stock_futures_day_trade_execution:
             force_exit = np.zeros_like(tradable, dtype=bool)
         if self.date_indices.size == 0:
             valid_indices = self.date_indices
@@ -657,6 +838,23 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
                     axis=1
                 ) | force_exit[valid_indices].any(axis=1)
                 valid_indices = valid_indices[executable_or_terminal]
+            elif (
+                valid_indices.size > 0
+                and stock_context_futures_portfolio_execution
+            ):
+                assert stock_context_futures_daily is not None
+                futures_executable = np.asarray(
+                    stock_context_futures_daily.executable_mask, dtype=bool
+                )
+                assert stock_context_futures_liquidation is not None
+                executable_or_terminal = futures_executable[valid_indices].any(
+                    axis=1
+                ) | stock_context_futures_liquidation[valid_indices].any(axis=1)
+                valid_indices = valid_indices[executable_or_terminal]
+            elif valid_indices.size > 0 and stock_futures_day_trade_execution:
+                valid_indices = valid_indices[
+                    close_tradable[valid_indices].any(axis=1)
+                ]
         self.valid_indices = valid_indices
 
         if futures_portfolio_execution and self.valid_indices.size > 0:
@@ -665,6 +863,20 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
             # omits the cost of closing an otherwise carryable final position.
             force_exit = np.asarray(force_exit, dtype=bool).copy()
             force_exit[int(self.valid_indices[-1]), :] = True
+
+        if stock_context_futures_portfolio_execution:
+            assert stock_context_futures_daily is not None
+            assert stock_context_futures_liquidation is not None
+            # A research fold cannot retain an unreported terminal liability.
+            # This extra close is independent of the source-owned expiry rows;
+            # stitched deployment later replays folds without these resets.
+            if self.valid_indices.size > 0:
+                stock_context_futures_liquidation[
+                    int(self.valid_indices[-1]), :
+                ] = True
+            overnight_returns = stock_context_futures_daily.execution_tensor(
+                must_liquidate_mask=stock_context_futures_liquidation
+            )
 
         if futures_execution:
             if self.valid_indices.size > 0:
@@ -720,6 +932,12 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
         if futures_execution:
             # These are executor gates for the single futures exposure. Stock
             # limit masks are model features only and never gate TX/MTX/TMF.
+            can_buy = close_tradable.copy()
+            can_sell = close_tradable.copy()
+        elif stock_futures_day_trade_execution:
+            # Cash-stock price limits and short-sale rules do not govern a
+            # futures contract. Both directions require the same observed
+            # positive-volume futures OPEN/CLOSE round trip.
             can_buy = close_tradable.copy()
             can_sell = close_tradable.copy()
         raw_short_capacity = getattr(panel, "short_capacity_shares", None)
@@ -984,15 +1202,34 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
         )
         self.volume_notional_t: torch.Tensor | None = None
         if bool(include_volume_notional):
-            daily_volumes = getattr(panel, "daily_volumes", None)
-            if daily_volumes is None:
+            if stock_futures_day_trade_execution:
+                assert stock_futures_daily is not None
+                volume_notional = np.asarray(
+                    stock_futures_daily.prior_volume_notional,
+                    dtype=np.float32,
+                )
+                if volume_notional.shape != panel.tradable_mask.shape:
+                    raise ValueError(
+                        "stock-futures prior-volume notional must match [T,S]"
+                    )
+                if np.any(
+                    ~np.isfinite(volume_notional) | (volume_notional < 0.0)
+                ):
+                    raise ValueError(
+                        "stock-futures prior-volume notional must be finite and "
+                        "non-negative"
+                    )
+                self.volume_notional_t = torch.from_numpy(volume_notional)
+            else:
+                daily_volumes = getattr(panel, "daily_volumes", None)
+            if not stock_futures_day_trade_execution and daily_volumes is None:
                 fill = 0.0 if self.execution_mode != "naive" else np.inf
                 volume_notional = np.full_like(
                     panel.close_prices,
                     fill,
                     dtype=np.float32,
                 )
-            else:
+            elif not stock_futures_day_trade_execution:
                 daily_volumes_arr = np.asarray(daily_volumes, dtype=np.float32)
                 if execution_feature_lag(self.execution_mode) > 0:
                     # A fill at today's open or close cannot be sized from the
@@ -1052,7 +1289,8 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
                         out=volume_notional,
                         where=valid_notional,
                     )
-            self.volume_notional_t = torch.from_numpy(volume_notional)
+            if not stock_futures_day_trade_execution:
+                self.volume_notional_t = torch.from_numpy(volume_notional)
         self.tradable_mask_t = torch.from_numpy(tradable)
         self.can_buy_mask_t = torch.from_numpy(can_buy)
         self.can_sell_mask_t = torch.from_numpy(can_sell)

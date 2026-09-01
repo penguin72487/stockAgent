@@ -41,11 +41,19 @@ from stockagent.backtest.tw_dual_session_integer import (
 )
 from stockagent.backtest.tw_execution import (
     TW_CARRYING_EXECUTION_MODES,
+    TW_STOCK_FUTURES_DAY_TRADE_EXECUTION_MODES,
+    TW_STOCK_FUTURES_INTEGER_DAY_TRADE_EXECUTION_MODES,
     normalize_execution_mode,
 )
 from stockagent.backtest.tw_futures_portfolio import (
     run_tw_futures_portfolio_continuous_numpy,
     run_tw_futures_portfolio_continuous_torch,
+    run_tw_futures_portfolio_integer_surrogate_torch,
+    run_tw_futures_portfolio_integer_torch,
+)
+from stockagent.backtest.tw_stock_futures_day_trade import (
+    run_tw_stock_futures_day_trade_continuous_torch,
+    run_tw_stock_futures_day_trade_integer_torch,
 )
 from stockagent.backtest.tw_integer_execution import (
     TaiwanIntegerBacktestResult,
@@ -140,8 +148,12 @@ _SCAN_COMPILED_CACHE: dict[
 _PREP_COMPILED_CACHE: dict[
     tuple, Callable[..., tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]
 ] = {}
+_FUTURES_PORTFOLIO_COMPILED_CACHE: dict[
+    tuple, Callable[..., tuple[torch.Tensor, ...]]
+] = {}
 _SCAN_COMPILE_FAILED: set[tuple] = set()
 _PREP_COMPILE_FAILED: set[tuple] = set()
+_FUTURES_PORTFOLIO_COMPILE_FAILED: set[tuple] = set()
 _SCAN_COMPILE_STATS: dict[str, int] = {
     "hits": 0,
     "misses": 0,
@@ -1045,6 +1057,124 @@ def _scan_runner_factory(
         )
 
     return _runner
+
+
+def _futures_portfolio_runner_factory(
+    *,
+    max_turnover_ratio: float,
+    record_weights_history: bool,
+) -> Callable[..., tuple[torch.Tensor, ...]]:
+    """Return the canonical carry ledger with a compiler-friendly tensor ABI."""
+
+    def _runner(
+        target_weights: torch.Tensor,
+        holding_log_returns: torch.Tensor,
+        tradable_mask: torch.Tensor,
+        must_liquidate_mask: torch.Tensor,
+        fee_rate_per_open_notional: torch.Tensor,
+        state_advance_mask: torch.Tensor,
+        initial_weights: torch.Tensor,
+        initial_alive: torch.Tensor,
+    ) -> tuple[torch.Tensor, ...]:
+        result = run_tw_futures_portfolio_continuous_torch(
+            target_weights,
+            holding_log_returns,
+            tradable_mask,
+            must_liquidate_mask,
+            fee_rate_per_open_notional=fee_rate_per_open_notional,
+            max_turnover_ratio=max_turnover_ratio,
+            volume_limit_weights=None,
+            state_advance_mask=state_advance_mask,
+            return_weights_history=record_weights_history,
+            initial_weights=initial_weights,
+            initial_alive=initial_alive,
+        )
+        return (
+            result.strategy_returns,
+            result.turnovers,
+            result.weights_history,
+            result.final_weights,
+            result.final_alive,
+        )
+
+    return _runner
+
+
+def _resolve_futures_portfolio_runner(
+    weights: torch.Tensor,
+    *,
+    max_turnover_ratio: float,
+    record_weights_history: bool,
+) -> Callable[..., tuple[torch.Tensor, ...]]:
+    """Compile the recurrent all-futures eval ledger once per fixed ABI.
+
+    The training loss already inlines this recurrence in its outer compiled
+    graph. Epoch evaluation calls it outside that graph; without this resolver
+    Python launches one kernel group per session and dominates the eval phase.
+    """
+
+    base_runner = _futures_portfolio_runner_factory(
+        max_turnover_ratio=max_turnover_ratio,
+        record_weights_history=record_weights_history,
+    )
+    if _torch_dynamo_is_compiling():
+        return base_runner
+    if (
+        not _compile_stateful_enabled()
+        or not _compile_enabled()
+        or weights.device.type != "cuda"
+        or not hasattr(torch, "compile")
+    ):
+        _SCAN_COMPILE_STATS["disabled"] += 1
+        return base_runner
+
+    key = (
+        "tw_futures_portfolio_continuous",
+        str(weights.device),
+        tuple(int(v) for v in weights.shape),
+        str(weights.dtype),
+        float(max_turnover_ratio),
+        bool(record_weights_history),
+        bool(_compile_dynamic_enabled()),
+    )
+    if key in _FUTURES_PORTFOLIO_COMPILE_FAILED:
+        if _strict_no_fallback_enabled():
+            raise RuntimeError(
+                "Futures portfolio ledger compile was previously marked failed; "
+                "strict_no_fallback=true so eager fallback is disabled."
+            )
+        _SCAN_COMPILE_STATS["disabled"] += 1
+        return base_runner
+
+    cached = _FUTURES_PORTFOLIO_COMPILED_CACHE.get(key)
+    if cached is not None:
+        _SCAN_COMPILE_STATS["hits"] += 1
+        return cached
+
+    try:
+        _SCAN_COMPILE_STATS["misses"] += 1
+        _mark_static_shape(weights)
+        compiled = torch.compile(
+            base_runner,
+            fullgraph=True,
+            dynamic=_compile_dynamic_enabled(),
+            options={"triton.cudagraphs": False},
+        )
+        _FUTURES_PORTFOLIO_COMPILED_CACHE[key] = compiled
+        return compiled
+    except Exception as exc:
+        _FUTURES_PORTFOLIO_COMPILE_FAILED.add(key)
+        _SCAN_COMPILE_STATS["failures"] += 1
+        if _strict_no_fallback_enabled():
+            raise RuntimeError(
+                "Futures portfolio ledger torch.compile failed; "
+                "strict_no_fallback=true so eager fallback is disabled."
+            ) from exc
+        print(
+            "[backtest compile] futures portfolio compile failed, falling back "
+            f"to eager: {type(exc).__name__}: {str(exc)[:300]}"
+        )
+        return base_runner
 
 
 def _autotune_scan_chunk_size(
@@ -2955,6 +3085,7 @@ def run_backtest(
     initial_long_margin_debt: np.ndarray | None = None,
     overnight_returns: np.ndarray | None = None,
     can_short_open_open_mask: np.ndarray | None = None,
+    day_trade_execution_initial_capital: float = 1_000_000.0,
 ) -> BacktestResult:
     """Simulate daily portfolio execution from model weights."""
     mode = normalize_execution_mode(execution_mode)
@@ -3026,6 +3157,7 @@ def run_backtest(
             initial_short_margin_collateral=tensor(initial_short_margin_collateral),
             initial_long_margin_debt=tensor(initial_long_margin_debt),
             symbol_indices=tensor(symbol_indices),
+            day_trade_execution_initial_capital=day_trade_execution_initial_capital,
         )
         return result.to_numpy()
 
@@ -3122,6 +3254,8 @@ def run_backtest_torch(
     day_trade_execution_initial_capital: float = 1_000_000.0,
     day_trade_execution_volume_participation: float = 0.50,
     symbol_sharded_ledger: bool = False,
+    futures_portfolio_training_surrogate_only: bool = False,
+    futures_portfolio_recoverable_backward: bool = False,
 ) -> BacktestResultTensor:
     """Simulate daily portfolio execution from model weights in torch."""
     mode = normalize_execution_mode(execution_mode)
@@ -3195,6 +3329,168 @@ def run_backtest_torch(
             execution_mode=mode,
             settlement_ledger_unit="notional_weight",
         )
+    if mode == "tw_stock_context_futures_portfolio":
+        if overnight_returns is None:
+            raise ValueError(
+                "tw_stock_context_futures_portfolio requires packed futures "
+                "execution channels"
+            )
+        execution = overnight_returns.to(device=weights.device, dtype=torch.float32)
+        if (
+            execution.ndim != 3
+            or tuple(execution.shape[:2]) != tuple(weights.shape)
+            or int(execution.size(-1)) not in {4, 11}
+        ):
+            raise ValueError(
+                "stock-context futures execution tensor must have shape "
+                "[T,1936,4] or exact-integer [T,1936,11] matching model actions"
+            )
+        if float(buy_fee_rate) != 0.0 or float(sell_fee_rate) != 0.0:
+            raise ValueError(
+                "tw_stock_context_futures_portfolio fixed commission is "
+                "mutually exclusive with proportional buy/sell fees"
+            )
+        gross_budget = _resolve_exposure_budget(gross_leverage)
+        prepped_weights = _normalize_target_weights_torch(
+            weights.to(dtype=torch.float32),
+            long_only=long_only,
+            gross_budget=gross_budget,
+            portfolio_activation=portfolio_activation,
+        )
+        prepped_weights = _apply_min_trade_weight_torch(
+            prepped_weights,
+            float(min_trade_weight),
+        )
+        if int(execution.size(-1)) == 11:
+            if float(max_turnover_ratio) != 0.0:
+                raise ValueError(
+                    "integer stock-context futures requires max_turnover_ratio=0"
+                )
+            if futures_portfolio_training_surrogate_only:
+                result = run_tw_futures_portfolio_integer_surrogate_torch(
+                    prepped_weights,
+                    execution,
+                    initial_capital=float(day_trade_execution_initial_capital),
+                    state_advance_mask=state_advance_mask,
+                    initial_weights=initial_weights,
+                    initial_equity_scale=initial_equity_scale,
+                    initial_alive=initial_alive,
+                    return_weights_history=return_weights_history,
+                )
+            else:
+                result = run_tw_futures_portfolio_integer_torch(
+                    prepped_weights,
+                    execution,
+                    initial_capital=float(day_trade_execution_initial_capital),
+                    state_advance_mask=state_advance_mask,
+                    initial_quantities=initial_weights,
+                    initial_equity_scale=initial_equity_scale,
+                    initial_alive=initial_alive,
+                    return_weights_history=return_weights_history,
+                    recoverable_backward=futures_portfolio_recoverable_backward,
+                )
+            return BacktestResultTensor(
+                strategy_returns=result.strategy_returns,
+                benchmark_returns=benchmark_returns.to(
+                    device=result.strategy_returns.device, dtype=torch.float32
+                ),
+                turnovers=result.turnovers,
+                # This execution contract reports its recurrent ledger in
+                # signed whole contracts.  Keep nominal weights only inside
+                # the differentiable executor; persisting them under the
+                # ``contract_quantity`` unit would make audit/replay silently
+                # interpret fractions as contracts.
+                weights_history=(
+                    result.weights_history
+                    if futures_portfolio_training_surrogate_only
+                    else result.contract_quantities_history.to(dtype=torch.float32)
+                    if result.contract_quantities_history is not None
+                    else result.weights_history.new_empty(
+                        (0, int(result.weights_history.size(-1)))
+                    )
+                ),
+                requested_weights_history=(
+                    prepped_weights if return_weights_history else None
+                ),
+                final_weights=result.final_weights,
+                final_alive=result.final_alive,
+                equity_scale_history=result.equity_scale_history,
+                final_equity_scale=result.final_equity_scale,
+                settlement_default=result.default_history,
+                default_reason_history=result.default_reason_history,
+                execution_mode=mode,
+                settlement_ledger_unit=(
+                    "notional_weight_training_surrogate"
+                    if futures_portfolio_training_surrogate_only
+                    else "contract_quantity"
+                ),
+            )
+        holding_returns = execution[..., 0]
+        executable = execution[..., 1] > 0.5
+        must_liquidate = execution[..., 2] > 0.5
+        fee_rates = execution[..., 3]
+        state_advance = (
+            torch.ones(
+                (int(prepped_weights.size(0)),),
+                device=prepped_weights.device,
+                dtype=torch.bool,
+            )
+            if state_advance_mask is None
+            else state_advance_mask.to(
+                device=prepped_weights.device,
+                dtype=torch.bool,
+            )
+        )
+        prev_weights = (
+            torch.zeros_like(prepped_weights[0])
+            if initial_weights is None
+            else initial_weights.to(
+                device=prepped_weights.device,
+                dtype=torch.float32,
+            )
+        )
+        prev_alive = (
+            torch.ones((), device=prepped_weights.device, dtype=torch.bool)
+            if initial_alive is None
+            else initial_alive.to(
+                device=prepped_weights.device,
+                dtype=torch.bool,
+            ).reshape(())
+        )
+        runner = _resolve_futures_portfolio_runner(
+            prepped_weights,
+            max_turnover_ratio=float(max_turnover_ratio),
+            record_weights_history=return_weights_history,
+        )
+        (
+            strategy_returns,
+            turnovers,
+            weights_history,
+            final_weights,
+            final_alive,
+        ) = runner(
+            prepped_weights,
+            holding_returns,
+            executable,
+            must_liquidate,
+            fee_rates,
+            state_advance,
+            prev_weights,
+            prev_alive,
+        )
+        return BacktestResultTensor(
+            strategy_returns=strategy_returns,
+            benchmark_returns=benchmark_returns.to(
+                device=strategy_returns.device, dtype=torch.float32
+            ),
+            turnovers=turnovers,
+            weights_history=weights_history,
+            requested_weights_history=(weights if return_weights_history else None),
+            final_weights=final_weights,
+            final_alive=final_alive,
+            execution_mode=mode,
+            settlement_ledger_unit="notional_weight",
+        )
     if mode == "tw_futures_portfolio_day":
         if force_exit_mask is None:
             raise ValueError(
@@ -3233,6 +3529,115 @@ def run_backtest_torch(
             return_weights_history=return_weights_history,
             initial_weights=initial_weights,
             initial_alive=initial_alive,
+        )
+        return BacktestResultTensor(
+            strategy_returns=result.strategy_returns,
+            benchmark_returns=benchmark_returns.to(
+                device=result.strategy_returns.device, dtype=torch.float32
+            ),
+            turnovers=result.turnovers,
+            weights_history=result.weights_history,
+            requested_weights_history=(weights if return_weights_history else None),
+            final_weights=result.final_weights,
+            final_alive=result.final_alive,
+            execution_mode=mode,
+            settlement_ledger_unit="notional_weight",
+        )
+    if mode in TW_STOCK_FUTURES_INTEGER_DAY_TRADE_EXECUTION_MODES:
+        if overnight_returns is None:
+            raise ValueError(
+                f"{mode} requires the standard/mini integer execution tensor"
+            )
+        if float(buy_fee_rate) != 0.0 or float(sell_fee_rate) != 0.0:
+            raise ValueError(
+                f"{mode} embeds exact per-contract commissions and tax"
+            )
+        if float(max_turnover_ratio) != 0.0:
+            raise ValueError(f"{mode} requires max_turnover_ratio=0")
+        policy_weights = torch.where(
+            tradable_mask.to(device=weights.device, dtype=torch.bool),
+            weights,
+            torch.zeros_like(weights),
+        )
+        prepped_weights, _, _, _ = _prepare_scan_inputs(
+            policy_weights,
+            tradable_mask,
+            can_buy_mask,
+            can_sell_mask,
+            long_only,
+            gross_leverage,
+            min_trade_weight,
+            portfolio_activation,
+        )
+        result = run_tw_stock_futures_day_trade_integer_torch(
+            prepped_weights,
+            overnight_returns,
+            initial_capital=day_trade_execution_initial_capital,
+            state_advance_mask=state_advance_mask,
+            initial_equity_scale=initial_equity_scale,
+            initial_alive=initial_alive,
+            return_weights_history=return_weights_history,
+        )
+        return BacktestResultTensor(
+            strategy_returns=result.strategy_returns,
+            benchmark_returns=benchmark_returns.to(
+                device=result.strategy_returns.device, dtype=torch.float32
+            ),
+            turnovers=result.turnovers,
+            weights_history=result.weights_history,
+            requested_weights_history=(weights if return_weights_history else None),
+            final_weights=result.final_weights,
+            final_alive=result.final_alive,
+            equity_scale_history=result.equity_scale_history,
+            final_equity_scale=result.final_equity_scale,
+            execution_mode=mode,
+            settlement_ledger_unit=None,
+        )
+    if mode in TW_STOCK_FUTURES_DAY_TRADE_EXECUTION_MODES:
+        if overnight_returns is None:
+            raise ValueError(
+                f"{mode} requires aligned round-trip cost "
+                "rates in the executor auxiliary tensor"
+            )
+        if float(buy_fee_rate) != 0.0 or float(sell_fee_rate) != 0.0:
+            raise ValueError(
+                f"{mode} embeds fixed commission and "
+                "statutory transaction tax; proportional fee rates must be zero"
+            )
+        if float(max_turnover_ratio) != 0.0:
+            raise ValueError(
+                f"{mode} does not support a portfolio-wide "
+                "turnover scaler"
+            )
+        # Enforce the causally known underlying-to-futures mapping before L1
+        # normalization.  This keeps the full stock model output ABI while
+        # making a name without a known nearby future contribute exactly zero
+        # policy mass.  Current-session execution failure is applied later and
+        # is deliberately not reallocated.
+        policy_weights = torch.where(
+            tradable_mask.to(device=weights.device, dtype=torch.bool),
+            weights,
+            torch.zeros_like(weights),
+        )
+        prepped_weights, _, prepped_buy, prepped_sell = _prepare_scan_inputs(
+            policy_weights,
+            tradable_mask,
+            can_buy_mask,
+            can_sell_mask,
+            long_only,
+            gross_leverage,
+            min_trade_weight,
+            portfolio_activation,
+        )
+        result = run_tw_stock_futures_day_trade_continuous_torch(
+            prepped_weights,
+            future_returns,
+            prepped_buy & prepped_sell,
+            round_trip_cost_rate_per_open_notional=overnight_returns,
+            volume_limit_weights=volume_limit_weights,
+            state_advance_mask=state_advance_mask,
+            initial_alive=initial_alive,
+            return_weights_history=return_weights_history,
         )
         return BacktestResultTensor(
             strategy_returns=result.strategy_returns,
@@ -4902,6 +5307,10 @@ def run_backtest_integer_shares(
         if mode not in {
             "tw_day_trade",
             "tw_futures_portfolio_day",
+            "tw_stock_context_futures_portfolio",
+            "tw_stock_futures_day_trade",
+            "tw_stock_futures_day_trade_0900",
+            "tw_stock_futures_day_trade_0900_integer",
             "crypto_perpetual",
         }:
             raise ValueError(
