@@ -1278,6 +1278,7 @@ def risk_aware_loss(
     day_trade_execution_initial_capital: float = 1_000_000.0,
     symbol_sharded_ledger: bool = False,
     futures_portfolio_training_surrogate_only: bool = False,
+    futures_portfolio_recoverable_backward: bool = False,
 ) -> Tensor:
     """Risk-aware loss with configurable objective, including excess-CVaR-drawdown."""
     normalize_start = _loss_timer_start()
@@ -1826,6 +1827,9 @@ def risk_aware_loss(
         symbol_sharded_ledger=symbol_sharded_ledger,
         futures_portfolio_training_surrogate_only=(
             futures_portfolio_training_surrogate_only
+        ),
+        futures_portfolio_recoverable_backward=(
+            futures_portfolio_recoverable_backward
         ),
     )
     _loss_timer_stop("backtest", backtest_start)

@@ -31,6 +31,8 @@ from stockagent.backtest.tw_index_derivatives_day import (
     TW_INDEX_DERIVATIVES_DAY_BACKTEST_CONTRACT_VERSION,
 )
 from stockagent.backtest.tw_futures_portfolio import (
+    TW_FUTURES_PORTFOLIO_INTEGER_RECOVERABLE_TRAINING_SURROGATE,
+    TW_FUTURES_PORTFOLIO_INTEGER_TRAINING_FORWARD,
     TW_FUTURES_PORTFOLIO_INTEGER_TRAINING_SURROGATE,
 )
 from stockagent.config import ExperimentConfig
@@ -298,6 +300,8 @@ def _active_model_config(config: ExperimentConfig) -> dict[str, Any]:
         "tw_stock_context_futures_portfolio",
     }:
         from stockagent.models.cross_sectional_all_futures import (
+            CROSS_SECTIONAL_ALL_FUTURES_CURRENT_OPEN_MODEL_CONTRACT_VERSION,
+            CROSS_SECTIONAL_ALL_FUTURES_LEGACY_MODEL_CONTRACT_VERSION,
             CROSS_SECTIONAL_ALL_FUTURES_MODEL_CONTRACT_VERSION,
         )
 
@@ -305,7 +309,17 @@ def _active_model_config(config: ExperimentConfig) -> dict[str, Any]:
             "config_name": "transformer_base_portfolio",
             "contract_name": "cross_sectional_all_futures",
             "contract_version": int(
-                CROSS_SECTIONAL_ALL_FUTURES_MODEL_CONTRACT_VERSION
+                CROSS_SECTIONAL_ALL_FUTURES_CURRENT_OPEN_MODEL_CONTRACT_VERSION
+                if (
+                    config.training.transformer_base_portfolio
+                    .futures_current_open_feature
+                )
+                else CROSS_SECTIONAL_ALL_FUTURES_MODEL_CONTRACT_VERSION
+                if (
+                    config.training.transformer_base_portfolio
+                    .futures_denomination_aware_output
+                )
+                else CROSS_SECTIONAL_ALL_FUTURES_LEGACY_MODEL_CONTRACT_VERSION
             ),
             "values": _project_temporal_basis_model_config(
                 asdict(config.training.transformer_base_portfolio)
@@ -907,13 +921,24 @@ def _trading_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
             TAIFEX_FUTURES_PORTFOLIO_SLOT_REUSE_COOLDOWN_SESSIONS,
         )
         from stockagent.data.tw_stock_context_futures_portfolio import (
+            TW_STOCK_CONTEXT_FUTURES_CURRENT_OPEN_MODEL_FEATURE_COLUMNS,
             TW_STOCK_CONTEXT_FUTURES_MODEL_FEATURE_COLUMNS,
+            TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_CURRENT_OPEN_CONTRACT_VERSION,
+            TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_GUARDED_CURRENT_OPEN_CONTRACT_VERSION,
+            TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_LEGACY_CONTRACT_VERSION,
             TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_CONTRACT_VERSION,
+            TW_STOCK_CONTEXT_FUTURES_PRIOR_MARKET_FEATURE_COLUMNS,
         )
 
         contract["taiwan_stock_context_futures_portfolio"] = {
             "cross_domain_contract_version": int(
-                TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_CONTRACT_VERSION
+                TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_GUARDED_CURRENT_OPEN_CONTRACT_VERSION
+                if config.data.tw_futures_carry_valuation_max_abs_simple_return > 0.0
+                else TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_CURRENT_OPEN_CONTRACT_VERSION
+                if config.data.tw_futures_current_open_feature
+                else TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_CONTRACT_VERSION
+                if trading.tw_futures_portfolio_integer_contracts
+                else TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_LEGACY_CONTRACT_VERSION
             ),
             "data_contract_version": int(
                 TAIFEX_FUTURES_PORTFOLIO_DATA_CONTRACT_VERSION
@@ -931,13 +956,45 @@ def _trading_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
                 TAIFEX_FUTURES_PORTFOLIO_FIXED_SLOT_COUNT
             ),
             "candidate_feature_columns": list(
-                TW_STOCK_CONTEXT_FUTURES_MODEL_FEATURE_COLUMNS
+                TW_STOCK_CONTEXT_FUTURES_CURRENT_OPEN_MODEL_FEATURE_COLUMNS
+                if config.data.tw_futures_current_open_feature
+                else TW_STOCK_CONTEXT_FUTURES_MODEL_FEATURE_COLUMNS
+                if trading.tw_futures_portfolio_integer_contracts
+                else TW_STOCK_CONTEXT_FUTURES_PRIOR_MARKET_FEATURE_COLUMNS
             ),
-            "candidate_clock": "completed_futures_session_t_minus_1_only",
+            "candidate_clock": (
+                "market_features_t_minus_1_plus_session_t_08:45_futures_open"
+                if config.data.tw_futures_current_open_feature
+                else "market_features_t_minus_1_plus_09:00_known_denomination_metadata"
+                if trading.tw_futures_portfolio_integer_contracts
+                else "completed_futures_session_t_minus_1_only"
+            ),
+            "cash_stock_information_clock": (
+                "completed_cash_stock_sessions_through_t_minus_1"
+                if config.data.tw_futures_current_open_feature
+                else "configured_cash_stock_panel_clock"
+            ),
+            "current_futures_open_feature": bool(
+                config.data.tw_futures_current_open_feature
+            ),
+            "entry_price_clock": (
+                "08:45_daily_session_open_same_print_research_proxy"
+                if config.data.tw_futures_current_open_feature
+                else "configured_daily_futures_execution_proxy"
+            ),
             "policy_mask": (
-                "prior_slot_context_and_same_physical_contract_at_session_t"
+                "prior_slot_context_same_physical_contract_valid_current_open_"
+                "and_physical_contract_carry_valuation_integrity"
+                if config.data.tw_futures_carry_valuation_max_abs_simple_return > 0.0
+                else "prior_slot_context_same_physical_contract_and_valid_current_open"
+                if config.data.tw_futures_current_open_feature
+                else "prior_slot_context_and_same_physical_contract_at_session_t"
             ),
-            "execution_mask": "current_observed_open_close_quote_executor_only",
+            "execution_mask": (
+                "current_open_shared_with_policy_close_and_fill_executor_only"
+                if config.data.tw_futures_current_open_feature
+                else "current_observed_open_close_quote_executor_only"
+            ),
             "slot_reuse_cooldown_sessions": int(
                 TAIFEX_FUTURES_PORTFOLIO_SLOT_REUSE_COOLDOWN_SESSIONS
             ),
@@ -970,11 +1027,43 @@ def _trading_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
                 "floor_prior_session_volume_times_max_volume_participation"
             ),
             "integer_training_surrogate": (
-                TW_FUTURES_PORTFOLIO_INTEGER_TRAINING_SURROGATE
+                TW_FUTURES_PORTFOLIO_INTEGER_RECOVERABLE_TRAINING_SURROGATE
+                if config.training.futures_portfolio_recoverable_backward
+                else TW_FUTURES_PORTFOLIO_INTEGER_TRAINING_SURROGATE
+                if trading.tw_futures_portfolio_integer_contracts
+                else None
+            ),
+            "integer_recoverable_backward": bool(
+                config.training.futures_portfolio_recoverable_backward
+            ),
+            "integer_training_forward": (
+                TW_FUTURES_PORTFOLIO_INTEGER_TRAINING_FORWARD
+                if trading.tw_futures_portfolio_integer_contracts
+                and not config.training.futures_portfolio_training_surrogate_only
+                else "surrogate_only"
+                if trading.tw_futures_portfolio_integer_contracts
+                else None
+            ),
+            "denomination_aware_model_output": bool(
+                config.training.transformer_base_portfolio
+                .futures_denomination_aware_output
+            ),
+            "denomination_clock": (
+                "08:45_same_print_group_tier_and_open_notional_research_proxy"
+                if config.data.tw_futures_current_open_feature
+                else "09:00_known_group_tier_and_observed_08:45_open_notional"
                 if trading.tw_futures_portfolio_integer_contracts
                 else None
             ),
             "unfilled_notional": "same_group_cash_no_cross_group_redistribution",
+            "carry_valuation_max_abs_simple_return": float(
+                config.data.tw_futures_carry_valuation_max_abs_simple_return
+            ),
+            "carry_valuation_failure": (
+                "quarantine_entire_stock_or_etf_physical_contract_no_return_clipping"
+                if config.data.tw_futures_carry_valuation_max_abs_simple_return > 0.0
+                else "disabled"
+            ),
         }
     if execution_mode in {
         "tw_stock_futures_day_trade",
@@ -1695,6 +1784,12 @@ def _checkpoint_manifest(
             if daily.integer_execution is not None:
                 panel_arrays["stock_context_futures_integer_execution"] = (
                     _array_content_fingerprint(daily.integer_execution)
+                )
+            if daily.carry_valuation_quarantine_mask is not None:
+                panel_arrays["stock_context_futures_carry_valuation_quarantine"] = (
+                    _array_content_fingerprint(
+                        daily.carry_valuation_quarantine_mask
+                    )
                 )
         if execution_mode == "tw_index_derivatives_day":
                 option_chain = panel.index_options_chain_day_session

@@ -20243,6 +20243,12 @@ def _run_training_impl(
         == "tw_stock_context_futures_portfolio"
         and config.trading.tw_futures_portfolio_integer_contracts
     )
+    risk_loss_kwargs["futures_portfolio_recoverable_backward"] = bool(
+        config.training.futures_portfolio_recoverable_backward
+        and normalize_execution_mode(config.trading.execution_mode)
+        == "tw_stock_context_futures_portfolio"
+        and config.trading.tw_futures_portfolio_integer_contracts
+    )
     factor_aug_kwargs = _factor_augmentation_kwargs(config, loss_objective)
     if factor_aug_kwargs and _distributed_is_rank0():
         print(
@@ -21457,6 +21463,9 @@ def _run_training_impl(
         eval_risk_loss_kwargs[
             "futures_portfolio_training_surrogate_only"
         ] = False
+        # Recovery is a backward-only training mechanism. Validation/test have
+        # gradients disabled and always report the exact absorbing account.
+        eval_risk_loss_kwargs["futures_portfolio_recoverable_backward"] = False
         if factor_aug_kwargs:
             # Input augmentation is stochastic regularization.  Validation and
             # test report the deterministic factor objective and explicitly

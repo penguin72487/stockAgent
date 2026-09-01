@@ -1,0 +1,28 @@
+# Corrected 08:45 all-TAIFEX carrying baseline. The exact signed whole-contract
+# account remains authoritative in forward. Backward alone uses a resettable
+# solvency shadow after exact ruin so one failed batch cannot erase every later
+# gradient. Unsupported stock/ETF physical-contract carry valuations fail closed
+# without return clipping, top-K selection, or redistribution.
+base_config: tw_stock_context_all_futures_portfolio_0845_integer_futures_open_full_features_multi_basis_projection_l1_cash_capital10m.yaml
+
+experiment_name: tw-stock-context-all-futures-carry-0845-integer-futures-open-exact-ste-recoverable-guarded-stock-tminus1-capital10m-v2
+
+runner:
+  # Data integrity and backward semantics are checkpoint-incompatible with v1.
+  # Preserve v1 artifacts and train this contract in a fresh root.
+  output_dir: artifacts/markets/tw_stock_context_all_futures_carry_0845_integer_futures_open_exact_ste_recoverable_guarded_stock_tminus1_cash_capital10m_v2
+  resume: true
+
+data:
+  # Treat a stock/ETF future OPEN-to-next-OPEN move above 25% as outside this
+  # research dataset's supported contract-unit valuation envelope. Such a jump
+  # indicates that the daily archive cannot reconstruct the contract economics
+  # (for example a unit adjustment). Quarantine the complete physical contract;
+  # do not clip the label or reassign its cash.
+  tw_futures_carry_valuation_max_abs_simple_return: 0.25
+
+training:
+  # Inherited unchanged: full feature ABI, all 1,936 futures slots, exact
+  # integer forward, BF16/DDP, 1000 maximum epochs, and no-improve ratio 0.1.
+  futures_portfolio_training_surrogate_only: false
+  futures_portfolio_recoverable_backward: true

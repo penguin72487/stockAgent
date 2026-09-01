@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import torch
@@ -12,7 +13,10 @@ from stockagent.data.tw_futures_portfolio_daily import (
     TAIFEX_FUTURES_PORTFOLIO_FIXED_SLOT_COUNT,
 )
 from stockagent.data.tw_stock_context_futures_portfolio import (
+    TW_STOCK_CONTEXT_FUTURES_CURRENT_OPEN_MODEL_FEATURE_COLUMNS,
+    TW_STOCK_CONTEXT_FUTURES_DENOMINATION_FEATURE_COLUMNS,
     TW_STOCK_CONTEXT_FUTURES_MODEL_FEATURE_COLUMNS,
+    TW_STOCK_CONTEXT_FUTURES_PRIOR_MARKET_FEATURE_COLUMNS,
 )
 from stockagent.models.normalization import (
     finite_mask_fill_value,
@@ -24,11 +28,13 @@ from stockagent.models.transformer_base_portfolio import (
 )
 
 
-CROSS_SECTIONAL_ALL_FUTURES_MODEL_CONTRACT_VERSION = 2
+CROSS_SECTIONAL_ALL_FUTURES_LEGACY_MODEL_CONTRACT_VERSION = 2
+CROSS_SECTIONAL_ALL_FUTURES_MODEL_CONTRACT_VERSION = 3
+CROSS_SECTIONAL_ALL_FUTURES_CURRENT_OPEN_MODEL_CONTRACT_VERSION = 4
 
 
 class CrossSectionalAllFuturesModel(TransformerBasePortfolioModel):
-    """Read all stock histories and emit 1,936 independent futures targets.
+    """Read all stock histories and emit a fixed 1,936-slot futures action.
 
     Every stock/ETF futures token first receives a learned gated residual from
     its own cash-underlying embedding. Four learned market queries then read
@@ -43,6 +49,9 @@ class CrossSectionalAllFuturesModel(TransformerBasePortfolioModel):
         *args: Any,
         futures_product_capacity: int = 1024,
         futures_joint_market_tokens: int = 4,
+        futures_denomination_aware_output: bool = False,
+        futures_current_open_feature: bool = False,
+        futures_denomination_reference_capital: float = 10_000_000.0,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -50,10 +59,25 @@ class CrossSectionalAllFuturesModel(TransformerBasePortfolioModel):
             raise ValueError("futures_product_capacity must be at least two")
         if int(futures_joint_market_tokens) < 1:
             raise ValueError("futures_joint_market_tokens must be positive")
+        reference_capital = float(futures_denomination_reference_capital)
+        if not math.isfinite(reference_capital) or reference_capital <= 0.0:
+            raise ValueError("futures_denomination_reference_capital must be positive")
         del self.score_head
 
         feature_dim = len(FUTURES_MODEL_FEATURE_COLUMNS)
         self.futures_product_capacity = int(futures_product_capacity)
+        self.futures_denomination_aware_output = bool(
+            futures_denomination_aware_output
+        )
+        self.futures_current_open_feature = bool(futures_current_open_feature)
+        if (
+            self.futures_current_open_feature
+            and not self.futures_denomination_aware_output
+        ):
+            raise ValueError(
+                "current futures OPEN feature requires denomination-aware output"
+            )
+        self.futures_denomination_reference_capital = reference_capital
         self.futures_continuous_encoder = nn.Sequential(
             nn.Linear(feature_dim - 1, self.d_model),
             nn.SiLU(),
@@ -106,14 +130,30 @@ class CrossSectionalAllFuturesModel(TransformerBasePortfolioModel):
             nn.Linear(self.d_model * 2, self.d_model),
         )
         self.futures_action_head = nn.Linear(self.d_model, 1)
+        if self.futures_denomination_aware_output:
+            self.futures_denomination_encoder = nn.Sequential(
+                nn.Linear(2, self.d_model),
+                nn.SiLU(),
+                PortfolioRMSNorm(self.d_model),
+            )
+        else:
+            self.futures_denomination_encoder = None
+        if self.futures_current_open_feature:
+            self.futures_current_open_encoder = nn.Sequential(
+                nn.Linear(1, self.d_model),
+                nn.SiLU(),
+                PortfolioRMSNorm(self.d_model),
+            )
+        else:
+            self.futures_current_open_encoder = None
         self.register_buffer(
             "futures_slot_indices",
             torch.arange(TAIFEX_FUTURES_PORTFOLIO_FIXED_SLOT_COUNT),
             persistent=False,
         )
 
-    @staticmethod
     def _require_futures_context(
+        self,
         context: dict[str, torch.Tensor],
         *,
         batch_size: int,
@@ -122,7 +162,11 @@ class CrossSectionalAllFuturesModel(TransformerBasePortfolioModel):
         features = context.get("candidate_features")
         mask = context.get("candidate_mask")
         base_features = len(FUTURES_MODEL_FEATURE_COLUMNS)
+        prior_features = len(TW_STOCK_CONTEXT_FUTURES_PRIOR_MARKET_FEATURE_COLUMNS)
         expected_features = len(TW_STOCK_CONTEXT_FUTURES_MODEL_FEATURE_COLUMNS)
+        current_open_features = len(
+            TW_STOCK_CONTEXT_FUTURES_CURRENT_OPEN_MODEL_FEATURE_COLUMNS
+        )
         if features is None or mask is None:
             raise ValueError(
                 "all-futures candidate_features and candidate_mask must be paired"
@@ -131,20 +175,128 @@ class CrossSectionalAllFuturesModel(TransformerBasePortfolioModel):
             features.ndim != 3
             or tuple(features.shape[:2])
             != (batch_size, TAIFEX_FUTURES_PORTFOLIO_FIXED_SLOT_COUNT)
-            or int(features.size(-1)) not in {base_features, expected_features}
+            or int(features.size(-1))
+            not in {
+                base_features,
+                prior_features,
+                expected_features,
+                current_open_features,
+            }
         ):
             raise ValueError(
                 "all-futures candidate_features must have shape "
                 f"[B,{TAIFEX_FUTURES_PORTFOLIO_FIXED_SLOT_COUNT},"
-                f"{base_features} or {expected_features}], "
+                f"{base_features}, {prior_features}, {expected_features}, or "
+                f"{current_open_features}], "
                 f"got {tuple(features.shape)}"
             )
         if tuple(mask.shape) != tuple(features.shape[:2]):
             raise ValueError("all-futures candidate_mask must match [B,1936]")
-        return (
-            features.to(device=device),
-            mask.to(device=device, dtype=torch.bool),
+        features = features.to(device=device)
+        feature_width = int(features.size(-1))
+        if self.futures_current_open_feature and feature_width != current_open_features:
+            raise ValueError(
+                "current futures OPEN model requires its current OPEN gap context"
+            )
+        if (
+            self.futures_denomination_aware_output
+            and not self.futures_current_open_feature
+            and feature_width != expected_features
+        ):
+            raise ValueError(
+                "denomination-aware all-futures output requires current group, "
+                "tier, and one-contract cash context"
+            )
+        return features, mask.to(device=device, dtype=torch.bool)
+
+    def _denomination_aware_group_projection(
+        self,
+        weights: torch.Tensor,
+        candidate_mask: torch.Tensor,
+        denomination_features: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Hard group denomination in forward, stable identity STE backward.
+
+        Every valid standard/mini pair is one economic exposure group.  The
+        raw L1-ball request is netted within that group, rounded down to an
+        integer number of the cheapest member's fully collateralized cash
+        denomination, and divided back across the still-present members only
+        so the downstream exact executor sees the same aggregate request.
+        Rounding down can only release cash; it never renormalizes another
+        group and never applies a top-K selection.
+        """
+
+        if int(denomination_features.size(-1)) != len(
+            TW_STOCK_CONTEXT_FUTURES_DENOMINATION_FEATURE_COLUMNS
+        ):
+            raise ValueError("invalid all-futures denomination feature width")
+        slots = int(weights.size(1))
+        group_index = torch.round(denomination_features[..., 0]).to(torch.int64)
+        group_index = group_index.clamp(0, slots - 1)
+        one_contract_cash = denomination_features[..., 2].to(dtype=weights.dtype)
+        valid_member = (
+            candidate_mask
+            & torch.isfinite(one_contract_cash)
+            & (one_contract_cash > 0.0)
         )
+        member_f = valid_member.to(dtype=weights.dtype)
+        group_count = torch.zeros_like(weights).scatter_add(
+            1, group_index, member_f
+        )
+        raw_group = torch.zeros_like(weights).scatter_add(
+            1,
+            group_index,
+            torch.where(valid_member, weights, torch.zeros_like(weights)),
+        )
+        group_minimum_cash = torch.full_like(weights, float("inf")).scatter_reduce(
+            1,
+            group_index,
+            torch.where(
+                valid_member,
+                one_contract_cash,
+                torch.full_like(one_contract_cash, float("inf")),
+            ),
+            reduce="amin",
+            include_self=True,
+        )
+        minimum_weight = (
+            group_minimum_cash / self.futures_denomination_reference_capital
+        )
+        valid_group = (
+            (group_count > 0.0)
+            & torch.isfinite(minimum_weight)
+            & (minimum_weight > 0.0)
+        )
+        safe_minimum = torch.where(
+            valid_group, minimum_weight, torch.ones_like(minimum_weight)
+        )
+        units = raw_group.abs() / safe_minimum
+        rounding_epsilon = torch.finfo(weights.dtype).eps * units.clamp_min(1.0) * 8.0
+        whole_units = torch.floor(units + rounding_epsilon)
+        hard_group = torch.sign(raw_group) * whole_units * safe_minimum
+        # Exact denomination owns forward.  Backward remains the identity with
+        # respect to the continuous group request, including inside a floor
+        # plateau, so the optimizer can learn to cross the one-contract edge.
+        straight_through_group = raw_group + (hard_group - raw_group).detach()
+        straight_through_group = torch.where(
+            valid_group,
+            straight_through_group,
+            torch.zeros_like(straight_through_group),
+        )
+        count_by_member = group_count.gather(1, group_index).clamp_min(1.0)
+        projected = torch.where(
+            valid_member,
+            straight_through_group.gather(1, group_index) / count_by_member,
+            torch.zeros_like(weights),
+        )
+        return projected, {
+            "futures_raw_group_actions": raw_group,
+            "futures_denomination_group_actions": straight_through_group,
+            "futures_group_minimum_contract_weight": torch.where(
+                valid_group, minimum_weight, torch.zeros_like(minimum_weight)
+            ),
+            "futures_valid_denomination_group": valid_group,
+        }
 
     def _portfolio_outputs_from_stock_embeddings(
         self,
@@ -170,16 +322,24 @@ class CrossSectionalAllFuturesModel(TransformerBasePortfolioModel):
             device=z_stock.device,
         )
 
-        has_underlying_channel = int(candidate_features.size(-1)) == len(
+        base_feature_count = len(FUTURES_MODEL_FEATURE_COLUMNS)
+        prior_feature_count = len(
+            TW_STOCK_CONTEXT_FUTURES_PRIOR_MARKET_FEATURE_COLUMNS
+        )
+        has_underlying_channel = int(candidate_features.size(-1)) >= (
+            prior_feature_count
+        )
+        has_denomination_channels = int(candidate_features.size(-1)) >= len(
             TW_STOCK_CONTEXT_FUTURES_MODEL_FEATURE_COLUMNS
         )
-        base_candidate_features = (
-            candidate_features[..., :-1]
-            if has_underlying_channel
-            else candidate_features
+        has_current_open_channel = int(candidate_features.size(-1)) == len(
+            TW_STOCK_CONTEXT_FUTURES_CURRENT_OPEN_MODEL_FEATURE_COLUMNS
         )
+        base_candidate_features = candidate_features[..., :base_feature_count]
         underlying_indices = (
-            torch.round(candidate_features[..., -1]).to(dtype=torch.long)
+            torch.round(candidate_features[..., base_feature_count]).to(
+                dtype=torch.long
+            )
             if has_underlying_channel
             else torch.full(
                 candidate_mask.shape,
@@ -203,6 +363,67 @@ class CrossSectionalAllFuturesModel(TransformerBasePortfolioModel):
             + self.futures_product_embedding(product_ids)
             + self.futures_slot_embedding(self.futures_slot_indices)[None, :, :]
         )
+        denomination_features = (
+            candidate_features[
+                ...,
+                prior_feature_count : prior_feature_count
+                + len(TW_STOCK_CONTEXT_FUTURES_DENOMINATION_FEATURE_COLUMNS),
+            ]
+            if has_denomination_channels
+            else None
+        )
+        if self.futures_denomination_encoder is not None:
+            if denomination_features is None:
+                raise ValueError(
+                    "denomination-aware all-futures output requires denomination context"
+                )
+            denomination_cash = denomination_features[..., 2].float()
+            valid_denomination = (
+                candidate_mask
+                & torch.isfinite(denomination_cash)
+                & (denomination_cash > 0.0)
+            )
+            log_cash_fraction = torch.log(
+                (
+                    denomination_cash
+                    / self.futures_denomination_reference_capital
+                ).clamp_min(1.0e-8)
+            ).clamp(-18.0, 4.0)
+            candidate_tier = torch.nan_to_num(
+                denomination_features[..., 1].float(),
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            ).clamp(0.0, 1.0)
+            denomination_token = self.futures_denomination_encoder(
+                torch.stack((log_cash_fraction, candidate_tier), dim=-1).to(
+                    dtype=z_stock.dtype
+                )
+            )
+            futures_tokens = futures_tokens + torch.where(
+                valid_denomination.unsqueeze(-1),
+                denomination_token,
+                torch.zeros_like(denomination_token),
+            )
+        if self.futures_current_open_encoder is not None:
+            if not has_current_open_channel:
+                raise ValueError(
+                    "current futures OPEN model requires its current OPEN gap context"
+                )
+            current_open_gap = torch.nan_to_num(
+                candidate_features[..., -1].float(),
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            ).clamp(-1.0, 1.0)
+            current_open_token = self.futures_current_open_encoder(
+                current_open_gap.unsqueeze(-1).to(dtype=z_stock.dtype)
+            )
+            futures_tokens = futures_tokens + torch.where(
+                candidate_mask.unsqueeze(-1),
+                current_open_token,
+                torch.zeros_like(current_open_token),
+            )
         valid_underlying = (
             (underlying_indices >= 0)
             & (underlying_indices < int(z_stock.size(1)))
@@ -300,6 +521,22 @@ class CrossSectionalAllFuturesModel(TransformerBasePortfolioModel):
                     )
                 ),
             )
+        if self.futures_denomination_aware_output:
+            if denomination_features is None:
+                raise ValueError(
+                    "denomination-aware all-futures output requires denomination context"
+                )
+            raw_projected_weights = weights
+            weights, denomination_aux = self._denomination_aware_group_projection(
+                raw_projected_weights,
+                candidate_mask,
+                denomination_features,
+            )
+            action_aux = {
+                **action_aux,
+                **denomination_aux,
+                "futures_pre_denomination_actions": raw_projected_weights,
+            }
         weights = weights.masked_fill(~candidate_mask, 0.0)
         reported_scores = scores.masked_fill(
             ~candidate_mask,
@@ -344,6 +581,8 @@ class CrossSectionalAllFuturesModel(TransformerBasePortfolioModel):
 
 
 __all__ = [
+    "CROSS_SECTIONAL_ALL_FUTURES_CURRENT_OPEN_MODEL_CONTRACT_VERSION",
+    "CROSS_SECTIONAL_ALL_FUTURES_LEGACY_MODEL_CONTRACT_VERSION",
     "CROSS_SECTIONAL_ALL_FUTURES_MODEL_CONTRACT_VERSION",
     "CrossSectionalAllFuturesModel",
 ]

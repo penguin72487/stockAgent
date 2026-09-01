@@ -7,6 +7,7 @@ import math
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from stockagent.data.tw_futures_portfolio_daily import (
     TAIFEX_FUTURES_PORTFOLIO_BACKTEST_CONTRACT_VERSION,
@@ -19,6 +20,15 @@ from stockagent.data.tw_futures_portfolio_daily import (
 TW_FUTURES_PORTFOLIO_INTEGER_TRAINING_SURROGATE = (
     "grouped_fake_floor_cash_surrogate_v4"
 )
+TW_FUTURES_PORTFOLIO_INTEGER_RECOVERABLE_TRAINING_SURROGATE = (
+    "grouped_fake_floor_cash_solvency_recovery_surrogate_v5"
+)
+TW_FUTURES_PORTFOLIO_INTEGER_TRAINING_FORWARD = "exact_integer_account_v1"
+
+TW_FUTURES_PORTFOLIO_DEFAULT_NONE = 0
+TW_FUTURES_PORTFOLIO_DEFAULT_FUNDING = 1
+TW_FUTURES_PORTFOLIO_DEFAULT_NONFINITE_EQUITY = 2
+TW_FUTURES_PORTFOLIO_DEFAULT_NONPOSITIVE_EQUITY = 3
 
 
 @dataclass(slots=True)
@@ -31,6 +41,8 @@ class FuturesPortfolioTensorResult:
     equity_scale_history: torch.Tensor | None = None
     final_equity_scale: torch.Tensor | None = None
     contract_quantities_history: torch.Tensor | None = None
+    default_history: torch.Tensor | None = None
+    default_reason_history: torch.Tensor | None = None
 
 
 @dataclass(slots=True)
@@ -113,6 +125,7 @@ def run_tw_futures_portfolio_integer_surrogate_torch(
     initial_equity_scale: torch.Tensor | None = None,
     initial_alive: torch.Tensor | None = None,
     return_weights_history: bool = True,
+    recover_after_default_for_backward: bool = False,
 ) -> FuturesPortfolioTensorResult:
     """Differentiable grouped relaxation for the exact integer account.
 
@@ -267,6 +280,11 @@ def run_tw_futures_portfolio_integer_surrogate_torch(
         include_self=True,
     )
 
+    supplied_alive = (
+        torch.ones((), device=weights.device, dtype=torch.bool)
+        if initial_alive is None
+        else initial_alive.to(device=weights.device, dtype=torch.bool).reshape(())
+    )
     starting_scale = (
         weights.new_ones(())
         if initial_equity_scale is None
@@ -275,11 +293,22 @@ def run_tw_futures_portfolio_integer_surrogate_torch(
             dtype=weights.dtype,
         ).reshape(())
     )
+    if recover_after_default_for_backward:
+        valid_start = (
+            supplied_alive
+            & torch.isfinite(starting_scale)
+            & (starting_scale > 0.0)
+        )
+        starting_scale = torch.where(
+            valid_start,
+            starting_scale,
+            weights.new_ones(()),
+        )
     equity = weights.new_tensor(capital) * starting_scale
     alive = (
         torch.ones((), device=weights.device, dtype=torch.bool)
-        if initial_alive is None
-        else initial_alive.to(device=weights.device, dtype=torch.bool).reshape(())
+        if recover_after_default_for_backward
+        else supplied_alive
     )
     if initial_quantities is not None and initial_weights is not None:
         raise ValueError("provide initial_quantities or initial_weights, not both")
@@ -321,7 +350,11 @@ def run_tw_futures_portfolio_integer_surrogate_torch(
     weight_rows: list[torch.Tensor] = []
     equity_rows: list[torch.Tensor] = []
     for row in range(rows):
-        row_advances = advance[row] & alive
+        row_advances = (
+            advance[row]
+            if recover_after_default_for_backward
+            else advance[row] & alive
+        )
         current_group = torch.zeros_like(previous_slot_weights).scatter_add(
             0,
             group_index[row],
@@ -417,20 +450,61 @@ def run_tw_futures_portfolio_integer_surrogate_torch(
             torch.zeros_like(held_group),
         ).sum()
         net_simple = gross_simple - entry_cost - close_cost
-        survived = alive & (
-            ~advance[row]
-            | (torch.isfinite(net_simple) & (net_simple > -1.0))
+        row_survived = ~advance[row] | (
+            torch.isfinite(net_simple) & (net_simple > -1.0)
+        )
+        survived = row_survived if recover_after_default_for_backward else (
+            alive & row_survived
         )
         safe_net = torch.where(
             survived,
             net_simple,
             torch.full_like(net_simple, -1.0 + 1.0e-7),
         )
-        log_return = torch.where(
-            row_advances,
-            torch.log1p(safe_net),
-            torch.zeros_like(safe_net),
-        )
+        if recover_after_default_for_backward:
+            # Exact forward ruin remains absorbing in the integer executor. This
+            # shadow account exists only in backward: use a smooth positive
+            # wealth map at/through the -100% boundary, while preserving the
+            # hard ruin sentinel as the forward value. Resetting the shadow
+            # account after ruin lets later batches provide a learning signal
+            # instead of turning every subsequent optimizer step into zero.
+            finite_net = torch.nan_to_num(
+                net_simple,
+                nan=-2.0,
+                posinf=2.0,
+                neginf=-2.0,
+            )
+            soft_wealth = F.softplus((1.0 + finite_net) / 0.10) * 0.10 + 1.0e-7
+            hard_log_return = torch.log1p(safe_net)
+            soft_log_return = torch.log(soft_wealth)
+            recoverable_log_return = soft_log_return + (
+                hard_log_return - soft_log_return
+            ).detach()
+
+            # This zero-forward barrier is the differentiable form of the exact
+            # account's full-notional-plus-cost funding test. It does not add a
+            # top-K, target leverage, or portfolio redistribution heuristic.
+            funding_required = (
+                held_group.abs().sum()
+                + entry_cost
+                + (held_group.abs() * group_exit_cost_rate[row]).sum()
+            )
+            funding_excess = funding_required - 1.0
+            funding_barrier = F.softplus(funding_excess / 0.05) * 0.05
+            recoverable_log_return = recoverable_log_return - (
+                funding_barrier - funding_barrier.detach()
+            )
+            log_return = torch.where(
+                row_advances,
+                recoverable_log_return,
+                torch.zeros_like(recoverable_log_return),
+            )
+        else:
+            log_return = torch.where(
+                row_advances,
+                torch.log1p(safe_net),
+                torch.zeros_like(safe_net),
+            )
         forced_close_turnover = torch.where(
             group_must_liquidate[row] & row_advances,
             (held_group * (1.0 + group_simple_return[row])).abs(),
@@ -474,7 +548,20 @@ def run_tw_futures_portfolio_integer_surrogate_torch(
             equity * (1.0 + safe_net),
             equity,
         )
-        alive = survived
+        if recover_after_default_for_backward:
+            previous_slot_weights = torch.where(
+                survived,
+                previous_slot_weights,
+                torch.zeros_like(previous_slot_weights),
+            )
+            equity = torch.where(
+                survived,
+                equity,
+                weights.new_tensor(capital),
+            )
+            alive = torch.ones_like(alive)
+        else:
+            alive = survived
         return_rows.append(log_return)
         turnover_rows.append(turnover)
         if return_weights_history:
@@ -512,6 +599,7 @@ def run_tw_futures_portfolio_integer_torch(
     initial_equity_scale: torch.Tensor | None = None,
     initial_alive: torch.Tensor | None = None,
     return_weights_history: bool = True,
+    recoverable_backward: bool = False,
 ) -> FuturesPortfolioTensorResult:
     """Run the exact fully-collateralized all-futures carrying account.
 
@@ -585,6 +673,8 @@ def run_tw_futures_portfolio_integer_torch(
     weight_rows: list[torch.Tensor] = []
     quantity_rows: list[torch.Tensor] = []
     equity_scale_rows: list[torch.Tensor] = []
+    default_rows: list[torch.Tensor] = []
+    default_reason_rows: list[torch.Tensor] = []
     for row in range(rows):
         row_exec = execution[row]
         holding_log_returns = row_exec[:, 0]
@@ -794,6 +884,36 @@ def run_tw_futures_portfolio_integer_torch(
                 & (next_equity > 0.0)
             )
         )
+        row_default = alive & advance[row] & ~row_alive
+        default_reason = torch.where(
+            row_default & ~funded,
+            torch.full_like(
+                net_simple,
+                TW_FUTURES_PORTFOLIO_DEFAULT_FUNDING,
+                dtype=torch.int64,
+            ),
+            torch.where(
+                row_default & ~torch.isfinite(next_equity),
+                torch.full_like(
+                    net_simple,
+                    TW_FUTURES_PORTFOLIO_DEFAULT_NONFINITE_EQUITY,
+                    dtype=torch.int64,
+                ),
+                torch.where(
+                    row_default & (next_equity <= 0.0),
+                    torch.full_like(
+                        net_simple,
+                        TW_FUTURES_PORTFOLIO_DEFAULT_NONPOSITIVE_EQUITY,
+                        dtype=torch.int64,
+                    ),
+                    torch.full_like(
+                        net_simple,
+                        TW_FUTURES_PORTFOLIO_DEFAULT_NONE,
+                        dtype=torch.int64,
+                    ),
+                ),
+            ),
+        )
         safe_net = torch.where(
             row_alive,
             net_simple,
@@ -834,6 +954,8 @@ def run_tw_futures_portfolio_integer_torch(
         weight_rows.append(exact_weight)
         quantity_rows.append(chosen_by_slot)
         equity_scale_rows.append(equity / capital)
+        default_rows.append(row_default)
+        default_reason_rows.append(default_reason)
 
     exact_strategy_returns = torch.stack(return_rows)
     exact_turnovers = torch.stack(turnover_rows)
@@ -858,6 +980,7 @@ def run_tw_futures_portfolio_integer_torch(
             initial_equity_scale=initial_equity_scale,
             initial_alive=initial_alive,
             return_weights_history=return_weights_history,
+            recover_after_default_for_backward=recoverable_backward,
         )
         strategy_returns = surrogate.strategy_returns + (
             exact_strategy_returns - surrogate.strategy_returns
@@ -886,6 +1009,8 @@ def run_tw_futures_portfolio_integer_torch(
             equity_scales[-1] if equity_scales.numel() else starting_scale
         ),
         contract_quantities_history=quantity_history,
+        default_history=torch.stack(default_rows),
+        default_reason_history=torch.stack(default_reason_rows),
     )
 
 
@@ -1184,6 +1309,8 @@ __all__ = [
     "FuturesPortfolioNumpyResult",
     "FuturesPortfolioTensorResult",
     "TAIFEX_FUTURES_PORTFOLIO_BACKTEST_CONTRACT_VERSION",
+    "TW_FUTURES_PORTFOLIO_INTEGER_TRAINING_FORWARD",
+    "TW_FUTURES_PORTFOLIO_INTEGER_RECOVERABLE_TRAINING_SURROGATE",
     "TW_FUTURES_PORTFOLIO_INTEGER_TRAINING_SURROGATE",
     "run_tw_futures_portfolio_continuous_numpy",
     "run_tw_futures_portfolio_continuous_torch",

@@ -535,6 +535,7 @@ def _build_panel_kwargs(config) -> dict:
         "feature_include": config.data.feature_include,
         "feature_exclude": config.data.feature_exclude,
         "feature_zero_fill": config.data.feature_zero_fill,
+        "feature_shift_next_session": config.data.feature_shift_next_session,
         "panel_start_date": config.data.panel_start_date,
     }
 
@@ -1354,6 +1355,12 @@ def main() -> None:
             },
             integer_contracts=bool(
                 config.trading.tw_futures_portfolio_integer_contracts
+            ),
+            current_open_feature=bool(
+                config.data.tw_futures_current_open_feature
+            ),
+            carry_valuation_max_abs_simple_return=float(
+                config.data.tw_futures_carry_valuation_max_abs_simple_return
             ),
             integer_fee_per_contract_per_side_twd=float(
                 config.trading.tw_futures_portfolio_integer_fee_per_contract_per_side_twd
