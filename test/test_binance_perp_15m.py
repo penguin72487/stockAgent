@@ -114,7 +114,9 @@ def test_binance_overlap_replaces_tail_and_preserves_prior_features() -> None:
 
 
 def test_binance_existing_date_uses_valid_redundant_close_time() -> None:
-    open_time = 1_780_000_100_000
+    open_time = int(
+        datetime(2026, 8, 24, 18, 25, tzinfo=timezone.utc).timestamp() * 1000
+    )
     frame = binance._normalize_candles([_raw_candle(open_time)]).with_columns(
         pl.lit("2026-08-24 18:25:08").alias("date")
     )
