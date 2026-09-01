@@ -95,6 +95,46 @@ def test_explicit_day_trade_open_gap_is_next_open_over_current_close(
     )
 
 
+def test_day_trade_open_gap_can_be_delayed_until_the_following_session(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "2330_features.parquet"
+    pl.DataFrame(
+        {
+            "date": ["2024-01-02", "2024-01-03", "2024-01-04"],
+            "open": [100.0, 110.0, 121.0],
+            "max": [102.0, 112.0, 123.0],
+            "min": [99.0, 104.0, 118.0],
+            "close": [100.0, 105.0, 120.0],
+            "adjclose": [100.0, 105.0, 120.0],
+            "Trading_Volume": [1.0, 2.0, 3.0],
+        }
+    ).write_parquet(path)
+
+    def load() -> object:
+        return build_panel(
+            tmp_path,
+            benchmark_name="2330",
+            panel_backend="pyarrow",
+            panel_load_workers=0,
+            trading_volume_policy="required",
+            feature_include=["close_logret_1d", DAY_TRADE_OPEN_GAP_FEATURE],
+            feature_shift_next_session=[DAY_TRADE_OPEN_GAP_FEATURE],
+        )
+
+    expected = np.asarray(
+        [0.0, math.log(110.0 / 100.0), math.log(121.0 / 105.0)]
+    )
+    for panel in (load(), load()):
+        gap_idx = panel.feature_names.index(DAY_TRADE_OPEN_GAP_FEATURE)
+        np.testing.assert_allclose(
+            panel.features[:, 0, gap_idx],
+            expected,
+            rtol=1e-6,
+            atol=1e-7,
+        )
+
+
 def test_day_trade_open_gap_is_not_in_default_panel_schema(tmp_path: Path) -> None:
     _write_symbol(
         tmp_path / "2330_features.parquet",

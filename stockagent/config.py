@@ -662,6 +662,16 @@ def _validate_tw_stock_context_futures_portfolio_mode_contract(
     model_name: object,
     train_symbol_compaction: object,
     model_portfolio_output_mode: object,
+    futures_denomination_aware_output: object,
+    futures_current_open_feature: object,
+    data_futures_current_open_feature: object,
+    carry_valuation_max_abs_simple_return: object,
+    day_trade_open_feature: object,
+    feature_shift_next_session: object,
+    feature_exclude: object,
+    integer_contracts: object,
+    futures_portfolio_training_surrogate_only: object,
+    futures_portfolio_recoverable_backward: object,
     trading_portfolio_activation: object,
     loss_portfolio_activation: object,
     return_rank_ic_weight: object,
@@ -690,6 +700,72 @@ def _validate_tw_stock_context_futures_portfolio_mode_contract(
         raise ValueError(
             "tw_stock_context_futures_portfolio requires model "
             "portfolio_output_mode='projection_l1'"
+        )
+    if bool(integer_contracts):
+        if not bool(futures_denomination_aware_output):
+            raise ValueError(
+                "integer tw_stock_context_futures_portfolio requires "
+                "futures_denomination_aware_output=true"
+            )
+        if bool(futures_portfolio_training_surrogate_only):
+            raise ValueError(
+                "integer denomination-aware all-futures training requires the "
+                "exact integer account in forward; "
+                "futures_portfolio_training_surrogate_only must be false"
+            )
+        if bool(futures_portfolio_recoverable_backward) and bool(
+            futures_portfolio_training_surrogate_only
+        ):
+            raise ValueError(
+                "futures_portfolio_recoverable_backward requires the exact "
+                "integer forward account"
+            )
+    elif bool(futures_denomination_aware_output):
+        raise ValueError(
+            "futures_denomination_aware_output requires integer all-futures "
+            "execution metadata"
+        )
+    elif bool(futures_portfolio_recoverable_backward):
+        raise ValueError(
+            "futures_portfolio_recoverable_backward requires integer "
+            "all-futures execution metadata"
+        )
+    if bool(futures_current_open_feature) != bool(
+        data_futures_current_open_feature
+    ):
+        raise ValueError(
+            "tw_stock_context_futures_portfolio current OPEN data/model flags "
+            "must match"
+        )
+    if bool(futures_current_open_feature):
+        if not bool(integer_contracts):
+            raise ValueError(
+                "current futures OPEN feature requires integer all-futures "
+                "execution metadata"
+            )
+        if float(carry_valuation_max_abs_simple_return) < 0.0:
+            raise ValueError(
+                "tw_futures_carry_valuation_max_abs_simple_return cannot be negative"
+            )
+        shifted_patterns = tuple(str(value) for value in feature_shift_next_session)
+        excluded_patterns = tuple(str(value) for value in feature_exclude)
+        open_gap_shifted = DAY_TRADE_OPEN_GAP_FEATURE in shifted_patterns
+        open_gap_excluded = any(
+            fnmatch.fnmatchcase(DAY_TRADE_OPEN_GAP_FEATURE, pattern)
+            for pattern in excluded_patterns
+        )
+        if not bool(day_trade_open_feature) or open_gap_excluded or not open_gap_shifted:
+            raise ValueError(
+                "08:45 current futures OPEN mode must preserve the cash-stock "
+                "OPEN-gap feature but expose it only tomorrow: require "
+                "data.day_trade_open_feature=true, do not exclude "
+                "next_session_open_gap_logret, and include it in "
+                "data.feature_shift_next_session"
+            )
+    elif float(carry_valuation_max_abs_simple_return) > 0.0:
+        raise ValueError(
+            "tw_futures_carry_valuation_max_abs_simple_return is defined only "
+            "for the 08:45 current futures OPEN contract"
         )
     activations = {
         "trading.portfolio_activation": normalize_portfolio_activation(
@@ -1322,6 +1398,15 @@ class DataConfig:
     # Explicitly append the open[t]/close[t-1] execution-context feature.  It
     # is valid only for tw_day_trade and is never part of the default schema.
     day_trade_open_feature: bool = False
+    # Research-only 08:45 all-futures clock.  The same daily TAIFEX OPEN is
+    # exposed as current information and used by the execution proxy, while
+    # the cash-stock panel remains complete only through session t-1.
+    tw_futures_current_open_feature: bool = False
+    # Optional data-integrity guard for stock/ETF futures whose physical
+    # contract cannot be valued consistently across adjacent daily OPENs.
+    # Zero preserves historical contracts. A positive threshold fails the
+    # entire affected physical contract closed instead of clipping its return.
+    tw_futures_carry_valuation_max_abs_simple_return: float = 0.0
     # Features whose session-t value is not available early enough for a
     # session-t decision.  Panel construction exposes that value on the next
     # panel session while preserving the source's original dated archive.
@@ -1835,6 +1920,15 @@ class TransformerBasePortfolioModelConfig:
     # average gross conviction and rows can retain cash without depending on S.
     # Disabled by default for historical checkpoint compatibility.
     projection_l1_scale_by_active_count: bool = False
+    # Integer all-futures policies may quantize the projected action by the
+    # causally known standard/mini exposure group and one-contract cash
+    # denomination.  Hard whole-unit values own forward; identity STE owns
+    # backward.  This is disabled for legacy checkpoint compatibility.
+    futures_denomination_aware_output: bool = False
+    # Encode session-t TAIFEX OPEN/previous-settlement gap. This changes the
+    # data and model ABI and is valid only for the explicit 08:45 same-print
+    # research contract.
+    futures_current_open_feature: bool = False
     max_full_tokens: int = 4096
     checkpoint_blocks: bool = False
     return_aux: bool = True
@@ -2045,6 +2139,10 @@ class TrainingConfig:
     # relaxation and reserve the exact integer ledger for validation/test.
     # This avoids carrying a stale discrete account across optimizer steps.
     futures_portfolio_training_surrogate_only: bool = False
+    # Preserve the exact integer account in forward while allowing a resettable
+    # shadow account only in backward after exact insolvency. This prevents an
+    # absorbing default in one batch from zeroing all later optimizer gradients.
+    futures_portfolio_recoverable_backward: bool = False
     # Executor-only optimization: compile the panel-slab model with a symbolic
     # stock axis so expanding walk-forward folds can reuse one Inductor graph.
     # Batch/time/feature axes remain static and assets are never padded.
@@ -3330,6 +3428,18 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         data["feature_include"], field_name="data.feature_include"
     )
     data["day_trade_open_feature"] = bool(data["day_trade_open_feature"])
+    data["tw_futures_current_open_feature"] = bool(
+        data["tw_futures_current_open_feature"]
+    )
+    carry_guard = float(
+        data["tw_futures_carry_valuation_max_abs_simple_return"]
+    )
+    if not math.isfinite(carry_guard) or not (0.0 <= carry_guard < 1.0):
+        raise ValueError(
+            "data.tw_futures_carry_valuation_max_abs_simple_return must be "
+            "finite in [0,1)"
+        )
+    data["tw_futures_carry_valuation_max_abs_simple_return"] = carry_guard
     if (
         data["day_trade_open_feature"]
         and DAY_TRADE_OPEN_GAP_FEATURE not in data["feature_include"]
@@ -3619,6 +3729,30 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         model_name=training["model_name"],
         train_symbol_compaction=training["train_symbol_compaction"],
         model_portfolio_output_mode=phase_model_config["portfolio_output_mode"],
+        futures_denomination_aware_output=phase_model_config[
+            "futures_denomination_aware_output"
+        ],
+        futures_current_open_feature=phase_model_config[
+            "futures_current_open_feature"
+        ],
+        data_futures_current_open_feature=data[
+            "tw_futures_current_open_feature"
+        ],
+        carry_valuation_max_abs_simple_return=data[
+            "tw_futures_carry_valuation_max_abs_simple_return"
+        ],
+        day_trade_open_feature=data["day_trade_open_feature"],
+        feature_shift_next_session=data["feature_shift_next_session"],
+        feature_exclude=data["feature_exclude"],
+        integer_contracts=trading[
+            "tw_futures_portfolio_integer_contracts"
+        ],
+        futures_portfolio_training_surrogate_only=training[
+            "futures_portfolio_training_surrogate_only"
+        ],
+        futures_portfolio_recoverable_backward=training[
+            "futures_portfolio_recoverable_backward"
+        ],
         trading_portfolio_activation=trading["portfolio_activation"],
         loss_portfolio_activation=training["loss_portfolio_activation"],
         return_rank_ic_weight=training["multitask_loss"]["return_rank_ic_weight"],
@@ -4330,6 +4464,9 @@ def load_config(path: str | Path) -> ExperimentConfig:
             compile_loss=training_raw["compile_loss"],
             futures_portfolio_training_surrogate_only=training_raw[
                 "futures_portfolio_training_surrogate_only"
+            ],
+            futures_portfolio_recoverable_backward=training_raw[
+                "futures_portfolio_recoverable_backward"
             ],
             compile_model_dynamic_symbols=training_raw["compile_model_dynamic_symbols"],
             compile_loss_dynamic_symbols=training_raw["compile_loss_dynamic_symbols"],

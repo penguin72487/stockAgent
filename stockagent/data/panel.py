@@ -3937,12 +3937,13 @@ def load_cached_panel(
     panel = _load_valid_panel_cache(parquet_root, source_paths, backend_key, source_hash)
     if panel is not None:
         if include_day_trade_open_gap:
-            panel = _append_day_trade_open_gap_feature(panel)
-            if DAY_TRADE_OPEN_GAP_FEATURE in feature_zero_fill_patterns:
-                panel = _zero_fill_panel_features(
-                    panel,
-                    (DAY_TRADE_OPEN_GAP_FEATURE,),
-                )
+            panel = _append_configured_day_trade_open_gap_feature(
+                panel,
+                feature_zero_fill_patterns=feature_zero_fill_patterns,
+                feature_shift_next_session_patterns=(
+                    feature_shift_next_session_patterns
+                ),
+            )
         _print_feature_overview(panel)
     return panel
 
@@ -5010,6 +5011,34 @@ def _append_day_trade_open_gap_feature(panel: PanelData) -> PanelData:
     return panel
 
 
+def _append_configured_day_trade_open_gap_feature(
+    panel: PanelData,
+    *,
+    feature_zero_fill_patterns: tuple[str, ...],
+    feature_shift_next_session_patterns: tuple[str, ...],
+) -> PanelData:
+    """Append OPEN gap, then apply its explicit availability transforms.
+
+    The derived channel is intentionally kept out of the reusable close-panel
+    cache.  Consequently its zero-fill and next-session shift must happen
+    after attachment instead of being silently skipped with the cached base
+    features.
+    """
+
+    panel = _append_day_trade_open_gap_feature(panel)
+    if DAY_TRADE_OPEN_GAP_FEATURE in feature_zero_fill_patterns:
+        panel = _zero_fill_panel_features(
+            panel,
+            (DAY_TRADE_OPEN_GAP_FEATURE,),
+        )
+    if DAY_TRADE_OPEN_GAP_FEATURE in feature_shift_next_session_patterns:
+        panel = _shift_panel_features_to_next_session(
+            panel,
+            (DAY_TRADE_OPEN_GAP_FEATURE,),
+        )
+    return panel
+
+
 def _shift_panel_features_to_next_session(
     panel: PanelData,
     feature_shift_next_session: tuple[str, ...] = (),
@@ -5195,6 +5224,11 @@ def build_panel(
     feature_shift_next_session_patterns = _normalize_feature_patterns(
         feature_shift_next_session, label="feature_shift_next_session"
     )
+    base_feature_shift_next_session_patterns = tuple(
+        pattern
+        for pattern in feature_shift_next_session_patterns
+        if pattern != DAY_TRADE_OPEN_GAP_FEATURE
+    )
     normalized_panel_start_date = _normalize_panel_start_date(panel_start_date)
     feature_shift_key = (
         f"feature_shift_next_session={list(feature_shift_next_session_patterns)!r}|"
@@ -5316,12 +5350,13 @@ def build_panel(
     panel = _load_valid_panel_cache(parquet_root, source_paths, backend_key, source_hash)
     if panel is not None:
         if include_day_trade_open_gap:
-            panel = _append_day_trade_open_gap_feature(panel)
-            if DAY_TRADE_OPEN_GAP_FEATURE in feature_zero_fill_patterns:
-                panel = _zero_fill_panel_features(
-                    panel,
-                    (DAY_TRADE_OPEN_GAP_FEATURE,),
-                )
+            panel = _append_configured_day_trade_open_gap_feature(
+                panel,
+                feature_zero_fill_patterns=feature_zero_fill_patterns,
+                feature_shift_next_session_patterns=(
+                    feature_shift_next_session_patterns
+                ),
+            )
         _print_feature_overview(panel)
         return panel
 
@@ -5397,7 +5432,7 @@ def build_panel(
     panel = _zero_fill_panel_features(panel, base_feature_zero_fill_patterns)
     panel = _shift_panel_features_to_next_session(
         panel,
-        feature_shift_next_session_patterns,
+        base_feature_shift_next_session_patterns,
     )
     panel = _slice_panel_start(panel, normalized_panel_start_date)
     panel = _apply_corporate_action_avoidance_transitions(
@@ -5410,11 +5445,12 @@ def build_panel(
     _save_panel_cache(parquet_root, panel, source_hash, backend_key)
     print(f"[panel] cache v2 saved: {panel_cache_v2_dir(parquet_root)}")
     if include_day_trade_open_gap:
-        panel = _append_day_trade_open_gap_feature(panel)
-        if DAY_TRADE_OPEN_GAP_FEATURE in feature_zero_fill_patterns:
-            panel = _zero_fill_panel_features(
-                panel,
-                (DAY_TRADE_OPEN_GAP_FEATURE,),
-            )
+        panel = _append_configured_day_trade_open_gap_feature(
+            panel,
+            feature_zero_fill_patterns=feature_zero_fill_patterns,
+            feature_shift_next_session_patterns=(
+                feature_shift_next_session_patterns
+            ),
+        )
     _print_feature_overview(panel)
     return panel

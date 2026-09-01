@@ -40,10 +40,33 @@ except Exception:  # pragma: no cover - checked at the public entry point
     pq = None
 
 
-TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_CONTRACT_VERSION: Final[int] = 2
-TW_STOCK_CONTEXT_FUTURES_MODEL_FEATURE_COLUMNS: Final[tuple[str, ...]] = (
+TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_LEGACY_CONTRACT_VERSION: Final[int] = 2
+TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_CONTRACT_VERSION: Final[int] = 3
+TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_CURRENT_OPEN_CONTRACT_VERSION: Final[int] = 4
+TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_GUARDED_CURRENT_OPEN_CONTRACT_VERSION: Final[
+    int
+] = 5
+TW_STOCK_CONTEXT_FUTURES_PRIOR_MARKET_FEATURE_COLUMNS: Final[tuple[str, ...]] = (
     *FUTURES_MODEL_FEATURE_COLUMNS,
     "cash_stock_underlying_panel_index",
+)
+TW_STOCK_CONTEXT_FUTURES_DENOMINATION_FEATURE_COLUMNS: Final[tuple[str, ...]] = (
+    "current_integer_exposure_group_index",
+    "current_integer_candidate_tier",
+    "current_one_contract_cash_requirement_twd",
+)
+TW_STOCK_CONTEXT_FUTURES_MODEL_FEATURE_COLUMNS: Final[tuple[str, ...]] = (
+    *TW_STOCK_CONTEXT_FUTURES_PRIOR_MARKET_FEATURE_COLUMNS,
+    *TW_STOCK_CONTEXT_FUTURES_DENOMINATION_FEATURE_COLUMNS,
+)
+TW_STOCK_CONTEXT_FUTURES_CURRENT_OPEN_FEATURE_COLUMNS: Final[tuple[str, ...]] = (
+    "current_futures_open_gap_logret",
+)
+TW_STOCK_CONTEXT_FUTURES_CURRENT_OPEN_MODEL_FEATURE_COLUMNS: Final[
+    tuple[str, ...]
+] = (
+    *TW_STOCK_CONTEXT_FUTURES_MODEL_FEATURE_COLUMNS,
+    *TW_STOCK_CONTEXT_FUTURES_CURRENT_OPEN_FEATURE_COLUMNS,
 )
 TW_STOCK_CONTEXT_FUTURES_EXECUTION_CHANNELS: Final[tuple[str, ...]] = (
     "holding_log_return",
@@ -95,6 +118,7 @@ class TaiwanStockContextFuturesPortfolioDaily:
     source_path: str
     manifest_path: str
     integer_execution: np.ndarray | None = None
+    carry_valuation_quarantine_mask: np.ndarray | None = None
     contract_version: int = TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_CONTRACT_VERSION
     futures_data_contract_version: int = (
         TAIFEX_FUTURES_PORTFOLIO_DATA_CONTRACT_VERSION
@@ -151,18 +175,39 @@ def attach_stock_context_futures_portfolio_daily(
     *,
     fee_per_side_twd_by_group: dict[str, float],
     integer_contracts: bool = False,
+    current_open_feature: bool = False,
+    carry_valuation_max_abs_simple_return: float = 0.0,
     integer_fee_per_contract_per_side_twd: float = 40.0,
     max_volume_participation: float = 0.0,
 ) -> PanelData:
     """Attach prior-session futures tokens and current execution facts.
 
-    ``candidate_features[t]`` is copied exclusively from futures row ``t-1``.
-    Its mask additionally requires that the fixed slot still owns the same
-    physical contract on ``t``.  Current open/close/volume, realised returns,
-    and fill availability are stored only in the executor sidecar.
+    Market/policy features in ``candidate_features[t]`` are copied exclusively
+    from futures row ``t-1`` unless ``current_open_feature`` explicitly opts
+    into the session-t TAIFEX OPEN gap.  That research-only channel treats the
+    observed 08:45 daily OPEN as both information and entry-price proxy, so it
+    must never be described as a causal live fill.  The mask additionally
+    requires that the fixed slot still owns the same physical contract on
+    ``t``.  In integer mode the three denomination channels contain group
+    identity, standard/mini tier, and one fully collateralized contract's cash
+    need. Current close/return/volume remain executor-only.
     """
 
     _require_dependencies()
+    if current_open_feature and not integer_contracts:
+        raise ValueError(
+            "current futures OPEN context requires integer contract metadata"
+        )
+    carry_guard = float(carry_valuation_max_abs_simple_return)
+    if not np.isfinite(carry_guard) or not (0.0 <= carry_guard < 1.0):
+        raise ValueError(
+            "carry_valuation_max_abs_simple_return must be finite in [0,1)"
+        )
+    if carry_guard > 0.0 and (not integer_contracts or not current_open_feature):
+        raise ValueError(
+            "carry valuation quarantine currently requires the 08:45 current-OPEN "
+            "integer contract"
+        )
     source_path = Path(data_path)
     manifest_path = source_path.parent / "manifest.json"
     if not source_path.exists() or not manifest_path.exists():
@@ -223,6 +268,8 @@ def attach_stock_context_futures_portfolio_daily(
                 "previous_volume",
             ]
         )
+    if current_open_feature:
+        source_columns.append("previous_settlement")
     table = pq.read_table(
         source_path,
         columns=source_columns,
@@ -261,17 +308,61 @@ def attach_stock_context_futures_portfolio_daily(
     if frame.height == 0:
         raise ValueError("TAIFEX futures rows do not intersect the stock date axis")
 
+    # A stock/ETF future physical contract whose adjacent-OPEN valuation jumps
+    # outside the configured integrity envelope cannot be reconstructed from
+    # this archive with trustworthy contract-unit economics. Quarantine the
+    # complete physical contract, not only the discontinuity row: clipping the
+    # label would invent P&L and dropping only the bad day would allow a model
+    # to retain an unpriceable position. This is a data-integrity rule, not a
+    # return-selection or portfolio-ranking heuristic.
+    source_carry_quarantine = np.zeros(frame.height, dtype=bool)
+    if carry_guard > 0.0:
+        asset_values = np.asarray(frame["asset_class"].to_list(), dtype=object)
+        physical_values = np.asarray(
+            [str(value or "").strip() for value in frame["physical_contract"].to_list()],
+            dtype=object,
+        )
+        source_holding = frame["holding_log_return"].to_numpy().astype(np.float64)
+        source_simple_return = np.expm1(source_holding)
+        relevant = np.isin(asset_values, ["stock_future", "etf_future"])
+        suspicious = relevant & (
+            ~np.isfinite(source_simple_return)
+            | (np.abs(source_simple_return) > carry_guard)
+        )
+        if np.any(suspicious & (physical_values == "")):
+            raise ValueError(
+                "suspicious stock/ETF futures carry rows require physical_contract"
+            )
+        bad_physical_contracts = set(physical_values[suspicious].tolist())
+        if bad_physical_contracts:
+            source_carry_quarantine = relevant & np.isin(
+                physical_values,
+                list(bad_physical_contracts),
+            )
+
     flat_keys = date_indices * TAIFEX_FUTURES_PORTFOLIO_FIXED_SLOT_COUNT + symbol_indices
     if np.unique(flat_keys).size != flat_keys.size:
         raise ValueError("TAIFEX source contains duplicate date/fixed-slot rows")
 
     shape = (dates.size, TAIFEX_FUTURES_PORTFOLIO_FIXED_SLOT_COUNT)
-    feature_shape = (
-        *shape,
-        len(TW_STOCK_CONTEXT_FUTURES_MODEL_FEATURE_COLUMNS),
+    model_feature_columns = (
+        TW_STOCK_CONTEXT_FUTURES_CURRENT_OPEN_MODEL_FEATURE_COLUMNS
+        if current_open_feature
+        else TW_STOCK_CONTEXT_FUTURES_MODEL_FEATURE_COLUMNS
+        if integer_contracts
+        else TW_STOCK_CONTEXT_FUTURES_PRIOR_MARKET_FEATURE_COLUMNS
     )
+    feature_shape = (*shape, len(model_feature_columns))
     candidate_features = np.zeros(feature_shape, dtype=np.float32)
-    candidate_features[..., -1] = -1.0
+    prior_feature_count = len(TW_STOCK_CONTEXT_FUTURES_PRIOR_MARKET_FEATURE_COLUMNS)
+    underlying_feature_index = len(FUTURES_MODEL_FEATURE_COLUMNS)
+    denomination_feature_start = prior_feature_count
+    current_open_feature_index = len(TW_STOCK_CONTEXT_FUTURES_MODEL_FEATURE_COLUMNS)
+    candidate_features[..., underlying_feature_index] = -1.0
+    if integer_contracts:
+        candidate_features[..., denomination_feature_start] = np.arange(
+            shape[1], dtype=np.float32
+        )[None, :]
     candidate_source = np.zeros(shape, dtype=bool)
     same_as_previous = np.zeros(shape, dtype=bool)
     returns = np.full(shape, np.nan, dtype=np.float32)
@@ -283,6 +374,8 @@ def attach_stock_context_futures_portfolio_daily(
     closes = np.full(shape, np.nan, dtype=np.float32)
     volumes = np.full(shape, np.nan, dtype=np.float32)
     integer_execution: np.ndarray | None = None
+    current_open_available = np.ones(shape, dtype=bool)
+    carry_valuation_quarantine = np.zeros(shape, dtype=bool)
 
     raw_features = frame.select(FUTURES_MODEL_FEATURE_COLUMNS).to_numpy().astype(
         np.float32, copy=False
@@ -317,7 +410,7 @@ def attach_stock_context_futures_portfolio_daily(
     candidate_features[
         next_date_indices[has_next_stock_session],
         symbol_indices[has_next_stock_session],
-        -1,
+        underlying_feature_index,
     ] = underlying_panel_indices[has_next_stock_session].astype(
         np.float32,
         copy=False,
@@ -345,6 +438,34 @@ def attach_stock_context_futures_portfolio_daily(
 
     multipliers = frame["contract_multiplier"].to_numpy().astype(np.float64)
     opening_values = frame["open"].to_numpy().astype(np.float64)
+    if current_open_feature:
+        previous_settlement = frame["previous_settlement"].to_numpy().astype(
+            np.float64
+        )
+        valid_current_open = (
+            np.isfinite(opening_values)
+            & (opening_values > 0.0)
+            & np.isfinite(previous_settlement)
+            & (previous_settlement > 0.0)
+        )
+        current_open_gap = np.zeros(frame.height, dtype=np.float64)
+        current_open_gap[valid_current_open] = np.log(
+            opening_values[valid_current_open]
+            / previous_settlement[valid_current_open]
+        )
+        valid_current_open &= np.isfinite(current_open_gap)
+        candidate_features[
+            date_indices,
+            symbol_indices,
+            current_open_feature_index,
+        ] = np.nan_to_num(
+            current_open_gap,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        ).astype(np.float32, copy=False)
+        current_open_available = np.zeros(shape, dtype=bool)
+        current_open_available[date_indices, symbol_indices] = valid_current_open
     fee_groups = frame["sinopac_network_fee_group"].to_numpy()
     fees = np.full(frame.height, np.nan, dtype=np.float64)
     for group, raw_fee in fee_per_side_twd_by_group.items():
@@ -464,6 +585,28 @@ def attach_stock_context_futures_portfolio_daily(
         )
         opening_tax = np.floor(open_notionals * tax_rates + 0.5)
         ending_tax = np.floor(ending_notionals * tax_rates + 0.5)
+        # Full notional plus both entry and eventual exit fee/tax cash is
+        # reserved identically for long and short contracts.  In the optional
+        # 08:45 research contract, current OPEN-derived sizing is the same-print
+        # information/fill proxy and is intentionally checkpoint-distinct.
+        one_contract_cash = (
+            open_notionals + (2.0 * integer_fee) + (2.0 * opening_tax)
+        )
+        candidate_features[
+            date_indices,
+            symbol_indices,
+            denomination_feature_start,
+        ] = group_indices.astype(np.float32, copy=False)
+        candidate_features[
+            date_indices,
+            symbol_indices,
+            denomination_feature_start + 1,
+        ] = candidate_tiers.astype(np.float32, copy=False)
+        candidate_features[
+            date_indices,
+            symbol_indices,
+            denomination_feature_start + 2,
+        ] = one_contract_cash.astype(np.float32, copy=False)
         prior_volume = np.nan_to_num(
             integer_frame["previous_volume"].to_numpy().astype(np.float64),
             nan=0.0,
@@ -522,7 +665,34 @@ def attach_stock_context_futures_portfolio_daily(
                 "and finite tax"
             )
 
-    candidate_mask = candidate_source & same_as_previous
+    if bool(source_carry_quarantine.any()):
+        execution_quarantine = np.zeros(shape, dtype=bool)
+        execution_quarantine[date_indices, symbol_indices] = source_carry_quarantine
+        prior_context_quarantine = np.zeros(shape, dtype=bool)
+        quarantined_has_next = has_next_stock_session & source_carry_quarantine
+        prior_context_quarantine[
+            next_date_indices[quarantined_has_next],
+            symbol_indices[quarantined_has_next],
+        ] = True
+        carry_valuation_quarantine = (
+            execution_quarantine | prior_context_quarantine
+        )
+        candidate_source[prior_context_quarantine] = False
+        same_as_previous[execution_quarantine] = False
+        current_open_available[execution_quarantine] = False
+        executable[execution_quarantine] = False
+        must_liquidate[execution_quarantine] = False
+        can_hold[execution_quarantine] = False
+        returns[execution_quarantine] = np.nan
+        fee_rates[execution_quarantine] = np.nan
+        if integer_execution is not None:
+            integer_execution[execution_quarantine, :9] = np.nan
+            integer_execution[execution_quarantine, 1] = 0.0
+            integer_execution[execution_quarantine, 2] = 0.0
+            integer_execution[execution_quarantine, 8] = 0.0
+
+    candidate_mask = candidate_source & same_as_previous & current_open_available
+    candidate_mask &= ~carry_valuation_quarantine
     if bool((candidate_mask[0]).any()):
         raise RuntimeError("first stock date cannot have prior-session futures context")
     if bool((can_hold & must_liquidate).any()):
@@ -565,6 +735,16 @@ def attach_stock_context_futures_portfolio_daily(
             volumes=volumes,
             benchmark_log_returns=benchmark,
             integer_execution=integer_execution,
+            carry_valuation_quarantine_mask=carry_valuation_quarantine,
+            contract_version=(
+                TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_GUARDED_CURRENT_OPEN_CONTRACT_VERSION
+                if carry_guard > 0.0
+                else TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_CURRENT_OPEN_CONTRACT_VERSION
+                if current_open_feature
+                else TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_CONTRACT_VERSION
+                if integer_contracts
+                else TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_LEGACY_CONTRACT_VERSION
+            ),
             source_path=str(source_path),
             manifest_path=str(manifest_path),
         )
@@ -573,10 +753,17 @@ def attach_stock_context_futures_portfolio_daily(
 
 
 __all__ = [
+    "TW_STOCK_CONTEXT_FUTURES_CURRENT_OPEN_FEATURE_COLUMNS",
+    "TW_STOCK_CONTEXT_FUTURES_CURRENT_OPEN_MODEL_FEATURE_COLUMNS",
+    "TW_STOCK_CONTEXT_FUTURES_DENOMINATION_FEATURE_COLUMNS",
     "TW_STOCK_CONTEXT_FUTURES_EXECUTION_CHANNELS",
     "TW_STOCK_CONTEXT_FUTURES_INTEGER_EXECUTION_CHANNELS",
     "TW_STOCK_CONTEXT_FUTURES_MODEL_FEATURE_COLUMNS",
+    "TW_STOCK_CONTEXT_FUTURES_PRIOR_MARKET_FEATURE_COLUMNS",
+    "TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_LEGACY_CONTRACT_VERSION",
     "TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_CONTRACT_VERSION",
+    "TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_CURRENT_OPEN_CONTRACT_VERSION",
+    "TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_GUARDED_CURRENT_OPEN_CONTRACT_VERSION",
     "TaiwanStockContextFuturesPortfolioDaily",
     "attach_stock_context_futures_portfolio_daily",
     "fixed_futures_slot_symbols",

@@ -14,6 +14,8 @@ import torch
 
 from stockagent.backtest.simulator import run_backtest_torch
 from stockagent.backtest.tw_futures_portfolio import (
+    TW_FUTURES_PORTFOLIO_DEFAULT_NONPOSITIVE_EQUITY,
+    TW_FUTURES_PORTFOLIO_INTEGER_RECOVERABLE_TRAINING_SURROGATE,
     TW_FUTURES_PORTFOLIO_INTEGER_TRAINING_SURROGATE,
     run_tw_futures_portfolio_integer_surrogate_torch,
     run_tw_futures_portfolio_integer_torch,
@@ -27,7 +29,13 @@ from stockagent.data.tw_futures_portfolio_daily import (
     TAIFEX_FUTURES_PORTFOLIO_FIXED_SLOT_COUNT,
 )
 from stockagent.data.tw_stock_context_futures_portfolio import (
+    TW_STOCK_CONTEXT_FUTURES_CURRENT_OPEN_MODEL_FEATURE_COLUMNS,
+    TW_STOCK_CONTEXT_FUTURES_DENOMINATION_FEATURE_COLUMNS,
     TW_STOCK_CONTEXT_FUTURES_MODEL_FEATURE_COLUMNS,
+    TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_LEGACY_CONTRACT_VERSION,
+    TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_CURRENT_OPEN_CONTRACT_VERSION,
+    TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_GUARDED_CURRENT_OPEN_CONTRACT_VERSION,
+    TW_STOCK_CONTEXT_FUTURES_PRIOR_MARKET_FEATURE_COLUMNS,
     TaiwanStockContextFuturesPortfolioDaily,
     attach_stock_context_futures_portfolio_daily,
     fixed_futures_slot_symbols,
@@ -36,7 +44,10 @@ from stockagent.models.cross_sectional_all_futures import (
     CrossSectionalAllFuturesModel,
 )
 from stockagent.training.dataset import CrossSectionalDataset
-from stockagent.training.checkpoint_contract import build_checkpoint_manifest
+from stockagent.training.checkpoint_contract import (
+    build_checkpoint_manifest,
+    validate_checkpoint_manifest,
+)
 from stockagent.training.windowed import dataset_to_windowed_tensors
 from stockagent.training.trainer import (
     _split_recurrent_symbol_count,
@@ -123,6 +134,11 @@ def test_attach_uses_only_prior_futures_features_and_separate_action_axis(
             "contract_multiplier": 200.0,
             "sinopac_network_fee_group": "large",
             "underlying_symbol": "S0",
+            "contract": "202601",
+            "physical_contract": "TX202601",
+            "asset_class": "index_future",
+            "previous_volume": 10.0,
+            "previous_settlement": 99.0 + idx if idx < 2 else None,
         }
         for feature_idx, name in enumerate(FUTURES_MODEL_FEATURE_COLUMNS):
             row[name] = (
@@ -148,6 +164,9 @@ def test_attach_uses_only_prior_futures_features_and_separate_action_axis(
             "stock": 40.0,
             "micro": 16.0,
         },
+        integer_contracts=True,
+        integer_fee_per_contract_per_side_twd=40.0,
+        max_volume_participation=0.5,
     )
     daily = panel.stock_context_futures_portfolio_daily
     assert daily is not None
@@ -167,12 +186,163 @@ def test_attach_uses_only_prior_futures_features_and_separate_action_axis(
     )
     # The structural routing key is also lagged with the futures token. It is
     # consumed only as an integer gather index, never as a continuous feature.
-    assert daily.candidate_features[1, 0, -1] == pytest.approx(0.0)
+    underlying_index = len(FUTURES_MODEL_FEATURE_COLUMNS)
+    assert daily.candidate_features[1, 0, underlying_index] == pytest.approx(0.0)
+    denomination_start = len(TW_STOCK_CONTEXT_FUTURES_PRIOR_MARKET_FEATURE_COLUMNS)
+    assert len(TW_STOCK_CONTEXT_FUTURES_DENOMINATION_FEATURE_COLUMNS) == 3
+    assert daily.integer_execution is not None
+    expected_contract_cash = (
+        daily.integer_execution[1, 0, 3]
+        + 2.0 * daily.integer_execution[1, 0, 5]
+        + 2.0 * daily.integer_execution[1, 0, 6]
+    )
+    assert daily.candidate_features[
+        1, 0, denomination_start + 2
+    ] == pytest.approx(expected_contract_cash)
     # Zero current volume/executability is executor-only and cannot erase the
     # already known same-physical-contract policy token.
     assert not daily.executable_mask[1, 0]
     assert daily.candidate_mask[1, 0]
     assert daily.must_liquidate_mask[2, 0]
+
+    legacy_panel = attach_stock_context_futures_portfolio_daily(
+        _stock_panel(),
+        data_path,
+        fee_per_side_twd_by_group={
+            "large": 60.0,
+            "standard": 24.0,
+            "stock": 40.0,
+            "micro": 16.0,
+        },
+    )
+    legacy_daily = legacy_panel.stock_context_futures_portfolio_daily
+    assert legacy_daily is not None
+    assert legacy_daily.candidate_features.shape[-1] == len(
+        TW_STOCK_CONTEXT_FUTURES_PRIOR_MARKET_FEATURE_COLUMNS
+    )
+    assert (
+        legacy_daily.contract_version
+        == TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_LEGACY_CONTRACT_VERSION
+    )
+
+    current_open_panel = attach_stock_context_futures_portfolio_daily(
+        _stock_panel(),
+        data_path,
+        fee_per_side_twd_by_group={
+            "large": 60.0,
+            "standard": 24.0,
+            "stock": 40.0,
+            "micro": 16.0,
+        },
+        integer_contracts=True,
+        current_open_feature=True,
+        integer_fee_per_contract_per_side_twd=40.0,
+        max_volume_participation=0.5,
+    )
+    current_open_daily = current_open_panel.stock_context_futures_portfolio_daily
+    assert current_open_daily is not None
+    assert current_open_daily.contract_version == (
+        TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_CURRENT_OPEN_CONTRACT_VERSION
+    )
+    assert current_open_daily.candidate_features.shape[-1] == len(
+        TW_STOCK_CONTEXT_FUTURES_CURRENT_OPEN_MODEL_FEATURE_COLUMNS
+    )
+    assert current_open_daily.candidate_features[1, 0, -1] == pytest.approx(
+        np.log(101.0 / 100.0)
+    )
+    assert current_open_daily.candidate_mask[1, 0]
+    # Missing current previous-settlement makes the same-print feature
+    # unknowable, so the candidate fails closed without reallocating elsewhere.
+    assert not current_open_daily.candidate_mask[2, 0]
+
+
+def test_carry_valuation_guard_quarantines_complete_physical_contract(
+    tmp_path: Path,
+) -> None:
+    rows: list[dict[str, object]] = []
+    session_dates = [date(2026, 1, 2), date(2026, 1, 3), date(2026, 1, 4)]
+    for date_index, session_date in enumerate(session_dates):
+        for slot, product, asset_class, physical_contract, simple_return in (
+            (1, "TX", "index_future", "TX202601", 0.01),
+            # One unsupported +50% adjacent-OPEN valuation makes this entire
+            # physical stock-future contract non-reconstructable.
+            (
+                2,
+                "ABF",
+                "stock_future",
+                "ABF202601",
+                0.50 if date_index == 1 else 0.01,
+            ),
+        ):
+            row: dict[str, object] = {
+                "date": session_date,
+                "product": product,
+                "symbol": f"TAIFEX_SLOT_{slot:04d}",
+                "tenor_rank": 1,
+                "open": 100.0,
+                "close": 100.0,
+                "volume": 100,
+                "holding_log_return": float(np.log1p(simple_return)),
+                "executable": True,
+                "must_liquidate": date_index == 2,
+                "can_hold_overnight": date_index < 2,
+                "same_contract_as_previous_session": date_index > 0,
+                "contract_multiplier": 200.0,
+                "sinopac_network_fee_group": (
+                    "large" if asset_class == "index_future" else "stock"
+                ),
+                "underlying_symbol": "S0",
+                "contract": "202601",
+                "physical_contract": physical_contract,
+                "asset_class": asset_class,
+                "previous_volume": 100.0,
+                "previous_settlement": 99.0,
+            }
+            for feature_index, name in enumerate(FUTURES_MODEL_FEATURE_COLUMNS):
+                row[name] = 7 if name == "taifex_product_id" else feature_index
+            rows.append(row)
+    data_path = tmp_path / "continuous_daily.parquet"
+    pq.write_table(pa.Table.from_pylist(rows), data_path)
+    (tmp_path / "manifest.json").write_text(
+        json.dumps(
+            {
+                "contract_version": TAIFEX_FUTURES_PORTFOLIO_DATA_CONTRACT_VERSION,
+                "feature_contract_version": TAIFEX_FUTURES_PORTFOLIO_FEATURE_CONTRACT_VERSION,
+                "fixed_model_output_slots": TAIFEX_FUTURES_PORTFOLIO_FIXED_SLOT_COUNT,
+                "outputs": {"continuous_daily": {"sha256": _sha256(data_path)}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    panel = attach_stock_context_futures_portfolio_daily(
+        _stock_panel(),
+        data_path,
+        fee_per_side_twd_by_group={
+            "large": 60.0,
+            "standard": 24.0,
+            "stock": 40.0,
+            "micro": 16.0,
+        },
+        integer_contracts=True,
+        current_open_feature=True,
+        carry_valuation_max_abs_simple_return=0.25,
+        integer_fee_per_contract_per_side_twd=40.0,
+        max_volume_participation=0.5,
+    )
+    daily = panel.stock_context_futures_portfolio_daily
+    assert daily is not None
+    assert daily.contract_version == (
+        TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_GUARDED_CURRENT_OPEN_CONTRACT_VERSION
+    )
+    assert daily.carry_valuation_quarantine_mask is not None
+    assert daily.carry_valuation_quarantine_mask[:, 1].all()
+    assert not daily.candidate_mask[:, 1].any()
+    assert not daily.executable_mask[:, 1].any()
+    assert daily.integer_execution is not None
+    assert not np.isfinite(daily.integer_execution[:, 1, 3]).any()
+    # The index future is unaffected, proving that this is physical-contract
+    # fail-close rather than a day-level market filter.
+    assert daily.candidate_mask[1:, 0].all()
 
 
 def test_dataset_keeps_stock_attention_axis_and_packs_futures_execution() -> None:
@@ -257,8 +427,8 @@ def test_model_masks_before_projection_and_can_retain_cash() -> None:
         temporal_query_mode="last_only",
         portfolio_mode="long_short",
         portfolio_output_mode="projection_l1",
-        center_long_short_logits=False,
         projection_l1_scale_by_active_count=True,
+        center_long_short_logits=False,
         return_aux=False,
         execution_mode="tw_stock_context_futures_portfolio",
     ).eval()
@@ -284,6 +454,142 @@ def test_model_masks_before_projection_and_can_retain_cash() -> None:
         model(
             torch.zeros((1, 2, 4, 3), dtype=torch.float32),
             torch.ones((1, 4), dtype=torch.bool),
+        )
+
+
+def test_denomination_aware_output_groups_contracts_without_top_k_or_redistribution() -> None:
+    model = CrossSectionalAllFuturesModel(
+        lookback=1,
+        num_features=3,
+        num_symbols=2,
+        d_model=8,
+        attention_mode="temporal_only",
+        use_latent_factors=False,
+        use_market_tokens=False,
+        temporal_layers=1,
+        temporal_heads=2,
+        temporal_ffn_mult=2,
+        temporal_pooling="last",
+        temporal_query_mode="last_only",
+        portfolio_mode="long_short",
+        portfolio_output_mode="projection_l1",
+        projection_l1_scale_by_active_count=True,
+        center_long_short_logits=False,
+        futures_denomination_aware_output=True,
+        futures_denomination_reference_capital=1_000_000.0,
+        return_aux=False,
+        execution_mode="tw_stock_context_futures_portfolio",
+    )
+    # Group 0 contains a standard and mini contract. Group 1 is below one
+    # contract and must remain cash. Groups 2 and 3 are both viable: there is
+    # deliberately no fixed-K selection between them.
+    raw = torch.tensor(
+        [[0.20, 0.35, 0.05, -0.11, 0.21]],
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    mask = torch.ones_like(raw, dtype=torch.bool)
+    denomination = torch.tensor(
+        [[
+            [0.0, 0.0, 400_000.0],
+            [0.0, 1.0, 20_000.0],
+            [1.0, 0.0, 100_000.0],
+            [2.0, 0.0, 100_000.0],
+            [3.0, 0.0, 100_000.0],
+        ]],
+        dtype=torch.float32,
+    )
+    projected, aux = model._denomination_aware_group_projection(
+        raw, mask, denomination
+    )
+    # 55% group request becomes 27 mini denominations = 54%, shared back over
+    # the two candidate slots so the exact executor receives one group target.
+    assert projected[0, :2].tolist() == pytest.approx([0.27, 0.27], abs=1.0e-7)
+    assert projected[0, 2].item() == pytest.approx(0.0, abs=1.0e-7)
+    assert projected[0, 3].item() == pytest.approx(-0.10, abs=1.0e-7)
+    assert projected[0, 4].item() == pytest.approx(0.20, abs=1.0e-7)
+    assert projected.abs().sum().item() < raw.abs().sum().item()
+    assert int(aux["futures_valid_denomination_group"].sum().item()) == 4
+    projected.sum().backward()
+    assert raw.grad is not None
+    assert torch.isfinite(raw.grad).all()
+    # Even the sub-contract group has an STE direction toward its first unit.
+    assert raw.grad[0, 2].item() == pytest.approx(1.0, abs=1.0e-7)
+
+
+def test_current_futures_open_model_requires_new_abi_and_backpropagates() -> None:
+    model = CrossSectionalAllFuturesModel(
+        lookback=1,
+        num_features=3,
+        num_symbols=2,
+        d_model=8,
+        attention_mode="temporal_only",
+        use_latent_factors=False,
+        use_market_tokens=False,
+        temporal_layers=1,
+        temporal_heads=2,
+        temporal_ffn_mult=2,
+        temporal_pooling="last",
+        temporal_query_mode="last_only",
+        portfolio_mode="long_short",
+        portfolio_output_mode="projection_l1",
+        center_long_short_logits=False,
+        futures_denomination_aware_output=True,
+        projection_l1_scale_by_active_count=True,
+        futures_current_open_feature=True,
+        futures_denomination_reference_capital=1_000_000.0,
+        return_aux=False,
+        execution_mode="tw_stock_context_futures_portfolio",
+    )
+    features = torch.zeros(
+        (
+            1,
+            TAIFEX_FUTURES_PORTFOLIO_FIXED_SLOT_COUNT,
+            len(TW_STOCK_CONTEXT_FUTURES_CURRENT_OPEN_MODEL_FEATURE_COLUMNS),
+        ),
+        dtype=torch.float32,
+    )
+    features[..., len(FUTURES_MODEL_FEATURE_COLUMNS)] = -1.0
+    denomination_start = len(TW_STOCK_CONTEXT_FUTURES_PRIOR_MARKET_FEATURE_COLUMNS)
+    features[0, 2, denomination_start : denomination_start + 3] = torch.tensor(
+        [2.0, 0.0, 100_000.0]
+    )
+    features[0, 9, denomination_start : denomination_start + 3] = torch.tensor(
+        [9.0, 0.0, 100_000.0]
+    )
+    features[0, 2, -1] = 0.01
+    features[0, 9, -1] = -0.02
+    candidate_mask = torch.zeros((1, 1936), dtype=torch.bool)
+    candidate_mask[:, [2, 9]] = True
+    inputs = torch.zeros((1, 1, 2, 3), dtype=torch.float32)
+    stock_mask = torch.ones((1, 2), dtype=torch.bool)
+
+    weights = model(
+        inputs,
+        stock_mask,
+        portfolio_context={
+            "candidate_features": features,
+            "candidate_mask": candidate_mask,
+        },
+    )
+    # A slot-specific objective avoids cancellation between the positive and
+    # negative OPEN-gap examples while proving that the new input participates
+    # in the differentiable backward world.
+    weights[0, 2].backward()
+    assert model.futures_current_open_encoder is not None
+    open_grad = model.futures_current_open_encoder[0].weight.grad
+    assert open_grad is not None
+    assert torch.isfinite(open_grad).all()
+    assert torch.count_nonzero(open_grad) > 0
+
+    with pytest.raises(ValueError, match="current OPEN gap context"):
+        model(
+            inputs,
+            stock_mask,
+            portfolio_context={
+                "candidate_features": features[..., :-1],
+                "candidate_mask": candidate_mask,
+            },
         )
 
 
@@ -316,9 +622,10 @@ def test_model_routes_each_futures_token_to_its_underlying_stock() -> None:
         ),
         dtype=torch.float32,
     )
-    features[..., -1] = -1.0
-    features[0, 2, -1] = 0.0
-    features[0, 9, -1] = 1.0
+    underlying_index = len(FUTURES_MODEL_FEATURE_COLUMNS)
+    features[..., underlying_index] = -1.0
+    features[0, 2, underlying_index] = 0.0
+    features[0, 9, underlying_index] = 1.0
     candidate_mask = torch.zeros((1, 1936), dtype=torch.bool)
     candidate_mask[:, [2, 9]] = True
     stock_embeddings = torch.randn((1, 4, 8), dtype=torch.float32)
@@ -565,6 +872,106 @@ def test_integer_training_surrogate_carries_continuous_state_without_account_dea
     assert torch.count_nonzero(actions.grad) == 2
 
 
+def test_integer_training_uses_exact_forward_and_surrogate_only_for_backward() -> None:
+    actions = torch.tensor([[0.05, 0.20]], dtype=torch.float32, requires_grad=True)
+    execution = _integer_execution(
+        torch.tensor([[0.03, -0.01]], dtype=torch.float32)
+    )
+    trained = run_backtest_torch(
+        actions,
+        torch.zeros((1, 1)),
+        torch.ones((1, 1), dtype=torch.bool),
+        torch.zeros(1),
+        0.0,
+        0.0,
+        long_only=False,
+        portfolio_activation="pre_normalized",
+        overnight_returns=execution,
+        execution_mode="tw_stock_context_futures_portfolio",
+        day_trade_execution_initial_capital=1_000_000.0,
+        futures_portfolio_training_surrogate_only=False,
+    )
+    audited = run_backtest_torch(
+        actions.detach(),
+        torch.zeros((1, 1)),
+        torch.ones((1, 1), dtype=torch.bool),
+        torch.zeros(1),
+        0.0,
+        0.0,
+        long_only=False,
+        portfolio_activation="pre_normalized",
+        overnight_returns=execution,
+        execution_mode="tw_stock_context_futures_portfolio",
+        day_trade_execution_initial_capital=1_000_000.0,
+        futures_portfolio_training_surrogate_only=False,
+    )
+    assert trained.settlement_ledger_unit == "contract_quantity"
+    assert torch.equal(trained.weights_history, audited.weights_history)
+    assert torch.equal(trained.weights_history, torch.round(trained.weights_history))
+    assert trained.strategy_returns.tolist() == pytest.approx(
+        audited.strategy_returns.tolist(), abs=1.0e-8
+    )
+    (-trained.strategy_returns.sum()).backward()
+    assert actions.grad is not None
+    assert torch.isfinite(actions.grad).all()
+    # Slot 0 has an exact zero-contract forward at 5%, yet receives a stable
+    # backward direction from the grouped quantization relaxation.
+    assert trained.weights_history[0, 0].item() == 0.0
+    assert abs(actions.grad[0, 0].item()) > 0.0
+
+
+def test_integer_exact_ruin_keeps_forward_absorbing_but_backward_recoverable() -> None:
+    actions = torch.tensor([[-0.50], [0.20]], dtype=torch.float32, requires_grad=True)
+    # A short five-contract position loses more than the fully collateralized
+    # account on row 0. Exact forward must die and row 1 must stay flat.
+    execution = _integer_execution(
+        torch.tensor([[3.0], [0.10]], dtype=torch.float32)
+    )
+    result = run_tw_futures_portfolio_integer_torch(
+        actions,
+        execution,
+        initial_capital=1_000_000.0,
+        recoverable_backward=True,
+    )
+    assert result.final_alive is not None and not bool(result.final_alive)
+    assert result.default_history is not None
+    assert result.default_history.tolist() == [True, False]
+    assert result.default_reason_history is not None
+    assert result.default_reason_history.tolist() == [
+        TW_FUTURES_PORTFOLIO_DEFAULT_NONPOSITIVE_EQUITY,
+        0,
+    ]
+    assert result.strategy_returns[0].item() < -15.0
+    assert result.strategy_returns[1].item() == 0.0
+    (-result.strategy_returns.sum()).backward()
+    assert actions.grad is not None
+    assert torch.isfinite(actions.grad).all()
+    # Row 0 learns away from insolvency and row 1 still learns although exact
+    # state entered the batch dead. Neither value changed in forward.
+    assert torch.count_nonzero(actions.grad) == 2
+
+
+def test_integer_dead_initial_account_has_exact_zero_forward_and_shadow_gradient() -> None:
+    actions = torch.tensor([[0.20]], dtype=torch.float32, requires_grad=True)
+    execution = _integer_execution(torch.tensor([[0.10]], dtype=torch.float32))
+    result = run_tw_futures_portfolio_integer_torch(
+        actions,
+        execution,
+        initial_capital=1_000_000.0,
+        initial_alive=torch.tensor(False),
+        initial_equity_scale=torch.tensor(0.0),
+        recoverable_backward=True,
+    )
+    assert result.strategy_returns.tolist() == [0.0]
+    assert result.final_alive is not None and not bool(result.final_alive)
+    assert result.default_history is not None
+    assert result.default_history.tolist() == [False]
+    (-result.strategy_returns.sum()).backward()
+    assert actions.grad is not None
+    assert torch.isfinite(actions.grad).all()
+    assert torch.count_nonzero(actions.grad) == 1
+
+
 def test_integer_executor_chunking_carries_quantities_and_equity_together() -> None:
     actions = torch.tensor([[0.30, 0.10], [0.35, 0.05]], dtype=torch.float32)
     execution = _integer_execution(
@@ -643,6 +1050,11 @@ def test_formal_config_preserves_full_contract_and_1000_epochs() -> None:
     assert futures_contract["holding"] == (
         "same_physical_contract_cross_session_until_own_expiry"
     )
+    assert manifest["contracts"]["model"]["contract_version"] == 2
+    assert futures_contract["cross_domain_contract_version"] == 2
+    assert futures_contract["candidate_feature_columns"] == list(
+        TW_STOCK_CONTEXT_FUTURES_PRIOR_MARKET_FEATURE_COLUMNS
+    )
 
 
 def test_integer_0900_carry_config_is_fresh_full_feature_contract() -> None:
@@ -665,10 +1077,14 @@ def test_integer_0900_carry_config_is_fresh_full_feature_contract() -> None:
     assert config.training.epochs == 1000
     assert config.training.early_stopping_no_improve_ratio == pytest.approx(0.1)
     assert config.training.compile_loss is False
-    assert config.training.futures_portfolio_training_surrogate_only is True
+    assert config.training.futures_portfolio_training_surrogate_only is False
+    assert (
+        config.training.transformer_base_portfolio.futures_denomination_aware_output
+        is True
+    )
     assert config.runner.output_dir.endswith(
-        "tw_stock_context_all_futures_carry_0900_integer_full_features_"
-        "multi_basis_projection_l1_cash_capital10m_v5_early_stop_010"
+        "tw_stock_context_all_futures_carry_0900_integer_denomination_exact_"
+        "ste_full_features_cash_capital10m_v6"
     )
     manifest = build_checkpoint_manifest(
         _stock_panel(), config, include_data_content=False
@@ -679,7 +1095,117 @@ def test_integer_0900_carry_config_is_fresh_full_feature_contract() -> None:
     assert futures_contract["integer_training_surrogate"] == (
         TW_FUTURES_PORTFOLIO_INTEGER_TRAINING_SURROGATE
     )
+    assert futures_contract["integer_training_forward"] == "exact_integer_account_v1"
+    assert futures_contract["denomination_aware_model_output"] is True
     assert futures_contract["candidate_feature_columns"] == list(
         TW_STOCK_CONTEXT_FUTURES_MODEL_FEATURE_COLUMNS
     )
-    assert manifest["contracts"]["model"]["contract_version"] == 2
+    assert manifest["contracts"]["model"]["contract_version"] == 3
+
+
+def test_integer_0845_futures_open_config_uses_stock_tminus1_and_new_contract() -> None:
+    config = load_config(
+        "configs/markets/"
+        "tw_stock_context_all_futures_portfolio_0845_integer_futures_open_"
+        "full_features_multi_basis_projection_l1_cash_capital10m.yaml"
+    )
+    assert config.data.day_trade_open_feature is True
+    assert config.data.feature_exclude == []
+    assert config.data.feature_shift_next_session == [
+        "next_session_open_gap_logret"
+    ]
+    assert config.data.tw_futures_current_open_feature is True
+    assert config.trading.tw_futures_portfolio_integer_contracts is True
+    assert config.training.epochs == 1000
+    assert config.training.early_stopping_no_improve_ratio == pytest.approx(0.1)
+    assert config.training.futures_portfolio_training_surrogate_only is False
+    assert config.training.transformer_base_portfolio.futures_denomination_aware_output
+    assert config.training.transformer_base_portfolio.futures_current_open_feature
+    assert config.runner.output_dir.endswith(
+        "tw_stock_context_all_futures_carry_0845_integer_futures_open_exact_"
+        "ste_stock_tminus1_cash_capital10m_v1"
+    )
+    manifest = build_checkpoint_manifest(
+        _stock_panel(), config, include_data_content=False
+    )
+    futures_contract = manifest["contracts"]["trading"][
+        "taiwan_stock_context_futures_portfolio"
+    ]
+    assert futures_contract["cross_domain_contract_version"] == 4
+    assert futures_contract["candidate_feature_columns"] == list(
+        TW_STOCK_CONTEXT_FUTURES_CURRENT_OPEN_MODEL_FEATURE_COLUMNS
+    )
+    assert futures_contract["cash_stock_information_clock"] == (
+        "completed_cash_stock_sessions_through_t_minus_1"
+    )
+    assert futures_contract["entry_price_clock"] == (
+        "08:45_daily_session_open_same_print_research_proxy"
+    )
+    assert manifest["contracts"]["model"]["contract_version"] == 4
+    legacy_0900 = load_config(
+        "configs/markets/"
+        "tw_stock_context_all_futures_portfolio_0900_integer_full_features_"
+        "multi_basis_projection_l1_cash_capital10m.yaml"
+    )
+    legacy_manifest = build_checkpoint_manifest(
+        _stock_panel(), legacy_0900, include_data_content=False
+    )
+    with pytest.raises(RuntimeError, match="semantic fingerprint mismatch"):
+        validate_checkpoint_manifest(
+            {"experiment_manifest": legacy_manifest},
+            manifest,
+            checkpoint_path=Path("legacy-0900-v3.pt"),
+            scope="model",
+        )
+
+
+def test_integer_0845_recoverable_config_is_fresh_guarded_baseline() -> None:
+    v1 = load_config(
+        "configs/markets/"
+        "tw_stock_context_all_futures_portfolio_0845_integer_futures_open_"
+        "full_features_multi_basis_projection_l1_cash_capital10m.yaml"
+    )
+    config = load_config(
+        "configs/markets/"
+        "tw_stock_context_all_futures_portfolio_0845_integer_futures_open_"
+        "recoverable_full_features_multi_basis_projection_l1_cash_capital10m.yaml"
+    )
+    assert config.training.epochs == 1000
+    assert config.training.early_stopping_no_improve_ratio == pytest.approx(0.1)
+    assert config.training.futures_portfolio_training_surrogate_only is False
+    assert config.training.futures_portfolio_recoverable_backward is True
+    assert config.data.feature_exclude == []
+    assert len(config.data.feature_include) >= 90
+    assert config.data.tw_futures_carry_valuation_max_abs_simple_return == pytest.approx(
+        0.25
+    )
+    assert config.runner.output_dir.endswith(
+        "tw_stock_context_all_futures_carry_0845_integer_futures_open_exact_"
+        "ste_recoverable_guarded_stock_tminus1_cash_capital10m_v2"
+    )
+    manifest = build_checkpoint_manifest(
+        _stock_panel(), config, include_data_content=False
+    )
+    futures_contract = manifest["contracts"]["trading"][
+        "taiwan_stock_context_futures_portfolio"
+    ]
+    assert futures_contract["cross_domain_contract_version"] == (
+        TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_GUARDED_CURRENT_OPEN_CONTRACT_VERSION
+    )
+    assert futures_contract["integer_training_surrogate"] == (
+        TW_FUTURES_PORTFOLIO_INTEGER_RECOVERABLE_TRAINING_SURROGATE
+    )
+    assert futures_contract["integer_recoverable_backward"] is True
+    assert futures_contract["carry_valuation_max_abs_simple_return"] == pytest.approx(
+        0.25
+    )
+    v1_manifest = build_checkpoint_manifest(
+        _stock_panel(), v1, include_data_content=False
+    )
+    with pytest.raises(RuntimeError, match="semantic fingerprint mismatch"):
+        validate_checkpoint_manifest(
+            {"experiment_manifest": v1_manifest},
+            manifest,
+            checkpoint_path=Path("legacy-0845-v1.pt"),
+            scope="resume",
+        )

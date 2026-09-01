@@ -3254,6 +3254,7 @@ def run_backtest_torch(
     day_trade_execution_initial_capital: float = 1_000_000.0,
     symbol_sharded_ledger: bool = False,
     futures_portfolio_training_surrogate_only: bool = False,
+    futures_portfolio_recoverable_backward: bool = False,
 ) -> BacktestResultTensor:
     """Simulate daily portfolio execution from model weights in torch."""
     mode = normalize_execution_mode(execution_mode)
@@ -3385,6 +3386,7 @@ def run_backtest_torch(
                     initial_equity_scale=initial_equity_scale,
                     initial_alive=initial_alive,
                     return_weights_history=return_weights_history,
+                    recoverable_backward=futures_portfolio_recoverable_backward,
                 )
             return BacktestResultTensor(
                 strategy_returns=result.strategy_returns,
@@ -3413,6 +3415,8 @@ def run_backtest_torch(
                 final_alive=result.final_alive,
                 equity_scale_history=result.equity_scale_history,
                 final_equity_scale=result.final_equity_scale,
+                settlement_default=result.default_history,
+                default_reason_history=result.default_reason_history,
                 execution_mode=mode,
                 settlement_ledger_unit=(
                     "notional_weight_training_surrogate"

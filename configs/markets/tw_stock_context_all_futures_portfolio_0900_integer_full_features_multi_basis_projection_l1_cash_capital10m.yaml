@@ -3,10 +3,10 @@
 # legacy continuous-notional all-futures mode and therefore owns a fresh root.
 base_config: tw_stock_context_all_futures_portfolio_multi_basis_projection_l1.yaml
 
-experiment_name: tw-stock-context-all-futures-carry-0900-integer-full-features-multi-basis-projection-l1-cash-capital10m-v5-early-stop-010
+experiment_name: tw-stock-context-all-futures-carry-0900-integer-denomination-exact-ste-full-features-capital10m-v6
 
 runner:
-  output_dir: artifacts/markets/tw_stock_context_all_futures_carry_0900_integer_full_features_multi_basis_projection_l1_cash_capital10m_v5_early_stop_010
+  output_dir: artifacts/markets/tw_stock_context_all_futures_carry_0900_integer_denomination_exact_ste_full_features_cash_capital10m_v6
   resume: true
   post_train_infer: false
 
@@ -39,11 +39,10 @@ training:
   # short bounded eager recurrence.  Outer torch.compile unrolled the entire
   # batch, added a multi-minute cold compile, and made steady-state loss slower.
   compile_loss: false
-  # Optimizer steps change the policy between batches, so carrying stale exact
-  # integer quantities made the account fail its funding check and killed all
-  # later gradients. Train the explicit quantization-aware relaxation; exact
-  # integer quantities remain mandatory for validation, test, and deployment.
-  futures_portfolio_training_surrogate_only: true
+  # Exact signed integer quantities, cash, fees, tax, P&L, and expiry state own
+  # the training forward pass.  Only backward uses the explicit grouped STE;
+  # validation/test/deployment therefore inhabit the same account world.
+  futures_portfolio_training_surrogate_only: false
   # Keep the four global market tokens, while also routing each stock/ETF
   # future directly to the full-context embedding of its own cash underlying.
   # This is a learned gated link, not a hand-written sizing or selection rule.
@@ -51,3 +50,8 @@ training:
   # consecutive validation checks without improvement.
   early_stopping_no_improve_ratio: 0.1
   record_epoch_curve: true
+  transformer_base_portfolio:
+    # Projection-L1 remains the unconstrained learned request.  The model then
+    # nets standard+mini by economic group and floors each group to current
+    # whole-contract cash denominations without top-K or reallocation.
+    futures_denomination_aware_output: true

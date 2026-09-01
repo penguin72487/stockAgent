@@ -418,6 +418,18 @@ def build_model(
                 ),
             }
             if model_name in _CROSS_SECTIONAL_INDEX_FUTURES_NAMES
+            else {
+                "futures_denomination_aware_output": (
+                    tbp_cfg.futures_denomination_aware_output
+                ),
+                "futures_current_open_feature": (
+                    tbp_cfg.futures_current_open_feature
+                ),
+                "futures_denomination_reference_capital": (
+                    config.trading.tw_futures_portfolio_integer_initial_capital
+                ),
+            }
+            if model_name in _CROSS_SECTIONAL_ALL_FUTURES_NAMES
             else {}
         )
         return model_class(
