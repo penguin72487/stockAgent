@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -49,6 +49,51 @@ def _candidate(tmp_path: Path, *, register_result: str = "registered") -> Path:
         ),
         encoding="utf-8",
     )
+    base = datetime.fromisoformat("2026-08-13T09:01:00+08:00")
+    minute_rows = [
+        {
+            "session_date": "2026-08-13",
+            "market": market,
+            "minute": (base + timedelta(minutes=offset)).isoformat(
+                timespec="minutes"
+            ),
+        }
+        for market in sorted(MARKETS)
+        for offset in range(promotion.MINUTE_CURVE_SESSION_POINTS)
+    ]
+    marks_path = root / "marks.jsonl"
+    marks_path.write_text(
+        "".join(json.dumps(row) + "\n" for row in minute_rows),
+        encoding="utf-8",
+    )
+    benchmark_path = root / "benchmark_history.json"
+    benchmark_path.write_text(json.dumps({"marks": []}), encoding="utf-8")
+    (root / "minute_curve_receipt.json").write_text(
+        json.dumps(
+            {
+                "simulation_only": True,
+                "production_order_possible": False,
+                "start_date": "2026-08-13",
+                "end_date": "2026-08-13",
+                "minute_contract": promotion.MINUTE_CURVE_CONTRACT,
+                "linear_interpolation_used": False,
+                "accepted_09_01_strategy_and_13_30_endpoints_preserved": True,
+                "coverage_after_fetch": {"missing_pairs": 0},
+                "strategy": {
+                    "session_dates": ["2026-08-13"],
+                    "markets": sorted(MARKETS),
+                    "generated_rows": len(minute_rows),
+                },
+                "outputs": {
+                    "marks": {"sha256": promotion._sha256(marks_path)},
+                    "benchmark_history": {
+                        "sha256": promotion._sha256(benchmark_path)
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
     return root
 
 
@@ -58,6 +103,18 @@ def test_validate_rebuild_accepts_exact_flat_mode_set(tmp_path: Path) -> None:
     assert result["registrations"] == 3
     assert result["mode_set"] == sorted(MARKETS)
     assert result["final_open_positions"] == {market: 0 for market in sorted(MARKETS)}
+    assert result["minute_curve_validation"]["validated_rows"] == 810
+
+
+def test_validate_rebuild_rejects_stale_daily_only_curve(tmp_path: Path) -> None:
+    candidate = _candidate(tmp_path)
+    receipt_path = candidate / "minute_curve_receipt.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["strategy"]["generated_rows"] = 3
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="270 points per completed session"):
+        promotion._validate_rebuild(candidate, expected_markets=MARKETS)
 
 
 def test_validate_rebuild_accepts_0901_official_open_contract(tmp_path: Path) -> None:
@@ -130,6 +187,82 @@ def test_validate_rebuild_accepts_0901_official_open_contract(tmp_path: Path) ->
     assert result["official_open_fills"] == 3
     assert result["signal_ledger_validation"]["fill_ledger_official_open_fills"] == 3
     assert result["synthetic_fallback_fills"] == 0
+
+
+def test_validate_rebuild_accepts_0900_open_0901_vwap_contract(
+    tmp_path: Path,
+) -> None:
+    candidate = _candidate(tmp_path)
+    state_path = candidate / "state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    for mode in state["modes"].values():
+        mode["entry_fill_policy"] = promotion.MINUTE_VWAP_0901_ENTRY_POLICY
+        mode["entry_fill_contract"] = promotion.MINUTE_VWAP_0901_REPLAY_CONTRACT
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    receipt_path = candidate / "rebuild_receipt.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["replay_contract"] = {"entry": promotion.MINUTE_VWAP_0901_REPLAY_CONTRACT}
+    for row in receipt["sessions"][0]["modes"]:
+        row["entry"] = {
+            "entry_fill_policy": promotion.MINUTE_VWAP_0901_ENTRY_POLICY,
+            "entry_fill_count": 1,
+            "entry_0901_vwap_fill_count": 1,
+            "entry_official_open_fill_count": 0,
+            "entry_fill_is_synthetic": False,
+        }
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+    common = {
+        "entry_fill_policy": promotion.MINUTE_VWAP_0901_ENTRY_POLICY,
+        "entry_price_offset_ticks": 0,
+        "counterfactual_0901_price_fill": True,
+        "counterfactual_open_price_fill": False,
+        "synthetic_fill": False,
+        "synthetic_fallback_fill": False,
+        "paper_market_fill": False,
+    }
+    (candidate / "signals.jsonl").write_text(
+        "".join(
+            json.dumps(
+                {
+                    **common,
+                    "market": market,
+                    "recorded_at": "2026-08-13T09:01:00+08:00",
+                    "filled_shares": 1_000,
+                    "execution_price": 101.0,
+                    "sizing_open_price": 100.0,
+                    "entry_price_source": "fixture_0901_minute_vwap",
+                }
+            )
+            + "\n"
+            for market in sorted(MARKETS)
+        ),
+        encoding="utf-8",
+    )
+    (candidate / "fills.jsonl").write_text(
+        "".join(
+            json.dumps(
+                {
+                    **common,
+                    "market": market,
+                    "purpose": "entry",
+                    "fill_at": "2026-08-13T09:01:00+08:00",
+                    "fill_contract": promotion.MINUTE_VWAP_0901_REPLAY_CONTRACT,
+                    "price": 101.0,
+                }
+            )
+            + "\n"
+            for market in sorted(MARKETS)
+        ),
+        encoding="utf-8",
+    )
+
+    result = promotion._validate_rebuild(candidate, expected_markets=MARKETS)
+
+    assert result["minute_vwap_0901_fills"] == 3
+    assert result["signal_ledger_validation"][
+        "fill_ledger_minute_vwap_0901_fills"
+    ] == 3
 
 
 def test_validate_rebuild_rejects_blocked_registration(tmp_path: Path) -> None:

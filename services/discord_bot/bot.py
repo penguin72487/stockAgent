@@ -1909,16 +1909,19 @@ def _recent_pre_signal_artifact_failure(
 
 
 def _tw_data_layer_lock_path(command: list[str]) -> Path | None:
-    if any(
-        Path(str(item)).name == "refresh_tw_public_live_snapshot.py"
-        for item in command
+    command_names = {Path(str(item)).name for item in command}
+    if command_names.intersection(
+        {
+            "activate_tw_public_opening_data.py",
+            "refresh_tw_public_live_snapshot.py",
+        }
     ):
         configured = command_option(command, "--live-root")
         live_root = Path(configured or "/srv/stockagent-live/data_tw_public")
         if not live_root.is_absolute():
             live_root = ROOT / live_root
         return live_root.parent / ".locks" / "tw-public-refresh.lock"
-    if not any(Path(str(item)).name == "download_tw_official_data.py" for item in command):
+    if "download_tw_official_data.py" not in command_names:
         return None
     configured = command_option(command, "--lock-file")
     path = Path(configured) if configured else Path("artifacts/data_locks/tw_official_data.lock")

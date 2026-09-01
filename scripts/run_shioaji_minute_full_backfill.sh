@@ -34,9 +34,9 @@ resolve_backfill_end_date() {
   run_fintech_python - <<'PY'
 from pathlib import Path
 
-from stockagent.live.shioaji_schedule import previous_tw_stock_session
+from stockagent.live.shioaji_schedule import latest_completed_tw_stock_session
 
-print(previous_tw_stock_session(parquet_root=Path("data_tw_public")).isoformat())
+print(latest_completed_tw_stock_session(parquet_root=Path("data_tw_public")).isoformat())
 PY
 }
 
@@ -177,7 +177,7 @@ echo "[shioaji-minute-runner] started_at=$(TZ=Asia/Taipei date --iso-8601=second
 while true; do
   BACKFILL_END_DATE="$(resolve_backfill_end_date)"
   publish_target "$BACKFILL_END_DATE"
-  echo "[shioaji-minute-runner] target_end_date=$BACKFILL_END_DATE boundary=previous_completed_tw_stock_session"
+  echo "[shioaji-minute-runner] target_end_date=$BACKFILL_END_DATE boundary=latest_completed_tw_stock_session"
 
   read -r futures_delay futures_reason <<< "$(futures_priority_state)"
   if (( futures_delay > 0 )); then

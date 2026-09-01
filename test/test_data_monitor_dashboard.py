@@ -1425,8 +1425,12 @@ def test_registered_refresh_reuses_downloaders_and_preserves_tw_snapshot_owner()
     assert "RUN_YAHOO=0" in runner
     assert "RUN_CEX_PERP=1" in runner
     assert "CRYPTO_TAIL_ONLY=1" in runner
-    assert "CRYPTO_HISTORICAL_FEATURES=0" in runner
-    assert "CRYPTO_HISTORICAL_FEATURES=1" in runner
+    daily_scope = runner.split("  daily)", 1)[1].split("    ;;", 1)[0]
+    intraday_scope = runner.split("  intraday)", 1)[1].split("    ;;", 1)[0]
+    backfill_scope = runner.split("  backfill)", 1)[1].split("    ;;", 1)[0]
+    assert "CRYPTO_HISTORICAL_FEATURES=0" in daily_scope
+    assert "CRYPTO_HISTORICAL_FEATURES=0" in intraday_scope
+    assert "CRYPTO_HISTORICAL_FEATURES=1" in backfill_scope
     assert "registered-backfill" in runner
     assert "CRYPTO_TAIL_ONLY=0" in runner
     assert "registered_backfill" in dashboard._REFRESH_UNITS

@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import threading
 import time
-from datetime import datetime
+from contextlib import contextmanager
+from datetime import date, datetime
+import sys
+from types import SimpleNamespace
 from urllib.parse import parse_qs, unquote, urlparse
 from zoneinfo import ZoneInfo
 
@@ -32,6 +35,57 @@ def test_symbol_yahoo_map_derives_suffix_from_official_venue(tmp_path) -> None:
         "2330": "2330.TW",
         "6547": "6547.TWO",
     }
+
+
+def test_historical_0901_vwap_uses_only_0900_minute_ticks(monkeypatch) -> None:
+    timestamps = np.asarray(
+        [
+            np.datetime64("2026-08-13T09:00:10", "ns").astype(np.int64),
+            np.datetime64("2026-08-13T09:00:50", "ns").astype(np.int64),
+            np.datetime64("2026-08-13T09:01:00", "ns").astype(np.int64),
+        ],
+        dtype=np.int64,
+    )
+
+    class FakeAPI:
+        contracts = SimpleNamespace(get=lambda symbol: object())
+
+        @staticmethod
+        def usage():
+            return SimpleNamespace(bytes=10, limit_bytes=1_000_000)
+
+        @staticmethod
+        def ticks(**_kwargs):
+            return SimpleNamespace(
+                ts=timestamps,
+                close=[100.0, 110.0, 999.0],
+                volume=[1.0, 3.0, 100.0],
+            )
+
+    @contextmanager
+    def fake_query(*_args, **_kwargs):
+        yield lambda _result: None
+
+    monkeypatch.setattr(quote_provider, "_shioaji_stock_api", lambda: FakeAPI())
+    monkeypatch.setattr(quote_provider, "shioaji_query", fake_query)
+    monkeypatch.setattr(quote_provider, "_SHIOAJI_STOCK_CONTRACTS", {})
+    monkeypatch.setitem(
+        sys.modules,
+        "shioaji",
+        SimpleNamespace(TicksQueryType=SimpleNamespace(RangeTime="RangeTime")),
+    )
+
+    rows, receipt = quote_provider.fetch_shioaji_historical_stock_0901_vwaps(
+        ["2330"],
+        trading_date=date(2026, 8, 13),
+        progress_every=0,
+    )
+
+    assert rows["2330"]["execution_price_0901"] == 107.5
+    assert rows["2330"]["tick_count_0901"] == 2
+    assert rows["2330"]["quote_at"] == "2026-08-13T09:01:00+08:00"
+    assert receipt["resolved_symbols"] == 1
+    assert receipt["right_label"] == "09:01:00 Asia/Taipei"
 
 
 class _FakeResponse:
@@ -417,6 +471,53 @@ def test_tw_opening_snapshot_retries_only_symbols_whose_open_is_still_missing(
     assert np.isfinite(first.open_prices[0])
     assert np.isnan(first.open_prices[1])
     np.testing.assert_allclose(second.open_prices, [101.0, 201.0])
+
+
+def test_tw_opening_snapshot_counts_causal_no_open_row_as_source_coverage(
+    monkeypatch, tmp_path
+) -> None:
+    calls = 0
+    now_ms = int(time.time() * 1000)
+
+    def fake_fetch(symbols, fallback_prices, **kwargs):
+        nonlocal calls
+        del kwargs
+        calls += 1
+        return PriceSnapshot(
+            prices=np.asarray(fallback_prices, dtype=np.float64) + 0.5,
+            source="twse_tpex:mis",
+            available_count=len(symbols),
+            requested_count=len(symbols),
+            available_mask=np.ones((len(symbols),), dtype=bool),
+            open_prices=np.full((len(symbols),), np.nan),
+            timestamps_ms=np.full((len(symbols),), now_ms, dtype=np.int64),
+        )
+
+    monkeypatch.setattr(quote_provider, "fetch_tw_mis_last_prices", fake_fetch)
+    monkeypatch.setenv(
+        "STOCKAGENT_TW_OPENING_SNAPSHOT_ROOT", str(tmp_path / "receipts")
+    )
+    monkeypatch.setattr(quote_provider, "_TW_MIS_OPENING_CACHE_KEY", None)
+    quote_provider._TW_MIS_OPENING_CACHE.clear()
+
+    first = fetch_tw_mis_opening_snapshot(
+        ["ILLIQUID"],
+        np.array([100.0]),
+        parquet_root=tmp_path,
+        cache_ttl_seconds=21600,
+    )
+    second = fetch_tw_mis_opening_snapshot(
+        ["ILLIQUID"],
+        np.array([100.0]),
+        parquet_root=tmp_path,
+        cache_ttl_seconds=21600,
+    )
+
+    assert first.available_count == 1
+    assert second.available_count == 1
+    assert np.isnan(first.open_prices[0])
+    assert np.isnan(second.open_prices[0])
+    assert calls == 2
 
 
 def test_load_prices_csv_preserves_explicit_open_snapshot(tmp_path) -> None:

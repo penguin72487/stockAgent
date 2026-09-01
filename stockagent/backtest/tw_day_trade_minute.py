@@ -8,8 +8,12 @@ import os
 import torch
 
 from stockagent.data.tw_day_trade_execution import (
+    DAY_TRADE_FULL_SESSION_FIELDS,
+    DAY_TRADE_FULL_SESSION_MINUTES,
     DAY_TRADE_EXECUTION_FIELD_COUNT,
     DayTradeExecutionField as F,
+    FULL_SESSION_PRICE,
+    FULL_SESSION_VOLUME_SHARES,
 )
 
 
@@ -111,6 +115,247 @@ def _capacity(volume: torch.Tensor) -> torch.Tensor:
     )
 
 
+def _capacity_at_participation(
+    volume: torch.Tensor,
+    maximum_volume_participation: float,
+) -> torch.Tensor:
+    clean = torch.where(
+        torch.isfinite(volume) & (volume > 0.0), volume, torch.zeros_like(volume)
+    )
+    return (
+        torch.floor(
+            clean * float(maximum_volume_participation) / BOARD_LOT_SHARES
+        )
+        * BOARD_LOT_SHARES
+    )
+
+
+def _sequential_market_fill(
+    desired_shares: torch.Tensor,
+    prices: torch.Tensor,
+    volumes: torch.Tensor,
+    *,
+    maximum_volume_participation: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fill a persistent whole-lot order against chronological minute volume."""
+
+    valid_price = torch.isfinite(prices) & (prices > 0.0)
+    safe_prices = torch.where(valid_price, prices, torch.zeros_like(prices))
+    capacity = _capacity_at_participation(
+        torch.where(valid_price, volumes, torch.zeros_like(volumes)),
+        maximum_volume_participation,
+    )
+    cumulative = torch.cumsum(capacity, dim=-1)
+    before = cumulative - capacity
+    quantities = torch.minimum(
+        capacity,
+        (desired_shares.unsqueeze(-1) - before).clamp_min(0.0),
+    )
+    return quantities.sum(dim=-1), (quantities * safe_prices).sum(dim=-1)
+
+
+def _settle_day_trade_claim(
+    *,
+    pnl: torch.Tensor,
+    traded_notional: torch.Tensor,
+    entry_weights: torch.Tensor,
+    cash: torch.Tensor,
+    payables: torch.Tensor,
+    receivables: torch.Tensor,
+    equity_scale: torch.Tensor,
+    capital0: torch.Tensor,
+    state_advance: torch.Tensor,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """Apply the shared economic-NAV and T+2 net-claim recurrence."""
+
+    nav_twd = capital0 * equity_scale.clamp_min(1.0e-12)
+    simple_return = (pnl / nav_twd.clamp_min(1.0e-12)).clamp_min(-1.0 + 1.0e-6)
+    simple_return = torch.where(
+        state_advance, simple_return, torch.zeros_like(simple_return)
+    )
+    net_claim = equity_scale * simple_return
+
+    due_payable = payables[0]
+    due_receivable = receivables[0]
+    settled_cash = cash + due_receivable - due_payable
+    queue_zero = torch.zeros_like(due_payable).unsqueeze(0)
+    shifted_payables = torch.cat((payables[1:], queue_zero), dim=0)
+    shifted_receivables = torch.cat((receivables[1:], queue_zero), dim=0)
+    cash = torch.where(state_advance, settled_cash, cash)
+    payables = torch.where(state_advance, shifted_payables, payables)
+    receivables = torch.where(state_advance, shifted_receivables, receivables)
+    negative_claim = (-net_claim).clamp_min(0.0)
+    positive_claim = net_claim.clamp_min(0.0)
+    insertion = torch.nn.functional.one_hot(
+        torch.tensor(
+            int(payables.numel()) - 1,
+            device=payables.device,
+        ),
+        num_classes=int(payables.numel()),
+    ).to(dtype=payables.dtype)
+    payables = payables + insertion * negative_claim
+    receivables = receivables + insertion * positive_claim
+    next_equity_scale = cash + receivables.sum() - payables.sum()
+    turnover = traded_notional.sum() / nav_twd.clamp_min(1.0e-12)
+    return (
+        torch.log1p(simple_return),
+        turnover,
+        entry_weights,
+        next_equity_scale,
+        net_claim,
+        cash,
+        payables,
+        receivables,
+    )
+
+
+def _run_tw_day_trade_full_session_volume_day(
+    target_weights: torch.Tensor,
+    execution_row: torch.Tensor,
+    tradable_mask: torch.Tensor,
+    can_short_open_mask: torch.Tensor,
+    day_trade_eligible_mask: torch.Tensor,
+    day_trade_can_buy_open_mask: torch.Tensor,
+    day_trade_can_sell_open_mask: torch.Tensor,
+    buy_fee_rates: torch.Tensor,
+    sell_fee_rates: torch.Tensor,
+    normal_sell_fee_rates: torch.Tensor,
+    cash: torch.Tensor,
+    payables: torch.Tensor,
+    receivables: torch.Tensor,
+    equity_scale: torch.Tensor,
+    capital0: torch.Tensor,
+    state_advance: torch.Tensor,
+    maximum_volume_participation: float,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """Execute one 09:00 target through persistent minute market orders."""
+
+    official_open = execution_row[:, 0, FULL_SESSION_PRICE]
+    valid_open = torch.isfinite(official_open) & (official_open > 0.0)
+    safe_official_open = torch.where(
+        valid_open, official_open, torch.ones_like(official_open)
+    )
+    request = torch.where(
+        state_advance, target_weights, torch.zeros_like(target_weights)
+    )
+    permission = (
+        tradable_mask.bool()
+        & day_trade_eligible_mask.bool()
+        & torch.where(
+            request < 0.0,
+            can_short_open_mask.bool() & day_trade_can_sell_open_mask.bool(),
+            day_trade_can_buy_open_mask.bool(),
+        )
+        & valid_open
+    )
+    request = torch.where(permission, request, torch.zeros_like(request))
+    deployable_twd = capital0 * cash.clamp_min(0.0)
+    nav_twd = capital0 * equity_scale.clamp_min(1.0e-12)
+    desired = _ste_floor_lots(
+        request.abs() * deployable_twd / safe_official_open.clamp_min(1.0e-12)
+    )
+    # The opening order is live from 09:00. Bars 09:01..13:19 represent
+    # chronological fills; at 13:20 any unfilled entry remainder is cancelled.
+    entry_shares, entry_notional = _sequential_market_fill(
+        desired,
+        execution_row[:, 1:260, FULL_SESSION_PRICE],
+        execution_row[:, 1:260, FULL_SESSION_VOLUME_SHARES],
+        maximum_volume_participation=maximum_volume_participation,
+    )
+    direction = torch.sign(request)
+    entry_average = torch.where(
+        entry_shares > 0.0,
+        entry_notional / entry_shares.clamp_min(1.0),
+        torch.zeros_like(entry_shares),
+    )
+
+    # A close decision made after the completed 13:20 bar can execute only in
+    # the right-labelled 13:21..13:30 bars. Non-trading minutes naturally
+    # contribute zero capacity; the 13:30 row is the closing auction.
+    exit_prices = execution_row[:, 261:271, FULL_SESSION_PRICE]
+    exit_volumes = execution_row[:, 261:271, FULL_SESSION_VOLUME_SHARES]
+    exit_shares, exit_notional = _sequential_market_fill(
+        entry_shares,
+        exit_prices,
+        exit_volumes,
+        maximum_volume_participation=maximum_volume_participation,
+    )
+    remaining = (entry_shares - exit_shares).clamp_min(0.0)
+
+    close_price = execution_row[:, 270, FULL_SESSION_PRICE]
+    valid_close = torch.isfinite(close_price) & (close_price > 0.0)
+    safe_close = torch.where(valid_close, close_price, entry_average)
+    marked_remaining = torch.where(valid_close, remaining, torch.zeros_like(remaining))
+    residual_exit_notional = marked_remaining * safe_close
+    gross_pnl = direction * (
+        exit_notional + residual_exit_notional - entry_notional
+    )
+    entry_fees = entry_notional * torch.where(
+        direction > 0.0, buy_fee_rates, sell_fee_rates
+    )
+    exit_fees = exit_notional * torch.where(
+        direction > 0.0, sell_fee_rates, buy_fee_rates
+    )
+    residual_exit_fees = residual_exit_notional * torch.where(
+        direction > 0.0, normal_sell_fee_rates, buy_fee_rates
+    )
+    normal_sell_tax_adjustment = (
+        normal_sell_fee_rates - sell_fee_rates
+    ).clamp_min(0.0)
+    residual_entry_notional = marked_remaining * entry_average
+    margin_cost = torch.where(
+        direction > 0.0,
+        residual_exit_notional * MARGIN_FINANCING_ONE_DAY_RATE,
+        residual_exit_notional * MARGIN_SHORT_ONE_DAY_BORROW_RATE
+        + residual_entry_notional
+        * (MARGIN_SHORT_HANDLING_FEE_RATE + normal_sell_tax_adjustment),
+    )
+    missing_close_loss = torch.where(
+        (remaining > 0.0) & ~valid_close,
+        remaining * entry_average,
+        torch.zeros_like(remaining),
+    )
+    pnl = (
+        gross_pnl.sum()
+        - entry_fees.sum()
+        - exit_fees.sum()
+        - residual_exit_fees.sum()
+        - margin_cost.sum()
+        - missing_close_loss.sum()
+    )
+    traded_notional = entry_notional + exit_notional + residual_exit_notional
+    entry_weights = direction * entry_notional / nav_twd.clamp_min(1.0e-12)
+    return _settle_day_trade_claim(
+        pnl=pnl,
+        traded_notional=traded_notional,
+        entry_weights=entry_weights,
+        cash=cash,
+        payables=payables,
+        receivables=receivables,
+        equity_scale=equity_scale,
+        capital0=capital0,
+        state_advance=state_advance,
+    )
+
+
 def _run_tw_day_trade_minute_day(
     target_weights: torch.Tensor,
     execution_row: torch.Tensor,
@@ -128,6 +373,7 @@ def _run_tw_day_trade_minute_day(
     equity_scale: torch.Tensor,
     capital0: torch.Tensor,
     state_advance: torch.Tensor,
+    maximum_volume_participation: float,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -139,6 +385,27 @@ def _run_tw_day_trade_minute_day(
     torch.Tensor,
 ]:
     """Fixed-shape one-session kernel used by the chronological executor."""
+
+    if execution_row.ndim == 3:
+        return _run_tw_day_trade_full_session_volume_day(
+            target_weights,
+            execution_row,
+            tradable_mask,
+            can_short_open_mask,
+            day_trade_eligible_mask,
+            day_trade_can_buy_open_mask,
+            day_trade_can_sell_open_mask,
+            buy_fee_rates,
+            sell_fee_rates,
+            normal_sell_fee_rates,
+            cash,
+            payables,
+            receivables,
+            equity_scale,
+            capital0,
+            state_advance,
+            maximum_volume_participation,
+        )
 
     official_open = execution_row[:, F.OFFICIAL_OPEN]
     entry_price = execution_row[:, F.ENTRY_VWAP_0901]
@@ -268,48 +535,17 @@ def _run_tw_day_trade_minute_day(
         - margin_cost.sum()
         - missing_close_loss.sum()
     )
-    simple_return = (pnl / nav_twd.clamp_min(1.0e-12)).clamp_min(-1.0 + 1.0e-6)
-    simple_return = torch.where(
-        state_advance, simple_return, torch.zeros_like(simple_return)
-    )
-    # The securities legs offset on T.  Only this fixed-original-capital net
-    # cash claim remains; gross buy and sell consideration is not carried.
-    net_claim = equity_scale * simple_return
-
-    # T+2 claims settle only after today's orders have executed.  Cash history
-    # is post-close, while today's sizing used the pre-settlement cash above.
-    due_payable = payables[0]
-    due_receivable = receivables[0]
-    settled_cash = cash + due_receivable - due_payable
-    queue_zero = torch.zeros_like(due_payable).unsqueeze(0)
-    shifted_payables = torch.cat((payables[1:], queue_zero), dim=0)
-    shifted_receivables = torch.cat((receivables[1:], queue_zero), dim=0)
-    cash = torch.where(state_advance, settled_cash, cash)
-    payables = torch.where(state_advance, shifted_payables, payables)
-    receivables = torch.where(state_advance, shifted_receivables, receivables)
-    negative_claim = (-net_claim).clamp_min(0.0)
-    positive_claim = net_claim.clamp_min(0.0)
-    insertion = torch.nn.functional.one_hot(
-        torch.tensor(
-            int(payables.numel()) - 1,
-            device=payables.device,
-        ),
-        num_classes=int(payables.numel()),
-    ).to(dtype=payables.dtype)
-    payables = payables + insertion * negative_claim
-    receivables = receivables + insertion * positive_claim
-    next_equity_scale = cash + receivables.sum() - payables.sum()
-    turnover = traded_notional.sum() / nav_twd.clamp_min(1.0e-12)
     entry_weights = signed_entry * entry_price / nav_twd.clamp_min(1.0e-12)
-    return (
-        torch.log1p(simple_return),
-        turnover,
-        entry_weights,
-        next_equity_scale,
-        net_claim,
-        cash,
-        payables,
-        receivables,
+    return _settle_day_trade_claim(
+        pnl=pnl,
+        traded_notional=traded_notional,
+        entry_weights=entry_weights,
+        cash=cash,
+        payables=payables,
+        receivables=receivables,
+        equity_scale=equity_scale,
+        capital0=capital0,
+        state_advance=state_advance,
     )
 
 
@@ -330,6 +566,7 @@ def _run_tw_day_trade_minute_block(
     equity_scale: torch.Tensor,
     capital0: torch.Tensor,
     state_advance: torch.Tensor,
+    maximum_volume_participation: float,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -377,6 +614,7 @@ def _run_tw_day_trade_minute_block(
             equity_scale,
             capital0,
             state_advance[idx],
+            maximum_volume_participation,
         )
         log_rows.append(log_return)
         turnover_rows.append(turnover)
@@ -398,7 +636,12 @@ def _run_tw_day_trade_minute_block(
     )
 
 
-def _block_runner_for(weights: torch.Tensor, settlement_lag_sessions: int):
+def _block_runner_for(
+    weights: torch.Tensor,
+    execution_tape: torch.Tensor,
+    settlement_lag_sessions: int,
+    maximum_volume_participation: float,
+):
     """Return one reusable four-session kernel for a fixed symbol axis."""
 
     if (
@@ -413,7 +656,9 @@ def _block_runner_for(weights: torch.Tensor, settlement_lag_sessions: int):
         weights.device.index,
         weights.dtype,
         int(weights.size(1)),
+        tuple(int(value) for value in execution_tape.shape[2:]),
         int(settlement_lag_sessions),
+        float(maximum_volume_participation),
     )
     if key in _COMPILED_DAY_FAILED:
         if _strict_no_fallback_enabled():
@@ -448,6 +693,7 @@ def run_tw_day_trade_minute_execution(
     normal_sell_fee_rates: torch.Tensor,
     *,
     initial_capital_twd: float,
+    maximum_volume_participation: float = MINUTE_VOLUME_PARTICIPATION,
     settlement_lag_sessions: int = 2,
     state_advance_mask: torch.Tensor | None = None,
     initial_cash: torch.Tensor | None = None,
@@ -470,9 +716,17 @@ def run_tw_day_trade_minute_execution(
 
     if target_weights.ndim != 2:
         raise ValueError("daily target weights must have shape [T,S]")
-    expected = (*target_weights.shape, DAY_TRADE_EXECUTION_FIELD_COUNT)
-    if tuple(execution_tape.shape) != expected:
-        raise ValueError(f"execution_tape must have shape {expected}")
+    scheduled_shape = (*target_weights.shape, DAY_TRADE_EXECUTION_FIELD_COUNT)
+    full_session_shape = (
+        *target_weights.shape,
+        DAY_TRADE_FULL_SESSION_MINUTES,
+        DAY_TRADE_FULL_SESSION_FIELDS,
+    )
+    if tuple(execution_tape.shape) not in {scheduled_shape, full_session_shape}:
+        raise ValueError(
+            "execution_tape must have scheduled shape "
+            f"{scheduled_shape} or full-session shape {full_session_shape}"
+        )
     for name, value in (
         ("tradable_mask", tradable_mask),
         ("can_short_open_mask", can_short_open_mask),
@@ -484,6 +738,16 @@ def run_tw_day_trade_minute_execution(
             raise ValueError(f"{name} must match target_weights")
     if not float(initial_capital_twd) > 0.0:
         raise ValueError("initial_capital_twd must be positive")
+    participation = float(maximum_volume_participation)
+    if not 0.0 < participation <= 1.0:
+        raise ValueError("maximum_volume_participation must be in (0, 1]")
+    if tuple(execution_tape.shape) == scheduled_shape and abs(
+        participation - MINUTE_VOLUME_PARTICIPATION
+    ) > 1.0e-12:
+        raise ValueError(
+            "scheduled event tape preserves its 50% capacity contract; use the "
+            "full-session tape for another participation rate"
+        )
     if (
         isinstance(settlement_lag_sessions, bool)
         or int(settlement_lag_sessions) != settlement_lag_sessions
@@ -556,7 +820,12 @@ def run_tw_day_trade_minute_execution(
     payable_rows: list[torch.Tensor] = []
     receivable_rows: list[torch.Tensor] = []
     capital0 = weights.new_tensor(float(initial_capital_twd))
-    block_runner, compiled_key = _block_runner_for(weights, lag)
+    block_runner, compiled_key = _block_runner_for(
+        weights,
+        tape,
+        lag,
+        participation,
+    )
     total_rows = int(weights.size(0))
 
     for idx in range(0, total_rows, COMPILED_BLOCK_ROWS):
@@ -595,6 +864,7 @@ def run_tw_day_trade_minute_execution(
                 equity_scale,
                 capital0,
                 block_advance,
+                participation,
             )
         except Exception as exc:
             if compiled_key is None or _strict_no_fallback_enabled():
@@ -625,6 +895,7 @@ def run_tw_day_trade_minute_execution(
                 equity_scale,
                 capital0,
                 block_advance,
+                participation,
             )
         else:
             if compiled_key is not None:

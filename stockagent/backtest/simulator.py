@@ -3120,6 +3120,7 @@ def run_backtest_torch(
     overnight_returns: torch.Tensor | None = None,
     can_short_open_open_mask: torch.Tensor | None = None,
     day_trade_execution_initial_capital: float = 1_000_000.0,
+    day_trade_execution_volume_participation: float = 0.50,
     symbol_sharded_ledger: bool = False,
 ) -> BacktestResultTensor:
     """Simulate daily portfolio execution from model weights in torch."""
@@ -3868,7 +3869,7 @@ def run_backtest_torch(
                     )
                     & prepped_sell_open
                 )
-            if overnight_returns is not None and overnight_returns.dim() == 3:
+            if overnight_returns is not None and overnight_returns.dim() in {3, 4}:
                 if day_trade_unlimited_margin_conversion:
                     raise ValueError(
                         "stateful carry tw_day_trade cannot use the legacy "
@@ -3909,6 +3910,9 @@ def run_backtest_torch(
                     sell_fee_rates,
                     active_normal_sell_fees,
                     initial_capital_twd=day_trade_execution_initial_capital,
+                    maximum_volume_participation=(
+                        day_trade_execution_volume_participation
+                    ),
                     settlement_lag_sessions=settlement_lag_sessions,
                     state_advance_mask=state_advance_mask,
                     initial_cash=initial_cash,

@@ -1334,6 +1334,11 @@ def _operational_issues(
             "官方開盤價不可用",
             "歷史回補缺少有效官方開盤價，09:01 反事實計價已停止；不使用 Bid/Ask、最後價或 +1 Tick 替代。",
         ),
+        "observed_09_01_minute_vwap_unavailable": (
+            "error",
+            "09:01 首分鐘成交價不可用",
+            "漏跑回補缺少右標記 09:01 首分鐘 VWAP，該股票保持空倉；不以 09:00 開盤價、Bid/Ask、最後價或 +1 Tick 替代。",
+        ),
         "synthetic_open_tick_price_unavailable": (
             "error",
             "開盤價 Tick 價格不可用",
@@ -1704,7 +1709,10 @@ def build_dashboard_history_snapshot(
         initial_capital = _finite_float(row.get("initial_capital_twd"))
         total_equity = _finite_float(row.get("total_equity_twd"))
         wealth_index = 1.0 + float(return_fraction)
-        if not math.isfinite(wealth_index) or wealth_index <= 0.0:
+        # A leveraged reference can truthfully cross zero. Dropping those rows
+        # creates a false hole in the minute curve; only logarithmic display is
+        # undefined, not the observed equity/PnL itself.
+        if not math.isfinite(wealth_index):
             return
         if total_equity is None and initial_capital is not None:
             total_equity = initial_capital * wealth_index
@@ -1827,7 +1835,11 @@ def build_dashboard_history_snapshot(
                 float(baseline["_wealth_index"]) if baseline is not None else 1.0
             )
             row_wealth = float(row["_wealth_index"])
-            range_return = row_wealth / baseline_wealth - 1.0
+            range_return = (
+                row_wealth / baseline_wealth - 1.0
+                if baseline_wealth > 0.0
+                else row_wealth - baseline_wealth
+            )
             row["return_fraction"] = range_return
             row["return_pct"] = range_return * 100.0
 
@@ -2737,6 +2749,9 @@ def build_dashboard_snapshot(
                 "entry_synthetic_fallback_fill_count": int(
                     mode.get("entry_synthetic_fallback_fill_count") or 0
                 ),
+                "entry_0901_vwap_fill_count": int(
+                    mode.get("entry_0901_vwap_fill_count") or 0
+                ),
                 "engine_status": mode.get("engine_status"),
                 "checkpoint_ready": mode.get("checkpoint_ready"),
                 "readiness_error": mode.get("readiness_error"),
@@ -3014,6 +3029,9 @@ def build_dashboard_snapshot(
             mode["entry_synthetic_fallback_fill_count"] = int(
                 (signal_event or {}).get("entry_synthetic_fallback_fill_count") or 0
             )
+            mode["entry_0901_vwap_fill_count"] = int(
+                (signal_event or {}).get("entry_0901_vwap_fill_count") or 0
+            )
             mode["simulation_replay"] = bool(
                 (signal_event or {}).get("simulation_replay", False)
             )
@@ -3228,8 +3246,8 @@ def build_dashboard_snapshot(
             "execution_record": "today's append-only signal_registered or signal_blocked event per mode; stale prior-session timestamps never count",
             "missed_start": "between 09:00 and 13:20, Linux inotify wakes the executor when the atomic latest-signal pointer is published; a 0.1-second timeout remains only as a portable catch-up fallback and the public dashboard remains read-only",
             "signal": "Discord live target_weights.parquet after observed opening quote",
-            "replay": "simulation_replay=true is recorded at 09:01 and retrospectively values the historical order at the observed official session open; it is explicitly counterfactual and is not a causally executable quote or real order fill",
-            "entry_fill": "live execution starts at 09:00: after the immutable signal pointer is published, buy/cover consumes the first strictly later best Ask and sell/short consumes the first strictly later best Bid; missing causal quotes are blocked without last-price, 09:01, or adverse-tick substitution. Historical replay alone uses the 09:01 official open",
+            "replay": "simulation_replay=true is recorded at 09:01: inference and whole-lot sizing use the official 09:00 session open, while execution uses the observed right-labelled 09:01 minute VWAP. It is explicitly counterfactual and is not a live quote or real order fill",
+            "entry_fill": "live execution starts at 09:00: after the immutable signal pointer is published, buy/cover consumes the first strictly later best Ask and sell/short consumes the first strictly later best Bid. An uncommitted opening after the 09:00:15 durability deadline waits for the observed 09:01 minute VWAP; missing data is blocked without open-price fill, last-price, or adverse-tick substitution",
             "latency": "measured 09:00 trigger through model, atomic artifact publication, consumer discovery, first causally later best quote, and durable simulation-ledger persistence on this host; it is not an external order acknowledgement or venue round-trip measurement",
             "service_sync": "Discord, the paper engine, and the dashboard share one compact engine commit revision; Discord acknowledges that revision without reparsing the full ledger and the dashboard fetches heavy state only when the revision changes",
             "unattended_guardian": "the weekday guardian verifies the schedule clock, all 156 source events, exact-session eligibility, 08:30 acceptance, the three engine/Discord revisions, post-close flatness, public endpoints, and disk headroom; it re-arms existing systemd units but never invents data, signals, or fills",
@@ -3239,14 +3257,14 @@ def build_dashboard_snapshot(
             "fees": "gross commission and sell tax are charged first; earned commission rebate is recorded separately in economic NAV",
             "pnl_split": "realized net PnL uses simulated executable exits plus any explicitly tagged 13:30 terminal ledger flatten, with allocated entry and exit costs; unrealized net liquidation PnL values remaining shares at executable bid or ask after remaining costs; total net PnL is their reconciled sum",
             "comparison": "all strategies and benchmarks are compared as cumulative net return divided by their own capital basis; TX uses one-contract official initial margin, while 0050/2330 use one-board-lot entry notional",
-            "benchmarks": "0050/2330 are total-return benchmarks anchored to the retained actual session open: the completed-session official corporate-action archive is combined with the current session's official previous close and Shioaji/MIS reference price, so cash dividends and ETF distributions are reinvested and stock dividends or splits are adjusted exactly once without waiting until after close. Adjusted units are then marked at executable bid after tw_cash costs. TXFR1 has no cash distribution; it holds one real TX front-month contract across sessions. Before expiry it rolls only when the old bid and new ask coexist; after expiry it cash-settles the old month only at the official TAIFEX final settlement price and opens the new month at ask. The two bases stay separate, so the calendar spread is never booked as return; fees and statutory futures tax remain explicit",
+            "benchmarks": "0050/2330 are total-return reference curves anchored to each official session open. Completed-session corporate actions are applied exactly once; minute valuation uses the receipt-backed observed last trade and explicitly carries only the last observation when a minute has no trade, without interpolation. TXFR1 holds one front-month TX reference contract: it enters at the first receipt-backed 08:45 ask and values at the observed best bid attached to retained book/tick evidence, carrying only a prior observed quote when necessary. This is counterfactual reference valuation, not an exchange fill guarantee. Before expiry it rolls only when the old bid and new ask coexist; after expiry it uses official TAIFEX final settlement for the old month and opens the new month at ask. Calendar spread is never booked as return; fees and statutory futures tax remain explicit",
             "benchmark_history": (
                 "audited actual-open benchmark history is merged read-only with later live executable marks"
                 if benchmark_history.get("origins")
                 else benchmark_history.get("load_error")
                 or "live benchmark marks only; no historical origin file"
             ),
-            "depth_limit": "live entry quantity is bounded by independently verified eligibility, whole lots, price limits, displayed level-one depth, and after 09:01 completed-minute participation; historical 09:01 official-open replay is a separate counterfactual convention and never claims exchange depth, queue priority, or a guaranteed real-market fill",
+            "depth_limit": "live entry quantity is bounded by independently verified eligibility, whole lots, price limits, displayed level-one depth, and after 09:01 completed-minute participation. Missed-opening replay uses the official open only for sizing and the observed 09:01 minute VWAP for price; its full requested paper quantity is counterfactual and never claims exchange depth, queue priority, or a guaranteed real-market fill",
             "bracket_fill": "each mode moves TP and the local SL trigger one legal dated TW tick inward; this improves fill probability but does not guarantee a fill without a trigger and executable counterparty volume",
             "exit_schedule": "from 13:20 through 13:23 each unfilled exit is checked for a real cross and otherwise cancel-repriced once per new minute to the current passive best ask for a sell or best bid for a buy-to-cover; at 13:24 it is replaced by a marketable exit attempt",
             "terminal_flatten": "after the 13:30 auction simulation, every residual is closed in a simulation-only terminal ledger pass so a day-trade mode never carries overnight; this is explicitly tagged and is not claimed as an exchange fill",

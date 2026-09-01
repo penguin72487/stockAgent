@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+from dataclasses import replace
 from datetime import datetime, time as datetime_time, timedelta
 import fcntl
 import json
@@ -34,12 +35,14 @@ from stockagent.live.market_config import (  # noqa: E402
 from stockagent.live.market_status import verified_tw_stock_session_day  # noqa: E402
 from stockagent.live.quote_provider import (  # noqa: E402
     fetch_futures_snapshot_prefer_stream,
+    fetch_shioaji_historical_stock_0901_vwaps,
     fetch_shioaji_stock_snapshots,
     prepare_tw_price_limit_snapshot,
     warm_shioaji_stock_quote_client,
 )
 from stockagent.live.service_notify import notify_systemd  # noqa: E402
 from stockagent.live.tw_day_trade_simulation import (  # noqa: E402
+    ENTRY_FILL_POLICY_0901_MINUTE_VWAP,
     ENTRY_FILL_POLICY_CAUSAL_BOOK,
     LIVE_ENTRY_GATE,
     CLOSING_AUCTION_TIME,
@@ -66,6 +69,12 @@ _LEGACY_SIGNAL_SCAN_CACHE: dict[
     str, tuple[float, tuple[dict[str, Any], list[dict[str, Any]]] | None]
 ] = {}
 _BENCHMARK_PREVIOUS_CLOSE_CACHE: dict[tuple[str, str, str], dict[str, Any]] = {}
+MISSED_OPENING_COMMIT_DEADLINE = datetime_time(9, 0, 15)
+MISSED_OPENING_REPLAY_AT = datetime_time(9, 1)
+MISSED_OPENING_SOURCE_SETTLE_DEADLINE = datetime_time(9, 3)
+MISSED_OPENING_REPLAY_CONTRACT = (
+    "retrospective_official_open_signal_at_09_00_observed_09_01_minute_vwap_counterfactual"
+)
 
 
 def _opening_batch_max_wait_seconds() -> float:
@@ -100,6 +109,153 @@ def _pending_signal_retry_delay_seconds(result: str, observed: datetime) -> floa
 def _repo_path(value: str | Path) -> Path:
     path = Path(value)
     return path if path.is_absolute() else REPO_ROOT / path
+
+
+def _missed_opening_recovery_required(observed: datetime) -> bool:
+    """Switch an uncommitted opening to replay after the durable 09:00 SLO."""
+
+    return observed.timetz().replace(tzinfo=None) > MISSED_OPENING_COMMIT_DEADLINE
+
+
+def _missed_opening_receipt_path(state_dir: Path, observed: datetime) -> Path:
+    return (
+        Path(state_dir)
+        / "missed_opening_0901_prices"
+        / f"{observed.date().isoformat()}.json"
+    )
+
+
+def _load_missed_opening_prices(
+    state_dir: Path,
+    observed: datetime,
+) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+    path = _missed_opening_receipt_path(state_dir, observed)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return {}, {}
+    if (
+        not isinstance(payload, dict)
+        or payload.get("session_date") != observed.date().isoformat()
+    ):
+        return {}, {}
+    prices = payload.get("prices")
+    receipt = payload.get("query_receipt")
+    return (
+        {
+            str(symbol): dict(row)
+            for symbol, row in prices.items()
+            if isinstance(row, dict)
+        }
+        if isinstance(prices, dict)
+        else {},
+        dict(receipt) if isinstance(receipt, dict) else {},
+    )
+
+
+def _persist_missed_opening_prices(
+    state_dir: Path,
+    observed: datetime,
+    *,
+    prices: dict[str, dict[str, Any]],
+    query_receipt: dict[str, Any],
+) -> Path:
+    path = _missed_opening_receipt_path(state_dir, observed)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema_version": 1,
+        "session_date": observed.date().isoformat(),
+        "simulation_only": True,
+        "production_order_possible": False,
+        "inference_price_contract": "official_session_open_at_09_00",
+        "execution_price_contract": (
+            "right_labelled_09_01_minute_vwap_from_09_00_00_to_09_00_59_ticks"
+        ),
+        "missing_price_policy": "fail_closed_no_open_last_best_quote_or_tick_fallback",
+        "updated_at": datetime.now(TAIPEI).isoformat(timespec="seconds"),
+        "prices": prices,
+        "query_receipt": query_receipt,
+    }
+    temporary = path.with_suffix(path.suffix + f".tmp.{uuid.uuid4().hex}")
+    try:
+        with temporary.open("w", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
+                + "\n"
+            )
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return path
+
+
+def _resolve_missed_opening_prices(
+    state_dir: Path,
+    observed: datetime,
+    symbols: set[str],
+) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+    """Resume and durably receipt one quota-bounded 09:01 price query."""
+
+    cached, prior_receipt = _load_missed_opening_prices(state_dir, observed)
+    missing = sorted(set(symbols) - set(cached))
+    wall_time = observed.timetz().replace(tzinfo=None)
+    source_is_settling = wall_time < MISSED_OPENING_SOURCE_SETTLE_DEADLINE
+    prior_complete = bool(
+        prior_receipt
+        and not prior_receipt.get("error_counts")
+        and not int(prior_receipt.get("unqueried_symbols") or 0)
+        and not bool(prior_receipt.get("stopped_for_traffic"))
+    )
+    if missing and (not prior_complete or source_is_settling):
+        fetched, receipt = fetch_shioaji_historical_stock_0901_vwaps(
+            missing,
+            trading_date=observed.date(),
+            max_traffic_fraction=0.90,
+        )
+        cached.update({symbol: dict(row) for symbol, row in fetched.items()})
+        receipt = {
+            **receipt,
+            "requested_union_symbols": len(symbols),
+            "resolved_union_symbols": len(set(symbols) & set(cached)),
+            "unresolved_union_symbols": len(set(symbols) - set(cached)),
+            "source_settling": bool(
+                source_is_settling and set(symbols) - set(cached)
+            ),
+            "source_settle_deadline": datetime.combine(
+                observed.date(),
+                MISSED_OPENING_SOURCE_SETTLE_DEADLINE,
+                tzinfo=TAIPEI,
+            ).isoformat(timespec="seconds"),
+        }
+        _persist_missed_opening_prices(
+            state_dir,
+            observed,
+            prices=cached,
+            query_receipt=receipt,
+        )
+        return cached, receipt
+    if prior_receipt.get("source_settling") and not source_is_settling:
+        finalized_receipt = {
+            **prior_receipt,
+            "source_settling": False,
+            "source_finalized_at": observed.isoformat(timespec="seconds"),
+            "unresolved_union_symbols": len(set(symbols) - set(cached)),
+        }
+        _persist_missed_opening_prices(
+            state_dir,
+            observed,
+            prices=cached,
+            query_receipt=finalized_receipt,
+        )
+        return cached, finalized_receipt
+    return cached, prior_receipt
 
 
 def _acquire_engine_lock(state_dir: Path):
@@ -1339,9 +1495,11 @@ def main(argv: list[str] | None = None) -> int:
                 int,
                 int,
                 bool,
+                bool,
             ]
         ] = []
         pending_symbols: set[str] = set()
+        recovery_symbols: set[str] = set()
         pending_fallback: dict[str, float] = {}
         minute_key = observed.replace(second=0, microsecond=0).isoformat(
             timespec="minutes"
@@ -1401,6 +1559,9 @@ def main(argv: list[str] | None = None) -> int:
                 eligibility=eligibility,
             )
             eligibility_ms = (time_module.perf_counter() - eligibility_started) * 1000.0
+            missed_opening_recovery = _missed_opening_recovery_required(
+                detected_at
+            )
             pending.append(
                 (
                     spec,
@@ -1420,9 +1581,13 @@ def main(argv: list[str] | None = None) -> int:
                     int(opening_batch.get("observed_mode_count") or 1),
                     int(opening_batch.get("expected_mode_count") or 1),
                     bool(opening_batch.get("complete", True)),
+                    missed_opening_recovery,
                 )
             )
-            pending_symbols.update(candidate_symbols)
+            if missed_opening_recovery:
+                recovery_symbols.update(candidate_symbols)
+            else:
+                pending_symbols.update(candidate_symbols)
             pending_fallback.update(candidate_fallback)
 
         active_symbols, active_fallback = _active_symbols(engine)
@@ -1453,6 +1618,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         all_symbols = sorted(
             pending_symbols
+            | recovery_symbols
             | (set(active_symbols) if quote_due else set())
             | benchmark_symbols
         )
@@ -1492,6 +1658,24 @@ def main(argv: list[str] | None = None) -> int:
                     flush=True,
                 )
 
+        recovery_prices: dict[str, dict[str, Any]] = {}
+        recovery_price_receipt: dict[str, Any] = {}
+        if recovery_symbols and wall_time >= MISSED_OPENING_REPLAY_AT:
+            try:
+                recovery_prices, recovery_price_receipt = (
+                    _resolve_missed_opening_prices(
+                        engine.state_dir,
+                        observed,
+                        recovery_symbols,
+                    )
+                )
+            except Exception as exc:
+                print(
+                    "[tw-day-trade-sim] missed_opening_0901_price_error="
+                    f"{type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+
         future_snapshot: dict[str, Any] = {}
         if benchmark_due and specs:
             last_benchmark_minute = minute_key
@@ -1524,18 +1708,170 @@ def main(argv: list[str] | None = None) -> int:
             opening_batch_mode_count,
             opening_batch_expected_mode_count,
             opening_batch_complete,
+            missed_opening_recovery,
         ) in pending:
             try:
+                if missed_opening_recovery and wall_time < MISSED_OPENING_REPLAY_AT:
+                    pending_retry_after[spec.market] = (
+                        time_module.monotonic()
+                        + max(
+                            0.1,
+                            (
+                                observed.replace(
+                                    hour=9,
+                                    minute=1,
+                                    second=0,
+                                    microsecond=0,
+                                )
+                                - observed
+                            ).total_seconds(),
+                        )
+                    )
+                    continue
                 ledger_started = time_module.perf_counter()
+                register_spec = spec
+                register_summary = summary
+                register_quotes = quotes
                 register_observed = datetime.now(TAIPEI)
+                counterfactual_open_replay = False
+                if missed_opening_recovery:
+                    query_incomplete = bool(
+                        recovery_price_receipt.get("error_counts")
+                        or int(
+                            recovery_price_receipt.get("unqueried_symbols") or 0
+                        )
+                        or recovery_price_receipt.get("stopped_for_traffic")
+                        or recovery_price_receipt.get("source_settling")
+                    )
+                    candidate_symbols, _candidate_fallback = _entry_candidate_symbols(
+                        spec=spec,
+                        rows=rows,
+                        eligibility=eligibility,
+                    )
+                    missing_recovery = candidate_symbols - set(recovery_prices)
+                    if missing_recovery and (
+                        not recovery_price_receipt or query_incomplete
+                    ):
+                        pending_retry_after[spec.market] = (
+                            time_module.monotonic() + 5.0
+                        )
+                        print(
+                            "[tw-day-trade-sim] market="
+                            f"{spec.market} missed_opening_recovery=waiting_0901_price "
+                            f"missing={len(missing_recovery)}",
+                            flush=True,
+                        )
+                        continue
+                    missing_limits = {
+                        symbol
+                        for symbol in candidate_symbols & set(recovery_prices)
+                        if not (
+                            np.isfinite(
+                                float(
+                                    (quotes.get(symbol) or {}).get("upper_limit")
+                                    or 0.0
+                                )
+                            )
+                            and float(
+                                (quotes.get(symbol) or {}).get("upper_limit") or 0.0
+                            )
+                            > 0.0
+                            and np.isfinite(
+                                float(
+                                    (quotes.get(symbol) or {}).get("lower_limit")
+                                    or 0.0
+                                )
+                            )
+                            and float(
+                                (quotes.get(symbol) or {}).get("lower_limit") or 0.0
+                            )
+                            > 0.0
+                        )
+                    }
+                    if missing_limits:
+                        pending_retry_after[spec.market] = (
+                            time_module.monotonic() + 0.5
+                        )
+                        print(
+                            "[tw-day-trade-sim] market="
+                            f"{spec.market} missed_opening_recovery=waiting_price_limits "
+                            f"missing={len(missing_limits)}",
+                            flush=True,
+                        )
+                        continue
+                    replay_at = observed.replace(
+                        hour=9,
+                        minute=1,
+                        second=0,
+                        microsecond=0,
+                    )
+                    register_spec = replace(
+                        spec,
+                        entry_fill_policy=ENTRY_FILL_POLICY_0901_MINUTE_VWAP,
+                        entry_price_offset_ticks=0,
+                    )
+                    register_summary = {
+                        **summary,
+                        "simulation_replay": True,
+                        "replay_basis": (
+                            "official_09_00_open_inference_to_observed_09_01_minute_vwap"
+                        ),
+                        "replay_source": (
+                            "immutable_live_signal_official_open_and_shioaji_historical_ticks"
+                        ),
+                        "entry_fill_contract": MISSED_OPENING_REPLAY_CONTRACT,
+                        "entry_liquidity_assumption": (
+                            "full_requested_paper_quantity_at_observed_09_01_minute_vwap_"
+                            "without_exchange_fill_or_queue_claim"
+                        ),
+                        "replay_effective_signal_at": replay_at.isoformat(
+                            timespec="seconds"
+                        ),
+                        "missed_opening_recovery": True,
+                        "missed_opening_detected_at": detected_at.isoformat(
+                            timespec="seconds"
+                        ),
+                    }
+                    register_quotes = {}
+                    open_by_symbol = {
+                        str(row.get("symbol") or ""): float(
+                            row.get("open_price") or 0.0
+                        )
+                        for row in rows
+                    }
+                    for symbol in row_symbols:
+                        base_quote = dict(quotes.get(symbol) or {})
+                        price_row = recovery_prices.get(symbol) or {}
+                        price = float(
+                            price_row.get("execution_price_0901") or 0.0
+                        )
+                        valid_price = price if np.isfinite(price) and price > 0.0 else None
+                        register_quotes[symbol] = {
+                            **base_quote,
+                            "open": open_by_symbol.get(symbol) or None,
+                            "last": valid_price,
+                            "bid": None,
+                            "ask": None,
+                            "execution_price_0901": valid_price,
+                            "quote_at": replay_at.isoformat(timespec="seconds"),
+                            "historical_source_quote_at": price_row.get(
+                                "source_window_end"
+                            ),
+                            "source": price_row.get("source")
+                            or "missing_observed_09_01_minute_vwap",
+                            "entry_price_source": price_row.get("source"),
+                        }
+                    register_observed = replay_at
+                    counterfactual_open_replay = True
                 result = engine.register_signal(
-                    spec=spec,
-                    summary=summary,
+                    spec=register_spec,
+                    summary=register_summary,
                     signal_rows=rows,
-                    quotes=quotes,
+                    quotes=register_quotes,
                     eligibility=eligibility,
                     eligibility_coverage=coverage,
                     now=register_observed,
+                    counterfactual_open_replay=counterfactual_open_replay,
                 )
                 ledger_ms = (time_module.perf_counter() - ledger_started) * 1000.0
                 persisted_at = datetime.now(TAIPEI)

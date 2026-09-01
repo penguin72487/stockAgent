@@ -37,6 +37,11 @@ from stockagent.data.tw_index_derivatives_day import (
     TAIFEX_DERIVATIVE_SHORT_CANDIDATE_CONTRACT_VERSION,
     TAIFEX_INDEX_DERIVATIVE_ACTION_COUNT_V4,
 )
+from stockagent.data.tw_day_trade_execution import (
+    DAY_TRADE_MINUTE_EXECUTION_CONTRACT_VERSION,
+    DAY_TRADE_MINUTE_EXECUTION_POLICY_FULL_VOLUME,
+    DAY_TRADE_MINUTE_SOURCE_SCHEMA_VERSION,
+)
 from stockagent.data.panel_cache import array_content_fingerprint
 from stockagent.data.walkforward import WalkForwardFold, normalize_lookback_context
 from stockagent.models.factory import _feature_indices_from_patterns
@@ -979,6 +984,57 @@ def _trading_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
             contract["taiwan_execution"]["benchmark_alignment"] = (
                 "prior_adjusted_close_to_execution_close_v1"
             )
+        if (
+            execution_mode == "tw_day_trade"
+            and config.data.day_trade_minute_execution_root is not None
+            and config.data.day_trade_minute_execution_policy
+            == DAY_TRADE_MINUTE_EXECUTION_POLICY_FULL_VOLUME
+        ):
+            minute_root = Path(config.data.day_trade_minute_execution_root)
+            manifest_path = minute_root / "manifest.json"
+            if not manifest_path.is_file():
+                raise ValueError(
+                    "full-session day-trade checkpoint contract requires "
+                    f"minute manifest: {manifest_path}"
+                )
+            minute_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            minute_dates = minute_manifest.get("dates")
+            if not (
+                minute_manifest.get("schema_version")
+                == DAY_TRADE_MINUTE_SOURCE_SCHEMA_VERSION
+                and minute_manifest.get("source") == "shioaji_kbars_1m"
+                and minute_manifest.get("research_ready") is True
+                and minute_manifest.get("status") == "research_ready"
+                and isinstance(minute_dates, list)
+                and minute_dates
+            ):
+                raise ValueError(
+                    "full-session day-trade checkpoint contract requires a "
+                    "schema-compatible research_ready Shioaji minute manifest"
+                )
+            contract["taiwan_execution"]["minute_execution"] = {
+                "contract_version": int(
+                    DAY_TRADE_MINUTE_EXECUTION_CONTRACT_VERSION
+                ),
+                "policy": str(config.data.day_trade_minute_execution_policy),
+                "source_root": str(minute_root),
+                "source_manifest_sha256": hashlib.sha256(
+                    manifest_path.read_bytes()
+                ).hexdigest(),
+                "source_schema_version": int(
+                    DAY_TRADE_MINUTE_SOURCE_SCHEMA_VERSION
+                ),
+                "entry_window": "right_labelled_09_01_through_13_19",
+                "exit_window": "right_labelled_13_21_through_13_30",
+                "source_last_date": str(minute_dates[-1]),
+                "continuous_price": "minute_amount_divided_by_volume_shares",
+                "closing_auction_price": "official_close",
+                "unfilled_entry": "cancel_after_completed_13_20_bar",
+                "unfilled_exit": (
+                    "research_margin_or_short_conversion_at_official_close"
+                ),
+                "market_impact": "not_modeled_capacity_upper_bound",
+            }
         if str(trading.tw_corporate_action_mode) == "exact":
             contract["taiwan_execution"]["corporate_action_claim_queue_sessions"] = int(
                 trading.tw_corporate_action_claim_queue_sessions

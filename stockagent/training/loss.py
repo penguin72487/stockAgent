@@ -1275,6 +1275,7 @@ def risk_aware_loss(
     overnight_log_returns: Tensor | None = None,
     can_short_open_open_mask: Tensor | None = None,
     day_trade_execution_initial_capital: float = 1_000_000.0,
+    day_trade_execution_volume_participation: float = 0.50,
     symbol_sharded_ledger: bool = False,
 ) -> Tensor:
     """Risk-aware loss with configurable objective, including excess-CVaR-drawdown."""
@@ -1772,6 +1773,9 @@ def risk_aware_loss(
         symbol_indices=symbol_indices,
         overnight_returns=overnight_log_returns,
         day_trade_execution_initial_capital=day_trade_execution_initial_capital,
+        day_trade_execution_volume_participation=(
+            day_trade_execution_volume_participation
+        ),
         symbol_sharded_ledger=symbol_sharded_ledger,
     )
     _loss_timer_stop("backtest", backtest_start)

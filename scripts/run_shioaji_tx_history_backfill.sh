@@ -19,6 +19,7 @@ TARGET_FILE="$RUN_ROOT/target_end_date.txt"
 BATCH_RECEIPT="$RUN_ROOT/latest_batch.json"
 ALIAS_FILE="${SHIOAJI_FUTURES_ALIAS_FILE:-data_tw_futures/shioaji_contracts/continuous_contracts.csv}"
 CALENDAR_FILE="${SHIOAJI_FUTURES_HISTORY_CALENDAR_FILE:-data_tw_index_futures/day_session_contracts.parquet}"
+QUERY_CALENDAR_FILE="$RUN_ROOT/receipt_verified_query_calendar.parquet"
 mkdir -p "$RUN_ROOT"
 exec 9>"$RUN_ROOT/runner.lock"
 flock -n 9 || exit 3
@@ -112,24 +113,54 @@ PY
 )
 
 resolve_targets() {
-  run_fintech_python - "$CALENDAR_FILE" <<'PY'
+  run_fintech_python - "$CALENDAR_FILE" "$QUERY_CALENDAR_FILE" <<'PY'
+import os
 from pathlib import Path
+import sys
+
 import polars as pl
 
-from stockagent.live.shioaji_schedule import previous_tw_stock_session
+from stockagent.live.shioaji_schedule import latest_completed_tw_stock_session
 
-calendar_path = Path(__import__("sys").argv[1])
-expected_latest = previous_tw_stock_session(parquet_root=Path("data_tw_public"))
-calendar_latest = (
+calendar_path = Path(sys.argv[1])
+query_calendar_path = Path(sys.argv[2])
+expected_latest = latest_completed_tw_stock_session(parquet_root=Path("data_tw_public"))
+calendar = (
     pl.scan_parquet(calendar_path)
-    .filter((pl.col("product") == "TX") & (pl.col("date") <= pl.lit(expected_latest)))
-    .select(pl.col("date").max())
+    .filter(
+        (pl.col("product") == "TX")
+        & (pl.col("date") <= pl.lit(expected_latest))
+    )
+    .select("date")
+    .unique()
+    .sort("date")
     .collect()
-    .item()
 )
+calendar_latest = calendar.get_column("date").max()
 if calendar_latest is None:
     raise SystemExit("official TX calendar contains no completed TX session")
-print(calendar_latest.isoformat(), expected_latest.isoformat())
+query_dates = calendar
+if calendar_latest < expected_latest:
+    # The public TAIEX session calendar is receipt-verified before
+    # latest_completed_tw_stock_session can return today.  Adding that date
+    # only expands the Shioaji query selector; downloaded prices still need a
+    # receipt and payload hash and can remain source-empty.
+    query_dates = pl.concat(
+        [calendar, pl.DataFrame({"date": [expected_latest]})],
+        how="vertical_relaxed",
+    ).unique().sort("date")
+query_calendar_path.parent.mkdir(parents=True, exist_ok=True)
+temporary = query_calendar_path.with_suffix(query_calendar_path.suffix + ".tmp")
+query_dates.with_columns(pl.lit("TX").alias("product")).select(
+    "product", "date"
+).write_parquet(temporary)
+os.replace(temporary, query_calendar_path)
+query_latest = query_dates.get_column("date").max()
+print(
+    query_latest.isoformat(),
+    expected_latest.isoformat(),
+    calendar_latest.isoformat(),
+)
 PY
 }
 
@@ -209,12 +240,12 @@ PY
 
 echo "[shioaji-futures-history-runner] started=$(TZ=Asia/Taipei date --iso-8601=seconds) contracts=${#CONTRACTS[@]} max_traffic_fraction=$MAX_TRAFFIC_FRACTION cutoff=07:45 resume=14:31 calendar=$CALENDAR_FILE"
 while true; do
-  read -r END_DATE EXPECTED_LATEST_DATE <<< "$(resolve_targets)"
+  read -r END_DATE EXPECTED_LATEST_DATE OFFICIAL_TX_CALENDAR_LATEST <<< "$(resolve_targets)"
   temporary_target="$TARGET_FILE.tmp"
   printf '%s\n' "$END_DATE" > "$temporary_target"
   mv "$temporary_target" "$TARGET_FILE"
-  if [[ "$END_DATE" != "$EXPECTED_LATEST_DATE" ]]; then
-    echo "[shioaji-futures-history-runner] calendar_lag=true target_end_date=$END_DATE expected_latest_completed_session=$EXPECTED_LATEST_DATE source=$CALENDAR_FILE"
+  if [[ "$OFFICIAL_TX_CALENDAR_LATEST" != "$EXPECTED_LATEST_DATE" ]]; then
+    echo "[shioaji-futures-history-runner] calendar_lag=true official_calendar_latest=$OFFICIAL_TX_CALENDAR_LATEST query_target=$END_DATE expected_latest_completed_session=$EXPECTED_LATEST_DATE query_selector_source=receipt_verified_taiex_session source=$CALENDAR_FILE"
   fi
   if batch_is_current "$END_DATE"; then
     echo "[shioaji-futures-history-runner] target_current=true end_date=$END_DATE waiting_seconds=$TARGET_RECHECK_SECONDS reason=await_official_calendar_advance"
@@ -229,7 +260,7 @@ while true; do
   contract_index=0
   for contract in "${CONTRACTS[@]}"; do
     if (( contract_index % TARGET_CHECK_CONTRACTS == 0 )); then
-      read -r OBSERVED_END_DATE OBSERVED_EXPECTED_LATEST <<< "$(resolve_targets)"
+      read -r OBSERVED_END_DATE OBSERVED_EXPECTED_LATEST OBSERVED_OFFICIAL_LATEST <<< "$(resolve_targets)"
       if [[ "$OBSERVED_END_DATE" != "$END_DATE" ]]; then
         echo "[shioaji-futures-history-runner] target_advanced=true previous_end_date=$END_DATE new_end_date=$OBSERVED_END_DATE action=restart_batch"
         target_advanced=true
@@ -265,7 +296,7 @@ while true; do
       run_fintech_python -m downloader.download_shioaji_tx_futures_ticks \
         --simulation \
         --contract "$contract" \
-        --calendar-path "$CALENDAR_FILE" \
+        --calendar-path "$QUERY_CALENDAR_FILE" \
         --output-dir "$output_dir" \
         --end-date "$END_DATE" \
         --max-traffic-fraction "$MAX_TRAFFIC_FRACTION"
