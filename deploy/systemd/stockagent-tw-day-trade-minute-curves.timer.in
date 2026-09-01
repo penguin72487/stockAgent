@@ -1,0 +1,17 @@
+[Unit]
+Description=Keep TW day-trade replay curves at one-minute grain
+
+[Timer]
+# Week-based calendar points avoid competing with the protected live window.
+OnCalendar=Mon..Fri *-*-* 05:30:00 Asia/Taipei
+OnCalendar=Mon..Fri *-*-* 07:30:00 Asia/Taipei
+OnCalendar=Mon..Fri *-*-* 14:35:00 Asia/Taipei
+OnCalendar=Mon..Fri *-*-* 15:30:00 Asia/Taipei
+OnCalendar=Mon..Fri *-*-* 18:00:00 Asia/Taipei
+AccuracySec=1s
+RandomizedDelaySec=0
+Persistent=true
+Unit=stockagent-tw-day-trade-minute-curves.service
+
+[Install]
+WantedBy=timers.target

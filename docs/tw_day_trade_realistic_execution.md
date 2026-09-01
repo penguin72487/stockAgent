@@ -1,13 +1,96 @@
 # 台股日當沖分鐘級紙上執行契約
 
-這份文件描述 `stockagent.live.tw_day_trade_simulation` schema 3，以及
+這份文件描述 `stockagent.live.tw_day_trade_simulation`，以及
 `configs/markets/tw_day_trade_1m_realistic.yaml` 的每日模型分鐘成交 loss。
 紙上交易不會呼叫券商下單 API；新訓練契約使用獨立 artifact root，舊日頻
 checkpoint 不可續訓。
 
-## 每日模型的訓練 loss
+## Multi-Basis 逐分鐘 100% 成交量模式
 
-模型仍然每天只輸出一次 signed target weights，不是每分鐘重新決策。執行
+`configs/markets/tw_day_trade_daily_multi_basis_projection_l1_minute_volume100_capital10m.yaml`
+是獨立的新研究模式。它沿用正式 1,000 萬 Multi-Basis Projection-L1
+模型、BF16、費稅、點時資格、T+2 淨額與 walk-forward 契約，只替換
+executor：
+
+- 09:00 使用已完成日資料與當日已觀測開盤資訊，凍結一次 signed target
+  和官方開盤價換算的整張數；模型不會在盤中重算訊號。
+- 同一張進場單依序使用右標 09:01--13:19 K 棒。每分鐘成交量上限為
+  `floor(1.0 * volume_shares / 1000) * 1000`；不足部分延續到下一分鐘。
+- 13:20 取消尚未成交的進場餘額。退出單從下一個因果可執行的 13:21 K
+  棒開始，逐分鐘使用 13:21--13:30；無連續交易的分鐘自然是零量，13:30
+  是收盤集合競價。
+- 連續市場價格為該分鐘 `Amount / volume_shares` VWAP；13:30 使用正式
+  closing-auction close。缺價、缺量或來源單位未通過稽核時，該分鐘容量為
+  零，不以 close、昨收或插值補成交。
+- 13:30 後仍未退出的部位不冒充市場成交。它沿用本文件既有研究假設，按
+  正式收盤價轉融資／融券會計結清、收一般費稅與壓力成本，只把淨差額放入
+  T+2 queue。
+
+100% participation 是「我們可以拿到歷史分鐘全部成交量、且自己的訂單不會
+改變價格或成交量」的反事實容量上界。當訂單等於市場全部成交量時，這個
+price-taking 假設必然忽略市場衝擊、排隊順位與其他交易者反應，因此報表
+不可標為真實可成交績效；正式上線前仍須用 Tick/BidAsk 與較低 participation
+做壓力測試。
+
+資料不另造下載器，使用 canonical `data_tw_minute/research_dataset`。完整
+準備與稽核命令：
+
+```bash
+cd /path/to/stockAgent
+source scripts/runtime_env.sh
+
+# 若 receipt-backed research dataset 尚未建立：
+run_fintech_python scripts/build_shioaji_tw_minute_dataset.py \
+  --input-root data_tw_minute/shioaji_1m \
+  --output-root data_tw_minute/research_dataset
+
+# 訓練前必須驗證全部 partitions 與 manifest SHA；不得只看 manifest 名稱。
+run_fintech_python scripts/audit_shioaji_tw_minute_dataset.py \
+  --dataset-root data_tw_minute/research_dataset \
+  --all-partitions \
+  --output artifacts/validation/tw_day_trade_minute_volume100_data_audit.json
+```
+
+2026-09-01 本機已實際完成上述全量稽核：schema 4、1,585 partitions、
+309,756,178 列、2020-03-02 至 2026-08-28、最多每日 2,313 檔，
+`failures={}`。這是目前可訓練的完整邊界；原始 hot-tail 雖已有較新的局部
+資料，未完成全市場重建與 receipt 前不混入正式訓練集。
+
+先跑一個 fold、一個 epoch 的 bounded real-data smoke；目前完整 panel 實測會
+建立 9,446,333,848 bytes（約 9.45 GB）的
+memory-mapped execution tape cache，來源 manifest、panel 日期、symbols 與
+官方開盤價任一改變都會換 cache key：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 run_fintech_python train.py \
+  --config configs/markets/tw_day_trade_daily_multi_basis_projection_l1_minute_volume100_capital10m.yaml \
+  --output-dir artifacts/smoke/tw_day_trade_multi_basis_minute_volume100_fold1 \
+  --start-fold 1 --max-folds 1 --epochs 1 --no-resume --profile-timing \
+  --multi-gpu-strategy none
+```
+
+smoke 與 artifact contract 通過後，正式訓練：
+
+```bash
+run_fintech_python train.py \
+  --config configs/markets/tw_day_trade_daily_multi_basis_projection_l1_minute_volume100_capital10m.yaml \
+  --profile-timing
+```
+
+2026-09-01 的單卡 RTX 5070 Ti 實測 smoke 已完成 lifecycle 與九張必要
+walk-forward 圖：首次 panel+tape 冷建構 1,098.3 秒，兩個 cache 命中後為
+2.8 秒；真實 compiled forward/backward probe 145.6 秒，epoch 1 為 132.3 秒，
+GPU 高點約 15.83/16.30 GiB。該單一 epoch 的 turnover 為零，原因是初始
+Projection-L1 權重分散到 2,749 檔後多數不足一張；測試已確認 exact-forward
+保持零張而 STE gradient 非零。這只證明管線可訓練，不是績效結論。
+
+這個 config 尚未加入 Discord/公開網頁的 enabled markets。必須等訓練完成、
+checkpoint/artifact gate 通過並建立獨立 deployment manifest 後才能啟用；不能
+讓不存在或未完成的 checkpoint 使現行三個紙上模式降級。
+
+## 既有 50% event-tape 每日模型 loss
+
+既有模式仍然每天只輸出一次 signed target weights，不是每分鐘重新決策。執行
 label 由 `stockagent.data.tw_day_trade_execution` 壓成 `[日期, 股票, 17]`：
 
 - 官方開盤價只負責把權重換算成整張股數；09:01 第一根完成 K 的
@@ -27,9 +110,9 @@ label 由 `stockagent.data.tw_day_trade_execution` 壓成 `[日期, 股票, 17]`
 虛構第一檔深度或排隊順位。即時紙上執行則額外取 `min(L1, 50% minute K)`；
 兩者的差異屬於資料可觀測性，不得將分鐘 K 回測宣稱為逐筆委託簿重播。
 
-目前稽核資料共有 1,567 個交易日，從 2020-03-02 到 2026-08-04。訓練
+目前稽核資料共有 1,585 個交易日，從 2020-03-02 到 2026-08-28。訓練
 panel 因此從 2020-03-02 開始；2014--2020 缺分鐘路徑的日期不會退回舊
-open-to-close proxy。第一次建立 279 MiB execution tape 後會按來源 manifest、
+open-to-close proxy。第一次建立約 282 MiB execution tape 後會按來源 manifest、
 日期、symbols 與官方開盤價指紋快取。
 
 ## 訓練指令與計算極限
@@ -136,5 +219,5 @@ T+2 收盤後才進現金，因此下一次模型真正可用於下單 sizing �
 - 目前訓練契約不保存殘部股票，但會跨 batch 保存 T+2 淨差額 queue；在無限
   融資假設下 `settlement_default` 維持 false。真實帳戶仍需確認券商契約、
   融資融券資格與 T 日申報結果；這個簡化不可用來估計追繳或斷頭風險。
-- 新訓練 loss 已包含 09:01、13:20--13:24 與 13:30 狀態；但沒有歷史
+- 舊 17-field 訓練 loss 已包含 09:01、13:20--13:24 與 13:30 狀態；但沒有歷史
   L1，所以不估計真實排隊順位、撤單或超過分鐘 VWAP 的市場衝擊。

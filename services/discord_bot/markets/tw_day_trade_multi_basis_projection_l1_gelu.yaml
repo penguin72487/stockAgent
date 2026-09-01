@@ -22,7 +22,8 @@ day_trade_quote_interval_seconds: 60
 
 # 09:00 starts the live signal. Once published, paper execution uses the first
 # strictly later best Ask/Bid with no +1 Tick fallback. Historical replay alone
-# uses the 09:01 observed official session open.
+# sizes from the official 09:00 open and executes at the observed right-labelled
+# 09:01 minute VWAP.
 
 pre_signal_command:
   - scripts/activate_tw_public_opening_data.py

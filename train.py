@@ -1339,6 +1339,7 @@ def main() -> None:
                 panel_symbols=panel.symbols,
                 official_open_prices=panel.open_prices,
                 cache_dir=config.data.day_trade_minute_execution_cache_dir,
+                policy=config.data.day_trade_minute_execution_policy,
             )
 
         if _distributed_ready() and _distributed_world_size() > 1:

@@ -12458,6 +12458,9 @@ def _run_eval_backtest_from_weight_buffers(
                         and execution_runtime.mode == "tw_index_futures_day"
                         else float(volume_participation_equity)
                     ),
+                    day_trade_execution_volume_participation=(
+                        float(max_volume_participation)
+                    ),
                 )
         except RuntimeError as exc:
             raise RuntimeError(
@@ -19975,6 +19978,9 @@ def _run_training_impl(
         == "tw_index_futures_day"
         else config.trading.volume_participation_equity
     )
+    risk_loss_kwargs["day_trade_execution_volume_participation"] = float(
+        config.trading.max_volume_participation
+    )
     risk_loss_kwargs["net_exposure_weight"] = config.training.multitask_loss.net_exposure_weight
     risk_loss_kwargs["log_utility_periods_per_year"] = (
         config.evaluation.eval_log_utility_periods_per_year
@@ -21102,7 +21108,7 @@ def _run_training_impl(
             execution_runtime.mode == "tw_day_trade"
             and train_windowed is not None
             and train_windowed.overnight_log_returns is not None
-            and train_windowed.overnight_log_returns.dim() == 3
+            and train_windowed.overnight_log_returns.dim() in {3, 4}
         )
         tw_settlement_compile_backend = _tw_settlement_compile_backend(
             execution_runtime,

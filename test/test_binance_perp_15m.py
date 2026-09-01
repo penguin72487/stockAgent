@@ -113,6 +113,30 @@ def test_binance_overlap_replaces_tail_and_preserves_prior_features() -> None:
     assert merged["prior_funding_feature"].item() == 0.001
 
 
+def test_binance_existing_date_uses_valid_redundant_close_time() -> None:
+    open_time = 1_780_000_100_000
+    frame = binance._normalize_candles([_raw_candle(open_time)]).with_columns(
+        pl.lit("2026-08-24 18:25:08").alias("date")
+    )
+
+    repaired = binance._normalize_date_frame(frame)
+
+    assert repaired["date"].item() == binance._ms_to_date_string(open_time)
+
+
+def test_binance_existing_date_does_not_trust_invalid_close_boundary() -> None:
+    frame = pl.DataFrame(
+        {
+            "date": ["2026-08-24 18:25:08"],
+            "binance_close_time_ms": [1_780_000_159_123],
+        }
+    )
+
+    normalized = binance._normalize_date_frame(frame)
+
+    assert normalized["date"].item() == "2026-08-24 18:25:08"
+
+
 def test_binance_symbol_download_paginates_and_publishes_atomically(
     tmp_path: Path,
 ) -> None:

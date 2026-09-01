@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
-from datetime import datetime
+from datetime import datetime, timedelta
 import fcntl
 import hashlib
 import json
@@ -41,6 +41,12 @@ OFFICIAL_OPEN_ENTRY_POLICY = "official_open_at_09_01"
 OFFICIAL_OPEN_REPLAY_CONTRACT = (
     "retrospective_official_session_open_at_09_01_counterfactual"
 )
+MINUTE_VWAP_0901_ENTRY_POLICY = "official_open_signal_0900_execute_0901_vwap"
+MINUTE_VWAP_0901_REPLAY_CONTRACT = (
+    "retrospective_official_open_signal_at_09_00_observed_09_01_minute_vwap_counterfactual"
+)
+MINUTE_CURVE_CONTRACT = "right_labelled_historical_last_trade_mark_v1"
+MINUTE_CURVE_SESSION_POINTS = 270
 
 
 def _sha256(path: Path) -> str:
@@ -66,6 +72,132 @@ def _load_object(path: Path) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError(f"JSON root is not an object: {path}")
     return payload
+
+
+def _validate_minute_curve_coverage(
+    candidate: Path,
+    *,
+    completed_session_dates: list[str],
+    expected_markets: set[str],
+    failures: list[str],
+) -> dict[str, Any]:
+    """Require every completed replay session to ship a minute-grain curve."""
+
+    if not completed_session_dates:
+        return {
+            "required": False,
+            "completed_session_dates": [],
+            "validated_rows": 0,
+        }
+    receipt_path = candidate / "minute_curve_receipt.json"
+    marks_path = candidate / "marks.jsonl"
+    benchmark_path = candidate / "benchmark_history.json"
+    if not receipt_path.is_file():
+        failures.append(
+            "minute_curve_receipt.json is required for every completed replay session"
+        )
+        return {
+            "required": True,
+            "completed_session_dates": completed_session_dates,
+            "validated_rows": 0,
+        }
+    try:
+        receipt = _load_object(receipt_path)
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        failures.append(f"invalid minute_curve_receipt.json: {type(exc).__name__}:{exc}")
+        return {
+            "required": True,
+            "completed_session_dates": completed_session_dates,
+            "validated_rows": 0,
+        }
+
+    strategy = receipt.get("strategy")
+    strategy = strategy if isinstance(strategy, dict) else {}
+    coverage = receipt.get("coverage_after_fetch")
+    coverage = coverage if isinstance(coverage, dict) else {}
+    outputs = receipt.get("outputs")
+    outputs = outputs if isinstance(outputs, dict) else {}
+    expected_rows = (
+        len(completed_session_dates)
+        * len(expected_markets)
+        * MINUTE_CURVE_SESSION_POINTS
+    )
+    if receipt.get("simulation_only") is not True:
+        failures.append("minute curve receipt is not simulation_only=true")
+    if receipt.get("production_order_possible") is not False:
+        failures.append("minute curve receipt does not prohibit production orders")
+    if str(receipt.get("minute_contract") or "") != MINUTE_CURVE_CONTRACT:
+        failures.append("minute curve receipt has the wrong one-minute contract")
+    if receipt.get("linear_interpolation_used") is not False:
+        failures.append("minute curve receipt permits linear interpolation")
+    if receipt.get("accepted_09_01_strategy_and_13_30_endpoints_preserved") is not True:
+        failures.append("minute curve receipt did not preserve accepted endpoints")
+    if int(coverage.get("missing_pairs") or 0) != 0:
+        failures.append("minute curve receipt still has missing symbol-date pairs")
+    if sorted(str(value) for value in strategy.get("session_dates") or ()) != completed_session_dates:
+        failures.append("minute curve session dates do not match completed replay sessions")
+    if {str(value) for value in strategy.get("markets") or ()} != expected_markets:
+        failures.append("minute curve markets do not match the promoted mode set")
+    if int(strategy.get("generated_rows") or 0) != expected_rows:
+        failures.append(
+            "minute curve generated row count does not equal "
+            f"{MINUTE_CURVE_SESSION_POINTS} points per completed session and mode"
+        )
+    if str(receipt.get("start_date") or "") != completed_session_dates[0]:
+        failures.append("minute curve start date does not match the replay start")
+    if str(receipt.get("end_date") or "") != completed_session_dates[-1]:
+        failures.append("minute curve end date does not match the latest completed replay")
+
+    for path, key in (
+        (marks_path, "marks"),
+        (benchmark_path, "benchmark_history"),
+    ):
+        output = outputs.get(key)
+        output = output if isinstance(output, dict) else {}
+        if not path.is_file():
+            failures.append(f"minute curve output is missing: {path.name}")
+        elif str(output.get("sha256") or "") != _sha256(path):
+            failures.append(f"minute curve output hash mismatch: {path.name}")
+
+    observed: dict[tuple[str, str], set[str]] = {}
+    if marks_path.is_file():
+        with marks_path.open("r", encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, start=1):
+                try:
+                    row = json.loads(line)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    failures.append(f"marks.jsonl:{line_number}: invalid JSON")
+                    continue
+                if not isinstance(row, dict):
+                    continue
+                session_date = str(row.get("session_date") or "")
+                market = str(row.get("market") or "")
+                if session_date not in completed_session_dates or market not in expected_markets:
+                    continue
+                observed.setdefault((session_date, market), set()).add(
+                    str(row.get("minute") or "")
+                )
+    for session_date in completed_session_dates:
+        base = datetime.fromisoformat(f"{session_date}T09:01:00+08:00")
+        expected_minutes = {
+            (base + timedelta(minutes=offset)).isoformat(timespec="minutes")
+            for offset in range(MINUTE_CURVE_SESSION_POINTS)
+        }
+        for market in expected_markets:
+            actual = observed.get((session_date, market), set())
+            if actual != expected_minutes:
+                failures.append(
+                    f"{session_date}/{market}: minute curve does not contain exactly "
+                    "09:01 through 13:30"
+                )
+    return {
+        "required": True,
+        "contract": str(receipt.get("minute_contract") or ""),
+        "completed_session_dates": completed_session_dates,
+        "points_per_session_mode": MINUTE_CURVE_SESSION_POINTS,
+        "validated_rows": sum(len(values) for values in observed.values()),
+        "receipt_sha256": _sha256(receipt_path),
+    }
 
 
 def _validate_hybrid_signal_ledger(
@@ -306,6 +438,120 @@ def _validate_official_open_fill_ledger(
     return {"fill_ledger_official_open_fills": fill_count}
 
 
+def _validate_0901_vwap_signal_ledger(
+    candidate: Path,
+    *,
+    expected_fills: int,
+    failures: list[str],
+) -> dict[str, int]:
+    path = candidate / "signals.jsonl"
+    if not path.is_file():
+        failures.append("09:01 VWAP replay has no signals.jsonl audit ledger")
+        return {"minute_vwap_0901_fills": 0}
+    fill_count = 0
+    with path.open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                failures.append(f"signals.jsonl:{line_number}: invalid JSON")
+                continue
+            if str(row.get("entry_fill_policy") or "") != MINUTE_VWAP_0901_ENTRY_POLICY:
+                continue
+            if int(row.get("filled_shares") or 0) <= 0:
+                continue
+            fill_count += 1
+            try:
+                execution_price = float(row.get("execution_price"))
+                sizing_open = float(row.get("sizing_open_price"))
+                recorded_at = datetime.fromisoformat(str(row.get("recorded_at")))
+            except (TypeError, ValueError):
+                failures.append(
+                    f"signals.jsonl:{line_number}: malformed 09:01 VWAP fill"
+                )
+                continue
+            source = str(row.get("entry_price_source") or "")
+            if (
+                row.get("counterfactual_0901_price_fill") is not True
+                or row.get("counterfactual_open_price_fill") is not False
+                or row.get("synthetic_fill") is not False
+                or row.get("synthetic_fallback_fill") is not False
+                or row.get("paper_market_fill") is not False
+                or int(row.get("entry_price_offset_ticks") or 0) != 0
+                or not math.isfinite(execution_price)
+                or execution_price <= 0.0
+                or not math.isfinite(sizing_open)
+                or sizing_open <= 0.0
+                or "0901" not in source.replace(":", "").replace("_", "")
+                or recorded_at.hour != 9
+                or recorded_at.minute != 1
+            ):
+                failures.append(
+                    f"signals.jsonl:{line_number}: 09:00-open/09:01-VWAP contract mismatch"
+                )
+    if fill_count != expected_fills:
+        failures.append(
+            f"signals ledger 09:01 VWAP fills={fill_count} receipt={expected_fills}"
+        )
+    return {"minute_vwap_0901_fills": fill_count}
+
+
+def _validate_0901_vwap_fill_ledger(
+    candidate: Path,
+    *,
+    expected_fills: int,
+    failures: list[str],
+) -> dict[str, int]:
+    path = candidate / "fills.jsonl"
+    if not path.is_file():
+        failures.append("09:01 VWAP replay has no fills.jsonl audit ledger")
+        return {"fill_ledger_minute_vwap_0901_fills": 0}
+    fill_count = 0
+    with path.open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                failures.append(f"fills.jsonl:{line_number}: invalid JSON")
+                continue
+            if (
+                str(row.get("purpose") or "") != "entry"
+                or str(row.get("fill_contract") or "")
+                != MINUTE_VWAP_0901_REPLAY_CONTRACT
+            ):
+                continue
+            fill_count += 1
+            try:
+                price = float(row.get("price"))
+                fill_at = datetime.fromisoformat(str(row.get("fill_at")))
+            except (TypeError, ValueError):
+                failures.append(
+                    f"fills.jsonl:{line_number}: malformed 09:01 VWAP fill"
+                )
+                continue
+            if (
+                str(row.get("entry_fill_policy") or "")
+                != MINUTE_VWAP_0901_ENTRY_POLICY
+                or row.get("counterfactual_0901_price_fill") is not True
+                or row.get("counterfactual_open_price_fill") is not False
+                or row.get("synthetic_fill") is not False
+                or row.get("synthetic_fallback_fill") is not False
+                or row.get("paper_market_fill") is not False
+                or not math.isfinite(price)
+                or price <= 0.0
+                or fill_at.hour != 9
+                or fill_at.minute != 1
+            ):
+                failures.append(
+                    f"fills.jsonl:{line_number}: 09:01 VWAP contract mismatch"
+                )
+    if fill_count != expected_fills:
+        failures.append(
+            f"fills ledger 09:01 VWAP fills={fill_count} receipt={expected_fills}"
+        )
+    return {"fill_ledger_minute_vwap_0901_fills": fill_count}
+
+
 def _validate_rebuild(
     candidate: Path,
     *,
@@ -343,6 +589,7 @@ def _validate_rebuild(
     best_quote_fills = 0
     synthetic_fallback_fills = 0
     official_open_fills = 0
+    minute_vwap_0901_fills = 0
     current_date = datetime.now(TAIPEI).date().isoformat()
     current_open_session: str | None = None
     for session_index, session in enumerate(sessions):
@@ -397,9 +644,30 @@ def _validate_rebuild(
                 official_open_count = int(
                     entry.get("entry_official_open_fill_count") or 0
                 )
+                minute_vwap_0901_count = int(
+                    entry.get("entry_0901_vwap_fill_count") or 0
+                )
                 best_quote_fills += exact_count
                 synthetic_fallback_fills += fallback_count
                 official_open_fills += official_open_count
+                minute_vwap_0901_fills += minute_vwap_0901_count
+                if policy == MINUTE_VWAP_0901_ENTRY_POLICY:
+                    if receipt_entry_contract != MINUTE_VWAP_0901_REPLAY_CONTRACT:
+                        failures.append(
+                            f"{session_date}/{market}: 09:01 VWAP replay contract is not explicit"
+                        )
+                    if minute_vwap_0901_count != fill_count:
+                        failures.append(
+                            f"{session_date}/{market}: 09:01 VWAP fill counts do not reconcile"
+                        )
+                    if (
+                        entry.get("entry_fill_is_synthetic") is True
+                        or fallback_count
+                        or official_open_count
+                    ):
+                        failures.append(
+                            f"{session_date}/{market}: 09:01 VWAP fill uses a forbidden fallback"
+                        )
                 if policy == OFFICIAL_OPEN_ENTRY_POLICY:
                     if receipt_entry_contract != OFFICIAL_OPEN_REPLAY_CONTRACT:
                         failures.append(
@@ -458,6 +726,7 @@ def _validate_rebuild(
         mode_is_hybrid = mode_policy == HYBRID_ENTRY_POLICY
         mode_is_paper_market = mode_policy == PAPER_MARKET_ENTRY_POLICY
         mode_is_official_open = mode_policy == OFFICIAL_OPEN_ENTRY_POLICY
+        mode_is_0901_vwap = mode_policy == MINUTE_VWAP_0901_ENTRY_POLICY
         if mode_policy == "synthetic_open_tick" or (
             mode.get("entry_fill_is_synthetic") is True
             and not (mode_is_hybrid or mode_is_paper_market)
@@ -480,6 +749,13 @@ def _validate_rebuild(
         ):
             failures.append(
                 f"{market}: official-open final state has no matching receipt"
+            )
+        if (
+            mode_is_0901_vwap
+            and receipt_entry_contract != MINUTE_VWAP_0901_REPLAY_CONTRACT
+        ):
+            failures.append(
+                f"{market}: 09:01 VWAP final state has no matching receipt"
             )
         positions = mode.get("positions")
         if not isinstance(positions, dict):
@@ -510,6 +786,8 @@ def _validate_rebuild(
                 allowed_contracts.add(PAPER_MARKET_REPLAY_CONTRACT)
             if mode_is_official_open:
                 allowed_contracts.add(OFFICIAL_OPEN_REPLAY_CONTRACT)
+            if mode_is_0901_vwap:
+                allowed_contracts.add(MINUTE_VWAP_0901_REPLAY_CONTRACT)
             if mode.get("entry_fill_contract") not in allowed_contracts:
                 failures.append(f"{market}: current entry fill contract is invalid")
             if mode.get("entry_fill_is_synthetic") is not False and not (
@@ -534,6 +812,13 @@ def _validate_rebuild(
                 if position.get("counterfactual_open_replay") is not True:
                     failures.append(
                         f"{market}/{symbol}: position is not counterfactual replay"
+                    )
+                if mode_is_0901_vwap and (
+                    position.get("counterfactual_0901_price_fill") is not True
+                    or position.get("counterfactual_open_price_fill") is not False
+                ):
+                    failures.append(
+                        f"{market}/{symbol}: position is not an observed 09:01 VWAP fill"
                     )
                 if (
                     position.get("entry_fill_is_synthetic") is not False
@@ -571,6 +856,31 @@ def _validate_rebuild(
                 failures=failures,
             )
         )
+    elif receipt_entry_contract == MINUTE_VWAP_0901_REPLAY_CONTRACT:
+        signal_ledger_validation = _validate_0901_vwap_signal_ledger(
+            candidate,
+            expected_fills=minute_vwap_0901_fills,
+            failures=failures,
+        )
+        signal_ledger_validation.update(
+            _validate_0901_vwap_fill_ledger(
+                candidate,
+                expected_fills=minute_vwap_0901_fills,
+                failures=failures,
+            )
+        )
+
+    completed_session_dates = [
+        session_date
+        for session_date in session_dates
+        if session_date != current_open_session
+    ]
+    minute_curve_validation = _validate_minute_curve_coverage(
+        candidate,
+        completed_session_dates=completed_session_dates,
+        expected_markets=expected_markets,
+        failures=failures,
+    )
 
     if failures:
         raise RuntimeError("replay promotion validation failed: " + "; ".join(failures))
@@ -581,7 +891,9 @@ def _validate_rebuild(
         "best_quote_fills": best_quote_fills,
         "synthetic_fallback_fills": synthetic_fallback_fills,
         "official_open_fills": official_open_fills,
+        "minute_vwap_0901_fills": minute_vwap_0901_fills,
         "signal_ledger_validation": signal_ledger_validation,
+        "minute_curve_validation": minute_curve_validation,
         "mode_set": sorted(expected_markets),
         "final_open_positions": final_open_positions,
         "ending_equity_twd": ending_equity,

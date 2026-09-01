@@ -503,6 +503,195 @@ def fetch_shioaji_historical_stock_entry_books(
     }
 
 
+def fetch_shioaji_historical_stock_0901_vwaps(
+    symbols: list[str],
+    *,
+    trading_date: date,
+    max_traffic_fraction: float = 0.90,
+    timeout_ms: int = 30_000,
+    progress_every: int = 50,
+) -> tuple[dict[str, dict[str, float | int | str]], dict[str, Any]]:
+    """Fetch the observed right-labelled 09:01 minute VWAP per stock.
+
+    The project's minute execution contract labels trades from
+    ``09:00:00..09:00:59`` as the completed ``09:01`` bar.  This function
+    computes ``sum(close * volume) / sum(volume)`` from those historical
+    trades.  Tick volume units cancel in the ratio.  Empty/invalid minutes are
+    left unresolved: callers must not replace them with the official open,
+    last price, best quote, or an adverse tick.
+    """
+
+    if not 0.0 < float(max_traffic_fraction) <= 1.0:
+        raise ValueError("max_traffic_fraction must be in (0, 1]")
+    requested = list(dict.fromkeys(str(symbol).strip() for symbol in symbols))
+    requested = [symbol for symbol in requested if symbol]
+    api = _shioaji_stock_api()
+    import shioaji as sj
+
+    def usage() -> dict[str, int | float] | None:
+        try:
+            current = api.usage()
+            used = int(current.bytes)
+            limit = int(current.limit_bytes)
+        except Exception:
+            return None
+        if used < 0 or limit <= 0:
+            return None
+        return {
+            "used_bytes": used,
+            "limit_bytes": limit,
+            "fraction": used / limit,
+        }
+
+    usage_before = usage()
+    resolved: dict[str, dict[str, float | int | str]] = {}
+    error_counts: dict[str, int] = {}
+    queried = 0
+    source_empty = 0
+    contract_missing = 0
+    stopped_for_traffic = False
+    request_times: deque[float] = deque()
+    window_start = datetime.combine(
+        trading_date,
+        datetime_time(9, 0),
+        tzinfo=ZoneInfo("Asia/Taipei"),
+    )
+    window_end = datetime.combine(
+        trading_date,
+        datetime_time(9, 1),
+        tzinfo=ZoneInfo("Asia/Taipei"),
+    )
+
+    for index, symbol in enumerate(requested, start=1):
+        current_usage = usage()
+        if current_usage is not None and float(current_usage["fraction"]) >= float(
+            max_traffic_fraction
+        ):
+            stopped_for_traffic = True
+            break
+        with _SHIOAJI_STOCK_LOCK:
+            if symbol not in _SHIOAJI_STOCK_CONTRACTS:
+                _SHIOAJI_STOCK_CONTRACTS[symbol] = api.contracts.get(symbol)
+            contract = _SHIOAJI_STOCK_CONTRACTS[symbol]
+        if contract is None:
+            contract_missing += 1
+            continue
+
+        now_monotonic = time.monotonic()
+        while request_times and now_monotonic - request_times[0] >= 5.0:
+            request_times.popleft()
+        if len(request_times) >= 50:
+            time.sleep(max(0.0, 5.01 - (now_monotonic - request_times[0])))
+            now_monotonic = time.monotonic()
+            while request_times and now_monotonic - request_times[0] >= 5.0:
+                request_times.popleft()
+        request_times.append(time.monotonic())
+        try:
+            with shioaji_query(
+                api,
+                consumer="tw_day_trade_missed_open_0901_vwap",
+                method="ticks",
+                asset_class="stock",
+                details={
+                    "contract": symbol,
+                    "date": trading_date.isoformat(),
+                    "start": "09:00:00",
+                    "end": "09:00:59",
+                    "right_label": "09:01:00",
+                },
+            ) as set_ledger_result:
+                ticks = api.ticks(
+                    contract=contract,
+                    date=trading_date.isoformat(),
+                    query_type=sj.TicksQueryType.RangeTime,
+                    time_start="09:00:00",
+                    time_end="09:00:59",
+                    timeout=int(timeout_ms),
+                )
+                set_ledger_result(ticks)
+            queried += 1
+            timestamps = list(getattr(ticks, "ts", ()))
+            closes = list(getattr(ticks, "close", ()))
+            volumes = list(getattr(ticks, "volume", ()))
+            lengths = {len(timestamps), len(closes), len(volumes)}
+            if len(lengths) != 1:
+                raise ValueError(
+                    "inconsistent historical Tick fields: "
+                    f"ts={len(timestamps)} close={len(closes)} volume={len(volumes)}"
+                )
+            notional = 0.0
+            total_volume = 0.0
+            accepted = 0
+            first_at: datetime | None = None
+            last_at: datetime | None = None
+            for position in sorted(
+                range(len(timestamps)),
+                key=lambda offset: (int(timestamps[offset]), offset),
+            ):
+                wall_clock = (
+                    np.datetime64(int(timestamps[position]), "ns")
+                    .astype("datetime64[us]")
+                    .astype(datetime)
+                    .replace(tzinfo=ZoneInfo("Asia/Taipei"))
+                )
+                if wall_clock < window_start or wall_clock >= window_end:
+                    continue
+                price = _float_or_none(closes[position])
+                volume = _float_or_none(volumes[position])
+                if price is None or volume is None or volume <= 0.0:
+                    continue
+                notional += price * volume
+                total_volume += volume
+                accepted += 1
+                first_at = first_at or wall_clock
+                last_at = wall_clock
+            vwap = notional / total_volume if total_volume > 0.0 else float("nan")
+            if not np.isfinite(vwap) or vwap <= 0.0 or accepted <= 0:
+                source_empty += 1
+            else:
+                resolved[symbol] = {
+                    "symbol": symbol,
+                    "execution_price_0901": float(vwap),
+                    "tick_volume_units_0901": float(total_volume),
+                    "tick_count_0901": int(accepted),
+                    "source_window_start": first_at.isoformat(timespec="microseconds"),
+                    "source_window_end": last_at.isoformat(timespec="microseconds"),
+                    "quote_at": window_end.isoformat(timespec="seconds"),
+                    "source": "shioaji:historical_ticks_0900_090059_vwap_right_label_0901",
+                }
+        except Exception as exc:
+            key = type(exc).__name__
+            error_counts[key] = error_counts.get(key, 0) + 1
+        if progress_every > 0 and (
+            index % progress_every == 0 or index == len(requested)
+        ):
+            print(
+                "[tw-day-trade-0901-vwap] "
+                f"date={trading_date.isoformat()} progress={index}/{len(requested)} "
+                f"queried={queried} resolved={len(resolved)}",
+                flush=True,
+            )
+
+    return resolved, {
+        "source": "shioaji:historical_ticks_0900_090059_vwap_right_label_0901",
+        "trading_date": trading_date.isoformat(),
+        "source_window": "09:00:00..09:00:59 Asia/Taipei",
+        "right_label": "09:01:00 Asia/Taipei",
+        "price_contract": "sum(close*volume)/sum(volume)",
+        "requested_symbols": len(requested),
+        "queried_symbols": queried,
+        "resolved_symbols": len(resolved),
+        "source_empty_symbols": source_empty,
+        "contract_missing_symbols": contract_missing,
+        "unqueried_symbols": max(0, len(requested) - queried - contract_missing),
+        "error_counts": error_counts,
+        "stopped_for_traffic": stopped_for_traffic,
+        "max_traffic_fraction": float(max_traffic_fraction),
+        "usage_before": usage_before,
+        "usage_after": usage(),
+    }
+
+
 def _contract_positive(contract: object, *names: str) -> float | None:
     for name in names:
         value = _float_or_none(getattr(contract, name, None))
@@ -1508,12 +1697,11 @@ def _load_tw_mis_opening_receipt(
     for symbol, raw in rows.items():
         if not isinstance(raw, dict):
             continue
-        open_price = _float_or_none(raw.get("open_prices"))
         try:
             timestamp_ms = int(raw.get("timestamp_ms") or 0)
         except (TypeError, ValueError):
             continue
-        if open_price is None or not _same_taipei_session_timestamp(
+        if not bool(raw.get("available")) or not _same_taipei_session_timestamp(
             timestamp_ms, session_date
         ):
             continue
@@ -1557,12 +1745,11 @@ def _persist_tw_mis_opening_receipt(
 ) -> Path | None:
     accepted: dict[str, dict[str, float | int | bool | None]] = {}
     for symbol, (_stored_at, raw) in rows.items():
-        open_price = _float_or_none(raw.get("open_prices"))
         try:
             timestamp_ms = int(raw.get("timestamp_ms") or 0)
         except (TypeError, ValueError):
             continue
-        if open_price is None or not _same_taipei_session_timestamp(
+        if not bool(raw.get("available")) or not _same_taipei_session_timestamp(
             timestamp_ms, session_date
         ):
             continue
@@ -1580,7 +1767,7 @@ def _persist_tw_mis_opening_receipt(
     path = _tw_mis_opening_receipt_path(session_date)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "session_date": session_date,
         "parquet_root": parquet_root,
         "captured_at_taipei": datetime.now(ZoneInfo("Asia/Taipei")).isoformat(
@@ -2022,20 +2209,21 @@ def fetch_tw_mis_opening_snapshot(
                 )
             )
         now_monotonic = time.monotonic()
-        missing_indices = [
-            idx
-            for idx, symbol in enumerate(requested)
-            if symbol not in _TW_MIS_OPENING_CACHE
-            or now_monotonic - _TW_MIS_OPENING_CACHE[symbol][0] > ttl
-        ]
+        missing_indices: list[int] = []
+        for idx, symbol in enumerate(requested):
+            cached = _TW_MIS_OPENING_CACHE.get(symbol)
+            if cached is None or now_monotonic - cached[0] > ttl:
+                missing_indices.append(idx)
+                continue
+            # Source-response coverage and the occurrence of an opening trade
+            # are different facts.  Keep the causal row as transport evidence,
+            # but retry no-open rows on every scheduler pass so a later auction
+            # print self-heals without waiting for the long immutable-open TTL.
+            if _float_or_none(cached[1].get("open_prices")) is None:
+                missing_indices.append(idx)
         cache_hits = len(requested) - len(missing_indices)
         if missing_indices:
             missing_symbols = [requested[idx] for idx in missing_indices]
-            # Once a row is expired it is no longer causal evidence for this
-            # request.  Remove it before I/O so a partial response cannot
-            # silently revive an older opening observation.
-            for symbol in missing_symbols:
-                _TW_MIS_OPENING_CACHE.pop(symbol, None)
             fresh = fetch_tw_mis_last_prices(
                 missing_symbols,
                 fallback[np.asarray(missing_indices, dtype=np.int64)],
@@ -2058,11 +2246,6 @@ def fetch_tw_mis_opening_snapshot(
                     ),
                 ),
             )
-            fresh_opens = (
-                np.asarray(fresh.open_prices, dtype=np.float64)
-                if fresh.open_prices is not None
-                else np.full((len(missing_symbols),), np.nan, dtype=np.float64)
-            )
             stored_at = time.monotonic()
             fresh_available = (
                 np.asarray(fresh.available_mask, dtype=bool)
@@ -2076,15 +2259,9 @@ def fetch_tw_mis_opening_snapshot(
             )
             accepted_count = 0
             for local_idx, symbol in enumerate(missing_symbols):
-                # Cache only a positive, receipt-timestamped opening price from
-                # this Taipei session.  A symbol can begin trading a few
-                # seconds after 09:00; caching its initial blank for six hours
-                # would permanently suppress the self-healing retry.
-                open_price = float(fresh_opens[local_idx])
                 timestamp_ms = int(fresh_timestamps[local_idx])
                 if not (
-                    np.isfinite(open_price)
-                    and open_price > 0.0
+                    bool(fresh_available[local_idx])
                     and _same_taipei_session_timestamp(timestamp_ms, session_date)
                 ):
                     continue

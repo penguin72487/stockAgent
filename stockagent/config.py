@@ -24,6 +24,11 @@ from stockagent.backtest.tw_index_derivatives_day import OptionDayCostSchedule
 from stockagent.data.tw_index_futures import (
     normalize_taifex_index_futures_product,
 )
+from stockagent.data.tw_day_trade_execution import (
+    DAY_TRADE_MINUTE_EXECUTION_POLICY_FULL_VOLUME,
+    DAY_TRADE_MINUTE_EXECUTION_POLICY_SCHEDULED,
+    normalize_day_trade_minute_execution_policy,
+)
 from stockagent.data.walkforward import normalize_lookback_context
 from stockagent.portfolio_contract import (
     DEFAULT_PORTFOLIO_ACTIVATION,
@@ -1075,13 +1080,20 @@ class DataConfig:
     # model that approximates execution at that same close.
     allow_same_close_feature_approximation: bool = False
     # Receipt-backed, date-partitioned right-labelled one-minute research data.
-    # This path is consumed only by execution_mode=tw_minute and never by the
-    # daily panel builder.
+    # The intraday model consumes it as training input; the daily day-trade
+    # model may consume it only through the executor-label field below. It is
+    # never appended to ordinary daily model features.
     minute_parquet_root: str = "data_tw_minute/research_dataset"
     # Optional executor-only minute tape for the *daily* tw_day_trade model.
     # When set, the daily loss uses the 09:01/13:20/13:24/13:30 execution
     # schedule instead of the legacy open-to-close return proxy.
     day_trade_minute_execution_root: str | None = None
+    # ``scheduled_events_50pct`` preserves the legacy 17-field tape.
+    # ``full_session_volume_100pct`` carries one persistent entry/exit order
+    # across right-labelled minute bars and is a distinct checkpoint contract.
+    day_trade_minute_execution_policy: str = (
+        DAY_TRADE_MINUTE_EXECUTION_POLICY_SCHEDULED
+    )
     day_trade_minute_execution_cache_dir: str = (
         "artifacts/cache/tw_day_trade_minute_execution_v1"
     )
@@ -3377,6 +3389,11 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         or not str(raw_day_trade_execution_root).strip()
         else str(raw_day_trade_execution_root).strip()
     )
+    data["day_trade_minute_execution_policy"] = (
+        normalize_day_trade_minute_execution_policy(
+            data["day_trade_minute_execution_policy"]
+        )
+    )
     if data["day_trade_minute_execution_root"] is not None:
         if trading["execution_mode"] != "tw_day_trade":
             raise ValueError(
@@ -3387,11 +3404,29 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
             raise ValueError(
                 "daily-model minute execution requires trading.frequency='daily'"
             )
-        if abs(float(trading["max_volume_participation"]) - 0.5) > 1.0e-12:
+        minute_policy = data["day_trade_minute_execution_policy"]
+        required_participation = (
+            1.0
+            if minute_policy == DAY_TRADE_MINUTE_EXECUTION_POLICY_FULL_VOLUME
+            else 0.5
+        )
+        if abs(
+            float(trading["max_volume_participation"])
+            - required_participation
+        ) > 1.0e-12:
             raise ValueError(
-                "daily-model minute execution contract requires "
-                "trading.max_volume_participation=0.5"
+                f"daily-model minute execution policy {minute_policy!r} requires "
+                "trading.max_volume_participation="
+                f"{required_participation}"
             )
+    elif (
+        data["day_trade_minute_execution_policy"]
+        != DAY_TRADE_MINUTE_EXECUTION_POLICY_SCHEDULED
+    ):
+        raise ValueError(
+            "non-default data.day_trade_minute_execution_policy requires "
+            "data.day_trade_minute_execution_root"
+        )
     if bool(trading["tw_day_trade_unlimited_margin_conversion"]):
         if trading["execution_mode"] != "tw_day_trade":
             raise ValueError(

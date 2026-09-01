@@ -1603,6 +1603,22 @@ def test_tw_snapshot_refresh_uses_the_outer_shared_lock(tmp_path) -> None:
     )
 
 
+def test_tw_opening_activation_waits_for_the_outer_shared_lock(tmp_path) -> None:
+    live_root = tmp_path / "live" / "data_tw_public"
+    command = [
+        "python",
+        "scripts/activate_tw_public_opening_data.py",
+        "--live-root",
+        str(live_root),
+        "--link",
+        "data_tw_public",
+    ]
+
+    assert _tw_data_layer_lock_path(command) == (
+        live_root.parent / ".locks" / "tw-public-refresh.lock"
+    )
+
+
 def test_pre_signal_failure_cache_is_shared_and_success_clears_it(monkeypatch) -> None:
     from services.discord_bot import bot as discord_bot
 

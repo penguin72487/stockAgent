@@ -1,0 +1,51 @@
+base_config: tw_day_trade_daily_multi_basis_projection_l1_tplus2_close_capital10m.yaml
+
+# 每日 Multi-Basis 模型仍只在 09:00 產生一次目標；差異只在 executor：
+# 進場與收盤都把未成交整張逐分鐘延續，單分鐘容量上限為已觀測成交量 100%。
+# 這是忽略自身市場衝擊的容量上界反事實，不是真實交易所成交保證。
+experiment_name: tw-day-trade-daily-multi-basis-projection-l1-minute-volume100-capital10m-v1
+
+runner:
+  output_dir: artifacts/markets/tw_day_trade_daily_multi_basis_projection_l1_minute_volume100_capital10m_v1
+  resume: true
+  post_train_infer: false
+
+data:
+  # 完整市場、receipt-backed 分鐘 K 的可用起點；缺分鐘路徑不退回日線
+  # open-to-close proxy。
+  panel_start_date: "2020-03-02"
+  day_trade_minute_execution_root: data_tw_minute/research_dataset
+  day_trade_minute_execution_policy: full_session_volume_100pct
+  day_trade_minute_execution_cache_dir: artifacts/cache/tw_day_trade_minute_execution_v2_full_volume
+
+walk_forward:
+  expected_first_year: 2020
+  split_start_year: null
+  min_train_years: 1
+  val_years: 1
+  require_future_test_year: false
+  require_contiguous_years: true
+  lookback_context: panel_history
+
+trading:
+  execution_mode: tw_day_trade
+  frequency: daily
+  volume_participation_equity: 10000000.0
+  max_volume_participation: 1.0
+  # 分鐘 executor 自己在 13:30 對未成交殘部做研究用轉融資／融券結清；
+  # 不可同時啟用另一條 daily residual-carry ledger。
+  tw_day_trade_unlimited_margin_conversion: false
+
+training:
+  # 新的 [day,symbol,271,2] executor ABI 尚未有 actual-shape compile 基準。
+  # 先用 eager exact forward 驗證完整 epoch，再獨立量測 compile 候選。
+  compile_loss: false
+  backtest_compile: false
+  eval_backtest_compile: false
+  # 單卡工作站直接執行；有兩張以上可見 CUDA 卡時才自動切 DDP。
+  multi_gpu_strategy: auto
+  # execution label 全 panel 約 9.45 GB；必須維持 mmap/逐 batch 傳輸，不能
+  # 把 train/val/test 各自整份複製到 GPU。
+  cache_train_tensors_on_gpu: false
+  cache_eval_tensors_on_gpu: false
+  save_integer_share_holdings_table: false

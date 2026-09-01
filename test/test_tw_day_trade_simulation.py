@@ -29,6 +29,7 @@ from stockagent.live.tw_day_trade_dashboard import (
     build_dashboard_summary,
 )
 from stockagent.live.tw_day_trade_simulation import (
+    ENTRY_FILL_POLICY_0901_MINUTE_VWAP,
     ENTRY_FILL_POLICY_CAUSAL_BOOK,
     ENTRY_FILL_POLICY_CAUSAL_BOOK_ELSE_OPEN_TICK,
     ENTRY_FILL_POLICY_MARKET_AT_BEST_ELSE_OPEN_TICK,
@@ -87,6 +88,71 @@ def _summary(signal_id: str = "signal-1") -> dict[str, object]:
         "symbol_count": 1,
         "target_risk": {"gross": 0.1, "long_gross": 0.1, "short_gross": 0.0},
     }
+
+
+def test_process_quotes_can_isolate_one_replay_market(tmp_path: Path) -> None:
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+    first = _spec(tmp_path)
+    second = replace(first, market="tw_day_trade_second", label="second")
+    for spec, signal_id in ((first, "signal-first"), (second, "signal-second")):
+        assert engine.register_signal(
+            spec=spec,
+            summary=_summary(signal_id),
+            signal_rows=[_row()],
+            quotes={"2330": _quote()},
+            eligibility=_eligibility(),
+            eligibility_coverage={},
+            now=_now(9, 1, 6),
+        ) == "registered"
+
+    exit_quote = _quote(bid=1_001.0, ask=1_002.0)
+    exit_quote["minute_volume_lots"] = 10_000.0
+    exit_quote["bid_volume"] = 10_000.0
+    engine.process_quotes(
+        quotes={"2330": exit_quote},
+        now=_now(13, 24),
+        markets=[first.market],
+    )
+
+    assert engine.state["modes"][first.market]["open_position_count"] == 0
+    assert engine.state["modes"][second.market]["open_position_count"] == 1
+
+
+def test_process_quotes_can_defer_state_persistence_for_historical_replay(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "state"
+    engine = TwDayTradeSimulationEngine(state_dir)
+    engine.state["modes"] = {
+        "tw_day_trade_100m": {
+            "market": "tw_day_trade_100m",
+            "initial_capital_twd": 100_000_000.0,
+            "positions": {},
+        }
+    }
+
+    engine.process_quotes(quotes={}, now=_now(9, 2), persist=False)
+
+    assert engine.state["modes"]["tw_day_trade_100m"]["last_mark_at"].startswith(
+        "2026-08-13T09:02"
+    )
+    assert not (state_dir / "state.json").exists()
+
+
+def test_historical_replay_ledgers_flush_once_at_session_boundary(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "state"
+    engine = TwDayTradeSimulationEngine(state_dir)
+    engine.begin_deferred_ledger_writes()
+    engine._event("historical_minute", recorded_at=_now(9, 2))
+
+    assert not (state_dir / "events.jsonl").exists()
+
+    engine.flush_deferred_ledger_writes()
+
+    rows = [json.loads(line) for line in (state_dir / "events.jsonl").read_text().splitlines()]
+    assert [row["event"] for row in rows] == ["historical_minute"]
 
 
 def test_dashboard_session_progress_exposes_market_retry_and_closing_auction() -> None:
@@ -658,6 +724,7 @@ def test_runner_keeps_quote_polling_for_post_close_terminal_catch_up() -> None:
     from scripts.run_tw_day_trade_simulation import (
         _active_quote_due,
         _loop_sleep_seconds,
+        _missed_opening_recovery_required,
         _pending_signal_retry_delay_seconds,
     )
 
@@ -707,6 +774,8 @@ def test_runner_keeps_quote_polling_for_post_close_terminal_catch_up() -> None:
     assert _pending_signal_retry_delay_seconds(
         "waiting_first_minute", _now(9, 18, 7)
     ) == pytest.approx(53.05)
+    assert not _missed_opening_recovery_required(_now(9, 0, 15))
+    assert _missed_opening_recovery_required(_now(9, 0, 16))
 
 
 def test_runner_recovers_missing_daily_limits_without_replacing_shioaji_book(
@@ -1117,6 +1186,126 @@ def test_official_open_policy_does_not_execute_before_0901(tmp_path: Path) -> No
     )
 
     assert result == "blocked"
+    assert not engine.fills_path.exists()
+
+
+@pytest.mark.parametrize("weight", (0.1, -0.1))
+def test_missed_opening_replay_sizes_at_open_and_executes_at_0901_vwap(
+    tmp_path: Path,
+    weight: float,
+) -> None:
+    spec = replace(
+        _spec(tmp_path),
+        entry_fill_policy=ENTRY_FILL_POLICY_0901_MINUTE_VWAP,
+        entry_price_offset_ticks=0,
+    )
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+    summary = {
+        **_summary(),
+        "simulation_replay": True,
+        "entry_fill_contract": (
+            "retrospective_official_open_signal_at_09_00_observed_09_01_minute_vwap_counterfactual"
+        ),
+    }
+    quote = _quote(open_price=1_000.0, bid=900.0, ask=1_100.0)
+    quote.update(
+        {
+            "execution_price_0901": 1_007.5,
+            "quote_at": _now(9, 1).isoformat(),
+            "historical_source_quote_at": _now(9, 0, 59).isoformat(),
+            "entry_price_source": (
+                "shioaji:historical_ticks_0900_090059_vwap_right_label_0901"
+            ),
+        }
+    )
+
+    assert (
+        engine.register_signal(
+            spec=spec,
+            summary=summary,
+            signal_rows=[{**_row(weight), "open_price": 1_000.0}],
+            quotes={"2330": quote},
+            eligibility=_eligibility(),
+            eligibility_coverage={},
+            now=_now(9, 1),
+            counterfactual_open_replay=True,
+        )
+        == "registered"
+    )
+
+    mode = engine.state["modes"][spec.market]
+    position = next(iter(mode["positions"].values()))
+    order = next(
+        json.loads(line)
+        for line in engine.orders_path.read_text().splitlines()
+        if json.loads(line)["purpose"] == "entry"
+    )
+    assert position["sizing_open_price"] == 1_000.0
+    assert position["entry_price"] == 1_007.5
+    assert position["counterfactual_0901_price_fill"] is True
+    assert position["counterfactual_open_price_fill"] is False
+    assert position["fill_guaranteed"] is False
+    assert order["order_type"] == "PAPER_0901_MINUTE_VWAP"
+    assert mode["entry_0901_vwap_fill_count"] == 1
+    assert mode["entry_official_open_fill_count"] == 0
+
+    # Reproduce the former restart bug: the live default had overwritten the
+    # policy label even though the committed position/fill contract was 09:01.
+    mode["entry_fill_policy"] = ENTRY_FILL_POLICY_CAUSAL_BOOK
+    engine._persist(_now(9, 1, 1))
+    restarted = TwDayTradeSimulationEngine(engine.state_dir)
+    restarted.update_readiness(
+        [replace(spec, entry_fill_policy=ENTRY_FILL_POLICY_CAUSAL_BOOK)],
+        now=_now(9, 2),
+    )
+    restarted_mode = restarted.state["modes"][spec.market]
+    assert (
+        restarted_mode["entry_fill_policy"]
+        == ENTRY_FILL_POLICY_0901_MINUTE_VWAP
+    )
+    assert (
+        restarted_mode["configured_entry_fill_policy"]
+        == ENTRY_FILL_POLICY_CAUSAL_BOOK
+    )
+    assert restarted_mode["counterfactual_0901_price_fill"] is True
+
+
+def test_missed_opening_replay_never_falls_back_when_0901_vwap_is_missing(
+    tmp_path: Path,
+) -> None:
+    spec = replace(
+        _spec(tmp_path),
+        entry_fill_policy=ENTRY_FILL_POLICY_0901_MINUTE_VWAP,
+    )
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+    summary = {
+        **_summary(),
+        "simulation_replay": True,
+        "entry_fill_contract": (
+            "retrospective_official_open_signal_at_09_00_observed_09_01_minute_vwap_counterfactual"
+        ),
+    }
+    quote = _quote(open_price=1_000.0, bid=999.0, ask=1_001.0)
+    quote["execution_price_0901"] = None
+    quote["quote_at"] = _now(9, 1).isoformat()
+
+    assert (
+        engine.register_signal(
+            spec=spec,
+            summary=summary,
+            signal_rows=[{**_row(0.1), "open_price": 1_000.0}],
+            quotes={"2330": quote},
+            eligibility=_eligibility(),
+            eligibility_coverage={},
+            now=_now(9, 1),
+            counterfactual_open_replay=True,
+        )
+        == "registered"
+    )
+    signal = json.loads(engine.signals_path.read_text().splitlines()[0])
+    assert signal["status"] == "blocked"
+    assert signal["reason"] == "observed_09_01_minute_vwap_unavailable"
+    assert signal["execution_price"] is None
     assert not engine.fills_path.exists()
 
 
@@ -3248,6 +3437,50 @@ def test_dashboard_history_ranges_anchor_to_latest_retained_mark(
     assert selected_day["expected_strategy_session_points_from_09_01"] == 270
 
 
+def test_dashboard_history_keeps_leveraged_reference_below_zero(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "state"
+    root.mkdir()
+    (root / "benchmark_history.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "origins": {},
+                "marks": [
+                    {
+                        "benchmark_id": "benchmark_tx_continuous",
+                        "session_date": "2026-03-09",
+                        "minute": "2026-03-09T08:45+08:00",
+                        "initial_capital_twd": 100.0,
+                        "total_equity_twd": -10.0,
+                    },
+                    {
+                        "benchmark_id": "benchmark_tx_continuous",
+                        "session_date": "2026-03-09",
+                        "minute": "2026-03-09T08:46+08:00",
+                        "initial_capital_twd": 100.0,
+                        "total_equity_twd": -5.0,
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = build_dashboard_history_snapshot(
+        state_dir=root,
+        range_key="all",
+        start_date="2026-03-09",
+        end_date="2026-03-09",
+    )
+
+    assert result["raw_points_in_range"] == 2
+    assert [row["return_pct"] for row in result["history"]] == pytest.approx(
+        [-110.0, -105.0]
+    )
+
+
 def test_dashboard_merges_actual_open_benchmark_history_and_rebases_live_marks(
     tmp_path: Path,
 ) -> None:
@@ -3394,12 +3627,16 @@ def test_dashboard_contains_all_sources_without_broker_secrets(tmp_path: Path) -
     assert payload["production_order_possible"] is False
     assert "live execution starts at 09:00" in payload["source_contract"]["entry_fill"]
     assert (
-        "Historical replay alone uses the 09:01 official open"
+        "observed 09:01 minute VWAP"
+        in payload["source_contract"]["entry_fill"]
+    )
+    assert (
+        "without open-price fill"
         in payload["source_contract"]["entry_fill"]
     )
     assert "live entry quantity is bounded" in payload["source_contract"]["depth_limit"]
     assert (
-        "historical 09:01 official-open replay"
+        "Missed-opening replay uses the official open only for sizing"
         in payload["source_contract"]["depth_limit"]
     )
     assert payload["signals"] == []

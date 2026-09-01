@@ -53,6 +53,7 @@ REQUIRED_TIMERS = (
     "stockagent-tw-day-trade-preopen-gate.timer",
     "stockagent-discord-artifact-maintenance.timer",
     "stockagent-tw-day-trade-unattended-guardian.timer",
+    "stockagent-tw-day-trade-minute-curves.timer",
 )
 
 

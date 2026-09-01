@@ -66,11 +66,35 @@ def previous_tw_stock_session(
     raise RuntimeError("cannot resolve the previous Taiwan stock session")
 
 
+def latest_completed_tw_stock_session(
+    value: datetime | None = None,
+    *,
+    parquet_root: Path | None = None,
+) -> date:
+    """Return today's session after the historical-query resume boundary.
+
+    Before 14:31 the current session is mutable and the latest safe history
+    target is the previous trading session.  At and after 14:31, today's
+    trading session is complete and may be queried.  Downloaders still retain
+    their source/receipt gates, so an upstream source that has not published
+    yet remains visible as empty/partial instead of being fabricated.
+    """
+
+    local = _taipei_datetime(value)
+    if (
+        local.time() >= HISTORICAL_QUERY_RESUME
+        and is_trading_day("tw", local.date(), parquet_root=parquet_root)
+    ):
+        return local.date()
+    return previous_tw_stock_session(local, parquet_root=parquet_root)
+
+
 __all__ = [
     "HISTORICAL_MAX_TRAFFIC_FRACTION",
     "HISTORICAL_QUERY_CUTOFF",
     "HISTORICAL_QUERY_RESUME",
     "historical_query_is_protected",
     "historical_query_pause_seconds",
+    "latest_completed_tw_stock_session",
     "previous_tw_stock_session",
 ]

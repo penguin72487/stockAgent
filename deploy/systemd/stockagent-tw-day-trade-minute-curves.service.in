@@ -1,0 +1,21 @@
+[Unit]
+Description=Rebuild audited minute curves for completed Taiwan day-trade sessions
+Wants=network-online.target time-sync.target
+After=network-online.target time-sync.target stockagent-tw-day-trade-simulation.service
+
+[Service]
+Type=oneshot
+User=@SERVICE_USER@
+Group=@SERVICE_GROUP@
+WorkingDirectory=@REPO_ROOT@
+Environment="HOME=@SERVICE_HOME@"
+Environment="PYTHONUNBUFFERED=1"
+EnvironmentFile=-@REPO_ROOT@/.env
+ExecStart=/usr/bin/bash "@REPO_ROOT@/scripts/run_tw_day_trade_minute_curve_maintenance.sh"
+TimeoutStartSec=2h
+Nice=10
+CPUWeight=50
+IOWeight=50
+NoNewPrivileges=true
+PrivateTmp=true
+

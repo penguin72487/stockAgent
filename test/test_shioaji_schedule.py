@@ -15,6 +15,7 @@ from stockagent.live.shioaji_schedule import (
     HISTORICAL_MAX_TRAFFIC_FRACTION,
     historical_query_is_protected,
     historical_query_pause_seconds,
+    latest_completed_tw_stock_session,
     previous_tw_stock_session,
 )
 from downloader import download_shioaji_tw_kbars, download_shioaji_tw_minute_kbars
@@ -46,6 +47,11 @@ def test_history_queries_resume_only_after_close_and_weekends_remain_available()
 def test_previous_tw_stock_session_skips_weekend_targets() -> None:
     observed = datetime(2026, 8, 23, 3, 0, tzinfo=TAIPEI)
     assert previous_tw_stock_session(observed) == date(2026, 8, 21)
+
+
+def test_latest_completed_session_advances_only_after_close() -> None:
+    assert latest_completed_tw_stock_session(_local(14, 30)) == date(2026, 8, 14)
+    assert latest_completed_tw_stock_session(_local(14, 31)) == date(2026, 8, 17)
 
 
 def test_existing_downloaders_share_the_schedule_guard(monkeypatch) -> None:

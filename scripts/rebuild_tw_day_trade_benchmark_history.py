@@ -58,6 +58,8 @@ DEFAULT_TWSE_DAILY_OHLCV_PATH = Path(
 DEFAULT_TPEX_DAILY_OHLCV_PATH = Path(
     "/srv/stockagent-live/data_tw_public/tpex_daily_ohlcv.parquet"
 )
+DEFAULT_TX_HISTORY_ROOT = Path("data_tw_index_futures/shioaji_history/TXFR1")
+TX_SESSION_MINUTES = 300
 
 
 def _sha256(path: Path) -> str:
@@ -354,6 +356,141 @@ def _tx_front_contract_metadata(
     }, receipts
 
 
+def _tx_contract_code(delivery_month: str) -> str:
+    month_codes = "ABCDEFGHIJKL"
+    if len(delivery_month) != 6 or not delivery_month.isdigit():
+        raise ValueError(f"invalid TX delivery month: {delivery_month!r}")
+    month = int(delivery_month[4:])
+    if not 1 <= month <= 12:
+        raise ValueError(f"invalid TX delivery month: {delivery_month!r}")
+    return f"TXF{month_codes[month - 1]}{delivery_month[3]}"
+
+
+def _tx_historical_contract_metadata(
+    *,
+    final_settlement_path: Path,
+    trading_date: date,
+) -> dict[str, Any]:
+    """Resolve the held monthly TX contract from official expiry history."""
+
+    rows = (
+        pl.scan_parquet(final_settlement_path)
+        .filter(
+            (pl.col("product") == "TXO")
+            & pl.col("option_series").cast(pl.String).str.contains(r"^\d{6}$")
+            & (pl.col("settlement_date") >= trading_date)
+        )
+        .select("settlement_date", "option_series")
+        .sort("settlement_date")
+        .limit(1)
+        .collect()
+    )
+    if rows.height != 1:
+        raise RuntimeError(
+            f"official monthly TX expiry is unavailable for {trading_date}"
+        )
+    row = rows.row(0, named=True)
+    delivery_month = str(row["option_series"])
+    return {
+        "code": _tx_contract_code(delivery_month),
+        "delivery_month": delivery_month,
+        "last_trading_date": row["settlement_date"].isoformat(),
+    }
+
+
+def _tx_historical_day_books(
+    *,
+    history_root: Path,
+    trading_date: date,
+) -> tuple[pl.DataFrame, dict[str, Any]]:
+    receipt_path = history_root / "receipts" / (
+        f"trading_date={trading_date.isoformat()}.json"
+    )
+    if not receipt_path.is_file():
+        raise FileNotFoundError(receipt_path)
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    if (
+        str(receipt.get("status") or "") != "complete"
+        or str(receipt.get("contract") or "").upper() != "TXFR1"
+        or str(receipt.get("trading_date") or "") != trading_date.isoformat()
+    ):
+        raise ValueError(f"invalid TXFR1 historical receipt: {receipt_path}")
+    data_path = Path(str(receipt.get("path") or ""))
+    if not data_path.is_absolute():
+        data_path = REPO_ROOT / data_path
+    if not data_path.is_file():
+        raise FileNotFoundError(data_path)
+    if _sha256(data_path) != str(receipt.get("sha256") or ""):
+        raise RuntimeError(f"TXFR1 historical hash mismatch: {data_path}")
+    frame = (
+        pl.scan_parquet(data_path)
+        .filter(
+            (pl.col("event_ts").dt.time() >= time(8, 45))
+            & (pl.col("event_ts").dt.time() < time(13, 45))
+            & (pl.col("bid_price") > 0.0)
+            & (pl.col("ask_price") > 0.0)
+            & (pl.col("bid_price") <= pl.col("ask_price"))
+        )
+        .select(
+            "event_ts",
+            pl.col("bid_price").alias("bid_price_1"),
+            pl.col("ask_price").alias("ask_price_1"),
+        )
+        .sort("event_ts")
+        .collect(engine="streaming")
+    )
+    if frame.is_empty():
+        raise RuntimeError(
+            f"no valid receipt-backed TXFR1 historical quote on {trading_date}"
+        )
+    return frame, {
+        "path": str(receipt_path.resolve()),
+        "sha256": _sha256(receipt_path),
+        "data_path": str(data_path.resolve()),
+        "data_sha256": _sha256(data_path),
+        "rows": int(receipt.get("rows") or 0),
+        "source": receipt.get("source"),
+    }
+
+
+def _tx_complete_minute_books(
+    books: pl.DataFrame,
+    *,
+    trading_date: date,
+    timestamp_column: str,
+    epoch_utc: bool,
+) -> list[tuple[datetime, dict[str, Any], bool]]:
+    """Return exactly 08:45..13:44, carrying only an observed prior quote."""
+
+    by_minute: dict[str, dict[str, Any]] = {}
+    for book in books.iter_rows(named=True):
+        if epoch_utc:
+            observed = datetime.fromtimestamp(
+                int(book[timestamp_column]) / 1e9, tz=timezone.utc
+            ).astimezone(TAIPEI)
+        else:
+            raw = book[timestamp_column]
+            if not isinstance(raw, datetime):
+                raise TypeError(f"invalid TX history timestamp: {raw!r}")
+            observed = raw.replace(tzinfo=TAIPEI)
+        by_minute[_minute(observed)] = book
+
+    start = datetime.combine(trading_date, time(8, 45), tzinfo=TAIPEI)
+    current: dict[str, Any] | None = None
+    output: list[tuple[datetime, dict[str, Any], bool]] = []
+    for offset in range(TX_SESSION_MINUTES):
+        observed = start + timedelta(minutes=offset)
+        fresh = _minute(observed) in by_minute
+        if fresh:
+            current = by_minute[_minute(observed)]
+        if current is None:
+            raise RuntimeError(
+                f"TX first minute has no valid quote on {trading_date}"
+            )
+        output.append((observed, dict(current), fresh))
+    return output
+
+
 def _tx_engine_history_mark(
     engine: TwDayTradeSimulationEngine,
     *,
@@ -557,6 +694,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--tx-history-root",
+        type=Path,
+        default=DEFAULT_TX_HISTORY_ROOT,
+        help=(
+            "Receipt-backed Shioaji TXFR1 historical Tick root used before "
+            "retained realtime book_1s capture coverage begins."
+        ),
+    )
+    parser.add_argument(
         "--final-settlement-path",
         type=Path,
         default=DEFAULT_TAIFEX_INDEX_FINAL_SETTLEMENT_PATH,
@@ -663,6 +809,7 @@ def main() -> None:
         "tpex_daily_ohlcv_path": str(tpex_daily_ohlcv_path),
         "tpex_daily_ohlcv_sha256": _sha256(tpex_daily_ohlcv_path),
         "fop_capture_root": str(args.fop_capture_root.resolve()),
+        "tx_history_root": str(args.tx_history_root.resolve()),
         "corporate_action_reference_path": str(corporate_action_path),
         "corporate_action_reference_sha256": _sha256(corporate_action_path),
         "corporate_action_reference_summary_path": str(
@@ -843,6 +990,7 @@ def main() -> None:
     provenance["tx_final_settlement_path"] = str(final_settlement_path)
     provenance["tx_final_settlement_sha256"] = _sha256(final_settlement_path)
     provenance["tx_capture_manifests"] = {}
+    provenance["tx_history_receipts"] = {}
     tx_rows = 0
     with tempfile.TemporaryDirectory(prefix="stockagent-tx-benchmark-replay-") as temp:
         tx_engine = TwDayTradeSimulationEngine(
@@ -850,36 +998,91 @@ def main() -> None:
             final_settlement_path=final_settlement_path,
         )
         for trading_date in session_dates:
-            metadata, manifest_receipts = _tx_front_contract_metadata(
-                capture_root=args.fop_capture_root,
-                trading_date=trading_date,
+            manifest_root = (
+                args.fop_capture_root
+                / "manifests"
+                / f"trade_date={trading_date.isoformat()}"
             )
-            provenance["tx_capture_manifests"][trading_date.isoformat()] = {
-                "contract": metadata,
-                "receipts": manifest_receipts,
-            }
-            end_at = datetime.combine(trading_date, time(13, 45), tzinfo=TAIPEI)
-            if trading_date == now.date() and current_session_unclosed:
-                end_at = now
-            books = _tx_day_books(
-                capture_root=args.fop_capture_root,
-                trading_date=trading_date,
-                contract_code=str(metadata["code"]),
-                end_at=end_at,
-            )
-            by_minute: dict[str, dict[str, Any]] = {}
-            for book in books.iter_rows(named=True):
-                observed = datetime.fromtimestamp(
-                    int(book["snapshot_ts_ns"]) / 1e9, tz=timezone.utc
-                ).astimezone(TAIPEI)
-                by_minute[_minute(observed)] = book
-            for minute_key, book in sorted(by_minute.items()):
-                observed = datetime.fromisoformat(minute_key)
+            if any(manifest_root.glob("worker=*.json")):
+                metadata, manifest_receipts = _tx_front_contract_metadata(
+                    capture_root=args.fop_capture_root,
+                    trading_date=trading_date,
+                )
+                provenance["tx_capture_manifests"][trading_date.isoformat()] = {
+                    "contract": metadata,
+                    "receipts": manifest_receipts,
+                }
+                end_at = datetime.combine(
+                    trading_date, time(13, 45), tzinfo=TAIPEI
+                )
+                if trading_date == now.date() and current_session_unclosed:
+                    end_at = now
+                books = _tx_day_books(
+                    capture_root=args.fop_capture_root,
+                    trading_date=trading_date,
+                    contract_code=str(metadata["code"]),
+                    end_at=end_at,
+                )
+                try:
+                    minute_books = _tx_complete_minute_books(
+                        books,
+                        trading_date=trading_date,
+                        timestamp_column="snapshot_ts_ns",
+                        epoch_utc=True,
+                    )
+                    quote_source = "retained_shioaji_fop_book_1s"
+                except RuntimeError as exc:
+                    # A reboot can leave a truthful partial realtime capture.
+                    # Prefer it when it covers the open, otherwise fall back to
+                    # the independently receipt-verified historical TXFR1 Tick
+                    # partition for the same completed session.
+                    provenance["tx_capture_manifests"][trading_date.isoformat()][
+                        "minute_coverage_error"
+                    ] = str(exc)
+                    books, history_receipt = _tx_historical_day_books(
+                        history_root=args.tx_history_root.resolve(),
+                        trading_date=trading_date,
+                    )
+                    provenance["tx_history_receipts"][trading_date.isoformat()] = {
+                        "contract": metadata,
+                        "receipt": history_receipt,
+                        "fallback_reason": "realtime_capture_missing_session_open",
+                    }
+                    minute_books = _tx_complete_minute_books(
+                        books,
+                        trading_date=trading_date,
+                        timestamp_column="event_ts",
+                        epoch_utc=False,
+                    )
+                    quote_source = (
+                        "receipt_backed_shioaji_txfr1_historical_tick_l1"
+                    )
+            else:
+                metadata = _tx_historical_contract_metadata(
+                    final_settlement_path=final_settlement_path,
+                    trading_date=trading_date,
+                )
+                books, history_receipt = _tx_historical_day_books(
+                    history_root=args.tx_history_root.resolve(),
+                    trading_date=trading_date,
+                )
+                provenance["tx_history_receipts"][trading_date.isoformat()] = {
+                    "contract": metadata,
+                    "receipt": history_receipt,
+                }
+                minute_books = _tx_complete_minute_books(
+                    books,
+                    trading_date=trading_date,
+                    timestamp_column="event_ts",
+                    epoch_utc=False,
+                )
+                quote_source = "receipt_backed_shioaji_txfr1_historical_tick_l1"
+            for observed, book, fresh in minute_books:
                 quote = {
                     "bid": float(book["bid_price_1"]),
                     "ask": float(book["ask_price_1"]),
                     "quote_at": observed.isoformat(timespec="seconds"),
-                    "source": "retained_shioaji_fop_book_1s",
+                    "source": quote_source,
                     "delivery_month": metadata["delivery_month"],
                     "last_trading_date": metadata["last_trading_date"],
                 }
@@ -890,10 +1093,13 @@ def main() -> None:
                     now=observed,
                 )
                 tx_mark = _tx_engine_history_mark(tx_engine, observed=observed)
+                tx_mark["source"] = quote_source
+                tx_mark["valuation_stale"] = not fresh
+                tx_mark["fresh_quote_in_minute"] = bool(fresh)
+                tx_mark["last_quote_carried"] = not fresh
                 if bool(tx_mark.get("valuation_stale")):
-                    raise RuntimeError(
-                        "TX benchmark replay became stale at "
-                        f"{observed.isoformat()}: {tx_mark.get('valuation_source')}"
+                    tx_mark["valuation_source"] = (
+                        "last_observed_best_bid_carried_without_interpolation"
                     )
                 marks.append(tx_mark)
                 tx_rows += 1
@@ -936,10 +1142,16 @@ def main() -> None:
         "initial_fixed_fees_twd": TX_FEE_PER_SIDE_TWD,
         "initial_transaction_tax_twd": _tx_tax(entry_price, start),
         "gross_pnl_multiplier": tx_multiplier,
-        "source": "retained_shioaji_front_month_book_at_day_open",
-        "contract_code": provenance["tx_capture_manifests"][start.isoformat()][
-            "contract"
-        ]["code"],
+        "source": "receipt_backed_shioaji_front_month_best_ask_at_day_open",
+        "contract_code": (
+            provenance["tx_capture_manifests"][start.isoformat()]["contract"][
+                "code"
+            ]
+            if start.isoformat() in provenance["tx_capture_manifests"]
+            else provenance["tx_history_receipts"][start.isoformat()]["contract"][
+                "code"
+            ]
+        ),
         "roll_contract": (
             "official final settlement after expiry; new front-month ask; "
             "calendar spread never booked as return"
@@ -976,8 +1188,9 @@ def main() -> None:
                 "reference factors reinvest cash distributions and adjust splits"
             ),
             "tx": (
-                "one real front-month TX entered at the first valid retained "
-                "08:45 ask; later marks use retained bids; an expired old month "
+                "one front-month TX entered at the first valid receipt-backed "
+                "08:45 ask; later minute marks use the observed bid or carry the "
+                "latest observed bid without interpolation; an expired old month "
                 "uses official final settlement before the new month opens at ask"
             ),
             "calendar_spread_return": "never booked as investment return",
@@ -994,6 +1207,11 @@ def main() -> None:
         },
         "provenance": provenance,
     }
+    expected_tx_rows = len(session_dates) * TX_SESSION_MINUTES
+    if tx_rows != expected_tx_rows:
+        raise RuntimeError(
+            f"TX benchmark minute cardinality mismatch: {tx_rows} != {expected_tx_rows}"
+        )
     destination = state_dir / BENCHMARK_HISTORY_FILENAME
     _atomic_json(destination, output)
     print(
@@ -1007,6 +1225,10 @@ def main() -> None:
                     {
                         item["contract"]["code"]
                         for item in provenance["tx_capture_manifests"].values()
+                    }
+                    | {
+                        item["contract"]["code"]
+                        for item in provenance["tx_history_receipts"].values()
                     }
                 ),
                 **output["counts"],
