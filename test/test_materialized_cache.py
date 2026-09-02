@@ -128,6 +128,10 @@ def test_expired_gc_removes_only_hot_copy_and_can_refetch(tmp_path: Path) -> Non
     assert result["evicted"] == 1
     assert not target.exists()
     assert not (hot_root / "current" / "prices").exists()
+    assert not (hot_root / "current" / "prices").is_symlink()
+    assert result["results"][0]["removed_links"] == [
+        str(hot_root / "current" / "prices")
+    ]
     assert (sync_root / "manifests" / "prices" / f"{snapshot_id}.json").is_file()
 
     renewed = use_materialized_snapshot(

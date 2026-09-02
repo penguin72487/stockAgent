@@ -37,6 +37,62 @@ def test_symbol_yahoo_map_derives_suffix_from_official_venue(tmp_path) -> None:
     }
 
 
+def test_shared_day_trade_quote_broker_reuses_serving_process_snapshot(
+    tmp_path, monkeypatch
+) -> None:
+    expected = PriceSnapshot(
+        prices=np.array([101.0, 202.0]),
+        source="shioaji:stock_snapshot",
+        timestamp="2026-09-02T09:45:00+08:00",
+        available_count=2,
+        requested_count=2,
+        available_mask=np.array([True, True]),
+        bid_prices=np.array([100.5, 201.5]),
+        ask_prices=np.array([101.5, 202.5]),
+        timestamps_ms=np.array([1_800_000_000_000, 1_800_000_000_001]),
+    )
+    monkeypatch.setattr(
+        quote_provider,
+        "fetch_shioaji_stock_snapshots",
+        lambda symbols, fallback_prices, *, cache_ttl_seconds: expected,
+    )
+    result: list[PriceSnapshot] = []
+    errors: list[BaseException] = []
+
+    def request() -> None:
+        try:
+            result.append(
+                quote_provider.fetch_shared_day_trade_stock_snapshots(
+                    ["2330", "2317"],
+                    np.array([100.0, 200.0]),
+                    state_dir=tmp_path,
+                    timeout_seconds=2.0,
+                )
+            )
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    thread = threading.Thread(target=request)
+    thread.start()
+    requests_dir = quote_provider.day_trade_quote_broker_request_dir(tmp_path)
+    deadline = time.monotonic() + 1.0
+    while not list(requests_dir.glob("*.json")) and time.monotonic() < deadline:
+        time.sleep(0.005)
+    receipts = quote_provider.serve_shared_day_trade_quote_requests(
+        state_dir=tmp_path,
+        max_requests=1,
+    )
+    thread.join(timeout=2.0)
+
+    assert not errors
+    assert not thread.is_alive()
+    assert receipts[0]["available_count"] == 2
+    assert result[0].source == "shioaji:stock_snapshot+shared_day_trade_engine"
+    np.testing.assert_allclose(result[0].prices, [101.0, 202.0])
+    np.testing.assert_allclose(result[0].bid_prices, [100.5, 201.5])
+    np.testing.assert_array_equal(result[0].available_mask, [True, True])
+
+
 def test_historical_0901_vwap_uses_only_0900_minute_ticks(monkeypatch) -> None:
     timestamps = np.asarray(
         [

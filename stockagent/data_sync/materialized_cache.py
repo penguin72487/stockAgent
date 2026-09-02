@@ -152,6 +152,10 @@ def _atomic_symlink(link: Path, target: Path) -> None:
 def _link_points_to(link: Path, target: Path) -> bool:
     if not link.is_symlink():
         return False
+    try:
+        return link.resolve(strict=False) == target.resolve(strict=False)
+    except OSError:
+        return False
 
 
 def _quarantine_corrupt_materialization(
@@ -180,10 +184,6 @@ def _quarantine_corrupt_materialization(
         os.replace(ready, destination)
         result["ready"] = str(destination)
     return result
-    try:
-        return link.resolve(strict=False) == target.resolve(strict=False)
-    except OSError:
-        return False
 
 
 def use_materialized_snapshot(

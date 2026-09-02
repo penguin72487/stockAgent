@@ -34,10 +34,12 @@ from stockagent.live.market_config import (  # noqa: E402
 )
 from stockagent.live.market_status import verified_tw_stock_session_day  # noqa: E402
 from stockagent.live.quote_provider import (  # noqa: E402
+    day_trade_quote_broker_request_dir,
     fetch_futures_snapshot_prefer_stream,
     fetch_shioaji_historical_stock_0901_vwaps,
     fetch_shioaji_stock_snapshots,
     prepare_tw_price_limit_snapshot,
+    serve_shared_day_trade_quote_requests,
     warm_shioaji_stock_quote_client,
 )
 from stockagent.live.service_notify import notify_systemd  # noqa: E402
@@ -218,6 +220,11 @@ def _resolve_missed_opening_prices(
             missing,
             trading_date=observed.date(),
             max_traffic_fraction=0.90,
+            progress_callback=lambda index, total, queried, resolved: notify_systemd(
+                "WATCHDOG=1\n"
+                "STATUS=missed-opening 09:01 recovery "
+                f"{index}/{total}; queried={queried}; resolved={resolved}"
+            ),
         )
         cached.update({symbol: dict(row) for symbol, row in fetched.items()})
         receipt = {
@@ -1219,7 +1226,10 @@ def main(argv: list[str] | None = None) -> int:
         observed = datetime.now(TAIPEI)
         if monotonic_now - last_reload >= 30.0 or not specs:
             specs, live_configs, errors = _mode_specs(markets_dir)
-            signal_watcher.configure([spec.live_output_dir for spec in specs])
+            signal_watcher.configure(
+                [spec.live_output_dir for spec in specs]
+                + [day_trade_quote_broker_request_dir(state_dir)]
+            )
             session_open, session_errors = _verified_stock_session(
                 specs,
                 live_configs,
@@ -1374,6 +1384,28 @@ def main(argv: list[str] | None = None) -> int:
         if monotonic_now - last_readiness >= 10.0:
             engine.update_readiness(specs, now=observed)
             last_readiness = monotonic_now
+
+        broker_wall_time = observed.timetz().replace(tzinfo=None)
+        broker_protected_open = (
+            datetime_time(8, 59, 30)
+            <= broker_wall_time
+            < MISSED_OPENING_COMMIT_DEADLINE
+        )
+        if not broker_protected_open:
+            broker_results = serve_shared_day_trade_quote_requests(
+                state_dir=engine.state_dir,
+                max_requests=1,
+            )
+            for broker_result in broker_results:
+                notify_systemd("WATCHDOG=1")
+                print(
+                    "[tw-day-trade-sim] shared_quote_request "
+                    f"id={broker_result.get('request_id')} "
+                    f"available={broker_result.get('available_count', 0)}/"
+                    f"{broker_result.get('requested_count', 0)} "
+                    f"error={broker_result.get('error')}",
+                    flush=True,
+                )
 
         prewarm_wall_time = observed.timetz().replace(tzinfo=None)
         prewarm_session = observed.date().isoformat()

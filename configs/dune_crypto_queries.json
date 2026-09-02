@@ -32,7 +32,7 @@
       "history_start": "2018-01-01",
       "chunk_months": 3,
       "cadence_seconds": 86400,
-      "performance": "medium",
+      "performance": "small",
       "description": "Daily DEX buy/sell activity for major crypto and stablecoin assets. This adds venue, direction and active-trader state beyond DefiLlama aggregate volume."
     },
     {
@@ -68,7 +68,7 @@
       "history_start": "2020-01-01",
       "chunk_months": 3,
       "cadence_seconds": 86400,
-      "performance": "medium",
+      "performance": "small",
       "description": "Flows touching Dune addresses labelled as Binance, OKX or Bybit users. The label snapshot version is part of the key; this is not called proof of reserves."
     },
     {
@@ -100,7 +100,7 @@
       "history_start": "2018-01-01",
       "chunk_months": 3,
       "cadence_seconds": 86400,
-      "performance": "medium",
+      "performance": "small",
       "description": "Realized mint and burn events for major stablecoins, kept separate from DefiLlama outstanding-supply snapshots."
     }
   ],

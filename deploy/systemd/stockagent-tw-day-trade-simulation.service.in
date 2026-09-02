@@ -20,7 +20,11 @@ CPUWeight=100
 IOWeight=100
 Restart=always
 RestartSec=1s
-WatchdogSec=20s
+# Historical 09:01 recovery is a bounded request/reply batch.  Individual
+# Shioaji Tick calls may legitimately wait up to 30s, while the in-process
+# opening path keeps its tighter progress checks.  Keep the outer process
+# watchdog above that legitimate blocking interval.
+WatchdogSec=90s
 TimeoutStartSec=60s
 SuccessExitStatus=143 SIGTERM
 TimeoutStopSec=20s

@@ -83,6 +83,19 @@ def audit_ok(path: Path) -> bool:
     )
 
 
+def terminal_skip_ok(path: Path) -> bool:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return (
+        isinstance(payload, dict)
+        and payload.get("trade_date") == trade_date
+        and payload.get("status") == "skipped"
+        and payload.get("reason") == "connection_budget"
+    )
+
+
 # Before 07:45 no stock live capture owns the quote connections or traffic, so
 # historical work may run.  From 07:45 onward the live capture and its audits
 # own the window through 14:31.
@@ -96,6 +109,10 @@ elif audit_ok(Path(f"data_tw_microstructure/audits/{trade_date}.json")) and audi
     Path(f"data_tw_microstructure/audits/hft_{trade_date}.json")
 ):
     print("0 top200_audited")
+elif terminal_skip_ok(
+    Path("artifacts/data_capture/shioaji_top200/latest_capture_state.json")
+):
+    print("0 top200_terminal_skip")
 else:
     print("60 top200_audit_pending")
 PY

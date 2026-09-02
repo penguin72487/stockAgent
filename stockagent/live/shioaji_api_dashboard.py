@@ -1560,6 +1560,22 @@ def _build_pipelines(
         or 0
     )
     minute_available = int((minute_audit or {}).get("available_source_symbols") or 0)
+    minute_unavailable_symbols = int(
+        (minute_audit or {}).get("contract_unavailable_symbols") or 0
+    )
+    # ``minute_total`` is the selected work in the latest incremental run.  It
+    # can be much smaller than the canonical research universe, so it is not a
+    # valid denominator for all-time research coverage.  Prefer the manifest's
+    # full-market contract and retain a conservative receipt-derived fallback
+    # for older manifests.
+    minute_research_total = int(
+        (minute_manifest or {}).get("full_market_selected_symbols") or 0
+    )
+    if minute_research_total <= 0:
+        minute_research_total = max(
+            minute_total,
+            minute_available + minute_unavailable_symbols,
+        )
     minute_latest = _payload_time(
         minute_run_summary or minute_summary or minute_manifest,
         (
@@ -1723,9 +1739,6 @@ def _build_pipelines(
             now=now,
         )
     minute_gap_symbols = int((minute_audit or {}).get("source_gap_symbols") or 0)
-    minute_unavailable_symbols = int(
-        (minute_audit or {}).get("contract_unavailable_symbols") or 0
-    )
     minute_warnings = []
     if minute_gap_symbols or minute_unavailable_symbols:
         minute_warnings.append(
@@ -1825,7 +1838,7 @@ def _build_pipelines(
             "target_date": minute_target_date or None,
             "coverage": _coverage(
                 minute_available,
-                minute_total,
+                minute_research_total,
                 unit="標的",
                 label="可研究標的",
             ),
@@ -1871,7 +1884,7 @@ def _build_pipelines(
             "detail": "將已落盤分鐘 K 棒轉成時間因果特徵、標籤與可交易遮罩。",
             "coverage": _coverage(
                 (minute_audit or {}).get("available_source_symbols"),
-                minute_total,
+                minute_research_total,
                 unit="標的",
                 label="可研究標的",
             ),

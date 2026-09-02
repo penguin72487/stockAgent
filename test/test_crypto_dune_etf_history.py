@@ -33,6 +33,7 @@ def test_dune_contracts_are_versioned_and_bound_to_three_active_cex_labels() -> 
         assert "{{end_date}}" in contract.sql
         assert len(contract.sql_sha256) == 64
         assert set(contract.primary_key) <= set(contract.expected_columns)
+        assert contract.performance == "small"
     cex = next(item for item in contracts if item.fact_family == "cex_labeled_token_flows")
     lowered = cex.sql.lower()
     assert all(name in lowered for name in ("binance", "okx", "bybit"))

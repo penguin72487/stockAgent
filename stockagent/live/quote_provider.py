@@ -9,8 +9,9 @@ from dataclasses import dataclass
 from datetime import date, datetime, time as datetime_time, timezone
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import quote
+import uuid
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -88,6 +89,86 @@ class PriceSnapshot:
     # decoding yields Taiwan wall time; it is not a UTC epoch to shift by +8h.
     # timestamps_ms remains the true local response receipt time.
     exchange_timestamps_ms: np.ndarray | None = None
+
+
+def _day_trade_quote_broker_paths(
+    state_dir: str | Path | None = None,
+) -> tuple[Path, Path]:
+    root = Path(
+        state_dir
+        or os.getenv(
+            "TW_DAY_TRADE_STATE_DIR",
+            "artifacts/live/tw_day_trade_simulation",
+        )
+    )
+    broker = root / "quote_broker"
+    requests_dir = broker / "requests"
+    responses_dir = broker / "responses"
+    requests_dir.mkdir(parents=True, exist_ok=True)
+    responses_dir.mkdir(parents=True, exist_ok=True)
+    return requests_dir, responses_dir
+
+
+def day_trade_quote_broker_request_dir(
+    state_dir: str | Path | None = None,
+) -> Path:
+    """Return the local inbox path so the engine can attach its inotify watch."""
+
+    requests_dir, _responses_dir = _day_trade_quote_broker_paths(state_dir)
+    return requests_dir
+
+
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(
+        f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    )
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True),
+        encoding="utf-8",
+    )
+    os.replace(temporary, path)
+
+
+def _price_snapshot_payload(snapshot: PriceSnapshot) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "prices": np.asarray(snapshot.prices, dtype=np.float64).tolist(),
+        "source": str(snapshot.source),
+        "timestamp": snapshot.timestamp,
+        "available_count": int(snapshot.available_count),
+        "requested_count": int(snapshot.requested_count),
+    }
+    for name in (*_PRICE_SNAPSHOT_ARRAY_FIELDS, "available_mask"):
+        values = getattr(snapshot, name)
+        if values is not None:
+            payload[name] = np.asarray(values).tolist()
+    for name in ("timestamps_ms", "exchange_timestamps_ms"):
+        values = getattr(snapshot, name)
+        if values is not None:
+            payload[name] = np.asarray(values, dtype=np.int64).tolist()
+    return payload
+
+
+def _price_snapshot_from_payload(payload: dict[str, Any]) -> PriceSnapshot:
+    prices = np.asarray(payload.get("prices") or (), dtype=np.float64)
+    keyword: dict[str, Any] = {
+        "prices": prices,
+        "source": str(payload.get("source") or "unknown"),
+        "timestamp": payload.get("timestamp"),
+        "available_count": int(payload.get("available_count") or 0),
+        "requested_count": int(payload.get("requested_count") or len(prices)),
+    }
+    for name in _PRICE_SNAPSHOT_ARRAY_FIELDS:
+        if payload.get(name) is not None:
+            keyword[name] = np.asarray(payload[name], dtype=np.float64)
+    if payload.get("available_mask") is not None:
+        keyword["available_mask"] = np.asarray(
+            payload["available_mask"], dtype=bool
+        )
+    for name in ("timestamps_ms", "exchange_timestamps_ms"):
+        if payload.get(name) is not None:
+            keyword[name] = np.asarray(payload[name], dtype=np.int64)
+    return PriceSnapshot(**keyword)
 
 
 def _is_shioaji_session_failure(exc: BaseException) -> bool:
@@ -510,6 +591,7 @@ def fetch_shioaji_historical_stock_0901_vwaps(
     max_traffic_fraction: float = 0.90,
     timeout_ms: int = 30_000,
     progress_every: int = 50,
+    progress_callback: Callable[[int, int, int, int], None] | None = None,
 ) -> tuple[dict[str, dict[str, float | int | str]], dict[str, Any]]:
     """Fetch the observed right-labelled 09:01 minute VWAP per stock.
 
@@ -563,6 +645,8 @@ def fetch_shioaji_historical_stock_0901_vwaps(
     )
 
     for index, symbol in enumerate(requested, start=1):
+        if progress_callback is not None:
+            progress_callback(index - 1, len(requested), queried, len(resolved))
         current_usage = usage()
         if current_usage is not None and float(current_usage["fraction"]) >= float(
             max_traffic_fraction
@@ -671,6 +755,8 @@ def fetch_shioaji_historical_stock_0901_vwaps(
                 f"queried={queried} resolved={len(resolved)}",
                 flush=True,
             )
+            if progress_callback is not None:
+                progress_callback(index, len(requested), queried, len(resolved))
 
     return resolved, {
         "source": "shioaji:historical_ticks_0900_090059_vwap_right_label_0901",
@@ -913,6 +999,158 @@ def fetch_shioaji_stock_snapshots(
                 raise
             _reconnect_shioaji_stock_quote_client(api)
     raise AssertionError("unreachable Shioaji stock snapshot retry state")
+
+
+def fetch_shared_day_trade_stock_snapshots(
+    symbols: list[str],
+    fallback_prices: np.ndarray,
+    *,
+    state_dir: str | Path | None = None,
+    timeout_seconds: float | None = None,
+) -> PriceSnapshot:
+    """Ask the long-lived paper engine to use its existing Shioaji session.
+
+    Shioaji logins are a scarce account-level resource.  Discord must not open
+    another process-local session merely to refresh an interactive signal while
+    the day-trade engine already owns a healthy simulation-only quote session.
+    The filesystem request/response boundary is local, atomic, bounded, and
+    carries per-row receipt times from the serving process.
+    """
+
+    requested = [str(symbol).strip() for symbol in symbols]
+    fallback = np.asarray(fallback_prices, dtype=np.float64)
+    if len(requested) != len(fallback):
+        raise ValueError("symbols and fallback_prices must have equal length")
+    if not requested:
+        raise ValueError("shared day-trade quote request is empty")
+    if len(requested) > 5_000:
+        raise ValueError("shared day-trade quote request exceeds 5000 symbols")
+    timeout = max(
+        0.25,
+        float(timeout_seconds)
+        if timeout_seconds is not None
+        else float(
+            os.getenv("STOCKAGENT_SHARED_QUOTE_TIMEOUT_SECONDS", "6") or "6"
+        ),
+    )
+    requests_dir, responses_dir = _day_trade_quote_broker_paths(state_dir)
+    request_id = uuid.uuid4().hex
+    request_path = requests_dir / f"{request_id}.json"
+    response_path = responses_dir / f"{request_id}.json"
+    requested_at = datetime.now(timezone.utc)
+    deadline_epoch = time.time() + timeout
+    _atomic_write_json(
+        request_path,
+        {
+            "schema_version": 1,
+            "request_id": request_id,
+            "requested_at_utc": requested_at.isoformat(),
+            "deadline_epoch": deadline_epoch,
+            "symbols": requested,
+            "fallback_prices": fallback.tolist(),
+            "requester_pid": os.getpid(),
+        },
+    )
+    try:
+        while time.time() < deadline_epoch:
+            try:
+                payload = json.loads(response_path.read_text(encoding="utf-8"))
+            except FileNotFoundError:
+                time.sleep(0.01)
+                continue
+            except (OSError, json.JSONDecodeError):
+                time.sleep(0.01)
+                continue
+            if str(payload.get("request_id") or "") != request_id:
+                raise RuntimeError("shared day-trade quote response id mismatch")
+            if payload.get("error"):
+                raise RuntimeError(str(payload["error"]))
+            snapshot_payload = payload.get("snapshot")
+            if not isinstance(snapshot_payload, dict):
+                raise RuntimeError("shared day-trade quote response has no snapshot")
+            snapshot = _price_snapshot_from_payload(snapshot_payload)
+            if len(snapshot.prices) != len(requested):
+                raise RuntimeError(
+                    "shared day-trade quote response size mismatch: "
+                    f"received={len(snapshot.prices)} requested={len(requested)}"
+                )
+            snapshot.source = f"{snapshot.source}+shared_day_trade_engine"
+            return snapshot
+        raise TimeoutError(
+            "shared day-trade quote engine did not respond within "
+            f"{timeout:.3f}s"
+        )
+    finally:
+        request_path.unlink(missing_ok=True)
+        response_path.unlink(missing_ok=True)
+
+
+def serve_shared_day_trade_quote_requests(
+    *,
+    state_dir: str | Path | None = None,
+    max_requests: int = 1,
+) -> list[dict[str, Any]]:
+    """Serve bounded local quote requests inside the paper-engine process."""
+
+    requests_dir, responses_dir = _day_trade_quote_broker_paths(state_dir)
+    results: list[dict[str, Any]] = []
+    request_paths = sorted(
+        requests_dir.glob("*.json"),
+        key=lambda path: path.stat().st_mtime_ns,
+    )[: max(0, int(max_requests))]
+    now_epoch = time.time()
+    for request_path in request_paths:
+        request_id = request_path.stem
+        response_path = responses_dir / f"{request_id}.json"
+        served_at = datetime.now(timezone.utc)
+        response: dict[str, Any] = {
+            "schema_version": 1,
+            "request_id": request_id,
+            "served_at_utc": served_at.isoformat(),
+            "server_pid": os.getpid(),
+        }
+        try:
+            request = json.loads(request_path.read_text(encoding="utf-8"))
+            if str(request.get("request_id") or "") != request_id:
+                raise ValueError("quote request id does not match its filename")
+            deadline_epoch = float(request.get("deadline_epoch") or 0.0)
+            if deadline_epoch <= now_epoch:
+                raise TimeoutError("shared quote request expired before service")
+            symbols = [str(value).strip() for value in request.get("symbols") or ()]
+            fallback = np.asarray(
+                request.get("fallback_prices") or (), dtype=np.float64
+            )
+            if not symbols or len(symbols) != len(fallback):
+                raise ValueError("shared quote request symbols/fallback are invalid")
+            if len(symbols) > 5_000:
+                raise ValueError("shared quote request exceeds 5000 symbols")
+            snapshot = fetch_shioaji_stock_snapshots(
+                symbols,
+                fallback,
+                cache_ttl_seconds=0.0,
+            )
+            response["snapshot"] = _price_snapshot_payload(snapshot)
+            response["available_count"] = int(snapshot.available_count)
+            response["requested_count"] = len(symbols)
+        except Exception as exc:
+            response["error"] = f"{type(exc).__name__}: {exc}"
+        try:
+            _atomic_write_json(response_path, response)
+        finally:
+            request_path.unlink(missing_ok=True)
+        results.append(response)
+
+    # A requester may die after publication.  Keep the broker self-cleaning
+    # without touching any ledger or signal artifact.
+    stale_before = time.time() - 300.0
+    for directory in (requests_dir, responses_dir):
+        for path in directory.glob("*.json"):
+            try:
+                if path.stat().st_mtime < stale_before:
+                    path.unlink(missing_ok=True)
+            except FileNotFoundError:
+                pass
+    return results
 
 
 def _fetch_shioaji_stock_snapshots_once(
@@ -1921,7 +2159,7 @@ def fetch_tw_mis_last_prices(
         0,
         int(empty_chunk_retry_attempts)
         if empty_chunk_retry_attempts is not None
-        else int(os.getenv("STOCKAGENT_TW_MIS_RETRY_ATTEMPTS", "3") or "3"),
+        else int(os.getenv("STOCKAGENT_TW_MIS_RETRY_ATTEMPTS", "1") or "1"),
     )
     retry_delay_seconds = max(
         0.0,
@@ -2091,19 +2329,31 @@ def fetch_tw_mis_last_prices(
             chunk_results[futures[future]] = future.result()
 
     # MIS intermittently closes full-universe connections. Empty chunks are not
-    # usable evidence that no symbol traded, so retry only those chunks in a
-    # paced single-thread pass. Never substitute the intraday last price for a
-    # missing opening price; callers receive NaN in open_prices and fail closed.
-    for chunk_index, rows in enumerate(chunk_results):
-        if rows or retry_attempts <= 0:
-            continue
-        for attempt in range(retry_attempts):
-            if retry_delay_seconds > 0.0:
-                time.sleep(retry_delay_seconds * (attempt + 1))
-            rows = fetch_chunk(chunks[chunk_index])
-            if rows:
-                chunk_results[chunk_index] = rows
-                break
+    # evidence that no symbol traded. Retry the empty set in bounded parallel
+    # rounds: the former per-chunk serial loop multiplied an outage into about
+    # 82 seconds before the healthy broker fallback could even run.
+    for attempt in range(retry_attempts):
+        empty_indices = [
+            index for index, rows in enumerate(chunk_results) if not rows
+        ]
+        if not empty_indices:
+            break
+        if retry_delay_seconds > 0.0:
+            time.sleep(retry_delay_seconds * (attempt + 1))
+        retry_workers = max(1, min(len(empty_indices), workers))
+        with ThreadPoolExecutor(
+            max_workers=retry_workers,
+            thread_name_prefix="tw-mis-quote-retry",
+        ) as executor:
+            retry_futures = {
+                executor.submit(fetch_chunk, chunks[index]): index
+                for index in empty_indices
+            }
+            for future in as_completed(retry_futures):
+                index = retry_futures[future]
+                rows = future.result()
+                if rows:
+                    chunk_results[index] = rows
 
     for rows in chunk_results:
         for (

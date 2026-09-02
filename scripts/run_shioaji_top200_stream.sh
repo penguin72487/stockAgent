@@ -29,6 +29,7 @@ RESERVED_STOCK_QUOTE_CLIENTS="${SHIOAJI_RESERVED_STOCK_QUOTE_CLIENTS:-2}"
 TOP200_WORKERS=2
 LOG_FILE="$RUN_ROOT/run.log"
 LOCK_FILE="$RUN_ROOT/runner.lock"
+CAPTURE_STATE_FILE="$RUN_ROOT/latest_capture_state.json"
 mkdir -p "$RUN_ROOT"
 exec 9>"$LOCK_FILE"
 if ! flock -n 9; then
@@ -36,6 +37,38 @@ if ! flock -n 9; then
   exit 3
 fi
 exec > >(tee -a "$LOG_FILE") 2>&1
+
+write_capture_state() {
+  local trade_date="$1"
+  local status="$2"
+  local reason="$3"
+  run_fintech_python - "$CAPTURE_STATE_FILE" "$trade_date" "$status" "$reason" \
+    "$TAIFEX_WORKERS" "$RESERVED_STOCK_QUOTE_CLIENTS" "$TOP200_WORKERS" \
+    "$MAX_CONNECTIONS" <<'PY'
+from datetime import UTC, datetime
+import json
+import os
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+payload = {
+    "schema_version": 1,
+    "trade_date": sys.argv[2],
+    "status": sys.argv[3],
+    "reason": sys.argv[4],
+    "taifex_workers": int(sys.argv[5]),
+    "reserved_stock_quote_clients": int(sys.argv[6]),
+    "top200_workers": int(sys.argv[7]),
+    "max_connections": int(sys.argv[8]),
+    "written_at_utc": datetime.now(UTC).isoformat(),
+}
+path.parent.mkdir(parents=True, exist_ok=True)
+temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+os.replace(temporary, path)
+PY
+}
 
 seconds_until_capture_window() {
   run_fintech_python - <<'PY'
@@ -106,8 +139,10 @@ while true; do
 
   wait_for_taifex_priority
 
+  trade_date="$(TZ=Asia/Taipei date +%F)"
   required_connections=$((TAIFEX_WORKERS + RESERVED_STOCK_QUOTE_CLIENTS + TOP200_WORKERS))
   if (( required_connections > MAX_CONNECTIONS )); then
+    write_capture_state "$trade_date" "skipped" "connection_budget"
     echo "[shioaji-top200] capture_skipped reason=connection_budget required=$required_connections max=$MAX_CONNECTIONS taifex=$TAIFEX_WORKERS reserved_day_trade_quotes=$RESERVED_STOCK_QUOTE_CLIENTS top200=$TOP200_WORKERS"
     next_delay="$(seconds_until_next_capture_day)"
     echo "[shioaji-top200] waiting_seconds=$next_delay reason=next_capture_day"
@@ -115,7 +150,7 @@ while true; do
     continue
   fi
 
-  trade_date="$(TZ=Asia/Taipei date +%F)"
+  write_capture_state "$trade_date" "capturing" "capture_started"
   echo "[shioaji-top200] universe_refresh date=$trade_date"
   run_fintech_python downloader/build_tw_top_market_cap_universe.py --count 200
 
@@ -158,7 +193,9 @@ while true; do
     run_fintech_python scripts/audit_shioaji_hft_dataset.py \
       --trade-date "$trade_date" --dataset-root "$HFT_DATASET_ROOT" \
       --output "data_tw_microstructure/audits/hft_$trade_date.json"
+    write_capture_state "$trade_date" "complete" "audits_complete"
   else
+    write_capture_state "$trade_date" "failed" "capture_worker_failure"
     echo "[shioaji-top200] capture_failed date=$trade_date" >&2
   fi
   next_delay="$(seconds_until_next_capture_day)"

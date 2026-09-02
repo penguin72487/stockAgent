@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 from http.client import HTTPConnection
 import json
@@ -16,6 +17,7 @@ from scripts.serve_public_dashboards import (
     PublicDashboardHandler,
     PublicDashboardServer,
     PublicTrafficObserver,
+    build_compact_tw_overview_status,
     build_public_overview,
     summarize_tw_status,
 )
@@ -562,6 +564,68 @@ def test_public_overview_and_tw_summary_exclude_large_ledgers() -> None:
     assert '"positions": [' not in encoded
 
 
+def test_compact_tw_overview_reads_atomic_status_and_current_failed_gate(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    (state_dir / "status.json").write_text(
+        json.dumps(
+            {
+                "health": "waiting",
+                "updated_at": "2026-09-01T01:00:00+00:00",
+                "simulation_only": True,
+                "production_order_possible": False,
+                "modes": {
+                    "a": {"open_position_count": 2},
+                    "b": {"open_position_count": 0, "stale_position_count": 1},
+                },
+                "private_path": "/private/state.json",
+            }
+        ),
+        encoding="utf-8",
+    )
+    gate = tmp_path / "opening-gate.json"
+    gate.write_text(
+        json.dumps({"session_date": "2026-09-01", "status": "failed"}),
+        encoding="utf-8",
+    )
+
+    payload = build_compact_tw_overview_status(
+        state_dir,
+        opening_gate_path=gate,
+        now=datetime.fromisoformat("2026-09-01T01:00:10+00:00"),
+    )
+
+    assert payload["health"] == "degraded"
+    assert payload["source_age_seconds"] == 10.0
+    assert payload["simulation_only"] is True
+    assert payload["production_order_possible"] is False
+    assert payload["modes"] == [
+        {"market": "a", "open_position_count": 2, "stale_position_count": 0},
+        {"market": "b", "open_position_count": 0, "stale_position_count": 1},
+    ]
+    assert "private_path" not in payload
+
+
+def test_compact_tw_overview_fails_closed_on_unsafe_receipt(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    (state_dir / "status.json").write_text(
+        json.dumps(
+            {
+                "updated_at": "2026-09-01T01:00:00+00:00",
+                "simulation_only": True,
+                "production_order_possible": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(UnsafePublicDashboardPayload):
+        build_compact_tw_overview_status(state_dir)
+
+
 def test_public_pages_share_visual_tokens() -> None:
     root = Path(__file__).resolve().parents[1] / "services"
     shared = (root / "public_dashboards" / "dashboard-core.css").read_text(
@@ -1012,6 +1076,20 @@ def test_overview_cache_matches_one_minute_client_refresh_contract() -> None:
     assert "ttl_seconds=55.0" in source
     assert "ThreadPoolExecutor" in source
     assert "prewarm_overview" in source
+
+
+def test_overview_prewarms_before_large_history_scans() -> None:
+    source = (
+        Path(__file__).resolve().parents[1] / "scripts/serve_public_dashboards.py"
+    ).read_text(encoding="utf-8")
+    method = source[source.index("    def prewarm_default_views") :]
+    overview_call = method.index("            self.prewarm_overview()")
+    tw_status_call = method.index("            self.tw_status()")
+    history_call = method.index("            taifex_history_builder()")
+    detail_pool = method.index(
+        "        builders: tuple[Callable[[], object], ...] = ("
+    )
+    assert overview_call < tw_status_call < history_call < detail_pool
 
 
 def test_token_bucket_rate_limiter_refills_and_caps_client_table() -> None:

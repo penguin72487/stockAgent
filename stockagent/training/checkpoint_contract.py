@@ -201,6 +201,17 @@ def _project_temporal_basis_model_config(
         # post-feature field so old checkpoints keep their fingerprint; an
         # enabled contraction remains explicit and owns a fresh trajectory.
         projected.pop("temporal_basis_algebraic_contraction", None)
+    for field_name in (
+        "futures_denomination_aware_output",
+        "futures_current_open_feature",
+    ):
+        if not bool(projected.get(field_name, False)):
+            # These futures-only branches were added after the cash-equity
+            # checkpoints.  A disabled value neither adds parameters nor
+            # changes their forward path, so it must not invalidate every
+            # pre-existing non-futures checkpoint.  Enabled branches remain
+            # explicit and therefore keep their own strict fingerprints.
+            projected.pop(field_name, None)
     if int(projected.get("daily_context_layers", 0) or 0) == 0:
         # These controls have no parameters or forward-path effect until the
         # daily-context branch has at least one layer.  Omitting them preserves
