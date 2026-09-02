@@ -49,6 +49,7 @@ TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_GUARDED_CURRENT_OPEN_CONTRACT_VERSION: Final[
 TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_EXPIRY_SETTLEMENT_CONTRACT_VERSION: Final[
     int
 ] = 6
+TAIFEX_FUTURES_FINAL_SETTLEMENT_SCHEMA_VERSION: Final[int] = 1
 TW_STOCK_CONTEXT_FUTURES_PRIOR_MARKET_FEATURE_COLUMNS: Final[tuple[str, ...]] = (
     *FUTURES_MODEL_FEATURE_COLUMNS,
     "cash_stock_underlying_panel_index",
@@ -122,7 +123,10 @@ class TaiwanStockContextFuturesPortfolioDaily:
     manifest_path: str
     integer_execution: np.ndarray | None = None
     carry_valuation_quarantine_mask: np.ndarray | None = None
+    expiry_settlement_quarantine_mask: np.ndarray | None = None
+    expiry_settlement_quarantined_physical_contracts: int = 0
     expiry_settlement_valuation: bool = False
+    expiry_final_settlement_path: str | None = None
     contract_version: int = TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_CONTRACT_VERSION
     futures_data_contract_version: int = (
         TAIFEX_FUTURES_PORTFOLIO_DATA_CONTRACT_VERSION
@@ -182,6 +186,7 @@ def attach_stock_context_futures_portfolio_daily(
     current_open_feature: bool = False,
     carry_valuation_max_abs_simple_return: float = 0.0,
     expiry_settlement_valuation: bool = False,
+    final_settlement_path: str | Path | None = None,
     integer_fee_per_contract_per_side_twd: float = 40.0,
     max_volume_participation: float = 0.0,
 ) -> PanelData:
@@ -197,8 +202,10 @@ def attach_stock_context_futures_portfolio_daily(
     identity, standard/mini tier, and one fully collateralized contract's cash
     need. Current close/return/volume remain executor-only.  With
     ``expiry_settlement_valuation``, only a contract's own ``last_trade_date``
-    row replaces the ordinary close-valued terminal return with the observed
-    TAIFEX settlement-valued return; non-expiry exits are unchanged.
+    row replaces the ordinary close-valued terminal return with a separately
+    receipted official TAIFEX *final* settlement price; the daily settlement
+    column is deliberately not accepted as a substitute. Non-expiry exits are
+    unchanged.
     """
 
     _require_dependencies()
@@ -279,7 +286,7 @@ def attach_stock_context_futures_portfolio_daily(
     if current_open_feature:
         source_columns.append("previous_settlement")
     if expiry_settlement_valuation:
-        source_columns.extend(["settlement", "liquidation_reason"])
+        source_columns.append("liquidation_reason")
     table = pq.read_table(
         source_path,
         columns=source_columns,
@@ -317,6 +324,81 @@ def attach_stock_context_futures_portfolio_daily(
     frame = frame.filter(pl.Series("aligned", aligned))
     if frame.height == 0:
         raise ValueError("TAIFEX futures rows do not intersect the stock date axis")
+    frame = frame.with_row_index("_aligned_source_row")
+
+    resolved_final_settlement_path: Path | None = None
+    if expiry_settlement_valuation:
+        if final_settlement_path is None or not str(final_settlement_path).strip():
+            raise ValueError(
+                "expiry settlement valuation requires a receipt-backed official "
+                "TAIFEX final settlement path"
+            )
+        resolved_final_settlement_path = Path(final_settlement_path)
+        settlement_manifest_path = resolved_final_settlement_path.parent / "manifest.json"
+        if not resolved_final_settlement_path.is_file() or not settlement_manifest_path.is_file():
+            raise FileNotFoundError(
+                "official TAIFEX final settlement dataset/manifest missing: "
+                f"{resolved_final_settlement_path}, {settlement_manifest_path}"
+            )
+        settlement_manifest = json.loads(
+            settlement_manifest_path.read_text(encoding="utf-8")
+        )
+        if int(settlement_manifest.get("schema_version", -1)) != int(
+            TAIFEX_FUTURES_FINAL_SETTLEMENT_SCHEMA_VERSION
+        ):
+            raise ValueError("official TAIFEX final settlement schema mismatch")
+        settlement_expected_sha = (
+            settlement_manifest.get("outputs", {})
+            .get("futures_final_settlement_history", {})
+            .get("sha256")
+        )
+        if settlement_expected_sha != _sha256_file(resolved_final_settlement_path):
+            raise ValueError(
+                "official TAIFEX final settlement SHA-256 differs from manifest"
+            )
+        settlement_table = pq.read_table(
+            resolved_final_settlement_path,
+            columns=[
+                "settlement_date",
+                "product",
+                "contract",
+                "final_settlement_price",
+            ],
+            filters=[
+                ("settlement_date", ">=", date.fromisoformat(str(dates.min()))),
+                ("settlement_date", "<=", date.fromisoformat(str(dates.max()))),
+            ],
+            memory_map=True,
+        )
+        settlements = pl.from_arrow(settlement_table).with_columns(
+            pl.col("settlement_date").cast(pl.Date),
+            pl.col("product").cast(pl.String).str.strip_chars().str.to_uppercase(),
+            pl.col("contract").cast(pl.String).str.strip_chars().str.to_uppercase(),
+            pl.col("final_settlement_price").cast(pl.Float64),
+        )
+        duplicate_settlements = (
+            settlements.group_by("settlement_date", "product", "contract")
+            .agg(
+                pl.len().alias("rows"),
+                pl.col("final_settlement_price").n_unique().alias("prices"),
+            )
+            .filter((pl.col("rows") != 1) | (pl.col("prices") != 1))
+        )
+        if duplicate_settlements.height:
+            raise ValueError(
+                "official TAIFEX final settlement keys must be unique"
+            )
+        frame = frame.join(
+            settlements.rename(
+                {
+                    "settlement_date": "date",
+                    "final_settlement_price": "_official_final_settlement_price",
+                }
+            ),
+            on=["date", "product", "contract"],
+            how="left",
+            validate="m:1",
+        ).sort("_aligned_source_row")
 
     # A stock/ETF future physical contract whose adjacent-OPEN valuation jumps
     # outside the configured integrity envelope cannot be reconstructed from
@@ -325,7 +407,42 @@ def attach_stock_context_futures_portfolio_daily(
     # label would invent P&L and dropping only the bad day would allow a model
     # to retain an unpriceable position. This is a data-integrity rule, not a
     # return-selection or portfolio-ranking heuristic.
-    source_carry_quarantine = np.zeros(frame.height, dtype=bool)
+    source_expiry_quarantine = np.zeros(frame.height, dtype=bool)
+    incomplete_contracts: set[str] = set()
+    if expiry_settlement_valuation:
+        source_liquidation_reasons = np.asarray(
+            [str(value or "").strip() for value in frame["liquidation_reason"].to_list()],
+            dtype=object,
+        )
+        source_final_settlements = frame[
+            "_official_final_settlement_price"
+        ].to_numpy().astype(np.float64)
+        source_expiry_rows = source_liquidation_reasons == "last_trade_date"
+        missing_final = source_expiry_rows & (
+            ~np.isfinite(source_final_settlements)
+            | (source_final_settlements <= 0.0)
+        )
+        source_physical_contracts = np.asarray(
+            [str(value or "").strip() for value in frame["physical_contract"].to_list()],
+            dtype=object,
+        )
+        if np.any(missing_final & (source_physical_contracts == "")):
+            raise ValueError(
+                "missing official final settlement rows require physical_contract"
+            )
+        incomplete_contracts = set(
+            source_physical_contracts[missing_final].tolist()
+        )
+        if incomplete_contracts:
+            # An early archive termination is not an expiry fill.  Prevent the
+            # policy from ever opening that physical contract instead of
+            # inventing a terminal price or reallocating its desired cash.
+            source_expiry_quarantine = np.isin(
+                source_physical_contracts,
+                list(incomplete_contracts),
+            )
+
+    source_carry_quarantine = source_expiry_quarantine.copy()
     if carry_guard > 0.0:
         asset_values = np.asarray(frame["asset_class"].to_list(), dtype=object)
         physical_values = np.asarray(
@@ -345,7 +462,7 @@ def attach_stock_context_futures_portfolio_daily(
             )
         bad_physical_contracts = set(physical_values[suspicious].tolist())
         if bad_physical_contracts:
-            source_carry_quarantine = relevant & np.isin(
+            source_carry_quarantine |= relevant & np.isin(
                 physical_values,
                 list(bad_physical_contracts),
             )
@@ -386,6 +503,7 @@ def attach_stock_context_futures_portfolio_daily(
     integer_execution: np.ndarray | None = None
     current_open_available = np.ones(shape, dtype=bool)
     carry_valuation_quarantine = np.zeros(shape, dtype=bool)
+    expiry_settlement_quarantine = np.zeros(shape, dtype=bool)
 
     raw_features = frame.select(FUTURES_MODEL_FEATURE_COLUMNS).to_numpy().astype(
         np.float32, copy=False
@@ -437,21 +555,21 @@ def attach_stock_context_futures_portfolio_daily(
             dtype=object,
         )
         expiry_rows = liquidation_reasons == "last_trade_date"
-        settlement_values = frame["settlement"].to_numpy().astype(np.float64)
+        settlement_values = frame[
+            "_official_final_settlement_price"
+        ].to_numpy().astype(np.float64)
         expiry_opens = frame["open"].to_numpy().astype(np.float64)
-        invalid_expiry = expiry_rows & (
-            ~np.isfinite(expiry_opens)
-            | (expiry_opens <= 0.0)
-            | ~np.isfinite(settlement_values)
-            | (settlement_values <= 0.0)
+        usable_expiry = expiry_rows & ~source_expiry_quarantine
+        invalid_expiry_open = usable_expiry & (
+            ~np.isfinite(expiry_opens) | (expiry_opens <= 0.0)
         )
-        if np.any(invalid_expiry):
+        if np.any(invalid_expiry_open):
             raise ValueError(
                 "expiry settlement valuation requires a finite positive OPEN "
-                "and TAIFEX settlement on every last_trade_date row"
+                "on every last_trade_date row"
             )
-        holding_values[expiry_rows] = np.log(
-            settlement_values[expiry_rows] / expiry_opens[expiry_rows]
+        holding_values[usable_expiry] = np.log(
+            settlement_values[usable_expiry] / expiry_opens[usable_expiry]
         )
     # Keep the effective return attached to each source row.  The denomination
     # join below is not allowed to make integer P&L depend on Polars' join row
@@ -719,6 +837,20 @@ def attach_stock_context_futures_portfolio_daily(
         carry_valuation_quarantine = (
             execution_quarantine | prior_context_quarantine
         )
+        source_expiry_execution_quarantine = np.zeros(shape, dtype=bool)
+        source_expiry_execution_quarantine[
+            date_indices, symbol_indices
+        ] = source_expiry_quarantine
+        source_expiry_prior_quarantine = np.zeros(shape, dtype=bool)
+        expiry_has_next = has_next_stock_session & source_expiry_quarantine
+        source_expiry_prior_quarantine[
+            next_date_indices[expiry_has_next],
+            symbol_indices[expiry_has_next],
+        ] = True
+        expiry_settlement_quarantine = (
+            source_expiry_execution_quarantine
+            | source_expiry_prior_quarantine
+        )
         candidate_source[prior_context_quarantine] = False
         same_as_previous[execution_quarantine] = False
         current_open_available[execution_quarantine] = False
@@ -778,7 +910,16 @@ def attach_stock_context_futures_portfolio_daily(
             benchmark_log_returns=benchmark,
             integer_execution=integer_execution,
             carry_valuation_quarantine_mask=carry_valuation_quarantine,
+            expiry_settlement_quarantine_mask=expiry_settlement_quarantine,
+            expiry_settlement_quarantined_physical_contracts=len(
+                incomplete_contracts
+            ),
             expiry_settlement_valuation=bool(expiry_settlement_valuation),
+            expiry_final_settlement_path=(
+                str(resolved_final_settlement_path)
+                if resolved_final_settlement_path is not None
+                else None
+            ),
             contract_version=(
                 TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_EXPIRY_SETTLEMENT_CONTRACT_VERSION
                 if expiry_settlement_valuation
@@ -810,6 +951,7 @@ __all__ = [
     "TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_CURRENT_OPEN_CONTRACT_VERSION",
     "TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_GUARDED_CURRENT_OPEN_CONTRACT_VERSION",
     "TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_EXPIRY_SETTLEMENT_CONTRACT_VERSION",
+    "TAIFEX_FUTURES_FINAL_SETTLEMENT_SCHEMA_VERSION",
     "TaiwanStockContextFuturesPortfolioDaily",
     "attach_stock_context_futures_portfolio_daily",
     "fixed_futures_slot_symbols",

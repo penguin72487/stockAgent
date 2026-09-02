@@ -29,6 +29,7 @@ trading:
   # only causal capacity source available in the daily archive.
   max_volume_participation: 0.5
   tw_futures_portfolio_integer_initial_capital: 10000000.0
+  tw_futures_portfolio_final_settlement_path: data_tw_futures/final_settlement_v1/futures_final_settlement_history.parquet
 
 training:
   model_name: cross_sectional_all_futures
@@ -39,6 +40,13 @@ training:
   auto_batch_size: false
   futures_portfolio_training_surrogate_only: false
   futures_portfolio_recoverable_backward: true
+  learning_rate: 1.0e-4
+  enable_lr_scheduler: true
+  lr_scheduler: warmup_cosine
+  lr_scheduler_warmup_steps: 256
+  lr_scheduler_eta_min: 1.0e-6
+  early_stopping_no_improve_ratio: 0.1
+  early_stopping_min_delta: 1.0e-4
 
   # No existing completed futures checkpoint has this 22-family/524-component
   # input ABI. Starting fresh is safer than pretending that a v12 stock
@@ -55,6 +63,11 @@ training:
   defer_epoch_curve_plot_until_end: false
 
   transformer_base_portfolio:
+    # The all-futures model has no FinancialTransformer CandleEncoder, so the
+    # closest exact analogue to v12's input-feature decomposition is its fused
+    # raw-feature contraction. It uses every one of the 99 features without
+    # materializing [batch,symbol,524*99] coefficients.
+    temporal_basis_input: raw_features
     temporal_basis_families:
       - haar
       - swt_db2

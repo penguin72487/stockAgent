@@ -1051,9 +1051,19 @@ def _trading_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
                 config.data.tw_futures_expiry_settlement_valuation
             ),
             "expiry_exit_price_source": (
-                "observed_taifex_settlement_on_last_trade_date"
+                "receipt_backed_official_taifex_final_settlement"
                 if config.data.tw_futures_expiry_settlement_valuation
                 else "observed_contract_close"
+            ),
+            "final_settlement_path": (
+                str(config.trading.tw_futures_portfolio_final_settlement_path)
+                if config.data.tw_futures_expiry_settlement_valuation
+                else None
+            ),
+            "missing_final_settlement_policy": (
+                "quarantine_entire_physical_contract_no_redistribution"
+                if config.data.tw_futures_expiry_settlement_valuation
+                else None
             ),
             "roll_gap_treatment": "mandatory_old_contract_own_close_no_gap_return",
             "accounting": (

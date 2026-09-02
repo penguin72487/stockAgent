@@ -681,6 +681,7 @@ def _validate_tw_stock_context_futures_portfolio_mode_contract(
     data_futures_current_open_feature: object,
     carry_valuation_max_abs_simple_return: object,
     expiry_settlement_valuation: object,
+    final_settlement_path: object,
     day_trade_open_feature: object,
     feature_shift_next_session: object,
     feature_exclude: object,
@@ -786,6 +787,13 @@ def _validate_tw_stock_context_futures_portfolio_mode_contract(
         raise ValueError(
             "tw_futures_expiry_settlement_valuation requires exact integer "
             "all-futures execution metadata"
+        )
+    if bool(expiry_settlement_valuation) and not str(
+        final_settlement_path or ""
+    ).strip():
+        raise ValueError(
+            "tw_futures_expiry_settlement_valuation requires "
+            "trading.tw_futures_portfolio_final_settlement_path"
         )
     activations = {
         "trading.portfolio_activation": normalize_portfolio_activation(
@@ -1670,6 +1678,10 @@ class TradingConfig:
     tw_futures_portfolio_data_path: str = (
         "data_tw_futures/taifex_portfolio_daily_v4/continuous_daily.parquet"
     )
+    # Receipt-backed official TAIFEX final settlement prices.  This path is
+    # required only by the carry-to-expiry contract; the ordinary daily
+    # settlement/close column is not a valid substitute for final settlement.
+    tw_futures_portfolio_final_settlement_path: str | None = None
     # User/account-specific SinoPac network-order fixed commission, TWD per
     # contract per side. Product classification and notional multipliers are
     # owned by the receipt-backed futures data contract.
@@ -3863,6 +3875,9 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         expiry_settlement_valuation=data[
             "tw_futures_expiry_settlement_valuation"
         ],
+        final_settlement_path=trading[
+            "tw_futures_portfolio_final_settlement_path"
+        ],
         day_trade_open_feature=data["day_trade_open_feature"],
         feature_shift_next_session=data["feature_shift_next_session"],
         feature_exclude=data["feature_exclude"],
@@ -4137,6 +4152,15 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     if not futures_portfolio_data_path:
         raise ValueError("trading.tw_futures_portfolio_data_path must not be empty")
     trading["tw_futures_portfolio_data_path"] = futures_portfolio_data_path
+    raw_final_settlement_path = trading[
+        "tw_futures_portfolio_final_settlement_path"
+    ]
+    trading["tw_futures_portfolio_final_settlement_path"] = (
+        None
+        if raw_final_settlement_path is None
+        or not str(raw_final_settlement_path).strip()
+        else str(raw_final_settlement_path).strip()
+    )
     for fee_key in (
         "tw_futures_portfolio_fee_large_twd",
         "tw_futures_portfolio_fee_standard_twd",
