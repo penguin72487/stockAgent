@@ -29,6 +29,7 @@ from stockagent.data.tw_futures_portfolio_daily import (
     TAIFEX_FUTURES_PORTFOLIO_FIXED_SLOT_COUNT,
 )
 from stockagent.data.tw_stock_context_futures_portfolio import (
+    TAIFEX_FUTURES_FINAL_SETTLEMENT_SCHEMA_VERSION,
     TW_STOCK_CONTEXT_FUTURES_CURRENT_OPEN_MODEL_FEATURE_COLUMNS,
     TW_STOCK_CONTEXT_FUTURES_DENOMINATION_FEATURE_COLUMNS,
     TW_STOCK_CONTEXT_FUTURES_MODEL_FEATURE_COLUMNS,
@@ -346,7 +347,7 @@ def test_carry_valuation_guard_quarantines_complete_physical_contract(
     assert daily.candidate_mask[1:, 0].all()
 
 
-def test_expiry_row_uses_observed_settlement_for_exact_integer_pnl(
+def test_expiry_row_uses_official_final_settlement_for_exact_integer_pnl(
     tmp_path: Path,
 ) -> None:
     rows: list[dict[str, object]] = []
@@ -355,7 +356,6 @@ def test_expiry_row_uses_observed_settlement_for_exact_integer_pnl(
     ):
         open_price = 100.0 + idx
         close_price = open_price + 1.0
-        settlement = 110.0 if idx == 2 else close_price
         row: dict[str, object] = {
             "date": session_date,
             "product": "TX",
@@ -363,7 +363,9 @@ def test_expiry_row_uses_observed_settlement_for_exact_integer_pnl(
             "tenor_rank": 1,
             "open": open_price,
             "close": close_price,
-            "settlement": settlement,
+            # The daily settlement/close is intentionally different from the
+            # separately receipted final settlement on the expiry row.
+            "settlement": close_price,
             "volume": 100,
             "holding_log_return": float(np.log(close_price / open_price)),
             "executable": True,
@@ -399,6 +401,35 @@ def test_expiry_row_uses_observed_settlement_for_exact_integer_pnl(
         ),
         encoding="utf-8",
     )
+    final_dir = tmp_path / "final_settlement_v1"
+    final_dir.mkdir()
+    final_path = final_dir / "futures_final_settlement_history.parquet"
+    pq.write_table(
+        pa.Table.from_pylist(
+            [
+                {
+                    "settlement_date": date(2026, 1, 4),
+                    "product": "TX",
+                    "contract": "202601",
+                    "final_settlement_price": 110.0,
+                }
+            ]
+        ),
+        final_path,
+    )
+    (final_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "schema_version": TAIFEX_FUTURES_FINAL_SETTLEMENT_SCHEMA_VERSION,
+                "outputs": {
+                    "futures_final_settlement_history": {
+                        "sha256": _sha256(final_path)
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
     panel = attach_stock_context_futures_portfolio_daily(
         _stock_panel(),
         data_path,
@@ -412,6 +443,7 @@ def test_expiry_row_uses_observed_settlement_for_exact_integer_pnl(
         current_open_feature=True,
         carry_valuation_max_abs_simple_return=0.25,
         expiry_settlement_valuation=True,
+        final_settlement_path=final_path,
         integer_fee_per_contract_per_side_twd=40.0,
         max_volume_participation=0.5,
     )
@@ -427,11 +459,70 @@ def test_expiry_row_uses_observed_settlement_for_exact_integer_pnl(
     assert daily.integer_execution is not None
     assert daily.integer_execution[2, 0, 3] == pytest.approx(102.0 * 200.0)
     assert daily.integer_execution[2, 0, 4] == pytest.approx(110.0 * 200.0)
+    assert daily.expiry_settlement_quarantine_mask is not None
+    assert not daily.expiry_settlement_quarantine_mask.any()
+    assert daily.expiry_settlement_quarantined_physical_contracts == 0
     # The expiry switch is intentionally narrow: pre-expiry rows retain the
     # archive's ordinary same-contract holding label.
     assert daily.holding_log_returns[1, 0] == pytest.approx(
         np.log(102.0 / 101.0), abs=1.0e-7
     )
+
+    # A missing official expiry price cannot be replaced by the daily close.
+    # Quarantine the complete physical contract from its first row so no held
+    # quantity can arrive at an unpriceable terminal state.
+    pq.write_table(
+        pa.Table.from_pylist(
+            [
+                {
+                    "settlement_date": date(2026, 1, 4),
+                    "product": "TE",
+                    "contract": "202601",
+                    "final_settlement_price": 999.0,
+                }
+            ]
+        ),
+        final_path,
+    )
+    (final_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "schema_version": TAIFEX_FUTURES_FINAL_SETTLEMENT_SCHEMA_VERSION,
+                "outputs": {
+                    "futures_final_settlement_history": {
+                        "sha256": _sha256(final_path)
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    quarantined_panel = attach_stock_context_futures_portfolio_daily(
+        _stock_panel(),
+        data_path,
+        fee_per_side_twd_by_group={
+            "large": 60.0,
+            "standard": 24.0,
+            "stock": 40.0,
+            "micro": 16.0,
+        },
+        integer_contracts=True,
+        current_open_feature=True,
+        carry_valuation_max_abs_simple_return=0.25,
+        expiry_settlement_valuation=True,
+        final_settlement_path=final_path,
+        integer_fee_per_contract_per_side_twd=40.0,
+        max_volume_participation=0.5,
+    )
+    quarantined = quarantined_panel.stock_context_futures_portfolio_daily
+    assert quarantined is not None
+    assert quarantined.expiry_settlement_quarantine_mask is not None
+    assert quarantined.expiry_settlement_quarantine_mask[:, 0].all()
+    assert quarantined.expiry_settlement_quarantined_physical_contracts == 1
+    assert not quarantined.candidate_mask[:, 0].any()
+    assert not quarantined.executable_mask[:, 0].any()
+    assert quarantined.integer_execution is not None
+    assert not np.isfinite(quarantined.integer_execution[:, 0, 3]).any()
 
 
 def test_dataset_keeps_stock_attention_axis_and_packs_futures_execution() -> None:
@@ -1332,8 +1423,15 @@ def test_integer_0845_carry_to_expiry_22_basis_config_is_fresh_contract() -> Non
     assert config.training.pretrained_initialization_validation_guard is False
     assert len(basis.temporal_basis_families) == 22
     assert sum(basis.temporal_basis_components_by_family.values()) == 524
+    assert basis.temporal_basis_input == "raw_features"
     assert basis.portfolio_output_mode == "projection_l1"
     assert basis.projection_l1_scale_by_active_count is True
+    assert config.training.learning_rate == pytest.approx(1.0e-4)
+    assert config.training.lr_scheduler == "warmup_cosine"
+    assert config.training.lr_scheduler_warmup_steps == 256
+    assert config.training.lr_scheduler_eta_min == pytest.approx(1.0e-6)
+    assert config.training.early_stopping_no_improve_ratio == pytest.approx(0.1)
+    assert config.training.early_stopping_min_delta == pytest.approx(1.0e-4)
     assert config.runner.output_dir.endswith(
         "tw_stock_context_all_futures_carry_to_expiry_0845_integer_22_"
         "effective_rank_full_features_cash_capital10m_v1"
@@ -1353,7 +1451,14 @@ def test_integer_0845_carry_to_expiry_22_basis_config_is_fresh_contract() -> Non
     )
     assert futures_contract["expiry_settlement_valuation"] is True
     assert futures_contract["expiry_exit_price_source"] == (
-        "observed_taifex_settlement_on_last_trade_date"
+        "receipt_backed_official_taifex_final_settlement"
+    )
+    assert futures_contract["final_settlement_path"].endswith(
+        "data_tw_futures/final_settlement_v1/"
+        "futures_final_settlement_history.parquet"
+    )
+    assert futures_contract["missing_final_settlement_policy"] == (
+        "quarantine_entire_physical_contract_no_redistribution"
     )
 
 

@@ -1365,6 +1365,9 @@ def main() -> None:
             expiry_settlement_valuation=bool(
                 config.data.tw_futures_expiry_settlement_valuation
             ),
+            final_settlement_path=(
+                config.trading.tw_futures_portfolio_final_settlement_path
+            ),
             integer_fee_per_contract_per_side_twd=float(
                 config.trading.tw_futures_portfolio_integer_fee_per_contract_per_side_twd
             ),
@@ -1372,6 +1375,20 @@ def main() -> None:
                 config.trading.max_volume_participation
             ),
         )
+        if (
+            _distributed_rank() == 0
+            and config.data.tw_futures_expiry_settlement_valuation
+        ):
+            futures_daily = panel.stock_context_futures_portfolio_daily
+            if futures_daily is None:
+                raise RuntimeError("all-futures expiry sidecar was not attached")
+            print(
+                "[all-futures expiry] official_final_settlement="
+                f"{futures_daily.expiry_final_settlement_path} "
+                "quarantined_incomplete_physical_contracts="
+                f"{futures_daily.expiry_settlement_quarantined_physical_contracts}",
+                flush=True,
+            )
     if str(config.trading.execution_mode) in {
         "tw_stock_futures_day_trade",
         "tw_stock_futures_day_trade_0900",
