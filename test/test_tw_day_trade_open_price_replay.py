@@ -23,6 +23,18 @@ from stockagent.live.tw_day_trade_simulation import (
 TAIPEI = ZoneInfo("Asia/Taipei")
 
 
+def test_replay_checks_receipt_backed_repair_kbars_before_bulk_minute_data() -> None:
+    roots = replay.DEFAULT_MINUTE_DATA_ROOTS
+
+    assert roots[0] == Path(
+        "artifacts/data_repair/tw_day_trade_minute_curve/maintenance/current/fetched_kbars"
+    )
+    assert roots[1] == Path(
+        "artifacts/data_repair/tw_day_trade_minute_curve/kbars"
+    )
+    assert roots.index(Path("data_tw_minute/shioaji_1m")) > 1
+
+
 def _complete_0901_query_receipt(*, resolved: int, requested: int) -> dict:
     return {
         "requested_symbols": requested,
@@ -803,6 +815,38 @@ def test_benchmark_sessions_follow_own_official_sources_not_strategy_receipt(
     )
 
     assert sessions == [date(2026, 8, 26), date(2026, 8, 27)]
+
+
+def test_benchmark_current_session_adjustment_uses_retained_reference_receipt() -> None:
+    captured: dict[str, object] = {}
+
+    class Engine:
+        def _stock_total_return_adjustment(self, **kwargs):
+            captured.update(kwargs)
+            return 1.0, [], "official_reference_complete_with_current_session_reference"
+
+    context = {
+        "corporate_action_coverage_end": "2026-09-02",
+        "current_session_reference_price": 108.45,
+        "current_session_reference_source": "shioaji:stock_snapshot+prepared_limits",
+        "previous_official_close": 108.45,
+        "previous_official_close_date": "2026-09-01",
+        "previous_official_close_source": "twse_official:0050_features.parquet",
+    }
+
+    factor, actions = benchmark_replay._required_stock_adjustment(
+        Engine(),
+        symbol="0050",
+        entry_at=datetime(2026, 8, 20, 9, 0, tzinfo=TAIPEI),
+        mark_date=date(2026, 9, 2),
+        current_session_reference=context,
+    )
+
+    assert factor == 1.0
+    assert actions == []
+    assert captured["current_reference_price"] == 108.45
+    assert captured["previous_close"] == 108.45
+    assert captured["previous_close_date"] == "2026-09-01"
 
 
 def test_replay_rows_cannot_fall_back_to_noncanonical_signal_open() -> None:

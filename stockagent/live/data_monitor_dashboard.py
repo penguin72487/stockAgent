@@ -4840,4 +4840,101 @@ def build_data_monitor_public_status(
     }
 
 
-__all__ = ["DATA_MONITOR_SCHEMA_VERSION", "build_data_monitor_public_status"]
+def build_tw_public_monitor_status(
+    repo_root: Path,
+    *,
+    now: datetime | None = None,
+    refresh_services: Mapping[str, Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Build only the TW official-source rows consumed by the day-trade page.
+
+    The complete data monitor joins every registered market, provider and
+    storage roll-up.  Running that multi-second inventory on the public request
+    thread used to contend with the latency-sensitive day-trade status route,
+    even though the day-trade page renders only the ``group:tw-public`` rows.
+    Keep the same source/publication/progress contracts while avoiding all
+    unrelated providers and storage scans.
+    """
+
+    root = Path(repo_root)
+    observed = (now or datetime.now(UTC)).astimezone(UTC)
+    service_states = (
+        _refresh_service_states(
+            snapshot_path=(root / "artifacts/live/data_monitor/refresh_services.json"),
+            now=observed,
+            prefer_snapshot=True,
+        )
+        if refresh_services is None
+        else {str(key): dict(value) for key, value in refresh_services.items()}
+    )
+    rows = _enrich_and_sort_rows(
+        _tw_public_sources(root, now=observed),
+        now=observed,
+        refresh_services=service_states,
+    )
+    operation_counts = {state: 0 for state in _OPERATION_ORDER}
+    status_counts: dict[str, int] = {}
+    for row in rows:
+        operation = str(row.get("operation_state") or "unable")
+        operation_counts[operation] = operation_counts.get(operation, 0) + 1
+        status = str(row.get("status") or "unavailable")
+        status_counts[status] = status_counts.get(status, 0) + 1
+    attention = operation_counts["unable"]
+    worst_status = max(
+        (str(row.get("status") or "unavailable") for row in rows),
+        key=lambda value: _STATUS_PRIORITY.get(value, 99),
+        default="unavailable",
+    )
+    if attention:
+        health = (
+            "critical" if worst_status in {"blocked", "unavailable"} else "degraded"
+        )
+    elif operation_counts["catching_up"]:
+        health = "updating"
+    else:
+        health = "active"
+    completed = sum(
+        bool(
+            (row.get("acquisition_progress") or {}).get("up_to_date")
+            or (row.get("acquisition_progress") or {}).get("coverage_complete")
+            or (row.get("acquisition_progress") or {}).get("batch_complete")
+        )
+        for row in rows
+    )
+    return {
+        "schema_version": DATA_MONITOR_SCHEMA_VERSION,
+        "generated_at_utc": _iso(observed),
+        "health": health,
+        "read_only": True,
+        "production_control_possible": False,
+        "scope": "tw_public_official_sources",
+        "summary": {
+            "registered_items": len(rows),
+            "completed_or_preparing": completed,
+            "attention_required": attention,
+            "status_counts": status_counts,
+            "operation_state_counts": operation_counts,
+        },
+        "sources": rows,
+        "definitions": {
+            "scope": (
+                "Only official TW public-source rows used by the day-trade page; "
+                "the complete cross-provider inventory remains on /data-monitor/."
+            ),
+            "publication": (
+                "Official publication evidence remains separate from local probe, "
+                "download and acceptance timestamps."
+            ),
+            "progress": (
+                "Completion uses each source's own receipt-backed denominator; "
+                "unknown denominators remain unknown."
+            ),
+        },
+    }
+
+
+__all__ = [
+    "DATA_MONITOR_SCHEMA_VERSION",
+    "build_data_monitor_public_status",
+    "build_tw_public_monitor_status",
+]

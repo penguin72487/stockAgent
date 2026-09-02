@@ -1,5 +1,5 @@
 [Unit]
-Description=Snapshot allowlisted data-refresh systemd state for the public monitor
+Description=Snapshot allowlisted data-refresh and public-monitor state off request path
 
 [Service]
 Type=oneshot

@@ -24,6 +24,7 @@ def test_guide_lists_all_tw_execution_modes() -> None:
     assert "`tw_cash` 現股/T+2" in guide
     assert "`tw_day_trade_multi_basis` Multi-Basis 現股當沖（初始 1,000 萬）" in guide
     assert "`tw_day_trade_100m` 現股當沖（初始 1 億）" in guide
+    assert "`tw_day_trade_multi_basis_22` 多基底22 現股當沖" in guide
     assert "`tw_day_trade_multi_basis_projection_l1_gelu`" in guide
 
 
@@ -33,15 +34,17 @@ def test_both_enabled_multi_basis_day_trades_are_available_in_market_autocomplet
     choices = asyncio.run(discord_bot.market_autocomplete(None, "multi_basis"))
 
     values = {choice.value for choice in choices}
+    assert "tw_day_trade_multi_basis_22" in values
     assert "tw_day_trade_multi_basis_projection_l1_gelu" in values
     assert "tw_day_trade_multi_basis" in values
 
 
-def test_all_three_day_trade_modes_share_the_0900_paper_execution_contract() -> None:
+def test_all_four_day_trade_modes_share_the_0900_paper_execution_contract() -> None:
     configs = discord_bot._market_configs()
     markets = (
         "tw_day_trade_multi_basis",
         "tw_day_trade_100m",
+        "tw_day_trade_multi_basis_22",
         "tw_day_trade_multi_basis_projection_l1_gelu",
     )
 
@@ -57,6 +60,17 @@ def test_all_three_day_trade_modes_share_the_0900_paper_execution_contract() -> 
             "scripts/finalize_tw_public_completed_session.py",
         )
         assert config.completed_session_timeout_seconds == 600
+
+
+def test_all_four_day_trade_modes_are_in_the_runtime_schedule() -> None:
+    scheduled = set(discord_bot._scheduled_markets())
+
+    assert {
+        "tw_day_trade_multi_basis",
+        "tw_day_trade_100m",
+        "tw_day_trade_multi_basis_22",
+        "tw_day_trade_multi_basis_projection_l1_gelu",
+    }.issubset(scheduled)
 
 
 def test_day_trade_model_uses_shared_official_opening_snapshot() -> None:
@@ -366,6 +380,7 @@ def test_setup_hook_syncs_only_global_commands(monkeypatch: pytest.MonkeyPatch) 
     assert sync_guilds == [None]
     assert set(started_loops) == {
         "scheduled_signal",
+        "startup_inference_warmup",
         "service_heartbeat",
         "signal_now_job_resumer",
         "preopen_prepare",

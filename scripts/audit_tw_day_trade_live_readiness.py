@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Audit the shared data and distinct model artifacts for three TW day trades."""
+"""Audit the shared data and distinct model artifacts for four TW day trades."""
 
 from __future__ import annotations
 
@@ -31,6 +31,7 @@ TAIPEI = ZoneInfo("Asia/Taipei")
 MARKETS = (
     "tw_day_trade_multi_basis",
     "tw_day_trade_100m",
+    "tw_day_trade_multi_basis_22",
     "tw_day_trade_multi_basis_projection_l1_gelu",
 )
 
@@ -257,7 +258,7 @@ def main() -> int:
     )
 
     lines = [
-        "# 台股三個當沖模式 readiness",
+        "# 台股四個當沖模式 readiness",
         "",
         f"更新時間：{payload['generated_at_taipei']}",
         "",

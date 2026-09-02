@@ -85,11 +85,13 @@ def test_weekly_guardian_uses_existing_authoritative_units_without_active_restar
     assert "stockagent-tw-public-0830-check.service" in guardian
     assert "stockagent-discord-artifact-maintenance.timer" in guardian
     assert "post_close_artifact_maintenance" in guardian
+    assert "scheduled_day_trade_markets" in guardian
     assert "systemctl\", \"restart" not in guardian
     assert "production_order_possible\": False" in guardian
     for market in (
         "tw_day_trade_100m",
         "tw_day_trade_multi_basis",
+        "tw_day_trade_multi_basis_22",
         "tw_day_trade_multi_basis_projection_l1_gelu",
     ):
         assert market in guardian

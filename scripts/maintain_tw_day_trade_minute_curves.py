@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime
+from datetime import datetime, timedelta
 import fcntl
 import json
 import os
@@ -20,6 +20,9 @@ if str(REPO_ROOT) not in sys.path:
 
 from scripts.promote_tw_day_trade_replay import (  # noqa: E402
     _validate_minute_curve_coverage,
+)
+from scripts.rebuild_tw_day_trade_minute_curves import (  # noqa: E402
+    historical_minute_mark_has_source,
 )
 from stockagent.live.shioaji_schedule import (  # noqa: E402
     HISTORICAL_MAX_TRAFFIC_FRACTION,
@@ -113,6 +116,61 @@ def _validate_current(
     if failures:
         raise RuntimeError("; ".join(failures))
     return result
+
+
+def _inspect_strategy_price_provenance(
+    state_dir: Path,
+    *,
+    completed_session_dates: list[str],
+    expected_markets: set[str],
+) -> dict[str, Any]:
+    """Inspect every completed-session interior minute, not just timestamps."""
+
+    expected_sessions = set(completed_session_dates)
+    expected_keys = {
+        (session_date, market, minute)
+        for session_date in completed_session_dates
+        for market in expected_markets
+        for minute in (
+            datetime.fromisoformat(f"{session_date}T09:02:00+08:00")
+            + timedelta(minutes=index)
+            for index in range(268)
+        )
+    }
+    audited: set[tuple[str, str, datetime]] = set()
+    unverified: set[tuple[str, str, datetime]] = set()
+    marks_path = state_dir / "marks.jsonl"
+    with marks_path.open(encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            row = json.loads(line)
+            if not isinstance(row, dict):
+                continue
+            session_date = str(row.get("session_date") or "")
+            market = str(row.get("market") or "")
+            if session_date not in expected_sessions or market not in expected_markets:
+                continue
+            try:
+                minute = datetime.fromisoformat(str(row.get("minute") or ""))
+            except ValueError:
+                raise RuntimeError(f"marks.jsonl:{line_number}: invalid minute")
+            key = (session_date, market, minute)
+            if key not in expected_keys:
+                continue
+            if historical_minute_mark_has_source(row):
+                audited.add(key)
+            else:
+                unverified.add(key)
+    unverified.update(expected_keys - audited)
+    return {
+        "contract": "right_labelled_historical_last_trade_mark_v1",
+        "expected_interior_rows": len(expected_keys),
+        "audited_interior_rows": len(audited),
+        "unverified_interior_rows": len(unverified),
+        "unverified_sample": [
+            f"{session_date}:{market}:{minute.isoformat(timespec='minutes')}"
+            for session_date, market, minute in sorted(unverified)[:20]
+        ],
+    }
 
 
 def _validate_benchmarks(
@@ -231,13 +289,29 @@ def main() -> None:
         except (OSError, RuntimeError, TypeError, ValueError):
             strategy_validation = None
         try:
+            price_validation = _inspect_strategy_price_provenance(
+                state_dir,
+                completed_session_dates=completed,
+                expected_markets=markets,
+            )
+        except (OSError, RuntimeError, TypeError, ValueError, json.JSONDecodeError):
+            price_validation = None
+        try:
             benchmark_validation = _validate_benchmarks(
                 state_dir,
                 completed_session_dates=completed,
             )
         except (OSError, RuntimeError, TypeError, ValueError):
             benchmark_validation = None
-        if strategy_validation is not None and benchmark_validation is not None:
+        price_provenance_ready = bool(
+            price_validation is not None
+            and int(price_validation.get("unverified_interior_rows") or 0) == 0
+        )
+        if (
+            strategy_validation is not None
+            and benchmark_validation is not None
+            and price_provenance_ready
+        ):
             payload = {
                 "schema_version": 1,
                 "status": "ready",
@@ -246,6 +320,7 @@ def main() -> None:
                 "completed_session_dates": completed,
                 "validation": {
                     "strategy": strategy_validation,
+                    "strategy_price_provenance": price_validation,
                     "benchmarks": benchmark_validation,
                 },
                 "simulation_only": True,
@@ -340,8 +415,10 @@ def main() -> None:
         ]
         if not args.no_fetch:
             command.append("--fetch-missing-kbars")
-        if strategy_validation is not None:
+        if strategy_validation is not None and price_provenance_ready:
             command.append("--validate-existing-strategy-marks")
+        elif price_validation is not None and not price_provenance_ready:
+            command.append("--repair-unverified-strategy-marks")
         started = datetime.now(TAIPEI)
         completed_process = subprocess.run(
             command,
@@ -382,6 +459,16 @@ def main() -> None:
             completed_session_dates=completed,
             expected_markets=markets,
         )
+        price_validation = _inspect_strategy_price_provenance(
+            state_dir,
+            completed_session_dates=completed,
+            expected_markets=markets,
+        )
+        if int(price_validation.get("unverified_interior_rows") or 0) != 0:
+            raise RuntimeError(
+                "minute-curve rebuild left unverified interior strategy prices: "
+                f"{price_validation['unverified_sample']}"
+            )
         benchmark_validation = _validate_benchmarks(
             state_dir,
             completed_session_dates=completed,
@@ -395,6 +482,7 @@ def main() -> None:
             "completed_session_dates": completed,
             "validation": {
                 "strategy": strategy_validation,
+                "strategy_price_provenance": price_validation,
                 "benchmarks": benchmark_validation,
             },
             "simulation_only": True,

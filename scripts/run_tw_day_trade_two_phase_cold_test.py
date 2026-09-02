@@ -5,7 +5,7 @@ The drill deliberately starts with every registered TW public source stale,
 no same-session opening observation, no signal pointer, and an unsynchronised
 Discord receipt.  It then atomically applies repaired source receipts and
 executes the same production pre-open readiness gate.  Only after that gate is
-ready does it inject an opening observation, publish three atomic signal
+ready does it inject an opening observation, publish four atomic signal
 pointers, and execute them immediately after 09:00 using a strictly later best
 Ask/Bid. A separate isolated phase proves that missed-opening replay sizes from
 the official 09:00 open and executes from an observed 09:01 minute VWAP.
@@ -68,11 +68,13 @@ TAIPEI = ZoneInfo("Asia/Taipei")
 EXPECTED_MARKETS = (
     "tw_day_trade_100m",
     "tw_day_trade_multi_basis",
+    "tw_day_trade_multi_basis_22",
     "tw_day_trade_multi_basis_projection_l1_gelu",
 )
 TARGET_WEIGHTS = {
     "tw_day_trade_100m": 0.01,
     "tw_day_trade_multi_basis": -0.10,
+    "tw_day_trade_multi_basis_22": 0.10,
     "tw_day_trade_multi_basis_projection_l1_gelu": 0.10,
 }
 
@@ -99,7 +101,7 @@ def parse_args() -> argparse.Namespace:
         "--real-model-inference",
         action="store_true",
         help=(
-            "also run cold+hot GPU inference for all three real configs/checkpoints; "
+            "also run cold+hot GPU inference for all four real configs/checkpoints; "
             "the opening observation remains an isolated fixture"
         ),
     )
@@ -532,6 +534,7 @@ def _run_real_model_inference_shadow(
         yahoo_chunk_size: int,
         request_mask: np.ndarray | None = None,
         require_official_tw_session_open: bool = False,
+        force_fresh: bool = False,
     ) -> PriceSnapshot:
         del (
             source,
@@ -540,6 +543,7 @@ def _run_real_model_inference_shadow(
             yahoo_chunk_size,
             request_mask,
             require_official_tw_session_open,
+            force_fresh,
         )
         closes = np.asarray(fallback_prices, dtype=np.float64)
         available = np.isfinite(closes) & (closes > 0.0)
@@ -930,7 +934,7 @@ def run_two_phase_cold_test(
         }
     _assert_check(
         checks,
-        "phase2_all_three_modes_register_once",
+        "phase2_all_four_modes_register_once",
         set(registered_results) == set(EXPECTED_MARKETS)
         and set(registered_results.values()) == {"registered"},
         evidence=registered_results,
@@ -1213,6 +1217,7 @@ def run_two_phase_cold_test(
         checks,
         "phase3_1324_uses_best_bid_and_preserves_unquoted_short",
         force_state["tw_day_trade_100m"] == 0
+        and force_state["tw_day_trade_multi_basis_22"] == 0
         and force_state["tw_day_trade_multi_basis_projection_l1_gelu"] == 0
         and force_state["tw_day_trade_multi_basis"] == -1_000,
         evidence=force_state,
@@ -1259,7 +1264,7 @@ def run_two_phase_cold_test(
         checks,
         "phase3_1330_all_modes_are_terminal_and_flat",
         all_flat
-        and len(force_fills) == 2
+        and len(force_fills) == 3
         and all(float(row.get("price") or 0.0) == 998.0 for row in force_fills)
         and len(terminal_fills) == 1
         and terminal_fills[0].get("market") == "tw_day_trade_multi_basis"

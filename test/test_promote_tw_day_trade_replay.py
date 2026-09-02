@@ -57,6 +57,14 @@ def _candidate(tmp_path: Path, *, register_result: str = "registered") -> Path:
             "minute": (base + timedelta(minutes=offset)).isoformat(
                 timespec="minutes"
             ),
+            "historical_minute_replay": True,
+            "minute_valuation_contract": promotion.MINUTE_CURVE_CONTRACT,
+            "valuation_source": "shioaji_historical_1m_close_with_last_trade_carry",
+            "fresh_trade_notional_coverage_ratio": 1.0,
+            "fresh_trade_position_count": 0,
+            "last_trade_carried_position_count": 0,
+            "missing_price_position_count": 0,
+            "valuation_executable": False,
         }
         for market in sorted(MARKETS)
         for offset in range(promotion.MINUTE_CURVE_SESSION_POINTS)
@@ -104,6 +112,10 @@ def test_validate_rebuild_accepts_exact_flat_mode_set(tmp_path: Path) -> None:
     assert result["mode_set"] == sorted(MARKETS)
     assert result["final_open_positions"] == {market: 0 for market in sorted(MARKETS)}
     assert result["minute_curve_validation"]["validated_rows"] == 810
+    assert (
+        result["minute_curve_validation"]["unverified_historical_interior_rows"]
+        == 0
+    )
 
 
 def test_validate_rebuild_rejects_stale_daily_only_curve(tmp_path: Path) -> None:
@@ -114,6 +126,26 @@ def test_validate_rebuild_rejects_stale_daily_only_curve(tmp_path: Path) -> None
     receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
 
     with pytest.raises(RuntimeError, match="270 points per completed session"):
+        promotion._validate_rebuild(candidate, expected_markets=MARKETS)
+
+
+def test_validate_rebuild_rejects_unproved_interior_minute_price(
+    tmp_path: Path,
+) -> None:
+    candidate = _candidate(tmp_path)
+    marks_path = candidate / "marks.jsonl"
+    rows = [json.loads(line) for line in marks_path.read_text().splitlines()]
+    row = next(value for value in rows if value["minute"].endswith("09:02+08:00"))
+    row.pop("valuation_source")
+    marks_path.write_text(
+        "".join(json.dumps(value) + "\n" for value in rows), encoding="utf-8"
+    )
+    receipt_path = candidate / "minute_curve_receipt.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["outputs"]["marks"]["sha256"] = promotion._sha256(marks_path)
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="without auditable historical price"):
         promotion._validate_rebuild(candidate, expected_markets=MARKETS)
 
 

@@ -5,6 +5,8 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
+
 from stockagent.backtest.tw_execution import TaiwanFeeSchedule
 from stockagent.live.tw_day_trade_simulation import (
     ENTRY_FILL_POLICY_0901_MINUTE_VWAP,
@@ -74,6 +76,8 @@ def test_two_phase_cold_start_separates_live_best_quote_from_0901_replay(
     assert modes["tw_day_trade_100m"]["entry_price"] == 1_000.0
     assert modes["tw_day_trade_multi_basis"]["side"] == "short"
     assert modes["tw_day_trade_multi_basis"]["entry_price"] == 998.0
+    assert modes["tw_day_trade_multi_basis_22"]["side"] == "long"
+    assert modes["tw_day_trade_multi_basis_22"]["entry_price"] == 1_000.0
     assert modes["tw_day_trade_multi_basis_projection_l1_gelu"]["side"] == "long"
     assert modes["tw_day_trade_multi_basis_projection_l1_gelu"]["entry_price"] == 1_000.0
     assert all(row["filled_shares"] == 1_000 for row in modes.values())
@@ -143,6 +147,18 @@ def test_real_model_shadow_requires_cold_then_hot_cache_proof(
     call_counts: dict[str, int] = {}
 
     def fake_generate_live_signal(**kwargs):
+        snapshot = signal_engine._price_snapshot(
+            source="cold_test_fixture",
+            symbols=["2330"],
+            fallback_prices=np.asarray([100.0]),
+            parquet_root=tmp_path / "stocks",
+            prices_csv=None,
+            yahoo_chunk_size=80,
+            request_mask=np.asarray([True]),
+            require_official_tw_session_open=True,
+            force_fresh=True,
+        )
+        assert snapshot.available_count == 1
         market = kwargs["market"]
         call_counts[market] = call_counts.get(market, 0) + 1
         hot = call_counts[market] == 2

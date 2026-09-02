@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from datetime import datetime
+import json
+from pathlib import Path
+from types import SimpleNamespace
 import weakref
 
 import numpy as np
@@ -205,8 +208,116 @@ def test_live_panel_cache_identity_ignores_worker_count(tmp_path) -> None:
         live_tail_rows=48,
         panel_kwargs={"feature_include": ["base"], "panel_load_workers": 112},
     )
+    different_start = _live_panel_cache_key(
+        config,
+        live_tail_rows=48,
+        panel_kwargs={
+            "feature_include": ["base"],
+            "panel_load_workers": 112,
+            "panel_start_date": "2026-01-01",
+        },
+    )
 
     assert first == second
+    assert first == different_start
+
+
+def test_live_tail_panel_disk_cache_survives_process_memory_clear(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    (source_root / "2330_features.parquet").write_bytes(b"source-v1")
+    disk_root = tmp_path / "runtime-cache"
+    monkeypatch.setenv("STOCKAGENT_LIVE_PANEL_CACHE_ROOT", str(disk_root))
+    monkeypatch.setenv("STOCKAGENT_LIVE_PANEL_DISK_CACHE", "1")
+    data = SimpleNamespace(
+        parquet_root=str(source_root),
+        benchmark_name="universe_average_return",
+        usd_only_trading_pairs=False,
+        tradable_mode="tradable",
+        trading_volume_policy="auto",
+        security_filter="none",
+        panel_backend="auto",
+        panel_load_workers=2,
+        feature_include=["base"],
+        feature_exclude=[],
+        feature_zero_fill=[],
+        feature_shift_next_session=[],
+        panel_start_date="2026-09-02",
+        live_tail_panel_rows=48,
+        use_external_features=False,
+        use_tw_public_features=False,
+        use_tw_public_rules=False,
+        external_feature_path=None,
+        external_market_symbol="__MARKET__",
+        tw_public_feature_path=None,
+        tw_public_market_symbol="__MARKET__",
+        external_include_features=False,
+        external_include_rules=False,
+        external_data_required=False,
+    )
+    config = SimpleNamespace(
+        data=data,
+        training=SimpleNamespace(lookback=2, strict_no_fallback=True),
+    )
+    panel = PanelData(
+        dates=np.array(["2026-09-01", "2026-09-02"], dtype="datetime64[D]"),
+        symbols=["2330"],
+        feature_names=["base"],
+        features=np.ones((2, 1, 1), dtype=np.float32),
+        returns_1d=np.zeros((2, 1), dtype=np.float32),
+        tradable_mask=np.ones((2, 1), dtype=bool),
+        alive_mask=np.ones((2, 1), dtype=bool),
+        benchmark_returns=np.zeros((2,), dtype=np.float32),
+        close_prices=np.ones((2, 1), dtype=np.float32),
+    )
+    builds: list[int] = []
+
+    def fake_build(*args, **kwargs):
+        del args, kwargs
+        builds.append(1)
+        return panel
+
+    monkeypatch.setattr(signal_engine, "build_tail_panel", fake_build)
+    signal_engine.clear_live_panel_memory_cache()
+
+    first, first_hit, first_tier = signal_engine._build_panel(
+        config,
+        live_tail=True,
+    )
+    signal_engine.clear_live_panel_memory_cache()
+    second, second_hit, second_tier = signal_engine._build_panel(
+        config,
+        live_tail=True,
+    )
+
+    assert first.num_dates == 1
+    assert str(first.dates[0]) == "2026-09-02"
+    assert not first_hit
+    assert first_tier == "rebuilt"
+    assert second_hit
+    assert second_tier == "disk"
+    assert second.num_dates == 1
+    np.testing.assert_array_equal(second.features, panel.features[-1:])
+    assert builds == [1]
+
+    meta_path = disk_root / "panel_cache_v2" / "meta.json"
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    (disk_root / "panel_cache_v2" / meta["arrays"]["features"]["file"]).unlink()
+    signal_engine.clear_live_panel_memory_cache()
+
+    repaired, repaired_hit, repaired_tier = signal_engine._build_panel(
+        config,
+        live_tail=True,
+    )
+
+    assert not repaired_hit
+    assert repaired_tier == "rebuilt"
+    assert repaired.num_dates == 1
+    assert builds == [1, 1]
+    signal_engine.clear_live_panel_memory_cache()
 
 
 def test_day_trade_live_window_rejects_foreign_feature_schema() -> None:
