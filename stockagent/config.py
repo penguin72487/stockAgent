@@ -24,6 +24,11 @@ from stockagent.backtest.tw_index_derivatives_day import OptionDayCostSchedule
 from stockagent.data.tw_index_futures import (
     normalize_taifex_index_futures_product,
 )
+from stockagent.data.tw_day_trade_execution import (
+    DAY_TRADE_MINUTE_EXECUTION_POLICY_FULL_VOLUME,
+    DAY_TRADE_MINUTE_EXECUTION_POLICY_SCHEDULED,
+    normalize_day_trade_minute_execution_policy,
+)
 from stockagent.data.walkforward import normalize_lookback_context
 from stockagent.portfolio_contract import (
     DEFAULT_PORTFOLIO_ACTIVATION,
@@ -675,6 +680,7 @@ def _validate_tw_stock_context_futures_portfolio_mode_contract(
     futures_current_open_feature: object,
     data_futures_current_open_feature: object,
     carry_valuation_max_abs_simple_return: object,
+    expiry_settlement_valuation: object,
     day_trade_open_feature: object,
     feature_shift_next_session: object,
     feature_exclude: object,
@@ -775,6 +781,11 @@ def _validate_tw_stock_context_futures_portfolio_mode_contract(
         raise ValueError(
             "tw_futures_carry_valuation_max_abs_simple_return is defined only "
             "for the 08:45 current futures OPEN contract"
+        )
+    if bool(expiry_settlement_valuation) and not bool(integer_contracts):
+        raise ValueError(
+            "tw_futures_expiry_settlement_valuation requires exact integer "
+            "all-futures execution metadata"
         )
     activations = {
         "trading.portfolio_activation": normalize_portfolio_activation(
@@ -1416,6 +1427,11 @@ class DataConfig:
     # Zero preserves historical contracts. A positive threshold fails the
     # entire affected physical contract closed instead of clipping its return.
     tw_futures_carry_valuation_max_abs_simple_return: float = 0.0
+    # When a physical TAIFEX contract reaches its own last-trading row, value
+    # the mandatory close with the observed exchange settlement column rather
+    # than an ordinary last-trade close. This is an executor-only label and is
+    # checkpoint-incompatible with the historical close-valued carry account.
+    tw_futures_expiry_settlement_valuation: bool = False
     # Features whose session-t value is not available early enough for a
     # session-t decision.  Panel construction exposes that value on the next
     # panel session while preserving the source's original dated archive.
@@ -1424,13 +1440,20 @@ class DataConfig:
     # model that approximates execution at that same close.
     allow_same_close_feature_approximation: bool = False
     # Receipt-backed, date-partitioned right-labelled one-minute research data.
-    # This path is consumed only by execution_mode=tw_minute and never by the
-    # daily panel builder.
+    # The intraday model consumes it as training input; the daily day-trade
+    # model may consume it only through the executor-label field below. It is
+    # never appended to ordinary daily model features.
     minute_parquet_root: str = "data_tw_minute/research_dataset"
     # Optional executor-only minute tape for the *daily* tw_day_trade model.
     # When set, the daily loss uses the 09:01/13:20/13:24/13:30 execution
     # schedule instead of the legacy open-to-close return proxy.
     day_trade_minute_execution_root: str | None = None
+    # ``scheduled_events_50pct`` preserves the legacy 17-field tape.
+    # ``full_session_volume_100pct`` carries one persistent entry/exit order
+    # across right-labelled minute bars and is a distinct checkpoint contract.
+    day_trade_minute_execution_policy: str = (
+        DAY_TRADE_MINUTE_EXECUTION_POLICY_SCHEDULED
+    )
     day_trade_minute_execution_cache_dir: str = (
         "artifacts/cache/tw_day_trade_minute_execution_v1"
     )
@@ -3521,6 +3544,9 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     data["tw_futures_current_open_feature"] = bool(
         data["tw_futures_current_open_feature"]
     )
+    data["tw_futures_expiry_settlement_valuation"] = bool(
+        data["tw_futures_expiry_settlement_valuation"]
+    )
     carry_guard = float(
         data["tw_futures_carry_valuation_max_abs_simple_return"]
     )
@@ -3834,6 +3860,9 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         carry_valuation_max_abs_simple_return=data[
             "tw_futures_carry_valuation_max_abs_simple_return"
         ],
+        expiry_settlement_valuation=data[
+            "tw_futures_expiry_settlement_valuation"
+        ],
         day_trade_open_feature=data["day_trade_open_feature"],
         feature_shift_next_session=data["feature_shift_next_session"],
         feature_exclude=data["feature_exclude"],
@@ -3957,6 +3986,11 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     data["day_trade_minute_execution_allow_daily_proxy"] = bool(
         data["day_trade_minute_execution_allow_daily_proxy"]
     )
+    data["day_trade_minute_execution_policy"] = (
+        normalize_day_trade_minute_execution_policy(
+            data["day_trade_minute_execution_policy"]
+        )
+    )
     if data["day_trade_minute_execution_root"] is not None:
         if trading["execution_mode"] != "tw_day_trade":
             raise ValueError(
@@ -3967,11 +4001,29 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
             raise ValueError(
                 "daily-model minute execution requires trading.frequency='daily'"
             )
-        if abs(float(trading["max_volume_participation"]) - 0.5) > 1.0e-12:
+        minute_policy = data["day_trade_minute_execution_policy"]
+        required_participation = (
+            1.0
+            if minute_policy == DAY_TRADE_MINUTE_EXECUTION_POLICY_FULL_VOLUME
+            else 0.5
+        )
+        if abs(
+            float(trading["max_volume_participation"])
+            - required_participation
+        ) > 1.0e-12:
             raise ValueError(
-                "daily-model minute execution contract requires "
-                "trading.max_volume_participation=0.5"
+                f"daily-model minute execution policy {minute_policy!r} requires "
+                "trading.max_volume_participation="
+                f"{required_participation}"
             )
+    elif (
+        data["day_trade_minute_execution_policy"]
+        != DAY_TRADE_MINUTE_EXECUTION_POLICY_SCHEDULED
+    ):
+        raise ValueError(
+            "non-default data.day_trade_minute_execution_policy requires "
+            "data.day_trade_minute_execution_root"
+        )
     if bool(trading["tw_day_trade_unlimited_margin_conversion"]):
         if trading["execution_mode"] != "tw_day_trade":
             raise ValueError(

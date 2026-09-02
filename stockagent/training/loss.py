@@ -1276,6 +1276,7 @@ def risk_aware_loss(
     overnight_log_returns: Tensor | None = None,
     can_short_open_open_mask: Tensor | None = None,
     day_trade_execution_initial_capital: float = 1_000_000.0,
+    day_trade_execution_volume_participation: float = 0.50,
     symbol_sharded_ledger: bool = False,
     futures_portfolio_training_surrogate_only: bool = False,
     futures_portfolio_recoverable_backward: bool = False,
@@ -1824,6 +1825,9 @@ def risk_aware_loss(
         symbol_indices=symbol_indices,
         overnight_returns=overnight_log_returns,
         day_trade_execution_initial_capital=day_trade_execution_initial_capital,
+        day_trade_execution_volume_participation=(
+            day_trade_execution_volume_participation
+        ),
         symbol_sharded_ledger=symbol_sharded_ledger,
         futures_portfolio_training_surrogate_only=(
             futures_portfolio_training_surrogate_only

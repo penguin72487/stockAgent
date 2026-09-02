@@ -42,17 +42,11 @@ export OPENBB_SUPERVISOR_TQDM="${OPENBB_SUPERVISOR_TQDM:-1}"
 
 state_dir="$output_dir/_state"
 mkdir -p "$state_dir"
-for pid_name in supervisor downloader; do
-  pid_path="$state_dir/$pid_name.pid"
-  pid=""
-  if [[ -s "$pid_path" ]]; then
-    pid="$(tr -d '[:space:]' <"$pid_path")"
-  fi
-  if [[ "$pid" =~ ^[1-9][0-9]*$ ]] && kill -0 "$pid" 2>/dev/null; then
-    echo "An OpenBB $pid_name is already active with PID $pid; refusing a duplicate run." >&2
-    exit 3
-  fi
-done
+# PID numbers are reusable and the files are intentionally diagnostic only.
+# The supervisor's kernel-held flock is the sole duplicate-run authority; a
+# crash releases it even when stale PID files remain on disk.  Let the
+# supervisor acquire that lock instead of treating an unrelated process that
+# inherited a recycled PID as an active archive worker.
 
 source scripts/runtime_env.sh
 python_bin="$(resolve_fintech_python)" || {

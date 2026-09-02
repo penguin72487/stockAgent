@@ -338,10 +338,11 @@ class PanelData:
     # Optional per-session/per-symbol legal or broker margin ratio.  Historical
     # sources in this module do not guess it; unknown values remain NaN/None.
     short_margin_rate: np.ndarray | None = None
-    # Executor-only compressed events [T,S,C] for a daily policy.  This may
-    # include explicitly labelled adverse daily-bar proxy fields before the
-    # canonical minute archive begins.  It is attached by train.py after panel
-    # cache loading and never enters model features or the ordinary panel cache.
+    # Executor-only compressed events [T,S,C] or full minute paths [T,S,M,C]
+    # for a daily policy. Compressed tapes may include explicitly labelled
+    # adverse daily-bar proxy fields before the canonical minute archive begins.
+    # They are attached by train.py after panel-cache loading and never enter
+    # model features or the ordinary panel cache.
     day_trade_minute_execution: np.ndarray | None = None
     # Exact logical-array hashes supplied only by an immutable panel-cache
     # generation. Synthetic or caller-mutated panels leave this unset and are

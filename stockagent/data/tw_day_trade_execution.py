@@ -1,10 +1,10 @@
-"""Compressed execution tape for the daily-policy Taiwan day-trade model.
+"""Historical minute-K execution tapes for the daily day-trade model.
 
 The model still makes exactly one decision per exchange session.  This module
-extracts only the causally later bars needed by the executor, so the resulting
-tensor is an execution label and must never be appended to model features.
+builds either a compressed event tape or the full right-labelled minute path.
+Both are execution labels and must never be appended to model features.
 
-Before the first canonical minute-K partition, the tape can carry an explicitly
+Before the first canonical minute-K partition, a compressed tape can carry an explicitly
 labelled daily-bar proxy.  It is deliberately adverse on both legs: long trades
 buy one dated legal tick above open and sell one tick below close; short trades
 sell one tick below open and buy one tick above close.  Missing minute
@@ -17,7 +17,9 @@ from __future__ import annotations
 from enum import IntEnum
 from pathlib import Path
 import hashlib
+import json
 import os
+from typing import Final
 
 import numpy as np
 
@@ -31,7 +33,7 @@ except Exception:  # pragma: no cover - validated by the public loader
     pq = None
 
 
-DAY_TRADE_MINUTE_EXECUTION_CONTRACT_VERSION = 5
+DAY_TRADE_MINUTE_EXECUTION_CONTRACT_VERSION = 6
 # A regular session is represented by minute labels 0..270 in the canonical
 # archive.  Without historical minute bars, allocating the full daily volume
 # to one synthetic bar would violate the user's 50%-of-minute-K capacity rule
@@ -39,6 +41,49 @@ DAY_TRADE_MINUTE_EXECUTION_CONTRACT_VERSION = 5
 # no-lookahead estimate daily_volume / 271 as each entry/exit bar's volume;
 # the executor subsequently applies its ordinary 50% whole-lot cap.
 DAILY_PROXY_SESSION_MINUTE_BARS = 271.0
+DAY_TRADE_MINUTE_SOURCE_SCHEMA_VERSION = 4
+DAY_TRADE_MINUTE_EXECUTION_POLICY_SCHEDULED: Final[str] = "scheduled_events_50pct"
+DAY_TRADE_MINUTE_EXECUTION_POLICY_FULL_VOLUME: Final[str] = (
+    "full_session_volume_100pct"
+)
+DAY_TRADE_MINUTE_EXECUTION_POLICIES: Final[tuple[str, ...]] = (
+    DAY_TRADE_MINUTE_EXECUTION_POLICY_SCHEDULED,
+    DAY_TRADE_MINUTE_EXECUTION_POLICY_FULL_VOLUME,
+)
+
+# Full-session tensors use minute 0 for the official opening price used only
+# for sizing.  Right-labelled executable bars occupy minutes 1..270.  The last
+# axis is [VWAP_OR_AUCTION_PRICE, VOLUME_SHARES].
+DAY_TRADE_FULL_SESSION_MINUTES = 271
+DAY_TRADE_FULL_SESSION_FIELDS = 2
+FULL_SESSION_PRICE = 0
+FULL_SESSION_VOLUME_SHARES = 1
+
+
+def normalize_day_trade_minute_execution_policy(value: object) -> str:
+    if not isinstance(value, str):
+        raise ValueError(
+            "day_trade_minute_execution_policy must be one of "
+            f"{DAY_TRADE_MINUTE_EXECUTION_POLICIES}"
+        )
+    normalized = "_".join(value.strip().casefold().replace("-", "_").split())
+    aliases = {
+        "scheduled": DAY_TRADE_MINUTE_EXECUTION_POLICY_SCHEDULED,
+        "scheduled_events": DAY_TRADE_MINUTE_EXECUTION_POLICY_SCHEDULED,
+        "scheduled_events_50pct": DAY_TRADE_MINUTE_EXECUTION_POLICY_SCHEDULED,
+        "legacy": DAY_TRADE_MINUTE_EXECUTION_POLICY_SCHEDULED,
+        "full_session": DAY_TRADE_MINUTE_EXECUTION_POLICY_FULL_VOLUME,
+        "full_session_volume": DAY_TRADE_MINUTE_EXECUTION_POLICY_FULL_VOLUME,
+        "full_session_volume_100pct": DAY_TRADE_MINUTE_EXECUTION_POLICY_FULL_VOLUME,
+        "minute_volume_100pct": DAY_TRADE_MINUTE_EXECUTION_POLICY_FULL_VOLUME,
+    }
+    result = aliases.get(normalized)
+    if result is None:
+        raise ValueError(
+            "day_trade_minute_execution_policy must be one of "
+            f"{DAY_TRADE_MINUTE_EXECUTION_POLICIES}"
+        )
+    return result
 
 
 class DayTradeExecutionField(IntEnum):
@@ -226,21 +271,23 @@ def load_tw_day_trade_execution_tape(
     panel_dates: np.ndarray,
     panel_symbols: list[str],
     official_open_prices: np.ndarray,
-    official_close_prices: np.ndarray,
-    daily_volume_shares: np.ndarray,
+    official_close_prices: np.ndarray | None = None,
+    daily_volume_shares: np.ndarray | None = None,
     cache_dir: str | Path | None = None,
     allow_daily_proxy: bool = True,
+    policy: str = DAY_TRADE_MINUTE_EXECUTION_POLICY_SCHEDULED,
 ) -> np.ndarray:
-    """Align minute events plus the pre-minute daily proxy to ``[T,S,C]``.
+    """Align executor-only minute facts to the daily panel.
 
-    When ``allow_daily_proxy`` is true, rows before the first canonical minute
-    partition use direction-specific adverse one-tick open/close proxy prices.
-    Their estimated one-minute volume is daily volume divided uniformly across
-    271 minute labels, after which the executor applies the same 50% cap as a
-    real minute bar.  Strict mode rejects those rows before constructing tape.
-    From the first minute partition onward, missing partitions, symbols, bars,
-    prices, or volume remain fail-closed.  ``Amount / volume_shares`` is the
-    observable minute VWAP used for historical market-order execution.
+    ``scheduled_events_50pct`` emits the compressed event tape and can use a
+    direction-specific adverse daily proxy before the first minute partition
+    when ``allow_daily_proxy`` is true. Strict mode rejects those earlier rows.
+    ``full_session_volume_100pct`` emits ``[T,S,271,2]`` with minute 0 holding
+    only the official sizing open and minutes 1..270 holding right-labelled
+    price/volume facts. Missing partitions, symbols, bars, prices, or volume
+    remain fail-closed: prices are NaN and capacity is zero. ``Amount /
+    volume_shares`` is the observable minute VWAP used for continuous-market
+    historical execution; minute 270 uses the official close-auction price.
     """
 
     if pq is None or pc is None:
@@ -274,24 +321,32 @@ def load_tw_day_trade_execution_tape(
 
     dates = np.asarray(panel_dates, dtype="datetime64[D]").reshape(-1)
     opens = np.asarray(official_open_prices, dtype=np.float64)
-    closes = np.asarray(official_close_prices, dtype=np.float64)
-    daily_volumes = np.asarray(daily_volume_shares, dtype=np.float64)
+    normalized_policy = normalize_day_trade_minute_execution_policy(policy)
     expected = (int(dates.size), len(panel_symbols))
     if opens.shape != expected:
         raise ValueError("official_open_prices must align with panel [T,S]")
-    if closes.shape != expected:
-        raise ValueError("official_close_prices must align with panel [T,S]")
-    if daily_volumes.shape != expected:
-        raise ValueError("daily_volume_shares must align with panel [T,S]")
+    closes: np.ndarray | None = None
+    daily_volumes: np.ndarray | None = None
+    if normalized_policy == DAY_TRADE_MINUTE_EXECUTION_POLICY_SCHEDULED:
+        if official_close_prices is None or daily_volume_shares is None:
+            raise ValueError(
+                "scheduled minute execution requires official close prices "
+                "and daily share volume"
+            )
+        closes = np.asarray(official_close_prices, dtype=np.float64)
+        daily_volumes = np.asarray(daily_volume_shares, dtype=np.float64)
+        if closes.shape != expected:
+            raise ValueError("official_close_prices must align with panel [T,S]")
+        if daily_volumes.shape != expected:
+            raise ValueError("daily_volume_shares must align with panel [T,S]")
     cache_path: Path | None = None
     if cache_dir is not None:
         digest = hashlib.sha256()
         digest.update(
-            f"contract={DAY_TRADE_MINUTE_EXECUTION_CONTRACT_VERSION}".encode(
-                "utf-8"
-            )
+            f"contract={DAY_TRADE_MINUTE_EXECUTION_CONTRACT_VERSION}\0"
+            f"policy={normalized_policy}\0"
+            f"allow_daily_proxy={bool(allow_daily_proxy)}\0".encode("utf-8")
         )
-        digest.update(f"allow_daily_proxy={bool(allow_daily_proxy)}".encode("utf-8"))
         digest.update(str(root_path.resolve()).encode("utf-8"))
         manifest = root_path / "manifest.json"
         if manifest.is_file():
@@ -299,27 +354,50 @@ def load_tw_day_trade_execution_tape(
         digest.update(dates.astype("datetime64[D]").astype(np.int64).tobytes())
         digest.update("\0".join(map(str, panel_symbols)).encode("utf-8"))
         digest.update(np.ascontiguousarray(opens, dtype=np.float32).tobytes())
-        digest.update(np.ascontiguousarray(closes, dtype=np.float32).tobytes())
-        digest.update(
-            np.ascontiguousarray(daily_volumes, dtype=np.float32).tobytes()
-        )
+        if closes is not None and daily_volumes is not None:
+            digest.update(np.ascontiguousarray(closes, dtype=np.float32).tobytes())
+            digest.update(
+                np.ascontiguousarray(daily_volumes, dtype=np.float32).tobytes()
+            )
         resolved_cache = Path(cache_dir)
         resolved_cache.mkdir(parents=True, exist_ok=True)
         cache_path = resolved_cache / f"tape-{digest.hexdigest()}.npy"
         if cache_path.is_file():
-            cached = np.load(cache_path, allow_pickle=False)
-            if cached.shape != (*expected, DAY_TRADE_EXECUTION_FIELD_COUNT):
-                raise RuntimeError(f"invalid cached day-trade execution tape: {cache_path}")
-            cached = np.asarray(cached, dtype=np.float32)
-            if not allow_daily_proxy and bool(
-                np.any(cached[:, :, DayTradeExecutionField.DAILY_PROXY_FLAG] > 0.5)
-            ):
-                raise RuntimeError(
-                    "strict minute execution cache contains daily proxy rows: "
-                    f"{cache_path}"
+            cached = np.load(cache_path, allow_pickle=False, mmap_mode="c")
+            expected_shape = (
+                (*expected, DAY_TRADE_EXECUTION_FIELD_COUNT)
+                if normalized_policy
+                == DAY_TRADE_MINUTE_EXECUTION_POLICY_SCHEDULED
+                else (
+                    *expected,
+                    DAY_TRADE_FULL_SESSION_MINUTES,
+                    DAY_TRADE_FULL_SESSION_FIELDS,
                 )
-            _require_executable_tape_coverage(cached, source=cache_path)
+            )
+            if cached.shape != expected_shape or cached.dtype != np.dtype(np.float32):
+                raise RuntimeError(f"invalid cached day-trade execution tape: {cache_path}")
+            if normalized_policy == DAY_TRADE_MINUTE_EXECUTION_POLICY_SCHEDULED:
+                cached = np.asarray(cached, dtype=np.float32)
+                if not allow_daily_proxy and bool(
+                    np.any(
+                        cached[:, :, DayTradeExecutionField.DAILY_PROXY_FLAG] > 0.5
+                    )
+                ):
+                    raise RuntimeError(
+                        "strict minute execution cache contains daily proxy rows: "
+                        f"{cache_path}"
+                    )
+                _require_executable_tape_coverage(cached, source=cache_path)
             return cached
+    if normalized_policy == DAY_TRADE_MINUTE_EXECUTION_POLICY_FULL_VOLUME:
+        return _load_full_session_volume_tape(
+            root=root,
+            dates=dates,
+            panel_symbols=panel_symbols,
+            opens=opens,
+            cache_path=cache_path,
+        )
+    assert closes is not None and daily_volumes is not None
     tape = np.full((*expected, DAY_TRADE_EXECUTION_FIELD_COUNT), np.nan, dtype=np.float32)
     tape[:, :, DayTradeExecutionField.ENTRY_VOLUME_0901] = 0.0
     tape[:, :, DayTradeExecutionField.VOLUME_1321] = 0.0
@@ -457,12 +535,142 @@ def load_tw_day_trade_execution_tape(
     return tape
 
 
+def _load_full_session_volume_tape(
+    *,
+    root: str | Path,
+    dates: np.ndarray,
+    panel_symbols: list[str],
+    opens: np.ndarray,
+    cache_path: Path | None,
+) -> np.ndarray:
+    """Build the full right-labelled market-volume path without a RAM copy."""
+
+    manifest_path = Path(root) / "manifest.json"
+    if not manifest_path.is_file():
+        raise RuntimeError(
+            "full-session day-trade execution requires the receipt-backed "
+            f"minute manifest: {manifest_path}"
+        )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if not (
+        isinstance(manifest, dict)
+        and manifest.get("schema_version")
+        == DAY_TRADE_MINUTE_SOURCE_SCHEMA_VERSION
+        and manifest.get("source") == "shioaji_kbars_1m"
+        and manifest.get("research_ready") is True
+        and manifest.get("status") == "research_ready"
+        and isinstance(manifest.get("partitions"), list)
+        and len(manifest["partitions"]) == len(manifest.get("dates", []))
+    ):
+        raise RuntimeError(
+            "full-session day-trade execution requires a complete "
+            "research_ready minute manifest"
+        )
+
+    shape = (
+        int(dates.size),
+        len(panel_symbols),
+        DAY_TRADE_FULL_SESSION_MINUTES,
+        DAY_TRADE_FULL_SESSION_FIELDS,
+    )
+    temporary: Path | None = None
+    if cache_path is None:
+        tape = np.full(shape, np.nan, dtype=np.float32)
+    else:
+        temporary = cache_path.with_name(f".{cache_path.name}.{os.getpid()}.tmp")
+        tape = np.lib.format.open_memmap(
+            temporary,
+            mode="w+",
+            dtype=np.float32,
+            shape=shape,
+        )
+        tape[:] = np.nan
+    tape[:, :, :, FULL_SESSION_VOLUME_SHARES] = 0.0
+    tape[:, :, 0, FULL_SESSION_PRICE] = opens.astype(np.float32)
+
+    symbol_index = {str(symbol): idx for idx, symbol in enumerate(panel_symbols)}
+    root_path = Path(root)
+    columns = [
+        "symbol",
+        "minutes_from_open",
+        "Close",
+        "Amount",
+        "volume_shares",
+    ]
+    for date_idx, day in enumerate(dates):
+        day_text = np.datetime_as_string(day, unit="D")
+        path = root_path / f"trade_date={day_text}" / "data.parquet"
+        if not path.is_file():
+            continue
+        table = pq.read_table(path, columns=columns)
+        payload = table.to_pydict()
+        row_symbols = payload["symbol"]
+        row_minutes = np.asarray(payload["minutes_from_open"], dtype=np.int16)
+        row_close = np.asarray(payload["Close"], dtype=np.float64)
+        row_amount = np.asarray(payload["Amount"], dtype=np.float64)
+        row_volume = np.asarray(payload["volume_shares"], dtype=np.float64)
+        row_symbol_indices = np.fromiter(
+            (symbol_index.get(str(symbol), -1) for symbol in row_symbols),
+            dtype=np.int64,
+            count=len(row_symbols),
+        )
+        selected = (
+            (row_symbol_indices >= 0)
+            & (row_minutes >= 1)
+            & (row_minutes < DAY_TRADE_FULL_SESSION_MINUTES)
+        )
+        if not bool(selected.any()):
+            continue
+        selected_indices = np.flatnonzero(selected)
+        symbol_slots = row_symbol_indices[selected_indices]
+        minute_slots = row_minutes[selected_indices].astype(np.int64, copy=False)
+        volumes = row_volume[selected_indices]
+        closes = row_close[selected_indices]
+        amounts = row_amount[selected_indices]
+        valid_volume = np.isfinite(volumes) & (volumes > 0.0)
+        valid_vwap = valid_volume & np.isfinite(amounts) & (amounts > 0.0)
+        prices = closes.copy()
+        np.divide(amounts, volumes, out=prices, where=valid_vwap)
+        # The 13:30 right-labelled row is the closing auction. Its official
+        # close is the execution price; treating its Amount/Volume as an
+        # ordinary continuous-market VWAP would obscure that boundary.
+        prices = np.where(minute_slots == 270, closes, prices)
+        valid_price = np.isfinite(prices) & (prices > 0.0)
+        tape[date_idx, symbol_slots, minute_slots, FULL_SESSION_PRICE] = np.where(
+            valid_price, prices, np.nan
+        ).astype(np.float32)
+        tape[
+            date_idx,
+            symbol_slots,
+            minute_slots,
+            FULL_SESSION_VOLUME_SHARES,
+        ] = np.where(valid_volume, volumes, 0.0).astype(np.float32)
+
+    if temporary is None or cache_path is None:
+        return tape
+    tape.flush()
+    del tape
+    with temporary.open("rb") as handle:
+        os.fsync(handle.fileno())
+    os.replace(temporary, cache_path)
+    return np.load(cache_path, allow_pickle=False, mmap_mode="c")
+
+
 __all__ = [
     "DAILY_PROXY_SESSION_MINUTE_BARS",
     "DAY_TRADE_EXECUTION_FIELD_COUNT",
+    "DAY_TRADE_FULL_SESSION_FIELDS",
+    "DAY_TRADE_FULL_SESSION_MINUTES",
     "DAY_TRADE_MINUTE_EXECUTION_CONTRACT_VERSION",
+    "DAY_TRADE_MINUTE_EXECUTION_POLICIES",
+    "DAY_TRADE_MINUTE_EXECUTION_POLICY_FULL_VOLUME",
+    "DAY_TRADE_MINUTE_EXECUTION_POLICY_SCHEDULED",
+    "DAY_TRADE_MINUTE_SOURCE_SCHEMA_VERSION",
     "DayTradeExecutionField",
     "MIN_EXECUTABLE_MINUTE_VOLUME_SHARES",
+    "FULL_SESSION_PRICE",
+    "FULL_SESSION_VOLUME_SHARES",
     "load_tw_day_trade_execution_tape",
+    "normalize_day_trade_minute_execution_policy",
     "tw_day_trade_minute_round_trip_masks",
 ]

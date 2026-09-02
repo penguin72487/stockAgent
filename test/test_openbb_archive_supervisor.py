@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import os
 from pathlib import Path
 import subprocess
@@ -65,18 +66,39 @@ def test_user_entry_rejects_start_date_override() -> None:
     assert "fixed at 2000-01-01" in result.stderr
 
 
-def test_user_entry_refuses_duplicate_live_supervisor(tmp_path) -> None:
+def test_user_entry_ignores_stale_or_recycled_pid_files(tmp_path) -> None:
     state_dir = tmp_path / "_state"
     state_dir.mkdir()
     (state_dir / "supervisor.pid").write_text(f"{os.getpid()}\n", encoding="utf-8")
 
     result = _run(
         USER_ENTRY,
-        env={"OPENBB_OUTPUT_DIR": str(tmp_path), "OPENBB_MIN_FREE_BYTES": "0"},
+        env={
+            "OPENBB_OUTPUT_DIR": str(tmp_path),
+            "OPENBB_MIN_FREE_BYTES": "0",
+            "OPENBB_PREFLIGHT_ONLY": "1",
+        },
     )
 
+    assert result.returncode == 0, result.stderr
+    assert "preflight completed" in result.stdout
+
+
+def test_user_entry_refuses_duplicate_kernel_lock_holder(tmp_path) -> None:
+    state_dir = tmp_path / "_state"
+    state_dir.mkdir()
+    with (state_dir / "supervisor.lock").open("w") as lock_handle:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        result = _run(
+            USER_ENTRY,
+            env={
+                "OPENBB_OUTPUT_DIR": str(tmp_path),
+                "OPENBB_MIN_FREE_BYTES": "0",
+            },
+        )
+
     assert result.returncode == 3
-    assert "already active" in result.stderr
+    assert "another supervisor already holds" in result.stdout
 
 
 def test_user_entry_preflight_does_not_start_downloader(tmp_path) -> None:

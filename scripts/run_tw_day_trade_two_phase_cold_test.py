@@ -7,8 +7,8 @@ Discord receipt.  It then atomically applies repaired source receipts and
 executes the same production pre-open readiness gate.  Only after that gate is
 ready does it inject an opening observation, publish three atomic signal
 pointers, and execute them immediately after 09:00 using a strictly later best
-Ask/Bid.  A separate isolated phase proves that historical replay alone is
-recorded at 09:01 using the observed official session open.
+Ask/Bid. A separate isolated phase proves that missed-opening replay sizes from
+the official 09:00 open and executes from an observed 09:01 minute VWAP.
 
 The final phase advances that same durable engine through intraday marking,
 13:20 passive exits, 13:24 market-at-best force exits, the 13:30 close, and two
@@ -56,8 +56,8 @@ from scripts.run_tw_day_trade_simulation import (  # noqa: E402
 )
 from stockagent.live.tw_day_trade_service_sync import load_service_sync  # noqa: E402
 from stockagent.live.tw_day_trade_simulation import (  # noqa: E402
+    ENTRY_FILL_POLICY_0901_MINUTE_VWAP,
     ENTRY_FILL_POLICY_CAUSAL_BOOK,
-    ENTRY_FILL_POLICY_OFFICIAL_OPEN_AT_0901,
     LiveEligibility,
     ModeSpec,
     TwDayTradeSimulationEngine,
@@ -667,6 +667,19 @@ def run_two_phase_cold_test(
     _LEGACY_SIGNAL_SCAN_CACHE.clear()
 
     specs = _enabled_specs(sandbox)
+    if not real_model_inference:
+        # The deterministic cold-start test validates orchestration and ledger
+        # contracts without loading model weights.  Give every isolated mode a
+        # sandbox-local checkpoint marker so the production runtime readiness
+        # gate does not depend on whichever formal artifacts happen to exist on
+        # the host running the test.
+        isolated_specs: list[ModeSpec] = []
+        for spec in specs:
+            checkpoint = sandbox / "checkpoints" / spec.market / "checkpoint_best.pt"
+            checkpoint.parent.mkdir(parents=True, exist_ok=True)
+            checkpoint.write_bytes(b"cold-test-checkpoint-fixture\n")
+            isolated_specs.append(replace(spec, checkpoint_path=str(checkpoint)))
+        specs = isolated_specs
     markets = tuple(spec.market for spec in specs)
     engine = TwDayTradeSimulationEngine(sandbox / "paper_engine")
     strict_after = datetime_time(8, 57)
@@ -994,8 +1007,8 @@ def run_two_phase_cold_test(
         },
     )
 
-    # Phase 2C: replay is isolated from live state and remains fixed to the
-    # official-open-at-09:01 counterfactual contract.
+    # Phase 2C: replay is isolated from live state and keeps inference/sizing
+    # at the official 09:00 open while execution uses the 09:01 minute VWAP.
     replay_engine = TwDayTradeSimulationEngine(sandbox / "replay_engine")
     replay_at = _at(session_date, 9, 1)
     replay_results: dict[str, str] = {}
@@ -1003,7 +1016,7 @@ def run_two_phase_cold_test(
     for spec in specs:
         replay_spec = replace(
             spec,
-            entry_fill_policy=ENTRY_FILL_POLICY_OFFICIAL_OPEN_AT_0901,
+            entry_fill_policy=ENTRY_FILL_POLICY_0901_MINUTE_VWAP,
             entry_price_offset_ticks=0,
         )
         loaded = _latest_signal(spec, commit_at)
@@ -1014,16 +1027,26 @@ def run_two_phase_cold_test(
             **source_summary,
             "signal_id": f"replay-{session_date.isoformat()}-{spec.market}",
             "simulation_replay": True,
-            "replay_basis": "official_session_open_at_09_01_to_official_close",
+            "replay_basis": "official_09_00_open_to_observed_09_01_minute_vwap",
             "entry_fill_contract": (
-                "retrospective_official_session_open_at_09_01_counterfactual"
+                "retrospective_official_open_signal_at_09_00_observed_09_01_minute_vwap_counterfactual"
             ),
         }
+        replay_quote = _opening_quote(session_date, replay_at)
+        replay_quote.update(
+            {
+                "execution_price_0901": 1_003.0,
+                "entry_price_source": "fixture_0901_minute_vwap",
+                "historical_source_quote_at": _at(
+                    session_date, 9, 0, 59
+                ).isoformat(timespec="seconds"),
+            }
+        )
         replay_results[spec.market] = replay_engine.register_signal(
             spec=replay_spec,
             summary=replay_summary,
             signal_rows=rows,
-            quotes={"2330": _opening_quote(session_date, replay_at)},
+            quotes={"2330": replay_quote},
             eligibility=_eligibility(session_date),
             eligibility_coverage=eligibility_coverage[spec.market],
             now=replay_at,
@@ -1039,20 +1062,24 @@ def run_two_phase_cold_test(
             "counterfactual_open_price_fill": replay_position.get(
                 "counterfactual_open_price_fill"
             ),
+            "counterfactual_0901_price_fill": replay_position.get(
+                "counterfactual_0901_price_fill"
+            ),
             "synthetic_fallback_fill": replay_position.get(
                 "synthetic_fallback_fill"
             ),
         }
     _assert_check(
         checks,
-        "phase2_historical_replay_only_uses_0901_official_open",
+        "phase2_missed_open_replay_uses_open_for_sizing_and_0901_vwap_for_fill",
         set(replay_results.values()) == {"registered"}
         and all(
-            row["entry_price"] == 999.0
+            row["entry_price"] == 1_003.0
             and row["entry_at"] == replay_at.isoformat(timespec="seconds")
             and row["entry_fill_policy"]
-            == ENTRY_FILL_POLICY_OFFICIAL_OPEN_AT_0901
-            and row["counterfactual_open_price_fill"] is True
+            == ENTRY_FILL_POLICY_0901_MINUTE_VWAP
+            and row["counterfactual_open_price_fill"] is False
+            and row["counterfactual_0901_price_fill"] is True
             and row["synthetic_fallback_fill"] is False
             for row in replay_evidence.values()
         ),
@@ -1343,7 +1370,7 @@ def run_two_phase_cold_test(
             "production_atomic_signal_pointer_consumer": True,
             "production_integer_paper_execution_engine": True,
             "production_0900_live_causal_best_quote_contract": True,
-            "historical_0901_official_open_replay_contract": True,
+            "missed_open_0900_inference_0901_vwap_replay_contract": True,
             "production_intraday_mark_and_exit_state_machine": True,
             "production_restart_recovery_and_idempotency": True,
             "external_publication_delivery": "deterministic_fixture",

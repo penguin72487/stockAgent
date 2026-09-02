@@ -1362,6 +1362,9 @@ def main() -> None:
             carry_valuation_max_abs_simple_return=float(
                 config.data.tw_futures_carry_valuation_max_abs_simple_return
             ),
+            expiry_settlement_valuation=bool(
+                config.data.tw_futures_expiry_settlement_valuation
+            ),
             integer_fee_per_contract_per_side_twd=float(
                 config.trading.tw_futures_portfolio_integer_fee_per_contract_per_side_twd
             ),
@@ -1440,6 +1443,7 @@ def main() -> None:
                 allow_daily_proxy=(
                     config.data.day_trade_minute_execution_allow_daily_proxy
                 ),
+                policy=config.data.day_trade_minute_execution_policy,
             )
 
         if _distributed_ready() and _distributed_world_size() > 1:

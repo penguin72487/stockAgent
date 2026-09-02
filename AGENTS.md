@@ -552,6 +552,15 @@ Guidelines:
   pre-fetch and post-fetch source coverage. Never re-download a locally covered
   pair or substitute an interpolated/fabricated price.
 
+- Every day-trade ledger replay/backfill must rebuild and validate one-minute
+  curves before promotion. Each completed session and active paper mode must
+  contain exactly 270 right-labelled points from 09:01 through 13:30; a daily
+  endpoint-only curve or a stale `minute_curve_receipt.json` is not promotable.
+  A still-open current session may be deferred, but the weekday post-close
+  minute-curve maintenance event must finalize it once the historical source is
+  available. Preserve accepted 09:01/13:30 ledger endpoints, disclose carried
+  last trades, and never use linear interpolation.
+
 - Current active low-rank baseline preference: `portfolio_mode: long_short`.
 - Keep `trading.long_only: false` when the model is intended to do long/short.
 - Portfolio direction and sizing should default to raw score direction followed by L1 normalization for gross exposure control:

@@ -221,6 +221,7 @@ def sanitize_tw_status(payload: Mapping[str, Any]) -> dict[str, Any]:
         "positions",
         allowed_fields={
             "counterfactual_open_replay",
+            "counterfactual_0901_price_fill",
             "closing_auction_limit_price",
             "closing_auction_order_status",
             "entry_at",
@@ -451,6 +452,7 @@ def sanitize_tw_signals(payload: Mapping[str, Any]) -> dict[str, Any]:
             "ask",
             "bid",
             "counterfactual_open_replay",
+            "counterfactual_0901_price_fill",
             "day_trade_eligible",
             "execution_price",
             "filled_shares",
@@ -510,6 +512,7 @@ def sanitize_tw_positions(payload: Mapping[str, Any]) -> dict[str, Any]:
             "closing_auction_limit_price",
             "closing_auction_order_status",
             "counterfactual_open_replay",
+            "counterfactual_0901_price_fill",
             "entry_at",
             "entry_fee_twd",
             "entry_price",

@@ -11,7 +11,9 @@ import pytest
 from scripts import rebuild_tw_day_trade_open_price_replay as replay
 from scripts import rebuild_tw_day_trade_benchmark_history as benchmark_replay
 from scripts import backfill_tw_day_trade_open_signals as signal_backfill
+from scripts import run_tw_day_trade_simulation as live_runner
 from stockagent.live.tw_day_trade_simulation import (
+    ENTRY_FILL_POLICY_0901_MINUTE_VWAP,
     ENTRY_FILL_POLICY_CAUSAL_BOOK,
     ENTRY_FILL_POLICY_CAUSAL_BOOK_ELSE_OPEN_TICK,
     ENTRY_FILL_POLICY_OFFICIAL_OPEN_AT_0901,
@@ -19,6 +21,104 @@ from stockagent.live.tw_day_trade_simulation import (
 
 
 TAIPEI = ZoneInfo("Asia/Taipei")
+
+
+def _complete_0901_query_receipt(*, resolved: int, requested: int) -> dict:
+    return {
+        "requested_symbols": requested,
+        "queried_symbols": requested,
+        "resolved_symbols": resolved,
+        "source_empty_symbols": requested - resolved,
+        "contract_missing_symbols": 0,
+        "unqueried_symbols": 0,
+        "error_counts": {},
+        "stopped_for_traffic": False,
+    }
+
+
+def test_live_missed_opening_retries_source_empty_during_settle_window(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[list[str]] = []
+
+    def fake_fetch(
+        symbols,
+        *,
+        trading_date,
+        max_traffic_fraction,
+        progress_callback=None,
+    ):
+        calls.append(list(symbols))
+        resolved_symbol = symbols[0]
+        return (
+            {
+                resolved_symbol: {
+                    "execution_price_0901": 100.0,
+                    "source": "fixture_0901_vwap",
+                }
+            },
+            _complete_0901_query_receipt(resolved=1, requested=len(symbols)),
+        )
+
+    monkeypatch.setattr(
+        live_runner,
+        "fetch_shioaji_historical_stock_0901_vwaps",
+        fake_fetch,
+    )
+    first_prices, first_receipt = live_runner._resolve_missed_opening_prices(
+        tmp_path,
+        datetime(2026, 8, 13, 9, 1, 5, tzinfo=TAIPEI),
+        {"1101", "2330"},
+    )
+    assert len(first_prices) == 1
+    assert first_receipt["source_settling"] is True
+
+    second_prices, second_receipt = live_runner._resolve_missed_opening_prices(
+        tmp_path,
+        datetime(2026, 8, 13, 9, 1, 30, tzinfo=TAIPEI),
+        {"1101", "2330"},
+    )
+    assert calls == [["1101", "2330"], ["2330"]]
+    assert set(second_prices) == {"1101", "2330"}
+    assert second_receipt["source_settling"] is False
+
+
+def test_live_missed_opening_finalizes_empty_source_after_settle_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        live_runner,
+        "fetch_shioaji_historical_stock_0901_vwaps",
+        lambda symbols, **_kwargs: (
+            {},
+            _complete_0901_query_receipt(resolved=0, requested=len(symbols)),
+        ),
+    )
+    _prices, settling = live_runner._resolve_missed_opening_prices(
+        tmp_path,
+        datetime(2026, 8, 13, 9, 1, 5, tzinfo=TAIPEI),
+        {"2330"},
+    )
+    assert settling["source_settling"] is True
+
+    def unexpected_fetch(*_args, **_kwargs):
+        raise AssertionError("terminal source-empty must not be queried forever")
+
+    monkeypatch.setattr(
+        live_runner,
+        "fetch_shioaji_historical_stock_0901_vwaps",
+        unexpected_fetch,
+    )
+    prices, finalized = live_runner._resolve_missed_opening_prices(
+        tmp_path,
+        datetime(2026, 8, 13, 9, 3, tzinfo=TAIPEI),
+        {"2330"},
+    )
+    assert prices == {}
+    assert finalized["source_settling"] is False
+    assert finalized["unresolved_union_symbols"] == 1
 
 
 def test_replay_candidate_retains_complete_benchmark_history(tmp_path: Path) -> None:
@@ -184,6 +284,131 @@ def test_official_open_entry_quotes_do_not_require_or_fabricate_book() -> None:
     assert quotes["2330"]["ask"] is None
     assert quotes["2330"]["entry_price_is_synthetic_fallback"] is False
     assert quality["adverse_tick_fallback_rows"] == 0
+
+
+def test_0901_vwap_entry_quotes_keep_open_and_execution_prices_separate() -> None:
+    spec = type(
+        "Spec",
+        (),
+        {
+            "market": "tw_day_trade",
+            "entry_fill_policy": ENTRY_FILL_POLICY_0901_MINUTE_VWAP,
+            "initial_capital_twd": 10_000_000.0,
+            "lot_size": 1_000,
+        },
+    )()
+    quotes, quality = replay._entry_quotes(
+        [{"symbol": "2330", "target_weight": 0.1, "open_price": 1_000.0}],
+        {
+            "2330": {
+                "upper_limit_price": 1_100.0,
+                "lower_limit_price": 900.0,
+                "reference_price": 1_000.0,
+            }
+        },
+        quote_at=datetime(2026, 8, 13, 9, 1, tzinfo=TAIPEI),
+        spec=spec,
+        canonical_open_by_symbol={"2330": 1_000.0},
+        canonical_open_source="official_daily_session_open",
+        historical_books={
+            "2330": {
+                "execution_price_0901": 1_006.25,
+                "source_window_end": "2026-08-13T09:00:59.500000+08:00",
+                "source": (
+                    "shioaji:historical_ticks_0900_090059_vwap_right_label_0901"
+                ),
+            }
+        },
+    )
+
+    assert quotes["2330"]["open"] == 1_000.0
+    assert quotes["2330"]["execution_price_0901"] == 1_006.25
+    assert quotes["2330"]["last"] == 1_006.25
+    assert quotes["2330"]["bid"] is None
+    assert quotes["2330"]["ask"] is None
+    assert quality["observed_0901_vwap_symbols"] == ["2330"]
+    assert quality["missing_0901_vwap_symbols"] == []
+
+
+def test_local_0901_vwap_loader_uses_amount_over_normalized_shares(
+    tmp_path: Path,
+) -> None:
+    partition = tmp_path / "minute" / "trade_date=2026-08-13"
+    partition.mkdir(parents=True)
+    pl.DataFrame(
+        {
+            "symbol": ["2330", "2330"],
+            "date": [date(2026, 8, 13), date(2026, 8, 13)],
+            "ts": [
+                datetime(2026, 8, 13, 9, 1),
+                datetime(2026, 8, 13, 9, 2),
+            ],
+            "minutes_from_open": [1, 2],
+            "Amount": [100_750.0, 999_000.0],
+            "volume_shares": [1_000.0, 1_000.0],
+            "Low": [100.0, 999.0],
+            "High": [102.0, 999.0],
+        }
+    ).write_parquet(partition / "data.parquet")
+
+    rows, receipt = replay._local_0901_vwap_rows(
+        minute_roots=(tmp_path / "minute",),
+        symbols=["2330"],
+        trading_date=date(2026, 8, 13),
+    )
+
+    assert rows["2330"]["execution_price_0901"] == 100.75
+    assert rows["2330"]["quote_at"] == "2026-08-13T09:01:00+08:00"
+    assert receipt["resolved_symbols"] == 1
+    assert receipt["additional_shioaji_requests"] == 0
+
+
+def test_previous_official_session_ignores_malformed_legacy_date(
+    tmp_path: Path,
+) -> None:
+    twse = tmp_path / "twse.parquet"
+    tpex = tmp_path / "tpex.parquet"
+    pl.DataFrame({"date": ["2014-12-;1", "2026-02-24", "2026-02-25"]}).write_parquet(
+        twse
+    )
+    pl.DataFrame({"date": ["2026-02-23", "2026-02-24"]}).write_parquet(tpex)
+
+    assert signal_backfill._previous_official_session_date(
+        twse, tpex, date(2026, 2, 25)
+    ) == date(2026, 2, 24)
+
+
+def test_intraday_bar_loader_preserves_right_label_and_observed_vwap(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "minute"
+    partition = root / "trade_date=2026-02-25"
+    partition.mkdir(parents=True)
+    pl.DataFrame(
+        {
+            "symbol": ["2330"],
+            "ts": [datetime(2026, 2, 25, 13, 24)],
+            "Open": [100.0],
+            "High": [102.0],
+            "Low": [99.0],
+            "Close": [101.0],
+            "Amount": [100_500.0],
+            "volume_shares": [1_000.0],
+        }
+    ).write_parquet(partition / "data.parquet")
+
+    bars, receipt = replay._minute_bar_rows(
+        (root,),
+        trading_date=date(2026, 2, 25),
+        symbols={"2330"},
+    )
+
+    row = bars["2330"]["2026-02-25T13:24+08:00"]
+    assert row["vwap"] == 100.5
+    assert row["high"] == 102.0
+    assert row["low"] == 99.0
+    assert receipt["resolved_symbols"] == 1
+    assert receipt["missing_symbols"] == []
 
 
 def _write_signal_candidate(
@@ -632,3 +857,32 @@ def test_tx_front_contract_comes_from_each_sessions_capture_manifest(
     }
     assert len(receipts) == 1
     assert len(receipts[0]["sha256"]) == 64
+
+
+def test_tx_history_minute_grid_is_complete_without_interpolation() -> None:
+    day = date(2026, 2, 25)
+    books = pl.DataFrame(
+        {
+            "event_ts": [
+                datetime(2026, 2, 25, 8, 45, 1),
+                datetime(2026, 2, 25, 8, 47, 1),
+            ],
+            "bid_price_1": [35_200.0, 35_210.0],
+            "ask_price_1": [35_205.0, 35_215.0],
+        }
+    )
+
+    minutes = benchmark_replay._tx_complete_minute_books(
+        books,
+        trading_date=day,
+        timestamp_column="event_ts",
+        epoch_utc=False,
+    )
+
+    assert len(minutes) == 300
+    assert minutes[0][0].strftime("%H:%M") == "08:45"
+    assert minutes[-1][0].strftime("%H:%M") == "13:44"
+    assert minutes[1][1]["bid_price_1"] == 35_200.0
+    assert minutes[1][2] is False
+    assert minutes[2][1]["bid_price_1"] == 35_210.0
+    assert benchmark_replay._tx_contract_code("202603") == "TXFC6"

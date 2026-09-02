@@ -148,11 +148,12 @@ class WindowedSplitTensors:
                 f"!= {expected_symbol_shape}"
             )
         elif self.execution_mode == "tw_day_trade" and (
-            self.overnight_log_returns.dim() not in {2, 3}
+            self.overnight_log_returns.dim() not in {2, 3, 4}
             or tuple(self.overnight_log_returns.shape[:2]) != expected_symbol_shape
         ):
             raise ValueError(
-                "tw_day_trade overnight/execution tensor must have shape [T,S] or [T,S,C]"
+                "tw_day_trade overnight/execution tensor must have shape "
+                "[T,S], [T,S,C], or [T,S,M,C]"
             )
         elif self.execution_mode == "tw_stock_context_futures_portfolio" and (
             tuple(self.overnight_log_returns.shape)

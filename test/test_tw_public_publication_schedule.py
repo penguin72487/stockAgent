@@ -1303,7 +1303,9 @@ def test_day_trade_critical_services_have_fast_restart_and_watchdogs() -> None:
         "deploy/systemd/stockagent-tw-day-trade-simulation.service.in"
     ).read_text(encoding="utf-8")
     assert "Restart=always" in executor
-    assert "WatchdogSec=20s" in executor
+    # The outer watchdog must exceed one bounded Shioaji historical Tick call
+    # (30s); opening latency is guarded independently inside the process.
+    assert "WatchdogSec=90s" in executor
     assert "Nice=-5" in executor
 
 

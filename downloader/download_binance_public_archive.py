@@ -668,6 +668,37 @@ def _capacity_receipt(
     }
 
 
+def _download_states(
+    counts: dict[str, int], durable_counts: dict[str, int]
+) -> tuple[str, str]:
+    """Separate dataset completeness from the outcome of the current cycle.
+
+    A checksum-valid official object with invalid OHLCV semantics remains
+    quarantined and keeps the dataset partial.  Once that durable quarantine is
+    recorded, however, a later cycle that encounters no new failure has
+    completed its maintenance work successfully.  Conflating those states
+    leaves systemd permanently failed even though the source gap is already
+    truthfully exposed by the durable receipt.
+    """
+    cycle_failed = any(
+        counts[name]
+        for name in (
+            "failed",
+            "quarantined_repair_required",
+            "quarantined_source_invalid",
+        )
+    )
+    dataset_partial = bool(
+        counts["failed"]
+        or counts["quarantined_repair_required"]
+        or durable_counts.get("quarantined_source_invalid", 0)
+    )
+    return (
+        "partial" if dataset_partial else "complete",
+        "failed" if cycle_failed else "complete",
+    )
+
+
 def execute_download(
     client: BinanceArchiveClient,
     *,
@@ -768,15 +799,11 @@ def execute_download(
         }
     source_invalid_objects = durable_counts.get("quarantined_source_invalid", 0)
     new_repair_objects = counts["quarantined_repair_required"]
+    dataset_state, cycle_state = _download_states(counts, durable_counts)
     return {
         "generated_at_utc": _utc_now().isoformat(),
-        "state": (
-            "complete"
-            if not counts["failed"]
-            and not source_invalid_objects
-            and not new_repair_objects
-            else "partial"
-        ),
+        "state": dataset_state,
+        "cycle_state": cycle_state,
         "planned_objects": len(objects),
         "already_complete_objects": len(objects) - len(pending),
         "attempted_objects": len(pending),
@@ -784,6 +811,9 @@ def execute_download(
         "failed_objects": counts["failed"],
         "source_invalid_objects": source_invalid_objects,
         "new_quarantined_repair_objects": new_repair_objects,
+        "new_quarantined_source_invalid_objects": counts[
+            "quarantined_source_invalid"
+        ],
         "durable_object_status_counts": durable_counts,
         "quarantined_monthly_objects": durable_counts.get(
             "quarantined_repair_required", 0
@@ -923,7 +953,7 @@ def main() -> int:
         json.dumps(summary, ensure_ascii=False, indent=2) + "\n",
     )
     print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
-    return 0 if summary["state"] == "complete" else 1
+    return 0 if summary["cycle_state"] == "complete" else 1
 
 
 if __name__ == "__main__":
