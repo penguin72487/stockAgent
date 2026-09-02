@@ -1,14 +1,15 @@
 # 台股日當沖分鐘級紙上執行契約
 
 這份文件描述 `stockagent.live.tw_day_trade_simulation` schema 3，以及
-`configs/markets/tw_day_trade_1m_realistic.yaml` 的每日模型分鐘成交 loss。
+`configs/markets/tw_day_trade_1m_realistic.yaml` 的 hybrid loss，以及
+`configs/markets/tw_day_trade_1m_strict_exact_2020.yaml` 的 strict-minute loss。
 紙上交易不會呼叫券商下單 API；新訓練契約使用獨立 artifact root，舊日頻
 checkpoint 不可續訓。
 
 ## 每日模型的訓練 loss
 
 模型仍然每天只輸出一次 signed target weights，不是每分鐘重新決策。執行
-label 由 `stockagent.data.tw_day_trade_execution` 壓成 `[日期, 股票, 17]`：
+label 由 `stockagent.data.tw_day_trade_execution` 壓成 `[日期, 股票, 23]`：
 
 - 官方開盤價只負責把權重換算成整張股數；09:01 第一根完成 K 的
   `Amount / volume_shares` VWAP 才是進場成交價。
@@ -27,35 +28,72 @@ label 由 `stockagent.data.tw_day_trade_execution` 壓成 `[日期, 股票, 17]`
 虛構第一檔深度或排隊順位。即時紙上執行則額外取 `min(L1, 50% minute K)`；
 兩者的差異屬於資料可觀測性，不得將分鐘 K 回測宣稱為逐筆委託簿重播。
 
-目前稽核資料共有 1,567 個交易日，從 2020-03-02 到 2026-08-04。訓練
-panel 因此從 2020-03-02 開始；2014--2020 缺分鐘路徑的日期不會退回舊
-open-to-close proxy。第一次建立 279 MiB execution tape 後會按來源 manifest、
-日期、symbols 與官方開盤價指紋快取。
+訓練 panel 從 2014-01-06 開始。在第一個已驗證分鐘 partition
+2020-03-02 之前，以方向別壓力代理作為可稽核的降階資料：多單
+`open + 1 tick` / `close - 1 tick`，空單 `open - 1 tick` /
+`close + 1 tick`；代理單分鐘量為當日量除以 271，再依相同 50%
+參與率與整張規則限制。從 2020-03-02 開始一律只接受真實分鐘資料；
+任何缺 partition 的日期 fail closed，不可偷退回日 K 代理。執行
+tape 會按來源 manifest、日期、symbols 與官方開收盤／成交量指紋快取。
+
+strict v9 不使用上述 2014--2020 代理。它從第一個 canonical partition
+`2020-03-02` 開始，並設定
+`day_trade_minute_execution_allow_daily_proxy: false`；只要 panel 仍含任何
+早於此日的 row，loader 會在建 cache／模型前失敗。2020-03-02 以後缺少的
+partition、股票、價或量仍各自 fail closed，不會補成日 K。分鐘 tape 內容
+本身納入 checkpoint fingerprint，所以換分鐘標籤不可沿用舊 optimizer。
+
+## 模型輸入 feature
+
+全特徵契約實際輸入 99 欄：15 個 OHLCV／蠟燭基礎特徵、83 個
+TW-public 歷史特徵，以及當日已觀察的開盤 gap。設定的
+`feature_exclude` 為空，所以融資融券、法人、股利／除權息、事件、
+匯率、總經與 TAIFEX 等已列入的歷史欄位都會進入 FinancialTransformer。
+`temporal_basis_input: input_features` 會對這些輸入全部做多基底處理，不是
+只對 OHLCV 處理。只有目前快照而沒有不可變 point-in-time vintage 的
+33 個 schema 欄位不得輸入；config loader 會直接拒絕，以防止把現在的
+資訊倒灌到 2014。成交分鐘價、當日收盤結果和 label 只供 loss／執行器使用，
+不是模型 feature。
+
+strict v9 先以 fold-training-only、零值保持為零的 causal RMS 做尺度化，
+再讓全部 99 個連續欄位進入 learned `99 -> 32` bottleneck。22 個 temporal
+basis family、共 524 個方向都作用於這 32 維 learned mixture；它不是手動
+選特徵。forward/backward smoke 已確認 99 個輸入欄都連到 loss。輸出改用
+`executable_portfolio_transformer`：只加入開盤時已知的方向資格與前一交易日
+量能容量，禁止 same-session close／volume 洩漏；projection-L1 不去均值、
+以 active-count 尺度投影，因此可以合法保留現金而非被迫 gross=1。
 
 ## 訓練指令與計算極限
 
-正式訓練使用每日 FinancialTransformer，不是分鐘決策模型：
+推薦的 strict-minute 正式訓練仍是每日決策模型，不是分鐘決策模型：
 
 ```bash
 cd /path/to/stockAgent
-source scripts/runtime_env.sh
-CUDA_VISIBLE_DEVICES=0 run_fintech_python train.py \
-  --config configs/markets/tw_day_trade_1m_realistic.yaml
+./scripts/run_tw_day_trade_1m_strict_exact_2020_dual_5090.sh
 ```
 
-設定保留 1,000 epochs、`batch_size_train: 128`、BF16 model AMP、單卡
-RTX 5090，以及相同的 exact-minute loss。事件 loss 將四個連續交易日編成
-一個固定 CUDA kernel；批次尾端重複最後一列並以 `state_advance=false`
-屏蔽，不改變 forward、NAV recurrence 或 action gradient。完整 batch
-不能整段編譯：32 日展開會產生過大的 Triton kernel；2/4/8 日微基準分別
-為 0.492/0.466/0.488 ms/日，故固定四日。
+設定保留 1,000 epochs、global train/eval batch 64/32、BF16 model AMP、雙卡
+DDP，以及 train／validation／test 共用的 exact-minute loss。事件 loss
+將四個連續交易日編成固定 CUDA 核心；批次尾端重複最後一列並以
+`state_advance=false` 屏蔽，不改變 forward、NAV recurrence 或 action
+gradient。由於 strict tape、模型 head、99-feature bottleneck 與舊 checkpoint
+ABI 不相容，新訓練使用獨立 `all_features_bottleneck32_v9` artifact root，
+不覆寫或續接 hybrid v8／日頻結果。
 
-在 Fold 6（1,393 個訓練日、2,744 檔）量到的四日核心穩態完整 epoch：
-batch 96/128/192 分別是 1.100/0.977/1.089 秒。batch 128 的雙 RTX 5090
-DDP 是 0.994 秒，仍慢於單卡，且兩個 rank 的冷編譯約 60.7 秒。原因是每張
-卡仍須重播同一條全域 NAV loss 並做 NCCL 同步，所以同一 fold 採單卡；
-第二張卡應用於另一個 fold 或獨立實驗。首次 shape 編譯不屬於穩態 epoch，
-會額外花數十秒並由 persistent Inductor cache 攤銷。
+64 是 power-of-two 的安全起點，不宣稱跨機器理論最佳。要在目前雙 5090
+機器以完整 epoch 吞吐、非零梯度、無 fallback 與 VRAM headroom 選擇
+32/64/128，可由使用者另外執行：
+
+```bash
+source scripts/runtime_env.sh
+run_fintech_python scripts/benchmark_tw_day_trade_batch_sizes.py \
+  --config configs/markets/tw_day_trade_1m_strict_exact_2020.yaml \
+  --batch-sizes 32,64,128 --batch-size-eval 32 --start-fold 5 \
+  --multi-gpu-strategy distributed_data_parallel \
+  --cuda-visible-devices 0,1 --cpu-threads 14 --compile-threads 8
+```
+
+這個 benchmark 使用獨立 artifact root，不會開始或污染正式 v9 root。
 
 最終 `test_backtest.npz`、`test_integer_share_backtest.npz`、年度報表與 console
 的 `exact-minute` 指標都直接來自同一分鐘事件 forward；不再以舊的

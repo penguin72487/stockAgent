@@ -706,17 +706,11 @@ class TrainingRunLifecycle:
         data_summary: Mapping[str, Any] | None = None,
         configuration: Mapping[str, Any] | None = None,
         mode_details: Mapping[str, Any] | None = None,
+        mode_contract_overrides: Mapping[str, Any] | None = None,
         compatibility_manifest_paths: Iterable[str | Path] = (),
     ) -> dict[str, Any]:
         selected_fold_ids = [int(fold_id) for fold_id in fold_ids]
-        manifest: dict[str, Any] = {
-            "schema_version": TRAINING_LIFECYCLE_SCHEMA_VERSION,
-            "lifecycle_schema_version": TRAINING_LIFECYCLE_SCHEMA_VERSION,
-            "artifact_layout_version": TRAINING_ARTIFACT_LAYOUT_VERSION,
-            "execution_mode": self.spec.execution_mode,
-            "run_mode": self.run_mode,
-            "strategy": self.strategy,
-            "model_name": self.model_name,
+        contract_values: dict[str, Any] = {
             "product_family": self.spec.product_family,
             "frequency": self.spec.frequency,
             "decision_clock": self.spec.decision_clock,
@@ -728,6 +722,24 @@ class TrainingRunLifecycle:
             "benchmark_contract": self.spec.benchmark_contract,
             "weight_snapshot_contract": self.spec.weight_snapshot_contract,
             "turnover_contract": self.spec.turnover_contract,
+        }
+        overrides = dict(mode_contract_overrides or {})
+        unknown_overrides = sorted(set(overrides) - set(contract_values))
+        if unknown_overrides:
+            raise ValueError(
+                "unsupported lifecycle mode-contract overrides: "
+                + ", ".join(unknown_overrides)
+            )
+        contract_values.update(overrides)
+        manifest: dict[str, Any] = {
+            "schema_version": TRAINING_LIFECYCLE_SCHEMA_VERSION,
+            "lifecycle_schema_version": TRAINING_LIFECYCLE_SCHEMA_VERSION,
+            "artifact_layout_version": TRAINING_ARTIFACT_LAYOUT_VERSION,
+            "execution_mode": self.spec.execution_mode,
+            "run_mode": self.run_mode,
+            "strategy": self.strategy,
+            "model_name": self.model_name,
+            **contract_values,
             "selected_fold_ids": selected_fold_ids,
             "dataset_fingerprint": dataset_fingerprint,
             "configuration_fingerprint": configuration_fingerprint,
@@ -741,6 +753,11 @@ class TrainingRunLifecycle:
         self._group_names = []
         self._progress["fold"]["selected_ids"] = selected_fold_ids
         self._progress["fold"]["total"] = len(selected_fold_ids)
+        self._progress["product_family"] = contract_values["product_family"]
+        self._progress["frequency"] = contract_values["frequency"]
+        self._progress["sample_order_contract"] = contract_values[
+            "sample_order_contract"
+        ]
         if self.writer_enabled:
             self.layout.root.mkdir(parents=True, exist_ok=True)
             write_training_json(self.layout.run_manifest_path, manifest)

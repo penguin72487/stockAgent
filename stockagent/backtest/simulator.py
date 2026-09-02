@@ -4313,6 +4313,8 @@ def run_backtest_torch(
                     buy_fee_rates,
                     sell_fee_rates,
                     active_normal_sell_fees,
+                    commission_rebate_rates=commission_rebate_rates,
+                    commission_rebate_timing=commission_rebate_timing,
                     initial_capital_twd=day_trade_execution_initial_capital,
                     settlement_lag_sessions=settlement_lag_sessions,
                     state_advance_mask=state_advance_mask,

@@ -3,7 +3,10 @@
 
 from dataclasses import fields
 from pathlib import Path
+from types import SimpleNamespace
 
+import numpy as np
+import pytest
 import torch
 import yaml
 
@@ -13,6 +16,7 @@ from stockagent.models.financial_transformer import FinancialTransformerModel
 from stockagent.models.transformer_base_portfolio import (
     ONLINE_SAFE_TEMPORAL_BASIS_FAMILIES,
 )
+from stockagent.training.trainer import _fit_group_causal_feature_rms
 
 
 def _device() -> torch.device:
@@ -141,6 +145,42 @@ def test_candle_encoder_directly_replaces_feature_projection() -> None:
     assert model.candle_encoder.joint_projection.proj.out_features == 48
 
 
+def test_all_continuous_features_flow_through_low_rank_basis_bottleneck() -> None:
+    device = _device()
+    common = {
+        "lookback": 8,
+        "temporal_pooling": "last",
+        "temporal_query_mode": "last_only",
+        "temporal_basis_families": ("haar", "dct"),
+        "temporal_basis_components": 2,
+        "temporal_basis_input": "input_features",
+        "return_aux": False,
+        "return_aux_details": False,
+    }
+    full = _make_model(**common).train()
+    bottleneck = _make_model(**common, feature_bottleneck_dim=4).train()
+    builder = bottleneck.temporal_basis_input_feature_builder
+    candle = bottleneck.candle_encoder
+    assert builder is not None
+    assert candle.feature_bottleneck_dim == 4
+    assert builder.source_dim == 4
+    assert candle.base_joint_input_dim == 4
+    assert candle.joint_input_dim == 4 + 2 * 2 * 4
+    assert sum(p.numel() for p in bottleneck.parameters()) < sum(
+        p.numel() for p in full.parameters()
+    )
+
+    raw = torch.randn(2, 8, 7, 10, device=device, requires_grad=True)
+    mask = torch.ones(2, 7, dtype=torch.bool, device=device)
+    weights = bottleneck(raw, mask)
+    weights.square().sum().backward()
+
+    assert raw.grad is not None
+    feature_gradient = raw.grad.abs().sum(dim=(0, 1, 2))
+    assert torch.isfinite(feature_gradient).all()
+    assert torch.all(feature_gradient > 0.0)
+
+
 def test_financial_transformer_panel_paths_match_materialized_windows() -> None:
     device = _device()
     model = _make_model(return_aux=False, return_aux_details=False).eval()
@@ -157,6 +197,100 @@ def test_financial_transformer_panel_paths_match_materialized_windows() -> None:
 
     torch.testing.assert_close(panel, materialized, rtol=1e-5, atol=1e-6)
     torch.testing.assert_close(slab, materialized, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize("basis_input", ["input_features", "raw_features"])
+def test_causal_feature_rms_normalizes_once_across_multi_basis_paths(
+    basis_input: str,
+) -> None:
+    device = _device()
+    common = {
+        "lookback": 8,
+        "temporal_pooling": "last",
+        "temporal_query_mode": "last_only",
+        "temporal_basis_families": ("haar", "dct"),
+        "temporal_basis_components": 2,
+        "temporal_basis_input": basis_input,
+        "return_aux": False,
+        "return_aux_details": False,
+    }
+    normalized_model = _make_model(
+        **common,
+        causal_feature_rms_normalization=True,
+    ).eval()
+    reference_model = _make_model(
+        **common,
+        causal_feature_rms_normalization=False,
+    ).eval()
+    scale = torch.linspace(1.0, 10.0, 10, device=device)
+    active = torch.ones(10, dtype=torch.bool, device=device)
+    active[3] = False
+    normalized_model.set_causal_feature_rms_normalizer(scale, active)
+    raw = torch.randn(2, 8, 7, 10, device=device)
+    expected_source = (raw / scale) * active.to(dtype=raw.dtype)
+    mask = torch.ones(2, 7, dtype=torch.bool, device=device)
+
+    with torch.no_grad():
+        actual = normalized_model(raw, mask)
+        expected = reference_model(expected_source, mask)
+
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+    assert "candle_encoder.causal_feature_rms_scale" in normalized_model.state_dict()
+    assert (
+        "candle_encoder.causal_feature_active_mask"
+        in normalized_model.state_dict()
+    )
+    assert not bool(
+        normalized_model.candle_encoder.causal_feature_active_mask[3].item()
+    )
+
+
+def test_causal_feature_rms_fit_uses_only_training_window_rows(tmp_path) -> None:
+    config = load_config(Path("configs/experiment_baseline.yaml"))
+    config.training.model_name = "financial_transformer"
+    config.training.financial_transformer.causal_feature_rms_normalization = True
+    config.training.financial_transformer.causal_feature_min_active_dates = 2
+    config.training.financial_transformer.causal_feature_scale_epsilon = 1.0e-6
+    config.training.financial_transformer.categorical_feature_names = []
+    values = np.zeros((8, 2, 3), dtype=np.float32)
+    # valid rows 4..5, lookback 3 and TW execution lag 1 imply that only
+    # feature rows 1..4 are causally visible to this training group.
+    values[1:5, :, 0] = 2.0
+    values[1, :, 1] = 3.0
+    values[1:5, :, 2] = 4.0
+    values[5:, :, :] = 1.0e6
+    panel = SimpleNamespace(
+        features=values,
+        alive_mask=np.ones((8, 2), dtype=np.bool_),
+        feature_names=("stable", "too_sparse", "future_outlier"),
+        dates=np.arange(
+            np.datetime64("2014-01-01"),
+            np.datetime64("2014-01-09"),
+            dtype="datetime64[D]",
+        ),
+    )
+    train_ds = SimpleNamespace(
+        valid_indices=np.asarray([4, 5], dtype=np.int64),
+        lookback=3,
+        execution_mode="tw_day_trade",
+    )
+
+    fitted = _fit_group_causal_feature_rms(
+        config=config,
+        panel=panel,
+        train_ds=train_ds,
+        train_years=[2014],
+        group_folds=[],
+        output_path=tmp_path,
+    )
+
+    assert fitted is not None
+    scale, active, metadata = fitted
+    torch.testing.assert_close(scale, torch.tensor([2.0, 1.0, 4.0]))
+    assert active.tolist() == [True, False, True]
+    assert metadata["feature_row_start"] == 1
+    assert metadata["feature_row_end_inclusive"] == 4
+    assert metadata["active_feature_count"] == 2
 
 
 def test_financial_transformer_decomposes_each_raw_feature_before_positions() -> None:
@@ -640,7 +774,12 @@ def test_active_financial_transformers_match_shared_non_output_contract() -> Non
         transformer_base = config.training.transformer_base_portfolio
         financial = config.training.financial_transformer
         for config_field in fields(TransformerBasePortfolioModelConfig):
-            if config_field.name in {"portfolio_mode", "portfolio_output_mode"}:
+            if config_field.name in {
+                "portfolio_mode",
+                "portfolio_output_mode",
+                "center_long_short_logits",
+                "projection_l1_scale_by_active_count",
+            }:
                 # Direction and output representation are legitimate
                 # experiment-level overrides for the active Financial
                 # Transformer head. All encoder/runtime fields stay shared.

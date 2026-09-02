@@ -67,12 +67,39 @@ def test_parse_batch_sizes_can_search_between_power_of_two_frontiers() -> None:
 
 def test_source_contract_fails_closed_on_another_executor() -> None:
     config = {
+        "data": {},
         "trading": {"execution_mode": "tw_day_trade", "frequency": "daily"},
         "training": {"model_name": "financial_transformer", "loss_type": "log_utility"},
     }
     assert benchmark._validate_source_contract(config)["trading.execution_mode"] == "tw_day_trade"
     config["trading"]["execution_mode"] = "tw_minute"
     with pytest.raises(ValueError, match="not the requested daily day-trade contract"):
+        benchmark._validate_source_contract(config)
+
+
+def test_source_contract_accepts_only_strict_minute_executable_pairing() -> None:
+    config = {
+        "data": {
+            "day_trade_minute_execution_root": "minute",
+            "day_trade_minute_execution_allow_daily_proxy": False,
+        },
+        "trading": {
+            "execution_mode": "tw_day_trade",
+            "frequency": "daily",
+            "tw_day_trade_unlimited_margin_conversion": False,
+            "tw_short_capacity_limit_enabled": False,
+        },
+        "training": {
+            "model_name": "executable_portfolio_transformer",
+            "loss_type": "log_utility",
+        },
+    }
+
+    contract = benchmark._validate_source_contract(config)
+    assert contract["objective"] == "strict_minute"
+
+    config["data"]["day_trade_minute_execution_allow_daily_proxy"] = True
+    with pytest.raises(ValueError, match="allow_daily_proxy=false"):
         benchmark._validate_source_contract(config)
 
 

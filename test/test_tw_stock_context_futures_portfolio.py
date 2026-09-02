@@ -1209,3 +1209,49 @@ def test_integer_0845_recoverable_config_is_fresh_guarded_baseline() -> None:
             checkpoint_path=Path("legacy-0845-v1.pt"),
             scope="resume",
         )
+
+
+def test_integer_0845_pretrained_guard_uses_fold_matched_source_and_exact_loss() -> None:
+    config = load_config(
+        "configs/markets/"
+        "tw_stock_context_all_futures_portfolio_0845_integer_futures_open_"
+        "pretrained_guard_full_features_multi_basis_projection_l1_"
+        "cash_capital10m.yaml"
+    )
+    assert config.training.epochs == 1000
+    assert config.training.model_name == "cross_sectional_all_futures"
+    assert config.training.futures_portfolio_training_surrogate_only is False
+    assert config.training.futures_portfolio_recoverable_backward is True
+    assert config.training.pretrained_initialization_root.endswith(
+        "tw_stock_context_all_futures_carry_multi_basis_projection_l1_"
+        "v3_full1000_batch96_chunk64"
+    )
+    assert config.training.pretrained_initialization_fold_policy == (
+        "matching_train_and_validation_years"
+    )
+    assert config.training.pretrained_initialization_feature_adapter == (
+        "transformer_feature_projection_by_name"
+    )
+    assert config.training.pretrained_initialization_require_exact_backbone is True
+    assert config.training.pretrained_initialization_validation_guard is True
+    assert config.training.warm_start_from_previous_fold is False
+    assert config.training.pretrained_initialization_trainable_parameter_prefixes == [
+        "feature_proj.",
+        "futures_underlying_",
+        "futures_denomination_encoder.",
+        "futures_current_open_encoder.",
+        "futures_action_head.",
+    ]
+    assert config.data.feature_exclude == []
+    assert config.data.feature_shift_next_session == [
+        "next_session_open_gap_logret"
+    ]
+    assert config.data.tw_futures_current_open_feature is True
+    assert config.trading.tw_futures_portfolio_integer_initial_capital == pytest.approx(
+        10_000_000.0
+    )
+    assert config.training.transformer_base_portfolio.projection_l1_scale_by_active_count
+    assert config.runner.output_dir.endswith(
+        "tw_stock_context_all_futures_carry_0845_integer_futures_open_exact_"
+        "recoverable_pretrained_guard_stock_tminus1_cash_capital10m_v3"
+    )

@@ -1423,13 +1423,23 @@ def main() -> None:
             raise RuntimeError(
                 "daily minute-execution loss requires official panel open prices"
             )
+        if panel.daily_volumes is None:
+            raise RuntimeError(
+                "hybrid daily/minute execution loss requires daily share volume "
+                "for the pre-minute-data uniform-minute 50% participation cap"
+            )
         def _load_execution_tape():
             return load_tw_day_trade_execution_tape(
                 config.data.day_trade_minute_execution_root,
                 panel_dates=panel.dates,
                 panel_symbols=panel.symbols,
                 official_open_prices=panel.open_prices,
+                official_close_prices=panel.close_prices,
+                daily_volume_shares=panel.daily_volumes,
                 cache_dir=config.data.day_trade_minute_execution_cache_dir,
+                allow_daily_proxy=(
+                    config.data.day_trade_minute_execution_allow_daily_proxy
+                ),
             )
 
         if _distributed_ready() and _distributed_world_size() > 1:

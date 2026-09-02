@@ -163,3 +163,30 @@ def test_registry_rejects_duplicate_roots(tmp_path: Path) -> None:
         assert "duplicate cold artifact root" in str(exc)
     else:
         raise AssertionError("duplicate cold root should fail closed")
+
+
+def test_registry_allows_full_run_without_file_size_limit(tmp_path: Path) -> None:
+    path = tmp_path / "registry.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "artifacts": [
+                    {
+                        "dataset": "full-run",
+                        "relative_root": "markets/full-run",
+                        "maximum_file_bytes": None,
+                        "loose_file_threshold_bytes": 8 * 1024 * 1024,
+                        "pack_buckets": 32,
+                        "min_stable_hours": 24,
+                        "completion_contract": "training-lifecycle-v1",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    registry = load_cold_artifact_registry(path)
+
+    assert registry["full-run"].maximum_file_bytes is None
