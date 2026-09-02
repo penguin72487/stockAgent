@@ -23,6 +23,18 @@ from stockagent.live.tw_day_trade_simulation import (
 TAIPEI = ZoneInfo("Asia/Taipei")
 
 
+def test_replay_checks_receipt_backed_repair_kbars_before_bulk_minute_data() -> None:
+    roots = replay.DEFAULT_MINUTE_DATA_ROOTS
+
+    assert roots[0] == Path(
+        "artifacts/data_repair/tw_day_trade_minute_curve/maintenance/current/fetched_kbars"
+    )
+    assert roots[1] == Path(
+        "artifacts/data_repair/tw_day_trade_minute_curve/kbars"
+    )
+    assert roots.index(Path("data_tw_minute/shioaji_1m")) > 1
+
+
 def _complete_0901_query_receipt(*, resolved: int, requested: int) -> dict:
     return {
         "requested_symbols": requested,

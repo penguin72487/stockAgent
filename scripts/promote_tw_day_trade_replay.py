@@ -24,6 +24,9 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from stockagent.data.tw_price_rules import move_price_ticks_numpy
+from scripts.rebuild_tw_day_trade_minute_curves import (
+    historical_minute_mark_has_source,
+)
 
 
 TAIPEI = ZoneInfo("Asia/Taipei")
@@ -160,6 +163,8 @@ def _validate_minute_curve_coverage(
             failures.append(f"minute curve output hash mismatch: {path.name}")
 
     observed: dict[tuple[str, str], set[str]] = {}
+    unverified_interior_rows = 0
+    unverified_interior_samples: list[str] = []
     if marks_path.is_file():
         with marks_path.open("r", encoding="utf-8") as handle:
             for line_number, line in enumerate(handle, start=1):
@@ -174,9 +179,17 @@ def _validate_minute_curve_coverage(
                 market = str(row.get("market") or "")
                 if session_date not in completed_session_dates or market not in expected_markets:
                     continue
-                observed.setdefault((session_date, market), set()).add(
-                    str(row.get("minute") or "")
-                )
+                minute = str(row.get("minute") or "")
+                observed.setdefault((session_date, market), set()).add(minute)
+                if (
+                    minute[11:16] not in {"09:01", "13:30"}
+                    and not historical_minute_mark_has_source(row)
+                ):
+                    unverified_interior_rows += 1
+                    if len(unverified_interior_samples) < 20:
+                        unverified_interior_samples.append(
+                            f"{session_date}:{market}:{minute}"
+                        )
     for session_date in completed_session_dates:
         base = datetime.fromisoformat(f"{session_date}T09:01:00+08:00")
         expected_minutes = {
@@ -190,12 +203,23 @@ def _validate_minute_curve_coverage(
                     f"{session_date}/{market}: minute curve does not contain exactly "
                     "09:01 through 13:30"
                 )
+    if unverified_interior_rows:
+        failures.append(
+            "minute curve contains interior rows without auditable historical "
+            f"price provenance: {unverified_interior_rows}; "
+            f"sample={unverified_interior_samples}"
+        )
     return {
         "required": True,
         "contract": str(receipt.get("minute_contract") or ""),
         "completed_session_dates": completed_session_dates,
         "points_per_session_mode": MINUTE_CURVE_SESSION_POINTS,
         "validated_rows": sum(len(values) for values in observed.values()),
+        "audited_historical_interior_rows": (
+            len(completed_session_dates) * len(expected_markets) * 268
+            - unverified_interior_rows
+        ),
+        "unverified_historical_interior_rows": unverified_interior_rows,
         "receipt_sha256": _sha256(receipt_path),
     }
 

@@ -4,14 +4,76 @@ from datetime import UTC, datetime, timedelta
 import json
 from pathlib import Path
 
+import pytest
+
 from stockagent.live import data_monitor_dashboard as dashboard
-from stockagent.live.data_monitor_dashboard import build_data_monitor_public_status
+from stockagent.live.data_monitor_dashboard import (
+    build_data_monitor_public_status,
+    build_tw_public_monitor_status,
+)
 
 
 def test_date_only_coverage_is_measured_through_end_of_day() -> None:
     parsed = dashboard._parse_time("2026-08-17")
 
     assert parsed == datetime(2026, 8, 17, 23, 59, 59, tzinfo=UTC)
+
+
+def test_tw_public_monitor_builds_only_requested_official_source_scope(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(
+        dashboard,
+        "_tw_public_sources",
+        lambda _root, *, now: [
+            {
+                "id": "tw-public:fixture",
+                "parent_id": "group:tw-public",
+                "scope": "logical_source",
+                "title": "fixture",
+                "provider": "TWSE",
+                "category": "daily",
+                "status": "current",
+                "status_label": "完整",
+                "cadence": "每日",
+                "latest_at_utc": now.isoformat(),
+                "data_through": "2026-09-02",
+                "freshness": {"state": "current", "age_seconds": 0.0},
+                "coverage": {
+                    "current": 1,
+                    "total": 1,
+                    "ratio": 1.0,
+                    "unit": "資料集",
+                },
+                "eta": {"state": "complete", "remaining_seconds": 0},
+                "rows": 1,
+                "publishable": True,
+                "automation_eligible": True,
+                "detail": "fixture",
+                "warnings": [],
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        dashboard,
+        "_shioaji_sources",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("unrelated Shioaji rows must not be built")
+        ),
+    )
+
+    payload = build_tw_public_monitor_status(
+        tmp_path,
+        now=datetime(2026, 9, 2, tzinfo=UTC),
+        refresh_services={},
+    )
+
+    assert payload["scope"] == "tw_public_official_sources"
+    assert payload["read_only"] is True
+    assert payload["production_control_possible"] is False
+    assert payload["summary"]["registered_items"] == 1
+    assert payload["sources"][0]["id"] == "tw-public:fixture"
+    json.dumps(payload, allow_nan=False)
 
 
 def test_data_monitor_registers_catalog_and_marks_stale_receipt(tmp_path: Path) -> None:

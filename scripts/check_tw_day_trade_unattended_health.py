@@ -577,6 +577,8 @@ def main() -> int:
             and discord_status.get("discord_connected") is True
             and set(discord_status.get("day_trade_markets") or ())
             == set(EXPECTED_MARKETS)
+            and set(discord_status.get("scheduled_day_trade_markets") or ())
+            == set(EXPECTED_MARKETS)
             and engine_age is not None
             and engine_age <= 20.0
             and discord_age is not None
@@ -717,6 +719,9 @@ def main() -> int:
                     "revision_lag": revision_lag,
                     "engine_run_id": engine_sync.get("engine_run_id"),
                     "enabled_markets": engine_sync.get("enabled_markets"),
+                    "scheduled_day_trade_markets": discord_status.get(
+                        "scheduled_day_trade_markets"
+                    ),
                 },
                 "post_close_artifact_maintenance": {
                     "ready": not maintenance_degraded,

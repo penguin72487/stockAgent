@@ -9,6 +9,7 @@ from datetime import date as datetime_date, datetime, time as datetime_time, tim
 import json
 import math
 from pathlib import Path
+import re
 import threading
 from typing import Any, Final
 from zoneinfo import ZoneInfo
@@ -64,6 +65,9 @@ _OBJECT_CACHE_LOCK = threading.Lock()
 _SIGNAL_PAGE_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
 _SIGNAL_PAGE_CACHE_LOCK = threading.Lock()
 _MAX_LEDGER_LINE_BYTES: Final[int] = 8 * 1024 * 1024
+_SESSION_DATE_FIELD_PATTERN: Final[re.Pattern[bytes]] = re.compile(
+    rb'"session_date"\s*:\s*"(\d{4}-\d{2}-\d{2})"'
+)
 
 
 @dataclass
@@ -78,6 +82,22 @@ class _LedgerSessionIndex:
 
 _LEDGER_SESSION_INDEX_CACHE: dict[tuple[Path, bool], _LedgerSessionIndex] = {}
 _LEDGER_SESSION_INDEX_LOCK = threading.Lock()
+
+
+@dataclass(frozen=True)
+class _BenchmarkHistoryIndex:
+    device: int
+    inode: int
+    size: int
+    modified_ns: int
+    origins: dict[str, Mapping[str, Any]]
+    marks: tuple[Mapping[str, Any], ...]
+    marks_by_session: dict[str, tuple[Mapping[str, Any], ...]]
+    load_error: str | None = None
+
+
+_BENCHMARK_HISTORY_INDEX_CACHE: dict[Path, _BenchmarkHistoryIndex] = {}
+_BENCHMARK_HISTORY_INDEX_LOCK = threading.Lock()
 
 
 def build_dashboard_revision(
@@ -485,12 +505,46 @@ def _ledger_row_session_date(
         except ValueError:
             return ""
         return explicit
-    if not recorded_at_fallback or not row.get("recorded_at"):
+    fallback_timestamp = row.get("recorded_at") or row.get("minute")
+    if not recorded_at_fallback or not fallback_timestamp:
         return ""
     try:
-        return _timestamp(row["recorded_at"]).astimezone(TAIPEI).date().isoformat()
+        return _timestamp(fallback_timestamp).astimezone(TAIPEI).date().isoformat()
     except (TypeError, ValueError):
         return ""
+
+
+def _ledger_line_session_date(
+    line: bytes, *, recorded_at_fallback: bool
+) -> str:
+    """Extract the index key without decoding a complete, often wide row.
+
+    Every canonical execution ledger has a top-level ISO ``session_date``.
+    Regex extraction makes index construction proportional to bytes copied,
+    rather than to allocation of every nested JSON field.  If nested and
+    top-level values ever disagree, or the field is absent, fall back to the
+    strict JSON path so unusual/legacy rows retain the original semantics.
+    Requested spans are always decoded and validated again before publication.
+    """
+
+    matches = {
+        match.group(1).decode("ascii")
+        for match in _SESSION_DATE_FIELD_PATTERN.finditer(line)
+    }
+    if len(matches) == 1:
+        session_date = next(iter(matches))
+        try:
+            datetime_date.fromisoformat(session_date)
+        except ValueError:
+            pass
+        else:
+            return session_date
+    payload = json.loads(line)
+    if not isinstance(payload, Mapping):
+        return ""
+    return _ledger_row_session_date(
+        payload, recorded_at_fallback=recorded_at_fallback
+    )
 
 
 def _ledger_session_index(
@@ -559,12 +613,8 @@ def _ledger_session_index(
                     if not line.strip():
                         scanned_offset = cursor
                         continue
-                    payload = json.loads(line)
-                    if not isinstance(payload, dict):
-                        scanned_offset = cursor
-                        continue
-                    session_date = _ledger_row_session_date(
-                        payload,
+                    session_date = _ledger_line_session_date(
+                        line,
                         recorded_at_fallback=recorded_at_fallback,
                     )
                     if session_date:
@@ -599,7 +649,7 @@ def _ledger_session_index(
 def _rows_for_sessions(
     path: Path,
     session_dates: list[str] | tuple[str, ...],
-    maximum_rows: int,
+    maximum_rows: int | None,
     *,
     recorded_at_fallback: bool = False,
 ) -> dict[str, tuple[dict[str, Any], ...]]:
@@ -608,7 +658,7 @@ def _rows_for_sessions(
     selected_dates = tuple(
         dict.fromkeys(str(value) for value in session_dates if value)
     )
-    if maximum_rows <= 0 or not selected_dates:
+    if (maximum_rows is not None and maximum_rows <= 0) or not selected_dates:
         return {}
     index = _ledger_session_index(
         path,
@@ -621,7 +671,13 @@ def _rows_for_sessions(
         for session_date in selected_dates
         for start, end in index.spans.get(session_date, ())
     )
-    retained: deque[tuple[str, dict[str, Any]]] = deque(maxlen=maximum_rows)
+    retained: deque[tuple[str, dict[str, Any]]] | list[
+        tuple[str, dict[str, Any]]
+    ] = (
+        deque(maxlen=maximum_rows)
+        if maximum_rows is not None
+        else []
+    )
     source = Path(path)
     stat = source.stat()
     if (stat.st_dev, stat.st_ino) != (index.device, index.inode):
@@ -864,6 +920,89 @@ def _load_benchmark_history(root: Path) -> dict[str, Any]:
     if int(payload.get("schema_version") or 0) != 1:
         return {"load_error": "benchmark_history_schema_unsupported"}
     return payload
+
+
+def _benchmark_history_index(root: Path) -> _BenchmarkHistoryIndex:
+    """Index immutable benchmark marks once per source-file generation.
+
+    ``benchmark_history.json`` is hundreds of MiB in production.  Filtering its
+    complete in-memory mark list for one session on every status poll made an
+    otherwise small request scale with all retained history.  Keep source order
+    for the history endpoint and a separate O(1) session lookup for status/date
+    views.  The index is invalidated by the same inode/size/mtime contract as
+    the existing object cache.
+    """
+
+    path = (Path(root) / BENCHMARK_HISTORY_FILENAME).resolve()
+    with _BENCHMARK_HISTORY_INDEX_LOCK:
+        for _attempt in range(3):
+            try:
+                stat = path.stat()
+            except FileNotFoundError:
+                return _BenchmarkHistoryIndex(
+                    device=0,
+                    inode=0,
+                    size=0,
+                    modified_ns=0,
+                    origins={},
+                    marks=(),
+                    marks_by_session={},
+                    load_error="benchmark_history_unavailable",
+                )
+            signature = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+            cached = _BENCHMARK_HISTORY_INDEX_CACHE.get(path)
+            if cached is not None and (
+                cached.device,
+                cached.inode,
+                cached.size,
+                cached.modified_ns,
+            ) == signature:
+                return cached
+
+            payload = _load_benchmark_history(path.parent)
+            load_error = str(payload.get("load_error") or "") or None
+            raw_origins = payload.get("origins")
+            origins = {
+                str(key): value
+                for key, value in (
+                    raw_origins.items() if isinstance(raw_origins, Mapping) else ()
+                )
+                if isinstance(value, Mapping)
+            }
+            marks = tuple(
+                row
+                for row in (payload.get("marks") or ())
+                if isinstance(row, Mapping)
+            )
+            grouped: dict[str, list[Mapping[str, Any]]] = {}
+            for row in marks:
+                session_date = str(row.get("session_date") or "")[:10]
+                if not session_date:
+                    continue
+                grouped.setdefault(session_date, []).append(row)
+            final_stat = path.stat()
+            if (
+                final_stat.st_dev,
+                final_stat.st_ino,
+                final_stat.st_size,
+                final_stat.st_mtime_ns,
+            ) != signature:
+                continue
+            result = _BenchmarkHistoryIndex(
+                device=stat.st_dev,
+                inode=stat.st_ino,
+                size=stat.st_size,
+                modified_ns=stat.st_mtime_ns,
+                origins=origins,
+                marks=marks,
+                marks_by_session={
+                    key: tuple(value) for key, value in grouped.items()
+                },
+                load_error=load_error,
+            )
+            _BENCHMARK_HISTORY_INDEX_CACHE[path] = result
+            return result
+    raise OSError("benchmark history changed repeatedly while indexing")
 
 
 def _rebase_live_benchmark(
@@ -1530,10 +1669,8 @@ def _available_session_dates(
             )
             if index is not None:
                 dates.update(index.spans)
-    benchmark_history = _load_benchmark_history(root)
-    for row in benchmark_history.get("marks") or ():
-        if isinstance(row, Mapping) and row.get("session_date"):
-            dates.add(str(row["session_date"])[:10])
+    benchmark_history = _benchmark_history_index(root)
+    dates.update(benchmark_history.marks_by_session)
     for raw_date in position_history_dates:
         try:
             datetime_date.fromisoformat(raw_date)
@@ -1693,9 +1830,55 @@ def build_dashboard_history_snapshot(
         if selected_start > selected_end:
             raise ValueError("history start_date must not be after end_date")
     root = Path(state_dir)
-    benchmark_history = _load_benchmark_history(root)
-    benchmark_origins = benchmark_history.get("origins") or {}
+    benchmark_history = _benchmark_history_index(root)
+    benchmark_origins = benchmark_history.origins
     deduplicated: dict[tuple[str, str], dict[str, Any]] = {}
+    marks_path = root / "marks.jsonl"
+    live_benchmark_path = root / "benchmark_marks.jsonl"
+    marks_recorded_at_fallback = False
+    marks_index = _ledger_session_index(
+        marks_path, recorded_at_fallback=marks_recorded_at_fallback
+    )
+    if (
+        marks_index is not None
+        and not marks_index.spans
+        and marks_path.stat().st_size > 0
+    ):
+        # Legacy fixtures/ledgers may omit session_date but retain a timestamp.
+        # Production marks carry session_date, so its already-warm compact
+        # index is reused without a second full-file scan.
+        marks_recorded_at_fallback = True
+        marks_index = _ledger_session_index(
+            marks_path, recorded_at_fallback=marks_recorded_at_fallback
+        )
+    live_benchmark_recorded_at_fallback = False
+    live_benchmark_index = _ledger_session_index(
+        live_benchmark_path,
+        recorded_at_fallback=live_benchmark_recorded_at_fallback,
+    )
+    if (
+        live_benchmark_index is not None
+        and not live_benchmark_index.spans
+        and live_benchmark_path.stat().st_size > 0
+    ):
+        live_benchmark_recorded_at_fallback = True
+        live_benchmark_index = _ledger_session_index(
+            live_benchmark_path,
+            recorded_at_fallback=live_benchmark_recorded_at_fallback,
+        )
+    available_session_dates = {
+        *(
+            marks_index.spans
+            if marks_index is not None
+            else ()
+        ),
+        *benchmark_history.marks_by_session,
+        *(
+            live_benchmark_index.spans
+            if live_benchmark_index is not None
+            else ()
+        ),
+    }
 
     def add(source: Mapping[str, Any], *, series_type: str) -> None:
         row = dict(source)
@@ -1770,17 +1953,128 @@ def build_dashboard_history_snapshot(
             ),
         }
 
-    for row in _all_json_objects(root / "marks.jsonl") or ():
-        add(row, series_type="strategy")
-    for row in benchmark_history.get("marks") or ():
-        if isinstance(row, Mapping):
-            add(row, series_type="benchmark")
-    for source in _all_json_objects(root / "benchmark_marks.jsonl") or ():
-        benchmark_id = str(source.get("benchmark_id") or "")
-        add(
-            _rebase_live_benchmark(source, benchmark_origins.get(benchmark_id)),
-            series_type="benchmark",
+    explicit_dates = selected_start is not None or selected_end is not None
+    if explicit_dates:
+        selected_sessions = sorted(
+            session_date
+            for session_date in available_session_dates
+            if (selected_start is None or session_date >= selected_start.isoformat())
+            and (selected_end is None or session_date <= selected_end.isoformat())
         )
+        strategy_rows = _rows_for_sessions(
+            marks_path,
+            selected_sessions,
+            None,
+            recorded_at_fallback=marks_recorded_at_fallback,
+        )
+        for session_date in selected_sessions:
+            for row in strategy_rows.get(session_date, ()):
+                add(row, series_type="strategy")
+        for session_date in selected_sessions:
+            for row in benchmark_history.marks_by_session.get(session_date, ()):
+                add(row, series_type="benchmark")
+        live_benchmark_rows = _rows_for_sessions(
+            live_benchmark_path,
+            selected_sessions,
+            None,
+            recorded_at_fallback=live_benchmark_recorded_at_fallback,
+        )
+        for session_date in selected_sessions:
+            for source in live_benchmark_rows.get(session_date, ()):
+                benchmark_id = str(source.get("benchmark_id") or "")
+                add(
+                    _rebase_live_benchmark(
+                        source, benchmark_origins.get(benchmark_id)
+                    ),
+                    series_type="benchmark",
+                )
+
+        # Period return needs one true retained observation before the chosen
+        # start for every displayed series.  Walk indexed sessions backwards
+        # and stop independently per source/series instead of parsing every
+        # historical JSONL row merely to find those baselines.
+        if selected_start is not None and deduplicated:
+            strategy_ids = {
+                str(row["series_id"])
+                for row in deduplicated.values()
+                if row["series_type"] == "strategy"
+            }
+            missing_strategy_ids = set(strategy_ids)
+            if marks_index is not None:
+                for session_date in sorted(marks_index.spans, reverse=True):
+                    if session_date >= selected_start.isoformat():
+                        continue
+                    rows = _rows_for_sessions(
+                        marks_path,
+                        [session_date],
+                        None,
+                        recorded_at_fallback=marks_recorded_at_fallback,
+                    ).get(session_date, ())
+                    for row in reversed(rows):
+                        market = str(row.get("market") or "")
+                        if market in missing_strategy_ids:
+                            add(row, series_type="strategy")
+                            missing_strategy_ids.remove(market)
+                    if not missing_strategy_ids:
+                        break
+
+            benchmark_ids = {
+                str(row["series_id"])
+                for row in deduplicated.values()
+                if row["series_type"] == "benchmark"
+            }
+            missing_history_ids = set(benchmark_ids)
+            for session_date in sorted(
+                benchmark_history.marks_by_session, reverse=True
+            ):
+                if session_date >= selected_start.isoformat():
+                    continue
+                for row in reversed(
+                    benchmark_history.marks_by_session.get(session_date, ())
+                ):
+                    benchmark_id = str(row.get("benchmark_id") or "")
+                    if benchmark_id in missing_history_ids:
+                        add(row, series_type="benchmark")
+                        missing_history_ids.remove(benchmark_id)
+                if not missing_history_ids:
+                    break
+
+            missing_live_ids = set(benchmark_ids)
+            if live_benchmark_index is not None:
+                for session_date in sorted(
+                    live_benchmark_index.spans, reverse=True
+                ):
+                    if session_date >= selected_start.isoformat():
+                        continue
+                    rows = _rows_for_sessions(
+                        live_benchmark_path,
+                        [session_date],
+                        None,
+                        recorded_at_fallback=live_benchmark_recorded_at_fallback,
+                    ).get(session_date, ())
+                    for source in reversed(rows):
+                        benchmark_id = str(source.get("benchmark_id") or "")
+                        if benchmark_id in missing_live_ids:
+                            add(
+                                _rebase_live_benchmark(
+                                    source, benchmark_origins.get(benchmark_id)
+                                ),
+                                series_type="benchmark",
+                            )
+                            missing_live_ids.remove(benchmark_id)
+                    if not missing_live_ids:
+                        break
+    else:
+        for row in _all_json_objects(marks_path) or ():
+            add(row, series_type="strategy")
+        for row in benchmark_history.marks:
+            add(row, series_type="benchmark")
+        for source in _all_json_objects(live_benchmark_path) or ():
+            benchmark_id = str(source.get("benchmark_id") or "")
+            add(
+                _rebase_live_benchmark(source, benchmark_origins.get(benchmark_id)),
+                series_type="benchmark",
+            )
 
     all_rows = sorted(
         deduplicated.values(),
@@ -1788,10 +2082,8 @@ def build_dashboard_history_snapshot(
     )
     rows = list(all_rows)
     available_dates = [
-        datetime.fromtimestamp(float(row["timestamp_seconds"]), tz=timezone.utc)
-        .astimezone(TAIPEI)
-        .date()
-        for row in rows
+        datetime_date.fromisoformat(session_date)
+        for session_date in available_session_dates
     ]
     if selected_start is not None or selected_end is not None:
         rows = [
@@ -2672,13 +2964,11 @@ def build_dashboard_snapshot(
     health = str(status.get("health") or "unknown")
     if source_age > float(max_source_age_seconds):
         health = "stale"
-    benchmark_history = _load_benchmark_history(root)
-    benchmark_origins = benchmark_history.get("origins") or {}
+    benchmark_history = _benchmark_history_index(root)
+    benchmark_origins = benchmark_history.origins
     benchmark_history_marks = [
         dict(row)
-        for row in (benchmark_history.get("marks") or ())
-        if isinstance(row, Mapping)
-        and str(row.get("session_date") or "") == selected_session_date
+        for row in benchmark_history.marks_by_session.get(selected_session_date, ())
     ]
 
     modes: list[dict[str, Any]] = []
@@ -3205,7 +3495,7 @@ def build_dashboard_snapshot(
         "fills": _line_count(root / "fills.jsonl"),
         "marks": _line_count(root / "marks.jsonl"),
         "benchmark_marks": _line_count(root / "benchmark_marks.jsonl"),
-        "benchmark_history_marks": len(benchmark_history.get("marks") or ()),
+        "benchmark_history_marks": len(benchmark_history.marks),
         "events": _line_count(root / "events.jsonl"),
         "latency_samples": _line_count(root / "latency.jsonl"),
         "historical_positions": sum(
@@ -3274,8 +3564,8 @@ def build_dashboard_snapshot(
             "benchmarks": "0050/2330 are total-return reference curves anchored to each official session open. Completed-session corporate actions are applied exactly once; minute valuation uses the receipt-backed observed last trade and explicitly carries only the last observation when a minute has no trade, without interpolation. TXFR1 holds one front-month TX reference contract: it enters at the first receipt-backed 08:45 ask and values at the observed best bid attached to retained book/tick evidence, carrying only a prior observed quote when necessary. This is counterfactual reference valuation, not an exchange fill guarantee. Before expiry it rolls only when the old bid and new ask coexist; after expiry it uses official TAIFEX final settlement for the old month and opens the new month at ask. Calendar spread is never booked as return; fees and statutory futures tax remain explicit",
             "benchmark_history": (
                 "audited actual-open benchmark history is merged read-only with later live executable marks"
-                if benchmark_history.get("origins")
-                else benchmark_history.get("load_error")
+                if benchmark_history.origins
+                else benchmark_history.load_error
                 or "live benchmark marks only; no historical origin file"
             ),
             "depth_limit": "live entry quantity is bounded by independently verified eligibility, whole lots, price limits, displayed level-one depth, and after 09:01 completed-minute participation. Missed-opening replay uses the official open only for sizing and the observed 09:01 minute VWAP for price; its full requested paper quantity is counterfactual and never claims exchange depth, queue priority, or a guaranteed real-market fill",
@@ -3572,6 +3862,7 @@ def build_dashboard_position_page(
         root=root,
         state=state,
         observed=datetime.now(timezone.utc),
+        include_ledger_dates=not bool(start_date or end_date or session_date),
     )
     selected_start_date, selected_end_date, selected_session_dates = (
         _select_session_range(

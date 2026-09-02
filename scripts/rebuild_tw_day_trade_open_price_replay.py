@@ -71,6 +71,8 @@ DEFAULT_TPEX_DAILY_OHLCV_PATH = Path(
     "/srv/stockagent-live/data_tw_public/tpex_daily_ohlcv.parquet"
 )
 DEFAULT_MINUTE_DATA_ROOTS = (
+    Path("artifacts/data_repair/tw_day_trade_minute_curve/maintenance/current/fetched_kbars"),
+    Path("artifacts/data_repair/tw_day_trade_minute_curve/kbars"),
     Path("data_tw_minute/shioaji_1m"),
     Path("data_tw_minute/research_dataset"),
 )

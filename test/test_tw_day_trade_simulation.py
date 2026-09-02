@@ -4163,6 +4163,12 @@ def test_dashboard_html_is_local_and_refreshes_api() -> None:
     assert "HIDDEN_EQUITY_SERIES_STORAGE_KEY" in javascript
     assert "HISTORY_CLIENT_CACHE_MS" in javascript
     assert "chartHistoryCache" in javascript
+    assert '"api/public-data-status"' in javascript
+    assert "IntersectionObserver" in javascript
+    assert "installTwPublicMonitorActivation()" in javascript
+    assert "void loadChartHistory({preferCache: !force});" in javascript
+    assert "Promise.allSettled(detailLoads)" in javascript
+    assert 'src="app.js?v=44"' in html
     assert "response.status === 429" not in javascript
     assert "秒後自動重試" not in javascript
     assert "button[data-series-id]" in javascript

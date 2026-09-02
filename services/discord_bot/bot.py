@@ -1560,6 +1560,7 @@ def _register_signal_now_job(
             "run_id": _BOT_RUN_ID,
             "updated_at": observed.isoformat(timespec="seconds"),
             "next_retry_at": None,
+            "source_event_token": _signal_now_source_event_token(),
             "error_type": None,
             "error_message": None,
             "waiting_reason": (
@@ -1625,6 +1626,7 @@ def _update_signal_now_job(
                 }
             )
         if status == "waiting_source":
+            delay = _signal_now_job_retry_delay_seconds(max(1, attempt))
             waiting_reason = (
                 getattr(runtime_status.data, "reason", None)
                 if runtime_status is not None
@@ -1632,7 +1634,11 @@ def _update_signal_now_job(
             )
             job.update(
                 {
-                    "next_retry_at": None,
+                    "next_retry_at": (
+                        observed + timedelta(seconds=delay)
+                    ).isoformat(timespec="seconds"),
+                    "retry_delay_seconds": delay,
+                    "source_event_token": _signal_now_source_event_token(),
                     "waiting_reason": str(
                         waiting_reason or exc or "source_not_fresh"
                     ),
@@ -1644,6 +1650,7 @@ def _update_signal_now_job(
             job.update(
                 {
                     "next_retry_at": None,
+                    "source_event_token": _signal_now_source_event_token(),
                     "waiting_reason": None,
                     "error_type": None,
                     "error_message": None,
@@ -1716,7 +1723,13 @@ def _signal_now_resumable_jobs(*, now: datetime | None = None) -> list[dict[str,
             if retry_at.tzinfo is None:
                 retry_at = retry_at.replace(tzinfo=observed.tzinfo)
             if observed < retry_at.astimezone(observed.tzinfo):
-                continue
+                source_changed = bool(
+                    row.get("status") == "waiting_source"
+                    and row.get("source_event_token")
+                    != _signal_now_source_event_token()
+                )
+                if not source_changed:
+                    continue
         pending.append(row)
     return sorted(
         pending,
@@ -1917,6 +1930,7 @@ def _tw_data_layer_lock_path(command: list[str]) -> Path | None:
     if command_names.intersection(
         {
             "activate_tw_public_opening_data.py",
+            "finalize_tw_public_completed_session.py",
             "refresh_tw_public_live_snapshot.py",
         }
     ):
@@ -2201,17 +2215,7 @@ def _date_key(value: Any) -> str | None:
     return text[:10] if len(text) >= 10 else text
 
 
-def _completed_session_receipt_ready(status: MarketRuntimeStatus) -> bool:
-    """Require derived close data to acknowledge the newest accepted close phase."""
-
-    data = getattr(status, "data", None)
-    expected = _date_key(
-        getattr(data, "expected_latest_date", None)
-        or getattr(data, "last_data_date", None)
-        or getattr(data, "panel_date", None)
-    )
-    if not expected:
-        return False
+def _completed_session_receipt_paths() -> tuple[Path, Path]:
     receipt_path = Path(
         _env(
             "STOCKAGENT_TW_COMPLETED_SESSION_RECEIPT",
@@ -2228,6 +2232,78 @@ def _completed_session_receipt_ready(status: MarketRuntimeStatus) -> bool:
         receipt_path = ROOT / receipt_path
     if not publication_root.is_absolute():
         publication_root = ROOT / publication_root
+    return receipt_path, publication_root
+
+
+def _signal_now_source_event_token() -> str:
+    """Return a cheap token that changes when the canonical close pipeline advances."""
+
+    receipt_path, publication_root = _completed_session_receipt_paths()
+    paths = [receipt_path]
+    paths.extend(
+        publication_root / phase / "latest.json"
+        for phase in ("close_final", "close_revision", "close_initial")
+    )
+    tokens: list[str] = []
+    for path in paths:
+        try:
+            stat = path.stat()
+        except OSError:
+            tokens.append(f"{path}:missing")
+            continue
+        tokens.append(f"{path}:{stat.st_mtime_ns}:{stat.st_size}")
+    return "|".join(tokens)
+
+
+def _completed_session_publication_ready(status: MarketRuntimeStatus) -> bool:
+    """Require the official close event before starting expensive derivation."""
+
+    data = getattr(status, "data", None)
+    expected = _date_key(
+        getattr(data, "expected_latest_date", None)
+        or getattr(data, "last_data_date", None)
+        or getattr(data, "panel_date", None)
+    )
+    if not expected:
+        return False
+    _receipt_path, publication_root = _completed_session_receipt_paths()
+    for phase in ("close_final", "close_revision", "close_initial"):
+        try:
+            publication = json.loads(
+                (publication_root / phase / "latest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(publication, dict):
+            continue
+        summary = publication.get("download_summary")
+        if (
+            publication.get("status") == "ok"
+            and str(publication.get("started_at_taipei") or "")[:10] == expected
+            and isinstance(summary, dict)
+            and str(summary.get("end_date") or "")[:10] == expected
+            and summary.get("daily_close_ready") is True
+            and int(summary.get("blocking_failed_count") or 0) == 0
+            and int(summary.get("incomplete_count") or 0) == 0
+        ):
+            return True
+    return False
+
+
+def _completed_session_receipt_ready(status: MarketRuntimeStatus) -> bool:
+    """Require derived close data to acknowledge the newest accepted close phase."""
+
+    data = getattr(status, "data", None)
+    expected = _date_key(
+        getattr(data, "expected_latest_date", None)
+        or getattr(data, "last_data_date", None)
+        or getattr(data, "panel_date", None)
+    )
+    if not expected:
+        return False
+    receipt_path, publication_root = _completed_session_receipt_paths()
     try:
         receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError):
@@ -3603,6 +3679,38 @@ def _returns_artifact_path(fold_dir: Path) -> Path | None:
     return None
 
 
+def _formal_returns_artifact_path(cfg: LiveMarketConfig) -> Path | None:
+    """Resolve the returns table that is valid for this execution contract.
+
+    The legacy integer-share day-trade oracle always closes within the session
+    and therefore cannot represent the unlimited-margin conversion contract.
+    In that mode the trainer deliberately omits new integer audit artifacts and
+    writes the canonical recurrent-state tensor result to ``daily_*``.  A stale
+    integer file left by an older run must never shadow that canonical table.
+    """
+
+    fold_dir = _market_fold_dir(cfg)
+    try:
+        config_path = _resolve_repo_path(cfg.config_path) or Path(cfg.config_path)
+        train_config = _load_experiment_config_cached(str(config_path))
+        incompatible_integer_oracle = bool(
+            str(train_config.trading.execution_mode) == "tw_day_trade"
+            and train_config.trading.tw_day_trade_unlimited_margin_conversion
+        )
+    except Exception:
+        incompatible_integer_oracle = False
+    if not incompatible_integer_oracle:
+        return _returns_artifact_path(fold_dir)
+    for name in (
+        "daily_portfolio_returns.parquet",
+        "daily_portfolio_returns.csv",
+    ):
+        path = fold_dir / name
+        if path.exists():
+            return path
+    return None
+
+
 def _history_sort_dt(value: Any) -> datetime:
     return _history_datetime(value) or datetime.min
 
@@ -3671,8 +3779,7 @@ def _recent_performance_from_returns(
         limit = max(1, int(periods))
     except Exception:
         limit = 32
-    fold_dir = _market_fold_dir(cfg)
-    path = _returns_artifact_path(fold_dir)
+    path = _formal_returns_artifact_path(cfg)
     rows: list[dict[str, Any]] = []
     source_paths: list[Path] = []
     if path is not None:
@@ -4525,6 +4632,9 @@ def _write_discord_service_status() -> dict[str, Any]:
         if _market_enabled(cfg)
         and bool(getattr(cfg, "day_trade_simulation_enabled", False))
     )
+    scheduled_day_trade_markets = sorted(
+        set(day_trade_markets).intersection(_scheduled_markets())
+    )
     engine = load_service_sync(_day_trade_state_dir()) or {}
     modes = engine.get("modes") or {}
     payload = {
@@ -4542,6 +4652,7 @@ def _write_discord_service_status() -> dict[str, Any]:
         # commands when a warmup retry is still pending.
         "startup_inference_warmup": _load_startup_inference_warmup_status(),
         "day_trade_markets": day_trade_markets,
+        "scheduled_day_trade_markets": scheduled_day_trade_markets,
         "engine_run_id": engine.get("engine_run_id"),
         "engine_state_revision": int(engine.get("state_revision") or 0),
         "engine_published_at": engine.get("published_at"),
@@ -4964,7 +5075,7 @@ def _market_has_panel_close_signal_for_date(
 
 
 def _formal_history_latest_date(cfg: LiveMarketConfig) -> str | None:
-    path = _returns_artifact_path(_market_fold_dir(cfg))
+    path = _formal_returns_artifact_path(cfg)
     if path is None or not path.exists():
         return None
     try:
@@ -5752,7 +5863,10 @@ async def _run_signal_now_background_refresh(
         completed_session = _completed_session_signal_path(cfg, initial_status)
         if (
             not bool(getattr(initial_status.data, "fresh", False))
-            and not completed_session
+            and (
+                not completed_session
+                or not _completed_session_publication_ready(initial_status)
+            )
         ):
             _update_signal_now_job(
                 key,
@@ -6013,20 +6127,16 @@ async def _resume_signal_now_jobs_once() -> None:
                 )
             return
         if not bool(getattr(status.data, "fresh", False)):
-            expected, actual = _signal_now_job_data_dates(status)
             completed_session = _completed_session_signal_path(cfg, status)
+            _update_signal_now_job(
+                key,
+                status="waiting_source",
+                runtime_status=status,
+            )
             if (
-                row.get("status") != "waiting_source"
-                or row.get("target_date") != expected
-                or row.get("actual_data_date") != actual
-                or row.get("waiting_reason") != str(status.data.reason or "source_not_fresh")
+                not completed_session
+                or not _completed_session_publication_ready(status)
             ):
-                _update_signal_now_job(
-                    key,
-                    status="waiting_source",
-                    runtime_status=status,
-                )
-            if not completed_session:
                 continue
         user_ids = {
             int(value)
