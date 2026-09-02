@@ -41,6 +41,7 @@ STRATEGY_ENTRY = datetime_time(9, 1)
 SESSION_CLOSE = datetime_time(13, 30)
 MINUTE_CONTRACT = "right_labelled_historical_last_trade_mark_v1"
 DEFAULT_LOCAL_MINUTE_ROOTS = (
+    Path("artifacts/data_repair/tw_day_trade_minute_curve/maintenance/current/fetched_kbars"),
     Path("artifacts/data_repair/tw_day_trade_minute_curve/kbars"),
     Path("data_tw_minute/shioaji_1m"),
     Path("data_tw_minute/research_dataset"),
@@ -593,6 +594,36 @@ def fetch_missing_kbars(
     return result
 
 
+def historical_minute_mark_has_source(row: Mapping[str, Any]) -> bool:
+    """Return whether an interior strategy mark has auditable minute pricing.
+
+    Cardinality alone is insufficient: a live writer can emit every wall-clock
+    minute while repeatedly carrying an unproved snapshot.  Completed-session
+    replay rows therefore need the retained one-minute contract and explicit
+    price-quality fields.  The accepted 09:01 entry and 13:30 endpoint are
+    checked separately and intentionally do not use this predicate.
+    """
+
+    try:
+        coverage = float(row.get("fresh_trade_notional_coverage_ratio"))
+        fresh_positions = int(row.get("fresh_trade_position_count"))
+        carried_positions = int(row.get("last_trade_carried_position_count"))
+        missing_positions = int(row.get("missing_price_position_count"))
+    except (TypeError, ValueError):
+        return False
+    return bool(
+        row.get("historical_minute_replay") is True
+        and str(row.get("minute_valuation_contract") or "") == MINUTE_CONTRACT
+        and str(row.get("valuation_source") or "")
+        and math.isfinite(coverage)
+        and 0.0 <= coverage <= 1.0
+        and fresh_positions >= 0
+        and carried_positions >= 0
+        and missing_positions == 0
+        and row.get("valuation_executable") is False
+    )
+
+
 def rebuild_strategy_marks(
     source_rows: list[dict[str, Any]],
     positions: Mapping[str, Mapping[str, list[dict[str, Any]]]],
@@ -600,7 +631,19 @@ def rebuild_strategy_marks(
     *,
     start: date,
     end: date,
+    fill_rows: Sequence[Mapping[str, Any]] = (),
+    repair_unverified_existing: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Fill exact minute holes without replacing observed strategy marks.
+
+    Existing audited replay marks are authoritative observations of the
+    bracket/EOD-aware paper engine. Missing minutes, and optionally existing
+    interior minutes without auditable price provenance, are reconstructed
+    from the retained one-minute trade tape and append-only exit-fill ledger.
+    The fill ledger preserves real stop, take-profit, and partial-exit state;
+    the accepted 09:01 entry and 13:30 endpoint remain untouched.
+    """
+
     outside = [
         dict(row)
         for row in source_rows
@@ -611,21 +654,63 @@ def rebuild_strategy_marks(
         for row in source_rows
         if _in_range(str(row.get("session_date") or ""), start, end)
     ]
-    endpoints = {
-        (str(row["session_date"]), str(row["market"]), str(row["minute"])[11:16]): row
-        for row in selected
-        if str(row.get("minute") or "")[11:16] in {"09:01", "13:30"}
-    }
-    session_dates = sorted({key[0] for key in endpoints})
-    markets = sorted({key[1] for key in endpoints})
+    by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
+    duplicate_rows_removed = 0
+    for raw in selected:
+        row = dict(raw)
+        session_date = str(row.get("session_date") or "")
+        market = str(row.get("market") or "")
+        minute = str(row.get("minute") or "")
+        if not session_date or not market or not minute:
+            raise RuntimeError(
+                "strategy mark is missing session_date, market, or minute"
+            )
+        key = (session_date, market, minute)
+        if key in by_key:
+            duplicate_rows_removed += 1
+        # Append-ledger order makes the latest observation inside a minute the
+        # canonical live mark, including legacy rows without recorded_at.
+        by_key[key] = row
+
+    session_dates = sorted({key[0] for key in by_key})
+    markets = sorted({key[1] for key in by_key})
     generated: list[dict[str, Any]] = []
+    inserted_rows = 0
+    replaced_unverified_rows = 0
+    preserved_rows = 0
     carried_rows = 0
     fresh_ratios: list[float] = []
+    fills_by_position: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(
+        list
+    )
+    for raw_fill in fill_rows:
+        if (
+            not isinstance(raw_fill, Mapping)
+            or str(raw_fill.get("purpose") or "") == "entry"
+        ):
+            continue
+        session_date = str(raw_fill.get("session_date") or "")
+        market = str(raw_fill.get("market") or "")
+        position_id = str(raw_fill.get("position_id") or "")
+        if not session_date or not market or not position_id:
+            continue
+        fills_by_position[(session_date, market, position_id)].append(dict(raw_fill))
+    for rows in fills_by_position.values():
+        rows.sort(
+            key=lambda row: str(row.get("fill_at") or row.get("recorded_at") or "")
+        )
+
     for session_date in session_dates:
         day = date.fromisoformat(session_date)
         for market in markets:
-            opening = endpoints.get((session_date, market, "09:01"))
-            closing = endpoints.get((session_date, market, "13:30"))
+            opening_minute = datetime.combine(
+                day, STRATEGY_ENTRY, tzinfo=TAIPEI
+            ).isoformat(timespec="minutes")
+            closing_minute = datetime.combine(
+                day, SESSION_CLOSE, tzinfo=TAIPEI
+            ).isoformat(timespec="minutes")
+            opening = by_key.get((session_date, market, opening_minute))
+            closing = by_key.get((session_date, market, closing_minute))
             if opening is None or closing is None:
                 raise RuntimeError(
                     f"missing accepted endpoint for {session_date}:{market}"
@@ -642,7 +727,8 @@ def rebuild_strategy_marks(
             for position in mode_positions:
                 symbol = str(position["symbol"])
                 initial = float(
-                    position.get("sizing_open_price")
+                    position.get("entry_price")
+                    or position.get("sizing_open_price")
                     or position.get("last_mark_price")
                     or 0.0
                 )
@@ -659,48 +745,93 @@ def rebuild_strategy_marks(
                     # The strategy has no position before its 09:01 paper entry.
                     # Do not fabricate a pre-entry equity point from the later fill.
                     continue
-                if minute.time() == STRATEGY_ENTRY:
-                    generated.append(dict(opening))
-                    continue
-                if clock == "13:30":
-                    generated.append(dict(closing))
-                    continue
+                minute_key = minute.isoformat(timespec="minutes")
+                existing = by_key.get((session_date, market, minute_key))
                 fresh_symbols: set[str] = set()
                 for symbol, prices in minute_prices.items():
-                    value = prices.get(minute.isoformat(timespec="minutes"))
+                    value = prices.get(minute_key)
                     if value is not None:
                         current_prices[symbol] = value
                         fresh_symbols.add(symbol)
+                preserve_existing = bool(
+                    existing is not None
+                    and (
+                        clock in {"09:01", "13:30"}
+                        or not repair_unverified_existing
+                        or historical_minute_mark_has_source(existing)
+                    )
+                )
+                if preserve_existing:
+                    generated.append(dict(existing))
+                    preserved_rows += 1
+                    continue
+                if existing is not None:
+                    replaced_unverified_rows += 1
                 open_net = 0.0
                 total_notional = 0.0
                 fresh_notional = 0.0
+                realized_this_session = 0.0
+                open_positions = 0
+                fresh_open_positions = 0
                 for position in mode_positions:
                     symbol = str(position["symbol"])
                     quantity = _filled_quantity(position)
+                    position_id = str(position.get("position_id") or symbol)
+                    exited_quantity = 0
+                    allocated_entry_fee = 0.0
+                    for fill in fills_by_position.get(
+                        (session_date, market, position_id), ()
+                    ):
+                        fill_at = str(
+                            fill.get("fill_at") or fill.get("recorded_at") or ""
+                        )
+                        if not fill_at or fill_at > minute.isoformat(
+                            timespec="seconds"
+                        ):
+                            break
+                        exited_quantity += int(fill.get("quantity") or 0)
+                        allocated_entry_fee += float(
+                            fill.get("entry_fee_allocated_twd") or 0.0
+                        )
+                        realized_this_session += float(fill.get("net_pnl_twd") or 0.0)
+                    remaining = quantity - exited_quantity
+                    if remaining < 0:
+                        raise RuntimeError(
+                            "exit quantity exceeds entry for "
+                            f"{session_date}:{market}:{position_id}"
+                        )
+                    if remaining == 0:
+                        continue
+                    open_positions += 1
                     signed = (
-                        quantity if str(position.get("side")) == "long" else -quantity
+                        remaining if str(position.get("side")) == "long" else -remaining
                     )
                     price = current_prices[symbol]
+                    remaining_entry_fee = max(
+                        0.0,
+                        float(position.get("entry_fee_twd") or 0.0)
+                        - allocated_entry_fee,
+                    )
                     open_net += position_net_liquidation_pnl(
                         position,
                         price,
                         signed_shares=signed,
-                        remaining_entry_fee_twd=float(
-                            position.get("entry_fee_twd") or 0.0
-                        ),
+                        remaining_entry_fee_twd=remaining_entry_fee,
                     )
-                    notional = abs(quantity * price)
+                    notional = abs(remaining * price)
                     total_notional += notional
                     if symbol in fresh_symbols:
                         fresh_notional += notional
-                carried = max(0, expected_open - len(fresh_symbols))
+                        fresh_open_positions += 1
+                carried = max(0, open_positions - fresh_open_positions)
                 coverage = (
                     fresh_notional / total_notional if total_notional > 0.0 else 1.0
                 )
                 carried_rows += int(carried > 0)
                 fresh_ratios.append(coverage)
-                cumulative = float(
-                    opening.get("cumulative_realized_net_pnl_twd") or 0.0
+                cumulative = (
+                    float(opening.get("cumulative_realized_net_pnl_twd") or 0.0)
+                    + realized_this_session
                 )
                 initial_capital = float(opening.get("initial_capital_twd") or 0.0)
                 generated.append(
@@ -713,10 +844,10 @@ def rebuild_strategy_marks(
                         "cumulative_realized_net_pnl_twd": cumulative,
                         "open_net_liquidation_pnl_twd": open_net,
                         "total_equity_twd": initial_capital + cumulative + open_net,
-                        "open_position_count": expected_open,
+                        "open_position_count": open_positions,
                         "stale_position_count": carried,
                         "valuation_stale": carried > 0,
-                        "fresh_trade_position_count": len(fresh_symbols),
+                        "fresh_trade_position_count": fresh_open_positions,
                         "last_trade_carried_position_count": carried,
                         "missing_price_position_count": 0,
                         "fresh_trade_notional_coverage_ratio": coverage,
@@ -727,6 +858,7 @@ def rebuild_strategy_marks(
                         "simulation_only": True,
                     }
                 )
+                inserted_rows += int(existing is None)
     rows = outside + generated
     rows.sort(
         key=lambda row: (str(row.get("minute") or ""), str(row.get("market") or ""))
@@ -740,6 +872,10 @@ def rebuild_strategy_marks(
         "session_dates": session_dates,
         "markets": markets,
         "generated_rows": len(generated),
+        "preserved_observed_rows": preserved_rows,
+        "inserted_missing_rows": inserted_rows,
+        "replaced_unverified_rows": replaced_unverified_rows,
+        "duplicate_rows_removed": duplicate_rows_removed,
         "rows_with_carried_prices": carried_rows,
         "minimum_fresh_trade_notional_coverage_ratio": min(fresh_ratios, default=1.0),
         "mean_fresh_trade_notional_coverage_ratio": (
@@ -766,7 +902,9 @@ def validate_existing_strategy_marks(
         session_date = str(row.get("session_date") or "")
         market = str(row.get("market") or "")
         if not session_date or not market:
-            raise RuntimeError("existing strategy mark is missing session_date or market")
+            raise RuntimeError(
+                "existing strategy mark is missing session_date or market"
+            )
         grouped[(session_date, market)].append(row)
     session_dates = sorted({key[0] for key in grouped})
     markets = sorted({key[1] for key in grouped})
@@ -790,9 +928,10 @@ def validate_existing_strategy_marks(
                     f"{session_date}:{market}; expected exactly 09:01..13:30"
                 )
             for row in rows:
-                stale = bool(row.get("valuation_stale")) or int(
-                    row.get("stale_position_count") or 0
-                ) > 0
+                stale = (
+                    bool(row.get("valuation_stale"))
+                    or int(row.get("stale_position_count") or 0) > 0
+                )
                 carried_rows += int(stale)
                 value = row.get("fresh_trade_notional_coverage_ratio")
                 try:
@@ -817,9 +956,7 @@ def validate_existing_strategy_marks(
             min(coverage_values) if coverage_values else None
         ),
         "mean_fresh_trade_notional_coverage_ratio": (
-            sum(coverage_values) / len(coverage_values)
-            if coverage_values
-            else None
+            sum(coverage_values) / len(coverage_values) if coverage_values else None
         ),
         "existing_bracket_aware_marks_preserved": True,
     }
@@ -1020,6 +1157,14 @@ def parse_args() -> argparse.Namespace:
             "strategy curve instead of replacing it with endpoint-derived marks."
         ),
     )
+    parser.add_argument(
+        "--repair-unverified-strategy-marks",
+        action="store_true",
+        help=(
+            "Replace completed-session interior marks that have no auditable "
+            "one-minute price provenance; preserve the 09:01 and 13:30 endpoints."
+        ),
+    )
     parser.add_argument("--fetch-workers", type=int, default=1)
     parser.add_argument("--requests-per-second", type=float, default=5.0)
     parser.add_argument(
@@ -1059,6 +1204,7 @@ def main() -> None:
     store = MinutePriceStore(local_roots, local_cache_roots)
     positions = load_positions(args.state_dir, start=start, end=end)
     source_marks = _read_jsonl(args.state_dir / "marks.jsonl")
+    source_fills = _read_jsonl(args.state_dir / "fills.jsonl")
     session_dates = sorted(
         {
             str(row.get("session_date"))
@@ -1116,7 +1262,15 @@ def main() -> None:
         )
     else:
         rebuilt_marks, strategy_stats = rebuild_strategy_marks(
-            source_marks, positions, store, start=start, end=end
+            source_marks,
+            positions,
+            store,
+            start=start,
+            end=end,
+            fill_rows=source_fills,
+            repair_unverified_existing=bool(
+                args.repair_unverified_strategy_marks
+            ),
         )
     source_benchmarks = _read_json(args.state_dir / "benchmark_history.json")
     rebuilt_benchmarks, benchmark_stats = rebuild_benchmark_history(

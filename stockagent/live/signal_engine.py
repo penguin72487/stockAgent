@@ -25,7 +25,15 @@ from stockagent.config import (
     external_panel_data_kwargs,
     load_config,
 )
-from stockagent.data.panel import PanelData, build_panel, build_tail_panel
+from stockagent.data.panel import (
+    PANEL_CACHE_VERSION,
+    PanelData,
+    build_panel,
+    build_tail_panel,
+    load_panel_cache_v2_exact,
+    slice_panel_start,
+)
+from stockagent.data.panel_cache import save_panel_cache_v2
 from stockagent.live.portfolio_state import (
     build_rebalance_rows,
     classify_rebalance_action,
@@ -95,6 +103,13 @@ _LIVE_MODEL_INPUT_CACHE: OrderedDict[
     str, tuple[weakref.ReferenceType[np.ndarray], np.ndarray]
 ] = OrderedDict()
 _LIVE_MODEL_INPUT_CACHE_LOCK = threading.Lock()
+
+
+def _env_enabled(name: str, default: bool = True) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return bool(default)
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def clear_live_panel_memory_cache() -> None:
@@ -203,23 +218,38 @@ def _live_panel_cache_key(
     digest = hashlib.sha256()
     digest.update(str(Path(config.data.parquet_root).resolve()).encode("utf-8"))
     digest.update(str(int(live_tail_rows)).encode("ascii"))
-    # Worker count changes construction throughput, not panel semantics. The
-    # 10M multi-basis and 100M modes intentionally share the same 99-feature
-    # panel even though their hardware-tuned worker counts differ.
+    # Worker count changes only throughput. The configured start boundary is
+    # applied canonically after loading the shared unsliced live tail, so two
+    # otherwise identical modes do not rebuild the same recent dates.
     semantic_panel_kwargs = {
         key: value
         for key, value in panel_kwargs.items()
-        if key != "panel_load_workers"
+        if key not in {"panel_load_workers", "panel_start_date"}
     }
     digest.update(repr(sorted(semantic_panel_kwargs.items())).encode("utf-8"))
     root = Path(config.data.parquet_root)
     # Refresh workflows explicitly call clear_live_panel_memory_cache(). Keep
     # three cheap sentinels as defense in depth, but do not resolve/stat all
     # ~2,700 symbol parquets merely to prove that a RAM cache entry exists.
-    sentinel_paths = [root, root / "symbols.csv"]
+    sentinel_paths = [root, root / "symbols.csv", root / "_hot_tail"]
     external_path = panel_kwargs.get("external_feature_path")
     if external_path:
-        sentinel_paths.append(Path(str(external_path)))
+        resolved_external = Path(str(external_path))
+        sentinel_paths.extend(
+            [
+                resolved_external,
+                resolved_external.with_suffix(".summary.json"),
+            ]
+        )
+        for directory in (resolved_external.parent, resolved_external.parent.parent):
+            sentinel_paths.extend(
+                [
+                    directory / "tw_corporate_action_reference.parquet",
+                    directory / "tw_corporate_action_reference.summary.json",
+                    directory / "tw_corporate_action_entitlements.parquet",
+                    directory / "tw_corporate_action_entitlements.summary.json",
+                ]
+            )
     for path in sentinel_paths:
         if not path.exists():
             continue
@@ -235,9 +265,14 @@ def _live_panel_cache_key(
             return cached_key
 
     source_digest = hashlib.sha256(source_identity.encode("ascii"))
-    for path in sorted(root.glob("*_features.parquet")):
+    source_paths = list(root.glob("*_features.parquet"))
+    hot_tail_root = root / "_hot_tail"
+    if hot_tail_root.is_dir():
+        source_paths.extend(hot_tail_root.glob("*_features.parquet"))
+    source_paths.extend(path for path in sentinel_paths[1:] if path.is_file())
+    for path in sorted(set(source_paths)):
         stat = path.stat()
-        source_digest.update(str(path.name).encode("utf-8"))
+        source_digest.update(str(path.resolve()).encode("utf-8"))
         source_digest.update(
             f":{stat.st_size}:{stat.st_mtime_ns}:{stat.st_ctime_ns}".encode("ascii")
         )
@@ -245,6 +280,39 @@ def _live_panel_cache_key(
     with _LIVE_PANEL_CACHE_LOCK:
         _LIVE_PANEL_SOURCE_KEY_CACHE[source_identity] = resolved
     return resolved
+
+
+def _live_panel_disk_backend_key(
+    config: ExperimentConfig,
+    *,
+    live_tail_rows: int,
+    panel_kwargs: dict[str, Any],
+) -> str:
+    """Identify panel semantics independently from the changing source day."""
+
+    semantic_panel_kwargs = {
+        key: value
+        for key, value in panel_kwargs.items()
+        if key not in {"panel_load_workers", "panel_start_date"}
+    }
+    payload = {
+        "schema_version": 1,
+        "parquet_root": str(Path(config.data.parquet_root).resolve()),
+        "live_tail_rows": int(live_tail_rows),
+        "panel_kwargs": sorted(semantic_panel_kwargs.items()),
+    }
+    digest = hashlib.sha256(
+        repr(payload).encode("utf-8")
+    ).hexdigest()
+    return f"live-tail-v1:{digest}"
+
+
+def _live_panel_disk_cache_root() -> Path:
+    configured = str(os.getenv("STOCKAGENT_LIVE_PANEL_CACHE_ROOT", "")).strip()
+    if configured:
+        path = Path(configured).expanduser()
+        return path if path.is_absolute() else Path.cwd() / path
+    return Path(__file__).resolve().parents[2] / "artifacts" / "cache" / "live_signal_panels"
 
 
 def _cached_live_panel(key: str) -> PanelData | None:
@@ -406,7 +474,7 @@ def _build_panel(
     config: ExperimentConfig,
     *,
     live_tail: bool = False,
-) -> tuple[PanelData, bool]:
+) -> tuple[PanelData, bool, str]:
     live_tail_rows = int(getattr(config.data, "live_tail_panel_rows", 0) or 0)
     external_kwargs = external_panel_data_kwargs(config.data)
     panel_kwargs = {
@@ -439,7 +507,44 @@ def _build_panel(
                 f"[panel] live memory cache hit dates={cached.num_dates} "
                 f"symbols={cached.num_symbols}"
             )
-            return cached, True
+            return (
+                slice_panel_start(cached, config.data.panel_start_date),
+                True,
+                "memory",
+            )
+        disk_backend_key = _live_panel_disk_backend_key(
+            config,
+            live_tail_rows=live_tail_rows,
+            panel_kwargs=panel_kwargs,
+        )
+        disk_cache_root = _live_panel_disk_cache_root()
+        if _env_enabled("STOCKAGENT_LIVE_PANEL_DISK_CACHE", True):
+            try:
+                cached = load_panel_cache_v2_exact(
+                    disk_cache_root,
+                    source_hash=cache_key,
+                    backend_key=disk_backend_key,
+                    source_paths=[],
+                )
+            except Exception as exc:
+                print(
+                    "[panel] live disk cache read failed; rebuilding "
+                    f"error={type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+                cached = None
+            if cached is not None:
+                print(
+                    f"[panel] live disk cache hit dates={cached.num_dates} "
+                    f"symbols={cached.num_symbols} root={disk_cache_root}",
+                    flush=True,
+                )
+                _remember_live_panel(cache_key, cached)
+                return (
+                    slice_panel_start(cached, config.data.panel_start_date),
+                    True,
+                    "disk",
+                )
         panel = build_tail_panel(
             config.data.parquet_root,
             tail_rows=live_tail_rows,
@@ -455,16 +560,46 @@ def _build_panel(
             feature_exclude=config.data.feature_exclude,
             feature_zero_fill=config.data.feature_zero_fill,
             feature_shift_next_session=config.data.feature_shift_next_session,
-            panel_start_date=config.data.panel_start_date,
+            # Persist the reusable unsliced tail. Apply each strategy's exact
+            # boundary after memory/disk/build retrieval.
+            panel_start_date=None,
         )
+        if _env_enabled("STOCKAGENT_LIVE_PANEL_DISK_CACHE", True):
+            try:
+                save_panel_cache_v2(
+                    disk_cache_root,
+                    panel,
+                    source_hash=cache_key,
+                    backend_key=disk_backend_key,
+                    version=PANEL_CACHE_VERSION,
+                )
+                print(
+                    f"[panel] live disk cache committed dates={panel.num_dates} "
+                    f"symbols={panel.num_symbols} root={disk_cache_root}",
+                    flush=True,
+                )
+            except Exception as exc:
+                # A cache optimization must never turn a correct in-memory
+                # signal into an outage. The next run can retry the atomic
+                # cache publication.
+                print(
+                    "[panel] live disk cache write failed; continuing with "
+                    f"rebuilt panel error={type(exc).__name__}: {exc}",
+                    flush=True,
+                )
         _remember_live_panel(cache_key, panel)
-        return panel, False
+        return (
+            slice_panel_start(panel, config.data.panel_start_date),
+            False,
+            "rebuilt",
+        )
     return (
         build_panel(
             config.data.parquet_root,
             **panel_kwargs,
         ),
         False,
+        "rebuilt-full",
     )
 
 
@@ -2495,8 +2630,12 @@ def generate_live_signal(
     if _panel_override is not None:
         panel = _panel_override
         panel_cache_hit = True
+        panel_cache_tier = "override"
     else:
-        panel, panel_cache_hit = _build_panel(config, live_tail=True)
+        panel, panel_cache_hit, panel_cache_tier = _build_panel(
+            config,
+            live_tail=True,
+        )
     _emit_progress(progress_callback, label=progress_name, step=4, total=progress_total, message="panel ready")
     panel = align_panel_to_checkpoint_universe(
         panel,
@@ -3369,6 +3508,7 @@ def generate_live_signal(
         "live_latency": {
             "schema_version": 2,
             "panel_cache_hit": bool(panel_cache_hit),
+            "panel_cache_tier": str(panel_cache_tier),
             "checkpoint_cache_hit": bool(checkpoint_cache_hit),
             "model_cache_hit": bool(model_cache_hit),
             "pre_quote_prepare_ms": round(

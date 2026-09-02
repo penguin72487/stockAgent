@@ -819,6 +819,131 @@ def test_data_monitor_summary_omits_heavy_detail_rows() -> None:
         server.server_close()
 
 
+def test_data_monitor_status_prefers_materialized_public_snapshot(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    server = _test_server()
+    server.repo_root = tmp_path
+    snapshot = tmp_path / "artifacts/live/data_monitor/public_status.json"
+    snapshot.parent.mkdir(parents=True)
+    snapshot.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "generated_at_utc": "2026-09-02T00:00:00+00:00",
+                "health": "active",
+                "read_only": True,
+                "production_control_possible": False,
+                "summary": {"registered_items": 7},
+                "sources": [{"id": "materialized"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "scripts.serve_public_dashboards.build_data_monitor_public_status",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("request path must not rebuild the full monitor")
+        ),
+    )
+    try:
+        payload = json.loads(server.data_monitor_status().body)
+        assert payload["summary"]["registered_items"] == 7
+        assert payload["sources"] == [{"id": "materialized"}]
+    finally:
+        server.server_close()
+
+
+def test_tw_status_wall_clock_boundary_reuses_same_content_revision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = _test_server()
+    calls = 0
+    server.tw_revision = lambda: server.cached_local_json(  # type: ignore[method-assign]
+        cache_key="revision-fixture",
+        ttl_seconds=60.0,
+        cache_control="no-store",
+        builder=lambda: {"revision_token": "material-7"},
+    )
+
+    def build_snapshot(**_kwargs: object) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        return {
+            "simulation_only": True,
+            "production_order_possible": False,
+            "modes": [],
+        }
+
+    monkeypatch.setattr(
+        "scripts.serve_public_dashboards.build_dashboard_snapshot",
+        build_snapshot,
+    )
+    try:
+        monkeypatch.setattr("scripts.serve_public_dashboards.time.time", lambda: 59.9)
+        first = server.tw_status()
+        monkeypatch.setattr("scripts.serve_public_dashboards.time.time", lambda: 60.1)
+        second = server.tw_status()
+        assert first.body == second.body
+        assert calls == 1
+    finally:
+        server.server_close()
+
+
+def test_tw_status_new_revision_returns_verified_stale_while_rebuilding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = _test_server()
+    revision = {"token": "revision-1"}
+    build_started = threading.Event()
+    release_build = threading.Event()
+    calls = 0
+    server.tw_revision = lambda: server.cached_local_json(  # type: ignore[method-assign]
+        cache_key=f"revision-{revision['token']}",
+        ttl_seconds=60.0,
+        cache_control="no-store",
+        builder=lambda: {"revision_token": revision["token"]},
+    )
+
+    def build_snapshot(**_kwargs: object) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            build_started.set()
+            assert release_build.wait(1.0)
+        return {
+            "health": revision["token"],
+            "simulation_only": True,
+            "production_order_possible": False,
+            "modes": [],
+        }
+
+    monkeypatch.setattr(
+        "scripts.serve_public_dashboards.build_dashboard_snapshot",
+        build_snapshot,
+    )
+    try:
+        first = server.tw_status()
+        revision["token"] = "revision-2"
+        started = time.monotonic()
+        stale = server.tw_status()
+        elapsed = time.monotonic() - started
+        assert stale.body == first.body
+        assert elapsed < 0.1
+        assert build_started.wait(1.0)
+        release_build.set()
+        deadline = time.monotonic() + 1.0
+        while "tw-status:latest:revision-2" not in server._cache:
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        refreshed = json.loads(server.tw_status().body)
+        assert refreshed["health"] == "revision-2"
+        assert calls == 2
+    finally:
+        release_build.set()
+        server.server_close()
+
+
 def test_public_gateway_protocol_is_read_only_fail_closed_and_hardened() -> None:
     server = _test_server()
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -849,6 +974,14 @@ def test_public_gateway_protocol_is_read_only_fail_closed_and_hardened() -> None
         response = connection.getresponse()
         assert response.status == 400
         assert json.loads(response.read()) == {"error": "invalid_request"}
+
+        connection.request("GET", "/tw-day-trade/api/public-data-status")
+        response = connection.getresponse()
+        assert response.status == 200
+        tw_public = json.loads(response.read())
+        assert tw_public["scope"] == "tw_public_official_sources"
+        assert tw_public["read_only"] is True
+        assert tw_public["production_control_possible"] is False
 
         server.data_monitor_status = lambda: (_ for _ in ()).throw(
             ValueError("private internal detail")
@@ -1084,12 +1217,21 @@ def test_overview_prewarms_before_large_history_scans() -> None:
     ).read_text(encoding="utf-8")
     method = source[source.index("    def prewarm_default_views") :]
     overview_call = method.index("            self.prewarm_overview()")
-    tw_status_call = method.index("            self.tw_status()")
+    tw_status_call = method.index("            warmed_tw_status = self.tw_status()")
+    tw_history_call = method.index("                self.tw_history(")
     history_call = method.index("            taifex_history_builder()")
     detail_pool = method.index(
         "        builders: tuple[Callable[[], object], ...] = ("
     )
-    assert overview_call < tw_status_call < history_call < detail_pool
+    assert (
+        overview_call
+        < tw_status_call
+        < tw_history_call
+        < history_call
+        < detail_pool
+    )
+    assert 'start_date=current_tw_session_date' in method
+    assert 'end_date=current_tw_session_date' in method
 
 
 def test_token_bucket_rate_limiter_refills_and_caps_client_table() -> None:

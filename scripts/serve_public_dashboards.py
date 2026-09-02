@@ -45,6 +45,7 @@ from stockagent.live.openbb_archive_dashboard import (  # noqa: E402
 )
 from stockagent.live.data_monitor_dashboard import (  # noqa: E402
     build_data_monitor_public_status,
+    build_tw_public_monitor_status,
 )
 from stockagent.live.tw_day_trade_dashboard import (  # noqa: E402
     DEFAULT_MAX_SOURCE_AGE_SECONDS,
@@ -95,6 +96,7 @@ _PUBLIC_API_ROUTES: Final[frozenset[str]] = frozenset(
         "/tw-day-trade/api/status",
         "/tw-day-trade/api/history",
         "/tw-day-trade/api/positions",
+        "/tw-day-trade/api/public-data-status",
         "/tw-day-trade/api/revision",
         "/tw-day-trade/api/summary",
         "/tw-day-trade/api/signals",
@@ -1058,27 +1060,107 @@ class PublicDashboardServer(ThreadingHTTPServer):
 
     def tw_status(self, session_date: str | None = None) -> PreparedResponse:
         normalized_date = str(session_date or "").strip()
+        revision = _response_json(self.tw_revision())
+        revision_token = str(
+            revision.get("revision_token")
+            or revision.get("state_revision")
+            or "missing"
+        )
+        # Price/valuation facts advance through the durable content revision.
+        # Keep time out of the key: adding a wall-clock bucket can start a
+        # duplicate hundreds-of-MiB history scan at a minute boundary.  Once a
+        # verified response exists, stale-while-refresh lets the first reader
+        # after TTL return immediately while one background thread refreshes
+        # source ages.  A new signal/mark/pre-open revision still gets a new
+        # key and starts a rebuild immediately; an existing timestamped,
+        # verified response remains visible only during that bounded rebuild.
+        cache_prefix = f"tw-status:{normalized_date or 'latest'}:"
+        cache_key = f"{cache_prefix}{revision_token}"
+
+        def build_response() -> PreparedResponse:
+            return self.cached_local_json(
+                cache_key=cache_key,
+                ttl_seconds=55.0,
+                cache_control="no-store",
+                stale_grace_seconds=120.0,
+                builder=lambda: sanitize_tw_status(
+                    build_dashboard_snapshot(
+                        state_dir=self.repo_root
+                        / "artifacts/live/tw_day_trade_simulation",
+                        preopen_readiness_path=self.repo_root
+                        / "artifacts/discord_bot/preopen_readiness.json",
+                        session_date=normalized_date or None,
+                        maximum_event_rows=500,
+                        maximum_mark_rows=32,
+                        include_position_rows=False,
+                        # Completed-session position snapshots and immutable
+                        # benchmark history already enumerate the public date
+                        # selector. Avoid indexing multi-GB append-only ledgers on
+                        # a cold read merely to rediscover the same dates.
+                        include_ledger_session_dates=False,
+                    )
+                ),
+            )
+
+        # An atomic history promotion can change the content revision and the
+        # 358 MiB benchmark inode together.  The previous verified response is
+        # still explicitly timestamped and safe to display while one thread
+        # rebuilds the new revision; blocking every viewer behind that parse
+        # created 10+ second blank-page spikes.  Never use this fallback on the
+        # first cold build, after its bounded stale window, or across dates.
+        start_refresh = False
+        fallback: PreparedResponse | None = None
+        with self._cache_lock:
+            if cache_key not in self._cache:
+                observed = time.monotonic()
+                candidates = [
+                    entry
+                    for key, entry in self._cache.items()
+                    if key.startswith(cache_prefix) and entry.stale_until > observed
+                ]
+                if candidates:
+                    latest = max(
+                        candidates, key=lambda entry: entry.last_accessed_at
+                    )
+                    latest.last_accessed_at = observed
+                    fallback = latest.response
+                    if cache_key not in self._refreshing:
+                        self._refreshing.add(cache_key)
+                        start_refresh = True
+        if fallback is not None:
+            self.traffic_observer.record_cache("revision_stale_hit")
+            if start_refresh:
+
+                def refresh_revision() -> None:
+                    try:
+                        build_response()
+                    except Exception as error:
+                        sys.stderr.write(
+                            "public-dashboard revision_refresh_failed "
+                            f"key={cache_key} error={type(error).__name__}\n"
+                        )
+                    finally:
+                        with self._cache_lock:
+                            self._refreshing.discard(cache_key)
+
+                threading.Thread(
+                    target=refresh_revision,
+                    name=f"public-revision-{revision_token[:32]}",
+                    daemon=True,
+                ).start()
+            return fallback
+
+        return build_response()
+
+    def tw_public_data_status(self) -> PreparedResponse:
+        """Return only official TW source progress used by the day-trade page."""
+
         return self.cached_local_json(
-            cache_key=f"tw-status:{normalized_date or 'latest'}",
-            ttl_seconds=2.0,
+            cache_key=f"tw-public-data-status:{int(time.time() // 25)}",
+            ttl_seconds=30.0,
             cache_control="no-store",
-            stale_grace_seconds=0.0,
-            builder=lambda: sanitize_tw_status(
-                build_dashboard_snapshot(
-                    state_dir=self.repo_root / "artifacts/live/tw_day_trade_simulation",
-                    preopen_readiness_path=self.repo_root
-                    / "artifacts/discord_bot/preopen_readiness.json",
-                    session_date=normalized_date or None,
-                    maximum_event_rows=500,
-                    maximum_mark_rows=32,
-                    include_position_rows=False,
-                    # Completed-session position snapshots and immutable
-                    # benchmark history already enumerate the public date
-                    # selector. Avoid indexing multi-GB append-only ledgers on
-                    # a cold read merely to rediscover the same dates.
-                    include_ledger_session_dates=False,
-                )
-            ),
+            stale_grace_seconds=60.0,
+            builder=lambda: build_tw_public_monitor_status(self.repo_root),
         )
 
     def tw_revision(self) -> PreparedResponse:
@@ -1141,6 +1223,40 @@ class PublicDashboardServer(ThreadingHTTPServer):
         shioaji_status: Mapping[str, Any] | None = None,
         openbb_status: Mapping[str, Any] | None = None,
     ) -> PreparedResponse:
+        snapshot_path = (
+            self.repo_root / "artifacts/live/data_monitor/public_status.json"
+        )
+        try:
+            stat = snapshot_path.stat()
+        except FileNotFoundError:
+            stat = None
+        if stat is not None:
+            signature = (
+                stat.st_dev,
+                stat.st_ino,
+                stat.st_size,
+                stat.st_mtime_ns,
+            )
+
+            def read_snapshot() -> Mapping[str, Any]:
+                payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
+                if not isinstance(payload, Mapping):
+                    raise ValueError("data-monitor public snapshot is not an object")
+                if payload.get("read_only") is not True:
+                    raise ValueError("data-monitor public snapshot is not read-only")
+                if payload.get("production_control_possible") is not False:
+                    raise ValueError(
+                        "data-monitor public snapshot exposes production control"
+                    )
+                return payload
+
+            return self.cached_local_json(
+                cache_key=f"data-monitor-status-snapshot:{signature}",
+                ttl_seconds=45.0,
+                cache_control="no-store",
+                stale_grace_seconds=60.0,
+                builder=read_snapshot,
+            )
         if shioaji_status is None:
             shioaji_status = _response_json(
                 self.cached_local_json(
@@ -1289,13 +1405,34 @@ class PublicDashboardServer(ThreadingHTTPServer):
         # The detailed TW page still receives the complete source-backed
         # snapshot. Warm it after the compact landing card is ready, so its
         # historical joins cannot hold the public readiness surface hostage.
+        current_tw_session_date: str | None = None
         try:
-            self.tw_status()
+            warmed_tw_status = self.tw_status()
+            current_tw_session_date = (
+                str(_response_json(warmed_tw_status).get("session_date") or "")
+                or None
+            )
         except Exception as error:
             sys.stderr.write(
                 "public-dashboard critical_tw_status_prewarm_failed "
                 f"error={type(error).__name__}\n"
             )
+        # The day-trade page asks for an explicit selected-date curve as soon
+        # as status paints.  Warm that exact response before lower-priority
+        # cross-dashboard histories so its request reuses the status-built
+        # benchmark index and never queues behind an unrelated TAIFEX scan.
+        if current_tw_session_date:
+            try:
+                self.tw_history(
+                    "all",
+                    start_date=current_tw_session_date,
+                    end_date=current_tw_session_date,
+                )
+            except Exception as error:
+                sys.stderr.write(
+                    "public-dashboard critical_tw_history_prewarm_failed "
+                    f"error={type(error).__name__}\n"
+                )
         # Build the largest detail payload next.  An immediate request joins
         # this cache key's single flight, while the remaining detail views wait
         # instead of competing for CPU and disk bandwidth.
@@ -1313,7 +1450,6 @@ class PublicDashboardServer(ThreadingHTTPServer):
         # 100-row result, so it is safe and useful to warm the laptop's first
         # visible detail table after the compact date index exists.
         builders: tuple[Callable[[], object], ...] = (
-            lambda: self.tw_history("1d"),
             lambda: self.openbb_history("1d"),
             lambda: build_dashboard_signal_page(
                 state_dir=self.repo_root / "artifacts/live/tw_day_trade_simulation",
@@ -1791,6 +1927,12 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                 start_date=history_query["start_date"],
                 end_date=history_query["end_date"],
             )
+        if path == "/tw-day-trade/api/public-data-status":
+            if raw_query:
+                raise InvalidPublicRequest(
+                    "public data status does not accept query fields"
+                )
+            return self.server.tw_public_data_status()
         if path == "/tw-day-trade/api/summary":
             session_date = self._date_query(raw_query)
             return self.server.cached_local_json(

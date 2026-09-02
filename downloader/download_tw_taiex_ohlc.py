@@ -42,8 +42,7 @@ SOURCE_NAME = "TWSE"
 SOURCE_PRODUCT = "indicesReport/MI_5MINS_HIST"
 OFFICIAL_START_DATE = date(1999, 1, 5)
 ENDPOINT_TEMPLATE = (
-    "https://wwwc.twse.com.tw/indicesReport/MI_5MINS_HIST"
-    "?date={date}&response=json"
+    "https://wwwc.twse.com.tw/indicesReport/MI_5MINS_HIST?date={date}&response=json"
 )
 PARSER_CONTRACT_VERSION = 1
 JOURNAL_SCHEMA_VERSION = 1
@@ -187,6 +186,10 @@ def _summary_path(output_dir: Path) -> Path:
     return output_dir / f"{DATASET_NAME}.summary.json"
 
 
+def _latest_attempt_summary_path(output_dir: Path) -> Path:
+    return output_dir / "state" / f"{DATASET_NAME}.latest_attempt.json"
+
+
 def _canonical_path(output_dir: Path) -> Path:
     return output_dir / f"{DATASET_NAME}.parquet"
 
@@ -227,9 +230,11 @@ def _global_rate_limiter() -> SharedRateLimiter:
 def _response_is_security_block(response: requests.Response) -> bool:
     if int(response.status_code) not in {307, 403}:
         return False
-    text = bytes(getattr(response, "content", b""))[:4096].decode(
-        "utf-8", errors="ignore"
-    ).lower()
+    text = (
+        bytes(getattr(response, "content", b""))[:4096]
+        .decode("utf-8", errors="ignore")
+        .lower()
+    )
     return (
         "for security reasons" in text
         or "page can not be accessed" in text
@@ -254,7 +259,9 @@ def _retry_delay(
                         retry_at = retry_at.replace(tzinfo=timezone.utc)
                     return min(
                         120.0,
-                        max(0.0, (retry_at - datetime.now(timezone.utc)).total_seconds()),
+                        max(
+                            0.0, (retry_at - datetime.now(timezone.utc)).total_seconds()
+                        ),
                     )
                 except (TypeError, ValueError, OverflowError):
                     pass
@@ -346,7 +353,11 @@ def _parse_date_value(value: Any) -> date:
         return datetime.strptime(text, "%Y%m%d").date()
     if re.fullmatch(r"\d{6,7}", text):
         year_digits = len(text) - 4
-        return date(int(text[:year_digits]) + 1911, int(text[year_digits:year_digits + 2]), int(text[-2:]))
+        return date(
+            int(text[:year_digits]) + 1911,
+            int(text[year_digits : year_digits + 2]),
+            int(text[-2:]),
+        )
     parts = [part for part in text.split("/") if part]
     if len(parts) == 3 and all(part.isdigit() for part in parts):
         year = int(parts[0])
@@ -357,13 +368,7 @@ def _parse_date_value(value: Any) -> date:
 
 
 def _parse_number(value: Any, *, field: str) -> float:
-    text = (
-        str(value)
-        .strip()
-        .replace(",", "")
-        .replace("−", "-")
-        .replace("－", "-")
-    )
+    text = str(value).strip().replace(",", "").replace("−", "-").replace("－", "-")
     if text in {"", "--", "---", "N/A", "null", "None"}:
         raise MonthPayloadError(f"missing numeric {field}: {value!r}")
     try:
@@ -405,11 +410,19 @@ def _extract_records(payload: Any, requested_month: str) -> list[dict[str, Any]]
                 )
             table = candidates[0]
             title_parts.append(str(table.get("title", "")))
-            fields = table.get("fields") if isinstance(table.get("fields"), list) else None
+            fields = (
+                table.get("fields") if isinstance(table.get("fields"), list) else None
+            )
             rows = table.get("data") if isinstance(table.get("data"), list) else None
         else:
-            fields = payload.get("fields") if isinstance(payload.get("fields"), list) else None
-            rows = payload.get("data") if isinstance(payload.get("data"), list) else None
+            fields = (
+                payload.get("fields")
+                if isinstance(payload.get("fields"), list)
+                else None
+            )
+            rows = (
+                payload.get("data") if isinstance(payload.get("data"), list) else None
+            )
     else:
         raise MonthPayloadError(
             f"official response root must be an object or list, got {type(payload).__name__}"
@@ -508,7 +521,9 @@ def _parse_month_payload(
             f"official response has no rows inside requested range "
             f"{range_start}..{range_end} for {requested_month}"
         )
-    return pl.DataFrame(records, schema={name: OUTPUT_SCHEMA[name] for name in PRICE_COLUMNS}).sort("date")
+    return pl.DataFrame(
+        records, schema={name: OUTPUT_SCHEMA[name] for name in PRICE_COLUMNS}
+    ).sort("date")
 
 
 def _attach_provenance(
@@ -541,13 +556,17 @@ def _atomic_write_bytes(path: Path, content: bytes) -> None:
 
 
 def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
-    encoded = (json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    encoded = (
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
     _atomic_write_bytes(path, encoded)
 
 
 def _write_parquet_atomic(path: Path, frame: pl.DataFrame) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(dir=path.parent, suffix=".parquet", delete=False) as handle:
+    with tempfile.NamedTemporaryFile(
+        dir=path.parent, suffix=".parquet", delete=False
+    ) as handle:
         temporary = Path(handle.name)
     try:
         frame.write_parquet(temporary, compression="snappy", statistics=True)
@@ -566,6 +585,46 @@ def _file_receipt(path: Path) -> dict[str, Any]:
         "size": int(path.stat().st_size),
         "sha256": digest.hexdigest(),
     }
+
+
+def _summary_still_certifies_canonical(
+    summary: dict[str, Any], canonical_path: Path
+) -> bool:
+    """Return whether an existing success summary still certifies its parquet.
+
+    A failed refresh attempt is operational evidence, but it must not mutate the
+    acceptance receipt of the last atomically promoted canonical dataset. The
+    caller records every attempt separately and preserves this summary only
+    after re-verifying the exact canonical bytes.
+    """
+
+    if (
+        int(summary.get("schema_version", -1)) != SUMMARY_SCHEMA_VERSION
+        or summary.get("dataset") != DATASET_NAME
+        or summary.get("coverage_complete") is not True
+        or summary.get("baseline_established") is not True
+        or summary.get("replacement_promoted") is not True
+        or int(summary.get("unresolved_month_count", -1)) != 0
+        or int(summary.get("failed_count", -1)) != 0
+        or not canonical_path.is_file()
+    ):
+        return False
+    receipt = summary.get("output_receipt")
+    if not isinstance(receipt, dict):
+        return False
+    try:
+        expected_size = int(receipt.get("size", -1))
+    except (TypeError, ValueError):
+        return False
+    expected_sha256 = str(receipt.get("sha256") or "").lower()
+    receipt_path = Path(str(receipt.get("path") or ""))
+    if (
+        receipt_path.name != canonical_path.name
+        or expected_size != canonical_path.stat().st_size
+        or not re.fullmatch(r"[0-9a-f]{64}", expected_sha256)
+    ):
+        return False
+    return _file_receipt(canonical_path)["sha256"] == expected_sha256
 
 
 def _response_audit(response: requests.Response, attempts: int) -> dict[str, Any]:
@@ -646,12 +705,11 @@ def _download_month(
 
     failure_raw: Path | None = None
     if response is not None and not bool(args.skip_raw):
-        digest = str(audit.get("body_sha256") or hashlib.sha256(response.content).hexdigest())
+        digest = str(
+            audit.get("body_sha256") or hashlib.sha256(response.content).hexdigest()
+        )
         failure_raw = (
-            output_dir
-            / "raw_failures"
-            / DATASET_NAME
-            / f"{month}.{digest[:16]}.json"
+            output_dir / "raw_failures" / DATASET_NAME / f"{month}.{digest[:16]}.json"
         )
         _atomic_write_bytes(failure_raw, bytes(response.content))
     return MonthResult(
@@ -718,6 +776,42 @@ def _load_journal_latest(path: Path) -> dict[str, dict[str, Any]]:
             continue
         latest[month] = payload
     return latest
+
+
+def _load_journal_latest_data(path: Path) -> dict[str, dict[str, Any]]:
+    """Load the newest accepted data receipt per month after the last reset."""
+
+    latest_data: dict[str, dict[str, Any]] = {}
+    if not path.exists():
+        return latest_data
+    raw_text = path.read_text(encoding="utf-8")
+    lines = raw_text.splitlines()
+    for index, line in enumerate(lines):
+        if not line.strip():
+            continue
+        try:
+            payload = json.loads(line)
+        except (json.JSONDecodeError, TypeError) as exc:
+            if index == len(lines) - 1 and not raw_text.endswith("\n"):
+                continue
+            raise ValueError(
+                f"corrupt non-terminal JSONL journal record {index + 1}: {path}"
+            ) from exc
+        if not isinstance(payload, dict):
+            continue
+        if payload.get("dataset") != DATASET_NAME:
+            continue
+        if payload.get("cache_key") != _resume_cache_key():
+            continue
+        if int(payload.get("schema_version", -1)) != JOURNAL_SCHEMA_VERSION:
+            continue
+        if payload.get("status") == "reset":
+            latest_data.clear()
+            continue
+        month = str(payload.get("month", ""))
+        if payload.get("status") == "data" and re.fullmatch(r"\d{4}-\d{2}", month):
+            latest_data[month] = payload
+    return latest_data
 
 
 def _event_for_result(
@@ -790,10 +884,14 @@ def _append_reset_event(path: Path) -> None:
     )
 
 
-def _validate_output_frame(frame: pl.DataFrame, *, path: Path | None = None) -> pl.DataFrame:
+def _validate_output_frame(
+    frame: pl.DataFrame, *, path: Path | None = None
+) -> pl.DataFrame:
     missing = [column for column in OUTPUT_COLUMNS if column not in frame.columns]
     if missing:
-        raise ValueError(f"{path or DATASET_NAME} is missing required columns: {missing}")
+        raise ValueError(
+            f"{path or DATASET_NAME} is missing required columns: {missing}"
+        )
     normalized = frame.select(
         [
             pl.col("date").cast(pl.Date, strict=False),
@@ -803,12 +901,14 @@ def _validate_output_frame(frame: pl.DataFrame, *, path: Path | None = None) -> 
             ],
             *[
                 pl.col(column).cast(pl.Utf8, strict=False).alias(column)
-                for column in OUTPUT_COLUMNS[len(PRICE_COLUMNS):]
+                for column in OUTPUT_COLUMNS[len(PRICE_COLUMNS) :]
             ],
         ]
     ).drop_nulls(list(PRICE_COLUMNS))
     if normalized.height != frame.height:
-        raise ValueError(f"{path or DATASET_NAME} contains null or unparseable required values")
+        raise ValueError(
+            f"{path or DATASET_NAME} contains null or unparseable required values"
+        )
     if normalized.get_column("date").n_unique() != normalized.height:
         raise ValueError(f"{path or DATASET_NAME} contains duplicate dates")
     invalid = normalized.filter(
@@ -842,7 +942,9 @@ def _validate_output_frame(frame: pl.DataFrame, *, path: Path | None = None) -> 
         | (pl.col("_url").str.len_chars() == 0)
     )
     if not invalid.is_empty():
-        raise ValueError(f"{path or DATASET_NAME} contains invalid OHLC/provenance rows")
+        raise ValueError(
+            f"{path or DATASET_NAME} contains invalid OHLC/provenance rows"
+        )
     return normalized.sort("date")
 
 
@@ -852,10 +954,16 @@ def _read_output_frame(path: Path) -> pl.DataFrame:
     return _validate_output_frame(pl.read_parquet(path), path=path)
 
 
-def _overlay_frame(base: pl.DataFrame, incoming: pl.DataFrame, start: date, end: date) -> pl.DataFrame:
+def _overlay_frame(
+    base: pl.DataFrame, incoming: pl.DataFrame, start: date, end: date
+) -> pl.DataFrame:
     kept = base.filter(~pl.col("date").is_between(start, end, closed="both"))
     merged = pl.concat([kept, incoming], how="diagonal_relaxed")
-    return _validate_output_frame(merged) if not merged.is_empty() else _empty_output_frame()
+    return (
+        _validate_output_frame(merged)
+        if not merged.is_empty()
+        else _empty_output_frame()
+    )
 
 
 def _overlay_all(base: pl.DataFrame, incoming: pl.DataFrame) -> pl.DataFrame:
@@ -885,11 +993,9 @@ def _resolved_months(
         month_frame = frame.filter(
             pl.col("date").is_between(window_start, window_end, closed="both")
         )
-        if (
-            month_frame.height == expected_rows
-            and str(event.get("data_sha256", ""))
-            == _frame_data_sha256(month_frame)
-        ):
+        if month_frame.height == expected_rows and str(
+            event.get("data_sha256", "")
+        ) == _frame_data_sha256(month_frame):
             resolved.add(month)
     return resolved
 
@@ -944,7 +1050,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "TWSE MI_5MINS_HIST with durable per-month resume state."
         )
     )
-    parser.add_argument("--mode", choices=("rebuild", "repair", "daily"), default="daily")
+    parser.add_argument(
+        "--mode", choices=("rebuild", "repair", "daily"), default="daily"
+    )
     parser.add_argument("--output-dir", type=Path, default=Path("data_tw_public"))
     parser.add_argument("--start-date", default="earliest")
     parser.add_argument("--end-date", default="today")
@@ -956,9 +1064,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--daily-overlap-days", type=int, default=7)
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--skip-raw", action="store_true")
-    parser.add_argument("--verify-ssl", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--progress", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--max-months", type=int, default=None, help="Optional smoke-test cap; incomplete coverage remains nonzero.")
+    parser.add_argument(
+        "--verify-ssl", action=argparse.BooleanOptionalAction, default=True
+    )
+    parser.add_argument(
+        "--progress", action=argparse.BooleanOptionalAction, default=True
+    )
+    parser.add_argument(
+        "--max-months",
+        type=int,
+        default=None,
+        help="Optional smoke-test cap; incomplete coverage remains nonzero.",
+    )
     return parser.parse_args(argv)
 
 
@@ -1023,7 +1140,11 @@ def _run(args: argparse.Namespace) -> int:
             if args.mode in {"repair", "daily"}
             else _empty_output_frame()
         )
-        partial = _read_output_frame(partial_path) if bool(args.resume) else _empty_output_frame()
+        partial = (
+            _read_output_frame(partial_path)
+            if bool(args.resume)
+            else _empty_output_frame()
+        )
         working = _overlay_all(canonical, partial)
 
         forced_refresh = (
@@ -1033,7 +1154,11 @@ def _run(args: argparse.Namespace) -> int:
         )
         resolved = _resolved_months(months, latest, working, start, end)
         resumed_before = len(resolved - forced_refresh)
-        unresolved = [month for month in months if month not in resolved and month not in forced_refresh]
+        unresolved = [
+            month
+            for month in months
+            if month not in resolved and month not in forced_refresh
+        ]
 
         if bool(args.resume):
             for month in unresolved:
@@ -1057,7 +1182,9 @@ def _run(args: argparse.Namespace) -> int:
 
         resolved = _resolved_months(months, latest, working, start, end)
         requested_network = [
-            month for month in months if month not in resolved or month in forced_refresh
+            month
+            for month in months
+            if month not in resolved or month in forced_refresh
         ]
         if args.max_months is not None:
             requested_network = requested_network[: max(0, int(args.max_months))]
@@ -1073,7 +1200,9 @@ def _run(args: argparse.Namespace) -> int:
             )
 
         with ThreadPoolExecutor(max_workers=max(1, int(args.workers))) as executor:
-            futures = {executor.submit(worker, month): month for month in requested_network}
+            futures = {
+                executor.submit(worker, month): month for month in requested_network
+            }
             progress = tqdm(
                 total=len(futures),
                 desc="twse_taiex_ohlc:months",
@@ -1084,7 +1213,9 @@ def _run(args: argparse.Namespace) -> int:
                 for future in as_completed(futures):
                     result = future.result()
                     if result.error is None:
-                        window_start, window_end = _month_window(result.month, start, end)
+                        window_start, window_end = _month_window(
+                            result.month, start, end
+                        )
                         working = _overlay_frame(
                             working,
                             result.frame,
@@ -1185,8 +1316,7 @@ def _run(args: argparse.Namespace) -> int:
         "network_requested_months": requested_network,
         "network_requested_count": len(requested_network),
         "network_succeeded_count": sum(
-            latest.get(month, {}).get("status") == "data"
-            for month in requested_network
+            latest.get(month, {}).get("status") == "data" for month in requested_network
         ),
         "resumed_month_count": resumed_before,
         "raw_resumed_month_count": raw_resumed,
@@ -1206,7 +1336,56 @@ def _run(args: argparse.Namespace) -> int:
         "rate_limit_basis": provider_rate_limit("tw_public").basis,
         "rate_limit_source": provider_rate_limit("tw_public").source_url,
     }
-    _atomic_write_json(summary_path, summary)
+    attempt_summary = dict(summary)
+    recovered_from_journal = False
+    if not coverage_complete and start is not None and end is not None:
+        try:
+            canonical = _read_output_frame(canonical_path)
+            accepted_events = _load_journal_latest_data(journal_path)
+            accepted_months = _resolved_months(
+                months,
+                accepted_events,
+                canonical,
+                start,
+                end,
+            )
+            recovered_from_journal = len(accepted_months) == len(months)
+        except (OSError, TypeError, ValueError):
+            recovered_from_journal = False
+        if recovered_from_journal:
+            receipt = _file_receipt(canonical_path)
+            receipt["path"] = canonical_path.name
+            latest_refresh_failures = dict(failed_months)
+            summary.update(
+                {
+                    "coverage_complete": True,
+                    "baseline_established": True,
+                    "replacement_promoted": True,
+                    "unresolved_months": [],
+                    "unresolved_month_count": 0,
+                    "failed_months": {},
+                    "failed_month_count": 0,
+                    "failed_count": 0,
+                    "fatal_error": None,
+                    "output_rows": int(canonical.height),
+                    "output_receipt": receipt,
+                    "canonical_recovered_from_journal": True,
+                    "nonblocking_latest_refresh_failed_months": latest_refresh_failures,
+                }
+            )
+            coverage_complete = True
+            promoted = True
+    preserve_previous = bool(
+        not coverage_complete
+        and _summary_still_certifies_canonical(previous_summary, canonical_path)
+    )
+    attempt_summary["preserved_previous_canonical_summary"] = bool(
+        preserve_previous or recovered_from_journal
+    )
+    attempt_summary["canonical_recovered_from_journal"] = recovered_from_journal
+    _atomic_write_json(_latest_attempt_summary_path(output_dir), attempt_summary)
+    if not preserve_previous:
+        _atomic_write_json(summary_path, summary)
     if coverage_complete:
         print(
             f"[twse-taiex] coverage complete months={len(months)} "

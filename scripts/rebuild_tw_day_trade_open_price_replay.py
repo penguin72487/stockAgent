@@ -71,6 +71,8 @@ DEFAULT_TPEX_DAILY_OHLCV_PATH = Path(
     "/srv/stockagent-live/data_tw_public/tpex_daily_ohlcv.parquet"
 )
 DEFAULT_MINUTE_DATA_ROOTS = (
+    Path("artifacts/data_repair/tw_day_trade_minute_curve/maintenance/current/fetched_kbars"),
+    Path("artifacts/data_repair/tw_day_trade_minute_curve/kbars"),
     Path("data_tw_minute/shioaji_1m"),
     Path("data_tw_minute/research_dataset"),
 )
@@ -1890,6 +1892,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--allow-unpinned-market",
+        action="append",
+        default=[],
+        help=(
+            "Explicit add-mode migration exception: discover signals only for this "
+            "new market while every pre-existing date/mode remains pinned to "
+            "--source-ledger-dir. Repeatable."
+        ),
+    )
+    parser.add_argument(
         "--benchmark-history-source",
         type=Path,
         help=(
@@ -1989,6 +2001,15 @@ def build_parser() -> argparse.ArgumentParser:
             "already retained in today's live signal artifacts."
         ),
     )
+    parser.add_argument(
+        "--include-current-open-session",
+        action="store_true",
+        help=(
+            "Append Taipei today to the completed official calendar only for an "
+            "already-open session. Requires retained same-session signals/open "
+            "prices and exact current eligibility; the session remains open."
+        ),
+    )
     return parser
 
 
@@ -2050,9 +2071,42 @@ def main() -> None:
     for official_path in (twse_daily_ohlcv_path, tpex_daily_ohlcv_path):
         if not official_path.is_file():
             raise FileNotFoundError(official_path)
+    current = datetime.now(TAIPEI)
+    current_session_appended = False
+    calendar_end = end
+    if args.include_current_open_session:
+        today = current.date()
+        wall_time = current.timetz().replace(tzinfo=None)
+        if end != today or today < start:
+            raise ValueError(
+                "--include-current-open-session requires --end-date to equal Taipei today"
+            )
+        if today.weekday() >= 5 or not (time(9, 1) <= wall_time < time(13, 30)):
+            raise ValueError(
+                "--include-current-open-session is valid only during an open weekday session"
+            )
+        if not args.reuse_retained_signal_open:
+            raise ValueError(
+                "--include-current-open-session requires --reuse-retained-signal-open"
+            )
+        current_limit_path = (
+            args.price_limit_dir / f"{today.isoformat()}.parquet"
+        ).resolve()
+        if not current_limit_path.is_file():
+            raise FileNotFoundError(current_limit_path)
+        # The receipt-verified TAIEX calendar deliberately contains completed
+        # sessions only.  Validate that authority through the prior day first;
+        # the still-open current session is admitted separately below from its
+        # retained signal/open, price-limit, and exact eligibility evidence.
+        calendar_end = end - timedelta(days=1)
     official_sessions, official_calendar_sha256 = _validated_taiex_session_dates(
-        args.tw_public_dir.resolve(), start, end
+        args.tw_public_dir.resolve(), start, calendar_end
     )
+    if args.include_current_open_session:
+        today = current.date()
+        official_sessions = set(official_sessions)
+        official_sessions.add(today)
+        current_session_appended = True
     engine = TwDayTradeSimulationEngine(state_dir)
     source_signal_ids: dict[tuple[str, str], str] = {}
     source_ledger_provenance: dict[str, Any] | None = None
@@ -2068,11 +2122,33 @@ def main() -> None:
             for spec in specs
         }
         missing_signal_keys = sorted(expected_signal_keys - set(source_signal_ids))
-        if missing_signal_keys:
+        allowed_unpinned_markets = {
+            str(value).strip()
+            for value in args.allow_unpinned_market
+            if str(value).strip()
+        }
+        unknown_unpinned_markets = allowed_unpinned_markets - set(specs_by_market)
+        if unknown_unpinned_markets:
+            raise ValueError(
+                "--allow-unpinned-market names unknown modes: "
+                f"{sorted(unknown_unpinned_markets)}"
+            )
+        disallowed_missing = [
+            key for key in missing_signal_keys if key[1] not in allowed_unpinned_markets
+        ]
+        if disallowed_missing:
             raise ValueError(
                 "source ledger is missing replay signal identities: "
-                f"{missing_signal_keys[:20]}"
+                f"{disallowed_missing[:20]}"
             )
+        source_ledger_provenance = {
+            **(source_ledger_provenance or {}),
+            "allowed_unpinned_markets": sorted(allowed_unpinned_markets),
+            "discovered_signal_keys": len(missing_signal_keys),
+            "pinned_signal_keys": len(expected_signal_keys) - len(missing_signal_keys),
+        }
+    elif args.allow_unpinned_market:
+        raise ValueError("--allow-unpinned-market requires --source-ledger-dir")
     benchmark_state_provenance: dict[str, Any] | None = None
     if args.benchmark_state_source is not None:
         benchmark_state_path = args.benchmark_state_source.resolve()
@@ -2106,7 +2182,6 @@ def main() -> None:
         if benchmark_history_path is not None
         else None
     )
-    current = datetime.now(TAIPEI)
     paper_market_at_best = bool(args.paper_market_at_best)
     official_open_at_0901 = bool(specs) and all(
         spec.entry_fill_policy == ENTRY_FILL_POLICY_OFFICIAL_OPEN_AT_0901
@@ -2211,6 +2286,12 @@ def main() -> None:
             "session_count": len(official_sessions),
             "start_date": min(official_sessions).isoformat(),
             "end_date": max(official_sessions).isoformat(),
+            "current_open_session_appended": current_session_appended,
+            "current_open_session_source": (
+                "same_session_price_limit_plus_retained_signal_open_plus_exact_eligibility"
+                if current_session_appended
+                else None
+            ),
         },
         "skipped_sessions": [],
         "sessions": [],

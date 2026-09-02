@@ -156,7 +156,9 @@ def test_twse_mi_index_semantic_bumps_quarantine_only_affected_partials():
 
     legacy_twse = replace(
         twse,
-        url_template=twse.url_template.replace("https://wwwc.twse.com.tw/", "https://www.twse.com.tw/"),
+        url_template=twse.url_template.replace(
+            "https://wwwc.twse.com.tw/", "https://www.twse.com.tw/"
+        ),
     )
     assert key_at_version(legacy_twse, 5) == "74ab358560b05834"
     assert key_at_version(twse, 5) == "e4ab06eeb2dff19a"
@@ -209,7 +211,9 @@ def test_repair_fetches_only_missing_weekdays(tmp_path: Path, monkeypatch):
     assert state["checked_through"] == "2024-01-04"
 
 
-def test_rebuild_keeps_previous_parquet_when_any_date_fails(tmp_path: Path, monkeypatch):
+def test_rebuild_keeps_previous_parquet_when_any_date_fails(
+    tmp_path: Path, monkeypatch
+):
     spec = _historical_spec()
     output_path = tmp_path / f"{spec.name}.parquet"
     original = pl.DataFrame({"date": ["2024-01-02"], "value": ["production"]})
@@ -263,7 +267,9 @@ def test_rebuild_resume_retries_only_unresolved_dates(tmp_path: Path, monkeypatc
         return twpub.HistoricalDateResult(
             day=day,
             url=f"https://example.test/{day}",
-            frame=pl.DataFrame({"date": [day.isoformat()], "value": [f"first-{day.day}"]}),
+            frame=pl.DataFrame(
+                {"date": [day.isoformat()], "value": [f"first-{day.day}"]}
+            ),
         )
 
     monkeypatch.setattr(twpub, "_download_historical_date", first_download)
@@ -532,9 +538,7 @@ def test_rebuild_reparses_only_verified_failed_receipt_after_contract_bump(
         return twpub.HistoricalDateResult(
             day=day,
             url=f"https://example.test/{day:%Y%m%d}",
-            frame=pl.DataFrame(
-                {"date": [day.isoformat()], "value": ["network"]}
-            ),
+            frame=pl.DataFrame({"date": [day.isoformat()], "value": ["network"]}),
         )
 
     monkeypatch.setattr(twpub, "_download_historical_date", fake_download)
@@ -559,8 +563,7 @@ def test_rebuild_reparses_only_verified_failed_receipt_after_contract_bump(
     current_events = [
         json.loads(line)
         for line in old_cache.journal_path.read_text(encoding="utf-8").splitlines()
-        if json.loads(line).get("cache_key")
-        == twpub._historical_resume_cache_key(spec)
+        if json.loads(line).get("cache_key") == twpub._historical_resume_cache_key(spec)
     ]
     reparsed = [
         event
@@ -576,7 +579,9 @@ def test_rebuild_reparses_only_verified_failed_receipt_after_contract_bump(
         assert reparsed[0]["body_sha256"] == digest
 
 
-def test_rebuild_max_dates_keeps_partial_without_publishing(tmp_path: Path, monkeypatch):
+def test_rebuild_max_dates_keeps_partial_without_publishing(
+    tmp_path: Path, monkeypatch
+):
     spec = _historical_spec()
     output_path = tmp_path / f"{spec.name}.parquet"
     pl.DataFrame({"date": ["2024-01-02"], "value": ["production"]}).write_parquet(
@@ -648,7 +653,7 @@ def test_historical_journal_tolerates_only_a_torn_final_line(tmp_path: Path):
         "date": "2024-01-02",
         "status": "empty",
     }
-    path.write_text(json.dumps(valid) + "\n{" , encoding="utf-8")
+    path.write_text(json.dumps(valid) + "\n{", encoding="utf-8")
     latest = twpub._load_historical_journal_latest(path, spec, cache_key)
     assert latest[date(2024, 1, 2)]["status"] == "empty"
 
@@ -777,9 +782,15 @@ def test_repair_trusts_confirmed_historical_holidays(tmp_path: Path):
 
 
 def test_official_status_distinguishes_no_data_from_server_errors():
-    assert twpub._json_payload_status_error({"stat": "很抱歉，沒有符合條件的資料!"}) is None
+    assert (
+        twpub._json_payload_status_error({"stat": "很抱歉，沒有符合條件的資料!"})
+        is None
+    )
     assert twpub._json_payload_status_error({"stat": "OK"}) is None
-    assert twpub._json_payload_status_error({"stat": "系統忙碌，請稍後再試"}) == "系統忙碌，請稍後再試"
+    assert (
+        twpub._json_payload_status_error({"stat": "系統忙碌，請稍後再試"})
+        == "系統忙碌，請稍後再試"
+    )
 
 
 def test_historical_parser_requires_explicit_no_data_status_for_empty_payload():
@@ -964,7 +975,9 @@ def test_tpex_margin_gap_journals_immutable_receipt_and_resumes(
         for line in twpub._historical_journal_path(
             tmp_path,
             spec,
-        ).read_text(encoding="utf-8").splitlines()
+        )
+        .read_text(encoding="utf-8")
+        .splitlines()
     ]
     empty_event = next(event for event in events if event["status"] == "empty")
     assert empty_event["date"] == gap_day.isoformat()
@@ -1245,7 +1258,14 @@ def test_historical_parser_rejects_wrong_selected_table_date_even_if_top_level_m
         "tables": [
             {
                 "title": "094年02月09日 每日收盤行情(全部)",
-                "fields": ["證券代號", "成交股數", "開盤價", "最高價", "最低價", "收盤價"],
+                "fields": [
+                    "證券代號",
+                    "成交股數",
+                    "開盤價",
+                    "最高價",
+                    "最低價",
+                    "收盤價",
+                ],
                 "data": [["2330", "1000", "50", "51", "49", "50"]],
             }
         ],
@@ -1486,7 +1506,9 @@ def test_historical_date_does_not_retry_valid_structured_empty_response(
 
     class FakeLimiter:
         def defer(self, seconds: float):
-            raise AssertionError("valid structured empty response must not trigger cooldown")
+            raise AssertionError(
+                "valid structured empty response must not trigger cooldown"
+            )
 
     calls = 0
 
@@ -1981,6 +2003,67 @@ def test_twse_daily_ohlcv_falls_back_to_exchange_report_after_primary_status_err
     assert result.url == requested_urls[1]
     assert result.response_attempts == 2
     assert responses == []
+
+
+def test_twse_transport_failure_uses_same_route_on_official_www_host(
+    tmp_path: Path,
+    monkeypatch,
+):
+    class FakeResponse:
+        status_code = 200
+        headers = {"Content-Type": "application/json"}
+
+        def __init__(self, content: bytes):
+            self.content = content
+
+    current_data = json.dumps(
+        {
+            "stat": "OK",
+            "date": "20260902",
+            "tables": [
+                {
+                    "title": "115年09月02日 每日收盤行情(全部)",
+                    "fields": [
+                        "證券代號",
+                        "成交股數",
+                        "開盤價",
+                        "最高價",
+                        "最低價",
+                        "收盤價",
+                    ],
+                    "data": [["2330", "1000", "100", "101", "99", "100"]],
+                }
+            ],
+        },
+        ensure_ascii=False,
+    ).encode()
+    requested_urls: list[str] = []
+
+    def fake_get(url: str, **_kwargs):
+        requested_urls.append(url)
+        if "wwwc.twse.com.tw" in url:
+            raise twpub.requests.ConnectionError("primary host unavailable")
+        return FakeResponse(current_data)
+
+    monkeypatch.setattr(twpub, "_http_get", fake_get)
+    monkeypatch.setattr(twpub, "_discard_http_session", lambda: None)
+    args = _historical_args("daily", end_date="2026-09-02")
+    args.retries = 0
+    spec = twpub.DEFAULT_DATASETS["twse_daily_ohlcv"]
+
+    result = twpub._download_historical_date(
+        spec,
+        date(2026, 9, 2),
+        args,
+        tmp_path,
+    )
+
+    assert result.error is None
+    assert result.frame.height == 1
+    assert len(requested_urls) == 2
+    assert requested_urls[0].startswith("https://wwwc.twse.com.tw/rwd/")
+    assert requested_urls[1].startswith("https://www.twse.com.tw/rwd/")
+    assert result.url == requested_urls[1]
 
 
 def test_http_retry_applies_provider_global_cooldown(monkeypatch):
@@ -2501,7 +2584,10 @@ def test_model_useful_group_is_curated_and_has_unique_dataset_names():
     assert len(specs) == 117
     assert len(names) == len(set(names))
     assert all("model_useful" in spec.tags for spec in specs)
-    assert not any("warrant" in spec.name or "bond" in spec.name or "gold" in spec.name for spec in specs)
+    assert not any(
+        "warrant" in spec.name or "bond" in spec.name or "gold" in spec.name
+        for spec in specs
+    )
 
 
 def test_merge_frames_replaces_existing_dates():
@@ -2586,21 +2672,39 @@ def test_parse_twse_delisted_company_payload():
 
     frame = twpub._twse_delisted_frame(payload)
 
-    assert frame.to_dicts() == [{
-        "date": "2025-07-24",
-        "market": "twse",
-        "symbol": "2888",
-        "company_name": "新光金",
-        "delisting_reason": "",
-    }]
+    assert frame.to_dicts() == [
+        {
+            "date": "2025-07-24",
+            "market": "twse",
+            "symbol": "2888",
+            "company_name": "新光金",
+            "delisting_reason": "",
+        }
+    ]
 
 
 def test_parse_tpex_delisted_company_payload():
     payload = {
-        "tables": [{
-            "fields": ["股票代號", "公司名稱", "終止上櫃日期", "終止上櫃原因", "公司資料網址"],
-            "data": [["6747", "亨泰光學股份有限公司", "114-12-04", "業務規則第15條之18", "https://example.test"]],
-        }],
+        "tables": [
+            {
+                "fields": [
+                    "股票代號",
+                    "公司名稱",
+                    "終止上櫃日期",
+                    "終止上櫃原因",
+                    "公司資料網址",
+                ],
+                "data": [
+                    [
+                        "6747",
+                        "亨泰光學股份有限公司",
+                        "114-12-04",
+                        "業務規則第15條之18",
+                        "https://example.test",
+                    ]
+                ],
+            }
+        ],
         "stat": "ok",
     }
 
@@ -2624,7 +2728,9 @@ def test_parse_tpex_legacy_daily_quotes_with_split_close_cells():
 
     frame = twpub._parse_tpex_daily_quotes_html(raw_html, date(2006, 12, 29))
 
-    assert frame.select(["date", "代號", "收盤", "漲跌", "開盤", "最高", "最低", "成交股數"]).to_dicts() == [
+    assert frame.select(
+        ["date", "代號", "收盤", "漲跌", "開盤", "最高", "最低", "成交股數"]
+    ).to_dicts() == [
         {
             "date": "2006-12-29",
             "代號": "4205",
@@ -2774,7 +2880,9 @@ def test_parse_tpex_2003_oracle_report_with_unclosed_spacer_cells():
 
     frame = twpub._parse_tpex_daily_quotes_html(raw_html, date(2003, 8, 1))
 
-    assert frame.select(["代號", "收盤", "漲跌", "開盤", "最高", "最低", "成交股數"]).to_dicts() == [
+    assert frame.select(
+        ["代號", "收盤", "漲跌", "開盤", "最高", "最低", "成交股數"]
+    ).to_dicts() == [
         {
             "代號": "3087",
             "收盤": "13.85",
@@ -2839,9 +2947,7 @@ def test_tpex_daily_lossy_receipt_marks_plausible_cp950_repaired_name_unusable()
 def test_tpex_daily_archive_rejects_lossy_numeric_cell():
     spec = twpub.DEFAULT_DATASETS["tpex_daily_ohlcv"]
     raw = (
-        "<html>資料日期：920801<tr><td>3087</td><td>翔準</td><td>13".encode(
-            "cp950"
-        )
+        "<html>資料日期：920801<tr><td>3087</td><td>翔準</td><td>13".encode("cp950")
         + b"\xff"
         + ".85</td><td>+0.00</td><td>14.00</td><td>14.30</td>"
         "<td>13.85</td><td>14.03</td><td>1,178,000</td><td>16,521,950</td>"
@@ -3038,9 +3144,7 @@ def test_tpex_daily_archive_rejects_lossy_change_cell():
         + b"<td>\xff</td>"
         + "<td>14.00</td><td>14.30</td><td>13.85</td><td>14.03</td>"
         "<td>1,178,000</td><td>16,521,950</td><td>472</td><td>13.85</td>"
-        "<td>13.90</td><td></td><td></td><td></td><td></td></tr></html>".encode(
-            "cp950"
-        )
+        "<td>13.90</td><td></td><td></td><td></td><td></td></tr></html>".encode("cp950")
     )
 
     with pytest.raises(twpub.HistoricalResponseError, match="lossy decode damage"):
@@ -3212,7 +3316,11 @@ def test_tpex_all_zero_ohlc_without_average_receipt_fails_closed(
 
 
 def test_tpex_historical_request_routes_each_official_archive_generation():
-    spec = next(item for item in twpub.HISTORICAL_DAILY_DATASETS if item.name == "tpex_daily_ohlcv")
+    spec = next(
+        item
+        for item in twpub.HISTORICAL_DAILY_DATASETS
+        if item.name == "tpex_daily_ohlcv"
+    )
 
     archive_url, archive_kind = twpub._tpex_historical_request(date(2006, 12, 29), spec)
     legacy_url, legacy_kind = twpub._tpex_historical_request(date(2007, 7, 1), spec)
@@ -3430,9 +3538,7 @@ def test_parse_tpex_margin_archive_maps_2004_sixteen_cell_layout():
         "<html>上櫃股票融資融券餘額"
         "<tr><td>單位：張</td>"
         "<td ALIGN=RIGHT VALIGN=CENTER COLSPAN='14'>940610</td></tr>"
-        "<tr>"
-        + "".join(f"<td>{value}</td>" for value in cells)
-        + "</tr></html>"
+        "<tr>" + "".join(f"<td>{value}</td>" for value in cells) + "</tr></html>"
     )
 
     frame, suffix = twpub._parse_historical_response_content(
@@ -4332,9 +4438,7 @@ def test_daily_close_publication_gate_accepts_current_exchange_ohlcv(
         coverage_end=requested,
     )
     for name in ("twse_daily_ohlcv", "tpex_daily_ohlcv"):
-        pl.DataFrame({"date": [requested]}).write_parquet(
-            tmp_path / f"{name}.parquet"
-        )
+        pl.DataFrame({"date": [requested]}).write_parquet(tmp_path / f"{name}.parquet")
     specs = [
         twpub.DEFAULT_DATASETS["twse_daily_ohlcv"],
         twpub.DEFAULT_DATASETS["tpex_daily_ohlcv"],
@@ -4368,7 +4472,9 @@ def test_daily_download_skips_superseded_tdcc_endpoint(monkeypatch, tmp_path: Pa
         "download_dataset",
         lambda spec, args, output_dir: (
             requested.append(spec.name)
-            or twpub.DownloadResult(spec.name, "ok", 1, str(output_dir / f"{spec.name}.parquet"))
+            or twpub.DownloadResult(
+                spec.name, "ok", 1, str(output_dir / f"{spec.name}.parquet")
+            )
         ),
     )
 

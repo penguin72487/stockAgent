@@ -12,9 +12,11 @@ import pytest
 
 from scripts.maintain_tw_day_trade_minute_curves import (
     _completed_scope,
+    _inspect_strategy_price_provenance,
     _validate_benchmarks,
 )
 from scripts.rebuild_tw_day_trade_minute_curves import (
+    DEFAULT_LOCAL_MINUTE_ROOTS,
     MinutePriceStore,
     _ticks_to_minute_frame,
     fetch_missing_kbars,
@@ -23,6 +25,12 @@ from scripts.rebuild_tw_day_trade_minute_curves import (
     required_symbol_dates,
     validate_existing_strategy_marks,
 )
+
+
+def test_minute_repair_checks_maintenance_cache_before_api_fallback() -> None:
+    assert DEFAULT_LOCAL_MINUTE_ROOTS[0] == Path(
+        "artifacts/data_repair/tw_day_trade_minute_curve/maintenance/current/fetched_kbars"
+    )
 from stockagent.live.tw_day_trade_simulation import position_net_liquidation_pnl
 
 
@@ -107,9 +115,7 @@ def _write_maintenance_scope(
             ),
             "engine_status": "active" if current_open_positions else "terminal",
         }
-    (root / "state.json").write_text(
-        json.dumps({"modes": modes}), encoding="utf-8"
-    )
+    (root / "state.json").write_text(json.dumps({"modes": modes}), encoding="utf-8")
 
 
 def test_minute_curve_maintenance_defers_open_current_session(tmp_path: Path) -> None:
@@ -440,6 +446,231 @@ def test_strategy_minute_rebuild_preserves_endpoints_and_discloses_carry(
     assert rows[2]["last_trade_carried_position_count"] == 1
     assert rows[2]["valuation_stale"] is True
     assert stats["generated_rows"] == 270
+
+
+def test_strategy_minute_rebuild_uses_exit_ledger_for_missing_mark(
+    tmp_path: Path,
+) -> None:
+    kbar_root = tmp_path / "kbars"
+    _minute_file(
+        kbar_root,
+        "2330",
+        [(datetime(2026, 8, 13, 9, 2), 102.0)],
+    )
+    store = MinutePriceStore(kbar_root, tmp_path / "ticks")
+    opening = {
+        "minute": "2026-08-13T09:01+08:00",
+        "recorded_at": "2026-08-13T09:01:00+08:00",
+        "session_date": "2026-08-13",
+        "market": "tw_day_trade",
+        "initial_capital_twd": 10_000_000.0,
+        "cumulative_realized_net_pnl_twd": 50.0,
+        "open_net_liquidation_pnl_twd": -100.0,
+        "total_equity_twd": 9_999_950.0,
+        "open_position_count": 1,
+        "stale_position_count": 0,
+        "valuation_stale": False,
+    }
+    closing = {
+        **opening,
+        "minute": "2026-08-13T13:30+08:00",
+        "recorded_at": "2026-08-13T13:30:00+08:00",
+        "cumulative_realized_net_pnl_twd": 450.0,
+        "open_net_liquidation_pnl_twd": 0.0,
+        "total_equity_twd": 10_000_450.0,
+        "open_position_count": 0,
+    }
+    exit_fill = {
+        "session_date": "2026-08-13",
+        "market": "tw_day_trade",
+        "position_id": "tw_day_trade:2026-08-13:2330",
+        "purpose": "stop_loss",
+        "fill_at": "2026-08-13T09:02:00+08:00",
+        "quantity": 1_000,
+        "entry_fee_allocated_twd": 30.0,
+        "net_pnl_twd": 400.0,
+    }
+
+    rows, stats = rebuild_strategy_marks(
+        [opening, closing],
+        {"2026-08-13": {"tw_day_trade": [_position()]}},
+        store,
+        start=date(2026, 8, 13),
+        end=date(2026, 8, 13),
+        fill_rows=[exit_fill],
+    )
+
+    minute_0902 = rows[1]
+    assert minute_0902["cumulative_realized_net_pnl_twd"] == 450.0
+    assert minute_0902["open_net_liquidation_pnl_twd"] == 0.0
+    assert minute_0902["open_position_count"] == 0
+    assert minute_0902["total_equity_twd"] == 10_000_450.0
+    assert rows[-1] == closing
+    assert stats["inserted_missing_rows"] == 268
+    assert stats["preserved_observed_rows"] == 2
+
+
+def test_strategy_minute_rebuild_keeps_latest_observed_duplicate(
+    tmp_path: Path,
+) -> None:
+    kbar_root = tmp_path / "kbars"
+    _minute_file(
+        kbar_root,
+        "2330",
+        [(datetime(2026, 8, 13, 9, 2), 102.0)],
+    )
+    store = MinutePriceStore(kbar_root, tmp_path / "ticks")
+    base = {
+        "session_date": "2026-08-13",
+        "market": "tw_day_trade",
+        "initial_capital_twd": 10_000_000.0,
+        "cumulative_realized_net_pnl_twd": 0.0,
+        "open_position_count": 1,
+    }
+    opening = {
+        **base,
+        "minute": "2026-08-13T09:01+08:00",
+        "recorded_at": "2026-08-13T09:01:00+08:00",
+    }
+    older = {
+        **base,
+        "minute": "2026-08-13T09:02+08:00",
+        "recorded_at": "2026-08-13T09:02:01+08:00",
+        "total_equity_twd": 9_999_000.0,
+    }
+    latest = {
+        **older,
+        "recorded_at": "2026-08-13T09:02:59+08:00",
+        "total_equity_twd": 10_001_000.0,
+    }
+    closing = {
+        **base,
+        "minute": "2026-08-13T13:30+08:00",
+        "recorded_at": "2026-08-13T13:30:00+08:00",
+        "open_position_count": 0,
+    }
+
+    rows, stats = rebuild_strategy_marks(
+        [opening, older, latest, closing],
+        {"2026-08-13": {"tw_day_trade": [_position()]}},
+        store,
+        start=date(2026, 8, 13),
+        end=date(2026, 8, 13),
+    )
+
+    assert len(rows) == 270
+    assert rows[1] == latest
+    assert stats["duplicate_rows_removed"] == 1
+
+
+def test_strategy_minute_repair_replaces_only_unverified_interior_marks(
+    tmp_path: Path,
+) -> None:
+    kbar_root = tmp_path / "kbars"
+    _minute_file(
+        kbar_root,
+        "2330",
+        [
+            (datetime(2026, 8, 13, 9, 2), 102.0),
+            (datetime(2026, 8, 13, 9, 3), 103.0),
+        ],
+    )
+    store = MinutePriceStore(kbar_root, tmp_path / "ticks")
+    base = {
+        "session_date": "2026-08-13",
+        "market": "tw_day_trade",
+        "initial_capital_twd": 10_000_000.0,
+        "cumulative_realized_net_pnl_twd": 0.0,
+        "open_position_count": 1,
+    }
+    opening = {
+        **base,
+        "minute": "2026-08-13T09:01+08:00",
+        "recorded_at": "2026-08-13T09:01:00+08:00",
+    }
+    unverified = {
+        **base,
+        "minute": "2026-08-13T09:02+08:00",
+        "recorded_at": "2026-08-13T09:02:00+08:00",
+        "open_position_count": 0,
+        "total_equity_twd": 1.0,
+    }
+    audited = {
+        **base,
+        "minute": "2026-08-13T09:03+08:00",
+        "recorded_at": "2026-08-13T09:03:00+08:00",
+        "total_equity_twd": 10_000_123.0,
+        "historical_minute_replay": True,
+        "minute_valuation_contract": "right_labelled_historical_last_trade_mark_v1",
+        "valuation_source": "shioaji_historical_1m_close_with_last_trade_carry",
+        "fresh_trade_notional_coverage_ratio": 1.0,
+        "fresh_trade_position_count": 1,
+        "last_trade_carried_position_count": 0,
+        "missing_price_position_count": 0,
+        "valuation_executable": False,
+    }
+    closing = {
+        **base,
+        "minute": "2026-08-13T13:30+08:00",
+        "recorded_at": "2026-08-13T13:30:00+08:00",
+        "open_position_count": 0,
+    }
+
+    rows, stats = rebuild_strategy_marks(
+        [opening, unverified, audited, closing],
+        {"2026-08-13": {"tw_day_trade": [_position()]}},
+        store,
+        start=date(2026, 8, 13),
+        end=date(2026, 8, 13),
+        repair_unverified_existing=True,
+    )
+
+    assert rows[0] == opening
+    assert rows[1]["open_position_count"] == 1
+    assert rows[1]["total_equity_twd"] != 1.0
+    assert rows[1]["historical_minute_replay"] is True
+    assert rows[2] == audited
+    assert rows[-1] == closing
+    assert stats["replaced_unverified_rows"] == 1
+    assert stats["inserted_missing_rows"] == 266
+
+
+def test_price_provenance_inspection_rejects_timestamp_only_minute(
+    tmp_path: Path,
+) -> None:
+    base = datetime(2026, 8, 13, 9, 1, tzinfo=TAIPEI)
+    rows = []
+    for offset in range(270):
+        row = {
+            "session_date": "2026-08-13",
+            "market": "tw_day_trade",
+            "minute": (base + timedelta(minutes=offset)).isoformat(
+                timespec="minutes"
+            ),
+            "historical_minute_replay": True,
+            "minute_valuation_contract": "right_labelled_historical_last_trade_mark_v1",
+            "valuation_source": "shioaji_historical_1m_close_with_last_trade_carry",
+            "fresh_trade_notional_coverage_ratio": 1.0,
+            "fresh_trade_position_count": 1,
+            "last_trade_carried_position_count": 0,
+            "missing_price_position_count": 0,
+            "valuation_executable": False,
+        }
+        rows.append(row)
+    rows[10].pop("valuation_source")
+    (tmp_path / "marks.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+    )
+
+    result = _inspect_strategy_price_provenance(
+        tmp_path,
+        completed_session_dates=["2026-08-13"],
+        expected_markets={"tw_day_trade"},
+    )
+
+    assert result["expected_interior_rows"] == 268
+    assert result["audited_interior_rows"] == 267
+    assert result["unverified_interior_rows"] == 1
 
 
 def test_stock_benchmark_minute_rebuild_preserves_tx_marks(tmp_path: Path) -> None:

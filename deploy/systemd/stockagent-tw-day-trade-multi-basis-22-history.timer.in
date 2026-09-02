@@ -1,0 +1,17 @@
+[Unit]
+Description=Retry Multi-Basis 22 history deployment on weekday post-close windows
+
+[Timer]
+# Week-based calendar points; the reconciler becomes a no-op after success.
+OnCalendar=Mon..Fri *-*-* 14:05:00 Asia/Taipei
+OnCalendar=Mon..Fri *-*-* 16:00:00 Asia/Taipei
+OnCalendar=Mon..Fri *-*-* 18:15:00 Asia/Taipei
+OnCalendar=Mon..Fri *-*-* 20:15:00 Asia/Taipei
+OnCalendar=Mon..Fri *-*-* 22:00:00 Asia/Taipei
+AccuracySec=1s
+RandomizedDelaySec=0
+Persistent=true
+Unit=stockagent-tw-day-trade-multi-basis-22-history.service
+
+[Install]
+WantedBy=timers.target

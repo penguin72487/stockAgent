@@ -142,6 +142,33 @@ def _parse_timestamp(value: object) -> datetime | None:
     return parsed.astimezone(TAIPEI)
 
 
+def _event_temporal_key(
+    event: Mapping[str, Any], *, sequence: int = 0
+) -> tuple[str, str, int]:
+    """Order ledger events by market time, not append position.
+
+    Historical repairs are intentionally appended to the durable ledger instead
+    of rewriting already committed live bytes. Their physical append position
+    can therefore be newer while their market timestamp is older. Consumers
+    recovering the latest signal must use the causal event clock or a valid
+    session date; file sequence is only a deterministic equal-time tie breaker.
+    """
+
+    recorded_at = _parse_timestamp(event.get("recorded_at"))
+    if recorded_at is not None:
+        return (
+            recorded_at.date().isoformat(),
+            recorded_at.isoformat(timespec="microseconds"),
+            int(sequence),
+        )
+    session_date = str(event.get("session_date") or "")[:10]
+    try:
+        date.fromisoformat(session_date)
+    except ValueError:
+        session_date = "0000-00-00"
+    return (session_date, f"{session_date}T00:00:00+08:00", int(sequence))
+
+
 def _timestamp_is_for_session(value: object, session_date: str) -> bool:
     """Return whether a lifecycle marker belongs to the active session.
 
@@ -1019,10 +1046,10 @@ class TwDayTradeSimulationEngine:
 
         if not self.events_path.is_file():
             return
-        latest_started: dict[str, tuple[str, str]] = {}
-        latest_registered: dict[str, tuple[str, str]] = {}
+        latest_started: dict[str, tuple[tuple[str, str, int], str, str]] = {}
+        latest_registered: dict[str, tuple[tuple[str, str, int], str, str]] = {}
         with self.events_path.open("r", encoding="utf-8") as handle:
-            for line in handle:
+            for sequence, line in enumerate(handle):
                 try:
                     event = json.loads(line)
                 except (TypeError, ValueError):
@@ -1040,15 +1067,28 @@ class TwDayTradeSimulationEngine:
                         if recorded_at is not None
                         else ""
                     )
+                ordered = (
+                    _event_temporal_key(event, sequence=sequence),
+                    signal_id,
+                    session_date,
+                )
                 if event_name == "signal_commit_started":
-                    latest_started[market] = (signal_id, session_date)
+                    if ordered > latest_started.get(
+                        market, (("0000-00-00", "", -1), "", "")
+                    ):
+                        latest_started[market] = ordered
                 elif event_name == "signal_registered":
-                    latest_registered[market] = (signal_id, session_date)
+                    if ordered > latest_registered.get(
+                        market, (("0000-00-00", "", -1), "", "")
+                    ):
+                        latest_registered[market] = ordered
 
         markets = set(latest_started) | set(latest_registered)
         for market in markets:
-            started = latest_started.get(market)
-            registered = latest_registered.get(market)
+            raw_started = latest_started.get(market)
+            raw_registered = latest_registered.get(market)
+            started = raw_started[1:] if raw_started is not None else None
+            registered = raw_registered[1:] if raw_registered is not None else None
             divergence_kind: str | None = None
             signal_id = ""
             session_date = ""
@@ -1215,10 +1255,12 @@ class TwDayTradeSimulationEngine:
 
         if not self.events_path.is_file():
             return
-        latest_registered: dict[str, str] = {}
-        latest_event: dict[str, tuple[str, str, str | None]] = {}
+        latest_registered: dict[str, tuple[tuple[str, str, int], str]] = {}
+        latest_event: dict[
+            str, tuple[tuple[str, str, int], str, str, str | None]
+        ] = {}
         with self.events_path.open("r", encoding="utf-8") as handle:
-            for line in handle:
+            for sequence, line in enumerate(handle):
                 try:
                     event = json.loads(line)
                 except (TypeError, ValueError):
@@ -1233,17 +1275,27 @@ class TwDayTradeSimulationEngine:
                     if event.get("reason") is not None
                     else None
                 )
+                event_key = _event_temporal_key(event, sequence=sequence)
                 if event_name == "signal_registered" and signal_id:
-                    latest_registered[market] = signal_id
+                    registered = (event_key, signal_id)
+                    if registered > latest_registered.get(
+                        market, (("0000-00-00", "", -1), "")
+                    ):
+                        latest_registered[market] = registered
                 if event_name in {"signal_registered", "signal_blocked"}:
-                    latest_event[market] = (event_name, signal_id, reason)
+                    latest = (event_key, event_name, signal_id, reason)
+                    if event_key >= latest_event.get(
+                        market, (("0000-00-00", "", -1), "", "", None)
+                    )[0]:
+                        latest_event[market] = latest
 
         for market, mode in (self.state.get("modes") or {}).items():
             if not isinstance(mode, dict) or not mode.get("entry_completed_at"):
                 continue
-            registered_id = latest_registered.get(str(market))
-            event_name, duplicate_id, reason = latest_event.get(
-                str(market), ("", "", None)
+            registered = latest_registered.get(str(market))
+            registered_id = registered[1] if registered is not None else None
+            _event_key, event_name, duplicate_id, reason = latest_event.get(
+                str(market), (("0000-00-00", "", -1), "", "", None)
             )
             if (
                 registered_id
