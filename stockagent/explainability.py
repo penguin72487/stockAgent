@@ -1392,6 +1392,182 @@ def _temporal_basis_warnings(frames: Mapping[str, pl.DataFrame]) -> list[str]:
     return warnings_out
 
 
+def _temporal_basis_selection_frames(
+    selection: Mapping[str, Any],
+    *,
+    disabled_families: Sequence[str] = (),
+) -> dict[str, pl.DataFrame]:
+    """Translate the fold-training basis receipt into complete audit tables.
+
+    The receipt answers a different question from model attribution: it records
+    which numerical directions were retained using training data.  Keeping it
+    separate prevents structural effective rank from being mislabeled as
+    learned usefulness, while a family-level join makes the two views directly
+    comparable without a Top-K truncation.
+    """
+
+    families = [str(value) for value in selection.get("families", ())]
+    candidate_counts = {
+        str(name): int(value)
+        for name, value in dict(selection.get("candidate_counts", {}) or {}).items()
+    }
+    selected_counts = {
+        str(name): int(value)
+        for name, value in dict(selection.get("selected_counts", {}) or {}).items()
+    }
+    disabled = {str(value) for value in disabled_families}
+    selected_total = int(
+        selection.get("selected_total", sum(selected_counts.values())) or 0
+    )
+    combined_rank = int(selection.get("actual_rank", 0) or 0)
+    near_duplicate_count = int(selection.get("near_duplicate_count", 0) or 0)
+    family_rows: list[dict[str, Any]] = []
+    for family_order, family in enumerate(families, start=1):
+        candidate_count = int(candidate_counts.get(family, 0))
+        selected_count = int(selected_counts.get(family, 0))
+        family_rows.append(
+            {
+                "family": family,
+                "family_order": family_order,
+                "candidate_count": candidate_count,
+                "selected_count": selected_count,
+                "unselected_candidate_count": max(
+                    0, candidate_count - selected_count
+                ),
+                "selection_retention_fraction": (
+                    float(selected_count) / candidate_count
+                    if candidate_count > 0
+                    else 0.0
+                ),
+                "selection_component_share": (
+                    float(selected_count) / selected_total
+                    if selected_total > 0
+                    else 0.0
+                ),
+                "configured_disabled": family in disabled,
+                "selection_policy": str(selection.get("selection_policy", "")),
+                "selection_fingerprint": str(
+                    selection.get("selection_fingerprint", "")
+                ),
+                "sum_family_effective_ranks": selected_total,
+                "combined_effective_rank": combined_rank,
+                "cross_family_redundant_direction_count": max(
+                    0, selected_total - combined_rank
+                ),
+                "reported_near_duplicate_count": near_duplicate_count,
+                "near_duplicate_threshold": float(
+                    selection.get("near_duplicate_threshold", 0.0) or 0.0
+                ),
+                "pca_klt_training_only": bool(
+                    selection.get("pca_klt_training_only", False)
+                ),
+            }
+        )
+
+    component_rows: list[dict[str, Any]] = []
+    family_order_by_name = {
+        family: order for order, family in enumerate(families, start=1)
+    }
+    for selection_order, raw in enumerate(selection.get("selected", ()) or (), start=1):
+        if not isinstance(raw, Mapping):
+            continue
+        family = str(raw.get("family", ""))
+        parameters = raw.get("parameters", {})
+        parameters = parameters if isinstance(parameters, Mapping) else {}
+        component_rows.append(
+            {
+                "selection_order": selection_order,
+                "family": family,
+                "family_order": int(family_order_by_name.get(family, 0)),
+                "basis_name": str(raw.get("basis_name", "")),
+                "family_component_index": int(
+                    raw.get("family_component_index", -1) or 0
+                ),
+                "candidate_index": int(parameters.get("candidate_index", -1) or 0),
+                "component_index": int(parameters.get("component_index", -1) or 0),
+                "variance_contribution": float(
+                    raw.get("variance_contribution", 0.0) or 0.0
+                ),
+                "novelty_variance_contribution": float(
+                    raw.get("novelty_variance_contribution", 0.0) or 0.0
+                ),
+                "novelty_ratio": float(raw.get("novelty_ratio", 0.0) or 0.0),
+                "near_duplicate": bool(raw.get("near_duplicate", False)),
+                "rank_after": int(raw.get("rank_after", 0) or 0),
+                "configured_disabled": family in disabled,
+            }
+        )
+    return {
+        "temporal_basis_selection_family": pl.DataFrame(family_rows),
+        "temporal_basis_selection_components": pl.DataFrame(component_rows),
+    }
+
+
+def _attach_temporal_basis_selection(
+    result: dict[str, Any],
+    selection: Mapping[str, Any],
+    *,
+    model: nn.Module,
+    strict: bool,
+) -> None:
+    subject = _basis_subject_model(model)
+    enabled = tuple(
+        str(value) for value in getattr(subject, "temporal_basis_families", ())
+    )
+    disabled = tuple(
+        str(value)
+        for value in getattr(subject, "temporal_basis_disabled_families", ())
+    )
+    receipt_families = tuple(str(value) for value in selection.get("families", ()))
+    if enabled and receipt_families != enabled:
+        message = (
+            "Temporal-basis selection receipt family ABI differs from the loaded "
+            f"model: receipt={list(receipt_families)} model={list(enabled)}"
+        )
+        if strict:
+            raise RuntimeError(message)
+        _append_summary_warning(result, message)
+        return
+
+    selection_frames = _temporal_basis_selection_frames(
+        selection,
+        disabled_families=disabled,
+    )
+    frames = result.setdefault("frames", {})
+    frames.update(selection_frames)
+    family_diagnostics = frames.get(
+        "temporal_basis_family_diagnostics", pl.DataFrame()
+    )
+    family_selection = selection_frames["temporal_basis_selection_family"]
+    if (
+        not _is_empty_frame(family_diagnostics)
+        and not _is_empty_frame(family_selection)
+        and "family" in family_diagnostics.columns
+    ):
+        frames["temporal_basis_family_diagnostics"] = family_diagnostics.join(
+            family_selection,
+            on="family",
+            how="left",
+            validate="m:1",
+        )
+
+    temporal_summary = result.setdefault("summary", {}).setdefault(
+        "temporal_basis", {}
+    )
+    temporal_summary["selection"] = {
+        "policy": str(selection.get("selection_policy", "")),
+        "fingerprint": str(selection.get("selection_fingerprint", "")),
+        "sum_family_effective_ranks": int(
+            selection.get("selected_total", 0) or 0
+        ),
+        "combined_effective_rank": int(selection.get("actual_rank", 0) or 0),
+        "near_duplicate_count": int(
+            selection.get("near_duplicate_count", 0) or 0
+        ),
+        "disabled_families": list(disabled),
+    }
+
+
 def _raw_temporal_basis_diagnostics(
     model: nn.Module,
     x: torch.Tensor,
@@ -6595,6 +6771,7 @@ def _write_markdown_report(
             "- `explainability_completeness`：確認部位／總曝險覆蓋率為 100%、inventory 列數一致，且啟用方法包含 lookback × feature 格。",
             "- `exposure_coverage_curve`：使用全部標的；曲線越陡代表策略越集中。",
             "- `temporal_basis_family_diagnostics`：projection/kernel 是結構代理量；input-feature 模式會把 `original_data_endpoint` 與每個基底家族放在同表，精確重跑共享 RMSNorm、CandleEncoder 與下游模型。因家族可能重疊，各消融效果不可直接相加。",
+            "- `temporal_basis_selection_family`：只描述訓練資料上每一家族候選方向與保留有效秩；必須和逐家族下游消融一起讀，不能把保留數直接當成模型重要性。",
         ]
     )
     lines.append("")
@@ -6641,6 +6818,7 @@ def _write_markdown_report(
         "stock_contributions",
         "aux_summary",
         "temporal_basis_family_diagnostics",
+        "temporal_basis_selection_family",
         "temporal_basis_completeness",
     ):
         frame = frames.get(name)
@@ -6979,6 +7157,8 @@ def _write_paper_tables(
         "shap_components",
         "aux_summary",
         "temporal_basis_family_diagnostics",
+        "temporal_basis_selection_family",
+        "temporal_basis_selection_components",
         "temporal_basis_component_feature_diagnostics",
         "temporal_basis_vectors",
         "temporal_basis_effective_kernel",
@@ -7497,6 +7677,121 @@ def _plot_paper_temporal_basis_family_diagnostics(
     plt.close(fig)
 
 
+def _plot_paper_temporal_basis_selection_vs_use(
+    frame: pl.DataFrame,
+    *,
+    output_path: Path,
+    subtitle: str,
+) -> None:
+    required = {
+        "family",
+        "path_type",
+        "candidate_count",
+        "selected_count",
+        "ablation_action_importance_share",
+        "ablation_score_importance_share",
+    }
+    if _is_empty_frame(frame) or not required.issubset(frame.columns):
+        return
+    data = frame.filter(pl.col("path_type") == "basis_family").sort(
+        ["family_order", "family"]
+    )
+    if data.is_empty():
+        return
+    data = _with_numeric(
+        data,
+        "candidate_count",
+        "selected_count",
+        "ablation_action_importance_share",
+        "ablation_score_importance_share",
+    )
+    disabled_values = (
+        data.get_column("configured_disabled").fill_null(False).to_list()
+        if "configured_disabled" in data.columns
+        else [False] * data.height
+    )
+    labels = [
+        f"{family} [disabled]" if bool(disabled) else family
+        for family, disabled in zip(
+            _string_list(data, "family"), disabled_values, strict=True
+        )
+    ]
+    y = np.arange(data.height)
+    selected = _numeric_numpy(data, "selected_count")
+    candidates = _numeric_numpy(data, "candidate_count")
+    rejected = np.maximum(0.0, candidates - selected)
+    action_share = _numeric_numpy(data, "ablation_action_importance_share")
+    score_share = _numeric_numpy(data, "ablation_score_importance_share")
+
+    plt, _ = _setup_paper_plotting()
+    fig, axes = plt.subplots(
+        1,
+        2,
+        figsize=(22.0, max(10.0, 0.43 * len(labels) + 3.2)),
+        dpi=165,
+        sharey=True,
+    )
+    axes[0].barh(
+        y,
+        selected,
+        color=PAPER_TOKENS["blue_mid"],
+        label="Retained per-family directions",
+    )
+    axes[0].barh(
+        y,
+        rejected,
+        left=selected,
+        color=PAPER_TOKENS["neutral_mid"],
+        label="Candidate directions not retained",
+    )
+    axes[0].set_xlabel("Direction count (selection structure only)")
+    axes[0].set_title("Training-only basis selection", fontsize=11)
+    axes[0].legend(loc="lower right", fontsize=8, frameon=True)
+
+    height = 0.36
+    axes[1].barh(
+        y - height / 2,
+        action_share,
+        height=height,
+        color=PAPER_TOKENS["orange_mid"],
+        label="Action-change share",
+    )
+    axes[1].barh(
+        y + height / 2,
+        score_share,
+        height=height,
+        color=PAPER_TOKENS["olive_mid"],
+        label="Score-change share",
+    )
+    axes[1].set_xlabel("Share of complete family-ablation change")
+    axes[1].set_title("Loaded checkpoint usage on explained decisions", fontsize=11)
+    axes[1].legend(loc="lower right", fontsize=8, frameon=True)
+
+    for ax in axes:
+        ax.set_yticks(y)
+        ax.set_yticklabels(labels, fontsize=8)
+        ax.invert_yaxis()
+        ax.grid(True, axis="x", color=PAPER_TOKENS["grid"], linewidth=0.8)
+        _finish_paper_axes(ax)
+    fig.suptitle(
+        "Temporal basis selection is not temporal basis usefulness",
+        fontsize=16,
+        y=0.995,
+    )
+    fig.text(
+        0.5,
+        0.975,
+        subtitle,
+        ha="center",
+        va="top",
+        fontsize=9,
+        color=PAPER_TOKENS["muted"],
+    )
+    _safe_matplotlib_tight_layout(fig)
+    _save_matplotlib_figure(fig, output_path, pad_to_standard_aspect=False)
+    plt.close(fig)
+
+
 def _plot_paper_temporal_basis_preference(
     frame: pl.DataFrame,
     *,
@@ -7797,7 +8092,7 @@ def _plot_all_paper_figures(
     generated: list[Path] = []
     scope = _paper_scope(metadata, summary)
     paper_progress = tqdm(
-        total=19,
+        total=20,
         desc="Paper plots",
         unit="plot",
         leave=False,
@@ -7957,6 +8252,20 @@ def _plot_all_paper_figures(
                 "Shares are normalized across the original endpoint and individual basis families; "
                 "overlapping path effects are not causal or additive. "
                 f"{scope}"
+            ),
+        ),
+        out,
+    )
+    out = plot_dir / "temporal_basis_selection_vs_use.png"
+    _time_plot(
+        "temporal_basis_selection_vs_use_s",
+        lambda: _plot_paper_temporal_basis_selection_vs_use(
+            frames.get("temporal_basis_family_diagnostics", pl.DataFrame()),
+            output_path=out,
+            subtitle=(
+                "Left: causal training-window numerical structure. Right: exact "
+                "downstream path-removal response. Neither panel is a causal P&L "
+                f"claim. {scope}"
             ),
         ),
         out,
@@ -8288,8 +8597,13 @@ FIGURE_GUIDE_ZH: dict[str, tuple[str, str, str]] = {
         "以精確消融後的 action／score 變化占比作為最接近決策的證據；表示層占比只作輔助判讀。",
         "基底家族可能高度重疊，因此大柱代表移除該路徑影響較大，不代表它因果上獨占該比例。",
     ),
+    "temporal_basis_selection_vs_use.png": (
+        "左側呈現訓練資料上每個家族的候選方向與保留有效秩，右側呈現載入 checkpoint 後逐家族精確移除造成的 action／score 變化。",
+        "先用左圖判斷容量與跨家族冗餘，再用右圖判斷模型是否實際依賴該家族；保留方向多不等於決策重要。",
+        "保留數很高但移除影響接近零代表容量可能冗餘；移除影響很大但跨 Fold 不穩則代表脆弱。兩者都不是因果 P&L 證明。",
+    ),
     "temporal_basis_vectors.png": (
-        "畫出 18 個時間基底家族的全部分量，包括 checkpoint 中實際學到的 learned dictionary。",
+        "畫出所有已設定時間基底家族的全部分量，包括 checkpoint 中實際學到的 learned dictionary。",
         "每條線就是同一個原始特徵在最舊到最新 32 天被加權的形狀，可直接看它分解趨勢、週期或局部變化。",
         "多個家族形狀幾乎重複，或 learned 完全塌到既有家族，表示基底容量可能重複。",
     ),
@@ -8488,6 +8802,7 @@ def _expected_explainability_plot_paths(
             ("aux_summary", "aux_token_diagnostics.png", ("name", "mean_abs")),
             ("temporal_basis_family_diagnostics", "temporal_basis_family_diagnostics.png", ("family", "ablation_action_relative_abs_delta")),
             ("temporal_basis_family_diagnostics", "temporal_basis_preference.png", ("family", "fusion_marginal_abs_share", "ablation_action_importance_share", "ablation_score_importance_share")),
+            ("temporal_basis_family_diagnostics", "temporal_basis_selection_vs_use.png", ("family", "candidate_count", "selected_count", "ablation_action_importance_share", "ablation_score_importance_share")),
             ("temporal_basis_vectors", "temporal_basis_vectors.png", ("family", "component", "lookback_index", "basis_value")),
             ("temporal_basis_component_feature_diagnostics", "temporal_basis_feature_scale_heatmap.png", ("family", "feature", "activation_projection_scale_proxy")),
             ("temporal_basis_effective_kernel", "temporal_basis_total_effective_kernel_heatmap.png", ("family", "feature", "lookback_from_end", "effective_kernel_l2")),
@@ -8846,6 +9161,16 @@ def _cross_fold_figure_spec(relative_path: str) -> _CrossFoldFigureSpec | None:
             ("path_type", "family"),
             (
                 "fusion_marginal_abs_share",
+                "ablation_action_importance_share",
+                "ablation_score_importance_share",
+            ),
+        ),
+        "temporal_basis_selection_vs_use.png": _CrossFoldFigureSpec(
+            "temporal_basis_family_diagnostics.csv",
+            ("path_type", "family"),
+            (
+                "candidate_count",
+                "selected_count",
                 "ablation_action_importance_share",
                 "ablation_score_importance_share",
             ),
@@ -9730,6 +10055,22 @@ def _write_paper_report(
             "基底彼此重疊，所以單一家族移除效果不可相加，也不能取代重新訓練的績效 ablation。"
         )
         lines.append("")
+        selection_info = summary.get("temporal_basis", {}).get("selection", {})
+        if selection_info:
+            lines.append(
+                "訓練選擇與模型使用是兩個層次：本 fold 的各家族有效秩總和為 "
+                f"`{selection_info.get('sum_family_effective_ranks', 0)}`，但合併子空間有效秩只有 "
+                f"`{selection_info.get('combined_effective_rank', 0)}`；"
+                "差額代表跨家族冗餘，不是額外獨立訊息。"
+            )
+            lines.append("")
+            lines.append(
+                _render_frame_markdown(
+                    frames.get("temporal_basis_selection_family", pl.DataFrame()),
+                    limit=None,
+                )
+            )
+            lines.append("")
         lines.append(_render_frame_markdown(frames.get("temporal_basis_family_diagnostics", pl.DataFrame()), limit=None))
         lines.append("")
         lines.append("### 基底完整性")
@@ -9997,6 +10338,7 @@ _SAVED_EXPLAINABILITY_FRAME_NAMES = (
     "regime_analysis", "decision_case_studies", "trust_checks",
     "aux_summary", "j_lens_transport", "j_lens_layer_summary",
     "temporal_basis_family_diagnostics", "temporal_basis_component_feature_diagnostics",
+    "temporal_basis_selection_family", "temporal_basis_selection_components",
     "temporal_basis_vectors", "temporal_basis_effective_kernel",
     "temporal_basis_subspace_overlap", "temporal_basis_completeness",
     "j_lens_dimension_readout", "j_lens_date_readout", "j_lens_stock_readout",
@@ -11718,6 +12060,33 @@ def run_loaded_model_explanation(
     finally:
         if was_training:
             model.train()
+    basis_selection_path = (
+        _fold_dir(Path(output_dir), int(fold.fold_id))
+        / "temporal_basis_selection.json"
+    )
+    if basis_selection_path.is_file():
+        selection_payload = json.loads(
+            basis_selection_path.read_text(encoding="utf-8")
+        )
+        if not isinstance(selection_payload, Mapping):
+            raise RuntimeError(
+                f"Temporal-basis selection receipt must be a mapping: "
+                f"{basis_selection_path}"
+            )
+        _attach_temporal_basis_selection(
+            result,
+            selection_payload,
+            model=model,
+            strict=bool(settings.strict_no_fallback),
+        )
+    elif getattr(
+        _basis_subject_model(model), "temporal_basis_families", ()
+    ):
+        _append_summary_warning(
+            result,
+            "Loaded model uses temporal bases but its fold selection receipt is "
+            f"missing: {basis_selection_path}",
+        )
     runner_timing["compute_s"] = float(time.perf_counter() - compute_start)
     runner_timing["compute_dates_per_s"] = float(len(dates)) / max(float(runner_timing["compute_s"]), 1e-9)
     if device.type == "cuda":
@@ -11751,6 +12120,9 @@ def run_loaded_model_explanation(
         "config_lookback": int(config.training.lookback),
         "date_start": dates[0] if dates else None,
         "date_end": dates[-1] if dates else None,
+        "temporal_basis_selection_receipt": (
+            str(basis_selection_path) if basis_selection_path.is_file() else None
+        ),
         **(checkpoint_info or {}),
     }
     resolved_plot_backend = plot_backend or str(getattr(config.training, "plot_backend", "auto"))

@@ -723,6 +723,32 @@ Rules:
   compatibility. Bump it whenever return, fee, turnover, or recurrent-state
   accounting changes; old-contract weights may be used for inference but must
   not silently resume an optimizer trajectory.
+- The exact all-futures account must reserve cash for blocked carried positions
+  before opening new targets.  If independently rounded group targets exceed
+  account equity, contract all requested exposures by one common radial scale
+  and reselect whole-contract baskets; do not add top-K, long/short quotas, or
+  freed-cash redistribution.  A funding default is valid only when the proven
+  minimum-cash capacity-feasible basket also exceeds equity.  Fixed fees and
+  reversals can make the discrete frontier non-monotone, so the search must
+  retain that minimum-cash fallback and recheck the final account inequality.
+- For exact futures, live account equity is the sole owner of hard denomination
+  rounding.  The model may encode denomination/cost features, but a fixed-
+  reference-capital model projection followed by executor rounding is forbidden
+  for new contracts because it double-quantizes actions.  Preserve it only for
+  legacy replay and record the projection owner in the checkpoint manifest.
+- When an exact recurrent log-utility config selects full-trajectory optimizer
+  cadence, every chronological batch in one epoch must see the same parameters.
+  Weight decomposable batch losses by their valid-row share, detach documented
+  recurrent state at batch boundaries, then clip, update AdamW, and advance the
+  step scheduler exactly once.  Any non-finite batch invalidates the complete
+  trajectory; never continue with cleared partial gradients.  Epoch-zero
+  pretrained validation must also reject defaults or non-positive/non-finite
+  ending equity even if its ruin-clamped scalar loss is finite.  Chunked exact
+  validation must retain default and default-reason histories.  A rejected
+  transfer may preserve its backbone only by resetting a proven trainable final
+  action head to an exactly flat cash portfolio, recording that fallback, and
+  requiring later checkpoints to beat the exact zero-loss cash baseline; never
+  weaken the solvency guard or accept the clamped dead-account loss.
 - If compiled loss hits CUDA Graph overwritten-output errors, only fall back the loss wrapper to eager tensor loss; do not disable model `torch.compile` globally.
 
 ## Intentional Walk-Forward Semantics

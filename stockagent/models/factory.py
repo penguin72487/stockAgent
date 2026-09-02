@@ -422,6 +422,9 @@ def build_model(
                 "futures_denomination_aware_output": (
                     tbp_cfg.futures_denomination_aware_output
                 ),
+                "futures_denomination_hard_projection": (
+                    tbp_cfg.futures_denomination_hard_projection
+                ),
                 "futures_current_open_feature": (
                     tbp_cfg.futures_current_open_feature
                 ),
@@ -461,6 +464,9 @@ def build_model(
             temporal_pooling=tbp_cfg.temporal_pooling,
             temporal_query_mode=tbp_cfg.temporal_query_mode,
             temporal_basis_families=tbp_cfg.temporal_basis_families,
+            temporal_basis_disabled_families=(
+                tbp_cfg.temporal_basis_disabled_families
+            ),
             temporal_basis_components=tbp_cfg.temporal_basis_components,
             temporal_basis_components_by_family=(
                 tbp_cfg.temporal_basis_components_by_family
@@ -612,6 +618,9 @@ def build_model(
             temporal_pooling=fin_cfg.temporal_pooling,
             temporal_query_mode=fin_cfg.temporal_query_mode,
             temporal_basis_families=fin_cfg.temporal_basis_families,
+            temporal_basis_disabled_families=(
+                fin_cfg.temporal_basis_disabled_families
+            ),
             temporal_basis_components=fin_cfg.temporal_basis_components,
             temporal_basis_components_by_family=(
                 fin_cfg.temporal_basis_components_by_family

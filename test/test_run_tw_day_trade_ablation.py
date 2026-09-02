@@ -106,6 +106,34 @@ output_root: artifacts/ablations/multi_basis
     assert [row["name"] for row in rows] == ["baseline"]
 
 
+def test_supervisor_only_selects_requested_experiments(tmp_path: Path) -> None:
+    spec_path = tmp_path / "spec.yaml"
+    spec_path.write_text(
+        """
+base_config: configs/markets/base.yaml
+output_root: artifacts/ablations/base
+expected_fold_count: 1
+matrix:
+  include_baseline: true
+  dimensions:
+    - name: basis
+      enabled: true
+      variants:
+        - name: without_haar
+          experiment_name: without_haar
+          overrides: {training: {financial_transformer: {temporal_basis_disabled_families: [haar]}}}
+        - name: without_dct
+          experiment_name: without_dct
+          overrides: {training: {financial_transformer: {temporal_basis_disabled_families: [dct]}}}
+""",
+        encoding="utf-8",
+    )
+
+    _, rows = _load_effective_spec(spec_path, {"without_dct"})
+
+    assert [row["name"] for row in rows] == ["without_dct"]
+
+
 def test_bar_has_exact_percentage_and_label() -> None:
     rendered = _bar(12.5, "baseline fold 1")
     assert "12.50%" in rendered

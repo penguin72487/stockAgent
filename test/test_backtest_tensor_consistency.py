@@ -1788,6 +1788,65 @@ def test_futures_chunked_eval_preserves_recurrent_equity_scale() -> None:
     torch.testing.assert_close(result.final_equity_scale, full.final_equity_scale)
 
 
+def test_integer_stock_context_chunked_eval_preserves_default_audit() -> None:
+    rows, slots = 3, 2
+    weights = torch.zeros((rows, slots), dtype=torch.float32)
+    weights[0, 0] = 1.0
+    execution = torch.zeros((rows, slots, 11), dtype=torch.float32)
+    execution[..., 0] = 0.0
+    execution[..., 3:5] = 100_000.0
+    execution[0, 0, 0] = torch.log(torch.tensor(0.8))
+    execution[0, 0, 1] = 1.0
+    execution[0, 0, 4] = 80_000.0
+    execution[0, 0, 8] = 100.0
+    execution[..., 9] = torch.arange(slots, dtype=torch.float32)[None, :]
+    runtime = trainer_module._ExecutionRuntime(
+        mode="tw_stock_context_futures_portfolio",
+        buy_fee_rates=None,
+        sell_fee_rates=None,
+        lot_sizes=None,
+        settlement_lag_sessions=0,
+        futures_initial_capital=1_000_000.0,
+    )
+
+    result, _ = trainer_module._run_eval_backtest_from_weight_buffers(
+        weights,
+        torch.zeros((rows, slots)),
+        torch.ones((rows, slots), dtype=torch.bool),
+        torch.ones((rows, slots), dtype=torch.bool),
+        torch.ones((rows, slots), dtype=torch.bool),
+        torch.ones((rows, slots), dtype=torch.bool),
+        torch.zeros((rows, slots), dtype=torch.bool),
+        torch.zeros((rows, slots), dtype=torch.bool),
+        torch.zeros(rows),
+        device=torch.device("cpu"),
+        non_blocking=False,
+        long_only=False,
+        buy_fee_rate=0.0,
+        sell_fee_rate=0.0,
+        max_turnover_ratio=0.0,
+        gross_leverage=1.0,
+        min_trade_weight=0.0,
+        backtest_chunk_rows=2,
+        compute_metrics_summary=False,
+        return_weights_history=False,
+        profile_timing=False,
+        progress_label=None,
+        timing=TimingBreakdown(),
+        reset_at_rows=None,
+        portfolio_activation="pre_normalized",
+        overnight_log_returns_all=execution,
+        execution_runtime=runtime,
+    )
+
+    assert result.settlement_default is not None
+    assert result.default_reason_history is not None
+    assert result.settlement_default.tolist() == [False, True, False]
+    assert result.default_reason_history.tolist() == [0, 1, 0]
+    assert result.equity_scale_history is not None
+    assert result.equity_scale_history.tolist() == pytest.approx([0.8, 0.0, 0.0])
+
+
 def test_force_exit_at_backtest_chunk_boundary_matches_full_and_ragged_tail() -> None:
     rows = 5
     raw_weights = torch.ones((rows, 1), dtype=torch.float32)

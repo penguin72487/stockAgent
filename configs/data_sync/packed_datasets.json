@@ -289,6 +289,7 @@
       "active_process_substrings": [
         "download_shioaji_tx_futures_ticks.py",
         "download_taifex_contract_codes.py",
+        "download_taifex_futures_final_settlement_history.py",
         "build_taifex_futures_portfolio_daily.py"
       ],
       "note": "Shioaji/TAIFEX futures data, including historical+current stock/ETF/domestic+foreign-index delivery-month-slot daily training data."

@@ -677,6 +677,7 @@ def _validate_tw_stock_context_futures_portfolio_mode_contract(
     train_symbol_compaction: object,
     model_portfolio_output_mode: object,
     futures_denomination_aware_output: object,
+    futures_denomination_hard_projection: object,
     futures_current_open_feature: object,
     data_futures_current_open_feature: object,
     carry_valuation_max_abs_simple_return: object,
@@ -688,6 +689,8 @@ def _validate_tw_stock_context_futures_portfolio_mode_contract(
     integer_contracts: object,
     futures_portfolio_training_surrogate_only: object,
     futures_portfolio_recoverable_backward: object,
+    futures_portfolio_optimizer_step_per_trajectory: object,
+    loss_type: object,
     trading_portfolio_activation: object,
     loss_portfolio_activation: object,
     return_rank_ic_weight: object,
@@ -746,6 +749,33 @@ def _validate_tw_stock_context_futures_portfolio_mode_contract(
             "futures_portfolio_recoverable_backward requires integer "
             "all-futures execution metadata"
         )
+    if futures_denomination_hard_projection is not None and bool(
+        futures_denomination_hard_projection
+    ) and not bool(
+        futures_denomination_aware_output
+    ):
+        raise ValueError(
+            "futures_denomination_hard_projection requires "
+            "futures_denomination_aware_output=true"
+        )
+    if bool(futures_portfolio_optimizer_step_per_trajectory):
+        if not bool(integer_contracts):
+            raise ValueError(
+                "futures_portfolio_optimizer_step_per_trajectory requires "
+                "exact integer all-futures execution"
+            )
+        objective = str(loss_type).strip().lower().replace("-", "_")
+        if objective not in {
+            "log_utility",
+            "log_util",
+            "kelly",
+            "growth",
+            "mean_log_return",
+        }:
+            raise ValueError(
+                "futures_portfolio_optimizer_step_per_trajectory requires the "
+                "decomposable exact log_utility objective"
+            )
     if bool(futures_current_open_feature) != bool(
         data_futures_current_open_feature
     ):
@@ -1268,6 +1298,7 @@ def _deep_merge_config(base: Any, override: Any) -> Any:
         # fall back to the shared temporal_basis_components count.
         if "temporal_basis_families" in override:
             merged["temporal_basis_components_by_family"] = {}
+            merged["temporal_basis_disabled_families"] = []
         for key, value in override.items():
             merged[key] = (
                 _deep_merge_config(merged[key], value) if key in merged else value
@@ -1922,6 +1953,11 @@ class TransformerBasePortfolioModelConfig:
     temporal_pooling: str = "attention"
     temporal_query_mode: str = "full_then_last"
     temporal_basis_families: list[str] = field(default_factory=list)
+    # Keep the full basis/checkpoint ABI while forcing selected families to
+    # contribute exactly zero.  This is intended for fold-matched ablations:
+    # deleting a family would resize the wide projection and make a pretrained
+    # control checkpoint incomparable.
+    temporal_basis_disabled_families: list[str] = field(default_factory=list)
     temporal_basis_components: int = 8
     temporal_basis_components_by_family: dict[str, int] = field(
         default_factory=dict
@@ -1973,6 +2009,11 @@ class TransformerBasePortfolioModelConfig:
     # denomination.  Hard whole-unit values own forward; identity STE owns
     # backward.  This is disabled for legacy checkpoint compatibility.
     futures_denomination_aware_output: bool = False
+    # Historical models quantized group actions against one fixed reference
+    # capital before the recurrent integer executor quantized them again against
+    # live equity. New exact-account experiments may retain denomination context
+    # while assigning all hard whole-contract choice to the executor alone.
+    futures_denomination_hard_projection: bool | None = None
     # Encode session-t TAIFEX OPEN/previous-settlement gap. This changes the
     # data and model ABI and is valid only for the explicit 08:45 same-print
     # research contract.
@@ -2206,6 +2247,10 @@ class TrainingConfig:
     # shadow account only in backward after exact insolvency. This prevents an
     # absorbing default in one batch from zeroing all later optimizer gradients.
     futures_portfolio_recoverable_backward: bool = False
+    # Preserve one policy parameter vector over the complete chronological
+    # account trajectory. Batches remain bounded truncated-BPTT chunks, while
+    # AdamW and the step scheduler advance exactly once after the full epoch.
+    futures_portfolio_optimizer_step_per_trajectory: bool = False
     # Executor-only optimization: compile the panel-slab model with a symbolic
     # stock axis so expanding walk-forward folds can reuse one Inductor graph.
     # Batch/time/feature axes remain static and assets are never padded.
@@ -2997,6 +3042,24 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         transformer_base_portfolio.get("temporal_basis_families"),
         field_name="training.transformer_base_portfolio.temporal_basis_families",
     )
+    transformer_base_portfolio["temporal_basis_disabled_families"] = (
+        _normalize_string_list(
+            transformer_base_portfolio.get("temporal_basis_disabled_families"),
+            field_name=(
+                "training.transformer_base_portfolio."
+                "temporal_basis_disabled_families"
+            ),
+        )
+    )
+    unexpected_disabled_families = set(
+        transformer_base_portfolio["temporal_basis_disabled_families"]
+    ).difference(transformer_base_portfolio["temporal_basis_families"])
+    if unexpected_disabled_families:
+        raise ValueError(
+            "training.transformer_base_portfolio."
+            "temporal_basis_disabled_families must be enabled families: "
+            f"{sorted(unexpected_disabled_families)}"
+        )
     transformer_base_portfolio["temporal_basis_components"] = max(
         1, int(transformer_base_portfolio["temporal_basis_components"])
     )
@@ -3056,6 +3119,24 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         financial_transformer.get("temporal_basis_families"),
         field_name="training.financial_transformer.temporal_basis_families",
     )
+    financial_transformer["temporal_basis_disabled_families"] = (
+        _normalize_string_list(
+            financial_transformer.get("temporal_basis_disabled_families"),
+            field_name=(
+                "training.financial_transformer."
+                "temporal_basis_disabled_families"
+            ),
+        )
+    )
+    unexpected_disabled_families = set(
+        financial_transformer["temporal_basis_disabled_families"]
+    ).difference(financial_transformer["temporal_basis_families"])
+    if unexpected_disabled_families:
+        raise ValueError(
+            "training.financial_transformer.temporal_basis_disabled_families "
+            "must be enabled families: "
+            f"{sorted(unexpected_disabled_families)}"
+        )
     financial_transformer["temporal_basis_components"] = max(
         1, int(financial_transformer["temporal_basis_components"])
     )
@@ -3173,6 +3254,26 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
             ),
         )
     )
+    executable_portfolio_transformer["temporal_basis_disabled_families"] = (
+        _normalize_string_list(
+            executable_portfolio_transformer.get(
+                "temporal_basis_disabled_families"
+            ),
+            field_name=(
+                "training.executable_portfolio_transformer."
+                "temporal_basis_disabled_families"
+            ),
+        )
+    )
+    unexpected_disabled_families = set(
+        executable_portfolio_transformer["temporal_basis_disabled_families"]
+    ).difference(executable_portfolio_transformer["temporal_basis_families"])
+    if unexpected_disabled_families:
+        raise ValueError(
+            "training.executable_portfolio_transformer."
+            "temporal_basis_disabled_families must be enabled families: "
+            f"{sorted(unexpected_disabled_families)}"
+        )
     executable_portfolio_transformer["temporal_basis_components"] = max(
         1,
         int(executable_portfolio_transformer["temporal_basis_components"]),
@@ -3863,6 +3964,9 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         futures_denomination_aware_output=phase_model_config[
             "futures_denomination_aware_output"
         ],
+        futures_denomination_hard_projection=phase_model_config[
+            "futures_denomination_hard_projection"
+        ],
         futures_current_open_feature=phase_model_config[
             "futures_current_open_feature"
         ],
@@ -3890,6 +3994,10 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         futures_portfolio_recoverable_backward=training[
             "futures_portfolio_recoverable_backward"
         ],
+        futures_portfolio_optimizer_step_per_trajectory=training[
+            "futures_portfolio_optimizer_step_per_trajectory"
+        ],
+        loss_type=training["loss_type"],
         trading_portfolio_activation=trading["portfolio_activation"],
         loss_portfolio_activation=training["loss_portfolio_activation"],
         return_rank_ic_weight=training["multitask_loss"]["return_rank_ic_weight"],
@@ -4639,6 +4747,9 @@ def load_config(path: str | Path) -> ExperimentConfig:
             ],
             futures_portfolio_recoverable_backward=training_raw[
                 "futures_portfolio_recoverable_backward"
+            ],
+            futures_portfolio_optimizer_step_per_trajectory=training_raw[
+                "futures_portfolio_optimizer_step_per_trajectory"
             ],
             compile_model_dynamic_symbols=training_raw["compile_model_dynamic_symbols"],
             compile_loss_dynamic_symbols=training_raw["compile_loss_dynamic_symbols"],

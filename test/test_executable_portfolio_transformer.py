@@ -131,7 +131,7 @@ def test_formal_config_keeps_rule_only_1000_epoch_contract() -> None:
     assert config.trading.tw_short_capacity_limit_enabled is False
     assert "causal_stateful_carry" in str(config.runner.output_dir)
     assert str(config.runner.output_dir).endswith("capital10m_v4")
-    assert CANONICAL_BACKTEST_CONTRACT_VERSION == 21
+    assert CANONICAL_BACKTEST_CONTRACT_VERSION == 22
     _assert_epoch_observability_enabled(config)
     assert all(
         getattr(config.training.multitask_loss, name) == 0.0

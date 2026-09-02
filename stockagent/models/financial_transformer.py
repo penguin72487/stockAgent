@@ -326,6 +326,7 @@ class TemporalBasisInputFeatureBuilder(nn.Module):
         source_dim: int,
         families: Sequence[str] | str,
         components: int,
+        disabled_families: Sequence[str] | str | None = None,
         sanitize_inputs: bool,
         components_by_family: Mapping[str, int] | None = None,
         novelty_threshold: float = DEFAULT_TEMPORAL_BASIS_NOVELTY_THRESHOLD,
@@ -341,6 +342,17 @@ class TemporalBasisInputFeatureBuilder(nn.Module):
         if not self.family_names:
             raise ValueError(
                 "TemporalBasisInputFeatureBuilder requires at least one family"
+            )
+        self.disabled_family_names = _normalize_temporal_basis_families(
+            disabled_families
+        )
+        unexpected_disabled = set(self.disabled_family_names).difference(
+            self.family_names
+        )
+        if unexpected_disabled:
+            raise ValueError(
+                "Disabled temporal basis families are not enabled: "
+                f"{sorted(unexpected_disabled)}"
             )
         self.family_component_counts: dict[str, int] = {}
         normalized_component_limits = {
@@ -405,7 +417,10 @@ class TemporalBasisInputFeatureBuilder(nn.Module):
             basis = F.normalize(basis.float(), dim=-1, eps=1e-6).to(
                 dtype=basis.dtype
             )
-        return basis.to(device=source.device, dtype=source.dtype)
+        basis = basis.to(device=source.device, dtype=source.dtype)
+        if family in self.disabled_family_names:
+            return torch.zeros_like(basis)
+        return basis
 
     def _prepare_source(
         self,
@@ -809,6 +824,7 @@ class FinancialTransformerModel(TransformerBasePortfolioModel):
                     - len(self.categorical_feature_indices)
                 ),
                 families=self.temporal_basis_families,
+                disabled_families=self.temporal_basis_disabled_families,
                 components=self.temporal_basis_components,
                 components_by_family=self.temporal_basis_components_by_family,
                 novelty_threshold=self.temporal_basis_novelty_threshold,

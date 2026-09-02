@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+import os
+from typing import Callable, Final
 
 import numpy as np
 import torch
@@ -23,12 +25,31 @@ TW_FUTURES_PORTFOLIO_INTEGER_TRAINING_SURROGATE = (
 TW_FUTURES_PORTFOLIO_INTEGER_RECOVERABLE_TRAINING_SURROGATE = (
     "grouped_fake_floor_cash_solvency_recovery_surrogate_v5"
 )
-TW_FUTURES_PORTFOLIO_INTEGER_TRAINING_FORWARD = "exact_integer_account_v1"
+TW_FUTURES_PORTFOLIO_INTEGER_TRAINING_FORWARD = "exact_integer_account_v2"
 
 TW_FUTURES_PORTFOLIO_DEFAULT_NONE = 0
 TW_FUTURES_PORTFOLIO_DEFAULT_FUNDING = 1
 TW_FUTURES_PORTFOLIO_DEFAULT_NONFINITE_EQUITY = 2
 TW_FUTURES_PORTFOLIO_DEFAULT_NONPOSITIVE_EQUITY = 3
+
+# The exact integer account and its backward-only shadow are both recurrent.
+# Compiling a whole global batch unrolls a large graph, while eager execution
+# launches hundreds of tiny scatter/reduction kernels per batch.  A fixed
+# power-of-two block amortizes launch overhead without changing either state
+# machine.  Sixteen rows is the measured dual-RTX-5090 throughput point; an
+# environment override remains available for hardware re-benchmarking.
+TW_FUTURES_PORTFOLIO_INTEGER_COMPILED_BLOCK_ROWS: Final[int] = 16
+_COMPILED_INTEGER_BLOCKS: dict[
+    tuple[object, ...], Callable[..., tuple[torch.Tensor, ...]]
+] = {}
+_FAILED_INTEGER_BLOCKS: set[tuple[object, ...]] = set()
+_INTEGER_COMPILE_STATS: dict[str, int] = {
+    "compile_constructors": 0,
+    "compiled_block_calls": 0,
+    "compiled_day_calls": 0,
+    "compiled_tail_calls": 0,
+    "eager_fallback_calls": 0,
+}
 
 
 @dataclass(slots=True)
@@ -43,6 +64,13 @@ class FuturesPortfolioTensorResult:
     contract_quantities_history: torch.Tensor | None = None
     default_history: torch.Tensor | None = None
     default_reason_history: torch.Tensor | None = None
+    # Internal continuation state for fixed-block compilation.  Public exact
+    # accounting continues to use ``final_weights`` (whole contracts),
+    # ``final_equity_scale``, and ``final_alive``.  These shadow fields never
+    # replace forward values or enter validation/inference artifacts.
+    _surrogate_final_weights: torch.Tensor | None = None
+    _surrogate_final_equity_scale: torch.Tensor | None = None
+    _surrogate_final_alive: torch.Tensor | None = None
 
 
 @dataclass(slots=True)
@@ -52,6 +80,46 @@ class FuturesPortfolioNumpyResult:
     weights_history: np.ndarray
     final_weights: np.ndarray
     final_alive: np.ndarray
+
+
+def _env_truthy(name: str, default: str) -> bool:
+    return os.environ.get(name, default).strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+        "",
+    }
+
+
+def _strict_no_fallback_enabled() -> bool:
+    return _env_truthy("STOCKAGENT_STRICT_NO_FALLBACK", "0")
+
+
+def get_tw_futures_portfolio_integer_compile_stats(
+    *, reset: bool = False,
+) -> dict[str, int]:
+    """Return process-local fixed-block usage counters."""
+
+    snapshot = dict(_INTEGER_COMPILE_STATS)
+    if reset:
+        for name in _INTEGER_COMPILE_STATS:
+            _INTEGER_COMPILE_STATS[name] = 0
+    return snapshot
+
+
+def resolve_tw_futures_portfolio_integer_compiled_block_rows() -> int:
+    """Resolve the one effective fixed-block length used by all callers."""
+
+    try:
+        return int(
+            os.environ.get(
+                "STOCKAGENT_TW_FUTURES_PORTFOLIO_COMPILE_BLOCK_ROWS",
+                str(TW_FUTURES_PORTFOLIO_INTEGER_COMPILED_BLOCK_ROWS),
+            )
+        )
+    except ValueError:
+        return 0
 
 
 def _integer_group_candidate_baskets(
@@ -90,13 +158,24 @@ def _integer_group_candidate_baskets(
         torch.floor((target_cash + eps) / safe_cash[:, 0]),
         caps[:, 0],
     ).clamp_min(0.0)
-    standard_candidates = torch.stack(
+    # Together with the two safety baskets appended by the executor, this makes
+    # a power-of-two 32-column compile shape: 28 descending 1/32 budget levels,
+    # then mini-only, cash, unchanged-current, and maximum-close. The denser
+    # frontier avoids a large exposure jump during account-wide de-risking.
+    numerators = torch.arange(
+        32,
+        4,
+        -1,
+        device=target_cash.device,
+        dtype=target_cash.dtype,
+    )
+    standard_candidates = torch.floor(
+        standard_max[:, None] * numerators[None, :] / 32.0
+    )
+    standard_candidates = torch.cat(
         (
-            standard_max,
-            (standard_max - 1.0).clamp_min(0.0),
-            (standard_max - 2.0).clamp_min(0.0),
-            torch.zeros_like(standard_max),
-            torch.zeros_like(standard_max),
+            standard_candidates,
+            torch.zeros((groups, 2), device=target_cash.device, dtype=target_cash.dtype),
         ),
         dim=1,
     )
@@ -114,6 +193,135 @@ def _integer_group_candidate_baskets(
     return torch.stack((standard_candidates, mini), dim=-1).to(torch.int64)
 
 
+def _globally_funded_group_candidate_indices(
+    *,
+    cash_required: torch.Tensor,
+    candidate_exposure: torch.Tensor,
+    target_exposure: torch.Tensor,
+    capacity_ok: torch.Tensor,
+    target_cash: torch.Tensor,
+    equity: torch.Tensor,
+    target_candidate_count: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Project discrete group choices onto the account-wide funding set.
+
+    Target baskets may spend only their model-requested sleeve. The terminal
+    current/max-close safety baskets may exceed that sleeve because a blocked
+    carried position is a pre-existing liability, not a new allocation.
+
+    When independent tracking-optimal choices overfund the account, a common
+    radial scale contracts every model-requested exposure by the same factor.
+    This keeps relative model conviction intact and introduces neither top-K,
+    a long/short quota, nor freed-cash reassignment. If even every group's
+    minimum-cash capacity-feasible basket exceeds equity, ``fundable`` is false
+    and the caller records a real funding default.
+    """
+
+    if cash_required.ndim != 2 or candidate_exposure.shape != cash_required.shape:
+        raise ValueError("candidate cash and exposure must have shape [G,K]")
+    if capacity_ok.shape != cash_required.shape:
+        raise ValueError("candidate capacity mask must have shape [G,K]")
+    groups, candidates = tuple(cash_required.shape)
+    target_count = int(target_candidate_count)
+    if not 0 < target_count <= candidates:
+        raise ValueError("target_candidate_count must be within the candidate axis")
+    if tuple(target_cash.shape) != (groups,):
+        raise ValueError("target_cash must have shape [G]")
+    if tuple(target_exposure.shape) != (groups,):
+        raise ValueError("target_exposure must have shape [G]")
+    if equity.numel() != 1:
+        raise ValueError("equity must be scalar")
+
+    dtype = cash_required.dtype
+    finite_candidate = torch.isfinite(cash_required) & torch.isfinite(
+        candidate_exposure
+    )
+    sleeve_eps = (
+        torch.finfo(dtype).eps * target_cash.abs().clamp_min(1.0) * 16.0
+    )
+    target_allowed = (
+        capacity_ok[:, :target_count]
+        & finite_candidate[:, :target_count]
+        & (
+            cash_required[:, :target_count]
+            <= target_cash[:, None] + sleeve_eps[:, None]
+        )
+    )
+    safety_allowed = (
+        capacity_ok[:, target_count:] & finite_candidate[:, target_count:]
+    )
+    allowed = torch.cat((target_allowed, safety_allowed), dim=1)
+
+    # The unchanged-current basket is normally capacity-feasible. Keep a tensor
+    # fallback for malformed metadata so the final exact funding check fails
+    # closed instead of choosing an arbitrary disallowed candidate.
+    fallback = torch.zeros_like(allowed)
+    fallback[:, -2] = True
+    allowed = torch.where(allowed.any(dim=1, keepdim=True), allowed, fallback)
+
+    scale = equity.detach().abs().clamp_min(1.0)
+    cash_norm = cash_required / scale
+    large = (
+        cash_norm.detach().amax(dim=1, keepdim=True)
+        + (candidate_exposure.detach().abs() / scale).amax(dim=1, keepdim=True)
+        + (target_exposure.detach().abs() / scale)[:, None]
+        + 2.0
+    )
+
+    def choose(radial_scale: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        scaled_target = target_exposure[:, None] * radial_scale
+        score = (candidate_exposure - scaled_target).abs() / scale
+        # Exact tracking-error ties prefer lower cash.
+        score = score + torch.finfo(dtype).eps * 32.0 * cash_norm
+        score = torch.where(allowed, score, large + score.abs())
+        selected = score.argmin(dim=1)
+        selected_cash = cash_required.gather(1, selected[:, None])[:, 0]
+        return selected, selected_cash.sum()
+
+    zero = cash_required.new_zeros(())
+    one = cash_required.new_ones(())
+    unconstrained, unconstrained_cash = choose(one)
+    funding_eps = (
+        torch.finfo(dtype).eps * equity.detach().abs().clamp_min(1.0) * 64.0
+    )
+    unconstrained_fits = unconstrained_cash <= equity + funding_eps
+
+    min_cash_score = torch.where(allowed, cash_required, large * scale)
+    min_cash = min_cash_score.argmin(dim=1)
+    min_cash_total = cash_required.gather(1, min_cash[:, None])[:, 0].sum()
+    fundable = torch.isfinite(min_cash_total) & (
+        min_cash_total <= equity + funding_eps
+    )
+
+    low = zero
+    high = one
+    best = min_cash
+    # Eight iterations resolve the 1/32 candidate frontier with extra room for
+    # fee/tax discontinuities, while keeping compiled block cost bounded.
+    for _ in range(8):
+        midpoint = (low + high) * 0.5
+        midpoint_choice, midpoint_cash = choose(midpoint)
+        midpoint_fits = midpoint_cash <= equity + funding_eps
+        low = torch.where(midpoint_fits, midpoint, low)
+        high = torch.where(midpoint_fits, high, midpoint)
+        best = torch.where(midpoint_fits, midpoint_choice, best)
+
+    selected = torch.where(unconstrained_fits, unconstrained, best)
+    selected_cash_total = cash_required.gather(1, selected[:, None])[:, 0].sum()
+    # Reversing a carried position and fixed per-contract costs can make the
+    # discrete frontier locally non-monotone.  The radial search is therefore
+    # an optimization only: when its final choice misses the funding boundary,
+    # fall back to the independently proven minimum-cash feasible state.  A
+    # real funding default is recorded only when that state is also impossible.
+    selected = torch.where(
+        selected_cash_total <= equity + funding_eps,
+        selected,
+        min_cash,
+    )
+    selected = torch.where(fundable, selected, min_cash)
+    return selected, fundable
+
+
 def run_tw_futures_portfolio_integer_surrogate_torch(
     target_weights: torch.Tensor,
     integer_execution: torch.Tensor,
@@ -125,7 +333,9 @@ def run_tw_futures_portfolio_integer_surrogate_torch(
     initial_equity_scale: torch.Tensor | None = None,
     initial_alive: torch.Tensor | None = None,
     return_weights_history: bool = True,
+    return_turnovers: bool = True,
     recover_after_default_for_backward: bool = False,
+    _detach_initial_weights: bool = True,
 ) -> FuturesPortfolioTensorResult:
     """Differentiable grouped relaxation for the exact integer account.
 
@@ -313,8 +523,14 @@ def run_tw_futures_portfolio_integer_surrogate_torch(
     if initial_quantities is not None and initial_weights is not None:
         raise ValueError("provide initial_quantities or initial_weights, not both")
     if initial_weights is not None:
+        carried_initial_weights = initial_weights.to(
+            device=weights.device,
+            dtype=weights.dtype,
+        )
+        if _detach_initial_weights:
+            carried_initial_weights = carried_initial_weights.detach()
         previous_slot_weights = torch.nan_to_num(
-            initial_weights.detach().to(device=weights.device, dtype=weights.dtype),
+            carried_initial_weights,
             nan=0.0,
             posinf=0.0,
             neginf=0.0,
@@ -505,16 +721,19 @@ def run_tw_futures_portfolio_integer_surrogate_torch(
                 torch.log1p(safe_net),
                 torch.zeros_like(safe_net),
             )
-        forced_close_turnover = torch.where(
-            group_must_liquidate[row] & row_advances,
-            (held_group * (1.0 + group_simple_return[row])).abs(),
-            torch.zeros_like(held_group),
-        ).sum()
-        turnover = torch.where(
-            row_advances,
-            group_delta.abs().sum() + forced_close_turnover,
-            torch.zeros_like(net_simple),
-        )
+        if return_turnovers:
+            forced_close_turnover = torch.where(
+                group_must_liquidate[row] & row_advances,
+                (held_group * (1.0 + group_simple_return[row])).abs(),
+                torch.zeros_like(held_group),
+            ).sum()
+            turnover = torch.where(
+                row_advances,
+                group_delta.abs().sum() + forced_close_turnover,
+                torch.zeros_like(net_simple),
+            )
+        else:
+            turnover = torch.zeros_like(net_simple)
         denominator = (1.0 + safe_net).clamp_min(1.0e-7)
         next_group = held_group * (1.0 + group_simple_return[row]) / denominator
         next_group = torch.where(
@@ -589,7 +808,7 @@ def run_tw_futures_portfolio_integer_surrogate_torch(
     )
 
 
-def run_tw_futures_portfolio_integer_torch(
+def _run_tw_futures_portfolio_integer_torch_impl(
     target_weights: torch.Tensor,
     integer_execution: torch.Tensor,
     *,
@@ -599,7 +818,11 @@ def run_tw_futures_portfolio_integer_torch(
     initial_equity_scale: torch.Tensor | None = None,
     initial_alive: torch.Tensor | None = None,
     return_weights_history: bool = True,
+    return_turnovers: bool = True,
     recoverable_backward: bool = False,
+    _initial_surrogate_weights: torch.Tensor | None = None,
+    _initial_surrogate_equity_scale: torch.Tensor | None = None,
+    _initial_surrogate_alive: torch.Tensor | None = None,
 ) -> FuturesPortfolioTensorResult:
     """Run the exact fully-collateralized all-futures carrying account.
 
@@ -668,6 +891,102 @@ def run_tw_futures_portfolio_integer_torch(
     )
     equity = weights.new_tensor(capital) * starting_scale
 
+    # Every field below is exogenous execution metadata.  Grouping it inside
+    # the recurrent loop repeated seven 1,936-slot scatter kernels per day,
+    # even though only quantities/equity/alive are recurrent.  Aggregate the
+    # complete fixed-shape block once across its row dimension; the loop then
+    # contains only the state-dependent integer basket choice and account
+    # update.  This is an algebraic reassociation of the same scatter sums.
+    holding_log_returns_all = execution[..., 0]
+    executable_all = execution[..., 1] > 0.5
+    must_liquidate_all = execution[..., 2] > 0.5
+    opening_notional_all = execution[..., 3]
+    ending_notional_all = execution[..., 4]
+    fixed_fee_all = execution[..., 5]
+    opening_tax_all = execution[..., 6]
+    ending_tax_all = execution[..., 7]
+    maximum_trade_all = torch.floor(
+        execution[..., 8].clamp_min(0.0)
+    ).to(torch.int64)
+    group_index_all = torch.round(execution[..., 9]).to(torch.int64).clamp(
+        0, slots - 1
+    )
+    candidate_tier_all = torch.round(execution[..., 10]).to(
+        torch.int64
+    ).clamp(0, 1)
+    active_metadata_all = (
+        torch.isfinite(holding_log_returns_all)
+        & torch.isfinite(opening_notional_all)
+        & (opening_notional_all > 0.0)
+        & torch.isfinite(ending_notional_all)
+        & (ending_notional_all > 0.0)
+        & torch.isfinite(fixed_fee_all)
+        & (fixed_fee_all >= 0.0)
+        & torch.isfinite(opening_tax_all)
+        & (opening_tax_all >= 0.0)
+        & torch.isfinite(ending_tax_all)
+        & (ending_tax_all >= 0.0)
+    )
+    flat_candidate_index_all = group_index_all * 2 + candidate_tier_all
+
+    def grouped_all(values: torch.Tensor) -> torch.Tensor:
+        source = torch.where(
+            active_metadata_all,
+            values,
+            torch.zeros_like(values),
+        )
+        return torch.zeros(
+            (rows, slots * 2),
+            device=weights.device,
+            dtype=weights.dtype,
+        ).scatter_add(1, flat_candidate_index_all, source).reshape(rows, slots, 2)
+
+    valid_candidates_all = (
+        torch.zeros(
+            (rows, slots * 2),
+            device=weights.device,
+            dtype=torch.int64,
+        ).scatter_add(
+            1,
+            flat_candidate_index_all,
+            active_metadata_all.to(torch.int64),
+        ).reshape(rows, slots, 2)
+        > 0
+    )
+    can_trade_candidates_all = (
+        torch.zeros(
+            (rows, slots * 2),
+            device=weights.device,
+            dtype=torch.int64,
+        ).scatter_add(
+            1,
+            flat_candidate_index_all,
+            (
+                active_metadata_all
+                & executable_all
+                & advance[:, None]
+            ).to(torch.int64),
+        ).reshape(rows, slots, 2)
+        > 0
+    )
+    notionals_all = grouped_all(opening_notional_all)
+    fees_all = grouped_all(fixed_fee_all)
+    entry_taxes_all = grouped_all(opening_tax_all)
+    trade_caps_all = grouped_all(maximum_trade_all.to(weights.dtype)).floor().to(
+        torch.int64
+    )
+    close_reserve_all = fees_all + entry_taxes_all
+    base_reserved_cash_all = notionals_all + close_reserve_all
+    requested_group_all = torch.zeros_like(weights).scatter_add(
+        1,
+        group_index_all,
+        torch.where(
+            advance[:, None],
+            weights,
+            torch.zeros_like(weights),
+        ),
+    )
+
     return_rows: list[torch.Tensor] = []
     turnover_rows: list[torch.Tensor] = []
     weight_rows: list[torch.Tensor] = []
@@ -676,70 +995,28 @@ def run_tw_futures_portfolio_integer_torch(
     default_rows: list[torch.Tensor] = []
     default_reason_rows: list[torch.Tensor] = []
     for row in range(rows):
-        row_exec = execution[row]
-        holding_log_returns = row_exec[:, 0]
-        executable = row_exec[:, 1] > 0.5
-        must_liquidate = row_exec[:, 2] > 0.5
-        opening_notional = row_exec[:, 3]
-        ending_notional = row_exec[:, 4]
-        fixed_fee = row_exec[:, 5]
-        opening_tax = row_exec[:, 6]
-        ending_tax = row_exec[:, 7]
-        maximum_trade = torch.floor(row_exec[:, 8].clamp_min(0.0)).to(torch.int64)
-        group_index = torch.round(row_exec[:, 9]).to(torch.int64).clamp(0, slots - 1)
-        candidate_tier = torch.round(row_exec[:, 10]).to(torch.int64).clamp(0, 1)
-        active_metadata = (
-            torch.isfinite(holding_log_returns)
-            & torch.isfinite(opening_notional)
-            & (opening_notional > 0.0)
-            & torch.isfinite(ending_notional)
-            & (ending_notional > 0.0)
-            & torch.isfinite(fixed_fee)
-            & (fixed_fee >= 0.0)
-            & torch.isfinite(opening_tax)
-            & (opening_tax >= 0.0)
-            & torch.isfinite(ending_tax)
-            & (ending_tax >= 0.0)
-        )
-        requested = torch.where(
-            advance[row] & alive,
-            weights[row],
-            torch.zeros_like(weights[row]),
-        )
-        group_target_weight = torch.zeros_like(requested).scatter_add(
-            0, group_index, requested
+        must_liquidate = must_liquidate_all[row]
+        opening_notional = opening_notional_all[row]
+        ending_notional = ending_notional_all[row]
+        fixed_fee = fixed_fee_all[row]
+        opening_tax = opening_tax_all[row]
+        ending_tax = ending_tax_all[row]
+        group_index = group_index_all[row]
+        active_metadata = active_metadata_all[row]
+        flat_candidate_index = flat_candidate_index_all[row]
+        group_target_weight = torch.where(
+            alive,
+            requested_group_all[row],
+            torch.zeros_like(requested_group_all[row]),
         )
         target_cash = group_target_weight.abs() * equity.detach().clamp_min(0.0)
         group_sign = torch.sign(group_target_weight).to(torch.int64)
-
-        flat_candidate_index = group_index * 2 + candidate_tier
-
-        def grouped(values: torch.Tensor, *, default: float = 0.0) -> torch.Tensor:
-            out = torch.full(
-                (slots * 2,),
-                float(default),
-                device=weights.device,
-                dtype=weights.dtype,
-            )
-            source = torch.where(active_metadata, values, torch.zeros_like(values))
-            return out.scatter_add(0, flat_candidate_index, source).reshape(slots, 2)
-
-        valid_candidates = torch.zeros(
-            (slots * 2,), device=weights.device, dtype=torch.int64
-        ).scatter_add(
-            0, flat_candidate_index, active_metadata.to(torch.int64)
-        ).reshape(slots, 2) > 0
-        can_trade_candidates = torch.zeros(
-            (slots * 2,), device=weights.device, dtype=torch.int64
-        ).scatter_add(
-            0,
-            flat_candidate_index,
-            (active_metadata & executable & advance[row] & alive).to(torch.int64),
-        ).reshape(slots, 2) > 0
-        notionals = grouped(opening_notional)
-        fees = grouped(fixed_fee)
-        entry_taxes = grouped(opening_tax)
-        trade_caps = grouped(maximum_trade.to(weights.dtype)).floor().to(torch.int64)
+        valid_candidates = valid_candidates_all[row]
+        can_trade_candidates = can_trade_candidates_all[row] & alive
+        notionals = notionals_all[row]
+        fees = fees_all[row]
+        entry_taxes = entry_taxes_all[row]
+        trade_caps = trade_caps_all[row]
         prior_group_quantities = torch.zeros(
             (slots * 2,), device=weights.device, dtype=torch.int64
         ).scatter_add(
@@ -748,8 +1025,8 @@ def run_tw_futures_portfolio_integer_torch(
             torch.where(active_metadata, quantities, torch.zeros_like(quantities)),
         ).reshape(slots, 2)
 
-        close_reserve = fees + entry_taxes
-        base_reserved_cash = notionals + close_reserve
+        close_reserve = close_reserve_all[row]
+        base_reserved_cash = base_reserved_cash_all[row]
         maximum_target_contracts = torch.where(
             valid_candidates,
             torch.floor(
@@ -791,32 +1068,19 @@ def run_tw_futures_portfolio_integer_torch(
             * (notionals + close_reserve)[:, None, :]
         ).sum(dim=-1)
         cash_required = candidate_reserved + candidate_trade_cost
-        eps = (
-            torch.finfo(weights.dtype).eps
-            * target_cash.abs().clamp_min(1.0)
-            * 16.0
-        )
-        cash_ok = cash_required <= target_cash[:, None] + eps[:, None]
         signed_exposure = (
             candidate_baskets.to(weights.dtype) * notionals[:, None, :]
         ).sum(dim=-1)
         target_exposure = group_target_weight * equity.detach().clamp_min(0.0)
-        tracking_error = (signed_exposure - target_exposure[:, None]).abs()
-        feasible = capacity_ok & cash_ok
-        any_feasible = feasible.any(dim=1, keepdim=True)
-        de_risk_score = cash_required + tracking_error
-        large = (
-            cash_required.detach().amax(dim=1, keepdim=True)
-            + tracking_error.detach().amax(dim=1, keepdim=True)
-            + equity.detach().abs()
-            + 1.0
+        best, globally_fundable = _globally_funded_group_candidate_indices(
+            cash_required=cash_required,
+            candidate_exposure=signed_exposure,
+            target_exposure=target_exposure,
+            capacity_ok=capacity_ok,
+            target_cash=target_cash,
+            equity=equity.detach().clamp_min(0.0),
+            target_candidate_count=int(target_baskets.size(1)),
         )
-        score = torch.where(
-            any_feasible,
-            torch.where(feasible, tracking_error, large + de_risk_score),
-            torch.where(capacity_ok, de_risk_score, large + de_risk_score),
-        )
-        best = score.argmin(dim=1)
         chosen_group_quantities = candidate_baskets.gather(
             1, best[:, None, None].expand(-1, 1, 2)
         )[:, 0, :]
@@ -847,7 +1111,8 @@ def run_tw_futures_portfolio_integer_torch(
         funded = (
             ~advance[row]
             | (
-                torch.isfinite(collateral_and_exit_reserve)
+                globally_fundable
+                & torch.isfinite(collateral_and_exit_reserve)
                 & torch.isfinite(trade_cost)
                 & (collateral_and_exit_reserve + trade_cost <= equity + 1.0e-3)
             )
@@ -924,20 +1189,32 @@ def run_tw_futures_portfolio_integer_torch(
             torch.log1p(safe_net),
             torch.zeros_like(safe_net),
         )
-        exact_weight = (
-            chosen_by_slot.to(weights.dtype)
-            * torch.where(active_metadata, opening_notional, torch.zeros_like(opening_notional))
-            / equity.detach().clamp_min(1.0e-12)
-        )
-        turnover = (
-            delta_by_slot.abs().to(weights.dtype)
-            * torch.where(active_metadata, opening_notional, torch.zeros_like(opening_notional))
-            + torch.where(
-                must_liquidate & active_metadata,
-                chosen_by_slot.abs().to(weights.dtype) * ending_notional,
-                torch.zeros_like(ending_notional),
+        if return_weights_history:
+            exact_weight = (
+                chosen_by_slot.to(weights.dtype)
+                * torch.where(
+                    active_metadata,
+                    opening_notional,
+                    torch.zeros_like(opening_notional),
+                )
+                / equity.detach().clamp_min(1.0e-12)
             )
-        ).sum() / equity.detach().clamp_min(1.0e-12)
+        if return_turnovers:
+            turnover = (
+                delta_by_slot.abs().to(weights.dtype)
+                * torch.where(
+                    active_metadata,
+                    opening_notional,
+                    torch.zeros_like(opening_notional),
+                )
+                + torch.where(
+                    must_liquidate & active_metadata,
+                    chosen_by_slot.abs().to(weights.dtype) * ending_notional,
+                    torch.zeros_like(ending_notional),
+                )
+            ).sum() / equity.detach().clamp_min(1.0e-12)
+        else:
+            turnover = torch.zeros_like(log_return)
 
         quantities = torch.where(
             advance[row] & must_liquidate,
@@ -951,8 +1228,9 @@ def run_tw_futures_portfolio_integer_torch(
         turnover_rows.append(
             torch.where(advance[row] & alive, turnover, torch.zeros_like(turnover))
         )
-        weight_rows.append(exact_weight)
-        quantity_rows.append(chosen_by_slot)
+        if return_weights_history:
+            weight_rows.append(exact_weight)
+            quantity_rows.append(chosen_by_slot)
         equity_scale_rows.append(equity / capital)
         default_rows.append(row_default)
         default_reason_rows.append(default_reason)
@@ -976,11 +1254,30 @@ def run_tw_futures_portfolio_integer_torch(
             integer_execution,
             initial_capital=capital,
             state_advance_mask=state_advance_mask,
-            initial_quantities=initial_quantities,
-            initial_equity_scale=initial_equity_scale,
-            initial_alive=initial_alive,
+            initial_quantities=(
+                initial_quantities
+                if _initial_surrogate_weights is None
+                else None
+            ),
+            initial_weights=_initial_surrogate_weights,
+            initial_equity_scale=(
+                initial_equity_scale
+                if _initial_surrogate_equity_scale is None
+                else _initial_surrogate_equity_scale
+            ),
+            initial_alive=(
+                initial_alive
+                if _initial_surrogate_alive is None
+                else _initial_surrogate_alive
+            ),
             return_weights_history=return_weights_history,
+            return_turnovers=return_turnovers,
             recover_after_default_for_backward=recoverable_backward,
+            # A public batch boundary intentionally detaches recurrent state.
+            # Internal compiled blocks must retain the graph across their
+            # artificial boundary to remain gradient-identical to one eager
+            # full-batch call.
+            _detach_initial_weights=(_initial_surrogate_weights is None),
         )
         strategy_returns = surrogate.strategy_returns + (
             exact_strategy_returns - surrogate.strategy_returns
@@ -1011,6 +1308,562 @@ def run_tw_futures_portfolio_integer_torch(
         contract_quantities_history=quantity_history,
         default_history=torch.stack(default_rows),
         default_reason_history=torch.stack(default_reason_rows),
+        _surrogate_final_weights=(
+            surrogate.final_weights
+            if surrogate_weights.requires_grad and torch.is_grad_enabled()
+            else None
+        ),
+        _surrogate_final_equity_scale=(
+            surrogate.final_equity_scale
+            if surrogate_weights.requires_grad and torch.is_grad_enabled()
+            else None
+        ),
+        _surrogate_final_alive=(
+            surrogate.final_alive
+            if surrogate_weights.requires_grad and torch.is_grad_enabled()
+            else None
+        ),
+    )
+
+
+def _integer_result_tuple(
+    result: FuturesPortfolioTensorResult,
+) -> tuple[torch.Tensor, ...]:
+    """Flatten one integer-account result into a compile-safe tensor tuple."""
+
+    if (
+        result.equity_scale_history is None
+        or result.final_equity_scale is None
+        or result.contract_quantities_history is None
+        or result.default_history is None
+        or result.default_reason_history is None
+    ):
+        raise RuntimeError("integer futures result omitted exact account state")
+    shadow_weights = (
+        result.final_weights
+        if result._surrogate_final_weights is None
+        else result._surrogate_final_weights
+    )
+    shadow_scale = (
+        result.final_equity_scale
+        if result._surrogate_final_equity_scale is None
+        else result._surrogate_final_equity_scale
+    )
+    shadow_alive = (
+        result.final_alive
+        if result._surrogate_final_alive is None
+        else result._surrogate_final_alive
+    )
+    return (
+        result.strategy_returns,
+        result.turnovers,
+        result.weights_history,
+        result.final_weights,
+        result.final_alive,
+        result.equity_scale_history,
+        result.final_equity_scale,
+        result.contract_quantities_history,
+        result.default_history,
+        result.default_reason_history,
+        shadow_weights,
+        shadow_scale,
+        shadow_alive,
+    )
+
+
+def _initial_integer_surrogate_state(
+    integer_execution: torch.Tensor,
+    *,
+    initial_capital: float,
+    initial_quantities: torch.Tensor | None,
+    initial_equity_scale: torch.Tensor | None,
+    initial_alive: torch.Tensor | None,
+    recoverable_backward: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Construct the shadow state exactly as the eager surrogate does."""
+
+    execution = integer_execution.to(dtype=torch.float32)
+    slots = int(execution.size(1))
+    quantities = (
+        torch.zeros((slots,), device=execution.device, dtype=torch.int64)
+        if initial_quantities is None
+        else torch.round(
+            initial_quantities.detach().to(
+                device=execution.device,
+                dtype=torch.float32,
+            )
+        ).to(torch.int64)
+    )
+    supplied_alive = (
+        torch.ones((), device=execution.device, dtype=torch.bool)
+        if initial_alive is None
+        else initial_alive.detach().to(
+            device=execution.device,
+            dtype=torch.bool,
+        ).reshape(())
+    )
+    supplied_scale = (
+        execution.new_ones(())
+        if initial_equity_scale is None
+        else initial_equity_scale.detach().to(
+            device=execution.device,
+            dtype=torch.float32,
+        ).reshape(())
+    )
+    if recoverable_backward:
+        valid_start = (
+            supplied_alive
+            & torch.isfinite(supplied_scale)
+            & (supplied_scale > 0.0)
+        )
+        shadow_scale = torch.where(
+            valid_start,
+            supplied_scale,
+            execution.new_ones(()),
+        )
+        shadow_alive = torch.ones_like(supplied_alive)
+    else:
+        shadow_scale = supplied_scale
+        shadow_alive = supplied_alive
+
+    first = execution[0]
+    holding_log_returns = first[:, 0]
+    opening_notional = first[:, 3]
+    ending_notional = first[:, 4]
+    fixed_fee = first[:, 5]
+    opening_tax = first[:, 6]
+    ending_tax = first[:, 7]
+    active = (
+        torch.isfinite(holding_log_returns)
+        & torch.isfinite(opening_notional)
+        & (opening_notional > 0.0)
+        & torch.isfinite(ending_notional)
+        & (ending_notional > 0.0)
+        & torch.isfinite(fixed_fee)
+        & (fixed_fee >= 0.0)
+        & torch.isfinite(opening_tax)
+        & (opening_tax >= 0.0)
+        & torch.isfinite(ending_tax)
+        & (ending_tax >= 0.0)
+    )
+    shadow_equity = execution.new_tensor(float(initial_capital)) * shadow_scale
+    shadow_weights = (
+        quantities.to(dtype=torch.float32)
+        * torch.where(active, opening_notional, torch.zeros_like(opening_notional))
+        / shadow_equity.clamp_min(1.0e-12)
+    )
+    return shadow_weights, shadow_scale, shadow_alive
+
+
+def _compiled_integer_block(
+    target_weights: torch.Tensor,
+    *,
+    block_rows: int,
+    initial_capital: float,
+    return_weights_history: bool,
+    return_turnovers: bool,
+    recoverable_backward: bool,
+) -> tuple[
+    tuple[object, ...],
+    Callable[..., tuple[torch.Tensor, ...]],
+]:
+    device_index = (
+        target_weights.device.index
+        if target_weights.device.index is not None
+        else torch.cuda.current_device()
+    )
+    training_shadow = bool(
+        torch.is_grad_enabled() and target_weights.requires_grad
+    )
+    key: tuple[object, ...] = (
+        int(device_index),
+        str(target_weights.dtype),
+        int(target_weights.size(1)),
+        int(block_rows),
+        float(initial_capital),
+        bool(return_weights_history),
+        bool(return_turnovers),
+        bool(recoverable_backward),
+        training_shadow,
+    )
+    compiled = _COMPILED_INTEGER_BLOCKS.get(key)
+    if compiled is not None:
+        return key, compiled
+
+    def block(
+        block_weights: torch.Tensor,
+        block_execution: torch.Tensor,
+        block_advance: torch.Tensor,
+        exact_quantities: torch.Tensor,
+        exact_equity_scale: torch.Tensor,
+        exact_alive: torch.Tensor,
+        shadow_weights: torch.Tensor,
+        shadow_equity_scale: torch.Tensor,
+        shadow_alive: torch.Tensor,
+    ) -> tuple[torch.Tensor, ...]:
+        return _integer_result_tuple(
+            _run_tw_futures_portfolio_integer_torch_impl(
+                block_weights,
+                block_execution,
+                initial_capital=initial_capital,
+                state_advance_mask=block_advance,
+                initial_quantities=exact_quantities,
+                initial_equity_scale=exact_equity_scale,
+                initial_alive=exact_alive,
+                return_weights_history=return_weights_history,
+                return_turnovers=return_turnovers,
+                recoverable_backward=recoverable_backward,
+                _initial_surrogate_weights=(
+                    shadow_weights if training_shadow else None
+                ),
+                _initial_surrogate_equity_scale=(
+                    shadow_equity_scale if training_shadow else None
+                ),
+                _initial_surrogate_alive=(
+                    shadow_alive if training_shadow else None
+                ),
+            )
+        )
+
+    compiled = torch.compile(
+        block,
+        fullgraph=True,
+        dynamic=False,
+        options={"triton.cudagraphs": False},
+    )
+    _COMPILED_INTEGER_BLOCKS[key] = compiled
+    _INTEGER_COMPILE_STATS["compile_constructors"] += 1
+    return key, compiled
+
+
+def _pad_integer_compile_tail(
+    target_weights: torch.Tensor,
+    integer_execution: torch.Tensor,
+    state_advance_mask: torch.Tensor,
+    *,
+    block_rows: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pad a short terminal block with inert rows for the fixed graph.
+
+    An eager terminal recurrence is disproportionately expensive: even one
+    real row launches the full 1,936-slot grouped-account kernel sequence.  A
+    zero execution row with ``state_advance_mask=False`` is an identity step
+    for both the exact integer ledger and its differentiable shadow, so the
+    fixed compiled graph can process the tail without changing any public or
+    recurrent result.  Concatenation keeps only the real prefix.
+    """
+
+    rows, slots = tuple(target_weights.shape)
+    if not 0 < rows < int(block_rows):
+        raise ValueError("integer compile tail must contain 1..block_rows-1 rows")
+    if tuple(integer_execution.shape) != (rows, slots, 11):
+        raise ValueError("integer compile tail execution must have shape [T,S,11]")
+    if tuple(state_advance_mask.shape) != (rows,):
+        raise ValueError("integer compile tail advance mask must have shape [T]")
+    padding = int(block_rows) - rows
+    return (
+        torch.cat(
+            (
+                target_weights,
+                target_weights.new_zeros((padding, slots)),
+            ),
+            dim=0,
+        ),
+        torch.cat(
+            (
+                integer_execution,
+                integer_execution.new_zeros((padding, slots, 11)),
+            ),
+            dim=0,
+        ),
+        torch.cat(
+            (
+                state_advance_mask,
+                torch.zeros(
+                    (padding,),
+                    device=state_advance_mask.device,
+                    dtype=torch.bool,
+                ),
+            ),
+            dim=0,
+        ),
+    )
+
+
+def run_tw_futures_portfolio_integer_torch(
+    target_weights: torch.Tensor,
+    integer_execution: torch.Tensor,
+    *,
+    initial_capital: float,
+    state_advance_mask: torch.Tensor | None = None,
+    initial_quantities: torch.Tensor | None = None,
+    initial_equity_scale: torch.Tensor | None = None,
+    initial_alive: torch.Tensor | None = None,
+    return_weights_history: bool = True,
+    return_turnovers: bool = True,
+    recoverable_backward: bool = False,
+) -> FuturesPortfolioTensorResult:
+    """Run the exact account through reusable, gradient-identical blocks."""
+
+    block_rows = resolve_tw_futures_portfolio_integer_compiled_block_rows()
+    compile_blocks = bool(
+        block_rows > 0
+        and target_weights.ndim == 2
+        and int(target_weights.size(0)) >= block_rows
+        and target_weights.device.type == "cuda"
+        and hasattr(torch, "compile")
+        and _env_truthy("STOCKAGENT_BACKTEST_COMPILE", "1")
+        and not torch.compiler.is_compiling()
+    )
+    if not compile_blocks:
+        return _run_tw_futures_portfolio_integer_torch_impl(
+            target_weights,
+            integer_execution,
+            initial_capital=initial_capital,
+            state_advance_mask=state_advance_mask,
+            initial_quantities=initial_quantities,
+            initial_equity_scale=initial_equity_scale,
+            initial_alive=initial_alive,
+            return_weights_history=return_weights_history,
+            return_turnovers=return_turnovers,
+            recoverable_backward=recoverable_backward,
+        )
+
+    rows, slots = tuple(target_weights.shape)
+    if (
+        integer_execution.ndim != 3
+        or tuple(integer_execution.shape[:2]) != (rows, slots)
+        or int(integer_execution.size(-1)) != 11
+    ):
+        raise ValueError("integer_execution must have shape [T,S,11]")
+    advance = (
+        torch.ones((rows,), device=target_weights.device, dtype=torch.bool)
+        if state_advance_mask is None
+        else state_advance_mask.to(device=target_weights.device, dtype=torch.bool)
+    )
+    if tuple(advance.shape) != (rows,):
+        raise ValueError("state_advance_mask must have shape [T]")
+    exact_quantities = (
+        torch.zeros((slots,), device=target_weights.device, dtype=torch.int64)
+        if initial_quantities is None
+        else torch.round(
+            initial_quantities.detach().to(
+                device=target_weights.device,
+                dtype=torch.float32,
+            )
+        ).to(torch.int64)
+    )
+    exact_equity_scale = (
+        target_weights.new_ones((), dtype=torch.float32)
+        if initial_equity_scale is None
+        else initial_equity_scale.detach().to(
+            device=target_weights.device,
+            dtype=torch.float32,
+        ).reshape(())
+    )
+    exact_alive = (
+        torch.ones((), device=target_weights.device, dtype=torch.bool)
+        if initial_alive is None
+        else initial_alive.detach().to(
+            device=target_weights.device,
+            dtype=torch.bool,
+        ).reshape(())
+    )
+    training_shadow = bool(
+        torch.is_grad_enabled() and target_weights.requires_grad
+    )
+    if training_shadow:
+        shadow_weights, shadow_equity_scale, shadow_alive = (
+            _initial_integer_surrogate_state(
+                integer_execution,
+                initial_capital=initial_capital,
+                initial_quantities=exact_quantities,
+                initial_equity_scale=exact_equity_scale,
+                initial_alive=exact_alive,
+                recoverable_backward=recoverable_backward,
+            )
+        )
+    else:
+        shadow_weights = exact_quantities.to(dtype=torch.float32)
+        shadow_equity_scale = exact_equity_scale
+        shadow_alive = exact_alive
+
+    try:
+        compiled_key, compiled_block = _compiled_integer_block(
+            target_weights,
+            block_rows=block_rows,
+            initial_capital=float(initial_capital),
+            return_weights_history=return_weights_history,
+            return_turnovers=return_turnovers,
+            recoverable_backward=recoverable_backward,
+        )
+    except Exception:
+        if _strict_no_fallback_enabled():
+            raise
+        _INTEGER_COMPILE_STATS["eager_fallback_calls"] += 1
+        return _run_tw_futures_portfolio_integer_torch_impl(
+            target_weights,
+            integer_execution,
+            initial_capital=initial_capital,
+            state_advance_mask=advance,
+            initial_quantities=exact_quantities,
+            initial_equity_scale=exact_equity_scale,
+            initial_alive=exact_alive,
+            return_weights_history=return_weights_history,
+            recoverable_backward=recoverable_backward,
+        )
+
+    outputs: list[tuple[torch.Tensor, ...]] = []
+    full_stop = rows - rows % block_rows
+    for start in range(0, full_stop, block_rows):
+        stop = start + block_rows
+        try:
+            values = compiled_block(
+                target_weights[start:stop],
+                integer_execution[start:stop],
+                advance[start:stop],
+                exact_quantities,
+                exact_equity_scale,
+                exact_alive,
+                shadow_weights,
+                shadow_equity_scale,
+                shadow_alive,
+            )
+        except Exception:
+            _COMPILED_INTEGER_BLOCKS.pop(compiled_key, None)
+            _FAILED_INTEGER_BLOCKS.add(compiled_key)
+            if _strict_no_fallback_enabled():
+                raise
+            _INTEGER_COMPILE_STATS["eager_fallback_calls"] += 1
+            values = _integer_result_tuple(
+                _run_tw_futures_portfolio_integer_torch_impl(
+                    target_weights[start:stop],
+                    integer_execution[start:stop],
+                    initial_capital=initial_capital,
+                    state_advance_mask=advance[start:stop],
+                    initial_quantities=exact_quantities,
+                    initial_equity_scale=exact_equity_scale,
+                    initial_alive=exact_alive,
+                    return_weights_history=return_weights_history,
+                    return_turnovers=return_turnovers,
+                    recoverable_backward=recoverable_backward,
+                    _initial_surrogate_weights=(
+                        shadow_weights if training_shadow else None
+                    ),
+                    _initial_surrogate_equity_scale=(
+                        shadow_equity_scale if training_shadow else None
+                    ),
+                    _initial_surrogate_alive=(
+                        shadow_alive if training_shadow else None
+                    ),
+                )
+            )
+        else:
+            _INTEGER_COMPILE_STATS["compiled_block_calls"] += 1
+            _INTEGER_COMPILE_STATS["compiled_day_calls"] += block_rows
+        outputs.append(values)
+        exact_quantities = values[3]
+        exact_alive = values[4]
+        exact_equity_scale = values[6]
+        if training_shadow:
+            shadow_weights = values[10]
+            shadow_equity_scale = values[11]
+            shadow_alive = values[12]
+
+    if full_stop < rows:
+        valid_tail_rows = rows - full_stop
+        padded_weights, padded_execution, padded_advance = (
+            _pad_integer_compile_tail(
+                target_weights[full_stop:],
+                integer_execution[full_stop:],
+                advance[full_stop:],
+                block_rows=block_rows,
+            )
+        )
+        try:
+            tail = compiled_block(
+                padded_weights,
+                padded_execution,
+                padded_advance,
+                exact_quantities,
+                exact_equity_scale,
+                exact_alive,
+                shadow_weights,
+                shadow_equity_scale,
+                shadow_alive,
+            )
+        except Exception:
+            _COMPILED_INTEGER_BLOCKS.pop(compiled_key, None)
+            _FAILED_INTEGER_BLOCKS.add(compiled_key)
+            if _strict_no_fallback_enabled():
+                raise
+            _INTEGER_COMPILE_STATS["eager_fallback_calls"] += 1
+            tail = _integer_result_tuple(
+                _run_tw_futures_portfolio_integer_torch_impl(
+                    target_weights[full_stop:],
+                    integer_execution[full_stop:],
+                    initial_capital=initial_capital,
+                    state_advance_mask=advance[full_stop:],
+                    initial_quantities=exact_quantities,
+                    initial_equity_scale=exact_equity_scale,
+                    initial_alive=exact_alive,
+                    return_weights_history=return_weights_history,
+                    return_turnovers=return_turnovers,
+                    recoverable_backward=recoverable_backward,
+                    _initial_surrogate_weights=(
+                        shadow_weights if training_shadow else None
+                    ),
+                    _initial_surrogate_equity_scale=(
+                        shadow_equity_scale if training_shadow else None
+                    ),
+                    _initial_surrogate_alive=(
+                        shadow_alive if training_shadow else None
+                    ),
+                )
+            )
+        else:
+            _INTEGER_COMPILE_STATS["compiled_block_calls"] += 1
+            _INTEGER_COMPILE_STATS["compiled_day_calls"] += valid_tail_rows
+            _INTEGER_COMPILE_STATS["compiled_tail_calls"] += 1
+
+            # Row-shaped histories include inert padding.  Terminal states are
+            # deliberately left unsliced because every padded row is an
+            # identity transition.
+            tail = tuple(
+                value[:valid_tail_rows]
+                if index in {0, 1, 2, 5, 7, 8, 9}
+                else value
+                for index, value in enumerate(tail)
+            )
+        outputs.append(tail)
+        exact_quantities = tail[3]
+        exact_alive = tail[4]
+        exact_equity_scale = tail[6]
+        if training_shadow:
+            shadow_weights = tail[10]
+            shadow_equity_scale = tail[11]
+            shadow_alive = tail[12]
+
+    def concatenate(index: int) -> torch.Tensor:
+        return torch.cat([values[index] for values in outputs], dim=0)
+
+    equity_scale_history = concatenate(5)
+    return FuturesPortfolioTensorResult(
+        strategy_returns=concatenate(0),
+        turnovers=concatenate(1),
+        weights_history=concatenate(2),
+        final_weights=exact_quantities,
+        final_alive=exact_alive,
+        equity_scale_history=equity_scale_history,
+        final_equity_scale=exact_equity_scale,
+        contract_quantities_history=concatenate(7),
+        default_history=concatenate(8),
+        default_reason_history=concatenate(9),
+        _surrogate_final_weights=(shadow_weights if training_shadow else None),
+        _surrogate_final_equity_scale=(
+            shadow_equity_scale if training_shadow else None
+        ),
+        _surrogate_final_alive=(shadow_alive if training_shadow else None),
     )
 
 
@@ -1312,6 +2165,9 @@ __all__ = [
     "TW_FUTURES_PORTFOLIO_INTEGER_TRAINING_FORWARD",
     "TW_FUTURES_PORTFOLIO_INTEGER_RECOVERABLE_TRAINING_SURROGATE",
     "TW_FUTURES_PORTFOLIO_INTEGER_TRAINING_SURROGATE",
+    "TW_FUTURES_PORTFOLIO_INTEGER_COMPILED_BLOCK_ROWS",
+    "get_tw_futures_portfolio_integer_compile_stats",
+    "resolve_tw_futures_portfolio_integer_compiled_block_rows",
     "run_tw_futures_portfolio_continuous_numpy",
     "run_tw_futures_portfolio_continuous_torch",
     "run_tw_futures_portfolio_integer_surrogate_torch",

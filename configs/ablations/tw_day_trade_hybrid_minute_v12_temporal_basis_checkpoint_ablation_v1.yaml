@@ -1,0 +1,180 @@
+# Fold-matched temporal-basis ablation for the completed exact-minute v12 run.
+#
+# The completed v12 artifact is the external control and is never overwritten
+# or retrained here.  Every variant keeps all 22 basis banks, all 524 retained
+# projection columns, the full 99-feature ABI, exact minute execution, fees,
+# capital, walk-forward splits, and checkpoint tensor shapes.  The only model
+# intervention is a deterministic zero-signal mask on the named basis family.
+# This permits each fold to initialize from the matching completed v12 policy
+# without pretending that a resized basis projection is checkpoint-compatible.
+base_config: configs/markets/tw_day_trade_1m_hybrid_22_effective_rank_pretrained_guard_v12.yaml
+output_root: artifacts/ablations/tw_day_trade_hybrid_minute_v12_temporal_basis_checkpoint_ablation_v1
+expected_fold_count: 11
+baseline_artifact_root: artifacts/markets/tw_day_trade_hybrid_minute_22_effective_rank_pretrained_exact_official_close_commission20_capital10m_all_features_v12
+require_complete_baseline_artifact: true
+
+pinned_panel_cache:
+  snapshot_id: tw-public-20260820T015018219623218Z-l0-penguin-6716296ea30636ba
+  variant_id: fe882a5c1a14a6f10a78759ff5c11bed190fdf7edd35f4020f5b4af2c52bc577
+  version: 54
+  generation: 3726b829b37d4d56833a80b20280e4a2
+  source_hash: 31f3e4f1e31338bb9c0fd52494cc0d840a5081ffeab00a1fceddfa3412258fe0
+
+runtime:
+  parallel_jobs: 1
+  cpu_threads: 112
+  torch_compile_threads: 16
+
+matrix:
+  mode: one_factor_at_a_time
+  # The formal baseline already has all 11 fold_complete markers.  The TW
+  # supervisor supplies it to every comparison plot through baseline_root.
+  include_baseline: false
+
+  fixed_overrides:
+    runner:
+      resume: true
+      post_train_infer: false
+    training:
+      epochs: 1000
+      early_stopping_no_improve_ratio: 0.1
+      explain_after_each_fold: false
+      # Same fold years, same raw feature ABI, same tensor schema.  Optimizer
+      # state is not imported; epoch 0 is revalued under the ablated forward.
+      pretrained_initialization_root: artifacts/markets/tw_day_trade_hybrid_minute_22_effective_rank_pretrained_exact_official_close_commission20_capital10m_all_features_v12
+      pretrained_initialization_fold_policy: matching_train_and_validation_years
+      pretrained_initialization_feature_adapter: identity_by_feature_name
+      pretrained_initialization_require_exact_backbone: true
+      record_epoch_curve: true
+      epoch_test_curve: true
+
+  dimensions:
+    - name: temporal_basis_checkpoint_ablation
+      enabled: true
+      baseline: all_22_paths_enabled
+      variants:
+        - name: all_disabled
+          experiment_name: no_temporal_basis_paths
+          description: Zero all 22 basis paths while preserving the complete v12 checkpoint ABI and ordinary original-data endpoint.
+          overrides:
+            training:
+              financial_transformer:
+                temporal_basis_disabled_families: &all_basis_families
+                  - haar
+                  - swt_db2
+                  - swt_sym4
+                  - wavelet_packet
+                  - walsh
+                  - fourier
+                  - dct
+                  - dpss
+                  - local_cosine
+                  - morlet
+                  - exponential
+                  - laguerre
+                  - difference
+                  - ar_innovation
+                  - bspline
+                  - legendre
+                  - chebyshev
+                  - learned
+                  - kautz
+                  - discrete_hermite
+                  - chirplet
+                  - pca_klt
+
+        - name: learned_only
+          experiment_name: learned_basis_only
+          description: Keep only the learned dictionary path; every analytical and training-only PCA/KLT path is zeroed without resizing the model.
+          overrides:
+            training:
+              financial_transformer:
+                temporal_basis_disabled_families:
+                  - haar
+                  - swt_db2
+                  - swt_sym4
+                  - wavelet_packet
+                  - walsh
+                  - fourier
+                  - dct
+                  - dpss
+                  - local_cosine
+                  - morlet
+                  - exponential
+                  - laguerre
+                  - difference
+                  - ar_innovation
+                  - bspline
+                  - legendre
+                  - chebyshev
+                  - kautz
+                  - discrete_hermite
+                  - chirplet
+                  - pca_klt
+
+        - name: without_haar
+          experiment_name: without_haar
+          overrides: {training: {financial_transformer: {temporal_basis_disabled_families: [haar]}}}
+        - name: without_swt_db2
+          experiment_name: without_swt_db2
+          overrides: {training: {financial_transformer: {temporal_basis_disabled_families: [swt_db2]}}}
+        - name: without_swt_sym4
+          experiment_name: without_swt_sym4
+          overrides: {training: {financial_transformer: {temporal_basis_disabled_families: [swt_sym4]}}}
+        - name: without_wavelet_packet
+          experiment_name: without_wavelet_packet
+          overrides: {training: {financial_transformer: {temporal_basis_disabled_families: [wavelet_packet]}}}
+        - name: without_walsh
+          experiment_name: without_walsh
+          overrides: {training: {financial_transformer: {temporal_basis_disabled_families: [walsh]}}}
+        - name: without_fourier
+          experiment_name: without_fourier
+          overrides: {training: {financial_transformer: {temporal_basis_disabled_families: [fourier]}}}
+        - name: without_dct
+          experiment_name: without_dct
+          overrides: {training: {financial_transformer: {temporal_basis_disabled_families: [dct]}}}
+        - name: without_dpss
+          experiment_name: without_dpss
+          overrides: {training: {financial_transformer: {temporal_basis_disabled_families: [dpss]}}}
+        - name: without_local_cosine
+          experiment_name: without_local_cosine
+          overrides: {training: {financial_transformer: {temporal_basis_disabled_families: [local_cosine]}}}
+        - name: without_morlet
+          experiment_name: without_morlet
+          overrides: {training: {financial_transformer: {temporal_basis_disabled_families: [morlet]}}}
+        - name: without_exponential
+          experiment_name: without_exponential
+          overrides: {training: {financial_transformer: {temporal_basis_disabled_families: [exponential]}}}
+        - name: without_laguerre
+          experiment_name: without_laguerre
+          overrides: {training: {financial_transformer: {temporal_basis_disabled_families: [laguerre]}}}
+        - name: without_difference
+          experiment_name: without_difference
+          overrides: {training: {financial_transformer: {temporal_basis_disabled_families: [difference]}}}
+        - name: without_ar_innovation
+          experiment_name: without_ar_innovation
+          overrides: {training: {financial_transformer: {temporal_basis_disabled_families: [ar_innovation]}}}
+        - name: without_bspline
+          experiment_name: without_bspline
+          overrides: {training: {financial_transformer: {temporal_basis_disabled_families: [bspline]}}}
+        - name: without_legendre
+          experiment_name: without_legendre
+          overrides: {training: {financial_transformer: {temporal_basis_disabled_families: [legendre]}}}
+        - name: without_chebyshev
+          experiment_name: without_chebyshev
+          overrides: {training: {financial_transformer: {temporal_basis_disabled_families: [chebyshev]}}}
+        - name: without_learned
+          experiment_name: without_learned
+          overrides: {training: {financial_transformer: {temporal_basis_disabled_families: [learned]}}}
+        - name: without_kautz
+          experiment_name: without_kautz
+          overrides: {training: {financial_transformer: {temporal_basis_disabled_families: [kautz]}}}
+        - name: without_discrete_hermite
+          experiment_name: without_discrete_hermite
+          overrides: {training: {financial_transformer: {temporal_basis_disabled_families: [discrete_hermite]}}}
+        - name: without_chirplet
+          experiment_name: without_chirplet
+          overrides: {training: {financial_transformer: {temporal_basis_disabled_families: [chirplet]}}}
+        - name: without_pca_klt
+          experiment_name: without_pca_klt
+          overrides: {training: {financial_transformer: {temporal_basis_disabled_families: [pca_klt]}}}

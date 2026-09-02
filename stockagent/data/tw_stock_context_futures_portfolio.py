@@ -437,9 +437,15 @@ def attach_stock_context_futures_portfolio_daily(
             # An early archive termination is not an expiry fill.  Prevent the
             # policy from ever opening that physical contract instead of
             # inventing a terminal price or reallocating its desired cash.
-            source_expiry_quarantine = np.isin(
-                source_physical_contracts,
-                list(incomplete_contracts),
+            # ``np.isin`` on a multi-million-row object array and thousands
+            # of strings degenerates into an expensive comparison workload.
+            # Polars builds a hash membership set and preserves the same
+            # row-aligned boolean result.
+            source_expiry_quarantine = (
+                frame["physical_contract"]
+                .fill_null("")
+                .is_in(sorted(incomplete_contracts))
+                .to_numpy()
             )
 
     source_carry_quarantine = source_expiry_quarantine.copy()
@@ -462,9 +468,11 @@ def attach_stock_context_futures_portfolio_daily(
             )
         bad_physical_contracts = set(physical_values[suspicious].tolist())
         if bad_physical_contracts:
-            source_carry_quarantine |= relevant & np.isin(
-                physical_values,
-                list(bad_physical_contracts),
+            source_carry_quarantine |= relevant & (
+                frame["physical_contract"]
+                .fill_null("")
+                .is_in(sorted(bad_physical_contracts))
+                .to_numpy()
             )
 
     flat_keys = date_indices * TAIFEX_FUTURES_PORTFOLIO_FIXED_SLOT_COUNT + symbol_indices

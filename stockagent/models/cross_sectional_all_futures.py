@@ -31,6 +31,7 @@ from stockagent.models.transformer_base_portfolio import (
 CROSS_SECTIONAL_ALL_FUTURES_LEGACY_MODEL_CONTRACT_VERSION = 2
 CROSS_SECTIONAL_ALL_FUTURES_MODEL_CONTRACT_VERSION = 3
 CROSS_SECTIONAL_ALL_FUTURES_CURRENT_OPEN_MODEL_CONTRACT_VERSION = 4
+CROSS_SECTIONAL_ALL_FUTURES_EXECUTOR_QUANTIZED_MODEL_CONTRACT_VERSION = 5
 
 
 class CrossSectionalAllFuturesModel(TransformerBasePortfolioModel):
@@ -50,6 +51,7 @@ class CrossSectionalAllFuturesModel(TransformerBasePortfolioModel):
         futures_product_capacity: int = 1024,
         futures_joint_market_tokens: int = 4,
         futures_denomination_aware_output: bool = False,
+        futures_denomination_hard_projection: bool | None = None,
         futures_current_open_feature: bool = False,
         futures_denomination_reference_capital: float = 10_000_000.0,
         **kwargs: Any,
@@ -69,6 +71,18 @@ class CrossSectionalAllFuturesModel(TransformerBasePortfolioModel):
         self.futures_denomination_aware_output = bool(
             futures_denomination_aware_output
         )
+        self.futures_denomination_hard_projection = (
+            self.futures_denomination_aware_output
+            if futures_denomination_hard_projection is None
+            else bool(futures_denomination_hard_projection)
+        )
+        if (
+            self.futures_denomination_hard_projection
+            and not self.futures_denomination_aware_output
+        ):
+            raise ValueError(
+                "futures denomination hard projection requires denomination context"
+            )
         self.futures_current_open_feature = bool(futures_current_open_feature)
         if (
             self.futures_current_open_feature
@@ -521,7 +535,7 @@ class CrossSectionalAllFuturesModel(TransformerBasePortfolioModel):
                     )
                 ),
             )
-        if self.futures_denomination_aware_output:
+        if self.futures_denomination_hard_projection:
             if denomination_features is None:
                 raise ValueError(
                     "denomination-aware all-futures output requires denomination context"

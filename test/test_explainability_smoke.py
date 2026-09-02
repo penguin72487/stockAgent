@@ -16,6 +16,7 @@ from stockagent.data.walkforward import WalkForwardFold
 from stockagent.explainability import (
     ExplainabilitySettings,
     _align_panel_to_checkpoint_universe,
+    _attach_temporal_basis_selection,
     _daily_weight_symbols,
     _evenly_spaced_sample_indices,
     _method_agreement_table,
@@ -749,6 +750,48 @@ def test_input_feature_temporal_basis_compares_original_endpoint_with_each_famil
     chunked = explain_batch_row_chunked(model, batch, **kwargs)
     assert chunked["summary"]["temporal_basis"]["chunks_aggregated"] == rows
     assert len(chunked["frames"]["temporal_basis_family_diagnostics"]) == 4
+    selection = {
+        "families": ["haar", "dct"],
+        "candidate_counts": {"haar": 4, "dct": 4},
+        "selected_counts": {"haar": 2, "dct": 2},
+        "selected_total": 4,
+        "actual_rank": 3,
+        "near_duplicate_count": 1,
+        "near_duplicate_threshold": 1e-4,
+        "selection_policy": "per_family_effective_rank",
+        "selection_fingerprint": "test-selection",
+        "pca_klt_training_only": True,
+        "selected": [
+            {
+                "basis_name": f"{family}_{component}",
+                "family": family,
+                "family_component_index": component,
+                "parameters": {
+                    "candidate_index": component,
+                    "component_index": component,
+                },
+                "variance_contribution": 0.25,
+                "novelty_variance_contribution": 0.25,
+                "novelty_ratio": 1.0,
+                "near_duplicate": False,
+                "rank_after": min(3, order + 1),
+            }
+            for order, (family, component) in enumerate(
+                (("haar", 0), ("haar", 1), ("dct", 0), ("dct", 1))
+            )
+        ],
+    }
+    _attach_temporal_basis_selection(
+        chunked,
+        selection,
+        model=model,
+        strict=True,
+    )
+    family = chunked["frames"]["temporal_basis_family_diagnostics"]
+    basis_rows = family.filter(pl.col("path_type") == "basis_family")
+    assert basis_rows.get_column("selected_count").to_list() == [2, 2]
+    assert basis_rows.get_column("combined_effective_rank").to_list() == [3, 3]
+    assert len(chunked["frames"]["temporal_basis_selection_components"]) == 4
 
     output_dir = tmp_path / "input_feature_basis_explainability"
     write_explanation_outputs(
@@ -757,12 +800,64 @@ def test_input_feature_temporal_basis_compares_original_endpoint_with_each_famil
         metadata={"model_name": "financial_transformer", "config_lookback": lookback},
         plot_backend="matplotlib",
     )
-    assert (output_dir / "plots_paper" / "temporal_basis_preference.png").exists()
+    for filename in (
+        "temporal_basis_preference.png",
+        "temporal_basis_selection_vs_use.png",
+    ):
+        assert (output_dir / "plots_paper" / filename).exists()
     assert (
         output_dir / "paper_tables" / "temporal_basis_family_diagnostics.csv"
     ).exists()
+    assert (
+        output_dir / "paper_tables" / "temporal_basis_selection_family.csv"
+    ).exists()
     summary_json = json.loads((output_dir / "summary.json").read_text(encoding="utf-8"))
     assert summary_json["plot_validation"]["failed"] == 0
+
+
+def test_input_feature_basis_disabled_family_preserves_checkpoint_abi() -> None:
+    common = dict(
+        lookback=4,
+        num_features=3,
+        num_symbols=2,
+        d_model=8,
+        attention_mode="market_token",
+        temporal_layers=1,
+        temporal_heads=2,
+        temporal_ffn_mult=1,
+        cross_heads=2,
+        cross_ffn_mult=1,
+        num_market_tokens=2,
+        market_layers=1,
+        head_hidden_dim=8,
+        head_layers=1,
+        dropout=0.0,
+        input_dropout=0.0,
+        temporal_basis_families=("haar", "dct"),
+        temporal_basis_components=2,
+        temporal_basis_input="input_features",
+        portfolio_output_mode="logits",
+        return_aux=False,
+        return_aux_details=False,
+        allow_dynamic_symbols=True,
+    )
+    torch.manual_seed(29)
+    baseline = FinancialTransformerModel(**common).eval()
+    disabled = FinancialTransformerModel(
+        **common,
+        temporal_basis_disabled_families=("haar",),
+    ).eval()
+    incompatible = disabled.load_state_dict(baseline.state_dict(), strict=True)
+
+    assert not incompatible.missing_keys
+    assert not incompatible.unexpected_keys
+    assert baseline.state_dict().keys() == disabled.state_dict().keys()
+    assert disabled.temporal_basis_disabled_families == ("haar",)
+    builder = disabled.temporal_basis_input_feature_builder
+    assert builder is not None
+    source = torch.randn(1, 4, 2, 3)
+    assert torch.count_nonzero(builder._basis("haar", source)).item() == 0
+    assert torch.count_nonzero(builder._basis("dct", source)).item() > 0
 
 
 def test_feature_correlations_zero_variance_without_runtime_warning() -> None:

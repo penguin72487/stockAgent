@@ -215,14 +215,17 @@ def _plot_completed_experiments(
         _run_checked(command)
 
 
-def _load_effective_spec(spec_path: Path) -> tuple[dict, list[dict]]:
+def _load_effective_spec(
+    spec_path: Path,
+    selected: set[str] | None = None,
+) -> tuple[dict, list[dict]]:
     """Load the same recursively inherited spec used by the worker runner."""
 
     if str(REPO_ROOT) not in sys.path:
         sys.path.insert(0, str(REPO_ROOT))
     from scripts.run_ablation_experiments import _experiment_rows
 
-    return _experiment_rows(spec_path.resolve())
+    return _experiment_rows(spec_path.resolve(), selected)
 
 
 def main() -> None:
@@ -243,6 +246,11 @@ def main() -> None:
     parser.add_argument("--max-no-progress-retries", type=int, default=3)
     parser.add_argument("--retry-backoff-seconds", type=float, default=5.0)
     parser.add_argument("--cuda-health-poll-seconds", type=float, default=30.0)
+    parser.add_argument(
+        "--only",
+        default=None,
+        help="Comma-separated experiment names for a resumable staged run.",
+    )
     args = parser.parse_args()
     if args.cuda_health_poll_seconds <= 0:
         raise SystemExit("--cuda-health-poll-seconds must be positive")
@@ -254,8 +262,13 @@ def main() -> None:
             flush=True,
         )
 
+    selected = (
+        {name.strip() for name in str(args.only).split(",") if name.strip()}
+        if args.only
+        else None
+    )
     spec_path = args.spec.resolve()
-    spec, experiment_rows = _load_effective_spec(spec_path)
+    spec, experiment_rows = _load_effective_spec(spec_path, selected)
     folds = int(spec["expected_fold_count"])
     root = (args.output_root or (REPO_ROOT / spec["output_root"])).resolve()
     root.mkdir(parents=True, exist_ok=True)
@@ -287,6 +300,8 @@ def main() -> None:
                "--spec", str(spec_path), "--output-root", str(root), "--dry-run",
                "--multi-gpu-strategy", args.multi_gpu_strategy,
                "--parallel-jobs", str(parallel_jobs)]
+    if selected:
+        dry_run.extend(["--only", ",".join(sorted(selected))])
     _run_checked(dry_run)
     # Derive the run set from the current spec, not from every historical file
     # left under generated_configs. This keeps removed/renamed experiments out
@@ -419,10 +434,9 @@ def main() -> None:
             )
 
     # Per-experiment worker invocations write a selected-run summary. Rebuild
-    # the root summary from all configured experiments without launching any
-    # training, so the final CSV/JSON retain the complete matrix.
-    _run_checked(
-        [
+    # the root summary without launching training; a staged --only run retains
+    # exactly that requested slice, while a full run retains the full matrix.
+    collect_command = [
             sys.executable,
             str(REPO_ROOT / "scripts/run_ablation_experiments.py"),
             "--spec",
@@ -435,7 +449,9 @@ def main() -> None:
             str(parallel_jobs),
             "--collect-only",
         ]
-    )
+    if selected:
+        collect_command.extend(["--only", ",".join(sorted(selected))])
+    _run_checked(collect_command)
     if not generated_any_plots:
         # A fully resumed suite may have no newly trained experiment in this
         # invocation. Ensure its aggregate outputs still exist and are current.
