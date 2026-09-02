@@ -196,6 +196,11 @@ def _project_temporal_basis_model_config(
         # post-feature field so old checkpoints keep their fingerprint; an
         # enabled contraction remains explicit and owns a fresh trajectory.
         projected.pop("temporal_basis_algebraic_contraction", None)
+    if int(projected.get("feature_bottleneck_dim", 0) or 0) == 0:
+        # Zero is the historical direct-input architecture.  Omit the disabled
+        # post-schema field so merely upgrading the runtime cannot invalidate
+        # an otherwise identical model/checkpoint contract.
+        projected.pop("feature_bottleneck_dim", None)
     if int(projected.get("daily_context_layers", 0) or 0) == 0:
         # These controls have no parameters or forward-path effect until the
         # daily-context branch has at least one layer.  Omitting them preserves
@@ -601,6 +606,27 @@ def _training_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
             "warm_start_from_previous_fold": bool(
                 training.warm_start_from_previous_fold
             ),
+            "pretrained_initialization_root": (
+                None
+                if training.pretrained_initialization_root is None
+                else str(training.pretrained_initialization_root)
+            ),
+            "pretrained_initialization_fold_policy": str(
+                training.pretrained_initialization_fold_policy
+            ),
+            "pretrained_initialization_feature_adapter": str(
+                training.pretrained_initialization_feature_adapter
+            ),
+            "pretrained_initialization_require_exact_backbone": bool(
+                training.pretrained_initialization_require_exact_backbone
+            ),
+            "pretrained_initialization_validation_guard": bool(
+                training.pretrained_initialization_validation_guard
+            ),
+            "pretrained_initialization_trainable_parameter_prefixes": [
+                str(value)
+                for value in training.pretrained_initialization_trainable_parameter_prefixes
+            ],
         },
         "validation_and_stopping": {
             "early_stopping_no_improve_ratio": float(
@@ -1659,6 +1685,16 @@ def _checkpoint_manifest(
                     ),
                 }
             )
+            if panel.day_trade_minute_execution is not None:
+                # The minute tape is an executor label, not a model feature,
+                # but changing any event price/volume changes both the exact
+                # objective and its STE gradient.  It therefore owns the same
+                # resume boundary as prices, masks, and fees.
+                panel_arrays["day_trade_minute_execution"] = (
+                    _array_content_fingerprint(
+                        panel.day_trade_minute_execution
+                    )
+                )
         if execution_mode in {"tw_index_futures_day", "tw_index_derivatives_day"}:
             futures_market = panel.index_futures_day_session
             if futures_market is None:
@@ -1920,6 +1956,13 @@ def _checkpoint_manifest(
         "feature_include": list(config.data.feature_include),
         "feature_exclude": list(config.data.feature_exclude),
     }
+    if not bool(config.data.day_trade_minute_execution_allow_daily_proxy):
+        # True is the historical hybrid-loader behavior and remains omitted for
+        # checkpoint compatibility.  Strict no-proxy mode changes the label
+        # domain and is therefore an explicit preprocessing contract.
+        preprocessing_contract["day_trade_minute_execution_allow_daily_proxy"] = (
+            False
+        )
     if config.data.feature_zero_fill:
         preprocessing_contract["feature_zero_fill"] = list(
             config.data.feature_zero_fill
@@ -1998,6 +2041,40 @@ def _checkpoint_manifest(
                 "data_schema": _stable_fingerprint(historical_data_schema),
             }
         )
+    schema_4_pre_minute_tape_fingerprints: dict[str, str] = {}
+    schema_4_pre_external_and_minute_tape_fingerprints: dict[str, str] = {}
+    if (
+        bool(config.data.day_trade_minute_execution_allow_daily_proxy)
+        and "day_trade_minute_execution" in panel_arrays
+    ):
+        # Hybrid v8 checkpoints predate content-addressing of the minute label.
+        # Preserve resume compatibility only for that unchanged legacy proxy
+        # contract.  Strict no-proxy experiments never enter this branch.
+        historical_panel_arrays = dict(panel_arrays)
+        historical_panel_arrays.pop("day_trade_minute_execution", None)
+        historical_data_contract = {
+            **data_schema_contract,
+            "panel_arrays": historical_panel_arrays,
+        }
+        schema_4_pre_minute_tape_fingerprints["data"] = _stable_fingerprint(
+            historical_data_contract
+        )
+        if not bool(config.data.use_external_features):
+            combined_preprocessing = dict(preprocessing_contract)
+            for name in (
+                "use_external_features",
+                "external_feature_path",
+                "external_market_symbol",
+            ):
+                combined_preprocessing.pop(name, None)
+            combined_data_contract = {
+                **data_schema_contract,
+                "preprocessing": combined_preprocessing,
+                "panel_arrays": historical_panel_arrays,
+            }
+            schema_4_pre_external_and_minute_tape_fingerprints["data"] = (
+                _stable_fingerprint(combined_data_contract)
+            )
     schema_4_pre_projection_scale_fingerprints: dict[str, str] = {}
     if not bool(model_contract["model"].get("projection_l1_scale_by_active_count")):
         # False is the historical model behavior.  A checkpoint written before
@@ -2161,6 +2238,12 @@ def _checkpoint_manifest(
             ),
             "schema_4_pre_projection_l1_active_count_scale": (
                 schema_4_pre_projection_scale_fingerprints
+            ),
+            "schema_4_pre_minute_tape_fingerprint": (
+                schema_4_pre_minute_tape_fingerprints
+            ),
+            "schema_4_pre_external_and_minute_tape_fingerprint": (
+                schema_4_pre_external_and_minute_tape_fingerprints
             ),
             "schema_3": schema_3_fingerprints,
             "schema_3_without_force_exit": schema_3_without_force_exit_fingerprints,
@@ -2488,6 +2571,11 @@ def _validate_checkpoint_manifest(
                 ("data", "schema_4_pre_external_feature_source"),
                 ("data_schema", "schema_4_pre_external_feature_source"),
                 ("model", "schema_4_pre_projection_l1_active_count_scale"),
+                ("data", "schema_4_pre_minute_tape_fingerprint"),
+                (
+                    "data",
+                    "schema_4_pre_external_and_minute_tape_fingerprint",
+                ),
             ):
                 candidate = compatibility.get(compatibility_key, {})
                 if actual_fingerprints.get(layer) == candidate.get(layer):

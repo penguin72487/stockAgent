@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -9,6 +10,10 @@ import pytest
 from stockagent.backtest.simulator import BacktestResult
 from stockagent.config import ExperimentConfig, load_config
 from stockagent.data.panel import PanelData
+from stockagent.data.tw_day_trade_execution import (
+    DAY_TRADE_EXECUTION_FIELD_COUNT,
+    DayTradeExecutionField as DayTradeField,
+)
 from stockagent.data.tw_futures_portfolio_daily import TaiwanFuturesPortfolioDaily
 from stockagent.training import trainer as trainer_module
 
@@ -453,6 +458,145 @@ def test_daily_no_default_stitched_replay_uses_same_fractional_tplus3_forward(
     np.testing.assert_allclose(stitched.final_equity_scale, 1.10)
     assert np.count_nonzero(stitched.weights_history) == 0
     assert np.count_nonzero(stitched.open_weights_history) == 2
+
+
+def test_exact_minute_stitched_replay_reuses_minute_tensor_ledger(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A minute-loss run must never be replaced by the legacy daily oracle."""
+
+    _disable_stitched_plots(monkeypatch)
+    panel = _day_trade_panel(
+        np.asarray(
+            [
+                [10.0, 11.0, 10.0],
+                [10.0, 10.0, 10.0],
+                [10.0, 10.0, 10.0],
+            ]
+        )
+    )
+    tape = np.full(
+        (*panel.tradable_mask.shape, DAY_TRADE_EXECUTION_FIELD_COUNT),
+        np.nan,
+        dtype=np.float32,
+    )
+    tape[:, :, DayTradeField.OFFICIAL_OPEN] = panel.open_prices
+    tape[:, :, DayTradeField.DAILY_PROXY_LONG_ENTRY_PRICE] = panel.open_prices
+    tape[:, :, DayTradeField.DAILY_PROXY_SHORT_ENTRY_PRICE] = panel.open_prices
+    tape[:, :, DayTradeField.DAILY_PROXY_LONG_EXIT_PRICE] = panel.close_prices
+    tape[:, :, DayTradeField.DAILY_PROXY_SHORT_EXIT_PRICE] = panel.close_prices
+    tape[:, :, DayTradeField.DAILY_PROXY_VOLUME] = 2_000.0
+    tape[:, :, DayTradeField.DAILY_PROXY_FLAG] = 1.0
+    panel.day_trade_minute_execution = tape
+
+    fold_one = _write_fold_requests(
+        tmp_path,
+        fold_id=1,
+        dates=panel.dates[:1],
+        symbols=("2330",),
+        requests=np.asarray([[1.0]]),
+    )
+    fold_two = _write_fold_requests(
+        tmp_path,
+        fold_id=2,
+        dates=panel.dates[1:],
+        symbols=("2317", "2330"),
+        requests=np.asarray([[0.0, 0.0], [0.0, 0.0]]),
+    )
+    config = _day_trade_config()
+    config.data.day_trade_minute_execution_root = "unit-test-minute-tape"
+    config.trading.tw_day_trade_unlimited_margin_conversion = False
+    config.trading.volume_participation_equity = 10_000.0
+
+    stitched = trainer_module._replay_taiwan_stitched_deployment(
+        tmp_path,
+        [fold_two, fold_one],
+        panel=panel,
+        config=config,
+    )
+
+    assert stitched is not None
+    assert stitched.settlement_ledger_unit == "nav_ratio"
+    assert stitched.final_integer_state is None
+    assert stitched.shares_history is None
+    np.testing.assert_allclose(
+        stitched.strategy_returns[0], np.log(1.10), atol=2.0e-7
+    )
+    np.testing.assert_allclose(stitched.weights_history[0], [0.0, 1.0, 0.0])
+    np.testing.assert_allclose(
+        stitched.receivables_history,
+        np.asarray([[0.0, 0.10], [0.10, 0.0], [0.0, 0.0]]),
+        atol=2.0e-7,
+    )
+    np.testing.assert_allclose(stitched.cash_history, [1.0, 1.0, 1.1])
+    np.testing.assert_allclose(stitched.final_equity_scale, 1.10, atol=2.0e-7)
+
+
+def test_exact_minute_stitched_replay_fails_closed_on_legacy_integer_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Publishing the old daily share oracle under a minute run is illegal."""
+
+    _disable_stitched_plots(monkeypatch)
+    panel = _day_trade_panel(np.full((3, 3), 10.0))
+    tape = np.full(
+        (*panel.tradable_mask.shape, DAY_TRADE_EXECUTION_FIELD_COUNT),
+        np.nan,
+        dtype=np.float32,
+    )
+    tape[:, :, DayTradeField.OFFICIAL_OPEN] = panel.open_prices
+    tape[:, :, DayTradeField.DAILY_PROXY_LONG_ENTRY_PRICE] = panel.open_prices
+    tape[:, :, DayTradeField.DAILY_PROXY_SHORT_ENTRY_PRICE] = panel.open_prices
+    tape[:, :, DayTradeField.DAILY_PROXY_LONG_EXIT_PRICE] = panel.close_prices
+    tape[:, :, DayTradeField.DAILY_PROXY_SHORT_EXIT_PRICE] = panel.close_prices
+    tape[:, :, DayTradeField.DAILY_PROXY_VOLUME] = 2_000.0
+    tape[:, :, DayTradeField.DAILY_PROXY_FLAG] = 1.0
+    panel.day_trade_minute_execution = tape
+    fold_dir = _write_fold_requests(
+        tmp_path,
+        fold_id=1,
+        dates=panel.dates,
+        symbols=tuple(panel.symbols),
+        requests=np.zeros((3, 3)),
+    )
+    config = _day_trade_config()
+    config.data.day_trade_minute_execution_root = "unit-test-minute-tape"
+    config.trading.tw_day_trade_unlimited_margin_conversion = False
+
+    legacy = BacktestResult(
+        strategy_returns=np.zeros(3, dtype=np.float64),
+        benchmark_returns=np.zeros(3, dtype=np.float64),
+        turnovers=np.zeros(3, dtype=np.float64),
+        weights_history=np.zeros((3, 3), dtype=np.float64),
+        requested_weights_history=np.zeros((3, 3), dtype=np.float64),
+        execution_mode="tw_day_trade",
+        settlement_ledger_unit="currency",
+        shares_history=np.zeros((3, 3), dtype=np.int64),
+        final_integer_state=trainer_module.TaiwanIntegerState(
+            mode="tw_day_trade",
+            settled_cash=10_000.0,
+            holdings=np.zeros(3, dtype=np.int64),
+            payable_queue=np.zeros(2, dtype=np.float64),
+            receivable_queue=np.zeros(2, dtype=np.float64),
+            last_nav=10_000.0,
+            alive=True,
+        ),
+    )
+    monkeypatch.setattr(
+        trainer_module,
+        "run_backtest_torch",
+        lambda *args, **kwargs: SimpleNamespace(to_numpy=lambda: legacy),
+    )
+
+    with pytest.raises(RuntimeError, match="changed accounting contracts"):
+        trainer_module._replay_taiwan_stitched_deployment(
+            tmp_path,
+            [fold_dir],
+            panel=panel,
+            config=config,
+        )
 
 
 def test_daily_no_default_stitched_replay_requires_action_mask_for_stateful_carry(

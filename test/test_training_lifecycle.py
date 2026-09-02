@@ -259,6 +259,50 @@ def test_mode_artifact_core_is_shared_across_frequencies() -> None:
     assert stable_keys <= daily.keys()
 
 
+def test_lifecycle_persists_explicit_execution_variant_contract(tmp_path: Path) -> None:
+    lifecycle = TrainingRunLifecycle(
+        tmp_path,
+        execution_mode="tw_day_trade",
+        run_mode="train",
+        strategy="none",
+        model_name="financial_transformer",
+    )
+    lifecycle.start(
+        fold_ids=[1],
+        mode_contract_overrides={
+            "frequency": "daily_policy_exact_minute_execution",
+            "execution_clock": "official_open_sizing_then_minute_event_tape",
+            "sample_order_contract": "strict_chronological_sessions",
+        },
+    )
+
+    manifest = json.loads((tmp_path / "run_manifest.json").read_text())
+    progress = json.loads((tmp_path / "progress.json").read_text())
+    assert manifest["execution_mode"] == "tw_day_trade"
+    assert manifest["frequency"] == "daily_policy_exact_minute_execution"
+    assert manifest["execution_clock"] == (
+        "official_open_sizing_then_minute_event_tape"
+    )
+    assert manifest["sample_order_contract"] == "strict_chronological_sessions"
+    assert progress["frequency"] == "daily_policy_exact_minute_execution"
+    assert progress["sample_order_contract"] == "strict_chronological_sessions"
+
+
+def test_lifecycle_rejects_unknown_mode_contract_override(tmp_path: Path) -> None:
+    lifecycle = TrainingRunLifecycle(
+        tmp_path,
+        execution_mode="tw_day_trade",
+        run_mode="train",
+        strategy="none",
+        model_name="financial_transformer",
+    )
+    with pytest.raises(ValueError, match="unsupported lifecycle mode-contract"):
+        lifecycle.start(
+            fold_ids=[1],
+            mode_contract_overrides={"execution_mode": "tw_minute"},
+        )
+
+
 def test_epoch_curve_core_is_flat_and_mode_extensions_are_preserved() -> None:
     row = normalize_epoch_curve_record(
         {"epoch": 2, "train_loss": 0.3, "minute_cache_gib": 1.5}

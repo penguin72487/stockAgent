@@ -7,6 +7,10 @@ import numpy as np
 
 from stockagent.backtest.tw_execution import normalize_execution_mode
 from stockagent.data.panel import PanelData
+from stockagent.data.tw_day_trade_execution import (
+    DAY_TRADE_EXECUTION_FIELD_COUNT,
+    tw_day_trade_minute_round_trip_masks,
+)
 from stockagent.data.walkforward import WalkForwardFold, normalize_lookback_context
 
 
@@ -68,6 +72,24 @@ def measure_tw_day_trade_execution_coverage(
         if panel.force_exit_mask is None
         else _required_bool_panel(panel, "force_exit_mask")
     )
+    minute_tape = getattr(panel, "day_trade_minute_execution", None)
+    minute_long_round_trip: np.ndarray | None = None
+    minute_short_round_trip: np.ndarray | None = None
+    if minute_tape is not None:
+        minute = np.asarray(minute_tape)
+        if (
+            minute.ndim != 3
+            or minute.shape[:2] != panel.tradable_mask.shape
+            or minute.shape[2] != DAY_TRADE_EXECUTION_FIELD_COUNT
+        ):
+            raise ValueError(
+                "PanelData.day_trade_minute_execution must align with the "
+                "daily panel and contain the exact-minute execution fields"
+            )
+        (
+            minute_long_round_trip,
+            minute_short_round_trip,
+        ) = tw_day_trade_minute_round_trip_masks(minute)
 
     row_count = int(panel.num_dates)
     eligible_cells_by_row = np.zeros(row_count, dtype=np.int64)
@@ -84,6 +106,8 @@ def measure_tw_day_trade_execution_coverage(
             & sell_close[row_slice]
             & finite_return
         )
+        if minute_long_round_trip is not None:
+            long_round_trip &= minute_long_round_trip[row_slice]
         if long_only:
             actionable = long_round_trip
         else:
@@ -94,6 +118,8 @@ def measure_tw_day_trade_execution_coverage(
                 & buy_close[row_slice]
                 & finite_return
             )
+            if minute_short_round_trip is not None:
+                short_round_trip &= minute_short_round_trip[row_slice]
             actionable = long_round_trip | short_round_trip
         eligible_cells_by_row[row_slice] = np.count_nonzero(
             entry_eligible,

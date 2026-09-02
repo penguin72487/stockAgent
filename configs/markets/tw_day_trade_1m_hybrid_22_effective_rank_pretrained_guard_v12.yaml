@@ -1,0 +1,28 @@
+base_config: tw_day_trade_1m_hybrid_22_effective_rank_pretrained_guard_v11.yaml
+
+# Correctness successor to v11.  Execution-tape contract v5 keeps the observed
+# 13:30 auction separate from the official daily close.  When the auction row
+# is absent, the close is valuation-only for the required residual
+# financing/borrow conversion; missing auction liquidity is never fabricated
+# and entered principal is no longer misclassified as a total loss.  It also
+# executes the requested 13:25 market continuation after an incomplete 13:24
+# attempt, before the 13:30 auction/residual-conversion boundary.
+experiment_name: tw-day-trade-hybrid-minute-22-effective-rank-pretrained-exact-official-close-v12
+
+runner:
+  output_dir: artifacts/markets/tw_day_trade_hybrid_minute_22_effective_rank_pretrained_exact_official_close_commission20_capital10m_all_features_v12
+  resume: true
+  post_train_infer: false
+
+data:
+  # A fresh cache root makes the execution-label ABI change explicit and
+  # prevents any older 23/24-field tape from being reused as a v5 26-field tape.
+  day_trade_minute_execution_cache_dir: artifacts/cache/tw_day_trade_execution_v7_official_close_1325
+
+training:
+  # Under the corrected exact replay, the completed v11 policy materially
+  # outperformed the old daily source policy.  Preserve that learned minute
+  # adaptation as fold-matched epoch 0, but import no optimizer state and let
+  # the inherited exact-objective validation guard replace it only when v12's
+  # corrected loss genuinely improves validation.
+  pretrained_initialization_root: artifacts/markets/tw_day_trade_hybrid_minute_22_effective_rank_pretrained_exact_guard_commission20_capital10m_all_features_v11

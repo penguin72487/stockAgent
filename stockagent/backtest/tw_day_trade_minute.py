@@ -7,6 +7,9 @@ import os
 
 import torch
 
+from stockagent.backtest.tw_commission_rebate import (
+    normalize_commission_rebate_timing,
+)
 from stockagent.data.tw_day_trade_execution import (
     DAY_TRADE_EXECUTION_FIELD_COUNT,
     DayTradeExecutionField as F,
@@ -140,22 +143,42 @@ def _run_tw_day_trade_minute_day(
 ]:
     """Fixed-shape one-session kernel used by the chronological executor."""
 
-    official_open = execution_row[:, F.OFFICIAL_OPEN]
-    entry_price = execution_row[:, F.ENTRY_VWAP_0901]
-    valid_entry = (
-        torch.isfinite(official_open)
-        & (official_open > 0.0)
-        & torch.isfinite(entry_price)
-        & (entry_price > 0.0)
+    request = torch.where(
+        state_advance, target_weights, torch.zeros_like(target_weights)
     )
+    direction = torch.sign(request)
+    official_open = execution_row[:, F.OFFICIAL_OPEN]
+    is_daily_proxy = execution_row[:, F.DAILY_PROXY_FLAG] > 0.5
+    minute_entry_price = execution_row[:, F.ENTRY_VWAP_0901]
+    proxy_entry_price = torch.where(
+        direction < 0.0,
+        execution_row[:, F.DAILY_PROXY_SHORT_ENTRY_PRICE],
+        execution_row[:, F.DAILY_PROXY_LONG_ENTRY_PRICE],
+    )
+    valid_minute_entry = (
+        ~is_daily_proxy
+        & torch.isfinite(official_open)
+        & (official_open > 0.0)
+        & torch.isfinite(minute_entry_price)
+        & (minute_entry_price > 0.0)
+    )
+    valid_proxy_entry = (
+        is_daily_proxy
+        & torch.isfinite(official_open)
+        & (official_open > 0.0)
+        & torch.isfinite(proxy_entry_price)
+        & (proxy_entry_price > 0.0)
+    )
+    valid_entry = valid_minute_entry | valid_proxy_entry
     safe_official_open = torch.where(
         torch.isfinite(official_open) & (official_open > 0.0),
         official_open,
         torch.ones_like(official_open),
     )
-    entry_price = torch.where(valid_entry, entry_price, safe_official_open)
-    request = torch.where(
-        state_advance, target_weights, torch.zeros_like(target_weights)
+    entry_price = torch.where(
+        valid_entry,
+        torch.where(is_daily_proxy, proxy_entry_price, minute_entry_price),
+        safe_official_open,
     )
     permission = (
         tradable_mask.bool()
@@ -177,10 +200,16 @@ def _run_tw_day_trade_minute_day(
         request.abs() * deployable_twd / safe_official_open.clamp_min(1.0e-12)
     )
     entry_shares = torch.minimum(
-        desired, _capacity(execution_row[:, F.ENTRY_VOLUME_0901])
+        desired,
+        _capacity(
+            torch.where(
+                is_daily_proxy,
+                execution_row[:, F.DAILY_PROXY_VOLUME],
+                execution_row[:, F.ENTRY_VOLUME_0901],
+            )
+        ),
     )
     signed_entry = torch.sign(request) * entry_shares
-    direction = torch.sign(request)
     # ``abs(0)`` has zero derivative. Multiplying by the requested direction
     # keeps the exact fail-closed forward value while retaining its STE signal.
     remaining = signed_entry * direction
@@ -202,7 +231,7 @@ def _run_tw_day_trade_minute_day(
         # Strict penetration is intentional: equality has unknown queue
         # priority and therefore cannot be claimed as a historical fill.
         crossed = torch.where(direction > 0.0, high > limit_price, low < limit_price)
-        valid_limit = crossed & valid_limit_price
+        valid_limit = crossed & valid_limit_price & ~is_daily_proxy
         quantity = torch.minimum(remaining, _capacity(volume))
         quantity = torch.where(valid_limit, quantity, torch.zeros_like(quantity))
         gross_pnl = gross_pnl + direction * quantity * (safe_limit_price - entry_price)
@@ -214,10 +243,13 @@ def _run_tw_day_trade_minute_day(
 
     for price_field, volume_field in (
         (F.MARKET_VWAP_1324, F.MARKET_VOLUME_1324),
+        (F.MARKET_VWAP_1325, F.MARKET_VOLUME_1325),
         (F.AUCTION_PRICE_1330, F.AUCTION_VOLUME_1330),
     ):
         price = execution_row[:, price_field]
-        valid_price = torch.isfinite(price) & (price > 0.0)
+        valid_price = (
+            torch.isfinite(price) & (price > 0.0) & ~is_daily_proxy
+        )
         safe_price = torch.where(valid_price, price, entry_price)
         quantity = torch.minimum(remaining, _capacity(execution_row[:, volume_field]))
         quantity = torch.where(valid_price, quantity, torch.zeros_like(quantity))
@@ -228,7 +260,57 @@ def _run_tw_day_trade_minute_day(
         traded_notional = traded_notional + quantity * safe_price
         remaining = remaining - quantity
 
-    close_price = execution_row[:, F.AUCTION_PRICE_1330]
+    # The pre-minute-data daily proxy is deliberately one observation per
+    # session, not a fabricated 13:20/13:24/13:30 path.  Its entry and exit
+    # both obey the same 50%-of-estimated-minute-volume whole-lot cap.  Since
+    # entry shares already cannot exceed that capacity, every admitted proxy
+    # position can close here without inventing extra liquidity.
+    proxy_exit_price = torch.where(
+        direction < 0.0,
+        execution_row[:, F.DAILY_PROXY_SHORT_EXIT_PRICE],
+        execution_row[:, F.DAILY_PROXY_LONG_EXIT_PRICE],
+    )
+    valid_proxy_exit = (
+        is_daily_proxy
+        & torch.isfinite(proxy_exit_price)
+        & (proxy_exit_price > 0.0)
+    )
+    safe_proxy_exit = torch.where(valid_proxy_exit, proxy_exit_price, entry_price)
+    proxy_exit_quantity = torch.minimum(
+        remaining,
+        _capacity(execution_row[:, F.DAILY_PROXY_VOLUME]),
+    )
+    proxy_exit_quantity = torch.where(
+        valid_proxy_exit,
+        proxy_exit_quantity,
+        torch.zeros_like(proxy_exit_quantity),
+    )
+    gross_pnl = (
+        gross_pnl
+        + direction * proxy_exit_quantity * (safe_proxy_exit - entry_price)
+    )
+    fees = fees + proxy_exit_quantity * safe_proxy_exit * torch.where(
+        direction > 0.0, sell_fee_rates, buy_fee_rates
+    )
+    traded_notional = traded_notional + proxy_exit_quantity * safe_proxy_exit
+    remaining = remaining - proxy_exit_quantity
+
+    observed_auction_close = torch.where(
+        is_daily_proxy,
+        proxy_exit_price,
+        execution_row[:, F.AUCTION_PRICE_1330],
+    )
+    official_close = execution_row[:, F.OFFICIAL_CLOSE]
+    # A missing 13:30 minute row means that no auction liquidity can be
+    # claimed; it does not make the security worthless.  Value the residual at
+    # the official daily close and route it through the existing unlimited
+    # financing/borrow conversion.  The normal tax/fee and highest financing
+    # costs below still apply, so this is not a free or fabricated fill.
+    close_price = torch.where(
+        torch.isfinite(observed_auction_close) & (observed_auction_close > 0.0),
+        observed_auction_close,
+        official_close,
+    )
     valid_close = torch.isfinite(close_price) & (close_price > 0.0)
     safe_close = torch.where(valid_close, close_price, entry_price)
     # Residual securities are marked at the official close and assumed to
@@ -254,8 +336,9 @@ def _run_tw_day_trade_minute_day(
         ),
     )
     traded_notional = traded_notional + marked_remaining * safe_close
-    # Missing official close is a fail-closed total loss of the affected
-    # entered notional, rather than a free stale mark.
+    # If both the auction observation and official daily close are absent,
+    # retain the conservative fail-closed total loss.  A source-data failure
+    # must never become a free stale mark.
     missing_close_loss = torch.where(
         (remaining > 0.0) & ~valid_close,
         remaining * entry_price,
@@ -446,6 +529,8 @@ def run_tw_day_trade_minute_execution(
     buy_fee_rates: torch.Tensor,
     sell_fee_rates: torch.Tensor,
     normal_sell_fee_rates: torch.Tensor,
+    commission_rebate_rates: torch.Tensor | None = None,
+    commission_rebate_timing: str = "daily_close",
     *,
     initial_capital_twd: float,
     settlement_lag_sessions: int = 2,
@@ -466,6 +551,9 @@ def run_tw_day_trade_minute_execution(
     lots and fills.  Residuals have unlimited financing/short inventory and are
     accounting-closed at the official close.  That close still creates a net
     T+2 cash claim; it creates neither a carried stock position nor a default.
+    A daily-close broker commission rebate is netted inside that same claim;
+    tax is never rebated. Deferred rebate timing fails closed because this
+    executor intentionally carries no separate rebate-receivable state.
     """
 
     if target_weights.ndim != 2:
@@ -495,15 +583,35 @@ def run_tw_day_trade_minute_execution(
     dtype = torch.float32
     tape = execution_tape.to(device=device, dtype=dtype)
     weights = target_weights.float()
-    buy_fees = buy_fee_rates.to(device=device, dtype=dtype).reshape(-1)
-    sell_fees = sell_fee_rates.to(device=device, dtype=dtype).reshape(-1)
-    normal_sell_fees = normal_sell_fee_rates.to(device=device, dtype=dtype).reshape(-1)
+    gross_buy_fees = buy_fee_rates.to(device=device, dtype=dtype).reshape(-1)
+    gross_sell_fees = sell_fee_rates.to(device=device, dtype=dtype).reshape(-1)
+    gross_normal_sell_fees = normal_sell_fee_rates.to(
+        device=device, dtype=dtype
+    ).reshape(-1)
+    rebate_timing = normalize_commission_rebate_timing(
+        commission_rebate_timing
+    )
+    rebate_fees = (
+        torch.zeros_like(gross_buy_fees)
+        if commission_rebate_rates is None
+        else commission_rebate_rates.to(device=device, dtype=dtype).reshape(-1)
+    )
     if (
-        buy_fees.numel() != weights.size(1)
-        or sell_fees.numel() != weights.size(1)
-        or normal_sell_fees.numel() != weights.size(1)
+        gross_buy_fees.numel() != weights.size(1)
+        or gross_sell_fees.numel() != weights.size(1)
+        or gross_normal_sell_fees.numel() != weights.size(1)
+        or rebate_fees.numel() != weights.size(1)
     ):
-        raise ValueError("fee vectors must have shape [S]")
+        raise ValueError("fee and commission-rebate vectors must have shape [S]")
+    if rebate_timing != "daily_close" and bool((rebate_fees > 0.0).any().item()):
+        raise ValueError(
+            "exact-minute tw_day_trade currently supports commission rebates "
+            "only at daily_close; deferred rebates require an explicit "
+            "cross-session rebate ledger"
+        )
+    buy_fees = (gross_buy_fees - rebate_fees).clamp_min(0.0)
+    sell_fees = (gross_sell_fees - rebate_fees).clamp_min(0.0)
+    normal_sell_fees = (gross_normal_sell_fees - rebate_fees).clamp_min(0.0)
     if bool((normal_sell_fees < sell_fees).any().item()):
         raise ValueError(
             "normal_sell_fee_rates must be at least day-trade sell_fee_rates"
