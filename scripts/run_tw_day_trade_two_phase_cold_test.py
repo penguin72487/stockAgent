@@ -671,6 +671,19 @@ def run_two_phase_cold_test(
     _LEGACY_SIGNAL_SCAN_CACHE.clear()
 
     specs = _enabled_specs(sandbox)
+    if not real_model_inference:
+        # The deterministic cold-start test validates orchestration and ledger
+        # contracts without loading model weights.  Give every isolated mode a
+        # sandbox-local checkpoint marker so the production runtime readiness
+        # gate does not depend on whichever formal artifacts happen to exist on
+        # the host running the test.
+        isolated_specs: list[ModeSpec] = []
+        for spec in specs:
+            checkpoint = sandbox / "checkpoints" / spec.market / "checkpoint_best.pt"
+            checkpoint.parent.mkdir(parents=True, exist_ok=True)
+            checkpoint.write_bytes(b"cold-test-checkpoint-fixture\n")
+            isolated_specs.append(replace(spec, checkpoint_path=str(checkpoint)))
+        specs = isolated_specs
     markets = tuple(spec.market for spec in specs)
     engine = TwDayTradeSimulationEngine(sandbox / "paper_engine")
     strict_after = datetime_time(8, 57)

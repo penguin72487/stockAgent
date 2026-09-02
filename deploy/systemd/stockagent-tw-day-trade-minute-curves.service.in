@@ -18,4 +18,3 @@ CPUWeight=50
 IOWeight=50
 NoNewPrivileges=true
 PrivateTmp=true
-

@@ -541,6 +541,10 @@ stockagent-data status tw-public
 持續寫入。可變／大型 artifacts 走 hot transport，已完成 run 的穩定小檔才封成 packed
 cold release。
 
+Vast 要發布完整可部署 run 時，先在 `configs/data_sync/cold_artifacts.json` 登錄唯一
+dataset，並以 `maximum_file_bytes: null` 明確要求包含所有檔案；仍須通過 lifecycle、
+穩定時間、inventory 與 packed-object 驗證。
+
 ### cold artifact 完整命令
 
 ```text

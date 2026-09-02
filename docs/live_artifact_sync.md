@@ -34,6 +34,11 @@ contract 且超過穩定時間的來源可以發布；目前首批只包含通�
 lifecycle gate 的 `feature_input_lookback32_v4`。另外兩個標示 complete 的舊 run
 因 epoch/summary contract 不完整而保持 hot，不會被誤封存。
 
+登錄項目的 `maximum_file_bytes` 設為整數時，只發布不超過該大小的穩定檔案；設為
+`null` 時發布通過 lifecycle gate 的完整 run。完整 run 中小於
+`loose_file_threshold_bytes` 的檔案進固定 hash buckets，較大的 checkpoints、回測與權重
+檔案成為 content-addressed blobs，不得因大小而漏傳部署必要檔案。
+
 penguin 發布與啟用：
 
 ```bash

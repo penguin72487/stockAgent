@@ -11,6 +11,10 @@ from stockagent.data.walkforward import (
     build_expanding_year_folds,
     validate_walk_forward_year_contract,
 )
+from stockagent.data.tw_day_trade_execution import (
+    DAY_TRADE_EXECUTION_FIELD_COUNT,
+    DayTradeExecutionField as F,
+)
 from stockagent.training.execution_coverage import (
     validate_training_execution_coverage,
 )
@@ -145,11 +149,28 @@ def test_checkpoint_inference_fold_requires_saved_test_year() -> None:
         build_checkpoint_inference_fold(dates, checkpoint)
 
 
-def _day_trade_panel(actionable: bool) -> SimpleNamespace:
+def _day_trade_panel(
+    actionable: bool,
+    *,
+    minute_actionable: bool | None = None,
+) -> SimpleNamespace:
     shape = (8, 2)
     eligible = np.zeros(shape, dtype=bool)
     if actionable:
         eligible[:, 0] = True
+    minute_tape = None
+    if minute_actionable is not None:
+        minute_tape = np.full(
+            (*shape, DAY_TRADE_EXECUTION_FIELD_COUNT),
+            np.nan,
+            dtype=np.float32,
+        )
+        minute_tape[:, :, F.OFFICIAL_OPEN] = 100.0
+        minute_tape[:, :, F.ENTRY_VWAP_0901] = 100.0
+        minute_tape[:, :, F.ENTRY_VOLUME_0901] = (
+            2_000.0 if minute_actionable else 0.0
+        )
+        minute_tape[:, :, F.AUCTION_PRICE_1330] = 101.0
     return SimpleNamespace(
         dates=np.asarray(
             [
@@ -174,6 +195,7 @@ def _day_trade_panel(actionable: bool) -> SimpleNamespace:
         can_buy_mask=np.ones(shape, dtype=bool),
         can_sell_mask=np.ones(shape, dtype=bool),
         force_exit_mask=np.zeros(shape, dtype=bool),
+        day_trade_minute_execution=minute_tape,
     )
 
 
@@ -214,4 +236,31 @@ def test_day_trade_execution_coverage_accepts_supported_fold() -> None:
 
     assert coverage is not None
     assert str(coverage.first_actionable_date) == "2020-01-02"
+    assert int(coverage.actionable_cells_by_row.sum()) == 8
+
+
+def test_day_trade_execution_coverage_rejects_zero_minute_fill_fold() -> None:
+    with pytest.raises(
+        ValueError,
+        match=r"zero executable round trips.*gradients would be exactly zero",
+    ):
+        validate_training_execution_coverage(
+            _day_trade_panel(actionable=True, minute_actionable=False),
+            [_single_day_trade_fold()],
+            execution_mode="tw_day_trade",
+            long_only=False,
+            lookback=1,
+        )
+
+
+def test_day_trade_execution_coverage_accepts_minute_fill_fold() -> None:
+    coverage = validate_training_execution_coverage(
+        _day_trade_panel(actionable=True, minute_actionable=True),
+        [_single_day_trade_fold()],
+        execution_mode="tw_day_trade",
+        long_only=False,
+        lookback=1,
+    )
+
+    assert coverage is not None
     assert int(coverage.actionable_cells_by_row.sum()) == 8

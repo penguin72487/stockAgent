@@ -1,0 +1,118 @@
+# Non-day-trade successor aligned as closely as the product allows with the
+# v12 exact-minute stock baseline.  The stock-context information ABI, 22
+# temporal families, projection-L1 policy, TWD 10M account, 50% causal volume
+# capacity, 1,000-epoch lifecycle, and per-epoch curves are retained.  Product
+# semantics deliberately differ: this policy emits whole TAIFEX contracts,
+# carries the same physical contract across sessions, and closes it no later
+# than its own last-trading row using the observed TAIFEX settlement value.
+base_config: tw_stock_context_all_futures_portfolio_0845_integer_futures_open_recoverable_full_features_multi_basis_projection_l1_cash_capital10m.yaml
+
+experiment_name: tw-stock-context-all-futures-carry-to-expiry-0845-integer-22-effective-rank-full-features-capital10m-v1
+
+runner:
+  # The 22-family input and expiry-settlement loss are incompatible with all
+  # earlier all-futures checkpoints and therefore require a fresh root.
+  output_dir: artifacts/markets/tw_stock_context_all_futures_carry_to_expiry_0845_integer_22_effective_rank_full_features_cash_capital10m_v1
+  resume: true
+  post_train_infer: false
+
+data:
+  # Keep all 99 ordered cash-stock inputs inherited from the v12-style full
+  # feature contract.  The 08:45 decision still sees stock data only through
+  # t-1 plus the same-print futures OPEN research context.
+  feature_exclude: []
+  tw_futures_expiry_settlement_valuation: true
+
+trading:
+  # Exact signed whole contracts; unfilled allocation remains cash in its own
+  # group and is never redistributed. Prior-session contract volume is the
+  # only causal capacity source available in the daily archive.
+  max_volume_participation: 0.5
+  tw_futures_portfolio_integer_initial_capital: 10000000.0
+  tw_futures_portfolio_final_settlement_path: data_tw_futures/final_settlement_v1/futures_final_settlement_history.parquet
+
+training:
+  model_name: cross_sectional_all_futures
+  epochs: 1000
+  lookback: 32
+  batch_size_train: 64
+  batch_size_eval: 32
+  auto_batch_size: false
+  futures_portfolio_training_surrogate_only: false
+  futures_portfolio_recoverable_backward: true
+  learning_rate: 1.0e-4
+  enable_lr_scheduler: true
+  lr_scheduler: warmup_cosine
+  lr_scheduler_warmup_steps: 256
+  lr_scheduler_eta_min: 1.0e-6
+  early_stopping_no_improve_ratio: 0.1
+  early_stopping_min_delta: 1.0e-4
+
+  # No existing completed futures checkpoint has this 22-family/524-component
+  # input ABI. Starting fresh is safer than pretending that a v12 stock
+  # day-trade checkpoint has the separate 1,936-contract action head.
+  pretrained_initialization_root: null
+  pretrained_initialization_validation_guard: false
+  pretrained_initialization_trainable_parameter_prefixes: []
+
+  record_epoch_curve: true
+  curve_plot_interval: 1
+  curve_test_interval: 1
+  curve_plot_async: true
+  epoch_test_curve: true
+  defer_epoch_curve_plot_until_end: false
+
+  transformer_base_portfolio:
+    # The all-futures model has no FinancialTransformer CandleEncoder, so the
+    # closest exact analogue to v12's input-feature decomposition is its fused
+    # raw-feature contraction. It uses every one of the 99 features without
+    # materializing [batch,symbol,524*99] coefficients.
+    temporal_basis_input: raw_features
+    temporal_basis_families:
+      - haar
+      - swt_db2
+      - swt_sym4
+      - wavelet_packet
+      - walsh
+      - fourier
+      - dct
+      - dpss
+      - local_cosine
+      - morlet
+      - exponential
+      - laguerre
+      - difference
+      - ar_innovation
+      - bspline
+      - legendre
+      - chebyshev
+      - learned
+      - kautz
+      - discrete_hermite
+      - chirplet
+      - pca_klt
+    temporal_basis_components: 31
+    temporal_basis_novelty_threshold: 0.0001
+    temporal_basis_components_by_family:
+      haar: 31
+      swt_db2: 13
+      swt_sym4: 10
+      wavelet_packet: 14
+      walsh: 31
+      fourier: 31
+      dct: 31
+      dpss: 31
+      local_cosine: 31
+      morlet: 27
+      exponential: 8
+      laguerre: 13
+      difference: 31
+      ar_innovation: 8
+      bspline: 30
+      legendre: 31
+      chebyshev: 31
+      learned: 31
+      kautz: 23
+      discrete_hermite: 16
+      chirplet: 21
+      pca_klt: 31

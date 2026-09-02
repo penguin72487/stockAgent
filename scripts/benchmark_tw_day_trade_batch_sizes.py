@@ -4,7 +4,9 @@
 The sweep intentionally changes only the global training batch size (plus the
 number of epochs/early-stopping guard needed to obtain repeated measurements).
 Every candidate uses a fresh artifact directory and the canonical train,
-validation, test-curve, loss, and backtest path.
+validation, test-curve, loss, and backtest path.  Both the single-device and
+DDP production paths are supported because a chronological settlement ledger
+can make one GPU faster than two even when the model itself parallelizes.
 """
 
 from __future__ import annotations
@@ -85,7 +87,7 @@ def _parse_batch_sizes(
             raise ValueError(f"batch size must be a power of two, got {value}")
         if value % world_size != 0:
             raise ValueError(
-                f"global batch size {value} must be divisible by DDP world size {world_size}"
+                f"global batch size {value} must be divisible by world size {world_size}"
             )
         local_batch = value // world_size
         if require_power_of_two and not _is_power_of_two(local_batch):
@@ -446,8 +448,15 @@ def _plain_config_value(value: Any) -> Any:
 def _validate_source_contract(config: dict[str, Any]) -> dict[str, Any]:
     training = config.get("training")
     trading = config.get("trading")
-    if not isinstance(training, dict) or not isinstance(trading, dict):
-        raise ValueError("source config must contain training and trading mappings")
+    data = config.get("data")
+    if (
+        not isinstance(training, dict)
+        or not isinstance(trading, dict)
+        or not isinstance(data, dict)
+    ):
+        raise ValueError(
+            "source config must contain data, training, and trading mappings"
+        )
     expected = {
         "trading.execution_mode": "tw_day_trade",
         "trading.frequency": "daily",
@@ -476,9 +485,24 @@ def _validate_source_contract(config: dict[str, Any]) -> dict[str, Any]:
         )
     actual["training.model_name"] = model_name
     if model_name == "executable_portfolio_transformer":
-        if not bool(trading.get("tw_day_trade_unlimited_margin_conversion")):
+        minute_execution = bool(data.get("day_trade_minute_execution_root"))
+        actual["objective"] = (
+            "strict_minute" if minute_execution else "daily_stateful_carry"
+        )
+        if minute_execution:
+            if bool(trading.get("tw_day_trade_unlimited_margin_conversion")):
+                raise ValueError(
+                    "strict-minute executable benchmark must not stack the daily "
+                    "stateful margin-conversion ledger"
+                )
+            if bool(data.get("day_trade_minute_execution_allow_daily_proxy", True)):
+                raise ValueError(
+                    "strict-minute executable benchmark requires "
+                    "day_trade_minute_execution_allow_daily_proxy=false"
+                )
+        elif not bool(trading.get("tw_day_trade_unlimited_margin_conversion")):
             raise ValueError(
-                "executable portfolio benchmark requires stateful margin conversion"
+                "daily executable portfolio benchmark requires stateful margin conversion"
             )
         if bool(trading.get("tw_short_capacity_limit_enabled")):
             raise ValueError(
@@ -567,7 +591,7 @@ def _run_candidate(args: argparse.Namespace, base: dict[str, Any], batch_size: i
         "--no-post-train-infer",
         "--no-isolate-train-folds",
         "--multi-gpu-strategy",
-        "distributed_data_parallel",
+        args.multi_gpu_strategy,
         "--batch-size-train",
         str(batch_size),
         "--batch-size-eval",
@@ -578,8 +602,8 @@ def _run_candidate(args: argparse.Namespace, base: dict[str, Any], batch_size: i
         str(args.compile_threads),
     ]
     print(
-        f"[batch-benchmark] start global_batch={batch_size} "
-        f"local_batch={batch_size // args.world_size}",
+        f"[batch-benchmark] start strategy={args.multi_gpu_strategy} "
+        f"global_batch={batch_size} local_batch={batch_size // args.world_size}",
         flush=True,
     )
     stop = threading.Event()
@@ -681,7 +705,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
             "Find the highest-throughput power-of-two global batch for the canonical "
-            "dual-GPU TW daily day-trade workload."
+            "single-device or DDP TW daily day-trade workload."
         )
     )
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
@@ -704,6 +728,12 @@ def main() -> None:
     parser.add_argument("--skip-epochs", type=int, default=2)
     parser.add_argument("--minimum-steady-epochs", type=int, default=4)
     parser.add_argument("--cuda-visible-devices", default="0,1")
+    parser.add_argument(
+        "--multi-gpu-strategy",
+        choices=("none", "distributed_data_parallel"),
+        default="distributed_data_parallel",
+        help="production training topology to benchmark",
+    )
     parser.add_argument("--python", type=Path, default=Path(sys.executable).resolve())
     parser.add_argument("--cpu-threads", type=int, default=112)
     parser.add_argument("--compile-threads", type=int, default=16)
@@ -727,8 +757,17 @@ def main() -> None:
         raise SystemExit("--cuda-visible-devices must be a comma-separated list of numeric GPU indices")
     args.gpu_indices = {int(value) for value in gpu_ids}
     args.world_size = len(gpu_ids)
-    if args.world_size < 2:
-        raise SystemExit("this production benchmark requires at least two DDP GPUs")
+    if args.multi_gpu_strategy == "none" and args.world_size != 1:
+        raise SystemExit(
+            "--multi-gpu-strategy none requires exactly one visible GPU"
+        )
+    if (
+        args.multi_gpu_strategy == "distributed_data_parallel"
+        and args.world_size < 2
+    ):
+        raise SystemExit(
+            "--multi-gpu-strategy distributed_data_parallel requires at least two GPUs"
+        )
     try:
         batch_sizes = _parse_batch_sizes(
             args.batch_sizes,
@@ -773,6 +812,7 @@ def main() -> None:
         "output_root": str(args.output_root),
         "batch_sizes": batch_sizes,
         "world_size": args.world_size,
+        "multi_gpu_strategy": args.multi_gpu_strategy,
         "batch_size_eval": args.batch_size_eval,
         "start_fold": args.start_fold,
         "epochs": args.epochs,

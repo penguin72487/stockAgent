@@ -51,7 +51,7 @@ ConflictPolicy = Literal["fail", "local-wins", "packed-wins"]
 class ColdArtifactSpec:
     dataset: str
     relative_root: str
-    maximum_file_bytes: int
+    maximum_file_bytes: int | None
     loose_file_threshold_bytes: int
     pack_buckets: int
     min_stable_hours: float
@@ -63,14 +63,15 @@ class ColdArtifactSpec:
         relative = _safe_relative_path(
             str(value.get("relative_root", "")), "cold artifact relative_root"
         ).as_posix()
-        maximum = int(value.get("maximum_file_bytes", -1))
+        raw_maximum = value.get("maximum_file_bytes", -1)
+        maximum = None if raw_maximum is None else int(raw_maximum)
         threshold = int(value.get("loose_file_threshold_bytes", -1))
         buckets = int(value.get("pack_buckets", 0))
         stable_hours = float(value.get("min_stable_hours", -1))
         contract = str(value.get("completion_contract", "")).strip()
-        if maximum < 0:
+        if maximum is not None and maximum < 0:
             raise SnapshotError("cold maximum_file_bytes must be non-negative")
-        if threshold <= maximum:
+        if maximum is not None and threshold <= maximum:
             raise SnapshotError(
                 "loose_file_threshold_bytes must exceed maximum_file_bytes so "
                 "every selected cold file is packed"
@@ -216,7 +217,12 @@ def publish_cold_artifact(
         metadata={
             "artifact_relative_root": spec.relative_root,
             "completion_contract": spec.completion_contract,
-            "transport_role": "cold-small-files",
+            "source_lifecycle_validated": "true",
+            "transport_role": (
+                "cold-full-run"
+                if spec.maximum_file_bytes is None
+                else "cold-small-files"
+            ),
         },
         repo_root=repo_root,
     )

@@ -1,0 +1,53 @@
+# Causally guarded successor to the completed all-TAIFEX carry v3 policy.
+# Each fold starts from the source fold with identical train/validation years.
+# The old 98-feature policy is preserved at epoch zero; the added t-1 stock-open
+# channel and the 08:45 futures execution paths start as trainable zero residuals.
+# Checkpoint selection is performed only by this target's exact signed
+# whole-contract account, never by the source continuous objective or test set.
+base_config: tw_stock_context_all_futures_portfolio_0845_integer_futures_open_recoverable_full_features_multi_basis_projection_l1_cash_capital10m.yaml
+
+experiment_name: tw-stock-context-all-futures-carry-0845-integer-futures-open-exact-recoverable-pretrained-guard-capital10m-v3
+
+runner:
+  # Input, model, and initialization contracts differ from the interrupted v2.
+  # Preserve both the completed source v3 and 08:45 v2 artifacts.
+  output_dir: artifacts/markets/tw_stock_context_all_futures_carry_0845_integer_futures_open_exact_recoverable_pretrained_guard_stock_tminus1_cash_capital10m_v3
+  resume: true
+  post_train_infer: false
+
+training:
+  # Formal lifecycle remains 1000 epochs. Recoverable backward is inherited and
+  # is training-only; validation/inference always use the exact integer forward.
+  epochs: 1000
+  warm_start_from_previous_fold: false
+  pretrained_initialization_root: artifacts/markets/tw_stock_context_all_futures_carry_multi_basis_projection_l1_v3_full1000_batch96_chunk64
+  pretrained_initialization_fold_policy: matching_train_and_validation_years
+  pretrained_initialization_feature_adapter: transformer_feature_projection_by_name
+  pretrained_initialization_require_exact_backbone: true
+  pretrained_initialization_validation_guard: true
+
+  # Freeze the already learned causal backbone. Fine-tune only the full named
+  # stock-feature projection, newly added legal execution context, and action
+  # head. This keeps every feature available without erasing the source alpha.
+  pretrained_initialization_trainable_parameter_prefixes:
+    - feature_proj.
+    - futures_underlying_
+    - futures_denomination_encoder.
+    - futures_current_open_encoder.
+    - futures_action_head.
+
+  learning_rate: 1.0e-4
+  enable_lr_scheduler: true
+  lr_scheduler: warmup_cosine
+  lr_scheduler_warmup_steps: 256
+  lr_scheduler_eta_min: 1.0e-6
+  early_stopping_no_improve_ratio: 0.1
+  early_stopping_min_delta: 1.0e-4
+
+  record_epoch_curve: true
+  curve_plot_interval: 1
+  curve_test_interval: 1
+  curve_plot_async: true
+  epoch_test_curve: true
+  defer_epoch_curve_plot_until_end: false
+

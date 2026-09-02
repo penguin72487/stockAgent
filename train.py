@@ -1362,6 +1362,12 @@ def main() -> None:
             carry_valuation_max_abs_simple_return=float(
                 config.data.tw_futures_carry_valuation_max_abs_simple_return
             ),
+            expiry_settlement_valuation=bool(
+                config.data.tw_futures_expiry_settlement_valuation
+            ),
+            final_settlement_path=(
+                config.trading.tw_futures_portfolio_final_settlement_path
+            ),
             integer_fee_per_contract_per_side_twd=float(
                 config.trading.tw_futures_portfolio_integer_fee_per_contract_per_side_twd
             ),
@@ -1369,6 +1375,20 @@ def main() -> None:
                 config.trading.max_volume_participation
             ),
         )
+        if (
+            _distributed_rank() == 0
+            and config.data.tw_futures_expiry_settlement_valuation
+        ):
+            futures_daily = panel.stock_context_futures_portfolio_daily
+            if futures_daily is None:
+                raise RuntimeError("all-futures expiry sidecar was not attached")
+            print(
+                "[all-futures expiry] official_final_settlement="
+                f"{futures_daily.expiry_final_settlement_path} "
+                "quarantined_incomplete_physical_contracts="
+                f"{futures_daily.expiry_settlement_quarantined_physical_contracts}",
+                flush=True,
+            )
     if str(config.trading.execution_mode) in {
         "tw_stock_futures_day_trade",
         "tw_stock_futures_day_trade_0900",
@@ -1423,13 +1443,23 @@ def main() -> None:
             raise RuntimeError(
                 "daily minute-execution loss requires official panel open prices"
             )
+        if panel.daily_volumes is None:
+            raise RuntimeError(
+                "hybrid daily/minute execution loss requires daily share volume "
+                "for the pre-minute-data uniform-minute 50% participation cap"
+            )
         def _load_execution_tape():
             return load_tw_day_trade_execution_tape(
                 config.data.day_trade_minute_execution_root,
                 panel_dates=panel.dates,
                 panel_symbols=panel.symbols,
                 official_open_prices=panel.open_prices,
+                official_close_prices=panel.close_prices,
+                daily_volume_shares=panel.daily_volumes,
                 cache_dir=config.data.day_trade_minute_execution_cache_dir,
+                allow_daily_proxy=(
+                    config.data.day_trade_minute_execution_allow_daily_proxy
+                ),
                 policy=config.data.day_trade_minute_execution_policy,
             )
 
