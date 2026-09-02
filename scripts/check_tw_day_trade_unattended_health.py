@@ -37,6 +37,7 @@ TAIPEI = ZoneInfo("Asia/Taipei")
 EXPECTED_MARKETS = (
     "tw_day_trade_100m",
     "tw_day_trade_multi_basis",
+    "tw_day_trade_multi_basis_22",
     "tw_day_trade_multi_basis_projection_l1_gelu",
 )
 REQUIRED_SERVICES = (

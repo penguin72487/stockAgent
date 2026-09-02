@@ -1,0 +1,72 @@
+base_config: ../markets/tw_day_trade_daily_multi_basis_22_effective_rank_projection_l1_tplus2_close_capital10m.yaml
+
+# Immutable inference contract for the completed 2026 deployment fold. Fold 12
+# validates on 2026 and has no stitched deployment rows, so live/replay inference
+# must stay on fold 11 (train through 2024, validate 2025, deploy to 2026).
+experiment_name: tw-day-trade-multi-basis-22-effective-rank-projection-l1-fold11-deployment
+
+runner:
+  output_dir: artifacts/markets/tw_day_trade_daily_multi_basis_22_effective_rank_projection_l1_tplus2_close_commission20_capital10m_v1
+  resume: false
+  post_train_infer: false
+
+walk_forward:
+  lookback_context: panel_history
+
+trading:
+  portfolio_activation: pre_normalized
+  volume_participation_equity: 10000000.0
+
+training:
+  loss_portfolio_activation: pre_normalized
+  financial_transformer:
+    portfolio_output_mode: projection_l1
+    temporal_basis_input: input_features
+    temporal_basis_families:
+      - haar
+      - swt_db2
+      - swt_sym4
+      - wavelet_packet
+      - walsh
+      - fourier
+      - dct
+      - dpss
+      - local_cosine
+      - morlet
+      - exponential
+      - laguerre
+      - difference
+      - ar_innovation
+      - bspline
+      - legendre
+      - chebyshev
+      - learned
+      - kautz
+      - discrete_hermite
+      - chirplet
+      - pca_klt
+    temporal_basis_components: 31
+    temporal_basis_novelty_threshold: 0.0001
+    temporal_basis_components_by_family:
+      haar: 31
+      swt_db2: 13
+      swt_sym4: 10
+      wavelet_packet: 14
+      walsh: 31
+      fourier: 31
+      dct: 31
+      dpss: 31
+      local_cosine: 31
+      morlet: 27
+      exponential: 8
+      laguerre: 13
+      difference: 31
+      ar_innovation: 8
+      bspline: 30
+      legendre: 31
+      chebyshev: 31
+      learned: 31
+      kautz: 23
+      discrete_hermite: 16
+      chirplet: 21
+      pca_klt: 31

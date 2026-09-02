@@ -117,6 +117,9 @@ AUDIT_LOG_PATH = ROOT / "artifacts" / "discord_bot" / "audit_events.jsonl"
 ARTIFACT_BACKFILL_STATUS_PATH = (
     ROOT / "artifacts" / "discord_bot" / "artifact_backfill_status.json"
 )
+STARTUP_INFERENCE_WARMUP_STATUS_PATH = (
+    ROOT / "artifacts" / "discord_bot" / "startup_inference_warmup.json"
+)
 PYTHON_EXECUTABLE_SENTINEL = "{python}"
 _MODEL_INFERENCE_LOCK = threading.Lock()
 _PRE_SIGNAL_SUCCESS_LOCK = threading.Lock()
@@ -125,6 +128,7 @@ _PREWARM_RUN_LOCKS_LOCK = threading.Lock()
 _PREOPEN_READINESS_LOCK = threading.Lock()
 _SERVICE_STATUS_LOCK = threading.Lock()
 _ARTIFACT_BACKFILL_STATUS_LOCK = threading.Lock()
+_STARTUP_INFERENCE_WARMUP_STATUS_LOCK = threading.Lock()
 _ERROR_LOG_LOCK = threading.Lock()
 _PRE_SIGNAL_SUCCESS_AT: dict[tuple[str, ...], float] = {}
 _PRE_SIGNAL_FAILURE_AT: dict[tuple[str, ...], tuple[float, str]] = {}
@@ -2470,6 +2474,7 @@ class StockAgentBot(discord.Client):
         self._opening_attempt_progress_message: str | None = None
         self._opening_attempt_market: str | None = None
         self._opening_attempt_hot = False
+        self._startup_inference_warmup_complete = False
 
     async def setup_hook(self) -> None:
         # Strategy recording is the primary responsibility of this process.
@@ -2505,6 +2510,7 @@ class StockAgentBot(discord.Client):
                 "installs=guild,user contexts=guild,dm,private_channel",
                 flush=True,
             )
+        startup_inference_warmup.start()
         signal_now_job_resumer.start()
         preopen_prepare.start()
         daily_summary.start()
@@ -2759,6 +2765,194 @@ def _write_preopen_final_arm(
             encoding="utf-8",
         )
         os.replace(temporary, path)
+
+
+def _startup_inference_warmup_status_path() -> Path:
+    configured = _env(
+        "STOCKAGENT_STARTUP_INFERENCE_WARMUP_STATUS_PATH",
+        str(STARTUP_INFERENCE_WARMUP_STATUS_PATH),
+    )
+    return _resolve_repo_path(configured) or Path(str(configured))
+
+
+def _write_startup_inference_warmup_status(
+    *,
+    status: str,
+    started_at: str,
+    markets: list[dict[str, Any]],
+    error: str | None = None,
+    elapsed_seconds: float | None = None,
+) -> dict[str, Any]:
+    observed = datetime.now().astimezone()
+    payload = {
+        "schema_version": 1,
+        "run_id": _BOT_RUN_ID,
+        "run_started_at": _BOT_RUN_STARTED_AT,
+        "status": str(status),
+        "started_at": str(started_at),
+        "updated_at": observed.isoformat(timespec="milliseconds"),
+        "completed_at": (
+            observed.isoformat(timespec="milliseconds")
+            if status in {"ready", "degraded"}
+            else None
+        ),
+        "market_count": len(markets),
+        "ready_count": sum(row.get("status") == "ready" for row in markets),
+        "elapsed_seconds": (
+            round(float(elapsed_seconds), 3)
+            if elapsed_seconds is not None
+            else None
+        ),
+        "markets": markets,
+        "error": error,
+    }
+    path = _startup_inference_warmup_status_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(
+        f"{path.name}.tmp.{os.getpid()}.{threading.get_ident()}"
+    )
+    with _STARTUP_INFERENCE_WARMUP_STATUS_LOCK:
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
+    return payload
+
+
+def _load_startup_inference_warmup_status() -> dict[str, Any]:
+    try:
+        payload = json.loads(
+            _startup_inference_warmup_status_path().read_text(encoding="utf-8")
+        )
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return {"status": "pending", "run_id": _BOT_RUN_ID, "markets": []}
+    if not isinstance(payload, dict) or payload.get("run_id") != _BOT_RUN_ID:
+        return {"status": "pending", "run_id": _BOT_RUN_ID, "markets": []}
+    return payload
+
+
+def _startup_inference_warmup_must_defer() -> bool:
+    """Yield the GPU lock while the canonical opening pipeline owns priority."""
+
+    for market in _scheduled_markets():
+        cfg = _resolve_market(market)
+        if not bool(getattr(cfg, "day_trade_simulation_enabled", False)):
+            continue
+        now = datetime.now(ZoneInfo(cfg.timezone or "Asia/Taipei"))
+        session_open, _reason = _scheduled_market_session_day(cfg, now)
+        if not session_open:
+            continue
+        prepare_minutes = _hhmm_minutes(
+            getattr(cfg, "preopen_prepare_time", None) or "08:15"
+        )
+        open_minutes = _hhmm_minutes(
+            getattr(cfg, "open_time", None) or _market_schedule_time(cfg)
+        )
+        if prepare_minutes is None or open_minutes is None:
+            continue
+        now_minutes = now.hour * 60 + now.minute
+        if (
+            prepare_minutes <= now_minutes <= open_minutes + 5
+            and _day_trade_schedule_state(cfg, now.date().isoformat()) == "retry"
+        ):
+            return True
+    return False
+
+
+def _warm_startup_inference_sync() -> dict[str, Any]:
+    """Warm panel, checkpoint, normalized input, and GPU model without I/O quotes."""
+
+    started = time.perf_counter()
+    started_at = datetime.now().astimezone().isoformat(timespec="milliseconds")
+    rows: list[dict[str, Any]] = []
+    markets = [
+        market
+        for market in _scheduled_markets()
+        if bool(
+            getattr(
+                _resolve_market(market),
+                "day_trade_simulation_enabled",
+                False,
+            )
+        )
+    ]
+    markets.sort(
+        key=lambda market: (
+            -_preopen_market_symbol_count(_resolve_market(market)),
+            market,
+        )
+    )
+    _write_startup_inference_warmup_status(
+        status="running",
+        started_at=started_at,
+        markets=rows,
+    )
+    for market in markets:
+        market_started = time.perf_counter()
+        try:
+            kwargs = _signal_kwargs(
+                market=market,
+                price_source="panel",
+                scheduled=True,
+                progress_label=f"startup-warm:{market}",
+            )
+            kwargs.update(
+                write=False,
+                ensure_previous_signal=False,
+                previous_signal_backfill_limit=0,
+            )
+            with _MODEL_INFERENCE_LOCK:
+                result = generate_live_signal(**kwargs)
+            latency = dict(result.summary.get("live_latency") or {})
+            rows.append(
+                {
+                    "market": market,
+                    "status": "ready",
+                    "elapsed_seconds": round(
+                        time.perf_counter() - market_started,
+                        3,
+                    ),
+                    "panel_date": result.summary.get("panel_date"),
+                    "fold_id": result.summary.get("fold_id"),
+                    "checkpoint_fingerprint": result.summary.get(
+                        "checkpoint_fingerprint"
+                    ),
+                    "symbol_count": result.summary.get("symbol_count"),
+                    "live_latency": latency,
+                }
+            )
+        except Exception as exc:
+            _log_exception(f"startup_inference_warmup:{market}", exc)
+            rows.append(
+                {
+                    "market": market,
+                    "status": "failed",
+                    "elapsed_seconds": round(
+                        time.perf_counter() - market_started,
+                        3,
+                    ),
+                    "error_type": type(exc).__name__,
+                    "error": str(exc)[:2000],
+                }
+            )
+        _write_startup_inference_warmup_status(
+            status="running",
+            started_at=started_at,
+            markets=rows,
+        )
+    ready = bool(rows) and all(row.get("status") == "ready" for row in rows)
+    return _write_startup_inference_warmup_status(
+        status="ready" if ready else "degraded",
+        started_at=started_at,
+        markets=rows,
+        elapsed_seconds=time.perf_counter() - started,
+        error=(
+            None
+            if ready
+            else "one or more configured day-trade inference modes failed to warm"
+        ),
+    )
 
 
 def _prewarm_market_signal_sync(cfg: LiveMarketConfig) -> LiveSignalResult:
@@ -4343,6 +4537,10 @@ def _write_discord_service_status() -> dict[str, Any]:
         "core_health": "ready" if bot.is_ready() else "waiting",
         "background_maintenance": _artifact_backfill_health_summary(),
         "interactive_signal_jobs": _signal_now_job_health_summary(),
+        # Process-local CUDA/checkpoint caches are a performance domain, not a
+        # Discord liveness gate. Keep their state visible without disconnecting
+        # commands when a warmup retry is still pending.
+        "startup_inference_warmup": _load_startup_inference_warmup_status(),
         "day_trade_markets": day_trade_markets,
         "engine_run_id": engine.get("engine_run_id"),
         "engine_state_revision": int(engine.get("state_revision") or 0),
@@ -5389,6 +5587,7 @@ def _guide_message() -> str:
         "`tw_cash` 現股/T+2 模式；需有相符 checkpoint 才能推論。",
         "`tw_day_trade_multi_basis` Multi-Basis 現股當沖（初始 1,000 萬）；使用 raw-feature lookback-32 fold 11。",
         "`tw_day_trade_100m` 現股當沖（初始 1 億）；使用獨立模型與資金基準。",
+        "`tw_day_trade_multi_basis_22` 多基底22 現股當沖（初始 1,000 萬）；使用 22 組 effective-rank 時間基底與 Projection-L1 fold 11。",
         "`tw_day_trade_multi_basis_projection_l1_gelu` Multi-Basis Projection-L1 GELU 現股當沖（初始 1,000 萬）。",
         "",
         "**日常看盤**",
@@ -8433,6 +8632,35 @@ async def model_auto_deployment() -> None:
 @tasks.loop(seconds=15)
 async def signal_now_job_resumer() -> None:
     await _resume_signal_now_jobs_once()
+
+
+@tasks.loop(seconds=15)
+async def startup_inference_warmup() -> None:
+    """Retry background warmup until all active paper modes are process-hot."""
+
+    if bot._startup_inference_warmup_complete:
+        return
+    if _startup_inference_warmup_must_defer():
+        return
+    try:
+        receipt = await asyncio.to_thread(_warm_startup_inference_sync)
+    except Exception as exc:
+        _log_exception("startup_inference_warmup", exc)
+        return
+    if receipt.get("status") == "ready":
+        bot._startup_inference_warmup_complete = True
+        print(
+            "[startup-warm] status=ready "
+            f"markets={receipt.get('ready_count')}/{receipt.get('market_count')} "
+            f"elapsed={receipt.get('elapsed_seconds')}s",
+            flush=True,
+        )
+    else:
+        print(
+            "[startup-warm] status=degraded; retrying in 15s "
+            f"markets={receipt.get('ready_count')}/{receipt.get('market_count')}",
+            flush=True,
+        )
 
 
 @tasks.loop(seconds=1)

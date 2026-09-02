@@ -15,6 +15,7 @@ from downloader.download_shioaji_tw_minute_kbars import (
     SharedRequestRateLimiter,
     SymbolResult,
     _write_run_summary,
+    _write_market_hours_stop,
     completed_symbol_manifest_result,
     contract_for_stock_symbol,
     minute_chunk_paths,
@@ -268,6 +269,42 @@ def test_incomplete_extension_does_not_replace_terminal_catalog(
     latest = json.loads(output.read_text())
     assert latest["published_terminal_catalog"] is False
     assert latest["partial_symbols"] == 1
+
+
+def test_market_hours_preflight_stop_persists_zero_request_receipt(
+    tmp_path: Path,
+) -> None:
+    row = UniverseRow(
+        symbol="2330",
+        name="台積電",
+        market="twse",
+        security_type="stock",
+        base_path=tmp_path / "2330.parquet",
+    )
+    args = SimpleNamespace(
+        start_date="2026-09-02",
+        end_date="2026-09-02",
+        chunk_days=1,
+        simulation=True,
+        workers=1,
+        requests_per_second=5.0,
+    )
+
+    summary_path = _write_market_hours_stop(
+        tmp_path,
+        args=args,
+        selected=[row],
+        message="live-priority window",
+    )
+
+    summary = json.loads(summary_path.read_text())
+    progress = json.loads((tmp_path / "progress.json").read_text())
+    assert summary["stopped_for_market_hours"] is True
+    assert summary["api_requests_started_this_run"] == 0
+    assert summary["published_terminal_catalog"] is False
+    assert progress["state"] == "stopped_for_market_hours"
+    assert progress["api_requests_started_this_run"] == 0
+    assert progress["stop_reason"] == "live-priority window"
 
 
 def test_research_gate_allows_audited_source_gaps_but_rejects_failures(

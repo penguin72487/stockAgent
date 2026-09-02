@@ -183,7 +183,10 @@ def main() -> None:
     experiment.data.live_tail_panel_rows = max(
         int(experiment.data.live_tail_panel_rows or 0), requested_tail_rows
     )
-    panel, panel_cache_hit = _build_panel(experiment, live_tail=True)
+    panel, panel_cache_hit, panel_cache_tier = _build_panel(
+        experiment,
+        live_tail=True,
+    )
 
     input_root = args.input_root.resolve() / market_config.market
     receipt: dict[str, Any] = {
@@ -201,6 +204,7 @@ def main() -> None:
             "symbols": int(panel.num_symbols),
             "requested_live_tail_panel_rows": requested_tail_rows,
             "memory_cache_hit": bool(panel_cache_hit),
+            "cache_tier": str(panel_cache_tier),
         },
         "market_config_path": str(market_config_path),
         "market_config_sha256": _sha256(market_config_path),

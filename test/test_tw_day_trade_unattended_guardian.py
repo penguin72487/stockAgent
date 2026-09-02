@@ -90,6 +90,7 @@ def test_weekly_guardian_uses_existing_authoritative_units_without_active_restar
     for market in (
         "tw_day_trade_100m",
         "tw_day_trade_multi_basis",
+        "tw_day_trade_multi_basis_22",
         "tw_day_trade_multi_basis_projection_l1_gelu",
     ):
         assert market in guardian
