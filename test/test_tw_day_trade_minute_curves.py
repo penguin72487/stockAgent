@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,17 +10,175 @@ import numpy as np
 import polars as pl
 import pytest
 
+from scripts.maintain_tw_day_trade_minute_curves import (
+    _completed_scope,
+    _validate_benchmarks,
+)
 from scripts.rebuild_tw_day_trade_minute_curves import (
     MinutePriceStore,
     _ticks_to_minute_frame,
     fetch_missing_kbars,
     rebuild_benchmark_history,
     rebuild_strategy_marks,
+    required_symbol_dates,
+    validate_existing_strategy_marks,
 )
 from stockagent.live.tw_day_trade_simulation import position_net_liquidation_pnl
 
 
 TAIPEI = ZoneInfo("Asia/Taipei")
+
+
+def test_existing_bracket_aware_strategy_marks_validate_without_rebuild() -> None:
+    start = datetime(2026, 8, 13, 9, 1, tzinfo=TAIPEI)
+    rows = []
+    for market in ("a", "b", "c"):
+        for offset in range(270):
+            observed = start + timedelta(minutes=offset)
+            rows.append(
+                {
+                    "session_date": "2026-08-13",
+                    "market": market,
+                    "minute": observed.isoformat(timespec="minutes"),
+                    "valuation_stale": offset == 1,
+                }
+            )
+
+    preserved, stats = validate_existing_strategy_marks(
+        rows, start=date(2026, 8, 13), end=date(2026, 8, 13)
+    )
+
+    assert preserved == rows
+    assert stats["generated_rows"] == 810
+    assert stats["rows_with_carried_prices"] == 3
+    assert stats["existing_bracket_aware_marks_preserved"] is True
+
+
+def test_existing_mark_validation_does_not_require_preserved_benchmarks() -> None:
+    positions = {
+        "2026-08-13": {
+            "tw_day_trade": [{"symbol": "2317"}],
+        }
+    }
+
+    required = required_symbol_dates(
+        positions,
+        ["2026-08-13"],
+        include_stock_benchmarks=False,
+    )
+
+    assert required == {"2317": {"2026-08-13"}}
+
+
+def _write_maintenance_scope(
+    root: Path,
+    *,
+    current_open_positions: int,
+    closing_auction_settled: bool,
+) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "rebuild_receipt.json").write_text(
+        json.dumps(
+            {
+                "sessions": [
+                    {
+                        "session_date": "2026-08-31",
+                        "close": {"status": "settled_official_close"},
+                    },
+                    {
+                        "session_date": "2026-09-01",
+                        "close": {"status": "current_session_open"},
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    modes = {}
+    for market in ("a", "b", "c"):
+        modes[market] = {
+            "session_date": "2026-09-01",
+            "open_position_count": current_open_positions,
+            "positions": {
+                "2330": {"signed_shares": 1_000 if current_open_positions else 0}
+            },
+            "closing_auction_settled_at": (
+                "2026-09-01T13:30:01+08:00" if closing_auction_settled else None
+            ),
+            "engine_status": "active" if current_open_positions else "terminal",
+        }
+    (root / "state.json").write_text(
+        json.dumps({"modes": modes}), encoding="utf-8"
+    )
+
+
+def test_minute_curve_maintenance_defers_open_current_session(tmp_path: Path) -> None:
+    _write_maintenance_scope(
+        tmp_path,
+        current_open_positions=1,
+        closing_auction_settled=False,
+    )
+
+    sessions, markets = _completed_scope(tmp_path)
+
+    assert sessions == ["2026-08-31"]
+    assert markets == {"a", "b", "c"}
+
+
+def test_minute_curve_maintenance_includes_flat_terminal_session(
+    tmp_path: Path,
+) -> None:
+    _write_maintenance_scope(
+        tmp_path,
+        current_open_positions=0,
+        closing_auction_settled=True,
+    )
+
+    sessions, markets = _completed_scope(tmp_path)
+
+    assert sessions == ["2026-08-31", "2026-09-01"]
+    assert markets == {"a", "b", "c"}
+
+
+def test_minute_curve_maintenance_requires_all_benchmark_minutes(
+    tmp_path: Path,
+) -> None:
+    day = "2026-09-01"
+    marks = []
+    for benchmark_id, start_clock, points in (
+        ("benchmark_0050", datetime(2026, 9, 1, 9, 0), 271),
+        ("benchmark_2330", datetime(2026, 9, 1, 9, 0), 271),
+        ("benchmark_tx_continuous", datetime(2026, 9, 1, 8, 45), 300),
+    ):
+        for offset in range(points):
+            observed = start_clock + timedelta(minutes=offset)
+            marks.append(
+                {
+                    "benchmark_id": benchmark_id,
+                    "session_date": day,
+                    "minute": observed.replace(tzinfo=TAIPEI).isoformat(
+                        timespec="minutes"
+                    ),
+                }
+            )
+    (tmp_path / "benchmark_history.json").write_text(
+        json.dumps({"marks": marks}), encoding="utf-8"
+    )
+
+    result = _validate_benchmarks(
+        tmp_path,
+        completed_session_dates=[day],
+    )
+
+    assert result["rows"]["benchmark_0050"] == 271
+    assert result["rows"]["benchmark_tx_continuous"] == 300
+
+    marks.pop()
+    (tmp_path / "benchmark_history.json").write_text(
+        json.dumps({"marks": marks}), encoding="utf-8"
+    )
+    with pytest.raises(RuntimeError, match="minute count"):
+        _validate_benchmarks(tmp_path, completed_session_dates=[day])
 
 
 def _minute_file(root: Path, symbol: str, rows: list[tuple[datetime, float]]) -> None:

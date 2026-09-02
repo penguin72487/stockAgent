@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
+import polars as pl
 import pytest
 import torch
 
@@ -20,8 +21,13 @@ from stockagent.backtest.tw_day_trade_minute import (
 )
 from stockagent.data.tw_day_trade_execution import (
     DAILY_PROXY_SESSION_MINUTE_BARS,
+    DAY_TRADE_FULL_SESSION_FIELDS,
+    DAY_TRADE_FULL_SESSION_MINUTES,
+    DAY_TRADE_MINUTE_EXECUTION_POLICY_FULL_VOLUME,
     DAY_TRADE_EXECUTION_FIELD_COUNT,
     DayTradeExecutionField as F,
+    FULL_SESSION_PRICE,
+    FULL_SESSION_VOLUME_SHARES,
     load_tw_day_trade_execution_tape,
 )
 from stockagent.training.loss import risk_aware_loss
@@ -191,6 +197,88 @@ def test_daily_proxy_prices_are_used_inside_exact_loss_forward_and_backward() ->
     assert history[1, 0] < 0.0
     assert torch.all(turnover > 0.0)
     (-returns.sum()).backward()
+    assert weights.grad is not None
+    assert torch.isfinite(weights.grad).all()
+    assert weights.grad.abs().sum() > 0.0
+
+
+def _full_session_tape(days: int = 1, symbols: int = 1) -> torch.Tensor:
+    tape = torch.full(
+        (
+            days,
+            symbols,
+            DAY_TRADE_FULL_SESSION_MINUTES,
+            DAY_TRADE_FULL_SESSION_FIELDS,
+        ),
+        float("nan"),
+    )
+    tape[:, :, :, FULL_SESSION_VOLUME_SHARES] = 0.0
+    tape[:, :, 0, FULL_SESSION_PRICE] = 100.0
+    tape[:, :, 1, FULL_SESSION_PRICE] = 100.0
+    tape[:, :, 1, FULL_SESSION_VOLUME_SHARES] = 5_000.0
+    tape[:, :, 2, FULL_SESSION_PRICE] = 102.0
+    tape[:, :, 2, FULL_SESSION_VOLUME_SHARES] = 5_000.0
+    tape[:, :, 261, FULL_SESSION_PRICE] = 110.0
+    tape[:, :, 261, FULL_SESSION_VOLUME_SHARES] = 4_000.0
+    tape[:, :, 262, FULL_SESSION_PRICE] = 108.0
+    tape[:, :, 262, FULL_SESSION_VOLUME_SHARES] = 6_000.0
+    tape[:, :, 270, FULL_SESSION_PRICE] = 107.0
+    return tape
+
+
+def test_full_volume_order_carries_entry_and_exit_across_minutes() -> None:
+    tape = _full_session_tape()
+    mask = torch.ones((1, 1), dtype=torch.bool)
+    zeros = torch.zeros(1)
+    result = run_tw_day_trade_minute_execution(
+        torch.tensor([[1.0]]),
+        tape,
+        mask,
+        mask,
+        mask,
+        mask,
+        mask,
+        zeros,
+        zeros,
+        zeros,
+        initial_capital_twd=1_000_000.0,
+        maximum_volume_participation=1.0,
+    )
+
+    # Requested 10 lots: 5 fill at 09:01 and 5 at 09:02. Exit fills 4 lots
+    # at 13:21 and 6 at 13:22. No 13:30 accounting conversion is required.
+    assert torch.allclose(
+        result.weights_history,
+        torch.tensor([[1.01]]),
+        atol=1.0e-7,
+    )
+    assert torch.allclose(
+        result.strategy_returns.exp() - 1.0,
+        torch.tensor([0.078]),
+        atol=1.0e-7,
+    )
+    assert torch.allclose(result.turnovers, torch.tensor([2.098]), atol=1.0e-7)
+
+
+def test_full_volume_execution_retains_action_gradient() -> None:
+    weights = torch.tensor([[1.0]], requires_grad=True)
+    mask = torch.ones((1, 1), dtype=torch.bool)
+    zeros = torch.zeros(1)
+    result = run_tw_day_trade_minute_execution(
+        weights,
+        _full_session_tape(),
+        mask,
+        mask,
+        mask,
+        mask,
+        mask,
+        zeros,
+        zeros,
+        zeros,
+        initial_capital_twd=1_000_000.0,
+        maximum_volume_participation=1.0,
+    )
+    (-result.strategy_returns.sum()).backward()
     assert weights.grad is not None
     assert torch.isfinite(weights.grad).all()
     assert weights.grad.abs().sum() > 0.0
@@ -391,6 +479,94 @@ def test_executable_minute_model_rejects_proxy_enabled_config(tmp_path) -> None:
 
     with pytest.raises(ValueError, match="allow_daily_proxy=false"):
         load_config(invalid)
+
+
+def test_full_volume_sub_lot_forward_is_flat_but_gradient_can_learn_concentration() -> None:
+    weights = torch.tensor([[0.05]], requires_grad=True)
+    mask = torch.ones((1, 1), dtype=torch.bool)
+    zeros = torch.zeros(1)
+    result = run_tw_day_trade_minute_execution(
+        weights,
+        _full_session_tape(),
+        mask,
+        mask,
+        mask,
+        mask,
+        mask,
+        zeros,
+        zeros,
+        zeros,
+        initial_capital_twd=1_000_000.0,
+        maximum_volume_participation=1.0,
+    )
+
+    assert result.weights_history.item() == 0.0
+    assert result.strategy_returns.item() == 0.0
+    (-result.strategy_returns.sum()).backward()
+    assert weights.grad is not None
+    assert torch.isfinite(weights.grad).all()
+    assert weights.grad.abs().sum() > 0.0
+
+
+def test_full_session_loader_preserves_every_right_labelled_minute(
+    tmp_path,
+) -> None:
+    root = tmp_path / "minute"
+    day_root = root / "trade_date=2026-08-13"
+    day_root.mkdir(parents=True)
+    (root / "manifest.json").write_text(
+        '{"schema_version":4,"source":"shioaji_kbars_1m",'
+        '"research_ready":true,"status":"research_ready",'
+        '"dates":["2026-08-13"],"partitions":[{}]}',
+        encoding="utf-8",
+    )
+    pl.DataFrame(
+        {
+            "symbol": ["2330", "2330", "2330"],
+            "minutes_from_open": [1, 2, 270],
+            "Close": [100.0, 102.0, 110.0],
+            "Amount": [500_000.0, 510_000.0, 550_000.0],
+            "volume_shares": [5_000.0, 5_000.0, 5_000.0],
+        }
+    ).write_parquet(day_root / "data.parquet")
+
+    tape = load_tw_day_trade_execution_tape(
+        root,
+        panel_dates=np.asarray(["2026-08-13"], dtype="datetime64[D]"),
+        panel_symbols=["2330"],
+        official_open_prices=np.asarray([[99.0]], dtype=np.float64),
+        cache_dir=tmp_path / "cache",
+        policy=DAY_TRADE_MINUTE_EXECUTION_POLICY_FULL_VOLUME,
+    )
+
+    assert tape.shape == (1, 1, 271, 2)
+    assert tape[0, 0, 0, FULL_SESSION_PRICE] == pytest.approx(99.0)
+    assert tape[0, 0, 1, FULL_SESSION_PRICE] == pytest.approx(100.0)
+    assert tape[0, 0, 2, FULL_SESSION_PRICE] == pytest.approx(102.0)
+    assert tape[0, 0, 2, FULL_SESSION_VOLUME_SHARES] == pytest.approx(5_000.0)
+    assert tape[0, 0, 270, FULL_SESSION_PRICE] == pytest.approx(110.0)
+    assert tape[0, 0, 3, FULL_SESSION_VOLUME_SHARES] == 0.0
+
+
+def test_multi_basis_full_volume_config_is_an_independent_contract() -> None:
+    config = load_config(
+        "configs/markets/"
+        "tw_day_trade_daily_multi_basis_projection_l1_minute_volume100_capital10m.yaml"
+    )
+    assert config.trading.execution_mode == "tw_day_trade"
+    assert config.trading.max_volume_participation == 1.0
+    assert config.trading.volume_participation_equity == 10_000_000.0
+    assert not config.trading.tw_day_trade_unlimited_margin_conversion
+    assert (
+        config.data.day_trade_minute_execution_policy
+        == DAY_TRADE_MINUTE_EXECUTION_POLICY_FULL_VOLUME
+    )
+    assert config.training.transformer_base_portfolio.temporal_basis_input == (
+        "input_features"
+    )
+    assert config.training.financial_transformer.portfolio_output_mode == (
+        "projection_l1"
+    )
 
 
 def test_daily_target_executes_first_minute_then_limit_market_and_auction() -> None:

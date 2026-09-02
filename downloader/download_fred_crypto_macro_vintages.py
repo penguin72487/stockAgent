@@ -124,7 +124,7 @@ def _fetch_series(
     profile = provider_rate_limit("fred_api")
     for attempt in range(max(1, max_retries + 1)):
         if attempt:
-            time.sleep(retry_delay_seconds(attempt, 1.0, maximum=30.0))
+            time.sleep(retry_delay_seconds(attempt, base=1.0, cap=30.0))
         try:
             request = Request(
                 url,

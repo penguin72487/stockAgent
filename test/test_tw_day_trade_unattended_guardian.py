@@ -118,6 +118,31 @@ def test_source_event_watchdog_tracks_probe_lock_and_download_progress() -> None
     assert "subprocess.Popen(command, cwd=REPO_ROOT)" in source
 
 
+def test_guardian_distinguishes_missing_signal_from_nonlive_recovery() -> None:
+    session_date = "2026-09-02"
+    modes = {
+        market: {
+            "session_date": session_date,
+            "signal_id": f"{market}-signal",
+            "entry_completed_at": f"{session_date}T09:01:00+08:00",
+            "entry_fill_policy": "causal_best_quote",
+            "entry_price_offset_ticks": 0,
+        }
+        for market in guardian.EXPECTED_MARKETS
+    }
+    modes["tw_day_trade_100m"]["entry_fill_policy"] = (
+        "official_open_signal_0900_execute_0901_vwap"
+    )
+    modes["tw_day_trade_multi_basis"].pop("entry_completed_at")
+
+    missing, recovered = guardian._classify_session_signals(
+        modes, session_date=session_date
+    )
+
+    assert missing == ["tw_day_trade_multi_basis"]
+    assert recovered == ["tw_day_trade_100m"]
+
+
 def test_guardian_rearms_failed_unit_without_restart(monkeypatch) -> None:
     commands: list[tuple[str, ...]] = []
 

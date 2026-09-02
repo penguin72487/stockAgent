@@ -17,6 +17,7 @@ Environment="OPENBB_SUPERVISOR_TQDM=0"
 ExecStart=/usr/bin/bash "__REPO_ROOT__/scripts/run_openbb_archive_until_complete.sh"
 Restart=on-failure
 RestartPreventExitStatus=2 3
+SuccessExitStatus=3
 RestartSec=60s
 TimeoutStopSec=120s
 KillMode=control-group

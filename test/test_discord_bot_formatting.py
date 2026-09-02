@@ -709,7 +709,10 @@ def test_day_trade_scheduler_waits_for_engine_execution_record(
         }
     }
     (state_dir / "state.json").write_text(json.dumps(state), encoding="utf-8")
-    assert _day_trade_schedule_state(cfg, "2026-08-14") == "retry"
+    # Once an immutable artifact exists, the independent engine owns retry and
+    # restart recovery.  Discord must not replace it while acknowledgement is
+    # pending.
+    assert _day_trade_schedule_state(cfg, "2026-08-14") == "pending_confirmation"
 
     state["modes"]["tw_day_trade"].update(
         {
@@ -1603,6 +1606,22 @@ def test_tw_snapshot_refresh_uses_the_outer_shared_lock(tmp_path) -> None:
     )
 
 
+def test_tw_opening_activation_waits_for_the_outer_shared_lock(tmp_path) -> None:
+    live_root = tmp_path / "live" / "data_tw_public"
+    command = [
+        "python",
+        "scripts/activate_tw_public_opening_data.py",
+        "--live-root",
+        str(live_root),
+        "--link",
+        "data_tw_public",
+    ]
+
+    assert _tw_data_layer_lock_path(command) == (
+        live_root.parent / ".locks" / "tw-public-refresh.lock"
+    )
+
+
 def test_pre_signal_failure_cache_is_shared_and_success_clears_it(monkeypatch) -> None:
     from services.discord_bot import bot as discord_bot
 
@@ -1938,7 +1957,7 @@ def test_can_reuse_latest_signal_now_for_recent_open_yahoo(monkeypatch) -> None:
     assert reason == "cached_open_yahoo_age=30s"
 
 
-def test_open_day_trade_cache_requires_current_decision_panel(monkeypatch) -> None:
+def test_open_day_trade_signal_now_never_reuses_a_price_or_signal_cache(monkeypatch) -> None:
     cfg = SimpleNamespace(
         market="tw_day_trade",
         market_type="tw",
@@ -1968,7 +1987,7 @@ def test_open_day_trade_cache_requires_current_decision_panel(monkeypatch) -> No
     )
 
     assert not reusable
-    assert reason == "day_trade_live_open_feature_missing"
+    assert reason == "day_trade_signal_now_requires_fresh_quote"
 
     summary.update(
         panel_date="2026-07-21 12:10:43",
@@ -1980,8 +1999,8 @@ def test_open_day_trade_cache_requires_current_decision_panel(monkeypatch) -> No
         summary,
         requested_price_source="auto",
     )
-    assert reusable
-    assert reason == "cached_open_tw_mis_age=10s"
+    assert not reusable
+    assert reason == "day_trade_signal_now_requires_fresh_quote"
 
 
 def test_signal_now_refreshes_automatically_when_data_is_stale() -> None:

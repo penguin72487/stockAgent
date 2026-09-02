@@ -455,11 +455,14 @@ class MinutePriceStore:
 def required_symbol_dates(
     positions: Mapping[str, Mapping[str, list[dict[str, Any]]]],
     session_dates: list[str],
+    *,
+    include_stock_benchmarks: bool = True,
 ) -> dict[str, set[str]]:
     required: dict[str, set[str]] = defaultdict(set)
     for session_date in session_dates:
-        required["0050"].add(session_date)
-        required["2330"].add(session_date)
+        if include_stock_benchmarks:
+            required["0050"].add(session_date)
+            required["2330"].add(session_date)
         for mode_positions in (positions.get(session_date) or {}).values():
             for position in mode_positions:
                 required[str(position["symbol"])].add(session_date)
@@ -745,6 +748,83 @@ def rebuild_strategy_marks(
     }
 
 
+def validate_existing_strategy_marks(
+    source_rows: list[dict[str, Any]],
+    *,
+    start: date,
+    end: date,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Validate bracket-aware replay marks without recomputing their PnL path."""
+
+    selected = [
+        row
+        for row in source_rows
+        if _in_range(str(row.get("session_date") or ""), start, end)
+    ]
+    grouped: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    for row in selected:
+        session_date = str(row.get("session_date") or "")
+        market = str(row.get("market") or "")
+        if not session_date or not market:
+            raise RuntimeError("existing strategy mark is missing session_date or market")
+        grouped[(session_date, market)].append(row)
+    session_dates = sorted({key[0] for key in grouped})
+    markets = sorted({key[1] for key in grouped})
+    if not session_dates or not markets:
+        raise RuntimeError("no existing strategy minute marks in requested range")
+
+    carried_rows = 0
+    coverage_values: list[float] = []
+    for session_date in session_dates:
+        base = datetime.fromisoformat(f"{session_date}T09:01:00+08:00")
+        expected_minutes = [
+            (base + timedelta(minutes=offset)).isoformat(timespec="minutes")
+            for offset in range(270)
+        ]
+        for market in markets:
+            rows = grouped.get((session_date, market), [])
+            actual_minutes = [str(row.get("minute") or "") for row in rows]
+            if len(rows) != 270 or Counter(actual_minutes) != Counter(expected_minutes):
+                raise RuntimeError(
+                    f"existing strategy minute cardinality mismatch for "
+                    f"{session_date}:{market}; expected exactly 09:01..13:30"
+                )
+            for row in rows:
+                stale = bool(row.get("valuation_stale")) or int(
+                    row.get("stale_position_count") or 0
+                ) > 0
+                carried_rows += int(stale)
+                value = row.get("fresh_trade_notional_coverage_ratio")
+                try:
+                    parsed = float(value)
+                except (TypeError, ValueError):
+                    parsed = math.nan
+                if math.isfinite(parsed):
+                    coverage_values.append(parsed)
+
+    expected_rows = len(session_dates) * len(markets) * 270
+    if len(selected) != expected_rows:
+        raise RuntimeError(
+            f"existing strategy minute rows include unexpected scope: "
+            f"{len(selected)} != {expected_rows}"
+        )
+    return list(source_rows), {
+        "session_dates": session_dates,
+        "markets": markets,
+        "generated_rows": len(selected),
+        "rows_with_carried_prices": carried_rows,
+        "minimum_fresh_trade_notional_coverage_ratio": (
+            min(coverage_values) if coverage_values else None
+        ),
+        "mean_fresh_trade_notional_coverage_ratio": (
+            sum(coverage_values) / len(coverage_values)
+            if coverage_values
+            else None
+        ),
+        "existing_bracket_aware_marks_preserved": True,
+    }
+
+
 def _benchmark_minute_row(
     template: Mapping[str, Any],
     *,
@@ -932,6 +1012,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--simulation", action="store_true")
+    parser.add_argument(
+        "--validate-existing-strategy-marks",
+        action="store_true",
+        help=(
+            "Validate and preserve an existing bracket/EOD-aware 270-point "
+            "strategy curve instead of replacing it with endpoint-derived marks."
+        ),
+    )
     parser.add_argument("--fetch-workers", type=int, default=1)
     parser.add_argument("--requests-per-second", type=float, default=5.0)
     parser.add_argument(
@@ -978,7 +1066,11 @@ def main() -> None:
             if _in_range(str(row.get("session_date") or ""), start, end)
         }
     )
-    required = required_symbol_dates(positions, session_dates)
+    required = required_symbol_dates(
+        positions,
+        session_dates,
+        include_stock_benchmarks=True,
+    )
     store.prepare(required)
     coverage_before = store.coverage(required)
     fetch = {
@@ -1018,12 +1110,20 @@ def main() -> None:
         _atomic_json(args.output_dir / "minute_curve_gap_audit.json", gap_audit)
         raise RuntimeError(f"required minute prices are missing: {missing[:20]}")
 
-    rebuilt_marks, strategy_stats = rebuild_strategy_marks(
-        source_marks, positions, store, start=start, end=end
-    )
+    if args.validate_existing_strategy_marks:
+        rebuilt_marks, strategy_stats = validate_existing_strategy_marks(
+            source_marks, start=start, end=end
+        )
+    else:
+        rebuilt_marks, strategy_stats = rebuild_strategy_marks(
+            source_marks, positions, store, start=start, end=end
+        )
     source_benchmarks = _read_json(args.state_dir / "benchmark_history.json")
     rebuilt_benchmarks, benchmark_stats = rebuild_benchmark_history(
         source_benchmarks, store, start=start, end=end
+    )
+    benchmark_stats["strategy_marks_preserved_independently"] = bool(
+        args.validate_existing_strategy_marks
     )
     tick_manifest_path = args.output_dir / "tick_minute_manifest.json"
     tick_manifest = build_tick_minute_manifest(tick_root, tick_manifest_path)
@@ -1041,6 +1141,9 @@ def main() -> None:
         "minute_contract": MINUTE_CONTRACT,
         "linear_interpolation_used": False,
         "accepted_09_01_strategy_and_13_30_endpoints_preserved": True,
+        "existing_bracket_aware_strategy_marks_preserved": bool(
+            args.validate_existing_strategy_marks
+        ),
         "historical_minute_marks_are_executable_quotes": False,
         "local_first_contract": (
             "ordered local KBar and research partitions first; canonical "

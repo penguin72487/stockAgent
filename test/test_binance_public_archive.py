@@ -14,6 +14,7 @@ from downloader.download_binance_public_archive import (
     ArchiveObject,
     _canonical_merge,
     _capacity_receipt,
+    _download_states,
     _is_requested_symbol,
     _parse_kline_zip,
     _parse_listing,
@@ -200,3 +201,34 @@ def test_parallel_state_writes_are_serialized(tmp_path: Path) -> None:
     completed = _completed_etags(state)
     assert len(completed) == len(items)
     assert set(completed) == {item.key for item in items}
+
+
+def test_durable_source_quarantine_keeps_data_partial_without_failing_clean_cycle() -> None:
+    counts = {
+        "failed": 0,
+        "quarantined_repair_required": 0,
+        "quarantined_source_invalid": 0,
+    }
+    durable_counts = {"complete": 10, "quarantined_source_invalid": 1}
+
+    dataset_state, cycle_state = _download_states(counts, durable_counts)
+
+    assert dataset_state == "partial"
+    assert cycle_state == "complete"
+
+
+@pytest.mark.parametrize(
+    "failure_name",
+    ("failed", "quarantined_repair_required", "quarantined_source_invalid"),
+)
+def test_new_archive_failure_fails_current_cycle(failure_name: str) -> None:
+    counts = {
+        "failed": 0,
+        "quarantined_repair_required": 0,
+        "quarantined_source_invalid": 0,
+    }
+    counts[failure_name] = 1
+
+    _, cycle_state = _download_states(counts, {})
+
+    assert cycle_state == "failed"

@@ -6,7 +6,10 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from stockagent.backtest.tw_execution import TaiwanFeeSchedule
-from stockagent.live.tw_day_trade_simulation import ModeSpec
+from stockagent.live.tw_day_trade_simulation import (
+    ENTRY_FILL_POLICY_0901_MINUTE_VWAP,
+    ModeSpec,
+)
 from scripts.run_tw_day_trade_two_phase_cold_test import (
     EXPECTED_MARKETS,
     _run_real_model_inference_shadow,
@@ -84,14 +87,17 @@ def test_two_phase_cold_start_separates_live_best_quote_from_0901_replay(
     assert all(row["synthetic_fill"] is False for row in modes.values())
 
     replay = report["phases"]["historical_replay"]["modes"]
-    assert all(row["entry_price"] == 999.0 for row in replay.values())
+    assert all(row["entry_price"] == 1_003.0 for row in replay.values())
     assert all(row["entry_at"].endswith("T09:01:00+08:00") for row in replay.values())
     assert all(
-        row["entry_fill_policy"] == "official_open_at_09_01"
+        row["entry_fill_policy"] == ENTRY_FILL_POLICY_0901_MINUTE_VWAP
         for row in replay.values()
     )
     assert all(
-        row["counterfactual_open_price_fill"] is True for row in replay.values()
+        row["counterfactual_open_price_fill"] is False for row in replay.values()
+    )
+    assert all(
+        row["counterfactual_0901_price_fill"] is True for row in replay.values()
     )
 
     isolation = report["isolation"]

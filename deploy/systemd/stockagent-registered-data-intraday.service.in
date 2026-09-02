@@ -14,6 +14,10 @@ ExecStart=/usr/bin/bash "@REPO_ROOT@/scripts/run_registered_data_refresh.sh" int
 Nice=10
 CPUWeight=20
 IOWeight=20
+MemoryAccounting=true
+MemoryHigh=8G
+MemoryMax=12G
+MemorySwapMax=2G
 TimeoutStartSec=infinity
 
 [Install]

@@ -37,7 +37,7 @@ from stockagent.live.market_config import (  # noqa: E402
     load_market_config,
     resolved_live_output_dir,
 )
-from stockagent.live.signal_engine import generate_live_signal  # noqa: E402
+from stockagent.live.signal_engine import _build_panel, generate_live_signal  # noqa: E402
 
 
 TAIPEI = ZoneInfo("Asia/Taipei")
@@ -52,7 +52,12 @@ def _previous_official_session_date(
 
     session_frames = [
         pl.scan_parquet(path)
-        .select(pl.col("date").cast(pl.Date).alias("date"))
+        # The retained venue archive contains one malformed legacy date.  It
+        # is unrelated to the requested modern session and must not make the
+        # entire official calendar unreadable.  Invalid values remain null
+        # and therefore cannot become a previous-session candidate.
+        .select(pl.col("date").cast(pl.Date, strict=False).alias("date"))
+        .filter(pl.col("date").is_not_null())
         .filter(pl.col("date") < trading_date)
         .select(pl.col("date").max())
         .collect()
@@ -133,6 +138,16 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=DEFAULT_TPEX_DAILY_OHLCV_PATH,
     )
+    parser.add_argument(
+        "--live-tail-panel-rows",
+        type=int,
+        default=256,
+        help=(
+            "Build one reusable causal panel tail large enough to contain every "
+            "requested prior-session row. This is a backfill-only override and "
+            "does not change the deployment config."
+        ),
+    )
     return parser
 
 
@@ -156,6 +171,19 @@ def main() -> None:
     for source_path in (twse_path, tpex_path):
         if not source_path.is_file():
             raise FileNotFoundError(source_path)
+    requested_tail_rows = int(args.live_tail_panel_rows)
+    if requested_tail_rows < int(experiment.training.lookback) + 1:
+        raise ValueError(
+            "--live-tail-panel-rows must exceed the configured model lookback"
+        )
+    # A historical batch must not rebuild the same 2,700-symbol panel once per
+    # session.  Build one sufficiently long, point-in-time panel and let the
+    # canonical signal generator select the requested prior date from it.  The
+    # loaded deployment object is process-local; the YAML remains untouched.
+    experiment.data.live_tail_panel_rows = max(
+        int(experiment.data.live_tail_panel_rows or 0), requested_tail_rows
+    )
+    panel, panel_cache_hit = _build_panel(experiment, live_tail=True)
 
     input_root = args.input_root.resolve() / market_config.market
     receipt: dict[str, Any] = {
@@ -168,6 +196,12 @@ def main() -> None:
             "prior completed panel plus official session open; actual generation "
             "time is never backdated"
         ),
+        "panel": {
+            "dates": int(panel.num_dates),
+            "symbols": int(panel.num_symbols),
+            "requested_live_tail_panel_rows": requested_tail_rows,
+            "memory_cache_hit": bool(panel_cache_hit),
+        },
         "market_config_path": str(market_config_path),
         "market_config_sha256": _sha256(market_config_path),
         "sessions": [],
@@ -228,6 +262,7 @@ def main() -> None:
             ),
             write=True,
         )
+        kwargs["_panel_override"] = panel
         result = generate_live_signal(**kwargs)
         if not result.output_dir:
             raise RuntimeError(f"{current}: signal writer returned no output_dir")

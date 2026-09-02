@@ -580,11 +580,12 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
                     panel.day_trade_minute_execution, dtype=np.float32
                 )
                 if (
-                    minute_execution.ndim != 3
+                    minute_execution.ndim not in {3, 4}
                     or minute_execution.shape[:2] != panel.tradable_mask.shape
                 ):
                     raise ValueError(
-                        "PanelData.day_trade_minute_execution must have shape [T,S,C]"
+                        "PanelData.day_trade_minute_execution must have shape "
+                        "[T,S,C] or [T,S,M,C]"
                     )
                 # overnight_log_returns is an executor-only side channel for
                 # tw_day_trade; it is never a model input.  Reusing this

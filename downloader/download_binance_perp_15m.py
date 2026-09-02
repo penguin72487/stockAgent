@@ -324,11 +324,31 @@ def _latest_closed_candle_start_ms(now: datetime | None = None) -> int:
 def _normalize_date_frame(frame: pl.DataFrame) -> pl.DataFrame:
     if frame.is_empty() or "date" not in frame.columns:
         return frame
-    expression = (
+    parsed_date = (
         pl.col("date").str.to_datetime(strict=False)
         if frame.schema.get("date") == pl.String
         else pl.col("date").cast(pl.Datetime("us"), strict=False)
     )
+    expression = parsed_date
+    if "binance_close_time_ms" in frame.columns:
+        close_time_ms = pl.col("binance_close_time_ms").cast(pl.Int64, strict=False)
+        valid_close_time = (
+            close_time_ms.is_not_null()
+            & (close_time_ms % CANDLE_INTERVAL_MS == CANDLE_INTERVAL_MS - 1)
+        )
+        # Binance kline close time redundantly identifies the exact open-time
+        # minute.  Prefer it only when it satisfies the documented interval
+        # boundary.  This repairs a persisted date-string bit flip without
+        # rounding an ambiguous timestamp or inventing a candle.
+        canonical_open = pl.from_epoch(
+            close_time_ms - (CANDLE_INTERVAL_MS - 1),
+            time_unit="ms",
+        )
+        expression = (
+            pl.when(valid_close_time)
+            .then(canonical_open)
+            .otherwise(parsed_date)
+        )
     return (
         frame.with_columns(expression.dt.strftime("%Y-%m-%d %H:%M:%S").alias("date"))
         .drop_nulls("date")

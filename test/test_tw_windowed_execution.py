@@ -145,6 +145,32 @@ def test_dataset_conversion_preserves_mode_and_uses_only_pre_session_features() 
     assert split.future_log_returns[split.valid_indices[0], 0].item() == pytest.approx(0.27)
 
 
+def test_daily_day_trade_full_minute_tape_stays_executor_only_through_windowing() -> None:
+    panel = _panel(rows=5, symbols=2)
+    tape = np.zeros((5, 2, 271, 2), dtype=np.float32)
+    tape[:, :, 0, 0] = panel.open_prices
+    tape[2, 1, 1, :] = np.asarray([101.0, 5_000.0], dtype=np.float32)
+    panel.day_trade_minute_execution = tape
+    dataset = CrossSectionalDataset(
+        panel,
+        np.arange(panel.num_dates),
+        lookback=2,
+        execution_mode="tw_day_trade",
+    )
+
+    split = dataset_to_windowed_tensors(dataset)
+    assert tuple(split.overnight_log_returns.shape) == (5, 2, 271, 2)
+    assert split.features.shape[-1] == 1
+    batch = split.batch_by_rows(
+        0,
+        1,
+        torch.device("cpu"),
+        non_blocking=False,
+    )
+    assert tuple(batch["overnight_log_returns"].shape) == (1, 2, 271, 2)
+    assert batch["overnight_log_returns"][0, 1, 1].tolist() == [101.0, 5_000.0]
+
+
 def test_panel_history_makes_split_row_zero_use_prior_causal_features() -> None:
     panel = _panel(rows=8, symbols=2)
     split_indices = np.arange(4, 8, dtype=np.int64)

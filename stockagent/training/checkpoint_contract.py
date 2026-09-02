@@ -42,6 +42,11 @@ from stockagent.data.tw_index_derivatives_day import (
     TAIFEX_DERIVATIVE_SHORT_CANDIDATE_CONTRACT_VERSION,
     TAIFEX_INDEX_DERIVATIVE_ACTION_COUNT_V4,
 )
+from stockagent.data.tw_day_trade_execution import (
+    DAY_TRADE_MINUTE_EXECUTION_CONTRACT_VERSION,
+    DAY_TRADE_MINUTE_EXECUTION_POLICY_FULL_VOLUME,
+    DAY_TRADE_MINUTE_SOURCE_SCHEMA_VERSION,
+)
 from stockagent.data.panel_cache import array_content_fingerprint
 from stockagent.data.walkforward import WalkForwardFold, normalize_lookback_context
 from stockagent.models.factory import _feature_indices_from_patterns
@@ -201,6 +206,17 @@ def _project_temporal_basis_model_config(
         # post-schema field so merely upgrading the runtime cannot invalidate
         # an otherwise identical model/checkpoint contract.
         projected.pop("feature_bottleneck_dim", None)
+    for field_name in (
+        "futures_denomination_aware_output",
+        "futures_current_open_feature",
+    ):
+        if not bool(projected.get(field_name, False)):
+            # These futures-only branches were added after the cash-equity
+            # checkpoints.  A disabled value neither adds parameters nor
+            # changes their forward path, so it must not invalidate every
+            # pre-existing non-futures checkpoint.  Enabled branches remain
+            # explicit and therefore keep their own strict fingerprints.
+            projected.pop(field_name, None)
     if int(projected.get("daily_context_layers", 0) or 0) == 0:
         # These controls have no parameters or forward-path effect until the
         # daily-context branch has at least one layer.  Omitting them preserves
@@ -950,6 +966,7 @@ def _trading_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
             TW_STOCK_CONTEXT_FUTURES_CURRENT_OPEN_MODEL_FEATURE_COLUMNS,
             TW_STOCK_CONTEXT_FUTURES_MODEL_FEATURE_COLUMNS,
             TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_CURRENT_OPEN_CONTRACT_VERSION,
+            TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_EXPIRY_SETTLEMENT_CONTRACT_VERSION,
             TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_GUARDED_CURRENT_OPEN_CONTRACT_VERSION,
             TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_LEGACY_CONTRACT_VERSION,
             TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_CONTRACT_VERSION,
@@ -958,7 +975,9 @@ def _trading_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
 
         contract["taiwan_stock_context_futures_portfolio"] = {
             "cross_domain_contract_version": int(
-                TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_GUARDED_CURRENT_OPEN_CONTRACT_VERSION
+                TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_EXPIRY_SETTLEMENT_CONTRACT_VERSION
+                if config.data.tw_futures_expiry_settlement_valuation
+                else TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_GUARDED_CURRENT_OPEN_CONTRACT_VERSION
                 if config.data.tw_futures_carry_valuation_max_abs_simple_return > 0.0
                 else TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_CURRENT_OPEN_CONTRACT_VERSION
                 if config.data.tw_futures_current_open_feature
@@ -1028,6 +1047,14 @@ def _trading_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
                 TAIFEX_FUTURES_PORTFOLIO_MAX_SAFE_LOOKBACK
             ),
             "holding": "same_physical_contract_cross_session_until_own_expiry",
+            "expiry_settlement_valuation": bool(
+                config.data.tw_futures_expiry_settlement_valuation
+            ),
+            "expiry_exit_price_source": (
+                "observed_taifex_settlement_on_last_trade_date"
+                if config.data.tw_futures_expiry_settlement_valuation
+                else "observed_contract_close"
+            ),
             "roll_gap_treatment": "mandatory_old_contract_own_close_no_gap_return",
             "accounting": (
                 "signed_integer_contracts_full_absolute_notional_recurrent_equity"
@@ -1352,6 +1379,57 @@ def _trading_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
             contract["taiwan_execution"]["benchmark_alignment"] = (
                 "prior_adjusted_close_to_execution_close_v1"
             )
+        if (
+            execution_mode == "tw_day_trade"
+            and config.data.day_trade_minute_execution_root is not None
+            and config.data.day_trade_minute_execution_policy
+            == DAY_TRADE_MINUTE_EXECUTION_POLICY_FULL_VOLUME
+        ):
+            minute_root = Path(config.data.day_trade_minute_execution_root)
+            manifest_path = minute_root / "manifest.json"
+            if not manifest_path.is_file():
+                raise ValueError(
+                    "full-session day-trade checkpoint contract requires "
+                    f"minute manifest: {manifest_path}"
+                )
+            minute_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            minute_dates = minute_manifest.get("dates")
+            if not (
+                minute_manifest.get("schema_version")
+                == DAY_TRADE_MINUTE_SOURCE_SCHEMA_VERSION
+                and minute_manifest.get("source") == "shioaji_kbars_1m"
+                and minute_manifest.get("research_ready") is True
+                and minute_manifest.get("status") == "research_ready"
+                and isinstance(minute_dates, list)
+                and minute_dates
+            ):
+                raise ValueError(
+                    "full-session day-trade checkpoint contract requires a "
+                    "schema-compatible research_ready Shioaji minute manifest"
+                )
+            contract["taiwan_execution"]["minute_execution"] = {
+                "contract_version": int(
+                    DAY_TRADE_MINUTE_EXECUTION_CONTRACT_VERSION
+                ),
+                "policy": str(config.data.day_trade_minute_execution_policy),
+                "source_root": str(minute_root),
+                "source_manifest_sha256": hashlib.sha256(
+                    manifest_path.read_bytes()
+                ).hexdigest(),
+                "source_schema_version": int(
+                    DAY_TRADE_MINUTE_SOURCE_SCHEMA_VERSION
+                ),
+                "entry_window": "right_labelled_09_01_through_13_19",
+                "exit_window": "right_labelled_13_21_through_13_30",
+                "source_last_date": str(minute_dates[-1]),
+                "continuous_price": "minute_amount_divided_by_volume_shares",
+                "closing_auction_price": "official_close",
+                "unfilled_entry": "cancel_after_completed_13_20_bar",
+                "unfilled_exit": (
+                    "research_margin_or_short_conversion_at_official_close"
+                ),
+                "market_impact": "not_modeled_capacity_upper_bound",
+            }
         if str(trading.tw_corporate_action_mode) == "exact":
             contract["taiwan_execution"]["corporate_action_claim_queue_sessions"] = int(
                 trading.tw_corporate_action_claim_queue_sessions

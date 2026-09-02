@@ -156,27 +156,35 @@ class DashboardHandler(BaseHTTPRequestHandler):
         *,
         cache_control: str = "no-store",
     ) -> None:
-        accepts_gzip = "gzip" in str(self.headers.get("Accept-Encoding") or "").lower()
-        if accepts_gzip and len(payload) >= 1_024:
-            payload = gzip.compress(payload, compresslevel=5)
-            self.send_response(status)
-            self.send_header("Content-Encoding", "gzip")
-            self.send_header("Vary", "Accept-Encoding")
-        else:
-            self.send_response(status)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(payload)))
-        self.send_header("Cache-Control", cache_control)
-        self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("Referrer-Policy", "no-referrer")
-        self.send_header("X-Frame-Options", "DENY")
-        self.send_header(
-            "Content-Security-Policy",
-            "default-src 'self'; script-src 'self'; style-src 'self'; "
-            "img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'",
-        )
-        self.end_headers()
-        self.wfile.write(payload)
+        try:
+            accepts_gzip = "gzip" in str(
+                self.headers.get("Accept-Encoding") or ""
+            ).lower()
+            if accepts_gzip and len(payload) >= 1_024:
+                payload = gzip.compress(payload, compresslevel=5)
+                self.send_response(status)
+                self.send_header("Content-Encoding", "gzip")
+                self.send_header("Vary", "Accept-Encoding")
+            else:
+                self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Cache-Control", cache_control)
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header(
+                "Content-Security-Policy",
+                "default-src 'self'; script-src 'self'; style-src 'self'; "
+                "img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'",
+            )
+            self.end_headers()
+            self.wfile.write(payload)
+        except (BrokenPipeError, ConnectionResetError):
+            # A client can time out while the cold cache scans a large replay
+            # ledger. Once it disconnects, the response is irrelevant; avoid a
+            # second 503 attempt and a misleading service traceback.
+            self.close_connection = True
 
     def _json(self, status: HTTPStatus, payload: object) -> None:
         encoded = (
@@ -302,13 +310,28 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
         if path == "/healthz":
             try:
-                snapshot = self.server.snapshot()
-                healthy = snapshot.get("health") not in {"critical", "stale"}
+                # Liveness must stay O(1) even when a newly promoted multi-month
+                # ledger is still warming the analytical caches.  The engine
+                # publishes status.json and service_sync.json atomically, so
+                # those small commit receipts are the correct health authority.
+                status = json.loads(
+                    (self.server.state_dir / "status.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                revision = self.server.revision()
+                health = status.get("health")
+                healthy = (
+                    health not in {"critical", "stale"}
+                    and int(revision.get("state_revision") or 0) > 0
+                )
                 self._json(
                     HTTPStatus.OK if healthy else HTTPStatus.SERVICE_UNAVAILABLE,
                     {
-                        "health": snapshot.get("health"),
-                        "source_age_seconds": snapshot.get("source_age_seconds"),
+                        "health": health,
+                        "source_age_seconds": revision.get("engine_age_seconds"),
+                        "state_revision": revision.get("state_revision"),
+                        "revision_status": revision.get("status"),
                     },
                 )
             except (OSError, ValueError, json.JSONDecodeError) as exc:

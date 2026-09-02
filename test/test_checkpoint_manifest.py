@@ -1479,6 +1479,14 @@ def test_schema_v4_added_inactive_external_and_projection_fields_remain_compatib
     historical["contracts"]["model"]["model"].pop(
         "projection_l1_scale_by_active_count"
     )
+    assert (
+        "futures_denomination_aware_output"
+        not in current["contracts"]["model"]["model"]
+    )
+    assert (
+        "futures_current_open_feature"
+        not in current["contracts"]["model"]["model"]
+    )
     historical["fingerprints"]["data_schema"] = trainer_module._stable_fingerprint(
         {
             "symbols": historical["contracts"]["data"]["symbols"],

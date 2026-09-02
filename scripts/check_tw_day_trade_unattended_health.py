@@ -53,6 +53,7 @@ REQUIRED_TIMERS = (
     "stockagent-tw-day-trade-preopen-gate.timer",
     "stockagent-discord-artifact-maintenance.timer",
     "stockagent-tw-day-trade-unattended-guardian.timer",
+    "stockagent-tw-day-trade-minute-curves.timer",
 )
 
 
@@ -132,6 +133,36 @@ def _age_seconds(value: Any, observed: datetime) -> float | None:
     if parsed is None:
         return None
     return max(0.0, (observed - parsed.astimezone(TAIPEI)).total_seconds())
+
+
+def _classify_session_signals(
+    modes: dict[str, Any], *, session_date: str
+) -> tuple[list[str], list[str]]:
+    """Separate a missing commit from a completed non-live recovery.
+
+    A retrospective official-open/09:01 replay is a durable current-session
+    signal, but it did not meet the causal 09:00 live-execution contract.  The
+    guardian must preserve both facts instead of reporting the replay as if no
+    signal had been committed at all.
+    """
+
+    missing_markets: list[str] = []
+    noncausal_recovery_markets: list[str] = []
+    for market in EXPECTED_MARKETS:
+        row = modes.get(market) or {}
+        if (
+            row.get("session_date") != session_date
+            or not row.get("signal_id")
+            or not row.get("entry_completed_at")
+        ):
+            missing_markets.append(market)
+            continue
+        if (
+            row.get("entry_fill_policy") != "causal_best_quote"
+            or int(row.get("entry_price_offset_ticks") or 0) != 0
+        ):
+            noncausal_recovery_markets.append(market)
+    return missing_markets, noncausal_recovery_markets
 
 
 def _systemctl_show(unit: str) -> dict[str, str]:
@@ -566,25 +597,22 @@ def main() -> int:
             warnings.append("post-close Discord artifact maintenance is degraded")
 
         if weekday and wall >= datetime_time(9, 0, 15):
-            missing_signals = [
-                market
-                for market in EXPECTED_MARKETS
-                if (modes.get(market) or {}).get("session_date") != session_date
-                or not (modes.get(market) or {}).get("signal_id")
-                or not (modes.get(market) or {}).get("entry_completed_at")
-                or (modes.get(market) or {}).get("entry_fill_policy")
-                != "causal_best_quote"
-                or int(
-                    (modes.get(market) or {}).get("entry_price_offset_ticks") or 0
-                )
-                != 0
-            ]
+            missing_signals, noncausal_recovery_markets = (
+                _classify_session_signals(modes, session_date=session_date)
+            )
             if missing_signals:
                 failures.append(
                     "current-session signal commit missing: " + ",".join(missing_signals)
                 )
+            if noncausal_recovery_markets:
+                failures.append(
+                    "09:00 causal live execution SLA missed; current-session "
+                    "signals recovered by non-live replay: "
+                    + ",".join(noncausal_recovery_markets)
+                )
         else:
             missing_signals = []
+            noncausal_recovery_markets = []
 
         if weekday and wall >= datetime_time(13, 30):
             open_markets = [
@@ -694,8 +722,13 @@ def main() -> int:
                     **maintenance,
                 },
                 "session_signals": {
-                    "ready": not missing_signals,
+                    "ready": not missing_signals and not noncausal_recovery_markets,
+                    "committed": not missing_signals,
+                    "live_sla_met": (
+                        not missing_signals and not noncausal_recovery_markets
+                    ),
                     "missing_markets": missing_signals,
+                    "noncausal_recovery_markets": noncausal_recovery_markets,
                     "modes": modes,
                 },
                 "post_close_flat": {

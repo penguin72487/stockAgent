@@ -584,7 +584,7 @@ function renderHeader(data) {
   if (operationalIssues.length || hasReplay || hasBenchmarkReplay || data.health === "stale" || blockers.length || catchUps.length || missed.length || signalMissingEligibility.size || currentMissingEligibility.size) {
     const messages = [
       hasReplay ? "所選交易日使用實際開盤價做反事實重建；原始訊號時間保留，但這不是當時可成交報價、即時執行或券商成交。" : "",
-      hasBenchmarkReplay ? "0050、2330 與台指期基準已補到實際開盤起點；補登區段是明確標示的回放，後續估值才接續記錄到的可成交 bid。" : "",
+      hasBenchmarkReplay ? "0050、2330 與台指期基準已補到實際開盤起點；補登區段是明確標示的回放，後續估值使用 receipt 驗證的逐分鐘觀察價；缺分鐘只延續前一筆實際觀察值並明示，不插值。" : "",
       data.health === "stale" ? "資料來源已逾時；畫面只能當歷史紀錄，不能視為現在行情。" : "",
       currentMissingEligibility.size ? `所選交易日當沖資格未完整覆蓋，後續訊號已停止執行：${[...currentMissingEligibility.entries()].map(([venue, row]) => `${venue.toUpperCase()} 需要 ${row.target_date || data.session_date || "所選日"}，最新僅到 ${row.latest_date || "無資料"}`).join("；")}` : "",
       !currentMissingEligibility.size && signalMissingEligibility.size ? "09:00 訊號產生時資格資料尚未到齊，因此已 fail-closed；較晚補齊的資料不會回填成假成交。" : "",
@@ -650,14 +650,18 @@ function renderModes(data) {
       : "TP／SL 使用完整漲跌停價";
     const configuredEntryPolicy = mode.configured_entry_fill_policy || mode.entry_fill_policy;
     const configuredEntryOffset = Number(mode.configured_entry_price_offset_ticks || 0);
-    const activeEntryPolicy = configuredEntryPolicy === "official_open_at_09_01"
+    const activeEntryPolicy = configuredEntryPolicy === "official_open_signal_0900_execute_0901_vwap"
+      ? "目前規則：官方 09:00 開盤價供推論／張數，右標記 09:01 首分鐘成交 VWAP 供回補執行；任一缺價即阻擋"
+      : configuredEntryPolicy === "official_open_at_09_01"
       ? "目前規則：09:01 以官方開盤價計算全部紙上買賣；缺價即阻擋，不使用 +1 Tick"
       : configuredEntryPolicy === "synthetic_open_tick"
       ? `目前規則：開盤價不利 ${number(configuredEntryOffset || 1)} Tick 合成成交`
       : configuredEntryPolicy === "market_at_best_quote_else_adverse_open_tick"
       ? `目前規則：紙上市價買進／回補取最佳 Ask、賣出／放空取最佳 Bid，完整模擬委託；缺報價才用開盤價不利 ${number(configuredEntryOffset || 1)} Tick`
-      : "目前規則：09:00 訊號原子發布後，市價買進／回補取第一筆較晚最佳 Ask；市價賣出／放空取第一筆較晚最佳 Bid，且只吃可驗證一檔量；歷史回補另用 09:01 官方開盤價";
-    const recordedEntryPolicy = mode.entry_fill_policy === "official_open_at_09_01"
+      : "目前規則：09:00 訊號原子發布後，市價買進／回補取第一筆較晚最佳 Ask；市價賣出／放空取第一筆較晚最佳 Bid，且只吃可驗證一檔量；若錯過開盤，另以 09:00 官方開盤推論、09:01 首分鐘 VWAP 執行";
+    const recordedEntryPolicy = mode.entry_fill_policy === "official_open_signal_0900_execute_0901_vwap"
+      ? `所選交易日紀錄：09:00 官方開盤推論／張數，09:01 首分鐘 VWAP 執行 ${number(mode.entry_0901_vwap_fill_count || mode.entry_fill_count || 0)} 筆（反事實紙上估值，非交易所成交）`
+      : mode.entry_fill_policy === "official_open_at_09_01"
       ? `所選交易日紀錄：09:01 官方開盤價計價 ${number(mode.entry_official_open_fill_count || mode.entry_fill_count || 0)} 筆（反事實紙上估值，非交易所成交）`
       : mode.entry_fill_policy === "synthetic_open_tick"
       ? `所選交易日紀錄：開盤價不利 ${number(mode.entry_price_offset_ticks || 1)} Tick 合成成交（不回寫成最佳報價）`

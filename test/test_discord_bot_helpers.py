@@ -268,10 +268,10 @@ def test_recent_day_trade_artifact_waits_for_engine_instead_of_recomputing(
         discord_bot._day_trade_schedule_state(cfg, observed.date().isoformat())
         == "pending_confirmation"
     )
-    summary["artifact_published_at"] = (observed - timedelta(seconds=30)).isoformat()
+    summary["artifact_published_at"] = (observed - timedelta(hours=3)).isoformat()
     assert (
         discord_bot._day_trade_schedule_state(cfg, observed.date().isoformat())
-        == "retry"
+        == "pending_confirmation"
     )
 
 

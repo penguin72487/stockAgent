@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Rebuild day-trade paper sessions from official session opens.
+"""Rebuild day-trade paper sessions from official opens and 09:01 prices.
 
-The active contract records paper execution at 09:01 using the official session
-open for both directions. Missing official opens fail closed; no Bid/Ask, last
-price, or adverse-tick substitute is allowed. This is explicitly counterfactual
-because a 09:01 order cannot receive the already completed opening price.
+The active replay contract uses the official 09:00 session open only for model
+inference and whole-lot sizing, then values paper execution at the observed
+right-labelled 09:01 minute VWAP. Missing opens or VWAPs fail closed; no
+Bid/Ask, last price, opening-price fill, or adverse-tick substitute is allowed.
+This is explicitly counterfactual and is never labelled as a live exchange fill.
 
 Legacy forensic modes remain available. With
 ``--paper-market-at-best`` it queries each actionable symbol's first
@@ -41,8 +42,10 @@ from scripts.run_tw_day_trade_simulation import _mode_specs, _rule_data_dir  # n
 from downloader.download_tw_public_data import (  # noqa: E402
     DEFAULT_DATASETS,
     _parse_historical_response_content,
+    _validated_taiex_session_dates,
 )
 from stockagent.live.tw_day_trade_simulation import (  # noqa: E402
+    ENTRY_FILL_POLICY_0901_MINUTE_VWAP,
     ENTRY_FILL_POLICY_CAUSAL_BOOK,
     ENTRY_FILL_POLICY_CAUSAL_BOOK_ELSE_OPEN_TICK,
     ENTRY_FILL_POLICY_MARKET_AT_BEST_ELSE_OPEN_TICK,
@@ -52,9 +55,11 @@ from stockagent.live.tw_day_trade_simulation import (  # noqa: E402
     load_live_eligibility,
 )
 from stockagent.live.quote_provider import (  # noqa: E402
+    fetch_shioaji_historical_stock_0901_vwaps,
     fetch_shioaji_historical_stock_entry_books,
     fetch_shioaji_stock_snapshots,
 )
+from stockagent.data.tw_price_rules import move_price_ticks_numpy  # noqa: E402
 
 
 TAIPEI = ZoneInfo("Asia/Taipei")
@@ -65,6 +70,17 @@ DEFAULT_TWSE_DAILY_OHLCV_PATH = Path(
 DEFAULT_TPEX_DAILY_OHLCV_PATH = Path(
     "/srv/stockagent-live/data_tw_public/tpex_daily_ohlcv.parquet"
 )
+DEFAULT_MINUTE_DATA_ROOTS = (
+    Path("data_tw_minute/shioaji_1m"),
+    Path("data_tw_minute/research_dataset"),
+)
+MINUTE_VOLUME_PARTICIPATION = 0.50
+HISTORICAL_KBAR_FILL_CONTRACT = (
+    "historical_1m_ohlcv_counterfactual_not_executable_bid_ask"
+)
+HISTORICAL_OFFICIAL_CLOSE_FILL_CONTRACT = (
+    "historical_official_close_auction_counterfactual_no_depth_claim"
+)
 
 
 def _sha256(path: Path) -> str:
@@ -73,6 +89,14 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _finite(value: object) -> float | None:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if math.isfinite(parsed) and parsed > 0.0 else None
 
 
 def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
@@ -291,6 +315,189 @@ def _load_retained_historical_entry_books(
     }
 
 
+def _local_0901_vwap_rows(
+    *,
+    minute_roots: tuple[Path, ...],
+    symbols: list[str],
+    trading_date: date,
+) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+    """Resolve 09:01 VWAPs from canonical local minute data before Shioaji."""
+
+    requested = set(symbols)
+    resolved: dict[str, dict[str, Any]] = {}
+    source_counts: dict[str, int] = {}
+
+    def accept(frame: pl.DataFrame, source: Path) -> None:
+        if not frame.height:
+            return
+        names = set(frame.columns)
+        if "minutes_from_open" in names:
+            frame = frame.filter(pl.col("minutes_from_open") == 1)
+        elif "ts" in names:
+            frame = frame.with_columns(pl.col("ts").cast(pl.Datetime("ns"))).filter(
+                (pl.col("ts").dt.hour() == 9) & (pl.col("ts").dt.minute() == 1)
+            )
+        if "date" in frame.columns:
+            frame = frame.filter(pl.col("date").cast(pl.Date) == trading_date)
+        for row in frame.iter_rows(named=True):
+            symbol = str(row.get("symbol") or "")
+            if symbol not in requested or symbol in resolved:
+                continue
+            try:
+                amount = float(row.get("Amount"))
+            except (TypeError, ValueError):
+                amount = math.nan
+            try:
+                volume_shares = float(row.get("volume_shares"))
+            except (TypeError, ValueError):
+                volume_shares = math.nan
+            if not (math.isfinite(volume_shares) and volume_shares > 0.0):
+                try:
+                    raw_volume = float(row.get("Volume"))
+                except (TypeError, ValueError):
+                    raw_volume = math.nan
+                candidates: list[float] = []
+                try:
+                    contract_unit = float(row.get("contract_unit"))
+                    if math.isfinite(contract_unit) and contract_unit > 0.0:
+                        candidates.append(contract_unit)
+                except (TypeError, ValueError):
+                    pass
+                candidates.extend([1_000.0, 100.0, 10.0, 1.0])
+                try:
+                    low = float(row.get("Low"))
+                    high = float(row.get("High"))
+                except (TypeError, ValueError):
+                    low, high = math.nan, math.nan
+                for multiplier in dict.fromkeys(candidates):
+                    candidate_shares = raw_volume * multiplier
+                    candidate_price = (
+                        amount / candidate_shares
+                        if candidate_shares > 0.0
+                        else math.nan
+                    )
+                    if (
+                        math.isfinite(candidate_price)
+                        and candidate_price > 0.0
+                        and math.isfinite(low)
+                        and math.isfinite(high)
+                        and low * 0.999 <= candidate_price <= high * 1.001
+                    ):
+                        volume_shares = candidate_shares
+                        break
+            vwap = (
+                amount / volume_shares
+                if math.isfinite(amount)
+                and amount > 0.0
+                and math.isfinite(volume_shares)
+                and volume_shares > 0.0
+                else math.nan
+            )
+            if not math.isfinite(vwap) or vwap <= 0.0:
+                continue
+            row_source = Path(str(row.get("_source_path") or source))
+            source_text = f"local_minute_parquet_0901_vwap:{row_source.resolve()}"
+            resolved[symbol] = {
+                "symbol": symbol,
+                "execution_price_0901": float(vwap),
+                "tick_volume_units_0901": float(volume_shares),
+                "tick_count_0901": 0,
+                "source_window_start": datetime.combine(
+                    trading_date, time(9, 0), tzinfo=TAIPEI
+                ).isoformat(timespec="seconds"),
+                "source_window_end": datetime.combine(
+                    trading_date, time(9, 0, 59), tzinfo=TAIPEI
+                ).isoformat(timespec="seconds"),
+                "quote_at": datetime.combine(
+                    trading_date, time(9, 1), tzinfo=TAIPEI
+                ).isoformat(timespec="seconds"),
+                "source": source_text,
+            }
+            source_counts[source_text] = source_counts.get(source_text, 0) + 1
+
+    for root in minute_roots:
+        unresolved = requested - set(resolved)
+        if not unresolved:
+            break
+        # Canonical receipt-backed source chunks are checked before the
+        # materialized research partition, matching the storage contract.
+        chunk_paths: list[Path] = []
+        for symbol in sorted(unresolved):
+            for path in sorted((root / "minute_chunks" / symbol).glob("*.parquet")):
+                boundaries = path.stem.split("_")
+                day_text = trading_date.isoformat()
+                if len(boundaries) != 2 or not (
+                    boundaries[0] <= day_text <= boundaries[1]
+                ):
+                    continue
+                chunk_paths.append(path)
+        schema_groups: dict[tuple[str, ...], list[Path]] = {}
+        for path in chunk_paths:
+            schema_groups.setdefault(
+                tuple(pl.read_parquet_schema(path).names()), []
+            ).append(path)
+        for schema_tuple, paths in schema_groups.items():
+            schema = set(schema_tuple)
+            columns = [
+                name
+                for name in (
+                    "symbol",
+                    "date",
+                    "ts",
+                    "Amount",
+                    "Volume",
+                    "volume_shares",
+                    "contract_unit",
+                    "Low",
+                    "High",
+                )
+                if name in schema
+            ]
+            lazy = pl.scan_parquet(
+                sorted(paths), include_file_paths="_source_path"
+            )
+            if "date" in schema:
+                lazy = lazy.filter(pl.col("date").cast(pl.Date) == trading_date)
+            chunk_frame = lazy.select(*columns, "_source_path").collect(
+                engine="streaming"
+            )
+            accept(chunk_frame, root)
+        unresolved = requested - set(resolved)
+        partition = root / f"trade_date={trading_date.isoformat()}" / "data.parquet"
+        if unresolved and partition.is_file():
+            schema = pl.scan_parquet(partition).collect_schema().names()
+            columns = [
+                name
+                for name in (
+                    "symbol",
+                    "date",
+                    "ts",
+                    "minutes_from_open",
+                    "Amount",
+                    "Volume",
+                    "volume_shares",
+                    "contract_unit",
+                    "Low",
+                    "High",
+                )
+                if name in schema
+            ]
+            frame = (
+                pl.scan_parquet(partition)
+                .filter(pl.col("symbol").is_in(sorted(unresolved)))
+                .select(columns)
+                .collect()
+            )
+            accept(frame, partition)
+    return resolved, {
+        "source": "local_minute_data_0901_vwap",
+        "requested_symbols": len(requested),
+        "resolved_symbols": len(resolved),
+        "source_counts": source_counts,
+        "additional_shioaji_requests": 0,
+    }
+
+
 def _load_price_limits(path: Path) -> dict[str, dict[str, Any]]:
     required = {
         "symbol",
@@ -369,6 +576,7 @@ def _entry_quotes(
     adverse_tick_fallback_rows = 0
     exact_best_quote_symbols: list[str] = []
     adverse_tick_fallback_symbols: list[str] = []
+    observed_0901_vwap_symbols: list[str] = []
     missing_official_open_symbols: list[str] = []
     official_open_mismatches: list[dict[str, Any]] = []
     for row in rows:
@@ -424,6 +632,9 @@ def _entry_quotes(
             else None
         )
         book = historical_books.get(symbol) or {}
+        is_0901_vwap_policy = (
+            spec.entry_fill_policy == ENTRY_FILL_POLICY_0901_MINUTE_VWAP
+        )
         transaction_price_key = "ask" if side == "long" else "bid"
         transaction_volume_key = "ask_volume" if side == "long" else "bid_volume"
         source_quote_at_key = "ask_quote_at" if side == "long" else "bid_quote_at"
@@ -440,6 +651,15 @@ def _entry_quotes(
             and math.isfinite(transaction_volume)
             and transaction_volume > 0.0
         )
+        try:
+            execution_price_0901 = float(book.get("execution_price_0901"))
+        except (TypeError, ValueError):
+            execution_price_0901 = math.nan
+        has_0901_vwap = bool(
+            potentially_executable
+            and math.isfinite(execution_price_0901)
+            and execution_price_0901 > 0.0
+        )
         use_adverse_tick_fallback = bool(
             potentially_executable
             and spec.entry_fill_policy
@@ -455,8 +675,15 @@ def _entry_quotes(
         elif use_adverse_tick_fallback:
             adverse_tick_fallback_rows += 1
             adverse_tick_fallback_symbols.append(symbol)
+        if is_0901_vwap_policy and has_0901_vwap:
+            observed_0901_vwap_symbols.append(symbol)
         source_quote_at = book.get(source_quote_at_key) or book.get("quote_at")
         entry_price_source = (
+            str(book.get("source") or "observed_right_labelled_09_01_minute_vwap")
+            if is_0901_vwap_policy and has_0901_vwap
+            else "missing_observed_09_01_minute_vwap"
+            if is_0901_vwap_policy
+            else
             f"shioaji:historical_stock_tick_best_{transaction_price_key}"
             if has_required_best_quote
             else "official_daily_session_open:adverse_one_legal_tick_fallback"
@@ -466,12 +693,19 @@ def _entry_quotes(
         quotes[symbol] = {
             "symbol": symbol,
             "open": serialized_open,
-            "last": book.get("last") or serialized_open,
+            "last": (
+                execution_price_0901
+                if is_0901_vwap_policy and has_0901_vwap
+                else book.get("last") or serialized_open
+            ),
             "bid": book.get("bid") if has_required_best_quote else None,
             "ask": book.get("ask") if has_required_best_quote else None,
             "bid_volume": (book.get("bid_volume") if has_required_best_quote else None),
             "ask_volume": (book.get("ask_volume") if has_required_best_quote else None),
             "minute_volume_lots": None,
+            "execution_price_0901": (
+                execution_price_0901 if has_0901_vwap else None
+            ),
             "upper_limit": evidence.get("upper_limit_price"),
             "lower_limit": evidence.get("lower_limit_price"),
             "reference_price": evidence.get("reference_price"),
@@ -479,8 +713,17 @@ def _entry_quotes(
                 official_no_trade_symbols and symbol in official_no_trade_symbols
             ),
             "quote_at": quote_at.isoformat(timespec="seconds"),
-            "historical_source_quote_at": source_quote_at,
+            "historical_source_quote_at": (
+                book.get("source_window_end")
+                if is_0901_vwap_policy
+                else source_quote_at
+            ),
             "source": (
+                str(book.get("source") or "observed_right_labelled_09_01_minute_vwap")
+                if is_0901_vwap_policy and has_0901_vwap
+                else "missing_observed_09_01_minute_vwap"
+                if is_0901_vwap_policy
+                else
                 "shioaji:historical_stock_tick_best_quote"
                 if has_required_best_quote
                 else "synthetic:adverse_open_tick_fallback"
@@ -490,6 +733,13 @@ def _entry_quotes(
             "entry_price_source": entry_price_source,
             "entry_price_is_synthetic_fallback": use_adverse_tick_fallback,
         }
+    nonzero_target_symbols = {
+        str(row.get("symbol") or "")
+        for row in rows
+        if str(row.get("symbol") or "")
+        and abs(float(row.get("target_weight") or 0.0)) > 0.0
+    }
+    observed_0901_vwap_symbol_set = set(observed_0901_vwap_symbols)
     return quotes, {
         "potential_whole_lot_rows": potential_whole_lot_rows,
         "official_open_covered_rows": official_open_covered_rows,
@@ -500,6 +750,11 @@ def _entry_quotes(
         "exact_best_quote_symbols": sorted(set(exact_best_quote_symbols)),
         "adverse_tick_fallback_rows": adverse_tick_fallback_rows,
         "adverse_tick_fallback_symbols": sorted(set(adverse_tick_fallback_symbols)),
+        "observed_0901_vwap_rows": len(observed_0901_vwap_symbols),
+        "observed_0901_vwap_symbols": sorted(set(observed_0901_vwap_symbols)),
+        "missing_0901_vwap_symbols": sorted(
+            nonzero_target_symbols - observed_0901_vwap_symbol_set
+        ),
     }
 
 
@@ -611,6 +866,12 @@ def _persist_historical_entry_books(
         "bid_source_row_index": pl.Int64,
         "ask_source_row_index": pl.Int64,
         "last": pl.Float64,
+        "execution_price_0901": pl.Float64,
+        "tick_volume_units_0901": pl.Float64,
+        "tick_count_0901": pl.Int64,
+        "source_window_start": pl.String,
+        "source_window_end": pl.String,
+        "quote_at": pl.String,
         "source": pl.String,
     }
     normalized = [
@@ -744,19 +1005,30 @@ def _official_open_map(
     opens: dict[str, float] = {}
     source_counts: dict[str, int] = {}
     no_trade_symbols: set[str] = set()
+    # The venue aggregates are the direct official authority and already carry
+    # the complete date slice.  Load each venue once instead of opening one
+    # derived per-symbol parquet for every market row.  The per-symbol path is
+    # retained only as a fallback for a symbol absent from both aggregates.
+    aggregate_rows = _official_aggregate_daily_rows(
+        twse_daily_ohlcv_path,
+        tpex_daily_ohlcv_path,
+        trading_date,
+    )
     for spec in specs:
         rows = selected[spec.market][4]
         for row in rows:
             symbol = str(row.get("symbol") or "")
             if not symbol or symbol in opens:
                 continue
-            daily = _official_daily_row(
-                spec.parquet_root,
-                symbol,
-                trading_date,
-                twse_daily_ohlcv_path,
-                tpex_daily_ohlcv_path,
-            )
+            daily = aggregate_rows.get(symbol)
+            if daily is None:
+                daily = _official_daily_row(
+                    spec.parquet_root,
+                    symbol,
+                    trading_date,
+                    twse_daily_ohlcv_path,
+                    tpex_daily_ohlcv_path,
+                )
             if daily is None:
                 continue
             opening = float(daily.get("open") or math.nan)
@@ -1148,6 +1420,10 @@ def _close_quotes(
                 "ask_volume": PAPER_LIQUIDITY_LOTS,
                 "quote_at": quote_at.isoformat(timespec="seconds"),
                 "source": f"{official_source}:session_close_replay",
+                "fill_contract": HISTORICAL_OFFICIAL_CLOSE_FILL_CONTRACT,
+                "depth_assumption": (
+                    "full_residual_at_official_close_no_historical_auction_depth_claim"
+                ),
             }
     if missing:
         raise ValueError(
@@ -1194,10 +1470,378 @@ def _position_stats(mode: Mapping[str, Any]) -> dict[str, Any]:
         "entry_official_open_fill_count": int(
             mode.get("entry_official_open_fill_count") or 0
         ),
+        "entry_0901_vwap_fill_count": int(
+            mode.get("entry_0901_vwap_fill_count") or 0
+        ),
         "entry_requested_shares": int(mode.get("entry_requested_shares") or 0),
         "entry_filled_shares": int(mode.get("entry_filled_shares") or 0),
         "entry_unfilled_shares": int(mode.get("entry_unfilled_shares") or 0),
     }
+
+
+def _minute_bar_rows(
+    roots: tuple[Path, ...],
+    *,
+    trading_date: date,
+    symbols: set[str],
+) -> tuple[dict[str, dict[str, dict[str, float]]], dict[str, Any]]:
+    """Load retained right-labelled minute OHLCV without fabricating books."""
+
+    unresolved = set(symbols)
+    output: dict[str, dict[str, dict[str, float]]] = {}
+    source_counts: dict[str, int] = {}
+
+    def accept(frame: pl.DataFrame, source: Path) -> None:
+        nonlocal unresolved
+        if not frame.height:
+            return
+        schema = set(frame.columns)
+        volume_expr = (
+            pl.col("volume_shares").cast(pl.Float64, strict=False)
+            if "volume_shares" in schema
+            else pl.col("Volume").cast(pl.Float64, strict=False)
+            * (
+                pl.col("contract_unit").cast(pl.Float64, strict=False)
+                if "contract_unit" in schema
+                else pl.lit(1_000.0)
+            )
+        )
+        amount_expr = (
+            pl.col("Amount").cast(pl.Float64, strict=False)
+            if "Amount" in schema
+            else pl.lit(None, dtype=pl.Float64)
+        )
+        normalized = frame.select(
+            pl.col("symbol").cast(pl.String),
+            pl.col("ts").cast(pl.Datetime("ns")),
+            pl.col("Open").cast(pl.Float64, strict=False),
+            pl.col("High").cast(pl.Float64, strict=False),
+            pl.col("Low").cast(pl.Float64, strict=False),
+            pl.col("Close").cast(pl.Float64, strict=False),
+            volume_expr.alias("volume_shares"),
+            amount_expr.alias("Amount"),
+            (
+                pl.col("_source_path")
+                if "_source_path" in schema
+                else pl.lit(str(source.resolve()))
+            ).alias("_source_path"),
+        )
+        accepted_symbols: set[str] = set()
+        accepted_sources: dict[str, str] = {}
+        for row in normalized.iter_rows(named=True):
+            symbol = str(row.get("symbol") or "")
+            stamp = row.get("ts")
+            close = _finite(row.get("Close"))
+            if symbol not in unresolved or not isinstance(stamp, datetime) or close is None:
+                continue
+            if stamp.tzinfo is None:
+                stamp = stamp.replace(tzinfo=TAIPEI)
+            else:
+                stamp = stamp.astimezone(TAIPEI)
+            if stamp.date() != trading_date:
+                continue
+            volume = max(0.0, float(row.get("volume_shares") or 0.0))
+            amount = _finite(row.get("Amount"))
+            vwap = amount / volume if amount is not None and volume > 0.0 else close
+            output.setdefault(symbol, {})[stamp.isoformat(timespec="minutes")] = {
+                "open": float(_finite(row.get("Open")) or close),
+                "high": float(_finite(row.get("High")) or close),
+                "low": float(_finite(row.get("Low")) or close),
+                "close": float(close),
+                "vwap": float(vwap),
+                "volume_shares": volume,
+            }
+            accepted_symbols.add(symbol)
+            accepted_sources.setdefault(
+                symbol, str(row.get("_source_path") or source.resolve())
+            )
+        if accepted_symbols:
+            for key in set(accepted_sources.values()):
+                source_counts[key] = source_counts.get(key, 0) + sum(
+                    value == key for value in accepted_sources.values()
+                )
+            unresolved -= accepted_symbols
+
+    for root in roots:
+        if not unresolved:
+            break
+        partition = root / f"trade_date={trading_date.isoformat()}" / "data.parquet"
+        if partition.is_file():
+            schema = set(pl.read_parquet_schema(partition).names())
+            columns = [
+                name
+                for name in (
+                    "symbol", "ts", "Open", "High", "Low", "Close", "Volume",
+                    "Amount", "volume_shares", "contract_unit",
+                )
+                if name in schema
+            ]
+            frame = (
+                pl.scan_parquet(partition)
+                .filter(pl.col("symbol").is_in(sorted(unresolved)))
+                .select(columns)
+                .collect(engine="streaming")
+            )
+            accept(frame, partition)
+        chunk_paths: list[Path] = []
+        for symbol in sorted(unresolved):
+            for path in sorted((root / "minute_chunks" / symbol).glob("*.parquet")):
+                boundary = path.stem.split("_")
+                if len(boundary) != 2 or not (
+                    boundary[0] <= trading_date.isoformat() <= boundary[1]
+                ):
+                    continue
+                chunk_paths.append(path)
+        schema_groups: dict[tuple[str, ...], list[Path]] = {}
+        for path in chunk_paths:
+            schema_groups.setdefault(
+                tuple(pl.read_parquet_schema(path).names()), []
+            ).append(path)
+        for schema_tuple, paths in schema_groups.items():
+            schema = set(schema_tuple)
+            columns = [
+                name
+                for name in (
+                    "symbol", "date", "ts", "Open", "High", "Low", "Close",
+                    "Volume", "Amount", "volume_shares", "contract_unit",
+                )
+                if name in schema
+            ]
+            lazy = pl.scan_parquet(
+                sorted(paths), include_file_paths="_source_path"
+            )
+            if "date" in schema:
+                lazy = lazy.filter(pl.col("date").cast(pl.Date) == trading_date)
+            frame = lazy.select(*columns, "_source_path").collect(
+                engine="streaming"
+            )
+            accept(frame, root)
+    return output, {
+        "requested_symbols": len(symbols),
+        "resolved_symbols": len(output),
+        "missing_symbols": sorted(unresolved),
+        "source_counts": dict(sorted(source_counts.items())),
+    }
+
+
+def _bar_quote(
+    position: Mapping[str, Any],
+    bar: Mapping[str, float],
+    *,
+    observed: datetime,
+    bid: float | None,
+    ask: float | None,
+    last: float | None = None,
+) -> dict[str, Any]:
+    lots = max(0.0, float(bar.get("volume_shares") or 0.0) / 1_000.0)
+    return {
+        "symbol": str(position.get("symbol") or ""),
+        "last": float(last if last is not None else bar["close"]),
+        "bid": bid,
+        "ask": ask,
+        "bid_volume": lots,
+        "ask_volume": lots,
+        "minute_volume_lots": lots,
+        "quote_at": observed.isoformat(timespec="seconds"),
+        "source": "retained_right_labelled_1m_ohlcv_counterfactual",
+        "fill_contract": HISTORICAL_KBAR_FILL_CONTRACT,
+        "depth_assumption": "50pct_observed_minute_volume_no_level_one_depth_claim",
+    }
+
+
+def _capacity_from_bar(position: Mapping[str, Any], bar: Mapping[str, float]) -> int:
+    lot_size = int(position.get("lot_size") or 1_000)
+    return (
+        int(
+            math.floor(
+                max(0.0, float(bar.get("volume_shares") or 0.0))
+                * MINUTE_VOLUME_PARTICIPATION
+                / lot_size
+            )
+        )
+        * lot_size
+    )
+
+
+def _apply_historical_kbar_brackets(
+    engine: TwDayTradeSimulationEngine,
+    *,
+    market: str,
+    bars: Mapping[str, Mapping[str, Mapping[str, float]]],
+    observed: datetime,
+) -> None:
+    """Replay brackets conservatively from a completed one-minute range.
+
+    If both stop and take-profit are touched inside one minute, the stop is
+    processed first.  This avoids using unknowable intraminute ordering to
+    improve the counterfactual result.
+    """
+
+    mode = engine.state["modes"][market]
+    valuation_quotes: dict[str, dict[str, Any]] = {}
+    minute_key = observed.isoformat(timespec="minutes")
+    for position in (mode.get("positions") or {}).values():
+        if int(position.get("signed_shares") or 0) == 0:
+            continue
+        symbol = str(position.get("symbol") or "")
+        bar = (bars.get(symbol) or {}).get(minute_key)
+        if bar is None:
+            continue
+        side = str(position.get("side") or "")
+        take_profit = float(position["take_profit_price"])
+        stop = float(position["stop_trigger_price"])
+        stop_waiting = str(position.get("stop_order_status") or "").startswith(
+            "triggered"
+        )
+        stop_hit = stop_waiting or (
+            side == "long" and float(bar["low"]) <= stop
+        ) or (side == "short" and float(bar["high"]) >= stop)
+        take_profit_hit = (
+            side == "long" and float(bar["high"]) > take_profit
+        ) or (side == "short" and float(bar["low"]) < take_profit)
+        capacity = _capacity_from_bar(position, bar)
+        if stop_hit:
+            position["stop_order_status"] = "triggered_waiting_liquidity"
+            if capacity > 0:
+                execution = float(bar["vwap"])
+                quote = _bar_quote(
+                    position,
+                    bar,
+                    observed=observed,
+                    bid=execution if side == "long" else None,
+                    ask=execution if side == "short" else None,
+                    last=stop,
+                )
+                engine._close_position(  # noqa: SLF001 - canonical ledger writer
+                    position,
+                    mode,
+                    price=execution,
+                    quote=quote,
+                    now=observed,
+                    reason=(
+                        "stop_loss_inside_daily_limit_"
+                        f"{int(position.get('price_limit_offset_ticks') or 0)}_tick_trigger"
+                    ),
+                    order_type="MKT",
+                    quantity=capacity,
+                )
+        elif take_profit_hit and capacity > 0:
+            quote = _bar_quote(
+                position,
+                bar,
+                observed=observed,
+                bid=take_profit if side == "long" else None,
+                ask=take_profit if side == "short" else None,
+            )
+            engine._close_position(  # noqa: SLF001 - canonical ledger writer
+                position,
+                mode,
+                price=take_profit,
+                quote=quote,
+                now=observed,
+                reason=(
+                    "take_profit_inside_daily_limit_"
+                    f"{int(position.get('price_limit_offset_ticks') or 0)}_tick"
+                ),
+                order_type="LMT",
+                quantity=capacity,
+            )
+        if int(position.get("signed_shares") or 0) != 0:
+            close = float(bar["close"])
+            valuation_quotes[symbol] = _bar_quote(
+                position,
+                bar,
+                observed=observed,
+                bid=close if side == "long" else None,
+                ask=close if side == "short" else None,
+            )
+    engine._mark_mode(  # noqa: SLF001 - one exact minute mark per mode
+        market,
+        observed,
+        valuation_quotes,
+        append_history=True,
+    )
+
+
+def _eod_kbar_quotes(
+    mode: Mapping[str, Any],
+    bars: Mapping[str, Mapping[str, Mapping[str, float]]],
+    *,
+    observed: datetime,
+) -> dict[str, dict[str, Any]]:
+    quotes: dict[str, dict[str, Any]] = {}
+    minute_key = observed.isoformat(timespec="minutes")
+    for position in (mode.get("positions") or {}).values():
+        if int(position.get("signed_shares") or 0) == 0:
+            continue
+        symbol = str(position.get("symbol") or "")
+        bar = (bars.get(symbol) or {}).get(minute_key)
+        if bar is None:
+            continue
+        side = str(position.get("side") or "")
+        close = float(bar["close"])
+        if observed.time() == time(13, 20):
+            day_array = np.asarray([np.datetime64(observed.date().isoformat(), "D")])
+            if side == "long":
+                bid = close
+                ask = float(move_price_ticks_numpy(np.asarray([close]), 1, day_array)[0])
+            else:
+                bid = float(move_price_ticks_numpy(np.asarray([close]), -1, day_array)[0])
+                ask = close
+        elif time(13, 20) < observed.time() < time(13, 24):
+            bid = float(bar["high"]) if side == "long" else close
+            ask = float(bar["low"]) if side == "short" else close
+        else:
+            execution = float(bar["vwap"])
+            bid = execution if side == "long" else None
+            ask = execution if side == "short" else None
+        quotes[symbol] = _bar_quote(
+            position,
+            bar,
+            observed=observed,
+            bid=bid,
+            ask=ask,
+        )
+    return quotes
+
+
+def _replay_historical_intraday(
+    engine: TwDayTradeSimulationEngine,
+    *,
+    markets: list[str],
+    bars: Mapping[str, Mapping[str, Mapping[str, float]]],
+    trading_date: date,
+) -> None:
+    # 09:01 was already emitted atomically with the entry registration.  Every
+    # following point is an exact right-labelled minute through 13:30.
+    for offset in range(2, 271):
+        observed = datetime.combine(trading_date, time(9, 0), tzinfo=TAIPEI) + timedelta(
+            minutes=offset
+        )
+        if observed.time() < time(13, 20):
+            for market in markets:
+                _apply_historical_kbar_brackets(
+                    engine,
+                    market=market,
+                    bars=bars,
+                    observed=observed,
+                )
+            continue
+        if observed.time() < time(13, 25):
+            for market in markets:
+                mode = engine.state["modes"][market]
+                engine.process_quotes(
+                    quotes=_eod_kbar_quotes(mode, bars, observed=observed),
+                    now=observed,
+                    markets=[market],
+                    persist=False,
+                )
+            continue
+        if observed.time() < time(13, 30):
+            for market in markets:
+                engine.process_quotes(
+                    quotes={}, now=observed, markets=[market], persist=False
+                )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1217,6 +1861,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--twse-daily-ohlcv-path",
         type=Path,
         default=DEFAULT_TWSE_DAILY_OHLCV_PATH,
+    )
+    parser.add_argument(
+        "--tw-public-dir",
+        type=Path,
+        default=Path("/srv/stockagent-live/data_tw_public"),
+        help="Receipt-verified public-data root that owns the TAIEX session calendar.",
     )
     parser.add_argument(
         "--tpex-daily-ohlcv-path",
@@ -1256,11 +1906,32 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--minute-data-root",
+        action="append",
+        type=Path,
+        default=[],
+        help=(
+            "Local canonical minute-data root checked before any 09:01 VWAP "
+            "Shioaji query; repeat for multiple roots."
+        ),
+    )
+    parser.add_argument(
         "--include-disabled",
         action="store_true",
         help=(
             "Include disabled day-trade modes for an explicit forensic rebuild. "
             "The default rebuilds enabled modes only."
+        ),
+    )
+    parser.add_argument(
+        "--replay-intraday-kbars",
+        action="store_true",
+        help=(
+            "Replay the retained right-labelled 1m OHLCV path: conservative "
+            "stop-before-profit bracket ordering through 13:19, a replay-only "
+            "13:20 passive-price proxy, 13:24 minute VWAP market attempt, then "
+            "the ordinary 13:30 auction/terminal flatten. The proxy is never "
+            "labelled as an executable historical Bid/Ask."
         ),
     )
     entry_policy = parser.add_mutually_exclusive_group()
@@ -1330,6 +2001,10 @@ def main() -> None:
     state_dir = args.state_dir.resolve()
     if state_dir.exists() and any(state_dir.iterdir()):
         raise RuntimeError(f"refusing non-empty rebuild target: {state_dir}")
+    minute_data_roots = tuple(
+        path.resolve()
+        for path in (args.minute_data_root or list(DEFAULT_MINUTE_DATA_ROOTS))
+    )
 
     specs, live_configs, errors = _mode_specs(
         args.markets_dir,
@@ -1358,14 +2033,13 @@ def main() -> None:
             for spec in specs
         ]
     else:
-        # Historical reconstruction is deliberately different from the live
-        # runner.  It is recorded at 09:01 and values every eligible order at
-        # the already observed official session open.  Never inherit the live
-        # causal best-quote policy merely because both paths share ModeSpec.
+        # Historical/missed-opening reconstruction is deliberately different
+        # from the live runner. It sizes from the official 09:00 open and
+        # executes from the observed right-labelled 09:01 minute VWAP.
         specs = [
             replace(
                 spec,
-                entry_fill_policy=ENTRY_FILL_POLICY_OFFICIAL_OPEN_AT_0901,
+                entry_fill_policy=ENTRY_FILL_POLICY_0901_MINUTE_VWAP,
                 entry_price_offset_ticks=0,
             )
             for spec in specs
@@ -1376,6 +2050,9 @@ def main() -> None:
     for official_path in (twse_daily_ohlcv_path, tpex_daily_ohlcv_path):
         if not official_path.is_file():
             raise FileNotFoundError(official_path)
+    official_sessions, official_calendar_sha256 = _validated_taiex_session_dates(
+        args.tw_public_dir.resolve(), start, end
+    )
     engine = TwDayTradeSimulationEngine(state_dir)
     source_signal_ids: dict[tuple[str, str], str] = {}
     source_ledger_provenance: dict[str, Any] | None = None
@@ -1387,11 +2064,7 @@ def main() -> None:
         )
         expected_signal_keys = {
             (day.isoformat(), spec.market)
-            for day in (
-                start + timedelta(days=offset)
-                for offset in range((end - start).days + 1)
-            )
-            if not _is_weekend(day)
+            for day in official_sessions
             for spec in specs
         }
         missing_signal_keys = sorted(expected_signal_keys - set(source_signal_ids))
@@ -1439,8 +2112,14 @@ def main() -> None:
         spec.entry_fill_policy == ENTRY_FILL_POLICY_OFFICIAL_OPEN_AT_0901
         for spec in specs
     )
+    minute_vwap_at_0901 = bool(specs) and all(
+        spec.entry_fill_policy == ENTRY_FILL_POLICY_0901_MINUTE_VWAP
+        for spec in specs
+    )
     replay_entry_contract = (
-        "retrospective_official_session_open_at_09_01_counterfactual"
+        "retrospective_official_open_signal_at_09_00_observed_09_01_minute_vwap_counterfactual"
+        if minute_vwap_at_0901
+        else "retrospective_official_session_open_at_09_01_counterfactual"
         if official_open_at_0901
         else "retrospective_historical_best_quote_market_else_adverse_open_tick_counterfactual"
         if paper_market_at_best
@@ -1456,7 +2135,12 @@ def main() -> None:
         "replay_contract": {
             "entry": replay_entry_contract,
             "entry_price": (
-                "every direction uses the official session open and missing opens "
+                "the official 09:00 open is used only for inference/sizing and every "
+                "direction executes at the observed right-labelled 09:01 minute VWAP; "
+                "missing opens or VWAPs fail closed without open-fill, Bid/Ask, last, "
+                "or adverse-tick substitution"
+                if minute_vwap_at_0901
+                else "every direction uses the official session open and missing opens "
                 "fail closed without Bid/Ask, last-price, or adverse-tick substitution"
                 if official_open_at_0901
                 else "market buy/cover uses first historical best ask in the 09:00 minute; "
@@ -1464,6 +2148,10 @@ def main() -> None:
                 "side uses official session open moved one adverse legal tick"
             ),
             "entry_liquidity": (
+                "complete independently legal whole-lot paper quantity at the observed "
+                "09:01 minute VWAP without any exchange-fill or queue claim"
+                if minute_vwap_at_0901
+                else
                 "complete independently legal whole-lot paper quantity at the official "
                 "open without any exchange-fill or queue claim"
                 if official_open_at_0901
@@ -1480,12 +2168,22 @@ def main() -> None:
                 "whole-lot, and available-liquidity constraints; no cross-symbol "
                 "direction balancing or fill reduction"
             ),
-            "completed_session_exit": "official daily close",
-            "intraday_path": "not reconstructed; daily-limit bracket ordering is not inferred from OHLC",
+            "completed_session_exit": (
+                "13:20 passive proxy, 13:24 minute VWAP, 13:30 official auction and terminal flatten"
+                if args.replay_intraday_kbars
+                else "official daily close"
+            ),
+            "intraday_path": (
+                "retained right-labelled 1m OHLCV; stop-before-profit for same-minute ambiguity; 50pct minute-volume capacity; no executable Bid/Ask claim"
+                if args.replay_intraday_kbars
+                else "not reconstructed; daily-limit bracket ordering is not inferred from OHLC"
+            ),
             "current_session": "left open for ordinary live quote service",
             "recorded_entry_time": "09:01:00 Asia/Taipei for every replayed session",
             "historical_quote_window": (
-                "not used by official-open execution"
+                "09:00:00-09:00:59 Asia/Taipei, right-labelled 09:01"
+                if minute_vwap_at_0901
+                else "not used by official-open execution"
                 if official_open_at_0901
                 else "09:00:00-09:00:59 Asia/Taipei"
             ),
@@ -1505,17 +2203,26 @@ def main() -> None:
                 "sha256": _sha256(tpex_daily_ohlcv_path),
             },
         },
+        "official_session_calendar": {
+            "path": str(
+                (args.tw_public_dir.resolve() / "twse_taiex_ohlc.parquet")
+            ),
+            "sha256": official_calendar_sha256,
+            "session_count": len(official_sessions),
+            "start_date": min(official_sessions).isoformat(),
+            "end_date": max(official_sessions).isoformat(),
+        },
         "skipped_sessions": [],
         "sessions": [],
     }
 
     day = start
     while day <= end:
-        if _is_weekend(day):
+        if day not in official_sessions:
             receipt["skipped_sessions"].append(
                 {
                     "session_date": day.isoformat(),
-                    "reason": "weekend_non_session",
+                    "reason": "receipt_verified_taiex_non_session",
                 }
             )
             day += timedelta(days=1)
@@ -1681,6 +2388,75 @@ def main() -> None:
                     ),
                 }
             )
+        elif minute_vwap_at_0901:
+            try:
+                local_books, local_query = _local_0901_vwap_rows(
+                    minute_roots=minute_data_roots,
+                    symbols=requested_book_symbols,
+                    trading_date=day,
+                )
+                unresolved = sorted(set(requested_book_symbols) - set(local_books))
+                remote_books: dict[str, dict[str, Any]] = {}
+                remote_query: dict[str, Any] = {
+                    "source": "not_required_local_0901_vwap_complete",
+                    "requested_symbols": 0,
+                    "queried_symbols": 0,
+                    "resolved_symbols": 0,
+                    "unqueried_symbols": 0,
+                    "error_counts": {},
+                    "stopped_for_traffic": False,
+                }
+                if unresolved:
+                    try:
+                        remote_books, remote_query = (
+                            fetch_shioaji_historical_stock_0901_vwaps(
+                                unresolved,
+                                trading_date=day,
+                                max_traffic_fraction=float(
+                                    args.max_shioaji_traffic_fraction
+                                ),
+                            )
+                        )
+                    except Exception as exc:
+                        remote_books = {}
+                        remote_query = {
+                            "source": "shioaji:historical_ticks_0900_090059_vwap_right_label_0901",
+                            "requested_symbols": len(unresolved),
+                            "resolved_symbols": 0,
+                            "unqueried_symbols": len(unresolved),
+                            "query_failed": True,
+                            "error_counts": {type(exc).__name__: 1},
+                            "error": str(exc),
+                            "stopped_for_traffic": False,
+                        }
+                historical_books = {**local_books, **remote_books}
+                historical_book_query = {
+                    "source": "local_first_then_shioaji_0901_vwap",
+                    "trading_date": day.isoformat(),
+                    "requested_symbols": len(requested_book_symbols),
+                    "resolved_symbols": len(historical_books),
+                    "local": local_query,
+                    "remote": remote_query,
+                    "unqueried_symbols": int(
+                        remote_query.get("unqueried_symbols") or 0
+                    ),
+                    "error_counts": dict(remote_query.get("error_counts") or {}),
+                    "query_failed": bool(remote_query.get("query_failed")),
+                    "stopped_for_traffic": bool(
+                        remote_query.get("stopped_for_traffic")
+                    ),
+                }
+            except Exception as exc:
+                historical_books = {}
+                historical_book_query = {
+                    "source": "shioaji:historical_ticks_0900_090059_vwap_right_label_0901",
+                    "trading_date": day.isoformat(),
+                    "requested_symbols": len(requested_book_symbols),
+                    "resolved_symbols": 0,
+                    "query_failed": True,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                }
         else:
             try:
                 historical_books, historical_book_query = (
@@ -1709,6 +2485,38 @@ def main() -> None:
                 books=historical_books,
             ),
         }
+        if minute_vwap_at_0901:
+            resolved_symbols = set(historical_books)
+            missing_symbols = sorted(
+                set(requested_book_symbols) - resolved_symbols
+            )
+            # The independent per-symbol execution contract must not turn one
+            # illiquid/no-print stock into a portfolio-wide outage.  A row
+            # without an observed 09:01 VWAP remains blocked by
+            # _prepare_entry_plan; it is never replaced by the official open,
+            # last price, a best quote, or an adverse tick.  Retain the gap in
+            # the receipt so replay completeness cannot be confused with data
+            # completeness.
+            historical_book_query.update(
+                {
+                    "missing_actionable_symbols": missing_symbols,
+                    "missing_actionable_symbol_count": len(missing_symbols),
+                    "missing_symbol_policy": (
+                        "per_symbol_fail_closed_no_price_substitution"
+                    ),
+                    "portfolio_wide_abort": False,
+                }
+            )
+            session_receipt["historical_entry_books"].update(
+                {
+                    "missing_actionable_symbols": missing_symbols,
+                    "missing_actionable_symbol_count": len(missing_symbols),
+                    "missing_symbol_policy": (
+                        "per_symbol_fail_closed_no_price_substitution"
+                    ),
+                    "portfolio_wide_abort": False,
+                }
+            )
         for (
             spec,
             generated_at,
@@ -1734,7 +2542,13 @@ def main() -> None:
                     "weights_path": str(weights_path.resolve()),
                     "simulation_replay": True,
                     "replay_basis": (
-                        "official_session_open_at_09_01_to_official_close"
+                        "official_09_00_open_inference_to_observed_09_01_minute_vwap_to_intraday_kbar_schedule"
+                        if minute_vwap_at_0901 and should_close and args.replay_intraday_kbars
+                        else "official_09_00_open_inference_to_observed_09_01_minute_vwap_to_official_close"
+                        if minute_vwap_at_0901 and should_close
+                        else "official_09_00_open_inference_to_observed_09_01_minute_vwap_to_live_quotes"
+                        if minute_vwap_at_0901
+                        else "official_session_open_at_09_01_to_official_close"
                         if official_open_at_0901 and should_close
                         else "official_session_open_at_09_01_to_live_quotes"
                         if official_open_at_0901
@@ -1743,13 +2557,17 @@ def main() -> None:
                         else "historical_best_quote_else_adverse_open_tick_to_live_quotes"
                     ),
                     "replay_source": (
-                        "immutable_live_signal_and_official_daily_session_open"
+                        "immutable_live_signal_official_daily_session_open_and_shioaji_09_01_minute_vwap"
+                        if minute_vwap_at_0901
+                        else "immutable_live_signal_and_official_daily_session_open"
                         if official_open_at_0901
                         else "immutable_live_signal_shioaji_historical_tick_and_official_market_data"
                     ),
                     "entry_fill_contract": replay_entry_contract,
                     "entry_liquidity_assumption": (
-                        "official_open_full_requested_paper_quantity_no_exchange_fill_claim"
+                        "observed_09_01_minute_vwap_full_requested_paper_quantity_no_exchange_fill_claim"
+                        if minute_vwap_at_0901
+                        else "official_open_full_requested_paper_quantity_no_exchange_fill_claim"
                         if official_open_at_0901
                         else "historical_best_quote_full_requested_paper_quantity_else_"
                         "adverse_open_tick_no_exchange_depth_claim"
@@ -1816,6 +2634,41 @@ def main() -> None:
                 }
             )
 
+        if should_close and args.replay_intraday_kbars:
+            position_symbols = {
+                str(position.get("symbol") or "")
+                for market in specs_by_market
+                for position in (
+                    engine.state.get("modes", {}).get(market, {}).get("positions", {})
+                    or {}
+                ).values()
+                if int(position.get("signed_shares") or 0) != 0
+            }
+            minute_bars, minute_coverage = _minute_bar_rows(
+                minute_data_roots,
+                trading_date=day,
+                symbols={symbol for symbol in position_symbols if symbol},
+            )
+            if minute_coverage["missing_symbols"]:
+                raise RuntimeError(
+                    f"missing retained minute path for {day}: "
+                    f"{minute_coverage['missing_symbols'][:30]}"
+                )
+            session_receipt["intraday_replay"] = {
+                **minute_coverage,
+                "contract": HISTORICAL_KBAR_FILL_CONTRACT,
+                "same_minute_bracket_order": "stop_before_take_profit",
+                "minute_volume_participation": MINUTE_VOLUME_PARTICIPATION,
+                "historical_best_bid_ask_claimed": False,
+            }
+            engine.begin_deferred_ledger_writes()
+            _replay_historical_intraday(
+                engine,
+                markets=list(specs_by_market),
+                bars=minute_bars,
+                trading_date=day,
+            )
+
         if should_close:
             close_at = datetime.combine(day, time(13, 30), tzinfo=TAIPEI)
             close_quotes, close_quality = _close_quotes(
@@ -1826,7 +2679,17 @@ def main() -> None:
                 twse_daily_ohlcv_path=twse_daily_ohlcv_path,
                 tpex_daily_ohlcv_path=tpex_daily_ohlcv_path,
             )
-            engine.process_quotes(quotes=close_quotes, now=close_at)
+            engine.process_quotes(
+                quotes=close_quotes,
+                now=close_at,
+                persist=not bool(args.replay_intraday_kbars),
+            )
+            if args.replay_intraday_kbars:
+                # Commit all append-only ledgers before advancing state.json.
+                # The live process still fsyncs each call; only this isolated
+                # completed-session replay batches writes at the day boundary.
+                engine.flush_deferred_ledger_writes()
+                engine._persist(close_at)  # noqa: SLF001 - session transaction
             session_receipt["close"] = {
                 "status": "settled_official_close",
                 **close_quality,

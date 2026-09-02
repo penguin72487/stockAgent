@@ -22,3 +22,7 @@ CPUWeight=25
 IOWeight=25
 IOSchedulingClass=best-effort
 IOSchedulingPriority=7
+MemoryAccounting=true
+MemoryHigh=48G
+MemoryMax=64G
+MemorySwapMax=8G
