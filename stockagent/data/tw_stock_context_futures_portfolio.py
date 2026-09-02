@@ -46,6 +46,9 @@ TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_CURRENT_OPEN_CONTRACT_VERSION: Final[int] = 4
 TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_GUARDED_CURRENT_OPEN_CONTRACT_VERSION: Final[
     int
 ] = 5
+TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_EXPIRY_SETTLEMENT_CONTRACT_VERSION: Final[
+    int
+] = 6
 TW_STOCK_CONTEXT_FUTURES_PRIOR_MARKET_FEATURE_COLUMNS: Final[tuple[str, ...]] = (
     *FUTURES_MODEL_FEATURE_COLUMNS,
     "cash_stock_underlying_panel_index",
@@ -119,6 +122,7 @@ class TaiwanStockContextFuturesPortfolioDaily:
     manifest_path: str
     integer_execution: np.ndarray | None = None
     carry_valuation_quarantine_mask: np.ndarray | None = None
+    expiry_settlement_valuation: bool = False
     contract_version: int = TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_CONTRACT_VERSION
     futures_data_contract_version: int = (
         TAIFEX_FUTURES_PORTFOLIO_DATA_CONTRACT_VERSION
@@ -177,6 +181,7 @@ def attach_stock_context_futures_portfolio_daily(
     integer_contracts: bool = False,
     current_open_feature: bool = False,
     carry_valuation_max_abs_simple_return: float = 0.0,
+    expiry_settlement_valuation: bool = False,
     integer_fee_per_contract_per_side_twd: float = 40.0,
     max_volume_participation: float = 0.0,
 ) -> PanelData:
@@ -190,7 +195,10 @@ def attach_stock_context_futures_portfolio_daily(
     requires that the fixed slot still owns the same physical contract on
     ``t``.  In integer mode the three denomination channels contain group
     identity, standard/mini tier, and one fully collateralized contract's cash
-    need. Current close/return/volume remain executor-only.
+    need. Current close/return/volume remain executor-only.  With
+    ``expiry_settlement_valuation``, only a contract's own ``last_trade_date``
+    row replaces the ordinary close-valued terminal return with the observed
+    TAIFEX settlement-valued return; non-expiry exits are unchanged.
     """
 
     _require_dependencies()
@@ -270,6 +278,8 @@ def attach_stock_context_futures_portfolio_daily(
         )
     if current_open_feature:
         source_columns.append("previous_settlement")
+    if expiry_settlement_valuation:
+        source_columns.extend(["settlement", "liquidation_reason"])
     table = pq.read_table(
         source_path,
         columns=source_columns,
@@ -420,6 +430,40 @@ def attach_stock_context_futures_portfolio_daily(
         symbol_indices[has_next_stock_session],
     ] = True
 
+    holding_values = frame["holding_log_return"].to_numpy().astype(np.float64)
+    if expiry_settlement_valuation:
+        liquidation_reasons = np.asarray(
+            [str(value or "").strip() for value in frame["liquidation_reason"].to_list()],
+            dtype=object,
+        )
+        expiry_rows = liquidation_reasons == "last_trade_date"
+        settlement_values = frame["settlement"].to_numpy().astype(np.float64)
+        expiry_opens = frame["open"].to_numpy().astype(np.float64)
+        invalid_expiry = expiry_rows & (
+            ~np.isfinite(expiry_opens)
+            | (expiry_opens <= 0.0)
+            | ~np.isfinite(settlement_values)
+            | (settlement_values <= 0.0)
+        )
+        if np.any(invalid_expiry):
+            raise ValueError(
+                "expiry settlement valuation requires a finite positive OPEN "
+                "and TAIFEX settlement on every last_trade_date row"
+            )
+        holding_values[expiry_rows] = np.log(
+            settlement_values[expiry_rows] / expiry_opens[expiry_rows]
+        )
+    # Keep the effective return attached to each source row.  The denomination
+    # join below is not allowed to make integer P&L depend on Polars' join row
+    # ordering, especially when standard and mini contracts share a group.
+    frame = frame.with_columns(
+        pl.Series(
+            "_effective_holding_log_return",
+            holding_values,
+            dtype=pl.Float64,
+        )
+    )
+
     same_values = frame["same_contract_as_previous_session"].to_numpy().astype(bool)
     same_as_previous[date_indices, symbol_indices] = same_values
     executable[date_indices, symbol_indices] = frame["executable"].to_numpy().astype(bool)
@@ -429,9 +473,7 @@ def attach_stock_context_futures_portfolio_daily(
     can_hold[date_indices, symbol_indices] = frame[
         "can_hold_overnight"
     ].to_numpy().astype(bool)
-    returns[date_indices, symbol_indices] = frame[
-        "holding_log_return"
-    ].to_numpy().astype(np.float32)
+    returns[date_indices, symbol_indices] = holding_values.astype(np.float32)
     opens[date_indices, symbol_indices] = frame["open"].to_numpy().astype(np.float32)
     closes[date_indices, symbol_indices] = frame["close"].to_numpy().astype(np.float32)
     volumes[date_indices, symbol_indices] = frame["volume"].to_numpy().astype(np.float32)
@@ -569,11 +611,11 @@ def attach_stock_context_futures_portfolio_daily(
                 "integer exposure groups support at most standard+mini candidates"
             )
 
-        holding_values = integer_frame["holding_log_return"].to_numpy().astype(
-            np.float64
-        )
+        integer_holding_values = integer_frame[
+            "_effective_holding_log_return"
+        ].to_numpy().astype(np.float64, copy=False)
         open_notionals = opening_values * multipliers
-        ending_notionals = open_notionals * np.exp(holding_values)
+        ending_notionals = open_notionals * np.exp(integer_holding_values)
         unique_dates = integer_frame.select("date").unique().sort("date")
         tax_schedule = {
             value: stock_index_futures_tax_rate(value)
@@ -629,7 +671,7 @@ def attach_stock_context_futures_portfolio_daily(
         integer_execution[..., 10] = 0.0
         packed = np.column_stack(
             (
-                holding_values,
+                integer_holding_values,
                 integer_frame["executable"].to_numpy().astype(np.float32),
                 integer_frame["must_liquidate"].to_numpy().astype(np.float32),
                 open_notionals,
@@ -711,7 +753,7 @@ def attach_stock_context_futures_portfolio_daily(
     benchmark_dates = date_indices[benchmark_rows]
     if np.unique(benchmark_dates).size != benchmark_dates.size:
         raise ValueError("TAIFEX TX front-month benchmark is not unique by date")
-    benchmark_values = frame["holding_log_return"].to_numpy()[benchmark_rows]
+    benchmark_values = holding_values[benchmark_rows]
     benchmark[benchmark_dates] = np.nan_to_num(
         benchmark_values.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0
     )
@@ -736,8 +778,11 @@ def attach_stock_context_futures_portfolio_daily(
             benchmark_log_returns=benchmark,
             integer_execution=integer_execution,
             carry_valuation_quarantine_mask=carry_valuation_quarantine,
+            expiry_settlement_valuation=bool(expiry_settlement_valuation),
             contract_version=(
-                TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_GUARDED_CURRENT_OPEN_CONTRACT_VERSION
+                TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_EXPIRY_SETTLEMENT_CONTRACT_VERSION
+                if expiry_settlement_valuation
+                else TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_GUARDED_CURRENT_OPEN_CONTRACT_VERSION
                 if carry_guard > 0.0
                 else TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_CURRENT_OPEN_CONTRACT_VERSION
                 if current_open_feature
@@ -764,6 +809,7 @@ __all__ = [
     "TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_CONTRACT_VERSION",
     "TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_CURRENT_OPEN_CONTRACT_VERSION",
     "TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_GUARDED_CURRENT_OPEN_CONTRACT_VERSION",
+    "TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_EXPIRY_SETTLEMENT_CONTRACT_VERSION",
     "TaiwanStockContextFuturesPortfolioDaily",
     "attach_stock_context_futures_portfolio_daily",
     "fixed_futures_slot_symbols",
